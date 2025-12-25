@@ -67,6 +67,24 @@ func (m *messageExtraDB) queryWithMessageIDsAndUID(messageIDs []string, loginUID
 	return models, err
 }
 
+func (m *messageExtraDB) queryRevokedWithMessageIDs(messageIDs []string) ([]*messageExtraModel, error) {
+	if len(messageIDs) == 0 {
+		return nil, nil
+	}
+	var list []*messageExtraModel
+	_, err := m.session.Select("*").From("message_extra").Where("message_id in ? and `revoke`=1", messageIDs).Load(&list)
+	return list, err
+}
+
+func (m *messageExtraDB) queryDeletedWithMessageIDs(messageIDs []string) ([]*messageExtraModel, error) {
+	if len(messageIDs) == 0 {
+		return nil, nil
+	}
+	var list []*messageExtraModel
+	_, err := m.session.Select("*").From("message_extra").Where("message_id in ? and is_deleted=1", messageIDs).Load(&list)
+	return list, err
+}
+
 func (m *messageExtraDB) queryWithMessageIDs(messageIDs []string) ([]*messageExtraModel, error) {
 	var list []*messageExtraModel
 	_, err := m.session.Select("*").From("message_extra").Where("message_id in ?", messageIDs).Load(&list)

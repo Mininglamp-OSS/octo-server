@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/group"
+	"github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/message"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/user"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServer/pkg/log"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServer/pkg/util"
@@ -18,16 +19,18 @@ import (
 type Search struct {
 	ctx *config.Context
 	log.Log
-	userService  user.IService
-	groupService group.IService
+	userService    user.IService
+	groupService   group.IService
+	messageService message.IService
 }
 
 func New(ctx *config.Context) *Search {
 	s := &Search{
-		ctx:          ctx,
-		Log:          log.NewTLog("search"),
-		userService:  user.NewService(ctx),
-		groupService: group.NewService(ctx),
+		ctx:            ctx,
+		Log:            log.NewTLog("search"),
+		userService:    user.NewService(ctx),
+		groupService:   group.NewService(ctx),
+		messageService: message.NewService(ctx),
 	}
 	return s
 }
@@ -59,7 +62,9 @@ func (s *Search) global(c *wkhttp.Context) {
 		c.ResponseError(errors.New("数据格式有误！"))
 		return
 	}
-
+	if req.Limit > 100 {
+		req.Limit = 100
+	}
 	payload := map[string]interface{}{
 		"content": req.Keyword,
 		"name":    req.Keyword,
@@ -86,12 +91,102 @@ func (s *Search) global(c *wkhttp.Context) {
 		c.ResponseError(errors.New("查询悟空IM消息错误"))
 		return
 	}
+	channelIds := make([]string, 0)
+	messageIds := make([]string, 0)
+	if msgResp != nil && len(msgResp.Messages) > 0 {
+		for _, m := range msgResp.Messages {
+			messageIds = append(messageIds, m.MessageIDStr)
+			channelIds = append(channelIds, m.ChannelID)
+		}
+	}
+	// 查询撤回标记
+	revokedMsgExtras, err := s.messageService.GetRevokedMessages(messageIds)
+	if err != nil {
+		s.Error("查询消息撤回消息错误", zap.Error(err))
+		c.ResponseError(errors.New("查询消息撤回消息错误"))
+		return
+	}
+	// 查询后台管理删除标记
+	deletedMsgExtras, err := s.messageService.GetDeletedMessages(messageIds)
+	if err != nil {
+		s.Error("查询消息删除消息错误", zap.Error(err))
+		c.ResponseError(errors.New("查询消息删除消息错误"))
+		return
+	}
+	// 查询登录用户的删除标记
+	deletedMsgUserExtras, err := s.messageService.GetDeletedMessagesWithUID(loginUID, messageIds)
+	if err != nil {
+		s.Error("查询消息删除消息错误", zap.Error(err))
+		c.ResponseError(errors.New("查询消息删除消息错误"))
+		return
+	}
 
+	// 查询登录用户清空channel消息标记
+	channelOffsetResps, err := s.messageService.GetChannelOffsetWithUID(loginUID, channelIds)
+	if err != nil {
+		s.Error("查询用户清空channel消息标记错误", zap.Error(err))
+		c.ResponseError(errors.New("查询用户清空channel消息标记错误"))
+		return
+	}
+
+	// 1. 预处理：构建 Map（O(n) 一次性处理）
+	revokedMap := make(map[string]bool, len(revokedMsgExtras))
+	for _, extra := range revokedMsgExtras {
+		revokedMap[extra.MessageIDStr] = true
+	}
+
+	deletedMap := make(map[string]bool, len(deletedMsgExtras))
+	for _, extra := range deletedMsgExtras {
+		if extra.IsMutualDeleted == 1 {
+			deletedMap[extra.MessageIDStr] = true
+		}
+	}
+
+	deletedUserMap := make(map[string]bool, len(deletedMsgUserExtras))
+	for _, extra := range deletedMsgUserExtras {
+		if extra.MessageIsDeleted == 1 {
+			deletedUserMap[extra.MessageIDStr] = true
+		}
+	}
+
+	// channelID -> 清空到的 messageSeq
+	channelOffsetMap := make(map[string]uint32, len(channelOffsetResps))
+	for _, offset := range channelOffsetResps {
+		channelOffsetMap[offset.ChannelID] = offset.MessageSeq
+	}
+
+	realMessages := make([]*config.MessageResp, 0)
+	if msgResp != nil && len(msgResp.Messages) > 0 {
+		for _, m := range msgResp.Messages {
+			// O(1) 检查是否撤回
+			if revokedMap[m.MessageIDStr] {
+				continue
+			}
+
+			// O(1) 检查是否后台删除
+			if deletedMap[m.MessageIDStr] {
+				continue
+			}
+
+			// O(1) 检查是否用户删除
+			if deletedUserMap[m.MessageIDStr] {
+				continue
+			}
+
+			// O(1) 检查是否清空channel消息
+			if offsetSeq, ok := channelOffsetMap[m.ChannelID]; ok && offsetSeq >= m.MessageSeq {
+				continue
+			}
+
+			realMessages = append(realMessages, m)
+		}
+	}
 	groupIds := make([]string, 0)
 	uids := make([]string, 0)
 	msgFromUids := make([]string, 0)
-	if msgResp != nil && len(msgResp.Messages) > 0 {
-		for _, m := range msgResp.Messages {
+
+	if len(realMessages) > 0 {
+		for _, m := range realMessages {
 			if m.ChannelType == common.ChannelTypeGroup.Uint8() {
 				groupIds = append(groupIds, m.ChannelID)
 			} else if m.ChannelType == common.ChannelTypePerson.Uint8() {
@@ -102,6 +197,7 @@ func (s *Search) global(c *wkhttp.Context) {
 			}
 		}
 	}
+
 	var joinedGroups []*group.InfoResp
 	if req.OnlyMessage == 0 {
 		joinedGroups, err = s.groupService.GetGroupsWithMemberUID(loginUID)
@@ -195,8 +291,8 @@ func (s *Search) global(c *wkhttp.Context) {
 	}
 
 	messagesResp := make([]*messageResp, 0)
-	if len(msgResp.Messages) > 0 {
-		for _, msg := range msgResp.Messages {
+	if len(realMessages) > 0 {
+		for _, msg := range realMessages {
 			var isDeleted int8 = 0
 			setting := config.SettingFromUint8(msg.Setting)
 			var payloadMap map[string]interface{}
@@ -228,7 +324,9 @@ func (s *Search) global(c *wkhttp.Context) {
 					}
 				}
 			}
-
+			if isDeleted == 1 {
+				continue
+			}
 			var tempChannel *channelResp
 			if msg.ChannelType == common.ChannelTypePerson.Uint8() {
 				for _, user := range users {

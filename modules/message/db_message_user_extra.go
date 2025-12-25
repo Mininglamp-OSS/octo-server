@@ -44,6 +44,16 @@ func (m *messageUserExtraDB) queryWithMessageIDsAndUID(messageIDs []string, uid 
 	return models, err
 }
 
+// 通过消息id集合和消息拥有者uid查询已删除消息
+func (m *messageUserExtraDB) queryDeletedWithMessageIDsAndUID(messageIDs []string, uid string) ([]*messageUserExtraModel, error) {
+	if len(messageIDs) == 0 {
+		return nil, nil
+	}
+	var models []*messageUserExtraModel
+	_, err := m.session.Select("*").From(m.getTable(uid)).Where("uid=? and message_id in ? and message_is_deleted=1", uid, messageIDs).Load(&models)
+	return models, err
+}
+
 func (m *messageUserExtraDB) getTable(uid string) string {
 	tableIndex := crc32.ChecksumIEEE([]byte(uid)) % uint32(m.ctx.GetConfig().TablePartitionConfig.MessageUserEditTableCount)
 	if tableIndex == 0 {
