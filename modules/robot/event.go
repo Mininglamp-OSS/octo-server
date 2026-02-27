@@ -53,6 +53,7 @@ func (rb *Robot) robotMessageListen(messages []*config.MessageResp) {
 				rb.Error("查询有效robotID失败！", zap.Error(err))
 				continue
 			}
+			rb.Debug("DM消息路由检测", zap.String("channelID", message.ChannelID), zap.String("fromUID", message.FromUID), zap.String("targetUID", uid), zap.Bool("isRobot", exist))
 			if exist {
 				robotID = uid
 			}
@@ -63,7 +64,7 @@ func (rb *Robot) robotMessageListen(messages []*config.MessageResp) {
 			if robotIDValue.Exists() {
 				robotID = robotIDValue.String()
 			} else if payloadValue.Get("mention").Exists() {
-				fmt.Println("mention---->", payloadValue.Get("mention"))
+				rb.Debug("检测到@提及", zap.String("mention", payloadValue.Get("mention").String()))
 				mentionValue := payloadValue.Get("mention")
 				mentionUIDsValue := mentionValue.Get("uids")
 				if mentionValue.Exists() && mentionUIDsValue.Exists() {
@@ -100,8 +101,8 @@ func (rb *Robot) robotMessageListen(messages []*config.MessageResp) {
 				}
 			}
 		}
-		fmt.Println("mention--robotID-->", robotID)
 		if len(robotID) > 0 {
+			rb.Info("投递消息到机器人事件队列", zap.String("robotID", robotID), zap.String("fromUID", message.FromUID), zap.Int64("messageID", message.MessageID))
 			go rb.saveRobotMessage(message, robotID)
 		}
 	}

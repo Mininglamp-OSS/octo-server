@@ -262,15 +262,34 @@ func (rb *Robot) sendMessage(c *wkhttp.Context) {
 }
 
 func (rb *Robot) supportContentType(contentType common.ContentType) bool {
-	return contentType == common.Text
+	switch contentType {
+	case common.Text, common.Image, common.GIF, common.Voice,
+		common.Video, common.Location, common.Card, common.File,
+		common.RichText, common.VectorSticker, common.EmojiSticker:
+		return true
+	}
+	return false
 }
 
 func (rb *Robot) payloadIsVail(payloadResult maputil.Data) bool {
 	contentType := common.ContentType(payloadResult.Int("type"))
-	if contentType == common.Text {
-		if payloadResult.Get("content") != nil {
-			return true
-		}
+	switch contentType {
+	case common.Text:
+		return payloadResult.Get("content") != nil
+	case common.Image, common.GIF, common.VectorSticker, common.EmojiSticker:
+		return payloadResult.Get("url") != nil
+	case common.Voice:
+		return payloadResult.Get("url") != nil
+	case common.Video:
+		return payloadResult.Get("url") != nil
+	case common.Location:
+		return payloadResult.Get("latitude") != nil && payloadResult.Get("longitude") != nil
+	case common.Card:
+		return payloadResult.Get("uid") != nil || payloadResult.Get("name") != nil
+	case common.File:
+		return payloadResult.Get("url") != nil
+	case common.RichText:
+		return payloadResult.Get("content") != nil
 	}
 	return false
 }

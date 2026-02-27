@@ -1,8 +1,8 @@
 swagger: "2.0"
 info:
-  description: "唐僧叨叨 API"
+  description: "DMWork API"
   version: "1.0.0"
-  title: "唐僧叨叨 API"
+  title: "DMWork API"
 host: "api.botgate.cn"
 tags:
   - name: "robot"
