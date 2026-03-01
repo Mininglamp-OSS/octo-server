@@ -50,14 +50,15 @@ RESP_BODY=""
 
 perform_request() {
   local method=$1 path=$2 body=${3-}
-  shift 3 || true
+  local extra_args=()
+  [[ $# -gt 3 ]] && extra_args=("${@:4}")
   local url="${API_BASE}${path}"
   local tmp
   tmp=$(mktemp)
   if [[ -n $body ]]; then
-    RESP_CODE=$(curl -sS -w "%{http_code}" -o "$tmp" -H "Content-Type: application/json" "$@" -X "$method" "$url" -d "$body")
+    RESP_CODE=$(curl -sS -w "%{http_code}" -o "$tmp" -H "Content-Type: application/json" "${extra_args[@]}" -X "$method" "$url" -d "$body")
   else
-    RESP_CODE=$(curl -sS -w "%{http_code}" -o "$tmp" "$@" -X "$method" "$url")
+    RESP_CODE=$(curl -sS -w "%{http_code}" -o "$tmp" "${extra_args[@]}" -X "$method" "$url")
   fi
   RESP_BODY=$(cat "$tmp")
   rm -f "$tmp"
