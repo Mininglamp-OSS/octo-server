@@ -45,6 +45,7 @@ func (rb *Robot) robotMessageListen(messages []*config.MessageResp) {
 			continue
 		}
 		var robotID string
+		var robotIDs []string
 
 		if message.ChannelType == common.ChannelTypePerson.Uint8() {
 			uid := common.GetToChannelIDWithFakeChannelID(message.ChannelID, message.FromUID)
@@ -78,8 +79,7 @@ func (rb *Robot) robotMessageListen(messages []*config.MessageResp) {
 							continue
 						}
 						if exist {
-							robotID = uid
-							break
+							robotIDs = append(robotIDs, uid)
 						}
 					}
 				}
@@ -105,11 +105,15 @@ func (rb *Robot) robotMessageListen(messages []*config.MessageResp) {
 				}
 			}
 		}
-		if len(robotID) > 0 {
+		if len(robotIDs) > 0 {
+			for _, rid := range robotIDs {
+				rb.Info("投递消息到机器人事件队列", zap.String("robotID", rid), zap.String("fromUID", message.FromUID), zap.Int64("messageID", message.MessageID))
+				go rb.saveRobotMessage(message, rid)
+				go rb.autoReadForBot(message, rid)
+			}
+		} else if len(robotID) > 0 {
 			rb.Info("投递消息到机器人事件队列", zap.String("robotID", robotID), zap.String("fromUID", message.FromUID), zap.Int64("messageID", message.MessageID))
 			go rb.saveRobotMessage(message, robotID)
-
-			// Bot自动已读：清除会话未读计数
 			go rb.autoReadForBot(message, robotID)
 		}
 	}

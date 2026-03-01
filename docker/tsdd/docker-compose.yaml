@@ -32,16 +32,12 @@ services:
       - ./configs/tsdd.yaml:/home/configs/tsdd.yaml
       - ./logs/tsdd:/home/logs
   tangsengdaodaoweb:  # DMWork的web服务
-    image: registry.cn-shanghai.aliyuncs.com/wukongim/tangsengdaodaoweb:latest
+    image: dmwork-web:latest
     restart: always
     environment:
       - API_URL
     ports:
       - "82:80"
-    volumes:
-      - ./configs/nginx.conf.template:/nginx.conf.template
-      - ./configs/index.html:/usr/share/nginx/html/index.html
-      - ./configs/main.eb3be439.js:/usr/share/nginx/html/static/js/main.eb3be439.js
   minio: # minio文件管理服务
     image: minio/minio:latest # use a remote image
     expose:

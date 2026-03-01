@@ -412,7 +412,7 @@ func (s *Service) AddUser(user *AddUserReq) error {
 	if user.Password != "" {
 		hashedPwd, hashErr := HashPassword(user.Password)
 		if hashErr != nil {
-			return nil, hashErr
+			return hashErr
 		}
 		userM.Password = hashedPwd
 	}
@@ -666,7 +666,8 @@ func (s *Service) UpdateLoginPassword(req UpdateLoginPasswordReq) error {
 	if userM == nil {
 		return errors.New("用户不存在！")
 	}
-	if !VerifyPassword(req.Password, userM.Password) {
+	matched, _ := CheckPassword(req.Password, userM.Password)
+	if !matched {
 		return errors.New("原密码不正确！")
 	}
 
