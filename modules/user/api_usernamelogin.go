@@ -170,6 +170,9 @@ func (u *User) registerWithUsername(username string, name string, password strin
 		"data":                      result,
 		"need_upload_web3publickey": 1,
 	})
+
+	// 新用户自动引导：BotFather + 示例 Bot 发送欢迎消息
+	go u.sendBotWelcomeMessages(uid)
 }
 
 // 通过web3公钥重置登录密码
@@ -498,4 +501,26 @@ type usernameRegisterReq struct {
 	Password string     `json:"password"`
 	Flag     uint8      `json:"flag"`   // 注册设备的标记 0.APP 1.PC
 	Device   *deviceReq `json:"device"` //注册用户设备信息
+}
+
+// sendBotWelcomeMessages 新用户注册后自动发送 Bot 欢迎消息
+func (u *User) sendBotWelcomeMessages(uid string) {
+	time.Sleep(time.Second * 1) // 等待注册完成
+
+	// BotFather 欢迎消息
+	err := u.ctx.SendMessage(&config.MsgSendReq{
+		FromUID:     "botfather",
+		ChannelID:   uid,
+		ChannelType: 1, // DM
+		Payload: []byte(util.ToJson(map[string]interface{}{
+			"content": "欢迎使用 DMWork！我是 BotFather，帮你创建和管理 AI 机器人。\n\n发送 /help 查看可用命令。",
+			"type":    1,
+		})),
+		Header: config.MsgHeader{
+			RedDot: 1,
+		},
+	})
+	if err != nil {
+		u.Error("发送 BotFather 欢迎消息失败", zap.Error(err))
+	}
 }

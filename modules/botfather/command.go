@@ -635,6 +635,7 @@ func (h *commandHandler) createBot(creatorUID, name, username, botToken string) 
 		Username: username,
 		Name:     name,
 		ShortNo:  username,
+		Robot:    1,
 	})
 	if err != nil {
 		return fmt.Errorf("创建用户失败: %w", err)

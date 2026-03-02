@@ -408,6 +408,7 @@ func (s *Service) AddUser(user *AddUserReq) error {
 		Email:    user.Email,
 		ShortNo:  shortNo,
 		Status:   1,
+		Robot:    user.Robot,
 	}
 	if user.Password != "" {
 		hashedPwd, hashErr := HashPassword(user.Password)
@@ -820,6 +821,7 @@ type AddUserReq struct {
 	Phone    string
 	Email    string
 	Password string
+	Robot    int    // 机器人 0.否 1.是
 }
 
 type UserUpdateReq struct {
