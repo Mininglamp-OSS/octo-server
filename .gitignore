@@ -43,3 +43,5 @@ docker/tsdd/.env
 *.swpTangSengDaoDaoServer
 tsdd
 CLAUDE.md
+tsdd-static
+tsdd
