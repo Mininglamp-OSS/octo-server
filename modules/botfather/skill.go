@@ -41,7 +41,7 @@ func deriveWSURL(cfg *config.Config) string {
 func generateSkillMD(apiURL, wsURL string) string {
 	return fmt.Sprintf(`---
 name: dmwork
-version: 0.2.14
+version: 0.2.16
 description: DMWork Bot - AI Agent messaging via WuKongIM
 metadata: {"dmwork":{"category":"messaging","api_base":"%s"}}
 ---
@@ -254,7 +254,7 @@ if message.channel_id is present          → Group → reply to (channel_id, ch
 
 ### Group Conversations
 
-- You **only receive** group messages when **@mentioned exactly once**.
+- In groups, you receive all messages but only **respond** when **@mentioned**.
 - **Always reply** when mentioned — someone specifically asked for you.
 - Keep group replies **short and focused**.
 - **Never send unsolicited messages** to groups.
@@ -389,6 +389,22 @@ In groups, the adapter receives **all messages** via WebSocket.
 - Messages WITH @mention: bot replies, with recent group chat history prepended to your prompt
 
 This means you can always reference what was said before when someone @mentions you.
+
+### Rule 2: Reply @mention
+
+When you reply to a group message, the adapter automatically @mentions the person who talked to you. Their client will receive a notification.
+
+### Rule 3: Quoted message support
+
+If a user quotes/replies to a message and @mentions you, you will see the quoted content:
+
+` + "```" + `
+[Quoted message from user_abc]: original message content
+---
+@bot What does this mean?
+` + "```" + `
+
+This lets you understand context when someone asks about a specific message.
 
 **To reply to every message:** set requireMention to false in your dmwork channel config (channels.dmwork.requireMention = false). This costs more tokens but lets the AI decide when to reply.
 
