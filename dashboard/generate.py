@@ -102,8 +102,8 @@ def get_metrics():
     r = query("SELECT HOUR(created_at), COUNT(*) FROM message WHERE created_at >= CURDATE() GROUP BY HOUR(created_at) ORDER BY HOUR(created_at)")
     data['hourly_msgs'] = [{'hour': int(row[0]), 'count': int(row[1])} for row in r] if r else []
     
-    # Bot列表及消息数 + 归属者邮箱
-    r = query("SELECT r.username, r.robot_id, (SELECT COUNT(*) FROM message m WHERE m.from_uid=r.robot_id AND m.created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)) as week_msgs, IFNULL((SELECT u.email FROM user u WHERE u.uid=r.creator_uid), '') as owner_email, IFNULL((SELECT u.name FROM user u WHERE u.uid=r.creator_uid), '') as owner_name FROM robot r ORDER BY week_msgs DESC LIMIT 15")
+    # Bot列表及消息数 + 归属者邮箱（排除系统Bot和E2E测试Bot）
+    r = query("SELECT r.username, r.robot_id, (SELECT COUNT(*) FROM message m WHERE m.from_uid=r.robot_id AND m.created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)) as week_msgs, IFNULL((SELECT u.email FROM user u WHERE u.uid=r.creator_uid), '') as owner_email, IFNULL((SELECT u.name FROM user u WHERE u.uid=r.creator_uid), '') as owner_name FROM robot r WHERE r.username != 'botfather' AND r.username != '' AND r.creator_uid != '' AND r.creator_uid IN (SELECT uid FROM user) ORDER BY week_msgs DESC LIMIT 20")
     data['top_bots'] = [{'name': row[0], 'id': row[1], 'week_msgs': int(row[2]), 'owner_email': row[3], 'owner_name': row[4]} for row in r] if r else []
     
     data['updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
