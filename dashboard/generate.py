@@ -79,19 +79,7 @@ def get_metrics():
     data['dau_trend'] = [{'date': row[0], 'count': int(row[1])} for row in r] if r else []
     
     # 群组详情
-    r = query("""
-        SELECT 
-          g.name,
-          (SELECT COUNT(*) FROM group_member gm WHERE gm.group_no=g.group_no AND gm.is_deleted=0) as total,
-          (SELECT COUNT(*) FROM group_member gm WHERE gm.group_no=g.group_no AND gm.is_deleted=0 AND gm.robot=0) as humans,
-          (SELECT COUNT(*) FROM group_member gm WHERE gm.group_no=g.group_no AND gm.is_deleted=0 AND gm.robot=1) as bots,
-          (SELECT COUNT(*) FROM message m WHERE m.channel_id=g.group_no AND m.channel_type=2) as total_msgs,
-          (SELECT COUNT(*) FROM message m WHERE m.channel_id=g.group_no AND m.channel_type=2 AND m.created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)) as week_msgs,
-          (SELECT COUNT(*) FROM message m WHERE m.channel_id=g.group_no AND m.channel_type=2 AND m.created_at >= CURDATE()) as today_msgs,
-          DATE(g.created_at) as created
-        FROM `group` g
-        ORDER BY week_msgs DESC
-    """)
+    r = query("SELECT g.name, (SELECT COUNT(*) FROM group_member gm WHERE gm.group_no=g.group_no AND gm.is_deleted=0) as total, (SELECT COUNT(*) FROM group_member gm WHERE gm.group_no=g.group_no AND gm.is_deleted=0 AND gm.robot=0) as humans, (SELECT COUNT(*) FROM group_member gm WHERE gm.group_no=g.group_no AND gm.is_deleted=0 AND gm.robot=1) as bots, (SELECT COUNT(*) FROM message m WHERE m.channel_id=g.group_no AND m.channel_type=2) as total_msgs, (SELECT COUNT(*) FROM message m WHERE m.channel_id=g.group_no AND m.channel_type=2 AND m.created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)) as week_msgs, (SELECT COUNT(*) FROM message m WHERE m.channel_id=g.group_no AND m.channel_type=2 AND m.created_at >= CURDATE()) as today_msgs, DATE(g.created_at) as created FROM \\`group\\` g ORDER BY week_msgs DESC")
     data['groups'] = []
     if r:
         for row in r:
@@ -110,13 +98,9 @@ def get_metrics():
     r = query("SELECT HOUR(created_at), COUNT(*) FROM message WHERE created_at >= CURDATE() GROUP BY HOUR(created_at) ORDER BY HOUR(created_at)")
     data['hourly_msgs'] = [{'hour': int(row[0]), 'count': int(row[1])} for row in r] if r else []
     
-    # Bot列表及消息数
-    r = query("""
-        SELECT r.username, r.robot_id,
-          (SELECT COUNT(*) FROM message m WHERE m.from_uid=r.robot_id AND m.created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)) as week_msgs
-        FROM robot r ORDER BY week_msgs DESC LIMIT 10
-    """)
-    data['top_bots'] = [{'name': row[0], 'id': row[1], 'week_msgs': int(row[2])} for row in r] if r else []
+    # Bot列表及消息数 + 归属者邮箱
+    r = query("SELECT r.username, r.robot_id, (SELECT COUNT(*) FROM message m WHERE m.from_uid=r.robot_id AND m.created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)) as week_msgs, IFNULL((SELECT u.email FROM user u WHERE u.uid=r.creator_uid), '') as owner_email, IFNULL((SELECT u.name FROM user u WHERE u.uid=r.creator_uid), '') as owner_name FROM robot r ORDER BY week_msgs DESC LIMIT 15")
+    data['top_bots'] = [{'name': row[0], 'id': row[1], 'week_msgs': int(row[2]), 'owner_email': row[3], 'owner_name': row[4]} for row in r] if r else []
     
     data['updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     return data
@@ -155,10 +139,10 @@ def generate_html(data):
     # Bot table rows
     bot_rows = ""
     for b in data['top_bots']:
-        if b['week_msgs'] > 0:
-            bot_rows += f"<tr><td>{b['name']}</td><td><code>{b['id'][:12]}...</code></td><td>{b['week_msgs']}</td></tr>"
+        owner = b.get('owner_email') or b.get('owner_name') or '-'
+        bot_rows += f"<tr><td>{b['name']}</td><td>{owner}</td><td>{b['week_msgs']}</td></tr>"
     if not bot_rows:
-        bot_rows = "<tr><td colspan='3' style='text-align:center;color:#666;'>暂无活跃 Bot</td></tr>"
+        bot_rows = "<tr><td colspan='3' style='text-align:center;color:#666;'>暂无 Bot</td></tr>"
 
     # Compute derived metrics
     avg_friends = round(data['total_friends'] * 2 / max(data['total_users'], 1), 1)
@@ -266,9 +250,9 @@ def generate_html(data):
     <canvas id="hourlyChart"></canvas>
   </div>
   <div class="chart-box">
-    <h3>🤖 活跃 Bot TOP 10（7日）</h3>
+    <h3>🤖 Bot 列表（7日消息）</h3>
     <table>
-      <thead><tr><th>Bot 名称</th><th>ID</th><th>7日消息</th></tr></thead>
+      <thead><tr><th>Bot 名称</th><th>归属者</th><th>7日消息</th></tr></thead>
       <tbody>{bot_rows}</tbody>
     </table>
   </div>
