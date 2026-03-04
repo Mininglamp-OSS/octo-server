@@ -1,5 +1,26 @@
 # Changelog
 
+## [v1.1.1] - 2026-03-04
+
+### 新功能
+- 搜索用户支持邮箱查找 — 输入完整邮箱可搜索添加好友
+- Android 文本文件内置预览 — yaml/json/md/conf/代码文件点击后直接预览（等宽字体，可复制）
+- Android 未知格式文件自动保存到下载目录（不再报错"格式不正确"）
+
+### 修复
+- Android 忘记密码验证码无效 — `emailSendCode` 未传 `code_type` 参数，默认 0（注册）但验证用 2（忘记密码），Redis key 不匹配
+- Android 文件消息显示"未知消息" — `WKFileContent` 未注册到 WuKongIM SDK 消息管理器和视图提供器
+
+### 改进
+- Android App Logo 更新为网页版 Logo
+- APK 下载地址统一到主域名 `https://api-test.example.com/download/dmwork.apk`
+
+### 文档
+- 添加团队协作流程规范 `docs/workflow.md`
+
+### 团队
+- 组织成员邀请：`lml2468`（dev/研发）、`yeejiaa`（product/产品）
+
 ## [v1.1] - 2026-03-04
 ### Security
 - Bot token 吊销时正确撤销 IM token（cleanupBotConnection）
