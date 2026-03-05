@@ -142,19 +142,16 @@ func (f *Friend) apply(c *wkhttp.Context) {
 			c.ResponseError(errors.New("申请者不存在"))
 			return
 		}
+		userMap := make(map[string]string, len(users))
+		for _, user := range users {
+			userMap[user.UID] = user.Name
+		}
 		for _, apply := range applys {
-			name := ""
-			for _, user := range users {
-				if user.UID == apply.ToUID {
-					name = user.Name
-					break
-				}
-			}
 			list = append(list, &friendApplyResp{
 				Id:        apply.Id,
 				UID:       apply.UID,
 				ToUID:     apply.ToUID,
-				ToName:    name,
+				ToName:    userMap[apply.ToUID],
 				Remark:    apply.Remark,
 				Status:    apply.Status,
 				Token:     apply.Token,
