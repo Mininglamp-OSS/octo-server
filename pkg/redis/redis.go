@@ -163,9 +163,13 @@ func (rc *Conn) Hmget(key string, field ...string) ([]string, error) {
 		return nil, err
 	}
 	if results != nil {
-		resultStrings := make([]string, 0)
+		resultStrings := make([]string, 0, len(results))
 		for _, result := range results {
-			resultStrings = append(resultStrings, result.(string))
+			if result == nil {
+				resultStrings = append(resultStrings, "")
+			} else {
+				resultStrings = append(resultStrings, result.(string))
+			}
 		}
 		return resultStrings, nil
 	}
