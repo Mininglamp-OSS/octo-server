@@ -24,6 +24,9 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 // Webhook Webhook
@@ -115,8 +118,34 @@ func (w *Webhook) Route(r *wkhttp.WKHttp) {
 
 }
 
+// grpcAuthInterceptor 返回一个 gRPC 一元拦截器，验证请求 metadata 中的 auth_token
+func grpcAuthInterceptor(expectedToken string) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+		md, ok := metadata.FromIncomingContext(ctx)
+		if !ok {
+			return nil, status.Error(codes.Unauthenticated, "missing metadata")
+		}
+		tokens := md.Get("auth_token")
+		if len(tokens) == 0 || tokens[0] != expectedToken {
+			return nil, status.Error(codes.Unauthenticated, "invalid or missing auth_token")
+		}
+		return handler(ctx, req)
+	}
+}
+
 func (w *Webhook) Start() error {
-	w.grpcServer = grpc.NewServer()
+	var opts []grpc.ServerOption
+
+	// 配置 gRPC 认证拦截器（通过环境变量 TS_GRPC_AUTH_TOKEN 启用）
+	grpcAuthToken := os.Getenv("TS_GRPC_AUTH_TOKEN")
+	if grpcAuthToken != "" {
+		opts = append(opts, grpc.UnaryInterceptor(grpcAuthInterceptor(grpcAuthToken)))
+		w.Info("gRPC server auth enabled")
+	} else {
+		w.Warn("gRPC server auth not configured, set TS_GRPC_AUTH_TOKEN to enable authentication")
+	}
+
+	w.grpcServer = grpc.NewServer(opts...)
 
 	lis, err := net.Listen("tcp", w.ctx.GetConfig().GRPCAddr)
 	if err != nil {
