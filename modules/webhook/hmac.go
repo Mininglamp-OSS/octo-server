@@ -6,7 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"io/ioutil"
+	"io"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"go.uber.org/zap"
@@ -32,14 +32,14 @@ func (w *Webhook) verifyRequestSignature(c *wkhttp.Context) bool {
 		return true
 	}
 
-	body, err := ioutil.ReadAll(c.Request.Body)
+	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		w.Error("读取请求体失败", zap.Error(err))
 		c.ResponseError(fmt.Errorf("读取请求体失败"))
 		return false
 	}
 	// 重置 body 供后续 handler 读取
-	c.Request.Body = ioutil.NopCloser(bytes.NewReader(body))
+	c.Request.Body = io.NopCloser(bytes.NewReader(body))
 
 	signature := c.GetHeader("X-Signature-256")
 	if signature == "" {

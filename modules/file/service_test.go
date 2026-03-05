@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"image/png"
 	"io"
-	"io/ioutil"
 	"os"
 	"testing"
 
@@ -55,7 +54,7 @@ func TestMakeCompose(t *testing.T) {
 func TestUploadPCFile(t *testing.T) {
 	file, err := os.Open("../../assets/assets/TangSengDaoDao-mac-1.0.5-arm64.zip")
 	assert.NoError(t, err)
-	bytes, err := ioutil.ReadAll(file)
+	bytes, err := io.ReadAll(file)
 	assert.NoError(t, err)
 	hash := sha512.Sum512(bytes)
 	// hash := sha512.New().Sum(bytes[:1024*1024])

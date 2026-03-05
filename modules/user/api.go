@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"net/http"
 	"os"
@@ -340,7 +339,7 @@ func (u *User) UserAvatar(c *wkhttp.Context) {
 	}
 	if uid == u.ctx.GetConfig().Account.SystemUID {
 		c.Header("Content-Type", "image/jpeg")
-		avatarBytes, err := ioutil.ReadFile("assets/assets/u_10000.png")
+		avatarBytes, err := os.ReadFile("assets/assets/u_10000.png")
 		if err != nil {
 			u.Error("系统用户头像读取失败！", zap.Error(err))
 			c.Writer.WriteHeader(http.StatusNotFound)
@@ -351,7 +350,7 @@ func (u *User) UserAvatar(c *wkhttp.Context) {
 	}
 	if uid == u.ctx.GetConfig().Account.FileHelperUID {
 		c.Header("Content-Type", "image/jpeg")
-		avatarBytes, err := ioutil.ReadFile("assets/assets/fileHelper.jpeg")
+		avatarBytes, err := os.ReadFile("assets/assets/fileHelper.jpeg")
 		if err != nil {
 			u.Error("文件传输助手头像读取失败！", zap.Error(err))
 			c.Writer.WriteHeader(http.StatusNotFound)

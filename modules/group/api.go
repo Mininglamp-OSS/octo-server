@@ -1,10 +1,10 @@
 package group
 
 import (
+	"os"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"strconv"
 	"strings"
@@ -234,7 +234,7 @@ func (g *Group) avatarGet(c *wkhttp.Context) {
 	//是否为系统群
 	if groupNo == g.ctx.GetConfig().Account.SystemGroupID {
 		c.Header("Content-Type", "image/jpeg")
-		avatarBytes, err := ioutil.ReadFile("assets/assets/g_avatar.jpeg")
+		avatarBytes, err := os.ReadFile("assets/assets/g_avatar.jpeg")
 		if err != nil {
 			g.Error("头像读取失败！", zap.Error(err))
 			c.Writer.WriteHeader(http.StatusNotFound)
@@ -246,7 +246,7 @@ func (g *Group) avatarGet(c *wkhttp.Context) {
 	// 组织群
 	if strings.HasPrefix(groupNo, "org_") {
 		c.Header("Content-Type", "image/jpeg")
-		avatarBytes, err := ioutil.ReadFile("assets/assets/org_avatar.png")
+		avatarBytes, err := os.ReadFile("assets/assets/org_avatar.png")
 		if err != nil {
 			g.Error("头像读取失败！", zap.Error(err))
 			c.Writer.WriteHeader(http.StatusNotFound)
@@ -258,7 +258,7 @@ func (g *Group) avatarGet(c *wkhttp.Context) {
 	// 部门群
 	if strings.HasPrefix(groupNo, "dept_") {
 		c.Header("Content-Type", "image/jpeg")
-		avatarBytes, err := ioutil.ReadFile("assets/assets/dept_avatar.png")
+		avatarBytes, err := os.ReadFile("assets/assets/dept_avatar.png")
 		if err != nil {
 			g.Error("头像读取失败！", zap.Error(err))
 			c.Writer.WriteHeader(http.StatusNotFound)

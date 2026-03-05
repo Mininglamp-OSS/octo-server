@@ -11,7 +11,7 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 )
@@ -88,7 +88,7 @@ func (u *SmsbaoProvider) SendSMS(ctx context.Context, zone, phone string, code s
 	defer resp.Body.Close()
 
 	// 读取响应
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		fmt.Println("读取响应失败:", err)
 		return err

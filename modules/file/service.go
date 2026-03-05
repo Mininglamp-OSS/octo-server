@@ -11,7 +11,6 @@ import (
 	"image/png"
 	_ "image/png"
 	"io"
-	"io/ioutil"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -454,7 +453,7 @@ func uploadFile(uploadURL, fileName string, copyFileWriter func(io.Writer) error
 		return nil, errors.New("文件上传返回状态有误！")
 	}
 	defer resp.Body.Close()
-	respData, err := ioutil.ReadAll(resp.Body)
+	respData, err := io.ReadAll(resp.Body)
 	if err != nil {
 		limlog.Error("读取上传返回的数据失败！", zap.Error(err))
 		return nil, err

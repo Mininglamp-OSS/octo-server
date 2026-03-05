@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"os"
 	"strconv"
@@ -361,7 +361,7 @@ func (w *Webhook) handleMsgOffline(data []byte) error {
 				return err
 			}
 			defer gReader.Close()
-			compresssToUIDBytes, err := ioutil.ReadAll(gReader)
+			compresssToUIDBytes, err := io.ReadAll(gReader)
 			if err != nil {
 				w.Error("读取gzip压缩数据失败！", zap.Error(err))
 				return err

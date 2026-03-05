@@ -8,7 +8,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -109,7 +109,7 @@ func (cn *Common) getKeepAliveVideo(c *wkhttp.Context) {
 	}
 	c.Header("Content-Type", "video/mp4")
 	videoPath := fmt.Sprintf("assets/resources/keepalive/%s", videoName)
-	videoBytes, err := ioutil.ReadFile(videoPath)
+	videoBytes, err := os.ReadFile(videoPath)
 	if err != nil {
 		cn.Error("视频不存在", zap.Error(err))
 		c.Writer.WriteHeader(http.StatusNotFound)

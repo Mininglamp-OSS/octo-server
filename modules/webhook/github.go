@@ -2,7 +2,7 @@ package webhook
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 )
@@ -10,6 +10,6 @@ import (
 func (w *Webhook) github(c *wkhttp.Context) {
 	fmt.Println("github webhook-->", c.Params)
 
-	result, _ := ioutil.ReadAll(c.Request.Body)
+	result, _ := io.ReadAll(c.Request.Body)
 	fmt.Println("github-result-->", result)
 }

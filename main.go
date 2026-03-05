@@ -3,7 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"runtime"
 	"strings"
@@ -184,6 +184,6 @@ func ingorePaths() []string {
 func replaceWebConfig(cfg *config.Config) {
 	path := "./assets/web/js/config.js"
 	newConfigContent := fmt.Sprintf(`const apiURL = "%s/"`, cfg.External.APIBaseURL)
-	ioutil.WriteFile(path, []byte(newConfigContent), 0)
+	os.WriteFile(path, []byte(newConfigContent), 0)
 
 }
