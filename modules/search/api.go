@@ -307,7 +307,10 @@ func (s *Search) global(c *wkhttp.Context) {
 				if len(payloadMap) > 0 {
 					visibles := payloadMap["visibles"]
 					if visibles != nil {
-						visiblesArray := visibles.([]interface{})
+						visiblesArray, ok := visibles.([]interface{})
+						if !ok {
+							visiblesArray = nil
+						}
 						if len(visiblesArray) > 0 {
 							isDeleted = 1
 							for _, limitUID := range visiblesArray {
@@ -350,6 +353,7 @@ func (s *Search) global(c *wkhttp.Context) {
 							ChannelRemark: user.Remark,
 							ChannelName:   user.Name,
 						}
+						break
 					}
 				}
 			}
