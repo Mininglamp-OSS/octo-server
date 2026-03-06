@@ -113,15 +113,18 @@ func (r *Report) categoies(c *wkhttp.Context) {
 	rootCategories := r.findRootCategories(en, categoryModels)
 	if len(rootCategories) > 0 {
 		for _, rootCategory := range rootCategories {
-			r.fillParentCategory(en, rootCategory, categoryModels)
+			r.fillParentCategory(en, rootCategory, categoryModels, 0)
 		}
 	}
 	c.Response(rootCategories)
 }
 
 // 填充父类
-func (r *Report) fillParentCategory(en bool, parent *categoryResp, categories []*categoryModel) {
+func (r *Report) fillParentCategory(en bool, parent *categoryResp, categories []*categoryModel, depth int) {
 	if len(categories) == 0 {
+		return
+	}
+	if depth > 100 {
 		return
 	}
 	for _, category := range categories {
@@ -131,7 +134,7 @@ func (r *Report) fillParentCategory(en bool, parent *categoryResp, categories []
 			}
 			categoryNode := newCategoryResp(en, category)
 			parent.Children = append(parent.Children, categoryNode)
-			r.fillParentCategory(en, categoryNode, categories)
+			r.fillParentCategory(en, categoryNode, categories, depth+1)
 		}
 	}
 }
