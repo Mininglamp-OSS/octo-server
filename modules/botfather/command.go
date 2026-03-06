@@ -807,6 +807,7 @@ Install adapter: openclaw plugins install openclaw-channel-dmwork
 Configure in ~/.openclaw/openclaw.json:
 {"channels":{"dmwork":{"botToken":"YOUR_TOKEN","apiUrl":"API_SERVER"}}}
 Replace YOUR_TOKEN and API_SERVER with the values above.
+For multi-bot on one instance, also add: {"session":{"dmScope":"per-account-channel-peer"}}
 IMPORTANT: Do NOT run "openclaw gateway restart" — the gateway auto-detects config changes and reloads after this conversation ends.
 Simply confirm the steps are complete and stop.
 ---
@@ -839,6 +840,7 @@ Install adapter: openclaw plugins install openclaw-channel-dmwork
 Configure in ~/.openclaw/openclaw.json:
 {"channels":{"dmwork":{"botToken":"YOUR_TOKEN","apiUrl":"API_SERVER"}}}
 Replace YOUR_TOKEN and API_SERVER with the values above.
+For multi-bot on one instance, also add: {"session":{"dmScope":"per-account-channel-peer"}}
 IMPORTANT: Do NOT run "openclaw gateway restart" — the gateway auto-detects config changes and reloads after this conversation ends.
 Simply confirm the steps are complete and stop.
 ---

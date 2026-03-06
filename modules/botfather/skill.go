@@ -41,7 +41,7 @@ func deriveWSURL(cfg *config.Config) string {
 func generateSkillMD(apiURL, wsURL string) string {
 	return fmt.Sprintf(`---
 name: dmwork
-version: 0.2.28
+version: 0.2.30
 description: DMWork Bot - AI Agent messaging via WuKongIM
 metadata: {"dmwork":{"category":"messaging","api_base":"%s"}}
 ---
@@ -152,7 +152,28 @@ channels:
         systemPrompt: "You are a general-purpose assistant."
 `+"```"+`
 
-v0.2.28+ supports full multi-bot isolation: each bot maintains an independent WebSocket connection with no message cross-processing between bots.
+v0.2.30+ supports full multi-bot isolation: each bot maintains an independent WebSocket connection with no message cross-processing between bots.
+
+#### ⚠️ Important: Session Isolation
+
+By default, dmScope is "main" — all DMs share one session regardless of which bot receives them. For multi-bot setups, you **MUST** add session.dmScope config so each bot gets its own isolated conversation context.
+
+`+"```"+`json
+{
+  "session": {
+    "dmScope": "per-account-channel-peer"
+  }
+}
+`+"```"+`
+
+Or in YAML:
+
+`+"```"+`yaml
+session:
+  dmScope: per-account-channel-peer
+`+"```"+`
+
+This makes the session key: `+"`"+`agent:{agentId}:{channel}:{accountId}:direct:{peerId}`+"`"+`, ensuring each bot gets isolated conversation context.
 
 The gateway auto-detects config changes and reloads the plugin.
 If the gateway was started before plugin install, restart it after your current conversation ends.
@@ -567,10 +588,10 @@ Save detailed explanations for DM conversations.
 | Bot shows "offline" | Heartbeat stopped | Send POST /v1/bot/heartbeat every 30s |
 | No messages received | WS not connected | Check wsUrl and bot token; adapter auto-reconnects |
 | WS connection drops | Network issue | SDK auto-reconnects; verify wsUrl |
-| Duplicate replies | Multiple bot instances or pre-v0.2.28 plugin | Upgrade to openclaw-channel-dmwork >= 0.2.28 (independent WebSocket per bot). Ensure only one instance per bot_token. |
+| Duplicate replies | Multiple bot instances or pre-v0.2.30 plugin | Upgrade to openclaw-channel-dmwork >= 0.2.30 (independent WebSocket per bot). Ensure only one instance per bot_token. |
 | 401 on API calls | Token expired/invalid | Re-register with POST /v1/bot/register |
 | Slow AI responses | High concurrency | Implement response queue, consider caching |
-| Bot-to-bot message loop | Bots replying to each other | v0.2.28+ auto-filters known bot UIDs. Ensure all bots run on same OpenClaw instance. |
+| Bot-to-bot message loop | Bots replying to each other | v0.2.30+ auto-filters known bot UIDs. Ensure all bots run on same OpenClaw instance. |
 | Messages out of order | Async processing | Use message_seq for ordering |
 
 ## Rate Limiting (Recommended)
