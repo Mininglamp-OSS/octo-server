@@ -197,6 +197,18 @@ func (ch *Channel) state(c *wkhttp.Context) {
 	var onlineCount int = 0
 	if channelType != common.ChannelTypePerson.Uint8() {
 
+		// 验证当前用户是否是群组成员
+		isMember, err := ch.groupService.ExistMember(channelID, loginUID)
+		if err != nil {
+			c.ResponseError(errors.New("查询群成员信息错误"))
+			ch.Error("查询群成员信息错误", zap.Error(err))
+			return
+		}
+		if !isMember {
+			c.ResponseError(errors.New("非群成员无法查询群状态"))
+			return
+		}
+
 		members, err := ch.groupService.GetMembers(channelID)
 		if err != nil {
 			c.ResponseError(errors.New("查询群成员错误"))
