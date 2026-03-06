@@ -68,6 +68,9 @@ func GetSoruce(code string) string {
 		return ""
 	}
 	strs := strings.Split(code, "@")
+	if len(strs) < 2 {
+		return ""
+	}
 	codeTypeStr, _ := strconv.Atoi(strs[1])
 	codeType := common.VercodeType(codeTypeStr)
 	if codeType != common.Friend && codeType != common.QRCode && codeType != common.User && codeType != common.GroupMember && codeType != common.MailList && codeType != common.InvitationCode {
@@ -196,6 +199,9 @@ func CheckRequestAddFriendCode(code string, requestUID string) error {
 		return err
 	}
 	strs := strings.Split(code, "@")
+	if len(strs) < 2 {
+		return errors.New("invalid code format")
+	}
 	codeTypeStr, _ := strconv.Atoi(strs[1])
 	codeType := common.VercodeType(codeTypeStr)
 	//验证群是否开启禁止加好友
@@ -230,6 +236,9 @@ func CheckRequestAddFriendCode(code string, requestUID string) error {
 // CheckSource 验证加好友来源
 func CheckSource(code string) error {
 	strs := strings.Split(code, "@")
+	if len(strs) < 2 {
+		return errors.New("invalid code format")
+	}
 	codeTypeStr, _ := strconv.Atoi(strs[1])
 	codeType := common.VercodeType(codeTypeStr)
 	if codeType != common.Friend && codeType != common.QRCode && codeType != common.User && codeType != common.GroupMember && codeType != common.MailList && codeType != common.InvitationCode {
