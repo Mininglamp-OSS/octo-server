@@ -1674,10 +1674,15 @@ func (u *User) removeQRCodeChan(uuid string) {
 // SendQRCodeInfo 发送二维码数据
 func SendQRCodeInfo(uuid string, qrcode *common.QRCodeModel) {
 	qrcodeChanLock.Lock()
+	defer qrcodeChanLock.Unlock()
+
 	qrcodeChan := qrcodeChanMap[uuid]
-	qrcodeChanLock.Unlock()
 	if qrcodeChan != nil {
-		qrcodeChan <- qrcode
+		select {
+		case qrcodeChan <- qrcode:
+		default:
+			// channel 已满或无接收者
+		}
 	}
 }
 

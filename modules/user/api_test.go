@@ -9,9 +9,11 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/stretchr/testify/assert"
@@ -922,4 +924,85 @@ func TestAddBotFatherFriend_Bidirectional(t *testing.T) {
 	isFriend2, err := u.friendDB.IsFriend(botFatherUID, testUID)
 	assert.NoError(t, err)
 	assert.True(t, isFriend2, "BotFather应该是用户的好友")
+}
+
+// TestSendQRCodeInfo_ConcurrentSendAndRemove 测试 QRCode 发送与删除的并发安全性
+// 此测试不依赖数据库，直接操作全局 qrcodeChanMap
+func TestSendQRCodeInfo_ConcurrentSendAndRemove(t *testing.T) {
+	// 测试多轮并发操作，确保没有竞态条件
+	for round := 0; round < 100; round++ {
+		uuid := fmt.Sprintf("test-uuid-%d", round)
+
+		// 手动创建 channel 并注册到全局 map
+		qrcodeChan := make(chan *common.QRCodeModel)
+		qrcodeChanLock.Lock()
+		qrcodeChanMap[uuid] = qrcodeChan
+		qrcodeChanLock.Unlock()
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		// Goroutine 1: 发送 QRCode 数据
+		go func() {
+			defer wg.Done()
+			qrcodeInfo := common.NewQRCodeModel(common.QRCodeTypeScanLogin, map[string]interface{}{
+				"status": 1,
+			})
+			SendQRCodeInfo(uuid, qrcodeInfo)
+		}()
+
+		// Goroutine 2: 移除 channel
+		go func() {
+			defer wg.Done()
+			qrcodeChanLock.Lock()
+			defer qrcodeChanLock.Unlock()
+			delete(qrcodeChanMap, uuid)
+		}()
+
+		// 等待两个 goroutine 完成
+		wg.Wait()
+
+		// 尝试从 channel 接收（非阻塞），验证不会 panic
+		select {
+		case <-qrcodeChan:
+			// 收到数据，正常
+		default:
+			// 没有数据（channel 可能已被移除或发送被跳过），也是正常的
+		}
+	}
+}
+
+// TestSendQRCodeInfo_NoReceiverDoesNotBlock 测试无接收者时发送不会阻塞
+// 此测试不依赖数据库，直接操作全局 qrcodeChanMap
+func TestSendQRCodeInfo_NoReceiverDoesNotBlock(t *testing.T) {
+	uuid := "test-no-receiver"
+
+	// 手动创建 channel 并注册到全局 map
+	qrcodeChan := make(chan *common.QRCodeModel)
+	qrcodeChanLock.Lock()
+	qrcodeChanMap[uuid] = qrcodeChan
+	qrcodeChanLock.Unlock()
+
+	// 不启动接收者，直接发送
+	done := make(chan bool)
+	go func() {
+		qrcodeInfo := common.NewQRCodeModel(common.QRCodeTypeScanLogin, map[string]interface{}{
+			"status": 1,
+		})
+		SendQRCodeInfo(uuid, qrcodeInfo)
+		done <- true
+	}()
+
+	// 验证发送不会阻塞（1秒内完成）
+	select {
+	case <-done:
+		// 正常完成
+	case <-time.After(1 * time.Second):
+		t.Fatal("SendQRCodeInfo 阻塞超时，应使用非阻塞发送")
+	}
+
+	// 清理
+	qrcodeChanLock.Lock()
+	delete(qrcodeChanMap, uuid)
+	qrcodeChanLock.Unlock()
 }
