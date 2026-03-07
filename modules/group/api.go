@@ -1685,22 +1685,38 @@ func (g *Group) groupScanJoin(c *wkhttp.Context) {
 		c.ResponseError(errors.New("解码认证信息的JSON数据失败！"))
 		return
 	}
-	authType := authMap["type"].(string)
+	authType, ok := authMap["type"].(string)
+	if !ok {
+		c.ResponseError(errors.New("无效的授权数据"))
+		return
+	}
 	if authType != string(common.AuthCodeTypeJoinGroup) {
 		c.ResponseError(errors.New("授权码不是入群授权码！"))
 		return
 	}
-	authGroupNo := authMap["group_no"].(string)
+	authGroupNo, ok := authMap["group_no"].(string)
+	if !ok {
+		c.ResponseError(errors.New("无效的授权数据"))
+		return
+	}
 	if authGroupNo != groupNo {
 		c.ResponseError(errors.New("此授权码非此群的！"))
 		return
 	}
-	generator := authMap["generator"].(string)
+	generator, ok := authMap["generator"].(string)
+	if !ok {
+		c.ResponseError(errors.New("无效的授权数据"))
+		return
+	}
 	if strings.TrimSpace(generator) == "" {
 		c.ResponseError(errors.New("没有二维码生成信息！"))
 		return
 	}
-	scaner := authMap["scaner"].(string)
+	scaner, ok := authMap["scaner"].(string)
+	if !ok {
+		c.ResponseError(errors.New("无效的授权数据"))
+		return
+	}
 	if strings.TrimSpace(scaner) == "" {
 		c.ResponseError(errors.New("没有二维码扫码信息！"))
 		return
