@@ -19,6 +19,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
@@ -181,25 +182,41 @@ func (m *Message) sendMsg(c *wkhttp.Context) {
 	}
 
 	if req.ReceiveChannelType == common.ChannelTypePerson.Uint8() {
-		sendUserIsFriend, err := m.userService.IsFriend(uid, req.ReceiveChannelID)
-		if err != nil {
-			m.Error("查询发送者与接受者好友关系错误", zap.Error(err))
-			c.ResponseError(errors.New("查询好友关系错误"))
-			return
-		}
-		if !sendUserIsFriend {
-			c.ResponseError(errors.New("发送者与接受者不是好友"))
-			return
-		}
-		recvUserIsFriend, err := m.userService.IsFriend(req.ReceiveChannelID, uid)
-		if err != nil {
-			m.Error("查询接受者与发送者好友关系错误", zap.Error(err))
-			c.ResponseError(errors.New("查询接受者与发送者好友关系错误"))
-			return
-		}
-		if !recvUserIsFriend {
-			c.ResponseError(errors.New("接受者与发送者不是好友"))
-			return
+		spaceID, peerID := spacepkg.ParseChannelID(req.ReceiveChannelID)
+		if spaceID != "" {
+			// Space 模式：校验双方都是 Space 成员
+			bothOk, err := spacepkg.CheckBothMembers(m.ctx.DB(), spaceID, uid, peerID)
+			if err != nil {
+				m.Error("校验 Space 成员关系错误", zap.Error(err))
+				c.ResponseError(errors.New("校验成员关系错误"))
+				return
+			}
+			if !bothOk {
+				c.ResponseError(errors.New("对方不在该 Space 内"))
+				return
+			}
+		} else {
+			// 个人空间模式（兼容）：检查好友关系
+			sendUserIsFriend, err := m.userService.IsFriend(uid, req.ReceiveChannelID)
+			if err != nil {
+				m.Error("查询发送者与接受者好友关系错误", zap.Error(err))
+				c.ResponseError(errors.New("查询好友关系错误"))
+				return
+			}
+			if !sendUserIsFriend {
+				c.ResponseError(errors.New("发送者与接受者不是好友"))
+				return
+			}
+			recvUserIsFriend, err := m.userService.IsFriend(req.ReceiveChannelID, uid)
+			if err != nil {
+				m.Error("查询接受者与发送者好友关系错误", zap.Error(err))
+				c.ResponseError(errors.New("查询接受者与发送者好友关系错误"))
+				return
+			}
+			if !recvUserIsFriend {
+				c.ResponseError(errors.New("接受者与发送者不是好友"))
+				return
+			}
 		}
 	}
 	if req.ReceiveChannelType == common.ChannelTypeGroup.Uint8() {
