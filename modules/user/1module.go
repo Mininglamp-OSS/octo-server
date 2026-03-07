@@ -200,6 +200,13 @@ func newChannelRespWithUserDetailResp(user *UserDetailResp) *model.ChannelResp {
 	if user.BotCommands != "" {
 		extraMap["bot_commands"] = user.BotCommands
 	}
+	if user.BotDescription != "" {
+		extraMap["bot_description"] = user.BotDescription
+	}
+	if user.BotCreatorUID != "" {
+		extraMap["bot_creator_uid"] = user.BotCreatorUID
+		extraMap["bot_creator_name"] = user.BotCreatorName
+	}
 	resp.Extra = extraMap
 
 	return resp

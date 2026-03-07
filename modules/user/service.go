@@ -224,16 +224,32 @@ func (s *Service) GetUserDetail(uid string, loginUID string) (*UserDetailResp, e
 	}
 	resp := NewUserDetailResp(model, remark, loginUID, sourceFrom, online, lastOffline, deviceFlag, follow, blacklist, beDeleted, beBlacklist, userSetting, vercode)
 
-	// 为机器人用户填充bot_commands
+	// 为机器人用户填充bot_commands + 详情
 	if model.Robot == 1 {
-		var botCmdResults []struct {
+		var botDetails []struct {
 			BotCommands string `db:"bot_commands"`
+			Description string `db:"description"`
+			CreatorUID  string `db:"creator_uid"`
 		}
-		_, err = s.ctx.DB().Select("IFNULL(bot_commands,'') as bot_commands").From("robot").Where("robot_id = ? and status=1", uid).Load(&botCmdResults)
+		_, err = s.ctx.DB().SelectBySql(
+			"SELECT IFNULL(bot_commands,'') as bot_commands, IFNULL(description,'') as description, IFNULL(creator_uid,'') as creator_uid FROM robot WHERE robot_id = ? AND status=1", uid,
+		).Load(&botDetails)
 		if err != nil {
-			s.Error("查询机器人命令失败", zap.Error(err))
-		} else if len(botCmdResults) > 0 && botCmdResults[0].BotCommands != "" {
-			resp.BotCommands = botCmdResults[0].BotCommands
+			s.Error("查询机器人详情失败", zap.Error(err))
+		} else if len(botDetails) > 0 {
+			if botDetails[0].BotCommands != "" {
+				resp.BotCommands = botDetails[0].BotCommands
+			}
+			resp.BotDescription = botDetails[0].Description
+			resp.BotCreatorUID = botDetails[0].CreatorUID
+			// 查创建者昵称
+			if botDetails[0].CreatorUID != "" {
+				var creatorName string
+				err2 := s.ctx.DB().Select("IFNULL(name,'')").From("user").Where("uid=?", botDetails[0].CreatorUID).LoadOne(&creatorName)
+				if err2 == nil {
+					resp.BotCreatorName = creatorName
+				}
+			}
 		}
 	}
 
@@ -945,7 +961,10 @@ type UserDetailResp struct {
 	IsUploadAvatar      int               `json:"is_upload_avatar"`       // 是否上传头像
 	Status              int               `json:"status"`                 //用户状态 1 正常 2:黑名单
 	Robot               int               `json:"robot"`                  // 机器人0.否1.是
-	BotCommands         string            `json:"bot_commands,omitempty"` // 机器人命令列表JSON
+	BotCommands         string            `json:"bot_commands,omitempty"`    // 机器人命令列表JSON
+	BotDescription      string            `json:"bot_description,omitempty"` // Bot 简介
+	BotCreatorUID       string            `json:"bot_creator_uid,omitempty"` // Bot 创建者 UID
+	BotCreatorName      string            `json:"bot_creator_name,omitempty"` // Bot 创建者昵称
 	IsDestroy           int               `json:"is_destroy"`             // 是否注销0.否1.是
 	Flame               int               `json:"flame"`                  // 是否开启阅后即焚
 	FlameSecond         int               `json:"flame_second"`           // 阅后即焚秒数
