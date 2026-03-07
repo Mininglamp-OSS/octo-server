@@ -109,6 +109,11 @@ func (m *manager) reorderBanner(c *wkhttp.Context) {
 
 // 编辑分类
 func (m *manager) updateCategory(c *wkhttp.Context) {
+	err := c.CheckLoginRoleIsSuperAdmin()
+	if err != nil {
+		c.ResponseError(err)
+		return
+	}
 	categoryNo := c.Param("category_no")
 	if categoryNo == "" {
 		c.ResponseError(errors.New("分类ID不能为空"))
@@ -145,12 +150,17 @@ func (m *manager) updateCategory(c *wkhttp.Context) {
 
 // 删除分类
 func (m *manager) deleteCategory(c *wkhttp.Context) {
+	err := c.CheckLoginRoleIsSuperAdmin()
+	if err != nil {
+		c.ResponseError(err)
+		return
+	}
 	categoryNo := c.Param("category_no")
 	if categoryNo == "" {
 		c.ResponseError(errors.New("分类ID不能为空"))
 		return
 	}
-	err := m.db.deleteCategory(categoryNo)
+	err = m.db.deleteCategory(categoryNo)
 	if err != nil {
 		m.Error("删除分类错误", zap.Error(err))
 		c.ResponseError(errors.New("删除分类错误"))
