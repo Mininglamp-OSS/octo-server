@@ -417,7 +417,8 @@ type InfoResp struct {
 	AllowViewHistoryMsg int       `json:"allow_view_history_msg"` // 是否允许新成员查看历史记录
 	CreatedAt           string    `json:"created_at"`
 	UpdatedAt           string    `json:"updated_at"`
-	Version             int64     `json:"version"` // 群数据版本
+	Version             int64     `json:"version"`   // 群数据版本
+	SpaceID             string    `json:"space_id"`  // Space ID
 }
 
 func toInfoResp(m *Model) *InfoResp {
@@ -435,6 +436,7 @@ func toInfoResp(m *Model) *InfoResp {
 		CreatedAt:           m.CreatedAt.String(),
 		UpdatedAt:           m.UpdatedAt.String(),
 		Version:             m.Version,
+		SpaceID:             m.SpaceID,
 	}
 }
 
@@ -562,6 +564,24 @@ func (g *GroupResp) from(model *DetailModel) *GroupResp {
 		Receipt:                  model.Receipt,
 		Flame:                    model.Flame,
 		FlameSecond:              model.FlameSecond,
+		Status:                   model.Status,
+		AllowViewHistoryMsg:      model.AllowViewHistoryMsg,
+		AllowMemberPinnedMessage: model.AllowMemberPinnedMessage,
+		CreatedAt:                model.CreatedAt.String(),
+		UpdatedAt:                model.UpdatedAt.String(),
+	}
+}
+
+func (g *GroupResp) fromModel(model *Model) *GroupResp {
+	return &GroupResp{
+		GroupNo:                  model.GroupNo,
+		GroupType:                GroupType(model.GroupType),
+		Category:                 model.Category,
+		Name:                     model.Name,
+		Notice:                   model.Notice,
+		Forbidden:                model.Forbidden,
+		Invite:                   model.Invite,
+		ForbiddenAddFriend:       model.ForbiddenAddFriend,
 		Status:                   model.Status,
 		AllowViewHistoryMsg:      model.AllowViewHistoryMsg,
 		AllowMemberPinnedMessage: model.AllowMemberPinnedMessage,

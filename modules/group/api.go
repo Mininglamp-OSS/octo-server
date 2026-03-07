@@ -446,6 +446,25 @@ func (g *Group) groupDetailGet(c *wkhttp.Context) {
 // list 我保存的群聊
 func (g *Group) list(c *wkhttp.Context) {
 	loginUID := c.MustGet("uid").(string)
+	spaceID := c.Query("space_id")
+
+	if spaceID != "" {
+		// Space 模式：返回该 Space 下用户加入的所有群
+		groups, err := g.db.queryGroupsWithMemberUIDAndSpaceID(loginUID, spaceID)
+		if err != nil {
+			g.Error("查询Space群列表失败", zap.Error(err))
+			c.ResponseError(errors.New("查询Space群列表失败"))
+			return
+		}
+		resps := make([]*GroupResp, 0)
+		for _, model := range groups {
+			groupResp := &GroupResp{}
+			resps = append(resps, groupResp.fromModel(model))
+		}
+		c.Response(resps)
+		return
+	}
+
 	models, err := g.db.querySavedGroups(loginUID)
 	if err != nil {
 		g.Error("查询我保存的群聊失败", zap.Error(err))

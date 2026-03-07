@@ -236,10 +236,15 @@ func (s *Search) global(c *wkhttp.Context) {
 		}
 	}
 
-	// 加入的群
+	// 加入的群（按 Space 过滤）
 	groupResps := make([]*channelResp, 0)
+	searchSpaceID := c.Query("space_id")
 	if req.OnlyMessage == 0 && len(joinedGroups) > 0 {
 		for _, g := range joinedGroups {
+			// Space 过滤：如果指定了 space_id，只显示该 Space 的群
+			if searchSpaceID != "" && g.SpaceID != searchSpaceID {
+				continue
+			}
 			isAdd := false
 			remark := ""
 			if strings.Contains(g.Name, req.Keyword) {
@@ -272,15 +277,14 @@ func (s *Search) global(c *wkhttp.Context) {
 	// 查询联系人（Space 模式：搜索 Space 成员；否则搜索好友）
 	friendResps := make([]*channelResp, 0)
 	if req.OnlyMessage == 0 {
-		spaceID := c.Query("space_id")
-		if spaceID != "" {
+		if searchSpaceID != "" {
 			var members []struct {
 				UID  string `db:"uid"`
 				Name string `db:"name"`
 			}
 			_, err := s.ctx.DB().SelectBySql(
 				"SELECT sm.uid, IFNULL(u.name,'') as name FROM space_member sm LEFT JOIN user u ON sm.uid=u.uid WHERE sm.space_id=? AND sm.status=1 AND (u.name LIKE ? OR sm.uid LIKE ?)",
-				spaceID, "%"+req.Keyword+"%", "%"+req.Keyword+"%",
+				searchSpaceID, "%"+req.Keyword+"%", "%"+req.Keyword+"%",
 			).Load(&members)
 			if err != nil {
 				s.Error("搜索Space成员错误", zap.Error(err))
