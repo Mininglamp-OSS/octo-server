@@ -75,12 +75,20 @@ func StartDispatcher(workerCount int64) Collector {
 func (c Collector) loopPop() {
 	for {
 		jobObj := c.queue.Pop()
+		if jobObj == nil {
+			// Queue is closed, exit loop
+			return
+		}
+		job, ok := jobObj.(*Job)
+		if !ok {
+			// Invalid job type, skip
+			continue
+		}
 		atomic.AddInt64(&c.jobS.Total, 1)
 		worker := <-WorkerChannel // wait for available channel
 		atomic.AddInt64(&c.jobS.Executing, 1)
-		worker <- jobObj.(*Job) // dispatch work to worker
+		worker <- job // dispatch work to worker
 	}
-
 }
 
 func (c Collector) GetStatistics() *JobStatistics {
