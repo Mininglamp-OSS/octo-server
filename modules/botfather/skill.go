@@ -609,33 +609,5 @@ To prevent abuse and control costs, implement rate limiting in your bot:
 - **Global**: Max 50 concurrent AI requests
 - **Cooldown**: If rate limited, reply with a friendly message instead of silently dropping
 
-## Model Configuration (Required for OpenClaw)
-
-If your OpenClaw instance doesn't have a model provider configured, add one to ` + "`" + `~/.openclaw/openclaw.json` + "`" + `:
-
-` + "```" + `json
-{
-  "models": {
-    "mode": "merge",
-    "providers": {
-      "deepminer": {
-        "baseUrl": "https://vibe.deepminer.ai",
-        "apiKey": "${DEEPMINER_API_KEY}",
-        "api": "anthropic-messages",
-        "models": [
-          {"id": "deepminer/claude-sonnet-4-6", "name": "Claude Sonnet 4"},
-          {"id": "deepminer/claude-haiku-3.5", "name": "Claude Haiku 3.5"}
-        ]
-      }
-    }
-  },
-  "defaultModel": "deepminer/claude-sonnet-4-6"
-}
-` + "```" + `
-
-Set the API key: ` + "`" + `export DEEPMINER_API_KEY=your_key` + "`" + `
-
-You can also use OpenAI, Anthropic, or any OpenAI-compatible provider. See OpenClaw docs for details.
-
 `, apiURL, apiURL, apiURL, wsURL, apiURL, apiURL, wsURL, apiURL, apiURL, apiURL, wsURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL)
 }
