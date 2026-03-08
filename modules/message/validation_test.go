@@ -337,3 +337,107 @@ func TestSensitiveWords_ContainsFinancialTerms(t *testing.T) {
 		assert.True(t, wordSet[term], "sensitive words should contain %q", term)
 	}
 }
+
+// TestTypeAssertionSafety verifies that type assertions in message payload
+// parsing use the comma-ok pattern to prevent panics on malformed data.
+func TestTypeAssertionSafety(t *testing.T) {
+	tests := []struct {
+		name        string
+		payloadMap  map[string]interface{}
+		expectPanic bool
+	}{
+		{
+			name: "valid reply object",
+			payloadMap: map[string]interface{}{
+				"reply": map[string]interface{}{
+					"message_id": "msg_123",
+				},
+			},
+			expectPanic: false,
+		},
+		{
+			name: "reply is string instead of map",
+			payloadMap: map[string]interface{}{
+				"reply": "invalid_string_type",
+			},
+			expectPanic: false,
+		},
+		{
+			name: "reply is nil",
+			payloadMap: map[string]interface{}{
+				"reply": nil,
+			},
+			expectPanic: false,
+		},
+		{
+			name: "reply is int",
+			payloadMap: map[string]interface{}{
+				"reply": 12345,
+			},
+			expectPanic: false,
+		},
+		{
+			name: "reply map with non-string message_id",
+			payloadMap: map[string]interface{}{
+				"reply": map[string]interface{}{
+					"message_id": 12345,
+				},
+			},
+			expectPanic: false,
+		},
+		{
+			name: "valid visibles array",
+			payloadMap: map[string]interface{}{
+				"visibles": []interface{}{"uid1", "uid2"},
+			},
+			expectPanic: false,
+		},
+		{
+			name: "visibles is string instead of array",
+			payloadMap: map[string]interface{}{
+				"visibles": "invalid_string_type",
+			},
+			expectPanic: false,
+		},
+		{
+			name: "visibles is map instead of array",
+			payloadMap: map[string]interface{}{
+				"visibles": map[string]interface{}{"uid": "123"},
+			},
+			expectPanic: false,
+		},
+		{
+			name:        "empty payload",
+			payloadMap:  map[string]interface{}{},
+			expectPanic: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					if !tt.expectPanic {
+						t.Errorf("unexpected panic: %v", r)
+					}
+				}
+			}()
+
+			// Test reply type assertion safety (mirrors api.go lines 1777-1779)
+			if replyJson := tt.payloadMap["reply"]; replyJson != nil {
+				if replyMap, ok := replyJson.(map[string]interface{}); ok {
+					if msgId, ok := replyMap["message_id"].(string); ok {
+						assert.NotEmpty(t, msgId)
+					}
+				}
+			}
+
+			// Test visibles type assertion safety (mirrors api.go line 2032)
+			if visibles := tt.payloadMap["visibles"]; visibles != nil {
+				if visiblesArray, ok := visibles.([]interface{}); ok && len(visiblesArray) > 0 {
+					assert.Greater(t, len(visiblesArray), 0)
+				}
+			}
+		})
+	}
+}

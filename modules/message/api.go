@@ -1774,9 +1774,10 @@ func newSyncChannelMessageResp(resp *config.SyncChannelMessageResp, loginUID str
 			}
 			if len(payloadMap) > 0 {
 				replyJson := payloadMap["reply"]
-				if replyJson != nil {
-					msgId := replyJson.(map[string]interface{})["message_id"].(string)
-					messageIDs = append(messageIDs, msgId)
+				if replyMap, ok := replyJson.(map[string]interface{}); ok {
+					if msgId, ok := replyMap["message_id"].(string); ok {
+						messageIDs = append(messageIDs, msgId)
+					}
 				}
 			}
 			messageIDs = append(messageIDs, fmt.Sprintf("%d", message.MessageID))
@@ -1796,10 +1797,14 @@ func newSyncChannelMessageResp(resp *config.SyncChannelMessageResp, loginUID str
 			}
 			if len(payloadMap) > 0 {
 				replyJson := payloadMap["reply"]
-				if replyJson == nil {
+				replyMap, ok := replyJson.(map[string]interface{})
+				if !ok {
 					continue
 				}
-				msgId := replyJson.(map[string]interface{})["message_id"].(string)
+				msgId, ok := replyMap["message_id"].(string)
+				if !ok {
+					continue
+				}
 				for _, messageExtra := range messageExtras {
 					if messageExtra.MessageID == msgId {
 						var contentEditMap map[string]interface{}
@@ -1809,8 +1814,8 @@ func newSyncChannelMessageResp(resp *config.SyncChannelMessageResp, loginUID str
 								log.Warn("负荷数据不是json格式！", zap.Error(err), zap.String("payload", string(messageExtra.ContentEdit.String)))
 								continue
 							}
-							replyJson.(map[string]interface{})["payload"] = contentEditMap
-							payloadMap["reply"] = replyJson
+							replyMap["payload"] = contentEditMap
+							payloadMap["reply"] = replyMap
 							message.Payload = []byte(util.ToJson(payloadMap))
 						}
 						break
@@ -2024,14 +2029,11 @@ func (m *MsgSyncResp) from(msgResp *config.MessageResp, loginUID string, message
 		}
 		if len(payloadMap) > 0 {
 			visibles := payloadMap["visibles"]
-			if visibles != nil {
-				visiblesArray := visibles.([]interface{})
-				if len(visiblesArray) > 0 {
-					m.IsDeleted = 1
-					for _, limitUID := range visiblesArray {
-						if limitUID == loginUID {
-							m.IsDeleted = 0
-						}
+			if visiblesArray, ok := visibles.([]interface{}); ok && len(visiblesArray) > 0 {
+				m.IsDeleted = 1
+				for _, limitUID := range visiblesArray {
+					if limitUID == loginUID {
+						m.IsDeleted = 0
 					}
 				}
 			}
