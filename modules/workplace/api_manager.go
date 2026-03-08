@@ -101,7 +101,6 @@ func (m *manager) reorderBanner(c *wkhttp.Context) {
 	if err != nil {
 		m.Error("数据库事物提交失败", zap.Error(err))
 		c.ResponseError(errors.New("数据库事物提交失败"))
-		tx.Rollback()
 		return
 	}
 	c.ResponseOK()
@@ -359,7 +358,6 @@ func (m *manager) addCategoryApp(c *wkhttp.Context) {
 	if err != nil {
 		m.Error("数据库事物提交失败", zap.Error(err))
 		c.ResponseError(errors.New("数据库事物提交失败"))
-		tx.Rollback()
 		return
 	}
 	c.ResponseOK()
@@ -416,7 +414,6 @@ func (m *manager) reorderCategoryApp(c *wkhttp.Context) {
 	if err != nil {
 		m.Error("数据库事物提交失败", zap.Error(err))
 		c.ResponseError(errors.New("数据库事物提交失败"))
-		tx.Rollback()
 		return
 	}
 	c.ResponseOK()
@@ -726,7 +723,6 @@ func (m *manager) deleteApp(c *wkhttp.Context) {
 	if err = tx.Commit(); err != nil {
 		m.Error("数据库事物提交失败", zap.Error(err))
 		c.ResponseError(errors.New("数据库事物提交失败"))
-		tx.Rollback()
 		return
 	}
 	c.ResponseOK()
@@ -775,7 +771,6 @@ func (m *manager) reorderCategory(c *wkhttp.Context) {
 	if err != nil {
 		m.Error("数据库事物提交失败", zap.Error(err))
 		c.ResponseError(errors.New("数据库事物提交失败"))
-		tx.Rollback()
 		return
 	}
 	c.ResponseOK()
