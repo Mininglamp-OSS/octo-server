@@ -402,22 +402,67 @@ func (s *Service) GetUserDetails(uids []string, loginUID string) ([]*UserDetailR
 		}
 	}
 	if len(robotUIDs) > 0 {
-		var botCmdResults []struct {
+		var botDetails []struct {
 			RobotID     string `db:"robot_id"`
 			BotCommands string `db:"bot_commands"`
+			Description string `db:"description"`
+			CreatorUID  string `db:"creator_uid"`
+			AutoApprove int    `db:"auto_approve"`
 		}
-		_, err = s.ctx.DB().Select("robot_id", "IFNULL(bot_commands,'') as bot_commands").From("robot").Where("robot_id in ? and status=1", robotUIDs).Load(&botCmdResults)
+		_, err = s.ctx.DB().SelectBySql(
+			"SELECT robot_id, IFNULL(bot_commands,'') as bot_commands, IFNULL(description,'') as description, IFNULL(creator_uid,'') as creator_uid, IFNULL(auto_approve,1) as auto_approve FROM robot WHERE robot_id in ? AND status=1",
+			robotUIDs,
+		).Load(&botDetails)
 		if err != nil {
-			s.Error("查询机器人命令失败", zap.Error(err))
+			s.Error("查询机器人详情失败", zap.Error(err))
 		} else {
-			botCmdMap := make(map[string]string, len(botCmdResults))
-			for _, r := range botCmdResults {
-				botCmdMap[r.RobotID] = r.BotCommands
+			botMap := make(map[string]*struct {
+				BotCommands string
+				Description string
+				CreatorUID  string
+				AutoApprove int
+			}, len(botDetails))
+			for i := range botDetails {
+				botMap[botDetails[i].RobotID] = &struct {
+					BotCommands string
+					Description string
+					CreatorUID  string
+					AutoApprove int
+				}{
+					BotCommands: botDetails[i].BotCommands,
+					Description: botDetails[i].Description,
+					CreatorUID:  botDetails[i].CreatorUID,
+					AutoApprove: botDetails[i].AutoApprove,
+				}
+			}
+			// 批量查创建者昵称
+			creatorUIDs := make([]string, 0)
+			for _, d := range botDetails {
+				if d.CreatorUID != "" {
+					creatorUIDs = append(creatorUIDs, d.CreatorUID)
+				}
+			}
+			creatorNameMap := make(map[string]string)
+			if len(creatorUIDs) > 0 {
+				var nameResults []struct {
+					UID  string `db:"uid"`
+					Name string `db:"name"`
+				}
+				_, _ = s.ctx.DB().Select("uid", "IFNULL(name,'') as name").From("user").Where("uid in ?", creatorUIDs).Load(&nameResults)
+				for _, n := range nameResults {
+					creatorNameMap[n.UID] = n.Name
+				}
 			}
 			for _, resp := range userDetailResps {
 				if resp.Robot == 1 {
-					if cmds, ok := botCmdMap[resp.UID]; ok && cmds != "" {
-						resp.BotCommands = cmds
+					if d, ok := botMap[resp.UID]; ok {
+						if d.BotCommands != "" {
+							resp.BotCommands = d.BotCommands
+						}
+						resp.BotDescription = d.Description
+						resp.BotCreatorUID = d.CreatorUID
+						resp.BotCreatorName = creatorNameMap[d.CreatorUID]
+						resp.BotAutoApprove = d.AutoApprove
 					}
 				}
 			}
