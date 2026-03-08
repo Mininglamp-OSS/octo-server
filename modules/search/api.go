@@ -263,12 +263,14 @@ func (s *Search) global(c *wkhttp.Context) {
 			}
 			if isAdd {
 				escapedKeyword := html.EscapeString(req.Keyword)
-				name := strings.ReplaceAll(g.Name, req.Keyword, fmt.Sprintf("<mark>%s</mark>", escapedKeyword))
+				escapedName := html.EscapeString(g.Name)
+				name := strings.ReplaceAll(escapedName, escapedKeyword, fmt.Sprintf("<mark>%s</mark>", escapedKeyword))
+				escapedRemark := html.EscapeString(remark)
 				groupResps = append(groupResps, &channelResp{
 					ChannelID:     g.GroupNo,
 					ChannelType:   common.ChannelTypeGroup.Uint8(),
 					ChannelName:   name,
-					ChannelRemark: remark,
+					ChannelRemark: escapedRemark,
 				})
 			}
 		}
@@ -294,7 +296,8 @@ func (s *Search) global(c *wkhttp.Context) {
 					continue
 				}
 				escapedKeyword := html.EscapeString(req.Keyword)
-				name := strings.ReplaceAll(m.Name, req.Keyword, fmt.Sprintf("<mark>%s</mark>", escapedKeyword))
+				escapedName := html.EscapeString(m.Name)
+				name := strings.ReplaceAll(escapedName, escapedKeyword, fmt.Sprintf("<mark>%s</mark>", escapedKeyword))
 				friendResps = append(friendResps, &channelResp{
 					ChannelID:   m.UID,
 					ChannelName: name,
@@ -311,12 +314,14 @@ func (s *Search) global(c *wkhttp.Context) {
 			if len(friends) > 0 {
 				for _, friend := range friends {
 					escapedKeyword := html.EscapeString(req.Keyword)
-					name := strings.ReplaceAll(friend.Name, req.Keyword, fmt.Sprintf("<mark>%s</mark>", escapedKeyword))
+					escapedName := html.EscapeString(friend.Name)
+					name := strings.ReplaceAll(escapedName, escapedKeyword, fmt.Sprintf("<mark>%s</mark>", escapedKeyword))
+					escapedRemark := html.EscapeString(friend.Remark)
 					friendResps = append(friendResps, &channelResp{
 						ChannelID:     friend.UID,
 						ChannelName:   name,
 						ChannelType:   common.ChannelTypePerson.Uint8(),
-						ChannelRemark: friend.Remark,
+						ChannelRemark: escapedRemark,
 					})
 				}
 			}
@@ -370,8 +375,8 @@ func (s *Search) global(c *wkhttp.Context) {
 						tempChannel = &channelResp{
 							ChannelID:     user.UID,
 							ChannelType:   common.ChannelTypePerson.Uint8(),
-							ChannelRemark: user.Remark,
-							ChannelName:   user.Name,
+							ChannelRemark: html.EscapeString(user.Remark),
+							ChannelName:   html.EscapeString(user.Name),
 						}
 						break
 					}
@@ -384,8 +389,8 @@ func (s *Search) global(c *wkhttp.Context) {
 						fromChannel = &channelResp{
 							ChannelID:     user.UID,
 							ChannelType:   common.ChannelTypePerson.Uint8(),
-							ChannelRemark: user.Remark,
-							ChannelName:   user.Name,
+							ChannelRemark: html.EscapeString(user.Remark),
+							ChannelName:   html.EscapeString(user.Name),
 						}
 						break
 					}
@@ -397,8 +402,8 @@ func (s *Search) global(c *wkhttp.Context) {
 						tempChannel = &channelResp{
 							ChannelID:     group.GroupNo,
 							ChannelType:   common.ChannelTypeGroup.Uint8(),
-							ChannelName:   group.Name,
-							ChannelRemark: group.Remark,
+							ChannelName:   html.EscapeString(group.Name),
+							ChannelRemark: html.EscapeString(group.Remark),
 						}
 						break
 					}
