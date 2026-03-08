@@ -73,8 +73,14 @@ func (f *File) makeImageCompose(c *wkhttp.Context) {
 		c.ResponseError(errors.New("组合图片失败！"))
 		return
 	}
+	fid, ok := resultMap["fid"].(string)
+	if !ok || fid == "" {
+		f.Error("图片合成返回结果异常", zap.Any("resultMap", resultMap))
+		c.ResponseError(errors.New("图片合成失败：返回结果异常"))
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
-		"path": resultMap["fid"].(string),
+		"path": fid,
 	})
 }
 
