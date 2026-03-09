@@ -1235,16 +1235,11 @@ func (g *Group) addMembersTx(members []string, groupNo string, operator, operato
 		for _, oldMember := range oldMembers {
 			ninceMembers = append(ninceMembers, oldMember.UID)
 		}
-		if len(ninceMembers)+len(userBaseVos) >= 9 {
-			for len(ninceMembers) < 9 {
-				for _, userBaseVo := range userBaseVos {
-					ninceMembers = append(ninceMembers, userBaseVo.UID)
-				}
+		for _, userBaseVo := range userBaseVos {
+			if len(ninceMembers) >= 9 {
+				break
 			}
-		} else {
-			for _, userBaseVo := range userBaseVos {
-				ninceMembers = append(ninceMembers, userBaseVo.UID)
-			}
+			ninceMembers = append(ninceMembers, userBaseVo.UID)
 		}
 
 		groupAvatarEventID, err = g.ctx.EventBegin(&wkevent.Data{
