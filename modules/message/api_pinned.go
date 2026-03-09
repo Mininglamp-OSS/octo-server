@@ -189,7 +189,13 @@ func (m *Message) pinnedMessage(c *wkhttp.Context) {
 			return
 		}
 	}
-	version := m.genMessageExtraSeq(fakeChannelID)
+	version, err := m.genMessageExtraSeq(fakeChannelID)
+	if err != nil {
+		tx.Rollback()
+		m.Error("生成消息扩展序列号失败！", zap.Error(err))
+		c.ResponseError(errors.New("生成消息扩展序列号失败！"))
+		return
+	}
 	err = m.messageExtraDB.insertOrUpdatePinnedTx(&messageExtraModel{
 		MessageID:   req.MessageID,
 		MessageSeq:  req.MessageSeq,
@@ -396,7 +402,13 @@ func (m *Message) clearPinnedMessage(c *wkhttp.Context) {
 			return
 		}
 
-		version := m.genMessageExtraSeq(fakeChannelID)
+		version, err := m.genMessageExtraSeq(fakeChannelID)
+		if err != nil {
+			tx.Rollback()
+			m.Error("生成消息扩展序列号失败！", zap.Error(err))
+			c.ResponseError(errors.New("生成消息扩展序列号失败！"))
+			return
+		}
 		err = m.messageExtraDB.insertOrUpdatePinnedTx(&messageExtraModel{
 			MessageID:   msg.MessageId,
 			MessageSeq:  msg.MessageSeq,

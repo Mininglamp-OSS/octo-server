@@ -332,7 +332,12 @@ func (m *Message) messageEdit(c *wkhttp.Context) {
 		fakeChannelID = common.GetFakeChannelIDWith(c.GetLoginUID(), req.ChannelID)
 	}
 
-	version := m.genMessageExtraSeq(fakeChannelID)
+	version, err := m.genMessageExtraSeq(fakeChannelID)
+	if err != nil {
+		m.Error("生成消息扩展序列号失败！", zap.Error(err))
+		c.ResponseError(errors.New("生成消息扩展序列号失败！"))
+		return
+	}
 	err = m.messageExtraDB.insertOrUpdateContentEditTx(&messageExtraModel{
 		MessageID:       req.MessageID,
 		MessageSeq:      req.MessageSeq,
@@ -1150,7 +1155,12 @@ func (m *Message) mutualDelete(c *wkhttp.Context) {
 		c.ResponseError(errors.New("用户无权删除此消息"))
 		return
 	}
-	version := m.genMessageExtraSeq(fakeChannelID)
+	version, err := m.genMessageExtraSeq(fakeChannelID)
+	if err != nil {
+		m.Error("生成消息扩展序列号失败！", zap.Error(err))
+		c.ResponseError(errors.New("生成消息扩展序列号失败！"))
+		return
+	}
 	err = m.messageExtraDB.insertOrUpdateDeleted(&messageExtraModel{
 		MessageID:   req.MessageID,
 		ChannelID:   fakeChannelID,
@@ -1252,9 +1262,8 @@ func (m *Message) delete(c *wkhttp.Context) {
 	c.ResponseOK()
 }
 
-func (m *Message) genMessageExtraSeq(channelID string) int64 {
-	return time.Now().UnixNano() / 1e3
-	// return m.ctx.GenSeq(fmt.Sprintf("%s:%s", common.MessageExtraSeqKey, channelID))
+func (m *Message) genMessageExtraSeq(channelID string) (int64, error) {
+	return m.ctx.GenSeq(fmt.Sprintf("%s:%s", common.MessageExtraSeqKey, channelID))
 }
 func (m *Message) genMessageReactionSeq(channelID string) (int64, error) {
 	return m.ctx.GenSeq(fmt.Sprintf("%s:%s", common.MessageReactionSeqKey, channelID))
@@ -1594,7 +1603,12 @@ func (m *Message) revoke(c *wkhttp.Context) {
 		}
 	}()
 	messageIDStr := strconv.FormatInt(message.MessageID, 10)
-	version := m.genMessageExtraSeq(fakeChannelID)
+	version, err := m.genMessageExtraSeq(fakeChannelID)
+	if err != nil {
+		m.Error("生成消息扩展序列号失败！", zap.Error(err), zap.String("channelID", fakeChannelID))
+		c.ResponseError(errors.New("生成消息扩展序列号失败！"))
+		return
+	}
 	if messageExtra != nil {
 		messageExtra.Revoke = 1
 		messageExtra.Revoker = loginUID
