@@ -54,6 +54,25 @@ func (f *Friend) handleFriendSure(data []byte, commit config.EventCommit) {
 		commit(errors.New("添加IM白名单错误"))
 		return
 	}
+
+	// 如果对方是 Bot，移除黑名单（可能之前删除好友时加入了黑名单）
+	isRobot, err := f.db.isRobot(toUID)
+	if err != nil {
+		f.Warn("查询是否是Bot失败", zap.Error(err), zap.String("toUID", toUID))
+	}
+	if isRobot {
+		err = f.ctx.IMBlacklistRemove(config.ChannelBlacklistReq{
+			ChannelReq: config.ChannelReq{
+				ChannelID:   toUID,
+				ChannelType: common.ChannelTypePerson.Uint8(),
+			},
+			UIDs: []string{uid},
+		})
+		if err != nil {
+			f.Warn("移除Bot黑名单失败", zap.Error(err), zap.String("toUID", toUID))
+		}
+	}
+
 	commit(nil)
 }
 
@@ -95,6 +114,25 @@ func (f *Friend) handleDeleteFriend(data []byte, commit config.EventCommit) {
 		commit(errors.New("移除IM白名单错误"))
 		return
 	}
+
+	// 如果被删的是 Bot，加入 WuKongIM 黑名单阻止 DM
+	isRobot, err := f.db.isRobot(toUID)
+	if err != nil {
+		f.Warn("查询是否是Bot失败", zap.Error(err), zap.String("toUID", toUID))
+	}
+	if isRobot {
+		err = f.ctx.IMBlacklistAdd(config.ChannelBlacklistReq{
+			ChannelReq: config.ChannelReq{
+				ChannelID:   toUID,
+				ChannelType: common.ChannelTypePerson.Uint8(),
+			},
+			UIDs: []string{uid},
+		})
+		if err != nil {
+			f.Warn("添加Bot黑名单失败", zap.Error(err), zap.String("toUID", toUID))
+		}
+	}
+
 	commit(nil)
 }
 

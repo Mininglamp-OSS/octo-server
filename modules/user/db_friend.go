@@ -265,6 +265,13 @@ func (d *friendDB) updateApply(apply *FriendApplyModel) error {
 	return err
 }
 
+// isRobot 判断uid是否是启用状态的Bot
+func (d *friendDB) isRobot(uid string) (bool, error) {
+	var cn int
+	err := d.session.Select("count(*)").From("robot").Where("robot_id=? and status=1", uid).LoadOne(&cn)
+	return cn > 0, err
+}
+
 func (d *friendDB) updateApplyTx(apply *FriendApplyModel, tx *dbr.Tx) error {
 	_, err := tx.Update("friend_apply_record").SetMap(map[string]interface{}{
 		"status":     apply.Status,
