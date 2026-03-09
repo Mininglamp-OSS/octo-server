@@ -69,6 +69,7 @@ func (sm *ServiceMinio) UploadFile(filePath string, contentType string, copyFile
 	allowedBuckets := map[string]bool{
 		"file": true, "chat": true, "moment": true, "sticker": true,
 		"report": true, "chatbg": true, "common": true, "download": true,
+		"group": true, "avatar": true,
 	}
 	bucketName := "file"
 	strs := strings.Split(filePath, "/")
@@ -145,6 +146,7 @@ func (sm *ServiceMinio) GetFile(ph string) (io.ReadCloser, string, error) {
 		allowedBuckets := map[string]bool{
 			"file": true, "chat": true, "moment": true, "sticker": true,
 			"report": true, "chatbg": true, "common": true, "download": true,
+			"group": true, "avatar": true,
 		}
 		if allowedBuckets[strs[0]] {
 			bucketName = strs[0]
