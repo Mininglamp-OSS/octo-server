@@ -46,6 +46,14 @@ var (
 	ErrUserNeedVerification = errors.New("user need verification") // 用户需要验证
 )
 
+// qrcodeChanMap stores channels for QR code login long-polling.
+// Concurrency safety is ensured by qrcodeChanLock:
+// - SendQRCodeInfo: holds lock during both map read AND channel send (no TOCTOU)
+// - removeQRCodeChan: holds lock during map delete AND channel close
+// - getQRCodeModelChan: holds lock during map write
+// The channel is buffered (size 1) to prevent message loss between
+// getQRCodeModelChan return and the caller's select/receive.
+// See: #294, #345 for race condition fixes.
 var qrcodeChanMap = map[string]chan *common.QRCodeModel{}
 var qrcodeChanLock sync.RWMutex
 
