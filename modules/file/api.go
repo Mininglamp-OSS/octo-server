@@ -318,7 +318,7 @@ func (f *File) checkReq(fileType Type, path string) error {
 			return err
 		}
 	}
-	if fileType != TypeChat && fileType != TypeMoment && fileType != TypeMomentCover && fileType != TypeSticker && fileType != TypeReport && fileType != TypeChatBg && fileType != TypeCommon && fileType != TypeDownload {
+	if fileType != TypeChat && fileType != TypeMoment && fileType != TypeMomentCover && fileType != TypeSticker && fileType != TypeReport && fileType != TypeChatBg && fileType != TypeCommon && fileType != TypeDownload && fileType != TypeWorkplaceBanner && fileType != TypeWorkplaceAppIcon {
 		return errors.New("文件类型错误")
 	}
 	return nil

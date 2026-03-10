@@ -50,8 +50,8 @@ func TestCheckReq(t *testing.T) {
 
 		// 无效文件类型
 		{"invalid type", Type("invalid"), "/path", true, "文件类型错误"},
-		{"workplace banner type", TypeWorkplaceBanner, "/path", true, "文件类型错误"},
-		{"workplace icon type", TypeWorkplaceAppIcon, "/path", true, "文件类型错误"},
+		{"workplace banner type", TypeWorkplaceBanner, "/path", false, ""},
+		{"workplace icon type", TypeWorkplaceAppIcon, "/path", false, ""},
 	}
 
 	for _, tt := range tests {
