@@ -11,6 +11,7 @@ type SpaceModel struct {
 	Description string // 空间描述
 	Logo        string // 空间Logo
 	Creator     string // 创建者uid
+	MaxUsers    int    // 最大成员数 0.不限制
 	Status      int    // 状态 1.正常 0.已解散
 	Version     int64  // 版本号
 	db.BaseModel
@@ -78,6 +79,7 @@ type spaceResp struct {
 	Creator     string `json:"creator"`
 	Status      int    `json:"status"`
 	Role        int    `json:"role"`
+	MaxUsers    int    `json:"max_users"`
 	MemberCount int    `json:"member_count"`
 	InviteCode  string `json:"invite_code"`
 	CreatedAt   string `json:"created_at"`
@@ -138,7 +140,7 @@ type MemberDetailModel struct {
 	Robot int    // 是否机器人 1=是 0=否
 }
 
-// SpaceDetailModel 带成员数和角色的空间详情
+// SpaceDetailModel 带成员数和角色的空间详情（MaxUsers 从 SpaceModel 继承）
 type SpaceDetailModel struct {
 	SpaceModel
 	Role        int // 当前用户角色

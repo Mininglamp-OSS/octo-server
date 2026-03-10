@@ -96,6 +96,13 @@ func (d *DB) querySpaceDetail(spaceId string, uid string) (*SpaceDetailModel, er
 	return &m, err
 }
 
+// countActiveMembers 查询空间活跃成员数
+func (d *DB) countActiveMembers(spaceId string) (int, error) {
+	var count int
+	_, err := d.session.SelectBySql("SELECT COUNT(*) FROM space_member WHERE space_id=? AND status=1", spaceId).Load(&count)
+	return count, err
+}
+
 // ---------- Member CRUD ----------
 
 func (d *DB) insertMember(m *MemberModel, tx *dbr.Tx) error {

@@ -196,6 +196,7 @@ func (s *Space) getSpace(c *wkhttp.Context) {
 		Creator:     detail.Creator,
 		Status:      detail.Status,
 		Role:        detail.Role,
+		MaxUsers:    detail.MaxUsers,
 		MemberCount: detail.MemberCount,
 		InviteCode:  inviteCode,
 		CreatedAt:   detail.CreatedAt.String(),
@@ -284,6 +285,7 @@ func (s *Space) mySpaces(c *wkhttp.Context) {
 			Creator:     sp.Creator,
 			Status:      sp.Status,
 			Role:        sp.Role,
+			MaxUsers:    sp.MaxUsers,
 			MemberCount: sp.MemberCount,
 			InviteCode:  inviteCode,
 			CreatedAt:   sp.CreatedAt.String(),
@@ -368,6 +370,24 @@ func (s *Space) addMembers(c *wkhttp.Context) {
 	if len(req.UIDs) == 0 {
 		c.ResponseError(errors.New("成员列表不能为空"))
 		return
+	}
+
+	// 检查空间人数上限
+	spaceInfo, err := s.db.querySpaceByID(spaceId)
+	if err != nil || spaceInfo == nil {
+		c.ResponseError(errors.New("空间不存在或已解散"))
+		return
+	}
+	if spaceInfo.MaxUsers > 0 {
+		memberCount, countErr := s.db.countActiveMembers(spaceId)
+		if countErr != nil {
+			c.ResponseError(errors.New("查询空间成员数失败"))
+			return
+		}
+		if memberCount+len(req.UIDs) > spaceInfo.MaxUsers {
+			c.ResponseError(errors.New("空间成员数已达上限"))
+			return
+		}
 	}
 
 	for _, uid := range req.UIDs {
@@ -636,6 +656,19 @@ func (s *Space) joinSpace(c *wkhttp.Context) {
 	if err != nil || space == nil {
 		c.ResponseError(errors.New("空间不存在或已解散"))
 		return
+	}
+
+	// 检查空间人数上限
+	if space.MaxUsers > 0 {
+		memberCount, countErr := s.db.countActiveMembers(invitation.SpaceId)
+		if countErr != nil {
+			c.ResponseError(errors.New("查询空间成员数失败"))
+			return
+		}
+		if memberCount >= space.MaxUsers {
+			c.ResponseError(errors.New("空间成员数已达上限"))
+			return
+		}
 	}
 
 	// 检查是否已经是成员
