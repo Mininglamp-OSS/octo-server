@@ -224,7 +224,7 @@ func (s *Service) GetUserDetail(uid string, loginUID string) (*UserDetailResp, e
 	if toUserSetting != nil {
 		beBlacklist = toUserSetting.Blacklist
 	}
-	if follow == 0 {
+	if follow == 0 && model.Robot == 0 {
 		if commonSpaceID := space.GetCommonSpaceID(s.ctx, loginUID, uid); commonSpaceID != "" {
 			follow = 1
 		}
@@ -371,7 +371,7 @@ func (s *Service) GetUserDetails(uids []string, loginUID string) ([]*UserDetailR
 			sourceFrom = friendVercodeSourceMap[friend.SourceVercode]
 			vercode = friend.Vercode
 		}
-		if follow == 0 {
+		if follow == 0 && userDetail.Robot == 0 {
 			if commonSpaceID := space.GetCommonSpaceID(s.ctx, loginUID, uid); commonSpaceID != "" {
 				follow = 1
 			}
