@@ -11,6 +11,7 @@ import (
 	wkutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
 	chservice "github.com/Mininglamp-OSS/octo-server/modules/channel/service"
 	"github.com/Mininglamp-OSS/octo-server/modules/source"
+	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
@@ -858,6 +859,28 @@ func (f *Friend) friendSync(c *wkhttp.Context) {
 			f.Error("同步好友信息错误！", zap.Error(err))
 			c.ResponseError(errors.New("同步好友信息错误！"))
 			return
+		}
+	}
+
+	// 老客户端兼容：没带 space_id 时，按用户默认 Space 过滤好友
+	spaceID := c.Query("space_id")
+	if spaceID == "" {
+		spaceID = space.GetUserDefaultSpaceID(f.ctx, uid)
+	}
+	if spaceID != "" {
+		memberUIDs, _ := space.GetSpaceMemberUIDs(f.ctx, spaceID)
+		if len(memberUIDs) > 0 {
+			memberSet := make(map[string]struct{}, len(memberUIDs))
+			for _, m := range memberUIDs {
+				memberSet[m] = struct{}{}
+			}
+			filtered := make([]*FriendModel, 0, len(friends))
+			for _, fr := range friends {
+				if _, ok := memberSet[fr.ToUID]; ok {
+					filtered = append(filtered, fr)
+				}
+			}
+			friends = filtered
 		}
 	}
 

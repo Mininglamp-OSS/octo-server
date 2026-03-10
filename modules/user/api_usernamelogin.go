@@ -173,6 +173,12 @@ func (u *User) registerWithUsername(username string, name string, password strin
 		"need_upload_web3publickey": 1,
 	})
 
+	// 新注册用户自动加入默认 Space
+	_, _ = u.db.session.InsertBySql(
+		"INSERT IGNORE INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW())",
+		"minglue_default", uid,
+	).Exec()
+
 	// 新用户自动引导：BotFather + 示例 Bot 发送欢迎消息
 	go u.sendBotWelcomeMessages(uid)
 }

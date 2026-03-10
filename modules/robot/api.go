@@ -986,7 +986,7 @@ func (rb *Robot) spaceBots(c *wkhttp.Context) {
 			IFNULL(r.auto_approve,0) as auto_approve
 		FROM space_member sm
 		INNER JOIN user u ON sm.uid = u.uid AND u.robot = 1
-		LEFT JOIN robot r ON r.robot_id = sm.uid AND r.status = 1
+		INNER JOIN robot r ON r.robot_id = sm.uid AND r.status = 1
 		WHERE sm.space_id = ? AND sm.uid != 'botfather'
 		ORDER BY u.created_at DESC
 	`, spaceID).Load(&bots)
