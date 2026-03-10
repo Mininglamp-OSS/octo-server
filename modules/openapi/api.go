@@ -2,6 +2,7 @@ package openapi
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -170,9 +171,24 @@ func (o *OpenAPI) authcodeGet(c *wkhttp.Context) {
 		return
 	}
 
+	// Validate app exists and is enabled
+	appResp, err := o.appService.GetApp(appID)
+	if err != nil {
+		c.ResponseError(errors.New("查询应用失败"))
+		return
+	}
+	if appResp == nil {
+		c.ResponseError(errors.New("应用不存在"))
+		return
+	}
+	if appResp.Status != app.StatusEnable {
+		c.ResponseError(errors.New("应用未启用"))
+		return
+	}
+
 	authcode := util.GenerUUID()
 
-	err := o.setOpenapiAuthcodeCache(uid, appID, authcode)
+	err = o.setOpenapiAuthcodeCache(uid, appID, authcode)
 	if err != nil {
 		c.ResponseError(err)
 		return
