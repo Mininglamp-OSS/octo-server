@@ -835,6 +835,38 @@ func (h *commandHandler) createBot(creatorUID, name, username, botToken string) 
 			h.Warn("Bot加入Space失败", zap.Error(err), zap.String("space_id", sid))
 		}
 	}
+	// 5. 设置 Bot person channel 白名单模式（ban=1），让 WuKongIM 拦截非好友消息
+	err = h.ctx.IMCreateOrUpdateChannelInfo(&config.ChannelInfoCreateReq{
+		ChannelID:   robotID,
+		ChannelType: common.ChannelTypePerson.Uint8(),
+		Ban:         1,
+	})
+	if err != nil {
+		h.Warn("设置Bot channel ban=1失败", zap.Error(err), zap.String("robotID", robotID))
+	}
+
+	// 6. 添加创建者到 Bot 白名单（双向）
+	err = h.ctx.IMWhitelistAdd(config.ChannelWhitelistReq{
+		ChannelReq: config.ChannelReq{
+			ChannelID:   robotID,
+			ChannelType: common.ChannelTypePerson.Uint8(),
+		},
+		UIDs: []string{creatorUID},
+	})
+	if err != nil {
+		h.Warn("添加创建者到Bot白名单失败", zap.Error(err), zap.String("robotID", robotID))
+	}
+	err = h.ctx.IMWhitelistAdd(config.ChannelWhitelistReq{
+		ChannelReq: config.ChannelReq{
+			ChannelID:   creatorUID,
+			ChannelType: common.ChannelTypePerson.Uint8(),
+		},
+		UIDs: []string{robotID},
+	})
+	if err != nil {
+		h.Warn("添加Bot到创建者白名单失败", zap.Error(err), zap.String("robotID", robotID))
+	}
+
 	// 兼容：仍添加好友关系（过渡期）
 	err = h.userService.AddFriend(creatorUID, &user.FriendReq{
 		UID:   creatorUID,
