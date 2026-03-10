@@ -89,7 +89,7 @@ func (a *AliyunInternationalProvider) SendSMS(ctx context.Context, zone, phone s
 	if *response.Body.ResponseCode == "OK" {
 		return nil
 	}
-	return nil
+	return fmt.Errorf("国际短信发送失败，错误码: %s", *response.Body.ResponseCode)
 }
 
 // 初始化账号Client
