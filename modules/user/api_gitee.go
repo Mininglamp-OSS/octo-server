@@ -266,7 +266,6 @@ func (u *User) requestGiteeAccessToken(code string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	fmt.Println("getGiteeAccessToken-result-->", result)
 
 	accessToken := ""
 	if result["access_token"] != nil {

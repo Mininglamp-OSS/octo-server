@@ -181,7 +181,7 @@ func (u *User) requestGithubAccessToken(code string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	fmt.Println("getGiteeAccessToken-result-->", result)
+
 	accessToken := ""
 	if result["access_token"] != nil {
 		if token, ok := result["access_token"].(string); ok {
