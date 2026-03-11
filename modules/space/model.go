@@ -12,7 +12,7 @@ type SpaceModel struct {
 	Logo           string // 空间Logo
 	Creator        string // 创建者uid
 	MaxUsers       int    // 最大成员数 0.不限制
-	PresetGroupIds string // 预设群组ID列表（JSON数组）
+	PresetGroupIds *string // 预设群组ID列表（JSON数组）
 	Status         int    // 状态 1.正常 0.已解散
 	Version        int64  // 版本号
 	db.BaseModel

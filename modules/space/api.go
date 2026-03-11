@@ -268,6 +268,7 @@ func (s *Space) mySpaces(c *wkhttp.Context) {
 
 	spaces, err := s.db.queryMySpaces(loginUID)
 	if err != nil {
+		s.Error("查询空间列表失败", zap.Error(err), zap.String("loginUID", loginUID))
 		c.ResponseError(errors.New("查询空间列表失败"))
 		return
 	}
@@ -694,8 +695,8 @@ func (s *Space) joinSpace(c *wkhttp.Context) {
 	})
 
 	// 异步加入预设群组（不影响 joinSpace 结果）
-	if space.PresetGroupIds != "" {
-		go s.joinPresetGroups(loginUID, space.PresetGroupIds)
+	if space.PresetGroupIds != nil && *space.PresetGroupIds != "" {
+		go s.joinPresetGroups(loginUID, *space.PresetGroupIds)
 	}
 }
 

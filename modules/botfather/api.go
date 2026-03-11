@@ -73,6 +73,9 @@ func New(ctx *config.Context) *BotFather {
 
 // Route 路由配置
 func (bf *BotFather) Route(r *wkhttp.WKHttp) {
+	// 启动时批量同步所有 bot 的 token 到 WuKongIM（防止 WuKongIM 重启后 token 丢失）
+	go bf.syncAllBotTokens()
+
 	// skill.md 端点（无需认证）
 	r.GET("/v1/bot/skill.md", bf.skillMD)
 
@@ -485,18 +488,22 @@ func (bf *BotFather) register(c *wkhttp.Context) {
 		return
 	}
 
-	// 获取或创建 IM Token
-	// force_refresh=true 时忽略缓存，强制从 WuKongIM 重新申请（适用于 WuKongIM 重启后 token 失效场景）
-	forceRefresh := c.Query("force_refresh") == "true"
-	imToken := robot.IMTokenCache
-	if forceRefresh || strings.TrimSpace(imToken) == "" {
-		imToken, err = bf.getOrCreateIMToken(robot.RobotID)
-		if err != nil {
-			bf.Error("获取IM Token失败", zap.Error(err))
-			c.ResponseError(errors.New("获取IM Token失败"))
-			return
-		}
-		// 缓存IM Token
+	// 直接用 bot_token 作为 im_token — 只有一个 token，永远不会不一致
+	imToken := robot.BotToken
+	// 无论是否有缓存，都向 WuKongIM 注册（保证 WuKongIM 内存中有该 token）
+	resp, tokenErr := bf.ctx.UpdateIMToken(config.UpdateIMTokenReq{
+		UID:         robot.RobotID,
+		Token:       imToken,
+		DeviceFlag:  config.APP,
+		DeviceLevel: config.DeviceLevelMaster,
+	})
+	if tokenErr != nil || resp.Status != config.UpdateTokenStatusSuccess {
+		bf.Error("获取IM Token失败", zap.Any("error", tokenErr), zap.String("robotID", robot.RobotID), zap.Any("status", resp))
+		c.ResponseError(errors.New("获取IM Token失败"))
+		return
+	}
+	// 更新缓存
+	if robot.IMTokenCache != imToken {
 		bf.db.updateRobotIMTokenCache(robot.RobotID, imToken)
 	}
 
@@ -1116,4 +1123,33 @@ type messageResp struct {
 	ChannelType uint8       `json:"channel_type,omitempty"`
 	Timestamp   int32       `json:"timestamp"`
 	Payload     interface{} `json:"payload"`
+}
+
+// syncAllBotTokens 启动时将所有活跃 bot 的 bot_token 同步到 WuKongIM
+// 确保 WuKongIM 重启后所有 bot 都能正常连接
+func (bf *BotFather) syncAllBotTokens() {
+	robots, err := bf.db.queryAllActiveRobots()
+	if err != nil {
+		bf.Error("同步 bot token 失败: 查询 robot 出错", zap.Error(err))
+		return
+	}
+	successCount := 0
+	for _, robot := range robots {
+		resp, tokenErr := bf.ctx.UpdateIMToken(config.UpdateIMTokenReq{
+			UID:         robot.RobotID,
+			Token:       robot.BotToken,
+			DeviceFlag:  config.APP,
+			DeviceLevel: config.DeviceLevelMaster,
+		})
+		if tokenErr != nil || resp.Status != config.UpdateTokenStatusSuccess {
+			bf.Warn("同步 bot token 失败", zap.String("robotID", robot.RobotID), zap.Any("error", tokenErr), zap.Any("status", resp))
+			continue
+		}
+		// 同步 DB cache
+		if robot.IMTokenCache != robot.BotToken {
+			bf.db.updateRobotIMTokenCache(robot.RobotID, robot.BotToken)
+		}
+		successCount++
+	}
+	bf.Info("Bot token 启动同步完成", zap.Int("total", len(robots)), zap.Int("success", successCount))
 }

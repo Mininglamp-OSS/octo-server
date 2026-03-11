@@ -149,3 +149,9 @@ func (d *botfatherDB) existRobotByUsername(username string) (bool, error) {
 	err := d.session.Select("count(*)").From("robot").Where("username=?", username).LoadOne(&count)
 	return count > 0, err
 }
+
+func (d *botfatherDB) queryAllActiveRobots() ([]*robotModel, error) {
+	var models []*robotModel
+	_, err := d.session.Select("*").From("robot").Where("status=1 AND bot_token != ''").Load(&models)
+	return models, err
+}
