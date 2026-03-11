@@ -310,8 +310,13 @@ func (m *Message) getMention(payloadMap map[string]interface{}) (all bool, uids 
 
 func (m *Message) contentType(payloadMap map[string]interface{}) int {
 	if payloadMap["type"] != nil {
-		contentTypeI, _ := payloadMap["type"].(json.Number).Int64()
-		return int(contentTypeI)
+		switch v := payloadMap["type"].(type) {
+		case json.Number:
+			contentTypeI, _ := v.Int64()
+			return int(contentTypeI)
+		case float64:
+			return int(v)
+		}
 	}
 	return 0
 }

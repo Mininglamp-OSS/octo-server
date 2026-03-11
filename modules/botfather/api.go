@@ -572,6 +572,38 @@ func (bf *BotFather) sendMessage(c *wkhttp.Context) {
 	}
 
 	robotID := getRobotIDFromContext(c)
+
+	// 验证 Bot 发送消息的频道权限
+	if req.ChannelType == common.ChannelTypeGroup.Uint8() {
+		// 群聊场景：验证 bot 是否在群内
+		var count int
+		_, err := bf.db.session.SelectBySql(
+			"SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0",
+			req.ChannelID, robotID,
+		).Load(&count)
+		if err != nil {
+			bf.Error("查询群成员失败", zap.Error(err))
+			c.ResponseError(errors.New("查询群成员失败"))
+			return
+		}
+		if count == 0 {
+			c.ResponseError(errors.New("bot is not a member of this group"))
+			return
+		}
+	} else if req.ChannelType == common.ChannelTypePerson.Uint8() {
+		// 私聊场景：验证 bot 与目标用户有好友关系
+		isFriend, err := bf.userService.IsFriend(robotID, req.ChannelID)
+		if err != nil {
+			bf.Error("查询好友关系失败", zap.Error(err))
+			c.ResponseError(errors.New("查询好友关系失败"))
+			return
+		}
+		if !isFriend {
+			c.ResponseError(errors.New("bot is not a friend of this user"))
+			return
+		}
+	}
+
 	channelID := bf.resolveSpaceChannelID(robotID, req.ChannelID, req.ChannelType)
 	result, err := bf.ctx.SendMessageWithResult(&config.MsgSendReq{
 		Header: config.MsgHeader{
