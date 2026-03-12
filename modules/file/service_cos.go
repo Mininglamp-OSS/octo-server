@@ -91,8 +91,37 @@ func (sc *ServiceCOS) UploadFile(filePath string, contentType string, copyFileWr
 }
 
 // DownloadURL 获取COS文件下载地址
-func (sc *ServiceCOS) GetFile(path string) (io.ReadCloser, string, error) {
-	return nil, "", fmt.Errorf("GetFile not supported for COS, use DownloadURL instead")
+func (sc *ServiceCOS) GetFile(ph string) (io.ReadCloser, string, error) {
+	client, err := sc.getClient()
+	if err != nil {
+		return nil, "", err
+	}
+
+	cosConfig := sc.ctx.GetConfig().COS
+	bucketName := cosConfig.Bucket
+	objectPath := ph
+	strs := strings.Split(ph, "/")
+	if len(strs) > 1 {
+		allowedBuckets := map[string]bool{
+			"file": true, "chat": true, "moment": true, "sticker": true,
+			"report": true, "chatbg": true, "common": true, "download": true,
+			"group": true, "avatar": true,
+		}
+		if allowedBuckets[strs[0]] {
+			objectPath = strings.TrimPrefix(ph, strs[0]+"/")
+		}
+	}
+
+	obj, err := client.GetObject(context.Background(), bucketName, objectPath, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, "", err
+	}
+	stat, err := obj.Stat()
+	if err != nil {
+		obj.Close()
+		return nil, "", err
+	}
+	return obj, stat.ContentType, nil
 }
 
 func (sc *ServiceCOS) DownloadURL(ph string, filename string) (string, error) {
