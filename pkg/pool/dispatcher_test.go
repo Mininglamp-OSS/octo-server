@@ -154,3 +154,77 @@ func TestTypeAssertionSafety(t *testing.T) {
 		t.Fatalf("expected job Data 'valid', got %v", job.Data)
 	}
 }
+
+func TestWorkerPanicRecovery(t *testing.T) {
+	// Test that worker recovers from panic and continues processing
+	workerChannel := make(chan chan *Job, 1)
+	jobChannel := make(chan *Job, 1)
+	endChannel := make(chan struct{})
+	jobFinished := make(chan bool, 1)
+
+	w := &Worker{
+		ID:            1,
+		WorkerChannel: workerChannel,
+		Channel:       jobChannel,
+		End:           endChannel,
+		jobFinished:   jobFinished,
+	}
+
+	w.Start()
+
+	// Wait for worker to register
+	select {
+	case <-workerChannel:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not register")
+	}
+
+	// Send a job that panics
+	panicJob := &Job{
+		Data: "panic",
+		JobFunc: func(id int64, data interface{}) {
+			panic("test panic")
+		},
+	}
+	jobChannel <- panicJob
+
+	// Worker should recover and signal job finished
+	select {
+	case <-jobFinished:
+		// Success - worker recovered from panic
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not recover from panic")
+	}
+
+	// Worker should still be alive and register again
+	select {
+	case <-workerChannel:
+		// Success - worker is still running
+	case <-time.After(time.Second):
+		t.Fatal("worker did not re-register after panic recovery")
+	}
+
+	// Send a normal job to verify worker still works
+	normalExecuted := false
+	normalJob := &Job{
+		Data: "normal",
+		JobFunc: func(id int64, data interface{}) {
+			normalExecuted = true
+		},
+	}
+	jobChannel <- normalJob
+
+	// Wait for job to finish
+	select {
+	case <-jobFinished:
+	case <-time.After(time.Second):
+		t.Fatal("normal job did not finish")
+	}
+
+	if !normalExecuted {
+		t.Fatal("normal job was not executed after panic recovery")
+	}
+
+	// Clean up
+	close(endChannel)
+}

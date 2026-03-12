@@ -2,6 +2,7 @@ package pool
 
 import (
 	"log"
+	"runtime/debug"
 )
 
 type JobFunc func(id int64, data interface{})
@@ -27,8 +28,19 @@ func (w *Worker) Start() {
 			select {
 			case job := <-w.Channel: // worker has received job
 				if job != nil {
-					job.JobFunc(w.ID, job.Data) // do work
-					w.jobFinished <- true
+					func() {
+						defer func() {
+							if r := recover(); r != nil {
+								log.Printf("worker [%d] recovered from panic: %v\n%s", w.ID, r, debug.Stack())
+							}
+						}()
+						job.JobFunc(w.ID, job.Data) // do work
+					}()
+					select {
+					case w.jobFinished <- true:
+					case <-w.End:
+						return
+					}
 				}
 
 			case <-w.End:

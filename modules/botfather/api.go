@@ -927,10 +927,15 @@ func (bf *BotFather) getEventsResult(robotID string, eventID int64, limit int64)
 
 func (bf *BotFather) eventAck(c *wkhttp.Context) {
 	robotID := getRobotIDFromContext(c)
-	eventID, _ := strconv.ParseInt(c.Param("event_id"), 10, 64)
+	eventIDStr := c.Param("event_id")
+	eventID, err := strconv.ParseInt(eventIDStr, 10, 64)
+	if err != nil {
+		c.ResponseError(errors.New("event_id 格式无效"))
+		return
+	}
 
 	key := fmt.Sprintf("%s%s", bf.robotEventPrefix, robotID)
-	err := bf.ctx.GetRedisConn().ZRemRangeByScore(key, fmt.Sprintf("%d", eventID), fmt.Sprintf("%d", eventID))
+	err = bf.ctx.GetRedisConn().ZRemRangeByScore(key, fmt.Sprintf("%d", eventID), fmt.Sprintf("%d", eventID))
 	if err != nil {
 		c.ResponseError(err)
 		return

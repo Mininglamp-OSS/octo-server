@@ -103,14 +103,8 @@ func PostForWWWFormForBytres(urlStr string, params map[string]string, headers ma
 	for key, value := range params {
 		data.Set(key, value)
 	}
-	queryStr := ""
-
-	for key, value := range params {
-		queryStr = fmt.Sprintf("%s=%s&%s", key, value, queryStr)
-	}
-	if len(queryStr) > 0 {
-		queryStr = queryStr[0 : len(queryStr)-1]
-	}
+	// Use url.Values.Encode() for proper URL encoding to prevent parameter injection
+	queryStr := data.Encode()
 	request, err := http.NewRequest("POST", urlStr, strings.NewReader(queryStr))
 	if err != nil {
 		return nil, err
@@ -177,19 +171,12 @@ func PostForWWWFormForAll(urlStr string, bodyData io.Reader, headers map[string]
 }
 
 func PostForWWWFormReXML(urlStr string, params map[string]string, headers map[string]string) ([]byte, error) {
-
 	data := url.Values{}
 	for key, value := range params {
 		data.Set(key, value)
 	}
-	queryStr := ""
-
-	for key, value := range params {
-		queryStr = fmt.Sprintf("%s=%s&%s", key, value, queryStr)
-	}
-	if len(queryStr) > 0 {
-		queryStr = queryStr[0 : len(queryStr)-1]
-	}
+	// Use url.Values.Encode() for proper URL encoding to prevent parameter injection
+	queryStr := data.Encode()
 	request, err := http.NewRequest("POST", urlStr, strings.NewReader(queryStr))
 	if err != nil {
 		return nil, err

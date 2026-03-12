@@ -791,8 +791,12 @@ func (s *Space) getInviteInfo(c *wkhttp.Context) {
 	var cnt struct {
 		Count int `db:"count"`
 	}
-	_, _ = s.ctx.DB().SelectBySql("SELECT COUNT(*) as count FROM space_member WHERE space_id=? AND status=1", invitation.SpaceId).Load(&cnt)
-	memberCount = cnt.Count
+	_, err = s.ctx.DB().SelectBySql("SELECT COUNT(*) as count FROM space_member WHERE space_id=? AND status=1", invitation.SpaceId).Load(&cnt)
+	if err != nil {
+		s.Error("查询空间成员数失败", zap.Error(err), zap.String("spaceId", invitation.SpaceId))
+	} else {
+		memberCount = cnt.Count
+	}
 
 	c.Response(inviteResp{
 		InviteCode:  invitation.InviteCode,
@@ -845,8 +849,12 @@ func (s *Space) getInvitePreview(c *wkhttp.Context) {
 	var cnt struct {
 		Count int `db:"count"`
 	}
-	_, _ = s.ctx.DB().SelectBySql("SELECT COUNT(*) as count FROM space_member WHERE space_id=? AND status=1", invitation.SpaceId).Load(&cnt)
-	memberCount = cnt.Count
+	_, err = s.ctx.DB().SelectBySql("SELECT COUNT(*) as count FROM space_member WHERE space_id=? AND status=1", invitation.SpaceId).Load(&cnt)
+	if err != nil {
+		s.Error("查询空间成员数失败", zap.Error(err), zap.String("spaceId", invitation.SpaceId))
+	} else {
+		memberCount = cnt.Count
+	}
 
 	// 查询 Space 内的 Bot 列表
 	botModels, err := s.db.querySpaceBots(invitation.SpaceId)
