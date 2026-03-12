@@ -239,6 +239,23 @@ func (s *Search) global(c *wkhttp.Context) {
 	// 加入的群（按 Space 过滤）
 	groupResps := make([]*channelResp, 0)
 	searchSpaceID := c.Query("space_id")
+	// Verify space membership if space_id filter is provided
+	if searchSpaceID != "" {
+		var spaceCount int
+		_, err := s.ctx.DB().SelectBySql(
+			"SELECT COUNT(*) FROM space_member WHERE space_id=? AND uid=? AND status=1",
+			searchSpaceID, loginUID,
+		).Load(&spaceCount)
+		if err != nil {
+			s.Error("查询Space成员关系错误", zap.Error(err))
+			c.ResponseError(errors.New("查询空间权限失败"))
+			return
+		}
+		if spaceCount == 0 {
+			c.ResponseError(errors.New("没有权限搜索此空间"))
+			return
+		}
+	}
 	if req.OnlyMessage == 0 && len(joinedGroups) > 0 {
 		for _, g := range joinedGroups {
 			// Space 过滤：如果指定了 space_id，只显示该 Space 的群
