@@ -1203,7 +1203,8 @@ func (g *Group) addMembersTx(members []string, groupNo string, operator, operato
 		g.Error("查询成员用户信息失败！", zap.Error(err))
 		return nil, errors.New("查询成员用户信息失败！")
 	}
-	memberCount, err := g.db.QueryMemberCount(groupNo)
+	// Use transactional count with FOR UPDATE to prevent concurrent capacity bypass
+	memberCount, err := g.db.QueryMemberCountTx(groupNo, tx)
 	if err != nil {
 		g.Error("查询群成员数量失败！", zap.Error(err))
 		return nil, errors.New("查询群成员数量失败！")

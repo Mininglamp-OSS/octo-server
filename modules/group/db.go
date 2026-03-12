@@ -434,6 +434,13 @@ func (d *DB) QueryMemberCount(groupNo string) (int64, error) {
 	return count, err
 }
 
+// QueryMemberCountTx queries member count within a transaction using FOR UPDATE to prevent concurrent bypass.
+func (d *DB) QueryMemberCountTx(groupNo string, tx *dbr.Tx) (int64, error) {
+	var count int64
+	_, err := tx.SelectBySql("SELECT count(*) FROM group_member WHERE group_no=? AND is_deleted=0 FOR UPDATE", groupNo).Load(&count)
+	return count, err
+}
+
 // 查询群总数
 func (d *DB) queryGroupCount() (int64, error) {
 	var count int64
