@@ -100,6 +100,13 @@ func (rb *Robot) robotMessageListen(messages []*config.MessageResp) {
 							}
 						}
 						if !isFriend {
+							// 检查发送者是否为 bot 或系统账号，避免向 bot 发送系统提示导致消息循环
+							isFromBot, _ := rb.existRobot(message.FromUID)
+							if isFromBot || message.FromUID == rb.ctx.GetConfig().Account.SystemUID {
+								rb.Warn("发送者为Bot或系统账号，跳过好友提示避免消息循环",
+									zap.String("fromUID", message.FromUID), zap.String("robotID", realUID))
+								continue
+							}
 							rb.Warn("用户与Bot非好友关系，拒绝转发消息", zap.String("fromUID", message.FromUID), zap.String("robotID", realUID))
 							rb.ctx.SendMessage(&config.MsgSendReq{
 								Header: config.MsgHeader{
