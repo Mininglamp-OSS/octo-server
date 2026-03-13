@@ -171,7 +171,7 @@ func (w *Webhook) Stop() error {
 }
 
 func (w *Webhook) SendWebhook(ctx context.Context, req *wkhook.EventReq) (*wkhook.EventResp, error) {
-	w.Debug("收到webhook grpc事件", zap.String("event", req.Event), zap.String("data", string(req.Data)))
+	w.Debug("收到webhook grpc事件", zap.String("event", req.Event), zap.Int("dataLen", len(req.Data)))
 	_, err := w.handleEvent(req.Event, req.Data)
 	if err != nil {
 		w.Error("处理webhook事件失败！", zap.Error(err))
@@ -269,7 +269,7 @@ func (w *Webhook) webhook(c *wkhttp.Context) {
 	}
 	result, err := w.handleEvent(event, data)
 	if err != nil {
-		w.Error("事件处理失败！", zap.Error(err), zap.String("event", event), zap.String("data", string(data)))
+		w.Error("事件处理失败！", zap.Error(err), zap.String("event", event), zap.Int("dataLen", len(data)))
 		c.ResponseError(err)
 		return
 	}
