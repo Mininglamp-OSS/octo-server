@@ -483,6 +483,11 @@ func (m *Message) messageReaded(c *wkhttp.Context) {
 	}
 	// 异步处理 Redis 缓存
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				m.Error("messageReaded redis cache panic", zap.Any("recover", r), zap.String("stack", string(debug.Stack())))
+			}
+		}()
 		for _, message := range syncMsg.Messages {
 			messageIDStr := strconv.FormatInt(message.MessageID, 10)
 			jsonStr, err := json.Marshal(&messageReadedCountModel{
