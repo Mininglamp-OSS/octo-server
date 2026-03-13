@@ -7,9 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"path/filepath"
-	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -230,9 +228,9 @@ func (bf *BotFather) initBotFatherUser() {
 			return
 		}
 		defer func() {
-			if err := recover(); err != nil {
+			if r := recover(); r != nil {
 				tx.Rollback()
-				fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
+				bf.Error("panic in initBotFatherUser transaction, rolled back", zap.Any("recover", r))
 			}
 		}()
 

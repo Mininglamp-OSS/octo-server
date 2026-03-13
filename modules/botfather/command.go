@@ -821,7 +821,7 @@ func (h *commandHandler) disconnectBot(fromUID string, bot *robotModel) {
 
 // ========== 辅助方法 ==========
 
-func (h *commandHandler) createBot(creatorUID, fromUID, name, username, botToken string) error {
+func (h *commandHandler) createBot(creatorUID, fromUID, name, username, botToken string) (retErr error) {
 	robotID := username // 机器人的UID就是用户名
 
 	// 1. 创建 App
@@ -838,6 +838,8 @@ func (h *commandHandler) createBot(creatorUID, fromUID, name, username, botToken
 	defer func() {
 		if r := recover(); r != nil {
 			tx.Rollback()
+			h.Error("panic in createBot transaction, rolled back", zap.Any("recover", r))
+			retErr = fmt.Errorf("panic in createBot: %v", r)
 		}
 	}()
 
