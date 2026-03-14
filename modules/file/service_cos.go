@@ -76,14 +76,8 @@ func (sc *ServiceCOS) UploadFile(filePath string, contentType string, copyFileWr
 	}
 
 	bucketName := cosConfig.Bucket
-	fileName := filePath
-	// 如果路径包含 bucket 前缀，分离出来
-	strs := strings.Split(filePath, "/")
-	if len(strs) > 1 {
-		fileName = strings.TrimPrefix(filePath, fmt.Sprintf("%s/", strs[0]))
-	}
-
-	fileName = sc.withPrefix(fileName)
+	// COS 单 bucket 模式：保留完整路径（含 chat/ 等原始 bucket 名），用 prefix 区分环境
+	fileName := sc.withPrefix(filePath)
 
 	ctx := context.Background()
 	n, err := client.PutObject(ctx, bucketName, fileName, buff, int64(buff.Len()), minio.PutObjectOptions{
@@ -111,20 +105,8 @@ func (sc *ServiceCOS) GetFile(ph string) (io.ReadCloser, string, error) {
 
 	cosConfig := sc.ctx.GetConfig().COS
 	bucketName := cosConfig.Bucket
-	objectPath := ph
-	strs := strings.Split(ph, "/")
-	if len(strs) > 1 {
-		allowedBuckets := map[string]bool{
-			"file": true, "chat": true, "moment": true, "sticker": true,
-			"report": true, "chatbg": true, "common": true, "download": true,
-			"group": true, "avatar": true,
-		}
-		if allowedBuckets[strs[0]] {
-			objectPath = strings.TrimPrefix(ph, strs[0]+"/")
-		}
-	}
-
-	objectPath = sc.withPrefix(objectPath)
+	// COS 单 bucket 模式：保留完整路径，用 prefix 区分环境
+	objectPath := sc.withPrefix(ph)
 
 	obj, err := client.GetObject(context.Background(), bucketName, objectPath, minio.GetObjectOptions{})
 	if err != nil {
