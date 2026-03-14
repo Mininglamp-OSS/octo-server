@@ -16,6 +16,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
@@ -172,13 +173,22 @@ func (w *Webhook) Stop() error {
 
 func (w *Webhook) SendWebhook(ctx context.Context, req *wkhook.EventReq) (*wkhook.EventResp, error) {
 	w.Debug("收到webhook grpc事件", zap.String("event", req.Event), zap.Int("dataLen", len(req.Data)))
-	_, err := w.handleEvent(req.Event, req.Data)
+	result, err := w.handleEvent(req.Event, req.Data)
 	if err != nil {
 		w.Error("处理webhook事件失败！", zap.Error(err))
 		return nil, err
 	}
+	var respData []byte
+	if result != nil {
+		respData, err = json.Marshal(result)
+		if err != nil {
+			w.Error("序列化webhook响应失败！", zap.Error(err))
+			return nil, err
+		}
+	}
 	return &wkhook.EventResp{
 		Status: wkhook.EventStatus_Success,
+		Data:   respData,
 	}, nil
 }
 
@@ -293,6 +303,12 @@ func (w *Webhook) handleEvent(event string, data []byte) (interface{}, error) {
 			return nil, err
 		}
 		return w.handleMessageNotify(messages)
+	} else if event == "checkSpacePermission" {
+		var reqData map[string]interface{}
+		if err := util.ReadJsonByByte(data, &reqData); err != nil {
+			return nil, err
+		}
+		return w.checkSpacePermission(reqData)
 	}
 	return nil, nil
 }
@@ -454,7 +470,17 @@ func (w *Webhook) pushTo(msgResp msgOfflineNotify, toUids []string) error {
 	// var users []*user.Resp
 	userSettings := make([]*user.SettingResp, 0)
 	groupSettings := make([]*group.SettingResp, 0)
-	users, err := w.userService.GetUsers(toUids)
+
+	// Parse Space prefix UIDs to extract real UIDs for user lookup
+	toUIDMap := make(map[string]string) // original toUID -> real UID
+	realToUids := make([]string, 0, len(toUids))
+	for _, uid := range toUids {
+		_, realUID := spacepkg.ParseChannelID(uid)
+		toUIDMap[uid] = realUID
+		realToUids = append(realToUids, realUID)
+	}
+
+	users, err := w.userService.GetUsers(realToUids)
 	if err != nil {
 		w.Error("查询推送用户信息错误", zap.Error(err))
 		return nil
@@ -486,8 +512,10 @@ func (w *Webhook) pushTo(msgResp msgOfflineNotify, toUids []string) error {
 	}
 
 	for _, toUID := range toUids {
+		// Use real UID (without Space prefix) for user matching
+		realToUID := toUIDMap[toUID]
 		if !isVideoCall {
-			if !w.allowPush(users, userSettings, groupSettings, toUID, fromUID) {
+			if !w.allowPush(users, userSettings, groupSettings, realToUID, fromUID) {
 				continue
 			}
 		} else {
@@ -496,14 +524,14 @@ func (w *Webhook) pushTo(msgResp msgOfflineNotify, toUids []string) error {
 		var toUser *user.Resp
 		if len(users) > 0 {
 			for _, user := range users {
-				if user.UID == toUID {
+				if user.UID == realToUID {
 					toUser = user
 					break
 				}
 			}
 		}
 		if toUser == nil {
-			w.Error("没有找到toUser", zap.String("toUID", toUID))
+			w.Error("没有找到toUser", zap.String("toUID", toUID), zap.String("realToUID", realToUID))
 			continue
 		}
 

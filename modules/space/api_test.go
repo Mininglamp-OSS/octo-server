@@ -12,6 +12,10 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func strPtr(s string) *string {
+	return &s
+}
+
 func TestGetInvitePreview(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
@@ -512,7 +516,7 @@ func TestJoinSpaceWithPresetGroup(t *testing.T) {
 	err = f.db.insertSpaceNoTx(&SpaceModel{
 		SpaceId:        spaceId,
 		Name:           "带预置群的空间",
-		PresetGroupIds: `["` + groupNo + `"]`,
+		PresetGroupIds: strPtr(`["` + groupNo + `"]`),
 		Creator:        "admin",
 		Status:         1,
 	})
@@ -572,7 +576,7 @@ func TestJoinSpaceWithNoPresetGroup(t *testing.T) {
 	err = f.db.insertSpaceNoTx(&SpaceModel{
 		SpaceId:        spaceId,
 		Name:           "无预置群的空间",
-		PresetGroupIds: "", // 没有预置群
+		PresetGroupIds: nil, // 没有预置群
 		Creator:        "admin",
 		Status:         1,
 	})
@@ -640,11 +644,11 @@ func TestJoinSpacePresetGroupIdempotent(t *testing.T) {
 	spaceId := "test-space-idem"
 	inviteCode := "idem1234"
 	err = f.db.insertSpaceNoTx(&SpaceModel{
-		SpaceId:       spaceId,
-		Name:          "幂等测试空间",
-		PresetGroupIds: `["` + groupNo + `"]`,
-		Creator:       "admin",
-		Status:        1,
+		SpaceId:        spaceId,
+		Name:           "幂等测试空间",
+		PresetGroupIds: strPtr(`["` + groupNo + `"]`),
+		Creator:        "admin",
+		Status:         1,
 	})
 	assert.NoError(t, err)
 
@@ -706,11 +710,11 @@ func TestJoinSpacePresetGroupDisbanded(t *testing.T) {
 	spaceId := "test-space-disbanded"
 	inviteCode := "disband1"
 	err = f.db.insertSpaceNoTx(&SpaceModel{
-		SpaceId:       spaceId,
-		Name:          "预置群已解散的空间",
-		PresetGroupIds: `["` + groupNo + `"]`,
-		Creator:       "admin",
-		Status:        1,
+		SpaceId:        spaceId,
+		Name:           "预置群已解散的空间",
+		PresetGroupIds: strPtr(`["` + groupNo + `"]`),
+		Creator:        "admin",
+		Status:         1,
 	})
 	assert.NoError(t, err)
 

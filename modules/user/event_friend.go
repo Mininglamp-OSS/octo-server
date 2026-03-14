@@ -6,6 +6,7 @@ import (
 	"runtime/debug"
 
 	"github.com/Mininglamp-OSS/octo-server/modules/source"
+	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
@@ -73,6 +74,9 @@ func (f *Friend) handleFriendSure(data []byte, commit config.EventCommit) {
 		}
 	}
 
+	// Notify WuKongIM to flush permission cache for both users
+	space.FlushWuKongIMPermissionCacheAsync(f.ctx, []string{uid, toUID})
+
 	commit(nil)
 }
 
@@ -132,6 +136,9 @@ func (f *Friend) handleDeleteFriend(data []byte, commit config.EventCommit) {
 			f.Warn("添加Bot黑名单失败", zap.Error(err), zap.String("toUID", toUID))
 		}
 	}
+
+	// Notify WuKongIM to flush permission cache for both users
+	space.FlushWuKongIMPermissionCacheAsync(f.ctx, []string{uid, toUID})
 
 	commit(nil)
 }

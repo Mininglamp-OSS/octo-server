@@ -8,6 +8,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/register"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"go.uber.org/zap"
 )
 
@@ -43,6 +44,8 @@ func (w *Webhook) datasource(c *wkhttp.Context) {
 		result, err = w.getWhitelist(cmdReq.Data)
 	case "getSystemUIDs":
 		result, err = w.getSystemUIDs()
+	case "checkSpacePermission":
+		result, err = w.checkSpacePermission(cmdReq.Data)
 	}
 
 	if err != nil {
@@ -224,4 +227,25 @@ func (w *Webhook) getSystemUIDs() ([]string, error) {
 type ChannelReq struct {
 	ChannelID   string `json:"channel_id"`
 	ChannelType uint8  `json:"channel_type"`
+}
+
+func (w *Webhook) checkSpacePermission(data map[string]interface{}) (interface{}, error) {
+	var req space.CheckSpacePermissionReq
+	if err := util.ReadJsonByByte([]byte(util.ToJson(data)), &req); err != nil {
+		return nil, err
+	}
+
+	if req.FromUID == "" || req.ToChannelID == "" {
+		return nil, errors.New("from_uid and to_channel_id are required")
+	}
+
+	permService := space.NewPermissionService(w.ctx)
+	resp, err := permService.CheckSpacePermission(&req)
+	if err != nil {
+		w.Error("checkSpacePermission failed", zap.Error(err), zap.String("fromUID", req.FromUID), zap.String("toChannelID", req.ToChannelID))
+		return nil, err
+	}
+
+	w.Debug("checkSpacePermission result", zap.String("fromUID", req.FromUID), zap.String("toChannelID", req.ToChannelID), zap.Bool("allow", resp.Allow), zap.String("reason", resp.Reason))
+	return resp, nil
 }

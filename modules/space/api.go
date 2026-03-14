@@ -459,6 +459,7 @@ func (s *Space) removeMembers(c *wkhttp.Context) {
 		return
 	}
 
+	removedUIDs := make([]string, 0, len(req.UIDs))
 	for _, uid := range req.UIDs {
 		target, err := s.db.queryMember(spaceId, uid)
 		if err != nil {
@@ -478,8 +479,17 @@ func (s *Space) removeMembers(c *wkhttp.Context) {
 			c.ResponseError(errors.New("移除成员失败"))
 			return
 		}
+		removedUIDs = append(removedUIDs, uid)
 	}
 	c.ResponseOK()
+
+	// Update Redis cache and notify WuKongIM for removed members
+	for _, uid := range removedUIDs {
+		go func(u string) {
+			_ = RemoveSpaceMemberFromCache(s.ctx, spaceId, u)
+			FlushWuKongIMPermissionCacheAsync(s.ctx, []string{u})
+		}(uid)
+	}
 }
 
 // leaveSpace 退出空间
@@ -511,6 +521,12 @@ func (s *Space) leaveSpace(c *wkhttp.Context) {
 		return
 	}
 	c.ResponseOK()
+
+	// Update Redis cache and notify WuKongIM
+	go func() {
+		_ = RemoveSpaceMemberFromCache(s.ctx, spaceId, loginUID)
+		FlushWuKongIMPermissionCacheAsync(s.ctx, []string{loginUID})
+	}()
 }
 
 // updateMemberRole 修改成员角色
@@ -927,6 +943,12 @@ func (s *Space) updateInvite(c *wkhttp.Context) {
 
 // fireSpaceMemberJoinEvent 触发 SpaceMemberJoin 事件
 func (s *Space) fireSpaceMemberJoinEvent(uid string, spaceId string) {
+	// Update Redis cache
+	_ = AddSpaceMemberToCache(s.ctx, spaceId, uid)
+
+	// Notify WuKongIM to flush permission cache
+	FlushWuKongIMPermissionCacheAsync(s.ctx, []string{uid})
+
 	tx, err := s.ctx.DB().Begin()
 	if err != nil {
 		s.Error("开启SpaceMemberJoin事件事务失败", zap.Error(err))
