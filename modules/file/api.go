@@ -299,7 +299,11 @@ func (f *File) getFile(c *wkhttp.Context) {
 		c.Header("Content-Disposition", fmt.Sprintf("inline; filename*=UTF-8''%s", escapedFilename))
 	}
 
-	downloadURL, err := f.service.DownloadURL(ph, filename)
+	dlFilename := filename
+	if disposition != "attachment" {
+		dlFilename = "" // inline显示不带content-disposition
+	}
+	downloadURL, err := f.service.DownloadURL(ph, dlFilename)
 	if err != nil {
 		c.ResponseError(err)
 		return

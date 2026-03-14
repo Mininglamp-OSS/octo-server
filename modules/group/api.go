@@ -286,7 +286,7 @@ func (g *Group) avatarGet(c *wkhttp.Context) {
 		return
 	}
 	path := g.ctx.GetConfig().GetGroupAvatarFilePath(groupNo)
-	downloadUrl, err := g.fileService.DownloadURL(path, "group_avatar.jpeg")
+	downloadUrl, err := g.fileService.DownloadURL(path, "")
 	if err != nil {
 		g.Error("获取下载路径失败！", zap.Error(err))
 		c.Writer.WriteHeader(http.StatusInternalServerError)

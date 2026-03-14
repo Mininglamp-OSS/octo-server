@@ -384,7 +384,6 @@ func (u *User) UserAvatar(c *wkhttp.Context) {
 		return
 	}
 	ph := ""
-	fileName := fmt.Sprintf("%s.png", uid)
 	downloadUrl := ""
 	if userInfo.IsUploadAvatar == 1 {
 		avatarID := crc32.ChecksumIEEE([]byte(uid)) % uint32(u.ctx.GetConfig().Avatar.Partition)
@@ -426,7 +425,7 @@ func (u *User) UserAvatar(c *wkhttp.Context) {
 		}
 	}
 	if downloadUrl == "" {
-		downloadUrl, err = u.fileService.DownloadURL(ph, fileName)
+		downloadUrl, err = u.fileService.DownloadURL(ph, "")
 		if err != nil {
 			u.Error("获取文件下载地址失败", zap.Error(err))
 			c.Writer.WriteHeader(http.StatusInternalServerError)
