@@ -101,6 +101,7 @@ func (bf *BotFather) Route(r *wkhttp.WKHttp) {
 		botAPI.POST("/setCommands", bf.setCommands)
 		// Bot File API (#433)
 		botAPI.POST("/file/upload", bf.botUploadFile)
+		botAPI.POST("/upload", bf.botUploadFile) // 兼容旧路径 (/v1/bot/upload)
 		botAPI.GET("/file/download/*path", bf.botFileDownload)
 	}
 
