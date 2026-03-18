@@ -178,10 +178,10 @@ func (d *botfatherDB) queryUserAPIKeyByKey(apiKey string) (*userAPIKeyModel, err
 	return m, err
 }
 
-// queryUserAPIKeyByUID 查询用户的API Key
+// queryUserAPIKeyByUID 查询用户的无 Space 绑定的 API Key（legacy 回退）
 func (d *botfatherDB) queryUserAPIKeyByUID(uid string) (*userAPIKeyModel, error) {
 	var m *userAPIKeyModel
-	_, err := d.session.Select("*").From("user_api_key").Where("uid=?", uid).Load(&m)
+	_, err := d.session.Select("*").From("user_api_key").Where("uid=? AND space_id=''", uid).Load(&m)
 	return m, err
 }
 
@@ -191,10 +191,18 @@ func (d *botfatherDB) insertUserAPIKey(uid, apiKey, spaceID string) error {
 	return err
 }
 
-// updateUserAPIKeySpaceID 更新已有API Key的绑定Space
-func (d *botfatherDB) updateUserAPIKeySpaceID(uid, spaceID string) error {
-	_, err := d.session.Update("user_api_key").Set("space_id", spaceID).Where("uid=? AND space_id!=?", uid, spaceID).Exec()
-	return err
+// queryUserAPIKeyByUIDAndSpaceID 查询用户在指定Space下的API Key
+func (d *botfatherDB) queryUserAPIKeyByUIDAndSpaceID(uid, spaceID string) (*userAPIKeyModel, error) {
+	var m *userAPIKeyModel
+	_, err := d.session.Select("*").From("user_api_key").Where("uid=? AND space_id=?", uid, spaceID).Load(&m)
+	return m, err
+}
+
+// querySpaceNameByID 查询Space名称
+func (d *botfatherDB) querySpaceNameByID(spaceID string) (string, error) {
+	var name string
+	err := d.session.SelectBySql("SELECT name FROM space WHERE id=? AND status=1", spaceID).LoadOne(&name)
+	return name, err
 }
 
 // queryRobotByRobotIDAndCreator 查询指定创建者的Bot

@@ -408,34 +408,63 @@ func (h *commandHandler) handleQuickstart(fromUID string) {
 	// 获取当前 Space ID，绑定到 API Key
 	spaceID := h.resolveSpaceID(fromUID)
 
-	// 获取或创建 User API Key（绑定当前 Space）
-	existing, err := h.db.queryUserAPIKeyByUID(realUID)
-	if err != nil {
-		h.Error("查询User API Key失败", zap.Error(err))
-		h.reply(fromUID, "操作失败，请稍后重试。")
-		return
+	// 查找当前 Space 的名称（用于展示）
+	spaceName := ""
+	if spaceID != "" {
+		if name, err := h.db.querySpaceNameByID(spaceID); err == nil && name != "" {
+			spaceName = name
+		}
 	}
-	apiKey := ""
-	if existing != nil {
-		apiKey = existing.APIKey
-		// 每次 quickstart 更新绑定的 Space（用户可能切换了 Space）
-		if spaceID != "" && existing.SpaceID != spaceID {
-			if err := h.db.updateUserAPIKeySpaceID(realUID, spaceID); err != nil {
-				h.Error("更新API Key绑定Space失败", zap.Error(err))
+
+	// 获取或创建 User API Key（每个 Space 独立一把 Key）
+	var apiKey string
+	if spaceID != "" {
+		// 优先查当前 Space 是否已有 Key
+		existing, err := h.db.queryUserAPIKeyByUIDAndSpaceID(realUID, spaceID)
+		if err != nil {
+			h.Error("查询User API Key失败", zap.Error(err))
+			h.reply(fromUID, "操作失败，请稍后重试。")
+			return
+		}
+		if existing != nil {
+			apiKey = existing.APIKey
+		} else {
+			apiKey, err = generateUserAPIKey()
+			if err != nil {
+				h.Error("生成User API Key失败", zap.Error(err))
+				h.reply(fromUID, "操作失败，请稍后重试。")
+				return
+			}
+			err = h.db.insertUserAPIKey(realUID, apiKey, spaceID)
+			if err != nil {
+				h.Error("保存User API Key失败", zap.Error(err))
+				h.reply(fromUID, "操作失败，请稍后重试。")
+				return
 			}
 		}
 	} else {
-		apiKey, err = generateUserAPIKey()
+		// 无 Space 场景：回退到按 UID 查询（兼容旧数据）
+		existing, err := h.db.queryUserAPIKeyByUID(realUID)
 		if err != nil {
-			h.Error("生成User API Key失败", zap.Error(err))
+			h.Error("查询User API Key失败", zap.Error(err))
 			h.reply(fromUID, "操作失败，请稍后重试。")
 			return
 		}
-		err = h.db.insertUserAPIKey(realUID, apiKey, spaceID)
-		if err != nil {
-			h.Error("保存User API Key失败", zap.Error(err))
-			h.reply(fromUID, "操作失败，请稍后重试。")
-			return
+		if existing != nil {
+			apiKey = existing.APIKey
+		} else {
+			apiKey, err = generateUserAPIKey()
+			if err != nil {
+				h.Error("生成User API Key失败", zap.Error(err))
+				h.reply(fromUID, "操作失败，请稍后重试。")
+				return
+			}
+			err = h.db.insertUserAPIKey(realUID, apiKey, "")
+			if err != nil {
+				h.Error("保存User API Key失败", zap.Error(err))
+				h.reply(fromUID, "操作失败，请稍后重试。")
+				return
+			}
 		}
 	}
 
@@ -443,6 +472,14 @@ func (h *commandHandler) handleQuickstart(fromUID string) {
 	apiURL := cfg.External.BaseURL
 	if strings.TrimSpace(apiURL) == "" {
 		apiURL = fmt.Sprintf("http://%s:8090", cfg.External.IP)
+	}
+
+	// 构造 Space 提示行
+	spaceInfo := ""
+	if spaceName != "" {
+		spaceInfo = fmt.Sprintf("\n📌 当前 Space：%s", spaceName)
+	} else if spaceID != "" {
+		spaceInfo = fmt.Sprintf("\n📌 当前 Space ID：%s", spaceID)
 	}
 
 	h.reply(fromUID, fmt.Sprintf(`🚀 Quickstart
@@ -459,9 +496,9 @@ Create a bot, get the bot_token, then follow the skill.md instructions to connec
 All User API endpoints require: Authorization: Bearer %s
 ---
 
-💡 User API Key 可反复使用，用于管理你的所有 Bot（Bot 会自动加入你当前的 Space）
+💡 User API Key 可反复使用，用于管理你的所有 Bot（Bot 会自动加入你当前的 Space）%s
 🔑 你的 API Key: %s`,
-		apiURL, apiKey, apiURL, apiKey, apiKey))
+		apiURL, apiKey, apiURL, apiKey, spaceInfo, apiKey))
 }
 
 func (h *commandHandler) handleHelp(fromUID string) {

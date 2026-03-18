@@ -54,6 +54,27 @@ func getAPIKeyUID(c *wkhttp.Context) string {
 	return ""
 }
 
+func getAPIKeySpaceID(c *wkhttp.Context) string {
+	v, _ := c.Get("api_key_space_id")
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
+
+// isBotInSpace checks whether a bot belongs to the given Space.
+func (bf *BotFather) isBotInSpace(botID, spaceID string) (bool, error) {
+	var count int
+	_, err := bf.db.session.SelectBySql(
+		"SELECT COUNT(*) FROM space_member WHERE space_id=? AND uid=? AND status=1",
+		spaceID, botID,
+	).Load(&count)
+	return count > 0, err
+}
+
 // setupUserAPIRoutes 注册 User API Key 认证的路由
 func (bf *BotFather) setupUserAPIRoutes(r *wkhttp.WKHttp) {
 	userAPI := r.Group("/v1/user", bf.authUserAPIKey())
@@ -193,14 +214,10 @@ func (bf *BotFather) createUserBot(c *wkhttp.Context) {
 		return
 	}
 
-	// Resolve Space ID: request > API Key binding
-	spaceID := req.SpaceID
+	// Resolve Space ID: API Key binding takes authority; fall back to request
+	spaceID := getAPIKeySpaceID(c)
 	if spaceID == "" {
-		if v, ok := c.Get("api_key_space_id"); ok {
-			if s, ok := v.(string); ok {
-				spaceID = s
-			}
-		}
+		spaceID = req.SpaceID
 	}
 
 	// Add bot to Space (best-effort, non-critical)
@@ -242,7 +259,15 @@ func (bf *BotFather) createUserBot(c *wkhttp.Context) {
 // listUserBots GET /v1/user/bots
 func (bf *BotFather) listUserBots(c *wkhttp.Context) {
 	uid := getAPIKeyUID(c)
-	bots, err := bf.db.queryRobotsByCreatorUID(uid)
+	spaceID := getAPIKeySpaceID(c)
+
+	var bots []*robotModel
+	var err error
+	if spaceID != "" {
+		bots, err = bf.db.queryRobotsByCreatorUIDAndSpaceID(uid, spaceID)
+	} else {
+		bots, err = bf.db.queryRobotsByCreatorUID(uid)
+	}
 	if err != nil {
 		bf.Error("查询Bot列表失败", zap.Error(err))
 		c.ResponseError(errors.New("查询失败"))
@@ -274,6 +299,7 @@ func (bf *BotFather) listUserBots(c *wkhttp.Context) {
 // updateUserBot PUT /v1/user/bots/:bot_id
 func (bf *BotFather) updateUserBot(c *wkhttp.Context) {
 	uid := getAPIKeyUID(c)
+	spaceID := getAPIKeySpaceID(c)
 	botID := c.Param("bot_id")
 
 	bot, err := bf.db.queryRobotByRobotIDAndCreator(botID, uid)
@@ -285,6 +311,20 @@ func (bf *BotFather) updateUserBot(c *wkhttp.Context) {
 	if bot == nil {
 		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"msg": "Bot不存在或无权限"})
 		return
+	}
+
+	// Space isolation: if the API Key is bound to a Space, verify the bot belongs to it
+	if spaceID != "" {
+		inSpace, sErr := bf.isBotInSpace(botID, spaceID)
+		if sErr != nil {
+			bf.Error("校验Bot Space归属失败", zap.Error(sErr))
+			c.ResponseError(errors.New("查询失败"))
+			return
+		}
+		if !inSpace {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "该Bot不属于当前Space"})
+			return
+		}
 	}
 
 	var req UpdateBotReq
@@ -330,6 +370,7 @@ func (bf *BotFather) updateUserBot(c *wkhttp.Context) {
 // deleteUserBot DELETE /v1/user/bots/:bot_id
 func (bf *BotFather) deleteUserBot(c *wkhttp.Context) {
 	uid := getAPIKeyUID(c)
+	spaceID := getAPIKeySpaceID(c)
 	botID := c.Param("bot_id")
 
 	bot, err := bf.db.queryRobotByRobotIDAndCreator(botID, uid)
@@ -341,6 +382,20 @@ func (bf *BotFather) deleteUserBot(c *wkhttp.Context) {
 	if bot == nil {
 		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"msg": "Bot不存在或无权限"})
 		return
+	}
+
+	// Space isolation: if the API Key is bound to a Space, verify the bot belongs to it
+	if spaceID != "" {
+		inSpace, sErr := bf.isBotInSpace(botID, spaceID)
+		if sErr != nil {
+			bf.Error("校验Bot Space归属失败", zap.Error(sErr))
+			c.ResponseError(errors.New("查询失败"))
+			return
+		}
+		if !inSpace {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "该Bot不属于当前Space"})
+			return
+		}
 	}
 
 	// Clean up IM connection: invalidate token to kick existing WS sessions
@@ -407,6 +462,7 @@ func (bf *BotFather) deleteUserBot(c *wkhttp.Context) {
 // getUserBotToken GET /v1/user/bots/:bot_id/token
 func (bf *BotFather) getUserBotToken(c *wkhttp.Context) {
 	uid := getAPIKeyUID(c)
+	spaceID := getAPIKeySpaceID(c)
 	botID := c.Param("bot_id")
 
 	bot, err := bf.db.queryRobotByRobotIDAndCreator(botID, uid)
@@ -418,6 +474,20 @@ func (bf *BotFather) getUserBotToken(c *wkhttp.Context) {
 	if bot == nil {
 		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"msg": "Bot不存在或无权限"})
 		return
+	}
+
+	// Space isolation: if the API Key is bound to a Space, verify the bot belongs to it
+	if spaceID != "" {
+		inSpace, sErr := bf.isBotInSpace(botID, spaceID)
+		if sErr != nil {
+			bf.Error("校验Bot Space归属失败", zap.Error(sErr))
+			c.ResponseError(errors.New("查询失败"))
+			return
+		}
+		if !inSpace {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "该Bot不属于当前Space"})
+			return
+		}
 	}
 
 	c.Response(gin.H{

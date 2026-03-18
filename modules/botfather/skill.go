@@ -615,9 +615,18 @@ Manage bots programmatically using a User API Key (obtained via BotFather /quick
 
 All endpoints require: `+"`"+`Authorization: Bearer uk_xxxxx`+"`"+`
 
+### Space-bound API Keys
+
+Each API Key is bound to a specific Space. When you run /quickstart in a Space, you get a key scoped to that Space:
+
+- **Bots created** with that key are automatically added to the bound Space
+- **GET /v1/user/bots** returns only bots in the bound Space
+- Running /quickstart in a different Space generates a **separate key** for that Space
+- Keys without a Space binding (legacy) return all bots across all Spaces
+
 ### Quickstart Flow
 
-1. Get your User API Key from BotFather /quickstart command
+1. Get your User API Key from BotFather /quickstart command (key is bound to your current Space)
 2. Create a bot via POST /v1/user/bots
 3. Get the bot_token from the response
 4. Register the bot via POST /v1/bot/register with the bot_token
