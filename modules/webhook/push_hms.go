@@ -20,6 +20,7 @@ import (
 type HMSPayload struct {
 	Payload
 	accessToken string
+	spaceID     string
 }
 
 // NewHMSPayload NewHMSPayload
@@ -27,6 +28,7 @@ func NewHMSPayload(payloadInfo *PayloadInfo, accessToken string) *HMSPayload {
 	return &HMSPayload{
 		Payload:     payloadInfo.toPayload(),
 		accessToken: accessToken,
+		spaceID:     payloadInfo.SpaceID,
 	}
 }
 
@@ -87,30 +89,37 @@ func (h *HMSPush) Push(deviceToken string, payload Payload) error {
 		category = "VOIP"
 	}
 
-	resp, err := network.Post(fmt.Sprintf("https://push-api.cloud.huawei.com/v1/%s/messages:send", h.appID), []byte(util.ToJson(map[string]interface{}{
-		"validate_only": false,
-		"message": map[string]interface{}{
-			"token": []string{deviceToken},
-			"android": map[string]interface{}{
-				"category": category,
-				"notification": map[string]interface{}{
-					"visibility":    "PUBLIC",
-					"title":         payload.GetTitle(),
-					"body":          payload.GetContent(),
-					"sound":         sound,
-					"importance":    "NORMAL",
-					"default_sound": false,
-					"channel_id":    channelID,
-					"click_action": map[string]interface{}{
-						"type": 3,
-					},
-					"badge": map[string]interface{}{
-						"add_num": 1,
-						"class":   fmt.Sprintf("%s%s", h.packageName, ".MainActivity"),
-					},
+	messagePayload := map[string]interface{}{
+		"token": []string{deviceToken},
+		"android": map[string]interface{}{
+			"category": category,
+			"notification": map[string]interface{}{
+				"visibility":    "PUBLIC",
+				"title":         payload.GetTitle(),
+				"body":          payload.GetContent(),
+				"sound":         sound,
+				"importance":    "NORMAL",
+				"default_sound": false,
+				"channel_id":    channelID,
+				"click_action": map[string]interface{}{
+					"type": 3,
+				},
+				"badge": map[string]interface{}{
+					"add_num": 1,
+					"class":   fmt.Sprintf("%s%s", h.packageName, ".MainActivity"),
 				},
 			},
 		},
+	}
+	if hmsPayload.spaceID != "" {
+		messagePayload["data"] = util.ToJson(map[string]string{
+			"space_id": hmsPayload.spaceID,
+		})
+	}
+
+	resp, err := network.Post(fmt.Sprintf("https://push-api.cloud.huawei.com/v1/%s/messages:send", h.appID), []byte(util.ToJson(map[string]interface{}{
+		"validate_only": false,
+		"message":       messagePayload,
 	})), map[string]string{
 		"Authorization": fmt.Sprintf("Bearer %s", hmsPayload.accessToken),
 	})

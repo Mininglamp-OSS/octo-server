@@ -58,6 +58,7 @@ func NewFIREBASEPush(jsonPath string, packageName string, projectID string, chan
 type FIREBASEPayload struct {
 	Payload
 	notifyID string
+	spaceID  string
 }
 
 // NewFIREBASEPayload NewFIREBASEPayload
@@ -65,6 +66,7 @@ func NewFIREBASEPayload(payloadInfo *PayloadInfo, notifyID string) *FIREBASEPayl
 	return &FIREBASEPayload{
 		Payload:  payloadInfo.toPayload(),
 		notifyID: notifyID,
+		spaceID:  payloadInfo.SpaceID,
 	}
 }
 
@@ -79,15 +81,20 @@ func (m *FIREBASEPush) GetPayload(msg msgOfflineNotify, ctx *config.Context, toU
 
 // Push 推送
 func (m *FIREBASEPush) Push(deviceToken string, payload Payload) error {
-	miPayload := payload.(*FIREBASEPayload)
+	fbPayload := payload.(*FIREBASEPayload)
 	ctx := context.Background()
 	// 文档 https://firebase.google.com/docs/admin/setup?hl=zh-cn#go_1
 	message := &messaging.Message{
 		Notification: &messaging.Notification{
-			Title: miPayload.GetTitle(),
-			Body:  miPayload.GetContent(),
+			Title: fbPayload.GetTitle(),
+			Body:  fbPayload.GetContent(),
 		},
 		Token: deviceToken,
+	}
+	if fbPayload.spaceID != "" {
+		message.Data = map[string]string{
+			"space_id": fbPayload.spaceID,
+		}
 	}
 
 	// Send a message to the device corresponding to the provided

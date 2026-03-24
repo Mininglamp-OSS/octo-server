@@ -16,6 +16,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
@@ -450,6 +451,19 @@ func (w *Webhook) pushTo(msgResp msgOfflineNotify, toUids []string) error {
 		return nil
 	}
 
+	// 解析消息来源的 space_id
+	if msgResp.ChannelType == common.ChannelTypeGroup.Uint8() {
+		groupInfo, err := w.groupService.GetGroupWithGroupNo(msgResp.ChannelID)
+		if err != nil {
+			w.Warn("获取群 space_id 失败，继续推送", zap.Error(err), zap.String("channelID", msgResp.ChannelID))
+		} else if groupInfo != nil {
+			msgResp.SpaceID = groupInfo.SpaceID
+		}
+	} else if msgResp.ChannelType == common.ChannelTypePerson.Uint8() {
+		spaceID, _ := spacepkg.ParseChannelID(msgResp.ChannelID)
+		msgResp.SpaceID = spaceID
+	}
+
 	var err error
 	// var users []*user.Resp
 	userSettings := make([]*user.SettingResp, 0)
@@ -732,6 +746,7 @@ type msgOfflineNotify struct {
 	Compress        string   `json:"compress,omitempty"`         // 压缩ToUIDs 如果为空 表示不压缩 为gzip则采用gzip压缩
 	CompresssToUIDs []byte   `json:"compress_to_uids,omitempty"` // 已压缩的to_uids
 	SourceID        int64    `json:"source_id,omitempty"`        // 来源节点ID
+	SpaceID         string   `json:"space_id,omitempty"`         // Space ID for push filtering
 }
 
 type pushResp struct {

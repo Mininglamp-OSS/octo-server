@@ -36,6 +36,7 @@ func NewMIPush(appID string, appSecret string, packageName string, channelID str
 type MIPayload struct {
 	Payload
 	notifyID string
+	spaceID  string
 }
 
 // NewMIPayload NewMIPayload
@@ -43,6 +44,7 @@ func NewMIPayload(payloadInfo *PayloadInfo, notifyID string) *MIPayload {
 	return &MIPayload{
 		Payload:  payloadInfo.toPayload(),
 		notifyID: notifyID,
+		spaceID:  payloadInfo.SpaceID,
 	}
 }
 
@@ -61,7 +63,7 @@ func (m *MIPush) Push(deviceToken string, payload Payload) error {
 
 	// 文档 https://dev.mi.com/console/doc/detail?pId=1163
 
-	result, err := network.PostForWWWForm("https://api.xmpush.xiaomi.com/v4/message/regid", map[string]string{
+	params := map[string]string{
 		"registration_id":         deviceToken,
 		"payload":                 url.QueryEscape(miPayload.GetContent()), //消息的内容。（注意：需要对payload字符串做urlencode处理）
 		"restricted_package_name": m.packageName,
@@ -74,7 +76,12 @@ func (m *MIPush) Push(deviceToken string, payload Payload) error {
 		"extra.badge":             fmt.Sprintf("%d", payload.GetBadge()),
 		"extra.notify_effect":     "1",
 		"extra.channel_id":        m.channelID,
-	}, map[string]string{
+	}
+	if miPayload.spaceID != "" {
+		params["extra.space_id"] = miPayload.spaceID
+	}
+
+	result, err := network.PostForWWWForm("https://api.xmpush.xiaomi.com/v4/message/regid", params, map[string]string{
 		"Authorization": fmt.Sprintf("key=%s", m.appSecret),
 	})
 	if err != nil {

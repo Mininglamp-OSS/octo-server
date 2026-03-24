@@ -16,6 +16,7 @@ import (
 // IOSPayload iOS负载
 type IOSPayload struct {
 	Payload
+	spaceID string
 }
 
 // NewIOSPayload NewIOSPayload
@@ -23,6 +24,7 @@ func NewIOSPayload(payloadInfo *PayloadInfo) Payload {
 
 	return &IOSPayload{
 		Payload: payloadInfo.toPayload(),
+		spaceID: payloadInfo.SpaceID,
 	}
 }
 
@@ -77,10 +79,11 @@ func (p *IOSPush) Push(deviceToken string, payload Payload) error {
 	notification.DeviceToken = deviceToken
 	notification.Topic = p.topic
 
+	iosPayload := payload.(*IOSPayload)
 	rtcPayload := payload.GetRTCPayload()
 	if rtcPayload != nil {
 		fmt.Println("音视频推送。。。。。")
-		notification.Payload = []byte(util.ToJson(map[string]interface{}{
+		data := map[string]interface{}{
 			"aps": map[string]interface{}{
 				"content-available": 1,
 				"alert":             "",
@@ -90,10 +93,14 @@ func (p *IOSPush) Push(deviceToken string, payload Payload) error {
 			"content":   payload.GetContent(),
 			"call_type": rtcPayload.GetCallType(),
 			"from_uid":  rtcPayload.GetFromUID(),
-		}))
+		}
+		if iosPayload.spaceID != "" {
+			data["space_id"] = iosPayload.spaceID
+		}
+		notification.Payload = []byte(util.ToJson(data))
 	} else {
 		fmt.Println("普通推送。。。。。")
-		notification.Payload = []byte(util.ToJson(map[string]interface{}{
+		data := map[string]interface{}{
 			"aps": map[string]interface{}{
 				"alert": map[string]interface{}{
 					"title": payload.GetTitle(),
@@ -102,7 +109,11 @@ func (p *IOSPush) Push(deviceToken string, payload Payload) error {
 				"badge": payload.GetBadge(),
 				"sound": "default",
 			},
-		}))
+		}
+		if iosPayload.spaceID != "" {
+			data["space_id"] = iosPayload.spaceID
+		}
+		notification.Payload = []byte(util.ToJson(data))
 	}
 
 	p.clientMu.Lock()

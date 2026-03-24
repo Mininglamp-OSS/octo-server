@@ -36,6 +36,8 @@ type PayloadInfo struct {
 	FromUID     string // rtc消息需要
 	CallType    common.RTCCallType
 	Operation   string
+
+	SpaceID string // 推送所属 Space
 }
 
 func (p *PayloadInfo) toPayload() Payload {
@@ -94,6 +96,7 @@ func ParsePushInfo(msgResp msgOfflineNotify, ctx *config.Context, toUser *user.R
 		content = fmt.Sprintf("%s：%s", fromName, content)
 	}
 	payloadInfo.Content = content
+	payloadInfo.SpaceID = msgResp.SpaceID
 
 	return payloadInfo, nil
 }

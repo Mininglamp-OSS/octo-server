@@ -41,6 +41,7 @@ func NewVIVOPush(appID, appKey, appSecret string, ctx *config.Context) *VIVOPush
 type VIVOPayload struct {
 	Payload
 	notifyID string
+	spaceID  string
 }
 
 // NewVIVOPayload NewVIVOPayload
@@ -48,6 +49,7 @@ func NewVIVOPayload(payloadInfo *PayloadInfo, notifyID string) *VIVOPayload {
 	return &VIVOPayload{
 		Payload:  payloadInfo.toPayload(),
 		notifyID: notifyID,
+		spaceID:  payloadInfo.SpaceID,
 	}
 }
 
@@ -66,7 +68,7 @@ func (v *VIVOPush) Push(deviceToken string, payload Payload) error {
 	authToken := v.getAuthToken()
 	vivoPayload := payload.(*VIVOPayload)
 
-	resp, err := network.Post("https://api-push.vivo.com.cn/message/send", []byte(util.ToJson(map[string]interface{}{
+	pushData := map[string]interface{}{
 		"regId":          deviceToken,
 		"notifyType":     "4",
 		"title":          vivoPayload.GetTitle(),
@@ -75,7 +77,14 @@ func (v *VIVOPush) Push(deviceToken string, payload Payload) error {
 		"classification": "1",
 		"pushMode":       "1",
 		"requestId":      util.GenerUUID(),
-	})), map[string]string{
+	}
+	if vivoPayload.spaceID != "" {
+		pushData["clientCustomMap"] = map[string]string{
+			"space_id": vivoPayload.spaceID,
+		}
+	}
+
+	resp, err := network.Post("https://api-push.vivo.com.cn/message/send", []byte(util.ToJson(pushData)), map[string]string{
 		"authToken": authToken,
 	})
 
