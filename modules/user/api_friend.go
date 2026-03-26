@@ -510,8 +510,12 @@ func (f *Friend) friendApply(c *wkhttp.Context) {
 			// 自动通过好友申请
 			go f.autoApproveFriend(fromUID, toUser.UID, token)
 		} else if botFriendApplyHook != nil {
-			// 需要 owner 审批
-			go botFriendApplyHook(fromUID, fromName, toUser.UID, req.Remark, token)
+			// 需要 owner 审批，传递 space_id 保证通知隔离到正确 Space
+			spaceID := c.Query("space_id")
+			if spaceID == "" {
+				spaceID = c.GetHeader("X-Space-ID")
+			}
+			go botFriendApplyHook(fromUID, fromName, toUser.UID, req.Remark, token, spaceID)
 		}
 	}
 

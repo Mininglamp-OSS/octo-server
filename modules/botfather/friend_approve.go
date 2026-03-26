@@ -27,7 +27,8 @@ type BotFriendApply struct {
 	ApplyName string `json:"apply_name"`
 	RobotID   string `json:"robot_id"`
 	Remark    string `json:"remark"`
-	Token     string `json:"token"` // friend apply token from cache
+	Token     string `json:"token"`     // friend apply token from cache
+	SpaceID   string `json:"space_id"`  // 申请来源 Space，用于隔离通知
 	CreatedAt int64  `json:"created_at"`
 }
 
@@ -199,26 +200,39 @@ func (h *commandHandler) approveFriend(ownerUID string, applyUID string, robotID
 		content = h.ctx.GetConfig().Friend.AddedTipsText
 	}
 
+	// 获取 Space ID：优先从申请记录读取，其次从当前消息处理链获取
+	applySpaceID := apply.SpaceID
+	if applySpaceID == "" {
+		applySpaceID = h.resolveSpaceID(ownerUID)
+	}
+
 	// Send CMD to sync friend list on both clients
+	cmdParam := map[string]interface{}{
+		"to_uid":   applyUID,
+		"from_uid": robotID,
+	}
+	if applySpaceID != "" {
+		cmdParam["space_id"] = applySpaceID
+	}
 	_ = h.ctx.SendCMD(config.MsgCMDReq{
 		CMD:         common.CMDFriendAccept,
 		Subscribers: []string{applyUID, robotID},
-		Param: map[string]interface{}{
-			"to_uid":   applyUID,
-			"from_uid": robotID,
-		},
+		Param:       cmdParam,
 	})
 
 	// Send tip message
-	payload := []byte(util.ToJson(map[string]interface{}{
+	tipPayload := map[string]interface{}{
 		"content": content,
 		"type":    common.Tip,
-	}))
+	}
+	if applySpaceID != "" {
+		tipPayload["space_id"] = applySpaceID
+	}
 	_ = h.ctx.SendMessage(&config.MsgSendReq{
 		FromUID:     robotID,
 		ChannelID:   applyUID,
 		ChannelType: common.ChannelTypePerson.Uint8(),
-		Payload:     payload,
+		Payload:     []byte(util.ToJson(tipPayload)),
 		Header: config.MsgHeader{
 			RedDot: 1,
 		},
@@ -282,13 +296,13 @@ func (h *commandHandler) updateFriendApplyStatus(robotID, applyUID string, statu
 
 // RegisterFriendApplyHook 注册好友申请通知回调到 user 模块
 func RegisterFriendApplyHook(ctx *config.Context) {
-	user.RegisterBotFriendApplyHook(func(applyUID, applyName, robotID, remark, token string) {
-		notifyOwnerFriendApply(ctx, applyUID, applyName, robotID, remark, token)
+	user.RegisterBotFriendApplyHook(func(applyUID, applyName, robotID, remark, token, spaceID string) {
+		notifyOwnerFriendApply(ctx, applyUID, applyName, robotID, remark, token, spaceID)
 	})
 }
 
 // notifyOwnerFriendApply 通知 bot owner 有好友申请
-func notifyOwnerFriendApply(ctx *config.Context, applyUID, applyName, robotID, remark, token string) {
+func notifyOwnerFriendApply(ctx *config.Context, applyUID, applyName, robotID, remark, token, spaceID string) {
 	handler := newCommandHandler(ctx)
 	l := log.NewTLog("BotFather")
 
@@ -299,13 +313,14 @@ func notifyOwnerFriendApply(ctx *config.Context, applyUID, applyName, robotID, r
 		return
 	}
 
-	// 存储申请
+	// 存储申请（含 spaceID，approve/reject 时读取）
 	apply := &BotFriendApply{
 		ApplyUID:  applyUID,
 		ApplyName: applyName,
 		RobotID:   robotID,
 		Remark:    remark,
 		Token:     token,
+		SpaceID:   spaceID,
 	}
 	err = handler.StoreBotFriendApply(apply)
 	if err != nil {
@@ -324,6 +339,13 @@ func notifyOwnerFriendApply(ctx *config.Context, applyUID, applyName, robotID, r
 		applyUID, robotID,
 		applyUID, robotID,
 	)
+
+	// 设置 Space 上下文后调用 reply，确保通知发送到正确的 Space
+	// 此函数从 hook 回调调用（非消息处理链），sync.Map 中无 owner 的 Space 信息
+	if spaceID != "" {
+		cleanup := setSpaceIDFromPayload(bot.CreatorUID, spaceID)
+		defer cleanup()
+	}
 	handler.reply(bot.CreatorUID, msg)
 }
 
