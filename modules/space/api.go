@@ -332,7 +332,7 @@ func (s *Space) listMembers(c *wkhttp.Context) {
 		limit = 10000
 	}
 
-	members, err := s.db.queryMembers(spaceId, page, limit)
+	members, err := s.db.queryMembers(spaceId, loginUID, page, limit)
 	if err != nil {
 		c.ResponseError(errors.New("查询成员列表失败"))
 		return
