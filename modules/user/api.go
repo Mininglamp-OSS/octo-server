@@ -443,6 +443,21 @@ func (u *User) UserAvatar(c *wkhttp.Context) {
 // uploadAvatar 上传用户头像
 func (u *User) uploadAvatar(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
+	targetUID := c.Param("uid")
+	if targetUID == "" {
+		targetUID = loginUID
+	}
+
+	// 若 targetUID 与 loginUID 不同，需确认 loginUID 是该 bot 的创建者
+	if targetUID != loginUID {
+		var creatorUID string
+		err := u.ctx.DB().Select("IFNULL(creator_uid,'')").From("robot").Where("robot_id=? and status=1", targetUID).LoadOne(&creatorUID)
+		if err != nil || creatorUID != loginUID {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "无权限修改该用户头像", "status": 403})
+			return
+		}
+	}
+
 	if c.Request.MultipartForm == nil {
 		err := c.Request.ParseMultipartForm(1024 * 1024 * 20) // 20M
 		if err != nil {
@@ -457,8 +472,8 @@ func (u *User) uploadAvatar(c *wkhttp.Context) {
 		c.ResponseError(errors.New("读取文件失败！"))
 		return
 	}
-	avatarID := crc32.ChecksumIEEE([]byte(loginUID)) % uint32(u.ctx.GetConfig().Avatar.Partition)
-	_, err = u.fileService.UploadFile(fmt.Sprintf("avatar/%d/%s.png", avatarID, loginUID), "image/png", func(w io.Writer) error {
+	avatarID := crc32.ChecksumIEEE([]byte(targetUID)) % uint32(u.ctx.GetConfig().Avatar.Partition)
+	_, err = u.fileService.UploadFile(fmt.Sprintf("avatar/%d/%s.png", avatarID, targetUID), "image/png", func(w io.Writer) error {
 		_, err := io.Copy(w, file)
 		return err
 	})
@@ -468,7 +483,7 @@ func (u *User) uploadAvatar(c *wkhttp.Context) {
 		c.ResponseError(errors.New("上传文件失败！"))
 		return
 	}
-	friends, err := u.friendDB.QueryFriends(loginUID)
+	friends, err := u.friendDB.QueryFriends(targetUID)
 	if err != nil {
 		u.Error("查询用户好友失败")
 		return
@@ -483,7 +498,7 @@ func (u *User) uploadAvatar(c *wkhttp.Context) {
 			CMD:         common.CMDUserAvatarUpdate,
 			Subscribers: uids,
 			Param: map[string]interface{}{
-				"uid": loginUID,
+				"uid": targetUID,
 			},
 		})
 		if err != nil {
@@ -492,7 +507,7 @@ func (u *User) uploadAvatar(c *wkhttp.Context) {
 		}
 	}
 	//更改用户上传头像状态
-	err = u.db.UpdateUsersWithField("is_upload_avatar", "1", loginUID)
+	err = u.db.UpdateUsersWithField("is_upload_avatar", "1", targetUID)
 	if err != nil {
 		u.Error("修改用户是否修改头像错误！", zap.Error(err))
 		c.ResponseError(errors.New("修改用户是否修改头像错误！"))

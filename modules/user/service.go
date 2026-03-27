@@ -251,6 +251,10 @@ func (s *Service) GetUserDetail(uid string, loginUID string) (*UserDetailResp, e
 			resp.BotDescription = botDetails[0].Description
 			resp.BotCreatorUID = botDetails[0].CreatorUID
 			resp.BotAutoApprove = botDetails[0].AutoApprove
+			// Bot 创建者可上传 Bot 头像，对其展示上传入口
+			if botDetails[0].CreatorUID == loginUID {
+				resp.IsUploadAvatar = 1
+			}
 			// 查创建者昵称
 			if botDetails[0].CreatorUID != "" {
 				var creatorName string
@@ -474,6 +478,10 @@ func (s *Service) GetUserDetails(uids []string, loginUID string) ([]*UserDetailR
 						resp.BotCreatorUID = d.CreatorUID
 						resp.BotCreatorName = creatorNameMap[d.CreatorUID]
 						resp.BotAutoApprove = d.AutoApprove
+						// Bot 创建者可上传 Bot 头像，对其展示上传入口
+						if d.CreatorUID == loginUID {
+							resp.IsUploadAvatar = 1
+						}
 					}
 				}
 			}
