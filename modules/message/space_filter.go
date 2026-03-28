@@ -113,14 +113,34 @@ func filterConversationsCore(
 				// 普通 Bot 在此 Space → 显示
 				filtered = append(filtered, conv)
 			} else if !botSet[conv.ChannelID] {
-				// 普通 DM（非 Bot） → 所有 Space 可见
-				filtered = append(filtered, conv)
+				// 普通 DM（非 Bot）→ 仅在 Recents 中有匹配 space_id 的消息时显示
+				if personConvHasSpaceMessages(conv, filterSpaceID) {
+					filtered = append(filtered, conv)
+				}
 			}
 			// Bot 不在此 Space → 不显示
 		}
 		// 其他情况（旧群会话 + 非默认 Space）→ 不显示
 	}
 	return filtered
+}
+
+// personConvHasSpaceMessages 检查 Person 会话的 Recents 中是否有 space_id 匹配的消息。
+// 用于判断该 DM 会话是否"属于"目标 Space（有过消息往来）。
+func personConvHasSpaceMessages(conv *SyncUserConversationResp, targetSpaceID string) bool {
+	if conv == nil || len(conv.Recents) == 0 {
+		return false
+	}
+	for _, msg := range conv.Recents {
+		if msg.Payload != nil {
+			if sid, ok := msg.Payload["space_id"]; ok {
+				if sidStr, ok := sid.(string); ok && sidStr == targetSpaceID {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // resolveBotFilter 批量查询 Bot 状态和 Space 成员关系。

@@ -53,20 +53,26 @@ func TestFilterConversationsBySpace_DefaultSpaceBareConvs(t *testing.T) {
 		{ChannelID: "user2", ChannelType: common.ChannelTypePerson.Uint8(), SpaceID: ""},
 	}
 
-	// filterSpaceID == defaultSpaceID
+	// filterSpaceID == defaultSpaceID → 旧会话保留
 	result := filterConversationsCore(convs, "spaceA", "spaceA", nil, nil, nil, false, false)
 	assert.Len(t, result, 2)
 
-	// filterSpaceID != defaultSpaceID → 普通 DM 仍然可见
+	// filterSpaceID != defaultSpaceID → 无 Recents 匹配 → 不显示
 	result = filterConversationsCore(convs, "spaceB", "spaceA", nil, nil, nil, false, false)
-	assert.Len(t, result, 2)
+	assert.Len(t, result, 0)
 }
 
 func TestFilterConversationsBySpace_NonDefaultSpaceDMVisible(t *testing.T) {
-	// 非默认 Space 中，普通 DM（非 Bot）应保留，Bot 不在此 Space 则不显示
+	// 非默认 Space 中，普通 DM 需有 Recents 中 space_id 匹配才显示
 	convs := []*SyncUserConversationResp{
-		{ChannelID: "user1", ChannelType: common.ChannelTypePerson.Uint8(), SpaceID: ""},
-		{ChannelID: "user2", ChannelType: common.ChannelTypePerson.Uint8(), SpaceID: ""},
+		{
+			ChannelID: "user1", ChannelType: common.ChannelTypePerson.Uint8(), SpaceID: "",
+			Recents: []*MsgSyncResp{{Payload: map[string]interface{}{"space_id": "spaceB", "content": "hi"}}},
+		},
+		{
+			ChannelID: "user2", ChannelType: common.ChannelTypePerson.Uint8(), SpaceID: "",
+			Recents: []*MsgSyncResp{{Payload: map[string]interface{}{"space_id": "spaceA", "content": "old"}}},
+		},
 		{ChannelID: "custom_bot", ChannelType: common.ChannelTypePerson.Uint8(), SpaceID: ""},
 		{ChannelID: "bot_in_space", ChannelType: common.ChannelTypePerson.Uint8(), SpaceID: ""},
 	}
@@ -77,16 +83,65 @@ func TestFilterConversationsBySpace_NonDefaultSpaceDMVisible(t *testing.T) {
 	// filterSpaceID=spaceB != defaultSpaceID=spaceA
 	result := filterConversationsCore(convs, "spaceB", "spaceA", nil, botSet, botInSpace, false, false)
 
-	// user1, user2（普通 DM）保留；bot_in_space（Bot 在此 Space）保留；custom_bot（Bot 不在此 Space）不保留
-	assert.Len(t, result, 3)
+	// user1（Recents 有 spaceB 消息）保留；user2（Recents 只有 spaceA）过滤；
+	// bot_in_space（Bot 在此 Space）保留；custom_bot（Bot 不在此 Space）不保留
+	assert.Len(t, result, 2)
 	ids := make([]string, len(result))
 	for i, r := range result {
 		ids[i] = r.ChannelID
 	}
 	assert.Contains(t, ids, "user1")
-	assert.Contains(t, ids, "user2")
 	assert.Contains(t, ids, "bot_in_space")
+	assert.NotContains(t, ids, "user2")
 	assert.NotContains(t, ids, "custom_bot")
+}
+
+func TestFilterConversationsBySpace_NewSpaceCleanSlate(t *testing.T) {
+	// 全新 Space：所有 DM 的 Recents 都没有该 Space 的消息 → 全部过滤
+	convs := []*SyncUserConversationResp{
+		{
+			ChannelID: "user1", ChannelType: common.ChannelTypePerson.Uint8(), SpaceID: "",
+			Recents: []*MsgSyncResp{{Payload: map[string]interface{}{"space_id": "spaceA", "content": "hi"}}},
+		},
+		{
+			ChannelID: "user2", ChannelType: common.ChannelTypePerson.Uint8(), SpaceID: "",
+			Recents: []*MsgSyncResp{{Payload: map[string]interface{}{"content": "no space"}}},
+		},
+		{
+			ChannelID: "user3", ChannelType: common.ChannelTypePerson.Uint8(), SpaceID: "",
+			// 空 Recents
+		},
+	}
+
+	result := filterConversationsCore(convs, "spaceNew", "spaceA", nil, map[string]bool{}, map[string]bool{}, false, false)
+
+	// 新 Space 没有任何 DM 有匹配消息 → clean slate
+	assert.Len(t, result, 0)
+}
+
+func TestPersonConvHasSpaceMessages(t *testing.T) {
+	// 有匹配的 space_id
+	conv1 := &SyncUserConversationResp{
+		Recents: []*MsgSyncResp{
+			{Payload: map[string]interface{}{"content": "hello"}},
+			{Payload: map[string]interface{}{"content": "world", "space_id": "spaceX"}},
+		},
+	}
+	assert.True(t, personConvHasSpaceMessages(conv1, "spaceX"))
+	assert.False(t, personConvHasSpaceMessages(conv1, "spaceY"))
+
+	// 空 Recents
+	conv2 := &SyncUserConversationResp{}
+	assert.False(t, personConvHasSpaceMessages(conv2, "spaceX"))
+
+	// nil conv
+	assert.False(t, personConvHasSpaceMessages(nil, "spaceX"))
+
+	// payload 为 nil
+	conv3 := &SyncUserConversationResp{
+		Recents: []*MsgSyncResp{{Payload: nil}},
+	}
+	assert.False(t, personConvHasSpaceMessages(conv3, "spaceX"))
 }
 
 func TestFilterConversationsBySpace_GroupSpaceMap(t *testing.T) {
