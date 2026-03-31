@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
@@ -337,4 +338,49 @@ func (bf *BotFather) sendGroupMdNotification(groupNo string, updatedBy string, v
 	if err != nil {
 		bf.Error("send GROUP.md notification failed", zap.Error(err))
 	}
+}
+
+// spaceUIDPattern matches space-prefixed UIDs: s{digits}_{baseUID}
+var spaceUIDPattern = regexp.MustCompile(`^s\d+_(.+)$`)
+
+// stripSpacePrefix extracts the base UID from a space-prefixed UID.
+// "s14_abc123" → "abc123", "abc123" → "abc123" (unchanged)
+func stripSpacePrefix(uid string) string {
+	if m := spaceUIDPattern.FindStringSubmatch(uid); len(m) == 2 {
+		return m[1]
+	}
+	return uid
+}
+
+// getUserInfo 查询用户基本信息 (GET /v1/bot/user/info?uid=xxx)
+// Bot 通过 token 认证后，查询指定 UID 的用户 name 和 avatar。
+// 用于 OpenClaw adapter DM 场景的 sender 名字解析。
+func (bf *BotFather) getUserInfo(c *wkhttp.Context) {
+	uid := strings.TrimSpace(c.Query("uid"))
+	if uid == "" {
+		c.ResponseError(errors.New("uid参数不能为空"))
+		return
+	}
+
+	// Strip space prefix if present (WuKongIM adds s{spaceId}_ in WS layer,
+	// but user table stores bare UIDs)
+	bareUID := stripSpacePrefix(uid)
+
+	userResp, err := bf.userService.GetUser(bareUID)
+	if err != nil || userResp == nil {
+		c.JSON(http.StatusNotFound, gin.H{"msg": "用户不存在"})
+		return
+	}
+
+	cfg := bf.ctx.GetConfig()
+	apiURL := cfg.External.BaseURL
+	if strings.TrimSpace(apiURL) == "" {
+		apiURL = fmt.Sprintf("http://%s:8090", cfg.External.IP)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"uid":    userResp.UID,
+		"name":   userResp.Name,
+		"avatar": fmt.Sprintf("%s/users/%s/avatar", apiURL, userResp.UID),
+	})
 }
