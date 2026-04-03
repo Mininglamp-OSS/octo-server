@@ -219,6 +219,8 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 		return
 	}
 
+	contentType = inferContentType(contentType, ext)
+
 	path := uploadPath
 	if !strings.HasPrefix(path, "/") {
 		path = fmt.Sprintf("/%s", path)
@@ -278,6 +280,36 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 		resp["sha512"] = encoded
 	}
 	c.Response(resp)
+}
+
+// textExtFallback covers common text extensions that may not exist in the
+// system MIME database (e.g. .md on macOS).
+var textExtFallback = map[string]string{
+	".md":       "text/markdown",
+	".markdown": "text/markdown",
+	".yml":      "text/yaml",
+	".yaml":     "text/yaml",
+	".log":      "text/plain",
+	".ini":      "text/plain",
+	".cfg":      "text/plain",
+	".conf":     "text/plain",
+}
+
+// inferContentType detects the content type from file extension when the
+// client-provided contentType is the default "application/octet-stream",
+// and ensures text/* types include charset=utf-8.
+func inferContentType(contentType string, ext string) string {
+	if contentType == "application/octet-stream" {
+		if detected := mime.TypeByExtension(ext); detected != "" {
+			contentType = detected
+		} else if fallback, ok := textExtFallback[ext]; ok {
+			contentType = fallback
+		}
+	}
+	if strings.HasPrefix(contentType, "text/") && !strings.Contains(contentType, "charset") {
+		contentType = contentType + "; charset=utf-8"
+	}
+	return contentType
 }
 
 // 获取文件
