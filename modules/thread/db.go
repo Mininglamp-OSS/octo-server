@@ -47,6 +47,15 @@ func (d *DB) InsertTx(m *Model, tx *dbr.Tx) error {
 	return err
 }
 
+// InsertTxReturningID 事务插入子区并返回 ID
+func (d *DB) InsertTxReturningID(m *Model, tx *dbr.Tx) (int64, error) {
+	result, err := tx.InsertInto("thread").Columns(util.AttrToUnderscore(m)...).Record(m).Exec()
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
+}
+
 // QueryByShortID 根据 shortID 查询子区
 func (d *DB) QueryByShortID(shortID string) (*Model, error) {
 	var model *Model
@@ -199,4 +208,33 @@ func (d *DB) CountMembers(threadID int64) (int, error) {
 		Where("thread_id=?", threadID).
 		Load(&count)
 	return count, err
+}
+
+// MemberCountResult 成员数量结果
+type MemberCountResult struct {
+	ThreadID int64 `db:"thread_id"`
+	Count    int   `db:"count"`
+}
+
+// CountMembersBatch 批量统计子区成员数量
+func (d *DB) CountMembersBatch(threadIDs []int64) (map[int64]int, error) {
+	if len(threadIDs) == 0 {
+		return make(map[int64]int), nil
+	}
+
+	var results []MemberCountResult
+	_, err := d.session.Select("thread_id", "count(*) as count").
+		From("thread_member").
+		Where("thread_id IN ?", threadIDs).
+		GroupBy("thread_id").
+		Load(&results)
+	if err != nil {
+		return nil, err
+	}
+
+	countMap := make(map[int64]int, len(results))
+	for _, r := range results {
+		countMap[r.ThreadID] = r.Count
+	}
+	return countMap, nil
 }

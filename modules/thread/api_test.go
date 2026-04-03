@@ -554,3 +554,120 @@ func TestBussDataSource_ChannelGet(t *testing.T) {
 	_, err = mod.BussDataSource.ChannelGet(fakeID, 5, testutil.UID)
 	assert.Equal(t, register.ErrDatasourceNotProcess, err)
 }
+
+// ==================== 修复验证测试 ====================
+
+// TestCreateThread_TransactionIntegrity 验证 #2: 事务完整性
+// 创建子区后，thread 和 member 记录应同时存在
+func TestCreateThread_TransactionIntegrity(t *testing.T) {
+	s, ctx := setupTestData(t)
+	groupNo := createTestGroup(t, ctx)
+
+	// 创建子区
+	shortID := createThreadViaAPI(t, s, groupNo, "事务测试")
+
+	// 验证 thread 记录存在
+	db := NewDB(ctx)
+	thread, err := db.QueryByGroupNoAndShortID(groupNo, shortID)
+	assert.NoError(t, err)
+	assert.NotNil(t, thread)
+	assert.Equal(t, "事务测试", thread.Name)
+	assert.True(t, thread.Id > 0, "thread.Id should be populated")
+
+	// 验证 creator 作为 member 存在
+	members, err := db.QueryMembers(thread.Id)
+	assert.NoError(t, err)
+	assert.Len(t, members, 1)
+	assert.Equal(t, testutil.UID, members[0].UID)
+	assert.Equal(t, MemberRoleCreator, members[0].Role)
+}
+
+// TestGetThreads_MemberCountBatch 验证 #3: 批量查询 member_count
+// GetThreads 应正确返回每个子区的成员数量
+func TestGetThreads_MemberCountBatch(t *testing.T) {
+	s, ctx := setupTestData(t)
+	groupNo := createTestGroup(t, ctx)
+
+	// 创建多个子区
+	shortID1 := createThreadViaAPI(t, s, groupNo, "话题1")
+	_ = createThreadViaAPI(t, s, groupNo, "话题2")
+
+	// 获取子区列表
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/groups/"+groupNo+"/threads", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var threads []ThreadResp
+	util.ReadJsonByByte(w.Body.Bytes(), &threads)
+
+	assert.Len(t, threads, 2)
+
+	// 验证每个子区都有 member_count 字段且至少为 1
+	for _, thread := range threads {
+		assert.GreaterOrEqual(t, thread.MemberCount, 1, "member_count should be at least 1 (creator)")
+	}
+
+	// 验证 shortID1 的 member_count = 1（只有创建者）
+	for _, thread := range threads {
+		if thread.ShortID == shortID1 {
+			assert.Equal(t, 1, thread.MemberCount)
+		}
+	}
+}
+
+// TestGetMembers_WithUserName 验证 #7: MemberResp.Name 填充
+// GetMembers 应返回成员的用户名
+func TestGetMembers_WithUserName(t *testing.T) {
+	s, ctx := setupTestData(t)
+	groupNo := createTestGroup(t, ctx)
+
+	// 创建子区
+	shortID := createThreadViaAPI(t, s, groupNo, "成员名称测试")
+
+	// 获取成员列表
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/groups/"+groupNo+"/threads/"+shortID+"/members", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var members []MemberResp
+	util.ReadJsonByByte(w.Body.Bytes(), &members)
+
+	assert.Len(t, members, 1)
+
+	// 验证 name 字段已填充（不是空字符串）
+	member := members[0]
+	assert.Equal(t, testutil.UID, member.UID)
+	assert.NotEmpty(t, member.Name, "member name should not be empty")
+	assert.Equal(t, "测试用户", member.Name) // setupTestData 中创建的用户名
+}
+
+// TestCreateThread_CreatorAsMember 验证创建者自动成为成员
+func TestCreateThread_CreatorAsMember(t *testing.T) {
+	s, ctx := setupTestData(t)
+	groupNo := createTestGroup(t, ctx)
+
+	// 创建子区
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/groups/"+groupNo+"/threads", bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
+		"name": "创建者成员测试",
+	}))))
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var createResp ThreadResp
+	util.ReadJsonByByte(w.Body.Bytes(), &createResp)
+
+	// 验证返回的 member_count = 1
+	assert.Equal(t, 1, createResp.MemberCount)
+
+	// 验证创建者 UID
+	assert.Equal(t, testutil.UID, createResp.CreatorUID)
+}

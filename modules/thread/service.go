@@ -11,6 +11,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"go.uber.org/zap"
 )
 
@@ -49,6 +50,7 @@ type Service struct {
 	ctx          *config.Context
 	db           *DB
 	groupService group.IService
+	userService  user.IService
 	log.Log
 }
 
@@ -58,6 +60,7 @@ func NewService(ctx *config.Context) IService {
 		ctx:          ctx,
 		db:           NewDB(ctx),
 		groupService: group.NewService(ctx),
+		userService:  user.NewService(ctx),
 		Log:          log.NewTLog("threadService"),
 	}
 }
@@ -124,29 +127,40 @@ func (s *Service) CreateThread(req *CreateThreadReq) (*ThreadResp, error) {
 		Version:         version,
 	}
 
-	err = s.db.Insert(thread)
+	// 使用事务插入 thread 和 member
+	tx, err := s.db.session.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	threadID, err := s.db.InsertTxReturningID(thread, tx)
 	if err != nil {
 		return nil, fmt.Errorf("insert thread: %w", err)
 	}
-
-	// 获取刚插入的子区 ID
-	threadID, err := s.db.QueryThreadIDByShortID(shortID)
-	if err != nil {
-		s.Error("获取子区ID失败", zap.Error(err))
-	}
+	thread.Id = threadID
 
 	// 添加创建者为子区成员
-	if threadID > 0 {
-		memberVersion, _ := s.ctx.GenSeq(ThreadSeqKey)
-		err = s.db.InsertMember(&MemberModel{
-			ThreadID: threadID,
-			UID:      req.CreatorUID,
-			Role:     MemberRoleCreator,
-			Version:  memberVersion,
-		})
-		if err != nil {
-			s.Error("添加创建者为成员失败", zap.Error(err))
-		}
+	memberVersion, err := s.ctx.GenSeq(ThreadSeqKey)
+	if err != nil {
+		return nil, fmt.Errorf("generate member sequence: %w", err)
+	}
+	err = s.db.InsertMemberTx(&MemberModel{
+		ThreadID: threadID,
+		UID:      req.CreatorUID,
+		Role:     MemberRoleCreator,
+		Version:  memberVersion,
+	}, tx)
+	if err != nil {
+		return nil, fmt.Errorf("insert creator as member: %w", err)
+	}
+
+	if err = tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit transaction: %w", err)
 	}
 
 	// 创建 IM 频道，只添加创建者为订阅者（只有主动加入的成员才收到消息通知）
@@ -158,15 +172,13 @@ func (s *Service) CreateThread(req *CreateThreadReq) (*ThreadResp, error) {
 		Subscribers: []string{req.CreatorUID},
 	})
 	if err != nil {
-		s.Error("创建IM频道失败",
-			zap.Error(err),
-			zap.String("channelID", channelID))
+		return nil, fmt.Errorf("create IM channel: %w", err)
 	}
 
 	// 在父群发送子区创建消息
 	s.sendThreadCreatedMessage(req.GroupNo, shortID, req.Name, req.CreatorUID, req.CreatorName)
 
-	resp := s.toThreadResp(thread)
+	resp := s.toThreadRespWithID(thread)
 	resp.MemberCount = 1 // 创建者
 	return resp, nil
 }
@@ -207,9 +219,35 @@ func (s *Service) GetThreads(groupNo string) ([]*ThreadResp, error) {
 		return nil, fmt.Errorf("query threads by group: %w", err)
 	}
 
+	if len(threads) == 0 {
+		return []*ThreadResp{}, nil
+	}
+
+	// 批量查询成员数量
+	threadIDs := make([]int64, 0, len(threads))
+	for _, t := range threads {
+		if t.Id > 0 {
+			threadIDs = append(threadIDs, t.Id)
+		}
+	}
+	memberCounts, _ := s.db.CountMembersBatch(threadIDs)
+
 	results := make([]*ThreadResp, 0, len(threads))
 	for _, t := range threads {
-		results = append(results, s.toThreadResp(t))
+		resp := &ThreadResp{
+			ShortID:         t.ShortID,
+			GroupNo:         t.GroupNo,
+			ChannelID:       BuildChannelID(t.GroupNo, t.ShortID),
+			ChannelType:     common.ChannelTypeCommunityTopic.Uint8(),
+			Name:            t.Name,
+			CreatorUID:      t.CreatorUID,
+			SourceMessageID: t.SourceMessageID,
+			Status:          t.Status,
+			MemberCount:     memberCounts[t.Id],
+			CreatedAt:       util.ToyyyyMMddHHmmss(time.Time(t.CreatedAt)),
+			UpdatedAt:       util.ToyyyyMMddHHmmss(time.Time(t.UpdatedAt)),
+		}
+		results = append(results, resp)
 	}
 	return results, nil
 }
@@ -369,13 +407,20 @@ func (s *Service) canOperate(groupNo, shortID, uid string) (bool, error) {
 	return isManager, nil
 }
 
-// toThreadResp 转换为响应
+// toThreadResp 转换为响应（需要额外查询 ID）
 func (s *Service) toThreadResp(m *Model) *ThreadResp {
-	// 查询成员数量
-	threadID, _ := s.db.QueryThreadIDByShortID(m.ShortID)
+	// 如果 Model 没有 ID，需要查询
+	if m.Id == 0 {
+		m.Id, _ = s.db.QueryThreadIDByShortID(m.ShortID)
+	}
+	return s.toThreadRespWithID(m)
+}
+
+// toThreadRespWithID 转换为响应（Model 已有 ID）
+func (s *Service) toThreadRespWithID(m *Model) *ThreadResp {
 	memberCount := 0
-	if threadID > 0 {
-		memberCount, _ = s.db.CountMembers(threadID)
+	if m.Id > 0 {
+		memberCount, _ = s.db.CountMembers(m.Id)
 	}
 
 	return &ThreadResp{
@@ -554,10 +599,26 @@ func (s *Service) GetMembers(groupNo, shortID string) ([]*MemberResp, error) {
 		return nil, fmt.Errorf("query members: %w", err)
 	}
 
+	if len(members) == 0 {
+		return []*MemberResp{}, nil
+	}
+
+	// 批量查询用户名
+	uids := make([]string, 0, len(members))
+	for _, m := range members {
+		uids = append(uids, m.UID)
+	}
+	users, _ := s.userService.GetUsers(uids)
+	userNameMap := make(map[string]string, len(users))
+	for _, u := range users {
+		userNameMap[u.UID] = u.Name
+	}
+
 	results := make([]*MemberResp, 0, len(members))
 	for _, m := range members {
 		results = append(results, &MemberResp{
 			UID:       m.UID,
+			Name:      userNameMap[m.UID],
 			Role:      m.Role,
 			CreatedAt: util.ToyyyyMMddHHmmss(time.Time(m.CreatedAt)),
 		})

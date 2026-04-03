@@ -199,8 +199,15 @@ Content-Type: application/json
 
 ### 当前实现 vs Discord Threads
 
+> 参考: [Discord Threads API](https://discord.com/developers/docs/topics/threads) | [Discord Threads FAQ](https://support.discord.com/hc/en-us/articles/4403205878423-Threads-FAQ)
+
 | 功能 | Discord | 当前实现 | 状态 |
 |------|---------|----------|------|
+| **子区类型** |
+| Public Thread | ✅ 所有频道成员可见 | ✅ 父群成员可见 | 完成 |
+| Private Thread | ✅ 邀请制私密子区 | ❌ | 未实现 |
+| Forum Channel | ✅ 专用帖子频道 | ❌ | 未实现 |
+| Media Channel | ✅ 媒体帖子（Beta） | ❌ | 未实现 |
 | **基础功能** |
 | 创建子区 | ✅ | ✅ | 完成 |
 | 从消息创建子区 | ✅ | ✅ 字段已有 | ⚠️ 前端未实现 |
@@ -209,14 +216,23 @@ Content-Type: application/json
 | **成员模型** |
 | 发消息自动加入 | ✅ | ❌ | 需 webhook |
 | 主动加入/离开 | ✅ | ✅ | 完成 |
-| 成员列表 | ✅ | ✅ | 完成 |
+| 成员列表 | ✅ `/thread-members` | ✅ `/members` | 完成 |
 | 成员计数 | ✅ | ✅ | 完成 |
+| **实时事件** |
+| threadCreate | ✅ Gateway 事件 | ⚠️ 父群通知消息 | 不同机制 |
+| threadUpdate | ✅ Gateway 事件 | ❌ | 未实现 |
+| threadDelete | ✅ Gateway 事件 | ❌ | 未实现 |
+| threadMembersUpdate | ✅ 成员变动推送 | ❌ | 未实现 |
 | **消息** |
 | 父群通知消息 | ✅ 可点击入口 | ✅ type=1100 | ⚠️ 前端渲染 |
 | 历史消息可见 | ✅ 所有父群成员 | ✅ | 完成 |
-| **自动化** |
-| 自动归档 (7天无活动) | ✅ | ❌ | 未实现 |
+| **生命周期** |
+| 自动归档 | ✅ 1h/24h/3d/7d 四档 | ❌ | 未实现 |
+| 自动锁定 | ✅ 归档后禁止回复 | ⚠️ ban=1 禁止发送 | 部分实现 |
 | 自动隐藏已归档子区 | ✅ | ❌ | 未实现 |
+| **高级特性** |
+| 慢速模式 | ✅ `rate_limit_per_user` | ❌ | 未实现 |
+| 置顶消息 | ✅ | ❌ | 未实现 |
 | **通知** |
 | @提及通知 | ✅ | ❌ | 未实现 |
 | 未读计数 | ✅ | ❌ | 未实现 |
@@ -224,6 +240,16 @@ Content-Type: application/json
 | **同步** |
 | 父群成员退群同步 | ✅ | ❌ | 未实现 |
 | 父群删除级联删除 | ✅ | ❌ | 未实现 |
+
+### 核心差异说明
+
+1. **Private Thread** — Discord 支持邀请制私密子区，DMWork 当前只有公开子区（所有父群成员可见）
+
+2. **自动归档** — Discord 提供 1h/24h/3d/7d 四档自动归档选项，DMWork 需要手动归档
+
+3. **实时事件** — Discord 通过 Gateway 推送 `threadCreate`/`threadUpdate`/`threadMembersUpdate` 等事件，DMWork 当前通过父群消息通知 + 客户端轮询
+
+4. **发消息自动加入** — Discord 原生支持发送消息自动加入 thread members，DMWork 需要通过 WuKongIM webhook 实现
 
 ### 优先级建议
 
