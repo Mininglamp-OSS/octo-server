@@ -220,10 +220,10 @@ func TestStateMachineKey(t *testing.T) {
 	sm := newStateMachine(ctx)
 
 	// 测试 key 生成
-	key := sm.key("user_001")
+	key := sm.key("user_001", "")
 	assert.Equal(t, "botfather:state:user_001", key)
 
-	key2 := sm.key("user_002")
+	key2 := sm.key("user_002", "")
 	assert.Equal(t, "botfather:state:user_002", key2)
 
 	// 不同 UID 应产生不同 key
@@ -236,7 +236,7 @@ func TestStateMachineKey_EmptyUID(t *testing.T) {
 	ctx := config.NewContext(cfg)
 	sm := newStateMachine(ctx)
 
-	key := sm.key("")
+	key := sm.key("", "")
 	assert.Equal(t, "botfather:state:", key)
 }
 

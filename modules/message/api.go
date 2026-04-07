@@ -780,6 +780,7 @@ func (m *Message) search(c *wkhttp.Context) {
 		ChannelType uint8  `json:"channel_type"`
 		ContentType int    `json:"content_type"` // 正文类型
 		Keyword     string `json:"keyword"`
+		SpaceID     string `json:"space_id"` // Space ID（可选）
 	}
 	if err := c.BindJSON(&req); err != nil {
 		m.Error("数据格式有误！", zap.Error(err))
@@ -788,6 +789,16 @@ func (m *Message) search(c *wkhttp.Context) {
 	}
 	uid := c.MustGet("uid").(string)
 	req.UID = uid
+
+	// 提取 space_id：body > query param > header
+	spaceID := req.SpaceID
+	if spaceID == "" {
+		spaceID = c.Query("space_id")
+	}
+	if spaceID == "" {
+		spaceID = c.GetHeader("X-Space-ID")
+	}
+
 	resp, err := network.Post(fmt.Sprintf("%s/message/search", m.ctx.GetConfig().WuKongIM.APIURL), []byte(util.ToJson(req)), nil)
 	if err != nil {
 		m.Error("调用搜索失败！", zap.Error(err))
@@ -807,7 +818,91 @@ func (m *Message) search(c *wkhttp.Context) {
 		c.ResponseError(errors.New("解析搜索数据失败！"))
 		return
 	}
+
+	// Space 过滤
+	if spaceID != "" && len(results) > 0 {
+		results, err = m.filterResultsBySpace(results, spaceID)
+		if err != nil {
+			m.Error("Space 过滤失败！", zap.Error(err))
+			c.ResponseError(errors.New("Space 过滤失败！"))
+			return
+		}
+	}
+
 	c.JSON(http.StatusOK, results)
+}
+
+// filterResultsBySpace 按 Space 过滤搜索结果
+func (m *Message) filterResultsBySpace(results []map[string]interface{}, spaceID string) ([]map[string]interface{}, error) {
+	// 收集群聊 channel_id
+	groupNos := make([]string, 0)
+	groupNoSet := make(map[string]struct{})
+	for _, r := range results {
+		ct, _ := r["channel_type"].(float64)
+		if int(ct) == 2 {
+			chID, _ := r["channel_id"].(string)
+			if chID != "" {
+				if _, exists := groupNoSet[chID]; !exists {
+					groupNoSet[chID] = struct{}{}
+					groupNos = append(groupNos, chID)
+				}
+			}
+		}
+	}
+
+	// 批量查询群组 space_id
+	groupSpaceMap := make(map[string]string) // group_no -> space_id
+	if len(groupNos) > 0 {
+		groups, err := m.groupService.GetGroups(groupNos)
+		if err != nil {
+			return nil, err
+		}
+		for _, g := range groups {
+			groupSpaceMap[g.GroupNo] = g.SpaceID
+		}
+	}
+
+	// 过滤
+	filtered := make([]map[string]interface{}, 0, len(results))
+	for _, r := range results {
+		ct, _ := r["channel_type"].(float64)
+		channelType := int(ct)
+		chID, _ := r["channel_id"].(string)
+
+		switch channelType {
+		case 2: // 群聊：匹配群的 space_id
+			if groupSpaceMap[chID] == spaceID {
+				filtered = append(filtered, r)
+			}
+		case 1: // DM：解析 payload 中的 space_id
+			if m.matchPayloadSpaceID(r, spaceID) {
+				filtered = append(filtered, r)
+			}
+		default:
+			filtered = append(filtered, r)
+		}
+	}
+	return filtered, nil
+}
+
+// matchPayloadSpaceID 从消息 payload 中提取 space_id 并匹配
+func (m *Message) matchPayloadSpaceID(msg map[string]interface{}, spaceID string) bool {
+	payloadStr, _ := msg["payload"].(string)
+	if payloadStr == "" {
+		return false
+	}
+	// payload 可能是 base64 编码
+	payloadBytes, err := base64.StdEncoding.DecodeString(payloadStr)
+	if err != nil {
+		// 不是 base64，尝试直接作为 JSON 解析
+		payloadBytes = []byte(payloadStr)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+		return false
+	}
+	msgSpaceID, _ := payload["space_id"].(string)
+	return msgSpaceID == spaceID
 }
 
 // 语音消息设置为已读

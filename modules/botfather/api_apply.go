@@ -103,8 +103,11 @@ func (bf *BotFather) robotApply(c *wkhttp.Context) {
 		return
 	}
 
-	// 提取 space_id
-	applySpaceID := c.Query("space_id")
+	// 提取 space_id：body > query > header
+	applySpaceID := req.SpaceID
+	if applySpaceID == "" {
+		applySpaceID = c.Query("space_id")
+	}
 	if applySpaceID == "" {
 		applySpaceID = c.GetHeader("X-Space-ID")
 	}

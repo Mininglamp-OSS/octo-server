@@ -45,6 +45,28 @@ func (d *friendDB) Insert(m *FriendModel) error {
 	return err
 }
 
+// InsertOrUpdate 插入好友关系，若已存在则更新为有效状态（is_deleted=0, is_alone=0）
+func (d *friendDB) InsertOrUpdate(m *FriendModel) error {
+	existing, err := d.queryWithUID(m.UID, m.ToUID)
+	if err != nil {
+		return err
+	}
+	if existing != nil {
+		_, err = d.session.Update("friend").SetMap(map[string]interface{}{
+			"is_deleted": 0,
+			"is_alone":   0,
+		}).Where("uid=? and to_uid=?", m.UID, m.ToUID).Exec()
+	} else {
+		_, err = d.session.InsertInto("friend").Columns(util.AttrToUnderscore(m)...).Record(m).Exec()
+	}
+	if err != nil {
+		return err
+	}
+	friendKey := fmt.Sprintf("%s%s", CacheKeyFriends, m.UID)
+	err = d.ctx.GetRedisConn().SAdd(friendKey, m.ToUID)
+	return err
+}
+
 // IsFriend 是否是好友
 func (d *friendDB) IsFriend(uid, toUID string) (bool, error) {
 	var m *FriendModel

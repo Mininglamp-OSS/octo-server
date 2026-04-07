@@ -83,6 +83,7 @@ type BotInfo struct {
 type RobotApplyReq struct {
 	RobotUID string `json:"robot_uid"`
 	Remark   string `json:"remark"`
+	SpaceID  string `json:"space_id"` // Space ID（可选，客户端从 body 传递）
 }
 
 // RobotApplySureReq Owner通过申请的请求

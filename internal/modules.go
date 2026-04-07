@@ -2,6 +2,7 @@ package modules
 
 // 引入模块
 import (
+	_ "github.com/Mininglamp-OSS/octo-server/modules/backup"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/base"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/botfather"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/channel"
@@ -16,7 +17,9 @@ import (
 	_ "github.com/Mininglamp-OSS/octo-server/modules/search"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/space"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/statistics"
+	_ "github.com/Mininglamp-OSS/octo-server/modules/thread"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/user"
+	_ "github.com/Mininglamp-OSS/octo-server/modules/voice"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/webhook"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/workplace"
 )

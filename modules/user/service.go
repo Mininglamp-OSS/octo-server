@@ -556,9 +556,9 @@ func (s *Service) AddUser(user *AddUserReq) error {
 	return nil
 }
 
-// AddFriend 添加一个好友
+// AddFriend 添加一个好友（若已存在则恢复为有效状态）
 func (s *Service) AddFriend(uid string, friend *FriendReq) error {
-	err := s.friendDB.Insert(&FriendModel{
+	err := s.friendDB.InsertOrUpdate(&FriendModel{
 		UID:   friend.UID,
 		ToUID: friend.ToUID,
 	})

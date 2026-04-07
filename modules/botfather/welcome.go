@@ -21,17 +21,17 @@ var (
 )
 
 // DefaultWelcomeMessage is the default welcome message content
-const DefaultWelcomeMessage = `👋 欢迎来到 Octo！体验企业级的 Agent-Native 协作平台
+const DefaultWelcomeMessage = `👋 **欢迎来到 Octo！**体验企业级的 Agent-Native 协作平台
 
 在 Octo，AI 不是工具，是你的同事：
-🤝 AI 是一等公民 — 可管理、可审计、可信任的数字员工
-🔗 你的 AI 属于你 — 跟着你走，为你工作
+🤝 **AI 是一等公民** — 可管理、可审计、可信任的数字员工
+🔗 **你的 AI 属于你** — 跟着你走，为你工作
 
 我是 BotFather，帮你创建和管理 AI 机器人：
 · /newbot — 创建新机器人
 · /help — 查看所有命令
 
-💡 有想法或建议？进入 Bot 广场，添加「Octo 产品管家」反馈！`
+💡 有想法或建议？进入 Bot 广场，添加「**Octo 产品管家**」反馈！`
 
 // handleUserRegisterEvent handles user registration event to send welcome message
 func (bf *BotFather) handleUserRegisterEvent(data []byte, commit config.EventCommit) {
@@ -153,8 +153,8 @@ func (bf *BotFather) handleSpaceMemberJoinEvent(data []byte, commit config.Event
 		return
 	}
 
-	// Deduplicate with Redis — per uid only (DM is shared across Spaces)
-	sentKey := fmt.Sprintf("botfather:welcome:sent:%s", uid)
+	// Deduplicate with Redis — per uid+spaceID (each Space gets its own welcome)
+	sentKey := fmt.Sprintf("botfather:welcome:sent:%s:%s", uid, spaceID)
 	sentValue, err := bf.ctx.GetRedisConn().GetString(sentKey)
 	if err != nil && err.Error() != "redis: nil" {
 		bf.Warn("检查Space欢迎消息发送状态失败", zap.Error(err), zap.String("uid", uid), zap.String("spaceID", spaceID))

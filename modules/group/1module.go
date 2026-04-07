@@ -205,6 +205,11 @@ func newChannelRespWithGroupResp(groupResp *GroupResp) *model.ChannelResp {
 		extraMap["forbidden_expir_time"] = groupResp.ForbiddenExpirTime
 	}
 
+	// Space 隔离：前端 channelInfo 需要 space_id 用于实时会话过滤
+	if groupResp.SpaceID != "" {
+		extraMap["space_id"] = groupResp.SpaceID
+	}
+
 	// GROUP.md fields
 	extraMap["has_group_md"] = groupResp.HasGroupMd
 	extraMap["group_md_version"] = groupResp.GroupMdVersion

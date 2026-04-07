@@ -381,8 +381,11 @@ func (f *Friend) friendApply(c *wkhttp.Context) {
 		}
 	}
 
-	// 提取 space_id（提前到 cache 写入前，确保持久化）
-	spaceID := c.Query("space_id")
+	// 提取 space_id：body > query > header（客户端可能从任意层传递）
+	spaceID := req.SpaceID
+	if spaceID == "" {
+		spaceID = c.Query("space_id")
+	}
 	if spaceID == "" {
 		spaceID = c.GetHeader("X-Space-ID")
 	}
@@ -651,7 +654,11 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 		c.ResponseError(err)
 		return
 	}
-	spaceID := c.Query("space_id")
+	// 提取 space_id：body > query > header
+	spaceID := req.SpaceID
+	if spaceID == "" {
+		spaceID = c.Query("space_id")
+	}
 	if spaceID == "" {
 		spaceID = c.GetHeader("X-Space-ID")
 	}
@@ -1045,6 +1052,45 @@ func (f *Friend) friendSync(c *wkhttp.Context) {
 func (f *Friend) friendSearch(c *wkhttp.Context) {
 	uid := c.MustGet("uid").(string)
 	keyword := c.Query("keyword")
+	spaceID := c.Query("space_id")
+
+	// Space 模式：从 space_member 表搜索，而非 friend 表
+	if spaceID != "" {
+		memberUIDs, err := space.GetSpaceMemberUIDs(f.ctx, spaceID)
+		if err != nil {
+			f.Error("获取 Space 成员失败！", zap.Error(err))
+			c.ResponseError(errors.New("获取 Space 成员失败！"))
+			return
+		}
+		// 排除自己
+		filteredUIDs := make([]string, 0, len(memberUIDs))
+		for _, m := range memberUIDs {
+			if m != uid {
+				filteredUIDs = append(filteredUIDs, m)
+			}
+		}
+		userDetails, err := f.userService.GetUserDetails(filteredUIDs, c.GetLoginUID())
+		if err != nil {
+			f.Error("获取用户详情失败！", zap.Error(err))
+			c.ResponseError(errors.New("获取用户详情失败！"))
+			return
+		}
+		resps := make([]*friendResp, 0, len(userDetails))
+		for _, userDetail := range userDetails {
+			// keyword 过滤
+			if keyword != "" && !strings.Contains(strings.ToLower(userDetail.Name), strings.ToLower(keyword)) {
+				continue
+			}
+			resp := &friendResp{}
+			resp.UserDetailResp = *userDetail
+			resp.Version = 1
+			resps = append(resps, resp)
+		}
+		c.JSON(http.StatusOK, resps)
+		return
+	}
+
+	// 非 Space 模式：原有 friend 表查询
 	friends, err := f.db.QueryFriendsWithKeyword(uid, keyword)
 	if err != nil {
 		f.Error("查询好友数据失败！", zap.Error(err))
@@ -1119,9 +1165,10 @@ func (f *Friend) remark(c *wkhttp.Context) {
 // ---------- vo ----------
 // 好友申请请求
 type applyReq struct {
-	ToUID   string `json:"to_uid"`  // 向谁申请好友
-	Remark  string `json:"remark"`  // 备注
-	Vercode string `json:"vercode"` // 验证码
+	ToUID   string `json:"to_uid"`   // 向谁申请好友
+	Remark  string `json:"remark"`   // 备注
+	Vercode string `json:"vercode"`  // 验证码
+	SpaceID string `json:"space_id"` // Space ID（可选，客户端从 body 传递）
 }
 
 // 修改好友备注请求
@@ -1141,7 +1188,8 @@ func (r applyReq) Check() error {
 }
 
 type sureReq struct {
-	Token string `json:"token"` // 收到申请的token
+	Token   string `json:"token"`    // 收到申请的token
+	SpaceID string `json:"space_id"` // Space ID（可选，客户端从 body 传递）
 }
 
 func (r sureReq) Check() error {

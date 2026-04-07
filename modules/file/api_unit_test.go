@@ -109,6 +109,83 @@ func TestSanitizePath(t *testing.T) {
 	}
 }
 
+func TestInferContentType(t *testing.T) {
+	tests := []struct {
+		name        string
+		contentType string
+		ext         string
+		want        string
+	}{
+		{
+			name:        "detect markdown from extension",
+			contentType: "application/octet-stream",
+			ext:         ".md",
+			want:        "text/markdown; charset=utf-8",
+		},
+		{
+			name:        "detect plain text from extension",
+			contentType: "application/octet-stream",
+			ext:         ".txt",
+			want:        "text/plain; charset=utf-8",
+		},
+		{
+			name:        "detect css from extension",
+			contentType: "application/octet-stream",
+			ext:         ".css",
+			want:        "text/css; charset=utf-8",
+		},
+		{
+			name:        "detect html from extension",
+			contentType: "application/octet-stream",
+			ext:         ".html",
+			want:        "text/html; charset=utf-8",
+		},
+		{
+			name:        "detect jpeg keeps binary type",
+			contentType: "application/octet-stream",
+			ext:         ".jpg",
+			want:        "image/jpeg",
+		},
+		{
+			name:        "detect png keeps binary type",
+			contentType: "application/octet-stream",
+			ext:         ".png",
+			want:        "image/png",
+		},
+		{
+			name:        "client-provided text type gets charset",
+			contentType: "text/plain",
+			ext:         ".txt",
+			want:        "text/plain; charset=utf-8",
+		},
+		{
+			name:        "client-provided text type with charset unchanged",
+			contentType: "text/plain; charset=utf-8",
+			ext:         ".txt",
+			want:        "text/plain; charset=utf-8",
+		},
+		{
+			name:        "client-provided non-text type preserved",
+			contentType: "application/pdf",
+			ext:         ".pdf",
+			want:        "application/pdf",
+		},
+		{
+			name:        "unknown extension keeps octet-stream",
+			contentType: "application/octet-stream",
+			ext:         ".xyz123",
+			want:        "application/octet-stream",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := inferContentType(tt.contentType, tt.ext)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
 // mockService implements IService for testing
 type mockService struct {
 	composeResult map[string]interface{}

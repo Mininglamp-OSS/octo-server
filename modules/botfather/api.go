@@ -113,6 +113,7 @@ func (bf *BotFather) Route(r *wkhttp.WKHttp) {
 		botAPI.GET("/file/download/*path", bf.botFileDownload)
 		botAPI.GET("/upload/credentials", bf.botUploadCredentials) // STS 临时密钥签发
 		botAPI.POST("/message/edit", bf.botMessageEdit)            // Bot 编辑消息
+		botAPI.GET("/user/info", bf.getUserInfo)                    // 查询用户基本信息 (#852)
 	}
 
 	// Bot File API（独立路由组，避免 GIN wildcard 冲突）

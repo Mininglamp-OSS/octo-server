@@ -151,11 +151,10 @@ func (d *DB) queryMembers(spaceId string, loginUID string, page uint64, limit ui
 		WHERE sm.space_id=? AND sm.status=1 AND (
 			r.robot_id IS NULL
 			OR r.creator_uid = ?
-			OR EXISTS (SELECT 1 FROM friend f WHERE f.uid = ? AND f.to_uid = sm.uid AND f.is_deleted = 0)
 		)
 		ORDER BY sm.role DESC, sm.created_at ASC
 		LIMIT ? OFFSET ?
-	`, spaceId, loginUID, loginUID, limit, (page-1)*limit).Load(&models)
+	`, spaceId, loginUID, limit, (page-1)*limit).Load(&models)
 	return models, err
 }
 

@@ -626,6 +626,9 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	}
 	// Space 过滤
 	if hasSpaceFilter {
+		// Person 频道：计算 per-Space 未读计数（在过滤之前，需要原始会话数据）
+		fillPersonSpaceUnread(syncUserConversationResps, conversations, filterSpaceID, loginUID, co.ctx)
+
 		syncUserConversationResps = FilterConversationsBySpace(
 			syncUserConversationResps, filterSpaceID, loginUID, co.ctx, co.groupService,
 		)
@@ -1138,6 +1141,8 @@ type SyncUserConversationResp struct {
 	ChannelType     uint8                  `json:"channel_type"`       // 频道类型
 	SpaceID         string                 `json:"space_id,omitempty"` // Space ID
 	Unread          int                    `json:"unread,omitempty"`   // 未读消息
+	SpaceUnread     *int                   `json:"space_unread,omitempty"`       // Space 维度未读（仅 Person 频道）
+	SpaceLastMessage *MsgSyncResp          `json:"space_last_message,omitempty"` // Space 维度最后一条消息（仅 Person 频道）
 	Mute            int                    `json:"mute,omitempty"`     // 免打扰
 	Stick           int                    `json:"stick,omitempty"`    //  置顶
 	Timestamp       int64                  `json:"timestamp"`          // 最后一次会话时间

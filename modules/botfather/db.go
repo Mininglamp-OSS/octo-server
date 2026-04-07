@@ -218,3 +218,16 @@ func (d *botfatherDB) queryRobotByUsernameActive(username string) (*robotModel, 
 	_, err := d.session.Select("*").From("robot").Where("username=? AND status=1", username).Load(&m)
 	return m, err
 }
+
+// isBotInSpace 检查 bot 是否属于指定 Space
+func (d *botfatherDB) isBotInSpace(robotID string, spaceID string) (bool, error) {
+	var count int
+	_, err := d.session.SelectBySql(
+		"SELECT COUNT(*) FROM space_member WHERE uid=? AND space_id=?",
+		robotID, spaceID,
+	).Load(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}

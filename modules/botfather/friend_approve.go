@@ -134,6 +134,14 @@ func (h *commandHandler) approveFriend(ownerUID string, applyUID string, robotID
 		h.reply(ownerUID, "❌ 你不是该机器人的创建者")
 		return
 	}
+	// 1.5 Space 隔离校验：bot 必须属于当前 Space
+	if currentSpace := h.resolveSpaceID(ownerUID); currentSpace != "" {
+		inSpace, _ := h.db.isBotInSpace(robotID, currentSpace)
+		if !inSpace {
+			h.reply(ownerUID, "❌ 该机器人不属于当前 Space")
+			return
+		}
+	}
 
 	// 2. 检查申请是否存在
 	apply, err := h.GetBotFriendApply(robotID, applyUID)
@@ -262,6 +270,14 @@ func (h *commandHandler) rejectFriend(ownerUID string, applyUID string, robotID 
 		h.reply(ownerUID, "❌ 你不是该机器人的创建者")
 		return
 	}
+	// Space 隔离校验：bot 必须属于当前 Space
+	if currentSpace := h.resolveSpaceID(ownerUID); currentSpace != "" {
+		inSpace, _ := h.db.isBotInSpace(robotID, currentSpace)
+		if !inSpace {
+			h.reply(ownerUID, "❌ 该机器人不属于当前 Space")
+			return
+		}
+	}
 
 	apply, err := h.GetBotFriendApply(robotID, applyUID)
 	if err != nil || apply == nil {
@@ -340,7 +356,7 @@ func notifyOwnerFriendApply(ctx *config.Context, applyUID, applyName, robotID, r
 		remarkText = fmt.Sprintf("\n备注：%s", remark)
 	}
 
-	msg := fmt.Sprintf("📨 好友申请\n用户「%s」(%s) 申请添加你的机器人「%s」为好友%s\n\n/approve %s %s\n/reject %s %s",
+	msg := fmt.Sprintf("📨 **好友申请**\n\n用户「%s」(`%s`) 申请添加你的机器人「**%s**」为好友%s\n\n/approve %s %s\n\n/reject %s %s",
 		applyName, applyUID, robotID, remarkText,
 		applyUID, robotID,
 		applyUID, robotID,
@@ -368,7 +384,7 @@ func (h *commandHandler) handlePending(fromUID string) {
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("📋 待审批好友申请（%d 条）：\n\n", len(applies)))
+	sb.WriteString(fmt.Sprintf("📋 **待审批好友申请**（%d 条）：\n\n", len(applies)))
 	for i, apply := range applies {
 		ago := time.Since(time.Unix(apply.CreatedAt, 0)).Truncate(time.Minute)
 		agoStr := "刚刚"
@@ -380,11 +396,11 @@ func (h *commandHandler) handlePending(fromUID string) {
 			agoStr = fmt.Sprintf("%d分钟前", int(ago.Minutes()))
 		}
 
-		sb.WriteString(fmt.Sprintf("%d. %s → %s (%s)\n", i+1, apply.ApplyName, apply.RobotID, agoStr))
+		sb.WriteString(fmt.Sprintf("%d. **%s** → %s (%s)", i+1, apply.ApplyName, apply.RobotID, agoStr))
 		if apply.Remark != "" {
-			sb.WriteString(fmt.Sprintf("   备注：%s\n", apply.Remark))
+			sb.WriteString(fmt.Sprintf("\n备注：%s", apply.Remark))
 		}
-		sb.WriteString(fmt.Sprintf("   /approve %s %s\n\n", apply.ApplyUID, apply.RobotID))
+		sb.WriteString(fmt.Sprintf("\n/approve %s %s\n\n", apply.ApplyUID, apply.RobotID))
 	}
 	h.reply(fromUID, sb.String())
 }

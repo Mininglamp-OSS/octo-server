@@ -576,6 +576,7 @@ type GroupResp struct {
 	GroupMdUpdatedAt         *string   `json:"group_md_updated_at"`         // GROUP.md最后更新时间
 	CanEditGroupMd           bool      `json:"can_edit_group_md"`           // 是否可编辑GROUP.md
 	CanManageBotAdmin        bool      `json:"can_manage_bot_admin"`        // 是否可管理Bot管理员
+	SpaceID                  string    `json:"space_id"`                    // Space ID
 	CreatedAt                string    `json:"created_at"`
 	UpdatedAt                string    `json:"updated_at"`
 	Version                  int64     `json:"version"` // 群数据版本
@@ -607,6 +608,7 @@ func (g *GroupResp) from(model *DetailModel) *GroupResp {
 		Status:                   model.Status,
 		AllowViewHistoryMsg:      model.AllowViewHistoryMsg,
 		AllowMemberPinnedMessage: model.AllowMemberPinnedMessage,
+		SpaceID:                  model.SpaceID,
 		HasGroupMd:               model.GroupMd != nil && *model.GroupMd != "",
 		GroupMdVersion:           model.GroupMdVersion,
 		CreatedAt:                model.CreatedAt.String(),
@@ -632,6 +634,7 @@ func (g *GroupResp) fromModel(model *Model) *GroupResp {
 		Status:                   model.Status,
 		AllowViewHistoryMsg:      model.AllowViewHistoryMsg,
 		AllowMemberPinnedMessage: model.AllowMemberPinnedMessage,
+		SpaceID:                  model.SpaceID,
 		HasGroupMd:               model.GroupMd != nil && *model.GroupMd != "",
 		GroupMdVersion:           model.GroupMdVersion,
 		CreatedAt:                model.CreatedAt.String(),
