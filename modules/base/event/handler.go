@@ -177,7 +177,7 @@ func (e *Event) handleGroupAvatarUpdateEvent(model *Model) {
 				if len(downloadURLs) >= 9 {
 					break
 				}
-				downloadURLs = append(downloadURLs, fmt.Sprintf("%s/users/%s/avatar?t=%d", e.ctx.GetConfig().External.APIBaseURL, member, time.Now().UnixNano()))
+				downloadURLs = append(downloadURLs, fmt.Sprintf("%s/users/%s/avatar?v=%d", e.ctx.GetConfig().External.APIBaseURL, member, time.Now().UnixNano()))
 			}
 			uploadPath := e.ctx.GetConfig().GetGroupAvatarFilePath(req.GroupNo)
 			_, err = e.fileService.DownloadAndMakeCompose(uploadPath, downloadURLs)
