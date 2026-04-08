@@ -168,9 +168,15 @@ func (s *VoiceService) callGPTWithModelFallback(audioData []byte, mimeType strin
 func (s *VoiceService) callLiteLLM(totalCtx context.Context, model string, audioData []byte, mimeType string, prompt string) (string, error) {
 	b64Audio := base64.StdEncoding.EncodeToString(audioData)
 
+	// Only use reasoning_effort=low for Gemini 3.1 Pro (reduces latency without hurting quality)
+	var reasoningEffort string
+	if strings.Contains(model, "3.1-pro") {
+		reasoningEffort = "low"
+	}
+
 	reqBody := chatCompletionRequest{
 		Model:           model,
-		ReasoningEffort: "low",
+		ReasoningEffort: reasoningEffort,
 		Messages: []message{
 			{
 				Role: "user",
