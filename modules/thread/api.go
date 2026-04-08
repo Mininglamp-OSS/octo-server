@@ -1,6 +1,7 @@
 package thread
 
 import (
+	"encoding/json"
 	"errors"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
@@ -115,8 +116,9 @@ func (t *Thread) createThread(c *wkhttp.Context) {
 	}
 
 	var req struct {
-		Name            string `json:"name" binding:"required,max=100"`
-		SourceMessageID *int64 `json:"source_message_id"`
+		Name                 string          `json:"name" binding:"required,max=100"`
+		SourceMessageID      *int64          `json:"source_message_id"`
+		SourceMessagePayload json.RawMessage `json:"source_message_payload"`
 	}
 	if err := c.BindJSON(&req); err != nil {
 		t.Error("参数错误", zap.Error(err))
@@ -124,12 +126,29 @@ func (t *Thread) createThread(c *wkhttp.Context) {
 		return
 	}
 
+	// 校验 source_message_payload
+	if len(req.SourceMessagePayload) > 0 {
+		if req.SourceMessageID == nil {
+			c.ResponseError(errors.New("source_message_payload requires source_message_id"))
+			return
+		}
+		if len(req.SourceMessagePayload) > maxSourcePayloadBytes {
+			c.ResponseError(errors.New("source_message_payload too large"))
+			return
+		}
+		if !json.Valid(req.SourceMessagePayload) || string(req.SourceMessagePayload) == "null" {
+			c.ResponseError(errors.New("invalid source_message_payload"))
+			return
+		}
+	}
+
 	resp, err := t.service.CreateThread(&CreateThreadReq{
-		GroupNo:         groupNo,
-		Name:            req.Name,
-		CreatorUID:      loginUID,
-		CreatorName:     loginName,
-		SourceMessageID: req.SourceMessageID,
+		GroupNo:              groupNo,
+		Name:                 req.Name,
+		CreatorUID:           loginUID,
+		CreatorName:          loginName,
+		SourceMessageID:      req.SourceMessageID,
+		SourceMessagePayload: req.SourceMessagePayload,
 	})
 	if err != nil {
 		t.Error("创建子区失败", zap.Error(err), zap.String("groupNo", groupNo), zap.String("uid", loginUID))

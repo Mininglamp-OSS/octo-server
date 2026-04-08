@@ -23,3 +23,6 @@ const ThreadSeqKey = "thread"
 const (
 	ContentTypeThreadCreated = 1100 // 子区创建通知
 )
+
+// 源消息 payload 最大大小 (64KB)
+const maxSourcePayloadBytes = 64 * 1024

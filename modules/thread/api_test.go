@@ -107,11 +107,12 @@ func TestCreateThread_WithSourceMessage(t *testing.T) {
 	s, ctx := setupTestData(t)
 	groupNo := createTestGroup(t, ctx)
 
-	// 创建子区（带来源消息）
+	// 创建子区（带来源消息和 payload）
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("POST", "/v1/groups/"+groupNo+"/threads", bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
-		"name":              "从消息创建的子区",
-		"source_message_id": 12345,
+		"name":                   "从消息创建的子区",
+		"source_message_id":      12345,
+		"source_message_payload": map[string]interface{}{"type": 1, "content": "原始消息内容"},
 	}))))
 	req.Header.Set("token", testutil.Token)
 	s.GetRoute().ServeHTTP(w, req)

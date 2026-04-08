@@ -1,6 +1,7 @@
 package thread
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -67,11 +68,12 @@ func NewService(ctx *config.Context) IService {
 
 // CreateThreadReq 创建子区请求
 type CreateThreadReq struct {
-	GroupNo         string
-	Name            string
-	CreatorUID      string
-	CreatorName     string
-	SourceMessageID *int64
+	GroupNo              string
+	Name                 string
+	CreatorUID           string
+	CreatorName          string
+	SourceMessageID      *int64
+	SourceMessagePayload json.RawMessage // 源消息原始 payload，用于拷贝到子区
 }
 
 // ThreadResp 子区响应
@@ -176,6 +178,11 @@ func (s *Service) CreateThread(req *CreateThreadReq) (*ThreadResp, error) {
 		return nil, fmt.Errorf("create IM channel: %w", err)
 	}
 
+	// 拷贝源消息到子区作为首条消息
+	if req.SourceMessageID != nil && len(req.SourceMessagePayload) > 0 {
+		s.sendSourceMessage(channelID, req.CreatorUID, req.SourceMessagePayload)
+	}
+
 	// 在父群发送子区创建消息
 	s.sendThreadCreatedMessage(req.GroupNo, shortID, req.Name, req.CreatorUID, req.CreatorName)
 
@@ -210,6 +217,24 @@ func (s *Service) sendThreadCreatedMessage(groupNo, shortID, name, creatorUID, c
 	})
 	if err != nil {
 		s.Error("发送子区创建消息失败", zap.Error(err), zap.String("groupNo", groupNo))
+	}
+}
+
+// sendSourceMessage 将源消息拷贝到子区频道作为首条消息
+func (s *Service) sendSourceMessage(channelID, creatorUID string, payload json.RawMessage) {
+	err := s.ctx.SendMessage(&config.MsgSendReq{
+		Header: config.MsgHeader{
+			NoPersist: 0,
+			RedDot:    1,
+			SyncOnce:  0,
+		},
+		FromUID:     creatorUID,
+		ChannelID:   channelID,
+		ChannelType: common.ChannelTypeCommunityTopic.Uint8(),
+		Payload:     payload,
+	})
+	if err != nil {
+		s.Error("拷贝源消息到子区失败", zap.Error(err), zap.String("channelID", channelID))
 	}
 }
 

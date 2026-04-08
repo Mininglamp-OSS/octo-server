@@ -29,15 +29,21 @@ type Common struct {
 	log.Log
 	db          *db
 	appConfigDB *appConfigDB
+	threadOn    int // 缓存 DM_THREAD_ON 环境变量
 }
 
 // New New
 func New(ctx *config.Context) *Common {
+	var threadOn int
+	if t := strings.ToLower(os.Getenv("DM_THREAD_ON")); t == "true" || t == "1" {
+		threadOn = 1
+	}
 	return &Common{
 		ctx:         ctx,
 		db:          newDB(ctx.DB()),
 		appConfigDB: newAppConfigDB(ctx),
 		Log:         log.NewTLog("common"),
+		threadOn:    threadOn,
 	}
 }
 
@@ -389,6 +395,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 		InviteSystemAccountJoinGroupOn: appConfigM.InviteSystemAccountJoinGroupOn,
 		RegisterUserMustCompleteInfoOn: appConfigM.RegisterUserMustCompleteInfoOn,
 		CanModifyApiUrl:                appConfigM.CanModifyApiUrl,
+		ThreadOn:                       cn.threadOn,
 	})
 }
 
@@ -549,6 +556,7 @@ type appConfigResp struct {
 	InviteSystemAccountJoinGroupOn int    `json:"invite_system_account_join_group_on"` // 开启系统账号加入群聊
 	RegisterUserMustCompleteInfoOn int    `json:"register_user_must_complete_info_on"` // 注册用户必须填写完整信息
 	CanModifyApiUrl                int    `json:"can_modify_api_url"`                  // 允许修改api地址
+	ThreadOn                       int    `json:"thread_on"`                           // 子区功能开关
 }
 
 type appVersionReq struct {
