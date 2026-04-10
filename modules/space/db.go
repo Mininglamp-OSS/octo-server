@@ -505,3 +505,16 @@ func (d *DB) updateJoinApplyStatus(id int64, status int, reviewerUID string) (in
 	}
 	return result.RowsAffected()
 }
+
+// updateJoinApplyStatusRaw 无条件更新状态（用于回滚）
+func (d *DB) updateJoinApplyStatusRaw(id int64, status int, reviewerUID string) (int64, error) {
+	result, err := d.session.Update("space_join_apply").
+		Set("status", status).
+		Set("reviewer_uid", reviewerUID).
+		Set("updated_at", time.Now()).
+		Where("id=?", id).Exec()
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}

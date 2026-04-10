@@ -1118,33 +1118,35 @@ func (s *Space) approveJoinApply(c *wkhttp.Context) {
 		return
 	}
 
-	// 执行加入逻辑（跳过邀请码校验，管理员审批即授权）
-	joinErr := s.executeJoinSpace(apply.UID, spaceId, space)
-	if joinErr != nil {
-		if errors.Is(joinErr, ErrSpaceFull) {
-			c.ResponseError(errors.New("空间已满，无法通过申请"))
-			return
-		}
-		if errors.Is(joinErr, ErrAlreadyMember) {
-			// 用户已通过其他方式加入，直接标记申请为通过
-			if _, err := s.db.updateJoinApplyStatus(applyID, 1, loginUID); err != nil {
-				s.Error("更新申请状态失败（已是成员）", zap.Error(err))
-			}
-			c.ResponseOK()
-			return
-		}
-		c.ResponseError(errors.New("加入空间失败"))
-		return
-	}
-
+	// 先更新申请状态（防止并发审批 + 确保加入后状态一致）
 	affected, err := s.db.updateJoinApplyStatus(applyID, 1, loginUID)
 	if err != nil {
 		c.ResponseError(errors.New("更新申请状态失败"))
 		return
 	}
 	if affected == 0 {
-		// 已被其他管理员处理，用户实际已加入，返回成功
+		// 已被其他管理员处理
 		c.ResponseOK()
+		return
+	}
+
+	// 执行加入逻辑（跳过邀请码校验，管理员审批即授权）
+	joinErr := s.executeJoinSpace(apply.UID, spaceId, space)
+	if joinErr != nil {
+		if errors.Is(joinErr, ErrSpaceFull) {
+			// 回滚申请状态
+			_, _ = s.db.updateJoinApplyStatusRaw(applyID, 0, "")
+			c.ResponseError(errors.New("空间已满，无法通过申请"))
+			return
+		}
+		if errors.Is(joinErr, ErrAlreadyMember) {
+			// 用户已通过其他方式加入，状态已更新，直接成功
+			c.ResponseOK()
+			return
+		}
+		// 回滚申请状态
+		_, _ = s.db.updateJoinApplyStatusRaw(applyID, 0, "")
+		c.ResponseError(errors.New("加入空间失败"))
 		return
 	}
 
@@ -1245,7 +1247,7 @@ func (s *Space) notifyAdminsNewJoinApply(applicantUID, spaceId, spaceName, remar
 			"space_id": spaceId,
 		}
 		payload := []byte(util.ToJson(notifyPayload))
-		_ = s.ctx.SendMessage(&config.MsgSendReq{
+		if err := s.ctx.SendMessage(&config.MsgSendReq{
 			FromUID:     s.ctx.GetConfig().Account.SystemUID,
 			ChannelID:   admin.UID,
 			ChannelType: common.ChannelTypePerson.Uint8(),
@@ -1253,7 +1255,9 @@ func (s *Space) notifyAdminsNewJoinApply(applicantUID, spaceId, spaceName, remar
 			Header: config.MsgHeader{
 				RedDot: 1,
 			},
-		})
+		}); err != nil {
+			s.Warn("发送加入申请通知失败", zap.Error(err), zap.String("adminUID", admin.UID), zap.String("spaceId", spaceId))
+		}
 	}
 }
 
