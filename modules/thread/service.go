@@ -16,6 +16,20 @@ import (
 	"go.uber.org/zap"
 )
 
+// parsePayloadContent 从消息 payload 中提取 content 字段
+func parsePayloadContent(payload []byte) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	var m struct {
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(payload, &m); err != nil {
+		return ""
+	}
+	return m.Content
+}
+
 // IService 子区服务接口
 type IService interface {
 	// CreateThread 创建子区
@@ -80,18 +94,22 @@ type CreateThreadReq struct {
 
 // ThreadResp 子区响应
 type ThreadResp struct {
-	ShortID         string `json:"short_id"`
-	GroupNo         string `json:"group_no"`
-	GroupName       string `json:"group_name"`
-	ChannelID       string `json:"channel_id"`
-	ChannelType     uint8  `json:"channel_type"`
-	Name            string `json:"name"`
-	CreatorUID      string `json:"creator_uid"`
-	SourceMessageID *int64 `json:"source_message_id,omitempty"`
-	Status          int    `json:"status"`
-	MemberCount     int    `json:"member_count"`
-	CreatedAt       string `json:"created_at"`
-	UpdatedAt       string `json:"updated_at"`
+	ShortID               string `json:"short_id"`
+	GroupNo               string `json:"group_no"`
+	GroupName             string `json:"group_name"`
+	ChannelID             string `json:"channel_id"`
+	ChannelType           uint8  `json:"channel_type"`
+	Name                  string `json:"name"`
+	CreatorUID            string `json:"creator_uid"`
+	SourceMessageID       *int64 `json:"source_message_id,omitempty"`
+	Status                int    `json:"status"`
+	MemberCount           int    `json:"member_count"`
+	MessageCount          int64  `json:"message_count"`
+	LastMessageContent    string `json:"last_message_content,omitempty"`
+	LastMessageSenderName string `json:"last_message_sender_name,omitempty"`
+	LastMessageAt         string `json:"last_message_at"`
+	CreatedAt             string `json:"created_at"`
+	UpdatedAt             string `json:"updated_at"`
 }
 
 // MemberResp 子区成员响应
@@ -206,7 +224,7 @@ func (s *Service) CreateThread(req *CreateThreadReq) (*ThreadResp, error) {
 	}
 
 	// 在父群发送子区创建消息
-	s.sendThreadCreatedMessage(req.GroupNo, shortID, req.Name, req.CreatorUID, req.CreatorName)
+	s.sendThreadCreatedMessage(req.GroupNo, shortID, req.Name, req.CreatorUID, req.CreatorName, req.SourceMessagePayload)
 
 	resp := s.toThreadRespWithID(thread)
 	resp.MemberCount = 1 // 创建者
@@ -214,8 +232,39 @@ func (s *Service) CreateThread(req *CreateThreadReq) (*ThreadResp, error) {
 }
 
 // sendThreadCreatedMessage 发送子区创建消息到父群
-func (s *Service) sendThreadCreatedMessage(groupNo, shortID, name, creatorUID, creatorName string) {
+func (s *Service) sendThreadCreatedMessage(groupNo, shortID, name, creatorUID, creatorName string, sourcePayload json.RawMessage) {
 	channelID := BuildChannelID(groupNo, shortID)
+
+	// 构建参与者列表（创建时只有创建者）
+	participants := []map[string]string{
+		{"uid": creatorUID, "name": creatorName},
+	}
+
+	// 构建消息 payload
+	payload := map[string]interface{}{
+		"type":         ContentTypeThreadCreated,
+		"content":      fmt.Sprintf("%s 创建了子区「%s」", creatorName, name),
+		"from_uid":     creatorUID,
+		"from_name":    creatorName,
+		"short_id":     shortID,
+		"channel_id":   channelID,
+		"channel_type": common.ChannelTypeCommunityTopic.Uint8(),
+		"thread_name":  name,
+		"participants": participants,
+	}
+
+	// 消息统计
+	var messageCount int64
+	if len(sourcePayload) > 0 {
+		messageCount = 1
+		payload["last_message"] = map[string]interface{}{
+			"from_uid":  creatorUID,
+			"from_name": creatorName,
+			"content":   parsePayloadContent(sourcePayload),
+			"timestamp": time.Now().Unix(),
+		}
+	}
+	payload["message_count"] = messageCount
 
 	// 发送可见的通知消息到父群
 	err := s.ctx.SendMessage(&config.MsgSendReq{
@@ -226,16 +275,7 @@ func (s *Service) sendThreadCreatedMessage(groupNo, shortID, name, creatorUID, c
 		},
 		ChannelID:   groupNo,
 		ChannelType: common.ChannelTypeGroup.Uint8(),
-		Payload: []byte(util.ToJson(map[string]interface{}{
-			"type":         ContentTypeThreadCreated,
-			"content":      fmt.Sprintf("%s 创建了子区「%s」", creatorName, name),
-			"from_uid":     creatorUID,
-			"from_name":    creatorName,
-			"short_id":     shortID,
-			"channel_id":   channelID,
-			"channel_type": common.ChannelTypeCommunityTopic.Uint8(),
-			"thread_name":  name,
-		})),
+		Payload:     []byte(util.ToJson(payload)),
 	})
 	if err != nil {
 		s.Error("发送子区创建消息失败", zap.Error(err), zap.String("groupNo", groupNo))
@@ -279,7 +319,11 @@ func (s *Service) GetThreads(groupNo string) ([]*ThreadResp, error) {
 			threadIDs = append(threadIDs, t.Id)
 		}
 	}
-	memberCounts, _ := s.db.CountMembersBatch(threadIDs)
+	memberCounts, err := s.db.CountMembersBatch(threadIDs)
+	if err != nil {
+		s.Warn("批量查询成员数量失败", zap.Error(err))
+		memberCounts = make(map[int64]int)
+	}
 
 	// 查询群名称
 	var groupName string
@@ -287,21 +331,37 @@ func (s *Service) GetThreads(groupNo string) ([]*ThreadResp, error) {
 		groupName = groupInfo.Name
 	}
 
+	// 批量查询最新消息发送者名称
+	senderUIDs := make([]string, 0)
+	for _, t := range threads {
+		if t.LastMessageSenderUID != "" {
+			senderUIDs = append(senderUIDs, t.LastMessageSenderUID)
+		}
+	}
+	senderNames := s.batchGetUserNames(senderUIDs)
+
 	results := make([]*ThreadResp, 0, len(threads))
 	for _, t := range threads {
 		resp := &ThreadResp{
-			ShortID:         t.ShortID,
-			GroupNo:         t.GroupNo,
-			GroupName:       groupName,
-			ChannelID:       BuildChannelID(t.GroupNo, t.ShortID),
-			ChannelType:     common.ChannelTypeCommunityTopic.Uint8(),
-			Name:            t.Name,
-			CreatorUID:      t.CreatorUID,
-			SourceMessageID: t.SourceMessageID,
-			Status:          t.Status,
-			MemberCount:     memberCounts[t.Id],
-			CreatedAt:       util.ToyyyyMMddHHmmss(time.Time(t.CreatedAt)),
-			UpdatedAt:       util.ToyyyyMMddHHmmss(time.Time(t.UpdatedAt)),
+			ShortID:               t.ShortID,
+			GroupNo:               t.GroupNo,
+			GroupName:             groupName,
+			ChannelID:             BuildChannelID(t.GroupNo, t.ShortID),
+			ChannelType:           common.ChannelTypeCommunityTopic.Uint8(),
+			Name:                  t.Name,
+			CreatorUID:            t.CreatorUID,
+			SourceMessageID:       t.SourceMessageID,
+			Status:                t.Status,
+			MemberCount:           memberCounts[t.Id],
+			MessageCount:          t.MessageCount,
+			LastMessageContent:    t.LastMessageContent,
+			LastMessageSenderName: senderNames[t.LastMessageSenderUID],
+			LastMessageAt:         util.ToyyyyMMddHHmmss(time.Time(t.CreatedAt)), // 默认 created_at
+			CreatedAt:             util.ToyyyyMMddHHmmss(time.Time(t.CreatedAt)),
+			UpdatedAt:             util.ToyyyyMMddHHmmss(time.Time(t.UpdatedAt)),
+		}
+		if t.LastMessageAt != nil {
+			resp.LastMessageAt = util.ToyyyyMMddHHmmss(*t.LastMessageAt)
 		}
 		results = append(results, resp)
 	}
@@ -483,19 +543,64 @@ func (s *Service) toThreadRespWithID(m *Model) *ThreadResp {
 		memberCount, _ = s.db.CountMembers(m.Id)
 	}
 
-	return &ThreadResp{
-		ShortID:         m.ShortID,
-		GroupNo:         m.GroupNo,
-		ChannelID:       BuildChannelID(m.GroupNo, m.ShortID),
-		ChannelType:     common.ChannelTypeCommunityTopic.Uint8(),
-		Name:            m.Name,
-		CreatorUID:      m.CreatorUID,
-		SourceMessageID: m.SourceMessageID,
-		Status:          m.Status,
-		MemberCount:     memberCount,
-		CreatedAt:       util.ToyyyyMMddHHmmss(time.Time(m.CreatedAt)),
-		UpdatedAt:       util.ToyyyyMMddHHmmss(time.Time(m.UpdatedAt)),
+	resp := &ThreadResp{
+		ShortID:            m.ShortID,
+		GroupNo:            m.GroupNo,
+		ChannelID:          BuildChannelID(m.GroupNo, m.ShortID),
+		ChannelType:        common.ChannelTypeCommunityTopic.Uint8(),
+		Name:               m.Name,
+		CreatorUID:         m.CreatorUID,
+		SourceMessageID:    m.SourceMessageID,
+		Status:             m.Status,
+		MemberCount:        memberCount,
+		MessageCount:       m.MessageCount,
+		LastMessageContent: m.LastMessageContent,
+		LastMessageAt:      util.ToyyyyMMddHHmmss(time.Time(m.CreatedAt)), // 默认 created_at
+		CreatedAt:          util.ToyyyyMMddHHmmss(time.Time(m.CreatedAt)),
+		UpdatedAt:          util.ToyyyyMMddHHmmss(time.Time(m.UpdatedAt)),
 	}
+	if m.LastMessageSenderUID != "" {
+		resp.LastMessageSenderName = s.getUserName(m.LastMessageSenderUID)
+	}
+	if m.LastMessageAt != nil {
+		resp.LastMessageAt = util.ToyyyyMMddHHmmss(*m.LastMessageAt)
+	}
+	return resp
+}
+
+// getUserName 根据 UID 获取用户名
+func (s *Service) getUserName(uid string) string {
+	users, err := s.userService.GetUsers([]string{uid})
+	if err != nil || len(users) == 0 {
+		return ""
+	}
+	return users[0].Name
+}
+
+// batchGetUserNames 批量获取用户名
+func (s *Service) batchGetUserNames(uids []string) map[string]string {
+	result := make(map[string]string, len(uids))
+	if len(uids) == 0 {
+		return result
+	}
+	// 去重
+	unique := make(map[string]struct{}, len(uids))
+	deduped := make([]string, 0, len(uids))
+	for _, uid := range uids {
+		if _, ok := unique[uid]; !ok {
+			unique[uid] = struct{}{}
+			deduped = append(deduped, uid)
+		}
+	}
+	users, err := s.userService.GetUsers(deduped)
+	if err != nil {
+		s.Warn("批量查询用户名失败", zap.Error(err))
+		return result
+	}
+	for _, u := range users {
+		result[u.UID] = u.Name
+	}
+	return result
 }
 
 // BuildChannelID 构建 channelID

@@ -13,9 +13,14 @@ const (
 	defaultTimeout       = 30
 	defaultTotalTimeout  = 45
 	defaultMaxDuration   = 60
-	defaultMaxFileSize   = 5 * 1024 * 1024 // 5MB
-	maxChatContextLength = 10000           // max chat_context characters
-	maxContextTextLength = 10000           // max context_text characters
+	defaultMaxFileSize = 3 * 1024 * 1024 // 3MB
+)
+
+// Exported constants for voice context limits
+const (
+	MaxVoiceContextLength = 10000 // max voice correction context characters (rune count)
+	MaxContextTextLength  = 10000 // max context_text characters (rune count)
+	MaxChatContextLength  = 10000 // max chat_context characters (rune count)
 )
 
 var defaultModels = []string{"gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro"}
@@ -154,4 +159,45 @@ func (c *VoiceConfig) Validate() error {
 		}
 	}
 	return nil
+}
+
+// TruncateRunes truncates a string to at most max Unicode characters (rune-safe).
+func TruncateRunes(s string, max int) string {
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	return string(runes[:max])
+}
+
+// TruncateRunesTail keeps the last max Unicode characters of a string (rune-safe).
+// Used for context_text / chat_context truncation to preserve recent content.
+func TruncateRunesTail(s string, max int) string {
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	return string(runes[len(runes)-max:])
+}
+
+// modelAbbreviations maps full model names to short identifiers
+var modelAbbreviations = map[string]string{
+	"gemini-3.1-pro-preview":  "g31pp",
+	"gemini-3-flash-preview":  "g3fp",
+	"gemini-2.5-pro":          "g25p",
+	"gemini-2.0-flash":        "g20f",
+	"gemini-2.0-flash-lite":   "g20fl",
+	"gpt-4o-transcribe":       "gpt4ot",
+	"gpt-4o-mini-transcribe":  "gpt4omt",
+	"whisper-1":               "w1",
+	"whisper-large-v3":        "wlv3",
+}
+
+// ShortenModelName returns a short identifier for a model name.
+// Returns the original name if not in the abbreviation table.
+func ShortenModelName(model string) string {
+	if short, ok := modelAbbreviations[model]; ok {
+		return short
+	}
+	return model
 }

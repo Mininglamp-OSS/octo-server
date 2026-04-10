@@ -997,7 +997,7 @@ func (rb *Robot) spaceBots(c *wkhttp.Context) {
 		FROM space_member sm
 		INNER JOIN user u ON sm.uid = u.uid AND u.robot = 1
 		INNER JOIN robot r ON r.robot_id = sm.uid AND r.status = 1
-		WHERE sm.space_id = ? AND sm.uid != 'botfather'
+		WHERE sm.space_id = ? AND sm.status = 1 AND sm.uid != 'botfather'
 		ORDER BY u.created_at DESC
 	`, spaceID).Load(&bots)
 	if err != nil {
@@ -1108,12 +1108,12 @@ func (rb *Robot) myBots(c *wkhttp.Context) {
 			IFNULL(r.bot_commands,'') as bot_commands
 		FROM friend f
 		INNER JOIN user u ON f.to_uid = u.uid AND u.robot = 1
-		LEFT JOIN robot r ON r.robot_id = f.to_uid AND r.status = 1
+		INNER JOIN robot r ON r.robot_id = f.to_uid AND r.status = 1
 		WHERE f.uid = ? AND f.is_deleted = 0 AND f.to_uid != 'botfather'`
 	args := []interface{}{loginUID}
 
 	if spaceID != "" {
-		query += ` AND f.to_uid IN (SELECT uid FROM space_member WHERE space_id = ?)`
+		query += ` AND f.to_uid IN (SELECT uid FROM space_member WHERE space_id = ? AND status = 1)`
 		args = append(args, spaceID)
 	}
 

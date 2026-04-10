@@ -1,6 +1,7 @@
 package thread
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -146,6 +147,59 @@ func TestIsValidGroupNo(t *testing.T) {
 	}
 }
 
+// ==================== parsePayloadContent 测试 ====================
+
+func TestParsePayloadContent(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload []byte
+		want    string
+	}{
+		{
+			name:    "normal_text_message",
+			payload: []byte(`{"type":1,"content":"你好世界"}`),
+			want:    "你好世界",
+		},
+		{
+			name:    "empty_content",
+			payload: []byte(`{"type":1,"content":""}`),
+			want:    "",
+		},
+		{
+			name:    "no_content_field",
+			payload: []byte(`{"type":1}`),
+			want:    "",
+		},
+		{
+			name:    "content_is_number",
+			payload: []byte(`{"type":1,"content":123}`),
+			want:    "",
+		},
+		{
+			name:    "nil_payload",
+			payload: nil,
+			want:    "",
+		},
+		{
+			name:    "empty_payload",
+			payload: []byte{},
+			want:    "",
+		},
+		{
+			name:    "invalid_json",
+			payload: []byte(`not json`),
+			want:    "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parsePayloadContent(tt.payload)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
 // ==================== 状态常量测试 ====================
 
 func TestThreadStatusConstants(t *testing.T) {
@@ -153,6 +207,57 @@ func TestThreadStatusConstants(t *testing.T) {
 	assert.Equal(t, 1, ThreadStatusActive)
 	assert.Equal(t, 2, ThreadStatusArchived)
 	assert.Equal(t, 3, ThreadStatusDeleted)
+}
+
+// ==================== DB 层 UpdateMessageStats 测试 ====================
+
+func TestUpdateMessageStats(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	db := NewDB(ctx)
+
+	// 插入 thread
+	shortID := fmt.Sprintf("%d", ctx.UserIDGen.Generate().Int64())
+	err = db.Insert(&Model{
+		ShortID:    shortID,
+		GroupNo:    "00000000000000000000000000000001",
+		Name:       "统计测试",
+		CreatorUID: "u1",
+		Status:     ThreadStatusActive,
+		Version:    1,
+	})
+	assert.NoError(t, err)
+
+	// 初始状态
+	thread, err := db.QueryByShortID(shortID)
+	assert.NoError(t, err)
+	assert.Equal(t, int64(0), thread.MessageCount)
+	assert.Nil(t, thread.LastMessageAt)
+	assert.Empty(t, thread.LastMessageContent)
+	assert.Empty(t, thread.LastMessageSenderUID)
+
+	// 更新一次
+	err = db.UpdateMessageStats(shortID, "你好世界", "sender1")
+	assert.NoError(t, err)
+
+	thread, err = db.QueryByShortID(shortID)
+	assert.NoError(t, err)
+	assert.Equal(t, int64(1), thread.MessageCount)
+	assert.NotNil(t, thread.LastMessageAt)
+	assert.Equal(t, "你好世界", thread.LastMessageContent)
+	assert.Equal(t, "sender1", thread.LastMessageSenderUID)
+
+	// 再更新一次，message_count 应递增
+	err = db.UpdateMessageStats(shortID, "第二条消息", "sender2")
+	assert.NoError(t, err)
+
+	thread, err = db.QueryByShortID(shortID)
+	assert.NoError(t, err)
+	assert.Equal(t, int64(2), thread.MessageCount)
+	assert.Equal(t, "第二条消息", thread.LastMessageContent)
+	assert.Equal(t, "sender2", thread.LastMessageSenderUID)
 }
 
 // ==================== RemoveUserFromGroupThreads 测试 ====================

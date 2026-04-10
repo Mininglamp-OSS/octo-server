@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
@@ -17,6 +18,7 @@ type Voice struct {
 	ctx     *config.Context
 	service *VoiceService
 	cfg     *VoiceConfig
+	db      VoiceStore
 	log.Log
 }
 
@@ -26,6 +28,7 @@ func New(ctx *config.Context, cfg *VoiceConfig) *Voice {
 		ctx:     ctx,
 		service: NewVoiceService(cfg),
 		cfg:     cfg,
+		db:      NewVoiceDB(ctx),
 		Log:     log.NewTLog("Voice"),
 	}
 }
@@ -35,6 +38,7 @@ func (v *Voice) Route(r *wkhttp.WKHttp) {
 	auth := r.Group("/v1/voice", v.ctx.AuthMiddleware(r))
 	{
 		auth.POST("/transcribe", v.transcribe)
+		auth.GET("/context", v.getContext)
 	}
 
 	open := r.Group("/v1/voice")
@@ -72,19 +76,19 @@ func (v *Voice) transcribe(c *wkhttp.Context) {
 	}
 
 	contextText := c.Request.FormValue("context_text")
-	if len(contextText) > maxContextTextLength {
+	if len([]rune(contextText)) > MaxContextTextLength {
 		v.Warn("context_text exceeds max length, truncating to keep recent text",
-			zap.Int("original_length", len(contextText)),
-			zap.Int("max_length", maxContextTextLength))
-		contextText = contextText[len(contextText)-maxContextTextLength:]
+			zap.Int("original_rune_length", len([]rune(contextText))),
+			zap.Int("max_length", MaxContextTextLength))
+		contextText = TruncateRunesTail(contextText, MaxContextTextLength)
 	}
 
 	chatContext := c.Request.FormValue("chat_context")
-	if len(chatContext) > maxChatContextLength {
+	if len([]rune(chatContext)) > MaxChatContextLength {
 		v.Warn("chat_context exceeds max length, truncating to last characters",
-			zap.Int("original_length", len(chatContext)),
-			zap.Int("max_length", maxChatContextLength))
-		chatContext = chatContext[len(chatContext)-maxChatContextLength:]
+			zap.Int("original_rune_length", len([]rune(chatContext))),
+			zap.Int("max_length", MaxChatContextLength))
+		chatContext = TruncateRunesTail(chatContext, MaxChatContextLength)
 	}
 
 	text, model, err := v.service.Transcribe(audioData, mimeType, contextText, chatContext)
@@ -109,26 +113,61 @@ func (v *Voice) transcribe(c *wkhttp.Context) {
 func (v *Voice) getConfig(c *wkhttp.Context) {
 	enabled := v.cfg.Validate() == nil
 	c.JSON(http.StatusOK, gin.H{
-		"enabled":      enabled,
-		"max_duration": v.cfg.MaxDuration,
-		"engine":       shortenEngineName(v.cfg.Engine),
-		"edit_mode":    v.cfg.EditMode,
+		"enabled":       enabled,
+		"max_duration":  v.cfg.MaxDuration,
+		"max_file_size": v.cfg.MaxFileSize,
+		"engine":        shortenEngineName(v.cfg.Engine),
+		"edit_mode":     v.cfg.EditMode,
+	})
+}
+
+// getContext returns the user's personal voice correction context for the given space
+func (v *Voice) getContext(c *wkhttp.Context) {
+	loginUID := c.GetLoginUID()
+	spaceID := c.Query("space_id")
+	if spaceID == "" {
+		c.ResponseErrorWithStatus(errors.New("space_id is required"), http.StatusBadRequest)
+		return
+	}
+
+	isMember, err := v.db.CheckSpaceMembership(spaceID, loginUID)
+	if err != nil {
+		v.Error("check space membership failed", zap.Error(err), zap.String("uid", loginUID), zap.String("spaceID", spaceID))
+		c.ResponseErrorWithStatus(errors.New("check space membership failed"), http.StatusInternalServerError)
+		return
+	}
+	if !isMember {
+		c.ResponseErrorWithStatus(errors.New("no permission to access this space"), http.StatusForbidden)
+		return
+	}
+
+	m, err := v.db.QueryVoiceContext(loginUID, spaceID)
+	if err != nil {
+		v.Error("query voice context failed", zap.Error(err), zap.String("uid", loginUID), zap.String("spaceID", spaceID))
+		c.ResponseErrorWithStatus(errors.New("query voice context failed"), http.StatusInternalServerError)
+		return
+	}
+
+	if m == nil {
+		c.JSON(http.StatusOK, gin.H{
+			"status":      http.StatusOK,
+			"has_context": false,
+			"context":     "",
+			"updated_at":  "",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":      http.StatusOK,
+		"has_context": true,
+		"context":     m.ASRCorrectContext,
+		"updated_at":  m.UpdatedAt.Format(time.RFC3339),
 	})
 }
 
 func shortenModelName(model string) string {
-	switch model {
-	case "gemini-3.1-pro-preview":
-		return "g31pp"
-	case "gemini-3-flash-preview":
-		return "g3fp"
-	case "gemini-2.5-pro":
-		return "g25p"
-	case "gpt-4o-mini-transcribe":
-		return "g4omt"
-	default:
-		return model
-	}
+	return ShortenModelName(model)
 }
 
 func shortenEngineName(engine string) string {

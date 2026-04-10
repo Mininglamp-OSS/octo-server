@@ -5,14 +5,18 @@ import (
 )
 
 // CheckMembership checks if uid is an active member of the given Space.
+// Also verifies the Space itself is active (space.status=1).
 func CheckMembership(session *dbr.Session, spaceID string, uid string) (bool, error) {
 	if spaceID == "" || uid == "" {
 		return false, nil
 	}
 	var count int
-	err := session.Select("COUNT(*)").From("space_member").
-		Where("space_id=? AND uid=? AND status=1", spaceID, uid).
-		LoadOne(&count)
+	err := session.SelectBySql(
+		"SELECT COUNT(*) FROM space_member sm "+
+			"INNER JOIN space s ON s.space_id = sm.space_id AND s.status = 1 "+
+			"WHERE sm.uid = ? AND sm.space_id = ? AND sm.status = 1",
+		uid, spaceID,
+	).LoadOne(&count)
 	if err != nil {
 		return false, err
 	}

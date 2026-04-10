@@ -461,7 +461,7 @@ func TestIMDatasource_ChannelInfo(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotContains(t, info, "ban")
 
-	// 归档子区 - 应该 ban=1
+	// 归档子区 - 不应 ban（归档子区允许发消息，发消息后自动解档）
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("POST", "/v1/groups/"+groupNo+"/threads/"+shortID+"/archive", nil)
 	req.Header.Set("token", testutil.Token)
@@ -470,7 +470,8 @@ func TestIMDatasource_ChannelInfo(t *testing.T) {
 
 	info, err = mod.IMDatasource.ChannelInfo(channelID, 5)
 	assert.NoError(t, err)
-	assert.Equal(t, 1, info["ban"])
+	assert.NotContains(t, info, "ban")
+	assert.Equal(t, ThreadStatusArchived, info["status"])
 
 	// 删除子区 - 也应该 ban=1
 	// 先取消归档再删除
@@ -554,6 +555,105 @@ func TestBussDataSource_ChannelGet(t *testing.T) {
 	fakeID := BuildChannelID(groupNo, "9999999999999999999")
 	_, err = mod.BussDataSource.ChannelGet(fakeID, 5, testutil.UID)
 	assert.Equal(t, register.ErrDatasourceNotProcess, err)
+}
+
+// ==================== 统计字段测试 ====================
+
+// TestListThreads_WithStats 验证列表返回消息统计字段
+func TestListThreads_WithStats(t *testing.T) {
+	s, ctx := setupTestData(t)
+	groupNo := createTestGroup(t, ctx)
+
+	// 创建子区
+	shortID := createThreadViaAPI(t, s, groupNo, "统计测试")
+
+	// 模拟收到消息，触发 onMessages 更新统计
+	api := New(ctx)
+	api.onMessages([]*config.MessageResp{
+		{
+			ChannelID:   BuildChannelID(groupNo, shortID),
+			ChannelType: 5,
+			FromUID:     testutil.UID,
+			Payload:     []byte(`{"type":1,"content":"你好世界"}`),
+		},
+	})
+
+	// 列出子区
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/groups/"+groupNo+"/threads", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var threads []ThreadResp
+	util.ReadJsonByByte(w.Body.Bytes(), &threads)
+	assert.Len(t, threads, 1)
+
+	thread := threads[0]
+	assert.Equal(t, int64(1), thread.MessageCount)
+	assert.Equal(t, "你好世界", thread.LastMessageContent)
+	assert.NotEmpty(t, thread.LastMessageSenderName)
+	assert.NotEmpty(t, thread.LastMessageAt)
+	assert.NotEqual(t, thread.CreatedAt, thread.LastMessageAt, "last_message_at should differ from created_at when messages exist")
+}
+
+// TestGetThread_WithStats 验证详情返回消息统计字段
+func TestGetThread_WithStats(t *testing.T) {
+	s, ctx := setupTestData(t)
+	groupNo := createTestGroup(t, ctx)
+
+	shortID := createThreadViaAPI(t, s, groupNo, "详情统计测试")
+
+	// 模拟收到消息
+	api := New(ctx)
+	api.onMessages([]*config.MessageResp{
+		{
+			ChannelID:   BuildChannelID(groupNo, shortID),
+			ChannelType: 5,
+			FromUID:     testutil.UID,
+			Payload:     []byte(`{"type":1,"content":"详情消息"}`),
+		},
+	})
+
+	// 获取子区详情
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/groups/"+groupNo+"/threads/"+shortID, nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp ThreadResp
+	util.ReadJsonByByte(w.Body.Bytes(), &resp)
+
+	assert.Equal(t, int64(1), resp.MessageCount)
+	assert.Equal(t, "详情消息", resp.LastMessageContent)
+	assert.NotEmpty(t, resp.LastMessageSenderName)
+	assert.NotEmpty(t, resp.LastMessageAt)
+}
+
+// TestCreateThread_ThreadCreatedMessagePayload 验证 ThreadCreated 消息包含 participants
+func TestCreateThread_ThreadCreatedMessagePayload(t *testing.T) {
+	s, ctx := setupTestData(t)
+	groupNo := createTestGroup(t, ctx)
+
+	// 创建子区
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/groups/"+groupNo+"/threads", bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
+		"name": "参与者测试",
+	}))))
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	// 验证返回的响应包含新的统计字段
+	var resp ThreadResp
+	util.ReadJsonByByte(w.Body.Bytes(), &resp)
+	assert.Equal(t, int64(0), resp.MessageCount)
+	assert.Equal(t, 1, resp.MemberCount)
+	assert.Equal(t, resp.CreatedAt, resp.LastMessageAt, "last_message_at should equal created_at when no messages")
 }
 
 // ==================== 修复验证测试 ====================

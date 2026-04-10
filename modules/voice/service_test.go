@@ -1141,8 +1141,34 @@ func TestCallGPTWithModelFallback_NoModels(t *testing.T) {
 	assert.Contains(t, err.Error(), "no GPT models configured")
 }
 
-// --- contextText length truncation (maxContextTextLength) ---
+// --- GPT engine + edit mode rejection ---
+
+func TestTranscribeWithOptions_GPT_EditModeRejected(t *testing.T) {
+	cfg := newGPTTestConfig("http://unused.example.com")
+	svc := NewVoiceService(cfg)
+
+	// Explicit mode=edit with GPT engine should fail
+	_, _, err := svc.TranscribeWithOptions([]byte("audio"), "audio/wav", "", "", TranscribeOptions{Mode: "edit"})
+	assert.Error(t, err)
+	assert.ErrorIs(t, err, ErrGPTEditNotSupported)
+
+	// GPT config with default edit mode set to "edit" should also fail
+	cfg2 := newGPTTestConfig("http://unused.example.com")
+	cfg2.EditMode = "edit"
+	svc2 := NewVoiceService(cfg2)
+
+	_, _, err = svc2.TranscribeWithOptions([]byte("audio"), "audio/wav", "", "", TranscribeOptions{})
+	assert.Error(t, err)
+	assert.ErrorIs(t, err, ErrGPTEditNotSupported)
+
+	// GPT engine with mode=append should NOT error (sanity check, will fail on network but not on validation)
+	_, _, err = svc.TranscribeWithOptions([]byte("audio"), "audio/wav", "", "", TranscribeOptions{Mode: "append"})
+	assert.Error(t, err) // network error, not validation error
+	assert.NotErrorIs(t, err, ErrGPTEditNotSupported)
+}
+
+// --- contextText length truncation (MaxContextTextLength) ---
 
 func TestMaxContextTextLength_Constant(t *testing.T) {
-	assert.Equal(t, 10000, maxContextTextLength)
+	assert.Equal(t, 10000, MaxContextTextLength)
 }

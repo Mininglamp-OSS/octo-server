@@ -1,6 +1,8 @@
 package message
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -626,6 +628,375 @@ func TestTypeAssertionSafety(t *testing.T) {
 					assert.Greater(t, len(visiblesArray), 0)
 				}
 			}
+		})
+	}
+}
+
+// TestMentionEntitiesJSONPassthrough verifies that the mention.entities field
+// is preserved intact through JSON marshal/unmarshal cycles. The backend treats
+// payload as an opaque JSON blob — entities must survive the round-trip.
+func TestMentionEntitiesJSONPassthrough(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+	}{
+		{
+			name: "v2 payload with uids and entities",
+			payload: `{
+				"type": 1,
+				"content": "@Alice @Bob hello",
+				"mention": {
+					"uids": ["uid_alice", "uid_bob"],
+					"all": 0,
+					"entities": [
+						{"uid": "uid_alice", "offset": 0, "length": 6},
+						{"uid": "uid_bob", "offset": 7, "length": 4}
+					]
+				}
+			}`,
+		},
+		{
+			name: "v2 payload with entities and all=true",
+			payload: `{
+				"type": 1,
+				"content": "@all check this",
+				"mention": {
+					"uids": [],
+					"all": 1,
+					"entities": [
+						{"uid": "__all__", "offset": 0, "length": 4}
+					]
+				}
+			}`,
+		},
+		{
+			name: "v1 payload without entities",
+			payload: `{
+				"type": 1,
+				"content": "@Alice hello",
+				"mention": {
+					"uids": ["uid_alice"],
+					"all": 0
+				}
+			}`,
+		},
+		{
+			name: "empty entities array",
+			payload: `{
+				"type": 1,
+				"content": "no mentions",
+				"mention": {
+					"uids": ["uid_alice"],
+					"entities": []
+				}
+			}`,
+		},
+		{
+			name: "entities with extra fields (forward compat)",
+			payload: `{
+				"type": 1,
+				"content": "@Alice hello",
+				"mention": {
+					"uids": ["uid_alice"],
+					"entities": [
+						{"uid": "uid_alice", "offset": 0, "length": 6, "display_name": "Alice", "color": "#ff0000"}
+					]
+				}
+			}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Simulate JSON round-trip as the backend does (unmarshal → re-marshal)
+			var payloadMap map[string]interface{}
+			decoder := json.NewDecoder(strings.NewReader(tt.payload))
+			decoder.UseNumber()
+			err := decoder.Decode(&payloadMap)
+			assert.NoError(t, err, "should unmarshal payload")
+
+			// Re-marshal
+			marshaled, err := json.Marshal(payloadMap)
+			assert.NoError(t, err, "should marshal payload")
+
+			// Unmarshal again and compare
+			var roundTripped map[string]interface{}
+			decoder2 := json.NewDecoder(strings.NewReader(string(marshaled)))
+			decoder2.UseNumber()
+			err = decoder2.Decode(&roundTripped)
+			assert.NoError(t, err, "should unmarshal round-tripped payload")
+
+			// Verify mention field is preserved
+			origMention, _ := json.Marshal(payloadMap["mention"])
+			rtMention, _ := json.Marshal(roundTripped["mention"])
+			assert.JSONEq(t, string(origMention), string(rtMention),
+				"mention field should be identical after round-trip")
+
+			// If entities existed in the original, verify they are still present
+			if mentionMap, ok := payloadMap["mention"].(map[string]interface{}); ok {
+				if _, hasEntities := mentionMap["entities"]; hasEntities {
+					rtMentionMap, ok := roundTripped["mention"].(map[string]interface{})
+					assert.True(t, ok, "round-tripped mention should be a map")
+					_, rtHasEntities := rtMentionMap["entities"]
+					assert.True(t, rtHasEntities, "entities should survive round-trip")
+				}
+			}
+		})
+	}
+}
+
+// TestGetMentionWithEntitiesCompatibility verifies that getMention() correctly
+// extracts uids and all from payloads that include the new entities field,
+// without panicking or returning wrong results.
+func TestGetMentionWithEntitiesCompatibility(t *testing.T) {
+	m := &Message{}
+
+	tests := []struct {
+		name       string
+		payloadMap map[string]interface{}
+		expectAll  bool
+		expectUIDs []string
+	}{
+		{
+			name: "v2 payload - uids + entities",
+			payloadMap: map[string]interface{}{
+				"mention": map[string]interface{}{
+					"uids": []interface{}{"uid_alice", "uid_bob"},
+					"entities": []interface{}{
+						map[string]interface{}{"uid": "uid_alice", "offset": json.Number("0"), "length": json.Number("6")},
+						map[string]interface{}{"uid": "uid_bob", "offset": json.Number("7"), "length": json.Number("4")},
+					},
+				},
+			},
+			expectAll:  false,
+			expectUIDs: []string{"uid_alice", "uid_bob"},
+		},
+		{
+			name: "v2 payload - all=1 + entities",
+			payloadMap: map[string]interface{}{
+				"mention": map[string]interface{}{
+					"all":  json.Number("1"),
+					"uids": []interface{}{},
+					"entities": []interface{}{
+						map[string]interface{}{"uid": "__all__", "offset": json.Number("0"), "length": json.Number("4")},
+					},
+				},
+			},
+			expectAll:  true,
+			expectUIDs: []string{},
+		},
+		{
+			name: "v1 payload - only uids (no entities key)",
+			payloadMap: map[string]interface{}{
+				"mention": map[string]interface{}{
+					"uids": []interface{}{"uid_alice"},
+				},
+			},
+			expectAll:  false,
+			expectUIDs: []string{"uid_alice"},
+		},
+		{
+			name: "entities is null",
+			payloadMap: map[string]interface{}{
+				"mention": map[string]interface{}{
+					"uids":     []interface{}{"uid_alice"},
+					"entities": nil,
+				},
+			},
+			expectAll:  false,
+			expectUIDs: []string{"uid_alice"},
+		},
+		{
+			name: "entities is empty array",
+			payloadMap: map[string]interface{}{
+				"mention": map[string]interface{}{
+					"uids":     []interface{}{"uid_alice", "uid_bob"},
+					"entities": []interface{}{},
+				},
+			},
+			expectAll:  false,
+			expectUIDs: []string{"uid_alice", "uid_bob"},
+		},
+		{
+			name: "entities is malformed string",
+			payloadMap: map[string]interface{}{
+				"mention": map[string]interface{}{
+					"uids":     []interface{}{"uid_alice"},
+					"entities": "not_an_array",
+				},
+			},
+			expectAll:  false,
+			expectUIDs: []string{"uid_alice"},
+		},
+		{
+			name: "entities is integer",
+			payloadMap: map[string]interface{}{
+				"mention": map[string]interface{}{
+					"uids":     []interface{}{"uid_alice"},
+					"entities": 42,
+				},
+			},
+			expectAll:  false,
+			expectUIDs: []string{"uid_alice"},
+		},
+		{
+			name: "entities contains malformed entries (no uid field)",
+			payloadMap: map[string]interface{}{
+				"mention": map[string]interface{}{
+					"uids": []interface{}{"uid_alice"},
+					"entities": []interface{}{
+						map[string]interface{}{"offset": json.Number("0"), "length": json.Number("6")},
+					},
+				},
+			},
+			expectAll:  false,
+			expectUIDs: []string{"uid_alice"},
+		},
+		{
+			name: "entities contains non-map elements",
+			payloadMap: map[string]interface{}{
+				"mention": map[string]interface{}{
+					"uids":     []interface{}{"uid_alice"},
+					"entities": []interface{}{"invalid", 123, nil},
+				},
+			},
+			expectAll:  false,
+			expectUIDs: []string{"uid_alice"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("getMention panicked with entities in payload: %v", r)
+				}
+			}()
+
+			all, uids := m.getMention(tt.payloadMap)
+			assert.Equal(t, tt.expectAll, all)
+			assert.Equal(t, tt.expectUIDs, uids)
+		})
+	}
+}
+
+// TestHasMentionWithEntities verifies that hasMention() returns true for
+// payloads containing the new entities field.
+func TestHasMentionWithEntities(t *testing.T) {
+	m := &Message{}
+
+	tests := []struct {
+		name       string
+		payloadMap map[string]interface{}
+		expected   bool
+	}{
+		{
+			name: "v2 mention with entities",
+			payloadMap: map[string]interface{}{
+				"mention": map[string]interface{}{
+					"uids": []interface{}{"uid_alice"},
+					"entities": []interface{}{
+						map[string]interface{}{"uid": "uid_alice", "offset": 0, "length": 6},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "v1 mention without entities",
+			payloadMap: map[string]interface{}{
+				"mention": map[string]interface{}{
+					"uids": []interface{}{"uid_alice"},
+				},
+			},
+			expected: true,
+		},
+		{
+			name:       "no mention",
+			payloadMap: map[string]interface{}{"type": 1},
+			expected:   false,
+		},
+		{
+			name:       "mention is nil",
+			payloadMap: map[string]interface{}{"mention": nil},
+			expected:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, m.hasMention(tt.payloadMap))
+		})
+	}
+}
+
+// TestV1V2MentionCoexistence verifies that getMention() works correctly when
+// processing a mix of v1 (uids-only) and v2 (uids + entities) payloads,
+// simulating the transition period where old and new clients coexist.
+func TestV1V2MentionCoexistence(t *testing.T) {
+	m := &Message{}
+
+	payloads := []struct {
+		label      string
+		payloadMap map[string]interface{}
+		expectAll  bool
+		expectUIDs []string
+	}{
+		{
+			label: "v1 message from old client",
+			payloadMap: map[string]interface{}{
+				"mention": map[string]interface{}{
+					"uids": []interface{}{"uid_1", "uid_2"},
+				},
+			},
+			expectAll:  false,
+			expectUIDs: []string{"uid_1", "uid_2"},
+		},
+		{
+			label: "v2 message from new client",
+			payloadMap: map[string]interface{}{
+				"mention": map[string]interface{}{
+					"uids": []interface{}{"uid_1", "uid_2"},
+					"entities": []interface{}{
+						map[string]interface{}{"uid": "uid_1", "offset": json.Number("0"), "length": json.Number("5")},
+						map[string]interface{}{"uid": "uid_2", "offset": json.Number("6"), "length": json.Number("7")},
+					},
+				},
+			},
+			expectAll:  false,
+			expectUIDs: []string{"uid_1", "uid_2"},
+		},
+		{
+			label: "v1 @all from old client",
+			payloadMap: map[string]interface{}{
+				"mention": map[string]interface{}{
+					"all": json.Number("1"),
+				},
+			},
+			expectAll:  true,
+			expectUIDs: nil,
+		},
+		{
+			label: "v2 @all from new client",
+			payloadMap: map[string]interface{}{
+				"mention": map[string]interface{}{
+					"all":  json.Number("1"),
+					"uids": []interface{}{},
+					"entities": []interface{}{
+						map[string]interface{}{"uid": "__all__", "offset": json.Number("0"), "length": json.Number("4")},
+					},
+				},
+			},
+			expectAll:  true,
+			expectUIDs: []string{},
+		},
+	}
+
+	for _, p := range payloads {
+		t.Run(p.label, func(t *testing.T) {
+			all, uids := m.getMention(p.payloadMap)
+			assert.Equal(t, p.expectAll, all, "all mismatch for %s", p.label)
+			assert.Equal(t, p.expectUIDs, uids, "uids mismatch for %s", p.label)
 		})
 	}
 }

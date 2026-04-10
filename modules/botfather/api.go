@@ -21,6 +21,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/modules/voice"
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
@@ -45,6 +46,9 @@ type BotFather struct {
 	groupService     group.IService
 	userDB           *user.DB
 	threadService    thread.IService
+	voiceDB          *voice.VoiceDB
+	voiceSvc         *voice.VoiceService
+	voiceCfg         *voice.VoiceConfig
 	robotEventPrefix string
 	initOnce         sync.Once
 	msgSem           chan struct{} // 限制并发消息处理的信号量
@@ -53,6 +57,7 @@ type BotFather struct {
 
 // New 创建BotFather实例
 func New(ctx *config.Context) *BotFather {
+	voiceCfg := voice.NewVoiceConfigFromEnv()
 	bf := &BotFather{
 		ctx:              ctx,
 		db:               newBotfatherDB(ctx),
@@ -63,6 +68,9 @@ func New(ctx *config.Context) *BotFather {
 		groupService:     group.NewService(ctx),
 		userDB:           user.NewDB(ctx),
 		threadService:    thread.NewService(ctx),
+		voiceDB:          voice.NewVoiceDB(ctx),
+		voiceSvc:         voice.NewVoiceService(voiceCfg),
+		voiceCfg:         voiceCfg,
 		robotEventPrefix: "robotEvent:",
 		msgSem:           make(chan struct{}, 100), // 限制最多100个并发消息处理
 		Log:              log.NewTLog("BotFather"),
@@ -132,6 +140,11 @@ func (bf *BotFather) Route(r *wkhttp.WKHttp) {
 		botAPI.GET("/upload/credentials", bf.botUploadCredentials) // STS 临时密钥签发
 		botAPI.POST("/message/edit", bf.botMessageEdit)            // Bot 编辑消息
 		botAPI.GET("/user/info", bf.getUserInfo)                    // 查询用户基本信息 (#852)
+		// Voice context API
+		botAPI.PUT("/voice/context", bf.botPutVoiceContext)
+		botAPI.GET("/voice/context", bf.botGetVoiceContext)
+		botAPI.DELETE("/voice/context", bf.botDeleteVoiceContext)
+		botAPI.POST("/voice/transcribe", bf.botTranscribe)
 	}
 
 	// Bot File API（独立路由组，避免 GIN wildcard 冲突）

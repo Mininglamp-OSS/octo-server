@@ -223,11 +223,24 @@ func (d *botfatherDB) queryRobotByUsernameActive(username string) (*robotModel, 
 func (d *botfatherDB) isBotInSpace(robotID string, spaceID string) (bool, error) {
 	var count int
 	_, err := d.session.SelectBySql(
-		"SELECT COUNT(*) FROM space_member WHERE uid=? AND space_id=?",
+		"SELECT COUNT(*) FROM space_member sm "+
+			"INNER JOIN space s ON s.space_id = sm.space_id AND s.status = 1 "+
+			"WHERE sm.uid=? AND sm.space_id=? AND sm.status=1",
 		robotID, spaceID,
 	).Load(&count)
 	if err != nil {
 		return false, err
 	}
 	return count > 0, nil
+}
+
+// querySpaceIDByRobotID returns the active Space ID for the given bot.
+// Checks both space_member.status=1 and space.status=1.
+func (d *botfatherDB) querySpaceIDByRobotID(robotID string) (string, error) {
+	var spaceID string
+	err := d.session.SelectBySql(
+		"SELECT sm.space_id FROM space_member sm INNER JOIN space s ON s.space_id = sm.space_id WHERE sm.uid=? AND sm.status=1 AND s.status=1",
+		robotID,
+	).LoadOne(&spaceID)
+	return spaceID, err
 }

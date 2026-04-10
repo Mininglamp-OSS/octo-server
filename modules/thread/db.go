@@ -27,13 +27,17 @@ func NewDB(ctx *config.Context) *DB {
 
 // Model 子区数据模型
 type Model struct {
-	ShortID         string `json:"short_id"`
-	GroupNo         string `json:"group_no"`
-	Name            string `json:"name"`
-	CreatorUID      string `json:"creator_uid"`
-	SourceMessageID *int64 `json:"source_message_id"`
-	Status          int    `json:"status"`
-	Version         int64  `json:"version"`
+	ShortID              string     `json:"short_id"`
+	GroupNo              string     `json:"group_no"`
+	Name                 string     `json:"name"`
+	CreatorUID           string     `json:"creator_uid"`
+	SourceMessageID      *int64     `json:"source_message_id"`
+	Status               int        `json:"status"`
+	Version              int64      `json:"version"`
+	MessageCount         int64      `json:"message_count"`
+	LastMessageAt        *time.Time `json:"last_message_at"`
+	LastMessageContent   string     `json:"last_message_content"`
+	LastMessageSenderUID string     `json:"last_message_sender_uid"`
 	db.BaseModel
 }
 
@@ -258,6 +262,17 @@ func (d *DB) CountMembersBatch(threadIDs []int64) (map[int64]int, error) {
 		countMap[r.ThreadID] = r.Count
 	}
 	return countMap, nil
+}
+
+// UpdateMessageStats 原子更新消息统计（收到消息时调用）
+func (d *DB) UpdateMessageStats(shortID string, content string, senderUID string) error {
+	_, err := d.session.Update("thread").SetMap(map[string]interface{}{
+		"message_count":          dbr.Expr("message_count + 1"),
+		"last_message_at":        time.Now(),
+		"last_message_content":   content,
+		"last_message_sender_uid": senderUID,
+	}).Where("short_id=?", shortID).Exec()
+	return err
 }
 
 // QueryMessageFromUID 根据 channelID 和 messageID 查询消息发送者

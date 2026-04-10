@@ -29,13 +29,53 @@ func NewVoiceService(cfg *VoiceConfig) *VoiceService {
 	}
 }
 
+// TranscribeOptions holds per-request overrides for transcription
+type TranscribeOptions struct {
+	// Mode overrides the transcription mode: "append" or "edit".
+	// Empty string uses the global VoiceConfig.EditMode.
+	Mode string
+
+	// Model overrides the preferred model.
+	// Empty string uses the global fallback chain.
+	Model string
+}
+
 // Transcribe dispatches to append or edit path based on EditMode.
 func (s *VoiceService) Transcribe(audioData []byte, mimeType string, contextText string, chatContext string) (string, string, error) {
-	switch s.config.EditMode {
+	return s.TranscribeWithOptions(audioData, mimeType, contextText, chatContext, TranscribeOptions{})
+}
+
+// ErrGPTEditNotSupported is returned when edit mode is requested with GPT engine.
+var ErrGPTEditNotSupported = fmt.Errorf("edit mode is not supported with GPT engine")
+
+// TranscribeWithOptions supports per-request mode/model override.
+// Empty option fields fall back to the global configuration.
+func (s *VoiceService) TranscribeWithOptions(audioData []byte, mimeType, contextText, chatContext string, opts TranscribeOptions) (string, string, error) {
+	mode := s.config.EditMode
+	if opts.Mode != "" {
+		mode = opts.Mode
+	}
+
+	if s.config.Engine == "gpt" && mode == "edit" {
+		return "", "", ErrGPTEditNotSupported
+	}
+
+	svc := s
+	if opts.Model != "" {
+		cfgCopy := *s.config
+		if s.config.Engine == "gpt" {
+			cfgCopy.GPTModels = append([]string{opts.Model}, s.config.GPTModels...)
+		} else {
+			cfgCopy.Models = append([]string{opts.Model}, s.config.Models...)
+		}
+		svc = &VoiceService{config: &cfgCopy, client: s.client}
+	}
+
+	switch mode {
 	case "append":
-		return s.transcribeAppend(audioData, mimeType, contextText, chatContext)
+		return svc.transcribeAppend(audioData, mimeType, contextText, chatContext)
 	default: // "edit"
-		return s.transcribeEdit(audioData, mimeType, contextText, chatContext)
+		return svc.transcribeEdit(audioData, mimeType, contextText, chatContext)
 	}
 }
 

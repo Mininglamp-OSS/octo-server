@@ -2,6 +2,7 @@ package robot
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -116,4 +117,132 @@ func TestInlineQueryEventsMapLockConsistency(t *testing.T) {
 	rb.inlineQueryEventsMapLock.RUnlock()
 
 	assert.Equal(t, iterations, len(events), "All events should have been added without race condition")
+}
+
+// TestMyBots_ExcludesDeletedRobots verifies that /robot/my_bots does not return
+// bots whose robot.status has been set to 0 (soft-deleted). Before the fix the
+// query used a LEFT JOIN on robot, so a deleted bot whose friend record had
+// not been cleaned up would still appear in the result set.
+func TestMyBots_ExcludesDeletedRobots(t *testing.T) {
+	s, ctx := newTestServer()
+	rb := New(ctx)
+	rb.Route(s.GetRoute())
+
+	db := ctx.DB()
+
+	// Clean up test data
+	db.UpdateBySql("DELETE FROM robot WHERE robot_id IN (?,?)", "active_bot_836", "deleted_bot_836").Exec()
+	db.UpdateBySql("DELETE FROM friend WHERE uid=? AND to_uid IN (?,?)", uid, "active_bot_836", "deleted_bot_836").Exec()
+	db.UpdateBySql("DELETE FROM user WHERE uid IN (?,?,?)", uid, "active_bot_836", "deleted_bot_836").Exec()
+
+	// Create the login user
+	_, err := db.InsertInto("user").Columns("uid", "name", "status").
+		Values(uid, "TestUser", 1).Exec()
+	assert.NoError(t, err)
+
+	// Create an active bot user + robot record
+	_, err = db.InsertInto("user").Columns("uid", "name", "robot", "status").
+		Values("active_bot_836", "ActiveBot", 1, 1).Exec()
+	assert.NoError(t, err)
+	_, err = db.InsertInto("robot").Columns("robot_id", "status", "creator_uid", "description").
+		Values("active_bot_836", 1, uid, "active bot").Exec()
+	assert.NoError(t, err)
+
+	// Create a deleted bot user + robot record (status=0)
+	_, err = db.InsertInto("user").Columns("uid", "name", "robot", "status").
+		Values("deleted_bot_836", "DeletedBot", 1, 1).Exec()
+	assert.NoError(t, err)
+	_, err = db.InsertInto("robot").Columns("robot_id", "status", "creator_uid", "description").
+		Values("deleted_bot_836", 0, uid, "deleted bot").Exec()
+	assert.NoError(t, err)
+
+	// Create friend records: login user -> both bots (is_deleted=0)
+	_, err = db.InsertInto("friend").Columns("uid", "to_uid", "is_deleted").
+		Values(uid, "active_bot_836", 0).Exec()
+	assert.NoError(t, err)
+	_, err = db.InsertInto("friend").Columns("uid", "to_uid", "is_deleted").
+		Values(uid, "deleted_bot_836", 0).Exec()
+	assert.NoError(t, err)
+
+	// Call GET /v1/robot/my_bots
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("GET", "/v1/robot/my_bots", nil)
+	assert.NoError(t, err)
+	req.Header.Set("token", token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	// Parse JSON array response
+	var results []map[string]interface{}
+	err = json.Unmarshal(w.Body.Bytes(), &results)
+	assert.NoError(t, err)
+
+	// Only active_bot_836 should be present
+	assert.Equal(t, 1, len(results), "deleted bot should not appear in my_bots")
+	if len(results) == 1 {
+		assert.Equal(t, "active_bot_836", results[0]["uid"])
+	}
+}
+
+// TestSpaceBots_ExcludesDeletedSpaceMembers verifies that /robot/space_bots
+// filters out bots whose space_member.status has been set to 0.
+func TestSpaceBots_ExcludesDeletedSpaceMembers(t *testing.T) {
+	s, ctx := newTestServer()
+	rb := New(ctx)
+	rb.Route(s.GetRoute())
+
+	db := ctx.DB()
+	testSpaceID := "space_test_836"
+
+	// Clean up test data
+	db.UpdateBySql("DELETE FROM robot WHERE robot_id IN (?,?)", "sbot_active_836", "sbot_removed_836").Exec()
+	db.UpdateBySql("DELETE FROM space_member WHERE space_id=?", testSpaceID).Exec()
+	db.UpdateBySql("DELETE FROM user WHERE uid IN (?,?,?)", uid, "sbot_active_836", "sbot_removed_836").Exec()
+
+	// Create the login user
+	_, err := db.InsertInto("user").Columns("uid", "name", "status").
+		Values(uid, "TestUser", 1).Exec()
+	assert.NoError(t, err)
+
+	// Active bot: user + robot + space_member(status=1)
+	_, err = db.InsertInto("user").Columns("uid", "name", "robot", "status").
+		Values("sbot_active_836", "SpaceActiveBot", 1, 1).Exec()
+	assert.NoError(t, err)
+	_, err = db.InsertInto("robot").Columns("robot_id", "status", "creator_uid", "description").
+		Values("sbot_active_836", 1, uid, "active space bot").Exec()
+	assert.NoError(t, err)
+	_, err = db.InsertInto("space_member").Columns("space_id", "uid", "status").
+		Values(testSpaceID, "sbot_active_836", 1).Exec()
+	assert.NoError(t, err)
+
+	// Removed bot: user + robot(status=1) + space_member(status=0)
+	_, err = db.InsertInto("user").Columns("uid", "name", "robot", "status").
+		Values("sbot_removed_836", "SpaceRemovedBot", 1, 1).Exec()
+	assert.NoError(t, err)
+	_, err = db.InsertInto("robot").Columns("robot_id", "status", "creator_uid", "description").
+		Values("sbot_removed_836", 1, uid, "removed from space").Exec()
+	assert.NoError(t, err)
+	_, err = db.InsertInto("space_member").Columns("space_id", "uid", "status").
+		Values(testSpaceID, "sbot_removed_836", 0).Exec()
+	assert.NoError(t, err)
+
+	// Call GET /v1/robot/space_bots?space_id=space_test_836
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("GET", "/v1/robot/space_bots?space_id="+testSpaceID, nil)
+	assert.NoError(t, err)
+	req.Header.Set("token", token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var results []map[string]interface{}
+	err = json.Unmarshal(w.Body.Bytes(), &results)
+	assert.NoError(t, err)
+
+	// Only the active space member bot should appear
+	assert.Equal(t, 1, len(results), "removed space member bot should not appear in space_bots")
+	if len(results) == 1 {
+		assert.Equal(t, "sbot_active_836", results[0]["uid"])
+	}
 }

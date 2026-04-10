@@ -33,7 +33,7 @@ func TestNewVoiceConfigFromEnv_Defaults(t *testing.T) {
 	assert.Equal(t, 45, cfg.TotalTimeout)
 	assert.Equal(t, []string{"gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro"}, cfg.Models)
 	assert.Equal(t, 60, cfg.MaxDuration)
-	assert.Equal(t, int64(5*1024*1024), cfg.MaxFileSize)
+	assert.Equal(t, int64(3*1024*1024), cfg.MaxFileSize)
 	assert.Equal(t, "gemini", cfg.Engine)
 	assert.Equal(t, []string{"gpt-4o-mini-transcribe"}, cfg.GPTModels)
 	assert.Equal(t, "", cfg.Language)
@@ -86,7 +86,7 @@ func TestNewVoiceConfigFromEnv_InvalidNumbers(t *testing.T) {
 	assert.Equal(t, 30, cfg.Timeout)
 	assert.Equal(t, 45, cfg.TotalTimeout)
 	assert.Equal(t, 60, cfg.MaxDuration)
-	assert.Equal(t, int64(5*1024*1024), cfg.MaxFileSize)
+	assert.Equal(t, int64(3*1024*1024), cfg.MaxFileSize)
 }
 
 func TestNewVoiceConfigFromEnv_EmptyModels(t *testing.T) {
@@ -319,4 +319,79 @@ func TestVoiceConfig_Validate_GPTEngine(t *testing.T) {
 	err := cfg.Validate()
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "VOICE_GPT_MODELS")
+}
+
+// --- TruncateRunes tests ---
+
+func TestTruncateRunes_ShortString(t *testing.T) {
+	assert.Equal(t, "hello", TruncateRunes("hello", 10))
+}
+
+func TestTruncateRunes_ExactLength(t *testing.T) {
+	assert.Equal(t, "hello", TruncateRunes("hello", 5))
+}
+
+func TestTruncateRunes_Truncated(t *testing.T) {
+	assert.Equal(t, "hel", TruncateRunes("hello", 3))
+}
+
+func TestTruncateRunes_CJK(t *testing.T) {
+	// Each CJK character is 1 rune
+	assert.Equal(t, "你好", TruncateRunes("你好世界", 2))
+}
+
+func TestTruncateRunes_Empty(t *testing.T) {
+	assert.Equal(t, "", TruncateRunes("", 10))
+}
+
+// --- TruncateRunesTail tests ---
+
+func TestTruncateRunesTail_ShortString(t *testing.T) {
+	assert.Equal(t, "hello", TruncateRunesTail("hello", 10))
+}
+
+func TestTruncateRunesTail_ExactLength(t *testing.T) {
+	assert.Equal(t, "hello", TruncateRunesTail("hello", 5))
+}
+
+func TestTruncateRunesTail_Truncated(t *testing.T) {
+	assert.Equal(t, "llo", TruncateRunesTail("hello", 3))
+}
+
+func TestTruncateRunesTail_CJK(t *testing.T) {
+	assert.Equal(t, "世界", TruncateRunesTail("你好世界", 2))
+}
+
+func TestTruncateRunesTail_Empty(t *testing.T) {
+	assert.Equal(t, "", TruncateRunesTail("", 10))
+}
+
+func TestTruncateRunesTail_Mixed(t *testing.T) {
+	// Mixed ASCII + CJK: each character is 1 rune
+	s := "abc你好"
+	assert.Equal(t, "好", TruncateRunesTail(s, 1))
+	assert.Equal(t, "你好", TruncateRunesTail(s, 2))
+	assert.Equal(t, "c你好", TruncateRunesTail(s, 3))
+}
+
+// --- ShortenModelName tests ---
+
+func TestShortenModelName_Known(t *testing.T) {
+	assert.Equal(t, "g3fp", ShortenModelName("gemini-3-flash-preview"))
+	assert.Equal(t, "g31pp", ShortenModelName("gemini-3.1-pro-preview"))
+	assert.Equal(t, "g25p", ShortenModelName("gemini-2.5-pro"))
+	assert.Equal(t, "gpt4omt", ShortenModelName("gpt-4o-mini-transcribe"))
+	assert.Equal(t, "gpt4ot", ShortenModelName("gpt-4o-transcribe"))
+	assert.Equal(t, "w1", ShortenModelName("whisper-1"))
+	assert.Equal(t, "g20f", ShortenModelName("gemini-2.0-flash"))
+}
+
+func TestShortenModelName_Unknown(t *testing.T) {
+	assert.Equal(t, "some-new-model", ShortenModelName("some-new-model"))
+}
+
+// --- MaxVoiceContextLength constant ---
+
+func TestMaxVoiceContextLength_Constant(t *testing.T) {
+	assert.Equal(t, 10000, MaxVoiceContextLength)
 }

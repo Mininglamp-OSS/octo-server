@@ -1,10 +1,15 @@
 package voice
 
 import (
+	"embed"
+
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/register"
 )
+
+//go:embed sql
+var sqlFS embed.FS
 
 func init() {
 	register.AddModule(func(ctx interface{}) register.Module {
@@ -20,6 +25,7 @@ func init() {
 			SetupAPI: func() register.APIRouter {
 				return api
 			},
+			SQLDir: register.NewSQLFS(sqlFS),
 		}
 	})
 }

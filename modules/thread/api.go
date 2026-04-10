@@ -69,6 +69,15 @@ func (t *Thread) onMessages(messages []*config.MessageResp) {
 			}
 		}
 
+		// 更新消息统计
+		content := parsePayloadContent(msg.Payload)
+		if runeLen := len([]rune(content)); runeLen > 500 {
+			content = string([]rune(content)[:500])
+		}
+		if err := t.db.UpdateMessageStats(shortID, content, msg.FromUID); err != nil {
+			t.Error("更新消息统计失败", zap.Error(err), zap.String("shortID", shortID))
+		}
+
 		// 发送者不是子区成员，自动加入
 		if msg.FromUID != "" {
 			if err := t.service.JoinThread(groupNo, shortID, msg.FromUID); err != nil {

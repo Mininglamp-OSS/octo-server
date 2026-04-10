@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
@@ -18,6 +19,22 @@ import (
 
 func init() {
 	gin.SetMode(gin.TestMode)
+}
+
+// mockVoiceStore is a mock implementation of VoiceStore for testing
+type mockVoiceStore struct {
+	contextResult    *UserVoiceContextModel
+	contextErr       error
+	membershipResult bool
+	membershipErr    error
+}
+
+func (m *mockVoiceStore) QueryVoiceContext(uid, spaceID string) (*UserVoiceContextModel, error) {
+	return m.contextResult, m.contextErr
+}
+
+func (m *mockVoiceStore) CheckSpaceMembership(spaceID, uid string) (bool, error) {
+	return m.membershipResult, m.membershipErr
 }
 
 // setupTestRouter creates a test router with voice endpoints (no auth middleware)
@@ -336,11 +353,11 @@ func TestTranscribeAPI_ChatContextTruncation(t *testing.T) {
 
 	cfg := newTestAPIConfig(litellmServer.URL)
 
-	// Create chat context that exceeds maxChatContextLength
+	// Create chat context that exceeds MaxChatContextLength
 	longPrefix := strings.Repeat("A", 5000) // will be truncated away
-	longSuffix := strings.Repeat("B", maxChatContextLength)
+	longSuffix := strings.Repeat("B", MaxChatContextLength)
 	longChatContext := longPrefix + longSuffix
-	assert.True(t, len(longChatContext) > maxChatContextLength)
+	assert.True(t, len(longChatContext) > MaxChatContextLength)
 
 	router := setupTestRouter(cfg, "")
 	w := httptest.NewRecorder()
@@ -351,7 +368,7 @@ func TestTranscribeAPI_ChatContextTruncation(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, w.Code)
 
-	// The truncated context should contain only the suffix (last maxChatContextLength chars)
+	// The truncated context should contain only the suffix (last MaxChatContextLength chars)
 	assert.Contains(t, receivedPrompt, longSuffix)
 	assert.NotContains(t, receivedPrompt, longPrefix)
 }
@@ -418,7 +435,7 @@ func TestTranscribeAPI_GPTEngine(t *testing.T) {
 	var resp map[string]interface{}
 	json.Unmarshal(w.Body.Bytes(), &resp)
 	assert.Equal(t, "GPT transcribed", resp["text"])
-	assert.Equal(t, "g4omt", resp["m"])
+	assert.Equal(t, "gpt4omt", resp["m"])
 	assert.Equal(t, "gp", resp["engine"])
 }
 
@@ -477,7 +494,7 @@ func TestTranscribeAPI_ContextTextTruncation(t *testing.T) {
 	cfg := newTestAPIConfig(litellmServer.URL)
 
 	longPrefix := strings.Repeat("X", 5000)
-	longSuffix := strings.Repeat("Y", maxContextTextLength)
+	longSuffix := strings.Repeat("Y", MaxContextTextLength)
 	longContextText := longPrefix + longSuffix
 
 	router := setupTestRouter(cfg, "")
@@ -518,7 +535,7 @@ func TestGetConfigAPI_EditModeAndEngine(t *testing.T) {
 }
 
 func TestShortenModelName(t *testing.T) {
-	assert.Equal(t, "g4omt", shortenModelName("gpt-4o-mini-transcribe"))
+	assert.Equal(t, "gpt4omt", shortenModelName("gpt-4o-mini-transcribe"))
 	assert.Equal(t, "g31pp", shortenModelName("gemini-3.1-pro-preview"))
 	assert.Equal(t, "g3fp", shortenModelName("gemini-3-flash-preview"))
 	assert.Equal(t, "g25p", shortenModelName("gemini-2.5-pro"))
@@ -529,4 +546,247 @@ func TestShortenEngineName(t *testing.T) {
 	assert.Equal(t, "gm", shortenEngineName("gemini"))
 	assert.Equal(t, "gp", shortenEngineName("gpt"))
 	assert.Equal(t, "other", shortenEngineName("other"))
+}
+
+// --- getConfig max_file_size tests ---
+
+func TestGetConfigAPI_MaxFileSize(t *testing.T) {
+	cfg := &VoiceConfig{
+		LiteLLMUrl:  "https://example.com",
+		LiteLLMKey:  "key",
+		Models:      []string{"m"},
+		MaxDuration: 60,
+		MaxFileSize: 3 * 1024 * 1024,
+		Engine:      "gemini",
+		EditMode:    "edit",
+	}
+
+	router := setupTestRouter(cfg, "")
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/voice/config", nil)
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	assert.Equal(t, float64(3*1024*1024), resp["max_file_size"])
+	assert.Equal(t, true, resp["enabled"])
+}
+
+// --- TranscribeWithOptions tests ---
+
+func TestTranscribeWithOptions_ModeOverride(t *testing.T) {
+	// Edit mode: prompt includes "已有以下文本"
+	// Append mode: prompt includes append template context hint
+	litellmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := chatCompletionResponse{
+			Choices: []choice{{Message: responseMessage{Content: "result text"}}},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer litellmServer.Close()
+
+	cfg := &VoiceConfig{
+		LiteLLMUrl:   litellmServer.URL,
+		LiteLLMKey:   "test-key",
+		Timeout:      5,
+		TotalTimeout: 10,
+		Models:       []string{"test-model"},
+		Engine:       "gemini",
+		EditMode:     "edit", // global default is edit
+		MaxFileSize:  3 * 1024 * 1024,
+	}
+	svc := NewVoiceService(cfg)
+
+	// Override to append mode
+	text, model, err := svc.TranscribeWithOptions([]byte("audio"), "audio/wav", "", "", TranscribeOptions{Mode: "append"})
+	assert.NoError(t, err)
+	assert.Equal(t, "result text", text)
+	assert.Equal(t, "test-model", model)
+}
+
+func TestTranscribeWithOptions_EmptyOptionsFallback(t *testing.T) {
+	litellmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := chatCompletionResponse{
+			Choices: []choice{{Message: responseMessage{Content: "transcribed"}}},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer litellmServer.Close()
+
+	cfg := &VoiceConfig{
+		LiteLLMUrl:   litellmServer.URL,
+		LiteLLMKey:   "test-key",
+		Timeout:      5,
+		TotalTimeout: 10,
+		Models:       []string{"test-model"},
+		Engine:       "gemini",
+		EditMode:     "edit",
+		MaxFileSize:  3 * 1024 * 1024,
+	}
+	svc := NewVoiceService(cfg)
+
+	// Empty options should fall back to global config
+	text, _, err := svc.TranscribeWithOptions([]byte("audio"), "audio/wav", "", "", TranscribeOptions{})
+	assert.NoError(t, err)
+	assert.Equal(t, "transcribed", text)
+}
+
+func TestTranscribeWithOptions_ModelOverride(t *testing.T) {
+	var requestedModel string
+	litellmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req chatCompletionRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		requestedModel = req.Model
+
+		resp := chatCompletionResponse{
+			Choices: []choice{{Message: responseMessage{Content: "ok"}}},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer litellmServer.Close()
+
+	cfg := &VoiceConfig{
+		LiteLLMUrl:   litellmServer.URL,
+		LiteLLMKey:   "test-key",
+		Timeout:      5,
+		TotalTimeout: 10,
+		Models:       []string{"default-model"},
+		Engine:       "gemini",
+		EditMode:     "edit",
+		MaxFileSize:  3 * 1024 * 1024,
+	}
+	svc := NewVoiceService(cfg)
+
+	// Override model
+	_, usedModel, err := svc.TranscribeWithOptions([]byte("audio"), "audio/wav", "", "", TranscribeOptions{Model: "custom-model"})
+	assert.NoError(t, err)
+	assert.Equal(t, "custom-model", requestedModel)
+	assert.Equal(t, "custom-model", usedModel)
+}
+
+// --- Rune-safe context truncation in transcribe handler ---
+
+// --- GET /v1/voice/context tests (mocked DB) ---
+
+func setupContextTestRouter(store VoiceStore) *wkhttp.WKHttp {
+	r := wkhttp.New()
+	v := &Voice{
+		cfg: &VoiceConfig{},
+		db:  store,
+		Log: log.NewTLog("VoiceTest"),
+	}
+
+	// Fake auth middleware that sets uid
+	group := r.Group("/v1/voice", func(c *wkhttp.Context) {
+		c.Set("uid", "test_user")
+		c.Next()
+	})
+	group.GET("/context", v.getContext)
+	return r
+}
+
+func TestGetContextAPI_HasContext(t *testing.T) {
+	store := &mockVoiceStore{
+		membershipResult: true,
+		contextResult: &UserVoiceContextModel{
+			UID:               "test_user",
+			SpaceID:           "space1",
+			ASRCorrectContext: "my correction terms",
+			UpdatedAt:         time.Date(2026, 4, 10, 12, 0, 0, 0, time.UTC),
+		},
+	}
+	router := setupContextTestRouter(store)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/voice/context?space_id=space1", nil)
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	assert.Equal(t, true, resp["has_context"])
+	assert.Equal(t, "my correction terms", resp["context"])
+	assert.NotEmpty(t, resp["updated_at"])
+}
+
+func TestGetContextAPI_NoContext(t *testing.T) {
+	store := &mockVoiceStore{
+		membershipResult: true,
+		contextResult:    nil,
+	}
+	router := setupContextTestRouter(store)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/voice/context?space_id=space1", nil)
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	assert.Equal(t, false, resp["has_context"])
+	assert.Equal(t, "", resp["context"])
+}
+
+func TestGetContextAPI_MissingSpaceID(t *testing.T) {
+	store := &mockVoiceStore{}
+	router := setupContextTestRouter(store)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/voice/context", nil)
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "space_id is required")
+}
+
+func TestGetContextAPI_NotMember(t *testing.T) {
+	store := &mockVoiceStore{
+		membershipResult: false,
+	}
+	router := setupContextTestRouter(store)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/voice/context?space_id=space1", nil)
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.Contains(t, w.Body.String(), "no permission")
+}
+
+func TestTranscribeAPI_RuneSafeChatContextTruncation(t *testing.T) {
+	var receivedPrompt string
+	litellmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req chatCompletionRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		receivedPrompt = req.Messages[0].Content[0].Text
+		resp := chatCompletionResponse{
+			Choices: []choice{{Message: responseMessage{Content: "OK"}}},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer litellmServer.Close()
+
+	cfg := newTestAPIConfig(litellmServer.URL)
+	router := setupTestRouter(cfg, "")
+
+	// CJK characters: each is 1 rune but 3 bytes
+	cjkTail := strings.Repeat("你", MaxChatContextLength)
+	longChatContext := "AAA" + cjkTail // 3 extra ASCII chars
+	assert.True(t, len([]rune(longChatContext)) > MaxChatContextLength)
+
+	w := httptest.NewRecorder()
+	req := createMultipartRequestWithOpts(t, "/v1/voice/transcribe", []byte("fake-audio"), multipartOpts{
+		chatContext: longChatContext,
+	})
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	// Truncation should keep the tail (CJK chars), not break multi-byte chars
+	assert.Contains(t, receivedPrompt, cjkTail)
+	assert.NotContains(t, receivedPrompt, "AAA")
 }
