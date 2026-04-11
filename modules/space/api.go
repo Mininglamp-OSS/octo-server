@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"strconv"
 	"time"
 
@@ -83,6 +82,8 @@ func (s *Space) Route(r *wkhttp.WKHttp) {
 	{
 		open.GET("/invite/:invite_code", s.getInviteInfo)
 		open.GET("/invite/:invite_code/preview", s.getInvitePreview)
+		open.GET("/join-approve/detail", s.joinApproveDetail)
+		open.POST("/join-approve/sure", s.joinApproveSure)
 	}
 }
 
@@ -678,11 +679,6 @@ func (s *Space) joinSpace(c *wkhttp.Context) {
 
 	// 需要审批模式
 	if space.JoinMode == 1 {
-		if len(req.Remark) > 200 {
-			c.ResponseError(errors.New("申请备注不能超过200字"))
-			return
-		}
-
 		// 只读校验邀请码次数（不消耗，审批通过时也跳过）
 		if invitation.MaxUses > 0 && invitation.UsedCount >= invitation.MaxUses {
 			c.ResponseError(errors.New("邀请码已达到使用次数上限"))
@@ -716,11 +712,10 @@ func (s *Space) joinSpace(c *wkhttp.Context) {
 		}
 
 		// 创建或重置申请记录（被拒后重新申请时覆盖更新）
-		err = s.db.upsertJoinApply(&spaceJoinApplyModel{
+		applyID, err := s.db.upsertJoinApply(&spaceJoinApplyModel{
 			SpaceId:    invitation.SpaceId,
 			UID:        loginUID,
 			InviteCode: req.InviteCode,
-			Remark:     req.Remark,
 		})
 		if err != nil {
 			c.ResponseError(errors.New("提交申请失败"))
@@ -728,7 +723,7 @@ func (s *Space) joinSpace(c *wkhttp.Context) {
 		}
 
 		// 异步通知管理员
-		go s.notifyAdminsNewJoinApply(loginUID, invitation.SpaceId, space.Name, req.Remark)
+		go s.notifyAdminsNewJoinApply(loginUID, invitation.SpaceId, space.Name, applyID)
 
 		c.Response(map[string]interface{}{
 			"status":   "pending",
@@ -1212,8 +1207,8 @@ func (s *Space) rejectJoinApply(c *wkhttp.Context) {
 	c.ResponseOK()
 }
 
-// notifyAdminsNewJoinApply 通过 BotFather 通知管理员有新的加入申请
-func (s *Space) notifyAdminsNewJoinApply(applicantUID, spaceId, spaceName, remark string) {
+// notifyAdminsNewJoinApply 通知管理员有新的加入申请（每人生成独立 auth_code）
+func (s *Space) notifyAdminsNewJoinApply(applicantUID, spaceId, spaceName string, applyID int64) {
 	admins, err := s.db.queryAdminsAndOwner(spaceId)
 	if err != nil || len(admins) == 0 {
 		s.Warn("查询管理员列表失败或无管理员", zap.Error(err), zap.String("spaceId", spaceId))
@@ -1235,20 +1230,31 @@ func (s *Space) notifyAdminsNewJoinApply(applicantUID, spaceId, spaceName, remar
 		emailText = fmt.Sprintf("\n\n邮箱: %s", userInfo.Email)
 	}
 
-	remarkText := ""
-	if remark != "" {
-		remarkText = fmt.Sprintf("\n\n备注: %s", remark)
+	h5BaseURL := s.ctx.GetConfig().External.BaseURL
+	if s.ctx.GetConfig().External.H5BaseURL != "" {
+		h5BaseURL = s.ctx.GetConfig().External.H5BaseURL
 	}
-
-	approveURL := ""
-	if baseURL := os.Getenv("DM_SPACE_APPROVE_URL"); baseURL != "" {
-		approveURL = fmt.Sprintf("\n\n审批链接: %s/space/%s/join-applies", baseURL, spaceId)
-	}
-
-	content := fmt.Sprintf("有新的 Space 加入申请\n\n用户: %s (%s)\n\n空间: %s%s%s%s",
-		applicantName, applicantUID, spaceName, emailText, remarkText, approveURL)
 
 	for _, admin := range admins {
+		// 为每个管理员生成独立 auth_code（7天有效）
+		authCode := util.GenerUUID()
+		authData := util.ToJson(map[string]interface{}{
+			"apply_id":     applyID,
+			"space_id":     spaceId,
+			"reviewer_uid": admin.UID,
+			"type":         "spaceJoinApprove",
+		})
+		if err := s.ctx.GetRedisConn().SetAndExpire(
+			fmt.Sprintf("%s%s", common.AuthCodeCachePrefix, authCode),
+			authData, time.Hour*24*7,
+		); err != nil {
+			s.Warn("缓存审批授权码失败", zap.Error(err), zap.String("adminUID", admin.UID))
+			continue
+		}
+
+		approveURL := fmt.Sprintf("%s/space_join_approve.html?auth_code=%s", h5BaseURL, authCode)
+		content := fmt.Sprintf("有新的 Space 加入申请\n\n用户: %s (%s)\n\n空间: %s%s\n\n审批链接: %s",
+			applicantName, applicantUID, spaceName, emailText, approveURL)
 		notifyPayload := map[string]interface{}{
 			"content":  content,
 			"type":     common.Text,
@@ -1293,6 +1299,163 @@ func (s *Space) notifyApplicantJoinResult(applicantUID, spaceId, spaceName strin
 			RedDot: 1,
 		},
 	})
+}
+
+// joinApproveDetail 获取审批详情（公开接口，通过 auth_code 鉴权）
+func (s *Space) joinApproveDetail(c *wkhttp.Context) {
+	authCode := c.Query("auth_code")
+	if authCode == "" {
+		c.ResponseError(errors.New("auth_code 不能为空"))
+		return
+	}
+
+	authInfo, err := s.ctx.GetRedisConn().GetString(fmt.Sprintf("%s%s", common.AuthCodeCachePrefix, authCode))
+	if err != nil || authInfo == "" {
+		c.ResponseError(errors.New("授权码无效或已过期"))
+		return
+	}
+
+	var authMap map[string]interface{}
+	if err := util.ReadJsonByByte([]byte(authInfo), &authMap); err != nil {
+		c.ResponseError(errors.New("授权信息解析失败"))
+		return
+	}
+
+	authType, _ := authMap["type"].(string)
+	if authType != "spaceJoinApprove" {
+		c.ResponseError(errors.New("授权码类型无效"))
+		return
+	}
+
+	applyIDNum, _ := authMap["apply_id"].(json.Number)
+	applyID, _ := applyIDNum.Int64()
+	spaceId, _ := authMap["space_id"].(string)
+
+	apply, err := s.db.queryJoinApplyByID(applyID)
+	if err != nil || apply == nil {
+		c.ResponseError(errors.New("申请记录不存在"))
+		return
+	}
+
+	space, _ := s.db.querySpaceByID(spaceId)
+	spaceName := spaceId
+	if space != nil {
+		spaceName = space.Name
+	}
+
+	applicantName := apply.UID
+	var userInfo struct {
+		Name  string
+		Email string
+	}
+	cnt, _ := s.ctx.DB().SelectBySql("SELECT IFNULL(name,'') as name, IFNULL(email,'') as email FROM `user` WHERE uid=?", apply.UID).Load(&userInfo)
+	if cnt > 0 && userInfo.Name != "" {
+		applicantName = userInfo.Name
+	}
+
+	c.Response(map[string]interface{}{
+		"apply_id":       apply.Id,
+		"space_id":       spaceId,
+		"space_name":     spaceName,
+		"uid":            apply.UID,
+		"applicant_name": applicantName,
+		"applicant_email": userInfo.Email,
+		"status":         apply.Status,
+	})
+}
+
+// joinApproveSure 执行审批（公开接口，通过 auth_code 鉴权，一次性）
+func (s *Space) joinApproveSure(c *wkhttp.Context) {
+	authCode := c.Query("auth_code")
+	action := c.Query("action")
+	if authCode == "" {
+		c.ResponseError(errors.New("auth_code 不能为空"))
+		return
+	}
+	if action != "approve" && action != "reject" {
+		c.ResponseError(errors.New("action 必须是 approve 或 reject"))
+		return
+	}
+
+	cacheKey := fmt.Sprintf("%s%s", common.AuthCodeCachePrefix, authCode)
+	authInfo, err := s.ctx.GetRedisConn().GetString(cacheKey)
+	if err != nil || authInfo == "" {
+		c.ResponseError(errors.New("授权码无效或已过期"))
+		return
+	}
+
+	var authMap map[string]interface{}
+	if err := util.ReadJsonByByte([]byte(authInfo), &authMap); err != nil {
+		c.ResponseError(errors.New("授权信息解析失败"))
+		return
+	}
+
+	authType, _ := authMap["type"].(string)
+	if authType != "spaceJoinApprove" {
+		c.ResponseError(errors.New("授权码类型无效"))
+		return
+	}
+
+	applyIDNum, _ := authMap["apply_id"].(json.Number)
+	applyID, _ := applyIDNum.Int64()
+	spaceId, _ := authMap["space_id"].(string)
+	reviewerUID, _ := authMap["reviewer_uid"].(string)
+
+	apply, err := s.db.queryJoinApplyByID(applyID)
+	if err != nil || apply == nil {
+		c.ResponseError(errors.New("申请记录不存在"))
+		return
+	}
+	if apply.Status != 0 {
+		c.ResponseError(errors.New("该申请已被处理"))
+		return
+	}
+
+	// 删除 auth_code（一次性）
+	_ = s.ctx.GetRedisConn().Del(cacheKey)
+
+	space, err := s.db.querySpaceByID(spaceId)
+	if err != nil || space == nil {
+		c.ResponseError(errors.New("空间不存在或已解散"))
+		return
+	}
+
+	if action == "approve" {
+		affected, err := s.db.updateJoinApplyStatus(applyID, 1, reviewerUID)
+		if err != nil {
+			c.ResponseError(errors.New("更新申请状态失败"))
+			return
+		}
+		if affected == 0 {
+			c.ResponseOK()
+			return
+		}
+
+		joinErr := s.executeJoinSpace(apply.UID, spaceId, space)
+		if joinErr != nil {
+			if errors.Is(joinErr, ErrSpaceFull) {
+				_, _ = s.db.updateJoinApplyStatusRaw(applyID, 0, "")
+				c.ResponseError(errors.New("空间已满，无法通过申请"))
+				return
+			}
+			if !errors.Is(joinErr, ErrAlreadyMember) {
+				_, _ = s.db.updateJoinApplyStatusRaw(applyID, 0, "")
+				c.ResponseError(errors.New("加入空间失败"))
+				return
+			}
+		}
+
+		go s.notifyApplicantJoinResult(apply.UID, spaceId, space.Name, true)
+	} else {
+		_, err = s.db.updateJoinApplyStatus(applyID, 2, reviewerUID)
+		if err != nil {
+			c.ResponseError(errors.New("更新申请状态失败"))
+			return
+		}
+		go s.notifyApplicantJoinResult(apply.UID, spaceId, space.Name, false)
+	}
+
+	c.ResponseOK()
 }
 
 // fireSpaceMemberJoinEvent 触发 SpaceMemberJoin 事件

@@ -444,13 +444,21 @@ func (d *DB) queryAdminsAndOwner(spaceId string) ([]*MemberModel, error) {
 
 // ---------- Join Apply CRUD ----------
 
-func (d *DB) upsertJoinApply(m *spaceJoinApplyModel) error {
+func (d *DB) upsertJoinApply(m *spaceJoinApplyModel) (int64, error) {
 	_, err := d.session.InsertBySql(
-		"INSERT INTO space_join_apply (space_id, uid, invite_code, remark, status, reviewer_uid) VALUES (?, ?, ?, ?, 0, '') "+
-			"ON DUPLICATE KEY UPDATE status=0, invite_code=VALUES(invite_code), remark=VALUES(remark), reviewer_uid='', updated_at=NOW()",
-		m.SpaceId, m.UID, m.InviteCode, m.Remark,
+		"INSERT INTO space_join_apply (space_id, uid, invite_code, status, reviewer_uid) VALUES (?, ?, ?, 0, '') "+
+			"ON DUPLICATE KEY UPDATE status=0, invite_code=VALUES(invite_code), reviewer_uid='', updated_at=NOW()",
+		m.SpaceId, m.UID, m.InviteCode,
 	).Exec()
-	return err
+	if err != nil {
+		return 0, err
+	}
+	// 查回 ID
+	var id int64
+	_, err = d.session.SelectBySql(
+		"SELECT id FROM space_join_apply WHERE space_id=? AND uid=?", m.SpaceId, m.UID,
+	).Load(&id)
+	return id, err
 }
 
 func (d *DB) queryJoinApplyByID(id int64) (*spaceJoinApplyModel, error) {

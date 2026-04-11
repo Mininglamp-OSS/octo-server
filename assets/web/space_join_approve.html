@@ -1,0 +1,191 @@
+<html>
+
+<head>
+    <title>Space 加入审批</title>
+    <meta charset='utf-8'>
+    <meta name="viewport"
+        content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+    <meta name="format-detection" content="telephone=no, email=no" />
+    <link rel="stylesheet" type="text/css" href="css/index.css" />
+    <script type="text/javascript" src="js/config.js"></script>
+    <script type="text/javascript" src="js/jquery-3.4.1.min.js"></script>
+    <script type="text/javascript" src="js/index.js"></script>
+    <style type="text/css">
+        .card {
+            margin: 40px 20px;
+            padding: 24px;
+            background: #fff;
+            border-radius: 12px;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+        }
+        .card-title {
+            font-size: 18px;
+            font-weight: bold;
+            text-align: center;
+            margin-bottom: 20px;
+            color: #333;
+        }
+        .info-row {
+            display: flex;
+            padding: 10px 0;
+            border-bottom: 1px solid #f0f0f0;
+            font-size: 15px;
+        }
+        .info-row:last-child { border-bottom: none; }
+        .info-label {
+            color: #999;
+            width: 60px;
+            flex-shrink: 0;
+        }
+        .info-value {
+            color: #333;
+            flex: 1;
+            word-break: break-all;
+        }
+        .btn-group {
+            display: flex;
+            gap: 12px;
+            margin: 30px 20px;
+        }
+        .btn {
+            flex: 1;
+            height: 44px;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        .btn-approve {
+            background: #07c160;
+            color: #fff;
+        }
+        .btn-reject {
+            background: #f0f0f0;
+            color: #666;
+        }
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .result {
+            text-align: center;
+            font-size: 16px;
+            padding: 20px;
+            display: none;
+        }
+        .result.success { color: #07c160; }
+        .result.error { color: #fa5151; }
+        .status-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            margin-left: 8px;
+        }
+        .status-pending { background: #fff3e0; color: #f57c00; }
+        .status-approved { background: #e8f5e9; color: #2e7d32; }
+        .status-rejected { background: #fbe9e7; color: #c62828; }
+    </style>
+</head>
+
+<body>
+    <div class="box">
+        <div class="card">
+            <div class="card-title">Space 加入申请</div>
+            <div class="info-row">
+                <span class="info-label">用户</span>
+                <span class="info-value" id="applicant-name"></span>
+            </div>
+            <div class="info-row" id="email-row" style="display:none">
+                <span class="info-label">邮箱</span>
+                <span class="info-value" id="applicant-email"></span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">空间</span>
+                <span class="info-value" id="space-name"></span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">状态</span>
+                <span class="info-value" id="apply-status"></span>
+            </div>
+        </div>
+
+        <div class="btn-group" id="btn-group">
+            <button class="btn btn-reject" id="btn-reject">拒绝</button>
+            <button class="btn btn-approve" id="btn-approve">同意加入</button>
+        </div>
+
+        <div class="result" id="result"></div>
+    </div>
+</body>
+<script language="javascript">
+    var authCode = getQueryString('auth_code');
+
+    function showResult(msg, isError) {
+        var el = document.getElementById('result');
+        el.textContent = msg;
+        el.className = 'result ' + (isError ? 'error' : 'success');
+        el.style.display = 'block';
+        document.getElementById('btn-group').style.display = 'none';
+    }
+
+    function statusText(status) {
+        if (status === 0) return '<span class="status-badge status-pending">待审批</span>';
+        if (status === 1) return '<span class="status-badge status-approved">已通过</span>';
+        if (status === 2) return '<span class="status-badge status-rejected">已拒绝</span>';
+        return '';
+    }
+
+    $(function () {
+        if (!authCode) {
+            showResult('缺少授权码', true);
+            return;
+        }
+
+        $.getJSON(apiURL + 'space/join-approve/detail?auth_code=' + authCode).then(function (resp) {
+            document.getElementById('applicant-name').textContent = resp.applicant_name + ' (' + resp.uid + ')';
+            document.getElementById('space-name').textContent = resp.space_name;
+            document.getElementById('apply-status').innerHTML = statusText(resp.status);
+
+            if (resp.applicant_email) {
+                document.getElementById('applicant-email').textContent = resp.applicant_email;
+                document.getElementById('email-row').style.display = 'flex';
+            }
+
+            if (resp.status !== 0) {
+                document.getElementById('btn-group').style.display = 'none';
+            }
+        }).fail(function () {
+            showResult('授权码无效或已过期', true);
+        });
+
+        document.getElementById('btn-approve').addEventListener('click', function () {
+            this.disabled = true;
+            document.getElementById('btn-reject').disabled = true;
+            $.postJSON(apiURL + 'space/join-approve/sure?auth_code=' + authCode + '&action=approve').then(function () {
+                showResult('已同意加入', false);
+            }).fail(function () {
+                showResult('操作失败，请重试', true);
+                document.getElementById('btn-approve').disabled = false;
+                document.getElementById('btn-reject').disabled = false;
+            });
+        });
+
+        document.getElementById('btn-reject').addEventListener('click', function () {
+            this.disabled = true;
+            document.getElementById('btn-approve').disabled = true;
+            $.postJSON(apiURL + 'space/join-approve/sure?auth_code=' + authCode + '&action=reject').then(function () {
+                showResult('已拒绝', false);
+            }).fail(function () {
+                showResult('操作失败，请重试', true);
+                document.getElementById('btn-approve').disabled = false;
+                document.getElementById('btn-reject').disabled = false;
+            });
+        });
+    });
+</script>
+
+</html>

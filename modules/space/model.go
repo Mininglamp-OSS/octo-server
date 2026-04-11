@@ -89,7 +89,6 @@ type updateMemberRoleReq struct {
 
 type joinSpaceReq struct {
 	InviteCode string `json:"invite_code"`
-	Remark     string `json:"remark"`
 }
 
 // ---------- Response Models ----------
