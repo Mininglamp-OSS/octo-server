@@ -590,13 +590,13 @@ func (u *User) userUpdateWithField(c *wkhttp.Context) {
 				c.ResponseError(errors.New("用户短编号只能修改一次"))
 				return
 			}
-			if len(fmt.Sprintf("%s", value)) < 6 || len(fmt.Sprintf("%s", value)) > 20 {
+			if len(fmt.Sprintf("%v", value)) < 6 || len(fmt.Sprintf("%v", value)) > 20 {
 				c.ResponseError(errors.New("短号须以字母开头，仅支持使用6～20个字母、数字、下划线、减号自由组合"))
 				return
 			}
 			isLetter := true
 			isIncludeNum := false
-			for index, r := range fmt.Sprintf("%s", value) {
+			for index, r := range fmt.Sprintf("%v", value) {
 				if !unicode.IsLetter(r) && index == 0 {
 					isLetter = false
 					break
@@ -617,7 +617,7 @@ func (u *User) userUpdateWithField(c *wkhttp.Context) {
 				c.ResponseError(errors.New("短号须以字母开头，仅支持使用6～20个字母、数字、下划线、减号自由组合"))
 				return
 			}
-			users, err = u.db.QueryUserWithOnlyShortNo(fmt.Sprintf("%s", value))
+			users, err = u.db.QueryUserWithOnlyShortNo(fmt.Sprintf("%v", value))
 			if err != nil {
 				u.Error("通过short_no查询用户失败！", zap.Error(err), zap.String("shortNo", key))
 				c.ResponseError(errors.New("通过short_no查询用户失败！"))
@@ -640,7 +640,7 @@ func (u *User) userUpdateWithField(c *wkhttp.Context) {
 					fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 				}
 			}()
-			err = u.db.UpdateUsersWithFieldTx(key, fmt.Sprintf("%s", value), loginUID, tx)
+			err = u.db.UpdateUsersWithFieldTx(key, fmt.Sprintf("%v", value), loginUID, tx)
 			if err != nil {
 				c.ResponseError(errors.New("修改用户资料失败"))
 				tx.Rollback()
@@ -676,7 +676,7 @@ func (u *User) userUpdateWithField(c *wkhttp.Context) {
 			}
 		}
 
-		err = u.db.UpdateUsersWithField(key, fmt.Sprintf("%s", value), loginUID)
+		err = u.db.UpdateUsersWithField(key, fmt.Sprintf("%v", value), loginUID)
 		if err != nil {
 			u.Error("修改用户资料失败", zap.Error(err))
 			c.ResponseError(errors.New("修改用户资料失败"))
@@ -684,7 +684,7 @@ func (u *User) userUpdateWithField(c *wkhttp.Context) {
 		}
 		if key == "name" {
 			// 将重新设置token设置到缓存（这里主要是更新登录者的name）
-			err = u.ctx.Cache().Set(u.ctx.GetConfig().Cache.TokenCachePrefix+c.GetHeader("token"), fmt.Sprintf("%s@%s@%s", loginUID, value, c.GetLoginRole()))
+			err = u.ctx.Cache().Set(u.ctx.GetConfig().Cache.TokenCachePrefix+c.GetHeader("token"), fmt.Sprintf("%s@%v@%s", loginUID, value, c.GetLoginRole()))
 			if err != nil {
 				u.Error("重新设置token缓存失败！", zap.Error(err))
 				c.ResponseError(errors.New("重新设置token缓存失败！"))
