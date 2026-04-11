@@ -12,6 +12,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/server"
@@ -1281,4 +1282,95 @@ func TestJoinApproveSure_Reject(t *testing.T) {
 	apply, err := f.db.queryJoinApplyByID(applyID)
 	assert.NoError(t, err)
 	assert.Equal(t, 2, apply.Status)
+}
+
+// Bug: rejectJoinApply 缺少 spaceId 校验，可跨空间拒绝
+func TestRejectJoinApply_CrossSpaceBlocked(t *testing.T) {
+	s, f, err := setup(t)
+
+	// Space A: 有申请记录
+	spaceA := "test-space-a"
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceA, Name: "Space A", Creator: testutil.UID, JoinMode: 1, Status: 1,
+	})
+	assert.NoError(t, err)
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceA, UID: "victim-uid", InviteCode: "inv-a",
+	})
+	assert.NoError(t, err)
+
+	// Space B: testutil.UID 是管理员
+	spaceB := "test-space-b"
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceB, Name: "Space B", Creator: testutil.UID, JoinMode: 1, Status: 1,
+	})
+	assert.NoError(t, err)
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceB, UID: testutil.UID, Role: 2, Status: 1,
+	})
+	assert.NoError(t, err)
+
+	// Space B 的管理员尝试拒绝 Space A 的申请 → 应被拒绝
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST",
+		fmt.Sprintf("/v1/space/%s/join-applies/%d/reject", spaceB, applyID), nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code, "跨空间拒绝应被阻止")
+	assert.Contains(t, w.Body.String(), "不属于当前空间")
+
+	// 验证申请状态未被修改
+	apply, err := f.db.queryJoinApplyByID(applyID)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, apply.Status, "申请状态不应被修改")
+}
+
+// Bug: auth_code 应先消费再操作，防止并发穿透
+func TestJoinApproveSure_AuthCodeConsumedBeforeAction(t *testing.T) {
+	s, f, err := setup(t)
+
+	spaceId := "test-space-authcode-order"
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceId, Name: "AuthCode顺序", Creator: testutil.UID, JoinMode: 1, Status: 1,
+	})
+	assert.NoError(t, err)
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId, UID: testutil.UID, Role: 2, Status: 1,
+	})
+	assert.NoError(t, err)
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: "applicant-authcode", InviteCode: "inv-ac",
+	})
+	assert.NoError(t, err)
+
+	authCode := "test-auth-consume"
+	authData := util.ToJson(map[string]interface{}{
+		"apply_id":     applyID,
+		"space_id":     spaceId,
+		"reviewer_uid": testutil.UID,
+		"type":         "spaceJoinApprove",
+	})
+	err = testCtx.GetRedisConn().SetAndExpire(
+		fmt.Sprintf("%s%s", common.AuthCodeCachePrefix, authCode), authData, time.Minute*5)
+	assert.NoError(t, err)
+
+	// 审批通过
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST",
+		"/v1/space/join-approve/sure?auth_code="+authCode+"&action=approve", nil)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	// auth_code 应已被消费
+	val, _ := testCtx.GetRedisConn().GetString(
+		fmt.Sprintf("%s%s", common.AuthCodeCachePrefix, authCode))
+	assert.Empty(t, val, "auth_code 应在操作前被消费")
+
+	// 用同一个 auth_code 再次请求应失败
+	w2 := httptest.NewRecorder()
+	req2, _ := http.NewRequest("POST",
+		"/v1/space/join-approve/sure?auth_code="+authCode+"&action=approve", nil)
+	s.GetRoute().ServeHTTP(w2, req2)
+	assert.Equal(t, http.StatusBadRequest, w2.Code, "重放应被拒绝")
 }

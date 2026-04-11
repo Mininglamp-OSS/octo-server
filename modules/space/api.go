@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
@@ -82,6 +84,7 @@ func (s *Space) Route(r *wkhttp.WKHttp) {
 	{
 		open.GET("/invite/:invite_code", s.getInviteInfo)
 		open.GET("/invite/:invite_code/preview", s.getInvitePreview)
+		open.GET("/join-approve", s.joinApprovePage)
 		open.GET("/join-approve/detail", s.joinApproveDetail)
 		open.POST("/join-approve/sure", s.joinApproveSure)
 	}
@@ -1129,18 +1132,19 @@ func (s *Space) approveJoinApply(c *wkhttp.Context) {
 	joinErr := s.executeJoinSpace(apply.UID, spaceId, space)
 	if joinErr != nil {
 		if errors.Is(joinErr, ErrSpaceFull) {
-			// 回滚申请状态
-			_, _ = s.db.updateJoinApplyStatusRaw(applyID, 0, "")
+			if _, rbErr := s.db.updateJoinApplyStatusRaw(applyID, 0, ""); rbErr != nil {
+				s.Error("回滚申请状态失败", zap.Error(rbErr), zap.Int64("applyID", applyID))
+			}
 			c.ResponseError(errors.New("空间已满，无法通过申请"))
 			return
 		}
 		if errors.Is(joinErr, ErrAlreadyMember) {
-			// 用户已通过其他方式加入，状态已更新，直接成功
 			c.ResponseOK()
 			return
 		}
-		// 回滚申请状态
-		_, _ = s.db.updateJoinApplyStatusRaw(applyID, 0, "")
+		if _, rbErr := s.db.updateJoinApplyStatusRaw(applyID, 0, ""); rbErr != nil {
+			s.Error("回滚申请状态失败", zap.Error(rbErr), zap.Int64("applyID", applyID))
+		}
 		c.ResponseError(errors.New("加入空间失败"))
 		return
 	}
@@ -1197,7 +1201,10 @@ func (s *Space) rejectJoinApply(c *wkhttp.Context) {
 	}
 
 	spaceName := ""
-	space, _ := s.db.querySpaceByID(spaceId)
+	space, spErr := s.db.querySpaceByID(spaceId)
+	if spErr != nil {
+		s.Warn("查询空间信息失败", zap.Error(spErr), zap.String("spaceId", spaceId))
+	}
 	if space != nil {
 		spaceName = space.Name
 	}
@@ -1230,11 +1237,6 @@ func (s *Space) notifyAdminsNewJoinApply(applicantUID, spaceId, spaceName string
 		emailText = fmt.Sprintf("\n\n邮箱: %s", userInfo.Email)
 	}
 
-	h5BaseURL := s.ctx.GetConfig().External.BaseURL
-	if s.ctx.GetConfig().External.H5BaseURL != "" {
-		h5BaseURL = s.ctx.GetConfig().External.H5BaseURL
-	}
-
 	for _, admin := range admins {
 		// 为每个管理员生成独立 auth_code（7天有效）
 		authCode := util.GenerUUID()
@@ -1252,7 +1254,7 @@ func (s *Space) notifyAdminsNewJoinApply(applicantUID, spaceId, spaceName string
 			continue
 		}
 
-		approveURL := fmt.Sprintf("%s/space_join_approve.html?auth_code=%s", h5BaseURL, authCode)
+		approveURL := fmt.Sprintf("%s/v1/space/join-approve?auth_code=%s", s.ctx.GetConfig().External.BaseURL, authCode)
 		content := fmt.Sprintf("有新的 Space 加入申请\n\n用户: %s (%s)\n\n空间: %s%s\n\n审批链接: %s",
 			applicantName, applicantUID, spaceName, emailText, approveURL)
 		notifyPayload := map[string]interface{}{
@@ -1299,6 +1301,17 @@ func (s *Space) notifyApplicantJoinResult(applicantUID, spaceId, spaceName strin
 			RedDot: 1,
 		},
 	})
+}
+
+// joinApprovePage 返回 H5 审批页面（注入 apiURL）
+func (s *Space) joinApprovePage(c *wkhttp.Context) {
+	htmlBytes, err := os.ReadFile("./assets/web/space_join_approve.html")
+	if err != nil {
+		c.ResponseError(errors.New("页面加载失败"))
+		return
+	}
+	html := strings.Replace(string(htmlBytes), "{{API_BASE_URL}}", s.ctx.GetConfig().External.BaseURL, 1)
+	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(html))
 }
 
 // joinApproveDetail 获取审批详情（公开接口，通过 auth_code 鉴权）
@@ -1434,12 +1447,16 @@ func (s *Space) joinApproveSure(c *wkhttp.Context) {
 		joinErr := s.executeJoinSpace(apply.UID, spaceId, space)
 		if joinErr != nil {
 			if errors.Is(joinErr, ErrSpaceFull) {
-				_, _ = s.db.updateJoinApplyStatusRaw(applyID, 0, "")
+				if _, rbErr := s.db.updateJoinApplyStatusRaw(applyID, 0, ""); rbErr != nil {
+					s.Error("回滚申请状态失败", zap.Error(rbErr), zap.Int64("applyID", applyID))
+				}
 				c.ResponseError(errors.New("空间已满，无法通过申请"))
 				return
 			}
 			if !errors.Is(joinErr, ErrAlreadyMember) {
-				_, _ = s.db.updateJoinApplyStatusRaw(applyID, 0, "")
+				if _, rbErr := s.db.updateJoinApplyStatusRaw(applyID, 0, ""); rbErr != nil {
+					s.Error("回滚申请状态失败", zap.Error(rbErr), zap.Int64("applyID", applyID))
+				}
 				c.ResponseError(errors.New("加入空间失败"))
 				return
 			}

@@ -1,191 +1,150 @@
+<!DOCTYPE html>
 <html>
-
 <head>
     <title>Space 加入审批</title>
-    <meta charset='utf-8'>
-    <meta name="viewport"
-        content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no">
-    <meta name="apple-mobile-web-app-capable" content="yes" />
-    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
-    <meta name="format-detection" content="telephone=no, email=no" />
-    <link rel="stylesheet" type="text/css" href="css/index.css" />
-    <script type="text/javascript" src="js/config.js"></script>
-    <script type="text/javascript" src="js/jquery-3.4.1.min.js"></script>
-    <script type="text/javascript" src="js/index.js"></script>
-    <style type="text/css">
-        .card {
-            margin: 40px 20px;
-            padding: 24px;
-            background: #fff;
-            border-radius: 12px;
-            box-shadow: 0 2px 12px rgba(0,0,0,0.08);
-        }
-        .card-title {
-            font-size: 18px;
-            font-weight: bold;
-            text-align: center;
-            margin-bottom: 20px;
-            color: #333;
-        }
-        .info-row {
-            display: flex;
-            padding: 10px 0;
-            border-bottom: 1px solid #f0f0f0;
-            font-size: 15px;
-        }
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; color: #333; min-height: 100vh; }
+        .container { max-width: 420px; margin: 0 auto; padding: 0 16px; }
+        .card { margin-top: 24px; padding: 20px; background: #fff; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); }
+        .card-title { font-size: 17px; font-weight: 600; text-align: center; margin-bottom: 16px; }
+        .info-row { display: flex; padding: 12px 0; border-bottom: 1px solid #f5f5f5; font-size: 14px; line-height: 1.5; }
         .info-row:last-child { border-bottom: none; }
-        .info-label {
-            color: #999;
-            width: 60px;
-            flex-shrink: 0;
-        }
-        .info-value {
-            color: #333;
-            flex: 1;
-            word-break: break-all;
-        }
-        .btn-group {
-            display: flex;
-            gap: 12px;
-            margin: 30px 20px;
-        }
+        .info-label { color: #999; width: 48px; flex-shrink: 0; }
+        .info-value { color: #333; flex: 1; word-break: break-all; }
+        .btn-group { display: flex; gap: 12px; margin-top: 24px; padding: 0; }
         .btn {
-            flex: 1;
-            height: 44px;
-            border: none;
-            border-radius: 8px;
-            font-size: 16px;
-            font-weight: bold;
-            cursor: pointer;
+            flex: 1; height: 44px; border: none; border-radius: 22px;
+            font-size: 15px; font-weight: 600; cursor: pointer;
+            transition: opacity 0.2s;
         }
-        .btn-approve {
-            background: #07c160;
-            color: #fff;
-        }
-        .btn-reject {
-            background: #f0f0f0;
-            color: #666;
-        }
-        .btn:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
+        .btn:active { opacity: 0.7; }
+        .btn-approve { background: #07c160; color: #fff; }
+        .btn-reject { background: #f0f0f0; color: #666; }
+        .btn:disabled { opacity: 0.4; cursor: not-allowed; }
         .result {
-            text-align: center;
-            font-size: 16px;
-            padding: 20px;
-            display: none;
+            text-align: center; font-size: 15px; padding: 24px 0;
+            display: none; margin-top: 24px;
         }
         .result.success { color: #07c160; }
         .result.error { color: #fa5151; }
-        .status-badge {
-            display: inline-block;
-            padding: 2px 8px;
-            border-radius: 4px;
-            font-size: 12px;
-            margin-left: 8px;
+        .badge {
+            display: inline-block; padding: 2px 10px; border-radius: 10px;
+            font-size: 12px; line-height: 18px;
         }
-        .status-pending { background: #fff3e0; color: #f57c00; }
-        .status-approved { background: #e8f5e9; color: #2e7d32; }
-        .status-rejected { background: #fbe9e7; color: #c62828; }
+        .badge-pending { background: #fff3e0; color: #f57c00; }
+        .badge-approved { background: #e8f5e9; color: #2e7d32; }
+        .badge-rejected { background: #fbe9e7; color: #c62828; }
+        .loading { text-align: center; padding: 80px 20px; color: #999; font-size: 15px; }
+        .error-page { text-align: center; padding: 80px 20px; color: #fa5151; font-size: 15px; display: none; }
+        .overlay {
+            position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.5); display: none;
+            justify-content: center; align-items: center; z-index: 100;
+        }
+        .overlay-card {
+            background: #fff; border-radius: 12px; padding: 32px 24px;
+            text-align: center; max-width: 300px; margin: 0 20px;
+        }
+        .overlay-msg { font-size: 15px; color: #666; line-height: 1.6; }
     </style>
 </head>
-
 <body>
-    <div class="box">
-        <div class="card">
-            <div class="card-title">Space 加入申请</div>
-            <div class="info-row">
-                <span class="info-label">用户</span>
-                <span class="info-value" id="applicant-name"></span>
+    <div class="container">
+        <div id="loading" class="loading">加载中...</div>
+        <div id="content" style="display:none">
+            <div class="card">
+                <div class="card-title">Space 加入申请</div>
+                <div class="info-row"><span class="info-label">用户</span><span class="info-value" id="v-name"></span></div>
+                <div class="info-row" id="row-email" style="display:none"><span class="info-label">邮箱</span><span class="info-value" id="v-email"></span></div>
+                <div class="info-row"><span class="info-label">空间</span><span class="info-value" id="v-space"></span></div>
+                <div class="info-row"><span class="info-label">状态</span><span class="info-value" id="v-status"></span></div>
             </div>
-            <div class="info-row" id="email-row" style="display:none">
-                <span class="info-label">邮箱</span>
-                <span class="info-value" id="applicant-email"></span>
+            <div class="btn-group" id="btn-group">
+                <button class="btn btn-reject" id="btn-reject">拒绝</button>
+                <button class="btn btn-approve" id="btn-approve">同意加入</button>
             </div>
-            <div class="info-row">
-                <span class="info-label">空间</span>
-                <span class="info-value" id="space-name"></span>
-            </div>
-            <div class="info-row">
-                <span class="info-label">状态</span>
-                <span class="info-value" id="apply-status"></span>
+            <div class="result" id="result"></div>
+        </div>
+        <div class="error-page" id="error-page"></div>
+        <div class="overlay" id="overlay">
+            <div class="overlay-card">
+                <div class="overlay-msg" id="overlay-msg"></div>
             </div>
         </div>
-
-        <div class="btn-group" id="btn-group">
-            <button class="btn btn-reject" id="btn-reject">拒绝</button>
-            <button class="btn btn-approve" id="btn-approve">同意加入</button>
-        </div>
-
-        <div class="result" id="result"></div>
     </div>
-</body>
-<script language="javascript">
-    var authCode = getQueryString('auth_code');
 
-    function showResult(msg, isError) {
-        var el = document.getElementById('result');
-        el.textContent = msg;
-        el.className = 'result ' + (isError ? 'error' : 'success');
-        el.style.display = 'block';
-        document.getElementById('btn-group').style.display = 'none';
-    }
+<script>
+var API_BASE = "{{API_BASE_URL}}";
+var authCode = new URLSearchParams(location.search).get("auth_code");
 
-    function statusText(status) {
-        if (status === 0) return '<span class="status-badge status-pending">待审批</span>';
-        if (status === 1) return '<span class="status-badge status-approved">已通过</span>';
-        if (status === 2) return '<span class="status-badge status-rejected">已拒绝</span>';
-        return '';
-    }
+function statusHTML(s) {
+    if (s === 0) return '<span class="badge badge-pending">待审批</span>';
+    if (s === 1) return '<span class="badge badge-approved">已通过</span>';
+    if (s === 2) return '<span class="badge badge-rejected">已拒绝</span>';
+    return '';
+}
 
-    $(function () {
-        if (!authCode) {
-            showResult('缺少授权码', true);
-            return;
-        }
+function showResult(msg, ok) {
+    var el = document.getElementById("result");
+    el.textContent = msg;
+    el.className = "result " + (ok ? "success" : "error");
+    el.style.display = "block";
+    document.getElementById("btn-group").style.display = "none";
+}
 
-        $.getJSON(apiURL + 'space/join-approve/detail?auth_code=' + authCode).then(function (resp) {
-            document.getElementById('applicant-name').textContent = resp.applicant_name + ' (' + resp.uid + ')';
-            document.getElementById('space-name').textContent = resp.space_name;
-            document.getElementById('apply-status').innerHTML = statusText(resp.status);
+function showError(msg) {
+    document.getElementById("loading").style.display = "none";
+    document.getElementById("overlay-msg").textContent = msg;
+    document.getElementById("overlay").style.display = "flex";
+}
 
-            if (resp.applicant_email) {
-                document.getElementById('applicant-email').textContent = resp.applicant_email;
-                document.getElementById('email-row').style.display = 'flex';
-            }
-
-            if (resp.status !== 0) {
-                document.getElementById('btn-group').style.display = 'none';
-            }
-        }).fail(function () {
-            showResult('授权码无效或已过期', true);
-        });
-
-        document.getElementById('btn-approve').addEventListener('click', function () {
-            this.disabled = true;
-            document.getElementById('btn-reject').disabled = true;
-            $.postJSON(apiURL + 'space/join-approve/sure?auth_code=' + authCode + '&action=approve').then(function () {
-                showResult('已同意加入', false);
-            }).fail(function () {
-                showResult('操作失败，请重试', true);
-                document.getElementById('btn-approve').disabled = false;
-                document.getElementById('btn-reject').disabled = false;
-            });
-        });
-
-        document.getElementById('btn-reject').addEventListener('click', function () {
-            this.disabled = true;
-            document.getElementById('btn-approve').disabled = true;
-            $.postJSON(apiURL + 'space/join-approve/sure?auth_code=' + authCode + '&action=reject').then(function () {
-                showResult('已拒绝', false);
-            }).fail(function () {
-                showResult('操作失败，请重试', true);
-                document.getElementById('btn-approve').disabled = false;
-                document.getElementById('btn-reject').disabled = false;
-            });
-        });
+function api(method, path) {
+    return fetch(API_BASE + path, { method: method }).then(function(r) {
+        return r.json().then(function(data) { return { ok: r.ok, data: data }; });
     });
-</script>
+}
 
+function doAction(action) {
+    document.getElementById("btn-approve").disabled = true;
+    document.getElementById("btn-reject").disabled = true;
+    api("POST", "/v1/space/join-approve/sure?auth_code=" + authCode + "&action=" + action).then(function(r) {
+        if (r.ok) {
+            showResult(action === "approve" ? "已同意加入" : "已拒绝", true);
+        } else {
+            showResult(r.data.msg || "操作失败", false);
+            document.getElementById("btn-approve").disabled = false;
+            document.getElementById("btn-reject").disabled = false;
+        }
+    }).catch(function() {
+        showResult("网络错误，请重试", false);
+        document.getElementById("btn-approve").disabled = false;
+        document.getElementById("btn-reject").disabled = false;
+    });
+}
+
+if (!authCode) {
+    showError("无效的审批链接，请从通知消息中点击打开");
+} else {
+    api("GET", "/v1/space/join-approve/detail?auth_code=" + authCode).then(function(r) {
+        if (!r.ok) { showError(r.data.msg || "审批链接已失效，请联系申请人重新申请"); return; }
+        var d = r.data;
+        document.getElementById("loading").style.display = "none";
+        document.getElementById("content").style.display = "block";
+        document.getElementById("v-name").textContent = d.applicant_name;
+        document.getElementById("v-space").textContent = d.space_name;
+        document.getElementById("v-status").innerHTML = statusHTML(d.status);
+        if (d.applicant_email) {
+            document.getElementById("v-email").textContent = d.applicant_email;
+            document.getElementById("row-email").style.display = "flex";
+        }
+        if (d.status !== 0) { document.getElementById("btn-group").style.display = "none"; }
+        document.getElementById("btn-approve").onclick = function() { doAction("approve"); };
+        document.getElementById("btn-reject").onclick = function() { doAction("reject"); };
+    }).catch(function() { showError("网络错误"); });
+}
+</script>
+</body>
 </html>
