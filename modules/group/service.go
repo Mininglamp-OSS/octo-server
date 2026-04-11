@@ -930,10 +930,12 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 	// 生成群头像事件（事务内）
 	var groupAvatarEventID int64
 	if s.ctx.Event != nil {
-		avatarMembers := realMemberUIDs
-		if len(avatarMembers) > 9 {
-			avatarMembers = avatarMembers[:9]
+		n := len(realMemberUIDs)
+		if n > 9 {
+			n = 9
 		}
+		avatarMembers := make([]string, n)
+		copy(avatarMembers, realMemberUIDs[:n])
 		groupAvatarEventID, err = s.ctx.EventBegin(&wkevent.Data{
 			Event: event.GroupAvatarUpdate,
 			Type:  wkevent.CMD,
@@ -943,7 +945,9 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 			},
 		}, tx)
 		if err != nil {
+			tx.Rollback()
 			s.Error("begin group avatar update event failed", zap.Error(err))
+			return nil, fmt.Errorf("begin group avatar update event: %w", err)
 		}
 	}
 
@@ -1245,13 +1249,22 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 	// 生成群头像更新事件（事务内）
 	var groupAvatarEventID int64
 	if s.ctx.Event != nil && len(removedUIDs) > 0 {
-		groupIsUploadAvatar, _ := s.db.queryGroupAvatarIsUpload(req.GroupNo)
-		if groupIsUploadAvatar != 1 {
-			remainingMembers, _ := s.db.QueryMembersFirstNine(req.GroupNo)
-			if len(remainingMembers) < 9 {
+		groupIsUploadAvatar, avatarErr := s.db.queryGroupAvatarIsUpload(req.GroupNo)
+		if avatarErr != nil {
+			s.Error("query group avatar upload status failed", zap.Error(avatarErr))
+		}
+		if avatarErr == nil && groupIsUploadAvatar != 1 {
+			memberCount, countErr := s.db.QueryMemberCountTx(req.GroupNo, tx)
+			if countErr != nil {
+				s.Error("query member count in tx failed", zap.Error(countErr))
+			}
+			if countErr == nil && memberCount < 9 {
+				remainingMembers, _ := s.db.QueryMembersFirstNine(req.GroupNo)
 				avatarUIDs := make([]string, 0, len(remainingMembers))
 				for _, m := range remainingMembers {
-					avatarUIDs = append(avatarUIDs, m.UID)
+					if !contains(removedUIDs, m.UID) {
+						avatarUIDs = append(avatarUIDs, m.UID)
+					}
 				}
 				groupAvatarEventID, err = s.ctx.EventBegin(&wkevent.Data{
 					Event: event.GroupAvatarUpdate,
@@ -1262,7 +1275,9 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 					},
 				}, tx)
 				if err != nil {
+					tx.Rollback()
 					s.Error("begin group avatar update event failed", zap.Error(err))
+					return nil, fmt.Errorf("begin group avatar update event: %w", err)
 				}
 			}
 		}
@@ -1408,6 +1423,15 @@ func (s *Service) UpdateGroupInfo(req *UpdateGroupInfoServiceReq) error {
 }
 
 // ---------- Service internal helpers (thread sync, no thread package import) ----------
+
+func contains(slice []string, s string) bool {
+	for _, v := range slice {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
 
 // removeUserFromGroupThreads 移除用户在某群下所有子区的成员记录和 IM 订阅（直接 SQL）
 func (s *Service) removeUserFromGroupThreads(groupNo, uid string) {

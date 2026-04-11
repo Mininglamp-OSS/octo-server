@@ -2379,13 +2379,22 @@ func (g *Group) groupExit(c *wkhttp.Context) {
 	}
 	// 生成群头像更新事件
 	var groupAvatarEventID int64
-	groupIsUploadAvatar, _ := g.db.queryGroupAvatarIsUpload(groupNo)
-	if groupIsUploadAvatar != 1 {
-		remainingMembers, _ := g.db.QueryMembersFirstNine(groupNo)
-		if len(remainingMembers) < 9 {
+	groupIsUploadAvatar, avatarErr := g.db.queryGroupAvatarIsUpload(groupNo)
+	if avatarErr != nil {
+		g.Error("查询群头像是否用户上传过失败！", zap.String("group_no", groupNo), zap.Error(avatarErr))
+	}
+	if avatarErr == nil && groupIsUploadAvatar != 1 {
+		memberCount, countErr := g.db.QueryMemberCountTx(groupNo, tx)
+		if countErr != nil {
+			g.Error("查询群成员数量失败！", zap.String("group_no", groupNo), zap.Error(countErr))
+		}
+		if countErr == nil && memberCount < 9 {
+			remainingMembers, _ := g.db.QueryMembersFirstNine(groupNo)
 			avatarUIDs := make([]string, 0, len(remainingMembers))
 			for _, m := range remainingMembers {
-				avatarUIDs = append(avatarUIDs, m.UID)
+				if m.UID != loginUID {
+					avatarUIDs = append(avatarUIDs, m.UID)
+				}
 			}
 			groupAvatarEventID, err = g.ctx.EventBegin(&wkevent.Data{
 				Event: event.GroupAvatarUpdate,
@@ -2396,7 +2405,10 @@ func (g *Group) groupExit(c *wkhttp.Context) {
 				},
 			}, tx)
 			if err != nil {
+				tx.Rollback()
 				g.Error("开启群头像更新事件失败！", zap.Error(err))
+				c.ResponseError(errors.New("开启群头像更新事件失败！"))
+				return
 			}
 		}
 	}
