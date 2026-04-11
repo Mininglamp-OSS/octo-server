@@ -543,7 +543,13 @@ func (g *Group) handleOrgOrDeptEmployeeUpdate(data []byte, commit config.EventCo
 			}
 		}
 	}
-	// 添加IM订阅者和发布入群消息
+	if err = tx.Commit(); err != nil {
+		g.Error("事物提交失败")
+		tx.Rollback()
+		commit(err)
+		return
+	}
+	// 添加IM订阅者和发布入群消息（必须在tx.Commit()成功之后）
 	for _, m := range addMembers {
 		groupName := ""
 		for _, group := range groups {
@@ -570,7 +576,6 @@ func (g *Group) handleOrgOrDeptEmployeeUpdate(data []byte, commit config.EventCo
 		})
 		if err != nil {
 			g.Error("调用IM的订阅接口失败！", zap.Error(err))
-			tx.RollbackUnlessCommitted()
 			commit(err)
 			return
 		}
@@ -594,18 +599,9 @@ func (g *Group) handleOrgOrDeptEmployeeUpdate(data []byte, commit config.EventCo
 		if err != nil {
 			g.Error("发送新增组织或部门群成员消息错误", zap.Error(err))
 			commit(nil)
-			tx.RollbackUnlessCommitted()
 			return
 		}
 	}
-
-	if err = tx.Commit(); err != nil {
-		g.Error("事物提交失败")
-		tx.Rollback()
-		commit(err)
-		return
-	}
-
 	// 同步新成员到群内所有子区的 IM 订阅（允许发消息）
 	for _, m := range addMembers {
 		uids := make([]string, 0, len(m.Members))
