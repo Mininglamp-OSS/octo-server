@@ -2377,13 +2377,10 @@ func (g *Group) groupExit(c *wkhttp.Context) {
 			return
 		}
 	}
-	// 生成群头像更新事件
+	// 生成群头像更新事件（best-effort，不阻塞退群）
 	groupAvatarEventID, avatarErr := beginAvatarUpdateEvent(g.ctx, g.db, groupNo, nil, []string{loginUID}, tx)
 	if avatarErr != nil {
-		tx.Rollback()
 		g.Error("开启群头像更新事件失败！", zap.Error(avatarErr))
-		c.ResponseError(errors.New("开启群头像更新事件失败！"))
-		return
 	}
 	if err := tx.Commit(); err != nil {
 		tx.RollbackUnlessCommitted()
