@@ -188,6 +188,7 @@ type spaceJoinApplyResp struct {
 	ApplicantName string `json:"applicant_name"`
 	Remark        string `json:"remark"`
 	Status        int    `json:"status"`
+	ReviewerUID   string `json:"reviewer_uid,omitempty"`
 	CreatedAt     string `json:"created_at"`
 }
 

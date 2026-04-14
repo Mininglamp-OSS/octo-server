@@ -61,6 +61,7 @@
                 <div class="info-row" id="row-email" style="display:none"><span class="info-label">邮箱</span><span class="info-value" id="v-email"></span></div>
                 <div class="info-row"><span class="info-label">空间</span><span class="info-value" id="v-space"></span></div>
                 <div class="info-row"><span class="info-label">状态</span><span class="info-value" id="v-status"></span></div>
+                <div class="info-row" id="row-reviewer" style="display:none"><span class="info-label">审批</span><span class="info-value" id="v-reviewer"></span></div>
             </div>
             <div class="btn-group" id="btn-group">
                 <button class="btn btn-reject" id="btn-reject">拒绝</button>
@@ -112,6 +113,7 @@ function doAction(action) {
     document.getElementById("btn-reject").disabled = true;
     api("POST", "/v1/space/join-approve/sure?auth_code=" + authCode + "&action=" + action).then(function(r) {
         if (r.ok) {
+            document.getElementById("v-status").innerHTML = statusHTML(action === "approve" ? 1 : 2);
             showResult(action === "approve" ? "已同意加入" : "已拒绝", true);
         } else {
             showResult(r.data.msg || "操作失败", false);
@@ -140,7 +142,13 @@ if (!authCode) {
             document.getElementById("v-email").textContent = d.applicant_email;
             document.getElementById("row-email").style.display = "flex";
         }
-        if (d.status !== 0) { document.getElementById("btn-group").style.display = "none"; }
+        if (d.status !== 0) {
+            document.getElementById("btn-group").style.display = "none";
+            if (d.reviewer_name) {
+                document.getElementById("v-reviewer").textContent = d.reviewer_name;
+                document.getElementById("row-reviewer").style.display = "flex";
+            }
+        }
         document.getElementById("btn-approve").onclick = function() { doAction("approve"); };
         document.getElementById("btn-reject").onclick = function() { doAction("reject"); };
     }).catch(function() { showError("网络错误"); });
