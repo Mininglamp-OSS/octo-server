@@ -1082,22 +1082,10 @@ func (h *commandHandler) sendConnectPrompt(toUID string, bot *robotModel) {
 		apiURL = fmt.Sprintf("http://%s:8090", cfg.External.IP)
 	}
 
-	prompt := fmt.Sprintf(`📋 机器人「**%s**」的连接信息：
-
-**Bot Name:** %s
-**Bot Token:** %s
-**API Server:** %s
-
-**安装插件并配置 bot：**
-`+"```"+`
-npx -y openclaw-channel-dmwork install --bot-token %s --api-url %s --account-id %s
-`+"```"+`
-
-**CLI 命令说明：** %s/v1/bot/cli-guide.md
-**OpenClaw API 文档：** %s/v1/bot/skill.md
-
-⚙️ 群聊默认只有 @机器人 时才回复（可在配置中修改）
-🔌 断开连接请发送 /disconnect`,
+	prompt := fmt.Sprintf("📋 机器人「**%s**」的连接信息：\n\n**Bot Name:** %s  \n**Bot Token:** %s  \n**API Server:** %s\n\n**安装插件并配置 bot：**\n"+
+		"```\nnpx -y openclaw-channel-dmwork install --bot-token %s --api-url %s --account-id %s\n```\n\n"+
+		"**使用帮助：** %s/v1/bot/cli-guide.md  \n**OpenClaw API 文档：** %s/v1/bot/skill.md\n\n"+
+		"⚙️ 群聊默认只有 @机器人 时才回复（可在配置中修改）  \n🔌 断开连接请发送 /disconnect",
 		bot.RobotID, bot.RobotID, bot.BotToken, apiURL,
 		bot.BotToken, apiURL, bot.RobotID,
 		apiURL, apiURL)
@@ -1112,24 +1100,11 @@ func (h *commandHandler) sendCreatedPrompt(toUID string, name string, bot *robot
 		apiURL = fmt.Sprintf("http://%s:8090", cfg.External.IP)
 	}
 
-	msg := fmt.Sprintf(`✅ 机器人「**%s**」创建成功！
-
-**Bot Name:** %s
-**Bot Token:** %s
-**API Server:** %s
-
-📋 **连接 OpenClaw**
-
-**安装插件并配置 bot：**
-`+"```"+`
-npx -y openclaw-channel-dmwork install --bot-token %s --api-url %s --account-id %s
-`+"```"+`
-
-**CLI 命令说明：** %s/v1/bot/cli-guide.md
-**OpenClaw API 文档：** %s/v1/bot/skill.md
-
-⚙️ 群聊默认只有 @机器人 时才回复（可在配置中修改）
-🔌 断开连接请发送 /disconnect`,
+	msg := fmt.Sprintf("✅ 机器人「**%s**」创建成功！\n\n**Bot Name:** %s  \n**Bot Token:** %s  \n**API Server:** %s\n\n"+
+		"📋 **连接 OpenClaw**\n\n**安装插件并配置 bot：**\n"+
+		"```\nnpx -y openclaw-channel-dmwork install --bot-token %s --api-url %s --account-id %s\n```\n\n"+
+		"**使用帮助：** %s/v1/bot/cli-guide.md  \n**OpenClaw API 文档：** %s/v1/bot/skill.md\n\n"+
+		"⚙️ 群聊默认只有 @机器人 时才回复（可在配置中修改）  \n🔌 断开连接请发送 /disconnect",
 		name, bot.RobotID, bot.BotToken, apiURL,
 		bot.BotToken, apiURL, bot.RobotID,
 		apiURL, apiURL)
