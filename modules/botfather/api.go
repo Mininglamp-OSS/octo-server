@@ -96,8 +96,9 @@ func (bf *BotFather) Route(r *wkhttp.WKHttp) {
 	// 启动时批量同步所有 bot 的 token 到 WuKongIM（防止 WuKongIM 重启后 token 丢失）
 	go bf.syncAllBotTokens()
 
-	// skill.md 端点（无需认证）
+	// 文档端点（无需认证）
 	r.GET("/v1/bot/skill.md", bf.skillMD)
+	r.GET("/v1/bot/cli-guide.md", bf.cliGuideMD)
 
 	// register 端点（只需bot token，不走authBot中间件组）
 	r.POST("/v1/bot/register", bf.register)
@@ -175,6 +176,13 @@ func (bf *BotFather) skillMD(c *wkhttp.Context) {
 	}
 	wsURL := deriveWSURL(cfg)
 	content := generateSkillMD(apiURL, wsURL)
+	c.Header("Content-Type", "text/markdown; charset=utf-8")
+	c.String(http.StatusOK, content)
+}
+
+// cliGuideMD 返回 CLI 使用指南
+func (bf *BotFather) cliGuideMD(c *wkhttp.Context) {
+	content := generateCLIGuideMD()
 	c.Header("Content-Type", "text/markdown; charset=utf-8")
 	c.String(http.StatusOK, content)
 }

@@ -490,7 +490,7 @@ func (h *commandHandler) handleQuickstart(fromUID string) {
 	apiKeyFormatted := "`" + apiKey + "`"
 	h.reply(fromUID, fmt.Sprintf(`🚀 **Quickstart**
 
-将下面的提示词复制发给你的 AI Agent：
+将下面的提示词复制发送给你的 OpenClaw：
 
 ---
 Read %s/v1/bot/skill.md to learn the DMWork Bot API (includes User API, multi-bot config, and OpenClaw setup).
@@ -1084,31 +1084,23 @@ func (h *commandHandler) sendConnectPrompt(toUID string, bot *robotModel) {
 
 	prompt := fmt.Sprintf(`📋 机器人「**%s**」的连接信息：
 
-将下面的提示词复制发给你的 AI Agent：
+**Bot Name:** %s
+**Bot Token:** %s
+**API Server:** %s
 
----
-Read %s/v1/bot/skill.md to connect to DMWork messaging.
-My bot token is: %s
-API server: %s
-Install adapter: openclaw plugins install openclaw-channel-dmwork
-Configure in ~/.openclaw/openclaw.json:
-{"channels":{"dmwork":{"botToken":"YOUR_TOKEN","apiUrl":"API_SERVER"}},"session":{"dmScope":"per-account-channel-peer"}}
-Replace YOUR_TOKEN and API_SERVER with the values above.
-IMPORTANT: dmScope MUST be set — without it all users share one session.
+**安装插件并配置 bot：**
+`+"```"+`
+npx -y openclaw-channel-dmwork install --bot-token %s --api-url %s --account-id %s
+`+"```"+`
 
-AFTER configuring openclaw.json, write your agent.md to define your identity. Write in FIRST PERSON, include:
-- Who you are, your bot token, API server, and accountId
-- Capability reference: "My full API capabilities are documented at %s/v1/bot/skill.md"
-Do NOT paste the raw skill.md — keep it concise, reference the URL instead.
+**CLI 命令说明：** %s/v1/bot/cli-guide.md
+**OpenClaw API 文档：** %s/v1/bot/skill.md
 
-Do NOT run "openclaw gateway restart" — auto-reloads.
-Simply confirm the steps are complete and stop.
----
-
-💡 支持 OpenClaw、Claude Code、及任何能读取 URL 的 AI Agent
 ⚙️ 群聊默认只有 @机器人 时才回复（可在配置中修改）
 🔌 断开连接请发送 /disconnect`,
-		bot.RobotID, apiURL, bot.BotToken, apiURL, apiURL)
+		bot.RobotID, bot.RobotID, bot.BotToken, apiURL,
+		bot.BotToken, apiURL, bot.RobotID,
+		apiURL, apiURL)
 
 	h.reply(toUID, prompt)
 }
@@ -1122,49 +1114,25 @@ func (h *commandHandler) sendCreatedPrompt(toUID string, name string, bot *robot
 
 	msg := fmt.Sprintf(`✅ 机器人「**%s**」创建成功！
 
-📋 **连接 Agent**
-将下面的提示词复制发送给你的 AI Agent：
+**Bot Name:** %s
+**Bot Token:** %s
+**API Server:** %s
 
----
-Read %s/v1/bot/skill.md to connect to DMWork messaging.
-My bot token is: %s
-API server: %s
-Install adapter: openclaw plugins install openclaw-channel-dmwork
+📋 **连接 OpenClaw**
 
-IMPORTANT - Check existing config first:
-1. Read ~/.openclaw/openclaw.json
-2. If channels.dmwork already exists with a botToken or accounts:
-   - Use multi-account structure, do NOT overwrite existing tokens
-   - Add your bot as a new account under channels.dmwork.accounts
-3. If channels.dmwork does not exist:
-   - Create it with single account structure
+**安装插件并配置 bot：**
+`+"```"+`
+npx -y openclaw-channel-dmwork install --bot-token %s --api-url %s --account-id %s
+`+"```"+`
 
-Single bot config:
-{"channels":{"dmwork":{"botToken":"YOUR_TOKEN","apiUrl":"API_SERVER"}}}
+**CLI 命令说明：** %s/v1/bot/cli-guide.md
+**OpenClaw API 文档：** %s/v1/bot/skill.md
 
-Multi-bot config (when other bots already exist):
-{"channels":{"dmwork":{"apiUrl":"API_SERVER","accounts":{"existing-bot":{"botToken":"KEEP_EXISTING","apiUrl":"API_SERVER"},"YOUR_BOT_ID":{"botToken":"YOUR_TOKEN","apiUrl":"API_SERVER"}}}}}
-
-Also add bindings for each bot:
-{"agentId":"YOUR_AGENT_ID","match":{"channel":"dmwork","accountId":"YOUR_BOT_ID"}}
-
-Always set: {"session":{"dmScope":"per-account-channel-peer"}}
-
-AFTER configuring openclaw.json, write your agent.md (e.g. ~/.openclaw/agents/YOUR_AGENT_ID/agent/agent.md) to define your identity. Write in FIRST PERSON, include:
-- Who you are: "I am [bot name], a DMWork bot"
-- Your credentials: bot token, API server, and your accountId (MUST pass accountId when using dmwork_management tool)
-- Capability reference: "My full API capabilities are documented at %s/v1/bot/skill.md — read it when I need to perform an action I'm unsure about"
-- Behavioral rules: respond in the user's language, be helpful
-Do NOT paste the raw skill.md into agent.md — keep it concise, reference the URL instead
-
-Do NOT run "openclaw gateway restart" — auto-reloads.
-Simply confirm the steps are complete and stop.
----
-
-💡 支持 OpenClaw、Claude Code、及任何能读取 URL 的 AI Agent
 ⚙️ 群聊默认只有 @机器人 时才回复（可在配置中修改）
 🔌 断开连接请发送 /disconnect`,
-		name, apiURL, bot.BotToken, apiURL, apiURL)
+		name, bot.RobotID, bot.BotToken, apiURL,
+		bot.BotToken, apiURL, bot.RobotID,
+		apiURL, apiURL)
 
 	h.reply(toUID, msg)
 }

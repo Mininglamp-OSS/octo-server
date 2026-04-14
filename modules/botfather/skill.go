@@ -1021,3 +1021,103 @@ curl -X DELETE %s/v1/user/bots/mybot_bot \
 
 `, apiURL, apiURL, apiURL, wsURL, apiURL, apiURL, wsURL, apiURL, apiURL, apiURL, wsURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL, apiURL)
 }
+
+func generateCLIGuideMD() string {
+	return `# DMWork 插件 CLI 使用指南
+
+## 安装插件
+
+在 DMWork 中通过 BotFather 创建 bot 后，复制安装命令到终端执行：
+
+` + "```" + `bash
+npx -y openclaw-channel-dmwork install \
+  --bot-token bf_你的token \
+  --api-url https://api.example.com/api \
+  --account-id 你的bot名称
+` + "```" + `
+
+也可以不带参数运行，按提示逐步输入：
+
+` + "```" + `bash
+npx -y openclaw-channel-dmwork install
+` + "```" + `
+
+## 添加更多 bot
+
+同样用 install 命令，换一个 account-id 即可，已有的 bot 不受影响：
+
+` + "```" + `bash
+npx -y openclaw-channel-dmwork install \
+  --bot-token bf_另一个token \
+  --api-url https://api.example.com/api \
+  --account-id second_bot
+` + "```" + `
+
+## 更新插件
+
+` + "```" + `bash
+npx -y openclaw-channel-dmwork update
+` + "```" + `
+
+已是最新版本会自动跳过，不会重复安装。
+
+## 检查状态
+
+` + "```" + `bash
+npx -y openclaw-channel-dmwork doctor
+` + "```" + `
+
+输出示例：
+
+` + "```" + `
+DMWork Plugin Doctor
+  [PASS]  Plugin installed (v0.5.19)
+  [PASS]  Plugin enabled (Yes)
+  [PASS]  Accounts configured (my_bot, second_bot (2 total))
+  [PASS]  my_bot: botToken (Configured)
+  [PASS]  my_bot: API reachable (https://api.example.com/api)
+  [PASS]  Gateway running (Yes)
+
+0 error(s), 0 warning(s).
+` + "```" + `
+
+## 遇到问题自动修复
+
+` + "```" + `bash
+npx -y openclaw-channel-dmwork doctor --fix
+` + "```" + `
+
+能自动修复的问题会标记为 ` + "`[FIXED]`" + `，无法自动修复的会标记为 ` + "`[FAIL]`" + ` 并给出提示。
+
+## 删除某个 bot
+
+` + "```" + `bash
+npx -y openclaw-channel-dmwork remove-account --account-id second_bot
+` + "```" + `
+
+只删除指定 bot，不影响其他 bot 和插件。
+
+## 卸载插件
+
+` + "```" + `bash
+npx -y openclaw-channel-dmwork uninstall
+` + "```" + `
+
+卸载插件并删除全部 bot 配置。
+
+## 查看版本信息
+
+` + "```" + `bash
+npx -y openclaw-channel-dmwork info
+` + "```" + `
+
+## 创建独立 Agent（可选）
+
+默认所有 bot 消息由 main agent 处理。如需为 bot 创建独立的 agent（独立身份和记忆）：
+
+` + "```" + `bash
+openclaw agents add <agent_name>
+openclaw agents bind <agent_name> dmwork <account_id>
+` + "```" + `
+`
+}
