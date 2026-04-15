@@ -311,7 +311,7 @@ func TestTranscribeAPI_WithChatContext(t *testing.T) {
 		json.NewDecoder(r.Body).Decode(&req)
 
 		prompt := req.Messages[0].Content[0].Text
-		assert.Contains(t, prompt, "辅助识别专有名词拼写")
+		assert.Contains(t, prompt, "词汇参考表")
 		assert.Contains(t, prompt, "Alice: 明天开会")
 
 		resp := chatCompletionResponse{
@@ -379,7 +379,7 @@ func TestTranscribeAPI_EmptyChatContext(t *testing.T) {
 		json.NewDecoder(r.Body).Decode(&req)
 
 		prompt := req.Messages[0].Content[0].Text
-		assert.NotContains(t, prompt, "辅助识别专有名词拼写")
+		assert.NotContains(t, prompt, "词汇参考表")
 
 		resp := chatCompletionResponse{
 			Choices: []choice{{Message: responseMessage{Content: "plain transcription"}}},

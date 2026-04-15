@@ -14,6 +14,9 @@ import (
 	"go.uber.org/zap"
 )
 
+// Blank import avoided: botfather init runs before voice init (internal/modules.go line 7 vs 23),
+// so voice.GetASRLogger() is called dynamically in botTranscribe() rather than in New().
+
 // resolveOwnerAndSpace extracts the owner UID, space ID, and robot ID from the
 // bot context (already authenticated by authBot middleware).
 // Returns (ownerUID, spaceID, robotID, ok).
@@ -204,12 +207,42 @@ func (bf *BotFather) botTranscribe(c *wkhttp.Context) {
 		return
 	}
 
-	text, usedModel, err := bf.voiceSvc.TranscribeWithOptions(audioData, mimeType, contextText, chatContext, voice.TranscribeOptions{
-		Mode:  mode,
-		Model: model,
-	})
+	startTime := time.Now()
+	result, err := bf.voiceSvc.TranscribeWithResult(audioData, mimeType, contextText, chatContext,
+		voice.TranscribeOptions{Mode: mode, Model: model})
+	durationMs := time.Since(startTime).Milliseconds()
+
 	if err != nil {
 		bf.Error("transcription failed", zap.Error(err))
+		if asrLogger := voice.GetASRLogger(); asrLogger != nil {
+			entry := voice.ASREntry{
+				RequestID:      asrLogger.GenerateRequestID(),
+				Timestamp:      startTime.UTC().Format(time.RFC3339Nano),
+				Source:         "bot",
+				Engine:         bf.voiceCfg.Engine,
+				ModelRequested: model,
+				Input: voice.ASRInput{
+					Mode:        effectiveMode,
+					MimeType:    mimeType,
+					AudioSize:   len(audioData),
+					ContextText: contextText,
+					ChatContext: chatContext,
+					Model:       model,
+					Language:    bf.voiceCfg.Language,
+				},
+				AudioData:  audioData,
+				Error:      err.Error(),
+				DurationMs: durationMs,
+			}
+			if result != nil {
+				entry.Prompt = &voice.ASRPrompt{
+					Type:        result.PromptType,
+					Text:        result.PromptText,
+					RequestBody: result.RequestBody,
+				}
+			}
+			asrLogger.Enqueue(entry)
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"status": http.StatusInternalServerError,
 			"msg":    "transcription failed",
@@ -217,10 +250,41 @@ func (bf *BotFather) botTranscribe(c *wkhttp.Context) {
 		return
 	}
 
+	if asrLogger := voice.GetASRLogger(); asrLogger != nil {
+		asrLogger.Enqueue(voice.ASREntry{
+			RequestID:      asrLogger.GenerateRequestID(),
+			Timestamp:      startTime.UTC().Format(time.RFC3339Nano),
+			Source:         "bot",
+			Engine:         bf.voiceCfg.Engine,
+			ModelRequested: model,
+			ModelUsed:      result.Model,
+			Input: voice.ASRInput{
+				Mode:        effectiveMode,
+				MimeType:    mimeType,
+				AudioSize:   len(audioData),
+				ContextText: contextText,
+				ChatContext: chatContext,
+				Model:       model,
+				Language:    bf.voiceCfg.Language,
+			},
+			Prompt: &voice.ASRPrompt{
+				Type:        result.PromptType,
+				Text:        result.PromptText,
+				RequestBody: result.RequestBody,
+			},
+			AudioData:     audioData,
+			RawResultText: result.RawText,
+			ResultText:    result.Text,
+			ResultLength:  len([]rune(result.Text)),
+			IsNoSpeech:    voice.IsNoSpeech(result.RawText),
+			DurationMs:    durationMs,
+		})
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"status": http.StatusOK,
-		"text":   text,
-		"m":      voice.ShortenModelName(usedModel),
+		"text":   result.Text,
+		"m":      voice.ShortenModelName(result.Model),
 		"engine": voice.ShortenEngineName(bf.voiceCfg.Engine),
 	})
 }
