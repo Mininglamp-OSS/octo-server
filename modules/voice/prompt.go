@@ -96,8 +96,8 @@ func buildAppendPrompt(contextText string, chatContext string) string {
 	return prompt
 }
 
-// isNoSpeech checks if the model output indicates no speech was detected.
-func isNoSpeech(text string) bool {
+// IsNoSpeech checks if the model output indicates no speech was detected.
+func IsNoSpeech(text string) bool {
 	if text == "" {
 		return true
 	}
