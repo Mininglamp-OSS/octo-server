@@ -114,6 +114,21 @@ func LoadPrompts(filePath string, log promptLogger) {
 	}
 
 	if log != nil {
-		log.Info("loaded voice prompts from file", zap.String("path", filePath))
+		log.Info("loaded voice prompts from file",
+			zap.String("path", filePath),
+			zap.String("transcribe", truncatePrompt(activePrompts.Transcribe, 80)),
+			zap.String("modify", truncatePrompt(activePrompts.Modify, 80)),
+			zap.String("append_context", truncatePrompt(activePrompts.AppendContext, 80)),
+			zap.String("chat_context_suffix", truncatePrompt(activePrompts.ChatContextSuffix, 80)),
+		)
 	}
+}
+
+// truncatePrompt returns the first n characters of s, appending "..." if truncated.
+func truncatePrompt(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "..."
 }
