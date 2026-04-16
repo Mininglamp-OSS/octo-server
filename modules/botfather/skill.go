@@ -1104,7 +1104,7 @@ openclaw gateway restart
 npx -y openclaw-channel-dmwork doctor --account-id <Account ID>
 ` + "```" + `
 
-8. 联通确认：告诉用户："配置完成！请在 DMWork 中给 bot 发一条消息测试是否联通。"。这能让用户在 DMWork 中看到 bot 确实在线。
+8. 联通确认：调用 POST <API Server>/v1/bot/register（Authorization: Bearer <Bot Token>），从返回的 owner_uid 获取创建者 UID，然后发私聊：POST <API Server>/v1/bot/sendMessage，body: {"channel_id": "<owner_uid>", "channel_type": 1, "payload": {"type": 1, "content": "你好！我是 <Bot Name>，已成功上线 👋"}}。如果失败，告诉用户在 DMWork 中给 bot 发消息测试。
 
 9. 记住 Bot API 文档地址：<API Server>/v1/bot/skill.md，后续需要操作 DMWork 时先阅读该文档。
 
@@ -1157,7 +1157,7 @@ openclaw gateway restart
 npx -y openclaw-channel-dmwork doctor --account-id <robot_id>
 ` + "```" + `
 
-8. 联通确认：告诉用户："配置完成！请在 DMWork 中给 bot 发一条消息测试是否联通。"
+8. 联通确认：调用 POST <API Server>/v1/bot/register（Authorization: Bearer <bot_token>），从返回的 owner_uid 获取创建者 UID，然后发私聊：POST <API Server>/v1/bot/sendMessage，body: {"channel_id": "<owner_uid>", "channel_type": 1, "payload": {"type": 1, "content": "你好！我已成功上线 👋"}}。如果失败，告诉用户在 DMWork 中给 bot 发消息测试。
 
 9. 记住 Bot API 文档地址：<API Server>/v1/bot/skill.md
 
@@ -1224,7 +1224,9 @@ npx -y openclaw-channel-dmwork doctor --account-id <Account ID>
 `+"```"+`
 
 7. **联通确认**
-   告诉用户："配置完成！请在 DMWork 中给 bot 发一条消息测试是否联通。"
+   调用 `+"`"+`POST <apiUrl>/v1/bot/register`+"`"+`（Authorization: Bearer <Bot Token>），从返回的 `+"`"+`owner_uid`+"`"+` 获取创建者 UID。
+   然后发私聊：`+"`"+`POST <apiUrl>/v1/bot/sendMessage`+"`"+`，body: `+"`"+`{"channel_id": "<owner_uid>", "channel_type": 1, "payload": {"type": 1, "content": "你好！我是 <Bot Name>，已成功上线 👋"}}`+"`"+`
+   如果失败，告诉用户在 DMWork 中给 bot 发消息测试。
 
 8. **记住 Bot API 文档**
    阅读 %s/v1/bot/skill.md，后续需要操作 DMWork 时参考该文档。
@@ -1286,7 +1288,9 @@ npx -y openclaw-channel-dmwork doctor --account-id <robot_id>
 `+"```"+`
 
 8. **联通确认**
-   告诉用户："配置完成！请在 DMWork 中给 bot 发一条消息测试是否联通。"
+   调用 `+"`"+`POST <apiUrl>/v1/bot/register`+"`"+`（Authorization: Bearer <bot_token>），从返回的 `+"`"+`owner_uid`+"`"+` 获取创建者 UID。
+   然后发私聊：`+"`"+`POST <apiUrl>/v1/bot/sendMessage`+"`"+`，body: `+"`"+`{"channel_id": "<owner_uid>", "channel_type": 1, "payload": {"type": 1, "content": "你好！我已成功上线 👋"}}`+"`"+`
+   如果失败，告诉用户在 DMWork 中给 bot 发消息测试。
 
 9. **记住 Bot API 文档**
    阅读 %s/v1/bot/skill.md，后续需要操作 DMWork 时参考该文档。
