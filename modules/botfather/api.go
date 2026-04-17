@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"path"
@@ -1416,7 +1417,10 @@ func (bf *BotFather) botUploadPresigned(c *wkhttp.Context) {
 	}
 
 	objectPath := fmt.Sprintf("chat/%d/%s_%s", time.Now().Unix(), util.GenerUUID(), url.PathEscape(filename))
-	contentType := c.DefaultQuery("contentType", "application/octet-stream")
+	contentType := mime.TypeByExtension(ext)
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
 
 	expiry := 30 * time.Minute
 	uploadURL, downloadURL, err := bf.fileService.PresignedPutURL(objectPath, contentType, expiry)

@@ -414,10 +414,6 @@ func (f *File) getUploadCredentials(c *wkhttp.Context) {
 		}
 		objectKey = fileType + sanitized
 	} else {
-		ext := ""
-		if filename != "" {
-			ext = strings.ToLower(filepath.Ext(filepath.Base(filename)))
-		}
 		objectKey = fmt.Sprintf("%s/%s%s", fileType, util.GenerUUID(), ext)
 	}
 
