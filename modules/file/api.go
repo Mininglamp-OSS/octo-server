@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
@@ -47,6 +48,8 @@ func (f *File) Route(r *wkhttp.WKHttp) {
 		auth.GET("/upload", f.getFilePath)
 		//上传文件
 		auth.POST("/upload", f.uploadFile)
+		// 预签名上传 URL 签发
+		auth.GET("/upload/credentials", f.getUploadCredentials)
 	}
 }
 
@@ -364,6 +367,59 @@ func (f *File) getFile(c *wkhttp.Context) {
 		return
 	}
 	c.Redirect(http.StatusFound, downloadURL)
+}
+
+// getUploadCredentials 返回预签名 PUT URL，供客户端直接上传文件，无需后端中转
+func (f *File) getUploadCredentials(c *wkhttp.Context) {
+	fileType := c.Query("type")
+	uploadPath := c.Query("path")
+	filename := c.Query("filename")
+	contentType := c.Query("contentType")
+
+	if err := f.checkReq(Type(fileType), uploadPath); err != nil {
+		c.ResponseError(err)
+		return
+	}
+
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+
+	var objectKey string
+	if uploadPath != "" {
+		sanitized, err := sanitizePath(uploadPath)
+		if err != nil {
+			c.ResponseError(errors.New("无效的文件路径"))
+			return
+		}
+		if !strings.HasPrefix(sanitized, "/") {
+			sanitized = "/" + sanitized
+		}
+		objectKey = fileType + sanitized
+	} else {
+		ext := ""
+		if filename != "" {
+			ext = strings.ToLower(filepath.Ext(filepath.Base(filename)))
+		}
+		objectKey = fmt.Sprintf("%s/%s%s", fileType, util.GenerUUID(), ext)
+	}
+
+	expiry := 30 * time.Minute
+	uploadURL, downloadURL, err := f.service.PresignedPutURL(objectKey, contentType, expiry)
+	if err != nil {
+		f.Error("生成预签名URL失败", zap.Error(err))
+		c.ResponseError(errors.New("生成预签名上传 URL 失败"))
+		return
+	}
+
+	c.Response(map[string]interface{}{
+		"uploadUrl":   uploadURL,
+		"downloadUrl": downloadURL,
+		"key":         objectKey,
+		"expiredTime": time.Now().Add(expiry).Unix(),
+		"method":      "PUT",
+		"contentType": contentType,
+	})
 }
 
 // sanitizePath 规范化上传路径，防止路径遍历攻击（包括双重编码）
