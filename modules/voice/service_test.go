@@ -15,6 +15,44 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// getUserPromptText extracts the text content from the user message in a decoded chat request.
+func getUserPromptText(t *testing.T, req chatCompletionRequest) string {
+	t.Helper()
+	for _, msg := range req.Messages {
+		if msg.Role == "user" {
+			parts, ok := msg.Content.([]contentPart)
+			if ok {
+				for _, p := range parts {
+					if p.Type == "text" {
+						return p.Text
+					}
+				}
+			}
+		}
+	}
+	t.Fatal("no user text content found in request")
+	return ""
+}
+
+// getUserAudioData extracts the audio data from the user message in a decoded chat request.
+func getUserAudioData(t *testing.T, req chatCompletionRequest) string {
+	t.Helper()
+	for _, msg := range req.Messages {
+		if msg.Role == "user" {
+			parts, ok := msg.Content.([]contentPart)
+			if ok {
+				for _, p := range parts {
+					if p.Type == "input_audio" && p.InputAudio != nil {
+						return p.InputAudio.Data
+					}
+				}
+			}
+		}
+	}
+	t.Fatal("no audio content found in request")
+	return ""
+}
+
 func newTestConfig(serverURL string) *VoiceConfig {
 	return &VoiceConfig{
 		LiteLLMUrl:   serverURL,
@@ -217,9 +255,11 @@ func TestTranscribe_WithContextText(t *testing.T) {
 		var req chatCompletionRequest
 		json.NewDecoder(r.Body).Decode(&req)
 
-		// In edit mode, prompt uses modifyPromptTemplate
-		prompt := req.Messages[0].Content[0].Text
-		assert.Contains(t, prompt, "# 已有文本")
+		// System message should be present
+		assert.Equal(t, "system", req.Messages[0].Role)
+		// In edit mode, user message uses editInputBufferTemplate
+		prompt := getUserPromptText(t, req)
+		assert.Contains(t, prompt, "<input_buffer>")
 		assert.Contains(t, prompt, "existing text here")
 
 		resp := chatCompletionResponse{
@@ -244,10 +284,10 @@ func TestTranscribe_WithChatContext(t *testing.T) {
 		var req chatCompletionRequest
 		json.NewDecoder(r.Body).Decode(&req)
 
-		prompt := req.Messages[0].Content[0].Text
-		assert.Contains(t, prompt, "词汇参考表")
+		prompt := getUserPromptText(t, req)
+		assert.Contains(t, prompt, "<vocabulary_reference>")
 		assert.Contains(t, prompt, "Alice: 周五开会")
-		assert.Contains(t, prompt, "将音频中的人类语音转为文字")
+		assert.Contains(t, prompt, "请转写音频中的语音")
 
 		resp := chatCompletionResponse{
 			Choices: []choice{{Message: responseMessage{Content: "transcribed with context"}}},
@@ -271,10 +311,10 @@ func TestTranscribe_WithChatContextAndContextText(t *testing.T) {
 		var req chatCompletionRequest
 		json.NewDecoder(r.Body).Decode(&req)
 
-		prompt := req.Messages[0].Content[0].Text
-		assert.Contains(t, prompt, "词汇参考表")
+		prompt := getUserPromptText(t, req)
+		assert.Contains(t, prompt, "<vocabulary_reference>")
 		assert.Contains(t, prompt, "chat history here")
-		assert.Contains(t, prompt, "# 已有文本")
+		assert.Contains(t, prompt, "<input_buffer>")
 		assert.Contains(t, prompt, "existing draft")
 
 		resp := chatCompletionResponse{
@@ -509,8 +549,8 @@ func TestGPT_Transcribe_NoSpeech_Sentinel(t *testing.T) {
 func TestGPT_Transcribe_WithContextText(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fields := parseMultipartForm(t, r)
-		// In append mode, prompt uses appendContextPromptTemplate
-		assert.Contains(t, fields["prompt"], "辅助理解语境和专有名词纠错")
+		// In append mode, prompt uses appendInputBufferNoVocabTemplate
+		assert.Contains(t, fields["prompt"], "辅助你理解当前语境")
 		assert.Contains(t, fields["prompt"], "existing text here")
 
 		w.Header().Set("Content-Type", "application/json")
@@ -778,9 +818,9 @@ func TestTranscribeAppend_Gemini_NoContext(t *testing.T) {
 		var req chatCompletionRequest
 		json.NewDecoder(r.Body).Decode(&req)
 
-		prompt := req.Messages[0].Content[0].Text
-		assert.Contains(t, prompt, "将音频中的人类语音转为文字")
-		assert.NotContains(t, prompt, "辅助理解语境")
+		prompt := getUserPromptText(t, req)
+		assert.Contains(t, prompt, "请转写音频中的语音")
+		assert.NotContains(t, prompt, "input_buffer")
 
 		resp := chatCompletionResponse{
 			Choices: []choice{{Message: responseMessage{Content: "transcribed text"}}},
@@ -805,8 +845,8 @@ func TestTranscribeAppend_Gemini_WithContext(t *testing.T) {
 		var req chatCompletionRequest
 		json.NewDecoder(r.Body).Decode(&req)
 
-		prompt := req.Messages[0].Content[0].Text
-		assert.Contains(t, prompt, "辅助理解语境和专有名词纠错")
+		prompt := getUserPromptText(t, req)
+		assert.Contains(t, prompt, "辅助你理解当前语境")
 		assert.Contains(t, prompt, "原有文本")
 
 		resp := chatCompletionResponse{
@@ -929,8 +969,8 @@ func TestTranscribeEdit_NoContext(t *testing.T) {
 		var req chatCompletionRequest
 		json.NewDecoder(r.Body).Decode(&req)
 
-		prompt := req.Messages[0].Content[0].Text
-		assert.Contains(t, prompt, "将音频中的人类语音转为文字")
+		prompt := getUserPromptText(t, req)
+		assert.Contains(t, prompt, "请转写音频中的语音")
 
 		resp := chatCompletionResponse{
 			Choices: []choice{{Message: responseMessage{Content: "transcribed"}}},
@@ -1061,7 +1101,7 @@ func TestCallChatCompletionWithFallback_Success(t *testing.T) {
 	cfg.Models = []string{"model-a"}
 	svc := NewVoiceService(cfg)
 
-	text, model, _, err := svc.callChatCompletionWithFallback([]byte("audio"), "audio/wav", "prompt", cfg.Models)
+	text, model, _, err := svc.callChatCompletionWithFallback([]byte("audio"), "audio/wav", "system", "prompt", cfg.Models)
 	assert.NoError(t, err)
 	assert.Equal(t, "ok", text)
 	assert.Equal(t, "model-a", model)
@@ -1077,7 +1117,7 @@ func TestCallChatCompletionWithFallback_NoModels(t *testing.T) {
 	}
 	svc := NewVoiceService(cfg)
 
-	_, _, _, err := svc.callChatCompletionWithFallback([]byte("audio"), "audio/wav", "prompt", cfg.Models)
+	_, _, _, err := svc.callChatCompletionWithFallback([]byte("audio"), "audio/wav", "", "prompt", cfg.Models)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "no models configured")
 }
@@ -1409,7 +1449,7 @@ func TestQwenTranscribe_AudioDataURI(t *testing.T) {
 		var req chatCompletionRequest
 		json.NewDecoder(r.Body).Decode(&req)
 
-		audioData := req.Messages[0].Content[1].InputAudio.Data
+		audioData := getUserAudioData(t, req)
 		assert.True(t, strings.HasPrefix(audioData, "data:;base64,"),
 			"qwen audio data should have data URI prefix, got: %s", audioData)
 
@@ -1433,7 +1473,7 @@ func TestGeminiTranscribe_AudioRawBase64(t *testing.T) {
 		var req chatCompletionRequest
 		json.NewDecoder(r.Body).Decode(&req)
 
-		audioData := req.Messages[0].Content[1].InputAudio.Data
+		audioData := getUserAudioData(t, req)
 		assert.False(t, strings.HasPrefix(audioData, "data:"),
 			"gemini audio data should be raw base64, got: %s", audioData)
 
@@ -1622,13 +1662,25 @@ func TestTranscribeWithResult_RequestBody_ContainsChatCompletionFields(t *testin
 
 	result, err := svc.TranscribeWithResult([]byte("audio"), "audio/wav", "", "", TranscribeOptions{})
 	assert.NoError(t, err)
+	assert.NotEmpty(t, result.SystemPrompt)
 
 	// RequestBody should be a chatCompletionRequest
 	reqBody, ok := result.RequestBody.(chatCompletionRequest)
 	assert.True(t, ok, "request body should be chatCompletionRequest")
 	assert.Equal(t, "model-a", reqBody.Model)
-	assert.Len(t, reqBody.Messages, 1)
-	assert.Len(t, reqBody.Messages[0].Content, 2)
-	assert.Equal(t, "text", reqBody.Messages[0].Content[0].Type)
-	assert.Equal(t, "input_audio", reqBody.Messages[0].Content[1].Type)
+	assert.Len(t, reqBody.Messages, 2) // system + user
+
+	// System message
+	assert.Equal(t, "system", reqBody.Messages[0].Role)
+	systemContent, ok := reqBody.Messages[0].Content.(string)
+	assert.True(t, ok, "system content should be string")
+	assert.NotEmpty(t, systemContent)
+
+	// User message
+	assert.Equal(t, "user", reqBody.Messages[1].Role)
+	userParts, ok := reqBody.Messages[1].Content.([]contentPart)
+	assert.True(t, ok, "user content should be []contentPart")
+	assert.Len(t, userParts, 2)
+	assert.Equal(t, "text", userParts[0].Type)
+	assert.Equal(t, "input_audio", userParts[1].Type)
 }

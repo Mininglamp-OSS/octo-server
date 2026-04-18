@@ -41,6 +41,7 @@ type IService interface {
 	IUploadService
 	DownloadAndMakeCompose(uploadPath string, downloadURLs []string) (map[string]interface{}, error)
 	DownloadImage(url string, ctx context.Context) (io.ReadCloser, error)
+	PresignedPutURL(objectPath string, contentType string, expires time.Duration) (uploadURL string, downloadURL string, err error)
 }
 
 // NewService NewService
@@ -88,6 +89,18 @@ func (s *Service) DownloadURL(path string, filename string) (string, error) {
 
 func (s *Service) GetFile(path string) (io.ReadCloser, string, error) {
 	return s.uploadService.GetFile(path)
+}
+
+type PresignedPutter interface {
+	PresignedPutURL(objectPath string, contentType string, expires time.Duration) (uploadURL string, downloadURL string, err error)
+}
+
+func (s *Service) PresignedPutURL(objectPath string, contentType string, expires time.Duration) (string, string, error) {
+	putter, ok := s.uploadService.(PresignedPutter)
+	if !ok {
+		return "", "", fmt.Errorf("当前文件服务不支持预签名上传")
+	}
+	return putter.PresignedPutURL(objectPath, contentType, expires)
 }
 
 func (s *Service) DownloadImage(url string, ctx context.Context) (io.ReadCloser, error) {

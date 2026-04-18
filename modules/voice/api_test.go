@@ -143,9 +143,9 @@ func TestTranscribeAPI_WithContextText(t *testing.T) {
 		var req chatCompletionRequest
 		json.NewDecoder(r.Body).Decode(&req)
 
-		// In edit mode, prompt uses modifyPromptTemplate
-		prompt := req.Messages[0].Content[0].Text
-		assert.Contains(t, prompt, "# 已有文本")
+		// In edit mode, user message uses editInputBufferTemplate
+		prompt := getUserPromptText(t, req)
+		assert.Contains(t, prompt, "<input_buffer>")
 		assert.Contains(t, prompt, "my existing content")
 
 		resp := chatCompletionResponse{
@@ -280,12 +280,16 @@ func TestTranscribeAPI_AudioRequestFormat(t *testing.T) {
 		assert.NoError(t, err)
 
 		assert.Equal(t, "test-model", req.Model)
-		assert.Len(t, req.Messages, 1)
-		assert.Equal(t, "user", req.Messages[0].Role)
-		assert.Len(t, req.Messages[0].Content, 2)
-		assert.Equal(t, "text", req.Messages[0].Content[0].Type)
-		assert.Equal(t, "input_audio", req.Messages[0].Content[1].Type)
-		assert.NotEmpty(t, req.Messages[0].Content[1].InputAudio.Data)
+		assert.Len(t, req.Messages, 2) // system + user
+
+		assert.Equal(t, "system", req.Messages[0].Role)
+		assert.Equal(t, "user", req.Messages[1].Role)
+		userParts, ok := req.Messages[1].Content.([]contentPart)
+		assert.True(t, ok)
+		assert.Len(t, userParts, 2)
+		assert.Equal(t, "text", userParts[0].Type)
+		assert.Equal(t, "input_audio", userParts[1].Type)
+		assert.NotEmpty(t, userParts[1].InputAudio.Data)
 
 		resp := chatCompletionResponse{
 			Choices: []choice{{Message: responseMessage{Content: "OK"}}},
@@ -310,8 +314,8 @@ func TestTranscribeAPI_WithChatContext(t *testing.T) {
 		var req chatCompletionRequest
 		json.NewDecoder(r.Body).Decode(&req)
 
-		prompt := req.Messages[0].Content[0].Text
-		assert.Contains(t, prompt, "词汇参考表")
+		prompt := getUserPromptText(t, req)
+		assert.Contains(t, prompt, "<vocabulary_reference>")
 		assert.Contains(t, prompt, "Alice: 明天开会")
 
 		resp := chatCompletionResponse{
@@ -341,7 +345,7 @@ func TestTranscribeAPI_ChatContextTruncation(t *testing.T) {
 	litellmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req chatCompletionRequest
 		json.NewDecoder(r.Body).Decode(&req)
-		receivedPrompt = req.Messages[0].Content[0].Text
+		receivedPrompt = getUserPromptText(t, req)
 
 		resp := chatCompletionResponse{
 			Choices: []choice{{Message: responseMessage{Content: "OK"}}},
@@ -378,8 +382,8 @@ func TestTranscribeAPI_EmptyChatContext(t *testing.T) {
 		var req chatCompletionRequest
 		json.NewDecoder(r.Body).Decode(&req)
 
-		prompt := req.Messages[0].Content[0].Text
-		assert.NotContains(t, prompt, "词汇参考表")
+		prompt := getUserPromptText(t, req)
+		assert.NotContains(t, prompt, "vocabulary_reference")
 
 		resp := chatCompletionResponse{
 			Choices: []choice{{Message: responseMessage{Content: "plain transcription"}}},
@@ -481,7 +485,7 @@ func TestTranscribeAPI_ContextTextTruncation(t *testing.T) {
 	litellmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req chatCompletionRequest
 		json.NewDecoder(r.Body).Decode(&req)
-		receivedPrompt = req.Messages[0].Content[0].Text
+		receivedPrompt = getUserPromptText(t, req)
 
 		resp := chatCompletionResponse{
 			Choices: []choice{{Message: responseMessage{Content: "OK"}}},
@@ -763,7 +767,7 @@ func TestTranscribeAPI_RuneSafeChatContextTruncation(t *testing.T) {
 	litellmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req chatCompletionRequest
 		json.NewDecoder(r.Body).Decode(&req)
-		receivedPrompt = req.Messages[0].Content[0].Text
+		receivedPrompt = getUserPromptText(t, req)
 		resp := chatCompletionResponse{
 			Choices: []choice{{Message: responseMessage{Content: "OK"}}},
 		}

@@ -1,61 +1,37 @@
 -- +migrate Up
 
--- 0. 统一 group_category 表 collation，与数据库默认保持一致（必须在存储过程之前执行）
-ALTER TABLE `group_category` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+-- 1. 迁移群聊关联：把挂在重复默认分组下的 group_setting 指向保留的分组（MIN(id)）
+UPDATE group_setting gs
+INNER JOIN group_category gc_remove ON gs.category_id = gc_remove.category_id COLLATE utf8mb4_0900_ai_ci
+    AND gs.uid = gc_remove.uid COLLATE utf8mb4_0900_ai_ci
+    AND gc_remove.is_default = 1 AND gc_remove.status = 1
+INNER JOIN group_category gc_keep ON gc_keep.uid = gc_remove.uid
+    AND gc_keep.space_id = gc_remove.space_id
+    AND gc_keep.is_default = 1 AND gc_keep.status = 1
+    AND gc_keep.id = (
+        SELECT MIN(gc_min.id) FROM group_category gc_min
+        WHERE gc_min.uid = gc_remove.uid
+          AND gc_min.space_id = gc_remove.space_id
+          AND gc_min.is_default = 1 AND gc_min.status = 1
+    )
+SET gs.category_id = gc_keep.category_id;
 
--- 1. 清理重复的默认分组：迁移群聊关联到保留的分组，再删除多余行
-DROP PROCEDURE IF EXISTS _dedup_default_categories;
+-- 2. 软删除重复默认分组（保留每组 MIN(id)），同时清除 is_default 避免唯一索引冲突
+UPDATE group_category gc1
+INNER JOIN group_category gc2
+    ON gc1.uid = gc2.uid AND gc1.space_id = gc2.space_id
+    AND gc1.is_default = 1 AND gc2.is_default = 1
+    AND gc1.status = 1 AND gc2.status = 1
+    AND gc1.id > gc2.id
+SET gc1.status = 2, gc1.is_default = 0;
 
--- +migrate StatementBegin
-CREATE PROCEDURE _dedup_default_categories()
-BEGIN
-    -- 每个 (uid, space_id) 保留 id 最小的一条
-    CREATE TEMPORARY TABLE _keep AS
-        SELECT uid, space_id, MIN(id) AS keep_id
-        FROM group_category
-        WHERE is_default = 1 AND status = 1
-        GROUP BY uid, space_id;
-
-    -- 找出保留行的 category_id
-    CREATE TEMPORARY TABLE _keep_cat AS
-        SELECT k.uid, k.space_id, gc.category_id AS keep_category_id
-        FROM _keep k
-        INNER JOIN group_category gc ON gc.id = k.keep_id;
-
-    -- 找出要删除的行
-    CREATE TEMPORARY TABLE _remove AS
-        SELECT gc.category_id AS remove_category_id, gc.uid, gc.space_id
-        FROM group_category gc
-        INNER JOIN _keep k ON k.uid = gc.uid AND k.space_id = gc.space_id
-        WHERE gc.is_default = 1 AND gc.status = 1 AND gc.id != k.keep_id;
-
-    -- 把挂在要删除分组下的群聊迁移到保留的分组
-    UPDATE group_setting gs
-    INNER JOIN _remove r ON gs.category_id = r.remove_category_id AND gs.uid = r.uid
-    INNER JOIN _keep_cat kc ON kc.uid = r.uid AND kc.space_id = r.space_id
-    SET gs.category_id = kc.keep_category_id;
-
-    -- 标记重复行为已删除，清除 is_default 避免与后续唯一索引冲突
-    UPDATE group_category gc
-    INNER JOIN _keep k ON k.uid = gc.uid AND k.space_id = gc.space_id
-    SET gc.status = 2, gc.is_default = 0
-    WHERE gc.is_default = 1
-      AND gc.status = 1
-      AND gc.id != k.keep_id;
-
-    DROP TEMPORARY TABLE _keep;
-    DROP TEMPORARY TABLE _keep_cat;
-    DROP TEMPORARY TABLE _remove;
-END;
--- +migrate StatementEnd
-
-CALL _dedup_default_categories();
-DROP PROCEDURE IF EXISTS _dedup_default_categories;
-
--- 2. is_default=0 改为 NULL，为唯一索引让路（MySQL 唯一索引不约束 NULL）
+-- 3. is_default 改为 nullable：非默认分组存 NULL（MySQL 唯一索引不约束 NULL）
 ALTER TABLE `group_category` MODIFY COLUMN `is_default` TINYINT DEFAULT NULL COMMENT '1=默认未分类分组（不可删除/重命名），NULL=普通分组';
 
 UPDATE `group_category` SET `is_default` = NULL WHERE `is_default` = 0;
 
--- 3. 添加唯一索引：同一用户同一 Space 最多一个 is_default=1
+-- 4. 添加唯一索引：同一用户同一 Space 最多一个 is_default=1
 ALTER TABLE `group_category` ADD UNIQUE KEY `uk_uid_space_is_default` (`uid`, `space_id`, `is_default`);
+
+-- 5. 统一 group_category 表 collation，与数据库默认及其他表保持一致
+ALTER TABLE `group_category` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;

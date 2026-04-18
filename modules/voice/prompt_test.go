@@ -7,180 +7,197 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestBuildPrompt_NoContext(t *testing.T) {
-	prompt := buildPrompt("", "")
-	assert.Equal(t, transcribePrompt, prompt)
-	assert.Contains(t, prompt, "将音频中的人类语音转为文字")
-	assert.NotContains(t, prompt, "# 已有文本")
+// --- buildSystemMessage tests ---
+
+func TestBuildSystemMessage_ReturnsSystemPrompt(t *testing.T) {
+	msg := buildSystemMessage()
+	assert.Equal(t, activePrompts.System, msg)
+	assert.Contains(t, msg, "智能语音转写器")
+	assert.Contains(t, msg, "[NO_SPEECH]")
+	assert.Contains(t, msg, "vocabulary_reference")
+	assert.Contains(t, msg, "input_buffer")
 }
 
-func TestBuildPrompt_WithContext(t *testing.T) {
-	contextText := "Hello, this is existing text."
-	prompt := buildPrompt(contextText, "")
-
-	assert.Contains(t, prompt, "# 已有文本")
-	assert.Contains(t, prompt, contextText)
-	assert.Contains(t, prompt, "编辑指令")
-	assert.NotEqual(t, transcribePrompt, prompt)
+func TestBuildSystemMessage_ContainsAllRules(t *testing.T) {
+	msg := buildSystemMessage()
+	assert.Contains(t, msg, "无语音判定")
+	assert.Contains(t, msg, "禁止猜测")
+	assert.Contains(t, msg, "语言润色")
+	assert.Contains(t, msg, "数据标签说明")
+	assert.Contains(t, msg, "编辑指令识别")
+	assert.Contains(t, msg, "追加新内容")
+	assert.Contains(t, msg, "词汇参考表使用规则")
+	assert.Contains(t, msg, "输出格式")
 }
 
-func TestBuildPrompt_ContextTextEmbedded(t *testing.T) {
+func TestBuildSystemMessage_ContainsExamples(t *testing.T) {
+	msg := buildSystemMessage()
+	assert.Contains(t, msg, "大背头")
+	assert.Contains(t, msg, "托马斯")
+	assert.Contains(t, msg, "嗯，好的，我知道了")
+}
+
+// --- buildUserMessage: default/transcribe mode ---
+
+func TestBuildUserMessage_Default_NoContext(t *testing.T) {
+	msg := buildUserMessage("", "", "")
+	assert.Equal(t, taskTranscribe, msg)
+	assert.Contains(t, msg, "请转写音频中的语音")
+	assert.NotContains(t, msg, "vocabulary_reference")
+	assert.NotContains(t, msg, "input_buffer")
+}
+
+func TestBuildUserMessage_Default_WithVocab(t *testing.T) {
+	msg := buildUserMessage("", "", "张三、李四")
+	assert.Contains(t, msg, "<vocabulary_reference>")
+	assert.Contains(t, msg, "张三、李四")
+	assert.Contains(t, msg, "不要输出纠错上下文中的任何内容")
+	assert.NotContains(t, msg, "input_buffer")
+}
+
+// --- buildUserMessage: edit mode ---
+
+func TestBuildUserMessage_Edit_NoContext(t *testing.T) {
+	msg := buildUserMessage("edit", "", "")
+	assert.Equal(t, taskTranscribe, msg)
+}
+
+func TestBuildUserMessage_Edit_WithContextText(t *testing.T) {
+	msg := buildUserMessage("edit", "existing text", "")
+	assert.Contains(t, msg, "<input_buffer>")
+	assert.Contains(t, msg, "existing text")
+	assert.Contains(t, msg, "根据音频中的语音对其进行处理")
+	assert.Contains(t, msg, "编辑指令")
+	assert.NotContains(t, msg, "vocabulary_reference")
+}
+
+func TestBuildUserMessage_Edit_WithVocabOnly(t *testing.T) {
+	msg := buildUserMessage("edit", "", "Alice: 测试")
+	assert.Contains(t, msg, "<vocabulary_reference>")
+	assert.Contains(t, msg, "Alice: 测试")
+	assert.Contains(t, msg, "不要输出纠错上下文中的任何内容")
+	assert.NotContains(t, msg, "input_buffer")
+}
+
+func TestBuildUserMessage_Edit_WithBothContexts(t *testing.T) {
+	msg := buildUserMessage("edit", "existing draft", "Alice: 专有名词ABC")
+
+	assert.Contains(t, msg, "<vocabulary_reference>")
+	assert.Contains(t, msg, "Alice: 专有名词ABC")
+	assert.Contains(t, msg, "<input_buffer>")
+	assert.Contains(t, msg, "existing draft")
+	assert.Contains(t, msg, "编辑指令")
+
+	// vocabulary_reference should appear before input_buffer
+	vocabIdx := strings.Index(msg, "<vocabulary_reference>")
+	bufferIdx := strings.Index(msg, "<input_buffer>")
+	assert.True(t, vocabIdx < bufferIdx, "vocabulary_reference should appear before input_buffer")
+
+	// task instruction at the end
+	taskIdx := strings.Index(msg, "请根据音频中的语音处理上述文本")
+	assert.True(t, taskIdx > bufferIdx, "task instruction should appear after input_buffer")
+}
+
+// --- buildUserMessage: append mode ---
+
+func TestBuildUserMessage_Append_NoContext(t *testing.T) {
+	msg := buildUserMessage("append", "", "")
+	assert.Equal(t, taskTranscribe, msg)
+}
+
+func TestBuildUserMessage_Append_WithContextText_NoVocab(t *testing.T) {
+	msg := buildUserMessage("append", "已有的文本内容", "")
+	assert.Contains(t, msg, "<input_buffer>")
+	assert.Contains(t, msg, "已有的文本内容")
+	assert.Contains(t, msg, "辅助你理解当前语境")
+	assert.Contains(t, msg, "只输出音频中新听到的内容")
+	assert.NotContains(t, msg, "vocabulary_reference")
+	assert.NotContains(t, msg, "编辑指令")
+}
+
+func TestBuildUserMessage_Append_WithVocabOnly(t *testing.T) {
+	msg := buildUserMessage("append", "", "Alice: 聊天内容")
+	assert.Contains(t, msg, "<vocabulary_reference>")
+	assert.Contains(t, msg, "Alice: 聊天内容")
+	assert.NotContains(t, msg, "input_buffer")
+}
+
+func TestBuildUserMessage_Append_WithBothContexts(t *testing.T) {
+	msg := buildUserMessage("append", "原有文本", "Alice: 聊天")
+
+	assert.Contains(t, msg, "<vocabulary_reference>")
+	assert.Contains(t, msg, "Alice: 聊天")
+	assert.Contains(t, msg, "<input_buffer>")
+	assert.Contains(t, msg, "原有文本")
+	assert.Contains(t, msg, "配合vocabulary_reference纠正专有名词拼写")
+	assert.Contains(t, msg, "只输出音频中新听到的内容")
+
+	// vocabulary_reference before input_buffer
+	vocabIdx := strings.Index(msg, "<vocabulary_reference>")
+	bufferIdx := strings.Index(msg, "<input_buffer>")
+	assert.True(t, vocabIdx < bufferIdx, "vocabulary_reference should appear before input_buffer")
+
+	// task instruction at the end
+	taskIdx := strings.Index(msg, "只输出音频中新听到的内容")
+	assert.True(t, taskIdx > bufferIdx, "task instruction should appear after input_buffer")
+}
+
+func TestBuildUserMessage_Append_DoesNotContainEditInstructions(t *testing.T) {
+	msg := buildUserMessage("append", "some text", "")
+	assert.NotContains(t, msg, "编辑指令")
+	assert.NotContains(t, msg, "删掉")
+	assert.NotContains(t, msg, "改成")
+}
+
+// --- XML tag structure tests ---
+
+func TestBuildUserMessage_VocabTag_ContainsOnlyData(t *testing.T) {
+	chatCtx := "WuKongIM、唐僧叨叨"
+	msg := buildUserMessage("edit", "", chatCtx)
+
+	// Extract content between vocabulary_reference tags
+	start := strings.Index(msg, "<vocabulary_reference>") + len("<vocabulary_reference>")
+	end := strings.Index(msg, "</vocabulary_reference>")
+	tagContent := strings.TrimSpace(msg[start:end])
+	assert.Equal(t, chatCtx, tagContent, "tag should contain only the vocabulary data")
+}
+
+func TestBuildUserMessage_InputBufferTag_ContainsOnlyData(t *testing.T) {
 	contextText := "Line 1\nLine 2\nLine 3"
-	prompt := buildPrompt(contextText, "")
+	msg := buildUserMessage("edit", contextText, "")
 
-	// Context text should appear between the --- delimiters
-	parts := strings.Split(prompt, "---")
-	assert.True(t, len(parts) >= 3, "prompt should contain --- delimiters")
-	assert.Contains(t, parts[1], contextText)
+	// Extract content between input_buffer tags
+	start := strings.Index(msg, "<input_buffer>") + len("<input_buffer>")
+	end := strings.Index(msg, "</input_buffer>")
+	tagContent := strings.TrimSpace(msg[start:end])
+	assert.Equal(t, contextText, tagContent, "tag should contain only the context data")
 }
 
-func TestBuildPrompt_WithChatContext_TranscribeMode(t *testing.T) {
-	chatCtx := "Alice: 你好\nBob: 你好啊"
-	prompt := buildPrompt("", chatCtx)
+// --- Append vs Edit template difference ---
 
-	assert.Contains(t, prompt, "词汇参考表")
-	assert.Contains(t, prompt, chatCtx)
-	assert.Contains(t, prompt, "将音频中的人类语音转为文字")
-	assert.NotContains(t, prompt, "# 已有文本")
+func TestBuildUserMessage_AppendWithVocab_UsesAppendTemplate(t *testing.T) {
+	msg := buildUserMessage("append", "text", "vocab")
+	assert.Contains(t, msg, "配合vocabulary_reference纠正专有名词拼写")
 }
 
-func TestBuildPrompt_WithChatContext_ModifyMode(t *testing.T) {
-	chatCtx := "Alice: 会议在周五\nBob: 收到"
-	contextText := "existing text"
-	prompt := buildPrompt(contextText, chatCtx)
-
-	assert.Contains(t, prompt, "词汇参考表")
-	assert.Contains(t, prompt, chatCtx)
-	assert.Contains(t, prompt, "# 已有文本")
-	assert.Contains(t, prompt, contextText)
-	assert.Contains(t, prompt, "编辑指令")
-
-	// Chat context should appear AFTER the main prompt
-	chatCtxIdx := strings.Index(prompt, chatCtx)
-	mainPromptIdx := strings.Index(prompt, "# 已有文本")
-	assert.True(t, chatCtxIdx > mainPromptIdx, "chat context should follow the main prompt")
+func TestBuildUserMessage_AppendNoVocab_UsesNoVocabTemplate(t *testing.T) {
+	msg := buildUserMessage("append", "text", "")
+	assert.NotContains(t, msg, "配合vocabulary_reference")
+	assert.Contains(t, msg, "辅助你理解当前语境")
 }
 
-func TestBuildPrompt_EmptyChatContext(t *testing.T) {
-	prompt := buildPrompt("", "")
-	assert.NotContains(t, prompt, "词汇参考表")
-	assert.Equal(t, transcribePrompt, prompt)
+func TestBuildUserMessage_Edit_UsesEditTemplate(t *testing.T) {
+	msg := buildUserMessage("edit", "text", "")
+	assert.Contains(t, msg, "根据音频中的语音对其进行处理")
 }
 
-// --- buildAppendPrompt tests ---
+// --- IsNoSpeech tests ---
 
-func TestBuildAppendPrompt_NoContext(t *testing.T) {
-	prompt := buildAppendPrompt("", "")
-	assert.Equal(t, transcribePrompt, prompt)
-}
-
-func TestBuildAppendPrompt_WithContextText(t *testing.T) {
-	prompt := buildAppendPrompt("已有的文本内容", "")
-	assert.Contains(t, prompt, "已有的文本内容")
-	assert.Contains(t, prompt, "辅助理解语境和专有名词纠错")
-	assert.Contains(t, prompt, "将音频中的人类语音转为文字") // transcribePrompt is appended
-	assert.NotContains(t, prompt, "编辑指令")               // no edit instructions
-}
-
-func TestBuildAppendPrompt_WithChatContext(t *testing.T) {
-	prompt := buildAppendPrompt("", "Alice: 聊天内容")
-	assert.Contains(t, prompt, "词汇参考表")
-	assert.Contains(t, prompt, "Alice: 聊天内容")
-	assert.Contains(t, prompt, "将音频中的人类语音转为文字")
-}
-
-func TestBuildAppendPrompt_WithBothContexts(t *testing.T) {
-	prompt := buildAppendPrompt("原有文本", "Alice: 聊天")
-
-	assert.Contains(t, prompt, "原有文本")
-	assert.Contains(t, prompt, "辅助理解语境和专有名词纠错")
-	assert.Contains(t, prompt, "Alice: 聊天")
-	assert.Contains(t, prompt, "词汇参考表")
-
-	// Chat context should follow the append prompt
-	chatIdx := strings.Index(prompt, "Alice: 聊天")
-	appendIdx := strings.Index(prompt, "辅助理解语境和专有名词纠错")
-	assert.True(t, chatIdx > appendIdx, "chat context should follow append prompt")
-}
-
-func TestBuildAppendPrompt_DoesNotContainEditInstructions(t *testing.T) {
-	prompt := buildAppendPrompt("some text", "")
-	assert.NotContains(t, prompt, "编辑指令")
-	assert.NotContains(t, prompt, "删掉")
-	assert.NotContains(t, prompt, "改成")
-}
-
-// --- New tests for chat context position fix ---
-
-func TestBuildPrompt_ChatContextPosition(t *testing.T) {
-	chatCtx := "Alice: 测试内容"
-	prompt := buildPrompt("", chatCtx)
-
-	// chatContext must appear AFTER transcribePrompt
-	transcribeIdx := strings.Index(prompt, "你是语音转写器")
-	chatCtxIdx := strings.Index(prompt, chatCtx)
-	assert.True(t, chatCtxIdx > transcribeIdx, "chatContext should appear after transcribePrompt")
-}
-
-func TestBuildAppendPrompt_ChatContextPosition(t *testing.T) {
-	chatCtx := "Bob: 测试聊天"
-	prompt := buildAppendPrompt("", chatCtx)
-
-	// chatContext must appear AFTER transcribePrompt
-	transcribeIdx := strings.Index(prompt, "你是语音转写器")
-	chatCtxIdx := strings.Index(prompt, chatCtx)
-	assert.True(t, chatCtxIdx > transcribeIdx, "chatContext should appear after transcribePrompt in append mode")
-}
-
-func TestBuildAppendPrompt_ChatContextAfterTranscribePrompt(t *testing.T) {
-	contextText := "已有的输入内容"
-	chatCtx := "Alice: 专有名词XYZ"
-	prompt := buildAppendPrompt(contextText, chatCtx)
-
-	// The appendContextPromptTemplate embeds transcribePrompt which starts with "你是语音转写器"
-	transcribeIdx := strings.Index(prompt, "你是语音转写器")
-	assert.True(t, transcribeIdx >= 0, "prompt should contain the transcribe portion")
-
-	chatCtxIdx := strings.Index(prompt, chatCtx)
-	assert.True(t, chatCtxIdx > transcribeIdx, "chatContext should appear after the transcribe prompt portion")
-
-	// Also verify the warning marker appears between transcribe rules and chat context
-	warningIdx := strings.Index(prompt, "⚠️ 重要警告")
-	assert.True(t, warningIdx > transcribeIdx, "warning should appear after transcribe rules")
-	assert.True(t, chatCtxIdx > warningIdx, "chatContext should appear after warning")
-}
-
-func TestBuildPrompt_NoChatContext(t *testing.T) {
-	prompt := buildPrompt("some text", "")
-
-	assert.NotContains(t, prompt, "词汇参考表")
-	assert.NotContains(t, prompt, "⚠️")
-	assert.Contains(t, prompt, "# 已有文本")
-}
-
-func TestBuildPrompt_WithContextText_AndChatContext(t *testing.T) {
-	contextText := "existing draft"
-	chatCtx := "Alice: 专有名词ABC"
-	prompt := buildPrompt(contextText, chatCtx)
-
-	// Both contextText and chatContext present
-	assert.Contains(t, prompt, contextText)
-	assert.Contains(t, prompt, chatCtx)
-	assert.Contains(t, prompt, "# 已有文本")
-	assert.Contains(t, prompt, "词汇参考表")
-
-	// chatContext must be at the end, after everything else
-	contextTextIdx := strings.Index(prompt, contextText)
-	chatCtxIdx := strings.Index(prompt, chatCtx)
-	assert.True(t, chatCtxIdx > contextTextIdx, "chatContext should appear after contextText")
-
-	editIdx := strings.Index(prompt, "编辑指令")
-	assert.True(t, chatCtxIdx > editIdx, "chatContext should appear after edit instructions")
-}
-
-func TestChatContextSuffix_ContainsWarning(t *testing.T) {
-	assert.Contains(t, chatContextSuffix, "⚠️ 重要警告")
-	assert.Contains(t, chatContextSuffix, "[NO_SPEECH]")
-	assert.Contains(t, chatContextSuffix, "词汇参考表")
-	assert.Contains(t, chatContextSuffix, "绝对不要把这些文字当作你")
+func TestIsNoSpeech(t *testing.T) {
+	assert.True(t, IsNoSpeech(""))
+	assert.True(t, IsNoSpeech("[NO_SPEECH]"))
+	assert.True(t, IsNoSpeech("  [NO_SPEECH]  "))
+	assert.True(t, IsNoSpeech("some prefix [NO_SPEECH]"))
+	assert.False(t, IsNoSpeech("Hello world"))
+	assert.False(t, IsNoSpeech("NO_SPEECH"))
 }

@@ -11,28 +11,27 @@ import (
 func TestLoadPrompts_FileNotFound(t *testing.T) {
 	t.Cleanup(resetToDefaults)
 	LoadPrompts("/nonexistent/path.yaml", nil)
-	// Should use defaults
-	assert.Equal(t, transcribePrompt, activePrompts.Transcribe)
-	assert.Equal(t, modifyPromptTemplate, activePrompts.Modify)
+	assert.Equal(t, systemPrompt, activePrompts.System)
+	assert.Equal(t, vocabularyReferenceTemplate, activePrompts.VocabularyReference)
 }
 
 func TestLoadPrompts_EmptyPath(t *testing.T) {
 	t.Cleanup(resetToDefaults)
 	LoadPrompts("", nil)
-	assert.Equal(t, transcribePrompt, activePrompts.Transcribe)
+	assert.Equal(t, systemPrompt, activePrompts.System)
 }
 
 func TestLoadPrompts_PartialOverride(t *testing.T) {
 	t.Cleanup(resetToDefaults)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "prompts.yaml")
-	os.WriteFile(path, []byte(`transcribe: "custom transcribe prompt"`), 0644)
+	os.WriteFile(path, []byte(`system: "custom system prompt"`), 0644)
 
 	LoadPrompts(path, nil)
-	assert.Equal(t, "custom transcribe prompt", activePrompts.Transcribe)
+	assert.Equal(t, "custom system prompt", activePrompts.System)
 	// Other fields should remain as defaults
-	assert.Equal(t, modifyPromptTemplate, activePrompts.Modify)
-	assert.Equal(t, chatContextSuffix, activePrompts.ChatContextSuffix)
+	assert.Equal(t, vocabularyReferenceTemplate, activePrompts.VocabularyReference)
+	assert.Equal(t, editInputBufferTemplate, activePrompts.EditInputBuffer)
 }
 
 func TestLoadPrompts_FullOverride(t *testing.T) {
@@ -40,18 +39,28 @@ func TestLoadPrompts_FullOverride(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "prompts.yaml")
 	content := `
-transcribe: "custom transcribe"
-modify: "custom modify %s"
-append_context: "custom append %s"
-chat_context_suffix: "custom suffix %s"
+system: "custom system"
+vocabulary_reference: "custom vocab %s"
+append_input_buffer: "custom append %s"
+append_input_buffer_no_vocab: "custom append nv %s"
+edit_input_buffer: "custom edit %s"
+task_transcribe: "custom task transcribe"
+task_transcribe_with_vocab: "custom task transcribe vocab"
+task_append: "custom task append"
+task_edit: "custom task edit"
 `
 	os.WriteFile(path, []byte(content), 0644)
 
 	LoadPrompts(path, nil)
-	assert.Equal(t, "custom transcribe", activePrompts.Transcribe)
-	assert.Equal(t, "custom modify %s", activePrompts.Modify)
-	assert.Equal(t, "custom append %s", activePrompts.AppendContext)
-	assert.Equal(t, "custom suffix %s", activePrompts.ChatContextSuffix)
+	assert.Equal(t, "custom system", activePrompts.System)
+	assert.Equal(t, "custom vocab %s", activePrompts.VocabularyReference)
+	assert.Equal(t, "custom append %s", activePrompts.AppendInputBuffer)
+	assert.Equal(t, "custom append nv %s", activePrompts.AppendInputBufferNoVocab)
+	assert.Equal(t, "custom edit %s", activePrompts.EditInputBuffer)
+	assert.Equal(t, "custom task transcribe", activePrompts.TaskTranscribe)
+	assert.Equal(t, "custom task transcribe vocab", activePrompts.TaskTranscribeWithVocab)
+	assert.Equal(t, "custom task append", activePrompts.TaskAppend)
+	assert.Equal(t, "custom task edit", activePrompts.TaskEdit)
 }
 
 func TestLoadPrompts_InvalidYAML(t *testing.T) {
@@ -61,8 +70,7 @@ func TestLoadPrompts_InvalidYAML(t *testing.T) {
 	os.WriteFile(path, []byte(`{{{invalid`), 0644)
 
 	LoadPrompts(path, nil)
-	// Should fall back to defaults
-	assert.Equal(t, transcribePrompt, activePrompts.Transcribe)
+	assert.Equal(t, systemPrompt, activePrompts.System)
 }
 
 func TestLoadPrompts_EmptyFields(t *testing.T) {
@@ -70,23 +78,23 @@ func TestLoadPrompts_EmptyFields(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "prompts.yaml")
 	content := `
-transcribe: ""
-modify: "custom modify %s"
+system: ""
+vocabulary_reference: "custom vocab %s"
 `
 	os.WriteFile(path, []byte(content), 0644)
 
 	LoadPrompts(path, nil)
-	// Empty transcribe should keep default
-	assert.Equal(t, transcribePrompt, activePrompts.Transcribe)
-	// Non-empty modify should override
-	assert.Equal(t, "custom modify %s", activePrompts.Modify)
+	// Empty system should keep default
+	assert.Equal(t, systemPrompt, activePrompts.System)
+	// Non-empty vocabulary_reference should override
+	assert.Equal(t, "custom vocab %s", activePrompts.VocabularyReference)
 }
 
 func TestLoadPrompts_MultilineBlockScalar(t *testing.T) {
 	t.Cleanup(resetToDefaults)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "prompts.yaml")
-	content := `transcribe: |
+	content := `system: |
   Line one.
   Line two.
   Line three.
@@ -94,7 +102,7 @@ func TestLoadPrompts_MultilineBlockScalar(t *testing.T) {
 	os.WriteFile(path, []byte(content), 0644)
 
 	LoadPrompts(path, nil)
-	assert.Equal(t, "Line one.\nLine two.\nLine three.", activePrompts.Transcribe)
+	assert.Equal(t, "Line one.\nLine two.\nLine three.", activePrompts.System)
 }
 
 func TestLoadPrompts_WhitespaceOnlyField(t *testing.T) {
@@ -102,15 +110,15 @@ func TestLoadPrompts_WhitespaceOnlyField(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "prompts.yaml")
 	content := `
-transcribe: "   "
-modify: "custom modify %s"
+system: "   "
+vocabulary_reference: "custom vocab %s"
 `
 	os.WriteFile(path, []byte(content), 0644)
 
 	LoadPrompts(path, nil)
-	// Whitespace-only transcribe should keep default
-	assert.Equal(t, transcribePrompt, activePrompts.Transcribe)
-	assert.Equal(t, "custom modify %s", activePrompts.Modify)
+	// Whitespace-only system should keep default
+	assert.Equal(t, systemPrompt, activePrompts.System)
+	assert.Equal(t, "custom vocab %s", activePrompts.VocabularyReference)
 }
 
 func TestLoadPrompts_InvalidPlaceholderCount(t *testing.T) {
@@ -118,19 +126,18 @@ func TestLoadPrompts_InvalidPlaceholderCount(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "prompts.yaml")
 
-	// modify with zero %s, append_context with two %s, chat_context_suffix with zero %s
 	content := `
-modify: "no placeholder here"
-append_context: "two %s placeholders %s"
-chat_context_suffix: "missing placeholder"
+vocabulary_reference: "no placeholder here"
+append_input_buffer: "two %s placeholders %s"
+edit_input_buffer: "missing placeholder"
 `
 	os.WriteFile(path, []byte(content), 0644)
 
 	LoadPrompts(path, nil)
-	// All three should fall back to defaults due to wrong %s count
-	assert.Equal(t, modifyPromptTemplate, activePrompts.Modify)
-	assert.Equal(t, appendContextHint, activePrompts.AppendContext)
-	assert.Equal(t, chatContextSuffix, activePrompts.ChatContextSuffix)
+	// All should fall back to defaults due to wrong %s count
+	assert.Equal(t, vocabularyReferenceTemplate, activePrompts.VocabularyReference)
+	assert.Equal(t, appendInputBufferTemplate, activePrompts.AppendInputBuffer)
+	assert.Equal(t, editInputBufferTemplate, activePrompts.EditInputBuffer)
 }
 
 func TestLoadPrompts_ValidPlaceholder(t *testing.T) {
@@ -138,14 +145,52 @@ func TestLoadPrompts_ValidPlaceholder(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "prompts.yaml")
 	content := `
-modify: "edit this: %s done"
-append_context: "context: %s end"
-chat_context_suffix: "vocab %s list"
+vocabulary_reference: "vocab %s list"
+append_input_buffer: "append %s end"
+append_input_buffer_no_vocab: "append nv %s end"
+edit_input_buffer: "edit %s done"
 `
 	os.WriteFile(path, []byte(content), 0644)
 
 	LoadPrompts(path, nil)
-	assert.Equal(t, "edit this: %s done", activePrompts.Modify)
-	assert.Equal(t, "context: %s end", activePrompts.AppendContext)
-	assert.Equal(t, "vocab %s list", activePrompts.ChatContextSuffix)
+	assert.Equal(t, "vocab %s list", activePrompts.VocabularyReference)
+	assert.Equal(t, "append %s end", activePrompts.AppendInputBuffer)
+	assert.Equal(t, "append nv %s end", activePrompts.AppendInputBufferNoVocab)
+	assert.Equal(t, "edit %s done", activePrompts.EditInputBuffer)
+}
+
+func TestLoadPrompts_LegacyFieldsIgnored(t *testing.T) {
+	t.Cleanup(resetToDefaults)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "prompts.yaml")
+	content := `
+transcribe: "old transcribe prompt"
+modify: "old modify %s"
+append_context: "old append %s"
+chat_context_suffix: "old suffix %s"
+system: "new system prompt"
+`
+	os.WriteFile(path, []byte(content), 0644)
+
+	LoadPrompts(path, nil)
+	// New field should be applied
+	assert.Equal(t, "new system prompt", activePrompts.System)
+	// Legacy fields should not affect active prompts
+	assert.Equal(t, vocabularyReferenceTemplate, activePrompts.VocabularyReference)
+}
+
+func TestLoadPrompts_TaskFieldsNoPlaceholderRequired(t *testing.T) {
+	t.Cleanup(resetToDefaults)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "prompts.yaml")
+	content := `
+task_transcribe: "transcribe task"
+task_edit: "edit task with special %s chars"
+`
+	os.WriteFile(path, []byte(content), 0644)
+
+	LoadPrompts(path, nil)
+	// Task fields should accept any content (no %s validation)
+	assert.Equal(t, "transcribe task", activePrompts.TaskTranscribe)
+	assert.Equal(t, "edit task with special %s chars", activePrompts.TaskEdit)
 }

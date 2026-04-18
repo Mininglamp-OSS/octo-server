@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"path"
@@ -143,6 +144,7 @@ func (bf *BotFather) Route(r *wkhttp.WKHttp) {
 		botAPI.POST("/upload", bf.botUploadFile) // 兼容旧路径 (/v1/bot/upload)
 		botAPI.GET("/file/download/*path", bf.botFileDownload)
 		botAPI.GET("/upload/credentials", bf.botUploadCredentials) // STS 临时密钥签发
+		botAPI.GET("/upload/presigned", bf.botUploadPresigned)    // 预签名上传 URL 签发
 		botAPI.POST("/message/edit", bf.botMessageEdit)            // Bot 编辑消息
 		botAPI.GET("/user/info", bf.getUserInfo)                    // 查询用户基本信息 (#852)
 		// Voice context API
@@ -1331,6 +1333,12 @@ func (bf *BotFather) botUploadCredentials(c *wkhttp.Context) {
 		return
 	}
 
+	ext := strings.ToLower(filepath.Ext(filename))
+	if ext == "" || file.IsBlockedExtension(ext) || !file.IsAllowedExtension(ext) {
+		c.ResponseError(errors.New("不支持的文件类型"))
+		return
+	}
+
 	cosConfig := bf.ctx.GetConfig().COS
 	if cosConfig.SecretID == "" || cosConfig.SecretKey == "" || cosConfig.Bucket == "" {
 		bf.Error("COS 配置不完整")
@@ -1338,7 +1346,6 @@ func (bf *BotFather) botUploadCredentials(c *wkhttp.Context) {
 		return
 	}
 
-	// 生成对象 key：{prefix}/chat/{timestamp}/{random}_{filename}
 	prefix := strings.TrimSpace(cosConfig.Prefix)
 	objectPath := fmt.Sprintf("chat/%d/%s_%s", time.Now().Unix(), util.GenerUUID(), url.PathEscape(filename))
 	var key string
@@ -1351,7 +1358,6 @@ func (bf *BotFather) botUploadCredentials(c *wkhttp.Context) {
 	bucket := cosConfig.Bucket
 	region := cosConfig.Region
 
-	// 从 bucket 名中提取 appId（格式：bucketname-appid）
 	appId := ""
 	if idx := strings.LastIndex(bucket, "-"); idx > 0 {
 		appId = bucket[idx+1:]
@@ -1362,7 +1368,6 @@ func (bf *BotFather) botUploadCredentials(c *wkhttp.Context) {
 		return
 	}
 
-	// 使用 STS SDK 生成临时密钥
 	client := sts.NewClient(cosConfig.SecretID, cosConfig.SecretKey, nil)
 	opt := &sts.CredentialOptions{
 		DurationSeconds: 1800,
@@ -1370,11 +1375,9 @@ func (bf *BotFather) botUploadCredentials(c *wkhttp.Context) {
 		Policy: &sts.CredentialPolicy{
 			Statement: []sts.CredentialPolicyStatement{
 				{
-					Action: []string{"cos:PutObject"},
-					Effect: "allow",
-					Resource: []string{
-						fmt.Sprintf("qcs::cos:%s:uid/%s:%s/%s", region, appId, bucket, key),
-					},
+					Action:   []string{"cos:PutObject"},
+					Effect:   "allow",
+					Resource: []string{fmt.Sprintf("qcs::cos:%s:uid/%s:%s/%s", region, appId, bucket, key)},
 				},
 			},
 		},
@@ -1399,6 +1402,45 @@ func (bf *BotFather) botUploadCredentials(c *wkhttp.Context) {
 		"startTime":   res.StartTime,
 		"expiredTime": res.ExpiredTime,
 		"cdnBaseUrl":  cosConfig.BucketURL,
+	})
+}
+
+// botUploadPresigned 签发预签名 PUT URL，供客户端直传文件（/v1/bot/upload/presigned）
+func (bf *BotFather) botUploadPresigned(c *wkhttp.Context) {
+	filename := c.Query("filename")
+	if strings.TrimSpace(filename) == "" {
+		c.ResponseError(errors.New("filename 不能为空"))
+		return
+	}
+
+	ext := strings.ToLower(filepath.Ext(filename))
+	if ext == "" || file.IsBlockedExtension(ext) || !file.IsAllowedExtension(ext) {
+		c.ResponseError(errors.New("不支持的文件类型"))
+		return
+	}
+
+	objectPath := fmt.Sprintf("chat/%d/%s_%s", time.Now().Unix(), util.GenerUUID(), url.PathEscape(filename))
+	contentType := mime.TypeByExtension(ext)
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+
+	expiry := 30 * time.Minute
+	uploadURL, downloadURL, err := bf.fileService.PresignedPutURL(objectPath, contentType, expiry)
+	if err != nil {
+		bf.Error("生成预签名上传URL失败", zap.Error(err))
+		c.ResponseError(errors.New("生成上传URL失败"))
+		return
+	}
+
+	c.Response(gin.H{
+		"method":      "PUT",
+		"uploadUrl":   uploadURL,
+		"downloadUrl": downloadURL,
+		"contentType": contentType,
+		"key":         objectPath,
+		"expiresIn":   int(expiry.Seconds()),
+		"expiredTime": time.Now().Add(expiry).Unix(),
 	})
 }
 

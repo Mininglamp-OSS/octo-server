@@ -120,6 +120,43 @@ func (sc *ServiceCOS) GetFile(ph string) (io.ReadCloser, string, error) {
 	return obj, stat.ContentType, nil
 }
 
+// PresignedPutURL 生成预签名 PUT URL，用于客户端直传 COS。
+// 如果配置了 BucketURL（自定义域名），会将预签名 URL 的 Host 替换为自定义域名，
+// 避免客户端网络屏蔽云厂商域名。
+func (sc *ServiceCOS) PresignedPutURL(objectPath string, contentType string, expires time.Duration) (uploadURL string, downloadURL string, err error) {
+	cosConfig := sc.ctx.GetConfig().COS
+	client, err := sc.getClient()
+	if err != nil {
+		return "", "", err
+	}
+
+	key := sc.withPrefix(objectPath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	presigned, err := client.PresignedPutObject(ctx, cosConfig.Bucket, key, expires)
+	if err != nil {
+		return "", "", fmt.Errorf("生成预签名URL失败: %w", err)
+	}
+
+	if customBase := strings.TrimSpace(cosConfig.BucketURL); customBase != "" {
+		parsed, parseErr := url.Parse(strings.TrimRight(customBase, "/"))
+		if parseErr == nil {
+			presigned.Host = parsed.Host
+			presigned.Scheme = parsed.Scheme
+		}
+	}
+
+	uploadURL = presigned.String()
+
+	downloadURL, dlErr := sc.DownloadURL(objectPath, "")
+	if dlErr != nil {
+		sc.Warn("生成下载URL失败", zap.Error(dlErr))
+	}
+	return uploadURL, downloadURL, nil
+}
+
 func (sc *ServiceCOS) DownloadURL(ph string, filename string) (string, error) {
 	cosConfig := sc.ctx.GetConfig().COS
 

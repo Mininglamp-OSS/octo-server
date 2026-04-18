@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
@@ -210,6 +211,10 @@ func (m *mockService) DownloadURL(path string, filename string) (string, error) 
 
 func (m *mockService) GetFile(path string) (io.ReadCloser, string, error) {
 	return nil, "", fmt.Errorf("not implemented")
+}
+
+func (m *mockService) PresignedPutURL(objectPath string, contentType string, expires time.Duration) (string, string, error) {
+	return "", "", fmt.Errorf("not implemented")
 }
 
 func TestMakeImageCompose_SafeTypeAssertion(t *testing.T) {
