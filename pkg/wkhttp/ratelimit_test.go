@@ -85,11 +85,42 @@ func TestRateLimitMiddleware(t *testing.T) {
 		assert.Equal(t, 200, w.Code)
 	})
 
-	t.Run("uses X-Forwarded-For rightmost IP", func(t *testing.T) {
+	t.Run("X-Real-Ip takes priority over X-Forwarded-For", func(t *testing.T) {
+		ip := getClientIP(&http.Request{
+			Header: http.Header{
+				"X-Real-Ip":       {"3.3.3.3"},
+				"X-Forwarded-For": {"spoofed, 1.1.1.1, 2.2.2.2"},
+			},
+			RemoteAddr: "127.0.0.1:80",
+		})
+		assert.Equal(t, "3.3.3.3", ip)
+	})
+
+	t.Run("falls back to X-Forwarded-For rightmost when no X-Real-Ip", func(t *testing.T) {
 		ip := getClientIP(&http.Request{
 			Header:     http.Header{"X-Forwarded-For": {"spoofed, 1.1.1.1, 2.2.2.2"}},
 			RemoteAddr: "127.0.0.1:80",
 		})
 		assert.Equal(t, "2.2.2.2", ip)
+	})
+
+	t.Run("fail-closed when no IP available", func(t *testing.T) {
+		r := gin.New()
+		r.Use(RateLimitMiddleware(1, 1))
+		r.GET("/test", func(c *gin.Context) {
+			c.JSON(200, gin.H{"ok": true})
+		})
+
+		blocked := 0
+		for i := 0; i < 5; i++ {
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest("GET", "/test", nil)
+			req.RemoteAddr = ""
+			r.ServeHTTP(w, req)
+			if w.Code == http.StatusTooManyRequests {
+				blocked++
+			}
+		}
+		assert.Greater(t, blocked, 0)
 	})
 }

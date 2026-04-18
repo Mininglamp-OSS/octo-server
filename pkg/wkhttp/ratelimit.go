@@ -18,14 +18,14 @@ type ipLimiter struct {
 }
 
 func getClientIP(r *http.Request) string {
+	if ip := strings.TrimSpace(r.Header.Get("X-Real-Ip")); ip != "" {
+		return ip
+	}
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		parts := strings.Split(xff, ",")
 		if ip := strings.TrimSpace(parts[len(parts)-1]); ip != "" {
 			return ip
 		}
-	}
-	if ip := strings.TrimSpace(r.Header.Get("X-Real-Ip")); ip != "" {
-		return ip
 	}
 	if ip, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr)); err == nil {
 		return ip
@@ -61,10 +61,10 @@ func RateLimitMiddleware(rps float64, burst int, excludePaths ...string) gin.Han
 			return
 		}
 
+		// fail-closed: 拿不到 IP 时走全局桶，不放行
 		ip := getClientIP(c.Request)
 		if ip == "" {
-			c.Next()
-			return
+			ip = "__unknown_ip__"
 		}
 
 		val, ok := limiters.Load(ip)
