@@ -1265,14 +1265,14 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 		removedVos = append(removedVos, &config.UserBaseVo{UID: m.UID, Name: name})
 	}
 
-	// 生成群头像更新事件（事务内）
+	// 生成群头像更新事件（best-effort，不阻塞踢人）
 	var groupAvatarEventID int64
 	if len(removedUIDs) > 0 {
-		groupAvatarEventID, err = beginAvatarUpdateEvent(s.ctx, s.db, req.GroupNo, nil, removedUIDs, tx)
-		if err != nil {
-			tx.Rollback()
-			s.Error("begin group avatar update event failed", zap.Error(err))
-			return nil, err
+		avatarEventID, avatarErr := beginAvatarUpdateEvent(s.ctx, s.db, req.GroupNo, nil, removedUIDs, tx)
+		if avatarErr != nil {
+			s.Error("begin group avatar update event failed", zap.Error(avatarErr))
+		} else {
+			groupAvatarEventID = avatarEventID
 		}
 	}
 
