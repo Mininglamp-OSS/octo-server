@@ -19,7 +19,7 @@ func TestOSSUpload(t *testing.T) {
 	cfg.OSS.AccessKeySecret = "xxxxxx"
 
 	service := file.NewServiceOSS(ctx)
-	_, err := service.UploadFile("chat/zdd/fjj.txt", "*", func(writer io.Writer) error {
+	_, err := service.UploadFile("chat/zdd/fjj.txt", "*", "", func(writer io.Writer) error {
 		_, err := writer.Write(bytes.NewBufferString("this is test content").Bytes())
 		return err
 	})

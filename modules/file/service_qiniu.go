@@ -29,7 +29,7 @@ func NewServiceQiniu(ctx *config.Context) *ServiceQiniu {
 }
 
 // UploadFile 上传文件
-func (s *ServiceQiniu) UploadFile(filePath string, contentType string, copyFileWriter func(io.Writer) error) (map[string]interface{}, error) {
+func (s *ServiceQiniu) UploadFile(filePath string, contentType string, contentDisposition string, copyFileWriter func(io.Writer) error) (map[string]interface{}, error) {
 
 	qiniuCfg := s.ctx.GetConfig().Qiniu
 
@@ -52,6 +52,11 @@ func (s *ServiceQiniu) UploadFile(filePath string, contentType string, copyFileW
 	ret := storage.PutRet{}
 	putExtra := storage.PutExtra{
 		Params: map[string]string{},
+	}
+
+	if contentDisposition != "" {
+		s.Warn("七牛云存储不支持在上传时设置 Content-Disposition 元数据，该值将被忽略",
+			zap.String("contentDisposition", contentDisposition))
 	}
 
 	data := bytes.NewBuffer(make([]byte, 0))

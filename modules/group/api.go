@@ -345,7 +345,7 @@ func (g *Group) avatarUpload(c *wkhttp.Context) {
 	}
 
 	groupAvatarPath := g.ctx.GetConfig().GetGroupAvatarFilePath(groupNo)
-	_, err = g.fileService.UploadFile(groupAvatarPath, "image/png", func(w io.Writer) error {
+	_, err = g.fileService.UploadFile(groupAvatarPath, "image/png", "", func(w io.Writer) error {
 		_, err := io.Copy(w, file)
 		return err
 	})

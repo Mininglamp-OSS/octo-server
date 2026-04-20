@@ -175,7 +175,7 @@ func (u *User) giteeOAuth(c *wkhttp.Context) {
 			cancel()
 			if imgReader != nil {
 				avatarID := crc32.ChecksumIEEE([]byte(uid)) % uint32(u.ctx.GetConfig().Avatar.Partition)
-				_, err = u.fileService.UploadFile(fmt.Sprintf("avatar/%d/%s.png", avatarID, uid), "image/png", func(w io.Writer) error {
+				_, err = u.fileService.UploadFile(fmt.Sprintf("avatar/%d/%s.png", avatarID, uid), "image/png", "", func(w io.Writer) error {
 					_, err := io.Copy(w, imgReader)
 					return err
 				})

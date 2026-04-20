@@ -61,7 +61,7 @@ func (sc *ServiceCOS) getClient() (*minio.Client, error) {
 }
 
 // UploadFile 上传文件到腾讯云COS
-func (sc *ServiceCOS) UploadFile(filePath string, contentType string, copyFileWriter func(io.Writer) error) (map[string]interface{}, error) {
+func (sc *ServiceCOS) UploadFile(filePath string, contentType string, contentDisposition string, copyFileWriter func(io.Writer) error) (map[string]interface{}, error) {
 	buff := bytes.NewBuffer(make([]byte, 0))
 	err := copyFileWriter(buff)
 	if err != nil {
@@ -79,11 +79,16 @@ func (sc *ServiceCOS) UploadFile(filePath string, contentType string, copyFileWr
 	// COS 单 bucket 模式：保留完整路径（含 chat/ 等原始 bucket 名），用 prefix 区分环境
 	fileName := sc.withPrefix(filePath)
 
-	ctx := context.Background()
-	n, err := client.PutObject(ctx, bucketName, fileName, buff, int64(buff.Len()), minio.PutObjectOptions{
+	opts := minio.PutObjectOptions{
 		ContentType: contentType,
 		PartSize:    10 * 1024 * 1024,
-	})
+	}
+	if contentDisposition != "" {
+		opts.ContentDisposition = contentDisposition
+	}
+
+	ctx := context.Background()
+	n, err := client.PutObject(ctx, bucketName, fileName, buff, int64(buff.Len()), opts)
 	if err != nil {
 		sc.Error("上传文件到COS失败", zap.Error(err))
 		return map[string]interface{}{
@@ -123,7 +128,7 @@ func (sc *ServiceCOS) GetFile(ph string) (io.ReadCloser, string, error) {
 // PresignedPutURL 生成预签名 PUT URL，用于客户端直传 COS。
 // 如果配置了 BucketURL（自定义域名），会将预签名 URL 的 Host 替换为自定义域名，
 // 避免客户端网络屏蔽云厂商域名。
-func (sc *ServiceCOS) PresignedPutURL(objectPath string, contentType string, expires time.Duration) (uploadURL string, downloadURL string, err error) {
+func (sc *ServiceCOS) PresignedPutURL(objectPath string, contentType string, contentDisposition string, expires time.Duration) (uploadURL string, downloadURL string, err error) {
 	cosConfig := sc.ctx.GetConfig().COS
 	client, err := sc.getClient()
 	if err != nil {
@@ -135,7 +140,14 @@ func (sc *ServiceCOS) PresignedPutURL(objectPath string, contentType string, exp
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	presigned, err := client.PresignedPutObject(ctx, cosConfig.Bucket, key, expires)
+	var presigned *url.URL
+	if contentDisposition != "" {
+		headers := http.Header{}
+		headers.Set("Content-Disposition", contentDisposition)
+		presigned, err = client.PresignHeader(ctx, http.MethodPut, cosConfig.Bucket, key, expires, nil, headers)
+	} else {
+		presigned, err = client.PresignedPutObject(ctx, cosConfig.Bucket, key, expires)
+	}
 	if err != nil {
 		return "", "", fmt.Errorf("生成预签名URL失败: %w", err)
 	}

@@ -36,7 +36,7 @@ func NewServiceMinio(ctx *config.Context) *ServiceMinio {
 }
 
 // UploadFile 上传文件
-func (sm *ServiceMinio) UploadFile(filePath string, contentType string, copyFileWriter func(io.Writer) error) (map[string]interface{}, error) {
+func (sm *ServiceMinio) UploadFile(filePath string, contentType string, contentDisposition string, copyFileWriter func(io.Writer) error) (map[string]interface{}, error) {
 	buff := bytes.NewBuffer(make([]byte, 0))
 	err := copyFileWriter(buff)
 	if err != nil {
@@ -108,7 +108,11 @@ func (sm *ServiceMinio) UploadFile(filePath string, contentType string, copyFile
 	}
 
 	fileName := strings.TrimPrefix(filePath, fmt.Sprintf("%s/", bucketName))
-	n, err := minioClient.PutObject(ctx, bucketName, fileName, buff, int64(len(buff.Bytes())), minio.PutObjectOptions{ContentType: contentType, PartSize: 10 * 1024 * 1024})
+	opts := minio.PutObjectOptions{ContentType: contentType, PartSize: 10 * 1024 * 1024}
+	if contentDisposition != "" {
+		opts.ContentDisposition = contentDisposition
+	}
+	n, err := minioClient.PutObject(ctx, bucketName, fileName, buff, int64(len(buff.Bytes())), opts)
 	if err != nil {
 		sm.Error("上传文件失败：", zap.Error(err))
 		return map[string]interface{}{

@@ -253,7 +253,8 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 		}
 		sign = h.Sum(nil)
 	}
-	_, err = f.service.UploadFile(fmt.Sprintf("%s%s", fileType, path), contentType, func(w io.Writer) error {
+	contentDisposition := buildContentDisposition(fileName)
+	_, err = f.service.UploadFile(fmt.Sprintf("%s%s", fileType, path), contentType, contentDisposition, func(w io.Writer) error {
 		_, err := file.Seek(0, io.SeekStart)
 		if err != nil {
 			f.Error("设置文件偏移量错误", zap.Error(err))
@@ -375,9 +376,18 @@ func (f *File) getUploadCredentials(c *wkhttp.Context) {
 	filename := c.Query("filename")
 	contentType := c.Query("contentType")
 
-	if err := f.checkReq(Type(fileType), uploadPath); err != nil {
+	// 当 filename 提供时，允许 path 为空
+	pathForCheck := uploadPath
+	if pathForCheck == "" && filename != "" {
+		pathForCheck = filename
+	}
+	if err := f.checkReq(Type(fileType), pathForCheck); err != nil {
 		c.ResponseError(err)
 		return
+	}
+
+	if filename != "" {
+		filename = sanitizeFilename(filename)
 	}
 
 	ext := ""
@@ -401,6 +411,9 @@ func (f *File) getUploadCredentials(c *wkhttp.Context) {
 		contentType = "application/octet-stream"
 	}
 
+	// When both path and filename are provided, path determines the objectKey
+	// while filename is used for Content-Disposition (friendly download name).
+	// This allows custom storage paths with user-friendly download filenames.
 	var objectKey string
 	if uploadPath != "" {
 		sanitized, err := sanitizePath(uploadPath)
@@ -412,19 +425,24 @@ func (f *File) getUploadCredentials(c *wkhttp.Context) {
 			sanitized = "/" + sanitized
 		}
 		objectKey = fileType + sanitized
+	} else if filename != "" {
+		objectKey = fmt.Sprintf("%s/%d/%s/%s", fileType, time.Now().Unix(), util.GenerUUID(), url.PathEscape(filename))
 	} else {
 		objectKey = fmt.Sprintf("%s/%s%s", fileType, util.GenerUUID(), ext)
 	}
 
+	// 构造 Content-Disposition
+	contentDisposition := buildContentDisposition(filename)
+
 	expiry := 30 * time.Minute
-	uploadURL, downloadURL, err := f.service.PresignedPutURL(objectKey, contentType, expiry)
+	uploadURL, downloadURL, err := f.service.PresignedPutURL(objectKey, contentType, contentDisposition, expiry)
 	if err != nil {
 		f.Error("生成预签名URL失败", zap.Error(err))
 		c.ResponseError(errors.New("生成预签名上传 URL 失败"))
 		return
 	}
 
-	c.Response(map[string]interface{}{
+	resp := map[string]interface{}{
 		"method":      "PUT",
 		"uploadUrl":   uploadURL,
 		"downloadUrl": downloadURL,
@@ -432,7 +450,49 @@ func (f *File) getUploadCredentials(c *wkhttp.Context) {
 		"key":         objectKey,
 		"expiresIn":   int(expiry.Seconds()),
 		"expiredTime": time.Now().Add(expiry).Unix(),
-	})
+	}
+	if contentDisposition != "" {
+		resp["contentDisposition"] = contentDisposition
+	}
+	c.Response(resp)
+}
+
+// buildContentDisposition 根据文件名构造 RFC 6266 兼容的 Content-Disposition 头。
+// 始终同时提供 filename（ASCII 回退）和 filename*（RFC 5987 编码），
+// 以确保新旧客户端都能正确解析下载文件名。
+func buildContentDisposition(filename string) string {
+	if filename == "" {
+		return ""
+	}
+	encoded := url.PathEscape(filename)
+	if isASCII(filename) {
+		// ASCII 文件名：转义反斜杠和双引号以确保安全
+		safe := strings.ReplaceAll(filename, `\`, `\\`)
+		safe = strings.ReplaceAll(safe, `"`, `\"`)
+		return fmt.Sprintf("attachment; filename=\"%s\"; filename*=UTF-8''%s", safe, encoded)
+	}
+	// 非 ASCII 文件名：filename 使用下划线替换非 ASCII 字符作为回退
+	var asciiFallback strings.Builder
+	for _, r := range filename {
+		if r > 127 {
+			asciiFallback.WriteRune('_')
+		} else {
+			asciiFallback.WriteRune(r)
+		}
+	}
+	safe := strings.ReplaceAll(asciiFallback.String(), `\`, `\\`)
+	safe = strings.ReplaceAll(safe, `"`, `\"`)
+	return fmt.Sprintf("attachment; filename=\"%s\"; filename*=UTF-8''%s", safe, encoded)
+}
+
+// isASCII 检查字符串是否全部为 ASCII 字符
+func isASCII(s string) bool {
+	for _, r := range s {
+		if r > 127 {
+			return false
+		}
+	}
+	return true
 }
 
 // sanitizePath 规范化上传路径，防止路径遍历攻击（包括双重编码）

@@ -27,7 +27,7 @@ func NewServiceOSS(ctx *config.Context) *ServiceOSS {
 }
 
 // UploadFile 上传文件
-func (s *ServiceOSS) UploadFile(filePath string, contentType string, copyFileWriter func(io.Writer) error) (map[string]interface{}, error) {
+func (s *ServiceOSS) UploadFile(filePath string, contentType string, contentDisposition string, copyFileWriter func(io.Writer) error) (map[string]interface{}, error) {
 	ossCfg := s.ctx.GetConfig().OSS
 	client, err := oss.New(ossCfg.Endpoint, ossCfg.AccessKeyID, ossCfg.AccessKeySecret)
 	if err != nil {
@@ -59,7 +59,11 @@ func (s *ServiceOSS) UploadFile(filePath string, contentType string, copyFileWri
 		s.Error("复制文件内容失败！", zap.Error(err))
 		return nil, err
 	}
-	err = bucket.PutObject(filePath, buff, oss.ContentType(contentType), oss.ContentLength(int64(len(buff.Bytes()))))
+	putOptions := []oss.Option{oss.ContentType(contentType), oss.ContentLength(int64(len(buff.Bytes())))}
+	if contentDisposition != "" {
+		putOptions = append(putOptions, oss.ContentDisposition(contentDisposition))
+	}
+	err = bucket.PutObject(filePath, buff, putOptions...)
 	if err != nil {
 		return nil, err
 	}

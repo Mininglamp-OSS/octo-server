@@ -29,7 +29,7 @@ import (
 )
 
 type IUploadService interface {
-	UploadFile(filePath string, contentType string, copyFileWriter func(io.Writer) error) (map[string]interface{}, error)
+	UploadFile(filePath string, contentType string, contentDisposition string, copyFileWriter func(io.Writer) error) (map[string]interface{}, error)
 	// 获取下载地址
 	DownloadURL(path string, filename string) (string, error)
 	// 直接读取文件内容（用于 MinIO 等非 public bucket）
@@ -41,7 +41,7 @@ type IService interface {
 	IUploadService
 	DownloadAndMakeCompose(uploadPath string, downloadURLs []string) (map[string]interface{}, error)
 	DownloadImage(url string, ctx context.Context) (io.ReadCloser, error)
-	PresignedPutURL(objectPath string, contentType string, expires time.Duration) (uploadURL string, downloadURL string, err error)
+	PresignedPutURL(objectPath string, contentType string, contentDisposition string, expires time.Duration) (uploadURL string, downloadURL string, err error)
 }
 
 // NewService NewService
@@ -78,8 +78,8 @@ type Service struct {
 	uploadService IUploadService
 }
 
-func (s *Service) UploadFile(filePath string, contentType string, copyFileWriter func(io.Writer) error) (map[string]interface{}, error) {
-	return s.uploadService.UploadFile(filePath, contentType, copyFileWriter)
+func (s *Service) UploadFile(filePath string, contentType string, contentDisposition string, copyFileWriter func(io.Writer) error) (map[string]interface{}, error) {
+	return s.uploadService.UploadFile(filePath, contentType, contentDisposition, copyFileWriter)
 }
 
 func (s *Service) DownloadURL(path string, filename string) (string, error) {
@@ -92,15 +92,15 @@ func (s *Service) GetFile(path string) (io.ReadCloser, string, error) {
 }
 
 type PresignedPutter interface {
-	PresignedPutURL(objectPath string, contentType string, expires time.Duration) (uploadURL string, downloadURL string, err error)
+	PresignedPutURL(objectPath string, contentType string, contentDisposition string, expires time.Duration) (uploadURL string, downloadURL string, err error)
 }
 
-func (s *Service) PresignedPutURL(objectPath string, contentType string, expires time.Duration) (string, string, error) {
+func (s *Service) PresignedPutURL(objectPath string, contentType string, contentDisposition string, expires time.Duration) (string, string, error) {
 	putter, ok := s.uploadService.(PresignedPutter)
 	if !ok {
 		return "", "", fmt.Errorf("当前文件服务不支持预签名上传")
 	}
-	return putter.PresignedPutURL(objectPath, contentType, expires)
+	return putter.PresignedPutURL(objectPath, contentType, contentDisposition, expires)
 }
 
 func (s *Service) DownloadImage(url string, ctx context.Context) (io.ReadCloser, error) {
@@ -182,7 +182,7 @@ func (s *Service) DownloadAndMakeCompose(uploadPath string, downloadURLs []strin
 
 	// uploadURL := fmt.Sprintf("%s/public%s", s.ctx.GetConfig().UploadURL, uploadPath)
 	// 上传文件
-	resultMap, err := s.UploadFile(uploadPath, "image/png", func(w io.Writer) error {
+	resultMap, err := s.UploadFile(uploadPath, "image/png", "", func(w io.Writer) error {
 		return png.Encode(w, img)
 	})
 	if err != nil {
