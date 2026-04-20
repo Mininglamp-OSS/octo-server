@@ -466,6 +466,21 @@ func (f *File) getDownloadURL(c *wkhttp.Context) {
 		c.ResponseError(errors.New("path参数不能为空"))
 		return
 	}
+
+	// If path is a full URL, extract just the object path
+	// e.g. https://bucket.cos.region.myqcloud.com/prefix/chat/2/xxx → /chat/2/xxx
+	if strings.HasPrefix(ph, "http://") || strings.HasPrefix(ph, "https://") {
+		parsed, parseErr := url.Parse(ph)
+		if parseErr == nil {
+			ph = parsed.Path
+			// Strip the COS prefix (e.g. /bucket-prefix) from the path
+			cosPrefix := strings.TrimSpace(f.ctx.GetConfig().COS.Prefix)
+			if cosPrefix != "" {
+				ph = strings.TrimPrefix(ph, "/"+cosPrefix)
+			}
+		}
+	}
+
 	sanitized, err := sanitizePath(ph)
 	if err != nil {
 		c.ResponseError(errors.New("无效的文件路径"))
