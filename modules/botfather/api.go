@@ -1333,6 +1333,7 @@ func (bf *BotFather) botUploadCredentials(c *wkhttp.Context) {
 		c.ResponseError(errors.New("filename 不能为空"))
 		return
 	}
+	filename = filepath.Base(filename)
 
 	ext := strings.ToLower(filepath.Ext(filename))
 	if ext == "" || file.IsBlockedExtension(ext) || !file.IsAllowedExtension(ext) {
@@ -1413,6 +1414,7 @@ func (bf *BotFather) botUploadPresigned(c *wkhttp.Context) {
 		c.ResponseError(errors.New("filename 不能为空"))
 		return
 	}
+	filename = filepath.Base(filename)
 
 	ext := strings.ToLower(filepath.Ext(filename))
 	if ext == "" || file.IsBlockedExtension(ext) || !file.IsAllowedExtension(ext) {
