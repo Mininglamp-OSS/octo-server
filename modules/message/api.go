@@ -37,16 +37,41 @@ import (
 
 // MaxSyncPayloadSize 同步接口返回的单条消息 payload 最大字节数，超过则截断。
 // 避免超大 payload 导致前端 SDK 递归解码栈溢出 (issue #1097)。
+// hardParsePayloadLimit 更高一级的硬上限：超过则不再尝试 JSON 解析，直接占位。
 const (
 	MaxSyncPayloadSize        = 10 * 1024
+	hardParsePayloadLimit     = 1 * 1024 * 1024
 	truncatedContentHeadBytes = 1024
 	truncatedContentSuffix    = "...[消息过大]"
 )
 
+// truncatedFallback 极端场景下（解析失败 / 无 content 字段 / 超过硬上限）的占位。
+func truncatedFallback(m map[string]interface{}) map[string]interface{} {
+	safe := map[string]interface{}{
+		"content": truncatedContentSuffix,
+	}
+	if t, ok := m["type"]; ok {
+		safe["type"] = t
+	} else {
+		safe["type"] = common.ContentError.Int()
+	}
+	if v, ok := m["visibles"]; ok {
+		safe["visibles"] = v
+	}
+	return safe
+}
+
 // TruncatedPayload 在 payload 字节长度超过阈值时，尽量保留原有 type / visibles 等元信息，
-// 只对 content 字段做前缀截取 + 占位后缀；解析失败则回退为整体占位。
+// 只对 content 字段做前缀截取 + 占位后缀；解析失败或无 content 字段时回退为只含
+// type / visibles 的安全占位，确保超大 payload 一定被截断。
 // 导出供 search 等其他路径复用。
 func TruncatedPayload(raw []byte) map[string]interface{} {
+	if len(raw) > hardParsePayloadLimit {
+		return map[string]interface{}{
+			"type":    common.ContentError.Int(),
+			"content": truncatedContentSuffix,
+		}
+	}
 	var m map[string]interface{}
 	if err := util.ReadJsonByByte(raw, &m); err != nil || len(m) == 0 {
 		return map[string]interface{}{
@@ -55,8 +80,8 @@ func TruncatedPayload(raw []byte) map[string]interface{} {
 		}
 	}
 	if _, exists := m["content"]; !exists {
-		// 无 content 字段的消息类型（如撤回通知），保留原结构不注入 content。
-		return m
+		// 无 content 字段但整体超大：只保留 type / visibles，丢弃其他未知大字段。
+		return truncatedFallback(m)
 	}
 	s := contentToString(m["content"])
 	m["content"] = truncateUTF8(s, truncatedContentHeadBytes) + truncatedContentSuffix
@@ -2351,6 +2376,7 @@ func (m *MsgSyncResp) from(msgResp *config.MessageResp, loginUID string, message
 	} else if len(msgResp.Payload) > MaxSyncPayloadSize {
 		log.Warn("消息 payload 超过大小阈值，已截断",
 			zap.Int64("message_id", msgResp.MessageID),
+			zap.String("from_uid", msgResp.FromUID),
 			zap.String("channel_id", msgResp.ChannelID),
 			zap.Int("payload_size", len(msgResp.Payload)))
 		payloadMap = TruncatedPayload(msgResp.Payload)

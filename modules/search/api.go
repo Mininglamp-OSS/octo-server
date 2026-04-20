@@ -364,6 +364,7 @@ func (s *Search) global(c *wkhttp.Context) {
 			} else if len(msg.Payload) > message.MaxSyncPayloadSize {
 				log.Warn("搜索结果消息 payload 超过大小阈值，已截断",
 					zap.Int64("message_id", msg.MessageID),
+					zap.String("from_uid", msg.FromUID),
 					zap.String("channel_id", msg.ChannelID),
 					zap.Int("payload_size", len(msg.Payload)))
 				payloadMap = message.TruncatedPayload(msg.Payload)
