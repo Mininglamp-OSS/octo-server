@@ -231,21 +231,21 @@ func TestBuildContentDisposition(t *testing.T) {
 	}{
 		{"empty filename", "", ""},
 		{"ascii filename", "report.pdf",
-			`attachment; filename="report.pdf"; filename*=UTF-8''report.pdf`},
+			`inline; filename="report.pdf"; filename*=UTF-8''report.pdf`},
 		{"ascii with spaces", "my file.pdf",
-			`attachment; filename="my file.pdf"; filename*=UTF-8''my%20file.pdf`},
+			`inline; filename="my file.pdf"; filename*=UTF-8''my%20file.pdf`},
 		{"chinese filename", "报告.pdf",
-			`attachment; filename="__.pdf"; filename*=UTF-8''` + url.PathEscape("报告.pdf")},
+			`inline; filename="__.pdf"; filename*=UTF-8''` + url.PathEscape("报告.pdf")},
 		{"japanese filename", "テスト.png",
-			`attachment; filename="___.png"; filename*=UTF-8''` + url.PathEscape("テスト.png")},
+			`inline; filename="___.png"; filename*=UTF-8''` + url.PathEscape("テスト.png")},
 		{"mixed ascii and unicode", "report-报告.pdf",
-			`attachment; filename="report-__.pdf"; filename*=UTF-8''` + url.PathEscape("report-报告.pdf")},
+			`inline; filename="report-__.pdf"; filename*=UTF-8''` + url.PathEscape("report-报告.pdf")},
 		{"emoji filename", "photo\U0001F600.jpg",
-			`attachment; filename="photo_.jpg"; filename*=UTF-8''` + url.PathEscape("photo\U0001F600.jpg")},
+			`inline; filename="photo_.jpg"; filename*=UTF-8''` + url.PathEscape("photo\U0001F600.jpg")},
 		{"ascii with backslash", `report\2024.pdf`,
-			`attachment; filename="report\\2024.pdf"; filename*=UTF-8''report%5C2024.pdf`},
+			`inline; filename="report\\2024.pdf"; filename*=UTF-8''report%5C2024.pdf`},
 		{"ascii with semicolon", "report;final.pdf",
-			`attachment; filename="report;final.pdf"; filename*=UTF-8''report%3Bfinal.pdf`},
+			`inline; filename="report;final.pdf"; filename*=UTF-8''report%3Bfinal.pdf`},
 	}
 
 	for _, tt := range tests {
@@ -362,7 +362,7 @@ func TestGetUploadCredentials_ObjectKeyWithFilename(t *testing.T) {
 				if tt.wantContentDisp {
 					cd, ok := resp["contentDisposition"].(string)
 					assert.True(t, ok, "response should contain 'contentDisposition'")
-					assert.Contains(t, cd, "attachment")
+					assert.Contains(t, cd, "inline")
 					assert.Equal(t, cd, mockSvc.lastContentDisp, "contentDisposition passed to service should match response")
 				}
 			}
@@ -430,6 +430,43 @@ func TestGetUploadCredentials_FallbackWithoutFilename(t *testing.T) {
 	_, hasCD := resp["contentDisposition"]
 	assert.False(t, hasCD, "response should not contain contentDisposition without filename")
 	assert.Equal(t, "", mockSvc.lastContentDisp)
+}
+
+func TestBuildContentDisposition_UsesInline(t *testing.T) {
+	// Verify that buildContentDisposition uses "inline" not "attachment"
+	tests := []string{"report.pdf", "photo.jpg", "报告.pdf", "test file.txt"}
+	for _, fn := range tests {
+		t.Run(fn, func(t *testing.T) {
+			got := buildContentDisposition(fn)
+			assert.Contains(t, got, "inline;")
+			assert.NotContains(t, got, "attachment")
+		})
+	}
+}
+
+func TestExtractFilenameFromDisposition(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"empty string", "", ""},
+		{"no filename", "inline", ""},
+		{"rfc5987 ascii", "inline; filename=\"report.pdf\"; filename*=UTF-8''report.pdf", "report.pdf"},
+		{"rfc5987 encoded", "inline; filename=\"__.pdf\"; filename*=UTF-8''%E6%8A%A5%E5%91%8A.pdf", "报告.pdf"},
+		{"rfc5987 with spaces", "inline; filename=\"my file.pdf\"; filename*=UTF-8''my%20file.pdf", "my file.pdf"},
+		{"only quoted filename", `inline; filename="report.pdf"`, "report.pdf"},
+		{"attachment style", `attachment; filename="old.pdf"; filename*=UTF-8''old.pdf`, "old.pdf"},
+		{"filename* only", "inline; filename*=UTF-8''doc.pdf", "doc.pdf"},
+		{"filename with semicolon after star", "inline; filename*=UTF-8''a.pdf; other=x", "a.pdf"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractFilenameFromDisposition(tt.input)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }
 
 func TestMakeImageCompose_SafeTypeAssertion(t *testing.T) {

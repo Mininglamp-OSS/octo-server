@@ -162,11 +162,43 @@ func (sc *ServiceCOS) PresignedPutURL(objectPath string, contentType string, con
 
 	uploadURL = presigned.String()
 
-	downloadURL, dlErr := sc.DownloadURL(objectPath, "")
+	filename := extractFilenameFromDisposition(contentDisposition)
+	downloadURL, dlErr := sc.DownloadURL(objectPath, filename)
 	if dlErr != nil {
 		sc.Warn("生成下载URL失败", zap.Error(dlErr))
 	}
 	return uploadURL, downloadURL, nil
+}
+
+// extractFilenameFromDisposition 从 Content-Disposition 头中提取文件名。
+// 优先解析 RFC 5987 的 filename*=UTF-8''xxx 格式，其次解析 filename="xxx" 格式。
+func extractFilenameFromDisposition(cd string) string {
+	if cd == "" {
+		return ""
+	}
+
+	// 优先匹配 filename*=UTF-8''xxx
+	if idx := strings.Index(cd, "filename*=UTF-8''"); idx >= 0 {
+		val := cd[idx+len("filename*=UTF-8''"):]
+		// 截取到分号或末尾
+		if semi := strings.Index(val, ";"); semi >= 0 {
+			val = val[:semi]
+		}
+		val = strings.TrimSpace(val)
+		if decoded, err := url.PathUnescape(val); err == nil && decoded != "" {
+			return decoded
+		}
+	}
+
+	// 回退：匹配 filename="xxx"
+	if idx := strings.Index(cd, "filename=\""); idx >= 0 {
+		val := cd[idx+len("filename=\""):]
+		if end := strings.Index(val, "\""); end >= 0 {
+			return val[:end]
+		}
+	}
+
+	return ""
 }
 
 func (sc *ServiceCOS) DownloadURL(ph string, filename string) (string, error) {

@@ -460,16 +460,23 @@ func (f *File) getUploadCredentials(c *wkhttp.Context) {
 // buildContentDisposition 根据文件名构造 RFC 6266 兼容的 Content-Disposition 头。
 // 始终同时提供 filename（ASCII 回退）和 filename*（RFC 5987 编码），
 // 以确保新旧客户端都能正确解析下载文件名。
+// rfc5987Encode encodes a filename for RFC 5987 filename* parameter.
+// url.PathEscape doesn't encode single quotes, which are delimiters in RFC 5987.
+func rfc5987Encode(s string) string {
+	encoded := url.PathEscape(s)
+	return strings.ReplaceAll(encoded, "'", "%27")
+}
+
 func buildContentDisposition(filename string) string {
 	if filename == "" {
 		return ""
 	}
-	encoded := url.PathEscape(filename)
+	encoded := rfc5987Encode(filename)
 	if isASCII(filename) {
 		// ASCII 文件名：转义反斜杠和双引号以确保安全
 		safe := strings.ReplaceAll(filename, `\`, `\\`)
 		safe = strings.ReplaceAll(safe, `"`, `\"`)
-		return fmt.Sprintf("attachment; filename=\"%s\"; filename*=UTF-8''%s", safe, encoded)
+		return fmt.Sprintf("inline; filename=\"%s\"; filename*=UTF-8''%s", safe, encoded)
 	}
 	// 非 ASCII 文件名：filename 使用下划线替换非 ASCII 字符作为回退
 	var asciiFallback strings.Builder
@@ -482,7 +489,7 @@ func buildContentDisposition(filename string) string {
 	}
 	safe := strings.ReplaceAll(asciiFallback.String(), `\`, `\\`)
 	safe = strings.ReplaceAll(safe, `"`, `\"`)
-	return fmt.Sprintf("attachment; filename=\"%s\"; filename*=UTF-8''%s", safe, encoded)
+	return fmt.Sprintf("inline; filename=\"%s\"; filename*=UTF-8''%s", safe, encoded)
 }
 
 // isASCII 检查字符串是否全部为 ASCII 字符
