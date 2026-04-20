@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -189,8 +191,10 @@ func TestInferContentType(t *testing.T) {
 
 // mockService implements IService for testing
 type mockService struct {
-	composeResult map[string]interface{}
-	composeErr    error
+	composeResult      map[string]interface{}
+	composeErr         error
+	lastObjectPath     string
+	lastContentDisp    string
 }
 
 func (m *mockService) DownloadAndMakeCompose(uploadPath string, downloadURLs []string) (map[string]interface{}, error) {
@@ -213,8 +217,185 @@ func (m *mockService) GetFile(path string) (io.ReadCloser, string, error) {
 	return nil, "", fmt.Errorf("not implemented")
 }
 
-func (m *mockService) PresignedPutURL(objectPath string, contentType string, expires time.Duration) (string, string, error) {
-	return "", "", fmt.Errorf("not implemented")
+func (m *mockService) PresignedPutURL(objectPath string, contentType string, contentDisposition string, expires time.Duration) (string, string, error) {
+	m.lastObjectPath = objectPath
+	m.lastContentDisp = contentDisposition
+	return "https://example.com/upload?" + objectPath, "https://example.com/download/" + objectPath, nil
+}
+
+func TestBuildContentDisposition(t *testing.T) {
+	tests := []struct {
+		name     string
+		filename string
+		want     string
+	}{
+		{"empty filename", "", ""},
+		{"ascii filename", "report.pdf", `attachment; filename="report.pdf"`},
+		{"ascii with spaces", "my file.pdf", `attachment; filename="my file.pdf"`},
+		{"chinese filename", "报告.pdf", "attachment; filename*=UTF-8''" + url.PathEscape("报告.pdf")},
+		{"japanese filename", "テスト.png", "attachment; filename*=UTF-8''" + url.PathEscape("テスト.png")},
+		{"mixed ascii and unicode", "report-报告.pdf", "attachment; filename*=UTF-8''" + url.PathEscape("report-报告.pdf")},
+		{"emoji filename", "photo\U0001F600.jpg", "attachment; filename*=UTF-8''" + url.PathEscape("photo\U0001F600.jpg")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := buildContentDisposition(tt.filename)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestIsASCII(t *testing.T) {
+	assert.True(t, isASCII("hello.pdf"))
+	assert.True(t, isASCII("my-file_2024.jpg"))
+	assert.True(t, isASCII(""))
+	assert.False(t, isASCII("报告.pdf"))
+	assert.False(t, isASCII("café.txt"))
+	assert.False(t, isASCII("photo\U0001F600.jpg"))
+}
+
+func TestGetUploadCredentials_ObjectKeyWithFilename(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name               string
+		queryParams        string
+		wantStatus         int
+		wantKeyContains    string
+		wantKeyNotContains string
+		wantContentDisp    bool
+	}{
+		{
+			name:            "filename provided generates timestamp/uuid/filename key",
+			queryParams:     "type=chat&filename=photo.jpg",
+			wantStatus:      http.StatusOK,
+			wantKeyContains: "photo.jpg",
+			wantContentDisp: true,
+		},
+		{
+			name:            "chinese filename in key",
+			queryParams:     "type=chat&filename=照片.jpg",
+			wantStatus:      http.StatusOK,
+			wantKeyContains: url.PathEscape("照片.jpg"),
+			wantContentDisp: true,
+		},
+		{
+			name:               "path provided uses path-based key",
+			queryParams:        "type=chat&path=/upload/test.jpg",
+			wantStatus:         http.StatusOK,
+			wantKeyContains:    "chat",
+			wantKeyNotContains: "",
+			wantContentDisp:    false,
+		},
+		{
+			name:        "no filename and no path with sticker type",
+			queryParams: "type=sticker&filename=sticker.gif",
+			wantStatus:  http.StatusOK,
+			wantContentDisp: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockSvc := &mockService{}
+			f := &File{
+				Log:     log.NewTLog("FileTest"),
+				service: mockSvc,
+			}
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request, _ = http.NewRequest(http.MethodGet, "/v1/file/upload/credentials?"+tt.queryParams, nil)
+
+			wkCtx := &wkhttp.Context{Context: c}
+			f.getUploadCredentials(wkCtx)
+
+			assert.Equal(t, tt.wantStatus, w.Code, "response body: %s", w.Body.String())
+
+			if tt.wantStatus == http.StatusOK {
+				var resp map[string]interface{}
+				err := json.Unmarshal(w.Body.Bytes(), &resp)
+				assert.NoError(t, err)
+
+				key, ok := resp["key"].(string)
+				assert.True(t, ok, "response should contain 'key' field")
+
+				if tt.wantKeyContains != "" {
+					assert.Contains(t, key, tt.wantKeyContains)
+				}
+
+				if tt.wantContentDisp {
+					cd, ok := resp["contentDisposition"].(string)
+					assert.True(t, ok, "response should contain 'contentDisposition'")
+					assert.Contains(t, cd, "attachment")
+					assert.Equal(t, cd, mockSvc.lastContentDisp, "contentDisposition passed to service should match response")
+				}
+			}
+		})
+	}
+}
+
+func TestGetUploadCredentials_ObjectKeyFormat(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	mockSvc := &mockService{}
+	f := &File{
+		Log:     log.NewTLog("FileTest"),
+		service: mockSvc,
+	}
+
+	// Test with filename: key should be fileType/timestamp/uuid/filename
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request, _ = http.NewRequest(http.MethodGet, "/v1/file/upload/credentials?type=chat&filename=test.jpg", nil)
+	wkCtx := &wkhttp.Context{Context: c}
+	f.getUploadCredentials(wkCtx)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	key := resp["key"].(string)
+
+	parts := strings.Split(key, "/")
+	assert.Equal(t, 4, len(parts), "key with filename should have 4 parts: type/timestamp/uuid/filename, got: %s", key)
+	assert.Equal(t, "chat", parts[0])
+	// parts[1] should be a unix timestamp (numeric)
+	for _, ch := range parts[1] {
+		assert.True(t, ch >= '0' && ch <= '9', "timestamp part should be numeric, got: %s", parts[1])
+	}
+	// parts[3] should be the filename
+	assert.Equal(t, "test.jpg", parts[3])
+}
+
+func TestGetUploadCredentials_FallbackWithoutFilename(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	mockSvc := &mockService{}
+	f := &File{
+		Log:     log.NewTLog("FileTest"),
+		service: mockSvc,
+	}
+
+	// Test with path (no filename): key should be fileType + sanitized path
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request, _ = http.NewRequest(http.MethodGet, "/v1/file/upload/credentials?type=chat&path=/abc123.jpg", nil)
+	wkCtx := &wkhttp.Context{Context: c}
+	f.getUploadCredentials(wkCtx)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+
+	key := resp["key"].(string)
+	assert.True(t, strings.HasPrefix(key, "chat/"), "key should start with 'chat/'")
+	assert.Contains(t, key, "abc123.jpg")
+
+	// No contentDisposition when no filename
+	_, hasCD := resp["contentDisposition"]
+	assert.False(t, hasCD, "response should not contain contentDisposition without filename")
+	assert.Equal(t, "", mockSvc.lastContentDisp)
 }
 
 func TestMakeImageCompose_SafeTypeAssertion(t *testing.T) {

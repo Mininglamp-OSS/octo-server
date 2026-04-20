@@ -375,9 +375,18 @@ func (f *File) getUploadCredentials(c *wkhttp.Context) {
 	filename := c.Query("filename")
 	contentType := c.Query("contentType")
 
-	if err := f.checkReq(Type(fileType), uploadPath); err != nil {
+	// 当 filename 提供时，允许 path 为空
+	pathForCheck := uploadPath
+	if pathForCheck == "" && filename != "" {
+		pathForCheck = filename
+	}
+	if err := f.checkReq(Type(fileType), pathForCheck); err != nil {
 		c.ResponseError(err)
 		return
+	}
+
+	if filename != "" {
+		filename = sanitizeFilename(filename)
 	}
 
 	ext := ""
@@ -412,19 +421,24 @@ func (f *File) getUploadCredentials(c *wkhttp.Context) {
 			sanitized = "/" + sanitized
 		}
 		objectKey = fileType + sanitized
+	} else if filename != "" {
+		objectKey = fmt.Sprintf("%s/%d/%s/%s", fileType, time.Now().Unix(), util.GenerUUID(), url.PathEscape(filename))
 	} else {
 		objectKey = fmt.Sprintf("%s/%s%s", fileType, util.GenerUUID(), ext)
 	}
 
+	// 构造 Content-Disposition
+	contentDisposition := buildContentDisposition(filename)
+
 	expiry := 30 * time.Minute
-	uploadURL, downloadURL, err := f.service.PresignedPutURL(objectKey, contentType, expiry)
+	uploadURL, downloadURL, err := f.service.PresignedPutURL(objectKey, contentType, contentDisposition, expiry)
 	if err != nil {
 		f.Error("生成预签名URL失败", zap.Error(err))
 		c.ResponseError(errors.New("生成预签名上传 URL 失败"))
 		return
 	}
 
-	c.Response(map[string]interface{}{
+	resp := map[string]interface{}{
 		"method":      "PUT",
 		"uploadUrl":   uploadURL,
 		"downloadUrl": downloadURL,
@@ -432,7 +446,34 @@ func (f *File) getUploadCredentials(c *wkhttp.Context) {
 		"key":         objectKey,
 		"expiresIn":   int(expiry.Seconds()),
 		"expiredTime": time.Now().Add(expiry).Unix(),
-	})
+	}
+	if contentDisposition != "" {
+		resp["contentDisposition"] = contentDisposition
+	}
+	c.Response(resp)
+}
+
+// buildContentDisposition 根据文件名构造 Content-Disposition 头。
+// 对于纯 ASCII 文件名使用 filename="..."，
+// 对于包含非 ASCII 字符的文件名使用 RFC 5987 编码 filename*=UTF-8''...。
+func buildContentDisposition(filename string) string {
+	if filename == "" {
+		return ""
+	}
+	if isASCII(filename) {
+		return fmt.Sprintf("attachment; filename=\"%s\"", filename)
+	}
+	return fmt.Sprintf("attachment; filename*=UTF-8''%s", url.PathEscape(filename))
+}
+
+// isASCII 检查字符串是否全部为 ASCII 字符
+func isASCII(s string) bool {
+	for _, r := range s {
+		if r > 127 {
+			return false
+		}
+	}
+	return true
 }
 
 // sanitizePath 规范化上传路径，防止路径遍历攻击（包括双重编码）

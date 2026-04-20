@@ -1425,7 +1425,7 @@ func (bf *BotFather) botUploadPresigned(c *wkhttp.Context) {
 	}
 
 	expiry := 30 * time.Minute
-	uploadURL, downloadURL, err := bf.fileService.PresignedPutURL(objectPath, contentType, expiry)
+	uploadURL, downloadURL, err := bf.fileService.PresignedPutURL(objectPath, contentType, "", expiry)
 	if err != nil {
 		bf.Error("生成预签名上传URL失败", zap.Error(err))
 		c.ResponseError(errors.New("生成上传URL失败"))

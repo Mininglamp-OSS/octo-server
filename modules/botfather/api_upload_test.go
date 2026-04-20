@@ -40,7 +40,7 @@ func (m *mockFileServiceForUpload) DownloadImage(url string, ctx context.Context
 	return nil, nil
 }
 
-func (m *mockFileServiceForUpload) PresignedPutURL(objectPath string, contentType string, expires time.Duration) (string, string, error) {
+func (m *mockFileServiceForUpload) PresignedPutURL(objectPath string, contentType string, contentDisposition string, expires time.Duration) (string, string, error) {
 	m.lastObjectPath = objectPath
 	return "https://example.com/upload?" + objectPath, "https://example.com/download/" + objectPath, nil
 }
