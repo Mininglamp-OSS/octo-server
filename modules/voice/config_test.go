@@ -23,6 +23,11 @@ func clearVoiceEnv() {
 	os.Unsetenv("VOICE_QWEN_URL")
 	os.Unsetenv("VOICE_QWEN_KEY")
 	os.Unsetenv("VOICE_QWEN_TIMEOUT")
+	os.Unsetenv("VOICE_PROMPT_FILE")
+	os.Unsetenv("VOICE_MAX_VOICE_CONTEXT_LENGTH")
+	os.Unsetenv("VOICE_MAX_CONTEXT_TEXT_LENGTH")
+	os.Unsetenv("VOICE_MAX_CHAT_CONTEXT_LENGTH")
+	os.Unsetenv("VOICE_MAX_MEMBER_CONTEXT_LENGTH")
 }
 
 func TestNewVoiceConfigFromEnv_Defaults(t *testing.T) {
@@ -397,7 +402,10 @@ func TestShortenModelName_Unknown(t *testing.T) {
 // --- MaxVoiceContextLength constant ---
 
 func TestMaxVoiceContextLength_Constant(t *testing.T) {
-	assert.Equal(t, 10000, MaxVoiceContextLength)
+	clearVoiceEnv()
+	defer clearVoiceEnv()
+	cfg := NewVoiceConfigFromEnv()
+	assert.Equal(t, 10000, cfg.MaxVoiceContextLength)
 }
 
 // --- Qwen engine config tests ---
@@ -502,4 +510,53 @@ func TestNewVoiceConfigFromEnv_QwenModelsWithSpaces(t *testing.T) {
 	os.Setenv("VOICE_QWEN_MODELS", " qwen3.5-omni-plus , qwen3.5-omni ")
 	cfg := NewVoiceConfigFromEnv()
 	assert.Equal(t, []string{"qwen3.5-omni-plus", "qwen3.5-omni"}, cfg.QwenModels)
+}
+
+// --- MaxLength config field tests ---
+
+func TestNewVoiceConfigFromEnv_MaxLengthDefaults(t *testing.T) {
+	clearVoiceEnv()
+	defer clearVoiceEnv()
+
+	cfg := NewVoiceConfigFromEnv()
+	assert.Equal(t, 10000, cfg.MaxVoiceContextLength)
+	assert.Equal(t, 5000, cfg.MaxContextTextLength)
+	assert.Equal(t, 20000, cfg.MaxChatContextLength)
+	assert.Equal(t, 5000, cfg.MaxMemberContextLength)
+}
+
+func TestNewVoiceConfigFromEnv_MaxLengthFromEnv(t *testing.T) {
+	clearVoiceEnv()
+	defer clearVoiceEnv()
+
+	os.Setenv("VOICE_MAX_VOICE_CONTEXT_LENGTH", "8000")
+	os.Setenv("VOICE_MAX_CONTEXT_TEXT_LENGTH", "3000")
+	os.Setenv("VOICE_MAX_CHAT_CONTEXT_LENGTH", "15000")
+	os.Setenv("VOICE_MAX_MEMBER_CONTEXT_LENGTH", "4000")
+
+	cfg := NewVoiceConfigFromEnv()
+	assert.Equal(t, 8000, cfg.MaxVoiceContextLength)
+	assert.Equal(t, 3000, cfg.MaxContextTextLength)
+	assert.Equal(t, 15000, cfg.MaxChatContextLength)
+	assert.Equal(t, 4000, cfg.MaxMemberContextLength)
+}
+
+func TestNewVoiceConfigFromEnv_MaxLengthInvalidValue(t *testing.T) {
+	clearVoiceEnv()
+	defer clearVoiceEnv()
+
+	// Non-numeric
+	os.Setenv("VOICE_MAX_VOICE_CONTEXT_LENGTH", "abc")
+	// Zero
+	os.Setenv("VOICE_MAX_CONTEXT_TEXT_LENGTH", "0")
+	// Negative
+	os.Setenv("VOICE_MAX_CHAT_CONTEXT_LENGTH", "-100")
+	// Non-numeric
+	os.Setenv("VOICE_MAX_MEMBER_CONTEXT_LENGTH", "xyz")
+
+	cfg := NewVoiceConfigFromEnv()
+	assert.Equal(t, 10000, cfg.MaxVoiceContextLength)
+	assert.Equal(t, 5000, cfg.MaxContextTextLength)
+	assert.Equal(t, 20000, cfg.MaxChatContextLength)
+	assert.Equal(t, 5000, cfg.MaxMemberContextLength)
 }

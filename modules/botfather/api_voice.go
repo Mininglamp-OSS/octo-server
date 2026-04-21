@@ -2,6 +2,7 @@ package botfather
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -82,8 +83,8 @@ func (bf *BotFather) botPutVoiceContext(c *wkhttp.Context) {
 		return
 	}
 
-	if len([]rune(ctx)) > voice.MaxVoiceContextLength {
-		c.ResponseErrorWithStatus(errors.New("context exceeds max length (10000 characters)"), http.StatusBadRequest)
+	if len([]rune(ctx)) > bf.voiceCfg.MaxVoiceContextLength {
+		c.ResponseErrorWithStatus(fmt.Errorf("context exceeds max length (%d characters)", bf.voiceCfg.MaxVoiceContextLength), http.StatusBadRequest)
 		return
 	}
 
@@ -185,10 +186,29 @@ func (bf *BotFather) botTranscribe(c *wkhttp.Context) {
 	}
 
 	contextText := c.Request.FormValue("context_text")
-	contextText = voice.TruncateRunesTail(contextText, voice.MaxContextTextLength)
+	if len([]rune(contextText)) > bf.voiceCfg.MaxContextTextLength {
+		contextText = voice.TruncateRunesTail(contextText, bf.voiceCfg.MaxContextTextLength)
+	}
 
 	chatContext := c.Request.FormValue("chat_context")
-	chatContext = voice.TruncateRunesTail(chatContext, voice.MaxChatContextLength)
+	if len([]rune(chatContext)) > bf.voiceCfg.MaxChatContextLength {
+		chatContext = voice.TruncateRunesTail(chatContext, bf.voiceCfg.MaxChatContextLength)
+	}
+
+	personalContext := c.Request.FormValue("personal_context")
+	if len([]rune(personalContext)) > bf.voiceCfg.MaxVoiceContextLength {
+		personalContext = voice.TruncateRunesTail(personalContext, bf.voiceCfg.MaxVoiceContextLength)
+	}
+
+	memberContext := c.Request.FormValue("member_context")
+	if len([]rune(memberContext)) > bf.voiceCfg.MaxMemberContextLength {
+		memberContext = voice.TruncateRunesTail(memberContext, bf.voiceCfg.MaxMemberContextLength)
+	}
+
+	// Save original chatContext for ASR logging
+	origChatContext := chatContext
+
+	chatContext = voice.BuildVocabularyReference(personalContext, memberContext, chatContext)
 
 	mode := c.Request.FormValue("mode")
 	model := c.Request.FormValue("model")
@@ -222,13 +242,15 @@ func (bf *BotFather) botTranscribe(c *wkhttp.Context) {
 				Engine:         bf.voiceCfg.Engine,
 				ModelRequested: model,
 				Input: voice.ASRInput{
-					Mode:        effectiveMode,
-					MimeType:    mimeType,
-					AudioSize:   len(audioData),
-					ContextText: contextText,
-					ChatContext: chatContext,
-					Model:       model,
-					Language:    bf.voiceCfg.Language,
+					Mode:            effectiveMode,
+					MimeType:        mimeType,
+					AudioSize:       len(audioData),
+					ContextText:     contextText,
+					ChatContext:     origChatContext,
+					PersonalContext: personalContext,
+					MemberContext:   memberContext,
+					Model:           model,
+					Language:        bf.voiceCfg.Language,
 				},
 				AudioData:  audioData,
 				Error:      err.Error(),
@@ -259,13 +281,15 @@ func (bf *BotFather) botTranscribe(c *wkhttp.Context) {
 			ModelRequested: model,
 			ModelUsed:      result.Model,
 			Input: voice.ASRInput{
-				Mode:        effectiveMode,
-				MimeType:    mimeType,
-				AudioSize:   len(audioData),
-				ContextText: contextText,
-				ChatContext: chatContext,
-				Model:       model,
-				Language:    bf.voiceCfg.Language,
+				Mode:            effectiveMode,
+				MimeType:        mimeType,
+				AudioSize:       len(audioData),
+				ContextText:     contextText,
+				ChatContext:     origChatContext,
+				PersonalContext: personalContext,
+				MemberContext:   memberContext,
+				Model:           model,
+				Language:        bf.voiceCfg.Language,
 			},
 			Prompt: &voice.ASRPrompt{
 				Type:        result.PromptType,

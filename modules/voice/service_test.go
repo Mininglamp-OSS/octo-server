@@ -55,30 +55,38 @@ func getUserAudioData(t *testing.T, req chatCompletionRequest) string {
 
 func newTestConfig(serverURL string) *VoiceConfig {
 	return &VoiceConfig{
-		LiteLLMUrl:   serverURL,
-		LiteLLMKey:   "test-key",
-		Timeout:      5,
-		TotalTimeout: 10,
-		Models:       []string{"model-a", "model-b", "model-c"},
-		GPTModels:    []string{"gpt-a", "gpt-b"},
-		MaxDuration:  60,
-		MaxFileSize:  5 * 1024 * 1024,
-		Engine:       "gemini",
-		EditMode:     "edit",
+		LiteLLMUrl:             serverURL,
+		LiteLLMKey:             "test-key",
+		Timeout:                5,
+		TotalTimeout:           10,
+		Models:                 []string{"model-a", "model-b", "model-c"},
+		GPTModels:              []string{"gpt-a", "gpt-b"},
+		MaxDuration:            60,
+		MaxFileSize:            5 * 1024 * 1024,
+		Engine:                 "gemini",
+		EditMode:               "edit",
+		MaxVoiceContextLength:  10000,
+		MaxContextTextLength:   5000,
+		MaxChatContextLength:   20000,
+		MaxMemberContextLength: 5000,
 	}
 }
 
 func newGPTTestConfig(serverURL string) *VoiceConfig {
 	return &VoiceConfig{
-		LiteLLMUrl:   serverURL,
-		LiteLLMKey:   "test-key",
-		Timeout:      5,
-		TotalTimeout: 10,
-		GPTModels:    []string{"gpt-model-a", "gpt-model-b"},
-		MaxDuration:  60,
-		MaxFileSize:  5 * 1024 * 1024,
-		Engine:       "gpt",
-		EditMode:     "append",
+		LiteLLMUrl:             serverURL,
+		LiteLLMKey:             "test-key",
+		Timeout:                5,
+		TotalTimeout:           10,
+		GPTModels:              []string{"gpt-model-a", "gpt-model-b"},
+		MaxDuration:            60,
+		MaxFileSize:            5 * 1024 * 1024,
+		Engine:                 "gpt",
+		EditMode:               "append",
+		MaxVoiceContextLength:  10000,
+		MaxContextTextLength:   5000,
+		MaxChatContextLength:   20000,
+		MaxMemberContextLength: 5000,
 	}
 }
 
@@ -1210,23 +1218,28 @@ func TestTranscribeWithOptions_GPT_EditModeRejected(t *testing.T) {
 // --- contextText length truncation (MaxContextTextLength) ---
 
 func TestMaxContextTextLength_Constant(t *testing.T) {
-	assert.Equal(t, 10000, MaxContextTextLength)
+	cfg := NewVoiceConfigFromEnv()
+	assert.Equal(t, 5000, cfg.MaxContextTextLength)
 }
 
 // --- Qwen engine tests ---
 
 func newQwenTestConfig(serverURL string) *VoiceConfig {
 	return &VoiceConfig{
-		QwenUrl:      serverURL,
-		QwenKey:      "qwen-test-key",
-		Timeout:      5,
-		TotalTimeout: 10,
-		QwenModels:   []string{"qwen3.5-omni-plus", "qwen3.5-omni"},
-		QwenTimeout:  8,
-		MaxDuration:  60,
-		MaxFileSize:  5 * 1024 * 1024,
-		Engine:       "qwen",
-		EditMode:     "edit",
+		QwenUrl:                serverURL,
+		QwenKey:                "qwen-test-key",
+		Timeout:                5,
+		TotalTimeout:           10,
+		QwenModels:             []string{"qwen3.5-omni-plus", "qwen3.5-omni"},
+		QwenTimeout:            8,
+		MaxDuration:            60,
+		MaxFileSize:            5 * 1024 * 1024,
+		Engine:                 "qwen",
+		EditMode:               "edit",
+		MaxVoiceContextLength:  10000,
+		MaxContextTextLength:   5000,
+		MaxChatContextLength:   20000,
+		MaxMemberContextLength: 5000,
 	}
 }
 

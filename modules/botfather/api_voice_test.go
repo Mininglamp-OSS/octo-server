@@ -10,7 +10,6 @@ import (
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/server"
-	"github.com/Mininglamp-OSS/octo-server/modules/voice"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -92,9 +91,9 @@ func TestBotPutVoiceContext_WhitespaceOnlyContext(t *testing.T) {
 }
 
 func TestBotPutVoiceContext_ExceedsMaxLength(t *testing.T) {
-	s, _, botToken := setupVoiceTestEnv(t)
+	s, bf, botToken := setupVoiceTestEnv(t)
 
-	longContext := strings.Repeat("a", voice.MaxVoiceContextLength+1)
+	longContext := strings.Repeat("a", bf.voiceCfg.MaxVoiceContextLength+1)
 	body, _ := json.Marshal(map[string]string{"context": longContext})
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("PUT", "/v1/bot/voice/context", bytes.NewReader(body))
@@ -107,9 +106,9 @@ func TestBotPutVoiceContext_ExceedsMaxLength(t *testing.T) {
 }
 
 func TestBotPutVoiceContext_ExactMaxLength(t *testing.T) {
-	s, _, botToken := setupVoiceTestEnv(t)
+	s, bf, botToken := setupVoiceTestEnv(t)
 
-	exactContext := strings.Repeat("a", voice.MaxVoiceContextLength)
+	exactContext := strings.Repeat("a", bf.voiceCfg.MaxVoiceContextLength)
 	body, _ := json.Marshal(map[string]string{"context": exactContext})
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("PUT", "/v1/bot/voice/context", bytes.NewReader(body))
@@ -370,10 +369,10 @@ func TestBotPutVoiceContext_Upsert(t *testing.T) {
 // --- CJK context length test ---
 
 func TestBotPutVoiceContext_CJKRuneCount(t *testing.T) {
-	s, _, botToken := setupVoiceTestEnv(t)
+	s, bf, botToken := setupVoiceTestEnv(t)
 
 	// Exactly MaxVoiceContextLength CJK characters (each is 3 bytes but 1 rune)
-	exactContext := strings.Repeat("你", voice.MaxVoiceContextLength)
+	exactContext := strings.Repeat("你", bf.voiceCfg.MaxVoiceContextLength)
 	body, _ := json.Marshal(map[string]string{"context": exactContext})
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("PUT", "/v1/bot/voice/context", bytes.NewReader(body))
@@ -383,7 +382,7 @@ func TestBotPutVoiceContext_CJKRuneCount(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 
 	// One more CJK character should exceed limit
-	overContext := strings.Repeat("你", voice.MaxVoiceContextLength+1)
+	overContext := strings.Repeat("你", bf.voiceCfg.MaxVoiceContextLength+1)
 	body, _ = json.Marshal(map[string]string{"context": overContext})
 	w = httptest.NewRecorder()
 	req, _ = http.NewRequest("PUT", "/v1/bot/voice/context", bytes.NewReader(body))
@@ -391,4 +390,48 @@ func TestBotPutVoiceContext_CJKRuneCount(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer "+botToken)
 	s.GetRoute().ServeHTTP(w, req)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+// --- personal_context / member_context in bot transcribe ---
+
+func TestBotTranscribe_WithPersonalAndMemberContext(t *testing.T) {
+	s, bf, botToken := setupVoiceTestEnv(t)
+
+	// Set up a mock LiteLLM server that verifies the prompt contains sub-tags
+	litellmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Return a simple success response
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"choices": []map[string]interface{}{
+				{"message": map[string]string{"content": "transcribed with contexts"}},
+			},
+		})
+	}))
+	defer litellmServer.Close()
+
+	bf.voiceCfg.LiteLLMUrl = litellmServer.URL
+	bf.voiceCfg.LiteLLMKey = "test-key"
+	bf.voiceCfg.Models = []string{"test-model"}
+	bf.voiceCfg.Engine = "gemini"
+	bf.voiceCfg.EditMode = "edit"
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	part, _ := writer.CreateFormFile("audio", "test.wav")
+	part.Write([]byte("fake-audio"))
+	writer.WriteField("personal_context", "my personal terms")
+	writer.WriteField("member_context", "Alice, Bob")
+	writer.WriteField("chat_context", "recent chat")
+	writer.Close()
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/bot/voice/transcribe", body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+botToken)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	assert.Equal(t, "transcribed with contexts", resp["text"])
 }

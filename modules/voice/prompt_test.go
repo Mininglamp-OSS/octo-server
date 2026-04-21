@@ -191,6 +191,76 @@ func TestBuildUserMessage_Edit_UsesEditTemplate(t *testing.T) {
 	assert.Contains(t, msg, "根据音频中的语音对其进行处理")
 }
 
+// --- BuildVocabularyReference tests ---
+
+func TestBuildVocabularyReference_AllEmpty(t *testing.T) {
+	result := BuildVocabularyReference("", "", "")
+	assert.Equal(t, "", result)
+}
+
+func TestBuildVocabularyReference_OnlyChatContext(t *testing.T) {
+	result := BuildVocabularyReference("", "", "chat messages here")
+	assert.Equal(t, "chat messages here", result)
+}
+
+func TestBuildVocabularyReference_OnlyPersonal(t *testing.T) {
+	result := BuildVocabularyReference("my terms", "", "")
+	assert.Contains(t, result, "<personal_vocabulary>")
+	assert.Contains(t, result, "my terms")
+	assert.NotContains(t, result, "<member_vocabulary>")
+	assert.NotContains(t, result, "<latest_chat_context>")
+}
+
+func TestBuildVocabularyReference_OnlyMember(t *testing.T) {
+	result := BuildVocabularyReference("", "Alice, Bob", "")
+	assert.Contains(t, result, "<member_vocabulary>")
+	assert.Contains(t, result, "Alice, Bob")
+	assert.NotContains(t, result, "<personal_vocabulary>")
+	assert.NotContains(t, result, "<latest_chat_context>")
+}
+
+func TestBuildVocabularyReference_PersonalAndMember(t *testing.T) {
+	result := BuildVocabularyReference("my terms", "Alice, Bob", "")
+	assert.Contains(t, result, "<personal_vocabulary>")
+	assert.Contains(t, result, "my terms")
+	assert.Contains(t, result, "<member_vocabulary>")
+	assert.Contains(t, result, "Alice, Bob")
+	assert.NotContains(t, result, "<latest_chat_context>")
+
+	pIdx := strings.Index(result, "<personal_vocabulary>")
+	mIdx := strings.Index(result, "<member_vocabulary>")
+	assert.True(t, pIdx < mIdx, "personal should appear before member")
+}
+
+func TestBuildVocabularyReference_PersonalAndChat(t *testing.T) {
+	result := BuildVocabularyReference("my terms", "", "chat messages")
+	assert.Contains(t, result, "<personal_vocabulary>")
+	assert.Contains(t, result, "my terms")
+	assert.Contains(t, result, "<latest_chat_context>")
+	assert.Contains(t, result, "chat messages")
+	assert.NotContains(t, result, "<member_vocabulary>")
+
+	pIdx := strings.Index(result, "<personal_vocabulary>")
+	cIdx := strings.Index(result, "<latest_chat_context>")
+	assert.True(t, pIdx < cIdx, "personal should appear before chat")
+}
+
+func TestBuildVocabularyReference_AllThree(t *testing.T) {
+	result := BuildVocabularyReference("my terms", "Alice, Bob", "chat messages")
+	assert.Contains(t, result, "<personal_vocabulary>")
+	assert.Contains(t, result, "my terms")
+	assert.Contains(t, result, "<member_vocabulary>")
+	assert.Contains(t, result, "Alice, Bob")
+	assert.Contains(t, result, "<latest_chat_context>")
+	assert.Contains(t, result, "chat messages")
+
+	pIdx := strings.Index(result, "<personal_vocabulary>")
+	mIdx := strings.Index(result, "<member_vocabulary>")
+	cIdx := strings.Index(result, "<latest_chat_context>")
+	assert.True(t, pIdx < mIdx, "personal should appear before member")
+	assert.True(t, mIdx < cIdx, "member should appear before chat")
+}
+
 // --- IsNoSpeech tests ---
 
 func TestIsNoSpeech(t *testing.T) {

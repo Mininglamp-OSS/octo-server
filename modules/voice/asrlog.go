@@ -21,9 +21,11 @@ type ASRInput struct {
 	MimeType    string `json:"mime_type"`
 	AudioSize   int    `json:"audio_size"`
 	AudioFile   string `json:"audio_file"`
-	ContextText string `json:"context_text"`
-	ChatContext string `json:"chat_context"`
-	Model       string `json:"model"`
+	ContextText     string `json:"context_text"`
+	ChatContext     string `json:"chat_context"`
+	PersonalContext string `json:"personal_context"`
+	MemberContext   string `json:"member_context"`
+	Model           string `json:"model"`
 	Language    string `json:"language"`
 }
 

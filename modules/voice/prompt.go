@@ -103,6 +103,32 @@ func buildSystemMessage() string {
 	return activePrompts.System
 }
 
+// BuildVocabularyReference merges personalCtx, memberCtx, chatCtx into a
+// single vocabulary_reference string. When personalCtx or memberCtx is
+// non-empty, sub-tags with Chinese labels are used; otherwise chatCtx is
+// returned as-is for backward compatibility.
+func BuildVocabularyReference(personalCtx, memberCtx, chatCtx string) string {
+	if personalCtx == "" && memberCtx == "" {
+		return chatCtx
+	}
+
+	var parts []string
+
+	if personalCtx != "" {
+		parts = append(parts, "用户个人设置的纠错上下文：\n<personal_vocabulary>\n"+personalCtx+"\n</personal_vocabulary>")
+	}
+
+	if memberCtx != "" {
+		parts = append(parts, "聊天成员上下文：\n<member_vocabulary>\n"+memberCtx+"\n</member_vocabulary>")
+	}
+
+	if chatCtx != "" {
+		parts = append(parts, "最近的聊天消息内容：\n<latest_chat_context>\n"+chatCtx+"\n</latest_chat_context>")
+	}
+
+	return strings.Join(parts, "\n")
+}
+
 // buildUserMessage builds the user message text based on mode and context.
 // mode is "append", "edit", or empty (defaults to edit-like behavior).
 func buildUserMessage(mode, contextText, chatContext string) string {

@@ -59,8 +59,10 @@ func setupTestRouter(cfg *VoiceConfig, litellmURL string) *wkhttp.WKHttp {
 }
 
 type multipartOpts struct {
-	contextText string
-	chatContext string
+	contextText     string
+	chatContext     string
+	personalContext string
+	memberContext   string
 }
 
 func createMultipartRequest(t *testing.T, path string, audioData []byte, contextText string) *http.Request {
@@ -86,6 +88,16 @@ func createMultipartRequestWithOpts(t *testing.T, path string, audioData []byte,
 		assert.NoError(t, err)
 	}
 
+	if opts.personalContext != "" {
+		err = writer.WriteField("personal_context", opts.personalContext)
+		assert.NoError(t, err)
+	}
+
+	if opts.memberContext != "" {
+		err = writer.WriteField("member_context", opts.memberContext)
+		assert.NoError(t, err)
+	}
+
 	err = writer.Close()
 	assert.NoError(t, err)
 
@@ -97,16 +109,20 @@ func createMultipartRequestWithOpts(t *testing.T, path string, audioData []byte,
 
 func newTestAPIConfig(litellmURL string) *VoiceConfig {
 	return &VoiceConfig{
-		LiteLLMUrl:   litellmURL,
-		LiteLLMKey:   "test-key",
-		Timeout:      5,
-		TotalTimeout: 10,
-		Models:       []string{"test-model"},
-		GPTModels:    []string{"gpt-test"},
-		MaxDuration:  60,
-		MaxFileSize:  5 * 1024 * 1024,
-		Engine:       "gemini",
-		EditMode:     "edit",
+		LiteLLMUrl:             litellmURL,
+		LiteLLMKey:             "test-key",
+		Timeout:                5,
+		TotalTimeout:           10,
+		Models:                 []string{"test-model"},
+		GPTModels:              []string{"gpt-test"},
+		MaxDuration:            60,
+		MaxFileSize:            5 * 1024 * 1024,
+		Engine:                 "gemini",
+		EditMode:               "edit",
+		MaxVoiceContextLength:  10000,
+		MaxContextTextLength:   5000,
+		MaxChatContextLength:   20000,
+		MaxMemberContextLength: 5000,
 	}
 }
 
@@ -359,9 +375,9 @@ func TestTranscribeAPI_ChatContextTruncation(t *testing.T) {
 
 	// Create chat context that exceeds MaxChatContextLength
 	longPrefix := strings.Repeat("A", 5000) // will be truncated away
-	longSuffix := strings.Repeat("B", MaxChatContextLength)
+	longSuffix := strings.Repeat("B", defaultMaxChatContextLength)
 	longChatContext := longPrefix + longSuffix
-	assert.True(t, len(longChatContext) > MaxChatContextLength)
+	assert.True(t, len(longChatContext) > defaultMaxChatContextLength)
 
 	router := setupTestRouter(cfg, "")
 	w := httptest.NewRecorder()
@@ -498,7 +514,7 @@ func TestTranscribeAPI_ContextTextTruncation(t *testing.T) {
 	cfg := newTestAPIConfig(litellmServer.URL)
 
 	longPrefix := strings.Repeat("X", 5000)
-	longSuffix := strings.Repeat("Y", MaxContextTextLength)
+	longSuffix := strings.Repeat("Y", defaultMaxContextTextLength)
 	longContextText := longPrefix + longSuffix
 
 	router := setupTestRouter(cfg, "")
@@ -780,9 +796,9 @@ func TestTranscribeAPI_RuneSafeChatContextTruncation(t *testing.T) {
 	router := setupTestRouter(cfg, "")
 
 	// CJK characters: each is 1 rune but 3 bytes
-	cjkTail := strings.Repeat("你", MaxChatContextLength)
+	cjkTail := strings.Repeat("你", defaultMaxChatContextLength)
 	longChatContext := "AAA" + cjkTail // 3 extra ASCII chars
-	assert.True(t, len([]rune(longChatContext)) > MaxChatContextLength)
+	assert.True(t, len([]rune(longChatContext)) > defaultMaxChatContextLength)
 
 	w := httptest.NewRecorder()
 	req := createMultipartRequestWithOpts(t, "/v1/voice/transcribe", []byte("fake-audio"), multipartOpts{
@@ -859,4 +875,182 @@ func TestGetConfigAPI_QwenEngine(t *testing.T) {
 	assert.Equal(t, true, resp["enabled"])
 	assert.Equal(t, "qw", resp["engine"])
 	assert.Equal(t, "edit", resp["edit_mode"])
+}
+
+// --- personal_context / member_context tests ---
+
+func TestTranscribeAPI_WithPersonalContext(t *testing.T) {
+	litellmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req chatCompletionRequest
+		json.NewDecoder(r.Body).Decode(&req)
+
+		prompt := getUserPromptText(t, req)
+		assert.Contains(t, prompt, "<personal_vocabulary>")
+		assert.Contains(t, prompt, "my personal terms")
+
+		resp := chatCompletionResponse{
+			Choices: []choice{{Message: responseMessage{Content: "OK with personal"}}},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer litellmServer.Close()
+
+	cfg := newTestAPIConfig(litellmServer.URL)
+	router := setupTestRouter(cfg, "")
+	w := httptest.NewRecorder()
+	req := createMultipartRequestWithOpts(t, "/v1/voice/transcribe", []byte("fake-audio"), multipartOpts{
+		personalContext: "my personal terms",
+	})
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	assert.Equal(t, "OK with personal", resp["text"])
+}
+
+func TestTranscribeAPI_WithMemberContext(t *testing.T) {
+	litellmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req chatCompletionRequest
+		json.NewDecoder(r.Body).Decode(&req)
+
+		prompt := getUserPromptText(t, req)
+		assert.Contains(t, prompt, "<member_vocabulary>")
+		assert.Contains(t, prompt, "Alice, Bob")
+
+		resp := chatCompletionResponse{
+			Choices: []choice{{Message: responseMessage{Content: "OK with member"}}},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer litellmServer.Close()
+
+	cfg := newTestAPIConfig(litellmServer.URL)
+	router := setupTestRouter(cfg, "")
+	w := httptest.NewRecorder()
+	req := createMultipartRequestWithOpts(t, "/v1/voice/transcribe", []byte("fake-audio"), multipartOpts{
+		memberContext: "Alice, Bob",
+	})
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	assert.Equal(t, "OK with member", resp["text"])
+}
+
+func TestTranscribeAPI_WithAllContexts(t *testing.T) {
+	litellmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req chatCompletionRequest
+		json.NewDecoder(r.Body).Decode(&req)
+
+		prompt := getUserPromptText(t, req)
+		assert.Contains(t, prompt, "<personal_vocabulary>")
+		assert.Contains(t, prompt, "my terms")
+		assert.Contains(t, prompt, "<member_vocabulary>")
+		assert.Contains(t, prompt, "Alice, Bob")
+		assert.Contains(t, prompt, "<latest_chat_context>")
+		assert.Contains(t, prompt, "recent chat")
+
+		// Verify order: personal → member → chat
+		pIdx := strings.Index(prompt, "<personal_vocabulary>")
+		mIdx := strings.Index(prompt, "<member_vocabulary>")
+		cIdx := strings.Index(prompt, "<latest_chat_context>")
+		assert.True(t, pIdx < mIdx, "personal should appear before member")
+		assert.True(t, mIdx < cIdx, "member should appear before chat")
+
+		resp := chatCompletionResponse{
+			Choices: []choice{{Message: responseMessage{Content: "OK with all"}}},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer litellmServer.Close()
+
+	cfg := newTestAPIConfig(litellmServer.URL)
+	router := setupTestRouter(cfg, "")
+	w := httptest.NewRecorder()
+	req := createMultipartRequestWithOpts(t, "/v1/voice/transcribe", []byte("fake-audio"), multipartOpts{
+		personalContext: "my terms",
+		memberContext:   "Alice, Bob",
+		chatContext:     "recent chat",
+	})
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	assert.Equal(t, "OK with all", resp["text"])
+}
+
+func TestTranscribeAPI_PersonalContextTruncation(t *testing.T) {
+	var receivedPrompt string
+	litellmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req chatCompletionRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		receivedPrompt = getUserPromptText(t, req)
+
+		resp := chatCompletionResponse{
+			Choices: []choice{{Message: responseMessage{Content: "OK"}}},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer litellmServer.Close()
+
+	cfg := newTestAPIConfig(litellmServer.URL)
+	cfg.MaxVoiceContextLength = 100 // small limit for testing
+
+	longPrefix := strings.Repeat("A", 50)
+	longSuffix := strings.Repeat("B", 100)
+	longPersonalContext := longPrefix + longSuffix
+
+	router := setupTestRouter(cfg, "")
+	w := httptest.NewRecorder()
+	req := createMultipartRequestWithOpts(t, "/v1/voice/transcribe", []byte("fake-audio"), multipartOpts{
+		personalContext: longPersonalContext,
+	})
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	// Should keep the tail, truncate the head
+	assert.Contains(t, receivedPrompt, longSuffix)
+	assert.NotContains(t, receivedPrompt, longPrefix)
+}
+
+func TestTranscribeAPI_MemberContextTruncation(t *testing.T) {
+	var receivedPrompt string
+	litellmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req chatCompletionRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		receivedPrompt = getUserPromptText(t, req)
+
+		resp := chatCompletionResponse{
+			Choices: []choice{{Message: responseMessage{Content: "OK"}}},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer litellmServer.Close()
+
+	cfg := newTestAPIConfig(litellmServer.URL)
+	cfg.MaxMemberContextLength = 100 // small limit for testing
+
+	longPrefix := strings.Repeat("A", 50)
+	longSuffix := strings.Repeat("B", 100)
+	longMemberContext := longPrefix + longSuffix
+
+	router := setupTestRouter(cfg, "")
+	w := httptest.NewRecorder()
+	req := createMultipartRequestWithOpts(t, "/v1/voice/transcribe", []byte("fake-audio"), multipartOpts{
+		memberContext: longMemberContext,
+	})
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	// Should keep the tail, truncate the head
+	assert.Contains(t, receivedPrompt, longSuffix)
+	assert.NotContains(t, receivedPrompt, longPrefix)
 }

@@ -90,20 +90,42 @@ func (v *Voice) transcribe(c *wkhttp.Context) {
 	}
 
 	contextText := c.Request.FormValue("context_text")
-	if len([]rune(contextText)) > MaxContextTextLength {
+	if len([]rune(contextText)) > v.cfg.MaxContextTextLength {
 		v.Warn("context_text exceeds max length, truncating to keep recent text",
 			zap.Int("original_rune_length", len([]rune(contextText))),
-			zap.Int("max_length", MaxContextTextLength))
-		contextText = TruncateRunesTail(contextText, MaxContextTextLength)
+			zap.Int("max_length", v.cfg.MaxContextTextLength))
+		contextText = TruncateRunesTail(contextText, v.cfg.MaxContextTextLength)
 	}
 
 	chatContext := c.Request.FormValue("chat_context")
-	if len([]rune(chatContext)) > MaxChatContextLength {
+	if len([]rune(chatContext)) > v.cfg.MaxChatContextLength {
 		v.Warn("chat_context exceeds max length, truncating to last characters",
 			zap.Int("original_rune_length", len([]rune(chatContext))),
-			zap.Int("max_length", MaxChatContextLength))
-		chatContext = TruncateRunesTail(chatContext, MaxChatContextLength)
+			zap.Int("max_length", v.cfg.MaxChatContextLength))
+		chatContext = TruncateRunesTail(chatContext, v.cfg.MaxChatContextLength)
 	}
+
+	personalContext := c.Request.FormValue("personal_context")
+	if len([]rune(personalContext)) > v.cfg.MaxVoiceContextLength {
+		v.Warn("personal_context exceeds max length, truncating to keep recent text",
+			zap.Int("original_rune_length", len([]rune(personalContext))),
+			zap.Int("max_length", v.cfg.MaxVoiceContextLength))
+		personalContext = TruncateRunesTail(personalContext, v.cfg.MaxVoiceContextLength)
+	}
+
+	memberContext := c.Request.FormValue("member_context")
+	if len([]rune(memberContext)) > v.cfg.MaxMemberContextLength {
+		v.Warn("member_context exceeds max length, truncating to keep recent text",
+			zap.Int("original_rune_length", len([]rune(memberContext))),
+			zap.Int("max_length", v.cfg.MaxMemberContextLength))
+		memberContext = TruncateRunesTail(memberContext, v.cfg.MaxMemberContextLength)
+	}
+
+	// Save original chatContext for ASR logging
+	origChatContext := chatContext
+
+	// Merge vocabulary reference
+	chatContext = BuildVocabularyReference(personalContext, memberContext, chatContext)
 
 	startTime := time.Now()
 	result, err := v.service.TranscribeWithResult(audioData, mimeType, contextText, chatContext,
@@ -113,8 +135,8 @@ func (v *Voice) transcribe(c *wkhttp.Context) {
 	if err != nil {
 		v.Error("transcription failed", zap.Error(err))
 		if v.asrLogger != nil {
-			entry := v.buildASREntry("app", audioData, mimeType, contextText, chatContext,
-				startTime, durationMs, result, err)
+			entry := v.buildASREntry("app", audioData, mimeType, contextText, origChatContext,
+				personalContext, memberContext, startTime, durationMs, result, err)
 			v.asrLogger.Enqueue(entry)
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -125,8 +147,8 @@ func (v *Voice) transcribe(c *wkhttp.Context) {
 	}
 
 	if v.asrLogger != nil {
-		v.asrLogger.Enqueue(v.buildASREntry("app", audioData, mimeType, contextText, chatContext,
-			startTime, durationMs, result, nil))
+		v.asrLogger.Enqueue(v.buildASREntry("app", audioData, mimeType, contextText, origChatContext,
+			personalContext, memberContext, startTime, durationMs, result, nil))
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -151,7 +173,8 @@ func (v *Voice) getConfig(c *wkhttp.Context) {
 
 // buildASREntry constructs an ASREntry with common fields populated.
 func (v *Voice) buildASREntry(source string, audioData []byte, mimeType string,
-	contextText string, chatContext string, startTime time.Time, durationMs int64,
+	contextText string, chatContext string, personalContext string, memberContext string,
+	startTime time.Time, durationMs int64,
 	result *TranscribeResult, err error) ASREntry {
 
 	entry := ASREntry{
@@ -160,11 +183,13 @@ func (v *Voice) buildASREntry(source string, audioData []byte, mimeType string,
 		Source:    source,
 		Engine:    v.cfg.Engine,
 		Input: ASRInput{
-			Mode:        v.cfg.EditMode,
-			MimeType:    mimeType,
-			AudioSize:   len(audioData),
-			ContextText: contextText,
-			ChatContext: chatContext,
+			Mode:            v.cfg.EditMode,
+			MimeType:        mimeType,
+			AudioSize:       len(audioData),
+			ContextText:     contextText,
+			ChatContext:     chatContext,
+			PersonalContext: personalContext,
+			MemberContext:   memberContext,
 		},
 		AudioData:  audioData,
 		DurationMs: durationMs,

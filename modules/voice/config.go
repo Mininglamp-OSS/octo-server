@@ -23,11 +23,12 @@ const (
 	defaultMaxFileSize = 3 * 1024 * 1024 // 3MB
 )
 
-// Exported constants for voice context limits
+// Package-private default values for voice context limits
 const (
-	MaxVoiceContextLength = 10000 // max voice correction context characters (rune count)
-	MaxContextTextLength  = 10000 // max context_text characters (rune count)
-	MaxChatContextLength  = 10000 // max chat_context characters (rune count)
+	defaultMaxVoiceContextLength  = 10000
+	defaultMaxContextTextLength   = 5000
+	defaultMaxChatContextLength   = 20000
+	defaultMaxMemberContextLength = 5000
 )
 
 var defaultModels = []string{"gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro"}
@@ -55,6 +56,11 @@ type VoiceConfig struct {
 	QwenTimeout int      // Qwen per-model timeout (optional, falls back to Timeout)
 
 	PromptFile string // Path to voice_prompts.yaml (env: VOICE_PROMPT_FILE)
+
+	MaxVoiceContextLength  int // max personal voice context runes (env: VOICE_MAX_VOICE_CONTEXT_LENGTH)
+	MaxContextTextLength   int // max context_text runes (env: VOICE_MAX_CONTEXT_TEXT_LENGTH)
+	MaxChatContextLength   int // max chat_context runes (env: VOICE_MAX_CHAT_CONTEXT_LENGTH)
+	MaxMemberContextLength int // max member_context runes (env: VOICE_MAX_MEMBER_CONTEXT_LENGTH)
 }
 
 // NewVoiceConfigFromEnv reads voice config from environment variables
@@ -172,6 +178,11 @@ func NewVoiceConfigFromEnv() *VoiceConfig {
 		cfg.PromptFile = v
 	}
 
+	cfg.MaxVoiceContextLength = getEnvInt("VOICE_MAX_VOICE_CONTEXT_LENGTH", defaultMaxVoiceContextLength)
+	cfg.MaxContextTextLength = getEnvInt("VOICE_MAX_CONTEXT_TEXT_LENGTH", defaultMaxContextTextLength)
+	cfg.MaxChatContextLength = getEnvInt("VOICE_MAX_CHAT_CONTEXT_LENGTH", defaultMaxChatContextLength)
+	cfg.MaxMemberContextLength = getEnvInt("VOICE_MAX_MEMBER_CONTEXT_LENGTH", defaultMaxMemberContextLength)
+
 	// EditMode: explicit setting takes priority, otherwise auto-decide by engine
 	if v := os.Getenv("VOICE_EDIT_MODE"); v == "edit" || v == "append" {
 		cfg.EditMode = v
@@ -234,6 +245,18 @@ func (c *VoiceConfig) Validate() error {
 		}
 	}
 	return nil
+}
+
+func getEnvInt(key string, defaultVal int) int {
+	val := os.Getenv(key)
+	if val == "" {
+		return defaultVal
+	}
+	n, err := strconv.Atoi(val)
+	if err != nil || n <= 0 {
+		return defaultVal
+	}
+	return n
 }
 
 // TruncateRunes truncates a string to at most max Unicode characters (rune-safe).
