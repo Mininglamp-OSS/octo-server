@@ -428,7 +428,10 @@ func (f *File) getUploadCredentials(c *wkhttp.Context) {
 		}
 		objectKey = fileType + sanitized
 	} else if filename != "" {
-		objectKey = fmt.Sprintf("%s/%d/%s/%s", fileType, time.Now().Unix(), util.GenerUUID(), url.PathEscape(filename))
+			// Use UUID-based key (pure ASCII) to avoid double-encoding by HTTP clients.
+		// The original filename is preserved in Content-Disposition header.
+		fnExt := filepath.Ext(filename)
+		objectKey = fmt.Sprintf("%s/%d/%s/%s%s", fileType, time.Now().Unix(), util.GenerUUID(), util.GenerUUID(), fnExt)
 	} else {
 		objectKey = fmt.Sprintf("%s/%s%s", fileType, util.GenerUUID(), ext)
 	}

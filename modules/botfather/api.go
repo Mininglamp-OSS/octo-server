@@ -1345,7 +1345,9 @@ func (bf *BotFather) botUploadCredentials(c *wkhttp.Context) {
 	}
 
 	prefix := strings.TrimSpace(cosConfig.Prefix)
-	objectPath := fmt.Sprintf("chat/%d/%s/%s", time.Now().Unix(), util.GenerUUID(), url.PathEscape(filename))
+	// Use UUID-based key (pure ASCII) to avoid double-encoding by HTTP clients.
+	fnExt := strings.ToLower(filepath.Ext(filename))
+	objectPath := fmt.Sprintf("chat/%d/%s/%s%s", time.Now().Unix(), util.GenerUUID(), util.GenerUUID(), fnExt)
 	var key string
 	if prefix != "" {
 		key = path.Join(prefix, objectPath)
@@ -1418,7 +1420,8 @@ func (bf *BotFather) botUploadPresigned(c *wkhttp.Context) {
 		return
 	}
 
-	objectPath := fmt.Sprintf("chat/%d/%s/%s", time.Now().Unix(), util.GenerUUID(), url.PathEscape(filename))
+	// Use UUID-based key (pure ASCII) to avoid double-encoding by HTTP clients.
+	objectPath := fmt.Sprintf("chat/%d/%s/%s%s", time.Now().Unix(), util.GenerUUID(), util.GenerUUID(), ext)
 	contentType := mime.TypeByExtension(ext)
 	if contentType == "" {
 		contentType = "application/octet-stream"

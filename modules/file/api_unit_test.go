@@ -304,18 +304,20 @@ func TestGetUploadCredentials_ObjectKeyWithFilename(t *testing.T) {
 		wantContentDisp    bool
 	}{
 		{
-			name:            "filename provided generates timestamp/uuid/filename key",
-			queryParams:     "type=chat&filename=photo.jpg",
-			wantStatus:      http.StatusOK,
-			wantKeyContains: "photo.jpg",
-			wantContentDisp: true,
+			name:               "filename provided generates UUID-based key with extension",
+			queryParams:        "type=chat&filename=photo.jpg",
+			wantStatus:         http.StatusOK,
+			wantKeyContains:    ".jpg",
+			wantKeyNotContains: "photo.jpg",
+			wantContentDisp:    true,
 		},
 		{
-			name:            "chinese filename in key",
-			queryParams:     "type=chat&filename=照片.jpg",
-			wantStatus:      http.StatusOK,
-			wantKeyContains: url.PathEscape("照片.jpg"),
-			wantContentDisp: true,
+			name:               "chinese filename not in key, extension preserved",
+			queryParams:        "type=chat&filename=照片.jpg",
+			wantStatus:         http.StatusOK,
+			wantKeyContains:    ".jpg",
+			wantKeyNotContains: "照片",
+			wantContentDisp:    true,
 		},
 		{
 			name:               "path provided uses path-based key",
@@ -368,6 +370,9 @@ func TestGetUploadCredentials_ObjectKeyWithFilename(t *testing.T) {
 				if tt.wantKeyContains != "" {
 					assert.Contains(t, key, tt.wantKeyContains)
 				}
+				if tt.wantKeyNotContains != "" {
+					assert.NotContains(t, key, tt.wantKeyNotContains)
+				}
 
 				if tt.wantContentDisp {
 					cd, ok := resp["contentDisposition"].(string)
@@ -389,7 +394,7 @@ func TestGetUploadCredentials_ObjectKeyFormat(t *testing.T) {
 		service: mockSvc,
 	}
 
-	// Test with filename: key should be fileType/timestamp/uuid/filename
+	// Test with filename: key should be fileType/timestamp/uuid/uuid.ext
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Request, _ = http.NewRequest(http.MethodGet, "/v1/file/upload/credentials?type=chat&filename=test.jpg", nil)
@@ -402,14 +407,96 @@ func TestGetUploadCredentials_ObjectKeyFormat(t *testing.T) {
 	key := resp["key"].(string)
 
 	parts := strings.Split(key, "/")
-	assert.Equal(t, 4, len(parts), "key with filename should have 4 parts: type/timestamp/uuid/filename, got: %s", key)
+	assert.Equal(t, 4, len(parts), "key should have 4 parts: type/timestamp/uuid/uuid.ext, got: %s", key)
 	assert.Equal(t, "chat", parts[0])
 	// parts[1] should be a unix timestamp (numeric)
 	for _, ch := range parts[1] {
 		assert.True(t, ch >= '0' && ch <= '9', "timestamp part should be numeric, got: %s", parts[1])
 	}
-	// parts[3] should be the filename
-	assert.Equal(t, "test.jpg", parts[3])
+	// parts[3] should be uuid.ext, NOT the original filename
+	assert.NotEqual(t, "test.jpg", parts[3], "last part should be uuid.ext, not the original filename")
+	assert.True(t, strings.HasSuffix(parts[3], ".jpg"), "last part should end with .jpg, got: %s", parts[3])
+}
+
+func TestGetUploadCredentials_UUIDBasedKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name    string
+		filename string
+		wantExt string
+	}{
+		{"chinese filename", "带中文的文件.pdf", ".pdf"},
+		{"japanese filename", "テスト.png", ".png"},
+		{"korean filename", "파일.docx", ".docx"},
+		{"emoji filename", "photo\U0001F600.jpg", ".jpg"},
+		{"mixed ascii and unicode", "report-报告-2024.pdf", ".pdf"},
+		{"spaces in filename", "file with spaces.pdf", ".pdf"},
+		{"question mark in filename", "file?query.jpg", ".jpg"},
+		{"pre-encoded filename", "already%20encoded.pdf", ".pdf"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockSvc := &mockService{}
+			f := &File{
+				Log:     log.NewTLog("FileTest"),
+				service: mockSvc,
+			}
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			q := url.Values{}
+			q.Set("type", "chat")
+			q.Set("filename", tt.filename)
+			c.Request, _ = http.NewRequest(http.MethodGet, "/v1/file/upload/credentials?"+q.Encode(), nil)
+
+			wkCtx := &wkhttp.Context{Context: c}
+			f.getUploadCredentials(wkCtx)
+
+			assert.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+			// objectKey should contain only ASCII characters (UUID-based)
+			assert.True(t, isASCII(mockSvc.lastObjectPath),
+				"objectKey should contain only ASCII characters, got: %s", mockSvc.lastObjectPath)
+
+			// objectKey should end with the correct file extension
+			assert.True(t, strings.HasSuffix(mockSvc.lastObjectPath, tt.wantExt),
+				"objectKey should end with %s, got: %s", tt.wantExt, mockSvc.lastObjectPath)
+
+			// objectKey should NOT contain the original filename
+			assert.NotContains(t, mockSvc.lastObjectPath, tt.filename,
+				"objectKey should not contain the original filename")
+		})
+	}
+
+	// Verify UUID uniqueness: different filenames with same extension produce different keys
+	t.Run("different filenames produce different keys", func(t *testing.T) {
+		filenames := []string{"fileA.pdf", "fileB.pdf", "报告.pdf"}
+		keys := make(map[string]bool)
+		for _, fn := range filenames {
+			mockSvc := &mockService{}
+			f := &File{
+				Log:     log.NewTLog("FileTest"),
+				service: mockSvc,
+			}
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			q := url.Values{}
+			q.Set("type", "chat")
+			q.Set("filename", fn)
+			c.Request, _ = http.NewRequest(http.MethodGet, "/v1/file/upload/credentials?"+q.Encode(), nil)
+
+			wkCtx := &wkhttp.Context{Context: c}
+			f.getUploadCredentials(wkCtx)
+
+			assert.Equal(t, http.StatusOK, w.Code)
+			assert.False(t, keys[mockSvc.lastObjectPath],
+				"objectKey should be unique, but got duplicate: %s", mockSvc.lastObjectPath)
+			keys[mockSvc.lastObjectPath] = true
+		}
+	})
 }
 
 func TestGetUploadCredentials_FallbackWithoutFilename(t *testing.T) {
