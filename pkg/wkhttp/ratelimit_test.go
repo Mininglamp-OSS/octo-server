@@ -187,6 +187,7 @@ func TestRateLimitMiddleware(t *testing.T) {
 		r.ServeHTTP(w, req)
 
 		assert.Equal(t, "20", w.Header().Get("X-RateLimit-Limit"))
+		assert.Equal(t, "ip", w.Header().Get("X-RateLimit-Scope"))
 		remaining, err := strconv.Atoi(w.Header().Get("X-RateLimit-Remaining"))
 		assert.NoError(t, err)
 		assert.GreaterOrEqual(t, remaining, 0)
@@ -354,6 +355,7 @@ func TestUIDRateLimitMiddleware(t *testing.T) {
 		r.ServeHTTP(w, req)
 
 		assert.Equal(t, "20", w.Header().Get("X-RateLimit-Limit"))
+		assert.Equal(t, "uid", w.Header().Get("X-RateLimit-Scope"))
 	})
 
 	t.Run("fails open when redis is unreachable", func(t *testing.T) {
@@ -480,6 +482,7 @@ func TestStrictIPRateLimitMiddleware(t *testing.T) {
 		r.ServeHTTP(w1, req1)
 		assert.Equal(t, 200, w1.Code)
 		assert.Equal(t, "1", w1.Header().Get("X-RateLimit-Limit"))
+		assert.Equal(t, "strict:login", w1.Header().Get("X-RateLimit-Scope"))
 
 		got429 := false
 		for i := 0; i < 5; i++ {
