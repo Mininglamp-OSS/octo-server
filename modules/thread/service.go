@@ -70,6 +70,16 @@ type IService interface {
 	DeleteThreadMd(groupNo, shortID, deletedBy string) (int64, error)
 	// CanEditThreadMd 检查是否有编辑子区 GROUP.md 的权限（供 API Handler 层调用）
 	CanEditThreadMd(groupNo, shortID, uid string) (bool, error)
+	// UpdateSetting 更新当前用户对子区的个人设置(目前支持 mute)
+	UpdateSetting(groupNo, shortID, uid string, settings map[string]interface{}) error
+	// GetSettingsWithUIDs 批量查询一批用户对某子区的设置,无记录则不返回
+	GetSettingsWithUIDs(groupNo, shortID string, uids []string) ([]*SettingResp, error)
+}
+
+// SettingResp 子区用户设置响应
+type SettingResp struct {
+	UID  string `json:"uid"`
+	Mute int    `json:"mute"`
 }
 
 // Service 子区服务实现
@@ -908,18 +918,107 @@ func (s *Service) IsMember(groupNo, shortID, uid string) (bool, error) {
 	return s.db.ExistMember(threadID, uid)
 }
 
-// RemoveUserFromGroupThreads 退群时移除用户在该群所有子区的成员身份和 IM 订阅
+// UpdateSetting 更新用户对某子区的个人设置(目前支持 mute)
+// 权限: 必须是父群成员; 无需是子区成员(与群聊 setting 行为保持一致)
+func (s *Service) UpdateSetting(groupNo, shortID, uid string, settings map[string]interface{}) error {
+	isGroupMember, err := s.groupService.ExistMember(groupNo, uid)
+	if err != nil {
+		return fmt.Errorf("check group membership: %w", err)
+	}
+	if !isGroupMember {
+		return errors.New("not a group member")
+	}
+
+	thread, err := s.db.QueryByGroupNoAndShortID(groupNo, shortID)
+	if err != nil {
+		return fmt.Errorf("query thread: %w", err)
+	}
+	if thread == nil {
+		return errors.New("thread not found")
+	}
+	if thread.Status == ThreadStatusDeleted {
+		return errors.New("thread has been deleted")
+	}
+
+	existing, err := s.db.QuerySetting(groupNo, shortID, uid)
+	if err != nil {
+		return fmt.Errorf("query thread setting: %w", err)
+	}
+
+	target := &SettingModel{
+		GroupNo: groupNo,
+		ShortID: shortID,
+		UID:     uid,
+	}
+	if existing != nil {
+		target.Mute = existing.Mute
+	}
+
+	for key, raw := range settings {
+		switch key {
+		case "mute":
+			val, ok := raw.(float64)
+			if !ok {
+				return fmt.Errorf("invalid mute value type")
+			}
+			intVal := int(val)
+			if intVal != 0 && intVal != 1 {
+				return fmt.Errorf("mute must be 0 or 1")
+			}
+			target.Mute = intVal
+		default:
+			// 未知字段忽略,保持向前兼容
+		}
+	}
+
+	// 校验通过后再申请版本号,避免校验失败时浪费全局序列
+	version, err := s.ctx.GenSeq(ThreadSeqKey)
+	if err != nil {
+		return fmt.Errorf("generate sequence: %w", err)
+	}
+	target.Version = version
+
+	if err := s.db.UpsertSetting(target); err != nil {
+		return fmt.Errorf("upsert thread setting: %w", err)
+	}
+
+	channelID := BuildChannelID(groupNo, shortID)
+	if err := s.ctx.SendChannelUpdate(
+		config.ChannelReq{ChannelID: uid, ChannelType: common.ChannelTypePerson.Uint8()},
+		config.ChannelReq{ChannelID: channelID, ChannelType: common.ChannelTypeCommunityTopic.Uint8()},
+	); err != nil {
+		s.Warn("下发子区频道更新失败", zap.Error(err), zap.String("channelID", channelID), zap.String("uid", uid))
+	}
+
+	return nil
+}
+
+// GetSettingsWithUIDs 批量查询一批用户对某子区的设置,无记录不返回
+func (s *Service) GetSettingsWithUIDs(groupNo, shortID string, uids []string) ([]*SettingResp, error) {
+	if len(uids) == 0 {
+		return []*SettingResp{}, nil
+	}
+	models, err := s.db.QuerySettingsWithUIDs(groupNo, shortID, uids)
+	if err != nil {
+		return nil, fmt.Errorf("query thread settings: %w", err)
+	}
+	resp := make([]*SettingResp, 0, len(models))
+	for _, m := range models {
+		resp = append(resp, &SettingResp{UID: m.UID, Mute: m.Mute})
+	}
+	return resp, nil
+}
+
+// RemoveUserFromGroupThreads 退群时清理用户在该群所有子区的成员身份、个人设置、IM 订阅
+// 注:即使用户未加入任何子区,也要清理 thread_setting(用户可能只设置了 mute 但未 join)
 func (s *Service) RemoveUserFromGroupThreads(groupNo, uid string) error {
-	// 查询用户在该群加入的所有子区
+	// 查询用户在该群加入的所有子区(用于 IM 退订)
 	threads, err := s.db.QueryThreadsByGroupNoAndUID(groupNo, uid)
 	if err != nil {
 		return fmt.Errorf("query user threads in group: %w", err)
 	}
-	if len(threads) == 0 {
-		return nil
-	}
 
-	// 批量删除子区成员记录
+	// 批量清理 thread_member + thread_setting(同一事务)
 	tx, err := s.db.session.Begin()
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
@@ -933,6 +1032,11 @@ func (s *Service) RemoveUserFromGroupThreads(groupNo, uid string) error {
 	err = s.db.DeleteMembersByGroupNoAndUIDTx(groupNo, uid, tx)
 	if err != nil {
 		return fmt.Errorf("delete thread members: %w", err)
+	}
+
+	err = s.db.DeleteSettingsByGroupNoAndUIDTx(groupNo, uid, tx)
+	if err != nil {
+		return fmt.Errorf("delete thread settings: %w", err)
 	}
 
 	if err = tx.Commit(); err != nil {

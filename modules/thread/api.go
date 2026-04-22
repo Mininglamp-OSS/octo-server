@@ -99,6 +99,7 @@ func (t *Thread) Route(r *wkhttp.WKHttp) {
 		threads.GET("", t.listThreads)
 		threads.GET("/:short_id", t.getThread)
 		threads.PUT("/:short_id", t.updateThread)
+		threads.PUT("/:short_id/setting", t.updateSetting)
 		threads.GET("/:short_id/members", t.listMembers)
 		threads.POST("/:short_id/join", t.joinThread)
 		threads.POST("/:short_id/leave", t.leaveThread)
@@ -203,6 +204,41 @@ func (t *Thread) updateThread(c *wkhttp.Context) {
 	err := t.service.UpdateName(groupNo, shortID, loginUID, req.Name)
 	if err != nil {
 		t.Error("修改子区名称失败", zap.Error(err), zap.String("groupNo", groupNo), zap.String("shortID", shortID))
+		c.ResponseError(err)
+		return
+	}
+	c.ResponseOK()
+}
+
+// updateSetting 更新当前用户对子区的个人设置(目前支持 mute)
+// PUT /v1/groups/:group_no/threads/:short_id/setting
+func (t *Thread) updateSetting(c *wkhttp.Context) {
+	groupNo := c.Param("group_no")
+	shortID := c.Param("short_id")
+	loginUID := c.GetLoginUID()
+
+	if !IsValidGroupNo(groupNo) {
+		c.ResponseError(errors.New("invalid group_no format"))
+		return
+	}
+	if !IsValidShortID(shortID) {
+		c.ResponseError(errors.New("invalid short_id format"))
+		return
+	}
+
+	var req map[string]interface{}
+	if err := c.BindJSON(&req); err != nil {
+		t.Error("参数错误", zap.Error(err))
+		c.ResponseError(errors.New("invalid request"))
+		return
+	}
+	if len(req) == 0 {
+		c.ResponseOK()
+		return
+	}
+
+	if err := t.service.UpdateSetting(groupNo, shortID, loginUID, req); err != nil {
+		t.Error("更新子区设置失败", zap.Error(err), zap.String("groupNo", groupNo), zap.String("shortID", shortID))
 		c.ResponseError(err)
 		return
 	}

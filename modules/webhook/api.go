@@ -503,6 +503,7 @@ func (w *Webhook) pushTo(msgResp msgOfflineNotify, toUids []string) error {
 	// var users []*user.Resp
 	userSettings := make([]*user.SettingResp, 0)
 	groupSettings := make([]*group.SettingResp, 0)
+	threadSettings := make([]*threadSettingResp, 0)
 	users, err := w.userService.GetUsers(toUids)
 	if err != nil {
 		w.Error("查询推送用户信息错误", zap.Error(err))
@@ -524,6 +525,20 @@ func (w *Webhook) pushTo(msgResp msgOfflineNotify, toUids []string) error {
 					return nil
 				}
 			}
+		} else if msgResp.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
+			// 子区: 查询 thread_setting + 降级父群 group_setting
+			if groupNo, shortID, ok := parseThreadChannelID(msgResp.ChannelID); ok {
+				threadSettings, err = w.db.QueryThreadSettingsWithUIDs(groupNo, shortID, toUids)
+				if err != nil {
+					w.Error("查询一批用户对某子区设置错误", zap.Error(err))
+					return nil
+				}
+				groupSettings, err = w.groupService.GetSettingsWithUIDs(groupNo, toUids)
+				if err != nil {
+					w.Error("查询一批用户对父群设置错误", zap.Error(err))
+					return nil
+				}
+			}
 		} else {
 			// 查询一批用户对某个群的设置
 			groupSettings, err = w.groupService.GetSettingsWithUIDs(msgResp.ChannelID, toUids)
@@ -536,7 +551,7 @@ func (w *Webhook) pushTo(msgResp msgOfflineNotify, toUids []string) error {
 
 	for _, toUID := range toUids {
 		if !isVideoCall {
-			if !w.allowPush(users, userSettings, groupSettings, toUID, fromUID) {
+			if !w.allowPush(users, userSettings, groupSettings, threadSettings, toUID, fromUID) {
 				w.Debug("allowPush返回false，跳过", zap.String("toUID", toUID))
 				continue
 			}
@@ -592,8 +607,16 @@ func (w *Webhook) pushTo(msgResp msgOfflineNotify, toUids []string) error {
 	return nil
 }
 
+// threadSettingResp 子区用户设置推送视角的精简表示
+type threadSettingResp struct {
+	UID  string
+	Mute int
+}
+
 // 是否允许推送
-func (w *Webhook) allowPush(users []*user.Resp, userSettings []*user.SettingResp, groupSettings []*group.SettingResp, toUID string, fromUID string) bool {
+// threadSettings 非空时优先于 groupSettings: 子区显式设置覆盖父群设置;
+// 若子区无记录,则降级使用父群 mute(与用户期望一致: 父群静音时子区也应静音)
+func (w *Webhook) allowPush(users []*user.Resp, userSettings []*user.SettingResp, groupSettings []*group.SettingResp, threadSettings []*threadSettingResp, toUID string, fromUID string) bool {
 	isPush := true
 	if len(users) > 0 {
 		for _, user := range users {
@@ -605,7 +628,7 @@ func (w *Webhook) allowPush(users []*user.Resp, userSettings []*user.SettingResp
 			}
 		}
 	}
-	if isPush && userSettings != nil && len(userSettings) > 0 && fromUID != "" {
+	if isPush && len(userSettings) > 0 && fromUID != "" {
 		for _, userSetting := range userSettings {
 			if userSetting.UID == toUID && userSetting.ToUID == fromUID {
 				if userSetting.Mute == 1 {
@@ -613,16 +636,29 @@ func (w *Webhook) allowPush(users []*user.Resp, userSettings []*user.SettingResp
 				}
 				break
 			}
-
 		}
 	}
-	if isPush && groupSettings != nil && len(groupSettings) > 0 {
-		for _, groupSetting := range groupSettings {
-			if groupSetting.UID == toUID {
-				if groupSetting.Mute == 1 {
+	if isPush {
+		// 子区设置优先
+		threadSettingFound := false
+		for _, ts := range threadSettings {
+			if ts.UID == toUID {
+				threadSettingFound = true
+				if ts.Mute == 1 {
 					isPush = false
 				}
 				break
+			}
+		}
+		// 无子区记录 → 降级到父群设置
+		if !threadSettingFound && len(groupSettings) > 0 {
+			for _, gs := range groupSettings {
+				if gs.UID == toUID {
+					if gs.Mute == 1 {
+						isPush = false
+					}
+					break
+				}
 			}
 		}
 	}
