@@ -145,9 +145,11 @@ func (bf *BotFather) createUserBot(c *wkhttp.Context) {
 		return
 	}
 
-	// 更新 description（tryCreateBotCore 不处理 description）
+	// description 写入（tryCreateBotCore 不处理 description）
 	if description != "" {
-		bf.db.updateRobotDescription(robotID, description)
+		if descErr := bf.db.updateRobotDescription(robotID, description); descErr != nil {
+			bf.Warn("写入description失败", zap.Error(descErr), zap.String("robotID", robotID))
+		}
 	}
 
 	// Resolve Space ID: API Key binding takes authority; fall back to request

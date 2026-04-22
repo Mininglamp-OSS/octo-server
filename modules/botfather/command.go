@@ -1058,7 +1058,7 @@ func (h *commandHandler) tryCreateBotCore(creatorUID, name, username, botToken, 
 	}
 
 	if err = tx.Commit(); err != nil {
-		compensateApp()
+		// Commit 报错不一定事务没提交，不安全补偿删 app，只返回错误
 		return fmt.Errorf("提交事务失败: %w", err)
 	}
 
