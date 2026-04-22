@@ -5,8 +5,70 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
+	"github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/stretchr/testify/assert"
 )
+
+// TestResolvePushChannelID 验证 APNs 推送中 channel_id 的计算逻辑：
+// 1v1 要把对端换成 FromUID（否则客户端用接收者自己的 UID 去定位会话，跳转错误）。
+func TestResolvePushChannelID(t *testing.T) {
+	// 注册测试用 spaceID 以便 ParseChannelID 能正确拆出前缀
+	const testSpaceID = "00112233445566778899aabbccddeeff"
+	space.RegisterSpaceIDs([]string{testSpaceID})
+	defer space.RegisterSpaceIDs(nil)
+
+	tests := []struct {
+		name        string
+		channelType uint8
+		channelID   string
+		fromUID     string
+		want        string
+	}{
+		{
+			name:        "person 个人空间：channel_id 改写为发送者 UID",
+			channelType: common.ChannelTypePerson.Uint8(),
+			channelID:   "userB",
+			fromUID:     "userA",
+			want:        "userA",
+		},
+		{
+			name:        "person 带 space 前缀：保留前缀，peer 换为发送者",
+			channelType: common.ChannelTypePerson.Uint8(),
+			channelID:   "s" + testSpaceID + "_userB",
+			fromUID:     "userA",
+			want:        "s" + testSpaceID + "_userA",
+		},
+		{
+			name:        "person fromUID 为空：原样返回，防御 early return",
+			channelType: common.ChannelTypePerson.Uint8(),
+			channelID:   "userB",
+			fromUID:     "",
+			want:        "userB",
+		},
+		{
+			name:        "group 群聊：原样返回",
+			channelType: common.ChannelTypeGroup.Uint8(),
+			channelID:   "groupNo123",
+			fromUID:     "userA",
+			want:        "groupNo123",
+		},
+		{
+			name:        "CommunityTopic 子区：原样返回",
+			channelType: common.ChannelTypeCommunityTopic.Uint8(),
+			channelID:   "groupNo123____shortID456",
+			fromUID:     "userA",
+			want:        "groupNo123____shortID456",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolvePushChannelID(tt.channelType, tt.channelID, tt.fromUID)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
 
 // TestGetWebhookDBSingleton verifies that getWebhookDB returns the same instance
 // across multiple calls, ensuring the sync.Once pattern works correctly.

@@ -10,8 +10,21 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
 )
+
+// resolvePushChannelID 计算推送 payload 中 channel_id 的最终取值。
+// 对 person 频道，WuKongIM 传入的 ChannelID 是发送者视角下的对端（即接收者自身 UID），
+// 客户端需要用 "对端 UID" 定位会话，因此需要把 peer 改写成 FromUID，同时保留 space 前缀。
+// 群聊 / 子区在所有成员视角下 channel_id 一致，原样返回。
+func resolvePushChannelID(channelType uint8, channelID, fromUID string) string {
+	if channelType != common.ChannelTypePerson.Uint8() || fromUID == "" {
+		return channelID
+	}
+	spaceID, _ := space.ParseChannelID(channelID)
+	return space.BuildChannelID(spaceID, fromUID)
+}
 
 // EventMsgOffline 离线消息
 const EventMsgOffline = "msg.offline"
@@ -112,7 +125,7 @@ func ParsePushInfo(msgResp msgOfflineNotify, ctx *config.Context, toUser *user.R
 	}
 	payloadInfo.Content = content
 	payloadInfo.SpaceID = msgResp.SpaceID
-	payloadInfo.ChannelID = msgResp.ChannelID
+	payloadInfo.ChannelID = resolvePushChannelID(msgResp.ChannelType, msgResp.ChannelID, msgResp.FromUID)
 	payloadInfo.ChannelType = msgResp.ChannelType
 	payloadInfo.MessageSeq = msgResp.MessageSeq
 
