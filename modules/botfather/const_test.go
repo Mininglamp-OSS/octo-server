@@ -3,6 +3,7 @@ package botfather
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/stretchr/testify/assert"
@@ -58,7 +59,6 @@ func TestCommandConstants(t *testing.T) {
 func TestStateConstants(t *testing.T) {
 	assert.Equal(t, "", StateNone)
 	assert.Equal(t, "waiting_bot_name", StateWaitingBotName)
-	assert.Equal(t, "waiting_bot_username", StateWaitingBotUsername)
 	assert.Equal(t, "waiting_select_bot", StateWaitingSelectBot)
 	assert.Equal(t, "waiting_new_name", StateWaitingNewName)
 	assert.Equal(t, "waiting_description", StateWaitingDescription)
@@ -246,49 +246,14 @@ func TestStateMachineKey_EmptyUID(t *testing.T) {
 	assert.Equal(t, "botfather:state:", key)
 }
 
-func TestBotUsernameValidation(t *testing.T) {
-	// 模拟 onBotUsernameInput 中的验证逻辑
-	tests := []struct {
-		name    string
-		input   string
-		valid   bool
-	}{
-		{"valid alphanumeric", "mybot123", true},
-		{"valid with underscore", "my_bot", true},
-		{"valid single char", "a", true},
-		{"valid max length", strings.Repeat("a", 20), true},
-		{"too long", strings.Repeat("a", 21), false},
-		{"empty", "", false},
-		{"uppercase converted", "MyBot", true}, // 转小写后验证
-		{"with hyphen", "my-bot", false},
-		{"with space", "my bot", false},
-		{"with dot", "my.bot", false},
-		{"with chinese", "机器人", false},
-		{"only underscores", "___", true},
-		{"only numbers", "12345", true},
-		{"starts with number", "1bot", true},
-	}
+func TestGenerateBotID(t *testing.T) {
+	id1 := generateBotID()
+	assert.True(t, strings.HasSuffix(id1, "_bot"))
+	assert.True(t, len(id1) > 4)
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			input := strings.TrimSpace(tt.input)
-			input = strings.ToLower(input)
-			input = strings.TrimSuffix(input, BotUsernameSuffix)
-
-			valid := true
-			if len(input) == 0 || len(input) > 20 {
-				valid = false
-			} else {
-				for _, r := range input {
-					if !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_') {
-						valid = false
-						break
-					}
-				}
-			}
-			assert.Equal(t, tt.valid, valid, "input: %q", tt.input)
-		})
-	}
+	time.Sleep(time.Millisecond)
+	id2 := generateBotID()
+	assert.NotEqual(t, id1, id2)
 }
 
 func TestBotNameValidation(t *testing.T) {

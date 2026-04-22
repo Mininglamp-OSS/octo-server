@@ -34,6 +34,11 @@ func (d *DB) insert(m *model) error {
 	return err
 }
 
+func (d *DB) deleteByAppID(appID string) error {
+	_, err := d.session.DeleteFrom("app").Where("app_id=?", appID).Exec()
+	return err
+}
+
 type model struct {
 	AppID   string
 	AppKey  string

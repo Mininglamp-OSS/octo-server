@@ -106,32 +106,9 @@ func (bf *BotFather) createUserBot(c *wkhttp.Context) {
 		return
 	}
 
-	// Validate and normalize username
-	username := strings.TrimSpace(strings.ToLower(req.Username))
-	username = strings.TrimSuffix(username, BotUsernameSuffix)
-	if username == "" || len(username) > 20 {
-		c.ResponseError(errors.New("username 长度需要在 1-20 个字符之间"))
-		return
-	}
-	for _, r := range username {
-		if !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_') {
-			c.ResponseError(errors.New("username 只能包含英文字母、数字和下划线"))
-			return
-		}
-	}
-	username = username + BotUsernameSuffix
-
-	// Check uniqueness
-	exists, _ := bf.db.existRobotByUsername(username)
-	if exists {
-		c.ResponseErrorWithStatus(fmt.Errorf("username %s 已被占用", username), http.StatusConflict)
-		return
-	}
-	u, _ := bf.userService.GetUserWithUsername(username)
-	if u != nil {
-		c.ResponseErrorWithStatus(fmt.Errorf("username %s 已被占用", username), http.StatusConflict)
-		return
-	}
+	// username 已废弃：接受但忽略，始终自动生成 Bot ID
+	robotID := generateBotID()
+	username := robotID
 
 	// Generate bot token
 	botToken, err := bf.cmdHandler.generateUniqueBotToken()
@@ -140,8 +117,6 @@ func (bf *BotFather) createUserBot(c *wkhttp.Context) {
 		c.ResponseError(errors.New("创建失败，请稍后重试"))
 		return
 	}
-
-	robotID := username
 	description := ""
 	if req.Description != nil {
 		description = *req.Description
