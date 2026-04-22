@@ -1,6 +1,7 @@
 package wkhttp
 
 import (
+	"os"
 	"testing"
 
 	libwkhttp "github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
@@ -17,29 +18,51 @@ func resetUIDRateLimiterForTest() {
 	uidRateLimitReady = false
 }
 
+// setOrUnsetEnv 把 setenv("")（空串）与 unset（变量真正不存在）区分开。
+// os.Getenv 对两者返回值一致，但语义不同——这里按测试用例真实意图设置。
+func setOrUnsetEnv(t *testing.T, key, value string, unset bool) {
+	t.Helper()
+	if unset {
+		prev, had := os.LookupEnv(key)
+		require := func(err error) {
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		require(os.Unsetenv(key))
+		t.Cleanup(func() {
+			if had {
+				_ = os.Setenv(key, prev)
+			} else {
+				_ = os.Unsetenv(key)
+			}
+		})
+		return
+	}
+	t.Setenv(key, value)
+}
+
 func TestParseRPSFromEnv(t *testing.T) {
 	const key = "DM_API_RATELIMIT_TEST_RPS"
 
 	tests := []struct {
-		name string
-		env  string
-		def  float64
-		want float64
+		name  string
+		env   string
+		unset bool
+		def   float64
+		want  float64
 	}{
-		{"unset uses default", "", 2.0, 2.0},
-		{"valid value", "5.5", 2.0, 5.5},
-		{"malformed falls back", "2x", 2.0, 2.0},
-		{"zero falls back", "0", 2.0, 2.0},
-		{"negative falls back", "-1", 2.0, 2.0},
+		{name: "unset uses default", unset: true, def: 2.0, want: 2.0},
+		{name: "empty string uses default", env: "", def: 2.0, want: 2.0},
+		{name: "valid value", env: "5.5", def: 2.0, want: 5.5},
+		{name: "malformed falls back", env: "2x", def: 2.0, want: 2.0},
+		{name: "zero falls back", env: "0", def: 2.0, want: 2.0},
+		{name: "negative falls back", env: "-1", def: 2.0, want: 2.0},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if tc.env == "" {
-				t.Setenv(key, "")
-			} else {
-				t.Setenv(key, tc.env)
-			}
-			assert.Equal(t, tc.want, parseRPSFromEnv(key, tc.def))
+			setOrUnsetEnv(t, key, tc.env, tc.unset)
+			assert.Equal(t, tc.want, ParseRPSFromEnv(key, tc.def))
 		})
 	}
 }
@@ -48,25 +71,23 @@ func TestParseBurstFromEnv(t *testing.T) {
 	const key = "DM_API_RATELIMIT_TEST_BURST"
 
 	tests := []struct {
-		name string
-		env  string
-		def  int
-		want int
+		name  string
+		env   string
+		unset bool
+		def   int
+		want  int
 	}{
-		{"unset uses default", "", 60, 60},
-		{"valid value", "100", 60, 100},
-		{"malformed falls back", "60x", 60, 60},
-		{"zero falls back", "0", 60, 60},
-		{"negative falls back", "-5", 60, 60},
+		{name: "unset uses default", unset: true, def: 60, want: 60},
+		{name: "empty string uses default", env: "", def: 60, want: 60},
+		{name: "valid value", env: "100", def: 60, want: 100},
+		{name: "malformed falls back", env: "60x", def: 60, want: 60},
+		{name: "zero falls back", env: "0", def: 60, want: 60},
+		{name: "negative falls back", env: "-5", def: 60, want: 60},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if tc.env == "" {
-				t.Setenv(key, "")
-			} else {
-				t.Setenv(key, tc.env)
-			}
-			assert.Equal(t, tc.want, parseBurstFromEnv(key, tc.def))
+			setOrUnsetEnv(t, key, tc.env, tc.unset)
+			assert.Equal(t, tc.want, ParseBurstFromEnv(key, tc.def))
 		})
 	}
 }

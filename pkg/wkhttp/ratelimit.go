@@ -163,9 +163,14 @@ func (k *keyedLimiter) allow(ctx context.Context, key string) (allowed bool, rem
 // setRateLimitHeaders 写入标准限流响应头，allowed=false 时同时写 Retry-After。
 // Retry-After 的下限由 Lua 脚本保证（math.max(1, ...)）；fail-open 分支
 // allowed=true 不会进入此处的 !allowed 写入路径，因此无需在 Go 侧兜底 clamp。
-func setRateLimitHeaders(h http.Header, burst, remaining int, allowed bool, retryAfter int) {
+//
+// scope 标识触发层（"ip" / "uid" / "strict:{tag}"），通过 X-RateLimit-Scope
+// 暴露给客户端，便于区分 429 的归因。多层链路上后挂的层会覆盖前层的头，
+// 看到的 scope 就是"最后一层写入者"——通常是通过的最紧桶或命中拒绝的层。
+func setRateLimitHeaders(h http.Header, scope string, burst, remaining int, allowed bool, retryAfter int) {
 	h.Set("X-RateLimit-Limit", strconv.Itoa(burst))
 	h.Set("X-RateLimit-Remaining", strconv.Itoa(remaining))
+	h.Set("X-RateLimit-Scope", scope)
 	if !allowed {
 		h.Set("Retry-After", strconv.Itoa(retryAfter))
 	}
@@ -220,7 +225,7 @@ func RateLimitMiddleware(ctx context.Context, client *rd.Client, rps float64, bu
 		}
 
 		allowed, remaining, retryAfter, _ := kl.allow(c.Request.Context(), ip)
-		setRateLimitHeaders(c.Writer.Header(), burst, remaining, allowed, retryAfter)
+		setRateLimitHeaders(c.Writer.Header(), "ip", burst, remaining, allowed, retryAfter)
 
 		if !allowed {
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
@@ -254,6 +259,7 @@ func RateLimitMiddleware(ctx context.Context, client *rd.Client, rps float64, bu
 // fail-open（Redis 故障）：Redis 调用失败时放行 + 告警，与其余中间件保持一致。
 func StrictIPRateLimitMiddleware(ctx context.Context, client *rd.Client, tag string, rps float64, burst int) libwkhttp.HandlerFunc {
 	kl := newKeyedLimiter(client, "ratelimit:strict:"+tag+":", rps, burst)
+	scope := "strict:" + tag
 	var unknownIPWarnOnce sync.Once
 
 	return func(c *libwkhttp.Context) {
@@ -266,7 +272,7 @@ func StrictIPRateLimitMiddleware(ctx context.Context, client *rd.Client, tag str
 		}
 
 		allowed, remaining, retryAfter, _ := kl.allow(c.Request.Context(), ip)
-		setRateLimitHeaders(c.Writer.Header(), burst, remaining, allowed, retryAfter)
+		setRateLimitHeaders(c.Writer.Header(), scope, burst, remaining, allowed, retryAfter)
 
 		if !allowed {
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
@@ -308,7 +314,7 @@ func UIDRateLimitMiddleware(ctx context.Context, client *rd.Client, rps float64,
 		}
 
 		allowed, remaining, retryAfter, _ := kl.allow(c.Request.Context(), uid)
-		setRateLimitHeaders(c.Writer.Header(), burst, remaining, allowed, retryAfter)
+		setRateLimitHeaders(c.Writer.Header(), "uid", burst, remaining, allowed, retryAfter)
 
 		if !allowed {
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{

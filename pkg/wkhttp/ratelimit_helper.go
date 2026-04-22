@@ -60,8 +60,8 @@ func SharedUIDRateLimiter(ctx *config.Context) libwkhttp.HandlerFunc {
 		return uidRateLimitMW
 	}
 
-	rps := parseRPSFromEnv("DM_API_UID_RATELIMIT_RPS", defaultUIDRateLimitRPS)
-	burst := parseBurstFromEnv("DM_API_UID_RATELIMIT_BURST", defaultUIDRateLimitBurst)
+	rps := ParseRPSFromEnv("DM_API_UID_RATELIMIT_RPS", defaultUIDRateLimitRPS)
+	burst := ParseBurstFromEnv("DM_API_UID_RATELIMIT_BURST", defaultUIDRateLimitBurst)
 
 	// 独立构造 go-redis client 的原因同 main.go：lib 的 redis.Conn 未暴露
 	// Eval/Script 接口，令牌桶 Lua 脚本必须走原生 go-redis。生命周期跟随进程。
@@ -78,9 +78,9 @@ func SharedUIDRateLimiter(ctx *config.Context) libwkhttp.HandlerFunc {
 	return uidRateLimitMW
 }
 
-// parseRPSFromEnv 解析 float 环境变量；缺省或解析失败回退到 def，
+// ParseRPSFromEnv 解析 float 环境变量；缺省或解析失败回退到 def，
 // 无效值（负数 / 非法格式）打 Warn 日志，避免操作配置错误静默失败。
-func parseRPSFromEnv(key string, def float64) float64 {
+func ParseRPSFromEnv(key string, def float64) float64 {
 	v := os.Getenv(key)
 	if v == "" {
 		return def
@@ -94,8 +94,8 @@ func parseRPSFromEnv(key string, def float64) float64 {
 	return n
 }
 
-// parseBurstFromEnv 解析 int 环境变量；语义同 parseRPSFromEnv。
-func parseBurstFromEnv(key string, def int) int {
+// ParseBurstFromEnv 解析 int 环境变量；语义同 ParseRPSFromEnv。
+func ParseBurstFromEnv(key string, def int) int {
 	v := os.Getenv(key)
 	if v == "" {
 		return def

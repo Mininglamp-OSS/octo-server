@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"runtime"
-	"strconv"
 	"strings"
 
 	_ "github.com/Mininglamp-OSS/octo-server/internal"
@@ -104,18 +103,9 @@ func runAPI(ctx *config.Context) {
 	// 全局 per-IP 作为 DDoS 底线：办公室共享出网 IP 下 IM 基础量就能到 100+ rps
 	// （每人 1-2 rps × 数十人），200 余量过小；真实 DDoS 常数千 rps+，底线设 500
 	// 更合理。精细限流交给 UID 层和端点级严格桶（#1090）。
-	rps := 500.0
-	burst := 1000
-	if v := os.Getenv("DM_API_RATELIMIT_RPS"); v != "" {
-		if n, err := strconv.ParseFloat(v, 64); err == nil && n > 0 {
-			rps = n
-		}
-	}
-	if v := os.Getenv("DM_API_RATELIMIT_BURST"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			burst = n
-		}
-	}
+	// 无效环境变量值回退到默认值 + Warn 日志，行为与 UID 层 helper 一致。
+	rps := wkhttp.ParseRPSFromEnv("DM_API_RATELIMIT_RPS", 500.0)
+	burst := wkhttp.ParseBurstFromEnv("DM_API_RATELIMIT_BURST", 1000)
 	// 限流状态存 Redis，多副本共享配额；与 dmwork-lib 的 GetRedisConn 指向同一实例。
 	// 独立构造 client 的原因：lib 的 redis.Conn 未暴露 Eval/Script 接口，
 	// 而令牌桶需要 Lua 脚本保证原子性。
