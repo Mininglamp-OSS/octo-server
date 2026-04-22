@@ -248,6 +248,13 @@ func (d *DB) DeleteMembersByGroupNoAndUIDTx(groupNo, uid string, tx *dbr.Tx) err
 	return err
 }
 
+// DeleteSettingsByGroupNoAndUIDTx 事务中删除用户在某群下所有子区的个人设置
+func (d *DB) DeleteSettingsByGroupNoAndUIDTx(groupNo, uid string, tx *dbr.Tx) error {
+	_, err := tx.DeleteFrom("thread_setting").
+		Where("group_no=? AND uid=?", groupNo, uid).Exec()
+	return err
+}
+
 // MemberModel 子区成员数据模型
 type MemberModel struct {
 	ID        int64  `json:"id"`
@@ -442,7 +449,45 @@ func (d *DB) QueryMessageFromUID(channelID string, messageID int64) (string, err
 	return fromUID, err
 }
 
-// getMessageTable 根据 channelID 计算消息分表名
+// SettingModel 子区用户设置
+type SettingModel struct {
+	GroupNo string
+	ShortID string
+	UID     string
+	Mute    int
+	Version int64
+	db.BaseModel
+}
+
+// QuerySetting 按 (groupNo, shortID, uid) 查询单条设置
+func (d *DB) QuerySetting(groupNo, shortID, uid string) (*SettingModel, error) {
+	var m *SettingModel
+	_, err := d.session.Select("*").From("thread_setting").
+		Where("group_no=? AND short_id=? AND uid=?", groupNo, shortID, uid).Load(&m)
+	return m, err
+}
+
+// QuerySettingsWithUIDs 批量查询一批用户对某子区的设置
+func (d *DB) QuerySettingsWithUIDs(groupNo, shortID string, uids []string) ([]*SettingModel, error) {
+	if len(uids) == 0 {
+		return []*SettingModel{}, nil
+	}
+	var settings []*SettingModel
+	_, err := d.session.Select("*").From("thread_setting").
+		Where("group_no=? AND short_id=? AND uid IN ?", groupNo, shortID, uids).Load(&settings)
+	return settings, err
+}
+
+// UpsertSetting 按 (group_no, short_id, uid) 幂等写入,避免并发 read-then-write 竞态
+func (d *DB) UpsertSetting(m *SettingModel) error {
+	_, err := d.session.InsertBySql(
+		"INSERT INTO thread_setting (group_no, short_id, uid, mute, version) VALUES (?, ?, ?, ?, ?) "+
+			"ON DUPLICATE KEY UPDATE mute=VALUES(mute), version=VALUES(version)",
+		m.GroupNo, m.ShortID, m.UID, m.Mute, m.Version,
+	).Exec()
+	return err
+}
+
 func (d *DB) getMessageTable(channelID string) string {
 	tableCount := d.ctx.GetConfig().TablePartitionConfig.MessageTableCount
 	if tableCount <= 0 {

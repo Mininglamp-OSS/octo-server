@@ -90,3 +90,14 @@ func (db *DB) GetThreadName(groupNo, shortID string) (string, error) {
 	_, err := db.session.Select("name").From("thread").Where("group_no=? AND short_id=?", groupNo, shortID).Load(&name)
 	return name, err
 }
+
+// QueryThreadSettingsWithUIDs 批量查询一批用户对某子区的设置(推送免打扰判断用)
+func (db *DB) QueryThreadSettingsWithUIDs(groupNo, shortID string, uids []string) ([]*threadSettingResp, error) {
+	if len(uids) == 0 {
+		return []*threadSettingResp{}, nil
+	}
+	var settings []*threadSettingResp
+	_, err := db.session.Select("uid", "mute").From("thread_setting").
+		Where("group_no=? AND short_id=? AND uid IN ?", groupNo, shortID, uids).Load(&settings)
+	return settings, err
+}
