@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/Mininglamp-OSS/octo-server/modules/base/app"
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-lib/common"
@@ -106,33 +105,6 @@ func (bf *BotFather) createUserBot(c *wkhttp.Context) {
 		return
 	}
 
-	// Validate and normalize username
-	username := strings.TrimSpace(strings.ToLower(req.Username))
-	username = strings.TrimSuffix(username, BotUsernameSuffix)
-	if username == "" || len(username) > 20 {
-		c.ResponseError(errors.New("username 长度需要在 1-20 个字符之间"))
-		return
-	}
-	for _, r := range username {
-		if !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_') {
-			c.ResponseError(errors.New("username 只能包含英文字母、数字和下划线"))
-			return
-		}
-	}
-	username = username + BotUsernameSuffix
-
-	// Check uniqueness
-	exists, _ := bf.db.existRobotByUsername(username)
-	if exists {
-		c.ResponseErrorWithStatus(fmt.Errorf("username %s 已被占用", username), http.StatusConflict)
-		return
-	}
-	u, _ := bf.userService.GetUserWithUsername(username)
-	if u != nil {
-		c.ResponseErrorWithStatus(fmt.Errorf("username %s 已被占用", username), http.StatusConflict)
-		return
-	}
-
 	// Generate bot token
 	botToken, err := bf.cmdHandler.generateUniqueBotToken()
 	if err != nil {
@@ -140,79 +112,25 @@ func (bf *BotFather) createUserBot(c *wkhttp.Context) {
 		c.ResponseError(errors.New("创建失败，请稍后重试"))
 		return
 	}
-
-	robotID := username
 	description := ""
 	if req.Description != nil {
 		description = *req.Description
 	}
 
-	// Create App
-	appResp, err := bf.appService.CreateApp(app.Req{AppID: robotID})
-	if err != nil {
-		bf.Error("创建App失败", zap.Error(err))
+	// username 已废弃：接受但忽略，始终自动生成 Bot ID（含碰撞重试）
+	robotID, createErr := bf.cmdHandler.createBotCoreWithRetry(uid, name, botToken)
+	if createErr != nil {
+		bf.Error("创建Bot失败", zap.Error(createErr))
 		c.ResponseError(errors.New("创建失败"))
 		return
 	}
+	username := robotID
 
-	// Create robot record
-	tx, err := bf.db.session.Begin()
-	if err != nil {
-		bf.Error("开启事务失败", zap.Error(err))
-		c.ResponseError(errors.New("创建失败"))
-		return
-	}
-	defer func() {
-		if r := recover(); r != nil {
-			tx.Rollback()
+	// description 写入（tryCreateBotCore 不处理 description）
+	if description != "" {
+		if descErr := bf.db.updateRobotDescription(robotID, description); descErr != nil {
+			bf.Warn("写入description失败", zap.Error(descErr), zap.String("robotID", robotID))
 		}
-	}()
-
-	version, err := bf.ctx.GenSeq(common.RobotSeqKey)
-	if err != nil {
-		tx.Rollback()
-		c.ResponseError(errors.New("创建失败"))
-		return
-	}
-	err = bf.db.insertRobotTx(&robotModel{
-		AppID:       appResp.AppID,
-		RobotID:     robotID,
-		Username:    username,
-		Token:       appResp.AppKey,
-		Version:     version,
-		Status:      1,
-		CreatorUID:  uid,
-		BotToken:    botToken,
-		Description: description,
-	}, tx)
-	if err != nil {
-		tx.Rollback()
-		bf.Error("插入机器人记录失败", zap.Error(err))
-		c.ResponseError(errors.New("创建失败"))
-		return
-	}
-	if err = tx.Commit(); err != nil {
-		bf.Error("提交事务失败", zap.Error(err))
-		c.ResponseError(errors.New("创建失败"))
-		return
-	}
-
-	// Create user
-	err = bf.userService.AddUser(&user.AddUserReq{
-		UID:      robotID,
-		Username: username,
-		Name:     name,
-		ShortNo:  username,
-		Robot:    1,
-	})
-	if err != nil {
-		// Rollback robot record
-		if delErr := bf.db.deleteRobot(robotID); delErr != nil {
-			bf.Error("回滚robot记录失败", zap.Error(delErr))
-		}
-		bf.Error("创建用户失败", zap.Error(err))
-		c.ResponseError(errors.New("创建失败"))
-		return
 	}
 
 	// Resolve Space ID: API Key binding takes authority; fall back to request

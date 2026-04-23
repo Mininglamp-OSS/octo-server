@@ -49,7 +49,6 @@ const (
 const (
 	StateNone                  = ""
 	StateWaitingBotName        = "waiting_bot_name"
-	StateWaitingBotUsername    = "waiting_bot_username"
 	StateWaitingSelectBot      = "waiting_select_bot"
 	StateWaitingNewName        = "waiting_new_name"
 	StateWaitingDescription    = "waiting_description"

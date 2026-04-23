@@ -15,6 +15,8 @@ type IService interface {
 	GetApp(appID string) (*Resp, error)
 	// 创建app
 	CreateApp(r Req) (*Resp, error)
+	// DeleteApp 删除app（Bot 创建失败时的补偿清理）
+	DeleteApp(appID string) error
 }
 
 // Service app服务
@@ -83,6 +85,10 @@ func (s *Service) CreateApp(r Req) (*Resp, error) {
 		Status: StatusEnable,
 	}, nil
 
+}
+
+func (s *Service) DeleteApp(appID string) error {
+	return s.db.deleteByAppID(appID)
 }
 
 type Resp struct {

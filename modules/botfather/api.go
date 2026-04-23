@@ -646,8 +646,14 @@ func (bf *BotFather) register(c *wkhttp.Context) {
 	}
 	wsURL := deriveWSURL(cfg)
 
+	botName := ""
+	if u, _ := bf.userService.GetUser(robot.RobotID); u != nil {
+		botName = u.Name
+	}
+
 	c.Response(&BotRegisterResp{
 		RobotID:        robot.RobotID,
+		Name:           botName,
 		IMToken:        imToken,
 		WSURL:          wsURL,
 		APIURL:         apiURL,
