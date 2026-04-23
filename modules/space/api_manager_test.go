@@ -503,6 +503,181 @@ func TestManager_DisableInvite(t *testing.T) {
 	assert.Nil(t, inv, "disabled invite should not be visible to business query")
 }
 
+func TestManager_CreateInvite_Default(t *testing.T) {
+	s, _, err := setup(t)
+	assert.NoError(t, err)
+	token := adminToken(t)
+
+	seedSpace(t, "mgr-inv-c1", "inv create", "u-owner", SpaceStatusNormal)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/manager/spaces/mgr-inv-c1/invites", bytes.NewBufferString(`{}`))
+	req.Header.Set("token", token)
+	req.Header.Set("Content-Type", "application/json")
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp struct {
+		InviteCode string `json:"invite_code"`
+		ExpiresAt  string `json:"expires_at"`
+		MaxUses    int    `json:"max_uses"`
+	}
+	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Len(t, resp.InviteCode, 16, "16 hex 邀请码")
+	assert.NotEmpty(t, resp.ExpiresAt, "默认带 72h TTL")
+	assert.Equal(t, 0, resp.MaxUses)
+
+	inv, err := testSpaceDB.queryInvitationByCode(resp.InviteCode)
+	assert.NoError(t, err)
+	assert.NotNil(t, inv)
+	assert.Equal(t, "mgr-inv-c1", inv.SpaceId)
+	assert.Equal(t, testutil.UID, inv.Creator, "creator = operator admin")
+}
+
+func TestManager_CreateInvite_WithOverrides(t *testing.T) {
+	s, _, err := setup(t)
+	assert.NoError(t, err)
+	token := adminToken(t)
+
+	seedSpace(t, "mgr-inv-c2", "inv create 2", "u-owner", SpaceStatusNormal)
+
+	body := `{"max_uses":50,"expires_at":"2030-01-01 00:00:00"}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/manager/spaces/mgr-inv-c2/invites", bytes.NewBufferString(body))
+	req.Header.Set("token", token)
+	req.Header.Set("Content-Type", "application/json")
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp struct {
+		InviteCode string `json:"invite_code"`
+		MaxUses    int    `json:"max_uses"`
+		ExpiresAt  string `json:"expires_at"`
+	}
+	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, 50, resp.MaxUses)
+	assert.Equal(t, "2030-01-01 00:00:00", resp.ExpiresAt)
+}
+
+func TestManager_CreateInvite_NonExistentSpace(t *testing.T) {
+	s, _, err := setup(t)
+	assert.NoError(t, err)
+	token := adminToken(t)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/manager/spaces/nope-space/invites", bytes.NewBufferString(`{}`))
+	req.Header.Set("token", token)
+	req.Header.Set("Content-Type", "application/json")
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestManager_UpdateInvite_AllFields(t *testing.T) {
+	s, _, err := setup(t)
+	assert.NoError(t, err)
+	token := adminToken(t)
+
+	seedSpace(t, "mgr-inv-u1", "inv update", "u-owner", SpaceStatusNormal)
+	err = testSpaceDB.insertInvitation(&InvitationModel{
+		SpaceId: "mgr-inv-u1", InviteCode: "upd-code-1", Creator: "u-owner", MaxUses: 10, Status: 1,
+	})
+	assert.NoError(t, err)
+
+	body := `{"max_uses":99,"expires_at":"2029-06-01 00:00:00","status":0}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("PUT", "/v1/manager/spaces/mgr-inv-u1/invites/upd-code-1", bytes.NewBufferString(body))
+	req.Header.Set("token", token)
+	req.Header.Set("Content-Type", "application/json")
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	// 状态检查：业务端按 status=1 查应找不到（已禁用）
+	inv, err := testSpaceDB.queryInvitationByCode("upd-code-1")
+	assert.NoError(t, err)
+	assert.Nil(t, inv, "status=0 后业务查询应失效")
+
+	// 原始数据检查
+	var got struct {
+		MaxUses int `db:"max_uses"`
+		Status  int `db:"status"`
+	}
+	_, err = testCtx.DB().SelectBySql("SELECT max_uses, status FROM space_invitation WHERE invite_code=?", "upd-code-1").Load(&got)
+	assert.NoError(t, err)
+	assert.Equal(t, 99, got.MaxUses)
+	assert.Equal(t, 0, got.Status)
+}
+
+func TestManager_UpdateInvite_InvalidStatus(t *testing.T) {
+	s, _, err := setup(t)
+	assert.NoError(t, err)
+	token := adminToken(t)
+
+	seedSpace(t, "mgr-inv-u2", "inv update 2", "u-owner", SpaceStatusNormal)
+	err = testSpaceDB.insertInvitation(&InvitationModel{
+		SpaceId: "mgr-inv-u2", InviteCode: "upd-code-2", Creator: "u-owner", Status: 1,
+	})
+	assert.NoError(t, err)
+
+	body := `{"status":9}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("PUT", "/v1/manager/spaces/mgr-inv-u2/invites/upd-code-2", bytes.NewBufferString(body))
+	req.Header.Set("token", token)
+	req.Header.Set("Content-Type", "application/json")
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestManager_UpdateInvite_CodeNotFound(t *testing.T) {
+	s, _, err := setup(t)
+	assert.NoError(t, err)
+	token := adminToken(t)
+
+	seedSpace(t, "mgr-inv-u3", "inv update 3", "u-owner", SpaceStatusNormal)
+
+	body := `{"max_uses":5}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("PUT", "/v1/manager/spaces/mgr-inv-u3/invites/nonexistent", bytes.NewBufferString(body))
+	req.Header.Set("token", token)
+	req.Header.Set("Content-Type", "application/json")
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+// TestGetSpace_NoInviteCodeInResponse 用户侧 GET /v1/space/:id 不再返回 invite_code。
+func TestGetSpace_NoInviteCodeInResponse(t *testing.T) {
+	s, _, err := setup(t)
+	assert.NoError(t, err)
+
+	seedSpace(t, "no-invite-in-detail", "detail", testutil.UID, SpaceStatusNormal)
+	err = testSpaceDB.insertInvitation(&InvitationModel{
+		SpaceId: "no-invite-in-detail", InviteCode: "leak-check", Creator: testutil.UID, Status: 1,
+	})
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/space/no-invite-in-detail", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.NotContains(t, w.Body.String(), "invite_code")
+	assert.NotContains(t, w.Body.String(), "leak-check")
+}
+
+// TestCreateSpace_NoInviteCodeInResponse 用户侧 POST /v1/space/create 响应不带 invite_code。
+func TestCreateSpace_NoInviteCodeInResponse(t *testing.T) {
+	s, _, err := setup(t)
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/space/create", bytes.NewBufferString(`{"name":"hidden invite"}`))
+	req.Header.Set("token", testutil.Token)
+	req.Header.Set("Content-Type", "application/json")
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.NotContains(t, w.Body.String(), "invite_code")
+}
+
 func TestManager_JoinAppliesList(t *testing.T) {
 	s, _, err := setup(t)
 	assert.NoError(t, err)

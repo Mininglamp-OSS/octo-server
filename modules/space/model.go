@@ -116,7 +116,6 @@ type spaceResp struct {
 	Role        int    `json:"role"`
 	MaxUsers    int    `json:"max_users"`
 	MemberCount int    `json:"member_count"`
-	InviteCode  string `json:"invite_code"`
 	JoinMode    int    `json:"join_mode"`
 	CreatedAt   string `json:"created_at"`
 	UpdatedAt   string `json:"updated_at"`

@@ -347,6 +347,34 @@ func (d *managerDB) disableInvitation(spaceId, code string) (int64, error) {
 	return result.RowsAffected()
 }
 
+// updateInvitationAdmin 管理端可修改 max_uses / expires_at / status，nil 字段不变更。
+// 返回 affected rows，0 表示记录不存在。
+func (d *managerDB) updateInvitationAdmin(spaceId, code string, maxUses *int, expiresAt *time.Time, status *int) (int64, error) {
+	builder := d.session.Update("space_invitation")
+	changed := false
+	if maxUses != nil {
+		builder = builder.Set("max_uses", *maxUses)
+		changed = true
+	}
+	if expiresAt != nil {
+		builder = builder.Set("expires_at", *expiresAt)
+		changed = true
+	}
+	if status != nil {
+		builder = builder.Set("status", *status)
+		changed = true
+	}
+	if !changed {
+		return 0, nil
+	}
+	builder = builder.Set("updated_at", time.Now())
+	result, err := builder.Where("space_id=? AND invite_code=?", spaceId, code).Exec()
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 // queryJoinAppliesAdmin 管理后台查询申请列表，status<0 表示不过滤
 func (d *managerDB) queryJoinAppliesAdmin(spaceId string, status int, pageSize, pageIndex uint64) ([]*spaceJoinApplyDetailModel, error) {
 	builder := d.session.Select("a.*", "IFNULL(u.name,'') as applicant_name").

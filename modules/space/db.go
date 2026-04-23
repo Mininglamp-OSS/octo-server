@@ -221,7 +221,15 @@ func GetCoMemberUIDs(ctx *config.Context, uid string) ([]string, error) {
 // ---------- Invitation CRUD ----------
 
 func (d *DB) insertInvitation(m *InvitationModel) error {
-	_, err := d.session.InsertInto("space_invitation").Columns(util.AttrToUnderscore(m)...).Record(m).Exec()
+	// 显式列写入：dbr 的 Record 反射无法处理 *db.Time（未实现 driver.Valuer）。
+	var expires interface{}
+	if m.ExpiresAt != nil {
+		expires = time.Time(*m.ExpiresAt)
+	}
+	_, err := d.session.InsertInto("space_invitation").
+		Columns("space_id", "invite_code", "creator", "max_uses", "used_count", "expires_at", "status").
+		Values(m.SpaceId, m.InviteCode, m.Creator, m.MaxUses, m.UsedCount, expires, m.Status).
+		Exec()
 	return err
 }
 

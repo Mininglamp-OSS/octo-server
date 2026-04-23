@@ -4,7 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"time"
 
+	"github.com/Mininglamp-OSS/octo-server/pkg/db"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
@@ -81,7 +83,9 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 
 		// 邀请码
 		auth.GET("/spaces/:space_id/invites", m.listInvites)            // 列表
-		auth.DELETE("/spaces/:space_id/invites/:code", m.disableInvite) // 禁用
+		auth.POST("/spaces/:space_id/invites", m.createInvite)          // 创建
+		auth.PUT("/spaces/:space_id/invites/:code", m.updateInvite)     // 修改 max_uses / expires_at / status
+		auth.DELETE("/spaces/:space_id/invites/:code", m.disableInvite) // 软禁用（等价 PUT status=0）
 
 		// 加入申请
 		auth.GET("/spaces/:space_id/join-applies", m.listJoinApplies)               // 列表
@@ -649,6 +653,170 @@ func (m *Manager) listInvites(c *wkhttp.Context) {
 		"count": count,
 		"list":  resp,
 	})
+}
+
+// managerCreateInviteReq 管理端创建邀请码请求体
+type managerCreateInviteReq struct {
+	MaxUses   *int    `json:"max_uses"`
+	ExpiresAt *string `json:"expires_at"`
+}
+
+// managerUpdateInviteReq 管理端修改邀请码请求体
+type managerUpdateInviteReq struct {
+	MaxUses   *int    `json:"max_uses"`
+	ExpiresAt *string `json:"expires_at"`
+	Status    *int    `json:"status"` // 0=禁用 1=启用
+}
+
+// createInvite 管理端为空间创建邀请码，未指定字段走默认值（DM_SPACE_INVITE_DEFAULT_*）。
+func (m *Manager) createInvite(c *wkhttp.Context) {
+	if !m.requireAdmin(c) {
+		return
+	}
+	spaceId := c.Param("space_id")
+	if spaceId == "" {
+		c.ResponseError(errors.New("空间ID不能为空"))
+		return
+	}
+	sp, err := m.managerDB.querySpaceIncludeDisbanded(spaceId)
+	if err != nil {
+		m.Error("查询空间失败", zap.Error(err), zap.String("spaceId", spaceId))
+		c.ResponseError(errors.New("查询空间失败"))
+		return
+	}
+	if sp == nil {
+		c.ResponseError(errors.New("空间不存在"))
+		return
+	}
+	if sp.Status == SpaceStatusDisbanded {
+		c.ResponseError(errors.New("空间已解散，无法创建邀请码"))
+		return
+	}
+
+	var req managerCreateInviteReq
+	if c.Request.ContentLength > 0 {
+		if err := c.BindJSON(&req); err != nil {
+			c.ResponseError(errors.New("请求参数错误"))
+			return
+		}
+	}
+	expiresAt, err := parseInviteExpiresAt(req.ExpiresAt)
+	if err != nil {
+		c.ResponseError(err)
+		return
+	}
+
+	operator := c.GetLoginUID()
+	model := &InvitationModel{
+		SpaceId: spaceId,
+		Creator: operator,
+		Status:  1,
+	}
+	if req.MaxUses != nil {
+		if *req.MaxUses < 0 {
+			c.ResponseError(errors.New("max_uses 不能为负"))
+			return
+		}
+		model.MaxUses = *req.MaxUses
+	}
+	if expiresAt != nil {
+		t := db.Time(*expiresAt)
+		model.ExpiresAt = &t
+	}
+
+	code, err := m.space.insertInvitationWithRetry(model)
+	if err != nil {
+		m.Error("管理端创建邀请码失败", zap.Error(err), zap.String("spaceId", spaceId), zap.String("operator", operator))
+		c.ResponseError(errors.New("创建邀请码失败"))
+		return
+	}
+
+	m.Info("管理员创建邀请码",
+		zap.String("spaceId", spaceId),
+		zap.String("code", code),
+		zap.String("operator", operator),
+	)
+
+	expiresStr := ""
+	if model.ExpiresAt != nil {
+		expiresStr = model.ExpiresAt.String()
+	}
+	c.Response(map[string]interface{}{
+		"invite_code": code,
+		"space_id":    spaceId,
+		"creator":     operator,
+		"max_uses":    model.MaxUses,
+		"expires_at":  expiresStr,
+		"status":      model.Status,
+	})
+}
+
+// updateInvite 管理端修改邀请码 max_uses / expires_at / status，未传字段保持不变。
+// status=0 等价于软禁用（与 DELETE 路径一致）。
+func (m *Manager) updateInvite(c *wkhttp.Context) {
+	if !m.requireAdmin(c) {
+		return
+	}
+	spaceId := c.Param("space_id")
+	code := c.Param("code")
+	if spaceId == "" || code == "" {
+		c.ResponseError(errors.New("空间ID或邀请码不能为空"))
+		return
+	}
+
+	var req managerUpdateInviteReq
+	if err := c.BindJSON(&req); err != nil {
+		c.ResponseError(errors.New("请求参数错误"))
+		return
+	}
+	if req.MaxUses == nil && req.ExpiresAt == nil && req.Status == nil {
+		c.ResponseError(errors.New("至少需要提供 max_uses / expires_at / status 之一"))
+		return
+	}
+	if req.MaxUses != nil && *req.MaxUses < 0 {
+		c.ResponseError(errors.New("max_uses 不能为负"))
+		return
+	}
+	if req.Status != nil && *req.Status != 0 && *req.Status != 1 {
+		c.ResponseError(errors.New("status 仅支持 0(禁用) 或 1(启用)"))
+		return
+	}
+	expiresAt, err := parseInviteExpiresAt(req.ExpiresAt)
+	if err != nil {
+		c.ResponseError(err)
+		return
+	}
+
+	affected, err := m.managerDB.updateInvitationAdmin(spaceId, code, req.MaxUses, expiresAt, req.Status)
+	if err != nil {
+		m.Error("修改邀请码失败", zap.Error(err), zap.String("spaceId", spaceId), zap.String("code", code))
+		c.ResponseError(errors.New("修改邀请码失败"))
+		return
+	}
+	if affected == 0 {
+		c.ResponseError(errors.New("邀请码不存在"))
+		return
+	}
+
+	m.Info("管理员修改邀请码",
+		zap.String("spaceId", spaceId),
+		zap.String("code", code),
+		zap.String("operator", c.GetLoginUID()),
+	)
+	c.ResponseOK()
+}
+
+// parseInviteExpiresAt 解析管理端 expires_at 字符串，空字符串视为未传。
+// 格式固定为 "2006-01-02 15:04:05"。
+func parseInviteExpiresAt(raw *string) (*time.Time, error) {
+	if raw == nil || *raw == "" {
+		return nil, nil
+	}
+	t, err := time.ParseInLocation("2006-01-02 15:04:05", *raw, time.Local)
+	if err != nil {
+		return nil, errors.New("过期时间格式错误，请使用 2006-01-02 15:04:05 格式")
+	}
+	return &t, nil
 }
 
 // disableInvite 禁用邀请码
