@@ -688,8 +688,9 @@ func (m *Manager) createInvite(c *wkhttp.Context) {
 		c.ResponseError(errors.New("空间不存在"))
 		return
 	}
-	if sp.Status == SpaceStatusDisbanded {
-		c.ResponseError(errors.New("空间已解散，无法创建邀请码"))
+	// 正向校验：仅正常状态空间可创建邀请码（封禁空间即使创建了，加入时也会被 querySpaceByID 拒）。
+	if sp.Status != SpaceStatusNormal {
+		c.ResponseError(errors.New("仅正常状态的空间可创建邀请码"))
 		return
 	}
 

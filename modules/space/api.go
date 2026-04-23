@@ -928,7 +928,7 @@ func (s *Space) getInviteInfo(c *wkhttp.Context) {
 
 	expiresAtStr := ""
 	if invitation.ExpiresAt != nil {
-		expiresAtStr = time.Time(*invitation.ExpiresAt).Format("2006-01-02 15:04:05")
+		expiresAtStr = time.Time(*invitation.ExpiresAt).Format(inviteTimeLayout)
 	}
 
 	// 查询 Space 成员数
@@ -988,7 +988,7 @@ func (s *Space) getInvitePreview(c *wkhttp.Context) {
 
 	expiresAtStr := ""
 	if invitation.ExpiresAt != nil {
-		expiresAtStr = time.Time(*invitation.ExpiresAt).Format("2006-01-02 15:04:05")
+		expiresAtStr = time.Time(*invitation.ExpiresAt).Format(inviteTimeLayout)
 	}
 
 	// 公开接口只返回基本空间信息，不暴露 Bot 列表和精确成员数量
@@ -1043,6 +1043,14 @@ func (s *Space) updateInvite(c *wkhttp.Context) {
 	var req updateInviteReq
 	if err := c.BindJSON(&req); err != nil {
 		c.ResponseError(errors.New("请求参数错误"))
+		return
+	}
+	if req.MaxUses == nil && req.ExpiresAt == nil {
+		c.ResponseError(errors.New("至少需要提供 max_uses 或 expires_at 之一"))
+		return
+	}
+	if req.MaxUses != nil && *req.MaxUses < 0 {
+		c.ResponseError(errors.New("max_uses 不能为负"))
 		return
 	}
 
