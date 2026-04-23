@@ -979,15 +979,35 @@ func (m *Manager) approveJoinApply(c *wkhttp.Context) {
 		c.ResponseOK() // 已被其他人处理
 		return
 	}
-	if joinErr := m.space.executeJoinSpace(apply.UID, spaceId, sp); joinErr != nil {
-		// ErrAlreadyMember 说明用户已经在空间里（例如业务侧并发通过了同一申请）——视作审批成功，不回滚状态
-		if errors.Is(joinErr, ErrAlreadyMember) {
-			c.ResponseOK()
-			return
-		}
+
+	// 审批通过时消耗邀请码名额（方案 B：在准入时消耗）
+	inviteConsumed, consumeErr := m.space.consumeInviteOnApprove(apply.InviteCode)
+	if consumeErr != nil {
+		m.Error("检查邀请码使用次数失败", zap.Error(consumeErr), zap.Int64("applyID", applyID))
 		if _, rbErr := m.db.updateJoinApplyStatusRaw(applyID, 0, ""); rbErr != nil {
 			m.Error("回滚申请状态失败", zap.Error(rbErr), zap.Int64("applyID", applyID))
 		}
+		c.ResponseError(errors.New("检查邀请码使用次数失败"))
+		return
+	}
+	if apply.InviteCode != "" && !inviteConsumed {
+		if _, rbErr := m.db.updateJoinApplyStatusRaw(applyID, 0, ""); rbErr != nil {
+			m.Error("回滚申请状态失败", zap.Error(rbErr), zap.Int64("applyID", applyID))
+		}
+		c.ResponseError(errors.New("该邀请码已用尽或已失效，无法通过此申请"))
+		return
+	}
+
+	if joinErr := m.space.executeJoinSpace(apply.UID, spaceId, sp); joinErr != nil {
+		// ErrAlreadyMember：用户已在空间里（并发路径），apply 视作审批成功，但未新增成员，归还名额
+		if errors.Is(joinErr, ErrAlreadyMember) {
+			if inviteConsumed {
+				m.space.refundInvite(apply.InviteCode)
+			}
+			c.ResponseOK()
+			return
+		}
+		m.space.rollbackApplyAndInvite(applyID, apply.InviteCode, inviteConsumed)
 		if errors.Is(joinErr, ErrSpaceFull) {
 			c.ResponseError(errors.New("空间已满，无法通过申请"))
 			return

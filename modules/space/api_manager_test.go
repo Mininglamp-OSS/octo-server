@@ -827,6 +827,9 @@ func TestManager_ApproveAndReject(t *testing.T) {
 	seedSpace(t, "mgr-approve", "approve space", "u-owner", SpaceStatusNormal)
 
 	t.Run("approve adds member", func(t *testing.T) {
+		assert.NoError(t, testSpaceDB.insertInvitation(&InvitationModel{
+			SpaceId: "mgr-approve", InviteCode: "c1", Creator: "u-owner", Status: 1,
+		}))
 		applyID, err := testSpaceDB.upsertJoinApply(&spaceJoinApplyModel{
 			SpaceId: "mgr-approve", UID: "apply-u1", InviteCode: "c1",
 		})
@@ -849,6 +852,9 @@ func TestManager_ApproveAndReject(t *testing.T) {
 	})
 
 	t.Run("approve is idempotent on already-processed apply", func(t *testing.T) {
+		assert.NoError(t, testSpaceDB.insertInvitation(&InvitationModel{
+			SpaceId: "mgr-approve", InviteCode: "c1x", Creator: "u-owner", Status: 1,
+		}))
 		applyID, err := testSpaceDB.upsertJoinApply(&spaceJoinApplyModel{
 			SpaceId: "mgr-approve", UID: "apply-u1x", InviteCode: "c1x",
 		})

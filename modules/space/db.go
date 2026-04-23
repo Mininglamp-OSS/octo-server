@@ -271,6 +271,26 @@ func (d *DB) incrementInviteUsedCountAtomic(code string) (bool, error) {
 	return rows > 0, nil
 }
 
+// decrementInviteUsedCountAtomic 原子回滚一次使用计数（used_count>0 时才减）。
+// 用于审批后执行加入失败（ErrSpaceFull 等）时撤销已消耗的名额，与 approve 路径的
+// incrementInviteUsedCountAtomic 配对，避免"消耗了但没人加入"。
+// 不校验 status/expires_at：邀请码可能在消耗后被 owner 禁用或过期，但回滚应无条件进行。
+func (d *DB) decrementInviteUsedCountAtomic(code string) (bool, error) {
+	result, err := d.session.UpdateBySql(
+		"UPDATE space_invitation SET used_count=used_count-1 "+
+			"WHERE invite_code=? AND used_count>0",
+		code,
+	).Exec()
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
 // BotDetailModel Bot 详情模型
 type BotDetailModel struct {
 	RobotID string // 机器人ID
