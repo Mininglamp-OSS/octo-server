@@ -166,6 +166,42 @@ paths:
           schema:
             $ref: "#/definitions/errorResp"
 
+  /groups/{group_no}/threads/{short_id}/setting:
+    put:
+      tags:
+        - "thread"
+      summary: "更新当前用户对子区的个人设置"
+      description: |
+        更新当前登录用户对子区的个人偏好(当前仅支持 mute 免打扰)。
+        权限:父群成员即可;无需是子区成员。
+        语义:子区显式设置优先于父群 group_setting;未设置时推送按父群 mute 降级。
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      parameters:
+        - $ref: "#/parameters/groupNoPath"
+        - $ref: "#/parameters/shortIdPath"
+        - in: "body"
+          name: "body"
+          required: true
+          schema:
+            type: object
+            properties:
+              mute:
+                type: integer
+                enum: [0, 1]
+                description: "免打扰 0=关闭, 1=开启"
+      responses:
+        200:
+          description: "更新成功(或空 body 直接返回 OK)"
+          schema:
+            $ref: "#/definitions/okResp"
+        400:
+          description: "参数错误、非群成员、子区不存在或已删除、mute 越界"
+          schema:
+            $ref: "#/definitions/errorResp"
+
   /groups/{group_no}/threads/{short_id}/members:
     get:
       tags:
