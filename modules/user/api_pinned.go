@@ -2,7 +2,6 @@ package user
 
 import (
 	"errors"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,15 +14,32 @@ import (
 	"go.uber.org/zap"
 )
 
+// 每个用户在每个 Space 下最多可置顶的频道数。
+const pinnedMaxPerSpace = 7
+
 // GroupMemberCheckFunc 检查用户是否为群成员的函数类型
 type GroupMemberCheckFunc func(groupNo string, uid string) (bool, error)
 
-// 全局群成员检查函数，由 group 模块在初始化时注册
-var globalGroupMemberCheckFunc GroupMemberCheckFunc
+var (
+	groupMemberCheckerMu sync.RWMutex
+	groupMemberChecker   GroupMemberCheckFunc
+)
 
 // RegisterGroupMemberChecker 注册群成员检查函数（供 group 模块调用）
 func RegisterGroupMemberChecker(fn GroupMemberCheckFunc) {
-	globalGroupMemberCheckFunc = fn
+	setGroupMemberChecker(fn)
+}
+
+func setGroupMemberChecker(fn GroupMemberCheckFunc) {
+	groupMemberCheckerMu.Lock()
+	groupMemberChecker = fn
+	groupMemberCheckerMu.Unlock()
+}
+
+func getGroupMemberChecker() GroupMemberCheckFunc {
+	groupMemberCheckerMu.RLock()
+	defer groupMemberCheckerMu.RUnlock()
+	return groupMemberChecker
 }
 
 // Pinned 置顶频道 API
@@ -40,25 +56,6 @@ func NewPinned(db *PinnedDB, friendDB *friendDB) *Pinned {
 		friendDB: friendDB,
 		Log:      log.NewTLog("Pinned"),
 	}
-}
-
-// 缓存置顶上限配置（只在启动时读取一次，运行时修改需重启）
-var (
-	pinnedMaxOnce  sync.Once
-	pinnedMaxValue int
-)
-
-// getPinnedMax 获取最大置顶数量（只读取一次环境变量）
-func getPinnedMax() int {
-	pinnedMaxOnce.Do(func() {
-		pinnedMaxValue = 7 // 默认值
-		if v := os.Getenv("DM_USER_PINNED_MAX"); v != "" {
-			if max, err := strconv.Atoi(v); err == nil && max > 0 {
-				pinnedMaxValue = max
-			}
-		}
-	})
-	return pinnedMaxValue
 }
 
 // 合法的频道类型白名单
@@ -106,14 +103,14 @@ func (p *Pinned) Add(c *wkhttp.Context) {
 		return
 	}
 
-	err := p.db.Add(loginUID, spaceID, req.ChannelID, req.ChannelType, getPinnedMax())
+	err := p.db.Add(loginUID, spaceID, req.ChannelID, req.ChannelType, pinnedMaxPerSpace)
 	if err != nil {
 		if errors.Is(err, ErrPinnedAlreadyExists) {
 			c.ResponseError(err)
 			return
 		}
 		if errors.Is(err, ErrPinnedLimitExceeded) {
-			c.ResponseError(pkgerrors.Errorf("最多只能置顶 %d 个频道", getPinnedMax()))
+			c.ResponseError(pkgerrors.Errorf("最多只能置顶 %d 个频道", pinnedMaxPerSpace))
 			return
 		}
 		p.Error("添加置顶失败", zap.Error(err))
@@ -224,8 +221,8 @@ func (p *Pinned) UpdateSort(c *wkhttp.Context) {
 	}
 
 	// 限制 items 数量
-	if len(req.Items) > getPinnedMax() {
-		c.ResponseError(pkgerrors.Errorf("items 数量不能超过 %d", getPinnedMax()))
+	if len(req.Items) > pinnedMaxPerSpace {
+		c.ResponseError(pkgerrors.Errorf("items 数量不能超过 %d", pinnedMaxPerSpace))
 		return
 	}
 
@@ -251,11 +248,12 @@ func (p *Pinned) validateChannelAccess(uid, channelID string, channelType uint8)
 			return pkgerrors.New("你和该用户不是好友")
 		}
 	case common.ChannelTypeGroup.Uint8(): // 群
-		if globalGroupMemberCheckFunc == nil {
+		checker := getGroupMemberChecker()
+		if checker == nil {
 			p.Error("群成员检查函数未注册")
 			return pkgerrors.New("系统配置错误")
 		}
-		isMember, err := globalGroupMemberCheckFunc(channelID, uid)
+		isMember, err := checker(channelID, uid)
 		if err != nil {
 			p.Error("校验群成员失败", zap.Error(err))
 			return pkgerrors.New("校验频道权限失败")
@@ -264,7 +262,8 @@ func (p *Pinned) validateChannelAccess(uid, channelID string, channelType uint8)
 			return pkgerrors.New("你不是该群的成员")
 		}
 	case common.ChannelTypeCommunityTopic.Uint8(): // 子区
-		if globalGroupMemberCheckFunc == nil {
+		checker := getGroupMemberChecker()
+		if checker == nil {
 			p.Error("群成员检查函数未注册")
 			return pkgerrors.New("系统配置错误")
 		}
@@ -274,7 +273,7 @@ func (p *Pinned) validateChannelAccess(uid, channelID string, channelType uint8)
 			return pkgerrors.New("无效的子区频道ID")
 		}
 		parentGroupNo := parts[0]
-		isMember, err := globalGroupMemberCheckFunc(parentGroupNo, uid)
+		isMember, err := checker(parentGroupNo, uid)
 		if err != nil {
 			p.Error("校验子区父群成员失败", zap.Error(err))
 			return pkgerrors.New("校验频道权限失败")

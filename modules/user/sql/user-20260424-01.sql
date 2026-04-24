@@ -1,3 +1,5 @@
+-- +migrate Up
+
 -- 用户置顶频道表
 CREATE TABLE IF NOT EXISTS user_pinned_channel (
   id BIGINT AUTO_INCREMENT PRIMARY KEY,
