@@ -102,7 +102,7 @@ func (p *Pinned) Add(c *wkhttp.Context) {
 	}
 
 	// 校验用户是否有权访问该频道
-	if err := p.validateChannelAccess(loginUID, req.ChannelID, req.ChannelType); err != nil {
+	if err := p.validateChannelAccess(loginUID, spaceID, req.ChannelID, req.ChannelType); err != nil {
 		c.ResponseError(err)
 		return
 	}
@@ -245,8 +245,16 @@ func (p *Pinned) UpdateSort(c *wkhttp.Context) {
 	c.ResponseOK()
 }
 
-// validateChannelAccess 校验用户是否有权访问该频道
-func (p *Pinned) validateChannelAccess(uid, channelID string, channelType uint8) error {
+// validateChannelAccess 校验用户是否有权访问该频道。
+//
+// 私聊分支放行条件（按序判定，满足其一即通过）：
+//  1. 双方互为好友；
+//  2. 对方是当前用户创建的 bot（creator_uid == 当前 uid）；
+//  3. 对方不是 bot，且双方都是当前 Space 的在籍成员。
+//
+// 非本人创建的 bot 必须走好友关系，与 robot 模块的消息转发规则保持一致
+// （参见 modules/robot/event.go："用户与Bot非好友关系，拒绝转发消息"）。
+func (p *Pinned) validateChannelAccess(uid, spaceID, channelID string, channelType uint8) error {
 	switch channelType {
 	case common.ChannelTypePerson.Uint8(): // 私聊
 		isFriend, err := p.friendDB.IsFriend(uid, channelID)
@@ -254,7 +262,27 @@ func (p *Pinned) validateChannelAccess(uid, channelID string, channelType uint8)
 			p.Error("校验好友关系失败", zap.Error(err))
 			return pkgerrors.New("校验频道权限失败")
 		}
-		if !isFriend {
+		if isFriend {
+			break
+		}
+		isRobot, creatorUID, err := p.db.QueryPeerRobotInfo(channelID)
+		if err != nil {
+			p.Error("查询目标用户信息失败", zap.Error(err))
+			return pkgerrors.New("校验频道权限失败")
+		}
+		if isRobot {
+			// 本人创建的 bot 豁免好友要求；他人创建的 bot 必须加好友。
+			if creatorUID == uid {
+				break
+			}
+			return pkgerrors.New("请先添加该机器人为好友")
+		}
+		sameSpace, err := p.db.AreSpaceMembers(spaceID, uid, channelID)
+		if err != nil {
+			p.Error("校验同 Space 成员失败", zap.Error(err))
+			return pkgerrors.New("校验频道权限失败")
+		}
+		if !sameSpace {
 			return pkgerrors.New("你和该用户不是好友")
 		}
 	case common.ChannelTypeGroup.Uint8(): // 群

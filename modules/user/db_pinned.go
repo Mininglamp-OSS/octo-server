@@ -7,6 +7,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
 )
@@ -43,6 +44,40 @@ var (
 	ErrPinnedLimitExceeded = errors.New("置顶数量已达上限")
 	ErrPinnedAlreadyExists = errors.New("该频道已置顶")
 )
+
+// AreSpaceMembers 校验 uid1、uid2 是否都是指定 Space 的在籍成员。
+// 用于私聊置顶时，允许同 Space 成员（即便未互加好友）之间互相置顶。
+func (d *PinnedDB) AreSpaceMembers(spaceID, uid1, uid2 string) (bool, error) {
+	return spacepkg.CheckBothMembers(d.session, spaceID, uid1, uid2)
+}
+
+// QueryPeerRobotInfo 返回目标用户是否为机器人，以及（若为机器人）其创建者 UID。
+// 用于私聊置顶时区分普通用户与 bot：非本人创建的 bot 必须是好友关系才允许对话 / 置顶。
+//
+// 边界：LEFT JOIN 条件限定 r.status=1，因此 user.robot=1 但 robot.status!=1
+// （已停用的 bot）的情况下，返回 isRobot=true, creatorUID=""。此时调用方的
+// creator 匹配必然失败，会 fallback 到 "请先添加该机器人为好友"——对已停用 bot
+// 采用更严格的访问控制，符合与 modules/robot/event.go existRobot 一致的语义。
+func (d *PinnedDB) QueryPeerRobotInfo(peerUID string) (isRobot bool, creatorUID string, err error) {
+	if peerUID == "" {
+		return false, "", nil
+	}
+	type row struct {
+		Robot      int    `db:"robot"`
+		CreatorUID string `db:"creator_uid"`
+	}
+	var r row
+	err = d.session.SelectBySql(
+		"SELECT u.robot AS robot, IFNULL(r.creator_uid,'') AS creator_uid "+
+			"FROM `user` u LEFT JOIN robot r ON r.robot_id = u.uid AND r.status = 1 "+
+			"WHERE u.uid = ?",
+		peerUID,
+	).LoadOne(&r)
+	if err != nil && err != dbr.ErrNotFound {
+		return false, "", err
+	}
+	return r.Robot == 1, r.CreatorUID, nil
+}
 
 // Add 添加置顶频道。
 //

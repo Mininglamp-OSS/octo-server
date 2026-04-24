@@ -230,6 +230,87 @@ func TestPinnedDB_UpdateSort_CrossUserIsolation(t *testing.T) {
 	assert.Contains(t, err.Error(), "未置顶")
 }
 
+func TestPinnedDB_AreSpaceMembers(t *testing.T) {
+	db := newPinnedDBForTest(t)
+
+	// 清表并准备夹具
+	for _, tbl := range []string{"space_member", "space"} {
+		_, err := db.session.DeleteFrom(tbl).Where("1=1").Exec()
+		require.NoError(t, err)
+	}
+	_, err := db.session.InsertBySql("INSERT INTO space(space_id,status) VALUES ('sp_active',1),('sp_disabled',0)").Exec()
+	require.NoError(t, err)
+	_, err = db.session.InsertBySql(
+		"INSERT INTO space_member(space_id,uid,status) VALUES " +
+			"('sp_active','u1',1),('sp_active','u2',1),('sp_active','u3',0)," +
+			"('sp_disabled','u1',1),('sp_disabled','u2',1)",
+	).Exec()
+	require.NoError(t, err)
+
+	tests := []struct {
+		name       string
+		spaceID    string
+		uid1, uid2 string
+		want       bool
+	}{
+		{"both active members", "sp_active", "u1", "u2", true},
+		{"one inactive member", "sp_active", "u1", "u3", false},
+		{"peer not a member", "sp_active", "u1", "u_other", false},
+		{"space disabled", "sp_disabled", "u1", "u2", false},
+		{"empty spaceID", "", "u1", "u2", false},
+		{"empty uid", "sp_active", "u1", "", false},
+		{"same uid twice", "sp_active", "u1", "u1", false}, // COUNT(DISTINCT uid) = 1
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, err := db.AreSpaceMembers(tc.spaceID, tc.uid1, tc.uid2)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, ok)
+		})
+	}
+}
+
+func TestPinnedDB_QueryPeerRobotInfo(t *testing.T) {
+	db := newPinnedDBForTest(t)
+
+	for _, tbl := range []string{"robot", "user"} {
+		_, err := db.session.DeleteFrom(tbl).Where("1=1").Exec()
+		require.NoError(t, err)
+	}
+	_, err := db.session.InsertBySql(
+		"INSERT INTO `user`(uid,robot) VALUES " +
+			"('human_u',0),('bot_active',1),('bot_disabled',1),('bot_no_row',1)",
+	).Exec()
+	require.NoError(t, err)
+	_, err = db.session.InsertBySql(
+		"INSERT INTO robot(robot_id,creator_uid,status) VALUES " +
+			"('bot_active','creator_x',1),('bot_disabled','creator_y',0)",
+	).Exec()
+	require.NoError(t, err)
+
+	tests := []struct {
+		name        string
+		peerUID     string
+		wantIsRobot bool
+		wantCreator string
+	}{
+		{"regular user", "human_u", false, ""},
+		{"active bot", "bot_active", true, "creator_x"},
+		{"disabled bot falls back to empty creator", "bot_disabled", true, ""},
+		{"user.robot=1 with no robot row", "bot_no_row", true, ""},
+		{"unknown peer treated as non-robot", "ghost", false, ""},
+		{"empty peer", "", false, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			isRobot, creator, err := db.QueryPeerRobotInfo(tc.peerUID)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantIsRobot, isRobot)
+			assert.Equal(t, tc.wantCreator, creator)
+		})
+	}
+}
+
 func TestPinnedDB_RemoveByUIDAndChannel_AllSpaces(t *testing.T) {
 	db := newPinnedDBForTest(t)
 	const uid = "u1"
