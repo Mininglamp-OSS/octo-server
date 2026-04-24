@@ -1,5 +1,6 @@
 # Binaries for programs and plugins
 *.exe
+*.exe~
 *.dll
 *.so
 *.dylib
@@ -9,6 +10,19 @@
 
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
+coverage.html
+coverage.txt
+coverage.xml
+*.coverprofile
+
+# Go profiling / tracing artifacts
+*.prof
+*.pprof
+*.trace
+
+# Go workspace file
+go.work
+go.work.sum
 
 # Project-local glide cache, RE: https://github.com/Masterminds/glide/issues/736
 .glide/
@@ -16,31 +30,51 @@
 # IDE
 .idea/
 .vscode/
+.fleet/
+.cursor/
+.zed/
 *.swp
+*.swo
+*~
+*.bak
+*.orig
+*.rej
 
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Runtime / logs / data
 *.socket
 *.db
 *.sqlite
 *.log
-.DS_Store
 .VSCodeCounter/
 logs/
+tmp/
 wukongimdata/
 
 # Build outputs
+/main
 tsdd
 TangSengDaoDaoServer
 app
 tsdd-static
+bin/
+dist/
 
 # Docker volumes & data
 docker/tsdd/mysqldata/
 docker/tsdd/redisdata/
 docker/tsdd/miniodata/
+docker/tsdd/wkdata/
 docker/tsdd/logs/
 
 # Environment config (contains secrets)
 docker/tsdd/.env
+.env
+.env.local
 
 # AI agent docs
 CLAUDE.md
