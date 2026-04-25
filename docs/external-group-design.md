@@ -65,9 +65,10 @@ ALTER TABLE `group` DROP COLUMN `is_external_group`;
 
 ### 2.3 索引
 
-`idx_group_member_external` 复合索引已随 migration 创建，命中
-`WHERE uid=? AND is_external=1 AND is_deleted=0` 的高频查询（`QueryExternalGroupNosForUser`
-/ `QueryExternalMemberCountTx` / `QuerySourceSpaceIDForMember` 均走此索引）。
+`idx_group_member_external (uid, is_external, is_deleted)` 随 migration 创建，命中
+以 `uid` 为起点的外部群查询：`QueryExternalGroupNosForUser` 与 `QuerySourceSpaceIDForMember`。
+`QueryExternalMemberCountTx` 以 `group_no` 起点过滤，走既有的 `group_no` 索引；
+此处列出只是说明「未漏建索引」，不是它们都用新复合索引。
 
 ---
 
@@ -97,8 +98,11 @@ type MemberDetailModel struct {
 }
 ```
 
-`MemberDetailModel` 所有 SELECT 列表均需补齐 `group_member.is_external, group_member.source_space_id`，
-否则 `membersGet` / `syncMembers` / `queryMembersWithKeyword` 等列表接口读出的外部字段为零值。
+会在 API 响应中暴露外部成员身份的 SELECT 路径均需补齐
+`group_member.is_external, group_member.source_space_id` ——
+实际补齐了 `SyncMembers`、`queryMembersWithKeyword`、`queryMembersWithGroupNo`、
+`queryMemberWithGroupNoAndUID` 四处。仅服务于管理者过滤的 `queryManagersWithGroupNos`
+无需这两列，保持原列表不动。
 
 新增查询方法：
 
@@ -344,7 +348,12 @@ if group.SpaceID != "" {
     for _, memberUID := range req.Members {
         // 查询 robot 标记...
         if isBot == 1 {
-            inSpace, _ := spacepkg.CheckMembership(g.ctx.DB(), inviterSpaceID, memberUID)
+            inSpace, checkErr := spacepkg.CheckMembership(g.ctx.DB(), inviterSpaceID, memberUID)
+            if checkErr != nil {
+                g.Error("检查Bot Space成员失败", zap.Error(checkErr))
+                c.ResponseError(errors.New("检查Bot Space成员失败"))
+                return
+            }
             if !inSpace {
                 c.ResponseError(errors.New("该 Bot 不属于你的 Space"))
                 return
