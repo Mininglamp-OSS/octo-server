@@ -22,6 +22,7 @@
             display: flex; align-items: center; justify-content: center;
         }
         .btn:active { opacity: 0.7; }
+        .btn[disabled], .btn.disabled { opacity: 0.5; pointer-events: none; }
         .btn-primary { background: #07c160; color: #fff; }
         .btn-secondary { background: #f0f0f0; color: #333; }
         .badge {
@@ -29,6 +30,12 @@
             font-size: 12px; line-height: 18px; margin-top: 8px;
         }
         .badge-warn { background: #fff3e0; color: #f57c00; }
+        .toast {
+            position: fixed; left: 50%; top: 32px; transform: translateX(-50%);
+            padding: 10px 16px; border-radius: 8px; font-size: 14px;
+            background: rgba(0,0,0,0.78); color: #fff; z-index: 1000;
+            max-width: 80%; text-align: center; display: none;
+        }
         .loading { text-align: center; padding: 80px 20px; color: #999; font-size: 15px; }
         .state-page { text-align: center; padding: 64px 20px; display: none; }
         .state-page .icon { font-size: 48px; margin-bottom: 16px; }
@@ -37,6 +44,7 @@
     </style>
 </head>
 <body>
+    <div id="toast" class="toast"></div>
     <div class="container">
         <div id="loading" class="loading">加载中...</div>
 
@@ -49,6 +57,7 @@
                 <div class="tip" id="v-tip" style="display:none"></div>
             </div>
             <div class="btn-group">
+                <button class="btn btn-primary" id="btn-join" style="display:none">加入群聊</button>
                 <a class="btn btn-primary" id="btn-open" href="#">打开 App</a>
                 <a class="btn btn-secondary" id="btn-download" href="#" target="_blank" rel="noopener">下载 App</a>
             </div>
@@ -64,6 +73,24 @@
             <div class="icon">🚫</div>
             <div class="title">群聊不存在或已解散</div>
             <div class="desc">请确认链接是否正确</div>
+        </div>
+
+        <div class="state-page" id="state-external-blocked">
+            <div class="icon">🔒</div>
+            <div class="title">该群不允许外部成员加入</div>
+            <div class="desc">该群仅允许所属空间（Space）内成员扫码入群，<br/>请联系管理员确认邀请方式</div>
+        </div>
+
+        <div class="state-page" id="state-already-member">
+            <div class="icon">👤</div>
+            <div class="title">你已在此群内</div>
+            <div class="desc">即将跳转到 Web 首页...</div>
+        </div>
+
+        <div class="state-page" id="state-joined">
+            <div class="icon">✅</div>
+            <div class="title">加入成功</div>
+            <div class="desc">即将返回首页...</div>
         </div>
     </div>
 
@@ -84,6 +111,33 @@ function showState(stateID) {
     hide("loading");
     hide("content");
     show(stateID);
+}
+
+function toast(msg, ms) {
+    var el = document.getElementById("toast");
+    el.textContent = msg;
+    el.style.display = "block";
+    clearTimeout(toast._t);
+    toast._t = setTimeout(function () { el.style.display = "none"; }, ms || 2200);
+}
+
+// 从 localStorage 抓 Web 客户端的登录会话（与 dmwork-web 的 InviteLanding 逻辑一致，
+// key 形如 "token{sid}"，value 为 token）。一次扫描同时返回 token 和 sid，
+// 避免调用方为两个值重复遍历 + 复制粘贴过滤规则。保持纯只读，不依赖框架。
+// 返回 {token: "", sid: ""}；找不到时两者都是空串（Safari 隐私模式等亦同）。
+function findTokenAndSid() {
+    try {
+        for (var i = 0; i < localStorage.length; i++) {
+            var key = localStorage.key(i);
+            if (key && key.indexOf("token") === 0 && key !== "tokenCallback") {
+                var val = localStorage.getItem(key);
+                if (val && val.length > 10) {
+                    return { token: val, sid: key.substring(5) };
+                }
+            }
+        }
+    } catch (e) { /* Safari 隐私模式等 */ }
+    return { token: "", sid: "" };
 }
 
 function renderInfo(data) {
@@ -109,8 +163,99 @@ function renderInfo(data) {
     // 「下载 App」回退到产品官网（无独立配置时复用 BaseURL）
     document.getElementById("btn-download").href = API_BASE;
 
+    // Web 已登录 & 群可直接入群 → 显示「加入群聊」按钮
+    // invite_required 场景仍交由 App 内审批，不在落地页直接入群
+    if (data.status === "joinable" && findTokenAndSid().token) {
+        var joinBtn = document.getElementById("btn-join");
+        joinBtn.style.display = "flex";
+        joinBtn.addEventListener("click", onJoinClick);
+    }
+
     hide("loading");
     show("content");
+}
+
+function onJoinClick() {
+    var btn = document.getElementById("btn-join");
+    if (btn.disabled) return;
+    btn.disabled = true;
+    btn.textContent = "正在加入...";
+
+    var session = findTokenAndSid();
+    var token = session.token;
+    if (!token) {
+        toast("请先登录 Web 端后再加入群聊");
+        btn.disabled = false;
+        btn.textContent = "加入群聊";
+        return;
+    }
+
+    // 1. 用公开 code 换出当前登录用户的 auth_code
+    fetch(API_BASE + "/v1/group/invite/authorize?code=" + encodeURIComponent(code), {
+        method: "POST",
+        headers: { "token": token }
+    }).then(function (r) {
+        return r.json().then(function (d) { return { ok: r.ok, data: d }; });
+    }).then(function (r) {
+        if (!r.ok || !r.data) {
+            throw new Error((r.data && r.data.msg) || "邀请链接已过期");
+        }
+        // 已经在群内：不再生成 auth_code，直接给提示 + 跳回首页（带 sid 保留登录态）。
+        if (r.data.already_member) {
+            toast("你已在此群内");
+            showState("state-already-member");
+            setTimeout(function () { redirectHome(session.sid); }, 1200);
+            return null;
+        }
+        // 群属于某 Space 且 allow_external=0：兜底短路（detail 已经把按钮藏掉，
+        // 这里是防御性分支，避免 H5 版本错位时直接撞到 scanjoin 的模糊错误）。
+        if (r.data.status === "external_blocked") {
+            showState("state-external-blocked");
+            return null;
+        }
+        if (!r.data.auth_code || !r.data.group_no) {
+            throw new Error((r.data && r.data.msg) || "邀请链接已过期");
+        }
+        var groupNo = r.data.group_no;
+        var authCode = r.data.auth_code;
+        // 2. 复用和移动端一致的入群接口，内部已覆盖外部成员 / allow_external / invite 校验
+        return fetch(API_BASE + "/v1/groups/" + encodeURIComponent(groupNo) +
+                     "/scanjoin?auth_code=" + encodeURIComponent(authCode), {
+            method: "GET",
+            headers: { "token": token }
+        }).then(function (r2) {
+            return r2.text().then(function (txt) {
+                var msg = "";
+                try { msg = (JSON.parse(txt) || {}).msg || ""; } catch (e) { /* ignore */ }
+                return { ok: r2.ok, msg: msg };
+            });
+        });
+    }).then(function (r) {
+        // 已在群内 / external_blocked 已提前 return null，这里什么都不做。
+        if (r === null) return;
+        if (!r.ok) {
+            throw new Error(r.msg || "加入失败");
+        }
+        // 3. 入群成功：提示 + 跳回 Web 首页（带 sid 保证登录态可恢复）
+        toast("加入成功");
+        showState("state-joined");
+        setTimeout(function () { redirectHome(session.sid); }, 1200);
+    }).catch(function (err) {
+        toast((err && err.message) || "加入失败");
+        btn.disabled = false;
+        btn.textContent = "加入群聊";
+    });
+}
+
+// redirectHome 把 Web 落地页跳回 dmwork-web 首页（保留 sid）；失败时兜底到 "/"。
+function redirectHome(sid) {
+    try {
+        var basePath = window.location.pathname.replace(/\/+$/, '').replace(/\/v1\/group\/invite$/, '');
+        var target = window.location.origin + (basePath || "/") + (sid ? "?sid=" + encodeURIComponent(sid) : "");
+        window.location.href = target;
+    } catch (e) {
+        window.location.href = "/";
+    }
 }
 
 if (!code) {
@@ -129,6 +274,11 @@ if (!code) {
                 case "joinable":
                 case "invite_required":
                     renderInfo(r.data);
+                    break;
+                case "external_blocked":
+                    // 群属于某 Space 且 allow_external=0：groupScanJoin 的最终裁决仍会拒绝，
+                    // 这里提前给明确状态页、藏掉「加入群聊」按钮，避免点了才看到错误。
+                    showState("state-external-blocked");
                     break;
                 case "not_found":
                     showState("state-not-found");

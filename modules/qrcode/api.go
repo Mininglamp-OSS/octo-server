@@ -215,15 +215,17 @@ func (q *QRCode) handleJoinGroup(loginUID string, qrCodeModel common.QRCodeModel
 		return nil, errors.New("群不存在")
 	}
 
-	// 检查用户是否在群所属的 Space 中
-	if groupModel.SpaceID != "" {
+	// 扫码预检仅拦截「群禁止外部成员且扫码者非 Space 成员」的场景。
+	// 外部群（is_external_group=1）和 allow_external=1（默认）场景下，预检放行，
+	// 真正的入群鉴权（外部成员识别 / allow_external / invite 审批等）由 groupScanJoin 完成。
+	if groupModel.SpaceID != "" && groupModel.AllowExternal == 0 {
 		isMember, err := q.spaceDB.IsMember(groupModel.SpaceID, loginUID)
 		if err != nil {
 			q.Error("查询空间成员失败", zap.Error(err))
 			return nil, errors.New("校验空间成员失败，请稍后重试")
 		}
 		if !isMember {
-			return nil, errors.New("请先加入该空间后再扫码入群")
+			return nil, errors.New("该群仅允许本空间成员加入")
 		}
 	}
 
