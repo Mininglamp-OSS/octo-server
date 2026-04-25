@@ -554,6 +554,100 @@ func TestGroupInviteAuthorize_AlreadyMember(t *testing.T) {
 	assert.False(t, authCodeExists, "already_member 场景不应返回 auth_code")
 }
 
+// YUJ-39 回归：invite=1 的群里，已是成员的用户扫码 authorize 应返回
+// already_member=true，而不是被 400「邀请模式」短路拦截。
+// 这固化「already_member 判定必须早于 invite 判定」的顺序约定，
+// 与 qrcode/api.go handleJoinGroup 对齐。
+func TestGroupInviteAuthorize_Invite1_AlreadyMember(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	groupNo := "g-invite-auth-invite1-already"
+	err = f.db.Insert(&Model{
+		GroupNo:       groupNo,
+		Name:          "审批群",
+		Creator:       "10001",
+		Status:        1,
+		Invite:        1, // 开启邀请审批
+		AllowExternal: 1,
+	})
+	assert.NoError(t, err)
+	// 当前登录用户已经是群成员
+	err = f.db.InsertMember(&MemberModel{GroupNo: groupNo, UID: testutil.UID, Role: MemberRoleCommon, Version: 1})
+	assert.NoError(t, err)
+
+	code := "test-auth-invite1-already-code"
+	err = ctx.GetRedisConn().SetAndExpire(
+		fmt.Sprintf("%s%s", common.QRCodeCachePrefix, code),
+		util.ToJson(common.NewQRCodeModel(common.QRCodeTypeGroup, map[string]interface{}{
+			"group_no":  groupNo,
+			"generator": "10001",
+		})),
+		time.Hour,
+	)
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/group/invite/authorize?code="+code, nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.NotContains(t, w.Body.String(), "邀请模式",
+		"已是成员的用户不应被 invite 模式 400 拦截")
+	var resp map[string]interface{}
+	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, groupNo, resp["group_no"])
+	assert.Equal(t, true, resp["already_member"])
+	_, authCodeExists := resp["auth_code"]
+	assert.False(t, authCodeExists, "already_member 场景不应返回 auth_code")
+}
+
+// YUJ-39 回归：invite=1 的群里，非成员扫码 authorize 仍应被 400「邀请模式」
+// 拦截（与 TestGroupInviteAuthorize_InviteRequired 互为对照：这里显式断言
+// 当 already_member 判定 miss 时，invite 判定仍然生效，顺序重排不影响非成员路径）。
+func TestGroupInviteAuthorize_Invite1_NonMember(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	groupNo := "g-invite-auth-invite1-nonmember"
+	err = f.db.Insert(&Model{
+		GroupNo:       groupNo,
+		Name:          "审批群",
+		Creator:       "10001",
+		Status:        1,
+		Invite:        1,
+		AllowExternal: 1,
+	})
+	assert.NoError(t, err)
+	// 注意：不插入 testutil.UID 为成员 —— 当前登录用户是非成员
+
+	code := "test-auth-invite1-nonmember-code"
+	err = ctx.GetRedisConn().SetAndExpire(
+		fmt.Sprintf("%s%s", common.QRCodeCachePrefix, code),
+		util.ToJson(common.NewQRCodeModel(common.QRCodeTypeGroup, map[string]interface{}{
+			"group_no":  groupNo,
+			"generator": "10001",
+		})),
+		time.Hour,
+	)
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/group/invite/authorize?code="+code, nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "邀请模式")
+}
+
 // 群属于某 Space 且 allow_external=0 时，authorize 应短路返回 external_blocked，
 // 不生成 auth_code。这是 H5 版本错位时的兜底路径（正常情况下 detail 已经藏掉按钮）。
 func TestGroupInviteAuthorize_ExternalBlocked(t *testing.T) {

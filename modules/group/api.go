@@ -3627,11 +3627,13 @@ func (g *Group) groupInviteDetail(c *wkhttp.Context) {
 // 是否允许、是否邀请审批）都交给 groupScanJoin，避免双份鉴权漂移。
 //
 // 但以下三类情况会在此端点提前短路，避免让 H5 用户看到一条令人困惑的错误
-// 或无谓往 Redis 写 30min TTL 的 auth_code（对齐 qrcode/api.go handleJoinGroup 的预检）：
-//   - 群属于某 Space 且 allow_external=0 且扫码者不是 Space 成员：返回 {status: "external_blocked", group_no}
+// 或无谓往 Redis 写 30min TTL 的 auth_code（对齐 qrcode/api.go handleJoinGroup 的预检）。
+// 短路优先级**严格**如下（顺序必须与下方代码一致，不要随手调换）：
+//  1. 群属于某 Space 且 allow_external=0 且扫码者不是 Space 成员：返回 {status: "external_blocked", group_no}
 //     （同 Space 成员继续走正常流程，避免误杀）
-//   - invite=1：返回 HTTP 400「邀请模式」错误（与 groupScanJoin 拒绝文案一致）
-//   - 已经在群内：返回 {already_member: true, group_no}
+//  2. 已经在群内：返回 {already_member: true, group_no}
+//     （必须排在 invite 之前：开启邀请审批的群里，已是群成员的用户扫码应走「已在群内」而不是被 400 拦截）
+//  3. invite=1：返回 HTTP 400「邀请模式」错误（与 groupScanJoin 拒绝文案一致）
 func (g *Group) groupInviteAuthorize(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	if loginUID == "" {
@@ -3706,17 +3708,13 @@ func (g *Group) groupInviteAuthorize(c *wkhttp.Context) {
 			})
 			return
 		}
-		// 同 Space 成员：继续走正常流程（可能落到 invite_required 或直接生成 auth_code）。
-	}
-	if groupModel.Invite == 1 {
-		// 与 groupScanJoin 保持一致：开启邀请审批的群不支持直接扫码入群，
-		// 也不在 H5 落地页生成 auth_code（避免后续 scanjoin 失败时的语义含糊）。
-		c.ResponseError(errors.New("群开启了邀请模式，不能直接加入群聊"))
-		return
+		// 同 Space 成员：继续走正常流程（可能落到 already_member / invite_required / 直接生成 auth_code）。
 	}
 	// 已经在群内：与 qrcode/api.go handleJoinGroup 对齐，返回 already_member=true，
 	// 不生成 auth_code（否则 scanjoin 只会回「已经在群内」，并白占一条 Redis TTL）。
 	// H5 收到后展示「你已在此群内」并给跳转入口。
+	// 注意：already_member 判定必须放在 invite 判定之前 —— 开启邀请审批的群，
+	// 已是群成员的用户扫码仍应走「已在群内」分支，而不是被 400「邀请模式」拦截。
 	existMember, err := g.db.ExistMember(loginUID, groupNo)
 	if err != nil {
 		g.Error("查询群成员失败", zap.Error(err), zap.String("group_no", groupNo))
@@ -3728,6 +3726,12 @@ func (g *Group) groupInviteAuthorize(c *wkhttp.Context) {
 			"group_no":       groupNo,
 			"already_member": true,
 		})
+		return
+	}
+	if groupModel.Invite == 1 {
+		// 与 groupScanJoin 保持一致：开启邀请审批的群不支持直接扫码入群，
+		// 也不在 H5 落地页生成 auth_code（避免后续 scanjoin 失败时的语义含糊）。
+		c.ResponseError(errors.New("群开启了邀请模式，不能直接加入群聊"))
 		return
 	}
 
