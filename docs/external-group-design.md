@@ -207,16 +207,16 @@ func (d *DB) recoverMemberTx(member *MemberModel, tx *dbr.Tx) error {
 isExternal := 0
 sourceSpaceID := ""
 if group.SpaceID != "" {
-    inSpace, err := spacepkg.CheckMembership(g.ctx.DB(), group.SpaceID, scaner)
-    if err != nil {
-        g.Error("检查 Space 成员失败", zap.Error(err))
+    inSpace, checkErr := spacepkg.CheckMembership(g.ctx.DB(), group.SpaceID, scaner)
+    if checkErr != nil {
+        g.Error("检查 Space 成员失败", zap.Error(checkErr))
         c.ResponseError(errors.New("检查成员关系失败"))
         return
     }
     if !inSpace {
         // 不在群的 Space → 外部成员
         isExternal = 1
-        sourceSpaceID = space.GetUserDefaultSpaceID(g.ctx, scaner)
+        sourceSpaceID = spacemod.GetUserDefaultSpaceID(g.ctx, scaner)
     }
 }
 
@@ -485,50 +485,60 @@ func (g *GroupResp) SetEffectiveSpaceIDFromMap(externalMap map[string]string) {
 ```go
 type memberDetailResp struct {
     // ... 现有字段 ...
-    IsExternal      int    `json:"is_external"`       // 外部成员
+    IsExternal      int    `json:"is_external"`       // 是否外部成员
+    SourceSpaceID   string `json:"source_space_id"`   // 来源 Space ID
     SourceSpaceName string `json:"source_space_name"` // 来源 Space 名称（外部成员时填充）
 }
 ```
 
+`memberDetailResp.from(model)` 同步赋值 `IsExternal` / `SourceSpaceID`。
+`SourceSpaceName` 由 `fillSourceSpaceNames` 在列表层统一补齐。
+
 #### 填充 source_space_name
 
-在 `memberDetailResp` 的序列化方法中，对外部成员查询 Space 名称：
+列表接口（`membersGet` / `syncMembers`）在序列化完成后调用 `fillSourceSpaceNames`，
+批量查询外部成员对应的 Space 名称，避免 N+1。`resps` 以值切片传入并直接写回：
 
 ```go
-// 在构建 memberDetailResp 列表时，批量查询 Space 名称避免 N+1
-func (g *Group) fillSourceSpaceNames(members []*memberDetailResp) {
+func (g *Group) fillSourceSpaceNames(resps []memberDetailResp) {
+    if len(resps) == 0 {
+        return
+    }
     // 1. 收集所有不重复的 source_space_id
-    spaceIDs := make(map[string]struct{})
-    for _, m := range members {
+    idSet := make(map[string]struct{})
+    for _, m := range resps {
         if m.IsExternal == 1 && m.SourceSpaceID != "" {
-            spaceIDs[m.SourceSpaceID] = struct{}{}
+            idSet[m.SourceSpaceID] = struct{}{}
         }
     }
-    if len(spaceIDs) == 0 {
+    if len(idSet) == 0 {
         return
     }
 
     // 2. 批量查询 Space 名称
-    ids := make([]string, 0, len(spaceIDs))
-    for id := range spaceIDs {
+    ids := make([]string, 0, len(idSet))
+    for id := range idSet {
         ids = append(ids, id)
     }
-    var spaces []struct {
+    var rows []struct {
         SpaceID string `db:"space_id"`
         Name    string `db:"name"`
     }
-    g.ctx.DB().SelectBySql(
-        "SELECT space_id, name FROM space WHERE space_id IN ?", ids,
-    ).Load(&spaces)
-    nameMap := make(map[string]string, len(spaces))
-    for _, s := range spaces {
-        nameMap[s.SpaceID] = s.Name
+    _, err := g.ctx.DB().Select("space_id", "name").From("space").
+        Where("space_id IN ?", ids).Load(&rows)
+    if err != nil {
+        g.Warn("查询来源 Space 名称失败", zap.Error(err))
+        return
+    }
+    nameMap := make(map[string]string, len(rows))
+    for _, r := range rows {
+        nameMap[r.SpaceID] = r.Name
     }
 
     // 3. 填充
-    for _, m := range members {
-        if m.IsExternal == 1 {
-            m.SourceSpaceName = nameMap[m.SourceSpaceID]
+    for i := range resps {
+        if resps[i].IsExternal == 1 {
+            resps[i].SourceSpaceName = nameMap[resps[i].SourceSpaceID]
         }
     }
 }
@@ -583,11 +593,18 @@ if spaceID == filterSpaceID {
 
 ### 3.5 modules/search/api.go — 搜索过滤
 
-修改 `shouldIncludeGroupForSpace`，增加外部成员判断：
+`shouldIncludeGroupForSpace` 扩展签名，引入外部群映射；`global` 接口在入口处批量查询映射：
 
 ```go
-// shouldIncludeGroupForSpace 改为方法，接收外部群映射
-func shouldIncludeGroupForSpace(groupSpaceID, searchSpaceID string, 
+// 搜索入口：一次性查询用户的外部群映射
+externalGroupMap, extErr := group.NewDB(s.ctx).QueryExternalGroupNosForUser(loginUID)
+if extErr != nil {
+    s.Warn("查询外部群失败，外部群将在搜索中不可见", zap.Error(extErr))
+    externalGroupMap = map[string]string{}
+}
+
+// 过滤判断：群 Space 精确匹配 或 外部群 source Space 匹配
+func shouldIncludeGroupForSpace(groupSpaceID, searchSpaceID string,
     groupNo string, externalGroupMap map[string]string) bool {
     if searchSpaceID == "" {
         return false
@@ -595,18 +612,11 @@ func shouldIncludeGroupForSpace(groupSpaceID, searchSpaceID string,
     if groupSpaceID == searchSpaceID {
         return true
     }
-    // 外部群：source_space_id 匹配当前搜索 Space
-    if sourceSpace, ok := externalGroupMap[groupNo]; ok {
-        return sourceSpace == searchSpaceID
+    if sourceSpace, ok := externalGroupMap[groupNo]; ok && sourceSpace == searchSpaceID {
+        return true
     }
     return false
 }
-```
-
-搜索 API 调用前，查询用户的外部群映射：
-
-```go
-externalGroupMap, _ := group.NewDB(s.ctx).QueryExternalGroupNosForUser(loginUID)
 ```
 
 ---
