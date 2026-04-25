@@ -75,6 +75,18 @@
             <div class="desc">请确认链接是否正确</div>
         </div>
 
+        <div class="state-page" id="state-external-blocked">
+            <div class="icon">🔒</div>
+            <div class="title">该群不允许外部成员加入</div>
+            <div class="desc">该群仅允许所属空间（Space）内成员扫码入群，<br/>请联系管理员确认邀请方式</div>
+        </div>
+
+        <div class="state-page" id="state-already-member">
+            <div class="icon">👤</div>
+            <div class="title">你已在此群内</div>
+            <div class="desc">即将跳转到 Web 首页...</div>
+        </div>
+
         <div class="state-page" id="state-joined">
             <div class="icon">✅</div>
             <div class="title">加入成功</div>
@@ -185,7 +197,23 @@ function onJoinClick() {
     }).then(function (r) {
         return r.json().then(function (d) { return { ok: r.ok, data: d }; });
     }).then(function (r) {
-        if (!r.ok || !r.data || !r.data.auth_code || !r.data.group_no) {
+        if (!r.ok || !r.data) {
+            throw new Error((r.data && r.data.msg) || "邀请链接已过期");
+        }
+        // 已经在群内：不再生成 auth_code，直接给提示 + 跳回首页（带 sid 保留登录态）。
+        if (r.data.already_member) {
+            toast("你已在此群内");
+            showState("state-already-member");
+            setTimeout(function () { redirectHome(session.sid); }, 1200);
+            return null;
+        }
+        // 群属于某 Space 且 allow_external=0：兜底短路（detail 已经把按钮藏掉，
+        // 这里是防御性分支，避免 H5 版本错位时直接撞到 scanjoin 的模糊错误）。
+        if (r.data.status === "external_blocked") {
+            showState("state-external-blocked");
+            return null;
+        }
+        if (!r.data.auth_code || !r.data.group_no) {
             throw new Error((r.data && r.data.msg) || "邀请链接已过期");
         }
         var groupNo = r.data.group_no;
@@ -203,27 +231,31 @@ function onJoinClick() {
             });
         });
     }).then(function (r) {
+        // 已在群内 / external_blocked 已提前 return null，这里什么都不做。
+        if (r === null) return;
         if (!r.ok) {
             throw new Error(r.msg || "加入失败");
         }
         // 3. 入群成功：提示 + 跳回 Web 首页（带 sid 保证登录态可恢复）
         toast("加入成功");
         showState("state-joined");
-        setTimeout(function () {
-            try {
-                var sid = session.sid;
-                var basePath = window.location.pathname.replace(/\/+$/, '').replace(/\/v1\/group\/invite$/, '');
-                var target = window.location.origin + (basePath || "/") + (sid ? "?sid=" + encodeURIComponent(sid) : "");
-                window.location.href = target;
-            } catch (e) {
-                window.location.href = "/";
-            }
-        }, 1200);
+        setTimeout(function () { redirectHome(session.sid); }, 1200);
     }).catch(function (err) {
         toast((err && err.message) || "加入失败");
         btn.disabled = false;
         btn.textContent = "加入群聊";
     });
+}
+
+// redirectHome 把 Web 落地页跳回 dmwork-web 首页（保留 sid）；失败时兜底到 "/"。
+function redirectHome(sid) {
+    try {
+        var basePath = window.location.pathname.replace(/\/+$/, '').replace(/\/v1\/group\/invite$/, '');
+        var target = window.location.origin + (basePath || "/") + (sid ? "?sid=" + encodeURIComponent(sid) : "");
+        window.location.href = target;
+    } catch (e) {
+        window.location.href = "/";
+    }
 }
 
 if (!code) {
@@ -242,6 +274,11 @@ if (!code) {
                 case "joinable":
                 case "invite_required":
                     renderInfo(r.data);
+                    break;
+                case "external_blocked":
+                    // 群属于某 Space 且 allow_external=0：groupScanJoin 的最终裁决仍会拒绝，
+                    // 这里提前给明确状态页、藏掉「加入群聊」按钮，避免点了才看到错误。
+                    showState("state-external-blocked");
                     break;
                 case "not_found":
                     showState("state-not-found");

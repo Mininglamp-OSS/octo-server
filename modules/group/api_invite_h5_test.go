@@ -415,3 +415,187 @@ func TestGroupInviteAuthorize_HasUIDRateLimit(t *testing.T) {
 	assert.NotEmpty(t, w.Header().Get("X-RateLimit-Limit"))
 	assert.NotEmpty(t, w.Header().Get("X-RateLimit-Remaining"))
 }
+
+// 群属于某 Space 且 allow_external=0 时，detail 接口应提前返回 external_blocked，
+// 让 H5 落地页直接给明确提示、藏掉「加入群聊」按钮，而不是等用户点了才被
+// groupScanJoin 拒绝。
+func TestGroupInviteDetail_ExternalBlocked(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	groupNo := "g-invite-h5-external"
+	err = f.db.Insert(&Model{
+		GroupNo:       groupNo,
+		Name:          "内部协作群",
+		Creator:       testutil.UID,
+		Status:        1,
+		Invite:        0,
+		SpaceID:       "space-a",
+		AllowExternal: 0,
+	})
+	assert.NoError(t, err)
+	err = f.db.InsertMember(&MemberModel{GroupNo: groupNo, UID: testutil.UID, Role: MemberRoleCreator, Version: 1})
+	assert.NoError(t, err)
+
+	code := "test-h5-external-blocked-code"
+	err = ctx.GetRedisConn().SetAndExpire(
+		fmt.Sprintf("%s%s", common.QRCodeCachePrefix, code),
+		util.ToJson(common.NewQRCodeModel(common.QRCodeTypeGroup, map[string]interface{}{
+			"group_no":  groupNo,
+			"generator": testutil.UID,
+		})),
+		time.Hour,
+	)
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	s.GetRoute().ServeHTTP(w, newInviteRequest(t, "/v1/group/invite/detail?code="+code))
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var resp map[string]interface{}
+	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, "external_blocked", resp["status"])
+	assert.Equal(t, groupNo, resp["group_no"])
+}
+
+// allow_external=1（默认）或群无 SpaceID 时不应触发 external_blocked。
+// 这里确保我们没把默认路径（App 内创建的无 Space 群）误伤。
+func TestGroupInviteDetail_NoSpaceNotExternalBlocked(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	groupNo := "g-invite-h5-no-space"
+	err = f.db.Insert(&Model{
+		GroupNo:       groupNo,
+		Name:          "默认群",
+		Creator:       testutil.UID,
+		Status:        1,
+		Invite:        0,
+		SpaceID:       "",
+		AllowExternal: 0, // 即便 allow_external=0, 只要无 SpaceID 也不触发
+	})
+	assert.NoError(t, err)
+	err = f.db.InsertMember(&MemberModel{GroupNo: groupNo, UID: testutil.UID, Role: MemberRoleCreator, Version: 1})
+	assert.NoError(t, err)
+
+	code := "test-h5-no-space-code"
+	err = ctx.GetRedisConn().SetAndExpire(
+		fmt.Sprintf("%s%s", common.QRCodeCachePrefix, code),
+		util.ToJson(common.NewQRCodeModel(common.QRCodeTypeGroup, map[string]interface{}{
+			"group_no":  groupNo,
+			"generator": testutil.UID,
+		})),
+		time.Hour,
+	)
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	s.GetRoute().ServeHTTP(w, newInviteRequest(t, "/v1/group/invite/detail?code="+code))
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var resp map[string]interface{}
+	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, "joinable", resp["status"])
+}
+
+// 登录用户已经在群内时，authorize 应返回 already_member=true 并且不写
+// Redis auth_code（与 qrcode/api.go handleJoinGroup 的预检对齐，避免
+// scanjoin 回「已经在群内」的模糊错误 + 白占 30min TTL）。
+func TestGroupInviteAuthorize_AlreadyMember(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	groupNo := "g-invite-auth-already"
+	err = f.db.Insert(&Model{
+		GroupNo:       groupNo,
+		Name:          "已在群",
+		Creator:       "10001",
+		Status:        1,
+		Invite:        0,
+		AllowExternal: 1,
+	})
+	assert.NoError(t, err)
+	// 当前登录用户已经是群成员
+	err = f.db.InsertMember(&MemberModel{GroupNo: groupNo, UID: testutil.UID, Role: MemberRoleCommon, Version: 1})
+	assert.NoError(t, err)
+
+	code := "test-auth-already-code"
+	err = ctx.GetRedisConn().SetAndExpire(
+		fmt.Sprintf("%s%s", common.QRCodeCachePrefix, code),
+		util.ToJson(common.NewQRCodeModel(common.QRCodeTypeGroup, map[string]interface{}{
+			"group_no":  groupNo,
+			"generator": "10001",
+		})),
+		time.Hour,
+	)
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/group/invite/authorize?code="+code, nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var resp map[string]interface{}
+	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, groupNo, resp["group_no"])
+	assert.Equal(t, true, resp["already_member"])
+	// already_member 不应生成 auth_code，避免白占 30min Redis TTL
+	_, authCodeExists := resp["auth_code"]
+	assert.False(t, authCodeExists, "already_member 场景不应返回 auth_code")
+}
+
+// 群属于某 Space 且 allow_external=0 时，authorize 应短路返回 external_blocked，
+// 不生成 auth_code。这是 H5 版本错位时的兜底路径（正常情况下 detail 已经藏掉按钮）。
+func TestGroupInviteAuthorize_ExternalBlocked(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	groupNo := "g-invite-auth-external"
+	err = f.db.Insert(&Model{
+		GroupNo:       groupNo,
+		Name:          "Space 内部群",
+		Creator:       "10001",
+		Status:        1,
+		Invite:        0,
+		SpaceID:       "space-a",
+		AllowExternal: 0,
+	})
+	assert.NoError(t, err)
+
+	code := "test-auth-external-code"
+	err = ctx.GetRedisConn().SetAndExpire(
+		fmt.Sprintf("%s%s", common.QRCodeCachePrefix, code),
+		util.ToJson(common.NewQRCodeModel(common.QRCodeTypeGroup, map[string]interface{}{
+			"group_no":  groupNo,
+			"generator": "10001",
+		})),
+		time.Hour,
+	)
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/group/invite/authorize?code="+code, nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var resp map[string]interface{}
+	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, "external_blocked", resp["status"])
+	assert.Equal(t, groupNo, resp["group_no"])
+	_, authCodeExists := resp["auth_code"]
+	assert.False(t, authCodeExists, "external_blocked 场景不应返回 auth_code")
+}
