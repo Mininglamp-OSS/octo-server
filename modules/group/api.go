@@ -1846,6 +1846,18 @@ func (g *Group) groupScanJoin(c *wkhttp.Context) {
 		return
 	}
 
+	// 首个外部成员加入时在同一事务内将群标记为外部群，确保成员/群标记一致提交
+	markedExternal := false
+	if isExternal == 1 && group.IsExternalGroup == 0 {
+		if updateErr := g.db.UpdateIsExternalGroupTx(groupNo, 1, tx); updateErr != nil {
+			tx.Rollback()
+			g.Error("更新 is_external_group 失败", zap.Error(updateErr), zap.String("group_no", groupNo))
+			c.ResponseError(errors.New("更新群外部标记失败！"))
+			return
+		}
+		markedExternal = true
+	}
+
 	if err := tx.Commit(); err != nil {
 		tx.Rollback()
 		g.Error("提交事务失败！", zap.Error(err))
@@ -1853,13 +1865,8 @@ func (g *Group) groupScanJoin(c *wkhttp.Context) {
 		return
 	}
 
-	// 首个外部成员加入时将群标记为外部群，并通知所有成员刷新频道信息
-	if isExternal == 1 && group.IsExternalGroup == 0 {
-		if updateErr := g.db.UpdateIsExternalGroup(groupNo, 1); updateErr != nil {
-			g.Warn("更新 is_external_group 失败", zap.Error(updateErr), zap.String("group_no", groupNo))
-		} else {
-			g.ctx.SendChannelUpdateToGroup(groupNo)
-		}
+	if markedExternal {
+		g.ctx.SendChannelUpdateToGroup(groupNo)
 	}
 
 	// 调用IM的添加订阅者（在事务提交后执行，确保数据一致性）

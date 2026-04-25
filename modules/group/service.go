@@ -223,13 +223,19 @@ func (s *Service) GetGroupDetails(groupNos []string, uid string) ([]*GroupResp, 
 		return nil, err
 	}
 	groupResps := make([]*GroupResp, 0)
-	if len(groupDetails) > 0 {
-		for _, groupDetail := range groupDetails {
-			groupResp := &GroupResp{}
-			groupResp = groupResp.from(groupDetail)
-			groupResp.SetEffectiveSpaceID(uid, s.db)
-			groupResps = append(groupResps, groupResp)
-		}
+	if len(groupDetails) == 0 {
+		return groupResps, nil
+	}
+	externalMap, err := s.db.QueryExternalGroupNosForUser(uid)
+	if err != nil {
+		s.Error("query external group nos failed", zap.Error(err), zap.String("uid", uid))
+		externalMap = nil
+	}
+	for _, groupDetail := range groupDetails {
+		groupResp := &GroupResp{}
+		groupResp = groupResp.from(groupDetail)
+		groupResp.SetEffectiveSpaceIDFromMap(externalMap)
+		groupResps = append(groupResps, groupResp)
 	}
 	return groupResps, nil
 }
@@ -686,6 +692,17 @@ func (g *GroupResp) SetEffectiveSpaceID(loginUID string, db *DB) {
 		return
 	}
 	g.SpaceID = sourceSpaceID
+}
+
+// SetEffectiveSpaceIDFromMap 与 SetEffectiveSpaceID 等价，但使用调用方预先批量查询的
+// groupNo -> sourceSpaceID 映射，避免列表场景下的 N+1 查询。
+func (g *GroupResp) SetEffectiveSpaceIDFromMap(externalMap map[string]string) {
+	if g == nil || g.IsExternalGroup == 0 || len(externalMap) == 0 {
+		return
+	}
+	if sourceSpaceID, ok := externalMap[g.GroupNo]; ok && sourceSpaceID != "" {
+		g.SpaceID = sourceSpaceID
+	}
 }
 
 // GetGroupMdMaxSize returns the max GROUP.md size from env or default (10240)
@@ -1187,19 +1204,24 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 		}
 	}
 
+	// 首次出现外部成员时，在事务内将群标记为外部群，确保成员/群标记一致提交
+	markedExternal := false
+	if hasNewExternal && groupModel.IsExternalGroup == 0 {
+		if updateErr := s.db.UpdateIsExternalGroupTx(req.GroupNo, 1, tx); updateErr != nil {
+			s.Error("update is_external_group failed", zap.Error(updateErr), zap.String("group_no", req.GroupNo))
+			return nil, errors.New("failed to update external group flag")
+		}
+		markedExternal = true
+	}
+
 	// 提交事务
 	if err := tx.Commit(); err != nil {
 		s.Error("commit transaction failed", zap.Error(err))
 		return nil, errors.New("failed to commit transaction")
 	}
 
-	// 首次出现外部成员时，标记群为外部群并通知成员刷新频道信息
-	if hasNewExternal && groupModel.IsExternalGroup == 0 {
-		if updateErr := s.db.UpdateIsExternalGroup(req.GroupNo, 1); updateErr != nil {
-			s.Error("update is_external_group failed", zap.Error(updateErr), zap.String("group_no", req.GroupNo))
-		} else {
-			s.ctx.SendChannelUpdateToGroup(req.GroupNo)
-		}
+	if markedExternal {
+		s.ctx.SendChannelUpdateToGroup(req.GroupNo)
 	}
 
 	// IM 操作（事务提交之后）
