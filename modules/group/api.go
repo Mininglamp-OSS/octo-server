@@ -1642,10 +1642,14 @@ func (g *Group) groupQRCode(c *wkhttp.Context) {
 		c.ResponseError(errors.New("设置缓存失败！"))
 		return
 	}
+	baseURL := g.ctx.GetConfig().External.BaseURL
 	c.Response(gin.H{
 		"day":    7,
-		"qrcode": fmt.Sprintf("%s/%s", g.ctx.GetConfig().External.BaseURL, strings.ReplaceAll(g.ctx.GetConfig().QRCodeInfoURL, ":code", uuid)),
-		"expire": time.Now().Add(time.Hour * 24 * 7).Format("01月02日"),
+		"qrcode": fmt.Sprintf("%s/%s", baseURL, strings.ReplaceAll(g.ctx.GetConfig().QRCodeInfoURL, ":code", uuid)),
+		// invite_url 是浏览器友好的公开落地页（YUJ-31），App 仍走 qrcode 字段。
+		// Web "复制邀请链接" 按钮（YUJ-30）应当使用此字段。
+		"invite_url": fmt.Sprintf("%s/v1/group/invite?code=%s", baseURL, uuid),
+		"expire":     time.Now().Add(time.Hour * 24 * 7).Format("01月02日"),
 	})
 
 }
