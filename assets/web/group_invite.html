@@ -92,6 +92,24 @@
             <div class="title">加入成功</div>
             <div class="desc">即将返回首页...</div>
         </div>
+
+        <div class="state-page" id="state-rate-limited">
+            <div class="icon">⏳</div>
+            <div class="title">请稍后再试</div>
+            <div class="desc">当前访问人数较多，请稍等片刻后刷新页面重试</div>
+        </div>
+
+        <div class="state-page" id="state-server-error">
+            <div class="icon">⚠️</div>
+            <div class="title">加载失败</div>
+            <div class="desc">服务暂时不可用，请稍后刷新重试</div>
+        </div>
+
+        <div class="state-page" id="state-network-error">
+            <div class="icon">📡</div>
+            <div class="title">网络异常</div>
+            <div class="desc">无法连接服务器，请检查网络后刷新重试</div>
+        </div>
     </div>
 
 <script>
@@ -263,10 +281,22 @@ if (!code) {
 } else {
     fetch(API_BASE + "/v1/group/invite/detail?code=" + encodeURIComponent(code))
         .then(function(r) {
-            return r.json().then(function(d) { return { ok: r.ok, data: d }; });
+            // 先按 HTTP 状态分流：429 / 5xx 都不是「邀请过期」，不能让用户误以为链接失效。
+            // 这些分支里的 body 通常也不是合法 JSON（网关页 / 空响应），所以不 .json()。
+            if (r.status === 429) {
+                showState("state-rate-limited");
+                return null;
+            }
+            if (r.status >= 500) {
+                showState("state-server-error");
+                return null;
+            }
+            return r.json().then(function(d) { return { ok: r.ok, status: r.status, data: d }; });
         })
         .then(function(r) {
+            if (r === null) return;
             if (!r.ok) {
+                // 4xx（主要是 404 / 400）：链接确实不存在或非法，保持「已过期」语义不回归。
                 showState("state-expired");
                 return;
             }
@@ -290,7 +320,8 @@ if (!code) {
             }
         })
         .catch(function() {
-            showState("state-expired");
+            // fetch reject / JSON parse 失败通常意味着网络层问题，而非链接过期。
+            showState("state-network-error");
         });
 }
 </script>

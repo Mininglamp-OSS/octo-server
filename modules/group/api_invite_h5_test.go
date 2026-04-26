@@ -225,6 +225,15 @@ func TestGroupInvitePage_RendersHTMLWithAPIBase(t *testing.T) {
 	assert.NotContains(t, body, "{{API_BASE_URL}}")
 	assert.True(t, strings.Contains(body, "群邀请"))
 	assert.True(t, strings.Contains(body, "/v1/group/invite/detail"))
+
+	// YUJ-42: 落地页必须区分 rate-limit / server error / network error 与真正的「已过期」，
+	// 避免 detail 返回 429 / 5xx 时把所有用户都误导成「邀请链接已过期」。
+	assert.True(t, strings.Contains(body, `id="state-rate-limited"`), "rate-limited state block missing")
+	assert.True(t, strings.Contains(body, "请稍后再试"), "rate-limited copy missing")
+	assert.True(t, strings.Contains(body, `id="state-server-error"`), "server-error state block missing")
+	assert.True(t, strings.Contains(body, `id="state-network-error"`), "network-error state block missing")
+	assert.True(t, strings.Contains(body, "r.status === 429"), "detail fetch must special-case 429")
+	assert.True(t, strings.Contains(body, "r.status >= 500"), "detail fetch must special-case 5xx")
 }
 
 // 已登录用户用公开 code 换取 auth_code：基础路径。
