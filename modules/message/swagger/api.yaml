@@ -689,6 +689,64 @@ paths:
             $ref: "#/definitions/response"
       security:
         - token: []
+  /message/channel/files:
+    post:
+      tags:
+        - "message"
+      summary: "频道文件聚合"
+      description: "查询某个对话中的所有文件/图片/视频消息，支持按类型分类筛选和文件名搜索"
+      operationId: "channel files"
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      parameters:
+        - in: "body"
+          name: "object"
+          description: "查询条件"
+          required: true
+          schema:
+            type: object
+            required:
+              - channel_id
+              - channel_type
+            properties:
+              channel_id:
+                type: string
+                description: "频道ID"
+              channel_type:
+                type: integer
+                description: "频道类型 1.单聊 2.群聊"
+              category:
+                type: string
+                description: "文件分类筛选，可选值：all(默认), document, image, video, archive, code"
+                enum:
+                  - all
+                  - document
+                  - image
+                  - video
+                  - archive
+                  - code
+              keyword:
+                type: string
+                description: "按文件名搜索（可选）"
+              page:
+                type: integer
+                description: "页码，默认1"
+              limit:
+                type: integer
+                description: "每页数量，默认20，最大100"
+      responses:
+        200:
+          description: "返回"
+          schema:
+            $ref: "#/definitions/channelFilesResp"
+        400:
+          description: "错误"
+          schema:
+            $ref: "#/definitions/response"
+      security:
+        - token: []
   /message/typing:
     post:
       tags:
@@ -1810,3 +1868,70 @@ definitions:
         format: int
       msg:
         type: "string"
+  channelFilesResp:
+    type: "object"
+    properties:
+      total:
+        type: integer
+        format: int64
+        description: "总数（扩展名过滤的分类返回-1表示未知）"
+      page:
+        type: integer
+        description: "当前页码"
+      limit:
+        type: integer
+        description: "每页数量"
+      has_more:
+        type: boolean
+        description: "是否有更多数据"
+      files:
+        type: array
+        items:
+          $ref: "#/definitions/channelFile"
+  channelFile:
+    type: "object"
+    properties:
+      message_id:
+        type: integer
+        format: int64
+        description: "消息ID"
+      message_seq:
+        type: integer
+        description: "消息序号"
+      from_uid:
+        type: string
+        description: "发送者UID"
+      from_name:
+        type: string
+        description: "发送者名称"
+      channel_id:
+        type: string
+        description: "频道ID"
+      channel_type:
+        type: integer
+        description: "频道类型"
+      category:
+        type: string
+        description: "文件分类：document, image, video, archive, code, other"
+      name:
+        type: string
+        description: "文件名"
+      url:
+        type: string
+        description: "文件URL"
+      size:
+        type: integer
+        format: int64
+        description: "文件大小（字节）"
+      width:
+        type: integer
+        description: "图片/视频宽度（px）"
+      height:
+        type: integer
+        description: "图片/视频高度（px）"
+      duration:
+        type: integer
+        description: "视频时长（秒）"
+      timestamp:
+        type: integer
+        description: "发送时间（Unix秒）"

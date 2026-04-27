@@ -241,6 +241,7 @@ func (m *Message) Route(r *wkhttp.WKHttp) {
 		message.POST("/pinned", m.pinnedMessage)                  // 置顶消息
 		message.POST("/pinned/sync", m.syncPinnedMessage)         // 同步置顶消息
 		message.POST("/pinned/clear", m.clearPinnedMessage)       // 删除所有置顶消息
+		message.POST("/channel/files", m.channelFiles)            // 频道文件聚合
 	}
 	messages := r.Group("/v1/messages", m.ctx.AuthMiddleware(r), uidLimit)
 	{
