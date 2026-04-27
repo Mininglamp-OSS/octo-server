@@ -382,6 +382,44 @@ func TestAcceptEmailInvite_AlreadyMember_KeepsConsumed(t *testing.T) {
 	assert.Equal(t, testutil.UID, got.ConsumedBy)
 }
 
+// 回归 PR #1172 review 反馈：管理员对已是普通成员的用户发 admin 邀请，
+// 应该提升为 admin 而非静默吞掉提权意图。
+func TestAcceptEmailInvite_AlreadyMember_PromotesToAdmin(t *testing.T) {
+	srv, _, err := setup(t)
+	resetSpaceInviteRateLimit(t)
+	assert.NoError(t, err)
+	spaceId := "sp-promote"
+	// 由其他人创建空间，testutil.UID 是 role=0 的普通成员
+	err = testSpaceDB.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceId, Name: "x", Creator: "owner-x", Status: SpaceStatusNormal,
+	})
+	assert.NoError(t, err)
+	err = testSpaceDB.insertMemberNoTx(&MemberModel{SpaceId: spaceId, UID: "owner-x", Role: 2, Status: 1})
+	assert.NoError(t, err)
+	err = testSpaceDB.insertMemberNoTx(&MemberModel{SpaceId: spaceId, UID: testutil.UID, Role: 0, Status: 1})
+	assert.NoError(t, err)
+	seedUserWithEmail(t, testutil.UID, "promote@x.com", "")
+
+	raw, id := seedEmailInviteWithToken(t, &spaceEmailInviteModel{
+		InviteType: EmailInviteTypeMember,
+		Email:      "promote@x.com",
+		SpaceId:    spaceId,
+		Role:       EmailInviteRoleAdmin,
+		Status:     EmailInviteStatusPending,
+		CreatedBy:  "owner-x",
+	})
+
+	w := acceptInviteHelper(t, srv, raw, testutil.Token)
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	mem, _ := testSpaceDB.queryMember(spaceId, testutil.UID)
+	assert.NotNil(t, mem)
+	assert.Equal(t, 1, mem.Role, "已是成员收到 admin 邀请应被提升为管理员")
+
+	got, _ := testSpaceDB.queryEmailInviteByID(id)
+	assert.Equal(t, EmailInviteStatusConsumed, got.Status)
+}
+
 func TestAcceptEmailInvite_EmptyInviteEmail_Rejected(t *testing.T) {
 	srv, _, err := setup(t)
 	resetSpaceInviteRateLimit(t)

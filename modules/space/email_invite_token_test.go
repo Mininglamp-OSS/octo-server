@@ -35,6 +35,32 @@ func TestGenerateEmailInviteToken_UniquePerCall(t *testing.T) {
 	}
 }
 
+func TestValidateInviteEmail(t *testing.T) {
+	cases := []struct {
+		in    string
+		valid bool
+	}{
+		{"a@b.com", true},
+		{"user.name+tag@sub.example.com", true},
+		{"", false},
+		{"@", false},
+		{"a@", false},
+		{"@b", false},
+		{"a@b", false}, // 缺 TLD 的点
+		{"abc", false},
+		{"a @b.com", false}, // 含空格
+		{"a@b.com extra", false},
+	}
+	for _, tc := range cases {
+		err := validateInviteEmail(tc.in)
+		if tc.valid {
+			assert.NoError(t, err, tc.in)
+		} else {
+			assert.Error(t, err, tc.in)
+		}
+	}
+}
+
 func TestHashEmailInviteToken_Deterministic(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},

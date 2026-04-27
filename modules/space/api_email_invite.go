@@ -172,9 +172,8 @@ func (s *Space) requireSpaceAdmin(spaceId, loginUID string) error {
 
 // validateMemberInviteReq 校验 member 邀请请求参数。
 func validateMemberInviteReq(req *spaceMemberEmailInviteReq) error {
-	email := strings.TrimSpace(req.Email)
-	if email == "" || !strings.Contains(email, "@") {
-		return errors.New("邮箱格式错误")
+	if err := validateInviteEmail(strings.TrimSpace(req.Email)); err != nil {
+		return err
 	}
 	if req.Role != EmailInviteRoleMember && req.Role != EmailInviteRoleAdmin {
 		return errors.New("角色无效")
