@@ -130,7 +130,6 @@
 var API_BASE = "{{API_BASE_URL}}";
 var token = new URLSearchParams(location.search).get("token") || "";
 
-// 与服务端 EmailInviteStatus* / EmailInviteType* / EmailInviteRole* 同步
 var STATUS_PENDING = 0, STATUS_CONSUMED = 1, STATUS_EXPIRED = 2, STATUS_REVOKED = 3;
 var TYPE_OWNER = 1, TYPE_MEMBER = 2;
 var ROLE_MEMBER = 0, ROLE_ADMIN = 1;
@@ -148,12 +147,7 @@ function toast(msg, ms) {
     toast._t = setTimeout(function () { el.style.display = "none"; }, ms || 2200);
 }
 
-// 抓取 dmwork-web / admin 后台的登录 token。当前生产实际约定（im-test 验证得来）：
-//   1. sessionStorage 里 "token{sid}" → 直接 value 就是 token（dmwork-web 与 admin 都写）
-//   2. localStorage "dm-admin-auth" → JSON，token 在 state.token（仅 admin 后台）
-//
-// group_invite.html 历史只扫 localStorage 的 "tokenXXX"，在 admin 后台用 sessionStorage
-// 的环境里读不到。这里两路都试，sessionStorage 优先（覆盖面更广）。
+// 找到当前登录会话的 token；找不到就视作未登录。
 function findTokenAndSid() {
     function scanByPrefix(storage) {
         try {
@@ -166,13 +160,12 @@ function findTokenAndSid() {
                     }
                 }
             }
-        } catch (e) { /* Safari 隐私模式等 */ }
+        } catch (e) { /* ignore */ }
         return null;
     }
     var hit = scanByPrefix(sessionStorage) || scanByPrefix(localStorage);
     if (hit) return hit;
 
-    // admin 后台的 dm-admin-auth 是 JSON 结构，存了 state.token / state.uid。
     try {
         var raw = localStorage.getItem("dm-admin-auth");
         if (raw) {
@@ -182,7 +175,7 @@ function findTokenAndSid() {
                 return { token: state.token, sid: state.uid || "" };
             }
         }
-    } catch (e) { /* 损坏的 JSON、隐私模式等 */ }
+    } catch (e) { /* ignore */ }
 
     return { token: "", sid: "" };
 }
@@ -281,7 +274,7 @@ if (!token) {
 } else {
     fetch(API_BASE + "/v1/space/email-invite/" + encodeURIComponent(token))
         .then(function (r) {
-            // 与 group_invite.html 同款分流：429 / 5xx 不当作"邀请失效"。
+            // 429 / 5xx 不当作"邀请失效"，分流到独立状态页。
             if (r.status === 429) { showState("state-rate-limited"); return null; }
             if (r.status >= 500) { showState("state-server-error"); return null; }
             return r.json().then(function (d) { return { ok: r.ok, status: r.status, data: d }; });
