@@ -242,21 +242,20 @@ func (s *Space) acceptMemberInvite(c *wkhttp.Context, inv *spaceEmailInviteModel
 	}
 
 	if err := s.executeJoinSpace(loginUID, inv.SpaceId, space); err != nil {
-		// 幂等：已是成员视为成功，保留 consumed 状态。其它错误才回滚 token 到 pending，
-		// 让用户/客户端可以重试或换链接（避免 token 因瞬态错误永久作废）。
+		// 幂等：已是成员视为成功，保留 consumed 状态。仍需 fall-through 到下方角色处理逻辑——
+		// 否则管理员对已有成员发 admin 邀请时，token 被消费但角色不会更新（PR #1172 review）。
 		if errors.Is(err, ErrAlreadyMember) {
 			s.Info("接受邀请时用户已是成员，保留 consumed 状态", zap.Int64("inviteID", inv.Id))
-			c.Response(map[string]interface{}{"space_id": inv.SpaceId})
+		} else {
+			s.rollbackConsumedInvite(inv.Id, loginUID)
+			if errors.Is(err, ErrSpaceFull) {
+				c.ResponseError(errors.New("空间已满，无法加入"))
+				return
+			}
+			s.Error("加入空间失败", zap.Error(err), zap.String("spaceId", inv.SpaceId))
+			c.ResponseError(errors.New("加入空间失败"))
 			return
 		}
-		s.rollbackConsumedInvite(inv.Id, loginUID)
-		if errors.Is(err, ErrSpaceFull) {
-			c.ResponseError(errors.New("空间已满，无法加入"))
-			return
-		}
-		s.Error("加入空间失败", zap.Error(err), zap.String("spaceId", inv.SpaceId))
-		c.ResponseError(errors.New("加入空间失败"))
-		return
 	}
 
 	if inv.Role == EmailInviteRoleAdmin {

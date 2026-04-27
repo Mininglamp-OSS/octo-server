@@ -168,9 +168,8 @@ func (m *Manager) revokeSpaceOwnerEmailInvite(c *wkhttp.Context) {
 
 // validateOwnerInviteReq 输入校验：邮箱、空间名、计划参数合理性。
 func validateOwnerInviteReq(req *managerCreateOwnerEmailInviteReq) error {
-	email := strings.TrimSpace(req.Email)
-	if email == "" || !strings.Contains(email, "@") {
-		return errors.New("邮箱格式错误")
+	if err := validateInviteEmail(strings.TrimSpace(req.Email)); err != nil {
+		return err
 	}
 	if strings.TrimSpace(req.PlannedName) == "" {
 		return errors.New("空间名不能为空")

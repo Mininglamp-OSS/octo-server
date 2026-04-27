@@ -4,32 +4,43 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-server/pkg/db"
 	"github.com/gocraft/dbr/v2"
 )
 
 // insertEmailInvite 写入一条邮件邀请，返回自增 ID。
+// 同时把 m.Id / m.CreatedAt / m.UpdatedAt 回填进 m，便于调用方直接序列化响应（避免零值时间）。
 func (d *DB) insertEmailInvite(m *spaceEmailInviteModel) (int64, error) {
 	var expires interface{}
 	if m.ExpiresAt != nil {
 		expires = time.Time(*m.ExpiresAt)
 	}
+	now := time.Now()
 	result, err := d.session.InsertInto("space_email_invite").
 		Columns(
 			"token_hash", "invite_type", "email", "space_id", "role",
 			"planned_name", "planned_description", "planned_logo",
 			"planned_max_users", "planned_join_mode",
-			"status", "expires_at", "created_by",
+			"status", "expires_at", "created_by", "created_at", "updated_at",
 		).
 		Values(
 			m.TokenHash, m.InviteType, m.Email, m.SpaceId, m.Role,
 			m.PlannedName, m.PlannedDescription, m.PlannedLogo,
 			m.PlannedMaxUsers, m.PlannedJoinMode,
-			m.Status, expires, m.CreatedBy,
+			m.Status, expires, m.CreatedBy, now, now,
 		).Exec()
 	if err != nil {
 		return 0, fmt.Errorf("insert space_email_invite: %w", err)
 	}
-	return result.LastInsertId()
+	id, err := result.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("insert space_email_invite last_insert_id: %w", err)
+	}
+	m.Id = id
+	stamp := db.Time(now)
+	m.CreatedAt = stamp
+	m.UpdatedAt = stamp
+	return id, nil
 }
 
 // queryEmailInviteByTokenHash 按 token_hash 精确查找。

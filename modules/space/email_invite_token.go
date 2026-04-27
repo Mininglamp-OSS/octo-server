@@ -6,6 +6,8 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"net/mail"
+	"strings"
 )
 
 // emailInviteTokenBytes token 原文字节长度（256 bit 熵）。
@@ -26,4 +28,25 @@ func generateEmailInviteToken() (raw, hash string, err error) {
 func hashEmailInviteToken(raw string) string {
 	sum := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(sum[:])
+}
+
+// validateInviteEmail 校验邀请邮箱：使用标准库 net/mail.ParseAddress 拒绝 "@"、"a@"、"@b" 这类
+// 表面通过 strings.Contains 但 RFC 上无效的格式（PR #1172 review）。
+// 入参应为已 trim 的字符串。
+func validateInviteEmail(email string) error {
+	if email == "" {
+		return fmt.Errorf("邮箱不能为空")
+	}
+	addr, err := mail.ParseAddress(email)
+	if err != nil || addr.Address != email {
+		return fmt.Errorf("邮箱格式错误")
+	}
+	at := strings.LastIndex(email, "@")
+	if at <= 0 || at == len(email)-1 {
+		return fmt.Errorf("邮箱格式错误")
+	}
+	if !strings.Contains(email[at+1:], ".") {
+		return fmt.Errorf("邮箱格式错误")
+	}
+	return nil
 }

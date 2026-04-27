@@ -58,6 +58,14 @@ func TestManager_CreateOwnerEmailInvite_Success(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotNil(t, inv)
 	assert.Equal(t, resp.ID, inv.Id)
+
+	// 回归 PR #1172 review：created_at 必须是真实时间，不能是 Go 零值。
+	var createdAt string
+	json.Unmarshal(w.Body.Bytes(), &struct {
+		CreatedAt *string `json:"created_at"`
+	}{CreatedAt: &createdAt})
+	assert.NotEmpty(t, createdAt)
+	assert.NotContains(t, createdAt, "0001-01-01", "created_at 不应是零值")
 }
 
 func TestManager_CreateOwnerEmailInvite_Validation(t *testing.T) {
