@@ -63,6 +63,7 @@ type multipartOpts struct {
 	chatContext     string
 	personalContext string
 	memberContext   string
+	mode            string
 }
 
 func createMultipartRequest(t *testing.T, path string, audioData []byte, contextText string) *http.Request {
@@ -95,6 +96,11 @@ func createMultipartRequestWithOpts(t *testing.T, path string, audioData []byte,
 
 	if opts.memberContext != "" {
 		err = writer.WriteField("member_context", opts.memberContext)
+		assert.NoError(t, err)
+	}
+
+	if opts.mode != "" {
+		err = writer.WriteField("mode", opts.mode)
 		assert.NoError(t, err)
 	}
 
@@ -1018,6 +1024,172 @@ func TestTranscribeAPI_PersonalContextTruncation(t *testing.T) {
 	// Should keep the tail, truncate the head
 	assert.Contains(t, receivedPrompt, longSuffix)
 	assert.NotContains(t, receivedPrompt, longPrefix)
+}
+
+// --- mode parameter tests ---
+
+func TestTranscribeAPI_ModeSmartFallsBackToConfig(t *testing.T) {
+	litellmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := chatCompletionResponse{
+			Choices: []choice{{Message: responseMessage{Content: "OK"}}},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer litellmServer.Close()
+
+	cfg := newTestAPIConfig(litellmServer.URL)
+	router := setupTestRouter(cfg, "")
+
+	w := httptest.NewRecorder()
+	req := createMultipartRequestWithOpts(t, "/v1/voice/transcribe", []byte("fake-audio"), multipartOpts{
+		mode: "smart",
+	})
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestTranscribeAPI_ModeEmptyFallsBackToConfig(t *testing.T) {
+	litellmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := chatCompletionResponse{
+			Choices: []choice{{Message: responseMessage{Content: "OK"}}},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer litellmServer.Close()
+
+	cfg := newTestAPIConfig(litellmServer.URL)
+	router := setupTestRouter(cfg, "")
+
+	w := httptest.NewRecorder()
+	req := createMultipartRequest(t, "/v1/voice/transcribe", []byte("fake-audio"), "")
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestTranscribeAPI_ModeAppendOnly(t *testing.T) {
+	var receivedPrompt string
+	litellmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req chatCompletionRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		receivedPrompt = getUserPromptText(t, req)
+
+		resp := chatCompletionResponse{
+			Choices: []choice{{Message: responseMessage{Content: "new text"}}},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer litellmServer.Close()
+
+	cfg := newTestAPIConfig(litellmServer.URL)
+	cfg.EditMode = "edit" // global is edit, but mode=append_only should override
+	router := setupTestRouter(cfg, "")
+
+	w := httptest.NewRecorder()
+	req := createMultipartRequestWithOpts(t, "/v1/voice/transcribe", []byte("fake-audio"), multipartOpts{
+		contextText: "existing",
+		mode:        "append_only",
+	})
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	// append mode uses "辅助你理解当前语境" template
+	assert.Contains(t, receivedPrompt, "辅助你理解当前语境")
+}
+
+func TestTranscribeAPI_ModeEditOnly_Success(t *testing.T) {
+	var receivedPrompt string
+	litellmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req chatCompletionRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		receivedPrompt = getUserPromptText(t, req)
+
+		resp := chatCompletionResponse{
+			Choices: []choice{{Message: responseMessage{Content: "edited text"}}},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer litellmServer.Close()
+
+	cfg := newTestAPIConfig(litellmServer.URL)
+	router := setupTestRouter(cfg, "")
+
+	w := httptest.NewRecorder()
+	req := createMultipartRequestWithOpts(t, "/v1/voice/transcribe", []byte("fake-audio"), multipartOpts{
+		contextText: "original text",
+		mode:        "edit_only",
+	})
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, receivedPrompt, "编辑上述文本")
+	assert.Contains(t, receivedPrompt, "original text")
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	assert.Equal(t, "edited text", resp["text"])
+}
+
+func TestTranscribeAPI_ModeEditOnly_MissingContextText(t *testing.T) {
+	cfg := newTestAPIConfig("https://unused.example.com")
+	router := setupTestRouter(cfg, "")
+
+	w := httptest.NewRecorder()
+	req := createMultipartRequestWithOpts(t, "/v1/voice/transcribe", []byte("fake-audio"), multipartOpts{
+		mode: "edit_only",
+		// no contextText
+	})
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "edit_only mode requires context_text")
+}
+
+func TestTranscribeAPI_ModeInvalid(t *testing.T) {
+	cfg := newTestAPIConfig("https://unused.example.com")
+	router := setupTestRouter(cfg, "")
+
+	w := httptest.NewRecorder()
+	req := createMultipartRequestWithOpts(t, "/v1/voice/transcribe", []byte("fake-audio"), multipartOpts{
+		mode: "invalid_mode",
+	})
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "invalid mode")
+}
+
+func TestTranscribeAPI_ModeEditOnly_GPTEngineRejected(t *testing.T) {
+	cfg := &VoiceConfig{
+		LiteLLMUrl:           "https://unused.example.com",
+		LiteLLMKey:           "key",
+		Timeout:              5,
+		TotalTimeout:         10,
+		Engine:               "gpt",
+		GPTModels:            []string{"gpt-test"},
+		MaxDuration:          60,
+		MaxFileSize:          5 * 1024 * 1024,
+		EditMode:             "append",
+		MaxContextTextLength: 5000,
+	}
+
+	router := setupTestRouter(cfg, "")
+
+	w := httptest.NewRecorder()
+	req := createMultipartRequestWithOpts(t, "/v1/voice/transcribe", []byte("fake-audio"), multipartOpts{
+		contextText: "some text",
+		mode:        "edit_only",
+	})
+	router.ServeHTTP(w, req)
+
+	// GPT engine doesn't support edit_only → API returns 400 before reaching service
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "edit mode is not supported with GPT engine")
 }
 
 func TestTranscribeAPI_MemberContextTruncation(t *testing.T) {

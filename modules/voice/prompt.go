@@ -125,6 +125,8 @@ const taskAppend = "请转写音频中的语音。只输出音频中新听到的
 
 const taskEdit = "请根据音频中的语音处理上述文本。如果语音包含编辑指令（替换、删除、插入、调整），对已有文本执行相应操作并输出完整结果；如果语音不包含编辑指令，将转写内容追加到已有文本末尾并输出完整结果。如果音频无清晰语音，只输出 [NO_SPEECH]。"
 
+const taskEditOnly = "请根据音频中的语音指令编辑上述文本。对已有文本执行语音要求的操作（包括但不限于：替换、删除、插入、调整顺序、改写、纠错、重排、格式化、精简、扩写、翻译等），并输出完整编辑后的结果。如果语音不包含明确的编辑意图，原样返回已有文本，不要追加任何内容。如果音频无清晰语音，只输出 [NO_SPEECH]。"
+
 // buildSystemMessage returns the system prompt for chat completion engines.
 func buildSystemMessage() string {
 	return activePrompts.System
@@ -157,7 +159,7 @@ func BuildVocabularyReference(personalCtx, memberCtx, chatCtx string) string {
 }
 
 // buildUserMessage builds the user message text based on mode and context.
-// mode is "append", "edit", or empty (defaults to edit-like behavior).
+// mode is "append", "edit", "edit_only", or empty (defaults to transcribe).
 func buildUserMessage(mode, contextText, chatContext string) string {
 	var parts []string
 
@@ -189,6 +191,17 @@ func buildUserMessage(mode, contextText, chatContext string) string {
 		if contextText != "" {
 			parts = append(parts, fmt.Sprintf(activePrompts.EditInputBuffer, contextText))
 			parts = append(parts, activePrompts.TaskEdit)
+		} else {
+			if hasVocab {
+				parts = append(parts, activePrompts.TaskTranscribeWithVocab)
+			} else {
+				parts = append(parts, activePrompts.TaskTranscribe)
+			}
+		}
+	case "edit_only":
+		if contextText != "" {
+			parts = append(parts, fmt.Sprintf(activePrompts.EditInputBuffer, contextText))
+			parts = append(parts, activePrompts.TaskEditOnly)
 		} else {
 			if hasVocab {
 				parts = append(parts, activePrompts.TaskTranscribeWithVocab)

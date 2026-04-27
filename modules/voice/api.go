@@ -121,6 +121,30 @@ func (v *Voice) transcribe(c *wkhttp.Context) {
 		memberContext = TruncateRunesTail(memberContext, v.cfg.MaxMemberContextLength)
 	}
 
+	// Parse and validate mode parameter
+	mode := c.Request.FormValue("mode")
+	var internalMode string
+	switch mode {
+	case "", "smart":
+		// fallback to config.EditMode (internalMode stays empty)
+	case "append_only":
+		internalMode = "append"
+	case "edit_only":
+		if contextText == "" {
+			c.ResponseErrorWithStatus(errors.New("edit_only mode requires context_text"), http.StatusBadRequest)
+			return
+		}
+		// GPT engine does not support edit_only mode
+		if v.cfg.Engine == EngineGPT {
+			c.ResponseErrorWithStatus(ErrGPTEditNotSupported, http.StatusBadRequest)
+			return
+		}
+		internalMode = "edit_only"
+	default:
+		c.ResponseErrorWithStatus(errors.New("invalid mode: must be smart, append_only, or edit_only"), http.StatusBadRequest)
+		return
+	}
+
 	// Save original chatContext for ASR logging
 	origChatContext := chatContext
 
@@ -129,7 +153,7 @@ func (v *Voice) transcribe(c *wkhttp.Context) {
 
 	startTime := time.Now()
 	result, err := v.service.TranscribeWithResult(audioData, mimeType, contextText, chatContext,
-		TranscribeOptions{})
+		TranscribeOptions{Mode: internalMode})
 	durationMs := time.Since(startTime).Milliseconds()
 
 	if err != nil {

@@ -67,7 +67,7 @@ func (s *VoiceService) chatCompletionModels() []string {
 
 // TranscribeOptions holds per-request overrides for transcription
 type TranscribeOptions struct {
-	// Mode overrides the transcription mode: "append" or "edit".
+	// Mode overrides the transcription mode: "append", "edit", or "edit_only".
 	// Empty string uses the global VoiceConfig.EditMode.
 	Mode string
 
@@ -115,7 +115,7 @@ func (s *VoiceService) TranscribeWithResult(audioData []byte, mimeType, contextT
 		mode = opts.Mode
 	}
 
-	if s.config.Engine == EngineGPT && mode == "edit" {
+	if s.config.Engine == EngineGPT && (mode == "edit" || mode == "edit_only") {
 		return nil, ErrGPTEditNotSupported
 	}
 
@@ -174,7 +174,7 @@ func (s *VoiceService) TranscribeWithResult(audioData []byte, mimeType, contextT
 		RequestBody:  requestBody,
 	}
 
-	// Post-processing: append and edit have different NoSpeech semantics
+	// Post-processing: append and edit/edit_only have different NoSpeech semantics
 	switch mode {
 	case "append":
 		if IsNoSpeech(rawText) {
@@ -186,7 +186,7 @@ func (s *VoiceService) TranscribeWithResult(audioData []byte, mimeType, contextT
 		} else if contextText != "" {
 			result.Text = joinContextAndText(contextText, rawText)
 		}
-	default: // edit
+	default: // edit, edit_only
 		if rawText == noSpeechSentinel {
 			if contextText != "" {
 				result.Text = contextText

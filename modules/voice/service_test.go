@@ -1094,6 +1094,109 @@ func TestTranscribeEdit_NoSpeech_Sentinel_NoContext(t *testing.T) {
 	assert.Equal(t, "", text)
 }
 
+// --- transcribeEditOnly tests ---
+
+func TestTranscribeEditOnly_WithContext(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req chatCompletionRequest
+		json.NewDecoder(r.Body).Decode(&req)
+
+		prompt := getUserPromptText(t, req)
+		assert.Contains(t, prompt, "<input_buffer>")
+		assert.Contains(t, prompt, "原始文本")
+		assert.Contains(t, prompt, "编辑上述文本")
+
+		resp := chatCompletionResponse{
+			Choices: []choice{{Message: responseMessage{Content: "修改后的文本"}}},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	cfg := newTestConfig(server.URL)
+	cfg.Models = []string{"model-a"}
+	svc := NewVoiceService(cfg)
+
+	text, _, err := svc.TranscribeWithOptions([]byte("audio"), "audio/wav", "原始文本", "",
+		TranscribeOptions{Mode: "edit_only"})
+	assert.NoError(t, err)
+	assert.Equal(t, "修改后的文本", text)
+}
+
+func TestTranscribeEditOnly_NoSpeech_ReturnsContextText(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := chatCompletionResponse{
+			Choices: []choice{{Message: responseMessage{Content: "[NO_SPEECH]"}}},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	cfg := newTestConfig(server.URL)
+	cfg.Models = []string{"model-a"}
+	svc := NewVoiceService(cfg)
+
+	text, _, err := svc.TranscribeWithOptions([]byte("audio"), "audio/wav", "keep this", "",
+		TranscribeOptions{Mode: "edit_only"})
+	assert.NoError(t, err)
+	assert.Equal(t, "keep this", text)
+}
+
+func TestTranscribeEditOnly_RestoresTrailingWhitespace(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := chatCompletionResponse{
+			Choices: []choice{{Message: responseMessage{Content: "会议纪要"}}},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	cfg := newTestConfig(server.URL)
+	cfg.Models = []string{"model-a"}
+	svc := NewVoiceService(cfg)
+
+	text, _, err := svc.TranscribeWithOptions([]byte("audio"), "audio/wav", "工作计划\n", "",
+		TranscribeOptions{Mode: "edit_only"})
+	assert.NoError(t, err)
+	assert.Equal(t, "会议纪要\n", text) // trailing \n preserved
+}
+
+func TestTranscribeEditOnly_GPT_Rejected(t *testing.T) {
+	cfg := newGPTTestConfig("http://unused.example.com")
+	svc := NewVoiceService(cfg)
+
+	_, _, err := svc.TranscribeWithOptions([]byte("audio"), "audio/wav", "text", "",
+		TranscribeOptions{Mode: "edit_only"})
+	assert.Error(t, err)
+	assert.ErrorIs(t, err, ErrGPTEditNotSupported)
+}
+
+func TestTranscribeEditOnly_NoContext_FallsBackToTranscribe(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req chatCompletionRequest
+		json.NewDecoder(r.Body).Decode(&req)
+
+		prompt := getUserPromptText(t, req)
+		assert.Contains(t, prompt, "请转写音频中的语音")
+		assert.NotContains(t, prompt, "input_buffer")
+
+		resp := chatCompletionResponse{
+			Choices: []choice{{Message: responseMessage{Content: "transcribed"}}},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	cfg := newTestConfig(server.URL)
+	cfg.Models = []string{"model-a"}
+	svc := NewVoiceService(cfg)
+
+	text, _, err := svc.TranscribeWithOptions([]byte("audio"), "audio/wav", "", "",
+		TranscribeOptions{Mode: "edit_only"})
+	assert.NoError(t, err)
+	assert.Equal(t, "transcribed", text)
+}
+
 // --- callChatCompletionWithFallback tests ---
 
 func TestCallChatCompletionWithFallback_Success(t *testing.T) {

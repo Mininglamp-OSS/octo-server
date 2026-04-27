@@ -152,6 +152,56 @@ func TestBuildUserMessage_Edit_WithBothContexts(t *testing.T) {
 	assert.True(t, taskIdx > bufferIdx, "task instruction should appear after input_buffer")
 }
 
+// --- buildUserMessage: edit_only mode ---
+
+func TestBuildUserMessage_EditOnly_NoContext(t *testing.T) {
+	msg := buildUserMessage("edit_only", "", "")
+	assert.Equal(t, taskTranscribe, msg)
+}
+
+func TestBuildUserMessage_EditOnly_WithContextText(t *testing.T) {
+	msg := buildUserMessage("edit_only", "existing text", "")
+	assert.Contains(t, msg, "<input_buffer>")
+	assert.Contains(t, msg, "existing text")
+	assert.Contains(t, msg, "根据音频中的语音对其进行处理")
+	assert.Contains(t, msg, "编辑上述文本")
+	assert.Contains(t, msg, "原样返回已有文本")
+	assert.NotContains(t, msg, "vocabulary_reference")
+}
+
+func TestBuildUserMessage_EditOnly_WithVocabOnly(t *testing.T) {
+	msg := buildUserMessage("edit_only", "", "Alice: 测试")
+	assert.Contains(t, msg, "<vocabulary_reference>")
+	assert.Contains(t, msg, "Alice: 测试")
+	assert.Contains(t, msg, "不要输出纠错上下文中的任何内容")
+	assert.NotContains(t, msg, "input_buffer")
+}
+
+func TestBuildUserMessage_EditOnly_WithBothContexts(t *testing.T) {
+	msg := buildUserMessage("edit_only", "existing draft", "Alice: 专有名词ABC")
+
+	assert.Contains(t, msg, "<vocabulary_reference>")
+	assert.Contains(t, msg, "Alice: 专有名词ABC")
+	assert.Contains(t, msg, "<input_buffer>")
+	assert.Contains(t, msg, "existing draft")
+	assert.Contains(t, msg, "原样返回已有文本")
+
+	// vocabulary_reference should appear before input_buffer
+	vocabIdx := strings.Index(msg, "<vocabulary_reference>")
+	bufferIdx := strings.Index(msg, "<input_buffer>")
+	assert.True(t, vocabIdx < bufferIdx, "vocabulary_reference should appear before input_buffer")
+
+	// task instruction at the end
+	taskIdx := strings.Index(msg, "编辑上述文本")
+	assert.True(t, taskIdx > bufferIdx, "task instruction should appear after input_buffer")
+}
+
+func TestBuildUserMessage_EditOnly_DoesNotContainAppendFallback(t *testing.T) {
+	msg := buildUserMessage("edit_only", "some text", "")
+	assert.NotContains(t, msg, "追加到已有文本末尾")
+	assert.Contains(t, msg, "原样返回已有文本，不要追加任何内容")
+}
+
 // --- buildUserMessage: append mode ---
 
 func TestBuildUserMessage_Append_NoContext(t *testing.T) {

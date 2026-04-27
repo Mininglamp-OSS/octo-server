@@ -48,6 +48,7 @@ task_transcribe: "custom task transcribe"
 task_transcribe_with_vocab: "custom task transcribe vocab"
 task_append: "custom task append"
 task_edit: "custom task edit"
+task_edit_only: "custom task edit only"
 `
 	os.WriteFile(path, []byte(content), 0644)
 
@@ -61,6 +62,7 @@ task_edit: "custom task edit"
 	assert.Equal(t, "custom task transcribe vocab", activePrompts.TaskTranscribeWithVocab)
 	assert.Equal(t, "custom task append", activePrompts.TaskAppend)
 	assert.Equal(t, "custom task edit", activePrompts.TaskEdit)
+	assert.Equal(t, "custom task edit only", activePrompts.TaskEditOnly)
 }
 
 func TestLoadPrompts_InvalidYAML(t *testing.T) {
@@ -177,6 +179,36 @@ system: "new system prompt"
 	assert.Equal(t, "new system prompt", activePrompts.System)
 	// Legacy fields should not affect active prompts
 	assert.Equal(t, vocabularyReferenceTemplate, activePrompts.VocabularyReference)
+}
+
+func TestLoadPrompts_TaskEditOnlyDefault(t *testing.T) {
+	t.Cleanup(resetToDefaults)
+	resetToDefaults()
+	assert.Equal(t, taskEditOnly, activePrompts.TaskEditOnly)
+}
+
+func TestLoadPrompts_TaskEditOnlyOverride(t *testing.T) {
+	t.Cleanup(resetToDefaults)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "prompts.yaml")
+	content := `task_edit_only: "custom edit only prompt"`
+	os.WriteFile(path, []byte(content), 0644)
+
+	LoadPrompts(path, nil)
+	assert.Equal(t, "custom edit only prompt", activePrompts.TaskEditOnly)
+	// Other fields should remain as defaults
+	assert.Equal(t, taskEdit, activePrompts.TaskEdit)
+}
+
+func TestLoadPrompts_TaskEditOnlyEmptyKeepsDefault(t *testing.T) {
+	t.Cleanup(resetToDefaults)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "prompts.yaml")
+	content := `task_edit_only: ""`
+	os.WriteFile(path, []byte(content), 0644)
+
+	LoadPrompts(path, nil)
+	assert.Equal(t, taskEditOnly, activePrompts.TaskEditOnly)
 }
 
 func TestLoadPrompts_TaskFieldsNoPlaceholderRequired(t *testing.T) {
