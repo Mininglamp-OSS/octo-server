@@ -167,6 +167,7 @@ func LoadPrompts(filePath string, log promptLogger) {
 			zap.String("vocabulary_reference", truncatePrompt(activePrompts.VocabularyReference, 80)),
 			zap.String("append_input_buffer", truncatePrompt(activePrompts.AppendInputBuffer, 80)),
 			zap.String("edit_input_buffer", truncatePrompt(activePrompts.EditInputBuffer, 80)),
+			zap.String("task_edit_only", truncatePrompt(activePrompts.TaskEditOnly, 80)),
 		)
 	}
 }

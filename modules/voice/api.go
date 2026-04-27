@@ -145,6 +145,12 @@ func (v *Voice) transcribe(c *wkhttp.Context) {
 		return
 	}
 
+	// Calculate effective mode for ASR logging
+	effectiveMode := mode
+	if effectiveMode == "" || effectiveMode == "smart" {
+		effectiveMode = "smart"
+	}
+
 	// Save original chatContext for ASR logging
 	origChatContext := chatContext
 
@@ -159,7 +165,7 @@ func (v *Voice) transcribe(c *wkhttp.Context) {
 	if err != nil {
 		v.Error("transcription failed", zap.Error(err))
 		if v.asrLogger != nil {
-			entry := v.buildASREntry("app", audioData, mimeType, contextText, origChatContext,
+			entry := v.buildASREntry("app", effectiveMode, audioData, mimeType, contextText, origChatContext,
 				personalContext, memberContext, startTime, durationMs, result, err)
 			v.asrLogger.Enqueue(entry)
 		}
@@ -171,7 +177,7 @@ func (v *Voice) transcribe(c *wkhttp.Context) {
 	}
 
 	if v.asrLogger != nil {
-		v.asrLogger.Enqueue(v.buildASREntry("app", audioData, mimeType, contextText, origChatContext,
+		v.asrLogger.Enqueue(v.buildASREntry("app", effectiveMode, audioData, mimeType, contextText, origChatContext,
 			personalContext, memberContext, startTime, durationMs, result, nil))
 	}
 
@@ -196,7 +202,7 @@ func (v *Voice) getConfig(c *wkhttp.Context) {
 }
 
 // buildASREntry constructs an ASREntry with common fields populated.
-func (v *Voice) buildASREntry(source string, audioData []byte, mimeType string,
+func (v *Voice) buildASREntry(source string, mode string, audioData []byte, mimeType string,
 	contextText string, chatContext string, personalContext string, memberContext string,
 	startTime time.Time, durationMs int64,
 	result *TranscribeResult, err error) ASREntry {
@@ -207,7 +213,7 @@ func (v *Voice) buildASREntry(source string, audioData []byte, mimeType string,
 		Source:    source,
 		Engine:    v.cfg.Engine,
 		Input: ASRInput{
-			Mode:            v.cfg.EditMode,
+			Mode:            mode,
 			MimeType:        mimeType,
 			AudioSize:       len(audioData),
 			ContextText:     contextText,
