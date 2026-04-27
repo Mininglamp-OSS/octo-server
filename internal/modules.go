@@ -11,6 +11,7 @@ import (
 	_ "github.com/Mininglamp-OSS/octo-server/modules/file"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/group"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/message"
+	_ "github.com/Mininglamp-OSS/octo-server/modules/oidc"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/openapi"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/qrcode"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/report"
