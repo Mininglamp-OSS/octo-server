@@ -155,6 +155,20 @@ func (d *DB) queryActiveMemberCount(spaceId string) (int, error) {
 	return count, nil
 }
 
+// rollbackConsumedEmailInvite 把已 consumed 的邀请回滚到 pending，并清空 consumed_by/consumed_at。
+// 仅用于 member accept 路径在 join 失败时的最终一致性补偿。WHERE 含 consumed_by 防止误回滚他人。
+func (d *DB) rollbackConsumedEmailInvite(id int64, consumedBy string) error {
+	_, err := d.session.UpdateBySql(
+		"UPDATE space_email_invite SET status=?, consumed_by='', consumed_at=NULL, updated_at=NOW() "+
+			"WHERE id=? AND status=? AND consumed_by=?",
+		EmailInviteStatusPending, id, EmailInviteStatusConsumed, consumedBy,
+	).Exec()
+	if err != nil {
+		return fmt.Errorf("rollback consumed space_email_invite: %w", err)
+	}
+	return nil
+}
+
 // consumeEmailInviteTx 在事务内原子地将 pending 邀请消费，附带过期检查；返回受影响行数。
 // 上层需要根据返回的行数决定是继续后续创建/加入流程，还是回滚事务。
 func (d *DB) consumeEmailInviteTx(tx *dbr.Tx, id int64, consumedBy string) (int64, error) {

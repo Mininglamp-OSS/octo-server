@@ -91,9 +91,10 @@ const (
 	EmailInviteRoleAdmin  = 1
 )
 
-// spaceEmailInviteModel 邮件邀请表模型
+// spaceEmailInviteModel 邮件邀请表模型。
+// Id / CreatedAt / UpdatedAt 由嵌入的 db.BaseModel 提供，与本模块其他 model
+// （SpaceModel / MemberModel / InvitationModel）保持一致。
 type spaceEmailInviteModel struct {
-	Id                 int64    // 主键
 	TokenHash          string   // SHA-256 hex
 	InviteType         int      // 1=owner 2=member
 	Email              string   // 收件邮箱

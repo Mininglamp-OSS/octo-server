@@ -303,19 +303,13 @@ func (s *Space) acceptMemberInvite(c *wkhttp.Context, inv *spaceEmailInviteModel
 	c.Response(map[string]interface{}{"space_id": inv.SpaceId})
 }
 
-// rollbackConsumedInvite 把已 consumed 的邀请回滚到 pending，并清空 consumed_by/consumed_at。
-// 仅用于 member accept 路径在 join 失败时的最终一致性补偿。
+// rollbackConsumedInvite 调用 DB 层做最终一致性补偿；失败仅打告警日志，不上抛。
 //
-// 失败语义：本函数失败不会向上传播，但会以 alert=email_invite_rollback_failed 标记日志，
-// 便于运维通过日志/监控系统检索人工介入。短期内 invite 会卡在 consumed 但用户未加入空间的
-// 状态，需要 ops 手工把 status 改回 pending（或直接 join）。Phase 6 之后会用乐观锁/异步
-// 任务做自动补偿（参见 PR #1172 跟进项）。
+// 失败语义：以 alert=email_invite_rollback_failed 标记结构化字段，便于监控告警检索。
+// 短期内 invite 会卡在 consumed 但用户未加入空间的状态，需要 ops 手工修复。Phase 6 后续
+// 会用乐观锁/异步任务做自动补偿（参见 PR #1172 跟进项）。
 func (s *Space) rollbackConsumedInvite(id int64, consumedBy string) {
-	if _, err := s.db.session.UpdateBySql(
-		"UPDATE space_email_invite SET status=?, consumed_by='', consumed_at=NULL, updated_at=NOW() "+
-			"WHERE id=? AND status=? AND consumed_by=?",
-		EmailInviteStatusPending, id, EmailInviteStatusConsumed, consumedBy,
-	).Exec(); err != nil {
+	if err := s.db.rollbackConsumedEmailInvite(id, consumedBy); err != nil {
 		s.Error("回滚邮件邀请状态失败，需要人工介入",
 			zap.String("alert", "email_invite_rollback_failed"),
 			zap.Error(err),
