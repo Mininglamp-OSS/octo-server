@@ -1554,6 +1554,7 @@ func (m *Message) delete(c *wkhttp.Context) {
 	}
 
 	// 验证用户对所涉频道的访问权限
+	// 私聊无需校验好友关系：此操作仅写入 messageUserExtraDB（按 loginUID 分区），只影响当前用户视图
 	checked := make(map[string]bool)
 	for _, req := range reqs {
 		key := fmt.Sprintf("%s-%d", req.ChannelID, req.ChannelType)
@@ -1570,17 +1571,6 @@ func (m *Message) delete(c *wkhttp.Context) {
 			}
 			if !isMember {
 				c.ResponseError(errors.New("非频道成员，无权操作"))
-				return
-			}
-		} else if req.ChannelType == common.ChannelTypePerson.Uint8() && req.ChannelID != loginUID {
-			isFriend, err := m.userService.IsFriend(loginUID, req.ChannelID)
-			if err != nil {
-				m.Error("查询好友关系失败", zap.Error(err))
-				c.ResponseError(errors.New("查询好友关系失败"))
-				return
-			}
-			if !isFriend {
-				c.ResponseError(errors.New("非会话参与者，无权操作"))
 				return
 			}
 		}

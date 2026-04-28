@@ -242,6 +242,64 @@ var UID = "beb714efd08a4530a5881ebd7f2fde38"
 var Token = "token122323"
 
 // NewTestServer 创建一个测试服务器
+func TestDeleteMessage_PersonChannel_NonFriend(t *testing.T) {
+	s, ctx := newTestServer()
+	msg := New(ctx)
+	msg.Route(s.GetRoute())
+
+	tests := []struct {
+		name       string
+		channelID  string
+		chanType   uint8
+		wantStatus int
+	}{
+		{
+			name:       "non-friend person channel should succeed",
+			channelID:  "non_friend_user_001",
+			chanType:   common.ChannelTypePerson.Uint8(),
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "self channel should succeed",
+			channelID:  uid,
+			chanType:   common.ChannelTypePerson.Uint8(),
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "non-member group should be rejected",
+			channelID:  "group_not_joined",
+			chanType:   common.ChannelTypeGroup.Uint8(),
+			wantStatus: http.StatusBadRequest,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reqs := []deleteReq{
+				{
+					MessageID:   "2046210125814730752",
+					ChannelID:   tt.channelID,
+					ChannelType: tt.chanType,
+					MessageSeq:  9,
+				},
+			}
+			w := httptest.NewRecorder()
+			req, err := http.NewRequest("DELETE", "/v1/message", bytes.NewReader([]byte(util.ToJson(reqs))))
+			assert.NoError(t, err)
+			req.Header.Set("token", token)
+			s.GetRoute().ServeHTTP(w, req)
+			assert.Equal(t, tt.wantStatus, w.Code)
+		})
+	}
+
+	extras, err := msg.messageUserExtraDB.queryDeletedWithMessageIDsAndUID([]string{"2046210125814730752"}, uid)
+	assert.NoError(t, err)
+	assert.NotEmpty(t, extras, "should have written delete records to messageUserExtraDB")
+	for _, e := range extras {
+		assert.Equal(t, 1, e.MessageIsDeleted)
+	}
+}
+
 func NewTestServer1(args ...string) (*server.Server, *config.Context) {
 	cfg := config.New()
 	cfg.Test = true
