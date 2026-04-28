@@ -2587,89 +2587,33 @@ func (u *User) addFileHelperFriend(uid string) error {
 	return nil
 }
 
-// addNotificationFriend 处理注册用户和通知助手互为好友（双向记录 + IM 白名单）
+// addNotificationFriend 处理注册用户和通知助手互为好友
 func (u *User) addNotificationFriend(uid string) error {
-	notifyUID := u.ctx.GetConfig().Account.NotificationUID
 	if uid == "" {
+		u.Error("用户ID不能为空")
 		return errors.New("用户ID不能为空")
 	}
-	isFriend, err := u.friendDB.IsFriend(uid, notifyUID)
+	isFriend, err := u.friendDB.IsFriend(uid, u.ctx.GetConfig().Account.NotificationUID)
 	if err != nil {
 		u.Error("查询用户与通知助手关系失败", zap.Error(err))
 		return err
 	}
-	if isFriend {
-		return nil
-	}
-
-	tx, err := u.friendDB.session.Begin()
-	if err != nil {
-		u.Error("创建数据库事务失败", zap.Error(err))
-		return err
-	}
-	defer func() {
-		if err := recover(); err != nil {
-			tx.Rollback()
+	if !isFriend {
+		version, err := u.ctx.GenSeq(common.FriendSeqKey)
+		if err != nil {
+			u.Error("GenSeq failed", zap.Error(err))
+			return err
 		}
-	}()
-
-	// 正向：uid → notification
-	version, err := u.ctx.GenSeq(common.FriendSeqKey)
-	if err != nil {
-		u.Error("GenSeq failed", zap.Error(err))
-		tx.Rollback()
-		return err
+		err = u.friendDB.Insert(&FriendModel{
+			UID:     uid,
+			ToUID:   u.ctx.GetConfig().Account.NotificationUID,
+			Version: version,
+		})
+		if err != nil {
+			u.Error("注册用户和通知助手成为好友失败")
+			return err
+		}
 	}
-	err = u.friendDB.InsertTx(&FriendModel{
-		UID:     uid,
-		ToUID:   notifyUID,
-		Version: version,
-	}, tx)
-	if err != nil {
-		u.Error("注册用户和通知助手成为好友失败", zap.Error(err))
-		tx.Rollback()
-		return err
-	}
-
-	// 反向：notification → uid
-	version2, err := u.ctx.GenSeq(common.FriendSeqKey)
-	if err != nil {
-		u.Error("GenSeq failed", zap.Error(err))
-		tx.Rollback()
-		return err
-	}
-	err = u.friendDB.InsertTx(&FriendModel{
-		UID:     notifyUID,
-		ToUID:   uid,
-		Version: version2,
-	}, tx)
-	if err != nil {
-		u.Error("通知助手和注册用户成为好友失败", zap.Error(err))
-		tx.Rollback()
-		return err
-	}
-
-	if err := tx.Commit(); err != nil {
-		u.Error("提交事务失败", zap.Error(err))
-		return err
-	}
-
-	// 双向 IM 白名单
-	_ = u.ctx.IMWhitelistAdd(config.ChannelWhitelistReq{
-		ChannelReq: config.ChannelReq{
-			ChannelID:   uid,
-			ChannelType: common.ChannelTypePerson.Uint8(),
-		},
-		UIDs: []string{notifyUID},
-	})
-	_ = u.ctx.IMWhitelistAdd(config.ChannelWhitelistReq{
-		ChannelReq: config.ChannelReq{
-			ChannelID:   notifyUID,
-			ChannelType: common.ChannelTypePerson.Uint8(),
-		},
-		UIDs: []string{uid},
-	})
-
 	return nil
 }
 
