@@ -34,6 +34,7 @@ func init() {
 			SetupAPI: func() register.APIRouter {
 				return api
 			},
+			Service: api.userService,
 			Swagger: swaggerContent,
 			SQLDir:  register.NewSQLFS(sqlFS),
 			IMDatasource: register.IMDatasource{

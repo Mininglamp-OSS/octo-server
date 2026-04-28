@@ -12,8 +12,10 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/register"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	mysql "github.com/go-sql-driver/mysql"
 	"go.uber.org/zap"
 )
@@ -26,6 +28,7 @@ const (
 	stateTTL         = 10 * time.Minute
 	thirdAuthcodeTTL = 1 * time.Minute
 	defaultDeviceFlag = uint8(0) // APP
+	maxAuditUID       = 64
 )
 
 // authcodeRe 限制前端短码字符集:[a-zA-Z0-9_-],防 Redis key 注入 / 跨 user 覆盖。
@@ -55,7 +58,8 @@ type OIDC struct {
 	cfg        *Config
 	client     *Client
 	service    *Service
-	store      identityStore // 直接持 store,callback 在 IsNew 时补绑定行
+	db         *DB
+	store      identityStore
 	stateStore StateStore
 	authcode   authcodeWriter
 	audit      auditWriter
@@ -81,7 +85,7 @@ func New(ctx *config.Context) *OIDC {
 	}
 	db := NewDB(ctx)
 	o.store = identityStoreAdapter{db: db}
-	o.service = newService(cfg.Aegis, o.store, newUserAdapter(ctx, db))
+	o.db = db
 	o.stateStore = newRedisStateStore(ctx)
 	o.authcode = redisAuthcode{ctx: ctx}
 	o.audit = db
@@ -99,12 +103,30 @@ func New(ctx *config.Context) *OIDC {
 	})
 	if cerr != nil {
 		o.Error("OIDC Discovery 失败,handlers 将返回 500", zap.Error(cerr))
-		_ = o.Close() // 释放已创建的 stateStore 连接池,避免 Discovery 永久失败时白白占资源
+		_ = o.Close()
 		o.stateStore = nil
 		return o
 	}
 	o.client = client
 	return o
+}
+
+// Init 在所有模块初始化完成后调用(register.Module.Start),
+// 此时 user 模块的 IService 已通过 register.GetService 可用。
+func (o *OIDC) Init() error {
+	if o.cfg == nil || !o.cfg.Enabled {
+		return nil
+	}
+	raw := register.GetService("user")
+	if raw == nil {
+		return fmt.Errorf("oidc: Init: user service not registered")
+	}
+	userSvc, ok := raw.(user.IService)
+	if !ok {
+		return fmt.Errorf("oidc: Init: expected user.IService, got %T", raw)
+	}
+	o.service = newService(o.cfg.Aegis, o.store, newUserAdapter(userSvc, o.db))
+	return nil
 }
 
 // Route 路由注册。Enabled=false 时所有端点返回 404,避免漏配置静默通过。
@@ -405,8 +427,10 @@ func (o *OIDC) failWithAuthcode(ctx context.Context, sd *StateData, claims *IDTo
 	o.Warn("OIDC callback 失败", zap.Error(err))
 	uid := ""
 	if claims != nil {
-		// 失败时通常没 dmwork uid,IdP sub 当备用追溯键,审计可定位是哪个 IdP 用户
 		uid = "sub:" + claims.Subject
+		if len(uid) > maxAuditUID {
+			uid = uid[:maxAuditUID]
+		}
 	}
 	o.writeAudit(uid, EventCallbackFail, sd, err.Error())
 	if sd == nil || sd.ClientAuthcode == "" {

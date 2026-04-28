@@ -19,9 +19,11 @@ type userAdapter struct {
 }
 
 // newUserAdapter 构造生产路径的 userLookup 实现。
-func newUserAdapter(ctx *config.Context, db *DB) *userAdapter {
+// userSvc 必须是已注入 ExternalLoginHandler 的实例(由 user.New 完成),
+// 通常通过 register.GetService("user") 获取。
+func newUserAdapter(userSvc user.IService, db *DB) *userAdapter {
 	return &userAdapter{
-		userSvc: user.NewService(ctx),
+		userSvc: userSvc,
 		db:      db,
 	}
 }
@@ -72,12 +74,6 @@ func (a *userAdapter) IssueSession(ctx context.Context, req IssueSessionReq) (*I
 		IsNewUser:     resp.IsNewUser,
 		LoginRespJSON: resp.LoginRespJSON,
 	}, nil
-}
-
-// NewService 生产路径构造 oidc Service:绑定 user 模块 + oidc DB。
-func NewService(ctx *config.Context, cfg ProviderConfig) *Service {
-	db := NewDB(ctx)
-	return newService(cfg, identityStoreAdapter{db: db}, newUserAdapter(ctx, db))
 }
 
 // identityStoreAdapter 把 *DB 适配到 service.identityStore 小接口。

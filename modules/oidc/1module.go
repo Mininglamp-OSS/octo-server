@@ -20,9 +20,8 @@ func init() {
 				return o
 			},
 			SQLDir: register.NewSQLFS(sqlFS),
-			// Stop 在 graceful shutdown 时关闭 redisStateStore 自有连接池;
-			// dmwork-lib 共享 Redis 连接由 framework 关,无需在此处理。
-			Stop: o.Close,
+			Start:  o.Init,
+			Stop:   o.Close,
 		}
 	})
 }

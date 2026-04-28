@@ -517,6 +517,33 @@ func TestAPI_Logout_OK(t *testing.T) {
 	}
 }
 
+// failWithAuthcode 对 long subject 的审计 uid 应截断到 maxAuditUID 长度,
+// 防止超过 oidc_audit_log.uid VARCHAR(64) 导致 INSERT 失败。
+func TestFailWithAuthcode_LongSubject_TruncatesAuditUID(t *testing.T) {
+	o := &OIDC{
+		Log:      log.NewTLog("OIDC-test"),
+		audit:    newFakeAudit(),
+		authcode: newFakeAuthcode(),
+	}
+	longSub := strings.Repeat("A", 100)
+	claims := &IDTokenClaims{Subject: longSub}
+	sd := &StateData{ClientAuthcode: "ac-long-sub"}
+
+	o.failWithAuthcode(context.Background(), sd, claims, errors.New("test error"))
+
+	audit := o.audit.(*fakeAudit)
+	if len(audit.entries) != 1 {
+		t.Fatalf("expected 1 audit entry, got %d", len(audit.entries))
+	}
+	uid := audit.entries[0].UID
+	if len(uid) > maxAuditUID {
+		t.Errorf("audit uid length = %d, want <= %d; uid = %q", len(uid), maxAuditUID, uid)
+	}
+	if !strings.HasPrefix(uid, "sub:") {
+		t.Errorf("audit uid should start with 'sub:', got %q", uid)
+	}
+}
+
 func mustQueryParam(t *testing.T, rawURL, name string) string {
 	t.Helper()
 	u, err := url.Parse(rawURL)
