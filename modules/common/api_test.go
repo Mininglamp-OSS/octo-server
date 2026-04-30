@@ -86,3 +86,67 @@ func TestGetAppConfig(t *testing.T) {
 	s.GetRoute().ServeHTTP(w, req)
 	assert.Equal(t, true, strings.Contains(w.Body.String(), `"invite_system_account_join_group_on":1`))
 }
+
+func TestGetAppConfig_OIDCURLsExplicit(t *testing.T) {
+	t.Setenv("DM_OIDC_ENABLED", "true")
+	t.Setenv("DM_OIDC_ACCOUNT_URL", "https://accounts.example.com/")
+	t.Setenv("DM_OIDC_RESET_PASSWORD_URL", "https://accounts.example.com/reset")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+	err = f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	body := w.Body.String()
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, body, `"oidc_account_url":"https://accounts.example.com/"`)
+	assert.Contains(t, body, `"oidc_reset_password_url":"https://accounts.example.com/reset"`)
+}
+
+// 未显式配置 DM_OIDC_ACCOUNT_URL 时，回退到 issuer，避免重复维护两份 URL。
+func TestGetAppConfig_OIDCAccountURLFallsBackToIssuer(t *testing.T) {
+	t.Setenv("DM_OIDC_ENABLED", "true")
+	t.Setenv("DM_OIDC_ACCOUNT_URL", "")
+	t.Setenv("DM_OIDC_AEGIS_ISSUER", "https://accounts.imocto.cn")
+	t.Setenv("DM_OIDC_RESET_PASSWORD_URL", "")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+	err = f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	body := w.Body.String()
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, body, `"oidc_account_url":"https://accounts.imocto.cn"`)
+	assert.NotContains(t, body, "oidc_reset_password_url")
+}
+
+// OIDC 未启用时，即使 issuer/url 已配置也不下发，避免误导前端。
+func TestGetAppConfig_OIDCDisabledOmitsAll(t *testing.T) {
+	t.Setenv("DM_OIDC_ENABLED", "false")
+	t.Setenv("DM_OIDC_ACCOUNT_URL", "https://accounts.example.com/")
+	t.Setenv("DM_OIDC_AEGIS_ISSUER", "https://accounts.imocto.cn")
+	t.Setenv("DM_OIDC_RESET_PASSWORD_URL", "https://accounts.example.com/reset")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+	err = f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	body := w.Body.String()
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.NotContains(t, body, "oidc_account_url")
+	assert.NotContains(t, body, "oidc_reset_password_url")
+}

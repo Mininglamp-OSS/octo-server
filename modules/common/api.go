@@ -398,7 +398,36 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 		CanModifyApiUrl:                appConfigM.CanModifyApiUrl,
 		ThreadOn:                       cn.threadOn,
 		DestroyCoolingOffDays:          destroyCoolingOffDaysOrDefault(appConfigM.DestroyCoolingOffDays),
+		OIDCAccountURL:                 oidcAccountURL(),
+		OIDCResetPasswordURL:           oidcResetPasswordURL(),
 	})
+}
+
+// oidcAccountURL 返回 OIDC 账户中心首页 URL，仅在 OIDC 启用时下发。
+// 优先取 DM_OIDC_ACCOUNT_URL；未配置时回退到 DM_OIDC_AEGIS_ISSUER（Aegis 的
+// issuer 即账户首页，避免重复维护两份 URL）。
+func oidcAccountURL() string {
+	if !oidcEnabled() {
+		return ""
+	}
+	if v := os.Getenv("DM_OIDC_ACCOUNT_URL"); v != "" {
+		return v
+	}
+	return os.Getenv("DM_OIDC_AEGIS_ISSUER")
+}
+
+// oidcResetPasswordURL 返回 OIDC 修改/重置密码 URL，仅在 OIDC 启用时下发。
+// issuer 不一定等于重置密码页，这里不做回退，缺省即不下发，前端隐藏对应入口。
+func oidcResetPasswordURL() string {
+	if !oidcEnabled() {
+		return ""
+	}
+	return os.Getenv("DM_OIDC_RESET_PASSWORD_URL")
+}
+
+func oidcEnabled() bool {
+	v := strings.ToLower(os.Getenv("DM_OIDC_ENABLED"))
+	return v == "true" || v == "1"
 }
 
 // 兼容历史 app_config 行（NOT NULL DEFAULT 7 在迁移前的行为）：值 ≤ 0 时回退为 7。
@@ -590,6 +619,8 @@ type appConfigResp struct {
 	CanModifyApiUrl                int    `json:"can_modify_api_url"`                  // 允许修改api地址
 	ThreadOn                       int    `json:"thread_on"`                           // 子区功能开关
 	DestroyCoolingOffDays          int    `json:"destroy_cooling_off_days"`            // 注销冷静期天数（默认 7）
+	OIDCAccountURL                 string `json:"oidc_account_url,omitempty"`          // OIDC 账户中心首页 URL（如 Aegis 个人主页）
+	OIDCResetPasswordURL           string `json:"oidc_reset_password_url,omitempty"`   // OIDC 修改/重置密码 URL
 }
 
 type appVersionReq struct {

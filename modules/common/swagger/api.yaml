@@ -551,6 +551,12 @@ paths:
               can_modify_api_url:
                 type: integer
                 description: "是否允许修改api地址 1.允许"
+              oidc_account_url:
+                type: string
+                description: "OIDC 账户中心首页 URL。仅在 DM_OIDC_ENABLED=true 时下发；优先取 DM_OIDC_ACCOUNT_URL，未配置时回退到 DM_OIDC_AEGIS_ISSUER"
+              oidc_reset_password_url:
+                type: string
+                description: "OIDC 修改/重置密码 URL。仅在 DM_OIDC_ENABLED=true 且 DM_OIDC_RESET_PASSWORD_URL 配置时下发"
         400:
           description: "错误"
           schema:
