@@ -95,3 +95,49 @@ func TestGroupScanJoinH5_WritesPendingJoinSuccessNotice_YUJ170(t *testing.T) {
 	assert.NotRegexp(t, regexp.MustCompile(`groups/[^/]+/detail[^"]*\)\.then\([^)]*space_id`), text,
 		"H5 不应再在 scanjoin 后二次调用 /detail 拿 space_id（死代码 / 多余往返）")
 }
+
+// TestGroupInviteH5_WritesPendingJoinSuccessNotice_YUJ179 断言 Web 端
+// /v1/group/invite 实际 serve 的 assets/web/group_invite.html 同样在
+// scanjoin 成功分支写 sessionStorage.pendingJoinSuccessNotice。
+//
+// 背景（octo-server#1255 / YUJ-170 round 3）：
+// PR#1250 只改了 assets/web/join_group.html，但 api.go groupInvitePage
+// serve 的是 assets/web/group_invite.html（两个文件各有独立 scanjoin
+// 调用链）。Yu 测试反馈 Web 跨 Space 加群无 toast / 无 Space 名称，
+// 根因就是 group_invite.html 这条路径漏改，本测试守住回归。
+func TestGroupInviteH5_WritesPendingJoinSuccessNotice_YUJ179(t *testing.T) {
+	src, err := os.ReadFile("../../assets/web/group_invite.html")
+	assert.NoError(t, err)
+	text := string(src)
+
+	// A. sessionStorage key 必须是 YUJ-106 契约：pendingJoinSuccessNotice。
+	assert.Contains(t, text, "sessionStorage.setItem('pendingJoinSuccessNotice'",
+		"group_invite.html sessionStorage key 必须与 YUJ-106 JoinSuccessNotice helper 对齐")
+
+	// B. payload 字段必须含 kind:'group' + 契约字段 + crossSpace:true。
+	assert.Regexp(t, regexp.MustCompile(`kind\s*:\s*'group'`), text,
+		"group_invite.html notice payload 必须含 kind:'group'")
+	assert.Regexp(t, regexp.MustCompile(`crossSpace\s*:\s*true`), text,
+		"group_invite.html notice payload 必须含 crossSpace:true（首页切换过去按钮依赖）")
+	assert.Regexp(t, regexp.MustCompile(`spaceId\s*:\s*groupSpaceId`), text)
+	assert.Regexp(t, regexp.MustCompile(`spaceName\s*:\s*r\.space_name`), text,
+		"spaceName 必须来自 scanjoin 响应 r.space_name，不能硬编码")
+	assert.Regexp(t, regexp.MustCompile(`entityName\s*:\s*r\.group_name`), text)
+	assert.Regexp(t, regexp.MustCompile(`ts\s*:\s*Date\.now\(\)`), text)
+
+	// C. scanjoin 响应解析必须保留 space_id / space_name / group_no / group_name，
+	//    只保留 msg 会让下游拿不到 Space 字段 — 正是 YUJ-170 round 2 漏掉的路径。
+	assert.Regexp(t, regexp.MustCompile(`space_id\s*:\s*data\.space_id`), text,
+		"group_invite.html scanjoin 响应解析必须保留 space_id 字段")
+	assert.Regexp(t, regexp.MustCompile(`space_name\s*:\s*data\.space_name`), text,
+		"group_invite.html scanjoin 响应解析必须保留 space_name 字段")
+	assert.Regexp(t, regexp.MustCompile(`group_no\s*:\s*data\.group_no`), text,
+		"group_invite.html scanjoin 响应解析必须保留 group_no 字段")
+	assert.Regexp(t, regexp.MustCompile(`group_name\s*:\s*data\.group_name`), text,
+		"group_invite.html scanjoin 响应解析必须保留 group_name 字段")
+
+	// D. crossSpace 守卫：必须 3 条件 AND，避免同 Space / 私群误弹。
+	assert.Regexp(t,
+		regexp.MustCompile(`if\s*\(\s*groupSpaceId\s*&&\s*prevSpaceId\s*&&\s*groupSpaceId\s*!==\s*prevSpaceId\s*\)`),
+		text, "group_invite.html 必须 3 条件 AND 守卫才写 notice，防止同 Space / 私群误弹")
+}

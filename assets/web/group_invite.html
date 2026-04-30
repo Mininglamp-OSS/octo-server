@@ -262,9 +262,20 @@ function onJoinClick() {
             headers: { "token": token }
         }).then(function (r2) {
             return r2.text().then(function (txt) {
-                var msg = "";
-                try { msg = (JSON.parse(txt) || {}).msg || ""; } catch (e) { /* ignore */ }
-                return { ok: r2.ok, msg: msg };
+                // YUJ-170 round 3 / octo-server#1255: scanjoin 成功响应带
+                // space_id / space_name / group_no / group_name（groupScanJoin
+                // 新字段），保留整个对象供下游 crossSpace notice 判定使用。
+                // 失败响应仅需 msg 做 toast；解析失败走空对象兜底。
+                var data = {};
+                try { data = JSON.parse(txt) || {}; } catch (e) { /* ignore */ }
+                return {
+                    ok: r2.ok,
+                    msg: data.msg || "",
+                    space_id: data.space_id || "",
+                    space_name: data.space_name || "",
+                    group_no: data.group_no || groupNo,
+                    group_name: data.group_name || ""
+                };
             });
         });
     }).then(function (r) {
@@ -273,6 +284,28 @@ function onJoinClick() {
         if (!r.ok) {
             throw new Error(r.msg || "加入失败");
         }
+        // YUJ-170 round 3 / dmwork-web#1100 / octo-server#1255:
+        // 跨 Space 加群引导 — 若群所属 Space 与端视角 currentSpaceId 不一致，
+        // 写 sessionStorage.pendingJoinSuccessNotice（YUJ-106 契约 key），
+        // Web 首页 consumeJoinSuccessNotice + showJoinSuccessToast 会按
+        // kind='group' 渲染「已加入「<群名>」群聊 / 位于「<Space 名>」空间 [切换过去]」。
+        // 同 Space / 私群（space_id=""）/ 未登录：跳过，保持原行为。
+        try {
+            var prevSpaceId = localStorage.getItem('currentSpaceId') || '';
+            var groupSpaceId = r.space_id || '';
+            if (groupSpaceId && prevSpaceId && groupSpaceId !== prevSpaceId) {
+                sessionStorage.setItem('pendingJoinSuccessNotice', JSON.stringify({
+                    kind: 'group',
+                    spaceId: groupSpaceId,
+                    spaceName: r.space_name || '',
+                    entityName: r.group_name || '',
+                    groupNo: r.group_no,
+                    groupName: r.group_name || '',
+                    crossSpace: true,
+                    ts: Date.now()
+                }));
+            }
+        } catch (e) { /* best-effort，不阻塞跳转 */ }
         // 3. 入群成功：提示 + 跳回 Web 首页（带 sid 保证登录态可恢复）
         toast("加入成功");
         showState("state-joined");
