@@ -152,3 +152,13 @@ func (e *Event) EventTimerPush() {
 		}
 	}
 }
+
+// SpaceMemberCacheInvalidator is a hook that modules can register to
+// invalidate member caches when space membership changes.
+// Set by the notify module at init; called by the space module on member removal.
+var SpaceMemberCacheInvalidator func(spaceID string)
+
+// NotifyBotProvisioner is a hook called when a new Space is created to
+// provision a notify bot for that Space.
+// Set by the notify module at init; called by the space module after commit.
+var NotifyBotProvisioner func(spaceID string, spaceName string)

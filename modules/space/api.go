@@ -274,6 +274,11 @@ func (s *Space) createSpaceCorePostCommit(spaceId string, p createSpaceParams) *
 		Status:  1,
 	})
 
+	// Provision notify bot for new Space (async, non-blocking)
+	if event.NotifyBotProvisioner != nil {
+		event.NotifyBotProvisioner(spaceId, p.Name)
+	}
+
 	// 为创建者补齐默认分类（GH octo-server#1228）。失败不阻塞空间创建，list 端有兜底。
 	ensureDefaultCategoryProvisioned(s.ctx, p.Creator, spaceId, s)
 
@@ -549,6 +554,11 @@ func (s *Space) addMembers(c *wkhttp.Context) {
 	for _, uid := range newMembers {
 		go s.fireSpaceMemberJoinEvent(uid, spaceId)
 	}
+
+	// 失效通知成员缓存
+	if event.SpaceMemberCacheInvalidator != nil {
+		event.SpaceMemberCacheInvalidator(spaceId)
+	}
 }
 
 // removeMembers 移除成员
@@ -596,6 +606,10 @@ func (s *Space) removeMembers(c *wkhttp.Context) {
 			return
 		}
 	}
+	// 失效通知成员缓存
+	if event.SpaceMemberCacheInvalidator != nil {
+		event.SpaceMemberCacheInvalidator(spaceId)
+	}
 	c.ResponseOK()
 }
 
@@ -626,6 +640,10 @@ func (s *Space) leaveSpace(c *wkhttp.Context) {
 	if err != nil {
 		c.ResponseError(errors.New("退出空间失败"))
 		return
+	}
+	// 失效通知成员缓存
+	if event.SpaceMemberCacheInvalidator != nil {
+		event.SpaceMemberCacheInvalidator(spaceId)
 	}
 	c.ResponseOK()
 }
@@ -892,6 +910,11 @@ func (s *Space) executeJoinSpace(uid, spaceId string, space *SpaceModel) error {
 
 	// 触发 SpaceMemberJoin 事件
 	go s.fireSpaceMemberJoinEvent(uid, spaceId)
+
+	// 失效通知成员缓存
+	if event.SpaceMemberCacheInvalidator != nil {
+		event.SpaceMemberCacheInvalidator(spaceId)
+	}
 
 	return nil
 }
