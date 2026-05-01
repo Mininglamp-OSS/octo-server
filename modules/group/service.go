@@ -52,6 +52,15 @@ type IService interface {
 	// GetMemberExternalMarkers 批量获取指定群所有非删除成员的外部来源标识。
 	// 返回 uid -> MemberExternalMarker 的映射，供消息同步等热路径 O(1) 查找，避免 N+1 JOIN。
 	GetMemberExternalMarkers(groupNo string) (map[string]MemberExternalMarker, error)
+	// GetMemberExternalFields 单成员版外部来源 / 归属 Space 字段查询（YUJ-206），
+	// 供 /users/{uid}?group_no= 路径补齐 GroupMemberResp 的 is_external / source_space_* /
+	// home_space_* 字段。语义与 GetMemberExternalMarkers 保持一致。
+	GetMemberExternalFields(groupNo, uid string) (
+		isExternal int,
+		sourceSpaceID, sourceSpaceName string,
+		homeSpaceID, homeSpaceName string,
+		err error,
+	)
 	// 获取指定群的指定成员信息
 	GetMember(groupNo, uid string) (*MemberResp, error)
 	// 获取黑名单成员uid集合
@@ -415,6 +424,74 @@ func (s *Service) GetMemberExternalMarkers(groupNo string) (map[string]MemberExt
 	}
 	return result, nil
 }
+// GetMemberExternalFields 返回单成员的外部来源/归属 Space 字段，供 /users/{uid}?group_no=
+// 路径（user 模块 GroupMemberResp）补齐。语义与批量版 GetMemberExternalMarkers 一致：
+//
+//   - isExternal==1: 成员相对群 Space 为外部
+//     sourceSpaceID = 来源 Space（原语义，保留）
+//     homeSpaceID   = sourceSpaceID（相对视角，对齐企微）
+//   - isExternal==0: 内部成员
+//     homeSpaceID   = 群自身 space_id
+//
+// 未注册 Space（群未挂 Space / 字段为空）时返回空字符串，而非 error。
+// 成员不存在或已删除时返回全零值 + nil error，避免 /users/{uid} 热路径抖动。
+//
+// 开销：1 次 group_member LEFT JOIN space（点查，命中 PRIMARY KEY）
+//
+//	+ 至多 1 次 group+space 回查（仅内部成员且需要 home_space_name 时）。
+func (s *Service) GetMemberExternalFields(groupNo, uid string) (
+	isExternal int,
+	sourceSpaceID, sourceSpaceName string,
+	homeSpaceID, homeSpaceName string,
+	err error,
+) {
+	if strings.TrimSpace(groupNo) == "" || strings.TrimSpace(uid) == "" {
+		return 0, "", "", "", "", nil
+	}
+	row, qerr := s.db.queryMemberExternalMarker(groupNo, uid)
+	if qerr != nil {
+		return 0, "", "", "", "", qerr
+	}
+	if row == nil {
+		return 0, "", "", "", "", nil
+	}
+	isExternal = row.IsExternal
+	sourceSpaceID = row.SourceSpaceID
+	sourceSpaceName = row.SourceSpaceName
+	if isExternal == 1 {
+		// 外部成员：home = source（企微"相对当前 Space 外部"语义）
+		homeSpaceID = sourceSpaceID
+		homeSpaceName = sourceSpaceName
+		return
+	}
+	// 内部成员：home = 群自身 space_id + name。
+	// 与批量版一致，只在确实是内部成员时才做群 + space 的回查。
+	grp, gerr := s.db.QueryWithGroupNo(groupNo)
+	if gerr != nil {
+		s.Warn("查询群资料失败（home space）", zap.Error(gerr), zap.String("group_no", groupNo))
+		return isExternal, sourceSpaceID, sourceSpaceName, "", "", nil
+	}
+	if grp == nil || grp.SpaceID == "" {
+		return
+	}
+	homeSpaceID = grp.SpaceID
+	// 查 space name；失败仅降级，不影响 home_space_id。
+	var nameRows []struct {
+		SpaceID string `db:"space_id"`
+		Name    string `db:"name"`
+	}
+	_, nerr := s.ctx.DB().Select("space_id", "name").From("space").
+		Where("space_id IN ?", []string{homeSpaceID}).Load(&nameRows)
+	if nerr != nil {
+		s.Warn("查询群归属 Space 名称失败", zap.Error(nerr), zap.String("space_id", homeSpaceID))
+		return
+	}
+	if len(nameRows) > 0 {
+		homeSpaceName = nameRows[0].Name
+	}
+	return
+}
+
 func (s *Service) GetMember(groupNo, uid string) (*MemberResp, error) {
 	memberDetail, err := s.db.queryMemberWithGroupNoAndUID(groupNo, uid)
 	if err != nil {

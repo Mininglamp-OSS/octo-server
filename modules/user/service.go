@@ -1110,8 +1110,20 @@ type GroupMemberResp struct {
 	InviteUID          string `json:"invite_uid"`           // 邀请人
 	Robot              int    `json:"robot"`                // 机器人
 	ForbiddenExpirTime int64  `json:"forbidden_expir_time"` // 禁言时长
-	CreatedAt          string `json:"created_at"`
-	UpdatedAt          string `json:"updated_at"`
+	// YUJ-206：透传群成员的外部来源/归属 Space 字段，命名与 /groups/{no}/members
+	// 的 memberDetailResp 保持一致，供 Web/Android/iOS UserInfo 判定"同 Space 非
+	// 好友 → 直接发消息" vs "跨 Space 外部成员 → 仅可在群内交流"。
+	// 后端保留 IsExternal / SourceSpaceID / SourceSpaceName 的绝对语义不变；
+	// HomeSpaceID / HomeSpaceName 是对齐企微相对视角的视图字段：
+	//   外部成员 (is_external == 1) → home_space_id = source_space_id
+	//   内部成员                     → home_space_id = group.space_id
+	IsExternal      int    `json:"is_external"`       // 是否外部成员 0/1
+	SourceSpaceID   string `json:"source_space_id"`   // 来源 Space ID（外部成员使用）
+	SourceSpaceName string `json:"source_space_name"` // 来源 Space 名称
+	HomeSpaceID     string `json:"home_space_id"`     // 成员归属 Space ID（相对视角）
+	HomeSpaceName   string `json:"home_space_name"`   // 成员归属 Space 名称
+	CreatedAt       string `json:"created_at"`
+	UpdatedAt       string `json:"updated_at"`
 }
 
 func NewUserDetailResp(m *Detail, remark, loginUID string, sourceFrom string, onLine int, lastOffline int, deviceFlag config.DeviceFlag, follow int, status int, beDeleted int, beBlacklist int, setting *SettingModel, vercode string) *UserDetailResp {

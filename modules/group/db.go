@@ -2,6 +2,7 @@ package group
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
@@ -802,6 +803,30 @@ func (d *DB) QuerySourceSpaceIDForMember(groupNo, uid string) (string, error) {
 		return "", err
 	}
 	return sourceSpaceID, nil
+}
+
+// queryMemberExternalMarker 单成员版本的 queryMemberExternalMarkers，供 /users/{uid}?group_no
+// 路径使用。返回 nil, nil 表示 uid 不在群内 / 已删除。
+//
+// 单独抽函数而非复用 queryMemberExternalMarkers，因为群成员数可能达到上万，
+// 为单点接口全量拉取代价远高于一条点查；LEFT JOIN 空间换时间完全一致。
+func (d *DB) queryMemberExternalMarker(groupNo, uid string) (*memberExternalMarkerRow, error) {
+	if strings.TrimSpace(groupNo) == "" || strings.TrimSpace(uid) == "" {
+		return nil, nil
+	}
+	var row *memberExternalMarkerRow
+	_, err := d.session.SelectBySql(
+		"SELECT gm.uid AS uid, gm.is_external AS is_external, "+
+			"IFNULL(gm.source_space_id,'') AS source_space_id, "+
+			"IFNULL(s.name,'') AS source_space_name "+
+			"FROM group_member gm LEFT JOIN space s ON s.space_id = gm.source_space_id "+
+			"WHERE gm.group_no = ? AND gm.uid = ? AND gm.is_deleted = 0",
+		groupNo, uid,
+	).Load(&row)
+	if err != nil {
+		return nil, err
+	}
+	return row, nil
 }
 
 type CategoryRow struct {

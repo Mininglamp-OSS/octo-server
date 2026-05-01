@@ -25,6 +25,11 @@ func init() {
 		api := New(ctx.(*config.Context))
 		// 注册群成员检查函数，供 user 模块置顶校验使用
 		user.RegisterGroupMemberChecker(api.groupService.ExistMember)
+		// YUJ-206：注册群成员外部来源 / 归属 Space 提供者，
+		// 供 /users/{uid}?group_no= 路径补齐 GroupMemberResp 的 is_external /
+		// source_space_* / home_space_* 字段，让 Web/Android/iOS UserInfo 能区分
+		// "同 Space 非好友 → 直接发消息" vs "跨 Space 外部成员 → 仅可在群内交流"。
+		user.RegisterGroupMemberExternalProvider(api.groupService.GetMemberExternalFields)
 		return register.Module{
 			Name: "group",
 			SetupAPI: func() register.APIRouter {

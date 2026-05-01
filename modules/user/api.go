@@ -889,6 +889,26 @@ func (u *User) get(c *wkhttp.Context) {
 			ForbiddenExpirTime: groupMember.ForbiddenExpirTime,
 			CreatedAt:          groupMember.CreatedAt,
 		}
+		// YUJ-206：补齐外部来源 / 归属 Space 视图字段（is_external /
+		// source_space_id / source_space_name / home_space_id / home_space_name），
+		// 供 Web/Android/iOS UserInfo 判定"同 Space 非好友 → 直接发消息" vs
+		// "跨 Space 外部成员 → 仅可在群内交流"。
+		// 命名与 /groups/{no}/members 的 memberDetailResp 保持一致。
+		// Provider 由 group 模块在 init 阶段通过 RegisterGroupMemberExternalProvider
+		// 注入；失败仅 log，不影响主响应链路（字段缺省即回落到原"is_external=0"语义，
+		// 客户端会走非 Space 模式陌生人分支，属可接受的降级）。
+		if provider := getGroupMemberExternalProvider(); provider != nil {
+			if isExt, srcID, srcName, homeID, homeName, err := provider(groupNo, uid); err != nil {
+				u.Error("查询群成员外部来源字段失败", zap.Error(err),
+					zap.String("group_no", groupNo), zap.String("uid", uid))
+			} else {
+				userDetailResp.GroupMember.IsExternal = isExt
+				userDetailResp.GroupMember.SourceSpaceID = srcID
+				userDetailResp.GroupMember.SourceSpaceName = srcName
+				userDetailResp.GroupMember.HomeSpaceID = homeID
+				userDetailResp.GroupMember.HomeSpaceName = homeName
+			}
+		}
 	}
 
 	if userDetailResp.Follow == 1 || uid == loginUID {
