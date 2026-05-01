@@ -3988,6 +3988,10 @@ func (g *Group) groupInviteDetail(c *wkhttp.Context) {
 	// YUJ-168 / GH #1243: 为公开 H5 landing 提供信任锚点字段。
 	// - space_name 始终下发（前端判断非空才渲染"来自 xx"）。
 	// - is_external：0=未登录 / 同 Space 成员（内部视角），1=跨 Space 登录者。
+	// YUJ-211 / GH #1277: 额外下发 space_id（公共群 / 查询失败时降级为空串），
+	// 让 H5 落地页能显示「📁 属于 "XX" Space」归属行，解决扫码加跨 Space 群
+	// 后用户找不到群挂在哪个 Space 的问题。空串时前端跳过渲染，保持向后兼容
+	// （旧客户端忽略未知字段不会报错）。
 	spaceName, _ := spacepkg.GetSpaceName(g.ctx.DB(), groupModel.SpaceID)
 	isExternal := 0
 	if groupModel.SpaceID != "" && loginUID != "" && !inSameSpace {
@@ -4000,6 +4004,7 @@ func (g *Group) groupInviteDetail(c *wkhttp.Context) {
 		"group_name":   groupModel.Name,
 		"avatar":       fmt.Sprintf("groups/%s/avatar", groupNo),
 		"member_count": memberCount,
+		"space_id":     groupModel.SpaceID,
 		"space_name":   spaceName,
 		"is_external":  isExternal,
 	})

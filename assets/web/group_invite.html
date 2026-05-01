@@ -12,6 +12,11 @@
         .card { margin-top: 32px; padding: 24px 20px; background: #fff; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); text-align: center; }
         .avatar { width: 72px; height: 72px; border-radius: 12px; background: #e6e6e6; object-fit: cover; display: block; margin: 0 auto 12px; }
         .group-name { font-size: 18px; font-weight: 600; color: #222; line-height: 1.4; word-break: break-all; }
+        .space-line {
+            font-size: 13px; color: #666; margin-top: 6px;
+            line-height: 1.5; word-break: break-all;
+        }
+        .space-line .space-icon { margin-right: 4px; }
         .meta { font-size: 13px; color: #999; margin-top: 6px; }
         .tip { font-size: 14px; color: #666; line-height: 1.6; margin-top: 16px; }
         .btn-group { margin-top: 24px; display: flex; flex-direction: column; gap: 12px; }
@@ -52,6 +57,9 @@
             <div class="card">
                 <img class="avatar" id="v-avatar" alt="" />
                 <div class="group-name" id="v-name"></div>
+                <div class="space-line" id="v-space" style="display:none">
+                    <span class="space-icon">📁</span>属于 "<span id="v-space-name"></span>" Space
+                </div>
                 <div class="meta" id="v-meta"></div>
                 <div class="badge badge-warn" id="v-badge" style="display:none"></div>
                 <div class="tip" id="v-tip" style="display:none"></div>
@@ -78,6 +86,7 @@
             <div class="icon">🔒</div>
             <div class="title">该群不允许外部成员加入</div>
             <div class="desc">该群仅允许所属空间（Space）内成员扫码入群，<br/>请联系管理员确认邀请方式</div>
+            <div class="desc" id="state-external-space" style="display:none; margin-top:8px">你不是「<span id="state-external-space-name"></span>」Space 的成员</div>
         </div>
 
         <div class="state-page" id="state-already-member">
@@ -187,6 +196,13 @@ function renderInfo(data) {
     }
     if (data.avatar) {
         document.getElementById("v-avatar").src = API_BASE + "/v1/" + data.avatar;
+    }
+    // YUJ-211: 渲染「📁 属于 "XX" Space」归属行。space_name 为空（公共群 /
+    // 降级路径）时保持隐藏，保证不破坏公共群极简卡片；后端 space_id 缺失的
+    // 旧客户端也会命中同一空串分支，向后兼容。
+    if (data.space_name) {
+        document.getElementById("v-space-name").textContent = data.space_name;
+        document.getElementById("v-space").style.display = "block";
     }
     // 邀请确认开启时，在落地页展示「需管理员审批」徽标，提示用户在 App 内走审批流
     if (data.status === "invite_required") {
@@ -369,6 +385,12 @@ if (!code) {
                 case "external_blocked":
                     // 群属于某 Space 且 allow_external=0：groupScanJoin 的最终裁决仍会拒绝，
                     // 这里提前给明确状态页、藏掉「加入群聊」按钮，避免点了才看到错误。
+                    // YUJ-211: space_name 非空时追加「你不是「XX」Space 的成员」提示，
+                    // 让用户立刻明白被拦的原因；公共群降级时不渲染保持旧行为。
+                    if (r.data && r.data.space_name) {
+                        document.getElementById("state-external-space-name").textContent = r.data.space_name;
+                        document.getElementById("state-external-space").style.display = "block";
+                    }
                     showState("state-external-blocked");
                     break;
                 case "not_found":
