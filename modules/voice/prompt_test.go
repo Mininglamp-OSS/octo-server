@@ -42,7 +42,7 @@ func TestBuildSystemMessage_ContainsMentionRule(t *testing.T) {
 	msg := buildSystemMessage()
 	assert.Contains(t, msg, "@提及识别")
 	assert.Contains(t, msg, "艾特")
-	assert.Contains(t, msg, "@张三")
+	assert.Contains(t, msg, "@Pythagoras")
 	assert.Contains(t, msg, "@Bob")
 }
 
@@ -50,26 +50,31 @@ func TestBuildSystemMessage_MentionV2Scenarios(t *testing.T) {
 	msg := buildSystemMessage()
 
 	// Positive scenarios present in prompt
-	assert.Contains(t, msg, "让陈皮皮帮忙处理一下")   // intent verb "让"
-	assert.Contains(t, msg, "Boris，明天天气怎么样")  // direct address
+	assert.Contains(t, msg, "让皮皮处理")            // intent verb "让"
+	assert.Contains(t, msg, "Boris，方案怎么样")      // direct address
 	assert.Contains(t, msg, "跟Bob说明天开会改时间")   // preposition "跟"
 	assert.Contains(t, msg, "这个方案怎么样，Boris")  // trailing address
+	assert.Contains(t, msg, "让Boris不要动那个代码")  // stop action (still @)
+	assert.Contains(t, msg, "跟宜林说一下")          // partial name
 
 	// Negative scenarios present in prompt
 	assert.Contains(t, msg, "Boris的代码写得不错")    // possessive, no @
-	assert.Contains(t, msg, "我昨天和张三聊了")      // past event, no @
-	assert.Contains(t, msg, "不用找Boris了")        // negation, no @
+	assert.Contains(t, msg, "告诉我Boris昨天说了什么") // asking third party, no @
+	assert.Contains(t, msg, "Boris那边先不急")        // delay intent, no @
 
-	// V2 structural elements
-	assert.Contains(t, msg, "识别为@的场景")
-	assert.Contains(t, msg, "不识别为@的场景")
-	assert.Contains(t, msg, "显式意图词")
-	assert.Contains(t, msg, "直接呼名对话")
-	assert.Contains(t, msg, "介词沟通")
-	assert.Contains(t, msg, "句尾呼名")
-	assert.Contains(t, msg, "叙述/引用")
-	assert.Contains(t, msg, "否定取消")
-	assert.Contains(t, msg, "过去事件")
+	// Structural elements
+	assert.Contains(t, msg, "通用判断原则")
+	assert.Contains(t, msg, "召回优先")
+	assert.Contains(t, msg, "人名匹配规则")
+	assert.Contains(t, msg, "翻译名/别名匹配")
+	assert.Contains(t, msg, "部分名/简称匹配")
+	assert.Contains(t, msg, "常见触发模式")
+	assert.Contains(t, msg, "直接对话")
+	assert.Contains(t, msg, "沟通介词")
+	assert.Contains(t, msg, "句尾呼唤")
+
+	// Disambiguation line
+	assert.Contains(t, msg, "暂不联系/延迟处理")
 }
 
 func TestBuildSystemMessage_MentionRuleOrder(t *testing.T) {
