@@ -89,6 +89,15 @@
             <div class="desc" id="state-external-space" style="display:none; margin-top:8px">你不是「<span id="state-external-space-name"></span>」Space 的成员</div>
         </div>
 
+        <div class="state-page" id="state-need-space">
+            <div class="icon">🛂</div>
+            <div class="title">请先加入一个 Space 后再加入群聊</div>
+            <div class="desc">你的账号尚未加入任何 Space，无法通过邀请链接入群。<br/>请打开 App 或 Web 首页，用邀请码加入一个 Space 后重试。</div>
+            <div class="btn-group" style="margin-top:24px">
+                <button class="btn btn-primary" id="btn-need-space-home">回主页加入 Space</button>
+            </div>
+        </div>
+
         <div class="state-page" id="state-already-member">
             <div class="icon">👤</div>
             <div class="title">你已在此群内</div>
@@ -266,6 +275,14 @@ function onJoinClick() {
             showState("state-external-blocked");
             return null;
         }
+        // GH #1319 / Direction A：零 Space 用户禁止入群。
+        // 后端在 authorize 入口就会短路返回，不生成 auth_code；H5 这边给出
+        // 明确提示 + 「回主页加入 Space」CTA（复用 redirectHome 保留 sid），
+        // 避免用户点了「加入群聊」按钮后看到一条通用「加入失败」toast。
+        if (r.data.status === "need_space") {
+            showNeedSpaceState(session.sid);
+            return null;
+        }
         if (!r.data.auth_code || !r.data.group_no) {
             throw new Error((r.data && r.data.msg) || "邀请链接已过期");
         }
@@ -353,6 +370,19 @@ function redirectHome(sid) {
     }
 }
 
+// showNeedSpaceState 渲染「零 Space 用户」的 need_space 状态页，并把
+// 「回主页加入 Space」按钮的点击处理器挂好（跳回 dmwork-web 首页走
+// checkSpaceOnColdStart → JoinSpacePage，Gate 完成后用户可回到邀请链接重试入群）。
+// sid 可能为空（邀请链接直接被未登录用户打开），空串时兜底回根路径。
+function showNeedSpaceState(sid) {
+    showState("state-need-space");
+    var btn = document.getElementById("btn-need-space-home");
+    if (btn && !btn._bound) {
+        btn._bound = true;
+        btn.addEventListener("click", function () { redirectHome(sid); });
+    }
+}
+
 if (!code) {
     showState("state-expired");
 } else {
@@ -392,6 +422,14 @@ if (!code) {
                         document.getElementById("state-external-space").style.display = "block";
                     }
                     showState("state-external-blocked");
+                    break;
+                case "need_space":
+                    // GH #1319 / Direction A：detail 使用可选鉴权发现登录用户尚未加入
+                    // 任何 Space。优先级高于 external_blocked（加 Space 是用户侧修复，
+                    // 比群级硬拦截更可操作），直接展示「请先加入 Space」引导 +
+                    // 「回主页加入 Space」CTA。未登录访问者后端不会返回 need_space，
+                    // 保持公共预览体验。
+                    showNeedSpaceState(findTokenAndSid().sid);
                     break;
                 case "not_found":
                     showState("state-not-found");

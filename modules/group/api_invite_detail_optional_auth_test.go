@@ -158,6 +158,18 @@ func TestGroupInviteDetail_OptionalAuth_CrossSpace_Blocked(t *testing.T) {
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
 
+	// GH #1319: 让 testutil.UID 有自己的 home Space（与群所属 space-yuj39-cross 不同），
+	// 这样仍然是「登录 + 跨 Space」场景而不是零 Space，能继续断言 external_blocked
+	// 不被可选鉴权放行。零 Space 路径由 TestGroupInviteDetail_NeedSpace_OptionalAuth 覆盖。
+	_, err = ctx.DB().InsertInto("space").
+		Columns("space_id", "name", "creator", "status").
+		Values("space-yuj39-cross-home-for-uid", "uid-home", testutil.UID, 1).Exec()
+	assert.NoError(t, err)
+	_, err = ctx.DB().InsertInto("space_member").
+		Columns("space_id", "uid", "role", "status").
+		Values("space-yuj39-cross-home-for-uid", testutil.UID, 0, 1).Exec()
+	assert.NoError(t, err)
+
 	spaceID := "space-yuj39-cross"
 	// 只有 10001 是 Space 成员，当前登录用户 testutil.UID 不是
 	_, err = ctx.DB().InsertInto("space").

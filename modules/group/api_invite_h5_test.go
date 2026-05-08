@@ -251,6 +251,9 @@ func TestGroupInviteAuthorize_OK(t *testing.T) {
 
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
+	// GH #1319: authorize 在 loginUID 校验后立即做零 Space 预检，测试需先给
+	// testutil.UID 一个 home Space（与任何群所属 Space 都不重合）。
+	seedDefaultSpaceForTestUID(t, ctx)
 
 	groupNo := "g-invite-auth-ok"
 	err = f.db.Insert(&Model{
@@ -304,6 +307,8 @@ func TestGroupInviteAuthorize_InviteRequired(t *testing.T) {
 
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
+	// GH #1319: 需要 testutil.UID 过 Space Gate 才能测 invite 审批分支。
+	seedDefaultSpaceForTestUID(t, ctx)
 
 	groupNo := "g-invite-auth-req"
 	err = f.db.Insert(&Model{
@@ -342,6 +347,8 @@ func TestGroupInviteAuthorize_Expired(t *testing.T) {
 
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
+	// GH #1319: need_space 早于 expired；想测 expired 需要 UID 先过 Space Gate。
+	seedDefaultSpaceForTestUID(t, ctx)
 
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("POST", "/v1/group/invite/authorize?code=does-not-exist-"+util.GenerUUID(), nil)
@@ -425,6 +432,9 @@ func TestGroupInviteAuthorize_HasUIDRateLimit(t *testing.T) {
 
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
+	// GH #1319: need_space 早于 rate limit header 写入路径；想测 rate limit
+	// 响应头需要 UID 先过 Space Gate 让 handler 正常落到成功分支。
+	seedDefaultSpaceForTestUID(t, ctx)
 
 	groupNo := "g-invite-auth-ratelimit"
 	err = f.db.Insert(&Model{
@@ -558,6 +568,8 @@ func TestGroupInviteAuthorize_AlreadyMember(t *testing.T) {
 
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
+	// GH #1319: need_space 早于 already_member；UID 需先有 home Space。
+	seedDefaultSpaceForTestUID(t, ctx)
 
 	groupNo := "g-invite-auth-already"
 	err = f.db.Insert(&Model{
@@ -609,6 +621,8 @@ func TestGroupInviteAuthorize_Invite1_AlreadyMember(t *testing.T) {
 
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
+	// GH #1319: UID 需有 home Space 才能测 invite=1 + already_member 顺序。
+	seedDefaultSpaceForTestUID(t, ctx)
 
 	groupNo := "g-invite-auth-invite1-already"
 	err = f.db.Insert(&Model{
@@ -660,6 +674,8 @@ func TestGroupInviteAuthorize_Invite1_NonMember(t *testing.T) {
 
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
+	// GH #1319: UID 需有 home Space 才能测 invite=1 非成员 400 拦截。
+	seedDefaultSpaceForTestUID(t, ctx)
 
 	groupNo := "g-invite-auth-invite1-nonmember"
 	err = f.db.Insert(&Model{
@@ -701,6 +717,9 @@ func TestGroupInviteAuthorize_ExternalBlocked(t *testing.T) {
 
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
+	// GH #1319: UID 需在独立 home Space（与群的 space-a 不重合），
+	// 才能维持「有 Space 但跨 Space」语义，否则会被 need_space 先短路。
+	seedDefaultSpaceForTestUID(t, ctx)
 
 	groupNo := "g-invite-auth-external"
 	err = f.db.Insert(&Model{
@@ -747,6 +766,9 @@ func TestGroupInviteAuthorize_ExternalBlocked_NonSpaceMember(t *testing.T) {
 
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
+	// GH #1319: 让 UID 有自己的 home Space（与群所属 space-yuj38-cross 不同），
+	// 这样仍然是「登录 + 跨 Space」场景而不是零 Space，能继续断言 external_blocked。
+	seedDefaultSpaceForTestUID(t, ctx)
 
 	spaceID := "space-yuj38-cross"
 	// 只给其他用户授予 space_member，当前登录用户（testutil.UID）不是成员。

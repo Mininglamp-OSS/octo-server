@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/Mininglamp-OSS/octo-lib/common"
@@ -194,6 +195,20 @@ func (q *QRCode) handleScanLogin(loginUID string, uuid string, qrCodeModel commo
 
 // 处理扫码入群
 func (q *QRCode) handleJoinGroup(loginUID string, qrCodeModel common.QRCodeModel) (interface{}, error) {
+	// GH #1319 / Direction A：零 Space 用户禁止通过扫码入群。
+	// 与 modules/group/api.go::groupScanJoin / groupInviteAuthorize 的预检语义对齐，
+	// 避免三端绕过「注册后必先加入 Space」产品约束。三端收到
+	// HandlerTypeGroup + status="need_space" 后应拉起 SpaceGate/JoinSpaceGuide，
+	// Gate 完成后可以直接用同一 qrcode UUID 重新扫一次恢复入群流程。
+	if spacemod.GetUserDefaultSpaceID(q.ctx, loginUID) == "" {
+		groupNoForHint, _ := qrCodeModel.Data["group_no"].(string)
+		return NewHandleResult(ForwardNative, HandlerTypeGroup, map[string]interface{}{
+			"status":   "need_space",
+			"msg":      "请先加入一个 Space 后再入群",
+			"group_no": groupNoForHint,
+		}), nil
+	}
+
 	groupNo, ok := qrCodeModel.Data["group_no"].(string)
 	if !ok {
 		return nil, errors.New("invalid QR code data: missing or invalid group_no")

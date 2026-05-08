@@ -1847,6 +1847,19 @@ func (g *Group) groupScanJoin(c *wkhttp.Context) {
 		c.ResponseError(errors.New("请先登录"))
 		return
 	}
+	// GH #1319 / Direction A：零 Space 用户禁止入群。
+	// 放在 loginUID 校验之后、auth_code / 群资料查询之前，避免写出脏
+	// group_member{is_external=1, source_space_id=""} 记录（下游
+	// space_filter 会把该记录在任何 Space 视角隐藏，造成消息到账但 UI 看不见）。
+	// 三端（Web / iOS / Android）收到该 status 后应拉起 SpaceGate/JoinSpacePage，
+	// Gate 完成后用当前 auth_code 重试本接口。auth_code 30min TTL 足够走一趟 Gate。
+	if spacemod.GetUserDefaultSpaceID(g.ctx, loginUID) == "" {
+		c.Response(gin.H{
+			"status": groupInviteStatusNeedSpace,
+			"msg":    needSpaceMsg,
+		})
+		return
+	}
 	authCode := c.Query("auth_code")
 	groupNo := c.Param("group_no")
 	if groupNo == "" {
@@ -3878,13 +3891,23 @@ func (m memberRemoveReq) Check() error {
 //   - external_blocked 群属于某 Space 且 allow_external=0，不允许外部成员加入。
 //     扫码鉴权的最终裁决仍由 groupScanJoin 完成，这里只是让 H5 提前给出
 //     明确提示、隐藏「加入群聊」按钮，避免用户点了才看到错误。
+//   - need_space       登录用户尚未加入任何 Space（产品决策 Direction A /
+//     GH #1319）。零 Space 用户不允许通过邀请链接 / 扫码 / 深链入群，
+//     避免 group_member{is_external=1, source_space_id=""} 脏数据 +
+//     下游 space_filter 隐藏导致的"消息到账但 UI 看不见"问题。
+//     三端收到该 status 后应拉起 SpaceGate/JoinSpacePage，Gate 完成后重试入群。
 const (
 	groupInviteStatusJoinable        = "joinable"
 	groupInviteStatusInviteRequired  = "invite_required"
 	groupInviteStatusExpired         = "expired"
 	groupInviteStatusNotFound        = "not_found"
 	groupInviteStatusExternalBlocked = "external_blocked"
+	groupInviteStatusNeedSpace       = "need_space"
 )
+
+// needSpaceMsg 是所有入群路径在「零 Space 用户」分支下返回给前端的标准文案。
+// 统一常量避免 H5 / React / iOS / Android 四端解析漂移。
+const needSpaceMsg = "请先加入一个 Space 后再入群"
 
 // groupInvitePage 返回邀请落地页 H5（无需认证，注入 API_BASE_URL）。
 // 进群操作仍走 App 内 groupScanJoin，公开页面只展示脱敏预览。
@@ -3999,12 +4022,20 @@ func (g *Group) groupInviteDetail(c *wkhttp.Context) {
 	//    明确提示，避免点了「加入群聊」再被 groupScanJoin 拒绝）。
 	//    同 Space 成员保留 joinable/invite_required 状态，和 groupInviteAuthorize
 	//    的放行路径对齐（PR#1174 / YUJ-38 fix）。
+	// 6. GH #1319 / Direction A：登录态 + 零 Space 用户 -> need_space。
+	//    优先级**高于** external_blocked，因为零 Space 是账号级问题（加
+	//    Space 后重试即可），比群级 external_blocked 更根本、更可操作；
+	//    前端看到 need_space 应直接引导加 Space 而不是显示「该群不允许外部」。
+	//    未登录访问者（loginUID==""）不触发，保持公共预览体验。
 	status := groupInviteStatusJoinable
 	if groupModel.Invite == 1 {
 		status = groupInviteStatusInviteRequired
 	}
 	if groupModel.SpaceID != "" && groupModel.AllowExternal == 0 && !inSameSpace {
 		status = groupInviteStatusExternalBlocked
+	}
+	if loginUID != "" && spacemod.GetUserDefaultSpaceID(g.ctx, loginUID) == "" {
+		status = groupInviteStatusNeedSpace
 	}
 
 	// YUJ-168 / GH #1243: 为公开 H5 landing 提供信任锚点字段。
@@ -4056,6 +4087,18 @@ func (g *Group) groupInviteAuthorize(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	if loginUID == "" {
 		c.ResponseError(errors.New("请先登录"))
+		return
+	}
+	// GH #1319 / Direction A：零 Space 用户禁止入群。
+	// 放在 loginUID 校验之后、所有 Redis / DB 查询之前，避免写入脏 auth_code
+	// 以及后续 groupScanJoin 落出 group_member{is_external=1, source_space_id=""} 记录。
+	// 优先级**必须**高于 external_blocked / already_member / invite，因为这是用户侧的
+	// 账号状态问题（加完 Space 后重试即可），而不是群本身的属性问题。
+	if spacemod.GetUserDefaultSpaceID(g.ctx, loginUID) == "" {
+		c.Response(gin.H{
+			"status": groupInviteStatusNeedSpace,
+			"msg":    needSpaceMsg,
+		})
 		return
 	}
 	code := strings.TrimSpace(c.Query("code"))
