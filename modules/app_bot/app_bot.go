@@ -267,6 +267,8 @@ func (ab *AppBot) loadRegistryFromDB(authRegistry *bot_api.AppBotRegistryAdapter
 			Username: bot.UID,
 			Name:     bot.DisplayName,
 			ShortNo:  bot.UID,
+			Phone:    "",
+			Zone:     "",
 			Robot:    1,
 		})
 	}
@@ -378,6 +380,8 @@ func (ab *AppBot) createBot(c *wkhttp.Context, scope, spaceID string) {
 		Username: uid,
 		Name:     req.DisplayName,
 		ShortNo:  uid,
+		Phone:    "",
+		Zone:     "",
 		Robot:    1,
 	}); err != nil {
 		// Rollback: remove app_bot and IM token to avoid orphaned records
