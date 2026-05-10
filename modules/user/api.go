@@ -532,7 +532,7 @@ func (u *User) uploadAvatar(c *wkhttp.Context) {
 				SpaceID string `db:"space_id"`
 			}
 			cnt, appErr := u.ctx.DB().SelectBySql(
-				"SELECT scope, IFNULL(space_id,'') as space_id FROM app_bot WHERE uid=? AND status=1 LIMIT 1", targetUID,
+				"SELECT scope, IFNULL(space_id,'') as space_id FROM app_bot WHERE uid=? LIMIT 1", targetUID,
 			).Load(&appBot)
 			if appErr != nil || cnt == 0 {
 				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "无权限修改该用户头像", "status": 403})
