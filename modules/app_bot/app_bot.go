@@ -249,7 +249,7 @@ func (ab *AppBot) loadRegistryFromDB(authRegistry *bot_api.AppBotRegistryAdapter
 			UID:         bot.UID,
 			DisplayName: bot.DisplayName,
 			Description: bot.Description,
-			Avatar:      ab.resolveAvatar(bot),
+			Avatar:      ab.ctx.GetConfig().GetAvatarPath(bot.UID),
 			Scope:       bot.Scope,
 			SpaceID:     bot.SpaceID,
 			Token:       bot.Token,
@@ -499,7 +499,7 @@ func (ab *AppBot) getBotDetail(c *wkhttp.Context) {
 		"uid":          bot.UID,
 		"display_name": bot.DisplayName,
 		"description":  bot.Description,
-		"avatar":       ab.resolveAvatar(bot),
+		"avatar":       ab.ctx.GetConfig().GetAvatarPath(bot.UID),
 		"welcome_msg":  bot.WelcomeMsg,
 		"scope":        bot.Scope,
 		"space_id":     bot.SpaceID,
@@ -583,7 +583,7 @@ func (ab *AppBot) updateBot(c *wkhttp.Context) {
 			UID:         bot.UID,
 			DisplayName: bot.DisplayName,
 			Description: bot.Description,
-			Avatar:      ab.resolveAvatar(bot),
+			Avatar:      ab.ctx.GetConfig().GetAvatarPath(bot.UID),
 			Scope:       bot.Scope,
 			SpaceID:     bot.SpaceID,
 			Token:       bot.Token,
@@ -741,7 +741,7 @@ func (ab *AppBot) rotateToken(c *wkhttp.Context) {
 			UID:         bot.UID,
 			DisplayName: bot.DisplayName,
 			Description: bot.Description,
-			Avatar:      ab.resolveAvatar(bot),
+			Avatar:      ab.ctx.GetConfig().GetAvatarPath(bot.UID),
 			Scope:       bot.Scope,
 			SpaceID:     bot.SpaceID,
 			Token:       newToken,
@@ -835,7 +835,7 @@ func (ab *AppBot) publishBot(c *wkhttp.Context) {
 		UID:         bot.UID,
 		DisplayName: bot.DisplayName,
 		Description: bot.Description,
-		Avatar:      ab.resolveAvatar(bot),
+		Avatar:      ab.ctx.GetConfig().GetAvatarPath(bot.UID),
 		Scope:       bot.Scope,
 		SpaceID:     bot.SpaceID,
 		Token:       bot.Token,
@@ -941,22 +941,11 @@ func (ab *AppBot) discoverBots(c *wkhttp.Context) {
 			"uid":          bot.UID,
 			"display_name": bot.DisplayName,
 			"description":  bot.Description,
-			"avatar":       ab.resolveAvatar(bot),
+			"avatar":       ab.ctx.GetConfig().GetAvatarPath(bot.UID),
 			"scope":        bot.Scope,
 		})
 	}
 	c.JSON(http.StatusOK, result)
-}
-
-// resolveAvatar returns the best avatar URL for an App Bot.
-// If the bot has a non-empty avatar (external URL or previously synced upload path),
-// use it; otherwise fall back to the live /users/{uid}/avatar endpoint.
-// This preserves existing URL-based avatars while supporting the new upload flow.
-func (ab *AppBot) resolveAvatar(bot *appBotModel) string {
-	if bot.Avatar != "" {
-		return bot.Avatar
-	}
-	return ab.ctx.GetConfig().GetAvatarPath(bot.UID)
 }
 
 // ==================== Helpers ====================
@@ -968,7 +957,7 @@ func (ab *AppBot) toBotListResp(bots []*appBotModel) []gin.H {
 			"id":           bot.ID,
 			"uid":          bot.UID,
 			"display_name": bot.DisplayName,
-			"avatar":       ab.resolveAvatar(bot),
+			"avatar":       ab.ctx.GetConfig().GetAvatarPath(bot.UID),
 			"status":       bot.Status,
 			"scope":        bot.Scope,
 			"created_at":   bot.CreatedAt,
