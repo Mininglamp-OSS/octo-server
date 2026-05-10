@@ -371,7 +371,8 @@ func (ab *AppBot) createBot(c *wkhttp.Context, scope, spaceID string) {
 		return
 	}
 
-	// Create user record so SDK can resolve avatar/name for message rows
+	// Create user record so SDK can resolve avatar/name for message rows.
+	// This is a hard dependency — without it, avatar and permission checks fail (404).
 	if err := ab.userService.AddUser(&user.AddUserReq{
 		UID:      uid,
 		Username: uid,
@@ -379,7 +380,11 @@ func (ab *AppBot) createBot(c *wkhttp.Context, scope, spaceID string) {
 		ShortNo:  uid,
 		Robot:    1,
 	}); err != nil {
-		ab.Warn("create user record for app bot failed (non-fatal)", zap.Error(err), zap.String("uid", uid))
+		// Rollback: remove app_bot and IM token to avoid orphaned records
+		ab.db.deleteAppBot(req.ID)
+		ab.Error("create user record for app bot failed, rolled back", zap.Error(err), zap.String("uid", uid))
+		c.ResponseError(errors.New("create app bot failed: user record creation failed"))
+		return
 	}
 
 	c.Response(gin.H{
