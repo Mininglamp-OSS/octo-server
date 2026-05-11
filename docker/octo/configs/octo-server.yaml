@@ -12,7 +12,10 @@
 
 # Runtime mode: debug | release
 # `release` turns off smsCode and tightens several safety checks.
-mode: "debug"
+# ⚠️  Default is `release` for safe OSS deployment. Override via the
+#     TS_MODE env var (or edit this file) if you need the convenience
+#     features of debug mode for local development.
+mode: "release"
 
 # External HTTP base URL used when generating absolute links (QR codes,
 # email payloads, etc). Match your nginx-exposed hostname.
@@ -23,9 +26,10 @@ external:
   # webLoginURL: "http://octo.local:28080/"
 
 # Test-only SMS verification code — any inbound SMS request will accept
-# this string. Leave empty or remove entirely before switching to release
-# mode; production smsProvider wiring lives further down this file.
-smsCode: "123456"
+# this string. Ignored in release mode.
+# ⚠️  Leaving a value here while mode=debug means ANYONE with the default
+#     code can complete registration. See README → Production Hardening.
+smsCode: ""
 
 # ---------- Database ---------------------------------------------------------
 db:
@@ -54,6 +58,9 @@ logger:
 
 # ---------- Registration -----------------------------------------------------
 # Disable open registration in production or restrict to your mobile region.
+# ⚠️  Default is `off: true` for safe OSS deployment. Set to false (via
+#     .env → TS_REGISTER_OFF or by editing this file) once you have
+#     email/SMS providers wired up and are ready to accept public signups.
 register:
-  off: false
+  off: true
   onlyChina: false

@@ -55,6 +55,7 @@ services:
     volumes:
       - mysql-data:/var/lib/mysql
       - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
+      - ./scripts/init-extra-dbs.sql:/docker-entrypoint-initdb.d/01-extra-dbs.sql:ro
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
       interval: 10s
@@ -115,6 +116,13 @@ services:
     environment:
       WK_MODE: ${WK_MODE:-debug}
       WK_EXTERNAL_IP: ${OCTO_EXTERNAL_IP:-127.0.0.1}
+      # The following env vars are promoted into WuKongIM's external.*
+      # config via viper's AutomaticEnv (SetEnvPrefix="WK", dot → underscore).
+      # Leave blank to fall back to the YAML defaults in configs/wk.yaml.
+      # See docker/octo/README.md → "Exposing via TLS" for the full matrix.
+      WK_EXTERNAL_TCPADDR: ${OCTO_WK_TCP_ADDR:-}
+      WK_EXTERNAL_WSADDR:  ${OCTO_WK_WS_ADDR:-}
+      WK_EXTERNAL_WSSADDR: ${OCTO_WK_WSS_ADDR:-}
     ports:
       - "${OCTO_WK_API_PORT:-25001}:5001"       # HTTP API
       - "${OCTO_WK_TCP_PORT:-25100}:5100"       # TCP long-connection
@@ -213,5 +221,130 @@ services:
       timeout: 5s
       retries: 12
       start_period: 10s
+    networks:
+      - octo-net
+
+  # ---------------------------------------------------------------------------
+  # Frontend: octo-web
+  # ---------------------------------------------------------------------------
+  # The web SPA is developed in the separate Mininglamp-OSS/octo-web repo.
+  # Rather than vendor its source here we pull the image the OSS publishes
+  # (or you can override OCTO_WEB_IMAGE to a locally-built tag).
+  web:
+    image: ${OCTO_WEB_IMAGE:-ghcr.io/mininglamp-oss/octo-web:latest}
+    container_name: octo-web
+    restart: unless-stopped
+    depends_on:
+      - octo-server
+      - summary-api
+    environment:
+      API_URL: http://octo-server:8090
+    ports:
+      - "${OCTO_WEB_PORT:-28083}:80"
+    networks:
+      - octo-net
+
+  # ---------------------------------------------------------------------------
+  # Admin console: octo-admin
+  # ---------------------------------------------------------------------------
+  admin:
+    image: ${OCTO_ADMIN_IMAGE:-ghcr.io/mininglamp-oss/octo-admin:latest}
+    container_name: octo-admin
+    restart: unless-stopped
+    depends_on:
+      - octo-server
+    environment:
+      API_BACKEND: octo-server:8090
+    ports:
+      - "${OCTO_ADMIN_PORT:-28082}:80"
+    networks:
+      - octo-net
+
+  # ---------------------------------------------------------------------------
+  # Matter service (tasks / todos)
+  # ---------------------------------------------------------------------------
+  matter:
+    image: ${OCTO_MATTER_IMAGE:-ghcr.io/mininglamp-oss/octo-matter:latest}
+    container_name: octo-matter
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      octo-server:
+        condition: service_started
+    environment:
+      APP_ENV: ${MATTER_APP_ENV:-prod}
+      MYSQL_DSN: "matter:matter@tcp(mysql:3306)/octo_matter?charset=utf8mb4&parseTime=true"
+      OCTO_IM_URL: http://octo-server:8090
+      SERVER_PORT: "8080"
+      NOTIFY_INTERNAL_TOKEN: ${OCTO_NOTIFY_INTERNAL_TOKEN}
+      LLM_API_URL: ${LLM_API_URL:-https://api.example.com/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-claude-sonnet-4-6}
+      LLM_TIMEOUT: "30"
+    ports:
+      - "${OCTO_MATTER_PORT:-28086}:8080"
+    networks:
+      - octo-net
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Smart summary API + worker
+  # ---------------------------------------------------------------------------
+  # Two containers share the same image family: the API handles HTTP requests
+  # from octo-web (routed as /summary/api/…), while the worker polls the
+  # summary_task queue and calls the LLM.  They are coupled via the
+  # summary_task table in the octo_summary database.
+  summary-api:
+    image: ${OCTO_SUMMARY_API_IMAGE:-ghcr.io/mininglamp-oss/octo-summary-api:latest}
+    container_name: octo-summary-api
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      MYSQL_DSN:    "summary:summary@tcp(mysql:3306)/octo_summary?charset=utf8mb4&parseTime=true"
+      IM_MYSQL_DSN: "root:${MYSQL_ROOT_PASSWORD}@tcp(mysql:3306)/${MYSQL_DATABASE:-octo}?charset=utf8mb4&parseTime=true"
+      OCTO_API_URL: http://octo-server:8090
+      LLM_API_URL:  ${LLM_API_URL:-https://api.example.com/v1}
+      LLM_API_KEY:  ${LLM_API_KEY:-}
+      LLM_MODEL:    ${LLM_MODEL:-claude-sonnet-4-6}
+      API_PORT: "8080"
+      WORKER_TRIGGER_URL:     http://summary-worker:8082/trigger
+      WORKER_API_CALLBACK_URL: http://summary-api:8081
+    ports:
+      - "${OCTO_SUMMARY_API_PORT:-28087}:8080"
+    networks:
+      - octo-net
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  summary-worker:
+    image: ${OCTO_SUMMARY_WORKER_IMAGE:-ghcr.io/mininglamp-oss/octo-summary-worker:latest}
+    container_name: octo-summary-worker
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      summary-api:
+        condition: service_started
+    environment:
+      MYSQL_DSN:    "summary:summary@tcp(mysql:3306)/octo_summary?charset=utf8mb4&parseTime=true"
+      IM_MYSQL_DSN: "root:${MYSQL_ROOT_PASSWORD}@tcp(mysql:3306)/${MYSQL_DATABASE:-octo}?charset=utf8mb4&parseTime=true"
+      OCTO_API_URL: http://octo-server:8090
+      LLM_API_URL:  ${LLM_API_URL:-https://api.example.com/v1}
+      LLM_API_KEY:  ${LLM_API_KEY:-}
+      LLM_MODEL:    ${LLM_MODEL:-claude-sonnet-4-6}
+      WORKER_INTERNAL_PORT: "8082"
+      WORKER_API_CALLBACK_URL: http://summary-api:8081
     networks:
       - octo-net

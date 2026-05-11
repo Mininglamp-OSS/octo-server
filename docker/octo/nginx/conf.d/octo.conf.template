@@ -96,23 +96,72 @@ server {
         proxy_set_header   X-Forwarded-Proto $scheme;
     }
 
-    # ---------- Landing page ----------
-    # Tiny dashboard confirming the stack is up. Replace with an SPA mount
-    # (e.g. octo-web) once you integrate the web frontend.
-    location = / {
-        default_type text/html;
-        return 200 '<!doctype html>\n<html><head><meta charset="utf-8"><title>OCTO Server</title>\n<style>body{font-family:system-ui,sans-serif;max-width:640px;margin:3rem auto;padding:0 1rem;color:#222}h1{margin-bottom:.25rem}code{background:#f4f4f7;padding:2px 6px;border-radius:4px}ul{line-height:1.9}</style></head>\n<body><h1>\xF0\x9F\x90\x99 OCTO Server</h1><p>The stack is up. Quick links:</p>\n<ul>\n<li><a href="/api/v1/ping">REST \xC2\xB7 <code>/api/v1/ping</code></a></li>\n<li><a href="/api/v1/health">REST \xC2\xB7 <code>/api/v1/health</code></a></li>\n<li><a href="/minio-console/">MinIO console</a></li>\n</ul>\n<p>See <code>docker/octo/README.md</code> for configuration.</p></body></html>\n';
+    # ---------- Admin console (octo-admin) ----------
+    location = /admin {
+        return 301 /admin/;
+    }
+    location /admin/ {
+        proxy_pass         http://admin/admin/;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
     }
 
-    # ---------- Default (future: web SPA) ----------
-    # When you enable octo-web (separate container), replace this block with
-    # a reverse proxy to the web container, e.g.:
-    #
-    #     location / { proxy_pass http://octo-web:80; }
-    #
-    # For now fall through to a 404 so stray requests are obvious.
+    # ---------- Matter service ----------
+    location /matter/ {
+        proxy_pass         http://matter:8080/;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+    }
+
+    # ---------- Smart summary API ----------
+    location /summary/ {
+        proxy_pass         http://summary-api:8080/;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+    }
+
+    # ---------- Landing page ----------
+    # Tiny dashboard confirming the stack is up. octo-web proxies everything
+    # else on `/`, but /_octo_up is always served from here so a curl probe
+    # can confirm the routing layer is healthy without depending on the SPA.
+    location = /_octo_up {
+        default_type text/html;
+        return 200 '<!doctype html>
+<html><head><meta charset="utf-8"><title>OCTO Server</title>
+<style>body{font-family:system-ui,sans-serif;max-width:640px;margin:3rem auto;padding:0 1rem;color:#222}h1{margin-bottom:.25rem}code{background:#f4f4f7;padding:2px 6px;border-radius:4px}ul{line-height:1.9}</style></head>
+<body><h1>🐙 OCTO Server</h1><p>The stack is up. Quick links:</p>
+<ul>
+<li><a href="/">Web (SPA)</a></li>
+<li><a href="/admin/">Admin console</a></li>
+<li><a href="/api/v1/ping">REST · <code>/api/v1/ping</code></a></li>
+<li><a href="/api/v1/health">REST · <code>/api/v1/health</code></a></li>
+<li><a href="/matter/health">Matter · <code>/matter/health</code></a></li>
+<li><a href="/summary/health">Smart-summary · <code>/summary/health</code></a></li>
+<li><a href="/minio-console/">MinIO console</a></li>
+</ul>
+<p>See <code>docker/octo/README.md</code> for configuration.</p></body></html>
+';
+    }
+
+    # ---------- Default: octo-web SPA ----------
+    # Anything that didn't match above (including `/`) falls through to the
+    # octo-web container. The web SPA handles its own routing client-side.
     location / {
-        return 404;
+        proxy_pass         http://web/;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
     }
 }
 
