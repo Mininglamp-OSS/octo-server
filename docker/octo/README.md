@@ -1,7 +1,7 @@
 # OCTO Server — Docker deployment
 
 One-shot, all-in-one OCTO stack for local development and small self-hosted
-deployments. Brings up 10 containers behind an nginx reverse proxy:
+deployments. Brings up 11 containers behind an nginx reverse proxy:
 
 | Service           | Role                          | Published port                    |
 | ----------------- | ----------------------------- | --------------------------------- |

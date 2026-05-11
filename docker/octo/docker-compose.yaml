@@ -50,12 +50,18 @@ services:
       TZ: ${TZ:-UTC}
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
       MYSQL_DATABASE: ${MYSQL_DATABASE:-octo}
+      # Propagate .env overrides into the init-extra-dbs.sh entrypoint
+      # script so OSS users can change the side-service DB passwords at
+      # first boot without hand-editing docker/octo/scripts/.
+      OCTO_MATTER_DB_PASSWORD: ${OCTO_MATTER_DB_PASSWORD:-matter}
+      OCTO_SUMMARY_DB_PASSWORD: ${OCTO_SUMMARY_DB_PASSWORD:-summary}
+      OCTO_SUMMARY_READER_PASSWORD: ${OCTO_SUMMARY_READER_PASSWORD:-summary_reader}
     ports:
       - "${OCTO_MYSQL_PORT:-23306}:3306"
     volumes:
       - mysql-data:/var/lib/mysql
       - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
-      - ./scripts/init-extra-dbs.sql:/docker-entrypoint-initdb.d/01-extra-dbs.sql:ro
+      - ./scripts/init-extra-dbs.sh:/docker-entrypoint-initdb.d/01-extra-dbs.sh:ro
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
       interval: 10s
@@ -239,8 +245,17 @@ services:
       - summary-api
     environment:
       API_URL: http://octo-server:8090
+      # Optional: smart-summary backend. octo-web handles absence gracefully
+      # when this is left blank (serves /summary/api/v1/* as 503 JSON).
+      SUMMARY_API_URL: ${OCTO_SUMMARY_API_URL:-http://summary-api:8080}
     ports:
       - "${OCTO_WEB_PORT:-28083}:80"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     networks:
       - octo-net
 
@@ -257,6 +272,12 @@ services:
       API_BACKEND: octo-server:8090
     ports:
       - "${OCTO_ADMIN_PORT:-28082}:80"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost/admin/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     networks:
       - octo-net
 
@@ -274,7 +295,7 @@ services:
         condition: service_started
     environment:
       APP_ENV: ${MATTER_APP_ENV:-prod}
-      MYSQL_DSN: "matter:matter@tcp(mysql:3306)/octo_matter?charset=utf8mb4&parseTime=true"
+      MYSQL_DSN: "matter:${OCTO_MATTER_DB_PASSWORD:-matter}@tcp(mysql:3306)/octo_matter?charset=utf8mb4&parseTime=true"
       OCTO_IM_URL: http://octo-server:8090
       SERVER_PORT: "8080"
       NOTIFY_INTERNAL_TOKEN: ${OCTO_NOTIFY_INTERNAL_TOKEN}
@@ -308,13 +329,23 @@ services:
       mysql:
         condition: service_healthy
     environment:
-      MYSQL_DSN:    "summary:summary@tcp(mysql:3306)/octo_summary?charset=utf8mb4&parseTime=true"
-      IM_MYSQL_DSN: "root:${MYSQL_ROOT_PASSWORD}@tcp(mysql:3306)/${MYSQL_DATABASE:-octo}?charset=utf8mb4&parseTime=true"
+      MYSQL_DSN:    "summary:${OCTO_SUMMARY_DB_PASSWORD:-summary}@tcp(mysql:3306)/octo_summary?charset=utf8mb4&parseTime=true"
+      # Read-only access to the IM schema for scanning messages to
+      # summarise. A dedicated `summary_reader` account with SELECT-only
+      # privileges is created by scripts/init-extra-dbs.sql so the
+      # summary services never see the MySQL root password.
+      IM_MYSQL_DSN: "summary_reader:${OCTO_SUMMARY_READER_PASSWORD:-summary_reader}@tcp(mysql:3306)/${MYSQL_DATABASE:-octo}?charset=utf8mb4&parseTime=true"
       OCTO_API_URL: http://octo-server:8090
       LLM_API_URL:  ${LLM_API_URL:-https://api.example.com/v1}
       LLM_API_KEY:  ${LLM_API_KEY:-}
       LLM_MODEL:    ${LLM_MODEL:-claude-sonnet-4-6}
-      API_PORT: "8080"
+      # summary-api binds two HTTP listeners:
+      #   API_PORT          (8080) — public API consumed by octo-web
+      #   API_INTERNAL_PORT (8081) — internal callback target for worker
+      # The internal listener receives task-event / worker-callback POSTs
+      # from summary-worker; it is never exposed on a host port.
+      API_PORT:          "8080"
+      API_INTERNAL_PORT: "8081"
       WORKER_TRIGGER_URL:     http://summary-worker:8082/trigger
       WORKER_API_CALLBACK_URL: http://summary-api:8081
     ports:
@@ -338,8 +369,8 @@ services:
       summary-api:
         condition: service_started
     environment:
-      MYSQL_DSN:    "summary:summary@tcp(mysql:3306)/octo_summary?charset=utf8mb4&parseTime=true"
-      IM_MYSQL_DSN: "root:${MYSQL_ROOT_PASSWORD}@tcp(mysql:3306)/${MYSQL_DATABASE:-octo}?charset=utf8mb4&parseTime=true"
+      MYSQL_DSN:    "summary:${OCTO_SUMMARY_DB_PASSWORD:-summary}@tcp(mysql:3306)/octo_summary?charset=utf8mb4&parseTime=true"
+      IM_MYSQL_DSN: "summary_reader:${OCTO_SUMMARY_READER_PASSWORD:-summary_reader}@tcp(mysql:3306)/${MYSQL_DATABASE:-octo}?charset=utf8mb4&parseTime=true"
       OCTO_API_URL: http://octo-server:8090
       LLM_API_URL:  ${LLM_API_URL:-https://api.example.com/v1}
       LLM_API_KEY:  ${LLM_API_KEY:-}
