@@ -21,12 +21,37 @@ deployments. Brings up 11 containers behind an nginx reverse proxy:
 
 ## Quick start
 
+The default `docker-compose.yaml` references `octo-web:local`,
+`octo-admin:local`, `octo-matter:local`, `octo-summary-api:local`, and
+`octo-summary-worker:local`. Until the project publishes public registry
+images, build them locally from the sibling OSS repos:
+
+```bash
+# First time only — build the frontend + side-service images.
+# Clone the companion repos next to this one:
+#   Mininglamp-OSS/octo-web
+#   Mininglamp-OSS/octo-admin
+#   Mininglamp-OSS/octo-matter
+#   Mininglamp-OSS/octo-smart-summary
+( cd ../octo-web          && docker build -t octo-web:local          . )
+( cd ../octo-admin        && docker build -t octo-admin:local        . )
+( cd ../octo-matter       && docker build -t octo-matter:local       . )
+( cd ../octo-smart-summary && \
+    docker build -f Dockerfile.api    -t octo-summary-api:local    . && \
+    docker build -f Dockerfile.worker -t octo-summary-worker:local . )
+```
+
+Once those images exist:
+
 ```bash
 cp docker/octo/.env.example docker/octo/.env
 # edit docker/octo/.env — at minimum change the CHANGE_ME_* values
 cd docker/octo
 docker compose up -d
 ```
+
+To use a registry-hosted image later, override via `.env` (e.g.
+`OCTO_WEB_IMAGE=ghcr.io/your-org/octo-web:v1.0.0`).
 
 Once healthy:
 
