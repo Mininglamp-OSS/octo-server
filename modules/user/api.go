@@ -180,6 +180,7 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 		user.DELETE("/device_token", u.unregisterUserDeviceToken)  // 卸载用户设备
 		user.POST("/device_badge", u.registerUserDeviceBadge)      // 上传设备红点数量
 		user.GET("/grant_login", u.grantLogin)                     // 授权登录
+		user.GET("/current", u.currentUser)                        // 获取当前登录用户信息（含 self 实名字段）
 		user.PUT("/current", u.userUpdateWithField)                //修改用户信息
 		user.GET("/qrcode", u.qrcodeMy)                            // 我的二维码
 		user.PUT("/my/setting", u.userUpdateSetting)               // 更新我的设置
@@ -661,6 +662,46 @@ func (u *User) qrcodeMy(c *wkhttp.Context) {
 	c.Response(gin.H{
 		"data": fmt.Sprintf("%s/%s", u.ctx.GetConfig().External.BaseURL, path),
 	})
+}
+
+// currentUser 返回当前登录用户的权威 profile（含 self 实名字段）。
+//
+// YUJ-413：/v1/user/login 和 GET /v1/user/current 必须下发 realname_verified /
+// real_name / realname_verified_at 三字段，否则 Web/Android/iOS 三端 self 实名
+// 徽章和 displayName 无法渲染（friend/sync、conversation/sync 对他人已下发
+// 同名字段，唯独 self 路径漏加）。
+//
+// 客户端调用场景：
+//   - Android VerifyLandingActivity → UserModel.refreshCurrentUser()；
+//   - iOS   WKRealnameVerifyManager Custom Tabs 回跳；
+//   - Web   loginSuccess() 后亦可作 fallback；
+//
+// 语义 vs POST /v1/user/login：
+//   - 结构完全对齐 loginUserDetailResp，客户端可共用 parser；
+//   - token 字段回显当前请求头里的 token（不换发），保持会话稳定；
+//   - realname_verified / real_name / realname_verified_at 从 user_verification
+//     表读取；未实名用户 realname_verified=false，其它字段 omitempty 省略。
+func (u *User) currentUser(c *wkhttp.Context) {
+	loginUID := c.GetLoginUID()
+	if loginUID == "" {
+		c.ResponseError(errors.New("未登录"))
+		return
+	}
+	userInfo, err := u.db.QueryByUID(loginUID)
+	if err != nil {
+		u.Error("查询当前用户信息失败", zap.Error(err), zap.String("uid", loginUID))
+		c.ResponseError(errors.New("查询当前用户信息失败"))
+		return
+	}
+	if userInfo == nil {
+		c.ResponseError(errors.New("当前用户不存在"))
+		return
+	}
+	// token 回显请求头 token：/user/current 不换发 token,避免干扰现有会话;
+	// 客户端本身就用这个 token 调的接口,回填仅为结构对齐 login response。
+	resp := newLoginUserDetailResp(userInfo, c.GetHeader("token"), u.ctx)
+	u.applyRealnameToLoginResp(resp, userInfo.UID)
+	c.Response(resp)
 }
 
 // 修改用户信息
@@ -1338,7 +1379,9 @@ func (u *User) execLogin(userInfo *Model, flag config.DeviceFlag, device *device
 		return nil, errors.New("此账号已经被封禁！")
 	}
 
-	return newLoginUserDetailResp(userInfo, token, u.ctx), nil
+	resp := newLoginUserDetailResp(userInfo, token, u.ctx)
+	u.applyRealnameToLoginResp(resp, userInfo.UID)
+	return resp, nil
 }
 
 // sendWelcomeMsg 发送欢迎语
@@ -1856,7 +1899,7 @@ func (u *User) loginWithAuthCode(c *wkhttp.Context) {
 		return
 	}
 
-	c.Response(map[string]interface{}{
+	resp := map[string]interface{}{
 		"app_id":     userModel.AppID,
 		"name":       userModel.Name,
 		"username":   userModel.Username,
@@ -1865,7 +1908,12 @@ func (u *User) loginWithAuthCode(c *wkhttp.Context) {
 		"short_no":   userModel.ShortNo,
 		"avatar":     u.ctx.GetConfig().GetAvatarPath(userModel.UID),
 		"im_pub_key": "",
-	})
+	}
+	// YUJ-413 R5 Blocking #2:auth-code 登录走手写 map,没经过
+	// newLoginUserDetailResp,必须单独补三个实名字段 —— 否则扫码登录的客户端
+	// 永远拿不到 self 实名态,和 POST /v1/user/login 契约不一致。
+	u.applyRealnameToAuthCodeMap(resp, userModel.UID)
+	c.Response(resp)
 }
 
 // 获取二维码数据的管道
@@ -2504,7 +2552,9 @@ func (u *User) loginCheckPhone(c *wkhttp.Context) {
 		c.ResponseError(errors.New("此账号已经被封禁！"))
 		return
 	}
-	c.Response(newLoginUserDetailResp(userInfo, token, u.ctx))
+	resp := newLoginUserDetailResp(userInfo, token, u.ctx)
+	u.applyRealnameToLoginResp(resp, userInfo.UID)
+	c.Response(resp)
 }
 
 // customerservices 客服列表
@@ -3140,7 +3190,9 @@ func (u *User) createUserWithRespAndTx(registerSpanCtx context.Context, createUs
 		}
 	}
 
-	return newLoginUserDetailResp(userModel, token, u.ctx), nil
+	resp := newLoginUserDetailResp(userModel, token, u.ctx)
+	u.applyRealnameToLoginResp(resp, userModel.UID)
+	return resp, nil
 }
 
 // ---------- vo ----------
@@ -3281,6 +3333,16 @@ type loginUserDetailResp struct {
 	DestroyStatus        int   `json:"destroy_status,omitempty"`
 	DestroyRemainingDays int   `json:"destroy_remaining_days,omitempty"`
 	DestroyExpireAt      int64 `json:"destroy_expire_at,omitempty"` // Unix 秒
+	// YUJ-413: self 实名字段（必须下发，否则 Web/Android/iOS 三端 self 徽章和
+	// displayName 全部瞎 —— friend/sync、conversation/sync 对他人已下发同名字段，
+	// 这里补 self 路径）。
+	// 字段语义和 UserDetailResp 对齐：
+	//   RealnameVerified    - 是否已完成 OCTO 实名（user_verification 表有记录）
+	//   RealName            - 已认证时的权威姓名；未认证留空
+	//   RealnameVerifiedAt  - 实名完成时间(Unix 秒)；未认证为 0 并被 omitempty 剥离
+	RealnameVerified   bool   `json:"realname_verified"`
+	RealName           string `json:"real_name,omitempty"`
+	RealnameVerifiedAt int64  `json:"realname_verified_at,omitempty"`
 }
 
 type setting struct {
@@ -3342,6 +3404,71 @@ func newLoginUserDetailResp(m *Model, token string, ctx *config.Context) *loginU
 			DeviceLock:        m.DeviceLock,
 			MuteOfApp:         m.MuteOfApp,
 		},
+	}
+}
+
+// applyRealnameToLoginResp 从 user_verification 表读取 self 实名字段并写入
+// login / current response。YUJ-413：/v1/user/login、GET /v1/user/current 必须下发
+// realname_verified / real_name / realname_verified_at 三字段，否则 Web/Android/iOS
+// 三端 self 徽章和 displayName 无法渲染（friend/sync、conversation/sync 对他人已
+// 下发同名字段，这里补齐 self 路径）。
+//
+// 语义：
+//   - 未实名 / 查询失败 → realname_verified=false，其它字段保持零值（被 omitempty 剥离）；
+//   - 已实名 → realname_verified=true，real_name 回填，verified_at 转 Unix 秒。
+//
+// 查询失败仅 warn 不阻断登录 —— 实名是增强信息，查询抖动不应让登录失败。
+func (u *User) applyRealnameToLoginResp(resp *loginUserDetailResp, uid string) {
+	if resp == nil || uid == "" {
+		return
+	}
+	vr, err := u.verificationDB.QueryByUID(uid)
+	if err != nil {
+		u.Warn("查询 self 实名认证记录失败", zap.Error(err), zap.String("uid", uid))
+		return
+	}
+	if vr == nil {
+		return
+	}
+	resp.RealnameVerified = true
+	resp.RealName = vr.RealName
+	if !vr.VerifiedAt.IsZero() {
+		resp.RealnameVerifiedAt = vr.VerifiedAt.Unix()
+	}
+}
+
+// applyRealnameToAuthCodeMap 往 loginWithAuthCode 的 map[string]interface{}
+// 响应里写三个实名字段（YUJ-413 R5 Blocking #2）。
+//
+// loginWithAuthCode 走的是手写 map（历史扫码登录协议保留了一组最小字段），
+// 不经过 newLoginUserDetailResp / applyRealnameToLoginResp，之前完全没有
+// 实名字段 —— 扫码登录进来的客户端永远拿不到 self 实名态。语义和
+// applyRealnameToLoginResp 对齐:
+//   - realname_verified 一律下发(true/false)，保留三态语义，key 存在即表示
+//     "服务器已表态"，缺失表示"数据链路有问题"。这是客户端 parser 的硬契约。
+//   - real_name / realname_verified_at 仅已实名时加（和 loginUserDetailResp
+//     的 omitempty 语义对齐）。
+//   - 查询失败只 warn 不阻断登录。
+func (u *User) applyRealnameToAuthCodeMap(m map[string]interface{}, uid string) {
+	if m == nil || uid == "" {
+		return
+	}
+	// 默认已先标 false，避免 DB 查询分支里忘记写默认值。
+	m["realname_verified"] = false
+	vr, err := u.verificationDB.QueryByUID(uid)
+	if err != nil {
+		u.Warn("auth-code 登录查询实名认证记录失败", zap.Error(err), zap.String("uid", uid))
+		return
+	}
+	if vr == nil {
+		return
+	}
+	m["realname_verified"] = true
+	if vr.RealName != "" {
+		m["real_name"] = vr.RealName
+	}
+	if !vr.VerifiedAt.IsZero() {
+		m["realname_verified_at"] = vr.VerifiedAt.Unix()
 	}
 }
 

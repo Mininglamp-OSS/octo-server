@@ -384,6 +384,9 @@ func (s *Service) GetUserDetail(uid string, loginUID string) (*UserDetailResp, e
 	} else if vr != nil {
 		resp.RealnameVerified = true
 		resp.RealName = vr.RealName
+		if !vr.VerifiedAt.IsZero() {
+			resp.RealnameVerifiedAt = vr.VerifiedAt.Unix()
+		}
 	}
 
 	// 为机器人用户填充bot_commands + 详情
@@ -578,6 +581,9 @@ func (s *Service) GetUserDetails(uids []string, loginUID string) ([]*UserDetailR
 			if vr, ok := verifiMap[resp.UID]; ok && vr != nil {
 				resp.RealnameVerified = true
 				resp.RealName = vr.RealName
+				if !vr.VerifiedAt.IsZero() {
+					resp.RealnameVerifiedAt = vr.VerifiedAt.Unix()
+				}
 			}
 		}
 	}
@@ -1281,6 +1287,11 @@ type UserDetailResp struct {
 	// 若后续产品要求"仅自己可见"，改为仅当 loginUID == m.UID 时填充即可。
 	RealnameVerified bool   `json:"realname_verified"`
 	RealName         string `json:"real_name,omitempty"`
+	// RealnameVerifiedAt：实名认证完成时间 (Unix 秒)。未认证时为 0 被 omitempty 剥离。
+	// 三端客户端（Web/Android/iOS）在 Custom Tabs 实名回跳后读此字段做
+	// 「已认证 · YYYY-MM」展示；同时与 login / GET /v1/user/current 下发的
+	// 字段名保持一致（YUJ-413）。
+	RealnameVerifiedAt int64 `json:"realname_verified_at,omitempty"`
 }
 
 type GroupMemberResp struct {

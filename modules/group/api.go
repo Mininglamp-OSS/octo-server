@@ -292,6 +292,8 @@ func (g *Group) membersGet(c *wkhttp.Context) {
 	// membersGet 路径未提前查过 group 表，传空 groupSpaceID 让 fillSpaceRelatedFields
 	// 内部按需兜底（仅在存在内部成员时才多做一次 group 查询）。
 	g.fillSpaceRelatedFields(groupNo, "", resps)
+	// YUJ-413 Scope B：批量回填实名字段（零 N+1），Android 气泡 + 群成员列表依赖。
+	g.fillRealnameFields(resps)
 
 	c.Response(resps)
 }
@@ -330,6 +332,10 @@ func (g *Group) memberGet(c *wkhttp.Context) {
 
 	resps := []memberDetailResp{(memberDetailResp{}).from(detail)}
 	g.fillSpaceRelatedFields(groupNo, "", resps)
+	// YUJ-413 Scope B：单成员查询也需要回填实名字段（单 uid 也走批量 API，
+	// 调用成本与 N=1 一致），Android 客户端 /v1/groups/:group_no/members/:uid
+	// 是资料卡 / @提及 等路径的数据源。
+	g.fillRealnameFields(resps)
 
 	c.Response(memberCheckResp{Exists: true, Member: &resps[0]})
 }
@@ -525,6 +531,10 @@ func (g *Group) syncMembers(c *wkhttp.Context) {
 	// syncMembers 在 L446 已经 QueryWithGroupNo 过一次，把 group.SpaceID 透传进去
 	// 可避免 fillSpaceRelatedFields 再做一次群查询（Jerry-Xin review 优化建议）。
 	g.fillSpaceRelatedFields(groupNo, group.SpaceID, resps)
+	// YUJ-413 Scope B：同 membersGet / memberGet，批量回填实名字段。
+	// membersync 是 Android WKSDK ChannelMember 缓存的唯一增量来源，漏下发就
+	// 永远没 extraMap.realname_verified → 气泡 + 群成员列表永远不亮。
+	g.fillRealnameFields(resps)
 	c.Response(resps)
 }
 
@@ -3765,6 +3775,14 @@ type memberDetailResp struct {
 	//   内部成员                     → home_space_id = group.space_id
 	HomeSpaceID        string `json:"home_space_id"`        // 成员归属 Space ID（供前端相对视角渲染）
 	HomeSpaceName      string `json:"home_space_name"`      // 成员归属 Space 名称
+	// OCTO 实名认证（YUJ-413 Scope B）。根因报告（YUJ-411）发现 Android 气泡 +
+	// 群成员列表两条渲染路径都依赖此处 JSON 下发 —— Web 通过 friend/sync 的
+	// UserDetailResp 已经有这三字段，Android/iOS 走 WKSDK ChannelMember.extraMap
+	// 缓存路径，对应的 /v1/groups/:group_no/members + /membersync 必须同名同型。
+	// 未实名用户：realname_verified=false，其它字段 omitempty 省略。
+	RealnameVerified   bool   `json:"realname_verified"`
+	RealName           string `json:"real_name,omitempty"`
+	RealnameVerifiedAt int64  `json:"realname_verified_at,omitempty"`
 	CreatedAt          string `json:"created_at"`
 	UpdatedAt          string `json:"updated_at"`
 }
@@ -3814,6 +3832,59 @@ func (r memberDetailResp) from(model *MemberDetailModel) memberDetailResp {
 //  1. 最多 1 次 group 表查询（仅在 groupSpaceID=="" 且存在内部成员时的兜底）
 //  2. 最多 1 次 space 表 WHERE IN 批量查询（合并所有 source_space_id ∪ group_space_id）
 //
+// fillRealnameFields 批量回填 memberDetailResp 的实名字段（YUJ-413 Scope B）。
+//
+// 背景：根因报告 YUJ-411 指出 Android 气泡 + 群成员列表 + WKSDK ChannelMember
+// 缓存全瞎，是因为 /v1/groups/:group_no/members 和 /membersync 的 response
+// 没有序列化 realname_verified / real_name / realname_verified_at。Web 通过
+// friend/sync 的 UserDetailResp 已有这三字段，Android/iOS 走 ChannelMember
+// extraMap 缓存路径只看 members / membersync，本 handler 不补就永远读不到。
+//
+// 实现：单次 `user_verification WHERE user_id IN (?)` 批量查，映射到每个 resp。
+// 与 modules/user/service.go::GetUserDetails 的批量回填同模式，零 N+1。
+//
+// 失败处理：仅 log，不阻断主响应链路 —— 实名是增强信息，不能因实名表查询抖动
+// 让群成员列表不可用。
+func (g *Group) fillRealnameFields(resps []memberDetailResp) {
+	if len(resps) == 0 {
+		return
+	}
+	uids := make([]string, 0, len(resps))
+	seen := make(map[string]struct{}, len(resps))
+	for _, r := range resps {
+		if r.UID == "" {
+			continue
+		}
+		if _, ok := seen[r.UID]; ok {
+			continue
+		}
+		seen[r.UID] = struct{}{}
+		uids = append(uids, r.UID)
+	}
+	if len(uids) == 0 {
+		return
+	}
+	infoMap, err := user.QueryVerificationsByUIDs(g.ctx, uids)
+	if err != nil {
+		g.Warn("批量查询群成员实名认证记录失败（YUJ-413）",
+			zap.Error(err), zap.Int("uid_count", len(uids)))
+		return
+	}
+	if len(infoMap) == 0 {
+		return
+	}
+	// 注意：resps 是值切片，必须按 index 回写，不能 range copy。
+	for i := range resps {
+		info, ok := infoMap[resps[i].UID]
+		if !ok || info == nil {
+			continue
+		}
+		resps[i].RealnameVerified = true
+		resps[i].RealName = info.RealName
+		resps[i].RealnameVerifiedAt = info.RealnameVerifiedAt
+	}
+}
+
 // 这个上限与 resps 长度无关，保持原先 fillSourceSpaceNames 的无 N+1 属性。
 // 函数不会改写 is_external / source_space_id 字段。
 func (g *Group) fillSpaceRelatedFields(groupNo, groupSpaceID string, resps []memberDetailResp) {

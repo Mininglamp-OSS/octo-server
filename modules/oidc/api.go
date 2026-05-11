@@ -2,6 +2,7 @@ package oidc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -615,6 +616,14 @@ func (o *OIDC) callback(c *wkhttp.Context) {
 	//
 	// **失败只告警不阻断登录**:实名状态刷不了是 P2,用户登不进系统是 P0。
 	// 不满足条件(未配 upserter / is_verified=false / legal_name 空)直接跳过,不报错。
+	//
+	// YUJ-413 R5 Critical #1 修复 — 写库时序 + LoginRespJSON patch:
+	// IssueSession 已在 sessResp.LoginRespJSON 里调过 applyRealnameToLoginResp,
+	// 但此时 user_verification 还没有这次 upsert 的行(首次实名 / 值变化场景),
+	// 所以 JSON 里的 realname 字段是 stale 的。下面 upsert 成功后,我们在这里
+	// 用刚写进去的 claims 值 in-place patch 一次 JSON —— 保证 SetAuthcode 缓存
+	// 的 payload 就是最新的,客户端首次 fresh login 就能拿到正确的实名态,
+	// 不必依赖 Custom Tabs 回跳后的 GET /v1/user/current 二次刷新。
 	if o.verification != nil && claims.IsVerified.Bool() && claims.LegalName != "" && sessResp.UID != "" {
 		vclaims := user.OIDCVerificationClaims{
 			Subject:          claims.Subject,
@@ -629,6 +638,19 @@ func (o *OIDC) callback(c *wkhttp.Context) {
 				zap.String("sub_hash", subHash(claims.Subject)),
 				zap.String("provider", claims.VerifiedProvider),
 				zap.Error(verr))
+		} else {
+			// upsert 成功才 patch — 失败时 stale 和 DB 保持一致,客户端后续
+			// GET /v1/user/current 会看到真实(仍 stale 的)状态。
+			if patched, perr := patchLoginRespJSONWithRealname(
+				sessResp.LoginRespJSON,
+				claims.LegalName,
+				claims.VerifiedAt.Int64(),
+			); perr != nil {
+				o.Warn("OIDC callback patch LoginRespJSON realname failed (非致命,客户端可用 /user/current 兜底)",
+					zap.String("trace_id", traceID), zap.Error(perr))
+			} else {
+				sessResp.LoginRespJSON = patched
+			}
 		}
 	}
 
@@ -810,6 +832,52 @@ func (o *OIDC) recoverFromIdentityRace(
 	o.writeAudit(original.UID, EventCallbackFail, sd,
 		"identity race ghost="+original.UID+" winner="+existing.UID)
 	return winnerSess
+}
+
+// patchLoginRespJSONWithRealname 把刚写入 user_verification 的三个实名字段
+// in-place patch 进 sessResp.LoginRespJSON。YUJ-413 R5 Critical #1 修复:
+//
+// OIDC callback 的原始时序是:
+//  1. IssueSession → user.execLogin → newLoginUserDetailResp →
+//     applyRealnameToLoginResp(读旧 user_verification)→ 生成 LoginRespJSON
+//  2. UpsertVerificationFromOIDC(写入新实名行)
+//  3. SetAuthcode(把 1 的 LoginRespJSON 缓存给前端)
+//
+// 首次实名 / 实名字段值变化时,第 1 步读到的是旧值(或缺失),第 3 步缓存的
+// JSON 就和 DB 现状不一致,客户端 fresh login 拿到的是 stale 态 ——
+// 直接违反"fresh login 后 self 实名字段可用"契约。
+//
+// 本函数在 upsert 成功后被调用,用已知的 claims 值替换 JSON 里的对应 key。
+// 用 claims 而不是再查一次 DB,一是省 round trip,二是语义最确定(就是刚写
+// 进去的那行)。
+//
+// 字段名严格对齐 loginUserDetailResp:
+//
+//	realname_verified      = true
+//	real_name              = realName  (空则不写)
+//	realname_verified_at   = verifiedAt (<=0 则不写)
+//
+// 传入 JSON 空 / 非法时返回原值 + 非 nil err,调用方自行决定是否回退。
+func patchLoginRespJSONWithRealname(jsonStr, realName string, verifiedAt int64) (string, error) {
+	if jsonStr == "" {
+		return jsonStr, nil
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &m); err != nil {
+		return jsonStr, fmt.Errorf("oidc: unmarshal LoginRespJSON: %w", err)
+	}
+	m["realname_verified"] = true
+	if realName != "" {
+		m["real_name"] = realName
+	}
+	if verifiedAt > 0 {
+		m["realname_verified_at"] = verifiedAt
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return jsonStr, fmt.Errorf("oidc: marshal patched LoginRespJSON: %w", err)
+	}
+	return string(b), nil
 }
 
 // writeAudit best-effort 审计:写失败只记 log,不阻塞调用方。

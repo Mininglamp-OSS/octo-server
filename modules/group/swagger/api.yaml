@@ -1428,6 +1428,16 @@ definitions:
       forbidden_expir_time:
         type: integer
         description: "禁言时长"
+      realname_verified:
+        type: boolean
+        description: "是否已完成 OCTO 实名认证（YUJ-413 Scope B）。与 friend/sync、conversation/sync、loginUserDetailResp、Channel extraMap 字段完全一致。"
+      real_name:
+        type: string
+        description: "权威姓名；未实名时缺省（omitempty）"
+      realname_verified_at:
+        type: integer
+        format: int64
+        description: "实名完成时间 Unix 秒；未实名时缺省"
 
   response:
     type: "object"

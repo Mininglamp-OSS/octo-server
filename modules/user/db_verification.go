@@ -170,3 +170,68 @@ func (d *verificationDB) DeleteByUID(uid string) error {
 	_, err := d.session.DeleteFrom("user_verification").Where("user_id=?", uid).Exec()
 	return err
 }
+
+// VerificationInfo 是对外导出的只读实名信息视图 —— 给其他模块(如 modules/group)
+// 批量回填 response 用。YUJ-413 Scope B 引入:根因报告(YUJ-411 memory
+// 07c6d080)发现 memberDetailResp 和 newChannelRespWithUserDetailResp 都漏下发
+// 实名字段,这些调用方都不应再私有化 verificationDB 结构体,改走本视图。
+//
+// 字段对齐 login / current / friend-sync / conversation-sync 的 wire 协议:
+//
+//	realname_verified    ← (info != nil)
+//	real_name            ← info.RealName
+//	realname_verified_at ← info.RealnameVerifiedAt (Unix 秒)
+type VerificationInfo struct {
+	UID                string
+	RealName           string
+	RealnameVerifiedAt int64 // Unix 秒;未实名 / 时间零值时为 0
+}
+
+// verificationBatchSize 限制单次 `WHERE user_id IN (?)` 的参数数量。
+// MySQL 理论上能吃大 IN list(max_allowed_packet 限制),但对包值大小、SQL
+// 规划器缓存、慢日志解析都不友好;超大群(群成员上限可到 100000,详见
+// modules/group/api.go::membersGet) 有可能一次性把几万个 uid 塞进来,分批
+// 避免 payload 过大 + 单个 round trip 时延过长。
+// 1000 与 UIDTokenCachePrefix 批量刷的同侧批大小一致,熟手值。
+const verificationBatchSize = 1000
+
+// QueryVerificationsByUIDs 批量查询 user_verification 表,返回 uid → *VerificationInfo。
+// 无实名记录的 uid 不会出现在 map 里 —— 调用方把缺失视为未实名
+// (realname_verified=false),与 UserDetailResp / loginUserDetailResp 的 omitempty
+// 语义一致。
+//
+// 实现走 verificationDB.QueryByUIDs(单次 `IN (?)` 查询),每批 1000 uid 以
+// verificationBatchSize 为上限避免超大群(成员上限 100000)一次性打爆 MySQL
+// packet / planner。零 N+1:外部循环次数 = len(uids)/batch,与成员数线性相关,
+// 每批一次 round trip,和 service.GetUserDetails 同模式。
+func QueryVerificationsByUIDs(ctx *config.Context, uids []string) (map[string]*VerificationInfo, error) {
+	if len(uids) == 0 {
+		return map[string]*VerificationInfo{}, nil
+	}
+	db := newVerificationDB(ctx)
+	out := make(map[string]*VerificationInfo, len(uids))
+	for start := 0; start < len(uids); start += verificationBatchSize {
+		end := start + verificationBatchSize
+		if end > len(uids) {
+			end = len(uids)
+		}
+		raw, err := db.QueryByUIDs(uids[start:end])
+		if err != nil {
+			return nil, err
+		}
+		for uid, m := range raw {
+			if m == nil {
+				continue
+			}
+			info := &VerificationInfo{
+				UID:      m.UserID,
+				RealName: m.RealName,
+			}
+			if !m.VerifiedAt.IsZero() {
+				info.RealnameVerifiedAt = m.VerifiedAt.Unix()
+			}
+			out[uid] = info
+		}
+	}
+	return out, nil
+}

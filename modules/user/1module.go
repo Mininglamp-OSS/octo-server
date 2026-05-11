@@ -229,6 +229,23 @@ func newChannelRespWithUserDetailResp(user *UserDetailResp) *model.ChannelResp {
 	if user.BotPluginVersion != "" {
 		extraMap["bot_plugin_version"] = user.BotPluginVersion
 	}
+	// OCTO 实名认证 extraMap 下发（YUJ-413 Scope B）。
+	//
+	// 根因报告 YUJ-411 指出 Android WKSDK 单用户 Channel 的唯一数据源是
+	// /v1/channels/:id/:type → newChannelRespWithUserDetailResp，其结果进
+	// wkChannel.remoteExtraMap。气泡 fallback `from.remoteExtraMap[realname_verified]`
+	// 依赖此处下发；不加就永远读不到。
+	//
+	// 字段名与 friend/sync、conversation/sync、memberDetailResp、loginUserDetailResp
+	// 保持完全一致（snake_case），三端可共用 parser。未实名用户 realname_verified
+	// 仍下发 false（不是 omit），保持与 Web UserDetailResp 顶层字段语义对齐。
+	extraMap["realname_verified"] = user.RealnameVerified
+	if user.RealName != "" {
+		extraMap["real_name"] = user.RealName
+	}
+	if user.RealnameVerifiedAt > 0 {
+		extraMap["realname_verified_at"] = user.RealnameVerifiedAt
+	}
 	resp.Extra = extraMap
 
 	return resp
