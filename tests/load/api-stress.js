@@ -2,7 +2,9 @@ import http from 'k6/http';
 import { check, sleep } from 'k6';
 import { Rate, Trend } from 'k6/metrics';
 
-const BASE_URL = __ENV.API_URL || 'http://localhost:8090';
+const BASE_URL   = __ENV.API_URL   || 'http://localhost:8090';
+const BOT_TOKEN  = __ENV.BOT_TOKEN;
+if (!BOT_TOKEN) { throw new Error('BOT_TOKEN env var is required'); }
 const errorRate = new Rate('errors');
 const loginTrend = new Trend('login_duration');
 
@@ -61,7 +63,7 @@ export function loginTest() {
 
 export function botEventsTest() {
   const res = http.post(`${BASE_URL}/v1/bot/events`, JSON.stringify({ event_id: 0, limit: 10 }), {
-    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer bf_605883eed917f57e7e46b347fe066e9b' },
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${BOT_TOKEN}` },
   });
   check(res, { 'events 200': (r) => r.status === 200 });
   sleep(1);
@@ -72,7 +74,7 @@ export function botSendTest() {
     channel_id: 'f1f2f95f8d324b6ea1ee4b626dfd16b8', channel_type: 2,
     payload: { type: 1, content: `k6 stress ${__VU}-${__ITER}` },
   }), {
-    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer bf_605883eed917f57e7e46b347fe066e9b' },
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${BOT_TOKEN}` },
   });
   check(res, { 'send 200': (r) => r.status === 200 });
   sleep(1);

@@ -21,7 +21,8 @@ import { Counter, Rate, Trend } from 'k6/metrics';
 // ── 配置 ─────────────────────────────────────────────────────────────────────
 
 const BASE_URL   = __ENV.API_URL   || 'http://localhost:8090';
-const BOT_TOKEN  = __ENV.BOT_TOKEN || 'bf_605883eed917f57e7e46b347fe066e9b';
+const BOT_TOKEN  = __ENV.BOT_TOKEN;
+if (!BOT_TOKEN) { throw new Error('BOT_TOKEN env var is required'); }
 const GROUP_ID   = __ENV.GROUP_ID  || 'f1f2f95f8d324b6ea1ee4b626dfd16b8';
 
 // Fix 4: 用 Number() || default 替代 parseInt，避免 NaN 静默传入
