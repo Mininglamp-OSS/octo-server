@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 )
 
@@ -41,6 +42,13 @@ type migrationIDMapping struct {
 // Call this once at startup, before any call to migrate.Exec / module.Setup.
 func RewriteLegacyMigrationIDs(ctx context.Context, db *sql.DB) error {
 	if err := ensureGorpMigrationsTable(ctx, db); err != nil {
+		// gorp_migrations doesn't exist yet — fresh install. sql-migrate
+		// will create the table during the upcoming migrate.Exec call,
+		// and there are no legacy IDs to rewrite, so this is a clean
+		// no-op rather than a startup failure.
+		if errors.Is(err, errTableAbsent) {
+			return nil
+		}
 		return fmt.Errorf("check gorp_migrations existence: %w", err)
 	}
 

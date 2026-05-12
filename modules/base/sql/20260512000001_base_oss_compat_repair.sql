@@ -68,14 +68,24 @@ BEGIN
   DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done = 1;
 
   -- (a) Normalise collation for each listed table (skip if absent or already correct).
+  --
+  -- Note on the lookup form: we use MAX(TABLE_COLLATION) rather than plain
+  -- SELECT … LIMIT 1, and *not* SELECT INTO with a guard. The CONTINUE
+  -- HANDLER FOR NOT FOUND below is shared with the cursor's FETCH, so a
+  -- SELECT INTO that returns zero rows (e.g. when DM_THREAD_ON=false and
+  -- the thread table is absent) would also fire the handler and set
+  -- v_done=1, causing the next FETCH iteration to terminate the loop and
+  -- silently skip every remaining table after the missing one. Aggregating
+  -- with MAX() always returns one row whose value is NULL when the table
+  -- is absent, so the NOT FOUND handler stays exclusive to cursor
+  -- exhaustion.
   OPEN v_cur;
   read_loop: LOOP
     FETCH v_cur INTO v_table;
     IF v_done = 1 THEN LEAVE read_loop; END IF;
-    SELECT TABLE_COLLATION INTO v_collation
+    SELECT MAX(TABLE_COLLATION) INTO v_collation
       FROM information_schema.TABLES
-      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = v_table
-      LIMIT 1;
+      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = v_table;
     IF v_collation IS NOT NULL AND v_collation <> 'utf8mb4_general_ci' THEN
       SET @sql = CONCAT('ALTER TABLE `', v_table, '` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci');
       PREPARE stmt FROM @sql;

@@ -1934,7 +1934,11 @@ INSERT INTO `gorp_migrations` VALUES ('20230906000001_workplace_legacy01.sql','2
 INSERT INTO `gorp_migrations` VALUES ('20240113000001_workplace_legacy01.sql','2026-03-13 18:20:05');
 INSERT INTO `gorp_migrations` VALUES ('20260512000001_base_oss_compat_repair.sql','2026-05-12 00:00:00');
 
--- 118 migrations seeded, 6 thread-* skipped: thread-20260402-01.sql, thread-20260402-02.sql, thread-20260410-01.sql, thread-20260413-01.sql, thread-20260422-01.sql, thread-20260511-01.sql
+-- 119 migrations seeded (118 historical + 20260512000001_base_oss_compat_repair).
+-- 6 thread-* migrations skipped (conditional module — only registers SQLDir
+-- when DM_THREAD_ON=true): 20260402000001_thread_legacy01, 20260402000002_thread_legacy02,
+-- 20260410000001_thread_legacy01, 20260413000001_thread_legacy01,
+-- 20260422000001_thread_legacy01, 20260511000001_thread_legacy01.
 
 SET FOREIGN_KEY_CHECKS = 1;
 SET UNIQUE_CHECKS = 1;
