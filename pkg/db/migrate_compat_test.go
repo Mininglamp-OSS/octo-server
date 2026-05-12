@@ -116,12 +116,14 @@ func TestRewriteLegacyMigrationIDs(t *testing.T) {
 		mustExpectationsMet(t, mock)
 	})
 
-	t.Run("mixed — both old and new present, no rewrite for that pair", func(t *testing.T) {
+	t.Run("mixed — pair A has both old+new (delete old), pair B has only old (rename)", func(t *testing.T) {
 		db, mock := openMock(t)
 		defer db.Close()
 
-		// Pick a second mapping entry so we can demonstrate the partial-rewrite
-		// case: pair A has both old+new (skip), pair B has only old (rewrite).
+		// Pick a second mapping entry so we can demonstrate the two-action
+		// case: pair A has both old+new in the table (we must DELETE the
+		// stale old row so sql-migrate doesn't see it as "unknown"), pair B
+		// has only old (canonical UPDATE rename).
 		var oldB, newB string
 		for k, v := range mapping {
 			if k == oldID {
@@ -140,21 +142,52 @@ func TestRewriteLegacyMigrationIDs(t *testing.T) {
 		mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM gorp_migrations")).
 			WillReturnRows(sqlmock.NewRows([]string{"id"}).
 				AddRow(oldID).
-				AddRow(newID). // pair A already migrated
-				AddRow(oldB))  // pair B still legacy
+				AddRow(newID). // pair A: both present → delete oldID
+				AddRow(oldB))  // pair B: only old → rename to newB
 
 		mock.ExpectBegin()
-		stmt := mock.ExpectPrepare(regexp.QuoteMeta(
+		// Rename path: oldB → newB
+		renameStmt := mock.ExpectPrepare(regexp.QuoteMeta(
 			"UPDATE gorp_migrations SET id = ? WHERE id = ?"))
-		// Only pair B should be rewritten; pair A is skipped because newID
-		// is already present.
-		stmt.ExpectExec().
+		renameStmt.ExpectExec().
 			WithArgs(newB, oldB).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		// Delete path: oldID (pair A's already-superseded legacy row)
+		delStmt := mock.ExpectPrepare(regexp.QuoteMeta(
+			"DELETE FROM gorp_migrations WHERE id = ?"))
+		delStmt.ExpectExec().
+			WithArgs(oldID).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 		mock.ExpectCommit()
 
 		if err := RewriteLegacyMigrationIDs(context.Background(), db); err != nil {
 			t.Fatalf("expected nil for mixed state, got %v", err)
+		}
+		mustExpectationsMet(t, mock)
+	})
+
+	t.Run("both old and new present alone — delete old, no rename", func(t *testing.T) {
+		// Concurrency safety check: if a peer replica raced ahead and
+		// wrote the new ID, our shim must still clean up the stale old
+		// row rather than skip it (which would leave a "ghost" ID that
+		// sql-migrate flags as unknown).
+		db, mock := openMock(t)
+		defer db.Close()
+
+		mock.ExpectQuery(regexp.QuoteMeta(
+			"SELECT TABLE_NAME FROM information_schema.TABLES")).
+			WillReturnRows(sqlmock.NewRows([]string{"TABLE_NAME"}).AddRow("gorp_migrations"))
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM gorp_migrations")).
+			WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(oldID).AddRow(newID))
+
+		mock.ExpectBegin()
+		delStmt := mock.ExpectPrepare(regexp.QuoteMeta(
+			"DELETE FROM gorp_migrations WHERE id = ?"))
+		delStmt.ExpectExec().WithArgs(oldID).WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectCommit()
+
+		if err := RewriteLegacyMigrationIDs(context.Background(), db); err != nil {
+			t.Fatalf("expected nil, got %v", err)
 		}
 		mustExpectationsMet(t, mock)
 	})
@@ -253,7 +286,7 @@ func TestReconcileThreadSchemaRecords(t *testing.T) {
 			WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("some_other_migration.sql"))
 		mock.ExpectBegin()
 		stmt := mock.ExpectPrepare(regexp.QuoteMeta(
-			"INSERT INTO gorp_migrations (id, applied_at) VALUES (?, NOW())"))
+			"INSERT IGNORE INTO gorp_migrations (id, applied_at) VALUES (?, NOW())"))
 		for _, id := range threadModuleMigrationIDs {
 			stmt.ExpectExec().WithArgs(id).WillReturnResult(sqlmock.NewResult(0, 1))
 		}

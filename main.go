@@ -137,20 +137,27 @@ func runAPI(ctx *config.Context) {
 	s.GetRoute().UseGin(wkhttp.SecureCORSOverrideMiddleware(
 		wkhttp.ParseAllowedOrigins(os.Getenv("DM_CORS_ALLOWED_ORIGINS")),
 	))
-	// 兼容老 DB：把 gorp_migrations 里的历史文件名升级到新的时间戳格式。
-	// 必须在 module.Setup（内部调 migrate.Exec）之前，否则 sql-migrate 的
-	// PlanMigration 在见到老 ID 时会 panic "unknown migration in database"。
-	// 幂等：fresh install 表不存在直接 no-op，老 ID 已重写后第二次启动也无操作。
+	// Legacy-database upgrade shim: rewrite the historical filename IDs in
+	// gorp_migrations to the new timestamp-prefixed format before
+	// module.Setup (which internally calls migrate.Exec) runs. Without
+	// this, sql-migrate's PlanMigration stage panics with "unknown
+	// migration in database" the moment it sees an ID that's no longer
+	// on disk. Idempotent: a fresh install (gorp_migrations table absent)
+	// is a clean no-op; restarting an already-rewritten database is also
+	// a no-op.
 	rewriteCtx, rewriteCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	if err := octodb.RewriteLegacyMigrationIDs(rewriteCtx, ctx.DB().DB); err != nil {
 		rewriteCancel()
 		panic(fmt.Errorf("rewrite legacy migration IDs: %w", err))
 	}
-	// 兼容老 snapshot：如果 thread/thread_member/thread_setting 三张表
-	// 是被旧版 init-db.sql 建出来的（gorp_migrations 没有对应的 thread-*
-	// 条目），把那 6 个 migration ID 预填进 gorp_migrations。否则 thread
-	// 模块的 SQLDir 现在是无条件注册，sql-migrate 看 embedded 有但 DB 没
-	// 应用过会去跑 `CREATE TABLE thread`（无 IF NOT EXISTS）→ 1050 panic。
+	// Snapshot-built-thread compatibility: when an older init-db.sql
+	// already created thread / thread_member / thread_setting but
+	// gorp_migrations has no matching thread-* rows, pre-seed those six
+	// IDs. The thread module's SQLDir is now registered unconditionally,
+	// so without this reconciliation sql-migrate would see the embedded
+	// thread migrations as un-applied, try to run `CREATE TABLE thread`
+	// (no IF NOT EXISTS) against an existing table, and panic with
+	// MySQL 1050.
 	if err := octodb.ReconcileThreadSchemaRecords(rewriteCtx, ctx.DB().DB); err != nil {
 		rewriteCancel()
 		panic(fmt.Errorf("reconcile thread schema records: %w", err))

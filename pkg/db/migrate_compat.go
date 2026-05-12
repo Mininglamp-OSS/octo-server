@@ -65,20 +65,35 @@ func RewriteLegacyMigrationIDs(ctx context.Context, db *sql.DB) error {
 		return fmt.Errorf("read gorp_migrations: %w", err)
 	}
 
-	// Build the rewrite set: rows where old is present and new is absent.
-	// Skipping rows where both are present (or where neither is present)
-	// keeps the operation idempotent across restarts and concurrent rollouts.
-	var rewrites [][2]string
+	// Classify each mapping pair into the right action:
+	//
+	//   - only old in table  → UPDATE old → new (the canonical rename)
+	//   - only new in table  → no-op (already migrated)
+	//   - both in table      → DELETE old (a concurrent replica or a
+	//                          previous partial run already wrote new;
+	//                          leaving old behind would make sql-migrate
+	//                          panic with "unknown migration in database"
+	//                          when it sees an ID with no corresponding
+	//                          embedded file)
+	//   - neither in table   → no-op
+	//
+	// Splitting the "both" case out of the original "skip" branch is what
+	// makes the shim safe under partial rollouts — without it, an aborted
+	// or racing rewrite leaves dangling legacy IDs that the next plan
+	// stage chokes on.
+	var renames [][2]string
+	var deletes []string
 	for old, new := range mapping {
 		if !existing[old] {
 			continue
 		}
 		if existing[new] {
+			deletes = append(deletes, old)
 			continue
 		}
-		rewrites = append(rewrites, [2]string{old, new})
+		renames = append(renames, [2]string{old, new})
 	}
-	if len(rewrites) == 0 {
+	if len(renames) == 0 && len(deletes) == 0 {
 		return nil
 	}
 
@@ -88,16 +103,31 @@ func RewriteLegacyMigrationIDs(ctx context.Context, db *sql.DB) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	stmt, err := tx.PrepareContext(ctx, "UPDATE gorp_migrations SET id = ? WHERE id = ?")
-	if err != nil {
-		return fmt.Errorf("prepare: %w", err)
-	}
-	defer stmt.Close()
-
-	for _, pair := range rewrites {
-		if _, err := stmt.ExecContext(ctx, pair[1], pair[0]); err != nil {
-			return fmt.Errorf("rewrite %s → %s: %w", pair[0], pair[1], err)
+	if len(renames) > 0 {
+		stmt, err := tx.PrepareContext(ctx, "UPDATE gorp_migrations SET id = ? WHERE id = ?")
+		if err != nil {
+			return fmt.Errorf("prepare update: %w", err)
 		}
+		for _, pair := range renames {
+			if _, err := stmt.ExecContext(ctx, pair[1], pair[0]); err != nil {
+				stmt.Close()
+				return fmt.Errorf("rewrite %s → %s: %w", pair[0], pair[1], err)
+			}
+		}
+		stmt.Close()
+	}
+	if len(deletes) > 0 {
+		stmt, err := tx.PrepareContext(ctx, "DELETE FROM gorp_migrations WHERE id = ?")
+		if err != nil {
+			return fmt.Errorf("prepare delete: %w", err)
+		}
+		for _, old := range deletes {
+			if _, err := stmt.ExecContext(ctx, old); err != nil {
+				stmt.Close()
+				return fmt.Errorf("delete dangling legacy id %s: %w", old, err)
+			}
+		}
+		stmt.Close()
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit: %w", err)
@@ -202,8 +232,16 @@ func ReconcileThreadSchemaRecords(ctx context.Context, db *sql.DB) error {
 
 	// applied_at is the column gorp_migrations uses; the timestamp marks
 	// "reconciled by shim" so the source of these rows is auditable.
+	//
+	// INSERT IGNORE rather than plain INSERT: two replicas can race past
+	// the loadExistingMigrationIDs check above (both see "no thread-*"
+	// at the same instant), both reach this INSERT, and the second one
+	// would otherwise hit a duplicate primary key on commit. Treating
+	// the dup as "the peer already did the work" is exactly the desired
+	// semantics — by the time we get the IGNORE'd error, the row is
+	// already there and sql-migrate's plan stage will be satisfied.
 	stmt, err := tx.PrepareContext(ctx,
-		"INSERT INTO gorp_migrations (id, applied_at) VALUES (?, NOW())")
+		"INSERT IGNORE INTO gorp_migrations (id, applied_at) VALUES (?, NOW())")
 	if err != nil {
 		return fmt.Errorf("prepare: %w", err)
 	}
