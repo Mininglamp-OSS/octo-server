@@ -1,11 +1,14 @@
 title = "Gitleaks config for octo-server"
 
+[extend]
+useDefault = true
+
 # ── Custom rules: detect project-specific token formats ──────────────────────
 
 [[rules]]
   id = "octo-bot-token"
   description = "OCTO bot token (bf_ + 32 hex chars)"
-  regex = '''bf_[a-f0-9]{32}'''
+  regex = '''\bbf_[A-Fa-f0-9]{32}\b'''
   tags = ["token", "bot"]
 
   [rules.allowlist]
@@ -16,7 +19,7 @@ title = "Gitleaks config for octo-server"
 [[rules]]
   id = "octo-user-api-key"
   description = "OCTO user API key (uk_ + 32 hex chars)"
-  regex = '''uk_[a-f0-9]{32}'''
+  regex = '''\buk_[A-Fa-f0-9]{32}\b'''
   tags = ["token", "api-key"]
 
   [rules.allowlist]
@@ -24,13 +27,20 @@ title = "Gitleaks config for octo-server"
     regexTarget = "match"
     regexes = ['''uk_a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6''']
 
-# ── Global allowlist: only exact known placeholders and RFC test vectors ─────
+# ── Global allowlist: doc placeholders, test fixtures, RFC test vectors ──────
 
 [allowlist]
-  description = "Doc placeholders and RFC test vectors only"
+  description = "Doc placeholders, test fixtures, and RFC test vectors"
   regexTarget = "match"
   regexes = [
     '''YOUR_BOT_TOKEN''',
     '''uk_YOUR_API_KEY''',
     '''dGhlIHNhbXBsZSBub25jZQ==''',
+    '''ghp_SensitiveTokenThatShouldNotBeLogged123''',
+    '''gho_abc123def456''',
+    '''abc12345xyz67890''',
+  ]
+  paths = [
+    '''pkg/wkrsa/rsa_test\.go$''',
+    '''modules/user/api_oauth_test\.go$''',
   ]

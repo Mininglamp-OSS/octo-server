@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Bot API integration tests
 source "$(dirname "$0")/lib.sh"
+: "${BOT_TOKEN:?BOT_TOKEN must be set (e.g. export BOT_TOKEN=bf_...)}"
 reset_counters
 log_section "Bot Tests"
 

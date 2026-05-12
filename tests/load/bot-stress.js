@@ -7,9 +7,9 @@
  * 场景4: 并发消息历史查询    (POST /v1/message/channel/sync)
  *
  * 运行示例:
- *   k6 run tests/load/bot-stress.js
- *   k6 run tests/load/bot-stress.js --env API_URL=http://localhost:8090
- *   k6 run tests/load/bot-stress.js --env VUS_SEND=20 --env VUS_EVENTS=15
+ *   k6 run tests/load/bot-stress.js --env BOT_TOKEN=bf_...
+ *   k6 run tests/load/bot-stress.js --env BOT_TOKEN=bf_... --env API_URL=http://localhost:8090
+ *   k6 run tests/load/bot-stress.js --env BOT_TOKEN=bf_... --env VUS_SEND=20 --env VUS_EVENTS=15
  *
  * 注意: k6 通过 snap 安装时无法访问 /tmp，脚本需放在非 /tmp 目录下运行
  */

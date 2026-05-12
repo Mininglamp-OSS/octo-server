@@ -6,7 +6,7 @@ API_BASE=${API_BASE:-http://localhost:8090}
 TEST_USER=${TEST_USER:-test_user_a}
 TEST_PASS=${TEST_PASS:-testpass123}
 TEST_UID=${TEST_UID:-aee7e220529141bfa5e0ac4a3a3dd40d}
-BOT_TOKEN=${BOT_TOKEN:?"BOT_TOKEN must be set (e.g. export BOT_TOKEN=bf_...)"}
+BOT_TOKEN=${BOT_TOKEN:-}
 BOT_ID=${BOT_ID:-e2e_test_bot}
 GROUP_ID=${GROUP_ID:-f1f2f95f8d324b6ea1ee4b626dfd16b8}
 DEVICE_ID=${DEVICE_ID:-cli-e2e}
