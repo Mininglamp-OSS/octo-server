@@ -11,4 +11,4 @@ CREATE TABLE IF NOT EXISTS `thread_member` (
     PRIMARY KEY (`id`),
     UNIQUE KEY `uk_thread_uid` (`thread_id`, `uid`),
     KEY `idx_uid` (`uid`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='子区成员表';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='子区成员表';

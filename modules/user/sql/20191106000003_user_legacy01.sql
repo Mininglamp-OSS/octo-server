@@ -137,5 +137,5 @@ CREATE TABLE IF NOT EXISTS login_log(
   login_ip    VARCHAR(40) DEFAULT '' NOT NULL COMMENT '最后一次登录ip',
   created_at  timeStamp     not null DEFAULT CURRENT_TIMESTAMP comment '创建时间',
   updated_at  timeStamp     not null DEFAULT CURRENT_TIMESTAMP comment '更新时间'
-) CHARACTER SET utf8mb4;
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
 

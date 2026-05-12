@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS user_verification (
     updated_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '记录更新时间',
     PRIMARY KEY (user_id),
     KEY idx_user_verification_source (source, source_sub)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户实名认证（OCTO 实名链路）';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='用户实名认证（OCTO 实名链路）';
 
 -- +migrate Down
 

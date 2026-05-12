@@ -1,10 +1,9 @@
 -- +migrate Up
--- Re-align app_bot collation with actual DB default (utf8mb4_0900_ai_ci).
--- The previous migration (20260509-01) targeted general_ci based on an incorrect
--- assumption about project default; actual production/test DB default is 0900_ai_ci.
--- This ensures app_bot JOINs with space_member (also 0900_ai_ci) work without
--- COLLATE casts. Requires MySQL 8.0+.
-ALTER TABLE app_bot CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+-- No-op: this was a mistaken flip to 0900_ai_ci which 20260510-02 reverted.
+-- The 20260505 CREATE TABLE now pins app_bot to utf8mb4_general_ci from the
+-- start, so neither this nor 20260510-02 need to ALTER anything. The
+-- migration row is preserved so already-applied environments stay in sync.
+SELECT 1;
 
 -- +migrate Down
-ALTER TABLE app_bot CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+SELECT 1;

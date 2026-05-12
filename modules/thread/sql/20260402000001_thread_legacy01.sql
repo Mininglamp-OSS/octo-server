@@ -15,7 +15,7 @@ CREATE TABLE `thread` (
     INDEX `idx_group_no` (`group_no`),
     INDEX `idx_creator` (`creator_uid`),
     INDEX `idx_status` (`status`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='群组子区表';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='群组子区表';
 
 -- +migrate Down
 DROP TABLE IF EXISTS `thread`;

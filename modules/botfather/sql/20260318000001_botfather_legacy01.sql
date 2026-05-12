@@ -8,4 +8,4 @@ CREATE TABLE IF NOT EXISTS `user_api_key` (
   PRIMARY KEY (`id`),
   UNIQUE KEY `uk_api_key` (`api_key`),
   KEY `idx_uid` (`uid`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户API Key';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='用户API Key';

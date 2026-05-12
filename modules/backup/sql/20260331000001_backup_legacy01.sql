@@ -10,7 +10,7 @@ CREATE TABLE `backup_config` (
     data_dir        VARCHAR(512)    NOT NULL DEFAULT '/data/wukongim' COMMENT 'WuKongIM数据目录',
     created_at      TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at      TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='备份配置表';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='备份配置表';
 
 -- backup_history 备份历史表
 CREATE TABLE `backup_history` (
@@ -28,7 +28,7 @@ CREATE TABLE `backup_history` (
     INDEX idx_backup_id (backup_id),
     INDEX idx_status (status),
     INDEX idx_created_at (created_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='备份历史表';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='备份历史表';
 
 -- +migrate Down
 DROP TABLE IF EXISTS `backup_history`;

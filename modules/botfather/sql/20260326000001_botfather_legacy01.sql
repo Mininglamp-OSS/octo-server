@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS `robot_apply` (
   UNIQUE KEY `uk_uid_robot_pending` (`uid`, `robot_uid`, `status`),
   KEY `idx_owner_status` (`owner_uid`, `status`),
   KEY `idx_robot_status` (`robot_uid`, `status`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Bot 好友申请记录';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='Bot 好友申请记录';
 
 -- 已有表补加 space_id 列（IF NOT EXISTS 需要存储过程包装）
 SET @col_exists = (SELECT COUNT(*) FROM information_schema.columns

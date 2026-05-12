@@ -148,14 +148,14 @@ DROP TABLE IF EXISTS `backup_config`;
 CREATE TABLE `backup_config` (
   `id` int NOT NULL AUTO_INCREMENT,
   `enabled` tinyint(1) NOT NULL DEFAULT '0' COMMENT '是否启用备份',
-  `prefix` varchar(128) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'backup/' COMMENT '备份路径前缀',
-  `cron_expr` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '0 2 * * *' COMMENT 'cron表达式',
+  `prefix` varchar(128) COLLATE utf8mb4_general_ci NOT NULL DEFAULT 'backup/' COMMENT '备份路径前缀',
+  `cron_expr` varchar(64) COLLATE utf8mb4_general_ci NOT NULL DEFAULT '0 2 * * *' COMMENT 'cron表达式',
   `retention_count` int NOT NULL DEFAULT '7' COMMENT '保留备份数量',
-  `data_dir` varchar(512) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '/data/wukongim' COMMENT 'WuKongIM数据目录',
+  `data_dir` varchar(512) COLLATE utf8mb4_general_ci NOT NULL DEFAULT '/data/wukongim' COMMENT 'WuKongIM数据目录',
   `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='备份配置表';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='备份配置表';
 
 --
 -- Table structure for table `backup_history`
@@ -164,21 +164,21 @@ CREATE TABLE `backup_config` (
 DROP TABLE IF EXISTS `backup_history`;
 CREATE TABLE `backup_history` (
   `id` int NOT NULL AUTO_INCREMENT,
-  `backup_id` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '备份ID (UUID)',
-  `status` varchar(16) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'pending' COMMENT '状态: pending/running/success/failed',
-  `file_name` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '' COMMENT '备份文件名',
+  `backup_id` varchar(64) COLLATE utf8mb4_general_ci NOT NULL COMMENT '备份ID (UUID)',
+  `status` varchar(16) COLLATE utf8mb4_general_ci NOT NULL DEFAULT 'pending' COMMENT '状态: pending/running/success/failed',
+  `file_name` varchar(255) COLLATE utf8mb4_general_ci NOT NULL DEFAULT '' COMMENT '备份文件名',
   `file_size` bigint NOT NULL DEFAULT '0' COMMENT '文件大小 (bytes)',
-  `storage_path` varchar(512) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '' COMMENT '存储路径',
+  `storage_path` varchar(512) COLLATE utf8mb4_general_ci NOT NULL DEFAULT '' COMMENT '存储路径',
   `started_at` datetime DEFAULT NULL COMMENT '开始时间',
   `finished_at` datetime DEFAULT NULL COMMENT '完成时间',
-  `error_message` text COLLATE utf8mb4_unicode_ci COMMENT '错误信息',
+  `error_message` text COLLATE utf8mb4_general_ci COMMENT '错误信息',
   `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
   KEY `idx_backup_id` (`backup_id`),
   KEY `idx_status` (`status`),
   KEY `idx_created_at` (`created_at`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='备份历史表';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='备份历史表';
 
 --
 -- Table structure for table `channel_offset`
@@ -675,7 +675,7 @@ CREATE TABLE `login_log` (
   `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   `updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '更新时间',
   PRIMARY KEY (`id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 --
 -- Table structure for table `member_readed`
@@ -945,7 +945,7 @@ CREATE TABLE `oidc_audit_log` (
   PRIMARY KEY (`id`),
   KEY `idx_uid_time` (`uid`,`created_at`),
   KEY `idx_event_time` (`event`,`created_at`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 --
 -- Table structure for table `pinned_message`
@@ -1100,7 +1100,7 @@ CREATE TABLE `robot` (
   `app_id` varchar(40) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL DEFAULT '' COMMENT '机器人所属app id',
   `creator_uid` varchar(40) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL DEFAULT '' COMMENT '创建者UID',
   `description` varchar(500) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL DEFAULT '' COMMENT '机器人描述',
-  `bot_token` varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL DEFAULT '' COMMENT 'Bot认证Token(bf_前缀)',
+  `bot_token` varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci DEFAULT NULL COMMENT 'Bot认证Token(bf_前缀)',
   `im_token_cache` varchar(200) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL DEFAULT '' COMMENT '缓存的IM Token',
   `bot_commands` varchar(1000) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL DEFAULT '' COMMENT '机器人命令列表JSON',
   `auto_approve` tinyint NOT NULL DEFAULT '0' COMMENT '是否自动通过好友申请 0:否 1:是',
@@ -1109,7 +1109,7 @@ CREATE TABLE `robot` (
   `plugin_version` varchar(50) COLLATE utf8mb4_general_ci DEFAULT '' COMMENT 'DMWork 插件版本号（最后一次注册时上报）',
   PRIMARY KEY (`id`),
   UNIQUE KEY `robot_id_robot_index` (`robot_id`),
-  UNIQUE KEY `idx_robot_bot_token` (`bot_token`),
+  KEY `idx_robot_bot_token` (`bot_token`),
   KEY `idx_robot_creator_uid` (`creator_uid`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
@@ -1120,11 +1120,11 @@ CREATE TABLE `robot` (
 DROP TABLE IF EXISTS `robot_apply`;
 CREATE TABLE `robot_apply` (
   `id` bigint unsigned NOT NULL AUTO_INCREMENT,
-  `uid` varchar(40) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '申请人 UID',
-  `robot_uid` varchar(40) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT 'Bot UID',
-  `owner_uid` varchar(40) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT 'Bot Owner UID',
-  `remark` varchar(200) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '' COMMENT '申请备注',
-  `space_id` varchar(100) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '' COMMENT '申请来源 Space',
+  `uid` varchar(40) COLLATE utf8mb4_general_ci NOT NULL COMMENT '申请人 UID',
+  `robot_uid` varchar(40) COLLATE utf8mb4_general_ci NOT NULL COMMENT 'Bot UID',
+  `owner_uid` varchar(40) COLLATE utf8mb4_general_ci NOT NULL COMMENT 'Bot Owner UID',
+  `remark` varchar(200) COLLATE utf8mb4_general_ci NOT NULL DEFAULT '' COMMENT '申请备注',
+  `space_id` varchar(100) COLLATE utf8mb4_general_ci NOT NULL DEFAULT '' COMMENT '申请来源 Space',
   `status` tinyint NOT NULL DEFAULT '0' COMMENT '0=待处理 1=通过 2=拒绝',
   `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -1132,7 +1132,7 @@ CREATE TABLE `robot_apply` (
   UNIQUE KEY `uk_uid_robot_pending` (`uid`,`robot_uid`,`status`),
   KEY `idx_owner_status` (`owner_uid`,`status`),
   KEY `idx_robot_status` (`robot_uid`,`status`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Bot 好友申请记录';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='Bot 好友申请记录';
 
 --
 -- Table structure for table `robot_menu`
@@ -1293,7 +1293,7 @@ CREATE TABLE `space_email_invite` (
   KEY `idx_email_status` (`email`,`status`),
   KEY `idx_space_status` (`space_id`,`status`),
   KEY `idx_created_by` (`created_by`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='空间邮件邀请（owner/member）';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='空间邮件邀请（owner/member）';
 
 --
 -- Table structure for table `space_invitation`
@@ -1363,10 +1363,10 @@ CREATE TABLE `space_member` (
 DROP TABLE IF EXISTS `thread`;
 CREATE TABLE `thread` (
   `id` bigint NOT NULL AUTO_INCREMENT COMMENT '主键ID',
-  `short_id` varchar(32) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '子区独立ID (snowflake)',
-  `group_no` varchar(40) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '父群编号',
-  `name` varchar(100) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '子区名称',
-  `creator_uid` varchar(40) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '创建者UID',
+  `short_id` varchar(32) COLLATE utf8mb4_general_ci NOT NULL COMMENT '子区独立ID (snowflake)',
+  `group_no` varchar(40) COLLATE utf8mb4_general_ci NOT NULL COMMENT '父群编号',
+  `name` varchar(100) COLLATE utf8mb4_general_ci NOT NULL COMMENT '子区名称',
+  `creator_uid` varchar(40) COLLATE utf8mb4_general_ci NOT NULL COMMENT '创建者UID',
   `source_message_id` bigint DEFAULT NULL COMMENT '来源消息ID (可选)',
   `status` tinyint NOT NULL DEFAULT '1' COMMENT '状态: 1=活跃, 2=已归档, 3=已删除',
   `version` bigint NOT NULL DEFAULT '0' COMMENT '版本号',
@@ -1374,12 +1374,12 @@ CREATE TABLE `thread` (
   `updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
   `message_count` bigint NOT NULL DEFAULT '0' COMMENT '消息数量',
   `last_message_at` timestamp NULL DEFAULT NULL COMMENT '最后一条消息时间',
-  `last_message_content` varchar(500) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '' COMMENT '最后一条消息内容',
-  `last_message_sender_uid` varchar(40) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '' COMMENT '最后一条消息发送者UID',
-  `thread_md` text COLLATE utf8mb4_unicode_ci COMMENT '子区 GROUP.md 内容',
+  `last_message_content` varchar(500) COLLATE utf8mb4_general_ci NOT NULL DEFAULT '' COMMENT '最后一条消息内容',
+  `last_message_sender_uid` varchar(40) COLLATE utf8mb4_general_ci NOT NULL DEFAULT '' COMMENT '最后一条消息发送者UID',
+  `thread_md` text COLLATE utf8mb4_general_ci COMMENT '子区 GROUP.md 内容',
   `thread_md_version` bigint NOT NULL DEFAULT '0' COMMENT '子区 GROUP.md 版本号（每次更新自增）',
   `thread_md_updated_at` timestamp NULL DEFAULT NULL COMMENT '子区 GROUP.md 最后更新时间',
-  `thread_md_updated_by` varchar(40) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '' COMMENT '子区 GROUP.md 最后更新者 UID',
+  `thread_md_updated_by` varchar(40) COLLATE utf8mb4_general_ci NOT NULL DEFAULT '' COMMENT '子区 GROUP.md 最后更新者 UID',
   PRIMARY KEY (`id`),
   UNIQUE KEY `uk_short_id` (`short_id`),
   UNIQUE KEY `uk_group_short` (`group_no`,`short_id`),
@@ -1387,7 +1387,7 @@ CREATE TABLE `thread` (
   KEY `idx_creator` (`creator_uid`),
   KEY `idx_status` (`status`),
   KEY `idx_status_last_msg_id` (`status`,`last_message_at`,`id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='群组子区表';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='群组子区表';
 
 --
 -- Table structure for table `thread_member`
@@ -1397,7 +1397,7 @@ DROP TABLE IF EXISTS `thread_member`;
 CREATE TABLE `thread_member` (
   `id` bigint unsigned NOT NULL AUTO_INCREMENT,
   `thread_id` bigint unsigned NOT NULL COMMENT '子区ID',
-  `uid` varchar(40) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '用户UID',
+  `uid` varchar(40) COLLATE utf8mb4_general_ci NOT NULL COMMENT '用户UID',
   `role` tinyint NOT NULL DEFAULT '0' COMMENT '角色: 0=普通成员, 1=创建者',
   `version` bigint NOT NULL DEFAULT '0' COMMENT '版本号',
   `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -1405,7 +1405,7 @@ CREATE TABLE `thread_member` (
   PRIMARY KEY (`id`),
   UNIQUE KEY `uk_thread_uid` (`thread_id`,`uid`),
   KEY `idx_uid` (`uid`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='子区成员表';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='子区成员表';
 
 --
 -- Table structure for table `thread_setting`
@@ -1424,7 +1424,7 @@ CREATE TABLE `thread_setting` (
   PRIMARY KEY (`id`),
   UNIQUE KEY `uk_thread_uid` (`group_no`,`short_id`,`uid`),
   KEY `idx_uid` (`uid`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='子区用户设置表';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='子区用户设置表';
 
 --
 -- Table structure for table `user`
@@ -1497,7 +1497,7 @@ CREATE TABLE `user_api_key` (
   PRIMARY KEY (`id`),
   UNIQUE KEY `uk_api_key` (`api_key`),
   KEY `idx_uid` (`uid`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='用户API Key';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='用户API Key';
 
 --
 -- Table structure for table `user_last_offset`
@@ -1557,7 +1557,7 @@ CREATE TABLE `user_oidc_identity` (
   UNIQUE KEY `uk_issuer_subject` (`issuer`,`subject`),
   KEY `idx_uid` (`uid`),
   KEY `idx_email` (`email`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 --
 -- Table structure for table `user_oidc_refresh`
@@ -1578,7 +1578,7 @@ CREATE TABLE `user_oidc_refresh` (
   UNIQUE KEY `uk_token_hash` (`token_hash`),
   KEY `idx_identity` (`identity_id`),
   KEY `idx_expires` (`expires_at`,`revoked_at`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 --
 -- Table structure for table `user_online`
@@ -1618,7 +1618,7 @@ CREATE TABLE `user_pinned_channel` (
   UNIQUE KEY `uk_user_space_channel` (`uid`,`space_id`,`channel_id`,`channel_type`),
   KEY `idx_uid_space_sort` (`uid`,`space_id`,`sort_order`),
   KEY `idx_channel` (`channel_id`,`channel_type`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='用户置顶频道（Space隔离）';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='用户置顶频道（Space隔离）';
 
 --
 -- Table structure for table `user_red_dot`
@@ -1683,7 +1683,7 @@ CREATE TABLE `user_verification` (
   `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '记录更新时间',
   PRIMARY KEY (`user_id`),
   KEY `idx_user_verification_source` (`source`,`source_sub`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='用户实名认证（OCTO 实名链路）';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='用户实名认证（OCTO 实名链路）';
 
 --
 -- Table structure for table `user_voice_context`
@@ -1700,7 +1700,7 @@ CREATE TABLE `user_voice_context` (
   `updated_by` varchar(100) NOT NULL COMMENT '设置该上下文的 bot id 或 user uid',
   PRIMARY KEY (`id`),
   UNIQUE KEY `uk_uid_space` (`uid`,`space_id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='用户语音纠错上下文';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='用户语音纠错上下文';
 
 --
 -- Table structure for table `workplace_app`
@@ -1814,124 +1814,124 @@ CREATE TABLE `workplace_user_app` (
 -- gorp_migrations seed (thread-* filtered out — conditional module)
 -- ============================================================
 
-INSERT INTO `gorp_migrations` VALUES ('app-20201103-01.sql','2026-03-13 18:20:02');
-INSERT INTO `gorp_migrations` VALUES ('app-20230912-01.sql','2026-03-13 18:20:02');
-INSERT INTO `gorp_migrations` VALUES ('app_bot-20260505-01.sql','2026-05-09 11:56:41');
-INSERT INTO `gorp_migrations` VALUES ('app_bot-20260508-01.sql','2026-05-09 11:56:41');
-INSERT INTO `gorp_migrations` VALUES ('app_bot-20260509-01.sql','2026-05-09 12:39:27');
-INSERT INTO `gorp_migrations` VALUES ('app_bot-20260510-01.sql','2026-05-10 17:55:01');
-INSERT INTO `gorp_migrations` VALUES ('app_bot-20260510-02.sql','2026-05-10 18:29:26');
-INSERT INTO `gorp_migrations` VALUES ('backup-20260331-01.sql','2026-03-31 18:40:48');
-INSERT INTO `gorp_migrations` VALUES ('backup-20260401-01.sql','2026-04-01 14:28:55');
-INSERT INTO `gorp_migrations` VALUES ('botfather-20260226-01.sql','2026-03-13 18:20:02');
-INSERT INTO `gorp_migrations` VALUES ('botfather-20260318-01.sql','2026-03-18 16:42:51');
-INSERT INTO `gorp_migrations` VALUES ('botfather-20260318-02.sql','2026-03-18 18:00:22');
-INSERT INTO `gorp_migrations` VALUES ('botfather-20260324-01.sql','2026-03-25 08:54:37');
-INSERT INTO `gorp_migrations` VALUES ('botfather-20260326-01.sql','2026-03-26 20:35:39');
-INSERT INTO `gorp_migrations` VALUES ('botfather-20260417-01.sql','2026-04-18 16:33:54');
-INSERT INTO `gorp_migrations` VALUES ('bot_api-20260505.sql','2026-05-09 11:56:41');
-INSERT INTO `gorp_migrations` VALUES ('category-20260403-01.sql','2026-04-08 14:22:29');
-INSERT INTO `gorp_migrations` VALUES ('category-20260415-01.sql','2026-04-15 17:08:50');
-INSERT INTO `gorp_migrations` VALUES ('category-20260416-01.sql','2026-04-16 16:19:09');
-INSERT INTO `gorp_migrations` VALUES ('category-20260418-01.sql','2026-04-18 16:33:54');
-INSERT INTO `gorp_migrations` VALUES ('category-20260428-01.sql','2026-04-29 01:57:01');
-INSERT INTO `gorp_migrations` VALUES ('channel-20221124-01.sql','2026-03-13 18:20:02');
-INSERT INTO `gorp_migrations` VALUES ('channel-20230920-01.sql','2026-03-13 18:20:02');
-INSERT INTO `gorp_migrations` VALUES ('channel-20240515-01.sql','2026-03-13 18:20:02');
-INSERT INTO `gorp_migrations` VALUES ('common-20210421-01.sql','2026-03-13 18:20:02');
-INSERT INTO `gorp_migrations` VALUES ('common-20210818-01.sql','2026-03-13 18:20:02');
-INSERT INTO `gorp_migrations` VALUES ('common-20211108-01.sql','2026-03-13 18:20:02');
-INSERT INTO `gorp_migrations` VALUES ('common-20220908-01.sql','2026-03-13 18:20:02');
-INSERT INTO `gorp_migrations` VALUES ('common-20220916-01.sql','2026-03-13 18:20:02');
-INSERT INTO `gorp_migrations` VALUES ('common-20220917-01.sql','2026-03-13 18:20:02');
-INSERT INTO `gorp_migrations` VALUES ('common-20221111-01.sql','2026-03-13 18:20:02');
-INSERT INTO `gorp_migrations` VALUES ('common-20221114-01.sql','2026-03-13 18:20:02');
-INSERT INTO `gorp_migrations` VALUES ('common-20230203-01.sql','2026-03-13 18:20:02');
-INSERT INTO `gorp_migrations` VALUES ('common-20240418-01.sql','2026-03-13 18:20:02');
-INSERT INTO `gorp_migrations` VALUES ('common-20240506-01.sql','2026-03-13 18:20:02');
-INSERT INTO `gorp_migrations` VALUES ('common-20240510-01.sql','2026-03-13 18:20:02');
-INSERT INTO `gorp_migrations` VALUES ('common-20240528-01.sql','2026-03-13 18:20:02');
-INSERT INTO `gorp_migrations` VALUES ('common-20260408-01.sql','2026-04-08 18:23:27');
-INSERT INTO `gorp_migrations` VALUES ('common-20260427-01.sql','2026-04-27 14:21:16');
-INSERT INTO `gorp_migrations` VALUES ('event-20191106-01.sql','2026-03-13 18:20:02');
-INSERT INTO `gorp_migrations` VALUES ('event-20250423-01.sql','2026-03-13 18:20:02');
-INSERT INTO `gorp_migrations` VALUES ('group_20191106-01.sql','2026-03-13 18:20:03');
-INSERT INTO `gorp_migrations` VALUES ('group_20211202-02.sql','2026-03-13 18:20:03');
-INSERT INTO `gorp_migrations` VALUES ('group_20220411-01.sql','2026-03-13 18:20:03');
-INSERT INTO `gorp_migrations` VALUES ('group_20220815-01.sql','2026-03-13 18:20:03');
-INSERT INTO `gorp_migrations` VALUES ('group_20220818-01.sql','2026-03-13 18:20:03');
-INSERT INTO `gorp_migrations` VALUES ('group_20220830-01.sql','2026-03-13 18:20:03');
-INSERT INTO `gorp_migrations` VALUES ('group_20231123-01.sql','2026-03-13 18:20:03');
-INSERT INTO `gorp_migrations` VALUES ('group_20240510-01.sql','2026-03-13 18:20:03');
-INSERT INTO `gorp_migrations` VALUES ('group_20260318-01.sql','2026-03-20 22:10:20');
-INSERT INTO `gorp_migrations` VALUES ('group_20260424-01.sql','2026-04-25 09:42:12');
-INSERT INTO `gorp_migrations` VALUES ('group_20260425-01.sql','2026-04-25 13:19:20');
-INSERT INTO `gorp_migrations` VALUES ('message-20210305-01.sql','2026-03-13 18:20:03');
-INSERT INTO `gorp_migrations` VALUES ('message-20210407-01.sql','2026-03-13 18:20:03');
-INSERT INTO `gorp_migrations` VALUES ('message-20210416-01.sql','2026-03-13 18:20:03');
-INSERT INTO `gorp_migrations` VALUES ('message-20210813-01.sql','2026-03-13 18:20:03');
-INSERT INTO `gorp_migrations` VALUES ('message-20211027-01.sql','2026-03-13 18:20:03');
-INSERT INTO `gorp_migrations` VALUES ('message-20220414-01.sql','2026-03-13 18:20:03');
-INSERT INTO `gorp_migrations` VALUES ('message-20220418-01.sql','2026-03-13 18:20:03');
-INSERT INTO `gorp_migrations` VALUES ('message-20220422-01.sql','2026-03-13 18:20:03');
-INSERT INTO `gorp_migrations` VALUES ('message-20220801-01.sql','2026-03-13 18:20:03');
-INSERT INTO `gorp_migrations` VALUES ('message-20220810-01.sql','2026-03-13 18:20:03');
-INSERT INTO `gorp_migrations` VALUES ('message-20221122-01.sql','2026-03-13 18:20:03');
-INSERT INTO `gorp_migrations` VALUES ('message-20240510-01.sql','2026-03-13 18:20:03');
-INSERT INTO `gorp_migrations` VALUES ('message-20250624-01.sql','2026-03-13 18:20:03');
-INSERT INTO `gorp_migrations` VALUES ('oidc-20260427-01.sql','2026-04-27 15:11:19');
-INSERT INTO `gorp_migrations` VALUES ('oidc-20260428-01.sql','2026-04-28 11:45:21');
-INSERT INTO `gorp_migrations` VALUES ('report-202012221237-01.sql','2026-03-13 18:20:03');
-INSERT INTO `gorp_migrations` VALUES ('report-202211291659-01.sql','2026-03-13 18:20:03');
-INSERT INTO `gorp_migrations` VALUES ('robot-20210926-01.sql','2026-03-13 18:20:03');
-INSERT INTO `gorp_migrations` VALUES ('robot-20211026-01.sql','2026-03-13 18:20:03');
-INSERT INTO `gorp_migrations` VALUES ('robot-20211105-01.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('robot-20260226-01.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('robot-20260307-01.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('robot-20260308-01.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('robot-20260309-01.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('space-20260307-01.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('space-20260307-02.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('space-20260307-03.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('space-20260308-01.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('space-20260308-02.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('space-20260308-03.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('space-20260310-01.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('space-20260310-02.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('space-20260410-01.sql','2026-04-10 18:51:04');
-INSERT INTO `gorp_migrations` VALUES ('space-20260410-02.sql','2026-04-10 18:51:04');
-INSERT INTO `gorp_migrations` VALUES ('space-20260423-01.sql','2026-04-23 16:36:23');
-INSERT INTO `gorp_migrations` VALUES ('space-20260424-01.sql','2026-04-27 13:06:25');
-INSERT INTO `gorp_migrations` VALUES ('user-20191106-01.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('user-20210204-01.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('user-20210405-01.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('user-20210413-01.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('user-20210907-01.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('user-20210916-01.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('user-20211115-01.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('user-20220222-01.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('user-20220609-01.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('user-20220713-01.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('user-20220816-01.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('user-20220906-01.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('user-20220919-01.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('user-20230611-01.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('user-20230911-01.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('user-20230924-01.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('user-20231127-01.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('user-20260228-01.sql','2026-03-13 18:20:04');
-INSERT INTO `gorp_migrations` VALUES ('user-20260305-01.sql','2026-03-13 18:20:05');
-INSERT INTO `gorp_migrations` VALUES ('user-20260424-01.sql','2026-04-24 18:16:36');
-INSERT INTO `gorp_migrations` VALUES ('user-20260427-01.sql','2026-04-27 14:21:16');
-INSERT INTO `gorp_migrations` VALUES ('user-20260505-01.sql','2026-05-06 00:24:02');
-INSERT INTO `gorp_migrations` VALUES ('user-20260510-01.sql','2026-05-10 22:38:02');
-INSERT INTO `gorp_migrations` VALUES ('voice-20260409-01.sql','2026-04-10 14:08:59');
-INSERT INTO `gorp_migrations` VALUES ('webhook-20210226-01.sql','2026-03-13 18:20:05');
-INSERT INTO `gorp_migrations` VALUES ('webhook-20230920-01.sql','2026-03-13 18:20:05');
-INSERT INTO `gorp_migrations` VALUES ('webhook-20241217-01.sql','2026-03-13 18:20:05');
-INSERT INTO `gorp_migrations` VALUES ('workplace-20230823-01.sql','2026-03-13 18:20:05');
-INSERT INTO `gorp_migrations` VALUES ('workplace-20230906-01.sql','2026-03-13 18:20:05');
-INSERT INTO `gorp_migrations` VALUES ('workplace-20240113-01.sql','2026-03-13 18:20:05');
+INSERT INTO `gorp_migrations` VALUES ('20201103000001_app_legacy01.sql','2026-03-13 18:20:02');
+INSERT INTO `gorp_migrations` VALUES ('20230912000001_app_legacy01.sql','2026-03-13 18:20:02');
+INSERT INTO `gorp_migrations` VALUES ('20260505000001_app_bot_legacy01.sql','2026-05-09 11:56:41');
+INSERT INTO `gorp_migrations` VALUES ('20260508000001_app_bot_legacy01.sql','2026-05-09 11:56:41');
+INSERT INTO `gorp_migrations` VALUES ('20260509000001_app_bot_legacy01.sql','2026-05-09 12:39:27');
+INSERT INTO `gorp_migrations` VALUES ('20260510000001_app_bot_legacy01.sql','2026-05-10 17:55:01');
+INSERT INTO `gorp_migrations` VALUES ('20260510000002_app_bot_legacy02.sql','2026-05-10 18:29:26');
+INSERT INTO `gorp_migrations` VALUES ('20260331000001_backup_legacy01.sql','2026-03-31 18:40:48');
+INSERT INTO `gorp_migrations` VALUES ('20260401000001_backup_legacy01.sql','2026-04-01 14:28:55');
+INSERT INTO `gorp_migrations` VALUES ('20260226000001_botfather_legacy01.sql','2026-03-13 18:20:02');
+INSERT INTO `gorp_migrations` VALUES ('20260318000001_botfather_legacy01.sql','2026-03-18 16:42:51');
+INSERT INTO `gorp_migrations` VALUES ('20260318000002_botfather_legacy02.sql','2026-03-18 18:00:22');
+INSERT INTO `gorp_migrations` VALUES ('20260324000001_botfather_legacy01.sql','2026-03-25 08:54:37');
+INSERT INTO `gorp_migrations` VALUES ('20260326000001_botfather_legacy01.sql','2026-03-26 20:35:39');
+INSERT INTO `gorp_migrations` VALUES ('20260417000001_botfather_legacy01.sql','2026-04-18 16:33:54');
+INSERT INTO `gorp_migrations` VALUES ('20260505000002_bot_api.sql','2026-05-09 11:56:41');
+INSERT INTO `gorp_migrations` VALUES ('20260403000001_category_legacy01.sql','2026-04-08 14:22:29');
+INSERT INTO `gorp_migrations` VALUES ('20260415000001_category_legacy01.sql','2026-04-15 17:08:50');
+INSERT INTO `gorp_migrations` VALUES ('20260416000001_category_legacy01.sql','2026-04-16 16:19:09');
+INSERT INTO `gorp_migrations` VALUES ('20260418000001_category_legacy01.sql','2026-04-18 16:33:54');
+INSERT INTO `gorp_migrations` VALUES ('20260428000001_category_legacy01.sql','2026-04-29 01:57:01');
+INSERT INTO `gorp_migrations` VALUES ('20221124000001_channel_legacy01.sql','2026-03-13 18:20:02');
+INSERT INTO `gorp_migrations` VALUES ('20230920000001_channel_legacy01.sql','2026-03-13 18:20:02');
+INSERT INTO `gorp_migrations` VALUES ('20240515000001_channel_legacy01.sql','2026-03-13 18:20:02');
+INSERT INTO `gorp_migrations` VALUES ('20210421000001_common_legacy01.sql','2026-03-13 18:20:02');
+INSERT INTO `gorp_migrations` VALUES ('20210818000001_common_legacy01.sql','2026-03-13 18:20:02');
+INSERT INTO `gorp_migrations` VALUES ('20211108000001_common_legacy01.sql','2026-03-13 18:20:02');
+INSERT INTO `gorp_migrations` VALUES ('20220908000001_common_legacy01.sql','2026-03-13 18:20:02');
+INSERT INTO `gorp_migrations` VALUES ('20220916000001_common_legacy01.sql','2026-03-13 18:20:02');
+INSERT INTO `gorp_migrations` VALUES ('20220917000001_common_legacy01.sql','2026-03-13 18:20:02');
+INSERT INTO `gorp_migrations` VALUES ('20221111000001_common_legacy01.sql','2026-03-13 18:20:02');
+INSERT INTO `gorp_migrations` VALUES ('20221114000001_common_legacy01.sql','2026-03-13 18:20:02');
+INSERT INTO `gorp_migrations` VALUES ('20230203000001_common_legacy01.sql','2026-03-13 18:20:02');
+INSERT INTO `gorp_migrations` VALUES ('20240418000001_common_legacy01.sql','2026-03-13 18:20:02');
+INSERT INTO `gorp_migrations` VALUES ('20240506000001_common_legacy01.sql','2026-03-13 18:20:02');
+INSERT INTO `gorp_migrations` VALUES ('20240510000001_common_legacy01.sql','2026-03-13 18:20:02');
+INSERT INTO `gorp_migrations` VALUES ('20240528000001_common_legacy01.sql','2026-03-13 18:20:02');
+INSERT INTO `gorp_migrations` VALUES ('20260408000001_common_legacy01.sql','2026-04-08 18:23:27');
+INSERT INTO `gorp_migrations` VALUES ('20260427000001_common_legacy01.sql','2026-04-27 14:21:16');
+INSERT INTO `gorp_migrations` VALUES ('20191106000001_event_legacy01.sql','2026-03-13 18:20:02');
+INSERT INTO `gorp_migrations` VALUES ('20250423000001_event_legacy01.sql','2026-03-13 18:20:02');
+INSERT INTO `gorp_migrations` VALUES ('20191106000002_group_legacy01.sql','2026-03-13 18:20:03');
+INSERT INTO `gorp_migrations` VALUES ('20211202000001_group_legacy02.sql','2026-03-13 18:20:03');
+INSERT INTO `gorp_migrations` VALUES ('20220411000001_group_legacy01.sql','2026-03-13 18:20:03');
+INSERT INTO `gorp_migrations` VALUES ('20220815000001_group_legacy01.sql','2026-03-13 18:20:03');
+INSERT INTO `gorp_migrations` VALUES ('20220818000001_group_legacy01.sql','2026-03-13 18:20:03');
+INSERT INTO `gorp_migrations` VALUES ('20220830000001_group_legacy01.sql','2026-03-13 18:20:03');
+INSERT INTO `gorp_migrations` VALUES ('20231123000001_group_legacy01.sql','2026-03-13 18:20:03');
+INSERT INTO `gorp_migrations` VALUES ('20240510000002_group_legacy01.sql','2026-03-13 18:20:03');
+INSERT INTO `gorp_migrations` VALUES ('20260318000003_group_legacy01.sql','2026-03-20 22:10:20');
+INSERT INTO `gorp_migrations` VALUES ('20260424000001_group_legacy01.sql','2026-04-25 09:42:12');
+INSERT INTO `gorp_migrations` VALUES ('20260425000001_group_legacy01.sql','2026-04-25 13:19:20');
+INSERT INTO `gorp_migrations` VALUES ('20210305000001_message_legacy01.sql','2026-03-13 18:20:03');
+INSERT INTO `gorp_migrations` VALUES ('20210407000001_message_legacy01.sql','2026-03-13 18:20:03');
+INSERT INTO `gorp_migrations` VALUES ('20210416000001_message_legacy01.sql','2026-03-13 18:20:03');
+INSERT INTO `gorp_migrations` VALUES ('20210813000001_message_legacy01.sql','2026-03-13 18:20:03');
+INSERT INTO `gorp_migrations` VALUES ('20211027000001_message_legacy01.sql','2026-03-13 18:20:03');
+INSERT INTO `gorp_migrations` VALUES ('20220414000001_message_legacy01.sql','2026-03-13 18:20:03');
+INSERT INTO `gorp_migrations` VALUES ('20220418000001_message_legacy01.sql','2026-03-13 18:20:03');
+INSERT INTO `gorp_migrations` VALUES ('20220422000001_message_legacy01.sql','2026-03-13 18:20:03');
+INSERT INTO `gorp_migrations` VALUES ('20220801000001_message_legacy01.sql','2026-03-13 18:20:03');
+INSERT INTO `gorp_migrations` VALUES ('20220810000001_message_legacy01.sql','2026-03-13 18:20:03');
+INSERT INTO `gorp_migrations` VALUES ('20221122000001_message_legacy01.sql','2026-03-13 18:20:03');
+INSERT INTO `gorp_migrations` VALUES ('20240510000003_message_legacy01.sql','2026-03-13 18:20:03');
+INSERT INTO `gorp_migrations` VALUES ('20250624000001_message_legacy01.sql','2026-03-13 18:20:03');
+INSERT INTO `gorp_migrations` VALUES ('20260427000002_oidc_legacy01.sql','2026-04-27 15:11:19');
+INSERT INTO `gorp_migrations` VALUES ('20260428000002_oidc_legacy01.sql','2026-04-28 11:45:21');
+INSERT INTO `gorp_migrations` VALUES ('20201222000001_report_legacy01.sql','2026-03-13 18:20:03');
+INSERT INTO `gorp_migrations` VALUES ('20221129000001_report_legacy01.sql','2026-03-13 18:20:03');
+INSERT INTO `gorp_migrations` VALUES ('20210926000001_robot_legacy01.sql','2026-03-13 18:20:03');
+INSERT INTO `gorp_migrations` VALUES ('20211026000001_robot_legacy01.sql','2026-03-13 18:20:03');
+INSERT INTO `gorp_migrations` VALUES ('20211105000001_robot_legacy01.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20260226000002_robot_legacy01.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20260307000001_robot_legacy01.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20260308000001_robot_legacy01.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20260309000001_robot_legacy01.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20260307000002_space_legacy01.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20260307000003_space_legacy02.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20260307000004_space_legacy03.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20260308000002_space_legacy01.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20260308000003_space_legacy02.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20260308000004_space_legacy03.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20260310000001_space_legacy01.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20260310000002_space_legacy02.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20260410000001_space_legacy01.sql','2026-04-10 18:51:04');
+INSERT INTO `gorp_migrations` VALUES ('20260410000002_space_legacy02.sql','2026-04-10 18:51:04');
+INSERT INTO `gorp_migrations` VALUES ('20260423000001_space_legacy01.sql','2026-04-23 16:36:23');
+INSERT INTO `gorp_migrations` VALUES ('20260424000002_space_legacy01.sql','2026-04-27 13:06:25');
+INSERT INTO `gorp_migrations` VALUES ('20191106000003_user_legacy01.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20210204000001_user_legacy01.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20210405000001_user_legacy01.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20210413000001_user_legacy01.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20210907000001_user_legacy01.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20210916000001_user_legacy01.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20211115000001_user_legacy01.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20220222000001_user_legacy01.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20220609000001_user_legacy01.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20220713000001_user_legacy01.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20220816000001_user_legacy01.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20220906000001_user_legacy01.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20220919000001_user_legacy01.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20230611000001_user_legacy01.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20230911000001_user_legacy01.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20230924000001_user_legacy01.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20231127000001_user_legacy01.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20260228000001_user_legacy01.sql','2026-03-13 18:20:04');
+INSERT INTO `gorp_migrations` VALUES ('20260305000001_user_legacy01.sql','2026-03-13 18:20:05');
+INSERT INTO `gorp_migrations` VALUES ('20260424000003_user_legacy01.sql','2026-04-24 18:16:36');
+INSERT INTO `gorp_migrations` VALUES ('20260427000003_user_legacy01.sql','2026-04-27 14:21:16');
+INSERT INTO `gorp_migrations` VALUES ('20260505000003_user_legacy01.sql','2026-05-06 00:24:02');
+INSERT INTO `gorp_migrations` VALUES ('20260510000003_user_legacy01.sql','2026-05-10 22:38:02');
+INSERT INTO `gorp_migrations` VALUES ('20260409000001_voice_legacy01.sql','2026-04-10 14:08:59');
+INSERT INTO `gorp_migrations` VALUES ('20210226000001_webhook_legacy01.sql','2026-03-13 18:20:05');
+INSERT INTO `gorp_migrations` VALUES ('20230920000002_webhook_legacy01.sql','2026-03-13 18:20:05');
+INSERT INTO `gorp_migrations` VALUES ('20241217000001_webhook_legacy01.sql','2026-03-13 18:20:05');
+INSERT INTO `gorp_migrations` VALUES ('20230823000001_workplace_legacy01.sql','2026-03-13 18:20:05');
+INSERT INTO `gorp_migrations` VALUES ('20230906000001_workplace_legacy01.sql','2026-03-13 18:20:05');
+INSERT INTO `gorp_migrations` VALUES ('20240113000001_workplace_legacy01.sql','2026-03-13 18:20:05');
 
 -- 118 migrations seeded, 6 thread-* skipped: thread-20260402-01.sql, thread-20260402-02.sql, thread-20260410-01.sql, thread-20260413-01.sql, thread-20260422-01.sql, thread-20260511-01.sql
 

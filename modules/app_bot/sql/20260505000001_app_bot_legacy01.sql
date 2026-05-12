@@ -15,4 +15,4 @@ CREATE TABLE IF NOT EXISTS app_bot (
   updated_at   DATETIME NOT NULL DEFAULT NOW() ON UPDATE NOW(),
   INDEX idx_scope_status (scope, status),
   INDEX idx_space_status (space_id, status)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;

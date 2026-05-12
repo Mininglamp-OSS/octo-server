@@ -19,7 +19,7 @@ create table `user_oidc_identity`
     unique key uk_issuer_subject (issuer, subject),
     key idx_uid (uid),
     key idx_email (email)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 -- OIDC Refresh Token 加密存储 (支撑后台状态同步 Worker)
 -- token_ciphertext 容量按 AES-GCM(plaintext)+ 12B nonce + 16B tag 估算,
@@ -43,7 +43,7 @@ create table `user_oidc_refresh`
     unique key uk_token_hash (token_hash),
     key idx_identity (identity_id),
     key idx_expires (expires_at, revoked_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 -- OIDC 登录 / 状态同步审计日志
 create table `oidc_audit_log`
@@ -59,7 +59,7 @@ create table `oidc_audit_log`
     updated_at  timestamp      not null default CURRENT_TIMESTAMP on update CURRENT_TIMESTAMP,
     key idx_uid_time (uid, created_at),
     key idx_event_time (event, created_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 -- +migrate Down
 

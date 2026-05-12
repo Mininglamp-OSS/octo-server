@@ -1,7 +1,9 @@
 -- +migrate Up
--- Align app_bot collation with project default (utf8mb4_general_ci) to avoid
--- "Illegal mix of collations" when JOIN-ing with space_member (general_ci).
-ALTER TABLE app_bot CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+-- No-op: the original 20260505 CREATE TABLE now pins app_bot to
+-- utf8mb4_general_ci explicitly, so this collation realignment is
+-- redundant on clean installs. Kept as a recorded migration so older
+-- environments that already ran this row stay consistent.
+SELECT 1;
 
 -- +migrate Down
-ALTER TABLE app_bot CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+SELECT 1;

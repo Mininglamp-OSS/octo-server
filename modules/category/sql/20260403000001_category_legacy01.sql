@@ -12,7 +12,7 @@ CREATE TABLE `group_category` (
     `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     UNIQUE KEY `uk_category_id` (`category_id`),
     INDEX `idx_uid_space_sort` (`uid`, `space_id`, `sort`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='群组类别表（用户个人视图）';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='群组类别表（用户个人视图）';
 
 ALTER TABLE `group_setting` ADD COLUMN `category_id` VARCHAR(32) DEFAULT NULL COMMENT '用户自定义类别ID';
 ALTER TABLE `group_setting` ADD COLUMN `category_sort` INT NOT NULL DEFAULT 0 COMMENT '类别内排序';

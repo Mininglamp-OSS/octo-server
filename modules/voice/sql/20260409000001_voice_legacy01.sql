@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS `user_voice_context` (
     `updated_by`           VARCHAR(100) NOT NULL COMMENT '设置该上下文的 bot id 或 user uid',
     PRIMARY KEY (`id`),
     UNIQUE KEY `uk_uid_space` (`uid`, `space_id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户语音纠错上下文';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='用户语音纠错上下文';
 
 -- +migrate Down
 DROP TABLE IF EXISTS `user_voice_context`;

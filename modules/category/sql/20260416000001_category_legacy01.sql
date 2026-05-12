@@ -2,8 +2,8 @@
 
 -- 1. 迁移群聊关联：把挂在重复默认分组下的 group_setting 指向保留的分组（MIN(id)）
 UPDATE group_setting gs
-INNER JOIN group_category gc_remove ON gs.category_id = gc_remove.category_id COLLATE utf8mb4_0900_ai_ci
-    AND gs.uid = gc_remove.uid COLLATE utf8mb4_0900_ai_ci
+INNER JOIN group_category gc_remove ON gs.category_id = gc_remove.category_id
+    AND gs.uid = gc_remove.uid
     AND gc_remove.is_default = 1 AND gc_remove.status = 1
 INNER JOIN group_category gc_keep ON gc_keep.uid = gc_remove.uid
     AND gc_keep.space_id = gc_remove.space_id

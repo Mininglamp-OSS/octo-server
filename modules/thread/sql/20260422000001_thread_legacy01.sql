@@ -12,7 +12,7 @@ CREATE TABLE `thread_setting` (
   PRIMARY KEY (`id`),
   UNIQUE KEY `uk_thread_uid` (`group_no`, `short_id`, `uid`),
   KEY `idx_uid` (`uid`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='子区用户设置表';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='子区用户设置表';
 
 -- +migrate Down
 DROP TABLE IF EXISTS `thread_setting`;

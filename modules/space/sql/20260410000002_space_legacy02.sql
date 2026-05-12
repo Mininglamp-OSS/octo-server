@@ -12,4 +12,4 @@ CREATE TABLE IF NOT EXISTS `space_join_apply` (
   PRIMARY KEY (`id`),
   UNIQUE KEY `uk_space_uid` (`space_id`, `uid`),
   KEY `idx_space_status` (`space_id`, `status`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Space加入申请记录';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='Space加入申请记录';
