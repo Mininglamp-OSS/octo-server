@@ -1100,7 +1100,7 @@ CREATE TABLE `robot` (
   `app_id` varchar(40) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL DEFAULT '' COMMENT '机器人所属app id',
   `creator_uid` varchar(40) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL DEFAULT '' COMMENT '创建者UID',
   `description` varchar(500) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL DEFAULT '' COMMENT '机器人描述',
-  `bot_token` varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci DEFAULT NULL COMMENT 'Bot认证Token(bf_前缀)',
+  `bot_token` varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL DEFAULT '' COMMENT 'Bot认证Token(bf_前缀)',
   `im_token_cache` varchar(200) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL DEFAULT '' COMMENT '缓存的IM Token',
   `bot_commands` varchar(1000) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL DEFAULT '' COMMENT '机器人命令列表JSON',
   `auto_approve` tinyint NOT NULL DEFAULT '0' COMMENT '是否自动通过好友申请 0:否 1:是',
@@ -1109,7 +1109,7 @@ CREATE TABLE `robot` (
   `plugin_version` varchar(50) COLLATE utf8mb4_general_ci DEFAULT '' COMMENT 'DMWork 插件版本号（最后一次注册时上报）',
   PRIMARY KEY (`id`),
   UNIQUE KEY `robot_id_robot_index` (`robot_id`),
-  KEY `idx_robot_bot_token` (`bot_token`),
+  UNIQUE KEY `idx_robot_bot_token` ((NULLIF(`bot_token`, _utf8mb4''))),
   KEY `idx_robot_creator_uid` (`creator_uid`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
