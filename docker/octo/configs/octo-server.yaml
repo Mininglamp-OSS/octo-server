@@ -64,3 +64,4 @@ logger:
 register:
   off: true
   onlyChina: false
+  emailOn: false
