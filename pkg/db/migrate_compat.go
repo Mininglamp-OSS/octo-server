@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 )
 
 // migrationIDMapping is the old-filename → new-filename map produced by
@@ -96,6 +97,13 @@ func RewriteLegacyMigrationIDs(ctx context.Context, db *sql.DB) error {
 	if len(renames) == 0 && len(deletes) == 0 {
 		return nil
 	}
+
+	// Sort both lists by the old ID so every replica acquires row locks
+	// in the same order, eliminating a deadlock window during multi-pod
+	// rolling deploys. Map iteration order in Go is randomised, so without
+	// this two pods could pick opposite orders on the same input.
+	sort.Slice(renames, func(i, j int) bool { return renames[i][0] < renames[j][0] })
+	sort.Strings(deletes)
 
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -214,13 +222,25 @@ func ReconcileThreadSchemaRecords(ctx context.Context, db *sql.DB) error {
 	if err != nil {
 		return fmt.Errorf("read gorp_migrations: %w", err)
 	}
+	// Only reconcile the "snapshot install" case — where the schema came
+	// from init-db.sql and gorp_migrations has no record of the thread
+	// module at all. The moment any thread-* row is present, sql-migrate
+	// is already tracking the module: missing rows on top of that mean a
+	// genuine pending migration (e.g. a new ADD INDEX added in a later
+	// release) that must run, not a snapshot gap to paper over. Pre-
+	// seeding only the missing IDs there would silently mark unapplied
+	// schema changes as applied and let sql-migrate skip them, producing
+	// invisible schema drift.
 	var toRecord []string
+	var anyPresent bool
 	for _, id := range threadModuleMigrationIDs {
-		if !existing[id] {
+		if existing[id] {
+			anyPresent = true
+		} else {
 			toRecord = append(toRecord, id)
 		}
 	}
-	if len(toRecord) == 0 {
+	if anyPresent || len(toRecord) == 0 {
 		return nil
 	}
 

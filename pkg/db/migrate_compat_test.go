@@ -297,6 +297,36 @@ func TestReconcileThreadSchemaRecords(t *testing.T) {
 		mustExpectationsMet(t, mock)
 	})
 
+	t.Run("partial state — any thread-* present means sql-migrate owns it, no-op", func(t *testing.T) {
+		// Regression test for the silent-corruption bug: if even one
+		// thread-* row is already in gorp_migrations, sql-migrate is
+		// actively tracking the module. Any *missing* thread-* row is a
+		// genuine unapplied migration (e.g. a future ADD INDEX) and the
+		// shim must NOT pre-seed it — doing so would mark a real DDL as
+		// applied without ever running it.
+		db, mock := openMock(t)
+		defer db.Close()
+		mock.ExpectQuery(probeQuery).
+			WillReturnRows(sqlmock.NewRows([]string{"TABLE_NAME"}).
+				AddRow("thread").AddRow("thread_member").AddRow("thread_setting"))
+		mock.ExpectQuery(regexp.QuoteMeta(
+			"SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'gorp_migrations'")).
+			WillReturnRows(sqlmock.NewRows([]string{"TABLE_NAME"}).AddRow("gorp_migrations"))
+		// Only the first five thread-* rows are recorded; the sixth
+		// (a hypothetical ADD INDEX in a later release) is genuinely
+		// pending and must be left for sql-migrate to apply.
+		rows := sqlmock.NewRows([]string{"id"})
+		for _, id := range threadModuleMigrationIDs[:5] {
+			rows.AddRow(id)
+		}
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM gorp_migrations")).WillReturnRows(rows)
+		// No transaction — the shim must hand control back to sql-migrate.
+		if err := ReconcileThreadSchemaRecords(context.Background(), db); err != nil {
+			t.Fatalf("expected nil for partial state, got %v", err)
+		}
+		mustExpectationsMet(t, mock)
+	})
+
 	t.Run("all tables present, gorp already has all thread-* — no-op", func(t *testing.T) {
 		db, mock := openMock(t)
 		defer db.Close()
