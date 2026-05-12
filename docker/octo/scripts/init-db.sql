@@ -15,13 +15,20 @@
 -- known-good schema per release for OSS users. It is no longer a
 -- workaround for a planner ordering bug.
 --
--- Conditional modules:
---   * thread-* migrations are NOT seeded here. The thread module only
---     registers its SQLDir when DM_THREAD_ON=true, so including thread-*
---     ids in gorp_migrations would make sql-migrate complain about
---     "unknown migration in database" on default OSS installs. When the
---     operator opts in by setting DM_THREAD_ON=true, the migration runner
---     will apply those SQLs fresh.
+-- thread module:
+--   The thread schema (thread / thread_member / thread_setting) is part of
+--   the snapshot below, but the corresponding thread-* migration IDs are
+--   deliberately *not* pre-seeded into gorp_migrations. Instead, the
+--   ReconcileThreadSchemaRecords shim (pkg/db/migrate_compat.go) runs at
+--   startup and writes those six IDs into gorp_migrations the first time
+--   it sees the schema present with no records. That keeps the snapshot
+--   path fast (no need for sql-migrate to actually run those six migrations
+--   on every clean install) while still being correct on snapshot-less
+--   installs (where the shim is a no-op and sql-migrate applies them
+--   normally) and on existing deployments whose thread tables predate the
+--   PR-#7 rename. DM_THREAD_ON now only gates the API + archive worker,
+--   not the schema — DM_THREAD_ON=true and DM_THREAD_ON=false produce
+--   byte-identical layouts.
 --
 -- Refresh procedure: dump from a healthy internal environment and re-run
 -- tools/octo-release/scripts/build-init-db.sh. Schema snapshots are
@@ -1935,10 +1942,10 @@ INSERT INTO `gorp_migrations` VALUES ('20240113000001_workplace_legacy01.sql','2
 INSERT INTO `gorp_migrations` VALUES ('20260512000001_base_oss_compat_repair.sql','2026-05-12 00:00:00');
 
 -- 119 migrations seeded (118 historical + 20260512000001_base_oss_compat_repair).
--- 6 thread-* migrations skipped (conditional module — only registers SQLDir
--- when DM_THREAD_ON=true): 20260402000001_thread_legacy01, 20260402000002_thread_legacy02,
--- 20260410000001_thread_legacy01, 20260413000001_thread_legacy01,
--- 20260422000001_thread_legacy01, 20260511000001_thread_legacy01.
+-- 6 thread-* migrations are NOT seeded here — see the "thread module" note
+-- in the file header. They're reconciled at startup by
+-- ReconcileThreadSchemaRecords on snapshot installs, or applied normally
+-- by sql-migrate on snapshot-less installs.
 
 SET FOREIGN_KEY_CHECKS = 1;
 SET UNIQUE_CHECKS = 1;

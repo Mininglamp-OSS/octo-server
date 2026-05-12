@@ -3,7 +3,10 @@ package db
 import (
 	"context"
 	"database/sql"
+	"os"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 
@@ -202,4 +205,122 @@ func TestLoadMigrationIDMapping(t *testing.T) {
 			t.Errorf("mapping pair doesn't look like SQL filenames: %q → %q", old, new)
 		}
 	}
+}
+
+// TestReconcileThreadSchemaRecords covers the four states the thread schema
+// reconciliation has to handle:
+//   - no thread tables present (fresh install) → no-op
+//   - all three thread tables present, no thread-* rows in gorp → INSERT all 6
+//   - all three thread tables present, rows already in gorp → no-op
+//   - partial state (only some thread tables present) → no-op, don't mask drift
+func TestReconcileThreadSchemaRecords(t *testing.T) {
+	probeQuery := regexp.QuoteMeta(
+		"SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN")
+
+	t.Run("no thread tables — fresh install no-op", func(t *testing.T) {
+		db, mock := openMock(t)
+		defer db.Close()
+		mock.ExpectQuery(probeQuery).
+			WillReturnRows(sqlmock.NewRows([]string{"TABLE_NAME"}))
+		if err := ReconcileThreadSchemaRecords(context.Background(), db); err != nil {
+			t.Fatalf("expected nil for fresh install, got %v", err)
+		}
+		mustExpectationsMet(t, mock)
+	})
+
+	t.Run("partial state — refuses to act", func(t *testing.T) {
+		db, mock := openMock(t)
+		defer db.Close()
+		// Only `thread` exists; thread_member / thread_setting missing.
+		mock.ExpectQuery(probeQuery).
+			WillReturnRows(sqlmock.NewRows([]string{"TABLE_NAME"}).AddRow("thread"))
+		if err := ReconcileThreadSchemaRecords(context.Background(), db); err != nil {
+			t.Fatalf("expected nil for partial state, got %v", err)
+		}
+		mustExpectationsMet(t, mock)
+	})
+
+	t.Run("all tables present, gorp empty of thread-* — INSERT all 6", func(t *testing.T) {
+		db, mock := openMock(t)
+		defer db.Close()
+		mock.ExpectQuery(probeQuery).
+			WillReturnRows(sqlmock.NewRows([]string{"TABLE_NAME"}).
+				AddRow("thread").AddRow("thread_member").AddRow("thread_setting"))
+		mock.ExpectQuery(regexp.QuoteMeta(
+			"SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'gorp_migrations'")).
+			WillReturnRows(sqlmock.NewRows([]string{"TABLE_NAME"}).AddRow("gorp_migrations"))
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM gorp_migrations")).
+			WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("some_other_migration.sql"))
+		mock.ExpectBegin()
+		stmt := mock.ExpectPrepare(regexp.QuoteMeta(
+			"INSERT INTO gorp_migrations (id, applied_at) VALUES (?, NOW())"))
+		for _, id := range threadModuleMigrationIDs {
+			stmt.ExpectExec().WithArgs(id).WillReturnResult(sqlmock.NewResult(0, 1))
+		}
+		mock.ExpectCommit()
+		if err := ReconcileThreadSchemaRecords(context.Background(), db); err != nil {
+			t.Fatalf("expected nil, got %v", err)
+		}
+		mustExpectationsMet(t, mock)
+	})
+
+	t.Run("all tables present, gorp already has all thread-* — no-op", func(t *testing.T) {
+		db, mock := openMock(t)
+		defer db.Close()
+		mock.ExpectQuery(probeQuery).
+			WillReturnRows(sqlmock.NewRows([]string{"TABLE_NAME"}).
+				AddRow("thread").AddRow("thread_member").AddRow("thread_setting"))
+		mock.ExpectQuery(regexp.QuoteMeta(
+			"SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'gorp_migrations'")).
+			WillReturnRows(sqlmock.NewRows([]string{"TABLE_NAME"}).AddRow("gorp_migrations"))
+		rows := sqlmock.NewRows([]string{"id"})
+		for _, id := range threadModuleMigrationIDs {
+			rows.AddRow(id)
+		}
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM gorp_migrations")).WillReturnRows(rows)
+		// No transaction expected because nothing needs inserting.
+		if err := ReconcileThreadSchemaRecords(context.Background(), db); err != nil {
+			t.Fatalf("expected nil, got %v", err)
+		}
+		mustExpectationsMet(t, mock)
+	})
+}
+
+// TestThreadModuleMigrationIDsMatchDisk catches drift between the
+// hard-coded ID list used by the shim and the actual files in
+// modules/thread/sql/. A new thread migration without a corresponding
+// entry here would leave that ID un-pre-seeded, defeating the whole
+// reconciliation. Surface the mismatch in CI rather than in production.
+func TestThreadModuleMigrationIDsMatchDisk(t *testing.T) {
+	dir := filepath.Join("..", "..", "modules", "thread", "sql")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read %s: %v", dir, err)
+	}
+	var onDisk []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") {
+			continue
+		}
+		onDisk = append(onDisk, e.Name())
+	}
+	sort.Strings(onDisk)
+	got := append([]string(nil), threadModuleMigrationIDs...)
+	sort.Strings(got)
+
+	if !equalStrSlices(onDisk, got) {
+		t.Errorf("threadModuleMigrationIDs drifted from modules/thread/sql/:\n  on disk: %v\n  in code: %v", onDisk, got)
+	}
+}
+
+func equalStrSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

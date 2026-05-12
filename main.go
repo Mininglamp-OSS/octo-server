@@ -146,6 +146,15 @@ func runAPI(ctx *config.Context) {
 		rewriteCancel()
 		panic(fmt.Errorf("rewrite legacy migration IDs: %w", err))
 	}
+	// 兼容老 snapshot：如果 thread/thread_member/thread_setting 三张表
+	// 是被旧版 init-db.sql 建出来的（gorp_migrations 没有对应的 thread-*
+	// 条目），把那 6 个 migration ID 预填进 gorp_migrations。否则 thread
+	// 模块的 SQLDir 现在是无条件注册，sql-migrate 看 embedded 有但 DB 没
+	// 应用过会去跑 `CREATE TABLE thread`（无 IF NOT EXISTS）→ 1050 panic。
+	if err := octodb.ReconcileThreadSchemaRecords(rewriteCtx, ctx.DB().DB); err != nil {
+		rewriteCancel()
+		panic(fmt.Errorf("reconcile thread schema records: %w", err))
+	}
 	rewriteCancel()
 
 	// 模块安装

@@ -105,6 +105,120 @@ func RewriteLegacyMigrationIDs(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
+// threadModuleMigrationIDs is the deterministic list of migration files that
+// own the thread/thread_member/thread_setting tables. It's deliberately
+// hard-coded here rather than discovered from disk: this function runs
+// before sql-migrate boots and we need to enumerate exactly the IDs we
+// expect to skip when the schema is already present.
+//
+// Keep this in sync with modules/thread/sql/*.sql. The
+// TestThreadModuleMigrationIDsMatchDisk test in this package catches drift.
+var threadModuleMigrationIDs = []string{
+	"20260402000001_thread_legacy01.sql",
+	"20260402000002_thread_legacy02.sql",
+	"20260410000003_thread_legacy01.sql",
+	"20260413000001_thread_legacy01.sql",
+	"20260422000001_thread_legacy01.sql",
+	"20260511000001_thread_legacy01.sql",
+}
+
+// ReconcileThreadSchemaRecords pre-seeds gorp_migrations with the thread
+// module's migration IDs when the thread tables are already present from a
+// prior snapshot-built install but the migration rows are missing. Without
+// this, the next sql-migrate.Exec would try to apply CREATE TABLE `thread`
+// (no IF NOT EXISTS) and panic with Error 1050.
+//
+// Why a separate step from RewriteLegacyMigrationIDs: the legacy-ID rewrite
+// is a 1:1 in-place rename, while this is a "the schema is here, please
+// record that" reconciliation. Splitting them keeps each function's
+// invariants narrow.
+//
+// Idempotent on three axes:
+//   - fresh install (no thread tables): no-op.
+//   - already-reconciled install (rows present): no-op.
+//   - already-applied install (sql-migrate ran the migrations itself): no-op.
+//
+// Call after RewriteLegacyMigrationIDs and before module.Setup.
+func ReconcileThreadSchemaRecords(ctx context.Context, db *sql.DB) error {
+	// All three tables have to be present before we treat the schema as
+	// "already built". A partial state (e.g. only `thread` present) is a
+	// corrupted DB we'd rather fail loudly on than mask.
+	required := []string{"thread", "thread_member", "thread_setting"}
+	rows, err := db.QueryContext(ctx,
+		"SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN (?, ?, ?)",
+		required[0], required[1], required[2])
+	if err != nil {
+		return fmt.Errorf("probe thread tables: %w", err)
+	}
+	have := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan thread table name: %w", err)
+		}
+		have[name] = true
+	}
+	rows.Close()
+	if len(have) == 0 {
+		// Fresh install path — sql-migrate will create the tables itself.
+		return nil
+	}
+	if len(have) < len(required) {
+		// Partial state: do nothing rather than mask a schema corruption.
+		// sql-migrate will surface the underlying issue on first ALTER.
+		return nil
+	}
+
+	// gorp_migrations may not exist yet on a brand-new database; if so
+	// there's nothing to reconcile (sql-migrate will create the table and
+	// apply the migrations cleanly).
+	if err := ensureGorpMigrationsTable(ctx, db); err != nil {
+		if errors.Is(err, errTableAbsent) {
+			return nil
+		}
+		return fmt.Errorf("check gorp_migrations existence: %w", err)
+	}
+
+	existing, err := loadExistingMigrationIDs(ctx, db)
+	if err != nil {
+		return fmt.Errorf("read gorp_migrations: %w", err)
+	}
+	var toRecord []string
+	for _, id := range threadModuleMigrationIDs {
+		if !existing[id] {
+			toRecord = append(toRecord, id)
+		}
+	}
+	if len(toRecord) == 0 {
+		return nil
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// applied_at is the column gorp_migrations uses; the timestamp marks
+	// "reconciled by shim" so the source of these rows is auditable.
+	stmt, err := tx.PrepareContext(ctx,
+		"INSERT INTO gorp_migrations (id, applied_at) VALUES (?, NOW())")
+	if err != nil {
+		return fmt.Errorf("prepare: %w", err)
+	}
+	defer stmt.Close()
+	for _, id := range toRecord {
+		if _, err := stmt.ExecContext(ctx, id); err != nil {
+			return fmt.Errorf("record %s: %w", id, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
+}
+
 func loadMigrationIDMapping() (map[string]string, error) {
 	var parsed migrationIDMapping
 	if err := json.Unmarshal(migrationIDMappingJSON, &parsed); err != nil {

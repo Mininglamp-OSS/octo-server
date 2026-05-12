@@ -23,12 +23,23 @@ var swaggerContent string
 
 func init() {
 	register.AddModule(func(ctx interface{}) register.Module {
-		// Beta 功能开关：DM_THREAD_ON=true 启用
+		// thread schema is always registered so the DB layout is identical
+		// across DM_THREAD_ON=true/false deployments. Without this, an
+		// operator who flips DM_THREAD_ON=true on a previously-disabled
+		// install would hit either "1050 table exists" (snapshot already
+		// built the tables) or missing thread tables when sql-migrate
+		// discovers thread-* migrations for the first time. Decoupling
+		// schema registration from runtime feature-gating eliminates that
+		// trap — DM_THREAD_ON now only controls whether the API surface
+		// and archive worker come up, not whether the tables exist.
 		threadOn := strings.ToLower(os.Getenv("DM_THREAD_ON"))
 		if threadOn != "true" && threadOn != "1" {
 			lg := log.NewTLog("Thread")
-			lg.Info("thread module disabled: set DM_THREAD_ON=true to enable")
-			return register.Module{Name: "thread"}
+			lg.Info("thread module runtime disabled: API + archive worker stay down; schema migrations still apply. Set DM_THREAD_ON=true to enable.")
+			return register.Module{
+				Name:   "thread",
+				SQLDir: register.NewSQLFS(sqlFS),
+			}
 		}
 
 		api := New(ctx.(*config.Context))
