@@ -1,0 +1,15 @@
+title = "Gitleaks config for octo-server"
+
+[allowlist]
+  description = "Known false positives: doc placeholders, test fixtures, RFC samples"
+  regexTarget = "match"
+  regexes = [
+    '''YOUR_BOT_TOKEN''',
+    '''uk_YOUR_API_KEY''',
+    '''dGhlIHNhbXBsZSBub25jZQ==''',
+  ]
+  paths = [
+    '''_test\.go$''',
+    '''testdata/''',
+    '''scripts/smoke-test\.sh$''',
+  ]

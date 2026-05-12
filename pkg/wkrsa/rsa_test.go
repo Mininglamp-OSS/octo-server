@@ -1,43 +1,63 @@
 package wkrsa
 
 import (
-	"fmt"
 	"testing"
 )
 
-func TestSignWithMD5(t *testing.T) {
-
-	dz := `-----BEGIN RSA PRIVATE KEY-----
-MIIEowIBAAKCAQEAxGbKnrOumh0r4FfRDL3NIGP7scxxvsVupktTdFqf8TgHLT67
-qfMXxM/JSAmNxJVz4zS8zVla4FlTJ4kyh3IJW+65vzXKX/errnI0gNk0p3IME+Wd
-LDetwy04Dk40B4GhMrfnomMff6W7UXG4fyLX9gzCIhkAeLNNl6eZS8IOgFULWZRO
-pYdlylncY4EQiv6ljXQtKmTIxvi7ivS/9sSFqgS+qnbd0QexrZlM1D2O4abFgrjs
-BaFHC4zGrg3TztiWynGUSOpjFv2v92doxDgSxP69xNry9Vq+6kERJpbqvJ3ujUEY
-T4bLk8avXNjyMg79/xNeiQ4gxvSHj3v3YOOlIQIDAQABAoIBADbY9fDIARSs3Nnz
-7D+Aqc5H3bxTedhqznHGS3IM9OmqWea6xDG734Fo/a8Oa/bgPdLPoYI/V++bQmui
-FuhYYmC4FEtfvDp8sgcvgZYSEnBImzLbRr9YdUAyWps0H7eQ7fF6BkgFIoDFScB+
-36Uxl9nwyi43iTgr6plVhqvvb5lKqPQTZWWI50hs0EYcADngy2st6+sJxJXylCI4
-w3vjXhE9WdwBk54QD6FPPrzRHWpqHDjPcuyxbVijEoz0YMdO+tnHweUn+YnQnHxi
-rswF7b9/DL8mhIX67SKqF7wM+RCgrweVswNCcEsZyfCtMKgI7uwDjaDkvhI+XaYq
-vfNUe9kCgYEAzK+Zb3A4ZxPWhYrubqmGYa7KvmtetRO5LAyWXMFH5vzU+TKzDcJm
-qZTxhzH8yt43PgrjOL5C+X2cIkNfEXHl9oIuuAMbMDSqThvox+o8Lsz5gTKy9/rR
-sucBRc41N/axLalVpbevD3Q3+2WjH25ap7h0RsZsladshEoxXI8jpCMCgYEA9aOD
-SSoywbVrsMXhr2wgxNXUuQGxWH6x3ZbAG86xxerElVwT06SbowDO77xFmiQsUvlW
-BpYrVPBg48B/Sgvvb0mKHhXVe8Maegq6bCofVpAU9IhDZokwIGJgEm2MgziZJAe+
-3/2DCFV22olrkqDhllqBTenuSyiIfWcGHr+zM+sCgYB0EWNVgPJK6UHtajH4iKMO
-Q1rujd4fmnaXlu+w211Vi6uNQAWu2Lz0juRDQMJTm50BzpS4uZMq/OKLv15qewbn
-OT0a1ZAWTtcAAe2HZ7kG5O7bJ4+69PzykPH0zpD5Eie4d9x8Y2OexM11/lV43lAD
-6aHt/FjYqB7uCVBiZzzTtwKBgQDGY+jN9+IEp4UxwbCUYQ1aTKXBQoe8xJ7dLDs+
-ekMEaaeaRkLRJdp53VZFM9c3Nk4COdTr/u9Ca96lM7zazib0x/1gbRv+GEbTGMUW
-RTMIU9hI46EkOFsBXNLhL09UUCsHeaYE/JiO64/R0zlptLxeFfznM6+9TiBmwAWm
-YgfXPwKBgDn1n2aWpGpH/cz8AQapMxqo7YK2Lc/Vwqw7O4mmNQ0TOJOgECHrWJX2
-2UfOnyh8mDNFq9Udt4XMkfH5aPmWF7ejl2ddz3A4kdz5DMaVgRPktJh6nFAllKz/
-R0a+FMM2fsqqRjYN4Zf84pJvWnIy7dG/pXKq8AAWkV7iJNVpshGb
+// testPrivateKey is a freshly generated RSA-2048 key used ONLY for unit
+// tests. It has no relationship to any production key material.
+// Regenerated 2026-05-12 during pre-open-source secret scrub.
+const testPrivateKey = `-----BEGIN RSA PRIVATE KEY-----
+MIIEowIBAAKCAQEA0GTVoxu02WMdxeg+QxgbQ5C5rWQpDL3OLhzYUXOsmSdF2vUM
+yJ5AFbv97Nt5DaNtmGzGldlQ9keNAvcljwGqR7F97jmxP+8kjqdOKqHYjj/Jt0FW
+K/QlXAtogASPig3t26QGbfW8+qruoooxc2PKT5WulK9OfwgGvvdcLaHLlWZufIeE
+cgdlQJ2qpNKOA/AgNTj16RspE9VdmKBIWzmGRDziFf1/pmmhBVe4TZ9MAfEUQIk7
+Cm1eS/g8YwYsi2bI6MoK9Tcwh5IcEV8tvAXz+qSfuO31ep/5CvsSlcVvYYjBf3mQ
+P7Dn811MDJFH5SzC4aknpQz2+c5GmHPJgYtTKQIDAQABAoIBAQDBoH8z70FpHwQB
+59k6BAMJE0bCiabulMkm5VxEyiLbprbsS/YVzZwj1amI0x+2AVyKXL9jaikku7SU
+xchbCKQLuyoUF/zON8gS1/bz+6839KLbJ9UGP/IahOsSz6oDDxArnUrwDn0Jt5rE
+4XwzB8xph91Pf1eDBpUmCLXYHFYJuBau1pJT71aWQyK5IXemVk0zc8VYzjn5vYm7
+FcaHVwMYVG/E5qnQKhcByYndAtyAoH6FrTXygtCRACbEMGR8wTz7dT4RNyLC72gQ
+jHRxDIO+cSRK/+sDDKrQfr3njr2ZAhQ4wFbu7f0mEPO6k4TIydwMZMfiUEM8uz/o
+Jfgwq4IRAoGBAOvLFXrZ1iVyaA1rUnfEn9omkGIDoD5yOdM+Altce7FTyrr3oViy
+40lveMEfc+m/HsqSrUk1+UadDKAaB6vU84i9M7zTTc5v1odOBt0LTFSd4APUCoXG
+GV9j4au5clYOQgLBfE2SOJ2YZgvHlatxG7YQg/Mtgv7EWirEHbJSM3F1AoGBAOJA
+pxesAOQ7y2f5czxkU54sBA0go0SzMO9p4lC+w/nySyFGAtzRJOLia8mTgqZ5gQ4+
+wA96dRjSyFBagOgjFLsofN5DhcV8UsxYeYTpV4IZDIVo9Y5S4OvsCAzAxKwC7uhv
+VAwDzA+ZQeqp159gzhAMggSBmDK3nD0CvMdEP1BlAoGAa0Yhp5qjirXaEQDarBKQ
+hzc0SONNbBubozd66wXQYIS2nwk6Jph8P1Svo20j1xxUbeT9YWlk13Nr4wr0ooBn
+q7Yoa6fWpizLdRNSnA4f0/9fg15cyy+tK3DNosrj8bLa5VYRr1ju2QQUqRdMSItV
+CCfLYD88cZvzSbGfsRkkvmECgYBLPv1TXh0dytUnS0sL9sHohPMD+qrSGlZYCXr/
+J7K92dsqwcIJ9nSyEGOQssJs41QMjMoLW8q96rw8HR1qFuC6Lgj5UrOWrnZLB9HC
+Zmh4GCSV6gZgwyeSzvkOZL4EByW1n/Dv3gNr3KiThtDzbJqbs805+m/HzlDj6Zkn
+HIeCEQKBgGBSn1dd93zD52eBQ37NXsDRyCTKYY03Ux573Y/0Gb5TV2C6vJdnBtoW
+zGtnCV4IyN9i7uoz/3F4q5b2vGvyQRC12c9ZILKdGfR3IqtMrXY9ns/2r5jhD9jz
+1DwwVIoQy6qHRVApUesBCI7HfRqwTwY0ZtH1LqpZij8qSlc1X7Sr
 -----END RSA PRIVATE KEY-----`
-	fmt.Println("privateKeyBuff.Bytes()-->", dz)
 
-	_, err := SignWithMD5([]byte("test"), []byte(dz))
+func TestSignWithMD5(t *testing.T) {
+	sig, err := SignWithMD5([]byte("test"), []byte(testPrivateKey))
 	if err != nil {
-		panic(err)
+		t.Fatalf("SignWithMD5 failed: %v", err)
+	}
+	if sig == "" {
+		t.Fatal("SignWithMD5 returned empty signature")
+	}
+}
+
+func TestSignWithSHA256(t *testing.T) {
+	sig, err := SignWithSHA256([]byte("test"), []byte(testPrivateKey))
+	if err != nil {
+		t.Fatalf("SignWithSHA256 failed: %v", err)
+	}
+	if sig == "" {
+		t.Fatal("SignWithSHA256 returned empty signature")
+	}
+}
+
+func TestSignWithSHA256_InvalidKey(t *testing.T) {
+	_, err := SignWithSHA256([]byte("test"), []byte("invalid key"))
+	if err == nil {
+		t.Fatal("SignWithSHA256 should fail with invalid key")
 	}
 }
