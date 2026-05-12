@@ -1,6 +1,12 @@
 package wkrsa
 
 import (
+	"crypto"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/pem"
 	"testing"
 )
 
@@ -46,12 +52,33 @@ func TestSignWithMD5(t *testing.T) {
 }
 
 func TestSignWithSHA256(t *testing.T) {
-	sig, err := SignWithSHA256([]byte("test"), []byte(testPrivateKey))
+	data := []byte("test")
+	sig, err := SignWithSHA256(data, []byte(testPrivateKey))
 	if err != nil {
 		t.Fatalf("SignWithSHA256 failed: %v", err)
 	}
 	if sig == "" {
 		t.Fatal("SignWithSHA256 returned empty signature")
+	}
+
+	// Verify the signature round-trips: decode from base64, then verify
+	// against the public half of the test key. This catches hash/sign
+	// regressions that a non-empty-string assertion alone would miss.
+	sigBytes, err := base64.StdEncoding.DecodeString(sig)
+	if err != nil {
+		t.Fatalf("failed to base64-decode signature: %v", err)
+	}
+	block, _ := pem.Decode([]byte(testPrivateKey))
+	if block == nil {
+		t.Fatal("failed to decode test private key PEM")
+	}
+	priv, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+	if err != nil {
+		t.Fatalf("failed to parse test private key: %v", err)
+	}
+	hashed := sha256.Sum256(data)
+	if err := rsa.VerifyPKCS1v15(&priv.PublicKey, crypto.SHA256, hashed[:], sigBytes); err != nil {
+		t.Fatalf("signature verify failed: %v", err)
 	}
 }
 
