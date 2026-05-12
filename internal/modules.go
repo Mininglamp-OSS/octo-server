@@ -1,17 +1,19 @@
 // Module import ordering notes:
 //
-// The import order in this file is significant — gorp migrations run
-// in module-registration (i.e. import) order.
+// Migration execution order is determined by SQL filename timestamps
+// (`YYYYMMDD<NNNNNN>_<module>_*.sql`), not by the import order here —
+// sql-migrate pools every module's SQL into one slice and sorts by
+// VersionInt across the whole set, so a cross-module dependency like
+// "botfather ALTERs robot" is honoured by virtue of the botfather file
+// being timestamped later than the robot CREATE.
 //
-//   - `robot` must appear BEFORE `botfather` because
-//     `botfather-20260417-01.sql` does `ALTER TABLE robot ...` which
-//     requires the `robot` table to already exist.
+// The import order in this file still matters for Go-level concerns:
 //
-//   - `bot_api` must appear BEFORE `app_bot` because `app_bot`
-//     imports `bot_api` at the Go package level.
+//   - `bot_api` must appear BEFORE `app_bot` because `app_bot` imports
+//     `bot_api` at the Go package level.
 //
-//   - Both `bot_api` and `app_bot` appear AFTER `user` and `robot`
-//     since they query those tables at runtime.
+//   - Both `bot_api` and `app_bot` appear AFTER `user` and `robot` since
+//     they query those tables at runtime (Go-init ordering).
 
 package modules
 

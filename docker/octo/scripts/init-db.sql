@@ -6,14 +6,14 @@
 -- gorp_migrations table so the Go binary's boot-time migration runner finds
 -- everything already applied and proceeds straight to serving traffic.
 --
--- Why snapshot instead of letting `sql-migrate` do its thing? The internal
--- SQL files have cross-module dependencies (e.g. botfather-*.sql ALTERs the
--- robot table owned by the robot module, category-*.sql UPDATEs
--- group_setting owned by the group module). Those dependencies happen to
--- work in internal environments because migrations were applied
--- incrementally over three years. On a clean docker-compose install the
--- planner sees the full set and orders strictly by filename, producing a
--- schedule that the schema does not support. See YUJ-440.
+-- Why a snapshot still exists: all source migrations now use timestamp-
+-- prefixed filenames (YYYYMMDD<NNNNNN>_<module>_*.sql), so sql-migrate's
+-- numeric-prefix branch orders them strictly by execution time — meaning
+-- a clean `sql-migrate` run from an empty database would also produce the
+-- right schema. The snapshot is kept because it cuts first-boot time from
+-- ~10s of sequential DDL to a single bulk load, and it lets us pin a
+-- known-good schema per release for OSS users. It is no longer a
+-- workaround for a planner ordering bug.
 --
 -- Conditional modules:
 --   * thread-* migrations are NOT seeded here. The thread module only
@@ -1932,6 +1932,7 @@ INSERT INTO `gorp_migrations` VALUES ('20241217000001_webhook_legacy01.sql','202
 INSERT INTO `gorp_migrations` VALUES ('20230823000001_workplace_legacy01.sql','2026-03-13 18:20:05');
 INSERT INTO `gorp_migrations` VALUES ('20230906000001_workplace_legacy01.sql','2026-03-13 18:20:05');
 INSERT INTO `gorp_migrations` VALUES ('20240113000001_workplace_legacy01.sql','2026-03-13 18:20:05');
+INSERT INTO `gorp_migrations` VALUES ('20260512000001_base_oss_compat_repair.sql','2026-05-12 00:00:00');
 
 -- 118 migrations seeded, 6 thread-* skipped: thread-20260402-01.sql, thread-20260402-02.sql, thread-20260410-01.sql, thread-20260413-01.sql, thread-20260422-01.sql, thread-20260511-01.sql
 

@@ -48,6 +48,10 @@ type migration struct {
 	NN       string   // 01 (or "" for the one bot_api file that lacks a -NN)
 	Creates  []string // tables this migration CREATEs
 	Touches  []string // tables this migration ALTER/UPDATE/INSERTs (not CREATE)
+	// AlreadyTimestamped is true when the source filename already matches
+	// the post-rename convention. The planner preserves the filename for
+	// these so reruns are byte-stable.
+	AlreadyTimestamped bool
 	// Filled in by the planner:
 	NewName string
 }
@@ -70,6 +74,15 @@ var (
 	// for the new timestamp; the HHMM tail (if any) just contributes to the
 	// stable secondary sort via NN.
 	reFilename = regexp.MustCompile(`^(?P<module>[a-z][a-z_]*?)[-_](?P<date>\d{8}(?:\d{4})?)(?:-(?P<nn>\d{2}))?\.sql$`)
+
+	// Post-rename convention used after this tool has been applied once:
+	//   <YYYYMMDD><NNNNNN>_<module>(_legacy<NN>)?(_<desc>)?.sql
+	// Re-parsing such a filename yields the same (date, nn, module) it had
+	// before the rename, so the tool's output is deterministic across reruns.
+	// Without this branch, re-running on the post-rename tree would fail at
+	// collection ("filename does not match …") and the tool wouldn't be
+	// idempotent.
+	reFilenameNew = regexp.MustCompile(`^(?P<date>\d{8})(?P<seq>\d{6})_(?P<module>[a-z][a-z_0-9]*?)(?:_legacy(?P<nn>\d{2}))?(?:_[a-z0-9_]+)?\.sql$`)
 
 	// DDL/DML targets. We strip backticks and trailing punctuation in code.
 	// Match CREATE TABLE [IF NOT EXISTS] `t` or t (no schema qualifier in this repo).
@@ -145,12 +158,30 @@ func collectMigrations(root string) ([]*migration, error) {
 
 func parseMigration(root, dir, name string) (*migration, error) {
 	matches := reFilename.FindStringSubmatch(name)
+	usedNew := false
 	if matches == nil {
-		return nil, fmt.Errorf("filename does not match <module>[-_]<YYYYMMDD>[-<NN>].sql convention")
+		// Try the post-rename layout (idempotent rerun).
+		matches = reFilenameNew.FindStringSubmatch(name)
+		if matches == nil {
+			return nil, fmt.Errorf("filename matches neither <module>[-_]<YYYYMMDD>[-<NN>].sql nor <YYYYMMDD><NNNNNN>_<module>...sql")
+		}
+		usedNew = true
 	}
-	mod := matches[reFilename.SubexpIndex("module")]
-	rawDate := matches[reFilename.SubexpIndex("date")]
-	nn := matches[reFilename.SubexpIndex("nn")]
+	var mod, rawDate, nn string
+	if usedNew {
+		mod = matches[reFilenameNew.SubexpIndex("module")]
+		rawDate = matches[reFilenameNew.SubexpIndex("date")]
+		nn = matches[reFilenameNew.SubexpIndex("nn")]
+		if nn == "" {
+			// Derive a stable NN-substitute from the per-day sequence so that
+			// the (date, nn, module) sort key still partitions cleanly.
+			nn = matches[reFilenameNew.SubexpIndex("seq")][4:6]
+		}
+	} else {
+		mod = matches[reFilename.SubexpIndex("module")]
+		rawDate = matches[reFilename.SubexpIndex("date")]
+		nn = matches[reFilename.SubexpIndex("nn")]
+	}
 	// Collapse 12-digit YYYYMMDDHHMM to its YYYYMMDD prefix for ordering.
 	// The HHMM tail is preserved implicitly by NN (and by ordering within
 	// the same date — there are only two 12-digit files and they live in
@@ -180,14 +211,15 @@ func parseMigration(root, dir, name string) (*migration, error) {
 
 	rel, _ := filepath.Rel(root, path)
 	return &migration{
-		Path:     path,
-		Rel:      rel,
-		Filename: name,
-		Module:   mod,
-		Date:     date,
-		NN:       nn,
-		Creates:  creates,
-		Touches:  touches,
+		Path:               path,
+		Rel:                rel,
+		Filename:           name,
+		Module:             mod,
+		Date:               date,
+		NN:                 nn,
+		Creates:            creates,
+		Touches:            touches,
+		AlreadyTimestamped: usedNew,
 	}, nil
 }
 
@@ -391,11 +423,18 @@ func assignTimestamps(order []*migration) error {
 		}
 		dayCounter[m.Date]++
 		seq := dayCounter[m.Date]
-		desc := m.Module
-		if m.NN != "" {
-			desc = fmt.Sprintf("%s_legacy%s", m.Module, m.NN)
+		if m.AlreadyTimestamped {
+			// Preserve the existing post-rename filename — the tool is
+			// idempotent on a tree it has already been applied to.
+			m.NewName = m.Filename
+		} else {
+			desc := m.Module
+			if m.NN != "" {
+				desc = fmt.Sprintf("%s_legacy%s", m.Module, m.NN)
+			}
+			m.NewName = fmt.Sprintf("%s%06d_%s.sql", m.Date, seq, desc)
 		}
-		m.NewName = fmt.Sprintf("%s%06d_%s.sql", m.Date, seq, desc)
+		_ = seq
 		if m.Date > prevDate {
 			prevDate = m.Date
 		}
@@ -417,8 +456,23 @@ type report struct {
 }
 
 func writeMapping(order []*migration, orphan map[string][]string, owners map[string]*migration, out string) error {
+	// Start from any existing mapping.json so reruns are append-only — once
+	// a rename has been recorded it stays in the historical map, even after
+	// the source tree no longer carries the old filename. The map is the
+	// authoritative source for the runtime ID-rewrite shim, so losing an
+	// entry would break upgrades of older deployments.
 	mapping := map[string]string{}
+	if existing, err := readExistingMapping(out); err == nil {
+		for k, v := range existing {
+			mapping[k] = v
+		}
+	}
 	for _, m := range order {
+		if m.Filename == m.NewName {
+			// Skip self-pairs from this run — they're either no-op renames
+			// or post-rename files we deliberately preserved.
+			continue
+		}
 		mapping[m.Filename] = m.NewName
 	}
 	// Pick a handful of cross-module dep examples for the report header.
@@ -449,6 +503,18 @@ func writeMapping(order []*migration, orphan map[string][]string, owners map[str
 		return err
 	}
 	return os.WriteFile(out, buf, 0o644)
+}
+
+func readExistingMapping(path string) (map[string]string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var rep report
+	if err := json.Unmarshal(raw, &rep); err != nil {
+		return nil, err
+	}
+	return rep.Mapping, nil
 }
 
 func applyRenames(order []*migration, root string) error {

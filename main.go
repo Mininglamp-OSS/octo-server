@@ -18,6 +18,7 @@ import (
 	_ "github.com/Mininglamp-OSS/octo-server/internal"
 	commonapi "github.com/Mininglamp-OSS/octo-server/modules/base/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	octodb "github.com/Mininglamp-OSS/octo-server/pkg/db"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
 	"github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"github.com/gin-gonic/gin"
@@ -136,6 +137,17 @@ func runAPI(ctx *config.Context) {
 	s.GetRoute().UseGin(wkhttp.SecureCORSOverrideMiddleware(
 		wkhttp.ParseAllowedOrigins(os.Getenv("DM_CORS_ALLOWED_ORIGINS")),
 	))
+	// 兼容老 DB：把 gorp_migrations 里的历史文件名升级到新的时间戳格式。
+	// 必须在 module.Setup（内部调 migrate.Exec）之前，否则 sql-migrate 的
+	// PlanMigration 在见到老 ID 时会 panic "unknown migration in database"。
+	// 幂等：fresh install 表不存在直接 no-op，老 ID 已重写后第二次启动也无操作。
+	rewriteCtx, rewriteCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	if err := octodb.RewriteLegacyMigrationIDs(rewriteCtx, ctx.DB().DB); err != nil {
+		rewriteCancel()
+		panic(fmt.Errorf("rewrite legacy migration IDs: %w", err))
+	}
+	rewriteCancel()
+
 	// 模块安装
 	err := module.Setup(ctx)
 	if err != nil {
