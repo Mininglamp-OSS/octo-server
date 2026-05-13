@@ -13,7 +13,14 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/stretchr/testify/assert"
 
-	// Ensure dependent modules register SQL migrations
+	// Ensure dependent modules register SQL migrations and HTTP routes.
+	// bot_api owns POST /v1/bot/createGroup (see modules/bot_api/bot_api.go);
+	// the rest provide migrations referenced by setupGroupTestEnv's
+	// testutil.NewTestServer call. The blank import is required because
+	// the bot_api module self-registers via init() and is otherwise
+	// pulled in transitively only by the prod entrypoint
+	// (internal/modules.go), not by botfather alone.
+	_ "github.com/Mininglamp-OSS/octo-server/modules/bot_api"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/group"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/space"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/user"

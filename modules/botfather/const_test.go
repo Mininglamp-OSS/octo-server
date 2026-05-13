@@ -265,7 +265,14 @@ func TestBotNameValidation(t *testing.T) {
 		valid bool
 	}{
 		{"valid short name", "Bot", true},
-		{"valid long name", strings.Repeat("名", 64), true},
+		// `len()` returns the byte length in Go and the matching production
+		// validation (modules/botfather/command.go:509,
+		// modules/botfather/api_user.go:103/335) uses `len(name) > 64`.
+		// 21 Chinese characters = 63 bytes — fits under the 64-byte cap.
+		// The previous fixture used `strings.Repeat("名", 64)` which is
+		// 192 bytes and is correctly rejected by the production code, so
+		// the old `valid: true` expectation was always wrong.
+		{"valid long name", strings.Repeat("名", 21), true},
 		{"too long", strings.Repeat("a", 65), false},
 		{"empty", "", false},
 		{"whitespace only", "   ", false},

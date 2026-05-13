@@ -33,9 +33,18 @@ func TestMain(m *testing.M) {
 	db, err := sql.Open("mysql", "root:demo@tcp(127.0.0.1:3306)/test?charset=utf8mb4&parseTime=true")
 	if err == nil {
 		defer db.Close()
-		db.Exec("CREATE TABLE IF NOT EXISTS `robot` (`id` BIGINT AUTO_INCREMENT PRIMARY KEY, `robot_id` VARCHAR(40) NOT NULL DEFAULT '', `token` VARCHAR(100) NOT NULL DEFAULT '', `version` BIGINT NOT NULL DEFAULT 0, `status` SMALLINT NOT NULL DEFAULT 1, `creator_uid` VARCHAR(40) NOT NULL DEFAULT '', `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4")
+		// COLLATE=utf8mb4_general_ci must match what the goose migrations
+		// produce: on mysql:8.0 the server default is utf8mb4_0900_ai_ci,
+		// so a bare `DEFAULT CHARSET=utf8mb4` here would create the robot
+		// table in 0900_ai_ci. The space migration
+		// 20260308000002_space_legacy01.sql then INNER JOINs `robot` to
+		// `space_member` (which migrations build as utf8mb4_general_ci)
+		// and crashes with "Illegal mix of collations". The thread
+		// package's main_test.go already sets the correct collation here;
+		// keep group's manually-built fixture in sync.
+		db.Exec("CREATE TABLE IF NOT EXISTS `robot` (`id` BIGINT AUTO_INCREMENT PRIMARY KEY, `robot_id` VARCHAR(40) NOT NULL DEFAULT '', `token` VARCHAR(100) NOT NULL DEFAULT '', `version` BIGINT NOT NULL DEFAULT 0, `status` SMALLINT NOT NULL DEFAULT 1, `creator_uid` VARCHAR(40) NOT NULL DEFAULT '', `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci")
 		db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS `robot_id_robot_index` ON `robot` (`robot_id`)")
-		db.Exec("CREATE TABLE IF NOT EXISTS `robot_menu` (`id` BIGINT AUTO_INCREMENT PRIMARY KEY, `robot_id` VARCHAR(40) NOT NULL DEFAULT '', `cmd` VARCHAR(100) NOT NULL DEFAULT '', `remark` VARCHAR(100) NOT NULL DEFAULT '', `type` VARCHAR(100) NOT NULL DEFAULT '', `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4")
+		db.Exec("CREATE TABLE IF NOT EXISTS `robot_menu` (`id` BIGINT AUTO_INCREMENT PRIMARY KEY, `robot_id` VARCHAR(40) NOT NULL DEFAULT '', `cmd` VARCHAR(100) NOT NULL DEFAULT '', `remark` VARCHAR(100) NOT NULL DEFAULT '', `type` VARCHAR(100) NOT NULL DEFAULT '', `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci")
 	}
 	os.Exit(m.Run())
 }
