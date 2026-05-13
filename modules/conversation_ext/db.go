@@ -16,6 +16,10 @@ var (
 	// ErrVersionConflict は UpdateSort の CAS に失敗したときに返す。
 	// 呼び出し元は errors.Is で判定して再試行を促す。
 	ErrVersionConflict = errors.New("version conflict: please retry")
+	// ErrSortTargetNotFound は UpdateSort で指定した先頭の target が存在しないときに返す。
+	// SELECT ... FOR UPDATE が空振りすると CAS の前提（行ロックを取れる）が崩れるため、
+	// 静かに成功させずに明示的に弾く。
+	ErrSortTargetNotFound = errors.New("sort target not found")
 )
 
 // Model は user_conversation_ext テーブルの 1 行に対応する。
@@ -232,12 +236,23 @@ func (d *DB) UpdateSort(uid, spaceID string, items []SortItem, expectedVersion i
 
 	// SELECT version FOR UPDATE — REPEATABLE READ 下でも current read を保証する。
 	// db_pinned.go の SELECT COUNT(*) FOR UPDATE と同じパターン。
+	//
+	// items[0] を CAS のアンカーとして利用するため、その行が存在しない場合は
+	// FOR UPDATE で何もロックできず、後続の UPDATE も 0 行に effect する。
+	// 結果として呼び出しが「成功」を返してしまい、並行 UpdateSort が完全に
+	// 直列化されない（PR review Blocking #1 に対応）。明示的に弾く。
 	var currentVersion int
-	if _, err = tx.SelectBySql(
+	// LoadOne を使うのが必須。dbr の Load は行が無くても (0, nil) を返すため、
+	// それを ErrNotFound と誤判定すると CAS が静かに通過する。
+	err = tx.SelectBySql(
 		"SELECT version FROM "+table+
 			" WHERE uid=? AND space_id=? AND target_type=? AND target_id=? FOR UPDATE",
 		uid, spaceID, items[0].TargetType, items[0].TargetID,
-	).Load(&currentVersion); err != nil && err != dbr.ErrNotFound {
+	).LoadOne(&currentVersion)
+	if err != nil {
+		if err == dbr.ErrNotFound {
+			return ErrSortTargetNotFound
+		}
 		return err
 	}
 

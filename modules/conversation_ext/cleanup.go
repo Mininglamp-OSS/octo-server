@@ -41,42 +41,78 @@ func InitGlobalConvExtDB(ctx *config.Context) {
 // same space, every thread row whose target_id begins with "{channelID}____",
 // mirroring the cascade logic in service.UnfollowChannel.
 //
-// Errors are logged as warnings and never propagated so that the caller's main
-// flow is not interrupted.
+// Atomicity (PR review Blocking #2): when the cascade applies (channelType=2)
+// the channel-row DELETE and the thread-cascade DELETE are wrapped in a single
+// transaction so a partial failure cannot leave orphaned thread rows.  Errors
+// are still logged as warnings and never propagated so the caller's main flow
+// is not interrupted; on failure the transaction rolls back and a subsequent
+// retry can re-run the same cleanup cleanly.
 func RemoveConvExtForUserInSpace(uid, spaceID, channelID string, channelType uint8) {
 	if globalConvExtDB == nil {
 		return
 	}
 	db := globalConvExtDB
 
-	// Delete the channel row itself.
-	if _, err := db.session.DeleteFrom(table).
-		Where("uid=? AND space_id=? AND target_type=? AND target_id=?",
-			uid, spaceID, channelType, channelID).
-		Exec(); err != nil {
-		db.Warn("RemoveConvExtForUserInSpace: 删除频道 ext 行失败",
-			zap.String("uid", uid),
-			zap.String("spaceID", spaceID),
-			zap.String("channelID", channelID),
-			zap.Uint8("channelType", channelType),
-			zap.Error(err))
-	}
-
-	// When the channel is a group (target_type=2), also cascade-delete all its
-	// child thread rows (target_type=5, target_id LIKE '{channelID}_____%').
-	if channelType == targetTypeGroup {
-		prefix := escapeLike(channelID) + threadSeparator + "%"
-		if _, err := db.session.DeleteBySql(
-			"DELETE FROM "+table+
-				" WHERE uid=? AND space_id=? AND target_type=? AND target_id LIKE ? ESCAPE '|'",
-			uid, spaceID, targetTypeThread, prefix,
-		).Exec(); err != nil {
-			db.Warn("RemoveConvExtForUserInSpace: 级联删除子区 ext 行失败",
+	// Single-statement case (non-group): no transaction required.
+	if channelType != targetTypeGroup {
+		if _, err := db.session.DeleteFrom(table).
+			Where("uid=? AND space_id=? AND target_type=? AND target_id=?",
+				uid, spaceID, channelType, channelID).
+			Exec(); err != nil {
+			db.Warn("RemoveConvExtForUserInSpace: 删除频道 ext 行失败",
 				zap.String("uid", uid),
 				zap.String("spaceID", spaceID),
 				zap.String("channelID", channelID),
+				zap.Uint8("channelType", channelType),
 				zap.Error(err))
 		}
+		return
+	}
+
+	// Group case: channel row + thread cascade in one transaction.
+	tx, err := db.session.Begin()
+	if err != nil {
+		db.Warn("RemoveConvExtForUserInSpace: Begin 失败",
+			zap.String("uid", uid),
+			zap.String("spaceID", spaceID),
+			zap.String("channelID", channelID),
+			zap.Error(err))
+		return
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	if _, err := tx.DeleteFrom(table).
+		Where("uid=? AND space_id=? AND target_type=? AND target_id=?",
+			uid, spaceID, channelType, channelID).
+		Exec(); err != nil {
+		db.Warn("RemoveConvExtForUserInSpace: 删除群 ext 行失败（事务回滚）",
+			zap.String("uid", uid),
+			zap.String("spaceID", spaceID),
+			zap.String("channelID", channelID),
+			zap.Error(err))
+		return
+	}
+
+	prefix := escapeLike(channelID) + threadSeparator + "%"
+	if _, err := tx.DeleteBySql(
+		"DELETE FROM "+table+
+			" WHERE uid=? AND space_id=? AND target_type=? AND target_id LIKE ? ESCAPE '|'",
+		uid, spaceID, targetTypeThread, prefix,
+	).Exec(); err != nil {
+		db.Warn("RemoveConvExtForUserInSpace: 级联删除子区 ext 行失败（事务回滚）",
+			zap.String("uid", uid),
+			zap.String("spaceID", spaceID),
+			zap.String("channelID", channelID),
+			zap.Error(err))
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		db.Warn("RemoveConvExtForUserInSpace: Commit 失败",
+			zap.String("uid", uid),
+			zap.String("spaceID", spaceID),
+			zap.String("channelID", channelID),
+			zap.Error(err))
 	}
 }
 
@@ -106,34 +142,63 @@ func RemoveConvExtForUser(uid, peerUID string) {
 // thread rows (target_type=5) whose target_id begins with "{channelID}____",
 // so that a single call cleans up both the group and every thread in it.
 //
-// Errors are logged as warnings and never propagated.
+// Atomicity (PR review Blocking #2): when the cascade applies (channelType=2)
+// the channel-row DELETE and the thread-cascade DELETE are wrapped in a single
+// transaction so a partial failure cannot leave orphaned thread rows.  Errors
+// are logged as warnings and never propagated.
 func RemoveConvExtForChannel(channelID string, channelType uint8) {
 	if globalConvExtDB == nil {
 		return
 	}
 	db := globalConvExtDB
 
-	// Delete all rows for this channel (across all users and spaces).
-	if _, err := db.session.DeleteFrom(table).
-		Where("target_type=? AND target_id=?", channelType, channelID).
-		Exec(); err != nil {
-		db.Warn("RemoveConvExtForChannel: 删除频道 ext 行失败",
-			zap.String("channelID", channelID),
-			zap.Uint8("channelType", channelType),
-			zap.Error(err))
-	}
-
-	// Cascade: when the channel is a group, also delete all child thread rows.
-	if channelType == targetTypeGroup {
-		prefix := escapeLike(channelID) + threadSeparator + "%"
-		if _, err := db.session.DeleteBySql(
-			"DELETE FROM "+table+
-				" WHERE target_type=? AND target_id LIKE ? ESCAPE '|'",
-			targetTypeThread, prefix,
-		).Exec(); err != nil {
-			db.Warn("RemoveConvExtForChannel: 级联删除子区 ext 行失败",
+	// Single-statement case (non-group): no transaction required.
+	if channelType != targetTypeGroup {
+		if _, err := db.session.DeleteFrom(table).
+			Where("target_type=? AND target_id=?", channelType, channelID).
+			Exec(); err != nil {
+			db.Warn("RemoveConvExtForChannel: 删除频道 ext 行失败",
 				zap.String("channelID", channelID),
+				zap.Uint8("channelType", channelType),
 				zap.Error(err))
 		}
+		return
+	}
+
+	// Group case: channel row + thread cascade in one transaction.
+	tx, err := db.session.Begin()
+	if err != nil {
+		db.Warn("RemoveConvExtForChannel: Begin 失败",
+			zap.String("channelID", channelID),
+			zap.Error(err))
+		return
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	if _, err := tx.DeleteFrom(table).
+		Where("target_type=? AND target_id=?", channelType, channelID).
+		Exec(); err != nil {
+		db.Warn("RemoveConvExtForChannel: 删除群 ext 行失败（事务回滚）",
+			zap.String("channelID", channelID),
+			zap.Error(err))
+		return
+	}
+
+	prefix := escapeLike(channelID) + threadSeparator + "%"
+	if _, err := tx.DeleteBySql(
+		"DELETE FROM "+table+
+			" WHERE target_type=? AND target_id LIKE ? ESCAPE '|'",
+		targetTypeThread, prefix,
+	).Exec(); err != nil {
+		db.Warn("RemoveConvExtForChannel: 级联删除子区 ext 行失败（事务回滚）",
+			zap.String("channelID", channelID),
+			zap.Error(err))
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		db.Warn("RemoveConvExtForChannel: Commit 失败",
+			zap.String("channelID", channelID),
+			zap.Error(err))
 	}
 }

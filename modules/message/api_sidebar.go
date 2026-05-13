@@ -19,10 +19,13 @@
 //      recent  – pinned DESC, timestamp DESC.
 // 7. Return SidebarSyncResp{Items, Version}.
 //
-// Design constraint: this file does NOT import modules/group, modules/user,
-// or modules/thread to avoid circular dependencies.  It accesses the DB
-// directly via ctx.DB() or through already-imported DB helpers in the
-// message package.
+// Module dependencies: imports modules/conversation_ext (for ext rows) and
+// modules/thread (for QueryByShortIDs to enrich thread items with last_message_at).
+// Does NOT import modules/group or modules/user — group_setting / pinned data
+// are read via ctx.DB() raw queries to avoid pulling in those packages.
+//
+// Note: a follow-up review item (Important #4 — read pinned via a user-module
+// helper) may eventually replace the raw user_pinned_channel query.
 package message
 
 import (
@@ -440,6 +443,13 @@ func buildFollowItems(
 //   - DM: always included (no time window).
 //   - Group / Thread: only included if timestamp > threeDaysAgo().
 //   - The returned slice is not yet sorted.
+//
+// Intentional non-rule (PR review Important #6): unfollowed groups
+// (group_unfollowed=1 in user_conversation_ext) are NOT filtered out here.
+// Per PM decision on issue #337 — "取消关注就是移除关注列表，放到最近 tab" —
+// an unfollowed group still belongs in the recent tab as long as it has
+// activity within the 72 h window.  The unfollow blacklist only affects
+// the follow tab.
 func buildRecentItems(
 	convs []*config.SyncUserConversationResp,
 	pinnedSet map[string]struct{},

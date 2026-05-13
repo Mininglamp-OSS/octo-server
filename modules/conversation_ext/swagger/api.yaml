@@ -1,8 +1,8 @@
 swagger: "2.0"
 info:
-  description: "DMWork Follow API — 关注/取消关注/排序操作"
+  description: "Octo Follow API — 关注/取消关注/排序操作"
   version: "1.0.0"
-  title: "DMWork Follow API"
+  title: "Octo Follow API"
 host: "api.botgate.cn"
 tags:
   - name: "follow"
@@ -241,6 +241,7 @@ paths:
                   $ref: "#/definitions/sortItem"
               version:
                 type: integer
+                format: int64
                 description: "客户端持有的当前版本号，用于 CAS 并发控制"
       responses:
         200:
@@ -248,7 +249,11 @@ paths:
           schema:
             $ref: "#/definitions/response"
         400:
-          description: "参数错误、无效 target_type 或 version conflict"
+          description: |
+            业务错误（msg 字段携带具体说明）：
+            - 参数错误：items 为空、target_type 不在白名单 (1/2/5)
+            - "version conflict: please retry"：CAS 版本号不匹配，客户端应重新拉取最新版本后重试
+            - "sort target not found"：items[0] 指向的目标在服务端不存在（可能并发被取消关注），客户端应重新拉取关注列表
           schema:
             $ref: "#/definitions/response"
       security:
@@ -267,7 +272,6 @@ definitions:
     required:
       - target_type
       - target_id
-      - sort
     properties:
       target_type:
         type: integer
@@ -278,7 +282,9 @@ definitions:
         description: "目标 ID（DM 为 peer_uid，群为 group_no，子区为 thread_channel_id）"
       sort:
         type: integer
-        description: "排序值（客户端侧参考值；服务端以 items 数组顺序为准）"
+        description: |
+          可选，客户端侧的本地排序值，服务端忽略此字段；最终 follow_sort 完全按 items 数组顺序（1, 2, 3, ...）重新分配。
+          字段保留是为了客户端在传输前后保持自身数据结构一致，未来可能完全弃用。
   response:
     type: object
     properties:
