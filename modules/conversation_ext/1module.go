@@ -7,10 +7,15 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/register"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 )
 
 //go:embed sql
 var sqlFS embed.FS
+
+//go:embed swagger/api.yaml
+var swaggerContent string
 
 // ---------------------------------------------------------------------------
 // Global singleton — same pattern as modules/user/db_pinned.go
@@ -48,14 +53,15 @@ func GetGlobalConvExtService() *Service {
 // when a user leaves a space") will be defined in task #5.
 type CleanupHookFn func(uid, spaceID string) error
 
+// cleanupHooks holds the registered callbacks.
 var (
 	cleanupHooksMu sync.RWMutex
 	cleanupHooks   []CleanupHookFn
 )
 
 // RegisterCleanupHook allows external modules to register a cascade-cleanup
-// callback.  Stub implementation: nil is accepted silently (no-op); the full
-// dispatch logic will be added in task #5.
+// callback.  This is a stub implementation: passing nil is accepted silently
+// (no-op).  The full dispatch logic will be added in task #5.
 func RegisterCleanupHook(fn CleanupHookFn) {
 	if fn == nil {
 		return
@@ -65,9 +71,13 @@ func RegisterCleanupHook(fn CleanupHookFn) {
 	cleanupHooks = append(cleanupHooks, fn)
 }
 
+// ---------------------------------------------------------------------------
 // resetGlobalConvExtServiceOnce is a test-only helper that resets the
 // sync.Once so individual tests can call InitGlobalConvExtService independently.
-// Cannot be called from production code — the *testing.T parameter enforces this.
+// It must NOT be called from production code — the *testing.T parameter
+// enforces this at compile time.
+// ---------------------------------------------------------------------------
+
 func resetGlobalConvExtServiceOnce(_ *testing.T) {
 	globalConvExtServiceOnce = sync.Once{}
 	globalConvExtService = nil
@@ -76,6 +86,29 @@ func resetGlobalConvExtServiceOnce(_ *testing.T) {
 // ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
+
+// followRouter is a thin wrapper that implements register.APIRouter so the
+// Follow handlers are wired into the global route table via SetupAPI.
+type followRouter struct {
+	ctx *config.Context
+	f   *Follow
+}
+
+// Route registers all 7 Follow endpoints under /v2/follow with auth and space
+// middleware — mirrors the pattern in modules/user/api.go (pinned group).
+func (fr *followRouter) Route(r *wkhttp.WKHttp) {
+	grp := r.Group("/v2/follow",
+		fr.ctx.AuthMiddleware(r),
+		spacepkg.SpaceMiddleware(fr.ctx),
+	)
+	grp.POST("/dm", fr.f.FollowDM)
+	grp.DELETE("/dm", fr.f.UnfollowDM)
+	grp.POST("/channel/unfollow", fr.f.UnfollowChannel)
+	grp.POST("/channel/refollow", fr.f.FollowChannel)
+	grp.POST("/thread", fr.f.FollowThread)
+	grp.DELETE("/thread", fr.f.UnfollowThread)
+	grp.PUT("/sort", fr.f.UpdateSort)
+}
 
 func init() {
 	register.AddModule(func(ctx interface{}) register.Module {
@@ -90,6 +123,24 @@ func init() {
 			Name:    "conversation_ext",
 			SQLDir:  register.NewSQLFS(sqlFS),
 			Service: GetGlobalConvExtService(),
+		}
+	})
+
+	// Register Follow API routes as a separate module entry so the HTTP
+	// handlers are wired without interfering with the migration/service
+	// registration above.
+	register.AddModule(func(ctx interface{}) register.Module {
+		appCtx := ctx.(*config.Context)
+		svc := GetGlobalConvExtService()
+		db := NewDB(appCtx)
+		f := NewFollow(svc, db)
+
+		return register.Module{
+			Name: "conversation_ext_follow",
+			SetupAPI: func() register.APIRouter {
+				return &followRouter{ctx: appCtx, f: f}
+			},
+			Swagger: swaggerContent,
 		}
 	})
 }
