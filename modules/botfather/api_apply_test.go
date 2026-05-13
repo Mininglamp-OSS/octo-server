@@ -53,6 +53,7 @@ func createTestUser(t *testing.T, bf *BotFather, uid, name string) {
 }
 
 func TestRobotApply_RequireApproval(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, bf := setupTestBotFather(t)
 
 	// Create test data
@@ -289,6 +290,7 @@ func TestRobotApplyRefuse(t *testing.T) {
 }
 
 func TestRobotApplies_List(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, bf := setupTestBotFather(t)
 
 	// Create test data

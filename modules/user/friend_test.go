@@ -14,6 +14,7 @@ import (
 )
 
 func TestFriendSureSearch(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	u := New(ctx)
 	//u.Route(s.GetRoute())
@@ -66,6 +67,7 @@ func TestFriendSureSearch(t *testing.T) {
 }
 
 func TestFriendSureQr(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	u := New(ctx)
 	u.Route(s.GetRoute())

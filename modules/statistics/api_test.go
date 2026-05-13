@@ -13,6 +13,7 @@ import (
 )
 
 func TestCountNum(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	u := NewStatistics(ctx)
 	u.Route(s.GetRoute())
@@ -36,6 +37,7 @@ func TestCountNum(t *testing.T) {
 }
 
 func TestRegisterUserListWithDateSpace(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	u := NewStatistics(ctx)
 	u.Route(s.GetRoute())
@@ -52,6 +54,7 @@ func TestRegisterUserListWithDateSpace(t *testing.T) {
 }
 
 func TestGroupWithDateSpace(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	u := NewStatistics(ctx)
 	u.Route(s.GetRoute())

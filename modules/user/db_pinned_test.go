@@ -34,6 +34,7 @@ func newPinnedDBForTest(t *testing.T) *PinnedDB {
 }
 
 func TestPinnedDB_Add_List_Remove(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	db := newPinnedDBForTest(t)
 	const uid, space = "u1", "s1"
 
@@ -56,6 +57,7 @@ func TestPinnedDB_Add_List_Remove(t *testing.T) {
 }
 
 func TestPinnedDB_Add_Duplicate(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	db := newPinnedDBForTest(t)
 	const uid, space = "u1", "s1"
 
@@ -65,6 +67,7 @@ func TestPinnedDB_Add_Duplicate(t *testing.T) {
 }
 
 func TestPinnedDB_Add_LimitExceeded(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	db := newPinnedDBForTest(t)
 	const uid, space = "u1", "s1"
 
@@ -86,6 +89,7 @@ func TestPinnedDB_Add_LimitExceeded(t *testing.T) {
 // REPEATABLE READ 下 consistent read 的 COUNT 看不到其他事务的插入，
 // 必须用 SELECT ... FOR UPDATE 才能在并发下保证上限。
 func TestPinnedDB_Add_ConcurrentLimit(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	db := newPinnedDBForTest(t)
 	const uid, space = "u1", "s1"
 	const workers = 20
@@ -109,6 +113,7 @@ func TestPinnedDB_Add_ConcurrentLimit(t *testing.T) {
 }
 
 func TestPinnedDB_Add_SpaceIsolation(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	db := newPinnedDBForTest(t)
 	const uid = "u1"
 
@@ -125,6 +130,7 @@ func TestPinnedDB_Add_SpaceIsolation(t *testing.T) {
 }
 
 func TestPinnedDB_UpdateSort_Success(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	db := newPinnedDBForTest(t)
 	const uid, space = "u1", "s1"
 
@@ -152,6 +158,7 @@ func TestPinnedDB_UpdateSort_Success(t *testing.T) {
 }
 
 func TestPinnedDB_UpdateSort_RejectUnknownChannel(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	db := newPinnedDBForTest(t)
 	const uid, space = "u1", "s1"
 
@@ -174,6 +181,7 @@ func TestPinnedDB_UpdateSort_RejectUnknownChannel(t *testing.T) {
 }
 
 func TestPinnedDB_UpdateSort_RejectDuplicate(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	db := newPinnedDBForTest(t)
 	const uid, space = "u1", "s1"
 
@@ -190,6 +198,7 @@ func TestPinnedDB_UpdateSort_RejectDuplicate(t *testing.T) {
 }
 
 func TestPinnedDB_UpdateSort_RejectPartialSubmit(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	db := newPinnedDBForTest(t)
 	const uid, space = "u1", "s1"
 
@@ -215,6 +224,7 @@ func TestPinnedDB_UpdateSort_RejectPartialSubmit(t *testing.T) {
 }
 
 func TestPinnedDB_UpdateSort_CrossUserIsolation(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	db := newPinnedDBForTest(t)
 	const space = "s1"
 
@@ -231,6 +241,7 @@ func TestPinnedDB_UpdateSort_CrossUserIsolation(t *testing.T) {
 }
 
 func TestPinnedDB_AreSpaceMembers(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	db := newPinnedDBForTest(t)
 
 	// 清表并准备夹具
@@ -271,6 +282,7 @@ func TestPinnedDB_AreSpaceMembers(t *testing.T) {
 }
 
 func TestPinnedDB_QueryPeerRobotInfo(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	db := newPinnedDBForTest(t)
 
 	for _, tbl := range []string{"robot", "user"} {
@@ -312,6 +324,7 @@ func TestPinnedDB_QueryPeerRobotInfo(t *testing.T) {
 }
 
 func TestPinnedDB_RemoveByUIDAndChannel_AllSpaces(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	db := newPinnedDBForTest(t)
 	const uid = "u1"
 

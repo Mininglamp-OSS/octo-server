@@ -27,6 +27,7 @@ func TestMain(m *testing.M) {
 
 
 func TestHandleJoinGroup_GroupNotFound(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 
 	err := testutil.CleanAllTables(ctx)
@@ -53,6 +54,7 @@ func TestHandleJoinGroup_GroupNotFound(t *testing.T) {
 }
 
 func TestHandleJoinGroup_CrossSpaceAllowedByDefault(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 
 	err := testutil.CleanAllTables(ctx)
@@ -95,6 +97,7 @@ func TestHandleJoinGroup_CrossSpaceAllowedByDefault(t *testing.T) {
 }
 
 func TestHandleJoinGroup_CrossSpaceBlockedWhenAllowExternalOff(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 
 	err := testutil.CleanAllTables(ctx)

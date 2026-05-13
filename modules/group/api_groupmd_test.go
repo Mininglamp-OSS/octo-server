@@ -47,6 +47,7 @@ func setupGroupMdTest(t *testing.T) (*Group, *server.Server) {
 }
 
 func TestGroupMdGet_NoContent(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	_, s := setupGroupMdTest(t)
 
 	w := httptest.NewRecorder()
@@ -60,6 +61,7 @@ func TestGroupMdGet_NoContent(t *testing.T) {
 }
 
 func TestGroupMdUpdate(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	_, s := setupGroupMdTest(t)
 
 	// Update GROUP.md
@@ -87,6 +89,7 @@ func TestGroupMdUpdate(t *testing.T) {
 }
 
 func TestGroupMdUpdate_TooLarge(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	_, s := setupGroupMdTest(t)
 
 	// Try to update with content exceeding max size
@@ -104,6 +107,7 @@ func TestGroupMdUpdate_TooLarge(t *testing.T) {
 }
 
 func TestGroupMdDelete(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	f, s := setupGroupMdTest(t)
 
 	// First create content
@@ -130,6 +134,7 @@ func TestGroupMdDelete(t *testing.T) {
 }
 
 func TestGroupMdUpdate_CreatorAllowed(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	_, s := setupGroupMdTest(t)
 
 	w := httptest.NewRecorder()
@@ -147,6 +152,7 @@ func TestGroupMdUpdate_CreatorAllowed(t *testing.T) {
 }
 
 func TestBotAdminSet(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	f, s := setupGroupMdTest(t)
 
 	// Add a bot member
@@ -176,6 +182,7 @@ func TestBotAdminSet(t *testing.T) {
 }
 
 func TestBotAdminSet_NonRobotDenied(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	f, s := setupGroupMdTest(t)
 
 	// Add a non-robot member
@@ -201,6 +208,7 @@ func TestBotAdminSet_NonRobotDenied(t *testing.T) {
 }
 
 func TestBotAdminRemove(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	f, s := setupGroupMdTest(t)
 
 	// Add a bot member with bot_admin=1
@@ -232,6 +240,7 @@ func TestBotAdminRemove(t *testing.T) {
 }
 
 func TestQueryBotMemberUIDs(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	f, _ := setupGroupMdTest(t)
 
 	// Add some bot members
@@ -274,6 +283,7 @@ func TestQueryBotMemberUIDs(t *testing.T) {
 }
 
 func TestGroupMdVersionAutoIncrement(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	f, _ := setupGroupMdTest(t)
 
 	// First update

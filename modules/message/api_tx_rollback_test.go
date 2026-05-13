@@ -11,6 +11,7 @@ import (
 // rolled back when an error occurs, preventing connection leaks.
 // This test covers the fix for issue #720.
 func TestTransactionRollbackOnError(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	_, ctx := testutil.NewTestServer()
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)

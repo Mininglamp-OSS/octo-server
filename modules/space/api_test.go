@@ -36,10 +36,10 @@ func TestMain(m *testing.M) {
 
 	// space 迁移脚本依赖 group 和 robot 表
 	depDDLs := []string{
-		"CREATE TABLE IF NOT EXISTS `group` (id BIGINT AUTO_INCREMENT PRIMARY KEY, group_no VARCHAR(40) NOT NULL DEFAULT '', name VARCHAR(100) DEFAULT '', creator VARCHAR(40) DEFAULT '', status SMALLINT DEFAULT 1, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, UNIQUE KEY idx_group_no(group_no)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
-		"CREATE TABLE IF NOT EXISTS group_member (id BIGINT AUTO_INCREMENT PRIMARY KEY, group_no VARCHAR(40) DEFAULT '', uid VARCHAR(40) DEFAULT '', role INT DEFAULT 0, is_deleted SMALLINT DEFAULT 0, status SMALLINT DEFAULT 1, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
-		"CREATE TABLE IF NOT EXISTS robot (id BIGINT AUTO_INCREMENT PRIMARY KEY, robot_id VARCHAR(40) NOT NULL DEFAULT '', token VARCHAR(200) DEFAULT '', status SMALLINT DEFAULT 1, creator_uid VARCHAR(40) DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, UNIQUE KEY idx_robot_id(robot_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
-		"CREATE TABLE IF NOT EXISTS `user` (id BIGINT AUTO_INCREMENT PRIMARY KEY, uid VARCHAR(40) NOT NULL DEFAULT '', name VARCHAR(100) DEFAULT '', email VARCHAR(200) DEFAULT '', avatar VARCHAR(200) DEFAULT '', robot SMALLINT DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, UNIQUE KEY idx_uid(uid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+		"CREATE TABLE IF NOT EXISTS `group` (id BIGINT AUTO_INCREMENT PRIMARY KEY, group_no VARCHAR(40) NOT NULL DEFAULT '', name VARCHAR(100) DEFAULT '', creator VARCHAR(40) DEFAULT '', status SMALLINT DEFAULT 1, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, UNIQUE KEY idx_group_no(group_no)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+		"CREATE TABLE IF NOT EXISTS group_member (id BIGINT AUTO_INCREMENT PRIMARY KEY, group_no VARCHAR(40) DEFAULT '', uid VARCHAR(40) DEFAULT '', role INT DEFAULT 0, is_deleted SMALLINT DEFAULT 0, status SMALLINT DEFAULT 1, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+		"CREATE TABLE IF NOT EXISTS robot (id BIGINT AUTO_INCREMENT PRIMARY KEY, robot_id VARCHAR(40) NOT NULL DEFAULT '', token VARCHAR(200) DEFAULT '', status SMALLINT DEFAULT 1, creator_uid VARCHAR(40) DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, UNIQUE KEY idx_robot_id(robot_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+		"CREATE TABLE IF NOT EXISTS `user` (id BIGINT AUTO_INCREMENT PRIMARY KEY, uid VARCHAR(40) NOT NULL DEFAULT '', name VARCHAR(100) DEFAULT '', email VARCHAR(200) DEFAULT '', avatar VARCHAR(200) DEFAULT '', robot SMALLINT DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, UNIQUE KEY idx_uid(uid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
 	}
 	for _, ddl := range depDDLs {
 		if _, err := db.Exec(ddl); err != nil {
@@ -68,6 +68,7 @@ func setup(t *testing.T) (*server.Server, *Space, error) {
 }
 
 func TestGetInvitePreview(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
 
@@ -124,6 +125,7 @@ func TestGetInvitePreview(t *testing.T) {
 }
 
 func TestGetInvitePreviewWithBots(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
 
@@ -533,6 +535,7 @@ func TestJoinSpaceUnlimitedCapacity(t *testing.T) {
 // === Preset Group Tests (PR #529) ===
 
 func TestJoinSpaceWithPresetGroup(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
 

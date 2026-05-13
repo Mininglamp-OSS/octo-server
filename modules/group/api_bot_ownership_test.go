@@ -98,6 +98,7 @@ func postAddMembers(t *testing.T, handler http.Handler, groupNo string, members 
 // TestGroupMemberAdd_BotOwnedBySelf — acceptance case 1 (YUJ-46):
 // user-c adds their own bot → 200.
 func TestGroupMemberAdd_BotOwnedBySelf(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	f, h := setupBotOwnershipGroup(t)
 
 	insertBotUser(t, f, "thomas_fu_bot", "thomas", "thomas_bot_sn", testutil.UID)

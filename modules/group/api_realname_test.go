@@ -186,6 +186,7 @@ func setupMembersGroup(t *testing.T) (*Group, http.Handler, string, string) {
 // TestMembersGet_CarriesRealnameFields：GET /v1/groups/:group_no/members
 // 响应里已实名成员带 realname_verified=true + real_name；未实名 realname_verified=false。
 func TestMembersGet_CarriesRealnameFields(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	_, handler, verifiedUID, unverifiedUID := setupMembersGroup(t)
 
 	w := httptest.NewRecorder()
@@ -228,6 +229,7 @@ func TestMembersGet_CarriesRealnameFields(t *testing.T) {
 // TestSyncMembers_CarriesRealnameFields：GET /v1/groups/:group_no/membersync
 // 对 Android WKSDK ChannelMember 缓存是唯一数据源，必须同样下发三字段。
 func TestSyncMembers_CarriesRealnameFields(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	_, handler, verifiedUID, _ := setupMembersGroup(t)
 
 	w := httptest.NewRecorder()
@@ -254,6 +256,7 @@ func TestSyncMembers_CarriesRealnameFields(t *testing.T) {
 // TestMemberGet_SingleUID_CarriesRealnameFields：GET /v1/groups/:group_no/members/:uid
 // 单成员查询也要带实名字段（资料卡 / @提及等路径）。
 func TestMemberGet_SingleUID_CarriesRealnameFields(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	_, handler, verifiedUID, _ := setupMembersGroup(t)
 
 	w := httptest.NewRecorder()

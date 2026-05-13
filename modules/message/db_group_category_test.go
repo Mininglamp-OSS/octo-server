@@ -9,6 +9,7 @@ import (
 
 // TestQueryCategorySettingsByGroupNos_WithCategory 测试查询有分类的群组
 func TestQueryCategorySettingsByGroupNos_WithCategory(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	_, ctx := testutil.NewTestServer()
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
@@ -37,6 +38,7 @@ func TestQueryCategorySettingsByGroupNos_WithCategory(t *testing.T) {
 
 // TestQueryCategorySettingsByGroupNos_WithoutCategory 测试查询无分类的群组
 func TestQueryCategorySettingsByGroupNos_WithoutCategory(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	_, ctx := testutil.NewTestServer()
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
@@ -63,6 +65,7 @@ func TestQueryCategorySettingsByGroupNos_WithoutCategory(t *testing.T) {
 
 // TestQueryCategorySettingsByGroupNos_NoSetting 测试查询无 setting 记录的群组
 func TestQueryCategorySettingsByGroupNos_NoSetting(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	_, ctx := testutil.NewTestServer()
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)

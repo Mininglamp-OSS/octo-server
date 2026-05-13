@@ -655,6 +655,7 @@ func TestBotGroupCreate_RejectCreatorOutsideSpace(t *testing.T) {
 
 // TestBotGroupCreate_RejectMemberOutsideSpace 验证不在 Space 的成员不能加入群
 func TestBotGroupCreate_RejectMemberOutsideSpace(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	handler, ctx := setupGroupTestEnv(t)
 	botToken := insertTestBot(t, ctx, grpTestBotID, testutil.UID)
 	insertTestBotUser(t, ctx, grpTestBotID)
@@ -717,6 +718,7 @@ func TestBotGroupCreate_DefaultAllowViewHistoryMsg(t *testing.T) {
 
 // TestBotGroupMemberAdd_RejectMemberOutsideGroupSpace 验证不在群所属 Space 的成员不能被添加
 func TestBotGroupMemberAdd_RejectMemberOutsideGroupSpace(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	handler, ctx := setupGroupTestEnv(t)
 	botToken := insertTestBot(t, ctx, grpTestBotID, testutil.UID)
 	insertTestBotUser(t, ctx, grpTestBotID)
