@@ -25,6 +25,7 @@ import (
 	_ "github.com/Mininglamp-OSS/octo-server/modules/robot"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/botfather"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/category"
+	_ "github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/channel"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/common"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/file"
