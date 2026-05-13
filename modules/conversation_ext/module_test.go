@@ -82,14 +82,3 @@ func TestTableExists(t *testing.T) {
 	assert.Equal(t, 1, count, "table %q must exist in the test database", table)
 }
 
-// TestOnHookFuncs_NotNil verifies that the hook registration functions are
-// available (even if they are stubs for now). The actual implementations will
-// be filled in by task #5.
-func TestOnHookFuncs_NotNil(t *testing.T) {
-	// RegisterCleanupHook is the outward-facing API for other modules to
-	// register cascade-cleanup callbacks.  Calling it with a nil fn must
-	// not panic (idempotent/no-op contract for stubs).
-	assert.NotPanics(t, func() {
-		RegisterCleanupHook(nil)
-	}, "RegisterCleanupHook(nil) must not panic")
-}

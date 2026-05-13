@@ -11,6 +11,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/pool"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"go.uber.org/zap"
 )
@@ -64,6 +65,7 @@ func (g *Group) handleGroupDisbandEvent(data []byte, commit config.EventCommit) 
 	}
 	// 清理所有用户对该群的置顶
 	user.RemovePinnedForChannel(req.GroupNo, common.ChannelTypeGroup.Uint8())
+	conversation_ext.RemoveConvExtForChannel(req.GroupNo, common.ChannelTypeGroup.Uint8())
 	commit(nil)
 }
 

@@ -26,6 +26,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/source"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
+	"github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
@@ -2958,10 +2959,12 @@ func (g *Group) groupExit(c *wkhttp.Context) {
 			}
 			g.removeUserFromGroupThreads(groupNo, bu.UID, groupInfo.SpaceID)
 			user.RemovePinnedForUserInSpace(bu.UID, groupInfo.SpaceID, groupNo, common.ChannelTypeGroup.Uint8())
+			conversation_ext.RemoveConvExtForUserInSpace(bu.UID, groupInfo.SpaceID, groupNo, common.ChannelTypeGroup.Uint8())
 		}
 	}
 	// 清理用户在该群的置顶（按 Space 隔离）
 	user.RemovePinnedForUserInSpace(loginUID, groupInfo.SpaceID, groupNo, common.ChannelTypeGroup.Uint8())
+	conversation_ext.RemoveConvExtForUserInSpace(loginUID, groupInfo.SpaceID, groupNo, common.ChannelTypeGroup.Uint8())
 	c.ResponseOK()
 
 }
@@ -3008,6 +3011,7 @@ func (g *Group) removeUserFromGroupThreads(groupNo, uid, spaceID string) {
 		}
 		// 清理用户在该子区的置顶
 		user.RemovePinnedForUserInSpace(uid, spaceID, channelID, common.ChannelTypeCommunityTopic.Uint8())
+		conversation_ext.RemoveConvExtForUserInSpace(uid, spaceID, channelID, common.ChannelTypeCommunityTopic.Uint8())
 	}
 }
 

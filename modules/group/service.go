@@ -15,6 +15,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkevent"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
+	"github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/gocraft/dbr/v2"
@@ -1675,6 +1676,7 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 			s.removeUserFromGroupThreads(req.GroupNo, uid, groupModel.SpaceID)
 			// 清理用户在该群的置顶（按 Space 隔离）
 			user.RemovePinnedForUserInSpace(uid, groupModel.SpaceID, req.GroupNo, common.ChannelTypeGroup.Uint8())
+			conversation_ext.RemoveConvExtForUserInSpace(uid, groupModel.SpaceID, req.GroupNo, common.ChannelTypeGroup.Uint8())
 		}
 	}
 
@@ -1867,6 +1869,7 @@ func (s *Service) removeUserFromGroupThreads(groupNo, uid, spaceID string) {
 		}
 		// 清理用户在该子区的置顶
 		user.RemovePinnedForUserInSpace(uid, spaceID, channelID, common.ChannelTypeCommunityTopic.Uint8())
+		conversation_ext.RemoveConvExtForUserInSpace(uid, spaceID, channelID, common.ChannelTypeCommunityTopic.Uint8())
 	}
 }
 

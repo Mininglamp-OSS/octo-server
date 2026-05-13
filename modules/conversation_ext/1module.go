@@ -45,33 +45,6 @@ func GetGlobalConvExtService() *Service {
 }
 
 // ---------------------------------------------------------------------------
-// Cascade-cleanup hook — stub for task #5
-// ---------------------------------------------------------------------------
-
-// CleanupHookFn is the signature for cascade-cleanup callbacks that other
-// modules can register.  The concrete contract (e.g. "delete all ext rows
-// when a user leaves a space") will be defined in task #5.
-type CleanupHookFn func(uid, spaceID string) error
-
-// cleanupHooks holds the registered callbacks.
-var (
-	cleanupHooksMu sync.RWMutex
-	cleanupHooks   []CleanupHookFn
-)
-
-// RegisterCleanupHook allows external modules to register a cascade-cleanup
-// callback.  This is a stub implementation: passing nil is accepted silently
-// (no-op).  The full dispatch logic will be added in task #5.
-func RegisterCleanupHook(fn CleanupHookFn) {
-	if fn == nil {
-		return
-	}
-	cleanupHooksMu.Lock()
-	defer cleanupHooksMu.Unlock()
-	cleanupHooks = append(cleanupHooks, fn)
-}
-
-// ---------------------------------------------------------------------------
 // resetGlobalConvExtServiceOnce is a test-only helper that resets the
 // sync.Once so individual tests can call InitGlobalConvExtService independently.
 // It must NOT be called from production code — the *testing.T parameter
@@ -114,10 +87,10 @@ func init() {
 	register.AddModule(func(ctx interface{}) register.Module {
 		appCtx := ctx.(*config.Context)
 
-		// Initialise the global singleton so it is available to other modules
-		// (e.g. for cascade-cleanup hooks registered via RegisterCleanupHook)
-		// before any HTTP request is served.
+		// Initialise both singletons so they are available to other modules
+		// (group, thread, user) for cascade-cleanup before any HTTP request is served.
 		InitGlobalConvExtService(appCtx)
+		InitGlobalConvExtDB(appCtx)
 
 		return register.Module{
 			Name:    "conversation_ext",

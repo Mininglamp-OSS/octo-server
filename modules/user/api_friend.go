@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	"github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	wkutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
 	chservice "github.com/Mininglamp-OSS/octo-server/modules/channel/service"
 	"github.com/Mininglamp-OSS/octo-server/modules/source"
@@ -278,6 +279,9 @@ func (f *Friend) delete(c *wkhttp.Context) {
 	// 清理双方的好友置顶
 	RemovePinnedForUser(loginUID, uid, common.ChannelTypePerson.Uint8())
 	RemovePinnedForUser(uid, loginUID, common.ChannelTypePerson.Uint8())
+	// 级联清理双方的 DM ext 关注行
+	conversation_ext.RemoveConvExtForUser(loginUID, uid)
+	conversation_ext.RemoveConvExtForUser(uid, loginUID)
 
 	c.ResponseOK()
 }
