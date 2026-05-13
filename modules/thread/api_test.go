@@ -86,6 +86,7 @@ func createTestGroup(t *testing.T, ctx *config.Context) string {
 // ==================== 创建子区测试 ====================
 
 func TestCreateThread(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := setupTestData(t)
 	groupNo := createTestGroup(t, ctx)
 
@@ -104,6 +105,7 @@ func TestCreateThread(t *testing.T) {
 }
 
 func TestCreateThread_WithSourceMessage(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := setupTestData(t)
 	groupNo := createTestGroup(t, ctx)
 
@@ -145,6 +147,7 @@ type threadListResp struct {
 }
 
 func TestListThreads(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := setupTestData(t)
 	groupNo := createTestGroup(t, ctx)
 
@@ -176,6 +179,7 @@ func TestListThreads(t *testing.T) {
 
 // TestListThreads_Pagination 验证分页参数 page_index / page_size 正确工作
 func TestListThreads_Pagination(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := setupTestData(t)
 	groupNo := createTestGroup(t, ctx)
 

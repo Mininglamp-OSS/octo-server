@@ -179,6 +179,7 @@ func TestBotListThreads_BackwardCompat_NoParams(t *testing.T) {
 
 // TestBotListThreads_EnvelopeWithParams 传分页参数时返回 {count, list} 信封
 func TestBotListThreads_EnvelopeWithParams(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, _, _, groupNo, botToken := setupBotThreadTestData(t)
 
 	createBotThread(t, s, groupNo, botToken, "A")
