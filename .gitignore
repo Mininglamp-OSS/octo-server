@@ -82,3 +82,6 @@ dmworkim
 scripts/healthcheck.sh
 .claude/
 testenv/miniodata/
+
+# TestMakeCompose temporary fixture (modules/file/service_test.go:46)
+modules/file/test.png
