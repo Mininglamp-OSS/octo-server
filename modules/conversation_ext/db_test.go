@@ -1,3 +1,5 @@
+//go:build integration
+
 package conversation_ext
 
 import (
@@ -29,8 +31,8 @@ func newDBForTest(t *testing.T) *DB {
 	return NewDB(ctx)
 }
 
-// int8Ptr と int64Ptr は table-driven テストの可読性向上ヘルパー。
-func int8Ptr(v int8) *int8   { return &v }
+// int8Ptr 等是 table-driven 测试中提高可读性的小辅助。
+func int8Ptr(v int8) *int8    { return &v }
 func int64Ptr(v int64) *int64 { return &v }
 func intPtr(v int) *int       { return &v }
 
@@ -186,16 +188,16 @@ func TestDB_ListFollowedDM_BasicOrder(t *testing.T) {
 	require.NoError(t, db.Upsert(uid, space, 1, "dm-a", ConvExtFields{FollowedDM: int8Ptr(1), DMCategoryID: &cat2, FollowSort: intPtr(5)}))
 	require.NoError(t, db.Upsert(uid, space, 1, "dm-b", ConvExtFields{FollowedDM: int8Ptr(1), DMCategoryID: &cat1, FollowSort: intPtr(3)}))
 	require.NoError(t, db.Upsert(uid, space, 1, "dm-c", ConvExtFields{FollowedDM: int8Ptr(1), DMCategoryID: &cat1, FollowSort: intPtr(1)}))
-	// 未関注 DM（リストに含まれてはいけない）
+	// 未关注的 DM（不应出现在列表里）
 	require.NoError(t, db.Upsert(uid, space, 1, "dm-unfollowed", ConvExtFields{FollowedDM: int8Ptr(0)}))
-	// 群（type=2, リストに含まれてはいけない）
+	// 群（type=2，不应出现在列表里）
 	require.NoError(t, db.Upsert(uid, space, 2, "grp-1", ConvExtFields{FollowedDM: int8Ptr(0)}))
 
 	list, err := db.ListFollowedDM(uid, space)
 	require.NoError(t, err)
 	require.Len(t, list, 3)
 
-	// 期待ソート: (dm_category_id ASC, follow_sort ASC)
+	// 期望排序：(dm_category_id ASC, follow_sort ASC)
 	// cat1/sort1 → cat1/sort3 → cat2/sort5
 	assert.Equal(t, "dm-c", list[0].TargetID)
 	assert.Equal(t, "dm-b", list[1].TargetID)
@@ -237,7 +239,7 @@ func TestDB_ListUnfollowedGroups_Basic(t *testing.T) {
 
 	require.NoError(t, db.Upsert(uid, space, 2, "grp-unfollowed", ConvExtFields{GroupUnfollowed: int8Ptr(1)}))
 	require.NoError(t, db.Upsert(uid, space, 2, "grp-followed", ConvExtFields{GroupUnfollowed: int8Ptr(0)}))
-	// DM（type=1）は含まれない
+	// DM（type=1）不应出现
 	require.NoError(t, db.Upsert(uid, space, 1, "dm-x", ConvExtFields{GroupUnfollowed: int8Ptr(1)}))
 
 	list, err := db.ListUnfollowedGroups(uid, space)
@@ -272,12 +274,12 @@ func TestDB_UpdateSort_Success(t *testing.T) {
 	}, 0 /* expectedVersion */)
 	require.NoError(t, err)
 
-	// dm-3 が先頭になっていること、version が 1 増えていること
+	// dm-3 排到首位（follow_sort=1）。
+	// Phase 3 之后 per-row version 不再被 UpdateSort 推进，所以这里不断言 m.Version。
 	m, err := db.Get(uid, space, 1, "dm-3")
 	require.NoError(t, err)
 	require.NotNil(t, m)
 	assert.Equal(t, 1, m.FollowSort)
-	assert.Equal(t, 1, m.Version)
 
 	m2, err := db.Get(uid, space, 1, "dm-1")
 	require.NoError(t, err)
@@ -296,12 +298,12 @@ func TestDB_UpdateSort_VersionConflict(t *testing.T) {
 
 	require.NoError(t, db.Upsert(uid, space, 1, "dm-1", ConvExtFields{FollowedDM: int8Ptr(1)}))
 
-	// 正常に version=0→1 に進める
+	// 正常推进 follow_version 0→1
 	require.NoError(t, db.UpdateSort(uid, space, []SortItem{
 		{TargetType: 1, TargetID: "dm-1"},
 	}, 0))
 
-	// 古い version=0 で再試行 → ErrVersionConflict
+	// 用旧 version=0 重试 → ErrVersionConflict
 	err := db.UpdateSort(uid, space, []SortItem{
 		{TargetType: 1, TargetID: "dm-1"},
 	}, 0)
@@ -310,7 +312,7 @@ func TestDB_UpdateSort_VersionConflict(t *testing.T) {
 
 func TestDB_UpdateSort_EmptyItems_NoOp(t *testing.T) {
 	db := newDBForTest(t)
-	// items が空のとき、version チェックもスキップして nil を返す
+	// items 为空时跳过版本校验直接返回 nil
 	err := db.UpdateSort("u1", "s1", []SortItem{}, 0)
 	require.NoError(t, err)
 }
@@ -318,18 +320,22 @@ func TestDB_UpdateSort_EmptyItems_NoOp(t *testing.T) {
 func TestDB_UpdateSort_VersionBumps_Sequential(t *testing.T) {
 	db := newDBForTest(t)
 	const uid, space = "u1", "s1"
+	fvDB := NewFollowVersionDB(newCtxForTest(t))
+	// Wipe so the user starts at follow_version=0.
+	_, _ = db.session.DeleteFrom(followVersionTable).Exec()
 
 	require.NoError(t, db.Upsert(uid, space, 1, "dm-seq", ConvExtFields{FollowedDM: int8Ptr(1)}))
 
-	for expectedVer := 0; expectedVer < 3; expectedVer++ {
+	// PR review Round-3 Blocking #1/#2: CAS anchor is user_follow_version, not
+	// per-row version. Each successful UpdateSort bumps follow_version by 1.
+	for expectedVer := int64(0); expectedVer < 3; expectedVer++ {
 		require.NoError(t, db.UpdateSort(uid, space, []SortItem{
 			{TargetType: 1, TargetID: "dm-seq"},
 		}, expectedVer))
 
-		m, err := db.Get(uid, space, 1, "dm-seq")
+		v, err := fvDB.Get(uid, space)
 		require.NoError(t, err)
-		require.NotNil(t, m)
-		assert.Equal(t, expectedVer+1, m.Version)
+		assert.Equal(t, expectedVer+1, v, "follow_version must advance monotonically")
 	}
 }
 
@@ -362,7 +368,7 @@ func TestDB_UpdateSort_ConcurrentConflict(t *testing.T) {
 	wg.Wait()
 	close(successCh)
 
-	// version=0 での成功は高々 1 回だけ
+	// 起始 version=0 时只允许 1 次成功
 	successes := 0
 	for range successCh {
 		successes++
@@ -377,7 +383,7 @@ func TestDB_UpdateSort_ConcurrentConflict(t *testing.T) {
 func TestDB_Upsert_UniqueKey_SameKeyDifferentUsers(t *testing.T) {
 	db := newDBForTest(t)
 
-	// 同 target、違う uid はそれぞれ独立した行になる
+	// 同 target、不同 uid 应各自独立成行
 	require.NoError(t, db.Upsert("u1", "s1", 1, "shared-dm", ConvExtFields{FollowedDM: int8Ptr(1)}))
 	require.NoError(t, db.Upsert("u2", "s1", 1, "shared-dm", ConvExtFields{FollowedDM: int8Ptr(0)}))
 
@@ -395,7 +401,7 @@ func TestDB_Upsert_UniqueKey_SameKeyDifferentUsers(t *testing.T) {
 func TestDB_Upsert_UniqueKey_SameKeyDifferentTypes(t *testing.T) {
 	db := newDBForTest(t)
 
-	// 同 target_id でも target_type が違えば別行
+	// 同 target_id 但 target_type 不同时是不同的行
 	require.NoError(t, db.Upsert("u1", "s1", 1, "target-x", ConvExtFields{FollowedDM: int8Ptr(1)}))
 	require.NoError(t, db.Upsert("u1", "s1", 2, "target-x", ConvExtFields{GroupUnfollowed: int8Ptr(1)}))
 

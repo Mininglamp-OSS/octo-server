@@ -1,3 +1,5 @@
+//go:build integration
+
 package conversation_ext
 
 import (
@@ -81,4 +83,3 @@ func TestTableExists(t *testing.T) {
 	require.NoError(t, err, "information_schema query must not error")
 	assert.Equal(t, 1, count, "table %q must exist in the test database", table)
 }
-

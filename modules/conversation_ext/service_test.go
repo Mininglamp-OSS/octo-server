@@ -1,3 +1,5 @@
+//go:build integration
+
 package conversation_ext
 
 import (
@@ -371,8 +373,8 @@ func TestService_UnfollowChannel_GroupNoWithUnderscore_DoesNotMatchOtherGroups(t
 	svc := newServiceForTest(t)
 	// groupNo contains underscores which are LIKE wildcards
 	const uid, space = "u1", "s1"
-	const grpA = "1_2"  // contains underscore
-	const grpB = "1X2"  // differs only in that position
+	const grpA = "1_2" // contains underscore
+	const grpB = "1X2" // differs only in that position
 
 	threadA := grpA + "____thr-a"
 	threadB := grpB + "____thr-b"

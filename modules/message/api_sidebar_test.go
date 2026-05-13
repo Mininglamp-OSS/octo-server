@@ -16,6 +16,7 @@ package message
 
 import (
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -78,6 +79,45 @@ func TestValidateSidebarRequest_Valid_Follow(t *testing.T) {
 func TestValidateSidebarRequest_Valid_Recent(t *testing.T) {
 	req := &sidebarSyncReq{Tab: "recent", DeviceUUID: "dev-1"}
 	assert.NoError(t, validateSidebarRequest(req))
+}
+
+func TestValidateSidebarRequest_NegativeVersion(t *testing.T) {
+	req := &sidebarSyncReq{Tab: "recent", DeviceUUID: "dev-1", Version: -1}
+	err := validateSidebarRequest(req)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "version")
+}
+
+func TestValidateSidebarRequest_NegativeMsgCount(t *testing.T) {
+	req := &sidebarSyncReq{Tab: "recent", DeviceUUID: "dev-1", MsgCount: -1}
+	err := validateSidebarRequest(req)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "msg_count")
+}
+
+func TestValidateSidebarRequest_MsgCountTooLarge(t *testing.T) {
+	req := &sidebarSyncReq{Tab: "recent", DeviceUUID: "dev-1", MsgCount: maxMsgCount + 1}
+	err := validateSidebarRequest(req)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "msg_count")
+}
+
+func TestValidateSidebarRequest_DeviceUUIDTooLong(t *testing.T) {
+	req := &sidebarSyncReq{Tab: "recent", DeviceUUID: strings.Repeat("a", maxDeviceUUIDLen+1)}
+	err := validateSidebarRequest(req)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "device_uuid")
+}
+
+func TestValidateSidebarRequest_LastMsgSeqsTooLong(t *testing.T) {
+	req := &sidebarSyncReq{
+		Tab:         "recent",
+		DeviceUUID:  "dev-1",
+		LastMsgSeqs: strings.Repeat("a", maxLastMsgSeqsLen+1),
+	}
+	err := validateSidebarRequest(req)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "last_msg_seqs")
 }
 
 // ---------------------------------------------------------------------------
@@ -266,6 +306,15 @@ func TestBuildRecentItems_PinnedFirst(t *testing.T) {
 // mergeThreadEntries — append standalone thread entries not in IM result
 // ---------------------------------------------------------------------------
 
+// followedG1 is the standard "g1 is followed" set used in mergeThreadEntries tests.
+func followedG1() (map[string]*GroupCategorySetting, map[string]struct{}) {
+	cat := "cat-1"
+	return map[string]*GroupCategorySetting{
+			"g1": {GroupNo: "g1", CategoryID: &cat, CategorySort: 1},
+		},
+		map[string]struct{}{}
+}
+
 func TestMergeThreadEntries_AddsNewEntry(t *testing.T) {
 	existing := []*SidebarItem{
 		{TargetID: "g1____th1", TargetType: int(common.ChannelTypeCommunityTopic)},
@@ -280,7 +329,8 @@ func TestMergeThreadEntries_AddsNewEntry(t *testing.T) {
 		"th2": timePtr(time.Now().Add(-30 * time.Minute)),
 	}
 
-	result := mergeThreadEntries(existing, threadExtRows, lastMsgAtMap)
+	cat, unfollowed := followedG1()
+	result := mergeThreadEntries(existing, threadExtRows, lastMsgAtMap, cat, unfollowed)
 	require.Len(t, result, 2)
 	ids := []string{result[0].TargetID, result[1].TargetID}
 	assert.Contains(t, ids, th2ChannelID)
@@ -293,14 +343,60 @@ func TestMergeThreadEntries_NoDuplicateIfAlreadyPresent(t *testing.T) {
 	threadExtRows := []*convext.Model{
 		{TargetID: "g1____th1", FollowSort: 1}, // already present
 	}
-	result := mergeThreadEntries(existing, threadExtRows, nil)
+	cat, unfollowed := followedG1()
+	result := mergeThreadEntries(existing, threadExtRows, nil, cat, unfollowed)
 	assert.Len(t, result, 1) // no duplicate
 }
 
 func TestMergeThreadEntries_EmptyExt(t *testing.T) {
 	existing := []*SidebarItem{}
-	result := mergeThreadEntries(existing, nil, nil)
+	cat, unfollowed := followedG1()
+	result := mergeThreadEntries(existing, nil, nil, cat, unfollowed)
 	assert.Len(t, result, 0)
+}
+
+// PR review (Round 3) Blocking #4: DB-only thread entries must respect the same
+// parent-follow predicate that buildFollowItems applies to IM-returned threads.
+// If the parent group is unfollowed, the standalone thread must NOT surface.
+func TestMergeThreadEntries_SkipWhenParentUnfollowed(t *testing.T) {
+	existing := []*SidebarItem{}
+	threadExtRows := []*convext.Model{
+		{TargetID: "g1____th-orphan", FollowSort: 1},
+	}
+	cat, _ := followedG1()
+	unfollowed := map[string]struct{}{"g1": {}}
+
+	result := mergeThreadEntries(existing, threadExtRows, nil, cat, unfollowed)
+	assert.Len(t, result, 0,
+		"thread whose parent group is unfollowed must NOT be merged into follow tab")
+}
+
+// PR review (Round 3) Blocking #4 — companion: parent group with no category
+// (i.e. not in the follow set) → thread must be filtered.
+func TestMergeThreadEntries_SkipWhenParentHasNoCategory(t *testing.T) {
+	existing := []*SidebarItem{}
+	threadExtRows := []*convext.Model{
+		{TargetID: "g-noCat____th-orphan", FollowSort: 1},
+	}
+	cat, unfollowed := followedG1() // only g1 is in the follow set, g-noCat is not
+
+	result := mergeThreadEntries(existing, threadExtRows, nil, cat, unfollowed)
+	assert.Len(t, result, 0,
+		"thread whose parent group lacks a category (not in follow set) must NOT be merged")
+}
+
+// PR review (Round 3) Blocking #4 — malformed thread channel ID (no separator)
+// must be skipped silently rather than appended with an empty parent.
+func TestMergeThreadEntries_SkipMalformedChannelID(t *testing.T) {
+	existing := []*SidebarItem{}
+	threadExtRows := []*convext.Model{
+		{TargetID: "no-separator-here", FollowSort: 1},
+	}
+	cat, unfollowed := followedG1()
+
+	result := mergeThreadEntries(existing, threadExtRows, nil, cat, unfollowed)
+	assert.Len(t, result, 0,
+		"malformed thread channel id (no separator) must be skipped")
 }
 
 // ---------------------------------------------------------------------------
@@ -388,10 +484,10 @@ func TestSortRecentItems_Empty(t *testing.T) {
 
 func TestBuildFollowItems_MixedTypes(t *testing.T) {
 	convs := []*config.SyncUserConversationResp{
-		makeIMConv("g1", common.ChannelTypeGroup.Uint8(), nowRecent()),         // followed group
-		makeIMConv("peer1", common.ChannelTypePerson.Uint8(), nowRecent()),      // followed DM
-		makeIMConv("peer2", common.ChannelTypePerson.Uint8(), nowRecent()),      // un-followed DM
-		makeIMConv("g2", common.ChannelTypeGroup.Uint8(), nowRecent()),          // group without category
+		makeIMConv("g1", common.ChannelTypeGroup.Uint8(), nowRecent()),                 // followed group
+		makeIMConv("peer1", common.ChannelTypePerson.Uint8(), nowRecent()),             // followed DM
+		makeIMConv("peer2", common.ChannelTypePerson.Uint8(), nowRecent()),             // un-followed DM
+		makeIMConv("g2", common.ChannelTypeGroup.Uint8(), nowRecent()),                 // group without category
 		makeIMConv("g1____th1", common.ChannelTypeCommunityTopic.Uint8(), nowRecent()), // followed thread
 	}
 	categorySetting := map[string]*GroupCategorySetting{
@@ -496,12 +592,14 @@ func TestParseThreadChannelIDSidebar_Invalid(t *testing.T) {
 // mergeThreadEntries — nil lastMsgAtMap
 // ---------------------------------------------------------------------------
 
+// retained: nil lastMsgAtMap is valid; merge still succeeds with ts=0.
 func TestMergeThreadEntries_NilLastMsgAtMap(t *testing.T) {
 	existing := []*SidebarItem{}
 	extRows := []*convext.Model{
 		{TargetID: "g1____th1", FollowSort: 1},
 	}
-	result := mergeThreadEntries(existing, extRows, nil)
+	cat, unfollowed := followedG1()
+	result := mergeThreadEntries(existing, extRows, nil, cat, unfollowed)
 	require.Len(t, result, 1)
 	assert.Equal(t, "g1____th1", result[0].TargetID)
 	assert.Equal(t, int64(0), result[0].Timestamp) // no timestamp available
@@ -511,5 +609,5 @@ func TestMergeThreadEntries_NilLastMsgAtMap(t *testing.T) {
 // helpers used only in tests
 // ---------------------------------------------------------------------------
 
-func strPtr(s string) *string { return &s }
+func strPtr(s string) *string        { return &s }
 func timePtr(t time.Time) *time.Time { return &t }

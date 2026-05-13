@@ -297,79 +297,8 @@ paths:
             $ref: "#/definitions/response"
       security:
         - token: []
-  /v2/sidebar/sync:
-    post:
-      tags:
-        - "conversation"
-      summary: "v2 Sidebar 聚合同步（按 Tab）"
-      description: |
-        Web 端 Sidebar 聚合接口。根据 tab 参数返回不同维度的会话条目列表。
-
-        **follow Tab（关注）**：
-        - 群：`group_setting.category_id IS NOT NULL` 且用户未取消关注（`group_unfollowed=0`）
-        - DM：`user_conversation_ext.followed_dm=1`
-        - 子区：父群在 follow 集合 + 该子区有 ext 行
-        - 排序：`category_sort ASC` → `pinned DESC` → `follow_sort ASC`
-        - 不过滤 3 天时间窗口
-
-        **recent Tab（最近）**：
-        - 直接基于 IM 核心返回的会话列表
-        - 群 / 子区：仅保留 `timestamp > NOW - 72h`
-        - DM：全保留（不受时间窗口限制）
-        - 排序：`pinned DESC` → `timestamp DESC`
-      operationId: "v2SidebarSync"
-      consumes:
-        - "application/json"
-      produces:
-        - "application/json"
-      parameters:
-        - in: "body"
-          name: "body"
-          required: true
-          schema:
-            type: object
-            required:
-              - tab
-              - device_uuid
-            properties:
-              tab:
-                type: string
-                enum: ["follow", "recent"]
-                description: "Sidebar 标签（关注 / 最近）"
-              version:
-                type: integer
-                format: int64
-                description: "客户端当前版本号（透传给 IM 核心）"
-              last_msg_seqs:
-                type: string
-                description: "客户端所有会话的最后一条消息序列号（透传给 IM 核心）"
-              msg_count:
-                type: integer
-                format: int64
-                description: "每个会话拉取的最近消息条数"
-              device_uuid:
-                type: string
-                description: "设备 UUID（必填）"
-      responses:
-        200:
-          description: "返回"
-          schema:
-            type: object
-            properties:
-              items:
-                type: array
-                items:
-                  $ref: "#/definitions/sidebarItem"
-              version:
-                type: integer
-                format: int64
-                description: "IM 核心返回的最新版本号（用于下次同步的 cursor）"
-        400:
-          description: "参数错误"
-          schema:
-            $ref: "#/definitions/response"
-      security:
-        - token: []
+  # NOTE: v2 sidebar 接口的 swagger 文档独立放在 conversation_v2.yaml
+  # 因为本文件的 basePath 是 /v1。
 
 securityDefinitions:
   token:
@@ -379,46 +308,6 @@ securityDefinitions:
     description: "用户token"
 
 definitions:
-  sidebarItem:
-    type: "object"
-    properties:
-      target_type:
-        type: integer
-        description: "目标类型：1=DM / 2=群 / 5=子区"
-      target_id:
-        type: string
-        description: "目标 ID（DM: peerUID；群: groupNo；子区: channelID）"
-      channel_type:
-        type: integer
-        description: "频道类型（与 target_type 对应）"
-      channel_id:
-        type: string
-        description: "频道 ID"
-      timestamp:
-        type: integer
-        format: int64
-        description: "最后一次会话时间（Unix 秒）"
-      unread:
-        type: integer
-        description: "未读消息数"
-      is_pinned:
-        type: boolean
-        description: "是否置顶（来自 user_pinned_channel）"
-      is_followed:
-        type: boolean
-        description: "是否已关注"
-      category_id:
-        type: string
-        description: "所属分组 ID（仅 follow tab；群为 group_setting.category_id，DM 为 ext.dm_category_id 转字符串）"
-      category_sort:
-        type: integer
-        description: "分组内排序权重（来自 group_category.sort）"
-      follow_sort:
-        type: integer
-        description: "关注列表内排序权重（来自 user_conversation_ext.follow_sort）"
-      parent_channel_id:
-        type: string
-        description: "父群频道 ID（仅子区条目返回）"
   group:
     type: "object"
     properties:

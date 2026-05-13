@@ -2,14 +2,21 @@ package message
 
 import (
 	"errors"
-	"os"
-	"runtime/debug"
 	"fmt"
 	"net/http"
+	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
+	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/model"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/register"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	"github.com/Mininglamp-OSS/octo-server/modules/channel"
 	chservice "github.com/Mininglamp-OSS/octo-server/modules/channel/service"
@@ -18,13 +25,6 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
-	"github.com/Mininglamp-OSS/octo-lib/common"
-	"github.com/Mininglamp-OSS/octo-lib/config"
-	"github.com/Mininglamp-OSS/octo-lib/model"
-	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
-	"github.com/Mininglamp-OSS/octo-lib/pkg/register"
-	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
-	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 )
@@ -109,7 +109,7 @@ func (co *Conversation) Route(r *wkhttp.WKHttp) {
 		// 离线的最近会话
 		conversation.POST("/sync", co.syncUserConversation)
 		conversation.POST("/syncack", co.syncUserConversationAck)
-		conversation.POST("/extra/sync", co.conversationExtraSync) // 同步最近会话扩展
+		conversation.POST("/extra/sync", co.conversationExtraSync)   // 同步最近会话扩展
 		conversation.PUT("/clearUnread", co.clearConversationUnread) // 清除未读（正确拼写路径）
 	}
 	conversations := r.Group("/v1/conversations", co.ctx.AuthMiddleware(r), uidLimit)
@@ -432,7 +432,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	groupMap := map[string]*group.GroupResp{}                   // 群详情
 	conversationExtraMap := map[string]*conversationExtraResp{} // 最近会话扩展
 	groupVailds := make([]string, 0, len(conversations))        // 有效群
-	activeThreadShortIDs := make(map[string]struct{})            // 有效子区
+	activeThreadShortIDs := make(map[string]struct{})           // 有效子区
 
 	// ---------- 是否在群内 ----------
 	if len(groupNos) > 0 {
@@ -1265,7 +1265,7 @@ type SyncUserConversationResp struct {
 	Version          int64                  `json:"version,omitempty"`            // 数据版本
 	Recents          []*MsgSyncResp         `json:"recents,omitempty"`            // 最近N条消息
 	Extra            *conversationExtraResp `json:"extra,omitempty"`              // 扩展
-	BotType          string                 `json:"bot_type,omitempty"`            // Bot 类型（"app_bot" 表示应用 Bot）
+	BotType          string                 `json:"bot_type,omitempty"`           // Bot 类型（"app_bot" 表示应用 Bot）
 }
 
 func newSyncUserConversationResp(resp *config.SyncUserConversationResp, extra *conversationExtraResp, loginUID string, messageExtraDB *messageExtraDB, messageReactionDB *messageReactionDB, messageUserExtraDB *messageUserExtraDB, mute int, stick int, channelOffsetM *channelOffsetModel, deviceOffsetM *deviceOffsetModel, channelOffsetMessageSeq uint32) *SyncUserConversationResp {

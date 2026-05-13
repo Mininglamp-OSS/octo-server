@@ -13,35 +13,35 @@ import (
 
 // 错误定义
 var (
-	// ErrVersionConflict は UpdateSort の CAS に失敗したときに返す。
-	// 呼び出し元は errors.Is で判定して再試行を促す。
+	// ErrVersionConflict 在 UpdateSort 的 CAS 失败时返回。
+	// 调用方应用 errors.Is 判定并重试。
 	ErrVersionConflict = errors.New("version conflict: please retry")
-	// ErrSortTargetNotFound は UpdateSort で指定した先頭の target が存在しないときに返す。
-	// SELECT ... FOR UPDATE が空振りすると CAS の前提（行ロックを取れる）が崩れるため、
-	// 静かに成功させずに明示的に弾く。
+	// ErrSortTargetNotFound 在 UpdateSort 指定的 target 任一不存在时返回。
+	// 任一 SELECT ... FOR UPDATE 落空都意味着 CAS 的"能锁住所有目标行"前提崩塌，
+	// 不能静默成功，必须显式拒绝。
 	ErrSortTargetNotFound = errors.New("sort target not found")
 )
 
-// Model は user_conversation_ext テーブルの 1 行に対応する。
+// Model 对应 user_conversation_ext 表的一行。
 type Model struct {
-	ID              int64      `db:"id"`
-	UID             string     `db:"uid"`
-	SpaceID         string     `db:"space_id"`
-	TargetType      uint8      `db:"target_type"`
-	TargetID        string     `db:"target_id"`
-	FollowedDM      int8       `db:"followed_dm"`
-	DMCategoryID    *int64     `db:"dm_category_id"`
-	GroupUnfollowed int8       `db:"group_unfollowed"`
-	FollowSort      int        `db:"follow_sort"`
-	Version         int        `db:"version"`
-	CreatedAt       time.Time  `db:"created_at"`
-	UpdatedAt       time.Time  `db:"updated_at"`
+	ID              int64     `db:"id"`
+	UID             string    `db:"uid"`
+	SpaceID         string    `db:"space_id"`
+	TargetType      uint8     `db:"target_type"`
+	TargetID        string    `db:"target_id"`
+	FollowedDM      int8      `db:"followed_dm"`
+	DMCategoryID    *int64    `db:"dm_category_id"`
+	GroupUnfollowed int8      `db:"group_unfollowed"`
+	FollowSort      int       `db:"follow_sort"`
+	Version         int       `db:"version"`
+	CreatedAt       time.Time `db:"created_at"`
+	UpdatedAt       time.Time `db:"updated_at"`
 }
 
-// ConvExtFields は Upsert 時に更新可能なフィールドのセットを表す。
-// nil ポインタはそのフィールドを更新しないことを意味する。
-// ClearDMCategory が true のとき dm_category_id を NULL に更新する
-// （DMCategoryID と同時に指定した場合は ClearDMCategory が優先される）。
+// ConvExtFields 描述 Upsert 时可更新的字段集合。
+// nil 指针表示该字段不参与更新。
+// ClearDMCategory 为 true 时把 dm_category_id 更新为 NULL
+// （与 DMCategoryID 同时指定时 ClearDMCategory 优先）。
 type ConvExtFields struct {
 	FollowedDM      *int8
 	DMCategoryID    *int64
@@ -50,19 +50,19 @@ type ConvExtFields struct {
 	FollowSort      *int
 }
 
-// SortItem は UpdateSort で渡す並べ替え 1 要素。
+// SortItem 是传给 UpdateSort 的单条排序项。
 type SortItem struct {
 	TargetType uint8
 	TargetID   string
 }
 
-// DB は user_conversation_ext テーブルへのアクセスを提供する。
+// DB 提供对 user_conversation_ext 表的访问。
 type DB struct {
 	session *dbr.Session
 	log.Log
 }
 
-// NewDB は DB を生成する。
+// NewDB 构造 DB。
 func NewDB(ctx *config.Context) *DB {
 	return &DB{
 		session: ctx.DB(),
@@ -72,16 +72,16 @@ func NewDB(ctx *config.Context) *DB {
 
 const table = "user_conversation_ext"
 
-// Upsert は (uid, space_id, target_type, target_id) を UK として INSERT OR UPDATE する。
-// fields に指定された（非 nil の）フィールドをINSERT 時の初期値として設定し、
-// 重複キー時にも同じフィールドを UPDATE する。
-// すべてのフィールドが nil かつ ClearDMCategory も false の場合は INSERT IGNORE のみ実行する
-// （存在すれば何も変えない、存在しなければデフォルト値で挿入）。
+// Upsert 以 (uid, space_id, target_type, target_id) 为 UK 做 INSERT OR UPDATE。
+// fields 中（非 nil 的）字段在 INSERT 时作为初值写入，
+// 命中重复键时同样用这些字段 UPDATE。
+// 当所有字段都为 nil 且 ClearDMCategory=false 时仅执行 INSERT IGNORE
+// （存在则不变，不存在则按默认值插入）。
 func (d *DB) Upsert(uid, spaceID string, targetType uint8, targetID string, fields ConvExtFields) error {
 	extraCols, extraVals, setClauses, setArgs := buildUpsertParts(fields)
 
 	if len(setClauses) == 0 {
-		// UPDATE すべきフィールドがない場合は INSERT IGNORE のみ
+		// 没有需要 UPDATE 的字段时只跑 INSERT IGNORE
 		_, err := d.session.InsertBySql(
 			"INSERT IGNORE INTO "+table+
 				" (uid, space_id, target_type, target_id) VALUES (?, ?, ?, ?)",
@@ -91,7 +91,7 @@ func (d *DB) Upsert(uid, spaceID string, targetType uint8, targetID string, fiel
 	}
 
 	// INSERT ... ON DUPLICATE KEY UPDATE
-	// INSERT 側にも同じフィールドを含めることで新規行にも値が設定される。
+	// 在 INSERT 侧也带上同样字段，新行就能拿到对应初值。
 	colsSQL := "uid, space_id, target_type, target_id"
 	if len(extraCols) > 0 {
 		colsSQL += ", " + strings.Join(extraCols, ", ")
@@ -111,12 +111,12 @@ func (d *DB) Upsert(uid, spaceID string, targetType uint8, targetID string, fiel
 	return err
 }
 
-// buildUpsertParts は ConvExtFields から INSERT 用の追加列/値と
-// ON DUPLICATE KEY UPDATE 用の SET 句を組み立てる。
-// extraCols/extraVals は INSERT 列リストと VALUES プレースホルダへ追加する。
-// setClauses/setArgs は ON DUPLICATE KEY UPDATE 句で使う。
-// ClearDMCategory の場合のみ SET 句に "dm_category_id = NULL" を追加し、
-// INSERT 側では dm_category_id を列に含めない（NULL はデフォルト値と等価）。
+// buildUpsertParts 从 ConvExtFields 构造 INSERT 的追加列/值
+// 以及 ON DUPLICATE KEY UPDATE 的 SET 子句。
+// extraCols/extraVals 用于追加到 INSERT 的列名列表和 VALUES 占位符。
+// setClauses/setArgs 用于 ON DUPLICATE KEY UPDATE 子句。
+// 仅 ClearDMCategory 情况下 SET 中加入 "dm_category_id = NULL"，
+// INSERT 侧不把 dm_category_id 列出来（NULL 等价于默认值）。
 func buildUpsertParts(f ConvExtFields) (extraCols []string, extraVals []interface{}, setClauses []string, setArgs []interface{}) {
 	if f.FollowedDM != nil {
 		extraCols = append(extraCols, "followed_dm")
@@ -126,8 +126,8 @@ func buildUpsertParts(f ConvExtFields) (extraCols []string, extraVals []interfac
 	}
 	switch {
 	case f.ClearDMCategory:
-		// INSERT 側: 列を追加しない（NULL がデフォルト）
-		// UPDATE 側: 明示的に NULL に戻す
+		// INSERT 侧：不加列（NULL 即默认值）
+		// UPDATE 侧：显式置回 NULL
 		setClauses = append(setClauses, "dm_category_id = NULL")
 	case f.DMCategoryID != nil:
 		extraCols = append(extraCols, "dm_category_id")
@@ -150,7 +150,7 @@ func buildUpsertParts(f ConvExtFields) (extraCols []string, extraVals []interfac
 	return extraCols, extraVals, setClauses, setArgs
 }
 
-// Get は単一行を返す。行が存在しない場合は (nil, nil) を返す。
+// Get 返回单行。行不存在时返回 (nil, nil)。
 func (d *DB) Get(uid, spaceID string, targetType uint8, targetID string) (*Model, error) {
 	var m Model
 	err := d.session.SelectBySql(
@@ -167,7 +167,7 @@ func (d *DB) Get(uid, spaceID string, targetType uint8, targetID string) (*Model
 	return &m, nil
 }
 
-// Delete は指定行を削除する。行が存在しない場合もエラーを返さない。
+// Delete 删除指定行。行不存在时也不返回错误。
 func (d *DB) Delete(uid, spaceID string, targetType uint8, targetID string) error {
 	_, err := d.session.DeleteFrom(table).
 		Where("uid=? AND space_id=? AND target_type=? AND target_id=?",
@@ -176,9 +176,9 @@ func (d *DB) Delete(uid, spaceID string, targetType uint8, targetID string) erro
 	return err
 }
 
-// ListFollowedDM は followed_dm=1 の全 DM（target_type=1）行を
-// (dm_category_id ASC, follow_sort ASC) 順で返す。
-// dm_category_id が NULL の行はソート上先頭扱いになる（NULL first）。
+// ListFollowedDM 返回所有 followed_dm=1 的 DM 行（target_type=1），
+// 按 (dm_category_id ASC, follow_sort ASC) 排序。
+// dm_category_id 为 NULL 的行排在最前（NULL first）。
 func (d *DB) ListFollowedDM(uid, spaceID string) ([]*Model, error) {
 	var list []*Model
 	_, err := d.session.SelectBySql(
@@ -190,8 +190,8 @@ func (d *DB) ListFollowedDM(uid, spaceID string) ([]*Model, error) {
 	return list, err
 }
 
-// ListUnfollowedGroups は group_unfollowed=1 の群（target_type=2）行を返す。
-// 関注 Tab でグループが既に「取り消し関注」済みかどうかを判断するために使う。
+// ListUnfollowedGroups 返回 group_unfollowed=1 的群行（target_type=2）。
+// 用于关注 Tab 判断某个群是否已"取消关注"。
 func (d *DB) ListUnfollowedGroups(uid, spaceID string) ([]*Model, error) {
 	var list []*Model
 	_, err := d.session.SelectBySql(
@@ -202,9 +202,9 @@ func (d *DB) ListUnfollowedGroups(uid, spaceID string) ([]*Model, error) {
 	return list, err
 }
 
-// ListThreadExts は target_type=5（子区）の ext 行を
-// (follow_sort ASC) 順で返す。
-// follow tab の子区独立条目の構築に使う。
+// ListThreadExts 返回 target_type=5（子区）的 ext 行，
+// 按 (follow_sort ASC) 排序。
+// 用于 follow tab 里子区独立条目的构造。
 func (d *DB) ListThreadExts(uid, spaceID string) ([]*Model, error) {
 	var list []*Model
 	_, err := d.session.SelectBySql(
@@ -216,62 +216,106 @@ func (d *DB) ListThreadExts(uid, spaceID string) ([]*Model, error) {
 	return list, err
 }
 
-// UpdateSort は CAS で follow_sort を一括更新する。
+// UpdateSort 通过 CAS 一次性更新 follow_sort。
 //
-// 並行一致性:
-//   - BEGIN → SELECT version FOR UPDATE → version == expectedVersion を確認 →
-//     バッチ UPDATE follow_sort & version+1 → COMMIT。
-//   - version が一致しない場合は ErrVersionConflict を返す（ロールバック済み）。
-//   - items が空のとき、何もせず nil を返す。
-func (d *DB) UpdateSort(uid, spaceID string, items []SortItem, expectedVersion int) error {
+// PR review Round-3 Blocking #1/#2/#5 修正后的并发一致性：
+//   - BEGIN → 用 FOR UPDATE 锁 user_follow_version 的 (uid, space_id) 行取当前值。
+//   - cur != expectedVersion → ErrVersionConflict（回滚）。
+//   - 用 (target_type, target_id) 升序 FOR UPDATE 锁 user_conversation_ext 全部目标行。
+//     返回行数 != len(items) → ErrSortTargetNotFound（回滚）。
+//   - 对每一行 UPDATE follow_sort，并校验 RowsAffected==1。
+//   - 最后在同 tx 内把 user_follow_version +1。
+//   - items 为空时什么也不做，返回 nil。
+//
+// 旧实现的漏洞：
+//
+//	(1) 只锁 items[0] → items[1..] 缺失会被 0 行 UPDATE 静默吞掉。
+//	(2) 不同首 item 的并发调用没有共享锁行，完全交错执行。
+//	(3) 把 per-row version 当成用户级 CAS 的锚，但新关注的行 version=0，
+//	    与既存行不一致，导致 UpdateSort 要么硬通过要么永远失败。
+//
+// 修复是引入 user_follow_version 表 (uid, space_id, version) 作为 CAS 的单一根，
+// 任何 follow 状态变化都对它 +1，从根上解决问题。
+func (d *DB) UpdateSort(uid, spaceID string, items []SortItem, expectedVersion int64) error {
 	if len(items) == 0 {
 		return nil
 	}
 
 	tx, err := d.session.Begin()
 	if err != nil {
-		return err
+		return fmt.Errorf("update sort: begin tx: %w", err)
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	// SELECT version FOR UPDATE — REPEATABLE READ 下でも current read を保証する。
-	// db_pinned.go の SELECT COUNT(*) FOR UPDATE と同じパターン。
-	//
-	// items[0] を CAS のアンカーとして利用するため、その行が存在しない場合は
-	// FOR UPDATE で何もロックできず、後続の UPDATE も 0 行に effect する。
-	// 結果として呼び出しが「成功」を返してしまい、並行 UpdateSort が完全に
-	// 直列化されない（PR review Blocking #1 に対応）。明示的に弾く。
-	var currentVersion int
-	// LoadOne を使うのが必須。dbr の Load は行が無くても (0, nil) を返すため、
-	// それを ErrNotFound と誤判定すると CAS が静かに通過する。
-	err = tx.SelectBySql(
-		"SELECT version FROM "+table+
-			" WHERE uid=? AND space_id=? AND target_type=? AND target_id=? FOR UPDATE",
-		uid, spaceID, items[0].TargetType, items[0].TargetID,
-	).LoadOne(&currentVersion)
-	if err != nil {
-		if err == dbr.ErrNotFound {
-			return ErrSortTargetNotFound
-		}
-		return err
+	// 1. 锁 follow_version 行并取当前值。行不存在则初始化（version=0）。
+	if err := ensureFollowVersionRowTx(tx, uid, spaceID); err != nil {
+		return fmt.Errorf("update sort: %w", err)
 	}
-
-	if currentVersion != expectedVersion {
+	var cur int64
+	if err := tx.SelectBySql(
+		"SELECT version FROM "+followVersionTable+
+			" WHERE uid=? AND space_id=? FOR UPDATE",
+		uid, spaceID,
+	).LoadOne(&cur); err != nil {
+		return fmt.Errorf("update sort: lock follow_version: %w", err)
+	}
+	if cur != expectedVersion {
 		return ErrVersionConflict
 	}
 
-	// バッチ UPDATE: 配列インデックスを follow_sort に使い、同時に version を +1 する。
-	nextVersion := currentVersion + 1
+	// 2. 用 SELECT ... FOR UPDATE 按确定顺序锁住全部 ext 行。
+	pairPlaceholders := make([]string, len(items))
+	selectArgs := make([]interface{}, 0, 2+len(items)*2)
+	selectArgs = append(selectArgs, uid, spaceID)
+	for i, it := range items {
+		pairPlaceholders[i] = "(?, ?)"
+		selectArgs = append(selectArgs, it.TargetType, it.TargetID)
+	}
+	type lockedRow struct {
+		TargetType uint8  `db:"target_type"`
+		TargetID   string `db:"target_id"`
+	}
+	var locked []lockedRow
+	if _, err = tx.SelectBySql(
+		"SELECT target_type, target_id FROM "+table+
+			" WHERE uid=? AND space_id=?"+
+			" AND (target_type, target_id) IN ("+strings.Join(pairPlaceholders, ", ")+")"+
+			" ORDER BY target_type, target_id FOR UPDATE",
+		selectArgs...,
+	).Load(&locked); err != nil {
+		return fmt.Errorf("update sort: lock rows: %w", err)
+	}
+	if len(locked) != len(items) {
+		return ErrSortTargetNotFound
+	}
+
+	// 3. 逐行 UPDATE follow_sort，确认 RowsAffected==1。
 	for i, item := range items {
-		if _, err = tx.UpdateBySql(
-			"UPDATE "+table+
-				" SET follow_sort=?, version=?"+
+		res, err := tx.UpdateBySql(
+			"UPDATE "+table+" SET follow_sort=?"+
 				" WHERE uid=? AND space_id=? AND target_type=? AND target_id=?",
-			i+1, nextVersion, uid, spaceID, item.TargetType, item.TargetID,
-		).Exec(); err != nil {
-			return err
+			i+1, uid, spaceID, item.TargetType, item.TargetID,
+		).Exec()
+		if err != nil {
+			return fmt.Errorf("update sort: update row (%d,%s): %w", item.TargetType, item.TargetID, err)
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("update sort: rows affected: %w", err)
+		}
+		if affected != 1 {
+			// 锁后行被并发删除等，逻辑上不可达。保守起见按 conflict 处理。
+			return ErrVersionConflict
 		}
 	}
 
-	return tx.Commit()
+	// 4. 同 tx 内把 follow_version +1。
+	if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
+		return fmt.Errorf("update sort: bump follow_version: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("update sort: commit: %w", err)
+	}
+	return nil
 }

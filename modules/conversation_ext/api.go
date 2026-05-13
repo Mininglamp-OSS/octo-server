@@ -2,6 +2,7 @@ package conversation_ext
 
 import (
 	"errors"
+	"net/http"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
@@ -26,7 +27,7 @@ type followService interface {
 
 // sortDB is the subset of *DB that the sort handler needs.
 type sortDB interface {
-	UpdateSort(uid, spaceID string, items []SortItem, expectedVersion int) error
+	UpdateSort(uid, spaceID string, items []SortItem, expectedVersion int64) error
 }
 
 // validFollowTargetTypes is the white-list for target_type in sort items.
@@ -81,8 +82,11 @@ type sortItemReq struct {
 }
 
 type updateSortReq struct {
-	Items   []sortItemReq `json:"items"`
-	Version int           `json:"version"`
+	Items []sortItemReq `json:"items"`
+	// Version 是 CAS 锚。客户端把最近一次 sidebar 响应里的 follow_version
+	// 原样回传，服务端与 user_follow_version 表（PR review Round-3
+	// Blocking #1/#2）比对。
+	Version int64 `json:"version"`
 }
 
 // ---------------------------------------------------------------------------
@@ -228,6 +232,13 @@ func (f *Follow) FollowThread(c *wkhttp.Context) {
 	}
 
 	if err := f.svc.FollowThread(loginUID, spaceID, req.ThreadChannelID); err != nil {
+		// PR review (Round 3) Blocking #3：鉴权失败返回 403。
+		// 不向客户端泄露内部细节，只写到日志（zap.Error）。
+		if errors.Is(err, ErrThreadForbidden) {
+			f.Warn("关注子区认证失败", zap.Error(err))
+			c.ResponseErrorWithStatus(pkgerrors.New("无权关注该子区"), http.StatusForbidden)
+			return
+		}
 		f.Error("关注子区失败", zap.Error(err))
 		c.ResponseError(pkgerrors.New("关注子区失败"))
 		return

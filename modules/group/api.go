@@ -23,10 +23,10 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	chservice "github.com/Mininglamp-OSS/octo-server/modules/channel/service"
 	common2 "github.com/Mininglamp-OSS/octo-server/modules/common"
+	"github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/source"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
-	"github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
@@ -84,7 +84,7 @@ func (g *Group) Route(r *wkhttp.WKHttp) {
 		groups.POST("/:group_no/members", g.memberAdd)                                     // 添加群成员
 		groups.DELETE("/:group_no/members", g.memberRemove)                                // 移除群成员
 		groups.GET("/:group_no/members", g.membersGet)                                     // 获取群成员
-		groups.GET("/:group_no/members/:uid", g.memberGet)                                  // 查询单个 uid 是否为群成员（命中时返回成员详情）
+		groups.GET("/:group_no/members/:uid", g.memberGet)                                 // 查询单个 uid 是否为群成员（命中时返回成员详情）
 		groups.POST("/:group_no/members_delete", g.memberRemove)                           // 移除群成员
 		groups.GET("/:group_no/membersync", g.syncMembers)                                 // 同步群成员
 		groups.GET("/:group_no", g.groupGet)                                               // 获取群信息
@@ -2085,13 +2085,13 @@ func (g *Group) groupScanJoin(c *wkhttp.Context) {
 	}
 
 	memberModel := &MemberModel{
-		GroupNo:       groupNo,
-		UID:           scaner,
-		Role:          MemberRoleCommon,
-		Version:       version,
-		Status:        int(common.GroupMemberStatusNormal),
-		InviteUID:     generator,
-		Vercode:       fmt.Sprintf("%s@%d", util.GenerUUID(), common.GroupMember),
+		GroupNo:   groupNo,
+		UID:       scaner,
+		Role:      MemberRoleCommon,
+		Version:   version,
+		Status:    int(common.GroupMemberStatusNormal),
+		InviteUID: generator,
+		Vercode:   fmt.Sprintf("%s@%d", util.GenerUUID(), common.GroupMember),
 		// 保留 scaner 的 robot 标记，与其它入群路径保持一致，
 		// 让 DELETE 路径的 QueryExternalMemberCountTx(robot=0) 能正确排除 bot。
 		Robot:         scanerInfo.Robot,
@@ -3777,8 +3777,8 @@ type memberDetailResp struct {
 	// 规则：
 	//   外部成员 (is_external == 1) → home_space_id = source_space_id
 	//   内部成员                     → home_space_id = group.space_id
-	HomeSpaceID        string `json:"home_space_id"`        // 成员归属 Space ID（供前端相对视角渲染）
-	HomeSpaceName      string `json:"home_space_name"`      // 成员归属 Space 名称
+	HomeSpaceID   string `json:"home_space_id"`   // 成员归属 Space ID（供前端相对视角渲染）
+	HomeSpaceName string `json:"home_space_name"` // 成员归属 Space 名称
 	// OCTO 实名认证（YUJ-413 Scope B）。根因报告（YUJ-411）发现 Android 气泡 +
 	// 群成员列表两条渲染路径都依赖此处 JSON 下发 —— Web 通过 friend/sync 的
 	// UserDetailResp 已经有这三字段，Android/iOS 走 WKSDK ChannelMember.extraMap

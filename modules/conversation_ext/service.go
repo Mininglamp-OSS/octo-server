@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
@@ -21,13 +22,37 @@ const (
 // channel IDs: "{groupNo}____{shortID}".
 const threadSeparator = "____"
 
+// ErrThreadForbidden 在 FollowThread 鉴权失败时返回。
+// 调用方（HTTP handler）应将此错误翻译为 403。
+var ErrThreadForbidden = errors.New("thread follow forbidden: not a member of parent group or thread not visible")
+
+// ThreadAuthChecker 判定 FollowThread 是否被授权，是一个 narrow interface。
+// 为避免对 modules/group / modules/thread 形成循环依赖，采用依赖倒置从外部注入。
+//
+// AuthorizeThreadFollow 一次性校验：
+//   - shortID 对应的 thread 存在，且 status != deleted。
+//   - thread.group_no == 入参 groupNo（拒绝跨群引用）。
+//   - uid 是 groupNo 的成员。
+//
+// 鉴权失败返回 ErrThreadForbidden（具体原因由 handler 写日志）。
+// 校验通过返回 nil。基础设施错误（DB 错误等）以 wrap 后的形式向上透传。
+type ThreadAuthChecker interface {
+	AuthorizeThreadFollow(uid, spaceID, groupNo, shortID string) error
+}
+
 // Service encapsulates composite operations on user_conversation_ext that
 // require a single transaction boundary.  It intentionally avoids importing
 // modules/group, modules/user, or modules/thread to prevent circular
 // dependencies.
+//
+// threadAuth 是 FollowThread 的鉴权钩子，由外部模块（在 1module.go 里把
+// group/thread 组合起来的实现）在启动时通过 SetThreadAuthChecker 注入。
+// 为 nil 时跳过鉴权（仅供测试 / 迁移期使用）。
 type Service struct {
-	db      *DB
-	session *dbr.Session
+	db          *DB
+	session     *dbr.Session
+	threadAuth  ThreadAuthChecker
+	threadAuthM sync.RWMutex
 	log.Log
 }
 
@@ -38,6 +63,23 @@ func NewService(ctx *config.Context) *Service {
 		session: ctx.DB(),
 		Log:     log.NewTLog("ConvExtService"),
 	}
+}
+
+// SetThreadAuthChecker injects the auth checker used by FollowThread.
+// Safe for concurrent use; intended to be called once at startup from
+// 1module.go after the group / thread modules have initialised.
+func (s *Service) SetThreadAuthChecker(c ThreadAuthChecker) {
+	s.threadAuthM.Lock()
+	s.threadAuth = c
+	s.threadAuthM.Unlock()
+}
+
+// getThreadAuthChecker returns the currently registered checker (or nil).
+func (s *Service) getThreadAuthChecker() ThreadAuthChecker {
+	s.threadAuthM.RLock()
+	c := s.threadAuth
+	s.threadAuthM.RUnlock()
+	return c
 }
 
 // ---------------------------------------------------------------------------
@@ -82,6 +124,10 @@ func escapeLike(s string) string {
 
 // FollowChannel marks the group as followed (group_unfollowed=0) for the given
 // user and space.  If no ext row exists it is created with the default values.
+//
+// PR review (Round 3) Blocking #1/#2 — 关注状态变化时把 user_follow_version +1。
+// Upsert 和 Bump 在同一 tx 内执行，这样客户端只要观察 follow_version 就能可靠
+// 检测到变化。
 func (s *Service) FollowChannel(uid, spaceID, groupNo string) error {
 	if err := validateBase(uid, spaceID); err != nil {
 		return err
@@ -90,10 +136,31 @@ func (s *Service) FollowChannel(uid, spaceID, groupNo string) error {
 		return errors.New("group_no must not be empty")
 	}
 	zero := int8(0)
-	if err := s.db.Upsert(uid, spaceID, targetTypeGroup, groupNo, ConvExtFields{
-		GroupUnfollowed: &zero,
-	}); err != nil {
-		return fmt.Errorf("FollowChannel upsert: %w", err)
+	return s.withTx("FollowChannel", func(tx *dbr.Tx) error {
+		if err := upsertTx(tx, uid, spaceID, targetTypeGroup, groupNo, ConvExtFields{
+			GroupUnfollowed: &zero,
+		}); err != nil {
+			return fmt.Errorf("FollowChannel upsert: %w", err)
+		}
+		if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
+			return fmt.Errorf("FollowChannel bump version: %w", err)
+		}
+		return nil
+	})
+}
+
+// withTx wraps fn in a tx with consistent error handling.
+func (s *Service) withTx(op string, fn func(tx *dbr.Tx) error) error {
+	tx, err := s.session.Begin()
+	if err != nil {
+		return fmt.Errorf("%s begin tx: %w", op, err)
+	}
+	defer tx.RollbackUnlessCommitted()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("%s commit: %w", op, err)
 	}
 	return nil
 }
@@ -104,7 +171,8 @@ func (s *Service) FollowChannel(uid, spaceID, groupNo string) error {
 
 // UnfollowChannel marks the group as unfollowed (group_unfollowed=1) and, in
 // the same transaction, deletes all thread (target_type=5) ext rows whose
-// target_id starts with "{groupNo}____" for this user+space.
+// target_id starts with "{groupNo}____" for this user+space, and bumps the
+// user_follow_version (PR review Round-3 Blocking #1/#2).
 func (s *Service) UnfollowChannel(uid, spaceID, groupNo string) error {
 	if err := validateBase(uid, spaceID); err != nil {
 		return err
@@ -112,35 +180,26 @@ func (s *Service) UnfollowChannel(uid, spaceID, groupNo string) error {
 	if groupNo == "" {
 		return errors.New("group_no must not be empty")
 	}
-
-	tx, err := s.session.Begin()
-	if err != nil {
-		return fmt.Errorf("UnfollowChannel begin tx: %w", err)
-	}
-	defer tx.RollbackUnlessCommitted()
-
-	// 1. Upsert the group row with group_unfollowed=1.
 	one := int8(1)
-	if err := upsertTx(tx, uid, spaceID, targetTypeGroup, groupNo, ConvExtFields{
-		GroupUnfollowed: &one,
-	}); err != nil {
-		return fmt.Errorf("UnfollowChannel upsert group: %w", err)
-	}
-
-	// 2. Delete all thread ext rows for this group.
-	//    Pattern: target_id LIKE '{escaped_groupNo}____%' ESCAPE '\'
-	//    The separator is exactly 4 underscores; escaping groupNo's own
-	//    underscores ensures we don't inadvertently match other groups.
-	prefix := escapeLike(groupNo) + threadSeparator + "%"
-	if _, err := tx.DeleteBySql(
-		"DELETE FROM "+table+
-			" WHERE uid=? AND space_id=? AND target_type=? AND target_id LIKE ? ESCAPE '|'",
-		uid, spaceID, targetTypeThread, prefix,
-	).Exec(); err != nil {
-		return fmt.Errorf("UnfollowChannel delete threads: %w", err)
-	}
-
-	return tx.Commit()
+	return s.withTx("UnfollowChannel", func(tx *dbr.Tx) error {
+		if err := upsertTx(tx, uid, spaceID, targetTypeGroup, groupNo, ConvExtFields{
+			GroupUnfollowed: &one,
+		}); err != nil {
+			return fmt.Errorf("UnfollowChannel upsert group: %w", err)
+		}
+		prefix := escapeLike(groupNo) + threadSeparator + "%"
+		if _, err := tx.DeleteBySql(
+			"DELETE FROM "+table+
+				" WHERE uid=? AND space_id=? AND target_type=? AND target_id LIKE ? ESCAPE '|'",
+			uid, spaceID, targetTypeThread, prefix,
+		).Exec(); err != nil {
+			return fmt.Errorf("UnfollowChannel delete threads: %w", err)
+		}
+		if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
+			return fmt.Errorf("UnfollowChannel bump version: %w", err)
+		}
+		return nil
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -152,35 +211,46 @@ func (s *Service) UnfollowChannel(uid, spaceID, groupNo string) error {
 // following a specific thread implicitly re-follows its parent group.
 //
 // threadChannelID must have the format "{groupNo}____{shortID}".
+//
+// PR review (Round 3) Blocking #3: prior to any DB write, the registered
+// ThreadAuthChecker (if any) MUST authorise (uid, groupNo, shortID). Without
+// this check FollowThread accepted any syntactically valid channel ID and wrote
+// an ext row referencing a thread the user could not see — surfacing unauthorised
+// entries on subsequent sidebar queries.  ErrThreadForbidden bubbles up unchanged
+// for the handler to translate to a 403 response.
 func (s *Service) FollowThread(uid, spaceID, threadChannelID string) error {
 	if err := validateBase(uid, spaceID); err != nil {
 		return err
 	}
-	groupNo, _, err := parseThreadChannelID(threadChannelID)
+	groupNo, shortID, err := parseThreadChannelID(threadChannelID)
 	if err != nil {
 		return err
 	}
 
-	tx, err := s.session.Begin()
-	if err != nil {
-		return fmt.Errorf("FollowThread begin tx: %w", err)
-	}
-	defer tx.RollbackUnlessCommitted()
-
-	// 1. Clear parent group's unfollowed flag.
-	zero := int8(0)
-	if err := upsertTx(tx, uid, spaceID, targetTypeGroup, groupNo, ConvExtFields{
-		GroupUnfollowed: &zero,
-	}); err != nil {
-		return fmt.Errorf("FollowThread clear parent group: %w", err)
+	if checker := s.getThreadAuthChecker(); checker != nil {
+		if err := checker.AuthorizeThreadFollow(uid, spaceID, groupNo, shortID); err != nil {
+			return err
+		}
 	}
 
-	// 2. Upsert thread ext row (no additional fields — default values suffice).
-	if err := upsertTx(tx, uid, spaceID, targetTypeThread, threadChannelID, ConvExtFields{}); err != nil {
-		return fmt.Errorf("FollowThread upsert thread: %w", err)
-	}
-
-	return tx.Commit()
+	return s.withTx("FollowThread", func(tx *dbr.Tx) error {
+		// 1. Clear parent group's unfollowed flag.
+		zero := int8(0)
+		if err := upsertTx(tx, uid, spaceID, targetTypeGroup, groupNo, ConvExtFields{
+			GroupUnfollowed: &zero,
+		}); err != nil {
+			return fmt.Errorf("FollowThread clear parent group: %w", err)
+		}
+		// 2. Upsert thread ext row (no additional fields — default values suffice).
+		if err := upsertTx(tx, uid, spaceID, targetTypeThread, threadChannelID, ConvExtFields{}); err != nil {
+			return fmt.Errorf("FollowThread upsert thread: %w", err)
+		}
+		// 3. Bump follow_version (PR review Round-3 Blocking #1/#2).
+		if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
+			return fmt.Errorf("FollowThread bump version: %w", err)
+		}
+		return nil
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +261,7 @@ func (s *Service) FollowThread(uid, spaceID, threadChannelID string) error {
 // It does NOT touch the parent group's unfollowed flag.
 //
 // threadChannelID must have the format "{groupNo}____{shortID}".
+// PR review (Round 3) Blocking #1/#2 — bumps follow_version in same tx.
 func (s *Service) UnfollowThread(uid, spaceID, threadChannelID string) error {
 	if err := validateBase(uid, spaceID); err != nil {
 		return err
@@ -198,10 +269,17 @@ func (s *Service) UnfollowThread(uid, spaceID, threadChannelID string) error {
 	if _, _, err := parseThreadChannelID(threadChannelID); err != nil {
 		return err
 	}
-	if err := s.db.Delete(uid, spaceID, targetTypeThread, threadChannelID); err != nil {
-		return fmt.Errorf("UnfollowThread delete: %w", err)
-	}
-	return nil
+	return s.withTx("UnfollowThread", func(tx *dbr.Tx) error {
+		if _, err := tx.DeleteFrom(table).
+			Where("uid=? AND space_id=? AND target_type=? AND target_id=?",
+				uid, spaceID, targetTypeThread, threadChannelID).Exec(); err != nil {
+			return fmt.Errorf("UnfollowThread delete: %w", err)
+		}
+		if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
+			return fmt.Errorf("UnfollowThread bump version: %w", err)
+		}
+		return nil
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +288,7 @@ func (s *Service) UnfollowThread(uid, spaceID, threadChannelID string) error {
 
 // FollowDM marks the DM conversation with peerUID as followed (followed_dm=1).
 // If categoryID is non-nil the DM is placed into that category.
+// PR review (Round 3) Blocking #1/#2 — bumps follow_version in same tx.
 func (s *Service) FollowDM(uid, spaceID, peerUID string, categoryID *int64) error {
 	if err := validateBase(uid, spaceID); err != nil {
 		return err
@@ -222,10 +301,15 @@ func (s *Service) FollowDM(uid, spaceID, peerUID string, categoryID *int64) erro
 		FollowedDM:   &one,
 		DMCategoryID: categoryID,
 	}
-	if err := s.db.Upsert(uid, spaceID, targetTypeDM, peerUID, fields); err != nil {
-		return fmt.Errorf("FollowDM upsert: %w", err)
-	}
-	return nil
+	return s.withTx("FollowDM", func(tx *dbr.Tx) error {
+		if err := upsertTx(tx, uid, spaceID, targetTypeDM, peerUID, fields); err != nil {
+			return fmt.Errorf("FollowDM upsert: %w", err)
+		}
+		if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
+			return fmt.Errorf("FollowDM bump version: %w", err)
+		}
+		return nil
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -235,6 +319,7 @@ func (s *Service) FollowDM(uid, spaceID, peerUID string, categoryID *int64) erro
 // UnfollowDM removes the ext row for the DM conversation with peerUID.
 // Deleting is cleaner than setting followed_dm=0 because it frees the row
 // and avoids stale dm_category_id values.
+// PR review (Round 3) Blocking #1/#2 — bumps follow_version in same tx.
 func (s *Service) UnfollowDM(uid, spaceID, peerUID string) error {
 	if err := validateBase(uid, spaceID); err != nil {
 		return err
@@ -242,10 +327,17 @@ func (s *Service) UnfollowDM(uid, spaceID, peerUID string) error {
 	if peerUID == "" {
 		return errors.New("peer_uid must not be empty")
 	}
-	if err := s.db.Delete(uid, spaceID, targetTypeDM, peerUID); err != nil {
-		return fmt.Errorf("UnfollowDM delete: %w", err)
-	}
-	return nil
+	return s.withTx("UnfollowDM", func(tx *dbr.Tx) error {
+		if _, err := tx.DeleteFrom(table).
+			Where("uid=? AND space_id=? AND target_type=? AND target_id=?",
+				uid, spaceID, targetTypeDM, peerUID).Exec(); err != nil {
+			return fmt.Errorf("UnfollowDM delete: %w", err)
+		}
+		if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
+			return fmt.Errorf("UnfollowDM bump version: %w", err)
+		}
+		return nil
+	})
 }
 
 // ---------------------------------------------------------------------------

@@ -53,23 +53,9 @@ func RemoveConvExtForUserInSpace(uid, spaceID, channelID string, channelType uin
 	}
 	db := globalConvExtDB
 
-	// Single-statement case (non-group): no transaction required.
-	if channelType != targetTypeGroup {
-		if _, err := db.session.DeleteFrom(table).
-			Where("uid=? AND space_id=? AND target_type=? AND target_id=?",
-				uid, spaceID, channelType, channelID).
-			Exec(); err != nil {
-			db.Warn("RemoveConvExtForUserInSpace: 删除频道 ext 行失败",
-				zap.String("uid", uid),
-				zap.String("spaceID", spaceID),
-				zap.String("channelID", channelID),
-				zap.Uint8("channelType", channelType),
-				zap.Error(err))
-		}
-		return
-	}
-
-	// Group case: channel row + thread cascade in one transaction.
+	// PR review (Round 3) Blocking #1/#2 — cascade cleanup also alters the user's
+	// follow set, so user_follow_version must be bumped in the same tx so the
+	// client can detect the change on the next sidebar sync.
 	tx, err := db.session.Begin()
 	if err != nil {
 		db.Warn("RemoveConvExtForUserInSpace: Begin 失败",
@@ -85,24 +71,36 @@ func RemoveConvExtForUserInSpace(uid, spaceID, channelID string, channelType uin
 		Where("uid=? AND space_id=? AND target_type=? AND target_id=?",
 			uid, spaceID, channelType, channelID).
 		Exec(); err != nil {
-		db.Warn("RemoveConvExtForUserInSpace: 删除群 ext 行失败（事务回滚）",
+		db.Warn("RemoveConvExtForUserInSpace: 删除频道 ext 行失败（事务回滚）",
 			zap.String("uid", uid),
 			zap.String("spaceID", spaceID),
 			zap.String("channelID", channelID),
+			zap.Uint8("channelType", channelType),
 			zap.Error(err))
 		return
 	}
 
-	prefix := escapeLike(channelID) + threadSeparator + "%"
-	if _, err := tx.DeleteBySql(
-		"DELETE FROM "+table+
-			" WHERE uid=? AND space_id=? AND target_type=? AND target_id LIKE ? ESCAPE '|'",
-		uid, spaceID, targetTypeThread, prefix,
-	).Exec(); err != nil {
-		db.Warn("RemoveConvExtForUserInSpace: 级联删除子区 ext 行失败（事务回滚）",
+	// Cascade thread rows only for group cleanup.
+	if channelType == targetTypeGroup {
+		prefix := escapeLike(channelID) + threadSeparator + "%"
+		if _, err := tx.DeleteBySql(
+			"DELETE FROM "+table+
+				" WHERE uid=? AND space_id=? AND target_type=? AND target_id LIKE ? ESCAPE '|'",
+			uid, spaceID, targetTypeThread, prefix,
+		).Exec(); err != nil {
+			db.Warn("RemoveConvExtForUserInSpace: 级联删除子区 ext 行失败（事务回滚）",
+				zap.String("uid", uid),
+				zap.String("spaceID", spaceID),
+				zap.String("channelID", channelID),
+				zap.Error(err))
+			return
+		}
+	}
+
+	if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
+		db.Warn("RemoveConvExtForUserInSpace: bump follow_version 失败（事务回滚）",
 			zap.String("uid", uid),
 			zap.String("spaceID", spaceID),
-			zap.String("channelID", channelID),
 			zap.Error(err))
 		return
 	}
@@ -119,19 +117,53 @@ func RemoveConvExtForUserInSpace(uid, spaceID, channelID string, channelType uin
 // RemoveConvExtForUser cleans up all DM ext rows (target_type=1) from uid toward
 // peerUID across every space.  Intended for use when two users delete each other
 // as friends.  Errors are logged as warnings and never propagated.
+//
+// PR review (Round 3) Blocking #1/#2 — affected (uid, spaceID) pairs have their
+// user_follow_version bumped in the same transaction so the next sidebar sync
+// observes the removal.
 func RemoveConvExtForUser(uid, peerUID string) {
 	if globalConvExtDB == nil {
 		return
 	}
 	db := globalConvExtDB
-	if _, err := db.session.DeleteFrom(table).
-		Where("uid=? AND target_type=? AND target_id=?",
-			uid, targetTypeDM, peerUID).
-		Exec(); err != nil {
-		db.Warn("RemoveConvExtForUser: 删除 DM ext 行失败",
-			zap.String("uid", uid),
-			zap.String("peerUID", peerUID),
-			zap.Error(err))
+
+	tx, err := db.session.Begin()
+	if err != nil {
+		db.Warn("RemoveConvExtForUser: Begin 失败", zap.String("uid", uid), zap.Error(err))
+		return
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	// 1. 先采集受影响的 (uid, space_id) 集合。
+	var spaces []string
+	if _, err := tx.SelectBySql(
+		"SELECT DISTINCT space_id FROM "+table+
+			" WHERE uid=? AND target_type=? AND target_id=?",
+		uid, targetTypeDM, peerUID,
+	).Load(&spaces); err != nil {
+		db.Warn("RemoveConvExtForUser: SELECT spaces 失败",
+			zap.String("uid", uid), zap.String("peerUID", peerUID), zap.Error(err))
+		return
+	}
+	// 2. DELETE。
+	if _, err := tx.DeleteBySql(
+		"DELETE FROM "+table+" WHERE uid=? AND target_type=? AND target_id=?",
+		uid, targetTypeDM, peerUID,
+	).Exec(); err != nil {
+		db.Warn("RemoveConvExtForUser: 删除 DM ext 行失败（事务回滚）",
+			zap.String("uid", uid), zap.String("peerUID", peerUID), zap.Error(err))
+		return
+	}
+	// 3. 在每个 space 内把 follow_version +1。
+	for _, sp := range spaces {
+		if _, err := BumpFollowVersionTx(tx, uid, sp); err != nil {
+			db.Warn("RemoveConvExtForUser: bump follow_version 失败（事务回滚）",
+				zap.String("uid", uid), zap.String("spaceID", sp), zap.Error(err))
+			return
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		db.Warn("RemoveConvExtForUser: Commit 失败", zap.String("uid", uid), zap.Error(err))
 	}
 }
 
@@ -152,53 +184,79 @@ func RemoveConvExtForChannel(channelID string, channelType uint8) {
 	}
 	db := globalConvExtDB
 
-	// Single-statement case (non-group): no transaction required.
-	if channelType != targetTypeGroup {
-		if _, err := db.session.DeleteFrom(table).
-			Where("target_type=? AND target_id=?", channelType, channelID).
-			Exec(); err != nil {
-			db.Warn("RemoveConvExtForChannel: 删除频道 ext 行失败",
-				zap.String("channelID", channelID),
-				zap.Uint8("channelType", channelType),
-				zap.Error(err))
-		}
-		return
-	}
-
-	// Group case: channel row + thread cascade in one transaction.
 	tx, err := db.session.Begin()
 	if err != nil {
 		db.Warn("RemoveConvExtForChannel: Begin 失败",
-			zap.String("channelID", channelID),
-			zap.Error(err))
+			zap.String("channelID", channelID), zap.Error(err))
 		return
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	if _, err := tx.DeleteFrom(table).
-		Where("target_type=? AND target_id=?", channelType, channelID).
-		Exec(); err != nil {
-		db.Warn("RemoveConvExtForChannel: 删除群 ext 行失败（事务回滚）",
-			zap.String("channelID", channelID),
-			zap.Error(err))
-		return
+	// 1. 先采集受影响的 (uid, space_id) 集合。
+	//    group 情况下要把父 channel + 子 thread 的 owner 一并采集，
+	//    所以用一次 SELECT DISTINCT 合并查。
+	type owner struct {
+		UID     string `db:"uid"`
+		SpaceID string `db:"space_id"`
+	}
+	var owners []owner
+	if channelType == targetTypeGroup {
+		prefix := escapeLike(channelID) + threadSeparator + "%"
+		if _, err := tx.SelectBySql(
+			"SELECT DISTINCT uid, space_id FROM "+table+
+				" WHERE (target_type=? AND target_id=?)"+
+				" OR (target_type=? AND target_id LIKE ? ESCAPE '|')",
+			channelType, channelID, targetTypeThread, prefix,
+		).Load(&owners); err != nil {
+			db.Warn("RemoveConvExtForChannel: SELECT owners 失败",
+				zap.String("channelID", channelID), zap.Error(err))
+			return
+		}
+	} else {
+		if _, err := tx.SelectBySql(
+			"SELECT DISTINCT uid, space_id FROM "+table+
+				" WHERE target_type=? AND target_id=?",
+			channelType, channelID,
+		).Load(&owners); err != nil {
+			db.Warn("RemoveConvExtForChannel: SELECT owners 失败",
+				zap.String("channelID", channelID), zap.Error(err))
+			return
+		}
 	}
 
-	prefix := escapeLike(channelID) + threadSeparator + "%"
-	if _, err := tx.DeleteBySql(
-		"DELETE FROM "+table+
-			" WHERE target_type=? AND target_id LIKE ? ESCAPE '|'",
-		targetTypeThread, prefix,
-	).Exec(); err != nil {
-		db.Warn("RemoveConvExtForChannel: 级联删除子区 ext 行失败（事务回滚）",
-			zap.String("channelID", channelID),
-			zap.Error(err))
+	// 2. 主 DELETE（group 时还要级联 thread）。
+	if _, err := tx.DeleteFrom(table).
+		Where("target_type=? AND target_id=?", channelType, channelID).Exec(); err != nil {
+		db.Warn("RemoveConvExtForChannel: 删除频道 ext 行失败（事务回滚）",
+			zap.String("channelID", channelID), zap.Uint8("channelType", channelType), zap.Error(err))
 		return
+	}
+	if channelType == targetTypeGroup {
+		prefix := escapeLike(channelID) + threadSeparator + "%"
+		if _, err := tx.DeleteBySql(
+			"DELETE FROM "+table+
+				" WHERE target_type=? AND target_id LIKE ? ESCAPE '|'",
+			targetTypeThread, prefix,
+		).Exec(); err != nil {
+			db.Warn("RemoveConvExtForChannel: 级联删除子区 ext 行失败（事务回滚）",
+				zap.String("channelID", channelID), zap.Error(err))
+			return
+		}
+	}
+
+	// 3. 在每个受影响的 (uid, space_id) 把 follow_version +1。
+	//    PR review Round-3 Blocking #1/#2 — 让客户端能感知到关注列表变化。
+	for _, o := range owners {
+		if _, err := BumpFollowVersionTx(tx, o.UID, o.SpaceID); err != nil {
+			db.Warn("RemoveConvExtForChannel: bump follow_version 失败（事务回滚）",
+				zap.String("uid", o.UID), zap.String("spaceID", o.SpaceID),
+				zap.String("channelID", channelID), zap.Error(err))
+			return
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
 		db.Warn("RemoveConvExtForChannel: Commit 失败",
-			zap.String("channelID", channelID),
-			zap.Error(err))
+			zap.String("channelID", channelID), zap.Error(err))
 	}
 }

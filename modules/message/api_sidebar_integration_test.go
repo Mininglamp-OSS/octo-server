@@ -148,7 +148,7 @@ func TestIntegration_Sidebar_FollowTab_BasicSmoke(t *testing.T) {
 	// 5. Run the same pure-function pipeline as Sidebar.Sync follow branch.
 	items := buildFollowItems(stubConvs, categorySetting, unfollowedGroups, followedDMs, threadExtMap)
 	// mergeThreadEntries: thread is already in IM result, so no new item added.
-	items = mergeThreadEntries(items, threadExtRows, map[string]*time.Time{})
+	items = mergeThreadEntries(items, threadExtRows, map[string]*time.Time{}, categorySetting, unfollowedGroups)
 	sortFollowItems(items)
 
 	// 6. Assert exactly 3 items with correct target_type.
@@ -311,7 +311,8 @@ func TestIntegration_Sidebar_MergeThreadEntries_AddsDBOnlyThreads(t *testing.T) 
 	require.Len(t, items, 1, "buildFollowItems must include threadInIM")
 
 	// mergeThreadEntries appends threadDBOnly (not yet in items).
-	items = mergeThreadEntries(items, threadExtRows, map[string]*time.Time{})
+	// PR review Round-3 Blocking #4: parent-follow predicate also applies here.
+	items = mergeThreadEntries(items, threadExtRows, map[string]*time.Time{}, categorySetting, map[string]struct{}{})
 	require.Len(t, items, 2, "mergeThreadEntries must add the DB-only thread")
 
 	// Both thread IDs must be present.

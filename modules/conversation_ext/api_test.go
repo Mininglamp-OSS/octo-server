@@ -73,10 +73,10 @@ func (s *stubService) UnfollowThread(uid, spaceID, threadChannelID string) error
 
 // stubDB is a test double for *DB (only UpdateSort is needed).
 type stubDB struct {
-	updateSortFn func(uid, spaceID string, items []SortItem, version int) error
+	updateSortFn func(uid, spaceID string, items []SortItem, version int64) error
 }
 
-func (d *stubDB) UpdateSort(uid, spaceID string, items []SortItem, version int) error {
+func (d *stubDB) UpdateSort(uid, spaceID string, items []SortItem, version int64) error {
 	if d.updateSortFn != nil {
 		return d.updateSortFn(uid, spaceID, items, version)
 	}
@@ -354,6 +354,57 @@ func TestFollow_FollowThread_ServiceError(t *testing.T) {
 	assertBadRequest(t, w)
 }
 
+// PR review (Round 3) Blocking #3: SetThreadAuthChecker is the injection seam
+// for the auth pipeline.  This test verifies the contract:
+//   - When a checker is registered AND it returns ErrThreadForbidden, FollowThread
+//     must short-circuit and propagate that error without touching the DB.
+//   - When no checker is registered, FollowThread proceeds (backward compatibility
+//     for tests that pre-date the injection).
+//
+// We use a dedicated package-level helper test that exercises Service directly
+// with a no-DB session — only the auth short-circuit path is asserted, which
+// avoids requiring MySQL for this regression.
+func TestService_FollowThread_RejectsWhenCheckerDenies(t *testing.T) {
+	called := false
+	checker := stubAuthChecker(func(uid, spaceID, groupNo, shortID string) error {
+		called = true
+		assert.Equal(t, "u1", uid)
+		assert.Equal(t, "s1", spaceID)
+		assert.Equal(t, "grp1", groupNo)
+		assert.Equal(t, "thr1", shortID)
+		return ErrThreadForbidden
+	})
+	// Service constructed without a session: the auth check fires before any
+	// DB call so session-nil is safe in this code path.
+	s := &Service{}
+	s.SetThreadAuthChecker(checker)
+
+	err := s.FollowThread("u1", "s1", "grp1____thr1")
+	assert.True(t, called, "checker must be invoked before any DB write")
+	assert.ErrorIs(t, err, ErrThreadForbidden)
+}
+
+// stubAuthChecker adapts a closure to the ThreadAuthChecker interface.
+type stubAuthChecker func(uid, spaceID, groupNo, shortID string) error
+
+func (f stubAuthChecker) AuthorizeThreadFollow(uid, spaceID, groupNo, shortID string) error {
+	return f(uid, spaceID, groupNo, shortID)
+}
+
+// PR review (Round 3) Blocking #3: ErrThreadForbidden bubbles up as 403,
+// distinguishable from generic 400 service errors so the client can show a
+// dedicated "no access" message.
+func TestFollow_FollowThread_Forbidden_Returns403(t *testing.T) {
+	svc := &stubService{
+		followThreadFn: func(uid, spaceID, threadChannelID string) error {
+			return ErrThreadForbidden
+		},
+	}
+	r := newTestRouter(svc, &stubDB{})
+	w := do(r, "POST", "/v2/follow/thread", map[string]interface{}{"thread_channel_id": "grp1____thr1"})
+	assert.Equal(t, http.StatusForbidden, w.Code, "body: %s", w.Body.String())
+}
+
 // ---------------------------------------------------------------------------
 // UnfollowThread
 // ---------------------------------------------------------------------------
@@ -396,9 +447,9 @@ func TestFollow_UnfollowThread_ServiceError(t *testing.T) {
 
 func TestFollow_UpdateSort_HappyPath(t *testing.T) {
 	var gotItems []SortItem
-	var gotVersion int
+	var gotVersion int64
 	db := &stubDB{
-		updateSortFn: func(uid, spaceID string, items []SortItem, version int) error {
+		updateSortFn: func(uid, spaceID string, items []SortItem, version int64) error {
 			gotItems = items
 			gotVersion = version
 			return nil
@@ -417,7 +468,7 @@ func TestFollow_UpdateSort_HappyPath(t *testing.T) {
 	require.Len(t, gotItems, 2)
 	assert.Equal(t, uint8(1), gotItems[0].TargetType)
 	assert.Equal(t, "dm-1", gotItems[0].TargetID)
-	assert.Equal(t, 3, gotVersion)
+	assert.Equal(t, int64(3), gotVersion)
 }
 
 func TestFollow_UpdateSort_MissingItems(t *testing.T) {
@@ -442,7 +493,7 @@ func TestFollow_UpdateSort_InvalidTargetType(t *testing.T) {
 
 func TestFollow_UpdateSort_CASConflict(t *testing.T) {
 	db := &stubDB{
-		updateSortFn: func(uid, spaceID string, items []SortItem, version int) error {
+		updateSortFn: func(uid, spaceID string, items []SortItem, version int64) error {
 			return ErrVersionConflict
 		},
 	}
@@ -459,7 +510,7 @@ func TestFollow_UpdateSort_CASConflict(t *testing.T) {
 
 func TestFollow_UpdateSort_DBError(t *testing.T) {
 	db := &stubDB{
-		updateSortFn: func(uid, spaceID string, items []SortItem, version int) error {
+		updateSortFn: func(uid, spaceID string, items []SortItem, version int64) error {
 			return errors.New("connection reset")
 		},
 	}

@@ -2,22 +2,22 @@
 //
 // # Data-flow overview
 //
-// 1. Validate request (tab ∈ {follow,recent}, device_uuid required).
-// 2. Call ctx.IMSyncUserConversation to get the raw conversation list from the
-//    IM core (timestamp, unread, last_msg_seq).
-// 3. Load ancillary data in parallel-ish batches:
-//      a. group_setting   → category_id, category_sort  (groupCategoryDB)
-//      b. user_conversation_ext → unfollowed groups, followed DMs, thread ext rows
-//      c. user_pinned_channel  → pinned set             (raw DB query via ctx.DB())
-// 4. Apply tab-specific filtering:
-//      follow  – groups with category + not unfollowed; followed DMs; threads
-//                with ext row whose parent group is in the follow set.
-//      recent  – all DMs; groups/threads with timestamp > now-72h.
-// 5. Append standalone thread ext entries not already in the IM result.
-// 6. Sort:
-//      follow  – category_sort ASC, pinned DESC, follow_sort ASC.
-//      recent  – pinned DESC, timestamp DESC.
-// 7. Return SidebarSyncResp{Items, Version}.
+//  1. Validate request (tab ∈ {follow,recent}, device_uuid required).
+//  2. Call ctx.IMSyncUserConversation to get the raw conversation list from the
+//     IM core (timestamp, unread, last_msg_seq).
+//  3. Load ancillary data in parallel-ish batches:
+//     a. group_setting   → category_id, category_sort  (groupCategoryDB)
+//     b. user_conversation_ext → unfollowed groups, followed DMs, thread ext rows
+//     c. user_pinned_channel  → pinned set             (raw DB query via ctx.DB())
+//  4. Apply tab-specific filtering:
+//     follow  – groups with category + not unfollowed; followed DMs; threads
+//     with ext row whose parent group is in the follow set.
+//     recent  – all DMs; groups/threads with timestamp > now-72h.
+//  5. Append standalone thread ext entries not already in the IM result.
+//  6. Sort:
+//     follow  – category_sort ASC, pinned DESC, follow_sort ASC.
+//     recent  – pinned DESC, timestamp DESC.
+//  7. Return SidebarSyncResp{Items, Version}.
 //
 // Module dependencies: imports modules/conversation_ext (for ext rows) and
 // modules/thread (for QueryByShortIDs to enrich thread items with last_message_at).
@@ -53,28 +53,30 @@ import (
 
 // Sidebar handles POST /v2/sidebar/sync.
 type Sidebar struct {
-	ctx            *config.Context
+	ctx             *config.Context
 	groupCategoryDB *groupCategoryDB
-	convExtDB      *convext.DB
-	threadDB       *thread.DB
+	convExtDB       *convext.DB
+	threadDB        *thread.DB
+	followVersionDB *convext.FollowVersionDB
 	log.Log
 }
 
 // NewSidebar creates a Sidebar handler.
 func NewSidebar(ctx *config.Context) *Sidebar {
 	return &Sidebar{
-		ctx:            ctx,
+		ctx:             ctx,
 		groupCategoryDB: newGroupCategoryDB(ctx),
-		convExtDB:      convext.NewDB(ctx),
-		threadDB:       thread.NewDB(ctx),
-		Log:            log.NewTLog("Sidebar"),
+		convExtDB:       convext.NewDB(ctx),
+		threadDB:        thread.NewDB(ctx),
+		followVersionDB: convext.NewFollowVersionDB(ctx),
+		Log:             log.NewTLog("Sidebar"),
 	}
 }
 
 // sidebarSyncReq is the JSON body for POST /v2/sidebar/sync.
 type sidebarSyncReq struct {
-	Tab         string `json:"tab"`          // "follow" | "recent"
-	Version     int64  `json:"version"`      // IM core version cursor
+	Tab         string `json:"tab"`     // "follow" | "recent"
+	Version     int64  `json:"version"` // IM core version cursor
 	LastMsgSeqs string `json:"last_msg_seqs"`
 	MsgCount    int64  `json:"msg_count"`
 	DeviceUUID  string `json:"device_uuid"`
@@ -82,7 +84,7 @@ type sidebarSyncReq struct {
 
 // SidebarItem is one entry in the sidebar response.
 type SidebarItem struct {
-	TargetType      int     `json:"target_type"`                // 1 DM / 2 group / 5 thread
+	TargetType      int     `json:"target_type"` // 1 DM / 2 group / 5 thread
 	TargetID        string  `json:"target_id"`
 	ChannelType     uint8   `json:"channel_type"`
 	ChannelID       string  `json:"channel_id"`
@@ -97,9 +99,17 @@ type SidebarItem struct {
 }
 
 // sidebarSyncResp is the JSON response for POST /v2/sidebar/sync.
+//
+// Version 是 IM 会话游标（recent tab 的 cursor）。
+// FollowVersion 是 user_follow_version 的当前值（follow tab 的 CAS / 增量检测）。
+// PR review (Round 3) Blocking #1/#2 — IM 游标无法感知 follow 状态变化，所以需要
+// 独立的 follow_version。客户端使用方式：
+//   - 拉取 follow tab 后保存 follow_version，下次比较是否需要全量重建。
+//   - 调 /v2/follow/sort 时把 follow_version 原样回传做 CAS。
 type sidebarSyncResp struct {
-	Items   []*SidebarItem `json:"items"`
-	Version int64          `json:"version"`
+	Items         []*SidebarItem `json:"items"`
+	Version       int64          `json:"version"`
+	FollowVersion int64          `json:"follow_version"`
 }
 
 // ---------------------------------------------------------------------------
@@ -120,13 +130,41 @@ func RegisterSidebarRoutes(r *wkhttp.WKHttp, ctx *config.Context) {
 // Request validation
 // ---------------------------------------------------------------------------
 
+// 上限常量：IM 透传字段的边界。
+// 透传给下游服务前 fail-fast，避免恶意/异常输入放大到 IM 核心。
+const (
+	// maxMsgCount 是 IM_SyncUserConversation 的 msg_count 上限。
+	// 客户端通常 <= 100，这里设 1000 做上限。
+	maxMsgCount int64 = 1000
+	// maxLastMsgSeqsLen 是 last_msg_seqs 字符串长度上限（约 5000 个会话）。
+	maxLastMsgSeqsLen = 65536
+	// maxDeviceUUIDLen 是客户端生成的 UUID 长度上限。
+	maxDeviceUUIDLen = 128
+)
+
 // validateSidebarRequest validates the request fields.
 func validateSidebarRequest(req *sidebarSyncReq) error {
 	if req.Tab != "follow" && req.Tab != "recent" {
 		return errors.New("tab must be 'follow' or 'recent'")
 	}
-	if strings.TrimSpace(req.DeviceUUID) == "" {
+	deviceUUID := strings.TrimSpace(req.DeviceUUID)
+	if deviceUUID == "" {
 		return errors.New("device_uuid is required")
+	}
+	if len(deviceUUID) > maxDeviceUUIDLen {
+		return fmt.Errorf("device_uuid too long (max %d)", maxDeviceUUIDLen)
+	}
+	if req.Version < 0 {
+		return errors.New("version must be >= 0")
+	}
+	if req.MsgCount < 0 {
+		return errors.New("msg_count must be >= 0")
+	}
+	if req.MsgCount > maxMsgCount {
+		return fmt.Errorf("msg_count too large (max %d)", maxMsgCount)
+	}
+	if len(req.LastMsgSeqs) > maxLastMsgSeqsLen {
+		return fmt.Errorf("last_msg_seqs too long (max %d bytes)", maxLastMsgSeqsLen)
 	}
 	return nil
 }
@@ -221,9 +259,11 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 	switch req.Tab {
 	case "follow":
 		items = buildFollowItems(conversations, categorySetting, unfollowedGroups, followedDMs, threadExtMap)
-		// Append standalone thread ext entries not present in IM result
+		// Append standalone thread ext entries not present in IM result.
+		// Pass categorySetting + unfollowedGroups so parent-follow filter applies
+		// to DB-only thread entries as well (PR review Round-3 Blocking #4).
 		lastMsgAtMap := sb.loadThreadLastMsgAt(threadExtRows)
-		items = mergeThreadEntries(items, threadExtRows, lastMsgAtMap)
+		items = mergeThreadEntries(items, threadExtRows, lastMsgAtMap, categorySetting, unfollowedGroups)
 	case "recent":
 		items = buildRecentItems(conversations, pinnedSet)
 	}
@@ -247,9 +287,19 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 	// 6. Compute response version from raw conversations
 	respVersion := maxConversationVersion(conversations, req.Version)
 
+	// 7. Load follow_version (PR review Round-3 Blocking #1/#2).
+	//    非致命：返 0 时客户端只会理解为"没有新状态"，对业务无害。
+	var followVersion int64
+	if v, err := sb.followVersionDB.Get(loginUID, spaceID); err != nil {
+		sb.Warn("sidebar sync: follow_version query failed (non-fatal)", zap.Error(err))
+	} else {
+		followVersion = v
+	}
+
 	c.JSON(http.StatusOK, &sidebarSyncResp{
-		Items:   items,
-		Version: respVersion,
+		Items:         items,
+		Version:       respVersion,
+		FollowVersion: followVersion,
 	})
 }
 
@@ -279,34 +329,41 @@ func (sb *Sidebar) loadPinnedSet(uid, spaceID string) (map[string]struct{}, erro
 
 // loadThreadLastMsgAt queries the thread table for last_message_at of the
 // given thread ext rows.
+//
+// PR review (Round 3) Blocking #3 / Important #4：用 (group_no, short_id) 复合键
+// 匹配，只取 status != deleted 的行。SELECT 也收窄到最小列，不必要地读 thread
+// 其他列（thread_md 等大文本）。
+//
+// 返回 map 的键就是 ext.TargetID（"{groupNo}____{shortID}" 格式）。
+// map 中不存在的键意味着"该 thread 已删除或不存在"。
 func (sb *Sidebar) loadThreadLastMsgAt(extRows []*convext.Model) map[string]*time.Time {
 	result := make(map[string]*time.Time, len(extRows))
 	if len(extRows) == 0 {
 		return result
 	}
-	shortIDs := make([]string, 0, len(extRows))
+	refs := make([]thread.ShortRef, 0, len(extRows))
+	keyOf := make(map[string]string, len(extRows)) // {groupNo}____{shortID} → ext.TargetID
 	for _, m := range extRows {
-		_, sid, err := parseThreadChannelIDSidebar(m.TargetID)
-		if err == nil {
-			shortIDs = append(shortIDs, sid)
+		gno, sid, err := parseThreadChannelIDSidebar(m.TargetID)
+		if err != nil {
+			continue
 		}
+		refs = append(refs, thread.ShortRef{GroupNo: gno, ShortID: sid})
+		keyOf[gno+threadSeparator+sid] = m.TargetID
 	}
-	if len(shortIDs) == 0 {
+	if len(refs) == 0 {
 		return result
 	}
-	threadMap, err := sb.threadDB.QueryByShortIDs(shortIDs)
+	threadMap, err := sb.threadDB.QueryActiveByGroupShortIDs(refs)
 	if err != nil {
 		sb.Warn("sidebar sync: thread last_message_at query failed", zap.Error(err))
 		return result
 	}
-	for _, m := range extRows {
-		_, sid, err := parseThreadChannelIDSidebar(m.TargetID)
-		if err != nil {
-			continue
-		}
-		if tm, ok := threadMap[sid]; ok {
-			result[sid] = tm.LastMessageAt
-		}
+	for key, lite := range threadMap {
+		// 注：mergeThreadEntries 按 shortID 查表，所以这里保留 shortID 为键。
+		// 出于旧签名兼容，map 的键是 shortID。
+		result[lite.ShortID] = lite.LastMessageAt
+		_ = key
 	}
 	return result
 }
@@ -372,14 +429,14 @@ func buildFollowItems(
 				continue
 			}
 			items = append(items, &SidebarItem{
-				TargetType:  int(common.ChannelTypeGroup),
-				TargetID:    conv.ChannelID,
-				ChannelType: conv.ChannelType,
-				ChannelID:   conv.ChannelID,
-				Timestamp:   conv.Timestamp,
-				Unread:      conv.Unread,
-				IsFollowed:  true,
-				CategoryID:  cs.CategoryID,
+				TargetType:   int(common.ChannelTypeGroup),
+				TargetID:     conv.ChannelID,
+				ChannelType:  conv.ChannelType,
+				ChannelID:    conv.ChannelID,
+				Timestamp:    conv.Timestamp,
+				Unread:       conv.Unread,
+				IsFollowed:   true,
+				CategoryID:   cs.CategoryID,
 				CategorySort: cs.CategorySort,
 			})
 
@@ -490,10 +547,23 @@ func buildRecentItems(
 // that are NOT already present in the existing items slice.
 // This covers threads that have an ext row but the IM core didn't return them
 // as independent conversation entries.
+//
+// PR review (Round 3) Blocking #4 — DB-only thread entries must apply the same
+// parent-follow predicate as IM-returned threads (see buildFollowItems thread
+// branch): the parent group must have a non-nil category AND must not be in
+// the unfollowed set. Without this filter, threads whose parent group was
+// unfollowed (or whose category was removed) would still surface in the follow
+// tab, exposing stale state.
+//
+// Malformed thread channel IDs (no separator, empty parts) are skipped silently;
+// they should never be persisted in the first place but defensive handling
+// avoids appending entries with an empty ParentChannelID.
 func mergeThreadEntries(
 	existing []*SidebarItem,
 	threadExtRows []*convext.Model,
 	lastMsgAtMap map[string]*time.Time, // shortID → *time.Time
+	categorySetting map[string]*GroupCategorySetting,
+	unfollowedGroups map[string]struct{},
 ) []*SidebarItem {
 	if len(threadExtRows) == 0 {
 		return existing
@@ -511,13 +581,23 @@ func mergeThreadEntries(
 		if _, present := presentIDs[ext.TargetID]; present {
 			continue
 		}
-		// Compute timestamp from lastMsgAt map
-		var ts int64
 		groupNo, shortID, err := parseThreadChannelIDSidebar(ext.TargetID)
-		if err == nil {
-			if t, ok := lastMsgAtMap[shortID]; ok && t != nil {
-				ts = t.Unix()
-			}
+		if err != nil {
+			// Malformed ID — never expose to client.
+			continue
+		}
+		// Apply parent-follow predicate (mirrors buildFollowItems thread branch).
+		cs, ok := categorySetting[groupNo]
+		if !ok || cs.CategoryID == nil {
+			continue // parent group not in follow set
+		}
+		if _, unfollowed := unfollowedGroups[groupNo]; unfollowed {
+			continue // parent group explicitly unfollowed
+		}
+		// Compute timestamp from lastMsgAt map.
+		var ts int64
+		if t, ok := lastMsgAtMap[shortID]; ok && t != nil {
+			ts = t.Unix()
 		}
 		result = append(result, &SidebarItem{
 			TargetType:      int(common.ChannelTypeCommunityTopic),

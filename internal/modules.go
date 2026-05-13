@@ -22,12 +22,11 @@ import (
 	_ "github.com/Mininglamp-OSS/octo-server/modules/backup"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/base"
 	// `robot` before `botfather`: botfather migrations ALTER the robot table.
-	_ "github.com/Mininglamp-OSS/octo-server/modules/robot"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/botfather"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/category"
-	_ "github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/channel"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/common"
+	_ "github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/file"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/group"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/message"
@@ -36,6 +35,7 @@ import (
 	_ "github.com/Mininglamp-OSS/octo-server/modules/openapi"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/qrcode"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/report"
+	_ "github.com/Mininglamp-OSS/octo-server/modules/robot"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/search"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/space"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/statistics"
@@ -43,8 +43,8 @@ import (
 	_ "github.com/Mininglamp-OSS/octo-server/modules/user"
 	// app_bot and bot_api query user/robot tables at runtime; app_bot
 	// also imports bot_api, so register bot_api before app_bot.
-	_ "github.com/Mininglamp-OSS/octo-server/modules/bot_api"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/app_bot"
+	_ "github.com/Mininglamp-OSS/octo-server/modules/bot_api"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/voice"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/webhook"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/workplace"
