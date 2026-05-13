@@ -99,7 +99,15 @@ func newThreadAuthChecker(ctx *config.Context) *threadAuthChecker {
 //
 // Returns convext.ErrThreadForbidden when the user cannot follow this thread.
 // Infra errors are wrapped and propagated unchanged.
-func (c *threadAuthChecker) AuthorizeThreadFollow(uid, _spaceID, groupNo, shortID string) error {
+//
+// PR review follow-up：spaceID 兜底校验。当前在 dmwork 中 group 成员身份隐含
+// space 访问权，所以单纯的 membership check 就足够；但显式 reject 空 spaceID 是
+// 一道便宜的纵深防御层（API 路径已经经过 SpaceMiddleware，理论上不会传空）。
+// 后续需要严格 space membership 校验时在此处接 spacepkg.CheckMembership。
+func (c *threadAuthChecker) AuthorizeThreadFollow(uid, spaceID, groupNo, shortID string) error {
+	if spaceID == "" {
+		return convext.ErrThreadForbidden
+	}
 	// 1. Membership check: must be a member of the parent group.
 	isMember, err := c.groupSvc.ExistMember(groupNo, uid)
 	if err != nil {

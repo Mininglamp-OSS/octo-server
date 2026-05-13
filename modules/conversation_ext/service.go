@@ -187,7 +187,7 @@ func (s *Service) UnfollowChannel(uid, spaceID, groupNo string) error {
 		}); err != nil {
 			return fmt.Errorf("UnfollowChannel upsert group: %w", err)
 		}
-		prefix := escapeLike(groupNo) + threadSeparator + "%"
+		prefix := escapeLike(groupNo) + escapeLike(threadSeparator) + "%"
 		if _, err := tx.DeleteBySql(
 			"DELETE FROM "+table+
 				" WHERE uid=? AND space_id=? AND target_type=? AND target_id LIKE ? ESCAPE '|'",

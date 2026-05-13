@@ -335,21 +335,24 @@ func (sb *Sidebar) loadPinnedSet(uid, spaceID string) (map[string]struct{}, erro
 // 其他列（thread_md 等大文本）。
 //
 // 返回 map 的键就是 ext.TargetID（"{groupNo}____{shortID}" 格式）。
-// map 中不存在的键意味着"该 thread 已删除或不存在"。
+// map 中不存在的键意味着"该 thread 已删除或不存在或跨群错配"，
+// 调用方据此 skip 该 ext 行，避免把幽灵 thread emit 给客户端。
+//
+// PR review follow-up：之前的实现以 shortID 单键作 map，跨群同名 shortID 会
+// 互相覆盖，且 mergeThreadEntries 无法区分"thread 不存在"与"last_message_at NULL"。
+// 改为复合键后两种语义都清楚：键存在 = thread 活跃；值为 nil = last_message_at NULL。
 func (sb *Sidebar) loadThreadLastMsgAt(extRows []*convext.Model) map[string]*time.Time {
 	result := make(map[string]*time.Time, len(extRows))
 	if len(extRows) == 0 {
 		return result
 	}
 	refs := make([]thread.ShortRef, 0, len(extRows))
-	keyOf := make(map[string]string, len(extRows)) // {groupNo}____{shortID} → ext.TargetID
 	for _, m := range extRows {
 		gno, sid, err := parseThreadChannelIDSidebar(m.TargetID)
 		if err != nil {
 			continue
 		}
 		refs = append(refs, thread.ShortRef{GroupNo: gno, ShortID: sid})
-		keyOf[gno+threadSeparator+sid] = m.TargetID
 	}
 	if len(refs) == 0 {
 		return result
@@ -359,11 +362,9 @@ func (sb *Sidebar) loadThreadLastMsgAt(extRows []*convext.Model) map[string]*tim
 		sb.Warn("sidebar sync: thread last_message_at query failed", zap.Error(err))
 		return result
 	}
+	// QueryActiveByGroupShortIDs 已经按 "{groupNo}____{shortID}" 做键，直接转写。
 	for key, lite := range threadMap {
-		// 注：mergeThreadEntries 按 shortID 查表，所以这里保留 shortID 为键。
-		// 出于旧签名兼容，map 的键是 shortID。
-		result[lite.ShortID] = lite.LastMessageAt
-		_ = key
+		result[key] = lite.LastMessageAt
 	}
 	return result
 }
@@ -555,13 +556,20 @@ func buildRecentItems(
 // unfollowed (or whose category was removed) would still surface in the follow
 // tab, exposing stale state.
 //
+// PR review follow-up：ext 行存在但目标 thread 已被删除（cleanup 延迟 / 失败）的
+// 情况，loadThreadLastMsgAt 不会把它放进 lastMsgAtMap。本函数据此 skip，
+// 避免把 timestamp=0 的"幽灵 thread"emit 给客户端。
+//
 // Malformed thread channel IDs (no separator, empty parts) are skipped silently;
 // they should never be persisted in the first place but defensive handling
 // avoids appending entries with an empty ParentChannelID.
 func mergeThreadEntries(
 	existing []*SidebarItem,
 	threadExtRows []*convext.Model,
-	lastMsgAtMap map[string]*time.Time, // shortID → *time.Time
+	// lastMsgAtMap 的键是 ext.TargetID（"{groupNo}____{shortID}" 格式）。
+	// 键存在表示 thread 仍活跃（status != deleted 且 group_no 匹配）。
+	// 值为 nil 表示 thread 活跃但 last_message_at 还是 NULL（新建后未发消息）。
+	lastMsgAtMap map[string]*time.Time,
 	categorySetting map[string]*GroupCategorySetting,
 	unfollowedGroups map[string]struct{},
 ) []*SidebarItem {
@@ -581,9 +589,15 @@ func mergeThreadEntries(
 		if _, present := presentIDs[ext.TargetID]; present {
 			continue
 		}
-		groupNo, shortID, err := parseThreadChannelIDSidebar(ext.TargetID)
+		groupNo, _, err := parseThreadChannelIDSidebar(ext.TargetID)
 		if err != nil {
 			// Malformed ID — never expose to client.
+			continue
+		}
+		// PR review follow-up：thread 必须仍活跃（在 lastMsgAtMap 中）。
+		// 不存在意味着 thread 已删除 / 不存在 / 跨群错配。
+		lastMsgAt, alive := lastMsgAtMap[ext.TargetID]
+		if !alive {
 			continue
 		}
 		// Apply parent-follow predicate (mirrors buildFollowItems thread branch).
@@ -594,10 +608,9 @@ func mergeThreadEntries(
 		if _, unfollowed := unfollowedGroups[groupNo]; unfollowed {
 			continue // parent group explicitly unfollowed
 		}
-		// Compute timestamp from lastMsgAt map.
 		var ts int64
-		if t, ok := lastMsgAtMap[shortID]; ok && t != nil {
-			ts = t.Unix()
+		if lastMsgAt != nil {
+			ts = lastMsgAt.Unix()
 		}
 		result = append(result, &SidebarItem{
 			TargetType:      int(common.ChannelTypeCommunityTopic),

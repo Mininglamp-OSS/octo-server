@@ -24,18 +24,21 @@ var (
 
 // Model 对应 user_conversation_ext 表的一行。
 type Model struct {
-	ID              int64     `db:"id"`
-	UID             string    `db:"uid"`
-	SpaceID         string    `db:"space_id"`
-	TargetType      uint8     `db:"target_type"`
-	TargetID        string    `db:"target_id"`
-	FollowedDM      int8      `db:"followed_dm"`
-	DMCategoryID    *int64    `db:"dm_category_id"`
-	GroupUnfollowed int8      `db:"group_unfollowed"`
-	FollowSort      int       `db:"follow_sort"`
-	Version         int       `db:"version"`
-	CreatedAt       time.Time `db:"created_at"`
-	UpdatedAt       time.Time `db:"updated_at"`
+	ID              int64  `db:"id"`
+	UID             string `db:"uid"`
+	SpaceID         string `db:"space_id"`
+	TargetType      uint8  `db:"target_type"`
+	TargetID        string `db:"target_id"`
+	FollowedDM      int8   `db:"followed_dm"`
+	DMCategoryID    *int64 `db:"dm_category_id"`
+	GroupUnfollowed int8   `db:"group_unfollowed"`
+	FollowSort      int    `db:"follow_sort"`
+	// Deprecated: 行级乐观锁 version 已被 user_follow_version 表（用户级单调序列号）
+	// 取代，UpdateSort 不再读写该列。仅为 schema 兼容保留，下一次 column drop migration
+	// 移除（PR review Round-3 follow-up）。
+	Version   int       `db:"version"`
+	CreatedAt time.Time `db:"created_at"`
+	UpdatedAt time.Time `db:"updated_at"`
 }
 
 // ConvExtFields 描述 Upsert 时可更新的字段集合。

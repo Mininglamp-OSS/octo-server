@@ -16,12 +16,12 @@ CREATE TABLE IF NOT EXISTS user_conversation_ext (
   updated_at      DATETIME     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
   UNIQUE KEY uk (uid, space_id, target_type, target_id),
   KEY idx_followed (uid, space_id, followed_dm, dm_category_id, follow_sort),
-  -- idx_unfollowed_group 支持 ListUnfollowedGroups: WHERE uid=? AND space_id=? AND target_type=2 AND group_unfollowed=1
-  KEY idx_unfollowed_group (uid, space_id, target_type, group_unfollowed),
-  -- idx_thread_sort 支持 ListThreadExts: WHERE uid=? AND space_id=? AND target_type=5 ORDER BY follow_sort
-  KEY idx_thread_sort (uid, space_id, target_type, follow_sort),
   KEY idx_target (target_type, target_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='用户会话扩展（关注/最近 Tab，issue #337）';
+
+-- NOTE: idx_unfollowed_group / idx_thread_sort 移到 20260513000004_conversation_ext_indexes.sql
+-- 是为了让早期跑过本迁移的 dev/staging 环境在重新 migrate 时也能拿到这两个索引
+-- （sql-migrate 通过 version 时间戳追踪，不会因为 SQL 文件内容变化而重跑同一 version）。
 
 -- +migrate Down
 

@@ -315,6 +315,13 @@ func followedG1() (map[string]*GroupCategorySetting, map[string]struct{}) {
 		map[string]struct{}{}
 }
 
+// aliveThread builds a lastMsgAtMap entry for a thread channel ID.
+// Helper for tests written after the round-3 follow-up which require ext rows
+// to be "alive" (present in the active-thread map) to be emitted.
+func aliveThread(channelID string, lastMsgAt *time.Time) map[string]*time.Time {
+	return map[string]*time.Time{channelID: lastMsgAt}
+}
+
 func TestMergeThreadEntries_AddsNewEntry(t *testing.T) {
 	existing := []*SidebarItem{
 		{TargetID: "g1____th1", TargetType: int(common.ChannelTypeCommunityTopic)},
@@ -325,8 +332,10 @@ func TestMergeThreadEntries_AddsNewEntry(t *testing.T) {
 		{TargetID: "g1____th1", FollowSort: 1},
 		{TargetID: th2ChannelID, FollowSort: 2},
 	}
+	t30 := time.Now().Add(-30 * time.Minute)
 	lastMsgAtMap := map[string]*time.Time{
-		"th2": timePtr(time.Now().Add(-30 * time.Minute)),
+		"g1____th1":  &t30, // both must be alive even though th1 is dedup'd via existing
+		th2ChannelID: &t30,
 	}
 
 	cat, unfollowed := followedG1()
@@ -344,6 +353,7 @@ func TestMergeThreadEntries_NoDuplicateIfAlreadyPresent(t *testing.T) {
 		{TargetID: "g1____th1", FollowSort: 1}, // already present
 	}
 	cat, unfollowed := followedG1()
+	// nil map is fine here: presentIDs short-circuits before the alive check.
 	result := mergeThreadEntries(existing, threadExtRows, nil, cat, unfollowed)
 	assert.Len(t, result, 1) // no duplicate
 }
@@ -353,6 +363,50 @@ func TestMergeThreadEntries_EmptyExt(t *testing.T) {
 	cat, unfollowed := followedG1()
 	result := mergeThreadEntries(existing, nil, nil, cat, unfollowed)
 	assert.Len(t, result, 0)
+}
+
+// PR review follow-up: ext 行存在但目标 thread 已删除 / 不存在（不在 lastMsgAtMap）
+// 必须跳过，不能把 timestamp=0 的幽灵 thread emit 给客户端。
+func TestMergeThreadEntries_SkipWhenThreadDeleted(t *testing.T) {
+	existing := []*SidebarItem{}
+	threadExtRows := []*convext.Model{
+		{TargetID: "g1____ghost", FollowSort: 1},
+	}
+	cat, unfollowed := followedG1()
+	// lastMsgAtMap 为空（thread 已被删除，cleanup 还没清理 ext 行）
+	result := mergeThreadEntries(existing, threadExtRows, map[string]*time.Time{}, cat, unfollowed)
+	assert.Len(t, result, 0,
+		"thread 已删除时 ext 行必须被 skip，避免 ghost 条目出现在 follow tab")
+}
+
+// PR review follow-up: 父群相同但 short_id 跨群冲突的旧 bug 已通过复合键关闭，
+// 这里同时验证 alive thread emit + alive timestamp 正确读取。
+func TestMergeThreadEntries_AliveThreadEmitsTimestamp(t *testing.T) {
+	now := time.Now().Add(-10 * time.Minute)
+	existing := []*SidebarItem{}
+	threadExtRows := []*convext.Model{
+		{TargetID: "g1____alive", FollowSort: 3},
+	}
+	cat, unfollowed := followedG1()
+	result := mergeThreadEntries(existing, threadExtRows, aliveThread("g1____alive", &now), cat, unfollowed)
+	require.Len(t, result, 1)
+	assert.Equal(t, now.Unix(), result[0].Timestamp,
+		"alive thread 的 timestamp 必须从 lastMsgAtMap 正确读取")
+	assert.Equal(t, "g1", result[0].ParentChannelID)
+	assert.Equal(t, 3, result[0].FollowSort)
+}
+
+// PR review follow-up: 活跃 thread 但 last_message_at NULL（新建未发消息）→ ts=0 但仍 emit。
+func TestMergeThreadEntries_AliveThreadNilLastMsgAt(t *testing.T) {
+	existing := []*SidebarItem{}
+	threadExtRows := []*convext.Model{
+		{TargetID: "g1____fresh", FollowSort: 1},
+	}
+	cat, unfollowed := followedG1()
+	// 键存在但值为 nil = thread 活跃但还没消息
+	result := mergeThreadEntries(existing, threadExtRows, aliveThread("g1____fresh", nil), cat, unfollowed)
+	require.Len(t, result, 1, "活跃 thread 即便 last_message_at=NULL 也必须 emit")
+	assert.Equal(t, int64(0), result[0].Timestamp)
 }
 
 // PR review (Round 3) Blocking #4: DB-only thread entries must respect the same
@@ -366,7 +420,7 @@ func TestMergeThreadEntries_SkipWhenParentUnfollowed(t *testing.T) {
 	cat, _ := followedG1()
 	unfollowed := map[string]struct{}{"g1": {}}
 
-	result := mergeThreadEntries(existing, threadExtRows, nil, cat, unfollowed)
+	result := mergeThreadEntries(existing, threadExtRows, aliveThread("g1____th-orphan", nil), cat, unfollowed)
 	assert.Len(t, result, 0,
 		"thread whose parent group is unfollowed must NOT be merged into follow tab")
 }
@@ -380,7 +434,7 @@ func TestMergeThreadEntries_SkipWhenParentHasNoCategory(t *testing.T) {
 	}
 	cat, unfollowed := followedG1() // only g1 is in the follow set, g-noCat is not
 
-	result := mergeThreadEntries(existing, threadExtRows, nil, cat, unfollowed)
+	result := mergeThreadEntries(existing, threadExtRows, aliveThread("g-noCat____th-orphan", nil), cat, unfollowed)
 	assert.Len(t, result, 0,
 		"thread whose parent group lacks a category (not in follow set) must NOT be merged")
 }
@@ -586,23 +640,6 @@ func TestParseThreadChannelIDSidebar_Invalid(t *testing.T) {
 		_, _, err := parseThreadChannelIDSidebar(c)
 		assert.Error(t, err, "expected error for %q", c)
 	}
-}
-
-// ---------------------------------------------------------------------------
-// mergeThreadEntries — nil lastMsgAtMap
-// ---------------------------------------------------------------------------
-
-// retained: nil lastMsgAtMap is valid; merge still succeeds with ts=0.
-func TestMergeThreadEntries_NilLastMsgAtMap(t *testing.T) {
-	existing := []*SidebarItem{}
-	extRows := []*convext.Model{
-		{TargetID: "g1____th1", FollowSort: 1},
-	}
-	cat, unfollowed := followedG1()
-	result := mergeThreadEntries(existing, extRows, nil, cat, unfollowed)
-	require.Len(t, result, 1)
-	assert.Equal(t, "g1____th1", result[0].TargetID)
-	assert.Equal(t, int64(0), result[0].Timestamp) // no timestamp available
 }
 
 // ---------------------------------------------------------------------------

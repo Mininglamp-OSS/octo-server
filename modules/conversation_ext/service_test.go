@@ -393,3 +393,33 @@ func TestService_UnfollowChannel_GroupNoWithUnderscore_DoesNotMatchOtherGroups(t
 	require.NoError(t, err)
 	assert.NotNil(t, mB, "thread for grpB must survive")
 }
+
+// PR review follow-up：threadSeparator 里的 4 个下划线如果没 escape，会被当作
+// 任意 4 字符通配，导致变长 groupNo 之间相互越界匹配。这里构造一个 28 字符的
+// "受害者" groupNo 加上一个 32 字符的 "攻击者" groupNo（差正好 4 个字符），
+// 验证修复后两者不会互相级联删除。
+func TestService_UnfollowChannel_SeparatorEscaped_LengthCollisionSafe(t *testing.T) {
+	svc := newServiceForTest(t)
+	const uid, space = "u1", "s1"
+	// 28 字符 victim：unfollow 它不应触及更长的 attacker。
+	const victim = "AAAAAAAAAAAAAAAAAAAAAAAAAAAA" // 28
+	// 32 字符 attacker：victim 后 4 个通配若未 escape，会去匹配 attacker 的中间 4 字符。
+	const attacker = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAXXXX" // 32
+
+	victimThread := victim + "____v-thr"
+	attackerThread := attacker + "____a-thr"
+
+	require.NoError(t, svc.db.Upsert(uid, space, targetTypeThread, victimThread, ConvExtFields{}))
+	require.NoError(t, svc.db.Upsert(uid, space, targetTypeThread, attackerThread, ConvExtFields{}))
+
+	require.NoError(t, svc.UnfollowChannel(uid, space, victim))
+
+	mV, err := svc.db.Get(uid, space, targetTypeThread, victimThread)
+	require.NoError(t, err)
+	assert.Nil(t, mV, "victim 的 thread 必须被级联删除")
+
+	mA, err := svc.db.Get(uid, space, targetTypeThread, attackerThread)
+	require.NoError(t, err)
+	assert.NotNil(t, mA,
+		"attacker 的 thread 必须留存——4 个下划线不应被当作通配跨群匹配")
+}

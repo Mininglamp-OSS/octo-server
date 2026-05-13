@@ -82,7 +82,7 @@ func RemoveConvExtForUserInSpace(uid, spaceID, channelID string, channelType uin
 
 	// Cascade thread rows only for group cleanup.
 	if channelType == targetTypeGroup {
-		prefix := escapeLike(channelID) + threadSeparator + "%"
+		prefix := escapeLike(channelID) + escapeLike(threadSeparator) + "%"
 		if _, err := tx.DeleteBySql(
 			"DELETE FROM "+table+
 				" WHERE uid=? AND space_id=? AND target_type=? AND target_id LIKE ? ESCAPE '|'",
@@ -201,7 +201,7 @@ func RemoveConvExtForChannel(channelID string, channelType uint8) {
 	}
 	var owners []owner
 	if channelType == targetTypeGroup {
-		prefix := escapeLike(channelID) + threadSeparator + "%"
+		prefix := escapeLike(channelID) + escapeLike(threadSeparator) + "%"
 		if _, err := tx.SelectBySql(
 			"SELECT DISTINCT uid, space_id FROM "+table+
 				" WHERE (target_type=? AND target_id=?)"+
@@ -232,7 +232,7 @@ func RemoveConvExtForChannel(channelID string, channelType uint8) {
 		return
 	}
 	if channelType == targetTypeGroup {
-		prefix := escapeLike(channelID) + threadSeparator + "%"
+		prefix := escapeLike(channelID) + escapeLike(threadSeparator) + "%"
 		if _, err := tx.DeleteBySql(
 			"DELETE FROM "+table+
 				" WHERE target_type=? AND target_id LIKE ? ESCAPE '|'",
