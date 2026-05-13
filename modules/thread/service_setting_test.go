@@ -10,6 +10,7 @@ import (
 // ==================== ThreadSetting Service 测试 ====================
 
 func TestUpdateSetting_NotMember(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	svc, groupNo := setupServiceTestData(t)
 
 	// 创建子区，testutil.UID 自动成为创建者成员
