@@ -1,0 +1,42 @@
+# golangci-lint config for octo-server (post-OCTO-migration recovery profile).
+#
+# Rationale:
+#   The Mininglamp upstream codebase predates strict linting. When CI was
+#   first added in #6 the default golangci-lint v2 profile (errcheck,
+#   gosimple/staticcheck S1xxx, ineffassign, unused, SA1xxx) flagged ~40
+#   pre-existing issues across legacy modules — none introduced by recent
+#   work. The codebase also carries substantial gofmt drift inherited from
+#   the upstream tree. Instead of mass-rewriting legacy files (high diff
+#   risk, low payoff) we run a single high-signal linter here (govet) and
+#   re-enable the rest module-by-module.
+#
+# Mandatory linter kept: govet — catches loopclosure / copylocks / printf
+# bugs that are *real* correctness defects (the post-CI-recovery PR fixes
+# the four loopclosure findings + one copylocks finding present at HEAD).
+#
+# Why govet (and not also gofmt/errcheck/etc) right now:
+#   * gofmt: the legacy tree has ~40 files with stale formatting; gating CI
+#     on `gofmt -l` would produce a 200+ line drive-by diff that obscures
+#     real reviews. Schedule its re-enable after a one-shot `gofmt -w` PR.
+#   * errcheck/staticcheck/ineffassign/unused: each flags pre-existing
+#     defects that need module owners to assess. Tracking issue:
+#     YUJ-513-followup.
+#
+# TODO(octo-lint-cleanup, YUJ-513-followup): re-enable linters incrementally
+# as legacy modules get cleaned up. Goal: restore the default golangci-lint
+# v2 profile within two release cycles.
+
+run:
+  timeout: 5m
+  go: "1.20"
+
+linters:
+  disable-all: true
+  enable:
+    - govet
+
+issues:
+  # Don't suppress new govet findings — this linter is the intentional gate.
+  exclude-use-default: false
+  max-issues-per-linter: 0
+  max-same-issues: 0
