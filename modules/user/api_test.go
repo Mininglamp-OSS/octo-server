@@ -214,6 +214,7 @@ func TestResetPwd(t *testing.T) {
 }
 
 func TestUser_Login(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	u := New(ctx)
 

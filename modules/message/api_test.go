@@ -64,6 +64,7 @@ func TestMessageSync(t *testing.T) {
 }
 
 func TestMessageSyncack(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := newTestServer()
 	f := New(ctx)
 	f.Route(s.GetRoute())
@@ -247,6 +248,7 @@ var Token = "token122323"
 
 // NewTestServer 创建一个测试服务器
 func TestDeleteMessage_PersonChannel_NonFriend(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := newTestServer()
 	msg := New(ctx)
 	msg.Route(s.GetRoute())

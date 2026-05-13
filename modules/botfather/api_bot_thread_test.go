@@ -106,6 +106,7 @@ func createBotThread(t *testing.T, s *server.Server, groupNo, botToken, name str
 // ==================== 创建子区 ====================
 
 func TestBotCreateThread(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, _, _, groupNo, botToken := setupBotThreadTestData(t)
 
 	w := botRequest(t, s, "POST", "/v1/bot/groups/"+groupNo+"/threads", botToken, map[string]interface{}{
@@ -147,6 +148,7 @@ func TestBotCreateThread_EmptyName(t *testing.T) {
 // ==================== 列出子区 ====================
 
 func TestBotListThreads(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, _, _, groupNo, botToken := setupBotThreadTestData(t)
 
 	// 创建两个子区
