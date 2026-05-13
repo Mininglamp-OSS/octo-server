@@ -159,6 +159,26 @@ func (d *DB) QueryThreadMetaByShortIDs(shortIDs []string) (map[string]*ThreadMet
 	return result, nil
 }
 
+// QueryByShortIDs 批量查询子区，返回 map[shortID]*Model。
+// 用于 sidebar 聚合接口补齐子区的 last_message_at。
+func (d *DB) QueryByShortIDs(shortIDs []string) (map[string]*Model, error) {
+	result := make(map[string]*Model)
+	if len(shortIDs) == 0 {
+		return result, nil
+	}
+	var models []*Model
+	_, err := d.session.Select("*").From("thread").
+		Where("short_id IN ?", shortIDs).
+		Load(&models)
+	if err != nil {
+		return nil, err
+	}
+	for _, m := range models {
+		result[m.ShortID] = m
+	}
+	return result, nil
+}
+
 // QueryNonDeletedShortIDs 批量查询未删除的子区 shortID
 func (d *DB) QueryNonDeletedShortIDs(shortIDs []string) ([]string, error) {
 	if len(shortIDs) == 0 {

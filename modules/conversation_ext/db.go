@@ -198,6 +198,20 @@ func (d *DB) ListUnfollowedGroups(uid, spaceID string) ([]*Model, error) {
 	return list, err
 }
 
+// ListThreadExts は target_type=5（子区）の ext 行を
+// (follow_sort ASC) 順で返す。
+// follow tab の子区独立条目の構築に使う。
+func (d *DB) ListThreadExts(uid, spaceID string) ([]*Model, error) {
+	var list []*Model
+	_, err := d.session.SelectBySql(
+		"SELECT * FROM "+table+
+			" WHERE uid=? AND space_id=? AND target_type=5"+
+			" ORDER BY follow_sort ASC",
+		uid, spaceID,
+	).Load(&list)
+	return list, err
+}
+
 // UpdateSort は CAS で follow_sort を一括更新する。
 //
 // 並行一致性:

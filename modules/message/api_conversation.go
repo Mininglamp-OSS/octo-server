@@ -121,6 +121,9 @@ func (co *Conversation) Route(r *wkhttp.WKHttp) {
 	co.ctx.AddEventListener(event.ConversationDelete, func(data []byte, commit config.EventCommit) {
 		co.handleConversationDeleteEvent(data, commit)
 	})
+
+	// v2 sidebar
+	RegisterSidebarRoutes(r, co.ctx)
 }
 
 func (co *Conversation) handleConversationDeleteEvent(data []byte, commit config.EventCommit) {
