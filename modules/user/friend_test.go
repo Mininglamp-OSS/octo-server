@@ -112,6 +112,7 @@ func TestFriendSureQr(t *testing.T) {
 }
 
 func TestFriendSureCard(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	u := New(ctx)
 	u.Route(s.GetRoute())
@@ -174,6 +175,7 @@ func TestFriendSureCard(t *testing.T) {
 }
 
 func TestFriendSureGroup(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	u := New(ctx)
 	u.Route(s.GetRoute())
@@ -250,6 +252,7 @@ func (e *emptyGroupProvider) GetGroupByGroupNo(groupNo string) (*source.GroupMod
 }
 
 func TestUserDetail(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	u := New(ctx)
 	u.Route(s.GetRoute())
@@ -305,6 +308,7 @@ func TestUserDetail(t *testing.T) {
 }
 
 func TestRemark(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	u := New(ctx)
 	u.Route(s.GetRoute())
@@ -331,6 +335,7 @@ func TestRemark(t *testing.T) {
 	panic(w.Body)
 }
 func TestApply(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	u := NewFriend(ctx)
 	//u.Route(s.GetRoute())

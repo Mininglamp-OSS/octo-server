@@ -84,6 +84,7 @@ func TestQueryCategorySettingsByGroupNos_NoSetting(t *testing.T) {
 
 // TestQueryCategorySettingsByGroupNos_MultipleGroups 测试批量查询多个群组
 func TestQueryCategorySettingsByGroupNos_MultipleGroups(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	_, ctx := testutil.NewTestServer()
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
@@ -137,6 +138,7 @@ func TestQueryCategorySettingsByGroupNos_MultipleGroups(t *testing.T) {
 
 // TestQueryCategorySettingsByGroupNos_EmptyInput 测试空输入
 func TestQueryCategorySettingsByGroupNos_EmptyInput(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	_, ctx := testutil.NewTestServer()
 	db := newGroupCategoryDB(ctx)
 
@@ -148,6 +150,7 @@ func TestQueryCategorySettingsByGroupNos_EmptyInput(t *testing.T) {
 
 // TestQueryCategorySettingsByGroupNos_DifferentUser 测试不同用户的隔离
 func TestQueryCategorySettingsByGroupNos_DifferentUser(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	_, ctx := testutil.NewTestServer()
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)

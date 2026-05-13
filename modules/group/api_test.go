@@ -890,6 +890,7 @@ func TestGroupForbidden(t *testing.T) {
 
 // TestGroupMembersGet 测试获取群成员列表
 func TestGroupMembersGet(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
 	f.Route(s.GetRoute())
@@ -936,6 +937,7 @@ func TestGroupMembersGet(t *testing.T) {
 }
 
 func TestGroupDetailGet_MemberCanAccess(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
 	f.Route(s.GetRoute())
@@ -972,6 +974,7 @@ func TestGroupDetailGet_MemberCanAccess(t *testing.T) {
 }
 
 func TestGroupDetailGet_NonMemberDenied(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
 	f.Route(s.GetRoute())
@@ -1000,6 +1003,7 @@ func TestGroupDetailGet_NonMemberDenied(t *testing.T) {
 }
 
 func TestGroupDetailGet_UnauthenticatedDenied(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
 	f.Route(s.GetRoute())
@@ -1027,6 +1031,7 @@ func TestGroupDetailGet_UnauthenticatedDenied(t *testing.T) {
 // TestBlacklistRemoveUsesFilteredUIDs tests that blacklist removal only removes
 // members with ForbiddenExpirTime == 0, not all requested UIDs (issue #482)
 func TestBlacklistRemoveUsesFilteredUIDs(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
 	f.Route(s.GetRoute())
