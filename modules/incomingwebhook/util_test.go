@@ -1,7 +1,9 @@
 package incomingwebhook
 
 import (
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/stretchr/testify/assert"
@@ -107,6 +109,43 @@ func TestBuildPayload_SpaceIDSetEvenWhenExtraOmitsIt(t *testing.T) {
 	req := &pushPayloadReq{Content: "hi"}
 	p := buildPayload(m, req)
 	assert.Equal(t, "real_space", p["space_id"])
+}
+
+// TestBuildPayload_TruncatesLongUsernameAvatar 锁定 push 路径 username / avatar_url
+// 服务端裁剪：调用方塞 KB 级字符串时，from.name / from.avatar 被截断到 create 侧
+// 的列长度上限（64 / 255 字节），防止污染所有客户端渲染。原回归来自 PR #31
+// yujiawei review P2-3。
+func TestBuildPayload_TruncatesLongUsernameAvatar(t *testing.T) {
+	m := &incomingWebhookModel{WebhookID: "iwh_x", Name: "WH", Avatar: "https://default"}
+	longName := strings.Repeat("A", 10000)
+	longAvatar := "https://" + strings.Repeat("x", 10000)
+	req := &pushPayloadReq{
+		Content:   "hi",
+		Username:  longName,
+		AvatarURL: longAvatar,
+	}
+	p := buildPayload(m, req)
+	from := p["from"].(map[string]interface{})
+	gotName := from["name"].(string)
+	gotAvatar := from["avatar"].(string)
+
+	assert.Equalf(t, 64, len(gotName), "from.name capped at 64 bytes; got %d", len(gotName))
+	assert.Equalf(t, 255, len(gotAvatar), "from.avatar capped at 255 bytes; got %d", len(gotAvatar))
+}
+
+// TestBuildPayload_TruncateRespectsUTF8 验证截断在 rune 边界回退，不会把多字节字符
+// 切成乱码字节。中文字符 3 字节，64 字节上限最多保留 21 个完整中文。
+func TestBuildPayload_TruncateRespectsUTF8(t *testing.T) {
+	m := &incomingWebhookModel{WebhookID: "iwh_x", Name: "WH"}
+	req := &pushPayloadReq{
+		Content:  "hi",
+		Username: strings.Repeat("一", 100), // 100 × 3 = 300 字节
+	}
+	p := buildPayload(m, req)
+	from := p["from"].(map[string]interface{})
+	gotName := from["name"].(string)
+	assert.LessOrEqualf(t, len(gotName), 64, "byte length capped; got %d", len(gotName))
+	assert.Truef(t, utf8.ValidString(gotName), "truncated name must remain valid UTF-8; got %q", gotName)
 }
 
 func TestPublicURL(t *testing.T) {

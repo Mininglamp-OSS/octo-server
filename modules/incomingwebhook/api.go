@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -608,16 +609,38 @@ func (w *IncomingWebhook) push(c *wkhttp.Context) {
 	})
 }
 
+// 与 create/update 路径的 webhook 名称/头像列长度约束一致，避免 push 路径成为绕过。
+const (
+	maxFromNameBytes   = 64
+	maxFromAvatarBytes = 255
+)
+
+// truncateUTF8 在 max 字节处裁剪，回退到上一 rune 边界避免破坏多字节字符。
+func truncateUTF8(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	for i := max; i > 0; i-- {
+		if utf8.RuneStart(s[i]) {
+			return s[:i]
+		}
+	}
+	return s[:max]
+}
+
 // buildPayload 把 webhook 请求映射到群消息 payload。
 //   - WuKongIM 只有 Text 类型，所有 webhook 消息都用 Text(1) 投递。
 //   - 注入 from.kind=webhook 元信息，便于客户端识别非真实用户消息；
 //     客户端可统一按 markdown 渲染 webhook 消息（无 markdown 时退化为纯文本）。
 //   - @all/@here 降级为纯文本：调用方写在 content 里的字面量保留，不附 mention 字段。
 //
-// 安全：调用方 req.Extra 一律**丢弃**，不进入持久化 payload。原因：message 模块对
-// 顶层 payload 字段（如 visibles / mention / reminder 等）按服务端控制语义解释，
-// 让外部 token 持有者写这些字段会绕过群可见性 / 通知策略。如需扩展，请在此处显式
-// 列入允许字段（且明确该字段无访问控制语义），不要再走透传。
+// 安全：
+//   - 调用方 req.Extra 一律**丢弃**，不进入持久化 payload。原因：message 模块对
+//     顶层 payload 字段（如 visibles / mention / reminder 等）按服务端控制语义解释，
+//     让外部 token 持有者写这些字段会绕过群可见性 / 通知策略。如需扩展，请在此处
+//     显式列入允许字段（且明确该字段无访问控制语义），不要再走透传。
+//   - req.Username / req.AvatarURL 服务端裁剪到 create 侧同样的字节上限。push 路径
+//     原本只受 8KB body cap 约束，调用方可塞 KB 级字符串污染所有客户端 from.* 渲染。
 func buildPayload(m *incomingWebhookModel, req *pushPayloadReq) map[string]interface{} {
 	name := req.Username
 	if name == "" {
@@ -627,6 +650,8 @@ func buildPayload(m *incomingWebhookModel, req *pushPayloadReq) map[string]inter
 	if avatar == "" {
 		avatar = m.Avatar
 	}
+	name = truncateUTF8(name, maxFromNameBytes)
+	avatar = truncateUTF8(avatar, maxFromAvatarBytes)
 	return map[string]interface{}{
 		"type":    int(common.Text),
 		"content": req.Content,

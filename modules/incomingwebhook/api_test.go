@@ -31,10 +31,11 @@ import (
 	_ "github.com/Mininglamp-OSS/octo-server/modules/user"
 )
 
-// TestMain 准备 common.Setup 所需的 master key（必须 32 字节，见 memory）。
+// TestMain 准备 common.Setup 所需的 master key（必须 32 字节）。CI 通过 ci.yml
+// 全局环境变量已经注入；本地直接 go test 也能跑通，无需额外设置。
 func TestMain(m *testing.M) {
-	if os.Getenv("DMWORK_MASTER_KEY") == "" {
-		os.Setenv("DMWORK_MASTER_KEY", "12345678901234567890123456789012")
+	if os.Getenv("OCTO_MASTER_KEY") == "" {
+		os.Setenv("OCTO_MASTER_KEY", "12345678901234567890123456789012")
 	}
 	os.Exit(m.Run())
 }
