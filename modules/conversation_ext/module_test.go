@@ -4,12 +4,22 @@ package conversation_ext
 
 import (
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// resetGlobalConvExtServiceOnce 是测试专用 helper：重置 sync.Once，让每个
+// test 可以独立 Init 全局 singleton。声明在 _test.go 中保证不会被生产代码引用
+// （PR #21 review I2 by Jerry-Xin —— 之前放在 1module.go 用 *testing.T 占位，
+// 仍然让 testing 包污染生产构建）。
+func resetGlobalConvExtServiceOnce(_ *testing.T) {
+	globalConvExtServiceOnce = sync.Once{}
+	globalConvExtService = nil
+}
 
 // newCtxForTest builds a *config.Context pointing at the test MySQL instance.
 // It does NOT run migrations (cfg.DB.Migration = false) — the table must

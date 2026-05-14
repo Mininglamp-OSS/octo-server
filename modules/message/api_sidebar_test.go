@@ -506,6 +506,62 @@ func TestSortFollowItems_CategoryGroupSort_PrimaryOverIntra(t *testing.T) {
 	assert.Equal(t, "g3", items[2].TargetID, "different CategorySort dominates intra order")
 }
 
+// PR #21 Round-4 review I6 (lml2468 #3) regression：appendThreadParentGroupNos
+// 必须把 thread ext 的父群 groupNo 合入查询集合，且去重不重复添加 IM 已经返回的群。
+func TestAppendThreadParentGroupNos(t *testing.T) {
+	type ext = convext.Model
+	tests := []struct {
+		name    string
+		initial []string
+		rows    []*ext
+		want    []string
+	}{
+		{
+			name:    "empty rows: no-op",
+			initial: []string{"g1"},
+			rows:    nil,
+			want:    []string{"g1"},
+		},
+		{
+			name:    "parent NOT in initial: append",
+			initial: []string{"g1"},
+			rows:    []*ext{{TargetID: "g2____thr-x"}},
+			want:    []string{"g1", "g2"},
+		},
+		{
+			name:    "parent IN initial: skip (dedup)",
+			initial: []string{"g1"},
+			rows:    []*ext{{TargetID: "g1____thr-x"}},
+			want:    []string{"g1"},
+		},
+		{
+			name:    "multiple threads, dedup parent",
+			initial: []string{},
+			rows: []*ext{
+				{TargetID: "g3____thr-a"},
+				{TargetID: "g3____thr-b"},
+				{TargetID: "g4____thr-c"},
+			},
+			want: []string{"g3", "g4"},
+		},
+		{
+			name:    "malformed thread id: skipped",
+			initial: []string{},
+			rows: []*ext{
+				{TargetID: "no-separator"},
+				{TargetID: "g5____thr-x"},
+			},
+			want: []string{"g5"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := appendThreadParentGroupNos(tc.initial, tc.rows)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
 // TestBuildFollowItems_CategoryGroupSort_Propagates 验证 buildFollowItems
 // 把 GroupCategorySetting.CategoryGroupSort 映射到 SidebarItem.CategorySort
 // （swagger 暴露字段），并保留 group_setting.category_sort 作为内部二级 key。

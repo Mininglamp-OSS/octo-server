@@ -46,6 +46,12 @@ type GroupCategorySetting struct {
 // 用 LEFT JOIN group_category：当用户改了 group_setting.category_id 但目标分类
 // 已删除时（gc.category_id IS NULL），CategoryGroupSort 退回到 0，
 // 与 LEFT JOIN 的 NULL 一致；客户端把该群当作"未分类"展示。
+//
+// JOIN 谓词同时绑定 `gc.uid = gs.uid`（PR #21 Round-4 review I4 by yujiawei）：
+// 虽然 group_category.category_id 当前是全局唯一、且应只被 owner 的 group_setting
+// 引用，但 LEFT JOIN 只匹配 category_id 时这条不变量是 *结构上未强制* 的隐式约束。
+// 显式加 uid 谓词把约束变成 JOIN 自身的属性，避免未来 schema 演进（例如允许
+// 跨用户共享 category）时静默走 stale category_group_sort=0 分支。
 func (d *groupCategoryDB) QueryCategorySettingsByGroupNos(groupNos []string, uid string) ([]*GroupCategorySetting, error) {
 	if len(groupNos) == 0 {
 		return nil, nil
@@ -58,7 +64,7 @@ func (d *groupCategoryDB) QueryCategorySettingsByGroupNos(groupNos []string, uid
 		"IFNULL(gc.sort, 0) AS category_group_sort",
 	).
 		From(dbr.I("group_setting").As("gs")).
-		LeftJoin(dbr.I("group_category").As("gc"), "gs.category_id = gc.category_id").
+		LeftJoin(dbr.I("group_category").As("gc"), "gs.category_id = gc.category_id AND gs.uid = gc.uid").
 		Where("gs.group_no IN ? AND gs.uid = ?", groupNos, uid).
 		Load(&results)
 	return results, err

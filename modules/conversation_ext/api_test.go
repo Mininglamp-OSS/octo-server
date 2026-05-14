@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
@@ -13,6 +14,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func strconvI(i int) string { return strconv.Itoa(i) }
 
 // ---------------------------------------------------------------------------
 // Test doubles — in-process stubs that satisfy the Follow handler's needs
@@ -522,6 +525,86 @@ func TestFollow_UpdateSort_DBError(t *testing.T) {
 		"version": 0,
 	})
 	assertBadRequest(t, w)
+}
+
+// PR #21 Round-4 review I3 (yujiawei) regressions：UpdateSort 必须在 parse 阶段
+// 拒绝以下输入，避免不必要的 DB 往返 + 不准确的客户端错误提示。
+
+func TestFollow_UpdateSort_TooManyItems_Rejected(t *testing.T) {
+	r := newTestRouter(&stubService{}, &stubDB{
+		updateSortFn: func(uid, spaceID string, items []SortItem, version int64) error {
+			t.Fatal("DB.UpdateSort must NOT be called for over-cap payloads")
+			return nil
+		},
+	})
+	items := make([]map[string]interface{}, 0, maxUpdateSortItems+1)
+	for i := 0; i < maxUpdateSortItems+1; i++ {
+		items = append(items, map[string]interface{}{
+			"target_type": 1,
+			"target_id":   "dm-" + strconvI(i),
+			"sort":        i,
+		})
+	}
+	w := do(r, "PUT", "/v2/follow/sort", map[string]interface{}{
+		"items":   items,
+		"version": 0,
+	})
+	assertBadRequest(t, w)
+	assert.Contains(t, w.Body.String(), "items 太多")
+}
+
+func TestFollow_UpdateSort_EmptyTargetID_Rejected(t *testing.T) {
+	r := newTestRouter(&stubService{}, &stubDB{
+		updateSortFn: func(uid, spaceID string, items []SortItem, version int64) error {
+			t.Fatal("DB.UpdateSort must NOT be called when target_id is empty")
+			return nil
+		},
+	})
+	w := do(r, "PUT", "/v2/follow/sort", map[string]interface{}{
+		"items": []map[string]interface{}{
+			{"target_type": 1, "target_id": "", "sort": 1},
+		},
+		"version": 0,
+	})
+	assertBadRequest(t, w)
+	assert.Contains(t, w.Body.String(), "target_id")
+}
+
+func TestFollow_UpdateSort_DuplicateItems_Rejected(t *testing.T) {
+	r := newTestRouter(&stubService{}, &stubDB{
+		updateSortFn: func(uid, spaceID string, items []SortItem, version int64) error {
+			t.Fatal("DB.UpdateSort must NOT be called when payload has duplicate items")
+			return nil
+		},
+	})
+	w := do(r, "PUT", "/v2/follow/sort", map[string]interface{}{
+		"items": []map[string]interface{}{
+			{"target_type": 1, "target_id": "dm-1", "sort": 1},
+			{"target_type": 1, "target_id": "dm-1", "sort": 2},
+		},
+		"version": 0,
+	})
+	assertBadRequest(t, w)
+	assert.Contains(t, w.Body.String(), "重复")
+}
+
+// PR #21 Round-4 review I5 (lml2468)：ErrSortTargetNotFound 必须作为独立业务错误
+// 暴露给客户端（swagger 已承诺），不能再吞成通用 "更新排序失败"。
+func TestFollow_UpdateSort_TargetNotFound_DistinctError(t *testing.T) {
+	db := &stubDB{
+		updateSortFn: func(uid, spaceID string, items []SortItem, version int64) error {
+			return ErrSortTargetNotFound
+		},
+	}
+	r := newTestRouter(&stubService{}, db)
+	w := do(r, "PUT", "/v2/follow/sort", map[string]interface{}{
+		"items": []map[string]interface{}{
+			{"target_type": 1, "target_id": "dm-1", "sort": 1},
+		},
+		"version": 0,
+	})
+	assertBadRequest(t, w)
+	assert.Contains(t, w.Body.String(), "sort target not found")
 }
 
 // ---------------------------------------------------------------------------

@@ -215,8 +215,14 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 		followVersion = v
 	}
 
-	// 1. Fetch IM conversations (version=0, no device offset logic for v2)
-	conversations, err := sb.ctx.IMSyncUserConversation(loginUID, req.Version, req.MsgCount, req.LastMsgSeqs, nil)
+	// 1. Fetch IM conversations (version=0, no device offset logic for v2).
+	//
+	//    rawConversations 必须独立保留 —— 它是 cursor 推进的唯一来源
+	//    （见 step 6 + maxConversationVersion 注释）。Space 过滤后的列表只用于
+	//    构建 items；如果用过滤后列表推 cursor，最高 version 的会话恰好属于另一个
+	//    Space 时会被剔除，respVersion 退回 req.Version，客户端反复拉同一批 raw
+	//    conversations 死循环（PR #21 Round-4 review B1 by Jerry-Xin / lml2468 / yujiawei）。
+	rawConversations, err := sb.ctx.IMSyncUserConversation(loginUID, req.Version, req.MsgCount, req.LastMsgSeqs, nil)
 	if err != nil {
 		sb.Error("sidebar sync: IM fetch failed", zap.Error(err))
 		c.ResponseError(errors.New("同步会话失败"))
@@ -231,68 +237,92 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 	//     - 子区：跟父群的 space_id；
 	//     - DM：默认 Space 兜底 + Bot 成员关系 + payload.space_id 匹配；
 	//     - 系统 Bot：补齐占位，所有 Space 可见。
+	//
+	//    conversations 是过滤 + 系统 Bot 补齐后的"可见列表"，专门给后续 build/sort
+	//    使用；cursor 不取自这里（见 step 6）。
+	conversations := rawConversations
 	if spaceID != "" {
-		conversations = FilterRawConversationsBySpace(conversations, spaceID, loginUID, sb.ctx, sb.groupService)
+		conversations = FilterRawConversationsBySpace(rawConversations, spaceID, loginUID, sb.ctx, sb.groupService)
 		conversations = EnsureSystemBotsPresentRaw(conversations)
 	}
 
 	// 2. Load ancillary data
-	// 2a. Group category settings
+	//
+	// PR #21 Round-4 review B2 (Jerry-Xin / yujiawei Important #1)：
+	// follow tab 的语义是 "服务器对客户端宣告完整 follow 列表"，伴随 follow_version
+	// 作为 fresh 标记。任何"影响 follow tab 内容"的查询失败如果被吞成 warn + 部分
+	// 列表，客户端会把 partial 当作 fresh 缓存进而长期看不到正确数据 —— 这是
+	// privacy/正确性回归。所以 follow tab 路径下，下列 4 个查询的失败一律 fail-closed
+	// 返回 500，让客户端短时退避后重试；recent tab 不依赖这些数据，仍 fail-open。
+	//
+	// 已 fail-closed 的列表：categorySetting / unfollowedGroups / followedDMs /
+	// threadExtRows / loadThreadLastMsgAt。
+	isFollowTab := req.Tab == "follow"
+	failClosedForFollow := func(stage string, err error) bool {
+		if err == nil {
+			return false
+		}
+		if isFollowTab {
+			sb.Error("sidebar sync: "+stage+" failed (follow tab fail-closed)", zap.Error(err))
+			c.ResponseError(errors.New("同步会话失败"))
+			return true
+		}
+		sb.Warn("sidebar sync: "+stage+" failed (recent tab non-fatal)", zap.Error(err))
+		return false
+	}
+
+	// 2a. Thread ext rows (for follow tab thread entries) —— 必须先于 2b（category
+	//     settings 查询），因为 DB-only thread 的父群可能没出现在 IM 返回里，需要把
+	//     父群 groupNo 合入 categorySetting 查询，否则 mergeThreadEntries 会因 parent
+	//     category 缺失而 skip 该 thread（PR #21 Round-4 review I6 / lml2468 #3）。
+	threadExtRows := []*convext.Model{}
+	if isFollowTab {
+		rows, err := sb.convExtDB.ListThreadExts(loginUID, spaceID)
+		if failClosedForFollow("thread ext query", err) {
+			return
+		}
+		threadExtRows = rows
+	}
+	threadExtMap := make(map[string]*convext.Model, len(threadExtRows))
+	for _, m := range threadExtRows {
+		threadExtMap[m.TargetID] = m
+	}
+
+	// 2b. Group category settings
+	//     groupNos = IM 返回的 group 频道 ∪ thread ext 行的父群（去重）。
 	groupNos := extractGroupNos(conversations)
+	if isFollowTab && len(threadExtRows) > 0 {
+		groupNos = appendThreadParentGroupNos(groupNos, threadExtRows)
+	}
 	categorySetting := map[string]*GroupCategorySetting{}
 	if len(groupNos) > 0 {
 		settings, err := sb.groupCategoryDB.QueryCategorySettingsByGroupNos(groupNos, loginUID)
-		if err != nil {
-			sb.Warn("sidebar sync: category query failed (non-fatal)", zap.Error(err))
-		} else {
-			for _, s := range settings {
-				categorySetting[s.GroupNo] = s
-			}
+		if failClosedForFollow("category query", err) {
+			return
+		}
+		for _, s := range settings {
+			categorySetting[s.GroupNo] = s
 		}
 	}
 
-	// 2b. Unfollowed groups
-	// PR #21 review P1-2 (yujiawei): follow tab 下 ListUnfollowedGroups 失败必须
-	// fail-closed —— 该列表是 "黑名单"，丢失它会让 buildFollowItems 把用户
-	// 明确取消关注的群暴露到 follow tab，属于隐私回归。对 follow tab fail 整个
-	// 请求，让客户端短时间内重试；recent tab 不依赖该列表，仍可降级继续。
+	// 2c. Unfollowed groups
 	unfollowedGroups := map[string]struct{}{}
 	unfollowed, err := sb.convExtDB.ListUnfollowedGroups(loginUID, spaceID)
-	if err != nil {
-		if req.Tab == "follow" {
-			sb.Error("sidebar sync: unfollowed groups query failed (follow tab fail-closed)", zap.Error(err))
-			c.ResponseError(errors.New("同步会话失败"))
-			return
-		}
-		sb.Warn("sidebar sync: unfollowed groups query failed (recent tab non-fatal)", zap.Error(err))
+	if failClosedForFollow("unfollowed groups query", err) {
+		return
 	}
 	for _, m := range unfollowed {
 		unfollowedGroups[m.TargetID] = struct{}{}
 	}
 
-	// 2c. Followed DMs
+	// 2d. Followed DMs
 	followedDMs := map[string]*convext.Model{}
-	if dms, err := sb.convExtDB.ListFollowedDM(loginUID, spaceID); err != nil {
-		sb.Warn("sidebar sync: followed DM query failed (non-fatal)", zap.Error(err))
-	} else {
-		for _, m := range dms {
-			followedDMs[m.TargetID] = m
-		}
+	dms, err := sb.convExtDB.ListFollowedDM(loginUID, spaceID)
+	if failClosedForFollow("followed DM query", err) {
+		return
 	}
-
-	// 2d. Thread ext rows (for follow tab thread entries)
-	threadExtRows := []*convext.Model{}
-	if req.Tab == "follow" {
-		rows, err := sb.convExtDB.ListThreadExts(loginUID, spaceID)
-		if err != nil {
-			sb.Warn("sidebar sync: thread ext query failed (non-fatal)", zap.Error(err))
-		} else {
-			threadExtRows = rows
-		}
-	}
-	threadExtMap := make(map[string]*convext.Model, len(threadExtRows))
-	for _, m := range threadExtRows {
-		threadExtMap[m.TargetID] = m
+	for _, m := range dms {
+		followedDMs[m.TargetID] = m
 	}
 
 	// 2e. Pinned channels
@@ -310,7 +340,10 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 		// Append standalone thread ext entries not present in IM result.
 		// Pass categorySetting + unfollowedGroups so parent-follow filter applies
 		// to DB-only thread entries as well (PR review Round-3 Blocking #4).
-		lastMsgAtMap := sb.loadThreadLastMsgAt(threadExtRows)
+		lastMsgAtMap, err := sb.loadThreadLastMsgAt(threadExtRows)
+		if failClosedForFollow("thread last_message_at query", err) {
+			return
+		}
 		items = mergeThreadEntries(items, threadExtRows, lastMsgAtMap, categorySetting, unfollowedGroups)
 	case "recent":
 		items = buildRecentItems(conversations, pinnedSet)
@@ -333,8 +366,10 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 	}
 
 	// 6. Compute response version from raw conversations.
+	//    必须用 rawConversations（过滤前）—— Space filter 把 max-version 会话
+	//    剔除时 respVersion 仍要前进，否则客户端死循环（PR #21 Round-4 review B1）。
 	//    follow_version 已在 step 0 读取（PR #21 review P1-1）。
-	respVersion := maxConversationVersion(conversations, req.Version)
+	respVersion := maxConversationVersion(rawConversations, req.Version)
 
 	c.JSON(http.StatusOK, &sidebarSyncResp{
 		Items:         items,
@@ -381,10 +416,15 @@ func (sb *Sidebar) loadPinnedSet(uid, spaceID string) (map[string]struct{}, erro
 // PR review follow-up：之前的实现以 shortID 单键作 map，跨群同名 shortID 会
 // 互相覆盖，且 mergeThreadEntries 无法区分"thread 不存在"与"last_message_at NULL"。
 // 改为复合键后两种语义都清楚：键存在 = thread 活跃；值为 nil = last_message_at NULL。
-func (sb *Sidebar) loadThreadLastMsgAt(extRows []*convext.Model) map[string]*time.Time {
+//
+// PR #21 Round-4 review B2：返回 error 让调用方决定 fail-closed 还是 fail-open。
+// 在 follow tab 路径下吞掉错误并返回空 map 会让 mergeThreadEntries 把所有 DB-only
+// thread 当 "不活跃" skip，客户端 follow tab 残缺但仍带 follow_version，看上去 fresh —
+// 客户端长期缓存错误结果。所以接口契约改为：错误必须显式上报。
+func (sb *Sidebar) loadThreadLastMsgAt(extRows []*convext.Model) (map[string]*time.Time, error) {
 	result := make(map[string]*time.Time, len(extRows))
 	if len(extRows) == 0 {
-		return result
+		return result, nil
 	}
 	refs := make([]thread.ShortRef, 0, len(extRows))
 	for _, m := range extRows {
@@ -395,18 +435,17 @@ func (sb *Sidebar) loadThreadLastMsgAt(extRows []*convext.Model) map[string]*tim
 		refs = append(refs, thread.ShortRef{GroupNo: gno, ShortID: sid})
 	}
 	if len(refs) == 0 {
-		return result
+		return result, nil
 	}
 	threadMap, err := sb.threadDB.QueryActiveByGroupShortIDs(refs)
 	if err != nil {
-		sb.Warn("sidebar sync: thread last_message_at query failed", zap.Error(err))
-		return result
+		return nil, fmt.Errorf("sidebar load thread last_message_at: %w", err)
 	}
 	// QueryActiveByGroupShortIDs 已经按 "{groupNo}____{shortID}" 做键，直接转写。
 	for key, lite := range threadMap {
 		result[key] = lite.LastMessageAt
 	}
-	return result
+	return result, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -428,6 +467,32 @@ func extractGroupNos(convs []*config.SyncUserConversationResp) []string {
 		if c.ChannelType == common.ChannelTypeGroup.Uint8() {
 			groupNos = append(groupNos, c.ChannelID)
 		}
+	}
+	return groupNos
+}
+
+// appendThreadParentGroupNos 把 thread ext 行的父群 groupNo 去重后追加到
+// groupNos 切片中。
+//
+// PR #21 Round-4 review I6 (lml2468 #3)：DB-only thread（父群最近没新消息、
+// 没出现在 IM 返回里）的父群 category 必须一起加载，否则 mergeThreadEntries 在
+// parent-follow predicate 处把它 skip，用户 follow 的子区会从 follow tab 消失。
+// 这里只追加 groupNo，调用方负责走 QueryCategorySettingsByGroupNos 拉真实数据。
+func appendThreadParentGroupNos(groupNos []string, threadExtRows []*convext.Model) []string {
+	seen := make(map[string]struct{}, len(groupNos)+len(threadExtRows))
+	for _, g := range groupNos {
+		seen[g] = struct{}{}
+	}
+	for _, m := range threadExtRows {
+		parentNo, _, err := parseThreadChannelIDSidebar(m.TargetID)
+		if err != nil {
+			continue
+		}
+		if _, ok := seen[parentNo]; ok {
+			continue
+		}
+		seen[parentNo] = struct{}{}
+		groupNos = append(groupNos, parentNo)
 	}
 	return groupNos
 }

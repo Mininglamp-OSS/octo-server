@@ -3,7 +3,6 @@ package conversation_ext
 import (
 	"embed"
 	"sync"
-	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/register"
@@ -42,18 +41,6 @@ func InitGlobalConvExtService(ctx *config.Context) {
 // should call this to reach the service without importing anything else.
 func GetGlobalConvExtService() *Service {
 	return globalConvExtService
-}
-
-// ---------------------------------------------------------------------------
-// resetGlobalConvExtServiceOnce is a test-only helper that resets the
-// sync.Once so individual tests can call InitGlobalConvExtService independently.
-// It must NOT be called from production code — the *testing.T parameter
-// enforces this at compile time.
-// ---------------------------------------------------------------------------
-
-func resetGlobalConvExtServiceOnce(_ *testing.T) {
-	globalConvExtServiceOnce = sync.Once{}
-	globalConvExtService = nil
 }
 
 // ---------------------------------------------------------------------------

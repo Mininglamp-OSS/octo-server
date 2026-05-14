@@ -253,7 +253,7 @@ paths:
             业务错误（msg 字段携带具体说明）：
             - 参数错误：items 为空、target_type 不在白名单 (1/2/5)
             - "version conflict: please retry"：CAS 版本号不匹配，客户端应重新拉取最新版本后重试
-            - "sort target not found"：items[0] 指向的目标在服务端不存在（可能并发被取消关注），客户端应重新拉取关注列表
+            - "sort target not found"：items 中至少一项指向的目标在服务端不存在（可能并发被取消关注），客户端应重新拉取关注列表后整体重试
           schema:
             $ref: "#/definitions/response"
       security:

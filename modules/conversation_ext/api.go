@@ -288,14 +288,31 @@ func (f *Follow) UpdateSort(c *wkhttp.Context) {
 		c.ResponseError(pkgerrors.New("items 不能为空"))
 		return
 	}
+	// PR #21 Round-4 review I3 (yujiawei)：cap len、reject 空 target_id 与重复对，
+	// 让客户端看到精确错误而非通用 "sort target not found"，也避免无效请求打到 DB。
+	if len(req.Items) > maxUpdateSortItems {
+		c.ResponseError(pkgerrors.Errorf("items 太多（max %d）", maxUpdateSortItems))
+		return
+	}
 
 	// Validate each item's target_type against the white-list.
 	items := make([]SortItem, 0, len(req.Items))
+	seen := make(map[sortItemKey]struct{}, len(req.Items))
 	for _, it := range req.Items {
 		if !validFollowTargetTypes[it.TargetType] {
 			c.ResponseError(pkgerrors.New("无效的 target_type，仅支持 1（DM）/ 2（群）/ 5（子区）"))
 			return
 		}
+		if it.TargetID == "" {
+			c.ResponseError(pkgerrors.New("items 中存在空的 target_id"))
+			return
+		}
+		key := sortItemKey{TargetType: it.TargetType, TargetID: it.TargetID}
+		if _, dup := seen[key]; dup {
+			c.ResponseError(pkgerrors.Errorf("items 中存在重复项: (target_type=%d, target_id=%q)", it.TargetType, it.TargetID))
+			return
+		}
+		seen[key] = struct{}{}
 		items = append(items, SortItem{
 			TargetType: it.TargetType,
 			TargetID:   it.TargetID,
@@ -307,11 +324,29 @@ func (f *Follow) UpdateSort(c *wkhttp.Context) {
 			c.ResponseError(err)
 			return
 		}
+		// PR #21 Round-4 review I5 (lml2468)：ErrSortTargetNotFound 是 swagger
+		// 承诺的客户端可处理业务错误，必须区别于通用 DB 失败，让客户端走
+		// "重拉关注列表后整体重试" 的恢复路径。
+		if errors.Is(err, ErrSortTargetNotFound) {
+			c.ResponseError(err)
+			return
+		}
 		f.Error("更新排序失败", zap.Error(err))
 		c.ResponseError(pkgerrors.New("更新排序失败"))
 		return
 	}
 	c.ResponseOK()
+}
+
+// maxUpdateSortItems caps the per-request items array length to keep tx lock
+// scope bounded —— 与 maxMsgCount=1000、maxLastMsgSeqsLen=65536 在 sidebar 一侧
+// 同一审美，500 个 follow 项已经覆盖产品上限场景。
+const maxUpdateSortItems = 500
+
+// sortItemKey 用作 dedup map 的复合键。
+type sortItemKey struct {
+	TargetType uint8
+	TargetID   string
 }
 
 // Route registers the 7 Follow endpoints under /v2/follow.
