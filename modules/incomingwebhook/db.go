@@ -56,9 +56,23 @@ func (d *incomingWebhookDB) countByGroupNo(groupNo string) (int, error) {
 	return n, err
 }
 
+// updateFieldsAllowed 限定 updateFields 可写的列，防御未来调用方误传用户输入作 key
+// 触发任意列改写。新增可更新列时显式在此追加。
+var updateFieldsAllowed = map[string]struct{}{
+	"name":       {},
+	"avatar":     {},
+	"status":     {},
+	"token_hash": {},
+}
+
 func (d *incomingWebhookDB) updateFields(webhookID string, fields map[string]interface{}) error {
 	if len(fields) == 0 {
 		return nil
+	}
+	for k := range fields {
+		if _, ok := updateFieldsAllowed[k]; !ok {
+			return fmt.Errorf("incomingwebhook: updateFields: disallowed column %q", k)
+		}
 	}
 	_, err := d.session.Update("incoming_webhook").
 		SetMap(fields).
