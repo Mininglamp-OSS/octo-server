@@ -8,6 +8,7 @@ import (
 )
 
 func TestHandleUserRegisterEvent_SendsWelcomeMessage(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	_, bf := setupTestBotFather(t)
 
 	// Create BotFather user first

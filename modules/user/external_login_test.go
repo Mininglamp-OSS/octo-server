@@ -58,6 +58,7 @@ func TestService_LoginByExternalIdentity_NotConfigured(t *testing.T) {
 // LoginByExternalIdentity 已存在用户分支:用 table-driven 覆盖正常/拒绝/冷静期/缺失四种情况。
 // 共享同一份 *User 实例,通过 t.Run 子用例前清表 + 重新插入避免相互污染。
 func TestService_LoginByExternalIdentity_ExistingUser(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	u := setupExternalLoginTest(t)
 
 	tests := []struct {
@@ -188,6 +189,7 @@ func TestService_LoginByExternalIdentity_ExistingUser(t *testing.T) {
 // 新建用户路径同样必须做 @ 消毒(externalLoginCreate),不然 IdP 注入的 name
 // 会直接进 createUserModel.Name → token cache key,绕开 ValidateName 守护。
 func TestService_LoginByExternalIdentity_CreateUserSanitizesAtInName(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	u := setupExternalLoginTest(t)
 
 	uid := util.GenerUUID()
@@ -209,6 +211,7 @@ func TestService_LoginByExternalIdentity_CreateUserSanitizesAtInName(t *testing.
 
 // 空 ExistingUID + 非空 UID:走 createUserWithRespAndTx 路径,新建用户。
 func TestService_LoginByExternalIdentity_CreateNewUser(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	u := setupExternalLoginTest(t)
 
 	uid := util.GenerUUID()

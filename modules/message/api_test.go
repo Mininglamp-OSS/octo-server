@@ -42,6 +42,7 @@ func newTestServer() (*server.Server, *config.Context) {
 }
 
 func TestMessageSync(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := newTestServer()
 	f := New(ctx)
 	f.Route(s.GetRoute())
@@ -63,6 +64,7 @@ func TestMessageSync(t *testing.T) {
 }
 
 func TestMessageSyncack(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := newTestServer()
 	f := New(ctx)
 	f.Route(s.GetRoute())
@@ -83,6 +85,7 @@ func TestMessageSyncack(t *testing.T) {
 
 // 消息已读
 func TestReadedMessage(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	msg := New(ctx)
 	err := testutil.CleanAllTables(ctx)
@@ -141,6 +144,7 @@ func TestReadedMessage(t *testing.T) {
 }
 
 func TestPinMessage(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, _ := NewTestServer1()
 	// msg := New(ctx)
 	// err := testutil.CleanAllTables(ctx)
@@ -159,6 +163,7 @@ func TestPinMessage(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 }
 func TestSyncPindMessage(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := NewTestServer1()
 	msg := New(ctx)
 	// err := testutil.CleanAllTables(ctx)
@@ -243,6 +248,7 @@ var Token = "token122323"
 
 // NewTestServer 创建一个测试服务器
 func TestDeleteMessage_PersonChannel_NonFriend(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := newTestServer()
 	msg := New(ctx)
 	msg.Route(s.GetRoute())

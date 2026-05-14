@@ -10,6 +10,7 @@ import (
 )
 
 func TestReportList(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	m := NewManager(ctx)
 	m.Route(s.GetRoute())

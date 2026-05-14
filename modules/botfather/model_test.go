@@ -154,6 +154,7 @@ func TestBotSendMessageReq_EmptyPayload(t *testing.T) {
 }
 
 func TestBotEventsReq_Defaults(t *testing.T) {
+	// Pure JSON marshal/unmarshal of a struct — no external dependencies.
 	req := BotEventsReq{}
 
 	data, err := json.Marshal(req)
@@ -163,7 +164,7 @@ func TestBotEventsReq_Defaults(t *testing.T) {
 	err = json.Unmarshal(data, &decoded)
 	assert.NoError(t, err)
 	assert.Equal(t, int64(0), decoded.EventID)
-	assert.Equal(t, 0, decoded.Limit)
+	assert.Equal(t, int64(0), decoded.Limit)
 }
 
 func TestBotReadReceiptReq_EmptyMessageIDs(t *testing.T) {

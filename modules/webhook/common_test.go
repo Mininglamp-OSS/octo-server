@@ -151,13 +151,16 @@ func TestWebhookDBOncePattern(t *testing.T) {
 
 // TestWebhookDBGlobalVariables verifies the global variables are properly declared.
 func TestWebhookDBGlobalVariables(t *testing.T) {
-	// Reset for test isolation
+	// Reset for test isolation. We cannot copy webhookDBOnce by value
+	// (sync.Once contains a Mutex; copylocks vet check rejects it), so we
+	// only snapshot/restore the *DB pointer and reset the Once via zero
+	// value at start and end. This is safe because TestWebhookDBGlobalVariables
+	// is the sole writer of these globals during testing.
 	originalDB := webhookDB
-	originalOnce := webhookDBOnce
 
 	defer func() {
 		webhookDB = originalDB
-		webhookDBOnce = originalOnce
+		webhookDBOnce = sync.Once{}
 	}()
 
 	// Verify initial state can be nil

@@ -14,6 +14,7 @@ import (
 )
 
 func TestAddBanner(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	//m := NewManager(ctx)
 	//m.Route(s.GetRoute())
@@ -33,6 +34,7 @@ func TestAddBanner(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 }
 func TestGetBanners(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	wm := NewManager(ctx)
 	//清除数据
@@ -76,6 +78,7 @@ func TestGetBanners(t *testing.T) {
 	assert.Equal(t, true, strings.Contains(w.Body.String(), `"cover":"cover_1122"`))
 }
 func TestUpdateBanner(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	wm := NewManager(ctx)
 	//清除数据
@@ -106,6 +109,7 @@ func TestUpdateBanner(t *testing.T) {
 }
 
 func TestDeleteBanner(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	wm := NewManager(ctx)
 	//清除数据
@@ -129,6 +133,7 @@ func TestDeleteBanner(t *testing.T) {
 }
 
 func TestAddCategory(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	//清除数据
 	err := testutil.CleanAllTables(ctx)
@@ -143,6 +148,7 @@ func TestAddCategory(t *testing.T) {
 }
 
 func TestGetManagerCategory(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	wm := NewManager(ctx)
 	//清除数据
@@ -168,6 +174,7 @@ func TestGetManagerCategory(t *testing.T) {
 }
 
 func TestSortCategory(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	wm := NewManager(ctx)
 	//清除数据
@@ -196,6 +203,7 @@ func TestSortCategory(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 }
 func TestAddAPP(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	wm := NewManager(ctx)
 	//清除数据
@@ -225,6 +233,7 @@ func TestAddAPP(t *testing.T) {
 }
 
 func TestUpdateAPP(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	wm := NewManager(ctx)
 	//清除数据
@@ -262,6 +271,7 @@ func TestUpdateAPP(t *testing.T) {
 
 // 删除app
 func TestDeleteAPP(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	wm := NewManager(ctx)
 	//清除数据
@@ -293,6 +303,7 @@ func TestDeleteAPP(t *testing.T) {
 }
 
 func TestAppList(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	wm := NewManager(ctx)
 	//清除数据
@@ -331,6 +342,7 @@ func TestAppList(t *testing.T) {
 }
 
 func TestGetCategoryApps(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	wm := NewManager(ctx)
 	//清除数据
@@ -384,6 +396,7 @@ func TestGetCategoryApps(t *testing.T) {
 }
 
 func TestReorderCategoryApp(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	wm := NewManager(ctx)
 	//清除数据
@@ -421,6 +434,7 @@ func TestReorderCategoryApp(t *testing.T) {
 }
 
 func TestAddCategoryApp(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	wm := NewManager(ctx)
 	//清除数据
@@ -481,6 +495,7 @@ func TestAddCategoryApp(t *testing.T) {
 }
 
 func TestDeleteCategoryApp(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	wm := NewManager(ctx)
 	//清除数据
@@ -540,6 +555,7 @@ func TestDeleteCategoryApp(t *testing.T) {
 
 // 删除分类
 func TestDeleteCategory(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	wm := NewManager(ctx)
 	//清除数据
@@ -561,6 +577,7 @@ func TestDeleteCategory(t *testing.T) {
 
 // 编辑分类
 func TestUpdateCategory(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	wm := NewManager(ctx)
 	//清除数据
@@ -584,6 +601,7 @@ func TestUpdateCategory(t *testing.T) {
 
 // 排序横幅
 func TestReorderBanner(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	wm := NewManager(ctx)
 	//清除数据

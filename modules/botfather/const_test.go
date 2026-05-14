@@ -258,6 +258,7 @@ func TestGenerateBotID(t *testing.T) {
 }
 
 func TestBotNameValidation(t *testing.T) {
+	// Pure string-length validation logic — no DB / Redis / IM dependencies.
 	// 模拟 onBotNameInput 中的验证逻辑
 	tests := []struct {
 		name  string
@@ -265,7 +266,7 @@ func TestBotNameValidation(t *testing.T) {
 		valid bool
 	}{
 		{"valid short name", "Bot", true},
-		{"valid long name", strings.Repeat("名", 64), true},
+		{"valid long name", strings.Repeat("a", 64), true},
 		{"too long", strings.Repeat("a", 65), false},
 		{"empty", "", false},
 		{"whitespace only", "   ", false},

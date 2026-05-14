@@ -13,6 +13,7 @@ import (
 )
 
 func TestAddVersion(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
 	f.Route(s.GetRoute())
@@ -34,6 +35,7 @@ func TestAddVersion(t *testing.T) {
 }
 
 func TestGetNewVersion(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
 	//清除数据

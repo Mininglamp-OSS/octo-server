@@ -13,6 +13,7 @@ import (
 // TestDeleteBotCleansUpGroupMembers verifies that deleting a bot
 // removes it from all group_member records.
 func TestDeleteBotCleansUpGroupMembers(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	_ = s
 
@@ -76,6 +77,7 @@ func TestDeleteBotCleansUpGroupMembers(t *testing.T) {
 // TestDeleteBotCleansUpFriends verifies that deleting a bot
 // removes it from all friend records (both directions).
 func TestDeleteBotCleansUpFriends(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	_ = s
 

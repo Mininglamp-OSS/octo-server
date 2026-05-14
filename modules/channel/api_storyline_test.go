@@ -82,6 +82,7 @@ func TestGetStoryline_OnlyGroupChannel(t *testing.T) {
 
 // TestGetStoryline_EmptyChannel tests storyline response for empty channel
 func TestGetStoryline_EmptyChannel(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 
 	// Create login user

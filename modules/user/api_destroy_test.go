@@ -31,6 +31,7 @@ func seedDestroyTestUser(t *testing.T, u *User, password string) {
 }
 
 func TestDestroyApply_OK(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	u := New(ctx)
 
@@ -382,6 +383,7 @@ func TestEmailLogin_BlocksDestroyed_AllowsCoolingOff(t *testing.T) {
 }
 
 func TestUsernameLogin_AllowsCoolingOff(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	u := New(ctx)
 

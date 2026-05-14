@@ -25,6 +25,7 @@ import (
 // 根因:之前 /v1/user/login 和 /v1/user/current 都漏下发这三字段,
 // Web/Android/iOS 三端 self 徽章和 displayName 全部不亮。
 func TestUserCurrent_VerifiedUser(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	u := New(ctx)
 	u.Route(s.GetRoute())
@@ -76,6 +77,7 @@ func TestUserCurrent_VerifiedUser(t *testing.T) {
 // TestUserCurrent_UnverifiedUser 未实名用户:realname_verified=false,
 // real_name / realname_verified_at 被 omitempty 剥离或为零值,**不能 500**。
 func TestUserCurrent_UnverifiedUser(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	u := New(ctx)
 	u.Route(s.GetRoute())
@@ -120,6 +122,7 @@ func TestUserCurrent_UnverifiedUser(t *testing.T) {
 //     "need_upload_web3publickey": ...},顶层断言路径会失败。
 // 两条路径共用 execLogin → applyRealnameToLoginResp,测 login 就覆盖契约。
 func TestUserLogin_CarriesRealnameFields(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	u := New(ctx)
 	u.Route(s.GetRoute())

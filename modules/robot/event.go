@@ -52,6 +52,10 @@ func (rb *Robot) existRobot(robotID string) (bool, error) {
 
 func (rb *Robot) robotMessageListen(messages []*config.MessageResp) {
 	for _, message := range messages {
+		// Go 1.20 loopclosure: the goroutines spawned below close over `message`,
+		// so bind a loop-local copy first. (Go 1.22 makes this implicit, but the
+		// project still targets 1.20.)
+		message := message
 		payloadValue := gjson.ParseBytes(message.Payload)
 
 		if !payloadValue.Exists() {

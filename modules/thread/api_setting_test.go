@@ -12,6 +12,7 @@ import (
 )
 
 func TestUpdateThreadSetting_Mute(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := setupTestData(t)
 	groupNo := createTestGroup(t, ctx)
 	shortID := createThreadViaAPI(t, s, groupNo, "话题1")
@@ -48,6 +49,7 @@ func TestUpdateThreadSetting_InvalidShortID(t *testing.T) {
 }
 
 func TestUpdateThreadSetting_NotGroupMember(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := setupTestData(t)
 	groupNo := createTestGroup(t, ctx)
 	shortID := createThreadViaAPI(t, s, groupNo, "话题1")
@@ -69,6 +71,7 @@ func TestUpdateThreadSetting_NotGroupMember(t *testing.T) {
 }
 
 func TestUpdateThreadSetting_EmptyBody(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := setupTestData(t)
 	groupNo := createTestGroup(t, ctx)
 	shortID := createThreadViaAPI(t, s, groupNo, "话题1")

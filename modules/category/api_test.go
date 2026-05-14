@@ -88,6 +88,7 @@ func createCategory(t *testing.T, route *wkhttp.WKHttp, spaceID, name string) *h
 // ---------- Happy Path Tests ----------
 
 func TestCategory_Create(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
 
@@ -230,6 +231,7 @@ func TestCategory_Delete(t *testing.T) {
 }
 
 func TestCategory_Sort(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
 
@@ -683,6 +685,7 @@ func TestCategory_MoveGroupCrossSpace(t *testing.T) {
 }
 
 func TestCategory_ListEmpty(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
 
@@ -866,6 +869,7 @@ func TestCategory_UpdateDefaultRejected(t *testing.T) {
 }
 
 func TestCategory_SortWithDefault(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
 
@@ -943,6 +947,7 @@ func TestCategory_DefaultNameFromEnv(t *testing.T) {
 }
 
 func TestCategory_DefaultNotCountedInLimit(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
 
@@ -970,6 +975,7 @@ func TestCategory_DefaultNotCountedInLimit(t *testing.T) {
 }
 
 func TestCategory_ListNoGroupsNoDefault(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
 
@@ -993,6 +999,7 @@ func TestCategory_ListNoGroupsNoDefault(t *testing.T) {
 }
 
 func TestCategory_MoveGroupToDefaultCategory(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
 

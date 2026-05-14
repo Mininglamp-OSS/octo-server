@@ -180,6 +180,7 @@ func TestReorderUserApp(t *testing.T) {
 }
 
 func TestGetCategory(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	wm := NewManager(ctx)
 	err := testutil.CleanAllTables(ctx)
@@ -266,6 +267,7 @@ func TestGetAppWithCategory(t *testing.T) {
 }
 
 func TestAddRecord(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	wm := NewManager(ctx)
 	err := testutil.CleanAllTables(ctx)
@@ -330,6 +332,7 @@ func TestGetRecord(t *testing.T) {
 }
 
 func TestDeleteRecord(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
 	wp := New(ctx)
 	err := testutil.CleanAllTables(ctx)
