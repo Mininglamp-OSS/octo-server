@@ -26,8 +26,11 @@ type PromptConfig struct {
 	TaskTranscribe           string `yaml:"task_transcribe"`
 	TaskTranscribeWithVocab  string `yaml:"task_transcribe_with_vocab"`
 	TaskAppend               string `yaml:"task_append"`
+	TaskAppendNoEmotion      string `yaml:"task_append_no_emotion"`
 	TaskEdit                 string `yaml:"task_edit"`
 	TaskEditOnly             string `yaml:"task_edit_only"`
+	TaskEditNoEmotion        string `yaml:"task_edit_no_emotion"`
+	TaskEditOnlyNoEmotion    string `yaml:"task_edit_only_no_emotion"`
 
 	// Legacy fields: parsed for backward compatibility but ignored with warning.
 	Transcribe        string `yaml:"transcribe,omitempty"`
@@ -48,7 +51,7 @@ func init() {
 // resetToDefaults sets activePrompts to the hardcoded constants.
 func resetToDefaults() {
 	activePrompts = PromptConfig{
-		System:                   systemPrompt,
+		System:                   systemPromptTemplate,
 		VocabularyReference:      vocabularyReferenceTemplate,
 		AppendInputBuffer:        appendInputBufferTemplate,
 		AppendInputBufferNoVocab: appendInputBufferNoVocabTemplate,
@@ -56,8 +59,11 @@ func resetToDefaults() {
 		TaskTranscribe:           taskTranscribe,
 		TaskTranscribeWithVocab:  taskTranscribeWithVocab,
 		TaskAppend:               taskAppend,
+		TaskAppendNoEmotion:      taskAppendNoEmotion,
 		TaskEdit:                 taskEdit,
 		TaskEditOnly:             taskEditOnly,
+		TaskEditNoEmotion:        taskEditNoEmotion,
+		TaskEditOnlyNoEmotion:    taskEditOnlyNoEmotion,
 	}
 }
 
@@ -115,6 +121,10 @@ func LoadPrompts(filePath string, log promptLogger) {
 	// System: no placeholder validation
 	if strings.TrimSpace(cfg.System) != "" {
 		activePrompts.System = strings.TrimRight(cfg.System, "\r\n")
+		if !strings.Contains(activePrompts.System, "{{RULE5_TITLE}}") && log != nil {
+			log.Warn("custom system prompt lacks {{RULE5_TITLE}} placeholder; emotion toggle will not affect system message",
+				zap.String("path", filePath))
+		}
 	}
 
 	// Template fields: require exactly 1 %s placeholder
@@ -151,12 +161,33 @@ func LoadPrompts(filePath string, log promptLogger) {
 		{"task_transcribe", cfg.TaskTranscribe, &activePrompts.TaskTranscribe},
 		{"task_transcribe_with_vocab", cfg.TaskTranscribeWithVocab, &activePrompts.TaskTranscribeWithVocab},
 		{"task_append", cfg.TaskAppend, &activePrompts.TaskAppend},
+		{"task_append_no_emotion", cfg.TaskAppendNoEmotion, &activePrompts.TaskAppendNoEmotion},
 		{"task_edit", cfg.TaskEdit, &activePrompts.TaskEdit},
 		{"task_edit_only", cfg.TaskEditOnly, &activePrompts.TaskEditOnly},
+		{"task_edit_no_emotion", cfg.TaskEditNoEmotion, &activePrompts.TaskEditNoEmotion},
+		{"task_edit_only_no_emotion", cfg.TaskEditOnlyNoEmotion, &activePrompts.TaskEditOnlyNoEmotion},
 	}
 	for _, f := range taskFields {
 		if strings.TrimSpace(f.value) != "" {
 			*f.target = strings.TrimRight(f.value, "\r\n")
+		}
+	}
+
+	emotionPairs := []struct {
+		emotionField   string
+		emotionValue   string
+		noEmotionField string
+		noEmotionValue string
+	}{
+		{"task_append", cfg.TaskAppend, "task_append_no_emotion", cfg.TaskAppendNoEmotion},
+		{"task_edit", cfg.TaskEdit, "task_edit_no_emotion", cfg.TaskEditNoEmotion},
+		{"task_edit_only", cfg.TaskEditOnly, "task_edit_only_no_emotion", cfg.TaskEditOnlyNoEmotion},
+	}
+	for _, p := range emotionPairs {
+		if strings.TrimSpace(p.emotionValue) != "" && strings.TrimSpace(p.noEmotionValue) == "" && log != nil {
+			log.Warn("YAML overrides task variant but not its no-emotion counterpart; default will be used when VOICE_EMOTION_EMOJI=false",
+				zap.String("override_field", p.emotionField),
+				zap.String("missing_field", p.noEmotionField))
 		}
 	}
 
