@@ -4,7 +4,7 @@
 CREATE TABLE `incoming_webhook` (
   `id`                  BIGINT       NOT NULL PRIMARY KEY AUTO_INCREMENT,
   `webhook_id`          VARCHAR(64)  NOT NULL DEFAULT '' COMMENT '公开 ID，URL 路径段（iwh_ + 32 hex 或 fallback 路径下的去横线 UUID）',
-  `token_hash`          VARCHAR(64)  NOT NULL DEFAULT '' COMMENT 'SHA-256(token) 十六进制；token 仅创建/重置时返回',
+  `token_hash`          VARCHAR(128) NOT NULL DEFAULT '' COMMENT '哈希(token) 十六进制；SHA-256 占 64 字符，128 字符留余量便于未来切换 SHA-512',
   `group_no`            VARCHAR(40)  NOT NULL DEFAULT '' COMMENT '所属群编号',
   `space_id`            VARCHAR(40)  NOT NULL DEFAULT '' COMMENT '冗余：群所属 Space',
   `name`                VARCHAR(64)  NOT NULL DEFAULT '' COMMENT '展示名',
