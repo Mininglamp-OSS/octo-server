@@ -261,18 +261,6 @@ func (w *IncomingWebhook) create(c *wkhttp.Context) {
 		return
 	}
 
-	// 配额检查
-	count, err := w.db.countByGroupNo(groupNo)
-	if err != nil {
-		w.Error("count webhooks failed", zap.Error(err))
-		c.ResponseError(errors.New("查询配额失败"))
-		return
-	}
-	if count >= maxPerGroup() {
-		c.ResponseError(fmt.Errorf("每个群最多 %d 个 webhook", maxPerGroup()))
-		return
-	}
-
 	// 查询 group 拿 space_id；同时确保群处于 Normal 状态。
 	// 已解散/已禁用的群禁止创建新 webhook，避免 disband 后被 stale 管理员复活。
 	g, err := w.requireActiveGroup(groupNo)
@@ -303,7 +291,12 @@ func (w *IncomingWebhook) create(c *wkhttp.Context) {
 		CreatorUID: loginUID,
 		Status:     1,
 	}
-	if err := w.db.insert(m); err != nil {
+	// 配额校验 + 写入在事务内原子完成；FOR UPDATE 锁住 group_no 范围，防止并发越限。
+	if err := w.db.insertWithQuota(m, maxPerGroup()); err != nil {
+		if errors.Is(err, ErrQuotaExceeded) {
+			c.ResponseError(fmt.Errorf("每个群最多 %d 个 webhook", maxPerGroup()))
+			return
+		}
 		w.Error("insert webhook failed", zap.Error(err))
 		c.ResponseError(errors.New("创建失败"))
 		return
@@ -620,6 +613,11 @@ func (w *IncomingWebhook) push(c *wkhttp.Context) {
 //   - 注入 from.kind=webhook 元信息，便于客户端识别非真实用户消息；
 //     客户端可统一按 markdown 渲染 webhook 消息（无 markdown 时退化为纯文本）。
 //   - @all/@here 降级为纯文本：调用方写在 content 里的字面量保留，不附 mention 字段。
+//
+// 安全：调用方 req.Extra 一律**丢弃**，不进入持久化 payload。原因：message 模块对
+// 顶层 payload 字段（如 visibles / mention / reminder 等）按服务端控制语义解释，
+// 让外部 token 持有者写这些字段会绕过群可见性 / 通知策略。如需扩展，请在此处显式
+// 列入允许字段（且明确该字段无访问控制语义），不要再走透传。
 func buildPayload(m *incomingWebhookModel, req *pushPayloadReq) map[string]interface{} {
 	name := req.Username
 	if name == "" {
@@ -629,7 +627,7 @@ func buildPayload(m *incomingWebhookModel, req *pushPayloadReq) map[string]inter
 	if avatar == "" {
 		avatar = m.Avatar
 	}
-	payload := map[string]interface{}{
+	return map[string]interface{}{
 		"type":    int(common.Text),
 		"content": req.Content,
 		"from": map[string]interface{}{
@@ -638,20 +636,10 @@ func buildPayload(m *incomingWebhookModel, req *pushPayloadReq) map[string]inter
 			"name":       name,
 			"avatar":     avatar,
 		},
+		// space_id 必须由服务端从 group 表派生，不接受调用方覆盖，
+		// 防止 webhook 消息被伪造到其他 Space。
+		"space_id": m.SpaceID,
 	}
-	if len(req.Extra) > 0 {
-		// 透传白名单字段，避免覆盖关键字段
-		for k, v := range req.Extra {
-			if k == "type" || k == "content" || k == "from" || k == "mention" || k == "space_id" {
-				continue
-			}
-			payload[k] = v
-		}
-	}
-	// space_id 必须由服务端从 group 表派生，不接受调用方覆盖，
-	// 防止 webhook 消息被伪造到其他 Space。
-	payload["space_id"] = m.SpaceID
-	return payload
 }
 
 // recordSuccess 写审计 + 累加调用计数。失败仅记日志，不阻塞主流程。
