@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
+	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/stretchr/testify/assert"
@@ -15,7 +16,13 @@ import (
 // group 模块的测试不会自动运行 thread 模块的迁移，沿用 TestMain 里手工建表的同款做法。
 func ensureThreadTables(t *testing.T, f *Group) {
 	t.Helper()
-	_, err := f.ctx.DB().UpdateBySql(`CREATE TABLE IF NOT EXISTS thread (
+	ensureThreadTablesByCtx(t, f.ctx)
+}
+
+// ensureThreadTablesByCtx 同 ensureThreadTables 但直接接受 ctx，方便 service 层 / 纯 ctx 测试复用。
+func ensureThreadTablesByCtx(t *testing.T, ctx *config.Context) {
+	t.Helper()
+	_, err := ctx.DB().UpdateBySql(`CREATE TABLE IF NOT EXISTS thread (
 		id BIGINT AUTO_INCREMENT PRIMARY KEY,
 		short_id VARCHAR(32) NOT NULL,
 		group_no VARCHAR(40) NOT NULL,
@@ -29,7 +36,7 @@ func ensureThreadTables(t *testing.T, f *Group) {
 		UNIQUE KEY uk_short_id (short_id)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`).Exec()
 	require.NoError(t, err)
-	_, err = f.ctx.DB().UpdateBySql(`CREATE TABLE IF NOT EXISTS thread_member (
+	_, err = ctx.DB().UpdateBySql(`CREATE TABLE IF NOT EXISTS thread_member (
 		id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
 		thread_id BIGINT UNSIGNED NOT NULL,
 		uid VARCHAR(40) NOT NULL,
@@ -41,8 +48,8 @@ func ensureThreadTables(t *testing.T, f *Group) {
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`).Exec()
 	require.NoError(t, err)
 	// CleanAllTables 之后再 delete 一遍，保证干净
-	_, _ = f.ctx.DB().DeleteFrom("thread_member").Exec()
-	_, _ = f.ctx.DB().DeleteFrom("thread").Exec()
+	_, _ = ctx.DB().DeleteFrom("thread_member").Exec()
+	_, _ = ctx.DB().DeleteFrom("thread").Exec()
 }
 
 // TestGroupExit_CascadeBot_AlsoRemovesFromThread 回归 YUJ-52 / Mininglamp-OSS/octo-server#1189：
