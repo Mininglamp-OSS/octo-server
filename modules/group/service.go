@@ -1827,47 +1827,10 @@ func beginAvatarUpdateEvent(ctx *config.Context, db *DB, groupNo string, memberU
 	return eventID, nil
 }
 
-// removeUserFromGroupThreads 移除用户在某群下所有子区的成员记录、IM 订阅和置顶（直接 SQL）
+// removeUserFromGroupThreads 委托给包级 removeUserFromGroupThreadsCleanup；
+// 见 thread_cleanup.go 注释（Issue #27）。
 func (s *Service) removeUserFromGroupThreads(groupNo, uid, spaceID string) {
-	type threadInfo struct {
-		ShortID string `db:"short_id"`
-	}
-	var threads []threadInfo
-	_, err := s.ctx.DB().Select("thread.short_id").
-		From("thread").
-		Join("thread_member", "thread.id = thread_member.thread_id").
-		Where("thread.group_no=? AND thread_member.uid=? AND thread.status!=3", groupNo, uid).
-		Load(&threads)
-	if err != nil {
-		s.Error("query user threads failed", zap.Error(err), zap.String("groupNo", groupNo), zap.String("uid", uid))
-		return
-	}
-	if len(threads) == 0 {
-		return
-	}
-
-	// 删除成员记录
-	_, err = s.ctx.DB().DeleteFrom("thread_member").
-		Where("uid=? AND thread_id IN (SELECT id FROM thread WHERE group_no=?)", uid, groupNo).
-		Exec()
-	if err != nil {
-		s.Error("delete thread member failed", zap.Error(err), zap.String("groupNo", groupNo), zap.String("uid", uid))
-		return
-	}
-
-	// 移除 IM 订阅和置顶
-	for _, t := range threads {
-		channelID := groupNo + "____" + t.ShortID
-		if rmErr := s.ctx.IMRemoveSubscriber(&config.SubscriberRemoveReq{
-			ChannelID:   channelID,
-			ChannelType: common.ChannelTypeCommunityTopic.Uint8(),
-			Subscribers: []string{uid},
-		}); rmErr != nil {
-			s.Error("remove thread IM subscriber failed", zap.Error(rmErr), zap.String("channelID", channelID), zap.String("uid", uid))
-		}
-		// 清理用户在该子区的置顶
-		user.RemovePinnedForUserInSpace(uid, spaceID, channelID, common.ChannelTypeCommunityTopic.Uint8())
-	}
+	removeUserFromGroupThreadsCleanup(s.ctx, s.Log, groupNo, uid, spaceID)
 }
 
 // addUsersToGroupThreads 新成员入群时，将其加入该群所有子区的 IM 订阅（直接 SQL）
