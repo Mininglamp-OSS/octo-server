@@ -134,7 +134,7 @@ func (s *VoiceService) TranscribeWithResult(audioData []byte, mimeType, contextT
 	}
 
 	// Build prompts
-	userMsg := buildUserMessage(mode, contextText, chatContext)
+	userMsg := buildUserMessage(mode, contextText, chatContext, svc.config.EmotionEmoji)
 	var systemMsg string
 	if svc.config.Engine != EngineGPT {
 		systemMsg = buildSystemMessage(svc.config.EmotionEmoji)

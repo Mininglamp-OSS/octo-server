@@ -6,19 +6,38 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/zap"
 )
+
+type warnEntry struct {
+	msg    string
+	fields []zap.Field
+}
+
+type mockLogger struct {
+	warns []warnEntry
+	infos []warnEntry
+}
+
+func (m *mockLogger) Info(msg string, fields ...zap.Field) {
+	m.infos = append(m.infos, warnEntry{msg, fields})
+}
+
+func (m *mockLogger) Warn(msg string, fields ...zap.Field) {
+	m.warns = append(m.warns, warnEntry{msg, fields})
+}
 
 func TestLoadPrompts_FileNotFound(t *testing.T) {
 	t.Cleanup(resetToDefaults)
 	LoadPrompts("/nonexistent/path.yaml", nil)
-	assert.Equal(t, systemPrompt, activePrompts.System)
+	assert.Equal(t, systemPromptTemplate, activePrompts.System)
 	assert.Equal(t, vocabularyReferenceTemplate, activePrompts.VocabularyReference)
 }
 
 func TestLoadPrompts_EmptyPath(t *testing.T) {
 	t.Cleanup(resetToDefaults)
 	LoadPrompts("", nil)
-	assert.Equal(t, systemPrompt, activePrompts.System)
+	assert.Equal(t, systemPromptTemplate, activePrompts.System)
 }
 
 func TestLoadPrompts_PartialOverride(t *testing.T) {
@@ -72,7 +91,7 @@ func TestLoadPrompts_InvalidYAML(t *testing.T) {
 	os.WriteFile(path, []byte(`{{{invalid`), 0644)
 
 	LoadPrompts(path, nil)
-	assert.Equal(t, systemPrompt, activePrompts.System)
+	assert.Equal(t, systemPromptTemplate, activePrompts.System)
 }
 
 func TestLoadPrompts_EmptyFields(t *testing.T) {
@@ -87,7 +106,7 @@ vocabulary_reference: "custom vocab %s"
 
 	LoadPrompts(path, nil)
 	// Empty system should keep default
-	assert.Equal(t, systemPrompt, activePrompts.System)
+	assert.Equal(t, systemPromptTemplate, activePrompts.System)
 	// Non-empty vocabulary_reference should override
 	assert.Equal(t, "custom vocab %s", activePrompts.VocabularyReference)
 }
@@ -119,7 +138,7 @@ vocabulary_reference: "custom vocab %s"
 
 	LoadPrompts(path, nil)
 	// Whitespace-only system should keep default
-	assert.Equal(t, systemPrompt, activePrompts.System)
+	assert.Equal(t, systemPromptTemplate, activePrompts.System)
 	assert.Equal(t, "custom vocab %s", activePrompts.VocabularyReference)
 }
 
@@ -187,6 +206,13 @@ func TestLoadPrompts_TaskEditOnlyDefault(t *testing.T) {
 	assert.Equal(t, taskEditOnly, activePrompts.TaskEditOnly)
 }
 
+func TestLoadPrompts_TaskAppendNoEmotionDefault(t *testing.T) {
+	t.Cleanup(resetToDefaults)
+	resetToDefaults()
+	assert.Equal(t, taskAppendNoEmotion, activePrompts.TaskAppendNoEmotion)
+	assert.NotEmpty(t, activePrompts.TaskAppendNoEmotion)
+}
+
 func TestLoadPrompts_TaskEditOnlyOverride(t *testing.T) {
 	t.Cleanup(resetToDefaults)
 	dir := t.TempDir()
@@ -225,4 +251,45 @@ task_edit: "edit task with special %s chars"
 	// Task fields should accept any content (no %s validation)
 	assert.Equal(t, "transcribe task", activePrompts.TaskTranscribe)
 	assert.Equal(t, "edit task with special %s chars", activePrompts.TaskEdit)
+}
+
+func TestLoadPrompts_SystemMissingPlaceholder_LogsWarning(t *testing.T) {
+	t.Cleanup(resetToDefaults)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "prompts.yaml")
+	os.WriteFile(path, []byte(`system: "custom prompt without placeholder"`), 0644)
+
+	ml := &mockLogger{}
+	LoadPrompts(path, ml)
+
+	assert.Equal(t, "custom prompt without placeholder", activePrompts.System)
+	assert.Len(t, ml.warns, 1)
+	assert.Contains(t, ml.warns[0].msg, "{{RULE5_TITLE}}")
+}
+
+func TestLoadPrompts_TaskOverrideMissingNoEmotion_LogsWarning(t *testing.T) {
+	t.Cleanup(resetToDefaults)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "prompts.yaml")
+	content := `
+task_append: "custom append task"
+task_edit: "custom edit task"
+`
+	os.WriteFile(path, []byte(content), 0644)
+
+	ml := &mockLogger{}
+	LoadPrompts(path, ml)
+
+	var warnFields []string
+	for _, w := range ml.warns {
+		if w.msg == "YAML overrides task variant but not its no-emotion counterpart; default will be used when VOICE_EMOTION_EMOJI=false" {
+			for _, f := range w.fields {
+				if f.Key == "override_field" {
+					warnFields = append(warnFields, f.String)
+				}
+			}
+		}
+	}
+	assert.Contains(t, warnFields, "task_append")
+	assert.Contains(t, warnFields, "task_edit")
 }
