@@ -1,0 +1,296 @@
+swagger: "2.0"
+info:
+  description: "Octo Follow API — 关注/取消关注/排序操作"
+  version: "1.0.0"
+  title: "Octo Follow API"
+host: "api.botgate.cn"
+tags:
+  - name: "follow"
+    description: "关注 Tab 相关操作（DM 关注、群黑名单、子区关注、手动排序）"
+schemes:
+  - "https"
+basePath: "/v2"
+
+paths:
+  /follow/dm:
+    post:
+      tags:
+        - "follow"
+      summary: "关注 DM"
+      description: "将指定用户的私聊会话加入关注列表，可选择指定所属分组"
+      operationId: "followDM"
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      parameters:
+        - in: "body"
+          name: "body"
+          required: true
+          schema:
+            type: object
+            required:
+              - peer_uid
+            properties:
+              peer_uid:
+                type: string
+                description: "对方用户 UID"
+              category_id:
+                type: string
+                maxLength: 32
+                description: "DM 所属分类的 UUID，引用 group_category.category_id（与群分类共用同一 namespace）。不传或 null 表示未分类。服务端会校验 categoryID 属于当前 uid 且未删除，否则返回 400 'dm category forbidden'。"
+      responses:
+        200:
+          description: "操作成功"
+          schema:
+            $ref: "#/definitions/response"
+        400:
+          description: "参数错误或业务错误"
+          schema:
+            $ref: "#/definitions/response"
+      security:
+        - token: []
+    delete:
+      tags:
+        - "follow"
+      summary: "取消关注 DM"
+      description: "从关注列表中移除指定用户的私聊会话"
+      operationId: "unfollowDM"
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      parameters:
+        - in: "query"
+          name: "peer_uid"
+          type: string
+          required: true
+          description: "对方用户 UID"
+      responses:
+        200:
+          description: "操作成功"
+          schema:
+            $ref: "#/definitions/response"
+        400:
+          description: "参数错误或业务错误"
+          schema:
+            $ref: "#/definitions/response"
+      security:
+        - token: []
+
+  /follow/channel/unfollow:
+    post:
+      tags:
+        - "follow"
+      summary: "取消关注群"
+      description: "将群加入黑名单（group_unfollowed=1），同时删除该群下所有子区的扩展行"
+      operationId: "unfollowChannel"
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      parameters:
+        - in: "body"
+          name: "body"
+          required: true
+          schema:
+            type: object
+            required:
+              - group_no
+            properties:
+              group_no:
+                type: string
+                description: "群编号"
+      responses:
+        200:
+          description: "操作成功"
+          schema:
+            $ref: "#/definitions/response"
+        400:
+          description: "参数错误或业务错误"
+          schema:
+            $ref: "#/definitions/response"
+      security:
+        - token: []
+
+  /follow/channel/refollow:
+    post:
+      tags:
+        - "follow"
+      summary: "重新关注群"
+      description: "清除群的黑名单标记（group_unfollowed=0），重新关注该群"
+      operationId: "followChannel"
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      parameters:
+        - in: "body"
+          name: "body"
+          required: true
+          schema:
+            type: object
+            required:
+              - group_no
+            properties:
+              group_no:
+                type: string
+                description: "群编号"
+      responses:
+        200:
+          description: "操作成功"
+          schema:
+            $ref: "#/definitions/response"
+        400:
+          description: "参数错误或业务错误"
+          schema:
+            $ref: "#/definitions/response"
+      security:
+        - token: []
+
+  /follow/thread:
+    post:
+      tags:
+        - "follow"
+      summary: "关注子区"
+      description: "关注子区，同时隐式清除父群的黑名单标记（group_unfollowed=0）。thread_channel_id 格式为 {groupNo}____{shortID}"
+      operationId: "followThread"
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      parameters:
+        - in: "body"
+          name: "body"
+          required: true
+          schema:
+            type: object
+            required:
+              - thread_channel_id
+            properties:
+              thread_channel_id:
+                type: string
+                description: "子区频道 ID，格式：{groupNo}____{shortID}"
+      responses:
+        200:
+          description: "操作成功"
+          schema:
+            $ref: "#/definitions/response"
+        400:
+          description: "参数错误或业务错误"
+          schema:
+            $ref: "#/definitions/response"
+      security:
+        - token: []
+    delete:
+      tags:
+        - "follow"
+      summary: "取消关注子区"
+      description: "从关注列表中移除指定子区，不影响父群的关注状态"
+      operationId: "unfollowThread"
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      parameters:
+        - in: "query"
+          name: "thread_channel_id"
+          type: string
+          required: true
+          description: "子区频道 ID，格式：{groupNo}____{shortID}"
+      responses:
+        200:
+          description: "操作成功"
+          schema:
+            $ref: "#/definitions/response"
+        400:
+          description: "参数错误或业务错误"
+          schema:
+            $ref: "#/definitions/response"
+      security:
+        - token: []
+
+  /follow/sort:
+    put:
+      tags:
+        - "follow"
+      summary: "关注 Tab 手动排序（CAS）"
+      description: |
+        对关注列表进行手动排序，使用乐观并发控制（CAS）。
+        - version 必须与服务端当前版本一致，否则返回 version conflict 错误。
+        - target_type 白名单：1（DM）/ 2（群）/ 5（子区）。
+      operationId: "updateFollowSort"
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      parameters:
+        - in: "body"
+          name: "body"
+          required: true
+          schema:
+            type: object
+            required:
+              - items
+              - version
+            properties:
+              items:
+                type: array
+                description: "排序项列表（非空）"
+                items:
+                  $ref: "#/definitions/sortItem"
+              version:
+                type: integer
+                format: int64
+                description: "客户端持有的当前版本号，用于 CAS 并发控制"
+      responses:
+        200:
+          description: "排序更新成功"
+          schema:
+            $ref: "#/definitions/response"
+        400:
+          description: |
+            业务错误（msg 字段携带具体说明）：
+            - 参数错误：items 为空、target_type 不在白名单 (1/2/5)
+            - "version conflict: please retry"：CAS 版本号不匹配，客户端应重新拉取最新版本后重试
+            - "sort target not found"：items 中至少一项指向的目标在服务端不存在（可能并发被取消关注），客户端应重新拉取关注列表后整体重试
+          schema:
+            $ref: "#/definitions/response"
+      security:
+        - token: []
+
+securityDefinitions:
+  token:
+    type: "apiKey"
+    in: "header"
+    name: "token"
+    description: "用户 token（登录后获取）"
+
+definitions:
+  sortItem:
+    type: object
+    required:
+      - target_type
+      - target_id
+    properties:
+      target_type:
+        type: integer
+        description: "目标类型：1=DM, 2=群, 5=子区"
+        enum: [1, 2, 5]
+      target_id:
+        type: string
+        description: "目标 ID（DM 为 peer_uid，群为 group_no，子区为 thread_channel_id）"
+      sort:
+        type: integer
+        description: |
+          可选，客户端侧的本地排序值，服务端忽略此字段；最终 follow_sort 完全按 items 数组顺序（1, 2, 3, ...）重新分配。
+          字段保留是为了客户端在传输前后保持自身数据结构一致，未来可能完全弃用。
+  response:
+    type: object
+    properties:
+      status:
+        type: integer
+        description: "HTTP 状态码"
+      msg:
+        type: string
+        description: "错误信息（成功时为空）"

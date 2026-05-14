@@ -2,18 +2,11 @@ package user
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"runtime/debug"
-	"net/http"
 	"strings"
 
-	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
-	wkutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
-	chservice "github.com/Mininglamp-OSS/octo-server/modules/channel/service"
-	"github.com/Mininglamp-OSS/octo-server/modules/source"
-	"github.com/Mininglamp-OSS/octo-server/modules/space"
-	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
-	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
@@ -21,6 +14,14 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkevent"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	chservice "github.com/Mininglamp-OSS/octo-server/modules/channel/service"
+	"github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
+	"github.com/Mininglamp-OSS/octo-server/modules/source"
+	"github.com/Mininglamp-OSS/octo-server/modules/space"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
+	wkutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
+	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 )
@@ -278,6 +279,9 @@ func (f *Friend) delete(c *wkhttp.Context) {
 	// 清理双方的好友置顶
 	RemovePinnedForUser(loginUID, uid, common.ChannelTypePerson.Uint8())
 	RemovePinnedForUser(uid, loginUID, common.ChannelTypePerson.Uint8())
+	// 级联清理双方的 DM ext 关注行
+	conversation_ext.RemoveConvExtForUser(loginUID, uid)
+	conversation_ext.RemoveConvExtForUser(uid, loginUID)
 
 	c.ResponseOK()
 }

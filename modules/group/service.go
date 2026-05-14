@@ -14,6 +14,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkevent"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	"github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
@@ -424,6 +425,7 @@ func (s *Service) GetMemberExternalMarkers(groupNo string) (map[string]MemberExt
 	}
 	return result, nil
 }
+
 // GetMemberExternalFields 返回单成员的外部来源/归属 Space 字段，供 /users/{uid}?group_no=
 // 路径（user 模块 GroupMemberResp）补齐。语义与批量版 GetMemberExternalMarkers 一致：
 //
@@ -438,7 +440,7 @@ func (s *Service) GetMemberExternalMarkers(groupNo string) (map[string]MemberExt
 //
 // 开销：1 次 group_member LEFT JOIN space（点查，命中 PRIMARY KEY）
 //
-//	+ 至多 1 次 group+space 回查（仅内部成员且需要 home_space_name 时）。
+//   - 至多 1 次 group+space 回查（仅内部成员且需要 home_space_name 时）。
 func (s *Service) GetMemberExternalFields(groupNo, uid string) (
 	isExternal int,
 	sourceSpaceID, sourceSpaceName string,
@@ -1675,6 +1677,7 @@ func (s *Service) RemoveGroupMembers(req *RemoveGroupMembersServiceReq) (*Remove
 			s.removeUserFromGroupThreads(req.GroupNo, uid, groupModel.SpaceID)
 			// 清理用户在该群的置顶（按 Space 隔离）
 			user.RemovePinnedForUserInSpace(uid, groupModel.SpaceID, req.GroupNo, common.ChannelTypeGroup.Uint8())
+			conversation_ext.RemoveConvExtForUserInSpace(uid, groupModel.SpaceID, req.GroupNo, common.ChannelTypeGroup.Uint8())
 		}
 	}
 
@@ -1867,6 +1870,7 @@ func (s *Service) removeUserFromGroupThreads(groupNo, uid, spaceID string) {
 		}
 		// 清理用户在该子区的置顶
 		user.RemovePinnedForUserInSpace(uid, spaceID, channelID, common.ChannelTypeCommunityTopic.Uint8())
+		conversation_ext.RemoveConvExtForUserInSpace(uid, spaceID, channelID, common.ChannelTypeCommunityTopic.Uint8())
 	}
 }
 

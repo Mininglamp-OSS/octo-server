@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"strings"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -159,6 +160,88 @@ func (d *DB) QueryThreadMetaByShortIDs(shortIDs []string) (map[string]*ThreadMet
 	return result, nil
 }
 
+// QueryByShortIDs 批量查询子区，返回 map[shortID]*Model。
+// 用于 sidebar 聚合接口补齐子区的 last_message_at。
+//
+// Deprecated: 仅按 short_id 不带 group_no/status 过滤会跨群命中且包含
+// deleted 行。新代码应使用 QueryActiveByGroupShortIDs（PR review Round-3
+// Blocking #3 / Important #4）。残留调用方清零后再行删除。
+func (d *DB) QueryByShortIDs(shortIDs []string) (map[string]*Model, error) {
+	result := make(map[string]*Model)
+	if len(shortIDs) == 0 {
+		return result, nil
+	}
+	var models []*Model
+	_, err := d.session.Select("*").From("thread").
+		Where("short_id IN ?", shortIDs).
+		Load(&models)
+	if err != nil {
+		return nil, err
+	}
+	for _, m := range models {
+		result[m.ShortID] = m
+	}
+	return result, nil
+}
+
+// ShortRef 表示 (group_no, short_id) 二元组的轻量引用。
+// 供 QueryActiveByGroupShortIDs 与 auth checker 使用。
+type ShortRef struct {
+	GroupNo string
+	ShortID string
+}
+
+// ThreadLite 只保留 sidebar 聚合 / auth check 必需的最小字段集。
+// 不读 thread.Model 的全部列（包括 thread_md 等大文本字段），以最小化 I/O
+// （PR review Round-3 Important #4）。
+type ThreadLite struct {
+	GroupNo       string     `db:"group_no"`
+	ShortID       string     `db:"short_id"`
+	Status        int        `db:"status"`
+	LastMessageAt *time.Time `db:"last_message_at"`
+}
+
+// QueryActiveByGroupShortIDs 按 (group_no, short_id) 批量查询子区。
+// 只返回 status != ThreadStatusDeleted 的行，SELECT 限定最小列集合。
+// 返回 map 的键是 "{groupNo}____{shortID}"（thread channel ID 形式）。
+// 无对应行的键不会出现在 map 中，调用方按零值判定。
+//
+// PR review Round-3：
+//   - Blocking #3：只按 short_id 匹配可能撞上其他 group 的同名 short_id，
+//     从鉴权角度是重大隐患，必须带上 group_no。
+//   - Important #4：sidebar enrich 路径原先用 SELECT *，这里收窄到最小列。
+func (d *DB) QueryActiveByGroupShortIDs(refs []ShortRef) (map[string]*ThreadLite, error) {
+	result := make(map[string]*ThreadLite)
+	if len(refs) == 0 {
+		return result, nil
+	}
+
+	// 拼接 len(refs) 个 (?, ?) 占位符。
+	placeholders := make([]string, len(refs))
+	args := make([]interface{}, 0, 1+len(refs)*2)
+	for i, r := range refs {
+		placeholders[i] = "(?, ?)"
+		args = append(args, r.GroupNo, r.ShortID)
+	}
+	args = append(args, ThreadStatusDeleted)
+
+	var rows []*ThreadLite
+	_, err := d.session.SelectBySql(
+		"SELECT group_no, short_id, status, last_message_at FROM thread"+
+			" WHERE (group_no, short_id) IN ("+strings.Join(placeholders, ", ")+")"+
+			" AND status != ?",
+		args...,
+	).Load(&rows)
+	if err != nil {
+		return nil, fmt.Errorf("query active threads by (group, short): %w", err)
+	}
+	for _, r := range rows {
+		key := r.GroupNo + "____" + r.ShortID
+		result[key] = r
+	}
+	return result, nil
+}
+
 // QueryNonDeletedShortIDs 批量查询未删除的子区 shortID
 func (d *DB) QueryNonDeletedShortIDs(shortIDs []string) ([]string, error) {
 	if len(shortIDs) == 0 {
@@ -205,7 +288,6 @@ func (d *DB) QuerySourceMessageIDsByShortIDs(shortIDs []string) (map[string]*int
 	}
 	return result, nil
 }
-
 
 // ArchiveStaleBatch 批量把 status=ThreadStatusActive 且 last_message_at < threshold
 // 的子区切到 ThreadStatusArchived，单次最多 batchSize 行，返回实际归档行数。
@@ -466,11 +548,11 @@ func (d *DB) DeleteSettingsByGroupNoAndUIDTx(groupNo, uid string, tx *dbr.Tx) er
 
 // MemberModel 子区成员数据模型
 type MemberModel struct {
-	ID        int64  `json:"id"`
-	ThreadID  int64  `json:"thread_id"`
-	UID       string `json:"uid"`
-	Role      int    `json:"role"` // 0=普通成员, 1=创建者
-	Version   int64  `json:"version"`
+	ID       int64  `json:"id"`
+	ThreadID int64  `json:"thread_id"`
+	UID      string `json:"uid"`
+	Role     int    `json:"role"` // 0=普通成员, 1=创建者
+	Version  int64  `json:"version"`
 	db.BaseModel
 }
 
@@ -633,9 +715,9 @@ func (d *DB) RecordMessageAndReactivate(shortID, content, senderUID string, newV
 // UpdateMessageStats 原子更新消息统计（收到消息时调用）
 func (d *DB) UpdateMessageStats(shortID string, content string, senderUID string) error {
 	_, err := d.session.Update("thread").SetMap(map[string]interface{}{
-		"message_count":          dbr.Expr("message_count + 1"),
-		"last_message_at":        time.Now(),
-		"last_message_content":   content,
+		"message_count":           dbr.Expr("message_count + 1"),
+		"last_message_at":         time.Now(),
+		"last_message_content":    content,
 		"last_message_sender_uid": senderUID,
 	}).Where("short_id=?", shortID).Exec()
 	return err

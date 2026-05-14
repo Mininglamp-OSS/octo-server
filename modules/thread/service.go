@@ -11,6 +11,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"go.uber.org/zap"
@@ -625,6 +626,7 @@ func (s *Service) DeleteThread(groupNo, shortID, operatorUID string) error {
 
 	// 清理所有用户对该子区的置顶
 	user.RemovePinnedForChannel(channelID, common.ChannelTypeCommunityTopic.Uint8())
+	conversation_ext.RemoveConvExtForChannel(channelID, common.ChannelTypeCommunityTopic.Uint8())
 
 	return nil
 }

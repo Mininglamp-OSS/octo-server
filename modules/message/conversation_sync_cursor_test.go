@@ -70,3 +70,33 @@ func TestMaxConversationVersion(t *testing.T) {
 		})
 	}
 }
+
+// TestSidebar_Cursor_UsesRawSliceAfterSpaceFilter 是 PR #21 Round-4 review B1
+// （Jerry-Xin / lml2468 / yujiawei 同时指出）的回归契约测试。
+//
+// Sidebar.Sync 在 X-Space-ID 存在时调用 FilterRawConversationsBySpace 把
+// IM 返回的 conversations 收紧到当前 Space，然后用 maxConversationVersion 算
+// respVersion。 如果 cursor 取自 *filtered* slice：最高 version 的会话恰好属于
+// 另一个 Space 时它会被过滤掉，respVersion 退回 req.Version，客户端缓存的 version
+// 永远不前进 —— 同一批 raw conversations 反复被拉。
+//
+// 本测试以 "raw vs filtered 算同一函数得到不同 cursor" 的方式锁定契约：必须用
+// raw 算，过滤后的只能用来构建 items。
+func TestSidebar_Cursor_UsesRawSliceAfterSpaceFilter(t *testing.T) {
+	raw := []*config.SyncUserConversationResp{
+		{ChannelID: "g-other-space", Version: 99},
+		{ChannelID: "g-current-space", Version: 5},
+	}
+	// 模拟 FilterRawConversationsBySpace 把 high-version 那条剔除
+	// （属于另一个 Space，对当前请求不可见）。
+	filtered := []*config.SyncUserConversationResp{raw[1]}
+
+	rawCur := maxConversationVersion(raw, 0)
+	filteredCur := maxConversationVersion(filtered, 0)
+
+	assert.Equal(t, int64(99), rawCur, "cursor 必须基于 raw slice → 客户端能推进")
+	assert.Equal(t, int64(5), filteredCur,
+		"反向证据：基于 filtered slice 会卡在 5，让客户端反复轮询同一批 raw conversations")
+	assert.NotEqual(t, rawCur, filteredCur,
+		"raw 与 filtered 的 cursor 不同 → Sidebar.Sync 必须传 raw 给 maxConversationVersion")
+}

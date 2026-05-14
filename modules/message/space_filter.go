@@ -1,6 +1,8 @@
 package message
 
 import (
+	"encoding/json"
+
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
@@ -105,88 +107,124 @@ func filterConversationsCore(
 ) []*SyncUserConversationResp {
 	filtered := make([]*SyncUserConversationResp, 0, len(conversations))
 	for _, conv := range conversations {
-		spaceID := conv.SpaceID
-		// 群聊用 group 表的 space_id 替代 ParseChannelID 的结果
-		if spaceID == "" && conv.ChannelType == common.ChannelTypeGroup.Uint8() {
-			if skipGroupFilter {
-				// 查询失败时不过滤群聊，直接保留
-				filtered = append(filtered, conv)
-				continue
-			}
-			spaceID = groupSpaceMap[conv.ChannelID]
-		}
-
-		if spaceID == filterSpaceID && conv.ChannelType != common.ChannelTypeCommunityTopic.Uint8() {
+		keep := decideConvKeepInSpace(
+			conv.ChannelID, conv.ChannelType, conv.SpaceID,
+			filterSpaceID, defaultSpaceID,
+			groupSpaceMap, externalGroupMap, botSet, botInSpace,
+			skipGroupFilter, skipBotFilter,
+			// v1 兼容：群表查询失败时不过滤（与历史 FilterConversationsBySpace 一致）。
+			false,
+			func(target string) bool { return personConvHasSpaceMessages(conv, target) },
+		)
+		if keep {
 			filtered = append(filtered, conv)
-		} else if conv.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
-			// 子区：按父群的 space_id 决定可见性，规则与群聊一致（含外部群兜底、旧群放行）
-			if filterThreadConv(conv, filterSpaceID, defaultSpaceID, groupSpaceMap, externalGroupMap, skipGroupFilter) {
-				filtered = append(filtered, conv)
-			}
-		} else if conv.ChannelType == common.ChannelTypeGroup.Uint8() {
-			// 外部群：用户作为外部成员加入的群，在其 source Space 下显示
-			if sourceSpace, ok := externalGroupMap[conv.ChannelID]; ok {
-				effectiveSource := sourceSpace
-				if effectiveSource == "" {
-					// fallback: 用户已离开 source Space 时，降级到默认 Space
-					effectiveSource = defaultSpaceID
-				}
-				if effectiveSource == filterSpaceID {
-					filtered = append(filtered, conv)
-					continue
-				}
-			}
-			if spaceID == "" {
-				// 旧群（无 space_id）在所有 Space 可见
-				filtered = append(filtered, conv)
-			}
-		} else if spaceID == "" && filterSpaceID == defaultSpaceID && conv.ChannelType != common.ChannelTypeCommunityTopic.Uint8() {
-			// 裸 UID 旧会话只在默认 Space 显示
-			// Bot DM：Bot 不在默认 Space 则排除（查询失败时不过滤，避免误删）
-			// 子区已在上面按父群 space_id 处理过，不能再从这里漏过去
-			if !skipBotFilter && conv.ChannelType == common.ChannelTypePerson.Uint8() && botSet[conv.ChannelID] && !botInSpace[conv.ChannelID] {
-				continue
-			}
-			filtered = append(filtered, conv)
-		} else if spaceID == "" && conv.ChannelType == common.ChannelTypePerson.Uint8() {
-			// 非默认 Space 中的 DM 会话
-			if skipBotFilter {
-				// 查询失败时不过滤，保留所有 DM
-				filtered = append(filtered, conv)
-			} else if spacepkg.SystemBots[conv.ChannelID] {
-				// 系统 Bot → 所有 Space 可见
-				filtered = append(filtered, conv)
-			} else if botSet[conv.ChannelID] && botInSpace[conv.ChannelID] {
-				// 普通 Bot 在此 Space → 显示
-				filtered = append(filtered, conv)
-			} else if !botSet[conv.ChannelID] {
-				// 普通 DM（非 Bot）→ 仅在 Recents 中有匹配 space_id 的消息时显示
-				if personConvHasSpaceMessages(conv, filterSpaceID) {
-					filtered = append(filtered, conv)
-				}
-			}
-			// Bot 不在此 Space → 不显示
 		}
 	}
 	return filtered
 }
 
-// filterThreadConv 判断子区会话是否应在 filterSpaceID 中显示。
-// 规则：跟父群一致——按父群的 space_id 匹配，外部群走 source Space 兜底，旧群（无 space_id）所有 Space 可见。
-// channel_id 解析失败的子区会话会被丢弃。
-func filterThreadConv(
-	conv *SyncUserConversationResp,
-	filterSpaceID string,
-	defaultSpaceID string,
-	groupSpaceMap map[string]string,
-	externalGroupMap map[string]string,
-	skipGroupFilter bool,
+// decideConvKeepInSpace 是单条会话是否在目标 Space 显示的纯决策函数。
+// 抽取出来是为了让 v1 (message.SyncUserConversationResp) 和 v2
+// (config.SyncUserConversationResp) 共用同一套过滤规则 —— payload 形态不同
+// 但规则一致；hasSpaceMsg 由调用方按各自的 Recents 表示填入。
+//
+// 参数：
+//   - convSpaceID: 调用方已对 channel_id 做过 ParseChannelID 后得到的 space_id。
+//     可为空，群聊/子区会进一步查 groupSpaceMap。
+//   - hasSpaceMsg: 仅对非默认 Space 的 Person DM 生效，判断 conv.Recents 内是否
+//     有 payload.space_id == targetSpaceID 的消息。
+//   - failClosedOnUnknownGroupSpace: 当 skipGroupFilter=true（group service 查询
+//     失败、无法确认群的 space_id）时的语义切换。
+//     - false（v1 兼容默认）：保留群/子区，不让一次 DB 抖动影响存量行为。
+//     - true（v2 sidebar 用，PR #21 Round-6 P0-1）：drop 群/子区，避免跨 Space
+//       泄露（reviewer Jerry-Xin / yujiawei）。这是 fail-closed —— 用户多刷
+//       一次即可，但绝不让 Space A 的群在 Space B 请求里露出。
+func decideConvKeepInSpace(
+	channelID string,
+	channelType uint8,
+	convSpaceID string,
+	filterSpaceID, defaultSpaceID string,
+	groupSpaceMap, externalGroupMap map[string]string,
+	botSet, botInSpace map[string]bool,
+	skipGroupFilter, skipBotFilter bool,
+	failClosedOnUnknownGroupSpace bool,
+	hasSpaceMsg func(targetSpaceID string) bool,
 ) bool {
-	parentNo, _, err := thread.ParseChannelID(conv.ChannelID)
+	spaceID := convSpaceID
+	if spaceID == "" && channelType == common.ChannelTypeGroup.Uint8() {
+		if skipGroupFilter {
+			if failClosedOnUnknownGroupSpace {
+				return false
+			}
+			return true
+		}
+		spaceID = groupSpaceMap[channelID]
+	}
+
+	if spaceID == filterSpaceID && channelType != common.ChannelTypeCommunityTopic.Uint8() {
+		return true
+	}
+	if channelType == common.ChannelTypeCommunityTopic.Uint8() {
+		return filterThreadConvCore(channelID, filterSpaceID, defaultSpaceID, groupSpaceMap, externalGroupMap, skipGroupFilter, failClosedOnUnknownGroupSpace)
+	}
+	if channelType == common.ChannelTypeGroup.Uint8() {
+		if sourceSpace, ok := externalGroupMap[channelID]; ok {
+			eff := sourceSpace
+			if eff == "" {
+				eff = defaultSpaceID
+			}
+			if eff == filterSpaceID {
+				return true
+			}
+		}
+		if spaceID == "" {
+			return true
+		}
+		return false
+	}
+	if spaceID == "" && filterSpaceID == defaultSpaceID && channelType != common.ChannelTypeCommunityTopic.Uint8() {
+		if !skipBotFilter && channelType == common.ChannelTypePerson.Uint8() && botSet[channelID] && !botInSpace[channelID] {
+			return false
+		}
+		return true
+	}
+	if spaceID == "" && channelType == common.ChannelTypePerson.Uint8() {
+		if skipBotFilter {
+			return true
+		}
+		if spacepkg.SystemBots[channelID] {
+			return true
+		}
+		if botSet[channelID] && botInSpace[channelID] {
+			return true
+		}
+		if !botSet[channelID] {
+			return hasSpaceMsg != nil && hasSpaceMsg(filterSpaceID)
+		}
+	}
+	return false
+}
+
+// filterThreadConvCore 是 filterThreadConv 的 channelID-only 变体，便于 v2
+// 不持有完整 SyncUserConversationResp 时复用。
+//
+// failClosedOnUnknownGroupSpace 参见 decideConvKeepInSpace 注释：
+// v1 兼容传 false，v2 sidebar 传 true。
+func filterThreadConvCore(
+	channelID string,
+	filterSpaceID, defaultSpaceID string,
+	groupSpaceMap, externalGroupMap map[string]string,
+	skipGroupFilter bool,
+	failClosedOnUnknownGroupSpace bool,
+) bool {
+	parentNo, _, err := thread.ParseChannelID(channelID)
 	if err != nil {
 		return false
 	}
 	if skipGroupFilter {
+		if failClosedOnUnknownGroupSpace {
+			return false
+		}
 		return true
 	}
 	parentSpaceID := groupSpaceMap[parentNo]
@@ -202,8 +240,25 @@ func filterThreadConv(
 			return true
 		}
 	}
-	// 父群无 space_id（旧群） → 子区跟旧群一样所有 Space 可见
 	return parentSpaceID == ""
+}
+
+// filterThreadConv 判断子区会话是否应在 filterSpaceID 中显示。
+// 规则：跟父群一致——按父群的 space_id 匹配，外部群走 source Space 兜底，旧群（无 space_id）所有 Space 可见。
+// channel_id 解析失败的子区会话会被丢弃。
+//
+// Deprecated: prefer filterThreadConvCore 以避免对 SyncUserConversationResp 类型依赖；
+// 此包装目前未被新代码使用，保留是为最小化 diff（PR #21 Space filter 重构）。
+func filterThreadConv(
+	conv *SyncUserConversationResp,
+	filterSpaceID string,
+	defaultSpaceID string,
+	groupSpaceMap map[string]string,
+	externalGroupMap map[string]string,
+	skipGroupFilter bool,
+) bool {
+	// v1 兼容：失败时 fail-open（与旧 filterThreadConv 一致）。
+	return filterThreadConvCore(conv.ChannelID, filterSpaceID, defaultSpaceID, groupSpaceMap, externalGroupMap, skipGroupFilter, false)
 }
 
 // personConvHasSpaceMessages 检查 Person 会话的 Recents 中是否有 space_id 匹配的消息。
@@ -381,4 +436,157 @@ func resolveBotFilter(ctx *config.Context, filterSpaceID string, bareDMUIDs []st
 		return
 	}
 	return
+}
+
+// FilterRawConversationsBySpace 是 FilterConversationsBySpace 在 v2 sidebar 上的
+// 对应版本：v2 直接操作 IM 返回的 *config.SyncUserConversationResp（没有
+// enriched SpaceID/parsed Payload），所以单独写一个入口，但内部沿用
+// decideConvKeepInSpace 同一套规则，保证 v1/v2 Space 可见性一致。
+//
+// 背景 (PR #21 review by Jerry-Xin)：原 v2 实现根本没做 Space 过滤，导致
+// X-Space-ID=B 的请求会拿到 Space A 的活跃 DM/Group/Thread。
+//
+// 差异点：
+//   - SpaceID 通过 spacepkg.ParseChannelID 推导，与 v1
+//     newSyncUserConversationResp 中的 line 1345 同一份逻辑。
+//   - hasSpaceMsg：DM Recents 的 Payload 是 []byte（IM 原始 JSON），需要 lazily
+//     json.Unmarshal；解析失败的消息当作"无 space_id"处理（保守不放行）。
+func FilterRawConversationsBySpace(
+	conversations []*config.SyncUserConversationResp,
+	filterSpaceID string,
+	loginUID string,
+	ctx *config.Context,
+	groupService group.IService,
+) []*config.SyncUserConversationResp {
+	if len(conversations) == 0 {
+		return conversations
+	}
+
+	defaultSpaceID := space.GetUserDefaultSpaceID(ctx, loginUID)
+
+	groupNoSeen := make(map[string]struct{})
+	var bareGroupNos []string
+	var bareDMUIDs []string
+	addGroupNo := func(no string) {
+		if _, ok := groupNoSeen[no]; ok {
+			return
+		}
+		groupNoSeen[no] = struct{}{}
+		bareGroupNos = append(bareGroupNos, no)
+	}
+	// v2 没有 enriched SpaceID 字段，直接 ParseChannelID。
+	convSpaceIDs := make([]string, len(conversations))
+	for i, conv := range conversations {
+		sid, _ := spacepkg.ParseChannelID(conv.ChannelID)
+		convSpaceIDs[i] = sid
+		if sid == "" && conv.ChannelType == common.ChannelTypeGroup.Uint8() {
+			addGroupNo(conv.ChannelID)
+		}
+		if sid == "" && conv.ChannelType == common.ChannelTypePerson.Uint8() {
+			bareDMUIDs = append(bareDMUIDs, conv.ChannelID)
+		}
+		if conv.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
+			if parentNo, _, err := thread.ParseChannelID(conv.ChannelID); err == nil {
+				addGroupNo(parentNo)
+			}
+		}
+	}
+
+	skipGroupFilter := false
+	groupSpaceMap, err := spacepkg.GetGroupSpaceMap(bareGroupNos, func(nos []string) ([]spacepkg.GroupSpaceInfo, error) {
+		infos, err := groupService.GetGroups(nos)
+		if err != nil {
+			return nil, err
+		}
+		result := make([]spacepkg.GroupSpaceInfo, 0, len(infos))
+		for _, g := range infos {
+			result = append(result, spacepkg.GroupSpaceInfo{GroupNo: g.GroupNo, SpaceID: g.SpaceID})
+		}
+		return result, nil
+	})
+	if err != nil {
+		log.Warn("v2 sidebar: 查询群 SpaceID 错误，跳过群过滤", zap.Error(err))
+		skipGroupFilter = true
+	}
+
+	externalGroupMap, err := group.NewDB(ctx).QueryExternalGroupNosForUser(loginUID)
+	if err != nil {
+		log.Warn("v2 sidebar: 查询外部群失败，跳过外部群过滤", zap.Error(err))
+		externalGroupMap = make(map[string]string)
+	}
+
+	botSet, botInSpace, skipBotFilter := resolveBotFilter(ctx, filterSpaceID, bareDMUIDs)
+
+	filtered := make([]*config.SyncUserConversationResp, 0, len(conversations))
+	for i, conv := range conversations {
+		keep := decideConvKeepInSpace(
+			conv.ChannelID, conv.ChannelType, convSpaceIDs[i],
+			filterSpaceID, defaultSpaceID,
+			groupSpaceMap, externalGroupMap, botSet, botInSpace,
+			skipGroupFilter, skipBotFilter,
+			// v2 sidebar 必须 fail-closed：群表查询失败时无法确认 space，drop
+			// 群/子区以免跨 Space 泄露（PR #21 Round-6 P0-1 by Jerry-Xin / yujiawei）。
+			true,
+			func(target string) bool { return rawConvHasSpaceMessages(conv, target) },
+		)
+		if keep {
+			filtered = append(filtered, conv)
+		}
+	}
+	return filtered
+}
+
+// rawConvHasSpaceMessages 是 personConvHasSpaceMessages 在原始 IM Payload []byte
+// 形态下的对应实现。容错地 lazy-unmarshal：解析失败的消息直接跳过 —— 保守
+// 不放行胜过误暴露 Space A 的消息给 Space B 请求。
+func rawConvHasSpaceMessages(conv *config.SyncUserConversationResp, targetSpaceID string) bool {
+	if conv == nil || len(conv.Recents) == 0 {
+		return false
+	}
+	for _, msg := range conv.Recents {
+		if len(msg.Payload) == 0 {
+			continue
+		}
+		var payload map[string]interface{}
+		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+			continue
+		}
+		sid, ok := payload["space_id"]
+		if !ok {
+			continue
+		}
+		if sidStr, ok := sid.(string); ok && sidStr == targetSpaceID {
+			return true
+		}
+	}
+	return false
+}
+
+// EnsureSystemBotsPresentRaw 与 EnsureSystemBotsPresent 等价但操作
+// *config.SyncUserConversationResp（v2 sidebar 用）。系统 Bot 占位写法对齐 v1：
+// ChannelID/ChannelType 设置好，其它字段保持零值。
+func EnsureSystemBotsPresentRaw(conversations []*config.SyncUserConversationResp) []*config.SyncUserConversationResp {
+	systemBots := spacepkg.SystemBotList()
+	if len(systemBots) == 0 {
+		return conversations
+	}
+	present := make(map[string]bool, len(conversations))
+	for _, conv := range conversations {
+		if conv == nil {
+			continue
+		}
+		if conv.ChannelType == common.ChannelTypePerson.Uint8() && spacepkg.IsSystemBot(conv.ChannelID) {
+			present[conv.ChannelID] = true
+		}
+	}
+	for _, uid := range systemBots {
+		if present[uid] {
+			continue
+		}
+		conversations = append(conversations, &config.SyncUserConversationResp{
+			ChannelID:   uid,
+			ChannelType: common.ChannelTypePerson.Uint8(),
+		})
+	}
+	return conversations
 }

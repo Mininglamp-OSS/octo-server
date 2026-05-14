@@ -3,13 +3,14 @@ package category
 import (
 	"errors"
 
-	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
-	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	convext "github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
+	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"go.uber.org/zap"
 )
 
@@ -356,6 +357,15 @@ func (c *Category) delete(ctx *wkhttp.Context) {
 		return
 	}
 
+	// PR review follow-up: category_id 置 NULL 会让群从 follow tab 消失，
+	// 必须同 tx 内 +1 follow_version，否则客户端拿同样的 follow_version
+	// 会跳过列表重建。
+	if _, err := convext.BumpFollowVersionTx(tx, loginUID, cat.SpaceID); err != nil {
+		c.Error("更新 follow_version 失败", zap.Error(err))
+		ctx.ResponseError(errors.New("删除类别失败"))
+		return
+	}
+
 	if err = tx.Commit(); err != nil {
 		c.Error("提交事务失败", zap.Error(err))
 		ctx.ResponseError(errors.New("删除类别失败"))
@@ -440,6 +450,14 @@ func (c *Category) sort(ctx *wkhttp.Context) {
 		}
 	}
 
+	// PR review follow-up: category 排序变化会改变 follow tab 的渲染顺序
+	// （sortFollowItems 首主键就是 CategorySort），客户端必须重建 follow 列表。
+	if _, err := convext.BumpFollowVersionTx(tx, loginUID, spaceID); err != nil {
+		c.Error("更新 follow_version 失败", zap.Error(err))
+		ctx.ResponseError(errors.New("更新排序失败"))
+		return
+	}
+
 	if err = tx.Commit(); err != nil {
 		c.Error("提交事务失败", zap.Error(err))
 		ctx.ResponseError(errors.New("更新排序失败"))
@@ -522,6 +540,17 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 		return
 	}
 
+	// PR review follow-up: 把 group_setting 写入和 follow_version +1 打包到同一个 tx。
+	// 群进/出分类直接改变 follow tab 的成员集合（buildFollowItems 要求 CategoryID != nil），
+	// 客户端必须重建列表，所以必须 bump。
+	tx, err := c.ctx.DB().Begin()
+	if err != nil {
+		c.Error("开启事务失败", zap.Error(err))
+		ctx.ResponseError(errors.New("更新群设置失败"))
+		return
+	}
+	defer tx.RollbackUnlessCommitted()
+
 	if setting == nil {
 		version, err := c.ctx.GenSeq(common.GroupSettingSeqKey)
 		if err != nil {
@@ -529,19 +558,35 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 			ctx.ResponseError(errors.New("生成版本号失败"))
 			return
 		}
-		err = c.db.insertGroupSettingForCategory(groupNo, loginUID, categoryIDPtr, 0, version)
-		if err != nil {
+		if _, err := tx.InsertBySql(
+			"INSERT INTO group_setting (group_no, uid, category_id, category_sort, revoke_remind, screenshot, receipt, version) VALUES (?, ?, ?, ?, 1, 1, 1, ?)",
+			groupNo, loginUID, categoryIDPtr, 0, version,
+		).Exec(); err != nil {
 			c.Error("创建群设置失败", zap.Error(err))
 			ctx.ResponseError(errors.New("创建群设置失败"))
 			return
 		}
 	} else {
-		err = c.db.updateGroupSettingCategory(setting.Id, categoryIDPtr, 0)
-		if err != nil {
+		if _, err := tx.Update("group_setting").
+			Set("category_id", categoryIDPtr).
+			Set("category_sort", 0).
+			Where("id=?", setting.Id).Exec(); err != nil {
 			c.Error("更新群设置失败", zap.Error(err))
 			ctx.ResponseError(errors.New("更新群设置失败"))
 			return
 		}
+	}
+
+	if _, err := convext.BumpFollowVersionTx(tx, loginUID, groupSpaceID); err != nil {
+		c.Error("更新 follow_version 失败", zap.Error(err))
+		ctx.ResponseError(errors.New("更新群设置失败"))
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		c.Error("提交事务失败", zap.Error(err))
+		ctx.ResponseError(errors.New("更新群设置失败"))
+		return
 	}
 
 	ctx.ResponseOK()
