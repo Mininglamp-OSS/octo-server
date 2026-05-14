@@ -20,7 +20,7 @@ func TestDecideConvKeepInSpace_Group_DirectSpaceMatch(t *testing.T) {
 		"grp1", common.ChannelTypeGroup.Uint8(), "",
 		"spaceA", "spaceA",
 		map[string]string{"grp1": "spaceA"}, nil,
-		nil, nil, false, false, nil,
+		nil, nil, false, false, false, nil,
 	)
 	assert.True(t, keep, "group in spaceA must be kept when filter=spaceA")
 }
@@ -30,7 +30,7 @@ func TestDecideConvKeepInSpace_Group_SpaceMismatch_Excluded(t *testing.T) {
 		"grp1", common.ChannelTypeGroup.Uint8(), "",
 		"spaceB", "spaceA",
 		map[string]string{"grp1": "spaceA"}, nil,
-		nil, nil, false, false, nil,
+		nil, nil, false, false, false, nil,
 	)
 	assert.False(t, keep, "group in spaceA must NOT leak into spaceB sidebar request")
 }
@@ -40,7 +40,7 @@ func TestDecideConvKeepInSpace_Group_LegacyNoSpace_VisibleEverywhere(t *testing.
 		"old-grp", common.ChannelTypeGroup.Uint8(), "",
 		"spaceB", "spaceA",
 		map[string]string{}, nil,
-		nil, nil, false, false, nil,
+		nil, nil, false, false, false, nil,
 	)
 	assert.True(t, keep, "legacy group without space_id stays visible everywhere")
 }
@@ -51,7 +51,7 @@ func TestDecideConvKeepInSpace_Group_ExternalSourceSpace(t *testing.T) {
 		"spaceX", "spaceA",
 		map[string]string{"grp1": "spaceB"},
 		map[string]string{"grp1": "spaceX"},
-		nil, nil, false, false, nil,
+		nil, nil, false, false, false, nil,
 	)
 	assert.True(t, keep, "external group must surface in its source space")
 }
@@ -62,7 +62,7 @@ func TestDecideConvKeepInSpace_Thread_FollowsParentSpace(t *testing.T) {
 		"grp1____thr1", common.ChannelTypeCommunityTopic.Uint8(), "",
 		"spaceA", "spaceA",
 		map[string]string{"grp1": "spaceA"}, nil,
-		nil, nil, false, false, nil,
+		nil, nil, false, false, false, nil,
 	)
 	assert.True(t, keep, "thread inherits parent group's space visibility")
 
@@ -70,7 +70,7 @@ func TestDecideConvKeepInSpace_Thread_FollowsParentSpace(t *testing.T) {
 		"grp1____thr1", common.ChannelTypeCommunityTopic.Uint8(), "",
 		"spaceB", "spaceA",
 		map[string]string{"grp1": "spaceA"}, nil,
-		nil, nil, false, false, nil,
+		nil, nil, false, false, false, nil,
 	)
 	assert.False(t, keep, "thread of spaceA parent must not appear in spaceB sidebar")
 }
@@ -80,7 +80,7 @@ func TestDecideConvKeepInSpace_DM_DefaultSpace_KeepBareConv(t *testing.T) {
 		"peer1", common.ChannelTypePerson.Uint8(), "",
 		"spaceA", "spaceA",
 		nil, nil,
-		map[string]bool{}, map[string]bool{}, false, false,
+		map[string]bool{}, map[string]bool{}, false, false, false,
 		func(string) bool { return false },
 	)
 	assert.True(t, keep, "bare DM stays in user's default space when no bot match")
@@ -91,7 +91,7 @@ func TestDecideConvKeepInSpace_DM_NonDefaultSpace_NoSpaceMsg_Excluded(t *testing
 		"peer1", common.ChannelTypePerson.Uint8(), "",
 		"spaceB", "spaceA",
 		nil, nil,
-		map[string]bool{}, map[string]bool{}, false, false,
+		map[string]bool{}, map[string]bool{}, false, false, false,
 		func(string) bool { return false },
 	)
 	assert.False(t, keep, "DM with no payload.space_id match must NOT appear in non-default space")
@@ -102,7 +102,7 @@ func TestDecideConvKeepInSpace_DM_NonDefaultSpace_HasSpaceMsg_Visible(t *testing
 		"peer1", common.ChannelTypePerson.Uint8(), "",
 		"spaceB", "spaceA",
 		nil, nil,
-		map[string]bool{}, map[string]bool{}, false, false,
+		map[string]bool{}, map[string]bool{}, false, false, false,
 		func(target string) bool { return target == "spaceB" },
 	)
 	assert.True(t, keep, "DM with payload.space_id == filter must appear in that space")
@@ -113,7 +113,7 @@ func TestDecideConvKeepInSpace_DM_BotInSpace(t *testing.T) {
 		"bot1", common.ChannelTypePerson.Uint8(), "",
 		"spaceB", "spaceA",
 		nil, nil,
-		map[string]bool{"bot1": true}, map[string]bool{"bot1": true}, false, false,
+		map[string]bool{"bot1": true}, map[string]bool{"bot1": true}, false, false, false,
 		nil,
 	)
 	assert.True(t, keep, "bot DM is visible when bot is a member of the target space")
@@ -124,20 +124,52 @@ func TestDecideConvKeepInSpace_DM_BotNotInSpace_Excluded(t *testing.T) {
 		"bot1", common.ChannelTypePerson.Uint8(), "",
 		"spaceB", "spaceA",
 		nil, nil,
-		map[string]bool{"bot1": true}, map[string]bool{"bot1": false}, false, false,
+		map[string]bool{"bot1": true}, map[string]bool{"bot1": false}, false, false, false,
 		nil,
 	)
 	assert.False(t, keep, "bot not in target space must be hidden in that space's sidebar")
 }
 
-func TestDecideConvKeepInSpace_SkipGroupFilter_KeepsGroups(t *testing.T) {
+// PR #21 Round-6 P0-1 regression：失败语义切换 —— v1 fail-open vs v2 fail-closed。
+func TestDecideConvKeepInSpace_SkipGroupFilter_v1FailOpen(t *testing.T) {
 	keep := decideConvKeepInSpace(
 		"grp1", common.ChannelTypeGroup.Uint8(), "",
 		"spaceB", "spaceA",
 		nil, nil,
-		nil, nil, true, false, nil,
+		nil, nil, true, false, false /*v1 兼容: fail-open*/, nil,
 	)
-	assert.True(t, keep, "skipGroupFilter must NOT silently drop groups")
+	assert.True(t, keep, "v1: skipGroupFilter must keep groups (兼容历史)")
+}
+
+func TestDecideConvKeepInSpace_SkipGroupFilter_v2FailClosed_Group(t *testing.T) {
+	keep := decideConvKeepInSpace(
+		"grp1", common.ChannelTypeGroup.Uint8(), "",
+		"spaceB", "spaceA",
+		nil, nil,
+		nil, nil, true, false, true /*v2: fail-closed*/, nil,
+	)
+	assert.False(t, keep,
+		"v2: skipGroupFilter 时 group 必须 drop，否则一次 GetGroups 抖动会让 Space A 群泄露到 Space B 请求")
+}
+
+func TestDecideConvKeepInSpace_SkipGroupFilter_v2FailClosed_Thread(t *testing.T) {
+	keep := decideConvKeepInSpace(
+		"grp1____thr1", common.ChannelTypeCommunityTopic.Uint8(), "",
+		"spaceB", "spaceA",
+		nil, nil,
+		nil, nil, true, false, true, nil,
+	)
+	assert.False(t, keep,
+		"v2: skipGroupFilter 时 thread 必须 drop（与父群同样语义）")
+}
+
+func TestFilterThreadConvCore_v1FailOpen_vs_v2FailClosed(t *testing.T) {
+	// v1: skipGroupFilter=true 时 keep
+	v1Keep := filterThreadConvCore("grp1____thr1", "spaceB", "spaceA", nil, nil, true, false)
+	assert.True(t, v1Keep, "v1 thread filter must remain fail-open")
+	// v2: skipGroupFilter=true 时 drop
+	v2Keep := filterThreadConvCore("grp1____thr1", "spaceB", "spaceA", nil, nil, true, true)
+	assert.False(t, v2Keep, "v2 thread filter must drop when parent space unknown")
 }
 
 // rawConvHasSpaceMessages 解析 IM 原始 Payload []byte：覆盖正常匹配、空 Payload、

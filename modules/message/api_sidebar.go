@@ -61,6 +61,9 @@ type Sidebar struct {
 	followVersionDB *convext.FollowVersionDB
 	// PR #21 review (Jerry-Xin Critical)：Space 过滤需要群表查询。
 	groupService group.IService
+	// groupDB 仅用于 thread ext 行的 Space 过滤（PR #21 Round-6 P0-2）查
+	// external-group mapping。
+	groupDB *group.DB
 	log.Log
 }
 
@@ -73,6 +76,7 @@ func NewSidebar(ctx *config.Context) *Sidebar {
 		threadDB:        thread.NewDB(ctx),
 		followVersionDB: convext.NewFollowVersionDB(ctx),
 		groupService:    group.NewService(ctx),
+		groupDB:         group.NewDB(ctx),
 		Log:             log.NewTLog("Sidebar"),
 	}
 }
@@ -283,6 +287,20 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 		}
 		threadExtRows = rows
 	}
+	// 2a.5. Space-filter thread ext rows by parent group's space_id
+	//       (PR #21 Round-6 P0-2 by Jerry-Xin / yujiawei).
+	//       FollowThread 的旧版鉴权可能让 ext 行的 (uid, space_id) 与父群真实 space
+	//       不一致；categorySetting 是按 (uid, group_no) 查的、不带 space 谓词，
+	//       所以仅靠 categorySetting 不能挡住跨 Space thread。这一步显式按父群
+	//       space_id 过滤，与 v2 sidebar group 过滤保持同口径。
+	//       fail-closed：群表查询失败 → follow tab 整体退避。
+	if isFollowTab && spaceID != "" && len(threadExtRows) > 0 {
+		var err error
+		threadExtRows, err = sb.filterThreadExtsBySpace(threadExtRows, spaceID, loginUID)
+		if failClosedForFollow("thread ext space filter", err) {
+			return
+		}
+	}
 	threadExtMap := make(map[string]*convext.Model, len(threadExtRows))
 	for _, m := range threadExtRows {
 		threadExtMap[m.TargetID] = m
@@ -471,6 +489,82 @@ func extractGroupNos(convs []*config.SyncUserConversationResp) []string {
 	return groupNos
 }
 
+// filterThreadExtsBySpace 按父群的 space_id 过滤 thread ext 行（v2 sidebar 专用）。
+//
+// PR #21 Round-6 P0-2：FollowThread 的旧鉴权允许在 X-Space-ID=B 下写 Space A 的群
+// 对应的 thread ext 行；categorySetting 又是按 (uid, group_no) 取的，不带 space 谓词，
+// 单靠 categorySetting + unfollowedGroups 挡不住跨 Space thread。这里在 sidebar 渲染
+// 前显式按父群 space_id 过滤，规则与 FilterRawConversationsBySpace 的 group 分支一致：
+//   - 内部群：parent.space_id == spaceID 才保留
+//   - 外部群：当前 user 作为外部成员加入该群且 sourceSpaceID == spaceID 才保留
+//   - 旧群 (parent.space_id == "")：保留（沿用历史"所有 Space 可见"语义）
+//
+// fail-closed：群表查询失败时返回 error，调用方 follow tab 整体退避，避免半结果泄露。
+func (sb *Sidebar) filterThreadExtsBySpace(rows []*convext.Model, spaceID, loginUID string) ([]*convext.Model, error) {
+	parentNos := uniqueThreadParentGroupNos(rows)
+	if len(parentNos) == 0 {
+		return rows, nil
+	}
+	groupInfos, err := sb.groupService.GetGroups(parentNos)
+	if err != nil {
+		return nil, fmt.Errorf("filter thread ext by space: get groups: %w", err)
+	}
+	parentSpaceMap := make(map[string]string, len(groupInfos))
+	for _, g := range groupInfos {
+		parentSpaceMap[g.GroupNo] = g.SpaceID
+	}
+	externalMap, err := sb.groupDB.QueryExternalGroupNosForUser(loginUID)
+	if err != nil {
+		return nil, fmt.Errorf("filter thread ext by space: external group map: %w", err)
+	}
+
+	kept := make([]*convext.Model, 0, len(rows))
+	for _, ext := range rows {
+		parentNo, _, perr := parseThreadChannelIDSidebar(ext.TargetID)
+		if perr != nil {
+			continue // malformed; drop silently
+		}
+		parentSpaceID, known := parentSpaceMap[parentNo]
+		if !known {
+			// Parent group disappeared from group table (disbanded mid-flight).
+			// Drop fail-closed; cleanup hooks will eventually remove the ext row.
+			continue
+		}
+		if parentSpaceID == "" {
+			// Legacy group without space_id: keep (mirrors v1 visibility).
+			kept = append(kept, ext)
+			continue
+		}
+		if parentSpaceID == spaceID {
+			kept = append(kept, ext)
+			continue
+		}
+		if sourceSpace, ok := externalMap[parentNo]; ok && sourceSpace == spaceID {
+			kept = append(kept, ext)
+		}
+	}
+	return kept, nil
+}
+
+// uniqueThreadParentGroupNos collects distinct parent groupNos from a slice of
+// thread ext rows. Malformed thread target IDs are skipped.
+func uniqueThreadParentGroupNos(rows []*convext.Model) []string {
+	seen := make(map[string]struct{}, len(rows))
+	parents := make([]string, 0, len(rows))
+	for _, m := range rows {
+		parent, _, err := parseThreadChannelIDSidebar(m.TargetID)
+		if err != nil {
+			continue
+		}
+		if _, dup := seen[parent]; dup {
+			continue
+		}
+		seen[parent] = struct{}{}
+		parents = append(parents, parent)
+	}
+	return parents
+}
+
 // appendThreadParentGroupNos 把 thread ext 行的父群 groupNo 去重后追加到
 // groupNos 切片中。
 //
@@ -562,9 +656,10 @@ func buildFollowItems(
 				IsFollowed:  true,
 				FollowSort:  ext.FollowSort,
 			}
+			// PR #21 Round-6：DMCategoryID 现在已经是 VARCHAR(32) UUID（与 group_category
+			// 共用 namespace），直接透传给客户端即可。
 			if ext.DMCategoryID != nil {
-				catIDStr := fmt.Sprintf("%d", *ext.DMCategoryID)
-				item.CategoryID = &catIDStr
+				item.CategoryID = ext.DMCategoryID
 			}
 			items = append(items, item)
 
@@ -586,16 +681,22 @@ func buildFollowItems(
 			if _, unfollowed := unfollowedGroups[groupNo]; unfollowed {
 				continue
 			}
+			// PR #21 Round-6 P1-2 (yujiawei) + 原型确认：thread 必须继承父群的
+			// CategorySort + intraCategorySort，让 thread 和父群在同一分类块内排序，
+			// 而不是默认全部落到 CategorySort=0 桶（与 DM 混在 follow tab 顶部）。
 			items = append(items, &SidebarItem{
-				TargetType:      int(common.ChannelTypeCommunityTopic),
-				TargetID:        conv.ChannelID,
-				ChannelType:     conv.ChannelType,
-				ChannelID:       conv.ChannelID,
-				Timestamp:       conv.Timestamp,
-				Unread:          conv.Unread,
-				IsFollowed:      true,
-				FollowSort:      extRow.FollowSort,
-				ParentChannelID: groupNo,
+				TargetType:        int(common.ChannelTypeCommunityTopic),
+				TargetID:          conv.ChannelID,
+				ChannelType:       conv.ChannelType,
+				ChannelID:         conv.ChannelID,
+				Timestamp:         conv.Timestamp,
+				Unread:            conv.Unread,
+				IsFollowed:        true,
+				FollowSort:        extRow.FollowSort,
+				ParentChannelID:   groupNo,
+				CategoryID:        cs.CategoryID,
+				CategorySort:      cs.CategoryGroupSort,
+				intraCategorySort: cs.CategorySort,
 			})
 		}
 	}
@@ -718,15 +819,19 @@ func mergeThreadEntries(
 		if lastMsgAt != nil {
 			ts = lastMsgAt.Unix()
 		}
+		// 与 buildFollowItems thread 分支一致：继承父群 CategorySort + intraCategorySort。
 		result = append(result, &SidebarItem{
-			TargetType:      int(common.ChannelTypeCommunityTopic),
-			TargetID:        ext.TargetID,
-			ChannelType:     common.ChannelTypeCommunityTopic.Uint8(),
-			ChannelID:       ext.TargetID,
-			Timestamp:       ts,
-			IsFollowed:      true,
-			FollowSort:      ext.FollowSort,
-			ParentChannelID: groupNo,
+			TargetType:        int(common.ChannelTypeCommunityTopic),
+			TargetID:          ext.TargetID,
+			ChannelType:       common.ChannelTypeCommunityTopic.Uint8(),
+			ChannelID:         ext.TargetID,
+			Timestamp:         ts,
+			IsFollowed:        true,
+			FollowSort:        ext.FollowSort,
+			ParentChannelID:   groupNo,
+			CategoryID:        cs.CategoryID,
+			CategorySort:      cs.CategoryGroupSort,
+			intraCategorySort: cs.CategorySort,
 		})
 	}
 	return result

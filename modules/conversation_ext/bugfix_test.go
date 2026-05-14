@@ -79,11 +79,11 @@ func TestDB_UpdateSort_RejectsMissingNonFirstItem(t *testing.T) {
 		"UpdateSort with any missing item must fail, not silently UPDATE zero rows")
 	assert.ErrorIs(t, err, ErrSortTargetNotFound)
 
-	// Anchor must not have been bumped (rollback).
+	// Anchor row must still be present (DELETE 在 tx 内不会发生；FOR UPDATE 锁
+	// 只是检测目标存在性）。Phase 3 后 per-row version 已废弃，不再断言。
 	m, err := db.Get("u1", "s1", 1, "dm-anchor")
 	require.NoError(t, err)
-	require.NotNil(t, m)
-	assert.Equal(t, 0, m.Version, "version must remain 0 after rolled-back UpdateSort")
+	require.NotNil(t, m, "anchor row must still exist after rolled-back UpdateSort")
 }
 
 // TestDB_UpdateSort_ConcurrentDifferentAnchors_OverlappingItems_Serializes
@@ -137,16 +137,18 @@ func TestDB_UpdateSort_ConcurrentDifferentAnchors_OverlappingItems_Serializes(t 
 		"only one concurrent UpdateSort starting at version=0 may succeed, "+
 			"regardless of which item each call places first")
 
-	// B's version must be exactly 1 (one successful bump, no double-write).
+	// B 行必须仍然存在（PR #21 Round-6 之后 per-row version 字段已删除，
+	// 验证锚点改为 user_follow_version 表，由 TestService_AllFollowWritePaths_BumpFollowVersion
+	// 端到端覆盖）。
 	mB, err := db.Get(uid, space, 1, "B")
 	require.NoError(t, err)
-	require.NotNil(t, mB)
-	assert.Equal(t, 1, mB.Version, "shared row B should be bumped exactly once")
+	require.NotNil(t, mB, "shared row B must survive")
 }
 
-// TestDB_UpdateSort_AllAffectedRowsBumpVersion verifies every requested item's
-// version advances together (not just the anchor).
-func TestDB_UpdateSort_AllAffectedRowsBumpVersion(t *testing.T) {
+// TestDB_UpdateSort_AllAffectedItemsLocked verifies UpdateSort 在事务里
+// 锁住了所有 item（而不只是 items[0]）；PR #21 Round-6 之后 per-row version 已删除，
+// 这里只断言所有 item 仍存在（rolled-forward 一致性），版本由 user_follow_version 反映。
+func TestDB_UpdateSort_AllAffectedItemsLocked(t *testing.T) {
 	db := newDBForTest(t)
 	const uid, space = "u1", "s1"
 
@@ -163,8 +165,7 @@ func TestDB_UpdateSort_AllAffectedRowsBumpVersion(t *testing.T) {
 	for _, id := range []string{"x", "y", "z"} {
 		m, err := db.Get(uid, space, 1, id)
 		require.NoError(t, err)
-		require.NotNil(t, m)
-		assert.Equal(t, 1, m.Version, "row %q version must be bumped to 1", id)
+		require.NotNil(t, m, "row %q must still exist after UpdateSort", id)
 	}
 }
 

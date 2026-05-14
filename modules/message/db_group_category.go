@@ -57,6 +57,9 @@ func (d *groupCategoryDB) QueryCategorySettingsByGroupNos(groupNos []string, uid
 		return nil, nil
 	}
 	var results []*GroupCategorySetting
+	// JOIN 谓词除了 (gs.category_id, gs.uid) 双绑定外，还加 gc.status != 2
+	// （PR #21 Round-6 P1 by yujiawei）：defense-in-depth，避免任何意外指向软删
+	// 分类的 group_setting 行从 gc.sort 拿到 stale 值而不是走 LEFT JOIN miss 退到 0。
 	_, err := d.session.Select(
 		"gs.group_no",
 		"gs.category_id",
@@ -64,7 +67,7 @@ func (d *groupCategoryDB) QueryCategorySettingsByGroupNos(groupNos []string, uid
 		"IFNULL(gc.sort, 0) AS category_group_sort",
 	).
 		From(dbr.I("group_setting").As("gs")).
-		LeftJoin(dbr.I("group_category").As("gc"), "gs.category_id = gc.category_id AND gs.uid = gc.uid").
+		LeftJoin(dbr.I("group_category").As("gc"), "gs.category_id = gc.category_id AND gs.uid = gc.uid AND gc.status != 2").
 		Where("gs.group_no IN ? AND gs.uid = ?", groupNos, uid).
 		Load(&results)
 	return results, err

@@ -17,7 +17,7 @@ import (
 
 // followService is the subset of *Service that Follow handlers need.
 type followService interface {
-	FollowDM(uid, spaceID, peerUID string, categoryID *int64) error
+	FollowDM(uid, spaceID, peerUID string, categoryID *string) error
 	UnfollowDM(uid, spaceID, peerUID string) error
 	UnfollowChannel(uid, spaceID, groupNo string) error
 	FollowChannel(uid, spaceID, groupNo string) error
@@ -63,8 +63,11 @@ func NewFollow(svc followService, db sortDB) *Follow {
 // ---------------------------------------------------------------------------
 
 type followDMReq struct {
-	PeerUID    string `json:"peer_uid"`
-	CategoryID *int64 `json:"category_id"`
+	PeerUID string `json:"peer_uid"`
+	// CategoryID 引用 group_category.category_id (VARCHAR(32) UUID)。
+	// DM 与群共用 group_category 命名空间（PR #21 Round-6, 原型 image-v1.png）。
+	// 不传或 null 表示未分类。
+	CategoryID *string `json:"category_id"`
 }
 
 type unfollowChannelReq struct {
@@ -128,6 +131,12 @@ func (f *Follow) FollowDM(c *wkhttp.Context) {
 	}
 
 	if err := f.svc.FollowDM(loginUID, spaceID, req.PeerUID, req.CategoryID); err != nil {
+		// PR #21 Round-6：DMCategoryChecker 拒绝时把具体业务错暴露给客户端，
+		// 不要吞成通用 "关注 DM 失败"，让客户端知道是 category 不存在 / 不属于自己。
+		if errors.Is(err, ErrDMCategoryForbidden) {
+			c.ResponseError(err)
+			return
+		}
 		f.Error("关注 DM 失败", zap.Error(err))
 		c.ResponseError(pkgerrors.New("关注 DM 失败"))
 		return
@@ -349,10 +358,6 @@ type sortItemKey struct {
 	TargetID   string
 }
 
-// Route registers the 7 Follow endpoints under /v2/follow.
-// It is called by the module init via register.Module.SetupAPI.
-func (f *Follow) Route(r *wkhttp.WKHttp) {
-	// Routes are registered by 1module.go using the ctx-provided middleware.
-	// This method is only called when used standalone (e.g. for testing without
-	// the full module stack); see 1module.go for the production wiring.
-}
+// (Follow.Route 已删除 —— PR #21 Round-6 P1 by yujiawei：原本是 no-op wrapper，
+// 真正的 routing 在 1module.go followRouter 上实现，保留 no-op 反而误导后来的
+// 维护者以为它会注册路由。)

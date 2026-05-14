@@ -112,6 +112,8 @@ func filterConversationsCore(
 			filterSpaceID, defaultSpaceID,
 			groupSpaceMap, externalGroupMap, botSet, botInSpace,
 			skipGroupFilter, skipBotFilter,
+			// v1 兼容：群表查询失败时不过滤（与历史 FilterConversationsBySpace 一致）。
+			false,
 			func(target string) bool { return personConvHasSpaceMessages(conv, target) },
 		)
 		if keep {
@@ -131,6 +133,12 @@ func filterConversationsCore(
 //     可为空，群聊/子区会进一步查 groupSpaceMap。
 //   - hasSpaceMsg: 仅对非默认 Space 的 Person DM 生效，判断 conv.Recents 内是否
 //     有 payload.space_id == targetSpaceID 的消息。
+//   - failClosedOnUnknownGroupSpace: 当 skipGroupFilter=true（group service 查询
+//     失败、无法确认群的 space_id）时的语义切换。
+//     - false（v1 兼容默认）：保留群/子区，不让一次 DB 抖动影响存量行为。
+//     - true（v2 sidebar 用，PR #21 Round-6 P0-1）：drop 群/子区，避免跨 Space
+//       泄露（reviewer Jerry-Xin / yujiawei）。这是 fail-closed —— 用户多刷
+//       一次即可，但绝不让 Space A 的群在 Space B 请求里露出。
 func decideConvKeepInSpace(
 	channelID string,
 	channelType uint8,
@@ -139,11 +147,15 @@ func decideConvKeepInSpace(
 	groupSpaceMap, externalGroupMap map[string]string,
 	botSet, botInSpace map[string]bool,
 	skipGroupFilter, skipBotFilter bool,
+	failClosedOnUnknownGroupSpace bool,
 	hasSpaceMsg func(targetSpaceID string) bool,
 ) bool {
 	spaceID := convSpaceID
 	if spaceID == "" && channelType == common.ChannelTypeGroup.Uint8() {
 		if skipGroupFilter {
+			if failClosedOnUnknownGroupSpace {
+				return false
+			}
 			return true
 		}
 		spaceID = groupSpaceMap[channelID]
@@ -153,7 +165,7 @@ func decideConvKeepInSpace(
 		return true
 	}
 	if channelType == common.ChannelTypeCommunityTopic.Uint8() {
-		return filterThreadConvCore(channelID, filterSpaceID, defaultSpaceID, groupSpaceMap, externalGroupMap, skipGroupFilter)
+		return filterThreadConvCore(channelID, filterSpaceID, defaultSpaceID, groupSpaceMap, externalGroupMap, skipGroupFilter, failClosedOnUnknownGroupSpace)
 	}
 	if channelType == common.ChannelTypeGroup.Uint8() {
 		if sourceSpace, ok := externalGroupMap[channelID]; ok {
@@ -195,17 +207,24 @@ func decideConvKeepInSpace(
 
 // filterThreadConvCore 是 filterThreadConv 的 channelID-only 变体，便于 v2
 // 不持有完整 SyncUserConversationResp 时复用。
+//
+// failClosedOnUnknownGroupSpace 参见 decideConvKeepInSpace 注释：
+// v1 兼容传 false，v2 sidebar 传 true。
 func filterThreadConvCore(
 	channelID string,
 	filterSpaceID, defaultSpaceID string,
 	groupSpaceMap, externalGroupMap map[string]string,
 	skipGroupFilter bool,
+	failClosedOnUnknownGroupSpace bool,
 ) bool {
 	parentNo, _, err := thread.ParseChannelID(channelID)
 	if err != nil {
 		return false
 	}
 	if skipGroupFilter {
+		if failClosedOnUnknownGroupSpace {
+			return false
+		}
 		return true
 	}
 	parentSpaceID := groupSpaceMap[parentNo]
@@ -238,7 +257,8 @@ func filterThreadConv(
 	externalGroupMap map[string]string,
 	skipGroupFilter bool,
 ) bool {
-	return filterThreadConvCore(conv.ChannelID, filterSpaceID, defaultSpaceID, groupSpaceMap, externalGroupMap, skipGroupFilter)
+	// v1 兼容：失败时 fail-open（与旧 filterThreadConv 一致）。
+	return filterThreadConvCore(conv.ChannelID, filterSpaceID, defaultSpaceID, groupSpaceMap, externalGroupMap, skipGroupFilter, false)
 }
 
 // personConvHasSpaceMessages 检查 Person 会话的 Recents 中是否有 space_id 匹配的消息。
@@ -504,6 +524,9 @@ func FilterRawConversationsBySpace(
 			filterSpaceID, defaultSpaceID,
 			groupSpaceMap, externalGroupMap, botSet, botInSpace,
 			skipGroupFilter, skipBotFilter,
+			// v2 sidebar 必须 fail-closed：群表查询失败时无法确认 space，drop
+			// 群/子区以免跨 Space 泄露（PR #21 Round-6 P0-1 by Jerry-Xin / yujiawei）。
+			true,
 			func(target string) bool { return rawConvHasSpaceMessages(conv, target) },
 		)
 		if keep {

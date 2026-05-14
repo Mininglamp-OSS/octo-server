@@ -36,9 +36,9 @@ paths:
                 type: string
                 description: "对方用户 UID"
               category_id:
-                type: integer
-                format: int64
-                description: "DM 分组 ID（可选）"
+                type: string
+                maxLength: 32
+                description: "DM 所属分类的 UUID，引用 group_category.category_id（与群分类共用同一 namespace）。不传或 null 表示未分类。服务端会校验 categoryID 属于当前 uid 且未删除，否则返回 400 'dm category forbidden'。"
       responses:
         200:
           description: "操作成功"

@@ -309,7 +309,7 @@ func TestService_FollowDM_WithoutCategory(t *testing.T) {
 func TestService_FollowDM_WithCategory(t *testing.T) {
 	svc := newServiceForTest(t)
 	const uid, space, peer = "u1", "s1", "peer-dm-2"
-	catID := int64(77)
+	catID := "cat-uuid-77"
 
 	require.NoError(t, svc.FollowDM(uid, space, peer, &catID))
 
@@ -324,8 +324,8 @@ func TestService_FollowDM_WithCategory(t *testing.T) {
 func TestService_FollowDM_Idempotent_UpdatesCategory(t *testing.T) {
 	svc := newServiceForTest(t)
 	const uid, space, peer = "u1", "s1", "peer-dm-3"
-	catA := int64(10)
-	catB := int64(20)
+	catA := "cat-uuid-A"
+	catB := "cat-uuid-B"
 
 	require.NoError(t, svc.FollowDM(uid, space, peer, &catA))
 	require.NoError(t, svc.FollowDM(uid, space, peer, &catB))

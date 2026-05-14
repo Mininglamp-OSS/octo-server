@@ -506,6 +506,54 @@ func TestSortFollowItems_CategoryGroupSort_PrimaryOverIntra(t *testing.T) {
 	assert.Equal(t, "g3", items[2].TargetID, "different CategorySort dominates intra order")
 }
 
+// PR #21 Round-6 P0-2 (Jerry-Xin / yujiawei) regression：uniqueThreadParentGroupNos
+// 必须去重 + 跳过无法解析的 thread channel ID。
+func TestUniqueThreadParentGroupNos(t *testing.T) {
+	type ext = convext.Model
+	tests := []struct {
+		name string
+		rows []*ext
+		want []string
+	}{
+		{name: "empty", rows: nil, want: []string{}},
+		{
+			name: "dedup same parent",
+			rows: []*ext{
+				{TargetID: "gA____thr1"},
+				{TargetID: "gA____thr2"},
+			},
+			want: []string{"gA"},
+		},
+		{
+			name: "multiple distinct",
+			rows: []*ext{
+				{TargetID: "gA____thr1"},
+				{TargetID: "gB____thr2"},
+				{TargetID: "gA____thr3"},
+			},
+			want: []string{"gA", "gB"},
+		},
+		{
+			name: "malformed skipped",
+			rows: []*ext{
+				{TargetID: "no-separator"},
+				{TargetID: "gA____thr1"},
+			},
+			want: []string{"gA"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := uniqueThreadParentGroupNos(tc.rows)
+			if len(tc.want) == 0 {
+				assert.Empty(t, got)
+			} else {
+				assert.Equal(t, tc.want, got)
+			}
+		})
+	}
+}
+
 // PR #21 Round-4 review I6 (lml2468 #3) regression：appendThreadParentGroupNos
 // 必须把 thread ext 的父群 groupNo 合入查询集合，且去重不重复添加 IM 已经返回的群。
 func TestAppendThreadParentGroupNos(t *testing.T) {
@@ -560,6 +608,69 @@ func TestAppendThreadParentGroupNos(t *testing.T) {
 			assert.Equal(t, tc.want, got)
 		})
 	}
+}
+
+// PR #21 Round-6 P1-2 (yujiawei) + 原型 image-v1.png 确认：thread 必须跟父群在
+// 同一分类块内排序。 SidebarItem.CategorySort（来自父群 group_category.sort）
+// 与 intraCategorySort（来自父群 group_setting.category_sort）必须从父群 copy 过来，
+// 否则所有 thread 都默认 0 → 与 DM 混挤在 follow tab 顶部，违反 UX 期望。
+func TestBuildFollowItems_ThreadInheritsParentCategorySort(t *testing.T) {
+	parentNo := "g-parent"
+	threadID := parentNo + "____thr-1"
+	convs := []*config.SyncUserConversationResp{
+		makeIMConv(parentNo, common.ChannelTypeGroup.Uint8(), 1_700_000_100),
+		makeIMConv(threadID, common.ChannelTypeCommunityTopic.Uint8(), 1_700_000_200),
+	}
+	categorySetting := map[string]*GroupCategorySetting{
+		parentNo: {
+			GroupNo:           parentNo,
+			CategoryID:        strPtr("cat-work"),
+			CategorySort:      5,  // group_setting.category_sort
+			CategoryGroupSort: 42, // group_category.sort
+		},
+	}
+	threadExtMap := map[string]*convext.Model{
+		threadID: {TargetID: threadID, FollowSort: 1},
+	}
+	items := buildFollowItems(convs, categorySetting, nil, nil, threadExtMap)
+	require.Len(t, items, 2)
+
+	var groupItem, threadItem *SidebarItem
+	for _, it := range items {
+		switch it.TargetID {
+		case parentNo:
+			groupItem = it
+		case threadID:
+			threadItem = it
+		}
+	}
+	require.NotNil(t, groupItem)
+	require.NotNil(t, threadItem)
+	assert.Equal(t, groupItem.CategorySort, threadItem.CategorySort,
+		"thread.CategorySort 必须等于父群（同一类间排序桶）")
+	assert.Equal(t, groupItem.intraCategorySort, threadItem.intraCategorySort,
+		"thread.intraCategorySort 必须等于父群（与父群紧贴，同类内位置）")
+	assert.Equal(t, "cat-work", *threadItem.CategoryID)
+}
+
+// 端到端 sort 回归：父群在分类 sort=42 内、CategorySort=5；DM 在 0 桶；
+// thread 必须排在父群附近、不会浮到顶部。
+func TestSortFollowItems_ThreadDoesNotFloatToTop(t *testing.T) {
+	items := []*SidebarItem{
+		// DM，CategorySort=0，理应在顶部
+		{TargetID: "dm-1", TargetType: 1, CategorySort: 0, FollowSort: 1},
+		// thread，继承父群的 (42, 5)
+		{TargetID: "g-parent____thr-1", TargetType: 5,
+			CategorySort: 42, intraCategorySort: 5, FollowSort: 1, ParentChannelID: "g-parent"},
+		// 父群本身，(42, 5)
+		{TargetID: "g-parent", TargetType: 2, CategorySort: 42, intraCategorySort: 5, FollowSort: 0},
+	}
+	sortFollowItems(items)
+	// 期望顺序: DM (顶部) → 父群 → thread（同分类块）
+	assert.Equal(t, "dm-1", items[0].TargetID, "DM 在最顶（CategorySort=0）")
+	// 父群与 thread 顺序由 FollowSort 二级 key 决定（父群 0 在前）。
+	assert.Equal(t, "g-parent", items[1].TargetID, "父群必须紧挨 thread")
+	assert.Equal(t, "g-parent____thr-1", items[2].TargetID, "thread 跟在父群后")
 }
 
 // TestBuildFollowItems_CategoryGroupSort_Propagates 验证 buildFollowItems
@@ -707,14 +818,15 @@ func TestBuildFollowItems_DMFollowed_WithDMCategory(t *testing.T) {
 	convs := []*config.SyncUserConversationResp{
 		makeIMConv("peer1", common.ChannelTypePerson.Uint8(), nowRecent()),
 	}
-	catID := int64(42)
+	// PR #21 Round-6: dm_category_id 类型从 BIGINT 改为 VARCHAR(32) UUID。
+	catID := "cat-uuid-abc"
 	followedDMs := map[string]*convext.Model{
 		"peer1": {TargetID: "peer1", FollowedDM: 1, FollowSort: 3, DMCategoryID: &catID},
 	}
 	items := buildFollowItems(convs, nil, nil, followedDMs, nil)
 	require.Len(t, items, 1)
 	require.NotNil(t, items[0].CategoryID)
-	assert.Equal(t, "42", *items[0].CategoryID)
+	assert.Equal(t, catID, *items[0].CategoryID, "DMCategoryID 直接透传 UUID，不再 fmt.Sprintf 转字符串")
 }
 
 // ---------------------------------------------------------------------------

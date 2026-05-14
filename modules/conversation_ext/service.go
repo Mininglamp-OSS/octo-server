@@ -26,6 +26,12 @@ const threadSeparator = "____"
 // 调用方（HTTP handler）应将此错误翻译为 403。
 var ErrThreadForbidden = errors.New("thread follow forbidden: not a member of parent group or thread not visible")
 
+// ErrDMCategoryForbidden 在 FollowDM 指定的 category 不属于当前 uid 或已删除时返回。
+// 调用方应将此错误翻译为 400 / 403（按业务约定）。
+// PR #21 Round-6 (Jerry-Xin)：DM category 必须由服务端校验归属，否则客户端可写入
+// 任意 UUID 让自己的 follow tab 引用不存在的分类（"未分类"渲染）。
+var ErrDMCategoryForbidden = errors.New("dm category forbidden: not owned by uid or category deleted")
+
 // ThreadAuthChecker 判定 FollowThread 是否被授权，是一个 narrow interface。
 // 为避免对 modules/group / modules/thread 形成循环依赖，采用依赖倒置从外部注入。
 //
@@ -38,6 +44,13 @@ var ErrThreadForbidden = errors.New("thread follow forbidden: not a member of pa
 // 校验通过返回 nil。基础设施错误（DB 错误等）以 wrap 后的形式向上透传。
 type ThreadAuthChecker interface {
 	AuthorizeThreadFollow(uid, spaceID, groupNo, shortID string) error
+}
+
+// DMCategoryChecker 校验 FollowDM 时传入的 categoryID 是否属于当前 uid 且未删除。
+// 与 ThreadAuthChecker 同样采用依赖倒置，避免 conversation_ext 直接 import category。
+// nil 时 FollowDM 跳过 categoryID 校验（用于测试 / 迁移期）。
+type DMCategoryChecker interface {
+	AuthorizeDMCategory(uid, spaceID, categoryID string) error
 }
 
 // Service encapsulates composite operations on user_conversation_ext that
@@ -53,6 +66,10 @@ type Service struct {
 	session     *dbr.Session
 	threadAuth  ThreadAuthChecker
 	threadAuthM sync.RWMutex
+	// dmCatAuth 是 FollowDM 的 categoryID 校验钩子（PR #21 Round-6 by Jerry-Xin）。
+	// 与 threadAuth 一样由 message/1module.go 启动时注入；nil 时跳过校验。
+	dmCatAuth  DMCategoryChecker
+	dmCatAuthM sync.RWMutex
 	log.Log
 }
 
@@ -79,6 +96,22 @@ func (s *Service) getThreadAuthChecker() ThreadAuthChecker {
 	s.threadAuthM.RLock()
 	c := s.threadAuth
 	s.threadAuthM.RUnlock()
+	return c
+}
+
+// SetDMCategoryChecker injects the auth checker used by FollowDM categoryID.
+// Safe for concurrent use; intended to be called once at startup from
+// message/1module.go after the category module has initialised.
+func (s *Service) SetDMCategoryChecker(c DMCategoryChecker) {
+	s.dmCatAuthM.Lock()
+	s.dmCatAuth = c
+	s.dmCatAuthM.Unlock()
+}
+
+func (s *Service) getDMCategoryChecker() DMCategoryChecker {
+	s.dmCatAuthM.RLock()
+	c := s.dmCatAuth
+	s.dmCatAuthM.RUnlock()
 	return c
 }
 
@@ -295,14 +328,32 @@ func (s *Service) UnfollowThread(uid, spaceID, threadChannelID string) error {
 // ---------------------------------------------------------------------------
 
 // FollowDM marks the DM conversation with peerUID as followed (followed_dm=1).
-// If categoryID is non-nil the DM is placed into that category.
+// If categoryID is non-nil the DM is placed into that group_category UUID.
+//
+// PR #21 Round-6 (Jerry-Xin)：categoryID 类型由 *int64 改为 *string，与
+// group_category.category_id (VARCHAR(32) UUID) 一致；DM 与群共用同一分类 namespace
+// 由原型 image-v1.png 证实。
+// 校验顺序：
+//   - 入参合法（uid/spaceID/peerUID 非空）
+//   - 注入的 DMCategoryChecker 验证 categoryID 属于 uid 且 status != 2
+//
 // PR review (Round 3) Blocking #1/#2 — bumps follow_version in same tx.
-func (s *Service) FollowDM(uid, spaceID, peerUID string, categoryID *int64) error {
+func (s *Service) FollowDM(uid, spaceID, peerUID string, categoryID *string) error {
 	if err := validateBase(uid, spaceID); err != nil {
 		return err
 	}
 	if peerUID == "" {
 		return errors.New("peer_uid must not be empty")
+	}
+	if categoryID != nil {
+		if *categoryID == "" {
+			return errors.New("category_id must not be empty string")
+		}
+		if checker := s.getDMCategoryChecker(); checker != nil {
+			if err := checker.AuthorizeDMCategory(uid, spaceID, *categoryID); err != nil {
+				return err
+			}
+		}
 	}
 	one := int8(1)
 	fields := ConvExtFields{

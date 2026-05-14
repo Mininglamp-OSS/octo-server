@@ -58,7 +58,6 @@ func TestDB_Upsert_Get_BasicInsert(t *testing.T) {
 	assert.Equal(t, "dm-target", m.TargetID)
 	assert.Equal(t, int8(1), m.FollowedDM)
 	assert.Equal(t, 10, m.FollowSort)
-	assert.Equal(t, 0, m.Version)
 }
 
 func TestDB_Get_NotFound_ReturnsNilNil(t *testing.T) {
@@ -93,7 +92,7 @@ func TestDB_Upsert_Update_ExistingRow(t *testing.T) {
 func TestDB_Upsert_DMCategoryID(t *testing.T) {
 	db := newDBForTest(t)
 
-	catID := int64(42)
+	catID := "cat-uuid-42"
 	require.NoError(t, db.Upsert("u1", "s1", 1, "dm-cat", ConvExtFields{
 		FollowedDM:   int8Ptr(1),
 		DMCategoryID: &catID,
@@ -181,8 +180,8 @@ func TestDB_ListFollowedDM_BasicOrder(t *testing.T) {
 	db := newDBForTest(t)
 	const uid, space = "u1", "s1"
 
-	cat1 := int64(1)
-	cat2 := int64(2)
+	cat1 := "cat-uuid-1"
+	cat2 := "cat-uuid-2"
 
 	// 関注 DM：異なる category + sort
 	require.NoError(t, db.Upsert(uid, space, 1, "dm-a", ConvExtFields{FollowedDM: int8Ptr(1), DMCategoryID: &cat2, FollowSort: intPtr(5)}))

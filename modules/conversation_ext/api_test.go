@@ -24,7 +24,7 @@ func strconvI(i int) string { return strconv.Itoa(i) }
 
 // stubService is a test double for *Service.
 type stubService struct {
-	followDMFn        func(uid, spaceID, peerUID string, categoryID *int64) error
+	followDMFn        func(uid, spaceID, peerUID string, categoryID *string) error
 	unfollowDMFn      func(uid, spaceID, peerUID string) error
 	unfollowChannelFn func(uid, spaceID, groupNo string) error
 	followChannelFn   func(uid, spaceID, groupNo string) error
@@ -32,7 +32,7 @@ type stubService struct {
 	unfollowThreadFn  func(uid, spaceID, threadChannelID string) error
 }
 
-func (s *stubService) FollowDM(uid, spaceID, peerUID string, categoryID *int64) error {
+func (s *stubService) FollowDM(uid, spaceID, peerUID string, categoryID *string) error {
 	if s.followDMFn != nil {
 		return s.followDMFn(uid, spaceID, peerUID, categoryID)
 	}
@@ -158,10 +158,10 @@ func assertBadRequest(t *testing.T, w *httptest.ResponseRecorder) {
 
 func TestFollow_FollowDM_HappyPath(t *testing.T) {
 	var gotUID, gotSpaceID, gotPeerUID string
-	var gotCatID *int64
+	var gotCatID *string
 
 	svc := &stubService{
-		followDMFn: func(uid, spaceID, peerUID string, categoryID *int64) error {
+		followDMFn: func(uid, spaceID, peerUID string, categoryID *string) error {
 			gotUID, gotSpaceID, gotPeerUID, gotCatID = uid, spaceID, peerUID, categoryID
 			return nil
 		},
@@ -177,15 +177,15 @@ func TestFollow_FollowDM_HappyPath(t *testing.T) {
 }
 
 func TestFollow_FollowDM_WithCategoryID(t *testing.T) {
-	var gotCatID *int64
+	var gotCatID *string
 	svc := &stubService{
-		followDMFn: func(uid, spaceID, peerUID string, categoryID *int64) error {
+		followDMFn: func(uid, spaceID, peerUID string, categoryID *string) error {
 			gotCatID = categoryID
 			return nil
 		},
 	}
 	r := newTestRouter(svc, &stubDB{})
-	catID := int64(99)
+	catID := "cat-uuid-abc"
 	w := do(r, "POST", "/v2/follow/dm", map[string]interface{}{
 		"peer_uid":    "peer2",
 		"category_id": catID,
@@ -204,13 +204,30 @@ func TestFollow_FollowDM_MissingPeerUID(t *testing.T) {
 
 func TestFollow_FollowDM_ServiceError(t *testing.T) {
 	svc := &stubService{
-		followDMFn: func(uid, spaceID, peerUID string, categoryID *int64) error {
+		followDMFn: func(uid, spaceID, peerUID string, categoryID *string) error {
 			return errors.New("db gone away")
 		},
 	}
 	r := newTestRouter(svc, &stubDB{})
 	w := do(r, "POST", "/v2/follow/dm", map[string]interface{}{"peer_uid": "peer1"})
 	assertBadRequest(t, w)
+}
+
+// PR #21 Round-6 (Jerry-Xin)：DMCategoryChecker 拒绝时 handler 应该把
+// ErrDMCategoryForbidden 暴露给客户端。
+func TestFollow_FollowDM_CategoryForbidden(t *testing.T) {
+	svc := &stubService{
+		followDMFn: func(uid, spaceID, peerUID string, categoryID *string) error {
+			return ErrDMCategoryForbidden
+		},
+	}
+	r := newTestRouter(svc, &stubDB{})
+	w := do(r, "POST", "/v2/follow/dm", map[string]interface{}{
+		"peer_uid":    "peer3",
+		"category_id": "not-mine-uuid",
+	})
+	assertBadRequest(t, w)
+	assert.Contains(t, w.Body.String(), "dm category forbidden")
 }
 
 // ---------------------------------------------------------------------------
