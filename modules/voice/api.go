@@ -121,6 +121,15 @@ func (v *Voice) transcribe(c *wkhttp.Context) {
 		memberContext = TruncateRunesTail(memberContext, v.cfg.MaxMemberContextLength)
 	}
 
+	channelType := c.Request.FormValue("channel_type")
+	if channelType == "" {
+		channelType = "2"
+	}
+	skipMention := channelType == "1"
+	if skipMention {
+		memberContext = ""
+	}
+
 	// Parse and validate mode parameter
 	mode := c.Request.FormValue("mode")
 	var internalMode string
@@ -159,14 +168,14 @@ func (v *Voice) transcribe(c *wkhttp.Context) {
 
 	startTime := time.Now()
 	result, err := v.service.TranscribeWithResult(audioData, mimeType, contextText, chatContext,
-		TranscribeOptions{Mode: internalMode})
+		TranscribeOptions{Mode: internalMode, SkipMention: skipMention})
 	durationMs := time.Since(startTime).Milliseconds()
 
 	if err != nil {
 		v.Error("transcription failed", zap.Error(err))
 		if v.asrLogger != nil {
 			entry := v.buildASREntry("app", effectiveMode, audioData, mimeType, contextText, origChatContext,
-				personalContext, memberContext, startTime, durationMs, result, err)
+				personalContext, memberContext, channelType, startTime, durationMs, result, err)
 			v.asrLogger.Enqueue(entry)
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -178,7 +187,7 @@ func (v *Voice) transcribe(c *wkhttp.Context) {
 
 	if v.asrLogger != nil {
 		v.asrLogger.Enqueue(v.buildASREntry("app", effectiveMode, audioData, mimeType, contextText, origChatContext,
-			personalContext, memberContext, startTime, durationMs, result, nil))
+			personalContext, memberContext, channelType, startTime, durationMs, result, nil))
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -207,7 +216,7 @@ func (v *Voice) getConfig(c *wkhttp.Context) {
 
 // buildASREntry constructs an ASREntry with common fields populated.
 func (v *Voice) buildASREntry(source string, mode string, audioData []byte, mimeType string,
-	contextText string, chatContext string, personalContext string, memberContext string,
+	contextText string, chatContext string, personalContext string, memberContext string, channelType string,
 	startTime time.Time, durationMs int64,
 	result *TranscribeResult, err error) ASREntry {
 
@@ -224,6 +233,7 @@ func (v *Voice) buildASREntry(source string, mode string, audioData []byte, mime
 			ChatContext:     chatContext,
 			PersonalContext: personalContext,
 			MemberContext:   memberContext,
+			ChannelType:     channelType,
 		},
 		AudioData:  audioData,
 		DurationMs: durationMs,

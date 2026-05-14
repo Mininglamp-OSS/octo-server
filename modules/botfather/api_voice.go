@@ -205,6 +205,15 @@ func (bf *BotFather) botTranscribe(c *wkhttp.Context) {
 		memberContext = voice.TruncateRunesTail(memberContext, bf.voiceCfg.MaxMemberContextLength)
 	}
 
+	channelType := c.Request.FormValue("channel_type")
+	if channelType == "" {
+		channelType = "2"
+	}
+	skipMention := channelType == "1"
+	if skipMention {
+		memberContext = ""
+	}
+
 	// Save original chatContext for ASR logging
 	origChatContext := chatContext
 
@@ -229,7 +238,7 @@ func (bf *BotFather) botTranscribe(c *wkhttp.Context) {
 
 	startTime := time.Now()
 	result, err := bf.voiceSvc.TranscribeWithResult(audioData, mimeType, contextText, chatContext,
-		voice.TranscribeOptions{Mode: mode, Model: model})
+		voice.TranscribeOptions{Mode: mode, Model: model, SkipMention: skipMention})
 	durationMs := time.Since(startTime).Milliseconds()
 
 	if err != nil {
@@ -251,6 +260,7 @@ func (bf *BotFather) botTranscribe(c *wkhttp.Context) {
 					MemberContext:   memberContext,
 					Model:           model,
 					Language:        bf.voiceCfg.Language,
+					ChannelType:     channelType,
 				},
 				AudioData:  audioData,
 				Error:      err.Error(),
@@ -290,6 +300,7 @@ func (bf *BotFather) botTranscribe(c *wkhttp.Context) {
 				MemberContext:   memberContext,
 				Model:           model,
 				Language:        bf.voiceCfg.Language,
+				ChannelType:     channelType,
 			},
 			Prompt: &voice.ASRPrompt{
 				Type:        result.PromptType,
