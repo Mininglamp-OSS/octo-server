@@ -340,12 +340,19 @@ func (rb *Robot) sendMessage(c *wkhttp.Context) {
 		c.ResponseError(fmt.Errorf("机器人[%s]不存在！", robotID))
 		return
 	}
+	// YUJ-644 / Mininglamp-OSS#33: PERSONAL DM 派发前服务端权威 space_id 注入。
+	// 设计 / 失败模式见 modules/bot_api/space_inject.go 顶部注释。
+	payload := messageReq.Payload
+	if messageReq.ChannelType == common.ChannelTypePerson.Uint8() {
+		payload = rb.enrichBotPayloadWithSpaceID(robotID, payload)
+	}
+
 	result, err := rb.ctx.SendMessageWithResult(&config.MsgSendReq{
 		StreamNo:    messageReq.StreamNo,
 		ChannelID:   messageReq.ChannelID,
 		ChannelType: messageReq.ChannelType,
 		FromUID:     robotID,
-		Payload:     []byte(util.ToJson(messageReq.Payload)),
+		Payload:     []byte(util.ToJson(payload)),
 	})
 	if err != nil {
 		rb.Error("发送robot消息失败！", zap.Error(err))

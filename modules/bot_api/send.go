@@ -56,6 +56,17 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 	}
 
 	channelID := ba.resolveSpaceChannelID(robotID, req.ChannelID, req.ChannelType)
+
+	// YUJ-644 / Mininglamp-OSS#33: PERSONAL DM 服务端权威 space_id 注入。
+	// WuKongIM 对 DM 仅按裸 uid 路由（无 Space 概念），收端 SpaceFilter 只能依赖
+	// payload.space_id；客户端上送任何值（包括缺省 / 伪造）都不可信。
+	// 优先使用 gin-context 里 authAppBot 写入的 SpaceID（O(1)，无 DB 调用）；
+	// 用户 Bot / 平台级 App Bot 落 querySpaceIDByRobotID。
+	payload := req.Payload
+	if req.ChannelType == common.ChannelTypePerson.Uint8() {
+		payload = ba.enrichBotPayloadWithSpaceID(c, robotID, payload)
+	}
+
 	result, err := ba.ctx.SendMessageWithResult(&config.MsgSendReq{
 		Header: config.MsgHeader{
 			RedDot: 1,
@@ -64,7 +75,7 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 		ChannelID:   channelID,
 		ChannelType: req.ChannelType,
 		FromUID:     robotID,
-		Payload:     []byte(util.ToJson(req.Payload)),
+		Payload:     []byte(util.ToJson(payload)),
 	})
 	if err != nil {
 		ba.Error("发送消息失败", zap.Error(err))
