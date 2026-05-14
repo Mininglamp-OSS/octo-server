@@ -495,8 +495,22 @@ func (w *Webhook) pushTo(msgResp msgOfflineNotify, toUids []string) error {
 			}
 		}
 	} else if msgResp.ChannelType == common.ChannelTypePerson.Uint8() {
-		spaceID, _ := spacepkg.ParseChannelID(msgResp.ChannelID)
-		msgResp.SpaceID = spaceID
+		// YUJ-660 / Mininglamp-OSS#33: PERSONAL offline push parallel leak path.
+		// `resolveSpaceChannelID` is a no-op on PERSONAL — the stored channel_id
+		// is the bare peer uid with no `s{spaceID}_` prefix, so ParseChannelID
+		// always returns ("", peerID) and msgResp.SpaceID would be empty for
+		// every PERSONAL offline push. APNs/FCM/HMS/VIVO/MI all read
+		// payloadInfo.SpaceID for client-side Space filtering of system tray
+		// pushes — empty space_id is the same fail-open class as the realtime
+		// WS push leak this PR closes.
+		//
+		// Source authoritative SpaceID from payload.space_id first (the
+		// dispatch-layer fixes in this PR guarantee it on PERSONAL); fall back
+		// to ParseChannelID for legacy prefixed channel_ids and for
+		// Signal-encrypted payloads where PayloadMap is nil — encrypted DM body
+		// content does not leak via push payload, so the legacy fallback is
+		// acceptable.
+		msgResp.SpaceID = w.resolvePersonalOfflinePushSpaceID(msgResp)
 	}
 
 	var err error
@@ -825,4 +839,39 @@ type msgOfflineNotify struct {
 type pushResp struct {
 	deviceToken string
 	deviceType  string
+}
+
+// resolvePersonalOfflinePushSpaceID returns the authoritative SpaceID for a
+// PERSONAL channel offline push (YUJ-660 / Mininglamp-OSS#33).
+//
+// Resolution order:
+//  1. msgResp.PayloadMap["space_id"] — populated by the dispatch-layer
+//     enrichment fixes in this PR (modules/message/api.go,
+//     modules/bot_api/space_inject.go, modules/robot/space_inject.go).
+//  2. spacepkg.ParseChannelID(channel_id) — legacy fallback for prefixed
+//     channel_ids (`s{spaceID}_{peer}`) and the only path for Signal-encrypted
+//     payloads where PayloadMap is nil.
+//
+// Returns "" only when both sources produced "". A structured zap warn is
+// emitted in that case (key=offline_push_space_id_empty=true) so operators can
+// alert on dispatchers that bypassed enrichment. Steady state should read 0
+// post-rollout.
+func (w *Webhook) resolvePersonalOfflinePushSpaceID(msgResp msgOfflineNotify) string {
+	// Step 1: payload-injected authoritative space_id.
+	if pm := msgResp.PayloadMap; pm != nil {
+		if sid, ok := pm["space_id"].(string); ok && sid != "" {
+			return sid
+		}
+	}
+	// Step 2: legacy prefixed channel_id (returns "" on bare-uid channel_id).
+	if sid, _ := spacepkg.ParseChannelID(msgResp.ChannelID); sid != "" {
+		return sid
+	}
+	// Both empty: log for ops alerting and return "".
+	w.Warn("PERSONAL offline push has empty space_id — dispatcher bypassed enrichment",
+		zap.String("channelID", msgResp.ChannelID),
+		zap.String("fromUID", msgResp.FromUID),
+		zap.Bool("offline_push_space_id_empty", true),
+	)
+	return ""
 }
