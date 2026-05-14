@@ -27,6 +27,7 @@ type ASRInput struct {
 	MemberContext   string `json:"member_context"`
 	Model           string `json:"model"`
 	Language    string `json:"language"`
+	ChannelType string `json:"channel_type,omitempty"`
 }
 
 // ASRPrompt holds the prompt and request body sent to the model

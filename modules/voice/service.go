@@ -74,6 +74,10 @@ type TranscribeOptions struct {
 	// Model overrides the preferred model.
 	// Empty string uses the global fallback chain.
 	Model string
+
+	// SkipMention removes the @mention recognition section from the system prompt.
+	// True for DM (1v1) conversations where mention recognition is meaningless.
+	SkipMention bool
 }
 
 // TranscribeResult holds the transcription result along with metadata for logging
@@ -137,7 +141,7 @@ func (s *VoiceService) TranscribeWithResult(audioData []byte, mimeType, contextT
 	userMsg := buildUserMessage(mode, contextText, chatContext, svc.config.EmotionEmoji)
 	var systemMsg string
 	if svc.config.Engine != EngineGPT {
-		systemMsg = buildSystemMessage(svc.config.EmotionEmoji)
+		systemMsg = buildSystemMessage(svc.config.EmotionEmoji, opts.SkipMention)
 	}
 
 	// Call model

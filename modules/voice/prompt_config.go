@@ -32,6 +32,12 @@ type PromptConfig struct {
 	TaskEditNoEmotion        string `yaml:"task_edit_no_emotion"`
 	TaskEditOnlyNoEmotion    string `yaml:"task_edit_only_no_emotion"`
 
+	MentionSection        string `yaml:"mention_section"`
+	EmotionSection        string `yaml:"emotion_section"`
+	EmotionExamples       string `yaml:"emotion_examples"`
+	Rule5TitleWithEmotion string `yaml:"rule5_title_with_emotion"`
+	Rule5TitleNoEmotion   string `yaml:"rule5_title_no_emotion"`
+
 	// Legacy fields: parsed for backward compatibility but ignored with warning.
 	Transcribe        string `yaml:"transcribe,omitempty"`
 	Modify            string `yaml:"modify,omitempty"`
@@ -64,6 +70,11 @@ func resetToDefaults() {
 		TaskEditOnly:             taskEditOnly,
 		TaskEditNoEmotion:        taskEditNoEmotion,
 		TaskEditOnlyNoEmotion:    taskEditOnlyNoEmotion,
+		MentionSection:           mentionRecognitionSection,
+		EmotionSection:           emotionAnnotationSection,
+		EmotionExamples:          emotionExamplesSection,
+		Rule5TitleWithEmotion:    rule5TitleWithEmotion,
+		Rule5TitleNoEmotion:      rule5TitleNoEmotion,
 	}
 }
 
@@ -188,6 +199,24 @@ func LoadPrompts(filePath string, log promptLogger) {
 			log.Warn("YAML overrides task variant but not its no-emotion counterpart; default will be used when VOICE_EMOTION_EMOJI=false",
 				zap.String("override_field", p.emotionField),
 				zap.String("missing_field", p.noEmotionField))
+		}
+	}
+
+	// Section fields: no placeholder validation
+	sectionFields := []struct {
+		name   string
+		value  string
+		target *string
+	}{
+		{"mention_section", cfg.MentionSection, &activePrompts.MentionSection},
+		{"emotion_section", cfg.EmotionSection, &activePrompts.EmotionSection},
+		{"emotion_examples", cfg.EmotionExamples, &activePrompts.EmotionExamples},
+		{"rule5_title_with_emotion", cfg.Rule5TitleWithEmotion, &activePrompts.Rule5TitleWithEmotion},
+		{"rule5_title_no_emotion", cfg.Rule5TitleNoEmotion, &activePrompts.Rule5TitleNoEmotion},
+	}
+	for _, f := range sectionFields {
+		if strings.TrimSpace(f.value) != "" {
+			*f.target = strings.TrimRight(f.value, "\r\n")
 		}
 	}
 

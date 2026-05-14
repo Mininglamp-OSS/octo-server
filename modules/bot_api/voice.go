@@ -218,6 +218,15 @@ func (ba *BotAPI) botTranscribe(c *wkhttp.Context) {
 		memberContext = voice.TruncateRunesTail(memberContext, ba.voiceCfg.MaxMemberContextLength)
 	}
 
+	channelType := c.Request.FormValue("channel_type")
+	if channelType == "" {
+		channelType = "2"
+	}
+	skipMention := channelType == "1"
+	if skipMention {
+		memberContext = ""
+	}
+
 	origChatContext := chatContext
 	chatContext = voice.BuildVocabularyReference(personalContext, memberContext, chatContext)
 
@@ -240,7 +249,7 @@ func (ba *BotAPI) botTranscribe(c *wkhttp.Context) {
 
 	startTime := time.Now()
 	result, err := ba.voiceSvc.TranscribeWithResult(audioData, mimeType, contextText, chatContext,
-		voice.TranscribeOptions{Mode: mode, Model: model})
+		voice.TranscribeOptions{Mode: mode, Model: model, SkipMention: skipMention})
 	durationMs := time.Since(startTime).Milliseconds()
 
 	if err != nil {
@@ -262,6 +271,7 @@ func (ba *BotAPI) botTranscribe(c *wkhttp.Context) {
 					MemberContext:   memberContext,
 					Model:           model,
 					Language:        ba.voiceCfg.Language,
+					ChannelType:     channelType,
 				},
 				AudioData:  audioData,
 				Error:      err.Error(),
@@ -301,6 +311,7 @@ func (ba *BotAPI) botTranscribe(c *wkhttp.Context) {
 				MemberContext:   memberContext,
 				Model:           model,
 				Language:        ba.voiceCfg.Language,
+				ChannelType:     channelType,
 			},
 			Prompt: &voice.ASRPrompt{
 				Type:        result.PromptType,
