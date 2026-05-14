@@ -1,6 +1,8 @@
 package message
 
 import (
+	"fmt"
+
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/gocraft/dbr/v2"
 )
@@ -71,4 +73,38 @@ func (d *groupCategoryDB) QueryCategorySettingsByGroupNos(groupNos []string, uid
 		Where("gs.group_no IN ? AND gs.uid = ?", groupNos, uid).
 		Load(&results)
 	return results, err
+}
+
+// QueryCategorySortsByIDs 批量返回 group_category.sort（map[categoryID]sort）。
+//
+// Issue #41：DM 在 user_conversation_ext.dm_category_id 上引用 group_category.category_id；
+// sidebar follow tab 排序需要把对应 category 的 sort 值写到 SidebarItem.CategorySort，
+// 让带 category 的 DM 与同 category 的群同桶。
+//
+// 与 QueryCategorySettingsByGroupNos 共同遵守 uid 维度的隔离 + 软删过滤：
+//   - uid 谓词阻止跨 user 读到他人的 category sort；
+//   - status != 2 过滤掉软删除 category，让 DM 的 dm_category_id 退到默认 0 桶。
+//
+// 入参为空时直接返回空 map，避免触发 "IN ()" 错误。
+func (d *groupCategoryDB) QueryCategorySortsByIDs(categoryIDs []string, uid string) (map[string]int, error) {
+	if len(categoryIDs) == 0 {
+		return map[string]int{}, nil
+	}
+	type row struct {
+		CategoryID string `db:"category_id"`
+		Sort       int    `db:"sort"`
+	}
+	var rows []*row
+	_, err := d.session.Select("category_id", "IFNULL(sort, 0) AS sort").
+		From("group_category").
+		Where("category_id IN ? AND uid = ? AND status != 2", categoryIDs, uid).
+		Load(&rows)
+	if err != nil {
+		return nil, fmt.Errorf("query category sorts by ids: %w", err)
+	}
+	result := make(map[string]int, len(rows))
+	for _, r := range rows {
+		result[r.CategoryID] = r.Sort
+	}
+	return result, nil
 }

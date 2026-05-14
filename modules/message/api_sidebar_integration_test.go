@@ -146,7 +146,7 @@ func TestIntegration_Sidebar_FollowTab_BasicSmoke(t *testing.T) {
 	}
 
 	// 5. Run the same pure-function pipeline as Sidebar.Sync follow branch.
-	items := buildFollowItems(stubConvs, categorySetting, unfollowedGroups, followedDMs, threadExtMap)
+	items := buildFollowItems(stubConvs, categorySetting, unfollowedGroups, followedDMs, threadExtMap, nil, nil)
 	// mergeThreadEntries: thread is already in IM result, so no new item added.
 	items = mergeThreadEntries(items, threadExtRows, map[string]*time.Time{}, categorySetting, unfollowedGroups)
 	sortFollowItems(items)
@@ -225,7 +225,7 @@ func TestIntegration_Sidebar_FollowTab_BlacklistedGroupExcluded(t *testing.T) {
 		{ChannelID: groupNo, ChannelType: common.ChannelTypeGroup.Uint8(), Timestamp: 100},
 	}
 
-	items := buildFollowItems(stubConvs, categorySetting, unfollowedGroups, nil, nil)
+	items := buildFollowItems(stubConvs, categorySetting, unfollowedGroups, nil, nil, nil, nil)
 	assert.Len(t, items, 0,
 		"blacklisted group (group_unfollowed=1 in DB) must be excluded from follow tab")
 }
@@ -261,7 +261,7 @@ func TestIntegration_Sidebar_FollowTab_NoExtRows_ReturnsEmpty(t *testing.T) {
 	}
 
 	// No category → group excluded; no followed_dm row → DM excluded.
-	items := buildFollowItems(stubConvs, nil /*categorySetting*/, unfollowedGroups, followedDMs, nil)
+	items := buildFollowItems(stubConvs, nil /*categorySetting*/, unfollowedGroups, followedDMs, nil, nil, nil)
 	assert.Len(t, items, 0, "follow tab with no ext data must return 0 items")
 }
 
@@ -307,7 +307,7 @@ func TestIntegration_Sidebar_MergeThreadEntries_AddsDBOnlyThreads(t *testing.T) 
 	}
 
 	// buildFollowItems picks up threadInIM (has ext row + parent in follow set).
-	items := buildFollowItems(stubConvs, categorySetting, nil, nil, threadExtMap)
+	items := buildFollowItems(stubConvs, categorySetting, nil, nil, threadExtMap, nil, nil)
 	require.Len(t, items, 1, "buildFollowItems must include threadInIM")
 
 	// mergeThreadEntries appends threadDBOnly (not yet in items).
@@ -332,4 +332,168 @@ func TestIntegration_Sidebar_MergeThreadEntries_AddsDBOnlyThreads(t *testing.T) 
 
 	// No duplicates.
 	assert.Len(t, items, 2, "no duplicates must exist after merge")
+}
+
+// ---------------------------------------------------------------------------
+// Issue #41 end-to-end regression: cross-type drag-sort must survive a reload.
+//
+// 严格按 issue 的 reproduction script 跑：账号有 1 个 DM (fileHelper) 和 1 个
+// 群（category=CA，category_sort=0）。两次反向的 follow_sort 写入必须分别
+// 产生 [DM, 群] 和 [群, DM] 两种 sidebar 响应——旧实现两次都恒回 [群, DM]。
+//
+// 数据流：
+//   1. seed group_category（CA, sort=0）+ group_setting（群在 CA 内）+
+//      followed-DM ext 行。
+//   2. 把 follow_sort 写到 user_conversation_ext（模拟 UpdateSort 的效果）。
+//   3. 走真正的 sidebar pipeline：ListFollowedDM → ListGroupExts →
+//      QueryCategorySettingsByGroupNos → QueryCategorySortsByIDs →
+//      buildFollowItems → sortFollowItems。
+//   4. 断言返回顺序与提交顺序一致。
+// ---------------------------------------------------------------------------
+
+func TestIntegration_Sidebar_Issue41_CrossTypeDragSurvivesReload(t *testing.T) {
+	ctx := newSidebarIntegCtx(t)
+	cleanConvExtTable(t, ctx)
+
+	const uid, space = "i41-uid", "i41-space"
+	const dmID = "fileHelper"
+	const groupNo = "i41-grp"
+	const catID = "i41-cat-ca"
+
+	// 1a. seed user_conversation_ext：DM followed_dm=1，群 ext 行（为 follow_sort 准备）。
+	db := convext.NewDB(ctx)
+	one := int8(1)
+	require.NoError(t, db.Upsert(uid, space, 1 /* DM */, dmID, convext.ConvExtFields{
+		FollowedDM: &one,
+	}))
+	require.NoError(t, db.Upsert(uid, space, 2 /* Group */, groupNo, convext.ConvExtFields{}))
+
+	// 1b. 准备 IM stub：同 reproduction，两者都来自 IM。
+	stubConvs := []*config.SyncUserConversationResp{
+		{ChannelID: dmID, ChannelType: common.ChannelTypePerson.Uint8(), Timestamp: 1_700_000_100},
+		{ChannelID: groupNo, ChannelType: common.ChannelTypeGroup.Uint8(), Timestamp: 1_700_000_200},
+	}
+
+	// 1c. categorySetting 在进程内构造（conv_ext_test 没有 group_setting 表，
+	//     与其他 integration tests 一致的处理：参见 Scene 7）。issue #41 的根因在
+	//     sidebar 的读取 + 排序路径，group_setting 的写入由 category 模块负责，
+	//     在这一层做 stub 不影响 regression 验证。
+	catCopy := catID
+	categorySetting := map[string]*GroupCategorySetting{
+		groupNo: {
+			GroupNo:           groupNo,
+			CategoryID:        &catCopy,
+			CategorySort:      0, // group_setting.category_sort
+			CategoryGroupSort: 0, // group_category.sort —— issue 中两者都在 0 桶
+		},
+	}
+
+	// runPipeline 复现 Sidebar.Sync 的剩余数据装配 + 排序步骤。
+	runPipeline := func() []*SidebarItem {
+		unfollowedList, err := db.ListUnfollowedGroups(uid, space)
+		require.NoError(t, err)
+		unfollowedGroups := map[string]struct{}{}
+		for _, m := range unfollowedList {
+			unfollowedGroups[m.TargetID] = struct{}{}
+		}
+
+		dmList, err := db.ListFollowedDM(uid, space)
+		require.NoError(t, err)
+		followedDMs := map[string]*convext.Model{}
+		for _, m := range dmList {
+			followedDMs[m.TargetID] = m
+		}
+
+		// Issue #41 fix #1: load group exts for FollowSort.
+		groupExtList, err := db.ListGroupExts(uid, space)
+		require.NoError(t, err)
+		groupExts := map[string]*convext.Model{}
+		for _, m := range groupExtList {
+			groupExts[m.TargetID] = m
+		}
+
+		// 本 case DM 没绑 category（issue #41 reproduction 的 fileHelper 也没有），
+		// dmCategorySorts 直接传 nil，避免依赖 group_setting 表。
+		items := buildFollowItems(stubConvs, categorySetting, unfollowedGroups, followedDMs, nil, groupExts, nil)
+		sortFollowItems(items)
+		return items
+	}
+
+	writeFollowSort := func(targetType uint8, targetID string, sort int) {
+		t.Helper()
+		s := sort
+		require.NoError(t, db.Upsert(uid, space, targetType, targetID, convext.ConvExtFields{
+			FollowSort: &s,
+		}))
+	}
+
+	// === Round 1: PUT [DM=1, group=2] → sidebar must return [DM, group] ===
+	writeFollowSort(1, dmID, 1)
+	writeFollowSort(2, groupNo, 2)
+
+	items := runPipeline()
+	require.Len(t, items, 2)
+	assert.Equal(t, dmID, items[0].TargetID,
+		"Round 1 (issue #41 reproduction): FollowSort=1 的 DM 必须在 FollowSort=2 的群前面")
+	assert.Equal(t, groupNo, items[1].TargetID)
+
+	// === Round 2: PUT [group=1, DM=2] → sidebar must return [group, DM] ===
+	writeFollowSort(1, dmID, 2)
+	writeFollowSort(2, groupNo, 1)
+
+	items = runPipeline()
+	require.Len(t, items, 2)
+	assert.Equal(t, groupNo, items[0].TargetID,
+		"Round 2 (issue #41 reproduction): FollowSort=1 的群必须在 FollowSort=2 的 DM 前面 —— 旧实现两次响应都恒回 [群, DM]")
+	assert.Equal(t, dmID, items[1].TargetID)
+}
+
+// Issue #41 fix #2 端到端：DM 带 dm_category_id 时必须从 group_category.sort
+// 读到对应的 CategorySort，与同 category 群进入同一排序桶。
+func TestIntegration_Sidebar_Issue41_DMCategorySortLoadedFromGroupCategory(t *testing.T) {
+	ctx := newSidebarIntegCtx(t)
+	cleanConvExtTable(t, ctx)
+
+	const uid, space = "i41b-uid", "i41b-space"
+	const dmID = "i41b-peer"
+	const catID = "i41b-cat"
+	const catSort = 77
+
+	_, err := ctx.DB().DeleteFrom("group_category").
+		Where("uid=? OR space_id=?", uid, space).Exec()
+	require.NoError(t, err)
+	_, err = ctx.DB().InsertBySql(
+		"INSERT INTO group_category (category_id, space_id, uid, name, sort, status) VALUES (?, ?, ?, ?, ?, 1)",
+		catID, space, uid, "DM-cat", catSort,
+	).Exec()
+	require.NoError(t, err)
+
+	db := convext.NewDB(ctx)
+	one := int8(1)
+	catCopy := catID
+	require.NoError(t, db.Upsert(uid, space, 1, dmID, convext.ConvExtFields{
+		FollowedDM:   &one,
+		DMCategoryID: &catCopy,
+	}))
+
+	dmList, err := db.ListFollowedDM(uid, space)
+	require.NoError(t, err)
+	require.Len(t, dmList, 1)
+	require.NotNil(t, dmList[0].DMCategoryID)
+
+	groupCategoryDB := newGroupCategoryDB(ctx)
+	sorts, err := groupCategoryDB.QueryCategorySortsByIDs([]string{*dmList[0].DMCategoryID}, uid)
+	require.NoError(t, err)
+	got, ok := sorts[catID]
+	require.True(t, ok, "DM 的 dm_category_id 必须能从 group_category 查到")
+	assert.Equal(t, catSort, got, "QueryCategorySortsByIDs 必须返回真实的 group_category.sort")
+
+	followedDMs := map[string]*convext.Model{dmID: dmList[0]}
+	stubConvs := []*config.SyncUserConversationResp{
+		{ChannelID: dmID, ChannelType: common.ChannelTypePerson.Uint8(), Timestamp: 100},
+	}
+	items := buildFollowItems(stubConvs, nil, nil, followedDMs, nil, nil, sorts)
+	require.Len(t, items, 1)
+	assert.Equal(t, catSort, items[0].CategorySort,
+		"带 dm_category_id 的 DM 必须把 group_category.sort 写到 SidebarItem.CategorySort")
 }
