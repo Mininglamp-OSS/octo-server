@@ -226,7 +226,8 @@ func (d *DB) ListThreadExts(uid, spaceID string) ([]*Model, error) {
 //   - cur != expectedVersion → ErrVersionConflict（回滚）。
 //   - 用 (target_type, target_id) 升序 FOR UPDATE 锁 user_conversation_ext 全部目标行。
 //     返回行数 != len(items) → ErrSortTargetNotFound（回滚）。
-//   - 对每一行 UPDATE follow_sort，并校验 RowsAffected==1。
+//   - 对每一行 UPDATE follow_sort。RowsAffected ∈ {0,1}：0=新值与旧值相同（无变化，
+//     仍视为成功），1=正常更新；>1 不可达（WHERE 含逻辑主键），仅作防御性守卫。
 //   - 最后在同 tx 内把 user_follow_version +1。
 //   - items 为空时什么也不做，返回 nil。
 //
@@ -292,7 +293,8 @@ func (d *DB) UpdateSort(uid, spaceID string, items []SortItem, expectedVersion i
 		return ErrSortTargetNotFound
 	}
 
-	// 3. 逐行 UPDATE follow_sort，确认 RowsAffected==1。
+	// 3. 逐行 UPDATE follow_sort。RowsAffected ∈ {0,1}（见函数注释）：0 仅意味着
+	//    新值等于旧值，仍是成功；>1 不可达，作为防御性守卫报错。
 	for i, item := range items {
 		res, err := tx.UpdateBySql(
 			"UPDATE "+table+" SET follow_sort=?"+

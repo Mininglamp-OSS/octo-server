@@ -304,8 +304,8 @@ func TestDB_UpdateSort_FirstItemUnchanged_NotConflict(t *testing.T) {
 		FollowedDM: int8Ptr(1), FollowSort: intPtr(2),
 	}))
 
-	// Keep head at position 0, swap tail (still ends up at 2).
-	// items[0]=dm-head: old=1, new=1 → affected=0 in rows-changed semantics.
+	// Submit the same order so dm-head stays at position 0 (new follow_sort=1,
+	// equal to its current value → affected=0 in rows-changed semantics).
 	err := db.UpdateSort("u1", "s1", []SortItem{
 		{TargetType: 1, TargetID: "dm-head"},
 		{TargetType: 1, TargetID: "dm-tail"},
