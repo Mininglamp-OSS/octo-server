@@ -28,6 +28,10 @@ func newDBForTest(t *testing.T) *DB {
 	ctx := config.NewContext(cfg)
 	_, err := ctx.DB().DeleteFrom(table).Exec()
 	require.NoError(t, err, "clean "+table+" before test")
+	// followVersionTable 必须一起清掉，否则上一个 test 留下的 follow_version
+	// 会让本 test 的 expectedVersion=0 失败为 ErrVersionConflict。
+	_, err = ctx.DB().DeleteFrom(followVersionTable).Exec()
+	require.NoError(t, err, "clean "+followVersionTable+" before test")
 	return NewDB(ctx)
 }
 

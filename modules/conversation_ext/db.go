@@ -306,9 +306,11 @@ func (d *DB) UpdateSort(uid, spaceID string, items []SortItem, expectedVersion i
 		if err != nil {
 			return fmt.Errorf("update sort: rows affected: %w", err)
 		}
-		if affected != 1 {
-			// 锁后行被并发删除等，逻辑上不可达。保守起见按 conflict 处理。
-			return ErrVersionConflict
+		// MySQL 驱动默认走 rows-changed 语义：新值等于旧值时 affected=0。
+		// 行的存在性已由前面的 SELECT ... FOR UPDATE + len(locked) 校验保证，
+		// 所以 affected ∈ {0, 1}，0 仅意味着无需变更，不是 conflict。
+		if affected > 1 {
+			return fmt.Errorf("update sort: unexpected rows affected=%d for (%d,%s)", affected, item.TargetType, item.TargetID)
 		}
 	}
 

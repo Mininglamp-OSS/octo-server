@@ -249,6 +249,81 @@ func TestDB_UpdateSort_CASUsesFollowVersion(t *testing.T) {
 	assert.Equal(t, int64(2), v)
 }
 
+// TestDB_UpdateSort_UnchangedSortValues_NotConflict 复现真实环境抓到的 bug：
+// 用户拖拽排序时，如果序列里某一项的新 follow_sort 等于它当前的 follow_sort
+// （最常见就是首项保持不动），MySQL 驱动默认以 rows-changed 语义返回
+// RowsAffected=0，老实现误判为 ErrVersionConflict 并整个 tx 回滚。
+//
+// 修复后：SELECT ... FOR UPDATE 已经在前面校验过 len(locked)==len(items)，
+// 行的存在性已被保证，affected==0 唯一含义是"新值等于旧值"，应当视作成功。
+func TestDB_UpdateSort_UnchangedSortValues_NotConflict(t *testing.T) {
+	ctx := newCtxForTest(t)
+	_, _ = ctx.DB().DeleteFrom(table).Exec()
+	_, _ = ctx.DB().DeleteFrom(followVersionTable).Exec()
+
+	db := NewDB(ctx)
+	fvDB := NewFollowVersionDB(ctx)
+
+	// Seed two rows already at the "target" sort values (1, 2).
+	require.NoError(t, db.Upsert("u1", "s1", 1, "dm-a", ConvExtFields{
+		FollowedDM: int8Ptr(1), FollowSort: intPtr(1),
+	}))
+	require.NoError(t, db.Upsert("u1", "s1", 1, "dm-b", ConvExtFields{
+		FollowedDM: int8Ptr(1), FollowSort: intPtr(2),
+	}))
+
+	// Submitting the same order: every row's new follow_sort equals its current
+	// value → MySQL reports RowsAffected=0 for each UPDATE. Must still succeed.
+	err := db.UpdateSort("u1", "s1", []SortItem{
+		{TargetType: 1, TargetID: "dm-a"},
+		{TargetType: 1, TargetID: "dm-b"},
+	}, 0)
+	require.NoError(t, err, "no-op sort (values unchanged) must not be reported as version conflict")
+
+	// follow_version must still advance — caller's optimistic CAS depends on it.
+	v, err := fvDB.Get("u1", "s1")
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), v)
+}
+
+// TestDB_UpdateSort_FirstItemUnchanged_NotConflict 覆盖最常见的复现路径：
+// 用户拖动列表但首项不动，items[0] 的旧值 (=1) 与新值 (i=0, i+1=1) 相同，
+// 老实现在第一次 UPDATE 就 affected=0，整个 tx 误回滚。
+func TestDB_UpdateSort_FirstItemUnchanged_NotConflict(t *testing.T) {
+	ctx := newCtxForTest(t)
+	_, _ = ctx.DB().DeleteFrom(table).Exec()
+	_, _ = ctx.DB().DeleteFrom(followVersionTable).Exec()
+
+	db := NewDB(ctx)
+
+	// dm-head sort=1 (head), dm-tail sort=2.
+	require.NoError(t, db.Upsert("u1", "s1", 1, "dm-head", ConvExtFields{
+		FollowedDM: int8Ptr(1), FollowSort: intPtr(1),
+	}))
+	require.NoError(t, db.Upsert("u1", "s1", 1, "dm-tail", ConvExtFields{
+		FollowedDM: int8Ptr(1), FollowSort: intPtr(2),
+	}))
+
+	// Keep head at position 0, swap tail (still ends up at 2).
+	// items[0]=dm-head: old=1, new=1 → affected=0 in rows-changed semantics.
+	err := db.UpdateSort("u1", "s1", []SortItem{
+		{TargetType: 1, TargetID: "dm-head"},
+		{TargetType: 1, TargetID: "dm-tail"},
+	}, 0)
+	require.NoError(t, err, "first item staying in place must not trigger version conflict")
+
+	// Final state still correct.
+	head, err := db.Get("u1", "s1", 1, "dm-head")
+	require.NoError(t, err)
+	require.NotNil(t, head)
+	assert.Equal(t, 1, head.FollowSort)
+
+	tail, err := db.Get("u1", "s1", 1, "dm-tail")
+	require.NoError(t, err)
+	require.NotNil(t, tail)
+	assert.Equal(t, 2, tail.FollowSort)
+}
+
 // TestRemoveConvExtForUserInSpace_GroupCascade_LeavesNoOrphans is a regression
 // guard for PR review Blocking #2.
 //
