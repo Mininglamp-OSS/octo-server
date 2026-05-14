@@ -800,6 +800,35 @@ func (m *Manager) sendMsg(c *wkhttp.Context) {
 		}
 		receiverName = group.Name
 	}
+	// YUJ-660 Medium-1 partial: super-admin sendMsg path also needs server-
+	// authoritative payload.space_id. /v1/manager has no SpaceMiddleware
+	// (super-admin endpoint, not Space-scoped) → senderSpaceID is "". For GROUP
+	// / COMMUNITY_TOPIC the enrichment helper writes the group's authoritative
+	// space_id; for PERSONAL the empty senderSpaceID strips any forged
+	// payload.space_id (YUJ-660 High-3 fail-open fix).
+	adminPayload := map[string]interface{}{
+		"content":  req.Content,
+		"type":     1,
+		"from_uid": req.Sender,
+	}
+	managerLookup := func(groupNo string) (string, error) {
+		g, err := m.groupService.GetGroupWithGroupNo(groupNo)
+		if err != nil {
+			return "", err
+		}
+		if g == nil {
+			return "", nil
+		}
+		return g.SpaceID, nil
+	}
+	adminPayload = enrichPayloadWithSpaceIDCore(
+		req.ReceivedChannelID,
+		uint8(req.ReceivedChannelType),
+		adminPayload,
+		"", // super-admin path has no sender SpaceID
+		managerLookup,
+		func(s string, fields ...zap.Field) { m.Warn(s, fields...) },
+	)
 	err = m.ctx.SendMessage(&config.MsgSendReq{
 		Header: config.MsgHeader{
 			RedDot: 1,
@@ -807,11 +836,7 @@ func (m *Manager) sendMsg(c *wkhttp.Context) {
 		FromUID:     req.Sender,
 		ChannelID:   req.ReceivedChannelID,
 		ChannelType: uint8(req.ReceivedChannelType),
-		Payload: []byte(util.ToJson(map[string]interface{}{
-			"content":  req.Content,
-			"type":     1,
-			"from_uid": req.Sender,
-		})),
+		Payload:     []byte(util.ToJson(adminPayload)),
 	})
 	if err != nil {
 		m.Error("发送消息错误", zap.Error(err))

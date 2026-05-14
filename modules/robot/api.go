@@ -108,8 +108,11 @@ type Robot struct {
 	inlineQueryEventResultChanMap     map[string]chan *InlineQueryResult
 	inlineQueryEventResultChanMapLock sync.RWMutex
 	mentionRegexp                     *regexp.Regexp
-	creatorCache                      sync.Map // robotID -> creatorUID 缓存
+	creatorCache                      sync.Map      // robotID -> creatorUID 缓存
 	msgSem                            chan struct{} // semaphore to limit concurrent message processing goroutines
+	// spaceQuerier overrides &rb.db for enrichBotPayloadWithSpaceID (test injection).
+	// nil in production; tests set it to stub the DB call deterministically.
+	spaceQuerier robotSpaceQuerier
 }
 
 func New(ctx *config.Context) *Robot {

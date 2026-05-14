@@ -689,14 +689,10 @@ func (bf *BotFather) sendMessage(c *wkhttp.Context) {
 
 	channelID := bf.resolveSpaceChannelID(robotID, req.ChannelID, req.ChannelType)
 
-	// YUJ-644 / Mininglamp-OSS#33: PERSONAL DM 派发前服务端权威 space_id 注入。
-	// 详见 modules/bot_api/space_inject.go 的 design 注释。这里复用相同语义但
-	// 直接落 botfatherDB 的 querySpaceIDByRobotID（botfather 路由是 User Bot 专属）。
-	payload := req.Payload
-	if req.ChannelType == common.ChannelTypePerson.Uint8() {
-		payload = bf.enrichBotPayloadWithSpaceID(robotID, payload)
-	}
-
+	// NOTE: This handler is currently NOT routed (the active /v1/bot/sendMessage
+	// route is wired through modules/bot_api/bot_api.go to ba.sendMessage). It is
+	// kept here as legacy code for the older /v1/botfather surface. Authoritative
+	// space_id enrichment is performed by the active route only.
 	result, err := bf.ctx.SendMessageWithResult(&config.MsgSendReq{
 		Header: config.MsgHeader{
 			RedDot: 1,
@@ -705,7 +701,7 @@ func (bf *BotFather) sendMessage(c *wkhttp.Context) {
 		ChannelID:   channelID,
 		ChannelType: req.ChannelType,
 		FromUID:     robotID,
-		Payload:     []byte(util.ToJson(payload)),
+		Payload:     []byte(util.ToJson(req.Payload)),
 	})
 	if err != nil {
 		bf.Error("发送消息失败", zap.Error(err))

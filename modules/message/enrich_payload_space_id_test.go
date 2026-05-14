@@ -100,13 +100,15 @@ func TestEnrichPayloadWithSpaceIDCore_CommunityTopicOverwritesForgedClientSpaceI
 	assert.Equal(t, []string{parentNo}, stub.calls)
 }
 
-func TestEnrichPayloadWithSpaceIDCore_PersonalRespectsExistingSpaceID(t *testing.T) {
-	// PERSONAL (DM) 场景，senderSpaceID 为空时（兼容老客户端 / 非 Space 部署）保留
-	// sender 上送的 space_id 约定，向前兼容。这是 senderSpaceID == "" 的 fallback。
+func TestEnrichPayloadWithSpaceIDCore_PersonalEmptySenderStripsClientSpaceID(t *testing.T) {
+	// YUJ-660 High-3 fail-open fix：senderSpaceID 为空（SpaceMiddleware 未注入）
+	// 时，payload.space_id 被无条件剥离，避免攻击者用 forged payload.space_id +
+	// 省略 X-Space-ID 的方式绕过权威覆盖。
 	stub := &groupSpaceLookupStub{}
-	payload := map[string]interface{}{"content": "hi", "space_id": "spaceA"}
+	payload := map[string]interface{}{"content": "hi", "space_id": "spaceA_forged"}
 	got := enrichPayloadWithSpaceIDCore("peer_uid", common.ChannelTypePerson.Uint8(), payload, "", stub.lookup, silentLog)
-	assert.Equal(t, "spaceA", got["space_id"], "PERSONAL senderSpaceID 为空时应保留 sender 上送的 space_id（兼容路径）")
+	_, ok := got["space_id"]
+	assert.False(t, ok, "PERSONAL senderSpaceID 为空时必须剥离客户端 payload.space_id")
 	assert.Empty(t, stub.calls, "PERSONAL 路径不应查群表")
 }
 
@@ -146,19 +148,21 @@ func TestEnrichPayloadWithSpaceIDCore_PersonalEmptySenderEmitsObservabilityWarn(
 	assert.Contains(t, captured, "enrich_payload_space_id_empty", "应发出 empty-space_id 监控 warn")
 }
 
-func TestEnrichPayloadWithSpaceIDCore_PersonalEmptySenderClientSpaceIDStillRespected(t *testing.T) {
-	// 当 senderSpaceID 为空但客户端上送了 space_id（老客户端 + 非 Space 路由）—— 保留。
-	// 不发监控 warn（payload 已有信号）。
+func TestEnrichPayloadWithSpaceIDCore_PersonalEmptySenderStripsAndWarns(t *testing.T) {
+	// YUJ-660 High-3：senderSpaceID 为空 + 客户端上送了 space_id —— 必须剥离，
+	// 同时发监控 warn 标记 client_space_id_stripped=true，便于运维识别 fail-open
+	// 绕过尝试。
 	stub := &groupSpaceLookupStub{}
 	var captured []string
 	captureLog := func(msg string, _ ...zap.Field) {
 		captured = append(captured, msg)
 	}
-	payload := map[string]interface{}{"content": "hi", "space_id": "spaceA"}
+	payload := map[string]interface{}{"content": "hi", "space_id": "spaceA_forged"}
 	got := enrichPayloadWithSpaceIDCore("peer_uid", common.ChannelTypePerson.Uint8(), payload, "", stub.lookup, captureLog)
-	assert.Equal(t, "spaceA", got["space_id"])
-	assert.NotContains(t, captured, "enrich_payload_space_id_empty",
-		"payload 已有 space_id 时不应发监控 warn")
+	_, ok := got["space_id"]
+	assert.False(t, ok, "客户端上送的 space_id 必须被剥离")
+	assert.Contains(t, captured, "enrich_payload_space_id_empty",
+		"剥离时仍应发出 empty-space_id 监控 warn")
 }
 
 func TestEnrichPayloadWithSpaceIDCore_ExistingEmptyStringOverwritten(t *testing.T) {

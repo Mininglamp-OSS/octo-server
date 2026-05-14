@@ -35,7 +35,23 @@ type BotAPI struct {
 	voiceDB       *voice.VoiceDB
 	voiceSvc      *voice.VoiceService
 	voiceCfg      *voice.VoiceConfig
+	// spaceQuerier overrides ba.db for resolveBotActiveSpaceID (test injection).
+	// nil in production; tests set it to stub the DB call deterministically.
+	spaceQuerier botSpaceQuerier
+	// dispatchOverride lets tests intercept the IM dispatch call to capture the
+	// final MsgSendReq (including server-authoritative payload.space_id).
+	// nil in production; the real path goes through ba.ctx.SendMessageWithResult.
+	dispatchOverride func(*config.MsgSendReq) (*config.MsgSendResp, error)
 	log.Log
+}
+
+// dispatchMsgSendReq sends a built MsgSendReq to WuKongIM via ba.ctx, OR to a
+// test-injected dispatchOverride for handler-level integration tests.
+func (ba *BotAPI) dispatchMsgSendReq(req *config.MsgSendReq) (*config.MsgSendResp, error) {
+	if ba.dispatchOverride != nil {
+		return ba.dispatchOverride(req)
+	}
+	return ba.ctx.SendMessageWithResult(req)
 }
 
 // NewBotAPI creates the Bot API gateway module.
@@ -139,6 +155,10 @@ func (ba *BotAPI) resolveBotDisplayName(robotID string) string {
 
 // clearTypingThrottle resets the typing throttle state (called after bot sends a message).
 func (ba *BotAPI) clearTypingThrottle(robotID string, channelID string, channelType uint8) {
+	if ba.ctx == nil {
+		// Test contexts may not wire ctx; nothing to clear.
+		return
+	}
 	typingStartKey := fmt.Sprintf("typing_start:%s:%s:%d", robotID, channelID, channelType)
 	typingCountKey := fmt.Sprintf("typing_count:%s:%s:%d", robotID, channelID, channelType)
 	ba.ctx.GetRedisConn().Del(typingStartKey)

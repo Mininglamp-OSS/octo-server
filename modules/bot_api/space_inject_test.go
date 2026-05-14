@@ -1,28 +1,54 @@
-// Package bot_api · YUJ-644 / Mininglamp-OSS#33 unit tests for
+// Package bot_api · YUJ-644 / Mininglamp-OSS#33 / YUJ-660 unit tests for
 // PERSONAL DM payload.space_id authoritative injection.
 //
-// 真实集成测试（HTTP + DB）见 modules/bot_api/send_test.go 中的相邻 cases；
-// 这里覆盖 enrichBotPayloadWithSpaceID 的纯逻辑分支：scope=space → ctx 路径，
-// 缺省 → fallback DB 路径，DB 失败 → 不阻断，空 SpaceID → 监控 warn。
+// Coverage:
+//   - resolveBotActiveSpaceID branch contract (ctx fast path vs DB fallback)
+//   - enrichBotPayloadWithSpaceID overrides forged client space_id
+//   - Medium-2 fix: dbr.ErrNotFound 不再被当成 DB 错误（无 false-positive warn），
+//     fall through 到 empty-space_id observability warn
+//   - Medium-4 fix: 用 fakeSpaceQuerier 桩 querySpaceIDByRobotID 并断言被调用
 package bot_api
 
 import (
 	"errors"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/gin-gonic/gin"
+	"github.com/gocraft/dbr/v2"
 	"github.com/stretchr/testify/assert"
 )
 
-// resolveBotActiveSpaceID 是混入 *BotAPI.db 的 query，因此这里走"包内 helper"
-// 测试：直接调用 enrichBotPayloadWithSpaceID 的纯分支需要桩 db；为简化，把 ctx
-// 路径单独抽出一个不依赖 db 的小测试。
+// fakeSpaceQuerier records the calls and returns scripted (spaceID, err) per robotID.
+type fakeSpaceQuerier struct {
+	calls   []string
+	results map[string]struct {
+		spaceID string
+		err     error
+	}
+	defaultSpace string
+	defaultErr   error
+}
 
-// fakeWkContext 创建一个最小可用的 wkhttp.Context（gin context wrapper）。
+func (f *fakeSpaceQuerier) querySpaceIDByRobotID(robotID string) (string, error) {
+	f.calls = append(f.calls, robotID)
+	if r, ok := f.results[robotID]; ok {
+		return r.spaceID, r.err
+	}
+	return f.defaultSpace, f.defaultErr
+}
+
+// fakeWkContext creates a minimal wkhttp.Context (gin context wrapper).
 func fakeWkContext() *wkhttp.Context {
 	c, _ := gin.CreateTestContext(nil)
 	return &wkhttp.Context{Context: c}
+}
+
+// newTestBotAPI builds a *BotAPI with logger wired and the given spaceQuerier
+// stub injected. Avoids nil-panic when the helper calls ba.Warn / ba.Error.
+func newTestBotAPI(q botSpaceQuerier) *BotAPI {
+	return &BotAPI{Log: log.NewTLog("BotAPI-test"), spaceQuerier: q}
 }
 
 func TestResolveBotActiveSpaceID_AppBotScopeSpace_UsesCtxValue(t *testing.T) {
@@ -34,14 +60,47 @@ func TestResolveBotActiveSpaceID_AppBotScopeSpace_UsesCtxValue(t *testing.T) {
 	assert.Equal(t, "spaceA", got, "App Bot scope=space 应直接使用 ctx 写入的 SpaceID（无 DB）")
 }
 
-func TestResolveBotActiveSpaceID_AppBotScopeSpaceMissingValue(t *testing.T) {
-	ba := &BotAPI{}
+func TestResolveBotActiveSpaceID_AppBotScopeSpace_MissingValueFallsBackToDB(t *testing.T) {
+	// Medium-4 fix：scope=space 但 ctx 缺 SpaceID 值 → 必须 fallback 到 DB。
+	// 用 fakeSpaceQuerier 替换 ba.db，断言 query 被以正确 robotID 调用。
+	q := &fakeSpaceQuerier{defaultSpace: "spaceFromDB"}
+	ba := newTestBotAPI(q)
 	c := fakeWkContext()
 	c.Set(CtxKeyAppBotScope, "space")
-	// CtxKeyAppBotSpaceID 故意不写入 → 跳到 DB fallback；db 为 nil 会 panic
-	// 触发 robot 路径前我们捕获 panic 来锁住"必须 fallback 才走 DB"的契约。
-	defer func() { _ = recover() }()
-	_ = ba.resolveBotActiveSpaceID(c, "bot_robot_2")
+	// CtxKeyAppBotSpaceID 故意不写入 → 必须 fallback 到 DB
+	got := ba.resolveBotActiveSpaceID(c, "bot_robot_2")
+	assert.Equal(t, "spaceFromDB", got)
+	assert.Equal(t, []string{"bot_robot_2"}, q.calls,
+		"scope=space 缺 SpaceID 时必须以 robotID fallback 调 querySpaceIDByRobotID")
+}
+
+func TestResolveBotActiveSpaceID_NonAppScope_UsesDB(t *testing.T) {
+	q := &fakeSpaceQuerier{defaultSpace: "spaceUserBot"}
+	ba := newTestBotAPI(q)
+	c := fakeWkContext()
+	// scope 不是 "space"（User Bot 或 App Bot scope=platform）
+	got := ba.resolveBotActiveSpaceID(c, "user_bot_1")
+	assert.Equal(t, "spaceUserBot", got)
+	assert.Equal(t, []string{"user_bot_1"}, q.calls)
+}
+
+func TestResolveBotActiveSpaceID_DBErrNotFound_NoWarnNoSpace(t *testing.T) {
+	// Medium-2 fix：querySpaceIDByRobotID 返回 dbr.ErrNotFound 表示 Bot 没归属
+	// 任何 Space（孤儿 Bot / 非 Space 部署），不是 DB 错误。helper 必须返回 ""
+	// 而不向 ba.Warn 发 false-positive DB-failure 日志。
+	q := &fakeSpaceQuerier{defaultErr: dbr.ErrNotFound}
+	ba := newTestBotAPI(q)
+	c := fakeWkContext()
+	got := ba.resolveBotActiveSpaceID(c, "orphan_bot")
+	assert.Equal(t, "", got, "ErrNotFound → 空 SpaceID")
+}
+
+func TestResolveBotActiveSpaceID_DBRealError_ReturnsEmpty(t *testing.T) {
+	q := &fakeSpaceQuerier{defaultErr: errors.New("connection refused")}
+	ba := newTestBotAPI(q)
+	c := fakeWkContext()
+	got := ba.resolveBotActiveSpaceID(c, "bot_with_db_error")
+	assert.Equal(t, "", got, "真实 DB 错误也返回 ''，让上层走 fail-open 不阻断发送")
 }
 
 func TestEnrichBotPayloadWithSpaceID_AppBotScopeSpace_OverridesClient(t *testing.T) {
@@ -54,6 +113,29 @@ func TestEnrichBotPayloadWithSpaceID_AppBotScopeSpace_OverridesClient(t *testing
 	assert.Equal(t, "spaceAuth", got["space_id"], "PERSONAL 必须用服务端权威 SpaceID 覆盖客户端伪造值")
 }
 
+func TestEnrichBotPayloadWithSpaceID_DBPathOverridesClient(t *testing.T) {
+	q := &fakeSpaceQuerier{defaultSpace: "spaceDB"}
+	ba := newTestBotAPI(q)
+	c := fakeWkContext()
+	payload := map[string]interface{}{"content": "hi", "space_id": "spaceForged"}
+	got := ba.enrichBotPayloadWithSpaceID(c, "user_bot_1", payload)
+	assert.Equal(t, "spaceDB", got["space_id"])
+}
+
+func TestEnrichBotPayloadWithSpaceID_ErrNotFoundFallsThroughToWarnPath(t *testing.T) {
+	// 当 Bot 没有归属 Space（ErrNotFound），spaceID="" → enrichBotPayloadWithSpaceID
+	// 不写入 space_id；如果 client 未上送（空），落 empty-warn 分支。客户端上送的
+	// space_id 在 bot_api 层不主动剥离 —— message 层的 enrichPayloadWithSpaceIDCore
+	// 会在 senderSpaceID == "" 时统一 strip，YUJ-660 High-3 fix 已闭环。
+	q := &fakeSpaceQuerier{defaultErr: dbr.ErrNotFound}
+	ba := newTestBotAPI(q)
+	c := fakeWkContext()
+	payload := map[string]interface{}{"content": "hi"}
+	got := ba.enrichBotPayloadWithSpaceID(c, "orphan_bot", payload)
+	_, ok := got["space_id"]
+	assert.False(t, ok, "ErrNotFound 时不应注入 space_id")
+}
+
 func TestEnrichBotPayloadWithSpaceID_NilPayloadInitialized(t *testing.T) {
 	ba := &BotAPI{}
 	c := fakeWkContext()
@@ -63,8 +145,3 @@ func TestEnrichBotPayloadWithSpaceID_NilPayloadInitialized(t *testing.T) {
 	assert.NotNil(t, got)
 	assert.Equal(t, "spaceAuth", got["space_id"])
 }
-
-// errSentinel 用于触发 querySpaceIDByRobotID 失败路径。当前 helper 直接
-// 调用 ba.db；这里通过 monkey-replace 不优雅，先以 ctx-路径覆盖关键
-// 不变量；DB 失败 / 空 SpaceID 路径在更高层（HTTP 集成测试）覆盖。
-var _ = errors.New

@@ -12,6 +12,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/gocraft/dbr/v2"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
@@ -261,6 +262,23 @@ func (m *Message) pinnedMessage(c *wkhttp.Context) {
 			content = common.GetDisplayText(contentType)
 		}
 		mesageContent := fmt.Sprintf("{0} 置顶了%s", content)
+		// YUJ-660 Medium-1 partial: 此 Tip 在 PERSONAL DM 上同样需要服务端权威
+		// payload.space_id（GROUP / COMMUNITY_TOPIC 也走同一条路径，由 enrich
+		// 函数按 channelType 分派到群表 / 父群权威源 / sender SpaceID）。
+		// 不直接调 m.ctx.SendMessage 绕过 enrichment。
+		tipPayload := map[string]interface{}{
+			"from_uid":  loginUID,
+			"from_name": loginName,
+			"content":   mesageContent,
+			"extra": []config.UserBaseVo{
+				{
+					UID:  loginUID,
+					Name: loginName,
+				},
+			},
+			"type": common.Tip,
+		}
+		tipPayload = m.enrichPayloadWithSpaceID(req.ChannelID, req.ChannelType, tipPayload, spacepkg.GetSpaceID(c))
 		err = m.ctx.SendMessage(&config.MsgSendReq{
 			Header: config.MsgHeader{
 				NoPersist: 0,
@@ -270,18 +288,7 @@ func (m *Message) pinnedMessage(c *wkhttp.Context) {
 			ChannelID:   req.ChannelID,
 			ChannelType: req.ChannelType,
 			FromUID:     loginUID,
-			Payload: []byte(util.ToJson(map[string]interface{}{
-				"from_uid":  loginUID,
-				"from_name": loginName,
-				"content":   mesageContent,
-				"extra": []config.UserBaseVo{
-					{
-						UID:  loginUID,
-						Name: loginName,
-					},
-				},
-				"type": common.Tip,
-			})),
+			Payload:     []byte(util.ToJson(tipPayload)),
 		})
 		if err != nil {
 			m.Warn("发送解散群消息错误", zap.Error(err))

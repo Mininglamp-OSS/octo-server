@@ -67,7 +67,7 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 		payload = ba.enrichBotPayloadWithSpaceID(c, robotID, payload)
 	}
 
-	result, err := ba.ctx.SendMessageWithResult(&config.MsgSendReq{
+	msgReq := &config.MsgSendReq{
 		Header: config.MsgHeader{
 			RedDot: 1,
 		},
@@ -76,7 +76,8 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 		ChannelType: req.ChannelType,
 		FromUID:     robotID,
 		Payload:     []byte(util.ToJson(payload)),
-	})
+	}
+	result, err := ba.dispatchMsgSendReq(msgReq)
 	if err != nil {
 		ba.Error("发送消息失败", zap.Error(err))
 		c.ResponseError(errors.New("发送消息失败"))

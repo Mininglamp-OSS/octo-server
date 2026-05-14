@@ -512,10 +512,11 @@ func (m *Message) enrichPayloadWithSpaceID(channelID string, channelType uint8, 
 // 导致跨 Space 信号污染。新版本对 Group / CommunityTopic 一律以群表/父群
 // SpaceID 为准，无论客户端是否上送 space_id。
 //
-// PERSONAL（YUJ-644）：senderSpaceID 是 SpaceMiddleware 已校验的发送方 Space
-// 上下文（X-Space-ID / query?space_id），非空时覆盖 payload.space_id 作为服务端
-// 权威值；空串时保持老 passthrough，兼容非 Space 部署和老客户端不带 X-Space-ID
-// 的场景（这种场景下没有跨 Space 风险，因为发送方根本没有声明 Space 归属）。
+// PERSONAL（YUJ-644 / YUJ-660 High-3）：senderSpaceID 是 SpaceMiddleware 已校验
+// 的发送方 Space 上下文（X-Space-ID / query?space_id），非空时覆盖 payload.space_id
+// 作为服务端权威值；空串时无条件剥离 payload.space_id（YUJ-660 fail-open 修复，
+// 见下文 PERSONAL case 注释），不再相信客户端在 SpaceMiddleware opt-in 缺失下
+// 提交的任何 space_id。
 //
 // 内部 emitWarn helper：当 PERSONAL 派发后 payload.space_id 仍为空时记一条结构化
 // warn 日志（key=enrich_payload_space_id_empty=true），可作为日志告警的稳态指标。
@@ -576,23 +577,28 @@ func enrichPayloadWithSpaceIDCore(
 	case common.ChannelTypePerson.Uint8():
 		// YUJ-644 / Mininglamp-OSS#33：PERSONAL DM 用发送方 SpaceMiddleware 已校验
 		// 的 SpaceID 覆盖客户端上送，作为客户端 SpaceFilter 的权威信号源。
-		// senderSpaceID == "" 表示发送方未声明 Space（非 Space 部署 / 老客户端没
-		// 带 X-Space-ID），保持老 passthrough。
 		if senderSpaceID != "" {
 			payload["space_id"] = senderSpaceID
 			return payload
 		}
-		// 监测：未设置 senderSpaceID 且 payload.space_id 仍为空 → 派发后客户端
-		// 走 fail-open 兼容分支。稳态下应为 0，看到非零持续上升即说明仍有路径
-		// 绕过 SpaceMiddleware 透传。
+		// YUJ-660 (High-3 FAIL-OPEN fix): senderSpaceID == "" 表示发送方未声明 Space
+		// (非 Space 部署 / 老客户端没带 X-Space-ID)。在这条路径下任何客户端
+		// payload.space_id 都不可信 —— 攻击者只要省略 X-Space-ID 即可塞入伪造值。
+		// 服务端无条件剥离，避免 SpaceMiddleware 的 opt-in 语义留下 fail-open 缝隙。
+		// 这与 GROUP / COMMUNITY_TOPIC 的"老群无 SpaceID 时删除客户端伪造 space_id"
+		// 行为对齐：当服务端无可信权威值时，不允许客户端旁路注入信号。
+		_, hadClientSpaceID := payload["space_id"]
+		delete(payload, "space_id")
 		if logWarn != nil {
-			if cur, _ := payload["space_id"].(string); cur == "" {
-				logWarn("enrich_payload_space_id_empty",
-					zap.Bool("enrich_payload_space_id_empty", true),
-					zap.String("channelID", channelID),
-					zap.Uint8("channelType", channelType),
-				)
-			}
+			// 监测：未设置 senderSpaceID → 派发后收端走 fail-open 兼容分支。
+			// 稳态下应为 0；非零持续上升即说明仍有路径绕过 SpaceMiddleware 透传，
+			// 或老客户端在 Space 路由上不带 X-Space-ID。
+			logWarn("enrich_payload_space_id_empty",
+				zap.Bool("enrich_payload_space_id_empty", true),
+				zap.Bool("client_space_id_stripped", hadClientSpaceID),
+				zap.String("channelID", channelID),
+				zap.Uint8("channelType", channelType),
+			)
 		}
 		return payload
 	}
