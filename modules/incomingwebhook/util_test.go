@@ -74,6 +74,25 @@ func TestBuildPayload_ExtraDoesNotOverrideKeyFields(t *testing.T) {
 	assert.Equal(t, "https://x", p["link"])
 }
 
+func TestBuildPayload_SpaceIDFromModelNotExtra(t *testing.T) {
+	m := &incomingWebhookModel{WebhookID: "iwh_x", Name: "WH", SpaceID: "real_space"}
+	req := &pushPayloadReq{
+		Content: "hi",
+		Extra: map[string]interface{}{
+			"space_id": "forged_space",
+		},
+	}
+	p := buildPayload(m, req)
+	assert.Equal(t, "real_space", p["space_id"], "space_id must come from model, not Extra")
+}
+
+func TestBuildPayload_SpaceIDSetEvenWhenExtraOmitsIt(t *testing.T) {
+	m := &incomingWebhookModel{WebhookID: "iwh_x", Name: "WH", SpaceID: "real_space"}
+	req := &pushPayloadReq{Content: "hi"}
+	p := buildPayload(m, req)
+	assert.Equal(t, "real_space", p["space_id"])
+}
+
 func TestPublicURL(t *testing.T) {
 	got := publicURL("iwh_abc", "tk")
 	assert.Equal(t, "/v1/incoming-webhooks/iwh_abc/tk", got)
