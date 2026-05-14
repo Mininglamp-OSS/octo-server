@@ -642,12 +642,15 @@ func buildPayload(m *incomingWebhookModel, req *pushPayloadReq) map[string]inter
 	if len(req.Extra) > 0 {
 		// 透传白名单字段，避免覆盖关键字段
 		for k, v := range req.Extra {
-			if k == "type" || k == "content" || k == "from" || k == "mention" {
+			if k == "type" || k == "content" || k == "from" || k == "mention" || k == "space_id" {
 				continue
 			}
 			payload[k] = v
 		}
 	}
+	// space_id 必须由服务端从 group 表派生，不接受调用方覆盖，
+	// 防止 webhook 消息被伪造到其他 Space。
+	payload["space_id"] = m.SpaceID
 	return payload
 }
 
