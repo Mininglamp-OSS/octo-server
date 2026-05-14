@@ -4,9 +4,11 @@
 // Coverage:
 //   - resolveBotActiveSpaceID branch contract (ctx fast path vs DB fallback)
 //   - enrichBotPayloadWithSpaceID overrides forged client space_id
-//   - Medium-2 fix: dbr.ErrNotFound 不再被当成 DB 错误（无 false-positive warn），
-//     fall through 到 empty-space_id observability warn
+//   - Medium-2 fix: dbr.ErrNotFound 不再被当成 DB 错误（无 false-positive warn）
 //   - Medium-4 fix: 用 fakeSpaceQuerier 桩 querySpaceIDByRobotID 并断言被调用
+//   - R3 Finding A fix: resolver 返回 ""（任何原因）→ enrich 必须 strip client
+//     上送的 payload.space_id（fail-closed），不能 preserve。具体覆盖：
+//     ErrNotFound + forged client → strip；real DB error + forged client → strip。
 package bot_api
 
 import (
@@ -122,18 +124,44 @@ func TestEnrichBotPayloadWithSpaceID_DBPathOverridesClient(t *testing.T) {
 	assert.Equal(t, "spaceDB", got["space_id"])
 }
 
-func TestEnrichBotPayloadWithSpaceID_ErrNotFoundFallsThroughToWarnPath(t *testing.T) {
-	// 当 Bot 没有归属 Space（ErrNotFound），spaceID="" → enrichBotPayloadWithSpaceID
-	// 不写入 space_id；如果 client 未上送（空），落 empty-warn 分支。客户端上送的
-	// space_id 在 bot_api 层不主动剥离 —— message 层的 enrichPayloadWithSpaceIDCore
-	// 会在 senderSpaceID == "" 时统一 strip，YUJ-660 High-3 fix 已闭环。
+func TestEnrichBotPayloadWithSpaceID_ErrNotFound_StripsClientSpaceID(t *testing.T) {
+	// YUJ-660 R3 Finding A：当 Bot 没有归属 Space（ErrNotFound），enrich 必须 strip
+	// 任何 client 上送的 payload.space_id（fail-closed）。message 层的 strip 只在
+	// /v1/message/send 路径生效，bot_api 路径必须独立 strip 否则 forged
+	// payload.space_id 会跨 Space 派发。
+	q := &fakeSpaceQuerier{defaultErr: dbr.ErrNotFound}
+	ba := newTestBotAPI(q)
+	c := fakeWkContext()
+	payload := map[string]interface{}{"content": "hi", "space_id": "spaceForged"}
+	got := ba.enrichBotPayloadWithSpaceID(c, "orphan_bot", payload)
+	_, ok := got["space_id"]
+	assert.False(t, ok,
+		"ErrNotFound + forged client space_id：bot_api 必须 strip，否则跨 Space 派发")
+}
+
+func TestEnrichBotPayloadWithSpaceID_OrphanBot_NoForgedClient_NoSpaceInjected(t *testing.T) {
+	// 孤儿 Bot + client 未上送：不注入 space_id，发 enrich_payload_space_id_empty warn。
 	q := &fakeSpaceQuerier{defaultErr: dbr.ErrNotFound}
 	ba := newTestBotAPI(q)
 	c := fakeWkContext()
 	payload := map[string]interface{}{"content": "hi"}
 	got := ba.enrichBotPayloadWithSpaceID(c, "orphan_bot", payload)
 	_, ok := got["space_id"]
-	assert.False(t, ok, "ErrNotFound 时不应注入 space_id")
+	assert.False(t, ok)
+}
+
+func TestEnrichBotPayloadWithSpaceID_RealDBError_StripsClientSpaceID(t *testing.T) {
+	// YUJ-660 R3 Finding A：真实 DB 错误（network blip / failover）也走 strip
+	// 路径，不能保留 client 上送 payload.space_id。攻击者构造 DB 错误条件 + forged
+	// payload 是已知攻击面，本测试是 regression guard。
+	q := &fakeSpaceQuerier{defaultErr: errors.New("connection refused")}
+	ba := newTestBotAPI(q)
+	c := fakeWkContext()
+	payload := map[string]interface{}{"content": "hi", "space_id": "spaceVictim"}
+	got := ba.enrichBotPayloadWithSpaceID(c, "bot_with_db_error", payload)
+	_, ok := got["space_id"]
+	assert.False(t, ok,
+		"DB 错误 + forged client space_id：bot_api 必须 strip，否则攻击者借 DB blip 跨 Space 派发")
 }
 
 func TestEnrichBotPayloadWithSpaceID_NilPayloadInitialized(t *testing.T) {

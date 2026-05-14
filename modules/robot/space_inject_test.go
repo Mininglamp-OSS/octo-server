@@ -46,22 +46,38 @@ func TestEnrichBotPayloadWithSpaceID_NilPayloadInitialized(t *testing.T) {
 	assert.Equal(t, "spaceAuth", got["space_id"])
 }
 
-func TestEnrichBotPayloadWithSpaceID_ErrNotFound_NoDBWarn_NoSpaceInjected(t *testing.T) {
-	// YUJ-660 Medium-2：dbr.ErrNotFound 是合法状态，不报 DB 错误。
+func TestEnrichBotPayloadWithSpaceID_ErrNotFound_StripsClientSpaceID(t *testing.T) {
+	// YUJ-660 R3 Finding A：孤儿 Bot (ErrNotFound) + forged client space_id →
+	// strip。fail-closed 语义：服务端无可信 SpaceID 时绝不允许客户端注入信号。
+	q := &fakeRobotSpaceQuerier{err: dbr.ErrNotFound}
+	rb := newTestRobot(q)
+	payload := map[string]interface{}{"content": "hi", "space_id": "spaceForged"}
+	got := rb.enrichBotPayloadWithSpaceID("orphan_bot", payload)
+	_, ok := got["space_id"]
+	assert.False(t, ok, "ErrNotFound + forged client space_id 必须 strip")
+	assert.Equal(t, []string{"orphan_bot"}, q.calls)
+}
+
+func TestEnrichBotPayloadWithSpaceID_OrphanBot_NoForgedClient_NoSpaceInjected(t *testing.T) {
+	// 孤儿 Bot + client 未上送：不注入 space_id，发 enrich_payload_space_id_empty warn。
 	q := &fakeRobotSpaceQuerier{err: dbr.ErrNotFound}
 	rb := newTestRobot(q)
 	payload := map[string]interface{}{"content": "hi"}
 	got := rb.enrichBotPayloadWithSpaceID("orphan_bot", payload)
 	_, ok := got["space_id"]
-	assert.False(t, ok, "ErrNotFound 时不应注入 space_id")
-	assert.Equal(t, []string{"orphan_bot"}, q.calls)
+	assert.False(t, ok, "孤儿 Bot 时不应注入 space_id")
 }
 
-func TestEnrichBotPayloadWithSpaceID_RealDBError_PreservesPayload(t *testing.T) {
-	// 真实 DB 错误：保持 payload 原样，不阻断发送。
+func TestEnrichBotPayloadWithSpaceID_RealDBError_StripsClientSpaceID(t *testing.T) {
+	// YUJ-660 R3 Finding A — INVERTED from prior _PreservesPayload behavior.
+	// 真实 DB 错误（network blip / failover）时也走 strip 路径，不能保留 client
+	// payload.space_id。攻击者可以构造 DB 错误 + forged payload 跨 Space 派发，
+	// 必须 fail-closed strip。
 	q := &fakeRobotSpaceQuerier{err: errors.New("connection refused")}
 	rb := newTestRobot(q)
-	payload := map[string]interface{}{"content": "hi", "space_id": "spaceX"}
+	payload := map[string]interface{}{"content": "hi", "space_id": "spaceVictim"}
 	got := rb.enrichBotPayloadWithSpaceID("bot_with_db_error", payload)
-	assert.Equal(t, "spaceX", got["space_id"], "真实 DB 错误下 payload 不动")
+	_, ok := got["space_id"]
+	assert.False(t, ok,
+		"DB 错误 + forged client space_id：robot 必须 strip，不能 preserve（fail-closed）")
 }

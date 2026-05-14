@@ -806,6 +806,17 @@ func (m *Manager) sendMsg(c *wkhttp.Context) {
 	// / COMMUNITY_TOPIC the enrichment helper writes the group's authoritative
 	// space_id; for PERSONAL the empty senderSpaceID strips any forged
 	// payload.space_id (YUJ-660 High-3 fail-open fix).
+	//
+	// YUJ-660 R3 Finding C — product clarification: super-admin PERSONAL DMs
+	// are intentionally Space-agnostic (operations / support broadcasts cut
+	// across Spaces). Because /v1/manager carries no SpaceMiddleware and the
+	// admin has no per-call Space context to propagate, the dispatched payload
+	// has no space_id field on PERSONAL — receiver clients then render the
+	// message in any Space view. This is the expected behavior, not a bug;
+	// changing it requires a product decision about whether super-admin DMs
+	// should be Space-bound. Group / CommunityTopic still get authoritative
+	// SpaceID from the group lookup, so cross-Space leak via admin GROUP send
+	// is not possible.
 	adminPayload := map[string]interface{}{
 		"content":  req.Content,
 		"type":     1,

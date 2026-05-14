@@ -14,6 +14,7 @@ package bot_api
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -179,4 +180,123 @@ func TestSendMessage_PersonalDM_OrphanBotNoForgedClientSpaceID(t *testing.T) {
 	_, hasSpaceID := dispatchedPayload["space_id"]
 	assert.False(t, hasSpaceID,
 		"orphan bot with no client-supplied space_id → dispatched payload must not contain space_id")
+}
+
+// TestSendMessage_PersonalDM_OrphanBot_ForgedClientSpaceID_Stripped is the
+// YUJ-660 R3 Finding A regression guard. An orphan bot (querySpaceIDByRobotID
+// returns "" with no error) combined with an attacker-forged
+// payload.space_id MUST result in payload.space_id being stripped from the
+// dispatched MsgSendReq. Before the fix this test would FAIL — the dispatched
+// payload preserved the forged client value, leaking across Spaces.
+func TestSendMessage_PersonalDM_OrphanBot_ForgedClientSpaceID_Stripped(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const (
+		botRobotID = "orphan_bot"
+		creatorUID = "user_creator"
+		forged     = "space_B_attacker"
+	)
+
+	dc := &dispatchCapture{}
+	q := &fakeSpaceQuerier{} // returns ("", nil) — orphan bot, no error
+
+	ba := &BotAPI{
+		Log:              log.NewTLog("BotAPI-it"),
+		spaceQuerier:     q,
+		dispatchOverride: dc.hook,
+	}
+
+	body, _ := json.Marshal(BotSendMessageReq{
+		ChannelID:   creatorUID,
+		ChannelType: common.ChannelTypePerson.Uint8(),
+		Payload: map[string]interface{}{
+			"content":  "hi",
+			"type":     1,
+			"space_id": forged,
+		},
+	})
+
+	httpReq := httptest.NewRequest(http.MethodPost, "/v1/bot/sendMessage", bytes.NewReader(body))
+	httpReq.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	gc, _ := gin.CreateTestContext(rec)
+	gc.Request = httpReq
+	c := &wkhttp.Context{Context: gc}
+	c.Set(CtxKeyRobotID, botRobotID)
+	c.Set(CtxKeyBotKind, BotKindUser)
+	c.Set(CtxKeyRobot, &robotModel{RobotID: botRobotID, CreatorUID: creatorUID})
+
+	ba.sendMessage(c)
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	if !assert.NotNil(t, dc.captured) {
+		return
+	}
+	var dispatchedPayload map[string]interface{}
+	assert.NoError(t, json.Unmarshal(dc.captured.Payload, &dispatchedPayload))
+	_, hasSpaceID := dispatchedPayload["space_id"]
+	assert.False(t, hasSpaceID,
+		"orphan bot + forged client space_id MUST be stripped from dispatched payload (fail-closed)")
+}
+
+// TestSendMessage_PersonalDM_DBError_ForgedClientSpaceID_Stripped is the
+// YUJ-660 R3 Finding A regression guard for the real-DB-error branch. When
+// querySpaceIDByRobotID returns a real error (network blip / failover), the
+// resolver returns "" — and the helper MUST still strip the client's forged
+// payload.space_id rather than passing it through. Without this protection,
+// an attacker can synthesize transient DB conditions to bypass authoritative
+// override.
+func TestSendMessage_PersonalDM_DBError_ForgedClientSpaceID_Stripped(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const (
+		botRobotID = "bot_with_db_error"
+		creatorUID = "user_creator"
+		forged     = "space_B_attacker"
+	)
+
+	dc := &dispatchCapture{}
+	q := &fakeSpaceQuerier{defaultErr: errors.New("connection refused")}
+
+	ba := &BotAPI{
+		Log:              log.NewTLog("BotAPI-it"),
+		spaceQuerier:     q,
+		dispatchOverride: dc.hook,
+	}
+
+	body, _ := json.Marshal(BotSendMessageReq{
+		ChannelID:   creatorUID,
+		ChannelType: common.ChannelTypePerson.Uint8(),
+		Payload: map[string]interface{}{
+			"content":  "hi",
+			"type":     1,
+			"space_id": forged,
+		},
+	})
+
+	httpReq := httptest.NewRequest(http.MethodPost, "/v1/bot/sendMessage", bytes.NewReader(body))
+	httpReq.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	gc, _ := gin.CreateTestContext(rec)
+	gc.Request = httpReq
+	c := &wkhttp.Context{Context: gc}
+	c.Set(CtxKeyRobotID, botRobotID)
+	c.Set(CtxKeyBotKind, BotKindUser)
+	c.Set(CtxKeyRobot, &robotModel{RobotID: botRobotID, CreatorUID: creatorUID})
+
+	ba.sendMessage(c)
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	if !assert.NotNil(t, dc.captured) {
+		return
+	}
+	var dispatchedPayload map[string]interface{}
+	assert.NoError(t, json.Unmarshal(dc.captured.Payload, &dispatchedPayload))
+	_, hasSpaceID := dispatchedPayload["space_id"]
+	assert.False(t, hasSpaceID,
+		"DB error + forged client space_id MUST be stripped from dispatched payload — attackers cannot use transient DB failure to bypass authoritative override")
 }
