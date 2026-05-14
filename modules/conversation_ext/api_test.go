@@ -114,7 +114,7 @@ func newTestRouter(svc followService, db sortDB) *wkhttp.WKHttp {
 		c.Next()
 	}
 
-	grp := r.Group("/v2/follow", inject)
+	grp := r.Group("/v1/follow", inject)
 	grp.POST("/dm", f.FollowDM)
 	grp.DELETE("/dm", f.UnfollowDM)
 	grp.POST("/channel/unfollow", f.UnfollowChannel)
@@ -167,7 +167,7 @@ func TestFollow_FollowDM_HappyPath(t *testing.T) {
 		},
 	}
 	r := newTestRouter(svc, &stubDB{})
-	w := do(r, "POST", "/v2/follow/dm", map[string]interface{}{"peer_uid": "peer1"})
+	w := do(r, "POST", "/v1/follow/dm", map[string]interface{}{"peer_uid": "peer1"})
 
 	assertOK(t, w)
 	assert.Equal(t, "test-uid", gotUID)
@@ -186,7 +186,7 @@ func TestFollow_FollowDM_WithCategoryID(t *testing.T) {
 	}
 	r := newTestRouter(svc, &stubDB{})
 	catID := "cat-uuid-abc"
-	w := do(r, "POST", "/v2/follow/dm", map[string]interface{}{
+	w := do(r, "POST", "/v1/follow/dm", map[string]interface{}{
 		"peer_uid":    "peer2",
 		"category_id": catID,
 	})
@@ -198,7 +198,7 @@ func TestFollow_FollowDM_WithCategoryID(t *testing.T) {
 
 func TestFollow_FollowDM_MissingPeerUID(t *testing.T) {
 	r := newTestRouter(&stubService{}, &stubDB{})
-	w := do(r, "POST", "/v2/follow/dm", map[string]interface{}{})
+	w := do(r, "POST", "/v1/follow/dm", map[string]interface{}{})
 	assertBadRequest(t, w)
 }
 
@@ -209,7 +209,7 @@ func TestFollow_FollowDM_ServiceError(t *testing.T) {
 		},
 	}
 	r := newTestRouter(svc, &stubDB{})
-	w := do(r, "POST", "/v2/follow/dm", map[string]interface{}{"peer_uid": "peer1"})
+	w := do(r, "POST", "/v1/follow/dm", map[string]interface{}{"peer_uid": "peer1"})
 	assertBadRequest(t, w)
 }
 
@@ -222,7 +222,7 @@ func TestFollow_FollowDM_CategoryForbidden(t *testing.T) {
 		},
 	}
 	r := newTestRouter(svc, &stubDB{})
-	w := do(r, "POST", "/v2/follow/dm", map[string]interface{}{
+	w := do(r, "POST", "/v1/follow/dm", map[string]interface{}{
 		"peer_uid":    "peer3",
 		"category_id": "not-mine-uuid",
 	})
@@ -243,7 +243,7 @@ func TestFollow_UnfollowDM_HappyPath(t *testing.T) {
 		},
 	}
 	r := newTestRouter(svc, &stubDB{})
-	w := do(r, "DELETE", "/v2/follow/dm?peer_uid=peerX", nil)
+	w := do(r, "DELETE", "/v1/follow/dm?peer_uid=peerX", nil)
 
 	assertOK(t, w)
 	assert.Equal(t, "peerX", gotPeerUID)
@@ -251,7 +251,7 @@ func TestFollow_UnfollowDM_HappyPath(t *testing.T) {
 
 func TestFollow_UnfollowDM_MissingPeerUID(t *testing.T) {
 	r := newTestRouter(&stubService{}, &stubDB{})
-	w := do(r, "DELETE", "/v2/follow/dm", nil)
+	w := do(r, "DELETE", "/v1/follow/dm", nil)
 	assertBadRequest(t, w)
 }
 
@@ -262,7 +262,7 @@ func TestFollow_UnfollowDM_ServiceError(t *testing.T) {
 		},
 	}
 	r := newTestRouter(svc, &stubDB{})
-	w := do(r, "DELETE", "/v2/follow/dm?peer_uid=p", nil)
+	w := do(r, "DELETE", "/v1/follow/dm?peer_uid=p", nil)
 	assertBadRequest(t, w)
 }
 
@@ -279,7 +279,7 @@ func TestFollow_UnfollowChannel_HappyPath(t *testing.T) {
 		},
 	}
 	r := newTestRouter(svc, &stubDB{})
-	w := do(r, "POST", "/v2/follow/channel/unfollow", map[string]interface{}{"group_no": "grp1"})
+	w := do(r, "POST", "/v1/follow/channel/unfollow", map[string]interface{}{"group_no": "grp1"})
 
 	assertOK(t, w)
 	assert.Equal(t, "grp1", gotGroupNo)
@@ -287,7 +287,7 @@ func TestFollow_UnfollowChannel_HappyPath(t *testing.T) {
 
 func TestFollow_UnfollowChannel_MissingGroupNo(t *testing.T) {
 	r := newTestRouter(&stubService{}, &stubDB{})
-	w := do(r, "POST", "/v2/follow/channel/unfollow", map[string]interface{}{})
+	w := do(r, "POST", "/v1/follow/channel/unfollow", map[string]interface{}{})
 	assertBadRequest(t, w)
 }
 
@@ -298,7 +298,7 @@ func TestFollow_UnfollowChannel_ServiceError(t *testing.T) {
 		},
 	}
 	r := newTestRouter(svc, &stubDB{})
-	w := do(r, "POST", "/v2/follow/channel/unfollow", map[string]interface{}{"group_no": "grp1"})
+	w := do(r, "POST", "/v1/follow/channel/unfollow", map[string]interface{}{"group_no": "grp1"})
 	assertBadRequest(t, w)
 }
 
@@ -315,7 +315,7 @@ func TestFollow_FollowChannel_HappyPath(t *testing.T) {
 		},
 	}
 	r := newTestRouter(svc, &stubDB{})
-	w := do(r, "POST", "/v2/follow/channel/refollow", map[string]interface{}{"group_no": "grp2"})
+	w := do(r, "POST", "/v1/follow/channel/refollow", map[string]interface{}{"group_no": "grp2"})
 
 	assertOK(t, w)
 	assert.Equal(t, "grp2", gotGroupNo)
@@ -323,7 +323,7 @@ func TestFollow_FollowChannel_HappyPath(t *testing.T) {
 
 func TestFollow_FollowChannel_MissingGroupNo(t *testing.T) {
 	r := newTestRouter(&stubService{}, &stubDB{})
-	w := do(r, "POST", "/v2/follow/channel/refollow", map[string]interface{}{})
+	w := do(r, "POST", "/v1/follow/channel/refollow", map[string]interface{}{})
 	assertBadRequest(t, w)
 }
 
@@ -334,7 +334,7 @@ func TestFollow_FollowChannel_ServiceError(t *testing.T) {
 		},
 	}
 	r := newTestRouter(svc, &stubDB{})
-	w := do(r, "POST", "/v2/follow/channel/refollow", map[string]interface{}{"group_no": "grp2"})
+	w := do(r, "POST", "/v1/follow/channel/refollow", map[string]interface{}{"group_no": "grp2"})
 	assertBadRequest(t, w)
 }
 
@@ -351,7 +351,7 @@ func TestFollow_FollowThread_HappyPath(t *testing.T) {
 		},
 	}
 	r := newTestRouter(svc, &stubDB{})
-	w := do(r, "POST", "/v2/follow/thread", map[string]interface{}{"thread_channel_id": "grp1____thr1"})
+	w := do(r, "POST", "/v1/follow/thread", map[string]interface{}{"thread_channel_id": "grp1____thr1"})
 
 	assertOK(t, w)
 	assert.Equal(t, "grp1____thr1", gotThreadID)
@@ -359,7 +359,7 @@ func TestFollow_FollowThread_HappyPath(t *testing.T) {
 
 func TestFollow_FollowThread_MissingThreadChannelID(t *testing.T) {
 	r := newTestRouter(&stubService{}, &stubDB{})
-	w := do(r, "POST", "/v2/follow/thread", map[string]interface{}{})
+	w := do(r, "POST", "/v1/follow/thread", map[string]interface{}{})
 	assertBadRequest(t, w)
 }
 
@@ -370,7 +370,7 @@ func TestFollow_FollowThread_ServiceError(t *testing.T) {
 		},
 	}
 	r := newTestRouter(svc, &stubDB{})
-	w := do(r, "POST", "/v2/follow/thread", map[string]interface{}{"thread_channel_id": "grp1____thr1"})
+	w := do(r, "POST", "/v1/follow/thread", map[string]interface{}{"thread_channel_id": "grp1____thr1"})
 	assertBadRequest(t, w)
 }
 
@@ -421,7 +421,7 @@ func TestFollow_FollowThread_Forbidden_Returns403(t *testing.T) {
 		},
 	}
 	r := newTestRouter(svc, &stubDB{})
-	w := do(r, "POST", "/v2/follow/thread", map[string]interface{}{"thread_channel_id": "grp1____thr1"})
+	w := do(r, "POST", "/v1/follow/thread", map[string]interface{}{"thread_channel_id": "grp1____thr1"})
 	assert.Equal(t, http.StatusForbidden, w.Code, "body: %s", w.Body.String())
 }
 
@@ -438,7 +438,7 @@ func TestFollow_UnfollowThread_HappyPath(t *testing.T) {
 		},
 	}
 	r := newTestRouter(svc, &stubDB{})
-	w := do(r, "DELETE", "/v2/follow/thread?thread_channel_id=grp1____thr2", nil)
+	w := do(r, "DELETE", "/v1/follow/thread?thread_channel_id=grp1____thr2", nil)
 
 	assertOK(t, w)
 	assert.Equal(t, "grp1____thr2", gotThreadID)
@@ -446,7 +446,7 @@ func TestFollow_UnfollowThread_HappyPath(t *testing.T) {
 
 func TestFollow_UnfollowThread_MissingThreadChannelID(t *testing.T) {
 	r := newTestRouter(&stubService{}, &stubDB{})
-	w := do(r, "DELETE", "/v2/follow/thread", nil)
+	w := do(r, "DELETE", "/v1/follow/thread", nil)
 	assertBadRequest(t, w)
 }
 
@@ -457,7 +457,7 @@ func TestFollow_UnfollowThread_ServiceError(t *testing.T) {
 		},
 	}
 	r := newTestRouter(svc, &stubDB{})
-	w := do(r, "DELETE", "/v2/follow/thread?thread_channel_id=grp1____thr2", nil)
+	w := do(r, "DELETE", "/v1/follow/thread?thread_channel_id=grp1____thr2", nil)
 	assertBadRequest(t, w)
 }
 
@@ -476,7 +476,7 @@ func TestFollow_UpdateSort_HappyPath(t *testing.T) {
 		},
 	}
 	r := newTestRouter(&stubService{}, db)
-	w := do(r, "PUT", "/v2/follow/sort", map[string]interface{}{
+	w := do(r, "PUT", "/v1/follow/sort", map[string]interface{}{
 		"items": []map[string]interface{}{
 			{"target_type": 1, "target_id": "dm-1", "sort": 1},
 			{"target_type": 2, "target_id": "grp-1", "sort": 2},
@@ -493,7 +493,7 @@ func TestFollow_UpdateSort_HappyPath(t *testing.T) {
 
 func TestFollow_UpdateSort_MissingItems(t *testing.T) {
 	r := newTestRouter(&stubService{}, &stubDB{})
-	w := do(r, "PUT", "/v2/follow/sort", map[string]interface{}{
+	w := do(r, "PUT", "/v1/follow/sort", map[string]interface{}{
 		"items":   []interface{}{},
 		"version": 0,
 	})
@@ -502,7 +502,7 @@ func TestFollow_UpdateSort_MissingItems(t *testing.T) {
 
 func TestFollow_UpdateSort_InvalidTargetType(t *testing.T) {
 	r := newTestRouter(&stubService{}, &stubDB{})
-	w := do(r, "PUT", "/v2/follow/sort", map[string]interface{}{
+	w := do(r, "PUT", "/v1/follow/sort", map[string]interface{}{
 		"items": []map[string]interface{}{
 			{"target_type": 99, "target_id": "x", "sort": 1},
 		},
@@ -518,7 +518,7 @@ func TestFollow_UpdateSort_CASConflict(t *testing.T) {
 		},
 	}
 	r := newTestRouter(&stubService{}, db)
-	w := do(r, "PUT", "/v2/follow/sort", map[string]interface{}{
+	w := do(r, "PUT", "/v1/follow/sort", map[string]interface{}{
 		"items": []map[string]interface{}{
 			{"target_type": 1, "target_id": "dm-1", "sort": 1},
 		},
@@ -535,7 +535,7 @@ func TestFollow_UpdateSort_DBError(t *testing.T) {
 		},
 	}
 	r := newTestRouter(&stubService{}, db)
-	w := do(r, "PUT", "/v2/follow/sort", map[string]interface{}{
+	w := do(r, "PUT", "/v1/follow/sort", map[string]interface{}{
 		"items": []map[string]interface{}{
 			{"target_type": 1, "target_id": "dm-1", "sort": 1},
 		},
@@ -562,7 +562,7 @@ func TestFollow_UpdateSort_TooManyItems_Rejected(t *testing.T) {
 			"sort":        i,
 		})
 	}
-	w := do(r, "PUT", "/v2/follow/sort", map[string]interface{}{
+	w := do(r, "PUT", "/v1/follow/sort", map[string]interface{}{
 		"items":   items,
 		"version": 0,
 	})
@@ -577,7 +577,7 @@ func TestFollow_UpdateSort_EmptyTargetID_Rejected(t *testing.T) {
 			return nil
 		},
 	})
-	w := do(r, "PUT", "/v2/follow/sort", map[string]interface{}{
+	w := do(r, "PUT", "/v1/follow/sort", map[string]interface{}{
 		"items": []map[string]interface{}{
 			{"target_type": 1, "target_id": "", "sort": 1},
 		},
@@ -594,7 +594,7 @@ func TestFollow_UpdateSort_DuplicateItems_Rejected(t *testing.T) {
 			return nil
 		},
 	})
-	w := do(r, "PUT", "/v2/follow/sort", map[string]interface{}{
+	w := do(r, "PUT", "/v1/follow/sort", map[string]interface{}{
 		"items": []map[string]interface{}{
 			{"target_type": 1, "target_id": "dm-1", "sort": 1},
 			{"target_type": 1, "target_id": "dm-1", "sort": 2},
@@ -614,7 +614,7 @@ func TestFollow_UpdateSort_TargetNotFound_DistinctError(t *testing.T) {
 		},
 	}
 	r := newTestRouter(&stubService{}, db)
-	w := do(r, "PUT", "/v2/follow/sort", map[string]interface{}{
+	w := do(r, "PUT", "/v1/follow/sort", map[string]interface{}{
 		"items": []map[string]interface{}{
 			{"target_type": 1, "target_id": "dm-1", "sort": 1},
 		},
@@ -641,7 +641,7 @@ func newTestRouterNoSpace(svc followService, db sortDB) *wkhttp.WKHttp {
 		c.Next()
 	}
 
-	grp := r.Group("/v2/follow", inject)
+	grp := r.Group("/v1/follow", inject)
 	grp.POST("/dm", f.FollowDM)
 	grp.DELETE("/dm", f.UnfollowDM)
 	grp.POST("/channel/unfollow", f.UnfollowChannel)
@@ -655,45 +655,45 @@ func newTestRouterNoSpace(svc followService, db sortDB) *wkhttp.WKHttp {
 
 func TestFollow_FollowDM_MissingSpaceID(t *testing.T) {
 	r := newTestRouterNoSpace(&stubService{}, &stubDB{})
-	w := do(r, "POST", "/v2/follow/dm", map[string]interface{}{"peer_uid": "peer1"})
+	w := do(r, "POST", "/v1/follow/dm", map[string]interface{}{"peer_uid": "peer1"})
 	assertBadRequest(t, w)
 	assert.Contains(t, w.Body.String(), "space_id")
 }
 
 func TestFollow_UnfollowDM_MissingSpaceID(t *testing.T) {
 	r := newTestRouterNoSpace(&stubService{}, &stubDB{})
-	w := do(r, "DELETE", "/v2/follow/dm?peer_uid=p", nil)
+	w := do(r, "DELETE", "/v1/follow/dm?peer_uid=p", nil)
 	assertBadRequest(t, w)
 	assert.Contains(t, w.Body.String(), "space_id")
 }
 
 func TestFollow_UnfollowChannel_MissingSpaceID(t *testing.T) {
 	r := newTestRouterNoSpace(&stubService{}, &stubDB{})
-	w := do(r, "POST", "/v2/follow/channel/unfollow", map[string]interface{}{"group_no": "g"})
+	w := do(r, "POST", "/v1/follow/channel/unfollow", map[string]interface{}{"group_no": "g"})
 	assertBadRequest(t, w)
 }
 
 func TestFollow_FollowChannel_MissingSpaceID(t *testing.T) {
 	r := newTestRouterNoSpace(&stubService{}, &stubDB{})
-	w := do(r, "POST", "/v2/follow/channel/refollow", map[string]interface{}{"group_no": "g"})
+	w := do(r, "POST", "/v1/follow/channel/refollow", map[string]interface{}{"group_no": "g"})
 	assertBadRequest(t, w)
 }
 
 func TestFollow_FollowThread_MissingSpaceID(t *testing.T) {
 	r := newTestRouterNoSpace(&stubService{}, &stubDB{})
-	w := do(r, "POST", "/v2/follow/thread", map[string]interface{}{"thread_channel_id": "g____t"})
+	w := do(r, "POST", "/v1/follow/thread", map[string]interface{}{"thread_channel_id": "g____t"})
 	assertBadRequest(t, w)
 }
 
 func TestFollow_UnfollowThread_MissingSpaceID(t *testing.T) {
 	r := newTestRouterNoSpace(&stubService{}, &stubDB{})
-	w := do(r, "DELETE", "/v2/follow/thread?thread_channel_id=g____t", nil)
+	w := do(r, "DELETE", "/v1/follow/thread?thread_channel_id=g____t", nil)
 	assertBadRequest(t, w)
 }
 
 func TestFollow_UpdateSort_MissingSpaceID(t *testing.T) {
 	r := newTestRouterNoSpace(&stubService{}, &stubDB{})
-	w := do(r, "PUT", "/v2/follow/sort", map[string]interface{}{
+	w := do(r, "PUT", "/v1/follow/sort", map[string]interface{}{
 		"items": []map[string]interface{}{
 			{"target_type": 1, "target_id": "dm-1", "sort": 1},
 		},

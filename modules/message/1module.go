@@ -21,8 +21,8 @@ var swaggerContent string
 //go:embed swagger/conversation.yaml
 var conversationSwagger string
 
-//go:embed swagger/conversation_v2.yaml
-var conversationV2Swagger string
+//go:embed swagger/sidebar.yaml
+var sidebarSwagger string
 
 func init() {
 
@@ -76,12 +76,12 @@ func init() {
 		return register.Module{Name: "conversation_ext_thread_auth"}
 	})
 
-	// PR review (Round 3) Important #3 — register the v2 sidebar swagger file
-	// independently so its `basePath: /v2` is honoured (the legacy file uses /v1).
+	// Sidebar swagger lives in its own file so the sidebar/follow surface can
+	// evolve independently from the legacy /v1/conversation contract.
 	register.AddModule(func(ctx interface{}) register.Module {
 		return register.Module{
-			Name:    "conversation_v2",
-			Swagger: conversationV2Swagger,
+			Name:    "sidebar",
+			Swagger: sidebarSwagger,
 		}
 	})
 }

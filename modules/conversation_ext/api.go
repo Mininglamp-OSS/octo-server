@@ -112,7 +112,7 @@ func spaceGuard(c *wkhttp.Context) (spaceID string, ok bool) {
 // ---------------------------------------------------------------------------
 
 // FollowDM 关注 DM 并可选指定分组
-// POST /v2/follow/dm
+// POST /v1/follow/dm
 func (f *Follow) FollowDM(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	spaceID, ok := spaceGuard(c)
@@ -145,7 +145,7 @@ func (f *Follow) FollowDM(c *wkhttp.Context) {
 }
 
 // UnfollowDM 取消关注 DM
-// DELETE /v2/follow/dm?peer_uid=xxx
+// DELETE /v1/follow/dm?peer_uid=xxx
 func (f *Follow) UnfollowDM(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	spaceID, ok := spaceGuard(c)
@@ -168,7 +168,7 @@ func (f *Follow) UnfollowDM(c *wkhttp.Context) {
 }
 
 // UnfollowChannel 群"取消关注"（写黑名单）
-// POST /v2/follow/channel/unfollow
+// POST /v1/follow/channel/unfollow
 func (f *Follow) UnfollowChannel(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	spaceID, ok := spaceGuard(c)
@@ -195,7 +195,7 @@ func (f *Follow) UnfollowChannel(c *wkhttp.Context) {
 }
 
 // FollowChannel 重新关注群（清黑名单）
-// POST /v2/follow/channel/refollow
+// POST /v1/follow/channel/refollow
 func (f *Follow) FollowChannel(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	spaceID, ok := spaceGuard(c)
@@ -222,7 +222,7 @@ func (f *Follow) FollowChannel(c *wkhttp.Context) {
 }
 
 // FollowThread 关注子区（隐式连带父群）
-// POST /v2/follow/thread
+// POST /v1/follow/thread
 func (f *Follow) FollowThread(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	spaceID, ok := spaceGuard(c)
@@ -256,7 +256,7 @@ func (f *Follow) FollowThread(c *wkhttp.Context) {
 }
 
 // UnfollowThread 取消关注子区
-// DELETE /v2/follow/thread?thread_channel_id=xxx
+// DELETE /v1/follow/thread?thread_channel_id=xxx
 func (f *Follow) UnfollowThread(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	spaceID, ok := spaceGuard(c)
@@ -279,7 +279,7 @@ func (f *Follow) UnfollowThread(c *wkhttp.Context) {
 }
 
 // UpdateSort 关注 Tab 内手动排序 CAS
-// PUT /v2/follow/sort
+// PUT /v1/follow/sort
 func (f *Follow) UpdateSort(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	spaceID, ok := spaceGuard(c)

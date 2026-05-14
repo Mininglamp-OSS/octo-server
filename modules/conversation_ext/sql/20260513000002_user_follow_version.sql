@@ -3,7 +3,7 @@
 -- 用户关注列表版本号（issue #337, PR review Round-3 Blocking #1/#2）
 --
 -- 设计动机：
---   v2 sidebar 既要支持 follow 列表的 CAS 排序（/v2/follow/sort），
+--   v2 sidebar 既要支持 follow 列表的 CAS 排序（/v1/follow/sort），
 --   又要让客户端感知 follow/unfollow/category 变更后的列表刷新。
 --
 --   原方案把 IM 会话游标当作 follow_version 用，但 IM 游标只在收到消息时推进，

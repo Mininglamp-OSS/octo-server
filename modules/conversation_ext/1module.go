@@ -54,10 +54,10 @@ type followRouter struct {
 	f   *Follow
 }
 
-// Route registers all 7 Follow endpoints under /v2/follow with auth and space
+// Route registers all 7 Follow endpoints under /v1/follow with auth and space
 // middleware — mirrors the pattern in modules/user/api.go (pinned group).
 func (fr *followRouter) Route(r *wkhttp.WKHttp) {
-	grp := r.Group("/v2/follow",
+	grp := r.Group("/v1/follow",
 		fr.ctx.AuthMiddleware(r),
 		spacepkg.SpaceMiddleware(fr.ctx),
 	)

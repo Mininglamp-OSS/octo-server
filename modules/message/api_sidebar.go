@@ -1,4 +1,4 @@
-// Package message — POST /v2/sidebar/sync
+// Package message — POST /v1/sidebar/sync
 //
 // # Data-flow overview
 //
@@ -52,7 +52,7 @@ import (
 // Structs
 // ---------------------------------------------------------------------------
 
-// Sidebar handles POST /v2/sidebar/sync.
+// Sidebar handles POST /v1/sidebar/sync.
 type Sidebar struct {
 	ctx             *config.Context
 	groupCategoryDB *groupCategoryDB
@@ -81,7 +81,7 @@ func NewSidebar(ctx *config.Context) *Sidebar {
 	}
 }
 
-// sidebarSyncReq is the JSON body for POST /v2/sidebar/sync.
+// sidebarSyncReq is the JSON body for POST /v1/sidebar/sync.
 type sidebarSyncReq struct {
 	Tab         string `json:"tab"`     // "follow" | "recent"
 	Version     int64  `json:"version"` // IM core version cursor
@@ -113,14 +113,14 @@ type SidebarItem struct {
 	ParentChannelID   string `json:"parent_channel_id,omitempty"` // thread only
 }
 
-// sidebarSyncResp is the JSON response for POST /v2/sidebar/sync.
+// sidebarSyncResp is the JSON response for POST /v1/sidebar/sync.
 //
 // Version 是 IM 会话游标（recent tab 的 cursor）。
 // FollowVersion 是 user_follow_version 的当前值（follow tab 的 CAS / 增量检测）。
 // PR review (Round 3) Blocking #1/#2 — IM 游标无法感知 follow 状态变化，所以需要
 // 独立的 follow_version。客户端使用方式：
 //   - 拉取 follow tab 后保存 follow_version，下次比较是否需要全量重建。
-//   - 调 /v2/follow/sort 时把 follow_version 原样回传做 CAS。
+//   - 调 /v1/follow/sort 时把 follow_version 原样回传做 CAS。
 type sidebarSyncResp struct {
 	Items         []*SidebarItem `json:"items"`
 	Version       int64          `json:"version"`
@@ -131,13 +131,13 @@ type sidebarSyncResp struct {
 // Route registration helper (called from Conversation.Route or standalone)
 // ---------------------------------------------------------------------------
 
-// RegisterSidebarRoutes mounts /v2/sidebar/sync onto the router.
+// RegisterSidebarRoutes mounts /v1/sidebar/sync onto the router.
 func RegisterSidebarRoutes(r *wkhttp.WKHttp, ctx *config.Context) {
 	sb := NewSidebar(ctx)
 	uidLimit := appwkhttp.SharedUIDRateLimiter(ctx)
-	v2 := r.Group("/v2/sidebar", ctx.AuthMiddleware(r), uidLimit, spacepkg.SpaceMiddleware(ctx))
+	grp := r.Group("/v1/sidebar", ctx.AuthMiddleware(r), uidLimit, spacepkg.SpaceMiddleware(ctx))
 	{
-		v2.POST("/sync", sb.Sync)
+		grp.POST("/sync", sb.Sync)
 	}
 }
 
@@ -188,7 +188,7 @@ func validateSidebarRequest(req *sidebarSyncReq) error {
 // HTTP handler
 // ---------------------------------------------------------------------------
 
-// Sync handles POST /v2/sidebar/sync.
+// Sync handles POST /v1/sidebar/sync.
 func (sb *Sidebar) Sync(c *wkhttp.Context) {
 	var req sidebarSyncReq
 	if err := c.BindJSON(&req); err != nil {

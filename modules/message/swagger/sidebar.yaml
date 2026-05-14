@@ -1,22 +1,22 @@
 swagger: "2.0"
 info:
-  description: "DMWork API v2 - Sidebar 聚合接口"
-  version: "2.0.0"
-  title: "DMWork API v2"
+  description: "DMWork API - Sidebar 聚合接口"
+  version: "1.0.0"
+  title: "DMWork API - Sidebar"
 host: "api.botgate.cn"
 tags:
   - name: "sidebar"
-    description: "v2 Sidebar 聚合（关注 / 最近 Tab，issue #337）"
+    description: "Sidebar 聚合（关注 / 最近 Tab，issue #337）"
 schemes:
   - "https"
-basePath: "/v2"
+basePath: "/v1"
 
 paths:
   /sidebar/sync:
     post:
       tags:
         - "sidebar"
-      summary: "v2 Sidebar 聚合同步（按 Tab）"
+      summary: "Sidebar 聚合同步（按 Tab）"
       description: |
         Web 端 Sidebar 聚合接口。根据 tab 参数返回不同维度的会话条目列表。
 
@@ -32,7 +32,7 @@ paths:
         - 群 / 子区：仅保留 `timestamp > NOW - 72h`
         - DM：全保留（不受时间窗口限制）
         - 排序：`pinned DESC` → `timestamp DESC`
-      operationId: "v2SidebarSync"
+      operationId: "sidebarSync"
       consumes:
         - "application/json"
       produces:
@@ -82,7 +82,7 @@ paths:
               follow_version:
                 type: integer
                 format: int64
-                description: "user_follow_version 的当前值（follow tab 的 CAS / 增量检测）。调用 /v2/follow/sort 时原样传回。"
+                description: "user_follow_version 的当前值（follow tab 的 CAS / 增量检测）。调用 /v1/follow/sort 时原样传回。"
         400:
           description: "参数错误"
           schema:

@@ -9,7 +9,7 @@ tags:
     description: "关注 Tab 相关操作（DM 关注、群黑名单、子区关注、手动排序）"
 schemes:
   - "https"
-basePath: "/v2"
+basePath: "/v1"
 
 paths:
   /follow/dm:

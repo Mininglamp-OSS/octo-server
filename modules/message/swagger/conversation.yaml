@@ -297,7 +297,7 @@ paths:
             $ref: "#/definitions/response"
       security:
         - token: []
-  # NOTE: v2 sidebar 接口的 swagger 文档独立放在 conversation_v2.yaml
+  # NOTE: sidebar/follow 接口的 swagger 文档独立放在 sidebar.yaml
   # 因为本文件的 basePath 是 /v1。
 
 securityDefinitions:
