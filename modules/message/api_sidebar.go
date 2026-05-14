@@ -41,6 +41,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	convext "github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
+	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
@@ -58,6 +59,8 @@ type Sidebar struct {
 	convExtDB       *convext.DB
 	threadDB        *thread.DB
 	followVersionDB *convext.FollowVersionDB
+	// PR #21 review (Jerry-Xin Critical)：Space 过滤需要群表查询。
+	groupService group.IService
 	log.Log
 }
 
@@ -69,6 +72,7 @@ func NewSidebar(ctx *config.Context) *Sidebar {
 		convExtDB:       convext.NewDB(ctx),
 		threadDB:        thread.NewDB(ctx),
 		followVersionDB: convext.NewFollowVersionDB(ctx),
+		groupService:    group.NewService(ctx),
 		Log:             log.NewTLog("Sidebar"),
 	}
 }
@@ -84,18 +88,25 @@ type sidebarSyncReq struct {
 
 // SidebarItem is one entry in the sidebar response.
 type SidebarItem struct {
-	TargetType      int     `json:"target_type"` // 1 DM / 2 group / 5 thread
-	TargetID        string  `json:"target_id"`
-	ChannelType     uint8   `json:"channel_type"`
-	ChannelID       string  `json:"channel_id"`
-	Timestamp       int64   `json:"timestamp"`
-	Unread          int     `json:"unread"`
-	IsPinned        bool    `json:"is_pinned"`
-	IsFollowed      bool    `json:"is_followed"`
-	CategoryID      *string `json:"category_id,omitempty"`
-	CategorySort    int     `json:"category_sort,omitempty"`
-	FollowSort      int     `json:"follow_sort,omitempty"`
-	ParentChannelID string  `json:"parent_channel_id,omitempty"` // thread only
+	TargetType  int    `json:"target_type"` // 1 DM / 2 group / 5 thread
+	TargetID    string `json:"target_id"`
+	ChannelType uint8  `json:"channel_type"`
+	ChannelID   string `json:"channel_id"`
+	Timestamp   int64  `json:"timestamp"`
+	Unread      int    `json:"unread"`
+	IsPinned    bool   `json:"is_pinned"`
+	IsFollowed  bool   `json:"is_followed"`
+	CategoryID  *string `json:"category_id,omitempty"`
+	// CategorySort 暴露给客户端的"类别之间排序权重"，来源是 group_category.sort
+	// （PR #21 review by lml2468 blocker #3）。改类别顺序会 bump follow_version
+	// 并改变这里返回的值，与 /category/sort 接口及 swagger 一致。
+	CategorySort int `json:"category_sort,omitempty"`
+	// intraCategorySort 是 group_setting.category_sort（类别内排序），仅在
+	// 服务端 sortFollowItems 作为二级 key 使用，不暴露给客户端 —— 客户端
+	// 拿到的 items 已经按服务端口径排序完毕。
+	intraCategorySort int
+	FollowSort        int    `json:"follow_sort,omitempty"`
+	ParentChannelID   string `json:"parent_channel_id,omitempty"` // thread only
 }
 
 // sidebarSyncResp is the JSON response for POST /v2/sidebar/sync.
@@ -189,12 +200,40 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	spaceID := spacepkg.GetSpaceID(c)
 
+	// 0. follow_version 必须先读再读数据（PR #21 review P1-1 by yujiawei）。
+	//    如果先读数据再读 version，并发的 Follow*/Unfollow*/UpdateSort 在两次
+	//    读取之间 bump 会让响应回 "V+1 + 数据V"——客户端缓存命中 V+1 不再触发
+	//    刷新，新关注的 item 被静默吞掉。
+	//    把读 version 放到第一步：任何并发 bump 都会让 follow_version < real_version，
+	//    下一次 sync 看到更大的 version，客户端自然刷新，错过可恢复。
+	//
+	//    返 0 时客户端只会理解为 "没有新状态"，对业务无害（仍是保守正确）。
+	var followVersion int64
+	if v, err := sb.followVersionDB.Get(loginUID, spaceID); err != nil {
+		sb.Warn("sidebar sync: follow_version query failed (non-fatal)", zap.Error(err))
+	} else {
+		followVersion = v
+	}
+
 	// 1. Fetch IM conversations (version=0, no device offset logic for v2)
 	conversations, err := sb.ctx.IMSyncUserConversation(loginUID, req.Version, req.MsgCount, req.LastMsgSeqs, nil)
 	if err != nil {
 		sb.Error("sidebar sync: IM fetch failed", zap.Error(err))
 		c.ResponseError(errors.New("同步会话失败"))
 		return
+	}
+
+	// 1b. Space 过滤（PR #21 review by Jerry-Xin Critical）：
+	//     IM 核心返回的是用户在全局视野下的会话，必须用 X-Space-ID 收紧到
+	//     当前请求 Space，否则 sidebar 会把别的 Space 的活跃 DM/Group/Thread
+	//     暴露到当前 Space 的 follow/recent tab。规则与 v1 完全一致：
+	//     - 群：按 group 表的 space_id；
+	//     - 子区：跟父群的 space_id；
+	//     - DM：默认 Space 兜底 + Bot 成员关系 + payload.space_id 匹配；
+	//     - 系统 Bot：补齐占位，所有 Space 可见。
+	if spaceID != "" {
+		conversations = FilterRawConversationsBySpace(conversations, spaceID, loginUID, sb.ctx, sb.groupService)
+		conversations = EnsureSystemBotsPresentRaw(conversations)
 	}
 
 	// 2. Load ancillary data
@@ -213,13 +252,22 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 	}
 
 	// 2b. Unfollowed groups
+	// PR #21 review P1-2 (yujiawei): follow tab 下 ListUnfollowedGroups 失败必须
+	// fail-closed —— 该列表是 "黑名单"，丢失它会让 buildFollowItems 把用户
+	// 明确取消关注的群暴露到 follow tab，属于隐私回归。对 follow tab fail 整个
+	// 请求，让客户端短时间内重试；recent tab 不依赖该列表，仍可降级继续。
 	unfollowedGroups := map[string]struct{}{}
-	if unfollowed, err := sb.convExtDB.ListUnfollowedGroups(loginUID, spaceID); err != nil {
-		sb.Warn("sidebar sync: unfollowed groups query failed (non-fatal)", zap.Error(err))
-	} else {
-		for _, m := range unfollowed {
-			unfollowedGroups[m.TargetID] = struct{}{}
+	unfollowed, err := sb.convExtDB.ListUnfollowedGroups(loginUID, spaceID)
+	if err != nil {
+		if req.Tab == "follow" {
+			sb.Error("sidebar sync: unfollowed groups query failed (follow tab fail-closed)", zap.Error(err))
+			c.ResponseError(errors.New("同步会话失败"))
+			return
 		}
+		sb.Warn("sidebar sync: unfollowed groups query failed (recent tab non-fatal)", zap.Error(err))
+	}
+	for _, m := range unfollowed {
+		unfollowedGroups[m.TargetID] = struct{}{}
 	}
 
 	// 2c. Followed DMs
@@ -284,17 +332,9 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 		sortRecentItems(items)
 	}
 
-	// 6. Compute response version from raw conversations
+	// 6. Compute response version from raw conversations.
+	//    follow_version 已在 step 0 读取（PR #21 review P1-1）。
 	respVersion := maxConversationVersion(conversations, req.Version)
-
-	// 7. Load follow_version (PR review Round-3 Blocking #1/#2).
-	//    非致命：返 0 时客户端只会理解为"没有新状态"，对业务无害。
-	var followVersion int64
-	if v, err := sb.followVersionDB.Get(loginUID, spaceID); err != nil {
-		sb.Warn("sidebar sync: follow_version query failed (non-fatal)", zap.Error(err))
-	} else {
-		followVersion = v
-	}
 
 	c.JSON(http.StatusOK, &sidebarSyncResp{
 		Items:         items,
@@ -430,15 +470,16 @@ func buildFollowItems(
 				continue
 			}
 			items = append(items, &SidebarItem{
-				TargetType:   int(common.ChannelTypeGroup),
-				TargetID:     conv.ChannelID,
-				ChannelType:  conv.ChannelType,
-				ChannelID:    conv.ChannelID,
-				Timestamp:    conv.Timestamp,
-				Unread:       conv.Unread,
-				IsFollowed:   true,
-				CategoryID:   cs.CategoryID,
-				CategorySort: cs.CategorySort,
+				TargetType:        int(common.ChannelTypeGroup),
+				TargetID:          conv.ChannelID,
+				ChannelType:       conv.ChannelType,
+				ChannelID:         conv.ChannelID,
+				Timestamp:         conv.Timestamp,
+				Unread:            conv.Unread,
+				IsFollowed:        true,
+				CategoryID:        cs.CategoryID,
+				CategorySort:      cs.CategoryGroupSort,
+				intraCategorySort: cs.CategorySort,
 			})
 
 		case common.ChannelTypePerson.Uint8():
@@ -631,12 +672,23 @@ func mergeThreadEntries(
 // ---------------------------------------------------------------------------
 
 // sortFollowItems sorts items for the follow tab:
-// primary: category_sort ASC; secondary: pinned DESC; tertiary: follow_sort ASC.
+//
+//	primary:    CategorySort       ASC  (group_category.sort —— 类别之间的顺序)
+//	secondary:  intraCategorySort  ASC  (group_setting.category_sort —— 同类别内组之间的顺序)
+//	tertiary:   IsPinned           DESC (pinned first)
+//	quaternary: FollowSort         ASC  (user_conversation_ext.follow_sort)
+//
+// PR #21 review (lml2468 blocker #3)：之前 primary 用的是 group_setting.category_sort，
+// 这里改成 group_category.sort（与 /category/sort 的写入对齐、与 swagger 对齐），
+// group_setting.category_sort 作为同类别内的二级 key 继续生效。
 func sortFollowItems(items []*SidebarItem) {
 	sort.SliceStable(items, func(i, j int) bool {
 		a, b := items[i], items[j]
 		if a.CategorySort != b.CategorySort {
 			return a.CategorySort < b.CategorySort
+		}
+		if a.intraCategorySort != b.intraCategorySort {
+			return a.intraCategorySort < b.intraCategorySort
 		}
 		if a.IsPinned != b.IsPinned {
 			return a.IsPinned // pinned first

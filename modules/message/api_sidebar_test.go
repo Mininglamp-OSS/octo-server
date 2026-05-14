@@ -130,7 +130,7 @@ func TestBuildFollowItems_GroupFollowed(t *testing.T) {
 		makeIMConv("g1", common.ChannelTypeGroup.Uint8(), nowRecent()),
 	}
 	categorySetting := map[string]*GroupCategorySetting{
-		"g1": {GroupNo: "g1", CategoryID: strPtr("cat1"), CategorySort: 1},
+		"g1": {GroupNo: "g1", CategoryID: strPtr("cat1"), CategorySort: 1, CategoryGroupSort: 1},
 	}
 	unfollowedGroups := map[string]struct{}{} // empty: not unfollowed
 
@@ -147,7 +147,7 @@ func TestBuildFollowItems_GroupUnfollowed_Excluded(t *testing.T) {
 		makeIMConv("g1", common.ChannelTypeGroup.Uint8(), nowRecent()),
 	}
 	categorySetting := map[string]*GroupCategorySetting{
-		"g1": {GroupNo: "g1", CategoryID: strPtr("cat1"), CategorySort: 1},
+		"g1": {GroupNo: "g1", CategoryID: strPtr("cat1"), CategorySort: 1, CategoryGroupSort: 1},
 	}
 	unfollowedGroups := map[string]struct{}{"g1": {}}
 
@@ -200,7 +200,7 @@ func TestBuildFollowItems_ThreadAsIMEntry_IncludedWhenParentFollowed(t *testing.
 	}
 	// parent group in follow set (has category, not unfollowed)
 	categorySetting := map[string]*GroupCategorySetting{
-		"g1": {GroupNo: "g1", CategoryID: strPtr("cat1"), CategorySort: 1},
+		"g1": {GroupNo: "g1", CategoryID: strPtr("cat1"), CategorySort: 1, CategoryGroupSort: 1},
 	}
 	threadExtMap := map[string]*convext.Model{
 		threadChannelID: {TargetID: threadChannelID, FollowSort: 2},
@@ -219,7 +219,7 @@ func TestBuildFollowItems_ThreadWithoutExtRow_Excluded(t *testing.T) {
 		makeIMConv(threadChannelID, common.ChannelTypeCommunityTopic.Uint8(), nowRecent()),
 	}
 	categorySetting := map[string]*GroupCategorySetting{
-		"g1": {GroupNo: "g1", CategoryID: strPtr("cat1"), CategorySort: 1},
+		"g1": {GroupNo: "g1", CategoryID: strPtr("cat1"), CategorySort: 1, CategoryGroupSort: 1},
 	}
 	threadExtMap := map[string]*convext.Model{} // no ext for this thread
 
@@ -310,7 +310,7 @@ func TestBuildRecentItems_PinnedFirst(t *testing.T) {
 func followedG1() (map[string]*GroupCategorySetting, map[string]struct{}) {
 	cat := "cat-1"
 	return map[string]*GroupCategorySetting{
-			"g1": {GroupNo: "g1", CategoryID: &cat, CategorySort: 1},
+			"g1": {GroupNo: "g1", CategoryID: &cat, CategorySort: 1, CategoryGroupSort: 1},
 		},
 		map[string]struct{}{}
 }
@@ -489,6 +489,44 @@ func TestSortFollowItems_NoCategoryNilID_ZeroSort(t *testing.T) {
 	assert.Equal(t, "dm2", items[0].TargetID)
 }
 
+// PR #21 review (lml2468 blocker #3) regression：CategorySort（来自
+// group_category.sort）是 primary key；同一 category 内由 intraCategorySort
+// （来自 group_setting.category_sort）二级 sort 决定群之间顺序。
+func TestSortFollowItems_CategoryGroupSort_PrimaryOverIntra(t *testing.T) {
+	items := []*SidebarItem{
+		// 同 CategoryGroupSort（CategorySort=1）下 intraCategorySort 排序
+		{TargetID: "g1", CategorySort: 1, intraCategorySort: 2, FollowSort: 1},
+		{TargetID: "g2", CategorySort: 1, intraCategorySort: 1, FollowSort: 1},
+		// 另一类 (CategoryGroupSort=2) —— 整个 cluster 在后
+		{TargetID: "g3", CategorySort: 2, intraCategorySort: 0, FollowSort: 1},
+	}
+	sortFollowItems(items)
+	assert.Equal(t, "g2", items[0].TargetID, "intra-category sort breaks ties within same CategorySort")
+	assert.Equal(t, "g1", items[1].TargetID)
+	assert.Equal(t, "g3", items[2].TargetID, "different CategorySort dominates intra order")
+}
+
+// TestBuildFollowItems_CategoryGroupSort_Propagates 验证 buildFollowItems
+// 把 GroupCategorySetting.CategoryGroupSort 映射到 SidebarItem.CategorySort
+// （swagger 暴露字段），并保留 group_setting.category_sort 作为内部二级 key。
+func TestBuildFollowItems_CategoryGroupSort_Propagates(t *testing.T) {
+	convs := []*config.SyncUserConversationResp{
+		makeIMConv("g1", common.ChannelTypeGroup.Uint8(), nowRecent()),
+	}
+	categorySetting := map[string]*GroupCategorySetting{
+		"g1": {
+			GroupNo:           "g1",
+			CategoryID:        strPtr("cat1"),
+			CategorySort:      7,  // group_setting.category_sort —— 内部二级 key
+			CategoryGroupSort: 42, // group_category.sort       —— 客户端可见 category_sort
+		},
+	}
+	items := buildFollowItems(convs, categorySetting, nil, nil, nil)
+	require.Len(t, items, 1)
+	assert.Equal(t, 42, items[0].CategorySort, "客户端可见的 category_sort 必须取自 group_category.sort")
+	assert.Equal(t, 7, items[0].intraCategorySort, "intraCategorySort 必须取自 group_setting.category_sort")
+}
+
 // ---------------------------------------------------------------------------
 // sortRecentItems
 // ---------------------------------------------------------------------------
@@ -545,7 +583,7 @@ func TestBuildFollowItems_MixedTypes(t *testing.T) {
 		makeIMConv("g1____th1", common.ChannelTypeCommunityTopic.Uint8(), nowRecent()), // followed thread
 	}
 	categorySetting := map[string]*GroupCategorySetting{
-		"g1": {GroupNo: "g1", CategoryID: strPtr("cat1"), CategorySort: 1},
+		"g1": {GroupNo: "g1", CategoryID: strPtr("cat1"), CategorySort: 1, CategoryGroupSort: 1},
 	}
 	followedDMs := map[string]*convext.Model{
 		"peer1": {TargetID: "peer1", FollowedDM: 1, FollowSort: 1},

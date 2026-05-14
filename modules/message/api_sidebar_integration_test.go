@@ -135,7 +135,7 @@ func TestIntegration_Sidebar_FollowTab_BasicSmoke(t *testing.T) {
 	// This avoids a dependency on the group_setting table in conv_ext_test DB.
 	catIDCopy := catID
 	categorySetting := map[string]*GroupCategorySetting{
-		groupNo: {GroupNo: groupNo, CategoryID: &catIDCopy, CategorySort: catSort},
+		groupNo: {GroupNo: groupNo, CategoryID: &catIDCopy, CategorySort: catSort, CategoryGroupSort: catSort},
 	}
 
 	// 4. Stub IM conversation result (replaces IMSyncUserConversation network call).
@@ -217,7 +217,7 @@ func TestIntegration_Sidebar_FollowTab_BlacklistedGroupExcluded(t *testing.T) {
 	// categorySetting has the group (so it would pass the category check).
 	catIDStr := "cat-s7b"
 	categorySetting := map[string]*GroupCategorySetting{
-		groupNo: {GroupNo: groupNo, CategoryID: &catIDStr, CategorySort: 1},
+		groupNo: {GroupNo: groupNo, CategoryID: &catIDStr, CategorySort: 1, CategoryGroupSort: 1},
 	}
 
 	// Stub IM returns the group.
@@ -298,7 +298,7 @@ func TestIntegration_Sidebar_MergeThreadEntries_AddsDBOnlyThreads(t *testing.T) 
 	// categorySetting: parent group is in follow set.
 	catIDStr := "cat-s7d"
 	categorySetting := map[string]*GroupCategorySetting{
-		groupNo: {GroupNo: groupNo, CategoryID: &catIDStr, CategorySort: 1},
+		groupNo: {GroupNo: groupNo, CategoryID: &catIDStr, CategorySort: 1, CategoryGroupSort: 1},
 	}
 
 	// IM only returns threadInIM (not threadDBOnly).
@@ -312,7 +312,14 @@ func TestIntegration_Sidebar_MergeThreadEntries_AddsDBOnlyThreads(t *testing.T) 
 
 	// mergeThreadEntries appends threadDBOnly (not yet in items).
 	// PR review Round-3 Blocking #4: parent-follow predicate also applies here.
-	items = mergeThreadEntries(items, threadExtRows, map[string]*time.Time{}, categorySetting, map[string]struct{}{})
+	// lastMsgAtMap 必须为 ext 行登记活跃记录，否则生产代码会按 "幽灵 thread"
+	// 规则 skip — 这里给 threadDBOnly 一个活跃时间戳，让 merge 真正生效。
+	alive := time.Unix(800, 0)
+	lastMsgAtMap := map[string]*time.Time{
+		threadInIM:   &alive,
+		threadDBOnly: &alive,
+	}
+	items = mergeThreadEntries(items, threadExtRows, lastMsgAtMap, categorySetting, map[string]struct{}{})
 	require.Len(t, items, 2, "mergeThreadEntries must add the DB-only thread")
 
 	// Both thread IDs must be present.

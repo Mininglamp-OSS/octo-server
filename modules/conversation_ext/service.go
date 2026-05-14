@@ -136,14 +136,19 @@ func (s *Service) FollowChannel(uid, spaceID, groupNo string) error {
 		return errors.New("group_no must not be empty")
 	}
 	zero := int8(0)
+	// PR #21 review (lml2468 blocker #2)：所有同时触及 user_follow_version 与
+	// user_conversation_ext 的事务必须按相同顺序拿锁，否则与先锁 version
+	// 再锁 ext 的 UpdateSort 互锁。把 Bump 放在最前 —— 它通过
+	// INSERT ... ON DUPLICATE KEY UPDATE 对 user_follow_version (uid, space_id)
+	// 行加 X 锁，使本 tx 在 version 行上有排它后再进入 ext 行操作。
 	return s.withTx("FollowChannel", func(tx *dbr.Tx) error {
+		if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
+			return fmt.Errorf("FollowChannel bump version: %w", err)
+		}
 		if err := upsertTx(tx, uid, spaceID, targetTypeGroup, groupNo, ConvExtFields{
 			GroupUnfollowed: &zero,
 		}); err != nil {
 			return fmt.Errorf("FollowChannel upsert: %w", err)
-		}
-		if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
-			return fmt.Errorf("FollowChannel bump version: %w", err)
 		}
 		return nil
 	})
@@ -181,7 +186,12 @@ func (s *Service) UnfollowChannel(uid, spaceID, groupNo string) error {
 		return errors.New("group_no must not be empty")
 	}
 	one := int8(1)
+	// PR #21 review (lml2468 blocker #2)：bump 必须先于 ext 行操作，保证与
+	// UpdateSort 同序拿锁，避免 (version vs ext) 反向死锁。
 	return s.withTx("UnfollowChannel", func(tx *dbr.Tx) error {
+		if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
+			return fmt.Errorf("UnfollowChannel bump version: %w", err)
+		}
 		if err := upsertTx(tx, uid, spaceID, targetTypeGroup, groupNo, ConvExtFields{
 			GroupUnfollowed: &one,
 		}); err != nil {
@@ -194,9 +204,6 @@ func (s *Service) UnfollowChannel(uid, spaceID, groupNo string) error {
 			uid, spaceID, targetTypeThread, prefix,
 		).Exec(); err != nil {
 			return fmt.Errorf("UnfollowChannel delete threads: %w", err)
-		}
-		if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
-			return fmt.Errorf("UnfollowChannel bump version: %w", err)
 		}
 		return nil
 	})
@@ -234,6 +241,10 @@ func (s *Service) FollowThread(uid, spaceID, threadChannelID string) error {
 	}
 
 	return s.withTx("FollowThread", func(tx *dbr.Tx) error {
+		// PR #21 review (lml2468 blocker #2)：先 bump 后改 ext，与 UpdateSort 同序拿锁。
+		if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
+			return fmt.Errorf("FollowThread bump version: %w", err)
+		}
 		// 1. Clear parent group's unfollowed flag.
 		zero := int8(0)
 		if err := upsertTx(tx, uid, spaceID, targetTypeGroup, groupNo, ConvExtFields{
@@ -244,10 +255,6 @@ func (s *Service) FollowThread(uid, spaceID, threadChannelID string) error {
 		// 2. Upsert thread ext row (no additional fields — default values suffice).
 		if err := upsertTx(tx, uid, spaceID, targetTypeThread, threadChannelID, ConvExtFields{}); err != nil {
 			return fmt.Errorf("FollowThread upsert thread: %w", err)
-		}
-		// 3. Bump follow_version (PR review Round-3 Blocking #1/#2).
-		if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
-			return fmt.Errorf("FollowThread bump version: %w", err)
 		}
 		return nil
 	})
@@ -269,14 +276,15 @@ func (s *Service) UnfollowThread(uid, spaceID, threadChannelID string) error {
 	if _, _, err := parseThreadChannelID(threadChannelID); err != nil {
 		return err
 	}
+	// PR #21 review (lml2468 blocker #2)：先 bump 后改 ext，与 UpdateSort 同序拿锁。
 	return s.withTx("UnfollowThread", func(tx *dbr.Tx) error {
+		if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
+			return fmt.Errorf("UnfollowThread bump version: %w", err)
+		}
 		if _, err := tx.DeleteFrom(table).
 			Where("uid=? AND space_id=? AND target_type=? AND target_id=?",
 				uid, spaceID, targetTypeThread, threadChannelID).Exec(); err != nil {
 			return fmt.Errorf("UnfollowThread delete: %w", err)
-		}
-		if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
-			return fmt.Errorf("UnfollowThread bump version: %w", err)
 		}
 		return nil
 	})
@@ -301,12 +309,13 @@ func (s *Service) FollowDM(uid, spaceID, peerUID string, categoryID *int64) erro
 		FollowedDM:   &one,
 		DMCategoryID: categoryID,
 	}
+	// PR #21 review (lml2468 blocker #2)：先 bump 后改 ext，与 UpdateSort 同序拿锁。
 	return s.withTx("FollowDM", func(tx *dbr.Tx) error {
-		if err := upsertTx(tx, uid, spaceID, targetTypeDM, peerUID, fields); err != nil {
-			return fmt.Errorf("FollowDM upsert: %w", err)
-		}
 		if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
 			return fmt.Errorf("FollowDM bump version: %w", err)
+		}
+		if err := upsertTx(tx, uid, spaceID, targetTypeDM, peerUID, fields); err != nil {
+			return fmt.Errorf("FollowDM upsert: %w", err)
 		}
 		return nil
 	})
@@ -327,14 +336,15 @@ func (s *Service) UnfollowDM(uid, spaceID, peerUID string) error {
 	if peerUID == "" {
 		return errors.New("peer_uid must not be empty")
 	}
+	// PR #21 review (lml2468 blocker #2)：先 bump 后改 ext，与 UpdateSort 同序拿锁。
 	return s.withTx("UnfollowDM", func(tx *dbr.Tx) error {
+		if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
+			return fmt.Errorf("UnfollowDM bump version: %w", err)
+		}
 		if _, err := tx.DeleteFrom(table).
 			Where("uid=? AND space_id=? AND target_type=? AND target_id=?",
 				uid, spaceID, targetTypeDM, peerUID).Exec(); err != nil {
 			return fmt.Errorf("UnfollowDM delete: %w", err)
-		}
-		if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
-			return fmt.Errorf("UnfollowDM bump version: %w", err)
 		}
 		return nil
 	})

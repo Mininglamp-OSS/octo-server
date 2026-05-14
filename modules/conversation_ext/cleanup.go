@@ -1,6 +1,7 @@
 package conversation_ext
 
 import (
+	"sort"
 	"sync"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -67,6 +68,15 @@ func RemoveConvExtForUserInSpace(uid, spaceID, channelID string, channelType uin
 	}
 	defer tx.RollbackUnlessCommitted()
 
+	// PR #21 review (lml2468 blocker #2)：先 bump 后 delete，与 UpdateSort 同序拿锁。
+	if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
+		db.Warn("RemoveConvExtForUserInSpace: bump follow_version 失败（事务回滚）",
+			zap.String("uid", uid),
+			zap.String("spaceID", spaceID),
+			zap.Error(err))
+		return
+	}
+
 	if _, err := tx.DeleteFrom(table).
 		Where("uid=? AND space_id=? AND target_type=? AND target_id=?",
 			uid, spaceID, channelType, channelID).
@@ -95,14 +105,6 @@ func RemoveConvExtForUserInSpace(uid, spaceID, channelID string, channelType uin
 				zap.Error(err))
 			return
 		}
-	}
-
-	if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
-		db.Warn("RemoveConvExtForUserInSpace: bump follow_version 失败（事务回滚）",
-			zap.String("uid", uid),
-			zap.String("spaceID", spaceID),
-			zap.Error(err))
-		return
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -145,7 +147,20 @@ func RemoveConvExtForUser(uid, peerUID string) {
 			zap.String("uid", uid), zap.String("peerUID", peerUID), zap.Error(err))
 		return
 	}
-	// 2. DELETE。
+	// 2. 按 space_id 字典序排序后再依次 bump follow_version：
+	//    - PR #21 review (yujiawei P2-4)：避免两个并发 cleanup 在重叠 space 上
+	//      以相反顺序拿锁导致 MySQL 死锁；
+	//    - PR #21 review (lml2468 blocker #2)：bump 也必须先于 ext DELETE，
+	//      与 UpdateSort 同序拿 (version → ext) 锁。
+	sort.Strings(spaces)
+	for _, sp := range spaces {
+		if _, err := BumpFollowVersionTx(tx, uid, sp); err != nil {
+			db.Warn("RemoveConvExtForUser: bump follow_version 失败（事务回滚）",
+				zap.String("uid", uid), zap.String("spaceID", sp), zap.Error(err))
+			return
+		}
+	}
+	// 3. DELETE。
 	if _, err := tx.DeleteBySql(
 		"DELETE FROM "+table+" WHERE uid=? AND target_type=? AND target_id=?",
 		uid, targetTypeDM, peerUID,
@@ -153,14 +168,6 @@ func RemoveConvExtForUser(uid, peerUID string) {
 		db.Warn("RemoveConvExtForUser: 删除 DM ext 行失败（事务回滚）",
 			zap.String("uid", uid), zap.String("peerUID", peerUID), zap.Error(err))
 		return
-	}
-	// 3. 在每个 space 内把 follow_version +1。
-	for _, sp := range spaces {
-		if _, err := BumpFollowVersionTx(tx, uid, sp); err != nil {
-			db.Warn("RemoveConvExtForUser: bump follow_version 失败（事务回滚）",
-				zap.String("uid", uid), zap.String("spaceID", sp), zap.Error(err))
-			return
-		}
 	}
 	if err := tx.Commit(); err != nil {
 		db.Warn("RemoveConvExtForUser: Commit 失败", zap.String("uid", uid), zap.Error(err))
@@ -224,7 +231,26 @@ func RemoveConvExtForChannel(channelID string, channelType uint8) {
 		}
 	}
 
-	// 2. 主 DELETE（group 时还要级联 thread）。
+	// 2. 按 (uid, space_id) 字典序排序后依次 bump follow_version：
+	//    - PR #21 review (yujiawei P2-4)：相同顺序拿锁，避免并发 cleanup 死锁；
+	//    - PR #21 review (lml2468 blocker #2)：bump 必须先于 ext DELETE，
+	//      与 UpdateSort 同序拿 (version → ext) 锁。
+	sort.Slice(owners, func(i, j int) bool {
+		if owners[i].UID != owners[j].UID {
+			return owners[i].UID < owners[j].UID
+		}
+		return owners[i].SpaceID < owners[j].SpaceID
+	})
+	for _, o := range owners {
+		if _, err := BumpFollowVersionTx(tx, o.UID, o.SpaceID); err != nil {
+			db.Warn("RemoveConvExtForChannel: bump follow_version 失败（事务回滚）",
+				zap.String("uid", o.UID), zap.String("spaceID", o.SpaceID),
+				zap.String("channelID", channelID), zap.Error(err))
+			return
+		}
+	}
+
+	// 3. 主 DELETE（group 时还要级联 thread）。
 	if _, err := tx.DeleteFrom(table).
 		Where("target_type=? AND target_id=?", channelType, channelID).Exec(); err != nil {
 		db.Warn("RemoveConvExtForChannel: 删除频道 ext 行失败（事务回滚）",
@@ -239,17 +265,6 @@ func RemoveConvExtForChannel(channelID string, channelType uint8) {
 			targetTypeThread, prefix,
 		).Exec(); err != nil {
 			db.Warn("RemoveConvExtForChannel: 级联删除子区 ext 行失败（事务回滚）",
-				zap.String("channelID", channelID), zap.Error(err))
-			return
-		}
-	}
-
-	// 3. 在每个受影响的 (uid, space_id) 把 follow_version +1。
-	//    PR review Round-3 Blocking #1/#2 — 让客户端能感知到关注列表变化。
-	for _, o := range owners {
-		if _, err := BumpFollowVersionTx(tx, o.UID, o.SpaceID); err != nil {
-			db.Warn("RemoveConvExtForChannel: bump follow_version 失败（事务回滚）",
-				zap.String("uid", o.UID), zap.String("spaceID", o.SpaceID),
 				zap.String("channelID", channelID), zap.Error(err))
 			return
 		}
