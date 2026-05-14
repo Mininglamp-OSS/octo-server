@@ -1988,6 +1988,15 @@ func (m *Message) hasRevokePermission(messageM *messageModel, loginUID string) (
 		if loginMember == nil {
 			return false, nil
 		}
+		// Fail-safe：黑名单 / 已退出但 is_deleted=0 的成员（脏数据或软删除残留）即使
+		// role 仍是 manager/creator，也不视为有效管理者；否则被踢出的管理员仍能撤回
+		// 任意 webhook 消息（FromUID = "iwh_..."，走 fromMember==nil 分支）或普通成员
+		// 消息。PR Mininglamp-OSS/octo-server#31 round-4 (Jerry-Xin)。
+		// 与 modules/group/db.go:QueryIsGroupManagerOrCreator 的 status=Normal 过滤
+		// 配对——前者守住管理 API 入口，后者守住消息撤回入口。
+		if loginMember.Status != int(common.GroupMemberStatusNormal) {
+			return false, nil
+		}
 		fromMember, err := m.groupService.GetMember(messageM.ChannelID, messageM.FromUID)
 		if err != nil {
 			return false, err

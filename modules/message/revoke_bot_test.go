@@ -148,8 +148,8 @@ func TestHasRevokePermission_NotBotOwner_Group_NotAdmin(t *testing.T) {
 func TestHasRevokePermission_NotBotOwner_Group_Admin(t *testing.T) {
 	rb := &fakeRobotService{byRobotID: map[string]string{botUID: ownerUID}}
 	gs := &fakeGroupService{members: map[string]*group.MemberResp{
-		adminUID: {GroupNo: groupNo, UID: adminUID, Role: int(common.GroupMemberRoleManager)},
-		botUID:   {GroupNo: groupNo, UID: botUID, Role: int(common.GroupMemberRoleNormal)},
+		adminUID: {GroupNo: groupNo, UID: adminUID, Role: int(common.GroupMemberRoleManager), Status: int(common.GroupMemberStatusNormal)},
+		botUID:   {GroupNo: groupNo, UID: botUID, Role: int(common.GroupMemberRoleNormal), Status: int(common.GroupMemberStatusNormal)},
 	}}
 	m := newRevokeTestMessage(rb, gs)
 
@@ -181,13 +181,62 @@ func TestHasRevokePermission_EmptyCreatorUID(t *testing.T) {
 	assert.False(t, allow, "creator_uid 为空时不应意外授予 bot-owner 权限")
 }
 
-// 场景 7: robotService.GetCreatorUID 返回 error → 降级不阻断后续分支
+// 场景 7-blacklisted: 黑名单 manager 不能撤回 webhook 消息（fromMember==nil 分支）
+//
+// PR Mininglamp-OSS/octo-server#31 round-4 (Jerry-Xin)。webhook 消息的 FromUID
+// 形如 "iwh_..."，不是真实群成员 → 走 fromMember==nil 分支。该分支历史上
+// 「只要 loginMember.Role != normal 就允许撤回」，忽略 loginMember.Status，
+// 等于让被踢出（status=Blacklist 但 is_deleted=0）的 manager 仍能任意撤回。
+// 修复后必须 status=Normal 才视为有效管理者。
+func TestHasRevokePermission_BlacklistedManager_CannotRevokeWebhookMsg(t *testing.T) {
+	const webhookUID = "iwh_abcdef" // 模拟 webhook 发送方（非群成员）
+	rb := &fakeRobotService{}       // bot-owner 分支不命中
+	gs := &fakeGroupService{members: map[string]*group.MemberResp{
+		// 黑名单 manager：is_deleted=0 但 status=Blacklist —— 脏数据 / 被踢出但未硬删
+		adminUID: {GroupNo: groupNo, UID: adminUID, Role: int(common.GroupMemberRoleManager), Status: int(common.GroupMemberStatusBlacklist)},
+		// webhook 不写 member 表，故 webhookUID 不存在 → GetMember 返回 nil
+	}}
+	m := newRevokeTestMessage(rb, gs)
+
+	msg := &messageModel{
+		FromUID:     webhookUID,
+		ChannelID:   groupNo,
+		ChannelType: common.ChannelTypeGroup.Uint8(),
+	}
+
+	allow, err := m.hasRevokePermission(msg, adminUID)
+	assert.NoError(t, err)
+	assert.False(t, allow, "黑名单 manager 不应能撤回 webhook 消息")
+}
+
+// 场景 7-blacklisted-2: 黑名单 manager 也不能撤回普通成员消息
+// （证明修复不只针对 fromMember==nil 分支，所有 group-revoke 路径都受 status 校验拦截）
+func TestHasRevokePermission_BlacklistedManager_CannotRevokeNormalMemberMsg(t *testing.T) {
+	rb := &fakeRobotService{} // bot-owner 分支不命中
+	gs := &fakeGroupService{members: map[string]*group.MemberResp{
+		adminUID:   {GroupNo: groupNo, UID: adminUID, Role: int(common.GroupMemberRoleManager), Status: int(common.GroupMemberStatusBlacklist)},
+		strangerID: {GroupNo: groupNo, UID: strangerID, Role: int(common.GroupMemberRoleNormal), Status: int(common.GroupMemberStatusNormal)},
+	}}
+	m := newRevokeTestMessage(rb, gs)
+
+	msg := &messageModel{
+		FromUID:     strangerID,
+		ChannelID:   groupNo,
+		ChannelType: common.ChannelTypeGroup.Uint8(),
+	}
+
+	allow, err := m.hasRevokePermission(msg, adminUID)
+	assert.NoError(t, err)
+	assert.False(t, allow, "黑名单 manager 不应能撤回普通成员消息")
+}
+
+// 场景 8: robotService.GetCreatorUID 返回 error → 降级不阻断后续分支
 // 并且不应向上返回 error。通过设置群管理员分支可命中来验证降级正确。
 func TestHasRevokePermission_RobotServiceError(t *testing.T) {
 	rb := &fakeRobotService{err: errors.New("mock db down")}
 	gs := &fakeGroupService{members: map[string]*group.MemberResp{
-		adminUID: {GroupNo: groupNo, UID: adminUID, Role: int(common.GroupMemberRoleCreater)},
-		botUID:   {GroupNo: groupNo, UID: botUID, Role: int(common.GroupMemberRoleNormal)},
+		adminUID: {GroupNo: groupNo, UID: adminUID, Role: int(common.GroupMemberRoleCreater), Status: int(common.GroupMemberStatusNormal)},
+		botUID:   {GroupNo: groupNo, UID: botUID, Role: int(common.GroupMemberRoleNormal), Status: int(common.GroupMemberStatusNormal)},
 	}}
 	m := newRevokeTestMessage(rb, gs)
 
