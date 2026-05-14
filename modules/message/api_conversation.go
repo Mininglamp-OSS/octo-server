@@ -122,7 +122,7 @@ func (co *Conversation) Route(r *wkhttp.WKHttp) {
 		co.handleConversationDeleteEvent(data, commit)
 	})
 
-	// v2 sidebar
+	// sidebar 聚合接口（/v1/sidebar/sync）
 	RegisterSidebarRoutes(r, co.ctx)
 }
 
