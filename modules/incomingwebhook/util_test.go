@@ -54,24 +54,40 @@ func TestBuildPayload_OverrideUsernameAndAvatar(t *testing.T) {
 	assert.Equal(t, "https://gh/a.png", from["avatar"])
 }
 
-func TestBuildPayload_ExtraDoesNotOverrideKeyFields(t *testing.T) {
+// TestBuildPayload_DropsAllExtra 锁定 Extra 一律丢弃的语义：调用方任何 key
+// 都不能写入持久化 payload。重点防御 visibles —— message 模块把它当作服务端
+// 强制的可见性白名单解释（不在列表内的用户会被同步标删 + 单消息 404），允许
+// token 持有者写就等于给了一个"对管理员隐身的群消息"通道。
+func TestBuildPayload_DropsAllExtra(t *testing.T) {
 	m := &incomingWebhookModel{WebhookID: "iwh_x", Name: "WH"}
 	req := &pushPayloadReq{
 		Content: "real",
 		Extra: map[string]interface{}{
-			"type":    9999,        // 不能覆盖
-			"content": "fake",      // 不能覆盖
-			"from":    "fake",      // 不能覆盖
-			"mention": "fake",      // 不能覆盖
-			"link":    "https://x", // 允许透传
+			"visibles":   []string{"attacker_uid"}, // 关键：访问控制字段必须被丢弃
+			"mention":    map[string]interface{}{"all": true},
+			"reminder":   "fake",
+			"link":       "https://x",
+			"type":       9999,
+			"content":    "fake",
+			"from":       "fake",
+			"space_id":   "forged",
+			"anything":   "else",
 		},
 	}
 	p := buildPayload(m, req)
+	// 核心字段保持服务端值
 	assert.Equal(t, int(common.Text), p["type"])
 	assert.Equal(t, "real", p["content"])
 	_, isMap := p["from"].(map[string]interface{})
 	assert.True(t, isMap, "from must remain the structured object")
-	assert.Equal(t, "https://x", p["link"])
+	// Extra 中任何 key 都不能写入 payload
+	for k := range req.Extra {
+		if k == "type" || k == "content" || k == "from" || k == "space_id" {
+			continue // 这些是服务端字段，断言已在上面
+		}
+		_, exists := p[k]
+		assert.Falsef(t, exists, "extra key %q must not leak into payload", k)
+	}
 }
 
 func TestBuildPayload_SpaceIDFromModelNotExtra(t *testing.T) {

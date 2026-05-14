@@ -1,13 +1,18 @@
 package incomingwebhook
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/db"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/gocraft/dbr/v2"
 )
+
+// ErrQuotaExceeded 创建时配额已满，由 insertWithQuota 在事务内原子判定。
+var ErrQuotaExceeded = errors.New("incomingwebhook: per-group quota exceeded")
 
 type incomingWebhookDB struct {
 	session *dbr.Session
@@ -18,14 +23,42 @@ func newDB(ctx *config.Context) *incomingWebhookDB {
 	return &incomingWebhookDB{ctx: ctx, session: ctx.DB()}
 }
 
-func (d *incomingWebhookDB) insert(m *incomingWebhookModel) error {
-	_, err := d.session.InsertInto("incoming_webhook").
-		Columns(util.AttrToUnderscore(m)...).
-		Record(m).Exec()
+// insertWithQuota 在事务内做"配额校验 + 写入"原子操作：
+//  1. SELECT count(*) ... WHERE group_no=? FOR UPDATE：在 idx_incoming_webhook_group
+//     上对该 group_no 范围加 next-key lock（InnoDB REPEATABLE READ 下覆盖间隙），
+//     并发的同 group 创建请求会被阻塞在此处直到本事务结束。
+//  2. count >= max 返回 ErrQuotaExceeded，事务回滚。
+//  3. 显式回填 CreatedAt：dbr 的 InsertInto.Record 不会从 DB 默认值回读时间，
+//     不写就会导致响应里的 created_at = epoch(0)。
+//
+// 替代之前的 countByGroupNo + insert 两步式调用——那种写法在没有锁的情况下并发
+// 创建会同时通过配额检查并都执行 INSERT，绕过 maxPerGroup 上限（lml2468 / Jerry-Xin
+// PR #31 review）。
+func (d *incomingWebhookDB) insertWithQuota(m *incomingWebhookModel, max int) error {
+	tx, err := d.session.Begin()
 	if err != nil {
+		return fmt.Errorf("incomingwebhook: begin tx: %w", err)
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	var count int
+	if _, err = tx.SelectBySql(
+		"SELECT count(*) FROM incoming_webhook WHERE group_no=? FOR UPDATE",
+		m.GroupNo,
+	).Load(&count); err != nil {
+		return fmt.Errorf("incomingwebhook: count for update: %w", err)
+	}
+	if count >= max {
+		return ErrQuotaExceeded
+	}
+
+	m.CreatedAt = db.Time(time.Now())
+	if _, err = tx.InsertInto("incoming_webhook").
+		Columns(util.AttrToUnderscore(m)...).
+		Record(m).Exec(); err != nil {
 		return fmt.Errorf("incomingwebhook: insert: %w", err)
 	}
-	return nil
+	return tx.Commit()
 }
 
 // queryByWebhookID 不存在时返回 (nil, nil)；dbr.Load 在无结果时即返回 (0, nil)，
@@ -44,16 +77,6 @@ func (d *incomingWebhookDB) queryByGroupNo(groupNo string) ([]*incomingWebhookMo
 		OrderDir("created_at", false).
 		Load(&list)
 	return list, err
-}
-
-// countByGroupNo 统计某群下所有 webhook 数量，**不**过滤 status——禁用的也占配额。
-// 这是有意为之：避免 enable→disable→create 循环绕过 max_per_group 限制。
-// 删除（不仅是禁用）才会释放配额。
-func (d *incomingWebhookDB) countByGroupNo(groupNo string) (int, error) {
-	var n int
-	err := d.session.Select("count(*)").From("incoming_webhook").
-		Where("group_no=?", groupNo).LoadOne(&n)
-	return n, err
 }
 
 // updateFieldsAllowed 限定 updateFields 可写的列，防御未来调用方误传用户输入作 key

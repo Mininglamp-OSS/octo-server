@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -100,7 +102,6 @@ func parseJSON(t *testing.T, w *httptest.ResponseRecorder) map[string]interface{
 // ============================================================
 
 func TestCreate_HappyPath(t *testing.T) {
-	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	handler, _, groupNo := setupTestEnv(t)
 	w := do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), map[string]interface{}{
 		"name": "GitHub Bot",
@@ -112,6 +113,9 @@ func TestCreate_HappyPath(t *testing.T) {
 	assert.NotEmpty(t, res["url"])
 	url, _ := res["url"].(string)
 	assert.True(t, strings.HasPrefix(url, "/v1/incoming-webhooks/"))
+	// created_at 必须由 insertWithQuota 回填，否则会以 epoch(0) 返回给客户端
+	createdAt, _ := res["created_at"].(float64)
+	assert.Greater(t, int64(createdAt), int64(0), "created_at must be populated, not zero/epoch")
 }
 
 func TestCreate_RejectsEmptyName(t *testing.T) {
@@ -192,7 +196,6 @@ func TestRegenerate_RotatesToken(t *testing.T) {
 // ============================================================
 
 func TestPush_RejectsBadToken(t *testing.T) {
-	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	handler, _, groupNo := setupTestEnv(t)
 	w := do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), map[string]interface{}{
 		"name": "x",
@@ -208,7 +211,6 @@ func TestPush_RejectsBadToken(t *testing.T) {
 }
 
 func TestPush_RejectsDisabledWebhook(t *testing.T) {
-	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	handler, ctx, groupNo := setupTestEnv(t)
 	w := do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), map[string]interface{}{
 		"name": "x",
@@ -345,7 +347,6 @@ func TestPush_RegenerateInvalidatesOldToken(t *testing.T) {
 }
 
 func TestCreate_QuotaEnforced(t *testing.T) {
-	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	handler, _, groupNo := setupTestEnv(t)
 	// 把每群配额降到 2，避免循环 10 次拖慢测试
 	t.Setenv("DM_INCOMINGWEBHOOK_MAX_PER_GROUP", "2")
@@ -362,6 +363,44 @@ func TestCreate_QuotaEnforced(t *testing.T) {
 	}))
 	assert.NotEqual(t, http.StatusOK, w.Code)
 	assert.Contains(t, w.Body.String(), "最多")
+}
+
+// TestCreate_QuotaConcurrent 验证 insertWithQuota 在并发下守住上限。
+// 之前的 countByGroupNo + insert 两步式写法在并发下会让多个请求同时通过配额校验，
+// 实际写入超过 maxPerGroup（PR #31 lml2468 / Jerry-Xin 反馈）。
+func TestCreate_QuotaConcurrent(t *testing.T) {
+	handler, ctx, groupNo := setupTestEnv(t)
+	const cap = 3
+	const fanout = 10
+	t.Setenv("DM_INCOMINGWEBHOOK_MAX_PER_GROUP", strconv.Itoa(cap))
+
+	var wg sync.WaitGroup
+	codes := make([]int, fanout)
+	for i := 0; i < fanout; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			w := do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), map[string]interface{}{
+				"name": fmt.Sprintf("wh-%d", idx),
+			}))
+			codes[idx] = w.Code
+		}(i)
+	}
+	wg.Wait()
+
+	ok := 0
+	for _, c := range codes {
+		if c == http.StatusOK {
+			ok++
+		}
+	}
+	assert.Equalf(t, cap, ok, "exactly %d concurrent creates should succeed, got %d (codes=%v)", cap, ok, codes)
+
+	// DB 里也应当只有 cap 条记录
+	var rows int
+	_, err := ctx.DB().SelectBySql("SELECT count(*) FROM incoming_webhook WHERE group_no=?", groupNo).Load(&rows)
+	assert.NoError(t, err)
+	assert.Equal(t, cap, rows, "DB row count must equal cap; quota leaked under concurrency")
 }
 
 // TestDisbandedGroup_FailsClosed 锁定 disband 生命周期：群一旦进入非 Normal
