@@ -312,13 +312,25 @@ func validatePublicDownloadURL(rawURL string) error {
 }
 
 // validatePresignObjectKey rejects object keys that would produce a
-// nonsense S3 path: empty keys, trailing slash (no actual object), and
-// any embedded `//` (a directory marker that the gateway would normalize
-// away, breaking signature validation). Matches the empty-key error
-// style used throughout the file module.
+// nonsense S3 path: empty keys, leading slash (which becomes `//` after
+// the bucket separator and trips the same gateway-normalization hazard
+// as the embedded-`//` case below), trailing slash (no actual object),
+// and any embedded `//` (a directory marker that the gateway would
+// normalize away, breaking signature validation). Matches the empty-key
+// error style used throughout the file module.
 func validatePresignObjectKey(objectKey string) error {
 	if objectKey == "" {
 		return fmt.Errorf("空对象路径，无法生成预签名URL")
+	}
+	if strings.HasPrefix(objectKey, "/") {
+		// `splitBucketAndObject` splits on the first `/`, so an input like
+		// `chat//foo.png` yields bucket=`chat`, objectKey=`/foo.png`. The
+		// signed canonical URI then becomes `/chat//foo.png` and gets
+		// path-normalized to `/chat/foo.png` by HTTP intermediaries —
+		// same SignatureDoesNotMatch failure mode as the embedded-`//`
+		// rejection below, just routed through the bucket-separator
+		// boundary. Reject up front for parity.
+		return fmt.Errorf("对象路径不可以斜杠开头，无法生成预签名URL: %q", objectKey)
 	}
 	if strings.HasSuffix(objectKey, "/") {
 		return fmt.Errorf("对象路径不可以斜杠结尾，无法生成预签名URL: %q", objectKey)

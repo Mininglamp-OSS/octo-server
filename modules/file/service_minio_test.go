@@ -44,6 +44,13 @@ func TestPresignedURLs_RejectMalformedObjectKeys(t *testing.T) {
 		{"trailing slash on allowed bucket prefix", "chat/dir/"},
 		{"trailing slash falls through to default bucket", "loose-name/"},
 		{"embedded double slash inside object key", "chat/a//b.png"},
+		// Leading-slash bypass of the `//` rejection: input `chat//foo.png`
+		// splits to bucket=`chat`, objectKey=`/foo.png` (no embedded `//`,
+		// not trailing-slash, not empty). Without an explicit leading-slash
+		// guard the canonical URI becomes `/chat//foo.png` and gateway
+		// normalization rewrites it to `/chat/foo.png` mid-flight, breaking
+		// signature validation. Pinned in PR#50 R5 codex finding 2.3.
+		{"leading slash via bucket-separator boundary", "chat//foo.png"},
 	}
 	for _, tc := range cases {
 		t.Run("PUT/"+tc.name, func(t *testing.T) {
