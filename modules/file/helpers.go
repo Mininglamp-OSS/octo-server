@@ -51,3 +51,29 @@ func splitBucketAndObject(objectPath string, defaultBucket string, allowed map[s
 	}
 	return first, rest
 }
+
+// ossNormalizeObjectKey returns the canonical OSS object key for an input
+// `objectPath` that may carry a leading `/` and / or a leading
+// `<bucketName>/` segment. Pure form of `ServiceOSS.normalizeOSSObjectKey`
+// — broken out so unit tests can exercise the bucket-name-equals-prefix
+// asymmetry path without a config context.
+//
+// Behavior:
+//
+//	bucketName="my-bucket", objectPath="my-bucket/chat/x.png" → "chat/x.png"
+//	bucketName="my-bucket", objectPath="/my-bucket/chat/x.png" → "chat/x.png"
+//	bucketName="chat",      objectPath="chat/2025/x.png"     → "2025/x.png"
+//	bucketName="chat",      objectPath="/chat/2025/x.png"    → "2025/x.png"
+//	bucketName="other",     objectPath="chat/2025/x.png"     → "chat/2025/x.png"
+//
+// Note the bucket-name-equals-prefix case (third row): the file API at
+// `modules/file/api.go` emits `<fileType>/<...>` where `fileType` is the
+// query string `type` (`chat`, `moment`, etc.). When a deployer's OSS
+// bucket happens to be named `chat`, the prefix gets stripped — both
+// `UploadFile` and `PresignedPutURL` apply the same rule so the two
+// upload paths land at the same OSS key for the same logical input.
+func ossNormalizeObjectKey(bucketName, objectPath string) string {
+	objectPath = strings.TrimPrefix(objectPath, "/")
+	prefix := bucketName + "/"
+	return strings.TrimPrefix(objectPath, prefix)
+}

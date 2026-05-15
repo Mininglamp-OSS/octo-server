@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -69,7 +68,12 @@ func (s *ServiceOSS) UploadFile(filePath string, contentType string, contentDisp
 	if contentDisposition != "" {
 		putOptions = append(putOptions, oss.ContentDisposition(contentDisposition))
 	}
-	err = bucket.PutObject(filePath, buff, putOptions...)
+	// Use the shared key normalizer so server-side and presigned uploads land
+	// at the SAME object key for the same logical input — see
+	// `normalizeOSSObjectKey` for the rationale (bucket-name-equals-prefix
+	// asymmetry, PR#50 R5 codex finding 2.4).
+	objectKey := s.normalizeOSSObjectKey(filePath)
+	err = bucket.PutObject(objectKey, buff, putOptions...)
 	if err != nil {
 		return nil, err
 	}
@@ -88,14 +92,28 @@ func (s *ServiceOSS) DownloadURL(path string, filename string) (string, error) {
 	return rpath, nil
 }
 
-// trimBucketPrefix strips a leading `<bucketName>/` from the object path. OSS
-// only takes the object key in SignURL — passing a path that starts with the
-// bucket would sign `/<bucket>/<bucket>/<key>` and 404 at the gateway.
-func (s *ServiceOSS) trimBucketPrefix(objectPath string) string {
-	bucketName := s.ctx.GetConfig().OSS.BucketName
-	objectPath = strings.TrimPrefix(objectPath, "/")
-	prefix := bucketName + "/"
-	return strings.TrimPrefix(objectPath, prefix)
+// normalizeOSSObjectKey turns an `objectPath` from the file API into the
+// canonical OSS object key. OSS only takes the object key in SignURL /
+// PutObject — passing a path that starts with the bucket would sign /
+// store under `/<bucket>/<bucket>/<key>` and 404 at the gateway.
+//
+// `UploadFile` (server-side) and `PresignedPutURL` / `PresignedGetURL`
+// (browser-direct) both call this helper so the two upload paths land
+// at the SAME key for the same logical input. The previous code had
+// `UploadFile` use `filePath` raw while presigned URLs stripped a
+// leading `<BucketName>/` prefix; when a deployer's bucket name happened
+// to match a `fileType` prefix produced by `modules/file/api.go`
+// (e.g. bucket=`chat`), the two paths landed on different keys for the
+// same input — fixed in PR#50 R5 codex finding 2.4.
+//
+// Normalization rules:
+//   - strip a single leading `/` (file API may emit either form)
+//   - strip a leading `<BucketName>/` segment when present
+//
+// The pure form (`ossNormalizeObjectKey` in helpers.go) is exposed for
+// unit testing without a config context.
+func (s *ServiceOSS) normalizeOSSObjectKey(objectPath string) string {
+	return ossNormalizeObjectKey(s.ctx.GetConfig().OSS.BucketName, objectPath)
 }
 
 // PresignedPutURL signs an OSS PUT URL the browser can use directly.
@@ -115,7 +133,7 @@ func (s *ServiceOSS) PresignedPutURL(objectPath string, contentType string, cont
 		return "", "", err
 	}
 
-	key := s.trimBucketPrefix(objectPath)
+	key := s.normalizeOSSObjectKey(objectPath)
 	if key == "" {
 		return "", "", fmt.Errorf("空对象路径，无法生成预签名URL")
 	}
@@ -153,7 +171,7 @@ func (s *ServiceOSS) PresignedGetURL(objectPath string, filename string, disposi
 		return "", err
 	}
 
-	key := s.trimBucketPrefix(objectPath)
+	key := s.normalizeOSSObjectKey(objectPath)
 	if key == "" {
 		return "", fmt.Errorf("空对象路径，无法生成预签名URL")
 	}

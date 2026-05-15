@@ -131,3 +131,86 @@ func TestSplitBucketAndObject(t *testing.T) {
 		})
 	}
 }
+
+// TestOSSNormalizeObjectKey pins the canonical key derivation used by
+// ServiceOSS.UploadFile / PresignedPutURL / PresignedGetURL.
+// PR#50 R5 codex finding 2.4: the two upload paths must agree for the
+// same logical input, especially in the bucket-name-equals-prefix case.
+func TestOSSNormalizeObjectKey(t *testing.T) {
+	cases := []struct {
+		name       string
+		bucketName string
+		input      string
+		want       string
+	}{
+		{
+			name:       "no leading slash, no bucket prefix",
+			bucketName: "my-bucket",
+			input:      "chat/2025/x.png",
+			want:       "chat/2025/x.png",
+		},
+		{
+			name:       "leading slash stripped",
+			bucketName: "my-bucket",
+			input:      "/chat/2025/x.png",
+			want:       "chat/2025/x.png",
+		},
+		{
+			name:       "bucket prefix stripped",
+			bucketName: "my-bucket",
+			input:      "my-bucket/chat/2025/x.png",
+			want:       "chat/2025/x.png",
+		},
+		{
+			name:       "leading slash + bucket prefix both stripped",
+			bucketName: "my-bucket",
+			input:      "/my-bucket/chat/2025/x.png",
+			want:       "chat/2025/x.png",
+		},
+		{
+			// The asymmetry path that PR#50 R5 codex finding 2.4 calls
+			// out: when the deployer's bucket name happens to match a
+			// `fileType` prefix from modules/file/api.go (`chat`), the
+			// helper strips it. Both UploadFile and PresignedPutURL
+			// route through this helper now, so they land at the SAME
+			// key (`2025/x.png`) — previously UploadFile kept the raw
+			// `chat/2025/x.png` while PresignedPutURL stripped to
+			// `2025/x.png`, and the two upload paths fragmented the
+			// object namespace.
+			name:       "bucket name equals fileType prefix (chat)",
+			bucketName: "chat",
+			input:      "chat/2025/x.png",
+			want:       "2025/x.png",
+		},
+		{
+			name:       "bucket name equals fileType prefix with leading slash",
+			bucketName: "chat",
+			input:      "/chat/2025/x.png",
+			want:       "2025/x.png",
+		},
+		{
+			// Bucket name that is a strict prefix of the first segment
+			// (but not equal to it) must NOT be stripped.
+			name:       "bucket name is non-segment prefix only",
+			bucketName: "ch",
+			input:      "chat/2025/x.png",
+			want:       "chat/2025/x.png",
+		},
+		{
+			name:       "empty input",
+			bucketName: "my-bucket",
+			input:      "",
+			want:       "",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ossNormalizeObjectKey(tc.bucketName, tc.input)
+			if got != tc.want {
+				t.Errorf("ossNormalizeObjectKey(%q, %q) = %q, want %q",
+					tc.bucketName, tc.input, got, tc.want)
+			}
+		})
+	}
+}
