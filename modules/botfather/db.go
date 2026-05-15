@@ -36,7 +36,7 @@ type robotModel struct {
 	AccessMode    int    // 0=需要审批 1=自动通过 2=禁止申请
 	AgentPlatform string // AI Agent 平台名称（如 OpenClaw）
 	AgentVersion  string // Agent 平台版本号
-	PluginVersion string // DMWork 插件版本号
+	PluginVersion string // Octo 插件版本号
 	db.BaseModel
 }
 

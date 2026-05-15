@@ -140,7 +140,7 @@ func TestGenerateSkillMD(t *testing.T) {
 	md := generateSkillMD(apiURL, wsURL)
 
 	// 应包含关键内容
-	assert.Contains(t, md, "dmwork")
+	assert.Contains(t, md, "octo")
 	assert.Contains(t, md, apiURL)
 	assert.Contains(t, md, wsURL)
 	assert.Contains(t, md, "/v1/bot/register")

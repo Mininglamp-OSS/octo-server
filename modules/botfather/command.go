@@ -469,13 +469,13 @@ func (h *commandHandler) handleQuickstart(fromUID string) {
 		apiURL = fmt.Sprintf("http://%s:8090", cfg.External.IP)
 	}
 
-	h.reply(fromUID, fmt.Sprintf("🚀 **Quickstart**\n\n一键为你的所有 OpenClaw Agent 创建对应的 DMWork bot 并完成绑定，让每个 Agent 都能通过 DMWork 收发消息。\n\n📋 **把下述内容发给 OpenClaw 执行（未安装插件请先使用 /install）：**\n\n```\n为所有 agent 批量创建并绑定 DMWork bot：\nnpx -y openclaw-channel-dmwork quickstart --api-key %s --api-url %s\n```",
+	h.reply(fromUID, fmt.Sprintf("🚀 **Quickstart**\n\n一键为你的所有 OpenClaw Agent 创建对应的 Octo bot 并完成绑定，让每个 Agent 都能通过 Octo 收发消息。\n\n📋 **把下述内容发给 OpenClaw 执行（未安装插件请先使用 /install）：**\n\n```\n为所有 agent 批量创建并绑定 Octo bot：\nnpx -y openclaw-channel-octo quickstart --api-key %s --api-url %s\n```",
 		apiKey, apiURL))
 }
 
 func (h *commandHandler) handleInstall(fromUID string) {
 	h.sm.Clear(fromUID, h.spaceID(fromUID))
-	h.reply(fromUID, "📦 **安装/更新 DMWork 插件**\n\n💡 建议先将 OpenClaw 升级到最新版本以获得最佳体验。\n\n📋 **把下面命令发给 OpenClaw 模型执行：**\n\n```\nnpx -y openclaw-channel-dmwork install\n```\n\n安装完成后，使用 /newbot 创建单个 bot 或 /quickstart 批量创建。")
+	h.reply(fromUID, "📦 **安装/更新 Octo 插件**\n\n💡 建议先将 OpenClaw 升级到最新版本以获得最佳体验。\n\n📋 **把下面命令发给 OpenClaw 模型执行：**\n\n```\nnpx -y openclaw-channel-octo install\n```\n\n安装完成后，使用 /newbot 创建单个 bot 或 /quickstart 批量创建。")
 }
 
 func (h *commandHandler) handleHelp(fromUID string) {
@@ -484,7 +484,7 @@ func (h *commandHandler) handleHelp(fromUID string) {
 
 **可用命令：**
 
-- /install — 安装/更新 DMWork 插件
+- /install — 安装/更新 Octo 插件
 - /quickstart — AI Agent 快速入门（推荐）
 - /newbot — 创建新机器人
 - /mybots — 查看我的机器人
@@ -981,10 +981,10 @@ func (h *commandHandler) sendConnectPrompt(toUID string, bot *robotModel) {
 		"**Bot Name:** %s  \n**Bot ID:** %s  \n**Bot Token:** %s  \n**API Server:** %s\n\n"+
 		"📋 **把下述内容发给 OpenClaw 执行，默认绑定到当前 Session 的 Agent（需先执行 /install 安装插件）：**\n\n"+
 		"```\n"+
-		"将 DMWork bot %s 绑定到 Agent。\n"+
+		"将 Octo bot %s 绑定到 Agent。\n"+
 		"默认绑定到当前 Session 的 Agent，agent 标识通过 /status 查看。\n"+
 		"如果用户指定了其他 Agent，使用用户指定的标识替换。\n\n"+
-		"npx -y openclaw-channel-dmwork bind --bot-token %s --api-url %s --account-id %s --agent <agent标识>\n"+
+		"npx -y openclaw-channel-octo bind --bot-token %s --api-url %s --account-id %s --agent <agent标识>\n"+
 		"```\n\n"+
 		"💡 **如需绑定到其他 Agent，修改 `--agent` 参数即可。**\n"+
 		"🔌 断开连接请发送 /disconnect",
@@ -1005,10 +1005,10 @@ func (h *commandHandler) sendCreatedPrompt(toUID string, name string, bot *robot
 		"**Bot Name:** %s  \n**Bot ID:** %s  \n**Bot Token:** %s  \n**API Server:** %s\n\n"+
 		"📋 **把下述内容发给 OpenClaw 执行，默认绑定到当前 Session 的 Agent（未安装插件请先使用 /install）：**\n\n"+
 		"```\n"+
-		"将 DMWork bot %s 绑定到 Agent。\n"+
+		"将 Octo bot %s 绑定到 Agent。\n"+
 		"默认绑定到当前 Session 的 Agent，agent 标识通过 /status 查看。\n"+
 		"如果用户指定了其他 Agent，使用用户指定的标识替换。\n\n"+
-		"npx -y openclaw-channel-dmwork bind --bot-token %s --api-url %s --account-id %s --agent <agent标识>\n"+
+		"npx -y openclaw-channel-octo bind --bot-token %s --api-url %s --account-id %s --agent <agent标识>\n"+
 		"```\n\n"+
 		"💡 **如需绑定到其他 Agent，修改 `--agent` 参数即可。**",
 		name, name, bot.RobotID, bot.BotToken, apiURL,

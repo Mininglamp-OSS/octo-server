@@ -75,9 +75,9 @@ func (s *EmailService) SendVerifyCode(ctx context.Context, email string, codeTyp
 		return err
 	}
 
-	subject := "DMWork 验证码"
+	subject := "Octo 验证码"
 	body := fmt.Sprintf(`<div style="max-width:400px;margin:20px auto;font-family:Arial,sans-serif;padding:20px;border:1px solid #e0e0e0;border-radius:8px;">
-<h2 style="color:#7c3aed;margin:0 0 16px;">DMWork</h2>
+<h2 style="color:#7c3aed;margin:0 0 16px;">Octo</h2>
 <p style="color:#333;">您的验证码为：</p>
 <div style="background:#f5f3ff;padding:16px;border-radius:6px;text-align:center;margin:12px 0;">
 <span style="font-size:32px;font-weight:bold;letter-spacing:8px;color:#7c3aed;">%s</span>

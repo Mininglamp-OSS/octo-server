@@ -28,7 +28,7 @@ func emailInviteAcceptURL(base, rawToken string) string {
 func inviterDisplay(name string) string {
 	name = strings.TrimSpace(name)
 	if name == "" {
-		return "DMWork 管理员"
+		return "Octo 管理员"
 	}
 	return name
 }
@@ -51,7 +51,7 @@ var (
 	ownerEmailTpl = template.Must(template.New("owner_invite").Parse(`<!DOCTYPE html>
 <html><body style="font-family:Arial,Helvetica,sans-serif;background:#f8fafc;padding:24px;">
 <div style="max-width:520px;margin:0 auto;background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:32px;">
-  <h2 style="color:#7c3aed;margin:0 0 16px;">DMWork Space 邀请</h2>
+  <h2 style="color:#7c3aed;margin:0 0 16px;">Octo Space 邀请</h2>
   <p style="color:#111;font-size:15px;line-height:1.6;">
     {{.InviterName}} 邀请你创建并成为团队空间 <strong>{{.PlannedName}}</strong> 的所有者。
   </p>
@@ -69,7 +69,7 @@ var (
 	memberEmailTpl = template.Must(template.New("member_invite").Parse(`<!DOCTYPE html>
 <html><body style="font-family:Arial,Helvetica,sans-serif;background:#f8fafc;padding:24px;">
 <div style="max-width:520px;margin:0 auto;background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:32px;">
-  <h2 style="color:#7c3aed;margin:0 0 16px;">DMWork Space 邀请</h2>
+  <h2 style="color:#7c3aed;margin:0 0 16px;">Octo Space 邀请</h2>
   <p style="color:#111;font-size:15px;line-height:1.6;">
     {{.InviterName}} 邀请你以 <strong>{{.RoleLabel}}</strong> 身份加入团队空间 <strong>{{.SpaceName}}</strong>。
   </p>
@@ -96,7 +96,7 @@ func buildOwnerInviteEmail(inv *spaceEmailInviteModel, inviterName, acceptURL st
 		PlannedDesc: inv.PlannedDescription,
 		AcceptURL:   template.URL(acceptURL),
 	}
-	subject := fmt.Sprintf("DMWork 邀请你创建团队空间「%s」", inv.PlannedName)
+	subject := fmt.Sprintf("Octo 邀请你创建团队空间「%s」", inv.PlannedName)
 	var buf bytes.Buffer
 	if err := ownerEmailTpl.Execute(&buf, data); err != nil {
 		return "", "", fmt.Errorf("渲染 owner 邀请邮件失败: %w", err)
@@ -116,7 +116,7 @@ func buildMemberInviteEmail(inv *spaceEmailInviteModel, inviterName, spaceName, 
 		RoleLabel:   roleLabel,
 		AcceptURL:   template.URL(acceptURL),
 	}
-	subject := fmt.Sprintf("DMWork 邀请你加入团队空间「%s」", spaceName)
+	subject := fmt.Sprintf("Octo 邀请你加入团队空间「%s」", spaceName)
 	var buf bytes.Buffer
 	if err := memberEmailTpl.Execute(&buf, data); err != nil {
 		return "", "", fmt.Errorf("渲染 member 邀请邮件失败: %w", err)
