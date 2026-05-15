@@ -939,6 +939,32 @@ func TestSortFollowItems_IntraCategoryAsFallbackWhenFollowSortEqual(t *testing.T
 	assert.Equal(t, "g-b", items[0].TargetID, "FollowSort 同为 0 时回退到 category-management UI 的顺序")
 }
 
+// PR #42 review (yujiawei) regression：IsPinned 从 T3 提升到 T2 后，pin 必须
+// 在同 category 内胜过 FollowSort —— 即便被 pin 的 item 的 FollowSort 远大于
+// 未 pin 的 item。"pin overrides everything within a category" 是排序契约的
+// 显式语义，需要专门验证以防回归。
+func TestSortFollowItems_PinnedBeatsFollowSort(t *testing.T) {
+	items := []*SidebarItem{
+		{TargetID: "unpinned", CategorySort: 1, IsPinned: false, FollowSort: 1},
+		{TargetID: "pinned", CategorySort: 1, IsPinned: true, FollowSort: 99},
+	}
+	sortFollowItems(items)
+	assert.Equal(t, "pinned", items[0].TargetID,
+		"pin 必须凌驾于 FollowSort：FollowSort=99 的 pinned 项必须排在 FollowSort=1 的 unpinned 项前")
+	assert.Equal(t, "unpinned", items[1].TargetID)
+}
+
+// pin 与 intraCategorySort 的交互：pin 同样必须凌驾于 intraCategorySort（T2 > T4）。
+func TestSortFollowItems_PinnedBeatsIntraCategorySort(t *testing.T) {
+	items := []*SidebarItem{
+		{TargetID: "unpinned-low-intra", CategorySort: 1, IsPinned: false, intraCategorySort: 0},
+		{TargetID: "pinned-high-intra", CategorySort: 1, IsPinned: true, intraCategorySort: 99},
+	}
+	sortFollowItems(items)
+	assert.Equal(t, "pinned-high-intra", items[0].TargetID)
+	assert.Equal(t, "unpinned-low-intra", items[1].TargetID)
+}
+
 // 所有排序键完全相同时按 TargetID ASC 决定，保证响应顺序确定。
 func TestSortFollowItems_TieBreakOnTargetID(t *testing.T) {
 	items := []*SidebarItem{

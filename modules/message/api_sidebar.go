@@ -15,7 +15,10 @@
 //     recent  – all DMs; groups/threads with timestamp > now-72h.
 //  5. Append standalone thread ext entries not already in the IM result.
 //  6. Sort:
-//     follow  – category_sort ASC, pinned DESC, follow_sort ASC.
+//     follow  – category_sort ASC → pinned DESC → follow_sort ASC →
+//               intra-category sort ASC → target_id ASC (Issue #41 — sidebar
+//               drag wins over category-management UI; pin overrides everything
+//               within a category; see sortFollowItems for the full rationale).
 //     recent  – pinned DESC, timestamp DESC.
 //  7. Return SidebarSyncResp{Items, Version}.
 //
