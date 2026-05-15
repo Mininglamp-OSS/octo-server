@@ -355,17 +355,78 @@ func extractFilenameFromDisposition(cd string) string {
 	return ""
 }
 
+// DownloadURL builds a browser-facing object URL that respects the
+// addressing style chosen by `publicEndpoint`. The result MUST land on
+// the same host (and path shape) as the presigned GET URL emitted by
+// `PresignedGetURL`, otherwise an upload-then-download flow returns
+// 404 even when the PUT succeeded.
+//
+// Hotfix history: this function previously concatenated `BucketURL`
+// with the object key directly, which silently dropped the bucket
+// segment for path-style CDN deployments (BucketURL=`https://cdn.example.com`):
+//
+//   - PresignedPutURL → `https://cdn.example.com/<bucket>/<prefix>/<key>` ✅
+//     (signed by `newPublicClient` with `BucketLookupPath`)
+//   - DownloadURL     → `https://cdn.example.com/<prefix>/<key>`           ❌
+//     (missing bucket segment → next browser GET = 404)
+//
+// `PresignedPutURL` calls `DownloadURL` to populate the
+// `downloadUrl` field returned by `/v1/file/upload-credentials`, so
+// the mismatch shipped to every browser client. This is the YUJ-848
+// follow-up to the YUJ-846 path-style fix in PR#56 — the sibling
+// `PresignedPutURL` / `PresignedGetURL` paths got `BucketLookupPath`
+// in PR#56, and this function now matches.
 func (sc *ServiceCOS) DownloadURL(ph string, filename string) (string, error) {
-	cosConfig := sc.ctx.GetConfig().COS
+	return sc.publicURL(ph), nil
+}
 
-	downloadBase := cosConfig.BucketURL
-	if strings.TrimSpace(downloadBase) == "" {
-		downloadBase = fmt.Sprintf("https://%s.cos.%s.myqcloud.com", cosConfig.Bucket, cosConfig.Region)
+// publicURL constructs a browser-facing object URL for `objectPath`,
+// respecting the BucketLookup addressing style decided by
+// `publicEndpoint`. It is the URL-construction sibling of
+// `newPublicClient` — both must agree on whether the bucket lives in
+// the host (DNS-style) or in the path (path-style), or the GET URL
+// will not address the same object as the signed PUT URL.
+//
+// Branches:
+//
+//  1. BucketURL empty — fall back to the SDK canonical endpoint
+//     `https://<bucket>.cos.<region>.myqcloud.com/<key>`. This mirrors
+//     `publicEndpoint` returning `BucketLookupDNS` against the default
+//     host; the bucket lives in the subdomain so we just append the key.
+//
+//  2. BucketURL is bucket-subdomain shape (host begins with `<bucket>.`) —
+//     `publicEndpoint` returns `BucketLookupDNS`. The bucket is already
+//     in the host, so `<BucketURL>/<key>` is the correct browser URL.
+//
+//  3. BucketURL is path-style (no `<bucket>.` subdomain, e.g.
+//     `https://cdn.example.com`) — `publicEndpoint` returns
+//     `BucketLookupPath`. The bucket must appear in the URL path, so
+//     the browser URL is `<BucketURL>/<bucket>/<key>`. Skipping the
+//     bucket segment here was the original YUJ-848 bug.
+//
+// `withPrefix` is applied identically in all three branches so the
+// env-prefix routing keeps working (multi-env shared bucket layout).
+func (sc *ServiceCOS) publicURL(objectPath string) string {
+	cosConfig := sc.ctx.GetConfig().COS
+	key := sc.withPrefix(objectPath)
+
+	base := strings.TrimRight(strings.TrimSpace(cosConfig.BucketURL), "/")
+	if base == "" {
+		// BucketURL empty: canonical bucket-as-subdomain shape.
+		base = fmt.Sprintf("https://%s.cos.%s.myqcloud.com", cosConfig.Bucket, cosConfig.Region)
+		result, _ := url.JoinPath(base, key)
+		return result
 	}
 
-	ph = sc.withPrefix(ph)
-	result, _ := url.JoinPath(downloadBase, ph)
-	return result, nil
+	_, _, lookup := sc.publicEndpoint()
+	if lookup == minio.BucketLookupPath {
+		// Path-style: bucket lives in the URL path, not the host.
+		result, _ := url.JoinPath(base, cosConfig.Bucket, key)
+		return result
+	}
+	// DNS-style: bucket already in the BucketURL host; just append key.
+	result, _ := url.JoinPath(base, key)
+	return result
 }
 
 // PresignedGetURL 生成预签名 GET URL，带 response-content-disposition 用于下载。

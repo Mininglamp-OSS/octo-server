@@ -13,8 +13,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 )
@@ -194,6 +196,7 @@ type mockService struct {
 	composeResult      map[string]interface{}
 	composeErr         error
 	lastObjectPath     string
+	lastGetObjectPath  string
 	lastContentDisp    string
 	lastFileSize       int64
 	presignedGetErr    error
@@ -228,6 +231,7 @@ func (m *mockService) PresignedPutURL(objectPath string, contentType string, con
 }
 
 func (m *mockService) PresignedGetURL(objectPath string, filename string, disposition string, expires time.Duration) (string, error) {
+	m.lastGetObjectPath = objectPath
 	m.lastGetDisposition = disposition
 	if m.presignedGetErr != nil {
 		return "", m.presignedGetErr
@@ -877,6 +881,122 @@ func TestGetUploadCredentials_FileSizeValidation(t *testing.T) {
 				assert.True(t, ok, "maxFileSize must be a number, got %T", echoedRaw)
 				assert.Equal(t, tt.wantPropagated, int64(echoed))
 			}
+		})
+	}
+}
+
+// TestGetDownloadURL_PathStyleStripsBucketSegment pins the YUJ-848
+// follow-up to the YUJ-846 path-style fix on the
+// `/v1/file/download/url` endpoint. When a path-style CDN BucketURL
+// is in effect (host has no `<bucket>.` subdomain), the URL we hand
+// the browser as `downloadUrl` is `<host>/<bucket>/<prefix>/<key>`
+// (see ServiceCOS.publicURL / PresignedGetURL with BucketLookupPath).
+// When the client round-trips that full URL back into this handler
+// via `?path=<full-url>`, the parsed path therefore begins with
+// `/<bucket>/`, and that bucket segment MUST be stripped BEFORE the
+// COS.Prefix strip — otherwise PresignedGetURL signs the bucket as
+// part of the object key and the resulting GET 404s.
+//
+// Pre-fix the handler stripped only `cosCfg.Prefix`, leaving the
+// bucket segment in the path; this regression was Jerry-Xin's R1
+// second warning (modules/file/api.go:559-569 in PR#56).
+func TestGetDownloadURL_PathStyleStripsBucketSegment(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cases := []struct {
+		name             string
+		bucket           string
+		bucketURL        string
+		prefix           string
+		inputPath        string
+		wantSignedObject string
+	}{
+		{
+			name:             "path-style CDN with prefix strips bucket then prefix",
+			bucket:           "im-data-1255521909",
+			bucketURL:        "https://cdn.example.com",
+			prefix:           "im-test",
+			inputPath:        "https://cdn.example.com/im-data-1255521909/im-test/chat/2026/05/abc.jpg",
+			wantSignedObject: "/chat/2026/05/abc.jpg",
+		},
+		{
+			name:             "path-style CDN no prefix strips just bucket",
+			bucket:           "im-data-1255521909",
+			bucketURL:        "https://cdn.example.com",
+			prefix:           "",
+			inputPath:        "https://cdn.example.com/im-data-1255521909/chat/2026/05/abc.jpg",
+			wantSignedObject: "/chat/2026/05/abc.jpg",
+		},
+		{
+			name:             "DNS-style bucket-subdomain BucketURL — bucket NOT in path, only prefix stripped",
+			bucket:           "im-data-1255521909",
+			bucketURL:        "https://im-data-1255521909.cos.example.com",
+			prefix:           "im-prod",
+			inputPath:        "https://im-data-1255521909.cos.example.com/im-prod/chat/2026/05/abc.jpg",
+			wantSignedObject: "/chat/2026/05/abc.jpg",
+		},
+		{
+			name:             "DNS-style: must NOT accidentally strip a path segment that happens to share the bucket name",
+			bucket:           "im-data-1255521909",
+			bucketURL:        "https://im-data-1255521909.cos.example.com",
+			prefix:           "",
+			inputPath:        "https://im-data-1255521909.cos.example.com/chat/2026/05/abc.jpg",
+			wantSignedObject: "/chat/2026/05/abc.jpg",
+		},
+		{
+			name:             "BucketURL empty (canonical default endpoint) — bucket lives in subdomain, path is just key",
+			bucket:           "im-data-1255521909",
+			bucketURL:        "",
+			prefix:           "",
+			inputPath:        "https://im-data-1255521909.cos.ap-beijing.myqcloud.com/chat/2026/05/abc.jpg",
+			wantSignedObject: "/chat/2026/05/abc.jpg",
+		},
+		{
+			name:             "non-URL path passes through unchanged",
+			bucket:           "im-data-1255521909",
+			bucketURL:        "https://cdn.example.com",
+			prefix:           "im-test",
+			inputPath:        "chat/2026/05/abc.jpg",
+			wantSignedObject: "chat/2026/05/abc.jpg",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.New()
+			cfg.Test = true
+			cfg.COS.Bucket = tc.bucket
+			cfg.COS.Region = "ap-beijing"
+			cfg.COS.BucketURL = tc.bucketURL
+			cfg.COS.Prefix = tc.prefix
+
+			mockSvc := &mockService{}
+			f := &File{
+				ctx:     testutil.NewTestContext(cfg),
+				Log:     log.NewTLog("FileTest"),
+				service: mockSvc,
+			}
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			req, _ := http.NewRequest(
+				http.MethodGet,
+				"/v1/file/download/url?path="+url.QueryEscape(tc.inputPath)+"&filename=abc.jpg",
+				nil,
+			)
+			c.Request = req
+
+			wkCtx := &wkhttp.Context{Context: c}
+			f.getDownloadURL(wkCtx)
+
+			assert.Equal(t, http.StatusOK, w.Code, "unexpected status; body=%s", w.Body.String())
+			// The handler runs sanitizePath on the stripped path
+			// before handing it to PresignedGetURL — sanitizePath
+			// preserves the leading `/` for absolute paths and
+			// returns relative paths unchanged. So the assertion is
+			// on the post-sanitize value the signer actually sees.
+			assert.Equal(t, tc.wantSignedObject, mockSvc.lastGetObjectPath,
+				"object path passed to PresignedGetURL must have the bucket segment stripped for path-style and the prefix stripped in all cases")
 		})
 	}
 }

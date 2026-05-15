@@ -562,8 +562,29 @@ func (f *File) getDownloadURL(c *wkhttp.Context) {
 		parsed, parseErr := url.Parse(ph)
 		if parseErr == nil {
 			ph = parsed.Path
+			cosCfg := f.ctx.GetConfig().COS
+			// Path-style CDN: when BucketURL is set and its host does
+			// NOT carry a `<bucket>.` subdomain (e.g.
+			// `BucketURL=https://cdn.example.com`), the URL we issued
+			// to the browser is `<host>/<bucket>/<prefix>/<key>` (see
+			// publicURL / PresignedGetURL with BucketLookupPath). When
+			// the client round-trips that full URL back to us, the
+			// parsed path therefore begins with `/<bucket>/`, and the
+			// bucket segment must be stripped BEFORE the COS.Prefix
+			// strip below — otherwise PresignedGetURL signs the bucket
+			// as part of the object key and the resulting GET 404s.
+			//
+			// Detection mirrors `publicEndpoint`: BucketURL set, parsed
+			// successfully, host does NOT begin with `<bucket>.`.
+			if strings.TrimSpace(cosCfg.BucketURL) != "" && cosCfg.Bucket != "" {
+				if bu, buErr := url.Parse(strings.TrimRight(strings.TrimSpace(cosCfg.BucketURL), "/")); buErr == nil && bu.Host != "" {
+					if !strings.HasPrefix(bu.Host, cosCfg.Bucket+".") {
+						ph = strings.TrimPrefix(ph, "/"+cosCfg.Bucket)
+					}
+				}
+			}
 			// Strip the COS prefix (e.g. /bucket-prefix) from the path
-			cosPrefix := strings.TrimSpace(f.ctx.GetConfig().COS.Prefix)
+			cosPrefix := strings.TrimSpace(cosCfg.Prefix)
 			if cosPrefix != "" {
 				ph = strings.TrimPrefix(ph, "/"+cosPrefix)
 			}

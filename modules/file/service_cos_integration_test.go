@@ -337,3 +337,227 @@ func TestServiceCOS_PresignedPutURL_PathStyleCDN_WithPrefix(t *testing.T) {
 	assert.True(t, strings.HasPrefix(u.Path, "/im-data-1255521909/im-test/chat/2026/05/abc.jpg"),
 		"path-style URL must include `/<bucket>/<prefix>/<key>`; got path=%s", u.Path)
 }
+
+// TestServiceCOS_DownloadURL_PathStyle pins the YUJ-848 follow-up to
+// the YUJ-846 path-style fix: the browser-facing URL produced by
+// `DownloadURL` MUST land on the same host AND path shape as the
+// presigned PUT URL emitted by `PresignedPutURL` for the same object.
+// PR#56 (YUJ-846) added `BucketLookupPath` to the presign clients, but
+// `DownloadURL` was still concatenating `BucketURL` with the object
+// key directly — for path-style CDN BucketURL it dropped the
+// `/<bucket>/` segment, so the upload-then-GET flow returned 404
+// even when the PUT succeeded.
+//
+// `PresignedPutURL` calls `DownloadURL` to populate the `downloadUrl`
+// field returned by `/v1/file/upload-credentials`, so the mismatch
+// shipped to every browser client. This test mirrors the production
+// repro from im-test.deepminer.com.cn (BucketURL=`https://cdn.deepminer.com.cn`,
+// bucket=`im-data-...`) and pins that PUT-URL host/path and download-URL
+// host/path agree.
+func TestServiceCOS_DownloadURL_PathStyle(t *testing.T) {
+	cfg := config.New()
+	cfg.Test = true
+	cfg.COS.SecretID = "test-secret-id"
+	cfg.COS.SecretKey = "test-secret-key-1234567890"
+	cfg.COS.Bucket = "im-data-1255521909"
+	cfg.COS.Region = "ap-beijing"
+	cfg.COS.BucketURL = "https://cdn.example.com"
+
+	svc := file.NewServiceCOS(testutil.NewTestContext(cfg))
+
+	t.Run("plain DownloadURL is path-style", func(t *testing.T) {
+		raw, err := svc.DownloadURL("chat/2026/05/abc.jpg", "")
+		require.NoError(t, err)
+		require.NotEmpty(t, raw)
+
+		u, err := url.Parse(raw)
+		require.NoError(t, err)
+
+		// Host MUST be the CDN host as-is — NOT
+		// `<bucket>.cdn.example.com`. Pre-fix the value was correct
+		// here only because BucketURL was used verbatim, but the
+		// path lacked the bucket segment — see path assertion below.
+		assert.Equal(t, "cdn.example.com", u.Host,
+			"path-style DownloadURL must keep the CDN host verbatim; got %s", u.Host)
+
+		// Path MUST start with `/<bucket>/` — that's the path-style
+		// addressing the CDN expects. Pre-fix this assertion failed
+		// because DownloadURL concatenated BucketURL with the key
+		// directly, dropping the bucket segment and producing
+		// `/chat/2026/05/abc.jpg`.
+		assert.True(t, strings.HasPrefix(u.Path, "/im-data-1255521909/"),
+			"path-style DownloadURL must place bucket in the path; got path=%s", u.Path)
+		assert.True(t, strings.HasSuffix(u.Path, "/chat/2026/05/abc.jpg"),
+			"object key must be reflected in the download URL path; got path=%s", u.Path)
+	})
+
+	t.Run("DownloadURL with prefix routes through bucket+prefix", func(t *testing.T) {
+		// Apply env prefix on top of path-style (multi-env shared bucket).
+		cfg2 := config.New()
+		cfg2.Test = true
+		cfg2.COS.SecretID = "test-secret-id"
+		cfg2.COS.SecretKey = "test-secret-key-1234567890"
+		cfg2.COS.Bucket = "im-data-1255521909"
+		cfg2.COS.Region = "ap-beijing"
+		cfg2.COS.BucketURL = "https://cdn.example.com"
+		cfg2.COS.Prefix = "im-test"
+
+		svc2 := file.NewServiceCOS(testutil.NewTestContext(cfg2))
+
+		raw, err := svc2.DownloadURL("chat/2026/05/abc.jpg", "")
+		require.NoError(t, err)
+
+		u, err := url.Parse(raw)
+		require.NoError(t, err)
+		assert.Equal(t, "cdn.example.com", u.Host)
+		assert.True(t,
+			strings.HasPrefix(u.Path, "/im-data-1255521909/im-test/chat/2026/05/abc.jpg"),
+			"path-style DownloadURL must include `/<bucket>/<prefix>/<key>`; got path=%s", u.Path)
+	})
+}
+
+// TestServiceCOS_DownloadURL_DNSStyle pins that the bucket-subdomain
+// (DNS-style) shape is unchanged — DownloadURL appends the key to the
+// BucketURL host (which already carries the `<bucket>.` subdomain) and
+// MUST NOT inject another bucket segment into the path.
+func TestServiceCOS_DownloadURL_DNSStyle(t *testing.T) {
+	cfg := config.New()
+	cfg.Test = true
+	cfg.COS.SecretID = "test-secret-id"
+	cfg.COS.SecretKey = "test-secret-key-1234567890"
+	cfg.COS.Bucket = "my-bucket-12345678"
+	cfg.COS.Region = "ap-beijing"
+	cfg.COS.BucketURL = "https://my-bucket-12345678.cos.example.com"
+
+	svc := file.NewServiceCOS(testutil.NewTestContext(cfg))
+
+	raw, err := svc.DownloadURL("chat/2026/05/abc.jpg", "")
+	require.NoError(t, err)
+
+	u, err := url.Parse(raw)
+	require.NoError(t, err)
+	assert.Equal(t, "my-bucket-12345678.cos.example.com", u.Host,
+		"DNS-style DownloadURL must keep BucketURL host verbatim")
+	assert.Equal(t, "/chat/2026/05/abc.jpg", u.Path,
+		"DNS-style DownloadURL must NOT prepend bucket to path (bucket is already in host); got %s", u.Path)
+}
+
+// TestServiceCOS_DownloadURL_DefaultEndpoint pins that BucketURL empty
+// falls back to the canonical SDK endpoint
+// `https://<bucket>.cos.<region>.myqcloud.com/<key>`. This is the COS
+// "no custom domain" deployment shape — the canonical hostname is
+// reachable from the browser without any operator-side DNS work.
+func TestServiceCOS_DownloadURL_DefaultEndpoint(t *testing.T) {
+	cfg := config.New()
+	cfg.Test = true
+	cfg.COS.SecretID = "test-secret-id"
+	cfg.COS.SecretKey = "test-secret-key-1234567890"
+	cfg.COS.Bucket = "my-bucket-12345678"
+	cfg.COS.Region = "ap-beijing"
+	cfg.COS.BucketURL = "" // fallback path
+
+	svc := file.NewServiceCOS(testutil.NewTestContext(cfg))
+
+	raw, err := svc.DownloadURL("chat/2026/05/abc.jpg", "")
+	require.NoError(t, err)
+
+	u, err := url.Parse(raw)
+	require.NoError(t, err)
+	assert.Equal(t, "my-bucket-12345678.cos.ap-beijing.myqcloud.com", u.Host,
+		"default DownloadURL must use canonical COS host")
+	assert.Equal(t, "https", u.Scheme)
+	assert.Equal(t, "/chat/2026/05/abc.jpg", u.Path,
+		"default DownloadURL must NOT prepend bucket to path (bucket is already in host); got %s", u.Path)
+}
+
+// TestServiceCOS_PresignedPutURL_DownloadURLConsistency is the
+// upload-then-download integration check Jerry-Xin / lml2468 / yujiawei
+// converged on: the URL handed to the browser as `downloadUrl` (the
+// companion field returned alongside `uploadUrl` from
+// `/v1/file/upload-credentials`) MUST address the same object as the
+// upload URL it ships beside. Specifically the host and path BEFORE
+// query parameters must agree.
+//
+// Pre-fix behaviour for path-style CDN (the YUJ-848 bug):
+//   - uploadUrl   = `https://cdn.example.com/im-data-…/im-test/chat/…/abc.jpg?X-Amz-…`
+//   - downloadUrl = `https://cdn.example.com/im-test/chat/…/abc.jpg`
+//     ^^^^^ missing `/<bucket>/`
+//   - browser PUT succeeds (signature valid for path-style URL),
+//     subsequent browser GET on `downloadUrl` returns 404.
+//
+// Post-fix behaviour: both URLs share the same host AND the same
+// path prefix `/<bucket>/<prefix>/<key>`, so a successful PUT
+// guarantees a successful GET.
+func TestServiceCOS_PresignedPutURL_DownloadURLConsistency(t *testing.T) {
+	cases := []struct {
+		name      string
+		bucketURL string
+		prefix    string
+	}{
+		{
+			name:      "path-style CDN without prefix",
+			bucketURL: "https://cdn.example.com",
+			prefix:    "",
+		},
+		{
+			name:      "path-style CDN with env prefix",
+			bucketURL: "https://cdn.example.com",
+			prefix:    "im-test",
+		},
+		{
+			name:      "DNS-style bucket subdomain without prefix",
+			bucketURL: "https://im-data-1255521909.cos.example.com",
+			prefix:    "",
+		},
+		{
+			name:      "DNS-style bucket subdomain with env prefix",
+			bucketURL: "https://im-data-1255521909.cos.example.com",
+			prefix:    "im-prod",
+		},
+		{
+			name:      "BucketURL empty (canonical default endpoint)",
+			bucketURL: "",
+			prefix:    "",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.New()
+			cfg.Test = true
+			cfg.COS.SecretID = "test-secret-id"
+			cfg.COS.SecretKey = "test-secret-key-1234567890"
+			cfg.COS.Bucket = "im-data-1255521909"
+			cfg.COS.Region = "ap-beijing"
+			cfg.COS.BucketURL = tc.bucketURL
+			cfg.COS.Prefix = tc.prefix
+
+			svc := file.NewServiceCOS(testutil.NewTestContext(cfg))
+
+			objectPath := "chat/2026/05/abc.jpg"
+			uploadURL, downloadURL, err := svc.PresignedPutURL(
+				objectPath, "image/jpeg", "", 12345, time.Minute,
+			)
+			require.NoError(t, err)
+			require.NotEmpty(t, uploadURL)
+			require.NotEmpty(t, downloadURL)
+
+			pu, err := url.Parse(uploadURL)
+			require.NoError(t, err)
+			pd, err := url.Parse(downloadURL)
+			require.NoError(t, err)
+
+			assert.Equal(t, pu.Host, pd.Host,
+				"uploadUrl and downloadUrl must share the same host (got upload=%s, download=%s)",
+				pu.Host, pd.Host)
+			assert.Equal(t, pu.Scheme, pd.Scheme,
+				"uploadUrl and downloadUrl must share the same scheme")
+
+			// Path must agree exactly — query params (signature, etc.)
+			// are intentionally only on the upload URL.
+			assert.Equal(t, pu.Path, pd.Path,
+				"uploadUrl and downloadUrl must address the same object path; upload=%s download=%s",
+				pu.Path, pd.Path)
+		})
+	}
+}
