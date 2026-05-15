@@ -169,6 +169,50 @@ func TestPresignedURLs_SignAgainstPublicEndpoint(t *testing.T) {
 		assert.Equal(t, "internal-minio:9000", u.Host,
 			"with DownloadURL empty, should fall back to UploadURL host")
 	})
+
+	t.Run("path-proxied DownloadURL keeps prefix in signed URL", func(t *testing.T) {
+		// Mirrors the docker-compose stack where nginx routes
+		// `https://octo.example.com/minio/*` to the MinIO service.
+		// The reverse-proxy path prefix is part of the signed canonical
+		// URI from the start, so both the host and the path are valid
+		// for SigV4 verification at the gateway. Companion regression
+		// to TestPresignedURLs_PreservesPublicPathPrefix in
+		// service_minio_test.go — kept here so the integration suite
+		// stays a complete picture of the path-routing case alongside
+		// the no-prefix and DownloadURL-empty fallbacks above.
+		cfg3 := config.New()
+		cfg3.Test = true
+		cfg3.Minio.URL = internalURL
+		cfg3.Minio.UploadURL = internalURL
+		cfg3.Minio.DownloadURL = "https://public.example.com/minio"
+		cfg3.Minio.AccessKeyID = "test-access-key"
+		cfg3.Minio.SecretAccessKey = "test-secret-access-key-1234567890"
+
+		svc3 := file.NewServiceMinio(testutil.NewTestContext(cfg3))
+
+		uploadURL, _, err := svc3.PresignedPutURL("chat/2026/05/abc.jpg", "image/jpeg", "", 5*time.Minute)
+		require.NoError(t, err)
+		u, err := url.Parse(uploadURL)
+		require.NoError(t, err)
+
+		assert.Equal(t, "public.example.com", u.Host,
+			"public path prefix must not leak into the host component")
+		assert.True(t, strings.HasPrefix(u.Path, "/minio/chat/"),
+			"presigned PUT URL must keep `/minio/<bucket>/...` prefix; got %q", u.Path)
+		assert.True(t, strings.HasSuffix(u.Path, "/abc.jpg"),
+			"presigned PUT URL must end with the object key; got %q", u.Path)
+		q := u.Query()
+		assert.NotEmpty(t, q.Get("X-Amz-Signature"))
+		assert.Contains(t, q.Get("X-Amz-SignedHeaders"), "host")
+
+		getURL, err := svc3.PresignedGetURL("chat/2026/05/abc.jpg", "report.jpg", "attachment", 5*time.Minute)
+		require.NoError(t, err)
+		gu, err := url.Parse(getURL)
+		require.NoError(t, err)
+		assert.Equal(t, "public.example.com", gu.Host)
+		assert.True(t, strings.HasPrefix(gu.Path, "/minio/chat/"),
+			"presigned GET URL must keep `/minio/<bucket>/...` prefix; got %q", gu.Path)
+	})
 }
 
 // TestPresignedPutURL_ConcurrentBucketBootstrap exercises the concurrency
