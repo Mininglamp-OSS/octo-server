@@ -24,7 +24,11 @@ paths:
         - 群：`group_setting.category_id IS NOT NULL` 且用户未取消关注（`group_unfollowed=0`）
         - DM：`user_conversation_ext.followed_dm=1`
         - 子区：父群在 follow 集合 + 该子区有 ext 行
-        - 排序：`category_sort ASC` → `pinned DESC` → `follow_sort ASC`
+        - 排序（Issue #41）：
+          `category_sort ASC` → `pinned DESC` → `follow_sort ASC` → `group_setting.category_sort ASC` → `target_id ASC`
+          其中 follow_sort 来自 sidebar 拖拽（`PUT /v1/follow/sort`），优先于 category-management UI
+          写入的 `group_setting.category_sort`，让 sidebar 拖拽真正决定同 category 内顺序；
+          后者作为用户未拖过 sidebar 时的回退顺序。
         - 不过滤 3 天时间窗口
 
         **recent Tab（最近）**：
@@ -131,10 +135,10 @@ definitions:
         description: "所属分组 ID（仅 follow tab；群为 group_setting.category_id，DM 为 ext.dm_category_id 转字符串）"
       category_sort:
         type: integer
-        description: "类别之间的排序权重，来自 group_category.sort —— 调用 /v1/category/sort 可改变它（值越小越靠前）。同一类别内的群之间另由 group_setting.category_sort 排序，已由服务端 sort，不单独返回。"
+        description: "类别之间的排序权重，来自 group_category.sort —— 调用 /v1/category/sort 可改变它（值越小越靠前）。同一类别内的群之间另由 group_setting.category_sort 排序，已由服务端 sort，不单独返回。Issue #41 起：带 dm_category_id 的 DM 也会返回对应 category 的 sort，使其与同 category 群进入同一排序桶。"
       follow_sort:
         type: integer
-        description: "关注列表内排序权重（来自 user_conversation_ext.follow_sort）"
+        description: "关注列表内排序权重（来自 user_conversation_ext.follow_sort）。Issue #41 起对所有 target_type（DM / 群 / 子区）均生效；通过 `PUT /v1/follow/sort` 写入，下一次 `/sidebar/sync` 将按提交的相对顺序返回同一 category 内的条目。"
       parent_channel_id:
         type: string
         description: "父群频道 ID（仅子区条目返回）"
