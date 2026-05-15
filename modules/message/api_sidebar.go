@@ -15,7 +15,10 @@
 //     recent  – all DMs; groups/threads with timestamp > now-72h.
 //  5. Append standalone thread ext entries not already in the IM result.
 //  6. Sort:
-//     follow  – category_sort ASC, pinned DESC, follow_sort ASC.
+//     follow  – category_sort ASC → pinned DESC → follow_sort ASC →
+//               intra-category sort ASC → target_id ASC (Issue #41 — sidebar
+//               drag wins over category-management UI; pin overrides everything
+//               within a category; see sortFollowItems for the full rationale).
 //     recent  – pinned DESC, timestamp DESC.
 //  7. Return SidebarSyncResp{Items, Version}.
 //
@@ -343,6 +346,46 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 		followedDMs[m.TargetID] = m
 	}
 
+	// 2d2. Group ext rows (Issue #41 fix #1)：读取群的 user_conversation_ext，
+	//      把 follow_sort 喂给 buildFollowItems 群分支。recent tab 不依赖 follow_sort，
+	//      仍走 fail-open。
+	groupExts := map[string]*convext.Model{}
+	if isFollowTab {
+		rows, err := sb.convExtDB.ListGroupExts(loginUID, spaceID)
+		if failClosedForFollow("group ext query", err) {
+			return
+		}
+		for _, m := range rows {
+			groupExts[m.TargetID] = m
+		}
+	}
+
+	// 2d3. DM category sorts (Issue #41 fix #2)：DM 引用的 dm_category_id 对应
+	//      group_category.sort 必须显式 JOIN 出来，才能让带 category 的 DM 与同
+	//      category 的群进入同一排序桶。
+	dmCategorySorts := map[string]int{}
+	if isFollowTab && len(followedDMs) > 0 {
+		ids := make([]string, 0, len(followedDMs))
+		seen := make(map[string]struct{}, len(followedDMs))
+		for _, m := range followedDMs {
+			if m.DMCategoryID == nil {
+				continue
+			}
+			if _, dup := seen[*m.DMCategoryID]; dup {
+				continue
+			}
+			seen[*m.DMCategoryID] = struct{}{}
+			ids = append(ids, *m.DMCategoryID)
+		}
+		if len(ids) > 0 {
+			sorts, err := sb.groupCategoryDB.QueryCategorySortsByIDs(ids, loginUID)
+			if failClosedForFollow("dm category sort query", err) {
+				return
+			}
+			dmCategorySorts = sorts
+		}
+	}
+
 	// 2e. Pinned channels
 	pinnedSet, err := sb.loadPinnedSet(loginUID, spaceID)
 	if err != nil {
@@ -354,7 +397,7 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 	var items []*SidebarItem
 	switch req.Tab {
 	case "follow":
-		items = buildFollowItems(conversations, categorySetting, unfollowedGroups, followedDMs, threadExtMap)
+		items = buildFollowItems(conversations, categorySetting, unfollowedGroups, followedDMs, threadExtMap, groupExts, dmCategorySorts)
 		// Append standalone thread ext entries not present in IM result.
 		// Pass categorySetting + unfollowedGroups so parent-follow filter applies
 		// to DB-only thread entries as well (PR review Round-3 Blocking #4).
@@ -610,12 +653,21 @@ func parseThreadChannelIDSidebar(channelID string) (groupNo, shortID string, err
 //   - DM:    must have a followedDMs entry with followed_dm=1.
 //   - Thread: parent group must be in the follow set AND the thread must have
 //     an ext row in threadExtMap.
+//
+// Issue #41：
+//   - groupExts 提供群的 user_conversation_ext 行（key = TargetID = groupNo），
+//     用于把 follow_sort 写到群 SidebarItem 上。旧实现完全忽略该字段，导致 sidebar
+//     拖拽群条目后下次 sync 返回顺序不变。无 ext 行的群按 0 处理。
+//   - dmCategorySorts 把 DM 关联的 group_category.sort 提供给 DM 排序键，让带
+//     category 的 DM 与同 category 群落到同一桶。
 func buildFollowItems(
 	convs []*config.SyncUserConversationResp,
 	categorySetting map[string]*GroupCategorySetting,
 	unfollowedGroups map[string]struct{},
 	followedDMs map[string]*convext.Model,
 	threadExtMap map[string]*convext.Model,
+	groupExts map[string]*convext.Model,
+	dmCategorySorts map[string]int,
 ) []*SidebarItem {
 	items := make([]*SidebarItem, 0, len(convs))
 	for _, conv := range convs {
@@ -628,6 +680,12 @@ func buildFollowItems(
 			if _, unfollowed := unfollowedGroups[conv.ChannelID]; unfollowed {
 				continue
 			}
+			// Issue #41 fix #1：读取群的 follow_sort；ext 行可能不存在（用户从未拖拽），
+			// map 缺失视为 0。
+			var groupFollowSort int
+			if ext, has := groupExts[conv.ChannelID]; has && ext != nil {
+				groupFollowSort = ext.FollowSort
+			}
 			items = append(items, &SidebarItem{
 				TargetType:        int(common.ChannelTypeGroup),
 				TargetID:          conv.ChannelID,
@@ -639,6 +697,7 @@ func buildFollowItems(
 				CategoryID:        cs.CategoryID,
 				CategorySort:      cs.CategoryGroupSort,
 				intraCategorySort: cs.CategorySort,
+				FollowSort:        groupFollowSort,
 			})
 
 		case common.ChannelTypePerson.Uint8():
@@ -658,8 +717,14 @@ func buildFollowItems(
 			}
 			// PR #21 Round-6：DMCategoryID 现在已经是 VARCHAR(32) UUID（与 group_category
 			// 共用 namespace），直接透传给客户端即可。
+			// Issue #41 fix #2：DM 关联了 category 时必须从 group_category.sort 读取
+			// CategorySort，旧实现仅 copy CategoryID 而 CategorySort=0，导致带 category
+			// 的 DM 永远排在"无 category"桶里。
 			if ext.DMCategoryID != nil {
 				item.CategoryID = ext.DMCategoryID
+				if cs, has := dmCategorySorts[*ext.DMCategoryID]; has {
+					item.CategorySort = cs
+				}
 			}
 			items = append(items, item)
 
@@ -843,27 +908,36 @@ func mergeThreadEntries(
 
 // sortFollowItems sorts items for the follow tab:
 //
-//	primary:    CategorySort       ASC  (group_category.sort —— 类别之间的顺序)
-//	secondary:  intraCategorySort  ASC  (group_setting.category_sort —— 同类别内组之间的顺序)
-//	tertiary:   IsPinned           DESC (pinned first)
-//	quaternary: FollowSort         ASC  (user_conversation_ext.follow_sort)
+//	T1: CategorySort       ASC  (group_category.sort —— 类别之间的顺序)
+//	T2: IsPinned           DESC (pin overrides everything within a category)
+//	T3: FollowSort         ASC  (user_conversation_ext.follow_sort, sidebar drag wins)
+//	T4: intraCategorySort  ASC  (group_setting.category_sort —— category-mgmt UI 回退)
+//	T5: TargetID           ASC  (deterministic tiebreaker)
 //
-// PR #21 review (lml2468 blocker #3)：之前 primary 用的是 group_setting.category_sort，
-// 这里改成 group_category.sort（与 /category/sort 的写入对齐、与 swagger 对齐），
-// group_setting.category_sort 作为同类别内的二级 key 继续生效。
+// Issue #41：旧实现把 intraCategorySort 排在 FollowSort 之前，导致 sidebar 拖拽
+// 排序被 category-management UI 设置过的同类内顺序覆盖；并且群分支根本没读
+// follow_sort，使群恒以 0 排在 DM 前。
+//
+// 新顺序的语义：用户在 sidebar 没拖过任何条目时 FollowSort=0，所有条目按
+// intraCategorySort（即 category-management UI 的顺序）展示；一旦拖动 sidebar，
+// 被拖条目的 FollowSort 非 0 即胜过 intraCategorySort。两套 UI 都仍然生效，
+// 且 sidebar 作为更直接的 UI 作为最终来源。
 func sortFollowItems(items []*SidebarItem) {
 	sort.SliceStable(items, func(i, j int) bool {
 		a, b := items[i], items[j]
 		if a.CategorySort != b.CategorySort {
 			return a.CategorySort < b.CategorySort
 		}
-		if a.intraCategorySort != b.intraCategorySort {
-			return a.intraCategorySort < b.intraCategorySort
-		}
 		if a.IsPinned != b.IsPinned {
 			return a.IsPinned // pinned first
 		}
-		return a.FollowSort < b.FollowSort
+		if a.FollowSort != b.FollowSort {
+			return a.FollowSort < b.FollowSort
+		}
+		if a.intraCategorySort != b.intraCategorySort {
+			return a.intraCategorySort < b.intraCategorySort
+		}
+		return a.TargetID < b.TargetID
 	})
 }
 

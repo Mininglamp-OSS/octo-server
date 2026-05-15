@@ -193,6 +193,22 @@ func (d *DB) ListFollowedDM(uid, spaceID string) ([]*Model, error) {
 	return list, err
 }
 
+// ListGroupExts 返回 target_type=2（群）的全部 ext 行（无视 group_unfollowed 标志）。
+//
+// Issue #41：sidebar follow tab 需要按 follow_sort 排序群条目，而 follow_sort 写在
+// user_conversation_ext 上。已关注的群在用户从未拖拽前不一定存在 ext 行，缺失时
+// 上层视为 FollowSort=0；存在 group_unfollowed=1 的行由 ListUnfollowedGroups 单独
+// 过滤，本方法不再次区分以避免漏读已设置过 follow_sort 的群。
+func (d *DB) ListGroupExts(uid, spaceID string) ([]*Model, error) {
+	var list []*Model
+	_, err := d.session.SelectBySql(
+		"SELECT * FROM "+table+
+			" WHERE uid=? AND space_id=? AND target_type=2",
+		uid, spaceID,
+	).Load(&list)
+	return list, err
+}
+
 // ListUnfollowedGroups 返回 group_unfollowed=1 的群行（target_type=2）。
 // 用于关注 Tab 判断某个群是否已"取消关注"。
 func (d *DB) ListUnfollowedGroups(uid, spaceID string) ([]*Model, error) {

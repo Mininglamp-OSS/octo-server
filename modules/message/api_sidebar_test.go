@@ -134,7 +134,7 @@ func TestBuildFollowItems_GroupFollowed(t *testing.T) {
 	}
 	unfollowedGroups := map[string]struct{}{} // empty: not unfollowed
 
-	items := buildFollowItems(convs, categorySetting, unfollowedGroups, nil, nil)
+	items := buildFollowItems(convs, categorySetting, unfollowedGroups, nil, nil, nil, nil)
 	require.Len(t, items, 1)
 	assert.Equal(t, "g1", items[0].TargetID)
 	assert.Equal(t, "cat1", *items[0].CategoryID)
@@ -151,7 +151,7 @@ func TestBuildFollowItems_GroupUnfollowed_Excluded(t *testing.T) {
 	}
 	unfollowedGroups := map[string]struct{}{"g1": {}}
 
-	items := buildFollowItems(convs, categorySetting, unfollowedGroups, nil, nil)
+	items := buildFollowItems(convs, categorySetting, unfollowedGroups, nil, nil, nil, nil)
 	assert.Len(t, items, 0)
 }
 
@@ -163,7 +163,7 @@ func TestBuildFollowItems_GroupWithoutCategory_Excluded(t *testing.T) {
 	categorySetting := map[string]*GroupCategorySetting{} // no entry
 	unfollowedGroups := map[string]struct{}{}
 
-	items := buildFollowItems(convs, categorySetting, unfollowedGroups, nil, nil)
+	items := buildFollowItems(convs, categorySetting, unfollowedGroups, nil, nil, nil, nil)
 	assert.Len(t, items, 0)
 }
 
@@ -176,7 +176,7 @@ func TestBuildFollowItems_DMFollowed(t *testing.T) {
 		"peer1": {TargetID: "peer1", FollowedDM: 1, FollowSort: 5},
 	}
 
-	items := buildFollowItems(convs, nil, nil, followedDMs, nil)
+	items := buildFollowItems(convs, nil, nil, followedDMs, nil, nil, nil)
 	require.Len(t, items, 1)
 	assert.Equal(t, "peer1", items[0].TargetID)
 	assert.Equal(t, 5, items[0].FollowSort)
@@ -188,7 +188,7 @@ func TestBuildFollowItems_DMNotFollowed_Excluded(t *testing.T) {
 	}
 	followedDMs := map[string]*convext.Model{} // no entry for peer2
 
-	items := buildFollowItems(convs, nil, nil, followedDMs, nil)
+	items := buildFollowItems(convs, nil, nil, followedDMs, nil, nil, nil)
 	assert.Len(t, items, 0)
 }
 
@@ -206,7 +206,7 @@ func TestBuildFollowItems_ThreadAsIMEntry_IncludedWhenParentFollowed(t *testing.
 		threadChannelID: {TargetID: threadChannelID, FollowSort: 2},
 	}
 
-	items := buildFollowItems(convs, categorySetting, nil, nil, threadExtMap)
+	items := buildFollowItems(convs, categorySetting, nil, nil, threadExtMap, nil, nil)
 	require.Len(t, items, 1)
 	assert.Equal(t, threadChannelID, items[0].TargetID)
 	assert.Equal(t, int(common.ChannelTypeCommunityTopic), items[0].TargetType)
@@ -223,7 +223,7 @@ func TestBuildFollowItems_ThreadWithoutExtRow_Excluded(t *testing.T) {
 	}
 	threadExtMap := map[string]*convext.Model{} // no ext for this thread
 
-	items := buildFollowItems(convs, categorySetting, nil, nil, threadExtMap)
+	items := buildFollowItems(convs, categorySetting, nil, nil, threadExtMap, nil, nil)
 	assert.Len(t, items, 0)
 }
 
@@ -632,7 +632,7 @@ func TestBuildFollowItems_ThreadInheritsParentCategorySort(t *testing.T) {
 	threadExtMap := map[string]*convext.Model{
 		threadID: {TargetID: threadID, FollowSort: 1},
 	}
-	items := buildFollowItems(convs, categorySetting, nil, nil, threadExtMap)
+	items := buildFollowItems(convs, categorySetting, nil, nil, threadExtMap, nil, nil)
 	require.Len(t, items, 2)
 
 	var groupItem, threadItem *SidebarItem
@@ -688,7 +688,7 @@ func TestBuildFollowItems_CategoryGroupSort_Propagates(t *testing.T) {
 			CategoryGroupSort: 42, // group_category.sort       —— 客户端可见 category_sort
 		},
 	}
-	items := buildFollowItems(convs, categorySetting, nil, nil, nil)
+	items := buildFollowItems(convs, categorySetting, nil, nil, nil, nil, nil)
 	require.Len(t, items, 1)
 	assert.Equal(t, 42, items[0].CategorySort, "客户端可见的 category_sort 必须取自 group_category.sort")
 	assert.Equal(t, 7, items[0].intraCategorySort, "intraCategorySort 必须取自 group_setting.category_sort")
@@ -724,7 +724,7 @@ func TestSortRecentItems_MultiplePinned_ByTimestampDesc(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestBuildFollowItems_EmptyConversations(t *testing.T) {
-	items := buildFollowItems(nil, nil, nil, nil, nil)
+	items := buildFollowItems(nil, nil, nil, nil, nil, nil, nil)
 	assert.Len(t, items, 0)
 }
 
@@ -759,7 +759,7 @@ func TestBuildFollowItems_MixedTypes(t *testing.T) {
 		"g1____th1": {TargetID: "g1____th1", FollowSort: 1},
 	}
 
-	items := buildFollowItems(convs, categorySetting, nil, followedDMs, threadExtMap)
+	items := buildFollowItems(convs, categorySetting, nil, followedDMs, threadExtMap, nil, nil)
 	// g1 + peer1 + g1____th1 = 3; peer2 (not followed) and g2 (no category) excluded
 	assert.Len(t, items, 3)
 	ids := make(map[string]bool)
@@ -823,10 +823,159 @@ func TestBuildFollowItems_DMFollowed_WithDMCategory(t *testing.T) {
 	followedDMs := map[string]*convext.Model{
 		"peer1": {TargetID: "peer1", FollowedDM: 1, FollowSort: 3, DMCategoryID: &catID},
 	}
-	items := buildFollowItems(convs, nil, nil, followedDMs, nil)
+	items := buildFollowItems(convs, nil, nil, followedDMs, nil, nil, nil)
 	require.Len(t, items, 1)
 	require.NotNil(t, items[0].CategoryID)
 	assert.Equal(t, catID, *items[0].CategoryID, "DMCategoryID 直接透传 UUID，不再 fmt.Sprintf 转字符串")
+}
+
+// ---------------------------------------------------------------------------
+// Issue #41 regression: follow tab cross-type drag-sort must survive reload.
+// ---------------------------------------------------------------------------
+
+// 群分支必须读取 user_conversation_ext.follow_sort（旧实现恒置为 0，导致 sidebar
+// 拖拽群条目后下次 sync 返回的群仍按默认顺序）。
+func TestBuildFollowItems_GroupHonorsFollowSort(t *testing.T) {
+	convs := []*config.SyncUserConversationResp{
+		makeIMConv("g1", common.ChannelTypeGroup.Uint8(), nowRecent()),
+	}
+	categorySetting := map[string]*GroupCategorySetting{
+		"g1": {GroupNo: "g1", CategoryID: strPtr("cat1"), CategorySort: 1, CategoryGroupSort: 1},
+	}
+	groupExts := map[string]*convext.Model{
+		"g1": {TargetID: "g1", FollowSort: 7},
+	}
+	items := buildFollowItems(convs, categorySetting, nil, nil, nil, groupExts, nil)
+	require.Len(t, items, 1)
+	assert.Equal(t, 7, items[0].FollowSort, "group FollowSort 必须取自 user_conversation_ext.follow_sort")
+}
+
+// 群分支没有 ext 行时回落 0（已关注但用户未拖拽过）。
+func TestBuildFollowItems_GroupMissingExtFallsBackToZero(t *testing.T) {
+	convs := []*config.SyncUserConversationResp{
+		makeIMConv("g-noext", common.ChannelTypeGroup.Uint8(), nowRecent()),
+	}
+	categorySetting := map[string]*GroupCategorySetting{
+		"g-noext": {GroupNo: "g-noext", CategoryID: strPtr("cat1"), CategorySort: 1, CategoryGroupSort: 1},
+	}
+	items := buildFollowItems(convs, categorySetting, nil, nil, nil, map[string]*convext.Model{}, nil)
+	require.Len(t, items, 1)
+	assert.Equal(t, 0, items[0].FollowSort)
+}
+
+// DM 分支必须从 dmCategorySorts 加载 group_category.sort 写入 CategorySort。
+// 旧实现只 copy DMCategoryID，导致带 category 的 DM 仍以 CategorySort=0 排序，
+// 与同 category 群不在同一桶内。
+func TestBuildFollowItems_DMLoadsCategorySort(t *testing.T) {
+	convs := []*config.SyncUserConversationResp{
+		makeIMConv("peer1", common.ChannelTypePerson.Uint8(), nowRecent()),
+	}
+	catID := "cat-dm"
+	followedDMs := map[string]*convext.Model{
+		"peer1": {TargetID: "peer1", FollowedDM: 1, FollowSort: 4, DMCategoryID: &catID},
+	}
+	dmCategorySorts := map[string]int{catID: 42}
+	items := buildFollowItems(convs, nil, nil, followedDMs, nil, nil, dmCategorySorts)
+	require.Len(t, items, 1)
+	assert.Equal(t, 42, items[0].CategorySort, "DM 的 CategorySort 必须取自 group_category.sort")
+	require.NotNil(t, items[0].CategoryID)
+	assert.Equal(t, catID, *items[0].CategoryID)
+}
+
+// DM 无 category 时 CategorySort=0、CategoryID=nil。
+func TestBuildFollowItems_DMNoCategory_NoCategorySort(t *testing.T) {
+	convs := []*config.SyncUserConversationResp{
+		makeIMConv("peer1", common.ChannelTypePerson.Uint8(), nowRecent()),
+	}
+	followedDMs := map[string]*convext.Model{
+		"peer1": {TargetID: "peer1", FollowedDM: 1, FollowSort: 4},
+	}
+	items := buildFollowItems(convs, nil, nil, followedDMs, nil, nil, nil)
+	require.Len(t, items, 1)
+	assert.Equal(t, 0, items[0].CategorySort)
+	assert.Nil(t, items[0].CategoryID)
+}
+
+// 新的 sort 顺序：FollowSort 必须凌驾于 intraCategorySort，让 sidebar 拖拽真正生效。
+func TestSortFollowItems_FollowSortBeforeIntraCategory(t *testing.T) {
+	items := []*SidebarItem{
+		{TargetID: "a", CategorySort: 1, intraCategorySort: 1, FollowSort: 2},
+		{TargetID: "b", CategorySort: 1, intraCategorySort: 2, FollowSort: 1},
+	}
+	sortFollowItems(items)
+	assert.Equal(t, "b", items[0].TargetID, "FollowSort 优先级必须高于 intraCategorySort")
+	assert.Equal(t, "a", items[1].TargetID)
+}
+
+// Issue #41 主场景：DM + 群同 CategorySort=0，FollowSort 决定相对顺序，
+// 两次相反拖拽请求必须产生两种不同结果（旧实现群恒在 DM 之前）。
+func TestSortFollowItems_CrossTypeDrag_DMBeforeGroup(t *testing.T) {
+	items := []*SidebarItem{
+		{TargetID: "dm-1", TargetType: 1, CategorySort: 0, FollowSort: 1},
+		{TargetID: "g-1", TargetType: 2, CategorySort: 0, FollowSort: 2},
+	}
+	sortFollowItems(items)
+	assert.Equal(t, "dm-1", items[0].TargetID, "FollowSort=1 的 DM 必须排在 FollowSort=2 的群前面")
+	assert.Equal(t, "g-1", items[1].TargetID)
+}
+
+func TestSortFollowItems_CrossTypeDrag_GroupBeforeDM(t *testing.T) {
+	items := []*SidebarItem{
+		{TargetID: "dm-1", TargetType: 1, CategorySort: 0, FollowSort: 2},
+		{TargetID: "g-1", TargetType: 2, CategorySort: 0, FollowSort: 1},
+	}
+	sortFollowItems(items)
+	assert.Equal(t, "g-1", items[0].TargetID, "FollowSort=1 的群必须排在 FollowSort=2 的 DM 前面")
+	assert.Equal(t, "dm-1", items[1].TargetID)
+}
+
+// intraCategorySort 在 FollowSort 后作为回退（用户没拖过 sidebar 但用过 category 管理 UI）。
+func TestSortFollowItems_IntraCategoryAsFallbackWhenFollowSortEqual(t *testing.T) {
+	items := []*SidebarItem{
+		{TargetID: "g-a", CategorySort: 1, FollowSort: 0, intraCategorySort: 2},
+		{TargetID: "g-b", CategorySort: 1, FollowSort: 0, intraCategorySort: 1},
+	}
+	sortFollowItems(items)
+	assert.Equal(t, "g-b", items[0].TargetID, "FollowSort 同为 0 时回退到 category-management UI 的顺序")
+}
+
+// PR #42 review (yujiawei) regression：IsPinned 从 T3 提升到 T2 后，pin 必须
+// 在同 category 内胜过 FollowSort —— 即便被 pin 的 item 的 FollowSort 远大于
+// 未 pin 的 item。"pin overrides everything within a category" 是排序契约的
+// 显式语义，需要专门验证以防回归。
+func TestSortFollowItems_PinnedBeatsFollowSort(t *testing.T) {
+	items := []*SidebarItem{
+		{TargetID: "unpinned", CategorySort: 1, IsPinned: false, FollowSort: 1},
+		{TargetID: "pinned", CategorySort: 1, IsPinned: true, FollowSort: 99},
+	}
+	sortFollowItems(items)
+	assert.Equal(t, "pinned", items[0].TargetID,
+		"pin 必须凌驾于 FollowSort：FollowSort=99 的 pinned 项必须排在 FollowSort=1 的 unpinned 项前")
+	assert.Equal(t, "unpinned", items[1].TargetID)
+}
+
+// pin 与 intraCategorySort 的交互：pin 同样必须凌驾于 intraCategorySort（T2 > T4）。
+func TestSortFollowItems_PinnedBeatsIntraCategorySort(t *testing.T) {
+	items := []*SidebarItem{
+		{TargetID: "unpinned-low-intra", CategorySort: 1, IsPinned: false, intraCategorySort: 0},
+		{TargetID: "pinned-high-intra", CategorySort: 1, IsPinned: true, intraCategorySort: 99},
+	}
+	sortFollowItems(items)
+	assert.Equal(t, "pinned-high-intra", items[0].TargetID)
+	assert.Equal(t, "unpinned-low-intra", items[1].TargetID)
+}
+
+// 所有排序键完全相同时按 TargetID ASC 决定，保证响应顺序确定。
+func TestSortFollowItems_TieBreakOnTargetID(t *testing.T) {
+	items := []*SidebarItem{
+		{TargetID: "zzz", CategorySort: 0, FollowSort: 0, intraCategorySort: 0},
+		{TargetID: "aaa", CategorySort: 0, FollowSort: 0, intraCategorySort: 0},
+		{TargetID: "mmm", CategorySort: 0, FollowSort: 0, intraCategorySort: 0},
+	}
+	sortFollowItems(items)
+	assert.Equal(t, "aaa", items[0].TargetID)
+	assert.Equal(t, "mmm", items[1].TargetID)
+	assert.Equal(t, "zzz", items[2].TargetID)
 }
 
 // ---------------------------------------------------------------------------
