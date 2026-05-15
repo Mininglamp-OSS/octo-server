@@ -87,7 +87,16 @@ minio:
   # process and the browser share the same DNS view (i.e. for inside-cluster
   # service-to-service tests, not real users). Set this once your nginx /
   # reverse-proxy / host-port mapping is finalized.
-  downloadURL: "http://minio:9000"
+  #
+  # Default: matches the bundled docker-compose stack's nginx route
+  # (octo.local:28080 → /minio/* → minio:9000). Override the host /
+  # port via the OCTO_DOMAIN and OCTO_HTTP_PORT env vars (see
+  # docker-compose.yaml in the deployment repo) when they differ from
+  # the defaults, or replace the whole value when running behind a
+  # different reverse proxy / host-port mapping. The internal hostname
+  # `minio` is intentionally NOT used here because browsers cannot
+  # resolve it.
+  downloadURL: "http://octo.local:28080/minio"
   accessKeyID: "octoadmin"
   secretAccessKey: "CHANGE_ME_MINIO_PASSWORD"
 
