@@ -37,14 +37,32 @@ type fakeSpaceQuerier struct {
 	// the full ordered list; falls back to a single-element list built from
 	// `defaultSpace` / per-robot result when absent.
 	multiRows map[string][]string
-	// isBotSpaceMember scripted return:
-	//   memberships[robotID][spaceID] = isMember
-	// missing entries fall through to memberDefault. memberErr (when non-nil)
-	// short-circuits everything.
+
+	// YUJ-688 / PR#43 R1 — production-shaped authorization fake.
+	//
+	// `isBotSpaceAuthorized` mirrors the production OR-of-three rule from
+	// modules/bot_api/db.go:
+	//   (1) `memberships[robotID][spaceID] == true` → space_member match
+	//   (2) `appBots[robotID].publishedPlatform == true` AND
+	//       `activeSpaces[spaceID] != false` → published platform App Bot
+	//       visible in target active Space
+	//   (3) `appBots[robotID].scopeSpaceID == spaceID` AND
+	//       `appBots[robotID].published == true` AND
+	//       `activeSpaces[spaceID] != false` → scope=space App Bot in own Space
+	// `activeSpaces` defaults to true for any spaceID not explicitly set to
+	// false, so tests that don't care about Space status can omit it.
 	memberships   map[string]map[string]bool
-	memberCalls   []memberCall
-	memberDefault bool
-	memberErr     error
+	authCalls     []memberCall
+	authDefault   bool
+	authErr       error
+	appBots       map[string]appBotShape
+	activeSpaces  map[string]bool
+}
+
+type appBotShape struct {
+	publishedPlatform bool   // app_bot row exists with scope='platform' status=1
+	scopeSpaceID      string // app_bot.space_id when scope='space' (status=1)
+	published         bool   // app_bot.status=1 for the scope=space case
 }
 
 type memberCall struct {
@@ -79,17 +97,48 @@ func (f *fakeSpaceQuerier) querySpaceIDsByRobotID(robotID string) (string, []str
 	return primary, []string{primary}, nil
 }
 
-func (f *fakeSpaceQuerier) isBotSpaceMember(robotID, spaceID string) (bool, error) {
-	f.memberCalls = append(f.memberCalls, memberCall{robotID: robotID, spaceID: spaceID})
-	if f.memberErr != nil {
-		return false, f.memberErr
+// isBotSpaceAuthorized mirrors the production OR-of-three rule. Tests pick the
+// branch they want by populating `memberships` (User Bot path) or `appBots`
+// (App Bot platform / scope=space path). `activeSpaces` defaults to active.
+func (f *fakeSpaceQuerier) isBotSpaceAuthorized(robotID, spaceID string) (bool, error) {
+	f.authCalls = append(f.authCalls, memberCall{robotID: robotID, spaceID: spaceID})
+	if f.authErr != nil {
+		return false, f.authErr
 	}
+	// Branch (1): space_member match.
+	if m, ok := f.memberships[robotID]; ok {
+		if v, ok := m[spaceID]; ok && v {
+			return true, nil
+		}
+	}
+	// Target Space must be active for app_bot branches. Default = active when
+	// activeSpaces is nil or the entry is missing.
+	spaceActive := true
+	if f.activeSpaces != nil {
+		if v, ok := f.activeSpaces[spaceID]; ok {
+			spaceActive = v
+		}
+	}
+	if spaceActive {
+		if shape, ok := f.appBots[robotID]; ok {
+			// Branch (2): published platform App Bot in any active Space.
+			if shape.publishedPlatform {
+				return true, nil
+			}
+			// Branch (3): scope=space App Bot dispatching into its own Space.
+			if shape.published && shape.scopeSpaceID != "" && shape.scopeSpaceID == spaceID {
+				return true, nil
+			}
+		}
+	}
+	// Fall through: explicit `memberships[robotID][spaceID] == false` or
+	// nothing matches → use authDefault for tests that don't model the bot.
 	if m, ok := f.memberships[robotID]; ok {
 		if v, ok := m[spaceID]; ok {
 			return v, nil
 		}
 	}
-	return f.memberDefault, nil
+	return f.authDefault, nil
 }
 
 // fakeWkContext creates a minimal wkhttp.Context (gin context wrapper) with

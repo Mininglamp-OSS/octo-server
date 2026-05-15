@@ -1,4 +1,4 @@
-// Package bot_api · YUJ-644 / Mininglamp-OSS#33 / YUJ-660
+// Package bot_api · YUJ-644 / Mininglamp-OSS#33 / YUJ-660 / YUJ-688
 //
 // PERSONAL DM 派发前为 payload 注入 Bot 的权威 SpaceID。WuKongIM 在 DM 上仅按
 // 裸 uid 路由（无 Space 概念），收端客户端 SpaceFilter 唯一可信信号源是
@@ -26,10 +26,24 @@
 // 件（或孤儿 Bot 触发条件）伪造 payload.space_id="victim_space" 通过派发，realtime
 // + offline push 都会信任这个值。strip 是唯一 fail-closed 行为；message 层 R2
 // High-3 strip 只在 sendMsg 路径生效，bot_api / robot 路径需要本层独立 strip。
+//
+// **YUJ-688 / PR#43 R1 fix-up — platform App Bot validator gap (Critical from
+// Jerry-Xin + lml2468)**: the X-Space-ID validator previously checked only
+// `space_member`. Platform App Bots are inserted in `app_bot` with
+// `scope='platform'` and never get a `space_member` row, yet they are
+// legitimately visible in every active Space (`pkg/space/query.go:99`).
+// Result: every valid platform App Bot dispatch with a valid X-Space-ID
+// header was rejected by the validator and the caller's strip path downgraded
+// the payload, sending the message as a personal DM with no SpaceID. The fix
+// renames `isBotSpaceMember` to `isBotSpaceAuthorized` and broadens the SQL
+// to honor the production `app_bot` rows (platform OR scope=space-with-match).
+// Trim whitespace from the header value first to avoid noisy reject logs from
+// "  space_X  " / trailing CR.
 package bot_api
 
 import (
 	"errors"
+	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/gocraft/dbr/v2"
@@ -44,13 +58,16 @@ import (
 //   - querySpaceIDsByRobotID returns the full ordered match list so the
 //     resolver can warn when a User Bot is in multiple Spaces (the ambiguity
 //     case Option C makes deterministic but doesn't *fix*).
-//   - isBotSpaceMember validates an X-Space-ID header hint before honoring it
-//     (Option B). Required because the legacy header path is not gated by
-//     SpaceMiddleware on /v1/bot/sendMessage.
+//   - isBotSpaceAuthorized validates an X-Space-ID header hint before honoring
+//     it (Option B). Required because the legacy header path is not gated by
+//     SpaceMiddleware on /v1/bot/sendMessage. Authorization is broader than
+//     space_member: it also recognizes platform App Bots (scope='platform'
+//     visible in every active Space) and scope=space App Bots dispatching
+//     into their own Space — see modules/bot_api/db.go for the full rule.
 type botSpaceQuerier interface {
 	querySpaceIDByRobotID(robotID string) (string, error)
 	querySpaceIDsByRobotID(robotID string) (string, []string, error)
-	isBotSpaceMember(robotID, spaceID string) (bool, error)
+	isBotSpaceAuthorized(robotID, spaceID string) (bool, error)
 }
 
 // enrichBotPayloadWithSpaceID 在 PERSONAL DM 派发前用 Bot 的权威 SpaceID 覆盖
@@ -90,7 +107,7 @@ func (ba *BotAPI) enrichBotPayloadWithSpaceID(c *wkhttp.Context, robotID string,
 }
 
 // resolveBotActiveSpaceID 优先读 gin-context（App Bot scope=space），其次接受
-// /v1/bot/sendMessage 上 X-Space-ID 头（前提是 Bot 是该 Space 的活跃成员），
+// /v1/bot/sendMessage 上 X-Space-ID 头（前提是 Bot 被授权在该 Space 派发），
 // fallback 到 querySpaceIDByRobotID。返回 "" 表示 Bot 没有活跃 SpaceID
 // （任何原因 — 孤儿 Bot、DB 错误、或 ErrNotFound）。调用方必须在 "" 返回时
 // 执行 strip 而非 passthrough。
@@ -100,10 +117,10 @@ func (ba *BotAPI) enrichBotPayloadWithSpaceID(c *wkhttp.Context, robotID string,
 //  1. App Bot scope=space → CtxKeyAppBotSpaceID（O(1)，由 authAppBot 写入）。
 //     这是最强的服务端权威信号，不接受任何 client override。
 //
-//  2. X-Space-ID 头（仅在 ctx 第一项缺失时才生效）→ 验证 Bot 是该 Space 的
-//     成员后采纳。User Bot 若已被加入 N 个 Space，client 可通过该头显式选择
-//     语义 Space；不命中（非成员 / 头空）则 fall through。验证通过 isBotSpaceMember
-//     —— 没有此校验，client 用任意头值就可绕过 Space 隔离。
+//  2. X-Space-ID 头（仅在 ctx 第一项缺失时才生效）→ 验证 Bot 在该 Space 被
+//     授权后采纳。授权语义见 isBotSpaceAuthorized：space_member 成员 OR
+//     published platform App Bot OR scope=space App Bot 派发到自身 Space。
+//     不命中（未授权 / 头空 / 头被空白填充）则 fall through。
 //
 //  3. querySpaceIDByRobotID（DB） → 取 deterministic 首行。多归属时 emit
 //     `multi_space_membership=true` warn 让运维定位需要走 Option B 的 Bot。
@@ -129,18 +146,24 @@ func (ba *BotAPI) resolveBotActiveSpaceID(c *wkhttp.Context, robotID string) str
 	// Option B 的精确实现：context-aware preference for Space-scoped routes
 	// without taking a hard dependency on SpaceMiddleware (which the /v1/bot
 	// route group does not currently mount).
+	//
+	// YUJ-688: trim whitespace from the header value before validation. Some
+	// clients send "  space_X  " or trailing CR; without TrimSpace these were
+	// rejected as non-member and emitted noisy reject warns.
 	if c != nil && c.Request != nil {
-		if hint := c.GetHeader("X-Space-ID"); hint != "" {
-			isMember, err := q.isBotSpaceMember(robotID, hint)
+		if hint := strings.TrimSpace(c.GetHeader("X-Space-ID")); hint != "" {
+			isAuthorized, err := q.isBotSpaceAuthorized(robotID, hint)
 			if err != nil {
-				ba.Warn("isBotSpaceMember 失败，回退到 deterministic DB 查询",
+				ba.Warn("isBotSpaceAuthorized 失败，回退到 deterministic DB 查询",
 					zap.String("robotID", robotID), zap.String("hint", hint), zap.Error(err))
-			} else if isMember {
+			} else if isAuthorized {
 				return hint
 			} else {
-				// Header sent but Bot isn't a member: log so operators can
-				// detect bots that need to be added (or attackers probing).
-				ba.Warn("x_space_id_header_rejected_not_member",
+				// Header sent but Bot isn't authorized for that Space: log so
+				// operators can detect bots that need to be added (or attackers
+				// probing). Authorization spans space_member + active platform
+				// App Bots + scope=space App Bots in their own active Space.
+				ba.Warn("x_space_id_header_rejected_not_authorized",
 					zap.Bool("x_space_id_header_rejected", true),
 					zap.String("dispatcher", "bot_api"),
 					zap.String("robotID", robotID),

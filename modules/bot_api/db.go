@@ -131,18 +131,62 @@ func (d *botAPIDB) querySpaceIDsByRobotID(robotID string) (string, []string, err
 	return spaceIDs[0], spaceIDs, nil
 }
 
-// isBotSpaceMember reports whether `robotID` is currently an active member of
-// the given `spaceID` (both rows status=1). Used by `/v1/bot/sendMessage` to
-// validate an `X-Space-ID` header hint before honoring it (Option B from
-// issue#36) — without this check, the header would be a trivial bypass.
-func (d *botAPIDB) isBotSpaceMember(robotID, spaceID string) (bool, error) {
+// isBotSpaceAuthorized reports whether `robotID` is allowed to dispatch into
+// the given `spaceID`. Used by `/v1/bot/sendMessage` to validate an
+// `X-Space-ID` header hint before honoring it (Option B from issue#36).
+// Without this check, the header would be a trivial cross-Space bypass.
+//
+// Authorization is the OR of three production conditions — all gated on the
+// target Space being active (`space.status=1`):
+//
+//  1. **User Bot / manually-added bot membership** — the bot has an active
+//     `space_member` row for the target Space (status=1).
+//  2. **Platform App Bot** — the bot is a published `app_bot` row with
+//     `scope='platform'` (status=1). Platform App Bots are visible in every
+//     active Space (mirrors `pkg/space/query.go:CheckBotsInSpace`) and never
+//     get a `space_member` insert (see `modules/app_bot/db.go:insertAppBot`).
+//     Without this branch the validator rejects every legitimate platform App
+//     Bot dispatch and the caller's `enrichBotPayloadWithSpaceID` strips the
+//     payload.space_id, downgrading the request to PERSONAL DM (Mininglamp-OSS/
+//     octo-server PR#43 R1 critical from Jerry-Xin + lml2468).
+//  3. **Scope=space App Bot** — the bot is a published `app_bot` row with
+//     `scope='space'` AND its own `space_id` matches the requested SpaceID.
+//     This branch is mostly defensive; production traffic for scope=space App
+//     Bots reaches `resolveBotActiveSpaceID` via `CtxKeyAppBotSpaceID` (the
+//     ctx fast path) and never falls through to the header validator. The
+//     branch is included so a future refactor (or test regression) cannot
+//     turn the header path into a cross-Space bypass for scope=space bots.
+//
+// Implementation note: two short queries instead of one OR-joined statement.
+// Both run on indexed columns (`space_member(uid, space_id)`, `app_bot.uid`)
+// and the second is skipped when the first hits, so the common case is a
+// single round trip. A single combined query was rejected because OR-of-
+// EXISTS in MySQL with parameter reuse forces the planner to materialize
+// both branches even when the first short-circuits.
+func (d *botAPIDB) isBotSpaceAuthorized(robotID, spaceID string) (bool, error) {
 	if robotID == "" || spaceID == "" {
 		return false, nil
 	}
+	// (1) space_member path: active member row in the target active Space.
 	var count int
 	err := d.session.SelectBySql(
 		"SELECT COUNT(*) FROM space_member sm INNER JOIN space s ON s.space_id = sm.space_id WHERE sm.uid=? AND sm.space_id=? AND sm.status=1 AND s.status=1",
 		robotID, spaceID,
+	).LoadOne(&count)
+	if err != nil {
+		return false, err
+	}
+	if count > 0 {
+		return true, nil
+	}
+	// (2)+(3) app_bot path: published platform Bot in any active Space, OR
+	// scope=space Bot whose own SpaceID matches the requested target Space.
+	// Both branches require the target Space to be active.
+	err = d.session.SelectBySql(
+		"SELECT COUNT(*) FROM app_bot ab INNER JOIN space s ON s.space_id=? "+
+			"WHERE ab.uid=? AND ab.status=1 AND s.status=1 "+
+			"AND (ab.scope='platform' OR (ab.scope='space' AND ab.space_id=?))",
+		spaceID, robotID, spaceID,
 	).LoadOne(&count)
 	if err != nil {
 		return false, err

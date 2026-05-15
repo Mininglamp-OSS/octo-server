@@ -46,7 +46,12 @@ func (ba *BotAPI) resolveOwnerAndSpace(c *wkhttp.Context) (string, string, strin
 		return "", "", "", false
 	}
 
-	spaceID, err := ba.db.querySpaceIDByRobotID(robotID)
+	// YUJ-688 medium ask: Voice context path was deterministic but used the
+	// single-row wrapper, discarding the multi-Space list and never emitting
+	// the `multi_space_membership=true` observability signal. Switch to the
+	// multi-row variant so multi-Space User Bot voice traffic is visible to
+	// operators alongside the bot_api / robot dispatchers.
+	spaceID, allSpaces, err := ba.db.querySpaceIDsByRobotID(robotID)
 	if err != nil {
 		if errors.Is(err, dbr.ErrNotFound) {
 			ba.Warn("bot is not in any active space", zap.String("robotID", robotID))
@@ -61,6 +66,17 @@ func (ba *BotAPI) resolveOwnerAndSpace(c *wkhttp.Context) (string, string, strin
 		ba.Warn("bot is not in any active space", zap.String("robotID", robotID))
 		c.ResponseErrorWithStatus(errors.New("bot is not in any active space"), http.StatusBadRequest)
 		return "", "", "", false
+	}
+	if len(allSpaces) > 1 {
+		// Mirror the dispatch-path warn shape so a single SLO query covers all
+		// multi-Space dispatch entry points (bot_api send, robot send, voice).
+		ba.Warn("multi_space_membership",
+			zap.Bool("multi_space_membership", true),
+			zap.String("dispatcher", "bot_api_voice"),
+			zap.String("robotID", robotID),
+			zap.String("chosen_space_id", spaceID),
+			zap.Strings("all_space_ids", allSpaces),
+		)
 	}
 
 	return ownerUID, spaceID, robotID, true
