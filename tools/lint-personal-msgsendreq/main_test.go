@@ -116,3 +116,91 @@ func _(ct uint8) {
 		t.Fatalf("expected 0 detections on variable channel_type, got %d", hits)
 	}
 }
+
+// Numeric literal `ChannelType: 1` must be detected. ChannelTypePerson is
+// the iota value 1 in octo-lib/common.ChannelType, so a hand-written numeric
+// literal would otherwise quietly bypass the symbolic guard. Reviewer ask
+// (Jerry-Xin, PR#44 R1): make this lint a durable CI backstop.
+func TestDetectsNumericPersonChannelType(t *testing.T) {
+	f := parse(t, `package x
+import "x/config"
+func _() {
+	_ = &config.MsgSendReq{
+		ChannelType: 1,
+	}
+}
+`)
+	hits := 0
+	walkComposites(f, func(typeMatched, valueMatched bool) {
+		if typeMatched && valueMatched {
+			hits++
+		}
+	})
+	if hits != 1 {
+		t.Fatalf("expected 1 numeric PERSONAL detection, got %d", hits)
+	}
+}
+
+// uint8(1) cast literal — same trap as bare `1`, just dressed in a cast.
+func TestDetectsNumericPersonChannelTypeWithCast(t *testing.T) {
+	f := parse(t, `package x
+import "x/config"
+func _() {
+	_ = &config.MsgSendReq{
+		ChannelType: uint8(1),
+	}
+}
+`)
+	hits := 0
+	walkComposites(f, func(typeMatched, valueMatched bool) {
+		if typeMatched && valueMatched {
+			hits++
+		}
+	})
+	if hits != 1 {
+		t.Fatalf("expected 1 numeric-cast PERSONAL detection, got %d", hits)
+	}
+}
+
+// Numeric literal for GROUP (==2) must NOT trip the lint — GROUP DM is out
+// of scope for the PERSONAL builder migration.
+func TestIgnoresNumericGroupChannelType(t *testing.T) {
+	f := parse(t, `package x
+import "x/config"
+func _() {
+	_ = &config.MsgSendReq{
+		ChannelType: 2,
+	}
+}
+`)
+	hits := 0
+	walkComposites(f, func(typeMatched, valueMatched bool) {
+		if typeMatched && valueMatched {
+			hits++
+		}
+	})
+	if hits != 0 {
+		t.Fatalf("expected 0 detections on numeric GROUP literal, got %d", hits)
+	}
+}
+
+// Numeric literal in a non-MsgSendReq composite must NOT trip the lint
+// (defense-in-depth: the type guard in walkComposites must still gate the
+// numeric value match).
+func TestIgnoresNumericChannelTypeOnUnrelatedStruct(t *testing.T) {
+	f := parse(t, `package x
+type SomethingElse struct{ ChannelType uint8 }
+func _() {
+	_ = &SomethingElse{ChannelType: 1}
+}
+`)
+	hits := 0
+	walkComposites(f, func(typeMatched, valueMatched bool) {
+		if typeMatched && valueMatched {
+			hits++
+		}
+	})
+	if hits != 0 {
+		t.Fatalf("expected 0 detections on unrelated struct, got %d", hits)
+	}
+}

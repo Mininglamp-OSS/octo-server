@@ -28,6 +28,14 @@ import (
 	"strings"
 )
 
+// channelTypePersonValue is the numeric value that a direct integer literal
+// would have to use to bypass the symbolic ChannelTypePerson detection.
+// octo-lib's common.ChannelType iota starts at ChannelTypeNone=0, so
+// ChannelTypePerson==1. This is part of the public protocol surface and is
+// not expected to drift; if it ever does, the constant must be updated here
+// AND in the test fixture below.
+const channelTypePersonValue = "1"
+
 func main() {
 	roots := os.Args[1:]
 	if len(roots) == 0 {
@@ -125,7 +133,10 @@ func isMsgSendReqType(e ast.Expr) bool {
 
 // containsPersonChannelType reports whether the expression refers to
 // ChannelTypePerson anywhere (e.g. common.ChannelTypePerson.Uint8(),
-// ChannelTypePerson.Uint8(), or just ChannelTypePerson).
+// ChannelTypePerson.Uint8(), or just ChannelTypePerson) — OR uses the raw
+// numeric literal that ChannelTypePerson resolves to (currently 1). The
+// numeric form is included so a `ChannelType: 1` literal cannot quietly
+// bypass the guard; the lint is meant to be a durable CI backstop.
 func containsPersonChannelType(e ast.Expr) bool {
 	found := false
 	ast.Inspect(e, func(n ast.Node) bool {
@@ -137,6 +148,11 @@ func containsPersonChannelType(e ast.Expr) bool {
 			}
 		case *ast.SelectorExpr:
 			if t.Sel != nil && t.Sel.Name == "ChannelTypePerson" {
+				found = true
+				return false
+			}
+		case *ast.BasicLit:
+			if t.Kind == token.INT && t.Value == channelTypePersonValue {
 				found = true
 				return false
 			}
