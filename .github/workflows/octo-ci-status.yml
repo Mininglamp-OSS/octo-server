@@ -6,6 +6,8 @@ on:
     types: [completed]
     branches: [main]
 
+permissions: {}
+
 jobs:
   notify:
     uses: Mininglamp-OSS/.github/.github/workflows/octo-ci-status.yml@v1
