@@ -5,16 +5,16 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/Mininglamp-OSS/octo-server/modules/group"
-	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
-	"github.com/Mininglamp-OSS/octo-server/pkg/util"
-	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/model"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/register"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
+	"github.com/Mininglamp-OSS/octo-server/pkg/util"
 	"go.uber.org/zap"
 )
 
@@ -41,10 +41,18 @@ func (ch *Channel) Route(r *wkhttp.WKHttp) {
 	auth := r.Group("/v1", ch.ctx.AuthMiddleware(r))
 	{
 		auth.GET("/channel/state", ch.state)
-		auth.GET("/channels/:channel_id/:channel_type", ch.channelGet)                                  // 获取频道信息
-		auth.POST("/channels/:channel_id/:channel_type/message/autodelete", ch.setAutoDeleteForMessage) // 设置消息定时删除时间
-		auth.POST("/channels/:channel_id/:channel_type/message/clear", ch.clearChannelMessages)         // 清空频道消息
-		auth.GET("/channels/:channel_id/:channel_type/storyline", ch.getStoryline)                      // 获取群聊个人故事线
+		auth.GET("/channels/:channel_id/:channel_type", ch.channelGet)                          // 获取频道信息
+		auth.POST("/channels/:channel_id/:channel_type/message/clear", ch.clearChannelMessages) // 清空频道消息
+		auth.GET("/channels/:channel_id/:channel_type/storyline", ch.getStoryline)              // 获取群聊个人故事线
+	}
+
+	// Routes that build PERSONAL MsgSendReq need SpaceMiddleware so the
+	// PERSONAL branch can read a SpaceMiddleware-validated space_id from the
+	// gin context (spacepkg.GetSpaceID); without this, payload.space_id would
+	// be fail-closed stripped by the NewPersonalMsgSendReq builder.
+	spaceAuth := r.Group("/v1", ch.ctx.AuthMiddleware(r), spacepkg.SpaceMiddleware(ch.ctx))
+	{
+		spaceAuth.POST("/channels/:channel_id/:channel_type/message/autodelete", ch.setAutoDeleteForMessage) // 设置消息定时删除时间
 	}
 }
 

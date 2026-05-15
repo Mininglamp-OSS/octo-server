@@ -1074,9 +1074,22 @@ func (ab *AppBot) applyBot(c *wkhttp.Context) {
 	ab.fixFriendVersion(req.RobotUID, loginUID)
 
 	// 3. IM Whitelist (bidirectional, with space prefix if applicable)
+	// For space-scoped bots, use bot.SpaceID directly. createBot persists the
+	// authoritative scope in app_bot.space_id but does NOT add the App Bot UID
+	// into space_member, so space.GetCommonSpaceID (which joins space_member
+	// for both UIDs) returns "" for valid space-scoped bots. That would cause
+	// NewPersonalMsgSendReq below to fail-closed strip payload.space_id and
+	// the welcome DM would not be attributed to its authoritative Space.
+	// The membership check above already validated loginUID belongs to
+	// bot.SpaceID.
 	userChannelID := loginUID
 	botChannelID := req.RobotUID
-	spaceID := space.GetCommonSpaceID(ab.ctx, loginUID, req.RobotUID)
+	var spaceID string
+	if bot.Scope == "space" {
+		spaceID = bot.SpaceID
+	} else {
+		spaceID = space.GetCommonSpaceID(ab.ctx, loginUID, req.RobotUID)
+	}
 	if spaceID != "" {
 		userChannelID = fmt.Sprintf("s%s_%s", spaceID, loginUID)
 		botChannelID = fmt.Sprintf("s%s_%s", spaceID, req.RobotUID)
@@ -1157,4 +1170,3 @@ func generateAppBotToken() (string, error) {
 	}
 	return AppBotTokenPrefix + hex.EncodeToString(b), nil
 }
-

@@ -27,8 +27,8 @@ type BotFriendApply struct {
 	ApplyName string `json:"apply_name"`
 	RobotID   string `json:"robot_id"`
 	Remark    string `json:"remark"`
-	Token     string `json:"token"`     // friend apply token from cache
-	SpaceID   string `json:"space_id"`  // 申请来源 Space，用于隔离通知
+	Token     string `json:"token"`    // friend apply token from cache
+	SpaceID   string `json:"space_id"` // 申请来源 Space，用于隔离通知
 	CreatedAt int64  `json:"created_at"`
 }
 

@@ -11,17 +11,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
-	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
-	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkevent"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
-	"github.com/gocraft/dbr/v2"
+	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
+	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	rd "github.com/go-redis/redis"
+	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
 )
 
@@ -1066,9 +1066,9 @@ func (s *Space) getInvitePreview(c *wkhttp.Context) {
 		MaxUses:     invitation.MaxUses,
 		UsedCount:   invitation.UsedCount,
 		ExpiresAt:   expiresAtStr,
-		MemberCount: 0,            // 不暴露精确成员数量
+		MemberCount: 0,              // 不暴露精确成员数量
 		JoinMode:    space.JoinMode, // 告知客户端是否需要审批
-		Bots:        nil,          // 不暴露 Bot 列表
+		Bots:        nil,            // 不暴露 Bot 列表
 	})
 }
 
@@ -1840,4 +1840,3 @@ func (s *Space) loadKnownSpaceIDs() {
 	spacepkg.RegisterSpaceIDs(ids)
 	s.Info("已注册 spaceId 到 ParseChannelID 缓存", zap.Int("count", len(ids)), zap.Strings("ids", ids))
 }
-

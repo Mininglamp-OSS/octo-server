@@ -5,11 +5,11 @@ import (
 	"os"
 	"runtime/debug"
 
-	"github.com/Mininglamp-OSS/octo-server/modules/source"
-	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-server/modules/source"
+	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 )
