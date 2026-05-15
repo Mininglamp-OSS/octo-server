@@ -8,7 +8,6 @@ import (
 	"os"
 	"sync"
 
-	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
@@ -235,20 +234,19 @@ func (n *Notify) deliverNotification(req *NotifyReq) (*NotifyResp, error) {
 		return nil, errors.New("notify bot unavailable")
 	}
 
-	// Inject space_id into payload for Space-level message filtering
-	// (same mechanism as botfather command.go:951)
-	// Clone to avoid mutating caller's map.
+	// Clone to avoid mutating caller's map. The PERSONAL builder
+	// (NewPersonalMsgSendReq) is the single authority for payload.space_id,
+	// so the legacy "if absent, inject req.SpaceID" check that lived here
+	// (mirrored from botfather/command.go:951) is removed in YUJ-674 /
+	// Mininglamp-OSS#37 — the builder either overrides with req.SpaceID or
+	// strips on empty, both fail-closed.
 	payload := make(map[string]interface{}, len(req.Payload))
 	for k, v := range req.Payload {
 		payload[k] = v
 	}
-	if payload["space_id"] == nil || payload["space_id"] == "" {
-		payload["space_id"] = req.SpaceID
-	}
 
 	// 并发投递（bounded worker pool，最多 20 并发）
 	fromUID := NotifyBotUID()
-	payloadBytes := []byte(util.ToJson(payload))
 
 	type sendResult struct {
 		uid     string
@@ -261,15 +259,20 @@ func (n *Notify) deliverNotification(req *NotifyReq) (*NotifyResp, error) {
 		sem <- struct{}{}
 		go func(uid string) {
 			defer func() { <-sem }()
-			err := n.ctx.SendMessage(&config.MsgSendReq{
-				Header: config.MsgHeader{
-					RedDot: 1,
-				},
-				FromUID:     fromUID,
-				ChannelID:   uid,
-				ChannelType: common.ChannelTypePerson.Uint8(),
-				Payload:     payloadBytes,
-			})
+			// Per-goroutine map clone is required: NewPersonalMsgSendReq mutates
+			// the payload map (sets/strips space_id) before encoding, so a shared
+			// map across goroutines would race.
+			perCall := make(map[string]interface{}, len(payload))
+			for k, v := range payload {
+				perCall[k] = v
+			}
+			err := n.ctx.SendMessage(config.NewPersonalMsgSendReq(
+				uid,
+				fromUID,
+				perCall,
+				req.SpaceID,
+				config.PersonalMsgOptions{Header: config.MsgHeader{RedDot: 1}},
+			))
 			if err != nil {
 				n.Warn("发送通知消息失败",
 					zap.String("target", uid),

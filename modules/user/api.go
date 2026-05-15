@@ -1410,18 +1410,19 @@ func (u *User) sentWelcomeMsg(publicIP, uid string) {
 		ipStr := fmt.Sprintf("本次登录的信息：%s %s", publicIP, util.ToyyyyMMddHHmmss(time.Now()))
 		sentContent = fmt.Sprintf("%s\n%s", content, ipStr)
 	}
-	err = u.ctx.SendMessage(&config.MsgSendReq{
-		FromUID:     u.ctx.GetConfig().Account.SystemUID,
-		ChannelID:   uid,
-		ChannelType: common.ChannelTypePerson.Uint8(),
-		Payload: []byte(util.ToJson(map[string]interface{}{
+	// YUJ-674 / Mininglamp-OSS#37: PERSONAL DM 走 NewPersonalMsgSendReq builder。
+	// SystemUID 是平台级账户，没有 Space 上下文 → senderSpaceID = ""，builder
+	// 会 fail-closed strip，与"系统欢迎消息不归属任何 Space"语义一致。
+	err = u.ctx.SendMessage(config.NewPersonalMsgSendReq(
+		uid,
+		u.ctx.GetConfig().Account.SystemUID,
+		map[string]interface{}{
 			"content": sentContent,
 			"type":    common.Text,
-		})),
-		Header: config.MsgHeader{
-			RedDot: 1,
 		},
-	})
+		"", // SystemUID is Space-agnostic; builder strips any client-supplied space_id.
+		config.PersonalMsgOptions{Header: config.MsgHeader{RedDot: 1}},
+	))
 	if err != nil {
 		u.Error("发送登录消息欢迎消息失败", zap.Error(err))
 	}

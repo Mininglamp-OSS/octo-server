@@ -947,24 +947,21 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 	if f.ctx.GetConfig().Friend.AddedTipsText != "" {
 		content = f.ctx.GetConfig().Friend.AddedTipsText
 	}
+	// YUJ-674 / Mininglamp-OSS#37: PERSONAL DM 用 octo-lib 的 NewPersonalMsgSendReq
+	// builder 构造，把 payload.space_id 的服务端权威 / fail-closed strip 语义集中
+	// 到一处。spaceID 已经通过上方 spacepkg.CheckMembership 校验，可以作为 senderSpaceID
+	// 直接传入。
 	tipPayloadMap := map[string]interface{}{
 		"content": content,
 		"type":    common.Tip,
 	}
-	if spaceID != "" {
-		tipPayloadMap["space_id"] = spaceID
-	}
-	payload := []byte(util.ToJson(tipPayloadMap))
-
-	err = f.ctx.SendMessage(&config.MsgSendReq{
-		FromUID:     loginUID,
-		ChannelID:   applyUID,
-		ChannelType: common.ChannelTypePerson.Uint8(),
-		Payload:     payload,
-		Header: config.MsgHeader{
-			RedDot: 1,
-		},
-	})
+	err = f.ctx.SendMessage(config.NewPersonalMsgSendReq(
+		applyUID, // channel = peer (DM target)
+		loginUID, // from = current user
+		tipPayloadMap,
+		spaceID,
+		config.PersonalMsgOptions{Header: config.MsgHeader{RedDot: 1}},
+	))
 	if err != nil {
 		f.Error("发送通过好友请求消息失败！", zap.Error(err))
 		c.ResponseError(errors.New("发送通过好友请求消息失败！"))
@@ -975,20 +972,13 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 		"content": remark,
 		"type":    common.Text,
 	}
-	if spaceID != "" {
-		remarkPayloadMap["space_id"] = spaceID
-	}
-	payload = []byte(util.ToJson(remarkPayloadMap))
-
-	err = f.ctx.SendMessage(&config.MsgSendReq{
-		FromUID:     applyUID,
-		ChannelID:   loginUID,
-		ChannelType: common.ChannelTypePerson.Uint8(),
-		Payload:     payload,
-		Header: config.MsgHeader{
-			RedDot: 1,
-		},
-	})
+	err = f.ctx.SendMessage(config.NewPersonalMsgSendReq(
+		loginUID, // channel = current user (mirror tip back to self thread)
+		applyUID, // from = applicant
+		remarkPayloadMap,
+		spaceID,
+		config.PersonalMsgOptions{Header: config.MsgHeader{RedDot: 1}},
+	))
 	if err != nil {
 		f.Error("发送接受好友请求消息失败！", zap.Error(err))
 		c.ResponseError(errors.New("发送接受好友请求消息失败！"))

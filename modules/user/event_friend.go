@@ -327,24 +327,21 @@ func (f *Friend) handleUserRegister(data []byte, commit config.EventCommit) {
 		content = f.ctx.GetConfig().Friend.AddedTipsText
 	}
 	// 发送消息
+	// YUJ-674 / Mininglamp-OSS#37: PERSONAL DM 走 NewPersonalMsgSendReq
+	// builder。evtSpaceID 由 space.GetCommonSpaceID 解析两个 UID 的共同 Space，
+	// 解析失败时为 ""，builder 会 fail-closed strip。
 	evtTipPayload := map[string]interface{}{
 		"content": content,
 		"type":    common.Tip,
 	}
-	if evtSpaceID != "" {
-		evtTipPayload["space_id"] = evtSpaceID
-	}
-	payload := []byte(util.ToJson(evtTipPayload))
 
-	err = f.ctx.SendMessage(&config.MsgSendReq{
-		FromUID:     uid,
-		ChannelID:   inviteUid,
-		ChannelType: common.ChannelTypePerson.Uint8(),
-		Payload:     payload,
-		Header: config.MsgHeader{
-			RedDot: 1,
-		},
-	})
+	err = f.ctx.SendMessage(config.NewPersonalMsgSendReq(
+		inviteUid,
+		uid,
+		evtTipPayload,
+		evtSpaceID,
+		config.PersonalMsgOptions{Header: config.MsgHeader{RedDot: 1}},
+	))
 	if err != nil {
 		f.Error("发送通过好友请求消息失败！", zap.Error(err))
 		commit(errors.New("发送通过好友请求消息失败！"))

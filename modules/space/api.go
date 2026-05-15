@@ -1546,20 +1546,18 @@ func (s *Space) notifyAdminsNewJoinApply(applicantUID, spaceId, spaceName string
 		content := fmt.Sprintf("有新的 Space 加入申请\n\n用户: %s (%s)\n\n空间: %s%s\n\n审批链接: %s",
 			applicantName, applicantUID, spaceName, emailText, approveURL)
 		notifyPayload := map[string]interface{}{
-			"content":  content,
-			"type":     common.Text,
-			"space_id": spaceId,
+			"content": content,
+			"type":    common.Text,
 		}
-		payload := []byte(util.ToJson(notifyPayload))
-		if err := s.ctx.SendMessage(&config.MsgSendReq{
-			FromUID:     s.ctx.GetConfig().Account.SystemUID,
-			ChannelID:   admin.UID,
-			ChannelType: common.ChannelTypePerson.Uint8(),
-			Payload:     payload,
-			Header: config.MsgHeader{
-				RedDot: 1,
-			},
-		}); err != nil {
+		// YUJ-674 / Mininglamp-OSS#37: PERSONAL DM via NewPersonalMsgSendReq builder.
+		// spaceId 是当前申请的 Space，作为 senderSpaceID 即权威值。
+		if err := s.ctx.SendMessage(config.NewPersonalMsgSendReq(
+			admin.UID,
+			s.ctx.GetConfig().Account.SystemUID,
+			notifyPayload,
+			spaceId,
+			config.PersonalMsgOptions{Header: config.MsgHeader{RedDot: 1}},
+		)); err != nil {
 			s.Warn("发送加入申请通知失败", zap.Error(err), zap.String("adminUID", admin.UID), zap.String("spaceId", spaceId))
 		}
 	}
@@ -1575,20 +1573,17 @@ func (s *Space) notifyApplicantJoinResult(applicantUID, spaceId, spaceName strin
 	}
 
 	resultPayload := map[string]interface{}{
-		"content":  content,
-		"type":     common.Text,
-		"space_id": spaceId,
+		"content": content,
+		"type":    common.Text,
 	}
-	payload := []byte(util.ToJson(resultPayload))
-	_ = s.ctx.SendMessage(&config.MsgSendReq{
-		FromUID:     s.ctx.GetConfig().Account.SystemUID,
-		ChannelID:   applicantUID,
-		ChannelType: common.ChannelTypePerson.Uint8(),
-		Payload:     payload,
-		Header: config.MsgHeader{
-			RedDot: 1,
-		},
-	})
+	// YUJ-674 / Mininglamp-OSS#37: PERSONAL DM via NewPersonalMsgSendReq builder.
+	_ = s.ctx.SendMessage(config.NewPersonalMsgSendReq(
+		applicantUID,
+		s.ctx.GetConfig().Account.SystemUID,
+		resultPayload,
+		spaceId,
+		config.PersonalMsgOptions{Header: config.MsgHeader{RedDot: 1}},
+	))
 }
 
 // joinApprovePage 返回 H5 审批页面（注入 apiURL）

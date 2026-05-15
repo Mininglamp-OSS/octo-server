@@ -7,7 +7,6 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
-	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
@@ -420,19 +419,14 @@ func (bf *BotFather) createFriendRelation(userUID, robotUID string) error {
 		"content": content,
 		"type":    common.Tip,
 	}
-	if spaceID != "" {
-		bfTipPayload["space_id"] = spaceID
-	}
-	payload := []byte(util.ToJson(bfTipPayload))
-	_ = bf.ctx.SendMessage(&config.MsgSendReq{
-		FromUID:     robotUID,
-		ChannelID:   userUID,
-		ChannelType: common.ChannelTypePerson.Uint8(),
-		Payload:     payload,
-		Header: config.MsgHeader{
-			RedDot: 1,
-		},
-	})
+	// YUJ-674 / Mininglamp-OSS#37: PERSONAL DM via NewPersonalMsgSendReq builder.
+	_ = bf.ctx.SendMessage(config.NewPersonalMsgSendReq(
+		userUID,
+		robotUID,
+		bfTipPayload,
+		spaceID,
+		config.PersonalMsgOptions{Header: config.MsgHeader{RedDot: 1}},
+	))
 
 	return nil
 }
@@ -457,19 +451,14 @@ func (bf *BotFather) notifyOwnerNewApply(applicantUID, robotUID, ownerUID, remar
 		"content": content,
 		"type":    common.Text,
 	}
-	if spaceID != "" {
-		notifyPayload["space_id"] = spaceID
-	}
-	payload := []byte(util.ToJson(notifyPayload))
-	_ = bf.ctx.SendMessage(&config.MsgSendReq{
-		FromUID:     BotFatherUID,
-		ChannelID:   ownerUID,
-		ChannelType: common.ChannelTypePerson.Uint8(),
-		Payload:     payload,
-		Header: config.MsgHeader{
-			RedDot: 1,
-		},
-	})
+	// YUJ-674 / Mininglamp-OSS#37: PERSONAL DM via NewPersonalMsgSendReq builder.
+	_ = bf.ctx.SendMessage(config.NewPersonalMsgSendReq(
+		ownerUID,
+		BotFatherUID,
+		notifyPayload,
+		spaceID,
+		config.PersonalMsgOptions{Header: config.MsgHeader{RedDot: 1}},
+	))
 }
 
 // notifyApplicantResult 通知申请人审批结果
@@ -485,19 +474,14 @@ func (bf *BotFather) notifyApplicantResult(applicantUID, robotUID string, approv
 		"content": content,
 		"type":    common.Text,
 	}
-	if spaceID != "" {
-		resultPayload["space_id"] = spaceID
-	}
-	payload := []byte(util.ToJson(resultPayload))
-	_ = bf.ctx.SendMessage(&config.MsgSendReq{
-		FromUID:     BotFatherUID,
-		ChannelID:   applicantUID,
-		ChannelType: common.ChannelTypePerson.Uint8(),
-		Payload:     payload,
-		Header: config.MsgHeader{
-			RedDot: 1,
-		},
-	})
+	// YUJ-674 / Mininglamp-OSS#37: PERSONAL DM via NewPersonalMsgSendReq builder.
+	_ = bf.ctx.SendMessage(config.NewPersonalMsgSendReq(
+		applicantUID,
+		BotFatherUID,
+		resultPayload,
+		spaceID,
+		config.PersonalMsgOptions{Header: config.MsgHeader{RedDot: 1}},
+	))
 }
 
 // setupApplyRoutes 注册apply相关路由（需要用户认证）

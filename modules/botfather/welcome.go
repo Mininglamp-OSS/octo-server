@@ -112,19 +112,14 @@ func (bf *BotFather) sendWelcomeMessage(toUID string, spaceID string) error {
 		"type":    common.Text,
 		"content": welcomeContent,
 	}
-	// 写入 space_id，前端按当前 Space 过滤 BotFather 聊天历史
-	if spaceID != "" {
-		payload["space_id"] = spaceID
-	}
-	_, err := bf.ctx.SendMessageWithResult(&config.MsgSendReq{
-		Header: config.MsgHeader{
-			RedDot: 1,
-		},
-		ChannelID:   channelID,
-		ChannelType: common.ChannelTypePerson.Uint8(),
-		FromUID:     BotFatherUID,
-		Payload:     []byte(util.ToJson(payload)),
-	})
+	// YUJ-674 / Mininglamp-OSS#37: PERSONAL DM via NewPersonalMsgSendReq builder.
+	_, err := bf.ctx.SendMessageWithResult(config.NewPersonalMsgSendReq(
+		channelID,
+		BotFatherUID,
+		payload,
+		spaceID,
+		config.PersonalMsgOptions{Header: config.MsgHeader{RedDot: 1}},
+	))
 
 	return err
 }

@@ -3,7 +3,6 @@ package app_bot
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -1121,23 +1120,20 @@ func (ab *AppBot) applyBot(c *wkhttp.Context) {
 	if bot.WelcomeMsg != "" {
 		welcomeContent = bot.WelcomeMsg
 	}
+	// YUJ-674 / Mininglamp-OSS#37: PERSONAL DM 走 NewPersonalMsgSendReq builder。
+	// spaceID 来自上方对 App Bot 的 Space 解析，非空时即为权威值；为空表示
+	// Bot 没有归属 Space，builder 会 fail-closed strip。
 	msgPayload := map[string]interface{}{
 		"content": welcomeContent,
 		"type":    common.Text,
 	}
-	if spaceID != "" {
-		msgPayload["space_id"] = spaceID
-	}
-	payload, _ := json.Marshal(msgPayload)
-	_ = ab.ctx.SendMessage(&config.MsgSendReq{
-		FromUID:     req.RobotUID,
-		ChannelID:   loginUID,
-		ChannelType: common.ChannelTypePerson.Uint8(),
-		Payload:     payload,
-		Header: config.MsgHeader{
-			RedDot: 1,
-		},
-	})
+	_ = ab.ctx.SendMessage(config.NewPersonalMsgSendReq(
+		loginUID,
+		req.RobotUID,
+		msgPayload,
+		spaceID,
+		config.PersonalMsgOptions{Header: config.MsgHeader{RedDot: 1}},
+	))
 
 	c.Response(gin.H{"status": "approved", "message": "\u5df2\u81ea\u52a8\u901a\u8fc7\uff0c\u53ef\u4ee5\u5f00\u59cb\u804a\u5929"})
 }

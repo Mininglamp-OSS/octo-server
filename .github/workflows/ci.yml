@@ -169,3 +169,22 @@ jobs:
         with:
           version: latest
           args: --timeout=5m
+
+  personal-msgsendreq-lint:
+    # Mininglamp-OSS/octo-server#37: defense-in-depth wrapper for PERSONAL
+    # MsgSendReq construction. The lint AST-walks modules/ and rejects any
+    # composite literal of MsgSendReq{ChannelType: ChannelTypePerson...}, since
+    # PERSONAL DM dispatchers MUST go through octo-lib's
+    # config.NewPersonalMsgSendReq builder so payload.space_id authoritative
+    # semantics are uniformly applied.
+    name: Personal MsgSendReq Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Reject direct PERSONAL MsgSendReq literals
+        run: go run ./tools/lint-personal-msgsendreq ./modules

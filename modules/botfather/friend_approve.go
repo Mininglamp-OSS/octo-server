@@ -239,18 +239,14 @@ func (h *commandHandler) approveFriend(ownerUID string, applyUID string, robotID
 		"content": content,
 		"type":    common.Tip,
 	}
-	if applySpaceID != "" {
-		tipPayload["space_id"] = applySpaceID
-	}
-	_ = h.ctx.SendMessage(&config.MsgSendReq{
-		FromUID:     robotID,
-		ChannelID:   applyUID,
-		ChannelType: common.ChannelTypePerson.Uint8(),
-		Payload:     []byte(util.ToJson(tipPayload)),
-		Header: config.MsgHeader{
-			RedDot: 1,
-		},
-	})
+	// YUJ-674 / Mininglamp-OSS#37: PERSONAL DM via NewPersonalMsgSendReq builder.
+	_ = h.ctx.SendMessage(config.NewPersonalMsgSendReq(
+		applyUID,
+		robotID,
+		tipPayload,
+		applySpaceID,
+		config.PersonalMsgOptions{Header: config.MsgHeader{RedDot: 1}},
+	))
 
 	// 8. 清理 Redis
 	_ = h.DeleteBotFriendApply(robotID, applyUID)

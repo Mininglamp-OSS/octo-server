@@ -948,19 +948,15 @@ func (h *commandHandler) reply(toUID string, content string) {
 		"content": content,
 		"type":    common.Text,
 	}
-	// 写入 space_id，前端按当前 Space 过滤 BotFather 聊天历史
-	if spaceID := h.resolveSpaceID(toUID); spaceID != "" {
-		payload["space_id"] = spaceID
-	}
-	h.ctx.SendMessage(&config.MsgSendReq{
-		Header: config.MsgHeader{
-			RedDot: 1,
-		},
-		FromUID:     fromUID,
-		ChannelID:   channelID,
-		ChannelType: common.ChannelTypePerson.Uint8(),
-		Payload:     []byte(util.ToJson(payload)),
-	})
+	// YUJ-674 / Mininglamp-OSS#37: PERSONAL DM via NewPersonalMsgSendReq builder.
+	// resolveSpaceID 返回 "" 时 builder fail-closed strip。
+	h.ctx.SendMessage(config.NewPersonalMsgSendReq(
+		channelID,
+		fromUID,
+		payload,
+		h.resolveSpaceID(toUID),
+		config.PersonalMsgOptions{Header: config.MsgHeader{RedDot: 1}},
+	))
 }
 
 func (h *commandHandler) sendBotSelectionList(fromUID string, bots []*robotModel, prompt string) {

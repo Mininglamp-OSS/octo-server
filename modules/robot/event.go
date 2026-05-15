@@ -112,18 +112,32 @@ func (rb *Robot) robotMessageListen(messages []*config.MessageResp) {
 								continue
 							}
 							rb.Warn("用户与Bot非好友关系，拒绝转发消息", zap.String("fromUID", message.FromUID), zap.String("robotID", realUID))
-							rb.ctx.SendMessage(&config.MsgSendReq{
-								Header: config.MsgHeader{
-									RedDot: 1,
-								},
-								FromUID:     realUID,
-								ChannelID:   message.FromUID,
-								ChannelType: message.ChannelType,
-								Payload: []byte(util.ToJson(map[string]interface{}{
-									"content": "请先添加好友后再与我对话",
-									"type":    common.Text,
-								})),
-							})
+							// YUJ-674 / Mininglamp-OSS#37: PERSONAL 走 NewPersonalMsgSendReq builder
+							// (with bot's resolved SpaceID); GROUP / 其它 channel_type 保留直接构造。
+							// "请先加好友"这条提示在 GROUP 路径下罕见，但保守保留旧语义。
+							friendTipPayload := map[string]interface{}{
+								"content": "请先添加好友后再与我对话",
+								"type":    common.Text,
+							}
+							if message.ChannelType == common.ChannelTypePerson.Uint8() {
+								rb.ctx.SendMessage(config.NewPersonalMsgSendReq(
+									message.FromUID,
+									realUID,
+									friendTipPayload,
+									rb.resolveBotActiveSpaceID(realUID),
+									config.PersonalMsgOptions{Header: config.MsgHeader{RedDot: 1}},
+								))
+							} else {
+								rb.ctx.SendMessage(&config.MsgSendReq{
+									Header: config.MsgHeader{
+										RedDot: 1,
+									},
+									FromUID:     realUID,
+									ChannelID:   message.FromUID,
+									ChannelType: message.ChannelType,
+									Payload:     []byte(util.ToJson(friendTipPayload)),
+								})
+							}
 							continue
 						}
 					}
@@ -311,18 +325,30 @@ func (rb *Robot) messagesListen(messages []*config.MessageResp) {
 					if sendContent == "" {
 						sendContent = "抱歉，无法解析您发送的命令"
 					}
-					rb.ctx.SendMessage(&config.MsgSendReq{
-						Header: config.MsgHeader{
-							RedDot: 1,
-						},
-						FromUID:     robotID,
-						ChannelID:   channelID,
-						ChannelType: message.ChannelType,
-						Payload: []byte(util.ToJson(map[string]interface{}{
-							"content": sendContent,
-							"type":    common.Text,
-						})),
-					})
+					// YUJ-674 / Mininglamp-OSS#37: PERSONAL 走 NewPersonalMsgSendReq builder。
+					sysReplyPayload := map[string]interface{}{
+						"content": sendContent,
+						"type":    common.Text,
+					}
+					if message.ChannelType == common.ChannelTypePerson.Uint8() {
+						rb.ctx.SendMessage(config.NewPersonalMsgSendReq(
+							channelID,
+							robotID,
+							sysReplyPayload,
+							rb.resolveBotActiveSpaceID(robotID),
+							config.PersonalMsgOptions{Header: config.MsgHeader{RedDot: 1}},
+						))
+					} else {
+						rb.ctx.SendMessage(&config.MsgSendReq{
+							Header: config.MsgHeader{
+								RedDot: 1,
+							},
+							FromUID:     robotID,
+							ChannelID:   channelID,
+							ChannelType: message.ChannelType,
+							Payload:     []byte(util.ToJson(sysReplyPayload)),
+						})
+					}
 				}
 
 			}
