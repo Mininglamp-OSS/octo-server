@@ -339,6 +339,12 @@ func validatePresignObjectKey(objectKey string) error {
 	if objectKey == "" {
 		return fmt.Errorf("空对象路径，无法生成预签名URL")
 	}
+	if strings.HasSuffix(objectKey, "/") {
+		return fmt.Errorf("对象路径不可以斜杠结尾，无法生成预签名URL: %q", objectKey)
+	}
+	if strings.Contains(objectKey, "//") {
+		return fmt.Errorf("对象路径包含连续斜杠，无法生成预签名URL: %q", objectKey)
+	}
 	return nil
 }
 

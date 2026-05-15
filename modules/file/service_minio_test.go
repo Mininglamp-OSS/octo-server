@@ -151,3 +151,48 @@ func TestPresignedURLs_PreservesPublicPathPrefix(t *testing.T) {
 			"path prefix should be preserved exactly once; got %q", u.Path)
 	})
 }
+
+// TestPresignedURLs_RejectMalformedObjectKeys is the regression test for
+// PR#50 R3 codex finding 2.5.
+//
+// `<bucket>/dir/` reaches the MinIO backend as an empty-keyed prefix; some
+// gateways collapse the trailing slash, others 404. Either way the URL is
+// useless to the browser. Reject up front, with the same "空对象路径" error
+// style as the existing empty-key path. Same for keys containing `//` —
+// these get path-normalized away by most HTTP intermediaries, breaking
+// signature validation downstream.
+func TestPresignedURLs_RejectMalformedObjectKeys(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	cfg := config.New()
+	cfg.Test = true
+	cfg.Minio.URL = srv.URL
+	cfg.Minio.UploadURL = srv.URL
+	cfg.Minio.DownloadURL = "https://public.example.com"
+	cfg.Minio.AccessKeyID = "test-access-key"
+	cfg.Minio.SecretAccessKey = "test-secret-access-key-1234567890"
+
+	svc := file.NewServiceMinio(testutil.NewTestContext(cfg))
+
+	cases := []struct {
+		name  string
+		input string
+	}{
+		{"trailing slash on allowed bucket prefix", "chat/dir/"},
+		{"trailing slash falls through to default bucket", "loose-name/"},
+		{"embedded double slash inside object key", "chat/a//b.png"},
+	}
+	for _, tc := range cases {
+		t.Run("PUT/"+tc.name, func(t *testing.T) {
+			_, _, err := svc.PresignedPutURL(tc.input, "image/jpeg", "", time.Minute)
+			require.Error(t, err, "PresignedPutURL must reject %q", tc.input)
+		})
+		t.Run("GET/"+tc.name, func(t *testing.T) {
+			_, err := svc.PresignedGetURL(tc.input, "x.jpg", "attachment", time.Minute)
+			require.Error(t, err, "PresignedGetURL must reject %q", tc.input)
+		})
+	}
+}
