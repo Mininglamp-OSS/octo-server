@@ -39,8 +39,18 @@ import (
 // botSpaceQuerier is the minimal data dependency of resolveBotActiveSpaceID,
 // extracted as an interface so unit tests can stub the DB call without
 // constructing a full *botAPIDB. *botAPIDB satisfies it implicitly.
+//
+// Mininglamp-OSS/octo-server#36 expansion:
+//   - querySpaceIDsByRobotID returns the full ordered match list so the
+//     resolver can warn when a User Bot is in multiple Spaces (the ambiguity
+//     case Option C makes deterministic but doesn't *fix*).
+//   - isBotSpaceMember validates an X-Space-ID header hint before honoring it
+//     (Option B). Required because the legacy header path is not gated by
+//     SpaceMiddleware on /v1/bot/sendMessage.
 type botSpaceQuerier interface {
 	querySpaceIDByRobotID(robotID string) (string, error)
+	querySpaceIDsByRobotID(robotID string) (string, []string, error)
+	isBotSpaceMember(robotID, spaceID string) (bool, error)
 }
 
 // enrichBotPayloadWithSpaceID 在 PERSONAL DM 派发前用 Bot 的权威 SpaceID 覆盖
@@ -79,14 +89,28 @@ func (ba *BotAPI) enrichBotPayloadWithSpaceID(c *wkhttp.Context, robotID string,
 	return payload
 }
 
-// resolveBotActiveSpaceID 优先读 gin-context（App Bot scope=space），fallback 到
-// querySpaceIDByRobotID。返回 "" 表示 Bot 没有活跃 SpaceID（任何原因 — 孤儿
-// Bot、DB 错误、或 ErrNotFound）。调用方必须在 "" 返回时执行 strip 而非
-// passthrough。
+// resolveBotActiveSpaceID 优先读 gin-context（App Bot scope=space），其次接受
+// /v1/bot/sendMessage 上 X-Space-ID 头（前提是 Bot 是该 Space 的活跃成员），
+// fallback 到 querySpaceIDByRobotID。返回 "" 表示 Bot 没有活跃 SpaceID
+// （任何原因 — 孤儿 Bot、DB 错误、或 ErrNotFound）。调用方必须在 "" 返回时
+// 执行 strip 而非 passthrough。
+//
+// 解析顺序（来自 Mininglamp-OSS/octo-server#36 推荐方案 B + C 混合）：
+//
+//  1. App Bot scope=space → CtxKeyAppBotSpaceID（O(1)，由 authAppBot 写入）。
+//     这是最强的服务端权威信号，不接受任何 client override。
+//
+//  2. X-Space-ID 头（仅在 ctx 第一项缺失时才生效）→ 验证 Bot 是该 Space 的
+//     成员后采纳。User Bot 若已被加入 N 个 Space，client 可通过该头显式选择
+//     语义 Space；不命中（非成员 / 头空）则 fall through。验证通过 isBotSpaceMember
+//     —— 没有此校验，client 用任意头值就可绕过 Space 隔离。
+//
+//  3. querySpaceIDByRobotID（DB） → 取 deterministic 首行。多归属时 emit
+//     `multi_space_membership=true` warn 让运维定位需要走 Option B 的 Bot。
 //
 // querier 默认是 ba.db；测试可通过 ba.spaceQuerier 注入 stub。
 func (ba *BotAPI) resolveBotActiveSpaceID(c *wkhttp.Context, robotID string) string {
-	// 优先：authAppBot 写入的 CtxKeyAppBotSpaceID（仅 App Bot scope=space）
+	// (1) authAppBot 写入的 CtxKeyAppBotSpaceID（仅 App Bot scope=space）
 	if scope, _ := c.Get(CtxKeyAppBotScope); scope == "space" {
 		if v, ok := c.Get(CtxKeyAppBotSpaceID); ok {
 			if s, _ := v.(string); s != "" {
@@ -94,14 +118,39 @@ func (ba *BotAPI) resolveBotActiveSpaceID(c *wkhttp.Context, robotID string) str
 			}
 		}
 	}
-	// Fallback：用户 Bot / 平台级 App Bot 查 space_member
 	q := ba.spaceQuerierOrDefault()
 	if q == nil {
 		// Defensive: tests sometimes construct &BotAPI{} with no db wired.
 		// Treat as "no active space" instead of nil-dereferencing.
 		return ""
 	}
-	spaceID, err := q.querySpaceIDByRobotID(robotID)
+	// (2) X-Space-ID 头 — 仅当 Bot 确实是该 Space 的活跃成员才采纳，否则
+	// fall through 到 deterministic DB query。这是 Mininglamp-OSS/octo-server#36
+	// Option B 的精确实现：context-aware preference for Space-scoped routes
+	// without taking a hard dependency on SpaceMiddleware (which the /v1/bot
+	// route group does not currently mount).
+	if c != nil && c.Request != nil {
+		if hint := c.GetHeader("X-Space-ID"); hint != "" {
+			isMember, err := q.isBotSpaceMember(robotID, hint)
+			if err != nil {
+				ba.Warn("isBotSpaceMember 失败，回退到 deterministic DB 查询",
+					zap.String("robotID", robotID), zap.String("hint", hint), zap.Error(err))
+			} else if isMember {
+				return hint
+			} else {
+				// Header sent but Bot isn't a member: log so operators can
+				// detect bots that need to be added (or attackers probing).
+				ba.Warn("x_space_id_header_rejected_not_member",
+					zap.Bool("x_space_id_header_rejected", true),
+					zap.String("dispatcher", "bot_api"),
+					zap.String("robotID", robotID),
+					zap.String("hint", hint),
+				)
+			}
+		}
+	}
+	// (3) Fallback：用户 Bot / 平台级 App Bot 查 space_member（deterministic）
+	primary, allSpaces, err := q.querySpaceIDsByRobotID(robotID)
 	if err != nil {
 		// YUJ-660 Medium-2: dbr.ErrNotFound is "Bot has no Space" — a valid
 		// state for orphan bots / non-Space deployments — NOT a DB error.
@@ -113,7 +162,21 @@ func (ba *BotAPI) resolveBotActiveSpaceID(c *wkhttp.Context, robotID string) str
 		}
 		return ""
 	}
-	return spaceID
+	if len(allSpaces) > 1 {
+		// Mininglamp-OSS/octo-server#36 — multi-Space User Bot. The result
+		// IS deterministic now (earliest joined wins) but the caller may
+		// have intended a different Space. Emit a structured warn so
+		// operators can route the affected Bot through the X-Space-ID
+		// header (Option B) or via authAppBot scope=space.
+		ba.Warn("multi_space_membership",
+			zap.Bool("multi_space_membership", true),
+			zap.String("dispatcher", "bot_api"),
+			zap.String("robotID", robotID),
+			zap.String("chosen_space_id", primary),
+			zap.Strings("all_space_ids", allSpaces),
+		)
+	}
+	return primary
 }
 
 // spaceQuerierOrDefault returns the test-injected stub when present, otherwise

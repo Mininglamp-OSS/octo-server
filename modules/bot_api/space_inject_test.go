@@ -13,6 +13,8 @@ package bot_api
 
 import (
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
@@ -31,6 +33,23 @@ type fakeSpaceQuerier struct {
 	}
 	defaultSpace string
 	defaultErr   error
+	// Mininglamp-OSS/octo-server#36 — multi-Space rows. Per-robot override of
+	// the full ordered list; falls back to a single-element list built from
+	// `defaultSpace` / per-robot result when absent.
+	multiRows map[string][]string
+	// isBotSpaceMember scripted return:
+	//   memberships[robotID][spaceID] = isMember
+	// missing entries fall through to memberDefault. memberErr (when non-nil)
+	// short-circuits everything.
+	memberships   map[string]map[string]bool
+	memberCalls   []memberCall
+	memberDefault bool
+	memberErr     error
+}
+
+type memberCall struct {
+	robotID string
+	spaceID string
 }
 
 func (f *fakeSpaceQuerier) querySpaceIDByRobotID(robotID string) (string, error) {
@@ -41,9 +60,55 @@ func (f *fakeSpaceQuerier) querySpaceIDByRobotID(robotID string) (string, error)
 	return f.defaultSpace, f.defaultErr
 }
 
-// fakeWkContext creates a minimal wkhttp.Context (gin context wrapper).
+func (f *fakeSpaceQuerier) querySpaceIDsByRobotID(robotID string) (string, []string, error) {
+	// Reuse single-row behaviour for err / empty handling, then layer the
+	// multi-row override on top so individual tests stay readable.
+	primary, err := f.querySpaceIDByRobotID(robotID)
+	if err != nil {
+		return "", nil, err
+	}
+	if rows, ok := f.multiRows[robotID]; ok {
+		if len(rows) == 0 {
+			return "", nil, dbr.ErrNotFound
+		}
+		return rows[0], rows, nil
+	}
+	if primary == "" {
+		return "", nil, dbr.ErrNotFound
+	}
+	return primary, []string{primary}, nil
+}
+
+func (f *fakeSpaceQuerier) isBotSpaceMember(robotID, spaceID string) (bool, error) {
+	f.memberCalls = append(f.memberCalls, memberCall{robotID: robotID, spaceID: spaceID})
+	if f.memberErr != nil {
+		return false, f.memberErr
+	}
+	if m, ok := f.memberships[robotID]; ok {
+		if v, ok := m[spaceID]; ok {
+			return v, nil
+		}
+	}
+	return f.memberDefault, nil
+}
+
+// fakeWkContext creates a minimal wkhttp.Context (gin context wrapper) with
+// a real http.Request attached so c.GetHeader is safe.
 func fakeWkContext() *wkhttp.Context {
 	c, _ := gin.CreateTestContext(nil)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/bot/sendMessage", nil)
+	return &wkhttp.Context{Context: c}
+}
+
+// fakeWkContextWithHeader is the variant that adds an `X-Space-ID` header for
+// Mininglamp-OSS/octo-server#36 Option B coverage.
+func fakeWkContextWithHeader(header, value string) *wkhttp.Context {
+	c, _ := gin.CreateTestContext(nil)
+	req := httptest.NewRequest(http.MethodPost, "/v1/bot/sendMessage", nil)
+	if value != "" {
+		req.Header.Set(header, value)
+	}
+	c.Request = req
 	return &wkhttp.Context{Context: c}
 }
 

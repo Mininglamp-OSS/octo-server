@@ -249,10 +249,17 @@ func (d *botfatherDB) isBotInSpace(robotID string, spaceID string) (bool, error)
 
 // querySpaceIDByRobotID returns the active Space ID for the given bot.
 // Checks both space_member.status=1 and space.status=1.
+//
+// Mininglamp-OSS/octo-server#36: deterministic ORDER BY (Option C). When the
+// bot is a member of multiple active Spaces, the earliest joined wins, with
+// `space_id` as a tie-breaker. This makes the result stable across calls
+// instead of engine-dependent. Voice context resolution (`api_voice.go`) is
+// the only caller in this package and accepts the first match — keeping the
+// SQL signature unchanged means no caller code needs to move.
 func (d *botfatherDB) querySpaceIDByRobotID(robotID string) (string, error) {
 	var spaceID string
 	err := d.session.SelectBySql(
-		"SELECT sm.space_id FROM space_member sm INNER JOIN space s ON s.space_id = sm.space_id WHERE sm.uid=? AND sm.status=1 AND s.status=1",
+		"SELECT sm.space_id FROM space_member sm INNER JOIN space s ON s.space_id = sm.space_id WHERE sm.uid=? AND sm.status=1 AND s.status=1 ORDER BY sm.created_at ASC, sm.space_id ASC LIMIT 1",
 		robotID,
 	).LoadOne(&spaceID)
 	return spaceID, err

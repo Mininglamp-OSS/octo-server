@@ -93,13 +93,61 @@ func (d *botAPIDB) queryAllActiveRobots() ([]*robotModel, error) {
 }
 
 // querySpaceIDByRobotID returns the active Space ID for the given bot.
+//
+// Mininglamp-OSS/octo-server#36 (multi-Space ambiguity, PR#35 deep-review
+// High-2): when a User Bot is a member of multiple active Spaces, the prior
+// SQL had no `ORDER BY` and used `LoadOne`, leaving the result up to the DB
+// engine. This function now:
+//
+//  1. Loads all matching rows (not just one) so the count is observable.
+//  2. Orders by `sm.created_at ASC, sm.space_id ASC` so ties resolve to the
+//     earliest joined Space, with `space_id` as a deterministic tie-breaker.
+//  3. Returns `dbr.ErrNotFound` for the empty case to preserve the existing
+//     caller contract (callers branch on `errors.Is(err, dbr.ErrNotFound)`).
+//
+// The full row list is exposed via `querySpaceIDsByRobotID` for callers that
+// want to observe ambiguity (`len(spaceIDs) > 1`) without issuing a second
+// query — see `resolveBotActiveSpaceID` for the structured warn it emits.
 func (d *botAPIDB) querySpaceIDByRobotID(robotID string) (string, error) {
-	var spaceID string
-	err := d.session.SelectBySql(
-		"SELECT sm.space_id FROM space_member sm INNER JOIN space s ON s.space_id = sm.space_id WHERE sm.uid=? AND sm.status=1 AND s.status=1",
-		robotID,
-	).LoadOne(&spaceID)
+	spaceID, _, err := d.querySpaceIDsByRobotID(robotID)
 	return spaceID, err
+}
+
+// querySpaceIDsByRobotID is the multi-row variant. Returns the deterministic
+// primary SpaceID, the full ordered list of matching SpaceIDs, and any DB
+// error. Empty result → `dbr.ErrNotFound` (preserves caller contract).
+func (d *botAPIDB) querySpaceIDsByRobotID(robotID string) (string, []string, error) {
+	var spaceIDs []string
+	_, err := d.session.SelectBySql(
+		"SELECT sm.space_id FROM space_member sm INNER JOIN space s ON s.space_id = sm.space_id WHERE sm.uid=? AND sm.status=1 AND s.status=1 ORDER BY sm.created_at ASC, sm.space_id ASC",
+		robotID,
+	).Load(&spaceIDs)
+	if err != nil {
+		return "", nil, err
+	}
+	if len(spaceIDs) == 0 {
+		return "", nil, dbr.ErrNotFound
+	}
+	return spaceIDs[0], spaceIDs, nil
+}
+
+// isBotSpaceMember reports whether `robotID` is currently an active member of
+// the given `spaceID` (both rows status=1). Used by `/v1/bot/sendMessage` to
+// validate an `X-Space-ID` header hint before honoring it (Option B from
+// issue#36) — without this check, the header would be a trivial bypass.
+func (d *botAPIDB) isBotSpaceMember(robotID, spaceID string) (bool, error) {
+	if robotID == "" || spaceID == "" {
+		return false, nil
+	}
+	var count int
+	err := d.session.SelectBySql(
+		"SELECT COUNT(*) FROM space_member sm INNER JOIN space s ON s.space_id = sm.space_id WHERE sm.uid=? AND sm.space_id=? AND sm.status=1 AND s.status=1",
+		robotID, spaceID,
+	).LoadOne(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 // ==================== App Bot Model ====================

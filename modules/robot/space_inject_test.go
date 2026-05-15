@@ -16,11 +16,31 @@ type fakeRobotSpaceQuerier struct {
 	calls   []string
 	spaceID string
 	err     error
+	// Mininglamp-OSS/octo-server#36 — full ordered list. When non-nil, takes
+	// precedence over `spaceID` for `querySpaceIDsByRobotID`.
+	rows []string
 }
 
 func (f *fakeRobotSpaceQuerier) querySpaceIDByRobotID(robotID string) (string, error) {
 	f.calls = append(f.calls, robotID)
 	return f.spaceID, f.err
+}
+
+func (f *fakeRobotSpaceQuerier) querySpaceIDsByRobotID(robotID string) (string, []string, error) {
+	primary, err := f.querySpaceIDByRobotID(robotID)
+	if err != nil {
+		return "", nil, err
+	}
+	if f.rows != nil {
+		if len(f.rows) == 0 {
+			return "", nil, dbr.ErrNotFound
+		}
+		return f.rows[0], f.rows, nil
+	}
+	if primary == "" {
+		return "", nil, dbr.ErrNotFound
+	}
+	return primary, []string{primary}, nil
 }
 
 // newTestRobot constructs a minimal *Robot with logger + injected querier
