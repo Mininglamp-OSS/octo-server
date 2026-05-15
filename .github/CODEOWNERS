@@ -1,5 +1,9 @@
-# Default owner
-* @yujiawei
+# Default owners — multiple maintainers so any one of them can satisfy
+# the "Require code-owner review" branch protection rule on PRs authored
+# by another default owner. Without multiple default owners, a PR by
+# @yujiawei (the original sole default owner) cannot satisfy the
+# required code-owner review without admin override.
+* @Jerry-Xin @lml2468 @yujiawei
 
 # Server (Go backend)
 /server/ @an9xyz @Jerry-Xin @yujiawei
