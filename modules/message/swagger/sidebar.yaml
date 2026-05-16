@@ -1,8 +1,8 @@
 swagger: "2.0"
 info:
-  description: "DMWork API - Sidebar 聚合接口"
+  description: "Octo API - Sidebar 聚合接口"
   version: "1.0.0"
-  title: "DMWork API - Sidebar"
+  title: "Octo API - Sidebar"
 host: "api.botgate.cn"
 tags:
   - name: "sidebar"

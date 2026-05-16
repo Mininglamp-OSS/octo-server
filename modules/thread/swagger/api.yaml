@@ -1,8 +1,8 @@
 swagger: "2.0"
 info:
-  description: "DMWork 群子区（Thread）模块 API"
+  description: "Octo 群子区（Thread）模块 API"
   version: "1.0.0"
-  title: "DMWork Thread API"
+  title: "Octo Thread API"
 host: "api.botgate.cn"
 basePath: "/v1"
 schemes:
