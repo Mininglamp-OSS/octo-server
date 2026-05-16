@@ -2,6 +2,7 @@ package user
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -343,60 +344,115 @@ func TestUserListBotAndSystemFlags(t *testing.T) {
 	})
 	assert.NoError(t, err)
 
-	t.Run("default returns all with correct flags", func(t *testing.T) {
+	// 响应解析成结构化数据，便于断言 count 与 list 一致 —— PR #62 review
+	// 反复强调"count/list 一致性"是这次重构的主旨，所以测试必须显式覆盖。
+	type userRow struct {
+		UID      string `json:"uid"`
+		IsBot    int    `json:"is_bot"`
+		IsSystem int    `json:"is_system"`
+	}
+	type listResp struct {
+		Count int64     `json:"count"`
+		List  []userRow `json:"list"`
+	}
+	doList := func(t *testing.T, query string) listResp {
+		t.Helper()
 		w := httptest.NewRecorder()
-		req, _ := http.NewRequest("GET", "/v1/manager/user/list?page_index=1&page_size=10", nil)
+		req, _ := http.NewRequest("GET", "/v1/manager/user/list?"+query, nil)
 		req.Header.Set("token", testutil.Token)
 		s.GetRoute().ServeHTTP(w, req)
 		assert.Equal(t, http.StatusOK, w.Code)
-		body := w.Body.String()
-		// 三个账号都在
-		assert.Contains(t, body, `"uid":"user_normal_001"`)
-		assert.Contains(t, body, `"uid":"user_bot_001"`)
-		assert.Contains(t, body, `"uid":"fileHelper"`)
-		// 字段一定出现（即使取 0 也要序列化出来）
-		assert.Contains(t, body, `"is_bot"`)
-		assert.Contains(t, body, `"is_system"`)
+		var resp listResp
+		assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp), "response is not JSON: %s", w.Body.String())
+		return resp
+	}
+	uidsOf := func(rs []userRow) []string {
+		out := make([]string, 0, len(rs))
+		for _, r := range rs {
+			out = append(out, r.UID)
+		}
+		return out
+	}
+	findUID := func(rs []userRow, uid string) (userRow, bool) {
+		for _, r := range rs {
+			if r.UID == uid {
+				return r, true
+			}
+		}
+		return userRow{}, false
+	}
 
-		// 各账号自身的 flag 取值
-		assert.Regexp(t, `"uid":"user_normal_001"[^}]*"is_bot":0[^}]*"is_system":0|"uid":"user_normal_001"[^}]*"is_system":0[^}]*"is_bot":0`, body)
-		assert.Regexp(t, `"uid":"user_bot_001"[^}]*"is_bot":1`, body)
-		assert.Regexp(t, `"uid":"fileHelper"[^}]*"is_system":1`, body)
-	})
+	cases := []struct {
+		name        string
+		query       string
+		wantUIDs    []string // 期望响应包含的 UID（顺序无关）
+		notWantUIDs []string // 期望响应不应包含的 UID
+	}{
+		{
+			name:     "default returns all three",
+			query:    "page_index=1&page_size=10",
+			wantUIDs: []string{"user_normal_001", "user_bot_001", "fileHelper"},
+		},
+		{
+			name:        "exclude_bot filters user.robot=1",
+			query:       "page_index=1&page_size=10&exclude_bot=1",
+			wantUIDs:    []string{"user_normal_001", "fileHelper"},
+			notWantUIDs: []string{"user_bot_001"},
+		},
+		{
+			name:        "exclude_system filters SystemBots UIDs",
+			query:       "page_index=1&page_size=10&exclude_system=1",
+			wantUIDs:    []string{"user_normal_001", "user_bot_001"},
+			notWantUIDs: []string{"fileHelper"},
+		},
+		{
+			name:        "exclude_bot + keyword still filters bots",
+			query:       "page_index=1&page_size=10&keyword=user_&exclude_bot=1",
+			wantUIDs:    []string{"user_normal_001"},
+			notWantUIDs: []string{"user_bot_001"},
+		},
+		{
+			name:        "exclude_bot + exclude_system filters both",
+			query:       "page_index=1&page_size=10&exclude_bot=1&exclude_system=1",
+			wantUIDs:    []string{"user_normal_001"},
+			notWantUIDs: []string{"user_bot_001", "fileHelper"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := doList(t, tc.query)
+			gotUIDs := uidsOf(resp.List)
+			for _, uid := range tc.wantUIDs {
+				assert.Contains(t, gotUIDs, uid)
+			}
+			for _, uid := range tc.notWantUIDs {
+				assert.NotContains(t, gotUIDs, uid)
+			}
+			// list/count 一致 —— 测试用例样本量都小于 page_size，所以 count 必须
+			// 与返回的 list 长度一致；如果 count 端漏掉了某个 filter，这里会立刻挂掉。
+			assert.Equal(t, int64(len(resp.List)), resp.Count, "count must equal list length under the same filter")
+		})
+	}
 
-	t.Run("exclude_bot filters out user.robot=1", func(t *testing.T) {
-		w := httptest.NewRecorder()
-		req, _ := http.NewRequest("GET", "/v1/manager/user/list?page_index=1&page_size=10&exclude_bot=1", nil)
-		req.Header.Set("token", testutil.Token)
-		s.GetRoute().ServeHTTP(w, req)
-		assert.Equal(t, http.StatusOK, w.Code)
-		body := w.Body.String()
-		assert.Contains(t, body, `"uid":"user_normal_001"`)
-		assert.Contains(t, body, `"uid":"fileHelper"`)
-		assert.NotContains(t, body, `"uid":"user_bot_001"`)
-	})
+	// 字段语义单测：分别校验三类账号的 is_bot/is_system 取值。
+	t.Run("flag values per account type", func(t *testing.T) {
+		resp := doList(t, "page_index=1&page_size=10")
+		normal, ok := findUID(resp.List, "user_normal_001")
+		assert.True(t, ok)
+		assert.Equal(t, 0, normal.IsBot)
+		assert.Equal(t, 0, normal.IsSystem)
 
-	t.Run("exclude_system filters out SystemBots UIDs", func(t *testing.T) {
-		w := httptest.NewRecorder()
-		req, _ := http.NewRequest("GET", "/v1/manager/user/list?page_index=1&page_size=10&exclude_system=1", nil)
-		req.Header.Set("token", testutil.Token)
-		s.GetRoute().ServeHTTP(w, req)
-		assert.Equal(t, http.StatusOK, w.Code)
-		body := w.Body.String()
-		assert.Contains(t, body, `"uid":"user_normal_001"`)
-		assert.Contains(t, body, `"uid":"user_bot_001"`)
-		assert.NotContains(t, body, `"uid":"fileHelper"`)
-	})
+		bot, ok := findUID(resp.List, "user_bot_001")
+		assert.True(t, ok)
+		assert.Equal(t, 1, bot.IsBot)
+		assert.Equal(t, 0, bot.IsSystem)
 
-	t.Run("exclude_bot with keyword still filters bots", func(t *testing.T) {
-		w := httptest.NewRecorder()
-		req, _ := http.NewRequest("GET", "/v1/manager/user/list?page_index=1&page_size=10&keyword=user_&exclude_bot=1", nil)
-		req.Header.Set("token", testutil.Token)
-		s.GetRoute().ServeHTTP(w, req)
-		assert.Equal(t, http.StatusOK, w.Code)
-		body := w.Body.String()
-		assert.Contains(t, body, `"uid":"user_normal_001"`)
-		assert.NotContains(t, body, `"uid":"user_bot_001"`)
+		// fileHelper 是系统账号但没有 user.robot=1 —— 这正是 is_bot 与
+		// is_system 设计为独立维度的关键 case（PR #62 review 共识）。
+		sys, ok := findUID(resp.List, "fileHelper")
+		assert.True(t, ok)
+		assert.Equal(t, 0, sys.IsBot)
+		assert.Equal(t, 1, sys.IsSystem)
 	})
 }
 
