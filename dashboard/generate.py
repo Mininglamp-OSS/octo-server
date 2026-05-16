@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DMWork 运营数据看板 - 静态 HTML 生成器"""
+"""Octo 运营数据看板 - 静态 HTML 生成器"""
 
 import subprocess
 import json
@@ -160,7 +160,7 @@ def generate_html(data):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>DMWork 运营看板</title>
+<title>Octo 运营看板</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
@@ -193,7 +193,7 @@ def generate_html(data):
 <body>
 
 <div class="header">
-  <h1>📊 DMWork 运营看板</h1>
+  <h1>📊 Octo 运营看板</h1>
   <div class="update">更新时间: {data['updated_at']} · 每 5 分钟自动刷新</div>
 </div>
 
@@ -273,7 +273,7 @@ def generate_html(data):
 </div>
 
 <div class="footer">
-  DMWork V1 · Powered by OpenClaw 🐾
+  Octo V1 · Powered by OpenClaw 🐾
 </div>
 
 <script>

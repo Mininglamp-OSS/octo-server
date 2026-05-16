@@ -1,5 +1,5 @@
 #!/bin/bash
-# DMWork API 冒烟测试
+# Octo API 冒烟测试
 # 用法: ./smoke-test.sh [--verbose]
 # 测试关键路径：注册、登录、Bot register、WS 握手、消息发送
 
@@ -167,7 +167,7 @@ test_mysql() {
 # ============ 运行所有测试 ============
 echo ""
 echo "========================================="
-echo "  DMWork 冒烟测试 — $(date '+%Y-%m-%d %H:%M:%S')"
+echo "  Octo 冒烟测试 — $(date '+%Y-%m-%d %H:%M:%S')"
 echo "  环境: $BASE_URL"
 echo "========================================="
 echo ""

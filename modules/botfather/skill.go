@@ -18,6 +18,7 @@ Connect an AI Agent to Octo messaging platform with full real-time capabilities.
 ### Save Locally (Recommended)
 
 `+"```"+`bash
+mkdir -p ~/.openclaw/skills/octo
 curl -s %s/v1/bot/skill.md > ~/.openclaw/skills/octo/SKILL.md
 `+"```"+`
 
