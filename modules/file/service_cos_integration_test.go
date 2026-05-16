@@ -201,92 +201,70 @@ func TestCOSPresignedURLs_HTTPScheme(t *testing.T) {
 	assert.Equal(t, "my-bucket-12345678.cos.local", u.Host)
 }
 
-// TestServiceCOS_PresignedPutURL_PathStyleCDN pins the YUJ-846 hotfix:
-// when `cosConfig.BucketURL` is a custom CDN / accelerator domain that
-// does NOT carry a `<bucket>.` subdomain (e.g.
-// `https://cdn.example.com`), presigned URLs must be served from that
-// host *as-is*, with the bucket placed in the URL path
-// (`<host>/<bucket>/<key>`), not virtual-hosted onto a phantom
-// subdomain.
+// TestServiceCOS_PresignedPutURL_CDNAlias pins the YUJ-877 (GH#57) fix:
+// when `cosConfig.BucketURL` is a CDN alias domain that does NOT carry a
+// `<bucket>.` subdomain (e.g. `https://cdn.deepminer.com.cn`), presigned
+// PUT/GET URLs must be signed against the canonical COS endpoint
+// (`<bucket>.cos.<region>.myqcloud.com`) because the CDN has no route
+// for path-style `/<bucket>/<key>` in the URL path.
 //
-// Pre-fix behaviour (broken in PR#50 R8 / e8b03a9):
-//   - publicEndpoint returned the BucketURL host with no `<bucket>.`
-//     prefix to strip, so it kept `cdn.example.com` and reported it
-//     as if it were the parent of a virtual-hosted bucket
-//   - newPublicClient hardcoded BucketLookupDNS
-//   - the SDK then virtual-hosted: `<bucket>.cdn.example.com`, a
-//     hostname that does not exist in DNS
-//   - browser PUT → `net::ERR_NAME_NOT_RESOLVED`, all uploads broken
+// Pre-fix behaviour (broken by PR#56 YUJ-846):
+//   - publicEndpoint detected the missing `<bucket>.` prefix and
+//     returned `BucketLookupPath`
+//   - newPublicClient signed against `cdn.example.com` with path-style
+//   - the SDK emitted `https://cdn.example.com/<bucket>/<key>`
+//   - CDN has no route for `/<bucket>/…` → all presigned URLs 404
 //
-// Post-fix behaviour (this hotfix):
-//   - publicEndpoint detects the missing `<bucket>.` prefix and
-//     returns `BucketLookupPath`
-//   - newPublicClient threads the lookup style through to minio.New
-//   - the SDK signs against `cdn.example.com` exactly and emits
-//     `https://cdn.example.com/<bucket>/<key>` — the host the browser
-//     actually resolves
-//
-// This test mirrors the production repro from im-test.deepminer.com.cn
-// (BucketURL=`https://cdn.deepminer.com.cn`, bucket=`im-data-...`).
-// It uses fake credentials and never makes a network call —
-// PresignHeader / PresignedGetObject are pure URL signing.
-func TestServiceCOS_PresignedPutURL_PathStyleCDN(t *testing.T) {
+// Post-fix behaviour (YUJ-877):
+//   - CDN alias detected → sign against canonical COS endpoint via
+//     getClient (DNS-style: `<bucket>.cos.<region>.myqcloud.com/<key>`)
+//   - browser uploads/downloads directly to COS, bypassing CDN
+//   - publicURL returns CDN URL without bucket segment for non-presigned
+//     download URLs
+func TestServiceCOS_PresignedPutURL_CDNAlias(t *testing.T) {
 	cfg := config.New()
 	cfg.Test = true
 	cfg.COS.SecretID = "test-secret-id"
 	cfg.COS.SecretKey = "test-secret-key-1234567890"
 	cfg.COS.Bucket = "im-data-1255521909"
 	cfg.COS.Region = "ap-beijing"
-	// Path-style CDN: host has NO `<bucket>.` subdomain.
+	// CDN alias: host has NO `<bucket>.` subdomain.
 	cfg.COS.BucketURL = "https://cdn.example.com"
 
 	svc := file.NewServiceCOS(testutil.NewTestContext(cfg))
 
-	t.Run("PUT URL is path-style on the CDN host", func(t *testing.T) {
-		uploadURL, _, err := svc.PresignedPutURL(
+	t.Run("PUT URL signed against canonical COS endpoint", func(t *testing.T) {
+		uploadURL, downloadURL, err := svc.PresignedPutURL(
 			"chat/2026/05/abc.jpg", "image/jpeg", "", 12345, 5*time.Minute,
 		)
 		require.NoError(t, err)
 		require.NotEmpty(t, uploadURL)
+		require.NotEmpty(t, downloadURL)
 
 		u, err := url.Parse(uploadURL)
 		require.NoError(t, err)
 
-		// Host MUST be the CDN host as-is — NOT
-		// `<bucket>.cdn.example.com`. Pre-fix this assertion failed
-		// because BucketLookupDNS produced the phantom subdomain.
-		assert.Equal(t, "cdn.example.com", u.Host,
-			"path-style BucketURL must keep the CDN host verbatim, not virtual-host the bucket onto it; got %s", u.Host)
-		assert.NotContains(t, u.Host, "im-data-1255521909",
-			"path-style BucketURL must NOT prepend the bucket as a subdomain; got %s", u.Host)
+		// Host MUST be the canonical COS endpoint, NOT the CDN host.
+		// CDN domains are bucket aliases — presigned URLs go direct to COS.
+		assert.Equal(t, "im-data-1255521909.cos.ap-beijing.myqcloud.com", u.Host,
+			"CDN alias: presigned PUT URL must be signed against canonical COS endpoint; got %s", u.Host)
+		assert.Equal(t, "https", u.Scheme)
 
-		// Path MUST start with `/<bucket>/` — that's the path-style
-		// addressing the CDN expects.
-		assert.True(t, strings.HasPrefix(u.Path, "/im-data-1255521909/"),
-			"path-style URL must place bucket in the path; got path=%s", u.Path)
+		// Path must NOT contain the bucket segment (DNS-style: bucket in host).
+		assert.False(t, strings.HasPrefix(u.Path, "/im-data-1255521909/"),
+			"CDN alias: presigned PUT URL path must NOT contain bucket segment (DNS-style); got path=%s", u.Path)
 		assert.True(t, strings.HasSuffix(u.Path, "/chat/2026/05/abc.jpg"),
 			"object key must be reflected in the signed URL path; got path=%s", u.Path)
 
-		assert.Equal(t, "https", u.Scheme,
-			"presigned PUT URL must inherit scheme from BucketURL")
-
-		// SigV4 shape: `host` and `content-length` MUST appear in the
-		// signed headers. Because the signing client was constructed
-		// against the CDN host with BucketLookupPath, the host
-		// covered by the signature is the URL's own host
-		// (`cdn.example.com`). A reviewer reading the URL back can
-		// confirm signature validity by host equality alone.
+		// SigV4 shape
 		q := u.Query()
-		assert.NotEmpty(t, q.Get("X-Amz-Signature"),
-			"presigned PUT URL must carry a SigV4 signature")
+		assert.NotEmpty(t, q.Get("X-Amz-Signature"))
 		signedHeaders := q.Get("X-Amz-SignedHeaders")
-		assert.Contains(t, signedHeaders, "host",
-			"presigned PUT URL must include `host` in its signed headers (got %q)", signedHeaders)
-		assert.Contains(t, signedHeaders, "content-length",
-			"presigned PUT URL must include `content-length` in its signed headers (got %q)", signedHeaders)
+		assert.Contains(t, signedHeaders, "host")
+		assert.Contains(t, signedHeaders, "content-length")
 	})
 
-	t.Run("GET URL is path-style on the CDN host", func(t *testing.T) {
+	t.Run("GET URL signed against canonical COS endpoint", func(t *testing.T) {
 		raw, err := svc.PresignedGetURL(
 			"chat/2026/05/abc.jpg", "report.jpg", "attachment", 5*time.Minute,
 		)
@@ -296,24 +274,41 @@ func TestServiceCOS_PresignedPutURL_PathStyleCDN(t *testing.T) {
 		u, err := url.Parse(raw)
 		require.NoError(t, err)
 
-		assert.Equal(t, "cdn.example.com", u.Host,
-			"path-style BucketURL must keep the CDN host verbatim for GET as well; got %s", u.Host)
-		assert.True(t, strings.HasPrefix(u.Path, "/im-data-1255521909/"),
-			"path-style GET URL must place bucket in the path; got path=%s", u.Path)
+		assert.Equal(t, "im-data-1255521909.cos.ap-beijing.myqcloud.com", u.Host,
+			"CDN alias: presigned GET URL must be signed against canonical COS endpoint; got %s", u.Host)
+		assert.Equal(t, "https", u.Scheme)
+
+		assert.False(t, strings.HasPrefix(u.Path, "/im-data-1255521909/"),
+			"CDN alias: presigned GET URL path must NOT contain bucket segment; got path=%s", u.Path)
 		assert.True(t, strings.HasSuffix(u.Path, "/chat/2026/05/abc.jpg"),
 			"object key must be reflected in the signed GET URL; got path=%s", u.Path)
 
 		signedHeaders := u.Query().Get("X-Amz-SignedHeaders")
-		assert.Contains(t, signedHeaders, "host",
-			"presigned GET URL must include `host` in its signed headers (got %q)", signedHeaders)
+		assert.Contains(t, signedHeaders, "host")
+	})
+
+	t.Run("download URL uses CDN without bucket segment", func(t *testing.T) {
+		_, downloadURL, err := svc.PresignedPutURL(
+			"chat/2026/05/abc.jpg", "image/jpeg", "", 12345, 5*time.Minute,
+		)
+		require.NoError(t, err)
+
+		du, err := url.Parse(downloadURL)
+		require.NoError(t, err)
+
+		// Download URL should be CDN-based, no bucket segment.
+		assert.Equal(t, "cdn.example.com", du.Host,
+			"download URL must use CDN host; got %s", du.Host)
+		assert.Equal(t, "/chat/2026/05/abc.jpg", du.Path,
+			"CDN download URL must NOT contain bucket segment; got %s", du.Path)
 	})
 }
 
-// TestServiceCOS_PresignedPutURL_PathStyleCDN_WithPrefix pins that the
-// env-prefix routing keeps working under path-style addressing — the
-// prefix is prepended to the object key before signing, and the bucket
-// still lands in the URL path (NOT folded into the host).
-func TestServiceCOS_PresignedPutURL_PathStyleCDN_WithPrefix(t *testing.T) {
+// TestServiceCOS_PresignedPutURL_CDNAlias_WithPrefix pins that the
+// env-prefix routing keeps working under CDN alias addressing — the
+// prefix is prepended to the object key before signing, and the presigned
+// URL goes to the canonical COS endpoint (NOT the CDN).
+func TestServiceCOS_PresignedPutURL_CDNAlias_WithPrefix(t *testing.T) {
 	cfg := config.New()
 	cfg.Test = true
 	cfg.COS.SecretID = "test-secret-id"
@@ -332,29 +327,22 @@ func TestServiceCOS_PresignedPutURL_PathStyleCDN_WithPrefix(t *testing.T) {
 
 	u, err := url.Parse(uploadURL)
 	require.NoError(t, err)
-	assert.Equal(t, "cdn.example.com", u.Host,
-		"prefix routing under path-style must not perturb the CDN host; got %s", u.Host)
-	assert.True(t, strings.HasPrefix(u.Path, "/im-data-1255521909/im-test/chat/2026/05/abc.jpg"),
-		"path-style URL must include `/<bucket>/<prefix>/<key>`; got path=%s", u.Path)
+	assert.Equal(t, "im-data-1255521909.cos.ap-beijing.myqcloud.com", u.Host,
+		"CDN alias with prefix: presigned URL must use canonical COS endpoint; got %s", u.Host)
+	assert.Contains(t, u.Path, "/im-test/chat/2026/05/abc.jpg",
+		"presigned URL path must include the env prefix; got path=%s", u.Path)
+	// Path must NOT contain bucket segment (DNS-style).
+	assert.False(t, strings.Contains(u.Path, "/im-data-1255521909/"),
+		"CDN alias: presigned URL path must NOT contain bucket segment; got path=%s", u.Path)
 }
 
-// TestServiceCOS_DownloadURL_PathStyle pins the YUJ-848 follow-up to
-// the YUJ-846 path-style fix: the browser-facing URL produced by
-// `DownloadURL` MUST land on the same host AND path shape as the
-// presigned PUT URL emitted by `PresignedPutURL` for the same object.
-// PR#56 (YUJ-846) added `BucketLookupPath` to the presign clients, but
-// `DownloadURL` was still concatenating `BucketURL` with the object
-// key directly — for path-style CDN BucketURL it dropped the
-// `/<bucket>/` segment, so the upload-then-GET flow returned 404
-// even when the PUT succeeded.
-//
-// `PresignedPutURL` calls `DownloadURL` to populate the `downloadUrl`
-// field returned by `/v1/file/upload-credentials`, so the mismatch
-// shipped to every browser client. This test mirrors the production
-// repro from im-test.deepminer.com.cn (BucketURL=`https://cdn.deepminer.com.cn`,
-// bucket=`im-data-...`) and pins that PUT-URL host/path and download-URL
-// host/path agree.
-func TestServiceCOS_DownloadURL_PathStyle(t *testing.T) {
+// TestServiceCOS_DownloadURL_CDNAlias pins the YUJ-877 (GH#57) fix for
+// download URLs: when BucketURL is a CDN alias (no `<bucket>.`
+// subdomain), the download URL must be `<CDN>/<key>` WITHOUT a bucket
+// segment. CDN domains are bucket aliases — the CDN origin routes to
+// the bucket implicitly. Inserting `/<bucket>/` in the URL path was
+// the root cause of all 404s on im-test.deepminer.com.cn after PR#56.
+func TestServiceCOS_DownloadURL_CDNAlias(t *testing.T) {
 	cfg := config.New()
 	cfg.Test = true
 	cfg.COS.SecretID = "test-secret-id"
@@ -365,7 +353,7 @@ func TestServiceCOS_DownloadURL_PathStyle(t *testing.T) {
 
 	svc := file.NewServiceCOS(testutil.NewTestContext(cfg))
 
-	t.Run("plain DownloadURL is path-style", func(t *testing.T) {
+	t.Run("plain DownloadURL has no bucket segment", func(t *testing.T) {
 		raw, err := svc.DownloadURL("chat/2026/05/abc.jpg", "")
 		require.NoError(t, err)
 		require.NotEmpty(t, raw)
@@ -373,26 +361,18 @@ func TestServiceCOS_DownloadURL_PathStyle(t *testing.T) {
 		u, err := url.Parse(raw)
 		require.NoError(t, err)
 
-		// Host MUST be the CDN host as-is — NOT
-		// `<bucket>.cdn.example.com`. Pre-fix the value was correct
-		// here only because BucketURL was used verbatim, but the
-		// path lacked the bucket segment — see path assertion below.
 		assert.Equal(t, "cdn.example.com", u.Host,
-			"path-style DownloadURL must keep the CDN host verbatim; got %s", u.Host)
+			"CDN alias DownloadURL must use CDN host; got %s", u.Host)
 
-		// Path MUST start with `/<bucket>/` — that's the path-style
-		// addressing the CDN expects. Pre-fix this assertion failed
-		// because DownloadURL concatenated BucketURL with the key
-		// directly, dropping the bucket segment and producing
-		// `/chat/2026/05/abc.jpg`.
-		assert.True(t, strings.HasPrefix(u.Path, "/im-data-1255521909/"),
-			"path-style DownloadURL must place bucket in the path; got path=%s", u.Path)
-		assert.True(t, strings.HasSuffix(u.Path, "/chat/2026/05/abc.jpg"),
-			"object key must be reflected in the download URL path; got path=%s", u.Path)
+		// Path must NOT contain bucket segment — the CDN routes to the
+		// bucket implicitly. This is the P0 YUJ-877 fix.
+		assert.Equal(t, "/chat/2026/05/abc.jpg", u.Path,
+			"CDN alias DownloadURL must NOT contain bucket segment; got path=%s", u.Path)
+		assert.False(t, strings.Contains(u.Path, "im-data-1255521909"),
+			"CDN alias DownloadURL must NOT contain bucket name anywhere in path; got path=%s", u.Path)
 	})
 
-	t.Run("DownloadURL with prefix routes through bucket+prefix", func(t *testing.T) {
-		// Apply env prefix on top of path-style (multi-env shared bucket).
+	t.Run("DownloadURL with prefix routes through CDN without bucket", func(t *testing.T) {
 		cfg2 := config.New()
 		cfg2.Test = true
 		cfg2.COS.SecretID = "test-secret-id"
@@ -410,9 +390,11 @@ func TestServiceCOS_DownloadURL_PathStyle(t *testing.T) {
 		u, err := url.Parse(raw)
 		require.NoError(t, err)
 		assert.Equal(t, "cdn.example.com", u.Host)
-		assert.True(t,
-			strings.HasPrefix(u.Path, "/im-data-1255521909/im-test/chat/2026/05/abc.jpg"),
-			"path-style DownloadURL must include `/<bucket>/<prefix>/<key>`; got path=%s", u.Path)
+		// Prefix is present, but bucket segment is NOT.
+		assert.Equal(t, "/im-test/chat/2026/05/abc.jpg", u.Path,
+			"CDN alias DownloadURL with prefix must be `/<prefix>/<key>` without bucket; got path=%s", u.Path)
+		assert.False(t, strings.Contains(u.Path, "im-data-1255521909"),
+			"CDN alias DownloadURL must NOT contain bucket name; got path=%s", u.Path)
 	})
 }
 
@@ -470,54 +452,66 @@ func TestServiceCOS_DownloadURL_DefaultEndpoint(t *testing.T) {
 		"default DownloadURL must NOT prepend bucket to path (bucket is already in host); got %s", u.Path)
 }
 
-// TestServiceCOS_PresignedPutURL_DownloadURLConsistency is the
-// upload-then-download integration check Jerry-Xin / lml2468 / yujiawei
-// converged on: the URL handed to the browser as `downloadUrl` (the
-// companion field returned alongside `uploadUrl` from
-// `/v1/file/upload-credentials`) MUST address the same object as the
-// upload URL it ships beside. Specifically the host and path BEFORE
-// query parameters must agree.
+// TestServiceCOS_PresignedPutURL_DownloadURLConsistency verifies the
+// relationship between the `uploadUrl` and `downloadUrl` returned by
+// `PresignedPutURL` for each BucketURL shape.
 //
-// Pre-fix behaviour for path-style CDN (the YUJ-848 bug):
-//   - uploadUrl   = `https://cdn.example.com/im-data-…/im-test/chat/…/abc.jpg?X-Amz-…`
-//   - downloadUrl = `https://cdn.example.com/im-test/chat/…/abc.jpg`
-//     ^^^^^ missing `/<bucket>/`
-//   - browser PUT succeeds (signature valid for path-style URL),
-//     subsequent browser GET on `downloadUrl` returns 404.
+// For bucket-subdomain and empty BucketURL: upload and download URLs
+// share the same host and path (upload signed, download unsigned).
 //
-// Post-fix behaviour: both URLs share the same host AND the same
-// path prefix `/<bucket>/<prefix>/<key>`, so a successful PUT
-// guarantees a successful GET.
+// For CDN alias BucketURL (YUJ-877 fix): upload URL points to the
+// canonical COS endpoint (`<bucket>.cos.<region>.myqcloud.com`) while
+// download URL points to the CDN (`cdn.example.com`). The hosts
+// intentionally differ — browser uploads go direct to COS (presigned),
+// while reads are served from the CDN (no bucket in path).
 func TestServiceCOS_PresignedPutURL_DownloadURLConsistency(t *testing.T) {
 	cases := []struct {
-		name      string
-		bucketURL string
-		prefix    string
+		name         string
+		bucketURL    string
+		prefix       string
+		sameHost     bool   // whether upload and download URLs share the same host
+		uploadHost   string // expected upload URL host
+		downloadHost string // expected download URL host
 	}{
 		{
-			name:      "path-style CDN without prefix",
-			bucketURL: "https://cdn.example.com",
-			prefix:    "",
+			name:         "CDN alias without prefix",
+			bucketURL:    "https://cdn.example.com",
+			prefix:       "",
+			sameHost:     false,
+			uploadHost:   "im-data-1255521909.cos.ap-beijing.myqcloud.com",
+			downloadHost: "cdn.example.com",
 		},
 		{
-			name:      "path-style CDN with env prefix",
-			bucketURL: "https://cdn.example.com",
-			prefix:    "im-test",
+			name:         "CDN alias with env prefix",
+			bucketURL:    "https://cdn.example.com",
+			prefix:       "im-test",
+			sameHost:     false,
+			uploadHost:   "im-data-1255521909.cos.ap-beijing.myqcloud.com",
+			downloadHost: "cdn.example.com",
 		},
 		{
-			name:      "DNS-style bucket subdomain without prefix",
-			bucketURL: "https://im-data-1255521909.cos.example.com",
-			prefix:    "",
+			name:         "DNS-style bucket subdomain without prefix",
+			bucketURL:    "https://im-data-1255521909.cos.example.com",
+			prefix:       "",
+			sameHost:     true,
+			uploadHost:   "im-data-1255521909.cos.example.com",
+			downloadHost: "im-data-1255521909.cos.example.com",
 		},
 		{
-			name:      "DNS-style bucket subdomain with env prefix",
-			bucketURL: "https://im-data-1255521909.cos.example.com",
-			prefix:    "im-prod",
+			name:         "DNS-style bucket subdomain with env prefix",
+			bucketURL:    "https://im-data-1255521909.cos.example.com",
+			prefix:       "im-prod",
+			sameHost:     true,
+			uploadHost:   "im-data-1255521909.cos.example.com",
+			downloadHost: "im-data-1255521909.cos.example.com",
 		},
 		{
-			name:      "BucketURL empty (canonical default endpoint)",
-			bucketURL: "",
-			prefix:    "",
+			name:         "BucketURL empty (canonical default endpoint)",
+			bucketURL:    "",
+			prefix:       "",
+			sameHost:     true,
+			uploadHost:   "im-data-1255521909.cos.ap-beijing.myqcloud.com",
+			downloadHost: "im-data-1255521909.cos.ap-beijing.myqcloud.com",
 		},
 	}
 
@@ -547,17 +541,94 @@ func TestServiceCOS_PresignedPutURL_DownloadURLConsistency(t *testing.T) {
 			pd, err := url.Parse(downloadURL)
 			require.NoError(t, err)
 
-			assert.Equal(t, pu.Host, pd.Host,
-				"uploadUrl and downloadUrl must share the same host (got upload=%s, download=%s)",
-				pu.Host, pd.Host)
-			assert.Equal(t, pu.Scheme, pd.Scheme,
-				"uploadUrl and downloadUrl must share the same scheme")
+			assert.Equal(t, tc.uploadHost, pu.Host,
+				"upload URL host mismatch")
+			assert.Equal(t, tc.downloadHost, pd.Host,
+				"download URL host mismatch")
 
-			// Path must agree exactly — query params (signature, etc.)
-			// are intentionally only on the upload URL.
-			assert.Equal(t, pu.Path, pd.Path,
-				"uploadUrl and downloadUrl must address the same object path; upload=%s download=%s",
-				pu.Path, pd.Path)
+			if tc.sameHost {
+				assert.Equal(t, pu.Host, pd.Host,
+					"uploadUrl and downloadUrl must share the same host")
+				assert.Equal(t, pu.Scheme, pd.Scheme)
+				assert.Equal(t, pu.Path, pd.Path,
+					"uploadUrl and downloadUrl must address the same object path")
+			} else {
+				// CDN alias: hosts intentionally differ.
+				assert.NotEqual(t, pu.Host, pd.Host,
+					"CDN alias: upload (COS) and download (CDN) hosts must differ")
+			}
 		})
 	}
+}
+
+// TestServiceCOS_CDNAlias_ProductionRepro is the exact production repro
+// from im-test.deepminer.com.cn (GH#57 / YUJ-877). Config:
+//
+//	cos:
+//	  bucketURL: "https://cdn.deepminer.com.cn"
+//	  bucket: "im-data-1255521909"
+//	  prefix: "im-test"
+//	  region: "ap-beijing"
+//
+// Before the fix:
+//   - publicURL("group/26/x.png") = "cdn.deepminer.com.cn/im-data-1255521909/im-test/group/26/x.png" (404!)
+//
+// After the fix:
+//   - publicURL("group/26/x.png") = "cdn.deepminer.com.cn/im-test/group/26/x.png" (200 ✓)
+func TestServiceCOS_CDNAlias_ProductionRepro(t *testing.T) {
+	cfg := config.New()
+	cfg.Test = true
+	cfg.COS.SecretID = "test-secret-id"
+	cfg.COS.SecretKey = "test-secret-key-1234567890"
+	cfg.COS.Bucket = "im-data-1255521909"
+	cfg.COS.Region = "ap-beijing"
+	cfg.COS.BucketURL = "https://cdn.deepminer.com.cn"
+	cfg.COS.Prefix = "im-test"
+
+	svc := file.NewServiceCOS(testutil.NewTestContext(cfg))
+
+	t.Run("download URL must NOT contain bucket segment", func(t *testing.T) {
+		raw, err := svc.DownloadURL("group/26/x.png", "")
+		require.NoError(t, err)
+
+		// Expected: https://cdn.deepminer.com.cn/im-test/group/26/x.png
+		assert.Equal(t, "https://cdn.deepminer.com.cn/im-test/group/26/x.png", raw,
+			"production CDN download URL must be <CDN>/<prefix>/<key> without bucket segment")
+
+		u, err := url.Parse(raw)
+		require.NoError(t, err)
+		assert.Equal(t, "cdn.deepminer.com.cn", u.Host)
+		assert.Equal(t, "/im-test/group/26/x.png", u.Path)
+		assert.False(t, strings.Contains(raw, "im-data-1255521909"),
+			"CDN download URL must NOT contain bucket name; got %s", raw)
+	})
+
+	t.Run("presigned PUT URL goes to canonical COS endpoint", func(t *testing.T) {
+		uploadURL, downloadURL, err := svc.PresignedPutURL(
+			"group/26/x.png", "image/png", "", 9999, 5*time.Minute,
+		)
+		require.NoError(t, err)
+
+		pu, err := url.Parse(uploadURL)
+		require.NoError(t, err)
+		assert.Equal(t, "im-data-1255521909.cos.ap-beijing.myqcloud.com", pu.Host,
+			"upload URL must go to canonical COS endpoint")
+
+		du, err := url.Parse(downloadURL)
+		require.NoError(t, err)
+		assert.Equal(t, "cdn.deepminer.com.cn", du.Host,
+			"download URL must use CDN host")
+		assert.Equal(t, "/im-test/group/26/x.png", du.Path,
+			"download URL path must be /<prefix>/<key> without bucket")
+	})
+
+	t.Run("presigned GET URL goes to canonical COS endpoint", func(t *testing.T) {
+		raw, err := svc.PresignedGetURL("group/26/x.png", "x.png", "attachment", 5*time.Minute)
+		require.NoError(t, err)
+
+		u, err := url.Parse(raw)
+		require.NoError(t, err)
+		assert.Equal(t, "im-data-1255521909.cos.ap-beijing.myqcloud.com", u.Host,
+			"presigned GET URL must go to canonical COS endpoint")
+	})
 }
