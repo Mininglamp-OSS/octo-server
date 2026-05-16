@@ -12,6 +12,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	common2 "github.com/Mininglamp-OSS/octo-server/modules/common"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	wkutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
@@ -555,32 +556,38 @@ func (m *Manager) list(c *wkhttp.Context) {
 	if strings.TrimSpace(onlineStr) != "" {
 		online = wkutil.ParseInt64OrDefault(onlineStr, -1)
 	}
+	// 默认不过滤，确保兼容旧前端；前端只在需要时显式传 1。
+	filter := userListFilter{
+		OnlineStatus:  int(online),
+		ExcludeBot:    c.Query("exclude_bot") == "1",
+		ExcludeSystem: c.Query("exclude_system") == "1",
+	}
 	pageIndex, pageSize := c.GetPage()
 	var userList []*managerUserModel
 	var count int64
 	if keyword == "" {
-		userList, err = m.db.queryUserListWithPage(uint64(pageSize), uint64(pageIndex), int(online))
+		userList, err = m.db.queryUserListWithPage(uint64(pageSize), uint64(pageIndex), filter)
 		if err != nil {
 			m.Error("查询用户列表报错", zap.Error(err))
 			c.ResponseError(err)
 			return
 		}
 
-		count, err = m.userDB.queryUserCount()
+		count, err = m.db.queryUserCount(filter)
 		if err != nil {
 			m.Error("查询用户数量错误", zap.Error(err))
 			c.ResponseError(errors.New("查询用户数量错误"))
 			return
 		}
 	} else {
-		userList, err = m.db.queryUserListWithPageAndKeyword(keyword, int(online), uint64(pageSize), uint64(pageIndex))
+		userList, err = m.db.queryUserListWithPageAndKeyword(keyword, uint64(pageSize), uint64(pageIndex), filter)
 		if err != nil {
 			m.Error("查询用户列表报错", zap.Error(err))
 			c.ResponseError(err)
 			return
 		}
 
-		count, err = m.db.queryUserCountWithKeyWord(keyword)
+		count, err = m.db.queryUserCountWithKeyWord(keyword, filter)
 		if err != nil {
 			m.Error("查询用户数量错误", zap.Error(err))
 			c.ResponseError(errors.New("查询用户数量错误"))
@@ -642,6 +649,10 @@ func (m *Manager) list(c *wkhttp.Context) {
 				lastOnlineTime = util.ToyyyyMMddHHmm(time.Unix(int64(respsdata[user.UID].LastOffline), 0))
 			}
 			showPhone := getShowPhoneNum(user.Phone)
+			isSystem := 0
+			if spacepkg.SystemBots[user.UID] {
+				isSystem = 1
+			}
 			result = append(result, &managerUserResp{
 				UID:      user.UID,
 				Username: user.Username,
@@ -662,6 +673,8 @@ func (m *Manager) list(c *wkhttp.Context) {
 				GiteeUID:       user.GiteeUID,
 				GithubUID:      user.GithubUID,
 				WXOpenid:       user.WXOpenid,
+				IsBot:          user.Robot,
+				IsSystem:       isSystem,
 			})
 			i++
 		}
@@ -1210,6 +1223,8 @@ type managerUserResp struct {
 	WXOpenid       string `json:"wx_openid"`  // 微信openid
 	GiteeUID       string `json:"gitee_uid"`  // gitee uid
 	GithubUID      string `json:"github_uid"` // github uid
+	IsBot          int    `json:"is_bot"`     // 0.否 1.是；来源 user.robot，与 /v1/robot/space_bots 一致
+	IsSystem       int    `json:"is_system"`  // 0.否 1.是；来源 pkg/space.SystemBots（botfather/u_10000/fileHelper/notification）
 }
 
 type managerFriendResp struct {

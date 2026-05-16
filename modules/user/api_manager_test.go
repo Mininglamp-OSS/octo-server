@@ -297,6 +297,109 @@ func TestUserListByEmailKeyword(t *testing.T) {
 	}
 }
 
+// 后台需要区分三类账号：普通用户、Bot（user.robot=1）与系统账号
+// （pkg/space.SystemBots，如 fileHelper/u_10000/botfather/notification）。
+// 之前前端只能靠 username 后缀 _bot 推断 bot，存在撞名/伪装风险，
+// 因此 /v1/manager/user/list 必须在响应里显式带 is_bot/is_system，
+// 并提供 exclude_bot / exclude_system 查询参数以便后台筛除。
+func TestUserListBotAndSystemFlags(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	m := NewManager(ctx)
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	err = ctx.Cache().Set(ctx.GetConfig().Cache.TokenCachePrefix+testutil.Token, testutil.UID+"@test@"+string(wkhttp.SuperAdmin))
+	assert.NoError(t, err)
+
+	// 普通用户
+	err = m.userDB.Insert(&Model{
+		UID:      "user_normal_001",
+		ShortNo:  util.GenerUUID(),
+		Username: "normaluser",
+		Name:     "NormalUser",
+		Status:   1,
+		Password: util.MD5(util.MD5("111")),
+	})
+	assert.NoError(t, err)
+	// Bot：与 /v1/robot/space_bots 判定一致，user.robot=1
+	err = m.userDB.Insert(&Model{
+		UID:      "user_bot_001",
+		ShortNo:  util.GenerUUID(),
+		Username: "thirdpartybot",
+		Name:     "ThirdPartyBot",
+		Status:   1,
+		Robot:    1,
+		Password: util.MD5(util.MD5("222")),
+	})
+	assert.NoError(t, err)
+	// 系统账号：pkg/space.SystemBots 中固定的 UID
+	err = m.userDB.Insert(&Model{
+		UID:      "fileHelper",
+		ShortNo:  util.GenerUUID(),
+		Username: "fileHelper",
+		Name:     "FileHelper",
+		Status:   1,
+		Password: util.MD5(util.MD5("333")),
+	})
+	assert.NoError(t, err)
+
+	t.Run("default returns all with correct flags", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/v1/manager/user/list?page_index=1&page_size=10", nil)
+		req.Header.Set("token", testutil.Token)
+		s.GetRoute().ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code)
+		body := w.Body.String()
+		// 三个账号都在
+		assert.Contains(t, body, `"uid":"user_normal_001"`)
+		assert.Contains(t, body, `"uid":"user_bot_001"`)
+		assert.Contains(t, body, `"uid":"fileHelper"`)
+		// 字段一定出现（即使取 0 也要序列化出来）
+		assert.Contains(t, body, `"is_bot"`)
+		assert.Contains(t, body, `"is_system"`)
+
+		// 各账号自身的 flag 取值
+		assert.Regexp(t, `"uid":"user_normal_001"[^}]*"is_bot":0[^}]*"is_system":0|"uid":"user_normal_001"[^}]*"is_system":0[^}]*"is_bot":0`, body)
+		assert.Regexp(t, `"uid":"user_bot_001"[^}]*"is_bot":1`, body)
+		assert.Regexp(t, `"uid":"fileHelper"[^}]*"is_system":1`, body)
+	})
+
+	t.Run("exclude_bot filters out user.robot=1", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/v1/manager/user/list?page_index=1&page_size=10&exclude_bot=1", nil)
+		req.Header.Set("token", testutil.Token)
+		s.GetRoute().ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code)
+		body := w.Body.String()
+		assert.Contains(t, body, `"uid":"user_normal_001"`)
+		assert.Contains(t, body, `"uid":"fileHelper"`)
+		assert.NotContains(t, body, `"uid":"user_bot_001"`)
+	})
+
+	t.Run("exclude_system filters out SystemBots UIDs", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/v1/manager/user/list?page_index=1&page_size=10&exclude_system=1", nil)
+		req.Header.Set("token", testutil.Token)
+		s.GetRoute().ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code)
+		body := w.Body.String()
+		assert.Contains(t, body, `"uid":"user_normal_001"`)
+		assert.Contains(t, body, `"uid":"user_bot_001"`)
+		assert.NotContains(t, body, `"uid":"fileHelper"`)
+	})
+
+	t.Run("exclude_bot with keyword still filters bots", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/v1/manager/user/list?page_index=1&page_size=10&keyword=user_&exclude_bot=1", nil)
+		req.Header.Set("token", testutil.Token)
+		s.GetRoute().ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code)
+		body := w.Body.String()
+		assert.Contains(t, body, `"uid":"user_normal_001"`)
+		assert.NotContains(t, body, `"uid":"user_bot_001"`)
+	})
+}
+
 func TestUserDisablelist(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
