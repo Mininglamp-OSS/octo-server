@@ -20,10 +20,10 @@ import (
 )
 
 type mockFileServiceForUpload struct {
-	lastObjectPath       string
-	lastContentDisp      string
-	lastContentType      string
-	lastUploadPath       string
+	lastObjectPath        string
+	lastContentDisp       string
+	lastContentType       string
+	lastUploadPath        string
 	lastUploadContentDisp string
 	lastUploadContentType string
 }
@@ -55,7 +55,7 @@ func (m *mockFileServiceForUpload) PresignedGetURL(objectPath string, filename s
 	return "https://example.com/download/" + objectPath, nil
 }
 
-func (m *mockFileServiceForUpload) PresignedPutURL(objectPath string, contentType string, contentDisposition string, expires time.Duration) (string, string, error) {
+func (m *mockFileServiceForUpload) PresignedPutURL(objectPath string, contentType string, contentDisposition string, fileSize int64, expires time.Duration) (string, string, error) {
 	m.lastObjectPath = objectPath
 	m.lastContentDisp = contentDisposition
 	m.lastContentType = contentType
@@ -66,29 +66,29 @@ func TestBotUploadPresigned_FilenameSanitization(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	tests := []struct {
-		name    string
+		name     string
 		filename string
-		wantExt string
+		wantExt  string
 	}{
 		{
-			name:    "normal filename",
+			name:     "normal filename",
 			filename: "test.jpg",
-			wantExt: ".jpg",
+			wantExt:  ".jpg",
 		},
 		{
-			name:    "path traversal attack",
+			name:     "path traversal attack",
 			filename: "../../etc/passwd.jpg",
-			wantExt: ".jpg",
+			wantExt:  ".jpg",
 		},
 		{
-			name:    "absolute path",
+			name:     "absolute path",
 			filename: "/var/log/secret.png",
-			wantExt: ".png",
+			wantExt:  ".png",
 		},
 		{
-			name:    "nested path",
+			name:     "nested path",
 			filename: "subdir/nested/file.pdf",
-			wantExt: ".pdf",
+			wantExt:  ".pdf",
 		},
 	}
 
@@ -102,7 +102,7 @@ func TestBotUploadPresigned_FilenameSanitization(t *testing.T) {
 
 			w := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(w)
-			c.Request, _ = http.NewRequest(http.MethodGet, "/v1/bot/upload/presigned?filename="+tt.filename, nil)
+			c.Request, _ = http.NewRequest(http.MethodGet, "/v1/bot/upload/presigned?fileSize=1024&filename="+tt.filename, nil)
 
 			wkCtx := &wkhttp.Context{Context: c}
 			bf.botUploadPresigned(wkCtx)
@@ -151,7 +151,7 @@ func TestBotUploadPresigned_ContentDisposition(t *testing.T) {
 
 			w := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(w)
-			c.Request, _ = http.NewRequest(http.MethodGet, "/v1/bot/upload/presigned?filename="+tt.filename, nil)
+			c.Request, _ = http.NewRequest(http.MethodGet, "/v1/bot/upload/presigned?fileSize=1024&filename="+tt.filename, nil)
 
 			wkCtx := &wkhttp.Context{Context: c}
 			bf.botUploadPresigned(wkCtx)
@@ -249,6 +249,60 @@ func TestBotUploadFile_UUIDPath_MIME_ContentDisposition(t *testing.T) {
 				"contentDisposition should contain 'inline'")
 			assert.Contains(t, mockFS.lastUploadContentDisp, tt.wantCDContains,
 				"contentDisposition should reference the original filename")
+		})
+	}
+}
+
+// TestBotUploadPresigned_ContentDispositionInResponse asserts the
+// /v1/bot/upload/presigned (BotFather) endpoint returns the
+// contentDisposition value that was signed into PresignedPutURL — the
+// same parity contract as the main file endpoint at modules/file/api.go.
+//
+// Critical: without this echo, browsers cannot construct a PUT that
+// passes SigV4. Independently flagged in PR#50 R7 by Jerry-Xin and
+// lml2468; the bot-side fix mirrors the conditional return already in
+// place at file/api.go presignedUpload.
+func TestBotUploadPresigned_ContentDispositionInResponse(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name     string
+		filename string
+	}{
+		{"ascii filename with spaces", "annual report 2025.pdf"},
+		{"chinese filename", "报告.pdf"},
+		{"mixed filename", "report-报告.pdf"},
+		{"unicode emoji filename", "🚀-launch.png"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockFS := &mockFileServiceForUpload{}
+			bf := &BotFather{
+				Log:         log.NewTLog("BotFatherTest"),
+				fileService: mockFS,
+			}
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request, _ = http.NewRequest(http.MethodGet, "/v1/bot/upload/presigned?fileSize=1024&filename="+tt.filename, nil)
+
+			wkCtx := &wkhttp.Context{Context: c}
+			bf.botUploadPresigned(wkCtx)
+
+			assert.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+			var payload map[string]interface{}
+			err := json.Unmarshal(w.Body.Bytes(), &payload)
+			assert.NoError(t, err, "response body must be JSON: %s", w.Body.String())
+
+			cd, ok := payload["contentDisposition"].(string)
+			assert.True(t, ok, "response MUST include contentDisposition field; body: %s", w.Body.String())
+			assert.NotEmpty(t, cd, "contentDisposition MUST be non-empty so browser can echo signed value")
+			assert.Equal(t, mockFS.lastContentDisp, cd,
+				"response contentDisposition MUST match value passed to PresignedPutURL")
+			assert.Contains(t, cd, "inline",
+				"contentDisposition should contain 'inline' disposition")
 		})
 	}
 }

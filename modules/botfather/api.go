@@ -16,20 +16,20 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
+	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/app"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
-	"github.com/Mininglamp-OSS/octo-server/pkg/botutil"
 	"github.com/Mininglamp-OSS/octo-server/modules/voice"
-	"github.com/Mininglamp-OSS/octo-lib/common"
-	"github.com/Mininglamp-OSS/octo-lib/config"
-	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
-	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botutil"
 	pkgutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
-	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis"
 	"github.com/gocraft/dbr/v2"
@@ -739,9 +739,9 @@ func (bf *BotFather) typing(c *wkhttp.Context) {
 	// 连续 3 个窗口未发消息则永久静默，直到 bot 发消息重置
 	typingStartKey := fmt.Sprintf("typing_start:%s:%s:%d", robotID, channelID, req.ChannelType)
 	typingCountKey := fmt.Sprintf("typing_count:%s:%s:%d", robotID, channelID, req.ChannelType)
-	const typingMaxDuration = 90  // 单窗口最大秒数
-	const typingMaxWindows = 3    // 最大连续窗口数
-	const typingKeyTTL = 180      // key 自动清理 TTL（秒）
+	const typingMaxDuration = 90 // 单窗口最大秒数
+	const typingMaxWindows = 3   // 最大连续窗口数
+	const typingKeyTTL = 180     // key 自动清理 TTL（秒）
 
 	startStr, _ := bf.ctx.GetRedisConn().GetString(typingStartKey)
 	now := time.Now().Unix()
@@ -1378,6 +1378,26 @@ func (bf *BotFather) botUploadPresigned(c *wkhttp.Context) {
 	}
 	filename = filepath.Base(filename)
 
+	// fileSize is REQUIRED so the storage layer can sign Content-Length and
+	// reject any PUT that exceeds the byte budget — same P0 size-bypass
+	// guard the public file API enforces (see modules/file/api.go).
+	fileSizeRaw := strings.TrimSpace(c.Query("fileSize"))
+	if fileSizeRaw == "" {
+		c.ResponseError(errors.New("fileSize 参数必填，且不能超过最大限制"))
+		return
+	}
+	fileSize, parseErr := strconv.ParseInt(fileSizeRaw, 10, 64)
+	if parseErr != nil || fileSize <= 0 {
+		c.ResponseError(errors.New("fileSize 参数必须为正整数（字节）"))
+		return
+	}
+	if fileSize > file.MaxFileSize {
+		bf.Warn("预签名上传 fileSize 超出限制",
+			zap.Int64("size", fileSize), zap.Int64("max", file.MaxFileSize))
+		c.ResponseError(fmt.Errorf("文件大小不能超过%dMB", file.MaxFileSize/1024/1024))
+		return
+	}
+
 	ext := strings.ToLower(filepath.Ext(filename))
 	if ext == "" || file.IsBlockedExtension(ext) || !file.IsAllowedExtension(ext) {
 		c.ResponseError(errors.New("不支持的文件类型"))
@@ -1393,14 +1413,14 @@ func (bf *BotFather) botUploadPresigned(c *wkhttp.Context) {
 
 	contentDisposition := file.BuildContentDisposition(filename)
 	expiry := 30 * time.Minute
-	uploadURL, downloadURL, err := bf.fileService.PresignedPutURL(objectPath, contentType, contentDisposition, expiry)
+	uploadURL, downloadURL, err := bf.fileService.PresignedPutURL(objectPath, contentType, contentDisposition, fileSize, expiry)
 	if err != nil {
 		bf.Error("生成预签名上传URL失败", zap.Error(err))
 		c.ResponseError(errors.New("生成上传URL失败"))
 		return
 	}
 
-	c.Response(gin.H{
+	resp := gin.H{
 		"method":      "PUT",
 		"uploadUrl":   uploadURL,
 		"downloadUrl": downloadURL,
@@ -1408,7 +1428,16 @@ func (bf *BotFather) botUploadPresigned(c *wkhttp.Context) {
 		"key":         objectPath,
 		"expiresIn":   int(expiry.Seconds()),
 		"expiredTime": time.Now().Add(expiry).Unix(),
-	})
+		"maxFileSize": fileSize,
+	}
+	// Content-Disposition is signed into the canonical headers on
+	// SigV4 backends (MinIO/COS), so the browser MUST echo this exact
+	// value at PUT time or the gateway returns 403 SignatureDoesNotMatch.
+	// Mirror the main file endpoint at modules/file/api.go.
+	if contentDisposition != "" {
+		resp["contentDisposition"] = contentDisposition
+	}
+	c.Response(resp)
 }
 
 // botMessageEdit Bot 编辑自己发送的消息（/v1/bot/message/edit）

@@ -14,11 +14,11 @@ import (
 	"strings"
 	"time"
 
-	pkgutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	pkgutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 )
@@ -371,12 +371,97 @@ func (f *File) getFile(c *wkhttp.Context) {
 	c.Redirect(http.StatusFound, downloadURL)
 }
 
-// getUploadCredentials 返回预签名 PUT URL，供客户端直接上传文件，无需后端中转
+// getUploadCredentials 返回预签名 PUT URL，供客户端直接上传文件，无需后端中转。
+//
+// SigV4 / OSS signed-header contract — REQUIRED for the client:
+//
+// The returned `contentType`, `contentDisposition` (when present), and
+// `Content-Length` (mirroring the request `fileSize` parameter) are
+// included in the signed headers of the presigned PUT URL (see
+// service_minio.go `PresignedPutURL`, service_cos.go `PresignedPutURL`,
+// and service_oss.go `PresignedPutURL`). The browser / client MUST echo
+// each verbatim as PUT request headers:
+//
+//	PUT <uploadUrl>
+//	Content-Type: <contentType from response>
+//	Content-Length: <fileSize from request, in bytes>
+//	Content-Disposition: <contentDisposition from response, when set>
+//	<exactly fileSize bytes>
+//
+// Per-header behaviour by backend (the deviation matrix that operators
+// hit in production):
+//
+//   - Content-Type: signed by every backend that supports presigned PUT
+//     (MinIO, COS, OSS). Any deviation produces 403 SignatureDoesNotMatch
+//     at the gateway.
+//   - Content-Length (MinIO + COS, S3 SigV4): signed via `signedHeaders`
+//     in the SigV4 canonical string. Any deviation — wrong value, missing
+//     header — produces 403 SignatureDoesNotMatch at the gateway. This
+//     IS the server-side enforcement of `MaxFileSize` for the presigned
+//     path on SigV4 backends: a client cannot upload more bytes than
+//     the server signed for.
+//   - Content-Length (OSS V1 signing): the OSS V1 canonical-string
+//     algorithm does NOT cover Content-Length even when `oss.ContentLength`
+//     is passed into SignURL. The signed URL therefore does NOT enforce
+//     the byte budget — OSS will accept a PUT of any size under that URL.
+//     The `maxFileSize` value still flows through the API contract, but
+//     on OSS it is advisory. Operators who need a hard size cap on OSS
+//     must enforce it at the bucket / RAM-policy / lifecycle layer, or
+//     migrate to a SigV4 backend (MinIO/COS) where the signature itself
+//     covers Content-Length. (Roadmap: OSS V4 signing covers Content-Length
+//     canonically; tracked separately from this PR.)
+//   - Content-Disposition (MinIO + COS, S3 SigV4): signed across the
+//     canonical-headers section. Any deviation, including alternate
+//     casing or omission, produces 403 SignatureDoesNotMatch.
+//   - Content-Disposition (OSS V1 signing): the OSS V1 canonical-string
+//     algorithm does NOT include Content-Disposition, so a deviation here
+//     does NOT produce a signature failure. The gateway records whatever
+//     value the browser actually sent (or none, if omitted) as the
+//     object's stored disposition. Operators who need strict disposition
+//     enforcement on OSS should migrate to a SigV4-capable backend
+//     (MinIO/COS) or run a post-upload validator.
+//
+// Response shape:
+//   - method:             always "PUT"
+//   - uploadUrl:          presigned PUT URL (consume within expiresIn seconds)
+//   - downloadUrl:        anonymous GET URL for the resulting object
+//   - contentType:        REQUIRED echo as PUT `Content-Type` header
+//   - contentDisposition: REQUIRED echo as PUT `Content-Disposition`
+//     header when present (omitted when empty;
+//     advisory-only on OSS V1 — see matrix above)
+//   - key:                final S3/OSS object key
+//   - expiresIn:          PUT URL validity in seconds
+//   - expiredTime:        absolute expiry, unix seconds
+//   - maxFileSize:        signed byte budget — the PUT must carry exactly
+//     `fileSize` bytes (echoed back so the client
+//     does not have to track it independently)
 func (f *File) getUploadCredentials(c *wkhttp.Context) {
 	fileType := c.Query("type")
 	uploadPath := c.Query("path")
 	filename := c.Query("filename")
 	contentType := c.Query("contentType")
+	fileSizeRaw := strings.TrimSpace(c.Query("fileSize"))
+
+	// fileSize is REQUIRED — without it the presigned PUT would have no
+	// signed Content-Length and the client could upload arbitrary bytes
+	// (the very security gap the multipart uploadFile handler closes via
+	// `MaxFileSize`). Reject the request rather than silently producing a
+	// URL the storage gateway cannot bound.
+	if fileSizeRaw == "" {
+		c.ResponseError(errors.New("fileSize 参数必填，且不能超过最大限制"))
+		return
+	}
+	fileSize, parseErr := strconv.ParseInt(fileSizeRaw, 10, 64)
+	if parseErr != nil || fileSize <= 0 {
+		c.ResponseError(errors.New("fileSize 参数必须为正整数（字节）"))
+		return
+	}
+	if fileSize > MaxFileSize {
+		f.Warn("预签名上传 fileSize 超出限制",
+			zap.Int64("size", fileSize), zap.Int64("max", MaxFileSize))
+		c.ResponseError(fmt.Errorf("文件大小不能超过%dMB", MaxFileSize/1024/1024))
+		return
+	}
 
 	// 当 filename 提供时，允许 path 为空
 	pathForCheck := uploadPath
@@ -428,7 +513,7 @@ func (f *File) getUploadCredentials(c *wkhttp.Context) {
 		}
 		objectKey = fileType + sanitized
 	} else if filename != "" {
-			// Use UUID-based key (pure ASCII) to avoid double-encoding by HTTP clients.
+		// Use UUID-based key (pure ASCII) to avoid double-encoding by HTTP clients.
 		// The original filename is preserved in Content-Disposition header.
 		fnExt := filepath.Ext(filename)
 		objectKey = fmt.Sprintf("%s/%d/%s/%s%s", fileType, time.Now().Unix(), util.GenerUUID(), util.GenerUUID(), fnExt)
@@ -440,7 +525,7 @@ func (f *File) getUploadCredentials(c *wkhttp.Context) {
 	contentDisposition := BuildContentDisposition(filename)
 
 	expiry := 30 * time.Minute
-	uploadURL, downloadURL, err := f.service.PresignedPutURL(objectKey, contentType, contentDisposition, expiry)
+	uploadURL, downloadURL, err := f.service.PresignedPutURL(objectKey, contentType, contentDisposition, fileSize, expiry)
 	if err != nil {
 		f.Error("生成预签名URL失败", zap.Error(err))
 		c.ResponseError(errors.New("生成预签名上传 URL 失败"))
@@ -455,6 +540,7 @@ func (f *File) getUploadCredentials(c *wkhttp.Context) {
 		"key":         objectKey,
 		"expiresIn":   int(expiry.Seconds()),
 		"expiredTime": time.Now().Add(expiry).Unix(),
+		"maxFileSize": fileSize,
 	}
 	if contentDisposition != "" {
 		resp["contentDisposition"] = contentDisposition
@@ -476,8 +562,29 @@ func (f *File) getDownloadURL(c *wkhttp.Context) {
 		parsed, parseErr := url.Parse(ph)
 		if parseErr == nil {
 			ph = parsed.Path
+			cosCfg := f.ctx.GetConfig().COS
+			// Path-style CDN: when BucketURL is set and its host does
+			// NOT carry a `<bucket>.` subdomain (e.g.
+			// `BucketURL=https://cdn.example.com`), the URL we issued
+			// to the browser is `<host>/<bucket>/<prefix>/<key>` (see
+			// publicURL / PresignedGetURL with BucketLookupPath). When
+			// the client round-trips that full URL back to us, the
+			// parsed path therefore begins with `/<bucket>/`, and the
+			// bucket segment must be stripped BEFORE the COS.Prefix
+			// strip below — otherwise PresignedGetURL signs the bucket
+			// as part of the object key and the resulting GET 404s.
+			//
+			// Detection mirrors `publicEndpoint`: BucketURL set, parsed
+			// successfully, host does NOT begin with `<bucket>.`.
+			if strings.TrimSpace(cosCfg.BucketURL) != "" && cosCfg.Bucket != "" {
+				if bu, buErr := url.Parse(strings.TrimRight(strings.TrimSpace(cosCfg.BucketURL), "/")); buErr == nil && bu.Host != "" {
+					if !strings.HasPrefix(bu.Host, cosCfg.Bucket+".") {
+						ph = strings.TrimPrefix(ph, "/"+cosCfg.Bucket)
+					}
+				}
+			}
 			// Strip the COS prefix (e.g. /bucket-prefix) from the path
-			cosPrefix := strings.TrimSpace(f.ctx.GetConfig().COS.Prefix)
+			cosPrefix := strings.TrimSpace(cosCfg.Prefix)
 			if cosPrefix != "" {
 				ph = strings.TrimPrefix(ph, "/"+cosPrefix)
 			}

@@ -3,8 +3,8 @@ package file
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
@@ -41,7 +41,16 @@ type IService interface {
 	IUploadService
 	DownloadAndMakeCompose(uploadPath string, downloadURLs []string) (map[string]interface{}, error)
 	DownloadImage(url string, ctx context.Context) (io.ReadCloser, error)
-	PresignedPutURL(objectPath string, contentType string, contentDisposition string, expires time.Duration) (uploadURL string, downloadURL string, err error)
+	// PresignedPutURL signs a direct-to-storage PUT URL. `fileSize` is the
+	// exact byte length the client commits to upload; the storage backend
+	// signs `Content-Length: <fileSize>` (or its OSS equivalent) into the
+	// canonical headers, so any deviation at PUT time is rejected by the
+	// gateway with a SignatureDoesNotMatch / SizeMismatch response. This
+	// is what lets the presigned-PUT path enforce the same MaxFileSize cap
+	// the multipart `uploadFile` handler enforces server-side; without it
+	// any authenticated caller could upload arbitrary bytes under an
+	// allowed extension and bypass the size gate entirely.
+	PresignedPutURL(objectPath string, contentType string, contentDisposition string, fileSize int64, expires time.Duration) (uploadURL string, downloadURL string, err error)
 	PresignedGetURL(objectPath string, filename string, disposition string, expires time.Duration) (string, error)
 }
 
@@ -93,19 +102,19 @@ func (s *Service) GetFile(path string) (io.ReadCloser, string, error) {
 }
 
 type PresignedPutter interface {
-	PresignedPutURL(objectPath string, contentType string, contentDisposition string, expires time.Duration) (uploadURL string, downloadURL string, err error)
+	PresignedPutURL(objectPath string, contentType string, contentDisposition string, fileSize int64, expires time.Duration) (uploadURL string, downloadURL string, err error)
 }
 
 type PresignedGetter interface {
 	PresignedGetURL(objectPath string, filename string, disposition string, expires time.Duration) (string, error)
 }
 
-func (s *Service) PresignedPutURL(objectPath string, contentType string, contentDisposition string, expires time.Duration) (string, string, error) {
+func (s *Service) PresignedPutURL(objectPath string, contentType string, contentDisposition string, fileSize int64, expires time.Duration) (string, string, error) {
 	putter, ok := s.uploadService.(PresignedPutter)
 	if !ok {
 		return "", "", fmt.Errorf("当前文件服务不支持预签名上传")
 	}
-	return putter.PresignedPutURL(objectPath, contentType, contentDisposition, expires)
+	return putter.PresignedPutURL(objectPath, contentType, contentDisposition, fileSize, expires)
 }
 
 func (s *Service) PresignedGetURL(objectPath string, filename string, disposition string, expires time.Duration) (string, error) {

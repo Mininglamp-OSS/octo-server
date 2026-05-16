@@ -6,9 +6,12 @@ on:
     types: [completed]
     branches: [main]
 
+permissions:
+  actions: read
+
 jobs:
   notify:
-    uses: Mininglamp-OSS/.github/.github/workflows/octo-ci-status.yml@main
+    uses: Mininglamp-OSS/.github/.github/workflows/octo-ci-status.yml@v1
     with:
       repo_name: ${{ github.event.workflow_run.repository.name }}
       workflow_name: ${{ github.event.workflow_run.name }}

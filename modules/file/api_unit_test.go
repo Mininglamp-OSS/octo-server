@@ -13,8 +13,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 )
@@ -191,12 +193,14 @@ func TestInferContentType(t *testing.T) {
 
 // mockService implements IService for testing
 type mockService struct {
-	composeResult        map[string]interface{}
-	composeErr           error
-	lastObjectPath       string
-	lastContentDisp      string
-	presignedGetErr      error
-	lastGetDisposition   string
+	composeResult      map[string]interface{}
+	composeErr         error
+	lastObjectPath     string
+	lastGetObjectPath  string
+	lastContentDisp    string
+	lastFileSize       int64
+	presignedGetErr    error
+	lastGetDisposition string
 }
 
 func (m *mockService) DownloadAndMakeCompose(uploadPath string, downloadURLs []string) (map[string]interface{}, error) {
@@ -219,13 +223,15 @@ func (m *mockService) GetFile(path string) (io.ReadCloser, string, error) {
 	return nil, "", fmt.Errorf("not implemented")
 }
 
-func (m *mockService) PresignedPutURL(objectPath string, contentType string, contentDisposition string, expires time.Duration) (string, string, error) {
+func (m *mockService) PresignedPutURL(objectPath string, contentType string, contentDisposition string, fileSize int64, expires time.Duration) (string, string, error) {
 	m.lastObjectPath = objectPath
 	m.lastContentDisp = contentDisposition
+	m.lastFileSize = fileSize
 	return "https://example.com/upload?" + objectPath, "https://example.com/download/" + objectPath, nil
 }
 
 func (m *mockService) PresignedGetURL(objectPath string, filename string, disposition string, expires time.Duration) (string, error) {
+	m.lastGetObjectPath = objectPath
 	m.lastGetDisposition = disposition
 	if m.presignedGetErr != nil {
 		return "", m.presignedGetErr
@@ -305,7 +311,7 @@ func TestGetUploadCredentials_ObjectKeyWithFilename(t *testing.T) {
 	}{
 		{
 			name:               "filename provided generates UUID-based key with extension",
-			queryParams:        "type=chat&filename=photo.jpg",
+			queryParams:        "type=chat&filename=photo.jpg&fileSize=1024",
 			wantStatus:         http.StatusOK,
 			wantKeyContains:    ".jpg",
 			wantKeyNotContains: "photo.jpg",
@@ -313,7 +319,7 @@ func TestGetUploadCredentials_ObjectKeyWithFilename(t *testing.T) {
 		},
 		{
 			name:               "chinese filename not in key, extension preserved",
-			queryParams:        "type=chat&filename=照片.jpg",
+			queryParams:        "type=chat&filename=照片.jpg&fileSize=1024",
 			wantStatus:         http.StatusOK,
 			wantKeyContains:    ".jpg",
 			wantKeyNotContains: "照片",
@@ -321,7 +327,7 @@ func TestGetUploadCredentials_ObjectKeyWithFilename(t *testing.T) {
 		},
 		{
 			name:               "path provided uses path-based key",
-			queryParams:        "type=chat&path=/upload/test.jpg",
+			queryParams:        "type=chat&path=/upload/test.jpg&fileSize=2048",
 			wantStatus:         http.StatusOK,
 			wantKeyContains:    "chat",
 			wantKeyNotContains: "",
@@ -329,13 +335,13 @@ func TestGetUploadCredentials_ObjectKeyWithFilename(t *testing.T) {
 		},
 		{
 			name:            "sticker type with filename",
-			queryParams:     "type=sticker&filename=sticker.gif",
+			queryParams:     "type=sticker&filename=sticker.gif&fileSize=512",
 			wantStatus:      http.StatusOK,
 			wantContentDisp: true,
 		},
 		{
 			name:            "path and filename both provided uses path for key and filename for disposition",
-			queryParams:     "type=chat&path=/custom/abc123.jpg&filename=photo.jpg",
+			queryParams:     "type=chat&path=/custom/abc123.jpg&filename=photo.jpg&fileSize=4096",
 			wantStatus:      http.StatusOK,
 			wantKeyContains: "chat",
 			wantContentDisp: true,
@@ -397,7 +403,7 @@ func TestGetUploadCredentials_ObjectKeyFormat(t *testing.T) {
 	// Test with filename: key should be fileType/timestamp/uuid/uuid.ext
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	c.Request, _ = http.NewRequest(http.MethodGet, "/v1/file/upload/credentials?type=chat&filename=test.jpg", nil)
+	c.Request, _ = http.NewRequest(http.MethodGet, "/v1/file/upload/credentials?type=chat&filename=test.jpg&fileSize=1024", nil)
 	wkCtx := &wkhttp.Context{Context: c}
 	f.getUploadCredentials(wkCtx)
 
@@ -422,9 +428,9 @@ func TestGetUploadCredentials_UUIDBasedKey(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	tests := []struct {
-		name    string
+		name     string
 		filename string
-		wantExt string
+		wantExt  string
 	}{
 		{"chinese filename", "带中文的文件.pdf", ".pdf"},
 		{"japanese filename", "テスト.png", ".png"},
@@ -449,6 +455,7 @@ func TestGetUploadCredentials_UUIDBasedKey(t *testing.T) {
 			q := url.Values{}
 			q.Set("type", "chat")
 			q.Set("filename", tt.filename)
+			q.Set("fileSize", "1024")
 			c.Request, _ = http.NewRequest(http.MethodGet, "/v1/file/upload/credentials?"+q.Encode(), nil)
 
 			wkCtx := &wkhttp.Context{Context: c}
@@ -486,6 +493,7 @@ func TestGetUploadCredentials_UUIDBasedKey(t *testing.T) {
 			q := url.Values{}
 			q.Set("type", "chat")
 			q.Set("filename", fn)
+			q.Set("fileSize", "1024")
 			c.Request, _ = http.NewRequest(http.MethodGet, "/v1/file/upload/credentials?"+q.Encode(), nil)
 
 			wkCtx := &wkhttp.Context{Context: c}
@@ -511,7 +519,7 @@ func TestGetUploadCredentials_FallbackWithoutFilename(t *testing.T) {
 	// Test with path (no filename): key should be fileType + sanitized path
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	c.Request, _ = http.NewRequest(http.MethodGet, "/v1/file/upload/credentials?type=chat&path=/abc123.jpg", nil)
+	c.Request, _ = http.NewRequest(http.MethodGet, "/v1/file/upload/credentials?type=chat&path=/abc123.jpg&fileSize=1024", nil)
 	wkCtx := &wkhttp.Context{Context: c}
 	f.getUploadCredentials(wkCtx)
 
@@ -773,4 +781,222 @@ func TestGetDownloadURL_ServiceError(t *testing.T) {
 	f.getDownloadURL(wkCtx)
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+// TestGetUploadCredentials_FileSizeValidation pins the P0 size-bypass guard
+// landed in PR#50 R6: the presigned-PUT path now refuses to sign a URL
+// without a `fileSize` query parameter, and rejects sizes outside the
+// (0, MaxFileSize] band. The signed Content-Length covered by SigV4 /
+// oss.ContentLength is the only thing stopping a caller from PUTting
+// arbitrary bytes through the presigned URL — without server-side
+// validation here, the storage layer would happily accept whatever the
+// client sent and we would lose parity with the multipart `uploadFile`
+// handler's MaxBytesReader gate.
+func TestGetUploadCredentials_FileSizeValidation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name           string
+		queryParams    string
+		wantStatus     int
+		wantMsgContain string
+		wantPropagated int64
+	}{
+		{
+			name:           "missing fileSize is rejected",
+			queryParams:    "type=chat&filename=photo.jpg",
+			wantStatus:     http.StatusBadRequest,
+			wantMsgContain: "fileSize",
+		},
+		{
+			name:           "non-numeric fileSize is rejected",
+			queryParams:    "type=chat&filename=photo.jpg&fileSize=abc",
+			wantStatus:     http.StatusBadRequest,
+			wantMsgContain: "正整数",
+		},
+		{
+			name:           "zero fileSize is rejected",
+			queryParams:    "type=chat&filename=photo.jpg&fileSize=0",
+			wantStatus:     http.StatusBadRequest,
+			wantMsgContain: "正整数",
+		},
+		{
+			name:           "negative fileSize is rejected",
+			queryParams:    "type=chat&filename=photo.jpg&fileSize=-1",
+			wantStatus:     http.StatusBadRequest,
+			wantMsgContain: "正整数",
+		},
+		{
+			name:           "fileSize over MaxFileSize is rejected",
+			queryParams:    fmt.Sprintf("type=chat&filename=photo.jpg&fileSize=%d", MaxFileSize+1),
+			wantStatus:     http.StatusBadRequest,
+			wantMsgContain: "MB",
+		},
+		{
+			name:           "fileSize exactly MaxFileSize is accepted",
+			queryParams:    fmt.Sprintf("type=chat&filename=photo.jpg&fileSize=%d", MaxFileSize),
+			wantStatus:     http.StatusOK,
+			wantPropagated: MaxFileSize,
+		},
+		{
+			name:           "small fileSize is accepted and propagated to backend",
+			queryParams:    "type=chat&filename=photo.jpg&fileSize=2048",
+			wantStatus:     http.StatusOK,
+			wantPropagated: 2048,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockSvc := &mockService{}
+			f := &File{
+				Log:     log.NewTLog("FileTest"),
+				service: mockSvc,
+			}
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request, _ = http.NewRequest(http.MethodGet, "/v1/file/upload/credentials?"+tt.queryParams, nil)
+
+			wkCtx := &wkhttp.Context{Context: c}
+			f.getUploadCredentials(wkCtx)
+
+			assert.Equal(t, tt.wantStatus, w.Code, "body: %s", w.Body.String())
+			if tt.wantMsgContain != "" {
+				assert.Contains(t, w.Body.String(), tt.wantMsgContain)
+			}
+			if tt.wantStatus == http.StatusOK {
+				assert.Equal(t, tt.wantPropagated, mockSvc.lastFileSize,
+					"fileSize must be propagated to the backend signer so the storage layer can enforce it")
+
+				// maxFileSize must also be echoed back to the caller so
+				// the client knows the exact byte budget the URL was
+				// signed against (the URL itself is opaque to the client).
+				var resp map[string]interface{}
+				err := json.Unmarshal(w.Body.Bytes(), &resp)
+				assert.NoError(t, err)
+				echoedRaw, ok := resp["maxFileSize"]
+				assert.True(t, ok, "response must echo maxFileSize so the client can match its PUT body length")
+				echoed, ok := echoedRaw.(float64)
+				assert.True(t, ok, "maxFileSize must be a number, got %T", echoedRaw)
+				assert.Equal(t, tt.wantPropagated, int64(echoed))
+			}
+		})
+	}
+}
+
+// TestGetDownloadURL_PathStyleStripsBucketSegment pins the YUJ-848
+// follow-up to the YUJ-846 path-style fix on the
+// `/v1/file/download/url` endpoint. When a path-style CDN BucketURL
+// is in effect (host has no `<bucket>.` subdomain), the URL we hand
+// the browser as `downloadUrl` is `<host>/<bucket>/<prefix>/<key>`
+// (see ServiceCOS.publicURL / PresignedGetURL with BucketLookupPath).
+// When the client round-trips that full URL back into this handler
+// via `?path=<full-url>`, the parsed path therefore begins with
+// `/<bucket>/`, and that bucket segment MUST be stripped BEFORE the
+// COS.Prefix strip — otherwise PresignedGetURL signs the bucket as
+// part of the object key and the resulting GET 404s.
+//
+// Pre-fix the handler stripped only `cosCfg.Prefix`, leaving the
+// bucket segment in the path; this regression was Jerry-Xin's R1
+// second warning (modules/file/api.go:559-569 in PR#56).
+func TestGetDownloadURL_PathStyleStripsBucketSegment(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cases := []struct {
+		name             string
+		bucket           string
+		bucketURL        string
+		prefix           string
+		inputPath        string
+		wantSignedObject string
+	}{
+		{
+			name:             "path-style CDN with prefix strips bucket then prefix",
+			bucket:           "im-data-1255521909",
+			bucketURL:        "https://cdn.example.com",
+			prefix:           "im-test",
+			inputPath:        "https://cdn.example.com/im-data-1255521909/im-test/chat/2026/05/abc.jpg",
+			wantSignedObject: "/chat/2026/05/abc.jpg",
+		},
+		{
+			name:             "path-style CDN no prefix strips just bucket",
+			bucket:           "im-data-1255521909",
+			bucketURL:        "https://cdn.example.com",
+			prefix:           "",
+			inputPath:        "https://cdn.example.com/im-data-1255521909/chat/2026/05/abc.jpg",
+			wantSignedObject: "/chat/2026/05/abc.jpg",
+		},
+		{
+			name:             "DNS-style bucket-subdomain BucketURL — bucket NOT in path, only prefix stripped",
+			bucket:           "im-data-1255521909",
+			bucketURL:        "https://im-data-1255521909.cos.example.com",
+			prefix:           "im-prod",
+			inputPath:        "https://im-data-1255521909.cos.example.com/im-prod/chat/2026/05/abc.jpg",
+			wantSignedObject: "/chat/2026/05/abc.jpg",
+		},
+		{
+			name:             "DNS-style: must NOT accidentally strip a path segment that happens to share the bucket name",
+			bucket:           "im-data-1255521909",
+			bucketURL:        "https://im-data-1255521909.cos.example.com",
+			prefix:           "",
+			inputPath:        "https://im-data-1255521909.cos.example.com/chat/2026/05/abc.jpg",
+			wantSignedObject: "/chat/2026/05/abc.jpg",
+		},
+		{
+			name:             "BucketURL empty (canonical default endpoint) — bucket lives in subdomain, path is just key",
+			bucket:           "im-data-1255521909",
+			bucketURL:        "",
+			prefix:           "",
+			inputPath:        "https://im-data-1255521909.cos.ap-beijing.myqcloud.com/chat/2026/05/abc.jpg",
+			wantSignedObject: "/chat/2026/05/abc.jpg",
+		},
+		{
+			name:             "non-URL path passes through unchanged",
+			bucket:           "im-data-1255521909",
+			bucketURL:        "https://cdn.example.com",
+			prefix:           "im-test",
+			inputPath:        "chat/2026/05/abc.jpg",
+			wantSignedObject: "chat/2026/05/abc.jpg",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.New()
+			cfg.Test = true
+			cfg.COS.Bucket = tc.bucket
+			cfg.COS.Region = "ap-beijing"
+			cfg.COS.BucketURL = tc.bucketURL
+			cfg.COS.Prefix = tc.prefix
+
+			mockSvc := &mockService{}
+			f := &File{
+				ctx:     testutil.NewTestContext(cfg),
+				Log:     log.NewTLog("FileTest"),
+				service: mockSvc,
+			}
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			req, _ := http.NewRequest(
+				http.MethodGet,
+				"/v1/file/download/url?path="+url.QueryEscape(tc.inputPath)+"&filename=abc.jpg",
+				nil,
+			)
+			c.Request = req
+
+			wkCtx := &wkhttp.Context{Context: c}
+			f.getDownloadURL(wkCtx)
+
+			assert.Equal(t, http.StatusOK, w.Code, "unexpected status; body=%s", w.Body.String())
+			// The handler runs sanitizePath on the stripped path
+			// before handing it to PresignedGetURL — sanitizePath
+			// preserves the leading `/` for absolute paths and
+			// returns relative paths unchanged. So the assertion is
+			// on the post-sanitize value the signer actually sees.
+			assert.Equal(t, tc.wantSignedObject, mockSvc.lastGetObjectPath,
+				"object path passed to PresignedGetURL must have the bucket segment stripped for path-style and the prefix stripped in all cases")
+		})
+	}
 }

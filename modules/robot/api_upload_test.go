@@ -49,7 +49,7 @@ func (m *mockFileServiceForUpload) DownloadImage(url string, ctx context.Context
 	return nil, nil
 }
 
-func (m *mockFileServiceForUpload) PresignedPutURL(objectPath string, contentType string, contentDisposition string, expires time.Duration) (string, string, error) {
+func (m *mockFileServiceForUpload) PresignedPutURL(objectPath string, contentType string, contentDisposition string, fileSize int64, expires time.Duration) (string, string, error) {
 	m.lastObjectPath = objectPath
 	m.lastContentDisp = contentDisposition
 	m.lastContentType = contentType
@@ -82,7 +82,7 @@ func TestBotUploadPresigned_ContentDisposition(t *testing.T) {
 
 			w := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(w)
-			c.Request, _ = http.NewRequest(http.MethodGet, "/v1/robot/upload/presigned?filename="+tt.filename, nil)
+			c.Request, _ = http.NewRequest(http.MethodGet, "/v1/robot/upload/presigned?fileSize=1024&filename="+tt.filename, nil)
 
 			wkCtx := &wkhttp.Context{Context: c}
 			rb.botUploadPresigned(wkCtx)
@@ -120,7 +120,7 @@ func TestBotUploadPresigned_UUIDBasedKey(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	c.Request, _ = http.NewRequest(http.MethodGet, "/v1/robot/upload/presigned?filename=test.jpg", nil)
+	c.Request, _ = http.NewRequest(http.MethodGet, "/v1/robot/upload/presigned?filename=test.jpg&fileSize=1024", nil)
 
 	wkCtx := &wkhttp.Context{Context: c}
 	rb.botUploadPresigned(wkCtx)
@@ -136,4 +136,57 @@ func TestBotUploadPresigned_UUIDBasedKey(t *testing.T) {
 	assert.Equal(t, "chat", parts[0])
 	assert.True(t, strings.HasSuffix(parts[3], ".jpg"), "last part should end with .jpg")
 	assert.NotEqual(t, "test.jpg", parts[3], "last part should be uuid.jpg, not the original filename")
+}
+
+// TestBotUploadPresigned_ContentDispositionInResponse asserts the
+// /v1/robot/upload/presigned endpoint returns the contentDisposition
+// value that was signed into PresignedPutURL — parity with the main
+// file endpoint at modules/file/api.go.
+//
+// Critical: without this echo, browsers cannot construct a PUT that
+// passes SigV4. Independently flagged in PR#50 R7 by Jerry-Xin and
+// lml2468.
+func TestBotUploadPresigned_ContentDispositionInResponse(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name     string
+		filename string
+	}{
+		{"ascii filename with spaces", "annual report 2025.pdf"},
+		{"chinese filename", "报告.pdf"},
+		{"mixed filename", "report-报告.pdf"},
+		{"unicode emoji filename", "🚀-launch.png"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockFS := &mockFileServiceForUpload{}
+			rb := &Robot{
+				Log:         log.NewTLog("RobotTest"),
+				fileService: mockFS,
+			}
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request, _ = http.NewRequest(http.MethodGet, "/v1/robot/upload/presigned?fileSize=1024&filename="+tt.filename, nil)
+
+			wkCtx := &wkhttp.Context{Context: c}
+			rb.botUploadPresigned(wkCtx)
+
+			assert.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+			var payload map[string]interface{}
+			err := json.Unmarshal(w.Body.Bytes(), &payload)
+			assert.NoError(t, err, "response body must be JSON: %s", w.Body.String())
+
+			cd, ok := payload["contentDisposition"].(string)
+			assert.True(t, ok, "response MUST include contentDisposition field; body: %s", w.Body.String())
+			assert.NotEmpty(t, cd, "contentDisposition MUST be non-empty so browser can echo signed value")
+			assert.Equal(t, mockFS.lastContentDisp, cd,
+				"response contentDisposition MUST match value passed to PresignedPutURL")
+			assert.Contains(t, cd, "inline",
+				"contentDisposition should contain 'inline' disposition")
+		})
+	}
 }

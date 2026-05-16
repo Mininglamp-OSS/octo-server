@@ -178,6 +178,17 @@ services:
       TS_DB_REDISADDR: "redis:6379"
       TS_MINIO_ACCESSKEYID: "${MINIO_ROOT_USER:-octoadmin}"
       TS_MINIO_SECRETACCESSKEY: "${MINIO_ROOT_PASSWORD}"
+      # Browser-reachable MinIO API endpoint used for presigned PUT/GET URLs.
+      # The yaml file ships a literal `http://octo.local:29000` default
+      # because Viper does NOT expand `${VAR:-default}` placeholders;
+      # `docker compose` itself DOES expand them, so we resolve the
+      # OCTO_DOMAIN / OCTO_MINIO_API_PORT vars here and pass the final
+      # browser-reachable URL through Viper's `TS_` env-prefix override.
+      # Without this, deployments that customize OCTO_DOMAIN /
+      # OCTO_MINIO_API_PORT in `.env` would still sign URLs against the
+      # default host:port and the resulting presigned URLs would 404
+      # at the operator's actual MinIO ingress.
+      TS_MINIO_DOWNLOADURL: "http://${OCTO_DOMAIN:-octo.local}:${OCTO_MINIO_API_PORT:-29000}"
       # Shared secret for the internal notify API (/v1/internal/notify).
       # Must match what matter (and any future side service) sends as
       # X-Internal-Token. The endpoint fail-closes when this is empty, so a

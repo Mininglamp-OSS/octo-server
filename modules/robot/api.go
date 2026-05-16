@@ -4,12 +4,12 @@ import (
 	"crypto/hmac"
 	"encoding/json"
 	"errors"
-	"os"
-	"path"
-	"runtime/debug"
 	"fmt"
 	"net/http"
+	"os"
+	"path"
 	"regexp"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,16 +20,16 @@ import (
 	"mime"
 	"path/filepath"
 
-	"github.com/Mininglamp-OSS/octo-server/modules/base/app"
-	"github.com/Mininglamp-OSS/octo-server/modules/file"
-	"github.com/Mininglamp-OSS/octo-server/modules/group"
-	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
-	pkgutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/modules/base/app"
+	"github.com/Mininglamp-OSS/octo-server/modules/file"
+	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	pkgutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis"
 	"github.com/gocraft/dbr/v2"
@@ -142,10 +142,10 @@ func (rb *Robot) Route(r *wkhttp.WKHttp) {
 
 	auth := r.Group("/v1", rb.ctx.AuthMiddleware(r))
 	{
-		auth.POST("/robot/sync", rb.sync)                        // 同步机器人菜单
-		auth.POST("/robot/inline_query", rb.inlineQuery)        // 机器人行内搜索
-		auth.GET("/robot/commands", rb.getCommands)              // 查询机器人命令列表
-		auth.PUT("/robot/:robot_id/description", rb.setDescription)     // 设置 Bot 简介
+		auth.POST("/robot/sync", rb.sync)                            // 同步机器人菜单
+		auth.POST("/robot/inline_query", rb.inlineQuery)             // 机器人行内搜索
+		auth.GET("/robot/commands", rb.getCommands)                  // 查询机器人命令列表
+		auth.PUT("/robot/:robot_id/description", rb.setDescription)  // 设置 Bot 简介
 		auth.PUT("/robot/:robot_id/auto_approve", rb.setAutoApprove) // 设置是否自动通过好友申请
 		auth.GET("/robot/space_bots", rb.spaceBots)                  // Bot 广场 — Space 内所有 Bot
 		auth.GET("/robot/my_bots", rb.myBots)                        // 我的 Bot — 已添加好友的 Bot
@@ -153,19 +153,19 @@ func (rb *Robot) Route(r *wkhttp.WKHttp) {
 
 	robotAuth := r.Group("/v1/robots/:robot_id/:app_key", rb.authRobot()) // :robot_id即user的username
 	{
-		robotAuth.GET("/events", rb.getEventsForGet)               // 获取事件
-		robotAuth.POST("/events", rb.getEventsForPost)             // 获取事件（POST方式）
-		robotAuth.POST("/events/:event_id/ack", rb.eventAck)       // 事件确认
-		robotAuth.POST("/answerInlineQuery", rb.answerInlineQuery) // 响应inlineQuery
-		robotAuth.POST("/sendMessage", rb.sendMessage)             // 发送消息
-		robotAuth.POST("/typing", rb.typing)                       // 输入中
-		robotAuth.POST("/stream/start", rb.streamStart)            // 流式消息开启
-		robotAuth.POST("/stream/end", rb.streamEnd)                // 流式消息结束
-		robotAuth.GET("/file/*path", rb.proxyFile)                  // 文件下载代理
-		robotAuth.POST("/upload", rb.botUploadFile)                 // 文件上传
+		robotAuth.GET("/events", rb.getEventsForGet)                  // 获取事件
+		robotAuth.POST("/events", rb.getEventsForPost)                // 获取事件（POST方式）
+		robotAuth.POST("/events/:event_id/ack", rb.eventAck)          // 事件确认
+		robotAuth.POST("/answerInlineQuery", rb.answerInlineQuery)    // 响应inlineQuery
+		robotAuth.POST("/sendMessage", rb.sendMessage)                // 发送消息
+		robotAuth.POST("/typing", rb.typing)                          // 输入中
+		robotAuth.POST("/stream/start", rb.streamStart)               // 流式消息开启
+		robotAuth.POST("/stream/end", rb.streamEnd)                   // 流式消息结束
+		robotAuth.GET("/file/*path", rb.proxyFile)                    // 文件下载代理
+		robotAuth.POST("/upload", rb.botUploadFile)                   // 文件上传
 		robotAuth.GET("/upload/credentials", rb.botUploadCredentials) // STS 临时密钥签发
-		robotAuth.GET("/upload/presigned", rb.botUploadPresigned)    // 预签名上传 URL 签发
-		robotAuth.POST("/message/edit", rb.botMessageEdit)           // Bot 编辑消息
+		robotAuth.GET("/upload/presigned", rb.botUploadPresigned)     // 预签名上传 URL 签发
+		robotAuth.POST("/message/edit", rb.botMessageEdit)            // Bot 编辑消息
 		// GROUP.md routes are in botfather module (/v1/bot/groups/:group_no/md)
 
 	}
@@ -1419,6 +1419,26 @@ func (rb *Robot) botUploadPresigned(c *wkhttp.Context) {
 	}
 	filename = filepath.Base(filename)
 
+	// fileSize is REQUIRED so the storage layer can sign Content-Length and
+	// reject any PUT that exceeds the byte budget — same P0 size-bypass
+	// guard the public file API enforces (see modules/file/api.go).
+	fileSizeRaw := strings.TrimSpace(c.Query("fileSize"))
+	if fileSizeRaw == "" {
+		c.ResponseError(errors.New("fileSize 参数必填，且不能超过最大限制"))
+		return
+	}
+	fileSize, parseErr := strconv.ParseInt(fileSizeRaw, 10, 64)
+	if parseErr != nil || fileSize <= 0 {
+		c.ResponseError(errors.New("fileSize 参数必须为正整数（字节）"))
+		return
+	}
+	if fileSize > file.MaxFileSize {
+		rb.Warn("预签名上传 fileSize 超出限制",
+			zap.Int64("size", fileSize), zap.Int64("max", file.MaxFileSize))
+		c.ResponseError(fmt.Errorf("文件大小不能超过%dMB", file.MaxFileSize/1024/1024))
+		return
+	}
+
 	ext := strings.ToLower(filepath.Ext(filename))
 	if ext == "" || file.IsBlockedExtension(ext) || !file.IsAllowedExtension(ext) {
 		c.ResponseError(errors.New("不支持的文件类型"))
@@ -1434,14 +1454,14 @@ func (rb *Robot) botUploadPresigned(c *wkhttp.Context) {
 
 	contentDisposition := file.BuildContentDisposition(filename)
 	expiry := 30 * time.Minute
-	uploadURL, downloadURL, err := rb.fileService.PresignedPutURL(objectPath, contentType, contentDisposition, expiry)
+	uploadURL, downloadURL, err := rb.fileService.PresignedPutURL(objectPath, contentType, contentDisposition, fileSize, expiry)
 	if err != nil {
 		rb.Error("生成预签名上传URL失败", zap.Error(err))
 		c.ResponseError(errors.New("生成上传URL失败"))
 		return
 	}
 
-	c.Response(gin.H{
+	resp := gin.H{
 		"method":      "PUT",
 		"uploadUrl":   uploadURL,
 		"downloadUrl": downloadURL,
@@ -1449,7 +1469,16 @@ func (rb *Robot) botUploadPresigned(c *wkhttp.Context) {
 		"key":         objectPath,
 		"expiresIn":   int(expiry.Seconds()),
 		"expiredTime": time.Now().Add(expiry).Unix(),
-	})
+		"maxFileSize": fileSize,
+	}
+	// Content-Disposition is signed into the canonical headers on
+	// SigV4 backends (MinIO/COS), so the browser MUST echo this exact
+	// value at PUT time or the gateway returns 403 SignatureDoesNotMatch.
+	// Mirror the main file endpoint at modules/file/api.go.
+	if contentDisposition != "" {
+		resp["contentDisposition"] = contentDisposition
+	}
+	c.Response(resp)
 }
 
 // botMessageEdit Bot 编辑自己发送的消息

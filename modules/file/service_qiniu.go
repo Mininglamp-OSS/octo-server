@@ -5,7 +5,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/url"
 	"strings"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
@@ -41,8 +43,9 @@ func (s *ServiceQiniu) UploadFile(filePath string, contentType string, contentDi
 	upToken := putPolicy.UploadToken(mac)
 
 	cfg := storage.Config{}
-	// 空间对应的机房
-	//cfg.Region = &storage.ZoneHuabei
+	// 空间对应的机房 — leave Region unset so the SDK queries the upload host
+	// at runtime via its configured probe path. Setting an explicit MinIO-
+	// style region here would not match Qiniu's zone names.
 	// 是否使用https域名
 	cfg.UseHTTPS = false
 	// 上传是否使用CDN上传加速
@@ -86,4 +89,47 @@ func (s *ServiceQiniu) DownloadURL(path string, filename string) (string, error)
 	key := strings.TrimPrefix(path, "/")
 	publicAccessURL := storage.MakePublicURL(domain, key)
 	return publicAccessURL, nil
+}
+
+// PresignedPutURL is intentionally not implemented for Qiniu.
+//
+// Qiniu's direct-upload contract is fundamentally different from the S3
+// presigned-PUT model that the rest of the IService surface assumes: a
+// browser uploads to a fixed upload host (e.g. `up.qiniup.com`) using a
+// multipart form whose `token` field carries an `UploadToken` derived from
+// a `PutPolicy`. There is no single signed URL the browser can `PUT` to.
+//
+// Surfacing that asymmetry as a clear error here keeps the IService
+// signatures uniform across backends; deployments that need browser-direct
+// upload to Qiniu should instead use the standard server-side UploadFile
+// path or migrate to the COS / OSS / MinIO backends. The
+// `configs/octo-server.yaml` support matrix documents this fallback.
+func (s *ServiceQiniu) PresignedPutURL(objectPath string, contentType string, contentDisposition string, fileSize int64, expires time.Duration) (string, string, error) {
+	return "", "", fmt.Errorf("七牛云后端暂不支持预签名上传：Qiniu uses an UploadToken+form-post upload model that does not map to a single PUT URL; falling back to server-side upload via UploadFile")
+}
+
+// PresignedGetURL signs a private-bucket download URL for Qiniu, with the
+// `attname` query parameter set so the browser saves under the user-facing
+// filename.
+func (s *ServiceQiniu) PresignedGetURL(objectPath string, filename string, disposition string, expires time.Duration) (string, error) {
+	qiniuCfg := s.ctx.GetConfig().Qiniu
+	mac := auth.New(qiniuCfg.AccessKey, qiniuCfg.SecretKey)
+
+	domain := qiniuCfg.URL
+	key := strings.TrimPrefix(objectPath, "/")
+	if key == "" {
+		return "", fmt.Errorf("空对象路径，无法生成预签名URL")
+	}
+
+	deadline := time.Now().Add(expires).Unix()
+
+	if filename == "" {
+		return storage.MakePrivateURLv2(mac, domain, key, deadline), nil
+	}
+
+	query := url.Values{}
+	// Qiniu uses `attname` for the response file name; it expects the raw
+	// (URL-decoded) filename and does its own quoting internally.
+	query.Set("attname", filename)
+	return storage.MakePrivateURLv2WithQuery(mac, domain, key, query, deadline), nil
 }
