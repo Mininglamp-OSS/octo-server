@@ -2468,7 +2468,7 @@ definitions:
         description: "GitHub授权登录返回"
       is_bot:
         type: integer
-        description: "是否为 Bot 账号 0.否 1.是；来源 user.robot，与 /v1/robot/space_bots 判定一致。与 is_system 是独立维度——系统账号（如 botfather）可能 is_system=1, is_bot=0"
+        description: "是否为 Bot 账号 0.否 1.是；来源 user.robot，与 /v1/robot/space_bots 判定一致。与 is_system 是独立维度——系统账号（如 fileHelper）可能 is_system=1, is_bot=0"
       is_system:
         type: integer
         description: "是否为系统内置账号 0.否 1.是；当前覆盖 botfather/u_10000/fileHelper/notification。与 is_bot 是独立维度——前端如需识别所有非自然人账号，应取 is_bot=1 或 is_system=1 的并集"
