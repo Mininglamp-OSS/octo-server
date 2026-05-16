@@ -14,13 +14,19 @@ const userListColumns = "user.uid,user.name,user.username,user.email,user.status
 
 // userListFilter 汇总 manager 端列表查询的过滤维度，方便 list/count 复用同一套
 // WHERE 条件，避免分页 count 与实际 list 不一致。
+//
+// Exclude* 与 *Only 是对称的两个方向：前者用于"全部里剔除某类"，后者用于"只看某类"。
+// 互斥校验由 handler 负责（同时传 ExcludeBot 与 BotOnly 应直接拒绝），DB 层只
+// 老实拼接 WHERE，不做语义合法性判断。
 type userListFilter struct {
 	OnlineStatus  int  // -1 表示不过滤；0/1 过滤离线/在线
 	ExcludeBot    bool // 剔除 user.robot=1 的账号
 	ExcludeSystem bool // 剔除 pkg/space.SystemBots 中的系统 UID
+	BotOnly       bool // 仅返回 user.robot=1 的账号
+	SystemOnly    bool // 仅返回 pkg/space.SystemBots 中的系统 UID
 }
 
-// applyExcludes 把 exclude_bot / exclude_system 翻译成 WHERE 子句。
+// applyExcludes 把账号过滤维度翻译成 WHERE 子句（exclude_* 与 *_only 同处）。
 // 不处理 OnlineStatus —— 那个只对 list 主查询有效，count 端不需要 JOIN user_online。
 func (f userListFilter) applyExcludes(stmt *dbr.SelectStmt) *dbr.SelectStmt {
 	if f.ExcludeBot {
@@ -28,6 +34,12 @@ func (f userListFilter) applyExcludes(stmt *dbr.SelectStmt) *dbr.SelectStmt {
 	}
 	if f.ExcludeSystem {
 		stmt = stmt.Where("user.uid NOT IN ?", spacepkg.SystemBotList())
+	}
+	if f.BotOnly {
+		stmt = stmt.Where("user.robot=1")
+	}
+	if f.SystemOnly {
+		stmt = stmt.Where("user.uid IN ?", spacepkg.SystemBotList())
 	}
 	return stmt
 }

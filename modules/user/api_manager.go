@@ -561,6 +561,19 @@ func (m *Manager) list(c *wkhttp.Context) {
 		OnlineStatus:  int(online),
 		ExcludeBot:    c.Query("exclude_bot") == "1",
 		ExcludeSystem: c.Query("exclude_system") == "1",
+		BotOnly:       c.Query("bot_only") == "1",
+		SystemOnly:    c.Query("system_only") == "1",
+	}
+	// 互斥校验：bot_only 与 exclude_bot、system_only 与 exclude_system 同时存在
+	// 是逻辑矛盾，会得到空结果集。返回 400 让前端及早发现 query 构造 bug，
+	// 比静默返回空更好。允许 bot_only + system_only（交集语义清晰）。
+	if filter.BotOnly && filter.ExcludeBot {
+		c.ResponseError(errors.New("bot_only 与 exclude_bot 互斥"))
+		return
+	}
+	if filter.SystemOnly && filter.ExcludeSystem {
+		c.ResponseError(errors.New("system_only 与 exclude_system 互斥"))
+		return
 	}
 	pageIndex, pageSize := c.GetPage()
 	var userList []*managerUserModel

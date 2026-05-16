@@ -343,6 +343,19 @@ func TestUserListBotAndSystemFlags(t *testing.T) {
 		Password: util.MD5(util.MD5("333")),
 	})
 	assert.NoError(t, err)
+	// 系统账号 + Bot 同时成立的关键 case（is_bot=1 & is_system=1）。
+	// 生产环境数据印证：botfather/u_10000/notification 都是 robot=1 的系统账号，
+	// bot_only=1&system_only=1 必须能精准命中这种交集账号。
+	err = m.userDB.Insert(&Model{
+		UID:      "botfather",
+		ShortNo:  util.GenerUUID(),
+		Username: "botfather",
+		Name:     "BotFather",
+		Status:   1,
+		Robot:    1,
+		Password: util.MD5(util.MD5("444")),
+	})
+	assert.NoError(t, err)
 
 	// 响应解析成结构化数据，便于断言 count 与 list 一致 —— PR #62 review
 	// 反复强调"count/list 一致性"是这次重构的主旨，所以测试必须显式覆盖。
@@ -389,21 +402,21 @@ func TestUserListBotAndSystemFlags(t *testing.T) {
 		notWantUIDs []string // 期望响应不应包含的 UID
 	}{
 		{
-			name:     "default returns all three",
+			name:     "default returns all four",
 			query:    "page_index=1&page_size=10",
-			wantUIDs: []string{"user_normal_001", "user_bot_001", "fileHelper"},
+			wantUIDs: []string{"user_normal_001", "user_bot_001", "fileHelper", "botfather"},
 		},
 		{
 			name:        "exclude_bot filters user.robot=1",
 			query:       "page_index=1&page_size=10&exclude_bot=1",
 			wantUIDs:    []string{"user_normal_001", "fileHelper"},
-			notWantUIDs: []string{"user_bot_001"},
+			notWantUIDs: []string{"user_bot_001", "botfather"},
 		},
 		{
 			name:        "exclude_system filters SystemBots UIDs",
 			query:       "page_index=1&page_size=10&exclude_system=1",
 			wantUIDs:    []string{"user_normal_001", "user_bot_001"},
-			notWantUIDs: []string{"fileHelper"},
+			notWantUIDs: []string{"fileHelper", "botfather"},
 		},
 		{
 			name:        "exclude_bot + keyword still filters bots",
@@ -415,7 +428,35 @@ func TestUserListBotAndSystemFlags(t *testing.T) {
 			name:        "exclude_bot + exclude_system filters both",
 			query:       "page_index=1&page_size=10&exclude_bot=1&exclude_system=1",
 			wantUIDs:    []string{"user_normal_001"},
-			notWantUIDs: []string{"user_bot_001", "fileHelper"},
+			notWantUIDs: []string{"user_bot_001", "fileHelper", "botfather"},
+		},
+		// bot_only / system_only：前端"只看 Bot""只看系统账号"档位需要的反向筛选。
+		// 没有这两个参数时前端只能客户端过滤当前页，会导致 total 与可见行数不一致。
+		{
+			name:        "bot_only returns all robot=1 (including system bots)",
+			query:       "page_index=1&page_size=10&bot_only=1",
+			wantUIDs:    []string{"user_bot_001", "botfather"},
+			notWantUIDs: []string{"user_normal_001", "fileHelper"},
+		},
+		{
+			name:        "system_only returns all SystemBots UIDs",
+			query:       "page_index=1&page_size=10&system_only=1",
+			wantUIDs:    []string{"fileHelper", "botfather"},
+			notWantUIDs: []string{"user_normal_001", "user_bot_001"},
+		},
+		{
+			name:        "bot_only + exclude_system narrows to user-created bots",
+			query:       "page_index=1&page_size=10&bot_only=1&exclude_system=1",
+			wantUIDs:    []string{"user_bot_001"},
+			notWantUIDs: []string{"user_normal_001", "fileHelper", "botfather"},
+		},
+		// 交集：既是 Bot 又是系统账号 —— botfather 是这种账号的代表。
+		// 这是 bot_only 和 system_only 共存的唯一有意义组合，因此显式覆盖。
+		{
+			name:        "bot_only + system_only returns intersection",
+			query:       "page_index=1&page_size=10&bot_only=1&system_only=1",
+			wantUIDs:    []string{"botfather"},
+			notWantUIDs: []string{"user_normal_001", "user_bot_001", "fileHelper"},
 		},
 	}
 	for _, tc := range cases {
@@ -434,7 +475,7 @@ func TestUserListBotAndSystemFlags(t *testing.T) {
 		})
 	}
 
-	// 字段语义单测：分别校验三类账号的 is_bot/is_system 取值。
+	// 字段语义单测：分别校验四类账号的 is_bot/is_system 取值。
 	t.Run("flag values per account type", func(t *testing.T) {
 		resp := doList(t, "page_index=1&page_size=10")
 		normal, ok := findUID(resp.List, "user_normal_001")
@@ -453,7 +494,32 @@ func TestUserListBotAndSystemFlags(t *testing.T) {
 		assert.True(t, ok)
 		assert.Equal(t, 0, sys.IsBot)
 		assert.Equal(t, 1, sys.IsSystem)
+
+		// botfather：交集账号，is_bot=1 且 is_system=1 同时成立。
+		bf, ok := findUID(resp.List, "botfather")
+		assert.True(t, ok)
+		assert.Equal(t, 1, bf.IsBot)
+		assert.Equal(t, 1, bf.IsSystem)
 	})
+
+	// 互斥校验：bot_only 与 exclude_bot、system_only 与 exclude_system 同时为 1
+	// 是逻辑矛盾，返回 400 比静默返回空更利于前端发现 bug。
+	conflictCases := []struct {
+		name  string
+		query string
+	}{
+		{"bot_only conflicts with exclude_bot", "page_index=1&page_size=10&bot_only=1&exclude_bot=1"},
+		{"system_only conflicts with exclude_system", "page_index=1&page_size=10&system_only=1&exclude_system=1"},
+	}
+	for _, tc := range conflictCases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequest("GET", "/v1/manager/user/list?"+tc.query, nil)
+			req.Header.Set("token", testutil.Token)
+			s.GetRoute().ServeHTTP(w, req)
+			assert.Equal(t, http.StatusBadRequest, w.Code, "body=%s", w.Body.String())
+		})
+	}
 }
 
 func TestUserDisablelist(t *testing.T) {

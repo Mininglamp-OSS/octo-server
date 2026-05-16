@@ -140,12 +140,22 @@ paths:
         - in: "query"
           name: "exclude_bot"
           type: integer
-          description: "是否排除 Bot 账号(user.robot=1) 0.否(默认) 1.是。与 exclude_system 是独立维度；如需排除所有非自然人账号，请同时传 exclude_bot=1&exclude_system=1"
+          description: "是否排除 Bot 账号(user.robot=1) 0.否(默认) 1.是。与 exclude_system 是独立维度；如需排除所有非自然人账号，请同时传 exclude_bot=1&exclude_system=1。与 bot_only 互斥（同时传返回 400）"
           required: false
         - in: "query"
           name: "exclude_system"
           type: integer
-          description: "是否排除系统内置账号(botfather/u_10000/fileHelper/notification) 0.否(默认) 1.是。注意系统账号未必同时是 Bot（如 botfather 自身 user.robot=0），如需排除所有非自然人账号请配合 exclude_bot=1"
+          description: "是否排除系统内置账号(botfather/u_10000/fileHelper/notification) 0.否(默认) 1.是。注意系统账号未必同时是 Bot（如 fileHelper 自身 user.robot=0），如需排除所有非自然人账号请配合 exclude_bot=1。与 system_only 互斥（同时传返回 400）"
+          required: false
+        - in: "query"
+          name: "bot_only"
+          type: integer
+          description: "仅返回 Bot 账号(user.robot=1) 0.否(默认) 1.是。与 exclude_bot 互斥。可与 exclude_system=1 组合得到非系统 Bot；可与 system_only=1 组合得到既是 Bot 又是系统账号的交集"
+          required: false
+        - in: "query"
+          name: "system_only"
+          type: integer
+          description: "仅返回系统内置账号(botfather/u_10000/fileHelper/notification) 0.否(默认) 1.是。与 exclude_system 互斥。可与 bot_only=1 组合定位系统 Bot"
           required: false
       responses:
         200:
