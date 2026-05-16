@@ -13,8 +13,14 @@ deploy-v2:
 	docker push registry.cn-shanghai.aliyuncs.com/wukongim/octo-server:v2
 
 run-dev:
-	docker-compose build;docker-compose up -d
+	@echo "run-dev has been retired — the bundled docker-compose stack moved to"; \
+	echo "  https://github.com/Mininglamp-OSS/octo-deployment"; \
+	echo "Use that repo's setup.sh + docker compose up -d, or see QUICKSTART.md"; \
+	echo "Option 2 (Local Go build) for the dev loop in this repo."; \
+	exit 1
 stop-dev:
-	docker-compose stop
+	@echo "stop-dev has been retired alongside run-dev — see"; \
+	echo "  https://github.com/Mininglamp-OSS/octo-deployment"; \
+	exit 1
 env-test:
 	docker-compose -f ./testenv/docker-compose.yaml up -d 

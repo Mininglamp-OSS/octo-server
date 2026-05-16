@@ -3,10 +3,14 @@
 // Sidecar: rewrites the pre-seeded gorp_migrations IDs in init-db.sql using
 // mapping.json produced by the main rename tool.
 //
-// Usage:
+// As of the docker/octo + docker/tsdd retirement, the canonical
+// init-db.sql now lives in `Mininglamp-OSS/octo-deployment`
+// (`docker/scripts/init-db.sql`). Pass `--initdb` pointing at a checkout
+// of that repo, e.g.:
+//
 //   go run tools/migrate-rename/rewrite_initdb.go \
 //     --mapping tools/migrate-rename/mapping.json \
-//     --initdb  docker/octo/scripts/init-db.sql
+//     --initdb  ../octo-deployment/docker/scripts/init-db.sql
 package main
 
 import (
@@ -20,7 +24,11 @@ import (
 
 func main() {
 	mappingPath := flag.String("mapping", "tools/migrate-rename/mapping.json", "")
-	initdbPath := flag.String("initdb", "docker/octo/scripts/init-db.sql", "")
+	// The default is intentionally a relative path into a sibling
+	// `octo-deployment` checkout. This sidecar tool predates the SoT
+	// move; pass --initdb explicitly to point at wherever init-db.sql
+	// lives in your environment.
+	initdbPath := flag.String("initdb", "../octo-deployment/docker/scripts/init-db.sql", "")
 	flag.Parse()
 
 	raw, err := os.ReadFile(*mappingPath)

@@ -71,8 +71,8 @@ workaround.
 
 ### Configure
 
-Copy a config template from `config/` (or write your own `tsdd.yaml`)
-and point each section at your live infra:
+Copy the bundled template under `configs/` (e.g. `configs/tsdd.yaml`)
+to your own path and point each section at your live infra:
 
 - `db.mysqlAddr` — your MySQL DSN
 - `db.redisAddr` — your Redis address
@@ -83,8 +83,17 @@ and point each section at your live infra:
 
 ### Run
 
+`octo-server` parses the `--config` flag with the stdlib `flag`
+package, then dispatches on the first non-flag argument (`api` /
+`config` / unset → API server). `flag.Parse()` stops at the first
+positional, so `--config` must come **before** the subcommand:
+
 ```bash
-./octo-server api --config /path/to/tsdd.yaml
+# default config (configs/tsdd.yaml relative to working dir)
+./octo-server api
+
+# explicit config — note the flag goes before the subcommand
+./octo-server --config /path/to/tsdd.yaml api
 ```
 
 Smoke check:
