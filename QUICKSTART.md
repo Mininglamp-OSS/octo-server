@@ -62,8 +62,13 @@ variable contract.
 ```bash
 git clone https://github.com/Mininglamp-OSS/octo-server.git
 cd octo-server
-go build ./...
+go build -o octo-server .
 ```
+
+`go build ./...` only compiles & checks every package; it does not
+write any binaries (Go discards the object when more than one
+package is built). To get a runnable `./octo-server`, build the root
+main package explicitly with `-o octo-server .` as shown above.
 
 If `go build` fails with "missing go.sum entry" against a sibling OCTO
 module, see [`BUILDING.md`](./BUILDING.md) for the cross-repo `replace`
@@ -76,8 +81,8 @@ to your own path and point each section at your live infra:
 
 - `db.mysqlAddr` — your MySQL DSN
 - `db.redisAddr` — your Redis address
-- `wukongIM.url` and `wukongIM.managerToken` — your WuKongIM control
-  plane
+- `wukongIM.apiURL` and `wukongIM.managerToken` — your WuKongIM control
+  plane (the YAML key is `apiURL`, not `url`; see `configs/tsdd.yaml`)
 - `minio.*` (or whichever object-storage adapter you use) — your S3
   endpoint, app credentials, and bucket layout
 

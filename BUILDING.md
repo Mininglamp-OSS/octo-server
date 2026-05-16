@@ -46,5 +46,12 @@ To build only the `octo-server` container image from this repository:
 make build          # docker build -t octo-server .
 ```
 
-Tag / push targets (publishing to the team registry) are defined in
-the `Makefile` (`make push`, `make deploy`, `make deploy-v2`).
+The image-release workflow (multi-arch tags, registry push, deploy
+manifests) lives in
+[`Mininglamp-OSS/octo-deployment`](https://github.com/Mininglamp-OSS/octo-deployment).
+The `push` / `deploy` / `deploy-v2` targets that still ship in this
+repo's `Makefile` predate the consolidation and hard-code the team's
+private Aliyun registry path (with one stale tag — `make push`
+currently tags `octo-server` and then pushes `wukongchatserver:latest`,
+which is a leftover from the pre-rename era); they are not the
+canonical release surface and should not be used.

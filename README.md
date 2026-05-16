@@ -47,7 +47,7 @@ messaging.
 ```bash
 git clone https://github.com/Mininglamp-OSS/octo-server.git
 cd octo-server
-go build ./...
+go build -o octo-server .
 ./octo-server --config ./configs/tsdd.yaml
 ```
 
