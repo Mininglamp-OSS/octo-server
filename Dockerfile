@@ -8,7 +8,7 @@
 #     build. The `2>/dev/null || echo dev` guard keeps the build green for
 #     OSS users without sacrificing the real version embed on internal builds.
 
-FROM golang:1.20 as build
+FROM golang:1.25 AS build
 
 ENV GOPROXY https://goproxy.cn,direct
 ENV GO111MODULE on
@@ -32,7 +32,7 @@ RUN GIT_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo unknown) && \
       -installsuffix cgo -o app ./main.go
 
 
-FROM alpine as prod
+FROM alpine AS prod
 COPY --from=build /etc/passwd /etc/passwd
 COPY --from=build /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
 RUN mkdir -p /usr/share/zoneinfo/Asia && \
