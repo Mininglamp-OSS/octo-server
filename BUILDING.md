@@ -32,7 +32,19 @@ will resolve imports from `proxy.golang.org` automatically.
 
 ## Docker
 
+For an end-to-end OCTO stack (this server plus admin / web / matter /
+smart-summary / WuKongIM / MySQL / Redis / MinIO / nginx), see the
+official OOTB deployment at
+[`Mininglamp-OSS/octo-deployment`](https://github.com/Mininglamp-OSS/octo-deployment).
+The older `docker/octo/` and `docker/tsdd/` compose stacks that used
+to ship in this repository have been retired in favour of that single
+source of truth.
+
+To build only the `octo-server` container image from this repository:
+
 ```bash
-make build          # Builds tangsengdaodaoserver image locally
-make run-dev        # docker-compose up full stack
+make build          # docker build -t octo-server .
 ```
+
+Tag / push targets (publishing to the team registry) are defined in
+the `Makefile` (`make push`, `make deploy`, `make deploy-v2`).

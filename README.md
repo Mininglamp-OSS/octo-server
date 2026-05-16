@@ -52,9 +52,18 @@ go build ./...
 ```
 
 The default dev config expects a local WuKongIM instance and a
-MySQL-compatible database. See `config/dev.yaml.example` and the
-`docker/` directory for a minimal local stack, plus [`QUICKSTART.md`](./QUICKSTART.md)
-and [`BUILDING.md`](./BUILDING.md) for a full walkthrough.
+MySQL-compatible database. See `config/dev.yaml.example` for the
+standalone-binary path, [`QUICKSTART.md`](./QUICKSTART.md) for an
+end-to-end walkthrough, and [`BUILDING.md`](./BUILDING.md) for
+cross-repo build notes.
+
+For a one-command Docker Compose stack (server + admin + web + matter
++ smart-summary + WuKongIM + MySQL + Redis + MinIO + nginx), use the
+**official OOTB deployment** at
+[`Mininglamp-OSS/octo-deployment`](https://github.com/Mininglamp-OSS/octo-deployment).
+The older `docker/octo/` and `docker/tsdd/` compose stacks that used
+to live in this repo have been retired in favour of that single
+source of truth.
 
 ## 📦 Modules / Architecture
 
@@ -70,7 +79,6 @@ High-level layout:
 | `internal/agent/` | Lobster routing, session store, tool-call execution |
 | `internal/adapter/` | Adapter registration + dispatch surfaces |
 | `config/` | YAML config schema + dev / prod examples |
-| `docker/` | Minimal compose stack (server + WuKongIM + MySQL + Redis) |
 | `migrations/` | SQL schema migrations |
 | `docs/` | Architecture notes, API reference, diagrams |
 
