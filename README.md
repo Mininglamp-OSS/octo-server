@@ -48,7 +48,7 @@ messaging.
 git clone https://github.com/Mininglamp-OSS/octo-server.git
 cd octo-server
 go build ./...
-./octo-server --config ./config/dev.yaml
+./octo-server --config ./configs/tsdd.yaml
 ```
 
 The default dev config expects a local WuKongIM instance and a

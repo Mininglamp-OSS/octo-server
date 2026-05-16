@@ -46,7 +46,7 @@
 git clone https://github.com/Mininglamp-OSS/octo-server.git
 cd octo-server
 go build ./...
-./octo-server --config ./config/dev.yaml
+./octo-server --config ./configs/tsdd.yaml
 ```
 
 默认 dev 配置期望本地存在一个 WuKongIM 实例与一个 MySQL 兼容的数据库。
