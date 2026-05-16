@@ -1,6 +1,6 @@
 module github.com/Mininglamp-OSS/octo-server
 
-go 1.20
+go 1.25
 
 require (
 	firebase.google.com/go/v4 v4.13.0
