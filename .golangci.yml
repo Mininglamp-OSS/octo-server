@@ -1,3 +1,4 @@
+version: "2"
 # golangci-lint config for octo-server (post-OCTO-migration recovery profile).
 #
 # Rationale:
