@@ -143,14 +143,16 @@ minio:
   # port published to the host on the default `octo.local` domain. Viper
   # does NOT expand shell-style `${VAR:-default}` placeholders in this
   # file (only `docker compose` does, in `docker-compose.yaml`), so this
-  # value MUST be a literal browser-reachable URL. The bundled
-  # `docker/octo/docker-compose.yaml` therefore sets
-  # `TS_MINIO_DOWNLOADURL` from the `OCTO_DOMAIN` / `OCTO_MINIO_API_PORT`
-  # env vars (Viper's `TS_` env prefix turns that into an authoritative
-  # override over this yaml value); operators running the binary outside
-  # Docker should either edit this line or export `TS_MINIO_DOWNLOADURL`
-  # directly. The internal hostname `minio` is intentionally NOT used
-  # here because browsers cannot resolve it.
+  # value MUST be a literal browser-reachable URL. This file is a
+  # snapshot taken from the previous octo-deployment compose stack
+  # (the live compose now lives in `Mininglamp-OSS/octo-deployment` and
+  # sets `TS_MINIO_DOWNLOADURL` from the `OCTO_DOMAIN` /
+  # `OCTO_MINIO_API_PORT` env vars — Viper's `TS_` env prefix turns
+  # that into an authoritative override over this yaml value);
+  # operators running the binary outside Docker should either edit
+  # this line or export `TS_MINIO_DOWNLOADURL` directly. The internal
+  # hostname `minio` is intentionally NOT used here because browsers
+  # cannot resolve it.
   #
   # NOTE: SigV4 signed-header contract — `presignedUpload` returns a
   # `contentType` (and optional `contentDisposition`) that the client

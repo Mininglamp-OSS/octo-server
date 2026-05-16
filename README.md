@@ -52,8 +52,8 @@ go build ./...
 ```
 
 The default dev config expects a local WuKongIM instance and a
-MySQL-compatible database. See `config/dev.yaml.example` for the
-standalone-binary path, [`QUICKSTART.md`](./QUICKSTART.md) for an
+MySQL-compatible database. See the bundled `configs/tsdd.yaml`
+template for the standalone-binary path, [`QUICKSTART.md`](./QUICKSTART.md) for an
 end-to-end walkthrough, and [`BUILDING.md`](./BUILDING.md) for
 cross-repo build notes.
 
@@ -78,7 +78,7 @@ High-level layout:
 | `internal/im/` | Control-plane client for WuKongIM (channel / message / presence) |
 | `internal/agent/` | Lobster routing, session store, tool-call execution |
 | `internal/adapter/` | Adapter registration + dispatch surfaces |
-| `config/` | YAML config schema + dev / prod examples |
+| `configs/` | YAML config schema + dev / prod examples |
 | `migrations/` | SQL schema migrations |
 | `docs/` | Architecture notes, API reference, diagrams |
 

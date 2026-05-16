@@ -50,7 +50,7 @@ go build ./...
 ```
 
 默认 dev 配置期望本地存在一个 WuKongIM 实例与一个 MySQL 兼容的数据库。
-参考 `config/dev.yaml.example` 单二进制运行路径，配合
+参考仓库自带的 `configs/tsdd.yaml` 模板获取单二进制运行路径，配合
 [`QUICKSTART.md`](./QUICKSTART.md) 与 [`BUILDING.md`](./BUILDING.md) 获取完整步骤。
 
 若需要一键拉起完整 OCTO 栈（server + admin + web + matter + smart-summary
@@ -72,7 +72,7 @@ go build ./...
 | `internal/im/` | WuKongIM 控制面客户端（频道 / 消息 / 在线状态） |
 | `internal/agent/` | 龙虾路由、会话存储、工具调用执行 |
 | `internal/adapter/` | Adapter 注册与下发入口 |
-| `config/` | YAML 配置 schema 与 dev / prod 示例 |
+| `configs/` | YAML 配置 schema 与 dev / prod 示例 |
 | `migrations/` | SQL 迁移脚本 |
 | `docs/` | 架构文档、API 参考、图表 |
 

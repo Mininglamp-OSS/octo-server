@@ -4,9 +4,11 @@
 // mapping.json produced by the main rename tool.
 //
 // As of the docker/octo + docker/tsdd retirement, the canonical
-// init-db.sql now lives in `Mininglamp-OSS/octo-deployment`
-// (`docker/scripts/init-db.sql`). Pass `--initdb` pointing at a checkout
-// of that repo, e.g.:
+// init-db.sql now lives in `Mininglamp-OSS/octo-deployment` (under
+// `docker/scripts/`; exact filename can vary across branches). The
+// `--initdb` flag is REQUIRED — no default is supplied because any
+// hard-coded sibling path is environment-specific and silently rots
+// when the upstream layout changes. Pass it explicitly:
 //
 //   go run tools/migrate-rename/rewrite_initdb.go \
 //     --mapping tools/migrate-rename/mapping.json \
@@ -24,12 +26,22 @@ import (
 
 func main() {
 	mappingPath := flag.String("mapping", "tools/migrate-rename/mapping.json", "")
-	// The default is intentionally a relative path into a sibling
-	// `octo-deployment` checkout. This sidecar tool predates the SoT
-	// move; pass --initdb explicitly to point at wherever init-db.sql
-	// lives in your environment.
-	initdbPath := flag.String("initdb", "../octo-deployment/docker/scripts/init-db.sql", "")
+	// `--initdb` is intentionally required (no default). The canonical
+	// init-db.sql lives in the sibling `octo-deployment` checkout and
+	// its exact path is environment-specific, so we make the caller
+	// pass it explicitly rather than fail with a misleading
+	// "no such file or directory" against a stale hard-coded path.
+	initdbPath := flag.String("initdb", "", "REQUIRED: path to init-db.sql in your octo-deployment checkout")
 	flag.Parse()
+
+	if *initdbPath == "" {
+		fmt.Fprintln(os.Stderr, "FATAL: --initdb is required (path to init-db.sql in octo-deployment checkout)")
+		fmt.Fprintln(os.Stderr, "example:")
+		fmt.Fprintln(os.Stderr, "  go run tools/migrate-rename/rewrite_initdb.go \\")
+		fmt.Fprintln(os.Stderr, "    --mapping tools/migrate-rename/mapping.json \\")
+		fmt.Fprintln(os.Stderr, "    --initdb  ../octo-deployment/docker/scripts/init-db.sql")
+		os.Exit(2)
+	}
 
 	raw, err := os.ReadFile(*mappingPath)
 	must(err)
