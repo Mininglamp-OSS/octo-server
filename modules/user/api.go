@@ -629,7 +629,11 @@ func (u *User) uploadAvatar(c *wkhttp.Context) {
 // 获取用户的IM连接地址
 func (u *User) userIM(c *wkhttp.Context) {
 	uid := c.Param("uid")
-	resp, err := network.Get(fmt.Sprintf("%s/route?uid=%s", u.ctx.GetConfig().WuKongIM.APIURL, uid), nil, nil)
+	headers := map[string]string{}
+	if mt := u.ctx.GetConfig().WuKongIM.ManagerToken; mt != "" {
+		headers["token"] = mt
+	}
+	resp, err := network.Get(fmt.Sprintf("%s/route?uid=%s", u.ctx.GetConfig().WuKongIM.APIURL, uid), nil, headers)
 	if err != nil {
 		u.Error("调用IM服务失败！", zap.Error(err))
 		c.ResponseError(errors.New("调用IM服务失败！"))
