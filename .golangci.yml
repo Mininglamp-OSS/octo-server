@@ -37,6 +37,5 @@ linters:
 
 issues:
   # Don't suppress new govet findings — this linter is the intentional gate.
-  exclude-use-default: false
   max-issues-per-linter: 0
   max-same-issues: 0
