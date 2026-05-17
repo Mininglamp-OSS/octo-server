@@ -67,7 +67,7 @@ func (u *User) VerifyPasswordByUID(_ context.Context, uid, password string) (boo
 	return true, "", nil
 }
 
-// SendOIDCBindSMS 详见 IService 注释。
+// SendOIDCBindSMS 详见 IService 注释(含跨流程 keyspace 共享勘误)。
 //
 // **安全契约(必须读)**:本方法不做"phone 来自 OIDC claims 而非用户输入"的来源校验,
 // 因为 oidc 模块在 callback 阶段已经拿着可信 claims 转发过来。**如果未来
@@ -76,9 +76,15 @@ func (u *User) VerifyPasswordByUID(_ context.Context, uid, password string) (boo
 //     自己 dmwork 账号(违反 FR-3.3 / SR-4 反伪造手机号)
 //   - 攻击者可批量请求发短信制造账号枚举 / 短信轰炸
 //
-// 实务防护:DM_OIDC_BIND_ISSUER_ALLOWLIST + bind_token 单次消费 + Redis
-// 5min TTL + commonapi.SMSService 内置发送频率限制(1min/手机号),
-// 共同压低风险。但 phone 输入来源校验属于"调用方契约",不在本层兜底。
+// 实务防护(分层互补):
+//   - **本层**:commonapi.SMSService 内置 1min 发送频率 + 10min 失败锁定,
+//     但锁定 key 不带 codeType(详见 IService 注释),与 register/forget-pwd
+//     等其他 SMS 流程共享 -> 提供"全局手机号粒度"的反滥用;
+//   - **oidc 模块 BindService 层**:DM_OIDC_BIND_ISSUER_ALLOWLIST 收口 +
+//     bind_token 单次消费 + Redis 5min TTL + BindStore.IncrAndCheck
+//     (bind_token 维度的 OTP 发送/校验/确认 counter, 对应 SR-2.1)
+//     -> 提供"OIDC bind 流程粒度"的反爆破;
+//   - 两层叠加,phone 输入来源校验是调用方契约,不在本层兜底。
 func (u *User) SendOIDCBindSMS(ctx context.Context, zone, phone string) error {
 	if zone == "" || phone == "" {
 		return fmt.Errorf("oidc bind sms: zone and phone required")
@@ -89,11 +95,18 @@ func (u *User) SendOIDCBindSMS(ctx context.Context, zone, phone string) error {
 	return nil
 }
 
-// VerifyOIDCBindSMS 详见 IService 注释。
+// VerifyOIDCBindSMS 详见 IService 注释(含跨流程 keyspace 共享勘误)。
 //
-// 底层 SMSService.Verify 自带"3 次失败锁定 10 分钟"行为(modules/base/common/
-// service_sms.go),与 loginGuard 的密码反爆破独立计数 —— 用户即便密码尝试
-// 已被限流,仍可走短信路径(反之亦然)。
+// 反爆破隔离边界:
+//   - 与 loginGuard 的密码反爆破计数器独立(后者用 "oidc-bind:"+uid 前缀,
+//     SMSService 用 zone@phone 前缀)—— 用户即便密码尝试已被限流,仍可走
+//     短信路径,反之亦然;
+//   - 但底层 SMSService 的"3 次失败锁定 10 分钟"行为 lock key 不带 codeType,
+//     与 register / forget-pwd / login_check_phone / destroy / email_login
+//     等所有 SMS 流程共享 —— OIDC bind 路径错 3 次也会把该手机号其他 SMS
+//     流程一并锁 10min(详见 IService.SendOIDCBindSMS 注释)。如需 codeType
+//     维度的独立锁,P0 之后单独评估改造 commonapi.SMSService(影响 5 个调
+//     用方,需 ops 决策)。
 func (u *User) VerifyOIDCBindSMS(ctx context.Context, zone, phone, code string) error {
 	if zone == "" || phone == "" || code == "" {
 		return fmt.Errorf("oidc bind sms verify: zone/phone/code required")

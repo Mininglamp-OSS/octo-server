@@ -126,12 +126,23 @@ type IService interface {
 	// phone_number/phone_number_verified,不接受用户输入** —— 否则攻击者
 	// 可用自己手机绑别人 sub。本方法仅做信道分发,不做来源校验。
 	//
-	// 与 register/login/forget-pwd 等流程隔离的 CodeTypeOIDCBind keyspace,
-	// 失败计数与重发频率与其他流程不互相影响。
+	// keyspace 隔离边界(踩坑勘误):
+	//   - 验证码本身 (CacheKeySMSCode) 按 codeType 分桶 —— OIDC bind 流程的
+	//     OTP 不会被其他流程的验证码覆盖,也不会覆盖别人;
+	//   - **但底层 SMSService 的"sms_rate_limit:zone@phone"(1min 发送频率)、
+	//     "sms_verify_lock:zone@phone"(10min 失败锁定)、"sms_verify_fail:..."
+	//     三个 key 都不带 codeType,跨流程共享**。后果:
+	//       a. 用户刚走过 register/forget-pwd SMS 流程,1min 内进 OIDC bind
+	//          会被 "发送过于频繁" 挡住;
+	//       b. OIDC bind 路径连续输错 3 次,该手机号其他 SMS 流程一并被
+	//          锁 10min。
+	//   - bind_token 维度的"OTP 发送 ≤ 3 次"(SR-2.1)由 oidc 模块的
+	//     BindStore.IncrAndCheck 单独兜底,与本层无关。
 	SendOIDCBindSMS(ctx context.Context, zone, phone string) error
 
 	// VerifyOIDCBindSMS 与 SendOIDCBindSMS 对称,复用底层 SMSService.Verify 的
-	// 锁定/重试限制。
+	// 锁定/重试限制。**注意 lock/failCount key 同样不带 codeType,跨流程共享**,
+	// 详见 SendOIDCBindSMS 注释。
 	VerifyOIDCBindSMS(ctx context.Context, zone, phone, code string) error
 }
 
