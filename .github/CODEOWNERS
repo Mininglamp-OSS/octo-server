@@ -1,12 +1,4 @@
-# Default owners — multiple maintainers so any one of them can satisfy
-# the "Require code-owner review" branch protection rule on PRs authored
-# by another default owner. Without multiple default owners, a PR by
-# @yujiawei (the original sole default owner) cannot satisfy the
-# required code-owner review without admin override.
-* @Jerry-Xin @lml2468 @yujiawei
+# CODEOWNERS — unified team ownership
+# See: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
 
-# Server (Go backend)
-/server/ @an9xyz @Jerry-Xin @yujiawei
-
-# Docs
-/docs/ @yujiawei
+* @Mininglamp-OSS/maintainers
