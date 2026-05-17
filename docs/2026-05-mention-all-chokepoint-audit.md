@@ -30,20 +30,18 @@
 
 **Finding**: zero server modules construct `mention.all=1`. Every `mention.all=1` byte on the wire originated in a client payload that was forwarded verbatim through `POST /v1/message/send` → `Message.sendMsg` → `Message.sendMessage`.
 
-`grep -rn 'mention.all' modules/` confirms only one match in production code — and it's a comment in `modules/robot/event.go:154` logging the field, plus `modules/message/api_reminders.go` *consuming* `mention.all=1` (post-fanout, to create reminders). Neither produces the field.
+`grep -rn 'mention.all' modules/` confirms two non-test consumers: log line at `robot/event.go:154` (debug-only field logging) + reminder check at `api_reminders.go:283-294` (`getReminders` consumes `mention.all=1` post-fanout to create per-user reminders). Neither produces the field.
 
 ---
 
-## 2. All `ctx.SendMessage()` call sites (36)
+## 2. All `ctx.SendMessage()` call sites (34)
 
 Grouped by module. ★ = entry that can carry **client-supplied** payload (and therefore potential `mention.all=1`); rest are server-internal system messages with hard-coded payload.
 
 | Module | File:line | Caller | Payload origin | Goes through `Message.sendMessage()` chokepoint? |
 |--------|-----------|--------|----------------|--------------------------------------------------|
 | message | `modules/message/api.go:450` | `Message.sendMessage` ★ | **client (via `sendMsg`)** | ✅ **IS the chokepoint** |
-| message | `modules/message/api_manager.go:843` | `Manager.sendMsg` (super-admin) | client (admin-only) | ❌ separate `/v1/manager` route, **no SpaceMiddleware**, but already uses `enrichPayloadWithSpaceIDCore` — adding a `rewriteDeadMentionAll` mirror here is cheap |
-| message | `modules/message/api_manager.go:98` | `Manager.sendMessageToFriends` | hardcoded `{content,type:1}` | ❌ no mention |
-| message | `modules/message/api_manager.go:739` | `Manager.sendMessageToAll` | hardcoded `{content,type:1}` | ❌ no mention |
+| message | `modules/message/api_manager.go:843` | `Manager.sendMsg` (super-admin) | hardcoded `{content, type:1, from_uid}`, no mention pass-through | ❌ separate `/v1/manager` route, **no SpaceMiddleware**; server hand-builds the payload from `managerSendMsgReq` (which only carries `Content`/`Sender`/etc., never `mention.*`) — cannot emit `mention.all` |
 | message | `modules/message/api_pinned.go:282` | pinned-message Tip | hardcoded | ❌ no mention |
 | message | `modules/message/event.go:307` | QR-scan join Tip | hardcoded | ❌ no mention |
 | bot_api | `modules/bot_api/threads.go:336` | `sendThreadMdNotification` | server-built `{uids}` | ❌ no `.all` |
@@ -69,14 +67,14 @@ Grouped by module. ★ = entry that can carry **client-supplied** payload (and t
 | notify | `modules/notify/api.go:269` | system notification DM | hardcoded | ❌ no mention |
 | space | `modules/space/api.go:1554,1580` | Space invite system DM | hardcoded | ❌ no mention |
 
-**Plus 4 `SendMessageWithResult` and 2 `SendMessageBatch` sites** — none take client-supplied mention.
+**Plus 4 `SendMessageWithResult` and 2 `SendMessageBatch` sites** — none take client-supplied mention. (The two `SendMessageBatch` sites are `Manager.sendMessageToFriends` at `api_manager.go:98` and `Manager.sendMessageToAll` at `api_manager.go:739` — both hardcoded `{content, type:1}`, no mention field.)
 
 ### Matrix conclusion
 
-- Only **2 entries** route client-supplied payload (and therefore could carry `mention.all`) to WuKongIM:
+- Only **1 entry** routes client-supplied payload (and therefore could carry `mention.all`) to WuKongIM:
   - `POST /v1/message/send` → `Message.sendMsg` → `Message.sendMessage()` ★ — **the chokepoint already exists**.
-  - `POST /v1/manager/...` super-admin `Manager.sendMsg` → calls `m.ctx.SendMessage()` directly, bypassing the message-module chokepoint but already shares `enrichPayloadWithSpaceIDCore`.
-- All 34 remaining `ctx.SendMessage` sites build payload server-side with hard-coded `mention.uids` (or no mention at all). They are not in scope for the dead-field rewrite.
+- The super-admin `POST /v1/manager/message/send` → `Manager.sendMsg` route also calls `m.ctx.SendMessage()` directly, but the handler hand-builds the payload as `{content, type:1, from_uid}` from `managerSendMsgReq` (no `mention` field at all) — so it cannot emit `mention.all` and needs no rewrite.
+- All 33 remaining `ctx.SendMessage` sites build payload server-side with hard-coded `mention.uids` (or no mention at all). They are not in scope for the dead-field rewrite.
 
 ---
 
@@ -84,7 +82,7 @@ Grouped by module. ★ = entry that can carry **client-supplied** payload (and t
 
 | Candidate | Location | Coverage of client `mention.all` flows | Pros | Cons | Verdict |
 |-----------|----------|----------------------------------------|------|------|---------|
-| **A. `Message.sendMessage()`** (`modules/message/api.go:442`) | octo-server, in message module | ✅ catches `POST /v1/message/send` (the only client-facing entry that actually carries `mention.all`); ✅ same kind of payload-rewrite precedent already lives one line above (`enrichPayloadWithSpaceID`); ❌ misses `Manager.sendMsg` (low-risk: super-admin) and robot webhook (no `mention.all` schema) | Minimal blast radius. Single-file diff. Easy to test. Matches established hardening pattern. | Need a 1-line mirror in `Manager.sendMsg` if we want 100% coverage of the super-admin path. | ⭐ **Recommended primary** |
+| **A. `Message.sendMessage()`** (`modules/message/api.go:442`) | octo-server, in message module | ✅ catches `POST /v1/message/send` (the only client-facing entry that actually carries `mention.all`); ✅ same kind of payload-rewrite precedent already lives one line above (`enrichPayloadWithSpaceID`); ❌ does not run for robot webhook (separate schema, no `mention.all`) | Minimal blast radius. Single-file diff. Easy to test. Matches established hardening pattern. | — (super-admin `Manager.sendMsg` doesn't need a mirror: its handler hand-builds `{content, type:1, from_uid}` with no `mention` field) | ⭐ **Recommended primary** |
 | **B. `Context.SendMessage()`** (octo-lib `config/msg.go:130`) | upstream module `github.com/Mininglamp-OSS/octo-lib` | ✅ blanket coverage of all 36 in-tree sites + every downstream octo-lib consumer (adapters, octo-deployment scripts) | True backstop. Catches even payloads built by future code we haven't audited. | ❌ Requires releasing a new octo-lib version (release lag, version-bump cascade). ❌ Crosses the architectural boundary — payload semantics belong to octo-server, not the transport layer. ❌ Over-broad: rewrites system messages that never had a mention field. ❌ Hard to feature-flag per-deployment. | 🚫 **Reject** — wrong layer, wrong release cadence |
 | **C. `Message.messageEdit()`** (`modules/message/api.go:610`) | octo-server, message module | ❌ messageEdit only writes `messageExtraDB.content_edit` and emits `CMDSyncMessageExtra` — it does NOT re-fan-out a new payload through `ctx.SendMessage`. No `mention.all` ever gets re-evaluated by the adapter via this path. | n/a | Wrong target entirely — there's no fan-out to intercept. | 🚫 **Reject** — non-issue, see §4 risk #3 below |
 
@@ -93,7 +91,7 @@ Grouped by module. ★ = entry that can carry **client-supplied** payload (and t
 | Flow | Caught by (A) sendMessage | Caught by (B) ctx.SendMessage | Caught by (C) messageEdit |
 |------|---------------------------|-------------------------------|---------------------------|
 | Client `POST /v1/message/send` | ✅ | ✅ | n/a |
-| Super-admin `POST /v1/manager/*` | ❌ (add 1-line mirror) | ✅ | n/a |
+| Super-admin `POST /v1/manager/*` | n/a — handler hardcodes `{content, type:1, from_uid}`, no `mention` field possible | n/a | n/a |
 | Server-built `*MdNotification` (uids only) | n/a | ✅ (no-op rewrite) | n/a |
 | Reply enrichment with stale `mention.all` snapshot | ❌ | ❌ | ❌ — read-path, not write-path; see §4 #1 |
 | Mergeforward nested `messages[].mention.all` | ❌ | ❌ | ❌ — adapter `isMentioned` only inspects outer payload; see §4 #2 |
@@ -126,8 +124,8 @@ Grouped by module. ★ = entry that can carry **client-supplied** payload (and t
 - **Action**: skip. If product wants edited-payload mention scrubbing for forensic correctness, add later.
 
 ### 4.4 New / not-listed risks discovered during audit
-- **Super-admin `/v1/manager/sendMsg`**: bypasses `Message.sendMessage()`. Today it carries no `mention.all` in known callers, but the route accepts arbitrary `Payload map[string]interface{}` from the admin UI. Add a 1-line mirror of `rewriteDeadMentionAll` for symmetry — already touches the same payload right next to `enrichPayloadWithSpaceIDCore` at `api_manager.go:835-842`.
-- **Robot webhook responses** (`modules/robot/event.go:131,342`): payload comes from external robot HTTP webhook body, not user client. Schema does not include `mention.all` in our current robot contract. Out of scope; flag as a follow-up if 3rd-party robots are later allowed to set arbitrary mention.
+- **Super-admin `/v1/manager/message/send`**: bypasses `Message.sendMessage()` but **needs no rewrite**. The handler (`Manager.sendMsg` at `api_manager.go:760-843`) hand-builds the outbound payload as `{content: req.Content, type: 1, from_uid: req.Sender}` — the `managerSendMsgReq` schema only exposes `Content`/`Sender`/`ReceivedChannelID`/`ReceivedChannelType`, so no `mention.*` field can ever flow through this path. No `rewriteDeadMentionAll` mirror is required.
+- **Robot webhook — friend-tip / command-reply sends from `robotMessageListen`** (`modules/robot/event.go:131,342`): payload comes from external robot HTTP webhook body, not user client. Schema does not include `mention.all` in our current robot contract. Out of scope; flag as a follow-up if 3rd-party robots are later allowed to set arbitrary mention.
 - **`listenerMessages` → `getReminders`**: this is the **consumer** of `mention.all` (`modules/message/api_reminders.go:283`). After 方案 X rewrites outbound payload to `mention.humans=1`, this code path stops generating "[有人@我]" group-wide reminders for newly-sent messages. **This is a behavior change requiring a parallel update**: either teach `getReminders` to also recognize `mention.humans=1` as @all-equivalent, or accept the product change (no more "@all generates a reminder for everyone"). Flag explicitly to product before merging方案 X.
 
 ---
@@ -137,11 +135,13 @@ Grouped by module. ★ = entry that can carry **client-supplied** payload (and t
 Single repo: `Mininglamp-OSS/octo-server`. No octo-lib bump, no adapter changes (adapter `ignoreMentionAll` already shipped in 0.6.3 stays).
 
 ### PR #1 — server-side `mention.all` → `mention.humans` rewrite (this audit's target)
-**Touched files** (3 production + 1 test):
+**Touched files** (2 production + 1 test):
 1. `modules/message/api.go` — add `rewriteDeadMentionAll(payload)` helper and call it inside `sendMessage()` right after `enrichPayloadWithSpaceID(...)` (line ~449). ~20 LOC including doc comment.
-2. `modules/message/api_manager.go` — call the same helper inside `Manager.sendMsg` adjacent to existing `enrichPayloadWithSpaceIDCore` block (line ~842). ~1 LOC.
-3. `modules/message/api_reminders.go` — extend `getMention` to also treat `mention.humans=1` as the @all-equivalent so reminder-generation behavior is preserved post-rewrite. ~5 LOC.
-4. `modules/message/api_test.go` (or a new `rewrite_dead_mention_all_test.go`) — table-driven tests for: `mention.all=1` → rewritten; `mention.all=0` → untouched; absent → untouched; mixed `all` + `uids` → uids preserved; non-map mention → untouched.
+2. `modules/message/api_reminders.go` — extend `getMention` to also treat `mention.humans=1` as the @all-equivalent so reminder-generation behavior is preserved post-rewrite. ~5 LOC.
+3. `modules/message/api_test.go` (or a new `rewrite_dead_mention_all_test.go`) — table-driven tests for: `mention.all=1` → rewritten; `mention.all=0` → untouched; absent → untouched; mixed `all` + `uids` → uids preserved; non-map mention → untouched; **v2 mention with `entities` — rewrite must not corrupt or drop `mention.entities`** (cross-reference `modules/message/validation_test.go:885-928`).
+
+**Explicitly NOT touched**:
+- `modules/message/api_manager.go` — `Manager.sendMsg` hand-builds `{content, type:1, from_uid}` from `managerSendMsgReq`; no `mention.*` field flows through this path, so the rewrite is a no-op and is omitted.
 
 **Do NOT touch**:
 - octo-lib (`Context.SendMessage`) — wrong layer.
@@ -155,6 +155,30 @@ Single repo: `Mininglamp-OSS/octo-server`. No octo-lib bump, no adapter changes 
 
 ### PR #3 (optional follow-up) — adapter cleanup
 - Once PR #1 has been live for N weeks and metrics show zero `mention.all=1` on the wire, retire the adapter `ignoreMentionAll` shim from 0.6.3. Separate repo, separate cadence.
+
+---
+
+## 6. Downstream consumer prerequisite (BLOCKING)
+
+方案 X 的 server-side rewrite (`mention.all=1` → `mention.humans=1`) 隐含假设所有下游 consumer 已经识别 `mention.humans=1`。审计本 PR 时只确认了 octo-server 内部 reminder consumer（§5 step 2 已含），但**未验证以下下游**：
+
+| Consumer | 当前状态 | 影响 |
+|---|---|---|
+| octo-server reminder (`api_reminders.go:283`) | ❌ 不认 | §5 step 2 解决 ✅ |
+| dmwork-adapters | ✅ `ignoreMentionAll` (0.6.3) 只 drop all 不 interpret humans → bot 不被触发，符合预期 | bot 静默是想要的，无问题 |
+| dmwork-web / android / ios 渲染 | ❌ **未审计** | 收到 `mention.humans=1` 可能渲染为普通文本，丢失 @所有人 蓝色 pill |
+| 离线推送 (FCM/APNs/HMS push) | ❌ **未审计** | 可能丢失"@你"重要推送音 |
+| 第三方 bot/集成 | ❌ **未审计** | 接口契约变更 |
+
+**结论**：在三端客户端读侧支持 `mention.humans=1` 之前，server-side rewrite 会导致新发送的 @所有人 消息出现 UX 退化（pill 消失）。
+
+### 推荐执行顺序
+
+**Phase 1（前置）**：三端客户端读侧支持 `mention.humans=1` 渲染为「@所有人」蓝色 pill（**不改发送侧**）。发版覆盖率达 80%+ 后才进 Phase 2。
+
+**Phase 2（本 PR follow-up）**：octo-server 上 `rewriteDeadMentionAll` + reminder 教学。
+
+**Phase 3（可选）**：三端发送侧切换 humans（有 server rewrite 后非必须）。
 
 ---
 
