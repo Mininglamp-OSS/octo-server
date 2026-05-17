@@ -136,6 +136,9 @@ func New(ctx *config.Context) *User {
 	// 但实际逻辑落在 *User 上（依赖 execLogin / createUserWithRespAndTx 等私有方法）。
 	if svc, ok := u.userService.(*Service); ok {
 		svc.SetExternalLoginHandler(u)
+		// 同款反向注入:VerifyPasswordByUID / Send|VerifyOIDCBindSMS 都依赖
+		// *User 私有的 loginGuard / smsServie / db.QueryByUID,Service 持不到。
+		svc.SetOIDCBindHandler(u)
 	}
 
 	return u
