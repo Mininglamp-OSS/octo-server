@@ -29,12 +29,25 @@ type systemSettingUpdateReq struct {
 }
 
 // systemSettingItemResp is one entry in the GET response.
+//
+// Field semantics:
+//   - Configured: true iff the DB row exists for this (category, key). The
+//     admin UI uses this to distinguish "explicitly set" from "using default".
+//   - Value: the DB-stored value, or "" if not configured. For encrypted
+//     types this is the secretMask placeholder whenever a non-empty
+//     ciphertext is stored; cleartext is never returned.
+//   - EffectiveValue: the value currently in effect after applying the
+//     DB → yaml → code-default fallback chain. For encrypted types this is
+//     secretMask whenever the effective plaintext is non-empty (whether the
+//     source is DB or yaml), and "" otherwise. Plaintext is NEVER returned.
 type systemSettingItemResp struct {
-	Category    string `json:"category"`
-	Key         string `json:"key"`
-	Value       string `json:"value"`
-	ValueType   string `json:"value_type"`
-	Description string `json:"description"`
+	Category       string `json:"category"`
+	Key            string `json:"key"`
+	Configured     bool   `json:"configured"`
+	Value          string `json:"value"`
+	EffectiveValue string `json:"effective_value"`
+	ValueType      string `json:"value_type"`
+	Description    string `json:"description"`
 }
 
 // systemSettingSchemaResp is the schema metadata surfaced to the admin UI.
@@ -93,15 +106,32 @@ func (m *Manager) listSystemSettings(c *wkhttp.Context) {
 			Description: def.Description,
 		}
 		if row, ok := stored[schemaKey(def.Category, def.Key)]; ok {
+			// A row exists. Configured tracks whether the DB explicitly holds a
+			// value — an empty Value means "DB row present but cleared back to
+			// yaml default" (see TestManagerSystemSetting_BoolEmptyValueResetsToYaml),
+			// so we still mark Configured=false in that case.
+			item.Configured = row.Value != ""
 			if def.Type == settingTypeEncrypted {
-				// Encrypted columns are returned as a mask whenever a value
-				// is stored. Empty stored value is reported as empty so the
-				// UI can render "not configured" rather than masked-empty.
 				if row.Value != "" {
 					item.Value = secretMask
 				}
 			} else {
 				item.Value = row.Value
+			}
+		}
+
+		// EffectiveValue resolves DB → yaml → code default through the typed
+		// getters bound on the schema entry. Encrypted plaintext is replaced
+		// with secretMask before serialisation — a yaml SMTP password must
+		// never leak through this endpoint.
+		if def.Effective != nil {
+			effective := def.Effective(m.systemSettings)
+			if def.Type == settingTypeEncrypted {
+				if effective != "" {
+					item.EffectiveValue = secretMask
+				}
+			} else {
+				item.EffectiveValue = effective
 			}
 		}
 		items = append(items, item)

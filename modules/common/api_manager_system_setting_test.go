@@ -41,8 +41,115 @@ func TestManagerSystemSetting_GetReturnsSchemaAndMaskedSecrets(t *testing.T) {
 	assert.Contains(t, body, `"register"`)
 	assert.Contains(t, body, `"email_on"`)
 	assert.Contains(t, body, `"items":`)
+	assert.Contains(t, body, `"configured"`, "GET must report whether each setting is explicitly configured")
+	assert.Contains(t, body, `"effective_value"`, "GET must report the effective (DB→yaml→default) value")
 	assert.NotContains(t, body, "super-secret", "encrypted values must NEVER be returned in cleartext")
 	assert.Contains(t, body, "****", "encrypted columns must be masked")
+}
+
+// GET must return:
+//   - configured=true + value=DB value for explicitly configured rows
+//   - configured=false + value="" for unconfigured rows
+//   - effective_value reflecting DB → yaml → code-default for every row
+//   - encrypted plaintext (from yaml or DB) is masked, never leaked
+func TestManagerSystemSetting_GetReturnsEffectiveValues(t *testing.T) {
+	t.Setenv(masterKeyEnv, "0123456789abcdef0123456789abcdef")
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	require.NoError(t, ctx.Cache().Set(
+		ctx.GetConfig().Cache.TokenCachePrefix+testutil.Token,
+		testutil.UID+"@test@"+string(wkhttp.SuperAdmin),
+	))
+
+	// Mutate via the singleton's captured ctx — see the BoolEmptyValueResetsToYaml
+	// test for the test-infra rationale.
+	settings := EnsureSystemSettings(ctx)
+	cfg := settings.ctx.GetConfig()
+	origRegEmailOn := cfg.Register.EmailOn
+	origRegOff := cfg.Register.Off
+	origSupportEmail := cfg.Support.Email
+	origSupportPwd := cfg.Support.EmailPwd
+	t.Cleanup(func() {
+		cfg.Register.EmailOn = origRegEmailOn
+		cfg.Register.Off = origRegOff
+		cfg.Support.Email = origSupportEmail
+		cfg.Support.EmailPwd = origSupportPwd
+	})
+	// yaml provides defaults the DB will not override.
+	cfg.Register.EmailOn = true
+	cfg.Register.Off = false
+	cfg.Support.Email = "yaml-default@example.com"
+	cfg.Support.EmailPwd = "yaml-fallback-secret"
+
+	// DB explicitly overrides one bool and one string.
+	db := newSystemSettingDB(ctx)
+	require.NoError(t, db.upsert("register", "email_on", "0", settingTypeBool, ""))
+	require.NoError(t, db.upsert("support", "email_smtp", "smtp.db:587", settingTypeString, ""))
+	require.NoError(t, settings.Reload())
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/manager/common/system_setting", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var resp struct {
+		Items []struct {
+			Category       string `json:"category"`
+			Key            string `json:"key"`
+			Configured     bool   `json:"configured"`
+			Value          string `json:"value"`
+			EffectiveValue string `json:"effective_value"`
+			ValueType      string `json:"value_type"`
+		} `json:"items"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+
+	byKey := map[string]struct {
+		Configured     bool
+		Value          string
+		EffectiveValue string
+	}{}
+	for _, it := range resp.Items {
+		byKey[it.Category+"."+it.Key] = struct {
+			Configured     bool
+			Value          string
+			EffectiveValue string
+		}{it.Configured, it.Value, it.EffectiveValue}
+	}
+
+	// DB-overridden bool: configured + DB value wins.
+	got := byKey["register.email_on"]
+	assert.True(t, got.Configured, "DB row present → configured=true")
+	assert.Equal(t, "0", got.Value)
+	assert.Equal(t, "0", got.EffectiveValue, "DB override 0 must be the effective value")
+
+	// Unconfigured bool: falls back to yaml.
+	got = byKey["register.off"]
+	assert.False(t, got.Configured)
+	assert.Equal(t, "", got.Value)
+	assert.Equal(t, "0", got.EffectiveValue, "yaml false → effective_value=\"0\"")
+
+	// Unconfigured string: yaml default surfaces in effective_value.
+	got = byKey["support.email"]
+	assert.False(t, got.Configured)
+	assert.Equal(t, "", got.Value)
+	assert.Equal(t, "yaml-default@example.com", got.EffectiveValue)
+
+	// DB-overridden string.
+	got = byKey["support.email_smtp"]
+	assert.True(t, got.Configured)
+	assert.Equal(t, "smtp.db:587", got.Value)
+	assert.Equal(t, "smtp.db:587", got.EffectiveValue)
+
+	// Encrypted with only a yaml fallback: effective_value must be masked,
+	// plaintext must never appear in the body.
+	got = byKey["support.email_pwd"]
+	assert.False(t, got.Configured, "no DB row → configured=false")
+	assert.Equal(t, "", got.Value, "no DB row → value empty (not masked)")
+	assert.Equal(t, "****", got.EffectiveValue, "yaml-backed secret must surface as mask")
+	assert.NotContains(t, w.Body.String(), "yaml-fallback-secret",
+		"encrypted yaml plaintext must NEVER leak through GET")
 }
 
 func TestManagerSystemSetting_UpdateRequiresSuperAdmin(t *testing.T) {
