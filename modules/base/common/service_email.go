@@ -31,8 +31,8 @@ type IEmailService interface {
 	SendHTMLEmail(ctx context.Context, to, subject, htmlBody string) error
 	// SendTransactionalHTML 发送一封带 plaintext 兜底 + 标准事务邮件 header 的邮件。
 	// 收件方反垃圾过滤对极简 HTML-only 事务邮件常常静默丢弃；这条路径包成
-	// multipart/alternative,补上 Date / Message-ID / Auto-Submitted / Precedence
-	// / List-Unsubscribe,显著降低被丢的概率。
+	// multipart/alternative,补上 Date / Message-ID / Auto-Submitted /
+	// List-Unsubscribe 等 header,显著降低被丢的概率。
 	SendTransactionalHTML(ctx context.Context, to, subject, htmlBody, plainBody string) error
 }
 
@@ -132,8 +132,10 @@ func (s *EmailService) SendHTMLEmail(ctx context.Context, to, subject, htmlBody 
 //
 // 与 SendHTMLEmail 的区别:
 //   - 包成 multipart/alternative,plaintext + HTML 双版本
-//   - 补 Date / Message-ID / Auto-Submitted / Precedence / List-Unsubscribe 等
-//     反垃圾过滤期望看到的事务邮件特征
+//   - 补 Date / Message-ID / Auto-Submitted / List-Unsubscribe 等反垃圾过滤
+//     期望看到的事务邮件特征(故意不发 Precedence: bulk,详见 buildTransactional
+//     Message 中的注释 —— 部分 MTA 会把它解释成"不要生成退信",跟本路径用于
+//     诊断的目的相反)
 //
 // 经验验证:阿里云 SMTP → mininglamp.com 这条链路,只发极简 HTML 单一部分
 // (~300 字节)的测试邮件会被收件方静默丢弃,既不入收件箱也不入垃圾夹也
