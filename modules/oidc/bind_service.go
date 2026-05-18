@@ -189,7 +189,7 @@ func (s *BindService) SendSMS(ctx context.Context, jti string) error {
 	}
 	zone, phone := extractZone(claims.PhoneNumber), extractPhone(claims.PhoneNumber)
 	if !claims.PhoneVerified || phone == "" {
-		return errors.New("oidc bind SendSMS: claims has no verified phone")
+		return ErrBindNoPhone
 	}
 	if _, err := s.store.IncrAndCheck(ctx,
 		"bind:otpsend:"+jti, s.cfg.OTPSendMax, s.cfg.TokenTTL); err != nil {
@@ -216,7 +216,7 @@ func (s *BindService) VerifySMS(ctx context.Context, jti, code string) error {
 	}
 	zone, phone := extractZone(claims.PhoneNumber), extractPhone(claims.PhoneNumber)
 	if !claims.PhoneVerified || phone == "" {
-		return errors.New("oidc bind VerifySMS: claims has no verified phone")
+		return ErrBindNoPhone
 	}
 	if _, err := s.store.IncrAndCheck(ctx,
 		"bind:verify:"+jti, s.cfg.VerifyMax, s.cfg.TokenTTL); err != nil {

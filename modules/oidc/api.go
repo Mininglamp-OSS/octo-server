@@ -82,6 +82,7 @@ type OIDC struct {
 	worker     *SyncWorker
 	tickLock   *RedisTickLock
 	cbGuard    *CallbackGuard
+	bind       *BindService // 自助绑定(P0);Bind.Enabled=false 时为 nil,handler 不挂载
 
 	// verification 由 Init() 注入(user.IService 的子集),OIDC callback 拿到 IdP
 	// identity_verification claims 后调用 UpsertVerificationFromOIDC 写 user_verification。
@@ -179,6 +180,17 @@ func (o *OIDC) Init() error {
 		o.verification = userSvc
 	}
 
+	// 自助绑定(P0):Bind.Enabled=true 时构造 BindService + 注入 user.IService。
+	// Bind.Enabled=false 时 o.bind=nil,bindRoutes 不挂任何路由(零生产影响)。
+	// PR4 才在 callback 失败分支真接管。
+	if o.cfg.Bind.Enabled {
+		bindStore := newRedisBindStore(o.ctx)
+		// userSvc 已经实现 BindAuthenticator(三个方法在 user.IService 内),
+		// Go 鸭子类型直接传即可。BindLocator 用 oidc.DB 适配:复用同一连接池。
+		locator := dbBindLocator{db: o.db}
+		o.bind = newBindService(o.cfg.Bind, bindStore, userSvc, locator)
+	}
+
 	// SyncWorker:Aegis 侧账号状态变更(封号/改密/登出)→ DMWork 主动感知。
 	// Interval=0 视为禁用,适合本地开发 / DB 还没准备好 RT 行的早期阶段。
 	if o.cfg.Provider.SyncInterval > 0 && o.db != nil && o.killer != nil {
@@ -242,6 +254,9 @@ func (o *OIDC) routeAt(r *wkhttp.WKHttp, pathID string) {
 	pub.GET("/callback", o.callback)
 	authed := r.Group(base, o.ctx.AuthMiddleware(r))
 	authed.POST("/logout", o.logout)
+	// 自助绑定(P0):Bind.Enabled=false 时 bindRoutes 自身 no-op,生产路径完
+	// 全不挂这些 endpoint;true 时挂 4 个 bind/* 端点,callback 接管由 PR4 引入。
+	o.bindRoutes(pub)
 }
 
 func (o *OIDC) disabled(c *wkhttp.Context) {

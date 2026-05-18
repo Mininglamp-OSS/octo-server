@@ -52,6 +52,11 @@ var (
 	ErrBindNotFound       = errors.New("oidc: bind session not found or expired")
 	ErrBindStatusConflict = errors.New("oidc: bind status transition conflict")
 	ErrBindRateLimited    = errors.New("oidc: bind rate limit exceeded")
+	// ErrBindNoPhone claims 里没有可信手机号(空 / phone_verified=false),
+	// 短信路径(SendSMS / VerifySMS)不可用 —— FR-3.3。
+	// 与"SMSService 内部失败"区分,让 handler 把前者翻 400(业务前提不满足,
+	// 客户端不应当 retry),后者翻 500(基础设施异常,可重试)。
+	ErrBindNoPhone = errors.New("oidc: bind claims has no verified phone")
 )
 
 // ---------- memory impl (单测 + 本地开发) ----------
