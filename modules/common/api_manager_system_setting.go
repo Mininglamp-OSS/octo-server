@@ -303,17 +303,136 @@ func (m *Manager) testSystemSettingEmail(c *wkhttp.Context) {
 	}
 
 	emailSvc := commonbase.NewEmailService(m.ctx, m.systemSettings)
-	if err := emailSvc.SendHTMLEmail(
+	// Pre-send log:遇到「投出去但收件人没收到」时,这条记录至少证明 endpoint
+	// 走到了发送阶段,排查时可以直接对比 SMTP 服务器 sent log;同时把当前
+	// effective 的发件人 / 服务器记下来,方便确认 DB override 与 yaml fallback
+	// 的最终生效值,避免再去 GET /system_setting 二次核对。
+	m.Info("SMTP 测试邮件已尝试投递",
+		zap.String("to", req.To),
+		zap.String("from", m.systemSettings.SupportEmail()),
+		zap.String("smtp", m.systemSettings.SupportEmailSmtp()))
+
+	if err := emailSvc.SendTransactionalHTML(
 		c.Request.Context(),
 		req.To,
-		"Octo SMTP 测试邮件",
-		`<p>这是一封来自 Octo 管理后台的测试邮件。如果你收到了它，说明 SMTP 配置正常。</p>`,
+		smtpTestEmailSubject,
+		smtpTestEmailHTML,
+		smtpTestEmailPlain,
 	); err != nil {
-		c.ResponseError(fmt.Errorf("发送失败: %w", err))
+		// 错误内文(SMTP 服务器返回码、host:port、TLS 握手细节)留在服务端
+		// 日志,不回客户端;avoid leaking infra detail to the admin UI 即使
+		// 调用方是 SuperAdmin,降低 HAR 抓包外流时的信息量。
+		m.Error("SMTP 测试邮件投递失败",
+			zap.String("to", req.To),
+			zap.String("from", m.systemSettings.SupportEmail()),
+			zap.String("smtp", m.systemSettings.SupportEmailSmtp()),
+			zap.Error(err))
+		c.ResponseError(errors.New("发送失败，请查看服务端日志"))
 		return
 	}
+	m.Info("SMTP 测试邮件已交付 SMTP 服务器", zap.String("to", req.To))
 	c.ResponseOK()
 }
+
+// SMTP 测试邮件的标题 / HTML / plaintext 模板。
+//
+// 设计取舍:把 v5 富版本内联在这里 —— 而不是抽到 modules/base/common —— 因为
+// 内容("自检结果 / 请勿回复")是这条 admin endpoint 自己的语义,base 层只
+// 负责 SMTP 投递的基础设施。SendTransactionalHTML 会负责包 multipart +
+// 加事务邮件 header,本处不再操心这些。
+//
+// HTML 用 inline CSS + <table> 布局,确保在 Outlook / 网易/腾讯邮箱客户端
+// 等对 <style> 块支持差的客户端上也能正常渲染;字体栈带 PingFang SC /
+// Microsoft YaHei,保证中英文同字号视觉一致。
+//
+// plaintext 是 RFC 2046 要求的 alternative,反垃圾过滤器把"是否提供
+// plain"作为 transactional vs spam 的关键打分项;不是给"看不懂 HTML 的
+// 收件人"准备的,是给打分器看的。
+const smtpTestEmailSubject = "[Octo] SMTP 配置自检 · SMTP Configuration Test"
+
+const smtpTestEmailPlain = `Octo SMTP 配置自检 · SMTP Configuration Test
+============================================
+
+[ 自动邮件 · 请勿回复 / Automated · Do Not Reply ]
+
+✓ SMTP 主机连接正常        Host connection OK
+✓ 发信凭据有效              Credentials valid
+✓ 反垃圾策略通过            Anti-spam check passed
+
+如果您收到了这封邮件，说明 Octo 系统的 SMTP 配置一切正常，无需任何操作。
+If you received this, your SMTP setup is working. No action needed.
+
+——
+Octo System Notification · Octo 系统通知
+`
+
+const smtpTestEmailHTML = `<!doctype html>
+<html lang="zh-CN">
+<body style="margin:0; padding:0; background:#f3f4f6; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', Roboto, sans-serif; color:#1f2937; line-height:1.6;">
+  <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="background:#f3f4f6; padding:32px 16px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="560" style="max-width:560px; background:#ffffff; border-radius:12px; box-shadow:0 1px 3px rgba(0,0,0,0.06); overflow:hidden;">
+          <tr>
+            <td style="padding:32px 32px 8px;">
+              <h1 style="margin:0; font-size:22px; font-weight:600; color:#111827; letter-spacing:-0.01em;">Octo SMTP 配置自检</h1>
+              <div style="margin-top:4px; font-size:13px; color:#6b7280;">SMTP Configuration Test</div>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:16px 32px 0;">
+              <div style="background:#fef3c7; border-left:3px solid #f59e0b; padding:10px 14px; border-radius:4px; font-size:13px; color:#78350f;">
+                <strong>自动邮件 · 请勿回复</strong> &nbsp;<span style="color:#92400e;">Automated · Do Not Reply</span>
+              </div>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:20px 32px 0;">
+              <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="border:1px solid #e5e7eb; border-radius:8px;">
+                <tr>
+                  <td style="padding:12px 16px; border-bottom:1px solid #f3f4f6;">
+                    <span style="display:inline-block; width:20px; color:#10b981; font-weight:700;">&#10003;</span>
+                    <span style="font-size:15px; color:#111827;">SMTP 主机连接正常</span>
+                    <span style="float:right; font-size:13px; color:#6b7280;">Host connection OK</span>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding:12px 16px; border-bottom:1px solid #f3f4f6;">
+                    <span style="display:inline-block; width:20px; color:#10b981; font-weight:700;">&#10003;</span>
+                    <span style="font-size:15px; color:#111827;">发信凭据有效</span>
+                    <span style="float:right; font-size:13px; color:#6b7280;">Credentials valid</span>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding:12px 16px;">
+                    <span style="display:inline-block; width:20px; color:#10b981; font-weight:700;">&#10003;</span>
+                    <span style="font-size:15px; color:#111827;">反垃圾策略通过</span>
+                    <span style="float:right; font-size:13px; color:#6b7280;">Anti-spam check passed</span>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:20px 32px 24px;">
+              <p style="margin:0 0 8px; font-size:14px; color:#374151;">如果您收到了这封邮件，说明 Octo 系统的 SMTP 配置一切正常，无需任何操作。</p>
+              <p style="margin:0; font-size:13px; color:#6b7280;">If you received this, your SMTP setup is working. No action needed.</p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:16px 32px 24px; border-top:1px solid #f3f4f6;">
+              <div style="font-size:12px; color:#9ca3af;">
+                Octo System Notification &middot; Octo 系统通知
+              </div>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+`
 
 // jsonH is a tiny alias for inline JSON payloads. We define a local alias
 // instead of importing gin.H to keep the surface visible at the call site.

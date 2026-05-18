@@ -2,8 +2,10 @@ package common
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -27,6 +29,11 @@ type IEmailService interface {
 	Verify(ctx context.Context, email, code string, codeType CodeType) error
 	// SendHTMLEmail 发送一封 HTML 邮件（不走频率限制 / 验证码缓存，由调用方自己控制）
 	SendHTMLEmail(ctx context.Context, to, subject, htmlBody string) error
+	// SendTransactionalHTML 发送一封带 plaintext 兜底 + 标准事务邮件 header 的邮件。
+	// 收件方反垃圾过滤对极简 HTML-only 事务邮件常常静默丢弃；这条路径包成
+	// multipart/alternative,补上 Date / Message-ID / Auto-Submitted / Precedence
+	// / List-Unsubscribe,显著降低被丢的概率。
+	SendTransactionalHTML(ctx context.Context, to, subject, htmlBody, plainBody string) error
 }
 
 // SMTPSettingsProvider exposes the admin-tunable SMTP config to EmailService
@@ -110,6 +117,10 @@ func (s *EmailService) SendVerifyCode(ctx context.Context, email string, codeTyp
 //
 // ctx 的 deadline 会传递到 SMTP 层（dial / 投递阶段）；调用方设的 ctx 比
 // SMTP 默认超时（dial 15s + IO 60s）更紧时，会真正生效。
+//
+// 内容仅含 text/html 单一部分,header 也只补 From/To/Subject/MIME-Version/
+// Content-Type。短 HTML 事务邮件容易被收件方反垃圾静默丢弃 —— 自检/状态类
+// 邮件请改用 SendTransactionalHTML,带 plaintext 兜底和完整事务邮件 header。
 func (s *EmailService) SendHTMLEmail(ctx context.Context, to, subject, htmlBody string) error {
 	if to == "" {
 		return errors.New("收件人不能为空")
@@ -117,61 +128,153 @@ func (s *EmailService) SendHTMLEmail(ctx context.Context, to, subject, htmlBody 
 	return s.sendEmail(ctx, to, subject, htmlBody)
 }
 
-// sendEmail 通过SMTP发送邮件（支持SSL端口465和STARTTLS端口587）。
-// ctx 的 deadline 会被注入到 dial 和 conn.SetDeadline；ctx 无 deadline 时
-// 退化到 smtpDialTimeout / smtpIOTimeout 默认值。
-func (s *EmailService) sendEmail(ctx context.Context, to, subject, body string) error {
-	smtpAddr, from, pwd := s.resolveSMTP()
+// SendTransactionalHTML 发送带 plaintext 兜底 + 标准事务邮件 header 的邮件。
+//
+// 与 SendHTMLEmail 的区别:
+//   - 包成 multipart/alternative,plaintext + HTML 双版本
+//   - 补 Date / Message-ID / Auto-Submitted / Precedence / List-Unsubscribe 等
+//     反垃圾过滤期望看到的事务邮件特征
+//
+// 经验验证:阿里云 SMTP → mininglamp.com 这条链路,只发极简 HTML 单一部分
+// (~300 字节)的测试邮件会被收件方静默丢弃,既不入收件箱也不入垃圾夹也
+// 不退信;同样的链路、同样的凭据,改成 multipart/alternative + 标准 header
+// (~2KB) 后能正常入箱。该方法把这套包装内化,所有"系统自检 / 邀请 / 通知"
+// 类事务邮件应该走这条路径。
+//
+// plainBody 必须由调用方提供(避免依赖脆弱的"从 HTML strip 标签"启发式)。
+// htmlBody 为空时,plaintext 仍会被发出(降级体验,但通路工作)。
+func (s *EmailService) SendTransactionalHTML(ctx context.Context, to, subject, htmlBody, plainBody string) error {
+	if to == "" {
+		return errors.New("收件人不能为空")
+	}
+	smtpAddr, fromAddr, pwd := s.resolveSMTP()
+	if smtpAddr == "" || fromAddr == "" || pwd == "" {
+		return errors.New("邮件服务未配置，请联系管理员")
+	}
+	toSan, fromSan, subjectSan := sanitizeHeader(to), sanitizeHeader(fromAddr), sanitizeHeader(subject)
+	msg, err := buildTransactionalMessage(fromSan, toSan, subjectSan, htmlBody, plainBody)
+	if err != nil {
+		return err
+	}
+	return s.dispatchSMTP(ctx, smtpAddr, fromSan, pwd, toSan, msg)
+}
 
-	if smtpAddr == "" || from == "" || pwd == "" {
+// sendEmail 通过SMTP发送简单的 text/html 单一部分邮件。
+// 用于验证码 / 兼容旧调用方;新通知类邮件请用 SendTransactionalHTML。
+func (s *EmailService) sendEmail(ctx context.Context, to, subject, body string) error {
+	smtpAddr, fromAddr, pwd := s.resolveSMTP()
+
+	if smtpAddr == "" || fromAddr == "" || pwd == "" {
 		return errors.New("邮件服务未配置，请联系管理员")
 	}
 
-	host, port, err := net.SplitHostPort(smtpAddr)
-	if err != nil {
-		return fmt.Errorf("smtp地址格式错误: %w", err)
-	}
+	toSan, fromSan, subjectSan := sanitizeHeader(to), sanitizeHeader(fromAddr), sanitizeHeader(subject)
 
-	auth := smtp.PlainAuth("", from, pwd, host)
-
-	// Sanitize header fields to prevent CRLF injection.
-	// An attacker could inject "Bcc: hacker@evil.com" via \r\n in to/subject.
-	sanitize := func(s string) string {
-		s = strings.ReplaceAll(s, "\r", "")
-		s = strings.ReplaceAll(s, "\n", "")
-		return s
-	}
-	to = sanitize(to)
-	subject = sanitize(subject)
-	from = sanitize(from)
-
-	msg := "From: " + from + "\r\n" +
-		"To: " + to + "\r\n" +
-		"Subject: " + subject + "\r\n" +
+	msg := "From: " + fromSan + "\r\n" +
+		"To: " + toSan + "\r\n" +
+		"Subject: " + subjectSan + "\r\n" +
 		"MIME-Version: 1.0\r\n" +
 		"Content-Type: text/html; charset=UTF-8\r\n" +
 		"\r\n" +
 		body + "\r\n"
 
+	return s.dispatchSMTP(ctx, smtpAddr, fromSan, pwd, toSan, []byte(msg))
+}
+
+// sanitizeHeader 清除 \r / \n,防止 CRLF 注入攻击者构造 "Bcc: hacker@evil.com"
+// 等额外 header。所有用作 SMTP header 字段或 envelope (MAIL FROM / RCPT TO) 的
+// 字符串都必须先过这里。
+func sanitizeHeader(s string) string {
+	s = strings.ReplaceAll(s, "\r", "")
+	s = strings.ReplaceAll(s, "\n", "")
+	return s
+}
+
+// buildTransactionalMessage 拼一份 multipart/alternative 报文,内含两段标准
+// 事务邮件特征 header。boundary 用随机串避免与 body 字面冲突。
+//
+// 设计取舍:把模板字符串内联放在这里而不是模板文件,因为这是 SMTP 层基础
+// 设施,完全不参与产品 UI;调用方传入的 htmlBody / plainBody 才是内容。
+func buildTransactionalMessage(fromSan, toSan, subjectSan, htmlBody, plainBody string) ([]byte, error) {
+	boundaryBytes := make([]byte, 8)
+	if _, err := rand.Read(boundaryBytes); err != nil {
+		return nil, fmt.Errorf("生成 multipart boundary 失败: %w", err)
+	}
+	boundary := "octo_" + hex.EncodeToString(boundaryBytes)
+
+	msgIDBytes := make([]byte, 12)
+	if _, err := rand.Read(msgIDBytes); err != nil {
+		return nil, fmt.Errorf("生成 Message-ID 失败: %w", err)
+	}
+	// Message-ID 的 domain 部分用 From 地址的域名,跟 SPF 校验对齐。
+	domain := "octo.local"
+	if at := strings.LastIndex(fromSan, "@"); at >= 0 && at < len(fromSan)-1 {
+		domain = fromSan[at+1:]
+	}
+	messageID := fmt.Sprintf("<%s@%s>", hex.EncodeToString(msgIDBytes), domain)
+
+	headers := []string{
+		"From: " + fromSan,
+		"To: " + toSan,
+		"Subject: " + subjectSan,
+		"Date: " + time.Now().UTC().Format(time.RFC1123Z),
+		"Message-ID: " + messageID,
+		"MIME-Version: 1.0",
+		`Content-Type: multipart/alternative; boundary="` + boundary + `"`,
+		"List-Unsubscribe: <mailto:" + fromSan + "?subject=unsubscribe>",
+		"List-Unsubscribe-Post: List-Unsubscribe=One-Click",
+		"X-Mailer: Octo Transactional Mailer",
+		"Auto-Submitted: auto-generated",
+		"Precedence: bulk",
+	}
+
+	var b strings.Builder
+	for _, h := range headers {
+		b.WriteString(h)
+		b.WriteString("\r\n")
+	}
+	b.WriteString("\r\n")
+	// plaintext part (RFC 2046: 多个 alternative 时,*先*放最简单的格式,*后*放最丰富的;
+	// 兼容性最差的客户端只会渲染第一个能识别的)。
+	b.WriteString("--" + boundary + "\r\n")
+	b.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
+	b.WriteString("Content-Transfer-Encoding: 8bit\r\n\r\n")
+	b.WriteString(plainBody)
+	b.WriteString("\r\n")
+	// html part
+	b.WriteString("--" + boundary + "\r\n")
+	b.WriteString("Content-Type: text/html; charset=UTF-8\r\n")
+	b.WriteString("Content-Transfer-Encoding: 8bit\r\n\r\n")
+	b.WriteString(htmlBody)
+	b.WriteString("\r\n")
+	b.WriteString("--" + boundary + "--\r\n")
+	return []byte(b.String()), nil
+}
+
+// dispatchSMTP 跑完一次 SMTP 投递:dial → (STARTTLS) → AUTH → MAIL → RCPT →
+// DATA → QUIT。fromSan / toSan 必须已经过 sanitizeHeader。
+func (s *EmailService) dispatchSMTP(ctx context.Context, smtpAddr, fromSan, pwd, toSan string, msg []byte) error {
+	host, port, err := net.SplitHostPort(smtpAddr)
+	if err != nil {
+		return fmt.Errorf("smtp地址格式错误: %w", err)
+	}
+	auth := smtp.PlainAuth("", fromSan, pwd, host)
+
 	dialer := &net.Dialer{Timeout: smtpDialTimeout}
 	var conn net.Conn
 	if port == "465" {
-		// 端口 465：直连 SSL/TLS。
 		tlsDialer := &tls.Dialer{NetDialer: dialer, Config: &tls.Config{ServerName: host}}
 		conn, err = tlsDialer.DialContext(ctx, "tcp", smtpAddr)
 		if err != nil {
 			return fmt.Errorf("TLS连接失败: %w", err)
 		}
 	} else {
-		// 端口 25 / 587：明文连接，连接后再 STARTTLS。
 		conn, err = dialer.DialContext(ctx, "tcp", smtpAddr)
 		if err != nil {
 			return fmt.Errorf("SMTP 连接失败: %w", err)
 		}
 	}
 	defer conn.Close()
-	// ctx 设了 deadline 就用它；否则退化到 smtpIOTimeout。
-	// 这一行是上限保险——dispatchInviteEmail 给的 30s ctx 会真正约束整个会话。
 	if d, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(d)
 	} else {
@@ -192,7 +295,7 @@ func (s *EmailService) sendEmail(ctx context.Context, to, subject, body string) 
 		}
 	}
 
-	return runSMTPTransaction(client, auth, from, to, []byte(msg))
+	return runSMTPTransaction(client, auth, fromSan, toSan, msg)
 }
 
 // runSMTPTransaction 跑完一次 SMTP 投递：Auth → Mail → Rcpt → Data → Quit。
