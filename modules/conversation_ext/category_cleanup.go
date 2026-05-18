@@ -29,11 +29,10 @@ func UnfollowGroupsTx(tx *dbr.Tx, uid, spaceID string, groupNos []string) error 
 		}); err != nil {
 			return fmt.Errorf("UnfollowGroupsTx upsert group %q: %w", groupNo, err)
 		}
-		prefix := escapeLike(groupNo) + escapeLike(threadSeparator) + "%"
 		if _, err := tx.DeleteBySql(
 			"DELETE FROM "+table+
 				" WHERE uid=? AND space_id=? AND target_type=? AND target_id LIKE ? ESCAPE '|'",
-			uid, spaceID, targetTypeThread, prefix,
+			uid, spaceID, targetTypeThread, threadLikePrefix(groupNo),
 		).Exec(); err != nil {
 			return fmt.Errorf("UnfollowGroupsTx delete threads for %q: %w", groupNo, err)
 		}

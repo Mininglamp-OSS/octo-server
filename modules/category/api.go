@@ -337,9 +337,11 @@ func (c *Category) delete(ctx *wkhttp.Context) {
 	defer tx.RollbackUnlessCommitted()
 
 	// 1. 把分组标记为已删除。
+	// AND uid=? 是防御性过滤——上层 cat.UID != loginUID 检查已能挡住越权，
+	// 这里再加一道，避免将来调用方绕过 ownership 检查时仍能误改他人分组。
 	if _, err = tx.Update("group_category").
 		Set("status", 2).
-		Where("category_id=?", categoryID).
+		Where("category_id=? AND uid=?", categoryID, loginUID).
 		Exec(); err != nil {
 		c.Error("删除类别失败", zap.Error(err))
 		ctx.ResponseError(errors.New("删除类别失败"))
@@ -347,9 +349,13 @@ func (c *Category) delete(ctx *wkhttp.Context) {
 	}
 
 	// 2. 采集该分组下用户名下的群编号列表（在解绑前先读，否则丢失对应关系）。
+	// FOR UPDATE 锁住目标 group_setting 行：本路径走 group_setting → version → ext
+	// 的锁序，moveGroupToCategory 也是同向；不加锁的话同用户并发 move/delete 时
+	// 会出现 G1 既被移到新分组又被标记 group_unfollowed=1 的不一致状态
+	// （PR #74 review by yujiawei P1）。
 	var groupNos []string
 	if _, err = tx.SelectBySql(
-		"SELECT group_no FROM group_setting WHERE category_id=? AND uid=?",
+		"SELECT group_no FROM group_setting WHERE category_id=? AND uid=? FOR UPDATE",
 		categoryID, loginUID,
 	).Load(&groupNos); err != nil {
 		c.Error("查询分组下群列表失败", zap.Error(err))

@@ -231,6 +231,9 @@ func TestCategory_Delete(t *testing.T) {
 	assert.Nil(t, setting.CategoryID) // category_id should be nil after delete
 
 	// 删除分组应同时取消关注分组下的群（退订语义，前端已提示用户）。
+	// 该 ext 行在 delete 之前并不存在——moveGroupToCategory 不会预先 seed
+	// user_conversation_ext，而是 delete 中 UnfollowGroupsTx 的 upsert 写出来的。
+	// 若将来改成"不再为仅退订的群创建 ext 行"（例如改成软标记），需同步调整这条断言。
 	var groupUnfollowed int
 	_, err = f.db.session.SelectBySql(
 		"SELECT group_unfollowed FROM user_conversation_ext"+
