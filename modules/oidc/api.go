@@ -84,6 +84,10 @@ type OIDC struct {
 	tickLock   *RedisTickLock
 	cbGuard    *CallbackGuard
 	bind       *BindService // 自助绑定(P0);Bind.Enabled=false 时为 nil,handler 不挂载
+	// bindStore 单独持引用便于 Close 时关连接池。bind.store 是 BindStore 接口,
+	// 接口本身没 Close,production impl(*redisBindStore)有独立 redis.Client,
+	// 不关会泄漏。
+	bindStore BindStore
 
 	// verification 由 Init() 注入(user.IService 的子集),OIDC callback 拿到 IdP
 	// identity_verification claims 后调用 UpsertVerificationFromOIDC 写 user_verification。
@@ -187,11 +191,11 @@ func (o *OIDC) Init() error {
 		return fmt.Errorf("oidc: Init: %w", err)
 	}
 	if o.cfg.Bind.Enabled {
-		bindStore := newRedisBindStore(o.ctx)
+		o.bindStore = newRedisBindStore(o.ctx)
 		// userSvc 已经实现 BindAuthenticator(三个方法在 user.IService 内),
 		// Go 鸭子类型直接传即可。BindLocator 用 oidc.DB 适配:复用同一连接池。
 		locator := dbBindLocator{db: o.db}
-		o.bind = newBindService(o.cfg.Bind, bindStore, userSvc, locator)
+		o.bind = newBindService(o.cfg.Bind, o.bindStore, userSvc, locator)
 		// Confirm 路径需要 identity 写入 + IssueSession 签发,复用 *Service 已经
 		// 持有的 store(identityStore) 和 users(userLookup)。两者都在 newService
 		// 内完成构造,Init 顺序保证 o.service 此时非 nil。
@@ -731,6 +735,14 @@ func (o *OIDC) Close() error {
 			o.Error("关闭 OIDC sync tick lock 失败", zap.Error(err))
 		}
 		o.tickLock = nil
+	}
+	// bindStore 独立 redis.Client(与 stateStore 同模式),Bind.Enabled=true
+	// 时由 Init 创建。优雅退出/Discovery 失败兜底清理都要关,否则 fd 泄漏。
+	if rbs, ok := o.bindStore.(*redisBindStore); ok {
+		if err := rbs.Close(); err != nil {
+			o.Error("关闭 OIDC bind store 失败", zap.Error(err))
+		}
+		o.bindStore = nil
 	}
 	if o.stateStore == nil {
 		return nil

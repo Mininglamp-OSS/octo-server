@@ -238,6 +238,10 @@ func (o *OIDC) handleBindVerifyErr(c *wkhttp.Context, path, token string, err er
 	case errors.Is(err, ErrBindConflictNeedManual):
 		// 多 dmwork 账号对应同 phone:自助流程无法判定,提示走 Admin 兜底。
 		c.AbortWithStatusJSON(http.StatusConflict, errMsg("multiple accounts matched; contact support"))
+	case errors.Is(err, ErrBindNoPhone):
+		// claims 无 phone 但客户端硬调 /verify/otp/check —— 业务前提不满足。
+		// metric (bindResultFromErr) 已归到 bad_request,HTTP 同步 400 保持一致。
+		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("sms not available for this account"))
 	case errors.Is(err, ErrBindAuthRejected):
 		// 业务拒绝(密码错 / OTP 错 / phone 不命中):统一 401 防账号枚举。
 		// 具体 reason 走 zap,客户端只看到通用文案。

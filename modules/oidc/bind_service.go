@@ -165,7 +165,9 @@ func (s *BindService) VerifyPassword(ctx context.Context, jti, identifier, passw
 	}
 	if uid == "" {
 		// 不暴露"用户存在 vs 密码错"差异(SR-6 反账号枚举)。上层统一兜底文案。
-		return errors.New("oidc bind VerifyPassword: account or password invalid")
+		// wrap ErrBindAuthRejected → handler 翻 401(与密码错路径一致),
+		// 避免归到 internal_error metric 污染告警。
+		return fmt.Errorf("oidc bind VerifyPassword: %w (unknown identifier)", ErrBindAuthRejected)
 	}
 	matched, reason, aerr := s.auth.VerifyPasswordByUID(ctx, uid, password)
 	if aerr != nil {
@@ -253,7 +255,10 @@ func (s *BindService) VerifySMS(ctx context.Context, jti, code string) error {
 	}
 	switch len(uids) {
 	case 0:
-		return errors.New("oidc bind VerifySMS: no dmwork user matches claims phone")
+		// 老用户没有匹配的 dmwork phone 记录(脏数据/历史未补全)。
+		// 业务可预期场景,wrap ErrBindAuthRejected → handler 翻 401 + 通用文案,
+		// 不归 internal_error。引导走 FR-7 "联系管理员"兜底。
+		return fmt.Errorf("oidc bind VerifySMS: %w (no dmwork user matches claims phone)", ErrBindAuthRejected)
 	case 1:
 		sess.CandidateUID = uids[0]
 	default:

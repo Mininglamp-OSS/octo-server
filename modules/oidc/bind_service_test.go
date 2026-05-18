@@ -659,6 +659,31 @@ func TestBindService_VerifyPassword_InfraErrorNotSentinel(t *testing.T) {
 // 真实的 BindReason* 常量(那些定义在 user 包,oidc 测试不该跨包依赖)。
 func BindReasonForTest(s string) string { return s }
 
+// TestBindService_VerifyPassword_UnknownIdentifierWrapsAuthRejected 锁定 #1 修复:
+// locator 没找到 uid 时返回的错误必须 wrap ErrBindAuthRejected,handler 才会
+// 翻 401(不是 500),metric 才会落 unauthorized(不是 internal_error)。
+func TestBindService_VerifyPassword_UnknownIdentifierWrapsAuthRejected(t *testing.T) {
+	h := newBindHarness(t)
+	// 不预置 byUsername["ghost"],locator 返 "", nil
+	jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	err := h.svc.VerifyPassword(context.Background(), jti, "ghost", "x")
+	if !errors.Is(err, ErrBindAuthRejected) {
+		t.Fatalf("unknown identifier must wrap ErrBindAuthRejected (handler -> 401, metric -> unauthorized), got %v", err)
+	}
+}
+
+// TestBindService_VerifySMS_NoPhoneMatchWrapsAuthRejected 锁定 #2 修复:
+// claims phone 没匹配到 dmwork user 时返 ErrBindAuthRejected,而不是普通 error。
+func TestBindService_VerifySMS_NoPhoneMatchWrapsAuthRejected(t *testing.T) {
+	h := newBindHarness(t)
+	// 不预置 byPhone -> 返空切片
+	jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	err := h.svc.VerifySMS(context.Background(), jti, "1234")
+	if !errors.Is(err, ErrBindAuthRejected) {
+		t.Fatalf("0-phone-match must wrap ErrBindAuthRejected, got %v", err)
+	}
+}
+
 // TestBindService_Confirm_RateLimited 每 jti confirm 计数走 ConfirmMax,
 // 即便 verified 状态没真正消费,过阈值也直接拒(挡攻击者反复 confirm 试探
 // downstream issue session 异常)。
