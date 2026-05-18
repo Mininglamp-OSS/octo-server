@@ -3,6 +3,7 @@ package group
 import (
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/stretchr/testify/assert"
 )
@@ -25,6 +26,7 @@ func TestQueryIsGroupManagerOrCreator_ExternalMemberFailSafe(t *testing.T) {
 		UID:        "internal-creator",
 		Role:       MemberRoleCreator,
 		IsExternal: 0,
+		Status:     int(common.GroupMemberStatusNormal),
 		Version:    1,
 	})
 	assert.NoError(t, err)
@@ -35,6 +37,7 @@ func TestQueryIsGroupManagerOrCreator_ExternalMemberFailSafe(t *testing.T) {
 		UID:        "external-dirty-manager",
 		Role:       MemberRoleManager,
 		IsExternal: 1,
+		Status:     int(common.GroupMemberStatusNormal),
 		Version:    2,
 	})
 	assert.NoError(t, err)
@@ -45,6 +48,7 @@ func TestQueryIsGroupManagerOrCreator_ExternalMemberFailSafe(t *testing.T) {
 		UID:        "external-dirty-creator",
 		Role:       MemberRoleCreator,
 		IsExternal: 1,
+		Status:     int(common.GroupMemberStatusNormal),
 		Version:    3,
 	})
 	assert.NoError(t, err)
@@ -55,6 +59,7 @@ func TestQueryIsGroupManagerOrCreator_ExternalMemberFailSafe(t *testing.T) {
 		UID:        "common-member",
 		Role:       MemberRoleCommon,
 		IsExternal: 0,
+		Status:     int(common.GroupMemberStatusNormal),
 		Version:    4,
 	})
 	assert.NoError(t, err)
