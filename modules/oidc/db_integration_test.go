@@ -318,3 +318,43 @@ func TestDB_InsertAudit_Integration(t *testing.T) {
 		TraceID: "trace-1",
 	}))
 }
+
+// TestDB_UkUidIssuer_RejectsDuplicate_Integration 锁定迁移
+// 20260515000001_oidc_bind_uniques.sql 引入的 uk_uid_issuer 行为:
+//   - 同 (uid, issuer) 第二次插入(sub 不同)必须被 DB 唯一约束拒绝
+//   - 同 uid 跨不同 issuer 仍允许(多 IdP 绑定保留)
+//
+// 这是 OIDC 自助绑定 P0 FR-5.3 / SR-5 的硬保证 —— confirm 路径上层应用
+// 的 CAS 是次要防护,DB 约束才是兜底。
+func TestDB_UkUidIssuer_RejectsDuplicate_Integration(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	d := NewDB(ctx)
+
+	require.NoError(t, d.InsertIdentity(&IdentityModel{
+		UID: "u-uk", Issuer: "https://idp-a", Subject: "sub-1", LinkedAt: time.Now(),
+	}))
+
+	// 同 uid 同 issuer + 不同 sub: 必须被 uk_uid_issuer 拒绝,
+	// 而不是被 uk_issuer_subject(那条约束只看 issuer+subject)误判通过。
+	err := d.InsertIdentity(&IdentityModel{
+		UID: "u-uk", Issuer: "https://idp-a", Subject: "sub-2", LinkedAt: time.Now(),
+	})
+	require.Error(t, err, "duplicate (uid, issuer) must be rejected")
+	assert.True(t, isDuplicateKeyError(err),
+		"expected MySQL 1062 duplicate-key, got %v", err)
+	// 断言具体约束名,避免未来引入别的 unique key 时误判通过 ——
+	// MySQL 1062 错误消息携带 key 名,例如:
+	//   "Duplicate entry 'u-uk-https://idp-a' for key 'user_oidc_identity.uk_uid_issuer'"
+	assert.Contains(t, err.Error(), "uk_uid_issuer",
+		"rejection must come from uk_uid_issuer, not another constraint")
+
+	// 同 uid + 不同 issuer 允许(同一用户绑多个 IdP)
+	require.NoError(t, d.InsertIdentity(&IdentityModel{
+		UID: "u-uk", Issuer: "https://idp-b", Subject: "sub-3", LinkedAt: time.Now(),
+	}))
+
+	rows, err := d.QueryIdentitiesByUID("u-uk")
+	require.NoError(t, err)
+	assert.Len(t, rows, 2)
+}

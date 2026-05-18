@@ -33,6 +33,9 @@ var providerIDRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
 type Config struct {
 	Enabled  bool
 	Provider ProviderConfig
+	// Bind 自助绑定子配置(P0)。Bind.Enabled 独立于 Config.Enabled,允许
+	// "OIDC 主流程开但 bind 灰度未开" 的中间态(NFR-5)。
+	Bind BindConfig
 }
 
 // ProviderConfig 单个 OIDC Provider 配置
@@ -89,6 +92,9 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("oidc: load provider: %w", err)
 	}
 	cfg.Provider = p
+	// Bind 子配置纯 env,无 required 校验;Enabled=false 时其他字段不参与
+	// 任何 runtime 决策(由 oidc/api.go 的 cfg.Bind.Enabled 分支兜底)。
+	cfg.Bind = loadBindConfig()
 	return cfg, nil
 }
 

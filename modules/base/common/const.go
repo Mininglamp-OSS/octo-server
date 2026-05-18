@@ -15,6 +15,9 @@ const (
 	// DestroyAccount 注销账号
 	CodeTypeDestroyAccount
 	CodeTypeEmailLogin
+	// CodeTypeOIDCBind OIDC 自助绑定 OTP。单独 keyspace 避免与
+	// register/login/forget-pwd 等流程的 SMS 计数器串扰。
+	CodeTypeOIDCBind
 )
 
 const (

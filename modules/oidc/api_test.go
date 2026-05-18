@@ -768,6 +768,166 @@ func TestAPI_Callback_UserInfoFailure_NonBlocking(t *testing.T) {
 	}
 }
 
+// TestAPI_Callback_TakesOverWithBindEnabled PR4 callback 接管端到端:
+//   - AllowNewUser=false 让 ResolveOrLink autolink 全失败时返 ErrUnknownUser
+//   - Bind.Enabled=true + issuer 在 allowlist
+//   - 应:302 跳 BindRedirectBase, query 含 token + authcode + return_to
+//   - 不应:写 LoginRespJSON / "0" 到 ThirdAuthcode
+func TestAPI_Callback_TakesOverWithBindEnabled(t *testing.T) {
+	mp := NewMockProvider(t)
+	// sub-newcomer 没有任何 dmwork 用户 + email/phone 也不命中 → autolink 全失败
+	mp.PrepUser("sub-newcomer", map[string]interface{}{
+		"email":          "nobody@example.com",
+		"email_verified": true,
+		"name":           "Newcomer",
+	})
+
+	users := &fakeUserLookup{} // 默认空 byEmail/byPhone
+	store := newFakeIdentityStore()
+	o := newTestOIDC(t, mp, users, store)
+	// 必须 AllowNewUser=false 才会 returnEr UnknownUser(否则 AllowNewUser=true 路径建新用户)。
+	// newTestOIDC 在构造 service 时按值捕获 cfg.Provider,所以这里改完要重建 service。
+	o.cfg.Provider.AllowNewUser = false
+	o.service = newService(o.cfg.Provider, store, users)
+	// 装 bind + 配置
+	o.cfg.Bind = BindConfig{
+		Enabled:         true,
+		IssuerAllowlist: []string{mp.Issuer},
+		TokenTTL:        time.Minute,
+		VerifyMax:       5, OTPSendMax: 3, ConfirmMax: 3, UIDFailPerDay: 10,
+		Methods:      []BindMethod{BindMethodPassword, BindMethodSMSOTP},
+		RedirectBase: "https://im.example.com/oidc/bind",
+	}
+	o.bind = newBindService(o.cfg.Bind, newMemoryBindStore(), &fakeBindAuth{}, &fakeBindLocator{
+		byUsername: map[string]string{}, byPhone: map[string][]string{},
+	})
+	fakeAC := newFakeAuthcode()
+	o.authcode = fakeAC
+	r := newTestRouter(o)
+
+	req := httptest.NewRequest("GET",
+		"/v1/auth/oidc/aegis/authorize?authcode=front-bind&return_to=/home", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	authURL, _ := url.Parse(w.Header().Get("Location"))
+	state := authURL.Query().Get("state")
+	mp.PrepCode("idp-code", "sub-newcomer", authURL.Query().Get("nonce"))
+
+	req2 := httptest.NewRequest("GET",
+		"/v1/auth/oidc/aegis/callback?state="+state+"&code=idp-code", nil)
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, req2)
+
+	if w2.Code != http.StatusFound {
+		t.Fatalf("callback status=%d body=%s", w2.Code, w2.Body.String())
+	}
+	loc := w2.Header().Get("Location")
+	if !strings.HasPrefix(loc, "https://im.example.com/oidc/bind?") {
+		t.Fatalf("expected redirect to bind page, got %q", loc)
+	}
+	u, _ := url.Parse(loc)
+	q := u.Query()
+	if q.Get("token") == "" {
+		t.Errorf("redirect missing token param: %q", loc)
+	}
+	if q.Get("authcode") != "front-bind" {
+		t.Errorf("redirect authcode=%q want front-bind", q.Get("authcode"))
+	}
+	// LoginRespJSON / "0" 都不该出现 —— bind 还没完成
+	if got := fakeAC.get("front-bind"); got != "" {
+		t.Errorf("ThirdAuthcode must NOT be set during bind takeover, got %q", got)
+	}
+	if len(users.loginCalls) != 0 {
+		t.Errorf("IssueSession must NOT be called during bind takeover, got %d calls", len(users.loginCalls))
+	}
+}
+
+// TestAPI_Callback_BindFlagOffPreservesLegacy NFR-6 可回滚:Bind.Enabled=false
+// 时 callback 行为与 PR3 之前完全一致 —— autolink 失败仍走 failWithAuthcode("0"),
+// 不会触发任何 bind 逻辑。
+func TestAPI_Callback_BindFlagOffPreservesLegacy(t *testing.T) {
+	mp := NewMockProvider(t)
+	mp.PrepUser("sub-newcomer", map[string]interface{}{
+		"email": "nobody@example.com", "email_verified": true,
+	})
+	users := &fakeUserLookup{}
+	store := newFakeIdentityStore()
+	o := newTestOIDC(t, mp, users, store)
+	o.cfg.Provider.AllowNewUser = false
+	o.service = newService(o.cfg.Provider, store, users)
+	o.cfg.Bind = BindConfig{Enabled: false} // 显式关
+	fakeAC := newFakeAuthcode()
+	o.authcode = fakeAC
+	r := newTestRouter(o)
+
+	req := httptest.NewRequest("GET",
+		"/v1/auth/oidc/aegis/authorize?authcode=ac-legacy&return_to=/home", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	authURL, _ := url.Parse(w.Header().Get("Location"))
+	state := authURL.Query().Get("state")
+	mp.PrepCode("idp-code", "sub-newcomer", authURL.Query().Get("nonce"))
+
+	req2 := httptest.NewRequest("GET",
+		"/v1/auth/oidc/aegis/callback?state="+state+"&code=idp-code", nil)
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, req2)
+
+	// 旧行为:回 return_to + oidc_error=1
+	if loc := w2.Header().Get("Location"); !strings.Contains(loc, "oidc_error=1") {
+		t.Fatalf("flag off must preserve legacy fail path, redirect=%q", loc)
+	}
+	if got := fakeAC.get("ac-legacy"); got != "0" {
+		t.Fatalf("flag off must write \"0\" to ThirdAuthcode, got %q", got)
+	}
+}
+
+// TestAPI_Callback_BindIssuerNotAllowed Bind.Enabled=true 但 issuer 不在 allowlist
+// 时,callback 仍走旧失败路径(灰度精确控制)。
+func TestAPI_Callback_BindIssuerNotAllowed(t *testing.T) {
+	mp := NewMockProvider(t)
+	mp.PrepUser("sub-newcomer", map[string]interface{}{
+		"email": "nobody@example.com", "email_verified": true,
+	})
+	users := &fakeUserLookup{}
+	store := newFakeIdentityStore()
+	o := newTestOIDC(t, mp, users, store)
+	o.cfg.Provider.AllowNewUser = false
+	o.service = newService(o.cfg.Provider, store, users)
+	// issuer = mp.Issuer,但 allowlist 故意只放 "https://other"
+	o.cfg.Bind = BindConfig{
+		Enabled:         true,
+		IssuerAllowlist: []string{"https://other"},
+		TokenTTL:        time.Minute,
+		RedirectBase:    "https://im.example.com/oidc/bind",
+		Methods:         []BindMethod{BindMethodPassword},
+	}
+	o.bind = newBindService(o.cfg.Bind, newMemoryBindStore(), &fakeBindAuth{}, &fakeBindLocator{})
+	fakeAC := newFakeAuthcode()
+	o.authcode = fakeAC
+	r := newTestRouter(o)
+
+	req := httptest.NewRequest("GET",
+		"/v1/auth/oidc/aegis/authorize?authcode=ac-deny&return_to=/home", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	authURL, _ := url.Parse(w.Header().Get("Location"))
+	state := authURL.Query().Get("state")
+	mp.PrepCode("idp-code", "sub-newcomer", authURL.Query().Get("nonce"))
+
+	req2 := httptest.NewRequest("GET",
+		"/v1/auth/oidc/aegis/callback?state="+state+"&code=idp-code", nil)
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, req2)
+
+	if loc := w2.Header().Get("Location"); !strings.Contains(loc, "oidc_error=1") {
+		t.Fatalf("issuer not in allowlist must use legacy fail, redirect=%q", loc)
+	}
+	if got := fakeAC.get("ac-deny"); got != "0" {
+		t.Fatalf("ThirdAuthcode must be \"0\", got %q", got)
+	}
+}
+
 // /userinfo 返回 sub 与 ID Token sub 不一致,视为账号串台,直接拒绝登录。
 // 这是关键安全分支:防止 confused deputy 攻击。
 func TestAPI_Callback_UserInfoSubMismatch_Rejects(t *testing.T) {

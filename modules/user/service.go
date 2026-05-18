@@ -99,10 +99,69 @@ type IService interface {
 	// 负责判断 IsVerified / LegalName 非空 — 本方法再做一次防御式校验,空则 no-op。
 	// verifiedProvider 必须在 allowlist 白名单内(cas/wecom/feishu),否则返错不写。
 	UpsertVerificationFromOIDC(ctx context.Context, uid string, claims OIDCVerificationClaims) error
+
+	// VerifyPasswordByUID 给 OIDC 自助绑定流程做账号密码二次验证(需求 FR-3.1)。
+	//
+	// 与 username 登录路径同款的 bcrypt/MD5 兼容 + loginGuard 反爆破,但走独立
+	// 计数维度 ("oidc-bind:"+uid),避免与登录失败计数互相串扰。已注销/封号账号
+	// 视为不可用。
+	//
+	// 三种返回组合(任一其它组合都是 bug,调用方可断言):
+	//   - (true,  "",        nil)   密码正确且账号可用 → 推进绑定流程
+	//   - (false, BindReason*, nil) 业务拒绝 → 计入审计,前端按 reason 显示文案
+	//                                **(false, "", nil) 视为非法返回**,调用方应当
+	//                                以基础设施异常处理(等同 err != nil)
+	//   - (false, "",        err)   基础设施异常 / 调用方 contract 违反(如空 uid)
+	//                                → 前端走兜底页 + 运维告警,不计审计失败计数
+	//
+	// reason 取值见 BindReason* 常量。
+	//
+	// 内部委托给 *User 实现,需通过 (*Service).SetOIDCBindHandler 注入;
+	// 未注入时返回 ErrOIDCBindNotConfigured。
+	VerifyPasswordByUID(ctx context.Context, uid, password string) (matched bool, reason string, err error)
+
+	// SendOIDCBindSMS 向给定手机号发送 OIDC 绑定 OTP(需求 FR-3.3)。
+	//
+	// **调用方(oidc 模块)负责保证 zone/phone 来自 OIDC claims 的
+	// phone_number/phone_number_verified,不接受用户输入** —— 否则攻击者
+	// 可用自己手机绑别人 sub。本方法仅做信道分发,不做来源校验。
+	//
+	// keyspace 隔离边界(踩坑勘误):
+	//   - 验证码本身 (CacheKeySMSCode) 按 codeType 分桶 —— OIDC bind 流程的
+	//     OTP 不会被其他流程的验证码覆盖,也不会覆盖别人;
+	//   - **但底层 SMSService 的"sms_rate_limit:zone@phone"(1min 发送频率)、
+	//     "sms_verify_lock:zone@phone"(10min 失败锁定)、"sms_verify_fail:..."
+	//     三个 key 都不带 codeType,跨流程共享**。后果:
+	//       a. 用户刚走过 register/forget-pwd SMS 流程,1min 内进 OIDC bind
+	//          会被 "发送过于频繁" 挡住;
+	//       b. OIDC bind 路径连续输错 3 次,该手机号其他 SMS 流程一并被
+	//          锁 10min。
+	//   - bind_token 维度的"OTP 发送 ≤ 3 次"(SR-2.1)由 oidc 模块的
+	//     BindStore.IncrAndCheck 单独兜底,与本层无关。
+	SendOIDCBindSMS(ctx context.Context, zone, phone string) error
+
+	// VerifyOIDCBindSMS 与 SendOIDCBindSMS 对称,复用底层 SMSService.Verify 的
+	// 锁定/重试限制。**注意 lock/failCount key 同样不带 codeType,跨流程共享**,
+	// 详见 SendOIDCBindSMS 注释。
+	VerifyOIDCBindSMS(ctx context.Context, zone, phone, code string) error
 }
 
 // ErrExternalLoginNotConfigured 外部登录未注入 handler（通常是单测中未走 user.New 完整初始化）
 var ErrExternalLoginNotConfigured = errors.New("user: external login handler not configured")
+
+// ErrOIDCBindNotConfigured OIDC 自助绑定 handler 未注入(同 ErrExternalLoginNotConfigured
+// 的故障模式:测试或部署时未完整走 user.New 初始化)。
+var ErrOIDCBindNotConfigured = errors.New("user: oidc bind handler not configured")
+
+// VerifyPasswordByUID 返回的 reason 枚举。typed const 而非 magic string,既能
+// 让调用方 switch-case 时被 govet 检出拼写错误,也作为"matched=false 时
+// reason 必非空"不变式的可枚举值集合。
+const (
+	BindReasonRateLimited      = "rate_limited"      // loginGuard 阈值已到,本次未走密码比对
+	BindReasonUserNotFound     = "user_not_found"    // uid 不存在,前端应统一兜底"账号或密码错误"避免枚举
+	BindReasonUserUnavailable  = "user_unavailable"  // 账号已注销或被封禁
+	BindReasonPasswordMismatch = "password_mismatch" // 密码错误
+)
 
 // externalLoginHandler 由 *User 实现,Service 通过 SetExternalLoginHandler 后注入。
 //
@@ -110,6 +169,17 @@ var ErrExternalLoginNotConfigured = errors.New("user: external login handler not
 // *User 的构造已依赖 IService（u.userService = NewService(ctx)）,反向再依赖会成环。
 type externalLoginHandler interface {
 	LoginByExternalIdentity(ctx context.Context, req ExternalLoginReq) (*ExternalLoginResp, error)
+}
+
+// oidcBindHandler OIDC 自助绑定流程所需的 *User 内部能力子集:
+// 密码二次验证 + 短信 OTP 发送/校验。复用 *User 已持有的 loginGuard / smsServie。
+//
+// 反向依赖注入(同 externalLoginHandler 模式):*User.New 构造时已经持 IService,
+// 想从 Service 调到 *User 的私有字段必须靠注入,直接 import 会成环。
+type oidcBindHandler interface {
+	VerifyPasswordByUID(ctx context.Context, uid, password string) (matched bool, reason string, err error)
+	SendOIDCBindSMS(ctx context.Context, zone, phone string) error
+	VerifyOIDCBindSMS(ctx context.Context, zone, phone, code string) error
 }
 
 // Service Service
@@ -123,6 +193,7 @@ type Service struct {
 	onetimePrekeysDB *onetimePrekeysDB
 	onlineService    *OnlineService
 	extLogin         externalLoginHandler
+	bindHandler      oidcBindHandler
 	verificationDB   *verificationDB
 }
 
@@ -131,12 +202,42 @@ func (s *Service) SetExternalLoginHandler(h externalLoginHandler) {
 	s.extLogin = h
 }
 
+// SetOIDCBindHandler 注入 OIDC 自助绑定 handler(在 user.New 内部调用,
+// 生产路径下保证非空)。未注入时三个 OIDC 绑定方法返回 ErrOIDCBindNotConfigured。
+func (s *Service) SetOIDCBindHandler(h oidcBindHandler) {
+	s.bindHandler = h
+}
+
 // LoginByExternalIdentity 委托给已注入的 handler。未注入时返回 ErrExternalLoginNotConfigured。
 func (s *Service) LoginByExternalIdentity(ctx context.Context, req ExternalLoginReq) (*ExternalLoginResp, error) {
 	if s.extLogin == nil {
 		return nil, ErrExternalLoginNotConfigured
 	}
 	return s.extLogin.LoginByExternalIdentity(ctx, req)
+}
+
+// VerifyPasswordByUID 详见 IService 注释。
+func (s *Service) VerifyPasswordByUID(ctx context.Context, uid, password string) (bool, string, error) {
+	if s.bindHandler == nil {
+		return false, "", ErrOIDCBindNotConfigured
+	}
+	return s.bindHandler.VerifyPasswordByUID(ctx, uid, password)
+}
+
+// SendOIDCBindSMS 详见 IService 注释。
+func (s *Service) SendOIDCBindSMS(ctx context.Context, zone, phone string) error {
+	if s.bindHandler == nil {
+		return ErrOIDCBindNotConfigured
+	}
+	return s.bindHandler.SendOIDCBindSMS(ctx, zone, phone)
+}
+
+// VerifyOIDCBindSMS 详见 IService 注释。
+func (s *Service) VerifyOIDCBindSMS(ctx context.Context, zone, phone, code string) error {
+	if s.bindHandler == nil {
+		return ErrOIDCBindNotConfigured
+	}
+	return s.bindHandler.VerifyOIDCBindSMS(ctx, zone, phone, code)
 }
 
 // OIDCVerificationClaims 从 OIDC id_token / userinfo claims 里摘出的实名字段子集。

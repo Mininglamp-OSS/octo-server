@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -82,6 +83,11 @@ type OIDC struct {
 	worker     *SyncWorker
 	tickLock   *RedisTickLock
 	cbGuard    *CallbackGuard
+	bind       *BindService // 自助绑定(P0);Bind.Enabled=false 时为 nil,handler 不挂载
+	// bindStore 单独持引用便于 Close 时关连接池。bind.store 是 BindStore 接口,
+	// 接口本身没 Close,production impl(*redisBindStore)有独立 redis.Client,
+	// 不关会泄漏。
+	bindStore BindStore
 
 	// verification 由 Init() 注入(user.IService 的子集),OIDC callback 拿到 IdP
 	// identity_verification claims 后调用 UpsertVerificationFromOIDC 写 user_verification。
@@ -179,6 +185,24 @@ func (o *OIDC) Init() error {
 		o.verification = userSvc
 	}
 
+	// 自助绑定(P0):Bind.Enabled=true 时构造 BindService + 注入 user.IService。
+	// Bind.Enabled=false 时 o.bind=nil,bindRoutes 不挂任何路由(零生产影响)。
+	if err := validateBindConfigAgainstProvider(o.cfg); err != nil {
+		return fmt.Errorf("oidc: Init: %w", err)
+	}
+	if o.cfg.Bind.Enabled {
+		o.bindStore = newRedisBindStore(o.ctx)
+		// userSvc 已经实现 BindAuthenticator(三个方法在 user.IService 内),
+		// Go 鸭子类型直接传即可。BindLocator 用 oidc.DB 适配:复用同一连接池。
+		locator := dbBindLocator{db: o.db}
+		o.bind = newBindService(o.cfg.Bind, o.bindStore, userSvc, locator)
+		// Confirm 路径需要 identity 写入 + IssueSession 签发,复用 *Service 已经
+		// 持有的 store(identityStore) 和 users(userLookup)。两者都在 newService
+		// 内完成构造,Init 顺序保证 o.service 此时非 nil。
+		o.bind.identity = o.store
+		o.bind.users = o.service.users
+	}
+
 	// SyncWorker:Aegis 侧账号状态变更(封号/改密/登出)→ DMWork 主动感知。
 	// Interval=0 视为禁用,适合本地开发 / DB 还没准备好 RT 行的早期阶段。
 	if o.cfg.Provider.SyncInterval > 0 && o.db != nil && o.killer != nil {
@@ -242,6 +266,9 @@ func (o *OIDC) routeAt(r *wkhttp.WKHttp, pathID string) {
 	pub.GET("/callback", o.callback)
 	authed := r.Group(base, o.ctx.AuthMiddleware(r))
 	authed.POST("/logout", o.logout)
+	// 自助绑定(P0):Bind.Enabled=false 时 bindRoutes 自身 no-op,生产路径完
+	// 全不挂这些 endpoint;true 时挂 4 个 bind/* 端点,callback 接管由 PR4 引入。
+	o.bindRoutes(pub)
 }
 
 func (o *OIDC) disabled(c *wkhttp.Context) {
@@ -522,6 +549,24 @@ func (o *OIDC) callback(c *wkhttp.Context) {
 
 	res, err := o.service.ResolveOrLink(c.Request.Context(), claims)
 	if err != nil {
+		// PR4 自助绑定接管:autolink 失败时,若 Bind.Enabled + issuer 在 allowlist
+		// 内 + 错误是可绑定类型(ErrUnknownUser/ErrConflictNeedManual),引导用户走
+		// 自助绑定流程。其它失败 / flag off / issuer 不在白名单都退回旧路径,确保
+		// NFR-6 一键回滚(关 flag + 重启)语义生效。
+		if o.bind.ShouldHandle(err, claims) {
+			jti, ierr := o.bind.Issue(c.Request.Context(), claims, sd)
+			if ierr == nil {
+				result = "bind_pending" // 已在 callbackResultLabels 注册
+				o.writeAudit("bind:"+subHash(jti), EventBindIssued, sd, "")
+				o.redirectToBindPage(c, sd, jti)
+				return
+			}
+			// Issue 失败:不让"bind 引擎抖动"把整条 OIDC 登录拖死,继续退回旧路径。
+			// 失败原因记 warn,运维通过 oidc_bind_request_total 看不到这一脚 ——
+			// 是有意的,这种"bind 接管异常但回落"应该看 callback_total{result=resolve_fail}。
+			o.Warn("OIDC bind Issue failed, falling back to legacy fail path",
+				zap.String("trace_id", traceID), zap.Error(ierr))
+		}
 		result = "resolve_fail"
 		o.failWithAuthcode(c.Request.Context(), sd, claims, err)
 		o.redirectAfterCallback(c, sd, true)
@@ -690,6 +735,14 @@ func (o *OIDC) Close() error {
 			o.Error("关闭 OIDC sync tick lock 失败", zap.Error(err))
 		}
 		o.tickLock = nil
+	}
+	// bindStore 独立 redis.Client(与 stateStore 同模式),Bind.Enabled=true
+	// 时由 Init 创建。优雅退出/Discovery 失败兜底清理都要关,否则 fd 泄漏。
+	if rbs, ok := o.bindStore.(*redisBindStore); ok {
+		if err := rbs.Close(); err != nil {
+			o.Error("关闭 OIDC bind store 失败", zap.Error(err))
+		}
+		o.bindStore = nil
 	}
 	if o.stateStore == nil {
 		return nil
@@ -904,6 +957,63 @@ func fallbackReturnTo(rt string) string {
 		return "/"
 	}
 	return rt
+}
+
+// redirectToBindPage 自助绑定触发时的 302 跳转。把 jti + 原 authcode + 清洗后
+// 的 return_to 拼到 BindConfig.RedirectBase 上。
+//
+// 设计:
+//   - 用 url.Parse + Query API 拼参,避免手拼 query 在 RedirectBase 自带 ? 时
+//     出 ?token=xxx?return_to=yyy 的 bug;
+//   - return_to 走 ValidateReturnTo 二次校验(纵深防御,与 redirectAfterCallback
+//     一致);非法时直接落空,前端按未提供处理;
+//   - RedirectBase 为空时(漏配置)记 error 并退回 redirectAfterCallback 失败
+//     路径,**绝不**裸跳 302 到空字符串(那会变 referrer 漏洞);
+//   - 不向 URL 拼任何 claims 内容(SR-7),客户端通过 /bind/info?token=... 拉脱敏。
+func (o *OIDC) redirectToBindPage(c *wkhttp.Context, sd *StateData, jti string) {
+	base := o.cfg.Bind.RedirectBase
+	if base == "" {
+		o.Error("OIDC bind redirect: DM_OIDC_BIND_REDIRECT_BASE not configured, falling back",
+			zap.String("jti_hash", subHash(jti)))
+		o.failBindRedirect(c, sd)
+		return
+	}
+	target, err := url.Parse(base)
+	if err != nil {
+		o.Error("OIDC bind redirect: invalid RedirectBase",
+			zap.String("base", base), zap.Error(err))
+		o.failBindRedirect(c, sd)
+		return
+	}
+	q := target.Query()
+	q.Set("token", jti)
+	if sd != nil && sd.ClientAuthcode != "" {
+		q.Set("authcode", sd.ClientAuthcode)
+	}
+	// 二次校验 return_to (纵深防御:即便 RedirectBase 是可信前端域,我们也
+	// 不应把任意原 return_to 透过)。
+	if sd != nil {
+		if cleaned, verr := ValidateReturnTo(sd.ReturnTo, o.cfg.Provider.ReturnToHosts); verr == nil && cleaned != "" {
+			q.Set("return_to", cleaned)
+		}
+	}
+	target.RawQuery = q.Encode()
+	c.Redirect(http.StatusFound, target.String())
+}
+
+// failBindRedirect 跳转到 bind 页失败(漏配 RedirectBase / 非法 URL)时的兜底:
+// 先把 ThirdAuthcode 写 "0",让原发起设备的前端轮询立即拿到失败信号(否则要等
+// 5min TTL 才会感知,用户会卡在加载态);再走 redirectAfterCallback 失败路径。
+//
+// 写 "0" 失败仅 log:此时已经在异常路径,继续 redirect 比 panic 更可控。
+func (o *OIDC) failBindRedirect(c *wkhttp.Context, sd *StateData) {
+	if o.authcode != nil && sd != nil && sd.ClientAuthcode != "" {
+		if e := o.authcode.SetAuthcode(c.Request.Context(), sd.ClientAuthcode, "0", thirdAuthcodeTTL); e != nil {
+			o.Error("OIDC bind redirect fallback: write ThirdAuthcode \"0\" failed",
+				zap.Error(e))
+		}
+	}
+	o.redirectAfterCallback(c, sd, true)
 }
 
 // redirectAfterCallback 统一 callback 完成后的 302 跳转。

@@ -41,6 +41,16 @@ const (
 	EventRefreshOK    AuditEvent = "refresh_ok"
 	EventRefreshFail  AuditEvent = "refresh_fail"
 	EventLogout       AuditEvent = "logout"
+
+	// 自助绑定流程事件(P0,SR-6 审计完整性)。
+	// 不改 oidc_audit_log schema —— 仍写同一张表,通过 event 列区分场景。
+	EventBindIssued      AuditEvent = "bind_issued"
+	EventBindVerifyOK    AuditEvent = "bind_verify_ok"
+	EventBindVerifyFail  AuditEvent = "bind_verify_fail"
+	EventBindOTPSend     AuditEvent = "bind_otp_send"
+	EventBindConfirmOK   AuditEvent = "bind_confirm_ok"
+	EventBindConfirmFail AuditEvent = "bind_confirm_fail"
+	EventBindRefused     AuditEvent = "bind_refused"
 )
 
 // AuditModel 登录与状态同步审计
