@@ -180,9 +180,10 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 				}
 			}
 		case settingTypeEncrypted:
-			if item.Value == "" {
-				// Empty payload preserves the existing ciphertext — do not
-				// queue an upsert that would blank it out.
+			if item.Value == "" || item.Value == secretMask {
+				// Empty payload or the GET mask sentinel preserves the existing
+				// ciphertext — do not queue an upsert that would blank it out
+				// or accidentally store "****" as the real password.
 				p.skip = true
 				break
 			}
@@ -297,9 +298,9 @@ func normaliseBool(v string) (string, bool) {
 	switch v {
 	case "":
 		return "", true
-	case "0", "false", "FALSE", "False":
+	case "0", "false", "FALSE":
 		return "0", true
-	case "1", "true", "TRUE", "True":
+	case "1", "true", "TRUE":
 		return "1", true
 	}
 	return "", false

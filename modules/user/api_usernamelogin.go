@@ -23,7 +23,12 @@ import (
 
 // 通过用户名注册
 func (u *User) usernameRegister(c *wkhttp.Context) {
-	if !common.EnsureSystemSettings(u.ctx).RegisterUsernameOn() {
+	settings := common.EnsureSystemSettings(u.ctx)
+	if settings.RegisterOff() {
+		c.ResponseError(errors.New("注册通道暂不开放"))
+		return
+	}
+	if !settings.RegisterUsernameOn() {
 		c.ResponseError(errors.New("暂不支持用户名注册"))
 		return
 	}

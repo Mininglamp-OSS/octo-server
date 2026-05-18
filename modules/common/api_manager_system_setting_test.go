@@ -95,6 +95,24 @@ func TestManagerSystemSetting_UpdateRejectsInvalidBool(t *testing.T) {
 	assert.NotEqual(t, http.StatusOK, w.Code)
 }
 
+func TestManagerSystemSetting_UpdateRejectsMixedCaseBool(t *testing.T) {
+	t.Setenv(masterKeyEnv, "0123456789abcdef0123456789abcdef")
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	require.NoError(t, ctx.Cache().Set(
+		ctx.GetConfig().Cache.TokenCachePrefix+testutil.Token,
+		testutil.UID+"@test@"+string(wkhttp.SuperAdmin),
+	))
+
+	body := []byte(`{"items":[{"category":"register","key":"email_on","value":"True"}]}`)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/manager/common/system_setting", bytes.NewReader(body))
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.NotEqual(t, http.StatusOK, w.Code)
+}
+
 func TestManagerSystemSetting_EncryptedEmptyDoesNotOverwrite(t *testing.T) {
 	t.Setenv(masterKeyEnv, "0123456789abcdef0123456789abcdef")
 	s, ctx := testutil.NewTestServer()
@@ -122,6 +140,35 @@ func TestManagerSystemSetting_EncryptedEmptyDoesNotOverwrite(t *testing.T) {
 	plaintext, err := decryptKey(rows[0].Value)
 	require.NoError(t, err)
 	assert.Equal(t, "original", plaintext, "empty payload must preserve existing secret")
+}
+
+func TestManagerSystemSetting_EncryptedMaskDoesNotOverwrite(t *testing.T) {
+	t.Setenv(masterKeyEnv, "0123456789abcdef0123456789abcdef")
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	require.NoError(t, ctx.Cache().Set(
+		ctx.GetConfig().Cache.TokenCachePrefix+testutil.Token,
+		testutil.UID+"@test@"+string(wkhttp.SuperAdmin),
+	))
+
+	db := newSystemSettingDB(ctx)
+	enc, err := encryptKey("original")
+	require.NoError(t, err)
+	require.NoError(t, db.upsert("support", "email_pwd", enc, settingTypeEncrypted, ""))
+
+	body := []byte(`{"items":[{"category":"support","key":"email_pwd","value":"****"}]}`)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/manager/common/system_setting", bytes.NewReader(body))
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	rows, err := db.listAll()
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	plaintext, err := decryptKey(rows[0].Value)
+	require.NoError(t, err)
+	assert.Equal(t, "original", plaintext, "mask payload must preserve existing secret")
 }
 
 // Writing "" for a bool resets the setting to "fall back to yaml". This

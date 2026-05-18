@@ -35,6 +35,16 @@ func (u *User) emailSendCode(c *wkhttp.Context) {
 		c.ResponseError(errors.New("邮箱格式不正确"))
 		return
 	}
+	if !common.EnsureSystemSettings(u.ctx).RegisterEmailOn() {
+		switch commonapi.CodeType(req.CodeType) {
+		case commonapi.CodeTypeRegister:
+			c.ResponseError(errors.New("暂不支持邮箱注册"))
+			return
+		case commonapi.CodeTypeEmailLogin:
+			c.ResponseError(errors.New("暂不支持邮箱登录"))
+			return
+		}
+	}
 
 	emailService := commonapi.NewEmailService(u.ctx, common.EnsureSystemSettings(u.ctx))
 	if err := emailService.SendVerifyCode(context.Background(), req.Email, commonapi.CodeType(req.CodeType)); err != nil {
@@ -47,7 +57,12 @@ func (u *User) emailSendCode(c *wkhttp.Context) {
 
 // emailRegister 邮箱注册
 func (u *User) emailRegister(c *wkhttp.Context) {
-	if !common.EnsureSystemSettings(u.ctx).RegisterEmailOn() {
+	settings := common.EnsureSystemSettings(u.ctx)
+	if settings.RegisterOff() {
+		c.ResponseError(errors.New("注册通道暂不开放"))
+		return
+	}
+	if !settings.RegisterEmailOn() {
 		c.ResponseError(errors.New("暂不支持邮箱注册"))
 		return
 	}
@@ -177,6 +192,10 @@ func (u *User) emailRegister(c *wkhttp.Context) {
 
 // emailLogin 邮箱登录（验证码方式）
 func (u *User) emailLogin(c *wkhttp.Context) {
+	if !common.EnsureSystemSettings(u.ctx).RegisterEmailOn() {
+		c.ResponseError(errors.New("暂不支持邮箱登录"))
+		return
+	}
 	type reqVO struct {
 		Email    string     `json:"email"`
 		Code     string     `json:"code"`
