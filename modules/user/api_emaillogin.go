@@ -35,14 +35,23 @@ func (u *User) emailSendCode(c *wkhttp.Context) {
 		c.ResponseError(errors.New("邮箱格式不正确"))
 		return
 	}
-	if !common.EnsureSystemSettings(u.ctx).RegisterEmailOn() {
-		switch commonapi.CodeType(req.CodeType) {
+	settings := common.EnsureSystemSettings(u.ctx)
+	codeType := commonapi.CodeType(req.CodeType)
+	if codeType == commonapi.CodeTypeRegister && settings.RegisterOff() {
+		c.ResponseError(errors.New("注册通道暂不开放"))
+		return
+	}
+	if !settings.RegisterEmailOn() {
+		switch codeType {
 		case commonapi.CodeTypeRegister:
 			c.ResponseError(errors.New("暂不支持邮箱注册"))
 			return
 		case commonapi.CodeTypeEmailLogin:
 			c.ResponseError(errors.New("暂不支持邮箱登录"))
 			return
+		default:
+			// RegisterEmailOn controls email registration/login only. Password
+			// recovery codes remain available for existing accounts.
 		}
 	}
 

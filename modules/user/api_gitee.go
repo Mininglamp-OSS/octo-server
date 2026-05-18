@@ -28,10 +28,6 @@ const (
 )
 
 func (u *User) thirdAuthcode(c *wkhttp.Context) {
-	if common.EnsureSystemSettings(u.ctx).RegisterOff() {
-		c.ResponseError(errors.New("注册通道暂不开放，请长按标题使用官网上演示账号登录"))
-		return
-	}
 	authcode := util.GenerUUID()
 	err := u.ctx.GetRedisConn().SetAndExpire(fmt.Sprintf("%s%s", ThirdAuthcodePrefix, authcode), "1", time.Minute*5)
 	if err != nil {
@@ -46,10 +42,6 @@ func (u *User) thirdAuthcode(c *wkhttp.Context) {
 }
 
 func (u *User) thirdAuthStatus(c *wkhttp.Context) {
-	if common.EnsureSystemSettings(u.ctx).RegisterOff() {
-		c.ResponseError(errors.New("注册通道暂不开放，请长按标题使用官网上演示账号登录"))
-		return
-	}
 	authcode := c.Query("authcode")
 	key := fmt.Sprintf("%s%s", ThirdAuthcodePrefix, authcode)
 	result, err := u.ctx.GetRedisConn().GetString(key)
@@ -154,6 +146,10 @@ func (u *User) giteeOAuth(c *wkhttp.Context) {
 		publicIP := util.GetClientPublicIP(c.Request)
 		go u.sentWelcomeMsg(publicIP, userInfoM.UID)
 	} else {
+		if common.EnsureSystemSettings(u.ctx).RegisterOff() {
+			c.ResponseError(errors.New("注册通道暂不开放"))
+			return
+		}
 		// 创建用户
 		uid := util.GenerUUID()
 		name := userInfo.Name

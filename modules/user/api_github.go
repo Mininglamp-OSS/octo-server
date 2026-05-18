@@ -2,13 +2,13 @@ package user
 
 import (
 	"context"
-	"os"
-	"runtime/debug"
 	"fmt"
 	"hash/crc32"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -16,6 +16,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/network"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	common "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
@@ -82,6 +83,10 @@ func (u *User) githubOAuth(c *wkhttp.Context) {
 		publicIP := util.GetClientPublicIP(c.Request)
 		go u.sentWelcomeMsg(publicIP, userInfoM.UID)
 	} else {
+		if common.EnsureSystemSettings(u.ctx).RegisterOff() {
+			c.ResponseError(errors.New("注册通道暂不开放"))
+			return
+		}
 		// 创建用户
 		uid := util.GenerUUID()
 		name := userInfo.Name

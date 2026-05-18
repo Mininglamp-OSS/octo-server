@@ -116,6 +116,41 @@ func TestEmailSendCodeBlockedByEmailOnForLoginAndRegister(t *testing.T) {
 	}
 }
 
+func TestEmailSendRegisterCodeBlockedByRegisterOff(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	setSystemSettingForUserTest(t, ctx, "register", "off", "1", "bool")
+	setSystemSettingForUserTest(t, ctx, "register", "email_on", "1", "bool")
+	require.NoError(t, commonsettings.EnsureSystemSettings(ctx).Reload())
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/user/email/sendcode", bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
+		"email":     "blocked@example.com",
+		"code_type": int(commonapi.CodeTypeRegister),
+	}))))
+	setPublicIPForUserTest(req, "1.0.0.1")
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Contains(t, w.Body.String(), "注册通道暂不开放")
+}
+
+func TestEmailForgetPasswordCodeAllowedWhenEmailLoginDisabled(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	setSystemSettingForUserTest(t, ctx, "register", "email_on", "0", "bool")
+	require.NoError(t, commonsettings.EnsureSystemSettings(ctx).Reload())
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/user/email/sendcode", bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
+		"email":     "recover@example.com",
+		"code_type": int(commonapi.CodeTypeForgetLoginPWD),
+	}))))
+	setPublicIPForUserTest(req, "1.0.0.2")
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.NotContains(t, w.Body.String(), "暂不支持邮箱")
+}
+
 func setSystemSettingForUserTest(t *testing.T, ctx *config.Context, category, key, value, valueType string) {
 	t.Helper()
 	_, err := ctx.DB().InsertBySql(
