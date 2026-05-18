@@ -52,15 +52,22 @@ jobs:
           REF: ${{ github.ref }}
         run: |
           set -euo pipefail
-          # Strip refs/tags/ prefix and require strict semver (with optional
-          # prerelease/build metadata) so metadata-action's type=semver
-          # actually matches. A non-semver `v*` tag (e.g. `vfoo`) would
-          # otherwise reach the secret-bearing build job, push digests, and
-          # only fail later when metadata-action emits no tags — defeating
-          # the no-secret preflight intent (PR #72 review, Jerry-Xin).
+          # Require strict semver per semver.org §9 (with mandatory leading 'v')
+          # so metadata-action's type=semver actually matches. A loose regex
+          # would let near-semver refs (e.g. 'vfoo', 'v01.2.3', 'v1.2.3-01',
+          # 'v1.2.3-..', 'v1.2.3+build..meta') reach the secret-bearing build
+          # job and push orphan digests before metadata-action quietly emits
+          # no tags — defeating the no-secret preflight intent.
+          #
+          # The regex below is the official semver.org regex (BRE/ERE form),
+          # prefixed with a literal 'v'. It rejects:
+          #   - leading zeros in numeric identifiers (v01.2.3, v1.2.3-01)
+          #   - empty dot-separated identifiers (v1.2.3-.. , v1.2.3+a..b)
+          #   - characters outside [0-9A-Za-z.+-]
           tag="${REF#refs/tags/}"
-          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
-            echo "::error::tag '$tag' is not strict semver (vMAJOR.MINOR.PATCH[-PRERELEASE][+BUILD]); refusing to publish"
+          semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*))?(\+([0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*))?$'
+          if ! printf '%s' "$tag" | grep -Eq "$semver"; then
+            echo "::error::tag '$tag' is not strict semver per semver.org (vMAJOR.MINOR.PATCH[-PRERELEASE][+BUILD]); refusing to publish"
             exit 1
           fi
           echo "OK: $REF"
@@ -100,9 +107,9 @@ jobs:
 
           # Restrict manual publishes from non-default branches to the
           # 'test-' namespace so feature-branch experimentation cannot land
-          # in the official release tag space. Use the repo's actual default
-          # branch (PR #72 review, Jerry-Xin non-blocking) so a future
-          # rename doesn't silently weaken this guard.
+          # in the official release tag space. Read the default branch from
+          # repository metadata so a future rename doesn't silently weaken
+          # this guard.
           DEFAULT_REF="refs/heads/${DEFAULT_BRANCH}"
           if [ "$REF" != "$DEFAULT_REF" ]; then
             case "$INPUT_TAG" in
