@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -182,13 +183,20 @@ func (o *OIDC) Init() error {
 
 	// 自助绑定(P0):Bind.Enabled=true 时构造 BindService + 注入 user.IService。
 	// Bind.Enabled=false 时 o.bind=nil,bindRoutes 不挂任何路由(零生产影响)。
-	// PR4 才在 callback 失败分支真接管。
+	if err := validateBindConfigAgainstProvider(o.cfg); err != nil {
+		return fmt.Errorf("oidc: Init: %w", err)
+	}
 	if o.cfg.Bind.Enabled {
 		bindStore := newRedisBindStore(o.ctx)
 		// userSvc 已经实现 BindAuthenticator(三个方法在 user.IService 内),
 		// Go 鸭子类型直接传即可。BindLocator 用 oidc.DB 适配:复用同一连接池。
 		locator := dbBindLocator{db: o.db}
 		o.bind = newBindService(o.cfg.Bind, bindStore, userSvc, locator)
+		// Confirm 路径需要 identity 写入 + IssueSession 签发,复用 *Service 已经
+		// 持有的 store(identityStore) 和 users(userLookup)。两者都在 newService
+		// 内完成构造,Init 顺序保证 o.service 此时非 nil。
+		o.bind.identity = o.store
+		o.bind.users = o.service.users
 	}
 
 	// SyncWorker:Aegis 侧账号状态变更(封号/改密/登出)→ DMWork 主动感知。
@@ -537,6 +545,22 @@ func (o *OIDC) callback(c *wkhttp.Context) {
 
 	res, err := o.service.ResolveOrLink(c.Request.Context(), claims)
 	if err != nil {
+		// PR4 自助绑定接管:autolink 失败时,若 Bind.Enabled + issuer 在 allowlist
+		// 内 + 错误是可绑定类型(ErrUnknownUser/ErrConflictNeedManual),引导用户走
+		// 自助绑定流程。其它失败 / flag off / issuer 不在白名单都退回旧路径,确保
+		// NFR-6 一键回滚(关 flag + 重启)语义生效。
+		if o.bind.ShouldHandle(err, claims) {
+			jti, ierr := o.bind.Issue(c.Request.Context(), claims, sd)
+			if ierr == nil {
+				result = "bind_pending"
+				o.writeAudit("bind:"+jti, EventBindIssued, sd, "")
+				o.redirectToBindPage(c, sd, jti)
+				return
+			}
+			// Issue 失败:不让"bind 引擎抖动"把整条 OIDC 登录拖死,继续退回旧路径。
+			o.Warn("OIDC bind Issue failed, falling back to legacy fail path",
+				zap.String("trace_id", traceID), zap.Error(ierr))
+		}
 		result = "resolve_fail"
 		o.failWithAuthcode(c.Request.Context(), sd, claims, err)
 		o.redirectAfterCallback(c, sd, true)
@@ -919,6 +943,48 @@ func fallbackReturnTo(rt string) string {
 		return "/"
 	}
 	return rt
+}
+
+// redirectToBindPage 自助绑定触发时的 302 跳转。把 jti + 原 authcode + 清洗后
+// 的 return_to 拼到 BindConfig.RedirectBase 上。
+//
+// 设计:
+//   - 用 url.Parse + Query API 拼参,避免手拼 query 在 RedirectBase 自带 ? 时
+//     出 ?token=xxx?return_to=yyy 的 bug;
+//   - return_to 走 ValidateReturnTo 二次校验(纵深防御,与 redirectAfterCallback
+//     一致);非法时直接落空,前端按未提供处理;
+//   - RedirectBase 为空时(漏配置)记 error 并退回 redirectAfterCallback 失败
+//     路径,**绝不**裸跳 302 到空字符串(那会变 referrer 漏洞);
+//   - 不向 URL 拼任何 claims 内容(SR-7),客户端通过 /bind/info?token=... 拉脱敏。
+func (o *OIDC) redirectToBindPage(c *wkhttp.Context, sd *StateData, jti string) {
+	base := o.cfg.Bind.RedirectBase
+	if base == "" {
+		o.Error("OIDC bind redirect: DM_OIDC_BIND_REDIRECT_BASE not configured, falling back",
+			zap.String("jti_hash", subHash(jti)))
+		o.redirectAfterCallback(c, sd, true)
+		return
+	}
+	target, err := url.Parse(base)
+	if err != nil {
+		o.Error("OIDC bind redirect: invalid RedirectBase",
+			zap.String("base", base), zap.Error(err))
+		o.redirectAfterCallback(c, sd, true)
+		return
+	}
+	q := target.Query()
+	q.Set("token", jti)
+	if sd != nil && sd.ClientAuthcode != "" {
+		q.Set("authcode", sd.ClientAuthcode)
+	}
+	// 二次校验 return_to (纵深防御:即便 RedirectBase 是可信前端域,我们也
+	// 不应把任意原 return_to 透过)。
+	if sd != nil {
+		if cleaned, verr := ValidateReturnTo(sd.ReturnTo, o.cfg.Provider.ReturnToHosts); verr == nil && cleaned != "" {
+			q.Set("return_to", cleaned)
+		}
+	}
+	target.RawQuery = q.Encode()
+	c.Redirect(http.StatusFound, target.String())
 }
 
 // redirectAfterCallback 统一 callback 完成后的 302 跳转。

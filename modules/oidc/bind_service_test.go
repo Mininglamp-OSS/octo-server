@@ -5,7 +5,15 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	mysql "github.com/go-sql-driver/mysql"
 )
+
+// mockDuplicateKeyErr 制造一个能被 isDuplicateKeyError(api.go) 识别的错误。
+// 用 mysql.MySQLError{Number:1062} 真型保证 errors.As 路径走通。
+func mockDuplicateKeyErr() error {
+	return &mysql.MySQLError{Number: 1062, Message: "Duplicate entry for key 'uk_uid_issuer'"}
+}
 
 // ---- fakes ----
 
@@ -47,6 +55,7 @@ func (f *fakeBindAuth) VerifyOIDCBindSMS(_ context.Context, zone, phone, code st
 
 type fakeBindLocator struct {
 	byUsername map[string]string
+	byPhone    map[string][]string // "zone|phone" -> uids
 	err        error
 }
 
@@ -57,13 +66,86 @@ func (f *fakeBindLocator) UIDByUsername(username string) (string, error) {
 	return f.byUsername[username], nil
 }
 
+func (f *fakeBindLocator) UIDsByPhone(zone, phone string) ([]string, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.byPhone[zone+"|"+phone], nil
+}
+
+type fakeIdentityWriter struct {
+	inserted    []*IdentityModel
+	insertErr   error
+	duplicate   bool // true => insertErr is treated as MySQL 1062
+	getResp     map[string]*IdentityModel
+	updateLogin error
+}
+
+func (f *fakeIdentityWriter) Get(issuer, subject string) (*IdentityModel, error) {
+	if f.getResp == nil {
+		return nil, nil
+	}
+	return f.getResp[issuer+"|"+subject], nil
+}
+func (f *fakeIdentityWriter) Insert(m *IdentityModel) error {
+	if f.insertErr != nil {
+		return f.insertErr
+	}
+	cp := *m
+	f.inserted = append(f.inserted, &cp)
+	return nil
+}
+func (f *fakeIdentityWriter) UpdateLogin(_ int64, _ string, _ int, _ string, _ int) error {
+	return f.updateLogin
+}
+
+type fakeIssueSession struct {
+	resp    *IssueSessionResp
+	err     error
+	gotReq  IssueSessionReq
+	callCnt int
+}
+
+func (f *fakeIssueSession) UIDsByEmail(string) ([]string, error)         { return nil, nil }
+func (f *fakeIssueSession) UIDsByPhone(string, string) ([]string, error) { return nil, nil }
+func (f *fakeIssueSession) IssueSession(_ context.Context, req IssueSessionReq) (*IssueSessionResp, error) {
+	f.callCnt++
+	f.gotReq = req
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.resp, nil
+}
+
 // ---- helpers ----
+
+type bindTestHarness struct {
+	svc      *BindService
+	store    *memoryBindStore
+	auth     *fakeBindAuth
+	loc      *fakeBindLocator
+	identity *fakeIdentityWriter
+	users    *fakeIssueSession
+}
 
 func newTestBindService(t *testing.T, cfgMutators ...func(*BindConfig)) (*BindService, *memoryBindStore, *fakeBindAuth, *fakeBindLocator) {
 	t.Helper()
+	h := newBindHarness(t, cfgMutators...)
+	return h.svc, h.store, h.auth, h.loc
+}
+
+func newBindHarness(t *testing.T, cfgMutators ...func(*BindConfig)) *bindTestHarness {
+	t.Helper()
 	store := newMemoryBindStore()
 	auth := &fakeBindAuth{}
-	loc := &fakeBindLocator{byUsername: map[string]string{}}
+	loc := &fakeBindLocator{
+		byUsername: map[string]string{},
+		byPhone:    map[string][]string{},
+	}
+	identity := &fakeIdentityWriter{}
+	users := &fakeIssueSession{resp: &IssueSessionResp{
+		UID: "u-default", LoginRespJSON: `{"token":"t-default"}`,
+	}}
 	cfg := BindConfig{
 		Enabled:        true,
 		TokenTTL:       time.Minute,
@@ -78,7 +160,12 @@ func newTestBindService(t *testing.T, cfgMutators ...func(*BindConfig)) (*BindSe
 		mut(&cfg)
 	}
 	svc := newBindService(cfg, store, auth, loc)
-	return svc, store, auth, loc
+	svc.identity = identity
+	svc.users = users
+	return &bindTestHarness{
+		svc: svc, store: store, auth: auth, loc: loc,
+		identity: identity, users: users,
+	}
 }
 
 func sampleClaims() *IDTokenClaims {
@@ -324,16 +411,19 @@ func TestBindService_SendSMS_RateLimited(t *testing.T) {
 
 // TestBindService_VerifySMS_Success 走通短信验证 -> status verified +
 // VerifiedMethod=sms_otp。zone/phone 仍从 claims snapshot 取(FR-3.3)。
+// PR4 起验证通过后会用 phone 反查 dmwork user,所以测试需要预置一条 byPhone 命中。
 func TestBindService_VerifySMS_Success(t *testing.T) {
-	svc, store, auth, _ := newTestBindService(t)
-	jti, _ := svc.Issue(context.Background(), sampleClaims(), sampleSD())
-	if err := svc.VerifySMS(context.Background(), jti, "1234"); err != nil {
+	h := newBindHarness(t)
+	h.loc.byPhone["0086|13900000000"] = []string{"u-phone-1"}
+
+	jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	if err := h.svc.VerifySMS(context.Background(), jti, "1234"); err != nil {
 		t.Fatalf("VerifySMS: %v", err)
 	}
-	if auth.calls.verifyZone != "0086" || auth.calls.verifyPhone != "13900000000" || auth.calls.verifyCode != "1234" {
-		t.Fatalf("auth.VerifyOIDCBindSMS args wrong: %+v", auth.calls)
+	if h.auth.calls.verifyZone != "0086" || h.auth.calls.verifyPhone != "13900000000" || h.auth.calls.verifyCode != "1234" {
+		t.Fatalf("auth.VerifyOIDCBindSMS args wrong: %+v", h.auth.calls)
 	}
-	sess, _ := store.Get(context.Background(), jti)
+	sess, _ := h.store.Get(context.Background(), jti)
 	if sess.Status != BindStatusVerified || sess.VerifiedMethod != BindMethodSMSOTP {
 		t.Fatalf("status/method=%v/%v want verified/sms_otp", sess.Status, sess.VerifiedMethod)
 	}
@@ -365,6 +455,156 @@ func TestBindService_VerifySMS_RateLimited(t *testing.T) {
 	err := svc.VerifySMS(context.Background(), jti, "2")
 	if !errors.Is(err, ErrBindRateLimited) {
 		t.Fatalf("expected ErrBindRateLimited after exceeding VerifyMax, got %v", err)
+	}
+}
+
+// TestBindService_VerifySMS_SinglePhoneMatchFillsCandidate 短信路径通过后,
+// 用 claims phone 在 dmwork user 表里找到唯一 uid → 写入 sess.CandidateUID,
+// confirm 阶段直接用,不再查一次 DB(SR-2 限流维度也更准)。
+func TestBindService_VerifySMS_SinglePhoneMatchFillsCandidate(t *testing.T) {
+	h := newBindHarness(t)
+	h.loc.byPhone["0086|13900000000"] = []string{"u-phone-1"}
+
+	jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	if err := h.svc.VerifySMS(context.Background(), jti, "1234"); err != nil {
+		t.Fatalf("VerifySMS: %v", err)
+	}
+	sess, _ := h.store.Get(context.Background(), jti)
+	if sess.CandidateUID != "u-phone-1" {
+		t.Fatalf("CandidateUID=%q want u-phone-1", sess.CandidateUID)
+	}
+}
+
+// TestBindService_VerifySMS_MultiPhoneMatchRejected 同 phone 对应多个 dmwork
+// 账号(脏数据/历史合并未完成),自助流程无法判定,早期拒绝(FR-4.2 / 风险表)。
+func TestBindService_VerifySMS_MultiPhoneMatchRejected(t *testing.T) {
+	h := newBindHarness(t)
+	h.loc.byPhone["0086|13900000000"] = []string{"u-a", "u-b"}
+
+	jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	err := h.svc.VerifySMS(context.Background(), jti, "1234")
+	if !errors.Is(err, ErrBindConflictNeedManual) {
+		t.Fatalf("expected ErrBindConflictNeedManual on multi-match, got %v", err)
+	}
+}
+
+// TestBindService_VerifySMS_NoPhoneMatchRejected 短信验证通过但 claims phone
+// 不命中任何 dmwork user —— 仍然拒绝,confirm 没有目标可绑。运维通过审计
+// (EventBindVerifyFail reason=user_not_found) 可以发现这类用户(应当走
+// FR-7 "联系管理员" 兜底)。
+func TestBindService_VerifySMS_NoPhoneMatchRejected(t *testing.T) {
+	h := newBindHarness(t)
+	// 不预置 byPhone -> 返空
+
+	jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	err := h.svc.VerifySMS(context.Background(), jti, "1234")
+	if err == nil {
+		t.Fatal("VerifySMS must reject when no dmwork user matches claims phone")
+	}
+}
+
+// TestBindService_Confirm_Success 端到端:已 verified 的 session 走 confirm →
+// identity.Insert + users.IssueSession + 单次消费(再 Get 应 NotFound)。
+func TestBindService_Confirm_Success(t *testing.T) {
+	h := newBindHarness(t)
+	h.auth.verifyPasswordResp.matched = true
+	h.loc.byUsername["alice"] = "u-alice"
+	h.users.resp = &IssueSessionResp{UID: "u-alice", LoginRespJSON: `{"token":"t-alice"}`}
+
+	jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	if err := h.svc.VerifyPassword(context.Background(), jti, "alice", "Pwd@1"); err != nil {
+		t.Fatalf("VerifyPassword: %v", err)
+	}
+	resp, err := h.svc.Confirm(context.Background(), jti)
+	if err != nil {
+		t.Fatalf("Confirm: %v", err)
+	}
+	if resp.IssueResp.UID != "u-alice" || resp.IssueResp.LoginRespJSON != `{"token":"t-alice"}` {
+		t.Fatalf("resp=%+v", resp.IssueResp)
+	}
+	if resp.SD == nil || resp.SD.ClientAuthcode != "ac-1" {
+		t.Fatalf("SD snapshot lost: %+v", resp.SD)
+	}
+	if len(h.identity.inserted) != 1 {
+		t.Fatalf("identity inserts=%d want 1", len(h.identity.inserted))
+	}
+	ins := h.identity.inserted[0]
+	if ins.UID != "u-alice" || ins.Issuer != "https://idp.example" || ins.Subject != "sub-A" {
+		t.Fatalf("inserted identity wrong: %+v", ins)
+	}
+	// 单次消费(SR-1)
+	if _, err := h.store.Get(context.Background(), jti); !errors.Is(err, ErrBindNotFound) {
+		t.Fatalf("session must be consumed after confirm, got err=%v", err)
+	}
+}
+
+// TestBindService_Confirm_RequiresVerifiedStatus 只有 verified 状态可 confirm,
+// issued/confirmed/refused 都拒。AC-6 并发 confirm 防护也走同样的状态机:
+// 第二个 confirm 看到的不是 verified(或根本 Consume 不到)→ 拒绝。
+func TestBindService_Confirm_RequiresVerifiedStatus(t *testing.T) {
+	h := newBindHarness(t)
+	jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	// 没走 verify → 状态还在 issued
+	_, err := h.svc.Confirm(context.Background(), jti)
+	if !errors.Is(err, ErrBindStatusConflict) {
+		t.Fatalf("expected ErrBindStatusConflict, got %v", err)
+	}
+}
+
+// TestBindService_Confirm_DuplicateKey 模拟 DB uk_uid_issuer 命中:
+// users.IssueSession 还没调到就被 identity.Insert 拒掉,Confirm 返
+// ErrBindAlreadyBound,session 不消费(让用户可重试或人工介入)。
+func TestBindService_Confirm_DuplicateKey(t *testing.T) {
+	h := newBindHarness(t)
+	h.auth.verifyPasswordResp.matched = true
+	h.loc.byUsername["alice"] = "u-alice"
+	// 模拟 1062
+	h.identity.insertErr = mockDuplicateKeyErr()
+
+	jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	_ = h.svc.VerifyPassword(context.Background(), jti, "alice", "Pwd@1")
+	_, err := h.svc.Confirm(context.Background(), jti)
+	if !errors.Is(err, ErrBindAlreadyBound) {
+		t.Fatalf("expected ErrBindAlreadyBound on duplicate-key, got %v", err)
+	}
+	if h.users.callCnt != 0 {
+		t.Fatalf("IssueSession should NOT be called when identity insert fails, called %d times", h.users.callCnt)
+	}
+}
+
+func TestBindService_Confirm_IssueSessionFailure(t *testing.T) {
+	h := newBindHarness(t)
+	h.auth.verifyPasswordResp.matched = true
+	h.loc.byUsername["alice"] = "u-alice"
+	h.users.err = errors.New("downstream issuer down")
+
+	jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	_ = h.svc.VerifyPassword(context.Background(), jti, "alice", "Pwd@1")
+	_, err := h.svc.Confirm(context.Background(), jti)
+	if err == nil {
+		t.Fatal("Confirm must propagate IssueSession error")
+	}
+}
+
+// TestBindService_Confirm_RateLimited 每 jti confirm 计数走 ConfirmMax,
+// 即便 verified 状态没真正消费,过阈值也直接拒(挡攻击者反复 confirm 试探
+// downstream issue session 异常)。
+func TestBindService_Confirm_RateLimited(t *testing.T) {
+	h := newBindHarness(t, func(c *BindConfig) { c.ConfirmMax = 1 })
+	h.auth.verifyPasswordResp.matched = true
+	h.loc.byUsername["alice"] = "u-alice"
+	// 让第 1 次 confirm 拒绝(users.IssueSession 返错)使 session 保留
+	h.users.err = errors.New("transient")
+
+	jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	_ = h.svc.VerifyPassword(context.Background(), jti, "alice", "Pwd@1")
+
+	if _, err := h.svc.Confirm(context.Background(), jti); err == nil {
+		t.Fatal("first confirm should fail on issue-session err")
+	}
+	// 第 2 次:counter 已经 +1 = 1,limit=1,> 1 → ErrBindRateLimited
+	if _, err := h.svc.Confirm(context.Background(), jti); !errors.Is(err, ErrBindRateLimited) {
+		t.Fatalf("expected ErrBindRateLimited, got %v", err)
 	}
 }
 

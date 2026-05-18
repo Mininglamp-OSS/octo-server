@@ -1,11 +1,36 @@
 package oidc
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// validateBindConfigAgainstProvider 启动期硬校验:Bind.Enabled=true 时
+// Provider.AllowNewUser 必须为 false。
+//
+// FR-1.1 触发条件要求:autolink 三种(issuer+sub / email / phone)全部失败 +
+// AllowNewUser=false 时,绑定流程才会启动。如果 AllowNewUser=true,callback
+// 会直接走"新建空账号"分支,绑定 handler 根本不可达。两个 flag 同开 →
+// 用户体验上等价于"绑定功能完全没开",但运维/前端会以为开了 —— 是危险的
+// 静默不一致。
+//
+// 在 OIDC.Init() 内部调用,返 error 让 module.Setup 直接 panic,ops 必须
+// 显式取舍才能启动。
+func validateBindConfigAgainstProvider(cfg *Config) error {
+	if cfg == nil || !cfg.Bind.Enabled {
+		return nil
+	}
+	if cfg.Provider.AllowNewUser {
+		return fmt.Errorf(
+			"oidc: Bind.Enabled=true conflicts with Provider.AllowNewUser=true: " +
+				"set DM_OIDC_PROVIDER_ALLOW_NEW_USER=false to enable self-service binding (FR-1.1)",
+		)
+	}
+	return nil
+}
 
 // BindConfig 自助绑定相关配置(NFR-4 全部走 env,不硬编码)。
 //

@@ -57,6 +57,13 @@ var (
 	// 与"SMSService 内部失败"区分,让 handler 把前者翻 400(业务前提不满足,
 	// 客户端不应当 retry),后者翻 500(基础设施异常,可重试)。
 	ErrBindNoPhone = errors.New("oidc: bind claims has no verified phone")
+	// ErrBindConflictNeedManual claims 命中多条 dmwork user(同 phone 多账号),
+	// 自助流程无法判定,走 P1 Admin 人工兜底。
+	ErrBindConflictNeedManual = errors.New("oidc: bind claims match multiple dmwork users")
+	// ErrBindAlreadyBound 同 (issuer, sub) 已绑到别的 uid;或同 (uid, issuer)
+	// 已存在另一 sub。两种都触发 DB 唯一约束 → 1062,confirm 路径需要分别
+	// 翻成对用户更友好的 409。
+	ErrBindAlreadyBound = errors.New("oidc: bind identity already exists")
 )
 
 // ---------- memory impl (单测 + 本地开发) ----------

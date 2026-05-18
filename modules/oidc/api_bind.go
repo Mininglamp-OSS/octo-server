@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"go.uber.org/zap"
 )
@@ -39,6 +40,7 @@ func (o *OIDC) bindRoutes(g bindRouteGroup) {
 	g.POST("/bind/verify/password", o.bindVerifyPassword)
 	g.POST("/bind/verify/otp/send", o.bindOTPSend)
 	g.POST("/bind/verify/otp/check", o.bindOTPCheck)
+	g.POST("/bind/confirm", o.bindConfirm)
 }
 
 // bindInfo GET /bind/info?token=...  → 脱敏身份信息 + 可用方法(FR-2)。
@@ -172,6 +174,94 @@ func (o *OIDC) handleBindVerifyErr(c *wkhttp.Context, path, token string, err er
 	}
 }
 
+// bindConfirm POST /bind/confirm  {token}
+//
+// 用户在确认页点"绑定"后调用(FR-4.1)。串行步骤:
+//   1. service.Confirm 写 user_oidc_identity + 调 IssueSession 拿 LoginRespJSON
+//   2. authcode.SetAuthcode 回填原发起设备的 ThirdAuthcode(FR-6.3 跨设备)
+//   3. 同时把 LoginRespJSON 直接返给当前设备,前端可选择走 ThirdAuthcode 或
+//      response body(若当前设备 == 发起设备,二者等价)
+//
+// 失败码:
+//   - 400 token 缺失/非法
+//   - 401 状态机不在 verified(用户没完成二次验证就 confirm)
+//   - 409 已绑定(uk_uid_issuer / uk_issuer_subject 命中,提示直接登录)
+//   - 410 token 已过期/未知
+//   - 429 confirm 次数超 ConfirmMax(SR-2.1)
+//   - 500 内部错误
+func (o *OIDC) bindConfirm(c *wkhttp.Context) {
+	var req struct {
+		Token string `json:"token"`
+	}
+	if err := c.BindJSON(&req); err != nil || !authcodeRe.MatchString(req.Token) {
+		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("token required"))
+		return
+	}
+	ctx := c.Request.Context()
+	resp, err := o.bind.Confirm(ctx, req.Token)
+	if err != nil {
+		o.handleBindConfirmErr(c, req.Token, err)
+		return
+	}
+	// 回填原发起设备的 ThirdAuthcode key,让 A 设备的轮询能拿到 LoginRespJSON
+	// (FR-6.3 跨设备流转)。同设备时这一步与 response body 等价,前端任选其一。
+	// 写失败不致命:用户在 B 设备(当前)已经拿到了 LoginRespJSON。
+	if resp.SD != nil && resp.SD.ClientAuthcode != "" && o.authcode != nil {
+		if e := o.authcode.SetAuthcode(ctx, resp.SD.ClientAuthcode,
+			resp.IssueResp.LoginRespJSON, thirdAuthcodeTTL); e != nil {
+			o.Warn("OIDC bind confirm: write ThirdAuthcode failed (non-fatal)",
+				zap.String("trace_id", newTraceID()), zap.Error(e))
+		}
+	}
+	o.writeAudit(resp.UID, EventBindConfirmOK, stateFromCtx(c), "")
+	c.JSON(http.StatusOK, map[string]interface{}{
+		"status":      "ok",
+		"login_resp":  resp.IssueResp.LoginRespJSON,
+		"uid":         resp.UID,
+	})
+}
+
+// handleBindConfirmErr Confirm 路径的错误码翻译,与 verify 路径区分:
+// 已绑定 → 409("已经绑定,直接用 OIDC 登录")。
+func (o *OIDC) handleBindConfirmErr(c *wkhttp.Context, token string, err error) {
+	switch {
+	case errors.Is(err, ErrBindNotFound):
+		c.AbortWithStatusJSON(http.StatusGone, errMsg("token expired or not found"))
+	case errors.Is(err, ErrBindRateLimited):
+		c.AbortWithStatusJSON(http.StatusTooManyRequests, errMsg("too many confirm attempts"))
+	case errors.Is(err, ErrBindStatusConflict):
+		// 状态不是 verified —— 用户跳过了二次验证,或并发 confirm 撞上(AC-6)。
+		c.AbortWithStatusJSON(http.StatusUnauthorized, errMsg("verify before confirm"))
+	case errors.Is(err, ErrBindAlreadyBound):
+		c.AbortWithStatusJSON(http.StatusConflict,
+			errMsg("identity already bound; please sign in via OIDC directly"))
+	default:
+		o.Error("OIDC bind confirm failed (internal)",
+			zap.String("token", token), zap.Error(err))
+		o.writeAudit("bind:"+token, EventBindConfirmFail, stateFromCtx(c), err.Error())
+		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("internal error"))
+	}
+}
+
+// stateFromCtx 从 HTTP 请求里抽出 IP/UA 拼一个最小 StateData 给审计写。
+// 不复用 callback 阶段的 sd(那个在 bind_token 签发时就固化在 BindSession 里);
+// 这里关心的是"用户当前在哪台设备完成的 confirm",对运维事后追溯有意义。
+func stateFromCtx(c *wkhttp.Context) *StateData {
+	return &StateData{
+		IP:        clientIP(c),
+		UserAgent: c.Request.UserAgent(),
+	}
+}
+
+// clientIP 抽出来避免对 util 包的多余依赖;直接读 Request.RemoteAddr 兜底。
+// 生产路径前置代理时由 util.GetClientPublicIP 透 X-Forwarded-For,这里测试
+// 走 httptest 不会有代理,RemoteAddr 即真实 IP。
+func clientIP(c *wkhttp.Context) string {
+	// 透 util 而非 net.SplitHostPort:与 callback 路径行为对齐,避免反向代理头
+	// 解析差异引入审计字段不一致。
+	return util.GetClientPublicIP(c.Request)
+}
+
 // dbBindLocator 生产路径下的 BindLocator 实现:走 oidc.DB 直接查 user 表。
 //
 // 直接 SQL 不走 user.IService 是因为:
@@ -201,6 +291,21 @@ func (l dbBindLocator) UIDByUsername(username string) (string, error) {
 		return "", nil
 	}
 	return uids[0], nil
+}
+
+// UIDsByPhone 与 service.userLookup.UIDsByPhone 等价 —— oidc.DB 已有同名方法,
+// 这里只是 BindLocator 接口的桥接,语义透传。
+//
+// 多返回是因为 dmwork user 表的 (zone, phone) 无强唯一约束,VerifySMS 在多
+// 匹配场景会走 ErrBindConflictNeedManual 兜底,不在本层做去重。
+func (l dbBindLocator) UIDsByPhone(zone, phone string) ([]string, error) {
+	if zone == "" || phone == "" {
+		return nil, nil
+	}
+	if l.db == nil {
+		return nil, fmt.Errorf("oidc bind locator: db not initialised")
+	}
+	return l.db.QueryUIDsByPhone(zone, phone)
 }
 
 // handleBindOTPSendErr 区分三种语义:

@@ -24,12 +24,14 @@ type BindAuthenticator interface {
 	VerifyOIDCBindSMS(ctx context.Context, zone, phone, code string) error
 }
 
-// BindLocator 把用户输入(目前只支持 username)解析到 dmwork uid。
+// BindLocator 把用户输入(username)或 claims phone 解析到 dmwork uid。
 //
-// 仅在密码路径使用 —— 短信路径 zone/phone 直接从 claims snapshot 取(FR-3.3)。
-// 多匹配场景按需扩展(P0 假定 username 全局唯一,有冲突单独走 P1 Admin 兜底)。
+// 多匹配场景按需扩展(P0 假定 username 全局唯一);UIDsByPhone 返回切片是因为
+// dmwork user 表的 (zone, phone) 不是强唯一约束 —— 历史脏数据可能有重复。
+// VerifySMS 路径多匹配 → ErrBindConflictNeedManual,走 P1 Admin 兜底。
 type BindLocator interface {
 	UIDByUsername(username string) (string, error)
+	UIDsByPhone(zone, phone string) ([]string, error)
 }
 
 // BindInfoResp /info 端点返回给前端的脱敏身份信息(FR-2)。
@@ -47,11 +49,17 @@ type BindInfoResp struct {
 //
 // 不持有 HTTP 上下文 / *wkhttp.Context;handler 层负责 HTTP 解析、CallbackGuard
 // IP 限流、审计写入(events 在 model.go 已就位)。
+//
+// identity / users 字段在 PR3 阶段未注入(nil)—— 仅 Confirm 路径用到,PR4
+// callback 接管时由 Init() 传入。其他 5 个方法(Issue/Info/Verify*/SendSMS)
+// 不依赖这两个字段,PR3 单测可以不注入。
 type BindService struct {
-	cfg     BindConfig
-	store   BindStore
-	auth    BindAuthenticator
-	locator BindLocator
+	cfg      BindConfig
+	store    BindStore
+	auth     BindAuthenticator
+	locator  BindLocator
+	identity identityStore // PR4: confirm 路径写 user_oidc_identity
+	users    userLookup    // PR4: confirm 路径调 IssueSession 签发 dmwork 会话
 }
 
 func newBindService(cfg BindConfig, store BindStore, auth BindAuthenticator, locator BindLocator) *BindService {
@@ -225,9 +233,137 @@ func (s *BindService) VerifySMS(ctx context.Context, jti, code string) error {
 	if err := s.auth.VerifyOIDCBindSMS(ctx, zone, phone, code); err != nil {
 		return fmt.Errorf("oidc bind VerifySMS: auth: %w", err)
 	}
+	// 用 claims phone 在 dmwork user 表找候选 uid:
+	//   - 单匹配 → fill CandidateUID,confirm 阶段直接用;
+	//   - 多匹配 → ErrBindConflictNeedManual,走 P1 Admin 兜底;
+	//   - 0 匹配 → 拒绝(confirm 没有目标可绑)。
+	// 与 service.go ResolveOrLink 的 phone autolink 行为对齐,语义可预测。
+	uids, lerr := s.locator.UIDsByPhone(zone, phone)
+	if lerr != nil {
+		return fmt.Errorf("oidc bind VerifySMS: locate phone: %w", lerr)
+	}
+	switch len(uids) {
+	case 0:
+		return errors.New("oidc bind VerifySMS: no dmwork user matches claims phone")
+	case 1:
+		sess.CandidateUID = uids[0]
+	default:
+		return ErrBindConflictNeedManual
+	}
 	sess.VerifiedMethod = BindMethodSMSOTP
 	sess.Status = BindStatusVerified
 	return s.saveVerified(ctx, sess)
+}
+
+// BindConfirmResp Confirm 返回给 handler 的完整快照。
+// handler 拿 IssueResp.LoginRespJSON 写 ThirdAuthcode,SD 用来回填原发起设备
+// 的 authcode key(FR-6.3 跨设备流转)。
+type BindConfirmResp struct {
+	IssueResp *IssueSessionResp
+	SD        *StateData
+	UID       string
+	Issuer    string
+}
+
+// Confirm 自助绑定终态写入。串行步骤:
+//
+//  1. Get session(不消费 —— 先校验状态,再原子 Consume,避免 cas-then-consume
+//     竞态被攻击者反复触发审计/限流计数)
+//  2. ConfirmMax counter +1(SR-2.1)
+//  3. 校验 Status == verified;否则拒绝
+//  4. identity.Insert((uid, issuer, sub)) —— DB uk_issuer_subject + uk_uid_issuer
+//     兜底 SR-5;duplicate-key → ErrBindAlreadyBound
+//  5. users.IssueSession 签发 dmwork 会话
+//  6. Consume session(SR-1 单次消费,即便 5/6 失败也由 caller 决定是否清场)
+//
+// 并发防护(AC-6):多个并发 confirm 同 jti,只有一个能拿到 status=verified
+// 并写入 identity;其他要么撞 status conflict,要么撞 DB unique constraint。
+// 都会返回明确错误,不会重复写。
+func (s *BindService) Confirm(ctx context.Context, jti string) (*BindConfirmResp, error) {
+	if s.identity == nil || s.users == nil {
+		return nil, errors.New("oidc bind Confirm: not configured (identity/users nil)")
+	}
+	sess, err := s.store.Get(ctx, jti)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.store.IncrAndCheck(ctx,
+		"bind:confirm:"+jti, s.cfg.ConfirmMax, s.cfg.TokenTTL); err != nil {
+		return nil, err
+	}
+	if sess.Status != BindStatusVerified {
+		return nil, ErrBindStatusConflict
+	}
+	if sess.CandidateUID == "" {
+		// VerifySMS 单匹配会 fill, VerifyPassword 也 fill;走到这里说明
+		// 状态机被异常推进了,拒绝写脏数据。
+		return nil, errors.New("oidc bind Confirm: candidate_uid empty")
+	}
+	claims, err := decodeClaimsSnapshot(sess.ClaimsSnapshot)
+	if err != nil {
+		return nil, err
+	}
+	sd, err := decodeSDSnapshot(sess.SDSnapshot)
+	if err != nil {
+		return nil, err
+	}
+	// 写 identity binding —— uk_uid_issuer / uk_issuer_subject 兜底竞态。
+	if err := s.identity.Insert(&IdentityModel{
+		UID:           sess.CandidateUID,
+		Issuer:        claims.Issuer,
+		Subject:       claims.Subject,
+		Email:         claims.Email,
+		EmailVerified: boolToInt(claims.EmailVerified),
+		Phone:         claims.PhoneNumber,
+		PhoneVerified: boolToInt(claims.PhoneVerified),
+		LinkedAt:      time.Now(),
+	}); err != nil {
+		if isDuplicateKeyError(err) {
+			return nil, ErrBindAlreadyBound
+		}
+		return nil, fmt.Errorf("oidc bind Confirm: insert identity: %w", err)
+	}
+	// 签发 dmwork 会话。沿用 callback 的 IssueSessionReq 形状,从 SD snapshot
+	// 取设备 flag / IP,从 claims 取 name/email/phone/zone。
+	zone, phone := extractZone(claims.PhoneNumber), extractPhone(claims.PhoneNumber)
+	issueReq := IssueSessionReq{
+		UID:        sess.CandidateUID,
+		CreateUser: false, // 绑定路径都是老用户,绝不在 confirm 阶段建用户
+		Name:       claims.Name,
+		Email:      claims.Email,
+		Phone:      phone,
+		Zone:       zone,
+		DeviceFlag: sd.DeviceFlag,
+		PublicIP:   sd.IP,
+	}
+	resp, err := s.users.IssueSession(ctx, issueReq)
+	if err != nil {
+		// identity 已写但 session 签发失败:不消费 token,让客户端可以重试
+		// 拿同一 token 再 confirm 一次。第二次 identity.Insert 会撞唯一约束
+		// → ErrBindAlreadyBound,handler 翻成 409 提示"已绑定,直接登录"。
+		// 比"identity 写了但用户不知道"的丢失更可控。
+		return nil, fmt.Errorf("oidc bind Confirm: issue session: %w", err)
+	}
+	// 单次消费:成功才删 session,避免回放。
+	if _, err := s.store.Consume(ctx, jti); err != nil {
+		// Consume 失败不致命:session TTL 自己会到期。记 warn,不阻断登录。
+		// 注意:这里**绝不能**回滚 identity / session —— 用户已经登录成功了。
+	}
+	return &BindConfirmResp{
+		IssueResp: resp,
+		SD:        sd,
+		UID:       sess.CandidateUID,
+		Issuer:    claims.Issuer,
+	}, nil
+}
+
+// decodeSDSnapshot 与 decodeClaimsSnapshot 对称。
+func decodeSDSnapshot(b []byte) (*StateData, error) {
+	var sd StateData
+	if err := json.Unmarshal(b, &sd); err != nil {
+		return nil, fmt.Errorf("oidc bind: decode sd snapshot: %w", err)
+	}
+	return &sd, nil
 }
 
 // saveVerified 用整段 Save 更新 sess(memory/redis 都覆盖整 key,等价于
