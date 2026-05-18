@@ -147,6 +147,16 @@ func (u *User) giteeOAuth(c *wkhttp.Context) {
 		go u.sentWelcomeMsg(publicIP, userInfoM.UID)
 	} else {
 		if common.EnsureSystemSettings(u.ctx).RegisterOff() {
+			// 必须先把 authcode 标记为登录失败再返回:thirdAuthcode 起手把 Redis
+			// 里的 key 置为 "1"(等待中),后续成功/失败路径都靠下面的 SetAndExpire
+			// 推进状态。直接 return 会让前端的 /thirdlogin/authstatus 轮询一直拿
+			// 到 "等待中" 直至 5min TTL 过期,而非立刻看到登录失败。
+			// 与 OIDC failure 路径(modules/oidc/api.go SetAuthcode "0")对齐。
+			if redisErr := u.ctx.GetRedisConn().SetAndExpire(
+				fmt.Sprintf("%s%s", ThirdAuthcodePrefix, authcode), "0", time.Minute*1,
+			); redisErr != nil {
+				u.Error("write authcode failure marker after RegisterOff", zap.Error(redisErr))
+			}
 			c.ResponseError(errors.New("注册通道暂不开放"))
 			return
 		}

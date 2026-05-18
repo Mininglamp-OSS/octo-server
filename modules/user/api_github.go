@@ -84,6 +84,15 @@ func (u *User) githubOAuth(c *wkhttp.Context) {
 		go u.sentWelcomeMsg(publicIP, userInfoM.UID)
 	} else {
 		if common.EnsureSystemSettings(u.ctx).RegisterOff() {
+			// 必须先把 authcode 标记为登录失败再返回,详见 api_gitee.go 同位
+			// 注释:thirdAuthcode 起手把 Redis 写成 "1",前端轮询靠下面的
+			// SetAndExpire 推进。直接 return 会让 /thirdlogin/authstatus 一直
+			// 拿到"等待中"直到 5min TTL 过期。
+			if redisErr := u.ctx.GetRedisConn().SetAndExpire(
+				fmt.Sprintf("%s%s", ThirdAuthcodePrefix, authcode), "0", time.Minute*1,
+			); redisErr != nil {
+				u.Error("write authcode failure marker after RegisterOff", zap.Error(redisErr))
+			}
 			c.ResponseError(errors.New("注册通道暂不开放"))
 			return
 		}
