@@ -46,6 +46,7 @@ import (
 	_ "github.com/Mininglamp-OSS/octo-server/modules/openapi"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/qrcode"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/report"
+	_ "github.com/Mininglamp-OSS/octo-server/modules/runtime"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/search"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/space"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/statistics"
