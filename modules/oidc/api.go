@@ -552,12 +552,14 @@ func (o *OIDC) callback(c *wkhttp.Context) {
 		if o.bind.ShouldHandle(err, claims) {
 			jti, ierr := o.bind.Issue(c.Request.Context(), claims, sd)
 			if ierr == nil {
-				result = "bind_pending"
+				result = "bind_pending" // 已在 callbackResultLabels 注册
 				o.writeAudit("bind:"+jti, EventBindIssued, sd, "")
 				o.redirectToBindPage(c, sd, jti)
 				return
 			}
 			// Issue 失败:不让"bind 引擎抖动"把整条 OIDC 登录拖死,继续退回旧路径。
+			// 失败原因记 warn,运维通过 oidc_bind_request_total 看不到这一脚 ——
+			// 是有意的,这种"bind 接管异常但回落"应该看 callback_total{result=resolve_fail}。
 			o.Warn("OIDC bind Issue failed, falling back to legacy fail path",
 				zap.String("trace_id", traceID), zap.Error(ierr))
 		}

@@ -586,6 +586,79 @@ func TestBindService_Confirm_IssueSessionFailure(t *testing.T) {
 	}
 }
 
+// TestBindService_Confirm_IssueSessionFail_RetryHitsAlreadyBound 锁定 reviewer
+// 提的"identity 已写但 IssueSession 失败 → 客户端重试"的故障恢复行为:
+//   - 第 1 次 confirm:identity.Insert 成功 + IssueSession 失败 → 返错,
+//     session 不消费(用户拿 token 还可以再试)
+//   - 第 2 次 confirm:identity 已存在 → uk_uid_issuer 撞 → ErrBindAlreadyBound
+//     handler 翻 409,前端引导用户走"已绑定,直接 OIDC 登录"
+//
+// 这条路径如果哪天行为变了(比如 identity.Insert 成功后立即 Consume),会破坏
+// 已上线流程,会被这个测试抓到。
+func TestBindService_Confirm_IssueSessionFail_RetryHitsAlreadyBound(t *testing.T) {
+	h := newBindHarness(t)
+	h.auth.verifyPasswordResp.matched = true
+	h.loc.byUsername["alice"] = "u-alice"
+	h.users.err = errors.New("transient downstream")
+
+	jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	_ = h.svc.VerifyPassword(context.Background(), jti, "alice", "Pwd@1")
+	// 第 1 次 confirm:IssueSession 失败 → 返错,但 identity 已写入
+	if _, err := h.svc.Confirm(context.Background(), jti); err == nil {
+		t.Fatal("first confirm should fail (IssueSession down)")
+	}
+	if len(h.identity.inserted) != 1 {
+		t.Fatalf("first confirm should still insert identity, got %d inserts", len(h.identity.inserted))
+	}
+	// session 仍存在(未 Consume),客户端可以重试
+	if _, err := h.store.Get(context.Background(), jti); err != nil {
+		t.Fatalf("session must remain for retry, got err=%v", err)
+	}
+	// 模拟 DB 端 uk_uid_issuer 兜底:第 2 次 Insert 撞唯一约束
+	h.identity.insertErr = mockDuplicateKeyErr()
+	// IssueSession 恢复 —— 但不应该走到这一步
+	h.users.err = nil
+	h.users.resp = &IssueSessionResp{UID: "u-alice", LoginRespJSON: "{}"}
+
+	_, err := h.svc.Confirm(context.Background(), jti)
+	if !errors.Is(err, ErrBindAlreadyBound) {
+		t.Fatalf("retry must surface ErrBindAlreadyBound (handler -> 409), got %v", err)
+	}
+}
+
+// TestBindService_VerifyPassword_AuthRejectedSentinel 锁定密码错走 ErrBindAuthRejected,
+// handler 通过 errors.Is 即可判定 401 vs 500。
+func TestBindService_VerifyPassword_AuthRejectedSentinel(t *testing.T) {
+	h := newBindHarness(t)
+	h.auth.verifyPasswordResp.matched = false
+	h.auth.verifyPasswordResp.reason = BindReasonForTest("password_mismatch")
+	h.loc.byUsername["alice"] = "u-alice"
+
+	jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	err := h.svc.VerifyPassword(context.Background(), jti, "alice", "wrong")
+	if !errors.Is(err, ErrBindAuthRejected) {
+		t.Fatalf("wrong password must wrap ErrBindAuthRejected (for 401 mapping), got %v", err)
+	}
+}
+
+// TestBindService_VerifyPassword_InfraErrorNotSentinel 内部错误(DB 抖动)
+// 不应当包成 ErrBindAuthRejected —— 否则 metric 错把 500 计为 401。
+func TestBindService_VerifyPassword_InfraErrorNotSentinel(t *testing.T) {
+	h := newBindHarness(t)
+	h.auth.verifyPasswordResp.err = errors.New("db timeout")
+	h.loc.byUsername["alice"] = "u-alice"
+
+	jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	err := h.svc.VerifyPassword(context.Background(), jti, "alice", "x")
+	if errors.Is(err, ErrBindAuthRejected) {
+		t.Fatalf("infra error must NOT wrap ErrBindAuthRejected (would mask 500 as 401), got %v", err)
+	}
+}
+
+// BindReasonForTest 测试 helper:只是个 string alias 避免在 test 文件硬编码
+// 真实的 BindReason* 常量(那些定义在 user 包,oidc 测试不该跨包依赖)。
+func BindReasonForTest(s string) string { return s }
+
 // TestBindService_Confirm_RateLimited 每 jti confirm 计数走 ConfirmMax,
 // 即便 verified 状态没真正消费,过阈值也直接拒(挡攻击者反复 confirm 试探
 // downstream issue session 异常)。

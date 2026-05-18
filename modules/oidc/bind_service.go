@@ -9,6 +9,9 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
+	"go.uber.org/zap"
 )
 
 // BindAuthenticator OIDC 自助绑定流程对 user 模块的最小依赖接口。
@@ -71,7 +74,7 @@ func newBindService(cfg BindConfig, store BindStore, auth BindAuthenticator, loc
 //
 // 不在此处写 audit —— handler 在拿到 jti 后统一写 EventBindIssued
 // (handler 持 HTTP 上下文,IP/UA/trace_id 都齐)。
-func (s *BindService) Issue(_ context.Context, claims *IDTokenClaims, sd *StateData) (string, error) {
+func (s *BindService) Issue(ctx context.Context, claims *IDTokenClaims, sd *StateData) (string, error) {
 	if claims == nil || claims.Issuer == "" || claims.Subject == "" {
 		return "", fmt.Errorf("oidc bind Issue: claims iss/sub required")
 	}
@@ -101,7 +104,7 @@ func (s *BindService) Issue(_ context.Context, claims *IDTokenClaims, sd *StateD
 		OriginUA:       sd.UserAgent,
 		CreatedAt:      nowUnix(),
 	}
-	if err := s.store.Save(context.Background(), sess, s.cfg.TokenTTL); err != nil {
+	if err := s.store.Save(ctx, sess, s.cfg.TokenTTL); err != nil {
 		return "", fmt.Errorf("oidc bind Issue: save: %w", err)
 	}
 	return jti, nil
@@ -109,8 +112,8 @@ func (s *BindService) Issue(_ context.Context, claims *IDTokenClaims, sd *StateD
 
 // Info 返回脱敏 claims + 可用方法。可用方法 = 配置 Methods ∩ 当前 claims 支持
 // 的手段(claims 无 verified phone → 屏蔽 sms_otp,FR-3.3)。
-func (s *BindService) Info(_ context.Context, jti string) (*BindInfoResp, error) {
-	sess, err := s.store.Get(context.Background(), jti)
+func (s *BindService) Info(ctx context.Context, jti string) (*BindInfoResp, error) {
+	sess, err := s.store.Get(ctx, jti)
 	if err != nil {
 		return nil, err
 	}
@@ -166,10 +169,14 @@ func (s *BindService) VerifyPassword(ctx context.Context, jti, identifier, passw
 	}
 	matched, reason, aerr := s.auth.VerifyPasswordByUID(ctx, uid, password)
 	if aerr != nil {
+		// 内部错误(DB/网络):wrap aerr,handler 看不到 ErrBindAuthRejected,
+		// metric 落 internal_error / HTTP 500。
 		return fmt.Errorf("oidc bind VerifyPassword: auth: %w", aerr)
 	}
 	if !matched {
-		return fmt.Errorf("oidc bind VerifyPassword: rejected: %s", reason)
+		// 业务拒绝:wrap ErrBindAuthRejected,handler 翻 401。
+		// reason 只用于 zap.Error / service 层日志,不直接给客户端 / 审计 reason 列。
+		return fmt.Errorf("oidc bind VerifyPassword: %w (%s)", ErrBindAuthRejected, reason)
 	}
 	// 用 *Service.store 直接改 session:CAS issued→verified,顺便回写
 	// CandidateUID + VerifiedMethod。memory/redis 两个 store 的 UpdateStatus
@@ -231,7 +238,9 @@ func (s *BindService) VerifySMS(ctx context.Context, jti, code string) error {
 		return err
 	}
 	if err := s.auth.VerifyOIDCBindSMS(ctx, zone, phone, code); err != nil {
-		return fmt.Errorf("oidc bind VerifySMS: auth: %w", err)
+		// commonapi.SMSService.Verify 把"验证码错误"和"未发送/已过期"都包成
+		// errors.New 字符串错误,无法精确判别。统一按"业务拒绝"处理 → 401 / unauthorized。
+		return fmt.Errorf("oidc bind VerifySMS: %w (%v)", ErrBindAuthRejected, err)
 	}
 	// 用 claims phone 在 dmwork user 表找候选 uid:
 	//   - 单匹配 → fill CandidateUID,confirm 阶段直接用;
@@ -345,9 +354,12 @@ func (s *BindService) Confirm(ctx context.Context, jti string) (*BindConfirmResp
 		return nil, fmt.Errorf("oidc bind Confirm: issue session: %w", err)
 	}
 	// 单次消费:成功才删 session,避免回放。
-	if _, err := s.store.Consume(ctx, jti); err != nil {
-		// Consume 失败不致命:session TTL 自己会到期。记 warn,不阻断登录。
-		// 注意:这里**绝不能**回滚 identity / session —— 用户已经登录成功了。
+	if _, cerr := s.store.Consume(ctx, jti); cerr != nil {
+		// Consume 失败不致命:session TTL 自己会到期。注意:这里**绝不能**
+		// 回滚 identity / session —— 用户已经登录成功了。
+		// log 让运维察觉 Redis 抖动(否则 5min 后 TTL 静默清理,问题消失无痕)。
+		log.Warn("OIDC bind Confirm: consume session failed (non-fatal, will TTL out)",
+			zap.String("jti_hash", subHash(jti)), zap.Error(cerr))
 	}
 	return &BindConfirmResp{
 		IssueResp: resp,

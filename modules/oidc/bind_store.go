@@ -64,6 +64,10 @@ var (
 	// 已存在另一 sub。两种都触发 DB 唯一约束 → 1062,confirm 路径需要分别
 	// 翻成对用户更友好的 409。
 	ErrBindAlreadyBound = errors.New("oidc: bind identity already exists")
+	// ErrBindAuthRejected 用户输入(密码/OTP)在底层校验被拒绝。与"内部错误"
+	// 区分,让 metric label 能正确归到 unauthorized 而非 internal_error。
+	// service 层用它包装 auth.* 的 matched=false / VerifyOIDCBindSMS 拒绝。
+	ErrBindAuthRejected = errors.New("oidc: bind auth rejected")
 )
 
 // ---------- memory impl (单测 + 本地开发) ----------

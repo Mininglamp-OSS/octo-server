@@ -4,11 +4,48 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"go.uber.org/zap"
 )
+
+// auditReason 审计 reason 列的安全写入:
+//   - 截断到 maxAuditDetail(api.go:38)防灌爆 + 防潜在的密码/凭据字面值
+//     被反向代理/客户端塞进 err.Error() 路径(纵深防御);
+//   - 空字符串原样返回,调用方决定是否带 reason。
+//
+// **不**做敏感词过滤:那是黑名单思路,容易遗漏;靠"截断 + reason 字面来自
+// service 层而非用户输入"的契约。service 层的错误消息(bind_service.go)
+// 由代码控制,不会拼用户原文。
+func auditReason(s string) string {
+	if len(s) > maxAuditDetail {
+		return s[:maxAuditDetail]
+	}
+	return s
+}
+
+// bindMetricRecord 在 handler 入口 defer,统一上报:
+//   - bind_request_total{endpoint, result}
+//   - bind_request_duration_seconds{endpoint}
+//
+// result 由 handler 写到 *string 上;默认 "internal_error" 保证未显式置位
+// 的路径(panic 之外)也被归到 5xx 桶,告警可定位。
+type bindMetricRecord struct {
+	endpoint string
+	result   string
+	start    time.Time
+}
+
+func startBindMetric(endpoint string) *bindMetricRecord {
+	return &bindMetricRecord{endpoint: endpoint, result: "internal_error", start: time.Now()}
+}
+
+func (r *bindMetricRecord) finish() {
+	metricBindRequestTotal.WithLabelValues(r.endpoint, r.result).Inc()
+	metricBindRequestDuration.WithLabelValues(r.endpoint).Observe(time.Since(r.start).Seconds())
+}
 
 // bindRouteGroup 把 wkhttp.RouterGroup 暴露的最小路由能力抽出来,让测试可以
 // 用 gin.Engine + 薄 adapter 跑 bindRoutes,避免拉起 wkhttp 全套中间件。
@@ -50,16 +87,22 @@ func (o *OIDC) bindRoutes(g bindRouteGroup) {
 //   - 410 token 已过期 / 已消费(单次性 + 5min TTL)
 //   - 500 服务端错误(claims snapshot 解码失败等内部异常)
 func (o *OIDC) bindInfo(c *wkhttp.Context) {
+	m := startBindMetric("info")
+	defer m.finish()
+
 	token := c.Query("token")
 	if !authcodeRe.MatchString(token) {
+		m.result = "bad_request"
 		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("token invalid"))
 		return
 	}
 	info, err := o.bind.Info(c.Request.Context(), token)
 	if err != nil {
+		m.result = bindResultFromErr(err)
 		o.handleBindLookupErr(c, "bind/info", token, err)
 		return
 	}
+	m.result = "ok"
 	c.JSON(http.StatusOK, info)
 }
 
@@ -72,24 +115,35 @@ func (o *OIDC) bindInfo(c *wkhttp.Context) {
 //   - 429 验证尝试超 VerifyMax(SR-2.1)
 //   - 500 内部错误
 func (o *OIDC) bindVerifyPassword(c *wkhttp.Context) {
+	m := startBindMetric("verify_password")
+	defer m.finish()
+
 	var req struct {
 		Token      string `json:"token"`
 		Identifier string `json:"identifier"`
 		Password   string `json:"password"`
 	}
 	if err := c.BindJSON(&req); err != nil {
+		m.result = "bad_request"
 		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("invalid request body"))
 		return
 	}
 	if !authcodeRe.MatchString(req.Token) || req.Identifier == "" || req.Password == "" {
+		m.result = "bad_request"
 		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("token/identifier/password required"))
 		return
 	}
 	err := o.bind.VerifyPassword(c.Request.Context(), req.Token, req.Identifier, req.Password)
 	if err != nil {
+		m.result = bindResultFromErr(err)
+		// 审计 reason 用通用文案,具体 reason 仅写 zap.Error(在 handleBindVerifyErr)
+		// — 防止 oidc_audit_log 反查"用户存在 vs 密码错"差异。
+		o.writeAudit("bind:"+req.Token, EventBindVerifyFail, stateFromCtx(c), "verify rejected")
 		o.handleBindVerifyErr(c, "bind/verify/password", req.Token, err)
 		return
 	}
+	m.result = "ok"
+	o.writeAudit("bind:"+req.Token, EventBindVerifyOK, stateFromCtx(c), "password")
 	c.JSON(http.StatusOK, map[string]string{"status": "verified"})
 }
 
@@ -101,20 +155,25 @@ func (o *OIDC) bindVerifyPassword(c *wkhttp.Context) {
 //   - 429 发送次数超 OTPSendMax(SR-2.1)
 //   - 500 内部错误(底层 SMSService 异常)
 func (o *OIDC) bindOTPSend(c *wkhttp.Context) {
+	m := startBindMetric("otp_send")
+	defer m.finish()
+
 	var req struct {
 		Token string `json:"token"`
 	}
 	if err := c.BindJSON(&req); err != nil || !authcodeRe.MatchString(req.Token) {
+		m.result = "bad_request"
 		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("token required"))
 		return
 	}
 	err := o.bind.SendSMS(c.Request.Context(), req.Token)
 	if err != nil {
+		m.result = bindResultFromErr(err)
 		o.handleBindOTPSendErr(c, req.Token, err)
 		return
 	}
-	// 审计写入统一在 PR4 callback 接管阶段补齐所有 handler;PR3 此处不写,
-	// 避免与其他三个 handler 不一致导致 dashboard 误读单边数据。
+	m.result = "ok"
+	o.writeAudit("bind:"+req.Token, EventBindOTPSend, stateFromCtx(c), "")
 	c.JSON(http.StatusOK, map[string]string{"status": "sent"})
 }
 
@@ -122,23 +181,34 @@ func (o *OIDC) bindOTPSend(c *wkhttp.Context) {
 //
 // 失败码与 bindVerifyPassword 同构:401 通用拒绝,429 计数超限,410 不存在/过期。
 func (o *OIDC) bindOTPCheck(c *wkhttp.Context) {
+	m := startBindMetric("otp_check")
+	defer m.finish()
+
 	var req struct {
 		Token string `json:"token"`
 		Code  string `json:"code"`
 	}
 	if err := c.BindJSON(&req); err != nil {
+		m.result = "bad_request"
 		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("invalid request body"))
 		return
 	}
 	if !authcodeRe.MatchString(req.Token) || req.Code == "" {
+		m.result = "bad_request"
 		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("token/code required"))
 		return
 	}
 	err := o.bind.VerifySMS(c.Request.Context(), req.Token, req.Code)
 	if err != nil {
+		m.result = bindResultFromErr(err)
+		// 同 verify_password 路径:reason 通用化,具体 err 走 zap.Error。
+		// 防止 oidc_audit_log 反查"phone 不存在" vs "OTP 错"差异。
+		o.writeAudit("bind:"+req.Token, EventBindVerifyFail, stateFromCtx(c), "verify rejected")
 		o.handleBindVerifyErr(c, "bind/verify/otp/check", req.Token, err)
 		return
 	}
+	m.result = "ok"
+	o.writeAudit("bind:"+req.Token, EventBindVerifyOK, stateFromCtx(c), "sms_otp")
 	c.JSON(http.StatusOK, map[string]string{"status": "verified"})
 }
 
@@ -165,12 +235,20 @@ func (o *OIDC) handleBindVerifyErr(c *wkhttp.Context, path, token string, err er
 	case errors.Is(err, ErrBindStatusConflict):
 		// status 不可推:多半是重复 verify,客户端应当跳过直接走 confirm。
 		c.AbortWithStatusJSON(http.StatusConflict, errMsg("already verified"))
-	default:
-		// 业务层 VerifyPassword / VerifySMS 没有错误类型化为哨兵(密码错只返
-		// "rejected: <reason>" 普通 error),此处统一 401 防账号枚举。
+	case errors.Is(err, ErrBindConflictNeedManual):
+		// 多 dmwork 账号对应同 phone:自助流程无法判定,提示走 Admin 兜底。
+		c.AbortWithStatusJSON(http.StatusConflict, errMsg("multiple accounts matched; contact support"))
+	case errors.Is(err, ErrBindAuthRejected):
+		// 业务拒绝(密码错 / OTP 错 / phone 不命中):统一 401 防账号枚举。
+		// 具体 reason 走 zap,客户端只看到通用文案。
 		o.Info("OIDC bind verify rejected",
 			zap.String("path", path), zap.String("token", token), zap.Error(err))
 		c.AbortWithStatusJSON(http.StatusUnauthorized, errMsg("invalid credentials"))
+	default:
+		// 未分类 → 500。bindResultFromErr 同步落 internal_error,告警阈值对齐。
+		o.Error("OIDC bind verify internal error",
+			zap.String("path", path), zap.String("token", token), zap.Error(err))
+		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("internal error"))
 	}
 }
 
@@ -190,19 +268,25 @@ func (o *OIDC) handleBindVerifyErr(c *wkhttp.Context, path, token string, err er
 //   - 429 confirm 次数超 ConfirmMax(SR-2.1)
 //   - 500 内部错误
 func (o *OIDC) bindConfirm(c *wkhttp.Context) {
+	m := startBindMetric("confirm")
+	defer m.finish()
+
 	var req struct {
 		Token string `json:"token"`
 	}
 	if err := c.BindJSON(&req); err != nil || !authcodeRe.MatchString(req.Token) {
+		m.result = "bad_request"
 		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("token required"))
 		return
 	}
 	ctx := c.Request.Context()
 	resp, err := o.bind.Confirm(ctx, req.Token)
 	if err != nil {
+		m.result = bindResultFromErr(err)
 		o.handleBindConfirmErr(c, req.Token, err)
 		return
 	}
+	m.result = "ok"
 	// 回填原发起设备的 ThirdAuthcode key,让 A 设备的轮询能拿到 LoginRespJSON
 	// (FR-6.3 跨设备流转)。同设备时这一步与 response body 等价,前端任选其一。
 	// 写失败不致命:用户在 B 设备(当前)已经拿到了 LoginRespJSON。
@@ -238,7 +322,10 @@ func (o *OIDC) handleBindConfirmErr(c *wkhttp.Context, token string, err error) 
 	default:
 		o.Error("OIDC bind confirm failed (internal)",
 			zap.String("token", token), zap.Error(err))
-		o.writeAudit("bind:"+token, EventBindConfirmFail, stateFromCtx(c), err.Error())
+		// 截断 err.Error() —— 即便我们写到 audit 的是自家 error message,也防
+		// 未来误把第三方 wrap 进来意外注入大字符串/凭据片段。256 字符上限和
+		// 其他 callback 失败审计一致(api.go:38)。
+		o.writeAudit("bind:"+token, EventBindConfirmFail, stateFromCtx(c), auditReason(err.Error()))
 		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("internal error"))
 	}
 }
@@ -260,6 +347,32 @@ func clientIP(c *wkhttp.Context) string {
 	// 透 util 而非 net.SplitHostPort:与 callback 路径行为对齐,避免反向代理头
 	// 解析差异引入审计字段不一致。
 	return util.GetClientPublicIP(c.Request)
+}
+
+// bindResultFromErr 把 BindService 返回的 error 翻译成 metric result label。
+// 错误码 → label 映射与 handle*Err 翻 HTTP 状态码同源(同一个 errors.Is 序),
+// 保证 Grafana 上的 rate_limited 计数和 429 计数一致。
+func bindResultFromErr(err error) string {
+	switch {
+	case errors.Is(err, ErrBindNotFound):
+		return "not_found"
+	case errors.Is(err, ErrBindRateLimited):
+		return "rate_limited"
+	case errors.Is(err, ErrBindStatusConflict):
+		return "conflict"
+	case errors.Is(err, ErrBindAlreadyBound):
+		return "conflict"
+	case errors.Is(err, ErrBindNoPhone):
+		return "bad_request"
+	case errors.Is(err, ErrBindConflictNeedManual):
+		return "conflict"
+	case errors.Is(err, ErrBindAuthRejected):
+		return "unauthorized"
+	default:
+		// 未分类 = 内部异常。dashboard 上看到 internal_error 持续升高就是
+		// 该报警的信号(DB/Redis/底层 SMSService 故障),与 401 不再混淆。
+		return "internal_error"
+	}
 }
 
 // dbBindLocator 生产路径下的 BindLocator 实现:走 oidc.DB 直接查 user 表。
