@@ -140,6 +140,12 @@ func parseThreadChannelID(threadChannelID string) (groupNo, shortID string, err 
 	return parts[0], parts[1], nil
 }
 
+// threadLikePrefix 构造 "{groupNo}____%" 的 LIKE 前缀，并用 '|' 作为转义符
+// （配合 ESCAPE '|' 使用）。集中在一处避免不同调用方对 ESCAPE 字符产生分歧。
+func threadLikePrefix(groupNo string) string {
+	return escapeLike(groupNo) + escapeLike(threadSeparator) + "%"
+}
+
 // escapeLike escapes LIKE special characters for use with ESCAPE '|'.
 // The pipe character is chosen as the escape character because it never
 // appears in snowflake IDs or our thread channel IDs, avoiding the
@@ -230,11 +236,10 @@ func (s *Service) UnfollowChannel(uid, spaceID, groupNo string) error {
 		}); err != nil {
 			return fmt.Errorf("UnfollowChannel upsert group: %w", err)
 		}
-		prefix := escapeLike(groupNo) + escapeLike(threadSeparator) + "%"
 		if _, err := tx.DeleteBySql(
 			"DELETE FROM "+table+
 				" WHERE uid=? AND space_id=? AND target_type=? AND target_id LIKE ? ESCAPE '|'",
-			uid, spaceID, targetTypeThread, prefix,
+			uid, spaceID, targetTypeThread, threadLikePrefix(groupNo),
 		).Exec(); err != nil {
 			return fmt.Errorf("UnfollowChannel delete threads: %w", err)
 		}

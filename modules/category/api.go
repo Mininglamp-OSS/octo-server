@@ -336,32 +336,66 @@ func (c *Category) delete(ctx *wkhttp.Context) {
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	_, err = tx.Update("group_category").
+	// 1. 把分组标记为已删除。
+	// AND uid=? 是防御性过滤——上层 cat.UID != loginUID 检查已能挡住越权，
+	// 这里再加一道，避免将来调用方绕过 ownership 检查时仍能误改他人分组。
+	if _, err = tx.Update("group_category").
 		Set("status", 2).
-		Where("category_id=?", categoryID).
-		Exec()
-	if err != nil {
+		Where("category_id=? AND uid=?", categoryID, loginUID).
+		Exec(); err != nil {
 		c.Error("删除类别失败", zap.Error(err))
 		ctx.ResponseError(errors.New("删除类别失败"))
 		return
 	}
 
-	_, err = tx.Update("group_setting").
+	// 2. 采集该分组下用户名下的群编号列表（在解绑前先读，否则丢失对应关系）。
+	// FOR UPDATE 锁住目标 group_setting 行：本路径走 group_setting → version → ext
+	// 的锁序，moveGroupToCategory 也是同向；不加锁的话同用户并发 move/delete 时
+	// 会出现 G1 既被移到新分组又被标记 group_unfollowed=1 的不一致状态
+	// （PR #74 review by yujiawei P1）。
+	var groupNos []string
+	if _, err = tx.SelectBySql(
+		"SELECT group_no FROM group_setting WHERE category_id=? AND uid=? FOR UPDATE",
+		categoryID, loginUID,
+	).Load(&groupNos); err != nil {
+		c.Error("查询分组下群列表失败", zap.Error(err))
+		ctx.ResponseError(errors.New("删除类别失败"))
+		return
+	}
+
+	// 3. 清空 group_setting.category_id 必须在 bump 之前。
+	// 锁序统一为 group_setting → user_follow_version → user_conversation_ext，
+	// 与 moveGroupToCategory（先 UPDATE group_setting 再 bump）一致，
+	// 否则两路并发时会形成 AB-BA 死锁。
+	// 同时这一步也避免重新关注后 category_id 仍指向已删分组（list 渲染会丢群）。
+	if _, err = tx.Update("group_setting").
 		Set("category_id", nil).
 		Set("category_sort", 0).
 		Where("category_id=? and uid=?", categoryID, loginUID).
-		Exec()
-	if err != nil {
+		Exec(); err != nil {
 		c.Error("清理群设置失败", zap.Error(err))
 		ctx.ResponseError(errors.New("删除类别失败"))
 		return
 	}
 
-	// PR review follow-up: category_id 置 NULL 会让群从 follow tab 消失，
-	// 必须同 tx 内 +1 follow_version，否则客户端拿同样的 follow_version
-	// 会跳过列表重建。
+	// 4. bump follow_version 必须先于 user_conversation_ext 的写操作，
+	// 与 UpdateSort 同序拿 (version → ext) 锁（PR #21 Round-3 blocker #2）。
 	if _, err := convext.BumpFollowVersionTx(tx, loginUID, cat.SpaceID); err != nil {
 		c.Error("更新 follow_version 失败", zap.Error(err))
+		ctx.ResponseError(errors.New("删除类别失败"))
+		return
+	}
+
+	// 5. 退订语义（前端提示「分组下的所有会话将取消关注」）：
+	//    - 群：group_unfollowed=1 + 级联删 thread ext 行
+	//    - DM：DELETE dm_category_id=cat 的 ext 行
+	if err := convext.UnfollowGroupsTx(tx, loginUID, cat.SpaceID, groupNos); err != nil {
+		c.Error("取消关注分组下群失败", zap.Error(err))
+		ctx.ResponseError(errors.New("删除类别失败"))
+		return
+	}
+	if err := convext.UnfollowDMsByCategoryTx(tx, loginUID, cat.SpaceID, categoryID); err != nil {
+		c.Error("取消关注分组下私聊失败", zap.Error(err))
 		ctx.ResponseError(errors.New("删除类别失败"))
 		return
 	}
