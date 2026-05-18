@@ -502,3 +502,84 @@ func (g *testRouteGroup) GET(path string, _ ...wkhttp.HandlerFunc) {
 func (g *testRouteGroup) POST(path string, _ ...wkhttp.HandlerFunc) {
 	g.routes = append(g.routes, "POST "+path)
 }
+
+// TestAPI_BindHandlers_NilBindReturnsServiceUnavailable 锁定 Issue F 修复:
+// Discovery 失败时 Init 早返,o.bind 保持 nil,但 cfg.Bind.Enabled=true 仍
+// 让 bindRoutes 挂上 5 个端点。任一 handler 被调用时第一行就调 o.bind.* →
+// nil pointer panic 影响整个进程。修复后必须返 503 而非 panic。
+func TestAPI_BindHandlers_NilBindReturnsServiceUnavailable(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	o := &OIDC{
+		Log:      log.NewTLog("OIDC-test"),
+		cfg:      &Config{Enabled: true, Bind: BindConfig{Enabled: true}},
+		bind:     nil, // 模拟 Discovery 失败:Init 早返,bind 未构造
+		audit:    newFakeAudit(),
+		authcode: newFakeAuthcode(),
+	}
+	r := newTestBindRouter(o)
+	cases := []struct {
+		method, path, body string
+	}{
+		{"GET", "/v1/auth/oidc/aegis/bind/info?token=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", ""},
+		{"POST", "/v1/auth/oidc/aegis/bind/verify/password",
+			`{"token":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","identifier":"x","password":"y"}`},
+		{"POST", "/v1/auth/oidc/aegis/bind/verify/otp/send",
+			`{"token":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}`},
+		{"POST", "/v1/auth/oidc/aegis/bind/verify/otp/check",
+			`{"token":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","code":"1"}`},
+		{"POST", "/v1/auth/oidc/aegis/bind/confirm",
+			`{"token":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}`},
+	}
+	for _, tc := range cases {
+		var body *bytes.Reader
+		if tc.body != "" {
+			body = bytes.NewReader([]byte(tc.body))
+		} else {
+			body = bytes.NewReader(nil)
+		}
+		req := httptest.NewRequest(tc.method, tc.path, body)
+		if tc.body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		w := httptest.NewRecorder()
+		// 若未修复,handler 内 o.bind.* 会 panic 而非返响应
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s %s: status=%d want 503 (nil bind), body=%s",
+				tc.method, tc.path, w.Code, w.Body.String())
+		}
+	}
+}
+
+// TestAPI_RedirectToBindPage_EmptyBaseWritesAuthcodeZero 锁定 Issue E 修复:
+// RedirectBase 漏配 时 redirectToBindPage 退回失败路径,但前端 ThirdAuthcode
+// 轮询会卡死 5min。必须先 SetAuthcode "0" 让前端尽早感知失败。
+func TestAPI_RedirectToBindPage_EmptyBaseWritesAuthcodeZero(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	fakeAC := newFakeAuthcode()
+	o := &OIDC{
+		Log: log.NewTLog("OIDC-test"),
+		cfg: &Config{
+			Enabled: true,
+			Provider: ProviderConfig{
+				ID: "aegis", ReturnToHosts: []string{"app.example.com"},
+			},
+			Bind: BindConfig{Enabled: true, RedirectBase: ""},
+		},
+		authcode: fakeAC,
+	}
+	// 自建 gin context 直接调
+	r := gin.New()
+	r.GET("/x", func(c *gin.Context) {
+		o.redirectToBindPage(wrapWk(c), &StateData{
+			ClientAuthcode: "ac-empty-base",
+		}, "jti-xyz")
+	})
+	req := httptest.NewRequest("GET", "/x", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if got := fakeAC.get("ac-empty-base"); got != "0" {
+		t.Fatalf("RedirectBase 为空必须先写 ThirdAuthcode \"0\",got %q", got)
+	}
+}

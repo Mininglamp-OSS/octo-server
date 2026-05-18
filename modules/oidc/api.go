@@ -557,7 +557,7 @@ func (o *OIDC) callback(c *wkhttp.Context) {
 			jti, ierr := o.bind.Issue(c.Request.Context(), claims, sd)
 			if ierr == nil {
 				result = "bind_pending" // 已在 callbackResultLabels 注册
-				o.writeAudit("bind:"+jti, EventBindIssued, sd, "")
+				o.writeAudit("bind:"+subHash(jti), EventBindIssued, sd, "")
 				o.redirectToBindPage(c, sd, jti)
 				return
 			}
@@ -975,14 +975,14 @@ func (o *OIDC) redirectToBindPage(c *wkhttp.Context, sd *StateData, jti string) 
 	if base == "" {
 		o.Error("OIDC bind redirect: DM_OIDC_BIND_REDIRECT_BASE not configured, falling back",
 			zap.String("jti_hash", subHash(jti)))
-		o.redirectAfterCallback(c, sd, true)
+		o.failBindRedirect(c, sd)
 		return
 	}
 	target, err := url.Parse(base)
 	if err != nil {
 		o.Error("OIDC bind redirect: invalid RedirectBase",
 			zap.String("base", base), zap.Error(err))
-		o.redirectAfterCallback(c, sd, true)
+		o.failBindRedirect(c, sd)
 		return
 	}
 	q := target.Query()
@@ -999,6 +999,21 @@ func (o *OIDC) redirectToBindPage(c *wkhttp.Context, sd *StateData, jti string) 
 	}
 	target.RawQuery = q.Encode()
 	c.Redirect(http.StatusFound, target.String())
+}
+
+// failBindRedirect 跳转到 bind 页失败(漏配 RedirectBase / 非法 URL)时的兜底:
+// 先把 ThirdAuthcode 写 "0",让原发起设备的前端轮询立即拿到失败信号(否则要等
+// 5min TTL 才会感知,用户会卡在加载态);再走 redirectAfterCallback 失败路径。
+//
+// 写 "0" 失败仅 log:此时已经在异常路径,继续 redirect 比 panic 更可控。
+func (o *OIDC) failBindRedirect(c *wkhttp.Context, sd *StateData) {
+	if o.authcode != nil && sd != nil && sd.ClientAuthcode != "" {
+		if e := o.authcode.SetAuthcode(c.Request.Context(), sd.ClientAuthcode, "0", thirdAuthcodeTTL); e != nil {
+			o.Error("OIDC bind redirect fallback: write ThirdAuthcode \"0\" failed",
+				zap.Error(e))
+		}
+	}
+	o.redirectAfterCallback(c, sd, true)
 }
 
 // redirectAfterCallback 统一 callback 完成后的 302 跳转。

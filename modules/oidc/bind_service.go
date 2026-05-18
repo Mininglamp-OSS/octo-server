@@ -151,9 +151,18 @@ func (s *BindService) availableMethods(claims *IDTokenClaims) []BindMethod {
 // ErrBindRateLimited。密码 / 短信共用同一 counter —— 需求文档 SR-2.1 说
 // "验证尝试 ≤ 5 次",不区分手段。
 func (s *BindService) VerifyPassword(ctx context.Context, jti, identifier, password string) error {
+	if !s.methodEnabled(BindMethodPassword) {
+		return ErrBindMethodDisabled
+	}
 	sess, err := s.store.Get(ctx, jti)
 	if err != nil {
 		return err
+	}
+	// 状态机守卫:只有 issued 才能进 verify,verified/confirmed 都拒绝(409)。
+	// 防身份接管:攻击者拿到 victim bind_token(已 verified)再调一次 verify
+	// 用自己账号 → 覆盖 CandidateUID → confirm 时绑到攻击者 uid。SR-1/SR-5。
+	if sess.Status != BindStatusIssued {
+		return ErrBindStatusConflict
 	}
 	if _, err := s.store.IncrAndCheck(ctx,
 		"bind:verify:"+jti, s.cfg.VerifyMax, s.cfg.TokenTTL); err != nil {
@@ -167,6 +176,15 @@ func (s *BindService) VerifyPassword(ctx context.Context, jti, identifier, passw
 		// 不暴露"用户存在 vs 密码错"差异(SR-6 反账号枚举)。上层统一兜底文案。
 		// wrap ErrBindAuthRejected → handler 翻 401(与密码错路径一致),
 		// 避免归到 internal_error metric 污染告警。
+		//
+		// 仍然消费 uid-fail 限流配额(用 identifier 哈希作为 dimension),
+		// 否则"未知用户路径免费"会形成副信道:攻击者可以从响应延迟之外的
+		// 维度(自己计数请求是否被限)区分"用户存在"与"用户不存在",绕过 SR-6。
+		// 用 subHash(identifier) 而非原文,避免攻击者通过 Redis 监控反查 identifier。
+		if _, lerr := s.store.IncrAndCheck(ctx,
+			bindUIDFailKey("unknown:"+subHash(identifier)), s.cfg.UIDFailPerDay, uidFailWindow); lerr != nil {
+			return lerr
+		}
 		return fmt.Errorf("oidc bind VerifyPassword: %w (unknown identifier)", ErrBindAuthRejected)
 	}
 	matched, reason, aerr := s.auth.VerifyPasswordByUID(ctx, uid, password)
@@ -176,6 +194,14 @@ func (s *BindService) VerifyPassword(ctx context.Context, jti, identifier, passw
 		return fmt.Errorf("oidc bind VerifyPassword: auth: %w", aerr)
 	}
 	if !matched {
+		// SR-2.2 uid 维度防爆破:同 uid 跨 token 的密码失败累计达 UIDFailPerDay
+		// 直接限流(优先于 ErrBindAuthRejected 返回,让攻击者无法用换 token 的
+		// 方式绕过 per-token 的 VerifyMax)。24h 窗口固定 —— 与 TokenTTL 解耦,
+		// SR-2.2 字面"每 uid 每日失败 ≤ 10 次"。
+		if _, lerr := s.store.IncrAndCheck(ctx,
+			bindUIDFailKey(uid), s.cfg.UIDFailPerDay, uidFailWindow); lerr != nil {
+			return lerr
+		}
 		// 业务拒绝:wrap ErrBindAuthRejected,handler 翻 401。
 		// reason 只用于 zap.Error / service 层日志,不直接给客户端 / 审计 reason 列。
 		return fmt.Errorf("oidc bind VerifyPassword: %w (%s)", ErrBindAuthRejected, reason)
@@ -196,6 +222,9 @@ func (s *BindService) VerifyPassword(ctx context.Context, jti, identifier, passw
 // 后者不带 codeType 跨流程串扰(详见 user.SendOIDCBindSMS godoc),所以
 // 这里的 counter 是 bind_token 维度的真正反爆破。
 func (s *BindService) SendSMS(ctx context.Context, jti string) error {
+	if !s.methodEnabled(BindMethodSMSOTP) {
+		return ErrBindMethodDisabled
+	}
 	sess, err := s.store.Get(ctx, jti)
 	if err != nil {
 		return err
@@ -223,9 +252,16 @@ func (s *BindService) SendSMS(ctx context.Context, jti string) error {
 // 直接确认 uid,confirm 阶段由 claims.phone → user 查询定位(P0 用 phone-only
 // 路径时由 service.UIDsByPhone 走);多匹配场景走 P1 Admin。
 func (s *BindService) VerifySMS(ctx context.Context, jti, code string) error {
+	if !s.methodEnabled(BindMethodSMSOTP) {
+		return ErrBindMethodDisabled
+	}
 	sess, err := s.store.Get(ctx, jti)
 	if err != nil {
 		return err
+	}
+	// 状态机守卫:同 VerifyPassword,只允许 issued → verified 的单向迁移。
+	if sess.Status != BindStatusIssued {
+		return ErrBindStatusConflict
 	}
 	claims, err := decodeClaimsSnapshot(sess.ClaimsSnapshot)
 	if err != nil {
@@ -463,6 +499,26 @@ func maskPhoneForBind(phone string) string {
 		return "***"
 	}
 	return "****" + phone[len(phone)-4:]
+}
+
+// uidFailWindow SR-2.2 uid 维度防爆破窗口。固定 24h 与 TokenTTL 解耦 ——
+// 后者按 token 生命周期(5min),前者按"每日 ≤ 10 次失败"语义。变量(非 const)
+// 以便单测可临时缩小窗口验证滚动行为(当前未用,保留扩展位)。
+var uidFailWindow = 24 * time.Hour
+
+// bindUIDFailKey 拼装 SR-2.2 计数器的 Redis key。集中拼装避免漂移。
+func bindUIDFailKey(uid string) string { return "bind:uidfail:" + uid }
+
+// methodEnabled 检查 cfg.Methods 是否启用了 m。配置必须是真实策略:
+// 运维通过 DM_OIDC_BIND_METHODS 关一种方法后,客户端硬调端点也不能绕过 ——
+// 否则配置就退化成 UI 提示,无安全意义。
+func (s *BindService) methodEnabled(m BindMethod) bool {
+	for _, x := range s.cfg.Methods {
+		if x == m {
+			return true
+		}
+	}
+	return false
 }
 
 // nowUnix 抽 var 以便未来 BindService 注入 clock 做 deterministic test。

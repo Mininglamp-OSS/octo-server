@@ -73,6 +73,7 @@ func bindResultLabels() []string {
 		"rate_limited",    // 429
 		"conflict",        // 409:already_bound
 		"internal_error",  // 500
+		"not_ready",       // 503:Discovery 失败,bind service 未构造
 	}
 }
 

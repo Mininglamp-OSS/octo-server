@@ -706,6 +706,140 @@ func TestBindService_Confirm_RateLimited(t *testing.T) {
 	}
 }
 
+// TestBindService_VerifyPassword_RejectsAfterVerified 锁定 Issue D 修复:
+// 一旦 session 已 verified,任何二次 verify 必须被状态机拒绝(409 conflict),
+// 不能再覆盖 CandidateUID。否则攻击者拿 victim 的 bind_token,在 confirm 前
+// 用自己账号再 verify 一次 → CandidateUID 被改 → confirm 时绑到攻击者 uid,
+// 等价于 OIDC 身份接管。
+func TestBindService_VerifyPassword_RejectsAfterVerified(t *testing.T) {
+	h := newBindHarness(t)
+	h.auth.verifyPasswordResp.matched = true
+	h.loc.byUsername["alice"] = "u-alice"
+	h.loc.byUsername["mallory"] = "u-mallory"
+
+	jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	if err := h.svc.VerifyPassword(context.Background(), jti, "alice", "Pwd@1"); err != nil {
+		t.Fatalf("first verify: %v", err)
+	}
+	// 攻击者拿到同 token,用自己账号 verify
+	err := h.svc.VerifyPassword(context.Background(), jti, "mallory", "Pwd@1")
+	if !errors.Is(err, ErrBindStatusConflict) {
+		t.Fatalf("re-verify after verified must be ErrBindStatusConflict, got %v", err)
+	}
+	sess, _ := h.store.Get(context.Background(), jti)
+	if sess.CandidateUID != "u-alice" {
+		t.Fatalf("CandidateUID must NOT be overwritten, got %q", sess.CandidateUID)
+	}
+}
+
+func TestBindService_VerifySMS_RejectsAfterVerified(t *testing.T) {
+	h := newBindHarness(t)
+	h.loc.byPhone["0086|13900000000"] = []string{"u-phone"}
+
+	jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	if err := h.svc.VerifySMS(context.Background(), jti, "1234"); err != nil {
+		t.Fatalf("first verify: %v", err)
+	}
+	err := h.svc.VerifySMS(context.Background(), jti, "1234")
+	if !errors.Is(err, ErrBindStatusConflict) {
+		t.Fatalf("re-verify after verified must be ErrBindStatusConflict, got %v", err)
+	}
+}
+
+// TestBindService_VerifyPassword_RejectsWhenMethodDisabled 锁定 Issue C 修复:
+// cfg.Methods 是真实策略,不仅是 UI 过滤。运维禁掉 password 后,即便客户端
+// 硬调端点,service 必须拒(400 method_disabled)而不能继续走 auth。
+func TestBindService_VerifyPassword_RejectsWhenMethodDisabled(t *testing.T) {
+	h := newBindHarness(t, func(c *BindConfig) {
+		c.Methods = []BindMethod{BindMethodSMSOTP} // password 禁用
+	})
+	h.auth.verifyPasswordResp.matched = true
+	h.loc.byUsername["alice"] = "u-alice"
+
+	jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	err := h.svc.VerifyPassword(context.Background(), jti, "alice", "Pwd@1")
+	if !errors.Is(err, ErrBindMethodDisabled) {
+		t.Fatalf("disabled method must return ErrBindMethodDisabled, got %v", err)
+	}
+	if h.auth.calls.pwdCount != 0 {
+		t.Fatalf("auth must not be called when method disabled, calls=%d", h.auth.calls.pwdCount)
+	}
+}
+
+func TestBindService_SendSMS_RejectsWhenMethodDisabled(t *testing.T) {
+	h := newBindHarness(t, func(c *BindConfig) {
+		c.Methods = []BindMethod{BindMethodPassword} // sms 禁用
+	})
+	jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	err := h.svc.SendSMS(context.Background(), jti)
+	if !errors.Is(err, ErrBindMethodDisabled) {
+		t.Fatalf("disabled sms must return ErrBindMethodDisabled, got %v", err)
+	}
+	if h.auth.calls.sendCount != 0 {
+		t.Fatalf("SMSService must not be called when method disabled, calls=%d", h.auth.calls.sendCount)
+	}
+}
+
+func TestBindService_VerifySMS_RejectsWhenMethodDisabled(t *testing.T) {
+	h := newBindHarness(t, func(c *BindConfig) {
+		c.Methods = []BindMethod{BindMethodPassword}
+	})
+	jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	err := h.svc.VerifySMS(context.Background(), jti, "1234")
+	if !errors.Is(err, ErrBindMethodDisabled) {
+		t.Fatalf("disabled sms verify must return ErrBindMethodDisabled, got %v", err)
+	}
+}
+
+// TestBindService_VerifyPassword_UIDFailPerDayEnforced 锁定 Issue A 修复:
+// 每个 uid 每日密码失败计数达到 UIDFailPerDay 后,后续请求必须直接 ErrBindRateLimited
+// (即便单 token 的 VerifyMax 还没到)。SR-2.2 防"一个 uid 被多 token 攻打"。
+func TestBindService_VerifyPassword_UIDFailPerDayEnforced(t *testing.T) {
+	h := newBindHarness(t, func(c *BindConfig) {
+		c.UIDFailPerDay = 2 // 小阈值便于测试
+		c.VerifyMax = 100   // 隔离 per-token 限流
+	})
+	h.auth.verifyPasswordResp.matched = false
+	h.loc.byUsername["alice"] = "u-alice"
+
+	// 第一个 token: 2 次失败
+	jti1, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	for i := 0; i < 2; i++ {
+		if err := h.svc.VerifyPassword(context.Background(), jti1, "alice", "wrong"); err == nil {
+			t.Fatalf("iter %d: wrong password should error", i)
+		}
+	}
+	// 切换到第二个 token(模拟攻击者在 VerifyMax 限流后换 token 继续),
+	// uid 维度 counter 应当已经 == 2,再 +1 = 3 > limit=2 → 限流。
+	jti2, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	err := h.svc.VerifyPassword(context.Background(), jti2, "alice", "wrong")
+	if !errors.Is(err, ErrBindRateLimited) {
+		t.Fatalf("UIDFailPerDay must rate-limit cross-token attempts, got %v", err)
+	}
+}
+
+// TestBindService_VerifyPassword_UnknownIdentifierConsumesUIDFailBudget 锁定
+// reviewer 提的副信道修复:unknown identifier 不能"免费"穿过 uid-fail 计数,
+// 否则攻击者可以从"我自己是否被限流"反推 identifier 是否存在(绕过 SR-6 反枚举)。
+func TestBindService_VerifyPassword_UnknownIdentifierConsumesUIDFailBudget(t *testing.T) {
+	h := newBindHarness(t, func(c *BindConfig) {
+		c.UIDFailPerDay = 2
+		c.VerifyMax = 100
+	})
+	// 同一不存在的 identifier 反复请求(变更 token 跳出 per-token VerifyMax)
+	for i := 0; i < 2; i++ {
+		jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+		if err := h.svc.VerifyPassword(context.Background(), jti, "ghost", "x"); err == nil {
+			t.Fatalf("iter %d: unknown identifier should still error", i)
+		}
+	}
+	jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	err := h.svc.VerifyPassword(context.Background(), jti, "ghost", "x")
+	if !errors.Is(err, ErrBindRateLimited) {
+		t.Fatalf("repeated unknown identifier must hit uid-fail limit (anti-enumeration), got %v", err)
+	}
+}
+
 // TestBindService_ShouldHandle 一致地决定 callback 失败分支接管。
 // 仅在 (Enabled && issuer in allowlist && err 是可绑定错误) 时返 true。
 func TestBindService_ShouldHandle(t *testing.T) {

@@ -47,6 +47,25 @@ func (r *bindMetricRecord) finish() {
 	metricBindRequestDuration.WithLabelValues(r.endpoint).Observe(time.Since(r.start).Seconds())
 }
 
+// guardBindReady 在每个 bind handler 入口检查 o.bind 是否就绪。
+//
+// 不就绪的真实路径:cfg.Bind.Enabled=true 但 Discovery 失败导致 Init 早返
+// (api.go:170)—— o.bind 仍是 nil,但 cfg.Bind.Enabled 让 bindRoutes 把 5 个
+// 端点挂上了路由。任一 handler 第一行调 o.bind.* 都 nil pointer panic
+// 影响整个进程。
+//
+// 返 true 表示已经写入 503 响应并把 metric.result 置位,handler 应立即 return。
+// 503 而非 500:服务"暂时不可用",运维修复 Discovery / 重启进程后即可恢复,
+// 与 5xx 报警系统语义对齐(transient 而非 bug)。
+func (o *OIDC) guardBindReady(c *wkhttp.Context, m *bindMetricRecord) bool {
+	if o.bind != nil {
+		return false
+	}
+	m.result = "not_ready"
+	c.AbortWithStatusJSON(http.StatusServiceUnavailable, errMsg("bind service not ready"))
+	return true
+}
+
 // bindRouteGroup 把 wkhttp.RouterGroup 暴露的最小路由能力抽出来,让测试可以
 // 用 gin.Engine + 薄 adapter 跑 bindRoutes,避免拉起 wkhttp 全套中间件。
 //
@@ -90,6 +109,9 @@ func (o *OIDC) bindInfo(c *wkhttp.Context) {
 	m := startBindMetric("info")
 	defer m.finish()
 
+	if o.guardBindReady(c, m) {
+		return
+	}
 	token := c.Query("token")
 	if !authcodeRe.MatchString(token) {
 		m.result = "bad_request"
@@ -118,6 +140,9 @@ func (o *OIDC) bindVerifyPassword(c *wkhttp.Context) {
 	m := startBindMetric("verify_password")
 	defer m.finish()
 
+	if o.guardBindReady(c, m) {
+		return
+	}
 	var req struct {
 		Token      string `json:"token"`
 		Identifier string `json:"identifier"`
@@ -138,12 +163,12 @@ func (o *OIDC) bindVerifyPassword(c *wkhttp.Context) {
 		m.result = bindResultFromErr(err)
 		// 审计 reason 用通用文案,具体 reason 仅写 zap.Error(在 handleBindVerifyErr)
 		// — 防止 oidc_audit_log 反查"用户存在 vs 密码错"差异。
-		o.writeAudit("bind:"+req.Token, EventBindVerifyFail, stateFromCtx(c), "verify rejected")
+		o.writeAudit("bind:"+subHash(req.Token), EventBindVerifyFail, stateFromCtx(c), "verify rejected")
 		o.handleBindVerifyErr(c, "bind/verify/password", req.Token, err)
 		return
 	}
 	m.result = "ok"
-	o.writeAudit("bind:"+req.Token, EventBindVerifyOK, stateFromCtx(c), "password")
+	o.writeAudit("bind:"+subHash(req.Token), EventBindVerifyOK, stateFromCtx(c), "password")
 	c.JSON(http.StatusOK, map[string]string{"status": "verified"})
 }
 
@@ -158,6 +183,9 @@ func (o *OIDC) bindOTPSend(c *wkhttp.Context) {
 	m := startBindMetric("otp_send")
 	defer m.finish()
 
+	if o.guardBindReady(c, m) {
+		return
+	}
 	var req struct {
 		Token string `json:"token"`
 	}
@@ -173,7 +201,7 @@ func (o *OIDC) bindOTPSend(c *wkhttp.Context) {
 		return
 	}
 	m.result = "ok"
-	o.writeAudit("bind:"+req.Token, EventBindOTPSend, stateFromCtx(c), "")
+	o.writeAudit("bind:"+subHash(req.Token), EventBindOTPSend, stateFromCtx(c), "")
 	c.JSON(http.StatusOK, map[string]string{"status": "sent"})
 }
 
@@ -184,6 +212,9 @@ func (o *OIDC) bindOTPCheck(c *wkhttp.Context) {
 	m := startBindMetric("otp_check")
 	defer m.finish()
 
+	if o.guardBindReady(c, m) {
+		return
+	}
 	var req struct {
 		Token string `json:"token"`
 		Code  string `json:"code"`
@@ -203,12 +234,12 @@ func (o *OIDC) bindOTPCheck(c *wkhttp.Context) {
 		m.result = bindResultFromErr(err)
 		// 同 verify_password 路径:reason 通用化,具体 err 走 zap.Error。
 		// 防止 oidc_audit_log 反查"phone 不存在" vs "OTP 错"差异。
-		o.writeAudit("bind:"+req.Token, EventBindVerifyFail, stateFromCtx(c), "verify rejected")
+		o.writeAudit("bind:"+subHash(req.Token), EventBindVerifyFail, stateFromCtx(c), "verify rejected")
 		o.handleBindVerifyErr(c, "bind/verify/otp/check", req.Token, err)
 		return
 	}
 	m.result = "ok"
-	o.writeAudit("bind:"+req.Token, EventBindVerifyOK, stateFromCtx(c), "sms_otp")
+	o.writeAudit("bind:"+subHash(req.Token), EventBindVerifyOK, stateFromCtx(c), "sms_otp")
 	c.JSON(http.StatusOK, map[string]string{"status": "verified"})
 }
 
@@ -220,7 +251,7 @@ func (o *OIDC) handleBindLookupErr(c *wkhttp.Context, path, token string, err er
 		return
 	}
 	o.Warn("OIDC bind lookup error",
-		zap.String("path", path), zap.String("token", token), zap.Error(err))
+		zap.String("path", path), zap.String("token_hash", subHash(token)), zap.Error(err))
 	c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("internal error"))
 }
 
@@ -242,16 +273,19 @@ func (o *OIDC) handleBindVerifyErr(c *wkhttp.Context, path, token string, err er
 		// claims 无 phone 但客户端硬调 /verify/otp/check —— 业务前提不满足。
 		// metric (bindResultFromErr) 已归到 bad_request,HTTP 同步 400 保持一致。
 		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("sms not available for this account"))
+	case errors.Is(err, ErrBindMethodDisabled):
+		// 运维通过 DM_OIDC_BIND_METHODS 关了该方法 —— 客户端不应再 retry。
+		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("verification method disabled"))
 	case errors.Is(err, ErrBindAuthRejected):
 		// 业务拒绝(密码错 / OTP 错 / phone 不命中):统一 401 防账号枚举。
 		// 具体 reason 走 zap,客户端只看到通用文案。
 		o.Info("OIDC bind verify rejected",
-			zap.String("path", path), zap.String("token", token), zap.Error(err))
+			zap.String("path", path), zap.String("token_hash", subHash(token)), zap.Error(err))
 		c.AbortWithStatusJSON(http.StatusUnauthorized, errMsg("invalid credentials"))
 	default:
 		// 未分类 → 500。bindResultFromErr 同步落 internal_error,告警阈值对齐。
 		o.Error("OIDC bind verify internal error",
-			zap.String("path", path), zap.String("token", token), zap.Error(err))
+			zap.String("path", path), zap.String("token_hash", subHash(token)), zap.Error(err))
 		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("internal error"))
 	}
 }
@@ -275,6 +309,9 @@ func (o *OIDC) bindConfirm(c *wkhttp.Context) {
 	m := startBindMetric("confirm")
 	defer m.finish()
 
+	if o.guardBindReady(c, m) {
+		return
+	}
 	var req struct {
 		Token string `json:"token"`
 	}
@@ -325,11 +362,11 @@ func (o *OIDC) handleBindConfirmErr(c *wkhttp.Context, token string, err error) 
 			errMsg("identity already bound; please sign in via OIDC directly"))
 	default:
 		o.Error("OIDC bind confirm failed (internal)",
-			zap.String("token", token), zap.Error(err))
+			zap.String("token_hash", subHash(token)), zap.Error(err))
 		// 截断 err.Error() —— 即便我们写到 audit 的是自家 error message,也防
 		// 未来误把第三方 wrap 进来意外注入大字符串/凭据片段。256 字符上限和
 		// 其他 callback 失败审计一致(api.go:38)。
-		o.writeAudit("bind:"+token, EventBindConfirmFail, stateFromCtx(c), auditReason(err.Error()))
+		o.writeAudit("bind:"+subHash(token), EventBindConfirmFail, stateFromCtx(c), auditReason(err.Error()))
 		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("internal error"))
 	}
 }
@@ -367,6 +404,8 @@ func bindResultFromErr(err error) string {
 	case errors.Is(err, ErrBindAlreadyBound):
 		return "conflict"
 	case errors.Is(err, ErrBindNoPhone):
+		return "bad_request"
+	case errors.Is(err, ErrBindMethodDisabled):
 		return "bad_request"
 	case errors.Is(err, ErrBindConflictNeedManual):
 		return "conflict"
@@ -441,10 +480,12 @@ func (o *OIDC) handleBindOTPSendErr(c *wkhttp.Context, token string, err error) 
 	case errors.Is(err, ErrBindNoPhone):
 		// 业务前提不满足:前端应改走密码手段,不要 retry SMS。
 		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("sms not available for this account"))
+	case errors.Is(err, ErrBindMethodDisabled):
+		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("verification method disabled"))
 	default:
 		// SMSService 内部 / 网络异常:5xx 报给客户端,运维 dashboard 可见。
 		o.Error("OIDC bind otp send failed (internal)",
-			zap.String("token", token), zap.Error(err))
+			zap.String("token_hash", subHash(token)), zap.Error(err))
 		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("sms send failed"))
 	}
 }

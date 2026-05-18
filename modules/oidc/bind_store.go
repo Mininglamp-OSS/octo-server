@@ -68,6 +68,11 @@ var (
 	// 区分,让 metric label 能正确归到 unauthorized 而非 internal_error。
 	// service 层用它包装 auth.* 的 matched=false / VerifyOIDCBindSMS 拒绝。
 	ErrBindAuthRejected = errors.New("oidc: bind auth rejected")
+	// ErrBindMethodDisabled 调用方请求的方法被运维通过 DM_OIDC_BIND_METHODS
+	// 关闭了。Methods 必须是真实策略,不仅 UI 过滤 —— 否则攻击者可以硬调
+	// 端点绕过运维"禁用密码"的安全开关。handler 翻 400,与"参数非法"同档,
+	// 不属于身份凭据拒绝,因此与 ErrBindAuthRejected 区分。
+	ErrBindMethodDisabled = errors.New("oidc: bind method disabled by configuration")
 )
 
 // ---------- memory impl (单测 + 本地开发) ----------
