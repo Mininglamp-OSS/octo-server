@@ -14,17 +14,21 @@ import (
 type Manager struct {
 	ctx *config.Context
 	log.Log
-	db          *db
-	appconfigDB *appConfigDB
+	db              *db
+	appconfigDB     *appConfigDB
+	systemSettingDB *systemSettingDB
+	systemSettings  *SystemSettings
 }
 
 // NewManager NewManager
 func NewManager(ctx *config.Context) *Manager {
 	return &Manager{
-		ctx:         ctx,
-		Log:         log.NewTLog("commonManager"),
-		db:          newDB(ctx.DB()),
-		appconfigDB: newAppConfigDB(ctx),
+		ctx:             ctx,
+		Log:             log.NewTLog("commonManager"),
+		db:              newDB(ctx.DB()),
+		appconfigDB:     newAppConfigDB(ctx),
+		systemSettingDB: newSystemSettingDB(ctx),
+		systemSettings:  EnsureSystemSettings(ctx),
 	}
 }
 
@@ -38,6 +42,11 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 		auth.PUT("/common/appmodule", m.updateAppModule)         // 修改app模块
 		auth.POST("/common/appmodule", m.addAppModule)           // 新增app模块
 		auth.DELETE("/common/:sid/appmodule", m.deleteAppModule) // 删除app模块
+
+		// System-setting KV (admin-tunable runtime config).
+		auth.GET("/common/system_setting", m.listSystemSettings)
+		auth.POST("/common/system_setting", m.updateSystemSettings)
+		auth.POST("/common/system_setting/test_email", m.testSystemSettingEmail)
 	}
 }
 func (m *Manager) deleteAppModule(c *wkhttp.Context) {

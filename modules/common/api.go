@@ -29,9 +29,10 @@ import (
 type Common struct {
 	ctx *config.Context
 	log.Log
-	db          *db
-	appConfigDB *appConfigDB
-	threadOn    int // 缓存 DM_THREAD_ON 环境变量
+	db             *db
+	appConfigDB    *appConfigDB
+	systemSettings *SystemSettings
+	threadOn       int // 缓存 DM_THREAD_ON 环境变量
 }
 
 // New New
@@ -41,12 +42,20 @@ func New(ctx *config.Context) *Common {
 		threadOn = 1
 	}
 	return &Common{
-		ctx:         ctx,
-		db:          newDB(ctx.DB()),
-		appConfigDB: newAppConfigDB(ctx),
-		Log:         log.NewTLog("common"),
-		threadOn:    threadOn,
+		ctx:            ctx,
+		db:             newDB(ctx.DB()),
+		appConfigDB:    newAppConfigDB(ctx),
+		systemSettings: EnsureSystemSettings(ctx),
+		Log:            log.NewTLog("common"),
+		threadOn:       threadOn,
 	}
+}
+
+// SystemSettings exposes the shared admin-tunable settings reader for
+// callers that already hold a *Common. New consumers in other packages
+// should prefer common.EnsureSystemSettings(ctx) directly.
+func (cn *Common) SystemSettings() *SystemSettings {
+	return cn.systemSettings
 }
 
 // Route 路由配置
@@ -405,7 +414,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 		OIDCResetPasswordURL:           oidcResetPasswordURL(),
 		OIDCProviders:                  oidcProviders(),
 		// YUJ-219-A / GH#1283：单一真源下发系统 Bot UID 列表，替代三端硬编码。
-		SystemBotUIDs:                  spacepkg.SystemBotList(),
+		SystemBotUIDs: spacepkg.SystemBotList(),
 	})
 }
 

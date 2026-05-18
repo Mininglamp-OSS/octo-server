@@ -1446,7 +1446,7 @@ func (u *User) register(c *wkhttp.Context) {
 		return
 	}
 
-	if u.ctx.GetConfig().Register.Off {
+	if common2.EnsureSystemSettings(u.ctx).RegisterOff() {
 		c.ResponseError(errors.New("注册通道暂不开放，请长按标题使用官网上演示账号登录"))
 		return
 	}
@@ -2241,7 +2241,7 @@ func (u *User) blacklists(c *wkhttp.Context) {
 
 // sendRegisterCode 发送注册短信
 func (u *User) sendRegisterCode(c *wkhttp.Context) {
-	if u.ctx.GetConfig().Register.Off {
+	if common2.EnsureSystemSettings(u.ctx).RegisterOff() {
 		c.ResponseError(errors.New("注册通道暂不开放，请长按标题使用官网上演示账号登录"))
 		return
 	}
@@ -2258,7 +2258,7 @@ func (u *User) sendRegisterCode(c *wkhttp.Context) {
 		c.ResponseError(errors.New("手机号不能为空！"))
 		return
 	}
-	if u.ctx.GetConfig().Register.OnlyChina {
+	if common2.EnsureSystemSettings(u.ctx).RegisterOnlyChina() {
 		if strings.TrimSpace(req.Zone) != "0086" {
 			c.ResponseError(errors.New("仅仅支持中国大陆手机号注册！"))
 			return

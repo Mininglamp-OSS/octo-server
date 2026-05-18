@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"net"
 	"net/smtp"
-	"strings"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -29,17 +29,35 @@ type IEmailService interface {
 	SendHTMLEmail(ctx context.Context, to, subject, htmlBody string) error
 }
 
+// SMTPSettingsProvider exposes the admin-tunable SMTP config to EmailService
+// without creating an import dependency on modules/common (which itself
+// imports modules/base/common — a cycle if we depended back). Any type that
+// implements these three getters can drive the email sender; the production
+// implementation lives in modules/common.SystemSettings.
+type SMTPSettingsProvider interface {
+	SupportEmail() string
+	SupportEmailSmtp() string
+	SupportEmailPwd() string
+}
+
 // EmailService 邮件服务
 type EmailService struct {
-	ctx *config.Context
+	ctx      *config.Context
+	settings SMTPSettingsProvider
 	log.Log
 }
 
-// NewEmailService 创建邮件服务
-func NewEmailService(ctx *config.Context) *EmailService {
+// NewEmailService 创建邮件服务。
+//
+// settings 为 nil 时退化到读取 cfg.Support.*（yaml 静态值）。生产路径
+// 应传入 common.EnsureSystemSettings(ctx) 以启用 admin 覆盖。参数显式
+// 强制每个 call site 在 nil（yaml-only）和实际注入之间做出选择，避免
+// 静默漏掉 admin 配置入口。
+func NewEmailService(ctx *config.Context, settings SMTPSettingsProvider) *EmailService {
 	return &EmailService{
-		ctx: ctx,
-		Log: log.NewTLog("EmailService"),
+		ctx:      ctx,
+		settings: settings,
+		Log:      log.NewTLog("EmailService"),
 	}
 }
 
@@ -103,10 +121,7 @@ func (s *EmailService) SendHTMLEmail(ctx context.Context, to, subject, htmlBody 
 // ctx 的 deadline 会被注入到 dial 和 conn.SetDeadline；ctx 无 deadline 时
 // 退化到 smtpDialTimeout / smtpIOTimeout 默认值。
 func (s *EmailService) sendEmail(ctx context.Context, to, subject, body string) error {
-	cfg := s.ctx.GetConfig()
-	smtpAddr := cfg.Support.EmailSmtp
-	from := cfg.Support.Email
-	pwd := cfg.Support.EmailPwd
+	smtpAddr, from, pwd := s.resolveSMTP()
 
 	if smtpAddr == "" || from == "" || pwd == "" {
 		return errors.New("邮件服务未配置，请联系管理员")
@@ -211,6 +226,23 @@ const (
 	smtpDialTimeout = 15 * time.Second
 	smtpIOTimeout   = 60 * time.Second
 )
+
+// resolveSMTP returns the effective SMTP config: admin-tunable values from
+// the injected provider win over yaml; a missing provider (legacy callers
+// and unit tests) falls back to cfg.Support.* directly.
+func (s *EmailService) resolveSMTP() (smtpAddr, from, pwd string) {
+	if s.settings != nil {
+		smtpAddr = s.settings.SupportEmailSmtp()
+		from = s.settings.SupportEmail()
+		pwd = s.settings.SupportEmailPwd()
+		return
+	}
+	cfg := s.ctx.GetConfig()
+	smtpAddr = cfg.Support.EmailSmtp
+	from = cfg.Support.Email
+	pwd = cfg.Support.EmailPwd
+	return
+}
 
 // Verify 验证验证码（验证成功后销毁缓存）
 func (s *EmailService) Verify(ctx context.Context, email, code string, codeType CodeType) error {

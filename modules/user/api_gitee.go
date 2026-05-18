@@ -2,13 +2,13 @@ package user
 
 import (
 	"context"
-	"os"
-	"runtime/debug"
 	"fmt"
 	"hash/crc32"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -16,6 +16,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/network"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	common "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/gin-gonic/gin"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
@@ -27,7 +28,7 @@ const (
 )
 
 func (u *User) thirdAuthcode(c *wkhttp.Context) {
-	if u.ctx.GetConfig().Register.Off {
+	if common.EnsureSystemSettings(u.ctx).RegisterOff() {
 		c.ResponseError(errors.New("注册通道暂不开放，请长按标题使用官网上演示账号登录"))
 		return
 	}
@@ -45,7 +46,7 @@ func (u *User) thirdAuthcode(c *wkhttp.Context) {
 }
 
 func (u *User) thirdAuthStatus(c *wkhttp.Context) {
-	if u.ctx.GetConfig().Register.Off {
+	if common.EnsureSystemSettings(u.ctx).RegisterOff() {
 		c.ResponseError(errors.New("注册通道暂不开放，请长按标题使用官网上演示账号登录"))
 		return
 	}
