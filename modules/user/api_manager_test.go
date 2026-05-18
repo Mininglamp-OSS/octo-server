@@ -2,6 +2,7 @@ package user
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -520,6 +521,68 @@ func TestUserListBotAndSystemFlags(t *testing.T) {
 			assert.Equal(t, http.StatusBadRequest, w.Code, "body=%s", w.Body.String())
 		})
 	}
+}
+
+// GH issue #54: 历史迁移 20220222000001_user_legacy01.sql 用裸 MODIFY 把
+// user.phone / user.zone 改成了 nullable，导致任何外部 INSERT 漏列就会让这
+// 两列出现 NULL，进而让 /v1/manager/user/list 等所有 SELECT phone/zone 到
+// string 字段的接口因 "converting NULL to string is unsupported" 报 400。
+//
+// 修复迁移 20260516000001_user_legacy01.sql 把列改回 NOT NULL DEFAULT ''。
+// 本测试通过 INFORMATION_SCHEMA 校验 schema、并直接走 raw SQL 尝试 NULL
+// 写入来验证约束是否真生效（修复前是 NULL 通过、读取报错；修复后是写入直接被
+// 拒，读取永远安全）。
+func TestUserTablePhoneZoneNotNullable(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	// 1. INFORMATION_SCHEMA 直接校验 schema。
+	type colMeta struct {
+		ColumnName    string `db:"COLUMN_NAME"`
+		IsNullable    string `db:"IS_NULLABLE"`
+		ColumnDefault sql.NullString `db:"COLUMN_DEFAULT"`
+	}
+	var cols []*colMeta
+	_, err = ctx.DB().SelectBySql(
+		"SELECT COLUMN_NAME, IS_NULLABLE, COLUMN_DEFAULT "+
+			"FROM INFORMATION_SCHEMA.COLUMNS "+
+			"WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME='user' "+
+			"AND COLUMN_NAME IN ('phone','zone') ORDER BY COLUMN_NAME",
+	).Load(&cols)
+	assert.NoError(t, err)
+	assert.Len(t, cols, 2, "expected phone+zone columns to exist")
+	for _, c := range cols {
+		assert.Equal(t, "NO", c.IsNullable, "%s must be NOT NULL", c.ColumnName)
+		assert.True(t, c.ColumnDefault.Valid, "%s must have a non-NULL DEFAULT", c.ColumnName)
+		assert.Equal(t, "", c.ColumnDefault.String, "%s DEFAULT should be empty string", c.ColumnName)
+	}
+
+	// 2. 显式 NULL 写入应被数据库拒绝（NOT NULL 约束实际生效，而不只是元数据声明）。
+	// short_no 走自定义值避免与系统账号或下面的 case 撞 unique 索引。
+	_, err = ctx.DB().InsertBySql(
+		"INSERT INTO `user` (uid, name, role, username, short_no, phone, zone) VALUES (?, ?, ?, ?, ?, NULL, NULL)",
+		"test_null_phone", "X", "admin", "test_null_phone", "test_short_1",
+	).Exec()
+	assert.Error(t, err, "INSERT with explicit NULL phone/zone must be rejected")
+
+	// 3. 漏列写入应该走 DEFAULT '' —— 这是 issue 报告的"手插 admin 行"场景。
+	_, err = ctx.DB().InsertBySql(
+		"INSERT INTO `user` (uid, name, role, username, short_no) VALUES (?, ?, ?, ?, ?)",
+		"test_missing_phone", "Y", "admin", "test_missing_phone", "test_short_2",
+	).Exec()
+	assert.NoError(t, err, "INSERT without phone/zone columns should succeed via DEFAULT ''")
+
+	// 4. 验证 DEFAULT 实际值确是 ''。
+	type row struct {
+		Phone string `db:"phone"`
+		Zone  string `db:"zone"`
+	}
+	var r row
+	_, err = ctx.DB().SelectBySql("SELECT phone, zone FROM `user` WHERE uid=?", "test_missing_phone").Load(&r)
+	assert.NoError(t, err)
+	assert.Equal(t, "", r.Phone)
+	assert.Equal(t, "", r.Zone)
 }
 
 func TestUserDisablelist(t *testing.T) {
