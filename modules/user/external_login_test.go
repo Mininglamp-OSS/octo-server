@@ -41,6 +41,14 @@ func setupExternalLoginTest(t *testing.T) *User {
 	).Exec()
 	require.NoError(t, err, "seed app_config")
 
+	// 兜底刷新 SystemSettings snapshot。CleanAllTables 只清 DB,不会触动
+	// EnsureSystemSettings 维护的进程级 snapshot;若先前测试通过
+	// setSystemSettingForUserTest + Reload 把 register.off=1 写进了 snapshot,
+	// 这里不重置就会让本测试组里依赖 yaml 默认值的用例(例如 CreateRequiresUID)
+	// 在 RegisterOff 早于 UID 校验的位置就被短路。
+	require.NoError(t, commonsettings.EnsureSystemSettings(ctx).Reload(),
+		"reset SystemSettings snapshot after CleanAllTables")
+
 	return New(ctx)
 }
 

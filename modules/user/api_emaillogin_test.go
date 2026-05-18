@@ -151,6 +151,15 @@ func TestEmailForgetPasswordCodeAllowedWhenEmailLoginDisabled(t *testing.T) {
 	assert.NotContains(t, w.Body.String(), "暂不支持邮箱")
 }
 
+// setSystemSettingForUserTest writes a system_setting row and registers a
+// cleanup that deletes the row AND reloads the shared SystemSettings
+// snapshot. Without the cleanup, the singleton's in-memory snapshot keeps
+// the override across tests — testutil.CleanAllTables truncates the table
+// but does not touch process-local caches, so later tests would see
+// `register.off=1` even after the DB row is gone. Caller usually pairs
+// this with EnsureSystemSettings(...).Reload() to push the new value into
+// the snapshot; the cleanup ensures the snapshot is restored regardless of
+// whether the caller did or did not call Reload at write time.
 func setSystemSettingForUserTest(t *testing.T, ctx *config.Context, category, key, value, valueType string) {
 	t.Helper()
 	_, err := ctx.DB().InsertBySql(
@@ -160,6 +169,16 @@ func setSystemSettingForUserTest(t *testing.T, ctx *config.Context, category, ke
 		category, key, value, valueType,
 	).Exec()
 	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		if _, delErr := ctx.DB().DeleteFrom("system_setting").
+			Where("category = ? AND key_name = ?", category, key).Exec(); delErr != nil {
+			t.Logf("cleanup: delete system_setting %s.%s failed: %v", category, key, delErr)
+		}
+		if reloadErr := commonsettings.EnsureSystemSettings(ctx).Reload(); reloadErr != nil {
+			t.Logf("cleanup: reload SystemSettings failed: %v", reloadErr)
+		}
+	})
 }
 
 func setPublicIPForUserTest(req *http.Request, ip string) {
