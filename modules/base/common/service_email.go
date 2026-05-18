@@ -221,11 +221,17 @@ func buildTransactionalMessage(fromSan, toSan, subjectSan, htmlBody, plainBody s
 		"Message-ID: " + messageID,
 		"MIME-Version: 1.0",
 		`Content-Type: multipart/alternative; boundary="` + boundary + `"`,
+		// List-Unsubscribe 单独保留 mailto 形态(RFC 2369),作为 transactional
+		// 信号给 Gmail/Outlook 打分用。
+		// 不再发 "List-Unsubscribe-Post: One-Click":RFC 8058 要求 One-Click 必
+		// 须配 HTTPS POST endpoint,跟 mailto 配是 misuse,部分打分引擎会判 weak
+		// signal。等真有 HTTPS 退订入口再加回来。
 		"List-Unsubscribe: <mailto:" + fromSan + "?subject=unsubscribe>",
-		"List-Unsubscribe-Post: List-Unsubscribe=One-Click",
 		"X-Mailer: Octo Transactional Mailer",
+		// Auto-Submitted 让收件方知道这是机器生成,顺便压制 out-of-office
+		// 自动回复。不发 "Precedence: bulk":部分 MTA 把它解释为"不要生成 DSN
+		// (退信)",而本 endpoint 的诊断价值正是依赖退信,跟意图相反。
 		"Auto-Submitted: auto-generated",
-		"Precedence: bulk",
 	}
 
 	var b strings.Builder

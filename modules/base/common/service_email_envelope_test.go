@@ -38,11 +38,19 @@ func TestBuildTransactionalMessage_StructureAndHeaders(t *testing.T) {
 	assert.Contains(t, s, `Content-Type: multipart/alternative; boundary="octo_`,
 		"Top-level Content-Type must declare multipart/alternative with a deterministic boundary prefix")
 	assert.Contains(t, s, "List-Unsubscribe: <mailto:contact@xming.ai?subject=unsubscribe>\r\n",
-		"List-Unsubscribe is one of the strongest transactional-email signals for Gmail/Outlook")
-	assert.Contains(t, s, "List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n")
-	assert.Contains(t, s, "Auto-Submitted: auto-generated\r\n")
-	assert.Contains(t, s, "Precedence: bulk\r\n")
+		"List-Unsubscribe (RFC 2369) is one of the strongest transactional-email signals for Gmail/Outlook")
+	assert.Contains(t, s, "Auto-Submitted: auto-generated\r\n",
+		"Auto-Submitted advertises this as a machine-generated message; suppresses OOO replies without suppressing DSN")
 	assert.Contains(t, s, "X-Mailer: Octo Transactional Mailer\r\n")
+
+	// 这两条 header 故意 *不* 发(详见 buildTransactionalMessage 中的注释):
+	//   - "List-Unsubscribe-Post: List-Unsubscribe=One-Click" 跟 mailto 配错 (RFC 8058 misuse)
+	//   - "Precedence: bulk" 可能在某些 MTA 上抑制退信,跟 /test_email 诊断意图相反
+	// 这里做 negative assertion 防止有人后续 hardening 时悄悄加回来。
+	assert.NotContains(t, s, "List-Unsubscribe-Post:",
+		"One-Click without an HTTPS POST endpoint is RFC 8058 misuse")
+	assert.NotContains(t, s, "Precedence: bulk",
+		"Precedence: bulk can suppress DSN, defeating the /test_email diagnostic purpose")
 
 	// ---- multipart body ----
 	plainPos := strings.Index(s, "Content-Type: text/plain")
