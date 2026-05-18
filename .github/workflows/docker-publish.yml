@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Image tag to publish (e.g. v1.2.3 or test-foo). Will overwrite any existing tag on Docker Hub.'
+        description: 'Image tag to publish. Must match ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$, must NOT look like a semver alias (1, 1.2, v1.2.3, ...), and from non-main branches must be prefixed with "test-".'
         required: true
 
 permissions:
@@ -27,9 +27,76 @@ env:
   IMAGE_NAME: mininglamposs/octo-server
 
 jobs:
+  validate:
+    # No-secret preflight: rejects bad inputs/refs BEFORE any job that holds
+    # Docker Hub credentials runs. Catches command-injection attempts,
+    # invalid Docker tag grammar, semver-alias clobbering, and manual
+    # publishes from unreviewed refs — all before any registry write.
+    name: Validate inputs and ref
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate tag push ref
+        if: github.event_name == 'push'
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          case "$REF" in
+            refs/tags/v*) echo "OK: $REF" ;;
+            *) echo "::error::Unexpected push ref '$REF'; only refs/tags/v* should reach this workflow"; exit 1 ;;
+          esac
+
+      - name: Validate workflow_dispatch input and ref
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+
+          # Docker image tag grammar (also blocks shell metacharacters as a
+          # side effect — only [A-Za-z0-9_.-] are allowed and length <= 128).
+          if ! printf '%s' "$INPUT_TAG" | grep -Eq '^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$'; then
+            echo "::error::tag '$INPUT_TAG' violates Docker tag grammar ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$"
+            exit 1
+          fi
+
+          # Reserved auto-managed names — manual dispatch must not clobber them.
+          case "$INPUT_TAG" in
+            latest|main|master)
+              echo "::error::tag '$INPUT_TAG' is reserved/auto-managed; pick a different name"
+              exit 1
+              ;;
+          esac
+
+          # Semver-alias shapes (e.g. 1, 1.2, 1.2.3, v1.2.3) are reserved for
+          # the auto-managed major / major.minor / major.minor.patch / version
+          # aliases populated by tag-push events. A manual dispatch with
+          # these shapes would race with / overwrite the next real release.
+          if printf '%s' "$INPUT_TAG" | grep -Eq '^v?[0-9]+(\.[0-9]+){0,2}([+-].+)?$'; then
+            echo "::error::tag '$INPUT_TAG' looks like a semver alias; manual publishes must use a non-semver name (or prefix with 'test-')"
+            exit 1
+          fi
+
+          # Restrict manual publishes from non-default branches to the
+          # 'test-' namespace so feature-branch experimentation cannot land
+          # in the official release tag space.
+          if [ "$REF" != "refs/heads/main" ]; then
+            case "$INPUT_TAG" in
+              test-*) echo "OK: non-main ref '$REF' with test- prefix" ;;
+              *)
+                echo "::error::manual publishes from '$REF' must use a 'test-*' tag (got '$INPUT_TAG'); merge to main for official tags"
+                exit 1
+                ;;
+            esac
+          fi
+
+          echo "OK: dispatch from $REF with tag '$INPUT_TAG'"
+
   build:
     name: Build ${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
+    needs: validate
     strategy:
       fail-fast: false
       matrix:
@@ -65,18 +132,20 @@ jobs:
           file: ./Dockerfile
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+          cache-from: type=gha,scope=docker-publish-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=docker-publish-${{ matrix.arch }}
           # Disable provenance attestation so the final manifest list doesn't
           # carry an extra "unknown/unknown" platform entry that confuses some
           # registry UIs and scanners.
           provenance: false
 
       - name: Export digest
+        env:
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
+          set -euo pipefail
           mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
+          touch "/tmp/digests/${BUILD_DIGEST#sha256:}"
 
       - name: Upload digest
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -125,29 +194,40 @@ jobs:
             type=semver,pattern={{major}}
             type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
-      - name: Reject reserved tag names on manual dispatch
-        if: github.event_name == 'workflow_dispatch'
-        run: |
-          tag="${{ github.event.inputs.tag }}"
-          case "$tag" in
-            latest|main|master|"")
-              echo "::error::Refusing to publish reserved/empty tag '$tag' — would clobber an auto-managed tag"
-              exit 1
-              ;;
-          esac
-
       - name: Create manifest list and push
         working-directory: /tmp/digests
+        env:
+          IMAGE: ${{ env.IMAGE_NAME }}
+          METADATA: ${{ steps.meta.outputs.json }}
         run: |
           set -euo pipefail
-          TAGS=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON")
-          if [ -z "$TAGS" ]; then
+          # Build "-t TAG" args as an array — never interpolate tags into the
+          # shell command line, which would be a command-injection vector
+          # if metadata-action ever emitted a tag containing shell syntax.
+          tags=()
+          while IFS= read -r tag; do
+            tags+=(-t "$tag")
+          done < <(jq -r '.tags[]' <<< "$METADATA")
+
+          if [ ${#tags[@]} -eq 0 ]; then
             echo "::error::metadata-action produced no tags; refusing to publish manifest"
             exit 1
           fi
-          docker buildx imagetools create $TAGS \
-            $(printf '${{ env.IMAGE_NAME }}@sha256:%s ' *)
+
+          # Digest filenames in /tmp/digests are SHA-256 hex strings (validated
+          # by upload-artifact's if-no-files-found:error and the controlled
+          # filename derived from build.outputs.digest), safe to feed in.
+          sources=()
+          for f in *; do
+            sources+=("${IMAGE}@sha256:${f}")
+          done
+
+          docker buildx imagetools create "${tags[@]}" "${sources[@]}"
 
       - name: Inspect image
+        env:
+          IMAGE: ${{ env.IMAGE_NAME }}
+          PRIMARY_TAG: ${{ steps.meta.outputs.version }}
         run: |
-          docker buildx imagetools inspect ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          set -euo pipefail
+          docker buildx imagetools inspect "${IMAGE}:${PRIMARY_TAG}"

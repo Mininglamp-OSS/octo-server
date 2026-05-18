@@ -46,9 +46,14 @@ To build only the `octo-server` container image from this repository:
 make build          # docker build -t octo-server .
 ```
 
-The image-release workflow (multi-arch tags, registry push, deploy
-manifests) lives in
+Multi-arch container images (`linux/amd64`, `linux/arm64`) are
+published to Docker Hub as
+[`mininglamposs/octo-server`](https://hub.docker.com/r/mininglamposs/octo-server)
+by `.github/workflows/docker-publish.yml`, triggered automatically on
+every `v*` Git tag push. Deployment manifests (Helm charts, compose
+stacks, etc.) for the full OOTB stack continue to live in
 [`Mininglamp-OSS/octo-deployment`](https://github.com/Mininglamp-OSS/octo-deployment).
+
 The `push` / `deploy` / `deploy-v2` targets that still ship in this
 repo's `Makefile` predate the consolidation and hard-code the team's
 private Aliyun registry path (with one stale tag — `make push`
