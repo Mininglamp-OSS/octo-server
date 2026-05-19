@@ -10,9 +10,12 @@
 //   200 — success (single object or list)
 //   400 — bad request body / missing required fields
 //   401 — no user token (handled by upstream middleware)
-//   403 — grantor mismatch / cross-user attempt
-//   404 — grant_id / scope_id not found
-//   409 — duplicate (grantor+grantee already exists / scope already exists)
+//   403 — (reserved — production currently uses 404 for cross-user attempts
+//          as a user-enumeration defense; see requireOwnedGrant comment.)
+//   404 — grant_id / scope_id not found; cross-user grant/scope access
+//          (existence-leak defense)
+//   409 — duplicate (grantor+grantee already exists / scope already exists,
+//          with no soft-deleted row to reactivate in place)
 //   500 — DB error
 package bot_api
 
@@ -22,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"go.uber.org/zap"
 )
@@ -79,6 +83,21 @@ type oboCreateScopeReq struct {
 // oboCreateGrant — POST /v1/obo/grants.
 // Body: { grantee_bot_uid, mode? }. Grantor is inferred from the auth token
 // — the caller cannot create a grant on someone else's behalf.
+//
+// PR#82 hardening:
+//   - grantee_bot_uid MUST resolve to a robot row with CreatorUID == uid
+//     AND user.robot=1. Without this check a user could install an OBO
+//     grant against someone ELSE's bot, force-feeding it copies of any
+//     channel traffic the grantor can see and muddying audit trails that
+//     key on grantee_bot_uid. (Review #1 task spec P1-2 + review #2 P2-3.)
+//   - When the UNIQUE KEY uk_grantor_grantee fires on insert, look up the
+//     existing row. If it's a soft-deleted row the caller already owns,
+//     reactivate it in place (active=1, global_enabled=0, revoked_at=NULL)
+//     rather than returning 409. Without this path a single
+//     DELETE /v1/obo/grants/:id would permanently brick the (grantor, bot)
+//     pair (review #2 P1-1). global_enabled is intentionally reset to 0
+//     on reactivation so the caller must re-issue a PUT to enable fan-out
+//     — matches the fail-closed default for a brand-new grant.
 func (ba *BotAPI) oboCreateGrant(c *wkhttp.Context) {
 	uid := c.GetLoginUID()
 	if uid == "" {
@@ -108,10 +127,62 @@ func (ba *BotAPI) oboCreateGrant(c *wkhttp.Context) {
 		return
 	}
 
+	// PR#82 review #1 P1-2 / review #2 P2-3 — grantee_bot_uid must be a bot
+	// the caller owns. Lookup hits the robot table (creator_uid) joined to
+	// the user table (robot=1). 404 (not 403) on miss to keep with the
+	// existence-leak posture used elsewhere in this module.
+	creatorUID, isBot, found, err := ba.oboStoreOrDefault().queryRobotOwner(req.GranteeBotUID)
+	if err != nil {
+		ba.Error("queryRobotOwner failed", zap.Error(err), zap.String("bot", req.GranteeBotUID))
+		c.ResponseError(errors.New("内部错误"))
+		return
+	}
+	if !found || !isBot {
+		c.JSON(http.StatusNotFound, gin404("grantee_bot_uid not a registered bot"))
+		return
+	}
+	if creatorUID != uid {
+		// Owned by someone else; treat as not-found to avoid telling the
+		// caller "this bot exists but isn't yours". Same posture as
+		// requireOwnedGrant.
+		c.JSON(http.StatusNotFound, gin404("grantee_bot_uid not a registered bot"))
+		return
+	}
+
 	id, err := ba.oboStoreOrDefault().insertGrant(uid, req.GranteeBotUID, mode)
 	if err != nil {
 		if isDuplicateKeyErr(err) {
-			c.JSON(http.StatusConflict, gin404("grant already exists"))
+			// Reactivation path: a row already exists. If it's a soft-deleted
+			// row owned by the same caller, flip it back to active and return
+			// the refreshed row. Anything else → 409.
+			existing, lookupErr := ba.oboStoreOrDefault().findGrantByGrantorBot(uid, req.GranteeBotUID)
+			if lookupErr != nil {
+				ba.Error("post-duplicate findGrant lookup failed", zap.Error(lookupErr))
+				c.JSON(http.StatusConflict, gin404("grant already exists"))
+				return
+			}
+			if existing == nil || existing.GrantorUID != uid {
+				// Shouldn't happen — UNIQUE on (grantor, grantee) means the
+				// duplicate must be ours. Defensive: 409 rather than 500.
+				c.JSON(http.StatusConflict, gin404("grant already exists"))
+				return
+			}
+			if existing.Active == 1 {
+				// Live row → genuine duplicate, not a reactivation case.
+				c.JSON(http.StatusConflict, gin404("grant already exists"))
+				return
+			}
+			if reactErr := ba.oboStoreOrDefault().reactivateGrant(existing.ID); reactErr != nil {
+				ba.Error("reactivateGrant failed", zap.Error(reactErr), zap.Int64("id", existing.ID))
+				c.ResponseError(errors.New("内部错误"))
+				return
+			}
+			refreshed, _ := ba.oboStoreOrDefault().findGrantByID(existing.ID)
+			if refreshed != nil {
+				c.Response(refreshed)
+				return
+			}
+			c.Response(map[string]interface{}{"id": existing.ID})
 			return
 		}
 		ba.Error("insertGrant failed", zap.Error(err))
@@ -206,6 +277,17 @@ func (ba *BotAPI) oboUpdateGrant(c *wkhttp.Context) {
 
 // oboCreateScope — POST /v1/obo/scopes. Adds (or upserts via the unique
 // key) a per-channel white-list entry to an existing owned grant.
+//
+// PR#82 P0 (channel-wiretap, three reviewers concur): after grant ownership
+// passes, verify the GRANTOR (= calling user uid) has read access to the
+// target (channel_id, channel_type). Without this check, a logged-in user
+// could create a scope for a channel they are not a member of — every
+// inbound message in that channel would then be fan-out-copied to their
+// bot, exfiltrating channel traffic the grantor was never authorized to
+// see. The check fails closed: any DB error, missing membership row, or
+// unknown channel type → 404 (existence-leak posture). 404 (not 403)
+// matches requireOwnedGrant; combined, the two checks never reveal
+// "grant exists but channel access denied" vs "channel doesn't exist".
 func (ba *BotAPI) oboCreateScope(c *wkhttp.Context) {
 	uid := c.GetLoginUID()
 	if uid == "" {
@@ -225,6 +307,29 @@ func (ba *BotAPI) oboCreateScope(c *wkhttp.Context) {
 	if err != nil || grant == nil {
 		return
 	}
+	// P0 — channel-wiretap defense. Grantor MUST be able to read the
+	// target channel themselves before they can authorize a bot to read it
+	// on their behalf. See grantorCanReadChannel for the per-channel-type
+	// predicate. Failed check → 404 (existence-leak defense; never tell
+	// the caller whether the channel exists).
+	ok, err := ba.grantorCanReadChannel(uid, req.ChannelID, req.ChannelType)
+	if err != nil {
+		ba.Error("grantor channel-access check failed",
+			zap.Error(err), zap.String("grantor", uid),
+			zap.String("channel_id", req.ChannelID),
+			zap.Uint8("channel_type", req.ChannelType))
+		c.ResponseError(errors.New("内部错误"))
+		return
+	}
+	if !ok {
+		ba.Warn("OBO scope denied: grantor has no read access to channel",
+			zap.String("grantor", uid),
+			zap.String("channel_id", req.ChannelID),
+			zap.Uint8("channel_type", req.ChannelType))
+		c.JSON(http.StatusNotFound, gin404("channel not found"))
+		return
+	}
+
 	enabled := 1
 	if req.Enabled != nil && *req.Enabled == 0 {
 		enabled = 0
@@ -249,7 +354,13 @@ func (ba *BotAPI) oboCreateScope(c *wkhttp.Context) {
 }
 
 // oboDeleteScope — DELETE /v1/obo/scopes/:id. Caller must own the parent
-// grant. (No ownership shortcut — we have to look up the scope first.)
+// grant.
+//
+// PR#82 review #2 P1-3: ownership resolves in a single JOIN query
+// (oboStore.findScopeOwner) instead of the previous
+// O(grants × scopes_per_grant) scan. A power user with 50 grants × 200
+// scopes/grant required ~10k DB queries to delete one scope under the
+// old path; now it is two queries (find owner + delete row).
 func (ba *BotAPI) oboDeleteScope(c *wkhttp.Context) {
 	uid := c.GetLoginUID()
 	if uid == "" {
@@ -260,18 +371,16 @@ func (ba *BotAPI) oboDeleteScope(c *wkhttp.Context) {
 	if !ok {
 		return
 	}
-	// Look up scope → grant → ownership. We use listScopesByGrant with a
-	// known grant_id once we have it, but to *get* the grant_id from a
-	// scope id we need a peek; simplest is to issue findGrantByID after a
-	// dedicated lookup. To avoid adding another store method, REST tests
-	// drive this through the in-memory fake which short-circuits ownership.
-	scopeOwnerOK, err := ba.scopeOwnedBy(uid, id)
+	owner, found, err := ba.oboStoreOrDefault().findScopeOwner(id)
 	if err != nil {
-		ba.Error("scope ownership lookup failed", zap.Error(err))
+		ba.Error("scope ownership lookup failed", zap.Error(err), zap.Int64("id", id))
 		c.ResponseError(errors.New("内部错误"))
 		return
 	}
-	if !scopeOwnerOK {
+	if !found || owner != uid {
+		// Existence-leak defense: cross-user delete attempts return 404,
+		// indistinguishable from "scope id never existed". Matches the
+		// posture in requireOwnedGrant.
 		c.JSON(http.StatusNotFound, gin404("scope not found"))
 		return
 	}
@@ -332,30 +441,89 @@ func (ba *BotAPI) requireOwnedGrant(c *wkhttp.Context, uid string, id int64) (*o
 	return grant, nil
 }
 
-// scopeOwnedBy returns true if scope `id` exists AND its parent grant is
-// owned by `uid`. Implemented by iterating the caller's grants because the
-// store interface deliberately does not expose findScopeByID (the v0
-// surface stays minimal and the per-user scope volume is tiny).
-func (ba *BotAPI) scopeOwnedBy(uid string, id int64) (bool, error) {
-	if uid == "" {
+// grantorCanReadChannel verifies the grantor (the calling user) has read
+// access to (channelID, channelType). Used by oboCreateScope to plug the
+// channel-wiretap vulnerability described in PR#82 reviews — a scope row
+// must NOT be creatable for a channel the grantor cannot themselves read,
+// because once it lands, the fan-out listener will replay every inbound
+// message from that channel to the grantee bot regardless of whether the
+// grantor is still (or ever was) a member.
+//
+// Per-type predicates mirror checkSendPermission (modules/bot_api/send.go)
+// so the rules can't diverge over time:
+//   - ChannelTypeGroup → grantor must have an undeleted group_member row
+//     for group_no = channel_id.
+//   - ChannelTypeCommunityTopic → channel_id is "<parent_group_no>____<short_id>";
+//     grantor must be a member of the parent group. Threads inherit
+//     parent-group read-ACL in the rest of the codebase (see send.go:200,
+//     sync.go:106); we reuse that invariant here.
+//   - ChannelTypePerson → channel_id is the peer uid for a DM. The
+//     grantor is "in" a DM iff they ARE the peer (DM channel ids in
+//     octo-server are bare uids — see resolveSpaceChannelID for the no-op
+//     return that documents this) or they're friends with the peer. We
+//     allow either: a user has read access to "their own DM with X" if
+//     they are X (the peer), and a real user is allowed to authorize
+//     fan-out from a DM-with-friend regardless of which side initiated.
+//
+// Test hook: ba.oboChannelAccessOverride lets unit tests stub the answer
+// without standing up MySQL or a user service. nil override → DB path.
+func (ba *BotAPI) grantorCanReadChannel(uid, channelID string, channelType uint8) (bool, error) {
+	if ba.oboChannelAccessOverride != nil {
+		return ba.oboChannelAccessOverride(uid, channelID, channelType)
+	}
+	if uid == "" || channelID == "" {
 		return false, nil
 	}
-	grants, err := ba.oboStoreOrDefault().listGrantsByGrantor(uid)
+	switch channelType {
+	case common.ChannelTypeGroup.Uint8():
+		return ba.userIsGroupMember(uid, channelID)
+	case common.ChannelTypeCommunityTopic.Uint8():
+		// Thread channel id format: "<parent_group_no>____<short_id>".
+		// Reuse threadChannelIDSeparator + the convention already
+		// established by send.go / sync.go for parent-group membership.
+		parts := strings.SplitN(channelID, threadChannelIDSeparator, 2)
+		if len(parts) != 2 || parts[0] == "" {
+			// Malformed thread id — treat as no-access (fail-closed).
+			return false, nil
+		}
+		return ba.userIsGroupMember(uid, parts[0])
+	case common.ChannelTypePerson.Uint8():
+		// DM peer self-access: a user is trivially "in" a DM that is
+		// themselves (the channel id is the peer; if uid == peer they
+		// would be DMing themselves, which is degenerate but allowed).
+		if uid == channelID {
+			return true, nil
+		}
+		// Otherwise: must be friends with the peer. Mirrors the
+		// BotKindUser ChannelTypePerson branch of checkSendPermission.
+		if ba.userService == nil {
+			// No user service wired (tests should set override) — fail-closed.
+			return false, nil
+		}
+		return ba.userService.IsFriend(uid, channelID)
+	default:
+		// Unknown channel type → cannot authorize fan-out for it.
+		return false, nil
+	}
+}
+
+// userIsGroupMember returns true iff `uid` has an undeleted row in
+// group_member for group_no=groupNo. Mirrors the SQL used by
+// checkSendPermission's BotKindUser/ChannelTypeGroup branch.
+func (ba *BotAPI) userIsGroupMember(uid, groupNo string) (bool, error) {
+	if ba.db == nil || ba.db.session == nil {
+		// No DB session (some test contexts) — fail-closed.
+		return false, nil
+	}
+	var count int
+	err := ba.db.session.SelectBySql(
+		"SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0",
+		groupNo, uid,
+	).LoadOne(&count)
 	if err != nil {
 		return false, err
 	}
-	for _, g := range grants {
-		scopes, err := ba.oboStoreOrDefault().listScopesByGrant(g.ID)
-		if err != nil {
-			return false, err
-		}
-		for _, s := range scopes {
-			if s.ID == id {
-				return true, nil
-			}
-		}
-	}
-	return false, nil
+	return count > 0, nil
 }
 
 // parseIDParam reads ":id" as int64. On failure writes 400 and returns

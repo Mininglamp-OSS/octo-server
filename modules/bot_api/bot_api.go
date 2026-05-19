@@ -69,6 +69,14 @@ type BotAPI struct {
 	// dispatchOverride hook keeps capturing sends in handler tests.
 	// nil in production.
 	oboFanoutDispatch func(*config.MsgSendReq) error
+	// oboChannelAccessOverride lets unit tests stub the grantor channel-
+	// access check used by oboCreateScope (PR#82 review P0 — channel-wiretap
+	// fix). Production path runs grantorCanReadChannel, which queries
+	// group_member + userService.IsFriend; tests that build BotAPI without
+	// a live DB session set this hook to deterministically accept or reject
+	// (uid, channel_id, channel_type) without touching MySQL.
+	// nil in production → the real DB-backed check runs.
+	oboChannelAccessOverride func(uid, channelID string, channelType uint8) (bool, error)
 	log.Log
 }
 

@@ -4,8 +4,9 @@
 // Exercises the full sendMessage handler with a stubbed oboStore + space
 // querier + dispatch capture, then asserts:
 //   - Authorized OBO sets FromUID = on_behalf_of (not robotID)
-//   - Authorized OBO marks payload with obo_processed=true (gate 3 marker)
-//     and actual_sender_uid=<bot>
+//   - Authorized OBO marks payload with __obo_processed__=true (gate 3
+//     marker; PR#82 review #2 P1-2 — reserved-namespace key) and
+//     actual_sender_uid=<bot>
 //   - Unauthorized OBO returns 400 with the "obo not authorized" body
 //     and does NOT dispatch (no leakage past the auth check)
 //
@@ -114,15 +115,15 @@ func TestSendMessage_OBO_Authorized_SwapsFromUID(t *testing.T) {
 	if err := json.Unmarshal(dc.captured.Payload, &got); err != nil {
 		t.Fatalf("payload decode: %v", err)
 	}
-	if v, _ := got["obo_processed"].(bool); !v {
-		t.Errorf("payload missing obo_processed marker: %v", got)
+	if v, _ := got[oboProcessedMarkerKey].(bool); !v {
+		t.Errorf("payload missing %s marker: %v", oboProcessedMarkerKey, got)
 	}
 	if got["actual_sender_uid"] != botID {
 		t.Errorf("payload actual_sender_uid should be %q, got %v", botID, got["actual_sender_uid"])
 	}
 }
 
-func TestSendMessage_OBO_Unauthorized_Returns403(t *testing.T) {
+func TestSendMessage_OBO_Unauthorized_Returns400Body(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	const (
@@ -217,10 +218,106 @@ func TestSendMessage_NoOBO_LegacyPath(t *testing.T) {
 	}
 	var got map[string]interface{}
 	_ = json.Unmarshal(dc.captured.Payload, &got)
-	if _, has := got["obo_processed"]; has {
-		t.Errorf("legacy path should not set obo_processed marker, got %v", got)
+	if _, has := got[oboProcessedMarkerKey]; has {
+		t.Errorf("legacy path should not set %s marker, got %v", oboProcessedMarkerKey, got)
 	}
 }
 
 // keep the compiler happy if msg-content imports go unused in a refactor
 var _ = config.MsgSendReq{}
+
+// TestSendMessage_RejectsReservedOBOKey — inbound /v1/bot/sendMessage
+// payloads carrying any `__obo_*` top-level key are rejected before any
+// other validation. This locks down gate 3's marker key
+// (`__obo_processed__`) and any future server-only OBO field: a bot
+// cannot forge or suppress them via the public REST API.
+// PR#82 review #2 P1-2 regression guard.
+func TestSendMessage_RejectsReservedOBOKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const (
+		botID  = "bot_legacy"
+		owner  = "creator_uid"
+		authSp = "space_A"
+	)
+
+	dc := &dispatchCapture{}
+	ba := &BotAPI{
+		Log:              log.NewTLog("BotAPI-reject-reserved"),
+		spaceQuerier:     &fakeSpaceQuerier{defaultSpace: authSp},
+		dispatchOverride: dc.hook,
+		oboStoreOverride: newFakeOBOStore(),
+	}
+
+	body, _ := json.Marshal(BotSendMessageReq{
+		ChannelID:   owner,
+		ChannelType: common.ChannelTypePerson.Uint8(),
+		Payload: map[string]interface{}{
+			"content":           "trying to bypass gate 3",
+			"type":              1,
+			"__obo_processed__": true, // <-- malicious / forbidden
+		},
+	})
+	httpReq := httptest.NewRequest(http.MethodPost, "/v1/bot/sendMessage", bytes.NewReader(body))
+	httpReq.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	gc, _ := gin.CreateTestContext(rec)
+	gc.Request = httpReq
+	c := &wkhttp.Context{Context: gc}
+	c.Set(CtxKeyRobotID, botID)
+	c.Set(CtxKeyBotKind, BotKindUser)
+	c.Set(CtxKeyRobot, &robotModel{RobotID: botID, CreatorUID: owner})
+
+	ba.sendMessage(c)
+	// Body must carry the reject message; dispatch must NOT fire.
+	if !strings.Contains(rec.Body.String(), "__obo_") {
+		t.Fatalf("expected reject body to mention __obo_ prefix, got %s", rec.Body.String())
+	}
+	if dc.captured != nil {
+		t.Fatalf("dispatch must NOT fire when reserved OBO key is rejected, got %+v", dc.captured)
+	}
+}
+
+// TestSendMessage_RejectsReservedOBOKey_OtherPrefix — covers an
+// arbitrary `__obo_*` key (not just the marker). Ensures the validator
+// is namespace-wide, so future server-only OBO fields cannot be spoofed
+// by adding them in the bot client.
+func TestSendMessage_RejectsReservedOBOKey_OtherPrefix(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const (
+		botID  = "bot_legacy"
+		owner  = "creator_uid"
+		authSp = "space_A"
+	)
+
+	dc := &dispatchCapture{}
+	ba := &BotAPI{
+		Log:              log.NewTLog("BotAPI-reject-reserved-other"),
+		spaceQuerier:     &fakeSpaceQuerier{defaultSpace: authSp},
+		dispatchOverride: dc.hook,
+		oboStoreOverride: newFakeOBOStore(),
+	}
+
+	body, _ := json.Marshal(BotSendMessageReq{
+		ChannelID:   owner,
+		ChannelType: common.ChannelTypePerson.Uint8(),
+		Payload: map[string]interface{}{
+			"content":              "hi",
+			"type":                 1,
+			"__obo_actual_sender__": "victim_bot",
+		},
+	})
+	httpReq := httptest.NewRequest(http.MethodPost, "/v1/bot/sendMessage", bytes.NewReader(body))
+	httpReq.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	gc, _ := gin.CreateTestContext(rec)
+	gc.Request = httpReq
+	c := &wkhttp.Context{Context: gc}
+	c.Set(CtxKeyRobotID, botID)
+	c.Set(CtxKeyBotKind, BotKindUser)
+	c.Set(CtxKeyRobot, &robotModel{RobotID: botID, CreatorUID: owner})
+
+	ba.sendMessage(c)
+	if dc.captured != nil {
+		t.Fatalf("dispatch must NOT fire for any __obo_* key, got %+v", dc.captured)
+	}
+}

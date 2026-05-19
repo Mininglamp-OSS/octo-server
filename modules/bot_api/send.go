@@ -126,12 +126,15 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 
 	// YUJ-1166 fan-out loop guard #3: mark this message so the fan-out
 	// listener (see obo_fanout.go) skips it on the way back through the
-	// listener pipeline. RFC §5.3 calls this `obo_processed=true`.
-	// Stored in payload (= message_extra in the persisted MessageResp) so
-	// the messages table itself doesn't need an ALTER (out-of-scope row).
+	// listener pipeline. Marker key lives in the reserved `__obo_*`
+	// namespace (see oboProcessedMarkerKey) which the inbound payload
+	// validator above strips off client requests — so the marker is
+	// server-only state that a bot cannot forge or suppress. Stored in
+	// payload (= message_extra in the persisted MessageResp) so the
+	// messages table itself doesn't need an ALTER (out-of-scope row).
 	if fromUID != robotID {
 		payload = ensureMap(payload)
-		payload["obo_processed"] = true
+		payload[oboProcessedMarkerKey] = true
 		payload["actual_sender_uid"] = robotID
 	}
 
