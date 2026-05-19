@@ -248,7 +248,7 @@ func (d *DB) RevokeRefreshByUID(uid string) (int64, error) {
 //     的 IsDestroyDone 检查同源
 //   - status<>0:排除被运维封禁/停用的账号。autolink 命中停用 uid 会让 IssueSession
 //     在终态拒绝,但 OIDC bind 路径会在 confirm 时已经写完 user_oidc_identity,
-//     残留脏数据让该用户后续 OIDC 登录持续失败(yujiawei + Jerry-Xin review 已确认)
+//     残留脏数据让该用户后续 OIDC 登录持续失败
 //
 // TODO: user.IService 后续应暴露 QueryUIDsByEmail,届时本方法迁移到 user 模块,
 // oidc 改走接口避免跨模块 SQL 耦合。

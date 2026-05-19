@@ -70,9 +70,9 @@ func TestDB_QueryUIDsByEmail_Integration(t *testing.T) {
 		"INSERT INTO user(uid, username, name, email, short_no, vercode, status, is_destroy) VALUES ('u-c','uc','C','same@x.com','sc','vc@1',1,1)",
 	).Exec()
 	require.NoError(t, err)
-	// 已封禁用户(status=0)也不该返回 —— Jerry-Xin review (PR #73 round-4) 修复:
-	// 之前缺这个过滤,SMS bind 会给停用账号写 user_oidc_identity 行,然后
-	// IssueSession 才拒绝,残留脏数据让该用户后续 OIDC 登录持续失败。
+	// 已封禁用户(status=0)也不该返回:之前缺这个过滤,SMS bind 会给停用账号
+	// 写 user_oidc_identity 行,然后 IssueSession 才拒绝,残留脏数据让该用户
+	// 后续 OIDC 登录持续失败。
 	_, err = ctx.DB().InsertBySql(
 		"INSERT INTO user(uid, username, name, email, short_no, vercode, status, is_destroy) VALUES ('u-d','ud','D','same@x.com','sd','vd@1',0,0)",
 	).Exec()
@@ -176,8 +176,7 @@ func TestDB_QueryUIDsByPhone_Integration(t *testing.T) {
 		"INSERT INTO user(uid, username, name, zone, phone, short_no, vercode, status, is_destroy) VALUES ('u-p1','up1','P1','0086','13900000001','sp1','vp1@1',1,0)",
 	).Exec()
 	require.NoError(t, err)
-	// Jerry-Xin review (PR #73 round-4) 修复:phone 共享下停用账号不该被返回。
-	// 同 email 路径的回归。
+	// 停用账号(status=0)不该出现在 bind locator 结果里,与 email 路径同款回归。
 	_, err = ctx.DB().InsertBySql(
 		"INSERT INTO user(uid, username, name, zone, phone, short_no, vercode, status, is_destroy) VALUES ('u-p2','up2','P2','0086','13900000002','sp2','vp2@1',0,0)",
 	).Exec()

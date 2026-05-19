@@ -217,7 +217,7 @@ bind_token 在 5 分钟 TTL 内：
 
 `/bind/confirm` 在 `identity.Insert` 之前还会再调一次同样的可绑定性检查，覆盖"verify 通过后账号才被运维 disable 或用户自助 destroy"的 TOCTOU 窗口；不可绑定时同样返 401。
 
-> 历史问题（commit 7b1fa9e 之前）：locator 只过滤 `is_destroy`，停用账号也能通过 verify；confirm 时 `IssueSession` 才拒绝，但 `user_oidc_identity` 行已写入，导致该用户后续 OIDC 登录持续失败需要人工 DB 清理。已在 round-4 修复。
+> 历史问题：早期版本 locator 只过滤 `is_destroy`，停用账号也能通过 verify；confirm 时 `IssueSession` 才拒绝，但 `user_oidc_identity` 行已写入，导致该用户后续 OIDC 登录持续失败需要人工 DB 清理。已修复。
 
 ### 3.7 bind_token TTL 是绝对截止
 
@@ -237,7 +237,7 @@ bind_token 在 5 分钟 TTL 内：
 
 ## 5. 已知限制 (follow-up)
 
-- **bind_token 在 URL 中传递**：浏览器历史/Referer/反代日志可能截获。已通过 (a) 后端 token 哈希化记录、(b) 本文档要求前端 `replaceState` 清除 URL 做缓解。彻底方案是 verify 成功后签发独立的 confirm secret，本期未做（参见 PR #73 review 中 Jerry-Xin 的 P1）。
+- **bind_token 在 URL 中传递**：浏览器历史/Referer/反代日志可能截获。已通过 (a) 后端 token 哈希化记录、(b) 本文档要求前端 `replaceState` 清除 URL 做缓解。彻底方案是 verify 成功后签发独立的 confirm secret，本期未做，列为 follow-up。
 - 端点级 IP rate-limit 后续 PR 添加，当前依赖 per-token 计数器（5 次 verify、3 次 confirm）+ uid 维度 10 次/天兜底。
 
 ## 6. 联调 checklist

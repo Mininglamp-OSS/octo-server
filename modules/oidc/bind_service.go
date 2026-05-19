@@ -377,7 +377,7 @@ func (s *BindService) Confirm(ctx context.Context, jti string) (*BindConfirmResp
 	if err != nil {
 		return nil, err
 	}
-	// TOCTOU 复核(round-4 Jerry-Xin):locator + VerifyPasswordByUID 都只在
+	// TOCTOU 复核:locator + VerifyPasswordByUID 都只在
 	// verify 阶段过滤 is_destroy/status,verify→confirm 之间有 5min 用户交互
 	// 窗口,运维 disable / 用户自助 destroy 都能让 CandidateUID 变成不可绑定状态。
 	// 此处再查一次,把残留 user_oidc_identity 脏数据导致用户后续 OIDC 登录
@@ -463,7 +463,7 @@ func decodeSDSnapshot(b []byte) (*StateData, error) {
 // 防止"victim 的 verified token + attacker 用自己账号再 verify 一次 →
 // CandidateUID 被覆盖 → confirm 绑到 attacker"的身份接管路径。
 //
-// TTL 使用 absolute expiry(round-4 Jerry-Xin Warning):传 remainingTTL 而非
+// TTL 使用 absolute expiry:传 remainingTTL 而非
 // 完整 cfg.TokenTTL,否则在 token 快过期时 verify 会把 TTL 续到 issue 后的
 // "TokenTTL × 2",与文档承诺的 5min 不符,也让 URL 泄漏窗口翻倍。
 // remaining<=0 时返 ErrBindNotFound 让调用方按"已过期"处理。
@@ -548,7 +548,6 @@ func maskEmailForBind(email string) string {
 //	""               → ""        // 空字符串透传,让 BindInfoResp.MaskedPhone 的
 //	                                json:"omitempty" 生效;否则返 *** 会让前端
 //	                                把"无手机号"误显示成"有手机号已脱敏"
-//	                                (round-4 Jerry-Xin nit)
 //
 // 不区分 +86 与裸号;调用方都来自 claims.PhoneNumber 字段,IdP 写法不固定。
 // 0<长度<4 时仍返 *** 兜底,不暴露原值(异常短手机号字段)。

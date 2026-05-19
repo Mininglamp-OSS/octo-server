@@ -60,6 +60,8 @@ func TestValidateBindConfigAgainstProvider(t *testing.T) {
 				Bind: BindConfig{
 					Enabled:      tc.bindEnabled,
 					RedirectBase: tc.redirectBase,
+					// 主表用例默认填合法 Methods,空 Methods 校验由独立子用例覆盖。
+					Methods: []BindMethod{BindMethodPassword, BindMethodSMSOTP},
 				},
 			}
 			err := validateBindConfigAgainstProvider(cfg)
@@ -75,4 +77,25 @@ func TestValidateBindConfigAgainstProvider(t *testing.T) {
 			}
 		})
 	}
+
+	// Methods 必须非空(防 loadBindMethods 在 env 全 invalid 时静默回退默认):
+	// 显式拒,匹配 "Methods 是真实策略不是 UI hint" 的安全契约。
+	t.Run("bind on, methods empty (all-invalid env) — fail Init", func(t *testing.T) {
+		cfg := &Config{
+			Enabled:  true,
+			Provider: ProviderConfig{AllowNewUser: false},
+			Bind: BindConfig{
+				Enabled:      true,
+				RedirectBase: validBase,
+				Methods:      nil,
+			},
+		}
+		err := validateBindConfigAgainstProvider(cfg)
+		if err == nil {
+			t.Fatal("expected error for empty Methods, got nil")
+		}
+		if !strings.Contains(err.Error(), "OCTO_OIDC_BIND_METHODS") {
+			t.Fatalf("error %q must mention OCTO_OIDC_BIND_METHODS", err.Error())
+		}
+	})
 }

@@ -33,6 +33,17 @@ func validateBindConfigAgainstProvider(cfg *Config) error {
 	if err := validateBindRedirectBase(cfg.Bind.RedirectBase); err != nil {
 		return err
 	}
+	if len(cfg.Bind.Methods) == 0 {
+		// 唯一进入 0 的路径是 loadBindMethods 在 env 全部非法时返空:运维
+		// 显式配 OCTO_OIDC_BIND_METHODS 但拼写错或全是 disallowed (email_otp) 值。
+		// 起服务直接拒,避免静默回退到默认两项让"显式想关 password"的配置
+		// fail-open 激活默认 [password, sms_otp]。
+		return fmt.Errorf(
+			"oidc: Bind.Enabled=true requires at least one valid method in " +
+				"OCTO_OIDC_BIND_METHODS (allowed: password, sms_otp); " +
+				"got an env value that parsed to zero valid methods",
+		)
+	}
 	return nil
 }
 
@@ -145,8 +156,19 @@ func loadBindCounter(key string, def int64) int64 {
 	return n
 }
 
-// loadBindMethods 解析 OCTO_OIDC_BIND_METHODS,逗号分隔。未知值/email_otp
-// 静默 drop(后者 SR-3 明确禁用);全部 drop 则回退默认两项,避免"无可用方法"死锁。
+// loadBindMethods 解析 OCTO_OIDC_BIND_METHODS,逗号分隔。
+//
+// 语义:
+//   - env 未设置/为空 → 返默认两项(password, sms_otp),便于零配置启动
+//   - env 设置但解析后**所有**项都被 drop(未知值 / email_otp / 拼写错)
+//     → 返**空切片**,让 validateBindConfigAgainstProvider 在
+//     Bind.Enabled=true 时拒绝启动。**绝不**回退到默认值 —— 那会让
+//     运维"显式想关 password"的 OCTO_OIDC_BIND_METHODS=email_otp
+//     之类配置静默激活默认 [password, sms_otp],auth 策略 fail-open。
+//   - 至少有一项合法 → 返过滤后的列表
+//
+// email_otp 在 validBindMethods 里被显式排除(SR-3),所以 "email_otp" 单值
+// 输入会落到第二条 → 空列表 → 启动拒绝,正是预期。
 func loadBindMethods() []BindMethod {
 	v, ok := os.LookupEnv("OCTO_OIDC_BIND_METHODS")
 	if !ok || v == "" {
@@ -164,9 +186,6 @@ func loadBindMethods() []BindMethod {
 			continue
 		}
 		out = append(out, m)
-	}
-	if len(out) == 0 {
-		return defaultBindMethods
 	}
 	return out
 }

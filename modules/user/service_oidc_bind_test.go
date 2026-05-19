@@ -175,7 +175,7 @@ func TestService_VerifyOIDCBindSMS_DelegationAndErrors(t *testing.T) {
 }
 
 // TestService_IsBindable_DelegationAndErrors 同 VerifyPasswordByUID 模式:
-// 未注入 sentinel,已注入直接透传 ok/err。round-4 TOCTOU 修复加的新方法。
+// 未注入 sentinel,已注入直接透传 ok/err。Confirm-time TOCTOU 复核的新方法。
 func TestService_IsBindable_DelegationAndErrors(t *testing.T) {
 	t.Run("not configured returns sentinel", func(t *testing.T) {
 		svc := &Service{}

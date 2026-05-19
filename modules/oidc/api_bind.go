@@ -377,7 +377,7 @@ func (o *OIDC) handleBindConfirmErr(c *wkhttp.Context, token string, err error) 
 		c.AbortWithStatusJSON(http.StatusConflict,
 			errMsg("identity already bound; sign in again via OIDC to continue"))
 	case errors.Is(err, ErrBindAuthRejected):
-		// round-4 TOCTOU 复核失败:verify→confirm 之间账号被停用/进入冷静期。
+		// TOCTOU 复核失败:verify→confirm 之间账号被停用/进入冷静期。
 		// 401 + 通用文案与 verify 路径反枚举一致(不暴露"账号被运维停用"差异);
 		// audit reason 写明区分让 SOC 在 oidc_audit_log 里能区分本因。
 		o.writeAudit("bind:"+tokenHash, EventBindConfirmFail, stateFromCtx(c), "candidate uid not bindable")

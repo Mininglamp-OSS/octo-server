@@ -840,8 +840,8 @@ func TestBindService_VerifyPassword_UIDFailPerDayEnforced(t *testing.T) {
 	}
 }
 
-// TestBindService_SaveVerified_UsesAbsoluteTTLNotFullTokenTTL 锁定 round-4
-// Jerry-Xin Warning 修复:CASSave 必须用"距离 Issue 时刻 + TokenTTL 还剩多少
+// TestBindService_SaveVerified_UsesAbsoluteTTLNotFullTokenTTL 锁定:
+// CASSave 必须用"距离 Issue 时刻 + TokenTTL 还剩多少
 // 秒"作为新 TTL,而不是完整 cfg.TokenTTL,否则用户在临近过期时 verify 会
 // 把 token 续到 ~2 × TokenTTL,违反 5min 文档承诺 + URL 泄漏窗口翻倍。
 //
@@ -908,8 +908,8 @@ func TestBindService_SaveVerified_RejectsExpiredSession(t *testing.T) {
 	}
 }
 
-// TestBindService_Confirm_RejectsWhenCandidateBecomesUnbindable 锁定 round-4
-// Jerry-Xin Critical 修复:verify→confirm 之间账号被 disable/destroy,Confirm
+// TestBindService_Confirm_RejectsWhenCandidateBecomesUnbindable 锁定:
+// verify→confirm 之间账号被 disable/destroy,Confirm
 // 必须再查一次 IsBindable,识别后拒绝(ErrBindAuthRejected),**不**写 identity 行。
 func TestBindService_Confirm_RejectsWhenCandidateBecomesUnbindable(t *testing.T) {
 	h := newBindHarness(t)
@@ -959,8 +959,8 @@ func TestBindService_Confirm_IsBindableInfraError(t *testing.T) {
 	}
 }
 
-// TestBindService_VerifyPassword_UserLayerRateLimitedMapsTo429 锁定 Jerry-Xin
-// PR #73 round-4 review 的 Warning:user.VerifyPasswordByUID 在 loginGuard
+// TestBindService_VerifyPassword_UserLayerRateLimitedMapsTo429 锁定:
+// user.VerifyPasswordByUID 在 loginGuard
 // 锁定时返 (matched=false, reason="rate_limited"),BindService 必须翻 ErrBindRateLimited
 // (handler 429 + metric rate_limited),不能笼统归 ErrBindAuthRejected(401 +
 // metric unauthorized)—— 与 PR 的 sentinel/status/metric 三方对齐契约一致。
@@ -989,8 +989,8 @@ func TestBindService_VerifyPassword_UserLayerRateLimitedMapsTo429(t *testing.T) 
 	}
 }
 
-// TestBindService_VerifyPassword_DisabledIdentifierRejected 锁定 Jerry-Xin
-// PR #73 round-4 Critical 修复在 service 层的契约:dbBindLocator 已经
+// TestBindService_VerifyPassword_DisabledIdentifierRejected 锁定 service 层
+// 对停用账号的契约:dbBindLocator 已经
 // 过滤了 is_destroy/status,locator 对停用账号返 "",service 走 unknown-identifier
 // 路径返 ErrBindAuthRejected(handler 401,与"用户存在但密码错"无差异 SR-6)。
 //

@@ -119,7 +119,9 @@ func TestLoadConfig_BindInvalidValuesFallback(t *testing.T) {
 	t.Setenv("OCTO_OIDC_BIND_OTP_SEND_MAX", "-1")
 	t.Setenv("OCTO_OIDC_BIND_CONFIRM_MAX", "abc")
 	t.Setenv("OCTO_OIDC_BIND_UID_FAIL_PER_DAY", "")
-	t.Setenv("OCTO_OIDC_BIND_METHODS", "email_otp") // SR-3 禁用,会被静默过滤掉
+	// 注意:此处不再设 METHODS,留默认行为。METHODS env 显式全非法的语义
+	// 已迁移到 TestLoadConfig_BindMethodsParsing + TestValidateBindConfigAgainstProvider:
+	// 显式配但全 invalid → 空切片 → validate fail Init(不再静默回退默认值)。
 
 	cfg, err := LoadConfig()
 	if err != nil {
@@ -136,16 +138,14 @@ func TestLoadConfig_BindInvalidValuesFallback(t *testing.T) {
 	if b.UIDFailPerDay != 10 {
 		t.Fatalf("empty UIDFailPerDay must fall back, got %d", b.UIDFailPerDay)
 	}
-	// 全部方法被过滤后回退到默认两项 —— 不让运维误配整出"无可用方法"的死锁。
-	if len(b.Methods) != 2 {
-		t.Fatalf("filtered-empty Methods must fall back to defaults, got %v", b.Methods)
-	}
 }
 
-// TestLoadConfig_BindMethodsParsing 单独覆盖 Methods 字段的几种边界:
-//   - 仅 password / 仅 sms_otp / 两者 / 含未知值 / 仅未知值
-//   - 未知方法静默丢弃(不报错,避免运维迁移 typo 拒启动);全部未知 → 回退默认
+// TestLoadConfig_BindMethodsParsing 覆盖 Methods 字段几种边界:
+//   - 仅 password / 仅 sms_otp / 两者 / 含未知值
+//   - 未知方法静默丢弃(不报错,避免运维迁移 typo 整条 env 失效)
 //   - email_otp 必须被过滤(SR-3 禁用)
+//   - **全部非法 → 返空切片**(让 validateBindConfigAgainstProvider fail Init,
+//     防 fail-open 回退到 [password, sms_otp])
 func TestLoadConfig_BindMethodsParsing(t *testing.T) {
 	cases := []struct {
 		name string
@@ -158,7 +158,7 @@ func TestLoadConfig_BindMethodsParsing(t *testing.T) {
 		{"with whitespace", "  password ,  sms_otp ", []BindMethod{BindMethodPassword, BindMethodSMSOTP}},
 		{"email_otp dropped (SR-3)", "password,email_otp,sms_otp", []BindMethod{BindMethodPassword, BindMethodSMSOTP}},
 		{"unknown dropped", "password,bogus", []BindMethod{BindMethodPassword}},
-		{"all unknown falls back", "email_otp,bogus", []BindMethod{BindMethodPassword, BindMethodSMSOTP}},
+		{"all invalid returns empty (no fail-open default)", "email_otp,bogus", []BindMethod{}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

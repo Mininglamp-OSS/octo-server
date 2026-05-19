@@ -503,9 +503,9 @@ func (g *testRouteGroup) POST(path string, _ ...wkhttp.HandlerFunc) {
 	g.routes = append(g.routes, "POST "+path)
 }
 
-// TestAPI_BindConfirm_4xxBranchesAlsoAudit 锁定 Jerry-Xin / yujiawei PR #73
-// round-4 review:handleBindConfirmErr 的 4xx 分支也必须写 EventBindConfirmFail
-// 审计行 —— SR-6 完整性。之前只有 default(500)分支 writeAudit,导致攻击者
+// TestAPI_BindConfirm_4xxBranchesAlsoAudit 锁定 handleBindConfirmErr 的 4xx
+// 分支也必须写 EventBindConfirmFail 审计行 —— SR-6 完整性。
+// 之前只有 default(500)分支 writeAudit,导致攻击者
 // 反复 confirm 探测 status/already-bound/expired 差异时 oidc_audit_log 留不下
 // 痕迹,SOC 反查丢半条时间序列。
 func TestAPI_BindConfirm_4xxBranchesAlsoAudit(t *testing.T) {
