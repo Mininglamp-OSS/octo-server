@@ -49,6 +49,8 @@ type BindInfoResp struct {
 	Name           string       `json:"name,omitempty"`
 	Methods        []BindMethod `json:"methods"`
 	SupportContact string       `json:"support_contact,omitempty"`
+	AllowCreate    bool         `json:"allow_create"`
+	CreateBlocked  string       `json:"create_blocked,omitempty"`
 }
 
 // BindService 自助绑定状态机的业务逻辑层。
@@ -113,8 +115,8 @@ func (s *BindService) Issue(ctx context.Context, claims *IDTokenClaims, sd *Stat
 	return jti, nil
 }
 
-// Info 返回脱敏 claims + 可用方法。可用方法 = 配置 Methods ∩ 当前 claims 支持
-// 的手段(claims 无 verified phone → 屏蔽 sms_otp,FR-3.3)。
+// Info 返回脱敏 claims + 可用方法 + create 能力状态。
+// 可用方法 = 配置 Methods ∩ 当前 claims 支持的手段(claims 无 verified phone → 屏蔽 sms_otp,FR-3.3)。
 func (s *BindService) Info(ctx context.Context, jti string) (*BindInfoResp, error) {
 	sess, err := s.store.Get(ctx, jti)
 	if err != nil {
@@ -131,6 +133,12 @@ func (s *BindService) Info(ctx context.Context, jti string) (*BindInfoResp, erro
 		SupportContact: s.cfg.SupportContact,
 	}
 	resp.Methods = s.availableMethods(claims)
+	resp.AllowCreate = s.cfg.AllowCreate
+	if !s.cfg.AllowCreate {
+		resp.CreateBlocked = "disabled"
+	} else if err := s.checkClaimsForCreate(claims); err != nil {
+		resp.CreateBlocked = "claims_incomplete"
+	}
 	return resp, nil
 }
 
@@ -445,6 +453,110 @@ func (s *BindService) Confirm(ctx context.Context, jti string) (*BindConfirmResp
 	}, nil
 }
 
+// BindCreateResp Create 返给 handler 的完整快照,与 BindConfirmResp 对齐。
+type BindCreateResp struct {
+	IssueResp *IssueSessionResp
+	SD        *StateData
+	UID       string
+	Issuer    string
+}
+
+// Create 在 status=issued 时直接用 bind_token 里的 claims 建号 + 写 identity + 签发会话。
+//
+// 步骤(见 plan §4):
+//  1. Get session
+//  2. IncrAndCheck("bind:create:"+jti, bindCreateMax) — counter→status 顺序与 Confirm 对齐
+//  3. 校验 status == issued
+//  4. decode claims snapshot
+//  5. 校验 claims 至少有一条 verified 的 email 或 phone
+//  6. IssueSession({CreateUser:true, ...claims})
+//  7. identity.Insert((uid, issuer, sub))
+//  8. CASSave(issued→created)
+//  9. Consume(token) — 单次消费;失败仅 log
+func (s *BindService) Create(ctx context.Context, jti string) (*BindCreateResp, error) {
+	if s.identity == nil || s.users == nil {
+		return nil, errors.New("oidc bind Create: not configured (identity/users nil)")
+	}
+	sess, err := s.store.Get(ctx, jti)
+	if err != nil {
+		return nil, err
+	}
+	// counter→status 顺序(与 Confirm 对齐):任意对 create 的探测都消耗配额
+	if _, err := s.store.IncrAndCheck(ctx,
+		"bind:create:"+jti, bindCreateMax, s.cfg.TokenTTL); err != nil {
+		return nil, err
+	}
+	if sess.Status != BindStatusIssued {
+		return nil, ErrBindStatusConflict
+	}
+	claims, err := decodeClaimsSnapshot(sess.ClaimsSnapshot)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.checkClaimsForCreate(claims); err != nil {
+		return nil, err
+	}
+	sd, err := decodeSDSnapshot(sess.SDSnapshot)
+	if err != nil {
+		return nil, err
+	}
+	zone, phone := extractZone(claims.PhoneNumber), extractPhone(claims.PhoneNumber)
+	issueReq := IssueSessionReq{
+		CreateUser: true,
+		Name:       claims.Name,
+		Email:      claims.Email,
+		Phone:      phone,
+		Zone:       zone,
+		DeviceFlag: sd.DeviceFlag,
+		PublicIP:   sd.IP,
+	}
+	resp, err := s.users.IssueSession(ctx, issueReq)
+	if err != nil {
+		return nil, fmt.Errorf("oidc bind Create: issue session: %w", err)
+	}
+	uid := resp.UID
+	if err := s.identity.Insert(&IdentityModel{
+		UID:           uid,
+		Issuer:        claims.Issuer,
+		Subject:       claims.Subject,
+		Email:         claims.Email,
+		EmailVerified: boolToInt(claims.EmailVerified),
+		Phone:         claims.PhoneNumber,
+		PhoneVerified: boolToInt(claims.PhoneVerified),
+		LinkedAt:      time.Now(),
+	}); err != nil {
+		if isDuplicateKeyError(err) {
+			return nil, ErrBindAlreadyBound
+		}
+		return nil, fmt.Errorf("oidc bind Create: insert identity: %w", err)
+	}
+	if err := s.saveCreated(ctx, sess); err != nil {
+		return nil, fmt.Errorf("oidc bind Create: save created: %w", err)
+	}
+	if _, cerr := s.store.Consume(ctx, jti); cerr != nil {
+		log.Warn("OIDC bind Create: consume session failed (non-fatal, will TTL out)",
+			zap.String("jti_hash", subHash(jti)), zap.Error(cerr))
+	}
+	return &BindCreateResp{
+		IssueResp: resp,
+		SD:        sd,
+		UID:       uid,
+		Issuer:    claims.Issuer,
+	}, nil
+}
+
+// checkClaimsForCreate 校验 claims 至少有一条强标识(email 或 phone)。
+// 与 autolink 的准入条件对齐:email_verified / phone_verified 必须为 true,
+// 否则后续客服 / 找回流程没有可信账号锚点。
+func (s *BindService) checkClaimsForCreate(claims *IDTokenClaims) error {
+	hasEmail := claims.Email != "" && claims.EmailVerified
+	hasPhone := claims.PhoneNumber != "" && claims.PhoneVerified
+	if !hasEmail && !hasPhone {
+		return ErrBindCreateClaimsIncomplete
+	}
+	return nil
+}
+
 // decodeSDSnapshot 与 decodeClaimsSnapshot 对称。
 func decodeSDSnapshot(b []byte) (*StateData, error) {
 	var sd StateData
@@ -474,6 +586,20 @@ func (s *BindService) saveVerified(ctx context.Context, sess *BindSession) error
 	}
 	if err := s.store.CASSave(ctx, sess, BindStatusIssued, remaining); err != nil {
 		return fmt.Errorf("oidc bind: cas save verified session: %w", err)
+	}
+	return nil
+}
+
+// saveCreated 把 sess.Status 从 issued CAS 到 created,使用绝对剩余 TTL。
+// 对称 saveVerified:CAS expected=issued,防并发 create 竞态。
+func (s *BindService) saveCreated(ctx context.Context, sess *BindSession) error {
+	remaining := s.remainingTTL(sess)
+	if remaining <= 0 {
+		return ErrBindNotFound
+	}
+	sess.Status = BindStatusCreated
+	if err := s.store.CASSave(ctx, sess, BindStatusIssued, remaining); err != nil {
+		return fmt.Errorf("oidc bind: cas save created session: %w", err)
 	}
 	return nil
 }

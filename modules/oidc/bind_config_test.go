@@ -237,8 +237,40 @@ func clearOIDCBindEnv(t *testing.T) {
 		"OCTO_OIDC_BIND_METHODS",
 		"OCTO_OIDC_BIND_SUPPORT_CONTACT",
 		"OCTO_OIDC_BIND_REDIRECT_BASE",
+		"OCTO_OIDC_BIND_ALLOW_CREATE",
 	}
 	for _, k := range keys {
 		t.Setenv(k, "")
+	}
+}
+
+// T1: 默认 AllowCreate=true
+func TestLoadConfig_BindCreate_Defaults(t *testing.T) {
+	clearOIDCBindEnv(t)
+	clearOIDCEnv(t)
+	mustSetMinimalOIDCEnv(t)
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if !cfg.Bind.AllowCreate {
+		t.Fatal("AllowCreate default must be true (D1)")
+	}
+}
+
+// T2: 显式关 AllowCreate
+func TestLoadConfig_BindCreate_Disabled(t *testing.T) {
+	clearOIDCBindEnv(t)
+	clearOIDCEnv(t)
+	mustSetMinimalOIDCEnv(t)
+	t.Setenv("OCTO_OIDC_BIND_ALLOW_CREATE", "false")
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.Bind.AllowCreate {
+		t.Fatal("AllowCreate must be false when env=false")
 	}
 }

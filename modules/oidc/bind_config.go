@@ -82,7 +82,7 @@ func validateBindRedirectBase(base string) error {
 // BindConfig 自助绑定相关配置(NFR-4 全部走 env,不硬编码)。
 //
 // **Enabled=false 时其余字段无效**:LoadConfig 不校验任何依赖关系,
-// PR3 仅起骨架作用,callback 接管在 PR4 才打开。PR4 会加 "Enabled && RedirectBase==''"
+// PR3 仅起骨架作用,callback 接管在 PR4 才打开。PR4 会加 "Enabled && RedirectBase==”"
 // 这类硬校验。
 //
 // keyspace 命名:OCTO_OIDC_BIND_* 与已有 DM_OIDC_* 并列,语义上 BindConfig
@@ -98,17 +98,26 @@ type BindConfig struct {
 	Methods         []BindMethod
 	SupportContact  string
 	RedirectBase    string
+	AllowCreate     bool
 }
 
 // 默认值集中定义,与 bind_config_test.go 的 TestLoadConfig_BindDefaults
 // 保持单一事实源 —— 改阈值时只需动一处。
 const (
-	defaultBindTokenTTL       = 5 * time.Minute
-	defaultBindVerifyMax      = 5  // SR-2.1
-	defaultBindOTPSendMax     = 3  // SR-2.1
-	defaultBindConfirmMax     = 3  // SR-2.1
-	defaultBindUIDFailPerDay  = 10 // SR-2.2
+	defaultBindTokenTTL      = 5 * time.Minute
+	defaultBindVerifyMax     = 5  // SR-2.1
+	defaultBindOTPSendMax    = 3  // SR-2.1
+	defaultBindConfirmMax    = 3  // SR-2.1
+	defaultBindUIDFailPerDay = 10 // SR-2.2
 )
+
+// bindCreateMax is fixed at 1 per bind_token: /bind/create is a terminal
+// one-shot operation; failure modes (claims incomplete, status conflict,
+// already bound) are deterministic and retrying cannot make them succeed.
+// Transient errors leave token state ambiguous and must not be retried
+// blindly. Operators who want stricter gating should disable AllowCreate
+// entirely and rely on /bind/verify/*.
+const bindCreateMax int64 = 1
 
 // defaultBindMethods 不导出但被 LoadConfig 与 fallback 路径共享,
 // 避免在两处 hardcode 顺序不一致(测试断言依赖顺序)。
@@ -126,6 +135,7 @@ func loadBindConfig() BindConfig {
 		Methods:         loadBindMethods(),
 		SupportContact:  getString("OCTO_OIDC_BIND_SUPPORT_CONTACT", ""),
 		RedirectBase:    getString("OCTO_OIDC_BIND_REDIRECT_BASE", ""),
+		AllowCreate:     getBool("OCTO_OIDC_BIND_ALLOW_CREATE", true),
 	}
 }
 

@@ -47,6 +47,7 @@ const (
 	BindStatusVerified  BindStatus = "verified"
 	BindStatusConfirmed BindStatus = "confirmed"
 	BindStatusRefused   BindStatus = "refused"
+	BindStatusCreated   BindStatus = "created"
 )
 
 // BindSession bind_token 在 Redis 里的完整快照。
@@ -54,12 +55,12 @@ const (
 // 字段说明:
 //   - JTI:            bind_token 自身,32 字节 base64,Redis key 后缀(SR-7)
 //   - Issuer/Subject: OIDC claims 原值,confirm 时直接写 user_oidc_identity
-//                     —— 用户在 5min TTL 内可能换 IdP session,这里固化避免漂移
+//     —— 用户在 5min TTL 内可能换 IdP session,这里固化避免漂移
 //   - CandidateUID:   email/phone 多匹配场景下用户选定的 uid(M1 暂不支持选择,
-//                     字段预留)。当前实现下用户走密码路径需先输入 username/uid 定位
+//     字段预留)。当前实现下用户走密码路径需先输入 username/uid 定位
 //   - ClaimsSnapshot: 完整 IDTokenClaims JSON,confirm 时透传给 IssueSession
 //   - SDSnapshot:     原 StateData JSON 关键字段(authcode/return_to/device_flag),
-//                     confirm 后回填到原发起设备的 ThirdAuthcode(FR-6.3)
+//     confirm 后回填到原发起设备的 ThirdAuthcode(FR-6.3)
 //   - Status:         状态机字段(见 BindStatus)
 //   - VerifiedMethod: 记录哪种手段通过的(audit 维度)
 //   - OriginIP/UA:    审计 + FR-6.2 设备差异提示

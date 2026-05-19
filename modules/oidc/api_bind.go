@@ -79,13 +79,14 @@ type bindRouteGroup interface {
 	POST(relativePath string, handlers ...wkhttp.HandlerFunc)
 }
 
-// bindRoutes 挂载自助绑定的 5 个 HTTP 端点。
+// bindRoutes 挂载自助绑定的 HTTP 端点。
 //
 // 设计:
 //   - Bind.Enabled=false 时整个函数 no-op,production 配 disabled provider
 //     时连"路由不存在"都成立(404 由 gin 默认 router 兜底)
 //   - 不带 AuthMiddleware:bind_token 自身就是单次消费认证凭据(SR-1),
 //     调用方还没有 dmwork session 才需要走这套流程
+//   - AllowCreate=false 时 /bind/create 不挂(D8:404 比 403 更彻底)
 func (o *OIDC) bindRoutes(g bindRouteGroup) {
 	// 仅由 routeAt 在 o.cfg 非 nil 时调用,o == nil / o.cfg == nil 不可达。
 	if !o.cfg.Bind.Enabled {
@@ -96,6 +97,9 @@ func (o *OIDC) bindRoutes(g bindRouteGroup) {
 	g.POST("/bind/verify/otp/send", o.bindOTPSend)
 	g.POST("/bind/verify/otp/check", o.bindOTPCheck)
 	g.POST("/bind/confirm", o.bindConfirm)
+	if o.cfg.Bind.AllowCreate {
+		g.POST("/bind/create", o.bindCreate)
+	}
 }
 
 // bindInfo GET /bind/info?token=...  → 脱敏身份信息 + 可用方法(FR-2)。
@@ -296,10 +300,10 @@ func (o *OIDC) handleBindVerifyErr(c *wkhttp.Context, path, token string, err er
 // bindConfirm POST /bind/confirm  {token}
 //
 // 用户在确认页点"绑定"后调用(FR-4.1)。串行步骤:
-//   1. service.Confirm 写 user_oidc_identity + 调 IssueSession 拿 LoginRespJSON
-//   2. authcode.SetAuthcode 回填原发起设备的 ThirdAuthcode(FR-6.3 跨设备)
-//   3. 同时把 LoginRespJSON 直接返给当前设备,前端可选择走 ThirdAuthcode 或
-//      response body(若当前设备 == 发起设备,二者等价)
+//  1. service.Confirm 写 user_oidc_identity + 调 IssueSession 拿 LoginRespJSON
+//  2. authcode.SetAuthcode 回填原发起设备的 ThirdAuthcode(FR-6.3 跨设备)
+//  3. 同时把 LoginRespJSON 直接返给当前设备,前端可选择走 ThirdAuthcode 或
+//     response body(若当前设备 == 发起设备,二者等价)
 //
 // 失败码:
 //   - 400 token 缺失/非法
@@ -343,9 +347,9 @@ func (o *OIDC) bindConfirm(c *wkhttp.Context) {
 	}
 	o.writeAudit(resp.UID, EventBindConfirmOK, stateFromCtx(c), "")
 	c.JSON(http.StatusOK, map[string]interface{}{
-		"status":      "ok",
-		"login_resp":  resp.IssueResp.LoginRespJSON,
-		"uid":         resp.UID,
+		"status":     "ok",
+		"login_resp": resp.IssueResp.LoginRespJSON,
+		"uid":        resp.UID,
 	})
 }
 
@@ -433,10 +437,94 @@ func bindResultFromErr(err error) string {
 		return "conflict"
 	case errors.Is(err, ErrBindAuthRejected):
 		return "unauthorized"
+	case errors.Is(err, ErrBindCreateClaimsIncomplete):
+		return "claims_incomplete"
 	default:
 		// 未分类 = 内部异常。dashboard 上看到 internal_error 持续升高就是
 		// 该报警的信号(DB/Redis/底层 SMSService 故障),与 401 不再混淆。
 		return "internal_error"
+	}
+}
+
+// bindCreate POST /bind/create  {token}
+//
+// 用 bind_token 里固化的 SSO claims 直接建号 + 写 identity + 签发会话。
+// 复用 AllowNewUser=true 路径语义(IssueSession{CreateUser:true}),但走 bind_token 护栏。
+//
+// 失败码:
+//   - 400 token 缺失/格式非法
+//   - 409 status 冲突或 identity 已存在(race recover 路径)
+//   - 410 token 已过期/未知
+//   - 422 claims 既无 verified email 也无 verified phone
+//   - 429 同一 token 已 create 过(单次性)
+//   - 500 内部错误
+func (o *OIDC) bindCreate(c *wkhttp.Context) {
+	m := startBindMetric("create")
+	defer m.finish()
+
+	if o.guardBindReady(c, m) {
+		return
+	}
+	var req struct {
+		Token string `json:"token"`
+	}
+	if err := c.BindJSON(&req); err != nil || !authcodeRe.MatchString(req.Token) {
+		m.result = "bad_request"
+		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("token required"))
+		return
+	}
+	ctx := c.Request.Context()
+	resp, err := o.bind.Create(ctx, req.Token)
+	if err != nil {
+		m.result = bindResultFromErr(err)
+		o.handleBindCreateErr(c, req.Token, err)
+		return
+	}
+	m.result = "ok"
+	if resp.SD != nil && resp.SD.ClientAuthcode != "" && o.authcode != nil {
+		if e := o.authcode.SetAuthcode(ctx, resp.SD.ClientAuthcode,
+			resp.IssueResp.LoginRespJSON, thirdAuthcodeTTL); e != nil {
+			o.Warn("OIDC bind create: write ThirdAuthcode failed (non-fatal)",
+				zap.String("trace_id", newTraceID()), zap.Error(e))
+		}
+	}
+	o.writeAudit(resp.UID, EventBindCreated, stateFromCtx(c), "")
+	c.JSON(http.StatusOK, map[string]interface{}{
+		"status":     "ok",
+		"login_resp": resp.IssueResp.LoginRespJSON,
+		"uid":        resp.UID,
+	})
+}
+
+// handleBindCreateErr /bind/create 路径的错误码翻译。
+// 所有分支都写 EventBindCreateFail 审计。
+func (o *OIDC) handleBindCreateErr(c *wkhttp.Context, token string, err error) {
+	tokenHash := subHash(token)
+	switch {
+	case errors.Is(err, ErrBindNotFound):
+		o.writeAudit("bind:"+tokenHash, EventBindCreateFail, stateFromCtx(c), "token expired or not found")
+		c.AbortWithStatusJSON(http.StatusGone, errMsg("token expired or not found"))
+	case errors.Is(err, ErrBindRateLimited):
+		o.writeAudit("bind:"+tokenHash, EventBindCreateFail, stateFromCtx(c), "rate limited")
+		c.AbortWithStatusJSON(http.StatusTooManyRequests, errMsg("too many create attempts"))
+	case errors.Is(err, ErrBindStatusConflict):
+		o.writeAudit("bind:"+tokenHash, EventBindCreateFail, stateFromCtx(c), "status conflict")
+		c.AbortWithStatusJSON(http.StatusConflict, errMsg("token status conflict"))
+	case errors.Is(err, ErrBindAlreadyBound):
+		// Identity 行已存在(并发 /bind/create 同 (issuer,sub) 触发了竞态)。
+		// 赢家已签发会话;此处只引导客户端重发起 OIDC 登录以拾取赢家会话。
+		// Ghost user 清理(输家创建的 dmwork user)不在本 PR 范围,见 plan §4/§15。
+		o.writeAudit("bind:"+tokenHash, EventBindCreateFail, stateFromCtx(c), "already bound")
+		c.AbortWithStatusJSON(http.StatusConflict,
+			errMsg("identity already bound; sign in via OIDC to continue"))
+	case errors.Is(err, ErrBindCreateClaimsIncomplete):
+		o.writeAudit("bind:"+tokenHash, EventBindCreateFail, stateFromCtx(c), "claims incomplete")
+		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, errMsg("claims missing required fields"))
+	default:
+		o.Error("OIDC bind create failed (internal)",
+			zap.String("token_hash", tokenHash), zap.Error(err))
+		o.writeAudit("bind:"+tokenHash, EventBindCreateFail, stateFromCtx(c), auditReason(err.Error()))
+		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("internal error"))
 	}
 }
 

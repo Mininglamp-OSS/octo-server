@@ -84,6 +84,11 @@ var (
 	// 端点绕过运维"禁用密码"的安全开关。handler 翻 400,与"参数非法"同档,
 	// 不属于身份凭据拒绝,因此与 ErrBindAuthRejected 区分。
 	ErrBindMethodDisabled = errors.New("oidc: bind method disabled by configuration")
+
+	// ErrBindCreateClaimsIncomplete claims 既无 verified email 也无 verified phone:
+	// /bind/create 拒绝建号,因为后续客服 / 找回流程没有可信账号锚点。
+	// handler 翻 422,metric label claims_incomplete。
+	ErrBindCreateClaimsIncomplete = errors.New("oidc bind: claims missing required fields")
 )
 
 // ---------- memory impl (单测 + 本地开发) ----------

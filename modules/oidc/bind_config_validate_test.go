@@ -98,4 +98,45 @@ func TestValidateBindConfigAgainstProvider(t *testing.T) {
 			t.Fatalf("error %q must mention OCTO_OIDC_BIND_METHODS", err.Error())
 		}
 	})
+
+	// T5: Bind.Enabled=true + AllowCreate=true + AllowNewUser=true → must fail
+	// 同时开 AllowCreate 和 AllowNewUser 等价于"autolink 失败后直接建号",
+	// bind 流程的建号路径(create)与 callback 自动建号路径同时存在,运维会误
+	// 以为 create 被 bind 护栏保护但实际已经被 AllowNewUser 旁路。
+	t.Run("T5: AllowCreate=true + AllowNewUser=true — must panic/fail", func(t *testing.T) {
+		cfg := &Config{
+			Enabled:  true,
+			Provider: ProviderConfig{AllowNewUser: true},
+			Bind: BindConfig{
+				Enabled:      true,
+				AllowCreate:  true,
+				RedirectBase: validBase,
+				Methods:      []BindMethod{BindMethodPassword, BindMethodSMSOTP},
+			},
+		}
+		err := validateBindConfigAgainstProvider(cfg)
+		if err == nil {
+			t.Fatal("T5: AllowCreate=true + AllowNewUser=true must be rejected at startup")
+		}
+		if !strings.Contains(err.Error(), "AllowNewUser") {
+			t.Fatalf("T5: error %q must mention AllowNewUser", err.Error())
+		}
+	})
+
+	// T6: AllowCreate=true + AllowNewUser=false → pass
+	t.Run("T6: AllowCreate=true + AllowNewUser=false — passes", func(t *testing.T) {
+		cfg := &Config{
+			Enabled:  true,
+			Provider: ProviderConfig{AllowNewUser: false},
+			Bind: BindConfig{
+				Enabled:      true,
+				AllowCreate:  true,
+				RedirectBase: validBase,
+				Methods:      []BindMethod{BindMethodPassword, BindMethodSMSOTP},
+			},
+		}
+		if err := validateBindConfigAgainstProvider(cfg); err != nil {
+			t.Fatalf("T6: valid AllowCreate config must pass validation, got: %v", err)
+		}
+	})
 }
