@@ -1192,6 +1192,84 @@ func TestTranscribeAPI_ModeEditOnly_GPTEngineRejected(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "edit mode is not supported with GPT engine")
 }
 
+func TestTranscribeAPI_ReturnsRequestID(t *testing.T) {
+	litellmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := chatCompletionResponse{
+			Choices: []choice{{Message: responseMessage{Content: "hello"}}},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer litellmServer.Close()
+
+	cfg := newTestAPIConfig(litellmServer.URL)
+	svc := NewVoiceService(cfg)
+	r := wkhttp.New()
+
+	logDir := t.TempDir()
+	asrLogger := NewASRLogger(logDir, 10)
+	defer asrLogger.Close()
+
+	v := &Voice{cfg: cfg, service: svc, Log: log.NewTLog("VoiceTest"), asrLogger: asrLogger}
+	group := r.Group("/v1/voice")
+	group.POST("/transcribe", v.transcribe)
+
+	w := httptest.NewRecorder()
+	req := createMultipartRequest(t, "/v1/voice/transcribe", []byte("fake-audio"), "")
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp map[string]interface{}
+	err := json.Unmarshal(w.Body.Bytes(), &resp)
+	assert.NoError(t, err)
+
+	requestID, ok := resp["request_id"].(string)
+	assert.True(t, ok, "request_id should be a string")
+	assert.NotEmpty(t, requestID, "request_id should not be empty")
+
+	// Verify format: {podID}_{unixMs}_{6hexChars}
+	parts := strings.Split(requestID, "_")
+	assert.Len(t, parts, 3, "request_id should have 3 underscore-separated parts")
+	assert.NotEmpty(t, parts[0], "pod ID part should not be empty")
+	assert.NotEmpty(t, parts[1], "timestamp part should not be empty")
+	assert.Len(t, parts[2], 6, "random hex part should be 6 characters")
+}
+
+func TestTranscribeAPI_RequestIDEmptyWithoutLogger(t *testing.T) {
+	litellmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := chatCompletionResponse{
+			Choices: []choice{{Message: responseMessage{Content: "hello"}}},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer litellmServer.Close()
+
+	cfg := newTestAPIConfig(litellmServer.URL)
+	router := setupTestRouter(cfg, "")
+
+	w := httptest.NewRecorder()
+	req := createMultipartRequest(t, "/v1/voice/transcribe", []byte("fake-audio"), "")
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	// When asrLogger is nil, request_id should use fallback with nolog_ prefix
+	requestID, ok := resp["request_id"].(string)
+	assert.True(t, ok, "request_id should be a string")
+	assert.NotEmpty(t, requestID, "request_id should not be empty even without logger")
+	assert.True(t, strings.HasPrefix(requestID, "nolog_"), "request_id should have nolog_ prefix")
+
+	parts := strings.Split(requestID, "_")
+	assert.Len(t, parts, 3, "request_id should have 3 underscore-separated parts")
+	assert.Equal(t, "nolog", parts[0])
+	assert.NotEmpty(t, parts[1], "timestamp part should not be empty")
+	assert.Len(t, parts[2], 6, "random hex part should be 6 characters")
+}
+
 func TestTranscribeAPI_MemberContextTruncation(t *testing.T) {
 	var receivedPrompt string
 	litellmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
