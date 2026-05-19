@@ -351,27 +351,38 @@ func (o *OIDC) bindConfirm(c *wkhttp.Context) {
 
 // handleBindConfirmErr Confirm 路径的错误码翻译,与 verify 路径区分:
 // 已绑定 → 409("已经绑定,直接用 OIDC 登录")。
+//
+// 所有分支(含 4xx)都写 EventBindConfirmFail 审计 —— SR-6 完整性:攻击者拿到
+// 已 verified 的 token 反复 confirm 探测"already_bound vs status_conflict vs
+// expired"的差异,在 metric 上能看到(`oidc_bind_request_total{result=...}`),
+// 但 oidc_audit_log 之前只有 default(500)分支落库,SOC 反查时间序列丢半条。
+// 不同分支的 reason 字面值固定(不带用户输入),不会扩大 attack surface。
 func (o *OIDC) handleBindConfirmErr(c *wkhttp.Context, token string, err error) {
+	tokenHash := subHash(token)
 	switch {
 	case errors.Is(err, ErrBindNotFound):
+		o.writeAudit("bind:"+tokenHash, EventBindConfirmFail, stateFromCtx(c), "token expired or not found")
 		c.AbortWithStatusJSON(http.StatusGone, errMsg("token expired or not found"))
 	case errors.Is(err, ErrBindRateLimited):
+		o.writeAudit("bind:"+tokenHash, EventBindConfirmFail, stateFromCtx(c), "rate limited")
 		c.AbortWithStatusJSON(http.StatusTooManyRequests, errMsg("too many confirm attempts"))
 	case errors.Is(err, ErrBindStatusConflict):
 		// 状态不是 verified —— 用户跳过了二次验证,或并发 confirm 撞上(AC-6)。
+		o.writeAudit("bind:"+tokenHash, EventBindConfirmFail, stateFromCtx(c), "status conflict")
 		c.AbortWithStatusJSON(http.StatusUnauthorized, errMsg("verify before confirm"))
 	case errors.Is(err, ErrBindAlreadyBound):
 		// 重试 confirm 命中已写 identity 的常见路径(IssueSession 失败后 retry);
 		// 文案引导用户回 OIDC 入口而不是放弃。
+		o.writeAudit("bind:"+tokenHash, EventBindConfirmFail, stateFromCtx(c), "already bound")
 		c.AbortWithStatusJSON(http.StatusConflict,
 			errMsg("identity already bound; sign in again via OIDC to continue"))
 	default:
 		o.Error("OIDC bind confirm failed (internal)",
-			zap.String("token_hash", subHash(token)), zap.Error(err))
+			zap.String("token_hash", tokenHash), zap.Error(err))
 		// 截断 err.Error() —— 即便我们写到 audit 的是自家 error message,也防
 		// 未来误把第三方 wrap 进来意外注入大字符串/凭据片段。256 字符上限和
 		// 其他 callback 失败审计一致(api.go:38)。
-		o.writeAudit("bind:"+subHash(token), EventBindConfirmFail, stateFromCtx(c), auditReason(err.Error()))
+		o.writeAudit("bind:"+tokenHash, EventBindConfirmFail, stateFromCtx(c), auditReason(err.Error()))
 		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("internal error"))
 	}
 }
@@ -442,9 +453,15 @@ func (l dbBindLocator) UIDByUsername(username string) (string, error) {
 		// 必须返 error,否则上层会把它当 user_not_found 静默吞掉,运维感知不到。
 		return "", fmt.Errorf("oidc bind locator: db not initialised")
 	}
+	// 过滤条件与 QueryUIDsByEmail/Phone 保持一致(is_destroy=0 AND status<>0):
+	// 排除冷静期/已注销/被封禁账号,避免 verify 通过后 confirm 时 IssueSession
+	// 才拒绝,残留 user_oidc_identity 脏数据让该用户后续 OIDC 登录持续失败。
+	// 与 user.VerifyPasswordByUID 的 IsDestroyDone || Status==0 检查互补
+	// (前者更严:还排除 is_destroy=1 冷静期账号,因为 5min bind_token 期内
+	// 不应该让正在冷静撤销的账号被绑到新 OIDC 身份)。
 	var uids []string
 	if _, err := l.db.session.Select("uid").From("user").
-		Where("username=? AND is_destroy=0", username).
+		Where("username=? AND is_destroy=0 AND status<>0", username).
 		Limit(1).Load(&uids); err != nil {
 		return "", fmt.Errorf("oidc bind locator: query user by username: %w", err)
 	}

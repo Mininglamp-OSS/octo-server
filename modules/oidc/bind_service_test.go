@@ -826,6 +826,55 @@ func TestBindService_VerifyPassword_UIDFailPerDayEnforced(t *testing.T) {
 	}
 }
 
+// TestBindService_VerifyPassword_UserLayerRateLimitedMapsTo429 锁定 Jerry-Xin
+// PR #73 round-4 review 的 Warning:user.VerifyPasswordByUID 在 loginGuard
+// 锁定时返 (matched=false, reason="rate_limited"),BindService 必须翻 ErrBindRateLimited
+// (handler 429 + metric rate_limited),不能笼统归 ErrBindAuthRejected(401 +
+// metric unauthorized)—— 与 PR 的 sentinel/status/metric 三方对齐契约一致。
+//
+// 同时锁定不消耗 SR-2.2 uid-fail 配额(配额给"密码错"用,user 已锁就别再 +1)。
+func TestBindService_VerifyPassword_UserLayerRateLimitedMapsTo429(t *testing.T) {
+	h := newBindHarness(t, func(c *BindConfig) {
+		c.UIDFailPerDay = 2
+		c.VerifyMax = 100 // 把 per-token rate-limit 拉远,本测试只考察 user-layer 反馈
+	})
+	h.auth.verifyPasswordResp.matched = false
+	h.auth.verifyPasswordResp.reason = userBindReasonRateLimited
+	h.loc.byUsername["alice"] = "u-alice"
+
+	jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	err := h.svc.VerifyPassword(context.Background(), jti, "alice", "x")
+	if !errors.Is(err, ErrBindRateLimited) {
+		t.Fatalf("user-layer rate_limited reason must map to ErrBindRateLimited, got %v", err)
+	}
+	// 重试若干次 —— 即便超过 UIDFailPerDay 也应当稳定返 ErrBindRateLimited,
+	// 因为 user 层短路在 SR-2.2 uid-fail counter 之前就返回了(不消费配额)。
+	for i := 0; i < 5; i++ {
+		if e := h.svc.VerifyPassword(context.Background(), jti, "alice", "x"); !errors.Is(e, ErrBindRateLimited) {
+			t.Fatalf("iter %d: should remain ErrBindRateLimited, got %v", i, e)
+		}
+	}
+}
+
+// TestBindService_VerifyPassword_DisabledIdentifierRejected 锁定 Jerry-Xin
+// PR #73 round-4 Critical 修复在 service 层的契约:dbBindLocator 已经
+// 过滤了 is_destroy/status,locator 对停用账号返 "",service 走 unknown-identifier
+// 路径返 ErrBindAuthRejected(handler 401,与"用户存在但密码错"无差异 SR-6)。
+//
+// SQL 层过滤在 db_integration_test.go 里覆盖;这条测试锁的是 service 层
+// 对 locator 返回 "" 的处理 —— 即便未来 SQL 漏掉过滤,user.VerifyPasswordByUID
+// 也有 BindReasonUserUnavailable 兜底,但 service 必须把它当作"业务拒绝"
+// 而不是 internal_error。
+func TestBindService_VerifyPassword_DisabledIdentifierRejected(t *testing.T) {
+	h := newBindHarness(t)
+	// 模拟 locator 已经过滤掉停用用户 → 返空
+	jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	err := h.svc.VerifyPassword(context.Background(), jti, "disabled-user", "any")
+	if !errors.Is(err, ErrBindAuthRejected) {
+		t.Fatalf("disabled identifier must surface as ErrBindAuthRejected (handler 401, anti-enum), got %v", err)
+	}
+}
+
 // TestBindService_VerifyPassword_ConcurrentRaceOnlyOneWins 锁定 CAS 修复:
 // 两个并发 verify 即便都基于同一份 status=issued 的快照 + 都 auth 成功,
 // 只有一个能把 CandidateUID 落地,另一个必须以 ErrBindStatusConflict 失败 ——

@@ -503,6 +503,54 @@ func (g *testRouteGroup) POST(path string, _ ...wkhttp.HandlerFunc) {
 	g.routes = append(g.routes, "POST "+path)
 }
 
+// TestAPI_BindConfirm_4xxBranchesAlsoAudit 锁定 Jerry-Xin / yujiawei PR #73
+// round-4 review:handleBindConfirmErr 的 4xx 分支也必须写 EventBindConfirmFail
+// 审计行 —— SR-6 完整性。之前只有 default(500)分支 writeAudit,导致攻击者
+// 反复 confirm 探测 status/already-bound/expired 差异时 oidc_audit_log 留不下
+// 痕迹,SOC 反查丢半条时间序列。
+func TestAPI_BindConfirm_4xxBranchesAlsoAudit(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		statusSetup func(*BindService, string) // 把 session 推到目标状态
+		wantStatus int
+	}{
+		{
+			"status_conflict (不 verify 直接 confirm) -> 401",
+			func(_ *BindService, _ string) {}, // session 还是 issued
+			http.StatusUnauthorized,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o, jti, _, _, _, _, _, _ := newTestOIDCWithBindFull(t, defaultBindCfg(), sampleClaims(), false)
+			audit := o.audit.(*fakeAudit)
+			tc.statusSetup(o.bind, jti)
+			r := newTestBindRouter(o)
+
+			body, _ := json.Marshal(map[string]string{"token": jti})
+			req := httptest.NewRequest("POST", "/v1/auth/oidc/aegis/bind/confirm",
+				bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != tc.wantStatus {
+				t.Fatalf("status=%d want %d body=%s", w.Code, tc.wantStatus, w.Body.String())
+			}
+			// 必须落 EventBindConfirmFail 审计
+			var found bool
+			for _, e := range audit.events() {
+				if e == EventBindConfirmFail {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("4xx confirm path must emit EventBindConfirmFail audit, got events=%v",
+					audit.events())
+			}
+		})
+	}
+}
+
 // TestAPI_BindVerifyPassword_MethodDisabledReturns400 锁定 Issue C 的 handler
 // 映射:service 返 ErrBindMethodDisabled → HTTP 400。防止"service 改对了但
 // handler 的 errors.Is 链漏一处"导致前端拿到 500/401 误判。

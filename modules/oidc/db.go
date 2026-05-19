@@ -243,6 +243,13 @@ func (d *DB) RevokeRefreshByUID(uid string) (int64, error) {
 
 // QueryUIDsByEmail 按邮箱查 dmwork user 表的 uid 列表(用于自动绑定时检测多匹配冲突)。
 //
+// 过滤条件:
+//   - is_destroy=0:排除冷静期(1)和已注销(2),与 user.VerifyPasswordByUID
+//     的 IsDestroyDone 检查同源
+//   - status<>0:排除被运维封禁/停用的账号。autolink 命中停用 uid 会让 IssueSession
+//     在终态拒绝,但 OIDC bind 路径会在 confirm 时已经写完 user_oidc_identity,
+//     残留脏数据让该用户后续 OIDC 登录持续失败(yujiawei + Jerry-Xin review 已确认)
+//
 // TODO: user.IService 后续应暴露 QueryUIDsByEmail,届时本方法迁移到 user 模块,
 // oidc 改走接口避免跨模块 SQL 耦合。
 func (d *DB) QueryUIDsByEmail(email string) ([]string, error) {
@@ -251,7 +258,7 @@ func (d *DB) QueryUIDsByEmail(email string) ([]string, error) {
 	}
 	var uids []string
 	if _, err := d.session.Select("uid").From("user").
-		Where("email=? AND email<>'' AND is_destroy=0", email).
+		Where("email=? AND email<>'' AND is_destroy=0 AND status<>0", email).
 		Load(&uids); err != nil {
 		return nil, fmt.Errorf("oidc: query users by email: %w", err)
 	}
@@ -259,13 +266,14 @@ func (d *DB) QueryUIDsByEmail(email string) ([]string, error) {
 }
 
 // QueryUIDsByPhone 按手机号查 dmwork user 表的 uid 列表(同 QueryUIDsByEmail)。
+// 同样过滤 is_destroy=0 AND status<>0 —— 见 QueryUIDsByEmail godoc。
 func (d *DB) QueryUIDsByPhone(zone, phone string) ([]string, error) {
 	if phone == "" {
 		return nil, nil
 	}
 	var uids []string
 	if _, err := d.session.Select("uid").From("user").
-		Where("zone=? AND phone=? AND phone<>'' AND is_destroy=0", zone, phone).
+		Where("zone=? AND phone=? AND phone<>'' AND is_destroy=0 AND status<>0", zone, phone).
 		Load(&uids); err != nil {
 		return nil, fmt.Errorf("oidc: query users by phone: %w", err)
 	}

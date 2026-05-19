@@ -194,6 +194,15 @@ func (s *BindService) VerifyPassword(ctx context.Context, jti, identifier, passw
 		return fmt.Errorf("oidc bind VerifyPassword: auth: %w", aerr)
 	}
 	if !matched {
+		// user 模块 loginGuard 已经把当前 uid 锁定 —— 把 reason 透传成限流,
+		// 让 handler 翻 429 + metric 落 rate_limited 而不是 401/unauthorized。
+		// 否则同一份"账号被锁"语义在 dashboard 上会被 unauthorized 桶吃掉,
+		// 与 PR 一直强调的"sentinel/HTTP 状态/metric label 三方对齐"违背。
+		// 不再消耗 SR-2.2 uid-fail 配额(配额是给"密码错"用的,loginGuard 锁定
+		// 期间根本没走密码比对,再 +1 会延长锁定窗口)。
+		if reason == userBindReasonRateLimited {
+			return fmt.Errorf("oidc bind VerifyPassword: %w (user loginGuard locked uid)", ErrBindRateLimited)
+		}
 		// SR-2.2 uid 维度防爆破:同 uid 跨 token 的密码失败累计达 UIDFailPerDay
 		// 直接限流(优先于 ErrBindAuthRejected 返回,让攻击者无法用换 token 的
 		// 方式绕过 per-token 的 VerifyMax)。24h 窗口固定 —— 与 TokenTTL 解耦,
@@ -510,6 +519,14 @@ func maskPhoneForBind(phone string) string {
 	}
 	return "****" + phone[len(phone)-4:]
 }
+
+// userBindReasonRateLimited 镜像 user.BindReasonRateLimited 字符串字面值。
+//
+// 不直接 import user 包是因为:user.IService 通过 BindAuthenticator 接口反向
+// 依赖 oidc 包不会触发,但 string 常量是契约层面的"魔法字符串"。这里复制
+// 一份并在测试里固定串到一起(见 bind_service_test.go 同名常量断言),保证
+// user 侧改动会被本包测试发现而不是 silently degrade 成 401/unauthorized。
+const userBindReasonRateLimited = "rate_limited"
 
 // uidFailWindow SR-2.2 uid 维度防爆破窗口。固定 24h 与 TokenTTL 解耦 ——
 // 后者按 token 生命周期(5min),前者按"每日 ≤ 10 次失败"语义。变量(非 const)

@@ -139,15 +139,17 @@ bind_token 在 5 分钟 TTL 内：
 
 错误码：
 
-| 码  | 含义                                                          |
-| --- | ------------------------------------------------------------- |
-| 400 | 入参非法 / 该 method 已被运维关闭                             |
-| 401 | 用户名或密码错（与"未知用户"不区分以防账号枚举）              |
-| 409 | session 状态已 verified 或更高（重复 verify 已被 CAS 拒绝）   |
-| 410 | token 已过期 / 未知                                           |
-| 429 | 验证尝试超 `VerifyMax` 或 uid 维度超 `UIDFailPerDay`          |
-| 500 | 内部错误                                                      |
-| 503 | bind service 未就绪                                           |
+| 码  | 含义                                                                                             |
+| --- | ------------------------------------------------------------------------------------------------ |
+| 400 | 入参非法 / 该 method 已被运维关闭                                                                |
+| 401 | 用户名或密码错（与"未知用户" / "账号被运维封禁" / "账号在注销冷静期"统一兜底，反账号枚举 SR-6） |
+| 409 | session 状态已 verified 或更高（重复 verify 已被 CAS 拒绝）                                      |
+| 410 | token 已过期 / 未知                                                                              |
+| 429 | 验证尝试超 `VerifyMax`、uid 维度超 `UIDFailPerDay`、或 dmwork 该账号触发了底层 `loginGuard` 锁定 |
+| 500 | 内部错误                                                                                         |
+| 503 | bind service 未就绪                                                                              |
+
+> 429 的三种来源对用户体验等价（都应当提示"请稍后重试"），但 dashboard 上能从 `oidc_bind_request_total{endpoint="verify_password",result="rate_limited"}` 区分。前端不需要再细分。
 
 ### 3.3 POST `/bind/verify/otp/send`
 
@@ -203,6 +205,17 @@ bind_token 在 5 分钟 TTL 内：
 | 429 | confirm 次数超 `ConfirmMax`                                                  | 提示稍后重试                                   |
 | 500 | 内部错误（DB / session 签发异常）                                            | 提示重试 + 联系管理员                          |
 | 503 | bind service 未就绪                                                          | 显示 "服务暂不可用"                            |
+
+### 3.6 哪些 dmwork 账号能被绑定
+
+- `is_destroy=0`（既不在冷静期也未注销）
+- `status<>0`（未被运维封禁/停用）
+
+不满足上述条件的账号在 locator 层就被过滤掉了：
+- 密码路径：`username` 命中但账号停用 → handler 返 401，文案与"账号或密码错误"一致（SR-6 反枚举）
+- SMS 路径：phone 命中的所有候选 uid 都被过滤 → handler 返 401，引导走 FR-7 联系管理员兜底
+
+> 历史问题（commit 7b1fa9e 之前）：locator 只过滤 `is_destroy`，停用账号也能通过 verify；confirm 时 `IssueSession` 才拒绝，但 `user_oidc_identity` 行已写入，导致该用户后续 OIDC 登录持续失败需要人工 DB 清理。已在 round-4 修复。
 
 ## 4. 关键约束 / 注意事项
 
