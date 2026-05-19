@@ -61,6 +61,24 @@
 //   - We do NOT recompute permissions; checkOBO already ran when the bot
 //     authored the message that's now bouncing, and inbound messages from
 //     real users are by definition allowed in the channel they arrived in.
+//
+// PR#82 R6 P0 — The fan-out copy's FromUID is the GRANTOR uid (not the
+// original sender). The v0 implementation used `FromUID=m.FromUID`
+// (= the peer who sent the inbound, e.g. u_bob), so for DMs WuKongIM
+// observed a (FromUID=u_bob, ChannelID=granteeBotUID) PERSONAL message
+// and synced the conversation pair `u_bob ↔ granteeBot` to **u_bob's**
+// client — leaking the persona-clone bot into bob's conversation list
+// even though bob only ever spoke to admin. The whole point of "managed
+// persona" is that bob sees ONLY admin as the counterparty; the bot is
+// strictly behind admin's identity.
+//
+// The fix routes the fan-out copy as "admin (grantor) forwarding to the
+// bot's own mailbox". WuKongIM then syncs the pair `admin ↔ granteeBot`
+// only — which is semantically correct because admin owns the bot
+// (admin is the grantor in the OBO grant row) and the bot is admin's
+// own managed persona. Bob is no longer in either UID of the fan-out
+// copy and therefore cannot see the bot at all. The bot still learns
+// who actually spoke via `obo_origin_from_uid` in the payload.
 package bot_api
 
 import (
@@ -239,7 +257,12 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 		// only subscriber of its own channel, so no real user sees the
 		// copy — even though Subscribers is now omitted (see PR#82 R5 P0
 		// in buildFanoutCopyReq for why both can't be set).
-		copyReq := buildFanoutCopyReq(m, g.GranteeBotUID)
+		//
+		// PR#82 R6 P0 — FromUID is the GRANTOR (not the original sender)
+		// so WuKongIM does NOT surface a `<peer> ↔ <granteeBot>`
+		// conversation entry on the original sender's client. See the
+		// package-level comment for the full rationale.
+		copyReq := buildFanoutCopyReq(m, g.GrantorUID, g.GranteeBotUID)
 		if err := ba.dispatchFanout(copyReq); err != nil {
 			ba.Error("OBO fan-out dispatch failed",
 				zap.String("grantee_bot", g.GranteeBotUID),
@@ -266,7 +289,18 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 //
 //   - ChannelID    = granteeBotUID (bot's own mailbox)
 //   - ChannelType  = Person (set by NewPersonalMsgSendReq)
+//   - FromUID      = grantorUID (NOT the original sender — see below)
 //   - Subscribers  = nil (omitted)
+//
+// FromUID rationale (PR#82 R6 P0): using `m.FromUID` (the original sender,
+// e.g. u_bob in a DM to admin) caused WuKongIM to sync a `<sender> ↔
+// <granteeBot>` conversation entry to the original sender's client,
+// leaking the persona-clone bot into bob's conversation list. Setting
+// FromUID to the GRANTOR fixes that — the only conversation entry now
+// shows admin ↔ granteeBot, which is fine because admin already owns
+// the bot (granted the OBO row that birthed the fan-out). The bot still
+// learns the real speaker via `obo_origin_from_uid` in the payload, so
+// the adapter can address its reply to the right user.
 //
 // NoPersist=1 + SyncOnce=1 keep the copy ephemeral so we don't bump red
 // dots or update conversation positions for any real user.
@@ -276,7 +310,7 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 // payload-supplied `space_id` (fail-closed per Mininglamp-OSS/octo-server
 // PR#35 R3). Downstream consumers must read `obo_origin_*` for routing
 // context, not `space_id`.
-func buildFanoutCopyReq(m *config.MessageResp, granteeBotUID string) *config.MsgSendReq {
+func buildFanoutCopyReq(m *config.MessageResp, grantorUID, granteeBotUID string) *config.MsgSendReq {
 	payload := map[string]interface{}{}
 	if len(m.Payload) > 0 {
 		// Best-effort decode. If the original is a non-JSON payload we
@@ -300,10 +334,11 @@ func buildFanoutCopyReq(m *config.MessageResp, granteeBotUID string) *config.Msg
 	// PERSONAL DM dispatch — must go through the octo-lib builder so
 	// payload.space_id authoritative semantics + the channel_id/subscribers
 	// mutex are uniformly applied. Subscribers omitted intentionally; see
-	// the contract block in the function doc.
+	// the contract block in the function doc. FromUID is the grantor (NOT
+	// m.FromUID) — see PR#82 R6 P0 rationale above.
 	return config.NewPersonalMsgSendReq(
 		granteeBotUID,
-		m.FromUID,
+		grantorUID,
 		payload,
 		"", // no authoritative sender Space for an internal control copy
 		config.PersonalMsgOptions{

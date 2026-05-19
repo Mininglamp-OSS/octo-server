@@ -769,7 +769,101 @@ func TestFanout_DMNonRecipient_NoLeak(t *testing.T) {
 	}
 }
 
-// assertFanoutDispatchContract enforces the WuKongIM /message/send mutex
+// TestFanout_OriginalSenderHasNoConversationLeak — PR#82 R6 P0 Bug A.
+// im-test 2026-05-19 surfaced that bob (the peer of an original DM
+// admin↔bob conversation) saw james (admin's persona-clone bot) appear
+// in his conversation list with the message he sent to admin. james
+// MUST be invisible to bob — that is the whole point of "managed
+// persona" (bob only ever sees admin as the counterparty).
+//
+// Root cause: the v0 fan-out copy used `FromUID=m.FromUID` (= bob), so
+// WuKongIM observed a (FromUID=bob, ChannelID=james) PERSONAL message
+// and synced the `bob ↔ james` conversation pair to bob's client.
+//
+// Fix: FromUID is the GRANTOR (admin), not the original sender. The
+// regression assertion is that NO fan-out copy ever carries
+// FromUID == original sender for any channel type. This locks the
+// invariant across the DM peer→grantor case (the actual reported bug)
+// AND every other channel type — a regression where group / topic
+// fan-outs use m.FromUID would similarly leak the bot into the original
+// sender's contacts via the same WuKongIM sync.
+func TestFanout_OriginalSenderHasNoConversationLeak(t *testing.T) {
+	cases := []struct {
+		name        string
+		ct          uint8
+		fromUID     string // original sender on the inbound message
+		channelID   string // ChannelID on the inbound message (listener view)
+		scope       string // OBO scope.channel_id (grantor frame of reference)
+		setupAccess func(ba *BotAPI)
+	}{
+		{
+			name:      "dm_peer_to_grantor",
+			ct:        common.ChannelTypePerson.Uint8(),
+			fromUID:   "u_bob",
+			channelID: tGrantor,
+			scope:     "u_bob", // for DM, scope.channel_id = peer uid
+		},
+		{
+			name:      "group",
+			ct:        common.ChannelTypeGroup.Uint8(),
+			fromUID:   "u_bob",
+			channelID: "group_42",
+			scope:     "group_42",
+		},
+		{
+			name:      "community_topic",
+			ct:        common.ChannelTypeCommunityTopic.Uint8(),
+			fromUID:   "u_bob",
+			channelID: "group_42____topic_99",
+			scope:     "group_42____topic_99",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := seedGrantWithScope(t, tc.scope, tc.ct)
+			fc := &fanoutCapture{}
+			ba := newBAforFanout(s, fc)
+
+			msg := &config.MessageResp{
+				FromUID:     tc.fromUID,
+				ChannelID:   tc.channelID,
+				ChannelType: tc.ct,
+				Payload:     []byte(`{"type":1,"content":"private to admin"}`),
+			}
+			if n := ba.fanoutForMessage(msg); n != 1 {
+				t.Fatalf("expected 1 dispatch, got %d", n)
+			}
+			if len(fc.copies) != 1 {
+				t.Fatalf("expected 1 captured copy, got %d", len(fc.copies))
+			}
+			cp := fc.copies[0]
+
+			// The bug-A assertion. If FromUID == original sender, WuKongIM
+			// will sync a `<sender> ↔ <granteeBot>` conversation pair to
+			// the sender's client and the bot leaks into the sender's
+			// contact list.
+			if cp.FromUID == tc.fromUID {
+				t.Fatalf("R6 P0 LEAK: fan-out FromUID == original sender %q — WuKongIM will surface the persona-clone bot %q in the sender's conversation list", tc.fromUID, tBot)
+			}
+			// Belt-and-braces: FromUID should be the grantor, which keeps
+			// the only synced conversation pair (`<grantor> ↔ <bot>`)
+			// scoped to a party who legitimately owns the bot.
+			if cp.FromUID != tGrantor {
+				t.Fatalf("fan-out FromUID should be grantor %q, got %q", tGrantor, cp.FromUID)
+			}
+			// And the bot still gets the original sender's uid via the
+			// payload field so it can address its reply to the right
+			// real user.
+			var p map[string]interface{}
+			_ = json.Unmarshal(cp.Payload, &p)
+			if got := p["obo_origin_from_uid"]; got != tc.fromUID {
+				t.Fatalf("obo_origin_from_uid must preserve the original sender %q for reply addressing, got %v", tc.fromUID, got)
+			}
+		})
+	}
+}
+
+
 // invariant: a MsgSendReq must carry EXACTLY ONE of (channel_id set with
 // empty subscribers) OR (empty channel_id with subscribers set). Setting
 // both triggers the production rejection observed in PR#82 R5 P0:
@@ -907,8 +1001,8 @@ func TestFanout_DispatchReq_NoConflict_ChannelOrSubscribers(t *testing.T) {
 //   - ChannelID == granteeBotUID
 //   - ChannelType == ChannelTypePerson (set by NewPersonalMsgSendReq)
 //   - Subscribers is empty
-//   - FromUID preserves the original sender's uid (so the bot's
-//     payload-side handlers can identify who spoke)
+//   - FromUID == GRANTOR uid (PR#82 R6 P0 — NOT the original sender;
+//     the bot learns the real speaker via obo_origin_from_uid)
 //   - obo_origin_* payload fields preserve the routing context
 func TestFanout_DispatchReq_BotReceivesViaOwnChannel(t *testing.T) {
 	ch, ct := "group_42", common.ChannelTypeGroup.Uint8()
@@ -942,8 +1036,13 @@ func TestFanout_DispatchReq_BotReceivesViaOwnChannel(t *testing.T) {
 	if len(cp.Subscribers) != 0 {
 		t.Fatalf("Subscribers must be omitted (mutex with channel_id), got %v", cp.Subscribers)
 	}
-	if cp.FromUID != "u_bob" {
-		t.Fatalf("FromUID should preserve origin sender %q, got %q", "u_bob", cp.FromUID)
+	// PR#82 R6 P0 — FromUID must be the GRANTOR, not the original sender.
+	// Using the original sender (m.FromUID = u_bob) made WuKongIM sync a
+	// u_bob ↔ bot_clone conversation entry to bob's client, leaking the
+	// persona-clone bot into bob's contact list. The grantor (admin) is
+	// the bot's owner and the only party who should see the bot.
+	if cp.FromUID != tGrantor {
+		t.Fatalf("FromUID should be grantor %q (PR#82 R6 P0 — NOT the original sender), got %q", tGrantor, cp.FromUID)
 	}
 
 	var p map[string]interface{}
@@ -957,6 +1056,9 @@ func TestFanout_DispatchReq_BotReceivesViaOwnChannel(t *testing.T) {
 	if got, _ := p["obo_origin_channel_type"].(float64); uint8(got) != ct {
 		t.Fatalf("obo_origin_channel_type should be %d, got %v", ct, p["obo_origin_channel_type"])
 	}
+	// obo_origin_from_uid carries the ORIGINAL sender so the bot can
+	// address replies / reactions to the right user — this is the
+	// substitute for the now-rewritten FromUID.
 	if got := p["obo_origin_from_uid"]; got != "u_bob" {
 		t.Fatalf("obo_origin_from_uid should be %q, got %v", "u_bob", got)
 	}

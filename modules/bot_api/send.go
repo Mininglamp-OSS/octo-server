@@ -229,15 +229,26 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 			}
 		} else if channelType == common.ChannelTypePerson.Uint8() {
 			// DM: creator can always talk to their bot; otherwise check friend
+			// OR the OBO managed-persona implicit bypass (PR#82 R6 P0).
 			robot := getRobotFromContext(c)
 			isCreator := robot != nil && robot.CreatorUID == channelID
 			if !isCreator {
-				isFriend, err := ba.userService.IsFriend(robotID, channelID)
+				// isFriendOrOBOBypass tries the friend lookup first; if
+				// the bot isn't a friend of the target, it falls back to
+				// the OBO bypass — "any active grant covering this
+				// channel where the grantor still has a relation with
+				// the target". The bypass is required by the
+				// managed-persona path: admin grants the clone bot
+				// james OBO over admin↔bob; james MUST be able to send
+				// (and signal typing / read-receipts) to bob even
+				// though james and bob are not friends. See
+				// modules/bot_api/obo_friend_gate.go for the rationale.
+				allowed, err := ba.isFriendOrOBOBypass(robotID, channelID, channelType)
 				if err != nil {
 					ba.Error("查询好友关系失败", zap.Error(err))
 					return errors.New("查询好友关系失败")
 				}
-				if !isFriend {
+				if !allowed {
 					return errors.New("bot is not a friend of this user")
 				}
 			}
