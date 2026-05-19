@@ -6,13 +6,13 @@
 // `mention.all=1` to `mention.humans=1`, and a new client may also set
 // `mention.ais=1`. This file pins:
 //
-//   1. Message.getMention recognizes any of {humans, ais, all} = 1 as a
-//      "broadcast" mention (channel-level reminder), and still pulls
-//      per-user `uids` for the non-broadcast path.
-//   2. Message.getReminders generates exactly the right shape of
-//      reminder rows for each matrix cell — channel-level (UID="")
-//      for broadcasts, per-uid rows for explicit uids, and zero rows
-//      when the payload has no mention at all.
+//  1. Message.getMention recognizes any of {humans, ais, all} = 1 as a
+//     "broadcast" mention (channel-level reminder), and still pulls
+//     per-user `uids` for the non-broadcast path.
+//  2. Message.getReminders generates exactly the right shape of
+//     reminder rows for each matrix cell — channel-level (UID="")
+//     for broadcasts, per-uid rows for explicit uids, and zero rows
+//     when the payload has no mention at all.
 //
 // These tests are pure helpers (no DB / no IM context) so they live
 // next to the existing mention-shape suite in validation_test.go.
