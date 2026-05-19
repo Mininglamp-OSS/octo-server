@@ -15,6 +15,7 @@ package bot_api
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -64,6 +65,12 @@ func newBAforREST(s *fakeOBOStore) *BotAPI {
 	return &BotAPI{
 		Log:              log.NewTLog("BotAPI-rest-test"),
 		oboStoreOverride: s,
+		// Default test override: grantor has access to any channel. The
+		// channel-wiretap regression test (TestOBO_CreateScope_NoChannelAccess)
+		// installs a denying override explicitly.
+		oboChannelAccessOverride: func(uid, channelID string, channelType uint8) (bool, error) {
+			return true, nil
+		},
 	}
 }
 
@@ -71,6 +78,7 @@ func newBAforREST(s *fakeOBOStore) *BotAPI {
 
 func TestOBO_CreateGrant_Happy(t *testing.T) {
 	s := newFakeOBOStore()
+	s.seedBot(tRESTBot, tRESTOwner)
 	ba := newBAforREST(s)
 
 	c, rec := makeCtx(t, tRESTOwner, http.MethodPost, "/v1/obo/grants",
@@ -122,6 +130,7 @@ func TestOBO_CreateGrant_BadMode(t *testing.T) {
 
 func TestOBO_CreateGrant_Duplicate(t *testing.T) {
 	s := newFakeOBOStore()
+	s.seedBot(tRESTBot, tRESTOwner)
 	_, _ = s.insertGrant(tRESTOwner, tRESTBot, "auto")
 	ba := newBAforREST(s)
 
@@ -313,5 +322,232 @@ func TestOBO_DeleteScope_CrossUser404(t *testing.T) {
 	scopes, _ := s.listScopesByGrant(gid)
 	if len(scopes) != 1 {
 		t.Fatalf("scope must survive cross-user attempt, got %d", len(scopes))
+	}
+}
+
+// ==================== PR#82 hardening regression tests ====================
+
+// TestOBO_CreateGrant_NotOwnBot_404 — caller MUST own the grantee bot
+// (review #1 task spec P1-2). The fake oboStore seeds bot_X as owned by
+// tRESTOther; the caller tRESTOwner is not allowed to install an OBO
+// grant targeting it, even with a syntactically valid body. 404 (not 403)
+// matches the existence-leak posture.
+func TestOBO_CreateGrant_NotOwnBot_404(t *testing.T) {
+	s := newFakeOBOStore()
+	s.seedBot("bot_X", tRESTOther) // owned by someone else
+	ba := newBAforREST(s)
+
+	c, rec := makeCtx(t, tRESTOwner, http.MethodPost, "/v1/obo/grants",
+		oboCreateGrantReq{GranteeBotUID: "bot_X"}, nil)
+	ba.oboCreateGrant(c)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for non-owned bot, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	// And nothing was persisted.
+	rows, _ := s.listGrantsByGrantor(tRESTOwner)
+	if len(rows) != 0 {
+		t.Fatalf("no grant should be persisted, got %+v", rows)
+	}
+}
+
+// TestOBO_CreateGrant_NotABot_404 — grantee_bot_uid must resolve to a
+// row in the robot table (i.e. an actual bot, not a real-user uid).
+// Review #2 P2-3. Without this check, a user could install a grant
+// targeting another HUMAN uid — inert today, but cluttered audit and a
+// poor invariant for v1 to inherit.
+func TestOBO_CreateGrant_NotABot_404(t *testing.T) {
+	s := newFakeOBOStore()
+	// seedNonBotUser → queryRobotOwner returns found=false (the prod
+	// query targets the robot table, where a real-user uid has no row).
+	s.seedNonBotUser("not_a_bot_uid")
+	ba := newBAforREST(s)
+
+	c, rec := makeCtx(t, tRESTOwner, http.MethodPost, "/v1/obo/grants",
+		oboCreateGrantReq{GranteeBotUID: "not_a_bot_uid"}, nil)
+	ba.oboCreateGrant(c)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for non-bot uid, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestOBO_CreateGrant_Reactivates_SoftDeletedRow — once a grant has been
+// soft-deleted (DELETE /v1/obo/grants/:id), the (grantor, bot) pair is
+// frozen by the UNIQUE KEY uk_grantor_grantee. A naive insert would 409
+// forever. The fix (review #2 P1-1): when the duplicate fires AND the
+// existing row is owned by the caller AND active=0, flip it back to
+// active=1 / global_enabled=0 / revoked_at=NULL in place. Verify the
+// row is reusable: re-create after revoke succeeds, returns the same
+// ID, and emerges with global_enabled=0 (caller must opt in again).
+func TestOBO_CreateGrant_Reactivates_SoftDeletedRow(t *testing.T) {
+	s := newFakeOBOStore()
+	s.seedBot(tRESTBot, tRESTOwner)
+	ba := newBAforREST(s)
+
+	// Step 1: create grant + enable it.
+	c, rec := makeCtx(t, tRESTOwner, http.MethodPost, "/v1/obo/grants",
+		oboCreateGrantReq{GranteeBotUID: tRESTBot}, nil)
+	ba.oboCreateGrant(c)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("initial create failed: %d body=%s", rec.Code, rec.Body.String())
+	}
+	rows, _ := s.listGrantsByGrantor(tRESTOwner)
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row after create, got %d", len(rows))
+	}
+	originalID := rows[0].ID
+	enable := 1
+	_ = s.updateGrant(originalID, "", &enable)
+
+	// Step 2: soft-delete the grant.
+	_ = s.revokeGrant(originalID)
+	g, _ := s.findGrantByID(originalID)
+	if g == nil || g.Active != 0 || g.GlobalEnabled != 0 {
+		t.Fatalf("expected revoked row after step 2, got %+v", g)
+	}
+
+	// Step 3: POST the same (grantor, bot) again — must reactivate, not 409.
+	c, rec = makeCtx(t, tRESTOwner, http.MethodPost, "/v1/obo/grants",
+		oboCreateGrantReq{GranteeBotUID: tRESTBot}, nil)
+	ba.oboCreateGrant(c)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("reactivation create must return 200, got %d body=%s",
+			rec.Code, rec.Body.String())
+	}
+
+	// Step 4: row is back to active=1 / global_enabled=0 with same ID.
+	g, _ = s.findGrantByID(originalID)
+	if g == nil || g.Active != 1 || g.GlobalEnabled != 0 {
+		t.Fatalf("reactivated row should be active=1 global_enabled=0, got %+v", g)
+	}
+	rows, _ = s.listGrantsByGrantor(tRESTOwner)
+	if len(rows) != 1 || rows[0].ID != originalID {
+		t.Fatalf("reactivation should reuse the same row id; got rows=%+v", rows)
+	}
+}
+
+// TestOBO_CreateGrant_LiveDuplicate_Still409 — when the duplicate row is
+// LIVE (active=1, not soft-deleted), the handler still returns 409 — the
+// reactivation path applies only to soft-deleted rows.
+func TestOBO_CreateGrant_LiveDuplicate_Still409(t *testing.T) {
+	s := newFakeOBOStore()
+	s.seedBot(tRESTBot, tRESTOwner)
+	_, _ = s.insertGrant(tRESTOwner, tRESTBot, "auto") // active=1 by default
+	ba := newBAforREST(s)
+
+	c, rec := makeCtx(t, tRESTOwner, http.MethodPost, "/v1/obo/grants",
+		oboCreateGrantReq{GranteeBotUID: tRESTBot}, nil)
+	ba.oboCreateGrant(c)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for live duplicate, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestOBO_CreateScope_NoChannelAccess_404 — P0 wiretap regression test.
+// The grantor must have read access to the target channel before a scope
+// row can be created. With the override returning false, the request is
+// rejected as 404 (existence-leak defense). Without this check, an
+// attacker could scope to a channel they aren't in and silently
+// exfiltrate every inbound message to their bot via the fan-out listener.
+func TestOBO_CreateScope_NoChannelAccess_404(t *testing.T) {
+	s := newFakeOBOStore()
+	gid, _ := s.insertGrant(tRESTOwner, tRESTBot, "auto")
+	ba := newBAforREST(s)
+	// Override the default permissive hook to deny access for this test.
+	ba.oboChannelAccessOverride = func(uid, channelID string, channelType uint8) (bool, error) {
+		// Grantor has read access to nothing.
+		return false, nil
+	}
+
+	c, rec := makeCtx(t, tRESTOwner, http.MethodPost, "/v1/obo/scopes",
+		oboCreateScopeReq{
+			GrantID:     gid,
+			ChannelID:   "secret_group",
+			ChannelType: common.ChannelTypeGroup.Uint8(),
+		}, nil)
+	ba.oboCreateScope(c)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 when grantor lacks channel access, got %d body=%s",
+			rec.Code, rec.Body.String())
+	}
+	// And no scope was persisted.
+	scopes, _ := s.listScopesByGrant(gid)
+	if len(scopes) != 0 {
+		t.Fatalf("scope must NOT be created when access check fails, got %+v", scopes)
+	}
+}
+
+// TestOBO_CreateScope_ChannelAccessErr_500 — when the channel-access
+// check errors (e.g. DB outage), the handler must surface a 500 rather
+// than fail-open. We assert via the body (ResponseError); the override
+// returns a synthetic error.
+func TestOBO_CreateScope_ChannelAccessErr_500(t *testing.T) {
+	s := newFakeOBOStore()
+	gid, _ := s.insertGrant(tRESTOwner, tRESTBot, "auto")
+	ba := newBAforREST(s)
+	boom := errors.New("connection refused")
+	ba.oboChannelAccessOverride = func(uid, channelID string, channelType uint8) (bool, error) {
+		return false, boom
+	}
+
+	c, rec := makeCtx(t, tRESTOwner, http.MethodPost, "/v1/obo/scopes",
+		oboCreateScopeReq{
+			GrantID:     gid,
+			ChannelID:   "any",
+			ChannelType: common.ChannelTypeGroup.Uint8(),
+		}, nil)
+	ba.oboCreateScope(c)
+	// ResponseError body carries the failure message; assert nothing was
+	// persisted regardless of the wire status convention.
+	scopes, _ := s.listScopesByGrant(gid)
+	if len(scopes) != 0 {
+		t.Fatalf("scope must NOT be created on access-check error, got %+v", scopes)
+	}
+	if rec.Body.Len() == 0 {
+		t.Fatalf("expected error body, got empty response")
+	}
+}
+
+// TestOBO_DeleteScope_FindScopeOwner_OK — the new oboDeleteScope path
+// uses findScopeOwner (single JOIN) instead of the O(N×M) scopeOwnedBy
+// scan. Verify owner-match → 200 and row removed.
+func TestOBO_DeleteScope_FindScopeOwner_OK(t *testing.T) {
+	s := newFakeOBOStore()
+	gid, _ := s.insertGrant(tRESTOwner, tRESTBot, "auto")
+	sid, _ := s.insertScope(gid, tRESTChannel, common.ChannelTypeGroup.Uint8(), 1)
+	ba := newBAforREST(s)
+
+	c, rec := makeCtx(t, tRESTOwner, http.MethodDelete,
+		"/v1/obo/scopes/"+strconv.FormatInt(sid, 10), nil,
+		gin.Params{{Key: "id", Value: strconv.FormatInt(sid, 10)}})
+	ba.oboDeleteScope(c)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	scopes, _ := s.listScopesByGrant(gid)
+	if len(scopes) != 0 {
+		t.Fatalf("scope should be deleted, got %d", len(scopes))
+	}
+}
+
+// TestOBO_DeleteScope_FindScopeOwner_LookupErr_500 — when the new
+// findScopeOwner method errors (DB outage), the delete must fail closed
+// without removing the row.
+func TestOBO_DeleteScope_FindScopeOwner_LookupErr(t *testing.T) {
+	s := newFakeOBOStore()
+	gid, _ := s.insertGrant(tRESTOwner, tRESTBot, "auto")
+	sid, _ := s.insertScope(gid, tRESTChannel, common.ChannelTypeGroup.Uint8(), 1)
+	s.failFindScopeOwner = errors.New("connection refused")
+	ba := newBAforREST(s)
+
+	c, rec := makeCtx(t, tRESTOwner, http.MethodDelete,
+		"/v1/obo/scopes/"+strconv.FormatInt(sid, 10), nil,
+		gin.Params{{Key: "id", Value: strconv.FormatInt(sid, 10)}})
+	ba.oboDeleteScope(c)
+	scopes, _ := s.listScopesByGrant(gid)
+	if len(scopes) != 1 {
+		t.Fatalf("scope must survive lookup error, got %d", len(scopes))
+	}
+	if rec.Body.Len() == 0 {
+		t.Fatalf("expected error body, got empty response")
 	}
 }

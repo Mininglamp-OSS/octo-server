@@ -13,6 +13,7 @@ package bot_api
 import (
 	"errors"
 	"sync"
+	"time"
 )
 
 // fakeOBOStore is the in-memory oboStore used by the OBO unit tests.
@@ -23,6 +24,14 @@ type fakeOBOStore struct {
 	nextID int64
 	grants map[int64]*oboGrantModel
 	scopes map[int64]*oboScopeModel
+	// robotOwners maps botUID → CreatorUID. A row in this map means
+	// "registered as a bot" (IsBot=true). Used by queryRobotOwner. Tests
+	// that exercise oboCreateGrant's owner-check must seed this map.
+	robotOwners map[string]string
+	// nonBotUsers — uids that exist in the user table but are NOT bots
+	// (user.robot=0). queryRobotOwner returns IsBot=false for these. Used
+	// to test the "grantee_bot_uid is a real user, not a bot" rejection.
+	nonBotUsers map[string]bool
 
 	// Test-side error injection hooks. Defaults to nil → no error.
 	failFindActiveGrant   error
@@ -31,14 +40,18 @@ type fakeOBOStore struct {
 	failInsertGrant       error
 	failListGrants        error
 	failInsertScope       error
+	failQueryRobotOwner   error
+	failFindScopeOwner    error
 }
 
 // newFakeOBOStore — constructor, zero-value-friendly so tests can also
 // just `&fakeOBOStore{}` and rely on lazy init.
 func newFakeOBOStore() *fakeOBOStore {
 	return &fakeOBOStore{
-		grants: map[int64]*oboGrantModel{},
-		scopes: map[int64]*oboScopeModel{},
+		grants:      map[int64]*oboGrantModel{},
+		scopes:      map[int64]*oboScopeModel{},
+		robotOwners: map[string]string{},
+		nonBotUsers: map[string]bool{},
 	}
 }
 
@@ -49,6 +62,32 @@ func (f *fakeOBOStore) ensureInit() {
 	if f.scopes == nil {
 		f.scopes = map[int64]*oboScopeModel{}
 	}
+	if f.robotOwners == nil {
+		f.robotOwners = map[string]string{}
+	}
+	if f.nonBotUsers == nil {
+		f.nonBotUsers = map[string]bool{}
+	}
+}
+
+// seedBot registers `botUID` as a bot owned by `creatorUID`. Helper for
+// tests that exercise oboCreateGrant's ownership + IsBot check.
+func (f *fakeOBOStore) seedBot(botUID, creatorUID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureInit()
+	f.robotOwners[botUID] = creatorUID
+}
+
+// seedNonBotUser marks `uid` as a real (human) user — exists in `user`
+// table but with robot=0. queryRobotOwner returns IsBot=false / found=false
+// for these (mirrors prod: queryRobotOwner only finds rows in the robot
+// table). Used to test the "you can't grant OBO to a non-bot uid" path.
+func (f *fakeOBOStore) seedNonBotUser(uid string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureInit()
+	f.nonBotUsers[uid] = true
 }
 
 func (f *fakeOBOStore) findActiveGrantByGrantorBot(grantorUID, granteeBotUID string) (*oboGrantModel, error) {
@@ -190,6 +229,8 @@ func (f *fakeOBOStore) revokeGrant(id int64) error {
 	}
 	g.Active = 0
 	g.GlobalEnabled = 0
+	now := time.Now()
+	g.RevokedAt = &now
 	return nil
 }
 
@@ -241,4 +282,77 @@ func (f *fakeOBOStore) listScopesByGrant(grantID int64) ([]*oboScopeModel, error
 		}
 	}
 	return out, nil
+}
+
+// findGrantByGrantorBot — any state (active OR revoked). Mirrors prod
+// signature; used by oboCreateGrant reactivation.
+func (f *fakeOBOStore) findGrantByGrantorBot(grantorUID, granteeBotUID string) (*oboGrantModel, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureInit()
+	for _, g := range f.grants {
+		if g.GrantorUID == grantorUID && g.GranteeBotUID == granteeBotUID {
+			cp := *g
+			return &cp, nil
+		}
+	}
+	return nil, nil
+}
+
+// reactivateGrant — flip soft-deleted row back to insertGrant defaults.
+func (f *fakeOBOStore) reactivateGrant(id int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureInit()
+	g, ok := f.grants[id]
+	if !ok {
+		return nil
+	}
+	g.Active = 1
+	g.GlobalEnabled = 0
+	g.RevokedAt = nil
+	return nil
+}
+
+// findScopeOwner — O(1) lookup in the fake; mirrors prod JOIN result.
+func (f *fakeOBOStore) findScopeOwner(scopeID int64) (string, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failFindScopeOwner != nil {
+		return "", false, f.failFindScopeOwner
+	}
+	f.ensureInit()
+	s, ok := f.scopes[scopeID]
+	if !ok {
+		return "", false, nil
+	}
+	g, ok := f.grants[s.GrantID]
+	if !ok {
+		return "", false, nil
+	}
+	return g.GrantorUID, true, nil
+}
+
+// queryRobotOwner — returns creator + IsBot=true for seeded bots,
+// (_, false, false, nil) for seeded non-bot users, and (_,_,false,nil)
+// otherwise. Tests seed via seedBot / seedNonBotUser helpers above.
+func (f *fakeOBOStore) queryRobotOwner(botUID string) (string, bool, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failQueryRobotOwner != nil {
+		return "", false, false, f.failQueryRobotOwner
+	}
+	f.ensureInit()
+	if creator, ok := f.robotOwners[botUID]; ok {
+		return creator, true, true, nil
+	}
+	if f.nonBotUsers[botUID] {
+		// Exists as a real user, but robot=0. Prod's queryRobotOwner only
+		// reads the robot table; a non-bot user has no row there, so we
+		// return found=false to match. The test-facing distinction is in
+		// seedNonBotUser, which exists so future tests can distinguish
+		// "uid unknown" vs "uid known but not a bot" if needed.
+		return "", false, false, nil
+	}
+	return "", false, false, nil
 }

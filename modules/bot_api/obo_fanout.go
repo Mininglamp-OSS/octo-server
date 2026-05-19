@@ -15,8 +15,21 @@
 //   Gate 1: bot self-sent → never replay to that same bot
 //   Gate 2: grantor's own outbound → don't fan it to the grantor's bot
 //           (covers the "I typed on my phone" case — bot should not echo)
-//   Gate 3: already-OBO-processed → message_extra has obo_processed=true
+//   Gate 3: already-OBO-processed → message_extra has __obo_processed__=true
 //           (the bot's outbound, marked by sendMessage, must not bounce)
+//
+// PR#82 review #2 P1-2: gate 3's marker key is `__obo_processed__` (double-
+// underscore reserved prefix), NOT the v0-shipped `obo_processed`. The
+// v0 key was a plain JSON field that any bot could set on its own
+// /v1/bot/sendMessage payload — letting a bot suppress its own fan-out by
+// crafting `{"content":"…", "obo_processed":true}`. The new key sits in
+// a reserved namespace (`__obo_*`) that sendMessage strips off inbound
+// payloads (see send.go) before processing, so the marker is now
+// server-only state. Compatibility note: messages persisted under the
+// legacy key during the v0 testing window are NOT honored — gate 3 is
+// strict on the new name. Any in-flight v0 messages would only suppress
+// their own fan-out (a bounded edge case) and the test suite is the only
+// caller that ever wrote the legacy key in this branch.
 //
 // For each surviving (message, grant) pair we build a CMD-style copy via
 // MsgSendReq with Subscribers=[grantee_bot_uid] so only the bot receives
@@ -168,22 +181,55 @@ func (ba *BotAPI) dispatchFanout(req *config.MsgSendReq) error {
 	return ba.ctx.SendMessage(req)
 }
 
+// oboProcessedMarkerKey is the JSON payload key set by sendMessage on
+// every OBO-authorized send so the fan-out listener can short-circuit
+// gate 3 without re-querying. The double-underscore prefix marks it as
+// part of the reserved `__obo_*` namespace that the inbound
+// /v1/bot/sendMessage handler strips off client payloads — making the
+// marker server-only state that bots cannot forge or suppress through
+// the public REST API. (PR#82 review #2 P1-2.)
+const oboProcessedMarkerKey = "__obo_processed__"
+
+// oboReservedKeyPrefix is the reserved-namespace prefix for server-only
+// OBO payload fields. Inbound /v1/bot/sendMessage payloads containing
+// keys with this prefix are rejected (see send.go) so the gate-3 marker
+// — and any future server-only OBO field — cannot be impersonated by a
+// bot client.
+const oboReservedKeyPrefix = "__obo_"
+
 // hasOBOProcessedMarker — Gate 3. Returns true iff the payload decodes as
-// a JSON object containing `"obo_processed": true`. Non-JSON / non-bool
-// values are treated as absent so we err on the side of fanning out.
+// a JSON object containing `oboProcessedMarkerKey: true`. Non-JSON /
+// non-bool values are treated as absent so we err on the side of fanning
+// out.
 func hasOBOProcessedMarker(payload []byte) bool {
 	if len(payload) == 0 {
 		return false
 	}
 	// Quick reject before the unmarshal — payloads in the millions/sec
 	// hot path shouldn't pay the JSON decode cost just to find no marker.
-	if !strings.Contains(string(payload), "obo_processed") {
+	if !strings.Contains(string(payload), oboProcessedMarkerKey) {
 		return false
 	}
 	var m map[string]interface{}
 	if err := json.Unmarshal(payload, &m); err != nil {
 		return false
 	}
-	v, ok := m["obo_processed"].(bool)
+	v, ok := m[oboProcessedMarkerKey].(bool)
 	return ok && v
+}
+
+// payloadHasReservedOBOKey reports whether any top-level key in the
+// JSON-decoded `payload` map starts with the reserved `__obo_` prefix.
+// Used by /v1/bot/sendMessage to reject inbound client payloads that
+// would attempt to spoof a server-only OBO marker (gate-3 bypass).
+func payloadHasReservedOBOKey(payload map[string]interface{}) bool {
+	if len(payload) == 0 {
+		return false
+	}
+	for k := range payload {
+		if strings.HasPrefix(k, oboReservedKeyPrefix) {
+			return true
+		}
+	}
+	return false
 }
