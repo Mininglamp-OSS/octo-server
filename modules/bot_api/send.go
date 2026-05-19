@@ -94,65 +94,20 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 	// invoking OBO.
 	fromUID := robotID
 	if strings.TrimSpace(req.OnBehalfOf) != "" {
-		// YUJ-1418 — managed-persona DM grantor-reply bypass.
-		//
-		// When admin (the OBO grantor) DMs the persona-clone bot, the
-		// persona service generates an AI reply and naturally calls
-		// /v1/bot/sendMessage with on_behalf_of=admin (the persona IS
-		// admin). The recipient (channel_id) is also admin — admin's own
-		// DM with the bot. Running the standard OBO scope check on this
-		// shape rejects: no scope row covers a "grantor speaks to
-		// themselves" DM, and creating one would be semantic noise (it
-		// would route admin→admin self-DM, not bot→admin reply). Without
-		// this bypass every persona reply to its own grantor would 400
-		// with `obo not authorized`.
-		//
-		// Detection: DM channel AND on_behalf_of == channel_id AND the
-		// bot has an active grant from this user. When all three hold we
-		// fall through to the legacy (non-OBO) bot send path — fromUID
-		// stays as the bot, no OBO substitution, no `__obo_processed__`
-		// marker, no fan-out machinery — exactly what the grantor would
-		// expect when their persona "talks back" to them. Any other
-		// shape (on_behalf_of != channel_id, channel is not a DM, no
-		// active grant from the recipient) falls through to the strict
-		// checkOBO below — the OBO scope check for third-party sends
-		// MUST remain strict (issue YUJ-1418 explicitly forbids
-		// loosening it).
-		grantorReplyBypass := false
-		if req.ChannelType == common.ChannelTypePerson.Uint8() && req.OnBehalfOf == req.ChannelID {
-			hasGrant, err := ba.botHasActiveGrantFrom(robotID, req.OnBehalfOf)
-			if err != nil {
-				ba.Error("OBO grantor-reply bypass lookup failed",
+		if err := ba.checkOBO(robotID, req.OnBehalfOf, req.ChannelID, req.ChannelType); err != nil {
+			if errors.Is(err, ErrOBONotAuthorized) {
+				ba.Warn("OBO denied: no active grant or scope",
 					zap.String("bot", robotID),
-					zap.String("grantor", req.OnBehalfOf),
-					zap.Error(err))
-				c.ResponseError(errors.New("OBO 检查失败"))
+					zap.String("on_behalf_of", req.OnBehalfOf),
+					zap.String("channel_id", req.ChannelID),
+					zap.Uint8("channel_type", req.ChannelType))
+				c.ResponseError(ErrOBONotAuthorized)
 				return
 			}
-			grantorReplyBypass = hasGrant
+			c.ResponseError(errors.New("OBO 检查失败"))
+			return
 		}
-
-		if !grantorReplyBypass {
-			if err := ba.checkOBO(robotID, req.OnBehalfOf, req.ChannelID, req.ChannelType); err != nil {
-				if errors.Is(err, ErrOBONotAuthorized) {
-					ba.Warn("OBO denied: no active grant or scope",
-						zap.String("bot", robotID),
-						zap.String("on_behalf_of", req.OnBehalfOf),
-						zap.String("channel_id", req.ChannelID),
-						zap.Uint8("channel_type", req.ChannelType))
-					c.ResponseError(ErrOBONotAuthorized)
-					return
-				}
-				c.ResponseError(errors.New("OBO 检查失败"))
-				return
-			}
-			fromUID = req.OnBehalfOf
-		} else {
-			ba.Info("OBO grantor-reply bypass: bot is replying to its own grantor in DM, sending as bot",
-				zap.String("bot", robotID),
-				zap.String("grantor", req.OnBehalfOf),
-				zap.String("channel_id", req.ChannelID))
-		}
+		fromUID = req.OnBehalfOf
 	}
 
 	// YUJ-644 / Mininglamp-OSS#33: PERSONAL DM 服务端权威 space_id 注入。
@@ -169,33 +124,14 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 		payload = ba.enrichBotPayloadWithSpaceID(c, robotID, payload)
 	}
 
-	// YUJ-202 / Mininglamp-OSS#94 / YUJ-1389 (Plan X) — mention
-	// three-state rewrite. Same chokepoint contract as
-	// modules/message/api.go: legacy `mention.all=1` is normalized to
-	// also carry `mention.ais=1` so legacy `@所有人` traffic auto-fans-
-	// out to all AI bots without requiring an SDK update on the
-	// sender side (outbound double-write keeps `all=1` for old
-	// read-side clients that only understand the legacy field).
-	// `mention.humans=1` remains an explicit, opt-in human-
-	// notification signal — it is NEVER inferred from `all=1`.
-	// ⚠️ F2 (PR#70 Jerry-Xin correctness-critical review): this MUST
-	// be placed OUTSIDE the `ChannelTypePerson` conditional above —
-	// otherwise group / community-topic `@所有人` traffic (the main
-	// pain-point being fixed) would bypass the rewrite. Helper is
-	// idempotent and safe on nil — see pkg/mentionrewrite.
-	payload = mentionrewrite.RewriteMention(payload)
-
 	// YUJ-1166 fan-out loop guard #3: mark this message so the fan-out
 	// listener (see obo_fanout.go) skips it on the way back through the
-	// listener pipeline. Marker key lives in the reserved `__obo_*`
-	// namespace (see oboProcessedMarkerKey) which the inbound payload
-	// validator above strips off client requests — so the marker is
-	// server-only state that a bot cannot forge or suppress. Stored in
-	// payload (= message_extra in the persisted MessageResp) so the
-	// messages table itself doesn't need an ALTER (out-of-scope row).
+	// listener pipeline. RFC §5.3 calls this `obo_processed=true`.
+	// Stored in payload (= message_extra in the persisted MessageResp) so
+	// the messages table itself doesn't need an ALTER (out-of-scope row).
 	if fromUID != robotID {
 		payload = ensureMap(payload)
-		payload[oboProcessedMarkerKey] = true
+		payload["obo_processed"] = true
 		payload["actual_sender_uid"] = robotID
 	}
 

@@ -69,54 +69,6 @@ type BotAPI struct {
 	// dispatchOverride hook keeps capturing sends in handler tests.
 	// nil in production.
 	oboFanoutDispatch func(*config.MsgSendReq) error
-	// oboFanoutBotEnqueue lets unit tests intercept the bot-event-queue
-	// enqueue that fanoutForMessage performs after a successful dispatch.
-	// Without this seam, fan-out tests would need a live Redis to assert
-	// the synthetic event reaches /v1/bot/events. The production path
-	// goes through ba.robotService.EnqueueBotEvent (see YUJ-1424 / PR#82
-	// Jerry-Xin blocker for why direct enqueue is necessary at all).
-	// nil in production → robotService path runs.
-	oboFanoutBotEnqueue func(robotID string, message *config.MessageResp) error
-	// oboChannelAccessOverride lets unit tests stub the grantor channel-
-	// access check used by oboCreateScope (PR#82 review P0 — channel-wiretap
-	// fix). Production path runs grantorCanReadChannel, which queries
-	// group_member + userService.IsFriend; tests that build BotAPI without
-	// a live DB session set this hook to deterministically accept or reject
-	// (uid, channel_id, channel_type) without touching MySQL.
-	// nil in production → the real DB-backed check runs.
-	oboChannelAccessOverride func(uid, channelID string, channelType uint8) (bool, error)
-	// oboDisplayNameLookup — YUJ-1465 / Mininglamp-OSS/octo-server#108
-	// (OBO v2). Test seam for resolving a uid → display name when the
-	// fan-out path builds the synthetic `obo_system_hint` string. Returns
-	// "" for unknown uids so the hint falls back to the bare uid. Empty
-	// override → the production path queries the `user` table.
-	oboDisplayNameLookup func(uid string) string
-	// oboGroupNameLookup — YUJ-1465 / Mininglamp-OSS/octo-server#108
-	// (OBO v2). Test seam for resolving a (group_no | thread channel id)
-	// to a human group name. The fan-out path only consults this for
-	// group / community-topic origin channels; DMs use the peer name
-	// instead. Returns "" for unknown channels so the hint falls back
-	// to the bare channel id. Empty override → the production path
-	// queries the `group` table (with parent-group resolution for
-	// community topics).
-	oboGroupNameLookup func(channelID string, channelType uint8) string
-	// typingCMDDispatch — YUJ-1465 / Mininglamp-OSS/octo-server#108.
-	// Test seam for the typing handler's ctx.SendCMD call. Lets unit
-	// tests capture the dispatched CMD (including the resolved
-	// `from_uid`) without standing up a live WuKongIM. Production
-	// path (nil override) goes through ba.ctx.SendCMD verbatim, so
-	// behaviour outside of tests is unchanged.
-	typingCMDDispatch func(req config.MsgCMDReq) error
-	// friendCheckOverride lets unit tests stub userService.IsFriend for the
-	// friend-gate decision in checkSendPermission / syncMessages, and for
-	// the OBO friend-gate bypass (see obo_friend_gate.go). Production path
-	// uses ba.userService.IsFriend; tests that build BotAPI without a live
-	// user service set this hook to deterministically accept or reject
-	// (uid, toUID) without touching MySQL. PR#82 R6 P0 — managed-persona
-	// OBO friend-gate bypass needs to be testable end-to-end without the
-	// full user-service stack.
-	// nil in production → the real userService.IsFriend runs.
-	friendCheckOverride func(uid, toUID string) (bool, error)
 	log.Log
 }
 
@@ -131,51 +83,19 @@ func (ba *BotAPI) dispatchMsgSendReq(req *config.MsgSendReq) (*config.MsgSendRes
 
 // NewBotAPI creates the Bot API gateway module.
 func NewBotAPI(ctx *config.Context) *BotAPI {
-	speechURL := os.Getenv(voice_adapter.EnvSpeechServiceURL)
-	speechKey := os.Getenv(voice_adapter.EnvSpeechAPIKey)
-	timeoutSec := voice_adapter.DefaultTimeoutSec
-	if v := os.Getenv(voice_adapter.EnvSpeechTimeout); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			timeoutSec = n
-		}
-	}
-	maxCtxLen := 10000
-	if v := os.Getenv("SPEECH_MAX_CONTEXT_LENGTH"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			maxCtxLen = n
-		}
-	} else if v := os.Getenv("VOICE_MAX_VOICE_CONTEXT_LENGTH"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			maxCtxLen = n
-		}
-	}
-	maxBodySize := int64(5 << 20)
-	if v := os.Getenv(voice_adapter.EnvSpeechMaxBodySize); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
-			maxBodySize = n
-		}
-	}
-	maxFileSize := int64(3 << 20)
-	if v := os.Getenv("SPEECH_MAX_FILE_SIZE"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
-			maxFileSize = n
-		}
-	}
-
+	voiceCfg := voice.NewVoiceConfigFromEnv()
 	ba := &BotAPI{
-		ctx:                   ctx,
-		db:                    newBotAPIDB(ctx),
-		userService:           user.NewService(ctx),
-		fileService:           file.NewService(ctx),
-		groupService:          group.NewService(ctx),
-		userDB:                user.NewDB(ctx),
-		threadService:         thread.NewService(ctx),
-		robotService:          robot.NewService(ctx),
-		speechClient:          voice_adapter.NewSpeechClient(speechURL, speechKey, time.Duration(timeoutSec)*time.Second),
-		maxVoiceContextLength: maxCtxLen,
-		maxBodySize:           maxBodySize,
-		maxFileSize:           maxFileSize,
-		Log:                   log.NewTLog("BotAPI"),
+		ctx:           ctx,
+		db:            newBotAPIDB(ctx),
+		userService:   user.NewService(ctx),
+		fileService:   file.NewService(ctx),
+		groupService:  group.NewService(ctx),
+		userDB:        user.NewDB(ctx),
+		threadService: thread.NewService(ctx),
+		voiceDB:       voice.NewVoiceDB(ctx),
+		voiceSvc:      voice.NewVoiceService(voiceCfg),
+		voiceCfg:      voiceCfg,
+		Log:           log.NewTLog("BotAPI"),
 	}
 	// YUJ-1166 / Mininglamp-OSS/octo-server#81 — Persona Clone fan-out.
 	// Subscribed AFTER the dependency wiring above so oboMessagesListen
