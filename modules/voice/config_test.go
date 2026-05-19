@@ -29,6 +29,7 @@ func clearVoiceEnv() {
 	os.Unsetenv("VOICE_MAX_CONTEXT_TEXT_LENGTH")
 	os.Unsetenv("VOICE_MAX_CHAT_CONTEXT_LENGTH")
 	os.Unsetenv("VOICE_MAX_MEMBER_CONTEXT_LENGTH")
+	os.Unsetenv("VOICE_FEEDBACK_URL")
 }
 
 func TestNewVoiceConfigFromEnv_Defaults(t *testing.T) {
@@ -606,4 +607,21 @@ func TestNewVoiceConfigFromEnv_EmotionEmoji_OtherValues(t *testing.T) {
 	os.Setenv("VOICE_EMOTION_EMOJI", "yes")
 	cfg := NewVoiceConfigFromEnv()
 	assert.True(t, cfg.EmotionEmoji)
+}
+
+func TestNewVoiceConfigFromEnv_FeedbackURL_Default(t *testing.T) {
+	clearVoiceEnv()
+	defer clearVoiceEnv()
+
+	cfg := NewVoiceConfigFromEnv()
+	assert.Empty(t, cfg.FeedbackURL)
+}
+
+func TestNewVoiceConfigFromEnv_FeedbackURL_Set(t *testing.T) {
+	clearVoiceEnv()
+	defer clearVoiceEnv()
+
+	os.Setenv("VOICE_FEEDBACK_URL", "/feedback")
+	cfg := NewVoiceConfigFromEnv()
+	assert.Equal(t, "/feedback", cfg.FeedbackURL)
 }

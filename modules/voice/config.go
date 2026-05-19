@@ -64,6 +64,8 @@ type VoiceConfig struct {
 	LocalProbeURL      string // Full URL for local model health probe (env: VOICE_LOCAL_PROBE_URL, default: "http://localhost:8787/")
 	LocalTranscribeURL string // Full URL for local model transcription (env: VOICE_LOCAL_TRANSCRIBE_URL, default: "http://localhost:8787/v1/voice/transcribe")
 
+	FeedbackURL string // Voice quality feedback service URL (env: VOICE_FEEDBACK_URL)
+
 	MaxVoiceContextLength  int // max personal voice context runes (env: VOICE_MAX_VOICE_CONTEXT_LENGTH)
 	MaxContextTextLength   int // max context_text runes (env: VOICE_MAX_CONTEXT_TEXT_LENGTH)
 	MaxChatContextLength   int // max chat_context runes (env: VOICE_MAX_CHAT_CONTEXT_LENGTH)
@@ -238,6 +240,10 @@ func NewVoiceConfigFromEnv() *VoiceConfig {
 	cfg.LocalTranscribeURL = "http://localhost:8787/v1/voice/transcribe"
 	if v := os.Getenv("VOICE_LOCAL_TRANSCRIBE_URL"); v != "" {
 		cfg.LocalTranscribeURL = v
+	}
+
+	if v := os.Getenv("VOICE_FEEDBACK_URL"); v != "" {
+		cfg.FeedbackURL = v
 	}
 
 	return cfg

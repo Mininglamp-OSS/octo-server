@@ -215,7 +215,7 @@ func (v *Voice) transcribe(c *wkhttp.Context) {
 // getConfig returns voice feature configuration
 func (v *Voice) getConfig(c *wkhttp.Context) {
 	enabled := v.cfg.Validate() == nil
-	c.JSON(http.StatusOK, gin.H{
+	resp := gin.H{
 		"enabled":              enabled,
 		"max_duration":         v.cfg.MaxDuration,
 		"max_file_size":        v.cfg.MaxFileSize,
@@ -225,7 +225,11 @@ func (v *Voice) getConfig(c *wkhttp.Context) {
 		"local_timeout_ms":     v.cfg.LocalTimeoutMs,
 		"local_probe_url":      v.cfg.LocalProbeURL,
 		"local_transcribe_url": v.cfg.LocalTranscribeURL,
-	})
+	}
+	if v.cfg.FeedbackURL != "" {
+		resp["feedback_url"] = v.cfg.FeedbackURL
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // buildASREntry constructs an ASREntry with common fields populated.

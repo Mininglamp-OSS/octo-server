@@ -1304,3 +1304,50 @@ func TestTranscribeAPI_MemberContextTruncation(t *testing.T) {
 	assert.Contains(t, receivedPrompt, longSuffix)
 	assert.NotContains(t, receivedPrompt, longPrefix)
 }
+
+func TestGetConfigAPI_FeedbackURL_Present(t *testing.T) {
+	cfg := &VoiceConfig{
+		LiteLLMUrl:  "https://example.com",
+		LiteLLMKey:  "key",
+		Models:      []string{"m"},
+		MaxDuration: 60,
+		MaxFileSize: 3 * 1024 * 1024,
+		Engine:      "gemini",
+		EditMode:    "edit",
+		FeedbackURL: "/feedback",
+	}
+
+	router := setupTestRouter(cfg, "")
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/voice/config", nil)
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	assert.Equal(t, "/feedback", resp["feedback_url"])
+}
+
+func TestGetConfigAPI_FeedbackURL_Absent(t *testing.T) {
+	cfg := &VoiceConfig{
+		LiteLLMUrl:  "https://example.com",
+		LiteLLMKey:  "key",
+		Models:      []string{"m"},
+		MaxDuration: 60,
+		MaxFileSize: 3 * 1024 * 1024,
+		Engine:      "gemini",
+		EditMode:    "edit",
+		FeedbackURL: "",
+	}
+
+	router := setupTestRouter(cfg, "")
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/voice/config", nil)
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	_, exists := resp["feedback_url"]
+	assert.False(t, exists, "feedback_url should not be present when empty")
+}
