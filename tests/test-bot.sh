@@ -43,7 +43,7 @@ fi
 # skill.md fetch
 perform_request GET "/v1/bot/skill.md" ""
 if expect_http 200 "skill.md"; then
-  if echo "$RESP_BODY" | grep -q "DMWork Bot Skill"; then
+  if echo "$RESP_BODY" | grep -q "Octo Bot Skill"; then
     pass "skill.md content looks correct"
   else
     warn "skill.md content missing expected heading"

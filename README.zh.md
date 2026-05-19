@@ -45,13 +45,19 @@
 ```bash
 git clone https://github.com/Mininglamp-OSS/octo-server.git
 cd octo-server
-go build ./...
-./octo-server --config ./config/dev.yaml
+go build -o octo-server .
+./octo-server --config ./configs/tsdd.yaml
 ```
 
 默认 dev 配置期望本地存在一个 WuKongIM 实例与一个 MySQL 兼容的数据库。
-参考 `config/dev.yaml.example`、`docker/` 下的最小本地 stack，以及
+参考仓库自带的 `configs/tsdd.yaml` 模板获取单二进制运行路径，配合
 [`QUICKSTART.md`](./QUICKSTART.md) 与 [`BUILDING.md`](./BUILDING.md) 获取完整步骤。
+
+若需要一键拉起完整 OCTO 栈（server + admin + web + matter + smart-summary
++ WuKongIM + MySQL + Redis + MinIO + nginx），请使用官方 OOTB 部署仓库
+[`Mininglamp-OSS/octo-deployment`](https://github.com/Mininglamp-OSS/octo-deployment)。
+本仓库原有的 `docker/octo/` 与 `docker/tsdd/` compose 栈已下线，统一收口
+到 `octo-deployment`，避免两份独立维护带来的偏移。
 
 ## 📦 模块与架构
 
@@ -66,8 +72,7 @@ go build ./...
 | `internal/im/` | WuKongIM 控制面客户端（频道 / 消息 / 在线状态） |
 | `internal/agent/` | 龙虾路由、会话存储、工具调用执行 |
 | `internal/adapter/` | Adapter 注册与下发入口 |
-| `config/` | YAML 配置 schema 与 dev / prod 示例 |
-| `docker/` | 最小 compose 栈（server + WuKongIM + MySQL + Redis） |
+| `configs/` | YAML 配置 schema 与 dev / prod 示例 |
 | `migrations/` | SQL 迁移脚本 |
 | `docs/` | 架构文档、API 参考、图表 |
 

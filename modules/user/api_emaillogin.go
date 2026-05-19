@@ -9,6 +9,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	commonapi "github.com/Mininglamp-OSS/octo-server/modules/base/common"
+	common "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
@@ -34,8 +35,27 @@ func (u *User) emailSendCode(c *wkhttp.Context) {
 		c.ResponseError(errors.New("邮箱格式不正确"))
 		return
 	}
+	settings := common.EnsureSystemSettings(u.ctx)
+	codeType := commonapi.CodeType(req.CodeType)
+	if codeType == commonapi.CodeTypeRegister && settings.RegisterOff() {
+		c.ResponseError(errors.New("注册通道暂不开放"))
+		return
+	}
+	if !settings.RegisterEmailOn() {
+		switch codeType {
+		case commonapi.CodeTypeRegister:
+			c.ResponseError(errors.New("暂不支持邮箱注册"))
+			return
+		case commonapi.CodeTypeEmailLogin:
+			c.ResponseError(errors.New("暂不支持邮箱登录"))
+			return
+		default:
+			// RegisterEmailOn controls email registration/login only. Password
+			// recovery codes remain available for existing accounts.
+		}
+	}
 
-	emailService := commonapi.NewEmailService(u.ctx)
+	emailService := commonapi.NewEmailService(u.ctx, common.EnsureSystemSettings(u.ctx))
 	if err := emailService.SendVerifyCode(context.Background(), req.Email, commonapi.CodeType(req.CodeType)); err != nil {
 		u.Error("发送邮箱验证码失败", zap.String("email", req.Email), zap.Error(err))
 		c.ResponseError(err)
@@ -46,7 +66,12 @@ func (u *User) emailSendCode(c *wkhttp.Context) {
 
 // emailRegister 邮箱注册
 func (u *User) emailRegister(c *wkhttp.Context) {
-	if !u.ctx.GetConfig().Register.EmailOn {
+	settings := common.EnsureSystemSettings(u.ctx)
+	if settings.RegisterOff() {
+		c.ResponseError(errors.New("注册通道暂不开放"))
+		return
+	}
+	if !settings.RegisterEmailOn() {
 		c.ResponseError(errors.New("暂不支持邮箱注册"))
 		return
 	}
@@ -97,7 +122,7 @@ func (u *User) emailRegister(c *wkhttp.Context) {
 			c.ResponseError(errors.New("验证码不能为空"))
 			return
 		}
-		emailService := commonapi.NewEmailService(u.ctx)
+		emailService := commonapi.NewEmailService(u.ctx, common.EnsureSystemSettings(u.ctx))
 		if err := emailService.Verify(context.Background(), req.Email, req.Code, commonapi.CodeTypeRegister); err != nil {
 			c.ResponseError(err)
 			return
@@ -176,6 +201,10 @@ func (u *User) emailRegister(c *wkhttp.Context) {
 
 // emailLogin 邮箱登录（验证码方式）
 func (u *User) emailLogin(c *wkhttp.Context) {
+	if !common.EnsureSystemSettings(u.ctx).RegisterEmailOn() {
+		c.ResponseError(errors.New("暂不支持邮箱登录"))
+		return
+	}
 	type reqVO struct {
 		Email    string     `json:"email"`
 		Code     string     `json:"code"`
@@ -246,7 +275,7 @@ func (u *User) emailLogin(c *wkhttp.Context) {
 
 	// 优先验证码登录，其次密码登录
 	if req.Code != "" {
-		emailService := commonapi.NewEmailService(u.ctx)
+		emailService := commonapi.NewEmailService(u.ctx, common.EnsureSystemSettings(u.ctx))
 		if err := emailService.Verify(loginSpanCtx, req.Email, req.Code, commonapi.CodeTypeEmailLogin); err != nil {
 			c.ResponseError(err)
 			return
@@ -307,7 +336,7 @@ func (u *User) emailForgetPwd(c *wkhttp.Context) {
 	}
 
 	// 验证验证码
-	emailService := commonapi.NewEmailService(u.ctx)
+	emailService := commonapi.NewEmailService(u.ctx, common.EnsureSystemSettings(u.ctx))
 	if err := emailService.Verify(context.Background(), req.Email, req.Code, commonapi.CodeTypeForgetLoginPWD); err != nil {
 		c.ResponseError(err)
 		return

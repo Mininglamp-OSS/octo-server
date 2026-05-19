@@ -92,11 +92,10 @@ func RemoveConvExtForUserInSpace(uid, spaceID, channelID string, channelType uin
 
 	// Cascade thread rows only for group cleanup.
 	if channelType == targetTypeGroup {
-		prefix := escapeLike(channelID) + escapeLike(threadSeparator) + "%"
 		if _, err := tx.DeleteBySql(
 			"DELETE FROM "+table+
 				" WHERE uid=? AND space_id=? AND target_type=? AND target_id LIKE ? ESCAPE '|'",
-			uid, spaceID, targetTypeThread, prefix,
+			uid, spaceID, targetTypeThread, threadLikePrefix(channelID),
 		).Exec(); err != nil {
 			db.Warn("RemoveConvExtForUserInSpace: 级联删除子区 ext 行失败（事务回滚）",
 				zap.String("uid", uid),
@@ -208,12 +207,11 @@ func RemoveConvExtForChannel(channelID string, channelType uint8) {
 	}
 	var owners []owner
 	if channelType == targetTypeGroup {
-		prefix := escapeLike(channelID) + escapeLike(threadSeparator) + "%"
 		if _, err := tx.SelectBySql(
 			"SELECT DISTINCT uid, space_id FROM "+table+
 				" WHERE (target_type=? AND target_id=?)"+
 				" OR (target_type=? AND target_id LIKE ? ESCAPE '|')",
-			channelType, channelID, targetTypeThread, prefix,
+			channelType, channelID, targetTypeThread, threadLikePrefix(channelID),
 		).Load(&owners); err != nil {
 			db.Warn("RemoveConvExtForChannel: SELECT owners 失败",
 				zap.String("channelID", channelID), zap.Error(err))
@@ -258,11 +256,10 @@ func RemoveConvExtForChannel(channelID string, channelType uint8) {
 		return
 	}
 	if channelType == targetTypeGroup {
-		prefix := escapeLike(channelID) + escapeLike(threadSeparator) + "%"
 		if _, err := tx.DeleteBySql(
 			"DELETE FROM "+table+
 				" WHERE target_type=? AND target_id LIKE ? ESCAPE '|'",
-			targetTypeThread, prefix,
+			targetTypeThread, threadLikePrefix(channelID),
 		).Exec(); err != nil {
 			db.Warn("RemoveConvExtForChannel: 级联删除子区 ext 行失败（事务回滚）",
 				zap.String("channelID", channelID), zap.Error(err))

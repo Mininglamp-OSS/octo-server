@@ -1,8 +1,8 @@
 swagger: "2.0"
 info:
-  description: "DMWork API"
+  description: "Octo API"
   version: "1.0.0"
-  title: "DMWork API"
+  title: "Octo API"
 host: "api.botgate.cn"
 tags:
   - name: "channel"

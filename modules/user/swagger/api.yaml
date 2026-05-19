@@ -1,8 +1,8 @@
 swagger: "2.0"
 info:
-  description: "DMWork API"
+  description: "Octo API"
   version: "1.0.0"
-  title: "DMWork API"
+  title: "Octo API"
 host: "api.botgate.cn"
 tags:
   - name: "user"
@@ -137,6 +137,26 @@ paths:
           type: integer
           description: "在线状态 -1为所有 0.离线 1.在线"
           required: true
+        - in: "query"
+          name: "exclude_bot"
+          type: integer
+          description: "是否排除 Bot 账号(user.robot=1) 0.否(默认) 1.是。与 exclude_system 是独立维度；如需排除所有非自然人账号，请同时传 exclude_bot=1&exclude_system=1。与 bot_only 互斥（同时传返回 400）"
+          required: false
+        - in: "query"
+          name: "exclude_system"
+          type: integer
+          description: "是否排除系统内置账号(botfather/u_10000/fileHelper/notification) 0.否(默认) 1.是。注意系统账号未必同时是 Bot（如 fileHelper 自身 user.robot=0），如需排除所有非自然人账号请配合 exclude_bot=1。与 system_only 互斥（同时传返回 400）"
+          required: false
+        - in: "query"
+          name: "bot_only"
+          type: integer
+          description: "仅返回 Bot 账号(user.robot=1) 0.否(默认) 1.是。与 exclude_bot 互斥。可与 exclude_system=1 组合得到非系统 Bot；可与 system_only=1 组合得到既是 Bot 又是系统账号的交集"
+          required: false
+        - in: "query"
+          name: "system_only"
+          type: integer
+          description: "仅返回系统内置账号(botfather/u_10000/fileHelper/notification) 0.否(默认) 1.是。与 exclude_system 互斥。可与 bot_only=1 组合定位系统 Bot"
+          required: false
       responses:
         200:
           description: "返回"
@@ -2446,6 +2466,12 @@ definitions:
       github_uid:
         type: string
         description: "GitHub授权登录返回"
+      is_bot:
+        type: integer
+        description: "是否为 Bot 账号 0.否 1.是；来源 user.robot，与 /v1/robot/space_bots 判定一致。与 is_system 是独立维度——系统账号（如 fileHelper）可能 is_system=1, is_bot=0"
+      is_system:
+        type: integer
+        description: "是否为系统内置账号 0.否 1.是；当前覆盖 botfather/u_10000/fileHelper/notification。与 is_bot 是独立维度——前端如需识别所有非自然人账号，应取 is_bot=1 或 is_system=1 的并集"
   UserLoginReq:
     type: "object"
     properties:

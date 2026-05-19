@@ -1,8 +1,8 @@
 swagger: "2.0"
 info:
-  description: "DMWork Space API"
+  description: "Octo Space API"
   version: "1.0.0"
-  title: "DMWork Space API"
+  title: "Octo Space API"
 host: "api.botgate.cn"
 tags:
   - name: "space"

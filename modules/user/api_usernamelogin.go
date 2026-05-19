@@ -14,6 +14,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkevent"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	event "github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	common "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
@@ -22,7 +23,12 @@ import (
 
 // 通过用户名注册
 func (u *User) usernameRegister(c *wkhttp.Context) {
-	if !u.ctx.GetConfig().Register.UsernameOn {
+	settings := common.EnsureSystemSettings(u.ctx)
+	if settings.RegisterOff() {
+		c.ResponseError(errors.New("注册通道暂不开放"))
+		return
+	}
+	if !settings.RegisterUsernameOn() {
 		c.ResponseError(errors.New("暂不支持用户名注册"))
 		return
 	}

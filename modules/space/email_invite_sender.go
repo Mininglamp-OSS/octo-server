@@ -6,6 +6,7 @@ import (
 	"time"
 
 	commonapi "github.com/Mininglamp-OSS/octo-server/modules/base/common"
+	common "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"go.uber.org/zap"
 )
 
@@ -48,7 +49,7 @@ func (s *Space) currentInviteSender() inviteEmailSender {
 	if v := getInviteEmailSenderForTest(); v != nil {
 		return v
 	}
-	return commonapi.NewEmailService(s.ctx)
+	return commonapi.NewEmailService(s.ctx, common.EnsureSystemSettings(s.ctx))
 }
 
 // dispatchInviteEmail 同步发送一封 owner/member 邀请邮件。

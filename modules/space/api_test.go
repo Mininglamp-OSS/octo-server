@@ -27,8 +27,18 @@ var (
 	testSpaceDB *DB
 )
 
-// TestMain 确保 space 迁移所依赖的外部表存在，并创建共享测试服务器
+// TestMain 确保 space 迁移所依赖的外部表存在，并创建共享测试服务器。
+//
+// OCTO_MASTER_KEY 必须在 NewTestServer 之前设置：space 包通过
+// email_invite_sender.go 直接 import modules/common，会触发 common 的
+// init() 注册 Module；NewTestServer 走到 common.Route() 时会调用
+// insertAppConfigIfNeed → encryptKey/decryptKey，缺 key 会 panic。
+// 这里 fallback 一个固定值，CI 已显式 export 同名变量，本地裸跑也能过。
 func TestMain(m *testing.M) {
+	if os.Getenv("OCTO_MASTER_KEY") == "" {
+		_ = os.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
+	}
+
 	db, err := sql.Open("mysql", "root:demo@tcp(127.0.0.1)/test?charset=utf8mb4&parseTime=true")
 	if err != nil {
 		panic("连接测试数据库失败: " + err.Error())

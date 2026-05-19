@@ -2,13 +2,13 @@ package user
 
 import (
 	"context"
-	"os"
-	"runtime/debug"
 	"fmt"
 	"hash/crc32"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -16,6 +16,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/network"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	common "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/gin-gonic/gin"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
@@ -27,10 +28,6 @@ const (
 )
 
 func (u *User) thirdAuthcode(c *wkhttp.Context) {
-	if u.ctx.GetConfig().Register.Off {
-		c.ResponseError(errors.New("注册通道暂不开放，请长按标题使用官网上演示账号登录"))
-		return
-	}
 	authcode := util.GenerUUID()
 	err := u.ctx.GetRedisConn().SetAndExpire(fmt.Sprintf("%s%s", ThirdAuthcodePrefix, authcode), "1", time.Minute*5)
 	if err != nil {
@@ -45,10 +42,6 @@ func (u *User) thirdAuthcode(c *wkhttp.Context) {
 }
 
 func (u *User) thirdAuthStatus(c *wkhttp.Context) {
-	if u.ctx.GetConfig().Register.Off {
-		c.ResponseError(errors.New("注册通道暂不开放，请长按标题使用官网上演示账号登录"))
-		return
-	}
 	authcode := c.Query("authcode")
 	key := fmt.Sprintf("%s%s", ThirdAuthcodePrefix, authcode)
 	result, err := u.ctx.GetRedisConn().GetString(key)
@@ -153,6 +146,20 @@ func (u *User) giteeOAuth(c *wkhttp.Context) {
 		publicIP := util.GetClientPublicIP(c.Request)
 		go u.sentWelcomeMsg(publicIP, userInfoM.UID)
 	} else {
+		if common.EnsureSystemSettings(u.ctx).RegisterOff() {
+			// 必须先把 authcode 标记为登录失败再返回:thirdAuthcode 起手把 Redis
+			// 里的 key 置为 "1"(等待中),后续成功/失败路径都靠下面的 SetAndExpire
+			// 推进状态。直接 return 会让前端的 /thirdlogin/authstatus 轮询一直拿
+			// 到 "等待中" 直至 5min TTL 过期,而非立刻看到登录失败。
+			// 与 OIDC failure 路径(modules/oidc/api.go SetAuthcode "0")对齐。
+			if redisErr := u.ctx.GetRedisConn().SetAndExpire(
+				fmt.Sprintf("%s%s", ThirdAuthcodePrefix, authcode), "0", time.Minute*1,
+			); redisErr != nil {
+				u.Error("write authcode failure marker after RegisterOff", zap.Error(redisErr))
+			}
+			c.ResponseError(errors.New("注册通道暂不开放"))
+			return
+		}
 		// 创建用户
 		uid := util.GenerUUID()
 		name := userInfo.Name

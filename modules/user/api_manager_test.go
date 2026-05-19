@@ -2,6 +2,8 @@ package user
 
 import (
 	"bytes"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -295,6 +297,292 @@ func TestUserListByEmailKeyword(t *testing.T) {
 			}
 		})
 	}
+}
+
+// 后台需要区分三类账号：普通用户、Bot（user.robot=1）与系统账号
+// （pkg/space.SystemBots，如 fileHelper/u_10000/botfather/notification）。
+// 之前前端只能靠 username 后缀 _bot 推断 bot，存在撞名/伪装风险，
+// 因此 /v1/manager/user/list 必须在响应里显式带 is_bot/is_system，
+// 并提供 exclude_bot / exclude_system 查询参数以便后台筛除。
+func TestUserListBotAndSystemFlags(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	m := NewManager(ctx)
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	err = ctx.Cache().Set(ctx.GetConfig().Cache.TokenCachePrefix+testutil.Token, testutil.UID+"@test@"+string(wkhttp.SuperAdmin))
+	assert.NoError(t, err)
+
+	// 普通用户
+	err = m.userDB.Insert(&Model{
+		UID:      "user_normal_001",
+		ShortNo:  util.GenerUUID(),
+		Username: "normaluser",
+		Name:     "NormalUser",
+		Status:   1,
+		Password: util.MD5(util.MD5("111")),
+	})
+	assert.NoError(t, err)
+	// Bot：与 /v1/robot/space_bots 判定一致，user.robot=1
+	err = m.userDB.Insert(&Model{
+		UID:      "user_bot_001",
+		ShortNo:  util.GenerUUID(),
+		Username: "thirdpartybot",
+		Name:     "ThirdPartyBot",
+		Status:   1,
+		Robot:    1,
+		Password: util.MD5(util.MD5("222")),
+	})
+	assert.NoError(t, err)
+	// 系统账号：pkg/space.SystemBots 中固定的 UID
+	err = m.userDB.Insert(&Model{
+		UID:      "fileHelper",
+		ShortNo:  util.GenerUUID(),
+		Username: "fileHelper",
+		Name:     "FileHelper",
+		Status:   1,
+		Password: util.MD5(util.MD5("333")),
+	})
+	assert.NoError(t, err)
+	// 系统账号 + Bot 同时成立的关键 case（is_bot=1 & is_system=1）。
+	// 生产环境数据印证：botfather/u_10000/notification 都是 robot=1 的系统账号，
+	// bot_only=1&system_only=1 必须能精准命中这种交集账号。
+	err = m.userDB.Insert(&Model{
+		UID:      "botfather",
+		ShortNo:  util.GenerUUID(),
+		Username: "botfather",
+		Name:     "BotFather",
+		Status:   1,
+		Robot:    1,
+		Password: util.MD5(util.MD5("444")),
+	})
+	assert.NoError(t, err)
+
+	// 响应解析成结构化数据，便于断言 count 与 list 一致 —— PR #62 review
+	// 反复强调"count/list 一致性"是这次重构的主旨，所以测试必须显式覆盖。
+	type userRow struct {
+		UID      string `json:"uid"`
+		IsBot    int    `json:"is_bot"`
+		IsSystem int    `json:"is_system"`
+	}
+	type listResp struct {
+		Count int64     `json:"count"`
+		List  []userRow `json:"list"`
+	}
+	doList := func(t *testing.T, query string) listResp {
+		t.Helper()
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/v1/manager/user/list?"+query, nil)
+		req.Header.Set("token", testutil.Token)
+		s.GetRoute().ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code)
+		var resp listResp
+		assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp), "response is not JSON: %s", w.Body.String())
+		return resp
+	}
+	uidsOf := func(rs []userRow) []string {
+		out := make([]string, 0, len(rs))
+		for _, r := range rs {
+			out = append(out, r.UID)
+		}
+		return out
+	}
+	findUID := func(rs []userRow, uid string) (userRow, bool) {
+		for _, r := range rs {
+			if r.UID == uid {
+				return r, true
+			}
+		}
+		return userRow{}, false
+	}
+
+	cases := []struct {
+		name        string
+		query       string
+		wantUIDs    []string // 期望响应包含的 UID（顺序无关）
+		notWantUIDs []string // 期望响应不应包含的 UID
+	}{
+		{
+			name:     "default returns all four",
+			query:    "page_index=1&page_size=10",
+			wantUIDs: []string{"user_normal_001", "user_bot_001", "fileHelper", "botfather"},
+		},
+		{
+			name:        "exclude_bot filters user.robot=1",
+			query:       "page_index=1&page_size=10&exclude_bot=1",
+			wantUIDs:    []string{"user_normal_001", "fileHelper"},
+			notWantUIDs: []string{"user_bot_001", "botfather"},
+		},
+		{
+			name:        "exclude_system filters SystemBots UIDs",
+			query:       "page_index=1&page_size=10&exclude_system=1",
+			wantUIDs:    []string{"user_normal_001", "user_bot_001"},
+			notWantUIDs: []string{"fileHelper", "botfather"},
+		},
+		{
+			name:        "exclude_bot + keyword still filters bots",
+			query:       "page_index=1&page_size=10&keyword=user_&exclude_bot=1",
+			wantUIDs:    []string{"user_normal_001"},
+			notWantUIDs: []string{"user_bot_001"},
+		},
+		{
+			name:        "exclude_bot + exclude_system filters both",
+			query:       "page_index=1&page_size=10&exclude_bot=1&exclude_system=1",
+			wantUIDs:    []string{"user_normal_001"},
+			notWantUIDs: []string{"user_bot_001", "fileHelper", "botfather"},
+		},
+		// bot_only / system_only：前端"只看 Bot""只看系统账号"档位需要的反向筛选。
+		// 没有这两个参数时前端只能客户端过滤当前页，会导致 total 与可见行数不一致。
+		{
+			name:        "bot_only returns all robot=1 (including system bots)",
+			query:       "page_index=1&page_size=10&bot_only=1",
+			wantUIDs:    []string{"user_bot_001", "botfather"},
+			notWantUIDs: []string{"user_normal_001", "fileHelper"},
+		},
+		{
+			name:        "system_only returns all SystemBots UIDs",
+			query:       "page_index=1&page_size=10&system_only=1",
+			wantUIDs:    []string{"fileHelper", "botfather"},
+			notWantUIDs: []string{"user_normal_001", "user_bot_001"},
+		},
+		{
+			name:        "bot_only + exclude_system narrows to user-created bots",
+			query:       "page_index=1&page_size=10&bot_only=1&exclude_system=1",
+			wantUIDs:    []string{"user_bot_001"},
+			notWantUIDs: []string{"user_normal_001", "fileHelper", "botfather"},
+		},
+		// 交集：既是 Bot 又是系统账号 —— botfather 是这种账号的代表。
+		// 这是 bot_only 和 system_only 共存的唯一有意义组合，因此显式覆盖。
+		{
+			name:        "bot_only + system_only returns intersection",
+			query:       "page_index=1&page_size=10&bot_only=1&system_only=1",
+			wantUIDs:    []string{"botfather"},
+			notWantUIDs: []string{"user_normal_001", "user_bot_001", "fileHelper"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := doList(t, tc.query)
+			gotUIDs := uidsOf(resp.List)
+			for _, uid := range tc.wantUIDs {
+				assert.Contains(t, gotUIDs, uid)
+			}
+			for _, uid := range tc.notWantUIDs {
+				assert.NotContains(t, gotUIDs, uid)
+			}
+			// list/count 一致 —— 测试用例样本量都小于 page_size，所以 count 必须
+			// 与返回的 list 长度一致；如果 count 端漏掉了某个 filter，这里会立刻挂掉。
+			assert.Equal(t, int64(len(resp.List)), resp.Count, "count must equal list length under the same filter")
+		})
+	}
+
+	// 字段语义单测：分别校验四类账号的 is_bot/is_system 取值。
+	t.Run("flag values per account type", func(t *testing.T) {
+		resp := doList(t, "page_index=1&page_size=10")
+		normal, ok := findUID(resp.List, "user_normal_001")
+		assert.True(t, ok)
+		assert.Equal(t, 0, normal.IsBot)
+		assert.Equal(t, 0, normal.IsSystem)
+
+		bot, ok := findUID(resp.List, "user_bot_001")
+		assert.True(t, ok)
+		assert.Equal(t, 1, bot.IsBot)
+		assert.Equal(t, 0, bot.IsSystem)
+
+		// fileHelper 是系统账号但没有 user.robot=1 —— 这正是 is_bot 与
+		// is_system 设计为独立维度的关键 case（PR #62 review 共识）。
+		sys, ok := findUID(resp.List, "fileHelper")
+		assert.True(t, ok)
+		assert.Equal(t, 0, sys.IsBot)
+		assert.Equal(t, 1, sys.IsSystem)
+
+		// botfather：交集账号，is_bot=1 且 is_system=1 同时成立。
+		bf, ok := findUID(resp.List, "botfather")
+		assert.True(t, ok)
+		assert.Equal(t, 1, bf.IsBot)
+		assert.Equal(t, 1, bf.IsSystem)
+	})
+
+	// 互斥校验：bot_only 与 exclude_bot、system_only 与 exclude_system 同时为 1
+	// 是逻辑矛盾，返回 400 比静默返回空更利于前端发现 bug。
+	conflictCases := []struct {
+		name  string
+		query string
+	}{
+		{"bot_only conflicts with exclude_bot", "page_index=1&page_size=10&bot_only=1&exclude_bot=1"},
+		{"system_only conflicts with exclude_system", "page_index=1&page_size=10&system_only=1&exclude_system=1"},
+	}
+	for _, tc := range conflictCases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequest("GET", "/v1/manager/user/list?"+tc.query, nil)
+			req.Header.Set("token", testutil.Token)
+			s.GetRoute().ServeHTTP(w, req)
+			assert.Equal(t, http.StatusBadRequest, w.Code, "body=%s", w.Body.String())
+		})
+	}
+}
+
+// GH issue #54: 历史迁移 20220222000001_user_legacy01.sql 用裸 MODIFY 把
+// user.phone / user.zone 改成了 nullable，导致任何外部 INSERT 漏列就会让这
+// 两列出现 NULL，进而让 /v1/manager/user/list 等所有 SELECT phone/zone 到
+// string 字段的接口因 "converting NULL to string is unsupported" 报 400。
+//
+// 修复迁移 20260516000001_user_legacy01.sql 把列改回 NOT NULL DEFAULT ''。
+// 本测试通过 INFORMATION_SCHEMA 校验 schema、并直接走 raw SQL 尝试 NULL
+// 写入来验证约束是否真生效（修复前是 NULL 通过、读取报错；修复后是写入直接被
+// 拒，读取永远安全）。
+func TestUserTablePhoneZoneNotNullable(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	// 1. INFORMATION_SCHEMA 直接校验 schema。
+	type colMeta struct {
+		ColumnName    string `db:"COLUMN_NAME"`
+		IsNullable    string `db:"IS_NULLABLE"`
+		ColumnDefault sql.NullString `db:"COLUMN_DEFAULT"`
+	}
+	var cols []*colMeta
+	_, err = ctx.DB().SelectBySql(
+		"SELECT COLUMN_NAME, IS_NULLABLE, COLUMN_DEFAULT "+
+			"FROM INFORMATION_SCHEMA.COLUMNS "+
+			"WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME='user' "+
+			"AND COLUMN_NAME IN ('phone','zone') ORDER BY COLUMN_NAME",
+	).Load(&cols)
+	assert.NoError(t, err)
+	assert.Len(t, cols, 2, "expected phone+zone columns to exist")
+	for _, c := range cols {
+		assert.Equal(t, "NO", c.IsNullable, "%s must be NOT NULL", c.ColumnName)
+		assert.True(t, c.ColumnDefault.Valid, "%s must have a non-NULL DEFAULT", c.ColumnName)
+		assert.Equal(t, "", c.ColumnDefault.String, "%s DEFAULT should be empty string", c.ColumnName)
+	}
+
+	// 2. 显式 NULL 写入应被数据库拒绝（NOT NULL 约束实际生效，而不只是元数据声明）。
+	// short_no 走自定义值避免与系统账号或下面的 case 撞 unique 索引。
+	_, err = ctx.DB().InsertBySql(
+		"INSERT INTO `user` (uid, name, role, username, short_no, phone, zone) VALUES (?, ?, ?, ?, ?, NULL, NULL)",
+		"test_null_phone", "X", "admin", "test_null_phone", "test_short_1",
+	).Exec()
+	assert.Error(t, err, "INSERT with explicit NULL phone/zone must be rejected")
+
+	// 3. 漏列写入应该走 DEFAULT '' —— 这是 issue 报告的"手插 admin 行"场景。
+	_, err = ctx.DB().InsertBySql(
+		"INSERT INTO `user` (uid, name, role, username, short_no) VALUES (?, ?, ?, ?, ?)",
+		"test_missing_phone", "Y", "admin", "test_missing_phone", "test_short_2",
+	).Exec()
+	assert.NoError(t, err, "INSERT without phone/zone columns should succeed via DEFAULT ''")
+
+	// 4. 验证 DEFAULT 实际值确是 ''。
+	type row struct {
+		Phone string `db:"phone"`
+		Zone  string `db:"zone"`
+	}
+	var r row
+	_, err = ctx.DB().SelectBySql("SELECT phone, zone FROM `user` WHERE uid=?", "test_missing_phone").Load(&r)
+	assert.NoError(t, err)
+	assert.Equal(t, "", r.Phone)
+	assert.Equal(t, "", r.Zone)
 }
 
 func TestUserDisablelist(t *testing.T) {

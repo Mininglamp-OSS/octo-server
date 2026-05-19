@@ -10,6 +10,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	common "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"go.uber.org/zap"
 )
 
@@ -127,6 +128,9 @@ func (u *User) externalLoginExisting(ctx context.Context, req ExternalLoginReq) 
 }
 
 func (u *User) externalLoginCreate(ctx context.Context, req ExternalLoginReq) (*ExternalLoginResp, error) {
+	if common.EnsureSystemSettings(u.ctx).RegisterOff() {
+		return nil, errors.New("注册通道暂不开放")
+	}
 	if req.UID == "" {
 		return nil, errors.New("user: external login: UID is required when creating new user")
 	}

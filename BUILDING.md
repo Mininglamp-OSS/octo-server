@@ -32,7 +32,31 @@ will resolve imports from `proxy.golang.org` automatically.
 
 ## Docker
 
+For an end-to-end OCTO stack (this server plus admin / web / matter /
+smart-summary / WuKongIM / MySQL / Redis / MinIO / nginx), see the
+official OOTB deployment at
+[`Mininglamp-OSS/octo-deployment`](https://github.com/Mininglamp-OSS/octo-deployment).
+The older `docker/octo/` and `docker/tsdd/` compose stacks that used
+to ship in this repository have been retired in favour of that single
+source of truth.
+
+To build only the `octo-server` container image from this repository:
+
 ```bash
-make build          # Builds tangsengdaodaoserver image locally
-make run-dev        # docker-compose up full stack
+make build          # docker build -t octo-server .
 ```
+
+Multi-arch container images (`linux/amd64`, `linux/arm64`) are
+published to Docker Hub as
+[`mininglamposs/octo-server`](https://hub.docker.com/r/mininglamposs/octo-server)
+by `.github/workflows/docker-publish.yml`, triggered automatically on
+every `v*` Git tag push. Deployment manifests (Helm charts, compose
+stacks, etc.) for the full OOTB stack continue to live in
+[`Mininglamp-OSS/octo-deployment`](https://github.com/Mininglamp-OSS/octo-deployment).
+
+The `push` / `deploy` / `deploy-v2` targets that still ship in this
+repo's `Makefile` predate the consolidation and hard-code the team's
+private Aliyun registry path (with one stale tag — `make push`
+currently tags `octo-server` and then pushes `wukongchatserver:latest`,
+which is a leftover from the pre-rename era); they are not the
+canonical release surface and should not be used.

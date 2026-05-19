@@ -632,7 +632,11 @@ func (u *User) uploadAvatar(c *wkhttp.Context) {
 // 获取用户的IM连接地址
 func (u *User) userIM(c *wkhttp.Context) {
 	uid := c.Param("uid")
-	resp, err := network.Get(fmt.Sprintf("%s/route?uid=%s", u.ctx.GetConfig().WuKongIM.APIURL, uid), nil, nil)
+	headers := map[string]string{}
+	if mt := u.ctx.GetConfig().WuKongIM.ManagerToken; mt != "" {
+		headers["token"] = mt
+	}
+	resp, err := network.Get(fmt.Sprintf("%s/route?uid=%s", u.ctx.GetConfig().WuKongIM.APIURL, uid), nil, headers)
 	if err != nil {
 		u.Error("调用IM服务失败！", zap.Error(err))
 		c.ResponseError(errors.New("调用IM服务失败！"))
@@ -1445,8 +1449,18 @@ func (u *User) register(c *wkhttp.Context) {
 		return
 	}
 
-	if u.ctx.GetConfig().Register.Off {
+	if common2.EnsureSystemSettings(u.ctx).RegisterOff() {
 		c.ResponseError(errors.New("注册通道暂不开放，请长按标题使用官网上演示账号登录"))
+		return
+	}
+	// 仅中国号码闸门必须在 register 这里再判一次：sendRegisterCode 处的
+	// 校验只能拦"取码"动作，但管理员把 only_china 切到 1 之前已发出去的
+	// 验证码、或任何能让 smsService.Verify 通过的外部路径，都还能拿着
+	// 非 0086 区号走到这里完成注册。把判断前移到 createUser 之前，
+	// 闭合 time-of-check vs time-of-use 缺口。
+	if common2.EnsureSystemSettings(u.ctx).RegisterOnlyChina() &&
+		strings.TrimSpace(req.Zone) != "0086" {
+		c.ResponseError(errors.New("仅仅支持中国大陆手机号注册！"))
 		return
 	}
 	appConfig, err := u.commonService.GetAppConfig()
@@ -2240,7 +2254,7 @@ func (u *User) blacklists(c *wkhttp.Context) {
 
 // sendRegisterCode 发送注册短信
 func (u *User) sendRegisterCode(c *wkhttp.Context) {
-	if u.ctx.GetConfig().Register.Off {
+	if common2.EnsureSystemSettings(u.ctx).RegisterOff() {
 		c.ResponseError(errors.New("注册通道暂不开放，请长按标题使用官网上演示账号登录"))
 		return
 	}
@@ -2257,7 +2271,7 @@ func (u *User) sendRegisterCode(c *wkhttp.Context) {
 		c.ResponseError(errors.New("手机号不能为空！"))
 		return
 	}
-	if u.ctx.GetConfig().Register.OnlyChina {
+	if common2.EnsureSystemSettings(u.ctx).RegisterOnlyChina() {
 		if strings.TrimSpace(req.Zone) != "0086" {
 			c.ResponseError(errors.New("仅仅支持中国大陆手机号注册！"))
 			return

@@ -1,8 +1,8 @@
 swagger: "2.0"
 info:
-  description: "DMWork 搜索 API"
+  description: "Octo 搜索 API"
   version: "1.0.0"
-  title: "DMWork Search API"
+  title: "Octo Search API"
 host: "api.botgate.cn"
 tags:
   - name: "search"

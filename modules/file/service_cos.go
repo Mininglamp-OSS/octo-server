@@ -201,6 +201,38 @@ func (sc *ServiceCOS) newPublicClient() (*minio.Client, error) {
 	return client, nil
 }
 
+// newCanonicalPresignClient builds a COS client for presigned URL generation
+// against the canonical COS endpoint (`<bucket>.cos.<region>.myqcloud.com`).
+//
+// This is used when BucketURL is a CDN alias (no `<bucket>.` subdomain):
+// CDN domains are bucket aliases — the CDN origin routes to the bucket
+// implicitly. The SDK's path-style `/<bucket>/<key>` URL shape has no
+// corresponding route on the CDN, so presigned URLs must go directly to
+// COS. The CDN is only used for non-presigned download URLs via
+// `publicURL`.
+//
+// Unlike `getClient` (which is for server-side I/O and does not set
+// Region), this sets Region explicitly so the SDK skips the
+// GetBucketLocation preflight — same rationale as `newPublicClient`.
+func (sc *ServiceCOS) newCanonicalPresignClient() (*minio.Client, error) {
+	cosConfig := sc.ctx.GetConfig().COS
+	endpoint := fmt.Sprintf("cos.%s.myqcloud.com", cosConfig.Region)
+	region := strings.TrimSpace(cosConfig.Region)
+	if region == "" {
+		region = "us-east-1"
+	}
+	client, err := minio.New(endpoint, &minio.Options{
+		Creds:        credentials.NewStaticV4(cosConfig.SecretID, cosConfig.SecretKey, ""),
+		Secure:       true,
+		Region:       region,
+		BucketLookup: minio.BucketLookupDNS,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("创建COS签名客户端失败: %w", err)
+	}
+	return client, nil
+}
+
 // UploadFile 上传文件到腾讯云COS
 func (sc *ServiceCOS) UploadFile(filePath string, contentType string, contentDisposition string, copyFileWriter func(io.Writer) error) (map[string]interface{}, error) {
 	buff := bytes.NewBuffer(make([]byte, 0))
@@ -268,15 +300,22 @@ func (sc *ServiceCOS) GetFile(ph string) (io.ReadCloser, string, error) {
 
 // PresignedPutURL 生成预签名 PUT URL，用于客户端直传 COS。
 //
-// The returned URL is signed against the *browser-facing* endpoint
-// resolved by `publicEndpoint`, not the SDK's default
-// `cos.<region>.myqcloud.com`. SigV4 covers `host` in the signed
-// headers, so any post-sign host change would invalidate the signature
-// (R6→R7 fix: previously we signed against the default endpoint and
-// then rewrote `presigned.Host` / `presigned.Scheme` to BucketURL,
-// which produced `403 SignatureDoesNotMatch` from the COS gateway on
-// every browser PUT — same hazard MinIO closed at PR#50 R3+, mirrored
-// here for COS).
+// Client selection depends on the BucketURL shape:
+//
+//   - Bucket-subdomain BucketURL (e.g. `https://<bucket>.cos.example.com`)
+//     or empty BucketURL: sign against the browser-facing endpoint via
+//     `newPublicClient`. SigV4 covers `host`, so the browser hits the
+//     same host the signature covers.
+//
+//   - CDN alias BucketURL (e.g. `https://cdn.deepminer.com.cn`): sign
+//     against the canonical COS endpoint via `getClient` (virtual-hosted
+//     `<bucket>.cos.<region>.myqcloud.com`). CDN domains are bucket
+//     aliases — the CDN origin routes to the bucket implicitly, so the
+//     SDK's path-style `/<bucket>/<key>` URL shape has no corresponding
+//     route on the CDN. Signing against the real COS endpoint means the
+//     browser uploads/downloads directly to COS, bypassing the CDN.
+//     `publicURL` uses the CDN for non-presigned download URLs only.
+//     (YUJ-877 / GH#57 fix)
 //
 // fileSize is signed into the canonical-headers section as
 // `Content-Length`. The browser MUST echo the same value (browsers
@@ -289,7 +328,17 @@ func (sc *ServiceCOS) PresignedPutURL(objectPath string, contentType string, con
 		return "", "", fmt.Errorf("预签名上传必须提供正向的 fileSize（字节数），用于在签名中固定 Content-Length")
 	}
 	cosConfig := sc.ctx.GetConfig().COS
-	client, err := sc.newPublicClient()
+
+	// Pick signing client based on BucketURL shape.
+	_, _, lookup := sc.publicEndpoint()
+	var client *minio.Client
+	if lookup == minio.BucketLookupPath {
+		// CDN alias: sign against canonical COS endpoint (DNS-style).
+		client, err = sc.newCanonicalPresignClient()
+	} else {
+		// Bucket-subdomain or empty: sign against the public endpoint.
+		client, err = sc.newPublicClient()
+	}
 	if err != nil {
 		return "", "", err
 	}
@@ -380,12 +429,7 @@ func (sc *ServiceCOS) DownloadURL(ph string, filename string) (string, error) {
 	return sc.publicURL(ph), nil
 }
 
-// publicURL constructs a browser-facing object URL for `objectPath`,
-// respecting the BucketLookup addressing style decided by
-// `publicEndpoint`. It is the URL-construction sibling of
-// `newPublicClient` — both must agree on whether the bucket lives in
-// the host (DNS-style) or in the path (path-style), or the GET URL
-// will not address the same object as the signed PUT URL.
+// publicURL constructs a browser-facing object URL for `objectPath`.
 //
 // Branches:
 //
@@ -398,14 +442,15 @@ func (sc *ServiceCOS) DownloadURL(ph string, filename string) (string, error) {
 //     `publicEndpoint` returns `BucketLookupDNS`. The bucket is already
 //     in the host, so `<BucketURL>/<key>` is the correct browser URL.
 //
-//  3. BucketURL is path-style (no `<bucket>.` subdomain, e.g.
-//     `https://cdn.example.com`) — `publicEndpoint` returns
-//     `BucketLookupPath`. The bucket must appear in the URL path, so
-//     the browser URL is `<BucketURL>/<bucket>/<key>`. Skipping the
-//     bucket segment here was the original YUJ-848 bug.
+//  3. BucketURL is a CDN / accelerator alias (no `<bucket>.` subdomain,
+//     e.g. `https://cdn.deepminer.com.cn`) — the CDN origin routes to
+//     the bucket implicitly. The browser URL is `<BucketURL>/<key>`
+//     *without* a bucket segment. Inserting the bucket here was the
+//     YUJ-877 (GH#57) 404 regression: the CDN has no route for
+//     `/<bucket>/…` in the URL path.
 //
-// `withPrefix` is applied identically in all three branches so the
-// env-prefix routing keeps working (multi-env shared bucket layout).
+// In all three branches `withPrefix` is applied so the env-prefix
+// routing keeps working (multi-env shared bucket layout).
 func (sc *ServiceCOS) publicURL(objectPath string) string {
 	cosConfig := sc.ctx.GetConfig().COS
 	key := sc.withPrefix(objectPath)
@@ -418,27 +463,35 @@ func (sc *ServiceCOS) publicURL(objectPath string) string {
 		return result
 	}
 
-	_, _, lookup := sc.publicEndpoint()
-	if lookup == minio.BucketLookupPath {
-		// Path-style: bucket lives in the URL path, not the host.
-		result, _ := url.JoinPath(base, cosConfig.Bucket, key)
-		return result
-	}
-	// DNS-style: bucket already in the BucketURL host; just append key.
+	// Both DNS-style (bucket-subdomain) and CDN-alias (no bucket
+	// subdomain) produce `<BucketURL>/<key>` — the bucket is either
+	// already embedded in the host or handled by the CDN origin rule.
+	// Neither case needs a `/<bucket>/` segment in the URL path.
 	result, _ := url.JoinPath(base, key)
 	return result
 }
 
 // PresignedGetURL 生成预签名 GET URL，带 response-content-disposition 用于下载。
 //
-// Like PresignedPutURL, the URL is signed against the browser-facing
-// endpoint (`publicEndpoint` → `cosConfig.BucketURL`). No post-sign host
-// rewrite is performed: the SigV4 signature covers `host`, so any
-// mutation after signing would produce 403 SignatureDoesNotMatch from
-// the COS gateway. R6→R7 fix mirrors the PUT-side change above.
+// Client selection follows the same logic as PresignedPutURL:
+// bucket-subdomain / empty BucketURL → sign via `newPublicClient`;
+// CDN alias BucketURL → sign via `getClient` (canonical COS endpoint)
+// because the CDN domain has no route for path-style `/<bucket>/<key>`.
+// (YUJ-877 / GH#57 fix — see PresignedPutURL for the full rationale.)
 func (sc *ServiceCOS) PresignedGetURL(objectPath string, filename string, disposition string, expires time.Duration) (string, error) {
 	cosConfig := sc.ctx.GetConfig().COS
-	client, err := sc.newPublicClient()
+
+	// Pick signing client based on BucketURL shape.
+	_, _, lookup := sc.publicEndpoint()
+	var client *minio.Client
+	var err error
+	if lookup == minio.BucketLookupPath {
+		// CDN alias: sign against canonical COS endpoint (DNS-style).
+		client, err = sc.newCanonicalPresignClient()
+	} else {
+		// Bucket-subdomain or empty: sign against the public endpoint.
+		client, err = sc.newPublicClient()
+	}
 	if err != nil {
 		return "", err
 	}

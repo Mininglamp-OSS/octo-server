@@ -2,13 +2,13 @@ package user
 
 import (
 	"context"
-	"os"
-	"runtime/debug"
 	"fmt"
 	"hash/crc32"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -16,6 +16,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/network"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	common "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
@@ -82,6 +83,19 @@ func (u *User) githubOAuth(c *wkhttp.Context) {
 		publicIP := util.GetClientPublicIP(c.Request)
 		go u.sentWelcomeMsg(publicIP, userInfoM.UID)
 	} else {
+		if common.EnsureSystemSettings(u.ctx).RegisterOff() {
+			// 必须先把 authcode 标记为登录失败再返回,详见 api_gitee.go 同位
+			// 注释:thirdAuthcode 起手把 Redis 写成 "1",前端轮询靠下面的
+			// SetAndExpire 推进。直接 return 会让 /thirdlogin/authstatus 一直
+			// 拿到"等待中"直到 5min TTL 过期。
+			if redisErr := u.ctx.GetRedisConn().SetAndExpire(
+				fmt.Sprintf("%s%s", ThirdAuthcodePrefix, authcode), "0", time.Minute*1,
+			); redisErr != nil {
+				u.Error("write authcode failure marker after RegisterOff", zap.Error(redisErr))
+			}
+			c.ResponseError(errors.New("注册通道暂不开放"))
+			return
+		}
 		// 创建用户
 		uid := util.GenerUUID()
 		name := userInfo.Name

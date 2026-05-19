@@ -1180,7 +1180,11 @@ func (m *Message) search(c *wkhttp.Context) {
 		spaceID = c.GetHeader("X-Space-ID")
 	}
 
-	resp, err := network.Post(fmt.Sprintf("%s/message/search", m.ctx.GetConfig().WuKongIM.APIURL), []byte(util.ToJson(req)), nil)
+	headers := map[string]string{"Content-Type": "application/json"}
+	if mt := m.ctx.GetConfig().WuKongIM.ManagerToken; mt != "" {
+		headers["token"] = mt
+	}
+	resp, err := network.Post(fmt.Sprintf("%s/message/search", m.ctx.GetConfig().WuKongIM.APIURL), []byte(util.ToJson(req)), headers)
 	if err != nil {
 		m.Error("调用搜索失败！", zap.Error(err))
 		c.ResponseError(errors.New("调用搜索失败！"))

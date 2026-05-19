@@ -12,6 +12,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	convext "github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -228,6 +229,106 @@ func TestCategory_Delete(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotNil(t, setting)
 	assert.Nil(t, setting.CategoryID) // category_id should be nil after delete
+
+	// 删除分组应同时取消关注分组下的群（退订语义，前端已提示用户）。
+	// 该 ext 行在 delete 之前并不存在——moveGroupToCategory 不会预先 seed
+	// user_conversation_ext，而是 delete 中 UnfollowGroupsTx 的 upsert 写出来的。
+	// 若将来改成"不再为仅退订的群创建 ext 行"（例如改成软标记），需同步调整这条断言。
+	var groupUnfollowed int
+	_, err = f.db.session.SelectBySql(
+		"SELECT group_unfollowed FROM user_conversation_ext"+
+			" WHERE uid=? AND space_id=? AND target_type=2 AND target_id=?",
+		testutil.UID, spaceID, groupNo,
+	).Load(&groupUnfollowed)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, groupUnfollowed)
+}
+
+// TestCategory_DeleteUnfollowsContents 验证删除分组时同步取消关注分组下的
+// 群（含 thread 级联）与 DM —— 前端提示「分组下的所有会话将取消关注」对应
+// 的服务端行为。
+func TestCategory_DeleteUnfollowsContents(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	spaceID := "space-delete-cascade"
+	seedSpaceAndMember(t, f, spaceID, 0)
+	route := s.GetRoute()
+
+	// 1. 建一个分组，挂一个群进去
+	wc := createCategory(t, route, spaceID, "待退订")
+	assert.Equal(t, http.StatusOK, wc.Code)
+	catID := parseJSON(t, wc)["category_id"].(string)
+
+	groupNo := "group-cascade-001"
+	seedGroup(t, f, groupNo, spaceID)
+	wm := doRequest(t, route, "PUT", "/v1/groups/"+groupNo+"/category", map[string]string{
+		"category_id": catID,
+	})
+	assert.Equal(t, http.StatusOK, wm.Code)
+
+	// 2. 直接在 user_conversation_ext 里塞一行该群的 thread ext，
+	// 以及一行 dm_category_id 指向当前分组的 DM ext。
+	threadID := groupNo + "____abc12345"
+	_, err = f.db.session.InsertBySql(
+		"INSERT INTO user_conversation_ext (uid, space_id, target_type, target_id) VALUES (?, ?, 5, ?)",
+		testutil.UID, spaceID, threadID,
+	).Exec()
+	assert.NoError(t, err)
+
+	dmPeer := "peer-cascade-001"
+	_, err = f.db.session.InsertBySql(
+		"INSERT INTO user_conversation_ext (uid, space_id, target_type, target_id, followed_dm, dm_category_id) VALUES (?, ?, 1, ?, 1, ?)",
+		testutil.UID, spaceID, dmPeer, catID,
+	).Exec()
+	assert.NoError(t, err)
+
+	// 记录删除前的 follow_version 以验证 bump。
+	versionDB := convext.NewFollowVersionDB(ctx)
+	beforeVer, err := versionDB.Get(testutil.UID, spaceID)
+	assert.NoError(t, err)
+
+	// 3. 删除分组
+	wd := doRequest(t, route, "DELETE", "/v1/spaces/"+spaceID+"/categories/"+catID, nil)
+	assert.Equal(t, http.StatusOK, wd.Code)
+
+	// 4a. 群取消关注：group_unfollowed=1
+	var groupUnfollowed int
+	_, err = f.db.session.SelectBySql(
+		"SELECT group_unfollowed FROM user_conversation_ext"+
+			" WHERE uid=? AND space_id=? AND target_type=2 AND target_id=?",
+		testutil.UID, spaceID, groupNo,
+	).Load(&groupUnfollowed)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, groupUnfollowed)
+
+	// 4b. thread ext 行被级联删除
+	var threadCount int
+	_, err = f.db.session.SelectBySql(
+		"SELECT COUNT(*) FROM user_conversation_ext"+
+			" WHERE uid=? AND space_id=? AND target_type=5 AND target_id=?",
+		testutil.UID, spaceID, threadID,
+	).Load(&threadCount)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, threadCount)
+
+	// 4c. DM ext 行被删除
+	var dmCount int
+	_, err = f.db.session.SelectBySql(
+		"SELECT COUNT(*) FROM user_conversation_ext"+
+			" WHERE uid=? AND space_id=? AND target_type=1 AND target_id=?",
+		testutil.UID, spaceID, dmPeer,
+	).Load(&dmCount)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, dmCount)
+
+	// 4d. follow_version 至少 +1，让客户端能感知到关注集合变化
+	afterVer, err := versionDB.Get(testutil.UID, spaceID)
+	assert.NoError(t, err)
+	assert.Greater(t, afterVer, beforeVer)
 }
 
 func TestCategory_Sort(t *testing.T) {

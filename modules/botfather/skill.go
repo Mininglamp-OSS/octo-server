@@ -5,20 +5,21 @@ import "fmt"
 
 func generateSkillMD(apiURL, wsURL string) string {
 	return fmt.Sprintf(`---
-name: dmwork
+name: octo
 version: latest
-description: DMWork Bot - AI Agent messaging via WuKongIM
-metadata: {"dmwork":{"category":"messaging","api_base":"%s"}}
+description: Octo Bot - AI Agent messaging via WuKongIM
+metadata: {"octo":{"category":"messaging","api_base":"%s"}}
 ---
 
-# DMWork Bot Skill
+# Octo Bot Skill
 
-Connect an AI Agent to DMWork messaging platform with full real-time capabilities.
+Connect an AI Agent to Octo messaging platform with full real-time capabilities.
 
 ### Save Locally (Recommended)
 
 `+"```"+`bash
-curl -s %s/v1/bot/skill.md > ~/.openclaw/skills/dmwork/SKILL.md
+mkdir -p ~/.openclaw/skills/octo
+curl -s %s/v1/bot/skill.md > ~/.openclaw/skills/octo/SKILL.md
 `+"```"+`
 
 ## Step 1: Register
@@ -46,8 +47,8 @@ Response:
 ### Save Credentials
 
 `+"```"+`bash
-mkdir -p ~/.config/dmwork
-cat > ~/.config/dmwork/credentials.json << EOF
+mkdir -p ~/.config/octo
+cat > ~/.config/octo/credentials.json << EOF
 {
   "botToken": "YOUR_BOT_TOKEN",
   "robotId": "xxx_bot",
@@ -57,7 +58,7 @@ cat > ~/.config/dmwork/credentials.json << EOF
   "ownerUid": "10001"
 }
 EOF
-chmod 600 ~/.config/dmwork/credentials.json
+chmod 600 ~/.config/octo/credentials.json
 `+"```"+`
 
 After registering, send a greeting to your owner (DM to owner_uid) to confirm you are online.
@@ -70,17 +71,17 @@ Install the pre-built adapter for instant message delivery, real-time online sta
 
 **Install plugin:**
 `+"```"+`bash
-npx -y openclaw-channel-dmwork install
+npx -y openclaw-channel-octo install
 `+"```"+`
 
 **Single bot — bind to agent:**
 `+"```"+`bash
-npx -y openclaw-channel-dmwork bind --bot-token <bot_token> --api-url <apiUrl> --account-id <robot_id> --agent <agent_id>
+npx -y openclaw-channel-octo bind --bot-token <bot_token> --api-url <apiUrl> --account-id <robot_id> --agent <agent_id>
 `+"```"+`
 
 **All agents — one-click setup (get key from BotFather /quickstart):**
 `+"```"+`bash
-npx -y openclaw-channel-dmwork quickstart --api-key <api_key> --api-url <apiUrl>
+npx -y openclaw-channel-octo quickstart --api-key <api_key> --api-url <apiUrl>
 `+"```"+`
 
 The CLI automatically writes `+"`"+`~/.openclaw/openclaw.json`+"`"+` config and agent bindings. No manual config editing needed.
@@ -90,7 +91,7 @@ Multi-account config example (written by CLI, shown for reference):
 `+"```"+`json
 {
   "channels": {
-    "dmwork": {
+    "octo": {
       "apiUrl": "%s",
       "accounts": {
         "27ba6or9NU_bot": { "botToken": "TOKEN_A", "name": "Bot A" },
@@ -110,7 +111,7 @@ Example: an owner creates bot-translator, bot-coder, and bot-assistant — each 
 `+"```"+`json
 {
   "channels": {
-    "dmwork": {
+    "octo": {
       "apiUrl": "%s",
       "accounts": {
         "bot-translator": {
@@ -134,7 +135,7 @@ Example: an owner creates bot-translator, bot-coder, and bot-assistant — each 
 }
 `+"```"+`
 
-v0.2.30+ supports full multi-bot isolation: each bot maintains an independent WebSocket connection with no message cross-processing between bots.
+Octo plugin supports full multi-bot isolation: each bot maintains an independent WebSocket connection with no message cross-processing between bots.
 
 #### ⚠️ Important: Session Isolation
 
@@ -158,7 +159,7 @@ Features:
 - Auto-reconnect on disconnection
 - Full OpenClaw plugin integration
 
-Source & docs: https://www.npmjs.com/package/openclaw-channel-dmwork
+Source & docs: https://www.npmjs.com/package/openclaw-channel-octo
 
 ## Step 3: Send Messages
 
@@ -809,7 +810,7 @@ If a user quotes/replies to a message and @mentions you, you will see the quoted
 
 This lets you understand context when someone asks about a specific message.
 
-**To reply to every message:** set requireMention to false in your dmwork channel config (channels.dmwork.requireMention = false). This costs more tokens but lets the AI decide when to reply.
+**To reply to every message:** set requireMention to false in your octo channel config (channels.octo.requireMention = false). This costs more tokens but lets the AI decide when to reply.
 
 ### Rule 2: Don't respond to other bots
 
@@ -842,10 +843,10 @@ Save detailed explanations for DM conversations.
 | Bot shows "offline" | Heartbeat stopped | Send POST /v1/bot/heartbeat every 30s |
 | No messages received | WS not connected | Check wsUrl and bot token; adapter auto-reconnects |
 | WS connection drops | Network issue | SDK auto-reconnects; verify wsUrl |
-| Duplicate replies | Multiple bot instances or pre-v0.2.30 plugin | Upgrade to openclaw-channel-dmwork >= 0.2.30 (independent WebSocket per bot). Ensure only one instance per bot_token. |
+| Duplicate replies | Multiple bot instances on same bot_token | Ensure only one instance per bot_token (each bot has an independent WebSocket connection). |
 | 401 on API calls | Token expired/invalid | Re-register with POST /v1/bot/register |
 | Slow AI responses | High concurrency | Implement response queue, consider caching |
-| Bot-to-bot message loop | Bots replying to each other | v0.2.30+ auto-filters known bot UIDs. Ensure all bots run on same OpenClaw instance. |
+| Bot-to-bot message loop | Bots replying to each other | Octo plugin auto-filters known bot UIDs. Ensure all bots run on same OpenClaw instance. |
 | Messages out of order | Async processing | Use message_seq for ordering |
 
 ## GROUP.md Management
@@ -946,9 +947,9 @@ Each API Key is bound to a specific Space. When you run /quickstart in a Space, 
 ### Quickstart Flow
 
 1. Get your User API Key from BotFather `+"`"+`/quickstart`+"`"+` command (key is bound to your current Space)
-2. Run `+"`"+`npx -y openclaw-channel-dmwork quickstart --api-key <key> --api-url <apiUrl>`+"`"+`
+2. Run `+"`"+`npx -y openclaw-channel-octo quickstart --api-key <key> --api-url <apiUrl>`+"`"+`
 3. The CLI automatically creates bots for all agents, writes config, and sends greetings
-4. Verify by sending a message to the bot in DMWork
+4. Verify by sending a message to the bot in Octo
 
 ### Endpoints
 
@@ -1009,16 +1010,16 @@ curl -X DELETE %s/v1/user/bots/mybot_bot \
 
 func generateCLIGuideMD() string {
 	return `---
-name: dmwork-setup-install
-description: DMWork 插件安装和更新指南
+name: octo-setup-install
+description: Octo 插件安装和更新指南
 ---
 
-# DMWork 插件安装/更新
+# Octo 插件安装/更新
 
 ## 安装或更新插件
 
 ` + "```" + `
-npx -y openclaw-channel-dmwork install
+npx -y openclaw-channel-octo install
 ` + "```" + `
 
 - 未安装 → 自动安装最新版
@@ -1031,40 +1032,40 @@ npx -y openclaw-channel-dmwork install
 
 **单个 bot（/newbot 创建后）：**
 ` + "```" + `
-npx -y openclaw-channel-dmwork bind --bot-token <token> --api-url <url> --account-id <id> --agent <agent标识>
+npx -y openclaw-channel-octo bind --bot-token <token> --api-url <url> --account-id <id> --agent <agent标识>
 ` + "```" + `
 
 **批量创建（/quickstart）：**
 ` + "```" + `
-npx -y openclaw-channel-dmwork quickstart --api-key <uk_key> --api-url <url>
+npx -y openclaw-channel-octo quickstart --api-key <uk_key> --api-url <url>
 ` + "```" + `
 
 ## 其他命令
 
 | 命令 | 用途 |
 |------|------|
-| ` + "`npx -y openclaw-channel-dmwork install`" + ` | 安装或更新插件 |
-| ` + "`npx -y openclaw-channel-dmwork bind`" + ` | 配置单个 bot 并绑定 agent |
-| ` + "`npx -y openclaw-channel-dmwork quickstart`" + ` | 批量创建 bot 并绑定所有 agent |
-| ` + "`npx -y openclaw-channel-dmwork doctor`" + ` | 诊断健康状态 |
-| ` + "`npx -y openclaw-channel-dmwork doctor --fix`" + ` | 自动修复问题 |
-| ` + "`npx -y openclaw-channel-dmwork info`" + ` | 显示版本信息 |
-| ` + "`npx -y openclaw-channel-dmwork uninstall`" + ` | 卸载插件 |
+| ` + "`npx -y openclaw-channel-octo install`" + ` | 安装或更新插件 |
+| ` + "`npx -y openclaw-channel-octo bind`" + ` | 配置单个 bot 并绑定 agent |
+| ` + "`npx -y openclaw-channel-octo quickstart`" + ` | 批量创建 bot 并绑定所有 agent |
+| ` + "`npx -y openclaw-channel-octo doctor`" + ` | 诊断健康状态 |
+| ` + "`npx -y openclaw-channel-octo doctor --fix`" + ` | 自动修复问题 |
+| ` + "`npx -y openclaw-channel-octo info`" + ` | 显示版本信息 |
+| ` + "`npx -y openclaw-channel-octo uninstall`" + ` | 卸载插件 |
 `
 }
 
 func generateSetupNewbotMD(apiURL string) string {
 	return fmt.Sprintf(`---
-name: dmwork-setup-newbot
+name: octo-setup-newbot
 description: 收到 BotFather /newbot 创建的 bot 信息后，执行 bind 命令完成配置和绑定。
 ---
 
-# DMWork Newbot 绑定流程
+# Octo Newbot 绑定流程
 
 收到 BotFather 的 bot 信息后（Bot Token、API Server、Account ID），执行以下命令：
 
 `+"```"+`
-npx -y openclaw-channel-dmwork bind --bot-token <Bot Token> --api-url <API Server> --account-id <Account ID> --agent <agent标识>
+npx -y openclaw-channel-octo bind --bot-token <Bot Token> --api-url <API Server> --account-id <Account ID> --agent <agent标识>
 `+"```"+`
 
 默认绑定到当前 Session 的 Agent，agent 标识通过 /status 查看。
@@ -1072,9 +1073,9 @@ npx -y openclaw-channel-dmwork bind --bot-token <Bot Token> --api-url <API Serve
 
 ## 前提条件
 
-DMWork 插件必须已安装。未安装请先执行：
+Octo 插件必须已安装。未安装请先执行：
 `+"```"+`
-npx -y openclaw-channel-dmwork install
+npx -y openclaw-channel-octo install
 `+"```"+`
 
 ## bind 命令会做什么
@@ -1083,12 +1084,12 @@ npx -y openclaw-channel-dmwork install
 2. 写入 bot 配置到 openclaw.json
 3. 设置会话隔离（session.dmScope）
 4. 添加 agent → bot 绑定
-5. 等待 DMWork channel 热重载
+5. 等待 Octo channel 热重载
 6. 给 bot 创建者发上线通知
 
 不需要手动重启 gateway。
 
-完成后请在 DMWork 中给 bot 发一条消息验证联通。
+完成后请在 Octo 中给 bot 发一条消息验证联通。
 
 ## Bot API 文档
 
@@ -1098,40 +1099,40 @@ npx -y openclaw-channel-dmwork install
 
 func generateSetupQuickstartMD(apiURL string) string {
 	return fmt.Sprintf(`---
-name: dmwork-setup-quickstart
+name: octo-setup-quickstart
 description: 收到 BotFather /quickstart 的 API Key 后，执行 quickstart 命令为所有 agent 批量创建并绑定 bot。
 ---
 
-# DMWork Quickstart 流程
+# Octo Quickstart 流程
 
 收到 BotFather 的 User API Key 和 API Server 后，执行以下命令：
 
 `+"```"+`
-npx -y openclaw-channel-dmwork quickstart --api-key <User API Key> --api-url <API Server>
+npx -y openclaw-channel-octo quickstart --api-key <User API Key> --api-url <API Server>
 `+"```"+`
 
 ## 前提条件
 
-DMWork 插件必须已安装。未安装请先执行：
+Octo 插件必须已安装。未安装请先执行：
 `+"```"+`
-npx -y openclaw-channel-dmwork install
+npx -y openclaw-channel-octo install
 `+"```"+`
 
 ## quickstart 命令会做什么
 
 1. 检查插件是否已安装（未装则报错）
 2. 获取 OpenClaw 的所有 agent 列表
-3. 为每个 agent 创建一个 DMWork bot
+3. 为每个 agent 创建一个 Octo bot
 4. 一次性写入所有 bot 配置和绑定
 5. 设置会话隔离（session.dmScope）
-6. 等待 DMWork channel 热重载
+6. 等待 Octo channel 热重载
 7. 给 bot 创建者发上线通知
 8. 输出结果清单
 
 不需要手动重启 gateway。
-quickstart 是一次性初始化工具，面向首次接入 DMWork 的用户。
+quickstart 是一次性初始化工具，面向首次接入 Octo 的用户。
 
-完成后请在 DMWork 中给 bot 发一条消息验证联通。
+完成后请在 Octo 中给 bot 发一条消息验证联通。
 
 ## Bot API 文档
 

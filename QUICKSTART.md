@@ -1,85 +1,117 @@
 # QUICKSTART — OCTO Server
 
-Run a full OCTO stack (server + WuKongIM + MySQL + Redis + MinIO) in
-~5 minutes with Docker Compose.
+`octo-server` is the Go backend at the centre of OCTO. There are two
+recommended ways to get a running instance:
 
-## Prerequisites
+1. **One-shot Docker Compose stack** (server + admin + web + matter +
+   smart-summary + WuKongIM + MySQL + Redis + MinIO + nginx, all wired
+   up): use the official OOTB deployment at
+   [`Mininglamp-OSS/octo-deployment`](https://github.com/Mininglamp-OSS/octo-deployment).
+   That repository is the single source of truth for OOTB deployment.
+2. **Local Go build against your own infra**: clone this repo, build
+   the binary, and point it at a WuKongIM + MySQL you already run.
 
-- Docker Engine 20+
-- Docker Compose v2 (`docker compose`, not `docker-compose`)
-- ~2 GB free RAM
-- Ports 82, 8090, 5100, 5200, 9000 available
+The first option is the right one if you "just want to try OCTO". The
+second is for backend developers iterating on `octo-server` itself.
 
-## 1. Clone
+---
+
+## Option 1 — One-shot Docker Compose (recommended for trial)
+
+Follow the walkthrough in
+[`Mininglamp-OSS/octo-deployment`](https://github.com/Mininglamp-OSS/octo-deployment):
+
+```bash
+git clone https://github.com/Mininglamp-OSS/octo-deployment.git
+cd octo-deployment
+./setup.sh                               # interactive, generates docker/.env
+cd docker
+docker compose up -d
+docker compose ps                        # all services should reach (healthy)
+```
+
+The stack listens on `http://${OCTO_DOMAIN}:${OCTO_HTTP_PORT}`
+(default `http://octo.local:28080`). See
+[`docker/README.md` in octo-deployment](https://github.com/Mininglamp-OSS/octo-deployment/blob/main/docker/README.md)
+for the prerequisites checklist, the pre-flight warning when another
+OCTO stack already runs on the same host, and the full environment-
+variable contract.
+
+> The `docker/octo/` and `docker/tsdd/` compose stacks that used to
+> live inside this repository have been **removed**. They duplicated a
+> subset of `octo-deployment` while drifting behind it (no preflight,
+> no minio-init secret rotation, no rate-limited nginx vhost, no
+> matter/summary services), and keeping two on-disk copies meant fixes
+> only landed in one of them. `octo-deployment` is now the single
+> source of truth for OOTB deployment.
+
+---
+
+## Option 2 — Local Go build against your own infra
+
+### Prerequisites
+
+- Go ≥ 1.25 (see `go.mod`)
+- A reachable WuKongIM ≥ v2 instance
+- A reachable MySQL 8 with the schema applied
+- A reachable Redis 7
+- (Optional) An S3-compatible object store for the file modules
+
+### Build
 
 ```bash
 git clone https://github.com/Mininglamp-OSS/octo-server.git
-cd octo-server/docker/tsdd
+cd octo-server
+go build -o octo-server .
 ```
 
-## 2. Prepare environment
+`go build ./...` only compiles & checks every package; it does not
+write any binaries (Go discards the object when more than one
+package is built). To get a runnable `./octo-server`, build the root
+main package explicitly with `-o octo-server .` as shown above.
+
+If `go build` fails with "missing go.sum entry" against a sibling OCTO
+module, see [`BUILDING.md`](./BUILDING.md) for the cross-repo `replace`
+workaround.
+
+### Configure
+
+Copy the bundled template under `configs/` (e.g. `configs/tsdd.yaml`)
+to your own path and point each section at your live infra:
+
+- `db.mysqlAddr` — your MySQL DSN
+- `db.redisAddr` — your Redis address
+- `wukongIM.apiURL` and `wukongIM.managerToken` — your WuKongIM control
+  plane (the YAML key is `apiURL`, not `url`; see `configs/tsdd.yaml`)
+- `minio.*` (or whichever object-storage adapter you use) — your S3
+  endpoint, app credentials, and bucket layout
+
+### Run
+
+`octo-server` parses the `--config` flag with the stdlib `flag`
+package, then dispatches on the first non-flag argument (`api` /
+`config` / unset → API server). `flag.Parse()` stops at the first
+positional, so `--config` must come **before** the subcommand:
 
 ```bash
-cp .env.example .env
+# default config (configs/tsdd.yaml relative to working dir)
+./octo-server api
+
+# explicit config — note the flag goes before the subcommand
+./octo-server --config /path/to/tsdd.yaml api
 ```
 
-Edit `.env` and set real values. **Important**: the same MySQL password
-must also be set in `configs/tsdd.yaml` under `db.mysqlAddr` — they are
-not auto-synced.
-
-Set `MYSQL_ROOT_PASSWORD` to your chosen password, then also update
-the `root:<password>` portion in `configs/tsdd.yaml`.
-
-Generate `OCTO_MASTER_KEY` (32 hex chars; encrypts bot private keys at rest):
-```bash
-echo "OCTO_MASTER_KEY=$(openssl rand -hex 16)" >> .env
-```
-
-Generate a secure WuKongIM manager token
-```
-
-Generate a WuKongIM manager token:
-```bash
-openssl rand -hex 16   # paste result into configs/tsdd.yaml wukongIM.managerToken
-```
-
-## 3. Build octo-server image
+Smoke check:
 
 ```bash
-cd ../..
-docker build -t octo-server:local -f Dockerfile .
-cd docker/tsdd
+curl http://localhost:8090/v1/ping        # {"status":"ok"} on success
 ```
 
-## 4. (Optional) Build octo-web image
+### Register your first user
 
-Clone and build [octo-web](https://github.com/Mininglamp-OSS/octo-web):
-```bash
-git clone https://github.com/Mininglamp-OSS/octo-web.git /tmp/octo-web
-cd /tmp/octo-web
-docker build -t octo-web:local .
-cd -
-```
-
-If you skip this step, comment out the `tangsengdaodaoweb` service
-in `docker-compose.yaml`.
-
-## 5. Start the stack
-
-```bash
-docker compose up -d
-```
-
-Wait ~30s for services to initialize. Check health:
-```bash
-docker compose ps
-curl http://localhost:8090/v1/ping
-```
-
-## 6. Register your first user
-
-Open http://localhost:82 in your browser (requires octo-web).
-Alternatively, use the API directly:
+Open the OCTO web SPA in your browser (the OOTB stack mounts it at
+`/`; with a custom deploy, point it at whatever URL fronts the web
+container). Or call the REST API directly:
 
 ```bash
 curl -X POST http://localhost:8090/v1/user/register \
@@ -87,9 +119,10 @@ curl -X POST http://localhost:8090/v1/user/register \
   -d '{"phone":"+8613800000000","password":"test1234","name":"Admin"}'
 ```
 
-## 7. Connect an AI Agent
+### Connect an AI Agent
 
 Install the daemon CLI:
+
 ```bash
 go install github.com/Mininglamp-OSS/octo-daemon-cli@latest
 ```
@@ -98,30 +131,23 @@ In OCTO, send `/daemon` to BotFather to receive your start command.
 
 ## Troubleshooting
 
-- **Port conflicts**: Edit the `ports:` block in `docker-compose.yaml`.
-- **WuKongIM unhealthy**: Check `configs/wk.yaml` and `logs/wk/`.
+- **Port conflicts** in the OOTB stack: override `OCTO_HTTP_PORT`,
+  `OCTO_WEB_PORT`, etc. in `docker/.env` (see the
+  `octo-deployment` README for the full list).
+- **WuKongIM unhealthy**: confirm `wk.yaml`'s `tokenAuthOn` /
+  `managerToken` match `octo-server`'s `wukongIM.managerToken` —
+  drift between the two is the most common cause.
 - **Go build fails with "missing go.sum entry for octo-lib"**:
-  See [BUILDING.md](./BUILDING.md) for the cross-repo `replace` workaround.
+  See [BUILDING.md](./BUILDING.md) for the cross-repo `replace`
+  workaround.
 
-## How initial schema works
-
-The MySQL container auto-loads `docker/tsdd/init/00-init-schema.sql` on
-first startup via Docker's standard `/docker-entrypoint-initdb.d/` hook.
-This seeds both the table schema and the `gorp_migrations` history, so
-octo-server's built-in migration engine sees a fully-initialized
-database and skips all historical migrations.
-
-When you upgrade octo-server later, only truly-new migrations run.
-
-To regenerate this snapshot from your production schema:
-```bash
-scripts/refresh-init-schema.sh  # (maintainers only)
-```
-
-## Stop & reset
+## Stop & reset (OOTB stack)
 
 ```bash
-docker compose down            # stop containers, keep data
-docker compose down -v         # stop + delete all volumes (DESTRUCTIVE)
+# ⚠ Pre-flight: read the matching section in
+#   https://github.com/Mininglamp-OSS/octo-deployment/blob/main/docker/README.md
+#   before any down -v on a host that may also run another OCTO stack.
+cd /path/to/octo-deployment/docker
+docker compose down                       # stop containers, keep data
+docker compose down -v                    # stop + delete volumes (DESTRUCTIVE)
 ```
-

@@ -312,7 +312,7 @@ func (bf *BotFather) initBotFatherUser() {
 // registerBotFatherCommands 注册BotFather自身的命令列表
 func (bf *BotFather) registerBotFatherCommands() {
 	commands := []map[string]string{
-		{"command": CmdInstall, "description": "安装/更新 DMWork 插件"},
+		{"command": CmdInstall, "description": "安装/更新 Octo 插件"},
 		{"command": CmdQuickstart, "description": "AI Agent 快速入门"},
 		{"command": CmdNewBot, "description": "创建新机器人"},
 		{"command": CmdMyBots, "description": "查看我的机器人"},
