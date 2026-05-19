@@ -400,6 +400,7 @@ func TestIntegration_ExtWrites_DoNotAffectOtherConversationTables(t *testing.T) 
 	// Perform ext writes: follow a DM and unfollow a channel.
 	const uid, space = "int-reg-u1", "sp-reg"
 	catID := "cat-uuid-99"
+	seedTestCategory(t, svc, uid, space, catID)
 	require.NoError(t, svc.FollowDM(uid, space, "int-reg-peer1", &catID))
 	require.NoError(t, svc.UnfollowChannel(uid, space, "int-reg-grp1"))
 	require.NoError(t, svc.FollowThread(uid, space, "int-reg-grp1____thr-r1"))
@@ -434,6 +435,7 @@ func TestIntegration_ListQueries_SpaceAndUserIsolation(t *testing.T) {
 	// uid1 in space A: follows DM and unfollows a group.
 	const uid1, spaceA = "int-iso-u1", "iso-spA"
 	catID := "cat-uuid-iso"
+	seedTestCategory(t, svc, uid1, spaceA, catID)
 	require.NoError(t, svc.FollowDM(uid1, spaceA, "iso-peer1", &catID))
 	require.NoError(t, svc.UnfollowChannel(uid1, spaceA, "iso-grp1"))
 

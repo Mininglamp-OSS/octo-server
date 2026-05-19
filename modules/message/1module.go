@@ -2,14 +2,12 @@ package message
 
 import (
 	"embed"
-	"errors"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/register"
 	convext "github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
-	"github.com/gocraft/dbr/v2"
 )
 
 //go:embed sql
@@ -57,21 +55,21 @@ func init() {
 		}
 	})
 
-	// PR review (Round 3) Blocking #3 — wire ThreadAuthChecker + DMCategoryChecker.
+	// PR review (Round 3) Blocking #3 — wire ThreadAuthChecker.
 	// message module is the natural composition point because it already
 	// imports group + thread + conversation_ext for the sidebar handler.
-	// We register the checkers on the conversation_ext singleton so that
-	// modules/conversation_ext stays free of group/thread/category imports (no cycle).
+	// We register the checker on the conversation_ext singleton so that
+	// modules/conversation_ext stays free of group/thread imports (no cycle).
 	//
-	// PR #21 Round-6 (Jerry-Xin)：新增 DMCategoryChecker，校验 FollowDM 的
-	// categoryID 属于当前 uid 且 status != 2（group_category 表）。
+	// （历史 DMCategoryChecker 注入 issue #75 / PR #79 fix 之后已移除——FollowDM
+	// 鉴权改为 conversation_ext 自己的事务内 SELECT ... FOR UPDATE，不再需要
+	// 从 message 模块注入 checker。）
 	register.AddModule(func(ctx interface{}) register.Module {
 		appCtx := ctx.(*config.Context)
 		convext.InitGlobalConvExtService(appCtx)
 		svc := convext.GetGlobalConvExtService()
 		if svc != nil {
 			svc.SetThreadAuthChecker(newThreadAuthChecker(appCtx))
-			svc.SetDMCategoryChecker(newDMCategoryChecker(appCtx))
 		}
 		return register.Module{Name: "conversation_ext_thread_auth"}
 	})
@@ -172,49 +170,4 @@ func (c *threadAuthChecker) AuthorizeThreadFollow(uid, spaceID, groupNo, shortID
 		}
 	}
 	return convext.ErrThreadForbidden
-}
-
-// dmCategoryChecker 实现 convext.DMCategoryChecker：校验 FollowDM 传入的
-// categoryID 必须存在于 group_category 表、归属当前 uid、status != 2。
-// PR #21 Round-6 (Jerry-Xin)：DM 与群共用 group_category 命名空间（原型 image-v1.png），
-// 服务端必须校验 categoryID 真实性，否则客户端可写任意 UUID 让 sidebar 引用不存在的分类。
-type dmCategoryChecker struct {
-	ctx *config.Context
-}
-
-func newDMCategoryChecker(ctx *config.Context) *dmCategoryChecker {
-	return &dmCategoryChecker{ctx: ctx}
-}
-
-// AuthorizeDMCategory 实现 convext.DMCategoryChecker.
-//
-// 校验规则（group_category 表）：
-//   - category_id 存在；
-//   - gc.uid == 请求 uid（不能引用别人的分类）；
-//   - gc.space_id == 请求 spaceID（分类是 per-Space 资源）；
-//   - gc.status != 2（未被软删除）。
-//
-// 任一不满足返回 convext.ErrDMCategoryForbidden；DB 错误透传。
-func (c *dmCategoryChecker) AuthorizeDMCategory(uid, spaceID, categoryID string) error {
-	type row struct {
-		UID     string `db:"uid"`
-		SpaceID string `db:"space_id"`
-		Status  int    `db:"status"`
-	}
-	var r row
-	err := c.ctx.DB().SelectBySql(
-		"SELECT uid, space_id, status FROM group_category WHERE category_id=?",
-		categoryID,
-	).LoadOne(&r)
-	if err != nil {
-		// dbr.ErrNotFound 也算 forbidden（不存在的 category 与无权访问语义等价）。
-		if errors.Is(err, dbr.ErrNotFound) {
-			return convext.ErrDMCategoryForbidden
-		}
-		return err
-	}
-	if r.UID != uid || r.SpaceID != spaceID || r.Status == 2 {
-		return convext.ErrDMCategoryForbidden
-	}
-	return nil
 }

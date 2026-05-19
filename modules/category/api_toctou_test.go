@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -20,7 +19,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/server"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	convext "github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
-	"github.com/gocraft/dbr/v2"
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -38,10 +37,20 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+// toctouDefaultDB is the isolated MySQL database this test file owns. We
+// don't reuse the project-wide `test` database because testutil.NewTestServer
+// hardcodes that name and the TOCTOU helper drops all tables to recover
+// from leftover stub schemas — running the helper against the shared `test`
+// DB would race destructively with any other package's tests under
+// `go test ./...` (which runs package binaries concurrently).
+const toctouDefaultDB = "octo_toctou_test"
+
 // newToctouTestServer mirrors testutil.NewTestServer but reads the MySQL DSN
 // from OCTO_TEST_MYSQL_ADDR so local podman / docker setups with different
 // credentials can run these tests without patching the testutil hardcoded
-// DSN. Default matches CI's mysql:8 service (root:demo@127.0.0.1/test).
+// DSN. Default uses an isolated DB name (toctouDefaultDB) which the helper
+// CREATEs lazily if missing, so CI's mysql:8 service doesn't need any
+// MYSQL_DATABASE config beyond what the existing Test job already gives us.
 //
 // Returns the test server, context, and a fresh *Category bound to ctx so
 // callers can poke its db helpers (seedSpace, seedGroup) in the same way the
@@ -50,20 +59,21 @@ func newToctouTestServer(t *testing.T) (*server.Server, *config.Context, *Catego
 	t.Helper()
 	addr := os.Getenv("OCTO_TEST_MYSQL_ADDR")
 	if addr == "" {
-		addr = "root:demo@tcp(127.0.0.1)/test?charset=utf8mb4&parseTime=true"
+		addr = "root:demo@tcp(127.0.0.1)/" + toctouDefaultDB + "?charset=utf8mb4&parseTime=true"
 	}
+	ensureToctouDB(t, addr)
+
 	cfg := config.New()
 	cfg.Test = true
 	cfg.DB.MySQLAddr = addr
 	cfg.DB.Migration = false
 	ctx := config.NewContext(cfg)
 
-	// Drop all existing tables (including gorp_migrations) so a fresh
-	// module.Setup re-creates everything from scratch. We can't use DELETE
-	// FROM here because sibling test packages (e.g. modules/conversation_ext)
-	// run their own minimal schema stubs against the same `test` DB; if a
-	// prior test left a stub `group_category` behind, the category module's
-	// CREATE TABLE migration would fail with 1050 (table already exists).
+	// Drop all tables in OUR isolated DB (including gorp_migrations) so
+	// module.Setup re-creates the schema from scratch every test. Safe
+	// because `(SELECT DATABASE())` resolves to whichever DB the helper
+	// connected to, and the default is the isolated one — never the shared
+	// `test` DB the rest of the project uses.
 	var dropSqls []string
 	_, err := ctx.DB().SelectBySql(
 		"SELECT CONCAT('DROP TABLE IF EXISTS ','`', table_name,'`') FROM information_schema.tables WHERE table_schema = (SELECT DATABASE())",
@@ -82,6 +92,28 @@ func newToctouTestServer(t *testing.T) (*server.Server, *config.Context, *Catego
 	require.NoError(t, module.Setup(ctx), "module setup")
 
 	return s, ctx, New(ctx)
+}
+
+// ensureToctouDB parses the DSN, opens a connection WITHOUT a DB name, and
+// runs CREATE DATABASE IF NOT EXISTS for the target DB. This lets a fresh
+// MySQL (e.g. CI's mysql:8 service container, or a freshly-restarted local
+// podman container) bootstrap the isolated DB without operator intervention.
+// Idempotent.
+func ensureToctouDB(t *testing.T, addr string) {
+	t.Helper()
+	parsed, err := mysqldriver.ParseDSN(addr)
+	require.NoError(t, err, "parse DSN")
+	dbName := parsed.DBName
+	if dbName == "" {
+		return
+	}
+	parsed.DBName = ""
+	bootstrapAddr := parsed.FormatDSN()
+	boot, err := sql.Open("mysql", bootstrapAddr)
+	require.NoError(t, err, "open bootstrap conn")
+	defer boot.Close()
+	_, err = boot.Exec("CREATE DATABASE IF NOT EXISTS `" + dbName + "` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci")
+	require.NoError(t, err, "create isolated DB %s", dbName)
 }
 
 // toctouDoRequest mirrors doRequest from api_test.go — kept local to avoid
@@ -198,37 +230,6 @@ func TestMoveGroupToCategory_TOCTOU_DanglingReference(t *testing.T) {
 		settingCategoryID.String, catStatus, result.resp.Code, result.resp.Body.String())
 }
 
-// productionLikeDMCategoryChecker mirrors dmCategoryChecker in
-// modules/message/1module.go — same SELECT against group_category (without
-// FOR UPDATE) so the test reproduces the production TOCTOU window. Inlined
-// here to avoid importing the message module purely for tests.
-type productionLikeDMCategoryChecker struct {
-	ctx *config.Context
-}
-
-func (c *productionLikeDMCategoryChecker) AuthorizeDMCategory(uid, spaceID, categoryID string) error {
-	type row struct {
-		UID     string `db:"uid"`
-		SpaceID string `db:"space_id"`
-		Status  int    `db:"status"`
-	}
-	var r row
-	err := c.ctx.DB().SelectBySql(
-		"SELECT uid, space_id, status FROM group_category WHERE category_id=?",
-		categoryID,
-	).LoadOne(&r)
-	if err != nil {
-		if errors.Is(err, dbr.ErrNotFound) {
-			return convext.ErrDMCategoryForbidden
-		}
-		return err
-	}
-	if r.UID != uid || r.SpaceID != spaceID || r.Status == 2 {
-		return convext.ErrDMCategoryForbidden
-	}
-	return nil
-}
-
 // TestFollowDM_TOCTOU_DanglingReference is the convext counterpart to
 // TestMoveGroupToCategory_TOCTOU_DanglingReference: same mid-flight delete
 // race, asserted against user_conversation_ext.dm_category_id.
@@ -239,10 +240,14 @@ func (c *productionLikeDMCategoryChecker) AuthorizeDMCategory(uid, spaceID, cate
 // re-run convext's migrations standalone hits sql-migrate + PROCEDURE
 // edge-cases on a previously-bootstrapped DB.
 //
-// Before fix: production-like checker (in FollowDM, outside withTx) reads
-// status=1 (deleter uncommitted, invisible), withTx upserts dm_category_id=X,
-// deleter commits status=2 → user_conversation_ext.dm_category_id=X AND
-// group_category.status=2 — dangling.
+// Before fix: the old DMCategoryChecker pre-check (in FollowDM, outside
+// withTx) read status=1 (deleter uncommitted, invisible), withTx upserted
+// dm_category_id=X, deleter committed status=2 → dangling reference.
+// PR #79 fix removed the checker and moved the validation into the
+// authoritative in-tx SELECT ... FOR UPDATE; the test now exercises that
+// path directly (no DMCategoryChecker injection needed — the in-tx check
+// is the sole authority).
+//
 // After fix: FollowDM's in-tx SELECT ... FOR UPDATE blocks on deleter,
 // observes status=2 once committed, returns ErrDMCategoryForbidden without
 // touching user_conversation_ext.
@@ -257,12 +262,11 @@ func TestFollowDM_TOCTOU_DanglingReference(t *testing.T) {
 	)
 
 	svc := convext.NewService(ctx)
-	svc.SetDMCategoryChecker(&productionLikeDMCategoryChecker{ctx: ctx})
 
 	rawDB := ctx.DB().DB
 
 	_, err := rawDB.Exec(
-		"INSERT INTO group_category (category_id, space_id, uid, name, sort, status, is_default) VALUES (?, ?, ?, ?, ?, 1, 0)",
+		"INSERT INTO group_category (category_id, space_id, uid, name, sort, status, is_default) VALUES (?, ?, ?, ?, ?, 1, NULL)",
 		catID, spaceID, uid, "工作", 0,
 	)
 	require.NoError(t, err, "seed group_category")

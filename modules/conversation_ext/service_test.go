@@ -29,6 +29,40 @@ func newServiceForTest(t *testing.T) *Service {
 	return NewService(ctx)
 }
 
+// seedTestCategory inserts a status=1 row into group_category owned by uid in
+// spaceID with the given catID, bootstrapping the table if missing. Required
+// for any FollowDM(..., &categoryID) call after PR #79 because
+// authorizeDMCategoryInTx now demands a real, status=1, owned row in the
+// same transaction. Pre-PR these tests passed only because no
+// DMCategoryChecker was injected via SetDMCategoryChecker — that hook is
+// gone, the in-tx lock is now the sole authority.
+//
+// The schema definition mirrors the category module's migration
+// (modules/category/sql/20260403000001_category_legacy01.sql) at the
+// minimum columns FollowDM cares about. CREATE TABLE IF NOT EXISTS keeps
+// this idempotent against a DB that already has the real schema applied.
+func seedTestCategory(t *testing.T, svc *Service, uid, spaceID, catID string) {
+	t.Helper()
+	rawDB := svc.session.DB
+	_, err := rawDB.Exec(`CREATE TABLE IF NOT EXISTS group_category (
+		id          BIGINT       AUTO_INCREMENT PRIMARY KEY,
+		category_id VARCHAR(32)  NOT NULL,
+		space_id    VARCHAR(40)  NOT NULL,
+		uid         VARCHAR(40)  NOT NULL,
+		name        VARCHAR(100) NOT NULL,
+		sort        INT          NOT NULL DEFAULT 0,
+		status      TINYINT      NOT NULL DEFAULT 1,
+		is_default  TINYINT      NULL,
+		UNIQUE KEY uk_category_id (category_id)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`)
+	require.NoError(t, err, "ensure group_category table")
+	_, err = rawDB.Exec(
+		"INSERT IGNORE INTO group_category (category_id, space_id, uid, name) VALUES (?, ?, ?, ?)",
+		catID, spaceID, uid, "test",
+	)
+	require.NoError(t, err, "seed group_category row")
+}
+
 // ---------------------------------------------------------------------------
 // Input validation
 // ---------------------------------------------------------------------------
@@ -310,6 +344,7 @@ func TestService_FollowDM_WithCategory(t *testing.T) {
 	svc := newServiceForTest(t)
 	const uid, space, peer = "u1", "s1", "peer-dm-2"
 	catID := "cat-uuid-77"
+	seedTestCategory(t, svc, uid, space, catID)
 
 	require.NoError(t, svc.FollowDM(uid, space, peer, &catID))
 
@@ -326,6 +361,8 @@ func TestService_FollowDM_Idempotent_UpdatesCategory(t *testing.T) {
 	const uid, space, peer = "u1", "s1", "peer-dm-3"
 	catA := "cat-uuid-A"
 	catB := "cat-uuid-B"
+	seedTestCategory(t, svc, uid, space, catA)
+	seedTestCategory(t, svc, uid, space, catB)
 
 	require.NoError(t, svc.FollowDM(uid, space, peer, &catA))
 	require.NoError(t, svc.FollowDM(uid, space, peer, &catB))
