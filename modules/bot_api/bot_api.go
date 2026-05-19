@@ -77,6 +77,16 @@ type BotAPI struct {
 	// (uid, channel_id, channel_type) without touching MySQL.
 	// nil in production → the real DB-backed check runs.
 	oboChannelAccessOverride func(uid, channelID string, channelType uint8) (bool, error)
+	// friendCheckOverride lets unit tests stub userService.IsFriend for the
+	// friend-gate decision in checkSendPermission / syncMessages, and for
+	// the OBO friend-gate bypass (see obo_friend_gate.go). Production path
+	// uses ba.userService.IsFriend; tests that build BotAPI without a live
+	// user service set this hook to deterministically accept or reject
+	// (uid, toUID) without touching MySQL. PR#82 R6 P0 — managed-persona
+	// OBO friend-gate bypass needs to be testable end-to-end without the
+	// full user-service stack.
+	// nil in production → the real userService.IsFriend runs.
+	friendCheckOverride func(uid, toUID string) (bool, error)
 	log.Log
 }
 

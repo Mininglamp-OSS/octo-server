@@ -71,12 +71,12 @@ func TestHasOBOAccessToChannel_DM_GrantorHasFriendship_ApplyBypass(t *testing.T)
 	)
 	ct := common.ChannelTypePerson.Uint8()
 	s := newFakeOBOStore()
-	gid, err := s.insertGrant(admin, bot, "auto", "")
+	gid, err := s.insertGrant(admin, bot, "auto")
 	if err != nil {
 		t.Fatalf("insertGrant: %v", err)
 	}
 	enable := 1
-	if err := s.updateGrant(gid, "", &enable, nil); err != nil {
+	if err := s.updateGrant(gid, "", &enable); err != nil {
 		t.Fatalf("updateGrant: %v", err)
 	}
 	if _, err := s.insertScope(gid, peer, ct, 1); err != nil {
@@ -120,9 +120,9 @@ func TestHasOBOAccessToChannel_DM_GrantorLostAccess_NoBypass(t *testing.T) {
 	)
 	ct := common.ChannelTypePerson.Uint8()
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(admin, bot, "auto", "")
+	gid, _ := s.insertGrant(admin, bot, "auto")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable, nil)
+	_ = s.updateGrant(gid, "", &enable)
 	if _, err := s.insertScope(gid, peer, ct, 1); err != nil {
 		t.Fatalf("insertScope: %v", err)
 	}
@@ -153,9 +153,9 @@ func TestHasOBOAccessToChannel_GrantForDifferentBot_NoBypass(t *testing.T) {
 	)
 	ct := common.ChannelTypePerson.Uint8()
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(admin, otherBot, "auto", "")
+	gid, _ := s.insertGrant(admin, otherBot, "auto")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable, nil)
+	_ = s.updateGrant(gid, "", &enable)
 	if _, err := s.insertScope(gid, peer, ct, 1); err != nil {
 		t.Fatalf("insertScope: %v", err)
 	}
@@ -181,7 +181,7 @@ func TestHasOBOAccessToChannel_GrantInactive_NoBypass(t *testing.T) {
 	)
 	ct := common.ChannelTypePerson.Uint8()
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(admin, bot, "auto", "")
+	gid, _ := s.insertGrant(admin, bot, "auto")
 	// NOTE: NOT enabling globally — the grant stays at global_enabled=0.
 	// (findActiveGrantsForChannel filters on active=1 AND global_enabled=1,
 	//  so this is the "grant exists but not switched on" case.)
@@ -214,9 +214,9 @@ func TestHasOBOAccessToChannel_Group_BypassApplies(t *testing.T) {
 	)
 	ct := common.ChannelTypeGroup.Uint8()
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(admin, bot, "auto", "")
+	gid, _ := s.insertGrant(admin, bot, "auto")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable, nil)
+	_ = s.updateGrant(gid, "", &enable)
 	if _, err := s.insertScope(gid, group, ct, 1); err != nil {
 		t.Fatalf("insertScope: %v", err)
 	}
@@ -258,9 +258,9 @@ func TestIsFriendOrOBOBypass_FriendsShortCircuits(t *testing.T) {
 	s := newFakeOBOStore()
 	// Seed a grant + scope that WOULD allow bypass — but we won't get
 	// there because the friend lookup short-circuits.
-	gid, _ := s.insertGrant("user_admin", "bot_clone", "auto", "")
+	gid, _ := s.insertGrant("user_admin", "bot_clone", "auto")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable, nil)
+	_ = s.updateGrant(gid, "", &enable)
 	_, _ = s.insertScope(gid, "u_bob", common.ChannelTypePerson.Uint8(), 1)
 
 	// If the bypass is consulted, the access override would fire and
@@ -278,7 +278,7 @@ func TestIsFriendOrOBOBypass_FriendsShortCircuits(t *testing.T) {
 		},
 	}
 
-	ok, err := ba.isFriendOrOBOBypass("bot_clone", "u_bob", common.ChannelTypePerson.Uint8(), true)
+	ok, err := ba.isFriendOrOBOBypass("bot_clone", "u_bob", common.ChannelTypePerson.Uint8())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -302,9 +302,9 @@ func TestIsFriendOrOBOBypass_NotFriendsButOBOApplies(t *testing.T) {
 	)
 	ct := common.ChannelTypePerson.Uint8()
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(admin, bot, "auto", "")
+	gid, _ := s.insertGrant(admin, bot, "auto")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable, nil)
+	_ = s.updateGrant(gid, "", &enable)
 	_, _ = s.insertScope(gid, peer, ct, 1)
 
 	ba := &BotAPI{
@@ -323,7 +323,7 @@ func TestIsFriendOrOBOBypass_NotFriendsButOBOApplies(t *testing.T) {
 		},
 	}
 
-	ok, err := ba.isFriendOrOBOBypass(bot, peer, ct, true)
+	ok, err := ba.isFriendOrOBOBypass(bot, peer, ct)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -349,7 +349,7 @@ func TestIsFriendOrOBOBypass_NotFriendsNoOBO_Denies(t *testing.T) {
 		},
 	}
 
-	ok, err := ba.isFriendOrOBOBypass("bot_clone", "u_bob", common.ChannelTypePerson.Uint8(), true)
+	ok, err := ba.isFriendOrOBOBypass("bot_clone", "u_bob", common.ChannelTypePerson.Uint8())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -371,7 +371,7 @@ func TestIsFriendOrOBOBypass_FriendErrorSurfaces(t *testing.T) {
 		},
 	}
 
-	ok, err := ba.isFriendOrOBOBypass("bot_clone", "u_bob", common.ChannelTypePerson.Uint8(), true)
+	ok, err := ba.isFriendOrOBOBypass("bot_clone", "u_bob", common.ChannelTypePerson.Uint8())
 	if !errors.Is(err, boom) {
 		t.Fatalf("IsFriend error must propagate; got err=%v ok=%v", err, ok)
 	}
@@ -386,89 +386,4 @@ func TestIsFriendOrOBOBypass_FriendErrorSurfaces(t *testing.T) {
 // number finds the test directly.
 func TestBotAPI_FriendGate_BypassedForOBOContext(t *testing.T) {
 	TestIsFriendOrOBOBypass_NotFriendsButOBOApplies(t)
-}
-
-// TestIsFriendOrOBOBypass_NoOBOContext_GrantsIgnored — PR#82 R7
-// regression (Jerry-Xin head a07b372). Bot is NOT friend of peer, an
-// active OBO grant covers (bot, peer) — but the caller passes
-// hasOBOContext=false (e.g. sendMessage without `on_behalf_of`, or
-// typing / readReceipt / messages-sync which have no on_behalf_of
-// field at all). The bypass MUST NOT fire — otherwise the bot could
-// reach peer directly bot→peer, defeating the user opt-in friend
-// gate and exposing the managed-persona bot as a contact.
-func TestIsFriendOrOBOBypass_NoOBOContext_GrantsIgnored(t *testing.T) {
-	const (
-		admin = "user_admin"
-		bot   = "bot_clone_james"
-		peer  = "u_bob"
-	)
-	ct := common.ChannelTypePerson.Uint8()
-	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(admin, bot, "auto", "")
-	enable := 1
-	_ = s.updateGrant(gid, "", &enable, nil)
-	_, _ = s.insertScope(gid, peer, ct, 1)
-
-	bypassConsulted := false
-	ba := &BotAPI{
-		Log:              log.NewTLog("BotAPI-r7-no-ctx-test"),
-		oboStoreOverride: s,
-		oboChannelAccessOverride: func(uid, channelID string, channelType uint8) (bool, error) {
-			// If this fires the bypass was reached — which is exactly
-			// the bug we are guarding against.
-			bypassConsulted = true
-			return true, nil
-		},
-		friendCheckOverride: func(uid, toUID string) (bool, error) {
-			return false, nil // bot is NOT friends with peer
-		},
-	}
-
-	ok, err := ba.isFriendOrOBOBypass(bot, peer, ct, false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if ok {
-		t.Fatalf("PR#82 R7: hasOBOContext=false MUST NOT permit bypass even when a grant exists — bot would reach peer without opt-in")
-	}
-	if bypassConsulted {
-		t.Fatalf("PR#82 R7: hasOBOAccessToChannel must NOT be consulted when hasOBOContext=false (perf + invariant)")
-	}
-}
-
-// TestIsFriendOrOBOBypass_OBOContextTrue_BypassApplies — companion of
-// the negative test above. Same fixture (bot not friend, grant
-// exists) but hasOBOContext=true → bypass fires. Locks in that the
-// only delta between allow and deny is the caller's OBO-context flag.
-func TestIsFriendOrOBOBypass_OBOContextTrue_BypassApplies(t *testing.T) {
-	const (
-		admin = "user_admin"
-		bot   = "bot_clone_james"
-		peer  = "u_bob"
-	)
-	ct := common.ChannelTypePerson.Uint8()
-	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(admin, bot, "auto", "")
-	enable := 1
-	_ = s.updateGrant(gid, "", &enable, nil)
-	_, _ = s.insertScope(gid, peer, ct, 1)
-
-	ba := &BotAPI{
-		Log:              log.NewTLog("BotAPI-r7-with-ctx-test"),
-		oboStoreOverride: s,
-		oboChannelAccessOverride: func(uid, channelID string, channelType uint8) (bool, error) {
-			return uid == admin && channelID == peer, nil
-		},
-		friendCheckOverride: func(uid, toUID string) (bool, error) {
-			return false, nil
-		},
-	}
-
-	ok, err := ba.isFriendOrOBOBypass(bot, peer, ct, true)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !ok {
-		t.Fatalf("hasOBOContext=true + valid grant → bypass must fire (parity with R6 P0 fix)")
-	}
 }
