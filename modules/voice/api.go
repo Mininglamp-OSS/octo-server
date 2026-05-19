@@ -1,7 +1,10 @@
 package voice
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"time"
@@ -173,28 +176,39 @@ func (v *Voice) transcribe(c *wkhttp.Context) {
 
 	if err != nil {
 		v.Error("transcription failed", zap.Error(err))
+		var requestID string
 		if v.asrLogger != nil {
 			entry := v.buildASREntry("app", effectiveMode, audioData, mimeType, contextText, origChatContext,
 				personalContext, memberContext, channelType, startTime, durationMs, result, err)
+			requestID = entry.RequestID
 			v.asrLogger.Enqueue(entry)
+		} else {
+			requestID = generateFallbackRequestID()
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{
-			"status": http.StatusInternalServerError,
-			"msg":    "transcription failed",
+			"status":     http.StatusInternalServerError,
+			"msg":        "transcription failed",
+			"request_id": requestID,
 		})
 		return
 	}
 
+	var requestID string
 	if v.asrLogger != nil {
-		v.asrLogger.Enqueue(v.buildASREntry("app", effectiveMode, audioData, mimeType, contextText, origChatContext,
-			personalContext, memberContext, channelType, startTime, durationMs, result, nil))
+		entry := v.buildASREntry("app", effectiveMode, audioData, mimeType, contextText, origChatContext,
+			personalContext, memberContext, channelType, startTime, durationMs, result, nil)
+		requestID = entry.RequestID
+		v.asrLogger.Enqueue(entry)
+	} else {
+		requestID = generateFallbackRequestID()
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"status": http.StatusOK,
-		"text":   result.Text,
-		"m":      shortenModelName(result.Model),
-		"engine": ShortenEngineName(v.cfg.Engine),
+		"status":     http.StatusOK,
+		"text":       result.Text,
+		"m":          shortenModelName(result.Model),
+		"engine":     ShortenEngineName(v.cfg.Engine),
+		"request_id": requestID,
 	})
 }
 
@@ -303,6 +317,12 @@ func (v *Voice) getContext(c *wkhttp.Context) {
 
 func shortenModelName(model string) string {
 	return ShortenModelName(model)
+}
+
+func generateFallbackRequestID() string {
+	b := make([]byte, 3)
+	rand.Read(b)
+	return fmt.Sprintf("nolog_%d_%s", time.Now().UTC().UnixMilli(), hex.EncodeToString(b))
 }
 
 // ShortenEngineName returns a short identifier for an engine name.
