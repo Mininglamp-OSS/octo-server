@@ -112,6 +112,9 @@ func defaultBindCfg() BindConfig {
 		Methods:        []BindMethod{BindMethodPassword, BindMethodSMSOTP},
 		SupportContact: "ops@example.com",
 		AllowCreate:    true,
+		// 默认放行 sampleClaims().Issuer,让 Create 路径 D. issuerAllowedForCreate
+		// 兜底校验默认放行(api_bind_test 多个用例依赖 Create 成功)。
+		IssuerAllowlist: []string{"https://idp.example"},
 	}
 }
 

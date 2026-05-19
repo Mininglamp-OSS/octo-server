@@ -77,9 +77,22 @@ func newBindService(cfg BindConfig, store BindStore, auth BindAuthenticator, loc
 // Issue 在 callback ResolveOrLink 失败分支调用:签发 bind_token,持久化
 // claims + state_data 快照,返回 jti 供 handler 拼前端跳转 URL。
 //
+// 等价于 IssueWithReason(ctx, claims, sd, BindReasonUnknownUser) —— 历史调用方
+// (单元测试 + ShouldHandle 早期路径)在没有明确区分原因时保留旧签名,语义即
+// "claims 未命中已有账号"(可走 /bind/create)。生产 callback 路径应该走
+// IssueWithReason 明确传 reason,与 manual_conflict 拒建号路径协同。
+//
 // 不在此处写 audit —— handler 在拿到 jti 后统一写 EventBindIssued
 // (handler 持 HTTP 上下文,IP/UA/trace_id 都齐)。
 func (s *BindService) Issue(ctx context.Context, claims *IDTokenClaims, sd *StateData) (string, error) {
+	return s.IssueWithReason(ctx, claims, sd, BindReasonUnknownUser)
+}
+
+// IssueWithReason 同 Issue,但额外把 reason 固化到 BindSession.IssueReason 字段。
+// callback 按 ResolveOrLink 返回的 err 类型选择 reason:ErrUnknownUser →
+// BindReasonUnknownUser(可建号);ErrConflictNeedManual → BindReasonManualConflict
+// (Create 路径拒绝)。详见 IssueReason godoc。
+func (s *BindService) IssueWithReason(ctx context.Context, claims *IDTokenClaims, sd *StateData, reason IssueReason) (string, error) {
 	if claims == nil || claims.Issuer == "" || claims.Subject == "" {
 		return "", fmt.Errorf("oidc bind Issue: claims iss/sub required")
 	}
@@ -108,6 +121,7 @@ func (s *BindService) Issue(ctx context.Context, claims *IDTokenClaims, sd *Stat
 		OriginIP:       sd.IP,
 		OriginUA:       sd.UserAgent,
 		CreatedAt:      nowUnix(),
+		IssueReason:    reason,
 	}
 	if err := s.store.Save(ctx, sess, s.cfg.TokenTTL); err != nil {
 		return "", fmt.Errorf("oidc bind Issue: save: %w", err)
@@ -134,10 +148,23 @@ func (s *BindService) Info(ctx context.Context, jti string) (*BindInfoResp, erro
 	}
 	resp.Methods = s.availableMethods(claims)
 	resp.AllowCreate = s.cfg.AllowCreate
-	if !s.cfg.AllowCreate {
+	// 优先级 disabled > claims_incomplete > manual_conflict > consumed。
+	// disabled 是配置层面的"运维关闭",最高优先;claims_incomplete 是
+	// claims 自身欠缺,继续往下走也注定建不出;manual_conflict 是 token 来源
+	// 的策略拒绝(reviewer 强调 P2-1);consumed 是 token 已被推进出 issued
+	// 状态(verify/create 已发生),前端最多展示"重发起 OIDC 登录"提示。
+	switch {
+	case !s.cfg.AllowCreate:
 		resp.CreateBlocked = "disabled"
-	} else if err := s.checkClaimsForCreate(claims); err != nil {
+	case s.checkClaimsForCreate(claims) != nil:
 		resp.CreateBlocked = "claims_incomplete"
+	case sess.IssueReason == BindReasonManualConflict:
+		resp.CreateBlocked = "manual_conflict"
+	case sess.Status != BindStatusIssued:
+		// token 已被推进(verified / creating / refused) —— 二次 /bind/info 仍可读,
+		// 但 /bind/create 已经不可能走通(状态机 CAS 必败)。提前告诉前端别让用户
+		// 误点"自助建号"按钮反复 429。
+		resp.CreateBlocked = "consumed"
 	}
 	return resp, nil
 }
@@ -494,12 +521,26 @@ func (s *BindService) Create(ctx context.Context, jti string) (*BindCreateResp, 
 		"bind:create:"+jti, bindCreateMax, s.cfg.TokenTTL); err != nil {
 		return nil, err
 	}
+	// manual_conflict 来源的 token 不允许走自助建号:用户在 dmwork 已经有(多条)
+	// 账号,/bind/create 会再造账号加剧脏数据 —— 走 P1 Admin 人工合并兜底。
+	// 空字符串视同 unknown_user(灰度兼容旧 token),与 IssueReason godoc 一致。
+	if sess.IssueReason == BindReasonManualConflict {
+		return nil, ErrBindCreateConflictNeedManual
+	}
 	claims, err := decodeClaimsSnapshot(sess.ClaimsSnapshot)
 	if err != nil {
 		return nil, err
 	}
 	if err := s.checkClaimsForCreate(claims); err != nil {
 		return nil, err
+	}
+	// D. IssuerAllowlist 防御性复核:ShouldHandle 在 callback 阶段已挡过一遍,
+	// 这里在 Create 入口再校验一次,防止运维在 token 5min TTL 内把某 issuer
+	// 从 allowlist 移走、但 token 已经签发的窗口里继续被滥用。
+	// 仅在 Create 路径加(与 reviewer 描述一致):verify/confirm 路径的 token
+	// 是用户主动二次验证,IdP 信任由原 callback 时已校验,风险低。
+	if !s.issuerAllowedForCreate(claims.Issuer) {
+		return nil, fmt.Errorf("oidc bind Create: %w (issuer no longer in allowlist)", ErrBindAuthRejected)
 	}
 	sd, err := decodeSDSnapshot(sess.SDSnapshot)
 	if err != nil {
@@ -520,6 +561,11 @@ func (s *BindService) Create(ctx context.Context, jti string) (*BindCreateResp, 
 		Zone:       zone,
 		DeviceFlag: sd.DeviceFlag,
 		PublicIP:   sd.IP,
+		// 进入本方法前已经过 ShouldHandle 的 IssuerAllowlist 校验(callback 阶段),
+		// 加上 bind_token 自身的 5min 单次性 + 上面的 checkClaimsForCreate / issuerAllowed
+		// 兜底,运维要授权的就是这条"OIDC 自助建号"路径 —— 告诉 user 模块绕过
+		// register.off 全局开关,与 callback `res.IsNew` 分支语义对称。
+		TrustedSSOCreate: true,
 	}
 	resp, err := s.users.IssueSession(ctx, issueReq)
 	if err != nil {
@@ -634,6 +680,18 @@ func (s *BindService) casLockForCreate(ctx context.Context, sess *BindSession) e
 func (s *BindService) remainingTTL(sess *BindSession) time.Duration {
 	deadline := time.Unix(sess.CreatedAt, 0).Add(s.cfg.TokenTTL)
 	return time.Until(deadline)
+}
+
+// issuerAllowedForCreate D. defense-in-depth 检查:Create 入口在
+// checkClaimsForCreate 后做最后一道 issuer allowlist 兜底。空 allowlist =
+// deny-all(灰度安全默认值),与 ShouldHandle 同语义。
+func (s *BindService) issuerAllowedForCreate(issuer string) bool {
+	for _, allowed := range s.cfg.IssuerAllowlist {
+		if allowed == issuer {
+			return true
+		}
+	}
+	return false
 }
 
 // ShouldHandle 给 callback 失败分支用的接管判定。任何一条不满足就走旧路径,

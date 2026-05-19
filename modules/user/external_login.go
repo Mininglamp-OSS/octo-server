@@ -48,6 +48,22 @@ type ExternalLoginReq struct {
 
 	// PublicIP 用于欢迎消息日志,可空
 	PublicIP string
+
+	// TrustedSSOCreate 调用方声明本次新建用户的身份已由可信 IdP 完成认证,
+	// 且已经过 oidc 模块的 IssuerAllowlist 准入校验(详见
+	// modules/oidc/bind_service.go BindService.Create 与
+	// modules/oidc/api.go callback `res.IsNew` 分支)。
+	//
+	// 置 true 时本方法**绕过** common.SystemSettings.RegisterOff() 全局开关:
+	// register.off=1 主要用于阻断公开 email/手机号注册入口与 GitHub/Gitee OAuth
+	// 自助建号通道,这两条通道的身份来源都是不受 dmwork 控制的外部输入。
+	// OIDC 通道在本 PR 后由 DM_OIDC_PROVIDER_ALLOW_NEW_USER 与
+	// OCTO_OIDC_BIND_ALLOW_CREATE 独立控制(IssuerAllowlist 兜底),
+	// 语义上属于"可信 IdP 授权创建",不应受 register.off 影响。
+	//
+	// 仅 OIDC 模块在 callback `res.IsNew=true` / `/bind/create` 路径上置 true;
+	// 其他外部 IdP(GitHub / Gitee 等)留 false,保留原有 register.off 守护。
+	TrustedSSOCreate bool
 }
 
 // DeviceInfo 登录设备信息（外部模块用,与内部 deviceReq 解耦）
@@ -128,7 +144,11 @@ func (u *User) externalLoginExisting(ctx context.Context, req ExternalLoginReq) 
 }
 
 func (u *User) externalLoginCreate(ctx context.Context, req ExternalLoginReq) (*ExternalLoginResp, error) {
-	if common.EnsureSystemSettings(u.ctx).RegisterOff() {
+	// TrustedSSOCreate 仅 OIDC 模块在通过 IssuerAllowlist + bind_token 显式同意
+	// 后置 true,代表"运维已通过 OIDC 配置授权该 IdP 自动建号",绕过
+	// register.off 全局开关。其他外部 IdP(GitHub/Gitee)与本地注册路径
+	// 不该走到这里。详见 ExternalLoginReq.TrustedSSOCreate godoc。
+	if !req.TrustedSSOCreate && common.EnsureSystemSettings(u.ctx).RegisterOff() {
 		return nil, errors.New("注册通道暂不开放")
 	}
 	if req.UID == "" {

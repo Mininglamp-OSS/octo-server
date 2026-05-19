@@ -185,6 +185,9 @@ func newBindHarness(t *testing.T, cfgMutators ...func(*BindConfig)) *bindTestHar
 		UIDFailPerDay:  10,
 		Methods:        []BindMethod{BindMethodPassword, BindMethodSMSOTP},
 		SupportContact: "support@example.com",
+		// 默认放行 sampleClaims().Issuer,让 Create 路径的 issuerAllowedForCreate
+		// 兜底校验默认放行;需要测"allowlist 拒绝"的用例显式覆盖。
+		IssuerAllowlist: []string{"https://idp.example"},
 	}
 	for _, mut := range cfgMutators {
 		mut(&cfg)
@@ -1480,6 +1483,140 @@ func TestBindService_Create_TokenNotFound(t *testing.T) {
 	}
 }
 
+// B. manual_conflict 来源的 bind_token Create 必须返 ErrBindCreateConflictNeedManual。
+// 锚定 P2-1:dmwork 端命中多账号脏数据时不允许走自助建号(会再造新账号加剧混乱),
+// 走 P1 Admin 人工合并兜底。
+func TestBindService_Create_ManualConflictRejected(t *testing.T) {
+	h := newBindHarness(t, func(c *BindConfig) {
+		c.AllowCreate = true
+	})
+	jti, err := h.svc.IssueWithReason(context.Background(), sampleClaims(), sampleSD(), BindReasonManualConflict)
+	if err != nil {
+		t.Fatalf("IssueWithReason: %v", err)
+	}
+	_, err = h.svc.Create(context.Background(), jti)
+	if !errors.Is(err, ErrBindCreateConflictNeedManual) {
+		t.Fatalf("expected ErrBindCreateConflictNeedManual, got %v", err)
+	}
+	// 副作用零容忍:identity 未写、IssueSession 未调
+	if len(h.identity.inserted) != 0 {
+		t.Fatalf("identity inserts=%d want 0 (no side-effect on rejected manual_conflict)", len(h.identity.inserted))
+	}
+	if h.users.callCnt != 0 {
+		t.Fatalf("IssueSession calls=%d want 0", h.users.callCnt)
+	}
+}
+
+// B. Info 在 manual_conflict 来源的 token 上必须把 create_blocked 置为
+// "manual_conflict",让前端展示"联系管理员人工合并"引导而不是"自助建号"按钮。
+func TestBindService_Info_ManualConflict_CreateBlocked(t *testing.T) {
+	h := newBindHarness(t, func(c *BindConfig) {
+		c.AllowCreate = true
+	})
+	jti, err := h.svc.IssueWithReason(context.Background(), sampleClaims(), sampleSD(), BindReasonManualConflict)
+	if err != nil {
+		t.Fatalf("IssueWithReason: %v", err)
+	}
+	info, err := h.svc.Info(context.Background(), jti)
+	if err != nil {
+		t.Fatalf("Info: %v", err)
+	}
+	if info.CreateBlocked != "manual_conflict" {
+		t.Fatalf("create_blocked=%q want manual_conflict", info.CreateBlocked)
+	}
+	if !info.AllowCreate {
+		t.Fatal("AllowCreate must remain true (config-level) — block reason is token-source")
+	}
+}
+
+// E. Info 在 token 已被推进出 issued 状态时,create_blocked = "consumed"。
+// 优先级低于 disabled / claims_incomplete / manual_conflict。
+func TestBindService_Info_ConsumedToken_CreateBlocked(t *testing.T) {
+	h := newBindHarness(t, func(c *BindConfig) {
+		c.AllowCreate = true
+	})
+	jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	// 把 token 推进到 verified
+	sess, _ := h.store.Get(context.Background(), jti)
+	sess.Status = BindStatusVerified
+	if err := h.store.CASSave(context.Background(), sess, BindStatusIssued, time.Minute); err != nil {
+		t.Fatalf("CASSave: %v", err)
+	}
+	info, err := h.svc.Info(context.Background(), jti)
+	if err != nil {
+		t.Fatalf("Info: %v", err)
+	}
+	if info.CreateBlocked != "consumed" {
+		t.Fatalf("create_blocked=%q want consumed", info.CreateBlocked)
+	}
+}
+
+// E. Info 优先级断言:disabled > claims_incomplete > manual_conflict > consumed。
+// 当多个条件同时成立时,最高优先级取胜 —— disabled 始终遮蔽其他。
+func TestBindService_Info_CreateBlocked_PriorityOrder(t *testing.T) {
+	t.Run("disabled wins over claims_incomplete", func(t *testing.T) {
+		h := newBindHarness(t, func(c *BindConfig) {
+			c.AllowCreate = false // disabled
+		})
+		c := sampleClaims()
+		c.Email = "" // claims_incomplete would also apply if AllowCreate=true
+		c.EmailVerified = false
+		c.PhoneNumber = ""
+		c.PhoneVerified = false
+		jti, _ := h.svc.Issue(context.Background(), c, sampleSD())
+		info, _ := h.svc.Info(context.Background(), jti)
+		if info.CreateBlocked != "disabled" {
+			t.Fatalf("create_blocked=%q want disabled (higher prio)", info.CreateBlocked)
+		}
+	})
+	t.Run("claims_incomplete wins over manual_conflict", func(t *testing.T) {
+		h := newBindHarness(t, func(c *BindConfig) {
+			c.AllowCreate = true
+		})
+		c := sampleClaims()
+		c.Email = ""
+		c.EmailVerified = false
+		c.PhoneNumber = ""
+		c.PhoneVerified = false
+		jti, _ := h.svc.IssueWithReason(context.Background(), c, sampleSD(), BindReasonManualConflict)
+		info, _ := h.svc.Info(context.Background(), jti)
+		if info.CreateBlocked != "claims_incomplete" {
+			t.Fatalf("create_blocked=%q want claims_incomplete (higher prio)", info.CreateBlocked)
+		}
+	})
+	t.Run("manual_conflict wins over consumed", func(t *testing.T) {
+		h := newBindHarness(t, func(c *BindConfig) {
+			c.AllowCreate = true
+		})
+		jti, _ := h.svc.IssueWithReason(context.Background(), sampleClaims(), sampleSD(), BindReasonManualConflict)
+		sess, _ := h.store.Get(context.Background(), jti)
+		sess.Status = BindStatusVerified
+		_ = h.store.CASSave(context.Background(), sess, BindStatusIssued, time.Minute)
+		info, _ := h.svc.Info(context.Background(), jti)
+		if info.CreateBlocked != "manual_conflict" {
+			t.Fatalf("create_blocked=%q want manual_conflict (higher prio than consumed)", info.CreateBlocked)
+		}
+	})
+}
+
+// D. P2-3: issuer 不在 IssuerAllowlist 时 Create 必须拒绝(defense-in-depth)。
+// 即便 token 已签发(ShouldHandle 当时放行),运维在 5min TTL 内把 issuer
+// 移走也要被 Create 入口拦下。返 ErrBindAuthRejected → handler 翻 401。
+func TestBindService_Create_IssuerNotAllowed_Rejected(t *testing.T) {
+	h := newBindHarness(t, func(c *BindConfig) {
+		c.AllowCreate = true
+		c.IssuerAllowlist = []string{"https://other"} // sampleClaims().Issuer 不在内
+	})
+	jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	_, err := h.svc.Create(context.Background(), jti)
+	if !errors.Is(err, ErrBindAuthRejected) {
+		t.Fatalf("expected ErrBindAuthRejected, got %v", err)
+	}
+	if len(h.identity.inserted) != 0 || h.users.callCnt != 0 {
+		t.Fatal("Create must short-circuit before any side-effect when issuer not allowed")
+	}
+}
+
 // TestBindService_CasLockForCreate_Issued CAS issued → creating,
 // 并用绝对剩余 TTL(与 saveVerified 对称,不续命到 TokenTTL × 2)。
 func TestBindService_CasLockForCreate_Issued(t *testing.T) {
@@ -1551,73 +1688,6 @@ func TestBindService_Create_IdentityRaceRecovery(t *testing.T) {
 	if !errors.Is(err, ErrBindAlreadyBound) {
 		t.Fatalf("T60: loser must get ErrBindAlreadyBound for handler to recover, got %v", err)
 	}
-}
-
-// T50: Redis CAS integration (skipped if Redis unavailable)
-// Verifies that CAS issued→created works correctly with real Redis,
-// and a verified-status token cannot create.
-func TestBindService_Create_RedisIntegration(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipped in short mode: requires Redis at 127.0.0.1:6379")
-	}
-	client := newProbeRedisClientForService(t)
-	if client == nil {
-		t.Skip("Redis not available")
-	}
-	defer client.Close()
-
-	store := newRedisBindStoreForTest(client)
-	auth := &fakeBindAuth{}
-	loc := &fakeBindLocator{byUsername: map[string]string{}, byPhone: map[string][]string{}}
-	identity := &fakeIdentityWriter{}
-	users := &fakeIssueSession{resp: &IssueSessionResp{UID: "u-redis", LoginRespJSON: `{}`}}
-	cfg := BindConfig{
-		Enabled:   true,
-		TokenTTL:  time.Minute,
-		VerifyMax: 5, OTPSendMax: 3, ConfirmMax: 3, UIDFailPerDay: 10,
-		Methods:     []BindMethod{BindMethodPassword, BindMethodSMSOTP},
-		AllowCreate: true,
-	}
-	svc := newBindService(cfg, store, auth, loc)
-	svc.identity = identity
-	svc.users = users
-
-	ctx := context.Background()
-
-	// T50a: happy path — CAS issued→created
-	jti1, err := svc.Issue(ctx, sampleClaims(), sampleSD())
-	if err != nil {
-		t.Fatalf("T50: Issue: %v", err)
-	}
-	resp, err := svc.Create(ctx, jti1)
-	if err != nil {
-		t.Fatalf("T50: Create: %v", err)
-	}
-	if resp.UID != "u-redis" {
-		t.Fatalf("T50: UID=%q want u-redis", resp.UID)
-	}
-
-	// T50b: verified token cannot create (status conflict)
-	auth.verifyPasswordResp.matched = true
-	loc.byUsername["alice"] = "u-alice"
-	jti2, _ := svc.Issue(ctx, sampleClaims(), sampleSD())
-	_ = svc.VerifyPassword(ctx, jti2, "alice", "p")
-	_, err = svc.Create(ctx, jti2)
-	if !errors.Is(err, ErrBindStatusConflict) {
-		t.Fatalf("T50: verified token must conflict on Create, got %v", err)
-	}
-}
-
-func newProbeRedisClientForService(t *testing.T) interface{ Close() error } {
-	t.Helper()
-	// We can't use newProbeRedisClient (it's in api_bind_test.go)
-	// This is a simplified version for the service test.
-	// Skip by default — Redis integration is covered at the store level.
-	return nil
-}
-
-func newRedisBindStoreForTest(_ interface{ Close() error }) BindStore {
-	return newMemoryBindStore()
 }
 
 // TestBindService_ShouldHandle 一致地决定 callback 失败分支接管。

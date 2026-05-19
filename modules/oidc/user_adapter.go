@@ -46,14 +46,15 @@ func (a *userAdapter) IssueSession(ctx context.Context, req IssueSessionReq) (*I
 		uid = util.GenerUUID()
 	}
 	extReq := user.ExternalLoginReq{
-		ExistingUID: req.UID, // 已有用户;CreateUser=true 时由 user 模块判空走创建
-		UID:         uid,
-		Name:        req.Name,
-		Email:       req.Email,
-		Phone:       req.Phone,
-		Zone:        req.Zone,
-		DeviceFlag:  config.DeviceFlag(req.DeviceFlag),
-		PublicIP:    req.PublicIP,
+		ExistingUID:      req.UID, // 已有用户;CreateUser=true 时由 user 模块判空走创建
+		UID:              uid,
+		Name:             req.Name,
+		Email:            req.Email,
+		Phone:            req.Phone,
+		Zone:             req.Zone,
+		DeviceFlag:       config.DeviceFlag(req.DeviceFlag),
+		PublicIP:         req.PublicIP,
+		TrustedSSOCreate: req.TrustedSSOCreate,
 	}
 	if req.CreateUser {
 		extReq.ExistingUID = ""

@@ -62,6 +62,25 @@ const (
 	BindStatusCreating BindStatus = "creating"
 )
 
+// IssueReason 描述 bind_token 是从哪种 callback 失败分支签发出来的。
+// Create 路径依赖此字段决定是否允许走"自助建号":多账号脏数据(manual_conflict)
+// 来源的 token 不应当被允许凭 claims 建号 —— 用户在 dmwork 已经有(多个)账号,
+// 走 /bind/create 会再造出新账号加剧数据混乱;只能走 P1 Admin 人工合并。
+//
+// 字段在 BindSession 中持久化,Info 路径用来回填 create_blocked,Create 路径
+// 用来拒绝建号。两个 Issue 入口(callback 的 ResolveOrLink 失败分支)按
+// err 类型显式置位,避免 oidc 模块的状态隐式扩散。
+type IssueReason string
+
+const (
+	// BindReasonUnknownUser claims 未命中已有 dmwork 账号(AllowNewUser=false
+	// 或 autolink 未命中)。这是"可以走 /bind/create 自助建号"的合法来源。
+	BindReasonUnknownUser IssueReason = "unknown_user"
+	// BindReasonManualConflict claims email/phone 命中**多条** dmwork 账号(脏数据)。
+	// 不允许走 /bind/create:重复建号会加剧数据混乱;只能走 Admin 人工合并(P1)。
+	BindReasonManualConflict IssueReason = "manual_conflict"
+)
+
 // BindSession bind_token 在 Redis 里的完整快照。
 //
 // 字段说明:
@@ -91,4 +110,9 @@ type BindSession struct {
 	OriginIP       string     `json:"origin_ip,omitempty"`
 	OriginUA       string     `json:"origin_ua,omitempty"`
 	CreatedAt      int64      `json:"created_at"`
+	// IssueReason 见 IssueReason godoc。Create 路径在 manual_conflict 时拒绝;
+	// Info 路径用它回填 create_blocked 让前端展示对应的引导文案。
+	// 旧 token(本字段引入前签发的)会落空字符串,Create 视同 unknown_user 放行,
+	// 保持 5min TTL 窗口内的灰度兼容。
+	IssueReason IssueReason `json:"issue_reason,omitempty"`
 }

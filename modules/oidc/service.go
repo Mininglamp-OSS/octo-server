@@ -39,6 +39,15 @@ type IssueSessionReq struct {
 	DeviceName string
 	DeviceMod  string
 	PublicIP   string
+
+	// TrustedSSOCreate 透传到 user.ExternalLoginReq.TrustedSSOCreate,
+	// 让可信 IdP 触发的新建用户路径绕过 user 模块的 register.off 全局开关。
+	//
+	// 仅在 CreateUser=true 时有意义。callback `res.IsNew=true` 与 /bind/create
+	// 两条入口显式置 true(代表 IssuerAllowlist 已经过),其他路径(verify→confirm
+	// 绑定老用户)留 false —— 与 CreateUser 本身的语义对齐:不建用户的请求不该
+	// 表达"信任创建"语义。
+	TrustedSSOCreate bool
 }
 
 // IssueSessionResp 会话签发结果。LoginRespJSON 直接塞 ThirdAuthcode Redis,

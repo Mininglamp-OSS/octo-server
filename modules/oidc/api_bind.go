@@ -439,6 +439,8 @@ func bindResultFromErr(err error) string {
 		return "unauthorized"
 	case errors.Is(err, ErrBindCreateClaimsIncomplete):
 		return "claims_incomplete"
+	case errors.Is(err, ErrBindCreateConflictNeedManual):
+		return "conflict_need_manual"
 	default:
 		// 未分类 = 内部异常。dashboard 上看到 internal_error 持续升高就是
 		// 该报警的信号(DB/Redis/底层 SMSService 故障),与 401 不再混淆。
@@ -520,6 +522,12 @@ func (o *OIDC) handleBindCreateErr(c *wkhttp.Context, token string, err error) {
 	case errors.Is(err, ErrBindCreateClaimsIncomplete):
 		o.writeAudit("bind:"+tokenHash, EventBindCreateFail, stateFromCtx(c), "claims incomplete")
 		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, errMsg("claims missing required fields"))
+	case errors.Is(err, ErrBindCreateConflictNeedManual):
+		// manual-conflict token:claims 命中多条 dmwork 账号,/bind/create
+		// 不允许重复建号,引导走 Admin 人工合并兜底(与 verify 多匹配同语义)。
+		o.writeAudit("bind:"+tokenHash, EventBindCreateFail, stateFromCtx(c), "conflict need manual")
+		c.AbortWithStatusJSON(http.StatusConflict,
+			errMsg("account conflict needs manual resolution"))
 	default:
 		o.Error("OIDC bind create failed (internal)",
 			zap.String("token_hash", tokenHash), zap.Error(err))

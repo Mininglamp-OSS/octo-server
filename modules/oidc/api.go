@@ -554,7 +554,15 @@ func (o *OIDC) callback(c *wkhttp.Context) {
 		// 自助绑定流程。其它失败 / flag off / issuer 不在白名单都退回旧路径,确保
 		// NFR-6 一键回滚(关 flag + 重启)语义生效。
 		if o.bind.ShouldHandle(err, claims) {
-			jti, ierr := o.bind.Issue(c.Request.Context(), claims, sd)
+			// 把 ResolveOrLink 的 err 类型固化到 BindSession.IssueReason —— Create
+			// 路径用它拒绝 manual_conflict 来源的建号请求,Info 路径用它回填
+			// create_blocked。BindReasonManualConflict 仅在多账号冲突时落地;
+			// 其他可接管错误统一按 BindReasonUnknownUser(自助建号合法来源)签发。
+			reason := BindReasonUnknownUser
+			if errors.Is(err, ErrConflictNeedManual) {
+				reason = BindReasonManualConflict
+			}
+			jti, ierr := o.bind.IssueWithReason(c.Request.Context(), claims, sd, reason)
 			if ierr == nil {
 				result = "bind_pending" // 已在 callbackResultLabels 注册
 				o.writeAudit("bind:"+subHash(jti), EventBindIssued, sd, "")
@@ -590,6 +598,11 @@ func (o *OIDC) callback(c *wkhttp.Context) {
 		Zone:       zone,
 		DeviceFlag: sd.DeviceFlag,
 		PublicIP:   sd.IP,
+		// res.IsNew=true 进入 user.externalLoginCreate;TrustedSSOCreate=true
+		// 让 user 模块绕过 register.off 全局开关。OIDC 的"自动建号"由
+		// AllowNewUser + IssuerAllowlist(ShouldHandle 也已校验)闭环控制,
+		// 与公开注册入口语义不同。与 /bind/create 路径对称(见 bind_service.Create)。
+		TrustedSSOCreate: res.IsNew,
 	}
 	sessResp, err := o.service.IssueSession(c.Request.Context(), issueReq)
 	if err != nil {
