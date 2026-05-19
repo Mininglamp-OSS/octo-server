@@ -11,6 +11,7 @@ import (
 	convext "github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
+	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
 )
 
@@ -543,28 +544,6 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 	}
 
 	var categoryIDPtr *string
-	if req.CategoryID != "" {
-		// 校验 category 所有权
-		cat, err := c.db.queryCategoryByID(req.CategoryID)
-		if err != nil {
-			c.Error("查询类别失败", zap.Error(err))
-			ctx.ResponseError(errors.New("查询类别失败"))
-			return
-		}
-		if cat == nil {
-			ctx.ResponseError(errors.New("分类不存在"))
-			return
-		}
-		if cat.UID != loginUID {
-			ctx.ResponseError(errors.New("无权限使用此分类"))
-			return
-		}
-		if groupSpaceID != cat.SpaceID {
-			ctx.ResponseError(errors.New("群组和分类不在同一空间"))
-			return
-		}
-		categoryIDPtr = &req.CategoryID
-	}
 
 	// 查询现有 group_setting
 	setting, err := c.db.queryGroupSettingForCategory(groupNo, loginUID)
@@ -584,6 +563,54 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 		return
 	}
 	defer tx.RollbackUnlessCommitted()
+
+	// Issue #75: category 校验必须放在写事务内，并对 group_category 中匹配
+	// category_id 的行加 X 锁（通过 uk_category_id 唯一索引等值定位，InnoDB
+	// 同时锁住二级索引行和对应的聚簇索引行，与 delete 路径互斥）。否则
+	// reader 在 tx 外读到 status=1、deleter 之后提交 status=2、reader 再写
+	// group_setting.category_id=X，落库出现指向已删除分类的悬挂引用
+	// （正是 #74 想消灭的脏状态）。
+	//
+	// 锁谓词只用 `WHERE category_id=?` 等值匹配，状态/归属判断放 Go 层完成。
+	// 在 REPEATABLE READ 下，UNIQUE 索引等值命中只取 record lock；如果走
+	// `WHERE status=1` 这种非唯一索引谓词，命中/未命中都可能取 next-key
+	// (gap) lock，扩大锁范围、增大死锁概率。命中已存在 UUID 时 record-only
+	// 是更稳的选择。
+	if req.CategoryID != "" {
+		var locked struct {
+			UID     string `db:"uid"`
+			SpaceID string `db:"space_id"`
+			Status  int    `db:"status"`
+		}
+		err := tx.SelectBySql(
+			"SELECT uid, space_id, status FROM group_category WHERE category_id=? FOR UPDATE",
+			req.CategoryID,
+		).LoadOne(&locked)
+		if err != nil {
+			if errors.Is(err, dbr.ErrNotFound) {
+				ctx.ResponseError(errors.New("分类不存在"))
+				return
+			}
+			c.Error("查询类别失败", zap.Error(err))
+			ctx.ResponseError(errors.New("查询类别失败"))
+			return
+		}
+		if locked.Status != 1 {
+			// status=2（已删除）等价于"分类不存在"——与旧路径
+			// queryCategoryByID(status=1 过滤) 后 nil 检查保持文案一致。
+			ctx.ResponseError(errors.New("分类不存在"))
+			return
+		}
+		if locked.UID != loginUID {
+			ctx.ResponseError(errors.New("无权限使用此分类"))
+			return
+		}
+		if groupSpaceID != locked.SpaceID {
+			ctx.ResponseError(errors.New("群组和分类不在同一空间"))
+			return
+		}
+		categoryIDPtr = &req.CategoryID
+	}
 
 	if setting == nil {
 		version, err := c.ctx.GenSeq(common.GroupSettingSeqKey)

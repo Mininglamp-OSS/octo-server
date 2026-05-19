@@ -68,6 +68,11 @@ type Service struct {
 	threadAuthM sync.RWMutex
 	// dmCatAuth 是 FollowDM 的 categoryID 校验钩子（PR #21 Round-6 by Jerry-Xin）。
 	// 与 threadAuth 一样由 message/1module.go 启动时注入；nil 时跳过校验。
+	//
+	// 注意（issue #75 / fix 之后）：FollowDM 不再调用这个 checker，鉴权改为
+	// 事务内 SELECT ... FOR UPDATE（见 authorizeDMCategoryInTx）以关闭 TOCTOU。
+	// 接口与注入点保留是为了向前兼容——其它路径仍可作为非授权 pre-check 使用，
+	// 也避免 message 模块的注入代码立即破坏。
 	dmCatAuth  DMCategoryChecker
 	dmCatAuthM sync.RWMutex
 	log.Log
@@ -354,11 +359,17 @@ func (s *Service) FollowDM(uid, spaceID, peerUID string, categoryID *string) err
 		if *categoryID == "" {
 			return errors.New("category_id must not be empty string")
 		}
-		if checker := s.getDMCategoryChecker(); checker != nil {
-			if err := checker.AuthorizeDMCategory(uid, spaceID, *categoryID); err != nil {
-				return err
-			}
-		}
+		// Issue #75: the DMCategoryChecker pre-check ran OUTSIDE withTx, so a
+		// concurrent DELETE /v1/spaces/:space_id/categories/:category_id could
+		// flip status to 2 between the checker's SELECT and the upsert below,
+		// leaving user_conversation_ext.dm_category_id pointing at a deleted
+		// category (the exact dangling state #74 set out to eliminate).
+		//
+		// The fix is to validate inside the same tx that writes the reference,
+		// holding an X lock on the group_category PK row so the deleter's
+		// UPDATE blocks until we either commit (and they then UPDATE NULLs we
+		// just wrote) or rollback. The checker injection stays for callers
+		// who want a cheap pre-validate; it's no longer authoritative here.
 	}
 	one := int8(1)
 	fields := ConvExtFields{
@@ -367,6 +378,11 @@ func (s *Service) FollowDM(uid, spaceID, peerUID string, categoryID *string) err
 	}
 	// PR #21 review (lml2468 blocker #2)：先 bump 后改 ext，与 UpdateSort 同序拿锁。
 	return s.withTx("FollowDM", func(tx *dbr.Tx) error {
+		if categoryID != nil {
+			if err := authorizeDMCategoryInTx(tx, uid, spaceID, *categoryID); err != nil {
+				return err
+			}
+		}
 		if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
 			return fmt.Errorf("FollowDM bump version: %w", err)
 		}
@@ -375,6 +391,43 @@ func (s *Service) FollowDM(uid, spaceID, peerUID string, categoryID *string) err
 		}
 		return nil
 	})
+}
+
+// authorizeDMCategoryInTx validates the category for a DM follow operation
+// inside the caller's transaction, holding an X lock on the group_category
+// PK row. Mirrors AuthorizeDMCategory in modules/message/1module.go but uses
+// SELECT ... FOR UPDATE so concurrent category deletes (which UPDATE
+// status=2 inside their own tx) serialize cleanly. Status / owner / space
+// checks are done in Go to avoid InnoDB gap locks on the status secondary
+// index.
+//
+// Returns ErrDMCategoryForbidden for:
+//   - category missing (dbr.ErrNotFound)
+//   - status != 1 (deleted)
+//   - uid mismatch (not the category owner)
+//   - space_id mismatch (category from a different space)
+//
+// DB errors are wrapped and returned as-is to surface infra problems.
+func authorizeDMCategoryInTx(tx *dbr.Tx, uid, spaceID, categoryID string) error {
+	var row struct {
+		UID     string `db:"uid"`
+		SpaceID string `db:"space_id"`
+		Status  int    `db:"status"`
+	}
+	err := tx.SelectBySql(
+		"SELECT uid, space_id, status FROM group_category WHERE category_id=? FOR UPDATE",
+		categoryID,
+	).LoadOne(&row)
+	if err != nil {
+		if errors.Is(err, dbr.ErrNotFound) {
+			return ErrDMCategoryForbidden
+		}
+		return err
+	}
+	if row.UID != uid || row.SpaceID != spaceID || row.Status != 1 {
+		return ErrDMCategoryForbidden
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
