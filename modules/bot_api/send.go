@@ -19,10 +19,17 @@ import (
 
 // BotSendMessageReq is the request for sendMessage.
 type BotSendMessageReq struct {
-	ChannelID   string                 `json:"channel_id"`
-	ChannelType uint8                  `json:"channel_type"`
-	StreamNo    string                 `json:"stream_no"`
-	Payload     map[string]interface{} `json:"payload"`
+	ChannelID   string `json:"channel_id"`
+	ChannelType uint8  `json:"channel_type"`
+	StreamNo    string `json:"stream_no"`
+	// OnBehalfOf — YUJ-1166 / Mininglamp-OSS/octo-server#81 (Persona Clone v0).
+	// When non-empty the bot is asking to dispatch as the real user
+	// `OnBehalfOf`. Server validates an active OBO grant
+	// (grantor=OnBehalfOf, grantee=robotID) AND a per-channel scope row
+	// (channel_id, channel_type) before substituting FromUID. Empty / absent
+	// preserves legacy behavior (FromUID = robotID). See RFC §5.1 / §5.2.
+	OnBehalfOf string                 `json:"on_behalf_of,omitempty"`
+	Payload    map[string]interface{} `json:"payload"`
 }
 
 // sendMessage handles POST /v1/bot/sendMessage.
@@ -57,14 +64,54 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 
 	channelID := ba.resolveSpaceChannelID(robotID, req.ChannelID, req.ChannelType)
 
+	// YUJ-1166 / Mininglamp-OSS#81 Persona Clone OBO:
+	// Resolve the dispatch identity. Default = the calling bot. If the bot
+	// asks to act on behalf of a real user, validate the grant + scope
+	// BEFORE we touch the payload (so a 403 short-circuits the dispatch).
+	// Note the order: OBO check runs AFTER checkSendPermission — a bot that
+	// can't legitimately reach this channel can't bypass that check by
+	// invoking OBO.
+	fromUID := robotID
+	if strings.TrimSpace(req.OnBehalfOf) != "" {
+		if err := ba.checkOBO(robotID, req.OnBehalfOf, req.ChannelID, req.ChannelType); err != nil {
+			if errors.Is(err, ErrOBONotAuthorized) {
+				ba.Warn("OBO denied: no active grant or scope",
+					zap.String("bot", robotID),
+					zap.String("on_behalf_of", req.OnBehalfOf),
+					zap.String("channel_id", req.ChannelID),
+					zap.Uint8("channel_type", req.ChannelType))
+				c.ResponseError(ErrOBONotAuthorized)
+				return
+			}
+			c.ResponseError(errors.New("OBO 检查失败"))
+			return
+		}
+		fromUID = req.OnBehalfOf
+	}
+
 	// YUJ-644 / Mininglamp-OSS#33: PERSONAL DM 服务端权威 space_id 注入。
 	// WuKongIM 对 DM 仅按裸 uid 路由（无 Space 概念），收端 SpaceFilter 只能依赖
 	// payload.space_id；客户端上送任何值（包括缺省 / 伪造）都不可信。
 	// 优先使用 gin-context 里 authAppBot 写入的 SpaceID（O(1)，无 DB 调用）；
 	// 用户 Bot / 平台级 App Bot 落 querySpaceIDByRobotID。
+	//
+	// space_id 解析始终基于 robotID (bot)，而不是 OBO 替身的 fromUID。
+	// 理由：grant 仅授权身份替换，不应改变租户隔离边界 — bot 的 Space 归属
+	// 是部署时确定的，与 grantor 的 Space 归属解耦。
 	payload := req.Payload
 	if req.ChannelType == common.ChannelTypePerson.Uint8() {
 		payload = ba.enrichBotPayloadWithSpaceID(c, robotID, payload)
+	}
+
+	// YUJ-1166 fan-out loop guard #3: mark this message so the fan-out
+	// listener (see obo_fanout.go) skips it on the way back through the
+	// listener pipeline. RFC §5.3 calls this `obo_processed=true`.
+	// Stored in payload (= message_extra in the persisted MessageResp) so
+	// the messages table itself doesn't need an ALTER (out-of-scope row).
+	if fromUID != robotID {
+		payload = ensureMap(payload)
+		payload["obo_processed"] = true
+		payload["actual_sender_uid"] = robotID
 	}
 
 	msgReq := &config.MsgSendReq{
@@ -74,7 +121,7 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 		StreamNo:    req.StreamNo,
 		ChannelID:   channelID,
 		ChannelType: req.ChannelType,
-		FromUID:     robotID,
+		FromUID:     fromUID,
 		Payload:     []byte(util.ToJson(payload)),
 	}
 	result, err := ba.dispatchMsgSendReq(msgReq)
@@ -88,6 +135,16 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 	ba.clearTypingThrottle(robotID, channelID, req.ChannelType)
 
 	c.Response(result)
+}
+
+// ensureMap returns a non-nil map, allocating one if needed. Used by the
+// OBO marker logic in sendMessage so we never NPE on a payload that arrived
+// nil (validation above rejects len==0 but not nil-vs-empty after enrich).
+func ensureMap(m map[string]interface{}) map[string]interface{} {
+	if m == nil {
+		return map[string]interface{}{}
+	}
+	return m
 }
 
 // checkSendPermission verifies the bot has permission to send to the target channel.

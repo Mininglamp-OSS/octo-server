@@ -42,6 +42,17 @@ type BotAPI struct {
 	// final MsgSendReq (including server-authoritative payload.space_id).
 	// nil in production; the real path goes through ba.ctx.SendMessageWithResult.
 	dispatchOverride func(*config.MsgSendReq) (*config.MsgSendResp, error)
+	// oboStoreOverride lets unit tests inject an in-memory oboStore so
+	// checkOBO / REST handlers / fan-out can run without standing up MySQL.
+	// nil in production; the real path uses ba.db (which satisfies oboStore).
+	// See modules/bot_api/obo_db.go for the interface contract.
+	oboStoreOverride oboStore
+	// oboFanoutDispatch lets unit tests intercept the per-grantee copy that
+	// the fan-out listener would otherwise hand to ba.ctx.SendMessage. The
+	// production path delegates to ba.dispatchMsgSendReq so the existing
+	// dispatchOverride hook keeps capturing sends in handler tests.
+	// nil in production.
+	oboFanoutDispatch func(*config.MsgSendReq) error
 	log.Log
 }
 
@@ -57,7 +68,7 @@ func (ba *BotAPI) dispatchMsgSendReq(req *config.MsgSendReq) (*config.MsgSendRes
 // NewBotAPI creates the Bot API gateway module.
 func NewBotAPI(ctx *config.Context) *BotAPI {
 	voiceCfg := voice.NewVoiceConfigFromEnv()
-	return &BotAPI{
+	ba := &BotAPI{
 		ctx:           ctx,
 		db:            newBotAPIDB(ctx),
 		userService:   user.NewService(ctx),
@@ -70,6 +81,14 @@ func NewBotAPI(ctx *config.Context) *BotAPI {
 		voiceCfg:      voiceCfg,
 		Log:           log.NewTLog("BotAPI"),
 	}
+	// YUJ-1166 / Mininglamp-OSS/octo-server#81 — Persona Clone fan-out.
+	// Subscribed AFTER the dependency wiring above so oboMessagesListen
+	// can safely consult ba.db (oboStore). Idempotent: the listener
+	// short-circuits when no grants exist for the message's channel.
+	if ctx != nil {
+		ctx.AddMessagesListener(ba.oboMessagesListen)
+	}
+	return ba
 }
 
 // Route registers all Bot API routes.
@@ -129,6 +148,11 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 		botFileAPI.GET("/*path", ba.botProxyFile)
 		botFileAPI.POST("/upload", ba.botUploadFile)
 	}
+
+	// YUJ-1166 / Mininglamp-OSS/octo-server#81 — Persona Clone (OBO) REST.
+	// User-token endpoints under /v1/obo. Implementation in obo_api.go;
+	// the call is split out so this Route function doesn't grow further.
+	ba.registerOBORoutes(r)
 }
 
 // ==================== Helper Functions ====================
