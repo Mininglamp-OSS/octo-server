@@ -51,6 +51,12 @@ func TestSendMessage_OBO_Authorized_SwapsFromUID(t *testing.T) {
 		spaceQuerier:     &fakeSpaceQuerier{defaultSpace: authSp},
 		dispatchOverride: dc.hook,
 		oboStoreOverride: s,
+		// PR#82 round-2 P1-A — checkOBO now re-checks live channel access.
+		// Default to "allowed" for the happy-path send integration; tests
+		// that need denial path use TestOBO_CheckOBO_GrantorMembershipRevoked_403.
+		oboChannelAccessOverride: func(uid, channelID string, channelType uint8) (bool, error) {
+			return true, nil
+		},
 	}
 
 	body, _ := json.Marshal(BotSendMessageReq{

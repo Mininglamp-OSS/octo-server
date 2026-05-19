@@ -25,6 +25,15 @@ func newBotAPIWithFakeStore(s *fakeOBOStore) *BotAPI {
 	return &BotAPI{
 		Log:              log.NewTLog("BotAPI-obo-test"),
 		oboStoreOverride: s,
+		// PR#82 round-2 P1-A — checkOBO now re-checks the grantor's live
+		// channel access on every call. Default the test override to
+		// "always allowed" so the original auth-matrix tests (no grant,
+		// revoked, scope missing, etc.) stay focused on the rows they
+		// were written for. The TOCTOU regression test installs a
+		// denying override explicitly.
+		oboChannelAccessOverride: func(uid, channelID string, channelType uint8) (bool, error) {
+			return true, nil
+		},
 	}
 }
 
@@ -179,6 +188,82 @@ func TestCheckOBO_DBError_OnScopeLookup(t *testing.T) {
 	s.failScopeEnabled = boom
 
 	ba := newBotAPIWithFakeStore(s)
+	err := ba.checkOBO(tBot, tGrantor, tChan, common.ChannelTypeGroup.Uint8())
+	if err == nil || errors.Is(err, ErrOBONotAuthorized) {
+		t.Fatalf("expected raw DB error to propagate, got %v", err)
+	}
+}
+
+// TestOBO_CheckOBO_GrantorMembershipRevoked_403 — PR#82 round-2 P1-A.
+// All static rows (active grant + enabled scope) are in place; the
+// grantor has since lost read access to the channel (kicked from the
+// group, un-friended the DM peer, etc.). checkOBO must reject the OBO
+// send so the bot cannot keep speaking as a user who no longer has eyes
+// on the channel. Maps to HTTP 403 at the handler boundary (the test
+// asserts the wire-equivalent sentinel ErrOBONotAuthorized).
+func TestOBO_CheckOBO_GrantorMembershipRevoked_403(t *testing.T) {
+	s := newFakeOBOStore()
+	gid, err := s.insertGrant(tGrantor, tBot, "auto")
+	if err != nil {
+		t.Fatalf("insertGrant: %v", err)
+	}
+	enable := 1
+	if err := s.updateGrant(gid, "", &enable); err != nil {
+		t.Fatalf("updateGrant: %v", err)
+	}
+	if _, err := s.insertScope(gid, tChan, common.ChannelTypeGroup.Uint8(), 1); err != nil {
+		t.Fatalf("insertScope: %v", err)
+	}
+
+	ba := newBotAPIWithFakeStore(s)
+	// Simulate "grantor was kicked from group_42" — the channel-access
+	// re-check now denies, even though grant + scope rows persist.
+	calls := 0
+	ba.oboChannelAccessOverride = func(uid, channelID string, channelType uint8) (bool, error) {
+		calls++
+		// Defensive: tests that depend on this override should be passing
+		// the live grantor + channel. Assert the values are what we expect
+		// so a refactor that swaps argument order is caught here.
+		if uid != tGrantor || channelID != tChan || channelType != common.ChannelTypeGroup.Uint8() {
+			t.Errorf("channel-access override called with unexpected args: uid=%q chan=%q type=%d", uid, channelID, channelType)
+		}
+		return false, nil
+	}
+	if err := ba.checkOBO(tBot, tGrantor, tChan, common.ChannelTypeGroup.Uint8()); !errors.Is(err, ErrOBONotAuthorized) {
+		t.Fatalf("revoked grantor membership must deny OBO, got %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected the re-check to fire exactly once, got %d", calls)
+	}
+
+	// Sanity: when membership is restored, the same row set passes again
+	// — proves the deny was driven by the access check, not a stale
+	// grant/scope state from the previous call.
+	ba.oboChannelAccessOverride = func(uid, channelID string, channelType uint8) (bool, error) {
+		return true, nil
+	}
+	if err := ba.checkOBO(tBot, tGrantor, tChan, common.ChannelTypeGroup.Uint8()); err != nil {
+		t.Fatalf("with access restored, expected nil, got %v", err)
+	}
+}
+
+// TestOBO_CheckOBO_GrantorChannelAccessDBError_Propagates — defensive:
+// the new re-check propagates DB errors the same way the scope lookup
+// does, so a transient DB blip doesn't masquerade as a permission denial
+// (which would mask a real outage and make a 500-vs-403 ambiguity at the
+// handler boundary).
+func TestOBO_CheckOBO_GrantorChannelAccessDBError_Propagates(t *testing.T) {
+	s := newFakeOBOStore()
+	gid, _ := s.insertGrant(tGrantor, tBot, "auto")
+	enable := 1
+	_ = s.updateGrant(gid, "", &enable)
+	_, _ = s.insertScope(gid, tChan, common.ChannelTypeGroup.Uint8(), 1)
+
+	ba := newBotAPIWithFakeStore(s)
+	boom := errors.New("connection refused")
+	ba.oboChannelAccessOverride = func(uid, channelID string, channelType uint8) (bool, error) {
+		return false, boom
+	}
 	err := ba.checkOBO(tBot, tGrantor, tChan, common.ChannelTypeGroup.Uint8())
 	if err == nil || errors.Is(err, ErrOBONotAuthorized) {
 		t.Fatalf("expected raw DB error to propagate, got %v", err)
