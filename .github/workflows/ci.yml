@@ -7,13 +7,17 @@ name: CI
 on:
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review, converted_to_draft]
+    # converted_to_draft is kept intentionally: it creates "skipped" check entries
+    # that satisfy required-check branch-protection rules when a PR is demoted
+    # back to draft, preventing stale "pending" statuses from the last real push.
     branches:
       - main
       - 'release/**'
-    paths-ignore:
-      - "**/*.md"
-      - "docs/**"
-      - ".github/ISSUE_TEMPLATE/**"
+    # paths-ignore is intentionally NOT set here — workflow-level path filtering
+    # prevents GitHub from creating any check run, which deadlocks required-status
+    # checks on docs-only PRs. Path-based skipping is handled by the `changes`
+    # preflight job below instead (dorny/paths-filter produces "skipped" statuses
+    # that GitHub counts as passing for required checks).
   push:
     branches:
       - main
@@ -33,8 +37,43 @@ env:
   GO_VERSION: '1.25.x'
 
 jobs:
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      # For push events the paths-filter step is skipped; default to 'true'
+      # so downstream jobs always run on direct main pushes.
+      code: ${{ github.event_name != 'pull_request' && 'true' || steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        if: github.event_name == 'pull_request'
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@6852f92c20ea7fd3b0c25de3b5112db3a98da050 # v3
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          # Negation patterns (! prefix) correctly exclude matched files even
+          # when '**' would otherwise match them — a .md file matches '**' but
+          # is then eliminated by '!**/*.md', leaving code: false for docs-only
+          # PRs. This is standard minimatch behaviour; predicate-quantifier
+          # defaults to 'any' which is exactly what we want: at least one
+          # non-doc file must have changed for code to be 'true'.
+          filters: |
+            code:
+              - '**'
+              - '!**/*.md'
+              - '!docs/**'
+              - '!.github/ISSUE_TEMPLATE/**'
+
   build:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: [changes]
+    if: |
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      needs.changes.outputs.code == 'true'
     name: Build
     runs-on: ubuntu-latest
     steps:
@@ -48,7 +87,10 @@ jobs:
         run: CGO_ENABLED=0 go build -v ./...
 
   test:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: [changes]
+    if: |
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      needs.changes.outputs.code == 'true'
     name: Test
     runs-on: ubuntu-latest
     # MySQL and Redis are required by ~10 modules' integration tests
@@ -152,7 +194,10 @@ jobs:
           exit $fail
 
   vet:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: [changes]
+    if: |
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      needs.changes.outputs.code == 'true'
     name: Vet
     runs-on: ubuntu-latest
     steps:
@@ -166,7 +211,10 @@ jobs:
         run: go vet ./...
 
   lint:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: [changes]
+    if: |
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      needs.changes.outputs.code == 'true'
     name: Lint
     runs-on: ubuntu-latest
     steps:
@@ -183,6 +231,10 @@ jobs:
           args: --timeout=5m
 
   personal-msgsendreq-lint:
+    needs: [changes]
+    if: |
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      needs.changes.outputs.code == 'true'
     # Mininglamp-OSS/octo-server#37: defense-in-depth wrapper for PERSONAL
     # MsgSendReq construction. The lint AST-walks modules/ and rejects any
     # composite literal of MsgSendReq{ChannelType: ChannelTypePerson...}, since
