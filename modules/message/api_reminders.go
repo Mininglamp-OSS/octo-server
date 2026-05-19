@@ -49,7 +49,7 @@ func (m *Message) reminderDone(c *wkhttp.Context) {
 		return
 	}
 	for _, id := range ids {
-		version, err := m.ctx.GenSeq(common.RemindersKey)
+		version, err := m.nextReminderSeq()
 		if err != nil {
 			c.ResponseError(err)
 			return
@@ -143,6 +143,20 @@ func (m *Message) listenerMessages(messages []*config.MessageResp) {
 
 }
 
+// nextReminderSeq returns the next monotonically increasing version
+// number used to seed remindersModel.Version. Production path delegates
+// to ctx.GenSeq(common.RemindersKey) (backed by the seq table); unit
+// tests inject reminderSeqOverride to skip the DB and exercise the
+// fan-out / matrix helpers in isolation. Keeping this seam local to
+// the reminders module avoids leaking the stub through Message's
+// exported surface.
+func (m *Message) nextReminderSeq() (int64, error) {
+	if m.reminderSeqOverride != nil {
+		return m.reminderSeqOverride()
+	}
+	return m.ctx.GenSeq(common.RemindersKey)
+}
+
 func (m *Message) getReminders(messages []*config.MessageResp) []*remindersModel {
 	reminders := make([]*remindersModel, 0, len(messages))
 	for _, message := range messages {
@@ -157,7 +171,7 @@ func (m *Message) getReminders(messages []*config.MessageResp) []*remindersModel
 		if m.hasMention(payloadMap) {
 			all, uids := m.getMention(payloadMap)
 			if all {
-				version, err := m.ctx.GenSeq(common.RemindersKey)
+				version, err := m.nextReminderSeq()
 				if err != nil {
 					m.Warn("GenSeq failed", zap.Error(err))
 					continue
@@ -176,7 +190,7 @@ func (m *Message) getReminders(messages []*config.MessageResp) []*remindersModel
 				})
 			} else if len(uids) > 0 {
 				for _, uid := range uids {
-					version, err := m.ctx.GenSeq(common.RemindersKey)
+					version, err := m.nextReminderSeq()
 					if err != nil {
 						m.Warn("GenSeq failed", zap.Error(err))
 						continue
@@ -209,7 +223,7 @@ func (m *Message) getReminders(messages []*config.MessageResp) []*remindersModel
 					if !ok {
 						continue
 					}
-					version, err := m.ctx.GenSeq(common.RemindersKey)
+					version, err := m.nextReminderSeq()
 					if err != nil {
 						m.Warn("GenSeq failed", zap.Error(err))
 						continue
@@ -285,13 +299,28 @@ func (m *Message) getMention(payloadMap map[string]interface{}) (all bool, uids 
 	if !ok {
 		return false, nil
 	}
-	if mentionMap["all"] != nil {
-		if allNum, ok := mentionMap["all"].(json.Number); ok {
-			allI, _ := allNum.Int64()
-			if allI == 1 {
-				all = true
-			}
-		}
+	// YUJ-202 / Mininglamp-OSS#94 — mention three-state read side. The
+	// chokepoint rewrite (pkg/mentionrewrite.RewriteMention) double-
+	// writes legacy `mention.all=1` into `mention.humans=1`, and a new
+	// client can also send `mention.ais=1` independently. Reminder
+	// fan-out treats ANY of {humans, ais, all} = 1 as a "broadcast"
+	// mention so the channel-level reminder is emitted. The per-role
+	// dispatch decision (humans-only / ais-only / both) lives client-
+	// side: new read-side adapters consult `humans` / `ais` to decide
+	// whether to render the red-dot; bots ignore `humans` and only
+	// react to `ais`. Reasoning matrix (RFC §6, Yu D1-D8):
+	//
+	//   humans=1                → human members see reminder, bots silent
+	//   ais=1                   → bot members see reminder, humans silent
+	//   humans=1 AND ais=1      → both render
+	//   all=1 (post-rewrite has humans=1 too) → humans only — legacy
+	//                              "@所有人" must NOT auto-fan-out to
+	//                              bots (the pain point being fixed)
+	//
+	// Server emits one channel-level reminder for any of these shapes;
+	// role filtering is the adapters' job.
+	if mentionAnyBroadcast(mentionMap) {
+		all = true
 	}
 	if mentionMap["uids"] != nil {
 		uidObjs, ok := mentionMap["uids"].([]interface{})
@@ -306,6 +335,62 @@ func (m *Message) getMention(payloadMap map[string]interface{}) (all bool, uids 
 		}
 	}
 	return
+}
+
+// mentionAnyBroadcast reports whether the parsed `mention` map carries
+// any of the three broadcast flags (humans / ais / all) set to 1. See
+// getMention's doc comment for the per-flag semantics. Defensive:
+// accepts json.Number / float / int / bool forms for each flag so
+// callers that decoded without UseNumber don't silently miss the
+// broadcast.
+func mentionAnyBroadcast(mentionMap map[string]interface{}) bool {
+	return mentionFlagTruthy(mentionMap["humans"]) ||
+		mentionFlagTruthy(mentionMap["ais"]) ||
+		mentionFlagTruthy(mentionMap["all"])
+}
+
+// mentionFlagTruthy reports whether a parsed mention.* flag value is
+// the numeric/boolean form of 1. Mirrors pkg/mentionrewrite.isTruthyOne
+// but kept local to avoid leaking the helper through an internal API —
+// the read side and the rewrite side intentionally share the same
+// "truthy = 1" semantics so a round-trip through the chokepoint is
+// observable.
+func mentionFlagTruthy(v interface{}) bool {
+	switch x := v.(type) {
+	case nil:
+		return false
+	case json.Number:
+		n, err := x.Int64()
+		return err == nil && n == 1
+	case float64:
+		return x == 1
+	case float32:
+		return x == 1
+	case int:
+		return x == 1
+	case int8:
+		return x == 1
+	case int16:
+		return x == 1
+	case int32:
+		return x == 1
+	case int64:
+		return x == 1
+	case uint:
+		return x == 1
+	case uint8:
+		return x == 1
+	case uint16:
+		return x == 1
+	case uint32:
+		return x == 1
+	case uint64:
+		return x == 1
+	case bool:
+		return x
+	default:
+		return false
+	}
 }
 
 func (m *Message) contentType(payloadMap map[string]interface{}) int {
