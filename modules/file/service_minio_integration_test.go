@@ -336,3 +336,66 @@ func TestPresignedPutURL_ConcurrentBucketBootstrap(t *testing.T) {
 	assert.Equal(t, int32(1), policyCount.Load(),
 		"SetBucketPolicy should run exactly once for a fresh shared bucket; ran %d times", policyCount.Load())
 }
+
+// TestEnsureBucket_SelfHealsPolicyOnExistingBucket reproduces issue #77: when
+// a bucket already exists at startup (typically because a `minio-init`
+// container or `mc mb` ran before octo-server), ensureBucket must still apply
+// the read-only anonymous policy. The old behaviour returned early on
+// `exists=true` and never called SetBucketPolicy, leaving pre-provisioned
+// buckets policy-less — anonymous GETs against them then returned 403, which
+// breaks any browser-direct asset (e.g. group avatars in the `group` bucket).
+//
+// The fake MinIO server returns 200 on HEAD (bucket already exists) and
+// records every PUT request. After triggering ensureBucket via PresignedPutURL
+// we assert:
+//   - MakeBucket was NOT called (no PUT without `policy` query key)
+//   - SetBucketPolicy WAS called at least once (PUT with `policy` query key)
+//
+// Before the fix this test fails (policyCount == 0). After the fix it passes
+// and the bootstrap is self-healing on every process start.
+func TestEnsureBucket_SelfHealsPolicyOnExistingBucket(t *testing.T) {
+	var (
+		makeCount   atomic.Int32
+		policyCount atomic.Int32
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			// Bucket already exists from the deployer's perspective.
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			if _, ok := r.URL.Query()["policy"]; ok {
+				policyCount.Add(1)
+			} else {
+				makeCount.Add(1)
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	cfg := config.New()
+	cfg.Test = true
+	cfg.Minio.URL = srv.URL
+	cfg.Minio.UploadURL = srv.URL
+	cfg.Minio.DownloadURL = "https://public.example.com"
+	cfg.Minio.AccessKeyID = "test-access-key"
+	cfg.Minio.SecretAccessKey = "test-secret-access-key-1234567890"
+
+	ctx := testutil.NewTestContext(cfg)
+	svc := file.NewServiceMinio(ctx)
+
+	// PresignedPutURL invokes ensureBucket on the resolved bucket. Use the
+	// `group` prefix specifically — that is the bucket #77 reported as
+	// broken on real deployments (group avatars served from /group/...).
+	_, _, err := svc.PresignedPutURL("group/avatar/abc.png", "image/png", "", 1024, time.Minute)
+	require.NoError(t, err)
+
+	assert.Equal(t, int32(0), makeCount.Load(),
+		"MakeBucket must not run when the bucket already exists; ran %d times", makeCount.Load())
+	assert.GreaterOrEqual(t, policyCount.Load(), int32(1),
+		"SetBucketPolicy must run on every ensureBucket call to self-heal pre-provisioned buckets; ran %d times", policyCount.Load())
+}

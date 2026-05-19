@@ -62,6 +62,17 @@ type ServiceMinio struct {
 	// itself is never deleted from — bucket count is bounded by the
 	// allow-list, so growth is O(allowed buckets).
 	bucketLocks sync.Map
+
+	// bucketReady records buckets whose policy has been successfully
+	// applied within this process lifetime. ensureBucket consults it
+	// inside `bucketLocks` so the first caller after process start runs
+	// the full BucketExists / MakeBucket / SetBucketPolicy sequence and
+	// every subsequent caller short-circuits. Together with bucketLocks
+	// this means: one bootstrap round-trip per bucket per process,
+	// regardless of upload concurrency. The set never shrinks — drift
+	// recovery only happens on process restart, which matches the
+	// `minio-init`-pre-creates-bucket failure mode that motivated #77.
+	bucketReady sync.Map
 }
 
 // NewServiceMinio NewServiceMinio
@@ -82,40 +93,68 @@ func NewServiceMinio(ctx *config.Context) *ServiceMinio {
 // race the policy update. The `BucketAlreadyOwnedByYou` S3 response is
 // swallowed as a benign no-op for the case where another process (or another
 // node sharing these credentials) won the create race.
+//
+// The full bootstrap (BucketExists + optional MakeBucket + SetBucketPolicy)
+// runs once per bucket per process. Deployers frequently pre-provision
+// buckets via `mc mb` / `minio-init` containers before this process starts;
+// the original implementation skipped SetBucketPolicy when BucketExists
+// returned true, so those pre-existing buckets stayed policy-less and any
+// browser-direct GET (e.g. group avatars) returned 403 (#77). The fix is to
+// apply the policy on the first ensureBucket call of each bucket regardless
+// of who created it, then memoize via `bucketReady` so the hot upload path
+// is not paying an extra HTTP round-trip per request. The memo is process-
+// local: a restart re-runs the bootstrap, which is exactly the self-healing
+// behaviour wanted for the minio-init-pre-creates-bucket failure mode.
 func (sm *ServiceMinio) ensureBucket(ctx context.Context, client *minio.Client, bucket string) error {
+	if _, ok := sm.bucketReady.Load(bucket); ok {
+		return nil
+	}
+
 	mtxIface, _ := sm.bucketLocks.LoadOrStore(bucket, &sync.Mutex{})
 	mtx := mtxIface.(*sync.Mutex)
 	mtx.Lock()
 	defer mtx.Unlock()
+
+	// Re-check inside the lock: a parallel cold-start caller may have
+	// finished the bootstrap while we were waiting on the mutex.
+	if _, ok := sm.bucketReady.Load(bucket); ok {
+		return nil
+	}
 
 	exists, err := client.BucketExists(ctx, bucket)
 	if err != nil {
 		sm.Error(fmt.Sprintf("检测 %s目录是否存在错误", bucket), zap.Error(err))
 		return err
 	}
-	if exists {
-		return nil
-	}
 
-	if err := client.MakeBucket(ctx, bucket, minio.MakeBucketOptions{Region: minioDefaultRegion}); err != nil {
-		// Another caller (different process / different node sharing the
-		// same credentials) may have created the bucket between our
-		// BucketExists call and our MakeBucket call. Treat that specific
-		// S3 response as a no-op rather than a hard failure.
-		if minio.ToErrorResponse(err).Code == minioBucketAlreadyOwnedByYou {
-			sm.Info("bucket already owned by us, skipping create", zap.String("bucket", bucket))
-		} else {
-			sm.Error(fmt.Sprintf("创建 %s目录失败", bucket), zap.Error(err))
-			return err
+	if !exists {
+		if err := client.MakeBucket(ctx, bucket, minio.MakeBucketOptions{Region: minioDefaultRegion}); err != nil {
+			// Another caller (different process / different node sharing
+			// the same credentials) may have created the bucket between
+			// our BucketExists call and our MakeBucket call. Treat that
+			// specific S3 response as a no-op rather than a hard failure
+			// and fall through to SetBucketPolicy — the race winner may
+			// not have applied the policy yet, and a redundant Set is
+			// cheap.
+			if minio.ToErrorResponse(err).Code == minioBucketAlreadyOwnedByYou {
+				sm.Info("bucket already owned by us, skipping create", zap.String("bucket", bucket))
+			} else {
+				sm.Error(fmt.Sprintf("创建 %s目录失败", bucket), zap.Error(err))
+				return err
+			}
 		}
 	}
 
 	// Read-only public policy: allow anonymous download only. Upload and
-	// delete go through authenticated server-side credentials.
+	// delete go through authenticated server-side credentials. Applied
+	// whether the bucket was just created or pre-existed — see function
+	// doc for the self-healing rationale.
 	if err := client.SetBucketPolicy(ctx, bucket, fmt.Sprintf(readOnlyAnonymousPolicy, bucket)); err != nil {
 		sm.Error("设置minio文件读写权限错误", zap.Error(err))
 		return err
 	}
+
+	sm.bucketReady.Store(bucket, struct{}{})
 	return nil
 }
 
