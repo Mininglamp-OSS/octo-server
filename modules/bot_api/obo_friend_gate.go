@@ -17,29 +17,35 @@
 //  2. block every managed-persona reply with `bot is not a friend of
 //     this user` — which is what im-test 2026-05-19 surfaced for james.
 //
-// The fix is a server-side **implicit** bypass: when the friend gate
-// would reject a DM send, we check whether an active OBO grant
-// authorises the bot to operate as some grantor in that channel, and
-// the grantor still has a valid relation with the target. If so, the
-// friendship requirement is satisfied transitively by the grantor's
-// relation — the bot is acting as the grantor, the grantor is friends
-// with the target, so the send is legitimate.
+// The fix is a server-side conditional bypass: when the request
+// carries a validated OBO context (i.e. the bot is asking to dispatch
+// as a real grantor via the `on_behalf_of` field on sendMessage), and
+// the friend gate would otherwise reject the DM, we check whether an
+// active OBO grant authorises the bot to operate as some grantor in
+// that channel and the grantor still has a valid relation with the
+// target. If so, the friendship requirement is satisfied transitively
+// by the grantor's relation — the bot is acting as the grantor, the
+// grantor is friends with the target, so the send is legitimate.
 //
-// Why implicit (instead of an `on_behalf_of` header on typing /
-// readReceipt): the bot adapter is the only caller and it already
-// signals OBO context for the actual message via `on_behalf_of`. typing
-// and readReceipt are side-channel signals tied to the same OBO
-// session; routing them through the same explicit field would require
-// matched changes in every adapter (octo-server fix should be
-// self-contained per the issue out-of-scope list). The implicit bypass
-// only fires when an active OBO grant + scope already exists, so it
-// cannot bypass anything a legitimate OBO send couldn't already do.
+// PR#82 R7 — the bypass is **gated on the caller passing
+// hasOBOContext=true**. The bot adapter sets this when the inbound
+// request carries `on_behalf_of`; the actual `checkOBO` validation
+// (grant + scope + grantor-still-has-access) runs immediately after,
+// so a bot that lies about the header gets short-circuited there.
+// Critically, requests that omit `on_behalf_of` (sendMessage as the
+// bot itself, typing, readReceipt, messages/sync) MUST NOT consult
+// the OBO bypass — otherwise a bot with any unrelated grant covering
+// a target user could dispatch directly bot→target and expose itself
+// as a contact, defeating the user opt-in friend gate. See
+// Jerry-Xin's R7 review on head a07b372 for the regression details.
 //
-// Hot-path cost: one cached `findActiveGrantsForChannel` lookup (the
-// same one the fan-out listener consults — already negative-cached via
-// `obo:chan:*`) PLUS a per-matching-grant `grantorCanReadChannel`
-// re-check. For the common case (no OBO grant covers the target
-// channel), the negative cache makes this a single Redis GET.
+// Hot-path cost (only paid when hasOBOContext=true): one cached
+// `findActiveGrantsForChannel` lookup (the same one the fan-out
+// listener consults — already negative-cached via `obo:chan:*`) PLUS
+// a per-matching-grant `grantorCanReadChannel` re-check. For the
+// common case (no OBO grant covers the target channel) the negative
+// cache makes this a single Redis GET. Requests without OBO context
+// skip the bypass entirely and go straight back to `isFriend`.
 package bot_api
 
 import (
@@ -120,12 +126,24 @@ func (ba *BotAPI) hasOBOAccessToChannel(botUID, channelID string, channelType ui
 // isFriendOrOBOBypass is the friend-gate decision used by the bot send
 // path's BotKindUser/ChannelTypePerson branch. It first asks the user
 // service whether bot↔target are friends (the original v0 rule); if
-// not, it falls back to the OBO implicit bypass.
+// not, AND the caller signals a validated OBO context is present
+// (hasOBOContext=true), it falls back to the OBO conditional bypass.
 //
 // The two-step shape is intentional: the OBO bypass is the EXCEPTION,
 // not the rule. Most bots interact with users they ARE friends with
 // (DM apply flow), so we keep the hot path on the existing IsFriend
 // query and only consult the OBO lookup when the friend answer is no.
+//
+// PR#82 R7 — `hasOBOContext` is the **caller's pledge** that the
+// inbound request carries an `on_behalf_of` field that will be
+// independently validated by `checkOBO` on the send path. Without
+// that pledge, this function MUST behave exactly like a plain
+// IsFriend check — i.e. a bot calling sendMessage as itself (no
+// `on_behalf_of`), or invoking typing / readReceipt / messages-sync
+// (which have no on_behalf_of field at all), gets no bypass even if
+// it happens to hold an OBO grant for the channel. Otherwise such a
+// bot could send a direct bot→target DM without the user opt-in
+// (Jerry-Xin R7 finding on head a07b372).
 //
 // Errors from IsFriend are surfaced verbatim — the caller treats them
 // as "permission verification failed". Errors from hasOBOAccessToChannel
@@ -134,7 +152,7 @@ func (ba *BotAPI) hasOBOAccessToChannel(botUID, channelID string, channelType ui
 // pre-fix behaviour when no OBO bypass would have applied anyway.
 //
 // Test seam: see friendCheckOverride on BotAPI.
-func (ba *BotAPI) isFriendOrOBOBypass(botUID, targetUID string, channelType uint8) (bool, error) {
+func (ba *BotAPI) isFriendOrOBOBypass(botUID, targetUID string, channelType uint8, hasOBOContext bool) (bool, error) {
 	isFriend, err := ba.isFriend(botUID, targetUID)
 	if err != nil {
 		return false, err
@@ -142,7 +160,14 @@ func (ba *BotAPI) isFriendOrOBOBypass(botUID, targetUID string, channelType uint
 	if isFriend {
 		return true, nil
 	}
-	// Not friends → try the OBO managed-persona implicit bypass.
+	if !hasOBOContext {
+		// No validated OBO context on the request → the OBO bypass
+		// MUST NOT widen the friend gate. Returning here preserves
+		// the legacy "not a friend → deny" behaviour for plain bot
+		// sends, typing, readReceipt, and messages-sync paths.
+		return false, nil
+	}
+	// OBO context present → try the managed-persona conditional bypass.
 	bypass, _ := ba.hasOBOAccessToChannel(botUID, targetUID, channelType)
 	return bypass, nil
 }

@@ -52,25 +52,15 @@ func (ba *BotAPI) typing(c *wkhttp.Context) {
 	robotID := getRobotIDFromContext(c)
 	channelID := ba.resolveSpaceChannelID(robotID, req.ChannelID, req.ChannelType)
 
-	// YUJ-1465 / Mininglamp-OSS/octo-server#108 — OBO v2 typing
-	// identity. When `on_behalf_of` is non-empty the bot is signalling
-	// typing AS the grantor; we reuse the /v1/bot/sendMessage auth
-	// contract (active grant + scope + grantor channel access)
-	// verbatim so a bot cannot signal typing as a grantor it cannot
-	// legitimately send as. The friend-gate bypass below is gated on
-	// the SAME `hasOBOContext` pledge so plain-bot typing cannot
-	// piggy-back on an unrelated grant.
-	hasOBOContext := strings.TrimSpace(req.OnBehalfOf) != ""
-
 	// Permission check: bot must have access to this channel.
-	// PR#82 R7 — the OBO friend-gate bypass is conditional on a
-	// validated OBO context; without on_behalf_of typing dispatches
-	// AS the bot (CMDTyping carries from_uid=robotID below) so the
-	// bypass MUST NOT apply (hasOBOContext=false). Allowing it would
-	// let a bot that holds an unrelated grant signal typing in a DM
-	// with a user that has not opted in to that bot.
+	// PR#82 R7 — typing has no `on_behalf_of` field and always
+	// dispatches AS the bot (CMDTyping carries from_uid=robotID below),
+	// so the OBO friend-gate bypass MUST NOT apply here
+	// (hasOBOContext=false). Allowing it would let a bot that holds an
+	// unrelated grant signal typing in a DM with a user that has not
+	// opted in to that bot.
 	botKind := getBotKindFromContext(c)
-	if err := ba.checkSendPermission(c, botKind, robotID, req.ChannelID, req.ChannelType, hasOBOContext); err != nil {
+	if err := ba.checkSendPermission(c, botKind, robotID, req.ChannelID, req.ChannelType, false); err != nil {
 		c.ResponseError(err)
 		return
 	}

@@ -252,16 +252,21 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 			isCreator := robot != nil && robot.CreatorUID == channelID
 			if !isCreator {
 				// isFriendOrOBOBypass tries the friend lookup first; if
-				// the bot isn't a friend of the target, it falls back to
-				// the OBO bypass — "any active grant covering this
-				// channel where the grantor still has a relation with
-				// the target". The bypass is required by the
-				// managed-persona path: admin grants the clone bot
-				// james OBO over admin↔bob; james MUST be able to send
-				// (and signal typing / read-receipts) to bob even
-				// though james and bob are not friends. See
-				// modules/bot_api/obo_friend_gate.go for the rationale.
-				allowed, err := ba.isFriendOrOBOBypass(robotID, channelID, channelType)
+				// the bot isn't a friend of the target AND the caller
+				// signals OBO context, it falls back to the OBO bypass —
+				// "any active grant covering this channel where the
+				// grantor still has a relation with the target". The
+				// bypass is required by the managed-persona path: admin
+				// grants the clone bot james OBO over admin↔bob; james
+				// MUST be able to send (as admin) to bob even though
+				// james and bob are not friends. PR#82 R7 — the bypass
+				// is GATED on hasOBOContext so plain bot sends, typing,
+				// readReceipt, and messages-sync (which dispatch AS the
+				// bot, not AS the grantor) cannot piggy-back on an
+				// unrelated grant to skip the user opt-in friend gate.
+				// See modules/bot_api/obo_friend_gate.go for the
+				// rationale and the regression that motivated R7.
+				allowed, err := ba.isFriendOrOBOBypass(robotID, channelID, channelType, hasOBOContext)
 				if err != nil {
 					ba.Error("查询好友关系失败", zap.Error(err))
 					return errors.New("查询好友关系失败")
