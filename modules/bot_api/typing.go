@@ -38,9 +38,15 @@ func (ba *BotAPI) typing(c *wkhttp.Context) {
 	robotID := getRobotIDFromContext(c)
 	channelID := ba.resolveSpaceChannelID(robotID, req.ChannelID, req.ChannelType)
 
-	// Permission check: bot must have access to this channel
+	// Permission check: bot must have access to this channel.
+	// PR#82 R7 — typing has no `on_behalf_of` field and always
+	// dispatches AS the bot (CMDTyping carries from_uid=robotID below),
+	// so the OBO friend-gate bypass MUST NOT apply here
+	// (hasOBOContext=false). Allowing it would let a bot that holds an
+	// unrelated grant signal typing in a DM with a user that has not
+	// opted in to that bot.
 	botKind := getBotKindFromContext(c)
-	if err := ba.checkSendPermission(c, botKind, robotID, req.ChannelID, req.ChannelType); err != nil {
+	if err := ba.checkSendPermission(c, botKind, robotID, req.ChannelID, req.ChannelType, false); err != nil {
 		c.ResponseError(err)
 		return
 	}

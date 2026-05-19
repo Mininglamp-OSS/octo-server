@@ -67,8 +67,17 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 	robotID := getRobotIDFromContext(c)
 	botKind := getBotKindFromContext(c)
 
+	// PR#82 R7 — the OBO friend-gate bypass is conditional on a
+	// validated OBO context. We pledge that here based on the
+	// `on_behalf_of` field; checkOBO below independently validates the
+	// grant + scope + grantor channel access. If the pledge is false
+	// (bot sends as itself) the friend gate falls back to plain
+	// IsFriend with no bypass — preventing a bot that holds any
+	// unrelated grant from skipping the user opt-in.
+	hasOBOContext := strings.TrimSpace(req.OnBehalfOf) != ""
+
 	// Permission check based on bot kind
-	if err := ba.checkSendPermission(c, botKind, robotID, req.ChannelID, req.ChannelType); err != nil {
+	if err := ba.checkSendPermission(c, botKind, robotID, req.ChannelID, req.ChannelType, hasOBOContext); err != nil {
 		c.ResponseError(err)
 		return
 	}
@@ -162,7 +171,15 @@ func ensureMap(m map[string]interface{}) map[string]interface{} {
 }
 
 // checkSendPermission verifies the bot has permission to send to the target channel.
-func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, channelID string, channelType uint8) error {
+//
+// PR#82 R7 — `hasOBOContext` signals that the inbound request carries a
+// validated `on_behalf_of` field. Only sendMessage can set this true
+// (it's the only handler whose request schema has the field, and the
+// dispatch path validates it via `checkOBO` immediately after this
+// returns). typing / readReceipt / messages-sync must pass false: they
+// dispatch AS the bot, never AS a grantor, so they cannot legitimately
+// take the OBO friend-gate bypass.
+func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, channelID string, channelType uint8, hasOBOContext bool) error {
 	switch botKind {
 	case BotKindApp:
 		// Rule 1: App Bot only supports DM
@@ -234,16 +251,21 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 			isCreator := robot != nil && robot.CreatorUID == channelID
 			if !isCreator {
 				// isFriendOrOBOBypass tries the friend lookup first; if
-				// the bot isn't a friend of the target, it falls back to
-				// the OBO bypass — "any active grant covering this
-				// channel where the grantor still has a relation with
-				// the target". The bypass is required by the
-				// managed-persona path: admin grants the clone bot
-				// james OBO over admin↔bob; james MUST be able to send
-				// (and signal typing / read-receipts) to bob even
-				// though james and bob are not friends. See
-				// modules/bot_api/obo_friend_gate.go for the rationale.
-				allowed, err := ba.isFriendOrOBOBypass(robotID, channelID, channelType)
+				// the bot isn't a friend of the target AND the caller
+				// signals OBO context, it falls back to the OBO bypass —
+				// "any active grant covering this channel where the
+				// grantor still has a relation with the target". The
+				// bypass is required by the managed-persona path: admin
+				// grants the clone bot james OBO over admin↔bob; james
+				// MUST be able to send (as admin) to bob even though
+				// james and bob are not friends. PR#82 R7 — the bypass
+				// is GATED on hasOBOContext so plain bot sends, typing,
+				// readReceipt, and messages-sync (which dispatch AS the
+				// bot, not AS the grantor) cannot piggy-back on an
+				// unrelated grant to skip the user opt-in friend gate.
+				// See modules/bot_api/obo_friend_gate.go for the
+				// rationale and the regression that motivated R7.
+				allowed, err := ba.isFriendOrOBOBypass(robotID, channelID, channelType, hasOBOContext)
 				if err != nil {
 					ba.Error("查询好友关系失败", zap.Error(err))
 					return errors.New("查询好友关系失败")
@@ -301,9 +323,12 @@ func (ba *BotAPI) readReceipt(c *wkhttp.Context) {
 		channelType = req.ChannelType
 	}
 
-	// Permission check: bot must have access to this channel
+	// Permission check: bot must have access to this channel.
+	// PR#82 R7 — readReceipt has no `on_behalf_of` field and always
+	// dispatches AS the bot, so the OBO friend-gate bypass MUST NOT
+	// apply here (hasOBOContext=false).
 	botKind := getBotKindFromContext(c)
-	if err := ba.checkSendPermission(c, botKind, robotID, req.ChannelID, channelType); err != nil {
+	if err := ba.checkSendPermission(c, botKind, robotID, req.ChannelID, channelType, false); err != nil {
 		c.ResponseError(err)
 		return
 	}

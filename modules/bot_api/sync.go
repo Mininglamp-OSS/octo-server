@@ -89,7 +89,15 @@ func (ba *BotAPI) syncMessages(c *wkhttp.Context) {
 				// clones need to read message history of channels they
 				// have OBO authority over even when bot↔user is not a
 				// friend pair.
-				allowed, err := ba.isFriendOrOBOBypass(robotID, req.ChannelID, req.ChannelType)
+				//
+				// PR#82 R7 — messages/sync has no `on_behalf_of` field
+				// and the response stream is delivered TO the bot, not
+				// proxied through any grantor. A bot that holds an
+				// unrelated grant covering some target must NOT be able
+				// to pull that target's DM history without the user
+				// opt-in friend gate. So hasOBOContext=false: pure
+				// IsFriend, no bypass.
+				allowed, err := ba.isFriendOrOBOBypass(robotID, req.ChannelID, req.ChannelType, false)
 				if err != nil {
 					ba.Error("failed to check friend relationship", zap.Error(err))
 					c.ResponseError(errors.New("failed to check friend relationship"))
