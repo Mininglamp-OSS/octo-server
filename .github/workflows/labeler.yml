@@ -1,7 +1,15 @@
 name: PR Labeler
 
 on:
-  pull_request:
+  # pull_request_target runs in the context of the base repo and retains write
+  # access even for fork PRs — required because the reusable labeler calls the
+  # GitHub REST API to set labels and post comments (both need write tokens).
+  #
+  # Security: this workflow does NOT check out or execute any code from the PR
+  # branch; it only passes the PR number / owner / repo name to a reusable
+  # workflow that performs only API calls against the base repo. This matches
+  # the pattern used by auto-add-to-project.yml and octo-pr-feed.yml.
+  pull_request_target: # zizmor: ignore[dangerous-triggers] metadata-only automation; no PR code executed
     types: [opened, synchronize, reopened]
 
 permissions: {}
