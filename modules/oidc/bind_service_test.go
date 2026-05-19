@@ -1163,6 +1163,26 @@ func TestBindService_Create_PhoneNotVerified(t *testing.T) {
 	}
 }
 
+// 非 +86 verified phone + 无 email → ErrBindCreateClaimsIncomplete。
+//
+// extractPhone 当前只识别 +86;放过其他号段会让 IssueSession 收到空 Phone/Zone,
+// 落库后用户没有可用手机号锚点。把"格式不支持"提前到 422 而非建残缺账号。
+func TestBindService_Create_NonCNPhone_NoEmail_ClaimsIncomplete(t *testing.T) {
+	h := newBindHarness(t, func(c *BindConfig) {
+		c.AllowCreate = true
+	})
+	c := sampleClaims()
+	c.Email = ""
+	c.EmailVerified = false
+	c.PhoneNumber = "+14155551234" // verified 但 dmwork 不支持
+	c.PhoneVerified = true
+	jti, _ := h.svc.Issue(context.Background(), c, sampleSD())
+	_, err := h.svc.Create(context.Background(), jti)
+	if !errors.Is(err, ErrBindCreateClaimsIncomplete) {
+		t.Fatalf("non-+86 phone + no email must be rejected, got %v", err)
+	}
+}
+
 // T22: email 存在但未 verified + phone 缺失 → ErrBindCreateClaimsIncomplete
 func TestBindService_Create_EmailNotVerified(t *testing.T) {
 	h := newBindHarness(t, func(c *BindConfig) {
@@ -1179,12 +1199,16 @@ func TestBindService_Create_EmailNotVerified(t *testing.T) {
 	}
 }
 
-// T16: 超过 bindCreateMax(=1)→ ErrBindRateLimited,status 不变
+// T16: 超过 bindCreateMax(=1)→ ErrBindRateLimited
+//
+// 新设计语义:第一次 Create 失败(IssueSession 报错)会把 token 留在 creating 锁
+// 状态(防 ghost user)。第二次 Create:counter=2 > bindCreateMax=1,先被
+// IncrAndCheck 拦下返 ErrBindRateLimited,不到 CAS。两个失败状态都不会让 token
+// 被同样的 jti 复用建出第二个 user。
 func TestBindService_Create_RateLimited(t *testing.T) {
 	h := newBindHarness(t, func(c *BindConfig) {
 		c.AllowCreate = true
 	})
-	// 让 IssueSession 失败,避免第一次 Create 把 token 消费掉
 	h.users.err = errors.New("transient")
 	jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
 
@@ -1192,17 +1216,12 @@ func TestBindService_Create_RateLimited(t *testing.T) {
 		t.Fatal("first create should fail due to IssueSession error")
 	}
 	sess, _ := h.store.Get(context.Background(), jti)
-	if sess.Status != BindStatusIssued {
-		t.Fatalf("T16: status must remain issued after failed create, got %v", sess.Status)
+	if sess.Status != BindStatusCreating {
+		t.Fatalf("T16: status must be 'creating' after failed create (lock-before-side-effect), got %v", sess.Status)
 	}
-	// 第二次:counter=2 > bindCreateMax=1 → ErrBindRateLimited
 	_, err := h.svc.Create(context.Background(), jti)
 	if !errors.Is(err, ErrBindRateLimited) {
 		t.Fatalf("T16: expected ErrBindRateLimited, got %v", err)
-	}
-	sess2, _ := h.store.Get(context.Background(), jti)
-	if sess2.Status != BindStatusIssued {
-		t.Fatalf("T16: status must remain issued after rate limit, got %v", sess2.Status)
 	}
 }
 
@@ -1227,21 +1246,31 @@ func TestBindService_Create_AfterVerifyFail_Succeeds(t *testing.T) {
 	}
 }
 
-// T26: create 失败后再 verify → 通过(D3)
-func TestBindService_Create_FailThenVerify_Succeeds(t *testing.T) {
+// T26: claims invalid 的 create 失败不会污染 token 状态 → 之后 verify 仍可走。
+//
+// 新设计语义:claims 校验在 CAS 之前(纯只读),失败保持 token 在 issued。
+// 这是"create 失败不阻塞 verify"的合法路径 —— IssueSession 已经发生的失败
+// 会把 token 锁到 creating(防 ghost user),此后 verify 也会被拒,符合预期。
+func TestBindService_Create_ClaimsFailThenVerify_Succeeds(t *testing.T) {
 	h := newBindHarness(t, func(c *BindConfig) {
 		c.AllowCreate = true
 		c.VerifyMax = 3
 	})
-	jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	c := sampleClaims()
+	c.Email = ""
+	c.EmailVerified = false
+	c.PhoneNumber = ""
+	c.PhoneVerified = false
+	jti, _ := h.svc.Issue(context.Background(), c, sampleSD())
 
-	// create fails (IssueSession error)
-	h.users.err = errors.New("transient")
-	if _, err := h.svc.Create(context.Background(), jti); err == nil {
-		t.Fatal("Create should fail with IssueSession error")
+	if _, err := h.svc.Create(context.Background(), jti); !errors.Is(err, ErrBindCreateClaimsIncomplete) {
+		t.Fatalf("Create must fail with claims incomplete, got %v", err)
+	}
+	sess, _ := h.store.Get(context.Background(), jti)
+	if sess.Status != BindStatusIssued {
+		t.Fatalf("status after claims-check failure must remain issued, got %v", sess.Status)
 	}
 
-	// status still issued → verify should work
 	h.auth.verifyPasswordResp.matched = true
 	h.loc.byUsername["alice"] = "u-alice"
 	if err := h.svc.VerifyPassword(context.Background(), jti, "alice", "p"); err != nil {
@@ -1249,8 +1278,13 @@ func TestBindService_Create_FailThenVerify_Succeeds(t *testing.T) {
 	}
 }
 
-// T23: IssueSession 失败 → wrap error，不消费 token（允许 retry）
-func TestBindService_Create_IssueSessionFail_TokenNotConsumed(t *testing.T) {
+// T23: IssueSession 失败 → wrap error,token 留在 creating 锁状态。
+//
+// 新设计语义:token 不被 Consume(Redis 行还在),但 status 已经被 CAS 推到
+// creating(防 ghost user)。retry 同 jti 会撞 CAS conflict 或 rate limit ——
+// 这是有意为之:确保单个 IdP 身份只产生一个本地 user。
+// 用户需重走 OIDC 登录拿新 bind_token 才能再次尝试。
+func TestBindService_Create_IssueSessionFail_TokenLockedCreating(t *testing.T) {
 	h := newBindHarness(t, func(c *BindConfig) {
 		c.AllowCreate = true
 	})
@@ -1261,9 +1295,12 @@ func TestBindService_Create_IssueSessionFail_TokenNotConsumed(t *testing.T) {
 	if err == nil {
 		t.Fatal("T23: Create must propagate IssueSession error")
 	}
-	// token must NOT be consumed — still available for retry
-	if _, err := h.store.Get(context.Background(), jti); err != nil {
-		t.Fatalf("T23: session must remain for retry after IssueSession failure, got err=%v", err)
+	sess, gerr := h.store.Get(context.Background(), jti)
+	if gerr != nil {
+		t.Fatalf("T23: session must NOT be consumed (Redis row still exists), got %v", gerr)
+	}
+	if sess.Status != BindStatusCreating {
+		t.Fatalf("T23: status must be 'creating' after IssueSession failure (防 ghost user), got %v", sess.Status)
 	}
 }
 
@@ -1399,10 +1436,10 @@ func TestBindService_Create_StatusGuards(t *testing.T) {
 			ErrBindStatusConflict,
 		},
 		{
-			"T13: status=created → conflict (防重复 create)",
+			"T13: status=creating → conflict (防重复 create / 抢到锁的另一 goroutine 正在副作用阶段)",
 			func(h *bindTestHarness, jti string) {
 				sess, _ := h.store.Get(context.Background(), jti)
-				sess.Status = BindStatusCreated
+				sess.Status = BindStatusCreating
 				_ = h.store.Save(context.Background(), sess, time.Minute)
 			},
 			ErrBindStatusConflict,
@@ -1443,42 +1480,41 @@ func TestBindService_Create_TokenNotFound(t *testing.T) {
 	}
 }
 
-// TestBindService_SaveCreated_CASIssued 锁定 saveCreated:
-// CAS issued → created,并用绝对 TTL(与 saveVerified 对称)。
-// 并发两次 saveCreated 只有一个成功,另一个 ErrBindStatusConflict。
-func TestBindService_SaveCreated_CASIssued(t *testing.T) {
+// TestBindService_CasLockForCreate_Issued CAS issued → creating,
+// 并用绝对剩余 TTL(与 saveVerified 对称,不续命到 TokenTTL × 2)。
+func TestBindService_CasLockForCreate_Issued(t *testing.T) {
 	h := newBindHarness(t)
 	jti, err := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
-
 	sess, err := h.store.Get(context.Background(), jti)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if err := h.svc.saveCreated(context.Background(), sess); err != nil {
-		t.Fatalf("saveCreated: %v", err)
+	if err := h.svc.casLockForCreate(context.Background(), sess); err != nil {
+		t.Fatalf("casLockForCreate: %v", err)
 	}
 	got, err := h.store.Get(context.Background(), jti)
 	if err != nil {
-		t.Fatalf("Get after saveCreated: %v", err)
+		t.Fatalf("Get after casLockForCreate: %v", err)
 	}
-	if got.Status != BindStatusCreated {
-		t.Fatalf("status=%v want created", got.Status)
+	if got.Status != BindStatusCreating {
+		t.Fatalf("status=%v want creating", got.Status)
 	}
 }
 
-func TestBindService_SaveCreated_CASConflictOnSecondCall(t *testing.T) {
+// TestBindService_CasLockForCreate_ConflictOnSecondCall 第二次 CAS 应当撞 conflict —
+// 这是"防 ghost user"的核心:并发两个 create 永远只有一个进入副作用阶段。
+func TestBindService_CasLockForCreate_ConflictOnSecondCall(t *testing.T) {
 	h := newBindHarness(t)
 	jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
 	sess, _ := h.store.Get(context.Background(), jti)
-	if err := h.svc.saveCreated(context.Background(), sess); err != nil {
-		t.Fatalf("first saveCreated: %v", err)
+	if err := h.svc.casLockForCreate(context.Background(), sess); err != nil {
+		t.Fatalf("first casLockForCreate: %v", err)
 	}
-	// second call: status is now created, not issued → conflict
-	if err := h.svc.saveCreated(context.Background(), sess); !errors.Is(err, ErrBindStatusConflict) {
-		t.Fatalf("second saveCreated must ErrBindStatusConflict, got %v", err)
+	if err := h.svc.casLockForCreate(context.Background(), sess); !errors.Is(err, ErrBindStatusConflict) {
+		t.Fatalf("second casLockForCreate must ErrBindStatusConflict, got %v", err)
 	}
 }
 

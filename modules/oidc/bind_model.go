@@ -32,14 +32,23 @@ var validBindMethods = map[BindMethod]struct{}{
 //
 // 合法迁移路径:
 //
-//	issued ─── verify ok ───▶ verified ─── confirm ok ───▶ confirmed
+//	issued ─── verify ok ───▶ verified ─── confirm ok ───▶ Consume(token 消失)
 //	  │                          │
 //	  │                          └── confirm fail ──▶ verified (允许重试,直到 ConfirmMax)
 //	  │
+//	  ├── create CAS lock ───▶ creating ─── IssueSession+Insert+Consume ──▶ (token 消失)
+//	  │                          │
+//	  │                          └── 中途失败 ──▶ creating (stuck,TTL 自然清理)
+//	  │
 //	  └── 超限/手动放弃 ──▶ refused
 //
-// CAS 由 BindStore.UpdateStatus 保证。confirmed/refused 是终态,任何指向终态
-// 之外的 UpdateStatus 都应当返 ErrBindStatusConflict。
+// CAS 由 BindStore.CASSave 保证。creating/refused 是中间或终止状态,任何对它们
+// 的进一步推进都返 ErrBindStatusConflict。confirmed/created 不入 Redis ——
+// 成功路径由 Consume 把 session 整条删除,后续 Get 拿到 ErrBindNotFound。
+//
+// creating 引入的目的:把"建号副作用"(IssueSession 落库 + identity.Insert)
+// 包在 CAS 锁后面,防止并发 verify/create 把已经在写真实用户的 token 推到其他
+// 状态后再 saveCreated 撞 conflict —— 那种顺序会留下"ghost user"。
 type BindStatus string
 
 const (
@@ -47,7 +56,10 @@ const (
 	BindStatusVerified  BindStatus = "verified"
 	BindStatusConfirmed BindStatus = "confirmed"
 	BindStatusRefused   BindStatus = "refused"
-	BindStatusCreated   BindStatus = "created"
+	// BindStatusCreating 介于 issued 与 Consume 之间的中间锁:CAS issued→creating
+	// 成功后才允许进入 IssueSession / identity.Insert 等副作用阶段。失败留 creating,
+	// 由 5min TTL 自然清理(用户需重走 OIDC 登录获取新 bind_token)。
+	BindStatusCreating BindStatus = "creating"
 )
 
 // BindSession bind_token 在 Redis 里的完整快照。

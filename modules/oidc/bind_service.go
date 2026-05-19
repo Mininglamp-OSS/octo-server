@@ -461,18 +461,27 @@ type BindCreateResp struct {
 	Issuer    string
 }
 
-// Create 在 status=issued 时直接用 bind_token 里的 claims 建号 + 写 identity + 签发会话。
+// Create 在 status=issued 时用 bind_token 里的 claims 建号 + 写 identity + 签发会话。
 //
-// 步骤(见 plan §4):
+// 顺序很关键(防 ghost user):
 //  1. Get session
-//  2. IncrAndCheck("bind:create:"+jti, bindCreateMax) — counter→status 顺序与 Confirm 对齐
-//  3. 校验 status == issued
-//  4. decode claims snapshot
-//  5. 校验 claims 至少有一条 verified 的 email 或 phone
-//  6. IssueSession({CreateUser:true, ...claims})
-//  7. identity.Insert((uid, issuer, sub))
-//  8. CASSave(issued→created)
-//  9. Consume(token) — 单次消费;失败仅 log
+//  2. IncrAndCheck("bind:create:"+jti, bindCreateMax) — counter→status 与 Confirm 对齐,
+//     任何对 create 的探测都消耗配额
+//  3. decode claims + 校验(纯只读,无副作用,失败保持 token 在 issued 让用户重试)
+//  4. CASSave issued→creating — 唯一的"锁":只有拿到锁的 goroutine 才能进入
+//     产生副作用的 #5/#6/#7。并发 verify/create 都会撞 CAS 失败 → ErrBindStatusConflict,
+//     不会出现"副作用已发生但终态锁不上"的 ghost-user 窗口。
+//  5. IssueSession({CreateUser:true, ...}) — 副作用 #1:dmwork user 入库
+//  6. identity.Insert((uid, issuer, sub)) — 副作用 #2:user_oidc_identity 入库
+//  7. Consume(token) — 终态:token 整条删除,后续 Get 返 ErrBindNotFound
+//
+// 中途失败语义:
+//   - #5/#6 失败:token 卡在 creating,5min TTL 后自然消失。**不会**被同一 token
+//     的二次 create 重复触发(CAS issued→creating 第二次必败)—— 避免重试产生
+//     第二个 ghost user。用户体感:需要重走 OIDC 登录拿新 bind_token。
+//   - #6 撞 uk_issuer_subject(并发不同 token 同 issuer+sub):返 ErrBindAlreadyBound,
+//     handler 引导用户重发起 OIDC 登录拾取赢家会话(与 plan §4 一致)。
+//   - #7 失败:用户已建,会话已发,token 5min TTL 自清,只 log warn。
 func (s *BindService) Create(ctx context.Context, jti string) (*BindCreateResp, error) {
 	if s.identity == nil || s.users == nil {
 		return nil, errors.New("oidc bind Create: not configured (identity/users nil)")
@@ -481,13 +490,9 @@ func (s *BindService) Create(ctx context.Context, jti string) (*BindCreateResp, 
 	if err != nil {
 		return nil, err
 	}
-	// counter→status 顺序(与 Confirm 对齐):任意对 create 的探测都消耗配额
 	if _, err := s.store.IncrAndCheck(ctx,
 		"bind:create:"+jti, bindCreateMax, s.cfg.TokenTTL); err != nil {
 		return nil, err
-	}
-	if sess.Status != BindStatusIssued {
-		return nil, ErrBindStatusConflict
 	}
 	claims, err := decodeClaimsSnapshot(sess.ClaimsSnapshot)
 	if err != nil {
@@ -498,6 +503,12 @@ func (s *BindService) Create(ctx context.Context, jti string) (*BindCreateResp, 
 	}
 	sd, err := decodeSDSnapshot(sess.SDSnapshot)
 	if err != nil {
+		return nil, err
+	}
+	// CAS issued→creating:把后续所有副作用包在锁里。
+	// 失败原因:(a) 别的 goroutine 已推进了 status(verify / 另一个 create),
+	// (b) token TTL 已到。两种都返 ErrBindStatusConflict / ErrBindNotFound,无副作用。
+	if err := s.casLockForCreate(ctx, sess); err != nil {
 		return nil, err
 	}
 	zone, phone := extractZone(claims.PhoneNumber), extractPhone(claims.PhoneNumber)
@@ -530,9 +541,6 @@ func (s *BindService) Create(ctx context.Context, jti string) (*BindCreateResp, 
 		}
 		return nil, fmt.Errorf("oidc bind Create: insert identity: %w", err)
 	}
-	if err := s.saveCreated(ctx, sess); err != nil {
-		return nil, fmt.Errorf("oidc bind Create: save created: %w", err)
-	}
 	if _, cerr := s.store.Consume(ctx, jti); cerr != nil {
 		log.Warn("OIDC bind Create: consume session failed (non-fatal, will TTL out)",
 			zap.String("jti_hash", subHash(jti)), zap.Error(cerr))
@@ -546,11 +554,17 @@ func (s *BindService) Create(ctx context.Context, jti string) (*BindCreateResp, 
 }
 
 // checkClaimsForCreate 校验 claims 至少有一条强标识(email 或 phone)。
-// 与 autolink 的准入条件对齐:email_verified / phone_verified 必须为 true,
-// 否则后续客服 / 找回流程没有可信账号锚点。
+//
+// phone 可用性必须用 extractPhone 判定,不能只看 PhoneNumber != "":
+// dmwork 当前仅支持 +86 号段(service.go:extractPhone),非 +86 verified phone
+// 会被 IssueSession 默默丢成空 Phone/Zone,落库后用户没有可用手机号锚点。
+// 用 extractPhone 做能用性检查,把"格式不支持"提前到 422 而非建出残缺账号。
+//
+// email_verified / phone_verified 必须为 true,否则后续客服 / 找回流程没有可信锚点
+// (与 autolink 准入条件一致)。
 func (s *BindService) checkClaimsForCreate(claims *IDTokenClaims) error {
 	hasEmail := claims.Email != "" && claims.EmailVerified
-	hasPhone := claims.PhoneNumber != "" && claims.PhoneVerified
+	hasPhone := claims.PhoneVerified && extractPhone(claims.PhoneNumber) != ""
 	if !hasEmail && !hasPhone {
 		return ErrBindCreateClaimsIncomplete
 	}
@@ -592,14 +606,24 @@ func (s *BindService) saveVerified(ctx context.Context, sess *BindSession) error
 
 // saveCreated 把 sess.Status 从 issued CAS 到 created,使用绝对剩余 TTL。
 // 对称 saveVerified:CAS expected=issued,防并发 create 竞态。
-func (s *BindService) saveCreated(ctx context.Context, sess *BindSession) error {
+// casLockForCreate 把 issued 锁到 creating —— Create 路径下唯一的状态写入。
+//
+// 不复用 saveVerified 的"写整条 session"是因为 Create 没有 verify/sms 那种业务字段
+// 要落地(CandidateUID/VerifiedMethod),只需推进 status。CAS 用 BindStatusIssued
+// 作为期望值,保证并发 verify(已把 status 推到 verified)或并发 create(已推到
+// creating)都拒绝在此处,不进入下游副作用阶段。
+//
+// TTL 用 remainingTTL 而非完整 cfg.TokenTTL:防止 Create 把 token 续命到 issue 后
+// 的 "TokenTTL × 2",与文档承诺的 5min 不符。remaining<=0 时返 ErrBindNotFound 让
+// 上层按"已过期"处理。
+func (s *BindService) casLockForCreate(ctx context.Context, sess *BindSession) error {
 	remaining := s.remainingTTL(sess)
 	if remaining <= 0 {
 		return ErrBindNotFound
 	}
-	sess.Status = BindStatusCreated
+	sess.Status = BindStatusCreating
 	if err := s.store.CASSave(ctx, sess, BindStatusIssued, remaining); err != nil {
-		return fmt.Errorf("oidc bind: cas save created session: %w", err)
+		return fmt.Errorf("oidc bind: cas lock creating: %w", err)
 	}
 	return nil
 }
