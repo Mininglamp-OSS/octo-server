@@ -224,11 +224,17 @@ type Message struct {
 	mutex    sync.Mutex
 	stopChan chan struct{}
 	// reminderSeqOverride lets unit tests stub the version generator
-	// used by getReminders / cancelMentionReminderIfNeed so the helpers
-	// can be exercised without standing up the seq table / MySQL.
-	// Production path: nil → ctx.GenSeq(common.RemindersKey) runs.
-	// Tests inject a deterministic counter so the matrix tests in
+	// used by getReminders so the matrix helpers can run without
+	// standing up the seq table / MySQL. Production path: nil →
+	// ctx.GenSeq(common.RemindersKey) runs. Tests inject a
+	// deterministic counter so the matrix tests in
 	// api_reminders_test.go don't need a live DB. See nextReminderSeq.
+	//
+	// Scope: getReminders + reminderDone only (everything wired through
+	// nextReminderSeq). cancelMentionReminderIfNeed and other in-tree
+	// callers still call ctx.GenSeq directly — those paths are not
+	// exercised by the matrix suite, so widening the seam there is
+	// deliberately deferred to keep the diff minimal.
 	reminderSeqOverride func() (int64, error)
 }
 

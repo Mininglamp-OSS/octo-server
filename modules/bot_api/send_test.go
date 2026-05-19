@@ -59,9 +59,9 @@ func TestSendMessage_PersonalDM_StripsForgedClientSpaceID(t *testing.T) {
 
 	const (
 		botRobotID    = "bot_X"
-		creatorUID    = "user_creator"      // == channel_id, exercises creator-bypass branch
-		authoritative = "space_A"           // returned by stubbed querySpaceIDByRobotID
-		forged        = "space_B_attacker"  // attacker-supplied value in payload
+		creatorUID    = "user_creator"     // == channel_id, exercises creator-bypass branch
+		authoritative = "space_A"          // returned by stubbed querySpaceIDByRobotID
+		forged        = "space_B_attacker" // attacker-supplied value in payload
 	)
 
 	dc := &dispatchCapture{}
