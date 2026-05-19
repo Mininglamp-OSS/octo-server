@@ -6,12 +6,21 @@ name: CI
 
 on:
   pull_request:
+    types: [opened, reopened, synchronize, ready_for_review, converted_to_draft]
     branches:
       - main
       - 'release/**'
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - ".github/ISSUE_TEMPLATE/**"
   push:
     branches:
       - main
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - ".github/ISSUE_TEMPLATE/**"
 
 permissions:
   contents: read
@@ -25,6 +34,7 @@ env:
 
 jobs:
   build:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Build
     runs-on: ubuntu-latest
     steps:
@@ -38,6 +48,7 @@ jobs:
         run: CGO_ENABLED=0 go build -v ./...
 
   test:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Test
     runs-on: ubuntu-latest
     # MySQL and Redis are required by ~10 modules' integration tests
@@ -141,6 +152,7 @@ jobs:
           exit $fail
 
   vet:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Vet
     runs-on: ubuntu-latest
     steps:
@@ -154,6 +166,7 @@ jobs:
         run: go vet ./...
 
   lint:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Lint
     runs-on: ubuntu-latest
     steps:
