@@ -32,10 +32,10 @@ func TestSendMessage_OBO_Authorized_SwapsFromUID(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	const (
-		botID    = "bot_clone_001"
-		grantor  = "user_yu"
-		group    = "group_42"
-		authSp   = "space_A"
+		botID   = "bot_clone_001"
+		grantor = "user_yu"
+		group   = "group_42"
+		authSp  = "space_A"
 	)
 
 	// Stub OBO: enabled grant + scope for (grantor, bot) in this group.
@@ -307,8 +307,8 @@ func TestSendMessage_RejectsReservedOBOKey_OtherPrefix(t *testing.T) {
 		ChannelID:   owner,
 		ChannelType: common.ChannelTypePerson.Uint8(),
 		Payload: map[string]interface{}{
-			"content":              "hi",
-			"type":                 1,
+			"content":               "hi",
+			"type":                  1,
 			"__obo_actual_sender__": "victim_bot",
 		},
 	})
@@ -325,5 +325,71 @@ func TestSendMessage_RejectsReservedOBOKey_OtherPrefix(t *testing.T) {
 	ba.sendMessage(c)
 	if dc.captured != nil {
 		t.Fatalf("dispatch must NOT fire for any __obo_* key, got %+v", dc.captured)
+	}
+}
+
+// TestBotMessage_OBOReservedKeysKept — PR#82 R8 contract guard.
+// Asserts that the bot-API behavior on reserved `__obo_*` keys is
+// UNCHANGED by the user-ingress strip fix: the bot ingress still
+// REJECTS the request (vs the user ingress, which silently strips).
+//
+// Why both behaviors coexist
+// ==========================
+// The R8 fix added a silent strip at the user-message ingress
+// (modules/message/api.go → m.sendMessage) so a normal user can't
+// forge gate-3 markers. The bot ingress already rejected the same
+// prefix and we MUST NOT relax that — bot authors are expected to
+// know the reserved namespace, and a loud 4xx makes integration bugs
+// obvious instead of silently dropping fields.
+//
+// This test is named to mirror the user-side guard
+// (`TestUserMessage_OBOReservedKeysStripped` in modules/message) so a
+// grep over the codebase finds both halves of the contract.
+func TestBotMessage_OBOReservedKeysKept(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const (
+		botID  = "bot_legacy"
+		owner  = "creator_uid"
+		authSp = "space_A"
+	)
+
+	dc := &dispatchCapture{}
+	ba := &BotAPI{
+		Log:              log.NewTLog("BotAPI-bot-keeps-reject"),
+		spaceQuerier:     &fakeSpaceQuerier{defaultSpace: authSp},
+		dispatchOverride: dc.hook,
+		oboStoreOverride: newFakeOBOStore(),
+	}
+
+	body, _ := json.Marshal(BotSendMessageReq{
+		ChannelID:   owner,
+		ChannelType: common.ChannelTypePerson.Uint8(),
+		Payload: map[string]interface{}{
+			"content":           "trying to bypass gate 3",
+			"type":              1,
+			"__obo_processed__": true, // <-- malicious / forbidden
+		},
+	})
+	httpReq := httptest.NewRequest(http.MethodPost, "/v1/bot/sendMessage", bytes.NewReader(body))
+	httpReq.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	gc, _ := gin.CreateTestContext(rec)
+	gc.Request = httpReq
+	c := &wkhttp.Context{Context: gc}
+	c.Set(CtxKeyRobotID, botID)
+	c.Set(CtxKeyBotKind, BotKindUser)
+	c.Set(CtxKeyRobot, &robotModel{RobotID: botID, CreatorUID: owner})
+
+	ba.sendMessage(c)
+
+	// Reject must carry a body that mentions the prefix so bot authors
+	// can grep for it in their logs.
+	if !strings.Contains(rec.Body.String(), "__obo_") {
+		t.Fatalf("expected bot-API reject body to mention __obo_ prefix, got %s", rec.Body.String())
+	}
+	// And no dispatch (= the strip-and-pass behavior the user ingress
+	// uses MUST NOT have leaked into the bot ingress).
+	if dc.captured != nil {
+		t.Fatalf("bot ingress must REJECT (not strip) reserved OBO keys; dispatch fired with %+v", dc.captured)
 	}
 }

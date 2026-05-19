@@ -220,9 +220,9 @@ type Message struct {
 	threadDB       *thread.DB
 	// groupDB: 直查 group 表，区分"群不存在"和"群已解散"两种 404 情况，
 	// groupService.GetGroupWithGroupNo 把 nil 也包成 error 不便分辨。
-	groupDB *group.DB
-	mutex          sync.Mutex
-	stopChan       chan struct{}
+	groupDB  *group.DB
+	mutex    sync.Mutex
+	stopChan chan struct{}
 }
 
 // New New
@@ -440,6 +440,11 @@ func (m *Message) sendMsg(c *wkhttp.Context) {
 // （YUJ-644 / Mininglamp-OSS#33）。空串 senderSpaceID 表示发送方未声明 Space
 // （非 Space 模式 / 老客户端兼容），PERSONAL 走老 passthrough 行为。
 func (m *Message) sendMessage(channelID string, channelType uint8, fromUID string, payload map[string]interface{}, senderSpaceID string) error {
+	// PR#82 R8 (Jerry-Xin 2026-05-19 review on head 244fe9fa): strip any
+	// reserved `__obo_*` top-level key from the user-supplied payload
+	// BEFORE persistence/dispatch. See sanitizeUserIngressPayload below
+	// for the full rationale and unit test surface.
+	sanitizeUserIngressPayload(payload, channelID, channelType, fromUID, m.Warn)
 	// YUJ-219-A / GH#1283 (analysis-report.md §4.5 / §7.4)：
 	// 派发前为消息 payload 注入权威 space_id，让客户端 SpaceFilter 拿到可信字段，
 	// race 窗口的 fail-open 语义可降级为 fail-closed。

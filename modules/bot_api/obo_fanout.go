@@ -87,6 +87,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-server/pkg/obopayload"
 	"go.uber.org/zap"
 )
 
@@ -372,38 +373,38 @@ func (ba *BotAPI) dispatchFanout(req *config.MsgSendReq) error {
 // oboProcessedMarkerKey is the JSON payload key set by sendMessage on
 // every OBO-authorized send so the fan-out listener can short-circuit
 // gate 3 without re-querying. The double-underscore prefix marks it as
-// part of the reserved `__obo_*` namespace that the inbound
-// /v1/bot/sendMessage handler strips off client payloads — making the
-// marker server-only state that bots cannot forge or suppress through
-// the public REST API. (PR#82 review #2 P1-2.)
-const oboProcessedMarkerKey = "__obo_processed__"
+// part of the reserved `__obo_*` namespace that every user-message and
+// /v1/bot/sendMessage ingress strips/rejects on client payloads —
+// making the marker server-only state that bots OR users cannot forge
+// or suppress through the public APIs.
+//
+// Source of truth for both the prefix and the marker key lives in
+// pkg/obopayload so the bot API (reject), the user message API
+// (strip), and the fan-out listener (gate-3 check) cannot drift.
+// (PR#82 review #2 P1-2 + R8 user-ingress hardening.)
+const oboProcessedMarkerKey = obopayload.ProcessedMarkerKey
 
 // oboReservedKeyPrefix is the reserved-namespace prefix for server-only
-// OBO payload fields. Inbound /v1/bot/sendMessage payloads containing
-// keys with this prefix are rejected (see send.go) so the gate-3 marker
-// — and any future server-only OBO field — cannot be impersonated by a
-// bot client.
-const oboReservedKeyPrefix = "__obo_"
+// OBO payload fields. Inbound payloads containing keys with this prefix
+// are rejected (bot API) or stripped (user message API) so the gate-3
+// marker — and any future server-only OBO field — cannot be
+// impersonated by a client.
+const oboReservedKeyPrefix = obopayload.ReservedKeyPrefix
 
 // hasOBOProcessedMarker — Gate 3. Returns true iff the payload decodes as
 // a JSON object containing `oboProcessedMarkerKey: true`. Non-JSON /
 // non-bool values are treated as absent so we err on the side of fanning
 // out.
+//
+// PR#82 R8 perf nit (Jerry-Xin): the cheap pre-check uses bytes.Contains
+// on the raw payload instead of the previous strings.Contains(string(...))
+// which forced an extra allocation on every inbound message (the vast
+// majority of which do not carry the marker at all). Both the pre-check
+// and the full decode live in pkg/obopayload now so the user-ingress
+// strip and the listener's gate-3 cannot disagree about what "marker
+// present" means.
 func hasOBOProcessedMarker(payload []byte) bool {
-	if len(payload) == 0 {
-		return false
-	}
-	// Quick reject before the unmarshal — payloads in the millions/sec
-	// hot path shouldn't pay the JSON decode cost just to find no marker.
-	if !strings.Contains(string(payload), oboProcessedMarkerKey) {
-		return false
-	}
-	var m map[string]interface{}
-	if err := json.Unmarshal(payload, &m); err != nil {
-		return false
-	}
-	v, ok := m[oboProcessedMarkerKey].(bool)
-	return ok && v
+	return obopayload.HasProcessedMarker(payload)
 }
 
 // payloadHasReservedOBOKey reports whether any top-level key in the
@@ -411,13 +412,5 @@ func hasOBOProcessedMarker(payload []byte) bool {
 // Used by /v1/bot/sendMessage to reject inbound client payloads that
 // would attempt to spoof a server-only OBO marker (gate-3 bypass).
 func payloadHasReservedOBOKey(payload map[string]interface{}) bool {
-	if len(payload) == 0 {
-		return false
-	}
-	for k := range payload {
-		if strings.HasPrefix(k, oboReservedKeyPrefix) {
-			return true
-		}
-	}
-	return false
+	return obopayload.HasReservedKey(payload)
 }
