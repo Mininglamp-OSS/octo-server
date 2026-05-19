@@ -987,6 +987,11 @@ func (o *OIDC) redirectToBindPage(c *wkhttp.Context, sd *StateData, jti string) 
 	}
 	q := target.Query()
 	q.Set("token", jti)
+	// provider 段在 bind API 路径里 (/v1/auth/oidc/<provider>/bind/*),前端从
+	// query 取出后拼回 API URL;缺失时前端兜底到 legacyProviderPathID="aegis"。
+	if o.cfg.Provider.ID != "" {
+		q.Set("provider", o.cfg.Provider.ID)
+	}
 	if sd != nil && sd.ClientAuthcode != "" {
 		q.Set("authcode", sd.ClientAuthcode)
 	}
@@ -998,6 +1003,12 @@ func (o *OIDC) redirectToBindPage(c *wkhttp.Context, sd *StateData, jti string) 
 		}
 	}
 	target.RawQuery = q.Encode()
+	// Referrer-Policy: no-referrer 防止 bind 页(可能位于独立域)及其内部子资源
+	// 把 callback URL 经 Referer 头泄漏。authcode 是 ThirdAuthcode 的 Redis key
+	// (5min 单次有效),仍是凭据,不应出现在跨域 Referer 上。后端单点强制比依赖
+	// 前端 <meta> 更可靠 —— meta 要等 bind 页 HTML 解析后才生效,防不了对 bind
+	// 页本身的请求那一跳。
+	c.Header("Referrer-Policy", "no-referrer")
 	c.Redirect(http.StatusFound, target.String())
 }
 

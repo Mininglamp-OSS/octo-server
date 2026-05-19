@@ -833,6 +833,14 @@ func TestAPI_Callback_TakesOverWithBindEnabled(t *testing.T) {
 	if q.Get("authcode") != "front-bind" {
 		t.Errorf("redirect authcode=%q want front-bind", q.Get("authcode"))
 	}
+	// 前端从 query 取 provider 拼回 /v1/auth/oidc/<provider>/bind/* API URL。
+	if q.Get("provider") != "aegis" {
+		t.Errorf("redirect provider=%q want aegis", q.Get("provider"))
+	}
+	// Referrer-Policy: no-referrer 防止 callback URL (含 authcode) 经 Referer 泄漏。
+	if got := w2.Header().Get("Referrer-Policy"); got != "no-referrer" {
+		t.Errorf("Referrer-Policy=%q want no-referrer", got)
+	}
 	// LoginRespJSON / "0" 都不该出现 —— bind 还没完成
 	if got := fakeAC.get("front-bind"); got != "" {
 		t.Errorf("ThirdAuthcode must NOT be set during bind takeover, got %q", got)
