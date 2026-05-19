@@ -30,14 +30,22 @@ var (
 // ErrOBONotAuthorized when any check fails. Unexpected DB errors are
 // returned wrapped so the handler can 500.
 //
-// Three layered checks (any failure → ErrOBONotAuthorized):
+// Four layered checks (any failure → ErrOBONotAuthorized):
 //  1. Grant row exists with active=1 AND global_enabled=1 for
 //     (grantor, botUID). This rejects revoked grants and grants whose
 //     master switch is off.
 //  2. Scope row exists with enabled=1 for (grant_id, channel_id,
 //     channel_type). White-list semantics per RFC §2 — opening a channel
 //     to a persona is always explicit.
-//  3. (No self-grant check at this layer; the REST POST /v1/obo/grants
+//  3. PR#82 round-2 P1-A — the grantor STILL has read access to the
+//     channel right now (`grantorCanReadChannel`). The scope-create-time
+//     check is not load-bearing for live membership: a grantor who
+//     authored a scope while a member of group_42 and was later kicked
+//     out must NOT be able to keep sending into group_42 as themselves
+//     through the bot, otherwise the kick is bypassable. Same logic for
+//     un-friended DM peers and parent-group leaves for community topics.
+//     DB cost: one covering-index lookup per OBO send.
+//  4. (No self-grant check at this layer; the REST POST /v1/obo/grants
 //     handler is the right place to reject `grantor == grantee` and we
 //     don't want to second-guess existing rows.)
 func (ba *BotAPI) checkOBO(botUID, grantor, channelID string, channelType uint8) error {
@@ -73,6 +81,30 @@ func (ba *BotAPI) checkOBO(botUID, grantor, channelID string, channelType uint8)
 		return err
 	}
 	if !ok {
+		return ErrOBONotAuthorized
+	}
+
+	// PR#82 round-2 P1-A — TOCTOU close-out. Re-check the grantor's live
+	// channel access on the hot path; revoking group/friend/thread access
+	// MUST stop the OBO send even when the scope row is still on file.
+	// Unexpected DB error → bubble up so the handler can 500 (matches the
+	// scopeEnabled error contract above); a clean "no access" answer
+	// degrades to ErrOBONotAuthorized.
+	canRead, err := ba.grantorCanReadChannel(grantor, channelID, channelType)
+	if err != nil {
+		ba.Error("OBO grantor channel-access re-check failed",
+			zap.String("grantor", grantor),
+			zap.String("channel_id", channelID),
+			zap.Uint8("channel_type", channelType),
+			zap.Error(err))
+		return err
+	}
+	if !canRead {
+		ba.Warn("OBO denied: grantor no longer has read access to channel",
+			zap.String("grantor", grantor),
+			zap.String("bot", botUID),
+			zap.String("channel_id", channelID),
+			zap.Uint8("channel_type", channelType))
 		return ErrOBONotAuthorized
 	}
 	return nil

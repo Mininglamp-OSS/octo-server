@@ -48,6 +48,7 @@ import (
 	"encoding/json"
 	"strings"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"go.uber.org/zap"
@@ -66,6 +67,37 @@ func (ba *BotAPI) oboMessagesListen(messages []*config.MessageResp) {
 	}
 }
 
+// fanoutLookupChannelID normalizes the channel id we use to look up scope
+// rows for an inbound listener message. The OBO scope contract stores
+// `channel_id` in the GRANTOR's "what channel did I subscribe to" frame
+// of reference (see grantorCanReadChannel / oboCreateScope), and for DMs
+// that frame is the PEER uid — not the receiver's own uid.
+//
+// Listener messages, however, carry the WuKongIM-native view. For DMs,
+// `m.ChannelID` is the receiver of the message (= grantor when fan-out is
+// meant to trigger) and `m.FromUID` is the sender (= peer). Looking up
+// scopes by `m.ChannelID` for DMs therefore searches for a row whose
+// `channel_id = grantor`, which can never match the scope rows the
+// grantor actually installed (those have `channel_id = peer`).
+//
+// PR#82 round-2 P1-B fix: for ChannelTypePerson we look up by
+// `m.FromUID` (the peer in the "peer → grantor" direction the fan-out is
+// designed to relay). For groups / community topics the channel id is
+// already the grantor's frame of reference, so we pass it through.
+//
+// The "grantor → peer" direction (Alice typing on her own device) is
+// caught two layers down — the lookup against `m.FromUID = grantor`
+// finds no scope rows (the grantor's scopes have `channel_id = peer`),
+// so fan-out is a no-op without even needing gate 2. Gate 2 still acts
+// as defense-in-depth for any future code path that uses the original
+// `m.ChannelID` lookup.
+func fanoutLookupChannelID(m *config.MessageResp) string {
+	if m.ChannelType == common.ChannelTypePerson.Uint8() {
+		return m.FromUID
+	}
+	return m.ChannelID
+}
+
 // fanoutForMessage is the single-message entry point used by tests AND by
 // oboMessagesListen. Returns the number of copies dispatched so tests can
 // assert without poking the dispatcher hook.
@@ -82,10 +114,24 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 		return 0
 	}
 
+	// PR#82 round-2 P1-B — normalize to the GRANTOR's frame of reference
+	// before consulting scope rows. For DMs this means looking up by the
+	// peer uid (= m.FromUID), not by m.ChannelID (which is the receiver /
+	// grantor). For groups / topics the two are the same.
+	lookupChannelID := fanoutLookupChannelID(m)
+	// Defensive: a DM with an empty FromUID would translate to a blank
+	// lookup key that could spuriously match scope rows for "channel_id =
+	// ''" (none should exist in prod but the API allows the row). Treat
+	// as no-op rather than risk a stray match.
+	if lookupChannelID == "" {
+		return 0
+	}
+
 	store := ba.oboStoreOrDefault()
-	grants, err := store.findActiveGrantsForChannel(m.ChannelID, m.ChannelType)
+	grants, err := store.findActiveGrantsForChannel(lookupChannelID, m.ChannelType)
 	if err != nil {
 		ba.Error("OBO fan-out lookup failed",
+			zap.String("lookup_channel_id", lookupChannelID),
 			zap.String("channel_id", m.ChannelID),
 			zap.Uint8("channel_type", m.ChannelType),
 			zap.Error(err))
@@ -94,6 +140,15 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 	if len(grants) == 0 {
 		return 0
 	}
+
+	// PR#82 round-2 P1-A — per-call cache for the grantor channel-access
+	// re-check. Multiple active grants for the same (channel, grantor)
+	// pair are rare in v0 (uk_grantor_grantee makes it (grantor, bot)),
+	// but for any given inbound message we batch the check so we don't
+	// hit the DB twice for the same grantor in one listener invocation.
+	// The boolean is the "can read" answer; presence in the map means
+	// "answer is final, do not re-query for this message".
+	grantorAccess := map[string]bool{}
 
 	dispatched := 0
 	for _, g := range grants {
@@ -107,6 +162,37 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 		// don't fan to the grantor's bot. Without this gate the bot
 		// would see every word the grantor types and potentially reply.
 		if g.GrantorUID == m.FromUID {
+			continue
+		}
+		// PR#82 round-2 P1-A — TOCTOU close-out on the fan-out hot path.
+		// Even though the scope row exists, the grantor may have lost
+		// access to the channel since (kicked from group, un-friended
+		// peer, left parent group of a thread). Skipping the dispatch
+		// keeps the bot from continuing to harvest channels the grantor
+		// no longer has eyes on. DB error → fail-closed (skip this
+		// grant, log, continue with the remaining ones; we never want a
+		// transient DB blip to leak otherwise-denied traffic).
+		canRead, cached := grantorAccess[g.GrantorUID]
+		if !cached {
+			ok, err := ba.grantorCanReadChannel(g.GrantorUID, lookupChannelID, m.ChannelType)
+			if err != nil {
+				ba.Error("OBO fan-out grantor channel-access re-check failed",
+					zap.String("grantor", g.GrantorUID),
+					zap.String("lookup_channel_id", lookupChannelID),
+					zap.Uint8("channel_type", m.ChannelType),
+					zap.Error(err))
+				grantorAccess[g.GrantorUID] = false
+				continue
+			}
+			canRead = ok
+			grantorAccess[g.GrantorUID] = canRead
+		}
+		if !canRead {
+			ba.Warn("OBO fan-out skipped: grantor no longer has read access",
+				zap.String("grantor", g.GrantorUID),
+				zap.String("grantee_bot", g.GranteeBotUID),
+				zap.String("lookup_channel_id", lookupChannelID),
+				zap.Uint8("channel_type", m.ChannelType))
 			continue
 		}
 		// Build a fan-out copy. NoPersist=1 + SyncOnce=1 + Subscribers
