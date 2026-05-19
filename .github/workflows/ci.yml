@@ -56,18 +56,18 @@ jobs:
         id: filter
         if: github.event_name == 'pull_request'
         with:
-          # Negation patterns (! prefix) correctly exclude matched files even
-          # when '**' would otherwise match them — a .md file matches '**' but
-          # is then eliminated by '!**/*.md', leaving code: false for docs-only
-          # PRs. This is standard minimatch behaviour; predicate-quantifier
-          # defaults to 'any' which is exactly what we want: at least one
-          # non-doc file must have changed for code to be 'true'.
+          # Positive patterns only — no negation, no predicate-quantifier needed.
+          # code=true when at least one changed file matches a source pattern.
+          # Docs-only PRs won't match any pattern -> code=false -> jobs skipped.
+          # (skipped jobs count as passing for required-check branch protection).
           filters: |
             code:
-              - '**'
-              - '!**/*.md'
-              - '!docs/**'
-              - '!.github/ISSUE_TEMPLATE/**'
+              - '**/*.go'
+              - '**/*.proto'
+              - '**/*.sql'
+              - 'go.mod'
+              - 'go.sum'
+              - '.github/workflows/**'
 
   build:
     needs: [changes]
