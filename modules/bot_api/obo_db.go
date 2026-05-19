@@ -10,16 +10,16 @@
 // by short-TTL Redis keys, populated on read-through, invalidated on write:
 //
 //   - obo:grantor:{uid}        "1" any active grant exists for grantor;
-//                              "0" no active grant. Read by
-//                              findActiveGrantByGrantorBot — negative answer
-//                              short-circuits the (grantor, bot) MySQL probe
-//                              that checkOBO would otherwise issue per send.
+//     "0" no active grant. Read by
+//     findActiveGrantByGrantorBot — negative answer
+//     short-circuits the (grantor, bot) MySQL probe
+//     that checkOBO would otherwise issue per send.
 //   - obo:chan:{ctype}:{cid}   "1" channel has at least one (active grant ×
-//                              enabled scope) match; "0" no match. Read by
-//                              findActiveGrantsForChannel — negative answer
-//                              short-circuits the JOIN that the fan-out
-//                              listener would otherwise issue per inbound
-//                              message system-wide.
+//     enabled scope) match; "0" no match. Read by
+//     findActiveGrantsForChannel — negative answer
+//     short-circuits the JOIN that the fan-out
+//     listener would otherwise issue per inbound
+//     message system-wide.
 //
 // Both keys are negative-cache friendly: a "0" answer returned within the
 // 30-second TTL eliminates the MySQL round-trip entirely. Writes that can
@@ -48,15 +48,15 @@ import (
 // oboGrantModel mirrors the obo_grants row. JSON tags are reused by HTTP
 // handlers, which return rows verbatim (v0 has no nuanced DTOs).
 type oboGrantModel struct {
-	ID             int64      `db:"id" json:"id"`
-	GrantorUID     string     `db:"grantor_uid" json:"grantor_uid"`
-	GranteeBotUID  string     `db:"grantee_bot_uid" json:"grantee_bot_uid"`
-	Mode           string     `db:"mode" json:"mode"`
-	GlobalEnabled  int        `db:"global_enabled" json:"global_enabled"`
-	Active         int        `db:"active" json:"active"`
-	CreatedAt      time.Time  `db:"created_at" json:"created_at"`
-	UpdatedAt      time.Time  `db:"updated_at" json:"updated_at"`
-	RevokedAt      *time.Time `db:"revoked_at" json:"revoked_at,omitempty"`
+	ID            int64      `db:"id" json:"id"`
+	GrantorUID    string     `db:"grantor_uid" json:"grantor_uid"`
+	GranteeBotUID string     `db:"grantee_bot_uid" json:"grantee_bot_uid"`
+	Mode          string     `db:"mode" json:"mode"`
+	GlobalEnabled int        `db:"global_enabled" json:"global_enabled"`
+	Active        int        `db:"active" json:"active"`
+	CreatedAt     time.Time  `db:"created_at" json:"created_at"`
+	UpdatedAt     time.Time  `db:"updated_at" json:"updated_at"`
+	RevokedAt     *time.Time `db:"revoked_at" json:"revoked_at,omitempty"`
 }
 
 // oboScopeModel mirrors obo_scopes.
@@ -298,7 +298,12 @@ func (d *botAPIDB) findGrantByID(id int64) (*oboGrantModel, error) {
 // updateGrant applies optional fields. mode="" leaves mode untouched;
 // globalEnabled=nil leaves the toggle untouched. The cache for the row's
 // grantor is always invalidated because either change can flip the
-// "any active grant" answer.
+// "any active grant" answer. When `global_enabled` is touched, the
+// per-channel `obo:chan:*` cache is ALSO invalidated for every scope on
+// this grant — otherwise a `PUT global_enabled=1` could leave the
+// channel-level negative cache holding "0" for up to oboCacheTTL (30s),
+// causing fan-out to drop messages on a freshly-enabled grant for the
+// remainder of the TTL window (PR#82 R3 non-blocking finding).
 func (d *botAPIDB) updateGrant(id int64, mode string, globalEnabled *int) error {
 	updates := map[string]interface{}{}
 	if mode != "" {
@@ -324,6 +329,23 @@ func (d *botAPIDB) updateGrant(id int64, mode string, globalEnabled *int) error 
 	g, _ := d.findGrantByID(id)
 	if g != nil {
 		d.invalidateGrantorCache(g.GrantorUID)
+	}
+	// PR#82 R3 non-blocking — when the global toggle flipped, every
+	// channel this grant covers may now have a different
+	// "any active grant × enabled scope" answer. The per-channel cache
+	// otherwise sticks at its prior value (most commonly "0", written
+	// when the grant was disabled) until the 30s TTL expires, causing
+	// the UI to look broken after an enable. Bust them all.
+	//
+	// Best-effort: errors are swallowed (caches are correctness-safe
+	// to be stale; the only cost is the next message paying the JOIN).
+	// Mode-only updates don't change any cached answer, so the work is
+	// skipped in that branch.
+	if globalEnabled != nil {
+		scopes, _ := d.listScopesByGrant(id)
+		for _, s := range scopes {
+			d.invalidateChannelCache(s.ChannelID, s.ChannelType)
+		}
 	}
 	return nil
 }

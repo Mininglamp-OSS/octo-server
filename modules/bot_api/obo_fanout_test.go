@@ -531,3 +531,206 @@ func TestFanout_DMUnrelatedPeer_NoMatch(t *testing.T) {
 		t.Fatalf("unscoped DM peer must not fan out, got %d", n)
 	}
 }
+
+// TestFanout_DMMultiGrantor_OnlyRecipientReceives — PR#82 round-3 P1.
+// Cross-user DM privacy leak in fan-out: two grantors (Alice and Carol)
+// each install an OBO grant + scope `(peer=Bob)` for their own clone
+// bots. When Bob DMs Alice, the listener sees ChannelID=Alice (the
+// recipient), FromUID=Bob. findActiveGrantsForChannel(Bob, Person)
+// returns BOTH Alice's grant AND Carol's grant — both scoped that peer
+// — and the per-grant grantor-access re-check accepts Carol because she
+// is also friends with Bob and so can read DMs with him. Without the
+// recipient filter, Carol's clone bot would receive a copy of Bob's
+// private message to Alice.
+//
+// The fix is a per-grant filter inside fanoutForMessage's ChannelType
+// Person branch: skip any grant whose grantor is not the actual DM
+// recipient (= m.ChannelID under the listener's frame of reference).
+// This test asserts exactly one fan-out (to Alice's bot), with Bob's
+// payload preserved.
+func TestFanout_DMMultiGrantor_OnlyRecipientReceives(t *testing.T) {
+	const (
+		peer     = "bob"
+		aliceUID = "user_alice"
+		aliceBot = "bot_alice_clone"
+		carolUID = "user_carol"
+		carolBot = "bot_carol_clone"
+	)
+	ct := common.ChannelTypePerson.Uint8()
+
+	s := newFakeOBOStore()
+	// Alice's grant + scope (peer=Bob).
+	gidAlice, err := s.insertGrant(aliceUID, aliceBot, "auto")
+	if err != nil {
+		t.Fatalf("insertGrant alice: %v", err)
+	}
+	enable := 1
+	if err := s.updateGrant(gidAlice, "", &enable); err != nil {
+		t.Fatalf("updateGrant alice: %v", err)
+	}
+	if _, err := s.insertScope(gidAlice, peer, ct, 1); err != nil {
+		t.Fatalf("insertScope alice: %v", err)
+	}
+	// Carol's grant + scope (peer=Bob) — the exploit setup. Carol and
+	// Bob are friends so the per-grant access check WOULD permit this
+	// grant absent the recipient filter.
+	gidCarol, err := s.insertGrant(carolUID, carolBot, "auto")
+	if err != nil {
+		t.Fatalf("insertGrant carol: %v", err)
+	}
+	if err := s.updateGrant(gidCarol, "", &enable); err != nil {
+		t.Fatalf("updateGrant carol: %v", err)
+	}
+	if _, err := s.insertScope(gidCarol, peer, ct, 1); err != nil {
+		t.Fatalf("insertScope carol: %v", err)
+	}
+
+	fc := &fanoutCapture{}
+	ba := newBAforFanout(s, fc)
+	// Both grantors are friends with Bob → both pass the per-grant
+	// access re-check. The recipient filter is the ONLY thing keeping
+	// Carol's bot off the dispatch list.
+	ba.oboChannelAccessOverride = func(uid, channelID string, channelType uint8) (bool, error) {
+		if channelID != peer || channelType != ct {
+			t.Errorf("access check called with wrong DM frame: uid=%q chan=%q (want peer=%q)", uid, channelID, peer)
+		}
+		if uid != aliceUID && uid != carolUID {
+			t.Errorf("unexpected grantor in access check: %q", uid)
+		}
+		return true, nil
+	}
+
+	// Bob → Alice DM.
+	msg := &config.MessageResp{
+		FromUID:     peer,
+		ChannelID:   aliceUID,
+		ChannelType: ct,
+		Payload:     []byte(`{"type":1,"content":"private note for alice"}`),
+	}
+	got := ba.fanoutForMessage(msg)
+	if got != 1 {
+		t.Fatalf("multi-grantor DM: expected exactly 1 fan-out (to alice's bot), got %d", got)
+	}
+	if len(fc.copies) != 1 {
+		t.Fatalf("multi-grantor DM: expected 1 captured copy, got %d", len(fc.copies))
+	}
+	cp := fc.copies[0]
+	if len(cp.Subscribers) != 1 || cp.Subscribers[0] != aliceBot {
+		t.Fatalf("multi-grantor DM leak: subscriber should be [%s], got %v", aliceBot, cp.Subscribers)
+	}
+	// Explicitly assert Carol's bot is NOT a subscriber on any copy —
+	// the regression we're guarding against.
+	for _, c := range fc.copies {
+		for _, sub := range c.Subscribers {
+			if sub == carolBot {
+				t.Fatalf("CROSS-USER DM LEAK: carol's bot (%s) received fan-out of bob→alice DM", carolBot)
+			}
+		}
+	}
+	var p map[string]interface{}
+	_ = json.Unmarshal(cp.Payload, &p)
+	if p["content"] != "private note for alice" {
+		t.Fatalf("payload content lost: %v", p)
+	}
+}
+
+// TestFanout_DMSingleGrantor_RecipientReceives — the happy path under
+// the new recipient filter still works: exactly one grantor (Alice) has
+// a scope for peer Bob; Bob → Alice DM fans out to Alice's bot. Mirrors
+// TestFanout_DMPeerToGrantor_MatchesScope but explicitly named in the
+// R3 regression set so future readers see the multi-grantor and
+// single-grantor cases side by side.
+func TestFanout_DMSingleGrantor_RecipientReceives(t *testing.T) {
+	const peer = "bob"
+	ct := common.ChannelTypePerson.Uint8()
+	s := newFakeOBOStore()
+	gid, err := s.insertGrant(tGrantor, tBot, "auto")
+	if err != nil {
+		t.Fatalf("insertGrant: %v", err)
+	}
+	enable := 1
+	if err := s.updateGrant(gid, "", &enable); err != nil {
+		t.Fatalf("updateGrant: %v", err)
+	}
+	if _, err := s.insertScope(gid, peer, ct, 1); err != nil {
+		t.Fatalf("insertScope: %v", err)
+	}
+	fc := &fanoutCapture{}
+	ba := newBAforFanout(s, fc)
+	ba.oboChannelAccessOverride = func(uid, channelID string, channelType uint8) (bool, error) {
+		return true, nil
+	}
+
+	msg := &config.MessageResp{
+		FromUID:     peer,
+		ChannelID:   tGrantor,
+		ChannelType: ct,
+		Payload:     []byte(`{"type":1,"content":"hello yu"}`),
+	}
+	if n := ba.fanoutForMessage(msg); n != 1 {
+		t.Fatalf("single-grantor DM happy path: expected 1 fan-out, got %d", n)
+	}
+	if len(fc.copies) != 1 || fc.copies[0].Subscribers[0] != tBot {
+		t.Fatalf("single-grantor DM happy path: wrong dispatch, copies=%+v", fc.copies)
+	}
+}
+
+// TestFanout_DMNonRecipient_NoLeak — edge case for the R3 recipient
+// filter: a grant exists whose grantor is NOT the DM recipient, but
+// access re-check would otherwise allow it. The filter must drop the
+// non-recipient grant BEFORE the access check fires, so the access
+// override is intentionally rigged to fail the test if it gets called
+// for the wrong grantor.
+//
+// Setup: Carol scopes peer Bob (Carol ↔ Bob are friends). Bob then
+// DMs Alice (a different user, who has NO grant). The fan-out lookup
+// returns Carol's grant (scope is keyed by peer=Bob). The filter must
+// drop it because Carol is not the recipient (Alice is, and Alice
+// doesn't even have a grant).
+func TestFanout_DMNonRecipient_NoLeak(t *testing.T) {
+	const (
+		peer     = "bob"
+		aliceUID = "user_alice_no_grant"
+		carolUID = "user_carol"
+		carolBot = "bot_carol_clone"
+	)
+	ct := common.ChannelTypePerson.Uint8()
+
+	s := newFakeOBOStore()
+	gidCarol, err := s.insertGrant(carolUID, carolBot, "auto")
+	if err != nil {
+		t.Fatalf("insertGrant carol: %v", err)
+	}
+	enable := 1
+	if err := s.updateGrant(gidCarol, "", &enable); err != nil {
+		t.Fatalf("updateGrant carol: %v", err)
+	}
+	if _, err := s.insertScope(gidCarol, peer, ct, 1); err != nil {
+		t.Fatalf("insertScope carol: %v", err)
+	}
+
+	fc := &fanoutCapture{}
+	ba := newBAforFanout(s, fc)
+	// If the access check fires here, the recipient filter leaked —
+	// surface that as a hard failure rather than a silent "0 dispatches"
+	// (which could mask a regression where a later gate happens to
+	// catch it).
+	ba.oboChannelAccessOverride = func(uid, channelID string, channelType uint8) (bool, error) {
+		t.Errorf("non-recipient grant reached the access check; filter must drop earlier (uid=%q chan=%q)", uid, channelID)
+		return true, nil
+	}
+
+	// Bob → Alice DM (recipient = Alice, who has NO grant).
+	msg := &config.MessageResp{
+		FromUID:     peer,
+		ChannelID:   aliceUID,
+		ChannelType: ct,
+		Payload:     []byte(`{"type":1,"content":"for alice only"}`),
+	}
+	if n := ba.fanoutForMessage(msg); n != 0 {
+		t.Fatalf("non-recipient grant must not fan out, got %d", n)
+	}
+	if len(fc.copies) != 0 {
+		t.Fatalf("non-recipient grant leaked: captured %d copies, expected 0", len(fc.copies))
+	}
+}

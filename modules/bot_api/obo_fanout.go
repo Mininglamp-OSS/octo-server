@@ -12,11 +12,11 @@
 // hit per inbound message — then applies the three loop-protection gates
 // from RFC §5.3:
 //
-//   Gate 1: bot self-sent → never replay to that same bot
-//   Gate 2: grantor's own outbound → don't fan it to the grantor's bot
-//           (covers the "I typed on my phone" case — bot should not echo)
-//   Gate 3: already-OBO-processed → message_extra has __obo_processed__=true
-//           (the bot's outbound, marked by sendMessage, must not bounce)
+//	Gate 1: bot self-sent → never replay to that same bot
+//	Gate 2: grantor's own outbound → don't fan it to the grantor's bot
+//	        (covers the "I typed on my phone" case — bot should not echo)
+//	Gate 3: already-OBO-processed → message_extra has __obo_processed__=true
+//	        (the bot's outbound, marked by sendMessage, must not bounce)
 //
 // PR#82 review #2 P1-2: gate 3's marker key is `__obo_processed__` (double-
 // underscore reserved prefix), NOT the v0-shipped `obo_processed`. The
@@ -162,6 +162,27 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 		// don't fan to the grantor's bot. Without this gate the bot
 		// would see every word the grantor types and potentially reply.
 		if g.GrantorUID == m.FromUID {
+			continue
+		}
+		// PR#82 round-3 P1 — Multi-grantor DM recipient filter. For
+		// DMs, findActiveGrantsForChannel is keyed by the peer uid
+		// (= m.FromUID after the P1-B lookup normalization), so it
+		// returns EVERY grantor who installed a `(peer=this peer)`
+		// scope — not just the grantor who is the actual recipient
+		// of this specific message. Without this filter, a Bob →
+		// Alice DM would also fan out to Carol's clone bot if Carol
+		// also scoped Bob: findActiveGrantsForChannel(Bob, Person)
+		// returns both Alice's grant and Carol's grant, and the
+		// per-grant access re-check below confirms Carol can read
+		// DMs with Bob (they're friends) — so without this gate the
+		// message silently leaks across users.
+		//
+		// The actual DM recipient is m.ChannelID under the listener's
+		// WuKongIM-native view (DM ChannelID = receiver, FromUID =
+		// sender). Drop any grant whose grantor is NOT that receiver.
+		// For groups / community topics the lookup is already 1:1
+		// with the conversation, so this filter is a DM-only concern.
+		if m.ChannelType == common.ChannelTypePerson.Uint8() && m.ChannelID != g.GrantorUID {
 			continue
 		}
 		// PR#82 round-2 P1-A — TOCTOU close-out on the fan-out hot path.
