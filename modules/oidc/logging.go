@@ -21,6 +21,24 @@ func subHash(sub string) string {
 	return hex.EncodeToString(sum[:4])
 }
 
+// identifierKeyHash 给 SR-2.2 反枚举计数器(bind:enumfail:<hash>)用的哈希维度。
+//
+// 与 subHash 区分是因为后者只服务于日志关联(32-bit 即可),而本函数被攻击者
+// 直接用作"输入 identifier → 计数器 key"的映射。32-bit 在 keyspace 维度可被
+// 离线 pre-image 攻击:攻击者算 SHA-256 找一个与真实 username 前 4 字节冲突
+// 的 identifier,从而共享同一锁定预算 / 反推真实用户名是否存在。
+//
+// 64-bit (16 hex) 把生日攻击成本提到 ~2^32 次哈希,显著高于 5 分钟 token
+// 窗口内可达的吞吐。仍然非保密哈希,需要更强保证时改 HMAC keyed by
+// DM_OIDC_RT_ENC_KEY,本期不引入额外密钥依赖。
+func identifierKeyHash(identifier string) string {
+	if identifier == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(identifier))
+	return hex.EncodeToString(sum[:8])
+}
+
 // newTraceID 生成 16 hex(8 字节)随机 trace id,贯穿单次 callback 的所有日志。
 //
 // 不入 wkhttp middleware:OIDC callback 由 IdP 重定向命中,没有上游 X-Request-Id

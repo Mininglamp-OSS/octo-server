@@ -80,7 +80,7 @@ func (u *User) VerifyPasswordByUID(_ context.Context, uid, password string) (boo
 //   - **本层**:commonapi.SMSService 内置 1min 发送频率 + 10min 失败锁定,
 //     但锁定 key 不带 codeType(详见 IService 注释),与 register/forget-pwd
 //     等其他 SMS 流程共享 -> 提供"全局手机号粒度"的反滥用;
-//   - **oidc 模块 BindService 层**:DM_OIDC_BIND_ISSUER_ALLOWLIST 收口 +
+//   - **oidc 模块 BindService 层**:OCTO_OIDC_BIND_ISSUER_ALLOWLIST 收口 +
 //     bind_token 单次消费 + Redis 5min TTL + BindStore.IncrAndCheck
 //     (bind_token 维度的 OTP 发送/校验/确认 counter, 对应 SR-2.1)
 //     -> 提供"OIDC bind 流程粒度"的反爆破;

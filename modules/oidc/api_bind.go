@@ -79,14 +79,13 @@ type bindRouteGroup interface {
 	POST(relativePath string, handlers ...wkhttp.HandlerFunc)
 }
 
-// bindRoutes 挂载自助绑定的 4 个 HTTP 端点。
+// bindRoutes 挂载自助绑定的 5 个 HTTP 端点。
 //
 // 设计:
 //   - Bind.Enabled=false 时整个函数 no-op,production 配 disabled provider
 //     时连"路由不存在"都成立(404 由 gin 默认 router 兜底)
 //   - 不带 AuthMiddleware:bind_token 自身就是单次消费认证凭据(SR-1),
 //     调用方还没有 dmwork session 才需要走这套流程
-//   - 不挂 /bind/confirm —— PR4 才接 callback 链路 + ThirdAuthcode 回填
 func (o *OIDC) bindRoutes(g bindRouteGroup) {
 	// 仅由 routeAt 在 o.cfg 非 nil 时调用,o == nil / o.cfg == nil 不可达。
 	if !o.cfg.Bind.Enabled {
@@ -197,6 +196,10 @@ func (o *OIDC) bindOTPSend(c *wkhttp.Context) {
 	err := o.bind.SendSMS(c.Request.Context(), req.Token)
 	if err != nil {
 		m.result = bindResultFromErr(err)
+		// SR-6 审计完整性:成功有 EventBindOTPSend,失败也要落审计,否则 SMS
+		// provider 异常等场景在 oidc_audit_log 留不下任何痕迹,SOC 只能看
+		// Prometheus 反推。reason 走通用文案,具体 err 走 zap。
+		o.writeAudit("bind:"+subHash(req.Token), EventBindOTPSendFail, stateFromCtx(c), "otp send failed")
 		o.handleBindOTPSendErr(c, req.Token, err)
 		return
 	}
@@ -274,7 +277,7 @@ func (o *OIDC) handleBindVerifyErr(c *wkhttp.Context, path, token string, err er
 		// metric (bindResultFromErr) 已归到 bad_request,HTTP 同步 400 保持一致。
 		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("sms not available for this account"))
 	case errors.Is(err, ErrBindMethodDisabled):
-		// 运维通过 DM_OIDC_BIND_METHODS 关了该方法 —— 客户端不应再 retry。
+		// 运维通过 OCTO_OIDC_BIND_METHODS 关了该方法 —— 客户端不应再 retry。
 		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("verification method disabled"))
 	case errors.Is(err, ErrBindAuthRejected):
 		// 业务拒绝(密码错 / OTP 错 / phone 不命中):统一 401 防账号枚举。
@@ -358,8 +361,10 @@ func (o *OIDC) handleBindConfirmErr(c *wkhttp.Context, token string, err error) 
 		// 状态不是 verified —— 用户跳过了二次验证,或并发 confirm 撞上(AC-6)。
 		c.AbortWithStatusJSON(http.StatusUnauthorized, errMsg("verify before confirm"))
 	case errors.Is(err, ErrBindAlreadyBound):
+		// 重试 confirm 命中已写 identity 的常见路径(IssueSession 失败后 retry);
+		// 文案引导用户回 OIDC 入口而不是放弃。
 		c.AbortWithStatusJSON(http.StatusConflict,
-			errMsg("identity already bound; please sign in via OIDC directly"))
+			errMsg("identity already bound; sign in again via OIDC to continue"))
 	default:
 		o.Error("OIDC bind confirm failed (internal)",
 			zap.String("token_hash", subHash(token)), zap.Error(err))

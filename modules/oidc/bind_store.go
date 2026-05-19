@@ -16,24 +16,35 @@ import (
 //
 // 接口职责拆分(每个方法只做一件事):
 //   - Save / Get / Consume:bind_token 整体生命周期(签发 → 读取 → 终态消费)
-//   - UpdateStatus:状态机 CAS 迁移,期望值不符返 ErrBindStatusConflict
+//   - CASSave:状态机 CAS 迁移 —— 期望 Status 匹配时原子写入整段 sess
 //   - IncrAndCheck:任意维度的限流计数器(SR-2.1 bind_token 维度 + SR-2.2 uid 维度)
 //
 // 一次性消费(SR-1)由 Consume 保证 —— 取出立即 DEL,即便后续 confirm 失败
-// 也不可重放。状态机 CAS 是次要防护层(防 verified→confirmed 并发重入)。
+// 也不可重放。状态机 CAS 是次要防护层(防 verified→confirmed 并发重入,
+// 以及 issued→verified 并发 verify 覆盖 CandidateUID 的身份接管)。
 type BindStore interface {
 	// Save 写入新 session,TTL 由 cfg 控制(NFR-2 默认 5min)。
 	// session.JTI 非空,Status 调用方指定(通常 BindStatusIssued)。
+	//
+	// **不做 CAS** —— Save 只在 Issue 阶段(首次写入)使用。状态机后续
+	// 迁移必须走 CASSave,否则两个并发 verify 可同时观察到 status=issued,
+	// 双 Save 后第二个覆盖第一个的 CandidateUID(身份接管)。
 	Save(ctx context.Context, s *BindSession, ttl time.Duration) error
 
 	// Get 读快照不消费。verify / info 路径用,允许多次读。
 	// key 不存在返 ErrBindNotFound。
 	Get(ctx context.Context, jti string) (*BindSession, error)
 
-	// UpdateStatus CAS 更新状态。expected 不匹配返 ErrBindStatusConflict
-	// (并发 confirm 防护 AC-6,以及防错误调用方把状态机推回上游)。
-	// 同时刷新 TTL,与 Save 保持一致 —— 长流程用户 TTL 内有进展不该被踢。
-	UpdateStatus(ctx context.Context, jti string, expected, next BindStatus, ttl time.Duration) error
+	// CASSave 原子地校验 Redis 里当前 sess.Status 与 expected 一致后,
+	// 写入入参 sess 的完整 payload 并刷新 TTL。
+	//
+	// 与朴素 Save 的区别:在 Redis 单线程里完成 "check status → write payload",
+	// 两个并发调用即便在客户端侧都读到了相同的旧快照,只有一个能成功 ——
+	// 第二个会因 status 已被推进到新值而返 ErrBindStatusConflict。
+	//
+	// 调用方:bind_service.saveVerified(expected=issued),将来 verified→
+	// confirmed 也走这条路径。key 不存在返 ErrBindNotFound。
+	CASSave(ctx context.Context, sess *BindSession, expected BindStatus, ttl time.Duration) error
 
 	// Consume 取出并立即删除,confirm 成功路径调(SR-1 单次消费)。
 	// key 不存在返 ErrBindNotFound。
@@ -68,7 +79,7 @@ var (
 	// 区分,让 metric label 能正确归到 unauthorized 而非 internal_error。
 	// service 层用它包装 auth.* 的 matched=false / VerifyOIDCBindSMS 拒绝。
 	ErrBindAuthRejected = errors.New("oidc: bind auth rejected")
-	// ErrBindMethodDisabled 调用方请求的方法被运维通过 DM_OIDC_BIND_METHODS
+	// ErrBindMethodDisabled 调用方请求的方法被运维通过 OCTO_OIDC_BIND_METHODS
 	// 关闭了。Methods 必须是真实策略,不仅 UI 过滤 —— 否则攻击者可以硬调
 	// 端点绕过运维"禁用密码"的安全开关。handler 翻 400,与"参数非法"同档,
 	// 不属于身份凭据拒绝,因此与 ErrBindAuthRejected 区分。
@@ -134,33 +145,35 @@ func (m *memoryBindStore) Get(_ context.Context, jti string) (*BindSession, erro
 	return decodeBindSession(entry.data)
 }
 
-func (m *memoryBindStore) UpdateStatus(_ context.Context, jti string, expected, next BindStatus, ttl time.Duration) error {
-	if jti == "" {
-		return ErrBindNotFound
+func (m *memoryBindStore) CASSave(_ context.Context, sess *BindSession, expected BindStatus, ttl time.Duration) error {
+	if sess == nil || sess.JTI == "" {
+		return errors.New("oidc: bind CASSave: sess/jti required")
 	}
 	if ttl <= 0 {
-		return fmt.Errorf("oidc: bind UpdateStatus: ttl must be positive, got %v", ttl)
+		return fmt.Errorf("oidc: bind CASSave: ttl must be positive, got %v", ttl)
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	entry, ok := m.sessions[jti]
-	if !ok || time.Now().After(entry.expiresAt) {
-		delete(m.sessions, jti)
-		return ErrBindNotFound
-	}
-	sess, err := decodeBindSession(entry.data)
-	if err != nil {
-		return err
-	}
-	if sess.Status != expected {
-		return ErrBindStatusConflict
-	}
-	sess.Status = next
 	encoded, err := json.Marshal(sess)
 	if err != nil {
 		return fmt.Errorf("oidc: bind session marshal: %w", err)
 	}
-	m.sessions[jti] = memoryBindEntry{data: encoded, expiresAt: time.Now().Add(ttl)}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry, ok := m.sessions[sess.JTI]
+	if !ok || time.Now().After(entry.expiresAt) {
+		delete(m.sessions, sess.JTI)
+		return ErrBindNotFound
+	}
+	current, err := decodeBindSession(entry.data)
+	if err != nil {
+		return err
+	}
+	// 在锁内比对当前 status 与 expected:即使两个并发调用都基于同一旧快照
+	// 修改了 sess.Status,只有一个能拿到 expected==current.Status,另一个
+	// 看到的是已被推进后的状态 → ErrBindStatusConflict。
+	if current.Status != expected {
+		return ErrBindStatusConflict
+	}
+	m.sessions[sess.JTI] = memoryBindEntry{data: encoded, expiresAt: time.Now().Add(ttl)}
 	return nil
 }
 

@@ -114,36 +114,25 @@ func (s *redisBindStore) Get(_ context.Context, jti string) (*BindSession, error
 	return decodeBindSession([]byte(raw))
 }
 
-func (s *redisBindStore) UpdateStatus(_ context.Context, jti string, expected, next BindStatus, ttl time.Duration) error {
-	if jti == "" {
-		return ErrBindNotFound
+func (s *redisBindStore) CASSave(_ context.Context, sess *BindSession, expected BindStatus, ttl time.Duration) error {
+	if sess == nil || sess.JTI == "" {
+		return errors.New("oidc: bind CASSave: sess/jti required")
 	}
 	if ttl <= 0 {
-		return fmt.Errorf("oidc: bind UpdateStatus: ttl must be positive, got %v", ttl)
+		return fmt.Errorf("oidc: bind CASSave: ttl must be positive, got %v", ttl)
 	}
-	// 先 GET 拿当前 payload,设新 status,再用 Lua CAS 写回。两步走是因为
-	// Lua 里改 JSON 太繁琐(且字段未来还会扩),客户端 marshal 更直观。
-	// CAS 仍然是原子的:Lua 校验 status 字段后才写,中间任何其他请求改了
-	// status 都会被检测到。
-	raw, err := s.client.Get(bindSessionKey(jti)).Result()
-	if err != nil {
-		if errors.Is(err, rd.Nil) {
-			return ErrBindNotFound
-		}
-		return fmt.Errorf("oidc: redis get bind session: %w", err)
-	}
-	sess, err := decodeBindSession([]byte(raw))
-	if err != nil {
-		return err
-	}
-	sess.Status = next
 	encoded, err := json.Marshal(sess)
 	if err != nil {
 		return fmt.Errorf("oidc: bind session marshal: %w", err)
 	}
+	// 调用方已经在 sess 上设了 new status + 业务字段(如 CandidateUID /
+	// VerifiedMethod)。luaBindCASUpdate 在 Redis 单线程里 GET → 校验当前
+	// status == expected → SET 整段 → PEXPIRE。并发场景下两个调用即便都
+	// 基于 status=issued 的旧快照,只有一个能把 status 推进到 verified;
+	// 另一个看到 status 已是 verified,返 conflict。
 	res, err := luaBindCASUpdate.Run(
 		s.client,
-		[]string{bindSessionKey(jti)},
+		[]string{bindSessionKey(sess.JTI)},
 		string(expected), string(encoded), ttl.Milliseconds(),
 	).Result()
 	if err != nil {

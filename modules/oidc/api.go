@@ -973,7 +973,7 @@ func fallbackReturnTo(rt string) string {
 func (o *OIDC) redirectToBindPage(c *wkhttp.Context, sd *StateData, jti string) {
 	base := o.cfg.Bind.RedirectBase
 	if base == "" {
-		o.Error("OIDC bind redirect: DM_OIDC_BIND_REDIRECT_BASE not configured, falling back",
+		o.Error("OIDC bind redirect: OCTO_OIDC_BIND_REDIRECT_BASE not configured, falling back",
 			zap.String("jti_hash", subHash(jti)))
 		o.failBindRedirect(c, sd)
 		return

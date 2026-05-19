@@ -3,6 +3,7 @@ package oidc
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ func mockDuplicateKeyErr() error {
 // ---- fakes ----
 
 type fakeBindAuth struct {
+	mu                 sync.Mutex // 并发测试(TestBindService_VerifyPassword_ConcurrentRaceOnlyOneWins)需要
 	verifyPasswordResp struct {
 		matched bool
 		reason  string
@@ -26,26 +28,32 @@ type fakeBindAuth struct {
 	sendSMSErr   error
 	verifySMSErr error
 	calls        struct {
-		pwdUID, pwdPassword string
-		smsZone, smsPhone   string
+		pwdUID, pwdPassword                 string
+		smsZone, smsPhone                   string
 		verifyZone, verifyPhone, verifyCode string
 		pwdCount, sendCount, verifyCount    int
 	}
 }
 
 func (f *fakeBindAuth) VerifyPasswordByUID(_ context.Context, uid, password string) (bool, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls.pwdCount++
 	f.calls.pwdUID = uid
 	f.calls.pwdPassword = password
 	return f.verifyPasswordResp.matched, f.verifyPasswordResp.reason, f.verifyPasswordResp.err
 }
 func (f *fakeBindAuth) SendOIDCBindSMS(_ context.Context, zone, phone string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls.sendCount++
 	f.calls.smsZone = zone
 	f.calls.smsPhone = phone
 	return f.sendSMSErr
 }
 func (f *fakeBindAuth) VerifyOIDCBindSMS(_ context.Context, zone, phone, code string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls.verifyCount++
 	f.calls.verifyZone = zone
 	f.calls.verifyPhone = phone
@@ -815,6 +823,62 @@ func TestBindService_VerifyPassword_UIDFailPerDayEnforced(t *testing.T) {
 	err := h.svc.VerifyPassword(context.Background(), jti2, "alice", "wrong")
 	if !errors.Is(err, ErrBindRateLimited) {
 		t.Fatalf("UIDFailPerDay must rate-limit cross-token attempts, got %v", err)
+	}
+}
+
+// TestBindService_VerifyPassword_ConcurrentRaceOnlyOneWins 锁定 CAS 修复:
+// 两个并发 verify 即便都基于同一份 status=issued 的快照 + 都 auth 成功,
+// 只有一个能把 CandidateUID 落地,另一个必须以 ErrBindStatusConflict 失败 ——
+// 否则攻击者拿到 victim bind_token 后用自己账号并发一次 verify 即可覆盖
+// CandidateUID 导致 confirm 时绑到攻击者 uid(身份接管)。
+//
+// 不直接构造"完全同时"的调度 —— Go 调度不保证,memorystore 内有 mutex
+// 串行化每个原语 —— 改用循环 + barrier 重复 30 次,在 -race 下足以暴露
+// 旧实现的 CandidateUID 覆盖问题;CAS 修复后始终是 (1 ok, 1 conflict)。
+func TestBindService_VerifyPassword_ConcurrentRaceOnlyOneWins(t *testing.T) {
+	for i := 0; i < 30; i++ {
+		h := newBindHarness(t)
+		h.auth.verifyPasswordResp.matched = true
+		h.loc.byUsername["alice"] = "u-alice"
+		h.loc.byUsername["mallory"] = "u-mallory"
+
+		jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		errs := make([]error, 2)
+		identifiers := []string{"alice", "mallory"}
+		for idx, id := range identifiers {
+			wg.Add(1)
+			go func(idx int, id string) {
+				defer wg.Done()
+				<-start
+				errs[idx] = h.svc.VerifyPassword(context.Background(), jti, id, "p")
+			}(idx, id)
+		}
+		close(start)
+		wg.Wait()
+
+		var okCount, conflictCount int
+		for _, e := range errs {
+			switch {
+			case e == nil:
+				okCount++
+			case errors.Is(e, ErrBindStatusConflict):
+				conflictCount++
+			default:
+				t.Fatalf("iter %d: unexpected err %v", i, e)
+			}
+		}
+		if okCount != 1 || conflictCount != 1 {
+			t.Fatalf("iter %d: want exactly 1 ok + 1 conflict, got ok=%d conflict=%d (errs=%v)",
+				i, okCount, conflictCount, errs)
+		}
+		// CandidateUID 必须是赢家的某一个,但绝不能为空或被覆盖成混合
+		sess, _ := h.store.Get(context.Background(), jti)
+		if sess.CandidateUID != "u-alice" && sess.CandidateUID != "u-mallory" {
+			t.Fatalf("iter %d: CandidateUID corrupted: %q", i, sess.CandidateUID)
+		}
 	}
 }
 

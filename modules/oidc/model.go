@@ -48,6 +48,7 @@ const (
 	EventBindVerifyOK    AuditEvent = "bind_verify_ok"
 	EventBindVerifyFail  AuditEvent = "bind_verify_fail"
 	EventBindOTPSend     AuditEvent = "bind_otp_send"
+	EventBindOTPSendFail AuditEvent = "bind_otp_send_fail"
 	EventBindConfirmOK   AuditEvent = "bind_confirm_ok"
 	EventBindConfirmFail AuditEvent = "bind_confirm_fail"
 	EventBindRefused     AuditEvent = "bind_refused"

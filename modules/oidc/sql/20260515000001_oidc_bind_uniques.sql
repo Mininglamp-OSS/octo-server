@@ -10,7 +10,12 @@
 --     GROUP BY uid, issuer
 --     HAVING n > 1;
 
-ALTER TABLE `user_oidc_identity` ADD UNIQUE KEY `uk_uid_issuer` (`uid`, `issuer`);
+-- 显式 INPLACE + LOCK=NONE:MySQL 8.0 默认会选 INPLACE,但显式 pin 一是
+-- 防 5.7 副本/被禁 online DDL 的环境静默退化成 LOCK=SHARED 锁表;二是让
+-- "无法在线执行"的环境在 apply 时立即报错,而不是阻塞业务写。
+ALTER TABLE `user_oidc_identity`
+  ADD UNIQUE KEY `uk_uid_issuer` (`uid`, `issuer`),
+  ALGORITHM=INPLACE, LOCK=NONE;
 
 -- +migrate Down
 

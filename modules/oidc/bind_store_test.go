@@ -67,41 +67,59 @@ func runBindStoreBehaviorSuite(t *testing.T, factory func(t *testing.T) BindStor
 		}
 	})
 
-	t.Run("UpdateStatus CAS transitions then conflicts", func(t *testing.T) {
+	t.Run("CASSave CAS transitions then conflicts on stale snapshot", func(t *testing.T) {
 		store := factory(t)
 		sess := &BindSession{JTI: "j-cas", Status: BindStatusIssued, CreatedAt: time.Now().Unix()}
 		if err := store.Save(context.Background(), sess, time.Minute); err != nil {
 			t.Fatalf("Save: %v", err)
 		}
-		// 正确的迁移
-		if err := store.UpdateStatus(context.Background(), "j-cas",
-			BindStatusIssued, BindStatusVerified, time.Minute); err != nil {
-			t.Fatalf("UpdateStatus issued->verified: %v", err)
+		// 客户端基于 issued 快照构造新 sess,CASSave 成功
+		toVerified := *sess
+		toVerified.Status = BindStatusVerified
+		toVerified.CandidateUID = "u-first"
+		toVerified.VerifiedMethod = BindMethodPassword
+		if err := store.CASSave(context.Background(), &toVerified, BindStatusIssued, time.Minute); err != nil {
+			t.Fatalf("CASSave issued->verified: %v", err)
 		}
-		// 重复同样的迁移应当 CAS 失败 —— 不变式:expected != actual 必返冲突
-		err := store.UpdateStatus(context.Background(), "j-cas",
-			BindStatusIssued, BindStatusVerified, time.Minute)
+		// 再用同样的"基于 issued 的旧快照"提交另一个 CandidateUID ——
+		// 模拟并发 verify 第二个写者。当前 status 已是 verified,expected
+		// 仍是 issued,必须 conflict + **绝不能**覆盖第一个的 CandidateUID。
+		toOverwrite := *sess
+		toOverwrite.Status = BindStatusVerified
+		toOverwrite.CandidateUID = "u-second"
+		toOverwrite.VerifiedMethod = BindMethodPassword
+		err := store.CASSave(context.Background(), &toOverwrite, BindStatusIssued, time.Minute)
 		if !errors.Is(err, ErrBindStatusConflict) {
 			t.Fatalf("expected ErrBindStatusConflict on stale expected, got %v", err)
-		}
-		// 现在状态是 verified,可以推进到 confirmed
-		if err := store.UpdateStatus(context.Background(), "j-cas",
-			BindStatusVerified, BindStatusConfirmed, time.Minute); err != nil {
-			t.Fatalf("UpdateStatus verified->confirmed: %v", err)
 		}
 		got, err := store.Get(context.Background(), "j-cas")
 		if err != nil {
 			t.Fatalf("Get: %v", err)
 		}
-		if got.Status != BindStatusConfirmed {
-			t.Fatalf("expected confirmed, got %v", got.Status)
+		if got.CandidateUID != "u-first" {
+			t.Fatalf("CASSave conflict must not overwrite, got CandidateUID=%q", got.CandidateUID)
+		}
+		// 当前状态是 verified,可以基于 verified 推进(将来 verified→confirmed
+		// 也应当走 CASSave;此处先验通用契约)
+		toConfirmed := got
+		toConfirmed.Status = BindStatusConfirmed
+		if err := store.CASSave(context.Background(), toConfirmed, BindStatusVerified, time.Minute); err != nil {
+			t.Fatalf("CASSave verified->confirmed: %v", err)
+		}
+		got2, err := store.Get(context.Background(), "j-cas")
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if got2.Status != BindStatusConfirmed {
+			t.Fatalf("expected confirmed, got %v", got2.Status)
 		}
 	})
 
-	t.Run("UpdateStatus on missing returns ErrBindNotFound", func(t *testing.T) {
+	t.Run("CASSave on missing returns ErrBindNotFound", func(t *testing.T) {
 		store := factory(t)
-		err := store.UpdateStatus(context.Background(), "j-nope",
-			BindStatusIssued, BindStatusVerified, time.Minute)
+		err := store.CASSave(context.Background(),
+			&BindSession{JTI: "j-nope", Status: BindStatusVerified},
+			BindStatusIssued, time.Minute)
 		if !errors.Is(err, ErrBindNotFound) {
 			t.Fatalf("expected ErrBindNotFound, got %v", err)
 		}

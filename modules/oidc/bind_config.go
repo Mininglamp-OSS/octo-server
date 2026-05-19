@@ -2,6 +2,7 @@ package oidc
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -29,7 +30,42 @@ func validateBindConfigAgainstProvider(cfg *Config) error {
 				"set DM_OIDC_PROVIDER_ALLOW_NEW_USER=false to enable self-service binding (FR-1.1)",
 		)
 	}
+	if err := validateBindRedirectBase(cfg.Bind.RedirectBase); err != nil {
+		return err
+	}
 	return nil
+}
+
+// validateBindRedirectBase 启动期 fail-fast:Bind.Enabled=true 时 RedirectBase
+// 必须是合法 https URL(开发可用 OCTO_OIDC_BIND_REDIRECT_ALLOW_INSECURE=1 放宽到 http)。
+//
+// 理由:跑到 callback 才发现 RedirectBase 漏配是糟糕的运维体验 —— bind_token
+// 已发,审计/metric 已计,前端轮询要等 5min TTL 才知道失败。启动 panic 比
+// runtime 退化好得多。同时拦 javascript:/data: scheme 防 misconfig 引入 XSS。
+func validateBindRedirectBase(base string) error {
+	if base == "" {
+		return fmt.Errorf(
+			"oidc: Bind.Enabled=true requires OCTO_OIDC_BIND_REDIRECT_BASE to be set " +
+				"(non-empty https URL pointing at the front-end bind page)",
+		)
+	}
+	u, err := url.Parse(base)
+	if err != nil {
+		return fmt.Errorf("oidc: invalid OCTO_OIDC_BIND_REDIRECT_BASE %q: %w", base, err)
+	}
+	if u.Host == "" {
+		return fmt.Errorf(
+			"oidc: OCTO_OIDC_BIND_REDIRECT_BASE %q must be absolute (scheme://host/path)", base)
+	}
+	if u.Scheme == "https" {
+		return nil
+	}
+	if u.Scheme == "http" && getBool("OCTO_OIDC_BIND_REDIRECT_ALLOW_INSECURE", false) {
+		return nil
+	}
+	return fmt.Errorf(
+		"oidc: OCTO_OIDC_BIND_REDIRECT_BASE %q must use https scheme "+
+			"(set OCTO_OIDC_BIND_REDIRECT_ALLOW_INSECURE=1 to allow http for dev)", base)
 }
 
 // BindConfig 自助绑定相关配置(NFR-4 全部走 env,不硬编码)。
@@ -38,7 +74,7 @@ func validateBindConfigAgainstProvider(cfg *Config) error {
 // PR3 仅起骨架作用,callback 接管在 PR4 才打开。PR4 会加 "Enabled && RedirectBase==''"
 // 这类硬校验。
 //
-// keyspace 命名:DM_OIDC_BIND_* 与已有 DM_OIDC_* 并列,语义上 BindConfig
+// keyspace 命名:OCTO_OIDC_BIND_* 与已有 DM_OIDC_* 并列,语义上 BindConfig
 // 是 OIDC 模块的子配置块,但运行期可独立灰度(NFR-5)。
 type BindConfig struct {
 	Enabled         bool
@@ -69,22 +105,22 @@ var defaultBindMethods = []BindMethod{BindMethodPassword, BindMethodSMSOTP}
 
 func loadBindConfig() BindConfig {
 	return BindConfig{
-		Enabled:         getBool("DM_OIDC_BIND_ENABLED", false),
-		IssuerAllowlist: getStringSlice("DM_OIDC_BIND_ISSUER_ALLOWLIST", nil),
+		Enabled:         getBool("OCTO_OIDC_BIND_ENABLED", false),
+		IssuerAllowlist: getStringSlice("OCTO_OIDC_BIND_ISSUER_ALLOWLIST", nil),
 		TokenTTL:        loadBindTokenTTL(),
-		VerifyMax:       loadBindCounter("DM_OIDC_BIND_VERIFY_MAX", defaultBindVerifyMax),
-		OTPSendMax:      loadBindCounter("DM_OIDC_BIND_OTP_SEND_MAX", defaultBindOTPSendMax),
-		ConfirmMax:      loadBindCounter("DM_OIDC_BIND_CONFIRM_MAX", defaultBindConfirmMax),
-		UIDFailPerDay:   loadBindCounter("DM_OIDC_BIND_UID_FAIL_PER_DAY", defaultBindUIDFailPerDay),
+		VerifyMax:       loadBindCounter("OCTO_OIDC_BIND_VERIFY_MAX", defaultBindVerifyMax),
+		OTPSendMax:      loadBindCounter("OCTO_OIDC_BIND_OTP_SEND_MAX", defaultBindOTPSendMax),
+		ConfirmMax:      loadBindCounter("OCTO_OIDC_BIND_CONFIRM_MAX", defaultBindConfirmMax),
+		UIDFailPerDay:   loadBindCounter("OCTO_OIDC_BIND_UID_FAIL_PER_DAY", defaultBindUIDFailPerDay),
 		Methods:         loadBindMethods(),
-		SupportContact:  getString("DM_OIDC_BIND_SUPPORT_CONTACT", ""),
-		RedirectBase:    getString("DM_OIDC_BIND_REDIRECT_BASE", ""),
+		SupportContact:  getString("OCTO_OIDC_BIND_SUPPORT_CONTACT", ""),
+		RedirectBase:    getString("OCTO_OIDC_BIND_REDIRECT_BASE", ""),
 	}
 }
 
 // loadBindTokenTTL 秒级整数 -> Duration。非法/0/负数回退默认 5min。
 func loadBindTokenTTL() time.Duration {
-	v, ok := os.LookupEnv("DM_OIDC_BIND_TOKEN_TTL_SEC")
+	v, ok := os.LookupEnv("OCTO_OIDC_BIND_TOKEN_TTL_SEC")
 	if !ok || v == "" {
 		return defaultBindTokenTTL
 	}
@@ -109,10 +145,10 @@ func loadBindCounter(key string, def int64) int64 {
 	return n
 }
 
-// loadBindMethods 解析 DM_OIDC_BIND_METHODS,逗号分隔。未知值/email_otp
+// loadBindMethods 解析 OCTO_OIDC_BIND_METHODS,逗号分隔。未知值/email_otp
 // 静默 drop(后者 SR-3 明确禁用);全部 drop 则回退默认两项,避免"无可用方法"死锁。
 func loadBindMethods() []BindMethod {
-	v, ok := os.LookupEnv("DM_OIDC_BIND_METHODS")
+	v, ok := os.LookupEnv("OCTO_OIDC_BIND_METHODS")
 	if !ok || v == "" {
 		return defaultBindMethods
 	}

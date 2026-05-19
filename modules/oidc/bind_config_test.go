@@ -59,22 +59,22 @@ func TestLoadConfig_BindDefaults(t *testing.T) {
 	}
 }
 
-// TestLoadConfig_BindOverrides 覆盖每个 DM_OIDC_BIND_* env 的解析。
+// TestLoadConfig_BindOverrides 覆盖每个 OCTO_OIDC_BIND_* env 的解析。
 func TestLoadConfig_BindOverrides(t *testing.T) {
 	clearOIDCBindEnv(t)
 	clearOIDCEnv(t)
 	mustSetMinimalOIDCEnv(t)
 
-	t.Setenv("DM_OIDC_BIND_ENABLED", "true")
-	t.Setenv("DM_OIDC_BIND_ISSUER_ALLOWLIST", "https://aegis,https://google")
-	t.Setenv("DM_OIDC_BIND_TOKEN_TTL_SEC", "120")
-	t.Setenv("DM_OIDC_BIND_VERIFY_MAX", "8")
-	t.Setenv("DM_OIDC_BIND_OTP_SEND_MAX", "2")
-	t.Setenv("DM_OIDC_BIND_CONFIRM_MAX", "1")
-	t.Setenv("DM_OIDC_BIND_UID_FAIL_PER_DAY", "20")
-	t.Setenv("DM_OIDC_BIND_METHODS", "password")
-	t.Setenv("DM_OIDC_BIND_SUPPORT_CONTACT", "ops@example.com")
-	t.Setenv("DM_OIDC_BIND_REDIRECT_BASE", "https://im.example.com/oidc/bind")
+	t.Setenv("OCTO_OIDC_BIND_ENABLED", "true")
+	t.Setenv("OCTO_OIDC_BIND_ISSUER_ALLOWLIST", "https://aegis,https://google")
+	t.Setenv("OCTO_OIDC_BIND_TOKEN_TTL_SEC", "120")
+	t.Setenv("OCTO_OIDC_BIND_VERIFY_MAX", "8")
+	t.Setenv("OCTO_OIDC_BIND_OTP_SEND_MAX", "2")
+	t.Setenv("OCTO_OIDC_BIND_CONFIRM_MAX", "1")
+	t.Setenv("OCTO_OIDC_BIND_UID_FAIL_PER_DAY", "20")
+	t.Setenv("OCTO_OIDC_BIND_METHODS", "password")
+	t.Setenv("OCTO_OIDC_BIND_SUPPORT_CONTACT", "ops@example.com")
+	t.Setenv("OCTO_OIDC_BIND_REDIRECT_BASE", "https://im.example.com/oidc/bind")
 
 	cfg, err := LoadConfig()
 	if err != nil {
@@ -114,12 +114,12 @@ func TestLoadConfig_BindInvalidValuesFallback(t *testing.T) {
 	clearOIDCEnv(t)
 	mustSetMinimalOIDCEnv(t)
 
-	t.Setenv("DM_OIDC_BIND_TOKEN_TTL_SEC", "not-a-number")
-	t.Setenv("DM_OIDC_BIND_VERIFY_MAX", "0")
-	t.Setenv("DM_OIDC_BIND_OTP_SEND_MAX", "-1")
-	t.Setenv("DM_OIDC_BIND_CONFIRM_MAX", "abc")
-	t.Setenv("DM_OIDC_BIND_UID_FAIL_PER_DAY", "")
-	t.Setenv("DM_OIDC_BIND_METHODS", "email_otp") // SR-3 禁用,会被静默过滤掉
+	t.Setenv("OCTO_OIDC_BIND_TOKEN_TTL_SEC", "not-a-number")
+	t.Setenv("OCTO_OIDC_BIND_VERIFY_MAX", "0")
+	t.Setenv("OCTO_OIDC_BIND_OTP_SEND_MAX", "-1")
+	t.Setenv("OCTO_OIDC_BIND_CONFIRM_MAX", "abc")
+	t.Setenv("OCTO_OIDC_BIND_UID_FAIL_PER_DAY", "")
+	t.Setenv("OCTO_OIDC_BIND_METHODS", "email_otp") // SR-3 禁用,会被静默过滤掉
 
 	cfg, err := LoadConfig()
 	if err != nil {
@@ -165,7 +165,7 @@ func TestLoadConfig_BindMethodsParsing(t *testing.T) {
 			clearOIDCBindEnv(t)
 			clearOIDCEnv(t)
 			mustSetMinimalOIDCEnv(t)
-			t.Setenv("DM_OIDC_BIND_METHODS", tc.in)
+			t.Setenv("OCTO_OIDC_BIND_METHODS", tc.in)
 
 			cfg, err := LoadConfig()
 			if err != nil {
@@ -194,8 +194,8 @@ func TestLoadConfig_BindEnabledDoesNotForceRedirectBase(t *testing.T) {
 	clearOIDCBindEnv(t)
 	clearOIDCEnv(t)
 	mustSetMinimalOIDCEnv(t)
-	t.Setenv("DM_OIDC_BIND_ENABLED", "true")
-	// 故意不设 DM_OIDC_BIND_REDIRECT_BASE
+	t.Setenv("OCTO_OIDC_BIND_ENABLED", "true")
+	// 故意不设 OCTO_OIDC_BIND_REDIRECT_BASE
 
 	cfg, err := LoadConfig()
 	if err != nil {
@@ -227,16 +227,16 @@ func mustSetMinimalOIDCEnv(t *testing.T) {
 func clearOIDCBindEnv(t *testing.T) {
 	t.Helper()
 	keys := []string{
-		"DM_OIDC_BIND_ENABLED",
-		"DM_OIDC_BIND_ISSUER_ALLOWLIST",
-		"DM_OIDC_BIND_TOKEN_TTL_SEC",
-		"DM_OIDC_BIND_VERIFY_MAX",
-		"DM_OIDC_BIND_OTP_SEND_MAX",
-		"DM_OIDC_BIND_CONFIRM_MAX",
-		"DM_OIDC_BIND_UID_FAIL_PER_DAY",
-		"DM_OIDC_BIND_METHODS",
-		"DM_OIDC_BIND_SUPPORT_CONTACT",
-		"DM_OIDC_BIND_REDIRECT_BASE",
+		"OCTO_OIDC_BIND_ENABLED",
+		"OCTO_OIDC_BIND_ISSUER_ALLOWLIST",
+		"OCTO_OIDC_BIND_TOKEN_TTL_SEC",
+		"OCTO_OIDC_BIND_VERIFY_MAX",
+		"OCTO_OIDC_BIND_OTP_SEND_MAX",
+		"OCTO_OIDC_BIND_CONFIRM_MAX",
+		"OCTO_OIDC_BIND_UID_FAIL_PER_DAY",
+		"OCTO_OIDC_BIND_METHODS",
+		"OCTO_OIDC_BIND_SUPPORT_CONTACT",
+		"OCTO_OIDC_BIND_REDIRECT_BASE",
 	}
 	for _, k := range keys {
 		t.Setenv(k, "")
