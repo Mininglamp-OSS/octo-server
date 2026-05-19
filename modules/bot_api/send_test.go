@@ -303,17 +303,13 @@ func TestSendMessage_PersonalDM_DBError_ForgedClientSpaceID_Stripped(t *testing.
 
 // TestSendMessage_MentionAllRewritten_HandlerIntegration is the YUJ-1343 /
 // Mininglamp-OSS/octo-server#94 acceptance test for the mention three-state
-// rewrite on the /v1/bot/sendMessage handler path, updated for Plan X
-// (YUJ-1389).
+// rewrite on the /v1/bot/sendMessage handler path.
 //
 // This is the "handler-level integration test" the issue calls out: drive
 // BotAPI.sendMessage end-to-end with a `payload.mention.all=1` body and
-// assert the captured MsgSendReq carries `mention.ais=1` (Plan X
-// chokepoint rewrite ran — legacy `@所有人` auto-fans-out to all AI bots
-// without an SDK update) AND still carries `mention.all=1` (outbound
-// double-write preserved for legacy read-side clients). humans MUST
-// stay absent — humans is the explicit human-notification signal and is
-// never inferred from a legacy `all=1`. Lesson from PR#82 OBO fan-out:
+// assert the captured MsgSendReq carries `mention.humans=1` (chokepoint
+// rewrite ran) AND still carries `mention.all=1` (outbound double-write
+// preserved for legacy read-side clients). Lesson from PR#82 OBO fan-out:
 // when an external-service shape constraint matters, the test MUST go
 // through the real handler stack — not call the helper in isolation —
 // otherwise a wiring regression (e.g. someone deletes the call site by
@@ -386,31 +382,27 @@ func TestSendMessage_MentionAllRewritten_HandlerIntegration(t *testing.T) {
 	if !assert.True(t, ok, "dispatched payload must keep mention map; got %T", dispatchedPayload["mention"]) {
 		return
 	}
-	// Plan X chokepoint rewrite ran — ais=1 is now present (legacy
-	// `@所有人` auto-fans-out to all AI bots without an SDK update).
-	ais, _ := mention["ais"].(json.Number)
-	assert.Equal(t, "1", ais.String(),
-		"Plan X: BotAPI.sendMessage must invoke mentionrewrite.RewriteMention so mention.ais=1 reaches the dispatcher")
+	// Chokepoint rewrite ran — humans=1 is now present.
+	humans, _ := mention["humans"].(json.Number)
+	assert.Equal(t, "1", humans.String(),
+		"BotAPI.sendMessage must invoke mentionrewrite.RewriteMention so mention.humans=1 reaches the dispatcher")
 	// Outbound double-write — legacy all=1 still present so old read-side
 	// clients keep rendering the @所有人 pill until they roll out support
 	// for the humans/ais fields.
 	all, _ := mention["all"].(json.Number)
 	assert.Equal(t, "1", all.String(),
 		"legacy mention.all=1 MUST be preserved on the dispatched payload (outbound double-write)")
-	// humans MUST stay absent — Plan X: humans is the explicit human-
-	// notification signal and is NEVER inferred from a legacy `all=1`.
-	// Only the sender may set humans, and only when they want a
-	// channel-level "[有人@我]" reminder for human members.
-	_, hasHumans := mention["humans"]
-	assert.False(t, hasHumans,
-		"BotAPI.sendMessage rewrite must NOT auto-set mention.humans — humans is an explicit opt-in signal")
+	// ais MUST stay absent — Yu D1: legacy @所有人 must NOT auto-fan-out
+	// to bots (the exact pain point the rewrite is closing).
+	_, hasAIs := mention["ais"]
+	assert.False(t, hasAIs,
+		"BotAPI.sendMessage rewrite must NOT auto-set mention.ais — would re-trigger the bot fan-out pain point")
 }
 
 // TestSendMessage_MentionAisPassthrough_HandlerIntegration verifies the
 // other end of the matrix: an explicit `mention.ais=1` from a new client
-// passes through the chokepoint untouched (the Plan X rewrite is a
-// one-way "all → also ais" rule, never adds humans/ais from thin air
-// when the inbound shape did not request the broadcast via all=1).
+// passes through the chokepoint untouched (the rewrite is a one-way
+// "all → also humans" rule, never adds humans/ais from thin air).
 func TestSendMessage_MentionAisPassthrough_HandlerIntegration(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

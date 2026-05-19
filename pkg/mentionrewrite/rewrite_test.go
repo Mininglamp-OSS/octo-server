@@ -1,15 +1,12 @@
 // Unit tests for the pure RewriteMention helper.
 //
 // These cover the spec contract from Mininglamp-OSS/octo-server#94 and
-// the issue YUJ-1343 acceptance list, updated for Plan X (YUJ-1389):
-// inbound `mention.all=1` now rewrites to carry `mention.ais=1` (not
-// `humans=1`) so legacy `@所有人` traffic automatically fans out to
-// all AI bots without requiring an SDK update. The companion thin
-// re-export in modules/message/mention_rewrite.go has its own
-// colocated test file that exercises the same shapes through the
-// message-package symbol, so a future refactor moving the helper
-// does not have to update two suites in lockstep — the contract is
-// asserted here and the shim test only verifies the shim is not a stub.
+// the issue YUJ-1343 acceptance list. The companion thin re-export in
+// modules/message/mention_rewrite.go has its own colocated test file
+// that exercises the same shapes through the message-package symbol,
+// so a future refactor moving the helper does not have to update two
+// suites in lockstep — the contract is asserted here and the shim test
+// only verifies the shim is not a stub.
 package mentionrewrite
 
 import (
@@ -21,12 +18,9 @@ import (
 )
 
 // TestRewriteMention_AllOnly — the canonical legacy-client shape. An
-// inbound `mention.all=1` MUST gain a `mention.ais=1` companion (Plan
-// X: legacy @所有人 → fan out to bots automatically) and MUST keep the
-// `all=1` field on the outbound payload (double-write for old
-// read-side clients that only understand `all`). humans MUST NOT be
-// set as a side effect — humans is the explicit human-notification
-// signal and must only be set by the sender.
+// inbound `mention.all=1` MUST gain a `mention.humans=1` companion and
+// MUST keep the `all=1` field on the outbound payload (double-write for
+// old read-side clients that only understand `all`).
 func TestRewriteMention_AllOnly(t *testing.T) {
 	payload := map[string]interface{}{
 		"type":    1,
@@ -41,11 +35,11 @@ func TestRewriteMention_AllOnly(t *testing.T) {
 	mention := out["mention"].(map[string]interface{})
 	assert.Equal(t, json.Number("1"), mention["all"],
 		"all=1 must be preserved (outbound double-write for legacy clients)")
-	assert.Equal(t, json.Number("1"), mention["ais"],
-		"Plan X: all=1 inbound must set ais=1 so legacy @所有人 fans out to bots")
-	_, hasHumans := mention["humans"]
-	assert.False(t, hasHumans,
-		"humans must NOT be auto-set — humans is the explicit human-notification signal")
+	assert.Equal(t, json.Number("1"), mention["humans"],
+		"all=1 inbound must set humans=1")
+	_, hasAIs := mention["ais"]
+	assert.False(t, hasAIs,
+		"ais must NOT be auto-set — legacy @所有人 must not silently fan out to bots (Yu D1 rationale)")
 	// Non-mention fields untouched.
 	assert.Equal(t, 1, out["type"])
 	assert.Equal(t, "@所有人 hi", out["content"])
@@ -115,7 +109,7 @@ func TestRewriteMention_AllPlusUIDs(t *testing.T) {
 	out := RewriteMention(payload)
 	mention := out["mention"].(map[string]interface{})
 	assert.Equal(t, json.Number("1"), mention["all"], "all preserved")
-	assert.Equal(t, json.Number("1"), mention["ais"], "Plan X: ais added")
+	assert.Equal(t, json.Number("1"), mention["humans"], "humans added")
 	assert.Equal(t,
 		[]interface{}{"uid_alice", "uid_bob"},
 		mention["uids"],
@@ -140,7 +134,7 @@ func TestRewriteMention_AllPlusEntities(t *testing.T) {
 	out := RewriteMention(payload)
 	mention := out["mention"].(map[string]interface{})
 	assert.Equal(t, json.Number("1"), mention["all"])
-	assert.Equal(t, json.Number("1"), mention["ais"], "Plan X: ais added")
+	assert.Equal(t, json.Number("1"), mention["humans"])
 	assert.True(t, reflect.DeepEqual(entities, mention["entities"]),
 		"entities array must survive the rewrite untouched")
 }
@@ -231,7 +225,7 @@ func TestRewriteMention_AllAsFloat(t *testing.T) {
 	}
 	out := RewriteMention(payload)
 	mention := out["mention"].(map[string]interface{})
-	assert.Equal(t, json.Number("1"), mention["ais"], "float64 all=1 must trigger rewrite to ais=1")
+	assert.Equal(t, json.Number("1"), mention["humans"], "float64 all=1 must trigger rewrite")
 	assert.Equal(t, float64(1), mention["all"], "original all value preserved verbatim")
 }
 
@@ -245,12 +239,12 @@ func TestRewriteMention_AllAsBool(t *testing.T) {
 	}
 	out := RewriteMention(payload)
 	mention := out["mention"].(map[string]interface{})
-	assert.Equal(t, json.Number("1"), mention["ais"])
+	assert.Equal(t, json.Number("1"), mention["humans"])
 	assert.Equal(t, true, mention["all"])
 }
 
 // TestRewriteMention_AllZero — `all=0` is the "no @所有人" sentinel; the
-// rewrite must NOT add an ais field.
+// rewrite must NOT add a humans field.
 func TestRewriteMention_AllZero(t *testing.T) {
 	payload := map[string]interface{}{
 		"mention": map[string]interface{}{
@@ -259,38 +253,15 @@ func TestRewriteMention_AllZero(t *testing.T) {
 	}
 	out := RewriteMention(payload)
 	mention := out["mention"].(map[string]interface{})
-	_, hasAIs := mention["ais"]
-	assert.False(t, hasAIs, "all=0 must not gain ais=1")
 	_, hasHumans := mention["humans"]
 	assert.False(t, hasHumans, "all=0 must not gain humans=1")
 }
 
-// TestRewriteMention_AllAndAIsBothSet — a forward-compat new client
-// might already set BOTH all and ais. The rewrite must NOT clobber
-// the client-supplied ais value (e.g. some future "ais=2" semantic
+// TestRewriteMention_AllAndHumansBothSet — a forward-compat new client
+// might already set BOTH all and humans. The rewrite must NOT clobber
+// the client-supplied humans value (e.g. some future "humans=2" semantic
 // would be silently overwritten by a blind set).
-func TestRewriteMention_AllAndAIsBothSet(t *testing.T) {
-	payload := map[string]interface{}{
-		"mention": map[string]interface{}{
-			"all": json.Number("1"),
-			"ais": json.Number("1"),
-		},
-	}
-	out := RewriteMention(payload)
-	mention := out["mention"].(map[string]interface{})
-	// Both still present, neither mutated.
-	assert.Equal(t, json.Number("1"), mention["all"])
-	assert.Equal(t, json.Number("1"), mention["ais"])
-	_, hasHumans := mention["humans"]
-	assert.False(t, hasHumans,
-		"humans must NOT be inferred from all=1 — only set explicitly by client")
-}
-
-// TestRewriteMention_AllPlusHumans — a client that explicitly wants to
-// notify humans alongside legacy `@所有人` sets both `all=1` and
-// `humans=1`. The rewrite still adds `ais=1` (Plan X) but must NOT
-// touch the existing humans field.
-func TestRewriteMention_AllPlusHumans(t *testing.T) {
+func TestRewriteMention_AllAndHumansBothSet(t *testing.T) {
 	payload := map[string]interface{}{
 		"mention": map[string]interface{}{
 			"all":    json.Number("1"),
@@ -299,9 +270,9 @@ func TestRewriteMention_AllPlusHumans(t *testing.T) {
 	}
 	out := RewriteMention(payload)
 	mention := out["mention"].(map[string]interface{})
-	assert.Equal(t, json.Number("1"), mention["all"], "all preserved")
-	assert.Equal(t, json.Number("1"), mention["humans"], "client-supplied humans untouched")
-	assert.Equal(t, json.Number("1"), mention["ais"], "Plan X: ais added")
+	// Both still present, neither mutated.
+	assert.Equal(t, json.Number("1"), mention["all"])
+	assert.Equal(t, json.Number("1"), mention["humans"])
 }
 
 // TestRewriteMention_Idempotent — RewriteMention(RewriteMention(p))

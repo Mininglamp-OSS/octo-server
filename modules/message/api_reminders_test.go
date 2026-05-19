@@ -1,26 +1,18 @@
 // modules/message/api_reminders_test.go
 //
 // Reminder fan-out matrix tests for the mention three-state rewrite
-// (YUJ-1343 / Mininglamp-OSS/octo-server#94) updated for Plan X
-// (YUJ-1389). The chokepoint rewrite (pkg/mentionrewrite.RewriteMention)
-// double-writes legacy `mention.all=1` to `mention.ais=1` so legacy
-// `@所有人` traffic fans out to all AI bots without an SDK update on
-// the sender side. A NEW field `mention.humans=1` is the explicit
-// human-notification signal — it is the only way to produce a
-// channel-level reminder (the "[有人@我]" red-dot). This file pins:
+// (YUJ-1343 / Mininglamp-OSS/octo-server#94). The chokepoint rewrite
+// (pkg/mentionrewrite.RewriteMention) double-writes legacy
+// `mention.all=1` to `mention.humans=1`, and a new client may also set
+// `mention.ais=1`. This file pins:
 //
-//  1. Message.getMention recognizes any of {humans, ais, all} = 1 as a
-//     "broadcast" mention (so the caller knows to consider the
-//     humans-gate), and still pulls per-user `uids` for the
-//     non-broadcast path.
-//  2. Message.getReminders emits a channel-level reminder ONLY when
-//     `humans=1` is set on the payload. ais-only broadcasts (including
-//     the legacy `all=1` shape after the chokepoint rewrite) produce
-//     ZERO reminder rows — bots respond via the message delivery path,
-//     so a "[有人@我]" for human members would be noise.
-//  3. Explicit @uid mentions still produce per-uid reminder rows even
-//     when the message ALSO carries a broadcast flag (`@所有人 + @alice`
-//     must still ping @alice individually).
+//   1. Message.getMention recognizes any of {humans, ais, all} = 1 as a
+//      "broadcast" mention (channel-level reminder), and still pulls
+//      per-user `uids` for the non-broadcast path.
+//   2. Message.getReminders generates exactly the right shape of
+//      reminder rows for each matrix cell — channel-level (UID="")
+//      for broadcasts, per-uid rows for explicit uids, and zero rows
+//      when the payload has no mention at all.
 //
 // These tests are pure helpers (no DB / no IM context) so they live
 // next to the existing mention-shape suite in validation_test.go.
@@ -52,11 +44,7 @@ func payloadJSON(t *testing.T, m map[string]interface{}) []byte {
 }
 
 // TestGetMention_ThreeStateMatrix locks the three-state read-side
-// semantics established in YUJ-1343 / GH#94 §RFC 6 and updated for
-// Plan X (YUJ-1389): getMention still reports all=true for any of
-// {humans, ais, all} = 1; the humans-gate that decides whether a
-// channel-level reminder is actually emitted lives at the call site
-// (see TestGetReminders_FanoutMatrix below).
+// semantics established in YUJ-1343 / GH#94 §RFC 6.
 func TestGetMention_ThreeStateMatrix(t *testing.T) {
 	m := &Message{}
 
@@ -73,7 +61,7 @@ func TestGetMention_ThreeStateMatrix(t *testing.T) {
 			expectUIDs: nil,
 		},
 		{
-			name:       "ais=1 alone → broadcast (read side sees it; emitter gates on humans)",
+			name:       "ais=1 alone → broadcast",
 			mention:    map[string]interface{}{"ais": json.Number("1")},
 			expectAll:  true,
 			expectUIDs: nil,
@@ -88,10 +76,10 @@ func TestGetMention_ThreeStateMatrix(t *testing.T) {
 			expectUIDs: nil,
 		},
 		{
-			name: "all=1 (Plan X post-rewrite carries ais=1) → broadcast",
+			name: "all=1 (post-rewrite carries humans=1) → broadcast",
 			mention: map[string]interface{}{
-				"all": json.Number("1"),
-				"ais": json.Number("1"),
+				"all":    json.Number("1"),
+				"humans": json.Number("1"),
 			},
 			expectAll:  true,
 			expectUIDs: nil,
@@ -101,7 +89,7 @@ func TestGetMention_ThreeStateMatrix(t *testing.T) {
 			// This path SHOULDN'T happen in production once the
 			// chokepoint runs, but if a listener somehow sees an
 			// un-rewritten message (e.g. replay of historical data),
-			// the reader must still recognize it as a broadcast.
+			// the reader must still emit a reminder.
 			mention:    map[string]interface{}{"all": json.Number("1")},
 			expectAll:  true,
 			expectUIDs: nil,
@@ -113,7 +101,7 @@ func TestGetMention_ThreeStateMatrix(t *testing.T) {
 			expectUIDs: []string{"u_alice", "u_bob"},
 		},
 		{
-			name: "humans=1 + uids → broadcast AND uids parsed",
+			name: "humans=1 + uids → broadcast wins (uids still parsed)",
 			mention: map[string]interface{}{
 				"humans": json.Number("1"),
 				"uids":   []interface{}{"u_alice"},
@@ -170,24 +158,18 @@ func newReminderTestMessage(t *testing.T) *Message {
 }
 
 // TestGetReminders_FanoutMatrix asserts the SHAPE of reminders
-// emitted for every cell of the Plan X (YUJ-1389) mention matrix.
-// The fan-out behavior is:
+// emitted for every cell of the three-state mention matrix. The fan-out
+// behavior is:
 //
-//   - humans=1            → exactly ONE channel-level reminder
-//     (UID="", "[有人@我]")
-//   - ais=1 (only)        → ZERO reminders (bots respond via delivery)
-//   - all=1 + ais=1       → ZERO reminders (post-rewrite ais-only)
-//   - humans=1 + ais=1    → ONE channel-level reminder (humans visible,
-//     bots fan out via delivery)
-//   - uids = [a, b]       → one reminder PER uid, with UID=<uid>
-//   - humans=1 + uids     → ONE channel-level reminder PLUS one
-//     per-uid reminder for each uid (the broadcast and the explicit
-//     mention coexist — `@所有人 + @alice` must still ping @alice)
-//   - no mention          → zero reminders
+//   - any of {humans, ais, all} = 1 → exactly ONE reminder per message
+//     with UID="" (channel-level — clients filter by role in adapter)
+//   - uids = [a, b]                 → one reminder PER uid, with
+//     UID=<uid>
+//   - no mention                    → zero reminders
 //
-// Role-aware delivery for bots is a downstream concern (bots subscribe
-// to ais=1 messages directly through the message-delivery path). This
-// test pins the server's reminder-emission contract.
+// Role-aware delivery (humans-only vs bots-only) is intentionally a
+// client-side adapter concern — see api_reminders.go:getMention for
+// the rationale. This test pins the server contract.
 func TestGetReminders_FanoutMatrix(t *testing.T) {
 	m := newReminderTestMessage(t)
 
@@ -205,13 +187,13 @@ func TestGetReminders_FanoutMatrix(t *testing.T) {
 			wantBroadcast: 1,
 		},
 		{
-			name:          "ais=1 only → 0 reminders (bots use delivery path)",
+			name:          "ais=1 → 1 channel-level reminder (bots fan-out)",
 			mention:       map[string]interface{}{"ais": json.Number("1")},
-			wantTotal:     0,
-			wantBroadcast: 0,
+			wantTotal:     1,
+			wantBroadcast: 1,
 		},
 		{
-			name: "humans=1 + ais=1 → 1 channel-level reminder (humans visible)",
+			name: "humans+ais → still ONE channel-level reminder (client filters role)",
 			mention: map[string]interface{}{
 				"humans": json.Number("1"),
 				"ais":    json.Number("1"),
@@ -220,19 +202,9 @@ func TestGetReminders_FanoutMatrix(t *testing.T) {
 			wantBroadcast: 1,
 		},
 		{
-			name: "all=1 + ais=1 (Plan X post-rewrite) → 0 reminders, ais-only semantics",
-			mention: map[string]interface{}{
-				"all": json.Number("1"),
-				"ais": json.Number("1"),
-			},
-			wantTotal:     0,
-			wantBroadcast: 0,
-		},
-		{
-			name: "humans=1 + ais=1 + all=1 (legacy + new client double-tag) → 1 channel-level",
+			name: "all=1 (rewrite double-wrote humans=1) → 1 channel-level reminder, humans-only semantics",
 			mention: map[string]interface{}{
 				"all":    json.Number("1"),
-				"ais":    json.Number("1"),
 				"humans": json.Number("1"),
 			},
 			wantTotal:     1,
@@ -245,24 +217,13 @@ func TestGetReminders_FanoutMatrix(t *testing.T) {
 			wantPerUserUIDs: []string{"u_alice", "u_bob"},
 		},
 		{
-			name: "humans=1 + uids → 1 channel-level + 1 per-user (broadcast and uid coexist)",
+			name: "humans=1 + uids → broadcast wins (1 channel-level)",
 			mention: map[string]interface{}{
 				"humans": json.Number("1"),
 				"uids":   []interface{}{"u_alice"},
 			},
-			wantTotal:       2,
-			wantBroadcast:   1,
-			wantPerUserUIDs: []string{"u_alice"},
-		},
-		{
-			name: "ais=1 + uids (post-rewrite ais-only with explicit @uid) → only per-user reminders",
-			mention: map[string]interface{}{
-				"ais":  json.Number("1"),
-				"uids": []interface{}{"u_alice"},
-			},
-			wantTotal:       1,
-			wantBroadcast:   0,
-			wantPerUserUIDs: []string{"u_alice"},
+			wantTotal:     1,
+			wantBroadcast: 1,
 		},
 		{
 			name:      "no mention → 0 reminders",
@@ -307,7 +268,9 @@ func TestGetReminders_FanoutMatrix(t *testing.T) {
 				assert.Equal(t, msg.FromUID, r.Publisher)
 				assert.Equal(t, fmt.Sprintf("%d", msg.MessageID), r.MessageID)
 			}
-			assert.Equal(t, tc.wantBroadcast, broadcasts, "broadcast count mismatch")
+			if tc.wantBroadcast > 0 {
+				assert.Equal(t, tc.wantBroadcast, broadcasts, "broadcast count mismatch")
+			}
 			if len(tc.wantPerUserUIDs) > 0 {
 				want := map[string]bool{}
 				for _, u := range tc.wantPerUserUIDs {
@@ -319,15 +282,12 @@ func TestGetReminders_FanoutMatrix(t *testing.T) {
 	}
 }
 
-// TestGetReminders_LegacyAllRoundTripThroughRewrite is the end-to-end
-// matrix cell that ties the chokepoint and the reader together under
-// Plan X (YUJ-1389): a legacy `mention.all=1` payload, after passing
-// through the chokepoint rewrite, produces ZERO channel-level
-// reminders — the post-rewrite payload is `{all:1, ais:1}`, which is
-// ais-only semantics and must NOT create a "[有人@我]" red-dot.
-// Bots receive the message via the delivery path; humans see nothing
-// in the reminder pane (which is the desired Plan X behavior).
-func TestGetReminders_LegacyAllRoundTripThroughRewrite(t *testing.T) {
+// TestGetReminders_AllAndHumans_RoundTripThroughRewrite is the
+// end-to-end matrix cell that ties the chokepoint and the reader
+// together: a legacy `mention.all=1` payload, after passing through
+// the chokepoint rewrite, still produces exactly ONE channel-level
+// reminder with humans-only semantics (Yu D1 — bots silent).
+func TestGetReminders_AllAndHumans_RoundTripThroughRewrite(t *testing.T) {
 	m := newReminderTestMessage(t)
 
 	// Legacy inbound shape.
@@ -341,9 +301,7 @@ func TestGetReminders_LegacyAllRoundTripThroughRewrite(t *testing.T) {
 	rewritten := RewriteMention(inbound)
 	mention := rewritten["mention"].(map[string]interface{})
 	assert.Equal(t, json.Number("1"), mention["all"], "all preserved (outbound double-write)")
-	assert.Equal(t, json.Number("1"), mention["ais"], "Plan X: ais added by rewrite")
-	_, hasHumans := mention["humans"]
-	assert.False(t, hasHumans, "Plan X: humans is NOT auto-set by rewrite")
+	assert.Equal(t, json.Number("1"), mention["humans"], "humans added by rewrite")
 
 	// Reader sees the rewritten payload.
 	msg := &config.MessageResp{
@@ -356,160 +314,6 @@ func TestGetReminders_LegacyAllRoundTripThroughRewrite(t *testing.T) {
 		Payload:     payloadJSON(t, rewritten),
 	}
 	rems := m.getReminders([]*config.MessageResp{msg})
-	assert.Len(t, rems, 0,
-		"Plan X: legacy all=1 (rewritten to all+ais) must produce ZERO channel-level reminders")
-}
-
-// TestGetReminders_HumansPlusAllRoundTrip — a future client that wants
-// BOTH the legacy `all=1` pill on old read-side clients AND a human-
-// visible reminder sends `{all:1, humans:1}` inbound. The chokepoint
-// rewrite ALSO adds `ais=1` (Plan X), so the dispatched payload is
-// `{all:1, humans:1, ais:1}`. Reader must emit exactly ONE channel-
-// level reminder (humans=1 is the gate).
-func TestGetReminders_HumansPlusAllRoundTrip(t *testing.T) {
-	m := newReminderTestMessage(t)
-
-	inbound := map[string]interface{}{
-		"type": 1,
-		"mention": map[string]interface{}{
-			"all":    json.Number("1"),
-			"humans": json.Number("1"),
-		},
-	}
-	rewritten := RewriteMention(inbound)
-	mention := rewritten["mention"].(map[string]interface{})
-	assert.Equal(t, json.Number("1"), mention["all"])
-	assert.Equal(t, json.Number("1"), mention["humans"])
-	assert.Equal(t, json.Number("1"), mention["ais"], "Plan X: rewrite always adds ais=1 for all=1")
-
-	msg := &config.MessageResp{
-		ChannelID:   "ch_humans_plus_all",
-		ChannelType: common.ChannelTypeGroup.Uint8(),
-		FromUID:     "u_sender",
-		MessageID:   2,
-		MessageSeq:  2,
-		ClientMsgNo: "cmn_humans_plus_all",
-		Payload:     payloadJSON(t, rewritten),
-	}
-	rems := m.getReminders([]*config.MessageResp{msg})
-	assert.Len(t, rems, 1, "humans=1 → exactly one channel-level reminder")
+	assert.Len(t, rems, 1, "round-trip must produce exactly one broadcast reminder")
 	assert.Equal(t, "", rems[0].UID, "broadcast reminder uses empty UID")
-}
-
-// TestFilterChannelLevelByPublisher pins YUJ-1377 / Mininglamp-OSS/
-// octo-server#101 — the sender of an `@所有人` broadcast must NOT
-// receive their own red-dot reminder. The fix lives in reminderSync,
-// which calls filterChannelLevelByPublisher on the rows returned by
-// remindersDB.sync; this test exercises the filter helper in
-// isolation (pure data, no DB / IM context).
-//
-// Coverage matrix:
-//   - channel-level reminder (UID="") authored by viewer → DROPPED
-//   - channel-level reminder authored by someone else    → KEPT
-//   - per-uid reminder addressed to viewer (e.g. @uid)   → KEPT
-//   - per-uid apply-join-group reminder                  → KEPT
-//     (this is the "do not break other reminder types"
-//     guarantee from the issue description)
-//   - empty/nil viewer UID                               → no-op
-//   - empty slice                                        → no-op
-//
-// Plan X (YUJ-1389): channel-level reminders are now only created
-// when `humans=1` is set, so this filter still applies to all rows
-// that reach it — the gate just means fewer rows are produced in the
-// first place. The filter contract is unchanged.
-func TestFilterChannelLevelByPublisher(t *testing.T) {
-	mk := func(uid, publisher string, reminderType int) *remindersDetailModel {
-		return &remindersDetailModel{
-			remindersModel: remindersModel{
-				ChannelID:    "ch_team",
-				ChannelType:  common.ChannelTypeGroup.Uint8(),
-				UID:          uid,
-				Publisher:    publisher,
-				ReminderType: reminderType,
-			},
-		}
-	}
-
-	t.Run("drops channel-level reminder authored by viewer", func(t *testing.T) {
-		input := []*remindersDetailModel{
-			mk("", "u_sender", int(ReminderTypeMentionMe)),        // sender's own broadcast → drop
-			mk("", "u_other", int(ReminderTypeMentionMe)),         // someone else's broadcast → keep
-			mk("u_sender", "u_other", int(ReminderTypeMentionMe)), // @u_sender from u_other → keep
-			mk("u_sender", "u_other", int(ReminderTypeApplyJoinGroup)),
-		}
-		got := filterChannelLevelByPublisher(input, "u_sender")
-		assert.Len(t, got, 3, "exactly one row (the self-broadcast) must be dropped")
-		for _, r := range got {
-			if r.UID == "" {
-				assert.NotEqual(t, "u_sender", r.Publisher,
-					"no remaining channel-level reminder may be authored by the viewer")
-			}
-		}
-	})
-
-	t.Run("keeps everything when viewer is not the publisher", func(t *testing.T) {
-		input := []*remindersDetailModel{
-			mk("", "u_alice", int(ReminderTypeMentionMe)),
-			mk("u_bob", "u_alice", int(ReminderTypeMentionMe)),
-		}
-		got := filterChannelLevelByPublisher(input, "u_bob")
-		assert.Equal(t, input, got, "no-op path must return the input slice unchanged")
-	})
-
-	t.Run("preserves apply-join-group reminders addressed to viewer", func(t *testing.T) {
-		// Apply-join-group reminders carry an explicit UID and have no
-		// Publisher set by getReminders; the filter must never drop
-		// them even if Publisher happens to coincide with the viewer.
-		input := []*remindersDetailModel{
-			mk("u_admin", "u_admin", int(ReminderTypeApplyJoinGroup)),
-		}
-		got := filterChannelLevelByPublisher(input, "u_admin")
-		assert.Equal(t, input, got, "apply-join-group must pass through verbatim")
-	})
-
-	t.Run("no-op on empty viewer uid", func(t *testing.T) {
-		input := []*remindersDetailModel{
-			mk("", "u_alice", int(ReminderTypeMentionMe)),
-		}
-		got := filterChannelLevelByPublisher(input, "")
-		assert.Equal(t, input, got)
-	})
-
-	t.Run("no-op on empty slice", func(t *testing.T) {
-		got := filterChannelLevelByPublisher(nil, "u_sender")
-		assert.Nil(t, got)
-		got = filterChannelLevelByPublisher([]*remindersDetailModel{}, "u_sender")
-		assert.Empty(t, got)
-	})
-}
-
-// TestReminderSync_SenderExcludedFromBroadcast is the contract-level
-// regression: the sender of `@所有人` is excluded from the reminder
-// list returned by the read path. We exercise the filter step here
-// (the DB layer is covered by integration tests); together with
-// TestGetReminders_FanoutMatrix this pins both "row is created" and
-// "row is hidden from the author on read".
-func TestReminderSync_SenderExcludedFromBroadcast(t *testing.T) {
-	// Simulate what remindersDB.sync would return for u_sender after
-	// u_sender broadcast `@所有人` and an unrelated peer also did.
-	rows := []*remindersDetailModel{
-		{remindersModel: remindersModel{
-			ChannelID: "ch_team", ChannelType: common.ChannelTypeGroup.Uint8(),
-			UID: "", Publisher: "u_sender", ReminderType: int(ReminderTypeMentionMe),
-			Text: "[有人@我]",
-		}},
-		{remindersModel: remindersModel{
-			ChannelID: "ch_team", ChannelType: common.ChannelTypeGroup.Uint8(),
-			UID: "", Publisher: "u_peer", ReminderType: int(ReminderTypeMentionMe),
-			Text: "[有人@我]",
-		}},
-	}
-
-	got := filterChannelLevelByPublisher(rows, "u_sender")
-	assert.Len(t, got, 1, "sender must see only the peer's broadcast, not their own")
-	assert.Equal(t, "u_peer", got[0].Publisher)
-
-	// And a third party sees both.
-	got = filterChannelLevelByPublisher(rows, "u_bystander")
-	assert.Len(t, got, 2)
 }
