@@ -11,6 +11,8 @@ package bot_api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
@@ -97,8 +99,14 @@ func TestFanout_Happy(t *testing.T) {
 		t.Fatalf("expected 1 captured copy, got %d", len(fc.copies))
 	}
 	cp := fc.copies[0]
-	if len(cp.Subscribers) != 1 || cp.Subscribers[0] != tBot {
-		t.Fatalf("subscribers should be [%s], got %v", tBot, cp.Subscribers)
+	if err := assertFanoutDispatchContract(cp); err != nil {
+		t.Fatalf("fan-out contract violated: %v (req=%+v)", err, cp)
+	}
+	if cp.ChannelID != tBot {
+		t.Fatalf("channel_id should be bot mailbox %q, got %q", tBot, cp.ChannelID)
+	}
+	if len(cp.Subscribers) != 0 {
+		t.Fatalf("subscribers must be omitted (channel_id/subscribers are mutually exclusive on /message/send), got %v", cp.Subscribers)
 	}
 	if cp.Header.NoPersist != 1 || cp.Header.RedDot != 0 {
 		t.Fatalf("fan-out must be silent (NoPersist=1, RedDot=0), got %+v", cp.Header)
@@ -111,6 +119,10 @@ func TestFanout_Happy(t *testing.T) {
 	}
 	if v, _ := got2["obo_fanout"].(bool); !v {
 		t.Fatalf("payload should be marked obo_fanout=true: %v", got2)
+	}
+	// Origin channel context preserved so downstream consumers can route.
+	if got2["obo_origin_channel_id"] != ch {
+		t.Fatalf("obo_origin_channel_id should be %q, got %v", ch, got2["obo_origin_channel_id"])
 	}
 }
 
@@ -441,8 +453,14 @@ func TestFanout_DMPeerToGrantor_MatchesScope(t *testing.T) {
 		t.Fatalf("expected 1 captured copy, got %d", len(fc.copies))
 	}
 	cp := fc.copies[0]
-	if len(cp.Subscribers) != 1 || cp.Subscribers[0] != tBot {
-		t.Fatalf("subscribers should be [%s], got %v", tBot, cp.Subscribers)
+	if err := assertFanoutDispatchContract(cp); err != nil {
+		t.Fatalf("fan-out contract violated: %v (req=%+v)", err, cp)
+	}
+	if cp.ChannelID != tBot {
+		t.Fatalf("channel_id should be bot mailbox %q, got %q", tBot, cp.ChannelID)
+	}
+	if len(cp.Subscribers) != 0 {
+		t.Fatalf("subscribers must be omitted on the fan-out copy, got %v", cp.Subscribers)
 	}
 	// Payload integrity: the bot must see the original sender and content.
 	var p map[string]interface{}
@@ -452,6 +470,10 @@ func TestFanout_DMPeerToGrantor_MatchesScope(t *testing.T) {
 	}
 	if v, _ := p["obo_origin_from_uid"].(string); v != peer {
 		t.Fatalf("obo_origin_from_uid should be %q, got %q", peer, v)
+	}
+	// Origin channel context: DM receiver is the grantor.
+	if v, _ := p["obo_origin_channel_id"].(string); v != tGrantor {
+		t.Fatalf("obo_origin_channel_id should be grantor %q, got %q", tGrantor, v)
 	}
 }
 
@@ -615,15 +637,24 @@ func TestFanout_DMMultiGrantor_OnlyRecipientReceives(t *testing.T) {
 		t.Fatalf("multi-grantor DM: expected 1 captured copy, got %d", len(fc.copies))
 	}
 	cp := fc.copies[0]
-	if len(cp.Subscribers) != 1 || cp.Subscribers[0] != aliceBot {
-		t.Fatalf("multi-grantor DM leak: subscriber should be [%s], got %v", aliceBot, cp.Subscribers)
+	if err := assertFanoutDispatchContract(cp); err != nil {
+		t.Fatalf("fan-out contract violated: %v (req=%+v)", err, cp)
 	}
-	// Explicitly assert Carol's bot is NOT a subscriber on any copy —
-	// the regression we're guarding against.
+	if cp.ChannelID != aliceBot {
+		t.Fatalf("multi-grantor DM leak: channel_id should be alice's bot mailbox %q, got %q", aliceBot, cp.ChannelID)
+	}
+	if len(cp.Subscribers) != 0 {
+		t.Fatalf("subscribers must be omitted on the fan-out copy, got %v", cp.Subscribers)
+	}
+	// Explicitly assert Carol's bot is NOT the addressed mailbox on any
+	// copy — the regression we're guarding against.
 	for _, c := range fc.copies {
+		if c.ChannelID == carolBot {
+			t.Fatalf("CROSS-USER DM LEAK: carol's bot mailbox (%s) received fan-out of bob→alice DM", carolBot)
+		}
 		for _, sub := range c.Subscribers {
 			if sub == carolBot {
-				t.Fatalf("CROSS-USER DM LEAK: carol's bot (%s) received fan-out of bob→alice DM", carolBot)
+				t.Fatalf("CROSS-USER DM LEAK: carol's bot (%s) listed in Subscribers (and Subscribers should be empty)", carolBot)
 			}
 		}
 	}
@@ -670,8 +701,11 @@ func TestFanout_DMSingleGrantor_RecipientReceives(t *testing.T) {
 	if n := ba.fanoutForMessage(msg); n != 1 {
 		t.Fatalf("single-grantor DM happy path: expected 1 fan-out, got %d", n)
 	}
-	if len(fc.copies) != 1 || fc.copies[0].Subscribers[0] != tBot {
+	if len(fc.copies) != 1 || fc.copies[0].ChannelID != tBot {
 		t.Fatalf("single-grantor DM happy path: wrong dispatch, copies=%+v", fc.copies)
+	}
+	if err := assertFanoutDispatchContract(fc.copies[0]); err != nil {
+		t.Fatalf("fan-out contract violated: %v (req=%+v)", err, fc.copies[0])
 	}
 }
 
@@ -732,5 +766,278 @@ func TestFanout_DMNonRecipient_NoLeak(t *testing.T) {
 	}
 	if len(fc.copies) != 0 {
 		t.Fatalf("non-recipient grant leaked: captured %d copies, expected 0", len(fc.copies))
+	}
+}
+
+// assertFanoutDispatchContract enforces the WuKongIM /message/send mutex
+// invariant: a MsgSendReq must carry EXACTLY ONE of (channel_id set with
+// empty subscribers) OR (empty channel_id with subscribers set). Setting
+// both triggers the production rejection observed in PR#82 R5 P0:
+//
+//	【message】channelId和subscribers不能同时存在！
+//
+// The OBO fan-out path picks the channel_id branch (bot's own mailbox).
+// This helper is used by every dispatch-contract regression test so any
+// future driver of buildFanoutCopyReq that re-introduces the conflict is
+// caught at the unit-test layer, before im-test ever sees it.
+func assertFanoutDispatchContract(req *config.MsgSendReq) error {
+	if req == nil {
+		return errors.New("dispatched a nil MsgSendReq")
+	}
+	hasChannelID := strings.TrimSpace(req.ChannelID) != ""
+	hasSubscribers := len(req.Subscribers) > 0
+	if hasChannelID && hasSubscribers {
+		return fmt.Errorf("MsgSendReq sets BOTH channel_id=%q AND subscribers=%v — WuKongIM rejects this combination", req.ChannelID, req.Subscribers)
+	}
+	if !hasChannelID && !hasSubscribers {
+		return errors.New("MsgSendReq has neither channel_id nor subscribers — WuKongIM cannot route the message")
+	}
+	return nil
+}
+
+// TestFanout_DispatchReq_NoConflict_ChannelOrSubscribers — PR#82 R5 P0
+// regression. The v0 buildFanoutCopyReq set BOTH ChannelID (origin
+// conversation) AND Subscribers ([granteeBot]); WuKongIM /message/send
+// rejected every fan-out with "channelId和subscribers不能同时存在", and
+// the bot consequently never received the copy → the persona never
+// replied.
+//
+// This test exercises every channel-type / sender-role combination the
+// fan-out hot path can see (DM peer→grantor, group, community topic) and
+// asserts the dispatched MsgSendReq always satisfies the mutex contract.
+// It does NOT touch the access-check or recipient-filter logic — those
+// have their own dedicated tests — so any future regression in
+// buildFanoutCopyReq alone surfaces here.
+func TestFanout_DispatchReq_NoConflict_ChannelOrSubscribers(t *testing.T) {
+	cases := []struct {
+		name       string
+		ct         uint8
+		setupMsg   func(scope string) *config.MessageResp
+		setupScope func() (string, *fakeOBOStore)
+	}{
+		{
+			name: "group",
+			ct:   common.ChannelTypeGroup.Uint8(),
+			setupScope: func() (string, *fakeOBOStore) {
+				ch := "group_42"
+				return ch, seedGrantWithScope(t, ch, common.ChannelTypeGroup.Uint8())
+			},
+			setupMsg: func(scope string) *config.MessageResp {
+				return &config.MessageResp{
+					FromUID:     "alice",
+					ChannelID:   scope,
+					ChannelType: common.ChannelTypeGroup.Uint8(),
+					Payload:     []byte(`{"type":1,"content":"hi group"}`),
+				}
+			},
+		},
+		{
+			name: "dm_peer_to_grantor",
+			ct:   common.ChannelTypePerson.Uint8(),
+			setupScope: func() (string, *fakeOBOStore) {
+				const peer = "bob"
+				ct := common.ChannelTypePerson.Uint8()
+				s := newFakeOBOStore()
+				gid, _ := s.insertGrant(tGrantor, tBot, "auto")
+				enable := 1
+				_ = s.updateGrant(gid, "", &enable)
+				if _, err := s.insertScope(gid, peer, ct, 1); err != nil {
+					t.Fatalf("insertScope: %v", err)
+				}
+				return peer, s
+			},
+			setupMsg: func(peer string) *config.MessageResp {
+				return &config.MessageResp{
+					FromUID:     peer,
+					ChannelID:   tGrantor,
+					ChannelType: common.ChannelTypePerson.Uint8(),
+					Payload:     []byte(`{"type":1,"content":"hey yu"}`),
+				}
+			},
+		},
+		{
+			name: "community_topic",
+			ct:   common.ChannelTypeCommunityTopic.Uint8(),
+			setupScope: func() (string, *fakeOBOStore) {
+				ch := "topic_99"
+				return ch, seedGrantWithScope(t, ch, common.ChannelTypeCommunityTopic.Uint8())
+			},
+			setupMsg: func(scope string) *config.MessageResp {
+				return &config.MessageResp{
+					FromUID:     "alice",
+					ChannelID:   scope,
+					ChannelType: common.ChannelTypeCommunityTopic.Uint8(),
+					Payload:     []byte(`{"type":1,"content":"hi topic"}`),
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			scope, s := tc.setupScope()
+			fc := &fanoutCapture{}
+			ba := newBAforFanout(s, fc)
+			msg := tc.setupMsg(scope)
+			n := ba.fanoutForMessage(msg)
+			if n != 1 {
+				t.Fatalf("expected 1 dispatch, got %d (copies=%+v)", n, fc.copies)
+			}
+			if len(fc.copies) != 1 {
+				t.Fatalf("expected 1 captured copy, got %d", len(fc.copies))
+			}
+			cp := fc.copies[0]
+			if err := assertFanoutDispatchContract(cp); err != nil {
+				t.Fatalf("WuKongIM mutex contract violated: %v\n  channel_id=%q\n  subscribers=%v\n  channel_type=%d\n  from_uid=%q",
+					err, cp.ChannelID, cp.Subscribers, cp.ChannelType, cp.FromUID)
+			}
+		})
+	}
+}
+
+// TestFanout_DispatchReq_BotReceivesViaOwnChannel — PR#82 R5 P0. Locks
+// in option-3 routing decision: the fan-out copy is delivered via the
+// grantee bot's OWN Person mailbox (ChannelID=granteeBotUID,
+// ChannelType=Person), not via the origin conversation's channel_id with
+// a Subscribers filter. This is the contract that satisfies the
+// WuKongIM mutex AND keeps the copy out of the origin channel's
+// subscriber pipeline (so no real user sees it even if NoPersist were
+// to ever regress).
+//
+// Asserts (per fan-out copy):
+//   - ChannelID == granteeBotUID
+//   - ChannelType == ChannelTypePerson (set by NewPersonalMsgSendReq)
+//   - Subscribers is empty
+//   - FromUID preserves the original sender's uid (so the bot's
+//     payload-side handlers can identify who spoke)
+//   - obo_origin_* payload fields preserve the routing context
+func TestFanout_DispatchReq_BotReceivesViaOwnChannel(t *testing.T) {
+	ch, ct := "group_42", common.ChannelTypeGroup.Uint8()
+	s := seedGrantWithScope(t, ch, ct)
+	fc := &fanoutCapture{}
+	ba := newBAforFanout(s, fc)
+
+	msg := &config.MessageResp{
+		FromUID:      "u_bob",
+		ChannelID:    ch,
+		ChannelType:  ct,
+		MessageIDStr: "origin_msg_42",
+		Payload:      []byte(`{"type":1,"content":"hi yu"}`),
+	}
+	if n := ba.fanoutForMessage(msg); n != 1 {
+		t.Fatalf("expected 1 dispatch, got %d", n)
+	}
+	if len(fc.copies) != 1 {
+		t.Fatalf("expected 1 captured copy, got %d", len(fc.copies))
+	}
+	cp := fc.copies[0]
+	if err := assertFanoutDispatchContract(cp); err != nil {
+		t.Fatalf("contract violated: %v", err)
+	}
+	if cp.ChannelID != tBot {
+		t.Fatalf("ChannelID should be grantee bot mailbox %q, got %q", tBot, cp.ChannelID)
+	}
+	if cp.ChannelType != common.ChannelTypePerson.Uint8() {
+		t.Fatalf("ChannelType should be Person (%d), got %d", common.ChannelTypePerson.Uint8(), cp.ChannelType)
+	}
+	if len(cp.Subscribers) != 0 {
+		t.Fatalf("Subscribers must be omitted (mutex with channel_id), got %v", cp.Subscribers)
+	}
+	if cp.FromUID != "u_bob" {
+		t.Fatalf("FromUID should preserve origin sender %q, got %q", "u_bob", cp.FromUID)
+	}
+
+	var p map[string]interface{}
+	if err := json.Unmarshal(cp.Payload, &p); err != nil {
+		t.Fatalf("payload not JSON: %v", err)
+	}
+	if got := p["obo_origin_channel_id"]; got != ch {
+		t.Fatalf("obo_origin_channel_id should be origin channel %q, got %v", ch, got)
+	}
+	// JSON numbers decode as float64.
+	if got, _ := p["obo_origin_channel_type"].(float64); uint8(got) != ct {
+		t.Fatalf("obo_origin_channel_type should be %d, got %v", ct, p["obo_origin_channel_type"])
+	}
+	if got := p["obo_origin_from_uid"]; got != "u_bob" {
+		t.Fatalf("obo_origin_from_uid should be %q, got %v", "u_bob", got)
+	}
+	if got := p["obo_origin_message_idstr"]; got != "origin_msg_42" {
+		t.Fatalf("obo_origin_message_idstr should be %q, got %v", "origin_msg_42", got)
+	}
+	// Original content preserved.
+	if got := p["content"]; got != "hi yu" {
+		t.Fatalf("original content lost: got %v", got)
+	}
+	// Fan-out marker present.
+	if v, _ := p["obo_fanout"].(bool); !v {
+		t.Fatalf("obo_fanout marker missing")
+	}
+	// And — defense in depth — the gate-3 marker MUST NOT be on the
+	// fan-out copy. The bot's own reply (a separate send via
+	// /v1/bot/sendMessage) is what carries the __obo_processed__ marker.
+	if _, present := p["__obo_processed__"]; present {
+		t.Fatalf("fan-out copy must not carry the gate-3 __obo_processed__ marker; that key is set only on the bot's own outbound: %v", p)
+	}
+}
+
+// TestFanout_DispatchReq_RealDispatcher_ContractCheck — PR#82 R5 P0. Test
+// gap closure: every existing fan-out test mocks oboFanoutDispatch with
+// the fanoutCapture hook, which means WuKongIM-shape rejections (like the
+// channel_id/subscribers mutex) are invisible to the unit suite. The
+// production v0 path silently fed conflicting requests to WuKongIM and
+// only im-test surfaced the bug.
+//
+// This test installs a "fake WuKongIM" dispatcher that performs the same
+// mutex check the real /message/send endpoint does, then runs the
+// fan-out happy path and asserts the dispatcher accepts the request (zero
+// rejections, exactly one delivery). A future regression that re-
+// introduces the conflict — by, say, copying buildFanoutCopyReq into a
+// new code path — will trip this fake and fail.
+func TestFanout_DispatchReq_RealDispatcher_ContractCheck(t *testing.T) {
+	ch, ct := "group_42", common.ChannelTypeGroup.Uint8()
+	s := seedGrantWithScope(t, ch, ct)
+
+	var (
+		dispatched int
+		rejected   []string
+	)
+	fakeWK := func(req *config.MsgSendReq) error {
+		// Mirror the WuKongIM /message/send precondition: channel_id and
+		// subscribers are mutually exclusive.
+		if strings.TrimSpace(req.ChannelID) != "" && len(req.Subscribers) > 0 {
+			msg := fmt.Sprintf("【message】channelId和subscribers不能同时存在！ (channel_id=%q subscribers=%v)", req.ChannelID, req.Subscribers)
+			rejected = append(rejected, msg)
+			return errors.New(msg)
+		}
+		if strings.TrimSpace(req.ChannelID) == "" && len(req.Subscribers) == 0 {
+			msg := "【message】channelId和subscribers至少需要一个！"
+			rejected = append(rejected, msg)
+			return errors.New(msg)
+		}
+		dispatched++
+		return nil
+	}
+	ba := &BotAPI{
+		Log:               log.NewTLog("BotAPI-fanout-test"),
+		oboStoreOverride:  s,
+		oboFanoutDispatch: fakeWK,
+		oboChannelAccessOverride: func(uid, channelID string, channelType uint8) (bool, error) {
+			return true, nil
+		},
+	}
+
+	msg := &config.MessageResp{
+		FromUID:     "u_bob",
+		ChannelID:   ch,
+		ChannelType: ct,
+		Payload:     []byte(`{"type":1,"content":"hi yu"}`),
+	}
+	if n := ba.fanoutForMessage(msg); n != 1 {
+		t.Fatalf("fan-out should succeed against contract-respecting WuKongIM, got %d (rejections=%v)", n, rejected)
+	}
+	if dispatched != 1 {
+		t.Fatalf("fake WuKongIM should have accepted 1 dispatch, accepted %d", dispatched)
+	}
+	if len(rejected) != 0 {
+		t.Fatalf("WuKongIM contract violations: %v", rejected)
 	}
 }

@@ -31,14 +31,33 @@
 // their own fan-out (a bounded edge case) and the test suite is the only
 // caller that ever wrote the legacy key in this branch.
 //
-// For each surviving (message, grant) pair we build a CMD-style copy via
-// MsgSendReq with Subscribers=[grantee_bot_uid] so only the bot receives
-// the fan-out. The original delivery to real users is untouched.
+// For each surviving (message, grant) pair we build a MsgSendReq addressed
+// to the grantee bot's own PERSONAL mailbox (ChannelID=grantee_bot_uid,
+// ChannelType=Person, Subscribers OMITTED). The original delivery to real
+// users is untouched.
+//
+// PR#82 review #5 P0 — WuKongIM /message/send contract: `channel_id` and
+// `subscribers` are MUTUALLY EXCLUSIVE on a single MsgSendReq. The v0
+// implementation set BOTH (ChannelID = origin conversation, Subscribers =
+// [granteeBot]) and WuKongIM rejected every dispatch with:
+//
+//	【message】channelId和subscribers不能同时存在！
+//
+// The "OBO fan-out dispatch failed" line in im-test prod showed every
+// inbound message tripping this. Fix: address the fan-out copy at the
+// bot's personal mailbox and drop Subscribers. The original conversation
+// context is preserved in the payload's `obo_origin_*` fields so the bot
+// (and any downstream consumer) can still reason about where the message
+// originated. We go through octo-lib's `NewPersonalMsgSendReq` builder so
+// the PERSONAL DM authoritative-payload contract (Mininglamp-OSS#37) is
+// preserved and the `tools/lint-personal-msgsendreq` invariant holds.
 //
 // What we do NOT do here:
 //   - We do NOT call SendMessageWithResult (which would create a new
-//     persisted message everyone sees). Subscribers + NoPersist gives the
-//     bot a one-shot copy via its existing subscriber pipeline.
+//     persisted message everyone sees). The Person-channel route +
+//     NoPersist=1 gives the bot a one-shot copy via its existing
+//     subscriber pipeline (the bot is the sole subscriber of its own
+//     mailbox channel).
 //   - We do NOT recompute permissions; checkOBO already ran when the bot
 //     authored the message that's now bouncing, and inbound messages from
 //     real users are by definition allowed in the channel they arrived in.
@@ -50,7 +69,6 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
-	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"go.uber.org/zap"
 )
 
@@ -216,9 +234,11 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 				zap.Uint8("channel_type", m.ChannelType))
 			continue
 		}
-		// Build a fan-out copy. NoPersist=1 + SyncOnce=1 + Subscribers
-		// limits delivery to the bot only and avoids re-incrementing
-		// red dots / conversation positions for any real user.
+		// Build a fan-out copy addressed to the bot's own Person mailbox.
+		// NoPersist=1 + SyncOnce=1 keep delivery silent and the bot is the
+		// only subscriber of its own channel, so no real user sees the
+		// copy — even though Subscribers is now omitted (see PR#82 R5 P0
+		// in buildFanoutCopyReq for why both can't be set).
 		copyReq := buildFanoutCopyReq(m, g.GranteeBotUID)
 		if err := ba.dispatchFanout(copyReq); err != nil {
 			ba.Error("OBO fan-out dispatch failed",
@@ -232,11 +252,30 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 	return dispatched
 }
 
-// buildFanoutCopyReq turns an inbound MessageResp into a CMD-style copy
-// addressed only to `granteeBotUID`. The payload is augmented with an
-// `obo_fanout=true` marker so downstream consumers can distinguish the
-// copy from the original (the marker is informational; loop protection
-// uses `obo_processed=true` set by the bot's own outbound).
+// buildFanoutCopyReq turns an inbound MessageResp into a one-shot copy
+// addressed to `granteeBotUID`'s PERSONAL mailbox. The payload is augmented
+// with `obo_fanout=true` plus `obo_origin_*` fields that pin down the
+// original conversation (the marker is informational; loop protection
+// uses `__obo_processed__` set by the bot's own outbound).
+//
+// Contract enforcement (PR#82 R5 P0): the returned MsgSendReq sets exactly
+// ONE of `ChannelID` / `Subscribers` (channel_id mode), never both —
+// WuKongIM `/message/send` rejects requests carrying both with
+// `channelId和subscribers不能同时存在`. We route via the bot's own Person
+// channel so:
+//
+//   - ChannelID    = granteeBotUID (bot's own mailbox)
+//   - ChannelType  = Person (set by NewPersonalMsgSendReq)
+//   - Subscribers  = nil (omitted)
+//
+// NoPersist=1 + SyncOnce=1 keep the copy ephemeral so we don't bump red
+// dots or update conversation positions for any real user.
+//
+// senderSpaceID is intentionally "" — the fan-out is an internal control
+// channel, not a user-authored DM. The builder will strip any
+// payload-supplied `space_id` (fail-closed per Mininglamp-OSS/octo-server
+// PR#35 R3). Downstream consumers must read `obo_origin_*` for routing
+// context, not `space_id`.
 func buildFanoutCopyReq(m *config.MessageResp, granteeBotUID string) *config.MsgSendReq {
 	payload := map[string]interface{}{}
 	if len(m.Payload) > 0 {
@@ -258,18 +297,25 @@ func buildFanoutCopyReq(m *config.MessageResp, granteeBotUID string) *config.Msg
 		payload["obo_origin_message_idstr"] = m.MessageIDStr
 	}
 
-	return &config.MsgSendReq{
-		Header: config.MsgHeader{
-			NoPersist: 1, // silent copy — doesn't enter normal storage
-			RedDot:    0,
-			SyncOnce:  1,
+	// PERSONAL DM dispatch — must go through the octo-lib builder so
+	// payload.space_id authoritative semantics + the channel_id/subscribers
+	// mutex are uniformly applied. Subscribers omitted intentionally; see
+	// the contract block in the function doc.
+	return config.NewPersonalMsgSendReq(
+		granteeBotUID,
+		m.FromUID,
+		payload,
+		"", // no authoritative sender Space for an internal control copy
+		config.PersonalMsgOptions{
+			Header: config.MsgHeader{
+				NoPersist: 1, // silent copy — doesn't enter normal storage
+				RedDot:    0,
+				SyncOnce:  1,
+			},
+			// Subscribers intentionally OMITTED — WuKongIM rejects when
+			// channel_id AND subscribers are both set.
 		},
-		FromUID:     m.FromUID,
-		ChannelID:   m.ChannelID,
-		ChannelType: m.ChannelType,
-		Subscribers: []string{granteeBotUID},
-		Payload:     []byte(util.ToJson(payload)),
-	}
+	)
 }
 
 // dispatchFanout sends the fan-out copy. Test override is consulted first
