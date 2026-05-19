@@ -25,7 +25,8 @@ type StateData struct {
 	// ClientAuthcode 前端在 /authorize 阶段传入的短码,callback 完成后用作 ThirdAuthcode
 	// Redis key 的后半段,前端按 GitHub 模式短码轮询取 LoginRespJSON。
 	ClientAuthcode string `json:"client_authcode,omitempty"`
-	// DeviceFlag 调用方期望的设备类型(0=APP / 1=PC / 2=Web ...),透传给 IssueSession。
+	// DeviceFlag 调用方期望的设备类型,透传给 IssueSession。
+	// 取值与 octo-lib config.DeviceFlag 一致(iota 顺序):0=APP / 1=Web / 2=PC。
 	DeviceFlag uint8 `json:"device_flag,omitempty"`
 }
 

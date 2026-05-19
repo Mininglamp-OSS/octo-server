@@ -1003,11 +1003,12 @@ func (o *OIDC) redirectToBindPage(c *wkhttp.Context, sd *StateData, jti string) 
 		}
 	}
 	target.RawQuery = q.Encode()
-	// Referrer-Policy: no-referrer 防止 bind 页(可能位于独立域)及其内部子资源
-	// 把 callback URL 经 Referer 头泄漏。authcode 是 ThirdAuthcode 的 Redis key
-	// (5min 单次有效),仍是凭据,不应出现在跨域 Referer 上。后端单点强制比依赖
-	// 前端 <meta> 更可靠 —— meta 要等 bind 页 HTML 解析后才生效,防不了对 bind
-	// 页本身的请求那一跳。
+	// Referrer-Policy: no-referrer 仅保护这一跳:浏览器从 callback URL 跳到
+	// bind 页时不会把 callback 的 ?code=... &state=... 经 Referer 泄漏给 bind
+	// 页 host。bind 页加载之后,其内部子资源是否泄漏"含 token/authcode 的
+	// bind 页 URL",取决于 bind 页**自己**的 Referrer-Policy(响应头或 meta),
+	// 后端无法跨域强制。前端 host 应同步下发 Referrer-Policy: no-referrer
+	// 作为纵深防御。
 	c.Header("Referrer-Policy", "no-referrer")
 	c.Redirect(http.StatusFound, target.String())
 }
@@ -1048,6 +1049,11 @@ func (o *OIDC) redirectAfterCallback(c *wkhttp.Context, sd *StateData, failed bo
 		}
 		target = target + sep + "oidc_error=1"
 	}
+	// 与 redirectToBindPage 同语义:防止 callback URL(IdP 回填的 code/state +
+	// 我们注入的 oidc_error 标记)在跳到 return_to 那一跳经 Referer 泄漏。code
+	// 是单次消费的,但 state 与时间窗内的 code 组合对反查仍有价值。无论成功还
+	// 是失败 callback 都走这条路径,所以统一加上。
+	c.Header("Referrer-Policy", "no-referrer")
 	c.Redirect(http.StatusFound, target)
 }
 

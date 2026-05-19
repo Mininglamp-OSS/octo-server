@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
@@ -668,5 +669,51 @@ func TestAPI_RedirectToBindPage_EmptyBaseWritesAuthcodeZero(t *testing.T) {
 
 	if got := fakeAC.get("ac-empty-base"); got != "0" {
 		t.Fatalf("RedirectBase 为空必须先写 ThirdAuthcode \"0\",got %q", got)
+	}
+}
+
+// TestAPI_RedirectToBindPage_EmptyProviderIDOmitsParam 锁定 PR #80 的回退契约:
+// cfg.Provider.ID 为空时,redirect URL **不**应出现 provider= 字段(让前端按
+// legacyProviderPathID="aegis" 兜底),而不是写空串 provider=。
+//
+// 生产路径下 LoadConfig 已用 ^[a-z0-9][a-z0-9_-]{0,63}$ 拦了空 ID,本测试钉住的是
+// 兜底 if 行为本身,防回退路径被无声删除后仍编译通过。
+func TestAPI_RedirectToBindPage_EmptyProviderIDOmitsParam(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	o := &OIDC{
+		Log: log.NewTLog("OIDC-test"),
+		cfg: &Config{
+			Enabled: true,
+			Provider: ProviderConfig{
+				ID:            "",
+				ReturnToHosts: []string{"app.example.com"},
+			},
+			Bind: BindConfig{
+				Enabled:      true,
+				RedirectBase: "https://im.example.com/oidc/bind",
+			},
+		},
+		authcode: newFakeAuthcode(),
+	}
+	r := gin.New()
+	r.GET("/x", func(c *gin.Context) {
+		o.redirectToBindPage(wrapWk(c), &StateData{
+			ClientAuthcode: "ac-no-provider",
+		}, "jti-xyz")
+	})
+	req := httptest.NewRequest("GET", "/x", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("status=%d want 302, body=%s", w.Code, w.Body.String())
+	}
+	loc, err := url.Parse(w.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse Location: %v", err)
+	}
+	if loc.Query().Has("provider") {
+		t.Fatalf("provider must be omitted when cfg.Provider.ID=\"\", got %q in %q",
+			loc.Query().Get("provider"), w.Header().Get("Location"))
 	}
 }
