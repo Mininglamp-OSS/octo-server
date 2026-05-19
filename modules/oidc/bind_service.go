@@ -182,7 +182,7 @@ func (s *BindService) VerifyPassword(ctx context.Context, jti, identifier, passw
 		// 维度(自己计数请求是否被限)区分"用户存在"与"用户不存在",绕过 SR-6。
 		// 用 subHash(identifier) 而非原文,避免攻击者通过 Redis 监控反查 identifier。
 		if _, lerr := s.store.IncrAndCheck(ctx,
-			bindUIDFailKey("unknown:"+subHash(identifier)), s.cfg.UIDFailPerDay, uidFailWindow); lerr != nil {
+			bindEnumFailKey(subHash(identifier)), s.cfg.UIDFailPerDay, uidFailWindow); lerr != nil {
 			return lerr
 		}
 		return fmt.Errorf("oidc bind VerifyPassword: %w (unknown identifier)", ErrBindAuthRejected)
@@ -506,8 +506,14 @@ func maskPhoneForBind(phone string) string {
 // 以便单测可临时缩小窗口验证滚动行为(当前未用,保留扩展位)。
 var uidFailWindow = 24 * time.Hour
 
-// bindUIDFailKey 拼装 SR-2.2 计数器的 Redis key。集中拼装避免漂移。
+// bindUIDFailKey 拼装 SR-2.2 真实 uid 维度计数器的 Redis key。集中拼装避免漂移。
 func bindUIDFailKey(uid string) string { return "bind:uidfail:" + uid }
+
+// bindEnumFailKey 反枚举(SR-6)维度计数器的 Redis key。**独立 keyspace**
+// (`bind:enumfail:` 而非 `bind:uidfail:unknown:`),避免万一某个 IdP 发出
+// 字面以 `unknown:` 开头的 uid 时与真实账号计数串扰 —— 真用户被攻击者用
+// 不存在的 identifier 反复探测而锁死。两个 keyspace 物理隔离更稳。
+func bindEnumFailKey(identifierHash string) string { return "bind:enumfail:" + identifierHash }
 
 // methodEnabled 检查 cfg.Methods 是否启用了 m。配置必须是真实策略:
 // 运维通过 DM_OIDC_BIND_METHODS 关一种方法后,客户端硬调端点也不能绕过 ——

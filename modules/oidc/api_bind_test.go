@@ -503,6 +503,45 @@ func (g *testRouteGroup) POST(path string, _ ...wkhttp.HandlerFunc) {
 	g.routes = append(g.routes, "POST "+path)
 }
 
+// TestAPI_BindVerifyPassword_MethodDisabledReturns400 锁定 Issue C 的 handler
+// 映射:service 返 ErrBindMethodDisabled → HTTP 400。防止"service 改对了但
+// handler 的 errors.Is 链漏一处"导致前端拿到 500/401 误判。
+func TestAPI_BindVerifyPassword_MethodDisabledReturns400(t *testing.T) {
+	cfg := defaultBindCfg()
+	cfg.Methods = []BindMethod{BindMethodSMSOTP} // 关闭密码
+	o, jti, _, _, _ := newTestOIDCWithBind(t, cfg, sampleClaims(), false)
+	r := newTestBindRouter(o)
+
+	body, _ := json.Marshal(map[string]string{
+		"token": jti, "identifier": "alice", "password": "x",
+	})
+	req := httptest.NewRequest("POST", "/v1/auth/oidc/aegis/bind/verify/password",
+		bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("disabled method must be 400, got %d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestAPI_BindOTPSend_MethodDisabledReturns400(t *testing.T) {
+	cfg := defaultBindCfg()
+	cfg.Methods = []BindMethod{BindMethodPassword}
+	o, jti, _, _, _ := newTestOIDCWithBind(t, cfg, sampleClaims(), false)
+	r := newTestBindRouter(o)
+
+	body, _ := json.Marshal(map[string]string{"token": jti})
+	req := httptest.NewRequest("POST", "/v1/auth/oidc/aegis/bind/verify/otp/send",
+		bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("disabled sms send must be 400, got %d body=%s", w.Code, w.Body.String())
+	}
+}
+
 // TestAPI_BindHandlers_NilBindReturnsServiceUnavailable 锁定 Issue F 修复:
 // Discovery 失败时 Init 早返,o.bind 保持 nil,但 cfg.Bind.Enabled=true 仍
 // 让 bindRoutes 挂上 5 个端点。任一 handler 被调用时第一行就调 o.bind.* →
