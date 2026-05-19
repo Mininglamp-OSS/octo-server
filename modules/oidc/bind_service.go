@@ -25,6 +25,9 @@ type BindAuthenticator interface {
 	VerifyPasswordByUID(ctx context.Context, uid, password string) (matched bool, reason string, err error)
 	SendOIDCBindSMS(ctx context.Context, zone, phone string) error
 	VerifyOIDCBindSMS(ctx context.Context, zone, phone, code string) error
+	// IsBindable Confirm 路径在 identity.Insert 前对 CandidateUID 做最后一次
+	// 状态复核。详见 user.IService.IsBindable godoc。
+	IsBindable(ctx context.Context, uid string) (bool, error)
 }
 
 // BindLocator 把用户输入(username)或 claims phone 解析到 dmwork uid。
@@ -374,6 +377,21 @@ func (s *BindService) Confirm(ctx context.Context, jti string) (*BindConfirmResp
 	if err != nil {
 		return nil, err
 	}
+	// TOCTOU 复核(round-4 Jerry-Xin):locator + VerifyPasswordByUID 都只在
+	// verify 阶段过滤 is_destroy/status,verify→confirm 之间有 5min 用户交互
+	// 窗口,运维 disable / 用户自助 destroy 都能让 CandidateUID 变成不可绑定状态。
+	// 此处再查一次,把残留 user_oidc_identity 脏数据导致用户后续 OIDC 登录
+	// dead-loop 的窗口从"用户交互级"压到"DB 单次 round-trip 级"。
+	// DB 层 uk_uid_issuer + 登录路径的 status 检查仍然是终态兜底。
+	bindable, berr := s.auth.IsBindable(ctx, sess.CandidateUID)
+	if berr != nil {
+		return nil, fmt.Errorf("oidc bind Confirm: check uid bindable: %w", berr)
+	}
+	if !bindable {
+		// 与 verify 阶段拒绝停用账号同语义,wrap ErrBindAuthRejected 让 handler
+		// 翻 401 + 通用文案(反账号枚举 SR-6,不暴露"账号被运维停用"vs"不存在")。
+		return nil, fmt.Errorf("oidc bind Confirm: %w (candidate uid not bindable)", ErrBindAuthRejected)
+	}
 	// 写 identity binding —— uk_uid_issuer / uk_issuer_subject 兜底竞态。
 	if err := s.identity.Insert(&IdentityModel{
 		UID:           sess.CandidateUID,
@@ -444,11 +462,28 @@ func decodeSDSnapshot(b []byte) (*StateData, error) {
 // 另一个 CASSave 看到 status 已经是 verified,返 ErrBindStatusConflict。
 // 防止"victim 的 verified token + attacker 用自己账号再 verify 一次 →
 // CandidateUID 被覆盖 → confirm 绑到 attacker"的身份接管路径。
+//
+// TTL 使用 absolute expiry(round-4 Jerry-Xin Warning):传 remainingTTL 而非
+// 完整 cfg.TokenTTL,否则在 token 快过期时 verify 会把 TTL 续到 issue 后的
+// "TokenTTL × 2",与文档承诺的 5min 不符,也让 URL 泄漏窗口翻倍。
+// remaining<=0 时返 ErrBindNotFound 让调用方按"已过期"处理。
 func (s *BindService) saveVerified(ctx context.Context, sess *BindSession) error {
-	if err := s.store.CASSave(ctx, sess, BindStatusIssued, s.cfg.TokenTTL); err != nil {
+	remaining := s.remainingTTL(sess)
+	if remaining <= 0 {
+		return ErrBindNotFound
+	}
+	if err := s.store.CASSave(ctx, sess, BindStatusIssued, remaining); err != nil {
 		return fmt.Errorf("oidc bind: cas save verified session: %w", err)
 	}
 	return nil
+}
+
+// remainingTTL 计算 sess 距离绝对过期(Issue 时刻 + TokenTTL)还剩多久。
+// 时间基准与 Issue 一致(nowUnix=time.Now().Unix(),time.Until 用 time.Now()),
+// 无 deterministic-clock 注入需求时可直接拿来用。
+func (s *BindService) remainingTTL(sess *BindSession) time.Duration {
+	deadline := time.Unix(sess.CreatedAt, 0).Add(s.cfg.TokenTTL)
+	return time.Until(deadline)
 }
 
 // ShouldHandle 给 callback 失败分支用的接管判定。任何一条不满足就走旧路径,
@@ -510,10 +545,17 @@ func maskEmailForBind(email string) string {
 //
 //	"+8613912345678" → "****5678"
 //	"13912345678"    → "****5678"
+//	""               → ""        // 空字符串透传,让 BindInfoResp.MaskedPhone 的
+//	                                json:"omitempty" 生效;否则返 *** 会让前端
+//	                                把"无手机号"误显示成"有手机号已脱敏"
+//	                                (round-4 Jerry-Xin nit)
 //
 // 不区分 +86 与裸号;调用方都来自 claims.PhoneNumber 字段,IdP 写法不固定。
-// 长度 < 4 时直接返 *** 兜底,不暴露原值。
+// 0<长度<4 时仍返 *** 兜底,不暴露原值(异常短手机号字段)。
 func maskPhoneForBind(phone string) string {
+	if phone == "" {
+		return ""
+	}
 	if len(phone) < 4 {
 		return "***"
 	}

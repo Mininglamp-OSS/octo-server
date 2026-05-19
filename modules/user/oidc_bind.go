@@ -116,3 +116,35 @@ func (u *User) VerifyOIDCBindSMS(ctx context.Context, zone, phone, code string) 
 	}
 	return nil
 }
+
+// IsBindable 详见 IService 注释。
+//
+// 可绑定条件比 VerifyPasswordByUID 更严:locator (oidc.dbBindLocator + DB
+// QueryUIDsByEmail/Phone) 已经用 `is_destroy=0 AND status<>0` 过滤,本方法
+// 必须与 locator 完全一致 —— 否则"verify 时被 locator 拒,改用别的入口
+// 绕到 confirm"或"verify 通过后进入冷静期"两种场景就会出现 verify/confirm
+// 不一致。
+//
+// 比 VerifyPasswordByUID 的 `IsDestroyDone || Status == 0` 多排除一个状态:
+// is_destroy=1(冷静期内可撤销注销)。理由:5min bind 窗口内被用户主动发起
+// 注销的账号,不该允许新 OIDC 身份绑定上去。
+//
+// 不计入 loginGuard 失败计数:Confirm 阶段调用,uid 已在 verify 阶段通过
+// 密码/OTP 校验,这里只是状态二次确认。如果计失败会让"管理员在用户绑定
+// 中途 disable"演变成"该 uid 被错锁 15min",体验差且无安全收益。
+func (u *User) IsBindable(_ context.Context, uid string) (bool, error) {
+	if uid == "" {
+		return false, fmt.Errorf("oidc bind IsBindable: uid required")
+	}
+	m, err := u.db.QueryByUID(uid)
+	if err != nil {
+		return false, fmt.Errorf("oidc bind IsBindable: query user by uid: %w", err)
+	}
+	if m == nil {
+		return false, nil
+	}
+	if m.IsDestroy != 0 || m.Status == 0 {
+		return false, nil
+	}
+	return true, nil
+}

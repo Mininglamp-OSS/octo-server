@@ -33,6 +33,15 @@ type fakeOIDCBindHandler struct {
 		zone, phone, code string
 		called            bool
 	}
+
+	isBindableResp struct {
+		ok  bool
+		err error
+	}
+	isBindableReq struct {
+		uid    string
+		called bool
+	}
 }
 
 func (f *fakeOIDCBindHandler) VerifyPasswordByUID(_ context.Context, uid, password string) (bool, string, error) {
@@ -55,6 +64,12 @@ func (f *fakeOIDCBindHandler) VerifyOIDCBindSMS(_ context.Context, zone, phone, 
 	f.verifySMSReq.code = code
 	f.verifySMSReq.called = true
 	return f.verifySMSErr
+}
+
+func (f *fakeOIDCBindHandler) IsBindable(_ context.Context, uid string) (bool, error) {
+	f.isBindableReq.uid = uid
+	f.isBindableReq.called = true
+	return f.isBindableResp.ok, f.isBindableResp.err
 }
 
 // TestService_VerifyPasswordByUID_DelegationAndErrors 锁定 *Service 委托
@@ -156,5 +171,49 @@ func TestService_VerifyOIDCBindSMS_DelegationAndErrors(t *testing.T) {
 		err := svc.VerifyOIDCBindSMS(context.Background(), "0086", "13900000000", "1234")
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "code expired")
+	})
+}
+
+// TestService_IsBindable_DelegationAndErrors 同 VerifyPasswordByUID 模式:
+// 未注入 sentinel,已注入直接透传 ok/err。round-4 TOCTOU 修复加的新方法。
+func TestService_IsBindable_DelegationAndErrors(t *testing.T) {
+	t.Run("not configured returns sentinel", func(t *testing.T) {
+		svc := &Service{}
+		ok, err := svc.IsBindable(context.Background(), "u1")
+		assert.False(t, ok)
+		assert.ErrorIs(t, err, ErrOIDCBindNotConfigured)
+	})
+
+	t.Run("forwards uid verbatim, returns ok=true", func(t *testing.T) {
+		fake := &fakeOIDCBindHandler{}
+		fake.isBindableResp.ok = true
+		svc := &Service{bindHandler: fake}
+
+		ok, err := svc.IsBindable(context.Background(), "u-alice")
+		assert.NoError(t, err)
+		assert.True(t, ok)
+		assert.True(t, fake.isBindableReq.called)
+		assert.Equal(t, "u-alice", fake.isBindableReq.uid)
+	})
+
+	t.Run("returns ok=false without error for unbindable account", func(t *testing.T) {
+		fake := &fakeOIDCBindHandler{}
+		// 默认 isBindableResp.ok=false
+		svc := &Service{bindHandler: fake}
+
+		ok, err := svc.IsBindable(context.Background(), "u-disabled")
+		assert.NoError(t, err)
+		assert.False(t, ok)
+	})
+
+	t.Run("infrastructure error bubbles", func(t *testing.T) {
+		fake := &fakeOIDCBindHandler{}
+		fake.isBindableResp.err = errors.New("db timeout")
+		svc := &Service{bindHandler: fake}
+
+		ok, err := svc.IsBindable(context.Background(), "u-x")
+		assert.False(t, ok)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "db timeout")
 	})
 }

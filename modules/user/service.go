@@ -144,6 +144,26 @@ type IService interface {
 	// 锁定/重试限制。**注意 lock/failCount key 同样不带 codeType,跨流程共享**,
 	// 详见 SendOIDCBindSMS 注释。
 	VerifyOIDCBindSMS(ctx context.Context, zone, phone, code string) error
+
+	// IsBindable 给 oidc bind Confirm 路径在 identity.Insert 之前再校验一次
+	// uid 仍可绑定。
+	//
+	// 必要性:locator/VerifyPasswordByUID 都只在 verify 阶段过滤
+	// (is_destroy + status<>0)。verify→confirm 之间有 5min 用户交互窗口,
+	// 期间运维可能 disable / 用户可能自助 destroy。若 confirm 不复核就 Insert,
+	// 会给一个已不可绑定的账号写入 user_oidc_identity 行;残留脏数据让该
+	// 用户后续 OIDC 登录走 (issuer, sub) autolink 命中 → IssueSession 拒绝 →
+	// 死循环登录失败,需要人工 DB 清理。
+	//
+	// 实务上 TOCTOU 窗口仍 ~毫秒级(本方法返 true 后到 identity.Insert 之间),
+	// DB 层 uk_uid_issuer + 登录路径的 status 检查兜底,但本方法把窗口从
+	// "用户交互级"压缩到"DB 单次 round-trip 级",符合纵深防御。
+	//
+	// 返回:
+	//   - (true, nil):账号可绑定
+	//   - (false, nil):账号不可绑定(已 destroy / 已停用 / 不存在),调用方按业务拒绝处理
+	//   - (false, err):基础设施错误,调用方按 internal_error 兜底
+	IsBindable(ctx context.Context, uid string) (bool, error)
 }
 
 // ErrExternalLoginNotConfigured 外部登录未注入 handler（通常是单测中未走 user.New 完整初始化）
@@ -180,6 +200,7 @@ type oidcBindHandler interface {
 	VerifyPasswordByUID(ctx context.Context, uid, password string) (matched bool, reason string, err error)
 	SendOIDCBindSMS(ctx context.Context, zone, phone string) error
 	VerifyOIDCBindSMS(ctx context.Context, zone, phone, code string) error
+	IsBindable(ctx context.Context, uid string) (bool, error)
 }
 
 // Service Service
@@ -238,6 +259,14 @@ func (s *Service) VerifyOIDCBindSMS(ctx context.Context, zone, phone, code strin
 		return ErrOIDCBindNotConfigured
 	}
 	return s.bindHandler.VerifyOIDCBindSMS(ctx, zone, phone, code)
+}
+
+// IsBindable 详见 IService 注释。
+func (s *Service) IsBindable(ctx context.Context, uid string) (bool, error) {
+	if s.bindHandler == nil {
+		return false, ErrOIDCBindNotConfigured
+	}
+	return s.bindHandler.IsBindable(ctx, uid)
 }
 
 // OIDCVerificationClaims 从 OIDC id_token / userinfo claims 里摘出的实名字段子集。

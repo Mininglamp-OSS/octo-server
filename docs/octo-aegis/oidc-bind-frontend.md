@@ -215,7 +215,16 @@ bind_token 在 5 分钟 TTL 内：
 - 密码路径：`username` 命中但账号停用 → handler 返 401，文案与"账号或密码错误"一致（SR-6 反枚举）
 - SMS 路径：phone 命中的所有候选 uid 都被过滤 → handler 返 401，引导走 FR-7 联系管理员兜底
 
+`/bind/confirm` 在 `identity.Insert` 之前还会再调一次同样的可绑定性检查，覆盖"verify 通过后账号才被运维 disable 或用户自助 destroy"的 TOCTOU 窗口；不可绑定时同样返 401。
+
 > 历史问题（commit 7b1fa9e 之前）：locator 只过滤 `is_destroy`，停用账号也能通过 verify；confirm 时 `IssueSession` 才拒绝，但 `user_oidc_identity` 行已写入，导致该用户后续 OIDC 登录持续失败需要人工 DB 清理。已在 round-4 修复。
+
+### 3.7 bind_token TTL 是绝对截止
+
+- token 在 `/authorize → callback → 签发` 那一刻起算 5 分钟（`OCTO_OIDC_BIND_TOKEN_TTL_SEC`）
+- verify 通过**不会**续 TTL；如果用户在 token 快过期时才点 verify，剩下的时间就是 confirm 必须完成的窗口
+- 已过期的 token 走任何端点都会返 410；前端拿到 410 后应当引导用户重新走 OIDC 登录
+- masked_phone 字段：claims 无手机号时 JSON 里**没有**该字段（不要靠 `=== ""` 判断）；存在时形如 `"****5678"`
 
 ## 4. 关键约束 / 注意事项
 

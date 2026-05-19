@@ -25,13 +25,17 @@ type fakeBindAuth struct {
 		reason  string
 		err     error
 	}
-	sendSMSErr   error
-	verifySMSErr error
-	calls        struct {
+	sendSMSErr      error
+	verifySMSErr    error
+	isBindableErr   error
+	isBindableFalse bool // 默认 true,设 true 时 IsBindable 返 (false, nil)
+	calls           struct {
 		pwdUID, pwdPassword                 string
 		smsZone, smsPhone                   string
 		verifyZone, verifyPhone, verifyCode string
+		isBindableUID                       string
 		pwdCount, sendCount, verifyCount    int
+		isBindableCount                     int
 	}
 }
 
@@ -59,6 +63,16 @@ func (f *fakeBindAuth) VerifyOIDCBindSMS(_ context.Context, zone, phone, code st
 	f.calls.verifyPhone = phone
 	f.calls.verifyCode = code
 	return f.verifySMSErr
+}
+func (f *fakeBindAuth) IsBindable(_ context.Context, uid string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls.isBindableCount++
+	f.calls.isBindableUID = uid
+	if f.isBindableErr != nil {
+		return false, f.isBindableErr
+	}
+	return !f.isBindableFalse, nil
 }
 
 type fakeBindLocator struct {
@@ -823,6 +837,125 @@ func TestBindService_VerifyPassword_UIDFailPerDayEnforced(t *testing.T) {
 	err := h.svc.VerifyPassword(context.Background(), jti2, "alice", "wrong")
 	if !errors.Is(err, ErrBindRateLimited) {
 		t.Fatalf("UIDFailPerDay must rate-limit cross-token attempts, got %v", err)
+	}
+}
+
+// TestBindService_SaveVerified_UsesAbsoluteTTLNotFullTokenTTL 锁定 round-4
+// Jerry-Xin Warning 修复:CASSave 必须用"距离 Issue 时刻 + TokenTTL 还剩多少
+// 秒"作为新 TTL,而不是完整 cfg.TokenTTL,否则用户在临近过期时 verify 会
+// 把 token 续到 ~2 × TokenTTL,违反 5min 文档承诺 + URL 泄漏窗口翻倍。
+//
+// 测试手法:把 nowUnix 改回退到过去,模拟"sess 是 50 秒前签发的,TokenTTL
+// 是 60 秒",触发 saveVerified 后用 store-level 直接验证 TTL 行为(memory
+// store 内部存 expiresAt = now + ttl,如果传了 cfg.TokenTTL=60s 应当看到
+// 比预期大的 expiresAt;预期实现传 ~10s remaining)。
+func TestBindService_SaveVerified_UsesAbsoluteTTLNotFullTokenTTL(t *testing.T) {
+	h := newBindHarness(t, func(c *BindConfig) {
+		c.TokenTTL = 60 * time.Second
+	})
+	h.auth.verifyPasswordResp.matched = true
+	h.loc.byUsername["alice"] = "u-alice"
+
+	// 模拟 sess 是 50 秒前签发的(剩 ~10 秒)
+	origNow := nowUnix
+	defer func() { nowUnix = origNow }()
+	pastIssue := time.Now().Add(-50 * time.Second).Unix()
+	nowUnix = func() int64 { return pastIssue }
+	jti, err := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+	// 恢复 nowUnix 让 saveVerified 走"真实当前时间",计算 remaining
+	nowUnix = origNow
+
+	// 用 60s 完整 TTL 直接 Save 一次,模拟旧实现的"刷新到完整 TokenTTL";
+	// 然后我们的 VerifyPassword 走 CASSave with remaining ≈ 10s,实际 expiresAt
+	// 不会被往后推超过 ~10s。
+	if err := h.svc.VerifyPassword(context.Background(), jti, "alice", "p"); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+
+	// 校验 memory store 的 expiresAt 距离现在不到 30 秒 —— 远小于完整 TokenTTL=60s。
+	// 30s 是宽松上限(测试机时钟漂移 + GC 暂停留余地)。
+	h.store.mu.Lock()
+	entry := h.store.sessions[jti]
+	h.store.mu.Unlock()
+	if remaining := time.Until(entry.expiresAt); remaining > 30*time.Second {
+		t.Fatalf("expiresAt extended beyond absolute deadline: remaining=%v want <=30s "+
+			"(would let bind_token live ~2 × TokenTTL — bug)", remaining)
+	}
+}
+
+// TestBindService_SaveVerified_RejectsExpiredSession sess 已经过绝对截止,
+// saveVerified 必须返 ErrBindNotFound(不能借 verify 路径无限续命已过期 token)。
+func TestBindService_SaveVerified_RejectsExpiredSession(t *testing.T) {
+	h := newBindHarness(t, func(c *BindConfig) {
+		c.TokenTTL = 60 * time.Second
+	})
+	h.auth.verifyPasswordResp.matched = true
+	h.loc.byUsername["alice"] = "u-alice"
+
+	origNow := nowUnix
+	defer func() { nowUnix = origNow }()
+	// sess 在 2 × TokenTTL 之前签发,绝对早已过期
+	nowUnix = func() int64 { return time.Now().Add(-2 * time.Minute).Unix() }
+	jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	nowUnix = origNow
+
+	err := h.svc.VerifyPassword(context.Background(), jti, "alice", "p")
+	if !errors.Is(err, ErrBindNotFound) {
+		t.Fatalf("expired session must surface ErrBindNotFound (not extendable), got %v", err)
+	}
+}
+
+// TestBindService_Confirm_RejectsWhenCandidateBecomesUnbindable 锁定 round-4
+// Jerry-Xin Critical 修复:verify→confirm 之间账号被 disable/destroy,Confirm
+// 必须再查一次 IsBindable,识别后拒绝(ErrBindAuthRejected),**不**写 identity 行。
+func TestBindService_Confirm_RejectsWhenCandidateBecomesUnbindable(t *testing.T) {
+	h := newBindHarness(t)
+	h.auth.verifyPasswordResp.matched = true
+	h.loc.byUsername["alice"] = "u-alice"
+
+	jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	if err := h.svc.VerifyPassword(context.Background(), jti, "alice", "p"); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	// 模拟管理员在 verify 后 disable 了账号
+	h.auth.isBindableFalse = true
+
+	_, err := h.svc.Confirm(context.Background(), jti)
+	if !errors.Is(err, ErrBindAuthRejected) {
+		t.Fatalf("confirm must reject when uid not bindable, got %v", err)
+	}
+	if h.auth.calls.isBindableUID != "u-alice" {
+		t.Fatalf("IsBindable not called with CandidateUID, got %q", h.auth.calls.isBindableUID)
+	}
+	// 绝不能写 identity 行
+	if len(h.identity.inserted) != 0 {
+		t.Fatalf("identity must NOT be inserted when uid unbindable, inserts=%d", len(h.identity.inserted))
+	}
+	// 也不该签 session
+	if h.users.callCnt != 0 {
+		t.Fatalf("IssueSession must NOT be called when uid unbindable, calls=%d", h.users.callCnt)
+	}
+}
+
+// TestBindService_Confirm_IsBindableInfraError 内部错误不该归 401,
+// metric 必须落 internal_error。
+func TestBindService_Confirm_IsBindableInfraError(t *testing.T) {
+	h := newBindHarness(t)
+	h.auth.verifyPasswordResp.matched = true
+	h.loc.byUsername["alice"] = "u-alice"
+	h.auth.isBindableErr = errors.New("db timeout")
+
+	jti, _ := h.svc.Issue(context.Background(), sampleClaims(), sampleSD())
+	_ = h.svc.VerifyPassword(context.Background(), jti, "alice", "p")
+	_, err := h.svc.Confirm(context.Background(), jti)
+	if err == nil {
+		t.Fatal("infra error must propagate")
+	}
+	if errors.Is(err, ErrBindAuthRejected) {
+		t.Fatalf("infra error must NOT wrap ErrBindAuthRejected (would mask 500 as 401), got %v", err)
 	}
 }
 
