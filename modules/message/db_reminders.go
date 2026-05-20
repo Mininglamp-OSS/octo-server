@@ -2,9 +2,9 @@ package message
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"runtime/debug"
-	"fmt"
 	"sort"
 	"strings"
 
@@ -60,7 +60,10 @@ func (r *remindersDB) deleteWithChannelAndUIDTx(channelID string, channelType ui
 func (r *remindersDB) queryWithUIDAndChannel(uid string, channelID string, channelType uint8, messageSeq uint32) ([]*remindersDetailModel, error) {
 	var list []*remindersDetailModel
 	builder := r.session.Select("reminders.*,IF(reminder_done.id is null and reminders.is_deleted=0,0,1) done").From("reminders").LeftJoin("reminder_done", dbr.Expr("reminders.id=reminder_done.reminder_id and reminder_done.uid=?", uid))
-	_, err := builder.Where("(reminders.uid=?  or  ( reminders.uid='' and reminders.channel_id=? and reminders.channel_type=?))  and reminders.message_seq<=? and reminder_done.id is null", uid, channelID, channelType, messageSeq).Load(&list)
+	// YUJ-1377: same publisher exclusion as sync() — channel-level
+	// (uid='') reminders authored by the viewer themselves must not
+	// be returned. Per-uid rows (uid=?) are unaffected.
+	_, err := builder.Where("(reminders.uid=?  or  ( reminders.uid='' and reminders.channel_id=? and reminders.channel_type=?))  and not (reminders.uid='' and reminders.publisher=?)  and reminders.message_seq<=? and reminder_done.id is null", uid, channelID, channelType, uid, messageSeq).Load(&list)
 	return list, err
 }
 
@@ -71,7 +74,14 @@ func (r *remindersDB) queryWithUIDAndChannel(uid string, channelID string, chann
 @param version 以uid为key的增量版本号
 @param limit 数据限制
 @param channelIDs 频道集合 查询以频道为目标的提醒项
-*
+
+YUJ-1377: the predicate `NOT (uid=” AND publisher=?)` excludes
+channel-level broadcasts authored by the viewer itself, so the
+sender of `@所有人` does not see their own red-dot. The filter must
+live in SQL (not post-filtered in Go) so the LIMIT/version cursor
+keeps advancing past hidden self-broadcasts — otherwise a page
+fully consumed by the viewer's own broadcasts would return [] and
+stall the client's incremental sync.
 */
 func (r *remindersDB) sync(uid string, version int64, limit uint64, channelIDs []string) ([]*remindersDetailModel, error) {
 	var models []*remindersDetailModel
@@ -80,16 +90,16 @@ func (r *remindersDB) sync(uid string, version int64, limit uint64, channelIDs [
 		builder := r.session.Select("reminders.*,IF(reminder_done.id is null and reminders.is_deleted=0,0,1) done").From("reminders").LeftJoin("reminder_done", dbr.Expr("reminders.id=reminder_done.reminder_id and reminder_done.uid=?", uid))
 
 		if len(channelIDs) == 0 {
-			_, err = builder.Where("(reminders.uid=?  or   reminders.uid='')  and reminders.version>? and reminder_done.id is null", uid, version).OrderAsc("version").Limit(limit).Load(&models)
+			_, err = builder.Where("(reminders.uid=?  or   reminders.uid='')  and not (reminders.uid='' and reminders.publisher=?)  and reminders.version>? and reminder_done.id is null", uid, uid, version).OrderAsc("version").Limit(limit).Load(&models)
 		} else {
-			_, err = builder.Where("(reminders.uid=?  or  ( reminders.uid='' and reminders.channel_id in ?))  and reminders.version>? and reminder_done.id is null", uid, channelIDs, version).OrderAsc("version").Limit(limit).Load(&models)
+			_, err = builder.Where("(reminders.uid=?  or  ( reminders.uid='' and reminders.channel_id in ?))  and not (reminders.uid='' and reminders.publisher=?)  and reminders.version>? and reminder_done.id is null", uid, channelIDs, uid, version).OrderAsc("version").Limit(limit).Load(&models)
 		}
 	} else {
 		build := r.session.Select("reminders.*,IF(reminder_done.id is null and reminders.is_deleted=0,0,1) done").From("reminders").LeftJoin("reminder_done", dbr.Expr("reminders.id=reminder_done.reminder_id and reminder_done.uid=?", uid))
 		if len(channelIDs) == 0 {
-			_, err = build.Where("(reminders.uid=?  or  reminders.uid='')  and reminders.version>?", uid, version).OrderAsc("version").Limit(limit).Load(&models)
+			_, err = build.Where("(reminders.uid=?  or  reminders.uid='')  and not (reminders.uid='' and reminders.publisher=?)  and reminders.version>?", uid, uid, version).OrderAsc("version").Limit(limit).Load(&models)
 		} else {
-			_, err = build.Where("(reminders.uid=?  or  ( reminders.uid='' and reminders.channel_id in ?))  and reminders.version>?", uid, channelIDs, version).OrderAsc("version").Limit(limit).Load(&models)
+			_, err = build.Where("(reminders.uid=?  or  ( reminders.uid='' and reminders.channel_id in ?))  and not (reminders.uid='' and reminders.publisher=?)  and reminders.version>?", uid, channelIDs, uid, version).OrderAsc("version").Limit(limit).Load(&models)
 		}
 
 	}

@@ -102,6 +102,19 @@ func (m *Message) reminderSync(c *wkhttp.Context) {
 		return
 	}
 
+	// YUJ-1377 / Mininglamp-OSS/octo-server#101 — drop channel-level
+	// (UID=="") broadcast reminders authored by the viewer itself, so
+	// the sender of `@所有人` does not receive their own red-dot.
+	// Per-uid reminders (apply-join-group, explicit `mention.uids`) are
+	// untouched: they carry UID!="" and pass through verbatim.
+	//
+	// Primary fix is in remindersDB.sync (SQL predicate) — that keeps
+	// the version/limit cursor advancing past hidden self-broadcasts so
+	// the client never stalls. This call is a defense-in-depth filter
+	// for any future read path that forgets the SQL predicate; it is a
+	// no-op when sync() has already done its job.
+	reminders = filterChannelLevelByPublisher(reminders, loginUID)
+
 	groupIds := make([]string, 0)
 	if len(reminders) > 0 {
 		for _, reminder := range reminders {
@@ -244,6 +257,44 @@ func (m *Message) getReminders(messages []*config.MessageResp) []*remindersModel
 		}
 	}
 	return reminders
+}
+
+// filterChannelLevelByPublisher removes channel-level reminders
+// (UID=="") whose Publisher equals the viewer. Used as a
+// defense-in-depth pass after remindersDB.sync, which already enforces
+// the same predicate at the SQL layer for cursor correctness
+// (YUJ-1377 / Mininglamp-OSS/octo-server#101).
+//
+// Per-uid reminders (UID!="") are returned untouched. This preserves
+// other reminder types — notably ReminderTypeApplyJoinGroup, which is
+// always emitted with an explicit UID — so the filter is a no-op for
+// anything except the @-broadcast fan-out.
+//
+// Returns the input slice unchanged when no row matches the filter,
+// avoiding an allocation on the common path.
+func filterChannelLevelByPublisher(reminders []*remindersDetailModel, viewerUID string) []*remindersDetailModel {
+	if len(reminders) == 0 || viewerUID == "" {
+		return reminders
+	}
+	// Fast path: scan first to decide whether we need to allocate.
+	drop := false
+	for _, r := range reminders {
+		if r != nil && r.UID == "" && r.Publisher == viewerUID {
+			drop = true
+			break
+		}
+	}
+	if !drop {
+		return reminders
+	}
+	out := make([]*remindersDetailModel, 0, len(reminders))
+	for _, r := range reminders {
+		if r != nil && r.UID == "" && r.Publisher == viewerUID {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
 func (m *Message) handleReminders(reminders []*remindersModel) {
