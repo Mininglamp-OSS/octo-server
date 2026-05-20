@@ -94,20 +94,65 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 	// invoking OBO.
 	fromUID := robotID
 	if strings.TrimSpace(req.OnBehalfOf) != "" {
-		if err := ba.checkOBO(robotID, req.OnBehalfOf, req.ChannelID, req.ChannelType); err != nil {
-			if errors.Is(err, ErrOBONotAuthorized) {
-				ba.Warn("OBO denied: no active grant or scope",
+		// YUJ-1418 — managed-persona DM grantor-reply bypass.
+		//
+		// When admin (the OBO grantor) DMs the persona-clone bot, the
+		// persona service generates an AI reply and naturally calls
+		// /v1/bot/sendMessage with on_behalf_of=admin (the persona IS
+		// admin). The recipient (channel_id) is also admin — admin's own
+		// DM with the bot. Running the standard OBO scope check on this
+		// shape rejects: no scope row covers a "grantor speaks to
+		// themselves" DM, and creating one would be semantic noise (it
+		// would route admin→admin self-DM, not bot→admin reply). Without
+		// this bypass every persona reply to its own grantor would 400
+		// with `obo not authorized`.
+		//
+		// Detection: DM channel AND on_behalf_of == channel_id AND the
+		// bot has an active grant from this user. When all three hold we
+		// fall through to the legacy (non-OBO) bot send path — fromUID
+		// stays as the bot, no OBO substitution, no `__obo_processed__`
+		// marker, no fan-out machinery — exactly what the grantor would
+		// expect when their persona "talks back" to them. Any other
+		// shape (on_behalf_of != channel_id, channel is not a DM, no
+		// active grant from the recipient) falls through to the strict
+		// checkOBO below — the OBO scope check for third-party sends
+		// MUST remain strict (issue YUJ-1418 explicitly forbids
+		// loosening it).
+		grantorReplyBypass := false
+		if req.ChannelType == common.ChannelTypePerson.Uint8() && req.OnBehalfOf == req.ChannelID {
+			hasGrant, err := ba.botHasActiveGrantFrom(robotID, req.OnBehalfOf)
+			if err != nil {
+				ba.Error("OBO grantor-reply bypass lookup failed",
 					zap.String("bot", robotID),
-					zap.String("on_behalf_of", req.OnBehalfOf),
-					zap.String("channel_id", req.ChannelID),
-					zap.Uint8("channel_type", req.ChannelType))
-				c.ResponseError(ErrOBONotAuthorized)
+					zap.String("grantor", req.OnBehalfOf),
+					zap.Error(err))
+				c.ResponseError(errors.New("OBO 检查失败"))
 				return
 			}
-			c.ResponseError(errors.New("OBO 检查失败"))
-			return
+			grantorReplyBypass = hasGrant
 		}
-		fromUID = req.OnBehalfOf
+
+		if !grantorReplyBypass {
+			if err := ba.checkOBO(robotID, req.OnBehalfOf, req.ChannelID, req.ChannelType); err != nil {
+				if errors.Is(err, ErrOBONotAuthorized) {
+					ba.Warn("OBO denied: no active grant or scope",
+						zap.String("bot", robotID),
+						zap.String("on_behalf_of", req.OnBehalfOf),
+						zap.String("channel_id", req.ChannelID),
+						zap.Uint8("channel_type", req.ChannelType))
+					c.ResponseError(ErrOBONotAuthorized)
+					return
+				}
+				c.ResponseError(errors.New("OBO 检查失败"))
+				return
+			}
+			fromUID = req.OnBehalfOf
+		} else {
+			ba.Info("OBO grantor-reply bypass: bot is replying to its own grantor in DM, sending as bot",
+				zap.String("bot", robotID),
+				zap.String("grantor", req.OnBehalfOf),
+				zap.String("channel_id", req.ChannelID))
+		}
 	}
 
 	// YUJ-644 / Mininglamp-OSS#33: PERSONAL DM 服务端权威 space_id 注入。
