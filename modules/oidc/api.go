@@ -599,9 +599,25 @@ func (o *OIDC) callback(c *wkhttp.Context) {
 		DeviceFlag: sd.DeviceFlag,
 		PublicIP:   sd.IP,
 		// res.IsNew=true 进入 user.externalLoginCreate;TrustedSSOCreate=true
-		// 让 user 模块绕过 register.off 全局开关。OIDC 的"自动建号"由
-		// AllowNewUser + IssuerAllowlist(ShouldHandle 也已校验)闭环控制,
-		// 与公开注册入口语义不同。与 /bind/create 路径对称(见 bind_service.Create)。
+		// 让 user 模块绕过 register.off 全局开关。
+		//
+		// callback 路径的信任锚(与 /bind/create 走 IssuerAllowlist 是**不同**的
+		// trust chain,不要混):
+		//   1. o.client.VerifyIDToken 用 cfg.Provider.Issuer discovery 出来的
+		//      IdP 公钥验签 → claims.Issuer 必然等于 cfg.Provider.Issuer
+		//      (不等则验签直接失败,根本走不到这里),等同于"size=1 的
+		//      隐式 issuer allowlist";
+		//   2. Service.ResolveOrLink 只在 cfg.Provider.AllowNewUser=true
+		//      时才返 IsNew=true,这是运维通过 DM_OIDC_PROVIDER_ALLOW_NEW_USER
+		//      显式开的 bool。
+		// 两条合在一起 = "运维显式信任的单一 Provider.Issuer 自动建号" —— 与
+		// 公开注册入口(email/phone signup / GitHub/Gitee OAuth)的不可控外部
+		// 输入语义不同,bypass register.off 的运维授权是显式的。
+		//
+		// 与 /bind/create 行为对称(都"OIDC 通道下让运维显式控制建号"),但
+		// 信任链的具体机制不同 —— /bind/create 用 IssuerAllowlist 兜底
+		// (多 issuer 配置 + bind_token 显式同意),callback 用单 Provider.Issuer
+		// 签名 + AllowNewUser flag。
 		TrustedSSOCreate: res.IsNew,
 	}
 	sessResp, err := o.service.IssueSession(c.Request.Context(), issueReq)

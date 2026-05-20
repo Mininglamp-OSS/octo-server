@@ -50,7 +50,11 @@ type BindInfoResp struct {
 	Methods        []BindMethod `json:"methods"`
 	SupportContact string       `json:"support_contact,omitempty"`
 	AllowCreate    bool         `json:"allow_create"`
-	CreateBlocked  string       `json:"create_blocked,omitempty"`
+	// CreateBlocked 始终序列化(无 omitempty):/bind/info 协议约定该字段恒在,
+	// 前端按字符串值分支("" / "disabled" / "claims_incomplete" /
+	// "manual_conflict" / "consumed");omitempty 会让 "" 路径整字段消失,
+	// 等价于前端要给"字段缺失"和"字段为空字符串"两种状态都写分支。
+	CreateBlocked string `json:"create_blocked"`
 }
 
 // BindService 自助绑定状态机的业务逻辑层。

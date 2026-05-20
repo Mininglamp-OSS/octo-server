@@ -59,7 +59,7 @@ func syncVerificationSyncedResultLabels() []string {
 // callback "bind_pending"(callback 接管入口)单独走 callbackResultLabels,这里
 // 只列 /bind/* handler。
 func bindEndpointLabels() []string {
-	return []string{"info", "verify_password", "otp_send", "otp_check", "confirm"}
+	return []string{"info", "verify_password", "otp_send", "otp_check", "confirm", "create"}
 }
 
 // bindResultLabels handler 的统一结果维度。与 callbackResultLabels 对应,
@@ -67,13 +67,15 @@ func bindEndpointLabels() []string {
 func bindResultLabels() []string {
 	return []string{
 		"ok",
-		"bad_request",     // 400:入参校验失败
-		"unauthorized",    // 401:密码/OTP 错;状态机不是 verified
-		"not_found",       // 410:token 已过期/未知
-		"rate_limited",    // 429
-		"conflict",        // 409:already_bound
-		"internal_error",  // 500
-		"not_ready",       // 503:Discovery 失败,bind service 未构造
+		"bad_request",          // 400:入参校验失败
+		"unauthorized",         // 401:密码/OTP 错;状态机不是 verified
+		"not_found",            // 410:token 已过期/未知
+		"rate_limited",         // 429
+		"conflict",             // 409:already_bound / status conflict
+		"conflict_need_manual", // 409:manual_conflict 来源 token 拒建号(B. P2-1)
+		"claims_incomplete",    // 422:/bind/create claims 缺 verified email/phone
+		"internal_error",       // 500
+		"not_ready",            // 503:Discovery 失败,bind service 未构造
 	}
 }
 
@@ -98,7 +100,7 @@ func init() {
 	for _, l := range syncVerificationSyncedResultLabels() {
 		metricSyncVerificationSyncedTotal.WithLabelValues(l).Add(0)
 	}
-	// 自助绑定:5 端点 × 7 结果 = 35 个序列,Prometheus 内存可忽略。
+	// 自助绑定:6 端点 × 10 结果 = 60 个序列,Prometheus 内存可忽略。
 	for _, ep := range bindEndpointLabels() {
 		for _, r := range bindResultLabels() {
 			metricBindRequestTotal.WithLabelValues(ep, r).Add(0)
@@ -166,7 +168,7 @@ var (
 	metricBindRequestTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricNamespace,
 		Name:      "bind_request_total",
-		Help:      "OIDC self-service bind handler outcomes by endpoint (info|verify_password|otp_send|otp_check|confirm) and result (ok|bad_request|unauthorized|not_found|rate_limited|conflict|internal_error).",
+		Help:      "OIDC self-service bind handler outcomes by endpoint (info|verify_password|otp_send|otp_check|confirm|create) and result (ok|bad_request|unauthorized|not_found|rate_limited|conflict|conflict_need_manual|claims_incomplete|internal_error|not_ready).",
 	}, []string{"endpoint", "result"})
 
 	metricBindRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
