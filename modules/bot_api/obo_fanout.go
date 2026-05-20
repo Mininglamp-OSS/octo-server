@@ -98,6 +98,36 @@ import (
 //
 // Wired in BotAPI.Route via ba.ctx.AddMessagesListener. Test surface is
 // the lower-level fanoutForMessage method.
+//
+// CONTENT-TYPE CONTRACT (YUJ-1356 / Mininglamp-OSS/octo-server#96 audit,
+// 2026-05-19): this listener is intentionally CONTENT-TYPE-AGNOSTIC. We
+// dispatch a fan-out copy for every inbound message regardless of
+// payload `type`, because the persona-clone bot needs to observe the
+// FULL conversation (text, image, voice, video, file, stickers, etc.)
+// to act as a faithful replica. Any future "skip CMD / system messages"
+// optimization MUST live at the upstream layer (webhook handleMessageNotify
+// already gates Header.SyncOnce/NoPersist for that purpose) and MUST
+// preserve fan-out for all real user content types. The
+// TestFanout_ContentTypeAgnostic + TestFanout_OBOMessagesListen_BatchAllContentTypes
+// pair in obo_fanout_content_type_test.go locks this contract in so a
+// regression that quietly adds a type filter here surfaces at unit-test
+// time instead of slipping into E2E (where it was first reported).
+//
+// If a deployment observes some content types triggering fan-out and
+// others not (e.g. file messages silently dropped while text/image work),
+// the audit checklist is:
+//
+//  1. WuKongIM webhook config (octo-deployment) — confirm the
+//     `event.webhook.on=msg.notify` subscription delivers EVERY content
+//     type. If WuKongIM is filtering at the source, no listener — fan-out
+//     or otherwise — will ever see those payloads.
+//  2. Header.SyncOnce / Header.NoPersist on the inbound — clients
+//     should not set these on real chat content. handleMessageNotify
+//     gates listener notification on both flags (cmd / ephemeral messages
+//     do not reach listeners by design).
+//  3. payload.__obo_processed__ marker — gate 3 in fanoutForMessage
+//     short-circuits on this. Real user messages cannot set the marker
+//     (it's stripped at /v1/message/send and rejected at /v1/bot/sendMessage).
 func (ba *BotAPI) oboMessagesListen(messages []*config.MessageResp) {
 	for _, m := range messages {
 		ba.fanoutForMessage(m)
