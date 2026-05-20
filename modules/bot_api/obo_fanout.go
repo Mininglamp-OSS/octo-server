@@ -84,6 +84,7 @@ package bot_api
 import (
 	"encoding/json"
 	"strings"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -301,6 +302,27 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 				zap.Error(err))
 			continue
 		}
+		// YUJ-1424 / PR#82 Jerry-Xin review blocker (2026-05-20) —
+		// directly enqueue the fan-out copy into the grantee bot's
+		// /v1/bot/events queue. WuKongIM has now accepted the message
+		// (above) and will deliver it to the bot's mailbox, but the
+		// webhook → NotifyMessagesListeners path drops NoPersist=1
+		// messages before listeners fire (modules/webhook/api.go,
+		// handleMessageNotify, by design). Without this enqueue the
+		// grantee bot never observes the fan-out — the bug Jerry-Xin
+		// flagged. The synthetic event mirrors what the listener path
+		// would have produced, so /v1/bot/events serves it
+		// transparently. Best-effort: a Redis failure here logs but
+		// does NOT roll back the dispatch (the message is already in
+		// WuKongIM's store and a later replay path is preferable to a
+		// no-op).
+		copyResp := buildFanoutCopyMessageResp(copyReq, m)
+		if err := ba.enqueueFanoutBotEvent(g.GranteeBotUID, copyResp); err != nil {
+			ba.Error("OBO fan-out bot-event enqueue failed",
+				zap.String("grantee_bot", g.GranteeBotUID),
+				zap.String("channel_id", m.ChannelID),
+				zap.Error(err))
+		}
 		dispatched++
 	}
 	return dispatched
@@ -443,4 +465,62 @@ func hasOBOProcessedMarker(payload []byte) bool {
 // would attempt to spoof a server-only OBO marker (gate-3 bypass).
 func payloadHasReservedOBOKey(payload map[string]interface{}) bool {
 	return obopayload.HasReservedKey(payload)
+}
+
+// buildFanoutCopyMessageResp synthesizes a *config.MessageResp that
+// mirrors what the WuKongIM → webhook → listener path WOULD have
+// produced for the just-dispatched fan-out copy, but doesn't (the
+// webhook drops NoPersist=1 — see fanoutForMessage and the package
+// comment).
+//
+// The fields are kept tight to what /v1/bot/events consumers actually
+// read: ChannelID / ChannelType / FromUID / Payload identify the
+// conversation, Header records the NoPersist+SyncOnce semantics the
+// listener path would have surfaced, and Timestamp lets the bot order
+// events. MessageID / MessageSeq / ClientMsgNo are left zero / empty
+// because we did not round-trip through WuKongIM's SendMessageWithResult
+// (the existing dispatchFanout uses SendMessage, which intentionally
+// discards the response per its docstring — "we don't need the result
+// and the simpler call avoids a wait"). A future change can upgrade
+// dispatchFanout to capture the response and populate these fields if
+// a bot adapter starts requiring them; the current persona-clone
+// adapter reads obo_origin_* from the payload, not the wire IDs.
+//
+// `origin` is the inbound message that triggered the fan-out — used
+// only to propagate the original Timestamp when present, falling back
+// to time.Now() when the inbound carried no timestamp.
+func buildFanoutCopyMessageResp(req *config.MsgSendReq, origin *config.MessageResp) *config.MessageResp {
+	if req == nil {
+		return nil
+	}
+	ts := time.Now().Unix()
+	if origin != nil && origin.Timestamp > 0 {
+		ts = int64(origin.Timestamp)
+	}
+	return &config.MessageResp{
+		Header:      req.Header,
+		FromUID:     req.FromUID,
+		ChannelID:   req.ChannelID,
+		ChannelType: req.ChannelType,
+		Payload:     req.Payload,
+		Timestamp:   int32(ts),
+	}
+}
+
+// enqueueFanoutBotEvent appends the synthetic fan-out event to the
+// grantee bot's /v1/bot/events queue. Honors the oboFanoutBotEnqueue
+// test seam first so unit tests can assert enqueue behavior without
+// standing up Redis; production path goes through
+// ba.robotService.EnqueueBotEvent. A nil robotService (defensive — the
+// constructor wires one, but BotAPI is sometimes assembled piecemeal
+// in older tests) is treated as a silent no-op so the dispatch loop
+// stays robust.
+func (ba *BotAPI) enqueueFanoutBotEvent(robotID string, message *config.MessageResp) error {
+	if ba.oboFanoutBotEnqueue != nil {
+		return ba.oboFanoutBotEnqueue(robotID, message)
+	}
+	if ba.robotService == nil {
+		return nil
+	}
+	return ba.robotService.EnqueueBotEvent(robotID, message)
 }

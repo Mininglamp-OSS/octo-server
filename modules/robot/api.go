@@ -41,17 +41,35 @@ import (
 
 // IService 为其他模块提供的窄接口，避免持有完整 *Robot 以及由此产生的循环依赖。
 // YUJ-60: 允许 bot 创建者撤回自己 bot 发的消息时，由 message 模块注入并调用。
+//
+// YUJ-1424 (PR#82 Jerry-Xin review blocker, 2026-05-20): EnqueueBotEvent
+// exposes the bot event queue write so cross-module callers (specifically
+// the OBO fan-out path in modules/bot_api) can deliver synthetic events
+// without going through WuKongIM → webhook → NotifyMessagesListeners.
+// The webhook drops NoPersist=1 messages before notifying listeners
+// (modules/webhook/api.go handleMessageNotify, by design — see the
+// content-type-contract comment in modules/bot_api/obo_fanout.go), so
+// the OBO fan-out copy (which intentionally sets NoPersist=1 to keep the
+// copy out of chat history) never reaches the bot event queue. Direct
+// enqueue bypasses that filter.
 type IService interface {
 	// GetCreatorUID 带缓存地查询机器人的创建者 UID。
 	// 机器人不存在或无 creator_uid 时返回空字符串及 nil error；
 	// 仅在底层查询异常时才返回 error。
 	GetCreatorUID(robotID string) (string, error)
+	// EnqueueBotEvent appends a synthetic event for `robotID` to the bot
+	// event queue consumed by /v1/bot/events. Mirrors the schema used by
+	// (*Robot).saveRobotMessage so /v1/bot/events serves both organic and
+	// synthetic events transparently. Returns an error only when the
+	// Redis ZADD / GenSeq call fails.
+	EnqueueBotEvent(robotID string, message *config.MessageResp) error
 }
 
 // Service robot 模块对外暴露的只读服务实现，供其它模块注入使用。
 // 与 *Robot 共享底层表结构，但不承担消息/事件监听等副作用，
 // 因此可以被重复 New 出来而不会导致重复注册 listener。
 type Service struct {
+	ctx          *config.Context
 	db           *robotDB
 	creatorCache sync.Map // robotID -> creatorUID
 }
@@ -59,7 +77,8 @@ type Service struct {
 // NewService 构造一个只读 robot 服务，满足 IService 接口。
 func NewService(ctx *config.Context) IService {
 	return &Service{
-		db: newBotDB(ctx),
+		ctx: ctx,
+		db:  newBotDB(ctx),
 	}
 }
 
@@ -93,6 +112,60 @@ func (rb *Robot) GetCreatorUID(robotID string) (string, error) {
 		return "", err
 	}
 	return uid, nil
+}
+
+// EnqueueBotEvent — IService — synthetic-event delivery path. See the
+// IService docstring for the YUJ-1424 / PR#82 R-blocker rationale. The
+// queue schema (key, score, payload shape, expiry) MUST match
+// (*Robot).saveRobotMessage exactly; if that helper's wire format ever
+// changes, update both sites in lockstep so /v1/bot/events serves
+// synthetic and organic events identically.
+func (s *Service) EnqueueBotEvent(robotID string, message *config.MessageResp) error {
+	return enqueueBotEventGeneric(s.ctx, robotID, message)
+}
+
+// EnqueueBotEvent — IService — *Robot variant. Delegates to the same
+// helper used by saveRobotMessage / Service.EnqueueBotEvent so the
+// queue write semantics cannot drift between the listener fast-path and
+// the cross-module synthetic path.
+func (rb *Robot) EnqueueBotEvent(robotID string, message *config.MessageResp) error {
+	return enqueueBotEventGeneric(rb.ctx, robotID, message)
+}
+
+// enqueueBotEventGeneric is the shared write-to-bot-event-queue helper
+// used by saveRobotMessage (listener path) and EnqueueBotEvent (cross-
+// module synthetic path). Centralizing the GenSeq / ZAdd / Expire shape
+// here means the bot event consumer (/v1/bot/events) sees identical
+// records regardless of which path produced them.
+func enqueueBotEventGeneric(ctx *config.Context, robotID string, message *config.MessageResp) error {
+	if ctx == nil {
+		return errors.New("robot: nil ctx, cannot enqueue bot event")
+	}
+	if strings.TrimSpace(robotID) == "" {
+		return errors.New("robot: empty robotID, cannot enqueue bot event")
+	}
+	if message == nil {
+		return errors.New("robot: nil message, cannot enqueue bot event")
+	}
+	seq, err := ctx.GenSeq(fmt.Sprintf("%s%s", common.RobotEventSeqKey, robotID))
+	if err != nil {
+		return err
+	}
+	messageUpdateJson := util.ToJson(&robotEvent{
+		EventID: seq,
+		Message: message,
+		Expire:  time.Now().Add(ctx.GetConfig().Robot.MessageExpire).Unix(),
+	})
+	key := fmt.Sprintf("robotEvent:%s", robotID)
+	if err := ctx.GetRedisConn().ZAdd(key, float64(seq), messageUpdateJson); err != nil {
+		return err
+	}
+	if err := ctx.GetRedisConn().Expire(key, ctx.GetConfig().Robot.MessageExpire); err != nil {
+		// Best-effort TTL refresh — do not fail the enqueue. Mirrors
+		// saveRobotMessage which also only logs on Expire failure.
+		return nil
+	}
+	return nil
 }
 
 type Robot struct {

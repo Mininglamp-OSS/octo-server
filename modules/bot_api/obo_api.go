@@ -7,16 +7,17 @@
 // NOT support cross-user persona management in v0 (RFC §2 / out-of-scope).
 //
 // Status code map (kept narrow on purpose):
-//   200 — success (single object or list)
-//   400 — bad request body / missing required fields
-//   401 — no user token (handled by upstream middleware)
-//   403 — (reserved — production currently uses 404 for cross-user attempts
-//          as a user-enumeration defense; see requireOwnedGrant comment.)
-//   404 — grant_id / scope_id not found; cross-user grant/scope access
-//          (existence-leak defense)
-//   409 — duplicate (grantor+grantee already exists / scope already exists,
-//          with no soft-deleted row to reactivate in place)
-//   500 — DB error
+//
+//	200 — success (single object or list)
+//	400 — bad request body / missing required fields
+//	401 — no user token (handled by upstream middleware)
+//	403 — (reserved — production currently uses 404 for cross-user attempts
+//	       as a user-enumeration defense; see requireOwnedGrant comment.)
+//	404 — grant_id / scope_id not found; cross-user grant/scope access
+//	       (existence-leak defense)
+//	409 — duplicate (grantor+grantee already exists / scope already exists,
+//	       with no soft-deleted row to reactivate in place)
+//	500 — DB error
 package bot_api
 
 import (
@@ -238,6 +239,26 @@ func (ba *BotAPI) oboDeleteGrant(c *wkhttp.Context) {
 
 // oboUpdateGrant — PUT /v1/obo/grants/:id. Toggle global_enabled / change
 // mode. mode validation matches Create (v0 only accepts "auto").
+//
+// YUJ-1424 / PR#82 Jerry-Xin review (2026-05-20, "Also fix" non-blocking):
+// requireOwnedGrant verifies ownership but NOT `active` status, so a
+// caller can flip mode / global_enabled on a grant they previously
+// revoked (active=0). That silently un-tombstones the row's logical
+// state from the caller's perspective (the row still has active=0 and
+// won't be picked up by findActiveGrantByGrantorBot / -ForChannel, but
+// PUTting mode="auto" + global_enabled=1 reads back as "live" via
+// findGrantByID and gives misleading client UX). The fix is to reject
+// the PUT when the row is revoked — callers that want to revive a
+// revoked grant must POST /v1/obo/grants (Create takes the
+// reactivation path; see oboCreateGrant's "soft-revoked → reactivate
+// in place" branch). 404 (not 409) mirrors the existence-leak posture
+// of requireOwnedGrant: a revoked grant is treated as "no longer
+// addressable" by per-grant write endpoints.
+//
+// Scope: oboUpdateGrant only. oboDeleteGrant is intentionally left
+// idempotent on already-revoked rows (re-revoke is a no-op), and
+// oboListScopes / per-grant reads on a revoked grant still surface
+// history so the UI can render audit trails.
 func (ba *BotAPI) oboUpdateGrant(c *wkhttp.Context) {
 	uid := c.GetLoginUID()
 	id, ok := parseIDParam(c, "id")
@@ -246,6 +267,16 @@ func (ba *BotAPI) oboUpdateGrant(c *wkhttp.Context) {
 	}
 	grant, err := ba.requireOwnedGrant(c, uid, id)
 	if err != nil || grant == nil {
+		return
+	}
+	// YUJ-1424 — active gate. See function doc for rationale. Defensive
+	// check on the row we already loaded; no extra DB roundtrip.
+	if grant.Active != 1 {
+		ba.Warn("OBO update rejected: grant is revoked",
+			zap.Int64("grant_id", id),
+			zap.String("grantor", uid),
+			zap.Int("active", grant.Active))
+		c.JSON(http.StatusNotFound, gin404("grant not found"))
 		return
 	}
 	var req oboUpdateGrantReq

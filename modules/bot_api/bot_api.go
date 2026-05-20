@@ -3,14 +3,15 @@ package bot_api
 import (
 	"fmt"
 
-	"github.com/Mininglamp-OSS/octo-server/modules/file"
-	"github.com/Mininglamp-OSS/octo-server/modules/group"
-	"github.com/Mininglamp-OSS/octo-server/modules/thread"
-	"github.com/Mininglamp-OSS/octo-server/modules/user"
-	"github.com/Mininglamp-OSS/octo-server/modules/voice"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/modules/file"
+	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/robot"
+	"github.com/Mininglamp-OSS/octo-server/modules/thread"
+	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/modules/voice"
 )
 
 const (
@@ -32,9 +33,20 @@ type BotAPI struct {
 	groupService  group.IService
 	userDB        *user.DB
 	threadService thread.IService
-	voiceDB       *voice.VoiceDB
-	voiceSvc      *voice.VoiceService
-	voiceCfg      *voice.VoiceConfig
+	// robotService gives the OBO fan-out path a way to enqueue synthetic
+	// events directly into a grantee bot's /v1/bot/events queue. The
+	// webhook layer drops NoPersist=1 messages before NotifyMessagesListeners
+	// (modules/webhook/api.go handleMessageNotify), and the OBO fan-out
+	// copy intentionally sets NoPersist=1 to keep the copy out of chat
+	// history. Without a direct enqueue, the fan-out copy reaches
+	// WuKongIM but never reaches the bot — see YUJ-1424 / PR#82
+	// Jerry-Xin review blocker. fanoutForMessage calls robotService
+	// AFTER dispatchFanout succeeds so we only enqueue events that
+	// WuKongIM actually accepted.
+	robotService robot.IService
+	voiceDB      *voice.VoiceDB
+	voiceSvc     *voice.VoiceService
+	voiceCfg     *voice.VoiceConfig
 	// spaceQuerier overrides ba.db for resolveBotActiveSpaceID (test injection).
 	// nil in production; tests set it to stub the DB call deterministically.
 	spaceQuerier botSpaceQuerier
@@ -53,6 +65,14 @@ type BotAPI struct {
 	// dispatchOverride hook keeps capturing sends in handler tests.
 	// nil in production.
 	oboFanoutDispatch func(*config.MsgSendReq) error
+	// oboFanoutBotEnqueue lets unit tests intercept the bot-event-queue
+	// enqueue that fanoutForMessage performs after a successful dispatch.
+	// Without this seam, fan-out tests would need a live Redis to assert
+	// the synthetic event reaches /v1/bot/events. The production path
+	// goes through ba.robotService.EnqueueBotEvent (see YUJ-1424 / PR#82
+	// Jerry-Xin blocker for why direct enqueue is necessary at all).
+	// nil in production → robotService path runs.
+	oboFanoutBotEnqueue func(robotID string, message *config.MessageResp) error
 	// oboChannelAccessOverride lets unit tests stub the grantor channel-
 	// access check used by oboCreateScope (PR#82 review P0 — channel-wiretap
 	// fix). Production path runs grantorCanReadChannel, which queries
@@ -94,6 +114,7 @@ func NewBotAPI(ctx *config.Context) *BotAPI {
 		groupService:  group.NewService(ctx),
 		userDB:        user.NewDB(ctx),
 		threadService: thread.NewService(ctx),
+		robotService:  robot.NewService(ctx),
 		voiceDB:       voice.NewVoiceDB(ctx),
 		voiceSvc:      voice.NewVoiceService(voiceCfg),
 		voiceCfg:      voiceCfg,
@@ -206,5 +227,3 @@ func (ba *BotAPI) clearTypingThrottle(robotID string, channelID string, channelT
 	ba.ctx.GetRedisConn().Del(typingStartKey)
 	ba.ctx.GetRedisConn().Del(typingCountKey)
 }
-
-
