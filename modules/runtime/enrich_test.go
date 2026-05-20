@@ -17,37 +17,37 @@ func TestBuildRouteInfos(t *testing.T) {
 	}{
 		{
 			name:   "dmwork bot hit + online",
-			route:  "dmwork/27gl5wrM9gA_bot",
+			route:  "octo/27gl5wrM9gA_bot",
 			online: true,
 			want: routeInfo{
-				Raw: "dmwork/27gl5wrM9gA_bot", Channel: "dmwork",
+				Raw: "octo/27gl5wrM9gA_bot", Channel: "octo",
 				UID: "27gl5wrM9gA_bot", Name: "Bot A", IsBot: true, Online: true,
 			},
 		},
 		{
 			name:   "dmwork bot hit + offline",
-			route:  "dmwork/27gl5wrM9gA_bot",
+			route:  "octo/27gl5wrM9gA_bot",
 			online: false,
 			want: routeInfo{
-				Raw: "dmwork/27gl5wrM9gA_bot", Channel: "dmwork",
+				Raw: "octo/27gl5wrM9gA_bot", Channel: "octo",
 				UID: "27gl5wrM9gA_bot", Name: "Bot A", IsBot: true, Online: false,
 			},
 		},
 		{
 			name:   "dmwork uid not in bots → uid only, is_bot false",
-			route:  "dmwork/strangeruid_bot",
+			route:  "octo/strangeruid_bot",
 			online: true,
 			want: routeInfo{
-				Raw: "dmwork/strangeruid_bot", Channel: "dmwork",
+				Raw: "octo/strangeruid_bot", Channel: "octo",
 				UID: "strangeruid_bot", IsBot: false, Online: false,
 			},
 		},
 		{
 			name:   "dmwork with empty uid",
-			route:  "dmwork/",
+			route:  "octo/",
 			online: true,
 			want: routeInfo{
-				Raw: "dmwork/", Channel: "dmwork", UID: "", IsBot: false, Online: false,
+				Raw: "octo/", Channel: "octo", UID: "", IsBot: false, Online: false,
 			},
 		},
 		{
@@ -77,10 +77,10 @@ func TestBuildRouteInfos(t *testing.T) {
 		},
 		{
 			name:   "multi-slash dmwork uid preserved",
-			route:  "dmwork/odd/multi/part",
+			route:  "octo/odd/multi/part",
 			online: true,
 			want: routeInfo{
-				Raw: "dmwork/odd/multi/part", Channel: "dmwork",
+				Raw: "octo/odd/multi/part", Channel: "octo",
 				UID: "odd/multi/part", IsBot: false, Online: false,
 			},
 		},
@@ -97,7 +97,7 @@ func TestBuildRouteInfos(t *testing.T) {
 }
 
 func TestBuildRouteInfos_PreservesOrder(t *testing.T) {
-	routes := []string{"dmwork/a_bot", "wecom/b", "dmwork/c_bot"}
+	routes := []string{"octo/a_bot", "wecom/b", "octo/c_bot"}
 	bots := map[string]botInfo{"a_bot": {UID: "a_bot", Name: "A"}}
 	got := buildRouteInfos(routes, bots, true)
 	if len(got) != 3 {
@@ -117,11 +117,11 @@ func TestBuildRouteInfos_PreservesOrder(t *testing.T) {
 func TestCollectDmworkUIDs(t *testing.T) {
 	seen := map[string]struct{}{}
 	collectDmworkUIDs([]string{
-		"dmwork/a_bot",
+		"octo/a_bot",
 		"wecom/skip_me",
-		"dmwork/b_bot",
-		"dmwork/",       // 空 uid 忽略
-		"dmwork/a_bot",  // 重复，set 去重
+		"octo/b_bot",
+		"octo/",       // 空 uid 忽略
+		"octo/a_bot",  // 重复，set 去重
 		"no_slash",      // 无 / 忽略
 		"/empty_channel",
 	}, seen)
@@ -184,7 +184,7 @@ func TestInjectRouteInfos_ExternalOnly(t *testing.T) {
 func TestInjectRouteInfos_PreservesAgentFields(t *testing.T) {
 	meta := `{"agents":[
 		{"id":"main","name":"Main","bindings":1,"is_default":true,"custom_field":"keep_me",
-		 "routes":["dmwork/x_bot"]}
+		 "routes":["octo/x_bot"]}
 	]}`
 	enriched, ok := injectRouteInfos(meta, map[string]botInfo{"x_bot": {UID: "x_bot", Name: "X"}}, true)
 	if !ok {

@@ -30,12 +30,12 @@ type routeInfo struct {
 // 纯函数，不碰 DB；bots 参数由调用方批量查询得到（仅合法 dmwork bot）。
 //
 // 异常格式处理（除命中 bot 的 dmwork 外一律 is_bot=false）：
-//   - "dmwork/<uid>" + bots[uid] 命中   → is_bot=true, name 填, online=<online 参数>
-//   - "dmwork/<uid>" + bots 未命中      → 仅 uid，不给 name
-//   - "dmwork/" 空 uid                   → uid=""
+//   - "octo/<uid>" + bots[uid] 命中   → is_bot=true, name 填, online=<online 参数>
+//   - "octo/<uid>" + bots 未命中      → 仅 uid，不给 name
+//   - "octo/" 空 uid                   → uid=""
 //   - "wecom/xxx" / "feishu/xxx" 等      → channel + account_id，不查表
 //   - 无 `/` 或空 channel                → channel="", account_id=raw
-//   - 多 slash（如 "dmwork/a/b"）        → uid="a/b" 整段保留
+//   - 多 slash（如 "octo/a/b"）        → uid="a/b" 整段保留
 func buildRouteInfos(routes []string, bots map[string]botInfo, online bool) []routeInfo {
 	out := make([]routeInfo, 0, len(routes))
 	for _, raw := range routes {
@@ -57,7 +57,7 @@ func parseRouteInfo(raw string, bots map[string]botInfo, online bool) routeInfo 
 	info.Channel = raw[:slashIdx]
 	accountID := raw[slashIdx+1:]
 
-	if info.Channel == "dmwork" {
+	if info.Channel == "octo" {
 		info.UID = accountID // 空 uid 也保留为 ""
 		if accountID != "" {
 			if b, ok := bots[accountID]; ok {
@@ -74,7 +74,7 @@ func parseRouteInfo(raw string, bots map[string]botInfo, online bool) routeInfo 
 	return info
 }
 
-// collectDmworkUIDs 从一组 routes 中收集 channel=="dmwork" 的非空 uid。
+// collectDmworkUIDs 从一组 routes 中收集 channel=="octo" 的非空 uid。
 // 用于 enrich 阶段的第一遍扫描，后续送进 queryBotInfoByUIDs 做批量查询。
 func collectDmworkUIDs(routes []string, seen map[string]struct{}) {
 	for _, raw := range routes {
@@ -82,7 +82,7 @@ func collectDmworkUIDs(routes []string, seen map[string]struct{}) {
 		if slashIdx <= 0 {
 			continue
 		}
-		if raw[:slashIdx] != "dmwork" {
+		if raw[:slashIdx] != "octo" {
 			continue
 		}
 		uid := raw[slashIdx+1:]

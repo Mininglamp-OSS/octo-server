@@ -89,7 +89,7 @@ type pingInitReq struct {
 type upgradeInitReq struct {
 	DaemonID  string `json:"daemon_id"`
 	SpaceID   string `json:"space_id"`
-	Component string `json:"component"`            // 默认 "octo-daemon"；插件填 "openclaw-channel-dmwork"
+	Component string `json:"component"`            // 默认 "octo-daemon"；插件填 "octo"
 	RuntimeID int64  `json:"runtime_id,omitempty"` // 插件分支必填：对应 openclaw runtime 的 id
 }
 

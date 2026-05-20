@@ -14,7 +14,7 @@ import (
 
 const (
 	componentDaemon = "octo-daemon"
-	componentPlugin = "openclaw-channel-dmwork"
+	componentPlugin = "octo"
 
 	daemonUpgradeTimeoutSec = 120  // 2 分钟
 	pluginUpgradeTimeoutSec = 600  // 10 分钟（npm install + 依赖 + gateway restart）
@@ -257,7 +257,7 @@ func (rt *Runtime) createDaemonUpgradeTask(c *wkhttp.Context, loginUID string, r
 	})
 }
 
-// openclaw-channel-dmwork 插件升级
+// octo 插件升级
 func (rt *Runtime) createPluginUpgradeTask(c *wkhttp.Context, loginUID string, req *upgradeInitReq, daemon *agentRuntimeModel) {
 	if req.RuntimeID == 0 {
 		c.ResponseError(errors.New("runtime_id is required for plugin upgrade"))

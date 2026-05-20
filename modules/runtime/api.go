@@ -362,13 +362,13 @@ func (rt *Runtime) list(c *wkhttp.Context) {
 			}
 
 			if r.Provider == "openclaw" && r.Metadata != "" {
-				if pluginLatest, ok := latestVersions["openclaw-channel-dmwork"]; ok && pluginLatest != "" {
+				if pluginLatest, ok := latestVersions["octo"]; ok && pluginLatest != "" {
 					var meta map[string]interface{}
 					if json.Unmarshal([]byte(r.Metadata), &meta) == nil {
 						plugins, _ := meta["plugins"].([]interface{})
 						for _, p := range plugins {
 							pm, _ := p.(map[string]interface{})
-							if pm["name"] == "openclaw-channel-dmwork" {
+							if pm["name"] == "octo" {
 								pv, _ := pm["version"].(string)
 								if pv != "" && isVersionOlder(pv, pluginLatest) {
 									hint["plugin_has_update"] = true
