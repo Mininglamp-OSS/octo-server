@@ -163,7 +163,7 @@ jobs:
         # the database default; using general_ci keeps them aligned with
         # the rest of the schema and avoids "Illegal mix of collations".
         run: |
-          for i in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             if mysqladmin ping -h 127.0.0.1 -uroot -pdemo --silent; then
               echo "mysql ready"
               exit 0
