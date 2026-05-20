@@ -13,6 +13,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
 	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
 )
@@ -122,6 +123,17 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 	if req.ChannelType == common.ChannelTypePerson.Uint8() {
 		payload = ba.enrichBotPayloadWithSpaceID(c, robotID, payload)
 	}
+
+	// YUJ-202 / Mininglamp-OSS#94 — mention three-state rewrite. Same
+	// chokepoint contract as modules/message/api.go: legacy
+	// `mention.all=1` is normalized to also carry `mention.humans=1`
+	// (outbound double-write keeps `all=1` for old read-side clients).
+	// ⚠️ F2 (PR#70 Jerry-Xin correctness-critical review): this MUST
+	// be placed OUTSIDE the `ChannelTypePerson` conditional above —
+	// otherwise group / community-topic `@所有人` traffic (the main
+	// pain-point being fixed) would bypass the rewrite. Helper is
+	// idempotent and safe on nil — see pkg/mentionrewrite.
+	payload = mentionrewrite.RewriteMention(payload)
 
 	// YUJ-1166 fan-out loop guard #3: mark this message so the fan-out
 	// listener (see obo_fanout.go) skips it on the way back through the

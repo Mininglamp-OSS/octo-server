@@ -29,6 +29,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
 	pkgutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis"
@@ -349,6 +350,17 @@ func (rb *Robot) sendMessage(c *wkhttp.Context) {
 	if messageReq.ChannelType == common.ChannelTypePerson.Uint8() {
 		payload = rb.enrichBotPayloadWithSpaceID(robotID, payload)
 	}
+
+	// YUJ-202 / Mininglamp-OSS#94 — mention three-state rewrite. Same
+	// chokepoint contract as the user and bot API ingresses: legacy
+	// `mention.all=1` is normalized to also carry `mention.humans=1`,
+	// with `all=1` preserved on the outbound payload for old read-side
+	// clients (double-write). ⚠️ F2 (PR#70 Jerry-Xin correctness-
+	// critical review): MUST stay OUTSIDE the `ChannelTypePerson`
+	// conditional above so group / community-topic `@所有人` traffic
+	// (the main pain-point) actually goes through the chokepoint.
+	// Helper is idempotent and safe on nil — see pkg/mentionrewrite.
+	payload = mentionrewrite.RewriteMention(payload)
 
 	result, err := rb.ctx.SendMessageWithResult(&config.MsgSendReq{
 		StreamNo:    messageReq.StreamNo,

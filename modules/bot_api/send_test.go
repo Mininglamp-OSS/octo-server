@@ -59,9 +59,9 @@ func TestSendMessage_PersonalDM_StripsForgedClientSpaceID(t *testing.T) {
 
 	const (
 		botRobotID    = "bot_X"
-		creatorUID    = "user_creator"      // == channel_id, exercises creator-bypass branch
-		authoritative = "space_A"           // returned by stubbed querySpaceIDByRobotID
-		forged        = "space_B_attacker"  // attacker-supplied value in payload
+		creatorUID    = "user_creator"     // == channel_id, exercises creator-bypass branch
+		authoritative = "space_A"          // returned by stubbed querySpaceIDByRobotID
+		forged        = "space_B_attacker" // attacker-supplied value in payload
 	)
 
 	dc := &dispatchCapture{}
@@ -299,4 +299,166 @@ func TestSendMessage_PersonalDM_DBError_ForgedClientSpaceID_Stripped(t *testing.
 	_, hasSpaceID := dispatchedPayload["space_id"]
 	assert.False(t, hasSpaceID,
 		"DB error + forged client space_id MUST be stripped from dispatched payload — attackers cannot use transient DB failure to bypass authoritative override")
+}
+
+// TestSendMessage_MentionAllRewritten_HandlerIntegration is the YUJ-1343 /
+// Mininglamp-OSS/octo-server#94 acceptance test for the mention three-state
+// rewrite on the /v1/bot/sendMessage handler path.
+//
+// This is the "handler-level integration test" the issue calls out: drive
+// BotAPI.sendMessage end-to-end with a `payload.mention.all=1` body and
+// assert the captured MsgSendReq carries `mention.humans=1` (chokepoint
+// rewrite ran) AND still carries `mention.all=1` (outbound double-write
+// preserved for legacy read-side clients). Lesson from PR#82 OBO fan-out:
+// when an external-service shape constraint matters, the test MUST go
+// through the real handler stack — not call the helper in isolation —
+// otherwise a wiring regression (e.g. someone deletes the call site by
+// mistake) slips past unit coverage.
+//
+// Uses the existing creator-DM path (BotKindUser whose CreatorUID ==
+// channel_id) so the test does not need a live IsFriend / group_member
+// table. The rewrite call site itself is placed OUTSIDE the
+// `ChannelTypePerson` conditional (F2 — see modules/bot_api/send.go), so
+// even though this test drives a DM, the helper still runs; the same
+// helper would run on the group / community-topic path by inspection.
+func TestSendMessage_MentionAllRewritten_HandlerIntegration(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const (
+		botRobotID = "bot_mention_rewrite_it"
+		creatorUID = "user_creator_mention_it"
+	)
+
+	dc := &dispatchCapture{}
+	q := &fakeSpaceQuerier{defaultSpace: "space_A"}
+
+	ba := &BotAPI{
+		Log:              log.NewTLog("BotAPI-mention-it"),
+		spaceQuerier:     q,
+		dispatchOverride: dc.hook,
+	}
+
+	body, _ := json.Marshal(BotSendMessageReq{
+		ChannelID:   creatorUID,
+		ChannelType: common.ChannelTypePerson.Uint8(),
+		Payload: map[string]interface{}{
+			"type":    1,
+			"content": "@所有人 ping",
+			// Legacy @所有人 inbound — chokepoint MUST rewrite this.
+			"mention": map[string]interface{}{
+				"all": 1,
+			},
+		},
+	})
+
+	httpReq := httptest.NewRequest(http.MethodPost, "/v1/bot/sendMessage", bytes.NewReader(body))
+	httpReq.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	gc, _ := gin.CreateTestContext(rec)
+	gc.Request = httpReq
+	c := &wkhttp.Context{Context: gc}
+	c.Set(CtxKeyRobotID, botRobotID)
+	c.Set(CtxKeyBotKind, BotKindUser)
+	c.Set(CtxKeyRobot, &robotModel{RobotID: botRobotID, CreatorUID: creatorUID})
+
+	ba.sendMessage(c)
+
+	assert.Equalf(t, http.StatusOK, rec.Code,
+		"sendMessage should respond 200 OK, got %d body=%s", rec.Code, rec.Body.String())
+
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	if !assert.NotNil(t, dc.captured, "dispatch hook must have been invoked") {
+		return
+	}
+
+	var dispatchedPayload map[string]interface{}
+	dec := json.NewDecoder(bytes.NewReader(dc.captured.Payload))
+	dec.UseNumber()
+	if !assert.NoError(t, dec.Decode(&dispatchedPayload)) {
+		return
+	}
+	mention, ok := dispatchedPayload["mention"].(map[string]interface{})
+	if !assert.True(t, ok, "dispatched payload must keep mention map; got %T", dispatchedPayload["mention"]) {
+		return
+	}
+	// Chokepoint rewrite ran — humans=1 is now present.
+	humans, _ := mention["humans"].(json.Number)
+	assert.Equal(t, "1", humans.String(),
+		"BotAPI.sendMessage must invoke mentionrewrite.RewriteMention so mention.humans=1 reaches the dispatcher")
+	// Outbound double-write — legacy all=1 still present so old read-side
+	// clients keep rendering the @所有人 pill until they roll out support
+	// for the humans/ais fields.
+	all, _ := mention["all"].(json.Number)
+	assert.Equal(t, "1", all.String(),
+		"legacy mention.all=1 MUST be preserved on the dispatched payload (outbound double-write)")
+	// ais MUST stay absent — Yu D1: legacy @所有人 must NOT auto-fan-out
+	// to bots (the exact pain point the rewrite is closing).
+	_, hasAIs := mention["ais"]
+	assert.False(t, hasAIs,
+		"BotAPI.sendMessage rewrite must NOT auto-set mention.ais — would re-trigger the bot fan-out pain point")
+}
+
+// TestSendMessage_MentionAisPassthrough_HandlerIntegration verifies the
+// other end of the matrix: an explicit `mention.ais=1` from a new client
+// passes through the chokepoint untouched (the rewrite is a one-way
+// "all → also humans" rule, never adds humans/ais from thin air).
+func TestSendMessage_MentionAisPassthrough_HandlerIntegration(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const (
+		botRobotID = "bot_ais_it"
+		creatorUID = "user_creator_ais_it"
+	)
+
+	dc := &dispatchCapture{}
+	q := &fakeSpaceQuerier{defaultSpace: "space_A"}
+
+	ba := &BotAPI{
+		Log:              log.NewTLog("BotAPI-ais-it"),
+		spaceQuerier:     q,
+		dispatchOverride: dc.hook,
+	}
+
+	body, _ := json.Marshal(BotSendMessageReq{
+		ChannelID:   creatorUID,
+		ChannelType: common.ChannelTypePerson.Uint8(),
+		Payload: map[string]interface{}{
+			"type":    1,
+			"content": "@所有 AI ping",
+			"mention": map[string]interface{}{
+				"ais": 1,
+			},
+		},
+	})
+
+	httpReq := httptest.NewRequest(http.MethodPost, "/v1/bot/sendMessage", bytes.NewReader(body))
+	httpReq.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	gc, _ := gin.CreateTestContext(rec)
+	gc.Request = httpReq
+	c := &wkhttp.Context{Context: gc}
+	c.Set(CtxKeyRobotID, botRobotID)
+	c.Set(CtxKeyBotKind, BotKindUser)
+	c.Set(CtxKeyRobot, &robotModel{RobotID: botRobotID, CreatorUID: creatorUID})
+
+	ba.sendMessage(c)
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	if !assert.NotNil(t, dc.captured) {
+		return
+	}
+	var dispatchedPayload map[string]interface{}
+	dec := json.NewDecoder(bytes.NewReader(dc.captured.Payload))
+	dec.UseNumber()
+	assert.NoError(t, dec.Decode(&dispatchedPayload))
+	mention := dispatchedPayload["mention"].(map[string]interface{})
+	ais, _ := mention["ais"].(json.Number)
+	assert.Equal(t, "1", ais.String(), "ais=1 must passthrough")
+	_, hasHumans := mention["humans"]
+	assert.False(t, hasHumans, "ais-only input must NOT gain humans=1")
+	_, hasAll := mention["all"]
+	assert.False(t, hasAll, "ais-only input must NOT gain legacy all=1")
 }
