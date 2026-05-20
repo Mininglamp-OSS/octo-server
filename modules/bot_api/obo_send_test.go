@@ -276,6 +276,94 @@ func TestSendMessage_OBO_GrantorReplyBypass_DM(t *testing.T) {
 	}
 }
 
+// TestSendMessage_OBO_GrantorReplyBypass_DM_GlobalDisabled — YUJ-1428
+// regression guard.
+//
+// Scenario: same as TestSendMessage_OBO_GrantorReplyBypass_DM but the
+// user has toggled the persona's global_enabled switch OFF. The grant
+// row is still active (active=1, global_enabled=0); only fan-out to
+// third parties is paused.
+//
+// Pre-fix the bypass consulted findActiveGrantByGrantorBot, which
+// requires `global_enabled=1`, so it incorrectly returned "no grant",
+// fell through to the strict OBO scope check, and replied with
+// "obo not authorized" — breaking direct grantor→bot DM conversation
+// every time a user paused the persona.
+//
+// Expected post-fix behaviour: bypass still fires (200 OK, FromUID =
+// bot, no OBO markers), exactly like the global_enabled=1 case. The
+// global switch governs whether the persona INTERCEPTS third-party
+// messages for fan-out, not whether the bot can talk to its own
+// grantor.
+//
+// Crucially this test does NOT change checkOBO's strict path — that
+// path is still required to enforce global_enabled=1 (see
+// TestSendMessage_OBO_GrantorReplyBypass_DoesNotApplyToThirdPartySend
+// for the matching guard on the strict path's contract).
+func TestSendMessage_OBO_GrantorReplyBypass_DM_GlobalDisabled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const (
+		botID   = "bot_clone_001"
+		grantor = "user_admin"
+		authSp  = "space_A"
+	)
+
+	// Seed an active grant from admin → james WITHOUT enabling
+	// global_enabled. insertGrant defaults global_enabled=0 (matches
+	// production schema), so omitting the updateGrant(enable=1) call
+	// reproduces the YUJ-1428 condition exactly.
+	s := newFakeOBOStore()
+	_, _ = s.insertGrant(grantor, botID, "auto")
+
+	dc := &dispatchCapture{}
+	ba := &BotAPI{
+		Log:              log.NewTLog("BotAPI-obo-grantor-reply-global-off"),
+		spaceQuerier:     &fakeSpaceQuerier{defaultSpace: authSp},
+		dispatchOverride: dc.hook,
+		oboStoreOverride: s,
+	}
+
+	body, _ := json.Marshal(BotSendMessageReq{
+		ChannelID:   grantor,
+		ChannelType: common.ChannelTypePerson.Uint8(),
+		OnBehalfOf:  grantor,
+		Payload:     map[string]interface{}{"content": "hi back even with global off", "type": 1},
+	})
+	httpReq := httptest.NewRequest(http.MethodPost, "/v1/bot/sendMessage", bytes.NewReader(body))
+	httpReq.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	gc, _ := gin.CreateTestContext(rec)
+	gc.Request = httpReq
+	c := &wkhttp.Context{Context: gc}
+	c.Set(CtxKeyRobotID, botID)
+	c.Set(CtxKeyBotKind, BotKindUser)
+	c.Set(CtxKeyRobot, &robotModel{RobotID: botID, CreatorUID: grantor})
+
+	ba.sendMessage(c)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on grantor-reply bypass with global_enabled=0, got status=%d body=%s",
+			rec.Code, rec.Body.String())
+	}
+	if dc.captured == nil {
+		t.Fatal("dispatch was not called — bypass must reach the send path even when global switch is off")
+	}
+	if dc.captured.FromUID != botID {
+		t.Errorf("FromUID should remain the bot under the bypass (no OBO substitution), got %q want %q",
+			dc.captured.FromUID, botID)
+	}
+	var got map[string]interface{}
+	if err := json.Unmarshal(dc.captured.Payload, &got); err != nil {
+		t.Fatalf("payload decode: %v", err)
+	}
+	if _, has := got[oboProcessedMarkerKey]; has {
+		t.Errorf("bypass must NOT inject %s marker: payload=%v", oboProcessedMarkerKey, got)
+	}
+	if _, has := got["actual_sender_uid"]; has {
+		t.Errorf("bypass must NOT inject actual_sender_uid: payload=%v", got)
+	}
+}
+
 // TestSendMessage_OBO_GrantorReplyBypass_RequiresActiveGrant — guard that
 // the bypass refuses to fire when the named grantor has NEVER granted
 // this bot. Without this guard a bot could forge OBO context for an

@@ -127,6 +127,30 @@ func (f *fakeOBOStore) findActiveGrantByGrantorBot(grantorUID, granteeBotUID str
 	return nil, nil
 }
 
+// findGrantByGrantorBotActiveOnly — YUJ-1428. Mirrors
+// findActiveGrantByGrantorBot but skips the GlobalEnabled gate so the
+// grantor-reply bypass keeps working when the user has toggled the
+// persona's global switch off. Shares the failFindActiveGrant injection
+// hook because the underlying DB error class is identical (any test that
+// wants this method to fail would also want the strict variant to fail
+// the same way) and tests that need to differentiate the two return
+// values can do so via the GlobalEnabled flag on the seeded grant.
+func (f *fakeOBOStore) findGrantByGrantorBotActiveOnly(grantorUID, granteeBotUID string) (*oboGrantModel, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failFindActiveGrant != nil {
+		return nil, f.failFindActiveGrant
+	}
+	f.ensureInit()
+	for _, g := range f.grants {
+		if g.GrantorUID == grantorUID && g.GranteeBotUID == granteeBotUID && g.Active == 1 {
+			cp := *g
+			return &cp, nil
+		}
+	}
+	return nil, nil
+}
+
 func (f *fakeOBOStore) scopeEnabled(grantID int64, channelID string, channelType uint8) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

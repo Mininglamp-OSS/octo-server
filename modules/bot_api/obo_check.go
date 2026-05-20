@@ -121,12 +121,28 @@ func (ba *BotAPI) oboStoreOrDefault() oboStore {
 }
 
 // botHasActiveGrantFrom reports whether bot `botUID` is currently authorised
-// as a grantee by `grantorUID` — i.e. there is an active+global_enabled row
-// in obo_grants for (grantor=grantorUID, grantee=botUID). It is a thin
-// boolean wrapper over the same `findActiveGrantByGrantorBot` store call
-// that checkOBO consults for its first layer, so it inherits the negative
-// cache fast path and the same "no row OR globally disabled → false"
-// contract.
+// as a grantee by `grantorUID` — i.e. there is an active row in obo_grants
+// for (grantor=grantorUID, grantee=botUID), regardless of the
+// `global_enabled` master switch.
+//
+// YUJ-1428: this helper deliberately uses
+// `findGrantByGrantorBotActiveOnly` rather than the strict
+// `findActiveGrantByGrantorBot` that checkOBO consults. The two checks
+// answer different questions:
+//
+//   - checkOBO (third-party send path) — "may this bot fan out a message
+//     while impersonating grantor X to peer Y?". Must respect
+//     global_enabled because that switch is the user-facing kill for
+//     persona fan-out and silently demoting it on the hot path re-opens
+//     the bug the switch exists to solve.
+//   - botHasActiveGrantFrom (grantor-reply bypass) — "is this bot
+//     legitimately authorised to talk to its OWN grantor in DM?". The
+//     relationship is established by the grant existing and not being
+//     revoked; whether the grantor has temporarily silenced fan-out is
+//     orthogonal. Pre-YUJ-1428 this consulted the global_enabled-aware
+//     query and broke the bypass whenever a user flipped the persona
+//     off — the bot could no longer reply to the grantor in DM even
+//     though the grant was still active.
 //
 // Used by sendMessage to power the YUJ-1418 grantor-reply bypass: when a
 // persona-clone bot is asked to reply (on behalf of the grantor) to the
@@ -150,7 +166,7 @@ func (ba *BotAPI) botHasActiveGrantFrom(botUID, grantorUID string) (bool, error)
 		return false, nil
 	}
 	store := ba.oboStoreOrDefault()
-	grant, err := store.findActiveGrantByGrantorBot(grantorUID, botUID)
+	grant, err := store.findGrantByGrantorBotActiveOnly(grantorUID, botUID)
 	if err != nil {
 		return false, err
 	}

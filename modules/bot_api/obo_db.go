@@ -102,6 +102,30 @@ type oboScopeModel struct {
 //     enabled=1. Empty slice (not nil) on no match keeps callers branch-free.
 type oboStore interface {
 	findActiveGrantByGrantorBot(grantorUID, granteeBotUID string) (*oboGrantModel, error)
+	// findGrantByGrantorBotActiveOnly — YUJ-1428. Same shape as
+	// findActiveGrantByGrantorBot but ONLY filters on active=1 (the
+	// `global_enabled` master switch is intentionally not consulted).
+	//
+	// Why a separate method instead of a parameter: the existing
+	// findActiveGrantByGrantorBot is the auth gate for third-party OBO
+	// sends (checkOBO) and MUST keep requiring global_enabled=1 — the
+	// global switch is the user-facing "stop letting this persona fan
+	// out my messages" kill switch and silently demoting it on the hot
+	// path would re-open exactly the class of bug the switch exists to
+	// solve. The grantor-reply bypass is a different concern: a bot
+	// must always be able to reply to its OWN grantor in DM as long
+	// as the grant is not revoked (active=1), independent of the
+	// global fan-out switch. Splitting the methods keeps both call
+	// sites locked to the right contract at compile time.
+	//
+	// Also intentionally does NOT consult the `obo:grantor:{uid}`
+	// negative cache: that cache is populated based on
+	// (active=1 AND global_enabled=1) and would falsely return
+	// "no grant" for a grantor who has an active grant with the
+	// global switch off. The bypass call is on the DM reply path,
+	// not the system-wide fan-out path, so the per-call MySQL probe
+	// is acceptable.
+	findGrantByGrantorBotActiveOnly(grantorUID, granteeBotUID string) (*oboGrantModel, error)
 	scopeEnabled(grantID int64, channelID string, channelType uint8) (bool, error)
 	findActiveGrantsForChannel(channelID string, channelType uint8) ([]*oboGrantModel, error)
 
@@ -201,6 +225,31 @@ func (d *botAPIDB) findActiveGrantByGrantorBot(grantorUID, granteeBotUID string)
 		// COUNT — same index as the row lookup above. Avoids a stale "0"
 		// suppressing other valid grant-bot pairs of the same grantor.
 		d.maybeCacheGrantorNegative(grantorUID)
+	}
+	return m, nil
+}
+
+// findGrantByGrantorBotActiveOnly — see oboStore. YUJ-1428.
+//
+// Bypasses the `obo:grantor:{uid}` negative cache because that cache
+// answers "any active AND global_enabled grant exists for grantor",
+// which would falsely return "no grant" for a grantor whose grant is
+// active but has the global switch toggled off — exactly the case the
+// grantor-reply bypass is designed to handle. The MySQL probe runs on
+// the same `(grantor_uid, grantee_bot_uid)` covering index used by
+// findActiveGrantByGrantorBot, so the per-call cost is comparable to
+// the cache-miss path of the strict variant.
+func (d *botAPIDB) findGrantByGrantorBotActiveOnly(grantorUID, granteeBotUID string) (*oboGrantModel, error) {
+	if grantorUID == "" || granteeBotUID == "" {
+		return nil, nil
+	}
+	var m *oboGrantModel
+	_, err := d.session.Select("*").From("obo_grants").
+		Where("grantor_uid=? AND grantee_bot_uid=? AND active=1",
+			grantorUID, granteeBotUID).
+		Load(&m)
+	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
+		return nil, err
 	}
 	return m, nil
 }
