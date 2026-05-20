@@ -77,12 +77,51 @@ type ServiceMinio struct {
 
 // NewServiceMinio NewServiceMinio
 func NewServiceMinio(ctx *config.Context) *ServiceMinio {
-	return &ServiceMinio{
+	sm := &ServiceMinio{
 		Log: log.NewTLog("File"),
 		ctx: ctx,
 		downloadClient: &http.Client{
 			Timeout: time.Second * 30,
 		},
+	}
+	// Self-heal MinIO bucket policy on every process start (#77). Without
+	// this proactive sweep, a pre-provisioned bucket whose policy was never
+	// applied (e.g. `minio-init` excluded `group` from its anonymous-read
+	// loop) only gets repaired the next time someone happens to upload to
+	// it — read-only buckets (group avatars exist but no fresh writes
+	// happen) stay broken across restarts. The sweep is async + best
+	// effort: ensureBucket failures are logged but don't block startup,
+	// and the upload path retries via the same ensureBucket on demand.
+	// Skipped under cfg.Test=true to keep unit/integration tests
+	// deterministic — they exercise ensureBucket explicitly via the upload
+	// entry points.
+	if !ctx.GetConfig().Test {
+		go sm.bootstrapAllowedBuckets()
+	}
+	return sm
+}
+
+// bootstrapAllowedBuckets runs `ensureBucket` against every bucket in the
+// allow-list once at process start. Errors are logged at WARN — the upload
+// path will retry on demand via the same ensureBucket call, so a transient
+// MinIO outage during boot does not require a restart to recover. A 30s
+// total budget keeps the goroutine from leaking if MinIO is unreachable
+// indefinitely (10 buckets × ~3s per BucketExists is generous; later
+// buckets short-circuit on the per-process memo if earlier ones succeed
+// after a slow start).
+func (sm *ServiceMinio) bootstrapAllowedBuckets() {
+	client, err := sm.newClient()
+	if err != nil {
+		sm.Warn("MinIO startup bootstrap: 创建 client 失败，跳过预扫", zap.Error(err))
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for bucket := range allowedMinioBuckets {
+		if err := sm.ensureBucket(ctx, client, bucket); err != nil {
+			sm.Warn("MinIO startup bootstrap: bucket 初始化失败，下次上传时会重试",
+				zap.String("bucket", bucket), zap.Error(err))
+		}
 	}
 }
 

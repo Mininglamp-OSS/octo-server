@@ -19,8 +19,8 @@ import (
 // newFakeMinioServer returns an httptest.Server that answers just enough of
 // the MinIO HTTP surface to let `ensureBucket` succeed:
 //
-//   - HEAD /<bucket>/  → 200 (BucketExists returns true, skipping MakeBucket
-//     and SetBucketPolicy entirely)
+//   - HEAD /<bucket>/  → 200 (BucketExists returns true; ensureBucket then
+//     reapplies SetBucketPolicy unconditionally per the #77 self-heal fix)
 //   - everything else  → 200 with empty body, so the test never panics on an
 //     unexpected request shape
 //
@@ -398,4 +398,86 @@ func TestEnsureBucket_SelfHealsPolicyOnExistingBucket(t *testing.T) {
 		"MakeBucket must not run when the bucket already exists; ran %d times", makeCount.Load())
 	assert.GreaterOrEqual(t, policyCount.Load(), int32(1),
 		"SetBucketPolicy must run on every ensureBucket call to self-heal pre-provisioned buckets; ran %d times", policyCount.Load())
+}
+
+// TestNewServiceMinio_BootstrapsAllAllowedBucketsAtStartup is the proof that
+// `NewServiceMinio` actually performs the policy repair *at process start*,
+// not just on the first upload (PR#87 review feedback from Jerry-Xin).
+//
+// The earlier #77 fix made ensureBucket reapply the policy whenever it ran,
+// but ensureBucket only runs from UploadFile / PresignedPutURL. A bucket
+// that is read-only after seed (e.g. `group` avatars uploaded once at group
+// creation and never written to again) would never see a repair across
+// restarts. This test pins the new behaviour: NewServiceMinio kicks off an
+// async bootstrap goroutine that walks the full `allowedMinioBuckets` set
+// and runs ensureBucket against each one.
+//
+// Setup: fake MinIO answers HEAD with 200 (every bucket pre-exists) and
+// records every PUT. After constructing the service we poll until policy
+// count reaches the expected total (= 10 = len(allowedMinioBuckets), kept
+// as a literal because the var is unexported; helpers.go is the source of
+// truth — bump this number if the allow-list changes). MakeBucket must
+// stay at zero because BucketExists returned true for all of them.
+//
+// cfg.Test must be false so the bootstrap goroutine actually runs; the
+// other integration tests in this file set cfg.Test=true precisely to
+// suppress this side effect and keep their counters deterministic.
+func TestNewServiceMinio_BootstrapsAllAllowedBucketsAtStartup(t *testing.T) {
+	var (
+		headCount   atomic.Int32
+		makeCount   atomic.Int32
+		policyCount atomic.Int32
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			headCount.Add(1)
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPut:
+			if _, ok := r.URL.Query()["policy"]; ok {
+				policyCount.Add(1)
+			} else {
+				makeCount.Add(1)
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	cfg := config.New()
+	// cfg.Test left as the zero value (false) so NewServiceMinio runs the
+	// bootstrap goroutine. The other tests in this file pin it true.
+	cfg.Minio.URL = srv.URL
+	cfg.Minio.UploadURL = srv.URL
+	cfg.Minio.DownloadURL = "https://public.example.com"
+	cfg.Minio.AccessKeyID = "test-access-key"
+	cfg.Minio.SecretAccessKey = "test-secret-access-key-1234567890"
+
+	ctx := testutil.NewTestContext(cfg)
+	// testutil.NewTestContext force-sets cfg.Test=true, which by design
+	// short-circuits the bootstrap goroutine. Flip it back so this test
+	// can observe the production code path.
+	ctx.GetConfig().Test = false
+	_ = file.NewServiceMinio(ctx)
+
+	// Bump this if `allowedMinioBuckets` in helpers.go grows or shrinks.
+	const wantBuckets int32 = 10
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if policyCount.Load() >= wantBuckets {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	assert.Equal(t, wantBuckets, policyCount.Load(),
+		"startup bootstrap must run SetBucketPolicy once per allowed bucket; got %d, want %d", policyCount.Load(), wantBuckets)
+	assert.Equal(t, int32(0), makeCount.Load(),
+		"startup bootstrap must not call MakeBucket when buckets already exist; got %d", makeCount.Load())
+	assert.GreaterOrEqual(t, headCount.Load(), wantBuckets,
+		"startup bootstrap must HEAD each bucket; got %d, want >= %d", headCount.Load(), wantBuckets)
 }
