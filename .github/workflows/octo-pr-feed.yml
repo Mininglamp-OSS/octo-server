@@ -9,7 +9,7 @@ permissions: {}
 jobs:
   notify:
     if: ${{ !github.event.pull_request.draft }}
-    uses: Mininglamp-OSS/.github/.github/workflows/octo-pr-feed.yml@db17008c4190b88ebd6589948efe62a02ec4d085
+    uses: Mininglamp-OSS/.github/.github/workflows/octo-pr-feed.yml@main
     with:
       repo_name: ${{ github.event.repository.name }}
       pr_number: ${{ github.event.pull_request.number }}
