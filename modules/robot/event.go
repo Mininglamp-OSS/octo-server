@@ -169,6 +169,39 @@ func (rb *Robot) robotMessageListen(messages []*config.MessageResp) {
 						}
 					}
 				}
+				// YUJ-1393 / PR#82 review #2 R2 (Jerry-Xin 2026-05-19
+				// follow-up): mention.ais=1 means "@所有 AI" (Plan X /
+				// YUJ-1389). The robot event dispatcher previously only
+				// considered robot_id / mention.uids / @username text,
+				// so a payload carrying only mention.ais=1 (no uids,
+				// no @username) silently skipped the robot event queue
+				// and group bots never received the "@所有 AI" broadcast
+				// — including the very common legacy `mention.all=1`
+				// case, which the send-side rewrite chokepoints
+				// (pkg/mentionrewrite/rewrite.go) normalize to also
+				// carry `mention.ais=1`.
+				//
+				// Scope: GROUP channels only. PERSONAL DMs are already
+				// dispatched via the realUID branch above and have no
+				// notion of "all members of a channel".
+				// COMMUNITY_TOPIC support is a deliberate follow-up —
+				// it needs the parent-group lookup (see
+				// modules/webhook/api.go parseThreadChannelID) and was
+				// intentionally left out of this hotfix to keep the
+				// change surface small.
+				//
+				// Dedup against any uid-matched robots already in
+				// robotIDs so the goroutine fan-out below never
+				// double-saves the same event for the same bot.
+				if rb.mentionAisTruthy(mentionValue.Get("ais")) &&
+					message.ChannelType == common.ChannelTypeGroup.Uint8() {
+					groupRobotIDs, err := rb.collectGroupRobotIDs(message.ChannelID)
+					if err != nil {
+						rb.Error("查询群机器人成员失败！", zap.Error(err), zap.String("channelID", message.ChannelID))
+					} else {
+						robotIDs = appendUniqueRobotIDs(robotIDs, groupRobotIDs)
+					}
+				}
 			} else {
 				if common.ContentType(payloadValue.Get("type").Int()) == common.Text {
 					content := payloadValue.Get("content").String()

@@ -318,6 +318,20 @@ func (rb *Robot) sendMessage(c *wkhttp.Context) {
 		return
 	}
 
+	// YUJ-1393 / PR#82 review #2 R1 (Jerry-Xin 2026-05-19 follow-up):
+	// strip any reserved `__obo_*` top-level key from the robot-supplied
+	// payload BEFORE validation / dispatch. The legacy robot endpoint
+	// was previously the only one of the three ingress points (user /
+	// bot / robot) that let `__obo_processed__: true` through unmodified,
+	// which a misbehaving / malicious robot script could exploit to
+	// suppress its own persona-clone fan-out copy (fan-out gate 3 in
+	// modules/bot_api/obo_fanout.go drops any payload carrying the
+	// marker). See modules/robot/sanitize_robot_ingress.go for the full
+	// rationale, the test surface, and why this ingress follows the
+	// silent-strip precedent set by the user API rather than the loud
+	// 4xx-reject precedent set by the bot API.
+	sanitizeRobotIngressPayload(messageReq.Payload, messageReq.ChannelID, messageReq.ChannelType, robotID, rb.Warn)
+
 	payloadResult := maputil.Data(messageReq.Payload)
 	contentTypeValue := payloadResult.Int("type")
 	if contentTypeValue == 0 {
@@ -353,13 +367,16 @@ func (rb *Robot) sendMessage(c *wkhttp.Context) {
 
 	// YUJ-202 / Mininglamp-OSS#94 — mention three-state rewrite. Same
 	// chokepoint contract as the user and bot API ingresses: legacy
-	// `mention.all=1` is normalized to also carry `mention.humans=1`,
-	// with `all=1` preserved on the outbound payload for old read-side
-	// clients (double-write). ⚠️ F2 (PR#70 Jerry-Xin correctness-
-	// critical review): MUST stay OUTSIDE the `ChannelTypePerson`
-	// conditional above so group / community-topic `@所有人` traffic
-	// (the main pain-point) actually goes through the chokepoint.
-	// Helper is idempotent and safe on nil — see pkg/mentionrewrite.
+	// `mention.all=1` is normalized (Plan X / YUJ-1389) to also carry
+	// `mention.ais=1`, with `all=1` preserved on the outbound payload
+	// for old read-side clients (double-write). `mention.humans=1` is
+	// NEVER inferred from legacy `all=1` — humans is the explicit human-
+	// notification signal and must be set by the client. ⚠️ F2 (PR#70
+	// Jerry-Xin correctness-critical review): MUST stay OUTSIDE the
+	// `ChannelTypePerson` conditional above so group / community-topic
+	// `@所有人` traffic (the main pain-point) actually goes through the
+	// chokepoint. Helper is idempotent and safe on nil —
+	// see pkg/mentionrewrite.
 	payload = mentionrewrite.RewriteMention(payload)
 
 	result, err := rb.ctx.SendMessageWithResult(&config.MsgSendReq{
