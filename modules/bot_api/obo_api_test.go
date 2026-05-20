@@ -551,3 +551,112 @@ func TestOBO_DeleteScope_FindScopeOwner_LookupErr(t *testing.T) {
 		t.Fatalf("expected error body, got empty response")
 	}
 }
+
+// ==================== YUJ-1358 grantee_bot_name regression ====================
+
+// TestOBO_ListGrants_PopulatesGranteeBotName — GET /v1/obo/grants must
+// return a non-empty `grantee_bot_name` on every row so the web
+// PersonaCard does NOT fall back to rendering the raw bot uid
+// (`27qFHDRBCJQ2c868c93_bot`). The prod query enriches via
+// LEFT JOIN `user` u ON u.uid = g.grantee_bot_uid; the fake mirrors that
+// via seedBotName. Verifies both the JOIN-success and the COALESCE
+// fallback (bot with no user row → uid surfaces, never empty string).
+// Refs YUJ-1358 / octo-web#60.
+func TestOBO_ListGrants_PopulatesGranteeBotName(t *testing.T) {
+	s := newFakeOBOStore()
+	// Two grants for the same grantor:
+	//   1. bot with a known display name (JOIN-success path)
+	//   2. bot with no name seeded → fallback to uid (COALESCE path)
+	s.seedBot(tRESTBot, tRESTOwner)
+	s.seedBotName(tRESTBot, "james")
+	_, _ = s.insertGrant(tRESTOwner, tRESTBot, "auto")
+
+	const unnamedBot = "bot_no_user_row"
+	s.seedBot(unnamedBot, tRESTOwner)
+	_, _ = s.insertGrant(tRESTOwner, unnamedBot, "auto")
+
+	ba := newBAforREST(s)
+	c, rec := makeCtx(t, tRESTOwner, http.MethodGet, "/v1/obo/grants", nil, nil)
+	ba.oboListGrants(c)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Decode the envelope used by the handler: c.Response wraps the payload
+	// inside the standard {status, data} shape. We unmarshal loosely.
+	var env struct {
+		Data struct {
+			Items []map[string]interface{} `json:"items"`
+		} `json:"data"`
+		Items []map[string]interface{} `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode list body: %v body=%s", err, rec.Body.String())
+	}
+	items := env.Data.Items
+	if len(items) == 0 {
+		items = env.Items
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items, got %d body=%s", len(items), rec.Body.String())
+	}
+
+	byUID := map[string]map[string]interface{}{}
+	for _, it := range items {
+		uid, _ := it["grantee_bot_uid"].(string)
+		byUID[uid] = it
+	}
+	if got, _ := byUID[tRESTBot]["grantee_bot_name"].(string); got != "james" {
+		t.Errorf("grant %s grantee_bot_name = %q, want %q", tRESTBot, got, "james")
+	}
+	if got, _ := byUID[unnamedBot]["grantee_bot_name"].(string); got != unnamedBot {
+		t.Errorf("grant %s grantee_bot_name = %q, want %q (COALESCE fallback)",
+			unnamedBot, got, unnamedBot)
+	}
+	// Hard contract: every row's grantee_bot_name MUST be non-empty so the
+	// frontend never falls back to the uid render path that motivated this
+	// fix in the first place.
+	for _, it := range items {
+		name, _ := it["grantee_bot_name"].(string)
+		if name == "" {
+			t.Errorf("grantee_bot_name must never be empty; row=%+v", it)
+		}
+	}
+}
+
+// TestOBO_StoreListGrantsByGrantor_GranteeBotNameContract — the same
+// invariant at the store layer (no HTTP). Pins down the fake's contract
+// so future contributors who add another caller of listGrantsByGrantor
+// can rely on a non-empty GranteeBotName without re-reading the SQL.
+func TestOBO_StoreListGrantsByGrantor_GranteeBotNameContract(t *testing.T) {
+	s := newFakeOBOStore()
+	s.seedBot(tRESTBot, tRESTOwner)
+	s.seedBotName(tRESTBot, "james")
+	_, _ = s.insertGrant(tRESTOwner, tRESTBot, "auto")
+
+	rows, err := s.listGrantsByGrantor(tRESTOwner)
+	if err != nil {
+		t.Fatalf("listGrantsByGrantor err=%v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("want 1 row, got %d", len(rows))
+	}
+	if rows[0].GranteeBotName != "james" {
+		t.Errorf("GranteeBotName = %q, want %q", rows[0].GranteeBotName, "james")
+	}
+
+	// Fallback: bot without a seeded display name → uid surfaces.
+	const unnamedBot = "bot_no_display"
+	s.seedBot(unnamedBot, tRESTOwner)
+	_, _ = s.insertGrant(tRESTOwner, unnamedBot, "auto")
+	rows, _ = s.listGrantsByGrantor(tRESTOwner)
+	for _, r := range rows {
+		if r.GranteeBotName == "" {
+			t.Errorf("GranteeBotName must never be empty (uid=%s)", r.GranteeBotUID)
+		}
+		if r.GranteeBotUID == unnamedBot && r.GranteeBotName != unnamedBot {
+			t.Errorf("fallback name for %s = %q, want %q (COALESCE)",
+				unnamedBot, r.GranteeBotName, unnamedBot)
+		}
+	}
+}

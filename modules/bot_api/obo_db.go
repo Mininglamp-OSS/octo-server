@@ -47,16 +47,30 @@ import (
 
 // oboGrantModel mirrors the obo_grants row. JSON tags are reused by HTTP
 // handlers, which return rows verbatim (v0 has no nuanced DTOs).
+//
+// GranteeBotName is NOT a column on obo_grants — it is populated by
+// listGrantsByGrantor via a LEFT JOIN against the `user` table (the bot's
+// display name lives on user.name, joined on user.uid = grantee_bot_uid).
+// Other reads that do `SELECT * FROM obo_grants` leave it empty; only the
+// listing endpoint pays the JOIN, since that is the only path the web UI
+// reads (PersonaCard renders `grantee_bot_name || grantee_bot_uid`, so a
+// missing name fell back to the raw uid — YUJ-1358 / octo-web#60).
 type oboGrantModel struct {
-	ID            int64      `db:"id" json:"id"`
-	GrantorUID    string     `db:"grantor_uid" json:"grantor_uid"`
-	GranteeBotUID string     `db:"grantee_bot_uid" json:"grantee_bot_uid"`
-	Mode          string     `db:"mode" json:"mode"`
-	GlobalEnabled int        `db:"global_enabled" json:"global_enabled"`
-	Active        int        `db:"active" json:"active"`
-	CreatedAt     time.Time  `db:"created_at" json:"created_at"`
-	UpdatedAt     time.Time  `db:"updated_at" json:"updated_at"`
-	RevokedAt     *time.Time `db:"revoked_at" json:"revoked_at,omitempty"`
+	ID            int64  `db:"id" json:"id"`
+	GrantorUID    string `db:"grantor_uid" json:"grantor_uid"`
+	GranteeBotUID string `db:"grantee_bot_uid" json:"grantee_bot_uid"`
+	// GranteeBotName is the bot's human-facing display name (user.name on
+	// the row whose uid == grantee_bot_uid). Empty string when the bot
+	// has no user row OR when the field was loaded by a query that did
+	// not include the JOIN. listGrantsByGrantor guarantees a non-empty
+	// value via COALESCE(u.name, g.grantee_bot_uid).
+	GranteeBotName string     `db:"grantee_bot_name" json:"grantee_bot_name"`
+	Mode           string     `db:"mode" json:"mode"`
+	GlobalEnabled  int        `db:"global_enabled" json:"global_enabled"`
+	Active         int        `db:"active" json:"active"`
+	CreatedAt      time.Time  `db:"created_at" json:"created_at"`
+	UpdatedAt      time.Time  `db:"updated_at" json:"updated_at"`
+	RevokedAt      *time.Time `db:"revoked_at" json:"revoked_at,omitempty"`
 }
 
 // oboScopeModel mirrors obo_scopes.
@@ -269,12 +283,33 @@ func (d *botAPIDB) insertGrant(grantorUID, granteeBotUID, mode string) (int64, e
 
 // listGrantsByGrantor returns ALL rows (active + revoked) so the UI can
 // surface history. Callers that only want active rows must filter.
+//
+// LEFT JOIN `user` enriches each row with the grantee bot's display name
+// (user.name on the row whose uid == grantee_bot_uid). The bot's display
+// name lives on the `user` table, NOT the `robot` table (the robot table
+// has no name column — see modules/robot/sql/20210926000001_robot_legacy01
+// and the precedent in modules/user/api.go ~L3612: every other place that
+// needs a bot's name does the same JOIN). COALESCE falls back to the raw
+// uid when the user row is missing, so callers always get a non-empty
+// `grantee_bot_name` — eliminating the PersonaCard fallback that
+// surfaced `<uid>_bot` literals to humans (YUJ-1358 / octo-web#60).
+//
+// LEFT JOIN (not INNER) preserves grants whose bot user row has been
+// deleted (e.g. cleanup script ran ahead of the grant revoke). Those
+// rows still need to render in the UI so the operator can revoke them.
 func (d *botAPIDB) listGrantsByGrantor(grantorUID string) ([]*oboGrantModel, error) {
 	var grants []*oboGrantModel
-	_, err := d.session.Select("*").From("obo_grants").
-		Where("grantor_uid=?", grantorUID).
-		OrderBy("created_at DESC").
-		Load(&grants)
+	_, err := d.session.SelectBySql(
+		"SELECT g.id, g.grantor_uid, g.grantee_bot_uid, "+
+			"COALESCE(u.name, g.grantee_bot_uid) AS grantee_bot_name, "+
+			"g.mode, g.global_enabled, g.active, "+
+			"g.created_at, g.updated_at, g.revoked_at "+
+			"FROM obo_grants g "+
+			"LEFT JOIN `user` u ON u.uid = g.grantee_bot_uid "+
+			"WHERE g.grantor_uid=? "+
+			"ORDER BY g.created_at DESC",
+		grantorUID,
+	).Load(&grants)
 	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
 		return nil, err
 	}
