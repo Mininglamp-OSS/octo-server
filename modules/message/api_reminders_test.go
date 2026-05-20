@@ -349,8 +349,8 @@ func TestFilterChannelLevelByPublisher(t *testing.T) {
 
 	t.Run("drops channel-level reminder authored by viewer", func(t *testing.T) {
 		input := []*remindersDetailModel{
-			mk("", "u_sender", int(ReminderTypeMentionMe)),     // sender's own broadcast → drop
-			mk("", "u_other", int(ReminderTypeMentionMe)),      // someone else's broadcast → keep
+			mk("", "u_sender", int(ReminderTypeMentionMe)),        // sender's own broadcast → drop
+			mk("", "u_other", int(ReminderTypeMentionMe)),         // someone else's broadcast → keep
 			mk("u_sender", "u_other", int(ReminderTypeMentionMe)), // @u_sender from u_other → keep
 			mk("u_sender", "u_other", int(ReminderTypeApplyJoinGroup)),
 		}

@@ -2,9 +2,9 @@ package message
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"runtime/debug"
-	"fmt"
 	"sort"
 	"strings"
 
@@ -75,7 +75,7 @@ func (r *remindersDB) queryWithUIDAndChannel(uid string, channelID string, chann
 @param limit 数据限制
 @param channelIDs 频道集合 查询以频道为目标的提醒项
 
-YUJ-1377: the predicate `NOT (uid='' AND publisher=?)` excludes
+YUJ-1377: the predicate `NOT (uid=” AND publisher=?)` excludes
 channel-level broadcasts authored by the viewer itself, so the
 sender of `@所有人` does not see their own red-dot. The filter must
 live in SQL (not post-filtered in Go) so the LIMIT/version cursor
