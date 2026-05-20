@@ -119,3 +119,40 @@ func (ba *BotAPI) oboStoreOrDefault() oboStore {
 	}
 	return ba.db
 }
+
+// botHasActiveGrantFrom reports whether bot `botUID` is currently authorised
+// as a grantee by `grantorUID` — i.e. there is an active+global_enabled row
+// in obo_grants for (grantor=grantorUID, grantee=botUID). It is a thin
+// boolean wrapper over the same `findActiveGrantByGrantorBot` store call
+// that checkOBO consults for its first layer, so it inherits the negative
+// cache fast path and the same "no row OR globally disabled → false"
+// contract.
+//
+// Used by sendMessage to power the YUJ-1418 grantor-reply bypass: when a
+// persona-clone bot is asked to reply (on behalf of the grantor) to the
+// grantor themselves in DM, the OBO scope check would otherwise reject
+// (no scope row covers a grantor-to-self DM, and creating one would be
+// semantic noise). The bypass treats the dispatch as a normal bot reply
+// — fromUID stays as the bot, no OBO substitution, no OBO markers — and
+// this helper is the auth gate that distinguishes "bot has a legitimate
+// relationship with the recipient" from "bot is forging a relationship".
+//
+// Empty bot or grantor → (false, nil); DB errors are surfaced verbatim so
+// the caller can 500 rather than silently widening access.
+func (ba *BotAPI) botHasActiveGrantFrom(botUID, grantorUID string) (bool, error) {
+	if botUID == "" || grantorUID == "" {
+		return false, nil
+	}
+	if botUID == grantorUID {
+		// Defensive: a bot cannot grant OBO to itself (the REST create-grant
+		// handler rejects this and checkOBO short-circuits too). Treat as
+		// no grant so the bypass cannot fire on a malformed pair.
+		return false, nil
+	}
+	store := ba.oboStoreOrDefault()
+	grant, err := store.findActiveGrantByGrantorBot(grantorUID, botUID)
+	if err != nil {
+		return false, err
+	}
+	return grant != nil, nil
+}

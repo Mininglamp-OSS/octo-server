@@ -177,6 +177,224 @@ func TestSendMessage_OBO_Unauthorized_Returns400Body(t *testing.T) {
 	}
 }
 
+// TestSendMessage_OBO_GrantorReplyBypass_DM — YUJ-1418 regression guard.
+//
+// Scenario: the persona-clone bot james holds an active OBO grant from
+// admin. Admin DMs james; the persona service generates an AI reply and
+// calls /v1/bot/sendMessage with on_behalf_of=admin AND channel_id=admin
+// (the reply target IS the grantor). Before YUJ-1418 this returned
+// `{"msg":"obo not authorized","status":400}` because the OBO scope check
+// requires an explicit (grant_id, channel=admin, channel_type=Person)
+// scope row — and no such row exists (and would not make sense; it would
+// route admin→admin self-DM, not bot→admin reply).
+//
+// Expected post-fix behaviour:
+//   - 200 OK (dispatch fires).
+//   - FromUID stays as the bot (NO OBO substitution to grantor). The bot
+//     is replying as itself, not impersonating admin to admin.
+//   - Payload carries NO `__obo_processed__` marker and NO
+//     `actual_sender_uid` field — those are server-only markers for the
+//     fan-out gate, and the bypass intentionally falls through to the
+//     legacy non-OBO send path.
+//
+// Bypass precondition (all three must hold for the bypass to fire):
+//   - channel_type == Person (DM)
+//   - on_behalf_of == channel_id (recipient IS the named grantor)
+//   - bot has an active grant from that user
+//
+// The third precondition is what differentiates this test from
+// TestSendMessage_OBO_Unauthorized_Returns400Body — that test runs the
+// same shape against an EMPTY OBO store, so the bypass cannot fire and
+// the legacy 400-on-missing-scope behaviour is preserved (regression
+// guard for the third-party send path which MUST remain strict).
+func TestSendMessage_OBO_GrantorReplyBypass_DM(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const (
+		botID   = "bot_clone_001"
+		grantor = "user_admin"
+		authSp  = "space_A"
+	)
+
+	// Seed an active+enabled grant from admin → james. No scope row at
+	// all — the bypass MUST work without one (the whole point is that
+	// requiring a scope here is wrong).
+	s := newFakeOBOStore()
+	gid, _ := s.insertGrant(grantor, botID, "auto")
+	enable := 1
+	_ = s.updateGrant(gid, "", &enable)
+
+	dc := &dispatchCapture{}
+	ba := &BotAPI{
+		Log:              log.NewTLog("BotAPI-obo-grantor-reply"),
+		spaceQuerier:     &fakeSpaceQuerier{defaultSpace: authSp},
+		dispatchOverride: dc.hook,
+		oboStoreOverride: s,
+	}
+
+	body, _ := json.Marshal(BotSendMessageReq{
+		ChannelID:   grantor, // DM to the grantor themselves
+		ChannelType: common.ChannelTypePerson.Uint8(),
+		OnBehalfOf:  grantor, // persona naively pledges OBO-as-grantor
+		Payload:     map[string]interface{}{"content": "hi back", "type": 1},
+	})
+	httpReq := httptest.NewRequest(http.MethodPost, "/v1/bot/sendMessage", bytes.NewReader(body))
+	httpReq.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	gc, _ := gin.CreateTestContext(rec)
+	gc.Request = httpReq
+	c := &wkhttp.Context{Context: gc}
+	c.Set(CtxKeyRobotID, botID)
+	c.Set(CtxKeyBotKind, BotKindUser)
+	// Use the creator-bypass branch so checkSendPermission doesn't depend
+	// on a userService stub. In production, the persona clone is created
+	// by its grantor, so robot.CreatorUID == grantor is the realistic
+	// shape (mirrors TestSendMessage_OBO_Unauthorized_Returns400Body).
+	c.Set(CtxKeyRobot, &robotModel{RobotID: botID, CreatorUID: grantor})
+
+	ba.sendMessage(c)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on grantor-reply bypass, got status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if dc.captured == nil {
+		t.Fatal("dispatch was not called — bypass must reach the send path")
+	}
+	if dc.captured.FromUID != botID {
+		t.Errorf("FromUID should remain the bot under the bypass (no OBO substitution), got %q want %q",
+			dc.captured.FromUID, botID)
+	}
+	var got map[string]interface{}
+	if err := json.Unmarshal(dc.captured.Payload, &got); err != nil {
+		t.Fatalf("payload decode: %v", err)
+	}
+	if _, has := got[oboProcessedMarkerKey]; has {
+		t.Errorf("bypass must NOT inject %s marker (this is a legacy bot reply, not an OBO send): payload=%v",
+			oboProcessedMarkerKey, got)
+	}
+	if _, has := got["actual_sender_uid"]; has {
+		t.Errorf("bypass must NOT inject actual_sender_uid (no impersonation happened): payload=%v", got)
+	}
+}
+
+// TestSendMessage_OBO_GrantorReplyBypass_RequiresActiveGrant — guard that
+// the bypass refuses to fire when the named grantor has NEVER granted
+// this bot. Without this guard a bot could forge OBO context for an
+// arbitrary user, hit the DM-to-self shape, and bypass the scope check —
+// effectively granting itself a free hop. The bypass MUST consult the
+// (grantor, bot) grant row, not just the channel shape.
+func TestSendMessage_OBO_GrantorReplyBypass_RequiresActiveGrant(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const (
+		botID    = "bot_clone_001"
+		stranger = "user_stranger" // no grant from this user
+		authSp   = "space_A"
+	)
+
+	// Empty OBO store — no grant from `stranger` to `bot`.
+	s := newFakeOBOStore()
+	dc := &dispatchCapture{}
+	ba := &BotAPI{
+		Log:              log.NewTLog("BotAPI-obo-grantor-reply-noauth"),
+		spaceQuerier:     &fakeSpaceQuerier{defaultSpace: authSp},
+		dispatchOverride: dc.hook,
+		oboStoreOverride: s,
+	}
+
+	body, _ := json.Marshal(BotSendMessageReq{
+		ChannelID:   stranger,
+		ChannelType: common.ChannelTypePerson.Uint8(),
+		OnBehalfOf:  stranger, // shape matches bypass, but no grant
+		Payload:     map[string]interface{}{"content": "forged", "type": 1},
+	})
+	httpReq := httptest.NewRequest(http.MethodPost, "/v1/bot/sendMessage", bytes.NewReader(body))
+	httpReq.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	gc, _ := gin.CreateTestContext(rec)
+	gc.Request = httpReq
+	c := &wkhttp.Context{Context: gc}
+	c.Set(CtxKeyRobotID, botID)
+	c.Set(CtxKeyBotKind, BotKindUser)
+	// Creator==stranger so checkSendPermission passes via creator-bypass;
+	// the failure under test is the OBO check, not the friend gate.
+	c.Set(CtxKeyRobot, &robotModel{RobotID: botID, CreatorUID: stranger})
+
+	ba.sendMessage(c)
+	if !strings.Contains(rec.Body.String(), ErrOBONotAuthorized.Error()) {
+		t.Fatalf("bypass must refuse to fire without a real grant; expected obo-not-authorized, got %s", rec.Body.String())
+	}
+	if dc.captured != nil {
+		t.Fatalf("dispatch must NOT fire when the bypass refuses; got %+v", dc.captured)
+	}
+}
+
+// TestSendMessage_OBO_GrantorReplyBypass_DoesNotApplyToThirdPartySend —
+// the bypass MUST NOT fire when channel_id != on_behalf_of, even if the
+// recipient happens to be a grantor for this bot. That shape is "send
+// from grantor X to peer Y", which is the canonical third-party OBO
+// send and requires the strict scope check. Issue YUJ-1418 explicitly
+// forbids loosening the third-party path: "Do NOT change the OBO scope
+// check for third-party sends (that must remain strict)".
+func TestSendMessage_OBO_GrantorReplyBypass_DoesNotApplyToThirdPartySend(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const (
+		botID   = "bot_clone_001"
+		grantor = "user_admin"
+		peer    = "user_bob"
+		authSp  = "space_A"
+	)
+
+	// Grant exists from admin, but the send is to bob (peer) ON BEHALF
+	// OF admin. There is NO scope row for (admin's grant, channel=bob).
+	// This is the standard "no scope → deny" path and the bypass must
+	// not rescue it just because admin (the on_behalf_of value) is also
+	// a grantor of the bot.
+	s := newFakeOBOStore()
+	gid, _ := s.insertGrant(grantor, botID, "auto")
+	enable := 1
+	_ = s.updateGrant(gid, "", &enable)
+
+	dc := &dispatchCapture{}
+	ba := &BotAPI{
+		Log:              log.NewTLog("BotAPI-obo-third-party"),
+		spaceQuerier:     &fakeSpaceQuerier{defaultSpace: authSp},
+		dispatchOverride: dc.hook,
+		oboStoreOverride: s,
+	}
+
+	body, _ := json.Marshal(BotSendMessageReq{
+		ChannelID:   peer, // sending to bob, NOT to the grantor
+		ChannelType: common.ChannelTypePerson.Uint8(),
+		OnBehalfOf:  grantor, // as admin
+		Payload:     map[string]interface{}{"content": "hi bob", "type": 1},
+	})
+	httpReq := httptest.NewRequest(http.MethodPost, "/v1/bot/sendMessage", bytes.NewReader(body))
+	httpReq.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	gc, _ := gin.CreateTestContext(rec)
+	gc.Request = httpReq
+	c := &wkhttp.Context{Context: gc}
+	c.Set(CtxKeyRobotID, botID)
+	c.Set(CtxKeyBotKind, BotKindUser)
+	// Creator==peer so checkSendPermission passes via creator-bypass; the
+	// failure under test is the OBO scope check, not the friend gate.
+	c.Set(CtxKeyRobot, &robotModel{RobotID: botID, CreatorUID: peer})
+	// Suppress reference-membership re-check — happy path for grantor
+	// channel access, so the failure is unambiguously the scope row miss.
+	ba.oboChannelAccessOverride = func(uid, channelID string, channelType uint8) (bool, error) {
+		return true, nil
+	}
+
+	ba.sendMessage(c)
+	if !strings.Contains(rec.Body.String(), ErrOBONotAuthorized.Error()) {
+		t.Fatalf("third-party OBO send without scope row must still be rejected; got %s", rec.Body.String())
+	}
+	if dc.captured != nil {
+		t.Fatalf("dispatch must NOT fire on third-party send without scope; got %+v", dc.captured)
+	}
+}
+
 // TestSendMessage_NoOBO_LegacyPath — sanity guard that adding the OBO
 // branch did not change behavior when OnBehalfOf is empty: FromUID still
 // = robotID and the obo_processed marker is NOT injected. This is the
