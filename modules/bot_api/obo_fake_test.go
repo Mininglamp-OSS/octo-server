@@ -32,6 +32,11 @@ type fakeOBOStore struct {
 	// (user.robot=0). queryRobotOwner returns IsBot=false for these. Used
 	// to test the "grantee_bot_uid is a real user, not a bot" rejection.
 	nonBotUsers map[string]bool
+	// botNames maps botUID → display name (user.name). listGrantsByGrantor
+	// reads this map to populate GranteeBotName, mirroring the prod LEFT
+	// JOIN against the `user` table (YUJ-1358). When a name is absent the
+	// fake falls back to the bot uid (same as prod's COALESCE).
+	botNames map[string]string
 
 	// Test-side error injection hooks. Defaults to nil → no error.
 	failFindActiveGrant   error
@@ -52,6 +57,7 @@ func newFakeOBOStore() *fakeOBOStore {
 		scopes:      map[int64]*oboScopeModel{},
 		robotOwners: map[string]string{},
 		nonBotUsers: map[string]bool{},
+		botNames:    map[string]string{},
 	}
 }
 
@@ -68,6 +74,9 @@ func (f *fakeOBOStore) ensureInit() {
 	if f.nonBotUsers == nil {
 		f.nonBotUsers = map[string]bool{}
 	}
+	if f.botNames == nil {
+		f.botNames = map[string]string{}
+	}
 }
 
 // seedBot registers `botUID` as a bot owned by `creatorUID`. Helper for
@@ -77,6 +86,18 @@ func (f *fakeOBOStore) seedBot(botUID, creatorUID string) {
 	defer f.mu.Unlock()
 	f.ensureInit()
 	f.robotOwners[botUID] = creatorUID
+}
+
+// seedBotName registers `botUID` → `displayName` for the fake's
+// listGrantsByGrantor name lookup. Tests that need to assert on the
+// JOIN-derived `grantee_bot_name` field should seed both ownership
+// (seedBot) and a name. Unsealed bots fall back to the bot uid, mirroring
+// the COALESCE in the production query (YUJ-1358).
+func (f *fakeOBOStore) seedBotName(botUID, displayName string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureInit()
+	f.botNames[botUID] = displayName
 }
 
 // seedNonBotUser marks `uid` as a real (human) user — exists in `user`
@@ -180,6 +201,13 @@ func (f *fakeOBOStore) listGrantsByGrantor(grantorUID string) ([]*oboGrantModel,
 	for _, g := range f.grants {
 		if g.GrantorUID == grantorUID {
 			cp := *g
+			// Mirror prod's LEFT JOIN COALESCE(u.name, g.grantee_bot_uid):
+			// always populate a non-empty display name (YUJ-1358).
+			if name, ok := f.botNames[g.GranteeBotUID]; ok && name != "" {
+				cp.GranteeBotName = name
+			} else {
+				cp.GranteeBotName = g.GranteeBotUID
+			}
 			out = append(out, &cp)
 		}
 	}
