@@ -23,19 +23,22 @@
 //
 // Inbound rewrite (CALL from message ingress chokepoints)
 // =======================================================
-// Legacy clients still emit `mention.all=1` for `@所有人`. The
-// three-state design assigns `all=1` the **humans-only** broadcast
-// semantics (Yu 2026-05-19 D1): "legacy `@所有人` should NOT auto-trigger
-// all bots, that's the exact pain point being fixed". So inbound
-// `mention.all=1` is rewritten to also carry `mention.humans=1`. The
-// legacy `mention.all=1` field is INTENTIONALLY preserved on the
-// outbound payload (double-write) so old read-side clients that only
-// understand `all` keep rendering the "@所有人" pill until their roll-out
-// catches up. New read-side clients prefer `humans` / `ais` and IGNORE
-// `all` when either of the new fields is set — see the read-side change
-// in Message.getMention (modules/message/api_reminders.go).
+// Legacy clients still emit `mention.all=1` for `@所有人`. Plan X
+// (YUJ-1389) assigns `all=1` the **ais broadcast** semantics: legacy
+// `@所有人` traffic automatically fans out to all AI bots without
+// requiring an SDK update on the sender side. So inbound
+// `mention.all=1` is rewritten to also carry `mention.ais=1`. A NEW
+// field `mention.humans=1` is the explicit human-notification signal
+// — it is the only way a client can request a channel-level reminder
+// for the human members of a channel. The legacy `mention.all=1` field
+// is INTENTIONALLY preserved on the outbound payload (double-write) so
+// old read-side clients that only understand `all` keep rendering the
+// "@所有人" pill until their roll-out catches up. New read-side clients
+// prefer `humans` / `ais` and IGNORE `all` when either of the new
+// fields is set — see the read-side change in Message.getMention
+// (modules/message/api_reminders.go).
 //
-// `mention.ais=1` is left untouched. `mention.humans=1` is left
+// `mention.humans=1` is left untouched. `mention.ais=1` is left
 // untouched. `mention.uids` / `mention.entities` are left untouched.
 //
 // The helper is idempotent: RewriteMention(RewriteMention(p)) ==
@@ -53,18 +56,25 @@ import "encoding/json"
 // mention state lives. Exposed so callers and tests share one constant.
 const MentionKey = "mention"
 
-// AllKey is the legacy `@所有人` field. Inbound `all=1` is rewritten to
-// also carry `humans=1`; the `all` field itself is preserved on the
-// dispatched payload (outbound double-write) for backward compat with
-// old read-side clients that only understand `all`.
+// AllKey is the legacy `@所有人` field. Inbound `all=1` is rewritten
+// (Plan X / YUJ-1389) to also carry `ais=1` so legacy clients
+// automatically trigger all AI bots without an SDK update; the `all`
+// field itself is preserved on the dispatched payload (outbound
+// double-write) for backward compat with old read-side clients that
+// only understand `all`.
 const AllKey = "all"
 
 // HumansKey signals a human-only broadcast (`@所有真人`). New read-side
 // clients render the "@所有人" pill from this field and IGNORE `all`.
+// Plan X: this is the ONLY signal that produces a channel-level
+// human-visible reminder — bots respond via the message delivery path
+// without needing a reminder row.
 const HumansKey = "humans"
 
-// AIsKey signals a bot-only broadcast (`@所有 AI`). Independent of
-// `humans` — both can be set on the same message (`@所有人 + @所有 AI`).
+// AIsKey signals a bot broadcast (`@所有 AI`). Independent of `humans`
+// — both can be set on the same message (`@所有人 + @所有 AI`). Plan X:
+// inbound legacy `all=1` is rewritten to carry `ais=1` so all bots
+// fan out by default for the legacy `@所有人` shape.
 const AIsKey = "ais"
 
 // RewriteMention normalizes the payload's `mention` sub-map per the
@@ -74,21 +84,23 @@ const AIsKey = "ais"
 // back pattern used elsewhere in the message dispatch stack (mirrors
 // `enrichPayloadWithSpaceID`).
 //
-// Behavior:
+// Behavior (Plan X / YUJ-1389):
 //   - payload == nil → returns nil (no allocation).
 //   - payload has no `mention` key, or `mention` is not a
 //     map[string]interface{} → returned untouched.
 //   - mention.all is truthy (==1 in either json.Number, float64, int,
-//     int64, uint64, or bool form) → mention.humans is set to the
+//     int64, uint64, or bool form) → mention.ais is set to the
 //     canonical json.Number("1"). mention.all is preserved.
-//   - mention.humans is already truthy → no-op on humans (preserves
+//   - mention.ais is already truthy → no-op on ais (preserves
 //     whatever numeric/bool form the caller sent).
-//   - mention.ais is left untouched in every branch.
+//   - mention.humans is left untouched in every branch — humans is the
+//     explicit human-notification signal and must NEVER be inferred
+//     from a legacy `all=1`.
 //   - mention.uids / mention.entities / any other key inside mention is
 //     left untouched.
 //
 // Idempotent by construction: a second pass over an already-rewritten
-// payload sees humans truthy and does nothing.
+// payload sees ais truthy and does nothing.
 func RewriteMention(payload map[string]interface{}) map[string]interface{} {
 	if payload == nil {
 		return nil
@@ -108,12 +120,14 @@ func RewriteMention(payload map[string]interface{}) map[string]interface{} {
 	if !isTruthyOne(mention[AllKey]) {
 		return payload
 	}
-	// Inbound `all=1` → make sure humans=1 is also present. Don't
-	// overwrite a humans value the client already supplied (might be a
-	// new client that explicitly set humans in addition to legacy all
-	// for forward+backward compat).
-	if !isTruthyOne(mention[HumansKey]) {
-		mention[HumansKey] = json.Number("1")
+	// Plan X / YUJ-1389: inbound `all=1` → make sure ais=1 is also
+	// present so legacy `@所有人` automatically fans out to all AI bots
+	// without requiring an SDK update on the sender side. Don't
+	// overwrite an ais value the client already supplied (might be a
+	// new client that explicitly set ais in addition to legacy all for
+	// forward+backward compat).
+	if !isTruthyOne(mention[AIsKey]) {
+		mention[AIsKey] = json.Number("1")
 	}
 	// `all` is INTENTIONALLY preserved — see package godoc on the
 	// outbound double-write rationale.

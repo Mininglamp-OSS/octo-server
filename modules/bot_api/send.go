@@ -124,10 +124,15 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 		payload = ba.enrichBotPayloadWithSpaceID(c, robotID, payload)
 	}
 
-	// YUJ-202 / Mininglamp-OSS#94 — mention three-state rewrite. Same
-	// chokepoint contract as modules/message/api.go: legacy
-	// `mention.all=1` is normalized to also carry `mention.humans=1`
-	// (outbound double-write keeps `all=1` for old read-side clients).
+	// YUJ-202 / Mininglamp-OSS#94 / YUJ-1389 (Plan X) — mention
+	// three-state rewrite. Same chokepoint contract as
+	// modules/message/api.go: legacy `mention.all=1` is normalized to
+	// also carry `mention.ais=1` so legacy `@所有人` traffic auto-fans-
+	// out to all AI bots without requiring an SDK update on the
+	// sender side (outbound double-write keeps `all=1` for old
+	// read-side clients that only understand the legacy field).
+	// `mention.humans=1` remains an explicit, opt-in human-
+	// notification signal — it is NEVER inferred from `all=1`.
 	// ⚠️ F2 (PR#70 Jerry-Xin correctness-critical review): this MUST
 	// be placed OUTSIDE the `ChannelTypePerson` conditional above —
 	// otherwise group / community-topic `@所有人` traffic (the main
