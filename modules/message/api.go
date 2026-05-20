@@ -461,13 +461,16 @@ func (m *Message) sendMessage(channelID string, channelType uint8, fromUID strin
 	// YUJ-202 / Mininglamp-OSS#94 — mention three-state rewrite
 	// (方案 X step §5 of docs/2026-05-mention-all-chokepoint-audit.md).
 	// Legacy clients still send `mention.all=1` for "@所有人"; the
-	// chokepoint normalizes that to also carry `mention.humans=1` so
-	// new read-side adapters can render the pill, AND keeps `all=1` in
-	// place as an outbound double-write for old read-side clients that
-	// only understand `all`. ais is left untouched (Yu D1 — legacy
-	// "@所有人" must NOT auto-trigger ais=1). Helper is idempotent and
-	// safe on nil / malformed mention shapes — see
-	// pkg/mentionrewrite/rewrite.go for the contract.
+	// chokepoint normalizes that to also carry `mention.ais=1` (Plan X
+	// / YUJ-1389) so legacy `@所有人` automatically fans out to all AI
+	// bots without an SDK update, AND keeps `all=1` in place as an
+	// outbound double-write for old read-side clients that only
+	// understand `all`. `mention.humans=1` is NEVER inferred from
+	// legacy `all=1` — humans is the explicit human-notification signal
+	// and must be set by the client (Yu D1 — legacy "@所有人" must NOT
+	// auto-tag humans). Helper is idempotent and safe on nil /
+	// malformed mention shapes — see pkg/mentionrewrite/rewrite.go for
+	// the contract.
 	payload = RewriteMention(payload)
 	// YUJ-219-A / GH#1283 (analysis-report.md §4.5 / §7.4)：
 	// 派发前为消息 payload 注入权威 space_id，让客户端 SpaceFilter 拿到可信字段，

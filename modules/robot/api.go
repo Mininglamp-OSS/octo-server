@@ -440,13 +440,16 @@ func (rb *Robot) sendMessage(c *wkhttp.Context) {
 
 	// YUJ-202 / Mininglamp-OSS#94 — mention three-state rewrite. Same
 	// chokepoint contract as the user and bot API ingresses: legacy
-	// `mention.all=1` is normalized to also carry `mention.humans=1`,
-	// with `all=1` preserved on the outbound payload for old read-side
-	// clients (double-write). ⚠️ F2 (PR#70 Jerry-Xin correctness-
-	// critical review): MUST stay OUTSIDE the `ChannelTypePerson`
-	// conditional above so group / community-topic `@所有人` traffic
-	// (the main pain-point) actually goes through the chokepoint.
-	// Helper is idempotent and safe on nil — see pkg/mentionrewrite.
+	// `mention.all=1` is normalized (Plan X / YUJ-1389) to also carry
+	// `mention.ais=1`, with `all=1` preserved on the outbound payload
+	// for old read-side clients (double-write). `mention.humans=1` is
+	// NEVER inferred from legacy `all=1` — humans is the explicit human-
+	// notification signal and must be set by the client. ⚠️ F2 (PR#70
+	// Jerry-Xin correctness-critical review): MUST stay OUTSIDE the
+	// `ChannelTypePerson` conditional above so group / community-topic
+	// `@所有人` traffic (the main pain-point) actually goes through the
+	// chokepoint. Helper is idempotent and safe on nil —
+	// see pkg/mentionrewrite.
 	payload = mentionrewrite.RewriteMention(payload)
 
 	result, err := rb.ctx.SendMessageWithResult(&config.MsgSendReq{
