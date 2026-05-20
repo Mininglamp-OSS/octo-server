@@ -17,10 +17,16 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// TestMessagePackage_RewriteMention_AllRewrittenToHumansDoubleWrite is
-// the canonical regression guard for the message-package shim. If
-// someone deletes the import or breaks the wiring this test fails.
-func TestMessagePackage_RewriteMention_AllRewrittenToHumansDoubleWrite(t *testing.T) {
+// TestMessagePackage_RewriteMention_AllRewrittenToAIsDoubleWrite is
+// the canonical regression guard for the message-package shim under
+// Plan X (YUJ-1389): inbound `mention.all=1` must be rewritten to
+// also carry `mention.ais=1` (so legacy `@所有人` auto-fans-out to
+// all AI bots without an SDK update), while preserving the legacy
+// `all=1` on the outbound payload for old read-side clients. humans
+// MUST NOT be auto-set — humans is the explicit human-notification
+// signal and only the sender may set it. If someone deletes the
+// import or breaks the wiring this test fails.
+func TestMessagePackage_RewriteMention_AllRewrittenToAIsDoubleWrite(t *testing.T) {
 	payload := map[string]interface{}{
 		"type":    1,
 		"content": "@所有人 ping",
@@ -32,11 +38,29 @@ func TestMessagePackage_RewriteMention_AllRewrittenToHumansDoubleWrite(t *testin
 	mention := out["mention"].(map[string]interface{})
 	assert.Equal(t, json.Number("1"), mention["all"],
 		"all=1 outbound double-write must be preserved")
-	assert.Equal(t, json.Number("1"), mention["humans"],
-		"all=1 inbound must rewrite to add humans=1")
+	assert.Equal(t, json.Number("1"), mention["ais"],
+		"Plan X: all=1 inbound must rewrite to add ais=1 (auto-fan-out to bots)")
+	_, hasHumans := mention["humans"]
+	assert.False(t, hasHumans,
+		"humans MUST NOT be auto-set — only the sender may set the human-notification signal")
+}
+
+// TestMessagePackage_RewriteMention_HumansPassthrough — message-package
+// shim must NOT short-circuit on the humans-only shape (the helper
+// preserves it untouched). ais MUST NOT be inferred from humans.
+func TestMessagePackage_RewriteMention_HumansPassthrough(t *testing.T) {
+	payload := map[string]interface{}{
+		"mention": map[string]interface{}{
+			"humans": json.Number("1"),
+		},
+	}
+	out := RewriteMention(payload)
+	mention := out["mention"].(map[string]interface{})
+	assert.Equal(t, json.Number("1"), mention["humans"])
 	_, hasAIs := mention["ais"]
-	assert.False(t, hasAIs,
-		"Yu D1: legacy @所有人 must NOT auto-trigger ais=1 (the bot-fan-out pain point)")
+	assert.False(t, hasAIs)
+	_, hasAll := mention["all"]
+	assert.False(t, hasAll)
 }
 
 // TestMessagePackage_RewriteMention_AisPassthrough — message-package
