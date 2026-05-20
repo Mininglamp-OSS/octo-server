@@ -317,3 +317,116 @@ func TestGetReminders_AllAndHumans_RoundTripThroughRewrite(t *testing.T) {
 	assert.Len(t, rems, 1, "round-trip must produce exactly one broadcast reminder")
 	assert.Equal(t, "", rems[0].UID, "broadcast reminder uses empty UID")
 }
+
+// TestFilterChannelLevelByPublisher pins YUJ-1377 / Mininglamp-OSS/
+// octo-server#101 — the sender of an `@所有人` broadcast must NOT
+// receive their own red-dot reminder. The fix lives in reminderSync,
+// which calls filterChannelLevelByPublisher on the rows returned by
+// remindersDB.sync; this test exercises the filter helper in
+// isolation (pure data, no DB / IM context).
+//
+// Coverage matrix:
+//   - channel-level reminder (UID="") authored by viewer → DROPPED
+//   - channel-level reminder authored by someone else    → KEPT
+//   - per-uid reminder addressed to viewer (e.g. @uid)   → KEPT
+//   - per-uid apply-join-group reminder                  → KEPT
+//     (this is the "do not break other reminder types"
+//     guarantee from the issue description)
+//   - empty/nil viewer UID                               → no-op
+//   - empty slice                                        → no-op
+func TestFilterChannelLevelByPublisher(t *testing.T) {
+	mk := func(uid, publisher string, reminderType int) *remindersDetailModel {
+		return &remindersDetailModel{
+			remindersModel: remindersModel{
+				ChannelID:    "ch_team",
+				ChannelType:  common.ChannelTypeGroup.Uint8(),
+				UID:          uid,
+				Publisher:    publisher,
+				ReminderType: reminderType,
+			},
+		}
+	}
+
+	t.Run("drops channel-level reminder authored by viewer", func(t *testing.T) {
+		input := []*remindersDetailModel{
+			mk("", "u_sender", int(ReminderTypeMentionMe)),        // sender's own broadcast → drop
+			mk("", "u_other", int(ReminderTypeMentionMe)),         // someone else's broadcast → keep
+			mk("u_sender", "u_other", int(ReminderTypeMentionMe)), // @u_sender from u_other → keep
+			mk("u_sender", "u_other", int(ReminderTypeApplyJoinGroup)),
+		}
+		got := filterChannelLevelByPublisher(input, "u_sender")
+		assert.Len(t, got, 3, "exactly one row (the self-broadcast) must be dropped")
+		for _, r := range got {
+			if r.UID == "" {
+				assert.NotEqual(t, "u_sender", r.Publisher,
+					"no remaining channel-level reminder may be authored by the viewer")
+			}
+		}
+	})
+
+	t.Run("keeps everything when viewer is not the publisher", func(t *testing.T) {
+		input := []*remindersDetailModel{
+			mk("", "u_alice", int(ReminderTypeMentionMe)),
+			mk("u_bob", "u_alice", int(ReminderTypeMentionMe)),
+		}
+		got := filterChannelLevelByPublisher(input, "u_bob")
+		assert.Equal(t, input, got, "no-op path must return the input slice unchanged")
+	})
+
+	t.Run("preserves apply-join-group reminders addressed to viewer", func(t *testing.T) {
+		// Apply-join-group reminders carry an explicit UID and have no
+		// Publisher set by getReminders; the filter must never drop
+		// them even if Publisher happens to coincide with the viewer.
+		input := []*remindersDetailModel{
+			mk("u_admin", "u_admin", int(ReminderTypeApplyJoinGroup)),
+		}
+		got := filterChannelLevelByPublisher(input, "u_admin")
+		assert.Equal(t, input, got, "apply-join-group must pass through verbatim")
+	})
+
+	t.Run("no-op on empty viewer uid", func(t *testing.T) {
+		input := []*remindersDetailModel{
+			mk("", "u_alice", int(ReminderTypeMentionMe)),
+		}
+		got := filterChannelLevelByPublisher(input, "")
+		assert.Equal(t, input, got)
+	})
+
+	t.Run("no-op on empty slice", func(t *testing.T) {
+		got := filterChannelLevelByPublisher(nil, "u_sender")
+		assert.Nil(t, got)
+		got = filterChannelLevelByPublisher([]*remindersDetailModel{}, "u_sender")
+		assert.Empty(t, got)
+	})
+}
+
+// TestReminderSync_SenderExcludedFromBroadcast is the contract-level
+// regression: the sender of `@所有人` is excluded from the reminder
+// list returned by the read path. We exercise the filter step here
+// (the DB layer is covered by integration tests); together with
+// TestGetReminders_FanoutMatrix this pins both "row is created" and
+// "row is hidden from the author on read".
+func TestReminderSync_SenderExcludedFromBroadcast(t *testing.T) {
+	// Simulate what remindersDB.sync would return for u_sender after
+	// u_sender broadcast `@所有人` and an unrelated peer also did.
+	rows := []*remindersDetailModel{
+		{remindersModel: remindersModel{
+			ChannelID: "ch_team", ChannelType: common.ChannelTypeGroup.Uint8(),
+			UID: "", Publisher: "u_sender", ReminderType: int(ReminderTypeMentionMe),
+			Text: "[有人@我]",
+		}},
+		{remindersModel: remindersModel{
+			ChannelID: "ch_team", ChannelType: common.ChannelTypeGroup.Uint8(),
+			UID: "", Publisher: "u_peer", ReminderType: int(ReminderTypeMentionMe),
+			Text: "[有人@我]",
+		}},
+	}
+
+	got := filterChannelLevelByPublisher(rows, "u_sender")
+	assert.Len(t, got, 1, "sender must see only the peer's broadcast, not their own")
+	assert.Equal(t, "u_peer", got[0].Publisher)
+
+	// And a third party sees both.
+	got = filterChannelLevelByPublisher(rows, "u_bystander")
+	assert.Len(t, got, 2)
+}
