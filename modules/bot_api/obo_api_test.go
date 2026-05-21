@@ -396,7 +396,7 @@ func TestOBO_CreateGrant_Reactivates_SoftDeletedRow(t *testing.T) {
 	}
 	originalID := rows[0].ID
 	enable := 1
-	_ = s.updateGrant(originalID, "", &enable)
+	_ = s.updateGrant(originalID, "", &enable, nil)
 
 	// Step 2: soft-delete the grant.
 	_ = s.revokeGrant(originalID)

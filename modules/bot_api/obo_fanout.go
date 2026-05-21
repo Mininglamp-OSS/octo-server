@@ -172,6 +172,10 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 	if m == nil || strings.TrimSpace(m.ChannelID) == "" {
 		return 0
 	}
+	ba.Info("OBO fan-out: processing message",
+		zap.String("from", m.FromUID),
+		zap.String("channel_id", m.ChannelID),
+		zap.Uint8("channel_type", m.ChannelType))
 
 	// Gate 3 (cheapest, no DB): drop messages already minted by the OBO
 	// dispatch path. Marker lives in payload (= message_extra). We don't
@@ -196,6 +200,10 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 
 	store := ba.oboStoreOrDefault()
 	grants, err := store.findActiveGrantsForChannel(lookupChannelID, m.ChannelType)
+	ba.Info("OBO fan-out: scope lookup result",
+		zap.String("lookup_channel_id", lookupChannelID),
+		zap.Int("scope_grants", len(grants)),
+		zap.Bool("err", err != nil))
 	if err != nil {
 		ba.Error("OBO fan-out lookup failed",
 			zap.String("lookup_channel_id", lookupChannelID),
@@ -204,6 +212,46 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 			zap.Error(err))
 		return 0
 	}
+
+	// Implicit scope: for GROUP channels, also find global_enabled grants
+	// whose grantor is a member of this group but has no explicit scope row.
+	// This enables "admin is in any group → persona clone auto-covers it"
+	// without manual scope management per channel.
+	if m.ChannelType == common.ChannelTypeGroup.Uint8() {
+		globalGrants, gErr := store.findGlobalGrantsWithoutScope(lookupChannelID, m.ChannelType)
+		if gErr != nil {
+			ba.Warn("OBO global-grant lookup failed",
+				zap.String("channel_id", lookupChannelID),
+				zap.Error(gErr))
+		} else {
+			// Filter: only include grants where the grantor is actually a member
+			seenIDs := map[int64]bool{}
+			for _, g := range grants {
+				seenIDs[g.ID] = true
+			}
+			for _, g := range globalGrants {
+				if seenIDs[g.ID] {
+					continue // already in scope-matched set
+				}
+				ok, mErr := ba.grantorCanReadChannel(g.GrantorUID, lookupChannelID, m.ChannelType)
+				if mErr != nil {
+					ba.Warn("OBO global-grant membership check failed",
+						zap.String("grantor", g.GrantorUID),
+						zap.String("channel_id", lookupChannelID),
+						zap.Error(mErr))
+					continue
+				}
+				if ok {
+					ba.Info("OBO implicit-scope: grantor is group member, auto-including grant",
+						zap.String("grantor", g.GrantorUID),
+						zap.String("bot", g.GranteeBotUID),
+						zap.String("channel_id", lookupChannelID))
+					grants = append(grants, g)
+				}
+			}
+		}
+	}
+
 	if len(grants) == 0 {
 		return 0
 	}
@@ -230,6 +278,23 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 		// would see every word the grantor types and potentially reply.
 		if g.GrantorUID == m.FromUID {
 			continue
+		}
+		// Gate 4: bot is already a member of this group → it receives
+		// messages directly via the WuKongIM subscriber pipeline, so a
+		// fan-out copy would cause duplicate processing (double typing,
+		// double reply, identity confusion on @AI/@bot). The adapter-
+		// side mention logic handles identity switching (“@所有人 →
+		// respond as grantor”) for the direct-receipt path.
+		// Only applies to GROUP channels; DM fan-out is the sole
+		// delivery path (bot is never a “member” of the peer’s DM).
+		if m.ChannelType == common.ChannelTypeGroup.Uint8() {
+			isBotInGroup, gErr := ba.userIsGroupMember(g.GranteeBotUID, lookupChannelID)
+			if gErr == nil && isBotInGroup {
+				ba.Info("OBO fan-out gate 4: bot is group member, skipping fan-out (adapter handles directly)",
+					zap.String("bot", g.GranteeBotUID),
+					zap.String("channel_id", lookupChannelID))
+				continue
+			}
 		}
 		// PR#82 round-3 P1 — Multi-grantor DM recipient filter. For
 		// DMs, findActiveGrantsForChannel is keyed by the peer uid
@@ -358,6 +423,8 @@ func buildFanoutCopyReq(m *config.MessageResp, grantorUID, granteeBotUID string)
 	payload["obo_origin_channel_id"] = m.ChannelID
 	payload["obo_origin_channel_type"] = m.ChannelType
 	payload["obo_origin_from_uid"] = m.FromUID
+	payload["obo_respond_as"] = grantorUID
+	payload["obo_grantor_uid"] = grantorUID
 	if m.MessageIDStr != "" {
 		payload["obo_origin_message_idstr"] = m.MessageIDStr
 	}

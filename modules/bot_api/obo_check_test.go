@@ -46,7 +46,7 @@ func TestCheckOBO_Happy(t *testing.T) {
 		t.Fatalf("insertGrant: %v", err)
 	}
 	enable := 1
-	if err := s.updateGrant(gid, "", &enable); err != nil {
+	if err := s.updateGrant(gid, "", &enable, nil); err != nil {
 		t.Fatalf("updateGrant: %v", err)
 	}
 	if _, err := s.insertScope(gid, tChan, common.ChannelTypeGroup.Uint8(), 1); err != nil {
@@ -74,7 +74,7 @@ func TestCheckOBO_GrantRevoked(t *testing.T) {
 	s := newFakeOBOStore()
 	gid, _ := s.insertGrant(tGrantor, tBot, "auto")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable)
+	_ = s.updateGrant(gid, "", &enable, nil)
 	_, _ = s.insertScope(gid, tChan, common.ChannelTypeGroup.Uint8(), 1)
 	if err := s.revokeGrant(gid); err != nil {
 		t.Fatalf("revokeGrant: %v", err)
@@ -102,20 +102,34 @@ func TestCheckOBO_GlobalDisabled(t *testing.T) {
 	}
 }
 
-// TestCheckOBO_ScopeMissing — grant is fully enabled but no scope row
-// for the channel. Whitelist semantics: channels not explicitly added
-// MUST be denied (RFC §2).
+// TestCheckOBO_ScopeMissing_GlobalOff — grant is active but global_enabled=0
+// and no scope row. Should be denied.
 func TestCheckOBO_ScopeMissing(t *testing.T) {
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(tGrantor, tBot, "auto")
-	enable := 1
-	_ = s.updateGrant(gid, "", &enable)
-	// No scope inserted at all.
+	_, _ = s.insertGrant(tGrantor, tBot, "auto")
+	// global_enabled defaults to 0, no scope inserted.
 
 	ba := newBotAPIWithFakeStore(s)
 	err := ba.checkOBO(tBot, tGrantor, tChan, common.ChannelTypeGroup.Uint8())
 	if !errors.Is(err, ErrOBONotAuthorized) {
-		t.Fatalf("missing scope should be unauthorized, got %v", err)
+		t.Fatalf("missing scope + global_enabled=0 should be unauthorized, got %v", err)
+	}
+}
+
+// TestCheckOBO_ScopeMissing_GlobalOn_ImplicitScope — grant has global_enabled=1
+// but no explicit scope row. With implicit scope, grantor membership check
+// should authorize the request.
+func TestCheckOBO_ScopeMissing_ImplicitScope(t *testing.T) {
+	s := newFakeOBOStore()
+	gid, _ := s.insertGrant(tGrantor, tBot, "auto")
+	enable := 1
+	_ = s.updateGrant(gid, "", &enable, nil)
+	// No scope inserted, but global_enabled=1 + grantor is group member (override returns true)
+
+	ba := newBotAPIWithFakeStore(s)
+	err := ba.checkOBO(tBot, tGrantor, tChan, common.ChannelTypeGroup.Uint8())
+	if err != nil {
+		t.Fatalf("global_enabled=1 + grantor is member should be authorized via implicit scope, got %v", err)
 	}
 }
 
@@ -124,7 +138,7 @@ func TestCheckOBO_ScopeDisabled(t *testing.T) {
 	s := newFakeOBOStore()
 	gid, _ := s.insertGrant(tGrantor, tBot, "auto")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable)
+	_ = s.updateGrant(gid, "", &enable, nil)
 	_, _ = s.insertScope(gid, tChan, common.ChannelTypeGroup.Uint8(), 0)
 
 	ba := newBotAPIWithFakeStore(s)
@@ -184,7 +198,7 @@ func TestCheckOBO_DBError_OnScopeLookup(t *testing.T) {
 	s := newFakeOBOStore()
 	gid, _ := s.insertGrant(tGrantor, tBot, "auto")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable)
+	_ = s.updateGrant(gid, "", &enable, nil)
 	s.failScopeEnabled = boom
 
 	ba := newBotAPIWithFakeStore(s)
@@ -208,7 +222,7 @@ func TestOBO_CheckOBO_GrantorMembershipRevoked_403(t *testing.T) {
 		t.Fatalf("insertGrant: %v", err)
 	}
 	enable := 1
-	if err := s.updateGrant(gid, "", &enable); err != nil {
+	if err := s.updateGrant(gid, "", &enable, nil); err != nil {
 		t.Fatalf("updateGrant: %v", err)
 	}
 	if _, err := s.insertScope(gid, tChan, common.ChannelTypeGroup.Uint8(), 1); err != nil {
@@ -256,7 +270,7 @@ func TestOBO_CheckOBO_GrantorChannelAccessDBError_Propagates(t *testing.T) {
 	s := newFakeOBOStore()
 	gid, _ := s.insertGrant(tGrantor, tBot, "auto")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable)
+	_ = s.updateGrant(gid, "", &enable, nil)
 	_, _ = s.insertScope(gid, tChan, common.ChannelTypeGroup.Uint8(), 1)
 
 	ba := newBotAPIWithFakeStore(s)

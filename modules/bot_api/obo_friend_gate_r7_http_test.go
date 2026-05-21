@@ -52,7 +52,7 @@ func newBAforR7Test() (*BotAPI, *dispatchCapture) {
 	s := newFakeOBOStore()
 	gid, _ := s.insertGrant("user_admin", "bot_clone_james", "auto")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable)
+	_ = s.updateGrant(gid, "", &enable, nil)
 	_, _ = s.insertScope(gid, "u_bob", common.ChannelTypePerson.Uint8(), 1)
 
 	dc := &dispatchCapture{}

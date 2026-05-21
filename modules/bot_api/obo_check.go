@@ -13,6 +13,7 @@ package bot_api
 import (
 	"errors"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	"go.uber.org/zap"
 )
 
@@ -79,6 +80,29 @@ func (ba *BotAPI) checkOBO(botUID, grantor, channelID string, channelType uint8)
 			zap.Uint8("channel_type", channelType),
 			zap.Error(err))
 		return err
+	}
+	// Implicit scope: when global_enabled=1 and NO explicit scope row exists
+	// for this channel, check if the grantor is a member. If so, allow the OBO
+	// send. BUT if a scope row exists (even with enabled=0), respect it —
+	// an explicitly disabled scope means the admin intentionally excluded
+	// this channel.
+	hasExplicitScope, _ := store.scopeRowExists(grant.ID, channelID, channelType)
+	if !ok && !hasExplicitScope && grant.GlobalEnabled == 1 && channelType == common.ChannelTypeGroup.Uint8() {
+		isMember, mErr := ba.grantorCanReadChannel(grantor, channelID, channelType)
+		if mErr != nil {
+			ba.Error("OBO implicit-scope membership check failed",
+				zap.String("grantor", grantor),
+				zap.String("channel_id", channelID),
+				zap.Error(mErr))
+			return mErr
+		}
+		if isMember {
+			ba.Info("OBO checkOBO: implicit-scope approved (grantor is group member)",
+				zap.String("grantor", grantor),
+				zap.String("bot", botUID),
+				zap.String("channel_id", channelID))
+			ok = true
+		}
 	}
 	if !ok {
 		return ErrOBONotAuthorized

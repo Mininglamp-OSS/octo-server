@@ -42,7 +42,7 @@ func TestSendMessage_OBO_Authorized_SwapsFromUID(t *testing.T) {
 	s := newFakeOBOStore()
 	gid, _ := s.insertGrant(grantor, botID, "auto")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable)
+	_ = s.updateGrant(gid, "", &enable, nil)
 	_, _ = s.insertScope(gid, group, common.ChannelTypeGroup.Uint8(), 1)
 
 	dc := &dispatchCapture{}
@@ -92,7 +92,7 @@ func TestSendMessage_OBO_Authorized_SwapsFromUID(t *testing.T) {
 	// fake to keep the test self-contained.
 	s2 := newFakeOBOStore()
 	gid2, _ := s2.insertGrant("user_alice", botID, "auto")
-	_ = s2.updateGrant(gid2, "", &enable)
+	_ = s2.updateGrant(gid2, "", &enable, nil)
 	_, _ = s2.insertScope(gid2, grantor, common.ChannelTypePerson.Uint8(), 1)
 	ba.oboStoreOverride = s2
 
@@ -222,7 +222,7 @@ func TestSendMessage_OBO_GrantorReplyBypass_DM(t *testing.T) {
 	s := newFakeOBOStore()
 	gid, _ := s.insertGrant(grantor, botID, "auto")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable)
+	_ = s.updateGrant(gid, "", &enable, nil)
 
 	dc := &dispatchCapture{}
 	ba := &BotAPI{
@@ -353,7 +353,7 @@ func TestSendMessage_OBO_GrantorReplyBypass_DoesNotApplyToThirdPartySend(t *test
 	s := newFakeOBOStore()
 	gid, _ := s.insertGrant(grantor, botID, "auto")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable)
+	_ = s.updateGrant(gid, "", &enable, nil)
 
 	dc := &dispatchCapture{}
 	ba := &BotAPI{

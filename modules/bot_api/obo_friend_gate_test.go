@@ -76,7 +76,7 @@ func TestHasOBOAccessToChannel_DM_GrantorHasFriendship_ApplyBypass(t *testing.T)
 		t.Fatalf("insertGrant: %v", err)
 	}
 	enable := 1
-	if err := s.updateGrant(gid, "", &enable); err != nil {
+	if err := s.updateGrant(gid, "", &enable, nil); err != nil {
 		t.Fatalf("updateGrant: %v", err)
 	}
 	if _, err := s.insertScope(gid, peer, ct, 1); err != nil {
@@ -122,7 +122,7 @@ func TestHasOBOAccessToChannel_DM_GrantorLostAccess_NoBypass(t *testing.T) {
 	s := newFakeOBOStore()
 	gid, _ := s.insertGrant(admin, bot, "auto")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable)
+	_ = s.updateGrant(gid, "", &enable, nil)
 	if _, err := s.insertScope(gid, peer, ct, 1); err != nil {
 		t.Fatalf("insertScope: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestHasOBOAccessToChannel_GrantForDifferentBot_NoBypass(t *testing.T) {
 	s := newFakeOBOStore()
 	gid, _ := s.insertGrant(admin, otherBot, "auto")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable)
+	_ = s.updateGrant(gid, "", &enable, nil)
 	if _, err := s.insertScope(gid, peer, ct, 1); err != nil {
 		t.Fatalf("insertScope: %v", err)
 	}
@@ -216,7 +216,7 @@ func TestHasOBOAccessToChannel_Group_BypassApplies(t *testing.T) {
 	s := newFakeOBOStore()
 	gid, _ := s.insertGrant(admin, bot, "auto")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable)
+	_ = s.updateGrant(gid, "", &enable, nil)
 	if _, err := s.insertScope(gid, group, ct, 1); err != nil {
 		t.Fatalf("insertScope: %v", err)
 	}
@@ -260,7 +260,7 @@ func TestIsFriendOrOBOBypass_FriendsShortCircuits(t *testing.T) {
 	// there because the friend lookup short-circuits.
 	gid, _ := s.insertGrant("user_admin", "bot_clone", "auto")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable)
+	_ = s.updateGrant(gid, "", &enable, nil)
 	_, _ = s.insertScope(gid, "u_bob", common.ChannelTypePerson.Uint8(), 1)
 
 	// If the bypass is consulted, the access override would fire and
@@ -304,7 +304,7 @@ func TestIsFriendOrOBOBypass_NotFriendsButOBOApplies(t *testing.T) {
 	s := newFakeOBOStore()
 	gid, _ := s.insertGrant(admin, bot, "auto")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable)
+	_ = s.updateGrant(gid, "", &enable, nil)
 	_, _ = s.insertScope(gid, peer, ct, 1)
 
 	ba := &BotAPI{
@@ -406,7 +406,7 @@ func TestIsFriendOrOBOBypass_NoOBOContext_GrantsIgnored(t *testing.T) {
 	s := newFakeOBOStore()
 	gid, _ := s.insertGrant(admin, bot, "auto")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable)
+	_ = s.updateGrant(gid, "", &enable, nil)
 	_, _ = s.insertScope(gid, peer, ct, 1)
 
 	bypassConsulted := false
@@ -450,7 +450,7 @@ func TestIsFriendOrOBOBypass_OBOContextTrue_BypassApplies(t *testing.T) {
 	s := newFakeOBOStore()
 	gid, _ := s.insertGrant(admin, bot, "auto")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable)
+	_ = s.updateGrant(gid, "", &enable, nil)
 	_, _ = s.insertScope(gid, peer, ct, 1)
 
 	ba := &BotAPI{

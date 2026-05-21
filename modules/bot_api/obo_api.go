@@ -65,7 +65,8 @@ type oboUpdateGrantReq struct {
 	// GlobalEnabled uses *int (not int / bool) so "field omitted" and
 	// "field set to 0" are distinguishable on the wire. Per RFC §5.1
 	// PUT semantics: only provided fields are updated.
-	GlobalEnabled *int `json:"global_enabled,omitempty"`
+	GlobalEnabled *int    `json:"global_enabled,omitempty"`
+	PersonaPrompt *string `json:"persona_prompt,omitempty"`
 }
 
 type oboCreateScopeReq struct {
@@ -257,12 +258,12 @@ func (ba *BotAPI) oboUpdateGrant(c *wkhttp.Context) {
 		c.ResponseError(errors.New("mode 仅支持 auto (v0)"))
 		return
 	}
-	if req.Mode == "" && req.GlobalEnabled == nil {
+	if req.Mode == "" && req.GlobalEnabled == nil && req.PersonaPrompt == nil {
 		// Idempotent no-op — return the existing row.
 		c.Response(grant)
 		return
 	}
-	if err := ba.oboStoreOrDefault().updateGrant(id, req.Mode, req.GlobalEnabled); err != nil {
+	if err := ba.oboStoreOrDefault().updateGrant(id, req.Mode, req.GlobalEnabled, req.PersonaPrompt); err != nil {
 		ba.Error("updateGrant failed", zap.Error(err), zap.Int64("id", id))
 		c.ResponseError(errors.New("内部错误"))
 		return

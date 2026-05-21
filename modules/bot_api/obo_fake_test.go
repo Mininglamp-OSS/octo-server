@@ -142,6 +142,18 @@ func (f *fakeOBOStore) scopeEnabled(grantID int64, channelID string, channelType
 	return false, nil
 }
 
+func (f *fakeOBOStore) scopeRowExists(grantID int64, channelID string, channelType uint8) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureInit()
+	for _, s := range f.scopes {
+		if s.GrantID == grantID && s.ChannelID == channelID && s.ChannelType == channelType {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (f *fakeOBOStore) findActiveGrantsForChannel(channelID string, channelType uint8) ([]*oboGrantModel, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -161,6 +173,31 @@ func (f *fakeOBOStore) findActiveGrantsForChannel(channelID string, channelType 
 		}
 		cp := *g
 		out = append(out, &cp)
+	}
+	return out, nil
+}
+
+func (f *fakeOBOStore) findGlobalGrantsWithoutScope(channelID string, channelType uint8) ([]*oboGrantModel, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureInit()
+	out := []*oboGrantModel{}
+	// Return active+global_enabled grants that DON'T have a scope row for this channel.
+	for _, g := range f.grants {
+		if g.Active != 1 || g.GlobalEnabled != 1 {
+			continue
+		}
+		hasScope := false
+		for _, s := range f.scopes {
+			if s.GrantID == g.ID && s.ChannelID == channelID && s.ChannelType == channelType {
+				hasScope = true
+				break
+			}
+		}
+		if !hasScope {
+			cp := *g
+			out = append(out, &cp)
+		}
 	}
 	return out, nil
 }
@@ -226,7 +263,7 @@ func (f *fakeOBOStore) findGrantByID(id int64) (*oboGrantModel, error) {
 	return &cp, nil
 }
 
-func (f *fakeOBOStore) updateGrant(id int64, mode string, globalEnabled *int) error {
+func (f *fakeOBOStore) updateGrant(id int64, mode string, globalEnabled *int, personaPrompt *string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.ensureInit()
@@ -243,6 +280,9 @@ func (f *fakeOBOStore) updateGrant(id int64, mode string, globalEnabled *int) er
 			v = 1
 		}
 		g.GlobalEnabled = v
+	}
+	if personaPrompt != nil {
+		g.PersonaPrompt = *personaPrompt
 	}
 	return nil
 }

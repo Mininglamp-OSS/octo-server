@@ -275,18 +275,24 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 
 	case BotKindUser:
 		if channelType == common.ChannelTypeGroup.Uint8() {
-			// Group: check bot is a group member
-			var count int
-			err := ba.db.session.SelectBySql(
-				"SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0",
-				channelID, robotID,
-			).LoadOne(&count)
-			if err != nil {
-				ba.Error("查询群成员失败", zap.Error(err))
-				return errors.New("查询群成员失败")
-			}
-			if count == 0 {
-				return errors.New("bot is not a member of this group")
+			// OBO bypass: when the bot acts on behalf of a grantor who IS a
+			// group member, skip the bot's own membership check. The downstream
+			// checkOBO validates that the grantor has a legitimate grant+scope
+			// (or implicit scope via global_enabled) for this channel.
+			if !hasOBOContext {
+				// Group: check bot is a group member
+				var count int
+				err := ba.db.session.SelectBySql(
+					"SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0",
+					channelID, robotID,
+				).LoadOne(&count)
+				if err != nil {
+					ba.Error("查询群成员失败", zap.Error(err))
+					return errors.New("查询群成员失败")
+				}
+				if count == 0 {
+					return errors.New("bot is not a member of this group")
+				}
 			}
 		} else if channelType == common.ChannelTypeCommunityTopic.Uint8() {
 			// Thread: extract parent group_no and verify membership

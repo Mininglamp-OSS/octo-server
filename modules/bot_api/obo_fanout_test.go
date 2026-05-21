@@ -51,7 +51,7 @@ func seedGrantWithScope(t *testing.T, ch string, ct uint8) *fakeOBOStore {
 		t.Fatalf("insertGrant: %v", err)
 	}
 	enable := 1
-	if err := s.updateGrant(gid, "", &enable); err != nil {
+	if err := s.updateGrant(gid, "", &enable, nil); err != nil {
 		t.Fatalf("updateGrant: %v", err)
 	}
 	if _, err := s.insertScope(gid, ch, ct, 1); err != nil {
@@ -417,7 +417,7 @@ func TestFanout_DMPeerToGrantor_MatchesScope(t *testing.T) {
 		t.Fatalf("insertGrant: %v", err)
 	}
 	enable := 1
-	if err := s.updateGrant(gid, "", &enable); err != nil {
+	if err := s.updateGrant(gid, "", &enable, nil); err != nil {
 		t.Fatalf("updateGrant: %v", err)
 	}
 	// Scope row uses the grantor's perspective: channel_id = peer uid.
@@ -494,7 +494,7 @@ func TestFanout_DMGrantorToPeer_DoesNotEcho(t *testing.T) {
 	s := newFakeOBOStore()
 	gid, _ := s.insertGrant(tGrantor, tBot, "auto")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable)
+	_ = s.updateGrant(gid, "", &enable, nil)
 	if _, err := s.insertScope(gid, peer, ct, 1); err != nil {
 		t.Fatalf("insertScope: %v", err)
 	}
@@ -532,7 +532,7 @@ func TestFanout_DMUnrelatedPeer_NoMatch(t *testing.T) {
 	s := newFakeOBOStore()
 	gid, _ := s.insertGrant(tGrantor, tBot, "auto")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable)
+	_ = s.updateGrant(gid, "", &enable, nil)
 	if _, err := s.insertScope(gid, scopedPeer, ct, 1); err != nil {
 		t.Fatalf("insertScope: %v", err)
 	}
@@ -587,7 +587,7 @@ func TestFanout_DMMultiGrantor_OnlyRecipientReceives(t *testing.T) {
 		t.Fatalf("insertGrant alice: %v", err)
 	}
 	enable := 1
-	if err := s.updateGrant(gidAlice, "", &enable); err != nil {
+	if err := s.updateGrant(gidAlice, "", &enable, nil); err != nil {
 		t.Fatalf("updateGrant alice: %v", err)
 	}
 	if _, err := s.insertScope(gidAlice, peer, ct, 1); err != nil {
@@ -600,7 +600,7 @@ func TestFanout_DMMultiGrantor_OnlyRecipientReceives(t *testing.T) {
 	if err != nil {
 		t.Fatalf("insertGrant carol: %v", err)
 	}
-	if err := s.updateGrant(gidCarol, "", &enable); err != nil {
+	if err := s.updateGrant(gidCarol, "", &enable, nil); err != nil {
 		t.Fatalf("updateGrant carol: %v", err)
 	}
 	if _, err := s.insertScope(gidCarol, peer, ct, 1); err != nil {
@@ -680,7 +680,7 @@ func TestFanout_DMSingleGrantor_RecipientReceives(t *testing.T) {
 		t.Fatalf("insertGrant: %v", err)
 	}
 	enable := 1
-	if err := s.updateGrant(gid, "", &enable); err != nil {
+	if err := s.updateGrant(gid, "", &enable, nil); err != nil {
 		t.Fatalf("updateGrant: %v", err)
 	}
 	if _, err := s.insertScope(gid, peer, ct, 1); err != nil {
@@ -736,7 +736,7 @@ func TestFanout_DMNonRecipient_NoLeak(t *testing.T) {
 		t.Fatalf("insertGrant carol: %v", err)
 	}
 	enable := 1
-	if err := s.updateGrant(gidCarol, "", &enable); err != nil {
+	if err := s.updateGrant(gidCarol, "", &enable, nil); err != nil {
 		t.Fatalf("updateGrant carol: %v", err)
 	}
 	if _, err := s.insertScope(gidCarol, peer, ct, 1); err != nil {
@@ -934,7 +934,7 @@ func TestFanout_DispatchReq_NoConflict_ChannelOrSubscribers(t *testing.T) {
 				s := newFakeOBOStore()
 				gid, _ := s.insertGrant(tGrantor, tBot, "auto")
 				enable := 1
-				_ = s.updateGrant(gid, "", &enable)
+				_ = s.updateGrant(gid, "", &enable, nil)
 				if _, err := s.insertScope(gid, peer, ct, 1); err != nil {
 					t.Fatalf("insertScope: %v", err)
 				}

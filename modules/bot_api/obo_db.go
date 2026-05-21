@@ -71,6 +71,7 @@ type oboGrantModel struct {
 	CreatedAt      time.Time  `db:"created_at" json:"created_at"`
 	UpdatedAt      time.Time  `db:"updated_at" json:"updated_at"`
 	RevokedAt      *time.Time `db:"revoked_at" json:"revoked_at,omitempty"`
+	PersonaPrompt  string     `db:"persona_prompt" json:"persona_prompt,omitempty"`
 }
 
 // oboScopeModel mirrors obo_scopes.
@@ -103,7 +104,9 @@ type oboScopeModel struct {
 type oboStore interface {
 	findActiveGrantByGrantorBot(grantorUID, granteeBotUID string) (*oboGrantModel, error)
 	scopeEnabled(grantID int64, channelID string, channelType uint8) (bool, error)
+	scopeRowExists(grantID int64, channelID string, channelType uint8) (bool, error)
 	findActiveGrantsForChannel(channelID string, channelType uint8) ([]*oboGrantModel, error)
+	findGlobalGrantsWithoutScope(channelID string, channelType uint8) ([]*oboGrantModel, error)
 
 	// CRUD used by the REST layer
 	insertGrant(grantorUID, granteeBotUID, mode string) (int64, error)
@@ -117,7 +120,7 @@ type oboStore interface {
 	// (PR#82 review #2 P1-1 — without this the (grantor, bot) pair would be
 	// permanently bricked after a single DELETE /v1/obo/grants/:id.)
 	findGrantByGrantorBot(grantorUID, granteeBotUID string) (*oboGrantModel, error)
-	updateGrant(id int64, mode string, globalEnabled *int) error
+	updateGrant(id int64, mode string, globalEnabled *int, personaPrompt *string) error
 	// reactivateGrant flips a soft-deleted row back to active=1 /
 	// global_enabled=0 / revoked_at=NULL. Used by oboCreateGrant when the
 	// duplicate-key conflict resolves to a row the caller already owns.
@@ -221,6 +224,25 @@ func (d *botAPIDB) scopeEnabled(grantID int64, channelID string, channelType uin
 	return count > 0, nil
 }
 
+// scopeRowExists checks if any scope row exists for this (grant, channel)
+// regardless of enabled state. Used to distinguish "no scope configured"
+// (implicit scope candidate) from "scope explicitly disabled" (admin
+// intentionally excluded this channel).
+func (d *botAPIDB) scopeRowExists(grantID int64, channelID string, channelType uint8) (bool, error) {
+	if grantID == 0 || channelID == "" {
+		return false, nil
+	}
+	var count int
+	err := d.session.SelectBySql(
+		"SELECT COUNT(*) FROM obo_scopes WHERE grant_id=? AND channel_id=? AND channel_type=?",
+		grantID, channelID, channelType,
+	).LoadOne(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 // findActiveGrantsForChannel — see oboStore. Single JOIN so the fan-out
 // hot path doesn't have to issue a per-grant scope lookup.
 //
@@ -252,6 +274,35 @@ func (d *botAPIDB) findActiveGrantsForChannel(channelID string, channelType uint
 		grants = []*oboGrantModel{}
 	}
 	d.writeChannelCache(channelID, channelType, len(grants) > 0)
+	return grants, nil
+}
+
+// findGlobalGrantsWithoutScope returns active grants with global_enabled=1
+// that do NOT have a scope row for the given channel. These are candidates
+// for the "implicit scope" path: if the grantor is a member of the channel,
+// the fan-out should trigger even without an explicit scope row.
+// This enables the "admin is in any group → persona clone auto-covers it"
+// UX without requiring manual scope management per channel.
+func (d *botAPIDB) findGlobalGrantsWithoutScope(channelID string, channelType uint8) ([]*oboGrantModel, error) {
+	if channelID == "" {
+		return []*oboGrantModel{}, nil
+	}
+	var grants []*oboGrantModel
+	_, err := d.session.SelectBySql(
+		"SELECT g.* FROM obo_grants g "+
+			"WHERE g.active=1 AND g.global_enabled=1 "+
+			"AND g.id NOT IN ("+
+			"  SELECT s.grant_id FROM obo_scopes s "+
+			"  WHERE s.grant_id=g.id AND s.channel_id=? AND s.channel_type=?"+
+			")",
+		channelID, channelType,
+	).Load(&grants)
+	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
+		return nil, err
+	}
+	if grants == nil {
+		grants = []*oboGrantModel{}
+	}
 	return grants, nil
 }
 
@@ -303,6 +354,7 @@ func (d *botAPIDB) listGrantsByGrantor(grantorUID string) ([]*oboGrantModel, err
 		"SELECT g.id, g.grantor_uid, g.grantee_bot_uid, "+
 			"COALESCE(u.name, g.grantee_bot_uid) AS grantee_bot_name, "+
 			"g.mode, g.global_enabled, g.active, "+
+			"COALESCE(g.persona_prompt, '') AS persona_prompt, "+
 			"g.created_at, g.updated_at, g.revoked_at "+
 			"FROM obo_grants g "+
 			"LEFT JOIN `user` u ON u.uid = g.grantee_bot_uid "+
@@ -339,7 +391,7 @@ func (d *botAPIDB) findGrantByID(id int64) (*oboGrantModel, error) {
 // channel-level negative cache holding "0" for up to oboCacheTTL (30s),
 // causing fan-out to drop messages on a freshly-enabled grant for the
 // remainder of the TTL window (PR#82 R3 non-blocking finding).
-func (d *botAPIDB) updateGrant(id int64, mode string, globalEnabled *int) error {
+func (d *botAPIDB) updateGrant(id int64, mode string, globalEnabled *int, personaPrompt *string) error {
 	updates := map[string]interface{}{}
 	if mode != "" {
 		updates["mode"] = mode
@@ -351,6 +403,9 @@ func (d *botAPIDB) updateGrant(id int64, mode string, globalEnabled *int) error 
 			v = 1
 		}
 		updates["global_enabled"] = v
+	}
+	if personaPrompt != nil {
+		updates["persona_prompt"] = *personaPrompt
 	}
 	if len(updates) == 0 {
 		return nil
