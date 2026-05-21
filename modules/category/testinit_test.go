@@ -18,7 +18,7 @@ import (
 	_ "github.com/Mininglamp-OSS/octo-server/modules/statistics"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/thread"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/user"
-	_ "github.com/Mininglamp-OSS/octo-server/modules/voice"
+	_ "github.com/Mininglamp-OSS/octo-server/modules/voice_adapter"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/webhook"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/workplace"
 )

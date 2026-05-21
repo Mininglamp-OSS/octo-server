@@ -27,7 +27,6 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
-	"github.com/Mininglamp-OSS/octo-server/modules/voice"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botutil"
 	pkgutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
 	"github.com/gin-gonic/gin"
@@ -49,9 +48,6 @@ type BotFather struct {
 	groupService     group.IService
 	userDB           *user.DB
 	threadService    thread.IService
-	voiceDB          *voice.VoiceDB
-	voiceSvc         *voice.VoiceService
-	voiceCfg         *voice.VoiceConfig
 	robotEventPrefix string
 	initOnce         sync.Once
 	msgSem           chan struct{} // 限制并发消息处理的信号量
@@ -60,7 +56,6 @@ type BotFather struct {
 
 // New 创建BotFather实例
 func New(ctx *config.Context) *BotFather {
-	voiceCfg := voice.NewVoiceConfigFromEnv()
 	bf := &BotFather{
 		ctx:              ctx,
 		db:               newBotfatherDB(ctx),
@@ -71,11 +66,8 @@ func New(ctx *config.Context) *BotFather {
 		groupService:     group.NewService(ctx),
 		userDB:           user.NewDB(ctx),
 		threadService:    thread.NewService(ctx),
-		voiceDB:          voice.NewVoiceDB(ctx),
-		voiceSvc:         voice.NewVoiceService(voiceCfg),
-		voiceCfg:         voiceCfg,
 		robotEventPrefix: "robotEvent:",
-		msgSem:           make(chan struct{}, 100), // 限制最多100个并发消息处理
+		msgSem:           make(chan struct{}, 100),
 		Log:              log.NewTLog("BotFather"),
 	}
 
