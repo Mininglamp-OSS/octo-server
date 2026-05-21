@@ -498,3 +498,137 @@ func makeRecBody(
 	handler(c)
 	return rec.Body.Bytes()
 }
+
+// ====================================================================
+// YUJ-1471 / PR#109 review-blocker regression tests
+// ====================================================================
+
+// TestOBO_V2_Reactivate_ClearsStalePersonaPrompt — when a revoked grant
+// is recreated with persona_prompt="" (or omitted), the previously-
+// stored prompt MUST be wiped. The old behavior silently inherited the
+// stale prompt, so a user who revoked a "be sarcastic" persona and then
+// recreated the same (grantor, bot) pair would still get the sarcasm
+// applied to fan-out. PR#109 review blocker #3.
+func TestOBO_V2_Reactivate_ClearsStalePersonaPrompt(t *testing.T) {
+	s := newFakeOBOStore()
+	ba := newBAforRESTV2(s)
+
+	// Step 1: create grant with a strong persona prompt.
+	staleSpeech := "You are sarcastic. Reply with biting wit."
+	c1, rec1 := makeCtx(t, tV2RESTOwner, http.MethodPost, "/v1/obo/grants",
+		oboCreateGrantReq{GranteeBotUID: tV2RESTBot1, PersonaPrompt: staleSpeech}, nil)
+	ba.oboCreateGrant(c1)
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("initial create: status=%d body=%s", rec1.Code, rec1.Body.String())
+	}
+	g, _ := s.findGrantByGrantorBot(tV2RESTOwner, tV2RESTBot1)
+	if g.PersonaPrompt != staleSpeech {
+		t.Fatalf("prompt not persisted, got %q", g.PersonaPrompt)
+	}
+
+	// Step 2: revoke the grant.
+	_ = s.revokeGrant(g.ID)
+
+	// Step 3: re-create the (grantor, bot) pair with NO persona prompt.
+	// The reactivation must wipe the stale prompt.
+	c2, rec2 := makeCtx(t, tV2RESTOwner, http.MethodPost, "/v1/obo/grants",
+		oboCreateGrantReq{GranteeBotUID: tV2RESTBot1}, nil)
+	ba.oboCreateGrant(c2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("reactivation: status=%d body=%s", rec2.Code, rec2.Body.String())
+	}
+	gAfter, _ := s.findGrantByGrantorBot(tV2RESTOwner, tV2RESTBot1)
+	if gAfter.PersonaPrompt != "" {
+		t.Fatalf("reactivation must clear stale persona_prompt, got %q", gAfter.PersonaPrompt)
+	}
+	if gAfter.ID != g.ID {
+		t.Fatalf("reactivation should reuse the same row, got id=%d want %d", gAfter.ID, g.ID)
+	}
+	if gAfter.Active != 1 {
+		t.Fatalf("reactivated row should be active=1, got %d", gAfter.Active)
+	}
+}
+
+// TestOBO_V2_Reactivate_OverwritesPersonaPromptWithNew — sibling case
+// of the clear test: a non-empty new prompt also overwrites the stale
+// value (always-overwrite invariant). Locks behavior in case anyone
+// later "fixes" the clear path with a "non-empty only" guard.
+func TestOBO_V2_Reactivate_OverwritesPersonaPromptWithNew(t *testing.T) {
+	s := newFakeOBOStore()
+	ba := newBAforRESTV2(s)
+
+	c1, _ := makeCtx(t, tV2RESTOwner, http.MethodPost, "/v1/obo/grants",
+		oboCreateGrantReq{GranteeBotUID: tV2RESTBot1, PersonaPrompt: "v1 prompt"}, nil)
+	ba.oboCreateGrant(c1)
+	g, _ := s.findGrantByGrantorBot(tV2RESTOwner, tV2RESTBot1)
+	_ = s.revokeGrant(g.ID)
+
+	c2, rec2 := makeCtx(t, tV2RESTOwner, http.MethodPost, "/v1/obo/grants",
+		oboCreateGrantReq{GranteeBotUID: tV2RESTBot1, PersonaPrompt: "v2 prompt"}, nil)
+	ba.oboCreateGrant(c2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("reactivation: status=%d body=%s", rec2.Code, rec2.Body.String())
+	}
+	gAfter, _ := s.findGrantByGrantorBot(tV2RESTOwner, tV2RESTBot1)
+	if gAfter.PersonaPrompt != "v2 prompt" {
+		t.Fatalf("reactivation must overwrite stale prompt with new value, got %q", gAfter.PersonaPrompt)
+	}
+}
+
+// TestOBO_V2_CreateGrant_RejectsOversizedPersonaPrompt — server-side
+// length cap. The persona_prompt is appended to every fan-out copy's
+// system hint; an unbounded value would balloon storage + LLM token
+// budgets. Reject with 400.
+func TestOBO_V2_CreateGrant_RejectsOversizedPersonaPrompt(t *testing.T) {
+	s := newFakeOBOStore()
+	ba := newBAforRESTV2(s)
+
+	huge := strings.Repeat("x", oboPersonaPromptMaxBytes+1)
+	c, rec := makeCtx(t, tV2RESTOwner, http.MethodPost, "/v1/obo/grants",
+		oboCreateGrantReq{GranteeBotUID: tV2RESTBot1, PersonaPrompt: huge}, nil)
+	ba.oboCreateGrant(c)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for oversized persona_prompt, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	// Confirm no row was written.
+	if g, _ := s.findGrantByGrantorBot(tV2RESTOwner, tV2RESTBot1); g != nil {
+		t.Fatalf("oversized create must not insert a row, got %+v", g)
+	}
+}
+
+// TestOBO_V2_CreateGrant_AcceptsMaxSizedPersonaPrompt — boundary check:
+// exactly the cap is allowed.
+func TestOBO_V2_CreateGrant_AcceptsMaxSizedPersonaPrompt(t *testing.T) {
+	s := newFakeOBOStore()
+	ba := newBAforRESTV2(s)
+
+	atCap := strings.Repeat("y", oboPersonaPromptMaxBytes)
+	c, rec := makeCtx(t, tV2RESTOwner, http.MethodPost, "/v1/obo/grants",
+		oboCreateGrantReq{GranteeBotUID: tV2RESTBot1, PersonaPrompt: atCap}, nil)
+	ba.oboCreateGrant(c)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for at-cap persona_prompt, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestOBO_V2_UpdateGrant_RejectsOversizedPersonaPrompt — mirror of the
+// create cap for the PUT path.
+func TestOBO_V2_UpdateGrant_RejectsOversizedPersonaPrompt(t *testing.T) {
+	s := newFakeOBOStore()
+	ba := newBAforRESTV2(s)
+
+	c1, _ := makeCtx(t, tV2RESTOwner, http.MethodPost, "/v1/obo/grants",
+		oboCreateGrantReq{GranteeBotUID: tV2RESTBot1}, nil)
+	ba.oboCreateGrant(c1)
+	g, _ := s.findGrantByGrantorBot(tV2RESTOwner, tV2RESTBot1)
+
+	huge := strings.Repeat("z", oboPersonaPromptMaxBytes+1)
+	c2, rec2 := makeCtx(t, tV2RESTOwner, http.MethodPut,
+		"/v1/obo/grants/"+strconv.FormatInt(g.ID, 10),
+		oboUpdateGrantReq{PersonaPrompt: &huge},
+		gin.Params{{Key: "id", Value: strconv.FormatInt(g.ID, 10)}})
+	ba.oboUpdateGrant(c2)
+	if rec2.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for oversized persona_prompt on PUT, got %d body=%s", rec2.Code, rec2.Body.String())
+	}
+}
