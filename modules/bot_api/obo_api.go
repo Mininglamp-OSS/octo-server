@@ -59,6 +59,11 @@ type oboCreateGrantReq struct {
 	// client can't quietly set "draft" and expect functionality. The field
 	// is kept on the wire for forward-compat with v1.
 	Mode string `json:"mode,omitempty"`
+	// PersonaPrompt — YUJ-1465 / Mininglamp-OSS/octo-server#108 (OBO v2).
+	// Optional free-form prompt the fan-out path appends to the synthetic
+	// `obo_system_hint` string. Empty / absent preserves legacy behavior
+	// (no prompt). Stored verbatim, including newlines and Unicode.
+	PersonaPrompt string `json:"persona_prompt,omitempty"`
 }
 
 type oboUpdateGrantReq struct {
@@ -67,6 +72,9 @@ type oboUpdateGrantReq struct {
 	// "field set to 0" are distinguishable on the wire. Per RFC §5.1
 	// PUT semantics: only provided fields are updated.
 	GlobalEnabled *int `json:"global_enabled,omitempty"`
+	// PersonaPrompt — YUJ-1465. Pointer so callers can distinguish
+	// "leave unchanged" (omit) from "clear the prompt" (empty string).
+	PersonaPrompt *string `json:"persona_prompt,omitempty"`
 }
 
 type oboCreateScopeReq struct {
@@ -150,7 +158,7 @@ func (ba *BotAPI) oboCreateGrant(c *wkhttp.Context) {
 		return
 	}
 
-	id, err := ba.oboStoreOrDefault().insertGrant(uid, req.GranteeBotUID, mode)
+	id, err := ba.oboStoreOrDefault().insertGrant(uid, req.GranteeBotUID, mode, req.PersonaPrompt)
 	if err != nil {
 		if isDuplicateKeyErr(err) {
 			// Reactivation path: a row already exists. If it's a soft-deleted
@@ -178,6 +186,24 @@ func (ba *BotAPI) oboCreateGrant(c *wkhttp.Context) {
 				c.ResponseError(errors.New("内部错误"))
 				return
 			}
+			// YUJ-1465 / Mininglamp-OSS/octo-server#108 — OBO v2 mutex.
+			// Reactivating a grant is semantically equivalent to creating
+			// it, so the same "only one active persona per grantor"
+			// invariant applies. Demote any other active personas the
+			// grantor previously held before this row was revoked.
+			if muErr := ba.oboStoreOrDefault().deactivateOtherActiveGrants(uid, existing.ID); muErr != nil {
+				ba.Error("deactivateOtherActiveGrants (reactivate) failed", zap.Error(muErr), zap.Int64("id", existing.ID))
+				// Non-fatal: the row is reactivated and the caller can
+				// always re-issue. Log and continue so the response is
+				// still a 200 with the freshly-activated row.
+			}
+			// Optional v2 persona_prompt update along with reactivation
+			// keeps the create-or-reactivate flow ergonomic: callers
+			// don't need an immediate PUT to set a new prompt on a
+			// previously-revoked grant.
+			if req.PersonaPrompt != "" {
+				_ = ba.oboStoreOrDefault().updateGrant(existing.ID, "", nil, &req.PersonaPrompt)
+			}
 			refreshed, _ := ba.oboStoreOrDefault().findGrantByID(existing.ID)
 			if refreshed != nil {
 				c.Response(refreshed)
@@ -189,6 +215,14 @@ func (ba *BotAPI) oboCreateGrant(c *wkhttp.Context) {
 		ba.Error("insertGrant failed", zap.Error(err))
 		c.ResponseError(errors.New("内部错误"))
 		return
+	}
+	// YUJ-1465 / Mininglamp-OSS/octo-server#108 — OBO v2 mutex.
+	// A freshly-created grant is born active=1; deactivate any other
+	// previously-active grant under the same grantor so the "one
+	// persona per user" invariant holds. Non-fatal on error: the new
+	// row is already on file and a follow-up POST would re-converge.
+	if muErr := ba.oboStoreOrDefault().deactivateOtherActiveGrants(uid, id); muErr != nil {
+		ba.Error("deactivateOtherActiveGrants (create) failed", zap.Error(muErr), zap.Int64("id", id))
 	}
 	grant, err := ba.oboStoreOrDefault().findGrantByID(id)
 	if err != nil || grant == nil {
@@ -288,12 +322,12 @@ func (ba *BotAPI) oboUpdateGrant(c *wkhttp.Context) {
 		c.ResponseError(errors.New("mode 仅支持 auto (v0)"))
 		return
 	}
-	if req.Mode == "" && req.GlobalEnabled == nil {
+	if req.Mode == "" && req.GlobalEnabled == nil && req.PersonaPrompt == nil {
 		// Idempotent no-op — return the existing row.
 		c.Response(grant)
 		return
 	}
-	if err := ba.oboStoreOrDefault().updateGrant(id, req.Mode, req.GlobalEnabled); err != nil {
+	if err := ba.oboStoreOrDefault().updateGrant(id, req.Mode, req.GlobalEnabled, req.PersonaPrompt); err != nil {
 		ba.Error("updateGrant failed", zap.Error(err), zap.Int64("id", id))
 		c.ResponseError(errors.New("内部错误"))
 		return

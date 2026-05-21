@@ -69,32 +69,38 @@ func TestFanout_ContentTypeAgnostic(t *testing.T) {
 		name    string
 		payload string
 	}{
-		{name: "text_type_1", payload: `{"type":1,"content":"hi"}`},
-		{name: "image_type_2", payload: `{"type":2,"url":"https://cdn/img.png","width":100,"height":100}`},
-		{name: "gif_type_3", payload: `{"type":3,"url":"https://cdn/a.gif","width":120,"height":80}`},
-		{name: "voice_type_4", payload: `{"type":4,"url":"https://cdn/v.amr","duration":3}`},
-		{name: "video_type_5", payload: `{"type":5,"url":"https://cdn/v.mp4","width":1280,"height":720,"duration":12}`},
-		{name: "location_type_6", payload: `{"type":6,"latitude":31.2304,"longitude":121.4737,"address":"Shanghai"}`},
-		{name: "card_type_7", payload: `{"type":7,"uid":"u_carol","name":"Carol"}`},
+		{name: "text_type_1", payload: `{"type":1,"content":"hi","mention":{"uids":["user_yu"]}}`},
+		{name: "image_type_2", payload: `{"type":2,"url":"https://cdn/img.png","width":100,"height":100,"mention":{"uids":["user_yu"]}}`},
+		{name: "gif_type_3", payload: `{"type":3,"url":"https://cdn/a.gif","width":120,"height":80,"mention":{"uids":["user_yu"]}}`},
+		{name: "voice_type_4", payload: `{"type":4,"url":"https://cdn/v.amr","duration":3,"mention":{"uids":["user_yu"]}}`},
+		{name: "video_type_5", payload: `{"type":5,"url":"https://cdn/v.mp4","width":1280,"height":720,"duration":12,"mention":{"uids":["user_yu"]}}`},
+		{name: "location_type_6", payload: `{"type":6,"latitude":31.2304,"longitude":121.4737,"address":"Shanghai","mention":{"uids":["user_yu"]}}`},
+		{name: "card_type_7", payload: `{"type":7,"uid":"u_carol","name":"Carol","mention":{"uids":["user_yu"]}}`},
 		// YUJ-1356 / octo-server#96 — octo-lib common.File.
-		{name: "file_type_8", payload: `{"type":8,"url":"https://cdn/report.pdf","name":"report.pdf","size":12345}`},
+		{name: "file_type_8", payload: `{"type":8,"url":"https://cdn/report.pdf","name":"report.pdf","size":12345,"mention":{"uids":["user_yu"]}}`},
 		// YUJ-1356 — the literal "type=9" value the E2E report flagged.
 		// Some client codepaths emit 9 for file instead of 8; either way
 		// fan-out MUST fire because the listener does not consult `type`.
-		{name: "file_type_9_e2e_report_value", payload: `{"type":9,"url":"https://cdn/q3-report.pdf","name":"q3-report.pdf","size":67890}`},
-		{name: "multipleforward_type_11", payload: `{"type":11,"messages":[{"type":1,"content":"a"},{"type":1,"content":"b"}]}`},
-		{name: "vector_sticker_type_12", payload: `{"type":12,"url":"https://cdn/sticker.json"}`},
-		{name: "emoji_sticker_type_13", payload: `{"type":13,"url":"https://cdn/emoji.png"}`},
-		{name: "rich_text_type_14", payload: `{"type":14,"content":[{"type":"text","text":"hello"}]}`},
+		{name: "file_type_9_e2e_report_value", payload: `{"type":9,"url":"https://cdn/q3-report.pdf","name":"q3-report.pdf","size":67890,"mention":{"uids":["user_yu"]}}`},
+		{name: "multipleforward_type_11", payload: `{"type":11,"messages":[{"type":1,"content":"a"},{"type":1,"content":"b"}],"mention":{"uids":["user_yu"]}}`},
+		{name: "vector_sticker_type_12", payload: `{"type":12,"url":"https://cdn/sticker.json","mention":{"uids":["user_yu"]}}`},
+		{name: "emoji_sticker_type_13", payload: `{"type":13,"url":"https://cdn/emoji.png","mention":{"uids":["user_yu"]}}`},
+		{name: "rich_text_type_14", payload: `{"type":14,"content":[{"type":"text","text":"hello"}],"mention":{"uids":["user_yu"]}}`},
 		// Defensive: an inbound message with no `type` field at all
 		// must STILL fan out — the fan-out listener has no business
 		// rejecting payloads that fail the bot-side payload validator;
 		// that's a sendMessage-ingress concern, not a relay concern.
-		{name: "no_type_field", payload: `{"content":"some content"}`},
-		// Defensive: non-JSON payload (e.g. a raw signal-encrypted blob
-		// in some future code path). buildFanoutCopyReq falls back to a
-		// `{"raw":..., "type":0}` envelope; fan-out must still dispatch.
-		{name: "non_json_payload", payload: `binary-blob-not-json`},
+		{name: "no_type_field", payload: `{"content":"some content","mention":{"uids":["user_yu"]}}`},
+		// YUJ-1465 / Mininglamp-OSS/octo-server#108 — note on the v2
+		// narrowing: the historical "non_json_payload" sub-case
+		// (binary-blob-not-json) is no longer exercised here. Under v2
+		// the fan-out trigger requires `payload.mention.uids` to contain
+		// the grantor uid; a non-JSON payload cannot carry that field,
+		// so it cannot summon the persona. The buildFanoutCopyReq
+		// fallback `{raw, type:0}` envelope is still preserved for
+		// future code paths that hand the builder pre-validated traffic
+		// without going through the listener; this matrix only covers
+		// the LISTENER trigger contract.
 	}
 
 	for _, tc := range cases {
@@ -156,13 +162,13 @@ func TestFanout_OBOMessagesListen_BatchAllContentTypes(t *testing.T) {
 
 	// Heterogeneous batch: every payload type the issue/E2E mentioned.
 	batch := []*config.MessageResp{
-		{FromUID: "alice", ChannelID: ch, ChannelType: ct, Payload: []byte(`{"type":1,"content":"hi"}`)},
-		{FromUID: "alice", ChannelID: ch, ChannelType: ct, Payload: []byte(`{"type":2,"url":"https://cdn/i.png"}`)},
-		{FromUID: "alice", ChannelID: ch, ChannelType: ct, Payload: []byte(`{"type":3,"url":"https://cdn/a.gif"}`)},
-		{FromUID: "alice", ChannelID: ch, ChannelType: ct, Payload: []byte(`{"type":4,"url":"https://cdn/v.amr","duration":2}`)},
-		{FromUID: "alice", ChannelID: ch, ChannelType: ct, Payload: []byte(`{"type":5,"url":"https://cdn/v.mp4","duration":10}`)},
-		{FromUID: "alice", ChannelID: ch, ChannelType: ct, Payload: []byte(`{"type":8,"url":"https://cdn/r.pdf","name":"r.pdf","size":1024}`)},
-		{FromUID: "alice", ChannelID: ch, ChannelType: ct, Payload: []byte(`{"type":9,"url":"https://cdn/f9","name":"file9.bin","size":2048}`)},
+		{FromUID: "alice", ChannelID: ch, ChannelType: ct, Payload: []byte(`{"type":1,"content":"hi","mention":{"uids":["user_yu"]}}`)},
+		{FromUID: "alice", ChannelID: ch, ChannelType: ct, Payload: []byte(`{"type":2,"url":"https://cdn/i.png","mention":{"uids":["user_yu"]}}`)},
+		{FromUID: "alice", ChannelID: ch, ChannelType: ct, Payload: []byte(`{"type":3,"url":"https://cdn/a.gif","mention":{"uids":["user_yu"]}}`)},
+		{FromUID: "alice", ChannelID: ch, ChannelType: ct, Payload: []byte(`{"type":4,"url":"https://cdn/v.amr","duration":2,"mention":{"uids":["user_yu"]}}`)},
+		{FromUID: "alice", ChannelID: ch, ChannelType: ct, Payload: []byte(`{"type":5,"url":"https://cdn/v.mp4","duration":10,"mention":{"uids":["user_yu"]}}`)},
+		{FromUID: "alice", ChannelID: ch, ChannelType: ct, Payload: []byte(`{"type":8,"url":"https://cdn/r.pdf","name":"r.pdf","size":1024,"mention":{"uids":["user_yu"]}}`)},
+		{FromUID: "alice", ChannelID: ch, ChannelType: ct, Payload: []byte(`{"type":9,"url":"https://cdn/f9","name":"file9.bin","size":2048,"mention":{"uids":["user_yu"]}}`)},
 	}
 
 	ba.oboMessagesListen(batch)

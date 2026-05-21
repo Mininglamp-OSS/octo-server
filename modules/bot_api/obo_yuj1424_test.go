@@ -67,7 +67,7 @@ func TestFanout_EnqueuesBotEvent(t *testing.T) {
 		FromUID:     "alice",
 		ChannelID:   ch,
 		ChannelType: ct,
-		Payload:     []byte(`{"type":1,"content":"hello"}`),
+		Payload:     []byte(`{"type":1,"content":"hello","mention":{"uids":["user_yu"]}}`),
 	}
 	if n := ba.fanoutForMessage(msg); n != 1 {
 		t.Fatalf("expected 1 dispatched, got %d", n)
@@ -124,7 +124,7 @@ func TestFanout_NoEnqueueOnDispatchFailure(t *testing.T) {
 		FromUID:     "alice",
 		ChannelID:   ch,
 		ChannelType: ct,
-		Payload:     []byte(`{"type":1,"content":"hello"}`),
+		Payload:     []byte(`{"type":1,"content":"hello","mention":{"uids":["user_yu"]}}`),
 	}
 	if n := ba.fanoutForMessage(msg); n != 0 {
 		t.Fatalf("expected 0 dispatched on failure, got %d", n)
@@ -152,7 +152,7 @@ func TestFanout_EnqueueFailureDoesNotRollbackDispatch(t *testing.T) {
 		FromUID:     "alice",
 		ChannelID:   ch,
 		ChannelType: ct,
-		Payload:     []byte(`{"type":1,"content":"hello"}`),
+		Payload:     []byte(`{"type":1,"content":"hello","mention":{"uids":["user_yu"]}}`),
 	}
 	if n := ba.fanoutForMessage(msg); n != 1 {
 		t.Fatalf("dispatch should still count on enqueue failure, got %d (want 1)", n)
@@ -168,7 +168,7 @@ func TestFanout_EnqueueFailureDoesNotRollbackDispatch(t *testing.T) {
 // route-level test surface needs a full BotAPI wiring.
 func TestOBOUpdate_RejectsRevokedGrant(t *testing.T) {
 	s := newFakeOBOStore()
-	gid, err := s.insertGrant(tGrantor, tBot, "auto")
+	gid, err := s.insertGrant(tGrantor, tBot, "auto", "")
 	if err != nil {
 		t.Fatalf("insertGrant: %v", err)
 	}

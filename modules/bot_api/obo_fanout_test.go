@@ -46,12 +46,12 @@ func (fc *fanoutCapture) hook(req *config.MsgSendReq) error {
 func seedGrantWithScope(t *testing.T, ch string, ct uint8) *fakeOBOStore {
 	t.Helper()
 	s := newFakeOBOStore()
-	gid, err := s.insertGrant(tGrantor, tBot, "auto")
+	gid, err := s.insertGrant(tGrantor, tBot, "auto", "")
 	if err != nil {
 		t.Fatalf("insertGrant: %v", err)
 	}
 	enable := 1
-	if err := s.updateGrant(gid, "", &enable); err != nil {
+	if err := s.updateGrant(gid, "", &enable, nil); err != nil {
 		t.Fatalf("updateGrant: %v", err)
 	}
 	if _, err := s.insertScope(gid, ch, ct, 1); err != nil {
@@ -89,7 +89,7 @@ func TestFanout_Happy(t *testing.T) {
 		FromUID:     "alice", // some random sender, NOT bot, NOT grantor
 		ChannelID:   ch,
 		ChannelType: ct,
-		Payload:     []byte(`{"type":1,"content":"hello yu"}`),
+		Payload:     []byte(`{"type":1,"content":"hello yu","mention":{"uids":["user_yu"]}}`),
 	}
 	got := ba.fanoutForMessage(msg)
 	if got != 1 {
@@ -225,7 +225,7 @@ func TestFanout_Gate3_LegacyMarkerIgnored(t *testing.T) {
 		FromUID:     "alice",
 		ChannelID:   ch,
 		ChannelType: ct,
-		Payload:     []byte(`{"type":1,"content":"forged","obo_processed":true}`),
+		Payload:     []byte(`{"type":1,"content":"forged","obo_processed":true,"mention":{"uids":["user_yu"]}}`),
 	}
 	if n := ba.fanoutForMessage(msg); n != 1 {
 		t.Fatalf("legacy obo_processed marker must NOT short-circuit gate 3, want fan-out=1 got %d", n)
@@ -347,7 +347,7 @@ func TestFanout_GrantorMembershipRevoked_SkipsCopy(t *testing.T) {
 		FromUID:     "alice",
 		ChannelID:   ch,
 		ChannelType: ct,
-		Payload:     []byte(`{"type":1,"content":"hello yu"}`),
+		Payload:     []byte(`{"type":1,"content":"hello yu","mention":{"uids":["user_yu"]}}`),
 	}
 	if n := ba.fanoutForMessage(msg); n != 0 {
 		t.Fatalf("grantor lost access, expected 0 fan-out copies, got %d", n)
@@ -387,7 +387,7 @@ func TestFanout_GrantorMembershipRevoked_DBErrorSkipsCopy(t *testing.T) {
 		FromUID:     "alice",
 		ChannelID:   ch,
 		ChannelType: ct,
-		Payload:     []byte(`{"type":1,"content":"hello yu"}`),
+		Payload:     []byte(`{"type":1,"content":"hello yu","mention":{"uids":["user_yu"]}}`),
 	}
 	if n := ba.fanoutForMessage(msg); n != 0 {
 		t.Fatalf("DB error on access re-check must fail closed, got %d", n)
@@ -412,12 +412,12 @@ func TestFanout_DMPeerToGrantor_MatchesScope(t *testing.T) {
 	const peer = "bob"
 	ct := common.ChannelTypePerson.Uint8()
 	s := newFakeOBOStore()
-	gid, err := s.insertGrant(tGrantor, tBot, "auto")
+	gid, err := s.insertGrant(tGrantor, tBot, "auto", "")
 	if err != nil {
 		t.Fatalf("insertGrant: %v", err)
 	}
 	enable := 1
-	if err := s.updateGrant(gid, "", &enable); err != nil {
+	if err := s.updateGrant(gid, "", &enable, nil); err != nil {
 		t.Fatalf("updateGrant: %v", err)
 	}
 	// Scope row uses the grantor's perspective: channel_id = peer uid.
@@ -492,9 +492,9 @@ func TestFanout_DMGrantorToPeer_DoesNotEcho(t *testing.T) {
 	const peer = "bob"
 	ct := common.ChannelTypePerson.Uint8()
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(tGrantor, tBot, "auto")
+	gid, _ := s.insertGrant(tGrantor, tBot, "auto", "")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable)
+	_ = s.updateGrant(gid, "", &enable, nil)
 	if _, err := s.insertScope(gid, peer, ct, 1); err != nil {
 		t.Fatalf("insertScope: %v", err)
 	}
@@ -530,9 +530,9 @@ func TestFanout_DMUnrelatedPeer_NoMatch(t *testing.T) {
 	const scopedPeer, otherPeer = "bob", "eve"
 	ct := common.ChannelTypePerson.Uint8()
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(tGrantor, tBot, "auto")
+	gid, _ := s.insertGrant(tGrantor, tBot, "auto", "")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable)
+	_ = s.updateGrant(gid, "", &enable, nil)
 	if _, err := s.insertScope(gid, scopedPeer, ct, 1); err != nil {
 		t.Fatalf("insertScope: %v", err)
 	}
@@ -547,7 +547,7 @@ func TestFanout_DMUnrelatedPeer_NoMatch(t *testing.T) {
 		FromUID:     otherPeer,
 		ChannelID:   tGrantor,
 		ChannelType: ct,
-		Payload:     []byte(`{"type":1,"content":"hi yu"}`),
+		Payload:     []byte(`{"type":1,"content":"hi yu","mention":{"uids":["user_yu"]}}`),
 	}
 	if n := ba.fanoutForMessage(msg); n != 0 {
 		t.Fatalf("unscoped DM peer must not fan out, got %d", n)
@@ -582,12 +582,12 @@ func TestFanout_DMMultiGrantor_OnlyRecipientReceives(t *testing.T) {
 
 	s := newFakeOBOStore()
 	// Alice's grant + scope (peer=Bob).
-	gidAlice, err := s.insertGrant(aliceUID, aliceBot, "auto")
+	gidAlice, err := s.insertGrant(aliceUID, aliceBot, "auto", "")
 	if err != nil {
 		t.Fatalf("insertGrant alice: %v", err)
 	}
 	enable := 1
-	if err := s.updateGrant(gidAlice, "", &enable); err != nil {
+	if err := s.updateGrant(gidAlice, "", &enable, nil); err != nil {
 		t.Fatalf("updateGrant alice: %v", err)
 	}
 	if _, err := s.insertScope(gidAlice, peer, ct, 1); err != nil {
@@ -596,11 +596,11 @@ func TestFanout_DMMultiGrantor_OnlyRecipientReceives(t *testing.T) {
 	// Carol's grant + scope (peer=Bob) — the exploit setup. Carol and
 	// Bob are friends so the per-grant access check WOULD permit this
 	// grant absent the recipient filter.
-	gidCarol, err := s.insertGrant(carolUID, carolBot, "auto")
+	gidCarol, err := s.insertGrant(carolUID, carolBot, "auto", "")
 	if err != nil {
 		t.Fatalf("insertGrant carol: %v", err)
 	}
-	if err := s.updateGrant(gidCarol, "", &enable); err != nil {
+	if err := s.updateGrant(gidCarol, "", &enable, nil); err != nil {
 		t.Fatalf("updateGrant carol: %v", err)
 	}
 	if _, err := s.insertScope(gidCarol, peer, ct, 1); err != nil {
@@ -675,12 +675,12 @@ func TestFanout_DMSingleGrantor_RecipientReceives(t *testing.T) {
 	const peer = "bob"
 	ct := common.ChannelTypePerson.Uint8()
 	s := newFakeOBOStore()
-	gid, err := s.insertGrant(tGrantor, tBot, "auto")
+	gid, err := s.insertGrant(tGrantor, tBot, "auto", "")
 	if err != nil {
 		t.Fatalf("insertGrant: %v", err)
 	}
 	enable := 1
-	if err := s.updateGrant(gid, "", &enable); err != nil {
+	if err := s.updateGrant(gid, "", &enable, nil); err != nil {
 		t.Fatalf("updateGrant: %v", err)
 	}
 	if _, err := s.insertScope(gid, peer, ct, 1); err != nil {
@@ -696,7 +696,7 @@ func TestFanout_DMSingleGrantor_RecipientReceives(t *testing.T) {
 		FromUID:     peer,
 		ChannelID:   tGrantor,
 		ChannelType: ct,
-		Payload:     []byte(`{"type":1,"content":"hello yu"}`),
+		Payload:     []byte(`{"type":1,"content":"hello yu","mention":{"uids":["user_yu"]}}`),
 	}
 	if n := ba.fanoutForMessage(msg); n != 1 {
 		t.Fatalf("single-grantor DM happy path: expected 1 fan-out, got %d", n)
@@ -731,12 +731,12 @@ func TestFanout_DMNonRecipient_NoLeak(t *testing.T) {
 	ct := common.ChannelTypePerson.Uint8()
 
 	s := newFakeOBOStore()
-	gidCarol, err := s.insertGrant(carolUID, carolBot, "auto")
+	gidCarol, err := s.insertGrant(carolUID, carolBot, "auto", "")
 	if err != nil {
 		t.Fatalf("insertGrant carol: %v", err)
 	}
 	enable := 1
-	if err := s.updateGrant(gidCarol, "", &enable); err != nil {
+	if err := s.updateGrant(gidCarol, "", &enable, nil); err != nil {
 		t.Fatalf("updateGrant carol: %v", err)
 	}
 	if _, err := s.insertScope(gidCarol, peer, ct, 1); err != nil {
@@ -828,7 +828,7 @@ func TestFanout_OriginalSenderHasNoConversationLeak(t *testing.T) {
 				FromUID:     tc.fromUID,
 				ChannelID:   tc.channelID,
 				ChannelType: tc.ct,
-				Payload:     []byte(`{"type":1,"content":"private to admin"}`),
+				Payload:     []byte(`{"type":1,"content":"private to admin","mention":{"uids":["user_yu"]}}`),
 			}
 			if n := ba.fanoutForMessage(msg); n != 1 {
 				t.Fatalf("expected 1 dispatch, got %d", n)
@@ -921,7 +921,7 @@ func TestFanout_DispatchReq_NoConflict_ChannelOrSubscribers(t *testing.T) {
 					FromUID:     "alice",
 					ChannelID:   scope,
 					ChannelType: common.ChannelTypeGroup.Uint8(),
-					Payload:     []byte(`{"type":1,"content":"hi group"}`),
+					Payload:     []byte(`{"type":1,"content":"hi group","mention":{"uids":["user_yu"]}}`),
 				}
 			},
 		},
@@ -932,9 +932,9 @@ func TestFanout_DispatchReq_NoConflict_ChannelOrSubscribers(t *testing.T) {
 				const peer = "bob"
 				ct := common.ChannelTypePerson.Uint8()
 				s := newFakeOBOStore()
-				gid, _ := s.insertGrant(tGrantor, tBot, "auto")
+				gid, _ := s.insertGrant(tGrantor, tBot, "auto", "")
 				enable := 1
-				_ = s.updateGrant(gid, "", &enable)
+				_ = s.updateGrant(gid, "", &enable, nil)
 				if _, err := s.insertScope(gid, peer, ct, 1); err != nil {
 					t.Fatalf("insertScope: %v", err)
 				}
@@ -961,7 +961,7 @@ func TestFanout_DispatchReq_NoConflict_ChannelOrSubscribers(t *testing.T) {
 					FromUID:     "alice",
 					ChannelID:   scope,
 					ChannelType: common.ChannelTypeCommunityTopic.Uint8(),
-					Payload:     []byte(`{"type":1,"content":"hi topic"}`),
+					Payload:     []byte(`{"type":1,"content":"hi topic","mention":{"uids":["user_yu"]}}`),
 				}
 			},
 		},
@@ -1015,7 +1015,7 @@ func TestFanout_DispatchReq_BotReceivesViaOwnChannel(t *testing.T) {
 		ChannelID:    ch,
 		ChannelType:  ct,
 		MessageIDStr: "origin_msg_42",
-		Payload:      []byte(`{"type":1,"content":"hi yu"}`),
+		Payload:      []byte(`{"type":1,"content":"hi yu","mention":{"uids":["user_yu"]}}`),
 	}
 	if n := ba.fanoutForMessage(msg); n != 1 {
 		t.Fatalf("expected 1 dispatch, got %d", n)
@@ -1131,7 +1131,7 @@ func TestFanout_DispatchReq_RealDispatcher_ContractCheck(t *testing.T) {
 		FromUID:     "u_bob",
 		ChannelID:   ch,
 		ChannelType: ct,
-		Payload:     []byte(`{"type":1,"content":"hi yu"}`),
+		Payload:     []byte(`{"type":1,"content":"hi yu","mention":{"uids":["user_yu"]}}`),
 	}
 	if n := ba.fanoutForMessage(msg); n != 1 {
 		t.Fatalf("fan-out should succeed against contract-respecting WuKongIM, got %d (rejections=%v)", n, rejected)

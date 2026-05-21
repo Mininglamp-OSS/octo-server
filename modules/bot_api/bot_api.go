@@ -81,6 +81,28 @@ type BotAPI struct {
 	// (uid, channel_id, channel_type) without touching MySQL.
 	// nil in production → the real DB-backed check runs.
 	oboChannelAccessOverride func(uid, channelID string, channelType uint8) (bool, error)
+	// oboDisplayNameLookup — YUJ-1465 / Mininglamp-OSS/octo-server#108
+	// (OBO v2). Test seam for resolving a uid → display name when the
+	// fan-out path builds the synthetic `obo_system_hint` string. Returns
+	// "" for unknown uids so the hint falls back to the bare uid. Empty
+	// override → the production path queries the `user` table.
+	oboDisplayNameLookup func(uid string) string
+	// oboGroupNameLookup — YUJ-1465 / Mininglamp-OSS/octo-server#108
+	// (OBO v2). Test seam for resolving a (group_no | thread channel id)
+	// to a human group name. The fan-out path only consults this for
+	// group / community-topic origin channels; DMs use the peer name
+	// instead. Returns "" for unknown channels so the hint falls back
+	// to the bare channel id. Empty override → the production path
+	// queries the `group` table (with parent-group resolution for
+	// community topics).
+	oboGroupNameLookup func(channelID string, channelType uint8) string
+	// typingCMDDispatch — YUJ-1465 / Mininglamp-OSS/octo-server#108.
+	// Test seam for the typing handler's ctx.SendCMD call. Lets unit
+	// tests capture the dispatched CMD (including the resolved
+	// `from_uid`) without standing up a live WuKongIM. Production
+	// path (nil override) goes through ba.ctx.SendCMD verbatim, so
+	// behaviour outside of tests is unchanged.
+	typingCMDDispatch func(req config.MsgCMDReq) error
 	// friendCheckOverride lets unit tests stub userService.IsFriend for the
 	// friend-gate decision in checkSendPermission / syncMessages, and for
 	// the OBO friend-gate bypass (see obo_friend_gate.go). Production path

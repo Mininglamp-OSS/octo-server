@@ -131,7 +131,7 @@ func TestOBO_CreateGrant_BadMode(t *testing.T) {
 func TestOBO_CreateGrant_Duplicate(t *testing.T) {
 	s := newFakeOBOStore()
 	s.seedBot(tRESTBot, tRESTOwner)
-	_, _ = s.insertGrant(tRESTOwner, tRESTBot, "auto")
+	_, _ = s.insertGrant(tRESTOwner, tRESTBot, "auto", "")
 	ba := newBAforREST(s)
 
 	c, rec := makeCtx(t, tRESTOwner, http.MethodPost, "/v1/obo/grants",
@@ -144,9 +144,9 @@ func TestOBO_CreateGrant_Duplicate(t *testing.T) {
 
 func TestOBO_ListGrants_Happy(t *testing.T) {
 	s := newFakeOBOStore()
-	_, _ = s.insertGrant(tRESTOwner, tRESTBot, "auto")
-	_, _ = s.insertGrant(tRESTOwner, "bot_other", "auto")
-	_, _ = s.insertGrant(tRESTOther, "alice_bot", "auto")
+	_, _ = s.insertGrant(tRESTOwner, tRESTBot, "auto", "")
+	_, _ = s.insertGrant(tRESTOwner, "bot_other", "auto", "")
+	_, _ = s.insertGrant(tRESTOther, "alice_bot", "auto", "")
 	ba := newBAforREST(s)
 
 	c, rec := makeCtx(t, tRESTOwner, http.MethodGet, "/v1/obo/grants", nil, nil)
@@ -167,7 +167,7 @@ func TestOBO_ListGrants_Happy(t *testing.T) {
 
 func TestOBO_UpdateGrant_Toggle(t *testing.T) {
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(tRESTOwner, tRESTBot, "auto")
+	gid, _ := s.insertGrant(tRESTOwner, tRESTBot, "auto", "")
 	ba := newBAforREST(s)
 
 	enable := 1
@@ -187,7 +187,7 @@ func TestOBO_UpdateGrant_Toggle(t *testing.T) {
 
 func TestOBO_UpdateGrant_Cross_user_404(t *testing.T) {
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(tRESTOther, "alice_bot", "auto")
+	gid, _ := s.insertGrant(tRESTOther, "alice_bot", "auto", "")
 	ba := newBAforREST(s)
 
 	enable := 1
@@ -208,7 +208,7 @@ func TestOBO_UpdateGrant_Cross_user_404(t *testing.T) {
 
 func TestOBO_DeleteGrant_Happy(t *testing.T) {
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(tRESTOwner, tRESTBot, "auto")
+	gid, _ := s.insertGrant(tRESTOwner, tRESTBot, "auto", "")
 	ba := newBAforREST(s)
 
 	c, rec := makeCtx(t, tRESTOwner, http.MethodDelete,
@@ -228,7 +228,7 @@ func TestOBO_DeleteGrant_Happy(t *testing.T) {
 
 func TestOBO_CreateScope_Happy(t *testing.T) {
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(tRESTOwner, tRESTBot, "auto")
+	gid, _ := s.insertGrant(tRESTOwner, tRESTBot, "auto", "")
 	ba := newBAforREST(s)
 
 	c, rec := makeCtx(t, tRESTOwner, http.MethodPost, "/v1/obo/scopes",
@@ -249,7 +249,7 @@ func TestOBO_CreateScope_Happy(t *testing.T) {
 
 func TestOBO_CreateScope_CrossUser404(t *testing.T) {
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(tRESTOther, "alice_bot", "auto")
+	gid, _ := s.insertGrant(tRESTOther, "alice_bot", "auto", "")
 	ba := newBAforREST(s)
 
 	c, rec := makeCtx(t, tRESTOwner, http.MethodPost, "/v1/obo/scopes",
@@ -266,7 +266,7 @@ func TestOBO_CreateScope_CrossUser404(t *testing.T) {
 
 func TestOBO_ListScopes_Happy(t *testing.T) {
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(tRESTOwner, tRESTBot, "auto")
+	gid, _ := s.insertGrant(tRESTOwner, tRESTBot, "auto", "")
 	_, _ = s.insertScope(gid, "ch_a", 1, 1)
 	_, _ = s.insertScope(gid, "ch_b", 2, 1)
 	ba := newBAforREST(s)
@@ -289,7 +289,7 @@ func TestOBO_ListScopes_Happy(t *testing.T) {
 
 func TestOBO_DeleteScope_Happy(t *testing.T) {
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(tRESTOwner, tRESTBot, "auto")
+	gid, _ := s.insertGrant(tRESTOwner, tRESTBot, "auto", "")
 	sid, _ := s.insertScope(gid, tRESTChannel, common.ChannelTypeGroup.Uint8(), 1)
 	ba := newBAforREST(s)
 
@@ -308,7 +308,7 @@ func TestOBO_DeleteScope_Happy(t *testing.T) {
 
 func TestOBO_DeleteScope_CrossUser404(t *testing.T) {
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(tRESTOther, "alice_bot", "auto")
+	gid, _ := s.insertGrant(tRESTOther, "alice_bot", "auto", "")
 	sid, _ := s.insertScope(gid, tRESTChannel, common.ChannelTypeGroup.Uint8(), 1)
 	ba := newBAforREST(s)
 
@@ -396,7 +396,7 @@ func TestOBO_CreateGrant_Reactivates_SoftDeletedRow(t *testing.T) {
 	}
 	originalID := rows[0].ID
 	enable := 1
-	_ = s.updateGrant(originalID, "", &enable)
+	_ = s.updateGrant(originalID, "", &enable, nil)
 
 	// Step 2: soft-delete the grant.
 	_ = s.revokeGrant(originalID)
@@ -431,7 +431,7 @@ func TestOBO_CreateGrant_Reactivates_SoftDeletedRow(t *testing.T) {
 func TestOBO_CreateGrant_LiveDuplicate_Still409(t *testing.T) {
 	s := newFakeOBOStore()
 	s.seedBot(tRESTBot, tRESTOwner)
-	_, _ = s.insertGrant(tRESTOwner, tRESTBot, "auto") // active=1 by default
+	_, _ = s.insertGrant(tRESTOwner, tRESTBot, "auto", "") // active=1 by default
 	ba := newBAforREST(s)
 
 	c, rec := makeCtx(t, tRESTOwner, http.MethodPost, "/v1/obo/grants",
@@ -450,7 +450,7 @@ func TestOBO_CreateGrant_LiveDuplicate_Still409(t *testing.T) {
 // exfiltrate every inbound message to their bot via the fan-out listener.
 func TestOBO_CreateScope_NoChannelAccess_404(t *testing.T) {
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(tRESTOwner, tRESTBot, "auto")
+	gid, _ := s.insertGrant(tRESTOwner, tRESTBot, "auto", "")
 	ba := newBAforREST(s)
 	// Override the default permissive hook to deny access for this test.
 	ba.oboChannelAccessOverride = func(uid, channelID string, channelType uint8) (bool, error) {
@@ -482,7 +482,7 @@ func TestOBO_CreateScope_NoChannelAccess_404(t *testing.T) {
 // returns a synthetic error.
 func TestOBO_CreateScope_ChannelAccessErr_500(t *testing.T) {
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(tRESTOwner, tRESTBot, "auto")
+	gid, _ := s.insertGrant(tRESTOwner, tRESTBot, "auto", "")
 	ba := newBAforREST(s)
 	boom := errors.New("connection refused")
 	ba.oboChannelAccessOverride = func(uid, channelID string, channelType uint8) (bool, error) {
@@ -512,7 +512,7 @@ func TestOBO_CreateScope_ChannelAccessErr_500(t *testing.T) {
 // scan. Verify owner-match → 200 and row removed.
 func TestOBO_DeleteScope_FindScopeOwner_OK(t *testing.T) {
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(tRESTOwner, tRESTBot, "auto")
+	gid, _ := s.insertGrant(tRESTOwner, tRESTBot, "auto", "")
 	sid, _ := s.insertScope(gid, tRESTChannel, common.ChannelTypeGroup.Uint8(), 1)
 	ba := newBAforREST(s)
 
@@ -534,7 +534,7 @@ func TestOBO_DeleteScope_FindScopeOwner_OK(t *testing.T) {
 // without removing the row.
 func TestOBO_DeleteScope_FindScopeOwner_LookupErr(t *testing.T) {
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(tRESTOwner, tRESTBot, "auto")
+	gid, _ := s.insertGrant(tRESTOwner, tRESTBot, "auto", "")
 	sid, _ := s.insertScope(gid, tRESTChannel, common.ChannelTypeGroup.Uint8(), 1)
 	s.failFindScopeOwner = errors.New("connection refused")
 	ba := newBAforREST(s)
@@ -569,11 +569,11 @@ func TestOBO_ListGrants_PopulatesGranteeBotName(t *testing.T) {
 	//   2. bot with no name seeded → fallback to uid (COALESCE path)
 	s.seedBot(tRESTBot, tRESTOwner)
 	s.seedBotName(tRESTBot, "james")
-	_, _ = s.insertGrant(tRESTOwner, tRESTBot, "auto")
+	_, _ = s.insertGrant(tRESTOwner, tRESTBot, "auto", "")
 
 	const unnamedBot = "bot_no_user_row"
 	s.seedBot(unnamedBot, tRESTOwner)
-	_, _ = s.insertGrant(tRESTOwner, unnamedBot, "auto")
+	_, _ = s.insertGrant(tRESTOwner, unnamedBot, "auto", "")
 
 	ba := newBAforREST(s)
 	c, rec := makeCtx(t, tRESTOwner, http.MethodGet, "/v1/obo/grants", nil, nil)
@@ -632,7 +632,7 @@ func TestOBO_StoreListGrantsByGrantor_GranteeBotNameContract(t *testing.T) {
 	s := newFakeOBOStore()
 	s.seedBot(tRESTBot, tRESTOwner)
 	s.seedBotName(tRESTBot, "james")
-	_, _ = s.insertGrant(tRESTOwner, tRESTBot, "auto")
+	_, _ = s.insertGrant(tRESTOwner, tRESTBot, "auto", "")
 
 	rows, err := s.listGrantsByGrantor(tRESTOwner)
 	if err != nil {
@@ -648,7 +648,7 @@ func TestOBO_StoreListGrantsByGrantor_GranteeBotNameContract(t *testing.T) {
 	// Fallback: bot without a seeded display name → uid surfaces.
 	const unnamedBot = "bot_no_display"
 	s.seedBot(unnamedBot, tRESTOwner)
-	_, _ = s.insertGrant(tRESTOwner, unnamedBot, "auto")
+	_, _ = s.insertGrant(tRESTOwner, unnamedBot, "auto", "")
 	rows, _ = s.listGrantsByGrantor(tRESTOwner)
 	for _, r := range rows {
 		if r.GranteeBotName == "" {

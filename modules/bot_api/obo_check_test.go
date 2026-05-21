@@ -41,12 +41,12 @@ func newBotAPIWithFakeStore(s *fakeOBOStore) *BotAPI {
 // (active=1, global_enabled=1) + matching enabled scope → nil.
 func TestCheckOBO_Happy(t *testing.T) {
 	s := newFakeOBOStore()
-	gid, err := s.insertGrant(tGrantor, tBot, "auto")
+	gid, err := s.insertGrant(tGrantor, tBot, "auto", "")
 	if err != nil {
 		t.Fatalf("insertGrant: %v", err)
 	}
 	enable := 1
-	if err := s.updateGrant(gid, "", &enable); err != nil {
+	if err := s.updateGrant(gid, "", &enable, nil); err != nil {
 		t.Fatalf("updateGrant: %v", err)
 	}
 	if _, err := s.insertScope(gid, tChan, common.ChannelTypeGroup.Uint8(), 1); err != nil {
@@ -72,9 +72,9 @@ func TestCheckOBO_NoGrant(t *testing.T) {
 // from "never existed" by contract.
 func TestCheckOBO_GrantRevoked(t *testing.T) {
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(tGrantor, tBot, "auto")
+	gid, _ := s.insertGrant(tGrantor, tBot, "auto", "")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable)
+	_ = s.updateGrant(gid, "", &enable, nil)
 	_, _ = s.insertScope(gid, tChan, common.ChannelTypeGroup.Uint8(), 1)
 	if err := s.revokeGrant(gid); err != nil {
 		t.Fatalf("revokeGrant: %v", err)
@@ -91,7 +91,7 @@ func TestCheckOBO_GrantRevoked(t *testing.T) {
 // kill-switch). Same denial behavior as no-grant.
 func TestCheckOBO_GlobalDisabled(t *testing.T) {
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(tGrantor, tBot, "auto")
+	gid, _ := s.insertGrant(tGrantor, tBot, "auto", "")
 	// Skip the enable step → global_enabled stays 0.
 	_, _ = s.insertScope(gid, tChan, common.ChannelTypeGroup.Uint8(), 1)
 
@@ -107,9 +107,9 @@ func TestCheckOBO_GlobalDisabled(t *testing.T) {
 // MUST be denied (RFC §2).
 func TestCheckOBO_ScopeMissing(t *testing.T) {
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(tGrantor, tBot, "auto")
+	gid, _ := s.insertGrant(tGrantor, tBot, "auto", "")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable)
+	_ = s.updateGrant(gid, "", &enable, nil)
 	// No scope inserted at all.
 
 	ba := newBotAPIWithFakeStore(s)
@@ -122,9 +122,9 @@ func TestCheckOBO_ScopeMissing(t *testing.T) {
 // TestCheckOBO_ScopeDisabled — scope row exists with enabled=0.
 func TestCheckOBO_ScopeDisabled(t *testing.T) {
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(tGrantor, tBot, "auto")
+	gid, _ := s.insertGrant(tGrantor, tBot, "auto", "")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable)
+	_ = s.updateGrant(gid, "", &enable, nil)
 	_, _ = s.insertScope(gid, tChan, common.ChannelTypeGroup.Uint8(), 0)
 
 	ba := newBotAPIWithFakeStore(s)
@@ -182,9 +182,9 @@ func TestCheckOBO_DBError_OnGrantLookup(t *testing.T) {
 func TestCheckOBO_DBError_OnScopeLookup(t *testing.T) {
 	boom := errors.New("connection refused")
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(tGrantor, tBot, "auto")
+	gid, _ := s.insertGrant(tGrantor, tBot, "auto", "")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable)
+	_ = s.updateGrant(gid, "", &enable, nil)
 	s.failScopeEnabled = boom
 
 	ba := newBotAPIWithFakeStore(s)
@@ -203,12 +203,12 @@ func TestCheckOBO_DBError_OnScopeLookup(t *testing.T) {
 // asserts the wire-equivalent sentinel ErrOBONotAuthorized).
 func TestOBO_CheckOBO_GrantorMembershipRevoked_403(t *testing.T) {
 	s := newFakeOBOStore()
-	gid, err := s.insertGrant(tGrantor, tBot, "auto")
+	gid, err := s.insertGrant(tGrantor, tBot, "auto", "")
 	if err != nil {
 		t.Fatalf("insertGrant: %v", err)
 	}
 	enable := 1
-	if err := s.updateGrant(gid, "", &enable); err != nil {
+	if err := s.updateGrant(gid, "", &enable, nil); err != nil {
 		t.Fatalf("updateGrant: %v", err)
 	}
 	if _, err := s.insertScope(gid, tChan, common.ChannelTypeGroup.Uint8(), 1); err != nil {
@@ -254,9 +254,9 @@ func TestOBO_CheckOBO_GrantorMembershipRevoked_403(t *testing.T) {
 // handler boundary).
 func TestOBO_CheckOBO_GrantorChannelAccessDBError_Propagates(t *testing.T) {
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(tGrantor, tBot, "auto")
+	gid, _ := s.insertGrant(tGrantor, tBot, "auto", "")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable)
+	_ = s.updateGrant(gid, "", &enable, nil)
 	_, _ = s.insertScope(gid, tChan, common.ChannelTypeGroup.Uint8(), 1)
 
 	ba := newBotAPIWithFakeStore(s)

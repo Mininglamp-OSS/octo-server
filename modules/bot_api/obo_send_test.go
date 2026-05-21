@@ -40,9 +40,9 @@ func TestSendMessage_OBO_Authorized_SwapsFromUID(t *testing.T) {
 
 	// Stub OBO: enabled grant + scope for (grantor, bot) in this group.
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(grantor, botID, "auto")
+	gid, _ := s.insertGrant(grantor, botID, "auto", "")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable)
+	_ = s.updateGrant(gid, "", &enable, nil)
 	_, _ = s.insertScope(gid, group, common.ChannelTypeGroup.Uint8(), 1)
 
 	dc := &dispatchCapture{}
@@ -91,8 +91,8 @@ func TestSendMessage_OBO_Authorized_SwapsFromUID(t *testing.T) {
 	// Switch the grant to (alice, bot) for a DM to peer=alice. Rebuild the
 	// fake to keep the test self-contained.
 	s2 := newFakeOBOStore()
-	gid2, _ := s2.insertGrant("user_alice", botID, "auto")
-	_ = s2.updateGrant(gid2, "", &enable)
+	gid2, _ := s2.insertGrant("user_alice", botID, "auto", "")
+	_ = s2.updateGrant(gid2, "", &enable, nil)
 	_, _ = s2.insertScope(gid2, grantor, common.ChannelTypePerson.Uint8(), 1)
 	ba.oboStoreOverride = s2
 
@@ -220,9 +220,9 @@ func TestSendMessage_OBO_GrantorReplyBypass_DM(t *testing.T) {
 	// all — the bypass MUST work without one (the whole point is that
 	// requiring a scope here is wrong).
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(grantor, botID, "auto")
+	gid, _ := s.insertGrant(grantor, botID, "auto", "")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable)
+	_ = s.updateGrant(gid, "", &enable, nil)
 
 	dc := &dispatchCapture{}
 	ba := &BotAPI{
@@ -314,7 +314,7 @@ func TestSendMessage_OBO_GrantorReplyBypass_DM_GlobalDisabled(t *testing.T) {
 	// production schema), so omitting the updateGrant(enable=1) call
 	// reproduces the YUJ-1428 condition exactly.
 	s := newFakeOBOStore()
-	_, _ = s.insertGrant(grantor, botID, "auto")
+	_, _ = s.insertGrant(grantor, botID, "auto", "")
 
 	dc := &dispatchCapture{}
 	ba := &BotAPI{
@@ -439,9 +439,9 @@ func TestSendMessage_OBO_GrantorReplyBypass_DoesNotApplyToThirdPartySend(t *test
 	// not rescue it just because admin (the on_behalf_of value) is also
 	// a grantor of the bot.
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(grantor, botID, "auto")
+	gid, _ := s.insertGrant(grantor, botID, "auto", "")
 	enable := 1
-	_ = s.updateGrant(gid, "", &enable)
+	_ = s.updateGrant(gid, "", &enable, nil)
 
 	dc := &dispatchCapture{}
 	ba := &BotAPI{

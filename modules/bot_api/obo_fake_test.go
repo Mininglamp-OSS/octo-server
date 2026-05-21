@@ -189,7 +189,7 @@ func (f *fakeOBOStore) findActiveGrantsForChannel(channelID string, channelType 
 	return out, nil
 }
 
-func (f *fakeOBOStore) insertGrant(grantorUID, granteeBotUID, mode string) (int64, error) {
+func (f *fakeOBOStore) insertGrant(grantorUID, granteeBotUID, mode, personaPrompt string) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.failInsertGrant != nil {
@@ -210,6 +210,7 @@ func (f *fakeOBOStore) insertGrant(grantorUID, granteeBotUID, mode string) (int6
 		Mode:          mode,
 		GlobalEnabled: 0,
 		Active:        1,
+		PersonaPrompt: personaPrompt,
 	}
 	return id, nil
 }
@@ -250,7 +251,7 @@ func (f *fakeOBOStore) findGrantByID(id int64) (*oboGrantModel, error) {
 	return &cp, nil
 }
 
-func (f *fakeOBOStore) updateGrant(id int64, mode string, globalEnabled *int) error {
+func (f *fakeOBOStore) updateGrant(id int64, mode string, globalEnabled *int, personaPrompt *string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.ensureInit()
@@ -267,6 +268,9 @@ func (f *fakeOBOStore) updateGrant(id int64, mode string, globalEnabled *int) er
 			v = 1
 		}
 		g.GlobalEnabled = v
+	}
+	if personaPrompt != nil {
+		g.PersonaPrompt = *personaPrompt
 	}
 	return nil
 }
@@ -363,6 +367,34 @@ func (f *fakeOBOStore) reactivateGrant(id int64) error {
 	g.Active = 1
 	g.GlobalEnabled = 0
 	g.RevokedAt = nil
+	return nil
+}
+
+// deactivateOtherActiveGrants — YUJ-1465 / Mininglamp-OSS/octo-server#108.
+// Mirrors the prod soft-delete: active=0, global_enabled=0, revoked_at=now,
+// skipping `exceptID`. Idempotent on already-deactivated rows.
+func (f *fakeOBOStore) deactivateOtherActiveGrants(grantorUID string, exceptID int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureInit()
+	if grantorUID == "" {
+		return nil
+	}
+	now := time.Now()
+	for _, g := range f.grants {
+		if g.GrantorUID != grantorUID {
+			continue
+		}
+		if g.ID == exceptID {
+			continue
+		}
+		if g.Active != 1 {
+			continue
+		}
+		g.Active = 0
+		g.GlobalEnabled = 0
+		g.RevokedAt = &now
+	}
 	return nil
 }
 
