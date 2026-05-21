@@ -63,9 +63,17 @@ import (
 // DM (Person) channels keep the strict scope-row contract: a DM is a
 // 1:1 conversation that the persona must be explicitly authorized for,
 // and the @grantor narrowing gate cannot be applied (DM payloads carry
-// no mention). The check in checkOBO (the third-party send path) also
-// still requires the scope row regardless of channel type — only the
-// fan-out trigger lookup is widened here.
+// no mention).
+//
+// PR#114 R3 update — `checkOBO` (the third-party reply send path) was
+// widened symmetrically in the same PR: for group-like channel types
+// it ALSO skips the scope-row requirement when the grant has
+// `global_enabled=1`, so a fan-out copy delivered into a group reaches
+// the bot AND the bot's OBO reply succeeds. The previous version of
+// this comment claimed `checkOBO` still required the scope row "regardless
+// of channel type" — true for the v1 ship but stale after the PR#114
+// commit `fix(obo): checkOBO skips scope check for group-like channels`.
+// DM (Person) `checkOBO` does still require the per-peer scope row.
 func isGroupLikeChannelType(channelType uint8) bool {
 	return channelType == common.ChannelTypeGroup.Uint8() ||
 		channelType == common.ChannelTypeCommunityTopic.Uint8()
@@ -146,6 +154,16 @@ type oboScopeModel struct {
 //     v2 narrowing gate (`@grantor` / `mention.all=1`) and the
 //     `grantorCanReadChannel` re-check carry the opt-in. Empty slice
 //     (not nil) on no match keeps callers branch-free.
+//   - findActiveGrantsForChannelByGrantors: PR#114 R3. Same shape as
+//     findActiveGrantsForChannel for group-like channels but adds a
+//     `grantor_uid IN (...)` filter so the fan-out hot path can
+//     restrict the system-wide scan to the explicit @mentioned UIDs
+//     decoded from `payload.mention.uids`. Used ONLY for group-like
+//     channels with explicit @uids — `mention.all` (@所有人) still goes
+//     through the unfiltered method (see fanoutForMessage doc for the
+//     trade-off). An empty / nil grantorUIDs slice returns an empty
+//     result without touching MySQL — callers should early-return on
+//     the no-mention case instead of paying a wasted query.
 type oboStore interface {
 	findActiveGrantByGrantorBot(grantorUID, granteeBotUID string) (*oboGrantModel, error)
 	// findGrantByGrantorBotActiveOnly — YUJ-1428. Same shape as
@@ -174,6 +192,15 @@ type oboStore interface {
 	findGrantByGrantorBotActiveOnly(grantorUID, granteeBotUID string) (*oboGrantModel, error)
 	scopeEnabled(grantID int64, channelID string, channelType uint8) (bool, error)
 	findActiveGrantsForChannel(channelID string, channelType uint8) ([]*oboGrantModel, error)
+	// findActiveGrantsForChannelByGrantors — PR#114 R3 (Jerry-Xin).
+	// Group-like-only fan-out lookup that filters at the DB layer by the
+	// explicit `mention.uids` set. Returns the subset of grants where
+	// `g.grantor_uid IN (grantorUIDs)` AND `g.active=1 AND
+	// g.global_enabled=1`. An empty / nil grantorUIDs slice returns an
+	// empty result with no DB round-trip — callers should treat the
+	// "no mentions" case at the fan-out layer instead of asking the DB.
+	// DM (Person) MUST NOT call this method (no mention semantics on DMs).
+	findActiveGrantsForChannelByGrantors(channelID string, channelType uint8, grantorUIDs []string) ([]*oboGrantModel, error)
 
 	// CRUD used by the REST layer
 	insertGrant(grantorUID, granteeBotUID, mode, personaPrompt string) (int64, error)
@@ -420,6 +447,75 @@ func (d *botAPIDB) findActiveGrantsForChannel(channelID string, channelType uint
 			channelID, channelType,
 		).Load(&grants)
 	}
+	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
+		return nil, err
+	}
+	if grants == nil {
+		grants = []*oboGrantModel{}
+	}
+	d.writeChannelCache(channelID, channelType, len(grants) > 0)
+	return grants, nil
+}
+
+// findActiveGrantsForChannelByGrantors — PR#114 R3 (Jerry-Xin perf
+// blocker). Same shape as `findActiveGrantsForChannel` for group-like
+// channels but scoped at the DB layer to the explicit `grantorUIDs`
+// set decoded from `payload.mention.uids`. The fan-out hot path uses
+// this when an inbound group message carries an explicit @grantor
+// mention so we never load grants for OTHER grantors who weren't
+// mentioned.
+//
+// Why this matters (Jerry-Xin's perf flag): the v2 group lookup loads
+// EVERY active+global_enabled grant system-wide and then post-filters
+// in Go, so every inbound group message — even plain text or @AI —
+// would otherwise pay an O(grants_total) DB scan. With this method
+// the DB returns at most `len(grantorUIDs)` rows (uk_grantor_grantee
+// guarantees one row per grantor), so the cost is O(mentioned_grantors)
+// per inbound and the unmentioned grantors never leave their index page.
+//
+// Behavior:
+//   - DM / Person (or any non-group-like type) → empty slice + nil
+//     error. Callers must NOT use this for DMs (no mention semantics).
+//   - Empty / nil grantorUIDs → empty slice + nil error WITHOUT a DB
+//     round-trip. The caller's early-return path should mean we never
+//     reach this branch, but the guard makes the contract self-evident.
+//   - channelID == "" → empty slice + nil error (defensive).
+//
+// Cache: writes the same `obo:chan:{type}:{id}` scalar that
+// `findActiveGrantsForChannel` does so a subsequent unfiltered call
+// can short-circuit on negative results. Reads from the cache as well
+// — a cached "0" answer (no grants in this channel for ANYBODY)
+// trumps the filter and returns empty without hitting MySQL.
+func (d *botAPIDB) findActiveGrantsForChannelByGrantors(channelID string, channelType uint8, grantorUIDs []string) ([]*oboGrantModel, error) {
+	if channelID == "" || len(grantorUIDs) == 0 {
+		return []*oboGrantModel{}, nil
+	}
+	if !isGroupLikeChannelType(channelType) {
+		// Method is group-like-only by contract; defensive return so a
+		// caller wiring this on the DM path can't silently widen access.
+		return []*oboGrantModel{}, nil
+	}
+	if d.channelCacheSaysNone(channelID, channelType) {
+		return []*oboGrantModel{}, nil
+	}
+
+	// Build the IN (...) placeholder list. dbr's positional binding
+	// expands a `[]interface{}` arg into the right number of `?` for
+	// the query, but we need to construct the literal placeholder
+	// string ourselves because the dbr SelectBySql shape in this file
+	// uses positional `?` markers.
+	placeholders := make([]string, len(grantorUIDs))
+	args := make([]interface{}, 0, len(grantorUIDs))
+	for i, uid := range grantorUIDs {
+		placeholders[i] = "?"
+		args = append(args, uid)
+	}
+
+	var grants []*oboGrantModel
+	q := "SELECT g.* FROM obo_grants g " +
+		"WHERE g.active=1 AND g.global_enabled=1 " +
+		"AND g.grantor_uid IN (" + strings.Join(placeholders, ",") + ")"
+	_, err := d.session.SelectBySql(q, args...).Load(&grants)
 	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
 		return nil, err
 	}
@@ -901,7 +997,6 @@ func (d *botAPIDB) createOrReactivateGrantAtomic(grantorUID, granteeBotUID, mode
 
 	return grant, reactivated, nil
 }
-
 
 // O(grants × scopes_per_grant) scan that scopeOwnedBy used to perform
 // on every `DELETE /v1/obo/scopes/:id` (PR#82 review #2 P1-3).

@@ -48,6 +48,25 @@ type fakeOBOStore struct {
 	failInsertScope       error
 	failQueryRobotOwner   error
 	failFindScopeOwner    error
+
+	// PR#114 R3 (Jerry-Xin perf blocker) — call counters so tests can
+	// pin the early-return contract: on plain / @AI-only group traffic,
+	// neither findActiveGrantsForChannel nor
+	// findActiveGrantsForChannelByGrantors must be invoked. Mirrors the
+	// production negative-cache short-circuit: the cheapest grant
+	// lookup is the one we never make.
+	findGrantsChannelCalls           int
+	findGrantsChannelByGrantorsCalls int
+	// lastFindByGrantorsArgs records the most recent argument set passed
+	// to findActiveGrantsForChannelByGrantors so tests can assert that
+	// the @grantor narrowing actually filtered the query (and didn't
+	// silently fall back to the unfiltered scan).
+	lastFindByGrantorsArgs struct {
+		channelID   string
+		channelType uint8
+		grantorUIDs []string
+		called      bool
+	}
 }
 
 // newFakeOBOStore — constructor, zero-value-friendly so tests can also
@@ -170,6 +189,7 @@ func (f *fakeOBOStore) scopeEnabled(grantID int64, channelID string, channelType
 func (f *fakeOBOStore) findActiveGrantsForChannel(channelID string, channelType uint8) ([]*oboGrantModel, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.findGrantsChannelCalls++
 	if f.failFindGrantsChannel != nil {
 		return nil, f.failFindGrantsChannel
 	}
@@ -205,6 +225,59 @@ func (f *fakeOBOStore) findActiveGrantsForChannel(channelID string, channelType 
 		}
 		g, ok := f.grants[s.GrantID]
 		if !ok || g.Active != 1 || g.GlobalEnabled != 1 {
+			continue
+		}
+		cp := *g
+		out = append(out, &cp)
+	}
+	return out, nil
+}
+
+// findActiveGrantsForChannelByGrantors — PR#114 R3 (Jerry-Xin perf
+// blocker) fake impl. Mirrors the production `grantor_uid IN (...)`
+// filter at the in-memory level so unit tests can pin both the
+// behavior (right rows returned) and the call shape (was it invoked,
+// with what filter set). DM / non-group-like calls return empty
+// without consulting the maps, mirroring the production guard.
+func (f *fakeOBOStore) findActiveGrantsForChannelByGrantors(channelID string, channelType uint8, grantorUIDs []string) ([]*oboGrantModel, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.findGrantsChannelByGrantorsCalls++
+	// Record the latest call so tests can assert the filter shape.
+	f.lastFindByGrantorsArgs.called = true
+	f.lastFindByGrantorsArgs.channelID = channelID
+	f.lastFindByGrantorsArgs.channelType = channelType
+	// Copy slice to insulate test assertions from caller mutations.
+	f.lastFindByGrantorsArgs.grantorUIDs = append([]string(nil), grantorUIDs...)
+	if f.failFindGrantsChannel != nil {
+		return nil, f.failFindGrantsChannel
+	}
+	f.ensureInit()
+	out := []*oboGrantModel{}
+	if channelID == "" || len(grantorUIDs) == 0 {
+		return out, nil
+	}
+	if !isGroupLikeChannelType(channelType) {
+		return out, nil
+	}
+	// Build the set so membership tests are O(1).
+	wanted := make(map[string]struct{}, len(grantorUIDs))
+	for _, u := range grantorUIDs {
+		wanted[u] = struct{}{}
+	}
+	// Iterate by sorted grant ID for deterministic ordering — mirrors
+	// the sort applied in findActiveGrantsForChannel's group branch.
+	ids := make([]int64, 0, len(f.grants))
+	for id := range f.grants {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for _, id := range ids {
+		g := f.grants[id]
+		if g == nil || g.Active != 1 || g.GlobalEnabled != 1 {
+			continue
+		}
+		if _, ok := wanted[g.GrantorUID]; !ok {
 			continue
 		}
 		cp := *g

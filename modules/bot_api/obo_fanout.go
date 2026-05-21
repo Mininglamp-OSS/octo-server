@@ -84,6 +84,7 @@ package bot_api
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -197,7 +198,81 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 	}
 
 	store := ba.oboStoreOrDefault()
-	grants, err := store.findActiveGrantsForChannel(lookupChannelID, m.ChannelType)
+	isGroupLike := m.ChannelType != common.ChannelTypePerson.Uint8()
+
+	// PR#114 R3 (Jerry-Xin perf blocker, 2026-05-21) — mention gate runs
+	// BEFORE the grant DB lookup for group-like channels. The previous
+	// shape called `findActiveGrantsForChannel` first, which for groups
+	// loads EVERY active+global_enabled grant system-wide with no
+	// channel filter — so every ordinary group message (plain text,
+	// @AI only, @bot, etc.) paid a full obo_grants scan even though
+	// the per-message v2 narrowing gate (decoded a few lines below)
+	// was going to reject them anyway.
+	//
+	// New shape for group-like channels:
+	//
+	//  1. Decode mentions ONCE up-front (cheap, in-memory JSON parse).
+	//  2. If neither `mention.all` nor any `mention.uids` is set →
+	//     EARLY RETURN. No DB query, no Redis hit beyond the cache
+	//     short-circuit that channelCacheSaysNone already provides.
+	//  3. For `mention.uids` (explicit @grantor): filter the grant
+	//     query at the DB layer via `findActiveGrantsForChannelByGrantors`
+	//     so we never load grants for OTHER grantors who weren't
+	//     mentioned. uk_grantor_grantee guarantees one row per grantor,
+	//     so the query returns at most `len(mention.uids)` rows.
+	//  4. For `mention.all` (@所有人): the full grant scan is
+	//     UNAVOIDABLE because every grantor in the group is implicitly
+	//     mentioned and we don't know the membership at this layer.
+	//     This is acceptable because `@所有人` is rare — operators
+	//     restrict its use to admins / announcements — so the
+	//     occasional full scan is bounded. The per-grant
+	//     `grantorCanReadChannel` re-check below still drops grantors
+	//     who aren't actually in the group.
+	//
+	// DM (Person) path stays unchanged: DM payloads carry no mention
+	// metadata, so we still call `findActiveGrantsForChannel` first
+	// and rely on the JOIN against the (per-peer) scope row to narrow.
+	mentioned, mentionAll := decodeMentionGate(m.Payload)
+
+	var grants []*oboGrantModel
+	var err error
+	if isGroupLike {
+		// Mention gate first — refuse to touch MySQL for plain / @AI /
+		// @bot traffic. This is THE perf fix Jerry-Xin flagged on the
+		// PR#114 review: without it every group message went through a
+		// full `obo_grants` scan.
+		if !mentionAll && len(mentioned) == 0 {
+			return 0
+		}
+		if mentionAll {
+			// @所有人 broadcast — every grantor is implicitly mentioned.
+			// The unfiltered scan is unavoidable here (we don't know
+			// who is in the group from this layer) but @所有人 is rare
+			// in practice and the alternative — fetching group
+			// membership just to filter the IN list — is more work
+			// than the scan saves.
+			grants, err = store.findActiveGrantsForChannel(lookupChannelID, m.ChannelType)
+		} else {
+			// Explicit @grantor(s) — filter at the DB layer so we
+			// never load grants for un-mentioned grantors. Collect
+			// the set into a slice in deterministic order so the
+			// IN(...) placeholder set is stable across calls (helps
+			// query-plan caching at the MySQL layer too).
+			grantorUIDs := make([]string, 0, len(mentioned))
+			for uid := range mentioned {
+				grantorUIDs = append(grantorUIDs, uid)
+			}
+			// Stable ordering — `range` on a map is unordered. Use a
+			// simple sort so identical mention sets produce identical
+			// query bind shapes.
+			sort.Strings(grantorUIDs)
+			grants, err = store.findActiveGrantsForChannelByGrantors(
+				lookupChannelID, m.ChannelType, grantorUIDs,
+			)
+		}
+	} else {
+		grants, err = store.findActiveGrantsForChannel(lookupChannelID, m.ChannelType)
+	}
 	if err != nil {
 		ba.Error("OBO fan-out lookup failed",
 			zap.String("lookup_channel_id", lookupChannelID),
@@ -221,15 +296,15 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 	// addressed" signal. @AI-only / @bot / plain (no mention) traffic
 	// still does NOT trigger the persona.
 	//
-	// Decoded once per inbound message: the per-grant loop below
-	// only re-uses `mentioned` to test set membership for each
-	// grantor. Decoding into a string-set keeps the inner loop O(1)
-	// per grant instead of O(N) over the mention.uids slice. We
-	// tolerate non-JSON / malformed mention payloads as "no
-	// mentions" — fail-closed (no fan-out) is correct; v1 silently
-	// dispatched in that case but v2 explicitly requires the summon
-	// signal.
-	mentioned, mentionAll := decodeMentionGate(m.Payload)
+	// PR#114 R3 — for group-like channels the mention gate has already
+	// run UP-FRONT (above) and either early-returned or narrowed the
+	// grant query by the mentioned UIDs. The per-grant check inside
+	// the loop below remains as a belt-and-suspenders verification —
+	// the DB filter could in principle drop rows but mentionAll uses
+	// the unfiltered scan, and we still want to verify each surviving
+	// grantor was actually summoned. For DMs the mention set is
+	// always empty (DM payloads carry no mention), but the DM-only
+	// "implicitly mentioned" branch below preserves the v2 contract.
 
 	// PR#82 round-2 P1-A — per-call cache for the grantor channel-access
 	// re-check. Multiple active grants for the same (channel, grantor)
