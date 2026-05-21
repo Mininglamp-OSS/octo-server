@@ -138,8 +138,14 @@ type oboScopeModel struct {
 //     enabled=0, or the grant_id doesn't exist. The hot path on sendMessage
 //     only needs a boolean.
 //   - findActiveGrantsForChannel: feeder for the fan-out listener; returns
-//     active+global_enabled grants whose scope row matches the channel and
-//     enabled=1. Empty slice (not nil) on no match keeps callers branch-free.
+//     active+global_enabled grants for the channel. Channel-type-aware
+//     (YUJ-1538 / PR#114): for DM (Person) the scope row is still
+//     required (strict per-peer white-list); for group-like channel
+//     types (Group / CommunityTopic) a `global_enabled=1` grant alone
+//     suffices and no `obo_scopes` row is consulted — the per-message
+//     v2 narrowing gate (`@grantor` / `mention.all=1`) and the
+//     `grantorCanReadChannel` re-check carry the opt-in. Empty slice
+//     (not nil) on no match keeps callers branch-free.
 type oboStore interface {
 	findActiveGrantByGrantorBot(grantorUID, granteeBotUID string) (*oboGrantModel, error)
 	// findGrantByGrantorBotActiveOnly — YUJ-1428. Same shape as

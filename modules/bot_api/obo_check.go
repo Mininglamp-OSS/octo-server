@@ -30,13 +30,29 @@ var (
 // ErrOBONotAuthorized when any check fails. Unexpected DB errors are
 // returned wrapped so the handler can 500.
 //
-// Four layered checks (any failure → ErrOBONotAuthorized):
+// Layered checks (any failure → ErrOBONotAuthorized):
 //  1. Grant row exists with active=1 AND global_enabled=1 for
 //     (grantor, botUID). This rejects revoked grants and grants whose
 //     master switch is off.
 //  2. Scope row exists with enabled=1 for (grant_id, channel_id,
-//     channel_type). White-list semantics per RFC §2 — opening a channel
-//     to a persona is always explicit.
+//     channel_type) — DM / Person ONLY. White-list semantics per RFC §2
+//     for 1:1 conversations: the persona must be explicitly authorized
+//     per peer because there is no in-message narrowing signal
+//     (mentions don't apply to DMs).
+//
+//     YUJ-1538 / PR#114 review fix — for group-like channel types
+//     (Group / CommunityTopic), the scope-row requirement is SKIPPED
+//     entirely. A grant with `active=1 AND global_enabled=1` covers
+//     every group/topic the grantor participates in; the per-message
+//     v2 narrowing gate (`@grantor` mention or `mention.all=1`) is the
+//     effective opt-in instead of a scope row, and the
+//     `grantorCanReadChannel` re-check below still enforces live
+//     membership. Without this skip, the fan-out copy delivered into a
+//     group reaches the bot but the bot's OBO reply hits scopeEnabled,
+//     returns false (operators never installed group scopes), and the
+//     reply 403s — defeating the whole PR#109 group fan-out path.
+//     `findActiveGrantsForChannel` (modules/bot_api/obo_db.go) was
+//     already widened symmetrically in PR#114.
 //  3. PR#82 round-2 P1-A — the grantor STILL has read access to the
 //     channel right now (`grantorCanReadChannel`). The scope-create-time
 //     check is not load-bearing for live membership: a grantor who
@@ -71,17 +87,28 @@ func (ba *BotAPI) checkOBO(botUID, grantor, channelID string, channelType uint8)
 		return ErrOBONotAuthorized
 	}
 
-	ok, err := store.scopeEnabled(grant.ID, channelID, channelType)
-	if err != nil {
-		ba.Error("OBO scope lookup failed",
-			zap.Int64("grant_id", grant.ID),
-			zap.String("channel_id", channelID),
-			zap.Uint8("channel_type", channelType),
-			zap.Error(err))
-		return err
-	}
-	if !ok {
-		return ErrOBONotAuthorized
+	// YUJ-1538 / PR#114 review fix (Jerry-Xin, lml2468) — skip the
+	// scope-row check for group-like channel types when the grant is
+	// `global_enabled=1`. See the function-level doc comment for the
+	// full rationale; without this branch, a group fan-out copy reaches
+	// the bot but the bot's OBO reply hits scopeEnabled, returns false
+	// (operators never install group scopes in production), and the
+	// reply 403s. DM (Person) and any unrecognized channel type keep
+	// the strict scope-row contract — the test
+	// TestCheckOBO_DMNoScope_StillUnauthorized pins that regression.
+	if !isGroupLikeChannelType(channelType) {
+		ok, err := store.scopeEnabled(grant.ID, channelID, channelType)
+		if err != nil {
+			ba.Error("OBO scope lookup failed",
+				zap.Int64("grant_id", grant.ID),
+				zap.String("channel_id", channelID),
+				zap.Uint8("channel_type", channelType),
+				zap.Error(err))
+			return err
+		}
+		if !ok {
+			return ErrOBONotAuthorized
+		}
 	}
 
 	// PR#82 round-2 P1-A — TOCTOU close-out. Re-check the grantor's live

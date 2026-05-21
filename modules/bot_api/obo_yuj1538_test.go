@@ -25,10 +25,12 @@
 package bot_api
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 )
 
 // seedGrantNoScope is the YUJ-1538 setup parity to seedGrantWithScope:
@@ -326,5 +328,93 @@ func TestDecodeMentionGate_YUJ1538_AllFlagShapes(t *testing.T) {
 				t.Fatalf("payload %q: want all=%v, got %v", tc.payload, tc.wantAll, all)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------
+// PR#114 review fix — checkOBO scope-row bypass for group-like channels
+// (Jerry-Xin / lml2468). Pre-fix, the bot's OBO reply hit
+// `store.scopeEnabled(...)` and returned false because operators never
+// installed channel_type=2 scopes in production, so the reply 403'd
+// even though the v2 fan-out trigger query had already been widened.
+// ---------------------------------------------------------------------
+
+// newBotAPIForCheckYUJ1538 mirrors newBotAPIWithFakeStore in
+// obo_check_test.go but is duplicated here so the new tests live next
+// to the rest of the YUJ-1538 pinning. The channel-access override
+// defaults to "always allowed" so the assertions focus on the
+// scope-row contract, not the TOCTOU re-check layer (which has its
+// own dedicated test in obo_check_test.go).
+func newBotAPIForCheckYUJ1538(s *fakeOBOStore) *BotAPI {
+	return &BotAPI{
+		Log:              log.NewTLog("BotAPI-yuj1538-check"),
+		oboStoreOverride: s,
+		oboChannelAccessOverride: func(uid, channelID string, channelType uint8) (bool, error) {
+			return true, nil
+		},
+	}
+}
+
+// TestCheckOBO_YUJ1538_GroupNoScopeRow_GlobalEnabledAuthorizes — PR#114
+// review blocker. With `global_enabled=1` and NO `obo_scopes` row,
+// `checkOBO` for a Group channel must succeed (return nil). Pre-fix
+// this returned ErrOBONotAuthorized because `scopeEnabled` was called
+// unconditionally and answered false, so the bot's OBO reply 403'd
+// even though PR#109 had already allowed the fan-out copy to reach
+// the bot. The new branch in checkOBO skips scopeEnabled for
+// group-like channel types; symmetry with findActiveGrantsForChannel.
+func TestCheckOBO_YUJ1538_GroupNoScopeRow_GlobalEnabledAuthorizes(t *testing.T) {
+	s := seedGrantNoScope(t)
+	ba := newBotAPIForCheckYUJ1538(s)
+	if err := ba.checkOBO(tBot, tGrantor, "group_42", common.ChannelTypeGroup.Uint8()); err != nil {
+		t.Fatalf("YUJ-1538 / PR#114: group with global_enabled=1 and no scope row must authorize, got %v", err)
+	}
+}
+
+// TestCheckOBO_YUJ1538_CommunityTopicNoScopeRow_GlobalEnabledAuthorizes —
+// CommunityTopic shares the group-like "@grantor narrowing" contract
+// and must therefore also bypass the scope-row requirement when
+// `global_enabled=1`. Keeps the two channel types as separate test
+// cases so a regression that drops only one surfaces with a precise
+// failure message.
+func TestCheckOBO_YUJ1538_CommunityTopicNoScopeRow_GlobalEnabledAuthorizes(t *testing.T) {
+	s := seedGrantNoScope(t)
+	ba := newBotAPIForCheckYUJ1538(s)
+	if err := ba.checkOBO(tBot, tGrantor, "group_42____topic_a1", common.ChannelTypeCommunityTopic.Uint8()); err != nil {
+		t.Fatalf("YUJ-1538 / PR#114: community-topic with global_enabled=1 and no scope row must authorize, got %v", err)
+	}
+}
+
+// TestCheckOBO_YUJ1538_DMNoScope_StillUnauthorized — regression guard.
+// The PR#114 fix MUST NOT relax DM behavior: a grant with
+// `global_enabled=1` but no scope row for the DM peer must still deny.
+// DMs have no in-message narrowing signal (mentions don't apply), so
+// the per-peer scope row is the only explicit opt-in.
+func TestCheckOBO_YUJ1538_DMNoScope_StillUnauthorized(t *testing.T) {
+	const dmPeer = "u_bob"
+	s := seedGrantNoScope(t) // grant exists with global_enabled=1, but no scope
+	ba := newBotAPIForCheckYUJ1538(s)
+	err := ba.checkOBO(tBot, tGrantor, dmPeer, common.ChannelTypePerson.Uint8())
+	if !errors.Is(err, ErrOBONotAuthorized) {
+		t.Fatalf("YUJ-1538 / PR#114: DM with no scope row must STILL deny (regression guard), got %v", err)
+	}
+}
+
+// TestCheckOBO_YUJ1538_GroupGlobalDisabled_StillUnauthorized — the
+// scope-row bypass only triggers when the grant itself is
+// `global_enabled=1`. A group inbound for a grantor whose grant has
+// the master switch OFF must still deny. Without this pin, a future
+// refactor that moves the bypass above the `findActiveGrantByGrantorBot`
+// gate would silently re-open the kill switch.
+func TestCheckOBO_YUJ1538_GroupGlobalDisabled_StillUnauthorized(t *testing.T) {
+	s := newFakeOBOStore()
+	if _, err := s.insertGrant(tGrantor, tBot, "auto", ""); err != nil {
+		t.Fatalf("insertGrant: %v", err)
+	}
+	// global_enabled stays 0 (insertGrant default).
+	ba := newBotAPIForCheckYUJ1538(s)
+	err := ba.checkOBO(tBot, tGrantor, "group_42", common.ChannelTypeGroup.Uint8())
+	if !errors.Is(err, ErrOBONotAuthorized) {
+		t.Fatalf("YUJ-1538 / PR#114: group with global_enabled=0 must STILL deny, got %v", err)
 	}
 }

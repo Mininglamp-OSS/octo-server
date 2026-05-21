@@ -103,9 +103,12 @@ func TestCheckOBO_GlobalDisabled(t *testing.T) {
 }
 
 // TestCheckOBO_ScopeMissing — grant is fully enabled but no scope row
-// for the channel. Whitelist semantics: channels not explicitly added
-// MUST be denied (RFC §2).
+// for the channel. Whitelist semantics: DM channels not explicitly
+// added MUST be denied (RFC §2). Group / CommunityTopic are tested
+// separately in obo_yuj1538_test.go because the YUJ-1538 / PR#114
+// fix bypasses the scope-row requirement for group-like types.
 func TestCheckOBO_ScopeMissing(t *testing.T) {
+	const dmPeer = "u_bob"
 	s := newFakeOBOStore()
 	gid, _ := s.insertGrant(tGrantor, tBot, "auto", "")
 	enable := 1
@@ -113,24 +116,27 @@ func TestCheckOBO_ScopeMissing(t *testing.T) {
 	// No scope inserted at all.
 
 	ba := newBotAPIWithFakeStore(s)
-	err := ba.checkOBO(tBot, tGrantor, tChan, common.ChannelTypeGroup.Uint8())
+	err := ba.checkOBO(tBot, tGrantor, dmPeer, common.ChannelTypePerson.Uint8())
 	if !errors.Is(err, ErrOBONotAuthorized) {
-		t.Fatalf("missing scope should be unauthorized, got %v", err)
+		t.Fatalf("missing DM scope should be unauthorized, got %v", err)
 	}
 }
 
-// TestCheckOBO_ScopeDisabled — scope row exists with enabled=0.
+// TestCheckOBO_ScopeDisabled — scope row exists with enabled=0. Same
+// DM-only rationale as TestCheckOBO_ScopeMissing: group-like types no
+// longer consult the scope row at all post-PR#114.
 func TestCheckOBO_ScopeDisabled(t *testing.T) {
+	const dmPeer = "u_bob"
 	s := newFakeOBOStore()
 	gid, _ := s.insertGrant(tGrantor, tBot, "auto", "")
 	enable := 1
 	_ = s.updateGrant(gid, "", &enable, nil)
-	_, _ = s.insertScope(gid, tChan, common.ChannelTypeGroup.Uint8(), 0)
+	_, _ = s.insertScope(gid, dmPeer, common.ChannelTypePerson.Uint8(), 0)
 
 	ba := newBotAPIWithFakeStore(s)
-	err := ba.checkOBO(tBot, tGrantor, tChan, common.ChannelTypeGroup.Uint8())
+	err := ba.checkOBO(tBot, tGrantor, dmPeer, common.ChannelTypePerson.Uint8())
 	if !errors.Is(err, ErrOBONotAuthorized) {
-		t.Fatalf("disabled scope should be unauthorized, got %v", err)
+		t.Fatalf("disabled DM scope should be unauthorized, got %v", err)
 	}
 }
 
@@ -178,8 +184,11 @@ func TestCheckOBO_DBError_OnGrantLookup(t *testing.T) {
 }
 
 // TestCheckOBO_DBError_OnScopeLookup — same propagation contract for the
-// second store call.
+// second store call. Uses a DM channel because the YUJ-1538 / PR#114
+// fix skips the scope lookup entirely for group-like types — error
+// propagation from scopeEnabled is only observable on the DM path.
 func TestCheckOBO_DBError_OnScopeLookup(t *testing.T) {
+	const dmPeer = "u_bob"
 	boom := errors.New("connection refused")
 	s := newFakeOBOStore()
 	gid, _ := s.insertGrant(tGrantor, tBot, "auto", "")
@@ -188,7 +197,7 @@ func TestCheckOBO_DBError_OnScopeLookup(t *testing.T) {
 	s.failScopeEnabled = boom
 
 	ba := newBotAPIWithFakeStore(s)
-	err := ba.checkOBO(tBot, tGrantor, tChan, common.ChannelTypeGroup.Uint8())
+	err := ba.checkOBO(tBot, tGrantor, dmPeer, common.ChannelTypePerson.Uint8())
 	if err == nil || errors.Is(err, ErrOBONotAuthorized) {
 		t.Fatalf("expected raw DB error to propagate, got %v", err)
 	}
