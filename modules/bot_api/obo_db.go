@@ -15,11 +15,20 @@
 //     short-circuits the (grantor, bot) MySQL probe
 //     that checkOBO would otherwise issue per send.
 //   - obo:chan:{ctype}:{cid}   "1" channel has at least one (active grant ×
-//     enabled scope) match; "0" no match. Read by
-//     findActiveGrantsForChannel — negative answer
+//     enabled scope) match; "0" no match. Read AND
+//     written ONLY by the unfiltered
+//     `findActiveGrantsForChannel` — negative answer
 //     short-circuits the JOIN that the fan-out
 //     listener would otherwise issue per inbound
-//     message system-wide.
+//     message system-wide. The filtered sibling
+//     `findActiveGrantsForChannelByGrantors`
+//     deliberately bypasses this key in BOTH
+//     directions (PR#114 R4): its result is a
+//     UID-scoped subset, so it cannot prove the
+//     channel-wide negative answer the cache
+//     encodes, and reading a write from the
+//     unfiltered path against a same-string DM key
+//     would suppress legitimate group fan-outs.
 //
 // Both keys are negative-cache friendly: a "0" answer returned within the
 // 30-second TTL eliminates the MySQL round-trip entirely. Writes that can
@@ -286,7 +295,10 @@ const (
 	// have at least one (active grant × enabled scope) match". The fan-out
 	// listener consults this scalar before the JOIN it would otherwise
 	// issue per inbound message system-wide. Population: written on every
-	// findActiveGrantsForChannel result (count 0 → "0", count >0 → "1").
+	// UNFILTERED findActiveGrantsForChannel result (count 0 → "0",
+	// count >0 → "1"). The filtered sibling
+	// findActiveGrantsForChannelByGrantors MUST NOT write here — see
+	// PR#114 R4 and the function doc for the poisoning scenario.
 	// Eviction: insertScope / deleteScope (the only operations that can
 	// flip the answer for a given channel within the TTL window).
 	oboChannelActiveCacheKeyFmt = "obo:chan:%d:%s"
@@ -481,11 +493,30 @@ func (d *botAPIDB) findActiveGrantsForChannel(channelID string, channelType uint
 //     reach this branch, but the guard makes the contract self-evident.
 //   - channelID == "" → empty slice + nil error (defensive).
 //
-// Cache: writes the same `obo:chan:{type}:{id}` scalar that
-// `findActiveGrantsForChannel` does so a subsequent unfiltered call
-// can short-circuit on negative results. Reads from the cache as well
-// — a cached "0" answer (no grants in this channel for ANYBODY)
-// trumps the filter and returns empty without hitting MySQL.
+// Cache: this method MUST NOT touch the `obo:chan:{type}:{id}`
+// channel-wide scalar in either direction (PR#114 R4 — Jerry-Xin /
+// lml2468 cache-poisoning blocker, 2026-05-21).
+//
+// Why no WRITE: the cache key answers "does this channel have ANY
+// active grant × enabled scope" — a CHANNEL-WIDE property. This
+// method's result is a UID-filtered subset, so a zero result here
+// only proves "none of the mentioned grantors have a grant", NOT
+// "the channel has no grants". Writing "0" after a filtered miss
+// would poison the cache for the NEXT inbound that mentions a
+// different grantor who DOES have a grant — the channelCacheSaysNone
+// short-circuit at the top of `findActiveGrantsForChannel` (or any
+// other consumer) would early-return empty and suppress the fan-out.
+//
+// Why no READ: the same cache key may legitimately hold "0" written
+// by the unfiltered `findActiveGrantsForChannel` for a channelID that
+// happens to share its string with this method's group ID (DM peer
+// uids and group ids live in the same Redis namespace). Honoring
+// that "0" here would incorrectly suppress a group query whose
+// mentioned-grantor SET we have not actually probed against MySQL.
+//
+// The unfiltered `findActiveGrantsForChannel` (used by the DM path
+// and the `@所有人` group broadcast path) still manages the channel
+// cache correctly because its result IS the channel-wide truth.
 func (d *botAPIDB) findActiveGrantsForChannelByGrantors(channelID string, channelType uint8, grantorUIDs []string) ([]*oboGrantModel, error) {
 	if channelID == "" || len(grantorUIDs) == 0 {
 		return []*oboGrantModel{}, nil
@@ -495,9 +526,8 @@ func (d *botAPIDB) findActiveGrantsForChannelByGrantors(channelID string, channe
 		// caller wiring this on the DM path can't silently widen access.
 		return []*oboGrantModel{}, nil
 	}
-	if d.channelCacheSaysNone(channelID, channelType) {
-		return []*oboGrantModel{}, nil
-	}
+	// Intentionally NO channelCacheSaysNone check here — see the
+	// "Why no READ" paragraph in the doc comment above.
 
 	// Build the IN (...) placeholder list. dbr's positional binding
 	// expands a `[]interface{}` arg into the right number of `?` for
@@ -522,7 +552,8 @@ func (d *botAPIDB) findActiveGrantsForChannelByGrantors(channelID string, channe
 	if grants == nil {
 		grants = []*oboGrantModel{}
 	}
-	d.writeChannelCache(channelID, channelType, len(grants) > 0)
+	// Intentionally NO writeChannelCache call here — see the
+	// "Why no WRITE" paragraph in the doc comment above.
 	return grants, nil
 }
 
