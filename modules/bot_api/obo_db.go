@@ -72,12 +72,13 @@ type oboGrantModel struct {
 	// Free-form, grantor-authored prompt that the fan-out path appends to
 	// the synthetic `obo_system_hint` string handed to the grantee bot.
 	// Empty string disables the append (the default for legacy grants).
-	// Column is TEXT (NULL-able; see migration 20260521000001_obo_v2_persona_prompt.sql).
-	// Pre-v2 rows surface as NULL on disk. Read paths that need a guaranteed
-	// non-empty string apply COALESCE(g.persona_prompt, '') (e.g.
-	// listGrantsByGrantor). New grants always supply an explicit value via
-	// insertGrant / createOrReactivateGrantAtomic, so post-v2 rows never
-	// carry NULL.
+	// Column is TEXT (NULL-able at the schema level — `DEFAULT ''` cannot
+	// be expressed on TEXT for MySQL < 8.0.13). The migration backfills
+	// any pre-v2 NULL row to '' immediately after the ALTER, and every
+	// post-v2 insert / reactivate writes an explicit value, so this
+	// field is safe to scan into a non-pointer `string` on every read
+	// path. The defensive COALESCE in listGrantsByGrantor remains as
+	// belt-and-suspenders for any future non-migrated environment.
 	PersonaPrompt string     `db:"persona_prompt" json:"persona_prompt"`
 	CreatedAt     time.Time  `db:"created_at" json:"created_at"`
 	UpdatedAt     time.Time  `db:"updated_at" json:"updated_at"`
@@ -159,22 +160,6 @@ type oboStore interface {
 	// Returns nil on missing row so callers can treat reactivation as
 	// idempotent. See findGrantByGrantorBot for the lookup pattern.
 	reactivateGrant(id int64) error
-	// deactivateOtherActiveGrants — YUJ-1465 / Mininglamp-OSS/octo-server#108
-	// (OBO v2 grant mutual exclusion). Sets `active=0` on every active row
-	// for `grantorUID` whose ID is NOT `exceptID`, with a corresponding
-	// `revoked_at=NOW()` audit stamp and `global_enabled=0` so the
-	// fan-out hot path on the deactivated grants behaves as if the user
-	// had explicitly revoked them. Idempotent: rows already at active=0
-	// are not re-touched. The caller is responsible for first
-	// activating (insert / reactivate) the row identified by `exceptID`;
-	// this method only mutates the OTHER rows.
-	//
-	// Mutex semantics: a grantor may have only ONE active persona at a
-	// time. Creating or reactivating a grant atomically demotes any
-	// previously-active persona under the same grantor. Audit history
-	// is preserved (rows are soft-deleted, not removed) so the UI can
-	// surface the historical timeline.
-	deactivateOtherActiveGrants(grantorUID string, exceptID int64) error
 	// createOrReactivateGrantAtomic — YUJ-1471 / PR#109 review blocker #2.
 	// Atomically creates a fresh grant or reactivates a soft-deleted grant
 	// for the (grantor, bot) pair, applies `personaPrompt`, and demotes
@@ -646,96 +631,15 @@ func (d *botAPIDB) reactivateGrant(id int64) error {
 	return nil
 }
 
-// deactivateOtherActiveGrants — YUJ-1465 / Mininglamp-OSS/octo-server#108
-// (OBO v2 grant mutual exclusion). See oboStore for the contract.
-//
-// Soft-deletes (active=0, global_enabled=0, revoked_at=NOW()) every
-// row for `grantorUID` whose ID is NOT `exceptID` and whose `active=1`.
-// The hot-path cache for the grantor is invalidated unconditionally
-// so a subsequent findActiveGrantByGrantorBot call cannot return a
-// stale "1" answer that points at a row we just demoted. The per-
-// channel caches for each demoted scope are ALSO invalidated so the
-// fan-out listener doesn't keep dispatching against the demoted grant
-// for up to oboCacheTTL (mirrors the same defense updateGrant runs
-// when global_enabled flips).
-//
-// Best-effort on cache eviction: a Redis error never blocks the
-// MySQL commit. The caches are correctness-safe to be stale — the
-// only cost is the next message paying a JOIN.
-func (d *botAPIDB) deactivateOtherActiveGrants(grantorUID string, exceptID int64) error {
-	if grantorUID == "" {
-		return nil
-	}
-	// Pre-fetch the IDs we are about to demote so we can invalidate
-	// their per-channel caches after the UPDATE commits. SELECT FOR
-	// UPDATE is not required — the UNIQUE KEY uk_grantor_grantee
-	// guarantees at most one row per (grantor, bot) pair, so a
-	// concurrent insert for the same grantor would either block on
-	// the unique key or land AFTER this transaction with active=1,
-	// which is fine for v2's "last write wins" mutex (the racing
-	// caller takes the same mutex path on their own insert).
-	type row struct {
-		ID int64 `db:"id"`
-	}
-	var demoted []*row
-	if exceptID == 0 {
-		_, _ = d.session.SelectBySql(
-			"SELECT id FROM obo_grants WHERE grantor_uid=? AND active=1",
-			grantorUID,
-		).Load(&demoted)
-	} else {
-		_, _ = d.session.SelectBySql(
-			"SELECT id FROM obo_grants WHERE grantor_uid=? AND active=1 AND id<>?",
-			grantorUID, exceptID,
-		).Load(&demoted)
-	}
-	if len(demoted) == 0 {
-		// Nothing to demote — common case for first-time grant creation.
-		// Bust the grantor cache anyway: a previously-cached "0" answer
-		// for this grantor must be cleared so the caller's freshly-
-		// activated row is visible on the hot path.
-		d.invalidateGrantorCache(grantorUID)
-		return nil
-	}
-	now := time.Now()
-	var execErr error
-	if exceptID == 0 {
-		_, execErr = d.session.Update("obo_grants").SetMap(map[string]interface{}{
-			"active":         0,
-			"global_enabled": 0,
-			"revoked_at":     now,
-			"updated_at":     now,
-		}).Where("grantor_uid=? AND active=1", grantorUID).Exec()
-	} else {
-		_, execErr = d.session.Update("obo_grants").SetMap(map[string]interface{}{
-			"active":         0,
-			"global_enabled": 0,
-			"revoked_at":     now,
-			"updated_at":     now,
-		}).Where("grantor_uid=? AND active=1 AND id<>?", grantorUID, exceptID).Exec()
-	}
-	if execErr != nil {
-		return execErr
-	}
-	// Per-channel cache invalidation for each demoted grant's scopes.
-	// Stale "1" caches are safe (next listener call re-queries the JOIN
-	// and finds zero rows), but stale "1"s waste a JOIN per inbound
-	// message in the channel for up to oboCacheTTL. Best-effort.
-	for _, r := range demoted {
-		if r == nil || r.ID == 0 {
-			continue
-		}
-		scopes, _ := d.listScopesByGrant(r.ID)
-		for _, s := range scopes {
-			if s == nil {
-				continue
-			}
-			d.invalidateChannelCache(s.ChannelID, s.ChannelType)
-		}
-	}
-	d.invalidateGrantorCache(grantorUID)
-	return nil
-}
+// deactivateOtherActiveGrants — removed in PR#109 R3.
+// The non-transactional standalone soft-deleter was superseded by
+// createOrReactivateGrantAtomic, which folds the demote step inside the
+// same SERIALIZABLE-grade transaction (SELECT ... FOR UPDATE on the
+// grantor row + UPDATE on the OTHER active rows + commit). Keeping the
+// standalone method around encouraged callers to bypass the mutex
+// transaction and re-introduce the two-grant race PR#109 closed. The
+// fan-out cache-invalidation logic now lives inline in
+// createOrReactivateGrantAtomic.
 
 // errOBOGrantAlreadyActive is the sentinel returned by
 // createOrReactivateGrantAtomic when the (grantor, bot) pair already has

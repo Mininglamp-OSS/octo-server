@@ -370,33 +370,9 @@ func (f *fakeOBOStore) reactivateGrant(id int64) error {
 	return nil
 }
 
-// deactivateOtherActiveGrants — YUJ-1465 / Mininglamp-OSS/octo-server#108.
-// Mirrors the prod soft-delete: active=0, global_enabled=0, revoked_at=now,
-// skipping `exceptID`. Idempotent on already-deactivated rows.
-func (f *fakeOBOStore) deactivateOtherActiveGrants(grantorUID string, exceptID int64) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.ensureInit()
-	if grantorUID == "" {
-		return nil
-	}
-	now := time.Now()
-	for _, g := range f.grants {
-		if g.GrantorUID != grantorUID {
-			continue
-		}
-		if g.ID == exceptID {
-			continue
-		}
-		if g.Active != 1 {
-			continue
-		}
-		g.Active = 0
-		g.GlobalEnabled = 0
-		g.RevokedAt = &now
-	}
-	return nil
-}
+// deactivateOtherActiveGrants — removed in PR#109 R3 alongside the prod
+// impl. The atomic createOrReactivateGrantAtomic path is the only
+// supported entry point for the v2 mutex semantics.
 
 // createOrReactivateGrantAtomic — YUJ-1471 / PR#109 review blocker #2 + #3.
 // In-memory analogue of the prod transactional path. The fake's outer mu

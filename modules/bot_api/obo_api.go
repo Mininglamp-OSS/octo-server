@@ -166,7 +166,7 @@ func (ba *BotAPI) oboCreateGrant(c *wkhttp.Context) {
 	// budget. 4096 bytes is generous for natural-language guidance and
 	// matches the cap UI surfaces (see web persona editor).
 	if len(req.PersonaPrompt) > oboPersonaPromptMaxBytes {
-		c.ResponseError(errors.New("persona_prompt 长度超过上限 (最多 4096 字符)"))
+		c.ResponseError(errors.New("persona_prompt 长度超过上限 (最多 4096 字节)"))
 		return
 	}
 
@@ -299,7 +299,7 @@ func (ba *BotAPI) oboUpdateGrant(c *wkhttp.Context) {
 	// PR#109 / YUJ-1471 — persona_prompt length cap. Same rationale as
 	// the create handler; rejected before any DB work hits the row.
 	if req.PersonaPrompt != nil && len(*req.PersonaPrompt) > oboPersonaPromptMaxBytes {
-		c.ResponseError(errors.New("persona_prompt 长度超过上限 (最多 4096 字符)"))
+		c.ResponseError(errors.New("persona_prompt 长度超过上限 (最多 4096 字节)"))
 		return
 	}
 	if req.Mode == "" && req.GlobalEnabled == nil && req.PersonaPrompt == nil {
