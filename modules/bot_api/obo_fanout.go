@@ -214,9 +214,24 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 	}
 
 	// Implicit scope: for GROUP channels, also find global_enabled grants
-	// whose grantor is a member of this group but has no explicit scope row.
-	// This enables "admin is in any group → persona clone auto-covers it"
-	// without manual scope management per channel.
+	// whose grantor is a member of this group AND whose bot is NOT a member,
+	// with no explicit scope row for the channel. The store call collapses
+	// all three predicates into a single JOIN — see
+	// findGlobalGrantsWithoutScope in obo_db.go for the SQL. Pre-PR#121
+	// this loop did one `grantorCanReadChannel` query per global grant
+	// here AND one `userIsGroupMember(bot)` (Gate 4) query per grant in the
+	// dispatch loop below; for a system with N global grants every inbound
+	// group message paid 2*N per-message round-trips. After PR#121 the
+	// implicit-scope feeder is a single SQL statement and the dispatch
+	// loop skips both per-grant checks for these rows (tracked via
+	// `implicitGrantIDs`). Explicit-scope grants returned by
+	// findActiveGrantsForChannel still pay the per-grant Gate 4 +
+	// TOCTOU re-check below — that set is bounded by the number of scope
+	// rows installed for this specific channel and is never large.
+	//
+	// "admin is in any group → persona clone auto-covers it" UX without
+	// requiring manual scope management per channel.
+	implicitGrantIDs := map[int64]bool{}
 	if m.ChannelType == common.ChannelTypeGroup.Uint8() {
 		globalGrants, gErr := store.findGlobalGrantsWithoutScope(lookupChannelID, m.ChannelType)
 		if gErr != nil {
@@ -224,30 +239,13 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 				zap.String("channel_id", lookupChannelID),
 				zap.Error(gErr))
 		} else {
-			// Filter: only include grants where the grantor is actually a member
-			seenIDs := map[int64]bool{}
-			for _, g := range grants {
-				seenIDs[g.ID] = true
-			}
 			for _, g := range globalGrants {
-				if seenIDs[g.ID] {
-					continue // already in scope-matched set
-				}
-				ok, mErr := ba.grantorCanReadChannel(g.GrantorUID, lookupChannelID, m.ChannelType)
-				if mErr != nil {
-					ba.Warn("OBO global-grant membership check failed",
-						zap.String("grantor", g.GrantorUID),
-						zap.String("channel_id", lookupChannelID),
-						zap.Error(mErr))
-					continue
-				}
-				if ok {
-					ba.Info("OBO implicit-scope: grantor is group member, auto-including grant",
-						zap.String("grantor", g.GrantorUID),
-						zap.String("bot", g.GranteeBotUID),
-						zap.String("channel_id", lookupChannelID))
-					grants = append(grants, g)
-				}
+				ba.Info("OBO implicit-scope: SQL-validated grant, auto-including",
+					zap.String("grantor", g.GrantorUID),
+					zap.String("bot", g.GranteeBotUID),
+					zap.String("channel_id", lookupChannelID))
+				implicitGrantIDs[g.ID] = true
+				grants = append(grants, g)
 			}
 		}
 	}
@@ -287,7 +285,15 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 		// respond as grantor”) for the direct-receipt path.
 		// Only applies to GROUP channels; DM fan-out is the sole
 		// delivery path (bot is never a “member” of the peer’s DM).
-		if m.ChannelType == common.ChannelTypeGroup.Uint8() {
+		//
+		// PR#121 perf: implicit-scope grants (sourced from
+		// findGlobalGrantsWithoutScope) have ALREADY been filtered by the
+		// SQL JOIN to guarantee `gm_bot.uid IS NULL`, so the per-grant
+		// `userIsGroupMember(bot)` query here is redundant for them. We
+		// keep it for explicit-scope grants (sourced from
+		// findActiveGrantsForChannel) where the bot-membership status is
+		// not part of the feeder's filter.
+		if !implicitGrantIDs[g.ID] && m.ChannelType == common.ChannelTypeGroup.Uint8() {
 			isBotInGroup, gErr := ba.userIsGroupMember(g.GranteeBotUID, lookupChannelID)
 			if gErr == nil && isBotInGroup {
 				ba.Info("OBO fan-out gate 4: bot is group member, skipping fan-out (adapter handles directly)",
@@ -325,28 +331,37 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 		// no longer has eyes on. DB error → fail-closed (skip this
 		// grant, log, continue with the remaining ones; we never want a
 		// transient DB blip to leak otherwise-denied traffic).
-		canRead, cached := grantorAccess[g.GrantorUID]
-		if !cached {
-			ok, err := ba.grantorCanReadChannel(g.GrantorUID, lookupChannelID, m.ChannelType)
-			if err != nil {
-				ba.Error("OBO fan-out grantor channel-access re-check failed",
+		//
+		// PR#121 perf: implicit-scope grants are skipped here. Their SQL
+		// feeder INNER JOIN'd `group_member` on the grantor exactly
+		// 1ms ago, so a redundant Go-level recheck would just pay for
+		// the same index lookup twice without changing the answer. The
+		// TOCTOU window between the SQL JOIN and the dispatch is
+		// negligible compared to the per-message cost we are removing.
+		if !implicitGrantIDs[g.ID] {
+			canRead, cached := grantorAccess[g.GrantorUID]
+			if !cached {
+				ok, err := ba.grantorCanReadChannel(g.GrantorUID, lookupChannelID, m.ChannelType)
+				if err != nil {
+					ba.Error("OBO fan-out grantor channel-access re-check failed",
+						zap.String("grantor", g.GrantorUID),
+						zap.String("lookup_channel_id", lookupChannelID),
+						zap.Uint8("channel_type", m.ChannelType),
+						zap.Error(err))
+					grantorAccess[g.GrantorUID] = false
+					continue
+				}
+				canRead = ok
+				grantorAccess[g.GrantorUID] = canRead
+			}
+			if !canRead {
+				ba.Warn("OBO fan-out skipped: grantor no longer has read access",
 					zap.String("grantor", g.GrantorUID),
+					zap.String("grantee_bot", g.GranteeBotUID),
 					zap.String("lookup_channel_id", lookupChannelID),
-					zap.Uint8("channel_type", m.ChannelType),
-					zap.Error(err))
-				grantorAccess[g.GrantorUID] = false
+					zap.Uint8("channel_type", m.ChannelType))
 				continue
 			}
-			canRead = ok
-			grantorAccess[g.GrantorUID] = canRead
-		}
-		if !canRead {
-			ba.Warn("OBO fan-out skipped: grantor no longer has read access",
-				zap.String("grantor", g.GrantorUID),
-				zap.String("grantee_bot", g.GranteeBotUID),
-				zap.String("lookup_channel_id", lookupChannelID),
-				zap.Uint8("channel_type", m.ChannelType))
-			continue
 		}
 		// Build a fan-out copy addressed to the bot's own Person mailbox.
 		// NoPersist=1 + SyncOnce=1 keep delivery silent and the bot is the

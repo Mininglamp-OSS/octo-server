@@ -14,6 +14,8 @@ import (
 	"errors"
 	"sync"
 	"time"
+
+	"github.com/Mininglamp-OSS/octo-lib/common"
 )
 
 // fakeOBOStore is the in-memory oboStore used by the OBO unit tests.
@@ -37,6 +39,13 @@ type fakeOBOStore struct {
 	// JOIN against the `user` table (YUJ-1358). When a name is absent the
 	// fake falls back to the bot uid (same as prod's COALESCE).
 	botNames map[string]string
+	// groupMembers maps groupNo → set of uids currently in the group
+	// (`group_member.is_deleted=0`). Used by findGlobalGrantsWithoutScope
+	// to mirror the prod SQL JOIN that filters implicit-scope candidates
+	// down to "grantor IS member AND bot IS NOT member" (PR#121). Tests
+	// that exercise the implicit-scope fan-out path seed this map via
+	// seedGroupMember.
+	groupMembers map[string]map[string]bool
 
 	// Test-side error injection hooks. Defaults to nil → no error.
 	failFindActiveGrant   error
@@ -54,11 +63,12 @@ type fakeOBOStore struct {
 // just `&fakeOBOStore{}` and rely on lazy init.
 func newFakeOBOStore() *fakeOBOStore {
 	return &fakeOBOStore{
-		grants:      map[int64]*oboGrantModel{},
-		scopes:      map[int64]*oboScopeModel{},
-		robotOwners: map[string]string{},
-		nonBotUsers: map[string]bool{},
-		botNames:    map[string]string{},
+		grants:       map[int64]*oboGrantModel{},
+		scopes:       map[int64]*oboScopeModel{},
+		robotOwners:  map[string]string{},
+		nonBotUsers:  map[string]bool{},
+		botNames:     map[string]string{},
+		groupMembers: map[string]map[string]bool{},
 	}
 }
 
@@ -77,6 +87,9 @@ func (f *fakeOBOStore) ensureInit() {
 	}
 	if f.botNames == nil {
 		f.botNames = map[string]string{}
+	}
+	if f.groupMembers == nil {
+		f.groupMembers = map[string]map[string]bool{}
 	}
 }
 
@@ -110,6 +123,26 @@ func (f *fakeOBOStore) seedNonBotUser(uid string) {
 	defer f.mu.Unlock()
 	f.ensureInit()
 	f.nonBotUsers[uid] = true
+}
+
+// seedGroupMember marks `uid` as an active (is_deleted=0) member of
+// `groupNo`. Mirrors the (group_no, uid) covering index on the real
+// `group_member` table. Used by findGlobalGrantsWithoutScope to drive
+// the implicit-scope JOIN filter — tests that exercise the implicit-scope
+// fan-out path must seed both the grantor (so the INNER JOIN matches) and
+// abstain from seeding the bot (so the LEFT JOIN's `gm_bot.uid IS NULL`
+// holds). Calling this for a (groupNo, uid) that is already a member is
+// a no-op.
+func (f *fakeOBOStore) seedGroupMember(groupNo, uid string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureInit()
+	members, ok := f.groupMembers[groupNo]
+	if !ok {
+		members = map[string]bool{}
+		f.groupMembers[groupNo] = members
+	}
+	members[uid] = true
 }
 
 func (f *fakeOBOStore) findActiveGrantByGrantorBot(grantorUID, granteeBotUID string) (*oboGrantModel, error) {
@@ -186,11 +219,32 @@ func (f *fakeOBOStore) findGlobalGrantsWithoutScope(channelID string, channelTyp
 	defer f.mu.Unlock()
 	f.ensureInit()
 	out := []*oboGrantModel{}
-	// Return active+global_enabled grants that DON'T have a scope row for this channel.
+	// Mirror the prod SQL JOIN (PR#121): implicit-scope candidates only
+	// fire for GROUP channels, and a candidate must satisfy ALL of:
+	//   1. active=1 AND global_enabled=1
+	//   2. no obo_scopes row for (grant_id, channel_id, channel_type)
+	//   3. grantor IS a member of the group (group_member, is_deleted=0)
+	//   4. grantee bot is NOT a member of the group (Gate 4)
+	if channelType != common.ChannelTypeGroup.Uint8() {
+		return out, nil
+	}
+	members := f.groupMembers[channelID] // nil-map reads return zero-value
 	for _, g := range f.grants {
 		if g.Active != 1 || g.GlobalEnabled != 1 {
 			continue
 		}
+		// (3) grantor must be a current member.
+		if !members[g.GrantorUID] {
+			continue
+		}
+		// (4) bot must NOT be a current member.
+		if members[g.GranteeBotUID] {
+			continue
+		}
+		// (2) no scope row for this channel — ANY scope row (regardless
+		// of enabled) blocks implicit-scope, matching prod semantics
+		// where an explicitly-disabled scope is an admin's intentional
+		// channel exclusion.
 		hasScope := false
 		for _, s := range f.scopes {
 			if s.GrantID == g.ID && s.ChannelID == channelID && s.ChannelType == channelType {
@@ -198,10 +252,11 @@ func (f *fakeOBOStore) findGlobalGrantsWithoutScope(channelID string, channelTyp
 				break
 			}
 		}
-		if !hasScope {
-			cp := *g
-			out = append(out, &cp)
+		if hasScope {
+			continue
 		}
+		cp := *g
+		out = append(out, &cp)
 	}
 	return out, nil
 }

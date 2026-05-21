@@ -1143,3 +1143,158 @@ func TestFanout_DispatchReq_RealDispatcher_ContractCheck(t *testing.T) {
 		t.Fatalf("WuKongIM contract violations: %v", rejected)
 	}
 }
+
+// TestFanout_ImplicitScope_GrantorMember_BotNotMember — PR#121 perf
+// optimization. With global_enabled=1 and NO explicit scope row, the
+// implicit-scope SQL feeder is the source of truth for "grantor IS in
+// group AND bot is NOT in group". A group message into such a channel
+// must produce one fan-out copy without the dispatch loop ever calling
+// `grantorCanReadChannel` or `userIsGroupMember(bot)` again — the SQL
+// already established both predicates.
+func TestFanout_ImplicitScope_GrantorMember_BotNotMember(t *testing.T) {
+	const groupNo = "group_implicit_42"
+	ct := common.ChannelTypeGroup.Uint8()
+
+	s := newFakeOBOStore()
+	gid, err := s.insertGrant(tGrantor, tBot, "auto", "")
+	if err != nil {
+		t.Fatalf("insertGrant: %v", err)
+	}
+	enable := 1
+	if err := s.updateGrant(gid, "", &enable, nil); err != nil {
+		t.Fatalf("updateGrant: %v", err)
+	}
+	// Grantor is a member; bot is intentionally NOT a member.
+	s.seedGroupMember(groupNo, tGrantor)
+
+	fc := &fanoutCapture{}
+	ba := newBAforFanout(s, fc)
+	// If the access override fires for an implicit-scope grant, the SQL
+	// pre-validation got bypassed — surface that as a hard failure so a
+	// regression that re-introduces the per-grant Go check is caught.
+	ba.oboChannelAccessOverride = func(uid, channelID string, channelType uint8) (bool, error) {
+		t.Errorf("implicit-scope grant must NOT trigger grantorCanReadChannel (uid=%q chan=%q)", uid, channelID)
+		return true, nil
+	}
+
+	msg := &config.MessageResp{
+		FromUID:     "u_alice", // not bot, not grantor
+		ChannelID:   groupNo,
+		ChannelType: ct,
+		Payload:     []byte(`{"type":1,"content":"hello implicit-scope"}`),
+	}
+	if n := ba.fanoutForMessage(msg); n != 1 {
+		t.Fatalf("implicit-scope grantor-member happy path: expected 1 fan-out, got %d", n)
+	}
+	if len(fc.copies) != 1 || fc.copies[0].ChannelID != tBot {
+		t.Fatalf("implicit-scope grantor-member happy path: wrong dispatch, copies=%+v", fc.copies)
+	}
+}
+
+// TestFanout_ImplicitScope_GrantorNotMember_NoFanout — when the grantor
+// is NOT a current group member the SQL JOIN's `INNER JOIN group_member
+// gm_grantor` excludes the grant entirely. No fan-out copy must be
+// dispatched, and the access override must not fire (the candidate set
+// is empty, so the dispatch loop has nothing to re-check).
+func TestFanout_ImplicitScope_GrantorNotMember_NoFanout(t *testing.T) {
+	const groupNo = "group_implicit_43"
+	ct := common.ChannelTypeGroup.Uint8()
+
+	s := newFakeOBOStore()
+	gid, _ := s.insertGrant(tGrantor, tBot, "auto", "")
+	enable := 1
+	_ = s.updateGrant(gid, "", &enable, nil)
+	// Intentionally do NOT seed grantor as group member.
+
+	fc := &fanoutCapture{}
+	ba := newBAforFanout(s, fc)
+	ba.oboChannelAccessOverride = func(uid, channelID string, channelType uint8) (bool, error) {
+		t.Errorf("non-member grantor should never reach the access check (uid=%q)", uid)
+		return true, nil
+	}
+
+	msg := &config.MessageResp{
+		FromUID:     "u_alice",
+		ChannelID:   groupNo,
+		ChannelType: ct,
+		Payload:     []byte(`{"type":1,"content":"should be dropped"}`),
+	}
+	if n := ba.fanoutForMessage(msg); n != 0 {
+		t.Fatalf("non-member grantor must not fan out, got %d", n)
+	}
+	if len(fc.copies) != 0 {
+		t.Fatalf("non-member grantor leaked: captured %d copies, expected 0", len(fc.copies))
+	}
+}
+
+// TestFanout_ImplicitScope_BotAlsoMember_NoFanout — Gate 4 in SQL. When
+// the grantee bot is itself in the group it already receives messages
+// directly via the WuKongIM subscriber pipeline; a fan-out copy would
+// double-process. The new SQL `LEFT JOIN ... gm_bot.uid IS NULL` filter
+// excludes these grants without the dispatch loop having to call
+// `userIsGroupMember(bot)`.
+func TestFanout_ImplicitScope_BotAlsoMember_NoFanout(t *testing.T) {
+	const groupNo = "group_implicit_44"
+	ct := common.ChannelTypeGroup.Uint8()
+
+	s := newFakeOBOStore()
+	gid, _ := s.insertGrant(tGrantor, tBot, "auto", "")
+	enable := 1
+	_ = s.updateGrant(gid, "", &enable, nil)
+	// Both grantor AND bot are members → Gate 4 must drop this candidate.
+	s.seedGroupMember(groupNo, tGrantor)
+	s.seedGroupMember(groupNo, tBot)
+
+	fc := &fanoutCapture{}
+	ba := newBAforFanout(s, fc)
+
+	msg := &config.MessageResp{
+		FromUID:     "u_alice",
+		ChannelID:   groupNo,
+		ChannelType: ct,
+		Payload:     []byte(`{"type":1,"content":"bot is in group already"}`),
+	}
+	if n := ba.fanoutForMessage(msg); n != 0 {
+		t.Fatalf("bot-also-member must not fan out (Gate 4), got %d", n)
+	}
+	if len(fc.copies) != 0 {
+		t.Fatalf("Gate 4 leaked: captured %d copies, expected 0", len(fc.copies))
+	}
+}
+
+// TestFanout_ImplicitScope_ExplicitScopeWins — when an explicit scope row
+// exists (even with enabled=0) the implicit-scope feeder must NOT return
+// the grant. The explicit-scope feeder (`findActiveGrantsForChannel`)
+// requires `enabled=1`, so an `enabled=0` row produces zero fan-out
+// either way — exactly the "admin disabled this channel" semantics.
+func TestFanout_ImplicitScope_ExplicitScopeWins(t *testing.T) {
+	const groupNo = "group_implicit_45"
+	ct := common.ChannelTypeGroup.Uint8()
+
+	s := newFakeOBOStore()
+	gid, _ := s.insertGrant(tGrantor, tBot, "auto", "")
+	enable := 1
+	_ = s.updateGrant(gid, "", &enable, nil)
+	// Grantor is a member, bot is not — would normally trigger implicit
+	// scope. But an explicitly DISABLED scope row exists for this channel.
+	s.seedGroupMember(groupNo, tGrantor)
+	if _, err := s.insertScope(gid, groupNo, ct, 0); err != nil {
+		t.Fatalf("insertScope (disabled): %v", err)
+	}
+
+	fc := &fanoutCapture{}
+	ba := newBAforFanout(s, fc)
+
+	msg := &config.MessageResp{
+		FromUID:     "u_alice",
+		ChannelID:   groupNo,
+		ChannelType: ct,
+		Payload:     []byte(`{"type":1,"content":"admin disabled this channel"}`),
+	}
+	if n := ba.fanoutForMessage(msg); n != 0 {
+		t.Fatalf("explicitly disabled scope must suppress implicit-scope, got %d", n)
+	}
+	if len(fc.copies) != 0 {
+		t.Fatalf("explicit-disabled scope leaked: captured %d copies", len(fc.copies))
+	}
+}

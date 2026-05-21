@@ -39,6 +39,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/go-sql-driver/mysql"
 	"github.com/gocraft/dbr/v2"
 )
@@ -305,24 +306,69 @@ func (d *botAPIDB) findActiveGrantsForChannel(channelID string, channelType uint
 }
 
 // findGlobalGrantsWithoutScope returns active grants with global_enabled=1
-// that do NOT have a scope row for the given channel. These are candidates
-// for the "implicit scope" path: if the grantor is a member of the channel,
-// the fan-out should trigger even without an explicit scope row.
-// This enables the "admin is in any group → persona clone auto-covers it"
-// UX without requiring manual scope management per channel.
+// that satisfy ALL three implicit-scope conditions for fan-out in (channelID,
+// channelType):
+//
+//  1. no explicit scope row exists for this channel (anything explicit, even
+//     `enabled=0`, takes precedence — admins disable a channel intentionally).
+//  2. the grantor IS currently a member of the group (otherwise the grantor
+//     has no read access and the bot must not harvest the channel).
+//  3. the grantee bot is NOT currently a member of the group (Gate 4 —
+//     when the bot is already in the group it receives messages directly via
+//     the WuKongIM subscriber pipeline, so a fan-out copy would double-process).
+//
+// Implicit-scope only applies to GROUP channels (DMs and community topics
+// have no "membership" concept in the way this function uses it), so we
+// return an empty slice for any other channel type. The fan-out caller
+// (oboFanoutForMessage) already guards on ChannelType==Group; the extra
+// check here is belt-and-braces so a future caller cannot accidentally
+// trigger the JOIN with a non-group `channel_id`.
+//
+// Perf rationale (PR#121 review — Jerry-Xin 15:21 blocking): the previous
+// implementation returned every active+global_enabled grant in the system
+// regardless of membership, and the caller looped in Go doing one
+// `userIsGroupMember(grantor)` query + one `userIsGroupMember(bot)` query
+// per grant. For every inbound group message that meant O(total global
+// grants) per-message DB round-trips. Pushing both membership predicates
+// into a single JOIN here collapses the entire scan into one SQL statement
+// — the planner uses the (group_no, uid) covering index on `group_member`
+// once for each join leg and the `(grant_id, channel_id, channel_type)`
+// index on `obo_scopes` once for the anti-join.
+//
+// Returned grants are READY FOR DISPATCH with respect to scope+membership:
+// the caller does NOT need to re-run `grantorCanReadChannel` or Gate 4 for
+// these rows. (Gates 1 / 2 / TOCTOU-after-DB-query still apply, of course;
+// see obo_fanout.go for the residual checks.)
 func (d *botAPIDB) findGlobalGrantsWithoutScope(channelID string, channelType uint8) ([]*oboGrantModel, error) {
 	if channelID == "" {
+		return []*oboGrantModel{}, nil
+	}
+	// Implicit-scope semantics are group-only — the membership joins below
+	// have no meaning for DMs or community topics. Caller already gates on
+	// this; we re-assert defensively so a future caller cannot regress.
+	if channelType != common.ChannelTypeGroup.Uint8() {
 		return []*oboGrantModel{}, nil
 	}
 	var grants []*oboGrantModel
 	_, err := d.session.SelectBySql(
 		"SELECT "+oboGrantColumnsAliased+" FROM obo_grants g "+
-			"WHERE g.active=1 AND g.global_enabled=1 "+
-			"AND g.id NOT IN ("+
-			"  SELECT s.grant_id FROM obo_scopes s "+
-			"  WHERE s.grant_id=g.id AND s.channel_id=? AND s.channel_type=?"+
-			")",
-		channelID, channelType,
+			"INNER JOIN group_member gm_grantor "+
+			"  ON gm_grantor.uid = g.grantor_uid "+
+			"  AND gm_grantor.group_no = ? "+
+			"  AND gm_grantor.is_deleted = 0 "+
+			"LEFT JOIN group_member gm_bot "+
+			"  ON gm_bot.uid = g.grantee_bot_uid "+
+			"  AND gm_bot.group_no = ? "+
+			"  AND gm_bot.is_deleted = 0 "+
+			"LEFT JOIN obo_scopes s "+
+			"  ON s.grant_id = g.id "+
+			"  AND s.channel_id = ? "+
+			"  AND s.channel_type = ? "+
+			"WHERE g.active = 1 "+
+			"  AND g.global_enabled = 1 "+
+			"  AND gm_bot.uid IS NULL "+
+			"  AND s.id IS NULL",
+		channelID, channelID, channelID, channelType,
 	).Load(&grants)
 	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
 		return nil, err
