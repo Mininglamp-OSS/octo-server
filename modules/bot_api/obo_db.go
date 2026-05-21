@@ -39,9 +39,37 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/go-sql-driver/mysql"
 	"github.com/gocraft/dbr/v2"
 )
+
+// isGroupLikeChannelType reports whether channelType is a "group-shaped"
+// type (Group / CommunityTopic) for which an OBO grant with
+// `global_enabled=1` covers EVERY group/topic the grantor participates in
+// without requiring a per-channel `obo_scopes` row.
+//
+// YUJ-1538 rationale: PR#82 / PR#109 v1+v2 modeled scopes as a strict
+// white-list — the grantor explicitly enumerated each channel they
+// wanted the persona to observe. In practice operators only ever
+// installed `channel_type=1` (DM) scopes; for groups the v2 fan-out
+// narrowing gate (`mention.uids` must contain the grantor) is the
+// effective opt-in signal, not a scope row. The fan-out trigger query
+// must therefore not require scope rows for group/topic channels — a
+// `global_enabled=1` grant suffices, and the per-grant
+// `grantorCanReadChannel` re-check inside fanoutForMessage still
+// enforces live membership.
+//
+// DM (Person) channels keep the strict scope-row contract: a DM is a
+// 1:1 conversation that the persona must be explicitly authorized for,
+// and the @grantor narrowing gate cannot be applied (DM payloads carry
+// no mention). The check in checkOBO (the third-party send path) also
+// still requires the scope row regardless of channel type — only the
+// fan-out trigger lookup is widened here.
+func isGroupLikeChannelType(channelType uint8) bool {
+	return channelType == common.ChannelTypeGroup.Uint8() ||
+		channelType == common.ChannelTypeCommunityTopic.Uint8()
+}
 
 // ==================== Models ====================
 
@@ -312,16 +340,46 @@ func (d *botAPIDB) scopeEnabled(grantID int64, channelID string, channelType uin
 	return count > 0, nil
 }
 
-// findActiveGrantsForChannel — see oboStore. Single JOIN so the fan-out
-// hot path doesn't have to issue a per-grant scope lookup.
+// findActiveGrantsForChannel — see oboStore. Single index-hit so the
+// fan-out hot path doesn't have to issue a per-grant scope lookup.
 //
 // Read path consults `obo:chan:{type}:{id}` first. A cached "0" answer
 // returns an empty slice without touching MySQL — the fan-out listener
 // fires for every inbound message system-wide, so the vast majority of
-// channels (those with no OBO grants) avoid the JOIN entirely. Positive
+// channels (those with no OBO grants) avoid the lookup entirely. Positive
 // hits and MySQL fallback both repopulate the cache with the count-based
 // scalar ("1" any matches, "0" none). Cache errors swallowed; production
 // behavior is identical whether Redis is healthy or absent.
+//
+// YUJ-1538 — channel-type-aware lookup:
+//
+//   - DM (Person, channel_type=1): keeps the strict
+//     `obo_grants ⨝ obo_scopes` JOIN. DMs are 1:1 conversations and the
+//     persona must be explicitly white-listed per peer. This is the
+//     pre-existing contract and is unchanged.
+//
+//   - Group (channel_type=2) / CommunityTopic (channel_type=5): a grant
+//     with `active=1 AND global_enabled=1` covers EVERY group/topic the
+//     grantor participates in, WITHOUT requiring an `obo_scopes` row.
+//     v2 narrowing (`mention.uids` must contain the grantor, or
+//     `mention.all=1`) is the effective per-message opt-in instead of a
+//     scope row, and the per-grant `grantorCanReadChannel` re-check in
+//     fanoutForMessage still enforces live channel membership. The bug
+//     PR#109 left behind: `obo_scopes` only ever held `channel_type=1`
+//     rows in production (operators never created group scopes), so the
+//     INNER JOIN returned zero matches for every group inbound and the
+//     fan-out copy never reached the bot — even though `checkOBO` had
+//     already been updated to bypass the scope check for groups.
+//
+// Cache notes (group/topic): the per-channel cache key still gates the
+// hot path. When the FIRST `global_enabled=1` grant is enabled in a
+// previously-empty system, group channel cache entries holding a stale
+// "0" remain so for at most `oboCacheTTL` (30s); after that the next
+// inbound re-queries MySQL and the cache flips. Per-channel
+// invalidation of group caches at grant-enable time would require
+// enumerating every group the grantor participates in, which is more
+// work than the bounded warmup window saves; the same 30s TTL was the
+// design's accepted risk in RFC §11.
 func (d *botAPIDB) findActiveGrantsForChannel(channelID string, channelType uint8) ([]*oboGrantModel, error) {
 	if channelID == "" {
 		return []*oboGrantModel{}, nil
@@ -330,12 +388,32 @@ func (d *botAPIDB) findActiveGrantsForChannel(channelID string, channelType uint
 		return []*oboGrantModel{}, nil
 	}
 	var grants []*oboGrantModel
-	_, err := d.session.SelectBySql(
-		"SELECT g.* FROM obo_grants g INNER JOIN obo_scopes s ON s.grant_id=g.id "+
-			"WHERE g.active=1 AND g.global_enabled=1 AND s.enabled=1 "+
-			"AND s.channel_id=? AND s.channel_type=?",
-		channelID, channelType,
-	).Load(&grants)
+	var err error
+	if isGroupLikeChannelType(channelType) {
+		// Group / CommunityTopic — `global_enabled=1` is sufficient,
+		// no scope row required. Returns every active+enabled grant
+		// system-wide; the per-grant `grantorCanReadChannel` re-check
+		// in the fan-out loop filters to grants whose grantor is
+		// actually a member of THIS group/topic. With the v2
+		// `uk_grantor_grantee` UNIQUE + create-mutex (PR#109), the
+		// number of active+enabled grants is bounded — at most one
+		// per grantor — so the fan-out cost is O(grantors) per
+		// inbound, not O(scopes).
+		_, err = d.session.SelectBySql(
+			"SELECT g.* FROM obo_grants g " +
+				"WHERE g.active=1 AND g.global_enabled=1",
+		).Load(&grants)
+	} else {
+		// DM (Person) and any other unrecognized channel type — keep
+		// the original strict JOIN so behavior is unchanged outside
+		// the group-like path.
+		_, err = d.session.SelectBySql(
+			"SELECT g.* FROM obo_grants g INNER JOIN obo_scopes s ON s.grant_id=g.id "+
+				"WHERE g.active=1 AND g.global_enabled=1 AND s.enabled=1 "+
+				"AND s.channel_id=? AND s.channel_type=?",
+			channelID, channelType,
+		).Load(&grants)
+	}
 	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
 		return nil, err
 	}

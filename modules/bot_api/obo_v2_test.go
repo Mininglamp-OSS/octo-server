@@ -60,26 +60,32 @@ func TestFanout_V2_GroupRequiresGrantorMention(t *testing.T) {
 }
 
 // TestFanout_V2_GroupMentionAIBotDoesNotSummonPersona — a message that
-// @-mentions only the bot (or only sets mention.all=1) must not summon
-// the grantor's persona. The narrowing gate is intentionally STRICT on
-// mention.uids — neither mention.all nor mention.ais counts. Without
+// @-mentions only the bot or only sets `mention.ais=1` (the AI-broadcast
+// flag) must not summon the grantor's persona. The narrowing gate is
+// strict on `mention.uids` for AI-only / bot-only traffic — neither
+// `mention.ais` nor a foreign-bot uid in `mention.uids` counts. Without
 // this strictness the v1 "fan out everything" semantics return.
+//
+// YUJ-1538 carve-out: `mention.all=1` (the `@所有人` broadcast flag) IS
+// honoured by the gate as an implicit summon for every grantor, so it
+// is intentionally NOT exercised here — the dedicated
+// TestFanout_V2_GroupMentionAllSummonsPersona below covers that.
 func TestFanout_V2_GroupMentionAIBotDoesNotSummonPersona(t *testing.T) {
 	ch, ct := "group_42", common.ChannelTypeGroup.Uint8()
 	s := seedGrantWithScope(t, ch, ct)
 	fc := &fanoutCapture{}
 	ba := newBAforFanout(s, fc)
 
-	// mention.all=1 + mention.uids=[some_other_bot] — neither summons
+	// mention.ais=1 + mention.uids=[some_other_bot] — neither summons
 	// our grantor (tGrantor) so v2 must skip.
 	msg := &config.MessageResp{
 		FromUID:     "alice",
 		ChannelID:   ch,
 		ChannelType: ct,
-		Payload:     []byte(`{"type":1,"content":"@AI everyone","mention":{"all":1,"ais":1,"uids":["some_other_bot"]}}`),
+		Payload:     []byte(`{"type":1,"content":"@AI please","mention":{"ais":1,"uids":["some_other_bot"]}}`),
 	}
 	if n := ba.fanoutForMessage(msg); n != 0 {
-		t.Fatalf("v2 narrowing violated: @AI / mention.all must NOT summon persona without explicit @grantor, got %d dispatches", n)
+		t.Fatalf("v2 narrowing violated: @AI / mention.ais must NOT summon persona without explicit @grantor or mention.all=1, got %d dispatches", n)
 	}
 }
 

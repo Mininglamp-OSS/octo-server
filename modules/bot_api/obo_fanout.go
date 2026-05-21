@@ -215,8 +215,11 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 	// (modulo the loop-protection gates) so the persona could observe
 	// the full conversation. v2 narrows the trigger: a fan-out copy is
 	// only minted when the inbound message explicitly summons the
-	// grantor via `payload.mention.uids`. @AI / @bot / plain (no
-	// mention) traffic no longer triggers the persona.
+	// grantor via `payload.mention.uids` — OR (YUJ-1538) when the
+	// message is a `@所有人` broadcast (`payload.mention.all=1`), which
+	// by spec is the strongest possible "you specifically were
+	// addressed" signal. @AI-only / @bot / plain (no mention) traffic
+	// still does NOT trigger the persona.
 	//
 	// Decoded once per inbound message: the per-grant loop below
 	// only re-uses `mentioned` to test set membership for each
@@ -226,7 +229,7 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 	// mentions" — fail-closed (no fan-out) is correct; v1 silently
 	// dispatched in that case but v2 explicitly requires the summon
 	// signal.
-	mentioned := decodeMentionUIDs(m.Payload)
+	mentioned, mentionAll := decodeMentionGate(m.Payload)
 
 	// PR#82 round-2 P1-A — per-call cache for the grantor channel-access
 	// re-check. Multiple active grants for the same (channel, grantor)
@@ -278,6 +281,13 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 		// traffic does NOT summon the persona. Mention set was decoded
 		// once at the top of fanoutForMessage; map lookup is O(1).
 		//
+		// YUJ-1538 — `@所有人` (`mention.all=1`) ALSO counts as
+		// "grantor was summoned". Real WuKongIM `@所有人` payloads
+		// commonly carry `mention.all=1` without re-listing every
+		// group member in `mention.uids`, so without this branch a
+		// broadcast in a group with an active persona grant would
+		// silently never fan out.
+		//
 		// DM-only special case: a DM is a 1:1 conversation in which the
 		// grantor is the implicit recipient (m.ChannelID == grantor for
 		// DMs after the round-3 P1 filter above). DM payloads in
@@ -289,8 +299,10 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 		// COMMUNITY_TOPIC traffic where the persona summon is
 		// disambiguating.
 		if m.ChannelType != common.ChannelTypePerson.Uint8() {
-			if _, ok := mentioned[g.GrantorUID]; !ok {
-				continue
+			if !mentionAll {
+				if _, ok := mentioned[g.GrantorUID]; !ok {
+					continue
+				}
 			}
 		}
 		// PR#82 round-2 P1-A — TOCTOU close-out on the fan-out hot path.
@@ -525,55 +537,115 @@ func buildFanoutCopyReq(m *config.MessageResp, g *oboGrantModel, grantorName, se
 	)
 }
 
-// decodeMentionUIDs — YUJ-1465 / Mininglamp-OSS/octo-server#108 (OBO v2).
-// Pulls the `mention.uids` array off the raw inbound payload and returns
-// it as a set keyed by uid. Returns an empty (non-nil) set when:
+// decodeMentionGate — YUJ-1465 / Mininglamp-OSS/octo-server#108 (OBO v2)
+// + YUJ-1538 (`@所有人` broadcast support).
+//
+// Pulls the v2 narrowing-gate inputs off the raw inbound payload:
+//
+//   - `uids`: the explicit `mention.uids` array, returned as a
+//     set keyed by uid (O(1) per-grant membership tests in
+//     fanoutForMessage's loop).
+//   - `all`:  whether `mention.all` is truthy (1 / true). `@所有人`
+//     traffic in WuKongIM commonly carries `mention.all=1` without
+//     re-listing every group member in `mention.uids`, so the gate
+//     treats it as "every grantor was implicitly mentioned" for
+//     group/topic channels.
+//
+// Returns an empty (non-nil) set + `all=false` when:
 //
 //   - the payload is empty or not JSON-decodable;
 //   - the payload has no `mention` object;
 //   - `mention.uids` is missing, not an array, or empty;
-//   - individual array entries are not strings.
+//   - `mention.all` is missing / falsey;
+//   - individual `uids` entries are not strings.
 //
-// Empty set = "no one was mentioned"; combined with the v2 narrowing
-// gate it means "do not fan out" for the GROUP / COMMUNITY_TOPIC path.
-// We intentionally do not look at `mention.all` or `mention.ais` —
-// per the spec, @AI / @bot / plain broadcast traffic MUST NOT summon
-// the persona; the grantor's uid must be present in `mention.uids`
-// specifically.
-func decodeMentionUIDs(payload []byte) map[string]struct{} {
-	out := map[string]struct{}{}
+// Empty set + `all=false` = "no one was mentioned"; combined with the
+// v2 narrowing gate it means "do not fan out" for the GROUP /
+// COMMUNITY_TOPIC path. We intentionally do NOT honour `mention.ais`
+// here — per the v2 spec, @AI / @bot traffic by itself MUST NOT summon
+// the persona; the grantor must be a target of `mention.uids` OR the
+// message must be a `@所有人` broadcast.
+func decodeMentionGate(payload []byte) (uids map[string]struct{}, all bool) {
+	uids = map[string]struct{}{}
 	if len(payload) == 0 {
-		return out
+		return uids, false
 	}
 	var decoded map[string]interface{}
 	if err := json.Unmarshal(payload, &decoded); err != nil {
-		return out
+		return uids, false
 	}
 	raw, ok := decoded["mention"]
 	if !ok || raw == nil {
-		return out
+		return uids, false
 	}
 	mentionMap, ok := raw.(map[string]interface{})
 	if !ok {
-		return out
+		return uids, false
 	}
-	uidsRaw, ok := mentionMap["uids"]
-	if !ok || uidsRaw == nil {
-		return out
-	}
-	uidsSlice, ok := uidsRaw.([]interface{})
-	if !ok {
-		return out
-	}
-	for _, v := range uidsSlice {
-		if s, ok := v.(string); ok {
-			s = strings.TrimSpace(s)
-			if s != "" {
-				out[s] = struct{}{}
+	if uidsRaw, ok := mentionMap["uids"]; ok && uidsRaw != nil {
+		if uidsSlice, ok := uidsRaw.([]interface{}); ok {
+			for _, v := range uidsSlice {
+				if s, ok := v.(string); ok {
+					s = strings.TrimSpace(s)
+					if s != "" {
+						uids[s] = struct{}{}
+					}
+				}
 			}
 		}
 	}
-	return out
+	all = mentionFlagTruthy(mentionMap["all"])
+	return uids, all
+}
+
+// mentionFlagTruthy reports whether a parsed `mention.*` flag is the
+// numeric/boolean form of 1. Mirrors `pkg/mentionrewrite.isTruthyOne`
+// (unexported there) and the read-side helper in
+// `modules/message/api_reminders.go` so the OBO fan-out gate cannot
+// disagree with the message-write/read-reminders code about what
+// counts as "set". Kept local to avoid widening pkg/mentionrewrite's
+// public surface for a helper that's mostly used at write-time.
+//
+// Real WuKongIM payloads decode into a mix of float64 (the default
+// json.Unmarshal numeric type — what `decodeMentionGate` produces) and
+// json.Number (used by other read paths that opt into
+// `json.Decoder.UseNumber()`). We accept both plus bool / int* / uint*
+// so a caller sending the legacy `"all": true` shape continues to work.
+func mentionFlagTruthy(v interface{}) bool {
+	switch x := v.(type) {
+	case nil:
+		return false
+	case bool:
+		return x
+	case float64:
+		return x == 1
+	case float32:
+		return x == 1
+	case json.Number:
+		n, err := x.Int64()
+		return err == nil && n == 1
+	case int:
+		return x == 1
+	case int8:
+		return x == 1
+	case int16:
+		return x == 1
+	case int32:
+		return x == 1
+	case int64:
+		return x == 1
+	case uint:
+		return x == 1
+	case uint8:
+		return x == 1
+	case uint16:
+		return x == 1
+	case uint32:
+		return x == 1
+	case uint64:
+		return x == 1
+	}
+	return false
 }
 
 // oboResolveDisplayName — YUJ-1465. Resolves a uid to a human display

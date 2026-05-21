@@ -12,6 +12,7 @@ package bot_api
 
 import (
 	"errors"
+	"sort"
 	"sync"
 	"time"
 )
@@ -174,7 +175,30 @@ func (f *fakeOBOStore) findActiveGrantsForChannel(channelID string, channelType 
 	}
 	f.ensureInit()
 	out := []*oboGrantModel{}
-	// First collect matching grant IDs via the scopes.
+	// YUJ-1538 — mirror the production channel-type-aware lookup:
+	// Group / CommunityTopic return every active+global_enabled grant
+	// without requiring a scope row; DM (Person) keeps the strict
+	// scope-row contract.
+	if isGroupLikeChannelType(channelType) {
+		// Iterate by sorted grant ID so tests get deterministic ordering
+		// independent of map iteration order.
+		ids := make([]int64, 0, len(f.grants))
+		for id := range f.grants {
+			ids = append(ids, id)
+		}
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		for _, id := range ids {
+			g := f.grants[id]
+			if g == nil || g.Active != 1 || g.GlobalEnabled != 1 {
+				continue
+			}
+			cp := *g
+			out = append(out, &cp)
+		}
+		return out, nil
+	}
+	// DM path — original behavior: only grants with a matching enabled
+	// scope row are surfaced.
 	for _, s := range f.scopes {
 		if s.ChannelID != channelID || s.ChannelType != channelType || s.Enabled != 1 {
 			continue
