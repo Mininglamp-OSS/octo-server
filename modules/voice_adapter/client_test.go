@@ -82,7 +82,7 @@ func TestGetVocabulary(t *testing.T) {
 	defer srv.Close()
 
 	client := NewSpeechClient(srv.URL, "test-key", 5*time.Second)
-	vocab, err := client.GetVocabulary("user1", "space", "space1")
+	vocab, err := client.GetVocabulary(context.Background(), "user1", "space", "space1")
 	if err != nil {
 		t.Fatalf("GetVocabulary failed: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestGetVocabularyError(t *testing.T) {
 	defer srv.Close()
 
 	client := NewSpeechClient(srv.URL, "test-key", 5*time.Second)
-	_, err := client.GetVocabulary("user1", "space", "space1")
+	_, err := client.GetVocabulary(context.Background(), "user1", "space", "space1")
 	if err == nil {
 		t.Fatal("expected error for 500 response")
 	}
@@ -145,7 +145,7 @@ func TestPutVocabulary(t *testing.T) {
 	defer srv.Close()
 
 	client := NewSpeechClient(srv.URL, "test-key", 5*time.Second)
-	err := client.PutVocabulary(PutVocabularyRequest{
+	err := client.PutVocabulary(context.Background(), PutVocabularyRequest{
 		SubjectID: "user1",
 		ScopeType: "space",
 		ScopeID:   "space1",
@@ -174,7 +174,7 @@ func TestDeleteVocabulary(t *testing.T) {
 	defer srv.Close()
 
 	client := NewSpeechClient(srv.URL, "test-key", 5*time.Second)
-	err := client.DeleteVocabulary("user1", "space", "space1")
+	err := client.DeleteVocabulary(context.Background(), "user1", "space", "space1")
 	if err != nil {
 		t.Fatalf("DeleteVocabulary failed: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestGetConfig(t *testing.T) {
 	defer srv.Close()
 
 	client := NewSpeechClient(srv.URL, "test-key", 5*time.Second)
-	cfg, err := client.GetConfig()
+	cfg, err := client.GetConfig(context.Background())
 	if err != nil {
 		t.Fatalf("GetConfig failed: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestGetConfigError(t *testing.T) {
 	defer srv.Close()
 
 	client := NewSpeechClient(srv.URL, "test-key", 5*time.Second)
-	_, err := client.GetConfig()
+	_, err := client.GetConfig(context.Background())
 	if err == nil {
 		t.Fatal("expected error for 503 response")
 	}
@@ -237,7 +237,7 @@ func TestGetConfig_ConnectionRefused(t *testing.T) {
 	ln.Close()
 
 	client := NewSpeechClient("http://"+addr, "test-key", 2*time.Second)
-	_, err = client.GetConfig()
+	_, err = client.GetConfig(context.Background())
 	if err == nil {
 		t.Fatal("expected error for unreachable server")
 	}
@@ -257,7 +257,7 @@ func TestGetVocabulary_URLEscaping(t *testing.T) {
 	defer srv.Close()
 
 	client := NewSpeechClient(srv.URL, "test-key", 5*time.Second)
-	_, err := client.GetVocabulary("user&id=1", "space", "space with spaces")
+	_, err := client.GetVocabulary(context.Background(), "user&id=1", "space", "space with spaces")
 	if err != nil {
 		t.Fatalf("GetVocabulary with special chars failed: %v", err)
 	}
@@ -274,7 +274,7 @@ func TestDeleteVocabulary_URLEscaping(t *testing.T) {
 	defer srv.Close()
 
 	client := NewSpeechClient(srv.URL, "test-key", 5*time.Second)
-	err := client.DeleteVocabulary("user&id=1", "space", "space1")
+	err := client.DeleteVocabulary(context.Background(), "user&id=1", "space", "space1")
 	if err != nil {
 		t.Fatalf("DeleteVocabulary with special chars failed: %v", err)
 	}

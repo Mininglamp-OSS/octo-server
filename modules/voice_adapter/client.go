@@ -40,6 +40,15 @@ type PutVocabularyRequest struct {
 	UpdatedBy string `json:"updated_by"`
 }
 
+type SpeechServiceError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *SpeechServiceError) Error() string {
+	return fmt.Sprintf("speech service returned %d: %s", e.StatusCode, e.Body)
+}
+
 func (c *SpeechClient) ForwardTranscribe(r *http.Request) (*http.Response, error) {
 	return c.ForwardTranscribeBody(r.Context(), r.Body, r.Header.Get("Content-Type"))
 }
@@ -57,14 +66,14 @@ func (c *SpeechClient) ForwardTranscribeBody(ctx context.Context, body io.Reader
 	return c.client.Do(proxyReq)
 }
 
-func (c *SpeechClient) GetVocabulary(subjectID, scopeType, scopeID string) (*VocabularyResponse, error) {
+func (c *SpeechClient) GetVocabulary(ctx context.Context, subjectID, scopeType, scopeID string) (*VocabularyResponse, error) {
 	params := url.Values{}
 	params.Set("subject_id", subjectID)
 	params.Set("scope_type", scopeType)
 	params.Set("scope_id", scopeID)
 	reqURL := c.baseURL + "/v1/speech/vocabularies?" + params.Encode()
 
-	req, err := http.NewRequest(http.MethodGet, reqURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -78,7 +87,7 @@ func (c *SpeechClient) GetVocabulary(subjectID, scopeType, scopeID string) (*Voc
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("speech service returned %d: %s", resp.StatusCode, string(body))
+		return nil, &SpeechServiceError{StatusCode: resp.StatusCode, Body: string(body)}
 	}
 
 	var result VocabularyResponse
@@ -88,13 +97,13 @@ func (c *SpeechClient) GetVocabulary(subjectID, scopeType, scopeID string) (*Voc
 	return &result, nil
 }
 
-func (c *SpeechClient) PutVocabulary(req PutVocabularyRequest) error {
+func (c *SpeechClient) PutVocabulary(ctx context.Context, req PutVocabularyRequest) error {
 	body, err := json.Marshal(req)
 	if err != nil {
 		return fmt.Errorf("marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequest(http.MethodPut, c.baseURL+"/v1/speech/vocabularies", bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPut, c.baseURL+"/v1/speech/vocabularies", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
@@ -109,19 +118,19 @@ func (c *SpeechClient) PutVocabulary(req PutVocabularyRequest) error {
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("speech service returned %d: %s", resp.StatusCode, string(respBody))
+		return &SpeechServiceError{StatusCode: resp.StatusCode, Body: string(respBody)}
 	}
 	return nil
 }
 
-func (c *SpeechClient) DeleteVocabulary(subjectID, scopeType, scopeID string) error {
+func (c *SpeechClient) DeleteVocabulary(ctx context.Context, subjectID, scopeType, scopeID string) error {
 	params := url.Values{}
 	params.Set("subject_id", subjectID)
 	params.Set("scope_type", scopeType)
 	params.Set("scope_id", scopeID)
 	reqURL := c.baseURL + "/v1/speech/vocabularies?" + params.Encode()
 
-	req, err := http.NewRequest(http.MethodDelete, reqURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, reqURL, nil)
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
@@ -135,13 +144,13 @@ func (c *SpeechClient) DeleteVocabulary(subjectID, scopeType, scopeID string) er
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("speech service returned %d: %s", resp.StatusCode, string(body))
+		return &SpeechServiceError{StatusCode: resp.StatusCode, Body: string(body)}
 	}
 	return nil
 }
 
-func (c *SpeechClient) GetConfig() (map[string]interface{}, error) {
-	req, err := http.NewRequest(http.MethodGet, c.baseURL+"/v1/speech/config", nil)
+func (c *SpeechClient) GetConfig(ctx context.Context) (map[string]interface{}, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/speech/config", nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -155,7 +164,7 @@ func (c *SpeechClient) GetConfig() (map[string]interface{}, error) {
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("speech service returned %d: %s", resp.StatusCode, string(body))
+		return nil, &SpeechServiceError{StatusCode: resp.StatusCode, Body: string(body)}
 	}
 
 	var result map[string]interface{}

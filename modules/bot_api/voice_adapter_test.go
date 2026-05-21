@@ -72,6 +72,8 @@ func TestBotTranscribe_ModeMapping(t *testing.T) {
 			ba := &BotAPI{
 				Log:          log.NewTLog("BotAPI-test"),
 				speechClient: client,
+				maxBodySize:  5 << 20,
+				maxFileSize:  3 << 20,
 			}
 
 			fields := map[string]string{"lang": "en"}
@@ -120,6 +122,8 @@ func TestBotTranscribe_ForwardsAudioFile(t *testing.T) {
 	ba := &BotAPI{
 		Log:          log.NewTLog("BotAPI-test"),
 		speechClient: client,
+		maxBodySize:  5 << 20,
+		maxFileSize:  3 << 20,
 	}
 
 	httpReq, _ := buildMultipartRequest(t, map[string]string{"mode": "edit"}, "audio.wav", audioData)
@@ -372,22 +376,14 @@ func TestBotDeleteVoiceContext_Success(t *testing.T) {
 	assert.Equal(t, http.StatusOK, rec.Code)
 }
 
-func TestBotTranscribe_UnknownModePassedThrough(t *testing.T) {
+func TestBotTranscribe_UnknownModeRejected(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	var receivedMode string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		r.ParseMultipartForm(32 << 20)
-		receivedMode = r.FormValue("mode")
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{"status": 200})
-	}))
-	defer srv.Close()
-
-	client := voice_adapter.NewSpeechClient(srv.URL, "test-key", 5*time.Second)
 	ba := &BotAPI{
 		Log:          log.NewTLog("BotAPI-test"),
-		speechClient: client,
+		speechClient: voice_adapter.NewSpeechClient("http://unused", "test-key", 5*time.Second),
+		maxBodySize:  5 << 20,
+		maxFileSize:  3 << 20,
 	}
 
 	httpReq, _ := buildMultipartRequest(t, map[string]string{"mode": "custom_mode"}, "audio.wav", []byte("data"))
@@ -399,9 +395,8 @@ func TestBotTranscribe_UnknownModePassedThrough(t *testing.T) {
 
 	ba.botTranscribe(c)
 
-	assert.Equal(t, http.StatusOK, rec.Code)
-	assert.Equal(t, "custom_mode", receivedMode,
-		"unknown modes should be passed through unchanged")
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "invalid mode")
 }
 
 func TestBotTranscribe_MultipleFormFields(t *testing.T) {
@@ -422,6 +417,8 @@ func TestBotTranscribe_MultipleFormFields(t *testing.T) {
 	ba := &BotAPI{
 		Log:          log.NewTLog("BotAPI-test"),
 		speechClient: client,
+		maxBodySize:  5 << 20,
+		maxFileSize:  3 << 20,
 	}
 
 	fields := map[string]string{
@@ -447,7 +444,11 @@ func TestBotTranscribe_MultipleFormFields(t *testing.T) {
 func TestBotTranscribe_InvalidMultipartForm(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	ba := &BotAPI{Log: log.NewTLog("BotAPI-test")}
+	ba := &BotAPI{
+		Log:         log.NewTLog("BotAPI-test"),
+		maxBodySize: 5 << 20,
+		maxFileSize: 3 << 20,
+	}
 
 	httpReq := httptest.NewRequest(http.MethodPost, "/v1/bot/voice/transcribe",
 		strings.NewReader("not a multipart form"))

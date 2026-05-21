@@ -7,6 +7,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
@@ -101,7 +102,7 @@ func (ba *BotAPI) botPutVoiceContext(c *wkhttp.Context) {
 		return
 	}
 
-	err := ba.speechClient.PutVocabulary(voice_adapter.PutVocabularyRequest{
+	err := ba.speechClient.PutVocabulary(c.Request.Context(), voice_adapter.PutVocabularyRequest{
 		SubjectID: ownerUID,
 		ScopeType: "space",
 		ScopeID:   spaceID,
@@ -123,7 +124,7 @@ func (ba *BotAPI) botGetVoiceContext(c *wkhttp.Context) {
 		return
 	}
 
-	vocab, err := ba.speechClient.GetVocabulary(ownerUID, "space", spaceID)
+	vocab, err := ba.speechClient.GetVocabulary(c.Request.Context(), ownerUID, "space", spaceID)
 	if err != nil {
 		ba.Error("get vocabulary failed", zap.Error(err), zap.String("robotID", robotID))
 		c.ResponseErrorWithStatus(errors.New("query voice context failed"), http.StatusInternalServerError)
@@ -144,7 +145,7 @@ func (ba *BotAPI) botDeleteVoiceContext(c *wkhttp.Context) {
 		return
 	}
 
-	err := ba.speechClient.DeleteVocabulary(ownerUID, "space", spaceID)
+	err := ba.speechClient.DeleteVocabulary(c.Request.Context(), ownerUID, "space", spaceID)
 	if err != nil {
 		ba.Error("delete vocabulary failed", zap.Error(err), zap.String("robotID", robotID))
 		c.ResponseErrorWithStatus(errors.New("delete voice context failed"), http.StatusInternalServerError)
@@ -164,9 +165,29 @@ func (ba *BotAPI) botTranscribe(c *wkhttp.Context) {
 		return
 	}
 
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, ba.maxBodySize)
+
 	if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			c.ResponseErrorWithStatus(errors.New("request body too large"), http.StatusRequestEntityTooLarge)
+			return
+		}
 		c.ResponseErrorWithStatus(errors.New("invalid multipart form"), http.StatusBadRequest)
 		return
+	}
+	defer c.Request.MultipartForm.RemoveAll()
+
+	for _, fileHeaders := range c.Request.MultipartForm.File {
+		for _, fh := range fileHeaders {
+			if fh.Size > ba.maxFileSize {
+				c.ResponseErrorWithStatus(
+					fmt.Errorf("file %s exceeds max size %d bytes", fh.Filename, ba.maxFileSize),
+					http.StatusRequestEntityTooLarge,
+				)
+				return
+			}
+		}
 	}
 
 	mode := c.Request.FormValue("mode")
@@ -175,6 +196,12 @@ func (ba *BotAPI) botTranscribe(c *wkhttp.Context) {
 		mode = "append_only"
 	case "edit", "":
 		mode = "smart"
+	default:
+		c.ResponseErrorWithStatus(
+			fmt.Errorf("invalid mode '%s': must be 'append' or 'edit'", mode),
+			http.StatusBadRequest,
+		)
+		return
 	}
 
 	var buf bytes.Buffer
@@ -206,7 +233,17 @@ func (ba *BotAPI) botTranscribe(c *wkhttp.Context) {
 				c.ResponseErrorWithStatus(errors.New("failed to read uploaded file"), http.StatusBadRequest)
 				return
 			}
-			dst, err := w.CreateFormFile(key, fh.Filename)
+
+			partHeader := make(textproto.MIMEHeader)
+			partHeader.Set("Content-Disposition",
+				fmt.Sprintf(`form-data; name="%s"; filename="%s"`, key, fh.Filename))
+			ct := fh.Header.Get("Content-Type")
+			if ct == "" {
+				ct = "application/octet-stream"
+			}
+			partHeader.Set("Content-Type", ct)
+
+			dst, err := w.CreatePart(partHeader)
 			if err != nil {
 				src.Close()
 				c.ResponseErrorWithStatus(errors.New("failed to build request"), http.StatusInternalServerError)

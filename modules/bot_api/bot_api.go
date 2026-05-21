@@ -49,6 +49,8 @@ type BotAPI struct {
 	robotService          robot.IService
 	speechClient          *voice_adapter.SpeechClient
 	maxVoiceContextLength int
+	maxBodySize           int64
+	maxFileSize           int64
 	// spaceQuerier overrides ba.db for resolveBotActiveSpaceID (test injection).
 	// nil in production; tests set it to stub the DB call deterministically.
 	spaceQuerier botSpaceQuerier
@@ -129,18 +131,34 @@ func (ba *BotAPI) dispatchMsgSendReq(req *config.MsgSendReq) (*config.MsgSendRes
 
 // NewBotAPI creates the Bot API gateway module.
 func NewBotAPI(ctx *config.Context) *BotAPI {
-	speechURL := os.Getenv("SPEECH_SERVICE_URL")
-	speechKey := os.Getenv("SPEECH_API_KEY")
-	timeoutSec := 50
-	if v := os.Getenv("SPEECH_TIMEOUT"); v != "" {
+	speechURL := os.Getenv(voice_adapter.EnvSpeechServiceURL)
+	speechKey := os.Getenv(voice_adapter.EnvSpeechAPIKey)
+	timeoutSec := voice_adapter.DefaultTimeoutSec
+	if v := os.Getenv(voice_adapter.EnvSpeechTimeout); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			timeoutSec = n
 		}
 	}
 	maxCtxLen := 10000
-	if v := os.Getenv("VOICE_MAX_VOICE_CONTEXT_LENGTH"); v != "" {
+	if v := os.Getenv("SPEECH_MAX_CONTEXT_LENGTH"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			maxCtxLen = n
+		}
+	} else if v := os.Getenv("VOICE_MAX_VOICE_CONTEXT_LENGTH"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxCtxLen = n
+		}
+	}
+	maxBodySize := int64(5 << 20)
+	if v := os.Getenv(voice_adapter.EnvSpeechMaxBodySize); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			maxBodySize = n
+		}
+	}
+	maxFileSize := int64(3 << 20)
+	if v := os.Getenv("SPEECH_MAX_FILE_SIZE"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			maxFileSize = n
 		}
 	}
 
@@ -155,6 +173,8 @@ func NewBotAPI(ctx *config.Context) *BotAPI {
 		robotService:          robot.NewService(ctx),
 		speechClient:          voice_adapter.NewSpeechClient(speechURL, speechKey, time.Duration(timeoutSec)*time.Second),
 		maxVoiceContextLength: maxCtxLen,
+		maxBodySize:           maxBodySize,
+		maxFileSize:           maxFileSize,
 		Log:                   log.NewTLog("BotAPI"),
 	}
 	// YUJ-1166 / Mininglamp-OSS/octo-server#81 — Persona Clone fan-out.

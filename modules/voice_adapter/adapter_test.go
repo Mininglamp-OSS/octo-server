@@ -5,7 +5,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"testing"
 	"time"
 
@@ -15,9 +14,10 @@ import (
 )
 
 func TestNewAdapterConfigFromEnv_Defaults(t *testing.T) {
-	os.Unsetenv("SPEECH_SERVICE_URL")
-	os.Unsetenv("SPEECH_API_KEY")
-	os.Unsetenv("SPEECH_TIMEOUT")
+	t.Setenv("SPEECH_SERVICE_URL", "")
+	t.Setenv("SPEECH_API_KEY", "")
+	t.Setenv("SPEECH_TIMEOUT", "")
+	t.Setenv("SPEECH_MAX_BODY_SIZE", "")
 
 	cfg := NewAdapterConfigFromEnv()
 
@@ -170,5 +170,31 @@ func TestGetConfigHandler_Timeout(t *testing.T) {
 	}
 	if body["enabled"] != false {
 		t.Errorf("expected enabled=false for timeout, got %v", body["enabled"])
+	}
+}
+
+func TestNewAdapterConfigFromEnv_MaxBodySize(t *testing.T) {
+	t.Setenv("SPEECH_MAX_BODY_SIZE", "1048576")
+	t.Setenv("SPEECH_SERVICE_URL", "")
+	t.Setenv("SPEECH_API_KEY", "")
+	t.Setenv("SPEECH_TIMEOUT", "")
+
+	cfg := NewAdapterConfigFromEnv()
+
+	if cfg.MaxBodySize != 1048576 {
+		t.Errorf("expected MaxBodySize 1048576, got %d", cfg.MaxBodySize)
+	}
+}
+
+func TestNewAdapterConfigFromEnv_MaxBodySizeDefault(t *testing.T) {
+	t.Setenv("SPEECH_MAX_BODY_SIZE", "")
+	t.Setenv("SPEECH_SERVICE_URL", "")
+	t.Setenv("SPEECH_API_KEY", "")
+	t.Setenv("SPEECH_TIMEOUT", "")
+
+	cfg := NewAdapterConfigFromEnv()
+
+	if cfg.MaxBodySize != 5<<20 {
+		t.Errorf("expected default MaxBodySize 5MB, got %d", cfg.MaxBodySize)
 	}
 }

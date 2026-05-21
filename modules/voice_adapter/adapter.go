@@ -38,8 +38,18 @@ func (a *VoiceAdapter) Route(r *wkhttp.WKHttp) {
 }
 
 func (a *VoiceAdapter) transcribe(c *wkhttp.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, a.cfg.MaxBodySize)
+
 	resp, err := a.client.ForwardTranscribe(c.Request)
 	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+				"status": http.StatusRequestEntityTooLarge,
+				"msg":    "request body too large",
+			})
+			return
+		}
 		a.Error("forward transcribe failed", zap.Error(err))
 		c.JSON(http.StatusBadGateway, gin.H{
 			"status": http.StatusBadGateway,
@@ -52,8 +62,17 @@ func (a *VoiceAdapter) transcribe(c *wkhttp.Context) {
 }
 
 func (a *VoiceAdapter) getConfig(c *wkhttp.Context) {
-	resp, err := a.client.GetConfig()
+	resp, err := a.client.GetConfig(c.Request.Context())
 	if err != nil {
+		var svcErr *SpeechServiceError
+		if errors.As(err, &svcErr) && (svcErr.StatusCode == 401 || svcErr.StatusCode == 403) {
+			a.Error("speech service auth failure", zap.Int("status", svcErr.StatusCode), zap.Error(err))
+			c.JSON(http.StatusBadGateway, gin.H{
+				"status": http.StatusBadGateway,
+				"msg":    "speech service configuration error",
+			})
+			return
+		}
 		a.Warn("get config failed, returning disabled fallback", zap.Error(err))
 		c.JSON(http.StatusOK, gin.H{
 			"enabled": false,
@@ -82,7 +101,7 @@ func (a *VoiceAdapter) getContext(c *wkhttp.Context) {
 		return
 	}
 
-	vocab, err := a.client.GetVocabulary(loginUID, "space", spaceID)
+	vocab, err := a.client.GetVocabulary(c.Request.Context(), loginUID, "space", spaceID)
 	if err != nil {
 		a.Error("get vocabulary failed", zap.Error(err))
 		c.ResponseErrorWithStatus(errors.New("query voice context failed"), http.StatusInternalServerError)
