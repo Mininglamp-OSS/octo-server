@@ -155,6 +155,37 @@ func TestRobotMessage_OBOReservedKeysStripped_LegacyKeyKept(t *testing.T) {
 	assert.Empty(t, cl.calls)
 }
 
+// TestRobotMessage_OBOExplicitFanoutKeysStripped — PR#121 R2
+// (Jerry-Xin 2026-05-21 blocking review). The single-underscore
+// `obo_*` fan-out routing keys (obo_respond_as / obo_grantor_uid /
+// obo_fanout / obo_origin_* / obo_system_hint) injected by
+// buildFanoutCopyReq are server-only and MUST be stripped from the
+// legacy robot ingress too — a misbehaving robot script could
+// otherwise spoof the OBO grantor or fan-out routing context.
+func TestRobotMessage_OBOExplicitFanoutKeysStripped(t *testing.T) {
+	cl := &captureRobotLog{}
+	payload := map[string]interface{}{
+		"content":                  "spoof attempt",
+		"type":                     1,
+		"obo_respond_as":           "u_admin",
+		"obo_grantor_uid":          "u_admin",
+		"obo_fanout":               true,
+		"obo_origin_channel_id":    "ch",
+		"obo_origin_channel_type":  1,
+		"obo_origin_from_uid":      "u",
+		"obo_origin_message_idstr": "m1",
+		"obo_system_hint":          "noop",
+	}
+
+	stripped := sanitizeRobotIngressPayload(payload, "ch", 2, "bot", cl.warn)
+
+	assert.Equal(t, 8, stripped)
+	assert.Len(t, payload, 2, "only non-reserved keys should remain")
+	assert.Equal(t, "spoof attempt", payload["content"])
+	assert.Equal(t, 1, payload["type"])
+	assert.Len(t, cl.calls, 1, "one warn log even for many reserved keys")
+}
+
 // TestRobotMessage_StripContract_PinnedToSharedPackage — meta-assertion
 // matching the user-ingress meta-assertion: the robot strip MUST go
 // through pkg/obopayload so the three ingresses + the fan-out listener

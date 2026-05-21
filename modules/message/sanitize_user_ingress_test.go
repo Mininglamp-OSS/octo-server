@@ -139,6 +139,10 @@ func TestUserMessage_OBOReservedKeysStripped_NilPayload(t *testing.T) {
 // `__obo_*` namespace is server-only. Locking this in protects
 // downstream consumers that might still inspect the legacy field for
 // debugging.
+// TestUserMessage_OBOReservedKeysStripped_LegacyKeyKept — the legacy
+// `obo_processed` key (single underscore, not in either reserved set)
+// must remain untouched: it's a client-readable hint, not a
+// server-only marker. Anti-overreach guard.
 func TestUserMessage_OBOReservedKeysStripped_LegacyKeyKept(t *testing.T) {
 	cl := &captureLog{}
 	payload := map[string]interface{}{
@@ -149,6 +153,38 @@ func TestUserMessage_OBOReservedKeysStripped_LegacyKeyKept(t *testing.T) {
 	assert.Equal(t, 0, stripped)
 	assert.Equal(t, true, payload["obo_processed"], "legacy key must survive")
 	assert.Empty(t, cl.calls)
+}
+
+// TestUserMessage_OBOExplicitFanoutKeysStripped — PR#121 R2
+// (Jerry-Xin 2026-05-21 blocking review). The single-underscore
+// `obo_*` fan-out routing keys injected by buildFanoutCopyReq
+// (obo_respond_as / obo_grantor_uid / obo_fanout / obo_origin_* /
+// obo_system_hint) are server-only and MUST be silently stripped from
+// user-message payloads — a malicious user could otherwise spoof the
+// OBO grantor identity or impersonate the system-hint pathway via
+// /v1/message/send.
+func TestUserMessage_OBOExplicitFanoutKeysStripped(t *testing.T) {
+	cl := &captureLog{}
+	payload := map[string]interface{}{
+		"content":                  "spoof attempt",
+		"type":                     1,
+		"obo_respond_as":           "u_admin",
+		"obo_grantor_uid":          "u_admin",
+		"obo_fanout":               true,
+		"obo_origin_channel_id":    "ch",
+		"obo_origin_channel_type":  1,
+		"obo_origin_from_uid":      "u",
+		"obo_origin_message_idstr": "m1",
+		"obo_system_hint":          "noop",
+	}
+
+	stripped := sanitizeUserIngressPayload(payload, "ch", 1, "u", cl.warn)
+
+	assert.Equal(t, 8, stripped)
+	assert.Len(t, payload, 2, "only non-reserved keys should remain")
+	assert.Equal(t, "spoof attempt", payload["content"])
+	assert.Equal(t, 1, payload["type"])
+	assert.Len(t, cl.calls, 1, "one warn log even for many reserved keys")
 }
 
 // TestUserMessage_StripContract_PinnedToSharedPackage — meta-assertion:

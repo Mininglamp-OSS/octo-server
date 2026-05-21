@@ -611,3 +611,74 @@ func TestBotMessage_OBOReservedKeysKept(t *testing.T) {
 		t.Fatalf("bot ingress must REJECT (not strip) reserved OBO keys; dispatch fired with %+v", dc.captured)
 	}
 }
+
+// TestSendMessage_RejectsExplicitFanoutKeys — PR#121 R2 (Jerry-Xin
+// 2026-05-21 blocking review) regression guard. The fan-out copy
+// builder (buildFanoutCopyReq) injects single-underscore obo_*
+// routing fields (obo_respond_as / obo_grantor_uid / obo_fanout /
+// obo_origin_* / obo_system_hint) — these are NOT under the legacy
+// `__obo_*` reserved prefix, but they ARE server-only. A bot client
+// that could set them on inbound /v1/bot/sendMessage payloads could
+// spoof the OBO grantor identity, redirect fan-out, or impersonate a
+// system-hint message. Per pkg/obopayload.IsReservedKey they are now
+// part of the same reject set; this test pins the bot-API behavior to
+// match.
+func TestSendMessage_RejectsExplicitFanoutKeys(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const (
+		botID  = "bot_legacy"
+		owner  = "creator_uid"
+		authSp = "space_A"
+	)
+
+	keys := []string{
+		"obo_respond_as",
+		"obo_grantor_uid",
+		"obo_fanout",
+		"obo_origin_channel_id",
+		"obo_origin_channel_type",
+		"obo_origin_from_uid",
+		"obo_origin_message_idstr",
+		"obo_system_hint",
+	}
+	for _, key := range keys {
+		t.Run(key, func(t *testing.T) {
+			dc := &dispatchCapture{}
+			ba := &BotAPI{
+				Log:              log.NewTLog("BotAPI-reject-fanout-key"),
+				spaceQuerier:     &fakeSpaceQuerier{defaultSpace: authSp},
+				dispatchOverride: dc.hook,
+				oboStoreOverride: newFakeOBOStore(),
+			}
+
+			body, _ := json.Marshal(BotSendMessageReq{
+				ChannelID:   owner,
+				ChannelType: common.ChannelTypePerson.Uint8(),
+				Payload: map[string]interface{}{
+					"content": "spoof attempt",
+					"type":    1,
+					key:       "victim_value",
+				},
+			})
+			httpReq := httptest.NewRequest(http.MethodPost, "/v1/bot/sendMessage", bytes.NewReader(body))
+			httpReq.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			gc, _ := gin.CreateTestContext(rec)
+			gc.Request = httpReq
+			c := &wkhttp.Context{Context: gc}
+			c.Set(CtxKeyRobotID, botID)
+			c.Set(CtxKeyBotKind, BotKindUser)
+			c.Set(CtxKeyRobot, &robotModel{RobotID: botID, CreatorUID: owner})
+
+			ba.sendMessage(c)
+			if dc.captured != nil {
+				t.Fatalf("dispatch must NOT fire when reserved OBO key %q is rejected, got %+v", key, dc.captured)
+			}
+			// Reject body should mention OBO so bot authors can grep
+			// for the cause; we don't pin the exact phrasing.
+			if !strings.Contains(rec.Body.String(), "obo") && !strings.Contains(rec.Body.String(), "OBO") {
+				t.Fatalf("expected reject body for %q to mention OBO, got %s", key, rec.Body.String())
+			}
+		})
+	}
+}

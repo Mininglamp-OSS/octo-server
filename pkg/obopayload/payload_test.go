@@ -10,6 +10,46 @@ import (
 	"testing"
 )
 
+// TestIsReservedKey locks down the reserved-namespace membership rule
+// per-key (rather than per-payload, which HasReservedKey covers). The
+// rule has two halves — `__obo_` prefix OR explicit allowlist — and a
+// regression in either half is a security bug, so the test asserts
+// both halves independently.
+func TestIsReservedKey(t *testing.T) {
+	cases := []struct {
+		key  string
+		want bool
+	}{
+		// Double-underscore prefix half.
+		{"__obo_processed__", true},
+		{"__obo_anything", true},
+		{"__obo_", true},
+		// Explicit single-underscore allowlist (PR#121 R2).
+		{"obo_respond_as", true},
+		{"obo_grantor_uid", true},
+		{"obo_fanout", true},
+		{"obo_origin_channel_id", true},
+		{"obo_origin_channel_type", true},
+		{"obo_origin_from_uid", true},
+		{"obo_origin_message_idstr", true},
+		{"obo_system_hint", true},
+		// Anti-overreach — plain keys, legacy keys, and unknown
+		// `obo_*` user-payload keys must remain non-reserved.
+		{"type", false},
+		{"content", false},
+		{"_obo_internal", false},
+		{"obo_processed", false},
+		{"obo_random_user_field", false},
+		{"obo", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := IsReservedKey(tc.key); got != tc.want {
+			t.Errorf("IsReservedKey(%q) = %v, want %v", tc.key, got, tc.want)
+		}
+	}
+}
+
 func TestHasReservedKey(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -24,6 +64,28 @@ func TestHasReservedKey(t *testing.T) {
 		{"the marker itself", map[string]interface{}{"__obo_processed__": true}, true},
 		{"any double-underscore obo key", map[string]interface{}{"__obo_anything__": "x"}, true},
 		{"mixed in", map[string]interface{}{"type": 1, "__obo_marker": false}, true},
+
+		// PR#121 R2: single-underscore obo_* fan-out keys must also be
+		// recognized as server-only so the bot-API ingress rejects them
+		// and the user / robot ingress strips them. These keys are
+		// injected by modules/bot_api/obo_fanout.go's
+		// buildFanoutCopyReq — a client setting them on inbound would
+		// spoof the OBO grantor identity or fan-out routing.
+		{"obo_respond_as reserved", map[string]interface{}{"obo_respond_as": "u_admin"}, true},
+		{"obo_grantor_uid reserved", map[string]interface{}{"obo_grantor_uid": "u_admin"}, true},
+		{"obo_fanout reserved", map[string]interface{}{"obo_fanout": true}, true},
+		{"obo_origin_channel_id reserved", map[string]interface{}{"obo_origin_channel_id": "ch"}, true},
+		{"obo_origin_channel_type reserved", map[string]interface{}{"obo_origin_channel_type": 1}, true},
+		{"obo_origin_from_uid reserved", map[string]interface{}{"obo_origin_from_uid": "u"}, true},
+		{"obo_origin_message_idstr reserved", map[string]interface{}{"obo_origin_message_idstr": "m1"}, true},
+		{"obo_system_hint reserved", map[string]interface{}{"obo_system_hint": "noop"}, true},
+
+		// Anti-overreach: only the explicit set is reserved at the
+		// single-underscore level. A user payload key that merely
+		// starts with `obo_` but is NOT one of the known fan-out
+		// fields must still be passed through (else we'd break legacy
+		// callers who happened to choose `obo_*` for unrelated data).
+		{"unknown single-underscore obo_ not reserved", map[string]interface{}{"obo_random_user_field": "x"}, false},
 	}
 	for _, tc := range cases {
 		got := HasReservedKey(tc.payload)
@@ -77,6 +139,44 @@ func TestStripReservedKeys(t *testing.T) {
 			map[string]interface{}{"obo_processed": true},
 			0,
 			map[string]interface{}{"obo_processed": true},
+		},
+
+		// PR#121 R2: single-underscore obo_* fan-out keys must be
+		// stripped from user / robot ingress payloads so a malicious
+		// client cannot inject buildFanoutCopyReq-only routing fields.
+		{
+			"all explicit reserved keys stripped",
+			map[string]interface{}{
+				"type":                     1,
+				"content":                  "hi",
+				"obo_respond_as":           "u_admin",
+				"obo_grantor_uid":          "u_admin",
+				"obo_fanout":               true,
+				"obo_origin_channel_id":    "ch",
+				"obo_origin_channel_type":  1,
+				"obo_origin_from_uid":      "u",
+				"obo_origin_message_idstr": "m1",
+				"obo_system_hint":          "noop",
+			},
+			8,
+			map[string]interface{}{"type": 1, "content": "hi"},
+		},
+		{
+			"explicit + double-underscore stripped together",
+			map[string]interface{}{
+				"type":              1,
+				"__obo_processed__": true,
+				"obo_respond_as":    "u_admin",
+				"obo_fanout":        true,
+			},
+			3,
+			map[string]interface{}{"type": 1},
+		},
+		{
+			"unknown obo_ key preserved",
+			map[string]interface{}{"obo_my_random_field": "x", "obo_respond_as": "u"},
+			1,
+			map[string]interface{}{"obo_my_random_field": "x"},
 		},
 	}
 	for _, tc := range cases {

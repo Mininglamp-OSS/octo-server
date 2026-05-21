@@ -53,15 +53,24 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 		c.ResponseError(errors.New("payload不能为空"))
 		return
 	}
-	// PR#82 review #2 P1-2 — reject any inbound payload that carries a
-	// reserved server-only key. The fan-out gate-3 marker
-	// (`__obo_processed__`) and any future server-injected OBO field live
-	// under this prefix; allowing a bot client to set them would let a
-	// malicious bot suppress its own fan-out copy or spoof OBO-state
-	// downstream. Reject before checkSendPermission / checkOBO so the
-	// error is fast and the auth path doesn't run on poisoned input.
+	// PR#82 review #2 P1-2 + PR#121 R2 — reject any inbound payload
+	// that carries a reserved server-only key. Two overlapping
+	// namespaces are reserved:
+	//   - `__obo_*` (double-underscore prefix): home of the fan-out
+	//     gate-3 marker `__obo_processed__` and any future
+	//     server-injected OBO field;
+	//   - explicit `obo_*` keys injected by buildFanoutCopyReq
+	//     (obo_respond_as, obo_grantor_uid, obo_fanout, obo_origin_*,
+	//     obo_system_hint).
+	// Allowing a bot client to set either would let a malicious bot
+	// suppress its own fan-out copy or spoof the OBO grantor /
+	// fan-out routing context downstream. Membership is owned by
+	// pkg/obopayload so this site cannot drift from the user / robot
+	// ingress strip or the fan-out listener's gate-3 check. Reject
+	// before checkSendPermission / checkOBO so the error is fast and
+	// the auth path doesn't run on poisoned input.
 	if payloadHasReservedOBOKey(req.Payload) {
-		c.ResponseError(errors.New("payload 不允许使用以 __obo_ 开头的保留字段"))
+		c.ResponseError(errors.New("payload 不允许使用 OBO 保留字段（__obo_* 前缀或 obo_respond_as/obo_grantor_uid/obo_fanout/obo_origin_*/obo_system_hint）"))
 		return
 	}
 
