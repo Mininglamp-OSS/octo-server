@@ -7,18 +7,20 @@ import (
 )
 
 const (
-	EnvSpeechServiceURL  = "SPEECH_SERVICE_URL"
-	EnvSpeechAPIKey      = "SPEECH_API_KEY"
-	EnvSpeechTimeout     = "SPEECH_TIMEOUT"
-	EnvSpeechMaxBodySize = "SPEECH_MAX_BODY_SIZE"
-	DefaultTimeoutSec    = 50
+	EnvSpeechServiceURL       = "SPEECH_SERVICE_URL"
+	EnvSpeechAPIKey           = "SPEECH_API_KEY"
+	EnvSpeechTimeout          = "SPEECH_TIMEOUT"
+	EnvSpeechMaxBodySize      = "SPEECH_MAX_BODY_SIZE"
+	EnvFeedbackPrivacyURL     = "VOICE_FEEDBACK_PRIVACY_URL"
+	DefaultTimeoutSec         = 50
 )
 
 type AdapterConfig struct {
-	SpeechServiceURL string
-	SpeechAPIKey     string
-	SpeechTimeout    time.Duration
-	MaxBodySize      int64
+	SpeechServiceURL   string
+	SpeechAPIKey       string
+	SpeechTimeout      time.Duration
+	MaxBodySize        int64
+	FeedbackPrivacyURL string
 }
 
 func NewAdapterConfigFromEnv() *AdapterConfig {
@@ -37,9 +39,10 @@ func NewAdapterConfigFromEnv() *AdapterConfig {
 	}
 
 	return &AdapterConfig{
-		SpeechServiceURL: os.Getenv(EnvSpeechServiceURL),
-		SpeechAPIKey:     os.Getenv(EnvSpeechAPIKey),
-		SpeechTimeout:    time.Duration(timeoutSec) * time.Second,
-		MaxBodySize:      maxBodySize,
+		SpeechServiceURL:   os.Getenv(EnvSpeechServiceURL),
+		SpeechAPIKey:       os.Getenv(EnvSpeechAPIKey),
+		SpeechTimeout:      time.Duration(timeoutSec) * time.Second,
+		MaxBodySize:        maxBodySize,
+		FeedbackPrivacyURL: os.Getenv(EnvFeedbackPrivacyURL),
 	}
 }

@@ -79,6 +79,9 @@ func (a *VoiceAdapter) getConfig(c *wkhttp.Context) {
 		})
 		return
 	}
+	if a.cfg.FeedbackPrivacyURL != "" {
+		resp["feedback_privacy_url"] = a.cfg.FeedbackPrivacyURL
+	}
 	c.JSON(http.StatusOK, resp)
 }
 

@@ -72,8 +72,9 @@ type User struct {
 	onlineService *OnlineService
 	giteeDB       *giteeDB
 	githubDB      *githubDB
-	pinnedDB      *PinnedDB
-	pinned        *Pinned
+	pinnedDB       *PinnedDB
+	pinned         *Pinned
+	spaceSettingDB *SpaceSettingDB
 
 	setting *Setting
 	log.Log
@@ -126,6 +127,7 @@ func New(ctx *config.Context) *User {
 		appService:               app.NewService(ctx),
 		loginGuard:               NewLoginGuard(ctx.GetRedisConn(), loginGuardThresholdFromEnv(), loginGuardWindowFromEnv()),
 		pinnedDB:                 NewPinnedDB(ctx),
+		spaceSettingDB:           NewSpaceSettingDB(ctx.DB()),
 		verificationDB:           newVerificationDB(ctx),
 	}
 	u.pinned = NewPinned(u.pinnedDB, u.friendDB)
@@ -227,6 +229,13 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 		pinned.DELETE("", u.pinned.Remove)       // 移除置顶
 		pinned.GET("", u.pinned.List)            // 获取置顶列表
 		pinned.PUT("/sort", u.pinned.UpdateSort) // 更新排序
+	}
+
+	// #################### Space 级用户设置 ####################
+	spaceSetting := r.Group("/v1/user/space", u.ctx.AuthMiddleware(r), spacepkg.SpaceMiddleware(u.ctx))
+	{
+		spaceSetting.GET("/setting", u.getSpaceSetting)
+		spaceSetting.PUT("/setting", u.updateSpaceSetting)
 	}
 	v := r.Group("/v1")
 	{

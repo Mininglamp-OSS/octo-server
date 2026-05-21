@@ -57,6 +57,7 @@ func TestNewAdapterConfigFromEnv_InvalidValues(t *testing.T) {
 func newTestAdapter(speechURL string) *VoiceAdapter {
 	return &VoiceAdapter{
 		client: NewSpeechClient(speechURL, "test-key", 2*time.Second),
+		cfg:    &AdapterConfig{},
 		Log:    log.NewTLog("VoiceAdapterTest"),
 	}
 }
@@ -156,6 +157,7 @@ func TestGetConfigHandler_Timeout(t *testing.T) {
 
 	a := &VoiceAdapter{
 		client: NewSpeechClient(srv.URL, "test-key", 100*time.Millisecond),
+		cfg:    &AdapterConfig{},
 		Log:    log.NewTLog("VoiceAdapterTest"),
 	}
 	rec := callGetConfig(a)
@@ -196,5 +198,78 @@ func TestNewAdapterConfigFromEnv_MaxBodySizeDefault(t *testing.T) {
 
 	if cfg.MaxBodySize != 5<<20 {
 		t.Errorf("expected default MaxBodySize 5MB, got %d", cfg.MaxBodySize)
+	}
+}
+
+func TestGetConfigHandler_InjectsFeedbackPrivacyURL(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"enabled": true,
+		})
+	}))
+	defer srv.Close()
+
+	a := &VoiceAdapter{
+		client: NewSpeechClient(srv.URL, "test-key", 2*time.Second),
+		cfg:    &AdapterConfig{FeedbackPrivacyURL: "https://example.com/privacy"},
+		Log:    log.NewTLog("VoiceAdapterTest"),
+	}
+	rec := callGetConfig(a)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["feedback_privacy_url"] != "https://example.com/privacy" {
+		t.Errorf("expected feedback_privacy_url='https://example.com/privacy', got %v", body["feedback_privacy_url"])
+	}
+	if body["enabled"] != true {
+		t.Errorf("expected enabled=true, got %v", body["enabled"])
+	}
+}
+
+func TestGetConfigHandler_NoFeedbackPrivacyURLWhenEmpty(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"enabled": true,
+		})
+	}))
+	defer srv.Close()
+
+	a := &VoiceAdapter{
+		client: NewSpeechClient(srv.URL, "test-key", 2*time.Second),
+		cfg:    &AdapterConfig{FeedbackPrivacyURL: ""},
+		Log:    log.NewTLog("VoiceAdapterTest"),
+	}
+	rec := callGetConfig(a)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if _, exists := body["feedback_privacy_url"]; exists {
+		t.Errorf("expected no feedback_privacy_url key when empty, but got %v", body["feedback_privacy_url"])
+	}
+}
+
+func TestNewAdapterConfigFromEnv_FeedbackPrivacyURL(t *testing.T) {
+	t.Setenv("VOICE_FEEDBACK_PRIVACY_URL", "https://example.com/policy")
+	t.Setenv("SPEECH_SERVICE_URL", "")
+	t.Setenv("SPEECH_API_KEY", "")
+	t.Setenv("SPEECH_TIMEOUT", "")
+	t.Setenv("SPEECH_MAX_BODY_SIZE", "")
+
+	cfg := NewAdapterConfigFromEnv()
+
+	if cfg.FeedbackPrivacyURL != "https://example.com/policy" {
+		t.Errorf("expected FeedbackPrivacyURL='https://example.com/policy', got %q", cfg.FeedbackPrivacyURL)
 	}
 }
