@@ -41,7 +41,7 @@ func newBotAPIWithFakeStore(s *fakeOBOStore) *BotAPI {
 // (active=1, global_enabled=1) + matching enabled scope → nil.
 func TestCheckOBO_Happy(t *testing.T) {
 	s := newFakeOBOStore()
-	gid, err := s.insertGrant(tGrantor, tBot, "auto")
+	gid, err := s.insertGrant(tGrantor, tBot, "auto", "")
 	if err != nil {
 		t.Fatalf("insertGrant: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestCheckOBO_NoGrant(t *testing.T) {
 // from "never existed" by contract.
 func TestCheckOBO_GrantRevoked(t *testing.T) {
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(tGrantor, tBot, "auto")
+	gid, _ := s.insertGrant(tGrantor, tBot, "auto", "")
 	enable := 1
 	_ = s.updateGrant(gid, "", &enable, nil)
 	_, _ = s.insertScope(gid, tChan, common.ChannelTypeGroup.Uint8(), 1)
@@ -91,7 +91,7 @@ func TestCheckOBO_GrantRevoked(t *testing.T) {
 // kill-switch). Same denial behavior as no-grant.
 func TestCheckOBO_GlobalDisabled(t *testing.T) {
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(tGrantor, tBot, "auto")
+	gid, _ := s.insertGrant(tGrantor, tBot, "auto", "")
 	// Skip the enable step → global_enabled stays 0.
 	_, _ = s.insertScope(gid, tChan, common.ChannelTypeGroup.Uint8(), 1)
 
@@ -106,7 +106,7 @@ func TestCheckOBO_GlobalDisabled(t *testing.T) {
 // and no scope row. Should be denied.
 func TestCheckOBO_ScopeMissing(t *testing.T) {
 	s := newFakeOBOStore()
-	_, _ = s.insertGrant(tGrantor, tBot, "auto")
+	_, _ = s.insertGrant(tGrantor, tBot, "auto", "")
 	// global_enabled defaults to 0, no scope inserted.
 
 	ba := newBotAPIWithFakeStore(s)
@@ -121,7 +121,7 @@ func TestCheckOBO_ScopeMissing(t *testing.T) {
 // should authorize the request.
 func TestCheckOBO_ScopeMissing_ImplicitScope(t *testing.T) {
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(tGrantor, tBot, "auto")
+	gid, _ := s.insertGrant(tGrantor, tBot, "auto", "")
 	enable := 1
 	_ = s.updateGrant(gid, "", &enable, nil)
 	// No scope inserted, but global_enabled=1 + grantor is group member (override returns true)
@@ -136,7 +136,7 @@ func TestCheckOBO_ScopeMissing_ImplicitScope(t *testing.T) {
 // TestCheckOBO_ScopeDisabled — scope row exists with enabled=0.
 func TestCheckOBO_ScopeDisabled(t *testing.T) {
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(tGrantor, tBot, "auto")
+	gid, _ := s.insertGrant(tGrantor, tBot, "auto", "")
 	enable := 1
 	_ = s.updateGrant(gid, "", &enable, nil)
 	_, _ = s.insertScope(gid, tChan, common.ChannelTypeGroup.Uint8(), 0)
@@ -196,7 +196,7 @@ func TestCheckOBO_DBError_OnGrantLookup(t *testing.T) {
 func TestCheckOBO_DBError_OnScopeLookup(t *testing.T) {
 	boom := errors.New("connection refused")
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(tGrantor, tBot, "auto")
+	gid, _ := s.insertGrant(tGrantor, tBot, "auto", "")
 	enable := 1
 	_ = s.updateGrant(gid, "", &enable, nil)
 	s.failScopeEnabled = boom
@@ -217,7 +217,7 @@ func TestCheckOBO_DBError_OnScopeLookup(t *testing.T) {
 // asserts the wire-equivalent sentinel ErrOBONotAuthorized).
 func TestOBO_CheckOBO_GrantorMembershipRevoked_403(t *testing.T) {
 	s := newFakeOBOStore()
-	gid, err := s.insertGrant(tGrantor, tBot, "auto")
+	gid, err := s.insertGrant(tGrantor, tBot, "auto", "")
 	if err != nil {
 		t.Fatalf("insertGrant: %v", err)
 	}
@@ -268,7 +268,7 @@ func TestOBO_CheckOBO_GrantorMembershipRevoked_403(t *testing.T) {
 // handler boundary).
 func TestOBO_CheckOBO_GrantorChannelAccessDBError_Propagates(t *testing.T) {
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(tGrantor, tBot, "auto")
+	gid, _ := s.insertGrant(tGrantor, tBot, "auto", "")
 	enable := 1
 	_ = s.updateGrant(gid, "", &enable, nil)
 	_, _ = s.insertScope(gid, tChan, common.ChannelTypeGroup.Uint8(), 1)
@@ -281,5 +281,37 @@ func TestOBO_CheckOBO_GrantorChannelAccessDBError_Propagates(t *testing.T) {
 	err := ba.checkOBO(tBot, tGrantor, tChan, common.ChannelTypeGroup.Uint8())
 	if err == nil || errors.Is(err, ErrOBONotAuthorized) {
 		t.Fatalf("expected raw DB error to propagate, got %v", err)
+	}
+}
+
+// TestCheckOBO_DBError_OnScopeRowExists — GH#122 fail-closed regression.
+// Prior code did `hasExplicitScope, _ := store.scopeRowExists(...)`, which
+// swallowed the error and silently treated the channel as having no
+// explicit scope. That would allow the implicit-scope branch to fire and
+// potentially approve a send the admin had explicitly disabled (the
+// disabled scope row exists in the DB but is invisible while the lookup
+// is failing). The fix propagates the error; this test pins that contract.
+func TestCheckOBO_DBError_OnScopeRowExists(t *testing.T) {
+	boom := errors.New("connection refused")
+	s := newFakeOBOStore()
+	gid, _ := s.insertGrant(tGrantor, tBot, "auto", "")
+	enable := 1
+	_ = s.updateGrant(gid, "", &enable, nil)
+	// No explicit scope: scopeEnabled returns ok=false, then scopeRowExists
+	// is consulted to decide whether to enter the implicit-scope branch.
+	// Inject the failure on scopeRowExists so checkOBO must propagate it
+	// instead of silently treating the channel as "no explicit scope".
+	s.failScopeRowExists = boom
+
+	ba := newBotAPIWithFakeStore(s)
+	err := ba.checkOBO(tBot, tGrantor, tChan, common.ChannelTypeGroup.Uint8())
+	if err == nil {
+		t.Fatalf("expected scopeRowExists DB error to propagate, got nil")
+	}
+	if errors.Is(err, ErrOBONotAuthorized) {
+		t.Fatalf("expected raw DB error, got ErrOBONotAuthorized — error was swallowed")
+	}
+	if !errors.Is(err, boom) {
+		t.Fatalf("expected the injected boom error, got %v", err)
 	}
 }

@@ -46,7 +46,7 @@ func (fc *fanoutCapture) hook(req *config.MsgSendReq) error {
 func seedGrantWithScope(t *testing.T, ch string, ct uint8) *fakeOBOStore {
 	t.Helper()
 	s := newFakeOBOStore()
-	gid, err := s.insertGrant(tGrantor, tBot, "auto")
+	gid, err := s.insertGrant(tGrantor, tBot, "auto", "")
 	if err != nil {
 		t.Fatalf("insertGrant: %v", err)
 	}
@@ -412,7 +412,7 @@ func TestFanout_DMPeerToGrantor_MatchesScope(t *testing.T) {
 	const peer = "bob"
 	ct := common.ChannelTypePerson.Uint8()
 	s := newFakeOBOStore()
-	gid, err := s.insertGrant(tGrantor, tBot, "auto")
+	gid, err := s.insertGrant(tGrantor, tBot, "auto", "")
 	if err != nil {
 		t.Fatalf("insertGrant: %v", err)
 	}
@@ -492,7 +492,7 @@ func TestFanout_DMGrantorToPeer_DoesNotEcho(t *testing.T) {
 	const peer = "bob"
 	ct := common.ChannelTypePerson.Uint8()
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(tGrantor, tBot, "auto")
+	gid, _ := s.insertGrant(tGrantor, tBot, "auto", "")
 	enable := 1
 	_ = s.updateGrant(gid, "", &enable, nil)
 	if _, err := s.insertScope(gid, peer, ct, 1); err != nil {
@@ -530,7 +530,7 @@ func TestFanout_DMUnrelatedPeer_NoMatch(t *testing.T) {
 	const scopedPeer, otherPeer = "bob", "eve"
 	ct := common.ChannelTypePerson.Uint8()
 	s := newFakeOBOStore()
-	gid, _ := s.insertGrant(tGrantor, tBot, "auto")
+	gid, _ := s.insertGrant(tGrantor, tBot, "auto", "")
 	enable := 1
 	_ = s.updateGrant(gid, "", &enable, nil)
 	if _, err := s.insertScope(gid, scopedPeer, ct, 1); err != nil {
@@ -582,7 +582,7 @@ func TestFanout_DMMultiGrantor_OnlyRecipientReceives(t *testing.T) {
 
 	s := newFakeOBOStore()
 	// Alice's grant + scope (peer=Bob).
-	gidAlice, err := s.insertGrant(aliceUID, aliceBot, "auto")
+	gidAlice, err := s.insertGrant(aliceUID, aliceBot, "auto", "")
 	if err != nil {
 		t.Fatalf("insertGrant alice: %v", err)
 	}
@@ -596,7 +596,7 @@ func TestFanout_DMMultiGrantor_OnlyRecipientReceives(t *testing.T) {
 	// Carol's grant + scope (peer=Bob) — the exploit setup. Carol and
 	// Bob are friends so the per-grant access check WOULD permit this
 	// grant absent the recipient filter.
-	gidCarol, err := s.insertGrant(carolUID, carolBot, "auto")
+	gidCarol, err := s.insertGrant(carolUID, carolBot, "auto", "")
 	if err != nil {
 		t.Fatalf("insertGrant carol: %v", err)
 	}
@@ -675,7 +675,7 @@ func TestFanout_DMSingleGrantor_RecipientReceives(t *testing.T) {
 	const peer = "bob"
 	ct := common.ChannelTypePerson.Uint8()
 	s := newFakeOBOStore()
-	gid, err := s.insertGrant(tGrantor, tBot, "auto")
+	gid, err := s.insertGrant(tGrantor, tBot, "auto", "")
 	if err != nil {
 		t.Fatalf("insertGrant: %v", err)
 	}
@@ -731,7 +731,7 @@ func TestFanout_DMNonRecipient_NoLeak(t *testing.T) {
 	ct := common.ChannelTypePerson.Uint8()
 
 	s := newFakeOBOStore()
-	gidCarol, err := s.insertGrant(carolUID, carolBot, "auto")
+	gidCarol, err := s.insertGrant(carolUID, carolBot, "auto", "")
 	if err != nil {
 		t.Fatalf("insertGrant carol: %v", err)
 	}
@@ -932,7 +932,7 @@ func TestFanout_DispatchReq_NoConflict_ChannelOrSubscribers(t *testing.T) {
 				const peer = "bob"
 				ct := common.ChannelTypePerson.Uint8()
 				s := newFakeOBOStore()
-				gid, _ := s.insertGrant(tGrantor, tBot, "auto")
+				gid, _ := s.insertGrant(tGrantor, tBot, "auto", "")
 				enable := 1
 				_ = s.updateGrant(gid, "", &enable, nil)
 				if _, err := s.insertScope(gid, peer, ct, 1); err != nil {

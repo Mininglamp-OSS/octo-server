@@ -150,7 +150,7 @@ func (ba *BotAPI) oboCreateGrant(c *wkhttp.Context) {
 		return
 	}
 
-	id, err := ba.oboStoreOrDefault().insertGrant(uid, req.GranteeBotUID, mode)
+	id, err := ba.oboStoreOrDefault().insertGrant(uid, req.GranteeBotUID, mode, "")
 	if err != nil {
 		if isDuplicateKeyErr(err) {
 			// Reactivation path: a row already exists. If it's a soft-deleted

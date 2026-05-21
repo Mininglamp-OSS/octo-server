@@ -41,6 +41,7 @@ type fakeOBOStore struct {
 	// Test-side error injection hooks. Defaults to nil → no error.
 	failFindActiveGrant   error
 	failScopeEnabled      error
+	failScopeRowExists    error
 	failFindGrantsChannel error
 	failInsertGrant       error
 	failListGrants        error
@@ -145,6 +146,9 @@ func (f *fakeOBOStore) scopeEnabled(grantID int64, channelID string, channelType
 func (f *fakeOBOStore) scopeRowExists(grantID int64, channelID string, channelType uint8) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failScopeRowExists != nil {
+		return false, f.failScopeRowExists
+	}
 	f.ensureInit()
 	for _, s := range f.scopes {
 		if s.GrantID == grantID && s.ChannelID == channelID && s.ChannelType == channelType {
@@ -202,7 +206,7 @@ func (f *fakeOBOStore) findGlobalGrantsWithoutScope(channelID string, channelTyp
 	return out, nil
 }
 
-func (f *fakeOBOStore) insertGrant(grantorUID, granteeBotUID, mode string) (int64, error) {
+func (f *fakeOBOStore) insertGrant(grantorUID, granteeBotUID, mode, personaPrompt string) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.failInsertGrant != nil {
@@ -223,6 +227,7 @@ func (f *fakeOBOStore) insertGrant(grantorUID, granteeBotUID, mode string) (int6
 		Mode:          mode,
 		GlobalEnabled: 0,
 		Active:        1,
+		PersonaPrompt: personaPrompt,
 	}
 	return id, nil
 }

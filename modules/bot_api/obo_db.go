@@ -108,8 +108,15 @@ type oboStore interface {
 	findActiveGrantsForChannel(channelID string, channelType uint8) ([]*oboGrantModel, error)
 	findGlobalGrantsWithoutScope(channelID string, channelType uint8) ([]*oboGrantModel, error)
 
-	// CRUD used by the REST layer
-	insertGrant(grantorUID, granteeBotUID, mode string) (int64, error)
+	// CRUD used by the REST layer.
+	//
+	// insertGrant persists `persona_prompt` alongside the row. The column was
+	// added nullable in migration 20260521000001_obo_v2_persona_prompt.sql and
+	// existing call sites pass "" — the explicit parameter exists so the row
+	// is written with an empty string instead of NULL, which prevents
+	// downstream `SELECT *` reads from blowing up scanning a *string into a
+	// non-pointer string field. (GH#122)
+	insertGrant(grantorUID, granteeBotUID, mode, personaPrompt string) (int64, error)
 	listGrantsByGrantor(grantorUID string) ([]*oboGrantModel, error)
 	findGrantByID(id int64) (*oboGrantModel, error)
 	// findGrantByGrantorBot returns the row for (grantor, bot) regardless of
@@ -171,6 +178,24 @@ const (
 	oboCacheTTL = 30 * time.Second
 )
 
+// oboGrantColumns is the explicit column list used by every `obo_grants`
+// SELECT path that decodes into oboGrantModel. We avoid `SELECT *` because
+// `persona_prompt` is a nullable TEXT column (migration
+// 20260521000001_obo_v2_persona_prompt.sql) and dbr panics when a NULL is
+// scanned into the non-pointer `PersonaPrompt string` field. COALESCE
+// guarantees a string at the driver boundary so legacy rows written before
+// the column existed (or by call paths that pre-date insertGrant carrying
+// persona_prompt) still load cleanly. (GH#122)
+const oboGrantColumns = "id, grantor_uid, grantee_bot_uid, mode, global_enabled, active, " +
+	"created_at, updated_at, revoked_at, " +
+	"COALESCE(persona_prompt, '') AS persona_prompt"
+
+// oboGrantColumnsAliased mirrors oboGrantColumns for queries that JOIN the
+// `obo_grants` table aliased as `g` (the fan-out feeders).
+const oboGrantColumnsAliased = "g.id, g.grantor_uid, g.grantee_bot_uid, g.mode, g.global_enabled, g.active, " +
+	"g.created_at, g.updated_at, g.revoked_at, " +
+	"COALESCE(g.persona_prompt, '') AS persona_prompt"
+
 // findActiveGrantByGrantorBot — see oboStore for the contract.
 //
 // Read path consults `obo:grantor:{uid}` first; "0" short-circuits to nil
@@ -189,10 +214,11 @@ func (d *botAPIDB) findActiveGrantByGrantorBot(grantorUID, granteeBotUID string)
 		return nil, nil
 	}
 	var m *oboGrantModel
-	_, err := d.session.Select("*").From("obo_grants").
-		Where("grantor_uid=? AND grantee_bot_uid=? AND active=1 AND global_enabled=1",
-			grantorUID, granteeBotUID).
-		Load(&m)
+	_, err := d.session.SelectBySql(
+		"SELECT "+oboGrantColumns+" FROM obo_grants "+
+			"WHERE grantor_uid=? AND grantee_bot_uid=? AND active=1 AND global_enabled=1",
+		grantorUID, granteeBotUID,
+	).Load(&m)
 	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
 		return nil, err
 	}
@@ -262,7 +288,8 @@ func (d *botAPIDB) findActiveGrantsForChannel(channelID string, channelType uint
 	}
 	var grants []*oboGrantModel
 	_, err := d.session.SelectBySql(
-		"SELECT g.* FROM obo_grants g INNER JOIN obo_scopes s ON s.grant_id=g.id "+
+		"SELECT "+oboGrantColumnsAliased+" "+
+			"FROM obo_grants g INNER JOIN obo_scopes s ON s.grant_id=g.id "+
 			"WHERE g.active=1 AND g.global_enabled=1 AND s.enabled=1 "+
 			"AND s.channel_id=? AND s.channel_type=?",
 		channelID, channelType,
@@ -289,7 +316,7 @@ func (d *botAPIDB) findGlobalGrantsWithoutScope(channelID string, channelType ui
 	}
 	var grants []*oboGrantModel
 	_, err := d.session.SelectBySql(
-		"SELECT g.* FROM obo_grants g "+
+		"SELECT "+oboGrantColumnsAliased+" FROM obo_grants g "+
 			"WHERE g.active=1 AND g.global_enabled=1 "+
 			"AND g.id NOT IN ("+
 			"  SELECT s.grant_id FROM obo_scopes s "+
@@ -309,14 +336,21 @@ func (d *botAPIDB) findGlobalGrantsWithoutScope(channelID string, channelType ui
 // insertGrant creates a new grant row. Returns the autoincrement ID. Unique
 // constraint violations (grantor+grantee already exists) surface verbatim so
 // the REST layer can translate them to 409.
-func (d *botAPIDB) insertGrant(grantorUID, granteeBotUID, mode string) (int64, error) {
+//
+// `personaPrompt` is persisted on insert (defaulting to "" when the caller
+// passes the zero value). Writing an explicit empty string — instead of
+// letting the column default to NULL — is what GH#122 required: legacy code
+// paths that re-read the row via dbr `Load(*oboGrantModel)` would otherwise
+// hit a "scan NULL into string" panic, because the column is nullable but
+// the struct field isn't.
+func (d *botAPIDB) insertGrant(grantorUID, granteeBotUID, mode, personaPrompt string) (int64, error) {
 	if mode == "" {
 		mode = "auto"
 	}
 	res, err := d.session.InsertInto("obo_grants").
-		Columns("grantor_uid", "grantee_bot_uid", "mode", "global_enabled", "active",
-			"created_at", "updated_at").
-		Values(grantorUID, granteeBotUID, mode, 0, 1, time.Now(), time.Now()).
+		Columns("grantor_uid", "grantee_bot_uid", "mode", "persona_prompt",
+			"global_enabled", "active", "created_at", "updated_at").
+		Values(grantorUID, granteeBotUID, mode, personaPrompt, 0, 1, time.Now(), time.Now()).
 		Exec()
 	if err != nil {
 		return 0, err
@@ -375,7 +409,9 @@ func (d *botAPIDB) listGrantsByGrantor(grantorUID string) ([]*oboGrantModel, err
 // resolve+authorize the row before mutating.
 func (d *botAPIDB) findGrantByID(id int64) (*oboGrantModel, error) {
 	var m *oboGrantModel
-	_, err := d.session.Select("*").From("obo_grants").Where("id=?", id).Load(&m)
+	_, err := d.session.SelectBySql(
+		"SELECT "+oboGrantColumns+" FROM obo_grants WHERE id=?", id,
+	).Load(&m)
 	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
 		return nil, err
 	}
@@ -550,9 +586,10 @@ func (d *botAPIDB) findGrantByGrantorBot(grantorUID, granteeBotUID string) (*obo
 		return nil, nil
 	}
 	var m *oboGrantModel
-	_, err := d.session.Select("*").From("obo_grants").
-		Where("grantor_uid=? AND grantee_bot_uid=?", grantorUID, granteeBotUID).
-		Load(&m)
+	_, err := d.session.SelectBySql(
+		"SELECT "+oboGrantColumns+" FROM obo_grants WHERE grantor_uid=? AND grantee_bot_uid=?",
+		grantorUID, granteeBotUID,
+	).Load(&m)
 	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
 		return nil, err
 	}

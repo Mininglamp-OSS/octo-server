@@ -86,7 +86,22 @@ func (ba *BotAPI) checkOBO(botUID, grantor, channelID string, channelType uint8)
 	// send. BUT if a scope row exists (even with enabled=0), respect it —
 	// an explicitly disabled scope means the admin intentionally excluded
 	// this channel.
-	hasExplicitScope, _ := store.scopeRowExists(grant.ID, channelID, channelType)
+	//
+	// GH#122 — scopeRowExists is fail-closed: a DB error here is propagated,
+	// not swallowed. Treating an error as "no explicit scope" would silently
+	// fall through to the implicit-scope branch and could approve a send the
+	// admin explicitly disabled, because the disabled scope row would be
+	// invisible to the check. Bubble up so the handler can 500 and the
+	// operator notices the outage.
+	hasExplicitScope, scopeExistErr := store.scopeRowExists(grant.ID, channelID, channelType)
+	if scopeExistErr != nil {
+		ba.Error("OBO scopeRowExists check failed",
+			zap.Int64("grant_id", grant.ID),
+			zap.String("channel_id", channelID),
+			zap.Uint8("channel_type", channelType),
+			zap.Error(scopeExistErr))
+		return scopeExistErr
+	}
 	if !ok && !hasExplicitScope && grant.GlobalEnabled == 1 && channelType == common.ChannelTypeGroup.Uint8() {
 		isMember, mErr := ba.grantorCanReadChannel(grantor, channelID, channelType)
 		if mErr != nil {
