@@ -33,6 +33,12 @@ func TestIsReservedKey(t *testing.T) {
 		{"obo_origin_from_uid", true},
 		{"obo_origin_message_idstr", true},
 		{"obo_system_hint", true},
+		// Prefix-less server-injected sender identity (PR#121 R3).
+		// Set by modules/bot_api/send.go when fromUID != robotID;
+		// a client that could set it would forge the "real bot
+		// behind an OBO send" identity downstream audit /
+		// attribution paths trust.
+		{"actual_sender_uid", true},
 		// Anti-overreach — plain keys, legacy keys, and unknown
 		// `obo_*` user-payload keys must remain non-reserved.
 		{"type", false},
@@ -41,6 +47,13 @@ func TestIsReservedKey(t *testing.T) {
 		{"obo_processed", false},
 		{"obo_random_user_field", false},
 		{"obo", false},
+		// Anti-overreach for `actual_sender_uid` (PR#121 R3): only
+		// the exact lowercase field is reserved. Common adjacent
+		// names that downstream code DOES NOT trust must stay
+		// pass-through so we don't break unrelated client schemas.
+		{"sender_uid", false},
+		{"actual_sender", false},
+		{"ACTUAL_SENDER_UID", false},
 		{"", false},
 	}
 	for _, tc := range cases {
@@ -80,12 +93,29 @@ func TestHasReservedKey(t *testing.T) {
 		{"obo_origin_message_idstr reserved", map[string]interface{}{"obo_origin_message_idstr": "m1"}, true},
 		{"obo_system_hint reserved", map[string]interface{}{"obo_system_hint": "noop"}, true},
 
+		// PR#121 R3: actual_sender_uid is server-only (no `obo_`
+		// prefix) — modules/bot_api/send.go injects it on every OBO
+		// send when fromUID != robotID so downstream consumers can
+		// attribute the message to the real bot behind the
+		// persona-clone dispatch. A client (bot OR user) that could
+		// set it on inbound would spoof that attribution.
+		{"actual_sender_uid reserved", map[string]interface{}{"actual_sender_uid": "u_admin"}, true},
+		{"actual_sender_uid mixed in", map[string]interface{}{"type": 1, "content": "hi", "actual_sender_uid": "bot_x"}, true},
+
 		// Anti-overreach: only the explicit set is reserved at the
 		// single-underscore level. A user payload key that merely
 		// starts with `obo_` but is NOT one of the known fan-out
 		// fields must still be passed through (else we'd break legacy
 		// callers who happened to choose `obo_*` for unrelated data).
 		{"unknown single-underscore obo_ not reserved", map[string]interface{}{"obo_random_user_field": "x"}, false},
+
+		// PR#121 R3 anti-overreach: only the exact lowercase
+		// `actual_sender_uid` is reserved. Adjacent client field
+		// names that downstream code does NOT trust must pass
+		// through so we don't break unrelated schemas.
+		{"adjacent sender_uid not reserved", map[string]interface{}{"sender_uid": "u"}, false},
+		{"adjacent actual_sender not reserved", map[string]interface{}{"actual_sender": "u"}, false},
+		{"upper-case ACTUAL_SENDER_UID not reserved", map[string]interface{}{"ACTUAL_SENDER_UID": "u"}, false},
 	}
 	for _, tc := range cases {
 		got := HasReservedKey(tc.payload)
@@ -157,8 +187,11 @@ func TestStripReservedKeys(t *testing.T) {
 				"obo_origin_from_uid":      "u",
 				"obo_origin_message_idstr": "m1",
 				"obo_system_hint":          "noop",
+				// PR#121 R3 — actual_sender_uid is in the same
+				// allowlist; co-strip with the obo_* set.
+				"actual_sender_uid": "bot_admin",
 			},
-			8,
+			9,
 			map[string]interface{}{"type": 1, "content": "hi"},
 		},
 		{
@@ -168,8 +201,9 @@ func TestStripReservedKeys(t *testing.T) {
 				"__obo_processed__": true,
 				"obo_respond_as":    "u_admin",
 				"obo_fanout":        true,
+				"actual_sender_uid": "bot_x",
 			},
-			3,
+			4,
 			map[string]interface{}{"type": 1},
 		},
 		{
@@ -177,6 +211,25 @@ func TestStripReservedKeys(t *testing.T) {
 			map[string]interface{}{"obo_my_random_field": "x", "obo_respond_as": "u"},
 			1,
 			map[string]interface{}{"obo_my_random_field": "x"},
+		},
+
+		// PR#121 R3 dedicated cases: actual_sender_uid alone must
+		// strip; adjacent client field names must be preserved.
+		{
+			"actual_sender_uid alone stripped",
+			map[string]interface{}{"type": 1, "content": "hi", "actual_sender_uid": "bot_x"},
+			1,
+			map[string]interface{}{"type": 1, "content": "hi"},
+		},
+		{
+			"adjacent sender_uid / actual_sender preserved",
+			map[string]interface{}{
+				"sender_uid":        "u1",
+				"actual_sender":     "u2",
+				"actual_sender_uid": "bot_x",
+			},
+			1,
+			map[string]interface{}{"sender_uid": "u1", "actual_sender": "u2"},
 		},
 	}
 	for _, tc := range cases {

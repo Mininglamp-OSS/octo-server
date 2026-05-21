@@ -53,24 +53,29 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 		c.ResponseError(errors.New("payload不能为空"))
 		return
 	}
-	// PR#82 review #2 P1-2 + PR#121 R2 — reject any inbound payload
-	// that carries a reserved server-only key. Two overlapping
-	// namespaces are reserved:
+	// PR#82 review #2 P1-2 + PR#121 R2 + PR#121 R3 — reject any
+	// inbound payload that carries a reserved server-only key. Three
+	// overlapping namespaces are reserved:
 	//   - `__obo_*` (double-underscore prefix): home of the fan-out
 	//     gate-3 marker `__obo_processed__` and any future
 	//     server-injected OBO field;
 	//   - explicit `obo_*` keys injected by buildFanoutCopyReq
 	//     (obo_respond_as, obo_grantor_uid, obo_fanout, obo_origin_*,
-	//     obo_system_hint).
-	// Allowing a bot client to set either would let a malicious bot
-	// suppress its own fan-out copy or spoof the OBO grantor /
-	// fan-out routing context downstream. Membership is owned by
-	// pkg/obopayload so this site cannot drift from the user / robot
-	// ingress strip or the fan-out listener's gate-3 check. Reject
-	// before checkSendPermission / checkOBO so the error is fast and
-	// the auth path doesn't run on poisoned input.
+	//     obo_system_hint);
+	//   - `actual_sender_uid` — the prefix-less server-injected
+	//     "real bot behind an OBO send" identity set below in the
+	//     fan-out marker block (PR#121 R3).
+	// Allowing a bot client to set any of them would let a malicious
+	// bot suppress its own fan-out copy, spoof the OBO grantor /
+	// fan-out routing context downstream, or forge the
+	// authenticated-by-server sender identity downstream consumers
+	// trust. Membership is owned by pkg/obopayload so this site
+	// cannot drift from the user / robot ingress strip or the
+	// fan-out listener's gate-3 check. Reject before
+	// checkSendPermission / checkOBO so the error is fast and the
+	// auth path doesn't run on poisoned input.
 	if payloadHasReservedOBOKey(req.Payload) {
-		c.ResponseError(errors.New("payload 不允许使用 OBO 保留字段（__obo_* 前缀或 obo_respond_as/obo_grantor_uid/obo_fanout/obo_origin_*/obo_system_hint）"))
+		c.ResponseError(errors.New("payload 不允许使用 OBO 保留字段（__obo_* 前缀、obo_respond_as/obo_grantor_uid/obo_fanout/obo_origin_*/obo_system_hint，或 actual_sender_uid）"))
 		return
 	}
 

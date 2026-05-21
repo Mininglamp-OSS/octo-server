@@ -57,6 +57,25 @@ type fakeOBOStore struct {
 	failInsertScope       error
 	failQueryRobotOwner   error
 	failFindScopeOwner    error
+
+	// PR#114 R3 (Jerry-Xin perf blocker) — call counters so tests can
+	// pin the early-return contract: on plain / @AI-only group traffic,
+	// neither findActiveGrantsForChannel nor
+	// findActiveGrantsForChannelByGrantors must be invoked. Mirrors the
+	// production negative-cache short-circuit: the cheapest grant
+	// lookup is the one we never make.
+	findGrantsChannelCalls           int
+	findGrantsChannelByGrantorsCalls int
+	// lastFindByGrantorsArgs records the most recent argument set passed
+	// to findActiveGrantsForChannelByGrantors so tests can assert that
+	// the @grantor narrowing actually filtered the query (and didn't
+	// silently fall back to the unfiltered scan).
+	lastFindByGrantorsArgs struct {
+		channelID   string
+		channelType uint8
+		grantorUIDs []string
+		called      bool
+	}
 }
 
 // newFakeOBOStore — constructor, zero-value-friendly so tests can also

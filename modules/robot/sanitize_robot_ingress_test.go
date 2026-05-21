@@ -186,6 +186,38 @@ func TestRobotMessage_OBOExplicitFanoutKeysStripped(t *testing.T) {
 	assert.Len(t, cl.calls, 1, "one warn log even for many reserved keys")
 }
 
+// TestRobotMessage_ActualSenderUidStripped — PR#121 R3 (Jerry-Xin
+// 2026-05-21 blocking review). `actual_sender_uid` has no `obo_`
+// prefix because downstream readers consume it by exact name, but it
+// IS server-only: modules/bot_api/send.go injects it on every OBO
+// send when fromUID != robotID. A robot script (this legacy ingress)
+// that could set it would forge the "real bot behind an OBO send"
+// attribution downstream audit / persona-clone provenance trusts.
+// Silently strip here too; adjacent client names (`sender_uid`,
+// `actual_sender`) downstream does NOT trust must pass through.
+func TestRobotMessage_ActualSenderUidStripped(t *testing.T) {
+	cl := &captureRobotLog{}
+	payload := map[string]interface{}{
+		"content":           "spoof attempt",
+		"type":              1,
+		"actual_sender_uid": "bot_admin",
+		"sender_uid":        "bot_self",
+		"actual_sender":     "bot_self_name",
+	}
+
+	stripped := sanitizeRobotIngressPayload(payload, "ch", 2, "bot", cl.warn)
+
+	assert.Equal(t, 1, stripped)
+	if _, present := payload["actual_sender_uid"]; present {
+		t.Fatalf("actual_sender_uid must be stripped from robot payload, got %v", payload)
+	}
+	assert.Equal(t, "spoof attempt", payload["content"])
+	assert.Equal(t, 1, payload["type"])
+	assert.Equal(t, "bot_self", payload["sender_uid"], "adjacent sender_uid must survive")
+	assert.Equal(t, "bot_self_name", payload["actual_sender"], "adjacent actual_sender must survive")
+	assert.Len(t, cl.calls, 1, "one warn log on strip")
+}
+
 // TestRobotMessage_StripContract_PinnedToSharedPackage — meta-assertion
 // matching the user-ingress meta-assertion: the robot strip MUST go
 // through pkg/obopayload so the three ingresses + the fan-out listener

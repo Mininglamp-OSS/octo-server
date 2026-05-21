@@ -54,21 +54,37 @@ const ReservedKeyPrefix = "__obo_"
 // prefix.
 const ProcessedMarkerKey = "__obo_processed__"
 
-// ExplicitReservedKeys lists single-underscore `obo_*` payload keys
-// that the server injects via modules/bot_api/obo_fanout.go's
-// buildFanoutCopyReq (PR#121 R2 — Jerry-Xin 2026-05-21 blocking review).
-// They carry OBO routing context (respond-as identity, grantor uid,
-// origin channel/from-uid/message id, fan-out marker, system hint) and
-// MUST be server-only: a client that could set them on inbound payloads
-// could spoof the grantor identity, redirect fan-out, or impersonate
-// the system-hint pathway.
+// ExplicitReservedKeys lists payload keys that the server injects on
+// the OBO send / fan-out path and that MUST be server-only: a client
+// that could set them on inbound payloads could spoof the grantor
+// identity, redirect fan-out, impersonate the system-hint pathway, or
+// (for `actual_sender_uid`) forge the message's effective sender for
+// any downstream consumer that trusts the field as the
+// authenticated-by-server identity behind an OBO send.
 //
-// They use the legacy single-underscore `obo_` prefix (not the
-// double-underscore `__obo_` reserved-marker prefix) for compatibility
-// with downstream consumers that already read these names. We can't
-// retroactively switch to a `__obo_` prefix without breaking those
-// consumers, so the ingress filters guard the same set via an explicit
-// allowlist instead of by prefix.
+// Two namespace shapes share this allowlist:
+//
+//   - `obo_*` (single-underscore) — the routing context injected by
+//     modules/bot_api/obo_fanout.go's buildFanoutCopyReq (PR#121 R2 —
+//     Jerry-Xin 2026-05-21 blocking review). They use the legacy
+//     single-underscore `obo_` prefix (not the double-underscore
+//     `__obo_` reserved-marker prefix) for compatibility with
+//     downstream consumers that already read these names. We can't
+//     retroactively switch to a `__obo_` prefix without breaking
+//     those consumers, so the ingress filters guard the same set via
+//     an explicit allowlist instead of by prefix.
+//
+//   - `actual_sender_uid` (no `obo_` prefix) — the server-injected
+//     "real bot behind an OBO send" identity set by
+//     modules/bot_api/send.go when fromUID != robotID (PR#121 R3 —
+//     Jerry-Xin 2026-05-21 blocking review). It does NOT live under
+//     any prefix because the field name predates the OBO reserved
+//     namespace and downstream consumers (audit, persona-clone
+//     attribution, fan-out copy provenance) read it by exact name. A
+//     client that could set `actual_sender_uid` on an inbound payload
+//     would be able to forge the bot identity that downstream paths
+//     attribute the message to — the same impersonation risk the
+//     `obo_grantor_uid` reservation closes for the user side.
 //
 // Notes
 //   - `obo_processed` (single-underscore) is intentionally NOT in this
@@ -76,8 +92,9 @@ const ProcessedMarkerKey = "__obo_processed__"
 //     gate-3 marker (that one is `__obo_processed__` under the
 //     ReservedKeyPrefix).
 //   - When adding a new server-only OBO payload key in
-//     buildFanoutCopyReq (or any other server injection site), add it
-//     here too. The shared payload_test.go locks the contract.
+//     buildFanoutCopyReq, send.go's OBO marker block, or any other
+//     server injection site, add it here too. The shared
+//     payload_test.go locks the contract.
 var ExplicitReservedKeys = map[string]struct{}{
 	"obo_respond_as":           {},
 	"obo_grantor_uid":          {},
@@ -87,6 +104,11 @@ var ExplicitReservedKeys = map[string]struct{}{
 	"obo_origin_from_uid":      {},
 	"obo_origin_message_idstr": {},
 	"obo_system_hint":          {},
+	// PR#121 R3 (Jerry-Xin 2026-05-21 blocking): server-set actual
+	// sender identity behind an OBO send. Injected by
+	// modules/bot_api/send.go when fromUID != robotID; no `obo_`
+	// prefix because downstream readers use the exact field name.
+	"actual_sender_uid": {},
 }
 
 // IsReservedKey reports whether a single top-level payload key name
@@ -99,7 +121,9 @@ var ExplicitReservedKeys = map[string]struct{}{
 //   - it matches an entry in ExplicitReservedKeys — the
 //     single-underscore `obo_*` set covering the buildFanoutCopyReq
 //     routing fields (`obo_respond_as`, `obo_grantor_uid`,
-//     `obo_fanout`, `obo_origin_*`, `obo_system_hint`).
+//     `obo_fanout`, `obo_origin_*`, `obo_system_hint`) PLUS the
+//     prefix-less `actual_sender_uid` field injected by send.go's
+//     OBO marker block (PR#121 R3).
 //
 // Used by HasReservedKey (bot-API reject) and StripReservedKeys
 // (user / robot ingress strip) so both ingresses + the listener's

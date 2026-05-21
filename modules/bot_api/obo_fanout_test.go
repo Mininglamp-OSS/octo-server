@@ -308,6 +308,16 @@ func TestPayloadHasReservedOBOKey(t *testing.T) {
 		{"the marker itself", map[string]interface{}{"__obo_processed__": true}, true},
 		{"any double-underscore obo key", map[string]interface{}{"__obo_anything__": "x"}, true},
 		{"mixed in", map[string]interface{}{"type": 1, "__obo_marker": false}, true},
+		// PR#121 R3 — actual_sender_uid is server-only (no `obo_`
+		// prefix) so the bot-API ingress MUST reject a bot client
+		// that tries to spoof the real-bot-behind-OBO identity.
+		{"actual_sender_uid rejected", map[string]interface{}{"actual_sender_uid": "bot_admin"}, true},
+		{"actual_sender_uid mixed in", map[string]interface{}{"type": 1, "content": "hi", "actual_sender_uid": "bot_x"}, true},
+		// Anti-overreach: adjacent client field names must not
+		// trip the reject (otherwise we'd break unrelated bot
+		// schemas that happen to ship `sender_uid` / `actual_sender`).
+		{"adjacent sender_uid passes", map[string]interface{}{"sender_uid": "u"}, false},
+		{"adjacent actual_sender passes", map[string]interface{}{"actual_sender": "u"}, false},
 	}
 	for _, tc := range cases {
 		got := payloadHasReservedOBOKey(tc.payload)
