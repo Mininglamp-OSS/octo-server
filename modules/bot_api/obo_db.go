@@ -77,10 +77,11 @@ func isGroupLikeChannelType(channelType uint8) bool {
 // GranteeBotName is NOT a column on obo_grants — it is populated by
 // listGrantsByGrantor via a LEFT JOIN against the `user` table (the bot's
 // display name lives on user.name, joined on user.uid = grantee_bot_uid).
-// Other reads that do `SELECT * FROM obo_grants` leave it empty; only the
-// listing endpoint pays the JOIN, since that is the only path the web UI
-// reads (PersonaCard renders `grantee_bot_name || grantee_bot_uid`, so a
-// missing name fell back to the raw uid — YUJ-1358 / octo-web#60).
+// Other reads that select via `oboGrantColumns` (the explicit column list
+// — see below) leave it empty; only the listing endpoint pays the JOIN,
+// since that is the only path the web UI reads (PersonaCard renders
+// `grantee_bot_name || grantee_bot_uid`, so a missing name fell back to
+// the raw uid — YUJ-1358 / octo-web#60).
 type oboGrantModel struct {
 	ID            int64  `db:"id" json:"id"`
 	GrantorUID    string `db:"grantor_uid" json:"grantor_uid"`
@@ -883,8 +884,15 @@ func (d *botAPIDB) setGrantActive(id int64, active int) error {
 	// Re-read target inside the tx — the grantor_uid we use to scope
 	// the demote query MUST be the locked snapshot, not a value read
 	// before the tx began.
+	// MUST use oboGrantColumns (not `SELECT *`) — `persona_prompt` is
+	// a nullable TEXT column and `oboGrantModel.PersonaPrompt` is a
+	// non-pointer `string`. Legacy rows created before migration
+	// 20260521000001_obo_v2_persona_prompt.sql carry NULL, and dbr
+	// will hit a scan error trying to land that into a `string`.
+	// `oboGrantColumns` wraps the column in COALESCE(..., '') so the
+	// NULL case lands cleanly. PR#131 R3 / YUJ-1740.
 	var grant *oboGrantModel
-	if _, lookupErr := tx.Select("*").From("obo_grants").
+	if _, lookupErr := tx.Select(oboGrantColumns).From("obo_grants").
 		Where("id=?", id).
 		Suffix("FOR UPDATE").
 		Load(&grant); lookupErr != nil && !errors.Is(lookupErr, dbr.ErrNotFound) {
@@ -1211,9 +1219,11 @@ func (d *botAPIDB) createOrReactivateGrantAtomic(grantorUID, granteeBotUID, mode
 	case isDuplicateKeyErr(insErr):
 		// Reactivation candidate. Re-read the existing row under FOR
 		// UPDATE so the demote-others step that follows operates on a
-		// locked snapshot.
+		// locked snapshot. Use oboGrantColumns (not `SELECT *`) so a
+		// NULL `persona_prompt` on a legacy row decodes cleanly into
+		// `oboGrantModel.PersonaPrompt string`. PR#131 R3 / YUJ-1740.
 		var existing *oboGrantModel
-		if _, lookupErr := tx.Select("*").From("obo_grants").
+		if _, lookupErr := tx.Select(oboGrantColumns).From("obo_grants").
 			Where("grantor_uid=? AND grantee_bot_uid=?", grantorUID, granteeBotUID).
 			Suffix("FOR UPDATE").
 			Load(&existing); lookupErr != nil && !errors.Is(lookupErr, dbr.ErrNotFound) {
@@ -1274,9 +1284,12 @@ func (d *botAPIDB) createOrReactivateGrantAtomic(grantorUID, granteeBotUID, mode
 	}
 
 	// Read the canonical post-write row inside the tx so the caller
-	// gets the same view we just committed.
+	// gets the same view we just committed. Use oboGrantColumns (not
+	// `SELECT *`) so a NULL `persona_prompt` on a legacy reactivated
+	// row decodes cleanly into `oboGrantModel.PersonaPrompt string`.
+	// PR#131 R3 / YUJ-1740.
 	var grant *oboGrantModel
-	if _, readErr := tx.Select("*").From("obo_grants").
+	if _, readErr := tx.Select(oboGrantColumns).From("obo_grants").
 		Where("id=?", grantID).
 		Load(&grant); readErr != nil {
 		return nil, false, readErr
