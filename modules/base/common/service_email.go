@@ -315,12 +315,20 @@ func (s *EmailService) dispatchSMTP(ctx context.Context, smtpAddr, fromSan, pwd,
 // Exchange Online which only advertises "AUTH LOGIN XOAUTH2").
 func (s *EmailService) chooseAuth(client *smtp.Client, username, password, host string) smtp.Auth {
 	if ok, authStr := client.Extension("AUTH"); ok {
-		mechs := strings.ToUpper(authStr)
-		if strings.Contains(mechs, "PLAIN") {
+		tokens := strings.Fields(strings.ToUpper(authStr))
+		hasMech := func(m string) bool {
+			for _, t := range tokens {
+				if t == m {
+					return true
+				}
+			}
+			return false
+		}
+		if hasMech("PLAIN") {
 			return smtp.PlainAuth("", username, password, host)
 		}
-		if strings.Contains(mechs, "LOGIN") {
-			return LoginAuth(username, password)
+		if hasMech("LOGIN") {
+			return LoginAuth(username, password, host)
 		}
 	}
 	// Default to PLAIN when server doesn't advertise (legacy behavior).
@@ -364,15 +372,23 @@ const (
 // Microsoft Exchange Online that only advertise AUTH LOGIN will reject PLAIN
 // with "504 5.7.4 Unrecognized authentication type".
 type loginAuth struct {
-	username, password string
+	username, password, host string
 }
 
 // LoginAuth returns an smtp.Auth that implements the LOGIN mechanism.
-func LoginAuth(username, password string) smtp.Auth {
-	return &loginAuth{username, password}
+// Like smtp.PlainAuth, it refuses to send credentials over unencrypted
+// connections (unless the server is localhost).
+func LoginAuth(username, password, host string) smtp.Auth {
+	return &loginAuth{username, password, host}
 }
 
 func (a *loginAuth) Start(server *smtp.ServerInfo) (string, []byte, error) {
+	if !server.TLS && !isLocalhost(server.Name) {
+		return "", nil, errors.New("unencrypted connection: LOGIN auth requires TLS")
+	}
+	if server.Name != a.host {
+		return "", nil, errors.New("wrong host name")
+	}
 	return "LOGIN", nil, nil
 }
 
@@ -380,14 +396,20 @@ func (a *loginAuth) Next(fromServer []byte, more bool) ([]byte, error) {
 	if !more {
 		return nil, nil
 	}
-	switch string(fromServer) {
-	case "Username:":
+	prompt := strings.TrimSpace(strings.ToLower(string(fromServer)))
+	switch {
+	case strings.HasPrefix(prompt, "username"):
 		return []byte(a.username), nil
-	case "Password:":
+	case strings.HasPrefix(prompt, "password"):
 		return []byte(a.password), nil
 	default:
-		return nil, fmt.Errorf("unexpected server challenge: %s", fromServer)
+		return nil, fmt.Errorf("unexpected server challenge: %q", fromServer)
 	}
+}
+
+// isLocalhost reports whether the given host is a loopback address.
+func isLocalhost(name string) bool {
+	return name == "localhost" || name == "127.0.0.1" || name == "::1"
 }
 
 // resolveSMTP returns the effective SMTP config: admin-tunable values from
