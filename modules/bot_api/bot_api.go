@@ -247,6 +247,14 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 		botAPI.GET("/voice/context", ba.botGetVoiceContext)
 		botAPI.DELETE("/voice/context", ba.botDeleteVoiceContext)
 		botAPI.POST("/voice/transcribe", ba.botTranscribe)
+		// OBO bot-token read (Mininglamp-OSS/octo-server#135 / YUJ-1762).
+		// Adapter-facing endpoint that returns the active grant whose
+		// grantee is the calling bot, including `persona_prompt`. Kept
+		// inside the bot-token group (not /v1/obo/*) because the auth
+		// posture is "the bot is asking about itself" — fundamentally
+		// different from the user-token /v1/obo/* CRUD which mutates
+		// grants on behalf of a logged-in grantor.
+		botAPI.GET("/obo-grant", ba.oboBotGetGrant)
 	}
 
 	// Bot File API (separate group for wildcard conflict avoidance)

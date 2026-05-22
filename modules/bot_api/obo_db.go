@@ -155,6 +155,33 @@ type oboStore interface {
 	// not the system-wide fan-out path, so the per-call MySQL probe
 	// is acceptable.
 	findGrantByGrantorBotActiveOnly(grantorUID, granteeBotUID string) (*oboGrantModel, error)
+	// findActiveGrantByBot — Mininglamp-OSS/octo-server#135 (YUJ-1762).
+	// Bot-side lookup: returns the active grant where `botUID` is the
+	// grantee, with no grantor predicate. Used by the bot-token endpoint
+	// GET /v1/bot/obo-grant so an adapter can pull its `persona_prompt`
+	// at runtime without storing a local copy.
+	//
+	// Contract:
+	//   - Filters on `active=1` ONLY (the `global_enabled` master switch
+	//     is intentionally NOT consulted — the response surfaces that
+	//     bit as a separate field so the adapter can decide whether to
+	//     apply the persona). This matches the spec on #135 which expects
+	//     both `active` and `global_enabled` to be returned independently.
+	//   - Returns (nil, nil) when no active row matches; the caller maps
+	//     that to a 404. Returning ErrNotFound was rejected to keep
+	//     callers free of `dbr` imports (mirrors findActiveGrantByGrantorBot).
+	//   - When multiple grantors have an active grant pointing at the
+	//     same bot (rare; a single bot rented out to multiple personas),
+	//     the row with the smallest ID wins. The ordering is deterministic
+	//     so repeated polls return the same persona until grant state
+	//     changes; the "at most one active grant per grantor" invariant
+	//     elsewhere in this package keeps the multi-row case bounded by
+	//     the number of distinct grantors who installed the same bot.
+	//   - Does NOT consult the `obo:grantor:{uid}` negative cache: that
+	//     cache is keyed by grantor, and this lookup has no grantor to
+	//     hash on. The query hits the same `(grantee_bot_uid, active)`
+	//     covering index used by the fan-out feeders.
+	findActiveGrantByBot(botUID string) (*oboGrantModel, error)
 	scopeEnabled(grantID int64, channelID string, channelType uint8) (bool, error)
 	scopeRowExists(grantID int64, channelID string, channelType uint8) (bool, error)
 	findActiveGrantsForChannel(channelID string, channelType uint8) ([]*oboGrantModel, error)
@@ -390,6 +417,36 @@ func (d *botAPIDB) findGrantByGrantorBotActiveOnly(grantorUID, granteeBotUID str
 		"SELECT "+oboGrantColumns+" FROM obo_grants "+
 			"WHERE grantor_uid=? AND grantee_bot_uid=? AND active=1",
 		grantorUID, granteeBotUID,
+	).Load(&m)
+	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
+		return nil, err
+	}
+	return m, nil
+}
+
+// findActiveGrantByBot — see oboStore for the contract.
+// Mininglamp-OSS/octo-server#135 (YUJ-1762). Bot-side lookup that
+// powers GET /v1/bot/obo-grant. Selects the active grant whose
+// `grantee_bot_uid` matches the calling bot, with no grantor predicate.
+//
+// `ORDER BY id ASC LIMIT 1` keeps the response deterministic when a bot
+// is somehow the grantee of multiple grantors' active grants. We do
+// NOT consult the `obo:grantor:{uid}` negative cache — it is keyed by
+// grantor and there is no grantor to hash on at this call site. The
+// `(grantee_bot_uid, active)` covering index keeps the per-call cost
+// comparable to the cache-miss path of findActiveGrantByGrantorBot.
+// `persona_prompt` arrives wrapped in COALESCE(..., '') via
+// oboGrantColumns so NULL columns load as the empty string.
+func (d *botAPIDB) findActiveGrantByBot(botUID string) (*oboGrantModel, error) {
+	if botUID == "" {
+		return nil, nil
+	}
+	var m *oboGrantModel
+	_, err := d.session.SelectBySql(
+		"SELECT "+oboGrantColumns+" FROM obo_grants "+
+			"WHERE grantee_bot_uid=? AND active=1 "+
+			"ORDER BY id ASC LIMIT 1",
+		botUID,
 	).Load(&m)
 	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
 		return nil, err

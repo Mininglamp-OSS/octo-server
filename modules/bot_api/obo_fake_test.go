@@ -205,6 +205,40 @@ func (f *fakeOBOStore) findGrantByGrantorBotActiveOnly(grantorUID, granteeBotUID
 	return nil, nil
 }
 
+// findActiveGrantByBot — Mininglamp-OSS/octo-server#135 (YUJ-1762). Fake
+// analogue of the prod bot-side lookup. Iterates by sorted grant ID so
+// the deterministic-row guarantee tests rely on (and the prod
+// `ORDER BY id ASC LIMIT 1` clause) holds in the in-memory store too.
+// Shares failFindActiveGrant because the same DB-class injection is
+// what tests want to surface from any "find active grant" path.
+func (f *fakeOBOStore) findActiveGrantByBot(botUID string) (*oboGrantModel, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failFindActiveGrant != nil {
+		return nil, f.failFindActiveGrant
+	}
+	f.ensureInit()
+	if botUID == "" {
+		return nil, nil
+	}
+	ids := make([]int64, 0, len(f.grants))
+	for id := range f.grants {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for _, id := range ids {
+		g := f.grants[id]
+		if g == nil {
+			continue
+		}
+		if g.GranteeBotUID == botUID && g.Active == 1 {
+			cp := *g
+			return &cp, nil
+		}
+	}
+	return nil, nil
+}
+
 func (f *fakeOBOStore) scopeEnabled(grantID int64, channelID string, channelType uint8) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

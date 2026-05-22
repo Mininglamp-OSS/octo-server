@@ -591,6 +591,80 @@ func (ba *BotAPI) oboListScopes(c *wkhttp.Context) {
 	c.Response(map[string]interface{}{"items": scopes})
 }
 
+// ==================== Bot-token endpoint (issue #135) ====================
+
+// oboBotGetGrantResp is the wire shape for GET /v1/bot/obo-grant.
+// Field set is intentionally narrow — the adapter only needs the four
+// values listed in the issue (grantor uid + the persona prompt + the
+// two booleans that gate "should I apply the persona right now?").
+// We do not surface the grant id, timestamps, or any scope rows: a bot
+// authenticated by its own token has no use for grant-management
+// metadata, and leaking it would expand the blast radius if the token
+// is exfiltrated.
+type oboBotGetGrantResp struct {
+	GrantorUID    string `json:"grantor_uid"`
+	PersonaPrompt string `json:"persona_prompt"`
+	Active        bool   `json:"active"`
+	GlobalEnabled bool   `json:"global_enabled"`
+}
+
+// oboBotGetGrant — GET /v1/bot/obo-grant.
+// Mininglamp-OSS/octo-server#135 (YUJ-1762). Bot-token authenticated;
+// returns the active OBO grant where the calling bot is the grantee so
+// the adapter can pull `persona_prompt` at runtime without keeping a
+// local copy.
+//
+// Auth posture: this handler intentionally reads the bot UID from the
+// authenticated context (CtxKeyRobotID set by ba.authBot()), NOT from
+// the URL or body. The endpoint never accepts a bot uid as input — a
+// compromised bot can only ever read its OWN grant, never probe for
+// someone else's persona by spoofing a path parameter.
+//
+// Status code map:
+//   - 200 — grant found; body is oboBotGetGrantResp.
+//   - 401 — handled by ba.authBot() upstream (this handler only runs
+//           on authenticated requests; the defensive empty-uid branch
+//           below 500s because reaching it means the middleware broke
+//           its invariant and a 401 would mask that).
+//   - 404 — no active grant for this bot. Note: "no active grant"
+//           covers both "grant never existed" and "grant was paused
+//           or revoked"; the adapter should treat 404 as "do not
+//           apply a persona" without distinguishing the cause.
+//   - 500 — store error.
+//
+// `persona_prompt` round-trips as an empty string when the column is
+// NULL, courtesy of the COALESCE wrapper in oboGrantColumns (issue
+// requirement: "persona_prompt 为 NULL 时返回空串").
+func (ba *BotAPI) oboBotGetGrant(c *wkhttp.Context) {
+	botUID := getRobotIDFromContext(c)
+	if botUID == "" {
+		// authBot middleware should have populated this. Treat as 500
+		// rather than 401 so the misconfiguration is noisy upstream
+		// instead of being silently mis-attributed to an auth failure.
+		ba.Error("oboBotGetGrant: empty robot id from auth context")
+		c.ResponseError(errors.New("内部错误"))
+		return
+	}
+	grant, err := ba.oboStoreOrDefault().findActiveGrantByBot(botUID)
+	if err != nil {
+		ba.Error("findActiveGrantByBot failed",
+			zap.Error(err),
+			zap.String("bot", botUID))
+		c.ResponseError(errors.New("内部错误"))
+		return
+	}
+	if grant == nil {
+		c.JSON(http.StatusNotFound, gin404("no active grant"))
+		return
+	}
+	c.Response(oboBotGetGrantResp{
+		GrantorUID:    grant.GrantorUID,
+		PersonaPrompt: grant.PersonaPrompt,
+		Active:        grant.Active == 1,
+		GlobalEnabled: grant.GlobalEnabled == 1,
+	})
+}
+
 // ==================== Helpers ====================
 
 // requireOwnedGrant resolves the grant and verifies the caller owns it.
