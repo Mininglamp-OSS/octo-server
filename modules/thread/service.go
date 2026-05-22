@@ -261,6 +261,19 @@ func (s *Service) CreateThread(req *CreateThreadReq) (*ThreadResp, error) {
 	// 在父群发送子区创建消息
 	s.sendThreadCreatedMessage(req.GroupNo, shortID, req.Name, req.CreatorUID, req.CreatorName, req.SourceMessageID, req.SourceMessagePayload)
 
+	// 给所有"已对父 channel 开启 auto_follow_threads=1"的用户 fanout 一行 thread ext。
+	// 与 IM 频道 / 子区创建消息一样在 commit 之后做 best-effort：失败只警告，不让
+	// thread 创建本身回滚（用户已经看到子区，下次 FollowChannel/refollow 会把缺失的
+	// fanout 补齐）。GetGlobalConvExtService 在单测环境（未 init 单例）返回 nil 时跳过。
+	if convSvc := conversation_ext.GetGlobalConvExtService(); convSvc != nil {
+		if err := convSvc.OnThreadCreated(req.GroupNo, shortID); err != nil {
+			s.Warn("OnThreadCreated fanout 失败（thread 已创建，sidebar 会延迟到下次 FollowChannel/refollow 补齐）",
+				zap.String("groupNo", req.GroupNo),
+				zap.String("shortID", shortID),
+				zap.Error(err))
+		}
+	}
+
 	resp := s.toThreadRespWithID(thread)
 	resp.MemberCount = 1 // 创建者
 	return resp, nil

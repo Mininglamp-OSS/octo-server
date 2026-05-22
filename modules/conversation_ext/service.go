@@ -316,6 +316,73 @@ func (s *Service) UnfollowChannel(uid, spaceID, groupNo string) error {
 }
 
 // ---------------------------------------------------------------------------
+// OnThreadCreated — fanout on new thread to every user with auto_follow_threads
+// ---------------------------------------------------------------------------
+
+// OnThreadCreated 在 thread.Service.CreateThread 提交 tx 之后调用，给所有
+// 已对 parent channel 开启 auto_follow_threads=1 的用户物化 thread ext 行
+// 并 bump 各自的 follow_version，从而实现"关注 channel 后新建子区自动跟随"。
+//
+// 设计说明（plan Q1 = C / fanout = 同步）：
+//   - 同步执行（非异步队列）—— 客户端 sidebar 在 thread 创建消息送达后立刻能拉到新行。
+//   - 单独 tx —— thread.Service.CreateThread 自己的 tx 已 commit，与 IM 频道 / 子区
+//     创建消息一样采取 best-effort post-commit hook 风格；fanout 失败只记日志不阻断
+//     thread 创建本身。
+//   - INSERT IGNORE —— 用户既有的 thread 行（含已手动调过 follow_sort 的）保持不变。
+//   - follow_version bump —— 只对真正参与 fanout 的用户 +1。无 auto_follow 用户时整体 no-op。
+//   - 锁顺序与 FollowChannel 一致：每个用户先 BumpFollowVersionTx（在 version 行加 X 锁）
+//     再写 ext 行，避免与 UpdateSort 反向死锁。
+//
+// 调用方应在 thread.Service.CreateThread 的 commit 之后立即调用，错误以 wrap 形式上传，
+// 由调用方决定是否记日志 / 触发告警（thread 创建不应因 fanout 失败回滚）。
+func (s *Service) OnThreadCreated(groupNo, shortID string) error {
+	if groupNo == "" {
+		return errors.New("group_no must not be empty")
+	}
+	if shortID == "" {
+		return errors.New("short_id must not be empty")
+	}
+
+	// 1. 在 tx 外把目标 (uid, space_id) 列表读出 —— 跨 N 用户的 SELECT 不参与 tx 锁。
+	type target struct {
+		UID     string `db:"uid"`
+		SpaceID string `db:"space_id"`
+	}
+	var targets []target
+	_, err := s.session.SelectBySql(
+		"SELECT uid, space_id FROM "+table+
+			" WHERE target_type=? AND target_id=? AND auto_follow_threads=1",
+		targetTypeGroup, groupNo,
+	).Load(&targets)
+	if err != nil {
+		return fmt.Errorf("OnThreadCreated query auto-follow users: %w", err)
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+
+	threadChannelID := groupNo + threadSeparator + shortID
+
+	// 2. 单 tx：对每个目标用户先 bump version 再 INSERT IGNORE 一行 thread ext。
+	//    若中途失败整体回滚，避免出现"version 已 bump 但 ext 行未落"的不一致。
+	return s.withTx("OnThreadCreated", func(tx *dbr.Tx) error {
+		for _, t := range targets {
+			if _, err := BumpFollowVersionTx(tx, t.UID, t.SpaceID); err != nil {
+				return fmt.Errorf("OnThreadCreated bump version (uid=%s): %w", t.UID, err)
+			}
+			if _, err := tx.InsertBySql(
+				"INSERT IGNORE INTO "+table+
+					" (uid, space_id, target_type, target_id) VALUES (?, ?, ?, ?)",
+				t.UID, t.SpaceID, targetTypeThread, threadChannelID,
+			).Exec(); err != nil {
+				return fmt.Errorf("OnThreadCreated insert thread ext (uid=%s): %w", t.UID, err)
+			}
+		}
+		return nil
+	})
+}
+
+// ---------------------------------------------------------------------------
 // FollowThread — re-follow parent group (implicit) + upsert thread ext row
 // ---------------------------------------------------------------------------
 

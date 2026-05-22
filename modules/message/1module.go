@@ -70,6 +70,10 @@ func init() {
 		svc := convext.GetGlobalConvExtService()
 		if svc != nil {
 			svc.SetThreadAuthChecker(newThreadAuthChecker(appCtx))
+			// 注入 ThreadEnumerator：FollowChannel 物化既有子区时通过它枚举
+			// active 子区的 shortID。同样落在 message 模块以避开 conversation_ext
+			// 直接 import modules/thread 的循环依赖（见 ThreadAuthChecker 同款逻辑）。
+			svc.SetThreadEnumerator(newThreadEnumerator(appCtx))
 		}
 		return register.Module{Name: "conversation_ext_thread_auth"}
 	})
@@ -170,4 +174,34 @@ func (c *threadAuthChecker) AuthorizeThreadFollow(uid, spaceID, groupNo, shortID
 		}
 	}
 	return convext.ErrThreadForbidden
+}
+
+// threadEnumerator implements convext.ThreadEnumerator for production wiring.
+// It thin-wraps thread.DB.QueryByGroupNoWithStatus(active-only) and projects to
+// shortID-only to keep the conversation_ext side free of thread.Model leakage.
+type threadEnumerator struct {
+	threadDB *thread.DB
+}
+
+func newThreadEnumerator(ctx *config.Context) *threadEnumerator {
+	return &threadEnumerator{threadDB: thread.NewDB(ctx)}
+}
+
+// EnumerateActiveShortIDs 返回 groupNo 下 active 子区的 shortID 列表，最多 limit 个。
+// 排序由 QueryByGroupNoWithStatus 决定：created_at DESC, id DESC —— 最新建的子区
+// 排在前面，截断后被丢弃的是最旧的子区，正好与"产品侧自动归档把旧子区清出 active"
+// 配合，让 cap 截断不会丢失"热"子区。
+func (e *threadEnumerator) EnumerateActiveShortIDs(groupNo string, limit int) ([]string, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	models, err := e.threadDB.QueryByGroupNoWithStatus(groupNo, []int{thread.ThreadStatusActive}, 0, int64(limit))
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(models))
+	for _, m := range models {
+		ids = append(ids, m.ShortID)
+	}
+	return ids, nil
 }

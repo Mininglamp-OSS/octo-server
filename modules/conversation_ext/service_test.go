@@ -356,6 +356,97 @@ func TestService_FollowChannel_PreservesExistingThreadSort(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// OnThreadCreated fanout — synchronous hook called by modules/thread on new thread
+// ---------------------------------------------------------------------------
+
+func TestService_OnThreadCreated_MaterializesForAutoFollowUsers(t *testing.T) {
+	svc := newServiceForTest(t)
+	const space, grp, shortID = "s1", "grp-ofc-1", "thr-new"
+	channelID := grp + threadSeparator + shortID
+
+	// A：开启 auto_follow_threads（关注了 channel）
+	require.NoError(t, svc.FollowChannel("uA", space, grp))
+	// B：关注过群但显式取关 —— UnfollowChannel 已经把 auto_follow_threads 清零
+	require.NoError(t, svc.UnfollowChannel("uB", space, grp))
+	// C：从未操作过该 channel，user_conversation_ext 中无该群行
+	// （不写任何行）
+
+	// Action
+	require.NoError(t, svc.OnThreadCreated(grp, shortID))
+
+	// 只有 A 拿到新的 thread ext 行
+	rowA, err := svc.db.Get("uA", space, targetTypeThread, channelID)
+	require.NoError(t, err)
+	assert.NotNil(t, rowA, "auto_follow_threads=1 的用户应被 fanout 物化 thread 行")
+
+	rowB, err := svc.db.Get("uB", space, targetTypeThread, channelID)
+	require.NoError(t, err)
+	assert.Nil(t, rowB, "已取消关注 channel 的用户不应被 fanout 触及")
+
+	rowC, err := svc.db.Get("uC", space, targetTypeThread, channelID)
+	require.NoError(t, err)
+	assert.Nil(t, rowC, "从未关注 channel 的用户不应被 fanout 触及")
+}
+
+func TestService_OnThreadCreated_BumpsVersionOnlyForTargetUsers(t *testing.T) {
+	svc := newServiceForTest(t)
+	const space, grp, shortID = "s1", "grp-ofc-2", "thr-v"
+
+	require.NoError(t, svc.FollowChannel("uA", space, grp))
+	require.NoError(t, svc.UnfollowChannel("uB", space, grp))
+
+	versionABefore := readFollowVersion(t, svc, "uA", space)
+	versionBBefore := readFollowVersion(t, svc, "uB", space)
+
+	require.NoError(t, svc.OnThreadCreated(grp, shortID))
+
+	versionAAfter := readFollowVersion(t, svc, "uA", space)
+	versionBAfter := readFollowVersion(t, svc, "uB", space)
+
+	assert.Equal(t, versionABefore+1, versionAAfter, "A 的 follow_version 应 +1")
+	assert.Equal(t, versionBBefore, versionBAfter, "B 的 follow_version 不应被 fanout 触及")
+}
+
+func TestService_OnThreadCreated_NoAutoFollowUsers_NoOp(t *testing.T) {
+	svc := newServiceForTest(t)
+	const space, grp, shortID = "s1", "grp-ofc-3", "thr-noop"
+
+	// 没有任何用户开启 auto_follow_threads —— OnThreadCreated 应安静返回。
+	require.NoError(t, svc.OnThreadCreated(grp, shortID))
+
+	// 表里没有该子区的行。
+	rows, err := svc.db.ListThreadExts("any-uid", space)
+	require.NoError(t, err)
+	assert.Empty(t, rows)
+}
+
+func TestService_OnThreadCreated_Idempotent_PreservesExistingRow(t *testing.T) {
+	svc := newServiceForTest(t)
+	const space, grp, shortID = "s1", "grp-ofc-4", "thr-dup"
+	channelID := grp + threadSeparator + shortID
+
+	require.NoError(t, svc.FollowChannel("uA", space, grp))
+	// uA 已手动给该 thread 拖到 sort=88
+	require.NoError(t, svc.db.Upsert("uA", space, targetTypeThread, channelID, ConvExtFields{
+		FollowSort: intPtr(88),
+	}))
+
+	require.NoError(t, svc.OnThreadCreated(grp, shortID))
+
+	row, err := svc.db.Get("uA", space, targetTypeThread, channelID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, 88, row.FollowSort, "已存在的 thread 行（含手动排序）必须保留，INSERT IGNORE 不应覆盖")
+}
+
+func TestService_OnThreadCreated_InvalidInput(t *testing.T) {
+	svc := newServiceForTest(t)
+
+	require.Error(t, svc.OnThreadCreated("", "thr"))
+	require.Error(t, svc.OnThreadCreated("grp", ""))
+}
+
+// ---------------------------------------------------------------------------
 // UnfollowChannel happy path + cascade
 // ---------------------------------------------------------------------------
 
