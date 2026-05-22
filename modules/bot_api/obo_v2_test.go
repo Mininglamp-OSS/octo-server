@@ -344,8 +344,13 @@ func TestOBO_V2_CreateGrant_DemotesPriorActiveGrant(t *testing.T) {
 	if demoted.GlobalEnabled != 0 {
 		t.Fatalf("v2 mutex: demoted grant must also have global_enabled=0, got %d", demoted.GlobalEnabled)
 	}
-	if demoted.RevokedAt == nil {
-		t.Fatalf("v2 mutex: demoted grant must carry revoked_at for audit, got nil")
+	// YUJ-1744 / PR#131 R4 — siblings demoted by create-mutex are PAUSED,
+	// not REVOKED. revoked_at stays NULL so the user can switch BACK to
+	// this grant via a later PUT {active:1} without hitting the
+	// oboUpdateGrant RevokedAt-gate. The audit timestamp is reserved
+	// for the explicit DELETE path (revokeGrant).
+	if demoted.RevokedAt != nil {
+		t.Fatalf("v2 mutex: demoted grant must keep revoked_at=NULL (paused != revoked), got %v", demoted.RevokedAt)
 	}
 }
 

@@ -405,8 +405,13 @@ func TestOBO_YUJ1738_B2_HappyPathStillWorks(t *testing.T) {
 	if a == nil || a.Active != 0 {
 		t.Fatalf("A must be demoted to active=0, got %+v", a)
 	}
-	if a.RevokedAt == nil {
-		t.Errorf("demoted sibling must carry revoked_at=now, got nil")
+	// YUJ-1744 / PR#131 R4 — siblings demoted by the activate path are
+	// PAUSED, not REVOKED. revoked_at must remain NULL so a later PUT
+	// {active:1} on this row can flip it back through oboUpdateGrant's
+	// RevokedAt-gate. (Pre-R4 this asserted RevokedAt != nil — that
+	// expectation encoded the very bug R4 fixes.)
+	if a.RevokedAt != nil {
+		t.Errorf("demoted sibling must keep revoked_at=NULL, got %v", a.RevokedAt)
 	}
 	// Quiet linter when no branch references time.
 	_ = time.Now

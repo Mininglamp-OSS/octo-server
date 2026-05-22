@@ -818,8 +818,18 @@ func (d *botAPIDB) updateGrant(id int64, mode string, globalEnabled *int, person
 //          resurrected even if step 2 misses (e.g. a future
 //          refactor moves the check).
 //       4. Demote every OTHER active row for the grantor to
-//          active=0 / global_enabled=0 / revoked_at=now (same shape
-//          as revokeGrant).
+//          active=0 / global_enabled=0. YUJ-1744 / PR#131 R4: the
+//          demote MUST NOT touch `revoked_at`. Siblings demoted by
+//          a persona switch are *paused*, not *revoked* — leaving
+//          `revoked_at=NULL` keeps them eligible for re-activation
+//          via a later PUT {active:1}, which is exactly the toggle
+//          contract this endpoint advertises. If we stamped
+//          `revoked_at=now` here, the next switch back would hit
+//          oboUpdateGrant's `RevokedAt != nil` gate and 404, turning
+//          the selector into a one-way trip. The demote WHERE is
+//          also scoped to `revoked_at IS NULL` so a row a concurrent
+//          DELETE has tombstoned (revoked_at != NULL, active still
+//          racing) keeps its audit-bearing timestamp intact.
 //     The entire sequence commits or rolls back together — no
 //     half-applied "target active but siblings still active" state.
 //
@@ -963,12 +973,19 @@ func (d *botAPIDB) setGrantActive(id int64, active int) error {
 	}
 
 	if len(demoted) > 0 {
+		// YUJ-1744 / PR#131 R4 — siblings are PAUSED, not REVOKED.
+		// Do NOT set revoked_at; that timestamp is reserved for the
+		// explicit DELETE /v1/obo/grants/:id path. Stamping it here
+		// would make the next persona switch back to this row 404
+		// via oboUpdateGrant's RevokedAt-gate, breaking the toggle
+		// contract. The `AND revoked_at IS NULL` predicate also
+		// shields any row a concurrent DELETE just tombstoned so
+		// its audit timestamp is preserved exactly.
 		if _, demErr := tx.Update("obo_grants").SetMap(map[string]interface{}{
 			"active":         0,
 			"global_enabled": 0,
-			"revoked_at":     now,
 			"updated_at":     now,
-		}).Where("grantor_uid=? AND active=1 AND id<>?", grant.GrantorUID, id).Exec(); demErr != nil {
+		}).Where("grantor_uid=? AND active=1 AND id<>? AND revoked_at IS NULL", grant.GrantorUID, id).Exec(); demErr != nil {
 			return demErr
 		}
 	}
@@ -1273,12 +1290,19 @@ func (d *botAPIDB) createOrReactivateGrantAtomic(grantorUID, granteeBotUID, mode
 	}
 
 	if len(demoted) > 0 {
+		// YUJ-1744 / PR#131 R4 — siblings demoted by a create / reactivate
+		// are PAUSED, not REVOKED. `revoked_at` is the audit timestamp
+		// owned exclusively by revokeGrant (DELETE /v1/obo/grants/:id);
+		// stamping it here would make the demoted row 404 on any future
+		// PUT {active:1} via oboUpdateGrant's RevokedAt-gate, turning
+		// the persona selector into a one-way trip. The `AND revoked_at
+		// IS NULL` predicate also shields rows a concurrent DELETE just
+		// tombstoned so the audit timestamp is preserved exactly.
 		if _, demErr := tx.Update("obo_grants").SetMap(map[string]interface{}{
 			"active":         0,
 			"global_enabled": 0,
-			"revoked_at":     now,
 			"updated_at":     now,
-		}).Where("grantor_uid=? AND active=1 AND id<>?", grantorUID, grantID).Exec(); demErr != nil {
+		}).Where("grantor_uid=? AND active=1 AND id<>? AND revoked_at IS NULL", grantorUID, grantID).Exec(); demErr != nil {
 			return nil, false, demErr
 		}
 	}

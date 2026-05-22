@@ -104,8 +104,12 @@ func TestOBO_UpdateGrant_Active_Activate_DemotesSiblings(t *testing.T) {
 	if cRow == nil || cRow.Active != 0 {
 		t.Fatalf("expected grant C demoted to active=0, got %+v", cRow)
 	}
-	if cRow.RevokedAt == nil {
-		t.Errorf("demoted grant C must carry revoked_at=now, got nil")
+	// YUJ-1744 / PR#131 R4 — demoted siblings must remain PAUSED
+	// (revoked_at=NULL) so a future PUT {active:1} on C still resolves
+	// through oboUpdateGrant. Pre-R4 the assertion here required
+	// `RevokedAt != nil`, which was the very breakage R4 fixes.
+	if cRow.RevokedAt != nil {
+		t.Errorf("demoted grant C must keep revoked_at=NULL, got %v", cRow.RevokedAt)
 	}
 }
 

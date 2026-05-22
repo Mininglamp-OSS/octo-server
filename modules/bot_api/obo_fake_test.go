@@ -555,7 +555,6 @@ func (f *fakeOBOStore) setGrantActive(id int64, active int) error {
 	}
 	g.Active = 1
 	g.RevokedAt = nil
-	now := time.Now()
 	for _, other := range f.grants {
 		if other == nil || other.ID == g.ID {
 			continue
@@ -566,10 +565,14 @@ func (f *fakeOBOStore) setGrantActive(id int64, active int) error {
 		if other.Active != 1 {
 			continue
 		}
+		// YUJ-1744 / PR#131 R4 — siblings are PAUSED, not REVOKED.
+		// Skip rows the DELETE path already tombstoned (defensive),
+		// and never stamp revoked_at on rows we demote here.
+		if other.RevokedAt != nil {
+			continue
+		}
 		other.Active = 0
 		other.GlobalEnabled = 0
-		revoked := now
-		other.RevokedAt = &revoked
 	}
 	return nil
 }
@@ -703,7 +706,6 @@ func (f *fakeOBOStore) createOrReactivateGrantAtomic(grantorUID, granteeBotUID, 
 	var (
 		target      *oboGrantModel
 		reactivated bool
-		now         = time.Now()
 	)
 
 	if existing == nil {
@@ -739,13 +741,18 @@ func (f *fakeOBOStore) createOrReactivateGrantAtomic(grantorUID, granteeBotUID, 
 	}
 
 	// Demote every other active grant under the same grantor.
+	// YUJ-1744 / PR#131 R4 — siblings demoted by create/reactivate are
+	// PAUSED, not REVOKED. Leave revoked_at untouched (and skip rows a
+	// prior DELETE already tombstoned, defensive).
 	for _, g := range f.grants {
 		if g.GrantorUID != grantorUID || g.ID == target.ID || g.Active != 1 {
 			continue
 		}
+		if g.RevokedAt != nil {
+			continue
+		}
 		g.Active = 0
 		g.GlobalEnabled = 0
-		g.RevokedAt = &now
 	}
 
 	cp := *target
