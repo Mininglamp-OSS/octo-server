@@ -134,7 +134,11 @@ paths:
         新建的子区由 fanout 在线补齐。超过 500 时按 created_at DESC 取最新，截断的是
         最旧的子区（产品上极有可能马上被归档）。
 
-        在同一事务内 +1 user_follow_version（即便物化 N 个子区也只 +1，因为是用户级单调序列）。
+        实现采用两阶段提交（关闭 enumerate 与 OnThreadCreated 之间的 race window），
+        bump user_follow_version 最多 +2（与子区数量无关；常数次数），客户端只需在
+        变化时拉一次 sidebar，多 +1 不影响正确性。
+
+        当 caller 不是该群成员（或群在请求 Space 不可见）时返回 403。
       operationId: "followChannel"
       consumes:
         - "application/json"
@@ -159,6 +163,10 @@ paths:
             $ref: "#/definitions/response"
         400:
           description: "参数错误或业务错误"
+          schema:
+            $ref: "#/definitions/response"
+        403:
+          description: "无权关注该群（非群成员或群在请求 Space 不可见）"
           schema:
             $ref: "#/definitions/response"
       security:

@@ -26,6 +26,14 @@ const threadSeparator = "____"
 // 调用方（HTTP handler）应将此错误翻译为 403。
 var ErrThreadForbidden = errors.New("thread follow forbidden: not a member of parent group or thread not visible")
 
+// ErrChannelForbidden 在 FollowChannel 鉴权失败时返回。
+// 调用方（HTTP handler）应将此错误翻译为 403。
+//
+// 引入背景（PR #123 round-1 review by Jerry-Xin / yujiawei）：FollowChannel
+// 不再只是 inert 的"清自己的黑名单"，而是会触发 thread ext fanout 订阅 +
+// 物化既有子区，因此必须在写前校验 caller 是该 group 的成员且该群在请求 Space 可见。
+var ErrChannelForbidden = errors.New("channel follow forbidden: not a member of the group or group not visible")
+
 // ErrDMCategoryForbidden 在 FollowDM 指定的 category 不属于当前 uid 或已删除时返回。
 // 调用方应将此错误翻译为 400 / 403（按业务约定）。
 // PR #21 Round-6 (Jerry-Xin)：DM category 必须由服务端校验归属，否则客户端可写入
@@ -44,6 +52,15 @@ var ErrDMCategoryForbidden = errors.New("dm category forbidden: not owned by uid
 // 校验通过返回 nil。基础设施错误（DB 错误等）以 wrap 后的形式向上透传。
 type ThreadAuthChecker interface {
 	AuthorizeThreadFollow(uid, spaceID, groupNo, shortID string) error
+}
+
+// ChannelAuthChecker 判定 FollowChannel 是否被授权。窄接口，与 ThreadAuthChecker
+// 同样采用依赖倒置（避免 conversation_ext 直接 import group），由 message/1module.go
+// 注入实现：调用 group.IService.ExistMember + group.DB 可见性逻辑。
+//
+// 鉴权失败返回 ErrChannelForbidden；基础设施错误以 wrap 后形式上传。
+type ChannelAuthChecker interface {
+	AuthorizeChannelFollow(uid, spaceID, groupNo string) error
 }
 
 // ThreadEnumerator 是 FollowChannel 级联物化子区时使用的窄接口。
@@ -93,6 +110,10 @@ type Service struct {
 	// 由 message/1module.go 启动时注入；nil 时跳过物化。
 	threadEnum  ThreadEnumerator
 	threadEnumM sync.RWMutex
+	// channelAuth 是 FollowChannel 的群成员/可见性鉴权钩子。
+	// 由 message/1module.go 启动时注入；nil 时跳过鉴权（仅供单测 / 迁移期使用）。
+	channelAuth  ChannelAuthChecker
+	channelAuthM sync.RWMutex
 	log.Log
 }
 
@@ -137,6 +158,22 @@ func (s *Service) getThreadEnumerator() ThreadEnumerator {
 	e := s.threadEnum
 	s.threadEnumM.RUnlock()
 	return e
+}
+
+// SetChannelAuthChecker injects the authorizer used by FollowChannel.
+// Safe for concurrent use; intended to be called once at startup from
+// message/1module.go after the group module has initialised.
+func (s *Service) SetChannelAuthChecker(c ChannelAuthChecker) {
+	s.channelAuthM.Lock()
+	s.channelAuth = c
+	s.channelAuthM.Unlock()
+}
+
+func (s *Service) getChannelAuthChecker() ChannelAuthChecker {
+	s.channelAuthM.RLock()
+	c := s.channelAuth
+	s.channelAuthM.RUnlock()
+	return c
 }
 
 // ---------------------------------------------------------------------------
@@ -210,8 +247,9 @@ func escapeLike(s string) string {
 // commit 之间创建的子区会被永久遗漏 —— OnThreadCreated 看不到 auto_follow=1，
 // enumerate 的快照也没拿到该子区。
 //
-// follow_version 在两个 tx 各 +1（合计 +2 在无并发场景下）：单调递增即可，
-// 客户端只需在变化时拉一次 sidebar，多 +1 不影响正确性。
+// follow_version 在 Phase 1 与 Phase 3 各 +1 —— 总次数随路径而定：未注入
+// enumerator / 群下无 active 子区 / Phase 3 re-check 跳过 都让 bump 停在 +1。
+// 关键不变量是 bump 次数与子区数量 N 无关（不会随 N 线性增长），保持小常数。
 //
 // 当未注入 ThreadEnumerator 时（单测 / 迁移期）跳过 Phase 2/3，仅写群行。
 func (s *Service) FollowChannel(uid, spaceID, groupNo string) error {
@@ -220,6 +258,17 @@ func (s *Service) FollowChannel(uid, spaceID, groupNo string) error {
 	}
 	if groupNo == "" {
 		return errors.New("group_no must not be empty")
+	}
+
+	// PR #123 round-1 review (Jerry-Xin / yujiawei P1)：FollowChannel 已不再是
+	// inert 的"清自己黑名单"，会写 auto_follow_threads=1 + 物化既有子区 +
+	// 挂 OnThreadCreated 订阅。必须在任何 DB 写入之前校验 caller 是该 group
+	// 的成员、且该群在请求 Space 可见，否则会泄露同 Space 内私有群的子区元数据。
+	// nil checker 仅用于单测 / 迁移期。
+	if checker := s.getChannelAuthChecker(); checker != nil {
+		if err := checker.AuthorizeChannelFollow(uid, spaceID, groupNo); err != nil {
+			return err
+		}
 	}
 
 	zero := int8(0)
@@ -262,7 +311,20 @@ func (s *Service) FollowChannel(uid, spaceID, groupNo string) error {
 	// Phase 3：bulk INSERT IGNORE thread ext + bump version。INSERT IGNORE 让
 	// 与并发 OnThreadCreated 的重叠安全（同 (uid, target_type=5, target_id)
 	// 由 UK 守护，重复写不会产生第二行）。
+	//
+	// Bug fix B2 (yujiawei P2 / lml2468 round-2 #2)：在 Phase 1 commit 与 Phase 3
+	// 之间用户可能调用 UnfollowChannel，那一刻群行变成 auto_follow=0 + group_unfollowed=1。
+	// Phase 3 必须在同一 tx 内 SELECT ... FOR UPDATE 该群行重新确认状态，发现不再
+	// 资格则跳过整批写入（含 bump），避免重建已被 UnfollowChannel 清掉的孤立 thread 行。
 	return s.withTx("FollowChannel-phase3", func(tx *dbr.Tx) error {
+		eligible, err := isChannelStillAutoFollowedTx(tx, uid, spaceID, groupNo)
+		if err != nil {
+			return fmt.Errorf("FollowChannel phase3 recheck: %w", err)
+		}
+		if !eligible {
+			// 用户已在 Phase 1 与 Phase 3 之间取关；丢弃旧 enumerate 快照，不写任何东西。
+			return nil
+		}
 		if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
 			return fmt.Errorf("FollowChannel phase3 bump version: %w", err)
 		}
@@ -271,6 +333,33 @@ func (s *Service) FollowChannel(uid, spaceID, groupNo string) error {
 		}
 		return nil
 	})
+}
+
+// isChannelStillAutoFollowedTx 在 tx 内对 (uid, spaceID, target_type=2, groupNo)
+// 取 SELECT ... FOR UPDATE，判断当前是否仍处于"已关注 + 自动跟随子区"状态。
+// 行不存在或两标志中任一不满足都返回 false，让 FollowChannel Phase 3 跳过写入。
+// 锁顺序：本函数应当在 BumpFollowVersionTx 之后调用 —— 群 ext 行的 SELECT
+// FOR UPDATE 不能先于 user_follow_version 的 X 锁，否则与 UpdateSort 反向死锁。
+// 但 Phase 3 实际是先 SELECT 再 bump（bump 只在 eligible 时发生），
+// 这是个例外：Phase 1 已经先锁过 user_follow_version 并 commit，本 tx 重新进入
+// 时 follow_version 行尚未在本 tx 中被锁，并不存在与 UpdateSort 反向交叉的窗口。
+func isChannelStillAutoFollowedTx(tx *dbr.Tx, uid, spaceID, groupNo string) (bool, error) {
+	var row struct {
+		AutoFollow int8 `db:"auto_follow_threads"`
+		Unfollowed int8 `db:"group_unfollowed"`
+	}
+	err := tx.SelectBySql(
+		"SELECT auto_follow_threads, group_unfollowed FROM "+table+
+			" WHERE uid=? AND space_id=? AND target_type=? AND target_id=? FOR UPDATE",
+		uid, spaceID, targetTypeGroup, groupNo,
+	).LoadOne(&row)
+	if err == dbr.ErrNotFound {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return row.AutoFollow == 1 && row.Unfollowed == 0, nil
 }
 
 // bulkInsertIgnoreThreadExtTx 给 (uid, spaceID) 在 user_conversation_ext 表中
@@ -419,10 +508,10 @@ func (s *Service) OnThreadCreated(groupNo, shortID string) error {
 		}
 		batch := targets[start:end]
 		if err := s.withTx("OnThreadCreated", func(tx *dbr.Tx) error {
-			if err := bulkBumpFollowVersionTx(tx, batch); err != nil {
+			if err := bulkBumpFollowVersionTx(tx, batch, groupNo); err != nil {
 				return fmt.Errorf("OnThreadCreated bulk bump version: %w", err)
 			}
-			if err := bulkInsertIgnoreThreadExtForUsersTx(tx, batch, threadChannelID); err != nil {
+			if err := bulkInsertIgnoreThreadExtForUsersTx(tx, batch, groupNo, threadChannelID); err != nil {
 				return fmt.Errorf("OnThreadCreated bulk insert thread ext: %w", err)
 			}
 			return nil
@@ -433,49 +522,66 @@ func (s *Service) OnThreadCreated(groupNo, shortID string) error {
 	return nil
 }
 
-// bulkBumpFollowVersionTx 一次性给一批 (uid, space_id) bump version +1。
-// 行不存在时初始化为 1（与 BumpFollowVersionTx 单行版语义一致）。
-//
-// SQL 用 INSERT ... ON DUPLICATE KEY UPDATE 批量插入若干 (uid, space_id, version=1)
-// 元组：已有行触发 ODKU 把 version 自增；不存在的行新建为 1。
+// onThreadCreatedTarget 是 OnThreadCreated 初始 SELECT 出来的目标 (uid, space_id)。
 type onThreadCreatedTarget = struct {
 	UID     string `db:"uid"`
 	SpaceID string `db:"space_id"`
 }
 
-func bulkBumpFollowVersionTx(tx *dbr.Tx, targets []onThreadCreatedTarget) error {
+// bulkBumpFollowVersionTx 批量给当前仍处于"auto_follow=1 + group_unfollowed=0"
+// 状态的 (uid, space_id) +1 follow_version；不在该状态的目标跳过。
+//
+// Bug fix B2：用 INSERT ... SELECT 内嵌 WHERE 让 re-check 与 write 落在同一条
+// SQL，关闭"初始 SELECT 后用户取关"的 race。SELECT 源是 user_conversation_ext
+// 的群行（target_type=2），这里 ORDER BY (uid, space_id) 让并发 fanout 的行锁
+// 顺序一致（W2，lml2468 round-1）—— 避免两条 OnThreadCreated 不同顺序枚举时
+// 触发 InnoDB 死锁检测器回滚。
+//
+// IN tuple 列表把行集限定在本 batch 内，让单条 SQL 的占位符数受 batchSize 约束。
+func bulkBumpFollowVersionTx(tx *dbr.Tx, targets []onThreadCreatedTarget, groupNo string) error {
 	if len(targets) == 0 {
 		return nil
 	}
-	placeholders := make([]string, len(targets))
-	args := make([]interface{}, 0, len(targets)*3)
+	tupleHolders := make([]string, len(targets))
+	args := []interface{}{targetTypeGroup, groupNo}
 	for i, t := range targets {
-		placeholders[i] = "(?, ?, 1)"
+		tupleHolders[i] = "(?, ?)"
 		args = append(args, t.UID, t.SpaceID)
 	}
 	_, err := tx.InsertBySql(
-		"INSERT INTO "+followVersionTable+" (uid, space_id, version) VALUES "+
-			strings.Join(placeholders, ", ")+
+		"INSERT INTO "+followVersionTable+" (uid, space_id, version)"+
+			" SELECT uid, space_id, 1 FROM "+table+
+			" WHERE target_type=? AND target_id=?"+
+			" AND auto_follow_threads=1 AND group_unfollowed=0"+
+			" AND (uid, space_id) IN ("+strings.Join(tupleHolders, ", ")+")"+
+			" ORDER BY uid, space_id"+
 			" ON DUPLICATE KEY UPDATE version = version + 1",
 		args...,
 	).Exec()
 	return err
 }
 
-func bulkInsertIgnoreThreadExtForUsersTx(tx *dbr.Tx, targets []onThreadCreatedTarget, threadChannelID string) error {
+// bulkInsertIgnoreThreadExtForUsersTx 给本 batch 内当前仍 auto_follow=1 +
+// group_unfollowed=0 的 (uid, space_id) 写入 target_type=5 的 thread ext 行。
+// Re-check 内嵌在 SELECT WHERE 里 —— 同 bulkBumpFollowVersionTx 关闭 B2 race。
+func bulkInsertIgnoreThreadExtForUsersTx(tx *dbr.Tx, targets []onThreadCreatedTarget, groupNo, threadChannelID string) error {
 	if len(targets) == 0 {
 		return nil
 	}
-	placeholders := make([]string, len(targets))
-	args := make([]interface{}, 0, len(targets)*4)
+	tupleHolders := make([]string, len(targets))
+	args := []interface{}{targetTypeThread, threadChannelID, targetTypeGroup, groupNo}
 	for i, t := range targets {
-		placeholders[i] = "(?, ?, ?, ?)"
-		args = append(args, t.UID, t.SpaceID, targetTypeThread, threadChannelID)
+		tupleHolders[i] = "(?, ?)"
+		args = append(args, t.UID, t.SpaceID)
 	}
 	_, err := tx.InsertBySql(
 		"INSERT IGNORE INTO "+table+
-			" (uid, space_id, target_type, target_id) VALUES "+
-			strings.Join(placeholders, ", "),
+			" (uid, space_id, target_type, target_id)"+
+			" SELECT uid, space_id, ?, ? FROM "+table+
+			" WHERE target_type=? AND target_id=?"+
+			" AND auto_follow_threads=1 AND group_unfollowed=0"+
+			" AND (uid, space_id) IN ("+strings.Join(tupleHolders, ", ")+")"+
+			" ORDER BY uid, space_id",
 		args...,
 	).Exec()
 	return err

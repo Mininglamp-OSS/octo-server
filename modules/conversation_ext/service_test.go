@@ -347,6 +347,60 @@ func (o *observingEnumerator) EnumerateActiveShortIDs(groupNo string, limit int)
 	return ids, nil
 }
 
+// stubChannelAuthChecker 是 service_test 用的 ChannelAuthChecker 桩：
+//   - 当 (uid, spaceID, groupNo) 在 denied map 中时返回 ErrChannelForbidden；
+//   - 否则返回 nil。
+type stubChannelAuthChecker struct {
+	denied map[string]bool
+}
+
+func (s *stubChannelAuthChecker) AuthorizeChannelFollow(uid, spaceID, groupNo string) error {
+	if s.denied[uid+"|"+spaceID+"|"+groupNo] {
+		return ErrChannelForbidden
+	}
+	return nil
+}
+
+func TestService_FollowChannel_RejectsUnauthorized(t *testing.T) {
+	// Bug fix B1: FollowChannel 现在会写 auto_follow_threads=1 + 物化最多 500 个 thread 行，
+	// 并把该用户挂上 OnThreadCreated fanout 订阅。必须在写之前过 ChannelAuthChecker，
+	// 否则同 Space 内非该群成员可以抓取私有群子区元数据。
+	svc := newServiceForTest(t)
+	const uid, space, grp = "u-not-member", "s1", "grp-private"
+
+	checker := &stubChannelAuthChecker{denied: map[string]bool{
+		uid + "|" + space + "|" + grp: true,
+	}}
+	svc.SetChannelAuthChecker(checker)
+
+	err := svc.FollowChannel(uid, space, grp)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrChannelForbidden, "非成员调用应返回 ErrChannelForbidden")
+
+	// 关键：必须没有任何写入发生（auto_follow=1 + thread 行都不能落库）。
+	row, err := svc.db.Get(uid, space, targetTypeGroup, grp)
+	require.NoError(t, err)
+	assert.Nil(t, row, "鉴权失败时不应写群行")
+
+	v := readFollowVersion(t, svc, uid, space)
+	assert.Equal(t, int64(0), v, "鉴权失败时不应 bump follow_version")
+}
+
+func TestService_FollowChannel_AllowsAuthorized(t *testing.T) {
+	svc := newServiceForTest(t)
+	const uid, space, grp = "u-member", "s1", "grp-ok"
+
+	checker := &stubChannelAuthChecker{denied: nil}
+	svc.SetChannelAuthChecker(checker)
+
+	require.NoError(t, svc.FollowChannel(uid, space, grp))
+
+	row, err := svc.db.Get(uid, space, targetTypeGroup, grp)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, int8(1), row.AutoFollowThreads)
+}
+
 func TestService_FollowChannel_AutoFollowCommittedBeforeEnumeration(t *testing.T) {
 	// Bug fix #2: 在 FollowChannel enumerate active 子区之前，
 	// auto_follow_threads=1 必须已经提交可见。否则在 enumerate 与 FollowChannel 提交
@@ -380,6 +434,91 @@ func TestService_FollowChannel_AutoFollowCommittedBeforeEnumeration(t *testing.T
 		require.NoError(t, err)
 		assert.NotNil(t, row)
 	}
+}
+
+func TestService_FollowChannel_Phase3RechecksEligibility(t *testing.T) {
+	// Bug fix B2 (yujiawei P2 / lml2468 round-2 #2): FollowChannel Phase 1 commit 后，
+	// 若用户在 Phase 2 enumerate 期间或之间调用 UnfollowChannel，Phase 3 不能再把
+	// thread 行 INSERT IGNORE 回来 —— 否则会出现"group_unfollowed=1 + auto_follow=0
+	// 但残留 thread ext 行"的孤立状态。
+	//
+	// 复现路径：使用 observingEnumerator 在 enumerate 中同步调用 UnfollowChannel
+	// 来等价模拟 Phase 1 commit 之后、Phase 3 写入之前的并发取关。
+	svc := newServiceForTest(t)
+	const uid, space, grp = "u-race-phase3", "s-race", "grp-race-phase3"
+
+	enum := &observingEnumerator{
+		groups: map[string][]string{grp: {"t1", "t2", "t3"}},
+		observe: func(g string) {
+			// 在 Phase 1 commit 之后、Phase 3 写入之前，同步取关该 channel。
+			require.NoError(t, svc.UnfollowChannel(uid, space, g))
+		},
+	}
+	svc.SetThreadEnumerator(enum)
+
+	require.NoError(t, svc.FollowChannel(uid, space, grp))
+
+	// 最终状态应是"已取关 channel" —— group_unfollowed=1, auto_follow_threads=0。
+	row, err := svc.db.Get(uid, space, targetTypeGroup, grp)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, int8(1), row.GroupUnfollowed)
+	assert.Equal(t, int8(0), row.AutoFollowThreads)
+
+	// 不允许任何 thread ext 行残留（违反"取消关注 = 不再有 thread 行"语义）。
+	for _, sid := range []string{"t1", "t2", "t3"} {
+		threadRow, err := svc.db.Get(uid, space, targetTypeThread, grp+threadSeparator+sid)
+		require.NoError(t, err)
+		assert.Nil(t, threadRow,
+			"Phase 3 应在 tx 内 re-check auto_follow=1 + group_unfollowed=0；"+
+				"用户在 Phase 1 commit 后已取关，thread %s 不应被 Phase 3 重建", sid)
+	}
+}
+
+func TestService_OnThreadCreated_SkipsConcurrentlyUnfollowedUsers(t *testing.T) {
+	// Bug fix B2: bulk INSERT 必须在写入瞬间 re-check 每个目标用户当前的
+	// auto_follow_threads / group_unfollowed 状态，过滤掉在初始 SELECT 之后取关
+	// 的用户。否则会给已取关用户重建 thread 行。
+	//
+	// 直接测试方式：构造 DB 状态使 targets 列表既包含 eligible 也包含 ineligible
+	// 用户，并校验 INSERT 只对 eligible 行落库（同 SQL re-check 才能做到）。
+	svc := newServiceForTest(t)
+	const space, grp, shortID = "s-recheck", "grp-recheck", "thr-recheck"
+	channelID := grp + threadSeparator + shortID
+
+	one := int8(1)
+	zero := int8(0)
+
+	// uEligible: auto_follow=1, group_unfollowed=0 —— OnThreadCreated 应给他写。
+	require.NoError(t, svc.db.Upsert("uEligible", space, targetTypeGroup, grp, ConvExtFields{
+		AutoFollowThreads: &one,
+		GroupUnfollowed:   &zero,
+	}))
+	// uUnfollowed: auto_follow=0, group_unfollowed=1 —— 不能给他写。
+	require.NoError(t, svc.db.Upsert("uUnfollowed", space, targetTypeGroup, grp, ConvExtFields{
+		AutoFollowThreads: &zero,
+		GroupUnfollowed:   &one,
+	}))
+	// uPartial: auto_follow=1 但 group_unfollowed=1 —— 状态不一致（理论上不该出现，
+	// 防御性测试），按"取消关注"语义不应被 fanout。
+	require.NoError(t, svc.db.Upsert("uPartial", space, targetTypeGroup, grp, ConvExtFields{
+		AutoFollowThreads: &one,
+		GroupUnfollowed:   &one,
+	}))
+
+	require.NoError(t, svc.OnThreadCreated(grp, shortID))
+
+	eligibleRow, err := svc.db.Get("uEligible", space, targetTypeThread, channelID)
+	require.NoError(t, err)
+	assert.NotNil(t, eligibleRow, "uEligible 应被 fanout")
+
+	unfollowedRow, err := svc.db.Get("uUnfollowed", space, targetTypeThread, channelID)
+	require.NoError(t, err)
+	assert.Nil(t, unfollowedRow, "uUnfollowed 不应被 fanout（auto_follow=0）")
+
+	partialRow, err := svc.db.Get("uPartial", space, targetTypeThread, channelID)
+	require.NoError(t, err)
+	assert.Nil(t, partialRow, "uPartial 不应被 fanout（group_unfollowed=1 即便 auto_follow=1）")
 }
 
 func TestService_FollowChannel_PreservesExistingThreadSort(t *testing.T) {

@@ -631,10 +631,24 @@ func TestIntegration_ChannelCascade_FollowVersionBumpedOnce(t *testing.T) {
 // 仅记录耗时供性能基线参考，不做断言（数值因机器而异）。
 // ---------------------------------------------------------------------------
 
+// newBenchService 是 benchmark 专用的 Service 工厂，避免在 *testing.B 里塞一个
+// 假的 *testing.T{}（Jerry-Xin review）。直接接 testing.TB —— newCtxForTest 已经
+// 用 testing.TB-兼容的方法（仅 Helper() + Fatalf via require）；require 系列也支持
+// testing.TB。
+func newBenchService(b *testing.B) (*DB, *Service) {
+	b.Helper()
+	ctx := newCtxForTestTB(b)
+	db := initGlobalConvExtDBForTestTB(b, ctx)
+	_, err := ctx.DB().DeleteFrom(table).Exec()
+	require.NoError(b, err, "clean table before bench")
+	_, err = ctx.DB().DeleteFrom(followVersionTable).Exec()
+	require.NoError(b, err, "clean follow_version before bench")
+	return db, NewService(ctx)
+}
+
 func benchmarkOnThreadCreatedFanout(b *testing.B, numUsers int) {
 	b.Helper()
-	t := &testing.T{}
-	_, svc := newIntegrationDB(t)
+	_, svc := newBenchService(b)
 	const space, grp = "bench-sp", "bench-grp-fanout"
 
 	// 预先：numUsers 个用户全部 auto_follow_threads=1。
@@ -664,8 +678,7 @@ func BenchmarkOnThreadCreated_N1000(b *testing.B)  { benchmarkOnThreadCreatedFan
 func BenchmarkOnThreadCreated_N10000(b *testing.B) { benchmarkOnThreadCreatedFanout(b, 10000) }
 
 func BenchmarkFollowChannel_Materialize500(b *testing.B) {
-	t := &testing.T{}
-	_, svc := newIntegrationDB(t)
+	_, svc := newBenchService(b)
 
 	ids := make([]string, 500)
 	for i := range ids {

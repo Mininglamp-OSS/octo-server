@@ -26,6 +26,13 @@ func resetGlobalConvExtServiceOnce(_ *testing.T) {
 // already exist (created by the CI test-setup or by the sql/ migration file).
 func newCtxForTest(t *testing.T) *config.Context {
 	t.Helper()
+	return newCtxForTestTB(t)
+}
+
+// newCtxForTestTB 是 newCtxForTest 的 testing.TB 版本，供 benchmark 使用，
+// 避免在 *testing.B 里塞 *testing.T{}。Jerry-Xin review (round-1) 指出的反模式。
+func newCtxForTestTB(tb testing.TB) *config.Context {
+	tb.Helper()
 	addr := os.Getenv("CONV_EXT_TEST_MYSQL_ADDR")
 	if addr == "" {
 		addr = "root:demo@tcp(127.0.0.1)/conv_ext_test?charset=utf8mb4&parseTime=true"

@@ -2,6 +2,7 @@ package message
 
 import (
 	"embed"
+	"errors"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/register"
@@ -69,11 +70,16 @@ func init() {
 		convext.InitGlobalConvExtService(appCtx)
 		svc := convext.GetGlobalConvExtService()
 		if svc != nil {
-			svc.SetThreadAuthChecker(newThreadAuthChecker(appCtx))
+			checker := newThreadAuthChecker(appCtx)
+			svc.SetThreadAuthChecker(checker)
 			// 注入 ThreadEnumerator：FollowChannel 物化既有子区时通过它枚举
 			// active 子区的 shortID。同样落在 message 模块以避开 conversation_ext
 			// 直接 import modules/thread 的循环依赖（见 ThreadAuthChecker 同款逻辑）。
 			svc.SetThreadEnumerator(newThreadEnumerator(appCtx))
+			// 注入 ChannelAuthChecker：FollowChannel 写 auto_follow=1 + 物化既有
+			// 子区前必须校验 caller 是群成员 + 群在 Space 可见。复用同一个 struct
+			// 实现，共享 checkChannelAccess 逻辑。
+			svc.SetChannelAuthChecker(checker)
 		}
 		return register.Module{Name: "conversation_ext_thread_auth"}
 	})
@@ -126,13 +132,14 @@ func (c *threadAuthChecker) AuthorizeThreadFollow(uid, spaceID, groupNo, shortID
 	if spaceID == "" {
 		return convext.ErrThreadForbidden
 	}
-	// 1. Membership check: must be a member of the parent group.
-	isMember, err := c.groupSvc.ExistMember(groupNo, uid)
-	if err != nil {
+	// 1. Channel-level checks (membership + Space visibility) — shared with FollowChannel.
+	if err := c.checkChannelAccess(uid, spaceID, groupNo); err != nil {
+		// 已是 ErrChannelForbidden 时，对 thread API 仍翻译为 ErrThreadForbidden，
+		// 让 handler 走原有 403 路径，客户端无需感知两套 sentinel。
+		if errors.Is(err, convext.ErrChannelForbidden) {
+			return convext.ErrThreadForbidden
+		}
 		return err
-	}
-	if !isMember {
-		return convext.ErrThreadForbidden
 	}
 	// 2. Thread existence + status + group consistency in one query.
 	threadMap, err := c.threadDB.QueryActiveByGroupShortIDs([]thread.ShortRef{
@@ -146,18 +153,51 @@ func (c *threadAuthChecker) AuthorizeThreadFollow(uid, spaceID, groupNo, shortID
 		// Either thread does not exist, status==deleted, or group_no mismatch.
 		return convext.ErrThreadForbidden
 	}
-	// 3. Parent-group must be visible in the requested Space.
+	return nil
+}
+
+// AuthorizeChannelFollow implements convext.ChannelAuthChecker.
+//
+// 与 AuthorizeThreadFollow 共享 channel-level access check（成员资格 + Space 可见性）,
+// 仅省略掉 thread-existence 这一步 —— FollowChannel 写群级 ext 行，与具体子区无关。
+//
+// 引入背景（PR #123 round-1 by Jerry-Xin / yujiawei P1）：FollowChannel 现在会
+// 物化 thread ext + 挂 OnThreadCreated fanout 订阅，必须先校验 caller 能"看到"
+// 这个群，否则同 Space 内私有群的子区元数据会泄露。
+func (c *threadAuthChecker) AuthorizeChannelFollow(uid, spaceID, groupNo string) error {
+	return c.checkChannelAccess(uid, spaceID, groupNo)
+}
+
+// checkChannelAccess 复用 FollowThread 既有逻辑的群级访问校验：
+//  1. spaceID 非空
+//  2. caller 是 group 成员
+//  3. group 在请求 Space 可见（内部群 same-space / 外部群 sourceSpaceID-match / 旧群 wildcard）
+//
+// 鉴权失败返回 convext.ErrChannelForbidden；基础设施错误 wrap 后上传。
+func (c *threadAuthChecker) checkChannelAccess(uid, spaceID, groupNo string) error {
+	if spaceID == "" {
+		return convext.ErrChannelForbidden
+	}
+	// 1. Membership check.
+	isMember, err := c.groupSvc.ExistMember(groupNo, uid)
+	if err != nil {
+		return err
+	}
+	if !isMember {
+		return convext.ErrChannelForbidden
+	}
+	// 2. Space visibility.
 	groups, err := c.groupSvc.GetGroups([]string{groupNo})
 	if err != nil {
 		return err
 	}
 	if len(groups) == 0 {
-		// Group disbanded between membership-check and now; safe to reject.
-		return convext.ErrThreadForbidden
+		// Group disbanded between membership-check and now; reject.
+		return convext.ErrChannelForbidden
 	}
 	parentSpaceID := groups[0].SpaceID
 	if parentSpaceID == "" {
-		// Legacy group without space_id is visible everywhere; allow.
+		// Legacy group without space_id is visible everywhere.
 		return nil
 	}
 	if parentSpaceID == spaceID {
@@ -173,7 +213,7 @@ func (c *threadAuthChecker) AuthorizeThreadFollow(uid, spaceID, groupNo, shortID
 			return nil
 		}
 	}
-	return convext.ErrThreadForbidden
+	return convext.ErrChannelForbidden
 }
 
 // threadEnumerator implements convext.ThreadEnumerator for production wiring.

@@ -214,6 +214,13 @@ func (f *Follow) FollowChannel(c *wkhttp.Context) {
 	}
 
 	if err := f.svc.FollowChannel(loginUID, spaceID, req.GroupNo); err != nil {
+		// PR #123 round-1 review (Jerry-Xin / yujiawei P1)：鉴权失败返回 403，
+		// 不向客户端泄露内部细节（仅写日志）。与 FollowThread 同样处理 ErrThreadForbidden。
+		if errors.Is(err, ErrChannelForbidden) {
+			f.Warn("关注群鉴权失败", zap.Error(err))
+			c.ResponseErrorWithStatus(pkgerrors.New("无权关注该群"), http.StatusForbidden)
+			return
+		}
 		f.Error("重新关注群失败", zap.Error(err))
 		c.ResponseError(pkgerrors.New("重新关注群失败"))
 		return

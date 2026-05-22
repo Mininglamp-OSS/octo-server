@@ -20,10 +20,17 @@ import (
 // that touches globalConvExtDB to keep tests hermetic.
 func initGlobalConvExtDBForTest(t *testing.T, ctx *config.Context) *DB {
 	t.Helper()
+	return initGlobalConvExtDBForTestTB(t, ctx)
+}
+
+// initGlobalConvExtDBForTestTB is the testing.TB-accepting variant used by
+// benchmarks (Jerry-Xin review round-1) — same body, no &testing.T{} reach.
+func initGlobalConvExtDBForTestTB(tb testing.TB, ctx *config.Context) *DB {
+	tb.Helper()
 	globalConvExtDBOnce = sync.Once{}
 	globalConvExtDB = nil
 	InitGlobalConvExtDB(ctx)
-	require.NotNil(t, globalConvExtDB, "globalConvExtDB must be non-nil after Init")
+	require.NotNil(tb, globalConvExtDB, "globalConvExtDB must be non-nil after Init")
 	return globalConvExtDB
 }
 
