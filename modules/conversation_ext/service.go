@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
+	"github.com/go-sql-driver/mysql"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -248,8 +250,13 @@ func escapeLike(s string) string {
 // commit 之间创建的子区会被永久遗漏 —— OnThreadCreated 看不到 auto_follow=1，
 // enumerate 的快照也没拿到该子区。
 //
-// follow_version 在 Phase 1 与 Phase 3 各 +1 —— 总次数随路径而定：未注入
-// enumerator / 群下无 active 子区 / Phase 3 re-check 跳过 都让 bump 停在 +1。
+// follow_version bump 次数随路径而定（lml2468 round-3 nit 后精确化）：
+//   - 鉴权失败 (ErrChannelForbidden)：0 次（直接返回，无 tx）
+//   - 未注入 ThreadEnumerator / 群下无 active 子区：1 次（仅 Phase 1）
+//   - 正常路径（含 Phase 3 re-check 跳过）：2 次 —— Phase 3 锁序修复
+//     (Jerry-Xin / yujiawei round-2 P1) 后 bump 先于 ext 行 SELECT FOR UPDATE，
+//     所以即便 re-check 判定 ineligible 仍会 +1（无害，客户端多刷一次 sidebar）。
+//
 // 关键不变量是 bump 次数与子区数量 N 无关（不会随 N 线性增长），保持小常数。
 //
 // 当未注入 ThreadEnumerator 时（单测 / 迁移期）跳过 Phase 2/3，仅写群行。
@@ -481,10 +488,13 @@ func (s *Service) OnThreadCreated(groupNo, shortID string) error {
 	}
 
 	// 1. 在 tx 外把目标 (uid, space_id) 列表读出 —— 跨 N 用户的 SELECT 不参与 tx 锁。
+	//    ORDER BY uid, space_id 让本 batch 内（以及并发 fanout 之间）按统一顺序
+	//    取行锁，减少死锁概率；真正死锁兜底走下面的 withDeadlockRetry。
 	var targets []onThreadCreatedTarget
 	_, err := s.session.SelectBySql(
 		"SELECT uid, space_id FROM "+table+
-			" WHERE target_type=? AND target_id=? AND auto_follow_threads=1",
+			" WHERE target_type=? AND target_id=? AND auto_follow_threads=1"+
+			" ORDER BY uid, space_id",
 		targetTypeGroup, groupNo,
 	).Load(&targets)
 	if err != nil {
@@ -497,15 +507,24 @@ func (s *Service) OnThreadCreated(groupNo, shortID string) error {
 	threadChannelID := groupNo + threadSeparator + shortID
 
 	// 2. 按 batch 切分，每 batch 一个 tx：
-	//    - 单 tx 内仍批量化两条 SQL（bulk bump version + bulk INSERT IGNORE），
-	//      避免 per-user round-trip 的 O(N) 延迟。
+	//    - 单 tx 内三步（按全包统一的 version → ext 锁序）：
+	//        a) bulkBumpFollowVersionTx —— INSERT VALUES on user_follow_version，
+	//           只锁 version 行；
+	//        b) selectEligibleForFanoutTx —— SELECT ... FOR UPDATE on ext 群行，
+	//           过滤出仍处于 auto_follow=1 AND group_unfollowed=0 的子集；
+	//        c) bulkInsertIgnoreThreadExtForUsersTx —— INSERT VALUES on ext 子区行，
+	//           只锁新写入的 ext 行。
+	//    - 关键修正（Jerry-Xin round-3 P1）：上一版用 INSERT ... SELECT FROM ext
+	//      在 REPEATABLE READ 下会先对 ext 加 S-lock 再写 version，反序锁可与
+	//      UnfollowChannel 形成死锁循环导致整批 fanout 回滚。改用 VALUES 写 + 单独
+	//      FOR UPDATE re-check 让真正的锁序与文档一致。
 	//    - batch 之间换 tx 防止两件事：
 	//      (a) 单 tx 持锁窗口随 N 线性增长拖慢其它 follow 操作；
 	//      (b) bug fix #3 —— 单 SQL 占位符数超过 MySQL 65,535 上限。
-	//    - INSERT IGNORE + version 单调递增 让"前一 batch 已 commit、后一 batch
-	//      失败"的 partial-success 状态可恢复：下次 FollowChannel / 新建子区
-	//      fanout 会把缺失的用户补齐。
-	//    锁顺序仍是 follow_version 先于 ext —— 与 FollowChannel / UpdateSort 一致。
+	//    - withDeadlockRetry 对 InnoDB 错误码 1213 做有界重试，保证 fanout 自愈，
+	//      不再依赖用户重新 refollow（yujiawei round-2 P2 建议）。
+	//    - INSERT IGNORE + version 单调递增让 partial-success 状态可恢复：下次
+	//      FollowChannel / 新子区 fanout 会把缺失的用户补齐。
 	batchSize := onThreadCreatedBatchSize
 	if batchSize <= 0 {
 		batchSize = 1000
@@ -516,19 +535,66 @@ func (s *Service) OnThreadCreated(groupNo, shortID string) error {
 			end = len(targets)
 		}
 		batch := targets[start:end]
-		if err := s.withTx("OnThreadCreated", func(tx *dbr.Tx) error {
-			if err := bulkBumpFollowVersionTx(tx, batch, groupNo); err != nil {
-				return fmt.Errorf("OnThreadCreated bulk bump version: %w", err)
-			}
-			if err := bulkInsertIgnoreThreadExtForUsersTx(tx, batch, groupNo, threadChannelID); err != nil {
-				return fmt.Errorf("OnThreadCreated bulk insert thread ext: %w", err)
-			}
-			return nil
+		if err := withDeadlockRetry(func() error {
+			return s.withTx("OnThreadCreated", func(tx *dbr.Tx) error {
+				if err := bulkBumpFollowVersionTx(tx, batch); err != nil {
+					return fmt.Errorf("OnThreadCreated bulk bump version: %w", err)
+				}
+				eligible, err := selectEligibleForFanoutTx(tx, batch, groupNo)
+				if err != nil {
+					return fmt.Errorf("OnThreadCreated eligible select: %w", err)
+				}
+				if err := bulkInsertIgnoreThreadExtForUsersTx(tx, eligible, threadChannelID); err != nil {
+					return fmt.Errorf("OnThreadCreated bulk insert thread ext: %w", err)
+				}
+				return nil
+			})
 		}); err != nil {
 			return fmt.Errorf("OnThreadCreated batch [%d,%d): %w", start, end, err)
 		}
 	}
 	return nil
+}
+
+// withDeadlockRetry 对 fn 做有界重试，专门捕获 MySQL InnoDB 死锁（错误码 1213）
+// 与锁等待超时（错误码 1205）。其它错误立刻向上传，不做重试。
+//
+// 引入背景（Jerry-Xin / yujiawei round-2/3）：OnThreadCreated 的批量 SQL 即便
+// 严格按 version → ext 顺序写，与并发 UnfollowChannel / UpdateSort 在大流量下
+// 仍可能偶发死锁（InnoDB 用次行索引或 gap lock 的内部顺序未必与 SQL VALUES 一致）。
+// 一次重试足以让另一边 commit / rollback 完释放锁；3 次封顶避免重试风暴。
+// 退避用 5ms / 20ms / 80ms 的等比序列。
+func withDeadlockRetry(fn func() error) error {
+	const maxAttempts = 3
+	delays := []time.Duration{5 * time.Millisecond, 20 * time.Millisecond, 80 * time.Millisecond}
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		err := fn()
+		if err == nil {
+			return nil
+		}
+		if !isRetriableMySQLLockErr(err) {
+			return err
+		}
+		lastErr = err
+		if attempt+1 < maxAttempts {
+			time.Sleep(delays[attempt])
+		}
+	}
+	return fmt.Errorf("retry exhausted after %d attempts on lock error: %w", maxAttempts, lastErr)
+}
+
+// isRetriableMySQLLockErr 识别 *mysql.MySQLError 的两个可恢复错误码：
+//   - 1213 ER_LOCK_DEADLOCK
+//   - 1205 ER_LOCK_WAIT_TIMEOUT
+//
+// 用 errors.As 兼容已包装的错误。
+func isRetriableMySQLLockErr(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	if !errors.As(err, &mysqlErr) {
+		return false
+	}
+	return mysqlErr.Number == 1213 || mysqlErr.Number == 1205
 }
 
 // onThreadCreatedTarget 是 OnThreadCreated 初始 SELECT 出来的目标 (uid, space_id)。
@@ -537,20 +603,52 @@ type onThreadCreatedTarget = struct {
 	SpaceID string `db:"space_id"`
 }
 
-// bulkBumpFollowVersionTx 批量给当前仍处于"auto_follow=1 + group_unfollowed=0"
-// 状态的 (uid, space_id) +1 follow_version；不在该状态的目标跳过。
+// bulkBumpFollowVersionTx 批量给一批已排序的 (uid, space_id) +1 follow_version。
 //
-// Bug fix B2：用 INSERT ... SELECT 内嵌 WHERE 让 re-check 与 write 落在同一条
-// SQL，关闭"初始 SELECT 后用户取关"的 race。SELECT 源是 user_conversation_ext
-// 的群行（target_type=2），这里 ORDER BY (uid, space_id) 让并发 fanout 在测试中
-// 观察到的行锁顺序一致（W2，lml2468 round-1）—— 注意 MySQL 文档并不严格保证
-// INSERT ... SELECT 的锁获取顺序对应 SELECT 输出顺序，所以这是 best-effort 的
-// 死锁缓解（yujiawei round-2 nit）；真正的死锁兜底仍依赖 InnoDB 检测 + 上层重试。
+// Bug fix (Jerry-Xin round-3 P1 / yujiawei round-3 P2 / lml2468 round-3 carry):
+// 原实现用 INSERT ... SELECT FROM user_conversation_ext。在 MySQL 默认
+// REPEATABLE READ 下，INSERT ... SELECT 会先对 source 表 (ext) 拿 next-key
+// shared lock，再对 dest 表 (version) 加 X 锁 —— 实际锁序是 ext → version，
+// 与 UnfollowChannel / UpdateSort / FollowDM 等单用户写路径 (version → ext) 反向，
+// 可形成 InnoDB 死锁循环，整批 fanout 被回滚。
 //
-// IN tuple 列表把行集限定在本 batch 内，让单条 SQL 的占位符数受 batchSize 约束。
-func bulkBumpFollowVersionTx(tx *dbr.Tx, targets []onThreadCreatedTarget, groupNo string) error {
+// 修复：改成 INSERT ... VALUES，纯写入 dest 表 (version)，**不读 ext**。
+// 锁仅落在 version 行上，符合全包统一的 version → ext 锁序。
+// 资格 re-check 在调用方拆出来的独立 SELECT ... FOR UPDATE 步骤里做。
+//
+// targets 必须按 (uid, space_id) 升序排序；并发 fanout 共享同一排序约定可减少
+// 死锁概率（InnoDB 按行物理顺序加锁与 VALUES 顺序未必一致，仍可能死锁 → 上层重试兜底）。
+func bulkBumpFollowVersionTx(tx *dbr.Tx, targets []onThreadCreatedTarget) error {
 	if len(targets) == 0 {
 		return nil
+	}
+	tupleHolders := make([]string, len(targets))
+	args := make([]interface{}, 0, len(targets)*3)
+	for i, t := range targets {
+		tupleHolders[i] = "(?, ?, 1)"
+		args = append(args, t.UID, t.SpaceID)
+	}
+	_, err := tx.InsertBySql(
+		"INSERT INTO "+followVersionTable+" (uid, space_id, version) VALUES "+
+			strings.Join(tupleHolders, ", ")+
+			" ON DUPLICATE KEY UPDATE version = version + 1",
+		args...,
+	).Exec()
+	return err
+}
+
+// selectEligibleForFanoutTx 在 tx 内 SELECT ... FOR UPDATE 锁住本 batch 内
+// 仍然 auto_follow_threads=1 AND group_unfollowed=0 的 (uid, space_id) 列表。
+// 返回值即"应被本次 fanout 写入 thread 行的用户子集"。
+//
+// 这一步必须在 bulkBumpFollowVersionTx 之后调用，保证全包统一的 version → ext
+// 锁序（Jerry-Xin / yujiawei round-2/3 P1）。
+// ORDER BY uid, space_id 在 mysql 8 上让本 SELECT 与同序的 INSERT VALUES 在
+// 测试观察中表现一致的加锁顺序；不是严格规范保证（详见
+// https://dev.mysql.com/doc/refman/8.0/en/innodb-locks-set.html），上层 retry 兜底。
+func selectEligibleForFanoutTx(tx *dbr.Tx, targets []onThreadCreatedTarget, groupNo string) ([]onThreadCreatedTarget, error) {
+	if len(targets) == 0 {
+		return nil, nil
 	}
 	tupleHolders := make([]string, len(targets))
 	args := []interface{}{targetTypeGroup, groupNo}
@@ -558,40 +656,38 @@ func bulkBumpFollowVersionTx(tx *dbr.Tx, targets []onThreadCreatedTarget, groupN
 		tupleHolders[i] = "(?, ?)"
 		args = append(args, t.UID, t.SpaceID)
 	}
-	_, err := tx.InsertBySql(
-		"INSERT INTO "+followVersionTable+" (uid, space_id, version)"+
-			" SELECT uid, space_id, 1 FROM "+table+
+	var eligible []onThreadCreatedTarget
+	_, err := tx.SelectBySql(
+		"SELECT uid, space_id FROM "+table+
 			" WHERE target_type=? AND target_id=?"+
 			" AND auto_follow_threads=1 AND group_unfollowed=0"+
 			" AND (uid, space_id) IN ("+strings.Join(tupleHolders, ", ")+")"+
-			" ORDER BY uid, space_id"+
-			" ON DUPLICATE KEY UPDATE version = version + 1",
+			" ORDER BY uid, space_id FOR UPDATE",
 		args...,
-	).Exec()
-	return err
+	).Load(&eligible)
+	return eligible, err
 }
 
-// bulkInsertIgnoreThreadExtForUsersTx 给本 batch 内当前仍 auto_follow=1 +
-// group_unfollowed=0 的 (uid, space_id) 写入 target_type=5 的 thread ext 行。
-// Re-check 内嵌在 SELECT WHERE 里 —— 同 bulkBumpFollowVersionTx 关闭 B2 race。
-func bulkInsertIgnoreThreadExtForUsersTx(tx *dbr.Tx, targets []onThreadCreatedTarget, groupNo, threadChannelID string) error {
-	if len(targets) == 0 {
+// bulkInsertIgnoreThreadExtForUsersTx 给一批已经过资格 re-check（selectEligibleForFanoutTx
+// 返回的）的 (uid, space_id) 写入 target_type=5 的 thread ext 行。
+//
+// 用 INSERT IGNORE ... VALUES 而非 INSERT ... SELECT —— 不读 user_conversation_ext，
+// 不会拿 source 表的 S-lock，避免与 bulkBumpFollowVersionTx 形成反向锁序
+// （同 Jerry-Xin round-3 P1 反馈）。
+func bulkInsertIgnoreThreadExtForUsersTx(tx *dbr.Tx, eligible []onThreadCreatedTarget, threadChannelID string) error {
+	if len(eligible) == 0 {
 		return nil
 	}
-	tupleHolders := make([]string, len(targets))
-	args := []interface{}{targetTypeThread, threadChannelID, targetTypeGroup, groupNo}
-	for i, t := range targets {
-		tupleHolders[i] = "(?, ?)"
-		args = append(args, t.UID, t.SpaceID)
+	tupleHolders := make([]string, len(eligible))
+	args := make([]interface{}, 0, len(eligible)*4)
+	for i, t := range eligible {
+		tupleHolders[i] = "(?, ?, ?, ?)"
+		args = append(args, t.UID, t.SpaceID, targetTypeThread, threadChannelID)
 	}
 	_, err := tx.InsertBySql(
 		"INSERT IGNORE INTO "+table+
-			" (uid, space_id, target_type, target_id)"+
-			" SELECT uid, space_id, ?, ? FROM "+table+
-			" WHERE target_type=? AND target_id=?"+
-			" AND auto_follow_threads=1 AND group_unfollowed=0"+
-			" AND (uid, space_id) IN ("+strings.Join(tupleHolders, ", ")+")"+
-			" ORDER BY uid, space_id",
+			" (uid, space_id, target_type, target_id) VALUES "+
+			strings.Join(tupleHolders, ", "),
 		args...,
 	).Exec()
 	return err
