@@ -796,28 +796,37 @@ func (d *botAPIDB) updateGrant(id int64, mode string, globalEnabled *int, person
 //     could silently reactivate a tombstoned grant.
 //
 //   - active=1 (activate). Wrapped in a transaction that mirrors
-//     createOrReactivateGrantAtomic's mutex semantics:
-//       1. `SELECT 1 FROM user WHERE uid=? FOR UPDATE` serializes
+//     createOrReactivateGrantAtomic's mutex semantics AND its lock
+//     order (YUJ-1752 / PR#131 R7 — see the LOCK ORDER INVARIANT
+//     comment in the function body). The order is:
+//       1. Unlocked `SELECT grantor_uid FROM obo_grants WHERE id=?`
+//          so we know which user row to lock first. We deliberately
+//          do NOT take FOR UPDATE on the grant row here — that would
+//          invert the lock order vs createOrReactivateGrantAtomic
+//          and re-introduce the AB-BA deadlock YUJ-1752 was filed for.
+//       2. `SELECT 1 FROM user WHERE uid=? FOR UPDATE` serializes
 //          concurrent activate/create/reactivate flows for the SAME
 //          grantor across bots — without it, two PUTs racing on
 //          different grants under the same grantor could leave the
 //          grantor with TWO active rows (UNIQUE only covers
-//          (grantor, bot)).
-//       2. Re-read the target row inside the tx so the grantor_uid
-//          we demote against is the committed value (not a snapshot
-//          that may have moved under us). YUJ-1738 / PR#131 R2 B2:
-//          if the re-read shows `revoked_at != NULL` the activate
-//          flow is aborted with a clean rollback. The handler-level
-//          gate already rejects revoked grants 404 before reaching
-//          this method, but a DELETE that COMMITS between the
-//          handler's grant load and our tx start would slip past
-//          that gate; the in-tx re-read closes the race.
-//       3. Flip target row to active=1, clear revoked_at — UPDATE
+//          (grantor, bot)). This is the FIRST lock acquired on any
+//          row in this tx, matching createOrReactivateGrantAtomic.
+//       3. Re-read the target grant row FOR UPDATE inside the tx so
+//          the grantor_uid we demote against is the locked snapshot
+//          (not the step-1 read that may have moved under us).
+//          YUJ-1738 / PR#131 R2 B2: if the re-read shows
+//          `revoked_at != NULL` the activate flow is aborted with a
+//          clean rollback. The handler-level gate already rejects
+//          revoked grants 404 before reaching this method, but a
+//          DELETE that COMMITS between the handler's grant load and
+//          our tx start would slip past that gate; the in-tx re-read
+//          closes the race.
+//       4. Flip target row to active=1, clear revoked_at — UPDATE
 //          itself also carries `AND revoked_at IS NULL` as a
 //          belt-and-braces guard so a tombstoned row is never
-//          resurrected even if step 2 misses (e.g. a future
+//          resurrected even if step 3 misses (e.g. a future
 //          refactor moves the check).
-//       4. Demote every OTHER active row for the grantor to
+//       5. Demote every OTHER active row for the grantor to
 //          active=0 / global_enabled=0. YUJ-1744 / PR#131 R4: the
 //          demote MUST NOT touch `revoked_at`. Siblings demoted by
 //          a persona switch are *paused*, not *revoked* — leaving
@@ -891,9 +900,70 @@ func (d *botAPIDB) setGrantActive(id int64, active int) error {
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	// Re-read target inside the tx — the grantor_uid we use to scope
-	// the demote query MUST be the locked snapshot, not a value read
-	// before the tx began.
+	// 🔒 LOCK ORDER INVARIANT — YUJ-1752 / PR#131 R7.
+	//
+	// Within any single tx, locks MUST be acquired in the order:
+	//
+	//     `user` row (grantor) → `obo_grants` row(s) (grant + siblings)
+	//
+	// createOrReactivateGrantAtomic establishes this order; setGrantActive
+	// MUST match it. If the two paths invert the order (e.g. setGrantActive
+	// locks the grant row first and createOrReactivateGrantAtomic locks
+	// the user row first), a concurrent PUT {active:1} and POST /v1/obo/grants
+	// on the SAME grantor will deadlock (AB-BA): the PUT holds the grant
+	// row and waits for the user row; the POST holds the user row and
+	// waits for the grant row (via the demote-others FOR UPDATE scan).
+	// MySQL eventually breaks the cycle with a deadlock error but the
+	// loser's request fails — exactly the symptom YUJ-1752 was filed for.
+	//
+	// Therefore step 1 below is the unlocked grantor_uid lookup, step 2
+	// is the user-row lock, and step 3 is the grant-row FOR UPDATE.
+	// DO NOT REORDER without updating createOrReactivateGrantAtomic in
+	// lock-step, and DO NOT introduce any FOR UPDATE on `obo_grants`
+	// above the `user` lock below. The TestOBO_YUJ1752_* tests pin this
+	// invariant at the source level.
+
+	// Step 1 — Resolve grantor_uid without taking any row lock.
+	// We need grantor_uid to take the user lock FIRST (per the invariant
+	// above), but we don't yet hold any lock on the grant row, so a
+	// concurrent writer COULD mutate the row between this read and our
+	// FOR UPDATE re-read in step 3. That's fine: grantor_uid is
+	// immutable for an existing grant row (UNIQUE KEY on
+	// (grantor_uid, grantee_bot_uid), never updated), and step 3's
+	// FOR UPDATE re-read is the authoritative snapshot we operate on.
+	// If the row vanishes between step 1 and step 3 we treat it as an
+	// idempotent no-op (same as if the row was missing on entry).
+	var preGrantorRow struct {
+		GrantorUID string `db:"grantor_uid"`
+	}
+	if grantorLookupErr := tx.SelectBySql(
+		"SELECT grantor_uid FROM obo_grants WHERE id=?", id,
+	).LoadOne(&preGrantorRow); grantorLookupErr != nil {
+		if errors.Is(grantorLookupErr, dbr.ErrNotFound) {
+			return nil
+		}
+		return grantorLookupErr
+	}
+	if preGrantorRow.GrantorUID == "" {
+		return nil
+	}
+
+	// Step 2 — Grantor-scoped user row lock. MUST run BEFORE any
+	// FOR UPDATE on `obo_grants` (see LOCK ORDER INVARIANT comment
+	// above). Missing user row is tolerated: the UNIQUE on
+	// (grantor, bot) + the grant FOR UPDATE in step 3 are sufficient
+	// to keep the demote set consistent for THIS request. Same posture
+	// as createOrReactivateGrantAtomic.
+	var lockHit int
+	if lockErr := tx.SelectBySql(
+		"SELECT 1 FROM `user` WHERE uid=? FOR UPDATE", preGrantorRow.GrantorUID,
+	).LoadOne(&lockHit); lockErr != nil && !errors.Is(lockErr, dbr.ErrNotFound) {
+		return lockErr
+	}
+
+	// Step 3 — Re-read target inside the tx under FOR UPDATE — the
+	// grantor_uid we use to scope the demote query MUST be the locked
+	// snapshot, not the step-1 read that may have moved under us.
 	// MUST use oboGrantColumns (not `SELECT *`) — `persona_prompt` is
 	// a nullable TEXT column and `oboGrantModel.PersonaPrompt` is a
 	// non-pointer `string`. Legacy rows created before migration
@@ -909,7 +979,7 @@ func (d *botAPIDB) setGrantActive(id int64, active int) error {
 		return lookupErr
 	}
 	if grant == nil {
-		// Row vanished between handler load and tx start. Treat as
+		// Row vanished between step 1 and the locked re-read. Treat as
 		// idempotent no-op so the caller's earlier 200 OK contract
 		// (no row → nothing to do) is preserved.
 		return nil
@@ -935,15 +1005,15 @@ func (d *botAPIDB) setGrantActive(id int64, active int) error {
 		return nil
 	}
 
-	// Grantor-scoped lock — same posture as
-	// createOrReactivateGrantAtomic. Missing user row is tolerated:
-	// the UNIQUE on (grantor, bot) + this method's own row-lock are
-	// sufficient to keep the demote set consistent for THIS request.
-	var lockHit int
-	if lockErr := tx.SelectBySql(
-		"SELECT 1 FROM `user` WHERE uid=? FOR UPDATE", grant.GrantorUID,
-	).LoadOne(&lockHit); lockErr != nil && !errors.Is(lockErr, dbr.ErrNotFound) {
-		return lockErr
+	// Defensive: if grantor_uid changed between the unlocked step-1
+	// read and the locked step-3 re-read, abort. grantor_uid is
+	// immutable in practice (no code path UPDATEs it), but if a
+	// future refactor ever did, locking the WRONG user row would
+	// break the per-grantor serialization the invariant promises.
+	// This check turns that subtle correctness issue into a clean
+	// no-op rather than a silent partial commit.
+	if grant.GrantorUID != preGrantorRow.GrantorUID {
+		return nil
 	}
 
 	now := time.Now()
@@ -1214,6 +1284,13 @@ func (d *botAPIDB) createOrReactivateGrantAtomic(grantorUID, granteeBotUID, mode
 	}
 	defer tx.RollbackUnlessCommitted()
 
+	// 🔒 LOCK ORDER INVARIANT — YUJ-1752 / PR#131 R7.
+	//
+	// `user` row (grantor) → `obo_grants` row(s). setGrantActive's
+	// activate path MUST mirror this order. The TestOBO_YUJ1752_*
+	// tests pin both sides. DO NOT reorder without updating
+	// setGrantActive in lock-step.
+	//
 	// Serialize concurrent create/reactivate for the same grantor.
 	// SELECT ... FOR UPDATE on the grantor's user row gives us a row
 	// lock that any sibling tx for the same grantor will block on,
