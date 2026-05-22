@@ -192,7 +192,18 @@ func (c *threadAuthChecker) checkChannelAccess(uid, spaceID, groupNo string) err
 		return err
 	}
 	if len(groups) == 0 {
-		// Group disbanded between membership-check and now; reject.
+		// Group row gone between membership-check and now; reject.
+		return convext.ErrChannelForbidden
+	}
+	// PR #123 round-6 (lml2468)：显式拒绝 Disband 群。解散流程把 group.status
+	// 置为 Disband 但不一定清理 group_member（部分清理路径目前是注释掉的），
+	// ExistMember 仍可能为 true；同时解散事件已清空 conversation_ext 行，
+	// 这里若放行会让 FollowChannel 重新写入 auto_follow_threads=1 + 物化已解散
+	// 群下的 active thread ext，导致已解散的群/子区重新出现在 sidebar。
+	// 与 modules/group/api.go 既有路径（"if group == nil || group.Status ==
+	// GroupStatusDisband"）保持一致。Disabled (=0, 管理员禁用) 当前不拒绝以
+	// 保持最小修复面；若日后产品确认 disabled 群也不应允许 follow，可在此追加。
+	if groups[0].Status == group.GroupStatusDisband {
 		return convext.ErrChannelForbidden
 	}
 	parentSpaceID := groups[0].SpaceID

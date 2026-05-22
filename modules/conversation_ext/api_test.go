@@ -338,6 +338,20 @@ func TestFollow_FollowChannel_ServiceError(t *testing.T) {
 	assertBadRequest(t, w)
 }
 
+// PR #123 round-1 (Jerry-Xin / yujiawei P1) + round-5 (Jerry-Xin follow-up)：
+// ErrChannelForbidden 必须作为 403 返回，与 FollowThread 的 ErrThreadForbidden→403
+// 契约对齐，让客户端走"无权访问"路径而不是通用 400 重试。
+func TestFollow_FollowChannel_Forbidden_Returns403(t *testing.T) {
+	svc := &stubService{
+		followChannelFn: func(uid, spaceID, groupNo string) error {
+			return ErrChannelForbidden
+		},
+	}
+	r := newTestRouter(svc, &stubDB{})
+	w := do(r, "POST", "/v1/follow/channel/refollow", map[string]interface{}{"group_no": "grp2"})
+	assert.Equal(t, http.StatusForbidden, w.Code, "body: %s", w.Body.String())
+}
+
 // ---------------------------------------------------------------------------
 // FollowThread
 // ---------------------------------------------------------------------------

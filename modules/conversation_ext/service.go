@@ -389,6 +389,10 @@ func isChannelStillAutoFollowedTx(tx *dbr.Tx, uid, spaceID, groupNo string) (boo
 // 批量插入 target_type=5 子区行。已存在的行（含用户手动调过 follow_sort 的）
 // 因 INSERT IGNORE 保持不变 —— 这是 FollowChannel 既不覆盖用户既有排序也能
 // 一次性补齐缺失行的关键。
+//
+// 返回的是 *dbr/MySQL 原始错误（yujiawei round-5 nit）；调用方负责加 op 上下文
+// wrap（当前唯一调用方 FollowChannel Phase 3 包成 "FollowChannel phase3
+// materialize threads: %w"），与文件内其它 *Tx helper 的约定一致。
 func bulkInsertThreadExtForChannelMaterializeTx(tx *dbr.Tx, uid, spaceID, groupNo string, shortIDs []string) error {
 	if len(shortIDs) == 0 {
 		return nil
@@ -497,6 +501,14 @@ func (s *Service) OnThreadCreated(groupNo, shortID string) error {
 	// 1. 在 tx 外把目标 (uid, space_id) 列表读出 —— 跨 N 用户的 SELECT 不参与 tx 锁。
 	//    ORDER BY uid, space_id 让本 batch 内（以及并发 fanout 之间）按统一顺序
 	//    取行锁，减少死锁概率；真正死锁兜底走下面的 withDeadlockRetry。
+	//
+	//    快照语义（yujiawei round-5 nit）：本 SELECT 在 autocommit 下运行，得到的是
+	//    "调用时刻"的近似集合，会出现以下时序：
+	//      - 这里查到了某用户，但在 selectEligibleForFanoutTx 之前他刚 UnfollowChannel
+	//        → 资格 re-check 把他过滤掉，最终不写 thread 行（正确）；
+	//      - 这里没查到某用户，但他在我们 commit 之前刚 FollowChannel
+	//        → 本次 fanout 漏掉他，由 FollowChannel Phase 3 物化兜底或下一条新子区补齐。
+	//    这两类窗口都是 expected，调用方无需感知。
 	var targets []onThreadCreatedTarget
 	_, err := s.session.SelectBySql(
 		"SELECT uid, space_id FROM "+table+
@@ -653,6 +665,13 @@ func bulkBumpFollowVersionTx(tx *dbr.Tx, targets []onThreadCreatedTarget) error 
 // ORDER BY uid, space_id 在 mysql 8 上让本 SELECT 与同序的 INSERT VALUES 在
 // 测试观察中表现一致的加锁顺序；不是严格规范保证（详见
 // https://dev.mysql.com/doc/refman/8.0/en/innodb-locks-set.html），上层 retry 兜底。
+//
+// 实际锁范围说明（yujiawei round-5 nit）：FOR UPDATE 走 idx_channel_auto_follow，
+// 在 InnoDB next-key lock 语义下加锁谓词等价于整条
+// (target_type, target_id, auto_follow_threads=1) 范围，而非 IN (…) 中字面列出的
+// (uid, space_id) 集合。这意味着同一群的两个并发 OnThreadCreated batch 会在
+// 此处串行化（即便 IN 集合不相交）—— fanout 单群吞吐受这一锁竞争上限制约，
+// 上线后若 fanout 失败 metric 显著上涨需要先排查这里的并发度。
 func selectEligibleForFanoutTx(tx *dbr.Tx, targets []onThreadCreatedTarget, groupNo string) ([]onThreadCreatedTarget, error) {
 	if len(targets) == 0 {
 		return nil, nil
