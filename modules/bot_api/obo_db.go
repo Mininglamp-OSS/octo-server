@@ -173,7 +173,17 @@ type oboStore interface {
 	// grantors; reading a cross-namespace DM write would suppress
 	// legitimate group fan-outs.
 	findActiveGrantsForChannelByGrantors(channelID string, channelType uint8, grantorUIDs []string) ([]*oboGrantModel, error)
-	findGlobalGrantsWithoutScope(channelID string, channelType uint8) ([]*oboGrantModel, error)
+	// PR#121 R9 (YUJ-1676 / Jerry-Xin + lml2468 blocking) — the implicit-
+	// scope feeder now serves both Group and CommunityTopic channels.
+	// `membershipGroupID` is the group whose membership rows gate the
+	// implicit-scope predicate (the channel itself for Group; the PARENT
+	// group for CommunityTopic). `channelID` + `channelType` continue to
+	// identify the row used for the obo_scopes anti-join, so a topic's
+	// own `(parent____short_id, ChannelTypeCommunityTopic)` scope row is
+	// the one that gets honoured for the "explicit scope wins" invariant
+	// — never the parent-group's. See findGlobalGrantsWithoutScope for
+	// the full per-argument contract.
+	findGlobalGrantsWithoutScope(membershipGroupID, channelID string, channelType uint8) ([]*oboGrantModel, error)
 
 	// CRUD used by the REST layer.
 	//
@@ -515,18 +525,35 @@ func (d *botAPIDB) findActiveGrantsForChannelByGrantors(channelID string, channe
 //
 //  1. no explicit scope row exists for this channel (anything explicit, even
 //     `enabled=0`, takes precedence — admins disable a channel intentionally).
-//  2. the grantor IS currently a member of the group (otherwise the grantor
-//     has no read access and the bot must not harvest the channel).
-//  3. the grantee bot is NOT currently a member of the group (Gate 4 —
-//     when the bot is already in the group it receives messages directly via
+//  2. the grantor IS currently a member of `membershipGroupID` (otherwise the
+//     grantor has no read access and the bot must not harvest the channel).
+//  3. the grantee bot is NOT currently a member of `membershipGroupID` (Gate 4
+//     — when the bot is already in the group it receives messages directly via
 //     the WuKongIM subscriber pipeline, so a fan-out copy would double-process).
 //
-// Implicit-scope only applies to GROUP channels (DMs and community topics
-// have no "membership" concept in the way this function uses it), so we
-// return an empty slice for any other channel type. The fan-out caller
-// (oboFanoutForMessage) already guards on ChannelType==Group; the extra
-// check here is belt-and-braces so a future caller cannot accidentally
-// trigger the JOIN with a non-group `channel_id`.
+// Implicit-scope applies to group-like channels — Group and CommunityTopic
+// (PR#121 R9 / YUJ-1676 Jerry-Xin + lml2468 blocker). For non-group-like
+// channels (DM, Customer Service, …) the function returns an empty slice;
+// the caller already gates on the channel type, the extra check here is
+// belt-and-braces so a future caller cannot accidentally trigger the JOIN
+// with a non-group `channel_id`.
+//
+// `membershipGroupID` vs (`channelID`, `channelType`) — pre-R9 the function
+// took a single channel id and used it for BOTH the `group_member` join
+// (membership predicates 2 & 3) AND the `obo_scopes` anti-join (predicate 1).
+// That worked for Group only, because Group's `channel_id` IS the membership
+// group_no. For CommunityTopic the `channel_id` is `"<parent>____<short_id>"`
+// and the membership rows live on `<parent>` — so we now accept the two
+// keys independently:
+//
+//   - Group           → caller passes (channelID, channelID, ChannelTypeGroup)
+//   - CommunityTopic  → caller passes (parentGroupID, topicChannelID,
+//                       ChannelTypeCommunityTopic)
+//
+// Scope anti-join still uses the channel's own (channel_id, channel_type) so
+// a topic's `enabled=0` row suppresses fan-out for that topic only — never
+// for sibling topics or the parent group itself. The "explicit scope wins"
+// invariant from PR#121 R5 / B1 is preserved per-channel.
 //
 // Perf rationale (PR#121 review — Jerry-Xin 15:21 blocking): the previous
 // implementation returned every active+global_enabled grant in the system
@@ -543,14 +570,15 @@ func (d *botAPIDB) findActiveGrantsForChannelByGrantors(channelID string, channe
 // the caller does NOT need to re-run `grantorCanReadChannel` or Gate 4 for
 // these rows. (Gates 1 / 2 / TOCTOU-after-DB-query still apply, of course;
 // see obo_fanout.go for the residual checks.)
-func (d *botAPIDB) findGlobalGrantsWithoutScope(channelID string, channelType uint8) ([]*oboGrantModel, error) {
-	if channelID == "" {
+func (d *botAPIDB) findGlobalGrantsWithoutScope(membershipGroupID, channelID string, channelType uint8) ([]*oboGrantModel, error) {
+	if membershipGroupID == "" || channelID == "" {
 		return []*oboGrantModel{}, nil
 	}
-	// Implicit-scope semantics are group-only — the membership joins below
-	// have no meaning for DMs or community topics. Caller already gates on
-	// this; we re-assert defensively so a future caller cannot regress.
-	if channelType != common.ChannelTypeGroup.Uint8() {
+	// Implicit-scope semantics are group-like only — the membership joins
+	// below have no meaning for DMs or customer-service channels. Caller
+	// already gates on this; we re-assert defensively so a future caller
+	// cannot regress.
+	if !isGroupLikeChannelType(channelType) {
 		return []*oboGrantModel{}, nil
 	}
 	var grants []*oboGrantModel
@@ -572,7 +600,7 @@ func (d *botAPIDB) findGlobalGrantsWithoutScope(channelID string, channelType ui
 			"  AND g.global_enabled = 1 "+
 			"  AND gm_bot.uid IS NULL "+
 			"  AND s.id IS NULL",
-		channelID, channelID, channelID, channelType,
+		membershipGroupID, membershipGroupID, channelID, channelType,
 	).Load(&grants)
 	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
 		return nil, err

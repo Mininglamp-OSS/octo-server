@@ -156,7 +156,7 @@ func TestFindGlobalGrantsWithoutScope_UsesCoalesceOnPersonaPrompt(t *testing.T) 
 	mock.ExpectQuery("COALESCE\\(g.persona_prompt, ''\\) AS persona_prompt").
 		WillReturnRows(rows)
 
-	grants, err := d.findGlobalGrantsWithoutScope("ch_1", 2)
+	grants, err := d.findGlobalGrantsWithoutScope("ch_1", "ch_1", 2)
 	require.NoError(t, err)
 	require.Len(t, grants, 1)
 	require.Equal(t, "", grants[0].PersonaPrompt)

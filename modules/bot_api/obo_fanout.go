@@ -258,88 +258,120 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 		return 0
 	}
 
-	// Implicit scope: for GROUP channels, also find global_enabled grants
-	// whose grantor is a member of this group AND whose bot is NOT a member,
-	// with no explicit scope row for the channel. The store call collapses
-	// all three predicates into a single JOIN — see
-	// findGlobalGrantsWithoutScope in obo_db.go for the SQL. Pre-PR#121
-	// this loop did one `grantorCanReadChannel` query per global grant
-	// here AND one `userIsGroupMember(bot)` (Gate 4) query per grant in the
-	// dispatch loop below; for a system with N global grants every inbound
-	// group message paid 2*N per-message round-trips. After PR#121 the
-	// implicit-scope feeder is a single SQL statement and the dispatch
-	// loop skips both per-grant checks for these rows (tracked via
-	// `implicitGrantIDs`). Explicit-scope grants returned by
-	// findActiveGrantsForChannel still pay the per-grant Gate 4 +
-	// TOCTOU re-check below — that set is bounded by the number of scope
-	// rows installed for this specific channel and is never large.
+	// Implicit scope: for group-like channels (GROUP and CommunityTopic),
+	// also find global_enabled grants whose grantor is a member of the
+	// (parent) group AND whose bot is NOT a member, with no explicit scope
+	// row for the channel. The store call collapses all three predicates
+	// into a single JOIN — see findGlobalGrantsWithoutScope in obo_db.go
+	// for the SQL. Pre-PR#121 this loop did one `grantorCanReadChannel`
+	// query per global grant here AND one `userIsGroupMember(bot)` (Gate 4)
+	// query per grant in the dispatch loop below; for a system with N
+	// global grants every inbound group message paid 2*N per-message
+	// round-trips. After PR#121 the implicit-scope feeder is a single SQL
+	// statement and the dispatch loop skips both per-grant checks for
+	// these rows (tracked via `implicitGrantIDs`). Explicit-scope grants
+	// returned by findActiveGrantsForChannel still pay the per-grant
+	// Gate 4 + TOCTOU re-check below — that set is bounded by the number
+	// of scope rows installed for this specific channel and is never
+	// large.
+	//
+	// PR#121 R9 (YUJ-1676 / Jerry-Xin + lml2468 blocking) — extended
+	// from GROUP-only to also cover CommunityTopic. Without the topic
+	// branch, a `mention.all=1` topic message from a non-grantor whose
+	// parent group has a global_enabled grant on file (and bot NOT in
+	// the parent group) produced ZERO fan-out copies — even though
+	// checkOBO already authorized the symmetric reply path for topics
+	// (obo_check.go:105) and Gate 4 / send-permission bypass / explicit-
+	// mention feeder all already supported topics. The asymmetry meant
+	// the bot could authorize a reply but never receive the message in
+	// the first place. For topics we extract the parent group id (split
+	// on threadChannelIDSeparator, mirroring grantorCanReadChannel) and
+	// pass it to the store as `membershipGroupID`; the scope anti-join
+	// keeps using the topic's own (channel_id, channel_type) so an
+	// `enabled=0` row on the topic still wins.
 	//
 	// "admin is in any group → persona clone auto-covers it" UX without
 	// requiring manual scope management per channel.
 	implicitGrantIDs := map[int64]bool{}
-	if m.ChannelType == common.ChannelTypeGroup.Uint8() {
-		globalGrants, gErr := store.findGlobalGrantsWithoutScope(lookupChannelID, m.ChannelType)
-		if gErr != nil {
-			ba.Warn("OBO global-grant lookup failed",
-				zap.String("channel_id", lookupChannelID),
-				zap.Error(gErr))
-		} else {
-			// PR#121 R6 / B2 (Jerry-Xin + lml2468 2026-05-22 blocking)
-			// — when only specific grantors were @-mentioned (i.e.
-			// `mention.uids` is set and `mention.all` is NOT), the
-			// implicit-scope feeder MUST be filtered to those uids
-			// before being merged with the explicit-scope set above.
-			//
-			// Without this filter, a message that mentions only Alice
-			// (`mention.uids = [alice_uid]`) would silently pull in
-			// Bob's persona too — `findGlobalGrantsWithoutScope`
-			// returns every global-enabled grant whose grantor is in
-			// the group, with no awareness of the mention gate. That
-			// directly violates the documented v2 mention contract:
-			// `mention.uids` summons ONLY the mentioned grantor(s);
-			// only `mention.all` summons everyone.
-			//
-			// The mentionAll branch passes through unfiltered (matches
-			// the explicit-path behavior — `@所有人` summons every
-			// grantor in the channel). The DM branch never reaches
-			// this block (gated above on ChannelTypeGroup) and
-			// therefore needs no symmetrical filter.
-			var mentionFilter map[string]struct{}
-			if !mentionAll && len(mentionedUIDs) > 0 {
-				mentionFilter = make(map[string]struct{}, len(mentionedUIDs))
-				for _, u := range mentionedUIDs {
-					mentionFilter[u] = struct{}{}
-				}
+	if isGroupLikeChannelType(m.ChannelType) {
+		var membershipGroupID string
+		switch m.ChannelType {
+		case common.ChannelTypeGroup.Uint8():
+			membershipGroupID = lookupChannelID
+		case common.ChannelTypeCommunityTopic.Uint8():
+			parts := strings.SplitN(lookupChannelID, threadChannelIDSeparator, 2)
+			if len(parts) == 2 && parts[0] != "" {
+				membershipGroupID = parts[0]
 			}
-			// PR#114 R3 dedup — when the mention-filtered query above
-			// already returned a grant that ALSO satisfies the implicit-
-			// scope predicates, mark it as implicit (skip the per-grant
-			// access re-check) rather than appending a duplicate row.
-			// The same SQL JOIN that proved implicit-scope ran inside
-			// findGlobalGrantsWithoutScope, so the access re-check is
-			// redundant for these grants and the test surface pins that
-			// invariant explicitly.
-			alreadyHave := map[int64]bool{}
-			for _, g := range grants {
-				alreadyHave[g.ID] = true
-			}
-			for _, g := range globalGrants {
-				if mentionFilter != nil {
-					if _, ok := mentionFilter[g.GrantorUID]; !ok {
-						// Grantor not mentioned — implicit-scope
-						// fan-out must NOT summon them. (B2.)
-						continue
+			// Malformed thread id → leave empty; the feeder fail-closes
+			// on an empty membership group id and returns no grants.
+		}
+		if membershipGroupID != "" {
+			globalGrants, gErr := store.findGlobalGrantsWithoutScope(membershipGroupID, lookupChannelID, m.ChannelType)
+			if gErr != nil {
+				ba.Warn("OBO global-grant lookup failed",
+					zap.String("channel_id", lookupChannelID),
+					zap.String("membership_group", membershipGroupID),
+					zap.Error(gErr))
+			} else {
+				// PR#121 R6 / B2 (Jerry-Xin + lml2468 2026-05-22 blocking)
+				// — when only specific grantors were @-mentioned (i.e.
+				// `mention.uids` is set and `mention.all` is NOT), the
+				// implicit-scope feeder MUST be filtered to those uids
+				// before being merged with the explicit-scope set above.
+				//
+				// Without this filter, a message that mentions only Alice
+				// (`mention.uids = [alice_uid]`) would silently pull in
+				// Bob's persona too — `findGlobalGrantsWithoutScope`
+				// returns every global-enabled grant whose grantor is in
+				// the group, with no awareness of the mention gate. That
+				// directly violates the documented v2 mention contract:
+				// `mention.uids` summons ONLY the mentioned grantor(s);
+				// only `mention.all` summons everyone.
+				//
+				// The mentionAll branch passes through unfiltered (matches
+				// the explicit-path behavior — `@所有人` summons every
+				// grantor in the channel). The DM branch never reaches
+				// this block (gated above on isGroupLikeChannelType) and
+				// therefore needs no symmetrical filter.
+				var mentionFilter map[string]struct{}
+				if !mentionAll && len(mentionedUIDs) > 0 {
+					mentionFilter = make(map[string]struct{}, len(mentionedUIDs))
+					for _, u := range mentionedUIDs {
+						mentionFilter[u] = struct{}{}
 					}
 				}
-				ba.Info("OBO implicit-scope: SQL-validated grant, auto-including",
-					zap.String("grantor", g.GrantorUID),
-					zap.String("bot", g.GranteeBotUID),
-					zap.String("channel_id", lookupChannelID))
-				implicitGrantIDs[g.ID] = true
-				if alreadyHave[g.ID] {
-					continue
+				// PR#114 R3 dedup — when the mention-filtered query above
+				// already returned a grant that ALSO satisfies the implicit-
+				// scope predicates, mark it as implicit (skip the per-grant
+				// access re-check) rather than appending a duplicate row.
+				// The same SQL JOIN that proved implicit-scope ran inside
+				// findGlobalGrantsWithoutScope, so the access re-check is
+				// redundant for these grants and the test surface pins that
+				// invariant explicitly.
+				alreadyHave := map[int64]bool{}
+				for _, g := range grants {
+					alreadyHave[g.ID] = true
 				}
-				grants = append(grants, g)
+				for _, g := range globalGrants {
+					if mentionFilter != nil {
+						if _, ok := mentionFilter[g.GrantorUID]; !ok {
+							// Grantor not mentioned — implicit-scope
+							// fan-out must NOT summon them. (B2.)
+							continue
+						}
+					}
+					ba.Info("OBO implicit-scope: SQL-validated grant, auto-including",
+						zap.String("grantor", g.GrantorUID),
+						zap.String("bot", g.GranteeBotUID),
+						zap.String("channel_id", lookupChannelID),
+						zap.String("membership_group", membershipGroupID))
+					implicitGrantIDs[g.ID] = true
+					if alreadyHave[g.ID] {
+						continue
+					}
+					grants = append(grants, g)
+				}
 			}
 		}
 	}
@@ -393,9 +425,11 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 		// `userIsGroupMember(bot)` query here is redundant for them. We
 		// keep it for explicit-scope grants (sourced from
 		// findActiveGrantsForChannel) where the bot-membership status is
-		// not part of the feeder's filter. The implicit-scope feeder
-		// only fires for ChannelTypeGroup today, so the implicit-grant
-		// skip below is a no-op for CommunityTopic.
+		// not part of the feeder's filter. PR#121 R9 (YUJ-1676) extended
+		// the implicit-scope feeder to CommunityTopic as well, so the
+		// implicit-grant skip below now correctly fires for both Group
+		// and CommunityTopic when the SQL JOIN already proved the bot
+		// is NOT a (parent-)group member.
 		if !implicitGrantIDs[g.ID] {
 			var membershipGroup string
 			switch m.ChannelType {
@@ -413,7 +447,30 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 			}
 			if membershipGroup != "" {
 				isBotInGroup, gErr := ba.userIsGroupMember(g.GranteeBotUID, membershipGroup)
-				if gErr == nil && isBotInGroup {
+				if gErr != nil {
+					// PR#121 R9 (YUJ-1676) fail-closed. Pre-R9 a
+					// userIsGroupMember error fell through to the
+					// dispatch path, which caused a duplicate fan-out
+					// whenever the bot ACTUALLY was a parent-group
+					// member but the membership query transiently
+					// errored (DB blip, deadlock, …). The bot would
+					// then receive the message BOTH directly via the
+					// WuKongIM subscriber pipeline AND as an OBO
+					// fan-out copy — the exact double-processing bug
+					// Gate 4 is meant to prevent. Log and skip the
+					// grant: a missed fan-out copy on a transient
+					// error is strictly safer than a guaranteed
+					// duplicate, and the next inbound message in the
+					// channel will retry naturally.
+					ba.Warn("OBO fan-out gate 4: bot membership check errored, skipping grant (fail-closed)",
+						zap.String("bot", g.GranteeBotUID),
+						zap.String("channel_id", lookupChannelID),
+						zap.String("membership_group", membershipGroup),
+						zap.Uint8("channel_type", m.ChannelType),
+						zap.Error(gErr))
+					continue
+				}
+				if isBotInGroup {
 					ba.Info("OBO fan-out gate 4: bot is parent-group member, skipping fan-out (adapter handles directly)",
 						zap.String("bot", g.GranteeBotUID),
 						zap.String("channel_id", lookupChannelID),

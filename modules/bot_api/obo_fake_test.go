@@ -376,21 +376,27 @@ func (f *fakeOBOStore) findActiveGrantsForChannelByGrantors(channelID string, ch
 	return out, nil
 }
 
-func (f *fakeOBOStore) findGlobalGrantsWithoutScope(channelID string, channelType uint8) ([]*oboGrantModel, error) {
+func (f *fakeOBOStore) findGlobalGrantsWithoutScope(membershipGroupID, channelID string, channelType uint8) ([]*oboGrantModel, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.ensureInit()
 	out := []*oboGrantModel{}
 	// Mirror the prod SQL JOIN (PR#121): implicit-scope candidates only
-	// fire for GROUP channels, and a candidate must satisfy ALL of:
+	// fire for group-like channels (Group / CommunityTopic per PR#121 R9 /
+	// YUJ-1676), and a candidate must satisfy ALL of:
 	//   1. active=1 AND global_enabled=1
 	//   2. no obo_scopes row for (grant_id, channel_id, channel_type)
-	//   3. grantor IS a member of the group (group_member, is_deleted=0)
-	//   4. grantee bot is NOT a member of the group (Gate 4)
-	if channelType != common.ChannelTypeGroup.Uint8() {
+	//   3. grantor IS a member of `membershipGroupID` (group_member,
+	//      is_deleted=0); for CommunityTopic that's the parent group, for
+	//      Group it's the channel itself.
+	//   4. grantee bot is NOT a member of `membershipGroupID` (Gate 4)
+	if !isGroupLikeChannelType(channelType) {
 		return out, nil
 	}
-	members := f.groupMembers[channelID] // nil-map reads return zero-value
+	if membershipGroupID == "" || channelID == "" {
+		return out, nil
+	}
+	members := f.groupMembers[membershipGroupID] // nil-map reads return zero-value
 	for _, g := range f.grants {
 		if g.Active != 1 || g.GlobalEnabled != 1 {
 			continue
