@@ -135,8 +135,11 @@ paths:
         最旧的子区（产品上极有可能马上被归档）。
 
         实现采用两阶段提交（关闭 enumerate 与 OnThreadCreated 之间的 race window），
-        bump user_follow_version 最多 +2（与子区数量无关；常数次数），客户端只需在
-        变化时拉一次 sidebar，多 +1 不影响正确性。
+        bump user_follow_version 0 到 2 次（与子区数量无关；常数次数）：
+          - 鉴权失败：0 次（直接 403，不进任何 tx）；
+          - 群下无 active 子区 / 未注入 enumerator：1 次（Phase 1 commit）；
+          - 正常路径：2 次（Phase 1 + Phase 3 各一次）。
+        客户端只需在 follow_version 变化时拉一次 sidebar，多 +1 不影响正确性。
 
         当 caller 不是该群成员（或群在请求 Space 不可见）时返回 403。
       operationId: "followChannel"

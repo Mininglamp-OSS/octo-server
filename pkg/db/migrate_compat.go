@@ -158,6 +158,7 @@ var threadModuleMigrationIDs = []string{
 	"20260413000001_thread_legacy01.sql",
 	"20260422000001_thread_legacy01.sql",
 	"20260511000001_thread_legacy01.sql",
+	"20260522000002_thread_group_status_created_index.sql",
 }
 
 // ReconcileThreadSchemaRecords pre-seeds gorp_migrations with the thread

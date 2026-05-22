@@ -68,9 +68,10 @@ type ChannelAuthChecker interface {
 // 由 message/1module.go 启动时通过 SetThreadEnumerator 注入；nil 时跳过物化
 // （供单测以及尚未注入的迁移期使用）。
 //
-// EnumerateActiveShortIDs 返回 groupNo 下 status=active 的子区 shortID 列表，
-// 最多返回 limit 项。返回顺序由调用方约定（通常按 created_at DESC），
-// 与 maxAutoFollowThreadsPerChannel 的截断语义一致。
+// 实现 MUST 按 created_at DESC 排序返回（yujiawei round-2 nit）——
+// maxAutoFollowThreadsPerChannel 的截断语义依赖这条不变量：cap 命中时丢弃的是
+// 最旧的子区，与产品侧"子区自动归档先归档旧子区"配合让"热"子区始终进入物化。
+// 如果未来引入新的 enumerator 实现，必须保留这个顺序约定。
 type ThreadEnumerator interface {
 	EnumerateActiveShortIDs(groupNo string, limit int) ([]string, error)
 }
@@ -314,19 +315,27 @@ func (s *Service) FollowChannel(uid, spaceID, groupNo string) error {
 	//
 	// Bug fix B2 (yujiawei P2 / lml2468 round-2 #2)：在 Phase 1 commit 与 Phase 3
 	// 之间用户可能调用 UnfollowChannel，那一刻群行变成 auto_follow=0 + group_unfollowed=1。
-	// Phase 3 必须在同一 tx 内 SELECT ... FOR UPDATE 该群行重新确认状态，发现不再
-	// 资格则跳过整批写入（含 bump），避免重建已被 UnfollowChannel 清掉的孤立 thread 行。
+	// Phase 3 在同一 tx 内 SELECT ... FOR UPDATE 该群行重新确认状态，发现不再
+	// 资格则跳过 thread 写入，避免重建已被 UnfollowChannel 清掉的孤立 thread 行。
+	//
+	// 锁序（Jerry-Xin / yujiawei round-2 P1 blocker）：BumpFollowVersionTx **必须**
+	// 排在 isChannelStillAutoFollowedTx 之前，与 UnfollowChannel / UpdateSort /
+	// FollowDM 等全部写路径同序（先 version 行的 X 锁再 ext 行）。否则 Phase 3 持
+	// ext 等 version、UnfollowChannel 持 version 等 ext 会构成 InnoDB 死锁循环，
+	// 一个 tx 被回滚 —— Phase 3 受害时表现为 auto_follow=1 已 commit 但子区永不物化。
+	// 代价：用户已取关时本次也会 +1 一次 version（无害，客户端多刷一次 sidebar）。
 	return s.withTx("FollowChannel-phase3", func(tx *dbr.Tx) error {
+		if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
+			return fmt.Errorf("FollowChannel phase3 bump version: %w", err)
+		}
 		eligible, err := isChannelStillAutoFollowedTx(tx, uid, spaceID, groupNo)
 		if err != nil {
 			return fmt.Errorf("FollowChannel phase3 recheck: %w", err)
 		}
 		if !eligible {
-			// 用户已在 Phase 1 与 Phase 3 之间取关；丢弃旧 enumerate 快照，不写任何东西。
+			// 用户已在 Phase 1 与 Phase 3 之间取关；丢弃旧 enumerate 快照，不写 thread 行。
+			// version 已 +1（一次额外刷新，benign）。
 			return nil
-		}
-		if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
-			return fmt.Errorf("FollowChannel phase3 bump version: %w", err)
 		}
 		if err := bulkInsertIgnoreThreadExtTx(tx, uid, spaceID, groupNo, shortIDs); err != nil {
 			return fmt.Errorf("FollowChannel phase3 materialize threads: %w", err)
@@ -337,12 +346,12 @@ func (s *Service) FollowChannel(uid, spaceID, groupNo string) error {
 
 // isChannelStillAutoFollowedTx 在 tx 内对 (uid, spaceID, target_type=2, groupNo)
 // 取 SELECT ... FOR UPDATE，判断当前是否仍处于"已关注 + 自动跟随子区"状态。
-// 行不存在或两标志中任一不满足都返回 false，让 FollowChannel Phase 3 跳过写入。
-// 锁顺序：本函数应当在 BumpFollowVersionTx 之后调用 —— 群 ext 行的 SELECT
-// FOR UPDATE 不能先于 user_follow_version 的 X 锁，否则与 UpdateSort 反向死锁。
-// 但 Phase 3 实际是先 SELECT 再 bump（bump 只在 eligible 时发生），
-// 这是个例外：Phase 1 已经先锁过 user_follow_version 并 commit，本 tx 重新进入
-// 时 follow_version 行尚未在本 tx 中被锁，并不存在与 UpdateSort 反向交叉的窗口。
+// 行不存在或两标志中任一不满足都返回 false，让 FollowChannel Phase 3 跳过 thread 写入。
+//
+// 锁序：必须在 BumpFollowVersionTx 之后调用（Jerry-Xin / yujiawei round-2 P1）。
+// 全包写路径都遵循 user_follow_version → user_conversation_ext 的锁序；本函数对
+// ext 行加 X 锁，调用方要先在同 tx 拿过 version 行的 X 锁，否则与 UnfollowChannel /
+// UpdateSort 等反向交叉会导致 InnoDB 死锁回滚。
 func isChannelStillAutoFollowedTx(tx *dbr.Tx, uid, spaceID, groupNo string) (bool, error) {
 	var row struct {
 		AutoFollow int8 `db:"auto_follow_threads"`
@@ -533,9 +542,10 @@ type onThreadCreatedTarget = struct {
 //
 // Bug fix B2：用 INSERT ... SELECT 内嵌 WHERE 让 re-check 与 write 落在同一条
 // SQL，关闭"初始 SELECT 后用户取关"的 race。SELECT 源是 user_conversation_ext
-// 的群行（target_type=2），这里 ORDER BY (uid, space_id) 让并发 fanout 的行锁
-// 顺序一致（W2，lml2468 round-1）—— 避免两条 OnThreadCreated 不同顺序枚举时
-// 触发 InnoDB 死锁检测器回滚。
+// 的群行（target_type=2），这里 ORDER BY (uid, space_id) 让并发 fanout 在测试中
+// 观察到的行锁顺序一致（W2，lml2468 round-1）—— 注意 MySQL 文档并不严格保证
+// INSERT ... SELECT 的锁获取顺序对应 SELECT 输出顺序，所以这是 best-effort 的
+// 死锁缓解（yujiawei round-2 nit）；真正的死锁兜底仍依赖 InnoDB 检测 + 上层重试。
 //
 // IN tuple 列表把行集限定在本 batch 内，让单条 SQL 的占位符数受 batchSize 约束。
 func bulkBumpFollowVersionTx(tx *dbr.Tx, targets []onThreadCreatedTarget, groupNo string) error {
