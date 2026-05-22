@@ -63,6 +63,23 @@ func (rb *Robot) robotMessageListen(messages []*config.MessageResp) {
 		}
 		var robotID string
 		var robotIDs []string
+		// aisBroadcastSet captures the robotIDs that were added to
+		// `robotIDs` purely because of the `mention.ais=1` broadcast
+		// branch below (i.e. group bots that were NOT already in
+		// `mention.uids`). The fan-out loop uses this set to inject
+		// each such bot's UID into its own per-event payload copy so
+		// legacy adapters (octo-server#137) that only inspect
+		// `mention.uids` still recognise themselves as mentioned and
+		// reply.
+		//
+		// Important invariants (locked by the ais_broadcast tests):
+		//   - bots that came from the explicit `mention.uids` path
+		//     are NOT in this set, and their payload is delivered
+		//     verbatim (no rewrite) — preserving exact-@ semantics.
+		//   - the set is keyed on the SAME string that appears in
+		//     `robotIDs`, so the lookup at fan-out time is O(1) and
+		//     can't drift.
+		var aisBroadcastSet map[string]struct{}
 
 		if message.ChannelType == common.ChannelTypePerson.Uint8() {
 			uid := common.GetToChannelIDWithFakeChannelID(message.ChannelID, message.FromUID)
@@ -199,7 +216,30 @@ func (rb *Robot) robotMessageListen(messages []*config.MessageResp) {
 					if err != nil {
 						rb.Error("查询群机器人成员失败！", zap.Error(err), zap.String("channelID", message.ChannelID))
 					} else {
+						// Snapshot what was already in robotIDs (from
+						// the explicit mention.uids path) so we can
+						// compute the ais-only delta. We rewrite
+						// payload ONLY for the ais-only delta — bots
+						// already targeted via mention.uids already
+						// carry their UID in the payload and must
+						// keep the verbatim message.
+						before := make(map[string]struct{}, len(robotIDs))
+						for _, id := range robotIDs {
+							before[id] = struct{}{}
+						}
 						robotIDs = appendUniqueRobotIDs(robotIDs, groupRobotIDs)
+						if len(groupRobotIDs) > 0 {
+							aisBroadcastSet = make(map[string]struct{}, len(groupRobotIDs))
+							for _, id := range groupRobotIDs {
+								if id == "" {
+									continue
+								}
+								if _, dup := before[id]; dup {
+									continue
+								}
+								aisBroadcastSet[id] = struct{}{}
+							}
+						}
 					}
 				}
 			} else {
@@ -227,6 +267,18 @@ func (rb *Robot) robotMessageListen(messages []*config.MessageResp) {
 			for _, rid := range robotIDs {
 				rb.Info("投递消息到机器人事件队列", zap.String("robotID", rid), zap.String("fromUID", message.FromUID), zap.Int64("messageID", message.MessageID))
 				rid := rid // capture loop variable
+				// Per-bot payload: bots that came in via the ais
+				// broadcast branch get their UID injected into
+				// mention.uids on a SHALLOW COPY of the message so
+				// legacy adapters (octo-server#137) recognise the
+				// mention. Bots that came in via mention.uids keep
+				// the verbatim payload.
+				perBotMsg := message
+				if _, isAis := aisBroadcastSet[rid]; isAis {
+					cp := *message
+					cp.Payload = injectBotUIDIntoMentionUIDs(message.Payload, rid)
+					perBotMsg = &cp
+				}
 				rb.msgSem <- struct{}{}
 				go func() {
 					defer func() {
@@ -235,8 +287,8 @@ func (rb *Robot) robotMessageListen(messages []*config.MessageResp) {
 							rb.Error("panic in robot message goroutine", zap.Any("recover", r), zap.String("robotID", rid))
 						}
 					}()
-					rb.saveRobotMessage(message, rid)
-					rb.autoReadForBot(message, rid)
+					rb.saveRobotMessage(perBotMsg, rid)
+					rb.autoReadForBot(perBotMsg, rid)
 				}()
 			}
 		} else if len(robotID) > 0 {

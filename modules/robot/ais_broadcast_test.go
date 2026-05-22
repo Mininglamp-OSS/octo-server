@@ -165,3 +165,168 @@ func TestMentionAisTruthy_AfterRewrite(t *testing.T) {
 	assert.True(t, rb.mentionAisTruthy(gjson.ParseBytes(b).Get("mention.ais")),
 		"json.Number(\"1\") MUST survive json.Marshal → gjson round-trip as truthy")
 }
+
+// gjsonStrArray is a tiny helper that materialises a gjson.Result array
+// into a []string so test assertions can compare against literal
+// slices without per-test boilerplate.
+func gjsonStrArray(arr []gjson.Result) []string {
+	out := make([]string, 0, len(arr))
+	for _, v := range arr {
+		out = append(out, v.String())
+	}
+	return out
+}
+
+// TestInjectBotUIDIntoMentionUIDs_AppendsToExistingUIDs — the primary
+// rewrite case described in the YUJ-1784 issue body:
+//
+//	payload has mention.uids=[a,b] → after rewrite uids=[a,b,botX]
+//
+// This is what unblocks the legacy adapter (octo-server#137) for a
+// payload that originally only carried ais=1 plus some explicit @uids.
+func TestInjectBotUIDIntoMentionUIDs_AppendsToExistingUIDs(t *testing.T) {
+	in := []byte(`{"type":1,"content":"hi","mention":{"uids":["bot_a","bot_b"]}}`)
+	out := injectBotUIDIntoMentionUIDs(in, "bot_x")
+
+	got := gjsonStrArray(gjson.GetBytes(out, "mention.uids").Array())
+	assert.Equal(t, []string{"bot_a", "bot_b", "bot_x"}, got)
+}
+
+// TestInjectBotUIDIntoMentionUIDs_DedupSkip — contract clause 3: if the
+// bot's UID is already in mention.uids, the helper returns the original
+// bytes UNCHANGED (same length, byte-identical). The dispatcher relies
+// on this as defence-in-depth for the case where a bot appears both in
+// explicit mention.uids AND in the ais broadcast member set.
+func TestInjectBotUIDIntoMentionUIDs_DedupSkip(t *testing.T) {
+	in := []byte(`{"type":1,"mention":{"uids":["bot_x","bot_b"]}}`)
+	out := injectBotUIDIntoMentionUIDs(in, "bot_x")
+	assert.Equal(t, string(in), string(out), "already present, return unchanged bytes")
+}
+
+// TestInjectBotUIDIntoMentionUIDs_MentionWithoutUIDs — contract clause
+// 4 (mention exists, uids missing): a fresh uids=[botX] is created and
+// every other mention.* field is preserved. This is the most common
+// real-world shape because the rewrite chokepoint
+// (pkg/mentionrewrite/rewrite.go) emits mention.{all,ais}=1 without
+// any uids when the source was a legacy `@所有人`.
+func TestInjectBotUIDIntoMentionUIDs_MentionWithoutUIDs(t *testing.T) {
+	in := []byte(`{"type":1,"mention":{"all":1,"ais":1}}`)
+	out := injectBotUIDIntoMentionUIDs(in, "bot_x")
+
+	uids := gjsonStrArray(gjson.GetBytes(out, "mention.uids").Array())
+	assert.Equal(t, []string{"bot_x"}, uids)
+	assert.Equal(t, int64(1), gjson.GetBytes(out, "mention.all").Int(),
+		"mention.all MUST survive the rewrite unchanged")
+	assert.Equal(t, int64(1), gjson.GetBytes(out, "mention.ais").Int(),
+		"mention.ais MUST survive the rewrite unchanged")
+}
+
+// TestInjectBotUIDIntoMentionUIDs_NoMention — contract clause 4 edge
+// (no mention object at all): the helper creates mention.uids=[botX].
+// Hard to imagine a real payload that reaches the ais branch without
+// any mention object, but the helper is documented as safe to call on
+// any parsable payload and the test pins the contract.
+func TestInjectBotUIDIntoMentionUIDs_NoMention(t *testing.T) {
+	in := []byte(`{"type":1,"content":"hi"}`)
+	out := injectBotUIDIntoMentionUIDs(in, "bot_x")
+
+	uids := gjsonStrArray(gjson.GetBytes(out, "mention.uids").Array())
+	assert.Equal(t, []string{"bot_x"}, uids)
+	// sibling keys preserved
+	assert.Equal(t, int64(1), gjson.GetBytes(out, "type").Int())
+	assert.Equal(t, "hi", gjson.GetBytes(out, "content").String())
+}
+
+// TestInjectBotUIDIntoMentionUIDs_DoesNotTouchMentionAllOrHumans —
+// contract clause 2, the load-bearing invariant of the entire fix:
+// ONLY mention.uids is mutated. mention.all participates in adapter-
+// side `ignoreMentionAll` opt-outs (persona clones / OBO targets) and
+// flipping it would break those opt-outs. mention.humans / mention.ais
+// are likewise preserved verbatim.
+func TestInjectBotUIDIntoMentionUIDs_DoesNotTouchMentionAllOrHumans(t *testing.T) {
+	in := []byte(`{"type":1,"mention":{"all":0,"humans":1,"ais":1,"uids":["a"]}}`)
+	out := injectBotUIDIntoMentionUIDs(in, "bot_x")
+
+	assert.Equal(t, int64(0), gjson.GetBytes(out, "mention.all").Int(),
+		"mention.all=0 must NOT flip to 1 just because we appended a uid")
+	assert.Equal(t, int64(1), gjson.GetBytes(out, "mention.humans").Int())
+	assert.Equal(t, int64(1), gjson.GetBytes(out, "mention.ais").Int())
+	assert.Equal(t, []string{"a", "bot_x"},
+		gjsonStrArray(gjson.GetBytes(out, "mention.uids").Array()))
+}
+
+// TestInjectBotUIDIntoMentionUIDs_EmptyInputs — contract clause 1 fast
+// rejects: empty payload and empty botUID are both no-ops. The
+// dispatcher will not call the helper with these in practice, but
+// keeping the guard explicit avoids a future caller producing a
+// spurious `{"mention":{"uids":[""]}}` payload.
+func TestInjectBotUIDIntoMentionUIDs_EmptyInputs(t *testing.T) {
+	assert.Nil(t, injectBotUIDIntoMentionUIDs(nil, "bot_x"))
+	assert.Empty(t, injectBotUIDIntoMentionUIDs([]byte{}, "bot_x"))
+
+	in := []byte(`{"mention":{"uids":["a"]}}`)
+	assert.Equal(t, string(in), string(injectBotUIDIntoMentionUIDs(in, "")))
+}
+
+// TestInjectBotUIDIntoMentionUIDs_MalformedPayload — contract clause 5:
+// a non-JSON payload returns the original bytes unchanged. Dropping
+// the message here would be strictly worse than the pre-fix state.
+func TestInjectBotUIDIntoMentionUIDs_MalformedPayload(t *testing.T) {
+	in := []byte(`{not json}`)
+	out := injectBotUIDIntoMentionUIDs(in, "bot_x")
+	assert.Equal(t, string(in), string(out))
+}
+
+// TestInjectBotUIDIntoMentionUIDs_MentionWrongType — contract clause 5
+// branch: if mention exists but is not an object (e.g. it was set to a
+// bare string by a buggy client), the helper returns the original
+// bytes unchanged rather than panic-ing or overwriting a typed field.
+func TestInjectBotUIDIntoMentionUIDs_MentionWrongType(t *testing.T) {
+	in := []byte(`{"mention":"@all"}`)
+	out := injectBotUIDIntoMentionUIDs(in, "bot_x")
+	assert.Equal(t, string(in), string(out))
+}
+
+// TestInjectBotUIDIntoMentionUIDs_UIDsWrongType — sibling guard for
+// contract clause 5: mention.uids exists but is e.g. an object, not
+// an array. Best-effort skip.
+func TestInjectBotUIDIntoMentionUIDs_UIDsWrongType(t *testing.T) {
+	in := []byte(`{"mention":{"uids":{"a":1}}}`)
+	out := injectBotUIDIntoMentionUIDs(in, "bot_x")
+	assert.Equal(t, string(in), string(out))
+}
+
+// TestInjectBotUIDIntoMentionUIDs_UIDsNull — `mention.uids: null` must
+// be treated like a missing uids field: create uids=[botX]. This shape
+// can be emitted by some JSON producers that always serialise every
+// declared field.
+func TestInjectBotUIDIntoMentionUIDs_UIDsNull(t *testing.T) {
+	in := []byte(`{"mention":{"ais":1,"uids":null}}`)
+	out := injectBotUIDIntoMentionUIDs(in, "bot_x")
+	uids := gjsonStrArray(gjson.GetBytes(out, "mention.uids").Array())
+	assert.Equal(t, []string{"bot_x"}, uids)
+}
+
+// TestInjectBotUIDIntoMentionUIDs_PreservesMessageIDPrecision —
+// contract clause 6: a near-MAX_INT64 message_id MUST survive the
+// json.Unmarshal → json.Marshal round trip without float64 precision
+// loss. UseNumber() on the decoder is what gives us this guarantee.
+func TestInjectBotUIDIntoMentionUIDs_PreservesMessageIDPrecision(t *testing.T) {
+	in := []byte(`{"message_id":9223372036854775806,"mention":{"ais":1}}`)
+	out := injectBotUIDIntoMentionUIDs(in, "bot_x")
+	assert.Equal(t, int64(9223372036854775806), gjson.GetBytes(out, "message_id").Int(),
+		"int64 fields must NOT be coerced through float64 during the rewrite")
+}
+
+// TestInjectBotUIDIntoMentionUIDs_DoesNotMutateCaller — contract
+// clause 1 hard guarantee: the input byte slice must NOT be mutated.
+// We pass a slice and confirm its bytes are identical after the call.
+// This protects callers that re-use payload bytes for other purposes
+// (e.g. the dispatcher passes the original message.Payload to other
+// non-ais bots in the same loop).
+func TestInjectBotUIDIntoMentionUIDs_DoesNotMutateCaller(t *testing.T) {
+	in := []byte(`{"mention":{"uids":["a"]}}`)
+	snapshot := append([]byte(nil), in...)
+	_ = injectBotUIDIntoMentionUIDs(in, "bot_x")
+	assert.Equal(t, snapshot, in, "input byte slice MUST NOT be mutated")
+}

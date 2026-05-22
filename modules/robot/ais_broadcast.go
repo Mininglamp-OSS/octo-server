@@ -26,6 +26,9 @@
 package robot
 
 import (
+	"bytes"
+	"encoding/json"
+
 	"github.com/tidwall/gjson"
 )
 
@@ -123,6 +126,127 @@ func (rb *Robot) collectGroupRobotIDs(groupNo string) ([]string, error) {
 		return nil, nil
 	}
 	return out, nil
+}
+
+// injectBotUIDIntoMentionUIDs returns a payload byte slice with `botUID`
+// appended to `mention.uids`. It is the per-bot rewrite used by the
+// ais-broadcast fan-out so a legacy adapter (octo-server#137) that only
+// looks at `mention.uids` (and ignores `mention.ais`) still recognises
+// itself as mentioned and replies.
+//
+// Contract (mirrors the constraints called out in the YUJ-1784 issue
+// body — change with care, the unit tests below lock each one):
+//
+//  1. The function is pure: it never mutates the caller's `payload`
+//     byte slice. A new []byte is returned on any successful rewrite.
+//  2. ONLY `mention.uids` is touched. `mention.all`, `mention.humans`,
+//     `mention.ais`, and any sibling keys are preserved exactly as
+//     they appeared in the input — see the explicit
+//     TestInjectBotUIDIntoMentionUIDs_DoesNotTouchMentionAllOrHumans
+//     guard. We rely on this in the dispatcher because:
+//       - `mention.all` participates in adapter-side
+//         `ignoreMentionAll` opt-outs (persona clones, OBO targets),
+//         flipping it on every bot would break those opt-outs.
+//       - `mention.ais` is the very signal that brought us into this
+//         branch; rewriting it would mask the source intent in
+//         downstream logs / audits.
+//  3. Dedup: if `botUID` is already a member of `mention.uids`, the
+//     original byte slice is returned unchanged (no allocation, no
+//     re-serialization). This matters because the same bot can appear
+//     both in `mention.uids` (explicit @bot_x) AND in the ais
+//     broadcast member list; the dispatcher only ever calls this
+//     helper for the broadcast subset, but we still defend in depth.
+//  4. Missing `mention` object: a fresh `mention.uids=[botUID]` is
+//     created. This keeps the helper safe to call on any payload
+//     shape that survives JSON parsing.
+//  5. Best-effort on malformed input: if the payload does not parse,
+//     or `mention` exists but is not an object, or `mention.uids`
+//     exists but is not an array, the original bytes are returned
+//     unchanged. We MUST NOT drop the message — the legacy adapter
+//     would simply fail to recognise the mention (the current bug),
+//     which is no worse than the pre-fix state.
+//  6. Numeric precision: payloads may carry `message_id` int64 values
+//     that exceed the float64 53-bit mantissa range. The decoder uses
+//     `UseNumber()` so the marshal round-trip preserves them.
+//
+// Performance: gjson is used for the fast-path dedup check so the
+// common "already present" case avoids the json.Unmarshal /
+// json.Marshal cycle. Only the "needs append" path pays the round
+// trip, which is amortised against the broadcast fan-out goroutine
+// anyway.
+func injectBotUIDIntoMentionUIDs(payload []byte, botUID string) []byte {
+	if len(payload) == 0 || botUID == "" {
+		return payload
+	}
+
+	// Fast-path: if the bot's UID is already inside mention.uids,
+	// return the original bytes without re-serialising. This is the
+	// defence-in-depth case described in contract clause 3.
+	if uidsResult := gjson.GetBytes(payload, "mention.uids"); uidsResult.IsArray() {
+		for _, u := range uidsResult.Array() {
+			if u.String() == botUID {
+				return payload
+			}
+		}
+	}
+
+	// Slow path: parse, mutate mention.uids only, re-marshal.
+	// UseNumber() preserves int64 fields (e.g. message_id) across the
+	// round trip — see contract clause 6.
+	dec := json.NewDecoder(bytes.NewReader(payload))
+	dec.UseNumber()
+	var doc map[string]interface{}
+	if err := dec.Decode(&doc); err != nil {
+		return payload
+	}
+	if doc == nil {
+		return payload
+	}
+
+	var mention map[string]interface{}
+	if existing, ok := doc["mention"]; ok {
+		m, isObj := existing.(map[string]interface{})
+		if !isObj {
+			// mention exists but is not an object — best-effort skip
+			// (contract clause 5). A malformed mention would already
+			// not be acted on by any sane adapter.
+			return payload
+		}
+		mention = m
+	} else {
+		mention = map[string]interface{}{}
+		doc["mention"] = mention
+	}
+
+	var uids []interface{}
+	if existing, ok := mention["uids"]; ok {
+		switch v := existing.(type) {
+		case []interface{}:
+			uids = v
+		case nil:
+			uids = nil
+		default:
+			// uids exists but is not an array — best-effort skip.
+			return payload
+		}
+		// Re-run the dedup after Unmarshal: the fast-path gjson check
+		// only covered the IsArray() case; if `mention.uids` was the
+		// JSON literal `null` it surfaces here as the typed-nil branch
+		// above and we still want to honour clause 3.
+		for _, u := range uids {
+			if s, ok := u.(string); ok && s == botUID {
+				return payload
+			}
+		}
+	}
+	uids = append(uids, botUID)
+	mention["uids"] = uids
+
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return payload
+	}
+	return out
 }
 
 // appendUniqueRobotIDs returns the concatenation of `existing` and the
