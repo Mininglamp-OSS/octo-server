@@ -997,6 +997,20 @@ func (d *botAPIDB) setGrantActive(id int64, active int) error {
 	// Post-commit, best-effort cache invalidation. See
 	// createOrReactivateGrantAtomic for the same pattern + rationale.
 	d.invalidateGrantorCache(grant.GrantorUID)
+	// YUJ-1747 / PR#131 R5: bust per-channel cache for the activated
+	// grant's own scopes. While the grant was paused, the cache may
+	// have been written as "0" (no active grant covers this channel)
+	// on a fan-out miss; if we only invalidate sibling scopes, the
+	// just-reactivated channel keeps answering "0" until TTL and
+	// findActiveGrantsForChannel short-circuits to empty, suppressing
+	// fan-out entirely. Mirror the demote loop below.
+	scopes, _ := d.listScopesByGrant(id)
+	for _, s := range scopes {
+		if s == nil {
+			continue
+		}
+		d.invalidateChannelCache(s.ChannelID, s.ChannelType)
+	}
 	for _, r := range demoted {
 		if r == nil || r.ID == 0 {
 			continue
