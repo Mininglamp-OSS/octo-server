@@ -30,7 +30,7 @@ func TestOBO_UpdateGrant_Active_Pause(t *testing.T) {
 	zero := 0
 	c, rec := makeCtx(t, tRESTOwner, http.MethodPut,
 		"/v1/obo/grants/"+strconv.FormatInt(gid, 10),
-		oboUpdateGrantReq{Active: &zero},
+		oboUpdateGrantReq{Active: flexPtr(zero)},
 		gin.Params{{Key: "id", Value: strconv.FormatInt(gid, 10)}})
 	ba.oboUpdateGrant(c)
 	if rec.Code != http.StatusOK {
@@ -68,7 +68,7 @@ func TestOBO_UpdateGrant_Active_Activate_DemotesSiblings(t *testing.T) {
 	one := 1
 	c, rec := makeCtx(t, tRESTOwner, http.MethodPut,
 		"/v1/obo/grants/"+strconv.FormatInt(gidA, 10),
-		oboUpdateGrantReq{Active: &one},
+		oboUpdateGrantReq{Active: flexPtr(one)},
 		gin.Params{{Key: "id", Value: strconv.FormatInt(gidA, 10)}})
 	ba.oboUpdateGrant(c)
 	if rec.Code != http.StatusOK {
@@ -90,7 +90,7 @@ func TestOBO_UpdateGrant_Active_Activate_DemotesSiblings(t *testing.T) {
 	gidC, _ := s.insertGrant(tRESTOwner, "bot_persona_c", "auto", "")
 	c2, rec2 := makeCtx(t, tRESTOwner, http.MethodPut,
 		"/v1/obo/grants/"+strconv.FormatInt(gidA, 10),
-		oboUpdateGrantReq{Active: &one},
+		oboUpdateGrantReq{Active: flexPtr(one)},
 		gin.Params{{Key: "id", Value: strconv.FormatInt(gidA, 10)}})
 	ba.oboUpdateGrant(c2)
 	if rec2.Code != http.StatusOK {
@@ -121,7 +121,7 @@ func TestOBO_UpdateGrant_Active_DoesNotTouchOtherGrantors(t *testing.T) {
 	one := 1
 	c, rec := makeCtx(t, tRESTOwner, http.MethodPut,
 		"/v1/obo/grants/"+strconv.FormatInt(gidX, 10),
-		oboUpdateGrantReq{Active: &one},
+		oboUpdateGrantReq{Active: flexPtr(one)},
 		gin.Params{{Key: "id", Value: strconv.FormatInt(gidX, 10)}})
 	ba.oboUpdateGrant(c)
 	if rec.Code != http.StatusOK {
@@ -172,7 +172,7 @@ func TestOBO_UpdateGrant_Active_RevokedGrant_Rejected(t *testing.T) {
 	one := 1
 	c, rec := makeCtx(t, tRESTOwner, http.MethodPut,
 		"/v1/obo/grants/"+strconv.FormatInt(gid, 10),
-		oboUpdateGrantReq{Active: &one},
+		oboUpdateGrantReq{Active: flexPtr(one)},
 		gin.Params{{Key: "id", Value: strconv.FormatInt(gid, 10)}})
 	ba.oboUpdateGrant(c)
 	if rec.Code != http.StatusNotFound {
@@ -198,7 +198,7 @@ func TestOBO_UpdateGrant_Active_CombinedWith_GlobalEnabled(t *testing.T) {
 	one := 1
 	c, rec := makeCtx(t, tRESTOwner, http.MethodPut,
 		"/v1/obo/grants/"+strconv.FormatInt(gidA, 10),
-		oboUpdateGrantReq{Active: &one, GlobalEnabled: &one},
+		oboUpdateGrantReq{Active: flexPtr(one), GlobalEnabled: &one},
 		gin.Params{{Key: "id", Value: strconv.FormatInt(gidA, 10)}})
 	ba.oboUpdateGrant(c)
 	if rec.Code != http.StatusOK {

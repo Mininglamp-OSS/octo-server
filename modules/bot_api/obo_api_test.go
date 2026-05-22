@@ -74,6 +74,23 @@ func newBAforREST(s *fakeOBOStore) *BotAPI {
 	}
 }
 
+// flexPtr — test helper. YUJ-1738: Active is `*FlexBoolInt` so the
+// JSON decoder accepts BOTH boolean and integer. Tests still
+// construct request bodies with Go values, so they need a quick way
+// to get an addressable FlexBoolInt for the pointer field. Mirrors
+// the inline `v := 0; &v` pattern used for the legacy `*int` fields.
+func flexPtr(v int) *FlexBoolInt {
+	f := FlexBoolInt(v)
+	return &f
+}
+
+// intPtr — test helper for the legacy `*int` request fields
+// (GlobalEnabled, the in-store updateGrant signature, etc.). Kept
+// alongside flexPtr so tests that mix both shapes read symmetrically.
+func intPtr(v int) *int {
+	return &v
+}
+
 // ==================== Grant CRUD ====================
 
 func TestOBO_CreateGrant_Happy(t *testing.T) {

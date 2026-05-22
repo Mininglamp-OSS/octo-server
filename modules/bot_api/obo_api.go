@@ -20,7 +20,10 @@
 package bot_api
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -29,6 +32,68 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"go.uber.org/zap"
 )
+
+// FlexBoolInt — YUJ-1738 / PR#131 R2 B1.
+//
+// Wire-shape adapter for fields whose on-disk representation is an
+// integer (0/1) but whose historical clients send either a JSON
+// boolean (true/false) OR a JSON integer (0/1). encoding/json's
+// default *int decoder rejects boolean tokens with
+// `json: cannot unmarshal bool into Go struct field`, which silently
+// 400s the entire PUT — the symptom Jerry-Xin flagged on R2 where
+// the octo-web persona toggle (sends raw {"active": false}) could
+// never reach the handler.
+//
+// Round-trip semantics:
+//   - JSON `true`  → 1
+//   - JSON `false` → 0
+//   - JSON integer N → N (passed through; the handler still treats
+//     "non-zero ⇒ activate, zero ⇒ pause" so any non-zero integer
+//     is equivalent to `true`).
+//   - JSON `null` → leaves the value zero (the OUTER pointer is
+//     what carries the "field absent" semantic, see usage in
+//     oboUpdateGrantReq.Active).
+//   - any other shape (string, array, object, float) → typed error
+//     so the caller still gets a clean 400 instead of a silent skip.
+//
+// Marshalling emits an integer so downstream consumers that already
+// parse the response as a number keep working. The underlying type
+// is `int` (not a struct) so callers in package-internal tests can
+// keep using the pointer-pattern `v := FlexBoolInt(0); &v` they
+// already use for `*int` fields like GlobalEnabled.
+type FlexBoolInt int
+
+// UnmarshalJSON implements the dual boolean-or-integer decode.
+func (f *FlexBoolInt) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	switch string(trimmed) {
+	case "true":
+		*f = 1
+		return nil
+	case "false":
+		*f = 0
+		return nil
+	case "null":
+		// Defensive: encoding/json on a *FlexBoolInt receiver normally
+		// leaves the pointer nil before reaching this method when the
+		// token is `null`, so this branch should not fire — but if it
+		// does we treat null as "no change" (zero value) rather than
+		// erroring, matching std library convention for *int.
+		return nil
+	}
+	var n int
+	if err := json.Unmarshal(trimmed, &n); err != nil {
+		return fmt.Errorf("expected boolean or integer, got %s", string(trimmed))
+	}
+	*f = FlexBoolInt(n)
+	return nil
+}
+
+// MarshalJSON emits the value as a JSON integer (NOT a boolean),
+// preserving wire compatibility with the original `*int` field.
+func (f FlexBoolInt) MarshalJSON() ([]byte, error) {
+	return strconv.AppendInt(nil, int64(f), 10), nil
+}
 
 // registerOBORoutes mounts the OBO endpoints onto r under user-auth.
 // Called from BotAPI.Route. Split out so the route table in bot_api.go
@@ -81,22 +146,28 @@ type oboUpdateGrantReq struct {
 	GlobalEnabled *int    `json:"global_enabled,omitempty"`
 	PersonaPrompt *string `json:"persona_prompt,omitempty"`
 	// Active — YUJ-1728 / octo-server#129 — persona selector switch.
-	// `*int` (not int / bool) so "field omitted" stays distinguishable
-	// from "field set to 0" — same wire convention as `GlobalEnabled`
-	// above. The handler treats `*Active != 0` as activate and
-	// `*Active == 0` as pause. Activate mutex-demotes every OTHER
-	// active grant under the same grantor (single-active-persona
-	// invariant, matching createOrReactivateGrantAtomic). Pause only
-	// flips this row's bit — siblings are untouched. Active=nil leaves
-	// the row's active column untouched. The handler's pre-existing
-	// active-status gate continues to reject PUTs on REVOKED rows
-	// (revoked_at != NULL); resurrecting a revoked grant requires
-	// POST /v1/obo/grants. PAUSED rows (active=0, revoked_at=NULL)
-	// remain addressable when the PUT explicitly carries an `active`
-	// field — that's the supported re-activate path (YUJ-1735 /
-	// PR#131 follow-up). PUTs that omit `active` on a paused row
-	// still 404, matching the original misleading-UX defense.
-	Active *int `json:"active,omitempty"`
+	// `*FlexBoolInt` (not int / bool) so "field omitted" stays
+	// distinguishable from "field set to 0" — same wire convention as
+	// `GlobalEnabled` above. The wrapper type accepts EITHER a JSON
+	// boolean (true/false) OR a JSON integer (0/1) on the wire —
+	// YUJ-1738 / PR#131 R2 B1: octo-web's PersonaSettings ships raw
+	// {"active": false}; the historical `*int` decoder rejected the
+	// boolean token and silently 400'd the entire PUT, leaving the
+	// persona toggle inert. The handler still treats `*Active != 0`
+	// as activate and `*Active == 0` as pause. Activate mutex-demotes
+	// every OTHER active grant under the same grantor (single-active-
+	// persona invariant, matching createOrReactivateGrantAtomic).
+	// Pause only flips this row's bit — siblings are untouched.
+	// Active=nil leaves the row's active column untouched. The
+	// handler's pre-existing active-status gate continues to reject
+	// PUTs on REVOKED rows (revoked_at != NULL); resurrecting a
+	// revoked grant requires POST /v1/obo/grants. PAUSED rows
+	// (active=0, revoked_at=NULL) remain addressable when the PUT
+	// explicitly carries an `active` field — that's the supported
+	// re-activate path (YUJ-1735 / PR#131 follow-up). PUTs that omit
+	// `active` on a paused row still 404, matching the original
+	// misleading-UX defense.
+	Active *FlexBoolInt `json:"active,omitempty"`
 }
 
 type oboCreateScopeReq struct {
@@ -359,7 +430,7 @@ func (ba *BotAPI) oboUpdateGrant(c *wkhttp.Context) {
 	// pre-demotion sibling set.
 	if req.Active != nil {
 		v := 0
-		if *req.Active != 0 {
+		if int(*req.Active) != 0 {
 			v = 1
 		}
 		if err := ba.oboStoreOrDefault().setGrantActive(id, v); err != nil {

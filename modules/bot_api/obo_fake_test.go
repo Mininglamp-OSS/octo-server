@@ -523,12 +523,26 @@ func (f *fakeOBOStore) updateGrant(id int64, mode string, globalEnabled *int, pe
 // other active grant under the same grantor. Demotion sets
 // active=0 / global_enabled=0 / revoked_at=now so the in-memory state
 // matches what createOrReactivateGrantAtomic also produces.
+//
+// YUJ-1738 / PR#131 R2 B2 — race guard parity: both paths short-
+// circuit when the loaded row already carries revoked_at != nil.
+// Without this, a test that interleaves revokeGrant + setGrantActive
+// would observe in-memory behavior diverging from prod (prod refuses
+// to resurrect; the fake would silently flip active back to 1).
 func (f *fakeOBOStore) setGrantActive(id int64, active int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.ensureInit()
 	g, ok := f.grants[id]
 	if !ok {
+		return nil
+	}
+	// YUJ-1738 / PR#131 R2 B2 — refuse to mutate a tombstoned row
+	// in either direction. Pause on a revoked row is a no-op (it is
+	// already active=0); activate on a revoked row would resurrect
+	// it, which is exactly the DELETE-vs-PUT race the prod code now
+	// guards against in-tx.
+	if g.RevokedAt != nil {
 		return nil
 	}
 	v := 0

@@ -781,12 +781,18 @@ func (d *botAPIDB) updateGrant(id int64, mode string, globalEnabled *int, person
 // Two paths:
 //
 //   - active=0 (pause). Single UPDATE on the target row's `active`
-//     column. We intentionally do NOT touch `revoked_at` — a paused
-//     row is semantically distinct from a revoked row (the latter
-//     went through DELETE /v1/obo/grants/:id and carries
+//     column, scoped to `revoked_at IS NULL` (YUJ-1738 / PR#131 R2
+//     B2 race guard). We intentionally do NOT touch `revoked_at` —
+//     a paused row is semantically distinct from a revoked row
+//     (the latter went through DELETE /v1/obo/grants/:id and carries
 //     `revoked_at != NULL` for audit). We also leave `global_enabled`
 //     in place so that a re-activation via the create/reactivate path
-//     could restore the user's last-known-good state if desired.
+//     could restore the user's last-known-good state if desired. The
+//     `AND revoked_at IS NULL` guard makes the pause UPDATE a no-op
+//     against rows a concurrent DELETE has already tombstoned —
+//     without it the `updated_at` bump on the revoked row would
+//     muddy audit, and a future change that swept other columns
+//     could silently reactivate a tombstoned grant.
 //
 //   - active=1 (activate). Wrapped in a transaction that mirrors
 //     createOrReactivateGrantAtomic's mutex semantics:
@@ -798,8 +804,18 @@ func (d *botAPIDB) updateGrant(id int64, mode string, globalEnabled *int, person
 //          (grantor, bot)).
 //       2. Re-read the target row inside the tx so the grantor_uid
 //          we demote against is the committed value (not a snapshot
-//          that may have moved under us).
-//       3. Flip target row to active=1, clear revoked_at.
+//          that may have moved under us). YUJ-1738 / PR#131 R2 B2:
+//          if the re-read shows `revoked_at != NULL` the activate
+//          flow is aborted with a clean rollback. The handler-level
+//          gate already rejects revoked grants 404 before reaching
+//          this method, but a DELETE that COMMITS between the
+//          handler's grant load and our tx start would slip past
+//          that gate; the in-tx re-read closes the race.
+//       3. Flip target row to active=1, clear revoked_at — UPDATE
+//          itself also carries `AND revoked_at IS NULL` as a
+//          belt-and-braces guard so a tombstoned row is never
+//          resurrected even if step 2 misses (e.g. a future
+//          refactor moves the check).
 //       4. Demote every OTHER active row for the grantor to
 //          active=0 / global_enabled=0 / revoked_at=now (same shape
 //          as revokeGrant).
@@ -829,10 +845,17 @@ func (d *botAPIDB) setGrantActive(id int64, active int) error {
 		if g == nil {
 			return nil
 		}
+		// YUJ-1738 / PR#131 R2 B2 — race guard. If a concurrent
+		// DELETE has tombstoned the row between handler load and now,
+		// treat as a logical no-op: the row is already active=0 and
+		// the audit-bearing revoked_at must NOT be disturbed.
+		if g.RevokedAt != nil {
+			return nil
+		}
 		if _, err := d.session.Update("obo_grants").SetMap(map[string]interface{}{
 			"active":     0,
 			"updated_at": time.Now(),
-		}).Where("id=?", id).Exec(); err != nil {
+		}).Where("id=? AND revoked_at IS NULL", id).Exec(); err != nil {
 			return err
 		}
 		// "Any active grant exists for grantor" answer may have flipped.
@@ -874,6 +897,26 @@ func (d *botAPIDB) setGrantActive(id int64, active int) error {
 		return nil
 	}
 
+	// YUJ-1738 / PR#131 R2 B2 — DELETE-vs-PUT race guard.
+	//
+	// Scenario: the handler loads the grant (active=1, revoked_at=NULL),
+	// passes the gate, and calls into setGrantActive. A concurrent
+	// DELETE /v1/obo/grants/:id commits BEFORE our tx's `SELECT
+	// FOR UPDATE` acquires its lock. We now hold the lock on a row
+	// whose committed snapshot has revoked_at != NULL. Without this
+	// check the activate-path UPDATE below would clear revoked_at
+	// and flip active=1, effectively un-deleting a grant the user
+	// just asked us to delete.
+	//
+	// Bail out with a clean rollback. The caller already returned
+	// 200 OK to the PUT (handler doesn't surface this race as an
+	// error — the user can retry the activate via POST
+	// /v1/obo/grants), and the DELETE's audit trail (revoked_at
+	// timestamp) is preserved.
+	if grant.RevokedAt != nil {
+		return nil
+	}
+
 	// Grantor-scoped lock — same posture as
 	// createOrReactivateGrantAtomic. Missing user row is tolerated:
 	// the UNIQUE on (grantor, bot) + this method's own row-lock are
@@ -886,11 +929,15 @@ func (d *botAPIDB) setGrantActive(id int64, active int) error {
 	}
 
 	now := time.Now()
+	// Belt-and-braces: the in-tx `revoked_at != nil` check above is
+	// the primary guard; this WHERE clause is a defensive second
+	// layer so a future refactor that drops the explicit check
+	// can't silently resurrect a tombstoned row.
 	if _, updErr := tx.Update("obo_grants").SetMap(map[string]interface{}{
 		"active":     1,
 		"revoked_at": nil,
 		"updated_at": now,
-	}).Where("id=?", id).Exec(); updErr != nil {
+	}).Where("id=? AND revoked_at IS NULL", id).Exec(); updErr != nil {
 		return updErr
 	}
 

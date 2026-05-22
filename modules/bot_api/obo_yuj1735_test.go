@@ -39,7 +39,7 @@ func TestOBO_YUJ1735_Pause_OK(t *testing.T) {
 	zero := 0
 	c, rec := makeCtx(t, tRESTOwner, http.MethodPut,
 		"/v1/obo/grants/"+strconv.FormatInt(gid, 10),
-		oboUpdateGrantReq{Active: &zero},
+		oboUpdateGrantReq{Active: flexPtr(zero)},
 		gin.Params{{Key: "id", Value: strconv.FormatInt(gid, 10)}})
 	ba.oboUpdateGrant(c)
 	if rec.Code != http.StatusOK {
@@ -77,7 +77,7 @@ func TestOBO_YUJ1735_ReactivatePausedGrant(t *testing.T) {
 	one := 1
 	c, rec := makeCtx(t, tRESTOwner, http.MethodPut,
 		"/v1/obo/grants/"+strconv.FormatInt(gid, 10),
-		oboUpdateGrantReq{Active: &one},
+		oboUpdateGrantReq{Active: flexPtr(one)},
 		gin.Params{{Key: "id", Value: strconv.FormatInt(gid, 10)}})
 	ba.oboUpdateGrant(c)
 	if rec.Code != http.StatusOK {
@@ -113,7 +113,7 @@ func TestOBO_YUJ1735_RevokedGrant_StillRejected(t *testing.T) {
 	one := 1
 	c, rec := makeCtx(t, tRESTOwner, http.MethodPut,
 		"/v1/obo/grants/"+strconv.FormatInt(gid, 10),
-		oboUpdateGrantReq{Active: &one},
+		oboUpdateGrantReq{Active: flexPtr(one)},
 		gin.Params{{Key: "id", Value: strconv.FormatInt(gid, 10)}})
 	ba.oboUpdateGrant(c)
 	if rec.Code != http.StatusNotFound {
@@ -175,7 +175,7 @@ func TestOBO_YUJ1735_PausedGrant_RepauseIdempotent(t *testing.T) {
 	ba := newBAforREST(s)
 	c, rec := makeCtx(t, tRESTOwner, http.MethodPut,
 		"/v1/obo/grants/"+strconv.FormatInt(gid, 10),
-		oboUpdateGrantReq{Active: &zero},
+		oboUpdateGrantReq{Active: flexPtr(zero)},
 		gin.Params{{Key: "id", Value: strconv.FormatInt(gid, 10)}})
 	ba.oboUpdateGrant(c)
 	if rec.Code != http.StatusOK {
