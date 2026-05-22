@@ -205,6 +205,28 @@ type oboStore interface {
 	// permanently bricked after a single DELETE /v1/obo/grants/:id.)
 	findGrantByGrantorBot(grantorUID, granteeBotUID string) (*oboGrantModel, error)
 	updateGrant(id int64, mode string, globalEnabled *int, personaPrompt *string) error
+	// setGrantActive — YUJ-1728 / octo-server#129. Toggle the
+	// per-grant `active` selector exposed by PUT /v1/obo/grants/:id.
+	// `active=1` runs inside a transaction that takes the
+	// grantor-scoped `SELECT 1 FROM user WHERE uid=? FOR UPDATE`
+	// row-lock (same pattern as createOrReactivateGrantAtomic), flips
+	// the target row to active=1 / revoked_at=NULL, then demotes
+	// every OTHER active grant under the same grantor to
+	// active=0 / global_enabled=0 / revoked_at=now — preserving the
+	// "at most one active grant per grantor" invariant the create
+	// path also enforces. `active=0` is the cheap pause path: a
+	// single UPDATE on the target row, no demotion. Cache
+	// invalidation for the grantor key and every demoted grant's
+	// channel scopes runs post-commit (best-effort, errors swallowed
+	// — cache is correctness-safe to be stale).
+	//
+	// Missing/zero id is a no-op (matches updateGrant). The caller
+	// — currently only oboUpdateGrant — is responsible for the
+	// active-gate check that rejects PUTs on already-revoked rows;
+	// setGrantActive itself does NOT re-enforce that policy because
+	// the create / reactivate path also legitimately resets `active`
+	// on rows whose Active==0.
+	setGrantActive(id int64, active int) error
 	// reactivateGrant flips a soft-deleted row back to active=1 /
 	// global_enabled=0 / revoked_at=NULL. Used by oboCreateGrant when the
 	// duplicate-key conflict resolves to a row the caller already owns.
@@ -748,6 +770,170 @@ func (d *botAPIDB) updateGrant(id int64, mode string, globalEnabled *int, person
 	if globalEnabled != nil {
 		scopes, _ := d.listScopesByGrant(id)
 		for _, s := range scopes {
+			d.invalidateChannelCache(s.ChannelID, s.ChannelType)
+		}
+	}
+	return nil
+}
+
+// setGrantActive — see oboStore. YUJ-1728 / octo-server#129.
+//
+// Two paths:
+//
+//   - active=0 (pause). Single UPDATE on the target row's `active`
+//     column. We intentionally do NOT touch `revoked_at` — a paused
+//     row is semantically distinct from a revoked row (the latter
+//     went through DELETE /v1/obo/grants/:id and carries
+//     `revoked_at != NULL` for audit). We also leave `global_enabled`
+//     in place so that a re-activation via the create/reactivate path
+//     could restore the user's last-known-good state if desired.
+//
+//   - active=1 (activate). Wrapped in a transaction that mirrors
+//     createOrReactivateGrantAtomic's mutex semantics:
+//       1. `SELECT 1 FROM user WHERE uid=? FOR UPDATE` serializes
+//          concurrent activate/create/reactivate flows for the SAME
+//          grantor across bots — without it, two PUTs racing on
+//          different grants under the same grantor could leave the
+//          grantor with TWO active rows (UNIQUE only covers
+//          (grantor, bot)).
+//       2. Re-read the target row inside the tx so the grantor_uid
+//          we demote against is the committed value (not a snapshot
+//          that may have moved under us).
+//       3. Flip target row to active=1, clear revoked_at.
+//       4. Demote every OTHER active row for the grantor to
+//          active=0 / global_enabled=0 / revoked_at=now (same shape
+//          as revokeGrant).
+//     The entire sequence commits or rolls back together — no
+//     half-applied "target active but siblings still active" state.
+//
+// Post-commit cache invalidation is best-effort: grantor cache always
+// busted (both paths change "any active grant exists" answer in
+// principle); each demoted grant's channel scopes busted too, mirroring
+// updateGrant + createOrReactivateGrantAtomic's pattern. Cache layer
+// is correctness-safe to be stale, so Redis errors are swallowed.
+func (d *botAPIDB) setGrantActive(id int64, active int) error {
+	if id == 0 {
+		return nil
+	}
+	v := 0
+	if active != 0 {
+		v = 1
+	}
+
+	if v == 0 {
+		// Pause path — no transaction needed, no sibling demotion.
+		g, err := d.findGrantByID(id)
+		if err != nil {
+			return err
+		}
+		if g == nil {
+			return nil
+		}
+		if _, err := d.session.Update("obo_grants").SetMap(map[string]interface{}{
+			"active":     0,
+			"updated_at": time.Now(),
+		}).Where("id=?", id).Exec(); err != nil {
+			return err
+		}
+		// "Any active grant exists for grantor" answer may have flipped.
+		d.invalidateGrantorCache(g.GrantorUID)
+		// Per-channel cache for the paused grant's scopes also flips —
+		// before pause the channel may have answered "1" (this grant
+		// covered it); now potentially "0".
+		scopes, _ := d.listScopesByGrant(id)
+		for _, s := range scopes {
+			if s == nil {
+				continue
+			}
+			d.invalidateChannelCache(s.ChannelID, s.ChannelType)
+		}
+		return nil
+	}
+
+	// Activate path — tx + grantor row-lock + demote-others.
+	tx, err := d.session.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	// Re-read target inside the tx — the grantor_uid we use to scope
+	// the demote query MUST be the locked snapshot, not a value read
+	// before the tx began.
+	var grant *oboGrantModel
+	if _, lookupErr := tx.Select("*").From("obo_grants").
+		Where("id=?", id).
+		Suffix("FOR UPDATE").
+		Load(&grant); lookupErr != nil && !errors.Is(lookupErr, dbr.ErrNotFound) {
+		return lookupErr
+	}
+	if grant == nil {
+		// Row vanished between handler load and tx start. Treat as
+		// idempotent no-op so the caller's earlier 200 OK contract
+		// (no row → nothing to do) is preserved.
+		return nil
+	}
+
+	// Grantor-scoped lock — same posture as
+	// createOrReactivateGrantAtomic. Missing user row is tolerated:
+	// the UNIQUE on (grantor, bot) + this method's own row-lock are
+	// sufficient to keep the demote set consistent for THIS request.
+	var lockHit int
+	if lockErr := tx.SelectBySql(
+		"SELECT 1 FROM `user` WHERE uid=? FOR UPDATE", grant.GrantorUID,
+	).LoadOne(&lockHit); lockErr != nil && !errors.Is(lockErr, dbr.ErrNotFound) {
+		return lockErr
+	}
+
+	now := time.Now()
+	if _, updErr := tx.Update("obo_grants").SetMap(map[string]interface{}{
+		"active":     1,
+		"revoked_at": nil,
+		"updated_at": now,
+	}).Where("id=?", id).Exec(); updErr != nil {
+		return updErr
+	}
+
+	// Snapshot demote-set IDs for the post-commit channel-cache bust.
+	// Same struct shape used by createOrReactivateGrantAtomic.
+	type row struct {
+		ID int64 `db:"id"`
+	}
+	var demoted []*row
+	if _, scanErr := tx.SelectBySql(
+		"SELECT id FROM obo_grants WHERE grantor_uid=? AND active=1 AND id<>? FOR UPDATE",
+		grant.GrantorUID, id,
+	).Load(&demoted); scanErr != nil && !errors.Is(scanErr, dbr.ErrNotFound) {
+		return scanErr
+	}
+
+	if len(demoted) > 0 {
+		if _, demErr := tx.Update("obo_grants").SetMap(map[string]interface{}{
+			"active":         0,
+			"global_enabled": 0,
+			"revoked_at":     now,
+			"updated_at":     now,
+		}).Where("grantor_uid=? AND active=1 AND id<>?", grant.GrantorUID, id).Exec(); demErr != nil {
+			return demErr
+		}
+	}
+
+	if commitErr := tx.Commit(); commitErr != nil {
+		return commitErr
+	}
+
+	// Post-commit, best-effort cache invalidation. See
+	// createOrReactivateGrantAtomic for the same pattern + rationale.
+	d.invalidateGrantorCache(grant.GrantorUID)
+	for _, r := range demoted {
+		if r == nil || r.ID == 0 {
+			continue
+		}
+		scopes, _ := d.listScopesByGrant(r.ID)
+		for _, s := range scopes {
+			if s == nil {
+				continue
+			}
 			d.invalidateChannelCache(s.ChannelID, s.ChannelType)
 		}
 	}

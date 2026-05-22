@@ -515,6 +515,51 @@ func (f *fakeOBOStore) updateGrant(id int64, mode string, globalEnabled *int, pe
 	return nil
 }
 
+// setGrantActive — YUJ-1728 / octo-server#129. In-memory analogue of
+// the prod tx; the outer mu serializes all writes so the activate
+// path's mutex semantics fall out naturally without an explicit lock
+// dance. Mirrors the prod implementation's two paths — pause is a
+// single-row mutation, activate flips the target then demotes every
+// other active grant under the same grantor. Demotion sets
+// active=0 / global_enabled=0 / revoked_at=now so the in-memory state
+// matches what createOrReactivateGrantAtomic also produces.
+func (f *fakeOBOStore) setGrantActive(id int64, active int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureInit()
+	g, ok := f.grants[id]
+	if !ok {
+		return nil
+	}
+	v := 0
+	if active != 0 {
+		v = 1
+	}
+	if v == 0 {
+		g.Active = 0
+		return nil
+	}
+	g.Active = 1
+	g.RevokedAt = nil
+	now := time.Now()
+	for _, other := range f.grants {
+		if other == nil || other.ID == g.ID {
+			continue
+		}
+		if other.GrantorUID != g.GrantorUID {
+			continue
+		}
+		if other.Active != 1 {
+			continue
+		}
+		other.Active = 0
+		other.GlobalEnabled = 0
+		revoked := now
+		other.RevokedAt = &revoked
+	}
+	return nil
+}
+
 func (f *fakeOBOStore) revokeGrant(id int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
