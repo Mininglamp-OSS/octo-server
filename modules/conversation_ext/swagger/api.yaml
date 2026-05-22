@@ -82,8 +82,13 @@ paths:
     post:
       tags:
         - "follow"
-      summary: "取消关注群"
-      description: "将群加入黑名单（group_unfollowed=1），同时删除该群下所有子区的扩展行"
+      summary: "取消关注群（级联取关子区）"
+      description: |
+        将群加入黑名单（group_unfollowed=1），同时：
+        - 清除该群在当前用户下的 auto_follow_threads 标记，后续新建子区不再自动关注；
+        - 删除该群下所有子区的扩展行（target_type=5 LIKE prefix 级联 DELETE）。
+
+        在同一事务内 +1 user_follow_version，客户端可凭 follow_version 触发增量同步。
       operationId: "unfollowChannel"
       consumes:
         - "application/json"
@@ -117,8 +122,19 @@ paths:
     post:
       tags:
         - "follow"
-      summary: "重新关注群"
-      description: "清除群的黑名单标记（group_unfollowed=0），重新关注该群"
+      summary: "关注群（级联关注子区）"
+      description: |
+        关注该群：
+        - 清除黑名单标记（group_unfollowed=0）+ 设置 auto_follow_threads=1；
+        - 按 created_at DESC 取当前群下最多 500 个 active 子区，逐一 INSERT IGNORE
+          落 thread ext 行（已存在的行保留用户原有 follow_sort）；
+        - 之后新建子区时由服务端在 thread 创建 hook 中自动给该用户 fanout（无需客户端轮询）。
+
+        500 上限与产品侧"子区自动归档"配合：归档后子区不在 active 集合，不参与初始物化；
+        新建的子区由 fanout 在线补齐。超过 500 时按 created_at DESC 取最新，截断的是
+        最旧的子区（产品上极有可能马上被归档）。
+
+        在同一事务内 +1 user_follow_version（即便物化 N 个子区也只 +1，因为是用户级单调序列）。
       operationId: "followChannel"
       consumes:
         - "application/json"

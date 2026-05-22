@@ -24,6 +24,7 @@ package conversation_ext
 // =============================================================================
 
 import (
+	"strconv"
 	"sync"
 	"testing"
 
@@ -459,4 +460,224 @@ func TestIntegration_ListQueries_SpaceAndUserIsolation(t *testing.T) {
 	dms2, err := db.ListFollowedDM(uid1, spaceB)
 	require.NoError(t, err)
 	assert.Len(t, dms2, 0, "uid1's query on spaceB must not see uid2's rows")
+}
+
+// ---------------------------------------------------------------------------
+// Scene 7: Channel→threads cascade follow (auto_follow_threads)
+//
+// End-to-end lifecycle for the sidebar-channel-follow-cascade PR. Covers:
+//
+//   - FollowChannel materialises every active thread under the channel.
+//   - OnThreadCreated fanouts to every auto_follow=1 user but skips users who
+//     UnfollowChannel'd (auto_follow=0) or never followed.
+//   - UnfollowChannel cascade-deletes all thread ext rows AND clears
+//     auto_follow_threads so future OnThreadCreated skips this user.
+//   - Re-FollowChannel "resurrects" the cascade —— even threads previously
+//     UnfollowThread'd come back (confirmed product requirement).
+//   - UnfollowThread keeps auto_follow_threads=1 and does NOT block fanout of
+//     subsequently-created threads (since fanout only runs on creation).
+// ---------------------------------------------------------------------------
+
+// fixedThreadEnumerator 是 integration test 内用的 ThreadEnumerator 桩：
+// 由测试自己维护 (groupNo -> shortIDs) 的快照，模拟"群下当前有哪些 active 子区"。
+// 与 thread.DB 解耦让本测试不依赖 thread 模块表。
+type fixedThreadEnumerator struct {
+	groups map[string][]string
+}
+
+func (f *fixedThreadEnumerator) EnumerateActiveShortIDs(groupNo string, limit int) ([]string, error) {
+	ids := f.groups[groupNo]
+	if limit > 0 && len(ids) > limit {
+		ids = ids[:limit]
+	}
+	out := make([]string, len(ids))
+	copy(out, ids)
+	return out, nil
+}
+
+func TestIntegration_ChannelCascade_FullLifecycle(t *testing.T) {
+	_, svc := newIntegrationDB(t)
+	const space, grp = "sp-cc", "int-cc-grp"
+	const userA, userB, userC = "int-cc-A", "int-cc-B", "int-cc-C"
+
+	// 模拟群下已有 3 个 active 子区。
+	enum := &fixedThreadEnumerator{groups: map[string][]string{
+		grp: {"t1", "t2", "t3"},
+	}}
+	svc.SetThreadEnumerator(enum)
+
+	// 1. A 关注 channel → 3 个 thread ext 行被物化，auto_follow_threads=1。
+	require.NoError(t, svc.FollowChannel(userA, space, grp))
+	for _, sid := range []string{"t1", "t2", "t3"} {
+		row, err := svc.db.Get(userA, space, targetTypeThread, grp+threadSeparator+sid)
+		require.NoError(t, err)
+		assert.NotNil(t, row, "A 关注 channel 后应物化子区 %s", sid)
+	}
+	grpRow, err := svc.db.Get(userA, space, targetTypeGroup, grp)
+	require.NoError(t, err)
+	require.NotNil(t, grpRow)
+	assert.Equal(t, int8(1), grpRow.AutoFollowThreads)
+
+	// 2. B 关注但立刻取关 channel —— OnThreadCreated 应跳过 B。
+	require.NoError(t, svc.FollowChannel(userB, space, grp))
+	require.NoError(t, svc.UnfollowChannel(userB, space, grp))
+	// B 的 group 行 auto_follow_threads 必须被清零（否则 OnThreadCreated 还会找到他）。
+	bGrp, err := svc.db.Get(userB, space, targetTypeGroup, grp)
+	require.NoError(t, err)
+	require.NotNil(t, bGrp)
+	assert.Equal(t, int8(0), bGrp.AutoFollowThreads)
+	assert.Equal(t, int8(1), bGrp.GroupUnfollowed)
+
+	// 3. C 完全没操作过 channel —— OnThreadCreated 应跳过 C。
+	// （不写任何行）
+
+	// 4. 模拟新建子区 t4：thread 模块创建后会同步调用 OnThreadCreated。
+	enum.groups[grp] = append(enum.groups[grp], "t4")
+	require.NoError(t, svc.OnThreadCreated(grp, "t4"))
+
+	// Only A should have the new thread row.
+	rowA4, err := svc.db.Get(userA, space, targetTypeThread, grp+threadSeparator+"t4")
+	require.NoError(t, err)
+	assert.NotNil(t, rowA4, "A 应在 fanout 中拿到 t4")
+	rowB4, err := svc.db.Get(userB, space, targetTypeThread, grp+threadSeparator+"t4")
+	require.NoError(t, err)
+	assert.Nil(t, rowB4, "B 已 unfollow channel，不应被 fanout")
+	rowC4, err := svc.db.Get(userC, space, targetTypeThread, grp+threadSeparator+"t4")
+	require.NoError(t, err)
+	assert.Nil(t, rowC4, "C 从未关注 channel，不应被 fanout")
+
+	// 5. A 单独 UnfollowThread(t2) —— 只删 t2 一行，auto_follow_threads 保持 1。
+	require.NoError(t, svc.UnfollowThread(userA, space, grp+threadSeparator+"t2"))
+	rowAT2, err := svc.db.Get(userA, space, targetTypeThread, grp+threadSeparator+"t2")
+	require.NoError(t, err)
+	assert.Nil(t, rowAT2, "A 单独取关 t2 后该行消失")
+	aGrp2, err := svc.db.Get(userA, space, targetTypeGroup, grp)
+	require.NoError(t, err)
+	require.NotNil(t, aGrp2)
+	assert.Equal(t, int8(1), aGrp2.AutoFollowThreads, "UnfollowThread 不应清掉 channel 级 auto_follow_threads")
+
+	// 6. 新建子区 t5 —— A 仍然被 fanout（auto_follow=1 没变），但 t2 不会复活
+	//    （fanout 只在子区创建时走，UnfollowThread 后已不再有 t2 的 create 信号）。
+	enum.groups[grp] = append(enum.groups[grp], "t5")
+	require.NoError(t, svc.OnThreadCreated(grp, "t5"))
+	rowAT5, err := svc.db.Get(userA, space, targetTypeThread, grp+threadSeparator+"t5")
+	require.NoError(t, err)
+	assert.NotNil(t, rowAT5, "新建子区 t5 应继续 fanout 给 A")
+	rowAT2Again, err := svc.db.Get(userA, space, targetTypeThread, grp+threadSeparator+"t2")
+	require.NoError(t, err)
+	assert.Nil(t, rowAT2Again, "fanout 只在子区创建时走；A 单独取关过的 t2 不会因为 t5 的 fanout 而复活")
+
+	// 7. A 取消关注 channel —— 全部 thread 行级联清空 + auto_follow_threads=0。
+	require.NoError(t, svc.UnfollowChannel(userA, space, grp))
+	for _, sid := range []string{"t1", "t3", "t4", "t5"} { // t2 早就被取关
+		row, err := svc.db.Get(userA, space, targetTypeThread, grp+threadSeparator+sid)
+		require.NoError(t, err)
+		assert.Nil(t, row, "UnfollowChannel 应级联删 %s", sid)
+	}
+	aGrp3, err := svc.db.Get(userA, space, targetTypeGroup, grp)
+	require.NoError(t, err)
+	require.NotNil(t, aGrp3)
+	assert.Equal(t, int8(0), aGrp3.AutoFollowThreads)
+	assert.Equal(t, int8(1), aGrp3.GroupUnfollowed)
+
+	// 8. A 重新关注 channel —— 当前 active 子区全部"复活"（含曾被 UnfollowThread 的 t2）。
+	//    enum 现在含 t1..t5。
+	require.NoError(t, svc.FollowChannel(userA, space, grp))
+	for _, sid := range []string{"t1", "t2", "t3", "t4", "t5"} {
+		row, err := svc.db.Get(userA, space, targetTypeThread, grp+threadSeparator+sid)
+		require.NoError(t, err)
+		assert.NotNil(t, row,
+			"FollowChannel 应物化所有当前 active 子区 %s（含 A 曾单独取关的 t2 —— 用户已确认这是预期行为）",
+			sid)
+	}
+}
+
+func TestIntegration_ChannelCascade_FollowVersionBumpedOnce(t *testing.T) {
+	_, svc := newIntegrationDB(t)
+	const uid, space, grp = "int-cc-v-u", "sp-ccv", "int-cc-v-grp"
+
+	enum := &fixedThreadEnumerator{groups: map[string][]string{
+		grp: {"v1", "v2", "v3", "v4", "v5"},
+	}}
+	svc.SetThreadEnumerator(enum)
+
+	var before int64
+	_ = svc.session.SelectBySql(
+		"SELECT version FROM "+followVersionTable+" WHERE uid=? AND space_id=?",
+		uid, space,
+	).LoadOne(&before)
+
+	require.NoError(t, svc.FollowChannel(uid, space, grp))
+
+	var after int64
+	require.NoError(t, svc.session.SelectBySql(
+		"SELECT version FROM "+followVersionTable+" WHERE uid=? AND space_id=?",
+		uid, space,
+	).LoadOne(&after))
+
+	assert.Equal(t, before+1, after,
+		"FollowChannel 即便物化 5 个子区也只 bump follow_version 一次（user-level 单调）")
+}
+
+// ---------------------------------------------------------------------------
+// Performance benchmarks (用户要求：fanout N=100/1000/10000 + 单 channel 500 子区物化)
+//
+// Run via: go test -tags integration -bench=. -benchmem -run=^$ \
+//          ./modules/conversation_ext/
+//
+// 仅记录耗时供性能基线参考，不做断言（数值因机器而异）。
+// ---------------------------------------------------------------------------
+
+func benchmarkOnThreadCreatedFanout(b *testing.B, numUsers int) {
+	b.Helper()
+	t := &testing.T{}
+	_, svc := newIntegrationDB(t)
+	const space, grp = "bench-sp", "bench-grp-fanout"
+
+	// 预先：numUsers 个用户全部 auto_follow_threads=1。
+	for i := 0; i < numUsers; i++ {
+		uid := "bench-u-" + strconv.Itoa(i)
+		// 不走 FollowChannel（避免触发 enumerator），直接 upsert 群行。
+		one := int8(1)
+		zero := int8(0)
+		require.NoError(b, svc.db.Upsert(uid, space, targetTypeGroup, grp, ConvExtFields{
+			GroupUnfollowed:   &zero,
+			AutoFollowThreads: &one,
+		}))
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		// 每次跑用一个新 shortID，避免 INSERT IGNORE 第二次起全部 no-op 影响测量。
+		shortID := "bench-thr-" + strconv.Itoa(i)
+		if err := svc.OnThreadCreated(grp, shortID); err != nil {
+			b.Fatalf("OnThreadCreated failed: %v", err)
+		}
+	}
+}
+
+func BenchmarkOnThreadCreated_N100(b *testing.B)   { benchmarkOnThreadCreatedFanout(b, 100) }
+func BenchmarkOnThreadCreated_N1000(b *testing.B)  { benchmarkOnThreadCreatedFanout(b, 1000) }
+func BenchmarkOnThreadCreated_N10000(b *testing.B) { benchmarkOnThreadCreatedFanout(b, 10000) }
+
+func BenchmarkFollowChannel_Materialize500(b *testing.B) {
+	t := &testing.T{}
+	_, svc := newIntegrationDB(t)
+
+	ids := make([]string, 500)
+	for i := range ids {
+		ids[i] = "bench-thr-" + strconv.Itoa(i)
+	}
+	enum := &fixedThreadEnumerator{groups: map[string][]string{
+		"bench-grp-mat": ids,
+	}}
+	svc.SetThreadEnumerator(enum)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		uid := "bench-mat-u-" + strconv.Itoa(i)
+		if err := svc.FollowChannel(uid, "bench-sp", "bench-grp-mat"); err != nil {
+			b.Fatalf("FollowChannel failed: %v", err)
+		}
+	}
 }

@@ -344,11 +344,7 @@ func (s *Service) OnThreadCreated(groupNo, shortID string) error {
 	}
 
 	// 1. 在 tx 外把目标 (uid, space_id) 列表读出 —— 跨 N 用户的 SELECT 不参与 tx 锁。
-	type target struct {
-		UID     string `db:"uid"`
-		SpaceID string `db:"space_id"`
-	}
-	var targets []target
+	var targets []onThreadCreatedTarget
 	_, err := s.session.SelectBySql(
 		"SELECT uid, space_id FROM "+table+
 			" WHERE target_type=? AND target_id=? AND auto_follow_threads=1",
@@ -363,23 +359,70 @@ func (s *Service) OnThreadCreated(groupNo, shortID string) error {
 
 	threadChannelID := groupNo + threadSeparator + shortID
 
-	// 2. 单 tx：对每个目标用户先 bump version 再 INSERT IGNORE 一行 thread ext。
-	//    若中途失败整体回滚，避免出现"version 已 bump 但 ext 行未落"的不一致。
+	// 2. 单 tx 内批量化两次写：一次性 bump N 个 (uid, space_id) 的 version，
+	//    一次性 INSERT IGNORE N 个 thread ext 行。
+	//    锁顺序仍是 follow_version 先于 ext —— 与 FollowChannel / UpdateSort 一致。
+	//
+	//    为何不走 per-user loop：在 N=10000 用户的基准下，逐行 BumpFollowVersionTx
+	//    + InsertBySql 要 2*N 个 round-trip（~3.4s）。批量化两条 SQL 后 N=10000
+	//    降到一位数 ms（实测见 bench）。
 	return s.withTx("OnThreadCreated", func(tx *dbr.Tx) error {
-		for _, t := range targets {
-			if _, err := BumpFollowVersionTx(tx, t.UID, t.SpaceID); err != nil {
-				return fmt.Errorf("OnThreadCreated bump version (uid=%s): %w", t.UID, err)
-			}
-			if _, err := tx.InsertBySql(
-				"INSERT IGNORE INTO "+table+
-					" (uid, space_id, target_type, target_id) VALUES (?, ?, ?, ?)",
-				t.UID, t.SpaceID, targetTypeThread, threadChannelID,
-			).Exec(); err != nil {
-				return fmt.Errorf("OnThreadCreated insert thread ext (uid=%s): %w", t.UID, err)
-			}
+		if err := bulkBumpFollowVersionTx(tx, targets); err != nil {
+			return fmt.Errorf("OnThreadCreated bulk bump version: %w", err)
+		}
+		if err := bulkInsertIgnoreThreadExtForUsersTx(tx, targets, threadChannelID); err != nil {
+			return fmt.Errorf("OnThreadCreated bulk insert thread ext: %w", err)
 		}
 		return nil
 	})
+}
+
+// bulkBumpFollowVersionTx 一次性给一批 (uid, space_id) bump version +1。
+// 行不存在时初始化为 1（与 BumpFollowVersionTx 单行版语义一致）。
+//
+// SQL 用 INSERT ... ON DUPLICATE KEY UPDATE 批量插入若干 (uid, space_id, version=1)
+// 元组：已有行触发 ODKU 把 version 自增；不存在的行新建为 1。
+type onThreadCreatedTarget = struct {
+	UID     string `db:"uid"`
+	SpaceID string `db:"space_id"`
+}
+
+func bulkBumpFollowVersionTx(tx *dbr.Tx, targets []onThreadCreatedTarget) error {
+	if len(targets) == 0 {
+		return nil
+	}
+	placeholders := make([]string, len(targets))
+	args := make([]interface{}, 0, len(targets)*3)
+	for i, t := range targets {
+		placeholders[i] = "(?, ?, 1)"
+		args = append(args, t.UID, t.SpaceID)
+	}
+	_, err := tx.InsertBySql(
+		"INSERT INTO "+followVersionTable+" (uid, space_id, version) VALUES "+
+			strings.Join(placeholders, ", ")+
+			" ON DUPLICATE KEY UPDATE version = version + 1",
+		args...,
+	).Exec()
+	return err
+}
+
+func bulkInsertIgnoreThreadExtForUsersTx(tx *dbr.Tx, targets []onThreadCreatedTarget, threadChannelID string) error {
+	if len(targets) == 0 {
+		return nil
+	}
+	placeholders := make([]string, len(targets))
+	args := make([]interface{}, 0, len(targets)*4)
+	for i, t := range targets {
+		placeholders[i] = "(?, ?, ?, ?)"
+		args = append(args, t.UID, t.SpaceID, targetTypeThread, threadChannelID)
+	}
+	_, err := tx.InsertBySql(
+		"INSERT IGNORE INTO "+table+
+			" (uid, space_id, target_type, target_id) VALUES "+
+			strings.Join(placeholders, ", "),
+		args...,
+	).Exec()
+	return err
 }
 
 // ---------------------------------------------------------------------------
