@@ -52,12 +52,25 @@ func (ba *BotAPI) registerOBORoutes(r *wkhttp.WKHttp) {
 
 // ==================== Request DTOs ====================
 
+// oboPersonaPromptMaxBytes caps the length of `persona_prompt` accepted on
+// the wire (PR#109 / YUJ-1471). The fan-out path appends the prompt to
+// every dispatched copy's `obo_system_hint`; an unbounded value would
+// balloon storage, the fan-out payload, and downstream LLM token budgets.
+// 4096 bytes is generous for natural-language guidance and matches the
+// cap surfaced by the persona editor in octo-web.
+const oboPersonaPromptMaxBytes = 4096
+
 type oboCreateGrantReq struct {
 	GranteeBotUID string `json:"grantee_bot_uid"`
 	// Mode defaults to "auto" on the server. v0 rejects anything else so a
 	// client can't quietly set "draft" and expect functionality. The field
 	// is kept on the wire for forward-compat with v1.
 	Mode string `json:"mode,omitempty"`
+	// PersonaPrompt — YUJ-1465 / Mininglamp-OSS/octo-server#108 (OBO v2).
+	// Optional free-form prompt the fan-out path appends to the synthetic
+	// `obo_system_hint` string. Empty / absent preserves legacy behavior
+	// (no prompt). Stored verbatim, including newlines and Unicode.
+	PersonaPrompt string `json:"persona_prompt,omitempty"`
 }
 
 type oboUpdateGrantReq struct {
@@ -127,6 +140,15 @@ func (ba *BotAPI) oboCreateGrant(c *wkhttp.Context) {
 		c.ResponseError(errors.New("mode 仅支持 auto (v0)"))
 		return
 	}
+	// PR#109 / YUJ-1471 — persona_prompt length cap. Fan-out appends
+	// the prompt to every dispatched copy; a runaway-size prompt would
+	// balloon storage, the obo_system_hint payload, and the LLM token
+	// budget. 4096 bytes is generous for natural-language guidance and
+	// matches the cap UI surfaces (see web persona editor).
+	if len(req.PersonaPrompt) > oboPersonaPromptMaxBytes {
+		c.ResponseError(errors.New("persona_prompt 长度超过上限 (最多 4096 字节)"))
+		return
+	}
 
 	// PR#82 review #1 P1-2 / review #2 P2-3 — grantee_bot_uid must be a bot
 	// the caller owns. Lookup hits the robot table (creator_uid) joined to
@@ -150,7 +172,7 @@ func (ba *BotAPI) oboCreateGrant(c *wkhttp.Context) {
 		return
 	}
 
-	id, err := ba.oboStoreOrDefault().insertGrant(uid, req.GranteeBotUID, mode, "")
+	id, err := ba.oboStoreOrDefault().insertGrant(uid, req.GranteeBotUID, mode, req.PersonaPrompt)
 	if err != nil {
 		if isDuplicateKeyErr(err) {
 			// Reactivation path: a row already exists. If it's a soft-deleted
@@ -178,6 +200,24 @@ func (ba *BotAPI) oboCreateGrant(c *wkhttp.Context) {
 				c.ResponseError(errors.New("内部错误"))
 				return
 			}
+			// PR#109 review blocker #3 — reactivation MUST overwrite the
+			// stale persona_prompt with the new request value (including
+			// empty string, which is the explicit "clear the prompt"
+			// signal). Without this the reactivated row would silently
+			// inherit the previous persona's instructions.
+			prompt := req.PersonaPrompt
+			if updErr := ba.oboStoreOrDefault().updateGrant(existing.ID, "", nil, &prompt); updErr != nil {
+				ba.Error("reactivate persona_prompt overwrite failed",
+					zap.Error(updErr), zap.Int64("id", existing.ID))
+				c.ResponseError(errors.New("内部错误"))
+				return
+			}
+			// YUJ-1465 / YUJ-1471 — v2 grant mutex. Demote any other
+			// active grant under the same grantor so only the
+			// just-(re)activated grant remains active. Best-effort:
+			// errors here are logged but not surfaced; the
+			// reactivation itself already succeeded.
+			ba.demoteOtherActiveGrants(uid, existing.ID)
 			refreshed, _ := ba.oboStoreOrDefault().findGrantByID(existing.ID)
 			if refreshed != nil {
 				c.Response(refreshed)
@@ -190,6 +230,11 @@ func (ba *BotAPI) oboCreateGrant(c *wkhttp.Context) {
 		c.ResponseError(errors.New("内部错误"))
 		return
 	}
+	// YUJ-1465 / YUJ-1471 — v2 grant mutex. After a successful fresh
+	// insert, demote every OTHER active grant the same grantor owns
+	// (different grantee bot) so at most one persona is live per
+	// grantor at any time. Best-effort: errors logged, not surfaced.
+	ba.demoteOtherActiveGrants(uid, id)
 	grant, err := ba.oboStoreOrDefault().findGrantByID(id)
 	if err != nil || grant == nil {
 		// Insert succeeded but read-back failed — return the bare ID so the
@@ -215,6 +260,39 @@ func (ba *BotAPI) oboListGrants(c *wkhttp.Context) {
 		return
 	}
 	c.Response(map[string]interface{}{"items": grants})
+}
+
+// demoteOtherActiveGrants — YUJ-1465 / YUJ-1471 v2 grant mutex helper.
+// Iterates over every grant owned by `grantorUID` and soft-deletes any
+// row that is currently active=1 and is NOT `keepID`. Best-effort: any
+// per-row error is logged and skipped so the caller cannot fail the
+// (re)activation it already succeeded with.
+//
+// Called from oboCreateGrant after a successful insert / reactivate so
+// only the just-(re)activated grant stays active. Mirrors the
+// "createOrReactivateGrantAtomic" semantics that the original PR#109
+// implementation provided via a single transaction; the in-handler
+// loop is acceptable here because the grant set per grantor is small
+// (typically 1-3 rows) and the operation is rare (only on create /
+// reactivate, never on the fan-out hot path).
+func (ba *BotAPI) demoteOtherActiveGrants(grantorUID string, keepID int64) {
+	grants, err := ba.oboStoreOrDefault().listGrantsByGrantor(grantorUID)
+	if err != nil {
+		ba.Warn("demoteOtherActiveGrants list failed",
+			zap.Error(err), zap.String("grantor", grantorUID))
+		return
+	}
+	for _, g := range grants {
+		if g == nil || g.ID == keepID || g.Active != 1 {
+			continue
+		}
+		if revErr := ba.oboStoreOrDefault().revokeGrant(g.ID); revErr != nil {
+			ba.Warn("demoteOtherActiveGrants revoke failed",
+				zap.Error(revErr),
+				zap.String("grantor", grantorUID),
+				zap.Int64("id", g.ID))
+		}
+	}
 }
 
 // oboDeleteGrant — DELETE /v1/obo/grants/:id. Soft delete (revoke). Caller
@@ -256,6 +334,12 @@ func (ba *BotAPI) oboUpdateGrant(c *wkhttp.Context) {
 	}
 	if req.Mode != "" && req.Mode != "auto" {
 		c.ResponseError(errors.New("mode 仅支持 auto (v0)"))
+		return
+	}
+	// PR#109 / YUJ-1471 — persona_prompt length cap. Same rationale as
+	// the create handler; rejected before any DB work hits the row.
+	if req.PersonaPrompt != nil && len(*req.PersonaPrompt) > oboPersonaPromptMaxBytes {
+		c.ResponseError(errors.New("persona_prompt 长度超过上限 (最多 4096 字节)"))
 		return
 	}
 	if req.Mode == "" && req.GlobalEnabled == nil && req.PersonaPrompt == nil {

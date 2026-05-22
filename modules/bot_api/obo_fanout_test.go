@@ -89,7 +89,7 @@ func TestFanout_Happy(t *testing.T) {
 		FromUID:     "alice", // some random sender, NOT bot, NOT grantor
 		ChannelID:   ch,
 		ChannelType: ct,
-		Payload:     []byte(`{"type":1,"content":"hello yu"}`),
+		Payload:     []byte(`{"type":1,"content":"hello yu","mention":{"uids":["user_yu"]}}`),
 	}
 	got := ba.fanoutForMessage(msg)
 	if got != 1 {
@@ -225,7 +225,7 @@ func TestFanout_Gate3_LegacyMarkerIgnored(t *testing.T) {
 		FromUID:     "alice",
 		ChannelID:   ch,
 		ChannelType: ct,
-		Payload:     []byte(`{"type":1,"content":"forged","obo_processed":true}`),
+		Payload:     []byte(`{"type":1,"content":"forged","obo_processed":true,"mention":{"uids":["user_yu"]}}`),
 	}
 	if n := ba.fanoutForMessage(msg); n != 1 {
 		t.Fatalf("legacy obo_processed marker must NOT short-circuit gate 3, want fan-out=1 got %d", n)
@@ -357,7 +357,7 @@ func TestFanout_GrantorMembershipRevoked_SkipsCopy(t *testing.T) {
 		FromUID:     "alice",
 		ChannelID:   ch,
 		ChannelType: ct,
-		Payload:     []byte(`{"type":1,"content":"hello yu"}`),
+		Payload:     []byte(`{"type":1,"content":"hello yu","mention":{"uids":["user_yu"]}}`),
 	}
 	if n := ba.fanoutForMessage(msg); n != 0 {
 		t.Fatalf("grantor lost access, expected 0 fan-out copies, got %d", n)
@@ -397,7 +397,7 @@ func TestFanout_GrantorMembershipRevoked_DBErrorSkipsCopy(t *testing.T) {
 		FromUID:     "alice",
 		ChannelID:   ch,
 		ChannelType: ct,
-		Payload:     []byte(`{"type":1,"content":"hello yu"}`),
+		Payload:     []byte(`{"type":1,"content":"hello yu","mention":{"uids":["user_yu"]}}`),
 	}
 	if n := ba.fanoutForMessage(msg); n != 0 {
 		t.Fatalf("DB error on access re-check must fail closed, got %d", n)
@@ -557,7 +557,7 @@ func TestFanout_DMUnrelatedPeer_NoMatch(t *testing.T) {
 		FromUID:     otherPeer,
 		ChannelID:   tGrantor,
 		ChannelType: ct,
-		Payload:     []byte(`{"type":1,"content":"hi yu"}`),
+		Payload:     []byte(`{"type":1,"content":"hi yu","mention":{"uids":["user_yu"]}}`),
 	}
 	if n := ba.fanoutForMessage(msg); n != 0 {
 		t.Fatalf("unscoped DM peer must not fan out, got %d", n)
@@ -706,7 +706,7 @@ func TestFanout_DMSingleGrantor_RecipientReceives(t *testing.T) {
 		FromUID:     peer,
 		ChannelID:   tGrantor,
 		ChannelType: ct,
-		Payload:     []byte(`{"type":1,"content":"hello yu"}`),
+		Payload:     []byte(`{"type":1,"content":"hello yu","mention":{"uids":["user_yu"]}}`),
 	}
 	if n := ba.fanoutForMessage(msg); n != 1 {
 		t.Fatalf("single-grantor DM happy path: expected 1 fan-out, got %d", n)
@@ -838,7 +838,7 @@ func TestFanout_OriginalSenderHasNoConversationLeak(t *testing.T) {
 				FromUID:     tc.fromUID,
 				ChannelID:   tc.channelID,
 				ChannelType: tc.ct,
-				Payload:     []byte(`{"type":1,"content":"private to admin"}`),
+				Payload:     []byte(`{"type":1,"content":"private to admin","mention":{"uids":["user_yu"]}}`),
 			}
 			if n := ba.fanoutForMessage(msg); n != 1 {
 				t.Fatalf("expected 1 dispatch, got %d", n)
@@ -931,7 +931,7 @@ func TestFanout_DispatchReq_NoConflict_ChannelOrSubscribers(t *testing.T) {
 					FromUID:     "alice",
 					ChannelID:   scope,
 					ChannelType: common.ChannelTypeGroup.Uint8(),
-					Payload:     []byte(`{"type":1,"content":"hi group"}`),
+					Payload:     []byte(`{"type":1,"content":"hi group","mention":{"uids":["user_yu"]}}`),
 				}
 			},
 		},
@@ -971,7 +971,7 @@ func TestFanout_DispatchReq_NoConflict_ChannelOrSubscribers(t *testing.T) {
 					FromUID:     "alice",
 					ChannelID:   scope,
 					ChannelType: common.ChannelTypeCommunityTopic.Uint8(),
-					Payload:     []byte(`{"type":1,"content":"hi topic"}`),
+					Payload:     []byte(`{"type":1,"content":"hi topic","mention":{"uids":["user_yu"]}}`),
 				}
 			},
 		},
@@ -1025,7 +1025,7 @@ func TestFanout_DispatchReq_BotReceivesViaOwnChannel(t *testing.T) {
 		ChannelID:    ch,
 		ChannelType:  ct,
 		MessageIDStr: "origin_msg_42",
-		Payload:      []byte(`{"type":1,"content":"hi yu"}`),
+		Payload:      []byte(`{"type":1,"content":"hi yu","mention":{"uids":["user_yu"]}}`),
 	}
 	if n := ba.fanoutForMessage(msg); n != 1 {
 		t.Fatalf("expected 1 dispatch, got %d", n)
@@ -1141,7 +1141,7 @@ func TestFanout_DispatchReq_RealDispatcher_ContractCheck(t *testing.T) {
 		FromUID:     "u_bob",
 		ChannelID:   ch,
 		ChannelType: ct,
-		Payload:     []byte(`{"type":1,"content":"hi yu"}`),
+		Payload:     []byte(`{"type":1,"content":"hi yu","mention":{"uids":["user_yu"]}}`),
 	}
 	if n := ba.fanoutForMessage(msg); n != 1 {
 		t.Fatalf("fan-out should succeed against contract-respecting WuKongIM, got %d (rejections=%v)", n, rejected)
@@ -1191,7 +1191,7 @@ func TestFanout_ImplicitScope_GrantorMember_BotNotMember(t *testing.T) {
 		FromUID:     "u_alice", // not bot, not grantor
 		ChannelID:   groupNo,
 		ChannelType: ct,
-		Payload:     []byte(`{"type":1,"content":"hello implicit-scope"}`),
+		Payload:     []byte(`{"type":1,"content":"hello implicit-scope","mention":{"uids":["user_yu"]}}`),
 	}
 	if n := ba.fanoutForMessage(msg); n != 1 {
 		t.Fatalf("implicit-scope grantor-member happy path: expected 1 fan-out, got %d", n)

@@ -13,7 +13,6 @@ package bot_api
 import (
 	"errors"
 
-	"github.com/Mininglamp-OSS/octo-lib/common"
 	"go.uber.org/zap"
 )
 
@@ -102,7 +101,7 @@ func (ba *BotAPI) checkOBO(botUID, grantor, channelID string, channelType uint8)
 			zap.Error(scopeExistErr))
 		return scopeExistErr
 	}
-	if !ok && !hasExplicitScope && grant.GlobalEnabled == 1 && channelType == common.ChannelTypeGroup.Uint8() {
+	if !ok && !hasExplicitScope && grant.GlobalEnabled == 1 && isGroupLikeChannelType(channelType) {
 		isMember, mErr := ba.grantorCanReadChannel(grantor, channelID, channelType)
 		if mErr != nil {
 			ba.Error("OBO implicit-scope membership check failed",

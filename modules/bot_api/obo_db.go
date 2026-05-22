@@ -46,6 +46,31 @@ import (
 
 // ==================== Models ====================
 
+// isGroupLikeChannelType reports whether channelType is a "group-shaped"
+// type (Group / CommunityTopic) for which an OBO grant with
+// `global_enabled=1` covers EVERY group/topic the grantor participates in
+// without requiring a per-channel `obo_scopes` row.
+//
+// YUJ-1538 rationale: PR#82 / PR#109 v1+v2 modeled scopes as a strict
+// white-list — the grantor explicitly enumerated each channel they
+// wanted the persona to observe. In practice operators only ever
+// installed `channel_type=1` (DM) scopes; for groups the v2 fan-out
+// narrowing gate (`mention.uids` must contain the grantor) is the
+// effective opt-in signal, not a scope row. The fan-out trigger query
+// must therefore not require scope rows for group/topic channels — a
+// `global_enabled=1` grant suffices, and the per-grant
+// `grantorCanReadChannel` re-check inside fanoutForMessage still
+// enforces live membership.
+//
+// DM (Person) channels keep the strict scope-row contract: a DM is a
+// 1:1 conversation that the persona must be explicitly authorized for,
+// and the @grantor narrowing gate cannot be applied (DM payloads carry
+// no mention).
+func isGroupLikeChannelType(channelType uint8) bool {
+	return channelType == common.ChannelTypeGroup.Uint8() ||
+		channelType == common.ChannelTypeCommunityTopic.Uint8()
+}
+
 // oboGrantModel mirrors the obo_grants row. JSON tags are reused by HTTP
 // handlers, which return rows verbatim (v0 has no nuanced DTOs).
 //
@@ -107,6 +132,22 @@ type oboStore interface {
 	scopeEnabled(grantID int64, channelID string, channelType uint8) (bool, error)
 	scopeRowExists(grantID int64, channelID string, channelType uint8) (bool, error)
 	findActiveGrantsForChannel(channelID string, channelType uint8) ([]*oboGrantModel, error)
+	// findActiveGrantsForChannelByGrantors — PR#114 R3 (Jerry-Xin).
+	// Group-like-only fan-out lookup that filters at the DB layer by the
+	// explicit `mention.uids` set. Returns the subset of grants where
+	// `g.grantor_uid IN (grantorUIDs)` AND `g.active=1 AND
+	// g.global_enabled=1`. An empty / nil grantorUIDs slice returns an
+	// empty result with no DB round-trip — callers should treat the
+	// "no mentions" case at the fan-out layer instead of asking the DB.
+	// DM (Person) MUST NOT call this method (no mention semantics on DMs).
+	//
+	// PR#114 R4 — this method MUST NOT read or write the channel-wide
+	// `obo:chan:{type}:{id}` cache: the result is a UID-scoped subset
+	// and cannot prove the channel-wide negative answer the cache
+	// encodes. Writing it would suppress legitimate fan-out for OTHER
+	// grantors; reading a cross-namespace DM write would suppress
+	// legitimate group fan-outs.
+	findActiveGrantsForChannelByGrantors(channelID string, channelType uint8, grantorUIDs []string) ([]*oboGrantModel, error)
 	findGlobalGrantsWithoutScope(channelID string, channelType uint8) ([]*oboGrantModel, error)
 
 	// CRUD used by the REST layer.
@@ -302,6 +343,50 @@ func (d *botAPIDB) findActiveGrantsForChannel(channelID string, channelType uint
 		grants = []*oboGrantModel{}
 	}
 	d.writeChannelCache(channelID, channelType, len(grants) > 0)
+	return grants, nil
+}
+
+// findActiveGrantsForChannelByGrantors — PR#114 R3 (Jerry-Xin perf
+// blocker). UID-FILTERED variant of findActiveGrantsForChannel for the
+// group-like fan-out path: when a message in a group / community-topic
+// explicitly @-mentions one or more grantor UIDs, the fan-out hot path
+// passes that set as `grantorUIDs` and the DB filters to just those
+// rows instead of returning every system-wide grant.
+//
+// PR#114 R4 invariant: this method MUST NOT consult or update the
+// channel-wide `obo:chan:{type}:{id}` cache in either direction. The
+// result is a UID-scoped subset and cannot prove the channel-wide
+// negative answer the cache encodes. See the function doc on
+// channelCacheSaysNone / writeChannelCache for the poisoning scenario.
+func (d *botAPIDB) findActiveGrantsForChannelByGrantors(channelID string, channelType uint8, grantorUIDs []string) ([]*oboGrantModel, error) {
+	if channelID == "" || len(grantorUIDs) == 0 {
+		return []*oboGrantModel{}, nil
+	}
+	if !isGroupLikeChannelType(channelType) {
+		return []*oboGrantModel{}, nil
+	}
+	// Build the `IN (?,?,?...)` placeholder list. dbr handles the bind
+	// expansion when we pass a []string, but we go through the explicit
+	// placeholder shape so the SQL string is debuggable in slow-query
+	// logs.
+	placeholders := make([]string, 0, len(grantorUIDs))
+	args := make([]interface{}, 0, len(grantorUIDs))
+	for _, u := range grantorUIDs {
+		placeholders = append(placeholders, "?")
+		args = append(args, u)
+	}
+	sqlStr := "SELECT " + oboGrantColumns + " FROM obo_grants " +
+		"WHERE active=1 AND global_enabled=1 AND grantor_uid IN (" +
+		strings.Join(placeholders, ",") + ")"
+	var grants []*oboGrantModel
+	_, err := d.session.SelectBySql(sqlStr, args...).Load(&grants)
+	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
+		return nil, err
+	}
+	if grants == nil {
+		grants = []*oboGrantModel{}
+	}
+	// Intentionally NO cache write: PR#114 R4.
 	return grants, nil
 }
 
