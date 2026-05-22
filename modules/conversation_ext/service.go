@@ -331,6 +331,13 @@ func (s *Service) FollowChannel(uid, spaceID, groupNo string) error {
 	// ext 等 version、UnfollowChannel 持 version 等 ext 会构成 InnoDB 死锁循环，
 	// 一个 tx 被回滚 —— Phase 3 受害时表现为 auto_follow=1 已 commit 但子区永不物化。
 	// 代价：用户已取关时本次也会 +1 一次 version（无害，客户端多刷一次 sidebar）。
+	//
+	// 为何不像 OnThreadCreated batch 那样包 withDeadlockRetry：Phase 3 是单用户单 tx，
+	// 与并发同用户写的 deadlock 概率极低（要 (UnfollowChannel | UpdateSort) 也同时进入
+	// 对同一 uid 的 tx 才行）；偶发死锁时 InnoDB 回滚 Phase 3，Phase 1 的 auto_follow=1
+	// 已 commit，下次新建子区的 OnThreadCreated 仍能 fanout，用户只是初次物化的旧
+	// 子区缺一批 —— 可由用户再点一次"关注"恢复。OnThreadCreated 因为多用户 + 大批
+	// 同时进 tx，死锁概率远高，所以才需要重试兜底。
 	return s.withTx("FollowChannel-phase3", func(tx *dbr.Tx) error {
 		if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
 			return fmt.Errorf("FollowChannel phase3 bump version: %w", err)
@@ -344,7 +351,7 @@ func (s *Service) FollowChannel(uid, spaceID, groupNo string) error {
 			// version 已 +1（一次额外刷新，benign）。
 			return nil
 		}
-		if err := bulkInsertIgnoreThreadExtTx(tx, uid, spaceID, groupNo, shortIDs); err != nil {
+		if err := bulkInsertThreadExtForChannelMaterializeTx(tx, uid, spaceID, groupNo, shortIDs); err != nil {
 			return fmt.Errorf("FollowChannel phase3 materialize threads: %w", err)
 		}
 		return nil
@@ -378,11 +385,11 @@ func isChannelStillAutoFollowedTx(tx *dbr.Tx, uid, spaceID, groupNo string) (boo
 	return row.AutoFollow == 1 && row.Unfollowed == 0, nil
 }
 
-// bulkInsertIgnoreThreadExtTx 给 (uid, spaceID) 在 user_conversation_ext 表中
+// bulkInsertThreadExtForChannelMaterializeTx 给 (uid, spaceID) 在 user_conversation_ext 表中
 // 批量插入 target_type=5 子区行。已存在的行（含用户手动调过 follow_sort 的）
 // 因 INSERT IGNORE 保持不变 —— 这是 FollowChannel 既不覆盖用户既有排序也能
 // 一次性补齐缺失行的关键。
-func bulkInsertIgnoreThreadExtTx(tx *dbr.Tx, uid, spaceID, groupNo string, shortIDs []string) error {
+func bulkInsertThreadExtForChannelMaterializeTx(tx *dbr.Tx, uid, spaceID, groupNo string, shortIDs []string) error {
 	if len(shortIDs) == 0 {
 		return nil
 	}
@@ -512,7 +519,7 @@ func (s *Service) OnThreadCreated(groupNo, shortID string) error {
 	//           只锁 version 行；
 	//        b) selectEligibleForFanoutTx —— SELECT ... FOR UPDATE on ext 群行，
 	//           过滤出仍处于 auto_follow=1 AND group_unfollowed=0 的子集；
-	//        c) bulkInsertIgnoreThreadExtForUsersTx —— INSERT VALUES on ext 子区行，
+	//        c) bulkInsertThreadExtForFanoutUsersTx —— INSERT VALUES on ext 子区行，
 	//           只锁新写入的 ext 行。
 	//    - 关键修正（Jerry-Xin round-3 P1）：上一版用 INSERT ... SELECT FROM ext
 	//      在 REPEATABLE READ 下会先对 ext 加 S-lock 再写 version，反序锁可与
@@ -544,7 +551,7 @@ func (s *Service) OnThreadCreated(groupNo, shortID string) error {
 				if err != nil {
 					return fmt.Errorf("OnThreadCreated eligible select: %w", err)
 				}
-				if err := bulkInsertIgnoreThreadExtForUsersTx(tx, eligible, threadChannelID); err != nil {
+				if err := bulkInsertThreadExtForFanoutUsersTx(tx, eligible, threadChannelID); err != nil {
 					return fmt.Errorf("OnThreadCreated bulk insert thread ext: %w", err)
 				}
 				return nil
@@ -668,13 +675,13 @@ func selectEligibleForFanoutTx(tx *dbr.Tx, targets []onThreadCreatedTarget, grou
 	return eligible, err
 }
 
-// bulkInsertIgnoreThreadExtForUsersTx 给一批已经过资格 re-check（selectEligibleForFanoutTx
+// bulkInsertThreadExtForFanoutUsersTx 给一批已经过资格 re-check（selectEligibleForFanoutTx
 // 返回的）的 (uid, space_id) 写入 target_type=5 的 thread ext 行。
 //
 // 用 INSERT IGNORE ... VALUES 而非 INSERT ... SELECT —— 不读 user_conversation_ext，
 // 不会拿 source 表的 S-lock，避免与 bulkBumpFollowVersionTx 形成反向锁序
 // （同 Jerry-Xin round-3 P1 反馈）。
-func bulkInsertIgnoreThreadExtForUsersTx(tx *dbr.Tx, eligible []onThreadCreatedTarget, threadChannelID string) error {
+func bulkInsertThreadExtForFanoutUsersTx(tx *dbr.Tx, eligible []onThreadCreatedTarget, threadChannelID string) error {
 	if len(eligible) == 0 {
 		return nil
 	}

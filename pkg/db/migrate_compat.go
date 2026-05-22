@@ -143,21 +143,38 @@ func RewriteLegacyMigrationIDs(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
-// threadModuleMigrationIDs is the deterministic list of migration files that
-// own the thread/thread_member/thread_setting tables. It's deliberately
-// hard-coded here rather than discovered from disk: this function runs
-// before sql-migrate boots and we need to enumerate exactly the IDs we
-// expect to skip when the schema is already present.
+// threadModuleSnapshotMigrationIDs lists the thread-module migration files
+// whose effects are **already present** in the init-db.sql snapshot. These
+// get pre-seeded into gorp_migrations on snapshot installs so sql-migrate
+// treats them as already-applied and skips the CREATE TABLE / ADD COLUMN
+// statements (which would otherwise hit Error 1050 on existing tables).
 //
-// Keep this in sync with modules/thread/sql/*.sql. The
-// TestThreadModuleMigrationIDsMatchDisk test in this package catches drift.
-var threadModuleMigrationIDs = []string{
+// !! When you move an ID into this list, the init-db.sql snapshot MUST
+// already include the corresponding DDL. TestThreadModuleMigrationIDsMatchDisk
+// can only check ID coverage, not whether the SQL actually landed in the
+// snapshot — wrongly promoting an entry here silently skips a real DDL on
+// snapshot installs. Always update the snapshot in the same change.
+var threadModuleSnapshotMigrationIDs = []string{
 	"20260402000001_thread_legacy01.sql",
 	"20260402000002_thread_legacy02.sql",
 	"20260410000003_thread_legacy01.sql",
 	"20260413000001_thread_legacy01.sql",
 	"20260422000001_thread_legacy01.sql",
 	"20260511000001_thread_legacy01.sql",
+}
+
+// threadModulePostSnapshotMigrationIDs lists thread-module migrations added
+// **after** the init-db.sql snapshot baseline. They are **not** pre-seeded
+// in ReconcileThreadSchemaRecords — sql-migrate will detect them as pending
+// and apply them on snapshot installs.
+//
+// Background (Jerry-Xin PR #123 round-4 warning): adding an ADD-INDEX-only
+// migration to the snapshot list would let ReconcileThreadSchemaRecords
+// mark it as already applied without ever creating the index, producing
+// invisible schema drift. So new post-snapshot migrations go here instead;
+// TestThreadModuleMigrationIDsMatchDisk asserts the union covers every file
+// on disk so drift in either direction surfaces in CI.
+var threadModulePostSnapshotMigrationIDs = []string{
 	"20260522000002_thread_group_status_created_index.sql",
 }
 
@@ -232,9 +249,12 @@ func ReconcileThreadSchemaRecords(ctx context.Context, db *sql.DB) error {
 	// seeding only the missing IDs there would silently mark unapplied
 	// schema changes as applied and let sql-migrate skip them, producing
 	// invisible schema drift.
+	// Pre-seed only the snapshot-baseline IDs. Post-snapshot migrations
+	// (e.g. new ADD INDEX) must remain as "pending" so sql-migrate.Exec
+	// actually applies them.
 	var toRecord []string
 	var anyPresent bool
-	for _, id := range threadModuleMigrationIDs {
+	for _, id := range threadModuleSnapshotMigrationIDs {
 		if existing[id] {
 			anyPresent = true
 		} else {

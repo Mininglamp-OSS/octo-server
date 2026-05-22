@@ -287,7 +287,7 @@ func TestReconcileThreadSchemaRecords(t *testing.T) {
 		mock.ExpectBegin()
 		stmt := mock.ExpectPrepare(regexp.QuoteMeta(
 			"INSERT IGNORE INTO gorp_migrations (id, applied_at) VALUES (?, NOW())"))
-		for _, id := range threadModuleMigrationIDs {
+		for _, id := range threadModuleSnapshotMigrationIDs {
 			stmt.ExpectExec().WithArgs(id).WillReturnResult(sqlmock.NewResult(0, 1))
 		}
 		mock.ExpectCommit()
@@ -316,7 +316,7 @@ func TestReconcileThreadSchemaRecords(t *testing.T) {
 		// (a hypothetical ADD INDEX in a later release) is genuinely
 		// pending and must be left for sql-migrate to apply.
 		rows := sqlmock.NewRows([]string{"id"})
-		for _, id := range threadModuleMigrationIDs[:5] {
+		for _, id := range threadModuleSnapshotMigrationIDs[:5] {
 			rows.AddRow(id)
 		}
 		mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM gorp_migrations")).WillReturnRows(rows)
@@ -337,7 +337,7 @@ func TestReconcileThreadSchemaRecords(t *testing.T) {
 			"SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'gorp_migrations'")).
 			WillReturnRows(sqlmock.NewRows([]string{"TABLE_NAME"}).AddRow("gorp_migrations"))
 		rows := sqlmock.NewRows([]string{"id"})
-		for _, id := range threadModuleMigrationIDs {
+		for _, id := range threadModuleSnapshotMigrationIDs {
 			rows.AddRow(id)
 		}
 		mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM gorp_migrations")).WillReturnRows(rows)
@@ -350,10 +350,19 @@ func TestReconcileThreadSchemaRecords(t *testing.T) {
 }
 
 // TestThreadModuleMigrationIDsMatchDisk catches drift between the
-// hard-coded ID list used by the shim and the actual files in
-// modules/thread/sql/. A new thread migration without a corresponding
-// entry here would leave that ID un-pre-seeded, defeating the whole
-// reconciliation. Surface the mismatch in CI rather than in production.
+// hard-coded ID lists used by the shim and the actual files in
+// modules/thread/sql/. The contract is:
+//
+//   - Every .sql file on disk MUST appear in exactly one of
+//     threadModuleSnapshotMigrationIDs or threadModulePostSnapshotMigrationIDs.
+//   - Snapshot-baseline migrations get pre-seeded by ReconcileThreadSchemaRecords;
+//     post-snapshot migrations stay pending so sql-migrate.Exec applies them.
+//
+// A file missing from both lists would leave its ID un-pre-seeded for snapshot
+// installs (potential Error 1050 on the next sql-migrate.Exec). A file in both
+// lists is also flagged because the pre-seed semantics conflict.
+//
+// Surface the mismatch in CI rather than in production.
 func TestThreadModuleMigrationIDsMatchDisk(t *testing.T) {
 	dir := filepath.Join("..", "..", "modules", "thread", "sql")
 	entries, err := os.ReadDir(dir)
@@ -368,11 +377,26 @@ func TestThreadModuleMigrationIDsMatchDisk(t *testing.T) {
 		onDisk = append(onDisk, e.Name())
 	}
 	sort.Strings(onDisk)
-	got := append([]string(nil), threadModuleMigrationIDs...)
-	sort.Strings(got)
 
-	if !equalStrSlices(onDisk, got) {
-		t.Errorf("threadModuleMigrationIDs drifted from modules/thread/sql/:\n  on disk: %v\n  in code: %v", onDisk, got)
+	combined := append([]string(nil), threadModuleSnapshotMigrationIDs...)
+	combined = append(combined, threadModulePostSnapshotMigrationIDs...)
+	sort.Strings(combined)
+
+	if !equalStrSlices(onDisk, combined) {
+		t.Errorf("thread migration ID lists drifted from modules/thread/sql/:\n  on disk: %v\n  snapshot+post: %v", onDisk, combined)
+	}
+
+	// Detect duplicates across the two lists — pre-seed semantics would
+	// conflict (snapshot says "already applied", post-snapshot says "still
+	// pending"); only one can be right per ID.
+	seen := map[string]string{}
+	for _, id := range threadModuleSnapshotMigrationIDs {
+		seen[id] = "snapshot"
+	}
+	for _, id := range threadModulePostSnapshotMigrationIDs {
+		if where, dup := seen[id]; dup {
+			t.Errorf("migration %q listed in both %s and post-snapshot lists; pick one", id, where)
+		}
 	}
 }
 
