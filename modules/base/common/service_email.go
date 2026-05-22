@@ -266,7 +266,6 @@ func (s *EmailService) dispatchSMTP(ctx context.Context, smtpAddr, fromSan, pwd,
 	if err != nil {
 		return fmt.Errorf("smtp地址格式错误: %w", err)
 	}
-	auth := smtp.PlainAuth("", fromSan, pwd, host)
 
 	dialer := &net.Dialer{Timeout: smtpDialTimeout}
 	var conn net.Conn
@@ -303,7 +302,29 @@ func (s *EmailService) dispatchSMTP(ctx context.Context, smtpAddr, fromSan, pwd,
 		}
 	}
 
+	// Choose auth mechanism based on server's EHLO advertisement.
+	// Prefer PLAIN (widely supported, simpler); fall back to LOGIN for
+	// servers like Microsoft Exchange Online that only offer LOGIN.
+	auth := s.chooseAuth(client, fromSan, pwd, host)
+
 	return runSMTPTransaction(client, auth, fromSan, toSan, msg)
+}
+
+// chooseAuth picks the best smtp.Auth based on the server's advertised AUTH
+// mechanisms. PLAIN is preferred; LOGIN is the fallback (needed for Microsoft
+// Exchange Online which only advertises "AUTH LOGIN XOAUTH2").
+func (s *EmailService) chooseAuth(client *smtp.Client, username, password, host string) smtp.Auth {
+	if ok, authStr := client.Extension("AUTH"); ok {
+		mechs := strings.ToUpper(authStr)
+		if strings.Contains(mechs, "PLAIN") {
+			return smtp.PlainAuth("", username, password, host)
+		}
+		if strings.Contains(mechs, "LOGIN") {
+			return LoginAuth(username, password)
+		}
+	}
+	// Default to PLAIN when server doesn't advertise (legacy behavior).
+	return smtp.PlainAuth("", username, password, host)
 }
 
 // runSMTPTransaction 跑完一次 SMTP 投递：Auth → Mail → Rcpt → Data → Quit。
@@ -337,6 +358,37 @@ const (
 	smtpDialTimeout = 15 * time.Second
 	smtpIOTimeout   = 60 * time.Second
 )
+
+// loginAuth implements smtp.Auth for the LOGIN mechanism.
+// Go's standard library only provides PlainAuth (AUTH PLAIN); servers like
+// Microsoft Exchange Online that only advertise AUTH LOGIN will reject PLAIN
+// with "504 5.7.4 Unrecognized authentication type".
+type loginAuth struct {
+	username, password string
+}
+
+// LoginAuth returns an smtp.Auth that implements the LOGIN mechanism.
+func LoginAuth(username, password string) smtp.Auth {
+	return &loginAuth{username, password}
+}
+
+func (a *loginAuth) Start(server *smtp.ServerInfo) (string, []byte, error) {
+	return "LOGIN", nil, nil
+}
+
+func (a *loginAuth) Next(fromServer []byte, more bool) ([]byte, error) {
+	if !more {
+		return nil, nil
+	}
+	switch string(fromServer) {
+	case "Username:":
+		return []byte(a.username), nil
+	case "Password:":
+		return []byte(a.password), nil
+	default:
+		return nil, fmt.Errorf("unexpected server challenge: %s", fromServer)
+	}
+}
 
 // resolveSMTP returns the effective SMTP config: admin-tunable values from
 // the injected provider win over yaml; a missing provider (legacy callers
