@@ -129,6 +129,31 @@ type oboScopeModel struct {
 //     enabled=1. Empty slice (not nil) on no match keeps callers branch-free.
 type oboStore interface {
 	findActiveGrantByGrantorBot(grantorUID, granteeBotUID string) (*oboGrantModel, error)
+	// findGrantByGrantorBotActiveOnly — YUJ-1428 / restored after PR#121
+	// R5 / B3 rebase regression. Same shape as
+	// findActiveGrantByGrantorBot but ONLY filters on active=1 (the
+	// `global_enabled` master switch is intentionally NOT consulted).
+	//
+	// Why a separate method instead of a parameter: the existing
+	// findActiveGrantByGrantorBot is the auth gate for third-party OBO
+	// sends (checkOBO) and MUST keep requiring global_enabled=1 — the
+	// global switch is the user-facing "stop letting this persona fan
+	// out my messages" kill switch and silently demoting it on the hot
+	// path would re-open exactly the class of bug the switch exists to
+	// solve. The grantor-reply bypass is a different concern: a bot
+	// must always be able to reply to its OWN grantor in DM as long
+	// as the grant is not revoked (active=1), independent of the
+	// global fan-out switch. Splitting the methods keeps both call
+	// sites locked to the right contract at compile time.
+	//
+	// Also intentionally does NOT consult the `obo:grantor:{uid}`
+	// negative cache: that cache is populated based on
+	// (active=1 AND global_enabled=1) and would falsely return
+	// "no grant" for a grantor who has an active grant with the
+	// global switch off. The bypass call is on the DM reply path,
+	// not the system-wide fan-out path, so the per-call MySQL probe
+	// is acceptable.
+	findGrantByGrantorBotActiveOnly(grantorUID, granteeBotUID string) (*oboGrantModel, error)
 	scopeEnabled(grantID int64, channelID string, channelType uint8) (bool, error)
 	scopeRowExists(grantID int64, channelID string, channelType uint8) (bool, error)
 	findActiveGrantsForChannel(channelID string, channelType uint8) ([]*oboGrantModel, error)
@@ -176,6 +201,42 @@ type oboStore interface {
 	// Returns nil on missing row so callers can treat reactivation as
 	// idempotent. See findGrantByGrantorBot for the lookup pattern.
 	reactivateGrant(id int64) error
+	// createOrReactivateGrantAtomic — YUJ-1471 / PR#109 review blocker #2
+	// (restored after PR#121 R5 / B2 rebase regression).
+	//
+	// Atomically creates a fresh grant or reactivates a soft-deleted grant
+	// for the (grantor, bot) pair, applies `personaPrompt`, and demotes
+	// every OTHER active grant under the same grantor. The entire flow
+	// runs inside a single MySQL transaction so callers can never observe
+	// a partial state — in particular, two concurrent creates for
+	// different bots under the same grantor cannot both succeed and then
+	// mutually demote each other to active=0, leaving the grantor with
+	// zero active personas and a 200 OK on the wire.
+	//
+	// The transaction takes a `SELECT 1 FROM user WHERE uid=? FOR UPDATE`
+	// row-lock on the grantor's user row before doing any obo_grants
+	// work, so concurrent create/reactivate flows for the SAME grantor
+	// serialize on that lock regardless of which bot they target. The
+	// (grantor_uid, grantee_bot_uid) UNIQUE KEY remains the secondary
+	// floor for same-bot duplicates.
+	//
+	// Reactivation semantics (PR#109 review blocker #3): on reactivation
+	// `personaPrompt` is written verbatim — including the empty string,
+	// which is the explicit "clear the prompt" signal. The
+	// previously-revoked row's stale prompt is overwritten regardless of
+	// the new value, so a reactivation never inherits the prior
+	// persona's instructions.
+	//
+	// Returns:
+	//   - (grant, false, nil) on a fresh insert
+	//   - (grant, true,  nil) on a reactivation of a previously-revoked row
+	//   - (nil,   false, errOBOGrantAlreadyActive) when the (grantor,
+	//     bot) pair already has an active grant (REST translates to 409)
+	//
+	// Any DB failure (insert, update, demotion, etc.) rolls the entire
+	// transaction back so the caller never observes a half-applied
+	// state.
+	createOrReactivateGrantAtomic(grantorUID, granteeBotUID, mode, personaPrompt string) (*oboGrantModel, bool, error)
 	revokeGrant(id int64) error
 	insertScope(grantID int64, channelID string, channelType uint8, enabled int) (int64, error)
 	deleteScope(id int64) error
@@ -276,6 +337,33 @@ func (d *botAPIDB) findActiveGrantByGrantorBot(grantorUID, granteeBotUID string)
 	return m, nil
 }
 
+// findGrantByGrantorBotActiveOnly — see oboStore. YUJ-1428 / restored
+// after PR#121 R5 / B3 rebase regression.
+//
+// Bypasses the `obo:grantor:{uid}` negative cache because that cache
+// answers "any active AND global_enabled grant exists for grantor",
+// which would falsely return "no grant" for a grantor whose grant is
+// active but has the global switch toggled off — exactly the case the
+// grantor-reply bypass is designed to handle. The MySQL probe runs on
+// the same `(grantor_uid, grantee_bot_uid)` covering index used by
+// findActiveGrantByGrantorBot, so the per-call cost is comparable to
+// the cache-miss path of the strict variant.
+func (d *botAPIDB) findGrantByGrantorBotActiveOnly(grantorUID, granteeBotUID string) (*oboGrantModel, error) {
+	if grantorUID == "" || granteeBotUID == "" {
+		return nil, nil
+	}
+	var m *oboGrantModel
+	_, err := d.session.SelectBySql(
+		"SELECT "+oboGrantColumns+" FROM obo_grants "+
+			"WHERE grantor_uid=? AND grantee_bot_uid=? AND active=1",
+		grantorUID, granteeBotUID,
+	).Load(&m)
+	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
+		return nil, err
+	}
+	return m, nil
+}
+
 // scopeEnabled — see oboStore.
 func (d *botAPIDB) scopeEnabled(grantID int64, channelID string, channelType uint8) (bool, error) {
 	if grantID == 0 || channelID == "" {
@@ -358,6 +446,22 @@ func (d *botAPIDB) findActiveGrantsForChannel(channelID string, channelType uint
 // result is a UID-scoped subset and cannot prove the channel-wide
 // negative answer the cache encodes. See the function doc on
 // channelCacheSaysNone / writeChannelCache for the poisoning scenario.
+//
+// PR#121 R5 / B1 (Jerry-Xin + lml2468 blocker): an explicit `obo_scopes`
+// row with `enabled=0` MUST suppress fan-out for this channel even when
+// the inbound message @-mentions the grantor. The "explicit scope row
+// takes precedence" invariant is enforced for the implicit-scope feeder
+// (findGlobalGrantsWithoutScope) and for the unfiltered explicit path
+// (findActiveGrantsForChannel via INNER JOIN obo_scopes ... enabled=1).
+// Pre-fix this UID-filtered query had no scope predicate at all, so a
+// channel admin could explicitly disable a channel via POST
+// /v1/obo/scopes (enabled=0) and a malicious peer could still trigger
+// a fan-out by @-mentioning the grantor — completely defeating the
+// admin's disable. The LEFT JOIN below acts as an anti-join: a row with
+// `enabled=0` for (grant_id, channel_id, channel_type) makes
+// `s.enabled=0` non-NULL and filters the grant out. Scope rows with
+// `enabled=1` (explicit allow) and the no-row case (implicit-scope
+// candidate) both pass through unaffected.
 func (d *botAPIDB) findActiveGrantsForChannelByGrantors(channelID string, channelType uint8, grantorUIDs []string) ([]*oboGrantModel, error) {
 	if channelID == "" || len(grantorUIDs) == 0 {
 		return []*oboGrantModel{}, nil
@@ -370,14 +474,29 @@ func (d *botAPIDB) findActiveGrantsForChannelByGrantors(channelID string, channe
 	// placeholder shape so the SQL string is debuggable in slow-query
 	// logs.
 	placeholders := make([]string, 0, len(grantorUIDs))
-	args := make([]interface{}, 0, len(grantorUIDs))
+	args := make([]interface{}, 0, len(grantorUIDs)+2)
+	// LEFT JOIN bind args first (channel_id, channel_type) so they
+	// line up with the `?` slots in the JOIN clause; the IN-list args
+	// come after to match the trailing `WHERE ... IN (?, ?, ...)`.
+	args = append(args, channelID, channelType)
 	for _, u := range grantorUIDs {
 		placeholders = append(placeholders, "?")
 		args = append(args, u)
 	}
-	sqlStr := "SELECT " + oboGrantColumns + " FROM obo_grants " +
-		"WHERE active=1 AND global_enabled=1 AND grantor_uid IN (" +
-		strings.Join(placeholders, ",") + ")"
+	// LEFT JOIN obo_scopes for the *disabled* scope row only — when no
+	// disabled row exists, `s.id IS NULL` lets the grant through; when a
+	// disabled row exists, the predicate filters the grant out. Allow
+	// rows (enabled=1) and absence-of-row both keep the grant eligible,
+	// preserving v2 implicit-scope semantics for @-mentioned grantors.
+	sqlStr := "SELECT " + oboGrantColumnsAliased + " FROM obo_grants g " +
+		"LEFT JOIN obo_scopes s " +
+		"  ON s.grant_id = g.id " +
+		"  AND s.channel_id = ? " +
+		"  AND s.channel_type = ? " +
+		"  AND s.enabled = 0 " +
+		"WHERE g.active=1 AND g.global_enabled=1 " +
+		"  AND s.id IS NULL " +
+		"  AND g.grantor_uid IN (" + strings.Join(placeholders, ",") + ")"
 	var grants []*oboGrantModel
 	_, err := d.session.SelectBySql(sqlStr, args...).Load(&grants)
 	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
@@ -750,6 +869,183 @@ func (d *botAPIDB) reactivateGrant(id int64) error {
 		d.invalidateGrantorCache(g.GrantorUID)
 	}
 	return nil
+}
+
+// errOBOGrantAlreadyActive is the sentinel returned by
+// createOrReactivateGrantAtomic when the (grantor, bot) pair already has
+// an active grant on file. The REST layer translates this into a 409
+// Conflict response so the caller can distinguish "you must revoke the
+// existing grant first" from other DB failure modes.
+var errOBOGrantAlreadyActive = errors.New("obo: active grant already exists for (grantor, bot) pair")
+
+// createOrReactivateGrantAtomic — see oboStore. YUJ-1471 / PR#109 review
+// blocker #2 + #3, restored after the PR#121 R5 / B2 rebase regression.
+//
+// Wraps the entire (insert | reactivate) + demote-others sequence in a
+// single MySQL transaction. The first statement inside the tx is a
+// `SELECT 1 FROM user WHERE uid=? FOR UPDATE` row lock on the grantor's
+// user row — concurrent grant create/reactivate flows for the SAME
+// grantor block on this lock, eliminating the v2 race where two
+// concurrent POSTs (different bots, same grantor) could both succeed and
+// then mutually demote each other to active=0. The (grantor_uid,
+// grantee_bot_uid) UNIQUE KEY remains the floor for same-bot duplicates.
+//
+// Reactivation always overwrites the previously-revoked row's
+// persona_prompt with the request value — including the empty string,
+// which is the explicit "clear the prompt" signal. Otherwise a caller
+// who soft-deletes a grant and then recreates it with no PersonaPrompt
+// (or PersonaPrompt="") would silently inherit the prior persona's
+// instructions (PR#109 review blocker #3).
+//
+// Demotion of every OTHER active grant for the grantor runs in the SAME
+// tx, so if demotion fails the new/reactivated row is also rolled back —
+// no half-applied "row inserted but other rows still active" state.
+func (d *botAPIDB) createOrReactivateGrantAtomic(grantorUID, granteeBotUID, mode, personaPrompt string) (*oboGrantModel, bool, error) {
+	if grantorUID == "" || granteeBotUID == "" {
+		return nil, false, errors.New("obo: grantor_uid and grantee_bot_uid are required")
+	}
+	if mode == "" {
+		mode = "auto"
+	}
+
+	tx, err := d.session.Begin()
+	if err != nil {
+		return nil, false, err
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	// Serialize concurrent create/reactivate for the same grantor.
+	// SELECT ... FOR UPDATE on the grantor's user row gives us a row
+	// lock that any sibling tx for the same grantor will block on,
+	// regardless of which bot they target. We tolerate `ErrNotFound`
+	// here — the grantor user row is normally guaranteed by the auth
+	// middleware that gates POST /v1/obo/grants, but a missing user
+	// row should not crash the request. The unique key still prevents
+	// same-(grantor, bot) duplicates and the in-tx scan below catches
+	// any racing demotion attempt.
+	var lockHit int
+	if lockErr := tx.SelectBySql(
+		"SELECT 1 FROM `user` WHERE uid=? FOR UPDATE", grantorUID,
+	).LoadOne(&lockHit); lockErr != nil && !errors.Is(lockErr, dbr.ErrNotFound) {
+		return nil, false, lockErr
+	}
+
+	now := time.Now()
+	var (
+		grantID     int64
+		reactivated bool
+	)
+
+	res, insErr := tx.InsertInto("obo_grants").
+		Columns("grantor_uid", "grantee_bot_uid", "mode", "global_enabled", "active",
+			"persona_prompt", "created_at", "updated_at").
+		Values(grantorUID, granteeBotUID, mode, 0, 1, personaPrompt, now, now).
+		Exec()
+	switch {
+	case insErr == nil:
+		grantID, err = res.LastInsertId()
+		if err != nil {
+			return nil, false, err
+		}
+	case isDuplicateKeyErr(insErr):
+		// Reactivation candidate. Re-read the existing row under FOR
+		// UPDATE so the demote-others step that follows operates on a
+		// locked snapshot.
+		var existing *oboGrantModel
+		if _, lookupErr := tx.Select("*").From("obo_grants").
+			Where("grantor_uid=? AND grantee_bot_uid=?", grantorUID, granteeBotUID).
+			Suffix("FOR UPDATE").
+			Load(&existing); lookupErr != nil && !errors.Is(lookupErr, dbr.ErrNotFound) {
+			return nil, false, lookupErr
+		}
+		if existing == nil {
+			// Should not happen — the duplicate key fired but the row
+			// vanished before our locked SELECT. Defensive: treat as
+			// 409 so the caller can retry.
+			return nil, false, errOBOGrantAlreadyActive
+		}
+		if existing.GrantorUID != grantorUID {
+			// Belt-and-suspenders: UNIQUE on (grantor, grantee) means
+			// the duplicate must be ours. If somehow it isn't, refuse.
+			return nil, false, errOBOGrantAlreadyActive
+		}
+		if existing.Active == 1 {
+			// Live row → genuine duplicate, not a reactivation case.
+			return nil, false, errOBOGrantAlreadyActive
+		}
+		if _, updErr := tx.Update("obo_grants").SetMap(map[string]interface{}{
+			"active":         1,
+			"global_enabled": 0,
+			"revoked_at":     nil,
+			"persona_prompt": personaPrompt,
+			"updated_at":     now,
+		}).Where("id=?", existing.ID).Exec(); updErr != nil {
+			return nil, false, updErr
+		}
+		grantID = existing.ID
+		reactivated = true
+	default:
+		return nil, false, insErr
+	}
+
+	// Snapshot the IDs we are about to demote so the post-commit cache
+	// bust knows which channel-scope caches to drop.
+	type row struct {
+		ID int64 `db:"id"`
+	}
+	var demoted []*row
+	if _, scanErr := tx.SelectBySql(
+		"SELECT id FROM obo_grants WHERE grantor_uid=? AND active=1 AND id<>? FOR UPDATE",
+		grantorUID, grantID,
+	).Load(&demoted); scanErr != nil && !errors.Is(scanErr, dbr.ErrNotFound) {
+		return nil, false, scanErr
+	}
+
+	if len(demoted) > 0 {
+		if _, demErr := tx.Update("obo_grants").SetMap(map[string]interface{}{
+			"active":         0,
+			"global_enabled": 0,
+			"revoked_at":     now,
+			"updated_at":     now,
+		}).Where("grantor_uid=? AND active=1 AND id<>?", grantorUID, grantID).Exec(); demErr != nil {
+			return nil, false, demErr
+		}
+	}
+
+	// Read the canonical post-write row inside the tx so the caller
+	// gets the same view we just committed.
+	var grant *oboGrantModel
+	if _, readErr := tx.Select("*").From("obo_grants").
+		Where("id=?", grantID).
+		Load(&grant); readErr != nil {
+		return nil, false, readErr
+	}
+	if grant == nil {
+		return nil, false, errors.New("obo: row vanished between write and read inside tx")
+	}
+
+	if commitErr := tx.Commit(); commitErr != nil {
+		return nil, false, commitErr
+	}
+
+	// Post-commit, best-effort cache invalidation. Cache layer is
+	// correctness-safe to be stale (callers always re-query MySQL on a
+	// positive cache) so we don't fail the request on Redis errors.
+	d.invalidateGrantorCache(grantorUID)
+	for _, r := range demoted {
+		if r == nil || r.ID == 0 {
+			continue
+		}
+		scopes, _ := d.listScopesByGrant(r.ID)
+		for _, s := range scopes {
+			if s == nil {
+				continue
+			}
+			d.invalidateChannelCache(s.ChannelID, s.ChannelType)
+		}
+	}
+
+	return grant, reactivated, nil
 }
 
 // findScopeOwner — see oboStore. Single JOIN replaces the

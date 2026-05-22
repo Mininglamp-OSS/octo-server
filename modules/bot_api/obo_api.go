@@ -172,74 +172,28 @@ func (ba *BotAPI) oboCreateGrant(c *wkhttp.Context) {
 		return
 	}
 
-	id, err := ba.oboStoreOrDefault().insertGrant(uid, req.GranteeBotUID, mode, req.PersonaPrompt)
+	// PR#109 / YUJ-1471 / PR#121 R5 B2 — atomic create-or-reactivate +
+	// demote. The store call wraps INSERT-or-reactivate + the v2 mutex
+	// demote in a single MySQL transaction (`SELECT ... FOR UPDATE` on
+	// the grantor's user row serializes concurrent create flows for
+	// the same grantor). The handler MUST NOT split these into separate
+	// autocommit ops: two concurrent POSTs for different bots under the
+	// same grantor could both succeed and then mutually demote each
+	// other to active=0, leaving the grantor with zero active personas
+	// and a 200 OK on the wire. Reactivation also re-writes
+	// persona_prompt verbatim (including "") so a tombstoned grant
+	// never inherits the prior persona's instructions.
+	grant, _, err := ba.oboStoreOrDefault().createOrReactivateGrantAtomic(uid, req.GranteeBotUID, mode, req.PersonaPrompt)
 	if err != nil {
-		if isDuplicateKeyErr(err) {
-			// Reactivation path: a row already exists. If it's a soft-deleted
-			// row owned by the same caller, flip it back to active and return
-			// the refreshed row. Anything else → 409.
-			existing, lookupErr := ba.oboStoreOrDefault().findGrantByGrantorBot(uid, req.GranteeBotUID)
-			if lookupErr != nil {
-				ba.Error("post-duplicate findGrant lookup failed", zap.Error(lookupErr))
-				c.JSON(http.StatusConflict, gin404("grant already exists"))
-				return
-			}
-			if existing == nil || existing.GrantorUID != uid {
-				// Shouldn't happen — UNIQUE on (grantor, grantee) means the
-				// duplicate must be ours. Defensive: 409 rather than 500.
-				c.JSON(http.StatusConflict, gin404("grant already exists"))
-				return
-			}
-			if existing.Active == 1 {
-				// Live row → genuine duplicate, not a reactivation case.
-				c.JSON(http.StatusConflict, gin404("grant already exists"))
-				return
-			}
-			if reactErr := ba.oboStoreOrDefault().reactivateGrant(existing.ID); reactErr != nil {
-				ba.Error("reactivateGrant failed", zap.Error(reactErr), zap.Int64("id", existing.ID))
-				c.ResponseError(errors.New("内部错误"))
-				return
-			}
-			// PR#109 review blocker #3 — reactivation MUST overwrite the
-			// stale persona_prompt with the new request value (including
-			// empty string, which is the explicit "clear the prompt"
-			// signal). Without this the reactivated row would silently
-			// inherit the previous persona's instructions.
-			prompt := req.PersonaPrompt
-			if updErr := ba.oboStoreOrDefault().updateGrant(existing.ID, "", nil, &prompt); updErr != nil {
-				ba.Error("reactivate persona_prompt overwrite failed",
-					zap.Error(updErr), zap.Int64("id", existing.ID))
-				c.ResponseError(errors.New("内部错误"))
-				return
-			}
-			// YUJ-1465 / YUJ-1471 — v2 grant mutex. Demote any other
-			// active grant under the same grantor so only the
-			// just-(re)activated grant remains active. Best-effort:
-			// errors here are logged but not surfaced; the
-			// reactivation itself already succeeded.
-			ba.demoteOtherActiveGrants(uid, existing.ID)
-			refreshed, _ := ba.oboStoreOrDefault().findGrantByID(existing.ID)
-			if refreshed != nil {
-				c.Response(refreshed)
-				return
-			}
-			c.Response(map[string]interface{}{"id": existing.ID})
+		if errors.Is(err, errOBOGrantAlreadyActive) {
+			c.JSON(http.StatusConflict, gin404("grant already exists"))
 			return
 		}
-		ba.Error("insertGrant failed", zap.Error(err))
+		ba.Error("createOrReactivateGrantAtomic failed",
+			zap.Error(err),
+			zap.String("grantor", uid),
+			zap.String("bot", req.GranteeBotUID))
 		c.ResponseError(errors.New("内部错误"))
-		return
-	}
-	// YUJ-1465 / YUJ-1471 — v2 grant mutex. After a successful fresh
-	// insert, demote every OTHER active grant the same grantor owns
-	// (different grantee bot) so at most one persona is live per
-	// grantor at any time. Best-effort: errors logged, not surfaced.
-	ba.demoteOtherActiveGrants(uid, id)
-	grant, err := ba.oboStoreOrDefault().findGrantByID(id)
-	if err != nil || grant == nil {
-		// Insert succeeded but read-back failed — return the bare ID so the
-		// client can still call other endpoints.
-		c.Response(map[string]interface{}{"id": id})
 		return
 	}
 	c.Response(grant)
@@ -260,39 +214,6 @@ func (ba *BotAPI) oboListGrants(c *wkhttp.Context) {
 		return
 	}
 	c.Response(map[string]interface{}{"items": grants})
-}
-
-// demoteOtherActiveGrants — YUJ-1465 / YUJ-1471 v2 grant mutex helper.
-// Iterates over every grant owned by `grantorUID` and soft-deletes any
-// row that is currently active=1 and is NOT `keepID`. Best-effort: any
-// per-row error is logged and skipped so the caller cannot fail the
-// (re)activation it already succeeded with.
-//
-// Called from oboCreateGrant after a successful insert / reactivate so
-// only the just-(re)activated grant stays active. Mirrors the
-// "createOrReactivateGrantAtomic" semantics that the original PR#109
-// implementation provided via a single transaction; the in-handler
-// loop is acceptable here because the grant set per grantor is small
-// (typically 1-3 rows) and the operation is rare (only on create /
-// reactivate, never on the fan-out hot path).
-func (ba *BotAPI) demoteOtherActiveGrants(grantorUID string, keepID int64) {
-	grants, err := ba.oboStoreOrDefault().listGrantsByGrantor(grantorUID)
-	if err != nil {
-		ba.Warn("demoteOtherActiveGrants list failed",
-			zap.Error(err), zap.String("grantor", grantorUID))
-		return
-	}
-	for _, g := range grants {
-		if g == nil || g.ID == keepID || g.Active != 1 {
-			continue
-		}
-		if revErr := ba.oboStoreOrDefault().revokeGrant(g.ID); revErr != nil {
-			ba.Warn("demoteOtherActiveGrants revoke failed",
-				zap.Error(revErr),
-				zap.String("grantor", grantorUID),
-				zap.Int64("id", g.ID))
-		}
-	}
 }
 
 // oboDeleteGrant — DELETE /v1/obo/grants/:id. Soft delete (revoke). Caller
@@ -317,6 +238,26 @@ func (ba *BotAPI) oboDeleteGrant(c *wkhttp.Context) {
 
 // oboUpdateGrant — PUT /v1/obo/grants/:id. Toggle global_enabled / change
 // mode. mode validation matches Create (v0 only accepts "auto").
+//
+// YUJ-1424 / PR#82 Jerry-Xin review (restored after PR#121 R5 / W1
+// rebase regression): requireOwnedGrant verifies ownership but NOT
+// `active` status, so a caller can flip mode / global_enabled on a
+// grant they previously revoked (active=0). That silently un-tombstones
+// the row's logical state from the caller's perspective (the row still
+// has active=0 and won't be picked up by findActiveGrantByGrantorBot /
+// -ForChannel, but PUTting mode="auto" + global_enabled=1 reads back
+// as "live" via findGrantByID and gives misleading client UX). The fix
+// is to reject the PUT when the row is revoked — callers that want to
+// revive a revoked grant must POST /v1/obo/grants (Create takes the
+// reactivation path; see oboCreateGrant's atomic create-or-reactivate
+// flow). 404 (not 409) mirrors the existence-leak posture of
+// requireOwnedGrant: a revoked grant is treated as "no longer
+// addressable" by per-grant write endpoints.
+//
+// Scope: oboUpdateGrant only. oboDeleteGrant is intentionally left
+// idempotent on already-revoked rows (re-revoke is a no-op), and
+// oboListScopes / per-grant reads on a revoked grant still surface
+// history so the UI can render audit trails.
 func (ba *BotAPI) oboUpdateGrant(c *wkhttp.Context) {
 	uid := c.GetLoginUID()
 	id, ok := parseIDParam(c, "id")
@@ -325,6 +266,17 @@ func (ba *BotAPI) oboUpdateGrant(c *wkhttp.Context) {
 	}
 	grant, err := ba.requireOwnedGrant(c, uid, id)
 	if err != nil || grant == nil {
+		return
+	}
+	// YUJ-1424 / W1 — active gate. See function doc for rationale.
+	// Defensive check on the row we already loaded; no extra DB
+	// roundtrip.
+	if grant.Active != 1 {
+		ba.Warn("OBO update rejected: grant is revoked",
+			zap.Int64("grant_id", id),
+			zap.String("grantor", uid),
+			zap.Int("active", grant.Active))
+		c.JSON(http.StatusNotFound, gin404("grant not found"))
 		return
 	}
 	var req oboUpdateGrantReq

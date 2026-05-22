@@ -188,7 +188,18 @@ func (ba *BotAPI) botHasActiveGrantFrom(botUID, grantorUID string) (bool, error)
 		return false, nil
 	}
 	store := ba.oboStoreOrDefault()
-	grant, err := store.findActiveGrantByGrantorBot(grantorUID, botUID)
+	// YUJ-1428 / PR#121 R5 / B3: must NOT consult the
+	// global_enabled-aware lookup. The grantor-reply bypass is the
+	// "bot may always talk to its OWN grantor in DM as long as the
+	// grant is active" gate; the global switch only governs whether
+	// the persona intercepts THIRD-PARTY messages for fan-out. Using
+	// findActiveGrantByGrantorBot (active=1 AND global_enabled=1)
+	// here would falsely return "no grant" the moment a user paused
+	// the persona, fall through to the strict OBO scope check, and
+	// reject the reply with "obo not authorized" — breaking direct
+	// grantor→bot DM conversation. checkOBO (the strict third-party
+	// send path) still uses findActiveGrantByGrantorBot.
+	grant, err := store.findGrantByGrantorBotActiveOnly(grantorUID, botUID)
 	if err != nil {
 		return false, err
 	}
