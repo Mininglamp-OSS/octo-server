@@ -1308,3 +1308,120 @@ func TestFanout_ImplicitScope_ExplicitScopeWins(t *testing.T) {
 		t.Fatalf("explicit-disabled scope leaked: captured %d copies", len(fc.copies))
 	}
 }
+
+// TestFanout_PR121R6_ImplicitScopeRespectsMentionFilter — PR#121 R6 / B2
+// (Jerry-Xin + lml2468 2026-05-22 blocking) regression guard. With two
+// global-enabled grantors in the same group, an inbound message that
+// @-mentions only ONE of them must summon only that grantor's persona;
+// the implicit-scope feeder must NOT silently pull in the un-mentioned
+// grantor's clone. Pre-fix the implicit-scope branch appended every
+// candidate `findGlobalGrantsWithoutScope` returned (which is
+// mention-agnostic by design), so a message mentioning Alice would
+// also dispatch a fan-out copy to Bob's clone — a direct violation
+// of the documented v2 mention contract: `mention.uids` summons only
+// the mentioned grantor(s); only `mention.all` summons everyone.
+func TestFanout_PR121R6_ImplicitScopeRespectsMentionFilter(t *testing.T) {
+	const (
+		groupNo   = "group_pr121_r6"
+		grantorA  = "user_alice"
+		botCloneA = "bot_clone_alice"
+		grantorB  = "user_bob"
+		botCloneB = "bot_clone_bob"
+	)
+	ct := common.ChannelTypeGroup.Uint8()
+
+	s := newFakeOBOStore()
+	// Two global-enabled grants, no explicit scope rows — both are
+	// implicit-scope candidates for this group.
+	gidA, err := s.insertGrant(grantorA, botCloneA, "auto", "")
+	if err != nil {
+		t.Fatalf("insertGrant A: %v", err)
+	}
+	gidB, err := s.insertGrant(grantorB, botCloneB, "auto", "")
+	if err != nil {
+		t.Fatalf("insertGrant B: %v", err)
+	}
+	enable := 1
+	_ = s.updateGrant(gidA, "", &enable, nil)
+	_ = s.updateGrant(gidB, "", &enable, nil)
+	// Both grantors are in the group; neither bot is.
+	s.seedGroupMember(groupNo, grantorA)
+	s.seedGroupMember(groupNo, grantorB)
+
+	fc := &fanoutCapture{}
+	ba := newBAforFanout(s, fc)
+
+	// Inbound mentions ONLY Alice.
+	msg := &config.MessageResp{
+		FromUID:     "u_carol", // not bot, not grantor
+		ChannelID:   groupNo,
+		ChannelType: ct,
+		Payload:     []byte(`{"type":1,"content":"hi alice","mention":{"uids":["` + grantorA + `"]}}`),
+	}
+	n := ba.fanoutForMessage(msg)
+	if n != 1 {
+		t.Fatalf("expected exactly 1 fan-out (Alice only), got %d (copies=%+v)", n, fc.copies)
+	}
+	if len(fc.copies) != 1 {
+		t.Fatalf("expected exactly 1 captured copy, got %d", len(fc.copies))
+	}
+	cp := fc.copies[0]
+	if cp.ChannelID != botCloneA {
+		t.Fatalf("fan-out must address Alice's bot mailbox (%q), got %q — implicit-scope leaked an un-mentioned grantor", botCloneA, cp.ChannelID)
+	}
+	if cp.FromUID != grantorA {
+		t.Fatalf("fan-out FromUID must be Alice (%q), got %q", grantorA, cp.FromUID)
+	}
+	// Defensive: explicitly confirm Bob's clone was NOT addressed.
+	for _, c := range fc.copies {
+		if c.ChannelID == botCloneB {
+			t.Fatalf("implicit-scope leaked: Bob's clone %q was un-mentioned but received a fan-out copy", botCloneB)
+		}
+	}
+}
+
+// TestFanout_PR121R6_ImplicitScopeMentionAllSummonsEveryone — companion
+// to the filter test above. `mention.all=1` (= `@所有人`) summons every
+// grantor in the channel, so BOTH implicit-scope candidates must fan
+// out. This locks the symmetry: filter when `mention.uids` is the only
+// signal, pass through when `mention.all` is set.
+func TestFanout_PR121R6_ImplicitScopeMentionAllSummonsEveryone(t *testing.T) {
+	const (
+		groupNo   = "group_pr121_r6_all"
+		grantorA  = "user_alice"
+		botCloneA = "bot_clone_alice"
+		grantorB  = "user_bob"
+		botCloneB = "bot_clone_bob"
+	)
+	ct := common.ChannelTypeGroup.Uint8()
+
+	s := newFakeOBOStore()
+	gidA, _ := s.insertGrant(grantorA, botCloneA, "auto", "")
+	gidB, _ := s.insertGrant(grantorB, botCloneB, "auto", "")
+	enable := 1
+	_ = s.updateGrant(gidA, "", &enable, nil)
+	_ = s.updateGrant(gidB, "", &enable, nil)
+	s.seedGroupMember(groupNo, grantorA)
+	s.seedGroupMember(groupNo, grantorB)
+
+	fc := &fanoutCapture{}
+	ba := newBAforFanout(s, fc)
+
+	msg := &config.MessageResp{
+		FromUID:     "u_carol",
+		ChannelID:   groupNo,
+		ChannelType: ct,
+		Payload:     []byte(`{"type":1,"content":"@everyone","mention":{"all":1}}`),
+	}
+	n := ba.fanoutForMessage(msg)
+	if n != 2 {
+		t.Fatalf("mention.all must summon both grantors, got %d (copies=%+v)", n, fc.copies)
+	}
+	seen := map[string]bool{}
+	for _, c := range fc.copies {
+		seen[c.ChannelID] = true
+	}
+	if !seen[botCloneA] || !seen[botCloneB] {
+		t.Fatalf("mention.all must reach both bot mailboxes, got %+v", seen)
+	}
+}

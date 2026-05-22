@@ -729,7 +729,9 @@ func TestSendMessage_RejectsExplicitFanoutKeys(t *testing.T) {
 		"obo_origin_channel_id",
 		"obo_origin_channel_type",
 		"obo_origin_from_uid",
+		"obo_origin_message_id",
 		"obo_origin_message_idstr",
+		"obo_grantor_name",
 		"obo_system_hint",
 	}
 	for _, key := range keys {
@@ -767,6 +769,68 @@ func TestSendMessage_RejectsExplicitFanoutKeys(t *testing.T) {
 			}
 			// Reject body should mention OBO so bot authors can grep
 			// for the cause; we don't pin the exact phrasing.
+			if !strings.Contains(rec.Body.String(), "obo") && !strings.Contains(rec.Body.String(), "OBO") {
+				t.Fatalf("expected reject body for %q to mention OBO, got %s", key, rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestSendMessage_RejectsR6FanoutKeys — PR#121 R6 / B1 (Jerry-Xin +
+// lml2468 2026-05-22 blocking) regression guard. buildFanoutCopyReq
+// also injects the v2-canonical `obo_origin_message_id` (alongside the
+// legacy `obo_origin_message_idstr`) and the resolved
+// `obo_grantor_name`. The R5 reserved set was missing both, so a bot
+// client could spoof either: faking `obo_origin_message_id` would let
+// a bot redirect a v2-aware adapter's reply to an arbitrary message;
+// faking `obo_grantor_name` would let a bot rewrite the persona's
+// user-visible display name (the system-hint copy is composed from
+// it). The bot ingress now rejects both, same as the rest of the
+// fan-out routing namespace.
+func TestSendMessage_RejectsR6FanoutKeys(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const (
+		botID  = "bot_legacy"
+		owner  = "creator_uid"
+		authSp = "space_A"
+	)
+	keys := []string{
+		"obo_origin_message_id",
+		"obo_grantor_name",
+	}
+	for _, key := range keys {
+		t.Run(key, func(t *testing.T) {
+			dc := &dispatchCapture{}
+			ba := &BotAPI{
+				Log:              log.NewTLog("BotAPI-reject-r6-key"),
+				spaceQuerier:     &fakeSpaceQuerier{defaultSpace: authSp},
+				dispatchOverride: dc.hook,
+				oboStoreOverride: newFakeOBOStore(),
+			}
+
+			body, _ := json.Marshal(BotSendMessageReq{
+				ChannelID:   owner,
+				ChannelType: common.ChannelTypePerson.Uint8(),
+				Payload: map[string]interface{}{
+					"content": "spoof attempt",
+					"type":    1,
+					key:       "victim_value",
+				},
+			})
+			httpReq := httptest.NewRequest(http.MethodPost, "/v1/bot/sendMessage", bytes.NewReader(body))
+			httpReq.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			gc, _ := gin.CreateTestContext(rec)
+			gc.Request = httpReq
+			c := &wkhttp.Context{Context: gc}
+			c.Set(CtxKeyRobotID, botID)
+			c.Set(CtxKeyBotKind, BotKindUser)
+			c.Set(CtxKeyRobot, &robotModel{RobotID: botID, CreatorUID: owner})
+
+			ba.sendMessage(c)
+			if dc.captured != nil {
+				t.Fatalf("dispatch must NOT fire when reserved OBO key %q is rejected, got %+v", key, dc.captured)
+			}
 			if !strings.Contains(rec.Body.String(), "obo") && !strings.Contains(rec.Body.String(), "OBO") {
 				t.Fatalf("expected reject body for %q to mention OBO, got %s", key, rec.Body.String())
 			}

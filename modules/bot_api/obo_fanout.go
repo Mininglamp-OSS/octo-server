@@ -284,6 +284,33 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 				zap.String("channel_id", lookupChannelID),
 				zap.Error(gErr))
 		} else {
+			// PR#121 R6 / B2 (Jerry-Xin + lml2468 2026-05-22 blocking)
+			// — when only specific grantors were @-mentioned (i.e.
+			// `mention.uids` is set and `mention.all` is NOT), the
+			// implicit-scope feeder MUST be filtered to those uids
+			// before being merged with the explicit-scope set above.
+			//
+			// Without this filter, a message that mentions only Alice
+			// (`mention.uids = [alice_uid]`) would silently pull in
+			// Bob's persona too — `findGlobalGrantsWithoutScope`
+			// returns every global-enabled grant whose grantor is in
+			// the group, with no awareness of the mention gate. That
+			// directly violates the documented v2 mention contract:
+			// `mention.uids` summons ONLY the mentioned grantor(s);
+			// only `mention.all` summons everyone.
+			//
+			// The mentionAll branch passes through unfiltered (matches
+			// the explicit-path behavior — `@所有人` summons every
+			// grantor in the channel). The DM branch never reaches
+			// this block (gated above on ChannelTypeGroup) and
+			// therefore needs no symmetrical filter.
+			var mentionFilter map[string]struct{}
+			if !mentionAll && len(mentionedUIDs) > 0 {
+				mentionFilter = make(map[string]struct{}, len(mentionedUIDs))
+				for _, u := range mentionedUIDs {
+					mentionFilter[u] = struct{}{}
+				}
+			}
 			// PR#114 R3 dedup — when the mention-filtered query above
 			// already returned a grant that ALSO satisfies the implicit-
 			// scope predicates, mark it as implicit (skip the per-grant
@@ -297,6 +324,13 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 				alreadyHave[g.ID] = true
 			}
 			for _, g := range globalGrants {
+				if mentionFilter != nil {
+					if _, ok := mentionFilter[g.GrantorUID]; !ok {
+						// Grantor not mentioned — implicit-scope
+						// fan-out must NOT summon them. (B2.)
+						continue
+					}
+				}
 				ba.Info("OBO implicit-scope: SQL-validated grant, auto-including",
 					zap.String("grantor", g.GrantorUID),
 					zap.String("bot", g.GranteeBotUID),

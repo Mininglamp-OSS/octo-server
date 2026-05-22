@@ -91,6 +91,16 @@ const ProcessedMarkerKey = "__obo_processed__"
 //     list: it is a legacy client-readable hint, not the server-only
 //     gate-3 marker (that one is `__obo_processed__` under the
 //     ReservedKeyPrefix).
+//   - PR#121 R6 (Jerry-Xin + lml2468 2026-05-22 blocking): the
+//     v2-canonical `obo_origin_message_id` and the resolved
+//     `obo_grantor_name` are ALSO injected by buildFanoutCopyReq
+//     alongside the legacy `obo_origin_message_idstr` /
+//     `obo_grantor_uid`. They were missing from the allowlist in R5,
+//     so a client could spoof either: faking `obo_origin_message_id`
+//     would let a peer redirect a v2-aware adapter's reply to an
+//     arbitrary message id, and faking `obo_grantor_name` would let a
+//     peer rewrite the persona's user-visible display name (the
+//     system-hint text is composed from it). Both are now reserved.
 //   - When adding a new server-only OBO payload key in
 //     buildFanoutCopyReq, send.go's OBO marker block, or any other
 //     server injection site, add it here too. The shared
@@ -102,7 +112,9 @@ var ExplicitReservedKeys = map[string]struct{}{
 	"obo_origin_channel_id":    {},
 	"obo_origin_channel_type":  {},
 	"obo_origin_from_uid":      {},
+	"obo_origin_message_id":    {},
 	"obo_origin_message_idstr": {},
+	"obo_grantor_name":         {},
 	"obo_system_hint":          {},
 	// PR#121 R3 (Jerry-Xin 2026-05-21 blocking): server-set actual
 	// sender identity behind an OBO send. Injected by

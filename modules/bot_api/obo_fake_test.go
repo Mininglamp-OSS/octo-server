@@ -245,10 +245,32 @@ func (f *fakeOBOStore) findActiveGrantsForChannel(channelID string, channelType 
 	f.ensureInit()
 	out := []*oboGrantModel{}
 	// YUJ-1538 — mirror the production channel-type-aware lookup:
-	// Group / CommunityTopic return every active+global_enabled grant
-	// without requiring a scope row; DM (Person) keeps the strict
-	// scope-row contract.
-	if isGroupLikeChannelType(channelType) {
+	// Group returns every active+global_enabled grant without
+	// requiring a scope row (the prod fan-out path combines this
+	// with a separate findGlobalGrantsWithoutScope call; aggregating
+	// here keeps the fake's behavior end-to-end equivalent for
+	// fanoutForMessage tests). DM (Person) keeps the strict scope-
+	// row contract.
+	//
+	// PR#121 R6 / B3 (Jerry-Xin + lml2468 2026-05-22 blocking):
+	// CommunityTopic does NOT take the implicit-global branch here.
+	// Production's findActiveGrantsForChannel uses an INNER JOIN on
+	// obo_scopes for ALL channel types (DM, Group, CommunityTopic),
+	// and the implicit-scope feeder
+	// (findGlobalGrantsWithoutScope) is only invoked from
+	// fanoutForMessage when the channel type is exactly
+	// ChannelTypeGroup (obo_fanout.go gate). The R5 fake treated
+	// CommunityTopic the same as Group via isGroupLikeChannelType,
+	// which created fake/prod divergence: tests that exercised topic
+	// fan-out without seeding a scope row would pass against the
+	// fake but fail in production. Aligning the fake to the prod
+	// contract (CommunityTopic requires a scope row) closes the
+	// divergence without expanding the production code surface.
+	// CommunityTopic implicit-scope support is NOT currently
+	// planned; if that changes, both production
+	// (fanoutForMessage / findGlobalGrantsWithoutScope) and this
+	// fake must be updated together.
+	if channelType == common.ChannelTypeGroup.Uint8() {
 		// Iterate by sorted grant ID so tests get deterministic ordering
 		// independent of map iteration order.
 		ids := make([]int64, 0, len(f.grants))

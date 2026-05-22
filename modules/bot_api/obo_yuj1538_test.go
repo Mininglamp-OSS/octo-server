@@ -259,19 +259,36 @@ func TestFindActiveGrantsForChannel_YUJ1538_GroupReturnsGlobalEnabled(t *testing
 	}
 }
 
-// TestFindActiveGrantsForChannel_YUJ1538_CommunityTopicReturnsGlobalEnabled —
-// store-level pin for the community-topic branch. Same shape as the
-// group test above; kept separate so a regression that drops one of
-// the two group-like channel types surfaces with a precise failure
-// message.
-func TestFindActiveGrantsForChannel_YUJ1538_CommunityTopicReturnsGlobalEnabled(t *testing.T) {
+// TestFindActiveGrantsForChannel_PR121R6_CommunityTopicRequiresScopeRow —
+// store-level pin for the CommunityTopic branch after PR#121 R6 / B3
+// (Jerry-Xin + lml2468 2026-05-22 blocking). The R5 fake treated
+// CommunityTopic the same as Group (implicit-global candidate) via
+// isGroupLikeChannelType, which diverged from production:
+//
+//   - Prod findActiveGrantsForChannel uses an INNER JOIN on obo_scopes
+//     for ALL channel types (DM, Group, CommunityTopic), so a topic
+//     without a scope row returns zero grants.
+//   - Prod findGlobalGrantsWithoutScope is only invoked from
+//     fanoutForMessage when channelType == ChannelTypeGroup, so the
+//     implicit-scope path is unreachable for topics.
+//
+// Aligning the fake to that contract closes the divergence without
+// expanding production code surface. CommunityTopic implicit-scope
+// support is NOT planned; if that changes, both prod and the fake
+// must be updated together.
+//
+// The original test (TestFindActiveGrantsForChannel_YUJ1538_
+// CommunityTopicReturnsGlobalEnabled) asserted the inverse and is
+// replaced by this regression — a refactor that re-introduces the
+// fake-only topic implicit-scope branch surfaces here.
+func TestFindActiveGrantsForChannel_PR121R6_CommunityTopicRequiresScopeRow(t *testing.T) {
 	s := seedGrantNoScope(t)
 	grants, err := s.findActiveGrantsForChannel("group_42____topic_a1", common.ChannelTypeCommunityTopic.Uint8())
 	if err != nil {
 		t.Fatalf("findActiveGrantsForChannel community-topic: %v", err)
 	}
-	if len(grants) != 1 || grants[0].GrantorUID != tGrantor {
-		t.Fatalf("community-topic lookup must return the global_enabled grant, got %+v", grants)
+	if len(grants) != 0 {
+		t.Fatalf("community-topic lookup must require a scope row (prod parity), got %+v", grants)
 	}
 }
 

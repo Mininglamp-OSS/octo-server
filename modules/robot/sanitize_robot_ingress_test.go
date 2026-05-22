@@ -173,13 +173,15 @@ func TestRobotMessage_OBOExplicitFanoutKeysStripped(t *testing.T) {
 		"obo_origin_channel_id":    "ch",
 		"obo_origin_channel_type":  1,
 		"obo_origin_from_uid":      "u",
+		"obo_origin_message_id":    "m1",
 		"obo_origin_message_idstr": "m1",
+		"obo_grantor_name":         "Admin",
 		"obo_system_hint":          "noop",
 	}
 
 	stripped := sanitizeRobotIngressPayload(payload, "ch", 2, "bot", cl.warn)
 
-	assert.Equal(t, 8, stripped)
+	assert.Equal(t, 10, stripped)
 	assert.Len(t, payload, 2, "only non-reserved keys should remain")
 	assert.Equal(t, "spoof attempt", payload["content"])
 	assert.Equal(t, 1, payload["type"])
@@ -230,4 +232,34 @@ func TestRobotMessage_StripContract_PinnedToSharedPackage(t *testing.T) {
 	obopayload.StripReservedKeys(direct)
 
 	assert.Equal(t, direct, via, "robot-module strip must match shared obopayload contract")
+}
+
+// TestRobotMessage_R6FanoutKeysStripped — PR#121 R6 / B1 (Jerry-Xin
+// + lml2468 2026-05-22 blocking). The legacy robot ingress must
+// strip the two additional server-only fan-out keys
+// (obo_origin_message_id / obo_grantor_name) that buildFanoutCopyReq
+// injects but R5 forgot to reserve. A misbehaving robot script that
+// could set either would forge fan-out reply routing or rewrite the
+// persona display name composed into obo_system_hint.
+func TestRobotMessage_R6FanoutKeysStripped(t *testing.T) {
+	cl := &captureRobotLog{}
+	payload := map[string]interface{}{
+		"content":               "spoof attempt",
+		"type":                  1,
+		"obo_origin_message_id": "victim_msg",
+		"obo_grantor_name":      "Forged Admin",
+	}
+
+	stripped := sanitizeRobotIngressPayload(payload, "ch", 2, "bot", cl.warn)
+
+	assert.Equal(t, 2, stripped)
+	if _, present := payload["obo_origin_message_id"]; present {
+		t.Fatalf("obo_origin_message_id must be stripped, got %v", payload)
+	}
+	if _, present := payload["obo_grantor_name"]; present {
+		t.Fatalf("obo_grantor_name must be stripped, got %v", payload)
+	}
+	assert.Equal(t, "spoof attempt", payload["content"])
+	assert.Equal(t, 1, payload["type"])
+	assert.Len(t, cl.calls, 1, "one warn log even for multiple reserved keys")
 }

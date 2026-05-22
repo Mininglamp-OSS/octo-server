@@ -31,7 +31,9 @@ func TestIsReservedKey(t *testing.T) {
 		{"obo_origin_channel_id", true},
 		{"obo_origin_channel_type", true},
 		{"obo_origin_from_uid", true},
+		{"obo_origin_message_id", true},
 		{"obo_origin_message_idstr", true},
+		{"obo_grantor_name", true},
 		{"obo_system_hint", true},
 		// Prefix-less server-injected sender identity (PR#121 R3).
 		// Set by modules/bot_api/send.go when fromUID != robotID;
@@ -90,7 +92,9 @@ func TestHasReservedKey(t *testing.T) {
 		{"obo_origin_channel_id reserved", map[string]interface{}{"obo_origin_channel_id": "ch"}, true},
 		{"obo_origin_channel_type reserved", map[string]interface{}{"obo_origin_channel_type": 1}, true},
 		{"obo_origin_from_uid reserved", map[string]interface{}{"obo_origin_from_uid": "u"}, true},
+		{"obo_origin_message_id reserved", map[string]interface{}{"obo_origin_message_id": "m1"}, true},
 		{"obo_origin_message_idstr reserved", map[string]interface{}{"obo_origin_message_idstr": "m1"}, true},
+		{"obo_grantor_name reserved", map[string]interface{}{"obo_grantor_name": "Admin"}, true},
 		{"obo_system_hint reserved", map[string]interface{}{"obo_system_hint": "noop"}, true},
 
 		// PR#121 R3: actual_sender_uid is server-only (no `obo_`
@@ -185,13 +189,15 @@ func TestStripReservedKeys(t *testing.T) {
 				"obo_origin_channel_id":    "ch",
 				"obo_origin_channel_type":  1,
 				"obo_origin_from_uid":      "u",
+				"obo_origin_message_id":    "m1",
 				"obo_origin_message_idstr": "m1",
+				"obo_grantor_name":         "Admin",
 				"obo_system_hint":          "noop",
 				// PR#121 R3 — actual_sender_uid is in the same
 				// allowlist; co-strip with the obo_* set.
 				"actual_sender_uid": "bot_admin",
 			},
-			9,
+			11,
 			map[string]interface{}{"type": 1, "content": "hi"},
 		},
 		{
