@@ -4,12 +4,32 @@ package conversation_ext
 
 import (
 	"os"
+	"strconv"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// intToStrAFT 短手包装 strconv.Itoa，仅供 auto_follow_threads 测试块内使用。
+func intToStrAFT(i int) string { return strconv.Itoa(i) }
+
+// readFollowVersion 直接读 user_follow_version 行的值（行不存在返回 0）。
+// 在 svc 上读，复用同一个 *dbr.Session，避免再开 ctx。
+func readFollowVersion(t *testing.T, svc *Service, uid, spaceID string) int64 {
+	t.Helper()
+	var v int64
+	err := svc.session.SelectBySql(
+		"SELECT version FROM "+followVersionTable+" WHERE uid=? AND space_id=?",
+		uid, spaceID,
+	).LoadOne(&v)
+	if err != nil {
+		// 行不存在时 dbr.ErrNotFound — 视为 0。
+		return 0
+	}
+	return v
+}
 
 // newServiceForTest creates a Service connected to the test MySQL instance and
 // wipes the table so every test starts from a clean slate.
@@ -26,6 +46,11 @@ func newServiceForTest(t *testing.T) *Service {
 	ctx := config.NewContext(cfg)
 	_, err := ctx.DB().DeleteFrom(table).Exec()
 	require.NoError(t, err, "clean "+table+" before service test")
+	// 同时清 follow_version 行 —— 否则前一个测试留下的 (uid, space_id, version=N)
+	// 让本测试的 FollowChannel bump 后 version 不再是 1，断言会假报失败。
+	// 与 newDBForTest 行为对齐。
+	_, err = ctx.DB().DeleteFrom(followVersionTable).Exec()
+	require.NoError(t, err, "clean "+followVersionTable+" before service test")
 	return NewService(ctx)
 }
 
@@ -184,6 +209,153 @@ func TestService_FollowChannel_NoExistingRow_CreatesRow(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// FollowChannel cascade: auto_follow_threads + ThreadEnumerator
+// ---------------------------------------------------------------------------
+
+// stubThreadEnumerator 是 service_test 内用的 ThreadEnumerator 桩实现：
+//   - groups[groupNo] 决定枚举返回值；
+//   - lastLimit 记录最近一次调用收到的 limit，便于断言 cap 透传；
+//   - callCount 用来确认 FollowChannel 不在 nil-enumerator 之外的路径多次调用。
+type stubThreadEnumerator struct {
+	groups    map[string][]string
+	lastLimit int
+	callCount int
+}
+
+func (s *stubThreadEnumerator) EnumerateActiveShortIDs(groupNo string, limit int) ([]string, error) {
+	s.callCount++
+	s.lastLimit = limit
+	ids := s.groups[groupNo]
+	if limit > 0 && len(ids) > limit {
+		ids = ids[:limit]
+	}
+	return ids, nil
+}
+
+func TestService_FollowChannel_SetsAutoFollowThreads(t *testing.T) {
+	svc := newServiceForTest(t)
+	const uid, space, grp = "u1", "s1", "grp-af-1"
+
+	require.NoError(t, svc.FollowChannel(uid, space, grp))
+
+	m, err := svc.db.Get(uid, space, targetTypeGroup, grp)
+	require.NoError(t, err)
+	require.NotNil(t, m)
+	assert.Equal(t, int8(0), m.GroupUnfollowed)
+	assert.Equal(t, int8(1), m.AutoFollowThreads, "FollowChannel 应把 auto_follow_threads 置 1")
+}
+
+func TestService_FollowChannel_MaterializesActiveThreads(t *testing.T) {
+	svc := newServiceForTest(t)
+	const uid, space, grp = "u1", "s1", "grp-af-2"
+
+	enum := &stubThreadEnumerator{groups: map[string][]string{
+		grp: {"thr-a", "thr-b", "thr-c"},
+	}}
+	svc.SetThreadEnumerator(enum)
+
+	require.NoError(t, svc.FollowChannel(uid, space, grp))
+
+	assert.Equal(t, 1, enum.callCount, "FollowChannel 应只查询一次 ThreadEnumerator")
+
+	for _, shortID := range []string{"thr-a", "thr-b", "thr-c"} {
+		channelID := grp + threadSeparator + shortID
+		row, err := svc.db.Get(uid, space, targetTypeThread, channelID)
+		require.NoError(t, err)
+		require.NotNil(t, row, "thread ext row for %s should exist after FollowChannel", channelID)
+		assert.Equal(t, 0, row.FollowSort,
+			"fanout 物化行 follow_sort 应保持默认 0（未手动排序），由客户端按规则聚拢渲染")
+	}
+}
+
+func TestService_FollowChannel_RespectsCap(t *testing.T) {
+	svc := newServiceForTest(t)
+	const uid, space, grp = "u1", "s1", "grp-af-3"
+
+	// 模拟有 600 个 active 子区。
+	ids := make([]string, 600)
+	for i := range ids {
+		ids[i] = "thr-" + intToStrAFT(i)
+	}
+	enum := &stubThreadEnumerator{groups: map[string][]string{grp: ids}}
+	svc.SetThreadEnumerator(enum)
+
+	require.NoError(t, svc.FollowChannel(uid, space, grp))
+
+	assert.Equal(t, maxAutoFollowThreadsPerChannel, enum.lastLimit,
+		"FollowChannel 应把 cap 透传给 ThreadEnumerator")
+
+	// 验前 500 个物化、500..599 未物化。
+	var got []*Model
+	got, err := svc.db.ListThreadExts(uid, space)
+	require.NoError(t, err)
+	assert.Equal(t, maxAutoFollowThreadsPerChannel, len(got),
+		"超过 cap 的子区不应被物化（fanout 会在后续 OnThreadCreated 持续补齐）")
+}
+
+func TestService_FollowChannel_NoEnumerator_NoMaterialization(t *testing.T) {
+	svc := newServiceForTest(t)
+	const uid, space, grp = "u1", "s1", "grp-af-4"
+
+	// 不注入 enumerator —— 与现有 FollowChannel 行为兼容。
+	require.NoError(t, svc.FollowChannel(uid, space, grp))
+
+	m, err := svc.db.Get(uid, space, targetTypeGroup, grp)
+	require.NoError(t, err)
+	require.NotNil(t, m)
+	assert.Equal(t, int8(1), m.AutoFollowThreads)
+
+	rows, err := svc.db.ListThreadExts(uid, space)
+	require.NoError(t, err)
+	assert.Empty(t, rows, "无 enumerator 时不应物化子区行")
+}
+
+func TestService_FollowChannel_VersionBumpedOnce(t *testing.T) {
+	svc := newServiceForTest(t)
+	const uid, space, grp = "u1", "s1", "grp-af-5"
+
+	enum := &stubThreadEnumerator{groups: map[string][]string{
+		grp: {"thr-1", "thr-2", "thr-3", "thr-4"},
+	}}
+	svc.SetThreadEnumerator(enum)
+
+	require.NoError(t, svc.FollowChannel(uid, space, grp))
+
+	v := readFollowVersion(t, svc, uid, space)
+	assert.Equal(t, int64(1), v,
+		"FollowChannel 即便物化 N 个子区，也只应 bump follow_version 一次（user-level 单调序列）")
+}
+
+func TestService_FollowChannel_PreservesExistingThreadSort(t *testing.T) {
+	svc := newServiceForTest(t)
+	const uid, space, grp = "u1", "s1", "grp-af-6"
+	preThread := grp + threadSeparator + "thr-pre"
+
+	// 预先：用户手动关注过该子区并拖拽到 sort=42。
+	require.NoError(t, svc.db.Upsert(uid, space, targetTypeThread, preThread, ConvExtFields{
+		FollowSort: intPtr(42),
+	}))
+
+	enum := &stubThreadEnumerator{groups: map[string][]string{
+		grp: {"thr-pre", "thr-new"},
+	}}
+	svc.SetThreadEnumerator(enum)
+	require.NoError(t, svc.FollowChannel(uid, space, grp))
+
+	// thr-pre 的手动 sort 必须保留（fanout 走 INSERT IGNORE）。
+	pre, err := svc.db.Get(uid, space, targetTypeThread, preThread)
+	require.NoError(t, err)
+	require.NotNil(t, pre)
+	assert.Equal(t, 42, pre.FollowSort, "已有手动排序的 thread 行不应被 fanout 覆盖")
+
+	// thr-new 是新物化的，follow_sort=0（未排序）。
+	newRow, err := svc.db.Get(uid, space, targetTypeThread, grp+threadSeparator+"thr-new")
+	require.NoError(t, err)
+	require.NotNil(t, newRow)
+	assert.Equal(t, 0, newRow.FollowSort)
+}
+
+// ---------------------------------------------------------------------------
 // UnfollowChannel happy path + cascade
 // ---------------------------------------------------------------------------
 
@@ -197,6 +369,28 @@ func TestService_UnfollowChannel_SetsGroupUnfollowed(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, m)
 	assert.Equal(t, int8(1), m.GroupUnfollowed)
+}
+
+func TestService_UnfollowChannel_ClearsAutoFollowThreads(t *testing.T) {
+	svc := newServiceForTest(t)
+	const uid, space, grp = "u1", "s1", "grp-uaf-1"
+
+	// 先关注 channel（auto_follow_threads=1）
+	require.NoError(t, svc.FollowChannel(uid, space, grp))
+	m, err := svc.db.Get(uid, space, targetTypeGroup, grp)
+	require.NoError(t, err)
+	require.NotNil(t, m)
+	require.Equal(t, int8(1), m.AutoFollowThreads)
+
+	// 取消关注后 auto_follow_threads 必须置回 0，
+	// 防止后续 OnThreadCreated 把已取关的用户当作 fanout 目标。
+	require.NoError(t, svc.UnfollowChannel(uid, space, grp))
+	m2, err := svc.db.Get(uid, space, targetTypeGroup, grp)
+	require.NoError(t, err)
+	require.NotNil(t, m2)
+	assert.Equal(t, int8(1), m2.GroupUnfollowed)
+	assert.Equal(t, int8(0), m2.AutoFollowThreads,
+		"UnfollowChannel 必须把 auto_follow_threads 清零，否则 fanout 还会找到该用户")
 }
 
 func TestService_UnfollowChannel_CascadeDeletesThreadExtRows(t *testing.T) {

@@ -46,6 +46,24 @@ type ThreadAuthChecker interface {
 	AuthorizeThreadFollow(uid, spaceID, groupNo, shortID string) error
 }
 
+// ThreadEnumerator 是 FollowChannel 级联物化子区时使用的窄接口。
+// 与 ThreadAuthChecker 一样采用依赖倒置，避免 conversation_ext 直接 import thread。
+// 由 message/1module.go 启动时通过 SetThreadEnumerator 注入；nil 时跳过物化
+// （供单测以及尚未注入的迁移期使用）。
+//
+// EnumerateActiveShortIDs 返回 groupNo 下 status=active 的子区 shortID 列表，
+// 最多返回 limit 项。返回顺序由调用方约定（通常按 created_at DESC），
+// 与 maxAutoFollowThreadsPerChannel 的截断语义一致。
+type ThreadEnumerator interface {
+	EnumerateActiveShortIDs(groupNo string, limit int) ([]string, error)
+}
+
+// maxAutoFollowThreadsPerChannel 是 FollowChannel 一次性物化的子区数量上限。
+// 与 maxUpdateSortItems=500 同审美：覆盖产品上限场景同时把 tx 锁范围与延迟控制住。
+// 超过该数量的子区不在 FollowChannel 时物化，依赖产品侧"子区自动归档"把活跃数控制在 cap 内
+// + 后续 OnThreadCreated fanout 持续补齐。
+const maxAutoFollowThreadsPerChannel = 500
+
 // Service encapsulates composite operations on user_conversation_ext that
 // require a single transaction boundary.  It intentionally avoids importing
 // modules/group, modules/user, or modules/thread to prevent circular
@@ -63,6 +81,10 @@ type Service struct {
 	session     *dbr.Session
 	threadAuth  ThreadAuthChecker
 	threadAuthM sync.RWMutex
+	// threadEnum 是 FollowChannel 级联物化子区时的查询钩子。
+	// 由 message/1module.go 启动时注入；nil 时跳过物化。
+	threadEnum  ThreadEnumerator
+	threadEnumM sync.RWMutex
 	log.Log
 }
 
@@ -90,6 +112,23 @@ func (s *Service) getThreadAuthChecker() ThreadAuthChecker {
 	c := s.threadAuth
 	s.threadAuthM.RUnlock()
 	return c
+}
+
+// SetThreadEnumerator injects the enumerator used by FollowChannel to
+// materialize thread ext rows for every active thread under the channel.
+// Safe for concurrent use; intended to be called once at startup from
+// message/1module.go after the thread module has initialised.
+func (s *Service) SetThreadEnumerator(e ThreadEnumerator) {
+	s.threadEnumM.Lock()
+	s.threadEnum = e
+	s.threadEnumM.Unlock()
+}
+
+func (s *Service) getThreadEnumerator() ThreadEnumerator {
+	s.threadEnumM.RLock()
+	e := s.threadEnum
+	s.threadEnumM.RUnlock()
+	return e
 }
 
 // ---------------------------------------------------------------------------
@@ -138,12 +177,19 @@ func escapeLike(s string) string {
 // FollowChannel — clear group-blacklist flag (re-follow a previously unfollowed group)
 // ---------------------------------------------------------------------------
 
-// FollowChannel marks the group as followed (group_unfollowed=0) for the given
-// user and space.  If no ext row exists it is created with the default values.
+// FollowChannel marks the group as followed (group_unfollowed=0,
+// auto_follow_threads=1) and, in the same transaction, materializes thread
+// ext rows for up to maxAutoFollowThreadsPerChannel currently-active threads
+// under the channel.
 //
 // PR review (Round 3) Blocking #1/#2 — 关注状态变化时把 user_follow_version +1。
-// Upsert 和 Bump 在同一 tx 内执行，这样客户端只要观察 follow_version 就能可靠
-// 检测到变化。
+// Upsert / Bump / fanout 在同一 tx 内执行，这样客户端只要观察 follow_version
+// 就能可靠检测到变化（即使物化了 N 个子区也只 +1，因为它是 user-level 单调序列）。
+//
+// 子区物化采用 INSERT IGNORE — 不覆盖用户既有的手动 follow_sort，新行 follow_sort
+// 保持默认 0 由客户端按"父 channel 之后聚拢渲染"规则决定位置。
+//
+// 当未注入 ThreadEnumerator 时（单测 / 迁移期）跳过物化，仅写群行。
 func (s *Service) FollowChannel(uid, spaceID, groupNo string) error {
 	if err := validateBase(uid, spaceID); err != nil {
 		return err
@@ -151,23 +197,64 @@ func (s *Service) FollowChannel(uid, spaceID, groupNo string) error {
 	if groupNo == "" {
 		return errors.New("group_no must not be empty")
 	}
+
+	// 先在 tx 外把活跃子区 shortID 拉出来 —— 把潜在的跨表 / 大查询挪到事务外，
+	// 缩短 ext 行锁 + follow_version 行锁的持有时间。
+	var shortIDs []string
+	if enum := s.getThreadEnumerator(); enum != nil {
+		ids, err := enum.EnumerateActiveShortIDs(groupNo, maxAutoFollowThreadsPerChannel)
+		if err != nil {
+			return fmt.Errorf("FollowChannel enumerate threads: %w", err)
+		}
+		shortIDs = ids
+	}
+
 	zero := int8(0)
+	one := int8(1)
 	// PR #21 review (lml2468 blocker #2)：所有同时触及 user_follow_version 与
-	// user_conversation_ext 的事务必须按相同顺序拿锁，否则与先锁 version
-	// 再锁 ext 的 UpdateSort 互锁。把 Bump 放在最前 —— 它通过
-	// INSERT ... ON DUPLICATE KEY UPDATE 对 user_follow_version (uid, space_id)
+	// user_conversation_ext 的事务必须按相同顺序拿锁。把 Bump 放在最前 ——
+	// 它通过 ON DUPLICATE KEY UPDATE 对 user_follow_version (uid, space_id)
 	// 行加 X 锁，使本 tx 在 version 行上有排它后再进入 ext 行操作。
 	return s.withTx("FollowChannel", func(tx *dbr.Tx) error {
 		if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
 			return fmt.Errorf("FollowChannel bump version: %w", err)
 		}
 		if err := upsertTx(tx, uid, spaceID, targetTypeGroup, groupNo, ConvExtFields{
-			GroupUnfollowed: &zero,
+			GroupUnfollowed:   &zero,
+			AutoFollowThreads: &one,
 		}); err != nil {
 			return fmt.Errorf("FollowChannel upsert: %w", err)
 		}
+		if len(shortIDs) > 0 {
+			if err := bulkInsertIgnoreThreadExtTx(tx, uid, spaceID, groupNo, shortIDs); err != nil {
+				return fmt.Errorf("FollowChannel materialize threads: %w", err)
+			}
+		}
 		return nil
 	})
+}
+
+// bulkInsertIgnoreThreadExtTx 给 (uid, spaceID) 在 user_conversation_ext 表中
+// 批量插入 target_type=5 子区行。已存在的行（含用户手动调过 follow_sort 的）
+// 因 INSERT IGNORE 保持不变 —— 这是 FollowChannel 既不覆盖用户既有排序也能
+// 一次性补齐缺失行的关键。
+func bulkInsertIgnoreThreadExtTx(tx *dbr.Tx, uid, spaceID, groupNo string, shortIDs []string) error {
+	if len(shortIDs) == 0 {
+		return nil
+	}
+	placeholders := make([]string, len(shortIDs))
+	args := make([]interface{}, 0, len(shortIDs)*4)
+	for i, sid := range shortIDs {
+		placeholders[i] = "(?, ?, ?, ?)"
+		args = append(args, uid, spaceID, targetTypeThread, groupNo+threadSeparator+sid)
+	}
+	_, err := tx.InsertBySql(
+		"INSERT IGNORE INTO "+table+
+			" (uid, space_id, target_type, target_id) VALUES "+
+			strings.Join(placeholders, ", "),
+		args...,
+	).Exec()
+	return err
 }
 
 // withTx wraps fn in a tx with consistent error handling.
@@ -202,14 +289,18 @@ func (s *Service) UnfollowChannel(uid, spaceID, groupNo string) error {
 		return errors.New("group_no must not be empty")
 	}
 	one := int8(1)
+	zero := int8(0)
 	// PR #21 review (lml2468 blocker #2)：bump 必须先于 ext 行操作，保证与
 	// UpdateSort 同序拿锁，避免 (version vs ext) 反向死锁。
 	return s.withTx("UnfollowChannel", func(tx *dbr.Tx) error {
 		if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
 			return fmt.Errorf("UnfollowChannel bump version: %w", err)
 		}
+		// 同时清零 auto_follow_threads —— 否则 OnThreadCreated 还会把该用户当作
+		// fanout 目标，违反"取消关注 = 不再自动跟随新子区"的语义。
 		if err := upsertTx(tx, uid, spaceID, targetTypeGroup, groupNo, ConvExtFields{
-			GroupUnfollowed: &one,
+			GroupUnfollowed:   &one,
+			AutoFollowThreads: &zero,
 		}); err != nil {
 			return fmt.Errorf("UnfollowChannel upsert group: %w", err)
 		}
