@@ -33,11 +33,14 @@ type Model struct {
 	// DMCategoryID 是 group_category.category_id（VARCHAR(32) UUID），DM 与群
 	// 共用同一分类 namespace（PR #21 Round-6，原型 image-v1.png 印证）。
 	// NULL 表示未分类。
-	DMCategoryID    *string   `db:"dm_category_id"`
-	GroupUnfollowed int8      `db:"group_unfollowed"`
-	FollowSort      int       `db:"follow_sort"`
-	CreatedAt       time.Time `db:"created_at"`
-	UpdatedAt       time.Time `db:"updated_at"`
+	DMCategoryID    *string `db:"dm_category_id"`
+	GroupUnfollowed int8    `db:"group_unfollowed"`
+	FollowSort      int     `db:"follow_sort"`
+	// AutoFollowThreads = 1 表示关注 target_type=2 群后，新建子区时自动给该 (uid, space_id) 物化 thread ext 行。
+	// 仅在 target_type=2 行上有意义；其他 target_type 写 0 保持。
+	AutoFollowThreads int8      `db:"auto_follow_threads"`
+	CreatedAt         time.Time `db:"created_at"`
+	UpdatedAt         time.Time `db:"updated_at"`
 }
 
 // ConvExtFields 描述 Upsert 时可更新的字段集合。
@@ -51,6 +54,8 @@ type ConvExtFields struct {
 	ClearDMCategory bool
 	GroupUnfollowed *int8
 	FollowSort      *int
+	// AutoFollowThreads 仅在 target_type=2 行有意义，nil 表示不更新该字段。
+	AutoFollowThreads *int8
 }
 
 // SortItem 是传给 UpdateSort 的单条排序项。
@@ -149,6 +154,12 @@ func buildUpsertParts(f ConvExtFields) (extraCols []string, extraVals []interfac
 		extraVals = append(extraVals, *f.FollowSort)
 		setClauses = append(setClauses, "follow_sort = ?")
 		setArgs = append(setArgs, *f.FollowSort)
+	}
+	if f.AutoFollowThreads != nil {
+		extraCols = append(extraCols, "auto_follow_threads")
+		extraVals = append(extraVals, *f.AutoFollowThreads)
+		setClauses = append(setClauses, "auto_follow_threads = ?")
+		setArgs = append(setArgs, *f.AutoFollowThreads)
 	}
 	return extraCols, extraVals, setClauses, setArgs
 }

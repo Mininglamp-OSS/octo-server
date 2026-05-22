@@ -132,6 +132,34 @@ func TestDB_Upsert_GroupUnfollowed(t *testing.T) {
 	assert.Equal(t, int8(1), m.GroupUnfollowed)
 }
 
+func TestDB_Upsert_AutoFollowThreads(t *testing.T) {
+	db := newDBForTest(t)
+
+	// Insert：通过新字段把群行写成"已关注且自动级联子区"。
+	require.NoError(t, db.Upsert("u1", "s1", 2, "grp-cascade", ConvExtFields{
+		GroupUnfollowed:   int8Ptr(0),
+		AutoFollowThreads: int8Ptr(1),
+	}))
+
+	m, err := db.Get("u1", "s1", 2, "grp-cascade")
+	require.NoError(t, err)
+	require.NotNil(t, m)
+	assert.Equal(t, int8(0), m.GroupUnfollowed)
+	assert.Equal(t, int8(1), m.AutoFollowThreads,
+		"AutoFollowThreads 字段应从 ConvExtFields 落库并通过 Get 读出")
+
+	// Update：再次 upsert 关掉级联开关，验证 ON DUPLICATE KEY UPDATE 路径。
+	require.NoError(t, db.Upsert("u1", "s1", 2, "grp-cascade", ConvExtFields{
+		AutoFollowThreads: int8Ptr(0),
+	}))
+	m, err = db.Get("u1", "s1", 2, "grp-cascade")
+	require.NoError(t, err)
+	require.NotNil(t, m)
+	assert.Equal(t, int8(0), m.AutoFollowThreads)
+	// GroupUnfollowed 未传，保持上次值 0。
+	assert.Equal(t, int8(0), m.GroupUnfollowed)
+}
+
 func TestDB_Upsert_NilFields_DoNotOverwrite(t *testing.T) {
 	db := newDBForTest(t)
 
