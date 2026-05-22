@@ -309,22 +309,39 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 				}
 			}
 		} else if channelType == common.ChannelTypeCommunityTopic.Uint8() {
-			// Thread: extract parent group_no and verify membership
-			parts := strings.SplitN(channelID, threadChannelIDSeparator, 2)
-			if len(parts) != 2 {
-				return errors.New("invalid thread channel_id format")
-			}
-			var count int
-			err := ba.db.session.SelectBySql(
-				"SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0",
-				parts[0], robotID,
-			).LoadOne(&count)
-			if err != nil {
-				ba.Error("查询群成员失败", zap.Error(err))
-				return errors.New("查询群成员失败")
-			}
-			if count == 0 {
-				return errors.New("bot is not a member of this group")
+			// Thread: extract parent group_no and verify membership.
+			//
+			// PR#121 R7 (YUJ-1671) — OBO bypass parity with Group above.
+			// CommunityTopic fan-out (`obo_fanout.go` / mention-gated)
+			// already delivers topic messages to clone bots that are
+			// NOT parent-group members; the bot must be allowed to reply
+			// on behalf of a grantor who IS a member. Without this
+			// bypass, `checkSendPermission` rejects the OBO reply with
+			// "bot is not a member of this group" before `checkOBO`
+			// gets the chance to authorize the grantor. Mirrors the
+			// `if !hasOBOContext` skip used by ChannelTypeGroup just
+			// above. Live grantor membership is still re-verified by
+			// `checkOBO` → `grantorCanReadChannel`, so the bypass does
+			// not widen access (the grantor must currently be in the
+			// parent group, or the implicit-scope membership branch
+			// will fail).
+			if !hasOBOContext {
+				parts := strings.SplitN(channelID, threadChannelIDSeparator, 2)
+				if len(parts) != 2 {
+					return errors.New("invalid thread channel_id format")
+				}
+				var count int
+				err := ba.db.session.SelectBySql(
+					"SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0",
+					parts[0], robotID,
+				).LoadOne(&count)
+				if err != nil {
+					ba.Error("查询群成员失败", zap.Error(err))
+					return errors.New("查询群成员失败")
+				}
+				if count == 0 {
+					return errors.New("bot is not a member of this group")
+				}
 			}
 		} else if channelType == common.ChannelTypePerson.Uint8() {
 			// DM: creator can always talk to their bot; otherwise check friend

@@ -92,30 +92,42 @@ func (ba *BotAPI) checkOBO(botUID, grantor, channelID string, channelType uint8)
 	// admin explicitly disabled, because the disabled scope row would be
 	// invisible to the check. Bubble up so the handler can 500 and the
 	// operator notices the outage.
-	hasExplicitScope, scopeExistErr := store.scopeRowExists(grant.ID, channelID, channelType)
-	if scopeExistErr != nil {
-		ba.Error("OBO scopeRowExists check failed",
-			zap.Int64("grant_id", grant.ID),
-			zap.String("channel_id", channelID),
-			zap.Uint8("channel_type", channelType),
-			zap.Error(scopeExistErr))
-		return scopeExistErr
-	}
-	if !ok && !hasExplicitScope && grant.GlobalEnabled == 1 && isGroupLikeChannelType(channelType) {
-		isMember, mErr := ba.grantorCanReadChannel(grantor, channelID, channelType)
-		if mErr != nil {
-			ba.Error("OBO implicit-scope membership check failed",
-				zap.String("grantor", grantor),
+	//
+	// PR#121 R7 (YUJ-1671) — only consult scopeRowExists when we actually
+	// need it, i.e. the explicit-scope check was negative (`!ok`) AND the
+	// channel type is one where implicit scope is possible
+	// (isGroupLikeChannelType). For DM (Person) and any future
+	// non-group-like channel, scopeRowExists adds nothing — the
+	// implicit-scope branch below would short-circuit on the
+	// isGroupLikeChannelType guard regardless. Skipping the redundant
+	// SELECT trims one DB round-trip off every successful OBO send (where
+	// `ok=true`), which is the dominant case.
+	if !ok && isGroupLikeChannelType(channelType) {
+		hasExplicitScope, scopeExistErr := store.scopeRowExists(grant.ID, channelID, channelType)
+		if scopeExistErr != nil {
+			ba.Error("OBO scopeRowExists check failed",
+				zap.Int64("grant_id", grant.ID),
 				zap.String("channel_id", channelID),
-				zap.Error(mErr))
-			return mErr
+				zap.Uint8("channel_type", channelType),
+				zap.Error(scopeExistErr))
+			return scopeExistErr
 		}
-		if isMember {
-			ba.Info("OBO checkOBO: implicit-scope approved (grantor is group member)",
-				zap.String("grantor", grantor),
-				zap.String("bot", botUID),
-				zap.String("channel_id", channelID))
-			ok = true
+		if !hasExplicitScope && grant.GlobalEnabled == 1 {
+			isMember, mErr := ba.grantorCanReadChannel(grantor, channelID, channelType)
+			if mErr != nil {
+				ba.Error("OBO implicit-scope membership check failed",
+					zap.String("grantor", grantor),
+					zap.String("channel_id", channelID),
+					zap.Error(mErr))
+				return mErr
+			}
+			if isMember {
+				ba.Info("OBO checkOBO: implicit-scope approved (grantor is group member)",
+					zap.String("grantor", grantor),
+					zap.String("bot", botUID),
+					zap.String("channel_id", channelID))
+				ok = true
+			}
 		}
 	}
 	if !ok {
