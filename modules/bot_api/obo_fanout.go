@@ -206,8 +206,9 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 	// (modulo the loop-protection gates) so the persona could observe
 	// the full conversation. v2 narrows the trigger: a fan-out copy is
 	// only minted when the inbound message explicitly summons the
-	// grantor via `payload.mention.uids`, OR sets `mention.all=1`
-	// (`@所有人` broadcast).
+	// grantor via `payload.mention.uids`, OR sets `mention.all=1` /
+	// `mention.humans=1` (`@所有人` broadcast — legacy WuKongIM uses
+	// `all`; Plan X web client uses `humans`, see YUJ-1709 / #125).
 	//
 	// PR#114 R3 (Jerry-Xin perf blocker) — the per-message mention gate
 	// runs BEFORE the grant DB lookup for group-like channels, so plain
@@ -723,17 +724,25 @@ func buildFanoutCopyReq(m *config.MessageResp, g *oboGrantModel, grantorName, se
 	)
 }
 
-// decodeMentionGate — YUJ-1465 / YUJ-1538. Pulls `mention.uids` and
-// `mention.all` off the raw payload. Returns:
+// decodeMentionGate — YUJ-1465 / YUJ-1538 / YUJ-1709 (octo-server#125).
+// Pulls `mention.uids`, `mention.all`, and `mention.humans` off the raw
+// payload. Returns:
 //   - mentionedUIDs: slice of distinct UIDs (sorted ascending for
 //     stable IN(...) bind ordering); empty when payload has no
 //     mention.uids or it is empty / malformed.
-//   - mentionAll: true iff `mention.all` is the integer 1 (numeric form)
-//     OR boolean true. Mirrors the two shapes real WuKongIM clients
-//     emit. PR#114 R3 + YUJ-1538.
+//   - mentionAll: true iff `mention.all` OR `mention.humans` is the
+//     integer 1 (numeric form) OR boolean true. The legacy WuKongIM
+//     clients emit `mention.all` (PR#114 R3 + YUJ-1538); the Plan X
+//     web client emits `mention.humans` (YUJ-1709 / #125) instead and
+//     never sets `mention.all`. Both shapes carry identical "@所有人"
+//     semantics from the user's POV, so the fan-out gate treats them
+//     equivalently. Downstream safety is unchanged: this only widens
+//     the gate's entry condition; the grant DB lookup + Gate 1/2/3 +
+//     scope/access checks all run as before.
 //
 // Returns (nil, false) on any decode error or absent `mention` field.
-// The fan-out narrowing gate treats (no uids, no all) as "no summon".
+// The fan-out narrowing gate treats (no uids, no all, no humans) as
+// "no summon".
 func decodeMentionGate(payload []byte) ([]string, bool) {
 	if len(payload) == 0 {
 		return nil, false
@@ -750,16 +759,34 @@ func decodeMentionGate(payload []byte) ([]string, bool) {
 	if !ok {
 		return nil, false
 	}
-	// mention.all — accept both numeric 1 and boolean true.
-	var all bool
-	if v, ok := mentionMap["all"]; ok && v != nil {
+	// truthy1 — accept both numeric 1 and boolean true. Mirrors the
+	// two shapes real WuKongIM / Plan X clients emit. Strings, null,
+	// missing, and any other type all decode to false (consistent with
+	// the YUJ-1538 contract pinned by TestDecodeMentionGate_*).
+	truthy1 := func(v interface{}) bool {
 		switch t := v.(type) {
 		case float64:
-			all = t == 1
+			return t == 1
 		case int:
-			all = t == 1
+			return t == 1
 		case bool:
-			all = t
+			return t
+		}
+		return false
+	}
+	// mention.all (legacy WuKongIM clients) — YUJ-1538.
+	var all bool
+	if v, ok := mentionMap["all"]; ok && v != nil {
+		all = truthy1(v)
+	}
+	// mention.humans (Plan X web client @所有人) — YUJ-1709 / #125.
+	// Plan X never co-emits `mention.all`, so without this branch the
+	// fan-out gate early-returns and any grantee bot for a grantor in
+	// the channel silently misses the OBO DM. Treated as identical to
+	// `mention.all` for gate purposes.
+	if !all {
+		if v, ok := mentionMap["humans"]; ok && v != nil {
+			all = truthy1(v)
 		}
 	}
 	// mention.uids — distinct, trim whitespace, drop empties.
