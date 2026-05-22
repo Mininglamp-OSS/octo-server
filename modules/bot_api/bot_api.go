@@ -85,6 +85,17 @@ type BotAPI struct {
 	// (uid, channel_id, channel_type) without touching MySQL.
 	// nil in production → the real DB-backed check runs.
 	oboChannelAccessOverride func(uid, channelID string, channelType uint8) (bool, error)
+	// oboGroupMemberOverride — PR#121 R8 (YUJ-1673). Test seam for
+	// `userIsGroupMember`, the (uid, group_no) → bool lookup used by
+	// Gate 4 (bot already in group) and by `grantorCanReadChannel`
+	// for ChannelTypeGroup / ChannelTypeCommunityTopic. Production
+	// path runs the `group_member` SELECT against MySQL; unit tests
+	// that build BotAPI without a live DB session set this hook to
+	// deterministically answer membership questions for the explicit-
+	// scope fan-out paths that previously could not be exercised in
+	// pure-Go tests (only the implicit-scope SQL-feeder filter was
+	// reachable). nil in production → the real DB-backed check runs.
+	oboGroupMemberOverride func(uid, groupNo string) (bool, error)
 	// oboDisplayNameLookup — YUJ-1465 / Mininglamp-OSS/octo-server#108
 	// (OBO v2). Test seam for resolving a uid → display name when the
 	// fan-out path builds the synthetic `obo_system_hint` string. Returns

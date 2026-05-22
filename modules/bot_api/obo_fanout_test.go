@@ -1425,3 +1425,93 @@ func TestFanout_PR121R6_ImplicitScopeMentionAllSummonsEveryone(t *testing.T) {
 		t.Fatalf("mention.all must reach both bot mailboxes, got %+v", seen)
 	}
 }
+
+// TestFanout_Gate4_CommunityTopic_BotInParentGroup_NoFanout — PR#121 R8
+// (Jerry-Xin + lml2468 blocking). Gate 4 originally only fired for
+// ChannelTypeGroup; for CommunityTopic, when the grantee bot was already
+// a parent-group member it received BOTH the direct WuKongIM delivery
+// AND the OBO fan-out copy — exactly the duplicate case Gate 4 prevents.
+//
+// Setup: grantor + grantee bot are BOTH members of the parent group.
+// An explicit scope row covers the topic channel (`<parent>____<short>`).
+// A third party (`u_bob`) posts to the topic with a mention summoning
+// the grantor.
+//
+// Expected: ZERO fan-out copies. The bot already receives the topic
+// message directly via the parent-group subscriber pipeline; an OBO copy
+// would be a strict duplicate (double processing / double reply).
+func TestFanout_Gate4_CommunityTopic_BotInParentGroup_NoFanout(t *testing.T) {
+	const parentGroup = "group_topic_parent_88"
+	const topicChan = parentGroup + "____topic_99"
+	ct := common.ChannelTypeCommunityTopic.Uint8()
+
+	s := seedGrantWithScope(t, topicChan, ct)
+	// Both grantor and grantee bot are in the parent group — the bot's
+	// direct delivery covers this topic, so Gate 4 must skip the fan-out.
+	s.seedGroupMember(parentGroup, tGrantor)
+	s.seedGroupMember(parentGroup, tBot)
+
+	fc := &fanoutCapture{}
+	ba := newBAforFanout(s, fc)
+	// Route the Gate 4 membership lookup through the fake store so the
+	// dispatch-loop check observes the seeded membership without a live
+	// DB.
+	ba.oboGroupMemberOverride = func(uid, groupNo string) (bool, error) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.groupMembers[groupNo][uid], nil
+	}
+
+	msg := &config.MessageResp{
+		FromUID:     "u_bob",
+		ChannelID:   topicChan,
+		ChannelType: ct,
+		Payload:     []byte(`{"type":1,"content":"@yu look at this","mention":{"uids":["` + tGrantor + `"]}}`),
+	}
+	if n := ba.fanoutForMessage(msg); n != 0 {
+		t.Fatalf("CommunityTopic Gate 4: bot in parent group must not fan out, got %d", n)
+	}
+	if len(fc.copies) != 0 {
+		t.Fatalf("CommunityTopic Gate 4 leaked: captured %d copies, expected 0", len(fc.copies))
+	}
+}
+
+// TestFanout_Gate4_CommunityTopic_BotNotInParentGroup_FansOut — control
+// case for the test above. Same setup EXCEPT the bot is NOT a parent-
+// group member. The OBO fan-out is the ONLY delivery path to the bot
+// (it isn't a direct topic subscriber), so Gate 4 must NOT fire and the
+// bot must receive exactly one fan-out copy.
+func TestFanout_Gate4_CommunityTopic_BotNotInParentGroup_FansOut(t *testing.T) {
+	const parentGroup = "group_topic_parent_89"
+	const topicChan = parentGroup + "____topic_100"
+	ct := common.ChannelTypeCommunityTopic.Uint8()
+
+	s := seedGrantWithScope(t, topicChan, ct)
+	// Grantor is in the parent group; bot is NOT. Bot only sees the
+	// message via OBO fan-out, so Gate 4 must NOT fire.
+	s.seedGroupMember(parentGroup, tGrantor)
+
+	fc := &fanoutCapture{}
+	ba := newBAforFanout(s, fc)
+	// Same DB-free membership shim as the sibling test — proves the
+	// Gate 4 branch correctly answers "bot NOT a parent-group member"
+	// and lets the fan-out through.
+	ba.oboGroupMemberOverride = func(uid, groupNo string) (bool, error) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.groupMembers[groupNo][uid], nil
+	}
+
+	msg := &config.MessageResp{
+		FromUID:     "u_bob",
+		ChannelID:   topicChan,
+		ChannelType: ct,
+		Payload:     []byte(`{"type":1,"content":"@yu look at this","mention":{"uids":["` + tGrantor + `"]}}`),
+	}
+	if n := ba.fanoutForMessage(msg); n != 1 {
+		t.Fatalf("CommunityTopic with bot outside parent group must fan out exactly 1, got %d", n)
+	}
+	if len(fc.copies) != 1 {
+		t.Fatalf("CommunityTopic control: expected 1 captured copy, got %d", len(fc.copies))
+	}
+}

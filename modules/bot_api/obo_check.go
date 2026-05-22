@@ -171,12 +171,13 @@ func (ba *BotAPI) oboStoreOrDefault() oboStore {
 }
 
 // botHasActiveGrantFrom reports whether bot `botUID` is currently authorised
-// as a grantee by `grantorUID` — i.e. there is an active+global_enabled row
-// in obo_grants for (grantor=grantorUID, grantee=botUID). It is a thin
-// boolean wrapper over the same `findActiveGrantByGrantorBot` store call
-// that checkOBO consults for its first layer, so it inherits the negative
-// cache fast path and the same "no row OR globally disabled → false"
-// contract.
+// as a grantee by `grantorUID` — i.e. there is an `active=1` row in
+// obo_grants for (grantor=grantorUID, grantee=botUID), REGARDLESS of the
+// `global_enabled` flag. It is a thin boolean wrapper over the
+// `findGrantByGrantorBotActiveOnly` store call (YUJ-1428 / PR#121 R5 / B3),
+// which deliberately bypasses the global_enabled predicate so the grantor-
+// reply bypass keeps working even when the persona is globally paused
+// (see the inline rationale below).
 //
 // Used by sendMessage to power the YUJ-1418 grantor-reply bypass: when a
 // persona-clone bot is asked to reply (on behalf of the grantor) to the

@@ -377,8 +377,15 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 		// double reply, identity confusion on @AI/@bot). The adapter-
 		// side mention logic handles identity switching (“@所有人 →
 		// respond as grantor”) for the direct-receipt path.
-		// Only applies to GROUP channels; DM fan-out is the sole
-		// delivery path (bot is never a “member” of the peer’s DM).
+		// Applies to GROUP and CommunityTopic channels; DM fan-out is
+		// the sole delivery path (bot is never a “member” of the peer’s
+		// DM). For CommunityTopic the membership we care about is the
+		// PARENT group: a topic message is delivered to every parent-
+		// group member, so a bot that is already in the parent group
+		// gets the message normally and the OBO copy would be a strict
+		// duplicate (same bug Gate 4 prevents for ChannelTypeGroup).
+		// Parent-group extraction mirrors grantorCanReadChannel /
+		// send.go — split on threadChannelIDSeparator.
 		//
 		// PR#121 perf: implicit-scope grants (sourced from
 		// findGlobalGrantsWithoutScope) have ALREADY been filtered by the
@@ -386,14 +393,34 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 		// `userIsGroupMember(bot)` query here is redundant for them. We
 		// keep it for explicit-scope grants (sourced from
 		// findActiveGrantsForChannel) where the bot-membership status is
-		// not part of the feeder's filter.
-		if !implicitGrantIDs[g.ID] && m.ChannelType == common.ChannelTypeGroup.Uint8() {
-			isBotInGroup, gErr := ba.userIsGroupMember(g.GranteeBotUID, lookupChannelID)
-			if gErr == nil && isBotInGroup {
-				ba.Info("OBO fan-out gate 4: bot is group member, skipping fan-out (adapter handles directly)",
-					zap.String("bot", g.GranteeBotUID),
-					zap.String("channel_id", lookupChannelID))
-				continue
+		// not part of the feeder's filter. The implicit-scope feeder
+		// only fires for ChannelTypeGroup today, so the implicit-grant
+		// skip below is a no-op for CommunityTopic.
+		if !implicitGrantIDs[g.ID] {
+			var membershipGroup string
+			switch m.ChannelType {
+			case common.ChannelTypeGroup.Uint8():
+				membershipGroup = lookupChannelID
+			case common.ChannelTypeCommunityTopic.Uint8():
+				parts := strings.SplitN(lookupChannelID, threadChannelIDSeparator, 2)
+				if len(parts) == 2 && parts[0] != "" {
+					membershipGroup = parts[0]
+				}
+				// Malformed thread id → leave membershipGroup empty
+				// and skip the check; downstream gates (TOCTOU
+				// re-check via grantorCanReadChannel) still fail-
+				// closed on the same malformed id.
+			}
+			if membershipGroup != "" {
+				isBotInGroup, gErr := ba.userIsGroupMember(g.GranteeBotUID, membershipGroup)
+				if gErr == nil && isBotInGroup {
+					ba.Info("OBO fan-out gate 4: bot is parent-group member, skipping fan-out (adapter handles directly)",
+						zap.String("bot", g.GranteeBotUID),
+						zap.String("channel_id", lookupChannelID),
+						zap.String("membership_group", membershipGroup),
+						zap.Uint8("channel_type", m.ChannelType))
+					continue
+				}
 			}
 		}
 		// PR#82 round-3 P1 — Multi-grantor DM recipient filter. For

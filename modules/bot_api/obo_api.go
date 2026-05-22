@@ -547,7 +547,15 @@ func (ba *BotAPI) grantorCanReadChannel(uid, channelID string, channelType uint8
 // userIsGroupMember returns true iff `uid` has an undeleted row in
 // group_member for group_no=groupNo. Mirrors the SQL used by
 // checkSendPermission's BotKindUser/ChannelTypeGroup branch.
+//
+// Test hook: ba.oboGroupMemberOverride lets unit tests stub the answer
+// without standing up MySQL (PR#121 R8 / YUJ-1673 — needed to exercise
+// the explicit-scope Gate 4 paths in fanoutForMessage). nil override →
+// DB path.
 func (ba *BotAPI) userIsGroupMember(uid, groupNo string) (bool, error) {
+	if ba.oboGroupMemberOverride != nil {
+		return ba.oboGroupMemberOverride(uid, groupNo)
+	}
 	if ba.db == nil || ba.db.session == nil {
 		// No DB session (some test contexts) — fail-closed.
 		return false, nil
