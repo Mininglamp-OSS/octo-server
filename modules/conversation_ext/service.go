@@ -64,6 +64,14 @@ type ThreadEnumerator interface {
 // + 后续 OnThreadCreated fanout 持续补齐。
 const maxAutoFollowThreadsPerChannel = 500
 
+// onThreadCreatedBatchSize 是 OnThreadCreated 给 follower 做 fanout 时单个 SQL
+// 处理的最大 (uid, space_id) 数量。MySQL prepared statement 占位符上限是
+// 65,535，本 fanout 单行 bulk INSERT IGNORE 用 4 个占位符 / bulk version bump
+// 用 3 个占位符。1000 留出充分余量同时让单 tx 锁窗口可控：N=10k follower 时
+// 按 10 个 tx 跑，每 tx 仅持锁 ~20ms 数量级。
+// var 而非 const 是为了让测试压到一个小值以低成本覆盖分批分支。
+var onThreadCreatedBatchSize = 1000
+
 // Service encapsulates composite operations on user_conversation_ext that
 // require a single transaction boundary.  It intentionally avoids importing
 // modules/group, modules/user, or modules/thread to prevent circular
@@ -178,18 +186,34 @@ func escapeLike(s string) string {
 // ---------------------------------------------------------------------------
 
 // FollowChannel marks the group as followed (group_unfollowed=0,
-// auto_follow_threads=1) and, in the same transaction, materializes thread
-// ext rows for up to maxAutoFollowThreadsPerChannel currently-active threads
-// under the channel.
+// auto_follow_threads=1) and materializes thread ext rows for up to
+// maxAutoFollowThreadsPerChannel currently-active threads under the channel.
 //
-// PR review (Round 3) Blocking #1/#2 — 关注状态变化时把 user_follow_version +1。
-// Upsert / Bump / fanout 在同一 tx 内执行，这样客户端只要观察 follow_version
-// 就能可靠检测到变化（即使物化了 N 个子区也只 +1，因为它是 user-level 单调序列）。
+// 两阶段提交（bug fix #2 race window）：
 //
-// 子区物化采用 INSERT IGNORE — 不覆盖用户既有的手动 follow_sort，新行 follow_sort
-// 保持默认 0 由客户端按"父 channel 之后聚拢渲染"规则决定位置。
+//  1. Phase 1 (tx)  ：bump follow_version + upsert 群行 (group_unfollowed=0,
+//     auto_follow_threads=1)，commit。auto_follow=1 一旦可见，并发新建的子区在
+//     thread.Service post-commit hook 中触发的 OnThreadCreated 会把本用户当作
+//     fanout 目标 ——── 这条 invariant 是覆盖 race window 的核心。
 //
-// 当未注入 ThreadEnumerator 时（单测 / 迁移期）跳过物化，仅写群行。
+//  2. Phase 2 (无 tx)：enumerate 当前 active 子区。在 Phase 1 commit 之后
+//     做这一步，意味着任意在 Phase 1 commit 之前已存在的子区都会进入快照；
+//     任意在快照之后才创建的子区则由 Phase 1 commit 后的 OnThreadCreated 兜底。
+//     两条路径合起来无遗漏；INSERT IGNORE 让任何重叠（同子区被两条路径都写）
+//     安全降为 no-op。
+//
+//  3. Phase 3 (tx)  ：bump follow_version + bulk INSERT IGNORE thread ext 行。
+//     失败时记日志但保留 Phase 1 的写入 —— 客户端会感知到 version bump 而触发
+//     重拉；missing 子区在下次 FollowChannel 或新子区 fanout 时补齐。
+//
+// 旧实现的 bug：enumerate 在 tx 外、auto_follow=1 写入之前；在 enumerate 与
+// commit 之间创建的子区会被永久遗漏 —— OnThreadCreated 看不到 auto_follow=1，
+// enumerate 的快照也没拿到该子区。
+//
+// follow_version 在两个 tx 各 +1（合计 +2 在无并发场景下）：单调递增即可，
+// 客户端只需在变化时拉一次 sidebar，多 +1 不影响正确性。
+//
+// 当未注入 ThreadEnumerator 时（单测 / 迁移期）跳过 Phase 2/3，仅写群行。
 func (s *Service) FollowChannel(uid, spaceID, groupNo string) error {
 	if err := validateBase(uid, spaceID); err != nil {
 		return err
@@ -198,37 +222,52 @@ func (s *Service) FollowChannel(uid, spaceID, groupNo string) error {
 		return errors.New("group_no must not be empty")
 	}
 
-	// 先在 tx 外把活跃子区 shortID 拉出来 —— 把潜在的跨表 / 大查询挪到事务外，
-	// 缩短 ext 行锁 + follow_version 行锁的持有时间。
-	var shortIDs []string
-	if enum := s.getThreadEnumerator(); enum != nil {
-		ids, err := enum.EnumerateActiveShortIDs(groupNo, maxAutoFollowThreadsPerChannel)
-		if err != nil {
-			return fmt.Errorf("FollowChannel enumerate threads: %w", err)
-		}
-		shortIDs = ids
-	}
-
 	zero := int8(0)
 	one := int8(1)
-	// PR #21 review (lml2468 blocker #2)：所有同时触及 user_follow_version 与
-	// user_conversation_ext 的事务必须按相同顺序拿锁。把 Bump 放在最前 ——
-	// 它通过 ON DUPLICATE KEY UPDATE 对 user_follow_version (uid, space_id)
-	// 行加 X 锁，使本 tx 在 version 行上有排它后再进入 ext 行操作。
-	return s.withTx("FollowChannel", func(tx *dbr.Tx) error {
+
+	// Phase 1：commit auto_follow=1 + group_unfollowed=0 + bump version。
+	// PR #21 review (lml2468 blocker #2)：先锁 follow_version 行再写 ext，与
+	// UpdateSort 同序拿锁，避免 (version vs ext) 反向死锁。
+	if err := s.withTx("FollowChannel-phase1", func(tx *dbr.Tx) error {
 		if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
-			return fmt.Errorf("FollowChannel bump version: %w", err)
+			return fmt.Errorf("FollowChannel phase1 bump version: %w", err)
 		}
 		if err := upsertTx(tx, uid, spaceID, targetTypeGroup, groupNo, ConvExtFields{
 			GroupUnfollowed:   &zero,
 			AutoFollowThreads: &one,
 		}); err != nil {
-			return fmt.Errorf("FollowChannel upsert: %w", err)
+			return fmt.Errorf("FollowChannel phase1 upsert: %w", err)
 		}
-		if len(shortIDs) > 0 {
-			if err := bulkInsertIgnoreThreadExtTx(tx, uid, spaceID, groupNo, shortIDs); err != nil {
-				return fmt.Errorf("FollowChannel materialize threads: %w", err)
-			}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	enum := s.getThreadEnumerator()
+	if enum == nil {
+		return nil
+	}
+
+	// Phase 2：在 Phase 1 commit 之后枚举 —— race-window 已被关闭。
+	shortIDs, err := enum.EnumerateActiveShortIDs(groupNo, maxAutoFollowThreadsPerChannel)
+	if err != nil {
+		// Phase 1 已经 commit；client 仍能观察到 auto_follow=1 + 后续新子区 fanout，
+		// 只是初始批的子区未物化。错误向上返回让调用方记录，但不回滚 Phase 1。
+		return fmt.Errorf("FollowChannel enumerate threads: %w", err)
+	}
+	if len(shortIDs) == 0 {
+		return nil
+	}
+
+	// Phase 3：bulk INSERT IGNORE thread ext + bump version。INSERT IGNORE 让
+	// 与并发 OnThreadCreated 的重叠安全（同 (uid, target_type=5, target_id)
+	// 由 UK 守护，重复写不会产生第二行）。
+	return s.withTx("FollowChannel-phase3", func(tx *dbr.Tx) error {
+		if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
+			return fmt.Errorf("FollowChannel phase3 bump version: %w", err)
+		}
+		if err := bulkInsertIgnoreThreadExtTx(tx, uid, spaceID, groupNo, shortIDs); err != nil {
+			return fmt.Errorf("FollowChannel phase3 materialize threads: %w", err)
 		}
 		return nil
 	})
@@ -359,22 +398,39 @@ func (s *Service) OnThreadCreated(groupNo, shortID string) error {
 
 	threadChannelID := groupNo + threadSeparator + shortID
 
-	// 2. 单 tx 内批量化两次写：一次性 bump N 个 (uid, space_id) 的 version，
-	//    一次性 INSERT IGNORE N 个 thread ext 行。
+	// 2. 按 batch 切分，每 batch 一个 tx：
+	//    - 单 tx 内仍批量化两条 SQL（bulk bump version + bulk INSERT IGNORE），
+	//      避免 per-user round-trip 的 O(N) 延迟。
+	//    - batch 之间换 tx 防止两件事：
+	//      (a) 单 tx 持锁窗口随 N 线性增长拖慢其它 follow 操作；
+	//      (b) bug fix #3 —— 单 SQL 占位符数超过 MySQL 65,535 上限。
+	//    - INSERT IGNORE + version 单调递增 让"前一 batch 已 commit、后一 batch
+	//      失败"的 partial-success 状态可恢复：下次 FollowChannel / 新建子区
+	//      fanout 会把缺失的用户补齐。
 	//    锁顺序仍是 follow_version 先于 ext —— 与 FollowChannel / UpdateSort 一致。
-	//
-	//    为何不走 per-user loop：在 N=10000 用户的基准下，逐行 BumpFollowVersionTx
-	//    + InsertBySql 要 2*N 个 round-trip（~3.4s）。批量化两条 SQL 后 N=10000
-	//    降到一位数 ms（实测见 bench）。
-	return s.withTx("OnThreadCreated", func(tx *dbr.Tx) error {
-		if err := bulkBumpFollowVersionTx(tx, targets); err != nil {
-			return fmt.Errorf("OnThreadCreated bulk bump version: %w", err)
+	batchSize := onThreadCreatedBatchSize
+	if batchSize <= 0 {
+		batchSize = 1000
+	}
+	for start := 0; start < len(targets); start += batchSize {
+		end := start + batchSize
+		if end > len(targets) {
+			end = len(targets)
 		}
-		if err := bulkInsertIgnoreThreadExtForUsersTx(tx, targets, threadChannelID); err != nil {
-			return fmt.Errorf("OnThreadCreated bulk insert thread ext: %w", err)
+		batch := targets[start:end]
+		if err := s.withTx("OnThreadCreated", func(tx *dbr.Tx) error {
+			if err := bulkBumpFollowVersionTx(tx, batch); err != nil {
+				return fmt.Errorf("OnThreadCreated bulk bump version: %w", err)
+			}
+			if err := bulkInsertIgnoreThreadExtForUsersTx(tx, batch, threadChannelID); err != nil {
+				return fmt.Errorf("OnThreadCreated bulk insert thread ext: %w", err)
+			}
+			return nil
+		}); err != nil {
+			return fmt.Errorf("OnThreadCreated batch [%d,%d): %w", start, end, err)
 		}
-		return nil
-	})
+	}
+	return nil
 }
 
 // bulkBumpFollowVersionTx 一次性给一批 (uid, space_id) bump version +1。

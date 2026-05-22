@@ -300,3 +300,47 @@ func TestRemoveConvExtForChannel_NilGlobalDB(t *testing.T) {
 		RemoveConvExtForChannel("ch", 2)
 	})
 }
+
+// ---------------------------------------------------------------------------
+// UnfollowGroupsTx must clear auto_follow_threads (bug fix #1)
+//
+// 删除分类时 category 模块调用 UnfollowGroupsTx 把分类下的群批量取关。
+// 若漏掉 auto_follow_threads=0，后续这些群里新建子区时 OnThreadCreated 仍会按
+// auto_follow_threads=1 把已取关的用户当作 fanout 目标，违反"取消关注 =
+// 不再自动跟随新子区"的语义。本测试与 service.UnfollowChannel 同语义守护。
+// ---------------------------------------------------------------------------
+
+func TestUnfollowGroupsTx_ClearsAutoFollowThreads(t *testing.T) {
+	ctx := newCtxForTest(t)
+	db := initGlobalConvExtDBForTest(t, ctx)
+	_, err := ctx.DB().DeleteFrom(table).Exec()
+	require.NoError(t, err)
+
+	const uid, space, grp1, grp2 = "u-cat-uf", "sp-cat", "grp-cat-1", "grp-cat-2"
+	// 模拟用户对两个群都开启了级联关注（FollowChannel 写入的状态）。
+	one := int8(1)
+	zero := int8(0)
+	require.NoError(t, db.Upsert(uid, space, targetTypeGroup, grp1, ConvExtFields{
+		GroupUnfollowed:   &zero,
+		AutoFollowThreads: &one,
+	}))
+	require.NoError(t, db.Upsert(uid, space, targetTypeGroup, grp2, ConvExtFields{
+		GroupUnfollowed:   &zero,
+		AutoFollowThreads: &one,
+	}))
+
+	tx, err := db.session.Begin()
+	require.NoError(t, err)
+	defer tx.RollbackUnlessCommitted()
+	require.NoError(t, UnfollowGroupsTx(tx, uid, space, []string{grp1, grp2}))
+	require.NoError(t, tx.Commit())
+
+	for _, grp := range []string{grp1, grp2} {
+		row, err := db.Get(uid, space, targetTypeGroup, grp)
+		require.NoError(t, err)
+		require.NotNil(t, row)
+		assert.Equal(t, int8(1), row.GroupUnfollowed, "%s 应被标记为取消关注", grp)
+		assert.Equal(t, int8(0), row.AutoFollowThreads,
+			"%s 必须清掉 auto_follow_threads，否则 OnThreadCreated 还会把已取关用户当目标", grp)
+	}
+}

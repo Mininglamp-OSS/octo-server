@@ -20,12 +20,16 @@ func UnfollowGroupsTx(tx *dbr.Tx, uid, spaceID string, groupNos []string) error 
 		return nil
 	}
 	one := int8(1)
+	zero := int8(0)
 	for _, groupNo := range groupNos {
 		if groupNo == "" {
 			continue
 		}
+		// 必须同时清 auto_follow_threads —— 与 service.UnfollowChannel 同语义：否则
+		// 后续 OnThreadCreated 会按 auto_follow_threads=1 把已取关的用户当 fanout 目标。
 		if err := upsertTx(tx, uid, spaceID, targetTypeGroup, groupNo, ConvExtFields{
-			GroupUnfollowed: &one,
+			GroupUnfollowed:   &one,
+			AutoFollowThreads: &zero,
 		}); err != nil {
 			return fmt.Errorf("UnfollowGroupsTx upsert group %q: %w", groupNo, err)
 		}

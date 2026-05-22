@@ -322,8 +322,64 @@ func TestService_FollowChannel_VersionBumpedOnce(t *testing.T) {
 	require.NoError(t, svc.FollowChannel(uid, space, grp))
 
 	v := readFollowVersion(t, svc, uid, space)
-	assert.Equal(t, int64(1), v,
-		"FollowChannel 即便物化 N 个子区，也只应 bump follow_version 一次（user-level 单调序列）")
+	// Bug fix #2 后 FollowChannel 拆 phase1/phase3 两次 commit，各 bump 一次 ——
+	// 关键不变量是 bump 次数与子区数量 N 无关（不会出现 "1 + N"），保持小常数即可。
+	assert.LessOrEqual(t, v, int64(2),
+		"FollowChannel 物化 N 个子区，bump follow_version 的次数应为小常数（2 次），不与 N 成比例")
+	assert.GreaterOrEqual(t, v, int64(1), "follow_version 至少 +1")
+}
+
+// observingEnumerator 是 race-window 测试用的桩：每次 EnumerateActiveShortIDs
+// 被调用时回调一次 observe，让测试观察"FollowChannel 走到 enumerate 步骤时数据库的状态"。
+type observingEnumerator struct {
+	groups  map[string][]string
+	observe func(groupNo string)
+}
+
+func (o *observingEnumerator) EnumerateActiveShortIDs(groupNo string, limit int) ([]string, error) {
+	if o.observe != nil {
+		o.observe(groupNo)
+	}
+	ids := o.groups[groupNo]
+	if limit > 0 && len(ids) > limit {
+		ids = ids[:limit]
+	}
+	return ids, nil
+}
+
+func TestService_FollowChannel_AutoFollowCommittedBeforeEnumeration(t *testing.T) {
+	// Bug fix #2: 在 FollowChannel enumerate active 子区之前，
+	// auto_follow_threads=1 必须已经提交可见。否则在 enumerate 与 FollowChannel 提交
+	// 之间新建的子区，OnThreadCreated 看不到本用户的 auto_follow=1 而漏发，
+	// 同时 enumerate 的旧快照也不含该子区，导致永久遗漏。
+	//
+	// 通过观察 enumerate 调用时刻 svc.db.Get（独立连接，只看 committed 状态）
+	// 返回的群行是否已有 auto_follow_threads=1 来锁住这个不变量。
+	svc := newServiceForTest(t)
+	const uid, space, grp = "u-race-fc", "s-race", "grp-race-fc"
+
+	enum := &observingEnumerator{
+		groups: map[string][]string{grp: {"t1", "t2"}},
+		observe: func(g string) {
+			row, err := svc.db.Get(uid, space, targetTypeGroup, g)
+			require.NoError(t, err)
+			require.NotNil(t, row, "auto_follow=1 必须已 commit 才可以 enumerate；"+
+				"否则并发新建子区的 OnThreadCreated 看不到本用户而漏 fanout")
+			assert.Equal(t, int8(1), row.AutoFollowThreads,
+				"auto_follow_threads 应在 enumerate 之前 commit；当前未 commit 意味着 "+
+					"FollowChannel 与并发 OnThreadCreated 之间存在丢子区竞态")
+		},
+	}
+	svc.SetThreadEnumerator(enum)
+
+	require.NoError(t, svc.FollowChannel(uid, space, grp))
+
+	// 二段提交后两个 thread 行都应存在。
+	for _, sid := range []string{"t1", "t2"} {
+		row, err := svc.db.Get(uid, space, targetTypeThread, grp+threadSeparator+sid)
+		require.NoError(t, err)
+		assert.NotNil(t, row)
+	}
 }
 
 func TestService_FollowChannel_PreservesExistingThreadSort(t *testing.T) {
@@ -437,6 +493,43 @@ func TestService_OnThreadCreated_Idempotent_PreservesExistingRow(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, row)
 	assert.Equal(t, 88, row.FollowSort, "已存在的 thread 行（含手动排序）必须保留，INSERT IGNORE 不应覆盖")
+}
+
+func TestService_OnThreadCreated_ChunksLargeTargetList(t *testing.T) {
+	// Bug fix #3: 当 channel 的 auto_follow follower 数量超过单条 SQL 的占位符上限
+	// （MySQL 65535 / 4 ≈ 16k），整批写会被驱动直接报错并整体失败。
+	// 本测试通过把 batch 大小压到 5、放 13 个 follower（不能被整除 → 3 个 batch：
+	// 5+5+3）来验证分批逻辑：每个目标用户都应拿到 ext 行 + version +1。
+	original := onThreadCreatedBatchSize
+	onThreadCreatedBatchSize = 5
+	defer func() { onThreadCreatedBatchSize = original }()
+
+	svc := newServiceForTest(t)
+	const space, grp, shortID = "s-batch", "grp-batch", "thr-batch"
+	const numUsers = 13
+
+	one := int8(1)
+	zero := int8(0)
+	for i := 0; i < numUsers; i++ {
+		uid := "u-batch-" + intToStrAFT(i)
+		require.NoError(t, svc.db.Upsert(uid, space, targetTypeGroup, grp, ConvExtFields{
+			GroupUnfollowed:   &zero,
+			AutoFollowThreads: &one,
+		}))
+	}
+
+	require.NoError(t, svc.OnThreadCreated(grp, shortID))
+
+	channelID := grp + threadSeparator + shortID
+	for i := 0; i < numUsers; i++ {
+		uid := "u-batch-" + intToStrAFT(i)
+		row, err := svc.db.Get(uid, space, targetTypeThread, channelID)
+		require.NoError(t, err)
+		assert.NotNil(t, row, "user %s 应在跨 batch fanout 中拿到 thread ext 行", uid)
+		v := readFollowVersion(t, svc, uid, space)
+		assert.Equal(t, int64(1), v,
+			"跨 batch fanout：user %s 的 follow_version 应 +1（每用户每次 fanout 单调一次）", uid)
+	}
 }
 
 func TestService_OnThreadCreated_InvalidInput(t *testing.T) {

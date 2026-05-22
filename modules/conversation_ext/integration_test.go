@@ -615,8 +615,11 @@ func TestIntegration_ChannelCascade_FollowVersionBumpedOnce(t *testing.T) {
 		uid, space,
 	).LoadOne(&after))
 
-	assert.Equal(t, before+1, after,
-		"FollowChannel 即便物化 5 个子区也只 bump follow_version 一次（user-level 单调）")
+	// Bug fix #2 后 FollowChannel 拆两阶段提交，每阶段 +1 共 +2。
+	// 不变量：bump 次数与子区数 N 无关，保持小常数（≤2）。
+	assert.LessOrEqual(t, after-before, int64(2),
+		"FollowChannel 物化 N 个子区，bump follow_version 的次数应为小常数（2 次），不与 N 成比例")
+	assert.GreaterOrEqual(t, after-before, int64(1), "follow_version 至少 +1")
 }
 
 // ---------------------------------------------------------------------------
