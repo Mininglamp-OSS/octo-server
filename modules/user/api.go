@@ -21,6 +21,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/model"
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/source"
+	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	rd "github.com/go-redis/redis"
@@ -153,12 +154,10 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 	rlCtx := context.Background()
 	// 限流状态存 Redis，多副本共享配额；生命周期跟随进程，与 main.go 的做法一致
 	// PoolSize 显式设 10：理由同 main.go——限流 Lua 脚本短事务，不需要大池。
-	rlRedis := rd.NewClient(&rd.Options{
-		Addr:       u.ctx.GetConfig().DB.RedisAddr,
-		Password:   u.ctx.GetConfig().DB.RedisPass,
-		MaxRetries: 1,
-		PoolSize:   10,
-	})
+	rlRedis := rd.NewClient(octoredis.MustBuildOptions(u.ctx.GetConfig(), func(o *rd.Options) {
+		o.MaxRetries = 1
+		o.PoolSize = 10
+	}))
 	// burst 取小值：人类正常重试容忍 + 不给攻击者初始白嫖窗口
 	// tag 用稳定字符串分离 keyspace；注意 register 和 sms 参数相同但语义不同，必须分开
 	loginLimit := appwkhttp.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "login", 10.0/60, 5)       // 10 req/min, burst 5

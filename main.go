@@ -20,6 +20,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	octodb "github.com/Mininglamp-OSS/octo-server/pkg/db"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
+	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	"github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"github.com/gin-gonic/gin"
 	rd "github.com/go-redis/redis"
@@ -124,12 +125,10 @@ func runAPI(ctx *config.Context) {
 	// 生命周期：跟随进程存续，不显式 Close——与 lib 自身的 redis.Conn 处理方式一致。
 	// PoolSize 显式设 10：令牌桶 Lua 脚本是短事务，Redis 端 <1ms，不需要大池；
 	// go-redis v6 默认 10*NumCPU 在大核机上会失控（多副本 × 多 client 连接数叠加）。
-	rlRedis := rd.NewClient(&rd.Options{
-		Addr:       ctx.GetConfig().DB.RedisAddr,
-		Password:   ctx.GetConfig().DB.RedisPass,
-		MaxRetries: 1,
-		PoolSize:   10,
-	})
+	rlRedis := rd.NewClient(octoredis.MustBuildOptions(ctx.GetConfig(), func(o *rd.Options) {
+		o.MaxRetries = 1
+		o.PoolSize = 10
+	}))
 	s.GetRoute().UseGin(wkhttp.RateLimitMiddleware(context.Background(), rlRedis, rps, burst, "/v1/ping"))
 	// CORS 白名单覆盖：dmwork-lib 的 server.New 默认注入 "*" + Credentials:true，
 	// 本中间件在其后执行，按 DM_CORS_ALLOWED_ORIGINS 重写/剥离 Allow-Origin/Credentials。

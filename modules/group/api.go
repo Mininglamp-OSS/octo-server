@@ -28,6 +28,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/source"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"github.com/gin-gonic/gin"
@@ -143,12 +144,10 @@ func (g *Group) Route(r *wkhttp.WKHttp) {
 	//   - DM_API_GROUP_INVITE_RPS   每秒填充速率（float，缺省 60.0）
 	//   - DM_API_GROUP_INVITE_BURST 桶容量（int，缺省 200）
 	// 生产环境如需收紧，在部署时设置 env（如 RPS=0.1667 / BURST=5 恢复到 10 req/min）。
-	rlRedis := redis.NewClient(&redis.Options{
-		Addr:       g.ctx.GetConfig().DB.RedisAddr,
-		Password:   g.ctx.GetConfig().DB.RedisPass,
-		MaxRetries: 1,
-		PoolSize:   10,
-	})
+	rlRedis := redis.NewClient(octoredis.MustBuildOptions(g.ctx.GetConfig(), func(o *redis.Options) {
+		o.MaxRetries = 1
+		o.PoolSize = 10
+	}))
 	inviteRPS := appwkhttp.ParseRPSFromEnv("DM_API_GROUP_INVITE_RPS", 60.0) // 默认 60 rps ≈ 3600 req/min
 	inviteBurst := appwkhttp.ParseBurstFromEnv("DM_API_GROUP_INVITE_BURST", 200)
 	groupInviteLimit := appwkhttp.StrictIPRateLimitMiddleware(context.Background(), rlRedis, "group_invite", inviteRPS, inviteBurst)

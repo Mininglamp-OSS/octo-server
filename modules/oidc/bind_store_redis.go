@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	rd "github.com/go-redis/redis"
 )
 
@@ -68,15 +69,12 @@ type redisBindStore struct {
 }
 
 func newRedisBindStore(ctx *config.Context) *redisBindStore {
-	cfg := ctx.GetConfig()
-	client := rd.NewClient(&rd.Options{
-		Addr:         cfg.DB.RedisAddr,
-		Password:     cfg.DB.RedisPass,
-		MaxRetries:   3,
-		ReadTimeout:  3 * time.Second,
-		WriteTimeout: 3 * time.Second,
-		DialTimeout:  3 * time.Second,
-	})
+	client := rd.NewClient(octoredis.MustBuildOptions(ctx.GetConfig(), func(o *rd.Options) {
+		o.MaxRetries = 3
+		o.ReadTimeout = 3 * time.Second
+		o.WriteTimeout = 3 * time.Second
+		o.DialTimeout = 3 * time.Second
+	}))
 	return &redisBindStore{client: client}
 }
 

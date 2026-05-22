@@ -28,6 +28,9 @@ mode: "debug" #   运行模式 debug or release
 #  mysqlAddr: "root:demo@tcp(127.0.0.1:3306)/test?charset=utf8mb4&parseTime=true" # mysql连接地址
 #  redisAddr: "" # redis地址
 #  redisPass: "" # redis密码
+#  redisTLS: false # 启用 TLS（rediss://），用于 AWS ElastiCache / Azure Cache 等托管服务
+#  redisTLSInsecureSkipVerify: false # 跳过 TLS 证书校验（仅用于测试 / 自签名证书）
+#  redisTLSCAFile: "" # 自定义 CA 证书路径（可选，留空走系统 CA 池）
 #  asynctaskRedisAddr: "" # 异步任务的redis地址 不写默认为RedisAddr的地址
 
 ##################### 外网配置 ####################

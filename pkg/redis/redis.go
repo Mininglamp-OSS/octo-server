@@ -17,13 +17,21 @@ type Conn struct {
 }
 
 func New(addr string, password string) *Conn {
-	c := &Conn{}
-	c.client = rd.NewClient(&rd.Options{
+	return NewWithOptions(&rd.Options{
 		Addr:       addr,
-		MaxRetries: 3, // 失败重试次数
+		MaxRetries: 3,
 		Password:   password,
 	})
-	return c
+}
+
+// NewWithOptions 用调用方构造的 *redis.Options 建立连接。
+// 调用方应当先用 BuildOptions/MustBuildOptions 从 cfg 构造 Options，
+// 以便 TLS 等公共配置被统一应用。
+func NewWithOptions(opts *rd.Options) *Conn {
+	if opts.MaxRetries == 0 {
+		opts.MaxRetries = 3
+	}
+	return &Conn{client: rd.NewClient(opts)}
 }
 
 func (rc *Conn) Ping() (string, error) {

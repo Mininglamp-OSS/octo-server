@@ -9,6 +9,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	libwkhttp "github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	rd "github.com/go-redis/redis"
 	"go.uber.org/zap"
 )
@@ -67,12 +68,10 @@ func SharedUIDRateLimiter(ctx *config.Context) libwkhttp.HandlerFunc {
 	// Eval/Script 接口，令牌桶 Lua 脚本必须走原生 go-redis。生命周期跟随进程。
 	// ctx 传 context.Background()：go-redis v6 的 Script.Run 不接受 context；
 	// 即便未来升级到 v8+ 也不应传请求 ctx（token 消耗不可因客户端断连回退）。
-	client := rd.NewClient(&rd.Options{
-		Addr:       ctx.GetConfig().DB.RedisAddr,
-		Password:   ctx.GetConfig().DB.RedisPass,
-		MaxRetries: 1,
-		PoolSize:   uidRateLimitPoolSize,
-	})
+	client := rd.NewClient(octoredis.MustBuildOptions(ctx.GetConfig(), func(o *rd.Options) {
+		o.MaxRetries = 1
+		o.PoolSize = uidRateLimitPoolSize
+	}))
 	uidRateLimitMW = UIDRateLimitMiddleware(context.Background(), client, rps, burst)
 	uidRateLimitReady = true
 	return uidRateLimitMW

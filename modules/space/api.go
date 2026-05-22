@@ -18,6 +18,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkevent"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	rd "github.com/go-redis/redis"
@@ -96,12 +97,10 @@ func (s *Space) Route(r *wkhttp.WKHttp) {
 	// 两个端点共享同一 limiter，使同一 IP 跨端点总配额受控。
 	// 阈值与 user 模块 login 同档（10 req/min, burst 5），详见 PR #1090。
 	// PoolSize=10：Lua 脚本短事务，与 user 模块 / main.go 保持一致。
-	rlRedis := rd.NewClient(&rd.Options{
-		Addr:       s.ctx.GetConfig().DB.RedisAddr,
-		Password:   s.ctx.GetConfig().DB.RedisPass,
-		MaxRetries: 1,
-		PoolSize:   10,
-	})
+	rlRedis := rd.NewClient(octoredis.MustBuildOptions(s.ctx.GetConfig(), func(o *rd.Options) {
+		o.MaxRetries = 1
+		o.PoolSize = 10
+	}))
 	invitePreviewLimit := appwkhttp.StrictIPRateLimitMiddleware(context.Background(), rlRedis, "space_invite", 10.0/60, 5)
 
 	open := r.Group("/v1/space")
