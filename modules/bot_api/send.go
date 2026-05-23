@@ -183,20 +183,20 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 		payload = ba.enrichBotPayloadWithSpaceID(c, robotID, payload)
 	}
 
-	// YUJ-202 / Mininglamp-OSS#94 / YUJ-1389 (Plan X) — mention
-	// three-state rewrite. Same chokepoint contract as
-	// modules/message/api.go: legacy `mention.all=1` is normalized to
-	// also carry `mention.ais=1` so legacy `@所有人` traffic auto-fans-
-	// out to all AI bots without requiring an SDK update on the
-	// sender side (outbound double-write keeps `all=1` for old
-	// read-side clients that only understand the legacy field).
-	// `mention.humans=1` remains an explicit, opt-in human-
-	// notification signal — it is NEVER inferred from `all=1`.
-	// ⚠️ F2 (PR#70 Jerry-Xin correctness-critical review): this MUST
-	// be placed OUTSIDE the `ChannelTypePerson` conditional above —
-	// otherwise group / community-topic `@所有人` traffic (the main
-	// pain-point being fixed) would bypass the rewrite. Helper is
-	// idempotent and safe on nil — see pkg/mentionrewrite.
+	// YUJ-202 / Mininglamp-OSS#94 / #142 — mention pass-through
+	// chokepoint. Same contract as modules/message/api.go: post-#142
+	// the helper no longer infers `mention.ais=1` from legacy
+	// `mention.all=1` (legacy `@所有人` MUST NOT trigger bots). The
+	// helper is now a pass-through that forwards `mention.all`,
+	// `mention.humans`, `mention.ais`, and `mention.uids` untouched.
+	// The call site is preserved so any future re-introduction of
+	// chokepoint normalization (and the symmetric ingress on
+	// modules/message/api.go + modules/robot/api.go) lands in one
+	// place. ⚠️ F2 (PR#70 Jerry-Xin correctness-critical review): this
+	// MUST stay OUTSIDE the `ChannelTypePerson` conditional above —
+	// otherwise group / community-topic mention payloads would bypass
+	// the chokepoint should we ever need to reinstate the rewrite.
+	// Helper is idempotent and safe on nil — see pkg/mentionrewrite.
 	payload = mentionrewrite.RewriteMention(payload)
 
 	// YUJ-1166 fan-out loop guard #3: mark this message so the fan-out

@@ -186,17 +186,25 @@ func (rb *Robot) robotMessageListen(messages []*config.MessageResp) {
 						}
 					}
 				}
-				// YUJ-1393 / PR#82 review #2 R2 (Jerry-Xin 2026-05-19
-				// follow-up): mention.ais=1 means "@所有 AI" (Plan X /
-				// YUJ-1389). The robot event dispatcher previously only
-				// considered robot_id / mention.uids / @username text,
-				// so a payload carrying only mention.ais=1 (no uids,
-				// no @username) silently skipped the robot event queue
-				// and group bots never received the "@所有 AI" broadcast
-				// — including the very common legacy `mention.all=1`
-				// case, which the send-side rewrite chokepoints
-				// (pkg/mentionrewrite/rewrite.go) normalize to also
-				// carry `mention.ais=1`.
+				// YUJ-1393 / PR#82 review #2 R2 / #142 follow-up:
+				// mention.ais=1 means "@所有 AI" (Plan X / YUJ-1389).
+				// The robot event dispatcher previously only considered
+				// robot_id / mention.uids / @username text, so a payload
+				// carrying only mention.ais=1 (no uids, no @username)
+				// silently skipped the robot event queue and group bots
+				// never received the "@所有 AI" broadcast.
+				//
+				// Post-#142 (`pkg/mentionrewrite` reverted to pass-
+				// through): legacy `mention.all=1` is NO LONGER
+				// auto-promoted to `mention.ais=1` by the send-side
+				// chokepoint. New clients that want their `@所有 AI`
+				// broadcast to summon group bots MUST set
+				// `mention.ais=1` explicitly. Legacy clients that only
+				// emit `mention.all=1` will not trigger this branch —
+				// that is intentional and matches the OBO fan-out
+				// gate's post-#142 contract (see modules/bot_api/
+				// obo_fanout.go: `mention.all` alone is not a bot
+				// summon).
 				//
 				// Scope: GROUP channels only. PERSONAL DMs are already
 				// dispatched via the realUID branch above and have no

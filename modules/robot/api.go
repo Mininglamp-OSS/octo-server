@@ -438,17 +438,17 @@ func (rb *Robot) sendMessage(c *wkhttp.Context) {
 		payload = rb.enrichBotPayloadWithSpaceID(robotID, payload)
 	}
 
-	// YUJ-202 / Mininglamp-OSS#94 — mention three-state rewrite. Same
-	// chokepoint contract as the user and bot API ingresses: legacy
-	// `mention.all=1` is normalized (Plan X / YUJ-1389) to also carry
-	// `mention.ais=1`, with `all=1` preserved on the outbound payload
-	// for old read-side clients (double-write). `mention.humans=1` is
-	// NEVER inferred from legacy `all=1` — humans is the explicit human-
-	// notification signal and must be set by the client. ⚠️ F2 (PR#70
-	// Jerry-Xin correctness-critical review): MUST stay OUTSIDE the
-	// `ChannelTypePerson` conditional above so group / community-topic
-	// `@所有人` traffic (the main pain-point) actually goes through the
-	// chokepoint. Helper is idempotent and safe on nil —
+	// YUJ-202 / Mininglamp-OSS#94 / #142 — mention pass-through
+	// chokepoint. Same contract as the user and bot API ingresses:
+	// post-#142 the helper no longer infers `mention.ais=1` from
+	// legacy `mention.all=1` (legacy `@所有人` MUST NOT trigger bots);
+	// it now forwards `mention.all`, `mention.humans`, `mention.ais`,
+	// and `mention.uids` untouched. The call site is preserved so any
+	// future chokepoint normalization lands in one place across the
+	// three ingresses. ⚠️ F2 (PR#70 Jerry-Xin correctness-critical
+	// review): MUST stay OUTSIDE the `ChannelTypePerson` conditional
+	// above so group / community-topic mention payloads always reach
+	// the chokepoint. Helper is idempotent and safe on nil —
 	// see pkg/mentionrewrite.
 	payload = mentionrewrite.RewriteMention(payload)
 

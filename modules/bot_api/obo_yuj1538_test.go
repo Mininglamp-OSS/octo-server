@@ -106,41 +106,82 @@ func TestFanout_YUJ1538_CommunityTopicNoScopeRow_GlobalEnabledFansOut(t *testing
 	}
 }
 
-// TestFanout_YUJ1538_GroupMentionAllSummonsPersona — `@所有人`
-// (`mention.all=1`) in a group must trigger fan-out for every
-// `global_enabled=1` grantor, even when the grantor is not listed in
-// `mention.uids`. Pre-YUJ-1538 the narrowing gate only inspected
-// `mention.uids`, so broadcast messages silently never reached the
-// persona — a more visible regression than the missing scope-row case
-// because grantors typically install bot personas precisely to
-// monitor broadcasts.
-func TestFanout_YUJ1538_GroupMentionAllSummonsPersona(t *testing.T) {
+// TestFanout_YUJ1538_GroupMentionAllDoesNotSummonPersona —
+// Mininglamp-OSS/octo-server#142 / #143 follow-up. Legacy
+// `@所有人` (`mention.all=1`) MUST NOT trigger OBO bot / persona
+// fan-out. Pre-#143 the `pkg/mentionrewrite` chokepoint silently
+// rewrote `all=1` to `ais=1` so legacy traffic auto-fanned-out to
+// every persona clone; #142 reverted that rewrite, and this gate
+// (`decodeMentionGate` + the `fanoutForMessage` branch) must enforce
+// the same contract one layer deeper. With the rewrite gone, a bare
+// `mention.all=1` is treated as plain traffic — the persona summon
+// path requires an EXPLICIT `mention.ais=1` (`@所有 AI`) or
+// `mention.humans=1` (`@所有人` Plan X shape) signal.
+//
+// Pre-#143 follow-up this test asserted the OPPOSITE behavior
+// (`mention.all=1` SHOULD summon every persona). That was the bug:
+// the rewrite chokepoint above the gate was load-bearing, and once
+// removed, this gate continued the implicit inference. The new
+// expectation pins the corrected behavior: zero dispatches for bare
+// `mention.all=1`.
+func TestFanout_YUJ1538_GroupMentionAllDoesNotSummonPersona(t *testing.T) {
 	ch, ct := "group_42", common.ChannelTypeGroup.Uint8()
 	s := seedGrantNoScope(t)
 	fc := &fanoutCapture{}
 	ba := newBAforFanout(s, fc)
 
-	// `@所有人 hi` shape: mention.all=1, no uids array. Real WuKongIM
-	// payloads use `1` (json.Number/float64 after json.Unmarshal); the
-	// gate also accepts `true` (boolean) for forward compat.
+	// `@所有人 hi` legacy WuKongIM shape: mention.all=1, no uids array,
+	// no ais, no humans. The post-#143 contract: NO fan-out.
 	msg := &config.MessageResp{
 		FromUID:     "alice",
 		ChannelID:   ch,
 		ChannelType: ct,
 		Payload:     []byte(`{"type":1,"content":"@所有人 hi","mention":{"all":1}}`),
 	}
+	if got := ba.fanoutForMessage(msg); got != 0 {
+		t.Fatalf("#142/#143: bare mention.all=1 must NOT summon any persona (rewrite chokepoint is gone — gate must not re-create the inference), got %d", got)
+	}
+	if len(fc.copies) != 0 {
+		t.Fatalf("expected 0 captured copies, got %d", len(fc.copies))
+	}
+}
+
+// TestFanout_YUJ1538_GroupMentionAisSummonsPersona — positive
+// companion to TestFanout_YUJ1538_GroupMentionAllDoesNotSummonPersona.
+// The post-#143 trigger for "summon every persona in the channel" is
+// `mention.ais=1` (Plan X / YUJ-1389 `@所有 AI` broadcast). Pins the
+// happy path so a regression that drops the ais branch from
+// `decodeMentionGate` / `fanoutForMessage` fails immediately rather
+// than silently reverting to the pre-#143 implicit-inference behavior.
+func TestFanout_YUJ1538_GroupMentionAisSummonsPersona(t *testing.T) {
+	ch, ct := "group_42", common.ChannelTypeGroup.Uint8()
+	s := seedGrantNoScope(t)
+	fc := &fanoutCapture{}
+	ba := newBAforFanout(s, fc)
+
+	// `@所有 AI` Plan X shape: mention.ais=1, no uids, no all, no humans.
+	msg := &config.MessageResp{
+		FromUID:     "alice",
+		ChannelID:   ch,
+		ChannelType: ct,
+		Payload:     []byte(`{"type":1,"content":"@所有 AI hi","mention":{"ais":1}}`),
+	}
 	if got := ba.fanoutForMessage(msg); got != 1 {
-		t.Fatalf("YUJ-1538: @所有人 (mention.all=1) in group must summon every grantor's persona, got %d", got)
+		t.Fatalf("YUJ-1538 + #143: @所有 AI (mention.ais=1) in group must summon every grantor's persona, got %d", got)
 	}
 	if len(fc.copies) != 1 {
 		t.Fatalf("expected 1 captured copy, got %d", len(fc.copies))
 	}
 }
 
-// TestFanout_YUJ1538_GroupMentionAllBooleanShape — defensive check
-// that the boolean shape `mention.all=true` (some clients) is also
-// honoured, not just the numeric `1` form.
-func TestFanout_YUJ1538_GroupMentionAllBooleanShape(t *testing.T) {
+// TestFanout_YUJ1538_GroupMentionAllBooleanShapeDoesNotSummon —
+// the boolean shape (`mention.all=true`) of the legacy WuKongIM
+// `@所有人` payload must follow the same post-#143 contract: NO
+// fan-out. Mirrors TestFanout_YUJ1538_GroupMentionAllDoesNotSummonPersona
+// but pins the alternative wire shape. Pre-#143 this asserted the
+// opposite (boolean true must summon every persona) and has been
+// reversed alongside the rewrite removal.
+func TestFanout_YUJ1538_GroupMentionAllBooleanShapeDoesNotSummon(t *testing.T) {
 	ch, ct := "group_42", common.ChannelTypeGroup.Uint8()
 	s := seedGrantNoScope(t)
 	fc := &fanoutCapture{}
@@ -152,8 +193,30 @@ func TestFanout_YUJ1538_GroupMentionAllBooleanShape(t *testing.T) {
 		ChannelType: ct,
 		Payload:     []byte(`{"type":1,"content":"@所有人 hi","mention":{"all":true}}`),
 	}
+	if got := ba.fanoutForMessage(msg); got != 0 {
+		t.Fatalf("#142/#143: mention.all=true (boolean) must NOT summon any persona either, got %d", got)
+	}
+}
+
+// TestFanout_YUJ1538_GroupMentionAisBooleanShapeSummonsPersona —
+// boolean-shape positive companion. Some clients emit
+// `mention.ais=true` instead of the numeric `1`. The gate must honor
+// both shapes for the ais summon path (parity with the legacy
+// boolean-shape coverage on `mention.all`).
+func TestFanout_YUJ1538_GroupMentionAisBooleanShapeSummonsPersona(t *testing.T) {
+	ch, ct := "group_42", common.ChannelTypeGroup.Uint8()
+	s := seedGrantNoScope(t)
+	fc := &fanoutCapture{}
+	ba := newBAforFanout(s, fc)
+
+	msg := &config.MessageResp{
+		FromUID:     "alice",
+		ChannelID:   ch,
+		ChannelType: ct,
+		Payload:     []byte(`{"type":1,"content":"@所有 AI hi","mention":{"ais":true}}`),
+	}
 	if got := ba.fanoutForMessage(msg); got != 1 {
-		t.Fatalf("YUJ-1538: mention.all=true (boolean) must be treated as truthy, got %d", got)
+		t.Fatalf("YUJ-1538 + #143: mention.ais=true (boolean) must be treated as truthy summon, got %d", got)
 	}
 }
 
@@ -340,7 +403,7 @@ func TestDecodeMentionGate_YUJ1538_AllFlagShapes(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, all := decodeMentionGate([]byte(tc.payload))
+			_, all, _, _ := decodeMentionGate([]byte(tc.payload))
 			if all != tc.wantAll {
 				t.Fatalf("payload %q: want all=%v, got %v", tc.payload, tc.wantAll, all)
 			}

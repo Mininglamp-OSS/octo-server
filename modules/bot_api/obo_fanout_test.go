@@ -1380,12 +1380,23 @@ func TestFanout_PR121R6_ImplicitScopeRespectsMentionFilter(t *testing.T) {
 	}
 }
 
-// TestFanout_PR121R6_ImplicitScopeMentionAllSummonsEveryone — companion
-// to the filter test above. `mention.all=1` (= `@所有人`) summons every
-// grantor in the channel, so BOTH implicit-scope candidates must fan
-// out. This locks the symmetry: filter when `mention.uids` is the only
-// signal, pass through when `mention.all` is set.
-func TestFanout_PR121R6_ImplicitScopeMentionAllSummonsEveryone(t *testing.T) {
+// TestFanout_PR121R6_ImplicitScopeMentionAllDoesNotSummonAnyone —
+// post-#143 review follow-up companion to the mention-filter test
+// above. Bare `mention.all=1` (legacy `@所有人` shape) no longer
+// triggers the unfiltered fan-out branch — the `pkg/mentionrewrite`
+// `all → ais` chokepoint was removed by #142 and the OBO fan-out gate
+// must not re-create the inference one layer deeper. With two
+// global-enabled grants in the same group, a bare `mention.all=1`
+// payload must produce ZERO fan-out copies. The persona-summon
+// trigger now requires an EXPLICIT `mention.ais=1` or
+// `mention.humans=1` signal — see the `mention.ais=1` companion test
+// below for the happy path.
+//
+// Pre-#143 follow-up this test asserted the OPPOSITE (`mention.all=1`
+// summons both grantors). The reversal pins the new contract: filter
+// when `mention.uids` is the only signal, summon everyone only when
+// the explicit ais/humans signal is set.
+func TestFanout_PR121R6_ImplicitScopeMentionAllDoesNotSummonAnyone(t *testing.T) {
 	const (
 		groupNo   = "group_pr121_r6_all"
 		grantorA  = "user_alice"
@@ -1414,15 +1425,61 @@ func TestFanout_PR121R6_ImplicitScopeMentionAllSummonsEveryone(t *testing.T) {
 		Payload:     []byte(`{"type":1,"content":"@everyone","mention":{"all":1}}`),
 	}
 	n := ba.fanoutForMessage(msg)
+	if n != 0 {
+		t.Fatalf("#142/#143: bare mention.all=1 must NOT summon any grantor (rewrite chokepoint is gone, gate must not re-infer), got %d (copies=%+v)", n, fc.copies)
+	}
+	if len(fc.copies) != 0 {
+		t.Fatalf("expected 0 captured copies, got %+v", fc.copies)
+	}
+}
+
+// TestFanout_PR121R6_ImplicitScopeMentionAisSummonsEveryone — post-#143
+// follow-up positive companion to ...DoesNotSummonAnyone above. The
+// new persona-summon trigger is `mention.ais=1` (Plan X `@所有 AI`).
+// With the same two-grantor setup, an explicit `mention.ais=1` must
+// summon BOTH grantors' personas via the implicit-scope feeder. Pins
+// that the unfiltered branch keeps working through the implicit-scope
+// codepath; a regression that drops the ais branch from
+// `fanoutForMessage` would fail this test rather than silently leaking
+// `mention.all=1` traffic back into the fan-out.
+func TestFanout_PR121R6_ImplicitScopeMentionAisSummonsEveryone(t *testing.T) {
+	const (
+		groupNo   = "group_pr121_r6_ais"
+		grantorA  = "user_alice"
+		botCloneA = "bot_clone_alice"
+		grantorB  = "user_bob"
+		botCloneB = "bot_clone_bob"
+	)
+	ct := common.ChannelTypeGroup.Uint8()
+
+	s := newFakeOBOStore()
+	gidA, _ := s.insertGrant(grantorA, botCloneA, "auto", "")
+	gidB, _ := s.insertGrant(grantorB, botCloneB, "auto", "")
+	enable := 1
+	_ = s.updateGrant(gidA, "", &enable, nil)
+	_ = s.updateGrant(gidB, "", &enable, nil)
+	s.seedGroupMember(groupNo, grantorA)
+	s.seedGroupMember(groupNo, grantorB)
+
+	fc := &fanoutCapture{}
+	ba := newBAforFanout(s, fc)
+
+	msg := &config.MessageResp{
+		FromUID:     "u_carol",
+		ChannelID:   groupNo,
+		ChannelType: ct,
+		Payload:     []byte(`{"type":1,"content":"@所有 AI","mention":{"ais":1}}`),
+	}
+	n := ba.fanoutForMessage(msg)
 	if n != 2 {
-		t.Fatalf("mention.all must summon both grantors, got %d (copies=%+v)", n, fc.copies)
+		t.Fatalf("mention.ais=1 must summon both grantors via implicit-scope, got %d (copies=%+v)", n, fc.copies)
 	}
 	seen := map[string]bool{}
 	for _, c := range fc.copies {
 		seen[c.ChannelID] = true
 	}
 	if !seen[botCloneA] || !seen[botCloneB] {
-		t.Fatalf("mention.all must reach both bot mailboxes, got %+v", seen)
+		t.Fatalf("mention.ais=1 must reach both bot mailboxes, got %+v", seen)
 	}
 }
 

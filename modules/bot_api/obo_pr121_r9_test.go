@@ -36,23 +36,19 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 )
 
-// TestFanout_PR121R9_CommunityTopic_MentionAll_ImplicitScope_FansOut
-// — the headline R9 repro. CommunityTopic + mention.all=1 +
-// global_enabled=1 + NO explicit scope row + grantor in parent group
-// + bot NOT in parent group → fan-out copy IS dispatched.
+// TestFanout_PR121R9_CommunityTopic_MentionAll_NoDispatch — post-#143
+// review follow-up. Bare `mention.all=1` (legacy `@所有人` shape) on a
+// CommunityTopic must NOT trigger fan-out, mirroring the Group case.
+// The `pkg/mentionrewrite` `all → ais` chokepoint was removed by #142
+// and the OBO fan-out gate (incl. the R9 implicit-scope topic feeder)
+// must not re-create the inference one layer deeper. The post-#143
+// trigger for the R9 topic implicit-scope path is `mention.ais=1` —
+// see the companion test below for the happy path.
 //
-// Pre-R9 this returned 0 because:
-//
-//   - The mention.all branch in fanoutForMessage uses
-//     findActiveGrantsForChannel, which INNER JOINs obo_scopes and
-//     returns 0 rows when no scope exists.
-//   - findGlobalGrantsWithoutScope (the implicit-scope feeder) was
-//     gated to ChannelTypeGroup only and returned [] for topics.
-//
-// R9 wires CommunityTopic through the feeder using the parent group
-// for membership; the anti-join still uses the topic's own channel id
-// so per-topic admin disables are respected.
-func TestFanout_PR121R9_CommunityTopic_MentionAll_ImplicitScope_FansOut(t *testing.T) {
+// Pre-#143 follow-up this test asserted the OPPOSITE (CommunityTopic
+// + mention.all=1 + implicit-scope MUST fan out). The reversal pins
+// the corrected gate.
+func TestFanout_PR121R9_CommunityTopic_MentionAll_NoDispatch(t *testing.T) {
 	const parentGroup = "group_topic_parent_pr121r9"
 	const topicChan = parentGroup + "____topic_pr121r9"
 	ct := common.ChannelTypeCommunityTopic.Uint8()
@@ -60,11 +56,47 @@ func TestFanout_PR121R9_CommunityTopic_MentionAll_ImplicitScope_FansOut(t *testi
 	// Active+global_enabled grant, NO explicit scope row for the topic
 	// (matches operator reality: scopes are only ever installed for DMs).
 	s := seedGrantNoScope(t)
-	// Grantor is in the parent group → satisfies the implicit-scope
-	// grantor-membership predicate (the bot must inherit the grantor's
-	// read access). Bot is intentionally NOT seeded → satisfies Gate 4
-	// (bot not in parent group, so the OBO copy is the sole delivery
-	// path to the bot).
+	// Grantor is in the parent group; bot intentionally NOT seeded —
+	// the same shape that produced fan-out under the pre-#143 contract.
+	// Post-#143, the gate short-circuits BEFORE the feeder runs because
+	// `mention.all=1` alone no longer opens the unfiltered branch.
+	s.seedGroupMember(parentGroup, tGrantor)
+
+	fc := &fanoutCapture{}
+	ba := newBAforFanout(s, fc)
+	ba.oboChannelAccessOverride = func(uid, channelID string, channelType uint8) (bool, error) {
+		t.Errorf("post-#143: bare mention.all=1 must short-circuit BEFORE access checks (uid=%q chan=%q)", uid, channelID)
+		return true, nil
+	}
+
+	msg := &config.MessageResp{
+		FromUID:     "u_alice", // not bot, not grantor
+		ChannelID:   topicChan,
+		ChannelType: ct,
+		Payload:     []byte(`{"type":1,"content":"@所有人 heads up","mention":{"all":1}}`),
+	}
+	if n := ba.fanoutForMessage(msg); n != 0 {
+		t.Fatalf("#142/#143: CommunityTopic + bare mention.all=1 must NOT dispatch, got %d", n)
+	}
+	if len(fc.copies) != 0 {
+		t.Fatalf("expected 0 captured copies, got %d", len(fc.copies))
+	}
+}
+
+// TestFanout_PR121R9_CommunityTopic_MentionAis_ImplicitScope_FansOut
+// — post-#143 follow-up positive companion. The R9 implicit-scope
+// codepath for CommunityTopic still needs to fire when an explicit
+// `mention.ais=1` (`@所有 AI`) signal is present. Same setup as the
+// pre-#143 headline R9 repro, just swapped to the post-#143 trigger:
+// CommunityTopic + mention.ais=1 + global_enabled=1 + NO explicit
+// scope row + grantor in parent group + bot NOT in parent group →
+// fan-out copy IS dispatched via the implicit-scope feeder.
+func TestFanout_PR121R9_CommunityTopic_MentionAis_ImplicitScope_FansOut(t *testing.T) {
+	const parentGroup = "group_topic_parent_pr121r9_ais"
+	const topicChan = parentGroup + "____topic_pr121r9_ais"
+	ct := common.ChannelTypeCommunityTopic.Uint8()
+
+	s := seedGrantNoScope(t)
 	s.seedGroupMember(parentGroup, tGrantor)
 
 	fc := &fanoutCapture{}
@@ -84,20 +116,20 @@ func TestFanout_PR121R9_CommunityTopic_MentionAll_ImplicitScope_FansOut(t *testi
 		FromUID:     "u_alice", // not bot, not grantor
 		ChannelID:   topicChan,
 		ChannelType: ct,
-		Payload:     []byte(`{"type":1,"content":"@所有人 heads up","mention":{"all":1}}`),
+		Payload:     []byte(`{"type":1,"content":"@所有 AI heads up","mention":{"ais":1}}`),
 	}
 	if n := ba.fanoutForMessage(msg); n != 1 {
-		t.Fatalf("PR#121 R9: CommunityTopic + mention.all + implicit-scope must fan out, got %d", n)
+		t.Fatalf("PR#121 R9 + #143: CommunityTopic + mention.ais=1 + implicit-scope must fan out, got %d", n)
 	}
 	if len(fc.copies) != 1 {
-		t.Fatalf("PR#121 R9: expected exactly 1 captured copy, got %d", len(fc.copies))
+		t.Fatalf("PR#121 R9 + #143: expected exactly 1 captured copy, got %d", len(fc.copies))
 	}
 	cp := fc.copies[0]
 	if cp.FromUID != tGrantor {
-		t.Fatalf("PR#121 R9: fan-out copy FromUID must be grantor %q, got %q", tGrantor, cp.FromUID)
+		t.Fatalf("PR#121 R9 + #143: fan-out copy FromUID must be grantor %q, got %q", tGrantor, cp.FromUID)
 	}
 	if cp.ChannelID != tBot {
-		t.Fatalf("PR#121 R9: fan-out copy ChannelID must be bot mailbox %q, got %q", tBot, cp.ChannelID)
+		t.Fatalf("PR#121 R9 + #143: fan-out copy ChannelID must be bot mailbox %q, got %q", tBot, cp.ChannelID)
 	}
 }
 
@@ -113,6 +145,13 @@ func TestFanout_PR121R9_CommunityTopic_MentionAll_ImplicitScope_FansOut(t *testi
 // fired for topics) but it MUST be safe after the extension —
 // otherwise R9 reintroduces the duplicate-fan-out bug Gate 4 was
 // created to prevent.
+//
+// Post-#143 follow-up: switched the trigger payload from
+// `mention.all=1` to `mention.ais=1`. The previous shape no longer
+// opens the unfiltered branch, so the original test would still pass
+// (zero fan-out) but for the wrong reason and would no longer
+// exercise Gate 4. Using `mention.ais=1` keeps Gate 4 the load-
+// bearing check.
 func TestFanout_PR121R9_CommunityTopic_MentionAll_BotInParentGroup_NoFanout(t *testing.T) {
 	const parentGroup = "group_topic_parent_pr121r9_gate4"
 	const topicChan = parentGroup + "____topic_pr121r9_gate4"
@@ -130,7 +169,7 @@ func TestFanout_PR121R9_CommunityTopic_MentionAll_BotInParentGroup_NoFanout(t *t
 		FromUID:     "u_alice",
 		ChannelID:   topicChan,
 		ChannelType: ct,
-		Payload:     []byte(`{"type":1,"content":"@所有人 heads up","mention":{"all":1}}`),
+		Payload:     []byte(`{"type":1,"content":"@所有 AI heads up","mention":{"ais":1}}`),
 	}
 	if n := ba.fanoutForMessage(msg); n != 0 {
 		t.Fatalf("PR#121 R9: bot in parent group → implicit-scope SQL Gate 4 must suppress fan-out, got %d", n)
@@ -179,7 +218,11 @@ func TestFanout_PR121R9_CommunityTopic_MentionAll_ExplicitDisableWins(t *testing
 		FromUID:     "u_alice",
 		ChannelID:   topicChan,
 		ChannelType: ct,
-		Payload:     []byte(`{"type":1,"content":"@所有人 hi","mention":{"all":1}}`),
+		// Post-#143: switched from `mention.all=1` to `mention.ais=1`
+		// so the unfiltered branch is opened and the explicit-disable
+		// scope row remains the load-bearing suppression — see the
+		// pre-#143 follow-up commit for rationale.
+		Payload: []byte(`{"type":1,"content":"@所有 AI hi","mention":{"ais":1}}`),
 	}
 	if n := ba.fanoutForMessage(msg); n != 0 {
 		t.Fatalf("PR#121 R9: explicit enabled=0 scope on topic must suppress implicit-scope fan-out, got %d", n)
@@ -212,7 +255,12 @@ func TestFanout_PR121R9_CommunityTopic_MalformedThreadID_NoFanout(t *testing.T) 
 		FromUID:     "u_alice",
 		ChannelID:   malformed,
 		ChannelType: ct,
-		Payload:     []byte(`{"type":1,"content":"@所有人 hi","mention":{"all":1}}`),
+		// Post-#143: switched from `mention.all=1` to `mention.ais=1`
+		// so the unfiltered branch is opened and the malformed thread
+		// id remains the load-bearing fail-closed signal — otherwise
+		// the test passes for the wrong reason (bare mention.all=1 no
+		// longer triggers fan-out under the post-#143 gate).
+		Payload: []byte(`{"type":1,"content":"@所有 AI hi","mention":{"ais":1}}`),
 	}
 	if n := ba.fanoutForMessage(msg); n != 0 {
 		t.Fatalf("PR#121 R9: malformed thread id must fail-closed, got %d", n)

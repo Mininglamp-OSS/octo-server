@@ -59,33 +59,47 @@ func TestFanout_V2_GroupRequiresGrantorMention(t *testing.T) {
 	}
 }
 
-// TestFanout_V2_GroupMentionAIBotDoesNotSummonPersona — a message that
-// @-mentions only the bot or only sets `mention.ais=1` (the AI-broadcast
-// flag) must not summon the grantor's persona. The narrowing gate is
-// strict on `mention.uids` for AI-only / bot-only traffic — neither
-// `mention.ais` nor a foreign-bot uid in `mention.uids` counts. Without
-// this strictness the v1 "fan out everything" semantics return.
+// TestFanout_V2_GroupMentionAIBotSummonsPersona — post-#143 review
+// follow-up. A message that sets `mention.ais=1` (the `@所有 AI`
+// broadcast flag, Plan X / YUJ-1389) MUST summon every grantor's
+// persona via the unfiltered scan branch. This pins the post-#143
+// contract: with the `pkg/mentionrewrite` `all → ais` chokepoint
+// removed (octo-server#142) AND the OBO fan-out gate corrected so
+// `mention.all=1` no longer triggers (octo-server#143 follow-up),
+// `mention.ais=1` becomes the single explicit signal for an "every
+// bot persona in the channel responds" broadcast.
 //
-// YUJ-1538 carve-out: `mention.all=1` (the `@所有人` broadcast flag) IS
-// honoured by the gate as an implicit summon for every grantor, so it
-// is intentionally NOT exercised here — the dedicated
-// TestFanout_V2_GroupMentionAllSummonsPersona below covers that.
-func TestFanout_V2_GroupMentionAIBotDoesNotSummonPersona(t *testing.T) {
+// Pre-#143 follow-up this test asserted the OPPOSITE: that
+// `mention.ais=1` (and `mention.uids=[foreign_bot]`) must NOT
+// summon the grantor's persona. That contract was specific to the
+// pre-#143 world where the rewrite chokepoint already widened
+// legacy `mention.all=1` into `mention.ais=1` at the boundary, so
+// the OBO gate treated `mention.ais` as plain "AI broadcast" noise
+// rather than a persona-summon signal. With the chokepoint gone,
+// `mention.ais=1` is now the load-bearing summon trigger and this
+// test is reversed.
+//
+// The presence of an unrelated `mention.uids=[some_other_bot]` does
+// NOT narrow the summon — `mention.ais=1` is itself a sufficient
+// trigger for the unfiltered scan, mirroring the legacy
+// `mention.all=1` semantics that the chokepoint used to materialize.
+func TestFanout_V2_GroupMentionAIBotSummonsPersona(t *testing.T) {
 	ch, ct := "group_42", common.ChannelTypeGroup.Uint8()
 	s := seedGrantWithScope(t, ch, ct)
 	fc := &fanoutCapture{}
 	ba := newBAforFanout(s, fc)
 
-	// mention.ais=1 + mention.uids=[some_other_bot] — neither summons
-	// our grantor (tGrantor) so v2 must skip.
+	// mention.ais=1 + mention.uids=[some_other_bot] — under the
+	// post-#143 contract `ais=1` summons every grantor regardless of
+	// the foreign uid in `mention.uids`.
 	msg := &config.MessageResp{
 		FromUID:     "alice",
 		ChannelID:   ch,
 		ChannelType: ct,
 		Payload:     []byte(`{"type":1,"content":"@AI please","mention":{"ais":1,"uids":["some_other_bot"]}}`),
 	}
-	if n := ba.fanoutForMessage(msg); n != 0 {
-		t.Fatalf("v2 narrowing violated: @AI / mention.ais must NOT summon persona without explicit @grantor or mention.all=1, got %d dispatches", n)
+	if n := ba.fanoutForMessage(msg); n != 1 {
+		t.Fatalf("post-#143: mention.ais=1 MUST summon grantor persona via unfiltered scan, got %d dispatches", n)
 	}
 }
 

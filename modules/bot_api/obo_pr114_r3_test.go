@@ -222,13 +222,22 @@ func TestFanout_PR114R3_GroupMultipleGrantorMentions_FilterCarriesAll(t *testing
 	}
 }
 
-// TestFanout_PR114R3_GroupMentionAll_UsesUnfilteredScan — `@所有人`
-// (mention.all=1) is the documented exception: we cannot know group
-// membership at this layer so the full grant scan is unavoidable.
-// Pin that contract so a future "always-filter" refactor doesn't
-// silently break @所有人 broadcasts (they would early-return because
-// the empty filter set returns no rows).
-func TestFanout_PR114R3_GroupMentionAll_UsesUnfilteredScan(t *testing.T) {
+// TestFanout_PR114R3_GroupMentionAll_NoDispatch — post-#143 review
+// follow-up. Bare `mention.all=1` is no longer the documented "summon
+// everyone" trigger: the `pkg/mentionrewrite` `all → ais` chokepoint
+// was removed by #142, and accepting `mention.all=1` at the fan-out
+// gate would re-create the implicit inference one layer deeper.
+// `@所有 AI` now requires the explicit `mention.ais=1` signal — see
+// the companion test below for the unfiltered-scan happy path. Pin
+// the new contract so a future "always-fan-out-on-all" regression
+// fails immediately rather than silently leaking legacy `@所有人`
+// traffic to every persona clone.
+//
+// Pre-#143 follow-up this test asserted the OPPOSITE — that
+// `mention.all=1` MUST trigger the unfiltered scan. The reversal
+// pins the corrected fan-out gate (see fanoutForMessage's branch
+// rationale in modules/bot_api/obo_fanout.go).
+func TestFanout_PR114R3_GroupMentionAll_NoDispatch(t *testing.T) {
 	ch, ct := "group_42", common.ChannelTypeGroup.Uint8()
 	s := seedGrantNoScope(t)
 	fc := &fanoutCapture{}
@@ -238,18 +247,52 @@ func TestFanout_PR114R3_GroupMentionAll_UsesUnfilteredScan(t *testing.T) {
 		FromUID:     "alice",
 		ChannelID:   ch,
 		ChannelType: ct,
-		// `@所有人` shape: mention.all=1, no uids.
+		// `@所有人` legacy shape: mention.all=1, no uids, no ais, no humans.
 		Payload: []byte(`{"type":1,"content":"@所有人 ship today","mention":{"all":1}}`),
 	}
-	if got := ba.fanoutForMessage(msg); got != 1 {
-		t.Fatalf("@所有人 in group must summon every grantor, got %d", got)
+	if got := ba.fanoutForMessage(msg); got != 0 {
+		t.Fatalf("#142/#143: bare mention.all=1 must NOT dispatch (gate must not re-infer `all → ais`), got %d", got)
 	}
-	if s.findGrantsChannelCalls != 1 {
-		t.Fatalf("unfiltered scan must be used for @所有人, got %d call(s)",
+	if s.findGrantsChannelCalls != 0 {
+		t.Fatalf("bare mention.all=1 must short-circuit BEFORE the unfiltered scan (no rewrite, no fan-out), got %d call(s)",
 			s.findGrantsChannelCalls)
 	}
 	if s.findGrantsChannelByGrantorsCalls != 0 {
-		t.Fatalf("filtered query MUST NOT be used for @所有人 (no UID set to filter on), got %d",
+		t.Fatalf("bare mention.all=1 must short-circuit BEFORE the @-mention filtered scan too, got %d call(s)",
+			s.findGrantsChannelByGrantorsCalls)
+	}
+}
+
+// TestFanout_PR114R3_GroupMentionAis_UsesUnfilteredScan — post-#143
+// follow-up positive companion. The explicit `mention.ais=1`
+// (`@所有 AI`) signal MUST hit the unfiltered channel-wide scan — we
+// cannot know group membership at this layer so the full grant scan
+// is unavoidable, mirroring the historical `mention.all=1` rationale.
+// Pin that contract so a future "always-filter" refactor doesn't
+// silently break `@所有 AI` broadcasts (they would early-return
+// because the empty filter set returns no rows).
+func TestFanout_PR114R3_GroupMentionAis_UsesUnfilteredScan(t *testing.T) {
+	ch, ct := "group_42", common.ChannelTypeGroup.Uint8()
+	s := seedGrantNoScope(t)
+	fc := &fanoutCapture{}
+	ba := newBAforFanout(s, fc)
+
+	msg := &config.MessageResp{
+		FromUID:     "alice",
+		ChannelID:   ch,
+		ChannelType: ct,
+		// `@所有 AI` Plan X shape: mention.ais=1, no uids.
+		Payload: []byte(`{"type":1,"content":"@所有 AI ship today","mention":{"ais":1}}`),
+	}
+	if got := ba.fanoutForMessage(msg); got != 1 {
+		t.Fatalf("@所有 AI (mention.ais=1) in group must summon every grantor, got %d", got)
+	}
+	if s.findGrantsChannelCalls != 1 {
+		t.Fatalf("unfiltered scan must be used for @所有 AI, got %d call(s)",
+			s.findGrantsChannelCalls)
+	}
+	if s.findGrantsChannelByGrantorsCalls != 0 {
+		t.Fatalf("filtered query MUST NOT be used for @所有 AI (no UID set to filter on), got %d",
 			s.findGrantsChannelByGrantorsCalls)
 	}
 }
@@ -331,9 +374,13 @@ func TestFanout_PR114R3_GroupBotSelfSent_StillEarlyReturns(t *testing.T) {
 		FromUID:     tBot,
 		ChannelID:   ch,
 		ChannelType: ct,
-		// Payload carries the marker AND a mention.all=1 — the marker
-		// must win or we'd loop forever.
-		Payload: []byte(`{"type":1,"content":"echo","__obo_processed__":true,"mention":{"all":1}}`),
+		// Payload carries the marker AND a mention.ais=1 — the marker
+		// must win or we'd loop forever. (Pre-#143 follow-up this used
+		// `mention.all=1`, but that is no longer a fan-out trigger so
+		// the test no longer exercised the marker-vs-mention-gate
+		// ordering it was written to pin; switched to `mention.ais=1`
+		// which IS the post-#143 unfiltered-scan trigger.)
+		Payload: []byte(`{"type":1,"content":"echo","__obo_processed__":true,"mention":{"ais":1}}`),
 	}
 	if got := ba.fanoutForMessage(msg); got != 0 {
 		t.Fatalf("__obo_processed__ marker must short-circuit before fan-out, got %d", got)

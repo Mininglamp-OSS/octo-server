@@ -38,12 +38,16 @@ import (
 // side (reminders) and the dispatch side (robot events) agree on what
 // counts as `@所有 AI`.
 //
-// The send-side rewrite chokepoint (pkg/mentionrewrite/rewrite.go)
-// writes json.Number("1") which gjson surfaces as a Number with
-// Int() == 1, so that's the hot path. We also accept the JSON `true`
+// Post-Mininglamp-OSS/octo-server#142 the send-side chokepoint
+// (pkg/mentionrewrite/rewrite.go) is a pass-through — legacy
+// `mention.all=1` is NOT auto-promoted into `mention.ais=1` anymore,
+// so a client that wants its broadcast to summon group bots must set
+// `mention.ais=1` explicitly. The numeric `1` shape (json.Number from
+// the upstream UseNumber decoder, surfaced by gjson as a Number with
+// Int() == 1) is still the hot path; we also accept the JSON `true`
 // form and the string "1" form defensively — a future client / proxy
-// rewrite might canonicalize the field differently and we don't want
-// a quiet broadcast regression because of it.
+// might canonicalize the field differently and we don't want a quiet
+// broadcast regression because of it.
 //
 // Exposed as a method on *Robot purely so the dispatcher's call site
 // reads `rb.mentionAisTruthy(...)`, matching the surrounding

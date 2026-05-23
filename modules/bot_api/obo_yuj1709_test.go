@@ -37,15 +37,21 @@ import (
 )
 
 // TestDecodeMentionGate_YUJ1709_HumansFlagShapes — exhaustive shape
-// coverage for the new `mention.humans` truthy decoder. Mirrors the
+// coverage for the `mention.humans` truthy decoder. Mirrors the
 // YUJ-1538 `mention.all` shape table so the two flags stay in lock-step:
 // numeric `1` and boolean `true` are truthy, everything else (`0`,
 // `false`, missing, null, strings, unrelated types) is not.
+//
+// Post-#142 / #143 follow-up: the decoder now returns `mentionAll`,
+// `mentionAis`, and `mentionHumans` as three independent slots rather
+// than the historical conflated `all || humans` boolean. This test
+// asserts on `mentionHumans` specifically — `mention.all` no longer
+// participates in the humans gate.
 func TestDecodeMentionGate_YUJ1709_HumansFlagShapes(t *testing.T) {
 	cases := []struct {
-		name    string
-		payload string
-		wantAll bool
+		name       string
+		payload    string
+		wantHumans bool
 	}{
 		{"humans_number_one", `{"mention":{"humans":1}}`, true},
 		{"humans_number_zero", `{"mention":{"humans":0}}`, false},
@@ -53,23 +59,24 @@ func TestDecodeMentionGate_YUJ1709_HumansFlagShapes(t *testing.T) {
 		{"humans_bool_false", `{"mention":{"humans":false}}`, false},
 		{"humans_string_one", `{"mention":{"humans":"1"}}`, false},
 		{"humans_null", `{"mention":{"humans":null}}`, false},
-		// Co-presence: all=0 + humans=1 → still truthy (Plan X never
-		// co-emits but we must not let an explicit `all:0` veto a
-		// truthy `humans`).
+		// Co-presence: all=0 + humans=1 → mentionHumans=true (an
+		// explicit `all:0` must not veto a truthy `humans`; Plan X
+		// never co-emits but be defensive).
 		{"all_zero_humans_one", `{"mention":{"all":0,"humans":1}}`, true},
-		// Co-presence: all=1 + humans=0 → still truthy (legacy clients
-		// that happen to also emit humans=0 must keep working).
-		{"all_one_humans_zero", `{"mention":{"all":1,"humans":0}}`, true},
+		// Co-presence: all=1 + humans=0 → mentionHumans=false. After
+		// #142 / #143 `mention.all` no longer rolls into the humans
+		// slot; `humans=0` is the controlling signal here.
+		{"all_one_humans_zero", `{"mention":{"all":1,"humans":0}}`, false},
 		// Plain `@AI` style payload: neither flag set, just uids →
-		// mentionAll must remain false (the uid-narrowed query handles
-		// dispatch).
+		// mentionHumans must remain false (the uid-narrowed query
+		// handles dispatch).
 		{"only_uids", `{"mention":{"uids":["u_alice"]}}`, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, all := decodeMentionGate([]byte(tc.payload))
-			if all != tc.wantAll {
-				t.Fatalf("payload %q: want all=%v, got %v", tc.payload, tc.wantAll, all)
+			_, _, _, humans := decodeMentionGate([]byte(tc.payload))
+			if humans != tc.wantHumans {
+				t.Fatalf("payload %q: want humans=%v, got %v", tc.payload, tc.wantHumans, humans)
 			}
 		})
 	}

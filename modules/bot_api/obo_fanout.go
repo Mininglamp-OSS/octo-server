@@ -206,9 +206,23 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 	// (modulo the loop-protection gates) so the persona could observe
 	// the full conversation. v2 narrows the trigger: a fan-out copy is
 	// only minted when the inbound message explicitly summons the
-	// grantor via `payload.mention.uids`, OR sets `mention.all=1` /
-	// `mention.humans=1` (`@所有人` broadcast — legacy WuKongIM uses
-	// `all`; Plan X web client uses `humans`, see YUJ-1709 / #125).
+	// grantor via `payload.mention.uids`, OR sets `mention.ais=1`
+	// (`@所有 AI` — Plan X broadcast that summons every AI/bot), OR
+	// sets `mention.humans=1` (`@所有人` — Plan X web client human
+	// broadcast that fans out to every persona clone of in-channel
+	// grantors; see YUJ-1709 / #125).
+	//
+	// IMPORTANT (Mininglamp-OSS/octo-server#142 review follow-up):
+	// legacy `mention.all=1` (old WuKongIM `@所有人` shape) MUST NOT
+	// trigger OBO bot / persona dispatch. The historical `all → ais`
+	// rewrite chokepoint was removed by #143, but this fan-out gate
+	// still treated `mention.all=1` as equivalent to the persona-
+	// summon broadcast. With the rewrite gone, accepting `all=1` here
+	// would re-create the implicit inference one layer deeper and
+	// silently fan-out legacy `@所有人` traffic to every persona
+	// clone. The gate therefore now requires an EXPLICIT `mention.ais=1`
+	// or `mention.humans=1` signal; bare `mention.all=1` (with no ais /
+	// humans / uids) is treated as plain traffic and short-circuits.
 	//
 	// PR#114 R3 (Jerry-Xin perf blocker) — the per-message mention gate
 	// runs BEFORE the grant DB lookup for group-like channels, so plain
@@ -220,7 +234,7 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 	// scope-joined query.
 	var (
 		mentionedUIDs []string
-		mentionAll    bool
+		summonAll     bool
 		grants        []*oboGrantModel
 		err           error
 	)
@@ -228,10 +242,19 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 		// DM path — unchanged, uses scope-joined query.
 		grants, err = store.findActiveGrantsForChannel(lookupChannelID, m.ChannelType)
 	} else {
-		// Group-like channels: gate on mention first.
-		mentionedUIDs, mentionAll = decodeMentionGate(m.Payload)
-		if mentionAll {
-			// @所有人 — summon every grantor in the channel. Use the
+		// Group-like channels: gate on mention first. `mention.all` is
+		// parsed (decoder still surfaces it for telemetry / future use)
+		// but intentionally NOT consulted at the fan-out branch — see
+		// the rationale block above and Mininglamp-OSS/octo-server#142.
+		var (
+			mentionAis    bool
+			mentionHumans bool
+		)
+		mentionedUIDs, _, mentionAis, mentionHumans = decodeMentionGate(m.Payload)
+		summonAll = mentionAis || mentionHumans
+		if summonAll {
+			// @所有 AI (mention.ais=1) or @所有人 (mention.humans=1) —
+			// summon every grantor's persona in the channel. Use the
 			// unfiltered channel-wide query (the only way to enumerate
 			// "every grant in this channel" without knowing membership).
 			grants, err = store.findActiveGrantsForChannel(lookupChannelID, m.ChannelType)
@@ -242,7 +265,9 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 			// R4) so the filtered miss cannot poison the unfiltered hit.
 			grants, err = store.findActiveGrantsForChannelByGrantors(lookupChannelID, m.ChannelType, mentionedUIDs)
 		} else {
-			// Plain / @AI / @bot only — no fan-out trigger for v2.
+			// Plain / @AI-text-only / @bot-only / bare mention.all=1
+			// (legacy `@所有人`, post-#142 + this PR no longer a fan-out
+			// trigger) — no fan-out trigger for v2.
 			return 0
 		}
 	}
@@ -278,16 +303,17 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 	//
 	// PR#121 R9 (YUJ-1676 / Jerry-Xin + lml2468 blocking) — extended
 	// from GROUP-only to also cover CommunityTopic. Without the topic
-	// branch, a `mention.all=1` topic message from a non-grantor whose
-	// parent group has a global_enabled grant on file (and bot NOT in
-	// the parent group) produced ZERO fan-out copies — even though
-	// checkOBO already authorized the symmetric reply path for topics
-	// (obo_check.go:105) and Gate 4 / send-permission bypass / explicit-
-	// mention feeder all already supported topics. The asymmetry meant
-	// the bot could authorize a reply but never receive the message in
-	// the first place. For topics we extract the parent group id (split
-	// on threadChannelIDSeparator, mirroring grantorCanReadChannel) and
-	// pass it to the store as `membershipGroupID`; the scope anti-join
+	// branch, a `mention.ais=1` / `mention.humans=1` topic message
+	// from a non-grantor whose parent group has a global_enabled grant
+	// on file (and bot NOT in the parent group) produced ZERO fan-out
+	// copies — even though checkOBO already authorized the symmetric
+	// reply path for topics (obo_check.go:105) and Gate 4 / send-
+	// permission bypass / explicit-mention feeder all already supported
+	// topics. The asymmetry meant the bot could authorize a reply but
+	// never receive the message in the first place. For topics we
+	// extract the parent group id (split on threadChannelIDSeparator,
+	// mirroring grantorCanReadChannel) and pass it to the store as
+	// `membershipGroupID`; the scope anti-join
 	// keeps using the topic's own (channel_id, channel_type) so an
 	// `enabled=0` row on the topic still wins.
 	//
@@ -317,9 +343,10 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 			} else {
 				// PR#121 R6 / B2 (Jerry-Xin + lml2468 2026-05-22 blocking)
 				// — when only specific grantors were @-mentioned (i.e.
-				// `mention.uids` is set and `mention.all` is NOT), the
-				// implicit-scope feeder MUST be filtered to those uids
-				// before being merged with the explicit-scope set above.
+				// `mention.uids` is set and neither `mention.ais` nor
+				// `mention.humans` are), the implicit-scope feeder MUST
+				// be filtered to those uids before being merged with the
+				// explicit-scope set above.
 				//
 				// Without this filter, a message that mentions only Alice
 				// (`mention.uids = [alice_uid]`) would silently pull in
@@ -328,15 +355,18 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 				// the group, with no awareness of the mention gate. That
 				// directly violates the documented v2 mention contract:
 				// `mention.uids` summons ONLY the mentioned grantor(s);
-				// only `mention.all` summons everyone.
+				// only `mention.ais=1` / `mention.humans=1` summon
+				// everyone (mention.all=1 alone no longer summons —
+				// see Mininglamp-OSS/octo-server#142 / #143 follow-up).
 				//
-				// The mentionAll branch passes through unfiltered (matches
-				// the explicit-path behavior — `@所有人` summons every
-				// grantor in the channel). The DM branch never reaches
-				// this block (gated above on isGroupLikeChannelType) and
-				// therefore needs no symmetrical filter.
+				// The summonAll branch passes through unfiltered (matches
+				// the explicit-path behavior — `@所有 AI` / `@所有人`
+				// summons every grantor in the channel). The DM branch
+				// never reaches this block (gated above on
+				// isGroupLikeChannelType) and therefore needs no
+				// symmetrical filter.
 				var mentionFilter map[string]struct{}
-				if !mentionAll && len(mentionedUIDs) > 0 {
+				if !summonAll && len(mentionedUIDs) > 0 {
 					mentionFilter = make(map[string]struct{}, len(mentionedUIDs))
 					for _, u := range mentionedUIDs {
 						mentionFilter[u] = struct{}{}
@@ -724,40 +754,48 @@ func buildFanoutCopyReq(m *config.MessageResp, g *oboGrantModel, grantorName, se
 	)
 }
 
-// decodeMentionGate — YUJ-1465 / YUJ-1538 / YUJ-1709 (octo-server#125).
-// Pulls `mention.uids`, `mention.all`, and `mention.humans` off the raw
-// payload. Returns:
+// decodeMentionGate — YUJ-1465 / YUJ-1538 / YUJ-1709 / #142 follow-up.
+// Pulls `mention.uids`, `mention.all`, `mention.ais`, and
+// `mention.humans` off the raw payload. Returns:
 //   - mentionedUIDs: slice of distinct UIDs (sorted ascending for
 //     stable IN(...) bind ordering); empty when payload has no
 //     mention.uids or it is empty / malformed.
-//   - mentionAll: true iff `mention.all` OR `mention.humans` is the
-//     integer 1 (numeric form) OR boolean true. The legacy WuKongIM
-//     clients emit `mention.all` (PR#114 R3 + YUJ-1538); the Plan X
-//     web client emits `mention.humans` (YUJ-1709 / #125) instead and
-//     never sets `mention.all`. Both shapes carry identical "@所有人"
-//     semantics from the user's POV, so the fan-out gate treats them
-//     equivalently. Downstream safety is unchanged: this only widens
-//     the gate's entry condition; the grant DB lookup + Gate 1/2/3 +
-//     scope/access checks all run as before.
+//   - mentionAll: true iff `mention.all` is the integer 1 (numeric
+//     form) OR boolean true. The legacy WuKongIM clients emit
+//     `mention.all=1` for `@所有人` (PR#114 R3 + YUJ-1538). After
+//     Mininglamp-OSS/octo-server#142 / #143 this flag is parsed for
+//     telemetry / future use but is NOT consumed by the OBO fan-out
+//     gate — see fanoutForMessage above for the rationale: the
+//     `all → ais` rewrite chokepoint was removed by #142, and
+//     accepting `all=1` here would re-create the implicit inference
+//     one layer deeper. Callers MUST gate fan-out on
+//     `mentionAis || mentionHumans`.
+//   - mentionAis: true iff `mention.ais` is truthy (numeric 1 or
+//     boolean true). `@所有 AI` (Plan X / YUJ-1389) — summons every
+//     bot/persona clone in the channel.
+//   - mentionHumans: true iff `mention.humans` is truthy. The Plan X
+//     web client emits `mention.humans=1` for `@所有人` (YUJ-1709 /
+//     #125) and never sets `mention.all`. The OBO fan-out gate
+//     treats this as a persona-clone summon.
 //
-// Returns (nil, false) on any decode error or absent `mention` field.
-// The fan-out narrowing gate treats (no uids, no all, no humans) as
-// "no summon".
-func decodeMentionGate(payload []byte) ([]string, bool) {
+// Returns (nil, false, false, false) on any decode error or absent
+// `mention` field. The fan-out narrowing gate treats (no uids, no
+// ais, no humans) as "no summon".
+func decodeMentionGate(payload []byte) ([]string, bool, bool, bool) {
 	if len(payload) == 0 {
-		return nil, false
+		return nil, false, false, false
 	}
 	var decoded map[string]interface{}
 	if err := json.Unmarshal(payload, &decoded); err != nil {
-		return nil, false
+		return nil, false, false, false
 	}
 	raw, ok := decoded["mention"]
 	if !ok || raw == nil {
-		return nil, false
+		return nil, false, false, false
 	}
 	mentionMap, ok := raw.(map[string]interface{})
 	if !ok {
-		return nil, false
+		return nil, false, false, false
 	}
 	// truthy1 — accept both numeric 1 and boolean true. Mirrors the
 	// two shapes real WuKongIM / Plan X clients emit. Strings, null,
@@ -774,20 +812,26 @@ func decodeMentionGate(payload []byte) ([]string, bool) {
 		}
 		return false
 	}
-	// mention.all (legacy WuKongIM clients) — YUJ-1538.
+	// mention.all (legacy WuKongIM clients) — YUJ-1538. Parsed but
+	// NOT consumed by the OBO fan-out gate (see #142 / #143).
 	var all bool
 	if v, ok := mentionMap["all"]; ok && v != nil {
 		all = truthy1(v)
 	}
-	// mention.humans (Plan X web client @所有人) — YUJ-1709 / #125.
+	// mention.ais (Plan X / YUJ-1389) — `@所有 AI`. Triggers the
+	// unfiltered fan-out branch in fanoutForMessage.
+	var ais bool
+	if v, ok := mentionMap["ais"]; ok && v != nil {
+		ais = truthy1(v)
+	}
+	// mention.humans (Plan X web client `@所有人`) — YUJ-1709 / #125.
 	// Plan X never co-emits `mention.all`, so without this branch the
 	// fan-out gate early-returns and any grantee bot for a grantor in
-	// the channel silently misses the OBO DM. Treated as identical to
-	// `mention.all` for gate purposes.
-	if !all {
-		if v, ok := mentionMap["humans"]; ok && v != nil {
-			all = truthy1(v)
-		}
+	// the channel silently misses the OBO DM. Treated as a persona-
+	// clone summon at the gate.
+	var humans bool
+	if v, ok := mentionMap["humans"]; ok && v != nil {
+		humans = truthy1(v)
 	}
 	// mention.uids — distinct, trim whitespace, drop empties.
 	var uids []string
@@ -819,7 +863,7 @@ func decodeMentionGate(payload []byte) ([]string, bool) {
 			}
 		}
 	}
-	return uids, all
+	return uids, all, ais, humans
 }
 
 // oboResolveDisplayName — YUJ-1465. Resolves a uid to a human display
