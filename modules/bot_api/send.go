@@ -199,18 +199,6 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 	// Helper is idempotent and safe on nil — see pkg/mentionrewrite.
 	payload = mentionrewrite.RewriteMention(payload)
 
-	// Mininglamp-OSS/octo-server#144 — second-pass mention chokepoint
-	// (sister call to the user and robot ingresses). When mention.ais=1
-	// in a GROUP channel, expand mention.uids to every bot member of
-	// the channel so legacy adapter bots (#137) on the WuKongIM
-	// websocket recognise the broadcast. PR #138 only rewrites the
-	// /v1/bot/events queue path; this helper covers the websocket
-	// dispatch path. Idempotent + dedups with PR #138 — see
-	// pkg/mentionrewrite/expand_ais.go. channelID uses the
-	// space-resolved value so a multi-Space group still hits the right
-	// member roster.
-	payload = mentionrewrite.ExpandAisToBotUIDs(payload, req.ChannelType, channelID, ba.fetchBotMemberUIDs)
-
 	// YUJ-1166 fan-out loop guard #3: mark this message so the fan-out
 	// listener (see obo_fanout.go) skips it on the way back through the
 	// listener pipeline. Marker key lives in the reserved `__obo_*`
@@ -225,6 +213,30 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 		payload["actual_sender_uid"] = robotID
 	}
 
+	// Mininglamp-OSS/octo-server#144 + PR#145 review follow-up:
+	// second-pass mention chokepoint (sister call to the user and
+	// robot ingresses). When mention.ais=1 in a GROUP channel, expand
+	// mention.uids to every bot member of the channel so legacy
+	// adapter bots (#137) on the WuKongIM websocket recognise the
+	// broadcast. PR #138 only rewrites the /v1/bot/events queue path;
+	// this helper covers the websocket dispatch path. channelID uses
+	// the space-resolved value so a multi-Space group still hits the
+	// right member roster.
+	//
+	// ⚠️ PR#145 review (Jerry-Xin / lml2468 / yujiawei 2026-05-23):
+	// the expansion MUST run on a clone of `payload`, not on `payload`
+	// itself. ExpandAisToBotUIDs mutates the inner `mention` sub-map
+	// in place, and the in-memory `payload` flows into the persisted
+	// MessageResp + the listener pipeline (obo_fanout, reminder
+	// writer at modules/message/api_reminders.go) — mutating it here
+	// would create one human-visible `[有人@我]` reminder per
+	// server-expanded bot member of the group. The clone is used ONLY
+	// for the wire bytes; `payload` retains the original
+	// caller-supplied `mention.uids`. See pkg/mentionrewrite/clone.go
+	// for the clone contract.
+	wirePayload := mentionrewrite.CloneForExpansion(payload)
+	wirePayload = mentionrewrite.ExpandAisToBotUIDs(wirePayload, req.ChannelType, channelID, ba.fetchBotMemberUIDs)
+
 	msgReq := &config.MsgSendReq{
 		Header: config.MsgHeader{
 			RedDot: 1,
@@ -233,7 +245,7 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 		ChannelID:   channelID,
 		ChannelType: req.ChannelType,
 		FromUID:     fromUID,
-		Payload:     []byte(util.ToJson(payload)),
+		Payload:     []byte(util.ToJson(wirePayload)),
 	}
 	result, err := ba.dispatchMsgSendReq(msgReq)
 	if err != nil {

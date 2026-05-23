@@ -485,23 +485,36 @@ func (rb *Robot) sendMessage(c *wkhttp.Context) {
 	// see pkg/mentionrewrite.
 	payload = mentionrewrite.RewriteMention(payload)
 
-	// Mininglamp-OSS/octo-server#144 — second-pass mention chokepoint
-	// (sister call to the user and bot ingresses). When mention.ais=1
-	// in a GROUP channel, expand mention.uids to include every bot
-	// member of the channel so legacy adapter bots (#137) on the
-	// WuKongIM websocket recognise the `@所有 AI` broadcast. PR #138
-	// only rewrites the /v1/bot/events queue path; this helper covers
-	// the websocket dispatch path. Idempotent and dedups with PR
-	// #138's injectBotUIDIntoMentionUIDs — see
-	// pkg/mentionrewrite/expand_ais.go for the full contract.
-	payload = mentionrewrite.ExpandAisToBotUIDs(payload, messageReq.ChannelType, messageReq.ChannelID, rb.fetchBotMemberUIDs)
+	// Mininglamp-OSS/octo-server#144 + PR#145 review follow-up:
+	// second-pass mention chokepoint (sister call to the user and bot
+	// ingresses). When mention.ais=1 in a GROUP channel, expand
+	// mention.uids to include every bot member of the channel so
+	// legacy adapter bots (#137) on the WuKongIM websocket recognise
+	// the `@所有 AI` broadcast. PR #138 only rewrites the
+	// /v1/bot/events queue path; this helper covers the websocket
+	// dispatch path.
+	//
+	// ⚠️ PR#145 review (Jerry-Xin / lml2468 / yujiawei 2026-05-23):
+	// the expansion MUST run on a clone of `payload`, not on `payload`
+	// itself. ExpandAisToBotUIDs mutates the inner `mention` sub-map
+	// in place, and the in-memory `payload` is shared with the
+	// persisted message_extra row + the reminder writer at
+	// modules/message/api_reminders.go (which iterates `mention.uids`
+	// to emit one ReminderTypeMentionMe row per UID) — mutating it
+	// here would create one human-visible `[有人@我]` reminder per
+	// server-expanded bot member. The clone is used ONLY for the wire
+	// bytes; `payload` retains the original caller-supplied
+	// `mention.uids`. See pkg/mentionrewrite/clone.go for the clone
+	// contract.
+	wirePayload := mentionrewrite.CloneForExpansion(payload)
+	wirePayload = mentionrewrite.ExpandAisToBotUIDs(wirePayload, messageReq.ChannelType, messageReq.ChannelID, rb.fetchBotMemberUIDs)
 
 	result, err := rb.ctx.SendMessageWithResult(&config.MsgSendReq{
 		StreamNo:    messageReq.StreamNo,
 		ChannelID:   messageReq.ChannelID,
 		ChannelType: messageReq.ChannelType,
 		FromUID:     robotID,
-		Payload:     []byte(util.ToJson(payload)),
+		Payload:     []byte(util.ToJson(wirePayload)),
 	})
 	if err != nil {
 		rb.Error("发送robot消息失败！", zap.Error(err))

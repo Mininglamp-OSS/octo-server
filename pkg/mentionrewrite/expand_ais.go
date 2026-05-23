@@ -132,20 +132,19 @@ func ExpandAisToBotUIDs(
 	if !isTruthyOne(mention[AIsKey]) {
 		return payload
 	}
-	// Clause 5: nil callback or lookup error → no-op (best effort).
-	if fetchBotUIDs == nil {
-		return payload
-	}
-	botUIDs, err := fetchBotUIDs(channelID)
-	if err != nil || len(botUIDs) == 0 {
-		return payload
-	}
-
 	// Clause 4: only mutate when uids is absent or already a
 	// []interface{}. Any other shape (string, map, number) means a
 	// malformed inbound payload and we forward untouched — same
 	// defensive contract injectBotUIDIntoMentionUIDs follows on the
 	// outbound side.
+	//
+	// P2 (PR#145 review, yujiawei 2026-05-23): this shape gate runs
+	// BEFORE the fetchBotUIDs callback so a malformed `mention.uids`
+	// value cannot trigger an unnecessary DB roundtrip
+	// (group.GetMembers + per-member robot.ExistRobot). The previous
+	// ordering called fetchBotUIDs first and then discarded the
+	// result on a non-array uids — wasted IO on a payload we know we
+	// will not mutate.
 	var existing []interface{}
 	if rawUIDs, hasUIDs := mention[UIDsKey]; hasUIDs && rawUIDs != nil {
 		arr, isArr := rawUIDs.([]interface{})
@@ -153,6 +152,14 @@ func ExpandAisToBotUIDs(
 			return payload
 		}
 		existing = arr
+	}
+	// Clause 5: nil callback or lookup error → no-op (best effort).
+	if fetchBotUIDs == nil {
+		return payload
+	}
+	botUIDs, err := fetchBotUIDs(channelID)
+	if err != nil || len(botUIDs) == 0 {
+		return payload
 	}
 
 	// Build a string-set for clause 3 dedup. Pre-allocate to the

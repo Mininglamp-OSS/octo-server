@@ -475,16 +475,6 @@ func (m *Message) sendMessage(channelID string, channelType uint8, fromUID strin
 	// nil / malformed mention shapes — see pkg/mentionrewrite/rewrite.go
 	// for the contract.
 	payload = RewriteMention(payload)
-	// Mininglamp-OSS/octo-server#144 — second-pass mention chokepoint.
-	// When mention.ais=1 in a GROUP channel, expand mention.uids to
-	// include every bot member of the channel so legacy adapter bots
-	// (octo-server#137) that only inspect mention.uids over the
-	// WuKongIM websocket still recognise the `@所有 AI` broadcast.
-	// PR #138's per-bot UID injection only reaches the bot event
-	// queue (/v1/bot/events); the WuKongIM dispatch path needs this
-	// helper. Helper is idempotent + dedups with PR #138 — see
-	// pkg/mentionrewrite/expand_ais.go for the full contract.
-	payload = mentionrewrite.ExpandAisToBotUIDs(payload, channelType, channelID, m.fetchBotMemberUIDs)
 	// YUJ-219-A / GH#1283 (analysis-report.md §4.5 / §7.4)：
 	// 派发前为消息 payload 注入权威 space_id，让客户端 SpaceFilter 拿到可信字段，
 	// race 窗口的 fail-open 语义可降级为 fail-closed。
@@ -492,6 +482,29 @@ func (m *Message) sendMessage(channelID string, channelType uint8, fromUID strin
 	// 直接覆盖客户端 payload.space_id，跨 Space 推送时收端 SpaceFilter 拿到权威值
 	// 立刻丢弃，不再依赖 channelInfo 缓存命中。
 	payload = m.enrichPayloadWithSpaceID(channelID, channelType, payload, senderSpaceID)
+	// Mininglamp-OSS/octo-server#144 + PR#145 review follow-up:
+	// second-pass mention chokepoint. When mention.ais=1 in a GROUP
+	// channel, expand mention.uids to include every bot member of the
+	// channel so legacy adapter bots (octo-server#137) that only
+	// inspect mention.uids over the WuKongIM websocket still recognise
+	// the `@所有 AI` broadcast. PR #138's per-bot UID injection only
+	// reaches the bot event queue (/v1/bot/events); this helper covers
+	// the WuKongIM dispatch path.
+	//
+	// ⚠️ PR#145 review (Jerry-Xin / lml2468 / yujiawei 2026-05-23):
+	// the expansion MUST run on a clone of `payload`, not on `payload`
+	// itself. ExpandAisToBotUIDs mutates the inner `mention` sub-map
+	// in place, and the in-memory `payload` is shared with the
+	// reminder writer (modules/message/api_reminders.go iterates
+	// `mention.uids` to emit one ReminderTypeMentionMe row per UID) —
+	// so mutating `payload` here would create one human-visible
+	// `[有人@我]` red-dot per server-expanded bot member. The clone is
+	// used ONLY for the wire bytes; `payload` retains the original
+	// caller-supplied `mention.uids`. See
+	// pkg/mentionrewrite/clone.go for the clone contract and
+	// pkg/mentionrewrite/expand_ais.go for the expansion contract.
+	wirePayload := mentionrewrite.CloneForExpansion(payload)
+	wirePayload = mentionrewrite.ExpandAisToBotUIDs(wirePayload, channelType, channelID, m.fetchBotMemberUIDs)
 	err := m.ctx.SendMessage(&config.MsgSendReq{
 		Header: config.MsgHeader{
 			RedDot: 1,
@@ -499,7 +512,7 @@ func (m *Message) sendMessage(channelID string, channelType uint8, fromUID strin
 		ChannelID:   channelID,
 		ChannelType: channelType,
 		FromUID:     fromUID,
-		Payload:     []byte(util.ToJson(payload)),
+		Payload:     []byte(util.ToJson(wirePayload)),
 	})
 	if err != nil {
 		m.Error("发送消息错误", zap.Error(err))

@@ -34,6 +34,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -521,4 +522,105 @@ func TestReminderSync_SenderExcludedFromBroadcast(t *testing.T) {
 	// And a third party sees both.
 	got = filterChannelLevelByPublisher(rows, "u_bystander")
 	assert.Len(t, got, 2)
+}
+
+// TestGetReminders_AisExpansionDoesNotPolluteReminderRows is the
+// PR#145 review-blocker regression. The chokepoint at
+// (*Message).sendMessage is supposed to expand `mention.ais=1`
+// into `mention.uids` on a CLONE of the payload (the wire-only
+// representation) so the in-memory `payload` map — which feeds the
+// persisted MessageResp and downstream consumers like the reminder
+// writer below — keeps the original caller-supplied
+// `mention.uids` untouched.
+//
+// Bug we are guarding against
+// ===========================
+// Before this fix the chokepoint mutated `payload` in place. The
+// reminder writer at modules/message/api_reminders.go:223-243
+// iterates `mention.uids` and emits one ReminderTypeMentionMe row
+// per UID — so every `ais=1` broadcast created one human-visible
+// `[有人@我]` red-dot per bot member of the group. DB pollution AND
+// a contract violation (`ais=1` is supposed to mean "bots respond
+// via the delivery path; do NOT create human-visible reminders").
+//
+// What this test pins
+// ===================
+// We replicate the chokepoint composition (CloneForExpansion →
+// ExpandAisToBotUIDs) and then assert two things:
+//
+//  1. The wire-only payload bytes (what WuKongIM dispatches and
+//     legacy adapter bots inspect) DO carry the expanded bot UIDs.
+//
+//  2. The original in-memory `payload` map, when fed into
+//     getReminders the way the persistence + listener pipeline
+//     does, produces reminder rows ONLY for the explicit human
+//     UIDs that the caller supplied — NEVER for the expanded bot
+//     UIDs.
+//
+// If a future refactor reverts the chokepoint to mutate `payload`
+// directly, this test fails on the second assertion (bot UIDs
+// would leak into the reminder set).
+func TestGetReminders_AisExpansionDoesNotPolluteReminderRows(t *testing.T) {
+	const channelID = "ch_team"
+
+	// Caller-supplied payload: `@所有 AI + @alice` in a GROUP channel.
+	// The explicit human mention (`u_alice`) MUST still get a per-user
+	// reminder row; the broadcast (`ais=1`) MUST NOT — bots will
+	// respond via the delivery path.
+	original := map[string]interface{}{
+		"type":    1,
+		"content": "@所有 AI plus @alice",
+		"mention": map[string]interface{}{
+			"ais":  json.Number("1"),
+			"uids": []interface{}{"u_alice"},
+		},
+	}
+
+	// Simulate the chokepoint at sendMessage(): clone, expand on the
+	// clone, serialize the clone for the wire. Same shape as the
+	// production code at modules/message/api.go.
+	wire := mentionrewrite.CloneForExpansion(original)
+	wire = mentionrewrite.ExpandAisToBotUIDs(wire, common.ChannelTypeGroup.Uint8(), channelID,
+		func(string) ([]string, error) {
+			return []string{"bot_a", "bot_b"}, nil
+		})
+
+	// Assertion #1: wire bytes carry the expansion so legacy adapter
+	// bots that only inspect `mention.uids` on the WuKongIM payload
+	// still see the `@所有 AI` broadcast.
+	wireMention := wire["mention"].(map[string]interface{})
+	wireUIDs, _ := wireMention["uids"].([]interface{})
+	assert.ElementsMatch(t,
+		[]interface{}{"u_alice", "bot_a", "bot_b"},
+		wireUIDs,
+		"wire payload must include expanded bot UIDs for legacy adapter compat")
+
+	// Assertion #2: the in-memory payload is unmutated. We feed it
+	// into getReminders the way the persistence + listener pipeline
+	// does (config.MessageResp.GetPayloadMap decodes the persisted
+	// bytes with UseNumber — see payloadJSON above for the same
+	// re-decode pattern).
+	m := newReminderTestMessage(t)
+	msg := &config.MessageResp{
+		ChannelID:   channelID,
+		ChannelType: common.ChannelTypeGroup.Uint8(),
+		FromUID:     "u_sender",
+		MessageID:   2024,
+		MessageSeq:  42,
+		ClientMsgNo: "cmn_pr145",
+		Payload:     payloadJSON(t, original),
+	}
+	got := m.getReminders([]*config.MessageResp{msg})
+
+	// Exactly one reminder, for the human `u_alice`. Zero reminders
+	// for `bot_a` / `bot_b` / the channel-level broadcast (no
+	// `humans=1`, so no `[有人@我]` red-dot either).
+	assert.Len(t, got, 1, "exactly one reminder row, for the explicit human mention")
+	assert.Equal(t, "u_alice", got[0].UID,
+		"reminder must be for the explicit human UID, NOT a server-expanded bot UID")
+	for _, r := range got {
+		assert.NotEqual(t, "bot_a", r.UID, "bot_a must not receive a reminder row")
+		assert.NotEqual(t, "bot_b", r.UID, "bot_b must not receive a reminder row")
+		assert.NotEqual(t, "", r.UID, "no channel-level [有人@我] red-dot for ais-only broadcast")
+	}
 }
