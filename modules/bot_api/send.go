@@ -199,6 +199,18 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 	// Helper is idempotent and safe on nil — see pkg/mentionrewrite.
 	payload = mentionrewrite.RewriteMention(payload)
 
+	// Mininglamp-OSS/octo-server#144 — second-pass mention chokepoint
+	// (sister call to the user and robot ingresses). When mention.ais=1
+	// in a GROUP channel, expand mention.uids to every bot member of
+	// the channel so legacy adapter bots (#137) on the WuKongIM
+	// websocket recognise the broadcast. PR #138 only rewrites the
+	// /v1/bot/events queue path; this helper covers the websocket
+	// dispatch path. Idempotent + dedups with PR #138 — see
+	// pkg/mentionrewrite/expand_ais.go. channelID uses the
+	// space-resolved value so a multi-Space group still hits the right
+	// member roster.
+	payload = mentionrewrite.ExpandAisToBotUIDs(payload, req.ChannelType, channelID, ba.fetchBotMemberUIDs)
+
 	// YUJ-1166 fan-out loop guard #3: mark this message so the fan-out
 	// listener (see obo_fanout.go) skips it on the way back through the
 	// listener pipeline. Marker key lives in the reserved `__obo_*`

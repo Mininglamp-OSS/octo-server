@@ -29,6 +29,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/robot"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"github.com/gocraft/dbr/v2"
@@ -474,6 +475,16 @@ func (m *Message) sendMessage(channelID string, channelType uint8, fromUID strin
 	// nil / malformed mention shapes — see pkg/mentionrewrite/rewrite.go
 	// for the contract.
 	payload = RewriteMention(payload)
+	// Mininglamp-OSS/octo-server#144 — second-pass mention chokepoint.
+	// When mention.ais=1 in a GROUP channel, expand mention.uids to
+	// include every bot member of the channel so legacy adapter bots
+	// (octo-server#137) that only inspect mention.uids over the
+	// WuKongIM websocket still recognise the `@所有 AI` broadcast.
+	// PR #138's per-bot UID injection only reaches the bot event
+	// queue (/v1/bot/events); the WuKongIM dispatch path needs this
+	// helper. Helper is idempotent + dedups with PR #138 — see
+	// pkg/mentionrewrite/expand_ais.go for the full contract.
+	payload = mentionrewrite.ExpandAisToBotUIDs(payload, channelType, channelID, m.fetchBotMemberUIDs)
 	// YUJ-219-A / GH#1283 (analysis-report.md §4.5 / §7.4)：
 	// 派发前为消息 payload 注入权威 space_id，让客户端 SpaceFilter 拿到可信字段，
 	// race 窗口的 fail-open 语义可降级为 fail-closed。

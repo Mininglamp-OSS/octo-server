@@ -63,6 +63,18 @@ type IService interface {
 	// synthetic events transparently. Returns an error only when the
 	// Redis ZADD / GenSeq call fails.
 	EnqueueBotEvent(robotID string, message *config.MessageResp) error
+	// ExistRobot reports whether `uid` identifies an active robot
+	// (robot.status=1). Mininglamp-OSS/octo-server#144: the ingress
+	// chokepoint that expands `mention.ais=1` into `mention.uids` uses
+	// this to filter the channel's group-member list down to the bot
+	// subset, so legacy adapter bots that only inspect `mention.uids`
+	// still receive the `@所有 AI` broadcast over the WuKongIM payload.
+	//
+	// Returns false (no error) for unknown / disabled robots — callers
+	// can treat any non-nil error as a "lookup failed" and skip the
+	// expansion best-effort (an unexpanded broadcast is no worse than
+	// the pre-#144 state).
+	ExistRobot(uid string) (bool, error)
 }
 
 // Service robot 模块对外暴露的只读服务实现，供其它模块注入使用。
@@ -130,6 +142,27 @@ func (s *Service) EnqueueBotEvent(robotID string, message *config.MessageResp) e
 // the cross-module synthetic path.
 func (rb *Robot) EnqueueBotEvent(robotID string, message *config.MessageResp) error {
 	return enqueueBotEventGeneric(rb.ctx, robotID, message)
+}
+
+// ExistRobot — IService — Service variant. Delegates to the same
+// robotDB.exist helper used by /v1/manager/robots etc., scoped to
+// `status=1` (active robots only). See the IService docstring for the
+// Mininglamp-OSS/octo-server#144 rationale.
+func (s *Service) ExistRobot(uid string) (bool, error) {
+	if strings.TrimSpace(uid) == "" {
+		return false, nil
+	}
+	return s.db.exist(uid)
+}
+
+// ExistRobot — IService — *Robot variant. Delegates to the embedded
+// robotDB.exist so existing *Robot instances satisfy the wider
+// IService surface introduced for Mininglamp-OSS/octo-server#144.
+func (rb *Robot) ExistRobot(uid string) (bool, error) {
+	if strings.TrimSpace(uid) == "" {
+		return false, nil
+	}
+	return rb.db.exist(uid)
 }
 
 // enqueueBotEventGeneric is the shared write-to-bot-event-queue helper
@@ -451,6 +484,17 @@ func (rb *Robot) sendMessage(c *wkhttp.Context) {
 	// the chokepoint. Helper is idempotent and safe on nil —
 	// see pkg/mentionrewrite.
 	payload = mentionrewrite.RewriteMention(payload)
+
+	// Mininglamp-OSS/octo-server#144 — second-pass mention chokepoint
+	// (sister call to the user and bot ingresses). When mention.ais=1
+	// in a GROUP channel, expand mention.uids to include every bot
+	// member of the channel so legacy adapter bots (#137) on the
+	// WuKongIM websocket recognise the `@所有 AI` broadcast. PR #138
+	// only rewrites the /v1/bot/events queue path; this helper covers
+	// the websocket dispatch path. Idempotent and dedups with PR
+	// #138's injectBotUIDIntoMentionUIDs — see
+	// pkg/mentionrewrite/expand_ais.go for the full contract.
+	payload = mentionrewrite.ExpandAisToBotUIDs(payload, messageReq.ChannelType, messageReq.ChannelID, rb.fetchBotMemberUIDs)
 
 	result, err := rb.ctx.SendMessageWithResult(&config.MsgSendReq{
 		StreamNo:    messageReq.StreamNo,
