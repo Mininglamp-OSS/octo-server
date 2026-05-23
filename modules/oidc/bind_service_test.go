@@ -2,7 +2,9 @@ package oidc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -303,6 +305,40 @@ func TestBindService_Info_MasksIdentity(t *testing.T) {
 	// 检测无 sub/issuer 泄漏(以字面搜)
 	if got := info.MaskedEmail + info.MaskedPhone + info.Name; got == "" {
 		t.Fatal("info empty?")
+	}
+}
+
+// TestBindService_Info_MaskedFieldsAlwaysSerialized GH#148:masked_email /
+// masked_phone 必须始终出现在 JSON 中,空 claim 序列化为 ""(而非 omit)。
+// omitempty 会让前端 schema validator 抛 "masked_email must be string",
+// 通用错误映射把它误报为"网络异常",见 issue 148。
+func TestBindService_Info_MaskedFieldsAlwaysSerialized(t *testing.T) {
+	svc, _, _, _ := newTestBindService(t)
+	c := sampleClaims()
+	c.Email = ""
+	c.PhoneNumber = ""
+	c.PhoneVerified = false
+	jti, err := svc.Issue(context.Background(), c, sampleSD())
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	info, err := svc.Info(context.Background(), jti)
+	if err != nil {
+		t.Fatalf("Info: %v", err)
+	}
+	if info.MaskedEmail != "" || info.MaskedPhone != "" {
+		t.Fatalf("expected empty masks, got email=%q phone=%q", info.MaskedEmail, info.MaskedPhone)
+	}
+	raw, err := json.Marshal(info)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	body := string(raw)
+	if !strings.Contains(body, `"masked_email":""`) {
+		t.Fatalf("masked_email key missing or non-empty in JSON: %s", body)
+	}
+	if !strings.Contains(body, `"masked_phone":""`) {
+		t.Fatalf("masked_phone key missing or non-empty in JSON: %s", body)
 	}
 }
 

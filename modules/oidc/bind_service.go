@@ -44,8 +44,13 @@ type BindLocator interface {
 //
 // 不含 sub / issuer / claims 原值,避免社工攻击(SR-7)。
 type BindInfoResp struct {
-	MaskedEmail    string       `json:"masked_email,omitempty"`
-	MaskedPhone    string       `json:"masked_phone,omitempty"`
+	// MaskedEmail / MaskedPhone 协议约定恒在(无 omitempty):空字符串 "" 表示
+	// 该 claim 不存在,前端按 truthy 分支隐藏对应行。omitempty 会让"无 email"
+	// 路径整字段消失,迫使前端把"字段缺失"与"字段为空"当两种状态处理,
+	// 也会触发前端 schema validator 抛出 "masked_email must be string"
+	// 被通用错误处理误报为"网络异常"(GH#148)。
+	MaskedEmail    string       `json:"masked_email"`
+	MaskedPhone    string       `json:"masked_phone"`
 	Name           string       `json:"name,omitempty"`
 	Methods        []BindMethod `json:"methods"`
 	SupportContact string       `json:"support_contact,omitempty"`

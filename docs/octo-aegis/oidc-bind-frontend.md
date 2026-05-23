@@ -114,7 +114,7 @@ bind_token 在 5 分钟 TTL 内：
 }
 ```
 
-- `masked_email` / `masked_phone` 可能为空字符串（IdP 没下发或不可信）
+- `masked_email` / `masked_phone` **始终出现**在响应中；IdP 没下发或不可信时序列化为 `""`（空字符串），前端按 truthy 判断隐藏对应行即可（GH#148）
 - `methods` 来自后端 `cfg.Methods ∩ claims 支持`：claims 无 verified phone 时不会出现 `sms_otp`
 - `support_contact` 来自 env，可空，用于 FR-7 "联系管理员"兜底
 
@@ -224,7 +224,7 @@ bind_token 在 5 分钟 TTL 内：
 - token 在 `/authorize → callback → 签发` 那一刻起算 5 分钟（`OCTO_OIDC_BIND_TOKEN_TTL_SEC`）
 - verify 通过**不会**续 TTL；如果用户在 token 快过期时才点 verify，剩下的时间就是 confirm 必须完成的窗口
 - 已过期的 token 走任何端点都会返 410；前端拿到 410 后应当引导用户重新走 OIDC 登录
-- masked_phone 字段：claims 无手机号时 JSON 里**没有**该字段（不要靠 `=== ""` 判断）；存在时形如 `"****5678"`
+- `masked_email` / `masked_phone` 字段：claims 无对应值时序列化为 `""`(空字符串,字段**始终存在**),存在时形如 `"a***@example.com"` / `"****5678"`;前端按 truthy 判断隐藏对应行(GH#148)
 
 ## 4. 关键约束 / 注意事项
 
