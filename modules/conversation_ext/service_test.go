@@ -3,6 +3,7 @@
 package conversation_ext
 
 import (
+	"errors"
 	"os"
 	"strconv"
 	"testing"
@@ -976,4 +977,166 @@ func TestService_UnfollowChannel_SeparatorEscaped_LengthCollisionSafe(t *testing
 	require.NoError(t, err)
 	assert.NotNil(t, mA,
 		"attacker 的 thread 必须留存——4 个下划线不应被当作通配跨群匹配")
+}
+
+// ---------------------------------------------------------------------------
+// Issue #151 code review #1 — AuthorizeAndMaterializeDefaultFollowedGroups
+// ---------------------------------------------------------------------------
+
+// stubDefaultFollowedGroupGuard is a service_test double for
+// DefaultFollowedGroupGuard.  allowed[uid|spaceID|group_no]=true → kept in the
+// filtered result; entries not in allowed are dropped (simulating either
+// "no category", "wrong space", or "not a member" — the production guard
+// merges all three signals).  Keying on the full triple lets tests assert
+// spaceID is plumbed correctly (issue #151 code review #2).
+type stubDefaultFollowedGroupGuard struct {
+	allowed map[string]bool
+	err     error
+	// gotCalls captures every (uid, spaceID, candidate-list) invocation so
+	// tests can assert spaceID is forwarded verbatim.
+	gotCalls []stubGuardCall
+}
+
+type stubGuardCall struct {
+	uid        string
+	spaceID    string
+	candidates []string
+}
+
+func (s *stubDefaultFollowedGroupGuard) FilterDefaultFollowed(uid, spaceID string, candidates []string) ([]string, error) {
+	s.gotCalls = append(s.gotCalls, stubGuardCall{uid: uid, spaceID: spaceID, candidates: append([]string(nil), candidates...)})
+	if s.err != nil {
+		return nil, s.err
+	}
+	out := make([]string, 0, len(candidates))
+	for _, c := range candidates {
+		if s.allowed[uid+"|"+spaceID+"|"+c] {
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+
+func TestService_AuthorizeAndMaterialize_FiltersOutDisallowedGroups(t *testing.T) {
+	svc := newServiceForTest(t)
+	const uid, space = "u1", "s1"
+
+	// Guard says only g-ok passes the (member + space-visible + categorized)
+	// chain in this space; g-evil is an attacker-injected ID.
+	svc.SetDefaultFollowedGroupGuard(&stubDefaultFollowedGroupGuard{
+		allowed: map[string]bool{uid + "|" + space + "|g-ok": true},
+	})
+
+	require.NoError(t, svc.AuthorizeAndMaterializeDefaultFollowedGroups(
+		uid, space, []string{"g-ok", "g-evil"}))
+
+	// g-ok was materialized.
+	rowOK, err := svc.db.Get(uid, space, targetTypeGroup, "g-ok")
+	require.NoError(t, err)
+	require.NotNil(t, rowOK, "guard-allowed group must be materialized")
+	assert.Equal(t, int8(1), rowOK.AutoFollowThreads,
+		"materialized row must have auto_follow_threads=1")
+
+	// g-evil was NOT materialized — critical for the security contract.
+	rowEvil, err := svc.db.Get(uid, space, targetTypeGroup, "g-evil")
+	require.NoError(t, err)
+	assert.Nil(t, rowEvil,
+		"guard-disallowed group MUST NOT be materialized — otherwise a client "+
+			"could piggyback arbitrary group IDs in /v1/follow/sort and start "+
+			"receiving OnThreadCreated fan-outs for groups they cannot access "+
+			"(issue #151 code review #1)")
+}
+
+func TestService_AuthorizeAndMaterialize_NoGuard_ReturnsSentinel(t *testing.T) {
+	svc := newServiceForTest(t)
+	const uid, space = "u1", "s1"
+
+	// No guard injected — must return the diagnostic sentinel so test /
+	// misconfigured deployments fail loudly instead of degenerating into the
+	// obscure ErrSortTargetNotFound on the downstream db.UpdateSort
+	// (issue #151 re-review M1).
+	err := svc.AuthorizeAndMaterializeDefaultFollowedGroups(
+		uid, space, []string{"g-no-guard"})
+	assert.ErrorIs(t, err, ErrDefaultFollowedGuardNotConfigured,
+		"missing-guard branch must return the diagnostic sentinel")
+
+	// And must NOT have materialized anything (fail-closed remains intact).
+	row, err := svc.db.Get(uid, space, targetTypeGroup, "g-no-guard")
+	require.NoError(t, err)
+	assert.Nil(t, row,
+		"without a registered DefaultFollowedGroupGuard, no group may be "+
+			"materialized — fail-closed is the safer default for an "+
+			"authorization-bearing path")
+}
+
+func TestService_AuthorizeAndMaterialize_GuardError_Propagates(t *testing.T) {
+	svc := newServiceForTest(t)
+	const uid, space = "u1", "s1"
+
+	wantErr := errors.New("group_setting query failed")
+	svc.SetDefaultFollowedGroupGuard(&stubDefaultFollowedGroupGuard{err: wantErr})
+
+	err := svc.AuthorizeAndMaterializeDefaultFollowedGroups(
+		uid, space, []string{"g-any"})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, wantErr,
+		"guard errors must propagate so the caller can surface a 5xx rather "+
+			"than silently falling back to no-op materialization")
+
+	row, err := svc.db.Get(uid, space, targetTypeGroup, "g-any")
+	require.NoError(t, err)
+	assert.Nil(t, row, "guard error must NOT leak partial materialization")
+}
+
+func TestService_AuthorizeAndMaterialize_EmptyInput_NoOp(t *testing.T) {
+	svc := newServiceForTest(t)
+	svc.SetDefaultFollowedGroupGuard(&stubDefaultFollowedGroupGuard{allowed: nil})
+
+	require.NoError(t, svc.AuthorizeAndMaterializeDefaultFollowedGroups(
+		"u1", "s1", nil))
+	require.NoError(t, svc.AuthorizeAndMaterializeDefaultFollowedGroups(
+		"u1", "s1", []string{}))
+}
+
+// TestService_AuthorizeAndMaterialize_ForwardsSpaceID_AndDoesNotLeakAcrossSpaces
+// pins the issue #151 code review #2 fix: a group_setting row whose
+// category_id was set in Space A must NOT cause materialization for the same
+// user in Space B.  The Service passes spaceID through to the guard; the
+// guard's allow-map key includes spaceID, so the cross-space group is
+// rejected even though it has category_id set for this uid.
+func TestService_AuthorizeAndMaterialize_ForwardsSpaceID_AndDoesNotLeakAcrossSpaces(t *testing.T) {
+	svc := newServiceForTest(t)
+	const uid, spaceA, spaceB = "u1", "sA", "sB"
+
+	guard := &stubDefaultFollowedGroupGuard{
+		// Group g-cross has category in Space A only.  Space B treats it as
+		// "no membership / no visibility" — the production guard implementation
+		// reuses ChannelAuthChecker which would return forbidden here.
+		allowed: map[string]bool{uid + "|" + spaceA + "|g-cross": true},
+	}
+	svc.SetDefaultFollowedGroupGuard(guard)
+
+	// Submit g-cross under Space B — must NOT materialize.
+	require.NoError(t, svc.AuthorizeAndMaterializeDefaultFollowedGroups(
+		uid, spaceB, []string{"g-cross"}))
+
+	row, err := svc.db.Get(uid, spaceB, targetTypeGroup, "g-cross")
+	require.NoError(t, err)
+	assert.Nil(t, row,
+		"group categorized in Space A must NOT be materialized when the sort "+
+			"request comes from Space B — otherwise OnThreadCreated in Space B "+
+			"fans out threads for a group the user cannot see in this Space "+
+			"(issue #151 code review #2)")
+
+	// Assert guard saw the actual spaceID.
+	require.Len(t, guard.gotCalls, 1)
+	assert.Equal(t, spaceB, guard.gotCalls[0].spaceID,
+		"Service must forward the request's spaceID to the guard")
+
+	// Sanity: same group + same uid under Space A succeeds.
+	require.NoError(t, svc.AuthorizeAndMaterializeDefaultFollowedGroups(
+		uid, spaceA, []string{"g-cross"}))
+	row, err = svc.db.Get(uid, spaceA, targetTypeGroup, "g-cross")
+	require.NoError(t, err)
+	require.NotNil(t, row, "Space-A materialization must still work")
 }

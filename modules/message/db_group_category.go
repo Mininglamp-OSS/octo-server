@@ -108,3 +108,53 @@ func (d *groupCategoryDB) QueryCategorySortsByIDs(categoryIDs []string, uid stri
 	}
 	return result, nil
 }
+
+// FilterDefaultFollowedGroups returns the subset of candidateGroupNos that the
+// given uid has actually placed into a non-deleted category.  These are the
+// "default-followed" groups per the follow-tab definition — see
+// modules/conversation_ext/service.go DefaultFollowedGroupGuard for why this
+// gate exists (issue #151 code review #1).
+//
+// INNER JOIN group_category (with gc.status != 2) is the same defense-in-depth
+// pattern QueryCategorySettingsByGroupNos already applies (line 72 of this
+// file): a soft-deleted category leaves the original group_setting.category_id
+// pointing at gc.status=2, which sidebar's LEFT JOIN treats as "no category"
+// and excludes from the follow tab.  Without the JOIN here, Stage 1 would let
+// those stale rows through, Stage 2 would then materialize an
+// auto_follow_threads=1 row for a group the user's sidebar never even shows —
+// phantom fanout (issue #151 code review #3 / re-review H1).
+//
+// The JOIN's `gc.uid = gs.uid` predicate matches QueryCategorySettingsByGroupNos
+// — protects against future schema evolution that allows category sharing
+// across users.
+//
+// Returns an empty slice if no candidate matches.  Callers must NOT assume the
+// result preserves input order.
+func (d *groupCategoryDB) FilterDefaultFollowedGroups(uid string, candidateGroupNos []string) ([]string, error) {
+	if len(candidateGroupNos) == 0 {
+		return nil, nil
+	}
+	type row struct {
+		GroupNo string `db:"group_no"`
+	}
+	var rows []*row
+	_, err := d.session.Select("gs.group_no").
+		From(dbr.I("group_setting").As("gs")).
+		Join(
+			dbr.I("group_category").As("gc"),
+			"gs.category_id = gc.category_id AND gs.uid = gc.uid AND gc.status != 2",
+		).
+		Where("gs.uid = ? AND gs.group_no IN ?", uid, candidateGroupNos).
+		Load(&rows)
+	if err != nil {
+		return nil, fmt.Errorf("filter default-followed groups: %w", err)
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.GroupNo)
+	}
+	return out, nil
+}

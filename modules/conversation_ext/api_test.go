@@ -30,6 +30,9 @@ type stubService struct {
 	followChannelFn   func(uid, spaceID, groupNo string) error
 	followThreadFn    func(uid, spaceID, threadChannelID string) error
 	unfollowThreadFn  func(uid, spaceID, threadChannelID string) error
+	// authorizeAndMaterializeFn is the issue #151 gate.  Default (nil) → no-op
+	// so existing tests that don't exercise the sort path are unaffected.
+	authorizeAndMaterializeFn func(uid, spaceID string, candidateGroupNos []string) error
 }
 
 func (s *stubService) FollowDM(uid, spaceID, peerUID string, categoryID *string) error {
@@ -70,6 +73,13 @@ func (s *stubService) FollowThread(uid, spaceID, threadChannelID string) error {
 func (s *stubService) UnfollowThread(uid, spaceID, threadChannelID string) error {
 	if s.unfollowThreadFn != nil {
 		return s.unfollowThreadFn(uid, spaceID, threadChannelID)
+	}
+	return nil
+}
+
+func (s *stubService) AuthorizeAndMaterializeDefaultFollowedGroups(uid, spaceID string, candidateGroupNos []string) error {
+	if s.authorizeAndMaterializeFn != nil {
+		return s.authorizeAndMaterializeFn(uid, spaceID, candidateGroupNos)
 	}
 	return nil
 }
@@ -636,6 +646,98 @@ func TestFollow_UpdateSort_TargetNotFound_DistinctError(t *testing.T) {
 	})
 	assertBadRequest(t, w)
 	assert.Contains(t, w.Body.String(), "sort target not found")
+}
+
+// ---------------------------------------------------------------------------
+// Issue #151 code review #1 — UpdateSort handler must run the default-followed
+// group materialization gate BEFORE db.UpdateSort, with target_type=2 group
+// IDs extracted from the payload.
+// ---------------------------------------------------------------------------
+
+func TestFollow_UpdateSort_CallsAuthorizeBeforeDB(t *testing.T) {
+	var sawAuthorize bool
+	var gotCandidates []string
+	var sawDB bool
+	svc := &stubService{
+		authorizeAndMaterializeFn: func(uid, spaceID string, candidates []string) error {
+			sawAuthorize = true
+			gotCandidates = candidates
+			assert.False(t, sawDB,
+				"AuthorizeAndMaterializeDefaultFollowedGroups must run BEFORE "+
+					"db.UpdateSort so any materialization is committed before the "+
+					"sort tx tries to lock the rows")
+			return nil
+		},
+	}
+	db := &stubDB{
+		updateSortFn: func(uid, spaceID string, items []SortItem, version int64) error {
+			sawDB = true
+			return nil
+		},
+	}
+	r := newTestRouter(svc, db)
+	w := do(r, "PUT", "/v1/follow/sort", map[string]interface{}{
+		"items": []map[string]interface{}{
+			{"target_type": 1, "target_id": "dm-1", "sort": 1},
+			{"target_type": 2, "target_id": "grp-a", "sort": 2},
+			{"target_type": 5, "target_id": "grp-a____thr-1", "sort": 3},
+			{"target_type": 2, "target_id": "grp-b", "sort": 4},
+		},
+		"version": 0,
+	})
+	assertOK(t, w)
+	assert.True(t, sawAuthorize, "handler must invoke the authorize gate")
+	assert.True(t, sawDB, "handler must invoke db.UpdateSort after authorize")
+	assert.ElementsMatch(t, []string{"grp-a", "grp-b"}, gotCandidates,
+		"only target_type=2 items must be forwarded to the gate — DM and thread "+
+			"types follow strict ext-row semantics enforced by db.UpdateSort")
+}
+
+func TestFollow_UpdateSort_NoGroupCandidates_SkipsAuthorize(t *testing.T) {
+	authorizeCalled := false
+	svc := &stubService{
+		authorizeAndMaterializeFn: func(uid, spaceID string, candidates []string) error {
+			authorizeCalled = true
+			return nil
+		},
+	}
+	r := newTestRouter(svc, &stubDB{})
+	w := do(r, "PUT", "/v1/follow/sort", map[string]interface{}{
+		"items": []map[string]interface{}{
+			{"target_type": 1, "target_id": "dm-1", "sort": 1},
+		},
+		"version": 0,
+	})
+	assertOK(t, w)
+	assert.False(t, authorizeCalled,
+		"payloads with no target_type=2 items must skip the gate to avoid an "+
+			"unnecessary DB round-trip")
+}
+
+func TestFollow_UpdateSort_AuthorizeError_FailsBeforeDB(t *testing.T) {
+	dbCalled := false
+	svc := &stubService{
+		authorizeAndMaterializeFn: func(uid, spaceID string, candidates []string) error {
+			return errors.New("guard failure")
+		},
+	}
+	db := &stubDB{
+		updateSortFn: func(uid, spaceID string, items []SortItem, version int64) error {
+			dbCalled = true
+			return nil
+		},
+	}
+	r := newTestRouter(svc, db)
+	w := do(r, "PUT", "/v1/follow/sort", map[string]interface{}{
+		"items": []map[string]interface{}{
+			{"target_type": 2, "target_id": "grp-x", "sort": 1},
+		},
+		"version": 0,
+	})
+	assertBadRequest(t, w)
+	assert.False(t, dbCalled,
+		"db.UpdateSort must NOT run when the authorize step failed; otherwise "+
+			"a partial materialization could land before the sort error surfaces")
 }
 
 // ---------------------------------------------------------------------------

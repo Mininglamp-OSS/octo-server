@@ -80,6 +80,19 @@ func init() {
 			// 子区前必须校验 caller 是群成员 + 群在 Space 可见。复用同一个 struct
 			// 实现，共享 checkChannelAccess 逻辑。
 			svc.SetChannelAuthChecker(checker)
+			// 注入 DefaultFollowedGroupGuard：/v1/follow/sort 的 target_type=2
+			// 候选必须先经过 (成员 + Space 可见性 + 非 Disband + category_id) 完整
+			// 校验链才能被物化为 ext 行。没有这一步，恶意客户端可借 sort 接口给
+			// 任意群创建 auto_follow=1 行，进而通过 OnThreadCreated fanout 拿到本
+			// 不可见的子区元数据（issue #151 code review #1 + #2 —— #2 补强了
+			// spaceID 与成员资格校验，防止跨 Space group_setting 残留越权）。
+			//
+			// channelAuth 复用同一个 threadAuthChecker（也即 ChannelAuthChecker），
+			// 共享 checkChannelAccess 与 group.IService 实例，避免重复初始化。
+			svc.SetDefaultFollowedGroupGuard(&defaultFollowedGroupGuard{
+				db:          newGroupCategoryDB(appCtx),
+				channelAuth: checker,
+			})
 		}
 		return register.Module{Name: "conversation_ext_thread_auth"}
 	})
@@ -255,4 +268,93 @@ func (e *threadEnumerator) EnumerateActiveShortIDs(groupNo string, limit int) ([
 		ids = append(ids, m.ShortID)
 	}
 	return ids, nil
+}
+
+// defaultFollowedGroupGuard implements convext.DefaultFollowedGroupGuard with
+// the full membership + Space-visibility + Disband + category check chain.
+// Lives in message because all the dependencies (group_setting via
+// groupCategoryDB, group membership / visibility via threadAuthChecker.checkChannelAccess)
+// already live here — keeps modules/conversation_ext free of group imports.
+//
+// Why a chained check rather than category-only (issue #151 code review #2):
+// group_setting rows are scoped to (uid, group_no) without spaceID.  A user
+// who previously categorized group X while in Space A keeps that
+// group_setting row even after leaving Space A.  If we filtered by category
+// alone, that user could submit group X in /v1/follow/sort while operating
+// in Space B and force a materialization with (uid, Space B, group X,
+// auto_follow_threads=1) — OnThreadCreated in Space B would then fan out
+// threads of group X to them, leaking metadata for a group they cannot
+// otherwise see in Space B.
+//
+// The fix layers the existing channel-access check (the same one FollowChannel
+// uses) before category — only groups the user is genuinely a member of AND
+// visible in the current Space AND categorized survive.
+//
+// Dependencies are typed as narrow interfaces (not concrete *groupCategoryDB /
+// *threadAuthChecker) so the two-stage filter can be unit-tested with fakes —
+// see default_followed_group_guard_test.go (issue #151 re-review M3 / M4).
+type defaultFollowedGroupGuard struct {
+	db          defaultFollowedGroupCategoryFilter
+	channelAuth convext.ChannelAuthChecker
+}
+
+// defaultFollowedGroupCategoryFilter is the narrow Stage-1 interface — pulls
+// the group_setting × group_category JOIN out of *groupCategoryDB so tests can
+// substitute a fake.  The real implementation is *groupCategoryDB.
+type defaultFollowedGroupCategoryFilter interface {
+	FilterDefaultFollowedGroups(uid string, candidateGroupNos []string) ([]string, error)
+}
+
+// Compile-time guarantee that defaultFollowedGroupGuard implements the
+// conversation_ext interface — a typo'd method signature would otherwise
+// surface only at runtime when SetDefaultFollowedGroupGuard accepted it as
+// a different interface (issue #151 re-review L2).
+var _ convext.DefaultFollowedGroupGuard = (*defaultFollowedGroupGuard)(nil)
+
+func (g *defaultFollowedGroupGuard) FilterDefaultFollowed(uid, spaceID string, candidates []string) ([]string, error) {
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	// Stage 1: narrow by category_id IS NOT NULL — a single batched query.
+	// This rejects the bulk of malicious / stale candidates cheaply before
+	// any per-group group/membership/Space round-trips.
+	withCategory, err := g.db.FilterDefaultFollowedGroups(uid, candidates)
+	if err != nil {
+		return nil, err
+	}
+	if len(withCategory) == 0 {
+		return nil, nil
+	}
+	// Stage 2: per-group channel-access check (member + Space visibility +
+	// not Disband).  Each call hits group.IService.ExistMember and
+	// group.IService.GetGroups; for external groups also QueryExternalGroupNosForUser.
+	//
+	// Worst-case load: upstream maxUpdateSortItems=500 → up to 500 sequential
+	// access checks per sort request.  Stage 1 typically narrows this to a
+	// handful for a real user; an attacker spamming bogus group_no's is
+	// already dropped at Stage 1.  No batching here today — the per-group
+	// call surface (ExistMember + GetGroups batch + external map) does not
+	// expose a single batched membership endpoint, and adding one would
+	// require touching modules/group.  Trade-off accepted; revisit if
+	// p99 latency on /v1/follow/sort with high default-followed-group counts
+	// (track via dmwork_http_business_error_total + duration histograms)
+	// outgrows the budget.
+	out := make([]string, 0, len(withCategory))
+	for _, groupNo := range withCategory {
+		err := g.channelAuth.AuthorizeChannelFollow(uid, spaceID, groupNo)
+		if err == nil {
+			out = append(out, groupNo)
+			continue
+		}
+		if errors.Is(err, convext.ErrChannelForbidden) {
+			// Group failed membership / visibility / Disband — silently drop
+			// from the materialization set.  Downstream db.UpdateSort will
+			// surface the missing row as ErrSortTargetNotFound to the client.
+			continue
+		}
+		// Infrastructure error — propagate so the caller can turn it into a
+		// 5xx rather than silently treating the group as "not allowed".
+		return nil, err
+	}
+	return out, nil
 }

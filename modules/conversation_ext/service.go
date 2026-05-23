@@ -36,6 +36,12 @@ var ErrThreadForbidden = errors.New("thread follow forbidden: not a member of pa
 // 物化既有子区，因此必须在写前校验 caller 是该 group 的成员且该群在请求 Space 可见。
 var ErrChannelForbidden = errors.New("channel follow forbidden: not a member of the group or group not visible")
 
+// ErrDefaultFollowedGuardNotConfigured 表示 AuthorizeAndMaterializeDefaultFollowed-
+// Groups 被调用时 service 上还没有注入 DefaultFollowedGroupGuard。生产路径里
+// message/1module.go 启动时必定注入；返回这个 sentinel 让 unit test / 错误启动
+// 顺序可观测，而不是悄无声息地把所有群当作未授权（issue #151 re-review M1）。
+var ErrDefaultFollowedGuardNotConfigured = errors.New("default-followed group guard not configured")
+
 // ErrDMCategoryForbidden 在 FollowDM 指定的 category 不属于当前 uid 或已删除时返回。
 // 调用方应将此错误翻译为 400 / 403（按业务约定）。
 // PR #21 Round-6 (Jerry-Xin)：DM category 必须由服务端校验归属，否则客户端可写入
@@ -63,6 +69,36 @@ type ThreadAuthChecker interface {
 // 鉴权失败返回 ErrChannelForbidden；基础设施错误以 wrap 后形式上传。
 type ChannelAuthChecker interface {
 	AuthorizeChannelFollow(uid, spaceID, groupNo string) error
+}
+
+// DefaultFollowedGroupGuard 过滤客户端 UpdateSort payload 中的 target_type=2
+// 候选项，只保留对该 uid + 当前 spaceID 真正"默认关注"的群。
+//
+// 引入背景（issue #151 code review #1）：UpdateSort 一度在事务里对任意 target_type=2
+// 缺失项做 INSERT IGNORE 物化（auto_follow_threads=1）。但 payload 完全由客户端
+// 提交，恶意/异常客户端可借此为任意 group_no 创建 ext 行；之后 OnThreadCreated
+// 给该用户 fanout 子区 ext 行 → sidebar 透出本不可见群的子区元数据。
+//
+// 校验链（issue #151 code review #2，spaceID 校验补强）：
+//  1. 成员资格：用户当前是该群成员（group.IService.ExistMember）；
+//  2. Space 可见性：群在请求 spaceID 内可见（同 ChannelAuthChecker / FollowChannel
+//     的 internal-same-space / external sourceSpaceID-match / legacy wildcard 规则）；
+//  3. Disband 拒绝：群已解散直接拒绝；
+//  4. 默认关注语义：group_setting.category_id IS NOT NULL（当前 uid，与 spaceID
+//     无关——group_setting 是 user-scoped、跨 Space 共享，所以 step 1/2/3 是
+//     必要的 Space 过滤，缺一不可）。
+//
+// 与 ChannelAuthChecker 的语义差别：ChannelAuthChecker 检查"caller 能否主动关注
+// 该群"；DefaultFollowedGroupGuard 在前者基础上额外要求"该群已被加入用户某 category"。
+// 这样恶意客户端拿一个用户当前不在的群（或在别的 Space 设过 category 的旧 group_setting
+// 残留）来提交 sort，guard 会一并拒绝，sidebar fanout 路径不会被毒化。
+//
+// 实现位于 modules/message（已直接 import group + group_setting），启动时通过
+// SetDefaultFollowedGroupGuard 注入；nil 时 fail-closed（拒绝任何物化）。
+type DefaultFollowedGroupGuard interface {
+	// FilterDefaultFollowed 返回 candidateGroupNos 中通过完整校验链的子集。
+	// spaceID 必填——校验链 step 2 / step 3 需要它来判定群的可见性。
+	FilterDefaultFollowed(uid, spaceID string, candidateGroupNos []string) ([]string, error)
 }
 
 // ThreadEnumerator 是 FollowChannel 级联物化子区时使用的窄接口。
@@ -117,6 +153,11 @@ type Service struct {
 	// 由 message/1module.go 启动时注入；nil 时跳过鉴权（仅供单测 / 迁移期使用）。
 	channelAuth  ChannelAuthChecker
 	channelAuthM sync.RWMutex
+	// defaultFollowedGuard 是 UpdateSort 默认关注群物化路径的鉴权钩子（issue #151
+	// code review #1）。由 message/1module.go 启动时注入；nil 时 AuthorizeAndMaterialize-
+	// DefaultFollowedGroups 直接返回空——fail-closed 比放过更安全。
+	defaultFollowedGuard  DefaultFollowedGroupGuard
+	defaultFollowedGuardM sync.RWMutex
 	log.Log
 }
 
@@ -177,6 +218,66 @@ func (s *Service) getChannelAuthChecker() ChannelAuthChecker {
 	c := s.channelAuth
 	s.channelAuthM.RUnlock()
 	return c
+}
+
+// SetDefaultFollowedGroupGuard injects the gate used by
+// AuthorizeAndMaterializeDefaultFollowedGroups to filter UpdateSort payloads
+// down to genuinely default-followed groups (issue #151 code review #1).
+// Safe for concurrent use; intended to be called once at startup.
+func (s *Service) SetDefaultFollowedGroupGuard(g DefaultFollowedGroupGuard) {
+	s.defaultFollowedGuardM.Lock()
+	s.defaultFollowedGuard = g
+	s.defaultFollowedGuardM.Unlock()
+}
+
+func (s *Service) getDefaultFollowedGroupGuard() DefaultFollowedGroupGuard {
+	s.defaultFollowedGuardM.RLock()
+	g := s.defaultFollowedGuard
+	s.defaultFollowedGuardM.RUnlock()
+	return g
+}
+
+// AuthorizeAndMaterializeDefaultFollowedGroups is the pre-flight step the
+// /v1/follow/sort handler calls before db.UpdateSort.  It accepts client-
+// supplied group_no's (target_type=2 items from the sort payload), filters
+// them through DefaultFollowedGroupGuard to retain only the genuine default-
+// followed ones, and materializes ext rows for the survivors via
+// db.MaterializeDefaultFollowedGroups.
+//
+// Rationale (issue #151 code review #1): putting the materialization inside
+// db.UpdateSort means trusting the client payload, which lets an attacker
+// piggy-back arbitrary group IDs and start receiving thread fan-outs.  Moving
+// the gate up to the service layer keeps DB free of group/group_setting
+// imports while still authorizing every materialization.
+//
+// fail-closed: if no guard is registered (test/migration mode), no
+// materialization happens — db.UpdateSort will then return
+// ErrSortTargetNotFound for the missing groups, which is the safer default
+// than silently allowing arbitrary materialization.
+func (s *Service) AuthorizeAndMaterializeDefaultFollowedGroups(uid, spaceID string, candidateGroupNos []string) error {
+	if err := validateBase(uid, spaceID); err != nil {
+		return err
+	}
+	if len(candidateGroupNos) == 0 {
+		return nil
+	}
+	guard := s.getDefaultFollowedGroupGuard()
+	if guard == nil {
+		// Fail-closed with a diagnostic sentinel.  Returning nil here would
+		// look like success to the handler, then surface as the obscure
+		// ErrSortTargetNotFound from db.UpdateSort — masking the real fault
+		// (the guard was never injected at startup).  Tests / misconfigured
+		// deployments get a clear signal instead (issue #151 re-review M1).
+		return ErrDefaultFollowedGuardNotConfigured
+	}
+	allowed, err := guard.FilterDefaultFollowed(uid, spaceID, candidateGroupNos)
+	if err != nil {
+		return fmt.Errorf("authorize default-followed group materialization: %w", err)
+	}
+	if len(allowed) == 0 {
+		return nil
+	}
+	return s.db.MaterializeDefaultFollowedGroups(uid, spaceID, allowed)
 }
 
 // ---------------------------------------------------------------------------

@@ -23,6 +23,10 @@ type followService interface {
 	FollowChannel(uid, spaceID, groupNo string) error
 	FollowThread(uid, spaceID, threadChannelID string) error
 	UnfollowThread(uid, spaceID, threadChannelID string) error
+	// AuthorizeAndMaterializeDefaultFollowedGroups is the UpdateSort pre-flight
+	// step that gates client-supplied target_type=2 group IDs through
+	// DefaultFollowedGroupGuard before any DB write (issue #151 code review #1).
+	AuthorizeAndMaterializeDefaultFollowedGroups(uid, spaceID string, candidateGroupNos []string) error
 }
 
 // sortDB is the subset of *DB that the sort handler needs.
@@ -333,6 +337,28 @@ func (f *Follow) UpdateSort(c *wkhttp.Context) {
 			TargetType: it.TargetType,
 			TargetID:   it.TargetID,
 		})
+	}
+
+	// Issue #151 — pre-flight materialization for default-followed groups.
+	// Collect target_type=2 candidates from the client payload, gate them
+	// through DefaultFollowedGroupGuard (rejects any group the user has not
+	// placed in a category — see service.go AuthorizeAndMaterializeDefault-
+	// FollowedGroups), and INSERT IGNORE the survivors.  The downstream
+	// db.UpdateSort then runs in strict mode: any client-injected fake group
+	// not surviving the guard becomes a regular ErrSortTargetNotFound, which
+	// the client must handle by re-fetching the follow list.
+	var groupCandidates []string
+	for _, it := range items {
+		if it.TargetType == targetTypeGroup {
+			groupCandidates = append(groupCandidates, it.TargetID)
+		}
+	}
+	if len(groupCandidates) > 0 {
+		if err := f.svc.AuthorizeAndMaterializeDefaultFollowedGroups(loginUID, spaceID, groupCandidates); err != nil {
+			f.Error("default-followed group materialization failed", zap.Error(err))
+			c.ResponseError(pkgerrors.New("更新排序失败"))
+			return
+		}
 	}
 
 	if err := f.db.UpdateSort(loginUID, spaceID, items, req.Version); err != nil {

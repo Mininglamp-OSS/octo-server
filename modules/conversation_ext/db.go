@@ -316,6 +316,14 @@ func (d *DB) UpdateSort(uid, spaceID string, items []SortItem, expectedVersion i
 	).Load(&locked); err != nil {
 		return fmt.Errorf("update sort: lock rows: %w", err)
 	}
+
+	// All items must already exist as ext rows.  Default-followed groups
+	// (target_type=2 with group_setting.category_id set but no ext row) must
+	// have been materialized upstream by Service.AuthorizeAndMaterializeDefaultFollowedGroups
+	// before this DB call.  Putting that materialization inside the same tx
+	// would require trusting client-supplied group IDs (issue #151 code review #1
+	// — unauthorized materialization risk), which the DB layer is not able to
+	// authorize without importing modules/group / modules/message.
 	if len(locked) != len(items) {
 		return ErrSortTargetNotFound
 	}
@@ -350,6 +358,102 @@ func (d *DB) UpdateSort(uid, spaceID string, items []SortItem, expectedVersion i
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("update sort: commit: %w", err)
+	}
+	return nil
+}
+
+// MaterializeDefaultFollowedGroups writes a fresh ext row (auto_follow_threads=1,
+// group_unfollowed=0) for each (uid, space_id, target_type=2, group_no) tuple
+// that does not yet have one.  It is the data-layer entry point used by:
+//
+//   - Sidebar.Sync: after buildFollowItems decides which groups belong in the
+//     follow tab (gated by group_setting.category_id IS NOT NULL), passes the
+//     missing ones here so OnThreadCreated fans out new threads going forward.
+//   - Service.AuthorizeAndMaterializeDefaultFollowedGroups: pre-flight step
+//     before UpdateSort, after DefaultFollowedGroupGuard has filtered the
+//     client-supplied payload down to groups the caller genuinely has in a
+//     category.
+//
+// SECURITY contract: this function does NOT authorize the (uid, group_no)
+// pair.  Callers MUST verify upstream that the user is allowed to follow
+// each group (member + visible, AND the group has category_id set, per
+// issue #151 code review #1).  Without that gate a malicious client can
+// piggy-back arbitrary group IDs and start receiving thread fan-outs for
+// groups they are not in — leaking thread metadata.
+//
+// Fail-open contract for sidebar callers: a failure here must not block the
+// sidebar response; the caller logs and continues.  Pre-flight callers
+// (UpdateSort path) propagate the error to the client.
+func (d *DB) MaterializeDefaultFollowedGroups(uid, spaceID string, groupNos []string) error {
+	if len(groupNos) == 0 {
+		return nil
+	}
+	items := make([]SortItem, len(groupNos))
+	for i, no := range groupNos {
+		items[i] = SortItem{TargetType: targetTypeGroup, TargetID: no}
+	}
+	tx, err := d.session.Begin()
+	if err != nil {
+		return fmt.Errorf("materialize default-followed groups: begin tx: %w", err)
+	}
+	defer tx.RollbackUnlessCommitted()
+	if err := materializeDefaultFollowedGroupsTx(tx, uid, spaceID, items); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("materialize default-followed groups: commit: %w", err)
+	}
+	return nil
+}
+
+// materializeDefaultFollowedGroupsTx INSERTs an ext row for each group the
+// caller listed that did not yet have one.  Default-followed groups (in a
+// category, never touched by the user) end up here on the first drag (via
+// UpdateSort) or on the first sidebar/sync (via MaterializeDefaultFollowedGroups
+// — issue #151 symptom #2 path).
+//
+// The newly-inserted row is intentionally configured so that downstream paths
+// already coded against ext-row presence start working immediately:
+//
+//   - group_unfollowed=0 — the group is followed.
+//   - auto_follow_threads=1 — selectEligibleForFanoutTx will include this user
+//     when OnThreadCreated fires for the group (closes symptom #2).
+//   - follow_sort=0 — UpdateSort's step 3 re-assigns the real sort position;
+//     the standalone read-path entry (MaterializeDefaultFollowedGroups) is fine
+//     leaving 0 because sidebar item ordering for default-followed groups
+//     already defaults to 0 in buildFollowItems.
+//
+// INSERT IGNORE rather than ON DUPLICATE KEY UPDATE: we want a strict no-op
+// when the row already exists — never overwrite a user's existing choices for
+// group_unfollowed or auto_follow_threads.  INSERT IGNORE also avoids burning
+// AUTO_INCREMENT id values on duplicate-key hits (innodb_autoinc_lock_mode=2
+// default on MySQL 8 would otherwise bump the counter even on the no-op
+// branch), matching the existing pattern in bulkInsertThreadExtForFanoutUsersTx.
+//
+// Concurrency: callers do NOT need to hold a SELECT ... FOR UPDATE on the
+// target (uid, space_id, target_type, target_id) tuple beforehand.  The unique
+// key uk(uid, space_id, target_type, target_id) plus INSERT IGNORE's
+// "skip duplicates" semantics make the operation safe under any interleaving
+// with FollowChannel / UnfollowChannel / OnThreadCreated fanout — whichever
+// committed first wins, the no-op preserves that row.
+func materializeDefaultFollowedGroupsTx(tx *dbr.Tx, uid, spaceID string, missing []SortItem) error {
+	if len(missing) == 0 {
+		return nil
+	}
+	tupleHolders := make([]string, len(missing))
+	args := make([]interface{}, 0, len(missing)*4)
+	for i, it := range missing {
+		tupleHolders[i] = "(?, ?, ?, ?, 0, 1)"
+		args = append(args, uid, spaceID, it.TargetType, it.TargetID)
+	}
+	_, err := tx.InsertBySql(
+		"INSERT IGNORE INTO "+table+
+			" (uid, space_id, target_type, target_id, group_unfollowed, auto_follow_threads) VALUES "+
+			strings.Join(tupleHolders, ", "),
+		args...,
+	).Exec()
+	if err != nil {
+		return fmt.Errorf("insert default-followed group rows: %w", err)
 	}
 	return nil
 }

@@ -497,3 +497,56 @@ func TestIntegration_Sidebar_Issue41_DMCategorySortLoadedFromGroupCategory(t *te
 	assert.Equal(t, catSort, items[0].CategorySort,
 		"带 dm_category_id 的 DM 必须把 group_category.sort 写到 SidebarItem.CategorySort")
 }
+
+// ---------------------------------------------------------------------------
+// Scene 7g: issue #151 — default-followed group (categorized but no ext row)
+// materializes during sidebar/sync.
+//
+// Bug: buildFollowItems treats "group has category + not blacklisted" as
+// followed regardless of ext-row presence.  But OnThreadCreated's fan-out
+// filter (selectEligibleForFanoutTx) only sees users whose ext row says
+// auto_follow_threads=1.  Users whose follow status was implied solely by
+// category had no ext row → fan-out silently skipped them → new threads
+// never appeared in their follow tab.
+//
+// Fix: when sidebar/sync's follow branch emits a group SidebarItem without a
+// matching groupExts entry, materialize the ext row with
+// auto_follow_threads=1, group_unfollowed=0 so the next OnThreadCreated for
+// that group reaches this user.  This test exercises the materialization
+// step end-to-end against the real DB.
+// ---------------------------------------------------------------------------
+
+func TestIntegration_Sidebar_FollowTab_MaterializesDefaultFollowedGroup(t *testing.T) {
+	ctx := newSidebarIntegCtx(t)
+	cleanConvExtTable(t, ctx)
+
+	const uid, space = "s7g-uid", "s7g-space"
+	const groupNo = "s7g-grp"
+
+	db := convext.NewDB(ctx)
+
+	// Precondition: no ext row exists for (uid, space, groupNo).
+	pre, err := db.Get(uid, space, 2 /* Group */, groupNo)
+	require.NoError(t, err)
+	require.Nil(t, pre,
+		"precondition: default-followed group must have NO ext row at sidebar/sync time")
+
+	// Simulate the diff that the sidebar handler computes: the group is in the
+	// follow tab (because it has a category) and groupExts had no entry for it.
+	// The handler then calls MaterializeDefaultFollowedGroups with this list.
+	require.NoError(t, db.MaterializeDefaultFollowedGroups(uid, space, []string{groupNo}),
+		"sidebar handler's materialization step must succeed for a default-followed group")
+
+	// After materialization, the ext row exists with the contract the
+	// downstream OnThreadCreated fan-out filter requires:
+	//   auto_follow_threads=1 AND group_unfollowed=0
+	post, err := db.Get(uid, space, 2, groupNo)
+	require.NoError(t, err)
+	require.NotNil(t, post,
+		"ext row must exist after sidebar/sync materialization (issue #151 symptom #2)")
+	assert.Equal(t, int8(1), post.AutoFollowThreads,
+		"materialized row must have auto_follow_threads=1 so OnThreadCreated "+
+			"fans out new threads to this user (closes issue #151 symptom #2)")
+	assert.Equal(t, int8(0), post.GroupUnfollowed,
+		"materialized row must have group_unfollowed=0")
+}

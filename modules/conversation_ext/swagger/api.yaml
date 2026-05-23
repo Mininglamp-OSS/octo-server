@@ -280,7 +280,7 @@ paths:
             业务错误（msg 字段携带具体说明）：
             - 参数错误：items 为空、target_type 不在白名单 (1/2/5)
             - "version conflict: please retry"：CAS 版本号不匹配，客户端应重新拉取最新版本后重试
-            - "sort target not found"：items 中至少一项指向的目标在服务端不存在（可能并发被取消关注），客户端应重新拉取关注列表后整体重试
+            - "sort target not found"：items 中至少一项 DM (target_type=1) 或子区 (target_type=5) 在服务端不存在（这两类目标进入关注列表的前提就是 ext 行存在，缺失意味着并发被取消关注），客户端应重新拉取关注列表后整体重试。注意：target_type=2（群）通过 group_setting.category_id 默认关注时，ext 行不存在不会触发此错误——服务端会先校验该群确实属于用户的 category 再自动物化（issue #151）。若客户端提交的群 target_id 既无 ext 行也未被加入用户的 category，仍会作为不存在目标被拒绝
           schema:
             $ref: "#/definitions/response"
       security:
