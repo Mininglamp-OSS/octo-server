@@ -438,6 +438,69 @@ func resolveBotFilter(ctx *config.Context, filterSpaceID string, bareDMUIDs []st
 	return
 }
 
+// CollectGroupSpaceMap 是 (groupNo -> spaceID) 的批量推导器：扫描
+// conversation 列表里的群和子区父群，去重后调一次 group service，输出
+// 客户端可见性判定所需的映射表。
+//
+// 调用方：
+//   - FilterRawConversationsBySpace / FilterConversationsBySpace：Space 过滤；
+//   - api_sidebar.go Sidebar.Sync：把 group.SpaceID 回填到 SidebarItem.SpaceID
+//     （GH octo-server#153），让客户端 WebSocket 实时消息能正确路由到当前
+//     Space tab，避免 conversation-level SpaceID 缺失导致 fail-open。
+//
+// 返回 (map, ok)。ok=false 表示底层 group service 调用失败 —— 调用方据此决定
+// fail-open 还是 fail-closed（v2 sidebar 必须 fail-closed，参见
+// decideConvKeepInSpace.failClosedOnUnknownGroupSpace 注释）。
+func CollectGroupSpaceMap(
+	conversations []*config.SyncUserConversationResp,
+	groupService group.IService,
+) (map[string]string, bool) {
+	seen := make(map[string]struct{})
+	var bareGroupNos []string
+	add := func(no string) {
+		if no == "" {
+			return
+		}
+		if _, ok := seen[no]; ok {
+			return
+		}
+		seen[no] = struct{}{}
+		bareGroupNos = append(bareGroupNos, no)
+	}
+	for _, conv := range conversations {
+		if conv == nil {
+			continue
+		}
+		sid, _ := spacepkg.ParseChannelID(conv.ChannelID)
+		if sid == "" && conv.ChannelType == common.ChannelTypeGroup.Uint8() {
+			add(conv.ChannelID)
+		}
+		if conv.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
+			if parentNo, _, err := thread.ParseChannelID(conv.ChannelID); err == nil {
+				add(parentNo)
+			}
+		}
+	}
+	if len(bareGroupNos) == 0 {
+		return map[string]string{}, true
+	}
+	m, err := spacepkg.GetGroupSpaceMap(bareGroupNos, func(nos []string) ([]spacepkg.GroupSpaceInfo, error) {
+		infos, err := groupService.GetGroups(nos)
+		if err != nil {
+			return nil, err
+		}
+		result := make([]spacepkg.GroupSpaceInfo, 0, len(infos))
+		for _, g := range infos {
+			result = append(result, spacepkg.GroupSpaceInfo{GroupNo: g.GroupNo, SpaceID: g.SpaceID})
+		}
+		return result, nil
+	})
+	if err != nil {
+		return nil, false
+	}
+	return m, true
+}
+
 // FilterRawConversationsBySpace 是 FilterConversationsBySpace 在 v2 sidebar 上的
 // 对应版本：v2 直接操作 IM 返回的 *config.SyncUserConversationResp（没有
 // enriched SpaceID/parsed Payload），所以单独写一个入口，但内部沿用

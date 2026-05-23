@@ -682,6 +682,23 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	// 避免前端 fromHomeSpaceId / fromIsExternal getter 在增量同步路径读到空值。
 	co.enrichConversationExternalMarkers(syncUserConversationResps)
 
+	// GH#153: 把 resolved space_id 回填到 SyncUserConversationResp，
+	// 同时为外部群成员填充 my_source_space_id。
+	// 群聊的 channel_id 是裸 group_no，newSyncUserConversationResp 走
+	// ParseChannelID 拿不到 SpaceID；客户端 WebSocket 收到群消息时若
+	// 没有 conversation-level 的 SpaceID 兜底，就会 fail-open 把消息
+	// 渲染到错误 Space tab。这里用 handler 早已批量查好的 groupMap +
+	// externalGroupMap 一次性补齐，避免客户端再发请求。
+	externalGroupMap, externalErr := co.groupDB.QueryExternalGroupNosForUser(loginUID)
+	if externalErr != nil {
+		// 非致命：缺失 my_source_space_id 不影响 conversation-level
+		// SpaceID 回填；保持空 map 让 fillConversationSpaceIDs 退化为
+		// 仅填 SpaceID。FilterConversationsBySpace 走它自己的失败兜底。
+		co.Warn("查询外部群失败，跳过 my_source_space_id 回填", zap.Error(externalErr))
+		externalGroupMap = make(map[string]string)
+	}
+	fillConversationSpaceIDs(syncUserConversationResps, groupMap, externalGroupMap)
+
 	// 查询通话中的频道
 	// 加入的群聊
 	joinedGroups, err := co.groupService.GetGroupsWithMemberUID(loginUID)
@@ -1247,9 +1264,16 @@ func (u userResp) from(user *user.Detail, avatarPath string) userResp {
 
 // SyncUserConversationResp 最近会话离线返回
 type SyncUserConversationResp struct {
-	ChannelID        string                 `json:"channel_id"`                   // 频道ID
-	ChannelType      uint8                  `json:"channel_type"`                 // 频道类型
-	SpaceID          string                 `json:"space_id,omitempty"`           // Space ID
+	ChannelID   string `json:"channel_id"`             // 频道ID
+	ChannelType uint8  `json:"channel_type"`           // 频道类型
+	SpaceID     string `json:"space_id,omitempty"`     // Space ID
+	// MySourceSpaceID 仅在 GROUP / COMMUNITY_TOPIC 频道且当前用户以外部成员
+	// 身份加入时非空。值取自 group_member.source_space_id，对应"我从哪个
+	// Space 加入了这个外部群"。客户端 WebSocket 收到该群实时消息时，可据此
+	// 把消息归属到当前 user 的 source Space —— 与服务端
+	// FilterConversationsBySpace 对外部群的可见性判定保持同口径，避免
+	// 三端 fail-open 把跨 Space 消息渲染到错误的 Space tab (GH#153)。
+	MySourceSpaceID  string                 `json:"my_source_space_id,omitempty"` // 外部群成员的 source Space ID
 	Thread           *threadMetaResp        `json:"thread,omitempty"`             // 子区元数据（仅 thread 频道）
 	CategoryID       *string                `json:"category_id,omitempty"`        // 用户自定义分类ID（仅群组）
 	CategorySort     int                    `json:"category_sort,omitempty"`      // 分类内排序（仅群组）
@@ -1364,6 +1388,65 @@ func newSyncUserConversationResp(resp *config.SyncUserConversationResp, extra *c
 type threadMetaResp struct {
 	SourceMessageID *int64 `json:"source_message_id,omitempty"` // 源消息ID
 	MessageCount    int64  `json:"message_count"`               // 消息数
+}
+
+// fillConversationSpaceIDs 把 resolved SpaceID + MySourceSpaceID 回填到 group /
+// thread 频道的 SyncUserConversationResp。
+//
+// 背景 (GH octo-server#153)：
+//   - newSyncUserConversationResp 通过 spacepkg.ParseChannelID(channelID) 推导
+//     SpaceID。但群聊和子区的 channel_id 是裸 group_no（或 "{groupNo}____{shortID}"），
+//     ParseChannelID 返回空串，导致客户端在 conversation/sync 响应里拿不到
+//     conversation-level 的 Space 归属。
+//   - 三端客户端收到 WebSocket 实时消息时，会 fallback 到 conversation-level
+//     SpaceID 决定渲染到哪个 Space tab。空字符串触发 fail-open，跨 Space 消息
+//     被错误渲染到当前 tab，构成 P1 信息泄漏（issue #153）。
+//
+// 回填规则：
+//   - GROUP: SpaceID = groupMap[channelID].SpaceID（group 表权威值）。
+//     用户作为外部成员加入时，再读 externalGroupMap 给 MySourceSpaceID 赋值。
+//   - COMMUNITY_TOPIC: SpaceID = parent group 的 SpaceID（与 FilterRawConversationsBySpace
+//     thread 分支的 fail-closed 同口径）。MySourceSpaceID 同样从 parent groupNo 取。
+//   - PERSON: 不动 —— 私聊的 Space 归属在消息级 payload.space_id 上，
+//     conversation 级别保持空，避免误把 DM 锁定到某个 Space。
+//
+// groupMap / externalGroupMap 都是 handler 已经查过的现成数据，本函数纯内存
+// 操作，不发任何 DB 请求。groupMap 缺失（如 thread 父群本批未活跃）时跳过该条
+// —— 客户端拿到空 SpaceID 会自己降级，比写错的值更安全。
+func fillConversationSpaceIDs(
+	resps []*SyncUserConversationResp,
+	groupMap map[string]*group.GroupResp,
+	externalGroupMap map[string]string,
+) {
+	for _, r := range resps {
+		if r == nil {
+			continue
+		}
+		switch r.ChannelType {
+		case common.ChannelTypeGroup.Uint8():
+			if g, ok := groupMap[r.ChannelID]; ok && g != nil {
+				if r.SpaceID == "" {
+					r.SpaceID = g.SpaceID
+				}
+			}
+			if src, ok := externalGroupMap[r.ChannelID]; ok {
+				r.MySourceSpaceID = src
+			}
+		case common.ChannelTypeCommunityTopic.Uint8():
+			parentNo, _, perr := thread.ParseChannelID(r.ChannelID)
+			if perr != nil {
+				continue
+			}
+			if g, ok := groupMap[parentNo]; ok && g != nil {
+				if r.SpaceID == "" {
+					r.SpaceID = g.SpaceID
+				}
+			}
+			if src, ok := externalGroupMap[parentNo]; ok {
+				r.MySourceSpaceID = src
+			}
+		}
+	}
 }
 
 // fillThreadMeta 批量填充子区会话的元数据

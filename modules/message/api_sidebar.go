@@ -99,6 +99,14 @@ type SidebarItem struct {
 	TargetID    string `json:"target_id"`
 	ChannelType uint8  `json:"channel_type"`
 	ChannelID   string `json:"channel_id"`
+	// SpaceID 是该 sidebar 条目所属 Space 的 ID（GH octo-server#153）。
+	//   - GROUP: group 表的 space_id；
+	//   - COMMUNITY_TOPIC: 父群的 space_id；
+	//   - PERSON: 留空 —— DM 的 Space 归属在消息级 payload.space_id 上，
+	//     conversation 级别保持空避免误锁定。
+	// 客户端 WebSocket 收到群消息时拿这个字段决定渲染到哪个 Space tab，
+	// 与服务端 FilterRawConversationsBySpace 的可见性判定同口径。
+	SpaceID     string `json:"space_id,omitempty"`
 	Timestamp   int64  `json:"timestamp"`
 	Unread      int    `json:"unread"`
 	IsPinned    bool   `json:"is_pinned"`
@@ -393,11 +401,23 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 		pinnedSet = map[string]struct{}{}
 	}
 
+	// 2f. groupNo -> space_id 映射，用于把 group / thread 父群的 SpaceID 回填到
+	//     SidebarItem.SpaceID（GH octo-server#153）。
+	//     使用 conversations（已 Space 过滤）作为输入：当前 Space tab 不会出现
+	//     其他 Space 的群，因此即便 group service 调用失败也只是少填一些字段，
+	//     不会泄露跨 Space 元数据。失败时退化为空 map，fail-open 把 SpaceID
+	//     置空，客户端走"未知 Space"分支（与历史行为一致）。
+	groupSpaceMap, ok := CollectGroupSpaceMap(conversations, sb.groupService)
+	if !ok {
+		sb.Warn("sidebar sync: group space map query failed (non-fatal, SidebarItem.SpaceID will be empty)")
+		groupSpaceMap = map[string]string{}
+	}
+
 	// 3. Build tab-specific items
 	var items []*SidebarItem
 	switch req.Tab {
 	case "follow":
-		items = buildFollowItems(conversations, categorySetting, unfollowedGroups, followedDMs, threadExtMap, groupExts, dmCategorySorts)
+		items = buildFollowItems(conversations, categorySetting, unfollowedGroups, followedDMs, threadExtMap, groupExts, dmCategorySorts, groupSpaceMap)
 		// Append standalone thread ext entries not present in IM result.
 		// Pass categorySetting + unfollowedGroups so parent-follow filter applies
 		// to DB-only thread entries as well (PR review Round-3 Blocking #4).
@@ -405,9 +425,9 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 		if failClosedForFollow("thread last_message_at query", err) {
 			return
 		}
-		items = mergeThreadEntries(items, threadExtRows, lastMsgAtMap, categorySetting, unfollowedGroups)
+		items = mergeThreadEntries(items, threadExtRows, lastMsgAtMap, categorySetting, unfollowedGroups, groupSpaceMap)
 	case "recent":
-		items = buildRecentItems(conversations, pinnedSet)
+		items = buildRecentItems(conversations, pinnedSet, groupSpaceMap)
 	}
 
 	// 4. Enrich pinned flag (follow tab items also need it)
@@ -668,6 +688,7 @@ func buildFollowItems(
 	threadExtMap map[string]*convext.Model,
 	groupExts map[string]*convext.Model,
 	dmCategorySorts map[string]int,
+	groupSpaceMap map[string]string,
 ) []*SidebarItem {
 	items := make([]*SidebarItem, 0, len(convs))
 	for _, conv := range convs {
@@ -691,6 +712,7 @@ func buildFollowItems(
 				TargetID:          conv.ChannelID,
 				ChannelType:       conv.ChannelType,
 				ChannelID:         conv.ChannelID,
+				SpaceID:           groupSpaceMap[conv.ChannelID],
 				Timestamp:         conv.Timestamp,
 				Unread:            conv.Unread,
 				IsFollowed:        true,
@@ -710,10 +732,12 @@ func buildFollowItems(
 				TargetID:    conv.ChannelID,
 				ChannelType: conv.ChannelType,
 				ChannelID:   conv.ChannelID,
-				Timestamp:   conv.Timestamp,
-				Unread:      conv.Unread,
-				IsFollowed:  true,
-				FollowSort:  ext.FollowSort,
+				// PERSON 频道 SpaceID 留空：DM 的 Space 归属在消息级 payload.space_id 上
+				// （GH octo-server#153）。
+				Timestamp:  conv.Timestamp,
+				Unread:     conv.Unread,
+				IsFollowed: true,
+				FollowSort: ext.FollowSort,
 			}
 			// PR #21 Round-6：DMCategoryID 现在已经是 VARCHAR(32) UUID（与 group_category
 			// 共用 namespace），直接透传给客户端即可。
@@ -754,6 +778,8 @@ func buildFollowItems(
 				TargetID:          conv.ChannelID,
 				ChannelType:       conv.ChannelType,
 				ChannelID:         conv.ChannelID,
+				// thread 继承父群 SpaceID（GH octo-server#153）。
+				SpaceID:           groupSpaceMap[groupNo],
 				Timestamp:         conv.Timestamp,
 				Unread:            conv.Unread,
 				IsFollowed:        true,
@@ -783,6 +809,7 @@ func buildFollowItems(
 func buildRecentItems(
 	convs []*config.SyncUserConversationResp,
 	pinnedSet map[string]struct{},
+	groupSpaceMap map[string]string,
 ) []*SidebarItem {
 	cutoff := threeDaysAgo()
 	items := make([]*SidebarItem, 0, len(convs))
@@ -796,10 +823,17 @@ func buildRecentItems(
 			_, pinned = pinnedSet[channelKey(conv.ChannelID, conv.ChannelType)]
 		}
 		parentID := ""
-		if conv.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
+		// spaceID 取自 groupSpaceMap：GROUP 直接查 channelID；COMMUNITY_TOPIC 取
+		// 父群；PERSON 留空（GH octo-server#153，规则与 buildFollowItems 一致）。
+		spaceID := ""
+		switch conv.ChannelType {
+		case common.ChannelTypeGroup.Uint8():
+			spaceID = groupSpaceMap[conv.ChannelID]
+		case common.ChannelTypeCommunityTopic.Uint8():
 			groupNo, _, err := parseThreadChannelIDSidebar(conv.ChannelID)
 			if err == nil {
 				parentID = groupNo
+				spaceID = groupSpaceMap[groupNo]
 			}
 		}
 		items = append(items, &SidebarItem{
@@ -807,6 +841,7 @@ func buildRecentItems(
 			TargetID:        conv.ChannelID,
 			ChannelType:     conv.ChannelType,
 			ChannelID:       conv.ChannelID,
+			SpaceID:         spaceID,
 			Timestamp:       conv.Timestamp,
 			Unread:          conv.Unread,
 			IsPinned:        pinned,
@@ -844,6 +879,7 @@ func mergeThreadEntries(
 	lastMsgAtMap map[string]*time.Time,
 	categorySetting map[string]*GroupCategorySetting,
 	unfollowedGroups map[string]struct{},
+	groupSpaceMap map[string]string,
 ) []*SidebarItem {
 	if len(threadExtRows) == 0 {
 		return existing
@@ -890,6 +926,8 @@ func mergeThreadEntries(
 			TargetID:          ext.TargetID,
 			ChannelType:       common.ChannelTypeCommunityTopic.Uint8(),
 			ChannelID:         ext.TargetID,
+			// thread 继承父群 SpaceID（GH octo-server#153）。
+			SpaceID:           groupSpaceMap[groupNo],
 			Timestamp:         ts,
 			IsFollowed:        true,
 			FollowSort:        ext.FollowSort,
