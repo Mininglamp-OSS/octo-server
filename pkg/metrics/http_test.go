@@ -254,9 +254,10 @@ func TestNewHTTPMetrics_RegistersOnProvidedRegistry(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := metrics.NewHTTPMetrics(reg)
 
-	// HistogramVec 在未观测前不会被 Gather() 报告(prometheus 库行为),
-	// 先打一个样本让 family 出现, 再断言两个指标都注册成功。
+	// HistogramVec / CounterVec 在未观测前不会被 Gather() 报告(prometheus 库行为),
+	// 先打样本让 family 出现, 再断言三个指标都注册成功。
 	m.Duration.WithLabelValues("GET", "/probe", "200").Observe(0.001)
+	m.BusinessError.WithLabelValues("/probe", "400").Inc()
 
 	families, err := reg.Gather()
 	if err != nil {
@@ -265,6 +266,7 @@ func TestNewHTTPMetrics_RegistersOnProvidedRegistry(t *testing.T) {
 	want := map[string]bool{
 		"dmwork_http_request_duration_seconds": false,
 		"dmwork_http_requests_in_flight":       false,
+		"dmwork_http_business_error_total":     false,
 	}
 	for _, mf := range families {
 		if _, ok := want[mf.GetName()]; ok {
@@ -275,6 +277,217 @@ func TestNewHTTPMetrics_RegistersOnProvidedRegistry(t *testing.T) {
 		if !found {
 			t.Errorf("expected metric %q to be registered", name)
 		}
+	}
+}
+
+// counterValue 通过 Gather 严格读取 CounterVec 指定 label 组合的累加值。
+// 不用 WithLabelValues / GetMetricWithLabelValues, 与 histogramSampleCount
+// 同样的原因 —— 那两个 API 会"静默创建 0 子项", 让断言失败变成假成功。
+func counterValue(
+	t *testing.T,
+	reg prometheus.Gatherer,
+	name string,
+	wantLabels map[string]string,
+) float64 {
+	t.Helper()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, mf := range families {
+		if mf.GetName() != name {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			if labelsEqual(m.GetLabel(), wantLabels) {
+				return m.GetCounter().GetValue()
+			}
+		}
+	}
+	return 0
+}
+
+// TestBusinessError_FromEnvelopeStatus 覆盖核心采集路径:wkhttp.ResponseError
+// 写出的 envelope `{"msg": "...", "status": 400}`,HTTP status 也是 400 —— 但
+// code label 必须来自 envelope 字段(为阶段 2 解耦 HTTP/业务 status 做准备)。
+func TestBusinessError_FromEnvelopeStatus(t *testing.T) {
+	cases := []struct {
+		name         string
+		body         gin.H
+		httpStatus   int
+		wantPath     string
+		wantCode     string
+		wantIncrease bool
+	}{
+		{
+			name:         "ResponseError envelope: status=400",
+			body:         gin.H{"msg": "bad input", "status": 400},
+			httpStatus:   http.StatusBadRequest,
+			wantPath:     "/v1/users/:uid/im",
+			wantCode:     "400",
+			wantIncrease: true,
+		},
+		{
+			name:         "ResponseErrorWithStatus(500): envelope status=500 even when HTTP also 500",
+			body:         gin.H{"msg": "db down", "status": 500},
+			httpStatus:   http.StatusInternalServerError,
+			wantPath:     "/v1/groups/:gid",
+			wantCode:     "500",
+			wantIncrease: true,
+		},
+		{
+			name:         "future: handler returns HTTP 400 but envelope says 500 (post-phase-2)",
+			body:         gin.H{"msg": "fake", "status": 500},
+			httpStatus:   http.StatusBadRequest,
+			wantPath:     "/v1/x",
+			wantCode:     "500", // envelope 优先于 HTTP
+			wantIncrease: true,
+		},
+		{
+			name:         "ResponseOK envelope status=200 -> no increment",
+			body:         gin.H{"status": 200},
+			httpStatus:   http.StatusOK,
+			wantPath:     "/v1/ok",
+			wantIncrease: false,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			r, _, reg := newRouterWithMetrics(t)
+			r.GET(tc.wantPath, func(c *gin.Context) {
+				c.JSON(tc.httpStatus, tc.body)
+			})
+
+			req := httptest.NewRequest(http.MethodGet, tc.wantPath, nil)
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
+
+			if tc.wantIncrease {
+				got := counterValue(t, reg, "dmwork_http_business_error_total",
+					map[string]string{"path": tc.wantPath, "code": tc.wantCode})
+				if got != 1 {
+					t.Errorf("expected counter=1 for {path=%s, code=%s}, got %v",
+						tc.wantPath, tc.wantCode, got)
+				}
+			} else {
+				families, _ := reg.Gather()
+				for _, mf := range families {
+					if mf.GetName() == "dmwork_http_business_error_total" && len(mf.GetMetric()) > 0 {
+						t.Errorf("expected no business_error_total samples, got %d series",
+							len(mf.GetMetric()))
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestBusinessError_FallbackToHTTPStatus 覆盖非 envelope 错误路径,例如
+// gin.Context.AbortWithStatusJSON(401, {"msg": "..."}) 没有 status 字段,
+// 或纯文本错误响应 —— 退回用 HTTP status 作为 code。
+func TestBusinessError_FallbackToHTTPStatus(t *testing.T) {
+	r, _, reg := newRouterWithMetrics(t)
+	// 模拟 wkhttp.AuthMiddleware: AbortWithStatusJSON(401, {"msg": ...})
+	// body 没有 "status" 字段,必须靠 HTTP status 兜底。
+	r.GET("/v1/auth", func(c *gin.Context) {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "please login"})
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/auth", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	got := counterValue(t, reg, "dmwork_http_business_error_total",
+		map[string]string{"path": "/v1/auth", "code": "401"})
+	if got != 1 {
+		t.Errorf("expected counter=1 for {path=/v1/auth, code=401}, got %v", got)
+	}
+}
+
+// TestBusinessError_PanicCountedAs500 panic 时 body 通常未写出,
+// 应当走 panic 分支按 500 计入,且 path label 仍是路由模板。
+func TestBusinessError_PanicCountedAs500(t *testing.T) {
+	r, _, reg := newRouterWithMetrics(t)
+	r.GET("/v1/panic", func(c *gin.Context) { panic("boom") })
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/panic", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	got := counterValue(t, reg, "dmwork_http_business_error_total",
+		map[string]string{"path": "/v1/panic", "code": "500"})
+	if got != 1 {
+		t.Errorf("expected counter=1 for {path=/v1/panic, code=500}, got %v", got)
+	}
+}
+
+// TestBusinessError_SuccessPathNotCounted 普通 200 响应(无 envelope status 或
+// envelope status=200)不应触发计数 —— 防止误报。
+func TestBusinessError_SuccessPathNotCounted(t *testing.T) {
+	r, _, reg := newRouterWithMetrics(t)
+	r.GET("/v1/list", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"data": []string{"a", "b"}}) // 无 status 字段
+	})
+
+	for i := 0; i < 3; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/v1/list", nil)
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+	}
+
+	families, _ := reg.Gather()
+	for _, mf := range families {
+		if mf.GetName() == "dmwork_http_business_error_total" && len(mf.GetMetric()) > 0 {
+			t.Errorf("expected no business_error_total samples on 200, got %d series",
+				len(mf.GetMetric()))
+		}
+	}
+}
+
+// TestBusinessError_TruncatedBodyFallsBack 当 body 超过 bodyCaptureLimit
+// 被截断时, JSON 解析失败 -> 用 HTTP status 兜底, 不应漏报或误报。
+func TestBusinessError_TruncatedBodyFallsBack(t *testing.T) {
+	r, _, reg := newRouterWithMetrics(t)
+	r.GET("/v1/big", func(c *gin.Context) {
+		// 构造 > 1 KiB 的错误响应,且把 status 字段塞到末尾(map 顺序不定也
+		// 大概率被截断), HTTP 状态显式 400 提供兜底信号。
+		big := make([]string, 200)
+		for i := range big {
+			big[i] = "padpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpad"
+		}
+		c.JSON(http.StatusBadRequest, gin.H{
+			"items":  big,
+			"msg":    "validation failed",
+			"status": 400,
+		})
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/big", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	got := counterValue(t, reg, "dmwork_http_business_error_total",
+		map[string]string{"path": "/v1/big", "code": "400"})
+	if got != 1 {
+		t.Errorf("expected fallback counter=1 for truncated body, got %v", got)
+	}
+}
+
+// TestBusinessError_UnmatchedRouteUses404 未匹配路由 gin 返回 404,
+// path label 应走 "unmatched", code 走 HTTP status 兜底。
+func TestBusinessError_UnmatchedRouteUses404(t *testing.T) {
+	r, _, reg := newRouterWithMetrics(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/never-registered", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	got := counterValue(t, reg, "dmwork_http_business_error_total",
+		map[string]string{"path": "unmatched", "code": "404"})
+	if got != 1 {
+		t.Errorf("expected counter=1 for {path=unmatched, code=404}, got %v", got)
 	}
 }
 
