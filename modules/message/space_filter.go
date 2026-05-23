@@ -442,6 +442,10 @@ func resolveBotFilter(ctx *config.Context, filterSpaceID string, bareDMUIDs []st
 // conversation 列表里的群和子区父群，去重后调一次 group service，输出
 // 客户端可见性判定所需的映射表。
 //
+// extraGroupNos 用于补充 conversations 之外的 groupNo（典型场景：v2 sidebar
+// 的 DB-only thread ext 行的父群可能不在 IM 返回里 —— GH octo-server#153
+// Round-2 Critical 2）。传 nil / 空切片表示纯走 conversations。
+//
 // 调用方：
 //   - FilterRawConversationsBySpace / FilterConversationsBySpace：Space 过滤；
 //   - api_sidebar.go Sidebar.Sync：把 group.SpaceID 回填到 SidebarItem.SpaceID
@@ -453,6 +457,7 @@ func resolveBotFilter(ctx *config.Context, filterSpaceID string, bareDMUIDs []st
 // decideConvKeepInSpace.failClosedOnUnknownGroupSpace 注释）。
 func CollectGroupSpaceMap(
 	conversations []*config.SyncUserConversationResp,
+	extraGroupNos []string,
 	groupService group.IService,
 ) (map[string]string, bool) {
 	seen := make(map[string]struct{})
@@ -480,6 +485,9 @@ func CollectGroupSpaceMap(
 				add(parentNo)
 			}
 		}
+	}
+	for _, no := range extraGroupNos {
+		add(no)
 	}
 	if len(bareGroupNos) == 0 {
 		return map[string]string{}, true

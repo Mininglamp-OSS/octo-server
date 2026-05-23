@@ -107,6 +107,14 @@ type SidebarItem struct {
 	// 客户端 WebSocket 收到群消息时拿这个字段决定渲染到哪个 Space tab，
 	// 与服务端 FilterRawConversationsBySpace 的可见性判定同口径。
 	SpaceID     string `json:"space_id,omitempty"`
+	// MySourceSpaceID 是当前用户加入该群的"来源 Space"（外部成员场景）。
+	//   - GROUP: externalGroupMap[channelID]，即 group_external_member.source_space_id；
+	//   - COMMUNITY_TOPIC: externalGroupMap[parentGroupNo]（与父群保持同口径）；
+	//   - 其它（PERSON / 内部群成员）: 留空。
+	// 与 v1 SyncUserConversationResp.MySourceSpaceID 字段口径一致
+	// （GH octo-server#153 Round-2 P1）。客户端在 source Space 下用 sidebar 时
+	// 需要这个字段才能识别"我以哪个 Space 身份加入了这个外部群"。
+	MySourceSpaceID string `json:"my_source_space_id,omitempty"`
 	Timestamp   int64  `json:"timestamp"`
 	Unread      int    `json:"unread"`
 	IsPinned    bool   `json:"is_pinned"`
@@ -407,17 +415,36 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 	//     其他 Space 的群，因此即便 group service 调用失败也只是少填一些字段，
 	//     不会泄露跨 Space 元数据。失败时退化为空 map，fail-open 把 SpaceID
 	//     置空，客户端走"未知 Space"分支（与历史行为一致）。
-	groupSpaceMap, ok := CollectGroupSpaceMap(conversations, sb.groupService)
+	//
+	//     额外把 threadExtRows 的父群 groupNo 合入查询集合（GH octo-server#153
+	//     Round-2 Critical 2）：DB-only thread 的父群可能不在 IM 返回里，
+	//     如果不显式带上，mergeThreadEntries 写 SidebarItem.SpaceID 时
+	//     groupSpaceMap[parentGroupNo] 会 miss，space_id 被回填为空。
+	var extraParentGroupNos []string
+	if len(threadExtRows) > 0 {
+		extraParentGroupNos = uniqueThreadParentGroupNos(threadExtRows)
+	}
+	groupSpaceMap, ok := CollectGroupSpaceMap(conversations, extraParentGroupNos, sb.groupService)
 	if !ok {
 		sb.Warn("sidebar sync: group space map query failed (non-fatal, SidebarItem.SpaceID will be empty)")
 		groupSpaceMap = map[string]string{}
+	}
+
+	// 2g. externalGroupMap：当前 user 作为外部成员加入的 (groupNo -> source_space_id)
+	//     映射，用来回填 SidebarItem.MySourceSpaceID（GH octo-server#153 Round-2 P1）。
+	//     与 api_conversation.go syncUserConversation 同口径：非致命错误时降级为
+	//     空 map，仅缺失 my_source_space_id 字段，不影响 SpaceID 回填。
+	externalGroupMap, externalErr := sb.groupDB.QueryExternalGroupNosForUser(loginUID)
+	if externalErr != nil {
+		sb.Warn("sidebar sync: external group map query failed (non-fatal, my_source_space_id will be empty)", zap.Error(externalErr))
+		externalGroupMap = map[string]string{}
 	}
 
 	// 3. Build tab-specific items
 	var items []*SidebarItem
 	switch req.Tab {
 	case "follow":
-		items = buildFollowItems(conversations, categorySetting, unfollowedGroups, followedDMs, threadExtMap, groupExts, dmCategorySorts, groupSpaceMap)
+		items = buildFollowItems(conversations, categorySetting, unfollowedGroups, followedDMs, threadExtMap, groupExts, dmCategorySorts, groupSpaceMap, externalGroupMap)
 		// Append standalone thread ext entries not present in IM result.
 		// Pass categorySetting + unfollowedGroups so parent-follow filter applies
 		// to DB-only thread entries as well (PR review Round-3 Blocking #4).
@@ -425,9 +452,9 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 		if failClosedForFollow("thread last_message_at query", err) {
 			return
 		}
-		items = mergeThreadEntries(items, threadExtRows, lastMsgAtMap, categorySetting, unfollowedGroups, groupSpaceMap)
+		items = mergeThreadEntries(items, threadExtRows, lastMsgAtMap, categorySetting, unfollowedGroups, groupSpaceMap, externalGroupMap)
 	case "recent":
-		items = buildRecentItems(conversations, pinnedSet, groupSpaceMap)
+		items = buildRecentItems(conversations, pinnedSet, groupSpaceMap, externalGroupMap)
 	}
 
 	// 4. Enrich pinned flag (follow tab items also need it)
@@ -689,6 +716,7 @@ func buildFollowItems(
 	groupExts map[string]*convext.Model,
 	dmCategorySorts map[string]int,
 	groupSpaceMap map[string]string,
+	externalGroupMap map[string]string,
 ) []*SidebarItem {
 	items := make([]*SidebarItem, 0, len(convs))
 	for _, conv := range convs {
@@ -713,6 +741,7 @@ func buildFollowItems(
 				ChannelType:       conv.ChannelType,
 				ChannelID:         conv.ChannelID,
 				SpaceID:           groupSpaceMap[conv.ChannelID],
+				MySourceSpaceID:   externalGroupMap[conv.ChannelID],
 				Timestamp:         conv.Timestamp,
 				Unread:            conv.Unread,
 				IsFollowed:        true,
@@ -780,6 +809,8 @@ func buildFollowItems(
 				ChannelID:         conv.ChannelID,
 				// thread 继承父群 SpaceID（GH octo-server#153）。
 				SpaceID:           groupSpaceMap[groupNo],
+				// thread 同样继承父群的 MySourceSpaceID（GH octo-server#153 Round-2 P1）。
+				MySourceSpaceID:   externalGroupMap[groupNo],
 				Timestamp:         conv.Timestamp,
 				Unread:            conv.Unread,
 				IsFollowed:        true,
@@ -810,6 +841,7 @@ func buildRecentItems(
 	convs []*config.SyncUserConversationResp,
 	pinnedSet map[string]struct{},
 	groupSpaceMap map[string]string,
+	externalGroupMap map[string]string,
 ) []*SidebarItem {
 	cutoff := threeDaysAgo()
 	items := make([]*SidebarItem, 0, len(convs))
@@ -825,15 +857,20 @@ func buildRecentItems(
 		parentID := ""
 		// spaceID 取自 groupSpaceMap：GROUP 直接查 channelID；COMMUNITY_TOPIC 取
 		// 父群；PERSON 留空（GH octo-server#153，规则与 buildFollowItems 一致）。
+		// mySourceSpaceID 同口径：从 externalGroupMap 查 channelID / parentGroupNo
+		// （GH octo-server#153 Round-2 P1）。
 		spaceID := ""
+		mySourceSpaceID := ""
 		switch conv.ChannelType {
 		case common.ChannelTypeGroup.Uint8():
 			spaceID = groupSpaceMap[conv.ChannelID]
+			mySourceSpaceID = externalGroupMap[conv.ChannelID]
 		case common.ChannelTypeCommunityTopic.Uint8():
 			groupNo, _, err := parseThreadChannelIDSidebar(conv.ChannelID)
 			if err == nil {
 				parentID = groupNo
 				spaceID = groupSpaceMap[groupNo]
+				mySourceSpaceID = externalGroupMap[groupNo]
 			}
 		}
 		items = append(items, &SidebarItem{
@@ -842,6 +879,7 @@ func buildRecentItems(
 			ChannelType:     conv.ChannelType,
 			ChannelID:       conv.ChannelID,
 			SpaceID:         spaceID,
+			MySourceSpaceID: mySourceSpaceID,
 			Timestamp:       conv.Timestamp,
 			Unread:          conv.Unread,
 			IsPinned:        pinned,
@@ -880,6 +918,7 @@ func mergeThreadEntries(
 	categorySetting map[string]*GroupCategorySetting,
 	unfollowedGroups map[string]struct{},
 	groupSpaceMap map[string]string,
+	externalGroupMap map[string]string,
 ) []*SidebarItem {
 	if len(threadExtRows) == 0 {
 		return existing
@@ -928,6 +967,8 @@ func mergeThreadEntries(
 			ChannelID:         ext.TargetID,
 			// thread 继承父群 SpaceID（GH octo-server#153）。
 			SpaceID:           groupSpaceMap[groupNo],
+			// thread 同样继承父群的 MySourceSpaceID（GH octo-server#153 Round-2 P1）。
+			MySourceSpaceID:   externalGroupMap[groupNo],
 			Timestamp:         ts,
 			IsFollowed:        true,
 			FollowSort:        ext.FollowSort,

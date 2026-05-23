@@ -409,6 +409,22 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	uids := make([]string, 0, len(conversations))
 	channelIDs := make([]string, 0, len(conversations))
 	threadChannelShortIDMap := make(map[string]string)
+	// groupNoSeen 用于 groupNos 的去重：COMMUNITY_TOPIC 频道除了把自身
+	// channel_id（"{groupNo}____{shortID}"）加入 groupNos 外，还要把解析出
+	// 的 parent groupNo 也加进去，否则当父群本批不在 IM 返回里时，
+	// fillConversationSpaceIDs 拿不到父群的 SpaceID，导致 thread 频道的
+	// SpaceID 被回填为空（GH octo-server#153 Round-2 Critical 1）。
+	groupNoSeen := make(map[string]struct{}, len(conversations))
+	addGroupNo := func(no string) {
+		if no == "" {
+			return
+		}
+		if _, ok := groupNoSeen[no]; ok {
+			return
+		}
+		groupNoSeen[no] = struct{}{}
+		groupNos = append(groupNos, no)
+	}
 	if len(conversations) > 0 {
 		for _, conversation := range conversations {
 			if len(conversation.Recents) == 0 {
@@ -417,12 +433,16 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 			if conversation.ChannelType == common.ChannelTypePerson.Uint8() {
 				uids = append(uids, conversation.ChannelID)
 			} else {
-				groupNos = append(groupNos, conversation.ChannelID)
+				addGroupNo(conversation.ChannelID)
 			}
 			channelIDs = append(channelIDs, conversation.ChannelID)
 			if conversation.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
-				if _, shortID, err := thread.ParseChannelID(conversation.ChannelID); err == nil {
+				if parentNo, shortID, err := thread.ParseChannelID(conversation.ChannelID); err == nil {
 					threadChannelShortIDMap[conversation.ChannelID] = shortID
+					// 父群可能未出现在 IM 批次里（最近无消息），但 fillConversationSpaceIDs
+					// 需要从 groupMap[parentNo] 取 SpaceID。这里显式合入预取集合，
+					// GetGroupDetails 才会覆盖父群。
+					addGroupNo(parentNo)
 				}
 			}
 		}
