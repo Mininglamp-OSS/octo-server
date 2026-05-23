@@ -170,6 +170,43 @@ func (m *Message) nextReminderSeq() (int64, error) {
 	return m.ctx.GenSeq(common.RemindersKey)
 }
 
+// isBotUID reports whether `uid` belongs to a bot in the robot
+// registry. Used by getReminders to filter out bot UIDs from the
+// per-uid reminder fan-out (PR#145 R3 / YUJ-1810): the persisted
+// payload that the WuKongIM listener replays already contains the
+// server-expanded `mention.ais` → `mention.uids` bot UIDs, and bots
+// must never receive a `[有人@我]` reminder row regardless of how
+// the UID landed in the mention list (server-expanded `ais=1` or
+// explicit user-typed `@bot_x`).
+//
+// Best-effort semantics:
+//
+//   - robotService unwired (unit tests that build &Message{} without
+//     ctor) → returns false; no filter is applied. Existing
+//     getReminders fan-out matrix tests (TestGetReminders_FanoutMatrix)
+//     supply human-only UIDs and don't wire robotService, so they keep
+//     working unchanged.
+//   - ExistRobot returns an error (transient robot-row corruption,
+//     DB blip) → log warn and treat the UID as not-a-bot. We err on
+//     the side of EMITTING the reminder for a human rather than
+//     SILENTLY DROPPING a reminder. The alternative (drop on error)
+//     would lose legitimate human notifications whenever the robot
+//     table hiccups, which is a worse failure mode than the
+//     temporary noise this guards against.
+func (m *Message) isBotUID(uid string) bool {
+	if m.robotService == nil {
+		return false
+	}
+	ok, err := m.robotService.ExistRobot(uid)
+	if err != nil {
+		m.Warn("ExistRobot lookup failed during reminder emission; treating UID as not-a-bot",
+			zap.String("uid", uid),
+			zap.Error(err))
+		return false
+	}
+	return ok
+}
+
 func (m *Message) getReminders(messages []*config.MessageResp) []*remindersModel {
 	reminders := make([]*remindersModel, 0, len(messages))
 	for _, message := range messages {
@@ -222,6 +259,31 @@ func (m *Message) getReminders(messages []*config.MessageResp) []*remindersModel
 			}
 			if len(uids) > 0 {
 				for _, uid := range uids {
+					// PR#145 R3 blocker (YUJ-1810): the persisted payload
+					// that lands here on the WuKongIM listener callback
+					// already contains the server-side
+					// ExpandAisToBotUIDs expansion (the wire bytes carry
+					// the expanded UIDs even though CloneForExpansion
+					// keeps the send-side in-memory map clean — the
+					// reminder writer runs on the persisted-payload path,
+					// not the in-memory one). Without filtering here,
+					// every `@所有 AI` broadcast writes one
+					// `[有人@我]` reminder row per bot member of the
+					// group, which (a) pollutes the reminders table and
+					// (b) violates the `ais=1` contract that bots
+					// respond via the delivery path and MUST NOT trigger
+					// human-visible red-dots.
+					//
+					// The filter also covers user-typed explicit
+					// `@bot_x` mentions — bots never need reminder rows
+					// regardless of how their UID landed in
+					// `mention.uids`. Skipping a bot here is the
+					// single source of truth for "no reminders for
+					// bots", complementing CloneForExpansion (which
+					// only protects the send-side map).
+					if m.isBotUID(uid) {
+						continue
+					}
 					version, err := m.nextReminderSeq()
 					if err != nil {
 						m.Warn("GenSeq failed", zap.Error(err))

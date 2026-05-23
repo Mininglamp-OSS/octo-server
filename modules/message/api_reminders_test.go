@@ -525,41 +525,44 @@ func TestReminderSync_SenderExcludedFromBroadcast(t *testing.T) {
 }
 
 // TestGetReminders_AisExpansionDoesNotPolluteReminderRows is the
-// PR#145 review-blocker regression. The chokepoint at
-// (*Message).sendMessage is supposed to expand `mention.ais=1`
-// into `mention.uids` on a CLONE of the payload (the wire-only
-// representation) so the in-memory `payload` map — which feeds the
-// persisted MessageResp and downstream consumers like the reminder
-// writer below — keeps the original caller-supplied
-// `mention.uids` untouched.
+// PR#145 review-blocker regression (R3, YUJ-1810).
 //
-// Bug we are guarding against
-// ===========================
-// Before this fix the chokepoint mutated `payload` in place. The
-// reminder writer at modules/message/api_reminders.go:223-243
-// iterates `mention.uids` and emits one ReminderTypeMentionMe row
-// per UID — so every `ais=1` broadcast created one human-visible
-// `[有人@我]` red-dot per bot member of the group. DB pollution AND
-// a contract violation (`ais=1` is supposed to mean "bots respond
-// via the delivery path; do NOT create human-visible reminders").
+// Production flow we are pinning
+// ==============================
+//  1. sendMessage builds the in-memory `payload`.
+//  2. wirePayload = CloneForExpansion(payload) →
+//     ExpandAisToBotUIDs(wirePayload) stamps bot UIDs into
+//     wirePayload["mention"]["uids"].
+//  3. MsgSendReq.Payload = util.ToJson(wirePayload) — WuKongIM
+//     persists the EXPANDED bytes.
+//  4. WuKongIM webhooks back → listenerMessages → getReminders, which
+//     decodes the persisted (expanded) bytes via
+//     config.MessageResp.GetPayloadMap.
+//
+// So `getReminders` sees `mention.uids = [u_alice, bot_a, bot_b]` —
+// NOT the original `[u_alice]`. CloneForExpansion alone is
+// insufficient: it only protects the send-side in-memory map; the
+// listener path doesn't touch that map at all.
+//
+// Required guard
+// ==============
+// getReminders must call robotService.ExistRobot for each UID and
+// skip bots — that's the single source of truth for "no reminder
+// rows for bots", and it covers both server-expanded ais UIDs AND
+// user-typed explicit @bot_x mentions (bots never need a red-dot).
 //
 // What this test pins
 // ===================
-// We replicate the chokepoint composition (CloneForExpansion →
-// ExpandAisToBotUIDs) and then assert two things:
+//  1. Wire bytes carry the expansion (legacy-adapter compat —
+//     same assertion as before).
+//  2. When the PERSISTED (= expanded) bytes are fed to getReminders
+//     with a robotService that knows {bot_a, bot_b} are bots, the
+//     emitted reminder set contains exactly ONE row for `u_alice`.
+//     Zero rows for `bot_a`, zero for `bot_b`, zero channel-level
+//     (no `humans=1`).
 //
-//  1. The wire-only payload bytes (what WuKongIM dispatches and
-//     legacy adapter bots inspect) DO carry the expanded bot UIDs.
-//
-//  2. The original in-memory `payload` map, when fed into
-//     getReminders the way the persistence + listener pipeline
-//     does, produces reminder rows ONLY for the explicit human
-//     UIDs that the caller supplied — NEVER for the expanded bot
-//     UIDs.
-//
-// If a future refactor reverts the chokepoint to mutate `payload`
-// directly, this test fails on the second assertion (bot UIDs
-// would leak into the reminder set).
+// If a future refactor removes the ExistRobot filter, this test
+// fails on bot_a / bot_b leaking into the reminder set.
 func TestGetReminders_AisExpansionDoesNotPolluteReminderRows(t *testing.T) {
 	const channelID = "ch_team"
 
@@ -595,12 +598,20 @@ func TestGetReminders_AisExpansionDoesNotPolluteReminderRows(t *testing.T) {
 		wireUIDs,
 		"wire payload must include expanded bot UIDs for legacy adapter compat")
 
-	// Assertion #2: the in-memory payload is unmutated. We feed it
-	// into getReminders the way the persistence + listener pipeline
-	// does (config.MessageResp.GetPayloadMap decodes the persisted
-	// bytes with UseNumber — see payloadJSON above for the same
-	// re-decode pattern).
+	// Assertion #2: feed the EXPANDED wire payload bytes into
+	// getReminders (this is exactly what the listener path sees —
+	// WuKongIM persists the expanded bytes and webhooks them back via
+	// config.MessageResp.GetPayloadMap). The robotService recognizes
+	// bot_a / bot_b as bots, so getReminders' new ExistRobot guard
+	// must filter them out and emit ONLY the row for u_alice.
 	m := newReminderTestMessage(t)
+	m.robotService = &fakeExpandRobotService{
+		exist: map[string]bool{
+			"bot_a":   true,
+			"bot_b":   true,
+			"u_alice": false,
+		},
+	}
 	msg := &config.MessageResp{
 		ChannelID:   channelID,
 		ChannelType: common.ChannelTypeGroup.Uint8(),
@@ -608,7 +619,7 @@ func TestGetReminders_AisExpansionDoesNotPolluteReminderRows(t *testing.T) {
 		MessageID:   2024,
 		MessageSeq:  42,
 		ClientMsgNo: "cmn_pr145",
-		Payload:     payloadJSON(t, original),
+		Payload:     payloadJSON(t, wire),
 	}
 	got := m.getReminders([]*config.MessageResp{msg})
 
