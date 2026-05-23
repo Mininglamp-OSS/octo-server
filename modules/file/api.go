@@ -588,6 +588,22 @@ func (f *File) getDownloadURL(c *wkhttp.Context) {
 			if cosPrefix != "" {
 				ph = strings.TrimPrefix(ph, "/"+cosPrefix)
 			}
+
+			// S3 backend: mirror the COS handling for the awsS3
+			// fileService. When the client round-trips a full URL we
+			// previously issued, the URL path carries the configured
+			// prefix (and the bucket segment in path-style deployments)
+			// — both must come off before PresignedGetURL re-applies
+			// the prefix via ServiceS3.withPrefix, otherwise the signed
+			// object key double-prefixes and the GET 404s.
+			s3Cfg := f.ctx.GetConfig().S3
+			if s3Cfg.UsePathStyle && s3Cfg.Bucket != "" {
+				ph = strings.TrimPrefix(ph, "/"+s3Cfg.Bucket)
+			}
+			s3Prefix := strings.TrimSpace(s3Cfg.Prefix)
+			if s3Prefix != "" {
+				ph = strings.TrimPrefix(ph, "/"+s3Prefix)
+			}
 		}
 	}
 

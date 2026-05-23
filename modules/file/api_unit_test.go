@@ -1000,3 +1000,115 @@ func TestGetDownloadURL_PathStyleStripsBucketSegment(t *testing.T) {
 		})
 	}
 }
+
+// TestGetDownloadURL_S3PrefixAndBucketStrip mirrors the COS round-trip
+// test for the awsS3 fileService. Same hazard: when the client posts
+// back a full URL we issued (e.g. with a multi-env prefix or a
+// path-style endpoint), the handler must strip both the prefix and
+// (path-style only) the bucket segment before PresignedGetURL
+// re-applies the prefix via ServiceS3.withPrefix. Without the strip,
+// the signed object key double-prefixes and the GET 404s.
+func TestGetDownloadURL_S3PrefixAndBucketStrip(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cases := []struct {
+		name             string
+		bucket           string
+		bucketURL        string
+		prefix           string
+		usePathStyle     bool
+		inputPath        string
+		wantSignedObject string
+	}{
+		{
+			name:             "virtual-hosted with prefix strips just prefix",
+			bucket:           "my-bucket",
+			bucketURL:        "",
+			prefix:           "prod",
+			usePathStyle:     false,
+			inputPath:        "https://my-bucket.s3.us-west-2.amazonaws.com/prod/chat/2026/05/abc.jpg",
+			wantSignedObject: "/chat/2026/05/abc.jpg",
+		},
+		{
+			name:             "path-style with prefix strips bucket then prefix",
+			bucket:           "my-bucket",
+			bucketURL:        "",
+			prefix:           "prod",
+			usePathStyle:     true,
+			inputPath:        "https://s3.us-west-2.amazonaws.com/my-bucket/prod/chat/2026/05/abc.jpg",
+			wantSignedObject: "/chat/2026/05/abc.jpg",
+		},
+		{
+			name:             "path-style no prefix strips just bucket",
+			bucket:           "my-bucket",
+			bucketURL:        "",
+			prefix:           "",
+			usePathStyle:     true,
+			inputPath:        "https://s3.us-west-2.amazonaws.com/my-bucket/chat/2026/05/abc.jpg",
+			wantSignedObject: "/chat/2026/05/abc.jpg",
+		},
+		{
+			name:             "CDN BucketURL with prefix — bucket NOT in path, only prefix stripped",
+			bucket:           "my-bucket",
+			bucketURL:        "https://files.example.com",
+			prefix:           "prod",
+			usePathStyle:     false,
+			inputPath:        "https://files.example.com/prod/chat/2026/05/abc.jpg",
+			wantSignedObject: "/chat/2026/05/abc.jpg",
+		},
+		{
+			name:             "virtual-hosted no prefix — path is just key",
+			bucket:           "my-bucket",
+			bucketURL:        "",
+			prefix:           "",
+			usePathStyle:     false,
+			inputPath:        "https://my-bucket.s3.us-west-2.amazonaws.com/chat/2026/05/abc.jpg",
+			wantSignedObject: "/chat/2026/05/abc.jpg",
+		},
+		{
+			name:             "non-URL path passes through unchanged",
+			bucket:           "my-bucket",
+			bucketURL:        "",
+			prefix:           "prod",
+			usePathStyle:     false,
+			inputPath:        "chat/2026/05/abc.jpg",
+			wantSignedObject: "chat/2026/05/abc.jpg",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.New()
+			cfg.Test = true
+			cfg.S3.Endpoint = "s3.us-west-2.amazonaws.com"
+			cfg.S3.Region = "us-west-2"
+			cfg.S3.Bucket = tc.bucket
+			cfg.S3.BucketURL = tc.bucketURL
+			cfg.S3.Prefix = tc.prefix
+			cfg.S3.UsePathStyle = tc.usePathStyle
+
+			mockSvc := &mockService{}
+			f := &File{
+				ctx:     testutil.NewTestContext(cfg),
+				Log:     log.NewTLog("FileTest"),
+				service: mockSvc,
+			}
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			req, _ := http.NewRequest(
+				http.MethodGet,
+				"/v1/file/download/url?path="+url.QueryEscape(tc.inputPath)+"&filename=abc.jpg",
+				nil,
+			)
+			c.Request = req
+
+			wkCtx := &wkhttp.Context{Context: c}
+			f.getDownloadURL(wkCtx)
+
+			assert.Equal(t, http.StatusOK, w.Code, "unexpected status; body=%s", w.Body.String())
+			assert.Equal(t, tc.wantSignedObject, mockSvc.lastGetObjectPath,
+				"object path passed to PresignedGetURL must have prefix (and path-style bucket) stripped before signing")
+		})
+	}
+}

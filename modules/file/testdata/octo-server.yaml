@@ -68,6 +68,9 @@ wukongIM:
 #   ------------------+---------------------------------------+--------------------------------
 #   "minio"           | yes — direct PUT signed by minio-go   | yes — signed GET via minio-go
 #   "tencentCOS"      | yes — direct PUT signed by minio-go   | yes — signed GET via minio-go
+#   "awsS3"           | yes — direct PUT signed by minio-go   | yes — signed GET via minio-go
+#                     |       (AWS S3, R2, B2, Wasabi,        |
+#                     |        MinIO with custom endpoint)    |
 #   "aliyunOSS"       | yes — direct PUT signed by OSS SDK    | yes — signed GET via OSS SDK
 #   "qiniu"           | no  — Qiniu uploads use a token+form  | yes — MakePrivateURLv2 signed URL
 #                     |       model that does not map to a    |
@@ -163,6 +166,108 @@ minio:
   downloadURL: "http://octo.local:29000"
   accessKeyID: "octoadmin"
   secretAccessKey: "CHANGE_ME_MINIO_PASSWORD"
+
+# ---------- AWS S3 / S3-compatible (alternative to the blocks above) --------
+# Activate this backend with `fileService: "awsS3"` above, then fill in the
+# `s3:` block below.
+#
+# Use this for AWS S3, Cloudflare R2, Backblaze B2, Wasabi, or any other
+# provider that implements the S3 protocol with SigV4. ServiceS3 is a
+# single-bucket backend — the upload "type" segment (chat/, moment/, ...)
+# lives inside the object key, not as a separate bucket — so you only
+# need ONE bucket pre-created with appropriate IAM + CORS.
+#
+# Pre-deployment checklist:
+#
+#   1. Pre-create the bucket in your provider's console (octo-server does
+#      NOT auto-create on S3 — the IAM permissions for CreateBucket should
+#      remain UNGRANTED to avoid accidental cross-region bucket creation).
+#   2. Attach a minimum IAM policy granting only the object operations
+#      ServiceS3 actually performs:
+#        s3:ListBucket, s3:GetBucketLocation       — on the bucket arn
+#        s3:GetObject, s3:PutObject, s3:DeleteObject, s3:AbortMultipartUpload
+#                                                  — on the bucket arn + "/*"
+#   3. Configure CORS on the bucket so browser-direct presigned PUT works
+#      from the octo-web origin. Example (AWS S3 JSON):
+#        [{
+#          "AllowedOrigins": ["https://octo.example.com"],
+#          "AllowedMethods": ["GET", "PUT", "HEAD"],
+#          "AllowedHeaders": ["*"],
+#          "ExposeHeaders": ["ETag"],
+#          "MaxAgeSeconds": 3000
+#        }]
+#   4. Leave Block Public Access ON. Downloads go through
+#      /v1/file/download/url (presigned GET); octo-server's getFile
+#      handler also produces presigned URLs for private buckets.
+#
+# Region / endpoint semantics:
+#
+#   * Endpoint MUST match the bucket's actual region — Region is signed
+#     into the SigV4 canonical request, so a region mismatch produces
+#     AuthorizationHeaderMalformed at the gateway.
+#   * AWS S3: minio-go internally canonicalizes Amazon endpoints to
+#     `s3.dualstack.<region>.amazonaws.com`; this is the publicly
+#     resolvable IPv4+IPv6 endpoint and works in all browsers. Operators
+#     allow-listing the non-dual-stack hostname in firewalls / WAF
+#     should add the dual-stack variant.
+#   * Cloudflare R2: use `auto` as the region (R2 ignores it but the
+#     SDK still requires non-empty for SigV4).
+#   * Backblaze B2 S3 API: endpoint shape is `s3.<region>.backblazeb2.com`.
+#
+# SigV4 signed-header contract (REQUIRED for the browser direct PUT path):
+#
+#   The contract is identical to the COS / MinIO backends — see the
+#   `getUploadCredentials` block at modules/file/api.go for the
+#   per-header rules. The presigned PUT URL covers `Content-Type`,
+#   `Content-Length`, and (when present) `Content-Disposition` in
+#   `X-Amz-SignedHeaders`. The browser MUST echo each verbatim or AWS
+#   returns 403 SignatureDoesNotMatch and the upload aborts before any
+#   bytes leave the browser. This is also the server-side enforcement
+#   of MaxFileSize on the presigned path.
+#fileService: "awsS3"
+#s3:
+#  # API endpoint hostname (NO scheme — the SDK adds https). Pasting a
+#  # full URL is tolerated (scheme is stripped), but the canonical form
+#  # is host[:port] only.
+#  endpoint: "s3.us-west-2.amazonaws.com"
+#
+#  # SigV4 signing region. Must match the bucket's actual region for
+#  # AWS S3. Use "auto" for Cloudflare R2; required (non-empty) for all
+#  # providers because the SDK signs it into the canonical request.
+#  region: "us-west-2"
+#
+#  # The single bucket all uploads land in. Pre-create it on the
+#  # provider side; ServiceS3 does NOT call CreateBucket.
+#  bucket: "my-octo-bucket"
+#
+#  # Long-lived IAM access keys. Also overridable via env vars:
+#  #
+#  #   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY  — standard AWS env,
+#  #     auto-picked up by IRSA / IAM-role workflows.
+#  #   TS_S3_ACCESS_KEY_ID / TS_S3_SECRET_ACCESS_KEY  — project-specific
+#  #     overrides that WIN over both the YAML and the AWS_* env vars.
+#  #     Use these when your host has unrelated AWS_* set and you want
+#  #     octo-server to talk to a different account (e.g. R2 / B2).
+#  accessKeyID: "AKIA..."
+#  secretAccessKey: "..."
+#
+#  # OPTIONAL: BucketURL — overrides the URL returned by DownloadURL
+#  # and the host signed against by presigned PUT/GET. Set this when
+#  # operators front the bucket with CloudFront / a custom domain.
+#  # MUST be scheme://host[:port] with NO path component (a path
+#  # prefix would be stripped before SigV4 canonical URI computation
+#  # and produce 403 SignatureDoesNotMatch at the browser).
+#  # bucketURL: "https://files.example.com"
+#
+#  # OPTIONAL: object-key prefix for multi-environment isolation
+#  # against a shared bucket. Mirrors COS Prefix.
+#  # prefix: "prod/"
+#
+#  # OPTIONAL: force path-style addressing (https://endpoint/bucket/key)
+#  # instead of virtual-hosted (https://bucket.endpoint/key). AWS S3
+#  # accepts both modern-style; some S3 gateways (MinIO with custom
+#  # endpoint, older B2 configurations) require true.
+#  # usePathStyle: false
 
 # ---------- Logging ----------------------------------------------------------
 logger:

@@ -5,7 +5,7 @@ go 1.25
 require (
 	firebase.google.com/go/v4 v4.13.0
 	github.com/DATA-DOG/go-sqlmock v1.5.0
-	github.com/Mininglamp-OSS/octo-lib v0.0.0-20260522122557-a65ecee15fc5
+	github.com/Mininglamp-OSS/octo-lib v0.0.0-20260523084316-72ee7103307d
 	github.com/alibabacloud-go/darabonba-openapi v0.2.1
 	github.com/alibabacloud-go/sms-intl-20180501 v1.0.1
 	github.com/alibabacloud-go/tea v1.2.1

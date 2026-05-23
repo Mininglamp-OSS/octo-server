@@ -66,6 +66,11 @@ func NewService(ctx *config.Context) IService {
 		uploadService = NewServiceQiniu(ctx)
 	} else if service == config.FileServiceTencentCOS {
 		uploadService = NewServiceCOS(ctx)
+	} else if service == "awsS3" {
+		// Literal "awsS3" — octo-lib has not (yet) declared a
+		// FileServiceAwsS3 constant; a follow-up upstream PR can
+		// add the constant and this branch will switch to it.
+		uploadService = NewServiceS3(ctx)
 	} else {
 		uploadService = NewSeaweedFS(ctx)
 	}
