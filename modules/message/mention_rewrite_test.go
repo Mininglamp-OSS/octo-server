@@ -17,16 +17,15 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// TestMessagePackage_RewriteMention_AllRewrittenToAIsDoubleWrite is
-// the canonical regression guard for the message-package shim under
-// Plan X (YUJ-1389): inbound `mention.all=1` must be rewritten to
-// also carry `mention.ais=1` (so legacy `@所有人` auto-fans-out to
-// all AI bots without an SDK update), while preserving the legacy
-// `all=1` on the outbound payload for old read-side clients. humans
-// MUST NOT be auto-set — humans is the explicit human-notification
-// signal and only the sender may set it. If someone deletes the
-// import or breaks the wiring this test fails.
-func TestMessagePackage_RewriteMention_AllRewrittenToAIsDoubleWrite(t *testing.T) {
+// TestMessagePackage_RewriteMention_AllPassThrough is the regression
+// guard for the message-package shim under
+// Mininglamp-OSS/octo-server#142: the historical Plan X (YUJ-1389)
+// rewrite that turned inbound `mention.all=1` into `all=1 + ais=1` was
+// removed because legacy `@所有人` must not auto-trigger bots. The
+// shim must now pass the inbound mention map through untouched — `all`
+// preserved, NO implicit `ais`, NO implicit `humans`. If someone
+// reintroduces the rewrite or breaks the wiring this test fails.
+func TestMessagePackage_RewriteMention_AllPassThrough(t *testing.T) {
 	payload := map[string]interface{}{
 		"type":    1,
 		"content": "@所有人 ping",
@@ -37,9 +36,10 @@ func TestMessagePackage_RewriteMention_AllRewrittenToAIsDoubleWrite(t *testing.T
 	out := RewriteMention(payload)
 	mention := out["mention"].(map[string]interface{})
 	assert.Equal(t, json.Number("1"), mention["all"],
-		"all=1 outbound double-write must be preserved")
-	assert.Equal(t, json.Number("1"), mention["ais"],
-		"Plan X: all=1 inbound must rewrite to add ais=1 (auto-fan-out to bots)")
+		"all=1 must be preserved (legacy read-side clients render @所有人 from it)")
+	_, hasAIs := mention["ais"]
+	assert.False(t, hasAIs,
+		"#142: ais MUST NOT be inferred from legacy all=1 — bots only fire on explicit ais=1")
 	_, hasHumans := mention["humans"]
 	assert.False(t, hasHumans,
 		"humans MUST NOT be auto-set — only the sender may set the human-notification signal")

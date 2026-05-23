@@ -1,15 +1,21 @@
-// Unit tests for the pure RewriteMention helper.
+// Unit tests for the (now pass-through) RewriteMention helper.
 //
-// These cover the spec contract from Mininglamp-OSS/octo-server#94 and
-// the issue YUJ-1343 acceptance list, updated for Plan X (YUJ-1389):
-// inbound `mention.all=1` now rewrites to carry `mention.ais=1` (not
-// `humans=1`) so legacy `@所有人` traffic automatically fans out to
-// all AI bots without requiring an SDK update. The companion thin
-// re-export in modules/message/mention_rewrite.go has its own
-// colocated test file that exercises the same shapes through the
-// message-package symbol, so a future refactor moving the helper
-// does not have to update two suites in lockstep — the contract is
-// asserted here and the shim test only verifies the shim is not a stub.
+// Originally these tests pinned a Plan X (YUJ-1389) inbound rewrite:
+// `mention.all=1` was rewritten to also carry `mention.ais=1` so
+// legacy `@所有人` traffic auto-fanned-out to all AI bots without an
+// SDK update. Product intent was corrected in
+// Mininglamp-OSS/octo-server#142 — legacy `@所有人` MUST NOT trigger
+// bots — so the rewrite block was removed and the helper is now a
+// strict pass-through. These tests have been updated to assert the
+// pass-through contract: the inbound mention map is returned untouched
+// (modulo nil / non-map defenses).
+//
+// The companion thin re-export in modules/message/mention_rewrite.go
+// has its own colocated test file that exercises the same shapes
+// through the message-package symbol, so a future refactor moving the
+// helper does not have to update two suites in lockstep — the contract
+// is asserted here and the shim test only verifies the shim is not a
+// stub.
 package mentionrewrite
 
 import (
@@ -20,13 +26,13 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// TestRewriteMention_AllOnly — the canonical legacy-client shape. An
-// inbound `mention.all=1` MUST gain a `mention.ais=1` companion (Plan
-// X: legacy @所有人 → fan out to bots automatically) and MUST keep the
-// `all=1` field on the outbound payload (double-write for old
-// read-side clients that only understand `all`). humans MUST NOT be
-// set as a side effect — humans is the explicit human-notification
-// signal and must only be set by the sender.
+// TestRewriteMention_AllOnly — the canonical legacy-client shape. After
+// Mininglamp-OSS/octo-server#142 the inbound `mention.all=1` MUST be
+// passed through untouched: `all=1` is preserved (legacy read-side
+// clients still render `@所有人` from it) and NEITHER `ais` NOR
+// `humans` is auto-set. The product intent is that legacy `@所有人`
+// no longer triggers bots — bots are only triggered by an explicit
+// client-supplied `ais=1`.
 func TestRewriteMention_AllOnly(t *testing.T) {
 	payload := map[string]interface{}{
 		"type":    1,
@@ -40,9 +46,10 @@ func TestRewriteMention_AllOnly(t *testing.T) {
 
 	mention := out["mention"].(map[string]interface{})
 	assert.Equal(t, json.Number("1"), mention["all"],
-		"all=1 must be preserved (outbound double-write for legacy clients)")
-	assert.Equal(t, json.Number("1"), mention["ais"],
-		"Plan X: all=1 inbound must set ais=1 so legacy @所有人 fans out to bots")
+		"all=1 must be preserved (legacy read-side clients render @所有人 from it)")
+	_, hasAIs := mention["ais"]
+	assert.False(t, hasAIs,
+		"#142: ais MUST NOT be inferred from legacy all=1 — bots only fire on explicit ais=1")
 	_, hasHumans := mention["humans"]
 	assert.False(t, hasHumans,
 		"humans must NOT be auto-set — humans is the explicit human-notification signal")
@@ -103,8 +110,8 @@ func TestRewriteMention_HumansAndAIs(t *testing.T) {
 }
 
 // TestRewriteMention_AllPlusUIDs — legacy `@所有人 + @alice + @bob`. The
-// uids array MUST be preserved (the rewrite is only about the broadcast
-// flag, not about individual mentions).
+// uids array MUST be preserved verbatim. Post-#142 there is also no
+// implicit ais=1 — the rewrite is a strict pass-through.
 func TestRewriteMention_AllPlusUIDs(t *testing.T) {
 	payload := map[string]interface{}{
 		"mention": map[string]interface{}{
@@ -115,7 +122,8 @@ func TestRewriteMention_AllPlusUIDs(t *testing.T) {
 	out := RewriteMention(payload)
 	mention := out["mention"].(map[string]interface{})
 	assert.Equal(t, json.Number("1"), mention["all"], "all preserved")
-	assert.Equal(t, json.Number("1"), mention["ais"], "Plan X: ais added")
+	_, hasAIs := mention["ais"]
+	assert.False(t, hasAIs, "#142: no implicit ais from legacy all=1")
 	assert.Equal(t,
 		[]interface{}{"uid_alice", "uid_bob"},
 		mention["uids"],
@@ -125,7 +133,8 @@ func TestRewriteMention_AllPlusUIDs(t *testing.T) {
 // TestRewriteMention_AllPlusEntities — v2 client shape (mention.entities
 // is the new-format inline-mention metadata, see
 // modules/message/validation_test.go:885+). RewriteMention must NOT
-// drop or mutate the entities array.
+// drop or mutate the entities array. Post-#142 there is also no
+// implicit ais=1.
 func TestRewriteMention_AllPlusEntities(t *testing.T) {
 	entities := []interface{}{
 		map[string]interface{}{"uid": "__all__", "offset": json.Number("0"), "length": json.Number("4")},
@@ -140,7 +149,8 @@ func TestRewriteMention_AllPlusEntities(t *testing.T) {
 	out := RewriteMention(payload)
 	mention := out["mention"].(map[string]interface{})
 	assert.Equal(t, json.Number("1"), mention["all"])
-	assert.Equal(t, json.Number("1"), mention["ais"], "Plan X: ais added")
+	_, hasAIs := mention["ais"]
+	assert.False(t, hasAIs, "#142: no implicit ais from legacy all=1")
 	assert.True(t, reflect.DeepEqual(entities, mention["entities"]),
 		"entities array must survive the rewrite untouched")
 }
@@ -220,9 +230,9 @@ func TestRewriteMention_MentionIsNonMap(t *testing.T) {
 }
 
 // TestRewriteMention_AllAsFloat — json.Decoder *without* UseNumber will
-// produce float64. Even though the message pipeline uses UseNumber, the
-// helper accepts the float form defensively so callers that decode with
-// the standard library default don't silently miss the rewrite.
+// produce float64. Post-#142 the helper is a pass-through, so a
+// float-encoded `all=1` survives verbatim and no `ais` field is
+// synthesized.
 func TestRewriteMention_AllAsFloat(t *testing.T) {
 	payload := map[string]interface{}{
 		"mention": map[string]interface{}{
@@ -231,12 +241,15 @@ func TestRewriteMention_AllAsFloat(t *testing.T) {
 	}
 	out := RewriteMention(payload)
 	mention := out["mention"].(map[string]interface{})
-	assert.Equal(t, json.Number("1"), mention["ais"], "float64 all=1 must trigger rewrite to ais=1")
+	_, hasAIs := mention["ais"]
+	assert.False(t, hasAIs, "#142: no implicit ais from legacy all=1 (any numeric form)")
 	assert.Equal(t, float64(1), mention["all"], "original all value preserved verbatim")
 }
 
 // TestRewriteMention_AllAsBool — defensive: some Go callers might
-// construct payloads with `all: true`. Treat truthy bool as 1.
+// construct payloads with `all: true`. Post-#142 the helper is a
+// pass-through; the bool form survives verbatim and no `ais` field is
+// synthesized.
 func TestRewriteMention_AllAsBool(t *testing.T) {
 	payload := map[string]interface{}{
 		"mention": map[string]interface{}{
@@ -245,12 +258,13 @@ func TestRewriteMention_AllAsBool(t *testing.T) {
 	}
 	out := RewriteMention(payload)
 	mention := out["mention"].(map[string]interface{})
-	assert.Equal(t, json.Number("1"), mention["ais"])
+	_, hasAIs := mention["ais"]
+	assert.False(t, hasAIs, "#142: no implicit ais from legacy all=true")
 	assert.Equal(t, true, mention["all"])
 }
 
 // TestRewriteMention_AllZero — `all=0` is the "no @所有人" sentinel; the
-// rewrite must NOT add an ais field.
+// rewrite is a pass-through and must NOT add ais / humans fields.
 func TestRewriteMention_AllZero(t *testing.T) {
 	payload := map[string]interface{}{
 		"mention": map[string]interface{}{
@@ -266,9 +280,9 @@ func TestRewriteMention_AllZero(t *testing.T) {
 }
 
 // TestRewriteMention_AllAndAIsBothSet — a forward-compat new client
-// might already set BOTH all and ais. The rewrite must NOT clobber
-// the client-supplied ais value (e.g. some future "ais=2" semantic
-// would be silently overwritten by a blind set).
+// might already set BOTH all and ais. Post-#142 the helper is a
+// pass-through, so both keys survive verbatim and humans is not
+// inferred.
 func TestRewriteMention_AllAndAIsBothSet(t *testing.T) {
 	payload := map[string]interface{}{
 		"mention": map[string]interface{}{
@@ -288,8 +302,8 @@ func TestRewriteMention_AllAndAIsBothSet(t *testing.T) {
 
 // TestRewriteMention_AllPlusHumans — a client that explicitly wants to
 // notify humans alongside legacy `@所有人` sets both `all=1` and
-// `humans=1`. The rewrite still adds `ais=1` (Plan X) but must NOT
-// touch the existing humans field.
+// `humans=1`. Post-#142 both keys pass through untouched and no
+// implicit `ais=1` is inserted.
 func TestRewriteMention_AllPlusHumans(t *testing.T) {
 	payload := map[string]interface{}{
 		"mention": map[string]interface{}{
@@ -301,14 +315,15 @@ func TestRewriteMention_AllPlusHumans(t *testing.T) {
 	mention := out["mention"].(map[string]interface{})
 	assert.Equal(t, json.Number("1"), mention["all"], "all preserved")
 	assert.Equal(t, json.Number("1"), mention["humans"], "client-supplied humans untouched")
-	assert.Equal(t, json.Number("1"), mention["ais"], "Plan X: ais added")
+	_, hasAIs := mention["ais"]
+	assert.False(t, hasAIs, "#142: no implicit ais from legacy all=1")
 }
 
 // TestRewriteMention_Idempotent — RewriteMention(RewriteMention(p))
-// must equal RewriteMention(p) for every input shape. Idempotency is
-// the property that lets us drop the helper at three independent
-// chokepoints + any future listener / relay without worrying about
-// repeated rewrites.
+// must equal RewriteMention(p) for every input shape. Trivially true
+// for a pass-through helper, but the property is the contract that
+// lets us drop the helper at three independent chokepoints + any
+// future listener / relay without worrying about repeated rewrites.
 func TestRewriteMention_Idempotent(t *testing.T) {
 	inputs := []map[string]interface{}{
 		nil,

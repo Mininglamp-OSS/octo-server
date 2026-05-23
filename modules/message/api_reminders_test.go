@@ -320,13 +320,16 @@ func TestGetReminders_FanoutMatrix(t *testing.T) {
 }
 
 // TestGetReminders_LegacyAllRoundTripThroughRewrite is the end-to-end
-// matrix cell that ties the chokepoint and the reader together under
-// Plan X (YUJ-1389): a legacy `mention.all=1` payload, after passing
-// through the chokepoint rewrite, produces ZERO channel-level
-// reminders — the post-rewrite payload is `{all:1, ais:1}`, which is
-// ais-only semantics and must NOT create a "[有人@我]" red-dot.
-// Bots receive the message via the delivery path; humans see nothing
-// in the reminder pane (which is the desired Plan X behavior).
+// matrix cell that ties the chokepoint and the reader together. Under
+// Mininglamp-OSS/octo-server#142 the chokepoint helper is now a strict
+// pass-through (the historical Plan X / YUJ-1389 `all→ais` inference
+// was removed because legacy `@所有人` must not auto-trigger bots), so
+// the post-rewrite payload is still `{all:1}` with no `ais` and no
+// `humans`. The reader-side outcome is unchanged: legacy `all=1` alone
+// produces ZERO channel-level reminders (no humans gate trips), bots
+// do NOT fan out (no explicit ais=1), and the legacy `all=1` field
+// stays on the wire so old read-side clients keep rendering the
+// `@所有人` pill.
 func TestGetReminders_LegacyAllRoundTripThroughRewrite(t *testing.T) {
 	m := newReminderTestMessage(t)
 
@@ -337,15 +340,19 @@ func TestGetReminders_LegacyAllRoundTripThroughRewrite(t *testing.T) {
 			"all": json.Number("1"),
 		},
 	}
-	// Chokepoint rewrite.
+	// Chokepoint rewrite (post-#142: pass-through).
 	rewritten := RewriteMention(inbound)
 	mention := rewritten["mention"].(map[string]interface{})
-	assert.Equal(t, json.Number("1"), mention["all"], "all preserved (outbound double-write)")
-	assert.Equal(t, json.Number("1"), mention["ais"], "Plan X: ais added by rewrite")
+	assert.Equal(t, json.Number("1"), mention["all"],
+		"all preserved verbatim (legacy read-side clients render @所有人 from it)")
+	_, hasAIs := mention["ais"]
+	assert.False(t, hasAIs,
+		"#142: ais MUST NOT be inferred from legacy all=1 — bots only fire on explicit ais=1")
 	_, hasHumans := mention["humans"]
-	assert.False(t, hasHumans, "Plan X: humans is NOT auto-set by rewrite")
+	assert.False(t, hasHumans,
+		"humans MUST NOT be auto-set by rewrite — only the sender may set it")
 
-	// Reader sees the rewritten payload.
+	// Reader sees the rewritten (pass-through) payload.
 	msg := &config.MessageResp{
 		ChannelID:   "ch_roundtrip",
 		ChannelType: common.ChannelTypeGroup.Uint8(),
@@ -357,15 +364,15 @@ func TestGetReminders_LegacyAllRoundTripThroughRewrite(t *testing.T) {
 	}
 	rems := m.getReminders([]*config.MessageResp{msg})
 	assert.Len(t, rems, 0,
-		"Plan X: legacy all=1 (rewritten to all+ais) must produce ZERO channel-level reminders")
+		"#142: legacy all=1 alone produces ZERO channel-level reminders (no humans gate trips)")
 }
 
-// TestGetReminders_HumansPlusAllRoundTrip — a future client that wants
-// BOTH the legacy `all=1` pill on old read-side clients AND a human-
-// visible reminder sends `{all:1, humans:1}` inbound. The chokepoint
-// rewrite ALSO adds `ais=1` (Plan X), so the dispatched payload is
-// `{all:1, humans:1, ais:1}`. Reader must emit exactly ONE channel-
-// level reminder (humans=1 is the gate).
+// TestGetReminders_HumansPlusAllRoundTrip — a client that wants BOTH
+// the legacy `all=1` pill on old read-side clients AND a human-visible
+// reminder sends `{all:1, humans:1}` inbound. Post-#142 the chokepoint
+// is a pass-through, so the dispatched payload is still `{all:1,
+// humans:1}` (no implicit `ais=1`). Reader must emit exactly ONE
+// channel-level reminder (humans=1 is the gate).
 func TestGetReminders_HumansPlusAllRoundTrip(t *testing.T) {
 	m := newReminderTestMessage(t)
 
@@ -380,7 +387,9 @@ func TestGetReminders_HumansPlusAllRoundTrip(t *testing.T) {
 	mention := rewritten["mention"].(map[string]interface{})
 	assert.Equal(t, json.Number("1"), mention["all"])
 	assert.Equal(t, json.Number("1"), mention["humans"])
-	assert.Equal(t, json.Number("1"), mention["ais"], "Plan X: rewrite always adds ais=1 for all=1")
+	_, hasAIs := mention["ais"]
+	assert.False(t, hasAIs,
+		"#142: rewrite no longer infers ais=1 from legacy all=1")
 
 	msg := &config.MessageResp{
 		ChannelID:   "ch_humans_plus_all",

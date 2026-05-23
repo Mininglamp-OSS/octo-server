@@ -301,23 +301,29 @@ func TestSendMessage_PersonalDM_DBError_ForgedClientSpaceID_Stripped(t *testing.
 		"DB error + forged client space_id MUST be stripped from dispatched payload — attackers cannot use transient DB failure to bypass authoritative override")
 }
 
-// TestSendMessage_MentionAllRewritten_HandlerIntegration is the YUJ-1343 /
-// Mininglamp-OSS/octo-server#94 acceptance test for the mention three-state
-// rewrite on the /v1/bot/sendMessage handler path, updated for Plan X
-// (YUJ-1389).
+// TestSendMessage_MentionAllPassThrough_HandlerIntegration is the
+// YUJ-1343 / Mininglamp-OSS/octo-server#94 acceptance test for the
+// mention three-state rewrite on the /v1/bot/sendMessage handler
+// path, updated for Mininglamp-OSS/octo-server#142.
 //
-// This is the "handler-level integration test" the issue calls out: drive
-// BotAPI.sendMessage end-to-end with a `payload.mention.all=1` body and
-// assert the captured MsgSendReq carries `mention.ais=1` (Plan X
-// chokepoint rewrite ran — legacy `@所有人` auto-fans-out to all AI bots
-// without an SDK update) AND still carries `mention.all=1` (outbound
-// double-write preserved for legacy read-side clients). humans MUST
-// stay absent — humans is the explicit human-notification signal and is
-// never inferred from a legacy `all=1`. Lesson from PR#82 OBO fan-out:
-// when an external-service shape constraint matters, the test MUST go
-// through the real handler stack — not call the helper in isolation —
-// otherwise a wiring regression (e.g. someone deletes the call site by
-// mistake) slips past unit coverage.
+// This is the "handler-level integration test" the issue calls out:
+// drive BotAPI.sendMessage end-to-end with a `payload.mention.all=1`
+// body and assert the captured MsgSendReq carries `mention.all=1`
+// untouched, with NO implicit `mention.ais=1` and NO implicit
+// `mention.humans=1`.
+//
+// History: under Plan X (YUJ-1389) this test asserted that the
+// chokepoint rewrote `all=1` to also carry `ais=1` so legacy
+// `@所有人` traffic auto-fanned-out to all AI bots without an SDK
+// update. Product intent was corrected in #142 — legacy `@所有人`
+// MUST NOT trigger bots — so the rewrite is now a pass-through and
+// the test asserts the pass-through invariant. Lesson from PR#82 OBO
+// fan-out remains: when an external-service shape constraint matters,
+// the test MUST go through the real handler stack — not call the
+// helper in isolation — otherwise a wiring regression (e.g. someone
+// deletes the call site by mistake) slips past unit coverage. The
+// chokepoint call site is preserved for that exact reason; only its
+// behavior changed.
 //
 // Uses the existing creator-DM path (BotKindUser whose CreatorUID ==
 // channel_id) so the test does not need a live IsFriend / group_member
@@ -325,7 +331,7 @@ func TestSendMessage_PersonalDM_DBError_ForgedClientSpaceID_Stripped(t *testing.
 // `ChannelTypePerson` conditional (F2 — see modules/bot_api/send.go), so
 // even though this test drives a DM, the helper still runs; the same
 // helper would run on the group / community-topic path by inspection.
-func TestSendMessage_MentionAllRewritten_HandlerIntegration(t *testing.T) {
+func TestSendMessage_MentionAllPassThrough_HandlerIntegration(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	const (
@@ -386,18 +392,18 @@ func TestSendMessage_MentionAllRewritten_HandlerIntegration(t *testing.T) {
 	if !assert.True(t, ok, "dispatched payload must keep mention map; got %T", dispatchedPayload["mention"]) {
 		return
 	}
-	// Plan X chokepoint rewrite ran — ais=1 is now present (legacy
-	// `@所有人` auto-fans-out to all AI bots without an SDK update).
-	ais, _ := mention["ais"].(json.Number)
-	assert.Equal(t, "1", ais.String(),
-		"Plan X: BotAPI.sendMessage must invoke mentionrewrite.RewriteMention so mention.ais=1 reaches the dispatcher")
-	// Outbound double-write — legacy all=1 still present so old read-side
-	// clients keep rendering the @所有人 pill until they roll out support
-	// for the humans/ais fields.
+	// Post-#142 the chokepoint is a pass-through — ais MUST stay absent
+	// (the historical Plan X `all → also ais` inference was removed
+	// because legacy `@所有人` must not auto-trigger bots).
+	_, hasAIs := mention["ais"]
+	assert.False(t, hasAIs,
+		"#142: BotAPI.sendMessage rewrite must NOT infer mention.ais from legacy mention.all=1 — bots only fire on explicit ais=1")
+	// Legacy all=1 still present on the dispatched payload — old
+	// read-side clients keep rendering the @所有人 pill.
 	all, _ := mention["all"].(json.Number)
 	assert.Equal(t, "1", all.String(),
-		"legacy mention.all=1 MUST be preserved on the dispatched payload (outbound double-write)")
-	// humans MUST stay absent — Plan X: humans is the explicit human-
+		"legacy mention.all=1 MUST be preserved on the dispatched payload (pass-through)")
+	// humans MUST stay absent — humans is the explicit human-
 	// notification signal and is NEVER inferred from a legacy `all=1`.
 	// Only the sender may set humans, and only when they want a
 	// channel-level "[有人@我]" reminder for human members.
@@ -408,9 +414,9 @@ func TestSendMessage_MentionAllRewritten_HandlerIntegration(t *testing.T) {
 
 // TestSendMessage_MentionAisPassthrough_HandlerIntegration verifies the
 // other end of the matrix: an explicit `mention.ais=1` from a new client
-// passes through the chokepoint untouched (the Plan X rewrite is a
-// one-way "all → also ais" rule, never adds humans/ais from thin air
-// when the inbound shape did not request the broadcast via all=1).
+// passes through the chokepoint untouched. Post-#142 the chokepoint is
+// a strict pass-through for every shape, so the helper also never adds
+// `humans` or `all` from thin air.
 func TestSendMessage_MentionAisPassthrough_HandlerIntegration(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
