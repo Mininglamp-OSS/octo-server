@@ -24,19 +24,19 @@ import (
 // space_id 就被正确回填。Round-2 修复确保 syncUserConversation 在调
 // GetGroupDetails 之前就把 g1 加入 groupNos，从而让 groupMap 真的包含 g1。
 func TestSpaceID_Round2_Finding1_ThreadParentPrefetched(t *testing.T) {
-	// 模拟 Round-2 修复后的状态：thread 的父群已被预取并写入 groupMap，
+	// 模拟 Round-2 修复后的状态：thread 的父群已被预取并写入 rawGroupSpaceMap，
 	// 即便 IM 批次没把父群作为独立 conversation 返回。
 	resps := []*SyncUserConversationResp{
 		{ChannelID: "g1____th1", ChannelType: common.ChannelTypeCommunityTopic.Uint8()},
 	}
-	groupMap := map[string]*group.GroupResp{
-		"g1": {GroupNo: "g1", SpaceID: "spaceA"},
+	rawGroupSpaceMap := map[string]string{
+		"g1": "spaceA",
 	}
 
-	fillConversationSpaceIDs(resps, groupMap, nil)
+	fillConversationSpaceIDs(resps, rawGroupSpaceMap, nil, "")
 
 	assert.Equal(t, "spaceA", resps[0].SpaceID,
-		"thread 的 SpaceID 应继承父群——前提是父群已被预取到 groupMap")
+		"thread 的 SpaceID 应继承父群——前提是父群已被预取到 rawGroupSpaceMap")
 }
 
 // TestSpaceID_Round2_Finding2_DBOnlyThreadParentInGroupSpaceMap 验证 sidebar
@@ -85,7 +85,7 @@ func TestSpaceID_Round2_Finding2_DBOnlyThreadInheritsParentSpace(t *testing.T) {
 	}
 
 	items := mergeThreadEntries(nil, extRows, aliveThread("g_db_parent____th9", nil),
-		categorySetting, nil, groupSpaceMap, nil)
+		categorySetting, nil, groupSpaceMap, nil, "")
 
 	require.Len(t, items, 1)
 	assert.Equal(t, "spaceX", items[0].SpaceID,
@@ -118,7 +118,7 @@ func TestSpaceID_Round2_Finding3_BuildFollowItems_ExternalGroupMySource(t *testi
 		"g_external": "spaceA",
 	}
 
-	items := buildFollowItems(convs, categorySetting, nil, nil, threadExtMap, nil, nil, groupSpaceMap, externalGroupMap)
+	items := buildFollowItems(convs, categorySetting, nil, nil, threadExtMap, nil, nil, groupSpaceMap, externalGroupMap, "")
 
 	byID := map[string]*SidebarItem{}
 	for _, it := range items {
@@ -152,7 +152,7 @@ func TestSpaceID_Round2_Finding3_BuildRecentItems_ExternalGroupMySource(t *testi
 	groupSpaceMap := map[string]string{"g_external": "spaceB"}
 	externalGroupMap := map[string]string{"g_external": "spaceA"}
 
-	items := buildRecentItems(convs, nil, groupSpaceMap, externalGroupMap)
+	items := buildRecentItems(convs, nil, groupSpaceMap, externalGroupMap, "")
 
 	byID := map[string]*SidebarItem{}
 	for _, it := range items {
@@ -182,7 +182,7 @@ func TestSpaceID_Round2_Finding3_MergeThreadEntries_ExternalGroupMySource(t *tes
 
 	result := mergeThreadEntries(nil, threadExtRows,
 		aliveThread("g_external____alive", nil),
-		categorySetting, nil, groupSpaceMap, externalGroupMap)
+		categorySetting, nil, groupSpaceMap, externalGroupMap, "")
 
 	require.Len(t, result, 1)
 	assert.Equal(t, "spaceB", result[0].SpaceID)

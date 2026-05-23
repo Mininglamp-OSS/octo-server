@@ -31,7 +31,7 @@ func TestSpaceID_BuildFollowItems_GroupAndThreadFilled(t *testing.T) {
 		"g1": "spaceA",
 	}
 
-	items := buildFollowItems(convs, categorySetting, nil, followedDMs, threadExtMap, nil, nil, groupSpaceMap, nil)
+	items := buildFollowItems(convs, categorySetting, nil, followedDMs, threadExtMap, nil, nil, groupSpaceMap, nil, "")
 
 	bySpace := map[string]string{}
 	byTarget := map[string]*SidebarItem{}
@@ -57,7 +57,7 @@ func TestSpaceID_BuildFollowItems_NilGroupSpaceMap(t *testing.T) {
 	}
 
 	assert.NotPanics(t, func() {
-		items := buildFollowItems(convs, categorySetting, nil, nil, nil, nil, nil, nil, nil)
+		items := buildFollowItems(convs, categorySetting, nil, nil, nil, nil, nil, nil, nil, "")
 		assert.Len(t, items, 1)
 		assert.Equal(t, "", items[0].SpaceID)
 	})
@@ -78,7 +78,7 @@ func TestSpaceID_BuildRecentItems_GroupAndThreadFilled(t *testing.T) {
 		"g1": "spaceB",
 	}
 
-	items := buildRecentItems(convs, nil, groupSpaceMap, nil)
+	items := buildRecentItems(convs, nil, groupSpaceMap, nil, "")
 
 	bySpace := map[string]string{}
 	for _, it := range items {
@@ -102,7 +102,7 @@ func TestSpaceID_MergeThreadEntries_FillsParentSpaceID(t *testing.T) {
 	}
 	groupSpaceMap := map[string]string{"g1": "spaceC"}
 
-	result := mergeThreadEntries(nil, threadExtRows, aliveThread("g1____alive", nil), categorySetting, nil, groupSpaceMap, nil)
+	result := mergeThreadEntries(nil, threadExtRows, aliveThread("g1____alive", nil), categorySetting, nil, groupSpaceMap, nil, "")
 
 	if assert.Len(t, result, 1) {
 		assert.Equal(t, "g1____alive", result[0].TargetID)

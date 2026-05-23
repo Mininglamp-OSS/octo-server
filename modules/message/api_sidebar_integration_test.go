@@ -146,9 +146,9 @@ func TestIntegration_Sidebar_FollowTab_BasicSmoke(t *testing.T) {
 	}
 
 	// 5. Run the same pure-function pipeline as Sidebar.Sync follow branch.
-	items := buildFollowItems(stubConvs, categorySetting, unfollowedGroups, followedDMs, threadExtMap, nil, nil, nil, nil)
+	items := buildFollowItems(stubConvs, categorySetting, unfollowedGroups, followedDMs, threadExtMap, nil, nil, nil, nil, "")
 	// mergeThreadEntries: thread is already in IM result, so no new item added.
-	items = mergeThreadEntries(items, threadExtRows, map[string]*time.Time{}, categorySetting, unfollowedGroups, nil, nil)
+	items = mergeThreadEntries(items, threadExtRows, map[string]*time.Time{}, categorySetting, unfollowedGroups, nil, nil, "")
 	sortFollowItems(items)
 
 	// 6. Assert exactly 3 items with correct target_type.
@@ -225,7 +225,7 @@ func TestIntegration_Sidebar_FollowTab_BlacklistedGroupExcluded(t *testing.T) {
 		{ChannelID: groupNo, ChannelType: common.ChannelTypeGroup.Uint8(), Timestamp: 100},
 	}
 
-	items := buildFollowItems(stubConvs, categorySetting, unfollowedGroups, nil, nil, nil, nil, nil, nil)
+	items := buildFollowItems(stubConvs, categorySetting, unfollowedGroups, nil, nil, nil, nil, nil, nil, "")
 	assert.Len(t, items, 0,
 		"blacklisted group (group_unfollowed=1 in DB) must be excluded from follow tab")
 }
@@ -261,7 +261,7 @@ func TestIntegration_Sidebar_FollowTab_NoExtRows_ReturnsEmpty(t *testing.T) {
 	}
 
 	// No category → group excluded; no followed_dm row → DM excluded.
-	items := buildFollowItems(stubConvs, nil /*categorySetting*/, unfollowedGroups, followedDMs, nil, nil, nil, nil, nil)
+	items := buildFollowItems(stubConvs, nil /*categorySetting*/, unfollowedGroups, followedDMs, nil, nil, nil, nil, nil, "")
 	assert.Len(t, items, 0, "follow tab with no ext data must return 0 items")
 }
 
@@ -307,7 +307,7 @@ func TestIntegration_Sidebar_MergeThreadEntries_AddsDBOnlyThreads(t *testing.T) 
 	}
 
 	// buildFollowItems picks up threadInIM (has ext row + parent in follow set).
-	items := buildFollowItems(stubConvs, categorySetting, nil, nil, threadExtMap, nil, nil, nil, nil)
+	items := buildFollowItems(stubConvs, categorySetting, nil, nil, threadExtMap, nil, nil, nil, nil, "")
 	require.Len(t, items, 1, "buildFollowItems must include threadInIM")
 
 	// mergeThreadEntries appends threadDBOnly (not yet in items).
@@ -319,7 +319,7 @@ func TestIntegration_Sidebar_MergeThreadEntries_AddsDBOnlyThreads(t *testing.T) 
 		threadInIM:   &alive,
 		threadDBOnly: &alive,
 	}
-	items = mergeThreadEntries(items, threadExtRows, lastMsgAtMap, categorySetting, map[string]struct{}{}, nil, nil)
+	items = mergeThreadEntries(items, threadExtRows, lastMsgAtMap, categorySetting, map[string]struct{}{}, nil, nil, "")
 	require.Len(t, items, 2, "mergeThreadEntries must add the DB-only thread")
 
 	// Both thread IDs must be present.
@@ -414,7 +414,7 @@ func TestIntegration_Sidebar_Issue41_CrossTypeDragSurvivesReload(t *testing.T) {
 
 		// 本 case DM 没绑 category（issue #41 reproduction 的 fileHelper 也没有），
 		// dmCategorySorts 直接传 nil，避免依赖 group_setting 表。
-		items := buildFollowItems(stubConvs, categorySetting, unfollowedGroups, followedDMs, nil, groupExts, nil, nil, nil)
+		items := buildFollowItems(stubConvs, categorySetting, unfollowedGroups, followedDMs, nil, groupExts, nil, nil, nil, "")
 		sortFollowItems(items)
 		return items
 	}
@@ -492,7 +492,7 @@ func TestIntegration_Sidebar_Issue41_DMCategorySortLoadedFromGroupCategory(t *te
 	stubConvs := []*config.SyncUserConversationResp{
 		{ChannelID: dmID, ChannelType: common.ChannelTypePerson.Uint8(), Timestamp: 100},
 	}
-	items := buildFollowItems(stubConvs, nil, nil, followedDMs, nil, nil, sorts, nil, nil)
+	items := buildFollowItems(stubConvs, nil, nil, followedDMs, nil, nil, sorts, nil, nil, "")
 	require.Len(t, items, 1)
 	assert.Equal(t, catSort, items[0].CategorySort,
 		"带 dm_category_id 的 DM 必须把 group_category.sort 写到 SidebarItem.CategorySort")

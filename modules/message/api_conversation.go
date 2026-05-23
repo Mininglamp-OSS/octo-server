@@ -21,6 +21,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/channel"
 	chservice "github.com/Mininglamp-OSS/octo-server/modules/channel/service"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
@@ -553,6 +554,34 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 		}
 	}
 
+	// ---------- 群原始 space_id（不经 SetEffectiveSpaceID 改写） ----------
+	// Round-3 修复 (GH octo-server#154 Round-2 Finding 1)：
+	// GetGroupDetails 内部走 SetEffectiveSpaceIDFromMap，会把外部成员视角下的
+	// GroupResp.SpaceID 从群表权威值改写成成员的 source Space。
+	// fillConversationSpaceIDs 直接用 groupMap[groupNo].SpaceID 时拿到的就是被
+	// 改写后的 effective 值 → SyncUserConversationResp.SpaceID 与
+	// MySourceSpaceID 同值。响应契约要求 SpaceID 是群表的权威归属 Space，
+	// 必须另起一次 GetGroups(groupNos) 取原始 SpaceID 构建 rawGroupSpaceMap。
+	// GetGroups 返回的 InfoResp.SpaceID 直接来自群表行，不做 effective rewrite。
+	rawGroupSpaceMap := make(map[string]string, len(groupNos))
+	if len(groupNos) > 0 {
+		rawGroups, rawErr := co.groupService.GetGroups(groupNos)
+		if rawErr != nil {
+			// 非致命：缺失 SpaceID 回填会让客户端走"未知 Space"分支，
+			// 与历史 v1 fail-open 行为一致。FilterConversationsBySpace 走它自己
+			// 的 GetGroupSpaceMap 路径，互不影响。
+			co.Warn("查询群原始 SpaceID 失败，跳过 conversation-level SpaceID 回填",
+				zap.Error(rawErr))
+		} else {
+			for _, g := range rawGroups {
+				if g == nil {
+					continue
+				}
+				rawGroupSpaceMap[g.GroupNo] = g.SpaceID
+			}
+		}
+	}
+
 	// ---------- 群组分类  ----------
 	groupCategoryMap := map[string]*GroupCategorySetting{}
 	if len(groupNos) > 0 {
@@ -707,8 +736,14 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	// 群聊的 channel_id 是裸 group_no，newSyncUserConversationResp 走
 	// ParseChannelID 拿不到 SpaceID；客户端 WebSocket 收到群消息时若
 	// 没有 conversation-level 的 SpaceID 兜底，就会 fail-open 把消息
-	// 渲染到错误 Space tab。这里用 handler 早已批量查好的 groupMap +
+	// 渲染到错误 Space tab。这里用 handler 早已批量查好的 rawGroupSpaceMap +
 	// externalGroupMap 一次性补齐，避免客户端再发请求。
+	//
+	// Round-3 修复 (GH octo-server#154 Round-2)：
+	//   - SpaceID 走 rawGroupSpaceMap（GetGroups 原始值），不用 groupMap
+	//     （GetGroupDetails 已被 SetEffectiveSpaceID 改写）→ Finding 1。
+	//   - 把 defaultSpaceID 传入用于 MySourceSpaceID 空值兜底（旧外部成员行
+	//     source_space_id=""），与 decideConvKeepInSpace 同口径 → Finding 2。
 	externalGroupMap, externalErr := co.groupDB.QueryExternalGroupNosForUser(loginUID)
 	if externalErr != nil {
 		// 非致命：缺失 my_source_space_id 不影响 conversation-level
@@ -717,7 +752,11 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 		co.Warn("查询外部群失败，跳过 my_source_space_id 回填", zap.Error(externalErr))
 		externalGroupMap = make(map[string]string)
 	}
-	fillConversationSpaceIDs(syncUserConversationResps, groupMap, externalGroupMap)
+	// defaultSpaceID 用于外部群 source_space_id="" 的空值兜底。
+	// 查询失败时返回空串，fillConversationSpaceIDs 自然退化为不写
+	// MySourceSpaceID —— omitempty 保持向后兼容。
+	defaultSpaceID := space.GetUserDefaultSpaceID(co.ctx, loginUID)
+	fillConversationSpaceIDs(syncUserConversationResps, rawGroupSpaceMap, externalGroupMap, defaultSpaceID)
 
 	// 查询通话中的频道
 	// 加入的群聊
@@ -1423,20 +1462,35 @@ type threadMetaResp struct {
 //     被错误渲染到当前 tab，构成 P1 信息泄漏（issue #153）。
 //
 // 回填规则：
-//   - GROUP: SpaceID = groupMap[channelID].SpaceID（group 表权威值）。
-//     用户作为外部成员加入时，再读 externalGroupMap 给 MySourceSpaceID 赋值。
+//   - GROUP: SpaceID = rawGroupSpaceMap[channelID]（group 表权威值，未经
+//     SetEffectiveSpaceID 改写）。用户作为外部成员加入时，再读 externalGroupMap
+//     给 MySourceSpaceID 赋值。
 //   - COMMUNITY_TOPIC: SpaceID = parent group 的 SpaceID（与 FilterRawConversationsBySpace
 //     thread 分支的 fail-closed 同口径）。MySourceSpaceID 同样从 parent groupNo 取。
 //   - PERSON: 不动 —— 私聊的 Space 归属在消息级 payload.space_id 上，
 //     conversation 级别保持空，避免误把 DM 锁定到某个 Space。
 //
-// groupMap / externalGroupMap 都是 handler 已经查过的现成数据，本函数纯内存
-// 操作，不发任何 DB 请求。groupMap 缺失（如 thread 父群本批未活跃）时跳过该条
+// Round-3 修复 (GH octo-server#154 Round-2 Finding 1)：
+//   - 之前传 groupMap (来自 GetGroupDetails) 的版本会被 SetEffectiveSpaceIDFromMap
+//     污染：外部成员视角下 group.SpaceID 已被改写成 source Space，导致
+//     SyncUserConversationResp.SpaceID 与 MySourceSpaceID 同值。响应契约要求
+//     SpaceID 是群表权威值，handler 必须额外用 GetGroups 拿原始 space_id 构建
+//     rawGroupSpaceMap 传入。
+//
+// Round-3 修复 (GH octo-server#154 Round-2 Finding 2)：
+//   - externalGroupMap[groupNo] 可能存在但值为空串（旧外部成员行
+//     source_space_id=""）。空串 + omitempty 会让客户端拿不到 my_source_space_id，
+//     无法判断外部群在哪个 Space 下可见。空值兜底到 defaultSpaceID，与
+//     decideConvKeepInSpace 同口径。
+//
+// rawGroupSpaceMap / externalGroupMap 都是 handler 已经查过的现成数据，本函数
+// 纯内存操作，不发任何 DB 请求。map 缺失（如 thread 父群本批未活跃）时跳过该条
 // —— 客户端拿到空 SpaceID 会自己降级，比写错的值更安全。
 func fillConversationSpaceIDs(
 	resps []*SyncUserConversationResp,
-	groupMap map[string]*group.GroupResp,
+	rawGroupSpaceMap map[string]string,
 	externalGroupMap map[string]string,
+	defaultSpaceID string,
 ) {
 	for _, r := range resps {
 		if r == nil {
@@ -1444,29 +1498,42 @@ func fillConversationSpaceIDs(
 		}
 		switch r.ChannelType {
 		case common.ChannelTypeGroup.Uint8():
-			if g, ok := groupMap[r.ChannelID]; ok && g != nil {
+			if sid, ok := rawGroupSpaceMap[r.ChannelID]; ok {
 				if r.SpaceID == "" {
-					r.SpaceID = g.SpaceID
+					r.SpaceID = sid
 				}
 			}
 			if src, ok := externalGroupMap[r.ChannelID]; ok {
-				r.MySourceSpaceID = src
+				r.MySourceSpaceID = resolveMySourceSpaceID(src, defaultSpaceID)
 			}
 		case common.ChannelTypeCommunityTopic.Uint8():
 			parentNo, _, perr := thread.ParseChannelID(r.ChannelID)
 			if perr != nil {
 				continue
 			}
-			if g, ok := groupMap[parentNo]; ok && g != nil {
+			if sid, ok := rawGroupSpaceMap[parentNo]; ok {
 				if r.SpaceID == "" {
-					r.SpaceID = g.SpaceID
+					r.SpaceID = sid
 				}
 			}
 			if src, ok := externalGroupMap[parentNo]; ok {
-				r.MySourceSpaceID = src
+				r.MySourceSpaceID = resolveMySourceSpaceID(src, defaultSpaceID)
 			}
 		}
 	}
+}
+
+// resolveMySourceSpaceID 把 externalGroupMap 的 source_space_id 解析为客户端实际
+// 可见的 Space：
+//   - 非空：直接返回。
+//   - 空串（旧外部成员行 source_space_id=""）：兜底到 defaultSpaceID
+//     （decideConvKeepInSpace 同口径，space_filter.go:171/234）。defaultSpaceID
+//     也是空时回退到空串——保持 omitempty 行为，与历史一致。
+func resolveMySourceSpaceID(sourceSpaceID, defaultSpaceID string) string {
+	if sourceSpaceID != "" {
+		return sourceSpaceID
+	}
+	return defaultSpaceID
 }
 
 // fillThreadMeta 批量填充子区会话的元数据
