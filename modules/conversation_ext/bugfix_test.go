@@ -620,3 +620,80 @@ func TestDB_ClearAutoFollowThreadsTx_EmptyInput_NoOp(t *testing.T) {
 		"empty spaceID is a no-op")
 	require.NoError(t, tx.Commit())
 }
+
+// RestoreAutoFollowThreadsTx is the symmetric counterpart — verify the same
+// contract surface but for the =1 side of the lifecycle.
+
+func TestDB_RestoreAutoFollowThreadsTx_RestoresClearedRow(t *testing.T) {
+	db := newDBForTest(t)
+	const uid, space = "u1", "s1"
+
+	// Simulate the post-move-out state: row exists but auto_follow_threads=0.
+	require.NoError(t, db.Upsert(uid, space, targetTypeGroup, "g-restore", ConvExtFields{
+		AutoFollowThreads: int8Ptr(0),
+		GroupUnfollowed:   int8Ptr(0),
+		FollowSort:        intPtr(3),
+	}))
+
+	tx, err := db.session.Begin()
+	require.NoError(t, err)
+	defer tx.RollbackUnlessCommitted()
+	require.NoError(t, RestoreAutoFollowThreadsTx(tx, uid, space, []string{"g-restore"}))
+	require.NoError(t, tx.Commit())
+
+	m, err := db.Get(uid, space, targetTypeGroup, "g-restore")
+	require.NoError(t, err)
+	require.NotNil(t, m)
+	assert.Equal(t, int8(1), m.AutoFollowThreads,
+		"auto_follow_threads must be restored to 1")
+	assert.Equal(t, int8(0), m.GroupUnfollowed,
+		"group_unfollowed must NOT be touched — restore is symmetric to clear, "+
+			"only the auto-subscribe flag changes")
+	assert.Equal(t, 3, m.FollowSort,
+		"follow_sort must be preserved")
+}
+
+func TestDB_RestoreAutoFollowThreadsTx_NoRow_NoOp(t *testing.T) {
+	db := newDBForTest(t)
+	tx, err := db.session.Begin()
+	require.NoError(t, err)
+	defer tx.RollbackUnlessCommitted()
+	// First-time-into-category case: no ext row yet.  Restore must NOT
+	// create a row — sidebar materialization is the canonical creation
+	// site; the move-in handler must stay strictly UPDATE so the two
+	// sites cannot race on the unique key.
+	require.NoError(t, RestoreAutoFollowThreadsTx(tx, "u-fresh", "s1", []string{"g-fresh"}))
+	require.NoError(t, tx.Commit())
+
+	m, err := db.Get("u-fresh", "s1", targetTypeGroup, "g-fresh")
+	require.NoError(t, err)
+	assert.Nil(t, m, "no row may be created — restore is strictly UPDATE")
+}
+
+func TestDB_RestoreAutoFollowThreadsTx_LeavesUnrelatedRowsAlone(t *testing.T) {
+	db := newDBForTest(t)
+	const uid, space = "u1", "s1"
+
+	// Two rows in scope, one out of scope (different target_id).
+	require.NoError(t, db.Upsert(uid, space, targetTypeGroup, "g-a", ConvExtFields{AutoFollowThreads: int8Ptr(0)}))
+	require.NoError(t, db.Upsert(uid, space, targetTypeGroup, "g-b", ConvExtFields{AutoFollowThreads: int8Ptr(0)}))
+	require.NoError(t, db.Upsert(uid, space, targetTypeGroup, "g-keep", ConvExtFields{AutoFollowThreads: int8Ptr(0)}))
+
+	tx, err := db.session.Begin()
+	require.NoError(t, err)
+	defer tx.RollbackUnlessCommitted()
+	require.NoError(t, RestoreAutoFollowThreadsTx(tx, uid, space, []string{"g-a", "g-b"}))
+	require.NoError(t, tx.Commit())
+
+	for _, id := range []string{"g-a", "g-b"} {
+		m, err := db.Get(uid, space, targetTypeGroup, id)
+		require.NoError(t, err)
+		require.NotNil(t, m)
+		assert.Equal(t, int8(1), m.AutoFollowThreads, "row %q restored", id)
+	}
+	mk, err := db.Get(uid, space, targetTypeGroup, "g-keep")
+	require.NoError(t, err)
+	require.NotNil(t, mk)
+	assert.Equal(t, int8(0), mk.AutoFollowThreads,
+		"row not in groupNos list must NOT be touched")
+}

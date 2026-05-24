@@ -638,29 +638,47 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 		}
 	}
 
-	// Issue #151 review #3 — when this transition takes the group OUT of any
-	// category (categoryIDPtr == nil), clear the materialized
-	// auto_follow_threads flag on the corresponding user_conversation_ext row.
-	// Otherwise OnThreadCreated's fan-out filter would continue to target this
-	// user for new threads in a group that has just left the follow tab —
-	// the read side (buildFollowItems) drops the group because CategoryID is
-	// now nil, but the write side (selectEligibleForFanoutTx) only looks at
-	// auto_follow_threads.  Without this cleanup the two sides drift.
+	// Project-wide lock order is group_setting → user_follow_version →
+	// user_conversation_ext (matches UpdateSort, FollowChannel, UnfollowGroupsTx,
+	// deleteCategory).  Bump version BEFORE writing ext: otherwise a concurrent
+	// /v1/follow/sort holding the version FOR UPDATE while waiting on ext
+	// would AB-BA-deadlock against a move-out holding ext while waiting on
+	// version (issue #151 review #4 by an9xyz).
+	if _, err := convext.BumpFollowVersionTx(tx, loginUID, groupSpaceID); err != nil {
+		c.Error("更新 follow_version 失败", zap.Error(err))
+		ctx.ResponseError(errors.New("更新群设置失败"))
+		return
+	}
+
+	// Issue #151 review #3/#4 — synchronize user_conversation_ext.auto_follow_threads
+	// with the new category membership state.  buildFollowItems decides follow-tab
+	// membership by `cs.CategoryID != nil`; selectEligibleForFanoutTx decides
+	// OnThreadCreated fan-out by `auto_follow_threads=1 AND group_unfollowed=0`.
+	// These two reads share no column, so the writer (this handler) must keep
+	// them in lockstep:
 	//
-	// Category-to-category move (req.CategoryID != "") preserves the implicit
-	// follow and therefore preserves auto_follow_threads — no cleanup needed.
+	//   - Move-out (categoryIDPtr == nil): clear auto_follow_threads to match
+	//     the new "not in follow tab" state.  Without this, fan-out continues
+	//     to target a user whose follow tab no longer shows the group.
+	//   - Move-in (categoryIDPtr != nil): restore auto_follow_threads=1 if
+	//     an ext row already exists with =0 (left over from a prior move-out).
+	//     Sidebar materialization (api_sidebar.go) skips its INSERT IGNORE
+	//     when the ext row is already present, so without this restore the
+	//     group re-appears in the follow tab but fan-out stays disabled.
+	//     For first-time categorize (no ext row) the call is a no-op —
+	//     sidebar materialization later creates the row with =1.
 	if categoryIDPtr == nil {
 		if err := convext.ClearAutoFollowThreadsTx(tx, loginUID, groupSpaceID, []string{groupNo}); err != nil {
 			c.Error("清理 auto_follow_threads 失败", zap.Error(err))
 			ctx.ResponseError(errors.New("更新群设置失败"))
 			return
 		}
-	}
-
-	if _, err := convext.BumpFollowVersionTx(tx, loginUID, groupSpaceID); err != nil {
-		c.Error("更新 follow_version 失败", zap.Error(err))
-		ctx.ResponseError(errors.New("更新群设置失败"))
-		return
+	} else {
+		if err := convext.RestoreAutoFollowThreadsTx(tx, loginUID, groupSpaceID, []string{groupNo}); err != nil {
+			c.Error("恢复 auto_follow_threads 失败", zap.Error(err))
+			ctx.ResponseError(errors.New("更新群设置失败"))
+			return
+		}
 	}
 
 	if err := tx.Commit(); err != nil {

@@ -362,6 +362,47 @@ func (d *DB) UpdateSort(uid, spaceID string, items []SortItem, expectedVersion i
 	return nil
 }
 
+// RestoreAutoFollowThreadsTx is the move-back counterpart of
+// ClearAutoFollowThreadsTx.  It sets auto_follow_threads=1 on the
+// (uid, space_id, target_type=2, group_no) ext rows in groupNos that exist,
+// silently skipping any that don't.  Idempotent; safe to call when no row
+// has been materialized (sidebar.Sync's later MaterializeDefaultFollowedGroups
+// call will create the row with auto_follow_threads=1 anyway).
+//
+// Why it exists (issue #151 review #4 by an9xyz): the lifecycle is symmetric:
+// materialize on first follow-tab read sets =1; move-out clears to 0;
+// move-back-into-a-category must restore =1, otherwise the sidebar
+// materialization branch sees the existing groupExts entry (with =0) and
+// skips its INSERT IGNORE.  The user re-categorizes the group, the group
+// re-appears in the follow tab via buildFollowItems, but OnThreadCreated's
+// fan-out filter (auto_follow_threads=1 AND group_unfollowed=0) still
+// excludes them — phantom missing fan-out.
+//
+// Like Clear, this helper does NOT touch group_unfollowed (the user's
+// explicit unfollow choice is preserved across category churn) and does NOT
+// bump user_follow_version (caller's surrounding category change already
+// bumps once).
+//
+// Callers in scope: modules/category moveGroupToCategory move-in branch
+// (req.CategoryID != ""), including first-time categorize (no row yet,
+// no-op here, sidebar materializes later) and A→B category move (row exists
+// with =1 already, no-op effectively).  The single common path simplifies
+// reasoning and removes the temptation to branch on subcases.
+func RestoreAutoFollowThreadsTx(tx *dbr.Tx, uid, spaceID string, groupNos []string) error {
+	if uid == "" || spaceID == "" || len(groupNos) == 0 {
+		return nil
+	}
+	_, err := tx.UpdateBySql(
+		"UPDATE "+table+" SET auto_follow_threads=1"+
+			" WHERE uid=? AND space_id=? AND target_type=? AND target_id IN ?",
+		uid, spaceID, targetTypeGroup, groupNos,
+	).Exec()
+	if err != nil {
+		return fmt.Errorf("restore auto_follow_threads: %w", err)
+	}
+	return nil
+}
+
 // ClearAutoFollowThreadsTx is the cleanup counterpart of
 // MaterializeDefaultFollowedGroups.  It sets auto_follow_threads=0 on the
 // (uid, space_id, target_type=2, group_no) ext rows in groupNos that exist,

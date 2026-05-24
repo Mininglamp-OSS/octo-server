@@ -598,6 +598,117 @@ func TestCategory_MoveGroupBetweenCategories_PreservesAutoFollowThreads(t *testi
 			"still in the follow tab, just under a different category")
 }
 
+// TestCategory_MoveGroupBackIntoCategory_RestoresAutoFollowThreads pins
+// issue #151 review #4 (an9xyz) symptom #1: a default-followed group that
+// has been materialized and then moved out must have auto_follow_threads
+// restored to 1 when it is moved back into any category.  Otherwise the
+// sidebar materialization branch skips the existing groupExts entry,
+// the group reappears in the follow tab via buildFollowItems, but
+// selectEligibleForFanoutTx still excludes the user (=0) — phantom missing
+// fan-out.
+func TestCategory_MoveGroupBackIntoCategory_RestoresAutoFollowThreads(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+	resetUIDRateLimit(t, ctx)
+
+	spaceID := "space-move-back-001"
+	seedSpaceAndMember(t, f, spaceID, 0)
+	route := s.GetRoute()
+
+	wc := createCategory(t, route, spaceID, "工作")
+	require.Equal(t, http.StatusOK, wc.Code)
+	catID := parseJSON(t, wc)["category_id"].(string)
+
+	groupNo := "group-move-back-001"
+	seedGroup(t, f, groupNo, spaceID)
+
+	// Cycle: move into category → simulate sidebar materialization → move
+	// out (clears auto_follow_threads) → move back into the SAME category.
+	require.Equal(t, http.StatusOK, doRequest(t, route, "PUT", "/v1/groups/"+groupNo+"/category", map[string]string{"category_id": catID}).Code)
+	_, err = f.db.session.InsertBySql(
+		"INSERT INTO user_conversation_ext (uid, space_id, target_type, target_id, group_unfollowed, auto_follow_threads) "+
+			"VALUES (?, ?, 2, ?, 0, 1)",
+		testutil.UID, spaceID, groupNo,
+	).Exec()
+	require.NoError(t, err, "simulate sidebar materialization")
+	require.Equal(t, http.StatusOK, doRequest(t, route, "PUT", "/v1/groups/"+groupNo+"/category", map[string]string{"category_id": ""}).Code,
+		"move out — must clear auto_follow_threads")
+
+	var afterOut int
+	_, err = f.db.session.SelectBySql(
+		"SELECT auto_follow_threads FROM user_conversation_ext"+
+			" WHERE uid=? AND space_id=? AND target_type=2 AND target_id=?",
+		testutil.UID, spaceID, groupNo,
+	).Load(&afterOut)
+	require.NoError(t, err)
+	require.Equal(t, 0, afterOut, "precondition: move-out cleared auto_follow_threads")
+
+	// Move BACK into the same category.  Sidebar materialization would skip
+	// this row (groupExts hit), so the move-in path itself must restore =1.
+	require.Equal(t, http.StatusOK, doRequest(t, route, "PUT", "/v1/groups/"+groupNo+"/category", map[string]string{"category_id": catID}).Code)
+
+	var afterIn int
+	_, err = f.db.session.SelectBySql(
+		"SELECT auto_follow_threads FROM user_conversation_ext"+
+			" WHERE uid=? AND space_id=? AND target_type=2 AND target_id=?",
+		testutil.UID, spaceID, groupNo,
+	).Load(&afterIn)
+	require.NoError(t, err)
+	assert.Equal(t, 1, afterIn,
+		"move-in must restore auto_follow_threads=1 on an existing ext row "+
+			"(issue #151 review #4 symptom #1); sidebar materialization would "+
+			"otherwise skip the existing row, leaving OnThreadCreated fan-out "+
+			"disabled even though the group is back in the follow tab")
+}
+
+// TestCategory_MoveFirstTimeIntoCategory_NoOpRestore ensures the move-in
+// restore call is a safe no-op when no ext row has been materialized yet —
+// sidebar materialization at the next /v1/sidebar/sync creates the row with
+// auto_follow_threads=1 anyway, and the move-in handler must not
+// short-circuit any subsequent paths or write inappropriate rows.
+func TestCategory_MoveFirstTimeIntoCategory_NoOpRestore(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+	resetUIDRateLimit(t, ctx)
+
+	spaceID := "space-move-first-001"
+	seedSpaceAndMember(t, f, spaceID, 0)
+	route := s.GetRoute()
+
+	wc := createCategory(t, route, spaceID, "工作")
+	require.Equal(t, http.StatusOK, wc.Code)
+	catID := parseJSON(t, wc)["category_id"].(string)
+
+	groupNo := "group-move-first-001"
+	seedGroup(t, f, groupNo, spaceID)
+
+	// Move into category for the first time — no ext row exists yet.
+	require.Equal(t, http.StatusOK, doRequest(t, route, "PUT", "/v1/groups/"+groupNo+"/category", map[string]string{"category_id": catID}).Code)
+
+	// No row should have been written by the move-in path — sidebar's
+	// MaterializeDefaultFollowedGroups is the canonical materialization site
+	// and stays solely responsible for creating ext rows.  Letting the
+	// move-in path INSERT here would race with the unique key and silently
+	// pick whichever flag set ends up committing first.
+	var count int
+	_, err = f.db.session.SelectBySql(
+		"SELECT COUNT(*) FROM user_conversation_ext"+
+			" WHERE uid=? AND space_id=? AND target_type=2 AND target_id=?",
+		testutil.UID, spaceID, groupNo,
+	).Load(&count)
+	require.NoError(t, err)
+	assert.Equal(t, 0, count,
+		"first-time move-in must NOT create an ext row — sidebar materialization "+
+			"is the single materialization site; RestoreAutoFollowThreadsTx is "+
+			"strictly UPDATE")
+}
+
 // ---------- Validation / Error Tests ----------
 
 func TestCategory_CreateLimit(t *testing.T) {
