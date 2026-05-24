@@ -33,7 +33,20 @@ func newGroupCategoryDB(ctx *config.Context) *groupCategoryDB {
 //     （sidebar 排序时作为二级 key，不暴露给客户端，避免破坏现有 schema）。
 type GroupCategorySetting struct {
 	GroupNo string
-	// CategoryID 是 group_setting.category_id —— 用户给该群指定的类别 ID。
+	// CategoryID 是 "live" category id —— 已经过 group_category.status != 2
+	// 过滤。NULL 含义统一为"该群当前未分类"，同时覆盖三种数据情况：
+	//   (a) group_setting 行不存在 category_id（用户从未分配）；
+	//   (b) group_setting.category_id 指向已被软删的 category
+	//       （TOCTOU race 残留 / category_cleanup 未跑）；
+	//   (c) group_setting.category_id 指向根本不存在的 category（异常残留）。
+	// 三种情况下游一律按"未分类"处理 —— sidebar 不展示在 follow tab、
+	// 物化路径不写 ext 行、API 不向客户端暴露 dangling id。这是 follow-tab
+	// 整套机制（issue #151）依赖的 schema-app 不变量：sidebar 显示 / 物化 /
+	// /v1/follow/sort 鉴权三处都按这个语义统一判定，不再有 stale-id 暴露。
+	//
+	// 实现上 SELECT 必须取 gc.category_id（JOIN 出来的字段），不是 gs.category_id
+	// （持久化的 stale 字段）—— 二者只在 JOIN 命中时相等，JOIN miss（status=2 或
+	// gc 不存在）时 gc.category_id 自然为 NULL，恰好对应 (b)(c) 两种 dangling 情况。
 	CategoryID *string
 	// CategorySort 是 group_setting.category_sort —— 类别内排序（v1 兼容字段，
 	// v1 API_conversation 直接回显该值，故保留语义不变）。
@@ -45,26 +58,33 @@ type GroupCategorySetting struct {
 
 // QueryCategorySettingsByGroupNos 批量查询群组的分类设置。
 //
-// 用 LEFT JOIN group_category：当用户改了 group_setting.category_id 但目标分类
-// 已删除时（gc.category_id IS NULL），CategoryGroupSort 退回到 0，
-// 与 LEFT JOIN 的 NULL 一致；客户端把该群当作"未分类"展示。
+// 用 LEFT JOIN group_category：保留所有 gs 行（包括未分类的、指向已删 category
+// 的），让 sidebar 能在一次查询里同时拿到分类内排序（gs.category_sort）和分类
+// 之间排序（gc.sort）；JOIN miss 走 IFNULL 退回 0，无需第二次查询。
 //
 // JOIN 谓词同时绑定 `gc.uid = gs.uid`（PR #21 Round-4 review I4 by yujiawei）：
 // 虽然 group_category.category_id 当前是全局唯一、且应只被 owner 的 group_setting
 // 引用，但 LEFT JOIN 只匹配 category_id 时这条不变量是 *结构上未强制* 的隐式约束。
 // 显式加 uid 谓词把约束变成 JOIN 自身的属性，避免未来 schema 演进（例如允许
 // 跨用户共享 category）时静默走 stale category_group_sort=0 分支。
+//
+// SELECT gc.category_id 而非 gs.category_id（issue #151 review fix）：
+// gs.category_id 是持久化字段，category 被软删后这里仍保留 stale 值（cleanup
+// 路径会清，但 TOCTOU race 可能产生 dangling — modules/category 的
+// MoveGroupToCategory_TOCTOU_DanglingReference 测试明确承认这种状态合法存在）。
+// 取 JOIN 后的 gc.category_id：JOIN miss（gc.status=2 或 gc 不存在）时为 NULL，
+// 恰好让 GroupCategorySetting.CategoryID 反映 "live" 语义。下游 buildFollowItems
+// 和 sidebar 物化路径的 cs.CategoryID == nil → 跳过 都自动获得正确语义，
+// 不再让 dangling category 的群进入 follow tab 或被物化（issue #151 review
+// blocker — 之前 SELECT gs.category_id 让 sidebar 物化路径绕过软删校验）。
 func (d *groupCategoryDB) QueryCategorySettingsByGroupNos(groupNos []string, uid string) ([]*GroupCategorySetting, error) {
 	if len(groupNos) == 0 {
 		return nil, nil
 	}
 	var results []*GroupCategorySetting
-	// JOIN 谓词除了 (gs.category_id, gs.uid) 双绑定外，还加 gc.status != 2
-	// （PR #21 Round-6 P1 by yujiawei）：defense-in-depth，避免任何意外指向软删
-	// 分类的 group_setting 行从 gc.sort 拿到 stale 值而不是走 LEFT JOIN miss 退到 0。
 	_, err := d.session.Select(
 		"gs.group_no",
-		"gs.category_id",
+		"gc.category_id",
 		"IFNULL(gs.category_sort, 0) AS category_sort",
 		"IFNULL(gc.sort, 0) AS category_group_sort",
 	).
@@ -115,18 +135,21 @@ func (d *groupCategoryDB) QueryCategorySortsByIDs(categoryIDs []string, uid stri
 // modules/conversation_ext/service.go DefaultFollowedGroupGuard for why this
 // gate exists (issue #151 code review #1).
 //
-// INNER JOIN group_category (with gc.status != 2) is the same defense-in-depth
-// pattern QueryCategorySettingsByGroupNos already applies (line 72 of this
-// file): a soft-deleted category leaves the original group_setting.category_id
-// pointing at gc.status=2, which sidebar's LEFT JOIN treats as "no category"
-// and excludes from the follow tab.  Without the JOIN here, Stage 1 would let
-// those stale rows through, Stage 2 would then materialize an
-// auto_follow_threads=1 row for a group the user's sidebar never even shows —
-// phantom fanout (issue #151 code review #3 / re-review H1).
+// Same "live category" predicate as QueryCategorySettingsByGroupNos above,
+// expressed as INNER JOIN rather than LEFT JOIN:
 //
-// The JOIN's `gc.uid = gs.uid` predicate matches QueryCategorySettingsByGroupNos
-// — protects against future schema evolution that allows category sharing
-// across users.
+//   - QueryCategorySettingsByGroupNos: LEFT JOIN, preserves uncategorized
+//     rows so sidebar can render them with CategoryID=nil + CategoryGroupSort=0.
+//   - FilterDefaultFollowedGroups (here): INNER JOIN, drops uncategorized
+//     rows entirely because the guard only needs to know "is this group
+//     live-categorized for this user" (boolean), not surface "no" rows.
+//
+// Both queries are the same schema-app invariant ("CategoryID is live IFF
+// gc.status != 2"), expressed for two consumer shapes.  Keep the JOIN
+// predicates in lockstep — diverging means one entry point would silently
+// admit dangling refs the other rejects.  The `gc.uid = gs.uid` binding
+// matches QueryCategorySettingsByGroupNos: protects against future schema
+// evolution that allows category sharing across users.
 //
 // Returns an empty slice if no candidate matches.  Callers must NOT assume the
 // result preserves input order.

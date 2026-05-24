@@ -26,6 +26,27 @@ func (d *categoryDB) updateGroupSettingCategory(id int64, categoryID *string, ca
 	return err
 }
 
+// queryUserGroupsInSpace returns the user's groups in the given Space, each
+// annotated with the category_id the user has assigned (NULL if uncategorized).
+//
+// KNOWN ISSUE (issue #151 follow-up, NOT addressed in this PR): the SELECT
+// returns gs.category_id (the persisted field) without joining group_category.
+// If the user soft-deleted the assigned category before category_cleanup ran,
+// or a TOCTOU race produced a dangling reference (see
+// MoveGroupToCategory_TOCTOU_DanglingReference test in this module), this
+// query returns the stale category_id to the caller — the /category list API
+// then shows the group nested under a category that no longer exists, and the
+// client may use that id in a follow-up call which silently fails.
+//
+// Fix is the same shape as modules/message/db_group_category.go
+// QueryCategorySettingsByGroupNos: INNER/LEFT JOIN group_category gc ON
+// (gs.category_id, gs.uid) AND gc.status != 2, then SELECT gc.category_id so
+// dangling refs surface as NULL.  Out of scope here because:
+//   (a) issue #151 is scoped to the follow tab / sidebar materialization;
+//   (b) the API consumer of this function may rely on stale ids to render the
+//       "uncategorize-after-delete" affordance — needs PM input before
+//       changing user-visible behaviour.
+// Track this as a follow-up; see PR description for rationale.
 func (d *categoryDB) queryUserGroupsInSpace(uid, spaceID string) ([]*userGroupInfo, error) {
 	var results []*userGroupInfo
 	_, err := d.session.SelectBySql(`

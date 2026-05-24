@@ -550,3 +550,129 @@ func TestIntegration_Sidebar_FollowTab_MaterializesDefaultFollowedGroup(t *testi
 	assert.Equal(t, int8(0), post.GroupUnfollowed,
 		"materialized row must have group_unfollowed=0")
 }
+
+// ---------------------------------------------------------------------------
+// Scene 7h: issue #151 review blocker (Jerry-Xin / lml2468) — sidebar must
+// NOT materialize a group whose group_setting.category_id points at a
+// soft-deleted group_category (status=2).
+//
+// Before fix: QueryCategorySettingsByGroupNos selected gs.category_id (the
+// stale persisted field).  Even though the LEFT JOIN had `gc.status != 2`,
+// that predicate only nullifies the JOIN-side columns (gc.sort → 0 via
+// IFNULL); the SELECT still returned the stale gs.category_id.  buildFollow-
+// Items checked `cs.CategoryID == nil` to filter, which was always FALSE for
+// a soft-deleted category — the group still entered the follow tab AND the
+// new sidebar materialization branch wrote an auto_follow_threads=1 ext row.
+// Subsequent OnThreadCreated would then fan out threads of a group whose
+// category lookup model treats as "not followed any more" — phantom
+// subscription.
+//
+// After fix: QueryCategorySettingsByGroupNos selects gc.category_id (the
+// JOIN-side column).  A soft-deleted category → JOIN miss → CategoryID=nil
+// → buildFollowItems excludes the group → the materialization loop never
+// sees it.  This test exercises the full chain against real
+// group_setting + group_category rows.
+// ---------------------------------------------------------------------------
+
+func TestIntegration_Sidebar_FollowTab_DoesNotMaterializeSoftDeletedCategoryGroup(t *testing.T) {
+	ctx := newSidebarIntegCtx(t)
+	cleanConvExtTable(t, ctx)
+	ensureSidebarSoftDeletedCategoryTables(t, ctx)
+	cleanSidebarSoftDeletedCategoryRows(t, ctx)
+
+	const (
+		uid           = "s7h-uid"
+		space         = "s7h-space"
+		groupNo       = "s7h-grp"
+		softDeletedID = "s7h-cat-deleted"
+	)
+
+	// Seed: user has assigned group → soft-deleted category.  gs.category_id
+	// is non-NULL but the underlying gc row has status=2.
+	_, err := ctx.DB().Exec(
+		"INSERT INTO group_category (category_id, space_id, uid, name, sort, status) "+
+			"VALUES (?, ?, ?, ?, 0, 2)",
+		softDeletedID, "", uid, "deleted cat",
+	)
+	require.NoError(t, err, "seed soft-deleted category")
+	_, err = ctx.DB().Exec(
+		"INSERT INTO group_setting (uid, group_no, category_id) VALUES (?, ?, ?)",
+		uid, groupNo, softDeletedID,
+	)
+	require.NoError(t, err, "seed group_setting pointing at soft-deleted category")
+
+	// Stage A — QueryCategorySettingsByGroupNos must return CategoryID=nil.
+	db := newGroupCategoryDB(ctx)
+	settings, err := db.QueryCategorySettingsByGroupNos([]string{groupNo}, uid)
+	require.NoError(t, err)
+	require.Len(t, settings, 1,
+		"row must still surface (sidebar needs intraCategorySort even for uncategorized groups)")
+	assert.Nil(t, settings[0].CategoryID,
+		"CategoryID must be nil for a group whose group_setting points at a "+
+			"soft-deleted category — issue #151 review blocker")
+
+	// Stage B — buildFollowItems must drop this group from the follow tab.
+	categorySetting := map[string]*GroupCategorySetting{
+		groupNo: settings[0],
+	}
+	stubConvs := []*config.SyncUserConversationResp{
+		{ChannelID: groupNo, ChannelType: common.ChannelTypeGroup.Uint8(), Timestamp: 100},
+	}
+	items := buildFollowItems(stubConvs, categorySetting, nil, nil, nil, nil, nil, nil, nil, "")
+	assert.Empty(t, items,
+		"buildFollowItems must NOT include groups with a soft-deleted category; "+
+			"otherwise they'd be displayed and then materialized via the "+
+			"sidebar materialization loop")
+
+	// Stage C — end-to-end check: even if a future regression somehow
+	// surfaced the group into the materialization candidate set, the
+	// MaterializeDefaultFollowedGroups call would still write the row (it is
+	// not gated for sidebar callers, by design — see api_sidebar.go comment).
+	// So the real defense lives at Stages A+B above.  Pin that with a
+	// no-ext-row assertion against the conv_ext DB.
+	convDB := convext.NewDB(ctx)
+	row, err := convDB.Get(uid, space, 2 /* Group */, groupNo)
+	require.NoError(t, err)
+	assert.Nil(t, row,
+		"no ext row may be written for the soft-deleted-category group "+
+			"(verified end-to-end: sidebar dropped it at Stage B, so the "+
+			"materialization branch never saw it)")
+}
+
+// ensureSidebarSoftDeletedCategoryTables creates the minimal group_setting
+// schema the Scene 7h regression needs.  conv_ext_test ships with
+// group_category but not group_setting; this helper adds it once (idempotent
+// via DROP+CREATE so the COLLATE pin can evolve safely).
+//
+// Reuses the same COLLATE workaround as the guard E2E test
+// (default_followed_group_guard_e2e_test.go) — issue #150 forward-repair
+// migration isn't in this test database.
+func ensureSidebarSoftDeletedCategoryTables(t *testing.T, ctx *config.Context) {
+	t.Helper()
+	_, err := ctx.DB().Exec("DROP TABLE IF EXISTS group_setting")
+	require.NoError(t, err)
+	_, err = ctx.DB().Exec(
+		"CREATE TABLE group_setting (" +
+			"  id INT NOT NULL AUTO_INCREMENT PRIMARY KEY," +
+			"  uid VARCHAR(40) NOT NULL DEFAULT ''," +
+			"  group_no VARCHAR(40) NOT NULL DEFAULT ''," +
+			"  category_id VARCHAR(32) COLLATE utf8mb4_general_ci DEFAULT NULL," +
+			"  category_sort INT NOT NULL DEFAULT 0," +
+			"  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP," +
+			"  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP," +
+			"  UNIQUE KEY uk_uid_groupno (uid, group_no)" +
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+	)
+	require.NoError(t, err)
+}
+
+// cleanSidebarSoftDeletedCategoryRows wipes only Scene 7h's data.  Scope by
+// uid prefix to keep the shared conv_ext_test database safe when other
+// integration tests run in parallel (same rationale as the guard E2E test).
+func cleanSidebarSoftDeletedCategoryRows(t *testing.T, ctx *config.Context) {
+	t.Helper()
+	for _, tbl := range []string{"group_setting", "group_category"} {
+		_, err := ctx.DB().Exec("DELETE FROM "+tbl+" WHERE uid LIKE ?", "s7h-%")
+		require.NoError(t, err, "clean %s rows", tbl)
+	}
+}
