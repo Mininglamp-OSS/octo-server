@@ -9,12 +9,37 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	convext "github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
+	redis "github.com/go-redis/redis"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+// resetUIDRateLimit clears the per-uid token-bucket keys
+// (ratelimit:uid:{uid}) so subsequent HTTP calls in this test start from a
+// full bucket.  Without this, tests that came earlier in the same go test
+// binary will have consumed tokens, and a later high-burst test (e.g.
+// TestCategory_CreateLimit, which makes 20+ category POSTs back-to-back)
+// fails with HTTP 429 even though the per-test logic is correct.  See
+// pkg/wkhttp/ratelimit_helper.go SharedUIDRateLimiter for the bucket key
+// scheme.  Pattern mirrors modules/space/api_email_invite_public_test.go's
+// resetSpaceInviteRateLimit.
+func resetUIDRateLimit(t *testing.T, ctx *config.Context) {
+	t.Helper()
+	rdsClient := redis.NewClient(&redis.Options{
+		Addr:     ctx.GetConfig().DB.RedisAddr,
+		Password: ctx.GetConfig().DB.RedisPass,
+	})
+	defer rdsClient.Close()
+	keys, err := rdsClient.Keys("ratelimit:uid:*").Result()
+	if err == nil && len(keys) > 0 {
+		_ = rdsClient.Del(keys...).Err()
+	}
+}
 
 // ---------- helpers ----------
 
@@ -425,6 +450,152 @@ func TestCategory_MoveGroupToCategory(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotNil(t, setting2)
 	assert.Nil(t, setting2.CategoryID)
+}
+
+// TestCategory_MoveGroupOutOfCategory_ClearsAutoFollowThreads is the
+// regression test for issue #151 review #3 (yujiawei).  When a user moves a
+// group out of any category, the auto_follow_threads flag on the
+// user_conversation_ext row (which the new sidebar materialization may have
+// set to 1) must be cleared in the same transaction.  Without this cleanup,
+// selectEligibleForFanoutTx would keep this user eligible for OnThreadCreated
+// fan-out — the read side (buildFollowItems) drops the group because
+// CategoryID is now nil, but the write side only checks auto_follow_threads.
+//
+// Repro before fix:
+//  1. group g placed in category c, no ext row yet (default-followed).
+//  2. /v1/sidebar/sync follow tab materializes (uid, space, g) with
+//     auto_follow_threads=1, group_unfollowed=0.
+//  3. User moves g out of category via PUT /v1/groups/g/category {"":""}.
+//  4. ext row still has auto_follow_threads=1 — fan-out continues.
+//
+// After fix the move-out branch in api.go calls ClearAutoFollowThreadsTx
+// in the same tx, restoring the read/write contract.
+func TestCategory_MoveGroupOutOfCategory_ClearsAutoFollowThreads(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+	resetUIDRateLimit(t, ctx)
+
+	spaceID := "space-move-clr-001"
+	seedSpaceAndMember(t, f, spaceID, 0)
+	route := s.GetRoute()
+
+	// 1. Set up: category + group + group-in-category.
+	wc := createCategory(t, route, spaceID, "工作")
+	require.Equal(t, http.StatusOK, wc.Code)
+	cat := parseJSON(t, wc)
+	catID := cat["category_id"].(string)
+
+	groupNo := "group-move-clr-001"
+	seedGroup(t, f, groupNo, spaceID)
+
+	wm := doRequest(t, route, "PUT", "/v1/groups/"+groupNo+"/category", map[string]string{
+		"category_id": catID,
+	})
+	require.Equal(t, http.StatusOK, wm.Code)
+
+	// 2. Simulate the sidebar materialization step (would normally fire on
+	//    /v1/sidebar/sync).  Insert ext row with auto_follow_threads=1,
+	//    matching what MaterializeDefaultFollowedGroups writes.
+	_, err = f.db.session.InsertBySql(
+		"INSERT INTO user_conversation_ext (uid, space_id, target_type, target_id, group_unfollowed, auto_follow_threads) "+
+			"VALUES (?, ?, 2, ?, 0, 1)",
+		testutil.UID, spaceID, groupNo,
+	).Exec()
+	require.NoError(t, err, "seed materialized ext row")
+
+	// Precondition sanity check.
+	var preAutoFollow int
+	_, err = f.db.session.SelectBySql(
+		"SELECT auto_follow_threads FROM user_conversation_ext"+
+			" WHERE uid=? AND space_id=? AND target_type=2 AND target_id=?",
+		testutil.UID, spaceID, groupNo,
+	).Load(&preAutoFollow)
+	require.NoError(t, err)
+	require.Equal(t, 1, preAutoFollow, "precondition: row is materialized auto_follow_threads=1")
+
+	// 3. Move group OUT of category.
+	wm2 := doRequest(t, route, "PUT", "/v1/groups/"+groupNo+"/category", map[string]string{
+		"category_id": "",
+	})
+	require.Equal(t, http.StatusOK, wm2.Code)
+
+	// 4. Assert auto_follow_threads is now 0 — the actual regression fix.
+	var postAutoFollow int
+	_, err = f.db.session.SelectBySql(
+		"SELECT auto_follow_threads FROM user_conversation_ext"+
+			" WHERE uid=? AND space_id=? AND target_type=2 AND target_id=?",
+		testutil.UID, spaceID, groupNo,
+	).Load(&postAutoFollow)
+	require.NoError(t, err)
+	assert.Equal(t, 0, postAutoFollow,
+		"auto_follow_threads must be cleared after move-out (issue #151 review #3); "+
+			"otherwise selectEligibleForFanoutTx would still target this user")
+
+	// 5. Other flags MUST be preserved — uncategorize is NOT a full unfollow.
+	var groupUnfollowed int
+	_, err = f.db.session.SelectBySql(
+		"SELECT group_unfollowed FROM user_conversation_ext"+
+			" WHERE uid=? AND space_id=? AND target_type=2 AND target_id=?",
+		testutil.UID, spaceID, groupNo,
+	).Load(&groupUnfollowed)
+	require.NoError(t, err)
+	assert.Equal(t, 0, groupUnfollowed,
+		"group_unfollowed must NOT be set — uncategorize ≠ explicit unfollow; "+
+			"the cleanup only revokes auto-subscribe to NEW threads, not all subscriptions")
+}
+
+// TestCategory_MoveGroupBetweenCategories_PreservesAutoFollowThreads pins the
+// non-regression: moving a group from category A to category B preserves the
+// implicit follow, so auto_follow_threads stays 1.  Without this guard, a
+// future change might over-eagerly clear in every move and break the
+// "default-followed across category-to-category move" contract.
+func TestCategory_MoveGroupBetweenCategories_PreservesAutoFollowThreads(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+	resetUIDRateLimit(t, ctx)
+
+	spaceID := "space-move-keep-001"
+	seedSpaceAndMember(t, f, spaceID, 0)
+	route := s.GetRoute()
+
+	// Two categories, one group, materialized ext row.
+	wcA := createCategory(t, route, spaceID, "工作A")
+	require.Equal(t, http.StatusOK, wcA.Code)
+	catA := parseJSON(t, wcA)["category_id"].(string)
+	wcB := createCategory(t, route, spaceID, "工作B")
+	require.Equal(t, http.StatusOK, wcB.Code)
+	catB := parseJSON(t, wcB)["category_id"].(string)
+
+	groupNo := "group-move-keep-001"
+	seedGroup(t, f, groupNo, spaceID)
+	require.Equal(t, http.StatusOK, doRequest(t, route, "PUT", "/v1/groups/"+groupNo+"/category", map[string]string{"category_id": catA}).Code)
+	_, err = f.db.session.InsertBySql(
+		"INSERT INTO user_conversation_ext (uid, space_id, target_type, target_id, group_unfollowed, auto_follow_threads) "+
+			"VALUES (?, ?, 2, ?, 0, 1)",
+		testutil.UID, spaceID, groupNo,
+	).Exec()
+	require.NoError(t, err)
+
+	// Move A → B.
+	w := doRequest(t, route, "PUT", "/v1/groups/"+groupNo+"/category", map[string]string{"category_id": catB})
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var autoFollow int
+	_, err = f.db.session.SelectBySql(
+		"SELECT auto_follow_threads FROM user_conversation_ext"+
+			" WHERE uid=? AND space_id=? AND target_type=2 AND target_id=?",
+		testutil.UID, spaceID, groupNo,
+	).Load(&autoFollow)
+	require.NoError(t, err)
+	assert.Equal(t, 1, autoFollow,
+		"category A→B move must NOT clear auto_follow_threads — the group is "+
+			"still in the follow tab, just under a different category")
 }
 
 // ---------- Validation / Error Tests ----------

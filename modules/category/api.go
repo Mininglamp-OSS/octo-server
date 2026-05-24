@@ -638,6 +638,25 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 		}
 	}
 
+	// Issue #151 review #3 — when this transition takes the group OUT of any
+	// category (categoryIDPtr == nil), clear the materialized
+	// auto_follow_threads flag on the corresponding user_conversation_ext row.
+	// Otherwise OnThreadCreated's fan-out filter would continue to target this
+	// user for new threads in a group that has just left the follow tab —
+	// the read side (buildFollowItems) drops the group because CategoryID is
+	// now nil, but the write side (selectEligibleForFanoutTx) only looks at
+	// auto_follow_threads.  Without this cleanup the two sides drift.
+	//
+	// Category-to-category move (req.CategoryID != "") preserves the implicit
+	// follow and therefore preserves auto_follow_threads — no cleanup needed.
+	if categoryIDPtr == nil {
+		if err := convext.ClearAutoFollowThreadsTx(tx, loginUID, groupSpaceID, []string{groupNo}); err != nil {
+			c.Error("清理 auto_follow_threads 失败", zap.Error(err))
+			ctx.ResponseError(errors.New("更新群设置失败"))
+			return
+		}
+	}
+
 	if _, err := convext.BumpFollowVersionTx(tx, loginUID, groupSpaceID); err != nil {
 		c.Error("更新 follow_version 失败", zap.Error(err))
 		ctx.ResponseError(errors.New("更新群设置失败"))

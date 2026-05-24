@@ -518,3 +518,105 @@ func TestDB_MaterializeDefaultFollowedGroups_EmptyInput_NoOp(t *testing.T) {
 	require.NoError(t, db.MaterializeDefaultFollowedGroups("u1", "s1", nil))
 	require.NoError(t, db.MaterializeDefaultFollowedGroups("u1", "s1", []string{}))
 }
+
+// ---------------------------------------------------------------------------
+// Issue #151 review #3 — ClearAutoFollowThreadsTx
+//
+// MaterializeDefaultFollowedGroups creates ext rows with auto_follow_threads=1.
+// When the implicit follow goes away (user moves group out of category),
+// the same flag must be cleared so OnThreadCreated stops fanning out new
+// threads to a user who no longer sees the group in their follow tab.
+// ---------------------------------------------------------------------------
+
+func TestDB_ClearAutoFollowThreadsTx_ClearsExistingRow(t *testing.T) {
+	db := newDBForTest(t)
+	const uid, space = "u1", "s1"
+
+	// Pre-existing row with auto_follow_threads=1 (the materialized state).
+	require.NoError(t, db.Upsert(uid, space, targetTypeGroup, "g-clear", ConvExtFields{
+		AutoFollowThreads: int8Ptr(1),
+		GroupUnfollowed:   int8Ptr(0),
+		FollowSort:        intPtr(7),
+	}))
+
+	tx, err := db.session.Begin()
+	require.NoError(t, err)
+	defer tx.RollbackUnlessCommitted()
+	require.NoError(t, ClearAutoFollowThreadsTx(tx, uid, space, []string{"g-clear"}))
+	require.NoError(t, tx.Commit())
+
+	m, err := db.Get(uid, space, targetTypeGroup, "g-clear")
+	require.NoError(t, err)
+	require.NotNil(t, m)
+	assert.Equal(t, int8(0), m.AutoFollowThreads,
+		"auto_follow_threads must be cleared")
+	assert.Equal(t, int8(0), m.GroupUnfollowed,
+		"group_unfollowed must NOT be set — uncategorize ≠ explicit unfollow; "+
+			"clearing this flag would break the existing UnfollowGroupsTx contract")
+	assert.Equal(t, 7, m.FollowSort,
+		"follow_sort must be preserved — only the auto_follow_threads flag changes")
+}
+
+func TestDB_ClearAutoFollowThreadsTx_BatchClearsMultipleRows(t *testing.T) {
+	db := newDBForTest(t)
+	const uid, space = "u1", "s1"
+
+	for _, g := range []string{"g-a", "g-b", "g-c"} {
+		require.NoError(t, db.Upsert(uid, space, targetTypeGroup, g, ConvExtFields{
+			AutoFollowThreads: int8Ptr(1),
+		}))
+	}
+	// Unrelated row in the same uid/space must be left alone (negative case).
+	require.NoError(t, db.Upsert(uid, space, targetTypeGroup, "g-keep", ConvExtFields{
+		AutoFollowThreads: int8Ptr(1),
+	}))
+
+	tx, err := db.session.Begin()
+	require.NoError(t, err)
+	defer tx.RollbackUnlessCommitted()
+	require.NoError(t, ClearAutoFollowThreadsTx(tx, uid, space, []string{"g-a", "g-b", "g-c"}))
+	require.NoError(t, tx.Commit())
+
+	for _, g := range []string{"g-a", "g-b", "g-c"} {
+		m, err := db.Get(uid, space, targetTypeGroup, g)
+		require.NoError(t, err)
+		require.NotNil(t, m)
+		assert.Equal(t, int8(0), m.AutoFollowThreads,
+			"batch member %q must be cleared", g)
+	}
+	mk, err := db.Get(uid, space, targetTypeGroup, "g-keep")
+	require.NoError(t, err)
+	require.NotNil(t, mk)
+	assert.Equal(t, int8(1), mk.AutoFollowThreads,
+		"row not in the groupNos list must NOT be touched")
+}
+
+func TestDB_ClearAutoFollowThreadsTx_NoRow_NoOp(t *testing.T) {
+	db := newDBForTest(t)
+	tx, err := db.session.Begin()
+	require.NoError(t, err)
+	defer tx.RollbackUnlessCommitted()
+	// No row materialized — the call must succeed without error and leave
+	// the table state unchanged (this is the happy path for a user who
+	// never opened the follow tab before uncategorizing).
+	require.NoError(t, ClearAutoFollowThreadsTx(tx, "u-ghost", "s1", []string{"g-ghost"}))
+	require.NoError(t, tx.Commit())
+
+	m, err := db.Get("u-ghost", "s1", targetTypeGroup, "g-ghost")
+	require.NoError(t, err)
+	assert.Nil(t, m, "no row may be created — the helper is strictly UPDATE")
+}
+
+func TestDB_ClearAutoFollowThreadsTx_EmptyInput_NoOp(t *testing.T) {
+	db := newDBForTest(t)
+	tx, err := db.session.Begin()
+	require.NoError(t, err)
+	defer tx.RollbackUnlessCommitted()
+	require.NoError(t, ClearAutoFollowThreadsTx(tx, "u1", "s1", nil))
+	require.NoError(t, ClearAutoFollowThreadsTx(tx, "u1", "s1", []string{}))
+	require.NoError(t, ClearAutoFollowThreadsTx(tx, "", "s1", []string{"g"}),
+		"empty uid is a no-op (defensive, matches other helpers)")
+	require.NoError(t, ClearAutoFollowThreadsTx(tx, "u1", "", []string{"g"}),
+		"empty spaceID is a no-op")
+	require.NoError(t, tx.Commit())
+}

@@ -362,6 +362,55 @@ func (d *DB) UpdateSort(uid, spaceID string, items []SortItem, expectedVersion i
 	return nil
 }
 
+// ClearAutoFollowThreadsTx is the cleanup counterpart of
+// MaterializeDefaultFollowedGroups.  It sets auto_follow_threads=0 on the
+// (uid, space_id, target_type=2, group_no) ext rows in groupNos that exist,
+// silently skipping any that don't.  Idempotent; safe to call when no row
+// has been materialized.
+//
+// Why it exists (issue #151 review #3 by yujiawei): MaterializeDefault-
+// FollowedGroups creates ext rows with auto_follow_threads=1 for groups that
+// are followed *implicitly* via group_setting.category_id.  When that
+// implicit follow is revoked (user moves the group out of any category, or
+// the category is deleted), the row remains and selectEligibleForFanoutTx
+// keeps treating the user as eligible for new-thread fan-out — even though
+// buildFollowItems now drops the group from the follow tab because
+// CategoryID is nil.  Before this PR no row existed so the cleanup was
+// implicit ("no row = no fanout"); once we materialize, the cleanup must
+// be made explicit at every site that clears group_setting.category_id.
+//
+// What it does NOT do:
+//   - Does not delete the ext row (preserves group_unfollowed flag and any
+//     follow_sort the user explicitly chose).
+//   - Does not touch thread (target_type=5) ext rows — existing thread
+//     subscriptions remain valid; we only stop auto-following NEW threads.
+//   - Does not bump user_follow_version — the caller (category handler)
+//     already bumps once for the surrounding group_setting change; bumping
+//     again here would force two client reloads for one logical action.
+//
+// Callers in scope: modules/category moveGroupToCategory move-out branch
+// (req.CategoryID == "").  modules/category deleteCategory does NOT need
+// this helper — it already calls UnfollowGroupsTx which sets
+// group_unfollowed=1 AND auto_follow_threads=0 (stronger semantic: explicit
+// unfollow on category delete per PM contract).  Future code that mutates
+// group_setting.category_id from non-NULL to NULL without setting
+// group_unfollowed=1 MUST call this helper in the same transaction to keep
+// the read/write contracts in sync.
+func ClearAutoFollowThreadsTx(tx *dbr.Tx, uid, spaceID string, groupNos []string) error {
+	if uid == "" || spaceID == "" || len(groupNos) == 0 {
+		return nil
+	}
+	_, err := tx.UpdateBySql(
+		"UPDATE "+table+" SET auto_follow_threads=0"+
+			" WHERE uid=? AND space_id=? AND target_type=? AND target_id IN ?",
+		uid, spaceID, targetTypeGroup, groupNos,
+	).Exec()
+	if err != nil {
+		return fmt.Errorf("clear auto_follow_threads: %w", err)
+	}
+	return nil
+}
+
 // MaterializeDefaultFollowedGroups writes a fresh ext row (auto_follow_threads=1,
 // group_unfollowed=0) for each (uid, space_id, target_type=2, group_no) tuple
 // that does not yet have one.  It is the data-layer entry point used by:
