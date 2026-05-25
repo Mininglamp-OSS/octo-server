@@ -310,7 +310,7 @@ func TestSpaceID_Round3_SpaceMemberships_AllJoinedGroups(t *testing.T) {
 	}, byID["g_legacy_ext"])
 }
 
-func TestSpaceID_Round3_SpaceMemberships_SkipsInvalidRows(t *testing.T) {
+func TestSpaceID_Round3_SpaceMemberships_KeepsLegacyEmptySpace(t *testing.T) {
 	got := buildSpaceMemberships([]*group.InfoResp{
 		nil,
 		{GroupNo: "", SpaceID: "spaceA"},
@@ -318,8 +318,9 @@ func TestSpaceID_Round3_SpaceMemberships_SkipsInvalidRows(t *testing.T) {
 		{GroupNo: "g2", SpaceID: "spaceB"},
 	}, map[string]string{"g2": ""}, "")
 
-	require.Len(t, got, 1)
-	assert.Equal(t, SpaceMembership{ChannelID: "g2", SpaceID: "spaceB"}, got[0])
+	require.Len(t, got, 2)
+	assert.Equal(t, SpaceMembership{ChannelID: "g1", SpaceID: ""}, got[0])
+	assert.Equal(t, SpaceMembership{ChannelID: "g2", SpaceID: "spaceB"}, got[1])
 }
 
 // 防止 unused import: group。这里通过引用 InfoResp 类型让 import 有意义。
