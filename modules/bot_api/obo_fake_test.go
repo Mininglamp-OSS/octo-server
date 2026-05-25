@@ -463,6 +463,61 @@ func (f *fakeOBOStore) findGlobalGrantsWithoutScope(membershipGroupID, channelID
 	return out, nil
 }
 
+// findGlobalGrantsForDM — Mininglamp-OSS/octo-server#161 (YUJ-1977) fake
+// impl. Returns active grants with `global_enabled=1` whose grantor uid
+// matches `grantorUID` AND for which no `obo_scopes` row exists for
+// `(peerChannelID, ChannelTypePerson)`. Mirrors the production
+// `NOT EXISTS` anti-join: ANY scope row for the tuple (regardless of
+// `enabled`) suppresses implicit-scope, matching the explicit-scope-wins
+// invariant.
+func (f *fakeOBOStore) findGlobalGrantsForDM(grantorUID, peerChannelID string) ([]*oboGrantModel, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureInit()
+	out := []*oboGrantModel{}
+	if grantorUID == "" || peerChannelID == "" {
+		return out, nil
+	}
+	// Deterministic order — mirror the sort applied by the other fake
+	// feeders so test assertions on slice ordering stay stable.
+	ids := make([]int64, 0, len(f.grants))
+	for id := range f.grants {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for _, id := range ids {
+		g := f.grants[id]
+		if g == nil || g.Active != 1 || g.GlobalEnabled != 1 {
+			continue
+		}
+		if g.GrantorUID != grantorUID {
+			continue
+		}
+		// Anti-join: any scope row for (grant, peer, Person) — regardless
+		// of `enabled` — suppresses implicit-scope. Rows with `enabled=1`
+		// are already covered by findActiveGrantsForChannel; rows with
+		// `enabled=0` are the admin's intentional disable (PR#121 R5/B1).
+		hasScope := false
+		for _, s := range f.scopes {
+			if s == nil {
+				continue
+			}
+			if s.GrantID == g.ID &&
+				s.ChannelID == peerChannelID &&
+				s.ChannelType == common.ChannelTypePerson.Uint8() {
+				hasScope = true
+				break
+			}
+		}
+		if hasScope {
+			continue
+		}
+		cp := *g
+		out = append(out, &cp)
+	}
+	return out, nil
+}
+
 func (f *fakeOBOStore) insertGrant(grantorUID, granteeBotUID, mode, personaPrompt string) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

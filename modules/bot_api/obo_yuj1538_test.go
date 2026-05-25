@@ -220,17 +220,36 @@ func TestFanout_YUJ1538_GroupMentionAisBooleanShapeSummonsPersona(t *testing.T) 
 	}
 }
 
-// TestFanout_YUJ1538_DMStillRequiresScopeRow — the new
-// channel-type-aware lookup path must NOT relax DM behavior. DMs
-// remain strict: a grant without a matching `obo_scopes` row
-// (channel_type=1, channel_id=peer uid) gets zero dispatches even
-// when `global_enabled=1`. Pins the contract from the issue:
+// TestFanout_YUJ1538_DMStillRequiresScopeRow — Mininglamp-OSS/octo-server#161
+// (YUJ-1977) INVERSION. The YUJ-1538 invariant ("DMs remain strict — a
+// grant without a matching scope row gets zero dispatches even when
+// global_enabled=1") was the bug behind issue #161: a grantor who flips
+// `global_enabled=1` on a DM-shaped grant without ever installing a per-
+// peer scope row expected fan-out symmetrical to the group-shaped
+// `findGlobalGrantsWithoutScope` path (PR#121) and got silence instead.
 //
-//   "Do NOT change DM fan-out behavior (must still require scope rows)"
+// Post-#161 the DM fan-out path consults `findGlobalGrantsForDM` after
+// `findActiveGrantsForChannel`, so a `global_enabled=1` grant with zero
+// scope rows now DOES fan out for any DM peer the grantor has live
+// access to (the friend-gate / `grantorCanReadChannel` re-check inside
+// `fanoutForMessage` enforces the access invariant; the explicit scope
+// row is no longer the sole opt-in signal).
+//
+// This test pins the new behavior — what was previously a "must NOT
+// dispatch" assertion is now a "must dispatch exactly one copy"
+// assertion. The original YUJ-1538 intent (group fan-out without scope
+// rows) is unchanged and still covered by the sibling tests in this
+// file; only the DM half of the contract flipped.
+//
+// The lower-level new tests live in obo_fanout_test.go:
+// TestFanout_DM_GlobalEnabled_NoScopes / WithExplicitScope /
+// GlobalDisabled_NoScopes — they assert the dispatch payload + dedup
+// contract; this test is the YUJ-1538 file's parity assertion that the
+// DM-side regression is closed.
 func TestFanout_YUJ1538_DMStillRequiresScopeRow(t *testing.T) {
 	const peer = "u_bob"
 	ct := common.ChannelTypePerson.Uint8()
-	s := seedGrantNoScope(t) // grant exists with global_enabled=1, but no DM scope
+	s := seedGrantNoScope(t) // grant exists with global_enabled=1, no DM scope row
 	fc := &fanoutCapture{}
 	ba := newBAforFanout(s, fc)
 
@@ -240,8 +259,8 @@ func TestFanout_YUJ1538_DMStillRequiresScopeRow(t *testing.T) {
 		ChannelType: ct,
 		Payload:     []byte(`{"type":1,"content":"hey, can we chat?"}`),
 	}
-	if got := ba.fanoutForMessage(msg); got != 0 {
-		t.Fatalf("YUJ-1538: DM with no scope row must NOT fan out (issue spec: DM behavior unchanged), got %d", got)
+	if got := ba.fanoutForMessage(msg); got != 1 {
+		t.Fatalf("issue #161 (YUJ-1977): DM with global_enabled=1 + no scope row must fan out via implicit-scope feeder, got %d", got)
 	}
 }
 

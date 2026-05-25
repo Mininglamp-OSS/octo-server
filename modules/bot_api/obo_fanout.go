@@ -166,6 +166,44 @@ func fanoutLookupChannelID(m *config.MessageResp) string {
 	return m.ChannelID
 }
 
+// mergeGrantsDedup appends `extras` to `base`, dropping any grant whose ID
+// already appears in `base`. Used by the DM fan-out path
+// (Mininglamp-OSS/octo-server#161 / YUJ-1977) to merge the explicit-feeder
+// result (`findActiveGrantsForChannel`) with the implicit-feeder result
+// (`findGlobalGrantsForDM`). The two production queries are disjoint by
+// construction — one INNER JOINs on `obo_scopes.enabled=1`, the other
+// `NOT EXISTS`-filters on the same table — but the helper guards against a
+// future store impl regression and against the test-fake aggregating both
+// branches in a single method.
+//
+// Order is preserved: explicit-feeder grants come first (they are the
+// authoritative dispatch shape for DMs the grantor explicitly opted into),
+// implicit grants append after. This keeps the dispatch loop's per-message
+// `grantorAccess` cache and the fan-out copy ordering deterministic across
+// the two paths.
+func mergeGrantsDedup(base, extras []*oboGrantModel) []*oboGrantModel {
+	if len(extras) == 0 {
+		return base
+	}
+	seen := make(map[int64]struct{}, len(base))
+	for _, g := range base {
+		if g != nil {
+			seen[g.ID] = struct{}{}
+		}
+	}
+	for _, g := range extras {
+		if g == nil {
+			continue
+		}
+		if _, dup := seen[g.ID]; dup {
+			continue
+		}
+		seen[g.ID] = struct{}{}
+		base = append(base, g)
+	}
+	return base
+}
+
 // fanoutForMessage is the single-message entry point used by tests AND by
 // oboMessagesListen. Returns the number of copies dispatched so tests can
 // assert without poking the dispatcher hook.
@@ -241,6 +279,41 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 	if m.ChannelType == common.ChannelTypePerson.Uint8() {
 		// DM path — unchanged, uses scope-joined query.
 		grants, err = store.findActiveGrantsForChannel(lookupChannelID, m.ChannelType)
+		// Mininglamp-OSS/octo-server#161 (YUJ-1977) — DM implicit-scope
+		// fallback. `findActiveGrantsForChannel` INNER JOINs on
+		// `obo_scopes` with `enabled=1`, so a grant with
+		// `global_enabled=1` but ZERO scope rows produces an empty
+		// result and the DM never fans out. PR#121 introduced the
+		// equivalent path for group-shaped channels via
+		// `findGlobalGrantsWithoutScope`; this branch closes the
+		// symmetrical gap for Person channels.
+		//
+		// `m.ChannelID` under the listener's WuKongIM-native view is
+		// the receiver of the inbound DM, which IS the grantor for
+		// fan-out (the multi-grantor recipient filter further down
+		// already pivots on this same identity). `lookupChannelID` is
+		// the peer (= `m.FromUID`, after the P1-B normalization) and
+		// is what an explicit scope row would have keyed under.
+		//
+		// The fallback is best-effort: a DB error on the implicit
+		// feeder MUST NOT mask whatever the explicit feeder
+		// successfully returned, so we log + carry on rather than
+		// failing the whole lookup. Merging is dedup-safe even though
+		// the two queries are disjoint by construction (one requires
+		// an enabled scope row, the other requires no scope row at
+		// all) — `mergeGrantsDedup` is belt-and-braces against future
+		// store impls that relax that invariant.
+		if err == nil && m.ChannelID != "" {
+			globalGrants, gErr := store.findGlobalGrantsForDM(m.ChannelID, lookupChannelID)
+			if gErr != nil {
+				ba.Warn("OBO DM implicit-scope lookup failed",
+					zap.String("grantor", m.ChannelID),
+					zap.String("peer", lookupChannelID),
+					zap.Error(gErr))
+			} else if len(globalGrants) > 0 {
+				grants = mergeGrantsDedup(grants, globalGrants)
+			}
+		}
 	} else {
 		// Group-like channels: gate on mention first. `mention.all` is
 		// parsed (decoder still surfaces it for telemetry / future use)

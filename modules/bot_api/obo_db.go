@@ -212,6 +212,33 @@ type oboStore interface {
 	// — never the parent-group's. See findGlobalGrantsWithoutScope for
 	// the full per-argument contract.
 	findGlobalGrantsWithoutScope(membershipGroupID, channelID string, channelType uint8) ([]*oboGrantModel, error)
+	// findGlobalGrantsForDM — Mininglamp-OSS/octo-server#161 (YUJ-1977).
+	// DM-only implicit-scope feeder. Returns active grants with
+	// `global_enabled=1` whose grantor uid is `grantorUID` AND for which no
+	// `obo_scopes` row exists for the (peer, ChannelTypePerson) tuple.
+	//
+	// Mirrors the group-shaped `findGlobalGrantsWithoutScope` semantics but
+	// for the 1:1 DM frame: a grantor who flips `global_enabled=1` on their
+	// grant without ever installing a per-peer scope row should still see
+	// fan-out for every DM their counterpart sends them. Pre-fix,
+	// `findActiveGrantsForChannel` short-circuited to empty for this case
+	// because its INNER JOIN on `obo_scopes` required at least one matching
+	// row; the group-like path solved it via the implicit-scope feeder, but
+	// DMs had no equivalent. PR#121 R5 / B1 invariant — an explicit scope
+	// row (regardless of `enabled`) for the (peer, Person) tuple suppresses
+	// implicit-scope fan-out — is preserved by the `NOT EXISTS` anti-join:
+	// a row with `enabled=1` is already covered by the explicit feeder, and
+	// a row with `enabled=0` is the admin's intentional disable.
+	//
+	// Empty `grantorUID` or `peerChannelID` returns an empty slice without
+	// touching the DB. Caller (`fanoutForMessage`) is responsible for the
+	// merge with the explicit-feeder result + per-grant Gate 1/2 filtering
+	// + the TOCTOU re-check (`grantorCanReadChannel` / friend-gate). This
+	// method does NOT consult or update the channel-wide cache: the result
+	// surfaces a different invariant than the cached scalar (any ACTIVE
+	// scope row vs. any `global_enabled` grant without scope rows) so cache
+	// reuse would be incorrect.
+	findGlobalGrantsForDM(grantorUID, peerChannelID string) ([]*oboGrantModel, error)
 
 	// CRUD used by the REST layer.
 	//
@@ -681,6 +708,58 @@ func (d *botAPIDB) findGlobalGrantsWithoutScope(membershipGroupID, channelID str
 			"  AND gm_bot.uid IS NULL "+
 			"  AND s.id IS NULL",
 		membershipGroupID, membershipGroupID, channelID, channelType,
+	).Load(&grants)
+	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
+		return nil, err
+	}
+	if grants == nil {
+		grants = []*oboGrantModel{}
+	}
+	return grants, nil
+}
+
+// findGlobalGrantsForDM — see oboStore. DM-only implicit-scope feeder for
+// Mininglamp-OSS/octo-server#161 (YUJ-1977). Returns active grants with
+// `global_enabled=1` whose `grantor_uid` matches `grantorUID` AND for which
+// no `obo_scopes` row exists for `(peerChannelID, ChannelTypePerson)`.
+//
+// Counterpart to `findGlobalGrantsWithoutScope` for the DM frame of
+// reference. The group feeder needs the `group_member` JOINs because a
+// group-shaped grant only fans out into channels where the grantor is a
+// member AND the bot is not; DMs have no such membership relation — a DM
+// grant fans out into any DM the grantor receives, and the per-grant
+// `grantorCanReadChannel` re-check inside `fanoutForMessage` enforces the
+// friend-gate (TOCTOU) at dispatch time. We therefore only need the
+// `global_enabled` row plus the scope anti-join here.
+//
+// The `NOT EXISTS` anti-join is identical in spirit to the LEFT JOIN
+// `s.id IS NULL` pattern used by the group feeder: ANY existing
+// `obo_scopes` row for `(grant_id, peer, Person)` — regardless of
+// `enabled` — suppresses implicit-scope. Rows with `enabled=1` are
+// already returned by `findActiveGrantsForChannel`, so suppressing them
+// here keeps the two queries disjoint and the merge in
+// `fanoutForMessage` cheap. Rows with `enabled=0` are the admin's
+// intentional disable and MUST suppress fan-out (PR#121 R5 / B1
+// invariant — "explicit scope row wins").
+//
+// Channel-wide cache (`obo:chan:1:{peer}`) is intentionally NOT consulted
+// or updated: a "0" cached scalar from `findActiveGrantsForChannel`
+// (= "no enabled scope row") cannot prove this query's negative answer
+// (= "no grant with global_enabled and no scope row"), and writing here
+// would poison the explicit feeder's cache contract.
+func (d *botAPIDB) findGlobalGrantsForDM(grantorUID, peerChannelID string) ([]*oboGrantModel, error) {
+	if grantorUID == "" || peerChannelID == "" {
+		return []*oboGrantModel{}, nil
+	}
+	var grants []*oboGrantModel
+	_, err := d.session.SelectBySql(
+		"SELECT "+oboGrantColumnsAliased+" FROM obo_grants g "+
+			"WHERE g.active=1 AND g.global_enabled=1 AND g.grantor_uid=? "+
+			"AND NOT EXISTS ("+
+			"  SELECT 1 FROM obo_scopes s "+
+			"  WHERE s.grant_id=g.id AND s.channel_id=? AND s.channel_type=?"+
+			")",
+		grantorUID, peerChannelID, common.ChannelTypePerson.Uint8(),
 	).Load(&grants)
 	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
 		return nil, err

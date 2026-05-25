@@ -534,8 +534,23 @@ func TestFanout_DMGrantorToPeer_DoesNotEcho(t *testing.T) {
 
 // TestFanout_DMUnrelatedPeer_NoMatch — defensive cousin of P1-B. A DM
 // from some third party Eve to the grantor must NOT fan out when the
-// grantor's scope is for Bob, not Eve. With the new lookup-by-FromUID,
-// scope (channel_id = Bob) and lookup (FromUID = Eve) do not match.
+// grantor is not friends with Eve. Pre-#161 the explicit Bob scope was
+// the sole opt-in signal and the lookup-by-FromUID(=Eve) returned no
+// scope row, so fan-out was 0 BEFORE the access check ran.
+//
+// Post-Mininglamp-OSS/octo-server#161 (YUJ-1977) the DM path also
+// consults `findGlobalGrantsForDM` for grants with `global_enabled=1`
+// and no per-peer scope row — so Eve's DM now reaches the access-check
+// gate (the grantor's `global_enabled=1` covers any DM peer they have
+// live access to, mirroring the group-shaped implicit-scope semantics).
+// The friend-gate (`grantorCanReadChannel`) is the gate that keeps
+// unrelated peers out: this test installs an override that returns
+// false for the (grantor, Eve) pair and asserts fan-out is still zero.
+//
+// The pre-#161 invariant "scope-row-key mismatch short-circuits before
+// the access check" is preserved in the form that actually matters for
+// the bug it was guarding against: an unrelated peer cannot leak DM
+// content into the persona via the new implicit-scope path either.
 func TestFanout_DMUnrelatedPeer_NoMatch(t *testing.T) {
 	const scopedPeer, otherPeer = "bob", "eve"
 	ct := common.ChannelTypePerson.Uint8()
@@ -548,8 +563,14 @@ func TestFanout_DMUnrelatedPeer_NoMatch(t *testing.T) {
 	}
 	fc := &fanoutCapture{}
 	ba := newBAforFanout(s, fc)
+	// Friend-gate is the "is the grantor authorized for this peer" gate
+	// under the new implicit-scope DM path. Deny for Eve to assert the
+	// no-leak invariant; if the access check is somehow not consulted
+	// for Eve (regression), the implicit feeder would fan-out blindly.
 	ba.oboChannelAccessOverride = func(uid, channelID string, channelType uint8) (bool, error) {
-		t.Errorf("unrelated peer DM should not reach access check; uid=%q chan=%q", uid, channelID)
+		if channelID == otherPeer {
+			return false, nil
+		}
 		return true, nil
 	}
 
@@ -560,7 +581,10 @@ func TestFanout_DMUnrelatedPeer_NoMatch(t *testing.T) {
 		Payload:     []byte(`{"type":1,"content":"hi yu","mention":{"uids":["user_yu"]}}`),
 	}
 	if n := ba.fanoutForMessage(msg); n != 0 {
-		t.Fatalf("unscoped DM peer must not fan out, got %d", n)
+		t.Fatalf("unrelated DM peer must not fan out (friend-gate denies), got %d", n)
+	}
+	if len(fc.copies) != 0 {
+		t.Fatalf("unrelated DM peer leaked: captured %d copies, expected 0", len(fc.copies))
 	}
 }
 
@@ -1570,5 +1594,169 @@ func TestFanout_Gate4_CommunityTopic_BotNotInParentGroup_FansOut(t *testing.T) {
 	}
 	if len(fc.copies) != 1 {
 		t.Fatalf("CommunityTopic control: expected 1 captured copy, got %d", len(fc.copies))
+	}
+}
+
+// ===== Mininglamp-OSS/octo-server#161 (YUJ-1977) DM implicit-scope tests =====
+//
+// Pre-fix `findActiveGrantsForChannel` INNER JOINed on `obo_scopes` with
+// `enabled=1`, so a grant with `global_enabled=1` but ZERO scope rows
+// produced an empty result for DMs and the listener never fanned out the
+// inbound message. Group-shaped channels solved the same gap via the
+// implicit-scope feeder `findGlobalGrantsWithoutScope` (PR#121); these
+// tests pin the symmetrical DM path: `findGlobalGrantsForDM` is consulted
+// after the explicit feeder, merged dedup-safely, and continues to honor
+// the "explicit scope row wins" invariant (PR#121 R5 / B1).
+
+// TestFanout_DM_GlobalEnabled_NoScopes — Mininglamp-OSS/octo-server#161
+// (YUJ-1977). Alice has a grant with `global_enabled=1` and ZERO scope
+// rows installed. When DM peer Bob sends Alice a message, the implicit-
+// scope DM feeder must surface the grant and the listener must dispatch
+// exactly one fan-out copy to the grantee bot. This is the regression
+// test for the original report — pre-fix the assertion `got == 1` would
+// fail with `got == 0`.
+func TestFanout_DM_GlobalEnabled_NoScopes(t *testing.T) {
+	const peer = "bob"
+	ct := common.ChannelTypePerson.Uint8()
+	s := newFakeOBOStore()
+	gid, err := s.insertGrant(tGrantor, tBot, "auto", "")
+	if err != nil {
+		t.Fatalf("insertGrant: %v", err)
+	}
+	enable := 1
+	if err := s.updateGrant(gid, "", &enable, nil); err != nil {
+		t.Fatalf("updateGrant: %v", err)
+	}
+	// NB: intentionally NO insertScope call — this is the whole point of
+	// the regression. The grant is global_enabled=1 with zero scope rows.
+	fc := &fanoutCapture{}
+	ba := newBAforFanout(s, fc)
+	ba.oboChannelAccessOverride = func(uid, channelID string, channelType uint8) (bool, error) {
+		// TOCTOU re-check must still run for implicit-scope DM grants;
+		// pin the frame of reference so a regression that strips the
+		// per-grant re-check on the DM implicit path surfaces here.
+		if uid != tGrantor || channelID != peer || channelType != ct {
+			t.Errorf("access check called with wrong frame: uid=%q chan=%q type=%d (want grantor=%q peer=%q)",
+				uid, channelID, channelType, tGrantor, peer)
+		}
+		return true, nil
+	}
+
+	// Listener-emitted DM: ChannelID = receiver (= grantor), FromUID = peer.
+	msg := &config.MessageResp{
+		FromUID:     peer,
+		ChannelID:   tGrantor,
+		ChannelType: ct,
+		Payload:     []byte(`{"type":1,"content":"hey from bob"}`),
+	}
+	got := ba.fanoutForMessage(msg)
+	if got != 1 {
+		t.Fatalf("expected 1 fan-out, got %d (regression: DM with global_enabled=1 + no scopes must fan out)", got)
+	}
+	if len(fc.copies) != 1 {
+		t.Fatalf("expected 1 captured copy, got %d", len(fc.copies))
+	}
+	cp := fc.copies[0]
+	if err := assertFanoutDispatchContract(cp); err != nil {
+		t.Fatalf("fan-out contract violated: %v (req=%+v)", err, cp)
+	}
+	if cp.ChannelID != tBot {
+		t.Fatalf("channel_id should be bot mailbox %q, got %q", tBot, cp.ChannelID)
+	}
+	var p map[string]interface{}
+	_ = json.Unmarshal(cp.Payload, &p)
+	if p["content"] != "hey from bob" {
+		t.Fatalf("payload content lost: %v", p)
+	}
+	if v, _ := p["obo_origin_from_uid"].(string); v != peer {
+		t.Fatalf("obo_origin_from_uid should be %q, got %q", peer, v)
+	}
+}
+
+// TestFanout_DM_GlobalEnabled_WithExplicitScope — Mininglamp-OSS/octo-server#161
+// (YUJ-1977). Same grant + peer setup as above, but THIS time Alice has
+// also installed an explicit `obo_scopes` row (`enabled=1`) for Bob.
+// `findActiveGrantsForChannel` returns the grant via the INNER JOIN and
+// `findGlobalGrantsForDM`'s `NOT EXISTS` anti-join filters it out — so
+// `mergeGrantsDedup` is never asked to deduplicate. The dispatch count
+// must remain exactly 1 (no double-fire).
+//
+// This pins both: (a) the two feeders are disjoint by construction, and
+// (b) the merge helper is dedup-safe even if a future store impl returns
+// the same grant from both — `mergeGrantsDedup` guards against that.
+func TestFanout_DM_GlobalEnabled_WithExplicitScope(t *testing.T) {
+	const peer = "bob"
+	ct := common.ChannelTypePerson.Uint8()
+	s := newFakeOBOStore()
+	gid, err := s.insertGrant(tGrantor, tBot, "auto", "")
+	if err != nil {
+		t.Fatalf("insertGrant: %v", err)
+	}
+	enable := 1
+	if err := s.updateGrant(gid, "", &enable, nil); err != nil {
+		t.Fatalf("updateGrant: %v", err)
+	}
+	// Explicit scope row — the original PR#82 round-2 P1-B happy path.
+	if _, err := s.insertScope(gid, peer, ct, 1); err != nil {
+		t.Fatalf("insertScope: %v", err)
+	}
+	fc := &fanoutCapture{}
+	ba := newBAforFanout(s, fc)
+	ba.oboChannelAccessOverride = func(uid, channelID string, channelType uint8) (bool, error) {
+		return true, nil
+	}
+
+	msg := &config.MessageResp{
+		FromUID:     peer,
+		ChannelID:   tGrantor,
+		ChannelType: ct,
+		Payload:     []byte(`{"type":1,"content":"hey from bob"}`),
+	}
+	got := ba.fanoutForMessage(msg)
+	if got != 1 {
+		t.Fatalf("expected exactly 1 fan-out (no duplicate), got %d", got)
+	}
+	if len(fc.copies) != 1 {
+		t.Fatalf("expected 1 captured copy (dedup invariant), got %d", len(fc.copies))
+	}
+
+	// Direct assertion on the helper to lock the dedup contract — pass
+	// the same grant via both slices and verify only one copy survives.
+	gModel := &oboGrantModel{ID: gid, GrantorUID: tGrantor, GranteeBotUID: tBot, Active: 1, GlobalEnabled: 1}
+	merged := mergeGrantsDedup([]*oboGrantModel{gModel}, []*oboGrantModel{gModel})
+	if len(merged) != 1 {
+		t.Fatalf("mergeGrantsDedup must dedup by grant ID, got %d entries", len(merged))
+	}
+}
+
+// TestFanout_DM_GlobalDisabled_NoScopes — Mininglamp-OSS/octo-server#161
+// (YUJ-1977). Existing-behavior regression guard. A grant with
+// `global_enabled=0` and zero scope rows must NOT trigger fan-out even
+// with the new DM implicit-scope path wired in. The implicit feeder's
+// `WHERE g.global_enabled=1` predicate is what excludes it; the test
+// pins that the gating clause survives any future refactor.
+func TestFanout_DM_GlobalDisabled_NoScopes(t *testing.T) {
+	const peer = "bob"
+	ct := common.ChannelTypePerson.Uint8()
+	s := newFakeOBOStore()
+	if _, err := s.insertGrant(tGrantor, tBot, "auto", ""); err != nil {
+		t.Fatalf("insertGrant: %v", err)
+	}
+	// Leave global_enabled at its post-insert default (0). No scope rows.
+	fc := &fanoutCapture{}
+	ba := newBAforFanout(s, fc)
+
+	msg := &config.MessageResp{
+		FromUID:     peer,
+		ChannelID:   tGrantor,
+		ChannelType: ct,
+		Payload:     []byte(`{"type":1,"content":"silence please"}`),
+	}
+	got := ba.fanoutForMessage(msg)
+	if got != 0 {
+		t.Fatalf("expected 0 fan-out (global_enabled=0), got %d", got)
+	}
+	if len(fc.copies) != 0 {
+		t.Fatalf("expected 0 captured copies, got %d", len(fc.copies))
 	}
 }
