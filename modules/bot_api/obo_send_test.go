@@ -426,6 +426,18 @@ func TestSendMessage_OBO_GrantorReplyBypass_RequiresActiveGrant(t *testing.T) {
 // send and requires the strict scope check. Issue YUJ-1418 explicitly
 // forbids loosening the third-party path: "Do NOT change the OBO scope
 // check for third-party sends (that must remain strict)".
+//
+// Post-Mininglamp-OSS/octo-server#162 R1 (DM implicit-scope on the
+// write path): a `global_enabled=1` grant with NO scope row and a
+// passing friend-gate now authorizes DM sends via the implicit-scope
+// branch. To keep this test focused on the bypass-scoping invariant
+// (and not accidentally exercise the new implicit-scope path), we
+// install an explicit `enabled=0` scope row for (peer, Person). The
+// explicit-disabled-scope-wins invariant (PR#121 R5 / B1) suppresses
+// the implicit branch and lets checkOBO answer "no" for the genuine
+// "admin opted this peer out" reason. If the bypass ever wrongly
+// fires, the dispatch would still go through and the test would
+// fail — i.e. the test still proves what it was written to prove.
 func TestSendMessage_OBO_GrantorReplyBypass_DoesNotApplyToThirdPartySend(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -436,15 +448,20 @@ func TestSendMessage_OBO_GrantorReplyBypass_DoesNotApplyToThirdPartySend(t *test
 		authSp  = "space_A"
 	)
 
-	// Grant exists from admin, but the send is to bob (peer) ON BEHALF
-	// OF admin. There is NO scope row for (admin's grant, channel=bob).
-	// This is the standard "no scope → deny" path and the bypass must
-	// not rescue it just because admin (the on_behalf_of value) is also
-	// a grantor of the bot.
+	// Grant exists from admin with `global_enabled=1`; the send is to
+	// bob (peer) ON BEHALF OF admin. We install an explicit DISABLED
+	// scope row for (admin's grant, channel=bob, Person) so the
+	// admin's intent ("do NOT let the persona answer bob for me") wins
+	// over the implicit-scope branch added in PR#162 R1. The bypass
+	// must still not rescue it just because admin (the on_behalf_of
+	// value) is also a grantor of the bot.
 	s := newFakeOBOStore()
 	gid, _ := s.insertGrant(grantor, botID, "auto", "")
 	enable := 1
 	_ = s.updateGrant(gid, "", &enable, nil)
+	if _, err := s.insertScope(gid, peer, common.ChannelTypePerson.Uint8(), 0); err != nil {
+		t.Fatalf("insertScope: %v", err)
+	}
 
 	dc := &dispatchCapture{}
 	ba := &BotAPI{
@@ -472,14 +489,15 @@ func TestSendMessage_OBO_GrantorReplyBypass_DoesNotApplyToThirdPartySend(t *test
 	// failure under test is the OBO scope check, not the friend gate.
 	c.Set(CtxKeyRobot, &robotModel{RobotID: botID, CreatorUID: peer})
 	// Suppress reference-membership re-check — happy path for grantor
-	// channel access, so the failure is unambiguously the scope row miss.
+	// channel access, so the failure is unambiguously the explicit-
+	// disabled scope row (not the friend gate).
 	ba.oboChannelAccessOverride = func(uid, channelID string, channelType uint8) (bool, error) {
 		return true, nil
 	}
 
 	ba.sendMessage(c)
 	if !strings.Contains(rec.Body.String(), ErrOBONotAuthorized.Error()) {
-		t.Fatalf("third-party OBO send without scope row must still be rejected; got %s", rec.Body.String())
+		t.Fatalf("third-party OBO send with explicit-disabled scope must still be rejected; got %s", rec.Body.String())
 	}
 	if dc.captured != nil {
 		t.Fatalf("dispatch must NOT fire on third-party send without scope; got %+v", dc.captured)

@@ -484,18 +484,53 @@ func TestCheckOBO_YUJ1538_CommunityTopicNoScopeRow_GlobalEnabledAuthorizes(t *te
 	}
 }
 
-// TestCheckOBO_YUJ1538_DMNoScope_StillUnauthorized — regression guard.
-// The PR#114 fix MUST NOT relax DM behavior: a grant with
-// `global_enabled=1` but no scope row for the DM peer must still deny.
-// DMs have no in-message narrowing signal (mentions don't apply), so
-// the per-peer scope row is the only explicit opt-in.
+// TestCheckOBO_YUJ1538_DMNoScope_StillUnauthorized — read/write symmetry
+// pin. Originally this test asserted that DM with `global_enabled=1` and
+// no scope row must DENY (the YUJ-1538-era intent). PR#162 inverted that
+// invariant on the read path (`findGlobalGrantsForDM` delivers the inbound
+// DM under the same predicate as the group implicit-scope feeder), and
+// the follow-up (Mininglamp-OSS/octo-server#162 R1) extended `checkOBO`
+// to honor the same predicate on the write path — otherwise the bot
+// receives the DM via fan-out but its reply 403s.
+//
+// The test name is preserved so the historical YUJ-1538 pin stays
+// findable in git blame; the assertion is now flipped to APPROVE the
+// reply when the friend-gate (`grantorCanReadChannel` →
+// `oboChannelAccessOverride`, defaulted to true in
+// `newBotAPIForCheckYUJ1538`) confirms live access. The companion
+// regression test `TestCheckOBO_DM_GlobalEnabled_NoScope_FriendGateDenied`
+// pins the deny side: friend-gate denial must still block the reply.
 func TestCheckOBO_YUJ1538_DMNoScope_StillUnauthorized(t *testing.T) {
 	const dmPeer = "u_bob"
 	s := seedGrantNoScope(t) // grant exists with global_enabled=1, but no scope
 	ba := newBotAPIForCheckYUJ1538(s)
+	if err := ba.checkOBO(tBot, tGrantor, dmPeer, common.ChannelTypePerson.Uint8()); err != nil {
+		t.Fatalf("Mininglamp-OSS/octo-server#162 R1: DM with global_enabled=1 and no scope row must APPROVE when friend-gate allows access (read/write symmetry), got %v", err)
+	}
+}
+
+// TestCheckOBO_DM_GlobalEnabled_NoScope_FriendGateDenied — deny-side
+// regression for the PR#162 R1 DM implicit-scope branch. With
+// `global_enabled=1`, no scope row, but the friend-gate
+// (`grantorCanReadChannel` → `IsFriend`) returning false, the reply
+// MUST still 403. This pins that the friend-gate is the load-bearing
+// safety net: removing it (or letting an error fall through to "ok")
+// would let an unrelated peer's DM authorize a reply, because there
+// is no per-peer scope row in the picture.
+func TestCheckOBO_DM_GlobalEnabled_NoScope_FriendGateDenied(t *testing.T) {
+	const dmPeer = "u_stranger"
+	s := seedGrantNoScope(t) // grant exists with global_enabled=1, but no scope
+	ba := newBotAPIForCheckYUJ1538(s)
+	// Friend-gate denies access for this peer.
+	ba.oboChannelAccessOverride = func(uid, channelID string, channelType uint8) (bool, error) {
+		if channelType == common.ChannelTypePerson.Uint8() && channelID == dmPeer {
+			return false, nil
+		}
+		return true, nil
+	}
 	err := ba.checkOBO(tBot, tGrantor, dmPeer, common.ChannelTypePerson.Uint8())
 	if !errors.Is(err, ErrOBONotAuthorized) {
-		t.Fatalf("YUJ-1538 / PR#114: DM with no scope row must STILL deny (regression guard), got %v", err)
+		t.Fatalf("Mininglamp-OSS/octo-server#162 R1: DM with global_enabled=1 and no scope row must STILL deny when friend-gate returns false, got %v", err)
 	}
 }
 

@@ -13,6 +13,7 @@ package bot_api
 import (
 	"errors"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	"go.uber.org/zap"
 )
 
@@ -36,7 +37,18 @@ var (
 //     master switch is off.
 //  2. Scope row exists with enabled=1 for (grant_id, channel_id,
 //     channel_type). White-list semantics per RFC §2 — opening a channel
-//     to a persona is always explicit.
+//     to a persona is always explicit. Implicit-scope exception (PR#114 /
+//     PR#162 follow-up): when the grant has `global_enabled=1` and NO
+//     scope row exists for the channel (regardless of channel type — group,
+//     community topic, OR DM), the channel is considered implicitly opted
+//     in and check (3) below is the live-access gate. An explicit scope row
+//     with `enabled=0` still wins, matching the explicit-scope-wins
+//     invariant. The DM branch closes the read/write asymmetry surfaced
+//     by Mininglamp-OSS/octo-server#162 review: the fan-out feeder
+//     `findGlobalGrantsForDM` already delivers the inbound message via the
+//     same `global_enabled + NOT EXISTS scope row` predicate, so checkOBO
+//     must accept the symmetric reply or the bot can read DMs it cannot
+//     answer.
 //  3. PR#82 round-2 P1-A — the grantor STILL has read access to the
 //     channel right now (`grantorCanReadChannel`). The scope-create-time
 //     check is not load-bearing for live membership: a grantor who
@@ -44,6 +56,10 @@ var (
 //     out must NOT be able to keep sending into group_42 as themselves
 //     through the bot, otherwise the kick is bypassable. Same logic for
 //     un-friended DM peers and parent-group leaves for community topics.
+//     This is also the DM friend-gate that backstops the implicit-scope
+//     branch above: implicit DM authorization is approved only when the
+//     grantor still has live read access to the peer (`IsFriend` or
+//     self-DM), so an unrelated peer cannot exploit the new branch.
 //     DB cost: one covering-index lookup per OBO send.
 //  4. (No self-grant check at this layer; the REST POST /v1/obo/grants
 //     handler is the right place to reject `grantor == grantee` and we
@@ -81,10 +97,10 @@ func (ba *BotAPI) checkOBO(botUID, grantor, channelID string, channelType uint8)
 		return err
 	}
 	// Implicit scope: when global_enabled=1 and NO explicit scope row exists
-	// for this channel, check if the grantor is a member. If so, allow the OBO
-	// send. BUT if a scope row exists (even with enabled=0), respect it —
-	// an explicitly disabled scope means the admin intentionally excluded
-	// this channel.
+	// for this channel, fall through to a per-channel-type live-access
+	// check. If that check passes, allow the OBO send. BUT if a scope row
+	// exists (even with enabled=0), respect it — an explicitly disabled
+	// scope means the admin intentionally excluded this channel.
 	//
 	// GH#122 — scopeRowExists is fail-closed: a DB error here is propagated,
 	// not swallowed. Treating an error as "no explicit scope" would silently
@@ -93,16 +109,21 @@ func (ba *BotAPI) checkOBO(botUID, grantor, channelID string, channelType uint8)
 	// invisible to the check. Bubble up so the handler can 500 and the
 	// operator notices the outage.
 	//
-	// PR#121 R7 (YUJ-1671) — only consult scopeRowExists when we actually
-	// need it, i.e. the explicit-scope check was negative (`!ok`) AND the
-	// channel type is one where implicit scope is possible
-	// (isGroupLikeChannelType). For DM (Person) and any future
-	// non-group-like channel, scopeRowExists adds nothing — the
-	// implicit-scope branch below would short-circuit on the
-	// isGroupLikeChannelType guard regardless. Skipping the redundant
-	// SELECT trims one DB round-trip off every successful OBO send (where
-	// `ok=true`), which is the dominant case.
-	if !ok && isGroupLikeChannelType(channelType) {
+	// PR#162 follow-up (Jerry-Xin's CR — read/write symmetry): originally
+	// the implicit-scope branch was gated by `isGroupLikeChannelType` so
+	// only Group / CommunityTopic took it; DM (Person) was hard-gated to
+	// the explicit-scope contract. PR#162 added the symmetric DM fan-out
+	// feeder (`findGlobalGrantsForDM`) which delivers DM payloads under
+	// the same `global_enabled + NOT EXISTS scope row` predicate, so the
+	// write path here must match — otherwise the bot would receive the
+	// DM via fan-out but `checkOBO` would reject the reply. The branch
+	// now triggers for ANY channel type once `global_enabled=1` and no
+	// scope row exists; the per-type live-access check (group membership
+	// for Group / CommunityTopic, friend-gate for Person) is the safety
+	// net. An unrelated peer cannot exploit the DM branch because
+	// `grantorCanReadChannel` for Person resolves to `IsFriend` (or
+	// self-DM), matching the fan-out TOCTOU re-check.
+	if !ok && grant.GlobalEnabled == 1 {
 		hasExplicitScope, scopeExistErr := store.scopeRowExists(grant.ID, channelID, channelType)
 		if scopeExistErr != nil {
 			ba.Error("OBO scopeRowExists check failed",
@@ -112,21 +133,51 @@ func (ba *BotAPI) checkOBO(botUID, grantor, channelID string, channelType uint8)
 				zap.Error(scopeExistErr))
 			return scopeExistErr
 		}
-		if !hasExplicitScope && grant.GlobalEnabled == 1 {
-			isMember, mErr := ba.grantorCanReadChannel(grantor, channelID, channelType)
-			if mErr != nil {
-				ba.Error("OBO implicit-scope membership check failed",
-					zap.String("grantor", grantor),
-					zap.String("channel_id", channelID),
-					zap.Error(mErr))
-				return mErr
-			}
-			if isMember {
-				ba.Info("OBO checkOBO: implicit-scope approved (grantor is group member)",
-					zap.String("grantor", grantor),
-					zap.String("bot", botUID),
-					zap.String("channel_id", channelID))
-				ok = true
+		if !hasExplicitScope {
+			switch {
+			case isGroupLikeChannelType(channelType):
+				isMember, mErr := ba.grantorCanReadChannel(grantor, channelID, channelType)
+				if mErr != nil {
+					ba.Error("OBO implicit-scope membership check failed",
+						zap.String("grantor", grantor),
+						zap.String("channel_id", channelID),
+						zap.Error(mErr))
+					return mErr
+				}
+				if isMember {
+					ba.Info("OBO checkOBO: implicit-scope approved (grantor is group member)",
+						zap.String("grantor", grantor),
+						zap.String("bot", botUID),
+						zap.String("channel_id", channelID))
+					ok = true
+				}
+			case channelType == common.ChannelTypePerson.Uint8():
+				// PR#162 follow-up — DM implicit scope. The friend-gate
+				// (`grantorCanReadChannel` resolves to `IsFriend` for
+				// Person, mirroring the fan-out feeder's TOCTOU re-check)
+				// is the safety net: an unrelated peer cannot exploit
+				// the new branch because the grantor must still have
+				// live access to the DM peer for `ok` to flip true. The
+				// downstream `grantorCanReadChannel` call later in
+				// checkOBO will re-run the same predicate on the dispatch
+				// path, but we must run it here to compute the implicit-
+				// scope approval (otherwise the second call would 403 a
+				// payload we never approved in the first place).
+				canRead, mErr := ba.grantorCanReadChannel(grantor, channelID, channelType)
+				if mErr != nil {
+					ba.Error("OBO implicit-scope DM friend-gate check failed",
+						zap.String("grantor", grantor),
+						zap.String("channel_id", channelID),
+						zap.Error(mErr))
+					return mErr
+				}
+				if canRead {
+					ba.Info("OBO checkOBO: DM implicit-scope approved (global_enabled + friend-gate)",
+						zap.String("grantor", grantor),
+						zap.String("bot", botUID),
+						zap.String("channel_id", channelID))
+					ok = true
+				}
 			}
 		}
 	}

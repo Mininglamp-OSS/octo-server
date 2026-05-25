@@ -62,10 +62,15 @@ import (
 // `grantorCanReadChannel` re-check inside fanoutForMessage still
 // enforces live membership.
 //
-// DM (Person) channels keep the strict scope-row contract: a DM is a
-// 1:1 conversation that the persona must be explicitly authorized for,
-// and the @grantor narrowing gate cannot be applied (DM payloads carry
-// no mention).
+// DM (Person) channels do NOT take this branch. Their implicit-scope
+// fan-out is delivered by the dedicated `findGlobalGrantsForDM` feeder
+// (Mininglamp-OSS/octo-server#161 / PR#162) and the symmetric write path
+// runs in `checkOBO` directly (Mininglamp-OSS/octo-server#162 follow-up):
+// a `global_enabled=1` grant with no scope row authorizes both the
+// inbound DM fan-out and the bot's reply, gated at TOCTOU close-out by
+// the friend-gate (`grantorCanReadChannel` → `IsFriend`). The
+// `@grantor`-mention narrowing path that this helper guards is still
+// group-shaped only — DM payloads carry no mention.
 func isGroupLikeChannelType(channelType uint8) bool {
 	return channelType == common.ChannelTypeGroup.Uint8() ||
 		channelType == common.ChannelTypeCommunityTopic.Uint8()

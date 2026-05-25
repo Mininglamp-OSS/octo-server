@@ -283,8 +283,15 @@ func (f *fakeOBOStore) findActiveGrantsForChannel(channelID string, channelType 
 	// requiring a scope row (the prod fan-out path combines this
 	// with a separate findGlobalGrantsWithoutScope call; aggregating
 	// here keeps the fake's behavior end-to-end equivalent for
-	// fanoutForMessage tests). DM (Person) keeps the strict scope-
-	// row contract.
+	// fanoutForMessage tests).
+	//
+	// DM (Person) implicit-scope is delivered by the dedicated
+	// `findGlobalGrantsForDM` feeder (Mininglamp-OSS/octo-server#161 /
+	// PR#162), NOT this method — `findActiveGrantsForChannel` retains
+	// the strict scope-row contract for DM here so the fake mirrors the
+	// production `INNER JOIN obo_scopes` shape. fanoutForMessage merges
+	// both feeders for DM, same as the group path merges the explicit
+	// and implicit feeders.
 	//
 	// PR#121 R6 / B3 (Jerry-Xin + lml2468 2026-05-22 blocking):
 	// CommunityTopic does NOT take the implicit-global branch here.
