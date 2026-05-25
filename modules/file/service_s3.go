@@ -36,25 +36,26 @@ import (
 //   - ServiceCOS bakes in cos.<region>.myqcloud.com endpoint templating
 //     plus a CDN-alias-vs-canonical client switch for path-style CDN
 //     fronts. ServiceS3 takes the endpoint verbatim from cfg.S3.Endpoint
-//     and supports UsePathStyle as an explicit operator opt-in instead
-//     of detecting it from BucketURL shape.
+//     and supports UsePathStyle as an explicit operator opt-in.
 //
-// Connection model: cfg.S3.Endpoint always uses HTTPS by design. The
-// optional cfg.S3.BucketURL is operator-owned infrastructure and DOES
-// honor `http://` for local emulators; see publicEndpoint and the yaml
-// example for the rationale.
+// Signing model: presigned PUT/GET URLs always sign against cfg.S3.Endpoint.
+// cfg.S3.DownloadURL is the browser-facing prefix for UNSIGNED URLs only
+// (preview redirects, upload response path) — it never participates in
+// SigV4. This deliberate separation removes the previous host-shape
+// detection on BucketURL and aligns with the octo-lib S3Config contract
+// (see config.S3Config.DownloadURL godoc).
 type ServiceS3 struct {
 	log.Log
 	ctx *config.Context
 }
 
 // NewServiceS3 constructs a ServiceS3 from the active config. Required
-// fields (Endpoint, Region, Bucket) are NOT validated here — the
-// constructor returns a usable struct even when fields are missing so
-// the process can start (matching the existing ServiceMinio / ServiceCOS
-// constructors), and per-request errors surface the missing configuration
-// at the first call site. Operators should treat
-// "S3 配置缺失" log lines as a startup failure.
+// fields (Endpoint, Region, Bucket, AccessKeyID, SecretAccessKey) are
+// NOT validated here — the constructor returns a usable struct even when
+// fields are missing so the process can start (matching the existing
+// ServiceMinio / ServiceCOS constructors), and per-request errors
+// surface the missing configuration at the first call site. Operators
+// should treat "S3 配置缺失" log lines as a startup failure.
 func NewServiceS3(ctx *config.Context) *ServiceS3 {
 	return &ServiceS3{
 		Log: log.NewTLog("FileS3"),
@@ -62,12 +63,12 @@ func NewServiceS3(ctx *config.Context) *ServiceS3 {
 	}
 }
 
-// validateConfig fails the request loudly when any of the three required
-// fields is missing, rather than letting the SDK surface an opaque
+// validateConfig fails the request loudly when any required field is
+// missing, rather than letting the SDK surface an opaque
 // "endpoint cannot be empty" or signing-with-empty-key error.
 func (s *ServiceS3) validateConfig() error {
 	cfg := s.ctx.GetConfig().S3
-	missing := make([]string, 0, 3)
+	missing := make([]string, 0, 5)
 	if strings.TrimSpace(cfg.Endpoint) == "" {
 		missing = append(missing, "s3.endpoint")
 	}
@@ -76,6 +77,12 @@ func (s *ServiceS3) validateConfig() error {
 	}
 	if strings.TrimSpace(cfg.Bucket) == "" {
 		missing = append(missing, "s3.bucket")
+	}
+	if strings.TrimSpace(cfg.AccessKeyID) == "" {
+		missing = append(missing, "s3.accessKeyID")
+	}
+	if strings.TrimSpace(cfg.SecretAccessKey) == "" {
+		missing = append(missing, "s3.secretAccessKey")
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("S3 配置缺失: %s 必须设置", strings.Join(missing, ", "))
@@ -112,9 +119,18 @@ func (s *ServiceS3) bucketLookup() minio.BucketLookupType {
 	return minio.BucketLookupDNS
 }
 
-// newClient builds a SigV4-signing minio-go client against cfg.S3.Endpoint.
+// newClient builds the single SigV4-signing minio-go client used for all
+// I/O against this backend: server-side uploads/downloads AND presigned
+// PUT/GET signing. The client always targets cfg.S3.Endpoint; cfg.S3.
+// DownloadURL is deliberately out of scope here (see file-level doc).
+//
+// SessionToken is forwarded when present, enabling STS / IRSA / IMDSv2 /
+// EKS Pod Identity workflows that issue rotating credentials. The token
+// is opaque to ServiceS3 — the deployment pipeline owns refreshing it
+// before STS expiry (see octo-lib S3Config.SessionToken godoc).
+//
 // Region is set explicitly so the SDK skips the GetBucketLocation
-// preflight on first use (same rationale as ServiceCOS.newCanonicalPresignClient).
+// preflight on first use.
 //
 // HTTPS is hard-coded — see the file-level comment for the rationale.
 func (s *ServiceS3) newClient() (*minio.Client, error) {
@@ -129,122 +145,13 @@ func (s *ServiceS3) newClient() (*minio.Client, error) {
 	endpoint = strings.TrimPrefix(endpoint, "http://")
 	endpoint = strings.TrimRight(endpoint, "/")
 	client, err := minio.New(endpoint, &minio.Options{
-		Creds:        credentials.NewStaticV4(cfg.AccessKeyID, cfg.SecretAccessKey, ""),
+		Creds:        credentials.NewStaticV4(cfg.AccessKeyID, cfg.SecretAccessKey, cfg.SessionToken),
 		Secure:       true,
 		Region:       strings.TrimSpace(cfg.Region),
 		BucketLookup: s.bucketLookup(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("创建S3客户端失败: %w", err)
-	}
-	return client, nil
-}
-
-// publicEndpoint resolves the browser-facing host used to sign presigned
-// PUT/GET URLs, and reports the bucket-addressing style the SDK should
-// use to reach it. Mirrors ServiceCOS.publicEndpoint — SigV4 covers
-// `host` and the canonical URI, so the host we sign against must
-// equal the host the browser will hit. Any post-sign rewrite breaks
-// the signature.
-//
-// Resolution rules:
-//
-//  1. cfg.S3.BucketURL is empty — fall back to cfg.S3.Endpoint with
-//     the lookup style chosen by cfg.S3.UsePathStyle.
-//
-//  2. BucketURL host begins with "<bucket>." (canonical bucket-subdomain
-//     shape, e.g. `https://my-bucket.s3.us-west-2.amazonaws.com` or
-//     `https://my-bucket.cdn.example.com`). The bucket already lives
-//     in the host, so we strip "<bucket>." before handing the parent
-//     host to the SDK and use BucketLookupDNS; the SDK re-attaches
-//     "<bucket>." and the resulting signed URL equals BucketURL+key.
-//
-//  3. BucketURL host has no "<bucket>." prefix (CDN alias / accelerator,
-//     e.g. `https://files.example.com`). The CDN routes to the bucket
-//     by some out-of-band rule (origin alias, path mapping, ...).
-//     The SDK signs against the host as-is with BucketLookupPath and
-//     emits `<host>/<bucket>/<key>`. This deliberately produces a URL
-//     shape that differs from publicURL (which returns
-//     `<BucketURL>/<key>` without a bucket segment) — operators
-//     fronting the bucket with a CDN must route both shapes; see the
-//     yaml docs for the deployment recipe.
-//
-// `host` is the bare host[:port] suitable for minio.New (no scheme,
-// no path). `secure` reflects the URL scheme — http:// flips it false
-// for the rare local-emulator-on-CDN case (the file-level "HTTPS only"
-// framing applies to cfg.S3.Endpoint; BucketURL is operator-owned
-// infrastructure and treated as such). `lookup` is the SDK addressing
-// style: DNS for shapes 1 & 2, Path for shape 3.
-func (s *ServiceS3) publicEndpoint() (host string, secure bool, lookup minio.BucketLookupType, err error) {
-	cfg := s.ctx.GetConfig().S3
-	base := strings.TrimSpace(cfg.BucketURL)
-	if base == "" {
-		ep := strings.TrimSpace(cfg.Endpoint)
-		ep = strings.TrimPrefix(ep, "https://")
-		ep = strings.TrimPrefix(ep, "http://")
-		ep = strings.TrimRight(ep, "/")
-		return ep, true, s.bucketLookup(), nil
-	}
-	parsed, parseErr := url.Parse(strings.TrimRight(base, "/"))
-	if parseErr != nil || parsed == nil || parsed.Host == "" {
-		s.Warn("s3.bucketURL 解析失败，预签名URL退回到 s3.endpoint",
-			zap.String("bucketURL", base))
-		ep := strings.TrimSpace(cfg.Endpoint)
-		ep = strings.TrimPrefix(ep, "https://")
-		ep = strings.TrimPrefix(ep, "http://")
-		ep = strings.TrimRight(ep, "/")
-		return ep, true, s.bucketLookup(), nil
-	}
-	if parsed.Path != "" && parsed.Path != "/" {
-		// SigV4 covers the canonical URI; a path component on BucketURL
-		// would be stripped before signing and produce
-		// SignatureDoesNotMatch at the browser. Reject loudly rather
-		// than silently dropping the path.
-		return "", false, 0, fmt.Errorf("s3.bucketURL 不可包含路径前缀（%q），仅支持 scheme://host[:port] 形式", base)
-	}
-	secure = !strings.EqualFold(parsed.Scheme, "http")
-	h := parsed.Host
-	if cfg.Bucket != "" {
-		bucketPrefix := cfg.Bucket + "."
-		if strings.HasPrefix(h, bucketPrefix) {
-			// Bucket-subdomain shape: strip "<bucket>." so the SDK with
-			// BucketLookupDNS can re-attach it without producing
-			// "<bucket>.<bucket>.<parent>".
-			parent := strings.TrimPrefix(h, bucketPrefix)
-			if parent == "" {
-				s.Warn("s3.bucketURL 仅包含 bucket 子域，无父域可签名，回退到 s3.endpoint",
-					zap.String("bucketURL", base))
-				ep := strings.TrimSpace(cfg.Endpoint)
-				ep = strings.TrimPrefix(ep, "https://")
-				ep = strings.TrimPrefix(ep, "http://")
-				ep = strings.TrimRight(ep, "/")
-				return ep, true, s.bucketLookup(), nil
-			}
-			return parent, secure, minio.BucketLookupDNS, nil
-		}
-	}
-	// CDN alias / accelerator: no "<bucket>." prefix. Sign against the
-	// host directly with path-style addressing.
-	return h, secure, minio.BucketLookupPath, nil
-}
-
-// newPublicClient builds the client used for presigned URL generation.
-// Routes through publicEndpoint so the signed URL's host matches the
-// host the browser will hit; otherwise SigV4 rejects at validation.
-func (s *ServiceS3) newPublicClient() (*minio.Client, error) {
-	cfg := s.ctx.GetConfig().S3
-	host, secure, lookup, err := s.publicEndpoint()
-	if err != nil {
-		return nil, err
-	}
-	client, err := minio.New(host, &minio.Options{
-		Creds:        credentials.NewStaticV4(cfg.AccessKeyID, cfg.SecretAccessKey, ""),
-		Secure:       secure,
-		Region:       strings.TrimSpace(cfg.Region),
-		BucketLookup: lookup,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("创建S3公网客户端失败: %w", err)
 	}
 	return client, nil
 }
@@ -328,15 +235,20 @@ func (s *ServiceS3) DownloadURL(ph string, filename string) (string, error) {
 	return s.publicURL(ph), nil
 }
 
-// publicURL constructs the public-shape URL for an object. If BucketURL
-// is set it wins (typical CDN front-door scenario). Otherwise we build
-// a virtual-hosted URL against cfg.S3.Endpoint — works for AWS S3 and
-// any provider whose endpoint accepts <bucket>.<endpoint> DNS.
+// publicURL constructs the unsigned, browser-facing URL for an object.
+// cfg.S3.DownloadURL wins when set (typical CloudFront / CDN front-door
+// or custom-domain scenario). Otherwise we build a virtual-hosted URL
+// against cfg.S3.Endpoint — works for AWS S3 and any provider whose
+// endpoint accepts <bucket>.<endpoint> DNS; with UsePathStyle the URL
+// flips to <endpoint>/<bucket>/<key>.
+//
+// cfg.S3.DownloadURL is NEVER used for SigV4 signing — that responsibility
+// belongs to newClient against cfg.S3.Endpoint.
 func (s *ServiceS3) publicURL(objectPath string) string {
 	cfg := s.ctx.GetConfig().S3
 	key := s.withPrefix(objectPath)
 
-	base := strings.TrimRight(strings.TrimSpace(cfg.BucketURL), "/")
+	base := strings.TrimRight(strings.TrimSpace(cfg.DownloadURL), "/")
 	if base != "" {
 		result, _ := url.JoinPath(base, key)
 		return result
@@ -363,6 +275,10 @@ func (s *ServiceS3) publicURL(objectPath string) string {
 // MaxFileSize on the presigned path — same model as ServiceMinio /
 // ServiceCOS, see modules/file/api.go getUploadCredentials for the full
 // signed-header contract returned to clients.
+//
+// Signing host is always cfg.S3.Endpoint; cfg.S3.DownloadURL has no
+// influence on the signed URL. The returned downloadURL (unsigned) is
+// constructed via publicURL and may carry the DownloadURL prefix.
 func (s *ServiceS3) PresignedPutURL(objectPath string, contentType string, contentDisposition string, fileSize int64, expires time.Duration) (uploadURL string, downloadURL string, err error) {
 	if fileSize <= 0 {
 		return "", "", errors.New("预签名上传必须提供正向的 fileSize（字节数），用于在签名中固定 Content-Length")
@@ -371,7 +287,7 @@ func (s *ServiceS3) PresignedPutURL(objectPath string, contentType string, conte
 		return "", "", err
 	}
 
-	client, err := s.newPublicClient()
+	client, err := s.newClient()
 	if err != nil {
 		return "", "", err
 	}
@@ -408,12 +324,13 @@ func (s *ServiceS3) PresignedPutURL(objectPath string, contentType string, conte
 
 // PresignedGetURL signs a GET URL with a Content-Disposition override so
 // the browser downloads with the operator-supplied filename instead of
-// the raw object key.
+// the raw object key. Signing host is always cfg.S3.Endpoint (see
+// file-level doc).
 func (s *ServiceS3) PresignedGetURL(objectPath string, filename string, disposition string, expires time.Duration) (string, error) {
 	if err := s.validateConfig(); err != nil {
 		return "", err
 	}
-	client, err := s.newPublicClient()
+	client, err := s.newClient()
 	if err != nil {
 		return "", err
 	}

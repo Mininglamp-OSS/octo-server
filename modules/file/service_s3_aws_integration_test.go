@@ -37,7 +37,7 @@ import (
 //
 // Optional:
 //
-//	TS_S3_TEST_BUCKET_URL        BucketURL override (CDN front, custom domain)
+//	TS_S3_TEST_DOWNLOAD_URL      DownloadURL override (CDN front, custom domain). Unsigned URL prefix only.
 //	TS_S3_TEST_USE_PATH_STYLE    "true" to force path-style addressing
 type awsS3TestEnv struct {
 	Endpoint        string
@@ -45,7 +45,7 @@ type awsS3TestEnv struct {
 	Bucket          string
 	AccessKeyID     string
 	SecretAccessKey string
-	BucketURL       string
+	DownloadURL     string
 	UsePathStyle    bool
 }
 
@@ -57,7 +57,7 @@ func requireAWSS3Env(t *testing.T) awsS3TestEnv {
 		Bucket:          os.Getenv("TS_S3_TEST_BUCKET"),
 		AccessKeyID:     os.Getenv("TS_S3_TEST_ACCESS_KEY_ID"),
 		SecretAccessKey: os.Getenv("TS_S3_TEST_SECRET_ACCESS_KEY"),
-		BucketURL:       os.Getenv("TS_S3_TEST_BUCKET_URL"),
+		DownloadURL:     os.Getenv("TS_S3_TEST_DOWNLOAD_URL"),
 		UsePathStyle:    strings.EqualFold(os.Getenv("TS_S3_TEST_USE_PATH_STYLE"), "true"),
 	}
 	missing := make([]string, 0, 5)
@@ -91,7 +91,7 @@ func newAWSS3TestService(t *testing.T, env awsS3TestEnv) (*file.ServiceS3, *conf
 	cfg.S3.Bucket = env.Bucket
 	cfg.S3.AccessKeyID = env.AccessKeyID
 	cfg.S3.SecretAccessKey = env.SecretAccessKey
-	cfg.S3.BucketURL = env.BucketURL
+	cfg.S3.DownloadURL = env.DownloadURL
 	cfg.S3.UsePathStyle = env.UsePathStyle
 	// Use a unique prefix per test run so concurrent runs (CI parallelism)
 	// and re-runs after partial failures don't collide.
@@ -263,7 +263,7 @@ func TestAWSS3Integration_PresignedPUTRejectsSizeMismatch(t *testing.T) {
 }
 
 // TestAWSS3Integration_DownloadURLShape sanity-checks that the public
-// (unsigned) download URL points at the configured BucketURL host
+// (unsigned) download URL points at the configured DownloadURL host
 // when set, and at the canonical S3 hostname when not. We don't
 // follow the URL — for private buckets it will 403 — but the host /
 // path shape is what /v1/file/preview hands the browser.
@@ -281,10 +281,10 @@ func TestAWSS3Integration_DownloadURLShape(t *testing.T) {
 	assert.True(t, strings.HasSuffix(u.EscapedPath(), expectedSuffix) ||
 		strings.HasSuffix(u.EscapedPath(), expectedSuffix[1:]),
 		"DownloadURL path must include the configured prefix + object path, got %s", u.EscapedPath())
-	if env.BucketURL != "" {
-		bu, _ := url.Parse(env.BucketURL)
+	if env.DownloadURL != "" {
+		bu, _ := url.Parse(env.DownloadURL)
 		assert.Equal(t, bu.Host, u.Host,
-			"BucketURL host must dominate DownloadURL host when set")
+			"DownloadURL host must dominate the unsigned URL host when set")
 	}
 }
 

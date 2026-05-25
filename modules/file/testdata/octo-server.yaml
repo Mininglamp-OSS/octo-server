@@ -196,46 +196,27 @@ minio:
 #          "ExposeHeaders": ["ETag"],
 #          "MaxAgeSeconds": 3000
 #        }]
-#   4. Public-read posture: octo-server's `/v1/file/preview/*` redirects
-#      to the UNSIGNED object URL returned by `ServiceS3.DownloadURL`,
-#      and the multipart upload response stores that same unsigned URL
-#      as the file's `path`. Both are consumed by clients without
-#      signing, mirroring how the MinIO and COS backends operate today.
-#      For AWS S3 this means operators choose ONE of three deployment
-#      shapes; the right choice is operator-specific. Block Public
-#      Access ON without one of these options will cause 403 on every
-#      preview and on every stored object reference.
+#   4. Browser-facing URL posture: with Block Public Access ON (the AWS
+#      default), the unsigned URLs returned by `/v1/file/preview/*` and
+#      stored in upload responses cannot be opened directly by clients.
+#      Two clean deployment shapes:
 #
-#      (A) CloudFront + Origin Access Control (RECOMMENDED for AWS-only)
+#      (A) CloudFront + Origin Access Control (RECOMMENDED for AWS)
 #          • Bucket: keep Block Public Access ON.
 #          • Front the bucket with CloudFront; attach an OAC so
 #            CloudFront identifies itself to the bucket; bucket policy
 #            grants `s3:GetObject` to that CloudFront principal only.
-#          • Set `s3.bucketURL` to the CloudFront distribution URL.
-#          • Pros: bucket stays fully private; URLs stable; cacheable.
-#          • Cons: cold-start latency on new keys; CloudFront billing.
+#          • Set `s3.downloadURL` to the CloudFront distribution URL
+#            (e.g. https://d123.cloudfront.net). Browser GETs flow
+#            through CloudFront; presigned PUT/GET still go directly
+#            to S3 (signed against `s3.endpoint`, not the CDN host —
+#            no cache-poisoning or signature-mismatch risk).
 #
-#      (B) Bucket policy allow-list `s3:GetObject` to "*" (public read)
-#          • Bucket: turn Block Public Access OFF on "Block public
-#            access through new policies"; attach a policy granting
-#            `s3:GetObject` on `arn:aws:s3:::<bucket>/*` to `"*"`.
-#          • Set `s3.bucketURL` empty so URLs use the AWS endpoint
-#            host directly.
-#          • Pros: simplest; lowest cost.
-#          • Cons: ALL object contents are world-readable; defeats
-#            AWS perimeter defense. Only acceptable when none of the
-#            uploaded content is sensitive (e.g. public avatars).
-#
-#      (C) Client-side: always use `/v1/file/download/url` (presigned)
-#          • Bucket: keep Block Public Access ON.
-#          • Re-route every client that today hits `/v1/file/preview/*`
-#            to `/v1/file/download/url` instead, and re-resolve stored
-#            `path` fields through the same endpoint before use.
-#          • Pros: bucket stays private without CDN; per-URL access
-#            control.
-#          • Cons: requires client refactor; URLs expire (default 30
-#            min); previously-stored `path` fields are no longer
-#            directly usable.
+#      (B) All-presigned: keep Block Public Access ON, route every
+#          client read through `/v1/file/download/url` (presigned GET),
+#          and avoid persisting unsigned URLs. Leave `s3.downloadURL`
+#          empty. Trade-off: URLs expire (default 30 min) and stored
+#          `path` fields must be re-signed before use.
 #
 # Region / endpoint semantics:
 #
@@ -288,45 +269,44 @@ minio:
 #  #     Use these when your host has unrelated AWS_* set and you want
 #  #     octo-server to talk to a different account (e.g. R2 / B2).
 #  #
-#  # NOTE: ServiceS3 currently signs with STATIC credentials only. IRSA /
-#  # IMDSv2 / web-identity / SSO credential provider chains are NOT
-#  # exercised — the SDK is constructed via `credentials.NewStaticV4`.
-#  # If you need rotating credentials (EKS pod role, ECS task role,
-#  # Instance Profile), wire that into your deployment pipeline so it
-#  # writes fresh AWS_* env vars before octo-server starts, or open an
-#  # issue to add a provider-chain option to ServiceS3.
 #  accessKeyID: "AKIA..."
 #  secretAccessKey: "..."
 #
-#  # OPTIONAL: BucketURL — overrides the URL returned by DownloadURL
-#  # and the host signed against by presigned PUT/GET. Set this when
-#  # operators front the bucket with CloudFront / a custom domain.
-#  # MUST be scheme://host[:port] with NO path component (a path
-#  # prefix would be stripped before SigV4 canonical URI computation
-#  # and produce 403 SignatureDoesNotMatch at the browser).
+#  # OPTIONAL: SessionToken — AWS STS session token paired with
+#  # temporary credentials (IRSA, IMDSv2, EKS Pod Identity, AWS SSO,
+#  # `aws sts assume-role`). Leave empty for long-lived IAM user
+#  # keys. ServiceS3 forwards the token verbatim into SigV4; the
+#  # signed URL gains `X-Amz-Security-Token` in its query.
 #  #
-#  # Two supported shapes — detected from the host:
+#  # Lifecycle: ServiceS3 does NOT refresh tokens itself. Your
+#  # deployment pipeline must rotate AccessKeyID / SecretAccessKey /
+#  # SessionToken (typically via env vars) before STS expiry (default
+#  # 1h, max 12h depending on role configuration). A stale token
+#  # produces 403 ExpiredToken on every signed request — fail loud,
+#  # not silent.
 #  #
-#  #   (1) Bucket-subdomain: host begins with "<bucket>."
-#  #       e.g. `https://my-octo-bucket.files.example.com`
-#  #       The SDK strips "<bucket>." and uses BucketLookupDNS so the
-#  #       resulting signed URL equals `<BucketURL>/<key>` exactly.
+#  # Env-var precedence (octo-lib wiring, project-prefixed wins):
+#  #   AWS_SESSION_TOKEN
+#  #   TS_S3_SESSION_TOKEN  (preferred for octo deployments)
+#  # sessionToken: ""
+#
+#  # OPTIONAL: DownloadURL — browser-facing base URL for UNSIGNED
+#  # object access (preview redirects, upload-response `path` field).
+#  # NEVER signs SigV4: presigned PUT/GET URLs are ALWAYS signed
+#  # against `s3.endpoint`, regardless of this value. Set this when
+#  # you front the bucket with CloudFront / a custom domain for
+#  # browser reads.
 #  #
-#  #   (2) CDN alias: host has NO "<bucket>." prefix
-#  #       e.g. `https://files.example.com`
-#  #       The SDK uses BucketLookupPath and emits
-#  #       `<host>/<bucket>/<key>` (with bucket in the URL path).
-#  #       Note that `DownloadURL` here returns `<BucketURL>/<key>`
-#  #       (without the bucket segment), so the CDN must be configured
-#  #       to route BOTH shapes to the bucket origin — one for the
-#  #       browser following the unsigned URL, the other for the
-#  #       presigned PUT/GET path.
+#  # Must be scheme://host[:port] with NO path component (same
+#  # contract as MinioConfig.DownloadURL).
 #  #
-#  # HTTPS-only contract: ServiceS3's primary endpoint (`s3.endpoint`)
-#  # always uses HTTPS. BucketURL is treated as operator-owned
-#  # infrastructure and DOES honor `http://` for local emulator
-#  # deployments — set this consciously, not by accident.
-#  # bucketURL: "https://files.example.com"
+#  # Typical values:
+#  #   - empty                              → URLs use the canonical
+#  #                                          virtual-hosted form
+#  #                                          `https://<bucket>.<endpoint>/<key>`
+#  #   - CloudFront distribution            → https://d123.cloudfront.net
+#  #   - bucket-subdomain custom domain     → https://my-octo-bucket.cdn.example.com
+#  # downloadURL: "https://d123.cloudfront.net"
 #
 #  # OPTIONAL: object-key prefix for multi-environment isolation
 #  # against a shared bucket. Mirrors COS Prefix.

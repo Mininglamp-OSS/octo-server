@@ -13,7 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// baseS3Cfg returns a config with the three required S3 fields populated
+// baseS3Cfg returns a config with all required S3 fields populated
 // against fake AWS-shaped values. Tests override individual fields as
 // needed.
 func baseS3Cfg() *config.Config {
@@ -49,13 +49,32 @@ func TestServiceS3_FailFastOnMissingRequiredConfig(t *testing.T) {
 			wantMsg: "s3.bucket",
 		},
 		{
-			name: "all three missing reported together",
+			name:    "missing accessKeyID",
+			mutate:  func(c *config.Config) { c.S3.AccessKeyID = "" },
+			wantMsg: "s3.accessKeyID",
+		},
+		{
+			name:    "missing secretAccessKey",
+			mutate:  func(c *config.Config) { c.S3.SecretAccessKey = "" },
+			wantMsg: "s3.secretAccessKey",
+		},
+		{
+			name: "all required fields missing reported together",
 			mutate: func(c *config.Config) {
 				c.S3.Endpoint = ""
 				c.S3.Region = ""
 				c.S3.Bucket = ""
+				c.S3.AccessKeyID = ""
+				c.S3.SecretAccessKey = ""
 			},
-			wantMsg: "s3.endpoint, s3.region, s3.bucket",
+			wantMsg: "s3.endpoint, s3.region, s3.bucket, s3.accessKeyID, s3.secretAccessKey",
+		},
+		{
+			name: "SessionToken empty is fine (optional field)",
+			mutate: func(c *config.Config) {
+				c.S3.SessionToken = ""
+			},
+			wantMsg: "",
 		},
 	}
 	for _, tc := range tests {
@@ -65,15 +84,22 @@ func TestServiceS3_FailFastOnMissingRequiredConfig(t *testing.T) {
 			svc := file.NewServiceS3(testutil.NewTestContext(cfg))
 
 			_, _, err := svc.PresignedPutURL("chat/foo.jpg", "image/jpeg", "", 1024, time.Minute)
+			if tc.wantMsg == "" {
+				require.NoError(t, err)
+				return
+			}
 			require.Error(t, err)
 			require.Contains(t, err.Error(), tc.wantMsg)
 		})
 	}
 }
 
-func TestServiceS3_PresignedPutURL_SignsAgainstEndpointWhenBucketURLEmpty(t *testing.T) {
+func TestServiceS3_PresignedPutURL_AlwaysSignsAgainstEndpoint(t *testing.T) {
+	// Core regression: presigned PUT URL host must equal cfg.S3.Endpoint
+	// (with the bucket virtual-hosted in front), regardless of whether
+	// DownloadURL is set. DownloadURL is for unsigned browser URLs only.
 	cfg := baseS3Cfg()
-	cfg.S3.BucketURL = ""
+	cfg.S3.DownloadURL = ""
 
 	svc := file.NewServiceS3(testutil.NewTestContext(cfg))
 
@@ -110,71 +136,80 @@ func TestServiceS3_PresignedPutURL_SignsAgainstEndpointWhenBucketURLEmpty(t *tes
 		"presigned PUT URL must include `content-length` in signed headers to enforce upload size cap (got %q)", signedHeaders)
 }
 
-func TestServiceS3_PresignedPutURL_BucketSubdomainBucketURL(t *testing.T) {
-	// Bucket-subdomain shape: BucketURL host begins with "<bucket>.".
-	// SDK must use BucketLookupDNS against the parent host so the
-	// signed URL equals BucketURL+key exactly. Pre-fix this was
-	// producing "octo-test-bucket.octo-test-bucket.files.example.com"
-	// (double bucket) because the SDK re-attached <bucket>. on top of
-	// the already-prefixed host.
+// TestServiceS3_PresignedURL_DownloadURLDoesNotAffectSigning pins the
+// soul of the post-#43 contract: presigned PUT/GET URLs must ALWAYS
+// sign against cfg.S3.Endpoint, no matter what DownloadURL is. If a
+// future change accidentally re-introduces DownloadURL into the signing
+// path (e.g. by reading it in newClient), this test will catch the
+// signature-host drift before it ships.
+func TestServiceS3_PresignedURL_DownloadURLDoesNotAffectSigning(t *testing.T) {
+	endpointHostSuffix := "us-west-2.amazonaws.com"
+
+	for _, downloadURL := range []string{
+		"https://d123.cloudfront.net",                 // CloudFront alias
+		"https://files.example.com",                   // generic CDN alias
+		"https://octo-test-bucket.cdn.example.com",    // bucket-subdomain custom domain
+		"http://localhost:9000",                       // local emulator
+	} {
+		t.Run(downloadURL, func(t *testing.T) {
+			cfg := baseS3Cfg()
+			cfg.S3.DownloadURL = downloadURL
+
+			svc := file.NewServiceS3(testutil.NewTestContext(cfg))
+
+			// PUT
+			uploadURL, _, err := svc.PresignedPutURL(
+				"chat/2026/05/abc.jpg", "image/jpeg", "", 1024, 5*time.Minute,
+			)
+			require.NoError(t, err)
+			pu, err := url.Parse(uploadURL)
+			require.NoError(t, err)
+			assert.True(t, strings.HasSuffix(pu.Host, endpointHostSuffix),
+				"presigned PUT host must derive from Endpoint, not DownloadURL=%q (got %s)", downloadURL, pu.Host)
+			assert.Equal(t, "https", pu.Scheme,
+				"presigned PUT must always be HTTPS regardless of DownloadURL scheme")
+
+			// GET
+			getURL, err := svc.PresignedGetURL("chat/abc.jpg", "x.jpg", "attachment", time.Minute)
+			require.NoError(t, err)
+			gu, err := url.Parse(getURL)
+			require.NoError(t, err)
+			assert.True(t, strings.HasSuffix(gu.Host, endpointHostSuffix),
+				"presigned GET host must derive from Endpoint, not DownloadURL=%q (got %s)", downloadURL, gu.Host)
+			assert.Equal(t, "https", gu.Scheme)
+		})
+	}
+}
+
+// TestServiceS3_SessionToken_AppearsInSignedURL covers STS / IRSA / IMDSv2
+// rotating-credentials workflows: when cfg.S3.SessionToken is set,
+// minio-go must add X-Amz-Security-Token to the presigned URL query, or
+// AWS will reject the request as "InvalidToken / The security token
+// included in the request is invalid."
+func TestServiceS3_SessionToken_AppearsInSignedURL(t *testing.T) {
 	cfg := baseS3Cfg()
-	cfg.S3.BucketURL = "https://octo-test-bucket.files.example.com"
+	cfg.S3.SessionToken = "IQoJb3JpZ2luX2VjEXAMPLESESSIONTOKENvalueGRwEAAaCXVzLWVhc3QtMQ=="
 
 	svc := file.NewServiceS3(testutil.NewTestContext(cfg))
 
 	uploadURL, _, err := svc.PresignedPutURL(
-		"chat/2026/05/abc.jpg", "image/jpeg", "", 12345, 5*time.Minute,
+		"chat/abc.jpg", "image/jpeg", "", 1024, time.Minute,
 	)
 	require.NoError(t, err)
-
 	u, err := url.Parse(uploadURL)
 	require.NoError(t, err)
-	// Pinned: presigned URL host must equal BucketURL host exactly —
-	// that is the host the browser resolves and the host SigV4
-	// canonicalized into the signature.
-	assert.Equal(t, "octo-test-bucket.files.example.com", u.Host,
-		"bucket-subdomain BucketURL: signed URL host must equal BucketURL host (no double bucket prefix), got %s", u.Host)
-}
 
-func TestServiceS3_PresignedPutURL_CDNAliasBucketURL(t *testing.T) {
-	// CDN alias shape: BucketURL host has NO "<bucket>." prefix. SDK
-	// must use BucketLookupPath so the bucket lives in the URL path
-	// (`/<bucket>/<key>`) rather than the SDK silently constructing a
-	// "<bucket>.files.example.com" subdomain that does not exist in
-	// DNS (the original reviewer-flagged bug).
-	cfg := baseS3Cfg()
-	cfg.S3.BucketURL = "https://files.example.com"
+	token := u.Query().Get("X-Amz-Security-Token")
+	require.NotEmpty(t, token,
+		"presigned URL must carry X-Amz-Security-Token when SessionToken is configured (STS path)")
+	assert.Equal(t, cfg.S3.SessionToken, token,
+		"X-Amz-Security-Token must equal the configured SessionToken verbatim")
 
-	svc := file.NewServiceS3(testutil.NewTestContext(cfg))
-
-	uploadURL, _, err := svc.PresignedPutURL(
-		"chat/2026/05/abc.jpg", "image/jpeg", "", 12345, 5*time.Minute,
-	)
+	// GET path mirrors PUT.
+	getURL, err := svc.PresignedGetURL("chat/abc.jpg", "x.jpg", "attachment", time.Minute)
 	require.NoError(t, err)
-
-	u, err := url.Parse(uploadURL)
-	require.NoError(t, err)
-	// Pinned: signed URL host must equal BucketURL host exactly,
-	// without an added "<bucket>." subdomain.
-	assert.Equal(t, "files.example.com", u.Host,
-		"CDN-alias BucketURL: signed URL host must equal BucketURL host (no added bucket subdomain), got %s", u.Host)
-	// Bucket lives in the path with path-style addressing.
-	assert.Contains(t, u.Path, "/octo-test-bucket/",
-		"CDN-alias BucketURL: bucket segment must appear in the URL path, got %s", u.Path)
-}
-
-func TestServiceS3_PresignedPutURL_RejectsBucketURLWithPathPrefix(t *testing.T) {
-	cfg := baseS3Cfg()
-	// Path components on BucketURL would be stripped before SigV4
-	// canonical URI computation, producing 403 SignatureDoesNotMatch
-	// at the browser. Reject loudly rather than silently dropping the
-	// path — same contract as MinioConfig.DownloadURL.
-	cfg.S3.BucketURL = "https://cdn.example.com/s3"
-
-	svc := file.NewServiceS3(testutil.NewTestContext(cfg))
-	_, _, err := svc.PresignedPutURL("chat/foo.jpg", "image/jpeg", "", 1024, time.Minute)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "路径前缀")
+	gu, _ := url.Parse(getURL)
+	assert.Equal(t, cfg.S3.SessionToken, gu.Query().Get("X-Amz-Security-Token"))
 }
 
 func TestServiceS3_PresignedPutURL_RejectsZeroOrNegativeFileSize(t *testing.T) {
@@ -217,7 +252,7 @@ func TestServiceS3_PresignedURLs_RejectMalformedObjectKeys(t *testing.T) {
 
 func TestServiceS3_DownloadURL_VirtualHostedStyle(t *testing.T) {
 	cfg := baseS3Cfg()
-	cfg.S3.BucketURL = ""
+	cfg.S3.DownloadURL = ""
 	cfg.S3.UsePathStyle = false
 
 	svc := file.NewServiceS3(testutil.NewTestContext(cfg))
@@ -228,7 +263,7 @@ func TestServiceS3_DownloadURL_VirtualHostedStyle(t *testing.T) {
 
 func TestServiceS3_DownloadURL_PathStyle(t *testing.T) {
 	cfg := baseS3Cfg()
-	cfg.S3.BucketURL = ""
+	cfg.S3.DownloadURL = ""
 	cfg.S3.UsePathStyle = true
 
 	svc := file.NewServiceS3(testutil.NewTestContext(cfg))
@@ -237,9 +272,9 @@ func TestServiceS3_DownloadURL_PathStyle(t *testing.T) {
 	assert.Equal(t, "https://s3.us-west-2.amazonaws.com/octo-test-bucket/chat/2026/abc.jpg", got)
 }
 
-func TestServiceS3_DownloadURL_BucketURLOverride(t *testing.T) {
+func TestServiceS3_DownloadURL_DownloadURLOverride(t *testing.T) {
 	cfg := baseS3Cfg()
-	cfg.S3.BucketURL = "https://cdn.example.com"
+	cfg.S3.DownloadURL = "https://cdn.example.com"
 
 	svc := file.NewServiceS3(testutil.NewTestContext(cfg))
 	got, err := svc.DownloadURL("chat/2026/abc.jpg", "")
@@ -249,7 +284,7 @@ func TestServiceS3_DownloadURL_BucketURLOverride(t *testing.T) {
 
 func TestServiceS3_DownloadURL_WithPrefix(t *testing.T) {
 	cfg := baseS3Cfg()
-	cfg.S3.BucketURL = "https://cdn.example.com"
+	cfg.S3.DownloadURL = "https://cdn.example.com"
 	cfg.S3.Prefix = "prod"
 
 	svc := file.NewServiceS3(testutil.NewTestContext(cfg))
@@ -270,7 +305,7 @@ func TestServiceS3_EndpointTolerates_FullURL(t *testing.T) {
 		t.Run(ep, func(t *testing.T) {
 			cfg := baseS3Cfg()
 			cfg.S3.Endpoint = ep
-			cfg.S3.BucketURL = ""
+			cfg.S3.DownloadURL = ""
 
 			svc := file.NewServiceS3(testutil.NewTestContext(cfg))
 			uploadURL, _, err := svc.PresignedPutURL(

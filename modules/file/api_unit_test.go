@@ -966,6 +966,7 @@ func TestGetDownloadURL_PathStyleStripsBucketSegment(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := config.New()
 			cfg.Test = true
+			cfg.FileService = config.FileServiceTencentCOS
 			cfg.COS.Bucket = tc.bucket
 			cfg.COS.Region = "ap-beijing"
 			cfg.COS.BucketURL = tc.bucketURL
@@ -1015,7 +1016,7 @@ func TestGetDownloadURL_S3PrefixAndBucketStrip(t *testing.T) {
 	cases := []struct {
 		name             string
 		bucket           string
-		bucketURL        string
+		downloadURL      string
 		prefix           string
 		usePathStyle     bool
 		inputPath        string
@@ -1024,7 +1025,7 @@ func TestGetDownloadURL_S3PrefixAndBucketStrip(t *testing.T) {
 		{
 			name:             "virtual-hosted with prefix strips just prefix",
 			bucket:           "my-bucket",
-			bucketURL:        "",
+			downloadURL:      "",
 			prefix:           "prod",
 			usePathStyle:     false,
 			inputPath:        "https://my-bucket.s3.us-west-2.amazonaws.com/prod/chat/2026/05/abc.jpg",
@@ -1033,7 +1034,7 @@ func TestGetDownloadURL_S3PrefixAndBucketStrip(t *testing.T) {
 		{
 			name:             "path-style with prefix strips bucket then prefix",
 			bucket:           "my-bucket",
-			bucketURL:        "",
+			downloadURL:      "",
 			prefix:           "prod",
 			usePathStyle:     true,
 			inputPath:        "https://s3.us-west-2.amazonaws.com/my-bucket/prod/chat/2026/05/abc.jpg",
@@ -1042,16 +1043,16 @@ func TestGetDownloadURL_S3PrefixAndBucketStrip(t *testing.T) {
 		{
 			name:             "path-style no prefix strips just bucket",
 			bucket:           "my-bucket",
-			bucketURL:        "",
+			downloadURL:      "",
 			prefix:           "",
 			usePathStyle:     true,
 			inputPath:        "https://s3.us-west-2.amazonaws.com/my-bucket/chat/2026/05/abc.jpg",
 			wantSignedObject: "chat/2026/05/abc.jpg",
 		},
 		{
-			name:             "CDN BucketURL with prefix — bucket NOT in path, only prefix stripped",
+			name:             "CDN DownloadURL with prefix — bucket NOT in path, only prefix stripped",
 			bucket:           "my-bucket",
-			bucketURL:        "https://files.example.com",
+			downloadURL:      "https://files.example.com",
 			prefix:           "prod",
 			usePathStyle:     false,
 			inputPath:        "https://files.example.com/prod/chat/2026/05/abc.jpg",
@@ -1060,7 +1061,7 @@ func TestGetDownloadURL_S3PrefixAndBucketStrip(t *testing.T) {
 		{
 			name:             "virtual-hosted no prefix — path is just key",
 			bucket:           "my-bucket",
-			bucketURL:        "",
+			downloadURL:      "",
 			prefix:           "",
 			usePathStyle:     false,
 			inputPath:        "https://my-bucket.s3.us-west-2.amazonaws.com/chat/2026/05/abc.jpg",
@@ -1069,7 +1070,7 @@ func TestGetDownloadURL_S3PrefixAndBucketStrip(t *testing.T) {
 		{
 			name:             "non-URL path passes through unchanged",
 			bucket:           "my-bucket",
-			bucketURL:        "",
+			downloadURL:      "",
 			prefix:           "prod",
 			usePathStyle:     false,
 			inputPath:        "chat/2026/05/abc.jpg",
@@ -1081,10 +1082,11 @@ func TestGetDownloadURL_S3PrefixAndBucketStrip(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := config.New()
 			cfg.Test = true
+			cfg.FileService = "awsS3"
 			cfg.S3.Endpoint = "s3.us-west-2.amazonaws.com"
 			cfg.S3.Region = "us-west-2"
 			cfg.S3.Bucket = tc.bucket
-			cfg.S3.BucketURL = tc.bucketURL
+			cfg.S3.DownloadURL = tc.downloadURL
 			cfg.S3.Prefix = tc.prefix
 			cfg.S3.UsePathStyle = tc.usePathStyle
 
