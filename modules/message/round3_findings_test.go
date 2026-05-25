@@ -270,5 +270,57 @@ func TestSpaceID_Round3_SidebarMySourceSpaceID(t *testing.T) {
 	})
 }
 
+// TestSpaceID_Round3_SpaceMemberships_AllJoinedGroups 验证
+// /v1/conversation/sync 新增的 sideband 契约：无论本批增量 conversations
+// 返回哪些会话，space_memberships 都必须覆盖用户已加入的全部群，供客户端
+// 初始化 group/my-row 缓存，关闭 groupSpaceId=null 与 my-row-not-cached 的
+// fail-open 窗口。
+func TestSpaceID_Round3_SpaceMemberships_AllJoinedGroups(t *testing.T) {
+	joinedGroups := []*group.InfoResp{
+		{GroupNo: "g_default", SpaceID: "minglue_default"},
+		{GroupNo: "g_external", SpaceID: "space_remote"},
+		{GroupNo: "g_legacy_ext", SpaceID: "space_remote"},
+	}
+	externalGroupMap := map[string]string{
+		"g_external":   "space_source",
+		"g_legacy_ext": "", // 旧外部成员行，必须兜底 defaultSpaceID。
+	}
+
+	got := buildSpaceMemberships(joinedGroups, externalGroupMap, "minglue_default")
+
+	require.Len(t, got, 3)
+	byID := make(map[string]SpaceMembership, len(got))
+	for _, m := range got {
+		byID[m.ChannelID] = m
+	}
+
+	assert.Equal(t, SpaceMembership{
+		ChannelID: "g_default",
+		SpaceID:   "minglue_default",
+	}, byID["g_default"])
+	assert.Equal(t, SpaceMembership{
+		ChannelID:       "g_external",
+		SpaceID:         "space_remote",
+		MySourceSpaceID: "space_source",
+	}, byID["g_external"])
+	assert.Equal(t, SpaceMembership{
+		ChannelID:       "g_legacy_ext",
+		SpaceID:         "space_remote",
+		MySourceSpaceID: "minglue_default",
+	}, byID["g_legacy_ext"])
+}
+
+func TestSpaceID_Round3_SpaceMemberships_SkipsInvalidRows(t *testing.T) {
+	got := buildSpaceMemberships([]*group.InfoResp{
+		nil,
+		{GroupNo: "", SpaceID: "spaceA"},
+		{GroupNo: "g1", SpaceID: ""},
+		{GroupNo: "g2", SpaceID: "spaceB"},
+	}, map[string]string{"g2": ""}, "")
+
+	require.Len(t, got, 1)
+	assert.Equal(t, SpaceMembership{ChannelID: "g2", SpaceID: "spaceB"}, got[0])
+}
+
 // 防止 unused import: group。这里通过引用 InfoResp 类型让 import 有意义。
 var _ = (*group.InfoResp)(nil)
