@@ -226,7 +226,10 @@ var ErrSpaceDisbandedForUpdate = errors.New("space already disbanded")
 // MySQL 默认 affected_rows 是「真正变更的行数」，对于"新值与旧值完全相同"的幂等请求
 // 会返回 0，与"行不存在"无法区分。强制走事务 + 显式校验消除歧义。
 //
-// nil 参数不变更；调用方需保证至少有一个非 nil（否则 no-op 直接返回 nil）。
+// 返回 tx 内锁定时刻读到的 pre-update 快照，供调用方做"旧值→新值"的审计日志；
+// 由于读取与 UPDATE 在同一事务内串行化，并发更新场景下的 from 值不会 stale。
+//
+// nil 参数不变更；调用方需保证至少有一个非 nil（否则 no-op，但仍返回快照）。
 func (d *managerDB) updateSpaceProfile(
 	spaceId string,
 	name *string,
@@ -234,26 +237,27 @@ func (d *managerDB) updateSpaceProfile(
 	logo *string,
 	joinMode *int,
 	maxUsers *int,
-) error {
+) (*SpaceModel, error) {
 	tx, err := d.session.Begin()
 	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
+		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	var status int
+	// SELECT ... FOR UPDATE 锁定整行并取得稳定快照（供审计 from 字段使用）。
+	var before SpaceModel
 	found, err := tx.SelectBySql(
-		"SELECT status FROM space WHERE space_id=? FOR UPDATE",
+		"SELECT * FROM space WHERE space_id=? FOR UPDATE",
 		spaceId,
-	).Load(&status)
+	).Load(&before)
 	if err != nil {
-		return fmt.Errorf("lock space row: %w", err)
+		return nil, fmt.Errorf("lock space row: %w", err)
 	}
 	if found == 0 {
-		return ErrSpaceNotFound
+		return nil, ErrSpaceNotFound
 	}
-	if status == SpaceStatusDisbanded {
-		return ErrSpaceDisbandedForUpdate
+	if before.Status == SpaceStatusDisbanded {
+		return nil, ErrSpaceDisbandedForUpdate
 	}
 
 	builder := tx.Update("space")
@@ -279,13 +283,19 @@ func (d *managerDB) updateSpaceProfile(
 		changed = true
 	}
 	if !changed {
-		return tx.Commit()
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		return &before, nil
 	}
 	builder = builder.Set("updated_at", time.Now())
 	if _, err := builder.Where("space_id=?", spaceId).Exec(); err != nil {
-		return fmt.Errorf("update space profile: %w", err)
+		return nil, fmt.Errorf("update space profile: %w", err)
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &before, nil
 }
 
 // upsertMembers 批量添加/重新激活成员（单一事务，部分失败则全部回滚）

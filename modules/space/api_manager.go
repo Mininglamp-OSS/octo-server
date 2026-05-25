@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/db"
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -14,11 +15,14 @@ import (
 	"go.uber.org/zap"
 )
 
-// 空间基础字段长度上限，与 sql/20260307000002_space_legacy01.sql 中的 VARCHAR 一致。
+// 空间基础字段长度上限，单位为**字符（rune）**，与 sql/20260307000002_space_legacy01.sql
+// 中的 VARCHAR(N) 语义一致 —— MySQL VARCHAR(N) 限制的是字符数而非字节数（utf8mb4
+// 下一个汉字仍计为 1）。因此校验必须用 utf8.RuneCountInString 而非 len()，
+// 否则 34 个汉字（102 字节）会被误拒，但 schema 完全能容纳。
 const (
-	managerSpaceNameMaxLen        = 100
-	managerSpaceDescriptionMaxLen = 500
-	managerSpaceLogoMaxLen        = 200
+	managerSpaceNameMaxChars        = 100
+	managerSpaceDescriptionMaxChars = 500
+	managerSpaceLogoMaxChars        = 200
 )
 
 // 管理端分页上限，防止恶意/误操作的大页请求把全表拉出来。
@@ -478,28 +482,29 @@ func (m *Manager) updateSpaceProfile(c *wkhttp.Context) {
 	}
 
 	// 字段级校验：在查 DB 前先把请求侧问题拦下。
+	// 长度单位为字符（rune），与 MySQL VARCHAR(N) 的字符语义一致。
 	if req.Name != nil {
 		trimmed := strings.TrimSpace(*req.Name)
 		if trimmed == "" {
 			c.ResponseError(errors.New("空间名称不能为空"))
 			return
 		}
-		if len(trimmed) > managerSpaceNameMaxLen {
-			c.ResponseError(fmt.Errorf("空间名称不能超过 %d 个字节", managerSpaceNameMaxLen))
+		if utf8.RuneCountInString(trimmed) > managerSpaceNameMaxChars {
+			c.ResponseError(fmt.Errorf("空间名称不能超过 %d 个字符", managerSpaceNameMaxChars))
 			return
 		}
 		req.Name = &trimmed
 	}
 	if req.Description != nil {
 		trimmed := strings.TrimSpace(*req.Description)
-		if len(trimmed) > managerSpaceDescriptionMaxLen {
-			c.ResponseError(fmt.Errorf("空间描述不能超过 %d 个字节", managerSpaceDescriptionMaxLen))
+		if utf8.RuneCountInString(trimmed) > managerSpaceDescriptionMaxChars {
+			c.ResponseError(fmt.Errorf("空间描述不能超过 %d 个字符", managerSpaceDescriptionMaxChars))
 			return
 		}
 		req.Description = &trimmed
 	}
-	if req.Logo != nil && len(*req.Logo) > managerSpaceLogoMaxLen {
-		c.ResponseError(fmt.Errorf("Logo 不能超过 %d 个字节", managerSpaceLogoMaxLen))
+	if req.Logo != nil && utf8.RuneCountInString(*req.Logo) > managerSpaceLogoMaxChars {
+		c.ResponseError(fmt.Errorf("Logo 不能超过 %d 个字符", managerSpaceLogoMaxChars))
 		return
 	}
 	if req.JoinMode != nil && (*req.JoinMode < JoinModeDirect || *req.JoinMode > JoinModeApproval) {
@@ -542,7 +547,8 @@ func (m *Manager) updateSpaceProfile(c *wkhttp.Context) {
 		}
 	}
 
-	if err = m.managerDB.updateSpaceProfile(spaceId, req.Name, req.Description, req.Logo, req.JoinMode, req.MaxUsers); err != nil {
+	before, err := m.managerDB.updateSpaceProfile(spaceId, req.Name, req.Description, req.Logo, req.JoinMode, req.MaxUsers)
+	if err != nil {
 		// 事务内 SELECT FOR UPDATE 用 sentinel error 报告并发场景；HTTP 层映射为 4xx 提示。
 		// 不能依赖 RowsAffected 区分：MySQL 默认返回变更行数而非匹配行数，
 		// 字段值与现值完全相同的幂等请求会被误判为"行不存在"。
@@ -558,25 +564,25 @@ func (m *Manager) updateSpaceProfile(c *wkhttp.Context) {
 		c.ResponseError(errors.New("更新空间信息失败"))
 		return
 	}
-	// 审计日志：记录 spaceId、操作人，及每个字段的旧→新值（仅记录请求中显式修改的字段）。
+	// 审计日志：from 值取自事务内锁定时的快照（before），避免并发更新窗口下 tx 外读到 stale 旧值。
 	fields := []zap.Field{
 		zap.String("spaceId", spaceId),
 		zap.String("operator", c.GetLoginUID()),
 	}
 	if req.Name != nil {
-		fields = append(fields, zap.String("nameFrom", sp.Name), zap.String("nameTo", *req.Name))
+		fields = append(fields, zap.String("nameFrom", before.Name), zap.String("nameTo", *req.Name))
 	}
 	if req.Description != nil {
-		fields = append(fields, zap.String("descFrom", sp.Description), zap.String("descTo", *req.Description))
+		fields = append(fields, zap.String("descFrom", before.Description), zap.String("descTo", *req.Description))
 	}
 	if req.Logo != nil {
-		fields = append(fields, zap.String("logoFrom", sp.Logo), zap.String("logoTo", *req.Logo))
+		fields = append(fields, zap.String("logoFrom", before.Logo), zap.String("logoTo", *req.Logo))
 	}
 	if req.JoinMode != nil {
-		fields = append(fields, zap.Int("joinModeFrom", sp.JoinMode), zap.Int("joinModeTo", *req.JoinMode))
+		fields = append(fields, zap.Int("joinModeFrom", before.JoinMode), zap.Int("joinModeTo", *req.JoinMode))
 	}
 	if req.MaxUsers != nil {
-		fields = append(fields, zap.Int("maxUsersFrom", sp.MaxUsers), zap.Int("maxUsersTo", *req.MaxUsers))
+		fields = append(fields, zap.Int("maxUsersFrom", before.MaxUsers), zap.Int("maxUsersTo", *req.MaxUsers))
 	}
 	m.Info("管理员修改空间信息", fields...)
 	c.ResponseOK()

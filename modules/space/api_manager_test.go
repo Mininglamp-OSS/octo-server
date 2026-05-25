@@ -1451,8 +1451,9 @@ func TestManagerDB_UpdateSpaceProfile_TOCTOU(t *testing.T) {
 
 	t.Run("returns ErrSpaceNotFound for missing space", func(t *testing.T) {
 		name := "x"
-		err := mdb.updateSpaceProfile("nope-not-exists", &name, nil, nil, nil, nil)
+		before, err := mdb.updateSpaceProfile("nope-not-exists", &name, nil, nil, nil, nil)
 		assert.ErrorIs(t, err, ErrSpaceNotFound)
+		assert.Nil(t, before)
 	})
 
 	t.Run("returns ErrSpaceDisbandedForUpdate when space is already disbanded", func(t *testing.T) {
@@ -1460,8 +1461,9 @@ func TestManagerDB_UpdateSpaceProfile_TOCTOU(t *testing.T) {
 		// 调用 DB 方法应被事务内的 status 校验拦下。
 		seedSpace(t, "mgr-upd-toctou", "dying", "u-o-toc", SpaceStatusDisbanded)
 		name := "new name"
-		err := mdb.updateSpaceProfile("mgr-upd-toctou", &name, nil, nil, nil, nil)
+		before, err := mdb.updateSpaceProfile("mgr-upd-toctou", &name, nil, nil, nil, nil)
 		assert.ErrorIs(t, err, ErrSpaceDisbandedForUpdate)
+		assert.Nil(t, before)
 
 		// 关键断言：UPDATE 必须没有真的执行，name 仍是原值
 		// querySpaceByID 过滤掉 disbanded，这里用 manager 查询绕过过滤。
@@ -1473,11 +1475,30 @@ func TestManagerDB_UpdateSpaceProfile_TOCTOU(t *testing.T) {
 
 	t.Run("no-op when all fields are nil on existing space", func(t *testing.T) {
 		seedSpace(t, "mgr-upd-noop", "untouched", "u-o-noop", SpaceStatusNormal)
-		err := mdb.updateSpaceProfile("mgr-upd-noop", nil, nil, nil, nil, nil)
+		before, err := mdb.updateSpaceProfile("mgr-upd-noop", nil, nil, nil, nil, nil)
 		assert.NoError(t, err)
+		assert.NotNil(t, before)
+		assert.Equal(t, "untouched", before.Name, "no-op 仍应返回 pre-update 快照")
 		sp, qErr := testSpaceDB.querySpaceByID("mgr-upd-noop")
 		assert.NoError(t, qErr)
 		assert.Equal(t, "untouched", sp.Name)
+	})
+
+	t.Run("returns pre-update snapshot for audit logging", func(t *testing.T) {
+		// 回归 Jerry-Xin 的 warning：handler 用返回的 before 快照写 audit log，
+		// 不再使用 tx 外的 sp，避免并发更新窗口下旧值 stale。
+		seedSpace(t, "mgr-upd-snap", "original", "u-o-snap", SpaceStatusNormal)
+		newName := "renamed"
+		before, err := mdb.updateSpaceProfile("mgr-upd-snap", &newName, nil, nil, nil, nil)
+		assert.NoError(t, err)
+		assert.NotNil(t, before)
+		assert.Equal(t, "original", before.Name, "before 应为 UPDATE 前的值")
+		assert.Equal(t, SpaceStatusNormal, before.Status)
+
+		// 落库值应是新值
+		sp, qErr := testSpaceDB.querySpaceByID("mgr-upd-snap")
+		assert.NoError(t, qErr)
+		assert.Equal(t, "renamed", sp.Name)
 	})
 }
 
@@ -1509,11 +1530,29 @@ func TestManager_UpdateSpaceProfile_Validation(t *testing.T) {
 	})
 
 	t.Run("reject name longer than 100 chars", func(t *testing.T) {
-		long := ""
-		for i := 0; i < 101; i++ {
-			long += "a"
-		}
+		long := strings.Repeat("a", 101)
 		w := doPUT(util.ToJson(map[string]interface{}{"name": long}))
+		assert.NotEqual(t, http.StatusOK, w.Code)
+	})
+
+	t.Run("accept CJK name up to 100 characters (~300 bytes utf8mb4)", func(t *testing.T) {
+		// 回归 Jerry-Xin 的 Critical：旧实现用 len() 按字节算，100 个汉字 = 300 字节会被误拒。
+		// MySQL VARCHAR(100) 在 utf8mb4 下是 100 个字符，应该接受。
+		seedSpace(t, "mgr-upd-cjk-ok", "old", "u-o-cjk", SpaceStatusNormal)
+		name := strings.Repeat("空", 100) // 100 chars, 300 bytes
+		w := httptest.NewRecorder()
+		body := util.ToJson(map[string]interface{}{"name": name})
+		req, _ := http.NewRequest("PUT", "/v1/manager/spaces/mgr-upd-cjk-ok", bytes.NewReader([]byte(body)))
+		req.Header.Set("token", token)
+		s.GetRoute().ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code, "100 个汉字应该被接受")
+		assert.Equal(t, name, readSpace(t, "mgr-upd-cjk-ok").Name)
+	})
+
+	t.Run("reject CJK name longer than 100 characters", func(t *testing.T) {
+		// 边界：101 个汉字应该被拒（字符数超限）。
+		name := strings.Repeat("空", 101)
+		w := doPUT(util.ToJson(map[string]interface{}{"name": name}))
 		assert.NotEqual(t, http.StatusOK, w.Code)
 	})
 
