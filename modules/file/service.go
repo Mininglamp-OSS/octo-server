@@ -66,10 +66,13 @@ func NewService(ctx *config.Context) IService {
 		uploadService = NewServiceQiniu(ctx)
 	} else if service == config.FileServiceTencentCOS {
 		uploadService = NewServiceCOS(ctx)
-	} else if service == "awsS3" {
-		// Literal "awsS3" — octo-lib has not (yet) declared a
-		// FileServiceAwsS3 constant; a follow-up upstream PR can
-		// add the constant and this branch will switch to it.
+	} else if service == fileServiceAwsS3 {
+		// octo-lib has not (yet) declared a FileServiceAwsS3 constant;
+		// the local fileServiceAwsS3 (see const.go) collapses the
+		// literal to one place so the dispatch site here and the
+		// round-trip URL strip in api.go cannot drift. A follow-up
+		// upstream PR will add the typed constant and both sites will
+		// switch over together.
 		uploadService = NewServiceS3(ctx)
 	} else {
 		uploadService = NewSeaweedFS(ctx)

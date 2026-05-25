@@ -9,6 +9,15 @@ import (
 	"unicode/utf8"
 )
 
+// fileServiceAwsS3 is the cfg.FileService value that activates the
+// awsS3 backend. octo-lib has not yet exported a typed
+// FileServiceAwsS3 constant — when it does (tracked in PR follow-ups),
+// callers should switch to the typed value and this local const can
+// go away. Keeping the literal in one place prevents drift between
+// the dispatch site (service.go) and the round-trip URL strip
+// (api.go).
+const fileServiceAwsS3 = "awsS3"
+
 // fileMagicNumbers 文件魔数签名映射表
 // 用于验证文件内容是否与扩展名声称的类型一致
 var fileMagicNumbers = map[string][][]byte{

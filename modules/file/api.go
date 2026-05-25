@@ -596,7 +596,7 @@ func (f *File) getDownloadURL(c *wkhttp.Context) {
 					ph = strings.TrimPrefix(ph, "/"+cosPrefix)
 				}
 
-			case "awsS3":
+			case fileServiceAwsS3:
 				// S3 backend: mirror the COS handling. When the client
 				// round-trips a full URL we previously issued, the URL
 				// path carries the configured prefix (and the bucket
@@ -604,8 +604,20 @@ func (f *File) getDownloadURL(c *wkhttp.Context) {
 				// off before PresignedGetURL re-applies the prefix via
 				// ServiceS3.withPrefix, otherwise the signed object key
 				// double-prefixes and the GET 404s.
+				//
+				// Bucket-segment strip is gated by DownloadURL being
+				// empty: ServiceS3.publicURL emits `<downloadURL>/<key>`
+				// (no bucket in path) when DownloadURL is set, so the
+				// bucket only appears in the path under the canonical
+				// path-style shape (`https://<endpoint>/<bucket>/<key>`).
+				// Without this gate, a deployment with bucket name
+				// matching the first object-key segment (e.g. bucket
+				// "chat", URL "https://files.example.com/chat/foo.jpg")
+				// would lose the real key segment and sign the wrong
+				// object. Reported by Jerry-Xin in PR #147 review.
 				s3Cfg := f.ctx.GetConfig().S3
-				if s3Cfg.UsePathStyle && s3Cfg.Bucket != "" {
+				downloadURLEmpty := strings.TrimSpace(s3Cfg.DownloadURL) == ""
+				if downloadURLEmpty && s3Cfg.UsePathStyle && s3Cfg.Bucket != "" {
 					ph = strings.TrimPrefix(ph, "/"+s3Cfg.Bucket)
 				}
 				s3Prefix := strings.TrimSpace(s3Cfg.Prefix)
@@ -614,17 +626,16 @@ func (f *File) getDownloadURL(c *wkhttp.Context) {
 				}
 			}
 		}
-		// Drop the leading slash left over from url.Parse(...).Path.
-		// ServiceS3.PresignedGetURL runs validatePresignObjectKey,
-		// which rejects keys with leading "/" because the SigV4
-		// canonical URI would acquire a "//<key>" segment that gateway
-		// path-normalization rewrites to "/<key>" mid-flight, breaking
-		// signature validation. ServiceCOS happens to tolerate this
-		// because it doesn't validate; ServiceS3 is strict, so the
-		// strip belongs at the ingress layer where the slash artifact
-		// is produced.
-		ph = strings.TrimPrefix(ph, "/")
 	}
+	// Drop any leading slash so the key handed to the signer is a clean
+	// relative key. ServiceS3.PresignedGetURL runs validatePresignObjectKey,
+	// which rejects keys with leading "/" because the SigV4 canonical URI
+	// would acquire a "//<key>" segment that gateway path-normalization
+	// rewrites to "/<key>" mid-flight, breaking signature validation.
+	// ServiceCOS happens to tolerate this because it doesn't validate;
+	// ServiceS3 is strict. The trim lives outside the http-URL branch so
+	// bare paths like `?path=/chat/foo` are normalized the same way.
+	ph = strings.TrimPrefix(ph, "/")
 
 	sanitized, err := sanitizePath(ph)
 	if err != nil {

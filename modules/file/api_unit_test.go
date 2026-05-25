@@ -1173,3 +1173,100 @@ func TestGetDownloadURL_S3_RealServiceRoundTrip(t *testing.T) {
 	assert.NotContains(t, w.Body.String(), `\/\/chat`,
 		"signed URL must not contain `//chat` (sign-time path normalization would break the signature)")
 }
+
+// TestGetDownloadURL_S3_DownloadURLPreservesBucketLikeKeySegment is the
+// regression for Jerry-Xin's PR #147 review nit: when DownloadURL is
+// set, ServiceS3.publicURL emits `<downloadURL>/<key>` (no bucket
+// segment in the path). If api.getDownloadURL strips `/<bucket>` from
+// path-style URLs unconditionally, a deployment where the bucket name
+// equals the first object-key segment (e.g. bucket "chat", URL
+// `https://files.example.com/chat/foo.jpg`) loses the real key and
+// signs the wrong object. The fix gates the bucket strip on
+// DownloadURL being empty.
+func TestGetDownloadURL_S3_DownloadURLPreservesBucketLikeKeySegment(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cfg := config.New()
+	cfg.Test = true
+	cfg.FileService = "awsS3"
+	cfg.S3.Endpoint = "s3.us-west-2.amazonaws.com"
+	cfg.S3.Region = "us-west-2"
+	// Bucket name deliberately equals the first object-key segment
+	// in the round-tripped URL below — the exact shape that would
+	// produce the wrong-object signature without the DownloadURL gate.
+	cfg.S3.Bucket = "chat"
+	cfg.S3.DownloadURL = "https://files.example.com"
+	cfg.S3.UsePathStyle = true
+
+	mockSvc := &mockService{}
+	f := &File{
+		ctx:     testutil.NewTestContext(cfg),
+		Log:     log.NewTLog("FileTest"),
+		service: mockSvc,
+	}
+
+	inputURL := "https://files.example.com/chat/2026/05/abc.jpg"
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	req, _ := http.NewRequest(
+		http.MethodGet,
+		"/v1/file/download/url?path="+url.QueryEscape(inputURL)+"&filename=abc.jpg",
+		nil,
+	)
+	c.Request = req
+
+	wkCtx := &wkhttp.Context{Context: c}
+	f.getDownloadURL(wkCtx)
+
+	require.Equal(t, http.StatusOK, w.Code, "unexpected status; body=%s", w.Body.String())
+	// The full key including the "chat/" prefix must reach the signer.
+	// Pre-fix, the bucket strip ate "chat/" and PresignedGetURL would
+	// have signed "2026/05/abc.jpg" — a completely different object.
+	assert.Equal(t, "chat/2026/05/abc.jpg", mockSvc.lastGetObjectPath,
+		"DownloadURL mode must NOT strip the bucket segment even when it matches the first key segment")
+}
+
+// TestGetDownloadURL_S3_BarePathLeadingSlashTrimmed locks in the
+// post-#147-P2 fix from yujiawei: a bare relative path with a leading
+// slash (`?path=/chat/foo`) must reach the signer as a clean key, not
+// `/chat/foo`. Pre-fix, the leading-slash trim lived inside the
+// `if strings.HasPrefix(ph, "http")` branch and bare paths slipped
+// through, triggering validatePresignObjectKey rejection (500) on the
+// strict S3 backend.
+func TestGetDownloadURL_S3_BarePathLeadingSlashTrimmed(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cfg := config.New()
+	cfg.Test = true
+	cfg.FileService = "awsS3"
+	cfg.S3.Endpoint = "s3.us-west-2.amazonaws.com"
+	cfg.S3.Region = "us-west-2"
+	cfg.S3.Bucket = "my-bucket"
+	cfg.S3.AccessKeyID = "AKIAFAKEACCESSKEY"
+	cfg.S3.SecretAccessKey = "fake-secret-access-key-1234567890"
+
+	ctx := testutil.NewTestContext(cfg)
+	svc := NewService(ctx)
+
+	f := &File{
+		ctx:     ctx,
+		Log:     log.NewTLog("FileTest"),
+		service: svc,
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	req, _ := http.NewRequest(
+		http.MethodGet,
+		"/v1/file/download/url?path=%2Fchat%2F2026%2Fabc.jpg&filename=abc.jpg",
+		nil,
+	)
+	c.Request = req
+
+	wkCtx := &wkhttp.Context{Context: c}
+	f.getDownloadURL(wkCtx)
+
+	require.Equal(t, http.StatusOK, w.Code,
+		"bare path with leading slash must be normalized before signing; pre-fix this returned 500 because validatePresignObjectKey rejected the leading-slash key. body=%s",
+		w.Body.String())
+}
