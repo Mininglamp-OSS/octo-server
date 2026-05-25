@@ -39,14 +39,13 @@ import (
 //     and supports UsePathStyle as an explicit operator opt-in instead
 //     of detecting it from BucketURL shape.
 //
-// Connection model: HTTPS only. Operators who need plain HTTP (local
-// MinIO emulator, development with self-signed cert) should keep using
-// the existing minio backend — adding TLS opt-out here would compromise
-// the "production-grade S3" framing and is intentionally out of scope.
+// Connection model: cfg.S3.Endpoint always uses HTTPS by design. The
+// optional cfg.S3.BucketURL is operator-owned infrastructure and DOES
+// honor `http://` for local emulators; see publicEndpoint and the yaml
+// example for the rationale.
 type ServiceS3 struct {
 	log.Log
-	ctx            *config.Context
-	downloadClient *http.Client
+	ctx *config.Context
 }
 
 // NewServiceS3 constructs a ServiceS3 from the active config. Required
@@ -60,9 +59,6 @@ func NewServiceS3(ctx *config.Context) *ServiceS3 {
 	return &ServiceS3{
 		Log: log.NewTLog("FileS3"),
 		ctx: ctx,
-		downloadClient: &http.Client{
-			Timeout: time.Second * 30,
-		},
 	}
 }
 
@@ -144,41 +140,108 @@ func (s *ServiceS3) newClient() (*minio.Client, error) {
 	return client, nil
 }
 
-// newPublicClient builds the client used for presigned URL generation.
+// publicEndpoint resolves the browser-facing host used to sign presigned
+// PUT/GET URLs, and reports the bucket-addressing style the SDK should
+// use to reach it. Mirrors ServiceCOS.publicEndpoint — SigV4 covers
+// `host` and the canonical URI, so the host we sign against must
+// equal the host the browser will hit. Any post-sign rewrite breaks
+// the signature.
 //
-// If cfg.S3.BucketURL is set and parseable, sign against that host so
-// the URL the browser sees has the same `host` covered by SigV4 — any
-// post-sign host rewrite would invalidate the signature. This is the
-// same hazard ServiceMinio / ServiceCOS close at their respective
-// `newPublicClient` paths.
+// Resolution rules:
 //
-// If BucketURL is empty, sign against cfg.S3.Endpoint — fine for direct
-// S3 deployments where the browser hits the same host the server does.
-func (s *ServiceS3) newPublicClient() (*minio.Client, error) {
+//  1. cfg.S3.BucketURL is empty — fall back to cfg.S3.Endpoint with
+//     the lookup style chosen by cfg.S3.UsePathStyle.
+//
+//  2. BucketURL host begins with "<bucket>." (canonical bucket-subdomain
+//     shape, e.g. `https://my-bucket.s3.us-west-2.amazonaws.com` or
+//     `https://my-bucket.cdn.example.com`). The bucket already lives
+//     in the host, so we strip "<bucket>." before handing the parent
+//     host to the SDK and use BucketLookupDNS; the SDK re-attaches
+//     "<bucket>." and the resulting signed URL equals BucketURL+key.
+//
+//  3. BucketURL host has no "<bucket>." prefix (CDN alias / accelerator,
+//     e.g. `https://files.example.com`). The CDN routes to the bucket
+//     by some out-of-band rule (origin alias, path mapping, ...).
+//     The SDK signs against the host as-is with BucketLookupPath and
+//     emits `<host>/<bucket>/<key>`. This deliberately produces a URL
+//     shape that differs from publicURL (which returns
+//     `<BucketURL>/<key>` without a bucket segment) — operators
+//     fronting the bucket with a CDN must route both shapes; see the
+//     yaml docs for the deployment recipe.
+//
+// `host` is the bare host[:port] suitable for minio.New (no scheme,
+// no path). `secure` reflects the URL scheme — http:// flips it false
+// for the rare local-emulator-on-CDN case (the file-level "HTTPS only"
+// framing applies to cfg.S3.Endpoint; BucketURL is operator-owned
+// infrastructure and treated as such). `lookup` is the SDK addressing
+// style: DNS for shapes 1 & 2, Path for shape 3.
+func (s *ServiceS3) publicEndpoint() (host string, secure bool, lookup minio.BucketLookupType, err error) {
 	cfg := s.ctx.GetConfig().S3
 	base := strings.TrimSpace(cfg.BucketURL)
 	if base == "" {
-		return s.newClient()
+		ep := strings.TrimSpace(cfg.Endpoint)
+		ep = strings.TrimPrefix(ep, "https://")
+		ep = strings.TrimPrefix(ep, "http://")
+		ep = strings.TrimRight(ep, "/")
+		return ep, true, s.bucketLookup(), nil
 	}
-	parsed, err := url.Parse(strings.TrimRight(base, "/"))
-	if err != nil || parsed == nil || parsed.Host == "" {
+	parsed, parseErr := url.Parse(strings.TrimRight(base, "/"))
+	if parseErr != nil || parsed == nil || parsed.Host == "" {
 		s.Warn("s3.bucketURL 解析失败，预签名URL退回到 s3.endpoint",
 			zap.String("bucketURL", base))
-		return s.newClient()
+		ep := strings.TrimSpace(cfg.Endpoint)
+		ep = strings.TrimPrefix(ep, "https://")
+		ep = strings.TrimPrefix(ep, "http://")
+		ep = strings.TrimRight(ep, "/")
+		return ep, true, s.bucketLookup(), nil
 	}
 	if parsed.Path != "" && parsed.Path != "/" {
 		// SigV4 covers the canonical URI; a path component on BucketURL
 		// would be stripped before signing and produce
 		// SignatureDoesNotMatch at the browser. Reject loudly rather
 		// than silently dropping the path.
-		return nil, fmt.Errorf("s3.bucketURL 不可包含路径前缀（%q），仅支持 scheme://host[:port] 形式", base)
+		return "", false, 0, fmt.Errorf("s3.bucketURL 不可包含路径前缀（%q），仅支持 scheme://host[:port] 形式", base)
 	}
-	secure := !strings.EqualFold(parsed.Scheme, "http")
-	client, err := minio.New(parsed.Host, &minio.Options{
+	secure = !strings.EqualFold(parsed.Scheme, "http")
+	h := parsed.Host
+	if cfg.Bucket != "" {
+		bucketPrefix := cfg.Bucket + "."
+		if strings.HasPrefix(h, bucketPrefix) {
+			// Bucket-subdomain shape: strip "<bucket>." so the SDK with
+			// BucketLookupDNS can re-attach it without producing
+			// "<bucket>.<bucket>.<parent>".
+			parent := strings.TrimPrefix(h, bucketPrefix)
+			if parent == "" {
+				s.Warn("s3.bucketURL 仅包含 bucket 子域，无父域可签名，回退到 s3.endpoint",
+					zap.String("bucketURL", base))
+				ep := strings.TrimSpace(cfg.Endpoint)
+				ep = strings.TrimPrefix(ep, "https://")
+				ep = strings.TrimPrefix(ep, "http://")
+				ep = strings.TrimRight(ep, "/")
+				return ep, true, s.bucketLookup(), nil
+			}
+			return parent, secure, minio.BucketLookupDNS, nil
+		}
+	}
+	// CDN alias / accelerator: no "<bucket>." prefix. Sign against the
+	// host directly with path-style addressing.
+	return h, secure, minio.BucketLookupPath, nil
+}
+
+// newPublicClient builds the client used for presigned URL generation.
+// Routes through publicEndpoint so the signed URL's host matches the
+// host the browser will hit; otherwise SigV4 rejects at validation.
+func (s *ServiceS3) newPublicClient() (*minio.Client, error) {
+	cfg := s.ctx.GetConfig().S3
+	host, secure, lookup, err := s.publicEndpoint()
+	if err != nil {
+		return nil, err
+	}
+	client, err := minio.New(host, &minio.Options{
 		Creds:        credentials.NewStaticV4(cfg.AccessKeyID, cfg.SecretAccessKey, ""),
 		Secure:       secure,
 		Region:       strings.TrimSpace(cfg.Region),
-		BucketLookup: s.bucketLookup(),
+		BucketLookup: lookup,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("创建S3公网客户端失败: %w", err)

@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -320,7 +319,3 @@ func doPresignedGET(t *testing.T, signedURL string) io.ReadCloser {
 	return resp.Body
 }
 
-// Compile-time guard: surface unused-import noise as early as possible
-// when this test file is dropped into a contributor's machine without
-// the AWS env vars set.
-var _ = fmt.Sprintf

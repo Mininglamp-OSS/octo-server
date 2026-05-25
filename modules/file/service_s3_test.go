@@ -110,7 +110,38 @@ func TestServiceS3_PresignedPutURL_SignsAgainstEndpointWhenBucketURLEmpty(t *tes
 		"presigned PUT URL must include `content-length` in signed headers to enforce upload size cap (got %q)", signedHeaders)
 }
 
-func TestServiceS3_PresignedPutURL_SignsAgainstBucketURLWhenSet(t *testing.T) {
+func TestServiceS3_PresignedPutURL_BucketSubdomainBucketURL(t *testing.T) {
+	// Bucket-subdomain shape: BucketURL host begins with "<bucket>.".
+	// SDK must use BucketLookupDNS against the parent host so the
+	// signed URL equals BucketURL+key exactly. Pre-fix this was
+	// producing "octo-test-bucket.octo-test-bucket.files.example.com"
+	// (double bucket) because the SDK re-attached <bucket>. on top of
+	// the already-prefixed host.
+	cfg := baseS3Cfg()
+	cfg.S3.BucketURL = "https://octo-test-bucket.files.example.com"
+
+	svc := file.NewServiceS3(testutil.NewTestContext(cfg))
+
+	uploadURL, _, err := svc.PresignedPutURL(
+		"chat/2026/05/abc.jpg", "image/jpeg", "", 12345, 5*time.Minute,
+	)
+	require.NoError(t, err)
+
+	u, err := url.Parse(uploadURL)
+	require.NoError(t, err)
+	// Pinned: presigned URL host must equal BucketURL host exactly —
+	// that is the host the browser resolves and the host SigV4
+	// canonicalized into the signature.
+	assert.Equal(t, "octo-test-bucket.files.example.com", u.Host,
+		"bucket-subdomain BucketURL: signed URL host must equal BucketURL host (no double bucket prefix), got %s", u.Host)
+}
+
+func TestServiceS3_PresignedPutURL_CDNAliasBucketURL(t *testing.T) {
+	// CDN alias shape: BucketURL host has NO "<bucket>." prefix. SDK
+	// must use BucketLookupPath so the bucket lives in the URL path
+	// (`/<bucket>/<key>`) rather than the SDK silently constructing a
+	// "<bucket>.files.example.com" subdomain that does not exist in
+	// DNS (the original reviewer-flagged bug).
 	cfg := baseS3Cfg()
 	cfg.S3.BucketURL = "https://files.example.com"
 
@@ -123,17 +154,13 @@ func TestServiceS3_PresignedPutURL_SignsAgainstBucketURLWhenSet(t *testing.T) {
 
 	u, err := url.Parse(uploadURL)
 	require.NoError(t, err)
-
-	// SigV4 covers `host`. The signing client was built against
-	// BucketURL's parent host (files.example.com); the SDK virtual-hosts
-	// the bucket on top, producing octo-test-bucket.files.example.com.
-	// The exact host shape doesn't matter to this test — only that no
-	// segment of the endpoint domain (s3.us-west-2.amazonaws.com) leaks
-	// through, which would indicate signing against the wrong host.
-	assert.NotContains(t, u.Host, "amazonaws.com",
-		"BucketURL must shadow Endpoint when set; got %s", u.Host)
-	assert.Contains(t, u.Host, "files.example.com",
-		"presigned URL host should derive from BucketURL; got %s", u.Host)
+	// Pinned: signed URL host must equal BucketURL host exactly,
+	// without an added "<bucket>." subdomain.
+	assert.Equal(t, "files.example.com", u.Host,
+		"CDN-alias BucketURL: signed URL host must equal BucketURL host (no added bucket subdomain), got %s", u.Host)
+	// Bucket lives in the path with path-style addressing.
+	assert.Contains(t, u.Path, "/octo-test-bucket/",
+		"CDN-alias BucketURL: bucket segment must appear in the URL path, got %s", u.Path)
 }
 
 func TestServiceS3_PresignedPutURL_RejectsBucketURLWithPathPrefix(t *testing.T) {

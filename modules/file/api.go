@@ -605,6 +605,16 @@ func (f *File) getDownloadURL(c *wkhttp.Context) {
 				ph = strings.TrimPrefix(ph, "/"+s3Prefix)
 			}
 		}
+		// Drop the leading slash left over from url.Parse(...).Path.
+		// ServiceS3.PresignedGetURL runs validatePresignObjectKey,
+		// which rejects keys with leading "/" because the SigV4
+		// canonical URI would acquire a "//<key>" segment that gateway
+		// path-normalization rewrites to "/<key>" mid-flight, breaking
+		// signature validation. ServiceCOS happens to tolerate this
+		// because it doesn't validate; ServiceS3 is strict, so the
+		// strip belongs at the ingress layer where the slash artifact
+		// is produced.
+		ph = strings.TrimPrefix(ph, "/")
 	}
 
 	sanitized, err := sanitizePath(ph)

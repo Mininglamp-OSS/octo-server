@@ -19,6 +19,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestCheckReq(t *testing.T) {
@@ -917,7 +918,7 @@ func TestGetDownloadURL_PathStyleStripsBucketSegment(t *testing.T) {
 			bucketURL:        "https://cdn.example.com",
 			prefix:           "im-test",
 			inputPath:        "https://cdn.example.com/im-data-1255521909/im-test/chat/2026/05/abc.jpg",
-			wantSignedObject: "/chat/2026/05/abc.jpg",
+			wantSignedObject: "chat/2026/05/abc.jpg",
 		},
 		{
 			name:             "path-style CDN no prefix strips just bucket",
@@ -925,7 +926,7 @@ func TestGetDownloadURL_PathStyleStripsBucketSegment(t *testing.T) {
 			bucketURL:        "https://cdn.example.com",
 			prefix:           "",
 			inputPath:        "https://cdn.example.com/im-data-1255521909/chat/2026/05/abc.jpg",
-			wantSignedObject: "/chat/2026/05/abc.jpg",
+			wantSignedObject: "chat/2026/05/abc.jpg",
 		},
 		{
 			name:             "DNS-style bucket-subdomain BucketURL — bucket NOT in path, only prefix stripped",
@@ -933,7 +934,7 @@ func TestGetDownloadURL_PathStyleStripsBucketSegment(t *testing.T) {
 			bucketURL:        "https://im-data-1255521909.cos.example.com",
 			prefix:           "im-prod",
 			inputPath:        "https://im-data-1255521909.cos.example.com/im-prod/chat/2026/05/abc.jpg",
-			wantSignedObject: "/chat/2026/05/abc.jpg",
+			wantSignedObject: "chat/2026/05/abc.jpg",
 		},
 		{
 			name:             "DNS-style: must NOT accidentally strip a path segment that happens to share the bucket name",
@@ -941,7 +942,7 @@ func TestGetDownloadURL_PathStyleStripsBucketSegment(t *testing.T) {
 			bucketURL:        "https://im-data-1255521909.cos.example.com",
 			prefix:           "",
 			inputPath:        "https://im-data-1255521909.cos.example.com/chat/2026/05/abc.jpg",
-			wantSignedObject: "/chat/2026/05/abc.jpg",
+			wantSignedObject: "chat/2026/05/abc.jpg",
 		},
 		{
 			name:             "BucketURL empty (canonical default endpoint) — bucket lives in subdomain, path is just key",
@@ -949,7 +950,7 @@ func TestGetDownloadURL_PathStyleStripsBucketSegment(t *testing.T) {
 			bucketURL:        "",
 			prefix:           "",
 			inputPath:        "https://im-data-1255521909.cos.ap-beijing.myqcloud.com/chat/2026/05/abc.jpg",
-			wantSignedObject: "/chat/2026/05/abc.jpg",
+			wantSignedObject: "chat/2026/05/abc.jpg",
 		},
 		{
 			name:             "non-URL path passes through unchanged",
@@ -1027,7 +1028,7 @@ func TestGetDownloadURL_S3PrefixAndBucketStrip(t *testing.T) {
 			prefix:           "prod",
 			usePathStyle:     false,
 			inputPath:        "https://my-bucket.s3.us-west-2.amazonaws.com/prod/chat/2026/05/abc.jpg",
-			wantSignedObject: "/chat/2026/05/abc.jpg",
+			wantSignedObject: "chat/2026/05/abc.jpg",
 		},
 		{
 			name:             "path-style with prefix strips bucket then prefix",
@@ -1036,7 +1037,7 @@ func TestGetDownloadURL_S3PrefixAndBucketStrip(t *testing.T) {
 			prefix:           "prod",
 			usePathStyle:     true,
 			inputPath:        "https://s3.us-west-2.amazonaws.com/my-bucket/prod/chat/2026/05/abc.jpg",
-			wantSignedObject: "/chat/2026/05/abc.jpg",
+			wantSignedObject: "chat/2026/05/abc.jpg",
 		},
 		{
 			name:             "path-style no prefix strips just bucket",
@@ -1045,7 +1046,7 @@ func TestGetDownloadURL_S3PrefixAndBucketStrip(t *testing.T) {
 			prefix:           "",
 			usePathStyle:     true,
 			inputPath:        "https://s3.us-west-2.amazonaws.com/my-bucket/chat/2026/05/abc.jpg",
-			wantSignedObject: "/chat/2026/05/abc.jpg",
+			wantSignedObject: "chat/2026/05/abc.jpg",
 		},
 		{
 			name:             "CDN BucketURL with prefix — bucket NOT in path, only prefix stripped",
@@ -1054,7 +1055,7 @@ func TestGetDownloadURL_S3PrefixAndBucketStrip(t *testing.T) {
 			prefix:           "prod",
 			usePathStyle:     false,
 			inputPath:        "https://files.example.com/prod/chat/2026/05/abc.jpg",
-			wantSignedObject: "/chat/2026/05/abc.jpg",
+			wantSignedObject: "chat/2026/05/abc.jpg",
 		},
 		{
 			name:             "virtual-hosted no prefix — path is just key",
@@ -1063,7 +1064,7 @@ func TestGetDownloadURL_S3PrefixAndBucketStrip(t *testing.T) {
 			prefix:           "",
 			usePathStyle:     false,
 			inputPath:        "https://my-bucket.s3.us-west-2.amazonaws.com/chat/2026/05/abc.jpg",
-			wantSignedObject: "/chat/2026/05/abc.jpg",
+			wantSignedObject: "chat/2026/05/abc.jpg",
 		},
 		{
 			name:             "non-URL path passes through unchanged",
@@ -1111,4 +1112,62 @@ func TestGetDownloadURL_S3PrefixAndBucketStrip(t *testing.T) {
 				"object path passed to PresignedGetURL must have prefix (and path-style bucket) stripped before signing")
 		})
 	}
+}
+
+// TestGetDownloadURL_S3_RealServiceRoundTrip is the regression that the
+// mock-based TestGetDownloadURL_S3PrefixAndBucketStrip cannot catch by
+// construction: yujiawei's P1 in PR#147 review noted that the previous
+// table test recorded `lastGetObjectPath` from a mock that skips
+// `validatePresignObjectKey`, hiding the fact that ServiceS3 rejects
+// leading-slash object keys at sign time. This test wires the real
+// `ServiceS3` (with fake credentials — the SDK never makes a network
+// call for `PresignedGetObject`) and asserts the handler returns 200,
+// not 500, when the default minimal config (no s3.prefix) round-trips a
+// virtual-hosted URL.
+func TestGetDownloadURL_S3_RealServiceRoundTrip(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cfg := config.New()
+	cfg.Test = true
+	cfg.S3.Endpoint = "s3.us-west-2.amazonaws.com"
+	cfg.S3.Region = "us-west-2"
+	cfg.S3.Bucket = "my-bucket"
+	cfg.S3.AccessKeyID = "AKIAFAKEACCESSKEY"
+	cfg.S3.SecretAccessKey = "fake-secret-access-key-1234567890"
+	// No prefix — this is the failure shape from the review.
+
+	// Use the real Service wrapper + ServiceS3. SDK PresignedGetObject
+	// is pure URL signing (no network I/O) so fake creds are fine.
+	cfg.FileService = "awsS3"
+	ctx := testutil.NewTestContext(cfg)
+	svc := NewService(ctx)
+
+	f := &File{
+		ctx:     ctx,
+		Log:     log.NewTLog("FileTest"),
+		service: svc,
+	}
+
+	inputURL := "https://my-bucket.s3.us-west-2.amazonaws.com/chat/2026/05/abc.jpg"
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	req, _ := http.NewRequest(
+		http.MethodGet,
+		"/v1/file/download/url?path="+url.QueryEscape(inputURL)+"&filename=abc.jpg",
+		nil,
+	)
+	c.Request = req
+
+	wkCtx := &wkhttp.Context{Context: c}
+	f.getDownloadURL(wkCtx)
+
+	require.Equal(t, http.StatusOK, w.Code,
+		"real ServiceS3 round-trip must return 200; pre-fix this returned 500 because validatePresignObjectKey rejected the leading-slash key. body=%s",
+		w.Body.String())
+
+	// The body should carry a signed URL with no double slashes in the
+	// path — that's the SigV4 normalization hazard the leading-slash
+	// strip is preventing in the first place.
+	assert.NotContains(t, w.Body.String(), `\/\/chat`,
+		"signed URL must not contain `//chat` (sign-time path normalization would break the signature)")
 }
