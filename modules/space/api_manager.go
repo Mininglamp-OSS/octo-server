@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/db"
@@ -11,6 +12,13 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"go.uber.org/zap"
+)
+
+// 空间基础字段长度上限，与 sql/20260307000002_space_legacy01.sql 中的 VARCHAR 一致。
+const (
+	managerSpaceNameMaxLen        = 100
+	managerSpaceDescriptionMaxLen = 500
+	managerSpaceLogoMaxLen        = 200
 )
 
 // 管理端分页上限，防止恶意/误操作的大页请求把全表拉出来。
@@ -72,6 +80,7 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 
 		// 空间单体
 		auth.GET("/spaces/:space_id", m.detail)                      // 空间详情
+		auth.PUT("/spaces/:space_id", m.updateSpaceProfile)          // 修改基础信息（名称/加入方式/成员上限等）
 		auth.DELETE("/spaces/:space_id", m.forceDisband)             // 强制解散
 		auth.PUT("/spaces/:space_id/status/:status", m.liftBan)      // 封禁(2) / 解禁(1)
 
@@ -428,6 +437,148 @@ func (m *Manager) liftBan(c *wkhttp.Context) {
 	// 刷新 ParseChannelID 缓存：loadKnownSpaceIDs 只加载 status=1 的空间，
 	// 封禁 1→2 需要把该 spaceId 从缓存中剔除，解禁 2→1 需要加回去，否则路由会走偏。
 	go m.space.loadKnownSpaceIDs()
+	c.ResponseOK()
+}
+
+// managerUpdateSpaceProfileReq 管理端修改空间基础信息请求体。
+// 所有字段可选，但至少需要提供一个；未提供（nil）的字段保持不变。
+type managerUpdateSpaceProfileReq struct {
+	Name        *string `json:"name"`
+	Description *string `json:"description"`
+	Logo        *string `json:"logo"`
+	JoinMode    *int    `json:"join_mode"`
+	MaxUsers    *int    `json:"max_users"`
+}
+
+// updateSpaceProfile 管理端修改空间基础信息：名称、描述、Logo、加入方式、成员上限。
+//
+// 已解散空间禁止修改；max_users 若 > 0 则与当前活跃成员数对比拒绝低于的请求。
+// 该 max_users 校验是**尽力而为**：成员计数与最终 UPDATE 不在同一事务，
+// 若并发 addMembers / 用户加入挤进窗口，可能出现 active > max_users 的瞬时不一致。
+// 这与现有 addMembers 主动绕过 max_users 的设计取舍一致，且本接口仅由管理员调用、频率极低。
+// max_users == 0 表示不限，规则上始终允许。
+func (m *Manager) updateSpaceProfile(c *wkhttp.Context) {
+	if !m.requireAdmin(c) {
+		return
+	}
+	spaceId := c.Param("space_id")
+	if spaceId == "" {
+		c.ResponseError(errors.New("空间ID不能为空"))
+		return
+	}
+
+	var req managerUpdateSpaceProfileReq
+	if err := c.BindJSON(&req); err != nil {
+		c.ResponseError(errors.New("请求参数错误"))
+		return
+	}
+	if req.Name == nil && req.Description == nil && req.Logo == nil && req.JoinMode == nil && req.MaxUsers == nil {
+		c.ResponseError(errors.New("至少需要提供 name / description / logo / join_mode / max_users 之一"))
+		return
+	}
+
+	// 字段级校验：在查 DB 前先把请求侧问题拦下。
+	if req.Name != nil {
+		trimmed := strings.TrimSpace(*req.Name)
+		if trimmed == "" {
+			c.ResponseError(errors.New("空间名称不能为空"))
+			return
+		}
+		if len(trimmed) > managerSpaceNameMaxLen {
+			c.ResponseError(fmt.Errorf("空间名称不能超过 %d 个字节", managerSpaceNameMaxLen))
+			return
+		}
+		req.Name = &trimmed
+	}
+	if req.Description != nil {
+		trimmed := strings.TrimSpace(*req.Description)
+		if len(trimmed) > managerSpaceDescriptionMaxLen {
+			c.ResponseError(fmt.Errorf("空间描述不能超过 %d 个字节", managerSpaceDescriptionMaxLen))
+			return
+		}
+		req.Description = &trimmed
+	}
+	if req.Logo != nil && len(*req.Logo) > managerSpaceLogoMaxLen {
+		c.ResponseError(fmt.Errorf("Logo 不能超过 %d 个字节", managerSpaceLogoMaxLen))
+		return
+	}
+	if req.JoinMode != nil && (*req.JoinMode < JoinModeDirect || *req.JoinMode > JoinModeApproval) {
+		c.ResponseError(errors.New("无效的加入模式，仅支持 0(直接加入) 或 1(需要审批)"))
+		return
+	}
+	if req.MaxUsers != nil && *req.MaxUsers < 0 {
+		c.ResponseError(errors.New("max_users 不能为负"))
+		return
+	}
+
+	sp, err := m.managerDB.querySpaceIncludeDisbanded(spaceId)
+	if err != nil {
+		m.Error("查询空间失败", zap.Error(err), zap.String("spaceId", spaceId))
+		c.ResponseError(errors.New("查询空间失败"))
+		return
+	}
+	if sp == nil {
+		c.ResponseError(errors.New("空间不存在"))
+		return
+	}
+	if sp.Status == SpaceStatusDisbanded {
+		c.ResponseError(errors.New("空间已解散，无法修改空间信息"))
+		return
+	}
+
+	// max_users > 0 时不得低于当前活跃成员数；0 表示不限，跳过校验。
+	// countActiveMembers 走的是 m.db（业务侧 session）而非 m.managerDB，与本文件其他 handler 一致；
+	// 两个 session 共享同一 *sql.DB 连接池，差异仅在 builder 包装，无功能性影响。
+	if req.MaxUsers != nil && *req.MaxUsers > 0 {
+		active, err := m.db.countActiveMembers(spaceId)
+		if err != nil {
+			m.Error("查询空间成员数失败", zap.Error(err), zap.String("spaceId", spaceId))
+			c.ResponseError(errors.New("查询空间成员数失败"))
+			return
+		}
+		if *req.MaxUsers < active {
+			c.ResponseError(fmt.Errorf("max_users (%d) 不能低于当前活跃成员数 (%d)", *req.MaxUsers, active))
+			return
+		}
+	}
+
+	if err = m.managerDB.updateSpaceProfile(spaceId, req.Name, req.Description, req.Logo, req.JoinMode, req.MaxUsers); err != nil {
+		// 事务内 SELECT FOR UPDATE 用 sentinel error 报告并发场景；HTTP 层映射为 4xx 提示。
+		// 不能依赖 RowsAffected 区分：MySQL 默认返回变更行数而非匹配行数，
+		// 字段值与现值完全相同的幂等请求会被误判为"行不存在"。
+		if errors.Is(err, ErrSpaceNotFound) {
+			c.ResponseError(errors.New("空间不存在"))
+			return
+		}
+		if errors.Is(err, ErrSpaceDisbandedForUpdate) {
+			c.ResponseError(errors.New("空间已解散，无法修改空间信息"))
+			return
+		}
+		m.Error("更新空间信息失败", zap.Error(err), zap.String("spaceId", spaceId))
+		c.ResponseError(errors.New("更新空间信息失败"))
+		return
+	}
+	// 审计日志：记录 spaceId、操作人，及每个字段的旧→新值（仅记录请求中显式修改的字段）。
+	fields := []zap.Field{
+		zap.String("spaceId", spaceId),
+		zap.String("operator", c.GetLoginUID()),
+	}
+	if req.Name != nil {
+		fields = append(fields, zap.String("nameFrom", sp.Name), zap.String("nameTo", *req.Name))
+	}
+	if req.Description != nil {
+		fields = append(fields, zap.String("descFrom", sp.Description), zap.String("descTo", *req.Description))
+	}
+	if req.Logo != nil {
+		fields = append(fields, zap.String("logoFrom", sp.Logo), zap.String("logoTo", *req.Logo))
+	}
+	if req.JoinMode != nil {
+		fields = append(fields, zap.Int("joinModeFrom", sp.JoinMode), zap.Int("joinModeTo", *req.JoinMode))
+	}
+	if req.MaxUsers != nil {
+		fields = append(fields, zap.Int("maxUsersFrom", sp.MaxUsers), zap.Int("maxUsersTo", *req.MaxUsers))
+	}
+	m.Info("管理员修改空间信息", fields...)
 	c.ResponseOK()
 }
 

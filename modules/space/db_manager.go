@@ -209,6 +209,85 @@ func (d *managerDB) updateSpaceStatus(spaceId string, status int) error {
 	return err
 }
 
+// ErrSpaceNotFound 空间不存在（事务内 SELECT FOR UPDATE 未命中）
+var ErrSpaceNotFound = errors.New("space not found")
+
+// ErrSpaceDisbandedForUpdate 事务内发现空间已解散，禁止更新基础信息
+var ErrSpaceDisbandedForUpdate = errors.New("space already disbanded")
+
+// updateSpaceProfile 管理端部分更新空间基础字段。
+//
+// 用 SELECT ... FOR UPDATE 在事务内锁定 space 行并原子校验存在性 + 非 Disbanded 状态，
+// 关闭 handler 层 guard 与 UPDATE 之间的 TOCTOU 窗口：
+// 即便 forceDisbandSpace 在 handler 通过 guard 后并发执行，它会阻塞到本事务结束，
+// 或本事务的 SELECT 看到 status=Disbanded 并直接返回 ErrSpaceDisbandedForUpdate。
+//
+// 存在性 / 已解散用 sentinel error 表达，**不依赖 RowsAffected**：
+// MySQL 默认 affected_rows 是「真正变更的行数」，对于"新值与旧值完全相同"的幂等请求
+// 会返回 0，与"行不存在"无法区分。强制走事务 + 显式校验消除歧义。
+//
+// nil 参数不变更；调用方需保证至少有一个非 nil（否则 no-op 直接返回 nil）。
+func (d *managerDB) updateSpaceProfile(
+	spaceId string,
+	name *string,
+	description *string,
+	logo *string,
+	joinMode *int,
+	maxUsers *int,
+) error {
+	tx, err := d.session.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	var status int
+	found, err := tx.SelectBySql(
+		"SELECT status FROM space WHERE space_id=? FOR UPDATE",
+		spaceId,
+	).Load(&status)
+	if err != nil {
+		return fmt.Errorf("lock space row: %w", err)
+	}
+	if found == 0 {
+		return ErrSpaceNotFound
+	}
+	if status == SpaceStatusDisbanded {
+		return ErrSpaceDisbandedForUpdate
+	}
+
+	builder := tx.Update("space")
+	changed := false
+	if name != nil {
+		builder = builder.Set("name", *name)
+		changed = true
+	}
+	if description != nil {
+		builder = builder.Set("description", *description)
+		changed = true
+	}
+	if logo != nil {
+		builder = builder.Set("logo", *logo)
+		changed = true
+	}
+	if joinMode != nil {
+		builder = builder.Set("join_mode", *joinMode)
+		changed = true
+	}
+	if maxUsers != nil {
+		builder = builder.Set("max_users", *maxUsers)
+		changed = true
+	}
+	if !changed {
+		return tx.Commit()
+	}
+	builder = builder.Set("updated_at", time.Now())
+	if _, err := builder.Where("space_id=?", spaceId).Exec(); err != nil {
+		return fmt.Errorf("update space profile: %w", err)
+	}
+	return tx.Commit()
+}
+
 // upsertMembers 批量添加/重新激活成员（单一事务，部分失败则全部回滚）
 func (d *managerDB) upsertMembers(spaceId string, uids []string) error {
 	if len(uids) == 0 {

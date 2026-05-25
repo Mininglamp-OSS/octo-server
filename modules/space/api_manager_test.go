@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -1272,4 +1273,312 @@ func TestManager_ListKeywordLikeEscape(t *testing.T) {
 	if len(resp.List) == 1 {
 		assert.Equal(t, "foo_bar", resp.List[0].Name)
 	}
+}
+
+// ==================== Update space profile ====================
+
+// readSpace 读取空间当前持久化的基础字段（绕过业务过滤，仅用于断言）。
+func readSpace(t *testing.T, spaceId string) *SpaceModel {
+	t.Helper()
+	sp, err := testSpaceDB.querySpaceByID(spaceId)
+	assert.NoError(t, err)
+	return sp
+}
+
+func TestManager_UpdateSpaceProfile(t *testing.T) {
+	s, _, err := setup(t)
+	assert.NoError(t, err)
+	token := adminToken(t)
+
+	t.Run("partial update of name only leaves other fields unchanged", func(t *testing.T) {
+		seedSpace(t, "mgr-upd-name", "old name", "u-owner", SpaceStatusNormal)
+		// 给空间补一些初始非默认值，便于断言"未变更"
+		_, err := testCtx.DB().Update("space").
+			Set("description", "orig desc").
+			Set("logo", "orig-logo").
+			Set("join_mode", JoinModeApproval).
+			Set("max_users", 50).
+			Where("space_id=?", "mgr-upd-name").Exec()
+		assert.NoError(t, err)
+
+		body := util.ToJson(map[string]interface{}{"name": "shiny new name"})
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("PUT", "/v1/manager/spaces/mgr-upd-name", bytes.NewReader([]byte(body)))
+		req.Header.Set("token", token)
+		s.GetRoute().ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		sp := readSpace(t, "mgr-upd-name")
+		assert.NotNil(t, sp)
+		assert.Equal(t, "shiny new name", sp.Name)
+		assert.Equal(t, "orig desc", sp.Description)
+		assert.Equal(t, "orig-logo", sp.Logo)
+		assert.Equal(t, JoinModeApproval, sp.JoinMode)
+		assert.Equal(t, 50, sp.MaxUsers)
+	})
+
+	t.Run("update join_mode 0 -> 1", func(t *testing.T) {
+		seedSpace(t, "mgr-upd-jm", "jm space", "u-o-jm", SpaceStatusNormal)
+		body := util.ToJson(map[string]interface{}{"join_mode": JoinModeApproval})
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("PUT", "/v1/manager/spaces/mgr-upd-jm", bytes.NewReader([]byte(body)))
+		req.Header.Set("token", token)
+		s.GetRoute().ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Equal(t, JoinModeApproval, readSpace(t, "mgr-upd-jm").JoinMode)
+	})
+
+	t.Run("update max_users (member limit)", func(t *testing.T) {
+		seedSpace(t, "mgr-upd-cap", "cap space", "u-o-cap", SpaceStatusNormal)
+		body := util.ToJson(map[string]interface{}{"max_users": 200})
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("PUT", "/v1/manager/spaces/mgr-upd-cap", bytes.NewReader([]byte(body)))
+		req.Header.Set("token", token)
+		s.GetRoute().ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Equal(t, 200, readSpace(t, "mgr-upd-cap").MaxUsers)
+	})
+
+	t.Run("max_users = 0 means unlimited and is allowed regardless of current count", func(t *testing.T) {
+		seedSpace(t, "mgr-upd-zero", "zero cap", "u-o-z", SpaceStatusNormal)
+		// 当前有 5 个成员
+		for i := 0; i < 4; i++ {
+			assert.NoError(t, testSpaceDB.insertMemberNoTx(&MemberModel{
+				SpaceId: "mgr-upd-zero", UID: fmt.Sprintf("m-z-%d", i), Role: 0, Status: 1,
+			}))
+		}
+		body := util.ToJson(map[string]interface{}{"max_users": 0})
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("PUT", "/v1/manager/spaces/mgr-upd-zero", bytes.NewReader([]byte(body)))
+		req.Header.Set("token", token)
+		s.GetRoute().ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Equal(t, 0, readSpace(t, "mgr-upd-zero").MaxUsers)
+	})
+
+	t.Run("max_users equal to current active members is allowed", func(t *testing.T) {
+		seedSpace(t, "mgr-upd-eq", "eq cap", "u-o-eq", SpaceStatusNormal)
+		for i := 0; i < 2; i++ {
+			assert.NoError(t, testSpaceDB.insertMemberNoTx(&MemberModel{
+				SpaceId: "mgr-upd-eq", UID: fmt.Sprintf("m-eq-%d", i), Role: 0, Status: 1,
+			}))
+		}
+		// owner + 2 = 3 active members
+		body := util.ToJson(map[string]interface{}{"max_users": 3})
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("PUT", "/v1/manager/spaces/mgr-upd-eq", bytes.NewReader([]byte(body)))
+		req.Header.Set("token", token)
+		s.GetRoute().ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Equal(t, 3, readSpace(t, "mgr-upd-eq").MaxUsers)
+	})
+
+	t.Run("combined update of name + join_mode + max_users", func(t *testing.T) {
+		seedSpace(t, "mgr-upd-combo", "combo old", "u-o-c", SpaceStatusNormal)
+		body := util.ToJson(map[string]interface{}{
+			"name":      "combo new",
+			"join_mode": JoinModeApproval,
+			"max_users": 123,
+		})
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("PUT", "/v1/manager/spaces/mgr-upd-combo", bytes.NewReader([]byte(body)))
+		req.Header.Set("token", token)
+		s.GetRoute().ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code)
+		sp := readSpace(t, "mgr-upd-combo")
+		assert.Equal(t, "combo new", sp.Name)
+		assert.Equal(t, JoinModeApproval, sp.JoinMode)
+		assert.Equal(t, 123, sp.MaxUsers)
+	})
+
+	t.Run("update description and logo", func(t *testing.T) {
+		seedSpace(t, "mgr-upd-dl", "dl space", "u-o-dl", SpaceStatusNormal)
+		body := util.ToJson(map[string]interface{}{
+			"description": "shiny description",
+			"logo":        "https://cdn.example/logo.png",
+		})
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("PUT", "/v1/manager/spaces/mgr-upd-dl", bytes.NewReader([]byte(body)))
+		req.Header.Set("token", token)
+		s.GetRoute().ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code)
+		sp := readSpace(t, "mgr-upd-dl")
+		assert.Equal(t, "shiny description", sp.Description)
+		assert.Equal(t, "https://cdn.example/logo.png", sp.Logo)
+	})
+
+	t.Run("idempotent update with identical values returns 200 not 404", func(t *testing.T) {
+		// 回归 #2：MySQL 默认 RowsAffected = 实际变更行数，
+		// 旧实现把 0 当作"空间不存在"会导致幂等重放被误判为失败。
+		seedSpace(t, "mgr-upd-idem", "same name", "u-o-idem", SpaceStatusNormal)
+		body := util.ToJson(map[string]interface{}{"name": "same name"})
+
+		// 第一次请求：可能落到 updated_at 变更（不同秒），任意结果都应是 200
+		w1 := httptest.NewRecorder()
+		req1, _ := http.NewRequest("PUT", "/v1/manager/spaces/mgr-upd-idem", bytes.NewReader([]byte(body)))
+		req1.Header.Set("token", token)
+		s.GetRoute().ServeHTTP(w1, req1)
+		assert.Equal(t, http.StatusOK, w1.Code)
+
+		// 第二次：同一秒内重放，所有字段都和现值一致，affected_rows 极可能为 0
+		w2 := httptest.NewRecorder()
+		req2, _ := http.NewRequest("PUT", "/v1/manager/spaces/mgr-upd-idem", bytes.NewReader([]byte(body)))
+		req2.Header.Set("token", token)
+		s.GetRoute().ServeHTTP(w2, req2)
+		assert.Equal(t, http.StatusOK, w2.Code, "幂等重放不应被误判为不存在")
+		assert.NotContains(t, w2.Body.String(), "不存在")
+	})
+
+	t.Run("trim whitespace on name and persist trimmed value", func(t *testing.T) {
+		seedSpace(t, "mgr-upd-trim", "trim before", "u-o-t", SpaceStatusNormal)
+		body := util.ToJson(map[string]interface{}{"name": "   padded   "})
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("PUT", "/v1/manager/spaces/mgr-upd-trim", bytes.NewReader([]byte(body)))
+		req.Header.Set("token", token)
+		s.GetRoute().ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Equal(t, "padded", readSpace(t, "mgr-upd-trim").Name)
+	})
+}
+
+// TestManagerDB_UpdateSpaceProfile_TOCTOU 回归 #1：
+// 事务内 SELECT FOR UPDATE 应在空间解散后拒绝继续 UPDATE，
+// 而不是依赖 handler 层 guard——guard 与 UPDATE 之间的窗口必须被 DB 关掉。
+func TestManagerDB_UpdateSpaceProfile_TOCTOU(t *testing.T) {
+	_, _, err := setup(t)
+	assert.NoError(t, err)
+	mdb := newManagerDB(testCtx.DB())
+
+	t.Run("returns ErrSpaceNotFound for missing space", func(t *testing.T) {
+		name := "x"
+		err := mdb.updateSpaceProfile("nope-not-exists", &name, nil, nil, nil, nil)
+		assert.ErrorIs(t, err, ErrSpaceNotFound)
+	})
+
+	t.Run("returns ErrSpaceDisbandedForUpdate when space is already disbanded", func(t *testing.T) {
+		// 模拟 handler guard 通过后被并发解散：直接 seed 一个已解散空间，
+		// 调用 DB 方法应被事务内的 status 校验拦下。
+		seedSpace(t, "mgr-upd-toctou", "dying", "u-o-toc", SpaceStatusDisbanded)
+		name := "new name"
+		err := mdb.updateSpaceProfile("mgr-upd-toctou", &name, nil, nil, nil, nil)
+		assert.ErrorIs(t, err, ErrSpaceDisbandedForUpdate)
+
+		// 关键断言：UPDATE 必须没有真的执行，name 仍是原值
+		// querySpaceByID 过滤掉 disbanded，这里用 manager 查询绕过过滤。
+		sp, qErr := mdb.querySpaceIncludeDisbanded("mgr-upd-toctou")
+		assert.NoError(t, qErr)
+		assert.NotNil(t, sp)
+		assert.Equal(t, "dying", sp.Name, "事务内拒绝后字段不应被改写")
+	})
+
+	t.Run("no-op when all fields are nil on existing space", func(t *testing.T) {
+		seedSpace(t, "mgr-upd-noop", "untouched", "u-o-noop", SpaceStatusNormal)
+		err := mdb.updateSpaceProfile("mgr-upd-noop", nil, nil, nil, nil, nil)
+		assert.NoError(t, err)
+		sp, qErr := testSpaceDB.querySpaceByID("mgr-upd-noop")
+		assert.NoError(t, qErr)
+		assert.Equal(t, "untouched", sp.Name)
+	})
+}
+
+func TestManager_UpdateSpaceProfile_Validation(t *testing.T) {
+	s, _, err := setup(t)
+	assert.NoError(t, err)
+	token := adminToken(t)
+
+	seedSpace(t, "mgr-upd-v", "v space", "u-o-v", SpaceStatusNormal)
+
+	doPUT := func(body string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("PUT", "/v1/manager/spaces/mgr-upd-v", bytes.NewReader([]byte(body)))
+		req.Header.Set("token", token)
+		s.GetRoute().ServeHTTP(w, req)
+		return w
+	}
+
+	t.Run("reject empty body (no fields)", func(t *testing.T) {
+		w := doPUT(`{}`)
+		assert.NotEqual(t, http.StatusOK, w.Code)
+	})
+
+	t.Run("reject empty/whitespace name", func(t *testing.T) {
+		for _, name := range []string{"", "   "} {
+			w := doPUT(util.ToJson(map[string]interface{}{"name": name}))
+			assert.NotEqual(t, http.StatusOK, w.Code, "empty name %q should be rejected", name)
+		}
+	})
+
+	t.Run("reject name longer than 100 chars", func(t *testing.T) {
+		long := ""
+		for i := 0; i < 101; i++ {
+			long += "a"
+		}
+		w := doPUT(util.ToJson(map[string]interface{}{"name": long}))
+		assert.NotEqual(t, http.StatusOK, w.Code)
+	})
+
+	t.Run("reject description longer than 500 chars", func(t *testing.T) {
+		long := strings.Repeat("d", 501)
+		w := doPUT(util.ToJson(map[string]interface{}{"description": long}))
+		assert.NotEqual(t, http.StatusOK, w.Code)
+	})
+
+	t.Run("reject logo longer than 200 chars", func(t *testing.T) {
+		long := strings.Repeat("l", 201)
+		w := doPUT(util.ToJson(map[string]interface{}{"logo": long}))
+		assert.NotEqual(t, http.StatusOK, w.Code)
+	})
+
+	t.Run("reject invalid join_mode", func(t *testing.T) {
+		for _, jm := range []int{-1, 2, 99} {
+			w := doPUT(util.ToJson(map[string]interface{}{"join_mode": jm}))
+			assert.NotEqual(t, http.StatusOK, w.Code, "join_mode=%d should be rejected", jm)
+		}
+	})
+
+	t.Run("reject negative max_users", func(t *testing.T) {
+		w := doPUT(util.ToJson(map[string]interface{}{"max_users": -1}))
+		assert.NotEqual(t, http.StatusOK, w.Code)
+	})
+
+	t.Run("reject max_users below current active member count", func(t *testing.T) {
+		// 把空间塞到 5 个活跃成员
+		for i := 0; i < 4; i++ {
+			assert.NoError(t, testSpaceDB.insertMemberNoTx(&MemberModel{
+				SpaceId: "mgr-upd-v", UID: fmt.Sprintf("under-%d", i), Role: 0, Status: 1,
+			}))
+		}
+		w := doPUT(util.ToJson(map[string]interface{}{"max_users": 2}))
+		assert.NotEqual(t, http.StatusOK, w.Code)
+		assert.Contains(t, w.Body.String(), "成员")
+	})
+
+	t.Run("reject when space does not exist", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		body := util.ToJson(map[string]interface{}{"name": "x"})
+		req, _ := http.NewRequest("PUT", "/v1/manager/spaces/does-not-exist", bytes.NewReader([]byte(body)))
+		req.Header.Set("token", token)
+		s.GetRoute().ServeHTTP(w, req)
+		assert.NotEqual(t, http.StatusOK, w.Code)
+	})
+
+	t.Run("reject on disbanded space", func(t *testing.T) {
+		seedSpace(t, "mgr-upd-dead", "dead", "u-o-d", SpaceStatusDisbanded)
+		w := httptest.NewRecorder()
+		body := util.ToJson(map[string]interface{}{"name": "x"})
+		req, _ := http.NewRequest("PUT", "/v1/manager/spaces/mgr-upd-dead", bytes.NewReader([]byte(body)))
+		req.Header.Set("token", token)
+		s.GetRoute().ServeHTTP(w, req)
+		assert.NotEqual(t, http.StatusOK, w.Code)
+		assert.Contains(t, w.Body.String(), "解散")
+	})
+
+	t.Run("reject without admin token", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		body := util.ToJson(map[string]interface{}{"name": "x"})
+		req, _ := http.NewRequest("PUT", "/v1/manager/spaces/mgr-upd-v", bytes.NewReader([]byte(body)))
+		// 无 token
+		s.GetRoute().ServeHTTP(w, req)
+		assert.NotEqual(t, http.StatusOK, w.Code)
+	})
 }
