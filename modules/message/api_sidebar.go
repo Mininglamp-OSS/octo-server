@@ -142,9 +142,14 @@ type SidebarItem struct {
 //   - 拉取 follow tab 后保存 follow_version，下次比较是否需要全量重建。
 //   - 调 /v1/follow/sort 时把 follow_version 原样回传做 CAS。
 type sidebarSyncResp struct {
-	Items         []*SidebarItem `json:"items"`
-	Version       int64          `json:"version"`
-	FollowVersion int64          `json:"follow_version"`
+	Items         []*SidebarItem    `json:"items"`
+	Version       int64             `json:"version"`
+	FollowVersion int64             `json:"follow_version"`
+	// SpaceMemberships: 当前用户加入的全部群的 Space 归属。每次都返回，与
+	// /v1/conversation/sync 同一字段口径。客户端用于刷新本地 group/my-row
+	// 缓存，避免 SpaceFilter 因缓存 miss 走 fail-open 导致跨 Space 群消息泄漏。
+	// 详见 buildSpaceMemberships（api_conversation.go）。
+	SpaceMemberships []SpaceMembership `json:"space_memberships"`
 }
 
 // ---------------------------------------------------------------------------
@@ -544,10 +549,26 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 	//    follow_version 已在 step 0 读取（PR #21 review P1-1）。
 	respVersion := maxConversationVersion(rawConversations, req.Version)
 
+	// space_memberships：每次都返回当前用户加入的全部群的 Space 归属，与
+	// /v1/conversation/sync 同一字段口径。客户端用于刷新 group/my-row 缓存避免
+	// SpaceFilter fail-open（详见 buildSpaceMemberships）。
+	// 非致命：joinedGroups 查询失败时返回空切片，客户端最差行为退化为修复前的
+	// fail-open（已有兜底），不阻塞 sidebar 主流程。
+	// 初始化为空切片而非 nil，确保 JSON 序列化为 `[]` 而不是 `null` ——
+	// 客户端按数组处理该字段，nil → null 会触发反序列化兼容问题。
+	spaceMemberships := make([]SpaceMembership, 0)
+	if joinedGroups, jgErr := sb.groupService.GetGroupsWithMemberUID(loginUID); jgErr != nil {
+		sb.Warn("sidebar sync: joined groups query failed (non-fatal, space_memberships will be empty)",
+			zap.Error(jgErr))
+	} else {
+		spaceMemberships = buildSpaceMemberships(joinedGroups, externalGroupMap, defaultSpaceID)
+	}
+
 	c.JSON(http.StatusOK, &sidebarSyncResp{
-		Items:         items,
-		Version:       respVersion,
-		FollowVersion: followVersion,
+		Items:            items,
+		Version:          respVersion,
+		FollowVersion:    followVersion,
+		SpaceMemberships: spaceMemberships,
 	})
 }
 

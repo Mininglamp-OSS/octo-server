@@ -87,6 +87,29 @@ paths:
                 type: integer
                 format: int64
                 description: "user_follow_version 的当前值（follow tab 的 CAS / 增量检测）。调用 /v1/follow/sort 时原样传回。"
+              space_memberships:
+                type: array
+                description: |
+                  当前用户加入的全部群的 Space 归属（每次都返回，与增量/全量同步无关）。
+                  与 `/v1/conversation/sync` 同一字段口径，客户端用于刷新本地
+                  group/my-row 缓存，避免 SpaceFilter 因缓存 miss 走 fail-open 导致
+                  跨 Space 群消息泄漏。
+
+                  子区不单列：客户端按 `ParseChannelID` 拿父群 groupNo 反查本字段即可。
+                items:
+                  type: object
+                  properties:
+                    channel_id:
+                      type: string
+                      description: "群 channel_id (即 group_no)"
+                    space_id:
+                      type: string
+                      description: "群表权威 Space ID"
+                    my_source_space_id:
+                      type: string
+                      description: |
+                        外部群成员视角下的 source Space ID（仅当登录用户是外部成员时返回，
+                        空 source_space_id 会兜底为用户默认 Space）。
         400:
           description: "参数错误"
           schema:

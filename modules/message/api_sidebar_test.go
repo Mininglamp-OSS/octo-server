@@ -15,6 +15,7 @@ package message
 // =============================================================================
 
 import (
+	"encoding/json"
 	"sort"
 	"strings"
 	"testing"
@@ -995,6 +996,25 @@ func TestParseThreadChannelIDSidebar_Invalid(t *testing.T) {
 		_, _, err := parseThreadChannelIDSidebar(c)
 		assert.Error(t, err, "expected error for %q", c)
 	}
+}
+
+// TestSidebarSyncResp_SpaceMembershipsSerializesAsEmptyArray 守护 sidebar
+// 响应中 space_memberships 字段的 JSON 形态：必须是 `[]` 而非 `null`。
+// 客户端按数组反序列化该字段，nil → null 会触发兼容性异常（已在 review
+// 中发现）。
+func TestSidebarSyncResp_SpaceMembershipsSerializesAsEmptyArray(t *testing.T) {
+	resp := &sidebarSyncResp{
+		Items:            []*SidebarItem{},
+		Version:          0,
+		FollowVersion:    0,
+		SpaceMemberships: make([]SpaceMembership, 0),
+	}
+	b, err := json.Marshal(resp)
+	require.NoError(t, err)
+	assert.Contains(t, string(b), `"space_memberships":[]`,
+		"空 space_memberships 必须序列化为 [] 而非 null，客户端按数组处理")
+	assert.NotContains(t, string(b), `"space_memberships":null`,
+		"nil slice 会编码为 null 触发客户端反序列化异常")
 }
 
 // ---------------------------------------------------------------------------
