@@ -746,11 +746,17 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	//     source_space_id=""），与 decideConvKeepInSpace 同口径 → Finding 2。
 	externalGroupMap, externalErr := co.groupDB.QueryExternalGroupNosForUser(loginUID)
 	if externalErr != nil {
-		// 非致命：缺失 my_source_space_id 不影响 conversation-level
-		// SpaceID 回填；保持空 map 让 fillConversationSpaceIDs 退化为
-		// 仅填 SpaceID。FilterConversationsBySpace 走它自己的失败兜底。
-		co.Warn("查询外部群失败，跳过 my_source_space_id 回填", zap.Error(externalErr))
-		externalGroupMap = make(map[string]string)
+		// Fail-closed (PR #159 review by Jerry-Xin)：
+		// space_memberships 是 authoritative 契约（客户端按 wipe-replace 处理），
+		// 这个 map 也是 buildSpaceMemberships 的输入。如果 fail-open 退化成空 map，
+		// 外部群条目会被序列化进 space_memberships 但缺失 my_source_space_id，
+		// 客户端无法察觉、重建 my-row 缓存时丢失外部群 source Space 链路 →
+		// SpaceFilter 对外部群再次 fail-open，与本 PR 要关闭的泄漏类同根。
+		// 与同 handler 下 GetGroupsWithMemberUID 失败的处理对称（一次 DB 抖动 →
+		// 500 → 客户端重试），保证 200 响应里的 space_memberships 行级完整。
+		co.Error("查询外部群失败！", zap.Error(externalErr))
+		c.ResponseError(errors.New("查询外部群失败！"))
+		return
 	}
 	// defaultSpaceID 用于外部群 source_space_id="" 的空值兜底。
 	// 查询失败时返回空串，fillConversationSpaceIDs 自然退化为不写

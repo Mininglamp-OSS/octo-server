@@ -117,11 +117,12 @@ paths:
                   客户端用于刷新本地 group/my-row 缓存，避免 SpaceFilter 因缓存 miss
                   走 fail-open 导致跨 Space 群消息泄漏。
 
-                  **契约 — empty array is authoritative**：`space_memberships: []`
-                  仅在用户加入了 0 个群时返回；服务端 membership 查询失败会直接返回
-                  HTTP 500，绝不会以空数组形式吞掉错误。因此客户端可以安全地按
-                  "wipe-replace" 语义处理：不在列表中的本地 group/my-row 行即视为
-                  用户退群，直接删除本地缓存。
+                  **契约 — authoritative**：
+                  1. 列表形态权威：`space_memberships: []` 仅在用户加入了 0 个群时返回；
+                  2. 行级字段权威：每个条目的 `space_id` 与 `my_source_space_id` 都来自权威 DB；
+                  上述任一查询失败时服务端直接返回 HTTP 500，绝不会以"空数组 / 缺字段"
+                  形式静默吞掉错误。客户端可以安全地按 "wipe-replace" 语义处理：不在列表
+                  中的本地 group/my-row 行即视为用户退群，直接删除本地缓存。
 
                   子区不单列：客户端按 `ParseChannelID` 拿父群 groupNo 反查本字段即可。
                 items:
