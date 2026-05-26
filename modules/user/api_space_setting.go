@@ -10,7 +10,8 @@ import (
 )
 
 var allowedSpaceSettingFields = map[string]bool{
-	"voice_feedback_on":          true,
+	"voice_input_enabled":         true,
+	"voice_feedback_on":           true,
 	"voice_feedback_notice_acked": true,
 }
 
@@ -29,10 +30,12 @@ func (u *User) getSpaceSetting(c *wkhttp.Context) {
 	}
 
 	resp := gin.H{
-		"voice_feedback_on":          1,
+		"voice_input_enabled":         0,
+		"voice_feedback_on":           0,
 		"voice_feedback_notice_acked": 0,
 	}
 	if m != nil {
+		resp["voice_input_enabled"] = m.VoiceInputEnabled
 		resp["voice_feedback_on"] = m.VoiceFeedbackOn
 		resp["voice_feedback_notice_acked"] = m.VoiceFeedbackNoticeAcked
 	}

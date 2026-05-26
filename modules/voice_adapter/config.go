@@ -7,12 +7,14 @@ import (
 )
 
 const (
-	EnvSpeechServiceURL       = "SPEECH_SERVICE_URL"
-	EnvSpeechAPIKey           = "SPEECH_API_KEY"
-	EnvSpeechTimeout          = "SPEECH_TIMEOUT"
-	EnvSpeechMaxBodySize      = "SPEECH_MAX_BODY_SIZE"
-	EnvFeedbackPrivacyURL     = "VOICE_FEEDBACK_PRIVACY_URL"
-	DefaultTimeoutSec         = 50
+	EnvSpeechServiceURL         = "SPEECH_SERVICE_URL"
+	EnvSpeechAPIKey             = "SPEECH_API_KEY"
+	EnvSpeechTimeout            = "SPEECH_TIMEOUT"
+	EnvSpeechMaxBodySize        = "SPEECH_MAX_BODY_SIZE"
+	EnvFeedbackPrivacyURL       = "VOICE_FEEDBACK_PRIVACY_URL"
+	EnvFeedbackUserAgreementURL = "VOICE_FEEDBACK_USER_AGREEMENT_URL"
+	EnvASRServiceDocFile        = "VOICE_ASR_SERVICE_DOC_FILE"
+	DefaultTimeoutSec           = 50
 )
 
 type AdapterConfig struct {
@@ -21,6 +23,8 @@ type AdapterConfig struct {
 	SpeechTimeout      time.Duration
 	MaxBodySize        int64
 	FeedbackPrivacyURL string
+	UserAgreementURL   string
+	ASRServiceDocFile  string
 }
 
 func NewAdapterConfigFromEnv() *AdapterConfig {
@@ -44,5 +48,7 @@ func NewAdapterConfigFromEnv() *AdapterConfig {
 		SpeechTimeout:      time.Duration(timeoutSec) * time.Second,
 		MaxBodySize:        maxBodySize,
 		FeedbackPrivacyURL: os.Getenv(EnvFeedbackPrivacyURL),
+		UserAgreementURL:   os.Getenv(EnvFeedbackUserAgreementURL),
+		ASRServiceDocFile:  os.Getenv(EnvASRServiceDocFile),
 	}
 }

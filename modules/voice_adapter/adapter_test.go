@@ -5,6 +5,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -271,5 +273,149 @@ func TestNewAdapterConfigFromEnv_FeedbackPrivacyURL(t *testing.T) {
 
 	if cfg.FeedbackPrivacyURL != "https://example.com/policy" {
 		t.Errorf("expected FeedbackPrivacyURL='https://example.com/policy', got %q", cfg.FeedbackPrivacyURL)
+	}
+}
+
+func TestNewAdapterConfigFromEnv_NewURLFields(t *testing.T) {
+	t.Setenv("VOICE_FEEDBACK_USER_AGREEMENT_URL", "https://example.com/agreement")
+	t.Setenv("VOICE_ASR_SERVICE_DOC_FILE", "/tmp/doc.html")
+	t.Setenv("SPEECH_SERVICE_URL", "")
+	t.Setenv("SPEECH_API_KEY", "")
+	t.Setenv("SPEECH_TIMEOUT", "")
+	t.Setenv("SPEECH_MAX_BODY_SIZE", "")
+	t.Setenv("VOICE_FEEDBACK_PRIVACY_URL", "")
+
+	cfg := NewAdapterConfigFromEnv()
+
+	if cfg.UserAgreementURL != "https://example.com/agreement" {
+		t.Errorf("expected UserAgreementURL='https://example.com/agreement', got %q", cfg.UserAgreementURL)
+	}
+	if cfg.ASRServiceDocFile != "/tmp/doc.html" {
+		t.Errorf("expected ASRServiceDocFile='/tmp/doc.html', got %q", cfg.ASRServiceDocFile)
+	}
+}
+
+func TestGetConfigHandler_InjectsNewURLs(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"enabled": true,
+		})
+	}))
+	defer srv.Close()
+
+	a := &VoiceAdapter{
+		client: NewSpeechClient(srv.URL, "test-key", 2*time.Second),
+		cfg: &AdapterConfig{
+			FeedbackPrivacyURL: "https://example.com/privacy",
+			UserAgreementURL:   "https://example.com/agreement",
+		},
+		Log: log.NewTLog("VoiceAdapterTest"),
+	}
+	rec := callGetConfig(a)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["feedback_privacy_url"] != "https://example.com/privacy" {
+		t.Errorf("expected feedback_privacy_url='https://example.com/privacy', got %v", body["feedback_privacy_url"])
+	}
+	if body["feedback_user_agreement_url"] != "https://example.com/agreement" {
+		t.Errorf("expected feedback_user_agreement_url='https://example.com/agreement', got %v", body["feedback_user_agreement_url"])
+	}
+}
+
+func TestGetConfigHandler_NoNewURLsWhenEmpty(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"enabled": true,
+		})
+	}))
+	defer srv.Close()
+
+	a := &VoiceAdapter{
+		client: NewSpeechClient(srv.URL, "test-key", 2*time.Second),
+		cfg:    &AdapterConfig{},
+		Log:    log.NewTLog("VoiceAdapterTest"),
+	}
+	rec := callGetConfig(a)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if _, exists := body["feedback_user_agreement_url"]; exists {
+		t.Errorf("expected no feedback_user_agreement_url key when empty")
+	}
+}
+
+func callGetDocument(a *VoiceAdapter) *httptest.ResponseRecorder {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	gc, _ := gin.CreateTestContext(rec)
+	gc.Request = httptest.NewRequest(http.MethodGet, "/v1/voice/document/asr_service_doc", nil)
+	ctx := &wkhttp.Context{Context: gc}
+	a.getDocument(ctx)
+	return rec
+}
+
+func TestGetDocument_ASRServiceDoc(t *testing.T) {
+	tmpDir := t.TempDir()
+	docPath := filepath.Join(tmpDir, "asr_service_doc.html")
+	if err := os.WriteFile(docPath, []byte("<div>test content</div>"), 0644); err != nil {
+		t.Fatalf("write test doc: %v", err)
+	}
+
+	a := &VoiceAdapter{
+		cfg: &AdapterConfig{ASRServiceDocFile: docPath},
+		Log: log.NewTLog("VoiceAdapterTest"),
+	}
+	rec := callGetDocument(a)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["doc_type"] != "asr_service_doc" {
+		t.Errorf("expected doc_type='asr_service_doc', got %v", body["doc_type"])
+	}
+	if body["title"] != "Octo 语音转写服务说明" {
+		t.Errorf("expected title='Octo 语音转写服务说明', got %v", body["title"])
+	}
+	if body["content"] != "<div>test content</div>" {
+		t.Errorf("expected content='<div>test content</div>', got %v", body["content"])
+	}
+	if body["version"] != "2.0" {
+		t.Errorf("expected version='2.0', got %v", body["version"])
+	}
+}
+
+func TestGetDocument_NotFound(t *testing.T) {
+	a := &VoiceAdapter{
+		cfg: &AdapterConfig{ASRServiceDocFile: "/nonexistent/path/doc.html"},
+		Log: log.NewTLog("VoiceAdapterTest"),
+	}
+	rec := callGetDocument(a)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", rec.Code)
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["msg"] != "document not available" {
+		t.Errorf("expected msg='document not available', got %v", body["msg"])
 	}
 }

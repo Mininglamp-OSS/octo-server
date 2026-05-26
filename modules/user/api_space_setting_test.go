@@ -63,8 +63,25 @@ func TestGetSpaceSetting_DefaultValues(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, w.Code)
 	resp := parseSpaceSettingResp(t, w)
-	assert.Equal(t, float64(1), resp["voice_feedback_on"])
+	assert.Equal(t, float64(0), resp["voice_input_enabled"])
+	assert.Equal(t, float64(0), resp["voice_feedback_on"])
 	assert.Equal(t, float64(0), resp["voice_feedback_notice_acked"])
+}
+
+func TestPutSpaceSetting_ExplicitSetVoiceFeedbackOn(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	seedSpaceForSettingTest(t, ctx)
+
+	w := doSpaceSettingRequest(t, s, "PUT", "/v1/user/space/setting?space_id="+testSpaceID, map[string]interface{}{
+		"voice_feedback_on": 1,
+	})
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	w = doSpaceSettingRequest(t, s, "GET", "/v1/user/space/setting?space_id="+testSpaceID, nil)
+	assert.Equal(t, http.StatusOK, w.Code)
+	resp := parseSpaceSettingResp(t, w)
+	assert.Equal(t, float64(1), resp["voice_feedback_on"])
 }
 
 func TestPutSpaceSetting_SingleField(t *testing.T) {
@@ -127,4 +144,38 @@ func TestPutSpaceSetting_MissingSpaceID(t *testing.T) {
 		"voice_feedback_on": 1,
 	})
 	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestPutSpaceSetting_VoiceInputEnabled(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	seedSpaceForSettingTest(t, ctx)
+
+	w := doSpaceSettingRequest(t, s, "PUT", "/v1/user/space/setting?space_id="+testSpaceID, map[string]interface{}{
+		"voice_input_enabled": 1,
+	})
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	w = doSpaceSettingRequest(t, s, "GET", "/v1/user/space/setting?space_id="+testSpaceID, nil)
+	assert.Equal(t, http.StatusOK, w.Code)
+	resp := parseSpaceSettingResp(t, w)
+	assert.Equal(t, float64(1), resp["voice_input_enabled"])
+}
+
+func TestPutSpaceSetting_Combined(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	seedSpaceForSettingTest(t, ctx)
+
+	w := doSpaceSettingRequest(t, s, "PUT", "/v1/user/space/setting?space_id="+testSpaceID, map[string]interface{}{
+		"voice_input_enabled": 1,
+		"voice_feedback_on":   1,
+	})
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	w = doSpaceSettingRequest(t, s, "GET", "/v1/user/space/setting?space_id="+testSpaceID, nil)
+	assert.Equal(t, http.StatusOK, w.Code)
+	resp := parseSpaceSettingResp(t, w)
+	assert.Equal(t, float64(1), resp["voice_input_enabled"])
+	assert.Equal(t, float64(1), resp["voice_feedback_on"])
 }

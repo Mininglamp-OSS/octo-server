@@ -3,6 +3,7 @@ package voice_adapter
 import (
 	"errors"
 	"net/http"
+	"os"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
@@ -34,6 +35,7 @@ func (a *VoiceAdapter) Route(r *wkhttp.WKHttp) {
 		auth.POST("/transcribe", a.transcribe)
 		auth.GET("/config", a.getConfig)
 		auth.GET("/context", a.getContext)
+		auth.GET("/document/asr_service_doc", a.getDocument)
 	}
 }
 
@@ -82,6 +84,9 @@ func (a *VoiceAdapter) getConfig(c *wkhttp.Context) {
 	if a.cfg.FeedbackPrivacyURL != "" {
 		resp["feedback_privacy_url"] = a.cfg.FeedbackPrivacyURL
 	}
+	if a.cfg.UserAgreementURL != "" {
+		resp["feedback_user_agreement_url"] = a.cfg.UserAgreementURL
+	}
 	c.JSON(http.StatusOK, resp)
 }
 
@@ -116,5 +121,27 @@ func (a *VoiceAdapter) getContext(c *wkhttp.Context) {
 		"has_context": vocab.HasContent,
 		"context":     vocab.Content,
 		"updated_at":  vocab.UpdatedAt,
+	})
+}
+
+func (a *VoiceAdapter) getDocument(c *wkhttp.Context) {
+	docPath := a.cfg.ASRServiceDocFile
+	if docPath == "" {
+		docPath = "./assets/web/asr_service_doc.html"
+	}
+
+	content, err := os.ReadFile(docPath)
+	if err != nil {
+		a.Error("read asr service doc failed", zap.String("path", docPath), zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"msg": "document not available"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"doc_type":   "asr_service_doc",
+		"title":      "Octo 语音转写服务说明",
+		"content":    string(content),
+		"version":    "2.0",
+		"updated_at": "2026-05-25",
 	})
 }

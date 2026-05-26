@@ -7,9 +7,10 @@ import (
 )
 
 type SpaceSettingModel struct {
-	UID                     string `db:"uid"`
-	SpaceID                 string `db:"space_id"`
-	VoiceFeedbackOn         int    `db:"voice_feedback_on"`
+	UID                      string `db:"uid"`
+	SpaceID                  string `db:"space_id"`
+	VoiceInputEnabled        int    `db:"voice_input_enabled"`
+	VoiceFeedbackOn          int    `db:"voice_feedback_on"`
 	VoiceFeedbackNoticeAcked int    `db:"voice_feedback_notice_acked"`
 }
 
@@ -23,7 +24,7 @@ func NewSpaceSettingDB(session *dbr.Session) *SpaceSettingDB {
 
 func (d *SpaceSettingDB) QuerySpaceSetting(uid, spaceID string) (*SpaceSettingModel, error) {
 	var m *SpaceSettingModel
-	_, err := d.session.Select("uid", "space_id", "voice_feedback_on", "voice_feedback_notice_acked").
+	_, err := d.session.Select("uid", "space_id", "voice_input_enabled", "voice_feedback_on", "voice_feedback_notice_acked").
 		From("user_space_setting").
 		Where("uid=? AND space_id=?", uid, spaceID).
 		Load(&m)
@@ -45,7 +46,7 @@ func (d *SpaceSettingDB) UpdateSpaceSetting(uid, spaceID string, fields map[stri
 	stmt := d.session.Update("user_space_setting")
 	for k, v := range fields {
 		switch k {
-		case "voice_feedback_on", "voice_feedback_notice_acked":
+		case "voice_input_enabled", "voice_feedback_on", "voice_feedback_notice_acked":
 			stmt = stmt.Set(k, v)
 		default:
 			return fmt.Errorf("field %q is not allowed for update", k)
