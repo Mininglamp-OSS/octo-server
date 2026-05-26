@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -327,7 +328,16 @@ func (s *Space) getSpace(c *wkhttp.Context) {
 	})
 }
 
-// updateSpace 更新空间信息
+// userSpacePresetGroupIdsMaxBytes preset_group_ids 列为 TEXT (≤65535 字节)。
+// 校验取整数 sanity cap，超过即拒，避免把 driver-level 错误透传给用户。
+const userSpacePresetGroupIdsMaxBytes = 65535
+
+// updateSpace 用户侧修改空间基础信息（owner / admin 自服务）。
+//
+// 全字段部分更新：nil 字段不变更；至少需要提供一个字段。
+// 复用管理端 managerDB.updateSpaceProfile 的事务 + SELECT ... FOR UPDATE 实现
+// 保证存在性 / 状态校验与 UPDATE 同事务串行化，关闭 handler guard 与并发解散之间的
+// TOCTOU 窗口；max_users 不在用户侧暴露（仍由管理端控制）。
 func (s *Space) updateSpace(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	spaceId := c.Param("space_id")
@@ -351,17 +361,143 @@ func (s *Space) updateSpace(c *wkhttp.Context) {
 		c.ResponseError(errors.New("请求参数错误"))
 		return
 	}
+	if req.Name == nil && req.Description == nil && req.Logo == nil && req.JoinMode == nil && req.PresetGroupIds == nil {
+		c.ResponseError(errors.New("至少需要提供 name / description / logo / join_mode / preset_group_ids 之一"))
+		return
+	}
+
+	// 字段级校验：长度单位为字符（rune），与 MySQL VARCHAR(N) 的字符语义一致。
+	// 复用管理端常量（同包，含义完全相同），避免双写漂移。
+	if req.Name != nil {
+		trimmed := strings.TrimSpace(*req.Name)
+		if trimmed == "" {
+			c.ResponseError(errors.New("空间名称不能为空"))
+			return
+		}
+		if utf8.RuneCountInString(trimmed) > managerSpaceNameMaxChars {
+			c.ResponseError(fmt.Errorf("空间名称不能超过 %d 个字符", managerSpaceNameMaxChars))
+			return
+		}
+		req.Name = &trimmed
+	}
+	if req.Description != nil {
+		trimmed := strings.TrimSpace(*req.Description)
+		if utf8.RuneCountInString(trimmed) > managerSpaceDescriptionMaxChars {
+			c.ResponseError(fmt.Errorf("空间描述不能超过 %d 个字符", managerSpaceDescriptionMaxChars))
+			return
+		}
+		req.Description = &trimmed
+	}
+	if req.Logo != nil && utf8.RuneCountInString(*req.Logo) > managerSpaceLogoMaxChars {
+		c.ResponseError(fmt.Errorf("Logo 不能超过 %d 个字符", managerSpaceLogoMaxChars))
+		return
+	}
 	if req.JoinMode != nil && (*req.JoinMode < JoinModeDirect || *req.JoinMode > JoinModeApproval) {
 		c.ResponseError(errors.New("无效的加入模式，仅支持 0(直接加入) 或 1(需要审批)"))
 		return
 	}
+	if req.PresetGroupIds != nil {
+		if err := validatePresetGroupIds(*req.PresetGroupIds); err != nil {
+			c.ResponseError(err)
+			return
+		}
+	}
 
-	err = s.db.updateSpace(spaceId, req.Name, req.Description, req.Logo, req.PresetGroupIds, req.JoinMode)
+	before, err := s.mdb.updateSpaceProfile(spaceId, req.Name, req.Description, req.Logo, req.JoinMode, nil, req.PresetGroupIds)
 	if err != nil {
-		c.ResponseError(errors.New("更新空间失败"))
+		// 复用管理端 sentinel，并发解散与 active 检查之间的 race 由事务侧裁决。
+		if errors.Is(err, ErrSpaceNotFound) {
+			c.ResponseError(errors.New("空间不存在"))
+			return
+		}
+		if errors.Is(err, ErrSpaceDisbandedForUpdate) {
+			c.ResponseError(errors.New("空间已解散，无法修改空间信息"))
+			return
+		}
+		s.Error("用户修改空间信息失败", zap.Error(err), zap.String("spaceId", spaceId), zap.String("operator", loginUID))
+		c.ResponseError(errors.New("更新空间信息失败"))
 		return
 	}
+
+	// 审计日志：from 取自事务内锁定时刻的快照，避免并发更新导致 stale；
+	// 字段命名与管理端 m.Info("管理员修改空间信息", ...) 对齐，便于运维统一查询。
+	fields := []zap.Field{
+		zap.String("spaceId", spaceId),
+		zap.String("operator", loginUID),
+		zap.Int("role", member.Role),
+	}
+	if req.Name != nil {
+		fields = append(fields, zap.String("nameFrom", before.Name), zap.String("nameTo", *req.Name))
+	}
+	if req.Description != nil {
+		fields = append(fields, zap.String("descFrom", before.Description), zap.String("descTo", *req.Description))
+	}
+	if req.Logo != nil {
+		fields = append(fields, zap.String("logoFrom", before.Logo), zap.String("logoTo", *req.Logo))
+	}
+	if req.JoinMode != nil {
+		fields = append(fields, zap.Int("joinModeFrom", before.JoinMode), zap.Int("joinModeTo", *req.JoinMode))
+	}
+	if req.PresetGroupIds != nil {
+		fields = append(fields,
+			zap.String("presetGroupIdsFrom", derefStringOr(before.PresetGroupIds, "")),
+			zap.String("presetGroupIdsTo", *req.PresetGroupIds),
+		)
+	}
+	s.Info("用户修改空间信息", fields...)
 	c.ResponseOK()
+}
+
+// derefStringOr 安全解引用 *string，nil 时返回 fallback。
+// 审计日志专用：preset_group_ids 是 *string，from 值可能为 nil。
+func derefStringOr(p *string, fallback string) string {
+	if p == nil {
+		return fallback
+	}
+	return *p
+}
+
+// validatePresetGroupIds 校验 preset_group_ids 的字符串载荷。
+//
+// 合法输入：
+//   - 空字符串 ""           → 表示清空预设群组列表
+//   - JSON 字符串数组 "[...]" → 元素必须严格为 JSON 字符串（含空数组 "[]"）
+//
+// 拒绝（之前用 json.Unmarshal 到 []string 会静默放过的坑）：
+//   - 顶层 "null"            → Go 解码到 []string 得 nil slice 不报错
+//   - 数组含 null：[null]     → Go 解码到 []string 把 null 写成 ""，不报错
+//   - 数组含非字符串：[1,{}]  → 同上，会被解码失败拦下，但单测显式覆盖
+//
+// 实现：先按 []json.RawMessage 切片解，再逐元素校验首字节是 '"'，
+// 这样能区分 JSON 字符串和 null/number/object/array。
+func validatePresetGroupIds(raw string) error {
+	if len(raw) > userSpacePresetGroupIdsMaxBytes {
+		return fmt.Errorf("preset_group_ids 不能超过 %d 字节", userSpacePresetGroupIdsMaxBytes)
+	}
+	if raw == "" {
+		return nil
+	}
+	// 用 *[]json.RawMessage 区分 "[...]" 与 "null"：top-level null 解到 *T 会得 nil 指针。
+	var arr *[]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &arr); err != nil {
+		return errors.New("preset_group_ids 必须为 JSON 字符串数组")
+	}
+	if arr == nil {
+		return errors.New("preset_group_ids 不能为 null，请用空字符串表示清空")
+	}
+	for i, elem := range *arr {
+		// json.RawMessage 不包含前后空白（json.Decoder 已剥离），直接判首字节即可。
+		// 字符串必以 '"' 开头；其余（null/数字/对象/数组）一律拒。
+		if len(elem) == 0 || elem[0] != '"' {
+			return fmt.Errorf("preset_group_ids[%d] 必须为字符串", i)
+		}
+		// 复活解到 string 以确保转义合法（如 "\uXXXX" 完整、引号闭合）。
+		var s string
+		if err := json.Unmarshal(elem, &s); err != nil {
+			return fmt.Errorf("preset_group_ids[%d] 解析失败: %w", i, err)
+		}
+	}
+	return nil
 }
 
 // disbandSpace 解散空间

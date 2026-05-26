@@ -122,12 +122,15 @@ type createSpaceReq struct {
 	JoinMode    int    `json:"join_mode"` // 0=直接加入(默认) 1=需要审批
 }
 
+// updateSpaceReq 用户侧 PUT /v1/space/:space_id 请求体。
+// 所有字段均为可选指针；nil 表示不变更。handler 拒空 body / all-nil。
+// 注意：max_users 仍是管理端专属，本结构不暴露。
 type updateSpaceReq struct {
-	Name           string  `json:"name"`
-	Description    string  `json:"description"`
-	Logo           string  `json:"logo"`
-	PresetGroupIds *string `json:"preset_group_ids"`
+	Name           *string `json:"name"`
+	Description    *string `json:"description"`
+	Logo           *string `json:"logo"`
 	JoinMode       *int    `json:"join_mode"`
+	PresetGroupIds *string `json:"preset_group_ids"`
 }
 
 type addMemberReq struct {

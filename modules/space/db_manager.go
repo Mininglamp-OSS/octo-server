@@ -230,6 +230,17 @@ var ErrSpaceDisbandedForUpdate = errors.New("space already disbanded")
 // 由于读取与 UPDATE 在同一事务内串行化，并发更新场景下的 from 值不会 stale。
 //
 // nil 参数不变更；调用方需保证至少有一个非 nil（否则 no-op，但仍返回快照）。
+//
+// presetGroupIds 与其他字段一致用 *string 表达"是否变更"，传入字符串作为整体写入
+// preset_group_ids 列（运行期解析见 api.go 的 joinPresetGroups）；
+// 该参数仅由用户侧 PUT /v1/space/:space_id 使用，管理端目前传 nil。
+//
+// 状态守卫契约：本函数仅拦截 SpaceStatusDisbanded（return ErrSpaceDisbandedForUpdate），
+// 不拦截 SpaceStatusBanned —— manager 端有意允许对 banned 空间执行修复性更新。
+// 因此调用方必须自行决定是否拒绝 banned：
+//   - 管理端 handler 故意放行；
+//   - 用户端 handler 通过 checkSpaceActive (status=1 才放行) 在入口就拒绝 banned。
+// 不要假设 helper 会替你挡 banned。
 func (d *managerDB) updateSpaceProfile(
 	spaceId string,
 	name *string,
@@ -237,6 +248,7 @@ func (d *managerDB) updateSpaceProfile(
 	logo *string,
 	joinMode *int,
 	maxUsers *int,
+	presetGroupIds *string,
 ) (*SpaceModel, error) {
 	tx, err := d.session.Begin()
 	if err != nil {
@@ -280,6 +292,10 @@ func (d *managerDB) updateSpaceProfile(
 	}
 	if maxUsers != nil {
 		builder = builder.Set("max_users", *maxUsers)
+		changed = true
+	}
+	if presetGroupIds != nil {
+		builder = builder.Set("preset_group_ids", *presetGroupIds)
 		changed = true
 	}
 	if !changed {

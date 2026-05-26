@@ -547,7 +547,8 @@ func (m *Manager) updateSpaceProfile(c *wkhttp.Context) {
 		}
 	}
 
-	before, err := m.managerDB.updateSpaceProfile(spaceId, req.Name, req.Description, req.Logo, req.JoinMode, req.MaxUsers)
+	// presetGroupIds 仅由用户侧 PUT /v1/space/:space_id 使用，管理端固定传 nil。
+	before, err := m.managerDB.updateSpaceProfile(spaceId, req.Name, req.Description, req.Logo, req.JoinMode, req.MaxUsers, nil)
 	if err != nil {
 		// 事务内 SELECT FOR UPDATE 用 sentinel error 报告并发场景；HTTP 层映射为 4xx 提示。
 		// 不能依赖 RowsAffected 区分：MySQL 默认返回变更行数而非匹配行数，

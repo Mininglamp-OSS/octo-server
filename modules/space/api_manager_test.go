@@ -1451,7 +1451,7 @@ func TestManagerDB_UpdateSpaceProfile_TOCTOU(t *testing.T) {
 
 	t.Run("returns ErrSpaceNotFound for missing space", func(t *testing.T) {
 		name := "x"
-		before, err := mdb.updateSpaceProfile("nope-not-exists", &name, nil, nil, nil, nil)
+		before, err := mdb.updateSpaceProfile("nope-not-exists", &name, nil, nil, nil, nil, nil)
 		assert.ErrorIs(t, err, ErrSpaceNotFound)
 		assert.Nil(t, before)
 	})
@@ -1461,7 +1461,7 @@ func TestManagerDB_UpdateSpaceProfile_TOCTOU(t *testing.T) {
 		// 调用 DB 方法应被事务内的 status 校验拦下。
 		seedSpace(t, "mgr-upd-toctou", "dying", "u-o-toc", SpaceStatusDisbanded)
 		name := "new name"
-		before, err := mdb.updateSpaceProfile("mgr-upd-toctou", &name, nil, nil, nil, nil)
+		before, err := mdb.updateSpaceProfile("mgr-upd-toctou", &name, nil, nil, nil, nil, nil)
 		assert.ErrorIs(t, err, ErrSpaceDisbandedForUpdate)
 		assert.Nil(t, before)
 
@@ -1475,7 +1475,7 @@ func TestManagerDB_UpdateSpaceProfile_TOCTOU(t *testing.T) {
 
 	t.Run("no-op when all fields are nil on existing space", func(t *testing.T) {
 		seedSpace(t, "mgr-upd-noop", "untouched", "u-o-noop", SpaceStatusNormal)
-		before, err := mdb.updateSpaceProfile("mgr-upd-noop", nil, nil, nil, nil, nil)
+		before, err := mdb.updateSpaceProfile("mgr-upd-noop", nil, nil, nil, nil, nil, nil)
 		assert.NoError(t, err)
 		assert.NotNil(t, before)
 		assert.Equal(t, "untouched", before.Name, "no-op 仍应返回 pre-update 快照")
@@ -1489,7 +1489,7 @@ func TestManagerDB_UpdateSpaceProfile_TOCTOU(t *testing.T) {
 		// 不再使用 tx 外的 sp，避免并发更新窗口下旧值 stale。
 		seedSpace(t, "mgr-upd-snap", "original", "u-o-snap", SpaceStatusNormal)
 		newName := "renamed"
-		before, err := mdb.updateSpaceProfile("mgr-upd-snap", &newName, nil, nil, nil, nil)
+		before, err := mdb.updateSpaceProfile("mgr-upd-snap", &newName, nil, nil, nil, nil, nil)
 		assert.NoError(t, err)
 		assert.NotNil(t, before)
 		assert.Equal(t, "original", before.Name, "before 应为 UPDATE 前的值")
