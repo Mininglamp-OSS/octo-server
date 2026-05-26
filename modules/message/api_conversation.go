@@ -755,13 +755,23 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 		// 与同 handler 下 GetGroupsWithMemberUID 失败的处理对称（一次 DB 抖动 →
 		// 500 → 客户端重试），保证 200 响应里的 space_memberships 行级完整。
 		co.Error("查询外部群失败！", zap.Error(externalErr))
-		c.ResponseError(errors.New("查询外部群失败！"))
+		c.ResponseErrorWithStatus(errors.New("查询外部群失败！"), http.StatusInternalServerError)
 		return
 	}
-	// defaultSpaceID 用于外部群 source_space_id="" 的空值兜底。
-	// 查询失败时返回空串，fillConversationSpaceIDs 自然退化为不写
-	// MySourceSpaceID —— omitempty 保持向后兼容。
-	defaultSpaceID := space.GetUserDefaultSpaceID(co.ctx, loginUID)
+	// defaultSpaceID 是外部群 source_space_id="" 的空值兜底（legacy 外部成员行）。
+	// 走 error-returning 变体并 fail-closed：与 QueryExternalGroupNosForUser /
+	// GetGroupsWithMemberUID 的失败处理对称，保证 200 响应里 space_memberships
+	// 的每个外部群行都带可靠的 my_source_space_id。
+	// 旧版 GetUserDefaultSpaceID 吞掉 DB error 返回 ""，会让 resolveMySourceSpaceID
+	// 在 legacy 外部行上回退到 ""，触发 omitempty 丢字段，客户端 wipe-replace 后
+	// 重建的 my-row 缺少 source Space 链路 → SpaceFilter 对外部群再次 fail-open
+	// （PR #159 review by Jerry-Xin / yujiawei P1）。
+	defaultSpaceID, defaultSpaceErr := space.GetUserDefaultSpaceIDE(co.ctx, loginUID)
+	if defaultSpaceErr != nil {
+		co.Error("查询用户默认 Space 失败！", zap.Error(defaultSpaceErr))
+		c.ResponseErrorWithStatus(errors.New("查询用户默认 Space 失败！"), http.StatusInternalServerError)
+		return
+	}
 	fillConversationSpaceIDs(syncUserConversationResps, rawGroupSpaceMap, externalGroupMap, defaultSpaceID)
 
 	// 查询通话中的频道
@@ -769,7 +779,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	joinedGroups, err := co.groupService.GetGroupsWithMemberUID(loginUID)
 	if err != nil {
 		co.Error("查询加入的群聊错误", zap.Error(err))
-		c.ResponseError(errors.New("查询加入的群聊错误"))
+		c.ResponseErrorWithStatus(errors.New("查询加入的群聊错误"), http.StatusInternalServerError)
 		return
 	}
 	callChannelIDs := make([]string, 0)

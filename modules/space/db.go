@@ -2,8 +2,10 @@ package space
 
 import (
 	"errors"
-	"go.uber.org/zap"
+	"fmt"
 	"time"
+
+	"go.uber.org/zap"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
@@ -390,15 +392,30 @@ func (d *DB) countInvitesBySpace(spaceId string, filter inviteListFilter, now ti
 }
 
 // GetUserDefaultSpaceID 获取用户最早加入的 Space（默认 Space）
+//
+// Deprecated: 内部吞掉 DB 错误，调用方无法区分"用户没默认 Space"和"查询失败"。
+// 对于"authoritative-empty 契约"敏感的路径（如 /v1/conversation/sync 的
+// space_memberships sideband），请改用 GetUserDefaultSpaceIDE 拿到 error
+// 后 fail-closed 返回非 200。
 func GetUserDefaultSpaceID(ctx *config.Context, uid string) string {
+	spaceID, _ := GetUserDefaultSpaceIDE(ctx, uid)
+	return spaceID
+}
+
+// GetUserDefaultSpaceIDE 是 GetUserDefaultSpaceID 的 error-returning 变体。
+// 用户没默认 Space 时返回 ("", nil)；DB 查询失败时返回 ("", err)。
+func GetUserDefaultSpaceIDE(ctx *config.Context, uid string) (string, error) {
 	var spaceID string
-	_, _ = ctx.DB().SelectBySql(`
+	_, err := ctx.DB().SelectBySql(`
 		SELECT space_id FROM space_member
 		WHERE uid=? AND status=1
 		ORDER BY created_at ASC
 		LIMIT 1
 	`, uid).Load(&spaceID)
-	return spaceID
+	if err != nil {
+		return "", fmt.Errorf("query user default space failed: %w", err)
+	}
+	return spaceID, nil
 }
 
 // GetSpaceMemberUIDs 获取指定 Space 的所有成员 UID
