@@ -1,6 +1,7 @@
 package message
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
@@ -401,6 +402,33 @@ func TestSpaceID_SpaceMemberships_LeftGroupDropped(t *testing.T) {
 
 	require.Len(t, got, 1, "退群后该群必须从 space_memberships 剔除")
 	assert.Equal(t, "g_kept", got[0].ChannelID)
+}
+
+// TestSyncUserConversationRespWrap_SpaceMembershipsSerializesAsEmptyArray 是
+// wire contract 的端到端守护：`SyncUserConversationRespWrap.SpaceMemberships`
+// 在用户加入 0 个群时必须序列化为 `[]` 而不是 `null`，且字段必须存在。
+//
+// 客户端按 "wipe-replace" 处理该字段（不在列表中 = 退群 → 删除本地缓存）。
+// 如果 JSON 编码出 `null`，三端的反序列化分支不一致：
+//   - Go/Kotlin/Swift 默认会把 null 当成"字段缺失" → 客户端跳过缓存重建 →
+//     残留过期成员关系 → SpaceFilter cached-match 继续放行跨 Space 消息
+//   - 部分客户端会把 null 当成空数组 → 触发 wipe-replace → 误删整个本地缓存
+//
+// buildSpaceMemberships 已用 `make([]SpaceMembership, 0, N)` 保证非 nil；
+// 本测试守护 wrapper 字段标签 + 编码结果，避免后续 refactor 不小心加上
+// omitempty 或改成指针类型破坏契约。
+func TestSyncUserConversationRespWrap_SpaceMembershipsSerializesAsEmptyArray(t *testing.T) {
+	wrap := SyncUserConversationRespWrap{
+		UID:              "u1",
+		Conversations:    []*SyncUserConversationResp{},
+		SpaceMemberships: buildSpaceMemberships(nil, nil, ""),
+	}
+	b, err := json.Marshal(wrap)
+	require.NoError(t, err)
+	assert.Contains(t, string(b), `"space_memberships":[]`,
+		"空 space_memberships 必须序列化为 [] 而非 null；契约要求 empty array is authoritative")
+	assert.NotContains(t, string(b), `"space_memberships":null`,
+		"nil/null 形态会让客户端无法区分'用户无群'和'字段缺失'，破坏 wipe-replace 契约")
 }
 
 // 防止 unused import: group。这里通过引用 InfoResp 类型让 import 有意义。
