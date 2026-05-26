@@ -403,15 +403,22 @@ func (s *Space) updateSpace(c *wkhttp.Context) {
 		}
 	}
 
-	before, err := s.mdb.updateSpaceProfile(spaceId, req.Name, req.Description, req.Logo, req.JoinMode, nil, req.PresetGroupIds)
+	// allowBanned=false：用户端绝不能更新封禁空间。事务侧二次校验关闭了
+	// "checkSpaceActive 通过 → 管理员并发 ban → 用户事务仍 UPDATE 落地" 的 TOCTOU race
+	// （Jerry-Xin 在 PR #164 review 中指出的 Critical 问题）。
+	before, err := s.mdb.updateSpaceProfile(spaceId, req.Name, req.Description, req.Logo, req.JoinMode, nil, req.PresetGroupIds, false)
 	if err != nil {
-		// 复用管理端 sentinel，并发解散与 active 检查之间的 race 由事务侧裁决。
+		// 复用管理端 sentinel，并发解散 / 封禁与 active 检查之间的 race 由事务侧裁决。
 		if errors.Is(err, ErrSpaceNotFound) {
 			c.ResponseError(errors.New("空间不存在"))
 			return
 		}
 		if errors.Is(err, ErrSpaceDisbandedForUpdate) {
 			c.ResponseError(errors.New("空间已解散，无法修改空间信息"))
+			return
+		}
+		if errors.Is(err, ErrSpaceBannedForUpdate) {
+			c.ResponseError(errors.New("空间已封禁，无法修改空间信息"))
 			return
 		}
 		s.Error("用户修改空间信息失败", zap.Error(err), zap.String("spaceId", spaceId), zap.String("operator", loginUID))

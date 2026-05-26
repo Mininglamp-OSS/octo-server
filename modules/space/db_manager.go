@@ -215,6 +215,11 @@ var ErrSpaceNotFound = errors.New("space not found")
 // ErrSpaceDisbandedForUpdate 事务内发现空间已解散，禁止更新基础信息
 var ErrSpaceDisbandedForUpdate = errors.New("space already disbanded")
 
+// ErrSpaceBannedForUpdate 事务内发现空间已封禁，且调用方未授权对封禁空间执行更新。
+// 用户端 PUT 应映射为 4xx；管理端调用 updateSpaceProfile 时 allowBanned=true，
+// 该 sentinel 不会被触发。
+var ErrSpaceBannedForUpdate = errors.New("space is banned and caller disallowed banned updates")
+
 // updateSpaceProfile 管理端部分更新空间基础字段。
 //
 // 用 SELECT ... FOR UPDATE 在事务内锁定 space 行并原子校验存在性 + 非 Disbanded 状态，
@@ -235,12 +240,14 @@ var ErrSpaceDisbandedForUpdate = errors.New("space already disbanded")
 // preset_group_ids 列（运行期解析见 api.go 的 joinPresetGroups）；
 // 该参数仅由用户侧 PUT /v1/space/:space_id 使用，管理端目前传 nil。
 //
-// 状态守卫契约：本函数仅拦截 SpaceStatusDisbanded（return ErrSpaceDisbandedForUpdate），
-// 不拦截 SpaceStatusBanned —— manager 端有意允许对 banned 空间执行修复性更新。
-// 因此调用方必须自行决定是否拒绝 banned：
-//   - 管理端 handler 故意放行；
-//   - 用户端 handler 通过 checkSpaceActive (status=1 才放行) 在入口就拒绝 banned。
-// 不要假设 helper 会替你挡 banned。
+// 状态守卫契约（事务内强制，关闭 handler 层 guard 与 UPDATE 之间的 TOCTOU 窗口）：
+//   - SpaceStatusDisbanded 永远拒绝（ErrSpaceDisbandedForUpdate）
+//   - SpaceStatusBanned 由 allowBanned 控制：
+//       allowBanned=true（管理端）  → 放行，允许对封禁空间执行修复性更新
+//       allowBanned=false（用户端）→ 拒绝（ErrSpaceBannedForUpdate）
+//
+// 用户端 handler 必须传 allowBanned=false：仅在入口用 checkSpaceActive 挡 banned 不够，
+// 入口检查与事务之间存在 race 窗口（manager 并发 ban），事务侧必须再挡一次才闭环。
 func (d *managerDB) updateSpaceProfile(
 	spaceId string,
 	name *string,
@@ -249,6 +256,7 @@ func (d *managerDB) updateSpaceProfile(
 	joinMode *int,
 	maxUsers *int,
 	presetGroupIds *string,
+	allowBanned bool,
 ) (*SpaceModel, error) {
 	tx, err := d.session.Begin()
 	if err != nil {
@@ -270,6 +278,9 @@ func (d *managerDB) updateSpaceProfile(
 	}
 	if before.Status == SpaceStatusDisbanded {
 		return nil, ErrSpaceDisbandedForUpdate
+	}
+	if !allowBanned && before.Status == SpaceStatusBanned {
+		return nil, ErrSpaceBannedForUpdate
 	}
 
 	builder := tx.Update("space")

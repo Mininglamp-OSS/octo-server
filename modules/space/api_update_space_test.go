@@ -398,6 +398,49 @@ func TestUserUpdateSpace_ActiveGuard(t *testing.T) {
 	})
 }
 
+// TestUserUpdateSpace_BannedTOCTOURegression 回归 PR #164 Jerry-Xin 指出的 Critical：
+// 用户端 checkSpaceActive（status=1 才放行）与事务内 UPDATE 之间存在 race 窗口 ——
+// 若管理员在 checkSpaceActive 通过后并发把空间置为 banned (status=2)，旧实现的
+// 事务内 status 检查只挡 disbanded，banned 行仍会被 UPDATE 写入。
+//
+// 该测试在 DB 层直接调用 updateSpaceProfile(..., allowBanned=false) on 一个 banned
+// 空间，模拟 race 时事务获取锁后看到的"已被 ban"状态，验证 helper 现在能拒。
+func TestUserUpdateSpace_BannedTOCTOURegression(t *testing.T) {
+	_, _, err := setup(t)
+	assert.NoError(t, err)
+	mdb := newManagerDB(testCtx.DB())
+
+	// seed 一个已被 ban 的空间（模拟 race 中"事务获取锁那一刻"的状态）
+	spaceId := "usr-upd-banned-race"
+	seedSpace(t, spaceId, "victim", "u-o-ban", SpaceStatusBanned)
+
+	t.Run("user-side call (allowBanned=false) rejects banned with ErrSpaceBannedForUpdate", func(t *testing.T) {
+		newName := "attacker-rename"
+		before, err := mdb.updateSpaceProfile(spaceId, &newName, nil, nil, nil, nil, nil, false)
+		assert.ErrorIs(t, err, ErrSpaceBannedForUpdate, "封禁空间 + 用户端调用应被事务侧拦下")
+		assert.Nil(t, before)
+
+		// 关键：UPDATE 必须没有真的执行
+		sp, qErr := mdb.querySpaceIncludeDisbanded(spaceId)
+		assert.NoError(t, qErr)
+		assert.Equal(t, "victim", sp.Name, "事务拒绝后 name 不应被改写")
+		assert.Equal(t, SpaceStatusBanned, sp.Status, "status 不应被影响")
+	})
+
+	t.Run("manager-side call (allowBanned=true) still allows banned (修复性更新)", func(t *testing.T) {
+		newName := "manager-fix-name"
+		before, err := mdb.updateSpaceProfile(spaceId, &newName, nil, nil, nil, nil, nil, true)
+		assert.NoError(t, err, "管理端对 banned 空间的修复性更新应被允许")
+		assert.NotNil(t, before)
+		assert.Equal(t, "victim", before.Name)
+
+		sp, qErr := mdb.querySpaceIncludeDisbanded(spaceId)
+		assert.NoError(t, qErr)
+		assert.Equal(t, "manager-fix-name", sp.Name, "管理端 UPDATE 应落库")
+		assert.Equal(t, SpaceStatusBanned, sp.Status, "status 不变")
+	})
+}
+
 func TestUserUpdateSpace_IdempotentReplay(t *testing.T) {
 	// 回归：MySQL 默认 RowsAffected = 实际变更行数。
 	// helper 走 SELECT ... FOR UPDATE + sentinel，不依赖 RowsAffected，
