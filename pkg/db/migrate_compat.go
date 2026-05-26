@@ -298,6 +298,91 @@ func ReconcileThreadSchemaRecords(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
+// removedMigrationIDs lists migration IDs whose source files have been
+// deleted from the repository (the owning module was removed). Any rows in
+// gorp_migrations under these IDs would make sql-migrate's PlanMigration
+// panic with "unknown migration in database" on the next startup.
+//
+// Both the post-rename timestamp form and the pre-rename legacy form are
+// listed: production databases that were rewritten by RewriteLegacyMigrationIDs
+// will only have the timestamp form, but a database that was never rewritten
+// (e.g. an upgrade that skipped the rename release entirely) still holds the
+// legacy form, and removing the rename mapping at the same time as the SQL
+// files means RewriteLegacyMigrationIDs no longer translates it on the way in.
+//
+// When adding new entries, document the module removal that produced them so
+// future readers can audit whether the underlying tables/data also need
+// follow-up cleanup. The list is intentionally code-resident (not data-driven)
+// because each entry is a one-time, irreversible decision tied to a specific
+// release.
+var removedMigrationIDs = []string{
+	// modules/backup removed in issue #139 (built-in WuKongIM backup module).
+	// Tables `backup_config` / `backup_history` intentionally left in place —
+	// no drop migration — so existing production rows are not lost.
+	"20260331000001_backup_legacy01.sql",
+	"20260401000001_backup_legacy01.sql",
+	"backup-20260331-01.sql",
+	"backup-20260401-01.sql",
+}
+
+// PurgeRemovedMigrationIDs deletes any rows in gorp_migrations whose ID
+// appears in removedMigrationIDs. Call after RewriteLegacyMigrationIDs and
+// before module.Setup.
+//
+// Idempotent: a fresh install (gorp_migrations table absent) is a no-op; a
+// database whose rows were already purged is a no-op; only rows present in
+// both the table and the removed list are deleted.
+func PurgeRemovedMigrationIDs(ctx context.Context, db *sql.DB) error {
+	if len(removedMigrationIDs) == 0 {
+		return nil
+	}
+	if err := ensureGorpMigrationsTable(ctx, db); err != nil {
+		if errors.Is(err, errTableAbsent) {
+			return nil
+		}
+		return fmt.Errorf("check gorp_migrations existence: %w", err)
+	}
+
+	existing, err := loadExistingMigrationIDs(ctx, db)
+	if err != nil {
+		return fmt.Errorf("read gorp_migrations: %w", err)
+	}
+
+	var toDelete []string
+	for _, id := range removedMigrationIDs {
+		if existing[id] {
+			toDelete = append(toDelete, id)
+		}
+	}
+	if len(toDelete) == 0 {
+		return nil
+	}
+	// Deterministic order so concurrent replicas acquire row locks in the
+	// same sequence during rolling deploys.
+	sort.Strings(toDelete)
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	stmt, err := tx.PrepareContext(ctx, "DELETE FROM gorp_migrations WHERE id = ?")
+	if err != nil {
+		return fmt.Errorf("prepare delete: %w", err)
+	}
+	defer stmt.Close()
+	for _, id := range toDelete {
+		if _, err := stmt.ExecContext(ctx, id); err != nil {
+			return fmt.Errorf("purge removed migration %s: %w", id, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
+}
+
 func loadMigrationIDMapping() (map[string]string, error) {
 	var parsed migrationIDMapping
 	if err := json.Unmarshal(migrationIDMappingJSON, &parsed); err != nil {

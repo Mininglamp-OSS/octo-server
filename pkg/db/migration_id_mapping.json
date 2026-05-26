@@ -1,5 +1,5 @@
 {
-  "total": 124,
+  "total": 122,
   "mapping": {
     "app-20201103-01.sql": "20201103000001_app_legacy01.sql",
     "app-20230912-01.sql": "20230912000001_app_legacy01.sql",
@@ -8,8 +8,6 @@
     "app_bot-20260509-01.sql": "20260509000001_app_bot_legacy01.sql",
     "app_bot-20260510-01.sql": "20260510000001_app_bot_legacy01.sql",
     "app_bot-20260510-02.sql": "20260510000002_app_bot_legacy02.sql",
-    "backup-20260331-01.sql": "20260331000001_backup_legacy01.sql",
-    "backup-20260401-01.sql": "20260401000001_backup_legacy01.sql",
     "bot_api-20260505.sql": "20260505000002_bot_api.sql",
     "botfather-20260226-01.sql": "20260226000001_botfather_legacy01.sql",
     "botfather-20260318-01.sql": "20260318000001_botfather_legacy01.sql",

@@ -161,6 +161,14 @@ func runAPI(ctx *config.Context) {
 		rewriteCancel()
 		panic(fmt.Errorf("reconcile thread schema records: %w", err))
 	}
+	// Purge gorp_migrations rows whose source SQL files were deleted by a
+	// module removal (e.g. issue #139: modules/backup). Without this,
+	// sql-migrate's PlanMigration would panic with "unknown migration in
+	// database" on the next startup of an existing deployment.
+	if err := octodb.PurgeRemovedMigrationIDs(rewriteCtx, ctx.DB().DB); err != nil {
+		rewriteCancel()
+		panic(fmt.Errorf("purge removed migration IDs: %w", err))
+	}
 	rewriteCancel()
 
 	// 模块安装
