@@ -21,6 +21,7 @@ package modules
 
 // 引入模块
 import (
+	_ "github.com/Mininglamp-OSS/octo-server/modules/backup"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/base"
 	// `robot` before `botfather`: botfather migrations ALTER the robot table
 	// (历史顺序，非 load-bearing —— 真正排序由 SQL 文件时间戳决定)。

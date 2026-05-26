@@ -3,6 +3,7 @@ package category
 // Blank imports to ensure all dependent modules register their SQL migrations
 // during tests. Mirrors internal/modules.go to ensure correct migration order.
 import (
+	_ "github.com/Mininglamp-OSS/octo-server/modules/backup"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/base"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/botfather"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/channel"
