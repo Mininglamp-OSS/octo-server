@@ -19,6 +19,7 @@ import (
 	_ "github.com/Mininglamp-OSS/octo-server/internal"
 	commonapi "github.com/Mininglamp-OSS/octo-server/modules/base/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	octodb "github.com/Mininglamp-OSS/octo-server/pkg/db"
 	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
@@ -103,6 +104,9 @@ func runAPI(ctx *config.Context) {
 		panic(fmt.Errorf("validate i18n runtime locales: %w", err))
 	}
 	route.SetErrorRenderer(octoi18n.NewErrorRenderer(octoi18n.NewLocalizer(defaultLanguage)))
+	// 注入自定义 TokenParser，替代 octo-lib legacyTokenParser：以 pkg/auth.Decode
+	// 解析 cache value，支持 v2 JSON envelope 与 "uid@name[@role]" 旧格式（i18n D19/D21）。
+	route.SetTokenParser(auth.NewCacheTokenParser(ctx.Cache(), ctx.GetConfig().Cache.TokenCachePrefix))
 	// 替换web下的配置文件
 	replaceWebConfig(ctx.GetConfig())
 	// 初始化api

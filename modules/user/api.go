@@ -39,6 +39,7 @@ import (
 	commonapi "github.com/Mininglamp-OSS/octo-server/modules/base/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	common2 "github.com/Mininglamp-OSS/octo-server/modules/common"
+	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/gin-gonic/gin"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
@@ -848,7 +849,13 @@ func (u *User) userUpdateWithField(c *wkhttp.Context) {
 		}
 		if key == "name" {
 			// 将重新设置token设置到缓存（这里主要是更新登录者的name）
-			err = u.ctx.Cache().Set(u.ctx.GetConfig().Cache.TokenCachePrefix+c.GetHeader("token"), fmt.Sprintf("%s@%v@%s", loginUID, value, c.GetLoginRole()))
+			payload, encErr := auth.Encode(auth.TokenInfo{UID: loginUID, Name: fmt.Sprintf("%v", value), Role: c.GetLoginRole()})
+			if encErr != nil {
+				u.Error("编码token缓存失败！", zap.Error(encErr))
+				c.ResponseError(errors.New("重新设置token缓存失败！"))
+				return
+			}
+			err = u.ctx.Cache().Set(u.ctx.GetConfig().Cache.TokenCachePrefix+c.GetHeader("token"), payload)
 			if err != nil {
 				u.Error("重新设置token缓存失败！", zap.Error(err))
 				c.ResponseError(errors.New("重新设置token缓存失败！"))
@@ -1362,7 +1369,13 @@ func (u *User) execLogin(userInfo *Model, flag config.DeviceFlag, device *device
 		}
 	}
 
-	err = u.ctx.Cache().SetAndExpire(u.ctx.GetConfig().Cache.TokenCachePrefix+token, fmt.Sprintf("%s@%s@%s", userInfo.UID, userInfo.Name, userInfo.Role), u.ctx.GetConfig().Cache.TokenExpire)
+	tokenPayload, err := auth.Encode(auth.TokenInfo{UID: userInfo.UID, Name: userInfo.Name, Role: userInfo.Role})
+	if err != nil {
+		u.Error("编码token缓存失败！", zap.Error(err))
+		tokenSpan.Finish()
+		return nil, errors.New("设置token缓存失败！")
+	}
+	err = u.ctx.Cache().SetAndExpire(u.ctx.GetConfig().Cache.TokenCachePrefix+token, tokenPayload, u.ctx.GetConfig().Cache.TokenExpire)
 	if err != nil {
 		u.Error("设置token缓存失败！", zap.Error(err))
 		tokenSpan.Finish()
@@ -1908,7 +1921,12 @@ func (u *User) loginWithAuthCode(c *wkhttp.Context) {
 	}
 
 	// 将token设置到缓存
-	err = u.ctx.Cache().SetAndExpire(u.ctx.GetConfig().Cache.TokenCachePrefix+token, fmt.Sprintf("%s@%s", userModel.UID, userModel.Name), u.ctx.GetConfig().Cache.TokenExpire)
+	tokenPayload, err := auth.Encode(auth.TokenInfo{UID: userModel.UID, Name: userModel.Name})
+	if err != nil {
+		u.Error("编码token缓存失败！", zap.Error(err))
+		return
+	}
+	err = u.ctx.Cache().SetAndExpire(u.ctx.GetConfig().Cache.TokenCachePrefix+token, tokenPayload, u.ctx.GetConfig().Cache.TokenExpire)
 	if err != nil {
 		u.Error("设置token缓存失败！", zap.Error(err))
 		c.ResponseError(errors.New("设置token缓存失败！"))
@@ -2570,7 +2588,13 @@ func (u *User) loginCheckPhone(c *wkhttp.Context) {
 	}
 	token := util.GenerUUID()
 	// 将token设置到缓存
-	err = u.ctx.Cache().SetAndExpire(u.ctx.GetConfig().Cache.TokenCachePrefix+token, fmt.Sprintf("%s@%s", userInfo.UID, userInfo.Name), u.ctx.GetConfig().Cache.TokenExpire)
+	tokenPayload, err := auth.Encode(auth.TokenInfo{UID: userInfo.UID, Name: userInfo.Name})
+	if err != nil {
+		u.Error("编码token缓存失败！", zap.Error(err))
+		c.ResponseError(errors.New("设置token缓存失败！"))
+		return
+	}
+	err = u.ctx.Cache().SetAndExpire(u.ctx.GetConfig().Cache.TokenCachePrefix+token, tokenPayload, u.ctx.GetConfig().Cache.TokenExpire)
 	if err != nil {
 		u.Error("设置token缓存失败！", zap.Error(err))
 		c.ResponseError(errors.New("设置token缓存失败！"))
@@ -3206,7 +3230,12 @@ func (u *User) createUserWithRespAndTx(registerSpanCtx context.Context, createUs
 	u.ctx.EventCommit(eventID)
 	token := util.GenerUUID()
 	// 将token设置到缓存
-	err = u.ctx.Cache().SetAndExpire(u.ctx.GetConfig().Cache.TokenCachePrefix+token, fmt.Sprintf("%s@%s@%s", userModel.UID, userModel.Name, userModel.Role), u.ctx.GetConfig().Cache.TokenExpire)
+	tokenPayload, err := auth.Encode(auth.TokenInfo{UID: userModel.UID, Name: userModel.Name, Role: userModel.Role})
+	if err != nil {
+		u.Error("编码token缓存失败！", zap.Error(err))
+		return nil, err
+	}
+	err = u.ctx.Cache().SetAndExpire(u.ctx.GetConfig().Cache.TokenCachePrefix+token, tokenPayload, u.ctx.GetConfig().Cache.TokenExpire)
 	if err != nil {
 		u.Error("设置token缓存失败！", zap.Error(err))
 		return nil, err
@@ -3602,26 +3631,24 @@ func (u *User) authVerifyToken(c *wkhttp.Context) {
 		return
 	}
 
-	// Same Redis lookup as AuthMiddleware: "token:<value>" → "uid@name@role"
-	uidAndName := wkhttp.GetLoginUID(req.Token, u.ctx.GetConfig().Cache.TokenCachePrefix, u.ctx.Cache())
-	if strings.TrimSpace(uidAndName) == "" {
+	// Same Redis lookup as AuthMiddleware: "token:<value>" → versioned envelope
+	// (v2 JSON) 或 legacy "uid@name[@role]"。auth.Decode 兼容两者。
+	raw, cacheErr := u.ctx.Cache().Get(u.ctx.GetConfig().Cache.TokenCachePrefix + req.Token)
+	if cacheErr != nil || strings.TrimSpace(raw) == "" {
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "invalid or expired token"})
 		return
 	}
-
-	parts := strings.SplitN(uidAndName, "@", 3)
-	if len(parts) < 2 {
+	info, decodeErr := auth.Decode(raw)
+	if decodeErr != nil {
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "malformed token data"})
 		return
 	}
 
 	resp := authVerifyTokenResp{
-		UID:       parts[0],
-		Name:      parts[1],
+		UID:       info.UID,
+		Name:      info.Name,
+		Role:      info.Role,
 		OwnedBots: make([]ownedBot, 0),
-	}
-	if len(parts) > 2 {
-		resp.Role = parts[2]
 	}
 
 	// Query owned bots: robot.creator_uid = uid

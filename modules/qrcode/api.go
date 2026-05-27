@@ -10,6 +10,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -66,22 +67,22 @@ func (q *QRCode) handleQRCodeInfo(c *wkhttp.Context) {
 		c.ResponseError(errors.New("token不能为空！"))
 		return
 	}
-	uidAndName, err := q.ctx.Cache().Get(q.ctx.GetConfig().Cache.TokenCachePrefix + token)
+	raw, err := q.ctx.Cache().Get(q.ctx.GetConfig().Cache.TokenCachePrefix + token)
 	if err != nil {
 		q.Error("获取登录信息失败！", zap.Error(err))
 		c.ResponseError(errors.New("获取登录信息失败！"))
 		return
 	}
-	if strings.TrimSpace(uidAndName) == "" {
+	if strings.TrimSpace(raw) == "" {
 		c.String(http.StatusOK, fmt.Sprintf("请下载“%s”APP扫码！", q.ctx.GetConfig().AppName))
 		return
 	}
-	uidAndNames := strings.Split(uidAndName, "@")
-	if len(uidAndNames) == 0 {
+	info, decodeErr := auth.Decode(raw)
+	if decodeErr != nil {
 		c.ResponseError(errors.New("登录信息格式错误！"))
 		return
 	}
-	loginUID := uidAndNames[0]
+	loginUID := info.UID
 	code := c.Param("code")
 
 	if strings.HasPrefix(code, "user_") { // 用户资料二维码 格式： user_xxxx

@@ -28,6 +28,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/source"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
@@ -4111,13 +4112,13 @@ func (g *Group) groupInviteDetail(c *wkhttp.Context) {
 	// 预览路径，不破坏未登录访问者的 external_blocked 硬拦截语义。
 	var loginUID string
 	if token := strings.TrimSpace(c.GetHeader("token")); token != "" {
-		uidAndName, cacheErr := g.ctx.Cache().Get(g.ctx.GetConfig().Cache.TokenCachePrefix + token)
-		if cacheErr == nil && strings.TrimSpace(uidAndName) != "" {
-			// AuthMiddleware 的 token value 约定：uid@name[@role]，和
-			// pkg/wkhttp/http.go 的 AuthMiddleware 解析一致，这里只取 uid。
-			parts := strings.SplitN(uidAndName, "@", 3)
-			if len(parts) >= 2 {
-				loginUID = parts[0]
+		raw, cacheErr := g.ctx.Cache().Get(g.ctx.GetConfig().Cache.TokenCachePrefix + token)
+		if cacheErr == nil && strings.TrimSpace(raw) != "" {
+			// AuthMiddleware 的 token value 由 pkg/auth 收口编解码：v2 JSON 或
+			// 灰度期残留的 "uid@name[@role]"。auth.Decode 返回 ErrInvalidToken
+			// 时安全降级为未登录访问者，沿用 external_blocked 硬拦截语义。
+			if info, decodeErr := auth.Decode(raw); decodeErr == nil {
+				loginUID = info.UID
 			}
 		}
 	}

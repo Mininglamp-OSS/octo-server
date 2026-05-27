@@ -12,6 +12,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	common2 "github.com/Mininglamp-OSS/octo-server/modules/common"
+	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	wkutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
 
@@ -197,7 +198,13 @@ func (m *Manager) login(c *wkhttp.Context) {
 	}
 	token := util.GenerUUID()
 	// 将token设置到缓存
-	err = m.ctx.Cache().SetAndExpire(m.ctx.GetConfig().Cache.TokenCachePrefix+token, fmt.Sprintf("%s@%s@%s", userInfo.UID, userInfo.Name, userInfo.Role), m.ctx.GetConfig().Cache.TokenExpire)
+	tokenPayload, err := auth.Encode(auth.TokenInfo{UID: userInfo.UID, Name: userInfo.Name, Role: userInfo.Role})
+	if err != nil {
+		m.Error("编码token缓存失败！", zap.Error(err))
+		c.ResponseError(errors.New("设置token缓存失败！"))
+		return
+	}
+	err = m.ctx.Cache().SetAndExpire(m.ctx.GetConfig().Cache.TokenCachePrefix+token, tokenPayload, m.ctx.GetConfig().Cache.TokenExpire)
 	if err != nil {
 		m.Error("设置token缓存失败！", zap.Error(err))
 		c.ResponseError(errors.New("设置token缓存失败！"))

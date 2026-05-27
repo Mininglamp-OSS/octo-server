@@ -29,6 +29,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/robot"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
@@ -367,22 +368,22 @@ func (m *Message) sendMsg(c *wkhttp.Context) {
 		c.ResponseError(errors.New("消息不能为空"))
 		return
 	}
-	uidAndName, err := m.ctx.Cache().Get(m.ctx.GetConfig().Cache.TokenCachePrefix + req.Token)
+	raw, err := m.ctx.Cache().Get(m.ctx.GetConfig().Cache.TokenCachePrefix + req.Token)
 	if err != nil {
 		m.Error("解析token错误", zap.Error(err))
 		c.ResponseError(errors.New("解析token错误"))
 		return
 	}
-	if strings.TrimSpace(uidAndName) == "" {
+	if strings.TrimSpace(raw) == "" {
 		c.ResponseError(errors.New("请先登录"))
 		return
 	}
-	uidAndNames := strings.Split(uidAndName, "@")
-	if len(uidAndNames) < 2 {
+	info, decodeErr := auth.Decode(raw)
+	if decodeErr != nil {
 		c.ResponseError(errors.New("token错误"))
 		return
 	}
-	uid := uidAndNames[0]
+	uid := info.UID
 	if uid == "" {
 		c.ResponseError(errors.New("发送者不能为空"))
 		return
