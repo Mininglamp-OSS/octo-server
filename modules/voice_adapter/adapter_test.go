@@ -939,6 +939,91 @@ func TestDeleteLocalConfigHandler_5xxReturnsBadGateway(t *testing.T) {
 	}
 }
 
+func TestDeleteLocalConfigHandler_Speech404ConfigNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"msg":"config not found","status":404}`))
+	}))
+	defer srv.Close()
+
+	ctx, mock, cleanup := newTestContextWithMockDB(t)
+	defer cleanup()
+	mock.ExpectQuery("SELECT COUNT").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+
+	a := newTestAdapterWithDB(srv.URL, ctx)
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	gc, _ := gin.CreateTestContext(rec)
+	gc.Request = httptest.NewRequest(http.MethodDelete, "/v1/voice/local-config", nil)
+	gc.Request.Header.Set("X-Space-ID", "space1")
+	gc.Set("uid", "user1")
+	wkCtx := &wkhttp.Context{Context: gc}
+	a.deleteLocalConfig(wkCtx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["msg"] != "ok" {
+		t.Errorf("expected msg='ok', got %v", body["msg"])
+	}
+}
+
+func TestDeleteLocalConfigHandler_Speech404InvalidJSON(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`not json at all`))
+	}))
+	defer srv.Close()
+
+	ctx, mock, cleanup := newTestContextWithMockDB(t)
+	defer cleanup()
+	mock.ExpectQuery("SELECT COUNT").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+
+	a := newTestAdapterWithDB(srv.URL, ctx)
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	gc, _ := gin.CreateTestContext(rec)
+	gc.Request = httptest.NewRequest(http.MethodDelete, "/v1/voice/local-config", nil)
+	gc.Request.Header.Set("X-Space-ID", "space1")
+	gc.Set("uid", "user1")
+	wkCtx := &wkhttp.Context{Context: gc}
+	a.deleteLocalConfig(wkCtx)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", rec.Code)
+	}
+}
+
+func TestDeleteLocalConfigHandler_Speech404WrongStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"msg":"error","status":500}`))
+	}))
+	defer srv.Close()
+
+	ctx, mock, cleanup := newTestContextWithMockDB(t)
+	defer cleanup()
+	mock.ExpectQuery("SELECT COUNT").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+
+	a := newTestAdapterWithDB(srv.URL, ctx)
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	gc, _ := gin.CreateTestContext(rec)
+	gc.Request = httptest.NewRequest(http.MethodDelete, "/v1/voice/local-config", nil)
+	gc.Request.Header.Set("X-Space-ID", "space1")
+	gc.Set("uid", "user1")
+	wkCtx := &wkhttp.Context{Context: gc}
+	a.deleteLocalConfig(wkCtx)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", rec.Code)
+	}
+}
+
 func TestGetConfig_NonMember(t *testing.T) {
 	ctx, mock, cleanup := newTestContextWithMockDB(t)
 	defer cleanup()

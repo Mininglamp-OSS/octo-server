@@ -1,6 +1,7 @@
 package voice_adapter
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
@@ -288,9 +289,20 @@ func (a *VoiceAdapter) deleteLocalConfig(c *wkhttp.Context) {
 	err = a.client.DeleteLocalConfig(c.Request.Context(), loginUID, "space", spaceID)
 	if err != nil {
 		var svcErr *SpeechServiceError
-		if errors.As(err, &svcErr) && svcErr.StatusCode >= 400 && svcErr.StatusCode < 500 {
-			c.JSON(svcErr.StatusCode, gin.H{"status": svcErr.StatusCode, "msg": svcErr.Body})
-			return
+		if errors.As(err, &svcErr) {
+			if svcErr.StatusCode == 404 {
+				var parsed struct {
+					Status int `json:"status"`
+				}
+				if json.Unmarshal([]byte(svcErr.Body), &parsed) == nil && parsed.Status == 404 {
+					c.JSON(http.StatusOK, gin.H{"status": http.StatusOK, "msg": "ok"})
+					return
+				}
+			}
+			if svcErr.StatusCode >= 400 && svcErr.StatusCode < 500 {
+				c.JSON(svcErr.StatusCode, gin.H{"status": svcErr.StatusCode, "msg": svcErr.Body})
+				return
+			}
 		}
 		a.Error("delete local config failed", zap.Error(err))
 		c.JSON(http.StatusBadGateway, gin.H{"status": http.StatusBadGateway, "msg": "speech service unavailable"})
