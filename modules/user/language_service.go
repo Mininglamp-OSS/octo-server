@@ -28,6 +28,13 @@ const LanguageCacheTTL = 5 * time.Minute
 // '-' is unambiguous because BCP 47 forbids a leading hyphen on any subtag.
 const negativeMarker = "-"
 
+// ErrUnsupportedLanguage is returned by SetLanguage when the input is a
+// well-formed but unsupported BCP 47 tag (i.e. not in the configured
+// supported-language matrix). Callers can errors.Is-match this to choose a
+// 4xx user-facing response, separate from infra errors (DB down, etc.) that
+// should surface as generic 5xx-ish failures.
+var ErrUnsupportedLanguage = errors.New("user: language not in supported matrix")
+
 // languageReader is the read surface LanguageService needs from the user DB
 // layer; defined here (consumer side) so tests can stub it without spinning
 // up dbr. Production code passes *DB which already satisfies the signature.
@@ -118,7 +125,7 @@ func (s *LanguageService) SetLanguage(ctx context.Context, uid, lang string) err
 	}
 	normalized := normalizeLanguageOrEmpty(lang)
 	if lang != "" && normalized == "" {
-		return fmt.Errorf("user: unsupported language %q", lang)
+		return fmt.Errorf("%w: %q", ErrUnsupportedLanguage, lang)
 	}
 	writer, ok := s.db.(languageWriter)
 	if !ok {

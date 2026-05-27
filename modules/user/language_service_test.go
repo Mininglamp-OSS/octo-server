@@ -257,6 +257,12 @@ func TestLanguageServiceSetLanguageRejectsUnsupported(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for unsupported language")
 	}
+	// Sentinel must wrap; handler relies on errors.Is to split user-facing
+	// copy between unsupported (400 with "不支持的语言") and infra error
+	// (generic 400 with "设置语言偏好失败！").
+	if !errors.Is(err, ErrUnsupportedLanguage) {
+		t.Fatalf("err = %v, want wrap of ErrUnsupportedLanguage", err)
+	}
 }
 
 func TestLanguageServiceSetLanguageAcceptsEmptyToClear(t *testing.T) {

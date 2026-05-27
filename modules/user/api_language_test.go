@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -102,6 +103,67 @@ func TestSetLanguageHandler_RejectsUnsupported(t *testing.T) {
 	}
 	if len(db.updates) != 0 {
 		t.Fatalf("unsupported language must not touch DB, got %v", db.updates)
+	}
+	// User-facing message is the classified "unsupported" copy, not the raw
+	// service-layer error (which contains the `user:` package prefix). Guards
+	// against information disclosure flagged in PR #182 review.
+	respBody := rec.Body.String()
+	if !strings.Contains(respBody, "不支持的语言") {
+		t.Fatalf("response body should carry classified message, got %s", respBody)
+	}
+	if strings.Contains(respBody, "user:") {
+		t.Fatalf("response body must not leak `user:` package prefix, got %s", respBody)
+	}
+}
+
+// TestSetLanguageHandler_LongLanguageRejected pins the 64-char length cap
+// applied at handler entry. The gate runs before any zap.String of the raw
+// body so a multi-KB payload from a misbehaving client can't be amplified
+// into the log pipeline before the supported-matrix gate rejects it (PR #182
+// reviewer log-amplification finding).
+func TestSetLanguageHandler_LongLanguageRejected(t *testing.T) {
+	db := newFakeLangDB()
+	r, _ := newLanguageHandlerHarness(t, db, newFakeLangCache())
+
+	oversized := strings.Repeat("x", languageMaxLen+1)
+	body := strings.NewReader(`{"language":"` + oversized + `"}`)
+	req := httptest.NewRequest(http.MethodPut, "/v1/user/language", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d (want 400), body = %s", rec.Code, rec.Body.String())
+	}
+	if len(db.updates) != 0 {
+		t.Fatalf("oversized language must short-circuit before DB, got %v", db.updates)
+	}
+}
+
+// TestSetLanguageHandler_InternalErrorReturnsGenericMsg verifies the
+// classified user-facing copy for infra errors (DB outage, etc.): the wire
+// response must not surface the wrapped `user: persist language: ...` /
+// driver text. PR #182 reviewer P2 fix.
+func TestSetLanguageHandler_InternalErrorReturnsGenericMsg(t *testing.T) {
+	db := newFakeLangDB()
+	db.updateErr = errors.New("driver: connection refused")
+	r, _ := newLanguageHandlerHarness(t, db, newFakeLangCache())
+
+	body := strings.NewReader(`{"language":"en-US"}`)
+	req := httptest.NewRequest(http.MethodPut, "/v1/user/language", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d (want 400), body = %s", rec.Code, rec.Body.String())
+	}
+	respBody := rec.Body.String()
+	if !strings.Contains(respBody, "设置语言偏好失败") {
+		t.Fatalf("response body should be classified generic message, got %s", respBody)
+	}
+	if strings.Contains(respBody, "driver:") || strings.Contains(respBody, "user: persist") {
+		t.Fatalf("response body must not leak internal error text, got %s", respBody)
 	}
 }
 

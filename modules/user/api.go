@@ -739,6 +739,13 @@ type setLanguageReq struct {
 	Language string `json:"language"`
 }
 
+// languageMaxLen 上界 BCP 47 tag 在落入服务层 / 日志前的字节长度。即使最长
+// 的合法标签（如 `zh-Hant-HK-x-private-extension`）也不会超过 ~35 字符；
+// DB 列定义 VARCHAR(16)。设 64 留 ~80% 余量，并在 handler 入口短路超长
+// payload，避免任意大小的客户端输入先被 zap.String 写进日志再被拒（PR
+// #182 reviewer 标的 log amplification 面）。
+const languageMaxLen = 64
+
 // setLanguage 更新当前用户的语言偏好。DB 持久化 + Redis user_language:{uid} 主动
 // DEL 由 LanguageService 处理；其他端的 token 缓存快照不会刷新——见 PR #181 的
 // 设计说明，下次请求由 AuthMiddleware 的 LanguageResolver 自动 hydrate 出
@@ -755,10 +762,25 @@ func (u *User) setLanguage(c *wkhttp.Context) {
 		c.ResponseError(errors.New("数据格式有误！"))
 		return
 	}
+	// Length gate runs BEFORE any zap.String("language", req.Language) so an
+	// attacker can't amplify a multi-KB payload into the log pipeline.
+	if len(req.Language) > languageMaxLen {
+		u.Error("language 请求过长", zap.String("uid", loginUID), zap.Int("len", len(req.Language)))
+		c.ResponseError(errors.New("数据格式有误！"))
+		return
+	}
 	if err := u.languageService.SetLanguage(c.Request.Context(), loginUID, req.Language); err != nil {
+		// Always log the wrapped service error server-side; only the
+		// classified user-facing message goes back on the wire so internal
+		// package prefixes / DB driver text don't leak. Matches the local
+		// convention in userUpdateWithField and neighbouring handlers.
 		u.Error("设置用户语言偏好失败",
 			zap.Error(err), zap.String("uid", loginUID), zap.String("language", req.Language))
-		c.ResponseError(err)
+		if errors.Is(err, ErrUnsupportedLanguage) {
+			c.ResponseError(errors.New("不支持的语言"))
+			return
+		}
+		c.ResponseError(errors.New("设置语言偏好失败！"))
 		return
 	}
 	c.ResponseOK()
