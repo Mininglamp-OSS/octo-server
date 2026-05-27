@@ -3,6 +3,7 @@ package user
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -151,6 +152,72 @@ func TestSetLanguageHandler_Unauthorized(t *testing.T) {
 // or cancellation on the inbound request must be honoured by the DB write
 // path. Without this hook a slow caller-aborting client could leave the
 // request blocked on MySQL/Redis.
+// TestLoginUserDetailResp_LanguageEncoded guards the JSON contract that
+// loginUserDetailResp emits the `language` field on every response that flows
+// through it (login / current / register-then-auto-login). A struct-level
+// test rather than an HTTP integration one because all the /v1/user/current
+// integration tests in this package are t.Skip'd behind issue #17's
+// migration gate — a struct-level assertion runs in CI today and guards
+// against accidental removal of either the field or the json tag. Tracks
+// the regression-guard ask in PR #182 review.
+func TestLoginUserDetailResp_LanguageEncoded(t *testing.T) {
+	cases := []struct {
+		name string
+		lang string
+	}{
+		{"populated", "zh-CN"},
+		{"empty_means_unset", ""}, // must still be present in JSON, not omitempty
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			b, err := json.Marshal(&loginUserDetailResp{UID: "u1", Language: tc.lang})
+			if err != nil {
+				t.Fatalf("Marshal: %v", err)
+			}
+			var got map[string]interface{}
+			if err := json.Unmarshal(b, &got); err != nil {
+				t.Fatalf("Unmarshal: %v", err)
+			}
+			if _, present := got["language"]; !present {
+				t.Fatalf("language field missing from JSON: %s", string(b))
+			}
+			if got["language"] != tc.lang {
+				t.Fatalf("language = %v, want %q", got["language"], tc.lang)
+			}
+		})
+	}
+}
+
+// TestLanguageService_PersistsCanonicalForm pins the contract that
+// LanguageService normalises mixed-case / underscore inputs to the canonical
+// BCP 47 form before persisting. Without this, a client sending "ZH_cn" today
+// and "zh-CN" tomorrow would write two different DB values for the same
+// preference. PR #182 reviewer asked for explicit coverage of this path.
+func TestLanguageService_PersistsCanonicalForm(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+	}{
+		{"underscore", "zh_CN", "zh-CN"},
+		{"mixed_case", "ZH-cn", "zh-CN"},
+		{"upper_en", "EN-us", "en-US"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			db := newFakeLangDB()
+			c := newFakeLangCache()
+			svc := NewLanguageService(db, c)
+			if err := svc.SetLanguage(context.Background(), "u1", tc.in); err != nil {
+				t.Fatalf("SetLanguage(%q): %v", tc.in, err)
+			}
+			if got := db.updates["u1"]; got != tc.want {
+				t.Fatalf("db value = %q, want canonical %q (input was %q)", got, tc.want, tc.in)
+			}
+		})
+	}
+}
+
 func TestSetLanguageHandler_RequestContextPropagated(t *testing.T) {
 	db := newFakeLangDB()
 	c := newFakeLangCache()

@@ -191,7 +191,7 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 		user.GET("/grant_login", u.grantLogin)                     // 授权登录
 		user.GET("/current", u.currentUser)                        // 获取当前登录用户信息（含 self 实名字段）
 		user.PUT("/current", u.userUpdateWithField)                //修改用户信息
-		user.PUT("/language", u.setLanguage)                       // 设置当前用户语言偏好（i18n）
+		user.PUT("/language", u.setLanguage)                       // 设置当前用户语言偏好（i18n）；依赖 group 上的 AuthMiddleware 注入 uid，handler 内仍保留 belt-and-braces 检查
 		user.GET("/qrcode", u.qrcodeMy)                            // 我的二维码
 		user.PUT("/my/setting", u.userUpdateSetting)               // 更新我的设置
 		user.POST("/blacklist/:uid", u.addBlacklist)               //添加黑名单
@@ -720,6 +720,13 @@ func (u *User) currentUser(c *wkhttp.Context) {
 	}
 	// token 回显请求头 token：/user/current 不换发 token,避免干扰现有会话;
 	// 客户端本身就用这个 token 调的接口,回填仅为结构对齐 login response。
+	//
+	// Language 字段直接来自 userInfo.Language（DB SELECT *）——刻意不走
+	// LanguageService.Resolve / user_language:{uid} 热缓存：这里既然已经为
+	// 其他字段拉了完整行，再读 Redis 只会引入"刚 PUT 完语言 → DEL 命中 →
+	// Resolve 反取 DB → 写回热缓存"的多余 RTT，而且会让 GET 在 SetLanguage
+	// 失效窗口里看到 Redis 的旧值（DB 已新但 SET 未到）。热缓存的存在意义
+	// 是保护 AuthMiddleware 那条每请求都走的 hot path；/current 不在此列。
 	resp := newLoginUserDetailResp(userInfo, c.GetHeader("token"), u.ctx)
 	u.applyRealnameToLoginResp(resp, userInfo.UID)
 	c.Response(resp)
