@@ -175,7 +175,14 @@ func TestCacheTokenParserResolverFailureKeepsSnapshot(t *testing.T) {
 	}
 }
 
-func TestCacheTokenParserResolverEmptyKeepsSnapshot(t *testing.T) {
+// TestCacheTokenParserResolverEmptyClearsSnapshot pins the documented
+// UserLanguageResolver contract: an empty (no-error) resolver result is
+// authoritative "no explicit preference" and must drop the token-cache
+// snapshot so EarlyMiddleware's Accept-Language / default wins. Without
+// this, clearing user.language in the DB would not free a previously
+// minted token from a stale language until the next login — the very
+// stale-read regression flagged in PR #181 review.
+func TestCacheTokenParserResolverEmptyClearsSnapshot(t *testing.T) {
 	t.Parallel()
 	c := newFakeCache()
 	encoded, _ := Encode(TokenInfo{UID: "u1", Name: "alice", Language: "zh-CN"})
@@ -183,9 +190,12 @@ func TestCacheTokenParserResolverEmptyKeepsSnapshot(t *testing.T) {
 
 	resolver := &stubResolver{lang: ""}
 	p := NewCacheTokenParser(c, testPrefix, WithLanguageResolver(resolver))
-	got, _ := p.Parse(context.Background(), "tok1")
-	if got.Language != "zh-CN" {
-		t.Fatalf("Language = %q, want snapshot zh-CN (resolver returned empty)", got.Language)
+	got, err := p.Parse(context.Background(), "tok1")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got.Language != "" {
+		t.Fatalf("Language = %q, want \"\" (resolver authoritative empty must drop snapshot)", got.Language)
 	}
 }
 

@@ -90,15 +90,22 @@ func (p *CacheTokenParser) Parse(ctx context.Context, token string) (wkhttp.User
 	}
 	language := info.Language
 	if p.resolver != nil {
-		// Resolver upgrades the token-cache snapshot to the authoritative
-		// preference (Redis/DB). Lookup failures keep the snapshot —
-		// authentication must not 5xx because user_language cache is
-		// momentarily unreachable. Empty resolver result is treated as
-		// "no explicit preference" and also leaves the snapshot intact;
-		// callers that want to clear a stale snapshot should write an
-		// empty value back to the cache instead of relying on the
-		// resolver's return.
-		if resolved, rerr := p.resolver.Resolve(ctx, info.UID); rerr == nil && resolved != "" {
+		// Resolver is the authoritative source per UserLanguageResolver's
+		// documented contract:
+		//   * rerr != nil  → keep the token-cache snapshot. Authentication
+		//     must not 5xx because user_language cache is momentarily
+		//     unreachable; the snapshot is the agreed last-resort fallback.
+		//   * resolved == "" (no error) → user has no explicit preference
+		//     right now (DB was cleared, negative-cache hit, or stored
+		//     value normalised away). Drop the snapshot so EarlyMiddleware's
+		//     Accept-Language / default decision wins downstream. Otherwise
+		//     a token minted earlier with a real language tag would keep
+		//     promoting LanguageSourceUser long after the user opted out
+		//     — a stale-read regression worth a dedicated test, see
+		//     parser_test.go::TestCacheTokenParserResolverEmptyClearsSnapshot.
+		//   * resolved != ""  → use the fresh authoritative value.
+		resolved, rerr := p.resolver.Resolve(ctx, info.UID)
+		if rerr == nil {
 			language = resolved
 		}
 	}
