@@ -1,0 +1,8 @@
+# Source (en-US) message file.
+#
+# 此文件由 AST extractor 生成（D18），开发者通常不手改。
+# 当前为占位：bundle 初始化时已自动从 pkg/i18n/codes/*.go 的 Register
+# 注入 DefaultMessage，无需在此重复声明源语言。
+#
+# AST extractor 落地后此文件会包含 goi18n message marker（含 description / hash），
+# 用作翻译团队的 source of truth。
