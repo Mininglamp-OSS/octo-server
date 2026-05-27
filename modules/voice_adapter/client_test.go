@@ -3,6 +3,7 @@ package voice_adapter
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -202,7 +203,7 @@ func TestGetConfig(t *testing.T) {
 	defer srv.Close()
 
 	client := NewSpeechClient(srv.URL, "test-key", 5*time.Second)
-	cfg, err := client.GetConfig(context.Background())
+	cfg, err := client.GetConfig(context.Background(), "", "", "")
 	if err != nil {
 		t.Fatalf("GetConfig failed: %v", err)
 	}
@@ -214,6 +215,35 @@ func TestGetConfig(t *testing.T) {
 	}
 }
 
+func TestGetConfig_WithScopeParams(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("subject_id") != "user1" {
+			t.Errorf("unexpected subject_id: %s", r.URL.Query().Get("subject_id"))
+		}
+		if r.URL.Query().Get("scope_type") != "space" {
+			t.Errorf("unexpected scope_type: %s", r.URL.Query().Get("scope_type"))
+		}
+		if r.URL.Query().Get("scope_id") != "space1" {
+			t.Errorf("unexpected scope_id: %s", r.URL.Query().Get("scope_id"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"enabled":       true,
+			"local_enabled": false,
+		})
+	}))
+	defer srv.Close()
+
+	client := NewSpeechClient(srv.URL, "test-key", 5*time.Second)
+	cfg, err := client.GetConfig(context.Background(), "user1", "space", "space1")
+	if err != nil {
+		t.Fatalf("GetConfig with scope params failed: %v", err)
+	}
+	if cfg["local_enabled"] != false {
+		t.Errorf("expected local_enabled=false, got %v", cfg["local_enabled"])
+	}
+}
+
 func TestGetConfigError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -222,7 +252,7 @@ func TestGetConfigError(t *testing.T) {
 	defer srv.Close()
 
 	client := NewSpeechClient(srv.URL, "test-key", 5*time.Second)
-	_, err := client.GetConfig(context.Background())
+	_, err := client.GetConfig(context.Background(), "", "", "")
 	if err == nil {
 		t.Fatal("expected error for 503 response")
 	}
@@ -237,7 +267,7 @@ func TestGetConfig_ConnectionRefused(t *testing.T) {
 	ln.Close()
 
 	client := NewSpeechClient("http://"+addr, "test-key", 2*time.Second)
-	_, err = client.GetConfig(context.Background())
+	_, err = client.GetConfig(context.Background(), "", "", "")
 	if err == nil {
 		t.Fatal("expected error for unreachable server")
 	}
@@ -313,5 +343,207 @@ func TestForwardTranscribeBody(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("expected 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestPutLocalConfig(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("expected PUT, got %s", r.Method)
+		}
+		if r.URL.Path != "/v1/speech/local-config" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		if r.Header.Get("Content-Type") != "application/json" {
+			t.Errorf("expected application/json, got %s", r.Header.Get("Content-Type"))
+		}
+		if r.Header.Get("Authorization") != "Bearer test-key" {
+			t.Errorf("expected Bearer test-key, got %q", r.Header.Get("Authorization"))
+		}
+
+		body, _ := io.ReadAll(r.Body)
+		var payload map[string]interface{}
+		json.Unmarshal(body, &payload)
+		if payload["subject_id"] != "user1" {
+			t.Errorf("unexpected subject_id: %v", payload["subject_id"])
+		}
+		if payload["scope_type"] != "space" {
+			t.Errorf("unexpected scope_type: %v", payload["scope_type"])
+		}
+		if payload["scope_id"] != "space1" {
+			t.Errorf("unexpected scope_id: %v", payload["scope_id"])
+		}
+		if payload["enabled"] != true {
+			t.Errorf("unexpected enabled: %v", payload["enabled"])
+		}
+
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":200,"msg":"ok"}`))
+	}))
+	defer srv.Close()
+
+	client := NewSpeechClient(srv.URL, "test-key", 5*time.Second)
+	err := client.PutLocalConfig(context.Background(), "user1", "space", "space1", true, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("PutLocalConfig failed: %v", err)
+	}
+}
+
+func TestPutLocalConfig_WithOptionalFields(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var payload map[string]interface{}
+		json.Unmarshal(body, &payload)
+		if payload["timeout_ms"] != float64(5000) {
+			t.Errorf("unexpected timeout_ms: %v", payload["timeout_ms"])
+		}
+		if payload["probe_url"] != "http://probe" {
+			t.Errorf("unexpected probe_url: %v", payload["probe_url"])
+		}
+		if payload["transcribe_url"] != "http://transcribe" {
+			t.Errorf("unexpected transcribe_url: %v", payload["transcribe_url"])
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":200,"msg":"ok"}`))
+	}))
+	defer srv.Close()
+
+	client := NewSpeechClient(srv.URL, "test-key", 5*time.Second)
+	timeout := 5000
+	probe := "http://probe"
+	transcribe := "http://transcribe"
+	err := client.PutLocalConfig(context.Background(), "user1", "space", "space1", false, &timeout, &probe, &transcribe)
+	if err != nil {
+		t.Fatalf("PutLocalConfig with optional fields failed: %v", err)
+	}
+}
+
+func TestPutLocalConfig_Error(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte("bad request"))
+	}))
+	defer srv.Close()
+
+	client := NewSpeechClient(srv.URL, "test-key", 5*time.Second)
+	err := client.PutLocalConfig(context.Background(), "user1", "space", "space1", true, nil, nil, nil)
+	if err == nil {
+		t.Fatal("expected error for 400 response")
+	}
+	var svcErr *SpeechServiceError
+	if !errors.As(err, &svcErr) {
+		t.Fatalf("expected SpeechServiceError, got %T", err)
+	}
+	if svcErr.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected status 400, got %d", svcErr.StatusCode)
+	}
+}
+
+func TestGetLocalConfig(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("expected GET, got %s", r.Method)
+		}
+		if r.URL.Path != "/v1/speech/local-config" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		if r.URL.Query().Get("subject_id") != "user1" {
+			t.Errorf("unexpected subject_id: %s", r.URL.Query().Get("subject_id"))
+		}
+		if r.URL.Query().Get("scope_type") != "space" {
+			t.Errorf("unexpected scope_type: %s", r.URL.Query().Get("scope_type"))
+		}
+		if r.URL.Query().Get("scope_id") != "space1" {
+			t.Errorf("unexpected scope_id: %s", r.URL.Query().Get("scope_id"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"enabled":    false,
+			"timeout_ms": 3000,
+		})
+	}))
+	defer srv.Close()
+
+	client := NewSpeechClient(srv.URL, "test-key", 5*time.Second)
+	cfg, err := client.GetLocalConfig(context.Background(), "user1", "space", "space1")
+	if err != nil {
+		t.Fatalf("GetLocalConfig failed: %v", err)
+	}
+	if cfg["enabled"] != false {
+		t.Errorf("expected enabled=false, got %v", cfg["enabled"])
+	}
+	if cfg["timeout_ms"] != float64(3000) {
+		t.Errorf("expected timeout_ms=3000, got %v", cfg["timeout_ms"])
+	}
+}
+
+func TestGetLocalConfig_Error(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte("not found"))
+	}))
+	defer srv.Close()
+
+	client := NewSpeechClient(srv.URL, "test-key", 5*time.Second)
+	_, err := client.GetLocalConfig(context.Background(), "user1", "space", "space1")
+	if err == nil {
+		t.Fatal("expected error for 404 response")
+	}
+	var svcErr *SpeechServiceError
+	if !errors.As(err, &svcErr) {
+		t.Fatalf("expected SpeechServiceError, got %T", err)
+	}
+	if svcErr.StatusCode != http.StatusNotFound {
+		t.Errorf("expected status 404, got %d", svcErr.StatusCode)
+	}
+}
+
+func TestDeleteLocalConfig(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			t.Errorf("expected DELETE, got %s", r.Method)
+		}
+		if r.URL.Path != "/v1/speech/local-config" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		if r.URL.Query().Get("subject_id") != "user1" {
+			t.Errorf("unexpected subject_id: %s", r.URL.Query().Get("subject_id"))
+		}
+		if r.URL.Query().Get("scope_type") != "space" {
+			t.Errorf("unexpected scope_type: %s", r.URL.Query().Get("scope_type"))
+		}
+		if r.URL.Query().Get("scope_id") != "space1" {
+			t.Errorf("unexpected scope_id: %s", r.URL.Query().Get("scope_id"))
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":200,"msg":"ok"}`))
+	}))
+	defer srv.Close()
+
+	client := NewSpeechClient(srv.URL, "test-key", 5*time.Second)
+	err := client.DeleteLocalConfig(context.Background(), "user1", "space", "space1")
+	if err != nil {
+		t.Fatalf("DeleteLocalConfig failed: %v", err)
+	}
+}
+
+func TestDeleteLocalConfig_Error(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte("internal error"))
+	}))
+	defer srv.Close()
+
+	client := NewSpeechClient(srv.URL, "test-key", 5*time.Second)
+	err := client.DeleteLocalConfig(context.Background(), "user1", "space", "space1")
+	if err == nil {
+		t.Fatal("expected error for 500 response")
+	}
+	var svcErr *SpeechServiceError
+	if !errors.As(err, &svcErr) {
+		t.Fatalf("expected SpeechServiceError, got %T", err)
+	}
+	if svcErr.StatusCode != http.StatusInternalServerError {
+		t.Errorf("expected status 500, got %d", svcErr.StatusCode)
 	}
 }
