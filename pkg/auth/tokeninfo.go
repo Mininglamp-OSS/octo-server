@@ -91,6 +91,11 @@ func decodeV2(payload string) (TokenInfo, error) {
 }
 
 func decodeLegacy(raw string) (TokenInfo, error) {
+	// Known limitation of the legacy "uid@name[@role]" wire format: a display
+	// name containing '@' (e.g. an email-style handle) is structurally
+	// ambiguous and rejected here as malformed. The original split-based
+	// readers had the same blind spot — this is not a regression — and the v2
+	// JSON envelope fixes it permanently for any token written after upgrade.
 	parts := strings.Split(raw, "@")
 	if len(parts) < 2 || len(parts) > 3 || parts[0] == "" {
 		return TokenInfo{}, fmt.Errorf("%w: legacy payload must be uid@name[@role]", ErrInvalidToken)
