@@ -263,6 +263,39 @@ func (c *SpeechClient) GetLocalConfig(ctx context.Context, subjectID, scopeType,
 	return result, nil
 }
 
+func (c *SpeechClient) ResetLocalConfig(ctx context.Context, subjectID, scopeType, scopeID string, enabled bool) error {
+	payload := map[string]interface{}{
+		"subject_id": subjectID,
+		"scope_type": scopeType,
+		"scope_id":   scopeID,
+		"enabled":    enabled,
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/speech/local-config/reset", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return &SpeechServiceError{StatusCode: resp.StatusCode, Body: string(respBody)}
+	}
+	return nil
+}
+
 func (c *SpeechClient) DeleteLocalConfig(ctx context.Context, subjectID, scopeType, scopeID string) error {
 	params := url.Values{}
 	params.Set("subject_id", subjectID)

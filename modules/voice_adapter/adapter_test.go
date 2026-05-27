@@ -1106,6 +1106,229 @@ func TestPutLocalConfig_BodyTooLarge(t *testing.T) {
 	}
 }
 
+func TestResetLocalConfig_Success(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("expected POST, got %s", r.Method)
+		}
+		if r.URL.Path != "/v1/speech/local-config/reset" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		var body map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		if body["subject_id"] != "user1" {
+			t.Errorf("expected subject_id=user1, got %v", body["subject_id"])
+		}
+		if body["scope_type"] != "space" {
+			t.Errorf("expected scope_type=space, got %v", body["scope_type"])
+		}
+		if body["scope_id"] != "space1" {
+			t.Errorf("expected scope_id=space1, got %v", body["scope_id"])
+		}
+		if body["enabled"] != true {
+			t.Errorf("expected enabled=true, got %v", body["enabled"])
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":200,"msg":"ok"}`))
+	}))
+	defer srv.Close()
+
+	ctx, mock, cleanup := newTestContextWithMockDB(t)
+	defer cleanup()
+	mock.ExpectQuery("SELECT COUNT").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+
+	a := newTestAdapterWithDB(srv.URL, ctx)
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	gc, _ := gin.CreateTestContext(rec)
+	reqBody := `{"enabled":true}`
+	gc.Request = httptest.NewRequest(http.MethodPost, "/v1/voice/local-config/reset", bytes.NewBufferString(reqBody))
+	gc.Request.Header.Set("Content-Type", "application/json")
+	gc.Request.Header.Set("X-Space-ID", "space1")
+	gc.Set("uid", "user1")
+	wkCtx := &wkhttp.Context{Context: gc}
+	a.resetLocalConfig(wkCtx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["msg"] != "ok" {
+		t.Errorf("expected msg='ok', got %v", body["msg"])
+	}
+}
+
+func TestResetLocalConfig_MissingSpaceID(t *testing.T) {
+	a := newTestAdapter("http://unused")
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	gc, _ := gin.CreateTestContext(rec)
+	reqBody := `{"enabled":true}`
+	gc.Request = httptest.NewRequest(http.MethodPost, "/v1/voice/local-config/reset", bytes.NewBufferString(reqBody))
+	gc.Request.Header.Set("Content-Type", "application/json")
+	gc.Set("uid", "user1")
+	ctx := &wkhttp.Context{Context: gc}
+	a.resetLocalConfig(ctx)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rec.Code)
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["msg"] != "X-Space-ID header is required" {
+		t.Errorf("expected msg='X-Space-ID header is required', got %v", body["msg"])
+	}
+}
+
+func TestResetLocalConfig_MissingEnabled(t *testing.T) {
+	ctx, _, cleanup := newTestContextWithMockDB(t)
+	defer cleanup()
+
+	a := newTestAdapterWithDB("http://unused", ctx)
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	gc, _ := gin.CreateTestContext(rec)
+	reqBody := `{}`
+	gc.Request = httptest.NewRequest(http.MethodPost, "/v1/voice/local-config/reset", bytes.NewBufferString(reqBody))
+	gc.Request.Header.Set("Content-Type", "application/json")
+	gc.Request.Header.Set("X-Space-ID", "space1")
+	gc.Set("uid", "user1")
+	wkCtx := &wkhttp.Context{Context: gc}
+	a.resetLocalConfig(wkCtx)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rec.Code)
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["msg"] != "enabled is required" {
+		t.Errorf("expected msg='enabled is required', got %v", body["msg"])
+	}
+}
+
+func TestResetLocalConfig_NotMember(t *testing.T) {
+	ctx, mock, cleanup := newTestContextWithMockDB(t)
+	defer cleanup()
+	mock.ExpectQuery("SELECT COUNT").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+
+	a := newTestAdapterWithDB("http://unused", ctx)
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	gc, _ := gin.CreateTestContext(rec)
+	reqBody := `{"enabled":true}`
+	gc.Request = httptest.NewRequest(http.MethodPost, "/v1/voice/local-config/reset", bytes.NewBufferString(reqBody))
+	gc.Request.Header.Set("Content-Type", "application/json")
+	gc.Request.Header.Set("X-Space-ID", "space1")
+	gc.Set("uid", "user1")
+	wkCtx := &wkhttp.Context{Context: gc}
+	a.resetLocalConfig(wkCtx)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", rec.Code)
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["msg"] != "not a member of this space" {
+		t.Errorf("expected msg='not a member of this space', got %v", body["msg"])
+	}
+}
+
+func TestResetLocalConfig_SpeechError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte("internal error"))
+	}))
+	defer srv.Close()
+
+	ctx, mock, cleanup := newTestContextWithMockDB(t)
+	defer cleanup()
+	mock.ExpectQuery("SELECT COUNT").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+
+	a := newTestAdapterWithDB(srv.URL, ctx)
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	gc, _ := gin.CreateTestContext(rec)
+	reqBody := `{"enabled":false}`
+	gc.Request = httptest.NewRequest(http.MethodPost, "/v1/voice/local-config/reset", bytes.NewBufferString(reqBody))
+	gc.Request.Header.Set("Content-Type", "application/json")
+	gc.Request.Header.Set("X-Space-ID", "space1")
+	gc.Set("uid", "user1")
+	wkCtx := &wkhttp.Context{Context: gc}
+	a.resetLocalConfig(wkCtx)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502, got %d", rec.Code)
+	}
+}
+
+func TestResetLocalConfig_BodyTooLarge(t *testing.T) {
+	ctx, _, cleanup := newTestContextWithMockDB(t)
+	defer cleanup()
+
+	a := newTestAdapterWithDB("http://unused", ctx)
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	gc, _ := gin.CreateTestContext(rec)
+	largeBody := `{"enabled":true,"extra":"` + strings.Repeat("a", 65*1024) + `"}`
+	gc.Request = httptest.NewRequest(http.MethodPost, "/v1/voice/local-config/reset", bytes.NewBufferString(largeBody))
+	gc.Request.Header.Set("Content-Type", "application/json")
+	gc.Request.Header.Set("X-Space-ID", "space1")
+	gc.Set("uid", "user1")
+	wkCtx := &wkhttp.Context{Context: gc}
+	a.resetLocalConfig(wkCtx)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d", rec.Code)
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["msg"] != "request body too large" {
+		t.Errorf("expected msg='request body too large', got %v", body["msg"])
+	}
+}
+
+func TestResetLocalConfig_MembershipDBError(t *testing.T) {
+	ctx, mock, cleanup := newTestContextWithMockDB(t)
+	defer cleanup()
+	mock.ExpectQuery("SELECT COUNT").WillReturnError(sqlmock.ErrCancelled)
+
+	a := newTestAdapterWithDB("http://unused", ctx)
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	gc, _ := gin.CreateTestContext(rec)
+	reqBody := `{"enabled":true}`
+	gc.Request = httptest.NewRequest(http.MethodPost, "/v1/voice/local-config/reset", bytes.NewBufferString(reqBody))
+	gc.Request.Header.Set("Content-Type", "application/json")
+	gc.Request.Header.Set("X-Space-ID", "space1")
+	gc.Set("uid", "user1")
+	wkCtx := &wkhttp.Context{Context: gc}
+	a.resetLocalConfig(wkCtx)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", rec.Code)
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["msg"] != "check space membership failed" {
+		t.Errorf("expected msg='check space membership failed', got %v", body["msg"])
+	}
+}
+
 func TestGetContext_QuerySpaceIDIgnored(t *testing.T) {
 	ctx, _, cleanup := newTestContextWithMockDB(t)
 	defer cleanup()
