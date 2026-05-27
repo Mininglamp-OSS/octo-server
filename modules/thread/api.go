@@ -136,10 +136,14 @@ func classifyThreadError(err error) codes.Code {
 		return errcode.ErrThreadStatusChanged
 	case strings.Contains(msg, "thread is not active"):
 		return errcode.ErrThreadNotActive
-	case strings.Contains(msg, "thread has been deleted"), strings.Contains(msg, "already deleted"):
-		return errcode.ErrThreadDeleted
-	case strings.Contains(msg, "thread not found"), strings.Contains(msg, "not found or already deleted"):
+	// Check "not found" before "deleted": the DB layer returns the ambiguous
+	// "thread not found or already deleted" when affected=0, which we map to
+	// 404 NotFound (the more accurate default for clients hitting unknown IDs).
+	// The explicit service-layer "thread has been deleted" still maps to 410.
+	case strings.Contains(msg, "thread not found"):
 		return errcode.ErrThreadNotFound
+	case strings.Contains(msg, "thread has been deleted"):
+		return errcode.ErrThreadDeleted
 	case strings.Contains(msg, "name is required"):
 		return errcode.ErrThreadNameInvalid
 	case strings.Contains(msg, "invalid mute"), strings.Contains(msg, "mute must"):
