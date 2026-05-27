@@ -92,6 +92,10 @@ that do not send `Accept-Language`, `lang`, or `i18n_lang` keep receiving
 Chinese error messages during the i18n rollout. Supported values are
 `zh-CN` and `en-US`; invalid values fail startup.
 
+Trusted service-to-service language propagation is configured with
+`OCTO_TRUSTED_LANG_HEADER_CIDRS`, a comma-separated CIDR list of direct
+peer addresses allowed to supply `X-Octo-Lang`.
+
 ### Run
 
 `octo-server` parses the `--config` flag with the stdlib `flag`

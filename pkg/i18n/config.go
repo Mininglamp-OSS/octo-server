@@ -2,6 +2,7 @@ package i18n
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"strings"
 )
@@ -10,6 +11,10 @@ const (
 	// EnvDefaultLanguage controls the runtime fallback language for requests
 	// that carry no explicit language signal.
 	EnvDefaultLanguage = "OCTO_DEFAULT_LANGUAGE"
+
+	// EnvTrustedLangHeaderCIDRs controls which direct peer CIDRs may supply
+	// X-Octo-Lang for service-to-service calls.
+	EnvTrustedLangHeaderCIDRs = "OCTO_TRUSTED_LANG_HEADER_CIDRS"
 
 	// DefaultLanguage preserves the legacy deployment behavior for clients that
 	// do not send Accept-Language yet.
@@ -21,6 +26,15 @@ const (
 // rollout misconfiguration fails during startup instead of surfacing per request.
 func DefaultLanguageFromEnv() (string, error) {
 	return ResolveDefaultLanguage(os.Getenv(EnvDefaultLanguage))
+}
+
+// TrustedLangHeaderCIDRsFromEnv parses OCTO_TRUSTED_LANG_HEADER_CIDRS.
+func TrustedLangHeaderCIDRsFromEnv() ([]*net.IPNet, error) {
+	cidrs, err := ParseCIDRList(os.Getenv(EnvTrustedLangHeaderCIDRs))
+	if err != nil {
+		return nil, fmt.Errorf("parse %s: %w", EnvTrustedLangHeaderCIDRs, err)
+	}
+	return cidrs, nil
 }
 
 // ResolveDefaultLanguage normalizes the configured default language.
