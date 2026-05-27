@@ -125,6 +125,85 @@ func TestCacheTokenParserPropagatesCacheError(t *testing.T) {
 	}
 }
 
+// stubResolver is used to exercise the LanguageResolver hook without pulling
+// modules/user into pkg/auth's test deps.
+type stubResolver struct {
+	lang string
+	err  error
+	gotUID string
+}
+
+func (s *stubResolver) Resolve(_ context.Context, uid string) (string, error) {
+	s.gotUID = uid
+	return s.lang, s.err
+}
+
+func TestCacheTokenParserResolverUpgradesLanguage(t *testing.T) {
+	t.Parallel()
+	c := newFakeCache()
+	encoded, _ := Encode(TokenInfo{UID: "u1", Name: "alice", Role: "admin", Language: "zh-CN"})
+	_ = c.Set(testPrefix+"tok1", encoded)
+
+	resolver := &stubResolver{lang: "en-US"}
+	p := NewCacheTokenParser(c, testPrefix, WithLanguageResolver(resolver))
+	got, err := p.Parse(context.Background(), "tok1")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got.Language != "en-US" {
+		t.Fatalf("Language = %q, want resolver value en-US", got.Language)
+	}
+	if resolver.gotUID != "u1" {
+		t.Fatalf("resolver got uid %q, want u1", resolver.gotUID)
+	}
+}
+
+func TestCacheTokenParserResolverFailureKeepsSnapshot(t *testing.T) {
+	t.Parallel()
+	c := newFakeCache()
+	encoded, _ := Encode(TokenInfo{UID: "u1", Name: "alice", Language: "zh-CN"})
+	_ = c.Set(testPrefix+"tok1", encoded)
+
+	resolver := &stubResolver{err: errors.New("redis down")}
+	p := NewCacheTokenParser(c, testPrefix, WithLanguageResolver(resolver))
+	got, err := p.Parse(context.Background(), "tok1")
+	if err != nil {
+		t.Fatalf("Parse must not surface resolver failure, got %v", err)
+	}
+	if got.Language != "zh-CN" {
+		t.Fatalf("Language = %q, want snapshot zh-CN (resolver failed)", got.Language)
+	}
+}
+
+func TestCacheTokenParserResolverEmptyKeepsSnapshot(t *testing.T) {
+	t.Parallel()
+	c := newFakeCache()
+	encoded, _ := Encode(TokenInfo{UID: "u1", Name: "alice", Language: "zh-CN"})
+	_ = c.Set(testPrefix+"tok1", encoded)
+
+	resolver := &stubResolver{lang: ""}
+	p := NewCacheTokenParser(c, testPrefix, WithLanguageResolver(resolver))
+	got, _ := p.Parse(context.Background(), "tok1")
+	if got.Language != "zh-CN" {
+		t.Fatalf("Language = %q, want snapshot zh-CN (resolver returned empty)", got.Language)
+	}
+}
+
+func TestWithLanguageResolverNilIsNoOp(t *testing.T) {
+	t.Parallel()
+	c := newFakeCache()
+	encoded, _ := Encode(TokenInfo{UID: "u1", Name: "alice"})
+	_ = c.Set(testPrefix+"tok1", encoded)
+
+	p := NewCacheTokenParser(c, testPrefix, WithLanguageResolver(nil))
+	if p.resolver != nil {
+		t.Fatal("nil resolver option must not set the field")
+	}
+	if _, err := p.Parse(context.Background(), "tok1"); err != nil {
+		t.Fatalf("Parse should still succeed without a resolver, got %v", err)
+	}
+}
+
 func TestNewCacheTokenParserPanicsOnNilCache(t *testing.T) {
 	t.Parallel()
 	defer func() {
