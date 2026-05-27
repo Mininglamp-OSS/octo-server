@@ -848,14 +848,29 @@ func (u *User) userUpdateWithField(c *wkhttp.Context) {
 			return
 		}
 		if key == "name" {
-			// 将重新设置token设置到缓存（这里主要是更新登录者的name）
-			payload, encErr := auth.Encode(auth.TokenInfo{UID: loginUID, Name: fmt.Sprintf("%v", value), Role: c.GetLoginRole()})
+			// 将重新设置token设置到缓存（这里主要是更新登录者的name）。
+			// 保留原有 Language 快照：从既存 cache value 解码后只换 Name，
+			// 避免 rename 把语言偏好抹空；Redis miss 时回退到无快照（由
+			// AuthMiddleware 上的 LanguageResolver 在下次请求重建）。
+			loginToken := c.GetHeader("token")
+			preservedLang := ""
+			if oldRaw, getErr := u.ctx.Cache().Get(u.ctx.GetConfig().Cache.TokenCachePrefix + loginToken); getErr == nil && oldRaw != "" {
+				if oldInfo, decErr := auth.Decode(oldRaw); decErr == nil {
+					preservedLang = oldInfo.Language
+				}
+			}
+			payload, encErr := auth.Encode(auth.TokenInfo{
+				UID:      loginUID,
+				Name:     fmt.Sprintf("%v", value),
+				Role:     c.GetLoginRole(),
+				Language: preservedLang,
+			})
 			if encErr != nil {
 				u.Error("编码token缓存失败！", zap.Error(encErr))
 				c.ResponseError(errors.New("重新设置token缓存失败！"))
 				return
 			}
-			err = u.ctx.Cache().Set(u.ctx.GetConfig().Cache.TokenCachePrefix+c.GetHeader("token"), payload)
+			err = u.ctx.Cache().Set(u.ctx.GetConfig().Cache.TokenCachePrefix+loginToken, payload)
 			if err != nil {
 				u.Error("重新设置token缓存失败！", zap.Error(err))
 				c.ResponseError(errors.New("重新设置token缓存失败！"))
@@ -1369,7 +1384,12 @@ func (u *User) execLogin(userInfo *Model, flag config.DeviceFlag, device *device
 		}
 	}
 
-	tokenPayload, err := auth.Encode(auth.TokenInfo{UID: userInfo.UID, Name: userInfo.Name, Role: userInfo.Role})
+	tokenPayload, err := auth.Encode(auth.TokenInfo{
+		UID:      userInfo.UID,
+		Name:     userInfo.Name,
+		Role:     userInfo.Role,
+		Language: userInfo.Language,
+	})
 	if err != nil {
 		u.Error("编码token缓存失败！", zap.Error(err))
 		tokenSpan.Finish()
@@ -1921,7 +1941,11 @@ func (u *User) loginWithAuthCode(c *wkhttp.Context) {
 	}
 
 	// 将token设置到缓存
-	tokenPayload, err := auth.Encode(auth.TokenInfo{UID: userModel.UID, Name: userModel.Name})
+	tokenPayload, err := auth.Encode(auth.TokenInfo{
+		UID:      userModel.UID,
+		Name:     userModel.Name,
+		Language: userModel.Language,
+	})
 	if err != nil {
 		u.Error("编码token缓存失败！", zap.Error(err))
 		return
@@ -2588,7 +2612,11 @@ func (u *User) loginCheckPhone(c *wkhttp.Context) {
 	}
 	token := util.GenerUUID()
 	// 将token设置到缓存
-	tokenPayload, err := auth.Encode(auth.TokenInfo{UID: userInfo.UID, Name: userInfo.Name})
+	tokenPayload, err := auth.Encode(auth.TokenInfo{
+		UID:      userInfo.UID,
+		Name:     userInfo.Name,
+		Language: userInfo.Language,
+	})
 	if err != nil {
 		u.Error("编码token缓存失败！", zap.Error(err))
 		c.ResponseError(errors.New("设置token缓存失败！"))
@@ -3230,7 +3258,12 @@ func (u *User) createUserWithRespAndTx(registerSpanCtx context.Context, createUs
 	u.ctx.EventCommit(eventID)
 	token := util.GenerUUID()
 	// 将token设置到缓存
-	tokenPayload, err := auth.Encode(auth.TokenInfo{UID: userModel.UID, Name: userModel.Name, Role: userModel.Role})
+	tokenPayload, err := auth.Encode(auth.TokenInfo{
+		UID:      userModel.UID,
+		Name:     userModel.Name,
+		Role:     userModel.Role,
+		Language: userModel.Language,
+	})
 	if err != nil {
 		u.Error("编码token缓存失败！", zap.Error(err))
 		return nil, err

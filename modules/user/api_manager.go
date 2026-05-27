@@ -198,7 +198,12 @@ func (m *Manager) login(c *wkhttp.Context) {
 	}
 	token := util.GenerUUID()
 	// 将token设置到缓存
-	tokenPayload, err := auth.Encode(auth.TokenInfo{UID: userInfo.UID, Name: userInfo.Name, Role: userInfo.Role})
+	tokenPayload, err := auth.Encode(auth.TokenInfo{
+		UID:      userInfo.UID,
+		Name:     userInfo.Name,
+		Role:     userInfo.Role,
+		Language: userInfo.Language,
+	})
 	if err != nil {
 		m.Error("编码token缓存失败！", zap.Error(err))
 		c.ResponseError(errors.New("设置token缓存失败！"))

@@ -165,6 +165,7 @@ type managerLoginModel struct {
 	Name     string
 	Password string
 	Role     string
+	Language string // 偏好语言快照——AuthMiddleware 上的 LanguageResolver 在 Parse 时会刷新成最新值
 }
 
 type managerUserModel struct {
