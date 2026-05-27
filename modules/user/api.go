@@ -96,6 +96,7 @@ type User struct {
 	appService               app.IService
 	loginGuard               *LoginGuard
 	verificationDB           *verificationDB
+	languageService          *LanguageService
 }
 
 // New New
@@ -131,6 +132,10 @@ func New(ctx *config.Context) *User {
 		spaceSettingDB:           NewSpaceSettingDB(ctx.DB()),
 		verificationDB:           newVerificationDB(ctx),
 	}
+	// LanguageService 与 main.go 注入到 CacheTokenParser 的实例独立构造，但共享
+	// 底层 *DB session / Redis 连接，因此读写同一份 user.language 列与
+	// user_language:{uid} 热缓存，行为等价。这样 handler 不需要 main.go 反向注入。
+	u.languageService = NewLanguageService(u.db, ctx.Cache())
 	u.pinned = NewPinned(u.pinnedDB, u.friendDB)
 	InitGlobalPinnedDB(ctx) // 初始化全局 PinnedDB 供其他模块调用
 	u.updateSystemUserToken()
@@ -186,6 +191,7 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 		user.GET("/grant_login", u.grantLogin)                     // 授权登录
 		user.GET("/current", u.currentUser)                        // 获取当前登录用户信息（含 self 实名字段）
 		user.PUT("/current", u.userUpdateWithField)                //修改用户信息
+		user.PUT("/language", u.setLanguage)                       // 设置当前用户语言偏好（i18n）
 		user.GET("/qrcode", u.qrcodeMy)                            // 我的二维码
 		user.PUT("/my/setting", u.userUpdateSetting)               // 更新我的设置
 		user.POST("/blacklist/:uid", u.addBlacklist)               //添加黑名单
@@ -717,6 +723,38 @@ func (u *User) currentUser(c *wkhttp.Context) {
 	resp := newLoginUserDetailResp(userInfo, c.GetHeader("token"), u.ctx)
 	u.applyRealnameToLoginResp(resp, userInfo.UID)
 	c.Response(resp)
+}
+
+// setLanguageReq 接收 PUT /v1/user/language 的请求体。Language 为空字符串
+// 表示清空偏好（回到 OCTO_DEFAULT_LANGUAGE 语义）；非空时由 LanguageService
+// 走 MatchSupportedLanguage 严格校验，不在支持矩阵内一律拒绝。
+type setLanguageReq struct {
+	Language string `json:"language"`
+}
+
+// setLanguage 更新当前用户的语言偏好。DB 持久化 + Redis user_language:{uid} 主动
+// DEL 由 LanguageService 处理；其他端的 token 缓存快照不会刷新——见 PR #181 的
+// 设计说明，下次请求由 AuthMiddleware 的 LanguageResolver 自动 hydrate 出
+// 新值，无需强制重新登录。
+func (u *User) setLanguage(c *wkhttp.Context) {
+	loginUID := c.GetLoginUID()
+	if loginUID == "" {
+		c.ResponseError(errors.New("未登录"))
+		return
+	}
+	var req setLanguageReq
+	if err := c.BindJSON(&req); err != nil {
+		u.Error("language 请求体格式错误", zap.Error(err), zap.String("uid", loginUID))
+		c.ResponseError(errors.New("数据格式有误！"))
+		return
+	}
+	if err := u.languageService.SetLanguage(c.Request.Context(), loginUID, req.Language); err != nil {
+		u.Error("设置用户语言偏好失败",
+			zap.Error(err), zap.String("uid", loginUID), zap.String("language", req.Language))
+		c.ResponseError(err)
+		return
+	}
+	c.ResponseOK()
 }
 
 // 修改用户信息
@@ -3429,6 +3467,10 @@ type loginUserDetailResp struct {
 	RSAPublicKey    string  `json:"rsa_public_key"` // 应用公钥做一些消息验证 base64编码
 	ShortStatus     int     `json:"short_status"`
 	MsgExpireSecond int64   `json:"msg_expire_second"` // 消息过期时长
+	// Language 是用户语言偏好（BCP 47，空字符串表示"未显式设置，沿用 OCTO_DEFAULT_LANGUAGE"）。
+	// 客户端读到非空值时应当持久化到本地并随后续请求带 X-Octo-Lang / cookie；
+	// 读到空值时不要本地强行回填一个默认，避免覆盖服务端的"未设置"状态。
+	Language string `json:"language"`
 	// 注销状态提示：仅当账号处于冷静期（is_destroy=1）时下发
 	// DestroyStatus: 0=正常 1=注销申请中
 	// DestroyRemainingDays: 距到期还剩天数（向上取整，最小 0）
@@ -3495,6 +3537,7 @@ func newLoginUserDetailResp(m *Model, token string, ctx *config.Context) *loginU
 		ShortStatus:          m.ShortStatus,
 		RSAPublicKey:         base64.StdEncoding.EncodeToString([]byte(ctx.GetConfig().AppRSAPubKey)),
 		MsgExpireSecond:      m.MsgExpireSecond,
+		Language:             m.Language,
 		Setting: setting{
 			SearchByPhone:     m.SearchByPhone,
 			SearchByShort:     m.SearchByShort,
