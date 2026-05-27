@@ -33,7 +33,7 @@ name: Check Sprint
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, edited]
     branches: [main]
 
 permissions: {}
