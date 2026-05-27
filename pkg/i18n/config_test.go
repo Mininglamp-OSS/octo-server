@@ -71,7 +71,10 @@ func TestTrustedLangHeaderCIDRsFromEnvPrefersOctoName(t *testing.T) {
 
 func TestTrustedLangHeaderCIDRsFromEnvIgnoresLegacyName(t *testing.T) {
 	t.Setenv(EnvTrustedLangHeaderCIDRs, "")
-	t.Setenv("DM_TRUSTED_LANG_HEADER_CIDRS", "192.168.0.0/16")
+	// Set legacy env to an INVALID CIDR: if the helper still consulted it,
+	// ParseCIDRList would surface a parse error. A nil error therefore proves
+	// the legacy var is never read.
+	t.Setenv("DM_TRUSTED_LANG_HEADER_CIDRS", "not-cidr")
 
 	got, err := TrustedLangHeaderCIDRsFromEnv()
 	if err != nil {
