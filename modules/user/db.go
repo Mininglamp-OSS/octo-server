@@ -487,6 +487,7 @@ type Model struct {
 	GithubUID         string // github uid
 	Web3PublicKey     string // web3公钥
 	MsgExpireSecond   int64  // 消息过期时长
+	Language          string // 用户语言偏好（BCP 47，空表示沿用 OCTO_DEFAULT_LANGUAGE）
 	db.BaseModel
 }
 
