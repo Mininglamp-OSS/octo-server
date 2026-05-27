@@ -38,6 +38,12 @@ var (
 		DefaultMessage: "Invalid source message payload.",
 		SafeDetailKeys: []string{"field", "max_size"},
 	})
+	ErrThreadStatusInvalid = register(codes.Code{
+		ID:             "err.server.thread.status_invalid",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Invalid thread status.",
+		SafeDetailKeys: []string{"field"},
+	})
 	ErrThreadNotGroupMember = register(codes.Code{
 		ID:             "err.server.thread.not_group_member",
 		HTTPStatus:     http.StatusForbidden,
@@ -52,6 +58,26 @@ var (
 		ID:             "err.server.thread.not_found",
 		HTTPStatus:     http.StatusNotFound,
 		DefaultMessage: "Thread not found.",
+	})
+	ErrThreadDeleted = register(codes.Code{
+		ID:             "err.server.thread.deleted",
+		HTTPStatus:     http.StatusGone,
+		DefaultMessage: "Thread has been deleted.",
+	})
+	ErrThreadNotActive = register(codes.Code{
+		ID:             "err.server.thread.not_active",
+		HTTPStatus:     http.StatusConflict,
+		DefaultMessage: "Thread is not active.",
+	})
+	ErrThreadStatusChanged = register(codes.Code{
+		ID:             "err.server.thread.status_changed",
+		HTTPStatus:     http.StatusConflict,
+		DefaultMessage: "Thread status changed concurrently.",
+	})
+	ErrThreadCreatorCannotLeave = register(codes.Code{
+		ID:             "err.server.thread.creator_cannot_leave",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Thread creator cannot leave the thread.",
 	})
 	ErrThreadGroupMDNotFound = register(codes.Code{
 		ID:             "err.server.thread.group_md_not_found",
@@ -69,6 +95,12 @@ var (
 		HTTPStatus:     http.StatusBadRequest,
 		DefaultMessage: "GROUP.md content exceeds the maximum size.",
 		SafeDetailKeys: []string{"field", "max_size"},
+	})
+	ErrThreadSettingInvalid = register(codes.Code{
+		ID:             "err.server.thread.setting_invalid",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Invalid thread setting.",
+		SafeDetailKeys: []string{"field"},
 	})
 	ErrThreadStoreFailed = register(codes.Code{
 		ID:             "err.server.thread.store_failed",
