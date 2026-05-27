@@ -111,6 +111,24 @@ func (d *DB) QueryByUID(uid string) (*Model, error) {
 	return model, err
 }
 
+// QueryLanguageByUID returns the user's language preference column only.
+// 用作 LanguageService 的真相源读取——只 SELECT 单列以保持 hot path 轻量，
+// 避免 5min TTL 的 Redis 缓存 miss 把整行 Model 拉到内存。
+// (uid 不存在时返回 ("", nil)；空串语义为"未显式设置"。)
+func (d *DB) QueryLanguageByUID(uid string) (string, error) {
+	var lang string
+	_, err := d.session.Select("language").From("user").Where("uid=?", uid).Load(&lang)
+	return lang, err
+}
+
+// UpdateLanguageByUID 持久化用户语言偏好。空字符串表示清空（回到
+// OCTO_DEFAULT_LANGUAGE 语义）；调用方负责在入库前完成 BCP 47 校验
+// （通常走 LanguageService.SetLanguage），这里不做二次校验。
+func (d *DB) UpdateLanguageByUID(uid, language string) error {
+	_, err := d.session.Update("user").Set("language", language).Where("uid=?", uid).Exec()
+	return err
+}
+
 // QueryByVercode 通过用户vercode查询用户信息
 func (d *DB) QueryByVercode(vercode string) (*Model, error) {
 	var model *Model
