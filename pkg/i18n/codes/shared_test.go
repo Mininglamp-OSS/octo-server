@@ -93,3 +93,18 @@ func TestSharedCodes_SafeDetailKeys(t *testing.T) {
 		}
 	}
 }
+
+// TestSharedCodes_DefaultMessageInjectedIntoRegistry 验证 DefaultMessage 进入
+// registry 后未被截断或丢失；TOML override 路径在 i18n 包测试中覆盖。
+func TestSharedCodes_DefaultMessageInjectedIntoRegistry(t *testing.T) {
+	for _, c := range All() {
+		if c.DefaultMessage == "" {
+			t.Errorf("%s: DefaultMessage empty after Register", c.ID)
+		}
+		// SafeDetailKeys 应是相同身份（地址不一定相同因为深拷贝）但内容相同。
+		// 这里只断言「不为 nil 时长度合理」，避免误依赖 slice identity。
+		if c.SafeDetailKeys != nil && len(c.SafeDetailKeys) == 0 {
+			t.Errorf("%s: SafeDetailKeys is non-nil but empty (use nil for none)", c.ID)
+		}
+	}
+}

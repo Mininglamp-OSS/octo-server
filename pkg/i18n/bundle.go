@@ -19,7 +19,11 @@ import (
 // SourceLanguage 是 source（D4）语言标签——AST extractor 输出 / 翻译模板基准。
 const SourceLanguage = "en-US"
 
-//go:embed locales/*.toml
+// 仅 embed active.*.toml；translate.*.toml 是 goi18n merge 流程的 WIP 文件
+// （含未翻译/部分翻译 stub），不应进入 runtime bundle，否则字典序后载会覆盖
+// active.*.toml 让客户端看到 stub 文案。
+//
+//go:embed locales/active.*.toml
 var localesFS embed.FS
 
 var (
@@ -88,7 +92,8 @@ func loadBundle() {
 	bundlePtr = b
 }
 
-// resetBundle 仅供测试使用——重置 lazy-init 状态使下次 Bundle() 重新初始化。
+// resetBundle 仅供测试使用，**非 goroutine 安全**——直接重置 sync.Once
+// 与 bundlePtr / bundleErr 三个全局变量，调用方需保证无并发 Bundle()。
 // 生产代码绝不应调用：bundle 是请求路径上的高频共享对象，运行期重建会引入
 // 数据竞争与翻译瞬时不一致。
 func resetBundle() {

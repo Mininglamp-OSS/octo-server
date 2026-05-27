@@ -1,0 +1,40 @@
+# zh-CN runtime 翻译文件（active.*）。
+#
+# 命名遵循 go-i18n 约定：
+#   - active.<lang>.toml: 运行期加载（本文件）
+#   - translate.<lang>.toml: 翻译流程 WIP 中间文件，由 goi18n merge 生成 stub
+#     供翻译团队补译，翻译完成后 merge 回 active.<lang>.toml 并删除；**不会被
+#     bundle embed**（参见 pkg/i18n/bundle.go 的 go:embed pattern）
+#
+# 当前手工维护首期 err.shared.* 翻译；AST extractor 流程接入后新增 code 会
+# 先在 translate.<lang>.toml 出现，翻译完成后 merge 进本文件。
+#
+# 与 pkg/i18n/codes/shared.go 的 DefaultMessages["zh-CN"] 内容一致——TOML 是
+# 日常运行路径，DefaultMessages 仅在 bundle 加载失败时兜底（D22）。
+
+["err.shared.auth.required"]
+other = "请先登录！"
+
+["err.shared.auth.token_missing"]
+other = "token不能为空，请先登录！"
+
+["err.shared.auth.token_invalid"]
+other = "token有误！"
+
+["err.shared.auth.token_expired"]
+other = "登录已过期，请重新登录。"
+
+["err.shared.auth.forbidden"]
+other = "无权执行此操作。"
+
+["err.shared.rate.limited"]
+other = "请求过于频繁，请稍后再试。"
+
+["err.shared.param.invalid"]
+other = "请求参数无效。"
+
+["err.shared.not_found"]
+other = "资源不存在。"
+
+["err.shared.internal"]
+other = "服务器内部错误。"

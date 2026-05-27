@@ -20,9 +20,27 @@ package codes
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"sync"
 )
+
+// idPattern 校验 Code.ID 必须满足项目命名约定：
+//   - 前缀 `err.shared.` 或 `err.server.`（不允许其他命名空间）
+//   - 后接至少一段、可有多段 `.` 分隔 segment
+//   - segment 限 lowercase letters / digits / underscore，不接受空格、点、大写
+//
+// 例：
+//
+//	err.shared.auth.required        ✓
+//	err.shared.not_found            ✓
+//	err.server.thread.archive_full  ✓
+//	err.shared.AUTH.required        ✗（大写）
+//	err.client.foo.bar              ✗（不在 shared|server 命名空间）
+//	err.shared                      ✗（无尾段）
+//
+// 在 Register 阶段强校验，CI lint 之外多一道防线，避免约定漂移。
+var idPattern = regexp.MustCompile(`^err\.(shared|server)\.[a-z0-9_]+(\.[a-z0-9_]+)*$`)
 
 // Code 描述一个稳定 i18n 错误码及其元信息。
 //
@@ -62,6 +80,12 @@ func Register(c Code) {
 	if c.ID == "" {
 		panic("codes.Register: empty Code.ID")
 	}
+	if !idPattern.MatchString(c.ID) {
+		panic(fmt.Sprintf(
+			"codes.Register: invalid ID %q "+
+				"(want err.(shared|server).<segment>(.<segment>)* with [a-z0-9_])",
+			c.ID))
+	}
 	if c.DefaultMessage == "" {
 		panic(fmt.Sprintf("codes.Register: empty DefaultMessage for %q", c.ID))
 	}
@@ -69,47 +93,73 @@ func Register(c Code) {
 		panic(fmt.Sprintf("codes.Register: invalid HTTPStatus %d for %q", c.HTTPStatus, c.ID))
 	}
 
+	stored := cloneCode(c)
+
 	mu.Lock()
 	defer mu.Unlock()
 	if _, ok := registry[c.ID]; ok {
 		panic(fmt.Sprintf("codes.Register: duplicate ID %q", c.ID))
 	}
-	registry[c.ID] = c
+	registry[c.ID] = stored
 }
 
 // Lookup 按 ID 检索 Code，未注册返回 false。
 // 运行期高频调用（每次 ResponseErrorL），用 RWMutex 读锁。
+//
+// 返回的 Code 是深拷贝——调用方修改 DefaultMessages / SafeDetailKeys 不会污染
+// 全局 registry。配合 hot-path 上并发读 renderer，避免 data race。
 func Lookup(id string) (Code, bool) {
 	mu.RLock()
 	defer mu.RUnlock()
 	c, ok := registry[id]
-	return c, ok
+	if !ok {
+		return Code{}, false
+	}
+	return cloneCode(c), true
 }
 
-// All 返回全部已注册 Code 的副本，按 ID 字典序排序。
+// All 返回全部已注册 Code 的深拷贝副本，按 ID 字典序排序。
 // 主要供 AST extractor、CI lint、调试 dump 使用，不应在 hot path 调用。
+//
+// 单次读锁覆盖收集 + 排序 + 克隆全过程，避免 Register 与 All 交错读到中间态。
 func All() []Code {
 	mu.RLock()
+	defer mu.RUnlock()
+
 	ids := make([]string, 0, len(registry))
 	for id := range registry {
 		ids = append(ids, id)
 	}
-	out := make([]Code, 0, len(registry))
-	mu.RUnlock()
-
 	sort.Strings(ids)
-	mu.RLock()
-	defer mu.RUnlock()
+
+	out := make([]Code, 0, len(ids))
 	for _, id := range ids {
-		if c, ok := registry[id]; ok {
-			out = append(out, c)
-		}
+		out = append(out, cloneCode(registry[id]))
 	}
 	return out
 }
 
-// reset 仅供测试使用。生产代码绝不应调用——registry 在 init 期定型后
-// 不应在运行期清空，否则未注册 code 阻断（CI lint）失去意义。
+// cloneCode 返回 c 的深拷贝。仅复制 DefaultMessages / SafeDetailKeys 两个
+// 引用类型字段；其余 string / int / bool 是值类型直接复制即可。
+//
+// 用于 Register / Lookup / All 三个出入口，使 registry 内部状态对外不可达。
+func cloneCode(c Code) Code {
+	out := c
+	if c.DefaultMessages != nil {
+		out.DefaultMessages = make(map[string]string, len(c.DefaultMessages))
+		for k, v := range c.DefaultMessages {
+			out.DefaultMessages[k] = v
+		}
+	}
+	if c.SafeDetailKeys != nil {
+		out.SafeDetailKeys = append([]string(nil), c.SafeDetailKeys...)
+	}
+	return out
+}
+
+// reset 仅供测试使用，**非 goroutine 安全**——直接重置全局 map，调用方需
+// 保证无并发 Register/Lookup。生产代码绝不应调用：registry 在 init 期定型后
+// 运行期清空会让未注册 code 阻断（CI lint）失去意义。
 func reset() {
 	mu.Lock()
 	defer mu.Unlock()

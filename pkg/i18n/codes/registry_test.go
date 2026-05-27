@@ -68,9 +68,9 @@ func TestRegister_PanicsOnInvalidInput(t *testing.T) {
 		code Code
 	}{
 		{"empty ID", Code{ID: "", HTTPStatus: 400, DefaultMessage: "x"}},
-		{"empty DefaultMessage", Code{ID: "err.x", HTTPStatus: 400, DefaultMessage: ""}},
-		{"status too low", Code{ID: "err.x", HTTPStatus: 99, DefaultMessage: "x"}},
-		{"status too high", Code{ID: "err.x", HTTPStatus: 600, DefaultMessage: "x"}},
+		{"empty DefaultMessage", Code{ID: "err.shared.x.y", HTTPStatus: 400, DefaultMessage: ""}},
+		{"status too low", Code{ID: "err.shared.x.y", HTTPStatus: 99, DefaultMessage: "x"}},
+		{"status too high", Code{ID: "err.shared.x.y", HTTPStatus: 600, DefaultMessage: "x"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -85,15 +85,154 @@ func TestRegister_PanicsOnInvalidInput(t *testing.T) {
 	}
 }
 
+// TestRegister_PanicsOnInvalidIDFormat 验证 idPattern 命名约定强校验。
+// 防止后续业务 module 用大写/空格/错前缀注册码，绕过 CI lint 漏到运行期。
+func TestRegister_PanicsOnInvalidIDFormat(t *testing.T) {
+	bad := []string{
+		"err.shared.AUTH.required",        // uppercase
+		"err.shared.auth required",        // space
+		"err.shared.",                     // empty trailing
+		"err.shared",                      // no trailing segment
+		"err.client.foo.bar",              // wrong namespace
+		"errshared.foo.bar",               // missing first dot
+		"err..foo.bar",                    // empty namespace
+		"err.shared.foo-bar",              // hyphen not allowed
+		"err.shared.foo.bar.",             // trailing dot
+		"Err.shared.foo.bar",              // uppercase prefix
+	}
+	for _, id := range bad {
+		t.Run(id, func(t *testing.T) {
+			withCleanRegistry(t)
+			defer func() {
+				if r := recover(); r == nil {
+					t.Fatalf("Register did not panic for invalid ID %q", id)
+				}
+			}()
+			Register(Code{ID: id, HTTPStatus: 400, DefaultMessage: "x"})
+		})
+	}
+}
+
+// TestRegister_AcceptsValidIDFormat 反向覆盖：合法 ID 不应被拒绝。
+func TestRegister_AcceptsValidIDFormat(t *testing.T) {
+	good := []string{
+		"err.shared.auth.required",
+		"err.shared.not_found",
+		"err.shared.rate.limited",
+		"err.server.thread.archive_full",
+		"err.server.user.x.y.z.w",  // 多层
+	}
+	for _, id := range good {
+		t.Run(id, func(t *testing.T) {
+			withCleanRegistry(t)
+			Register(Code{ID: id, HTTPStatus: 400, DefaultMessage: "x"})
+			if _, ok := Lookup(id); !ok {
+				t.Fatalf("Register accepted %q but Lookup returned false", id)
+			}
+		})
+	}
+}
+
+// TestLookup_ReturnsDeepCopy 验证 P1 修复：调用方修改返回值的引用字段
+// 不应污染 registry。renderer 在 hot path 上读这些字段，未深拷贝会触发 race。
+func TestLookup_ReturnsDeepCopy(t *testing.T) {
+	withCleanRegistry(t)
+
+	Register(Code{
+		ID:             "err.shared.deepcopy.test",
+		HTTPStatus:     400,
+		DefaultMessage: "x",
+		DefaultMessages: map[string]string{
+			"zh-CN": "中文",
+			"en-US": "english",
+		},
+		SafeDetailKeys: []string{"field", "retry_after"},
+	})
+
+	got1, _ := Lookup("err.shared.deepcopy.test")
+	got1.DefaultMessages["zh-CN"] = "MUTATED"
+	got1.DefaultMessages["NEW"] = "leak"
+	got1.SafeDetailKeys[0] = "MUTATED"
+	got1.SafeDetailKeys = append(got1.SafeDetailKeys, "leaked")
+
+	got2, _ := Lookup("err.shared.deepcopy.test")
+	if got2.DefaultMessages["zh-CN"] != "中文" {
+		t.Errorf("registry DefaultMessages mutated through Lookup: %v", got2.DefaultMessages)
+	}
+	if _, leaked := got2.DefaultMessages["NEW"]; leaked {
+		t.Errorf("new key leaked into registry: %v", got2.DefaultMessages)
+	}
+	if got2.SafeDetailKeys[0] != "field" {
+		t.Errorf("SafeDetailKeys[0] mutated through Lookup: %v", got2.SafeDetailKeys)
+	}
+	if len(got2.SafeDetailKeys) != 2 {
+		t.Errorf("SafeDetailKeys append leaked: %v", got2.SafeDetailKeys)
+	}
+}
+
+// TestRegister_DeepCopiesInput 调用方在 Register 后修改原入参的引用字段
+// 不应影响已注册的 Code。
+func TestRegister_DeepCopiesInput(t *testing.T) {
+	withCleanRegistry(t)
+
+	msgs := map[string]string{"zh-CN": "中文"}
+	keys := []string{"field"}
+	Register(Code{
+		ID:              "err.shared.deepcopy.input",
+		HTTPStatus:      400,
+		DefaultMessage:  "x",
+		DefaultMessages: msgs,
+		SafeDetailKeys:  keys,
+	})
+
+	// 入参后续突变 —— 不应影响 registry。
+	msgs["zh-CN"] = "MUTATED"
+	msgs["NEW"] = "leak"
+	keys[0] = "MUTATED"
+
+	got, _ := Lookup("err.shared.deepcopy.input")
+	if got.DefaultMessages["zh-CN"] != "中文" {
+		t.Errorf("registry mutated through Register input map: %v", got.DefaultMessages)
+	}
+	if got.SafeDetailKeys[0] != "field" {
+		t.Errorf("registry mutated through Register input slice: %v", got.SafeDetailKeys)
+	}
+}
+
+// TestAll_ReturnsDeepCopy 同 TestLookup_ReturnsDeepCopy，但走 All 路径。
+func TestAll_ReturnsDeepCopy(t *testing.T) {
+	withCleanRegistry(t)
+
+	Register(Code{
+		ID:              "err.shared.all.deepcopy",
+		HTTPStatus:      400,
+		DefaultMessage:  "x",
+		DefaultMessages: map[string]string{"zh-CN": "中文"},
+		SafeDetailKeys:  []string{"field"},
+	})
+
+	out := All()
+	out[0].DefaultMessages["zh-CN"] = "MUTATED"
+	out[0].SafeDetailKeys[0] = "MUTATED"
+
+	got, _ := Lookup("err.shared.all.deepcopy")
+	if got.DefaultMessages["zh-CN"] != "中文" {
+		t.Errorf("registry mutated through All() return: %v", got.DefaultMessages)
+	}
+	if got.SafeDetailKeys[0] != "field" {
+		t.Errorf("SafeDetailKeys mutated through All() return: %v", got.SafeDetailKeys)
+	}
+}
+
 func TestAll_SortedAndIndependent(t *testing.T) {
 	withCleanRegistry(t)
 
-	Register(Code{ID: "err.b", HTTPStatus: 400, DefaultMessage: "b"})
-	Register(Code{ID: "err.a", HTTPStatus: 400, DefaultMessage: "a"})
-	Register(Code{ID: "err.c", HTTPStatus: 400, DefaultMessage: "c"})
+	Register(Code{ID: "err.shared.b", HTTPStatus: 400, DefaultMessage: "b"})
+	Register(Code{ID: "err.shared.a", HTTPStatus: 400, DefaultMessage: "a"})
+	Register(Code{ID: "err.shared.c", HTTPStatus: 400, DefaultMessage: "c"})
 
 	got := All()
-	want := []string{"err.a", "err.b", "err.c"}
+	want := []string{"err.shared.a", "err.shared.b", "err.shared.c"}
 	if len(got) != len(want) {
 		t.Fatalf("All returned %d entries, want %d", len(got), len(want))
 	}
@@ -105,7 +244,7 @@ func TestAll_SortedAndIndependent(t *testing.T) {
 
 	// 返回的切片应是副本：调用方修改不影响 registry。
 	got[0].DefaultMessage = "MUTATED"
-	if c, _ := Lookup("err.a"); c.DefaultMessage == "MUTATED" {
+	if c, _ := Lookup("err.shared.a"); c.DefaultMessage == "MUTATED" {
 		t.Fatal("All returned a slice that aliases registry state")
 	}
 }
@@ -154,14 +293,14 @@ func itoa(n int) string {
 
 func TestLookup_ConcurrentReaders(t *testing.T) {
 	withCleanRegistry(t)
-	Register(Code{ID: "err.x", HTTPStatus: 400, DefaultMessage: "x"})
+	Register(Code{ID: "err.shared.x", HTTPStatus: 400, DefaultMessage: "x"})
 
 	var wg sync.WaitGroup
 	for i := 0; i < 100; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, ok := Lookup("err.x"); !ok {
+			if _, ok := Lookup("err.shared.x"); !ok {
 				t.Error("concurrent Lookup failed")
 			}
 		}()
