@@ -42,6 +42,7 @@ var (
 type LanguageNegotiationOptions struct {
 	DefaultLanguage        string
 	TrustedLangHeaderCIDRs []*net.IPNet
+	TrustedProxyCIDRs      []*net.IPNet
 	UserLanguage           string
 }
 
@@ -49,15 +50,16 @@ type LanguageNegotiationOptions struct {
 // trusted X-Octo-Lang > URL lang > cookie i18n_lang > user.language >
 // Accept-Language > default language。
 //
-// X-Octo-Lang 只根据 TCP RemoteAddr 命中 TrustedLangHeaderCIDRs 时采纳；
-// 本函数不读取 X-Forwarded-For，避免链尾伪造影响信任判定。
+// X-Octo-Lang 默认根据 TCP RemoteAddr 命中 TrustedLangHeaderCIDRs 时采纳；
+// 配置 TrustedProxyCIDRs 时，先对 X-Forwarded-For + RemoteAddr 从右向左
+// 剥离可信反代，再用剥离后的调用方 IP 判定 TrustedLangHeaderCIDRs。
 func NegotiateLanguage(r *http.Request, opts LanguageNegotiationOptions) LanguageDecision {
 	defaultLang := normalizeDefaultLanguage(opts.DefaultLanguage)
 	if r == nil {
 		return LanguageDecision{Language: defaultLang, Source: LanguageSourceDefault}
 	}
 
-	if IsTrustedLangHeaderRequest(r, opts.TrustedLangHeaderCIDRs) {
+	if IsTrustedLangHeaderRequest(r, opts.TrustedLangHeaderCIDRs, opts.TrustedProxyCIDRs) {
 		if lang, ok := MatchSupportedLanguage(r.Header.Get(HeaderOctoLang)); ok {
 			return LanguageDecision{Language: lang, Source: LanguageSourceTrustedHeader}
 		}
@@ -114,13 +116,65 @@ func ParseCIDRList(value string) ([]*net.IPNet, error) {
 	return out, nil
 }
 
-// IsTrustedLangHeaderRequest 判断请求的 TCP RemoteAddr 是否命中受信语言头 CIDR。
-func IsTrustedLangHeaderRequest(r *http.Request, cidrs []*net.IPNet) bool {
+// IsTrustedLangHeaderRequest 判断请求调用方 IP 是否命中受信语言头 CIDR。
+func IsTrustedLangHeaderRequest(r *http.Request, cidrs []*net.IPNet, trustedProxyCIDRs ...[]*net.IPNet) bool {
 	if r == nil || len(cidrs) == 0 {
 		return false
 	}
-	ip, ok := remoteAddrIP(r.RemoteAddr)
+	var proxyCIDRs []*net.IPNet
+	if len(trustedProxyCIDRs) > 0 {
+		proxyCIDRs = trustedProxyCIDRs[0]
+	}
+	ip, ok := trustedCallerIP(r, proxyCIDRs)
 	if !ok {
+		return false
+	}
+	for _, cidr := range cidrs {
+		if cidr != nil && cidr.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func trustedCallerIP(r *http.Request, trustedProxyCIDRs []*net.IPNet) (net.IP, bool) {
+	remoteIP, ok := remoteAddrIP(r.RemoteAddr)
+	if !ok {
+		return nil, false
+	}
+	if len(trustedProxyCIDRs) == 0 || !cidrListContains(trustedProxyCIDRs, remoteIP) {
+		return remoteIP, true
+	}
+
+	chain := forwardedForIPs(r.Header.Get("X-Forwarded-For"))
+	chain = append(chain, remoteIP)
+	for len(chain) > 1 && cidrListContains(trustedProxyCIDRs, chain[len(chain)-1]) {
+		chain = chain[:len(chain)-1]
+	}
+	if len(chain) == 0 {
+		return remoteIP, true
+	}
+	return chain[len(chain)-1], true
+}
+
+func forwardedForIPs(raw string) []net.IP {
+	parts := strings.Split(raw, ",")
+	out := make([]net.IP, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		ip := net.ParseIP(part)
+		if ip != nil {
+			out = append(out, ip)
+		}
+	}
+	return out
+}
+
+func cidrListContains(cidrs []*net.IPNet, ip net.IP) bool {
+	if ip == nil {
 		return false
 	}
 	for _, cidr := range cidrs {

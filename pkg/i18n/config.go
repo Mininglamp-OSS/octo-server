@@ -16,6 +16,10 @@ const (
 	// X-Octo-Lang for service-to-service calls.
 	EnvTrustedLangHeaderCIDRs = "OCTO_TRUSTED_LANG_HEADER_CIDRS"
 
+	// EnvTrustedProxyCIDRs controls which direct peer CIDRs are trusted
+	// reverse proxies for X-Forwarded-For peeling.
+	EnvTrustedProxyCIDRs = "OCTO_TRUSTED_PROXY_CIDRS"
+
 	// DefaultLanguage preserves the legacy deployment behavior for clients that
 	// do not send Accept-Language yet.
 	DefaultLanguage = "zh-CN"
@@ -33,6 +37,15 @@ func TrustedLangHeaderCIDRsFromEnv() ([]*net.IPNet, error) {
 	cidrs, err := ParseCIDRList(os.Getenv(EnvTrustedLangHeaderCIDRs))
 	if err != nil {
 		return nil, fmt.Errorf("parse %s: %w", EnvTrustedLangHeaderCIDRs, err)
+	}
+	return cidrs, nil
+}
+
+// TrustedProxyCIDRsFromEnv parses OCTO_TRUSTED_PROXY_CIDRS.
+func TrustedProxyCIDRsFromEnv() ([]*net.IPNet, error) {
+	cidrs, err := ParseCIDRList(os.Getenv(EnvTrustedProxyCIDRs))
+	if err != nil {
+		return nil, fmt.Errorf("parse %s: %w", EnvTrustedProxyCIDRs, err)
 	}
 	return cidrs, nil
 }

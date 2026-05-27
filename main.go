@@ -110,9 +110,14 @@ func runAPI(ctx *config.Context) {
 	if err != nil {
 		panic(err)
 	}
+	trustedProxyCIDRs, err := octoi18n.TrustedProxyCIDRsFromEnv()
+	if err != nil {
+		panic(err)
+	}
 	route.UseGin(octoi18n.EarlyMiddleware(octoi18n.MiddlewareOptions{
 		DefaultLanguage:        defaultLanguage,
 		TrustedLangHeaderCIDRs: trustedLangCIDRs,
+		TrustedProxyCIDRs:      trustedProxyCIDRs,
 	}))
 	route.UseGin(ctx.Tracer().GinMiddle()) // 需要放在 api.Route(s.GetRoute())的前面
 	// HTTP 入口指标(per-route latency / status / in-flight)。

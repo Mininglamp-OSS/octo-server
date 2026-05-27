@@ -94,7 +94,10 @@ Chinese error messages during the i18n rollout. Supported values are
 
 Trusted service-to-service language propagation is configured with
 `OCTO_TRUSTED_LANG_HEADER_CIDRS`, a comma-separated CIDR list of direct
-peer addresses allowed to supply `X-Octo-Lang`.
+peer addresses allowed to supply `X-Octo-Lang`. If OCTO runs behind
+trusted reverse proxies, also set `OCTO_TRUSTED_PROXY_CIDRS`; the server
+will peel `X-Forwarded-For` from right to left through those proxies
+before applying the trusted language CIDR check.
 
 ### Run
 

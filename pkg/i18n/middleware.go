@@ -10,6 +10,7 @@ import (
 type MiddlewareOptions struct {
 	DefaultLanguage        string
 	TrustedLangHeaderCIDRs []*net.IPNet
+	TrustedProxyCIDRs      []*net.IPNet
 }
 
 // EarlyMiddleware negotiates language before auth and stores the decision in
@@ -20,6 +21,7 @@ func EarlyMiddleware(opts MiddlewareOptions) gin.HandlerFunc {
 		decision := NegotiateLanguage(c.Request, LanguageNegotiationOptions{
 			DefaultLanguage:        opts.DefaultLanguage,
 			TrustedLangHeaderCIDRs: opts.TrustedLangHeaderCIDRs,
+			TrustedProxyCIDRs:      opts.TrustedProxyCIDRs,
 		})
 		c.Request = c.Request.WithContext(WithLanguage(c.Request.Context(), decision))
 		c.Writer.Header().Set("Content-Language", decision.Language)
