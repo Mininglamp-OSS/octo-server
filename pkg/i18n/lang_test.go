@@ -48,6 +48,58 @@ func TestNegotiateLanguageIgnoresUntrustedXOctoLang(t *testing.T) {
 	}
 }
 
+func TestNegotiateLanguageTrustsXOctoLangThroughTrustedProxy(t *testing.T) {
+	langCIDRs, err := ParseCIDRList("10.0.0.0/8")
+	if err != nil {
+		t.Fatalf("ParseCIDRList lang err = %v", err)
+	}
+	proxyCIDRs, err := ParseCIDRList("172.16.0.0/12")
+	if err != nil {
+		t.Fatalf("ParseCIDRList proxy err = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "172.16.1.10:4321"
+	req.Header.Set("X-Forwarded-For", "198.51.100.9, 10.1.2.3")
+	req.Header.Set(HeaderOctoLang, "zh-CN")
+	req.Header.Set("Accept-Language", "en-US")
+
+	got := NegotiateLanguage(req, LanguageNegotiationOptions{
+		DefaultLanguage:        "en-US",
+		TrustedLangHeaderCIDRs: langCIDRs,
+		TrustedProxyCIDRs:      proxyCIDRs,
+	})
+	if got.Language != "zh-CN" || got.Source != LanguageSourceTrustedHeader {
+		t.Fatalf("NegotiateLanguage = %#v, want trusted proxy zh-CN", got)
+	}
+}
+
+func TestNegotiateLanguageIgnoresSpoofedXFFBeforeUntrustedClient(t *testing.T) {
+	langCIDRs, err := ParseCIDRList("10.0.0.0/8")
+	if err != nil {
+		t.Fatalf("ParseCIDRList lang err = %v", err)
+	}
+	proxyCIDRs, err := ParseCIDRList("172.16.0.0/12")
+	if err != nil {
+		t.Fatalf("ParseCIDRList proxy err = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "172.16.1.10:4321"
+	req.Header.Set("X-Forwarded-For", "10.1.2.3, 198.51.100.9")
+	req.Header.Set(HeaderOctoLang, "zh-CN")
+	req.Header.Set("Accept-Language", "en-US")
+
+	got := NegotiateLanguage(req, LanguageNegotiationOptions{
+		DefaultLanguage:        "zh-CN",
+		TrustedLangHeaderCIDRs: langCIDRs,
+		TrustedProxyCIDRs:      proxyCIDRs,
+	})
+	if got.Language != "en-US" || got.Source != LanguageSourceAccept {
+		t.Fatalf("NegotiateLanguage = %#v, want Accept-Language en-US; spoofed XFF must not be trusted", got)
+	}
+}
+
 func TestNegotiateLanguageSourceOrder(t *testing.T) {
 	tests := []struct {
 		name   string
