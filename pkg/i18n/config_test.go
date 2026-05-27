@@ -1,6 +1,9 @@
 package i18n
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestResolveDefaultLanguage(t *testing.T) {
 	tests := []struct {
@@ -51,6 +54,43 @@ func TestDefaultLanguageFromEnv(t *testing.T) {
 	}
 	if got != "en-US" {
 		t.Fatalf("DefaultLanguageFromEnv = %q, want en-US", got)
+	}
+}
+
+func TestTrustedLangHeaderCIDRsFromEnvPrefersOctoName(t *testing.T) {
+	t.Setenv(EnvTrustedLangHeaderCIDRs, "10.0.0.0/8")
+
+	got, err := TrustedLangHeaderCIDRsFromEnv()
+	if err != nil {
+		t.Fatalf("TrustedLangHeaderCIDRsFromEnv returned error: %v", err)
+	}
+	if len(got) != 1 || got[0].String() != "10.0.0.0/8" {
+		t.Fatalf("TrustedLangHeaderCIDRsFromEnv = %v, want OCTO env CIDR", got)
+	}
+}
+
+func TestTrustedLangHeaderCIDRsFromEnvIgnoresLegacyName(t *testing.T) {
+	t.Setenv(EnvTrustedLangHeaderCIDRs, "")
+	t.Setenv("DM_TRUSTED_LANG_HEADER_CIDRS", "192.168.0.0/16")
+
+	got, err := TrustedLangHeaderCIDRsFromEnv()
+	if err != nil {
+		t.Fatalf("TrustedLangHeaderCIDRsFromEnv returned error: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("TrustedLangHeaderCIDRsFromEnv = %v, want empty list", got)
+	}
+}
+
+func TestTrustedLangHeaderCIDRsFromEnvReportsOctoName(t *testing.T) {
+	t.Setenv(EnvTrustedLangHeaderCIDRs, "not-cidr")
+
+	_, err := TrustedLangHeaderCIDRsFromEnv()
+	if err == nil {
+		t.Fatal("TrustedLangHeaderCIDRsFromEnv returned nil error")
+	}
+	if want := EnvTrustedLangHeaderCIDRs; !strings.Contains(err.Error(), want) {
+		t.Fatalf("error = %q, want env name %q", err.Error(), want)
 	}
 }
 
