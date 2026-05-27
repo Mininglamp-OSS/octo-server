@@ -36,7 +36,14 @@ func (a *VoiceAdapter) Route(r *wkhttp.WKHttp) {
 		auth.GET("/config", a.getConfig)
 		auth.GET("/context", a.getContext)
 		auth.GET("/document/asr_service_doc", a.getDocument)
+		auth.PUT("/local-config", a.putLocalConfig)
+		auth.GET("/local-config", a.getLocalConfig)
+		auth.DELETE("/local-config", a.deleteLocalConfig)
 	}
+}
+
+func getSpaceID(c *wkhttp.Context) string {
+	return c.GetHeader("X-Space-ID")
 }
 
 func (a *VoiceAdapter) transcribe(c *wkhttp.Context) {
@@ -64,7 +71,28 @@ func (a *VoiceAdapter) transcribe(c *wkhttp.Context) {
 }
 
 func (a *VoiceAdapter) getConfig(c *wkhttp.Context) {
-	resp, err := a.client.GetConfig(c.Request.Context())
+	loginUID := c.GetLoginUID()
+	spaceID := getSpaceID(c)
+	if spaceID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"status": http.StatusBadRequest, "msg": "X-Space-ID header is required"})
+		return
+	}
+
+	isMember, err := space.CheckMembership(a.ctx.DB(), spaceID, loginUID)
+	if err != nil {
+		a.Error("check space membership failed", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"status": http.StatusInternalServerError, "msg": "check space membership failed"})
+		return
+	}
+	if !isMember {
+		c.JSON(http.StatusForbidden, gin.H{"status": http.StatusForbidden, "msg": "not a member of this space"})
+		return
+	}
+
+	scopeType := "space"
+	scopeID := spaceID
+
+	resp, err := a.client.GetConfig(c.Request.Context(), loginUID, scopeType, scopeID)
 	if err != nil {
 		var svcErr *SpeechServiceError
 		if errors.As(err, &svcErr) && (svcErr.StatusCode == 401 || svcErr.StatusCode == 403) {
@@ -92,9 +120,9 @@ func (a *VoiceAdapter) getConfig(c *wkhttp.Context) {
 
 func (a *VoiceAdapter) getContext(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
-	spaceID := c.Query("space_id")
+	spaceID := getSpaceID(c)
 	if spaceID == "" {
-		c.ResponseErrorWithStatus(errors.New("space_id is required"), http.StatusBadRequest)
+		c.JSON(http.StatusBadRequest, gin.H{"status": http.StatusBadRequest, "msg": "X-Space-ID header is required"})
 		return
 	}
 
@@ -144,4 +172,129 @@ func (a *VoiceAdapter) getDocument(c *wkhttp.Context) {
 		"version":    "2.0",
 		"updated_at": "2026-05-25",
 	})
+}
+
+func (a *VoiceAdapter) putLocalConfig(c *wkhttp.Context) {
+	loginUID := c.GetLoginUID()
+
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64*1024)
+
+	var req struct {
+		Enabled       *bool   `json:"enabled"`
+		TimeoutMs     *int    `json:"timeout_ms"`
+		ProbeURL      *string `json:"probe_url"`
+		TranscribeURL *string `json:"transcribe_url"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"status": http.StatusRequestEntityTooLarge, "msg": "request body too large"})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"status": http.StatusBadRequest, "msg": "invalid request body"})
+		return
+	}
+
+	spaceID := getSpaceID(c)
+	if spaceID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"status": http.StatusBadRequest, "msg": "X-Space-ID header is required"})
+		return
+	}
+
+	if req.Enabled == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": http.StatusBadRequest, "msg": "enabled is required"})
+		return
+	}
+
+	isMember, err := space.CheckMembership(a.ctx.DB(), spaceID, loginUID)
+	if err != nil {
+		a.Error("check space membership failed", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"status": http.StatusInternalServerError, "msg": "check space membership failed"})
+		return
+	}
+	if !isMember {
+		c.JSON(http.StatusForbidden, gin.H{"status": http.StatusForbidden, "msg": "not a member of this space"})
+		return
+	}
+
+	err = a.client.PutLocalConfig(c.Request.Context(), loginUID, "space", spaceID, *req.Enabled, req.TimeoutMs, req.ProbeURL, req.TranscribeURL)
+	if err != nil {
+		var svcErr *SpeechServiceError
+		if errors.As(err, &svcErr) && svcErr.StatusCode >= 400 && svcErr.StatusCode < 500 {
+			c.JSON(svcErr.StatusCode, gin.H{"status": svcErr.StatusCode, "msg": svcErr.Body})
+			return
+		}
+		a.Error("put local config failed", zap.Error(err))
+		c.JSON(http.StatusBadGateway, gin.H{"status": http.StatusBadGateway, "msg": "speech service unavailable"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": http.StatusOK, "msg": "ok"})
+}
+
+func (a *VoiceAdapter) getLocalConfig(c *wkhttp.Context) {
+	loginUID := c.GetLoginUID()
+
+	spaceID := getSpaceID(c)
+	if spaceID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"status": http.StatusBadRequest, "msg": "X-Space-ID header is required"})
+		return
+	}
+
+	isMember, err := space.CheckMembership(a.ctx.DB(), spaceID, loginUID)
+	if err != nil {
+		a.Error("check space membership failed", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"status": http.StatusInternalServerError, "msg": "check space membership failed"})
+		return
+	}
+	if !isMember {
+		c.JSON(http.StatusForbidden, gin.H{"status": http.StatusForbidden, "msg": "not a member of this space"})
+		return
+	}
+
+	resp, err := a.client.GetLocalConfig(c.Request.Context(), loginUID, "space", spaceID)
+	if err != nil {
+		var svcErr *SpeechServiceError
+		if errors.As(err, &svcErr) && svcErr.StatusCode >= 400 && svcErr.StatusCode < 500 {
+			c.JSON(svcErr.StatusCode, gin.H{"status": svcErr.StatusCode, "msg": svcErr.Body})
+			return
+		}
+		a.Error("get local config failed", zap.Error(err))
+		c.JSON(http.StatusBadGateway, gin.H{"status": http.StatusBadGateway, "msg": "speech service unavailable"})
+		return
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+func (a *VoiceAdapter) deleteLocalConfig(c *wkhttp.Context) {
+	loginUID := c.GetLoginUID()
+
+	spaceID := getSpaceID(c)
+	if spaceID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"status": http.StatusBadRequest, "msg": "X-Space-ID header is required"})
+		return
+	}
+
+	isMember, err := space.CheckMembership(a.ctx.DB(), spaceID, loginUID)
+	if err != nil {
+		a.Error("check space membership failed", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"status": http.StatusInternalServerError, "msg": "check space membership failed"})
+		return
+	}
+	if !isMember {
+		c.JSON(http.StatusForbidden, gin.H{"status": http.StatusForbidden, "msg": "not a member of this space"})
+		return
+	}
+
+	err = a.client.DeleteLocalConfig(c.Request.Context(), loginUID, "space", spaceID)
+	if err != nil {
+		var svcErr *SpeechServiceError
+		if errors.As(err, &svcErr) && svcErr.StatusCode >= 400 && svcErr.StatusCode < 500 {
+			c.JSON(svcErr.StatusCode, gin.H{"status": svcErr.StatusCode, "msg": svcErr.Body})
+			return
+		}
+		a.Error("delete local config failed", zap.Error(err))
+		c.JSON(http.StatusBadGateway, gin.H{"status": http.StatusBadGateway, "msg": "speech service unavailable"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": http.StatusOK, "msg": "ok"})
 }
