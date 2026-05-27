@@ -1,6 +1,10 @@
 package i18n
 
-import "context"
+import (
+	"context"
+
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+)
 
 type languageContextKey struct{}
 
@@ -30,12 +34,31 @@ func WithLanguageIfHigherPriority(ctx context.Context, decision LanguageDecision
 }
 
 // LanguageFromContext 读取 context 中的语言协商结果。
+//
+// 除了 EarlyMiddleware 在 ctx 中写入的早期协商决策（trusted header / query /
+// cookie / Accept-Language / default），本函数还会顺带读取
+// wkhttp.UserFromCtx() 注入的 UserInfo.Language——它是 AuthMiddleware 经由
+// CacheTokenParser + UserLanguageResolver 解析出的"用户偏好真相源"。
+//
+// D9 两段式协商：EarlyMiddleware 不能在 Auth 前知道 user.language，所以这里把
+// "用户偏好覆盖" 做成读侧延迟合并。只有当 user.language 非空且来源优先级
+// （LanguageSourceUser=30）严格高于 ctx 中现有决策时（典型场景：现有为
+// LanguageSourceAccept=20 或 LanguageSourceDefault=10），才让用户偏好生效。
+// trusted header / query / cookie 这类显式选择仍然胜出（D6 优先级顺序）。
 func LanguageFromContext(ctx context.Context) (LanguageDecision, bool) {
 	if ctx == nil {
 		return LanguageDecision{}, false
 	}
 	decision, ok := ctx.Value(languageContextKey{}).(LanguageDecision)
-	if !ok || decision.Language == "" {
+	if ok && decision.Language == "" {
+		ok = false
+	}
+	if user, hasUser := wkhttp.UserFromCtx(ctx); hasUser && user.Language != "" {
+		if !ok || languageSourcePriority(LanguageSourceUser) > languageSourcePriority(decision.Source) {
+			return LanguageDecision{Language: user.Language, Source: LanguageSourceUser}, true
+		}
+	}
+	if !ok {
 		return LanguageDecision{}, false
 	}
 	return decision, true

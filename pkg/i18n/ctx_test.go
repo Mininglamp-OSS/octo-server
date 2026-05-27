@@ -3,6 +3,8 @@ package i18n
 import (
 	"context"
 	"testing"
+
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 )
 
 func TestContextLanguageRoundTrip(t *testing.T) {
@@ -60,6 +62,96 @@ func TestWithLanguageIfHigherPriority(t *testing.T) {
 	got, _ = LanguageFromContext(ctx)
 	if got.Language != "en-US" || got.Source != LanguageSourceCookie {
 		t.Fatalf("after lower-priority override = %#v", got)
+	}
+}
+
+// TestLanguageFromContextPromotesUserLanguage 验证 D9 两段式协商的读侧合并：
+// 当 ctx 中早期协商结果优先级低于 LanguageSourceUser 时，UserInfo.Language
+// 应在读取时被提升为最终决策。
+func TestLanguageFromContextPromotesUserLanguage(t *testing.T) {
+	cases := []struct {
+		name        string
+		existing    *LanguageDecision
+		userLang    string
+		wantLang    string
+		wantSource  LanguageSource
+		wantPresent bool
+	}{
+		{
+			name:        "promotes_over_accept",
+			existing:    &LanguageDecision{Language: "en-US", Source: LanguageSourceAccept},
+			userLang:    "zh-CN",
+			wantLang:    "zh-CN",
+			wantSource:  LanguageSourceUser,
+			wantPresent: true,
+		},
+		{
+			name:        "promotes_over_default",
+			existing:    &LanguageDecision{Language: "en-US", Source: LanguageSourceDefault},
+			userLang:    "zh-CN",
+			wantLang:    "zh-CN",
+			wantSource:  LanguageSourceUser,
+			wantPresent: true,
+		},
+		{
+			name:        "cookie_wins_over_user",
+			existing:    &LanguageDecision{Language: "en-US", Source: LanguageSourceCookie},
+			userLang:    "zh-CN",
+			wantLang:    "en-US",
+			wantSource:  LanguageSourceCookie,
+			wantPresent: true,
+		},
+		{
+			name:        "trusted_header_wins_over_user",
+			existing:    &LanguageDecision{Language: "en-US", Source: LanguageSourceTrustedHeader},
+			userLang:    "zh-CN",
+			wantLang:    "en-US",
+			wantSource:  LanguageSourceTrustedHeader,
+			wantPresent: true,
+		},
+		{
+			name:        "empty_user_language_no_promotion",
+			existing:    &LanguageDecision{Language: "en-US", Source: LanguageSourceAccept},
+			userLang:    "",
+			wantLang:    "en-US",
+			wantSource:  LanguageSourceAccept,
+			wantPresent: true,
+		},
+		{
+			name:        "no_existing_decision_user_promotes",
+			existing:    nil,
+			userLang:    "zh-CN",
+			wantLang:    "zh-CN",
+			wantSource:  LanguageSourceUser,
+			wantPresent: true,
+		},
+		{
+			name:        "no_existing_no_user",
+			existing:    nil,
+			userLang:    "",
+			wantPresent: false,
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			if tc.existing != nil {
+				ctx = WithLanguage(ctx, *tc.existing)
+			}
+			ctx = wkhttp.WithUser(ctx, wkhttp.UserInfo{UID: "u1", Language: tc.userLang})
+
+			got, ok := LanguageFromContext(ctx)
+			if ok != tc.wantPresent {
+				t.Fatalf("ok = %v, want %v", ok, tc.wantPresent)
+			}
+			if !tc.wantPresent {
+				return
+			}
+			if got.Language != tc.wantLang || got.Source != tc.wantSource {
+				t.Fatalf("got %+v, want lang=%q source=%q", got, tc.wantLang, tc.wantSource)
+			}
+		})
 	}
 }
 
