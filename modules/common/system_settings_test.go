@@ -223,6 +223,74 @@ func TestSystemSettings_LocalLoginOff_TrueWhenGiteeConfigured(t *testing.T) {
 	assert.True(t, s.LocalLoginOff(), "Gitee OAuth 配置齐备 → 守卫生效")
 }
 
+// SpaceDisableUserCreate 的 fallback 链：DB → env DM_SPACE_DISABLE_USER_CREATE → false。
+// 默认无 DB 行且无 env 时,返回 false（保持历史行为：用户侧可创建空间）。
+func TestSystemSettings_SpaceDisableUserCreate_DefaultsFalse(t *testing.T) {
+	s := newTestSystemSettings(t, nil)
+	t.Setenv("DM_SPACE_DISABLE_USER_CREATE", "")
+	assert.False(t, s.SpaceDisableUserCreate(),
+		"DB 未配置且 env 未设置时必须保持开放（false）")
+}
+
+// DB 值优先于 env：admin 在管理台显式关闭时,即便 env 未设置也立即生效。
+func TestSystemSettings_SpaceDisableUserCreate_DBTrueWins(t *testing.T) {
+	s := newTestSystemSettings(t, nil)
+	t.Setenv("DM_SPACE_DISABLE_USER_CREATE", "")
+	require.NoError(t, s.db.upsert("space", "disable_user_create", "1", settingTypeBool, ""))
+	require.NoError(t, s.Reload())
+	assert.True(t, s.SpaceDisableUserCreate(),
+		"DB=1 必须关闭用户侧创建入口")
+}
+
+// DB 行存在但值为 0 时必须明确返回 false,即使 env 设置为 true 也不再"漏出去"。
+// 这一条用例固化"DB 是单一真源"的语义：admin 在管理台 toggle 回 0 必须能压住
+// 历史 env 配置；否则运维改了配置却看不到效果。
+func TestSystemSettings_SpaceDisableUserCreate_DBFalseOverridesEnv(t *testing.T) {
+	s := newTestSystemSettings(t, nil)
+	t.Setenv("DM_SPACE_DISABLE_USER_CREATE", "true")
+	require.NoError(t, s.db.upsert("space", "disable_user_create", "0", settingTypeBool, ""))
+	require.NoError(t, s.Reload())
+	assert.False(t, s.SpaceDisableUserCreate(),
+		"DB=0 必须覆盖 env=true（DB 是单一真源）")
+}
+
+// DB 行存在但 value 为空字符串时, lookup 视为"未配置"(与其它所有设置一致),
+// 落回 env fallback —— 不是把 disable_user_create 强制 false。这条用例锁定
+// "DB row 空值 == 未配置" 的语义,与其他 bool 设置(register/login/support)
+// 共享同一回退规则,避免后续维护者误以为空值压制 env。
+func TestSystemSettings_SpaceDisableUserCreate_DBEmptyValueFallsBackToEnv(t *testing.T) {
+	s := newTestSystemSettings(t, nil)
+	t.Setenv("DM_SPACE_DISABLE_USER_CREATE", "true")
+	require.NoError(t, s.db.upsert("space", "disable_user_create", "", settingTypeBool, ""))
+	require.NoError(t, s.Reload())
+	assert.True(t, s.SpaceDisableUserCreate(),
+		"DB 值=\"\" 视为未配置, env=true 必须生效")
+}
+
+// 仅设置了 env 而无 DB 行时,getter 必须回退到 env 解析结果,保持对历史部署的
+// 兼容（envDisableUserCreateSpace 是这个开关的原始入口）。
+func TestSystemSettings_SpaceDisableUserCreate_EnvFallback(t *testing.T) {
+	s := newTestSystemSettings(t, nil)
+	for _, spelling := range []string{"1", "true", "TRUE", "yes", "on", " true "} {
+		t.Run(spelling, func(t *testing.T) {
+			t.Setenv("DM_SPACE_DISABLE_USER_CREATE", spelling)
+			assert.True(t, s.SpaceDisableUserCreate(),
+				"env=%q 必须被识别为开启", spelling)
+		})
+	}
+}
+
+func TestSystemSettings_SpaceDisableUserCreate_EnvNegativeSpellings(t *testing.T) {
+	s := newTestSystemSettings(t, nil)
+	for _, spelling := range []string{"0", "false", "FALSE", "no", "random"} {
+		t.Run(spelling, func(t *testing.T) {
+			t.Setenv("DM_SPACE_DISABLE_USER_CREATE", spelling)
+			assert.False(t, s.SpaceDisableUserCreate(),
+				"env=%q 不应被识别为开启", spelling)
+		})
+	}
+}
+
 func TestSystemSettings_StringFallsBackOnEmpty(t *testing.T) {
 	s := newTestSystemSettings(t, nil)
 	s.ctx.GetConfig().Support.EmailSmtp = "smtp.yaml.example:465"

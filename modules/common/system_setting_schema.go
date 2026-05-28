@@ -50,6 +50,12 @@ var systemSettingSchema = []settingDef{
 	{Category: "login", Key: "local_off", Type: settingTypeBool, Description: "是否关闭本地账号登录入口",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.LocalLoginOff()) }},
 
+	// Space user-facing creation toggle — admin 关闭后客户端隐藏创建入口,
+	// 后端 POST /v1/space/create 直接 403。env DM_SPACE_DISABLE_USER_CREATE
+	// 仍作 fallback,DB 行为单一真源。
+	{Category: "space", Key: "disable_user_create", Type: settingTypeBool, Description: "是否关闭普通用户创建空间入口",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.SpaceDisableUserCreate()) }},
+
 	// Email server config — formerly yaml-only (Support.* in config.go).
 	{Category: "support", Key: "email", Type: settingTypeString, Description: "技术支持邮箱（发件人）",
 		Effective: func(s *SystemSettings) string { return s.SupportEmail() }},

@@ -16,8 +16,10 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/server"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	modulescommon "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -1535,6 +1537,54 @@ func TestCreateSpace_AllowedByDefault(t *testing.T) {
 	assert.Equal(t, 2, mem.Role)
 }
 
+// system_setting 写入 space.disable_user_create=1 后, createSpace 必须返回 403,
+// 不依赖任何环境变量。这是「admin 在管理台实时关闭用户侧创建」核心路径的
+// 守卫用例 —— 离开 env 之后,DB 行 + Reload 立刻让本实例生效,多实例由 60s
+// 自动 reload 收敛(参见 SystemSettings.StartAutoReload)。
+func TestCreateSpace_DisabledBySystemSetting(t *testing.T) {
+	s, _, err := setup(t)
+	assert.NoError(t, err)
+	// 显式清空 env, 证明开关纯由 DB 驱动
+	t.Setenv(envDisableUserCreateSpace, "")
+
+	// 直接 DB 写入 + Reload, 模拟 manager API 的写路径但避开 admin token 与
+	// 路由准备 — 这条用例的关注点是 "DB → SystemSettings → createSpace 拒绝"
+	// 这条链路, 不是 manager API 本身(后者在 common 包已有单测覆盖)。
+	_, err = testCtx.DB().InsertInto("system_setting").
+		Pair("category", "space").
+		Pair("key_name", "disable_user_create").
+		Pair("value", "1").
+		Pair("value_type", "bool").
+		Pair("description", "").
+		Exec()
+	assert.NoError(t, err)
+	settings := modulescommon.EnsureSystemSettings(testCtx)
+	assert.NoError(t, settings.Reload())
+	defer func() {
+		_, _ = testCtx.DB().DeleteFrom("system_setting").
+			Where("category=? AND key_name=?", "space", "disable_user_create").
+			Exec()
+		_ = settings.Reload()
+	}()
+
+	body := util.ToJson(map[string]interface{}{
+		"name":      "p2-blocked-by-db",
+		"join_mode": 0,
+	})
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/space/create", bytes.NewReader([]byte(body)))
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusForbidden, w.Code, "DB 开关 ON 时应返回 403, body=%s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "已关闭")
+
+	var count int
+	_, err = testCtx.DB().SelectBySql("SELECT COUNT(*) FROM space WHERE name=?", "p2-blocked-by-db").Load(&count)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, count, "DB 开关 ON 时不应写入任何 space 记录")
+}
+
 func TestCreateSpace_DisabledByEnv(t *testing.T) {
 	s, _, err := setup(t)
 	assert.NoError(t, err)
@@ -1806,4 +1856,102 @@ func TestRejectJoinApply_DoesNotConsumeInvite(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, 2, updated.Status)
 	assert.Equal(t, testutil.UID, updated.ReviewerUID)
+}
+
+// TestE2E_DisableUserCreateSpace_FullChain 串起完整的 admin 实时调控链路:
+//
+//	manager POST /v1/manager/common/system_setting  (写 disable_user_create=1)
+//	    → 客户端 GET /v1/common/appconfig            (看到 disable_user_create_space=1)
+//	    → 用户 POST /v1/space/create                 (403)
+//	    → manager POST 写回 0
+//	    → 用户 POST /v1/space/create                 (200)
+//
+// 这条 e2e 守住 "DB 单一真源 + Reload 即时生效 + 前后端用同一 getter" 的整条链路,
+// 任一节点漂移(写路径未触发 Reload、appconfig 漏字段、createSpace 走老 env-only
+// 路径)都会让本用例失败。
+func TestE2E_DisableUserCreateSpace_FullChain(t *testing.T) {
+	srv, _, err := setup(t)
+	assert.NoError(t, err)
+	t.Setenv(envDisableUserCreateSpace, "")
+	t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
+
+	// CleanAllTables 清空了 app_config,/v1/common/appconfig 没拿到行会 400。
+	// 这里灌一行默认 app_config(其余 NOT NULL 列在 schema 里都有 DEFAULT),
+	// 让 appconfig handler 走到我们要验证的字段下发路径。
+	_, err = testCtx.DB().InsertInto("app_config").Pair("version", 1).Exec()
+	assert.NoError(t, err)
+
+	// 给 testutil.Token 升 super admin 角色,以便调用 manager 写接口。
+	// CleanAllTables 不会清缓存里的 token 行,但 setup 内已重置一次,这里覆盖
+	// 上层角色到 SuperAdmin。还原也走 cache.Set,无副作用。
+	cfg := testCtx.GetConfig()
+	tokenKey := cfg.Cache.TokenCachePrefix + testutil.Token
+	origTokenVal, _ := testCtx.Cache().Get(tokenKey)
+	assert.NoError(t, testCtx.Cache().Set(tokenKey,
+		testutil.UID+"@test@"+string(wkhttp.SuperAdmin)))
+	defer func() { _ = testCtx.Cache().Set(tokenKey, origTokenVal) }()
+
+	defer func() {
+		// 不论用例分支如何退出,把 system_setting 行清掉避免污染后续测试。
+		_, _ = testCtx.DB().DeleteFrom("system_setting").
+			Where("category=? AND key_name=?", "space", "disable_user_create").
+			Exec()
+		_ = modulescommon.EnsureSystemSettings(testCtx).Reload()
+	}()
+
+	writeSetting := func(value string) {
+		t.Helper()
+		body := util.ToJson(map[string]interface{}{
+			"items": []map[string]string{{
+				"category": "space",
+				"key":      "disable_user_create",
+				"value":    value,
+			}},
+		})
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST",
+			"/v1/manager/common/system_setting",
+			bytes.NewReader([]byte(body)))
+		req.Header.Set("token", testutil.Token)
+		srv.GetRoute().ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code,
+			"manager 写 disable_user_create=%s 应 200, body=%s", value, w.Body.String())
+	}
+
+	getAppconfig := func() string {
+		t.Helper()
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+		srv.GetRoute().ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code, "appconfig 应 200, body=%s", w.Body.String())
+		return w.Body.String()
+	}
+
+	createSpace := func(name string) int {
+		t.Helper()
+		body := util.ToJson(map[string]interface{}{
+			"name":      name,
+			"join_mode": 0,
+		})
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", "/v1/space/create",
+			bytes.NewReader([]byte(body)))
+		req.Header.Set("token", testutil.Token)
+		srv.GetRoute().ServeHTTP(w, req)
+		return w.Code
+	}
+
+	// --- Step 1: 关闭 ---
+	writeSetting("1")
+	assert.Contains(t, getAppconfig(), `"disable_user_create_space":1`,
+		"manager 写入后 appconfig 必须立刻下发 1")
+	assert.Equal(t, http.StatusForbidden, createSpace("e2e-off"),
+		"开关 ON 时 createSpace 必须 403")
+
+	// --- Step 2: 重新打开 ---
+	writeSetting("0")
+	assert.Contains(t, getAppconfig(), `"disable_user_create_space":0`,
+		"manager 写回 0 后 appconfig 必须立刻下发 0")
+	assert.Equal(t, http.StatusOK, createSpace("e2e-on"),
+		"开关 OFF 时 createSpace 必须 200")
 }

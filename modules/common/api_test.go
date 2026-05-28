@@ -119,6 +119,71 @@ func TestGetAppConfig_SystemBotUIDsOnVersionShortCircuit(t *testing.T) {
 	assert.Contains(t, body, `"fileHelper"`)
 }
 
+// appconfig 必须下发 disable_user_create_space：默认 0（缺 system_setting 行且
+// env 未设置）。客户端据此显示/隐藏「创建空间」入口；缺省必须保持开放。
+func TestGetAppConfig_DisableUserCreateSpace_DefaultsZero(t *testing.T) {
+	t.Setenv("DM_SPACE_DISABLE_USER_CREATE", "")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+	err = f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"disable_user_create_space":0`)
+}
+
+// DB 写入 disable_user_create=1 时 appconfig 必须下发 1，admin 在管理台切换
+// 后客户端下次拉配置即可看到入口隐藏 —— 系统级 KV + Reload 路径的实时性保证。
+func TestGetAppConfig_DisableUserCreateSpace_DBOverride(t *testing.T) {
+	t.Setenv("DM_SPACE_DISABLE_USER_CREATE", "")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+	err = f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+
+	settings := EnsureSystemSettings(ctx)
+	assert.NoError(t, settings.db.upsert("space", "disable_user_create", "1", settingTypeBool, ""))
+	assert.NoError(t, settings.Reload())
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"disable_user_create_space":1`)
+}
+
+// version 短路分支同样要下发 disable_user_create_space：老客户端命中版本
+// 短路也必须看到当前开关，否则被缓存住失去"实时调整"的能力（与 LocalLoginOff
+// 同样的"system_setting 与 app_config.version 解耦"约束）。
+func TestGetAppConfig_DisableUserCreateSpace_OnVersionShortCircuit(t *testing.T) {
+	t.Setenv("DM_SPACE_DISABLE_USER_CREATE", "")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+	err = f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+
+	settings := EnsureSystemSettings(ctx)
+	assert.NoError(t, settings.db.upsert("space", "disable_user_create", "1", settingTypeBool, ""))
+	assert.NoError(t, settings.Reload())
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig?version=99999999", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"disable_user_create_space":1`)
+}
+
 // appconfig 必须下发 local_login_off：默认 0（缺 system_setting 行）。
 func TestGetAppConfig_LocalLoginOff_DefaultsZero(t *testing.T) {
 	s, ctx := testutil.NewTestServer()

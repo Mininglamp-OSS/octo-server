@@ -6,6 +6,7 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -425,6 +426,54 @@ func (s *SystemSettings) LogLocalLoginOffSafetyOverrideIfActive(localOff bool) {
 // only external need is this one logging path.
 func (s *SystemSettings) RawLocalLoginOffFromSnapshot() bool {
 	return s.getBool("login", "local_off", false)
+}
+
+// envSpaceDisableUserCreate 与 modules/space/api.go:envDisableUserCreateSpace
+// 保持同名,镜像在 common 包以避免反向依赖 (space 已 import common)。新增/修改
+// env 解析规则时两处同步,语义就是: 1/true/yes/on (任意大小写,允许前后空格)
+// 视为 ON，其余皆 OFF。
+const envSpaceDisableUserCreate = "DM_SPACE_DISABLE_USER_CREATE"
+
+// SpaceDisableUserCreate reports whether the user-facing「创建空间」入口应被
+// 关闭。完整 fallback 链(按优先级):
+//
+//	1. system_setting space.disable_user_create 行的 DB 值(走 getBool 同款解析)
+//	2. 空 DB 行 / DB row 不存在 / DB 写入未知字面量 → env DM_SPACE_DISABLE_USER_CREATE
+//	3. 都缺失 → false (保持开放)
+//
+// DB 是单一真源：admin 在管理台显式 toggle 立刻生效（Reload 内存快照），
+// 多实例 60s 内收敛。env 仅作历史部署兼容入口；新部署应直接走 system_setting。
+//
+// 与 modules/space/api.go:IsUserCreateDisabled 保持等价语义 —— 后者仍是
+// env-only 的低层解析器,留给没有 ctx 的调用方与 yaml 模式;实际请求路径走本
+// 方法（modules/space/api.go:createSpace）。
+//
+// 实现细节：DB 路径委托给 getBool 以与其他 bool 设置共享解析规则,避免双写
+// 字面量集合(reviewer H1)。"DB 行是否存在"由独立 lookup 决定,从而区分
+// "DB 缺行 → env" 与 "DB 值=0 → 强制 false 压制 env" 两个语义。
+func (s *SystemSettings) SpaceDisableUserCreate() bool {
+	if _, ok := s.lookup("space", "disable_user_create"); ok {
+		// 走与所有其他 bool 设置一致的字面量解析;未知字面量会落到 fallback=false,
+		// 与 "DB 显式写了 0" 语义一致 —— 都视为 admin 不希望关闭。
+		return s.getBool("space", "disable_user_create", false)
+	}
+	return parseSpaceDisableUserCreateEnv(os.Getenv(envSpaceDisableUserCreate))
+}
+
+// parseSpaceDisableUserCreateEnv 与 modules/space/api.go:IsUserCreateDisabled
+// 的解析逻辑保持一致(1/true/yes/on,大小写不敏感,允许前后空格)。两处镜像而
+// 非提到 leaf package,理由同 LocalLoginOff/OIDC: 一个 helper 不值得为它引
+// 入一层新包。修改任何一处时两边同步,否则同一开关在两个出口语义会漂移。
+func parseSpaceDisableUserCreateEnv(v string) bool {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return false
+	}
+	switch strings.ToLower(v) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 // SupportEmail returns the From address used by the SMTP sender.

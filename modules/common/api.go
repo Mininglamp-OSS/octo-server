@@ -395,9 +395,10 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 	}
 	if versionI64 != 0 && int(versionI64) >= appConfigM.Version {
 		c.JSON(http.StatusOK, &appConfigResp{
-			Version:       appConfigM.Version,
-			SystemBotUIDs: spacepkg.SystemBotList(),
-			LocalLoginOff: boolToFlag(cn.systemSettings.LocalLoginOff()),
+			Version:                appConfigM.Version,
+			SystemBotUIDs:          spacepkg.SystemBotList(),
+			LocalLoginOff:          boolToFlag(cn.systemSettings.LocalLoginOff()),
+			DisableUserCreateSpace: boolToFlag(cn.systemSettings.SpaceDisableUserCreate()),
 		})
 		return
 	}
@@ -433,8 +434,9 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 		OIDCResetPasswordURL:           oidcResetPasswordURL(),
 		OIDCProviders:                  oidcProviders(),
 		// YUJ-219-A / GH#1283：单一真源下发系统 Bot UID 列表，替代三端硬编码。
-		SystemBotUIDs: spacepkg.SystemBotList(),
-		LocalLoginOff: boolToFlag(cn.systemSettings.LocalLoginOff()),
+		SystemBotUIDs:          spacepkg.SystemBotList(),
+		LocalLoginOff:          boolToFlag(cn.systemSettings.LocalLoginOff()),
+		DisableUserCreateSpace: boolToFlag(cn.systemSettings.SpaceDisableUserCreate()),
 	})
 }
 
@@ -735,6 +737,16 @@ type appConfigResp struct {
 	// 与 app_config.version 解耦：即使客户端命中 version 短路分支，也必须能拿到
 	// 最新值，否则 admin 切换开关后老客户端会被本地缓存住。和 SystemBotUIDs 同理。
 	LocalLoginOff int `json:"local_login_off"`
+
+	// DisableUserCreateSpace 控制客户端是否隐藏「创建空间」入口。
+	// 来源 system_setting space.disable_user_create,回退到 env
+	// DM_SPACE_DISABLE_USER_CREATE,默认 0(允许创建)。
+	//
+	// 与 app_config.version 解耦的原因同 LocalLoginOff：admin 在管理台 toggle
+	// 后老客户端命中 version 短路分支仍必须看到最新值，否则被本地缓存住失去
+	// 实时性。后端 POST /v1/space/create 也走同一个 getter 校验,客户端隐藏
+	// 与服务端拒绝由单一真源驱动,不存在前后端漂移。
+	DisableUserCreateSpace int `json:"disable_user_create_space"`
 }
 
 type oidcProviderResp struct {

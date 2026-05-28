@@ -19,6 +19,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkevent"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	commonmod "github.com/Mininglamp-OSS/octo-server/modules/common"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	rd "github.com/go-redis/redis"
@@ -121,11 +122,22 @@ func (s *Space) Route(r *wkhttp.WKHttp) {
 	}
 }
 
-// envDisableUserCreateSpace 全局开关：运维通过环境变量 DM_SPACE_DISABLE_USER_CREATE=true
-// 关闭用户侧创建空间入口（POST /v1/space/create）。管理端代建接口不受此开关约束。
+// envDisableUserCreateSpace 全局开关的历史 env 入口：运维通过环境变量
+// DM_SPACE_DISABLE_USER_CREATE=true 关闭用户侧创建空间入口
+// （POST /v1/space/create）。管理端代建接口不受此开关约束。
+//
+// 单一真源已迁移到 system_setting 表的 (space, disable_user_create) 行；
+// 本 env 仍作 fallback 供没有 DB override 的老部署使用,但 admin 在管理台写入
+// DB 后,DB 值优先。详见 modules/common/system_settings.go:SpaceDisableUserCreate。
 const envDisableUserCreateSpace = "DM_SPACE_DISABLE_USER_CREATE"
 
-// IsUserCreateDisabled 是否已通过环境变量关闭用户侧创建空间。
+// IsUserCreateDisabled 是否已通过环境变量关闭用户侧创建空间。env-only 的低层
+// 解析器,语义与 modules/common/system_settings.go:parseSpaceDisableUserCreateEnv
+// 保持一致 —— 后者是 system_setting 查询的 env fallback。修改此函数的解析
+// 规则时必须同步那一处,否则同一开关会在两个出口产生漂移。
+//
+// 调用方应优先走 (*Space).isUserCreateDisabled 以获得 DB → env 完整链路；本
+// 函数保留是为了向前兼容已有 callers / 测试,以及作为最简 env-only 探测点。
 func IsUserCreateDisabled() bool {
 	v := strings.TrimSpace(os.Getenv(envDisableUserCreateSpace))
 	if v == "" {
@@ -136,6 +148,13 @@ func IsUserCreateDisabled() bool {
 		return true
 	}
 	return false
+}
+
+// isUserCreateDisabled 走 system_setting DB → env 完整 fallback 链, 是
+// createSpace handler 的判断入口。SystemSettings snapshot 由 ticker 自动刷新,
+// admin 写 DB → Reload 后 60s 内多实例收敛, 本实例立即生效。
+func (s *Space) isUserCreateDisabled() bool {
+	return commonmod.EnsureSystemSettings(s.ctx).SpaceDisableUserCreate()
 }
 
 // createSpaceParams 创建空间的核心参数。Creator 为目标空间 owner，
@@ -158,7 +177,7 @@ type createSpaceResult struct {
 
 // createSpace 创建空间（用户侧入口）
 func (s *Space) createSpace(c *wkhttp.Context) {
-	if IsUserCreateDisabled() {
+	if s.isUserCreateDisabled() {
 		c.ResponseErrorWithStatus(errors.New("管理员已关闭空间创建功能"), http.StatusForbidden)
 		return
 	}
