@@ -437,9 +437,15 @@ const envSpaceDisableUserCreate = "DM_SPACE_DISABLE_USER_CREATE"
 // SpaceDisableUserCreate reports whether the user-facing「创建空间」入口应被
 // 关闭。完整 fallback 链(按优先级):
 //
-//	1. system_setting space.disable_user_create 行的 DB 值(走 getBool 同款解析)
-//	2. 空 DB 行 / DB row 不存在 / DB 写入未知字面量 → env DM_SPACE_DISABLE_USER_CREATE
+//	1. DB 行存在且 value 非空 → 走 getBool 解析(1/true/TRUE → true;
+//	   0/false/FALSE → false; 未知字面量 → false)。**不再回退到 env** —— 与
+//	   其他 bool 设置一致,未知字面量等同 "admin 不希望关闭"。
+//	2. DB 行不存在,或 value="" → env DM_SPACE_DISABLE_USER_CREATE
 //	3. 都缺失 → false (保持开放)
+//
+// 注：manager 写接口对 bool 值已做规范化(只接受 0/1/true/false 及大小写
+// 变体),正常路径不会出现未知字面量;此规则覆盖的是有人绕过 API 直接改 DB
+// 的边缘场景。
 //
 // DB 是单一真源：admin 在管理台显式 toggle 立刻生效（Reload 内存快照），
 // 多实例 60s 内收敛。env 仅作历史部署兼容入口；新部署应直接走 system_setting。
