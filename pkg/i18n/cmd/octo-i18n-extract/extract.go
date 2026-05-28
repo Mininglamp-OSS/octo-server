@@ -98,6 +98,11 @@ func extractFromFile(fset *token.FileSet, file *ast.File) ([]Marker, error) {
 		ferr error
 	)
 	ast.Inspect(file, func(n ast.Node) bool {
+		// Once ferr is set we stop creating new state, but ast.Inspect's
+		// `return false` only skips the current subtree — siblings still
+		// trigger the visitor, which re-checks ferr and short-circuits. Net
+		// effect: first error wins, no further work happens, traversal walks
+		// the rest of the file harmlessly. Acceptable for tool-binary use.
 		if ferr != nil {
 			return false
 		}
@@ -117,10 +122,15 @@ func extractFromFile(fset *token.FileSet, file *ast.File) ([]Marker, error) {
 			ferr = fmt.Errorf("%s: %w", fset.Position(call.Pos()), err)
 			return false
 		}
+		// Missing ID or DefaultMessage is a hard error, not a silent skip.
+		// Register() also panics at runtime, but relying on that means a
+		// typo'd Code literal disappears from the marker set and surfaces
+		// only as a recall-check mismatch in main.go with no source
+		// position. Failing here matches the rest of this file's strictness
+		// rationale and gives reviewers an actionable file:line.
 		if id == "" || msg == "" {
-			// Either field omitted — Register() itself panics at runtime, but
-			// during static extraction we silently skip rather than guess.
-			return true
+			ferr = fmt.Errorf("%s: Code literal is missing ID or DefaultMessage; both are required for a marker", fset.Position(call.Pos()))
+			return false
 		}
 		out = append(out, Marker{
 			ID:             id,
@@ -207,10 +217,4 @@ func checkDuplicates(ms []Marker) error {
 		seen[m.ID] = m.Pos
 	}
 	return nil
-}
-
-// writeTestFile is the single io.WriteFile call the test helper depends on;
-// kept here (not in *_test.go) so the helper file stays free of os imports.
-func writeTestFile(path string, data []byte) error {
-	return os.WriteFile(path, data, 0o644)
 }

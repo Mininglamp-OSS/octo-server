@@ -18,6 +18,13 @@ import (
 // The mapping is closed: unknown prefixes are a hard error. That guarantees
 // that introducing a third namespace forces an explicit routing decision
 // (and a Code.ID regex update in pkg/i18n/codes/registry.go).
+//
+// NOTE: `msg.` is a Phase 2 placeholder. pkg/i18n/codes/registry.go's
+// idPattern currently restricts IDs to `err.(shared|server).*`, so any
+// attempt to Register a `msg.*` Code panics at startup and never reaches
+// extraction. The routing entry is intentionally pre-wired so that when
+// Phase 2 widens the registry regex, this table doesn't need a parallel
+// edit. Any future maintainer touching one side must update both.
 var prefixGroup = map[string]string{
 	"err.shared.": "shared",
 	"err.server.": "server",

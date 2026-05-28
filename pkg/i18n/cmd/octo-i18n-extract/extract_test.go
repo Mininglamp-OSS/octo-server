@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"sort"
 	"testing"
@@ -13,7 +14,7 @@ import (
 func writeFile(t *testing.T, dir, name, body string) string {
 	t.Helper()
 	p := filepath.Join(dir, name)
-	if err := writeTestFile(p, []byte(body)); err != nil {
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
 		t.Fatalf("write %s: %v", p, err)
 	}
 	return p
@@ -144,5 +145,79 @@ func _() {
 	}
 	if len(got) != 0 {
 		t.Fatalf("expected test file to be skipped, got %v", got)
+	}
+}
+
+// TestExtractFromDir_RejectsEmptyFields locks the strict-fail upgrade: a
+// Code literal missing ID or DefaultMessage is a typo, not a deliberate
+// skip signal, and must surface with a file:line position rather than
+// silently disappearing into a recall-check mismatch later.
+func TestExtractFromDir_RejectsEmptyFields(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+	}{
+		{
+			name: "empty_id",
+			src: `package fake
+func _() {
+	Register(Code{ID: "", DefaultMessage: "x"})
+}`,
+		},
+		{
+			name: "empty_default_message",
+			src: `package fake
+func _() {
+	Register(Code{ID: "err.shared.x", DefaultMessage: ""})
+}`,
+		},
+		{
+			name: "id_only",
+			src: `package fake
+func _() {
+	Register(Code{ID: "err.shared.x"})
+}`,
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeFile(t, dir, "bad.go", tc.src)
+			_, err := ExtractFromDir(dir)
+			if err == nil {
+				t.Fatal("expected strict-fail on empty field, got nil")
+			}
+		})
+	}
+}
+
+// TestExtractFromDir_SkipsHiddenAndUnderscoreDirs codifies the convention
+// that test fixtures dropped under `.hidden/` or `_fixtures/` are off-limits
+// to extraction (matching `go build`'s dir-skip behavior). Without this
+// fixture the convention is only described in a comment and could regress.
+func TestExtractFromDir_SkipsHiddenAndUnderscoreDirs(t *testing.T) {
+	dir := t.TempDir()
+	// Real source under root — should be extracted.
+	writeFile(t, dir, "real.go", `package fake
+func _() {
+	Register(Code{ID: "err.shared.real", DefaultMessage: "R"})
+}`)
+	for _, sub := range []string{"_fixtures", ".hidden"} {
+		subDir := filepath.Join(dir, sub)
+		if err := os.MkdirAll(subDir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", subDir, err)
+		}
+		writeFile(t, subDir, "leak.go", `package fake
+func _() {
+	Register(Code{ID: "err.shared.LEAK_`+sub+`", DefaultMessage: "leak"})
+}`)
+	}
+	got, err := ExtractFromDir(dir)
+	if err != nil {
+		t.Fatalf("ExtractFromDir: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "err.shared.real" {
+		t.Fatalf("expected only real.go to extract, got %v", got)
 	}
 }

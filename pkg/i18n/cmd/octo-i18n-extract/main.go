@@ -69,7 +69,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "extract: %v\n", err)
 		os.Exit(exitExtractError)
 	}
-	if err := verifyRecall(markers); err != nil {
+	registered := make([]string, 0, len(codes.All()))
+	for _, c := range codes.All() {
+		registered = append(registered, c.ID)
+	}
+	if err := verifyRecall(markers, registered); err != nil {
 		fmt.Fprintf(os.Stderr, "recall: %v\n", err)
 		os.Exit(exitRecallMismatch)
 	}
@@ -80,13 +84,18 @@ func main() {
 		os.Exit(exitExtractError)
 	}
 
+	// Iterate in a fixed order so log output (and `-check` diff hints) is
+	// deterministic across runs — Go map iteration would otherwise swap the
+	// "wrote/unchanged ... → ..." lines, hurting log diffing.
+	targetOrder := []string{"shared", "server"}
 	targets := map[string]string{
 		"shared": joinPath(sharedDir, "active.en-US.toml"),
 		"server": joinPath(serverDir, "active.en-US.toml"),
 	}
 
 	exit := exitOK
-	for group, path := range targets {
+	for _, group := range targetOrder {
+		path := targets[group]
 		ms := groups[group]
 		if check {
 			diff, err := checkOnDisk(path, ms)
@@ -141,14 +150,19 @@ func collectMarkers(roots []string) ([]Marker, error) {
 // verifyRecall is the 100% guarantee: the AST-extracted set must match the
 // runtime-registered set exactly. Diffs surface as a sorted list of missing
 // and extra IDs to make CI failures actionable.
-func verifyRecall(markers []Marker) error {
+//
+// `registered` is passed in as a slice (rather than calling codes.All()
+// directly) so this function is unit-testable with synthetic inputs — the
+// recall guarantee is the load-bearing safety property of this binary and
+// deserves direct coverage independent of the live registry's state.
+func verifyRecall(markers []Marker, registered []string) error {
 	astIDs := make(map[string]struct{}, len(markers))
 	for _, m := range markers {
 		astIDs[m.ID] = struct{}{}
 	}
-	regIDs := make(map[string]struct{})
-	for _, c := range codes.All() {
-		regIDs[c.ID] = struct{}{}
+	regIDs := make(map[string]struct{}, len(registered))
+	for _, id := range registered {
+		regIDs[id] = struct{}{}
 	}
 
 	var missing, extra []string
