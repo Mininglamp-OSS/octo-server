@@ -28,11 +28,16 @@ func respondUserRequestInvalid(c *wkhttp.Context, field string) {
 }
 
 // respondUserUpdateNotAllowed tags the field the caller tried to mutate
-// (mirrors the legacy "不允许更新【x】" message). field MUST be non-empty;
-// pass the JSON / form key, not a user-facing label, so clients can
-// programmatically highlight the input.
+// (mirrors the legacy "不允许更新【x】" / "不允许编辑！" messages). An empty
+// field is omitted from details — the legacy "不允许编辑！" branch has no
+// field context to surface — matching the convention of
+// respondUserRequestInvalid so clients never see structured empty keys.
 func respondUserUpdateNotAllowed(c *wkhttp.Context, field string) {
-	httperr.ResponseErrorL(c, errcode.ErrUserUpdateNotAllowed, nil, i18n.Details{"field": field})
+	details := i18n.Details{}
+	if field != "" {
+		details["field"] = field
+	}
+	httperr.ResponseErrorL(c, errcode.ErrUserUpdateNotAllowed, nil, details)
 }
 
 // respondUserAuthInfoInvalid surfaces which field of the scanned QR-code

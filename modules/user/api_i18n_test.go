@@ -153,6 +153,15 @@ func TestRespondUserHelpers(t *testing.T) {
 			wantDetails:     map[string]any{"field": "short_no"},
 		},
 		{
+			name:            "respondUserUpdateNotAllowed drops empty field key",
+			probe:           func(c *wkhttp.Context) { respondUserUpdateNotAllowed(c, "") },
+			wantCodeID:      "err.server.user.update_not_allowed",
+			wantSemStatus:   http.StatusForbidden,
+			wantTransStatus: http.StatusBadRequest,
+			wantContains:    "不允许修改",
+			wantDetails:     map[string]any{},
+		},
+		{
 			name:            "respondUserAuthInfoInvalid carries missing_field",
 			probe:           func(c *wkhttp.Context) { respondUserAuthInfoInvalid(c, "type") },
 			wantCodeID:      "err.server.user.auth_info_invalid",

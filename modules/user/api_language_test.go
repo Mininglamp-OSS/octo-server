@@ -204,6 +204,10 @@ func TestSetLanguageHandler_Unauthorized(t *testing.T) {
 	u := &User{Log: log.NewTLog("user-test")}
 	u.languageService = NewLanguageService(db, newFakeLangCache())
 	r := wkhttp.New()
+	// Wire the i18n renderer so the unauthorized path exercises the same
+	// envelope production hits — every other handler test in this file goes
+	// through newLanguageHandlerHarness which already wires it.
+	r.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
 	// No ctx.Set("uid", …) — simulates a request that somehow reached the
 	// handler without AuthMiddleware. The handler's own uid guard must
 	// reject it; SetLanguage must not even be called.
