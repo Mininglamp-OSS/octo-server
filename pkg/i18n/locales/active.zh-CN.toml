@@ -92,3 +92,131 @@ other = "子区设置无效。"
 
 ["err.server.thread.store_failed"]
 other = "子区存储操作失败。"
+
+# ---- err.server.user.* (Phase 2.1 modules/user/api.go migration) ----
+
+["err.server.user.request_invalid"]
+other = "请求数据格式有误。"
+
+["err.server.user.lock_minute_out_of_range"]
+other = "锁屏时长必须在 0 到 60 分钟之间。"
+
+["err.server.user.short_no_format_invalid"]
+other = "短号必须以字母开头，长度 6-20 位，仅支持字母、数字、下划线或减号。"
+
+["err.server.user.language_unsupported"]
+other = "不支持的语言。"
+
+["err.server.user.token_required"]
+other = "Token 不能为空。"
+
+["err.server.user.invalid_credentials"]
+other = "用户名或密码错误。"
+
+["err.server.user.code_invalid"]
+other = "验证码错误。"
+
+["err.server.user.account_banned"]
+other = "此账号已被封禁。"
+
+["err.server.user.login_device_expired"]
+other = "登录设备已过期，请重新登录。"
+
+["err.server.user.not_found"]
+other = "用户不存在。"
+
+["err.server.user.current_not_found"]
+other = "当前登录用户不存在。"
+
+["err.server.user.already_exists"]
+other = "该用户已存在。"
+
+["err.server.user.registration_closed"]
+other = "注册通道暂未开放。"
+
+["err.server.user.local_login_disabled"]
+other = "本地登录已关闭。"
+
+["err.server.user.phone_region_unsupported"]
+other = "仅支持中国大陆手机号。"
+
+["err.server.user.invite_code_not_found"]
+other = "邀请码不存在。"
+
+["err.server.user.account_destroyed"]
+other = "该账号已注销。"
+
+["err.server.user.account_destroying"]
+other = "账号正处于注销冷静期，请使用新版客户端撤销或查询状态。"
+
+["err.server.user.update_not_allowed"]
+other = "该字段不允许修改。"
+
+["err.server.user.short_no_already_changed"]
+other = "短号仅可修改一次。"
+
+["err.server.user.demo_lock_unsupported"]
+other = "演示账号不支持开启设备锁。"
+
+["err.server.user.auth_code_not_found"]
+other = "授权码无效或已过期。"
+
+["err.server.user.auth_code_wrong_type"]
+other = "授权码类型不是登录授权码。"
+
+["err.server.user.auth_info_invalid"]
+other = "授权信息格式错误。"
+
+["err.server.user.auth_scanner_mismatch"]
+other = "扫描者与授权者不是同一用户。"
+
+["err.server.user.qr_ver_code_missing"]
+other = "用户没有 QR 验证码。"
+
+["err.server.user.wechat_exchange_failed"]
+other = "获取微信 access_token 失败。"
+
+["err.server.user.wechat_profile_failed"]
+other = "获取微信用户资料失败。"
+
+["err.server.user.wechat_response_invalid"]
+other = "微信返回数据格式错误。"
+
+["err.server.user.chat_pwd_update_failed"]
+other = "修改聊天密码失败。"
+
+["err.server.user.login_pwd_update_failed"]
+other = "修改登录密码失败。"
+
+["err.server.user.lock_screen_pwd_update_failed"]
+other = "修改锁屏密码失败。"
+
+["err.server.user.password_process_failed"]
+other = "密码处理失败。"
+
+["err.server.user.query_failed"]
+other = "查询用户数据失败。"
+
+["err.server.user.store_failed"]
+other = "存储用户数据失败。"
+
+["err.server.user.im_call_failed"]
+other = "调用 IM 服务失败。"
+
+["err.server.user.decode_failed"]
+other = "解码内部数据失败。"
+
+["err.server.user.file_operation_failed"]
+other = "文件处理失败。"
+
+["err.server.user.sms_send_failed"]
+other = "短信发送失败。"
+
+["err.server.user.destroy_failed"]
+other = "注销账号失败。"
+
+["err.server.user.register_failed"]
+other = "注册失败。"
+
+["err.server.user.language_set_failed"]
+other = "设置语言偏好失败。"

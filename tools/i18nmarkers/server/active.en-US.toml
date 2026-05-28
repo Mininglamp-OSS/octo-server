@@ -59,3 +59,129 @@ other = "Invalid thread status."
 
 ["err.server.thread.store_failed"]
 other = "Thread storage operation failed."
+
+["err.server.user.account_banned"]
+other = "This account has been banned."
+
+["err.server.user.account_destroyed"]
+other = "This account has been deactivated."
+
+["err.server.user.account_destroying"]
+other = "Account is in the deactivation cooldown period, please use a newer client to revoke or check status."
+
+["err.server.user.already_exists"]
+other = "User already exists."
+
+["err.server.user.auth_code_not_found"]
+other = "Authorization code is invalid or has expired."
+
+["err.server.user.auth_code_wrong_type"]
+other = "Authorization code is not a login code."
+
+["err.server.user.auth_info_invalid"]
+other = "Authorization payload is invalid."
+
+["err.server.user.auth_scanner_mismatch"]
+other = "Scanner and authorizer are not the same user."
+
+["err.server.user.chat_pwd_update_failed"]
+other = "Failed to update chat password."
+
+["err.server.user.code_invalid"]
+other = "Invalid verification code."
+
+["err.server.user.current_not_found"]
+other = "Current user not found."
+
+["err.server.user.decode_failed"]
+other = "Failed to decode internal payload."
+
+["err.server.user.demo_lock_unsupported"]
+other = "Demo accounts cannot enable device lock."
+
+["err.server.user.destroy_failed"]
+other = "Failed to deactivate account."
+
+["err.server.user.file_operation_failed"]
+other = "Failed to process file."
+
+["err.server.user.im_call_failed"]
+other = "Failed to call IM service."
+
+["err.server.user.invalid_credentials"]
+other = "Invalid username or password."
+
+["err.server.user.invite_code_not_found"]
+other = "Invite code does not exist."
+
+["err.server.user.language_set_failed"]
+other = "Failed to set language preference."
+
+["err.server.user.language_unsupported"]
+other = "Unsupported language."
+
+["err.server.user.local_login_disabled"]
+other = "Local login is disabled."
+
+["err.server.user.lock_minute_out_of_range"]
+other = "Lock screen delay must be between 0 and 60 minutes."
+
+["err.server.user.lock_screen_pwd_update_failed"]
+other = "Failed to update lock-screen password."
+
+["err.server.user.login_device_expired"]
+other = "Login device session expired, please sign in again."
+
+["err.server.user.login_pwd_update_failed"]
+other = "Failed to update login password."
+
+["err.server.user.not_found"]
+other = "User not found."
+
+["err.server.user.password_process_failed"]
+other = "Failed to process password."
+
+["err.server.user.phone_region_unsupported"]
+other = "Only mainland China phone numbers are supported."
+
+["err.server.user.qr_ver_code_missing"]
+other = "User has no QR verification code."
+
+["err.server.user.query_failed"]
+other = "Failed to query user data."
+
+["err.server.user.register_failed"]
+other = "Failed to register user."
+
+["err.server.user.registration_closed"]
+other = "Registration is currently closed."
+
+["err.server.user.request_invalid"]
+other = "Invalid request."
+
+["err.server.user.short_no_already_changed"]
+other = "Short ID can only be changed once."
+
+["err.server.user.short_no_format_invalid"]
+other = "Short ID must start with a letter and contain 6-20 letters, digits, underscores or hyphens."
+
+["err.server.user.sms_send_failed"]
+other = "Failed to send SMS."
+
+["err.server.user.store_failed"]
+other = "Failed to persist user data."
+
+["err.server.user.token_required"]
+other = "Token is required."
+
+["err.server.user.update_not_allowed"]
+other = "This field cannot be updated."
+
+["err.server.user.wechat_exchange_failed"]
+other = "Failed to exchange WeChat access token."
+
+["err.server.user.wechat_profile_failed"]
+other = "Failed to fetch WeChat user profile."
+
+["err.server.user.wechat_response_invalid"]
+other = "WeChat response is malformed."
