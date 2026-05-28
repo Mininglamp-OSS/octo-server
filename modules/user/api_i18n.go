@@ -1,0 +1,77 @@
+package user
+
+import (
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n/codes"
+)
+
+// respondUserError is the base wrapper for legacy c.ResponseError sites that
+// migrate to a localized error envelope. For codes that carry detail fields
+// (field / missing_field / lock bounds), call the more specific helpers
+// below instead so the SafeDetailKeys contract stays in one place.
+func respondUserError(c *wkhttp.Context, code codes.Code) {
+	httperr.ResponseErrorL(c, code, nil, nil)
+}
+
+// respondUserRequestInvalid covers the common "X 不能为空" / "数据格式有误"
+// shape — one code, one optional field detail. An empty field is omitted
+// so the renderer does not surface a noisy empty key to clients.
+func respondUserRequestInvalid(c *wkhttp.Context, field string) {
+	details := i18n.Details{}
+	if field != "" {
+		details["field"] = field
+	}
+	httperr.ResponseErrorL(c, errcode.ErrUserRequestInvalid, nil, details)
+}
+
+// respondUserUpdateNotAllowed tags the field the caller tried to mutate
+// (mirrors the legacy "不允许更新【x】" message). field MUST be non-empty;
+// pass the JSON / form key, not a user-facing label, so clients can
+// programmatically highlight the input.
+func respondUserUpdateNotAllowed(c *wkhttp.Context, field string) {
+	httperr.ResponseErrorL(c, errcode.ErrUserUpdateNotAllowed, nil, i18n.Details{"field": field})
+}
+
+// respondUserAuthInfoInvalid surfaces which field of the scanned QR-code
+// payload was missing or malformed. An empty missingField is omitted.
+func respondUserAuthInfoInvalid(c *wkhttp.Context, missingField string) {
+	details := i18n.Details{}
+	if missingField != "" {
+		details["missing_field"] = missingField
+	}
+	httperr.ResponseErrorL(c, errcode.ErrUserAuthInfoInvalid, nil, details)
+}
+
+// respondUserTokenRequired tags which token parameter was omitted. Used by
+// the verifyToken / verifyBot endpoints whose legacy English messages
+// (`token is required`, `bot_token is required`) third-party callers may
+// have keyed off — they are migrated to error.code keying.
+func respondUserTokenRequired(c *wkhttp.Context, field string) {
+	httperr.ResponseErrorL(c, errcode.ErrUserTokenRequired, nil, i18n.Details{"field": field})
+}
+
+// respondUserLockMinuteOutOfRange returns the lock-screen delay bounds so
+// the client can render a localized hint without hard-coding the limits.
+func respondUserLockMinuteOutOfRange(c *wkhttp.Context) {
+	httperr.ResponseErrorL(c, errcode.ErrUserLockMinuteOutOfRange, nil, i18n.Details{
+		"field": "lock_after_minute",
+		"min":   0,
+		"max":   60,
+	})
+}
+
+// respondUserServiceError responds with the generic ErrUserStoreFailed
+// (Internal=true). Callers MUST log the underlying err with full handler
+// context via the module's zap logger before invoking this helper —
+// Internal=true means the wire response carries no error message and ops
+// debug entirely from logs.
+//
+// For known sentinel errors (e.g. ErrUnsupportedLanguage) callers branch
+// explicitly to a more specific code BEFORE falling through here. Service
+// layer sentinel extraction is deferred (TODOS L219 follow-up).
+func respondUserServiceError(c *wkhttp.Context) {
+	httperr.ResponseErrorL(c, errcode.ErrUserStoreFailed, nil, nil)
+}
