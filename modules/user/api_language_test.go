@@ -12,6 +12,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 )
 
 // Handler-level tests for PUT /v1/user/language. We deliberately don't go
@@ -31,6 +32,12 @@ func newLanguageHandlerHarness(t *testing.T, db languageReader, c *fakeLangCache
 	u := &User{Log: log.NewTLog("user-test")}
 	u.languageService = NewLanguageService(db, c)
 	r := wkhttp.New()
+	// The handler now responds via httperr.ResponseErrorL, which delegates to
+	// the wkhttp ErrorRenderer. Wire the i18n renderer so the test exercises
+	// the same envelope path production hits — without this the renderer
+	// falls back to legacy {msg,status} with the unsuppressed English source
+	// message, defeating the Internal=true contract.
+	r.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
 	r.Group("/v1/user").PUT("language", func(ctx *wkhttp.Context) {
 		// Inject the login UID the way octo-lib's AuthMiddleware would.
 		// Bypassing AuthMiddleware keeps the test focused on the handler
@@ -141,9 +148,12 @@ func TestSetLanguageHandler_LongLanguageRejected(t *testing.T) {
 }
 
 // TestSetLanguageHandler_InternalErrorReturnsGenericMsg verifies the
-// classified user-facing copy for infra errors (DB outage, etc.): the wire
-// response must not surface the wrapped `user: persist language: ...` /
-// driver text. PR #182 reviewer P2 fix.
+// Internal=true contract for infra errors (DB outage, etc.): the wire
+// response collapses to the shared internal copy ("服务器内部错误。")
+// regardless of which err.server.user.* code the handler picked, and the
+// wrapped `user: persist language: ...` / driver text never leaves the
+// process. PR #182 reviewer P2 finding, adapted for Phase 2.1
+// httperr.ResponseErrorL migration.
 func TestSetLanguageHandler_InternalErrorReturnsGenericMsg(t *testing.T) {
 	db := newFakeLangDB()
 	db.updateErr = errors.New("driver: connection refused")
@@ -159,11 +169,15 @@ func TestSetLanguageHandler_InternalErrorReturnsGenericMsg(t *testing.T) {
 		t.Fatalf("status = %d (want 400), body = %s", rec.Code, rec.Body.String())
 	}
 	respBody := rec.Body.String()
-	if !strings.Contains(respBody, "设置语言偏好失败") {
-		t.Fatalf("response body should be classified generic message, got %s", respBody)
+	if !strings.Contains(respBody, "服务器内部错误") {
+		t.Fatalf("response body should carry shared internal copy, got %s", respBody)
 	}
-	if strings.Contains(respBody, "driver:") || strings.Contains(respBody, "user: persist") {
-		t.Fatalf("response body must not leak internal error text, got %s", respBody)
+	if !strings.Contains(respBody, "err.server.user.language_set_failed") {
+		t.Fatalf("response body should still carry the specific error.code for ops dashboards, got %s", respBody)
+	}
+	if strings.Contains(respBody, "driver:") || strings.Contains(respBody, "user: persist") ||
+		strings.Contains(respBody, "Failed to set language preference") {
+		t.Fatalf("response body must not leak internal error text or source DefaultMessage, got %s", respBody)
 	}
 }
 

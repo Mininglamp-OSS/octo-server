@@ -9,9 +9,11 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-lib/server"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	commonapi "github.com/Mininglamp-OSS/octo-server/modules/base/common"
 	commonsettings "github.com/Mininglamp-OSS/octo-server/modules/common"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -266,6 +268,18 @@ func setPublicIPForUserTest(req *http.Request, ip string) {
 	req.Header.Set("X-Forwarded-For", ip)
 	req.Header.Set("X-Real-IP", ip)
 	req.RemoteAddr = ip + ":12345"
+}
+
+// wireI18nRendererForUserTest injects the i18n ErrorRenderer onto the
+// route returned by testutil.NewTestServer, mirroring what main.go does at
+// boot. Post-Phase 2.1, modules/user handlers respond via
+// httperr.ResponseErrorL → c.RenderError; without a renderer wired the
+// route falls back to the legacy {msg,status} envelope carrying the
+// English source DefaultMessage instead of the localized zh-CN copy
+// production clients receive. testutil.NewTestServer lives in octo-lib and
+// is intentionally not touched from this PR to keep the migration scoped.
+func wireI18nRendererForUserTest(s *server.Server) {
+	s.GetRoute().SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
 }
 
 // TestCallbackErrorHandling verifies the pattern where callback errors

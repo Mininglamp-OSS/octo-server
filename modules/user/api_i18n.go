@@ -63,6 +63,28 @@ func respondUserLockMinuteOutOfRange(c *wkhttp.Context) {
 	})
 }
 
+// errSharedAuthRequired caches the shared "auth required" code so the
+// per-handler "未登录" guards do not pay a registry lookup on every miss.
+// Looked up at package init; a missing registration panics loudly rather
+// than silently rendering an empty envelope at request time.
+var errSharedAuthRequired = mustLookupSharedCode("err.shared.auth.required")
+
+func mustLookupSharedCode(id string) codes.Code {
+	c, ok := codes.Lookup(id)
+	if !ok {
+		panic("modules/user: shared code not registered: " + id)
+	}
+	return c
+}
+
+// respondUserNotLoggedIn responds with the shared err.shared.auth.required
+// code. Handlers protected by AuthMiddleware still keep a belt-and-braces
+// `loginUID == ""` check for legacy public routes; this helper renders
+// the consistent 401 envelope for that fallthrough.
+func respondUserNotLoggedIn(c *wkhttp.Context) {
+	httperr.ResponseErrorL(c, errSharedAuthRequired, nil, nil)
+}
+
 // respondUserServiceError responds with the generic ErrUserStoreFailed
 // (Internal=true). Callers MUST log the underlying err with full handler
 // context via the module's zap logger before invoking this helper —

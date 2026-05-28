@@ -30,6 +30,7 @@ var token = "token122323"
 func TestLoginBlockedByLocalLoginOff(t *testing.T) {
 	enableFullOIDCForUserTest(t) // 让 local_off=1 通过安全回退;验证守卫本身
 	s, ctx := testutil.NewTestServer()
+	wireI18nRendererForUserTest(s)
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	setSystemSettingForUserTest(t, ctx, "login", "local_off", "1", "bool")
 	require.NoError(t, commonsettings.EnsureSystemSettings(ctx).Reload())
@@ -52,6 +53,7 @@ func TestLoginBlockedByLocalLoginOff(t *testing.T) {
 func TestSendLoginCheckPhoneCodeBlockedByLocalLoginOff(t *testing.T) {
 	enableFullOIDCForUserTest(t)
 	s, ctx := testutil.NewTestServer()
+	wireI18nRendererForUserTest(s)
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	setSystemSettingForUserTest(t, ctx, "login", "local_off", "1", "bool")
 	require.NoError(t, commonsettings.EnsureSystemSettings(ctx).Reload())
@@ -69,6 +71,7 @@ func TestSendLoginCheckPhoneCodeBlockedByLocalLoginOff(t *testing.T) {
 func TestLoginCheckPhoneBlockedByLocalLoginOff(t *testing.T) {
 	enableFullOIDCForUserTest(t)
 	s, ctx := testutil.NewTestServer()
+	wireI18nRendererForUserTest(s)
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	setSystemSettingForUserTest(t, ctx, "login", "local_off", "1", "bool")
 	require.NoError(t, commonsettings.EnsureSystemSettings(ctx).Reload())
@@ -94,6 +97,7 @@ func TestLoginCheckPhoneBlockedByLocalLoginOff(t *testing.T) {
 // gate 命中点在 sms.Verify / createUser 之前,所以这条用例不需要 mock SMS。
 func TestPhoneRegisterBlockedByOnlyChina(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
+	wireI18nRendererForUserTest(s)
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	setSystemSettingForUserTest(t, ctx, "register", "only_china", "1", "bool")
 	require.NoError(t, commonsettings.EnsureSystemSettings(ctx).Reload())
@@ -108,7 +112,10 @@ func TestPhoneRegisterBlockedByOnlyChina(t *testing.T) {
 	}))))
 	s.GetRoute().ServeHTTP(w, req)
 
-	assert.Contains(t, w.Body.String(), "仅仅支持中国大陆手机号注册",
+	// Phase 2.1 migrated the gate to err.server.user.phone_region_unsupported;
+	// the zh-CN copy elided the legacy "仅仅" / "注册" suffix, so assert on the
+	// stable error.code to avoid future copy churn breaking the security gate.
+	assert.Contains(t, w.Body.String(), "err.server.user.phone_region_unsupported",
 		"register handler must enforce only_china before sms verify; "+
 			"sendRegisterCode-only gate leaks a TTL-window bypass when admins flip the toggle at runtime")
 }
