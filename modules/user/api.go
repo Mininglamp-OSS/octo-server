@@ -670,7 +670,8 @@ func (u *User) userIM(c *wkhttp.Context) {
 func (u *User) qrcodeMy(c *wkhttp.Context) {
 	userModel, err := u.db.QueryByUID(c.GetLoginUID())
 	if err != nil {
-		c.ResponseErrorf("查询当前用户信息失败！", err)
+		u.Error("查询当前用户信息失败！", zap.String("uid", c.GetLoginUID()), zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if userModel == nil {
@@ -1178,12 +1179,14 @@ func (u *User) wxLogin(c *wkhttp.Context) {
 		return
 	}
 	if accessTokenResp.StatusCode != http.StatusOK {
-		c.ResponseErrorf("请求验证微信access_token错误", fmt.Errorf("错误代码-> %d", accessTokenResp.StatusCode))
+		u.Error("请求验证微信access_token错误", zap.Int("status", accessTokenResp.StatusCode))
+		respondUserError(c, errcode.ErrUserWeChatExchangeFailed)
 		return
 	}
 	var bodyMap map[string]interface{}
 	if err = util.ReadJsonByByte([]byte(accessTokenResp.Body), &bodyMap); err != nil {
-		c.ResponseErrorf("解码微信access_token返回数据失败！", err)
+		u.Error("解码微信access_token返回数据失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserDecodeFailed)
 		return
 	}
 	accessToken, ok := bodyMap["access_token"].(string)
@@ -1207,13 +1210,15 @@ func (u *User) wxLogin(c *wkhttp.Context) {
 	}
 
 	if wxUserInfoResp.StatusCode != http.StatusOK {
-		c.ResponseErrorf("获取微信用户资料请求错误", fmt.Errorf("错误代码-> %d", wxUserInfoResp.StatusCode))
+		u.Error("获取微信用户资料请求错误", zap.Int("status", wxUserInfoResp.StatusCode))
+		respondUserError(c, errcode.ErrUserWeChatProfileFailed)
 		return
 	}
 
 	var wxUserInfoBodyMap map[string]interface{}
 	if err = util.ReadJsonByByte([]byte(wxUserInfoResp.Body), &wxUserInfoBodyMap); err != nil {
-		c.ResponseErrorf("解码微信用户信息返回数据失败！", err)
+		u.Error("解码微信用户信息返回数据失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserDecodeFailed)
 		return
 	}
 
@@ -2588,10 +2593,8 @@ func (u *User) sendLoginCheckPhoneCode(c *wkhttp.Context) {
 
 	userinfo, err := u.db.QueryByUID(req.UID)
 	if err != nil {
-		// PR #188 reviewer fix: legacy code used ErrUserChatPwdUpdateFailed
-		// for a user-lookup failure (wrong copy carried over from a copy-paste
-		// of setChatPwd). Both are Internal=true so the client wire message is
-		// unchanged, but ops dashboards keyed on error.code would mis-attribute.
+		// User-lookup failure here is a DB query error, NOT a chat-password
+		// update failure (mirror this code with loginCheckPhone below).
 		u.Error("查询用户信息失败！", zap.Error(err))
 		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
@@ -2648,7 +2651,7 @@ func (u *User) loginCheckPhone(c *wkhttp.Context) {
 
 	userInfo, err := u.db.QueryByUID(req.UID)
 	if err != nil {
-		// Same legacy mis-mapping as sendLoginCheckPhoneCode above; see comment there.
+		// User-lookup failure is a DB query error; mirror sendLoginCheckPhoneCode.
 		u.Error("查询用户信息失败！", zap.Error(err))
 		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
@@ -3753,7 +3756,8 @@ type authVerifyTokenResp struct {
 func (u *User) authVerifyToken(c *wkhttp.Context) {
 	var req authVerifyTokenReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseErrorf("invalid request: %v", err)
+		u.Warn("authVerifyToken 请求体格式错误", zap.Error(err))
+		respondUserRequestInvalid(c, "")
 		return
 	}
 	if req.Token == "" {
@@ -3817,7 +3821,8 @@ type authVerifyBotResp struct {
 func (u *User) authVerifyBot(c *wkhttp.Context) {
 	var req authVerifyBotReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseErrorf("invalid request: %v", err)
+		u.Warn("authVerifyBot 请求体格式错误", zap.Error(err))
+		respondUserRequestInvalid(c, "")
 		return
 	}
 	if req.BotToken == "" {

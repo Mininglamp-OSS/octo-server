@@ -14,9 +14,11 @@ import (
 )
 
 // TestUserAPINoLegacyResponseError pins the post-Phase-2.1 contract that
-// modules/user/api.go does not regress to legacy c.ResponseError. Phase 2
-// PR reviewers can rely on this guard catching reintroduced legacy calls
-// before the broader CI lint suite (0.10) is wired.
+// modules/user/api.go does not regress to legacy octo-lib error responses.
+// Catches both `.ResponseError(...)` and `.ResponseErrorf(...)` — the latter
+// is the formatted variant that bypasses the renderer just as completely,
+// so the guard must look for it too even though it never matches the
+// plain `.ResponseError(` substring (the `f` intervenes).
 func TestUserAPINoLegacyResponseError(t *testing.T) {
 	data, err := os.ReadFile("api.go")
 	if err != nil {
@@ -34,8 +36,11 @@ func TestUserAPINoLegacyResponseError(t *testing.T) {
 		clean.WriteString(line)
 		clean.WriteByte('\n')
 	}
-	if strings.Contains(clean.String(), ".ResponseError(") {
-		t.Fatal("modules/user/api.go must use httperr.ResponseErrorL via respondUser* helpers instead of legacy ResponseError")
+	cleaned := clean.String()
+	for _, banned := range []string{".ResponseError(", ".ResponseErrorf("} {
+		if strings.Contains(cleaned, banned) {
+			t.Fatalf("modules/user/api.go must use httperr.ResponseErrorL via respondUser* helpers instead of legacy %s", banned)
+		}
 	}
 }
 
