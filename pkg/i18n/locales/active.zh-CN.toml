@@ -122,6 +122,9 @@ other = "此账号已被封禁。"
 ["err.server.user.login_device_expired"]
 other = "登录设备已过期，请重新登录。"
 
+["err.server.user.login_locked"]
+other = "登录失败次数过多，账号已被临时锁定，请稍后再试。"
+
 ["err.server.user.not_found"]
 other = "用户不存在。"
 

@@ -23,6 +23,7 @@ func TestUserCodesHaveZhCNTranslations(t *testing.T) {
 		{ErrUserCodeInvalid.ID, ErrUserCodeInvalid.DefaultMessage, "验证码错误。"},
 		{ErrUserAccountBanned.ID, ErrUserAccountBanned.DefaultMessage, "此账号已被封禁。"},
 		{ErrUserLoginDeviceExpired.ID, ErrUserLoginDeviceExpired.DefaultMessage, "登录设备已过期，请重新登录。"},
+		{ErrUserLoginLocked.ID, ErrUserLoginLocked.DefaultMessage, "登录失败次数过多，账号已被临时锁定，请稍后再试。"},
 		{ErrUserNotFound.ID, ErrUserNotFound.DefaultMessage, "用户不存在。"},
 		{ErrUserCurrentNotFound.ID, ErrUserCurrentNotFound.DefaultMessage, "当前登录用户不存在。"},
 		{ErrUserAlreadyExists.ID, ErrUserAlreadyExists.DefaultMessage, "该用户已存在。"},

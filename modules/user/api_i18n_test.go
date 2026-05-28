@@ -195,6 +195,14 @@ func TestRespondUserHelpers(t *testing.T) {
 			wantContains:    "已被封禁",
 		},
 		{
+			name:            "ErrUserLoginLocked surfaces 429 + user-facing zh-CN copy",
+			probe:           func(c *wkhttp.Context) { respondUserError(c, errcode.ErrUserLoginLocked) },
+			wantCodeID:      "err.server.user.login_locked",
+			wantSemStatus:   http.StatusTooManyRequests,
+			wantTransStatus: http.StatusBadRequest,
+			wantContains:    "登录失败次数过多",
+		},
+		{
 			name:            "ErrUserWeChatExchangeFailed (Internal=true, 502) collapses to shared internal copy",
 			probe:           func(c *wkhttp.Context) { respondUserError(c, errcode.ErrUserWeChatExchangeFailed) },
 			wantCodeID:      "err.server.user.wechat_exchange_failed",

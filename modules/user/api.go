@@ -660,6 +660,7 @@ func (u *User) userIM(c *wkhttp.Context) {
 	var resultMap map[string]interface{}
 	err = util.ReadJsonByByte([]byte(resp.Body), &resultMap)
 	if err != nil {
+		u.Error("解析 IM 响应失败", zap.Error(err))
 		respondUserServiceError(c)
 		return
 	}
@@ -904,7 +905,8 @@ func (u *User) userUpdateWithField(c *wkhttp.Context) {
 				return
 			}
 			if err := ValidateName(nameStr); err != nil {
-				respondUserServiceError(c)
+				u.Warn("用户名格式校验失败", zap.String("uid", loginUID), zap.Error(err))
+				respondUserRequestInvalid(c, "name")
 				return
 			}
 		}
@@ -1295,12 +1297,16 @@ func (u *User) login(c *wkhttp.Context) {
 		return
 	}
 	if err := req.Check(); err != nil {
-		respondUserServiceError(c)
+		// loginReq.Check returns one of "用户名不能为空 / 密码不能为空"; both are
+		// pure client-side input gaps. Field detail is left blank because the
+		// helper string-matches the message rather than tagging the offending
+		// field — fix-up follows the broader sentinel extraction (TODOS L219).
+		respondUserRequestInvalid(c, "")
 		return
 	}
 	if err := u.loginGuard.Check(req.Username); err != nil {
 		u.Warn("登录被临时锁定", zap.String("username", req.Username), zap.Error(err))
-		respondUserServiceError(c)
+		respondUserError(c, errcode.ErrUserLoginLocked)
 		return
 	}
 	loginSpan := u.ctx.Tracer().StartSpan(
@@ -1313,8 +1319,8 @@ func (u *User) login(c *wkhttp.Context) {
 
 	userInfo, err := u.db.QueryByUsernameCxt(loginSpanCtx, req.Username)
 	if err != nil {
-		u.Error("查询用户信息失败！", zap.String("username", req.Username))
-		respondUserServiceError(c)
+		u.Error("查询用户信息失败！", zap.String("username", req.Username), zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	// 已注销 / 被禁用账号统一拒绝；与 emailLogin / usernameLogin 行为对齐
@@ -1364,6 +1370,7 @@ func (u *User) execLoginAndRespose(userInfo *Model, flag config.DeviceFlag, devi
 			})
 			return
 		}
+		u.Error("登录执行失败", zap.String("uid", userInfo.UID), zap.Error(err))
 		respondUserServiceError(c)
 		return
 	}
@@ -1557,7 +1564,11 @@ func (u *User) register(c *wkhttp.Context) {
 		return
 	}
 	if err := req.CheckRegister(); err != nil {
-		respondUserServiceError(c)
+		// CheckRegister returns "用户名不能为空 / 区号不能为空 / 手机号不能为空 /
+		// 验证码不能为空 / 密码不能为空 / 密码长度必须大于6位 / 名字格式错误".
+		// All client-side input failures. Field-level detail left empty for
+		// the same reason as login.Check (TODOS L219 sentinel follow-up).
+		respondUserRequestInvalid(c, "")
 		return
 	}
 
@@ -1578,7 +1589,7 @@ func (u *User) register(c *wkhttp.Context) {
 	appConfig, err := u.commonService.GetAppConfig()
 	if err != nil {
 		u.Error("查询应用设置错误", zap.Error(err))
-		respondUserServiceError(c)
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	var registerInviteOn = 0
@@ -1618,8 +1629,8 @@ func (u *User) register(c *wkhttp.Context) {
 	//验证手机号是否注册
 	userInfo, err := u.db.QueryByUsernameCxt(registerSpanCtx, fmt.Sprintf("%s%s", req.Zone, req.Phone))
 	if err != nil {
-		u.Error("查询用户信息失败！", zap.String("username", req.Phone))
-		respondUserServiceError(c)
+		u.Error("查询用户信息失败！", zap.String("username", req.Phone), zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if userInfo != nil {
@@ -1636,7 +1647,8 @@ func (u *User) register(c *wkhttp.Context) {
 		//线上验证短信验证码
 		err = u.smsServie.Verify(registerSpanCtx, req.Zone, req.Phone, req.Code, commonapi.CodeTypeRegister)
 		if err != nil {
-			respondUserServiceError(c)
+			u.Warn("注册短信校验失败", zap.String("phone", req.Phone), zap.Error(err))
+			respondUserError(c, errcode.ErrUserCodeInvalid)
 			return
 		}
 	}
@@ -2181,11 +2193,13 @@ func (u *User) addBlacklist(c *wkhttp.Context) {
 	//添加黑名单
 	version, err := u.ctx.GenSeq(common.UserSettingSeqKey)
 	if err != nil {
+		u.Error("生成用户设置版本号失败", zap.String("uid", loginUID), zap.Error(err))
 		respondUserServiceError(c)
 		return
 	}
 	friendVersion, err := u.ctx.GenSeq(common.FriendSeqKey)
 	if err != nil {
+		u.Error("生成好友版本号失败", zap.String("uid", loginUID), zap.Error(err))
 		respondUserServiceError(c)
 		return
 	}
@@ -2272,11 +2286,13 @@ func (u *User) removeBlacklist(c *wkhttp.Context) {
 
 	version, err := u.ctx.GenSeq(common.UserSettingSeqKey)
 	if err != nil {
+		u.Error("生成用户设置版本号失败", zap.String("uid", loginUID), zap.Error(err))
 		respondUserServiceError(c)
 		return
 	}
 	friendVersion, err := u.ctx.GenSeq(common.FriendSeqKey)
 	if err != nil {
+		u.Error("生成好友版本号失败", zap.String("uid", loginUID), zap.Error(err))
 		respondUserServiceError(c)
 		return
 	}
@@ -2572,8 +2588,12 @@ func (u *User) sendLoginCheckPhoneCode(c *wkhttp.Context) {
 
 	userinfo, err := u.db.QueryByUID(req.UID)
 	if err != nil {
+		// PR #188 reviewer fix: legacy code used ErrUserChatPwdUpdateFailed
+		// for a user-lookup failure (wrong copy carried over from a copy-paste
+		// of setChatPwd). Both are Internal=true so the client wire message is
+		// unchanged, but ops dashboards keyed on error.code would mis-attribute.
 		u.Error("查询用户信息失败！", zap.Error(err))
-		respondUserError(c, errcode.ErrUserChatPwdUpdateFailed)
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if userinfo == nil {
@@ -2628,8 +2648,9 @@ func (u *User) loginCheckPhone(c *wkhttp.Context) {
 
 	userInfo, err := u.db.QueryByUID(req.UID)
 	if err != nil {
+		// Same legacy mis-mapping as sendLoginCheckPhoneCode above; see comment there.
 		u.Error("查询用户信息失败！", zap.Error(err))
-		respondUserError(c, errcode.ErrUserChatPwdUpdateFailed)
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if userInfo == nil {
@@ -2645,7 +2666,7 @@ func (u *User) loginCheckPhone(c *wkhttp.Context) {
 	err = u.smsServie.Verify(spanCtx, userInfo.Zone, userInfo.Phone, req.Code, commonapi.CodeTypeCheckMobile)
 	if err != nil {
 		u.Error("验证短信失败", zap.Error(err))
-		respondUserServiceError(c)
+		respondUserError(c, errcode.ErrUserCodeInvalid)
 		return
 	}
 
@@ -2760,7 +2781,8 @@ func (u *User) sendDestroyCode(c *wkhttp.Context) {
 	}
 	err = u.smsServie.SendVerifyCode(c.Context, userInfo.Zone, userInfo.Phone, commonapi.CodeTypeDestroyAccount)
 	if err != nil {
-		respondUserServiceError(c)
+		u.Error("注销验证码短信发送失败", zap.String("uid", loginUID), zap.Error(err))
+		respondUserError(c, errcode.ErrUserSMSSendFailed)
 		return
 	}
 	c.ResponseOK()
@@ -2803,7 +2825,8 @@ func (u *User) destroyAccount(c *wkhttp.Context) {
 		// 校验验证码
 		err = u.smsServie.Verify(c.Context, userInfo.Zone, userInfo.Phone, code, commonapi.CodeTypeDestroyAccount)
 		if err != nil {
-			respondUserServiceError(c)
+			u.Warn("注销验证码校验失败", zap.String("uid", loginUID), zap.Error(err))
+			respondUserError(c, errcode.ErrUserCodeInvalid)
 			return
 		}
 	}
@@ -3079,7 +3102,8 @@ func (u *User) pwdforget(c *wkhttp.Context) {
 		//线上验证短信验证码
 		err = u.smsServie.Verify(context.Background(), req.Zone, req.Phone, req.Code, commonapi.CodeTypeForgetLoginPWD)
 		if err != nil {
-			respondUserServiceError(c)
+			u.Warn("忘记密码验证码校验失败", zap.String("phone", req.Phone), zap.Error(err))
+			respondUserError(c, errcode.ErrUserCodeInvalid)
 			return
 		}
 	}

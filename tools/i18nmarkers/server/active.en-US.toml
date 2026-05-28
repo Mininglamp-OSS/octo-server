@@ -132,6 +132,9 @@ other = "Failed to update lock-screen password."
 ["err.server.user.login_device_expired"]
 other = "Login device session expired, please sign in again."
 
+["err.server.user.login_locked"]
+other = "Too many failed login attempts, account temporarily locked. Please try again later."
+
 ["err.server.user.login_pwd_update_failed"]
 other = "Failed to update login password."
 

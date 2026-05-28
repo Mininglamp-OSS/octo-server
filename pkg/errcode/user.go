@@ -71,6 +71,16 @@ var (
 		HTTPStatus:     http.StatusUnauthorized,
 		DefaultMessage: "Login device session expired, please sign in again.",
 	})
+	// ErrUserLoginLocked maps the anti-brute-force lockout returned by
+	// LoginGuard.Check (ErrLoginLocked). Not Internal=true: the wire message
+	// is the user-actionable explanation. 429 is the standard HTTP status
+	// for rate-limited / lockout states even though the count window is
+	// per-account rather than per-IP.
+	ErrUserLoginLocked = register(codes.Code{
+		ID:             "err.server.user.login_locked",
+		HTTPStatus:     http.StatusTooManyRequests,
+		DefaultMessage: "Too many failed login attempts, account temporarily locked. Please try again later.",
+	})
 
 	// Existence.
 
