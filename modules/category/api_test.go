@@ -1134,6 +1134,132 @@ func TestCategory_MoveExternalGroupToCurrentSpaceCategory(t *testing.T) {
 	assert.Equal(t, 0, groupSpaceVer)
 }
 
+// TestCategory_MoveExternalGroupEmptySourceSpaceFallsBackToDefaultSpace covers
+// the legacy external-member path flagged in PR #192 review: an external member
+// row with is_external=1 but empty source_space_id is a legitimate state (e.g.
+// users/bots not bound to a Space). The rest of the codebase
+// (space_filter.decideConvKeepInSpace, api_sidebar.sidebarMySourceSpaceID)
+// resolves that state to the user's default Space, so categorize must do the
+// same — otherwise these groups stay un-categorizable and follow_version /
+// auto_follow_threads writes land in the group's owning Space.
+func TestCategory_MoveExternalGroupEmptySourceSpaceFallsBackToDefaultSpace(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+	resetUIDRateLimit(t, ctx)
+
+	// The user's only Space membership → resolves as their default Space.
+	defaultSpace := "space-ext191-default"
+	groupSpace := "space-ext191-group2"
+	seedSpaceAndMember(t, f, defaultSpace, 0)
+	route := s.GetRoute()
+
+	wc := createCategory(t, route, defaultSpace, "外部群关注-legacy")
+	assert.Equal(t, http.StatusOK, wc.Code)
+	catID := parseJSON(t, wc)["category_id"].(string)
+
+	// External member with EMPTY source_space_id (legacy row).
+	groupNo := "group-ext191-legacy-001"
+	_, err = f.db.session.InsertBySql("INSERT INTO `group` (group_no, name, creator, status, space_id) VALUES (?, ?, ?, ?, ?)",
+		groupNo, "外部群legacy", "owner-uid", 1, groupSpace).Exec()
+	assert.NoError(t, err)
+	_, err = f.db.session.InsertInto("group_member").
+		Columns("group_no", "uid", "role", "is_deleted", "status", "is_external", "source_space_id").
+		Values(groupNo, testutil.UID, 0, 0, 1, 1, "").Exec()
+	assert.NoError(t, err)
+
+	// Must succeed by falling back to the user's default Space.
+	wm := doRequest(t, route, "PUT", "/v1/groups/"+groupNo+"/category", map[string]string{
+		"category_id": catID,
+	})
+	assert.Equal(t, http.StatusOK, wm.Code)
+
+	setting, err := f.db.queryGroupSettingForCategory(groupNo, testutil.UID)
+	assert.NoError(t, err)
+	assert.NotNil(t, setting)
+	assert.NotNil(t, setting.CategoryID)
+	assert.Equal(t, catID, *setting.CategoryID)
+
+	// follow_version bumped under the default Space, not the group's owning Space.
+	var defVer int
+	_, err = f.db.session.Select("IFNULL(MAX(version),0)").From("user_follow_version").
+		Where("uid=? and space_id=?", testutil.UID, defaultSpace).Load(&defVer)
+	assert.NoError(t, err)
+	assert.Greater(t, defVer, 0)
+
+	var groupVer int
+	_, err = f.db.session.Select("IFNULL(MAX(version),0)").From("user_follow_version").
+		Where("uid=? and space_id=?", testutil.UID, groupSpace).Load(&groupVer)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, groupVer)
+}
+
+// TestCategory_MoveExternalGroupOutClearsAutoFollowThreadsInSourceSpace pins the
+// move-out (categoryIDPtr == nil) branch for an external group: the
+// ClearAutoFollowThreadsTx write must target the user's source Space, where the
+// sidebar materialized the ext row — not the group's owning Space. Without the
+// effectiveSpaceID fix this clear would miss the row entirely.
+func TestCategory_MoveExternalGroupOutClearsAutoFollowThreadsInSourceSpace(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+	resetUIDRateLimit(t, ctx)
+
+	userSpace := "space-ext191-mo-user"
+	groupSpace := "space-ext191-mo-group"
+	seedSpaceAndMember(t, f, userSpace, 0)
+	route := s.GetRoute()
+
+	wc := createCategory(t, route, userSpace, "外部群关注-moveout")
+	require.Equal(t, http.StatusOK, wc.Code)
+	catID := parseJSON(t, wc)["category_id"].(string)
+
+	groupNo := "group-ext191-mo-001"
+	_, err = f.db.session.InsertBySql("INSERT INTO `group` (group_no, name, creator, status, space_id) VALUES (?, ?, ?, ?, ?)",
+		groupNo, "外部群moveout", "owner-uid", 1, groupSpace).Exec()
+	require.NoError(t, err)
+	_, err = f.db.session.InsertInto("group_member").
+		Columns("group_no", "uid", "role", "is_deleted", "status", "is_external", "source_space_id").
+		Values(groupNo, testutil.UID, 0, 0, 1, 1, userSpace).Exec()
+	require.NoError(t, err)
+
+	// Move IN.
+	wm := doRequest(t, route, "PUT", "/v1/groups/"+groupNo+"/category", map[string]string{
+		"category_id": catID,
+	})
+	require.Equal(t, http.StatusOK, wm.Code)
+
+	// Simulate sidebar materialization in the SOURCE space (where the follow tab
+	// is). target_type=2 → group.
+	_, err = f.db.session.InsertBySql(
+		"INSERT INTO user_conversation_ext (uid, space_id, target_type, target_id, group_unfollowed, auto_follow_threads) "+
+			"VALUES (?, ?, 2, ?, 0, 1)",
+		testutil.UID, userSpace, groupNo,
+	).Exec()
+	require.NoError(t, err, "seed materialized ext row in source space")
+
+	// Move OUT.
+	wm2 := doRequest(t, route, "PUT", "/v1/groups/"+groupNo+"/category", map[string]string{
+		"category_id": "",
+	})
+	require.Equal(t, http.StatusOK, wm2.Code)
+
+	// auto_follow_threads must be cleared on the row in the SOURCE space.
+	var postAutoFollow int
+	_, err = f.db.session.SelectBySql(
+		"SELECT auto_follow_threads FROM user_conversation_ext"+
+			" WHERE uid=? AND space_id=? AND target_type=2 AND target_id=?",
+		testutil.UID, userSpace, groupNo,
+	).Load(&postAutoFollow)
+	require.NoError(t, err)
+	assert.Equal(t, 0, postAutoFollow,
+		"move-out must clear auto_follow_threads on the ext row under the source Space")
+}
+
 func TestCategory_ListEmpty(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()

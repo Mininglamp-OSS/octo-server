@@ -9,6 +9,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	convext "github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
+	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"github.com/gocraft/dbr/v2"
@@ -554,9 +555,25 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 	// 用户视角的有效空间：外部成员以来源 Space 为准，内部成员等同于群归属 Space。
 	// 后续的同空间校验、follow_version bump、auto_follow_threads 同步都以此为空间维度，
 	// 保证外部群被归类后能正确出现在用户当前 Space 的关注 tab（侧边栏按当前 Space 查询）。
+	//
+	// 外部成员但 source_space_id 为空是合法历史状态（如未绑定 Space 的用户/bot，
+	// 见 modules/group/service.go 注释）。必须与 sidebar / space_filter 的解析口径
+	// 一致回退到用户默认 Space（最早加入的 Space）：space_filter.decideConvKeepInSpace
+	// 对外部群的 `eff == "" → defaultSpaceID`、api_sidebar.sidebarMySourceSpaceID
+	// 同口径。否则这些 legacy 行仍无法归类，且 follow_version / auto_follow_threads
+	// 会写到群归属 Space，与侧边栏读取的默认 Space 不一致——正是 #191 想消灭的漂移。
 	effectiveSpaceID := groupSpaceID
-	if member.IsExternal == 1 && member.SourceSpaceID != "" {
-		effectiveSpaceID = member.SourceSpaceID
+	if member.IsExternal == 1 {
+		if member.SourceSpaceID != "" {
+			effectiveSpaceID = member.SourceSpaceID
+		} else if defaultSpaceID, derr := spacemod.GetUserDefaultSpaceIDE(c.ctx, loginUID); derr != nil {
+			// fail-closed：DB 查询失败时不要静默落到群 Space（会复现 #191），直接报错。
+			c.Error("查询用户默认空间失败", zap.Error(derr))
+			ctx.ResponseError(errors.New("查询用户默认空间失败"))
+			return
+		} else if defaultSpaceID != "" {
+			effectiveSpaceID = defaultSpaceID
+		}
 	}
 
 	var categoryIDPtr *string
