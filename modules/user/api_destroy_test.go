@@ -59,6 +59,7 @@ func TestDestroyApply_OK(t *testing.T) {
 
 func TestDestroyApply_WrongPassword(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
+	wireI18nRendererForUserTest(s)
 	u := New(ctx)
 
 	seedDestroyTestUser(t, u, "Pwd@12345")
@@ -75,6 +76,7 @@ func TestDestroyApply_WrongPassword(t *testing.T) {
 
 func TestDestroyApply_AlreadyApplying(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
+	wireI18nRendererForUserTest(s)
 	u := New(ctx)
 
 	password := "Pwd@12345"
@@ -113,6 +115,7 @@ func TestDestroyCancel_OK(t *testing.T) {
 
 func TestDestroyCancel_NotApplying(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
+	wireI18nRendererForUserTest(s)
 	u := New(ctx)
 
 	seedDestroyTestUser(t, u, "Pwd@12345")
@@ -202,6 +205,7 @@ func TestUsernameLogin_BlocksDestroyed(t *testing.T) {
 
 func TestDestroyApply_NoPasswordSet(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
+	wireI18nRendererForUserTest(s)
 	u := New(ctx)
 
 	// 模拟仅第三方登录、未设置密码的账号
@@ -245,6 +249,7 @@ func TestAnonymizeUsername_FitsColumnLimit(t *testing.T) {
 
 func TestDestroyApply_AlreadyDestroyed(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
+	wireI18nRendererForUserTest(s)
 	u := New(ctx)
 
 	password := "Pwd@12345"
@@ -312,6 +317,7 @@ func TestFinalizeDestroy_RaceWithCancel(t *testing.T) {
 
 func TestDestroyCancel_AfterFinalized(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
+	wireI18nRendererForUserTest(s)
 	u := New(ctx)
 
 	hashed, _ := HashPassword("Pwd@12345")
