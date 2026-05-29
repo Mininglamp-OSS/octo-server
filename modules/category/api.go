@@ -513,18 +513,26 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 		return
 	}
 
-	// 校验群成员身份
-	var memberCount int
-	_, err := c.db.session.Select("count(*)").From("group_member").
+	// 校验群成员身份，并取出 is_external / source_space_id 用于计算用户视角空间。
+	// Issue #191：外部群（群归属 Space 与用户所在 Space 不同）场景下，用户是该群的
+	// 外部成员（is_external=1, source_space_id=用户当前 Space），关注/归类是个人维度
+	// 操作，应以用户来源 Space 而非群归属 Space 作为空间维度。
+	var member struct {
+		IsExternal    int    `db:"is_external"`
+		SourceSpaceID string `db:"source_space_id"`
+	}
+	err := c.db.session.Select("is_external", "IFNULL(source_space_id,'') AS source_space_id").
+		From("group_member").
 		Where("group_no=? and uid=? and is_deleted=0", groupNo, loginUID).
-		Load(&memberCount)
+		Limit(1).
+		LoadOne(&member)
 	if err != nil {
+		if errors.Is(err, dbr.ErrNotFound) {
+			ctx.ResponseError(errors.New("你不是该群成员"))
+			return
+		}
 		c.Error("查询群成员失败", zap.Error(err))
 		ctx.ResponseError(errors.New("查询群成员失败"))
-		return
-	}
-	if memberCount == 0 {
-		ctx.ResponseError(errors.New("你不是该群成员"))
 		return
 	}
 
@@ -541,6 +549,14 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 	if groupSpaceID == "" {
 		ctx.ResponseError(errors.New("该群组不属于任何空间"))
 		return
+	}
+
+	// 用户视角的有效空间：外部成员以来源 Space 为准，内部成员等同于群归属 Space。
+	// 后续的同空间校验、follow_version bump、auto_follow_threads 同步都以此为空间维度，
+	// 保证外部群被归类后能正确出现在用户当前 Space 的关注 tab（侧边栏按当前 Space 查询）。
+	effectiveSpaceID := groupSpaceID
+	if member.IsExternal == 1 && member.SourceSpaceID != "" {
+		effectiveSpaceID = member.SourceSpaceID
 	}
 
 	var categoryIDPtr *string
@@ -605,7 +621,7 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 			ctx.ResponseError(errors.New("无权限使用此分类"))
 			return
 		}
-		if groupSpaceID != locked.SpaceID {
+		if effectiveSpaceID != locked.SpaceID {
 			ctx.ResponseError(errors.New("群组和分类不在同一空间"))
 			return
 		}
@@ -644,7 +660,7 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 	// /v1/follow/sort holding the version FOR UPDATE while waiting on ext
 	// would AB-BA-deadlock against a move-out holding ext while waiting on
 	// version (issue #151 review #4 by an9xyz).
-	if _, err := convext.BumpFollowVersionTx(tx, loginUID, groupSpaceID); err != nil {
+	if _, err := convext.BumpFollowVersionTx(tx, loginUID, effectiveSpaceID); err != nil {
 		c.Error("更新 follow_version 失败", zap.Error(err))
 		ctx.ResponseError(errors.New("更新群设置失败"))
 		return
@@ -668,13 +684,13 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 	//     For first-time categorize (no ext row) the call is a no-op —
 	//     sidebar materialization later creates the row with =1.
 	if categoryIDPtr == nil {
-		if err := convext.ClearAutoFollowThreadsTx(tx, loginUID, groupSpaceID, []string{groupNo}); err != nil {
+		if err := convext.ClearAutoFollowThreadsTx(tx, loginUID, effectiveSpaceID, []string{groupNo}); err != nil {
 			c.Error("清理 auto_follow_threads 失败", zap.Error(err))
 			ctx.ResponseError(errors.New("更新群设置失败"))
 			return
 		}
 	} else {
-		if err := convext.RestoreAutoFollowThreadsTx(tx, loginUID, groupSpaceID, []string{groupNo}); err != nil {
+		if err := convext.RestoreAutoFollowThreadsTx(tx, loginUID, effectiveSpaceID, []string{groupNo}); err != nil {
 			c.Error("恢复 auto_follow_threads 失败", zap.Error(err))
 			ctx.ResponseError(errors.New("更新群设置失败"))
 			return

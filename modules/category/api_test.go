@@ -1067,6 +1067,73 @@ func TestCategory_MoveGroupCrossSpace(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "群组和分类不在同一空间")
 }
 
+// TestCategory_MoveExternalGroupToCurrentSpaceCategory is the regression test
+// for issue #191. A user who is an external member of a group (the group lives
+// in another Space) follows/categorizes it into a category under the user's own
+// current Space. The space-consistency check must use the user's source Space
+// (group_member.source_space_id), not the group's owning Space, otherwise the
+// request is wrongly rejected with "群组和分类不在同一空间".
+//
+// It also asserts the follow_version is bumped under the user's source Space
+// (not the group's owning Space) so the group surfaces in the follow tab the
+// sidebar queries for the user's current Space.
+func TestCategory_MoveExternalGroupToCurrentSpaceCategory(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+	resetUIDRateLimit(t, ctx)
+
+	// userSpace = where the current user lives and owns categories.
+	// groupSpace = the external group's owning Space (a different Space).
+	userSpace := "space-ext191-user"
+	groupSpace := "space-ext191-group"
+	seedSpaceAndMember(t, f, userSpace, 0)
+	route := s.GetRoute()
+
+	// category lives under the user's current Space.
+	wc := createCategory(t, route, userSpace, "外部群关注")
+	assert.Equal(t, http.StatusOK, wc.Code)
+	catID := parseJSON(t, wc)["category_id"].(string)
+
+	// group lives in groupSpace; the current user joined as an external member
+	// whose source_space_id points back to their own (user) Space.
+	groupNo := "group-ext191-001"
+	_, err = f.db.session.InsertBySql("INSERT INTO `group` (group_no, name, creator, status, space_id) VALUES (?, ?, ?, ?, ?)",
+		groupNo, "外部群", "owner-uid", 1, groupSpace).Exec()
+	assert.NoError(t, err)
+	_, err = f.db.session.InsertInto("group_member").
+		Columns("group_no", "uid", "role", "is_deleted", "status", "is_external", "source_space_id").
+		Values(groupNo, testutil.UID, 0, 0, 1, 1, userSpace).Exec()
+	assert.NoError(t, err)
+
+	// categorizing the external group into the user-Space category must succeed.
+	wm := doRequest(t, route, "PUT", "/v1/groups/"+groupNo+"/category", map[string]string{
+		"category_id": catID,
+	})
+	assert.Equal(t, http.StatusOK, wm.Code)
+
+	setting, err := f.db.queryGroupSettingForCategory(groupNo, testutil.UID)
+	assert.NoError(t, err)
+	assert.NotNil(t, setting)
+	assert.NotNil(t, setting.CategoryID)
+	assert.Equal(t, catID, *setting.CategoryID)
+
+	// follow_version must be bumped under the user's source Space, not groupSpace.
+	var userSpaceVer int
+	_, err = f.db.session.Select("IFNULL(MAX(version),0)").From("user_follow_version").
+		Where("uid=? and space_id=?", testutil.UID, userSpace).Load(&userSpaceVer)
+	assert.NoError(t, err)
+	assert.Greater(t, userSpaceVer, 0)
+
+	var groupSpaceVer int
+	_, err = f.db.session.Select("IFNULL(MAX(version),0)").From("user_follow_version").
+		Where("uid=? and space_id=?", testutil.UID, groupSpace).Load(&groupSpaceVer)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, groupSpaceVer)
+}
+
 func TestCategory_ListEmpty(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
