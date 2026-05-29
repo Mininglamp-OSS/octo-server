@@ -15,6 +15,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	event "github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	common "github.com/Mininglamp-OSS/octo-server/modules/common"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
@@ -25,46 +26,46 @@ import (
 func (u *User) usernameRegister(c *wkhttp.Context) {
 	settings := common.EnsureSystemSettings(u.ctx)
 	if settings.RegisterOff() {
-		c.ResponseError(errors.New("注册通道暂不开放"))
+		respondUserError(c, errcode.ErrUserRegistrationClosed)
 		return
 	}
 	if !settings.RegisterUsernameOn() {
-		c.ResponseError(errors.New("暂不支持用户名注册"))
+		respondUserError(c, errcode.ErrUserUsernameRegisterDisabled)
 		return
 	}
 	var req usernameRegisterReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("请求数据格式有误！"))
+		respondUserRequestInvalid(c, "")
 		return
 	}
 	if req.Username == "" {
-		c.ResponseError(errors.New("用户名不能为空"))
+		respondUserRequestInvalid(c, "username")
 		return
 	}
 	if strings.TrimSpace(req.Password) == "" {
-		c.Response(errors.New("密码不能为空！"))
+		respondUserRequestInvalid(c, "password")
 		return
 	}
 	if len(req.Password) < 6 {
-		c.ResponseError(errors.New("密码不能少于6位"))
+		respondUserError(c, errcode.ErrUserPasswordTooShort)
 		return
 	}
 	if len(req.Username) < 8 || len(req.Username) > 22 {
-		c.ResponseError(errors.New("用户名必须在8-22位"))
+		respondUserError(c, errcode.ErrUserUsernameFormatInvalid)
 		return
 	}
 	userInfo, err := u.db.QueryByUsername(req.Username)
 	if err != nil {
-		u.Error("查询用户信息失败！", zap.String("username", req.Username))
-		c.ResponseError(err)
+		u.Error("查询用户信息失败！", zap.String("username", req.Username), zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if userInfo != nil {
-		c.ResponseError(errors.New("该用户名已存在"))
+		respondUserError(c, errcode.ErrUserAlreadyExists)
 		return
 	}
 	if err := ValidateName(req.Name); err != nil {
-		c.ResponseError(err)
+		respondUserRequestInvalid(c, "name")
 		return
 	}
 	// 通过用户名注册
@@ -74,25 +75,25 @@ func (u *User) usernameRegister(c *wkhttp.Context) {
 // 用户名登录
 func (u *User) usernameLogin(c *wkhttp.Context) {
 	if common.EnsureSystemSettings(u.ctx).LocalLoginOff() {
-		c.ResponseError(errors.New("本地登录已关闭"))
+		respondUserError(c, errcode.ErrUserLocalLoginDisabled)
 		return
 	}
 	var req loginReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("请求数据格式有误！"))
+		respondUserRequestInvalid(c, "")
 		return
 	}
 	if err := req.Check(); err != nil {
-		c.ResponseError(err)
+		respondUserRequestInvalid(c, "")
 		return
 	}
 	if len(req.Username) < 8 || len(req.Username) > 22 {
-		c.ResponseError(errors.New("用户名必须在8-22位"))
+		respondUserError(c, errcode.ErrUserUsernameFormatInvalid)
 		return
 	}
 	if err := u.loginGuard.Check(req.Username); err != nil {
 		u.Warn("登录被临时锁定", zap.String("username", req.Username), zap.Error(err))
-		c.ResponseError(err)
+		respondUserError(c, errcode.ErrUserLoginLocked)
 		return
 	}
 	loginSpan := u.ctx.Tracer().StartSpan(
@@ -105,27 +106,27 @@ func (u *User) usernameLogin(c *wkhttp.Context) {
 
 	userInfo, err := u.db.QueryByUsernameCxt(loginSpanCtx, req.Username)
 	if err != nil {
-		u.Error("查询用户信息失败！", zap.String("username", req.Username))
-		c.ResponseError(err)
+		u.Error("查询用户信息失败！", zap.String("username", req.Username), zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if userInfo == nil {
 		u.loginGuard.RecordFailureLogged(req.Username)
 		// 统一错误消息，避免枚举账号
-		c.ResponseError(errors.New("用户名或密码错误"))
+		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
 	}
 	// 已注销账号拒绝登录；冷静期账号允许登录（响应中附带注销状态提示）
 	if userInfo.IsDestroy == IsDestroyDone || userInfo.Status == 0 {
 		u.loginGuard.RecordFailureLogged(req.Username)
-		c.ResponseError(errors.New("用户名或密码错误"))
+		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
 	}
 
 	matched, needsMigration := CheckPassword(req.Password, userInfo.Password)
 	if !matched {
 		u.loginGuard.RecordFailureLogged(req.Username)
-		c.ResponseError(errors.New("用户名或密码错误"))
+		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
 	}
 	u.loginGuard.ResetLogged(req.Username)
@@ -138,7 +139,8 @@ func (u *User) usernameLogin(c *wkhttp.Context) {
 
 	result, err := u.execLogin(userInfo, config.DeviceFlag(req.Flag), req.Device, loginSpanCtx)
 	if err != nil {
-		c.ResponseError(err)
+		u.Error("用户名登录 execLogin 失败", zap.String("username", req.Username), zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	needUploadWeb3PublicKey := 0
@@ -177,7 +179,7 @@ func (u *User) registerWithUsername(username string, name string, password strin
 	tx, err := u.db.session.Begin()
 	if err != nil {
 		u.Error("创建事务失败！", zap.Error(err))
-		c.ResponseError(errors.New("创建事务失败！"))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	defer func() {
@@ -192,14 +194,14 @@ func (u *User) registerWithUsername(username string, name string, password strin
 		if err != nil {
 			tx.Rollback()
 			u.Error("数据库事务提交失败", zap.Error(err))
-			c.ResponseError(errors.New("数据库事务提交失败"))
+			respondUserError(c, errcode.ErrUserStoreFailed)
 			return nil
 		}
 		return nil
 	})
 	if err != nil {
 		tx.Rollback()
-		c.ResponseError(errors.New("注册失败！"))
+		respondUserError(c, errcode.ErrUserRegisterFailed)
 		return
 	}
 	c.Response(map[string]interface{}{
@@ -218,37 +220,37 @@ func (u *User) resetPwdWithWeb3PublicKey(c *wkhttp.Context) {
 	}
 	var req reqVO
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("请求数据格式有误！"))
+		respondUserRequestInvalid(c, "")
 		return
 	}
 	if req.Username == "" {
-		c.ResponseError(errors.New("用户名不能为空"))
+		respondUserRequestInvalid(c, "username")
 		return
 	}
 	if req.Password == "" {
-		c.ResponseError(errors.New("密码不能为空"))
+		respondUserRequestInvalid(c, "password")
 		return
 	}
 	if req.VerifyText == "" {
-		c.ResponseError(errors.New("校验字符不能为空"))
+		respondUserRequestInvalid(c, "verify_text")
 		return
 	}
 	if req.SignText == "" {
-		c.ResponseError(errors.New("签名字符不能为空"))
+		respondUserRequestInvalid(c, "sign_text")
 		return
 	}
 	user, err := u.db.QueryByUsername(req.Username)
 	if err != nil {
 		u.Error("查询用户信息错误", zap.Error(err))
-		c.ResponseError(err)
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if user == nil {
-		c.ResponseError(errors.New("该用户不存在"))
+		respondUserError(c, errcode.ErrUserNotFound)
 		return
 	}
 	if user.Web3PublicKey == "" {
-		c.ResponseError(errors.New("该用户未上传公钥"))
+		respondUserError(c, errcode.ErrUserPublicKeyNotFound)
 		return
 	}
 	// 判断签名明文是否存在
@@ -256,28 +258,28 @@ func (u *User) resetPwdWithWeb3PublicKey(c *wkhttp.Context) {
 	verifyText, err := u.ctx.GetRedisConn().GetString(cacheKey)
 	if err != nil {
 		u.Error("获取签名信息错误", zap.Error(err))
-		c.ResponseError(err)
+		respondUserError(c, errcode.ErrUserTokenCacheFailed)
 		return
 	}
 	if verifyText == "" || req.VerifyText != verifyText {
-		c.ResponseError(errors.New("签名信息不存在"))
+		respondUserError(c, errcode.ErrUserSignatureNotFound)
 		return
 	}
 
 	verify, err := u.verifySignature(user.Web3PublicKey, req.VerifyText, req.SignText)
 	if err != nil {
-		c.ResponseError(errors.New("校验签名错误"))
+		respondUserError(c, errcode.ErrUserSignatureInvalid)
 		return
 	}
 	if !verify {
-		c.ResponseError(errors.New("签名错误"))
+		respondUserError(c, errcode.ErrUserSignatureInvalid)
 		return
 	}
 
 	newHash, err := HashPassword(req.Password)
 	if err != nil {
 		u.Error("密码哈希失败", zap.Error(err))
-		c.ResponseError(errors.New("密码处理失败"))
+		respondUserError(c, errcode.ErrUserPasswordProcessFailed)
 		return
 	}
 	updateMap := map[string]interface{}{}
@@ -285,7 +287,7 @@ func (u *User) resetPwdWithWeb3PublicKey(c *wkhttp.Context) {
 	err = u.db.updateUser(updateMap, user.UID)
 	if err != nil {
 		u.Error("修改用户密码错误", zap.Error(err))
-		c.ResponseError(err)
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	err = u.ctx.GetRedisConn().Del(cacheKey)
@@ -333,26 +335,26 @@ func (u *User) uploadWeb3PublicKey(c *wkhttp.Context) {
 	}
 	var req reqVO
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("请求数据格式有误！"))
+		respondUserRequestInvalid(c, "")
 		return
 	}
 
 	if req.Web3PublicKey == "" {
-		c.ResponseError(errors.New("公钥不能为空"))
+		respondUserRequestInvalid(c, "web3_public_key")
 		return
 	}
 	userInfo, err := u.db.QueryByUID(loginUID)
 	if err != nil {
-		u.Error("查询用户信息失败！", zap.String("uid", loginUID))
-		c.ResponseError(err)
+		u.Error("查询用户信息失败！", zap.String("uid", loginUID), zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if userInfo == nil || userInfo.Status == 0 || userInfo.IsDestroy == IsDestroyDone {
-		c.ResponseError(errors.New("该用户不存在或被封禁"))
+		respondUserError(c, errcode.ErrUserNotFound)
 		return
 	}
 	if userInfo.Web3PublicKey != "" {
-		c.ResponseError(errors.New("该用户已上传过公钥信息"))
+		respondUserError(c, errcode.ErrUserPublicKeyAlreadyExists)
 		return
 	}
 
@@ -361,7 +363,7 @@ func (u *User) uploadWeb3PublicKey(c *wkhttp.Context) {
 	err = u.db.updateUser(updateMap, loginUID)
 	if err != nil {
 		u.Error("修改用户公钥错误", zap.Error(err))
-		c.ResponseError(err)
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	c.ResponseOK()
@@ -377,38 +379,38 @@ func (u *User) web3verifySignature(c *wkhttp.Context) {
 	}
 	var req reqVO
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("请求数据格式有误！"))
+		respondUserRequestInvalid(c, "")
 		return
 	}
 	if req.Username == "" {
-		c.ResponseError(errors.New("用户名不能为空"))
+		respondUserRequestInvalid(c, "username")
 		return
 	}
 	if req.VerifyText == "" {
-		c.ResponseError(errors.New("校验字符不能为空"))
+		respondUserRequestInvalid(c, "verify_text")
 		return
 	}
 	if req.SignText == "" {
-		c.ResponseError(errors.New("签名字符不能为空"))
+		respondUserRequestInvalid(c, "sign_text")
 		return
 	}
 	if req.Type == "" || (req.Type != Web3VerifyLogin && req.Type != Web3VerifyPassword) {
-		c.ResponseError(errors.New("验证类型不匹配"))
+		respondUserError(c, errcode.ErrUserVerifyTypeInvalid)
 		return
 	}
 
 	user, err := u.db.QueryByUsername(req.Username)
 	if err != nil {
 		u.Error("查询用户信息错误", zap.Error(err))
-		c.ResponseError(err)
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if user == nil {
-		c.ResponseError(errors.New("该用户不存在"))
+		respondUserError(c, errcode.ErrUserNotFound)
 		return
 	}
 	if user.Web3PublicKey == "" {
-		c.ResponseError(errors.New("该用户未上传公钥"))
+		respondUserError(c, errcode.ErrUserPublicKeyNotFound)
 		return
 	}
 	// 判断签名明文是否存在
@@ -416,21 +418,21 @@ func (u *User) web3verifySignature(c *wkhttp.Context) {
 	verifyText, err := u.ctx.GetRedisConn().GetString(cacheKey)
 	if err != nil {
 		u.Error("获取签名信息错误", zap.Error(err))
-		c.ResponseError(err)
+		respondUserError(c, errcode.ErrUserTokenCacheFailed)
 		return
 	}
 	if verifyText == "" || req.VerifyText != verifyText {
-		c.ResponseError(errors.New("签名信息不存在"))
+		respondUserError(c, errcode.ErrUserSignatureNotFound)
 		return
 	}
 
 	verify, err := u.verifySignature(user.Web3PublicKey, req.VerifyText, req.SignText)
 	if err != nil {
-		c.ResponseError(errors.New("校验签名错误"))
+		respondUserError(c, errcode.ErrUserSignatureInvalid)
 		return
 	}
 	if !verify {
-		c.ResponseError(errors.New("签名错误"))
+		respondUserError(c, errcode.ErrUserSignatureInvalid)
 		return
 	}
 	err = u.ctx.GetRedisConn().Del(cacheKey)
@@ -445,25 +447,25 @@ func (u *User) getVerifyText(c *wkhttp.Context) {
 	username := c.Query("username")
 	verifyType := c.Query("type")
 	if username == "" {
-		c.ResponseError(errors.New("用户名不能为空"))
+		respondUserRequestInvalid(c, "username")
 		return
 	}
 	if verifyType == "" || (verifyType != Web3VerifyLogin && verifyType != Web3VerifyPassword) {
-		c.ResponseError(errors.New("验证类型不匹配"))
+		respondUserError(c, errcode.ErrUserVerifyTypeInvalid)
 		return
 	}
 	user, err := u.db.QueryByUsername(username)
 	if err != nil {
 		u.Error("查询用户信息错误", zap.Error(err))
-		c.ResponseError(err)
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if user == nil || user.IsDestroy == IsDestroyDone || user.Status == 0 {
-		c.ResponseError(errors.New("该用户不存在或被禁用"))
+		respondUserError(c, errcode.ErrUserNotFound)
 		return
 	}
 	if user.Web3PublicKey == "" {
-		c.ResponseError(errors.New("该用户尚未上传公钥"))
+		respondUserError(c, errcode.ErrUserPublicKeyNotFound)
 		return
 	}
 	// 使用足够长的随机字符串，不包含可预测的时间戳
@@ -473,7 +475,7 @@ func (u *User) getVerifyText(c *wkhttp.Context) {
 	err = u.ctx.GetRedisConn().SetAndExpire(cacheKey, verifyText, time.Minute*5)
 	if err != nil {
 		u.Error("缓存校验信息错误", zap.Error(err))
-		c.ResponseError(err)
+		respondUserError(c, errcode.ErrUserTokenCacheFailed)
 		return
 	}
 	c.Response(map[string]interface{}{
@@ -491,42 +493,42 @@ func (u *User) updatePwd(c *wkhttp.Context) {
 	}
 	var req reqVO
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("请求数据格式有误！"))
+		respondUserRequestInvalid(c, "")
 		return
 	}
 	if req.Password == "" || req.NewPassword == "" {
-		c.ResponseError(errors.New("密码不能为空"))
+		respondUserRequestInvalid(c, "password")
 		return
 	}
 	if req.Password == req.NewPassword {
-		c.ResponseError(errors.New("新密码不能和旧密码相同"))
+		respondUserError(c, errcode.ErrUserNewPasswordSameAsOld)
 		return
 	}
 	userInfo, err := u.db.QueryByUID(loginUID)
 	if err != nil {
 		u.Error("查询用户资料错误", zap.Error(err))
-		c.ResponseError(errors.New("查询用户资料错误"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if userInfo == nil {
-		c.ResponseError(errors.New("该用户不存在"))
+		respondUserError(c, errcode.ErrUserNotFound)
 		return
 	}
 	matched, _ := CheckPassword(req.Password, userInfo.Password)
 	if !matched {
-		c.ResponseError(errors.New("旧密码错误"))
+		respondUserError(c, errcode.ErrUserOldPasswordIncorrect)
 		return
 	}
 	newHash, err := HashPassword(req.NewPassword)
 	if err != nil {
 		u.Error("密码哈希失败", zap.Error(err))
-		c.ResponseError(errors.New("密码处理失败"))
+		respondUserError(c, errcode.ErrUserPasswordProcessFailed)
 		return
 	}
 	err = u.db.UpdateUsersWithField("password", newHash, userInfo.UID)
 	if err != nil {
 		u.Error("修改登录密码错误", zap.Error(err))
-		c.ResponseError(errors.New("修改登录密码错误"))
+		respondUserError(c, errcode.ErrUserLoginPwdUpdateFailed)
 		return
 	}
 	c.ResponseOK()

@@ -10,8 +10,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	commonapi "github.com/Mininglamp-OSS/octo-server/modules/base/common"
 	common "github.com/Mininglamp-OSS/octo-server/modules/common"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/opentracing/opentracing-go"
-	"github.com/pkg/errors"
 	"go.uber.org/zap"
 )
 
@@ -23,22 +23,22 @@ func (u *User) emailSendCode(c *wkhttp.Context) {
 	}
 	var req reqVO
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("请求数据格式有误！"))
+		respondUserRequestInvalid(c, "")
 		return
 	}
 	req.Email = strings.TrimSpace(strings.ToLower(req.Email))
 	if req.Email == "" {
-		c.ResponseError(errors.New("邮箱不能为空"))
+		respondUserRequestInvalid(c, "email")
 		return
 	}
 	if !isValidEmail(req.Email) {
-		c.ResponseError(errors.New("邮箱格式不正确"))
+		respondUserError(c, errcode.ErrUserEmailInvalid)
 		return
 	}
 	settings := common.EnsureSystemSettings(u.ctx)
 	codeType := commonapi.CodeType(req.CodeType)
 	if codeType == commonapi.CodeTypeRegister && settings.RegisterOff() {
-		c.ResponseError(errors.New("注册通道暂不开放"))
+		respondUserError(c, errcode.ErrUserRegistrationClosed)
 		return
 	}
 	// 邮箱登录验证码与 emailLogin 守卫语义对齐:local_off=1 时连发码也拒,
@@ -46,16 +46,16 @@ func (u *User) emailSendCode(c *wkhttp.Context) {
 	// 注意范围:只覆盖 CodeTypeEmailLogin —— 忘记密码 / 注册验证码各有
 	// 自己的开关(register.off / 长期保留),不在 local_off 守备范围内。
 	if codeType == commonapi.CodeTypeEmailLogin && settings.LocalLoginOff() {
-		c.ResponseError(errors.New("本地登录已关闭"))
+		respondUserError(c, errcode.ErrUserLocalLoginDisabled)
 		return
 	}
 	if !settings.RegisterEmailOn() {
 		switch codeType {
 		case commonapi.CodeTypeRegister:
-			c.ResponseError(errors.New("暂不支持邮箱注册"))
+			respondUserError(c, errcode.ErrUserEmailRegisterDisabled)
 			return
 		case commonapi.CodeTypeEmailLogin:
-			c.ResponseError(errors.New("暂不支持邮箱登录"))
+			respondUserError(c, errcode.ErrUserEmailLoginDisabled)
 			return
 		default:
 			// RegisterEmailOn controls email registration/login only. Password
@@ -66,7 +66,7 @@ func (u *User) emailSendCode(c *wkhttp.Context) {
 	emailService := commonapi.NewEmailService(u.ctx, common.EnsureSystemSettings(u.ctx))
 	if err := emailService.SendVerifyCode(context.Background(), req.Email, commonapi.CodeType(req.CodeType)); err != nil {
 		u.Error("发送邮箱验证码失败", zap.String("email", req.Email), zap.Error(err))
-		c.ResponseError(err)
+		respondUserError(c, errcode.ErrUserEmailSendFailed)
 		return
 	}
 	c.ResponseOK()
@@ -76,11 +76,11 @@ func (u *User) emailSendCode(c *wkhttp.Context) {
 func (u *User) emailRegister(c *wkhttp.Context) {
 	settings := common.EnsureSystemSettings(u.ctx)
 	if settings.RegisterOff() {
-		c.ResponseError(errors.New("注册通道暂不开放"))
+		respondUserError(c, errcode.ErrUserRegistrationClosed)
 		return
 	}
 	if !settings.RegisterEmailOn() {
-		c.ResponseError(errors.New("暂不支持邮箱注册"))
+		respondUserError(c, errcode.ErrUserEmailRegisterDisabled)
 		return
 	}
 	type reqVO struct {
@@ -93,46 +93,46 @@ func (u *User) emailRegister(c *wkhttp.Context) {
 	}
 	var req reqVO
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("请求数据格式有误！"))
+		respondUserRequestInvalid(c, "")
 		return
 	}
 	req.Email = strings.TrimSpace(strings.ToLower(req.Email))
 	if req.Email == "" {
-		c.ResponseError(errors.New("邮箱不能为空"))
+		respondUserRequestInvalid(c, "email")
 		return
 	}
 	if !isValidEmail(req.Email) {
-		c.ResponseError(errors.New("邮箱格式不正确"))
+		respondUserError(c, errcode.ErrUserEmailInvalid)
 		return
 	}
 	if strings.TrimSpace(req.Password) == "" {
-		c.ResponseError(errors.New("密码不能为空"))
+		respondUserRequestInvalid(c, "password")
 		return
 	}
 	if len(strings.TrimSpace(req.Password)) < 6 {
-		c.ResponseError(errors.New("密码长度不能少于6位"))
+		respondUserError(c, errcode.ErrUserPasswordTooShort)
 		return
 	}
 
 	// 验证邮箱验证码（仅非 release 模式且配置了 SMSCode 时走测试分支）
 	if commonapi.IsTestCodeEnabled(u.ctx.GetConfig()) {
 		if strings.TrimSpace(req.Code) == "" {
-			c.ResponseError(errors.New("验证码不能为空"))
+			respondUserRequestInvalid(c, "code")
 			return
 		}
 		if !commonapi.MatchTestCode(u.ctx.GetConfig(), req.Code) {
-			c.ResponseError(errors.New("验证码错误"))
+			respondUserError(c, errcode.ErrUserCodeInvalid)
 			return
 		}
 	} else {
 		// 线上模式：必须提供验证码
 		if strings.TrimSpace(req.Code) == "" {
-			c.ResponseError(errors.New("验证码不能为空"))
+			respondUserRequestInvalid(c, "code")
 			return
 		}
 		emailService := commonapi.NewEmailService(u.ctx, common.EnsureSystemSettings(u.ctx))
 		if err := emailService.Verify(context.Background(), req.Email, req.Code, commonapi.CodeTypeRegister); err != nil {
-			c.ResponseError(err)
+			respondUserError(c, errcode.ErrUserCodeInvalid)
 			return
 		}
 	}
@@ -141,16 +141,16 @@ func (u *User) emailRegister(c *wkhttp.Context) {
 	existUser, err := u.db.QueryByEmail(req.Email)
 	if err != nil {
 		u.Error("查询用户信息失败", zap.String("email", req.Email), zap.Error(err))
-		c.ResponseError(errors.New("查询用户信息失败"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if existUser != nil {
-		c.ResponseError(errors.New("该邮箱已被注册"))
+		respondUserError(c, errcode.ErrUserAlreadyExists)
 		return
 	}
 
 	if err := ValidateName(req.Name); err != nil {
-		c.ResponseError(err)
+		respondUserRequestInvalid(c, "name")
 		return
 	}
 
@@ -169,7 +169,7 @@ func (u *User) emailRegister(c *wkhttp.Context) {
 	tx, err := u.db.session.Begin()
 	if err != nil {
 		u.Error("创建事务失败", zap.Error(err))
-		c.ResponseError(errors.New("创建事务失败"))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	defer func() {
@@ -178,7 +178,7 @@ func (u *User) emailRegister(c *wkhttp.Context) {
 			u.Error("emailRegister panic recovered",
 				zap.Any("recover", r),
 				zap.String("stack", string(debug.Stack())))
-			c.ResponseError(errors.New("注册失败，请重试"))
+			respondUserError(c, errcode.ErrUserRegisterFailed)
 		}
 	}()
 
@@ -194,14 +194,14 @@ func (u *User) emailRegister(c *wkhttp.Context) {
 		if err := tx.Commit(); err != nil {
 			tx.Rollback()
 			u.Error("数据库事务提交失败", zap.Error(err))
-			c.ResponseError(errors.New("数据库事务提交失败"))
+			respondUserError(c, errcode.ErrUserStoreFailed)
 			return err
 		}
 		return nil
 	})
 	if err != nil {
 		tx.Rollback()
-		c.ResponseError(errors.New("注册失败！"))
+		respondUserError(c, errcode.ErrUserRegisterFailed)
 		return
 	}
 	c.Response(result)
@@ -211,11 +211,11 @@ func (u *User) emailRegister(c *wkhttp.Context) {
 func (u *User) emailLogin(c *wkhttp.Context) {
 	settings := common.EnsureSystemSettings(u.ctx)
 	if settings.LocalLoginOff() {
-		c.ResponseError(errors.New("本地登录已关闭"))
+		respondUserError(c, errcode.ErrUserLocalLoginDisabled)
 		return
 	}
 	if !settings.RegisterEmailOn() {
-		c.ResponseError(errors.New("暂不支持邮箱登录"))
+		respondUserError(c, errcode.ErrUserEmailLoginDisabled)
 		return
 	}
 	type reqVO struct {
@@ -227,27 +227,27 @@ func (u *User) emailLogin(c *wkhttp.Context) {
 	}
 	var req reqVO
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("请求数据格式有误！"))
+		respondUserRequestInvalid(c, "")
 		return
 	}
 	req.Email = strings.TrimSpace(strings.ToLower(req.Email))
 	if req.Email == "" {
-		c.ResponseError(errors.New("邮箱不能为空"))
+		respondUserRequestInvalid(c, "email")
 		return
 	}
 	if !isValidEmail(req.Email) {
-		c.ResponseError(errors.New("邮箱格式不正确"))
+		respondUserError(c, errcode.ErrUserEmailInvalid)
 		return
 	}
 	if req.Code == "" && req.Password == "" {
-		c.ResponseError(errors.New("验证码或密码不能为空"))
+		respondUserRequestInvalid(c, "")
 		return
 	}
 	// 仅密码登录走 guard；验证码登录有独立的发送频控 + 验证次数限制，不纳入 guard 计数。
 	if req.Password != "" {
 		if err := u.loginGuard.Check(req.Email); err != nil {
 			u.Warn("邮箱登录被临时锁定", zap.String("email", req.Email), zap.Error(err))
-			c.ResponseError(err)
+			respondUserError(c, errcode.ErrUserLoginLocked)
 			return
 		}
 	}
@@ -262,27 +262,27 @@ func (u *User) emailLogin(c *wkhttp.Context) {
 	userInfo, err := u.db.QueryByEmail(req.Email)
 	if err != nil {
 		u.Error("查询用户信息失败", zap.String("email", req.Email), zap.Error(err))
-		c.ResponseError(errors.New("查询用户信息失败"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if userInfo == nil {
 		// 密码登录路径统一返回通用错误消息避免枚举；验证码登录路径不涉及密码，保留原提示。
 		if req.Password != "" {
 			u.loginGuard.RecordFailureLogged(req.Email)
-			c.ResponseError(errors.New("邮箱或密码错误"))
+			respondUserError(c, errcode.ErrUserInvalidCredentials)
 			return
 		}
-		c.ResponseError(errors.New("该邮箱未注册"))
+		respondUserError(c, errcode.ErrUserNotFound)
 		return
 	}
 	if userInfo.IsDestroy == IsDestroyDone || userInfo.Status == 0 {
 		// 密码路径同样泄露账号状态，统一为通用错误 + 计入失败计数
 		if req.Password != "" {
 			u.loginGuard.RecordFailureLogged(req.Email)
-			c.ResponseError(errors.New("邮箱或密码错误"))
+			respondUserError(c, errcode.ErrUserInvalidCredentials)
 			return
 		}
-		c.ResponseError(errors.New("该账号已注销或被禁用"))
+		respondUserError(c, errcode.ErrUserAccountUnavailable)
 		return
 	}
 
@@ -290,14 +290,14 @@ func (u *User) emailLogin(c *wkhttp.Context) {
 	if req.Code != "" {
 		emailService := commonapi.NewEmailService(u.ctx, common.EnsureSystemSettings(u.ctx))
 		if err := emailService.Verify(loginSpanCtx, req.Email, req.Code, commonapi.CodeTypeEmailLogin); err != nil {
-			c.ResponseError(err)
+			respondUserError(c, errcode.ErrUserCodeInvalid)
 			return
 		}
 	} else {
 		matched, needsMigration := CheckPassword(req.Password, userInfo.Password)
 		if !matched {
 			u.loginGuard.RecordFailureLogged(req.Email)
-			c.ResponseError(errors.New("邮箱或密码错误"))
+			respondUserError(c, errcode.ErrUserInvalidCredentials)
 			return
 		}
 		u.loginGuard.ResetLogged(req.Email)
@@ -310,7 +310,8 @@ func (u *User) emailLogin(c *wkhttp.Context) {
 
 	result, err := u.execLogin(userInfo, config.DeviceFlag(req.Flag), req.Device, loginSpanCtx)
 	if err != nil {
-		c.ResponseError(err)
+		u.Error("邮箱登录 execLogin 失败", zap.String("email", req.Email), zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	c.Response(result)
@@ -327,54 +328,54 @@ func (u *User) emailForgetPwd(c *wkhttp.Context) {
 	}
 	var req reqVO
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("请求数据格式有误！"))
+		respondUserRequestInvalid(c, "")
 		return
 	}
 	req.Email = strings.TrimSpace(strings.ToLower(req.Email))
 	if req.Email == "" {
-		c.ResponseError(errors.New("邮箱不能为空"))
+		respondUserRequestInvalid(c, "email")
 		return
 	}
 	if strings.TrimSpace(req.Code) == "" {
-		c.ResponseError(errors.New("验证码不能为空"))
+		respondUserRequestInvalid(c, "code")
 		return
 	}
 	if strings.TrimSpace(req.Password) == "" {
-		c.ResponseError(errors.New("新密码不能为空"))
+		respondUserRequestInvalid(c, "new_password")
 		return
 	}
 	if len(strings.TrimSpace(req.Password)) < 6 {
-		c.ResponseError(errors.New("密码长度不能少于6位"))
+		respondUserError(c, errcode.ErrUserPasswordTooShort)
 		return
 	}
 
 	// 验证验证码
 	emailService := commonapi.NewEmailService(u.ctx, common.EnsureSystemSettings(u.ctx))
 	if err := emailService.Verify(context.Background(), req.Email, req.Code, commonapi.CodeTypeForgetLoginPWD); err != nil {
-		c.ResponseError(err)
+		respondUserError(c, errcode.ErrUserCodeInvalid)
 		return
 	}
 
 	userInfo, err := u.db.QueryByEmail(req.Email)
 	if err != nil {
 		u.Error("查询用户信息失败", zap.String("email", req.Email), zap.Error(err))
-		c.ResponseError(errors.New("查询用户信息失败"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if userInfo == nil {
-		c.ResponseError(errors.New("该邮箱未注册"))
+		respondUserError(c, errcode.ErrUserNotFound)
 		return
 	}
 
 	newHash, err := HashPassword(req.Password)
 	if err != nil {
 		u.Error("密码哈希失败", zap.Error(err))
-		c.ResponseError(errors.New("密码处理失败"))
+		respondUserError(c, errcode.ErrUserPasswordProcessFailed)
 		return
 	}
 	if err := u.db.updatePassword(newHash, userInfo.UID); err != nil {
 		u.Error("更新密码失败", zap.Error(err))
-		c.ResponseError(errors.New("重置密码失败"))
+		respondUserError(c, errcode.ErrUserLoginPwdUpdateFailed)
 		return
 	}
 	c.ResponseOK()
