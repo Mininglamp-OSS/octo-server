@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
-	"github.com/pkg/errors"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"go.uber.org/zap"
 )
 
@@ -23,11 +23,11 @@ func (u *User) destroyApply(c *wkhttp.Context) {
 		Password string `json:"password"`
 	}
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("请求数据格式有误！"))
+		respondUserRequestInvalid(c, "")
 		return
 	}
 	if req.Password == "" {
-		c.ResponseError(errors.New("密码不能为空"))
+		respondUserRequestInvalid(c, "password")
 		return
 	}
 
@@ -37,31 +37,31 @@ func (u *User) destroyApply(c *wkhttp.Context) {
 	guardKey := "destroy:" + loginUID
 	if err := u.loginGuard.Check(guardKey); err != nil {
 		u.Warn("注销申请被临时锁定", zap.String("uid", loginUID), zap.Error(err))
-		c.ResponseError(err)
+		respondUserError(c, errcode.ErrUserLoginLocked)
 		return
 	}
 
 	userInfo, err := u.db.QueryByUID(loginUID)
 	if err != nil {
 		u.Error("查询登录用户信息错误", zap.Error(err))
-		c.ResponseError(errors.New("查询登录用户信息错误"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if userInfo == nil {
-		c.ResponseError(errors.New("登录用户不存在"))
+		respondUserError(c, errcode.ErrUserCurrentNotFound)
 		return
 	}
 	switch userInfo.IsDestroy {
 	case IsDestroyApplying:
-		c.ResponseError(errors.New("账号已在注销冷静期中"))
+		respondUserError(c, errcode.ErrUserAccountDestroying)
 		return
 	case IsDestroyDone:
-		c.ResponseError(errors.New("账号已注销"))
+		respondUserError(c, errcode.ErrUserAccountDestroyed)
 		return
 	}
 
 	if userInfo.Password == "" {
-		c.ResponseError(errors.New("当前账号未设置密码，无法验证身份"))
+		respondUserError(c, errcode.ErrUserPasswordNotSet)
 		return
 	}
 	// 注销路径丢弃 needsMigration 是有意为之：账号即将进入冷静期，
@@ -69,7 +69,7 @@ func (u *User) destroyApply(c *wkhttp.Context) {
 	matched, _ := CheckPassword(req.Password, userInfo.Password)
 	if !matched {
 		u.loginGuard.RecordFailureLogged(guardKey)
-		c.ResponseError(errors.New("密码错误"))
+		respondUserError(c, errcode.ErrUserPasswordIncorrect)
 		return
 	}
 	u.loginGuard.ResetLogged(guardKey)
@@ -82,11 +82,11 @@ func (u *User) destroyApply(c *wkhttp.Context) {
 		// 落库成功
 	case ErrDestroyStateConflict:
 		// 并发：另一请求已改变状态。返回业务冲突，避免给客户端假成功。
-		c.ResponseError(errors.New("账号状态已变化，请刷新后重试"))
+		respondUserError(c, errcode.ErrUserAccountStateChanged)
 		return
 	default:
 		u.Error("申请注销失败", zap.Error(err))
-		c.ResponseError(errors.New("申请注销失败"))
+		respondUserError(c, errcode.ErrUserDestroyFailed)
 		return
 	}
 	u.Info("用户申请注销", zap.String("uid", loginUID), zap.Time("expire_at", expireAt))
@@ -106,25 +106,25 @@ func (u *User) destroyCancel(c *wkhttp.Context) {
 	userInfo, err := u.db.QueryByUID(loginUID)
 	if err != nil {
 		u.Error("查询登录用户信息错误", zap.Error(err))
-		c.ResponseError(errors.New("查询登录用户信息错误"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if userInfo == nil {
-		c.ResponseError(errors.New("登录用户不存在"))
+		respondUserError(c, errcode.ErrUserCurrentNotFound)
 		return
 	}
 	if userInfo.IsDestroy != IsDestroyApplying {
-		c.ResponseError(errors.New("账号未在注销中"))
+		respondUserError(c, errcode.ErrUserNotDestroying)
 		return
 	}
 	switch err := u.db.cancelDestroy(loginUID); err {
 	case nil:
 	case ErrDestroyStateConflict:
-		c.ResponseError(errors.New("账号状态已变化，请刷新后重试"))
+		respondUserError(c, errcode.ErrUserAccountStateChanged)
 		return
 	default:
 		u.Error("撤销注销失败", zap.Error(err))
-		c.ResponseError(errors.New("撤销注销失败"))
+		respondUserError(c, errcode.ErrUserDestroyFailed)
 		return
 	}
 	u.Info("用户撤销注销", zap.String("uid", loginUID))
@@ -139,11 +139,11 @@ func (u *User) destroyStatus(c *wkhttp.Context) {
 	userInfo, err := u.db.QueryByUID(loginUID)
 	if err != nil {
 		u.Error("查询登录用户信息错误", zap.Error(err))
-		c.ResponseError(errors.New("查询登录用户信息错误"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if userInfo == nil {
-		c.ResponseError(errors.New("登录用户不存在"))
+		respondUserError(c, errcode.ErrUserCurrentNotFound)
 		return
 	}
 	// 注意：cooling_off_days 不下发——管理员事后调整该值会和用户实际 expire_at 不一致，引发歧义。

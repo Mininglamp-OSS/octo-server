@@ -17,6 +17,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	common "github.com/Mininglamp-OSS/octo-server/modules/common"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/gin-gonic/gin"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
@@ -32,7 +33,7 @@ func (u *User) thirdAuthcode(c *wkhttp.Context) {
 	err := u.ctx.GetRedisConn().SetAndExpire(fmt.Sprintf("%s%s", ThirdAuthcodePrefix, authcode), "1", time.Minute*5)
 	if err != nil {
 		u.Error("redis set error", zap.Error(err))
-		c.ResponseError(errors.New("redis set error"))
+		respondUserError(c, errcode.ErrUserTokenCacheFailed)
 		return
 	}
 
@@ -47,11 +48,11 @@ func (u *User) thirdAuthStatus(c *wkhttp.Context) {
 	result, err := u.ctx.GetRedisConn().GetString(key)
 	if err != nil {
 		u.Error("获取登录状态失败！", zap.Error(err))
-		c.ResponseError(errors.New("获取登录状态失败！"))
+		respondUserError(c, errcode.ErrUserTokenCacheFailed)
 		return
 	}
 	if len(result) == 0 {
-		c.ResponseError(errors.New("登录状态已过期！"))
+		respondUserError(c, errcode.ErrUserOAuthStateExpired)
 		return
 	}
 	if result == "1" {
@@ -75,7 +76,8 @@ func (u *User) thirdAuthStatus(c *wkhttp.Context) {
 	var loginResp *loginUserDetailResp
 	err = util.ReadJsonByByte([]byte(result), &loginResp)
 	if err != nil {
-		c.ResponseError(err)
+		u.Error("解码第三方登录结果失败", zap.Error(err))
+		respondUserError(c, errcode.ErrUserDecodeFailed)
 		return
 	}
 	c.Response(gin.H{
@@ -97,28 +99,30 @@ func (u *User) gitee(c *wkhttp.Context) {
 func (u *User) giteeOAuth(c *wkhttp.Context) {
 	code := c.Query("code")
 	if len(code) == 0 {
-		c.ResponseError(errors.New("code不能为空"))
+		respondUserRequestInvalid(c, "code")
 		return
 	}
 	authcode := c.Query("state")
 	accessToken, err := u.requestGiteeAccessToken(code)
 	if err != nil {
-		c.ResponseError(err)
+		u.Error("获取 gitee access_token 失败", zap.Error(err))
+		respondUserError(c, errcode.ErrUserOAuthExchangeFailed)
 		return
 	}
 	userInfo, err := u.requestGiteeUserInfo(accessToken)
 	if err != nil {
-		c.ResponseError(err)
+		u.Error("获取 gitee 用户信息失败", zap.Error(err))
+		respondUserError(c, errcode.ErrUserOAuthProfileFailed)
 		return
 	}
 	if userInfo == nil {
-		c.ResponseError(errors.New("获取gitee用户信息失败"))
+		respondUserError(c, errcode.ErrUserOAuthProfileFailed)
 		return
 	}
 	userInfoM, err := u.db.queryWithGiteeUID(userInfo.Login)
 	if err != nil {
-		u.Error("查询gitee用户信息失败！", zap.String("login", userInfo.Login))
-		c.ResponseError(errors.New("查询gitee用户信息失败！"))
+		u.Error("查询gitee用户信息失败！", zap.String("login", userInfo.Login), zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	loginSpan := u.ctx.Tracer().StartSpan(
@@ -134,12 +138,13 @@ func (u *User) giteeOAuth(c *wkhttp.Context) {
 	var loginResp *loginUserDetailResp
 	if userInfoM != nil { // 存在就登录
 		if userInfoM.IsDestroy == IsDestroyDone {
-			c.ResponseError(errors.New("用户不存在"))
+			respondUserError(c, errcode.ErrUserNotFound)
 			return
 		}
 		loginResp, err = u.execLogin(userInfoM, deviceFlag, nil, loginSpanCtx)
 		if err != nil {
-			c.ResponseError(err)
+			u.Error("gitee 登录失败", zap.Error(err))
+			respondUserError(c, errcode.ErrUserStoreFailed)
 			return
 		}
 		// 发送登录消息
@@ -157,7 +162,7 @@ func (u *User) giteeOAuth(c *wkhttp.Context) {
 			); redisErr != nil {
 				u.Error("write authcode failure marker after RegisterOff", zap.Error(redisErr))
 			}
-			c.ResponseError(errors.New("注册通道暂不开放"))
+			respondUserError(c, errcode.ErrUserRegistrationClosed)
 			return
 		}
 		// 创建用户
@@ -195,7 +200,7 @@ func (u *User) giteeOAuth(c *wkhttp.Context) {
 		tx, err := u.ctx.DB().Begin()
 		if err != nil {
 			u.Error("开启事务失败！", zap.Error(err))
-			c.ResponseError(errors.New("开启事务失败！"))
+			respondUserError(c, errcode.ErrUserStoreFailed)
 			return
 		}
 		defer func() {
@@ -209,7 +214,7 @@ func (u *User) giteeOAuth(c *wkhttp.Context) {
 		if err != nil {
 			tx.Rollback()
 			u.Error("插入gitee user失败！", zap.Error(err))
-			c.ResponseError(errors.New("插入gitee user失败！"))
+			respondUserError(c, errcode.ErrUserStoreFailed)
 			return
 		}
 		// 发送登录消息
@@ -219,14 +224,15 @@ func (u *User) giteeOAuth(c *wkhttp.Context) {
 			if err != nil {
 				tx.Rollback()
 				u.Error("数据库事物提交失败", zap.Error(err))
-				c.ResponseError(errors.New("数据库事物提交失败"))
+				respondUserError(c, errcode.ErrUserStoreFailed)
 				return nil
 			}
 			return nil
 		})
 		if err != nil {
 			tx.Rollback()
-			c.ResponseError(err)
+			u.Error("创建 gitee 用户失败", zap.Error(err))
+			respondUserError(c, errcode.ErrUserRegisterFailed)
 			return
 		}
 	}
@@ -239,7 +245,7 @@ func (u *User) giteeOAuth(c *wkhttp.Context) {
 	err = u.ctx.GetRedisConn().SetAndExpire(fmt.Sprintf("%s%s", ThirdAuthcodePrefix, authcode), loginRespStr, time.Minute*1)
 	if err != nil {
 		u.Error("redis set error", zap.Error(err))
-		c.ResponseError(errors.New("redis set error"))
+		respondUserError(c, errcode.ErrUserTokenCacheFailed)
 		return
 	}
 	// 认证结果已存入 Redis，前端通过轮询获取，无需延迟响应

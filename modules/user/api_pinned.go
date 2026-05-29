@@ -9,6 +9,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	pkgerrors "github.com/pkg/errors"
 	"go.uber.org/zap"
@@ -81,44 +82,47 @@ func (p *Pinned) Add(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	spaceID := spacepkg.GetSpaceID(c)
 	if spaceID == "" {
-		c.ResponseError(pkgerrors.New("space_id 不能为空"))
+		respondUserRequestInvalid(c, "space_id")
 		return
 	}
 
 	var req addPinnedReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(pkgerrors.New("参数错误"))
+		respondUserRequestInvalid(c, "")
 		return
 	}
 
 	if req.ChannelID == "" {
-		c.ResponseError(pkgerrors.New("channel_id 不能为空"))
+		respondUserRequestInvalid(c, "channel_id")
 		return
 	}
 
 	if !validChannelTypes[req.ChannelType] {
-		c.ResponseError(pkgerrors.New("无效的频道类型"))
+		respondUserRequestInvalid(c, "channel_type")
 		return
 	}
 
 	// 校验用户是否有权访问该频道
 	if err := p.validateChannelAccess(loginUID, spaceID, req.ChannelID, req.ChannelType); err != nil {
-		c.ResponseError(err)
+		// validateChannelAccess logs its own internal failures; on the wire all
+		// branches collapse to a single 403 (not-a-friend / not-a-member / bot
+		// not added). Splitting internal check failures into a 5xx is a follow-up.
+		respondUserError(c, errcode.ErrUserChannelAccessDenied)
 		return
 	}
 
 	err := p.db.Add(loginUID, spaceID, req.ChannelID, req.ChannelType, pinnedMaxPerSpace)
 	if err != nil {
 		if errors.Is(err, ErrPinnedAlreadyExists) {
-			c.ResponseError(err)
+			respondUserError(c, errcode.ErrUserPinnedAlreadyExists)
 			return
 		}
 		if errors.Is(err, ErrPinnedLimitExceeded) {
-			c.ResponseError(pkgerrors.Errorf("最多只能置顶 %d 个频道", pinnedMaxPerSpace))
+			respondUserPinnedLimitExceeded(c, pinnedMaxPerSpace)
 			return
 		}
 		p.Error("添加置顶失败", zap.Error(err))
-		c.ResponseError(pkgerrors.New("添加置顶失败"))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 
@@ -131,31 +135,31 @@ func (p *Pinned) Remove(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	spaceID := spacepkg.GetSpaceID(c)
 	if spaceID == "" {
-		c.ResponseError(pkgerrors.New("space_id 不能为空"))
+		respondUserRequestInvalid(c, "space_id")
 		return
 	}
 
 	channelID := c.Query("channel_id")
 	if channelID == "" {
-		c.ResponseError(pkgerrors.New("channel_id 不能为空"))
+		respondUserRequestInvalid(c, "channel_id")
 		return
 	}
 
 	channelTypeStr := c.Query("channel_type")
 	channelType, err := strconv.ParseUint(channelTypeStr, 10, 8)
 	if err != nil {
-		c.ResponseError(pkgerrors.New("channel_type 参数无效"))
+		respondUserRequestInvalid(c, "channel_type")
 		return
 	}
 
 	if !validChannelTypes[uint8(channelType)] {
-		c.ResponseError(pkgerrors.New("无效的频道类型"))
+		respondUserRequestInvalid(c, "channel_type")
 		return
 	}
 
 	if err := p.db.Remove(loginUID, spaceID, channelID, uint8(channelType)); err != nil {
 		p.Error("移除置顶失败", zap.Error(err))
-		c.ResponseError(pkgerrors.New("移除置顶失败"))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 
@@ -175,14 +179,14 @@ func (p *Pinned) List(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	spaceID := spacepkg.GetSpaceID(c)
 	if spaceID == "" {
-		c.ResponseError(pkgerrors.New("space_id 不能为空"))
+		respondUserRequestInvalid(c, "space_id")
 		return
 	}
 
 	list, err := p.db.List(loginUID, spaceID)
 	if err != nil {
 		p.Error("获取置顶列表失败", zap.Error(err))
-		c.ResponseError(pkgerrors.New("获取置顶列表失败"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 
@@ -209,24 +213,24 @@ func (p *Pinned) UpdateSort(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	spaceID := spacepkg.GetSpaceID(c)
 	if spaceID == "" {
-		c.ResponseError(pkgerrors.New("space_id 不能为空"))
+		respondUserRequestInvalid(c, "space_id")
 		return
 	}
 
 	var req updatePinnedSortReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(pkgerrors.New("参数错误"))
+		respondUserRequestInvalid(c, "")
 		return
 	}
 
 	if len(req.Items) == 0 {
-		c.ResponseError(pkgerrors.New("items 不能为空"))
+		respondUserRequestInvalid(c, "items")
 		return
 	}
 
 	// 限制 items 数量
 	if len(req.Items) > pinnedMaxPerSpace {
-		c.ResponseError(pkgerrors.Errorf("items 数量不能超过 %d", pinnedMaxPerSpace))
+		respondUserPinnedLimitExceeded(c, pinnedMaxPerSpace)
 		return
 	}
 
@@ -234,11 +238,14 @@ func (p *Pinned) UpdateSort(c *wkhttp.Context) {
 		// 参数校验错误属于客户端问题，原始消息透传给调用方。
 		var ve *PinnedSortError
 		if errors.As(err, &ve) {
-			c.ResponseError(ve)
+			// PinnedSortError is a client-side validation error; its specific
+			// detail is logged for ops, the wire carries the localized code.
+			p.Error("置顶排序参数无效", zap.Error(err))
+			respondUserError(c, errcode.ErrUserPinnedSortInvalid)
 			return
 		}
 		p.Error("更新排序失败", zap.Error(err))
-		c.ResponseError(pkgerrors.New("更新排序失败"))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 
