@@ -48,6 +48,13 @@ import (
 
 var (
 	ErrUserNeedVerification = errors.New("user need verification") // 用户需要验证
+	// ErrUserDisabled / ErrUserDeviceInfoRequired are execLogin's client-facing
+	// sentinels so every login entry point (main / OAuth / email / username) can
+	// classify them uniformly: a disabled account is 403, a missing device info
+	// is 400 — not a generic 500. errors.Is on these at the call site (see
+	// respondExecLoginError) keeps the classification in one place.
+	ErrUserDisabled           = errors.New("该用户已被禁用")
+	ErrUserDeviceInfoRequired = errors.New("登录设备信息不能为空！")
 )
 
 // qrcodeChanMap stores channels for QR code login long-polling.
@@ -1362,21 +1369,7 @@ func (u *User) execLoginAndRespose(userInfo *Model, flag config.DeviceFlag, devi
 
 	result, err := u.execLogin(userInfo, flag, device, loginSpanCtx)
 	if err != nil {
-		if errors.Is(err, ErrUserNeedVerification) {
-			phone := ""
-			if len(userInfo.Phone) > 5 {
-				phone = fmt.Sprintf("%s******%s", userInfo.Phone[0:3], userInfo.Phone[len(userInfo.Phone)-2:])
-			}
-			c.ResponseWithStatus(http.StatusBadRequest, map[string]interface{}{
-				"status": 110,
-				"msg":    "需要验证手机号码！",
-				"uid":    userInfo.UID,
-				"phone":  phone,
-			})
-			return
-		}
-		u.Error("登录执行失败", zap.String("uid", userInfo.UID), zap.Error(err))
-		respondUserServiceError(c)
+		u.respondExecLoginError(c, err, userInfo)
 		return
 	}
 
@@ -1386,9 +1379,43 @@ func (u *User) execLoginAndRespose(userInfo *Model, flag config.DeviceFlag, devi
 	go u.sentWelcomeMsg(publicIP, userInfo.UID)
 }
 
+// respondExecLoginError is the single classifier for execLogin's returned error,
+// shared by every login entry point (main / OAuth / email / username) so the
+// same condition always yields the same status:
+//   - ErrUserNeedVerification → the bespoke 110 "需要验证手机号码" response;
+//   - ErrUserDisabled         → 403 (account banned);
+//   - ErrUserDeviceInfoRequired → 400 (missing device info);
+//   - anything else           → logged + generic 500 (genuine internal failure).
+//
+// Before this existed, the OAuth/email/username paths collapsed all of these
+// onto a single 500, so a disabled account or a missing-device request looked
+// like a server outage. Keeping the mapping here avoids that divergence.
+func (u *User) respondExecLoginError(c *wkhttp.Context, err error, userInfo *Model) {
+	switch {
+	case errors.Is(err, ErrUserNeedVerification):
+		phone := ""
+		if len(userInfo.Phone) > 5 {
+			phone = fmt.Sprintf("%s******%s", userInfo.Phone[0:3], userInfo.Phone[len(userInfo.Phone)-2:])
+		}
+		c.ResponseWithStatus(http.StatusBadRequest, map[string]interface{}{
+			"status": 110,
+			"msg":    "需要验证手机号码！",
+			"uid":    userInfo.UID,
+			"phone":  phone,
+		})
+	case errors.Is(err, ErrUserDisabled):
+		respondUserError(c, errcode.ErrUserAccountBanned)
+	case errors.Is(err, ErrUserDeviceInfoRequired):
+		respondUserRequestInvalid(c, "device")
+	default:
+		u.Error("登录执行失败", zap.String("uid", userInfo.UID), zap.Error(err))
+		respondUserServiceError(c)
+	}
+}
+
 func (u *User) execLogin(userInfo *Model, flag config.DeviceFlag, device *deviceReq, loginSpanCtx context.Context) (*loginUserDetailResp, error) {
 	if userInfo.Status == int(common.UserDisable) {
-		return nil, errors.New("该用户已被禁用")
+		return nil, ErrUserDisabled
 	}
 	deviceLevel := config.DeviceLevelSlave
 	if flag == config.APP {
@@ -1397,7 +1424,7 @@ func (u *User) execLogin(userInfo *Model, flag config.DeviceFlag, device *device
 	//app登录验证设备锁
 	if flag == 0 && userInfo.DeviceLock == 1 {
 		if device == nil {
-			return nil, errors.New("登录设备信息不能为空！")
+			return nil, ErrUserDeviceInfoRequired
 		}
 		var existDevice bool
 		var err error

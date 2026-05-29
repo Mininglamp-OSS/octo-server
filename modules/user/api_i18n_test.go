@@ -437,6 +437,14 @@ func TestRespondUserHelpers(t *testing.T) {
 			wantTransStatus: http.StatusBadRequest,
 			wantContains:    "已注销或被禁用",
 		},
+		{
+			name:            "ErrUserEmailRateLimited surfaces 429 client-actionable copy (not Internal)",
+			probe:           func(c *wkhttp.Context) { respondUserError(c, errcode.ErrUserEmailRateLimited) },
+			wantCodeID:      "err.server.user.email_rate_limited",
+			wantSemStatus:   http.StatusTooManyRequests,
+			wantTransStatus: http.StatusBadRequest,
+			wantContains:    "发送过于频繁",
+		},
 	}
 
 	for _, tc := range cases {

@@ -132,6 +132,9 @@ other = "Invalid email address."
 ["err.server.user.email_login_disabled"]
 other = "Email login is not available."
 
+["err.server.user.email_rate_limited"]
+other = "Verification codes are being sent too frequently, please try again in a minute."
+
 ["err.server.user.email_register_disabled"]
 other = "Email registration is not available."
 

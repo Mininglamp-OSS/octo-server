@@ -518,6 +518,14 @@ var (
 		DefaultMessage: "Failed to send the email verification code.",
 		Internal:       true,
 	})
+	// ErrUserEmailRateLimited is the client-actionable resend cooldown (the
+	// 1-minute throttle in EmailService.SendVerifyCode). 429, not Internal, so
+	// the actionable "try again shortly" message reaches the client.
+	ErrUserEmailRateLimited = register(codes.Code{
+		ID:             "err.server.user.email_rate_limited",
+		HTTPStatus:     http.StatusTooManyRequests,
+		DefaultMessage: "Verification codes are being sent too frequently, please try again in a minute.",
+	})
 
 	// Username / Web3 signature login (modules/user/api_usernamelogin.go) codes.
 	// Reuse registration_closed / local_login_disabled / invalid_credentials /

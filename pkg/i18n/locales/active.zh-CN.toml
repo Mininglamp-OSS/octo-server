@@ -333,6 +333,9 @@ other = "该账号已注销或被禁用。"
 ["err.server.user.email_send_failed"]
 other = "发送邮箱验证码失败。"
 
+["err.server.user.email_rate_limited"]
+other = "验证码发送过于频繁，请 1 分钟后再试。"
+
 # ---- err.server.user.* (Phase 2.1 modules/user/api_usernamelogin.go migration) ----
 
 ["err.server.user.username_register_disabled"]

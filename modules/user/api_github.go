@@ -79,8 +79,7 @@ func (u *User) githubOAuth(c *wkhttp.Context) {
 		}
 		loginResp, err = u.execLogin(userInfoM, deviceFlag, nil, loginSpanCtx)
 		if err != nil {
-			u.Error("github 登录失败", zap.Error(err))
-			respondUserError(c, errcode.ErrUserStoreFailed)
+			u.respondExecLoginError(c, err, userInfoM)
 			return
 		}
 		// 发送登录消息

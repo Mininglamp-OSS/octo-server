@@ -139,8 +139,7 @@ func (u *User) usernameLogin(c *wkhttp.Context) {
 
 	result, err := u.execLogin(userInfo, config.DeviceFlag(req.Flag), req.Device, loginSpanCtx)
 	if err != nil {
-		u.Error("用户名登录 execLogin 失败", zap.String("username", req.Username), zap.Error(err))
-		respondUserError(c, errcode.ErrUserStoreFailed)
+		u.respondExecLoginError(c, err, userInfo)
 		return
 	}
 	needUploadWeb3PublicKey := 0

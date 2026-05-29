@@ -68,6 +68,12 @@ func NewEmailService(ctx *config.Context, settings SMTPSettingsProvider) *EmailS
 	}
 }
 
+// ErrEmailSendRateLimited is returned by SendVerifyCode when the per-address
+// 1-minute resend cooldown is still active. It is a client-actionable condition
+// (HTTP 429), not an internal failure — callers should branch on it with
+// errors.Is rather than collapsing it onto a generic send-failure code.
+var ErrEmailSendRateLimited = errors.New("发送过于频繁，请1分钟后再试")
+
 // SendVerifyCode 发送验证码
 func (s *EmailService) SendVerifyCode(ctx context.Context, email string, codeType CodeType) error {
 	// 检查发送频率限制
@@ -77,7 +83,7 @@ func (s *EmailService) SendVerifyCode(ctx context.Context, email string, codeTyp
 		return err
 	}
 	if exists != "" {
-		return errors.New("发送过于频繁，请1分钟后再试")
+		return ErrEmailSendRateLimited
 	}
 
 	// 生成6位验证码

@@ -929,7 +929,7 @@ func (m *Manager) liftBanUser(c *wkhttp.Context) {
 	}
 	userInfo, err := m.userDB.QueryByUID(uid)
 	if err != nil {
-		m.Error("查询用户信息失败！", zap.String("uid", uid))
+		m.Error("查询用户信息失败！", zap.String("uid", uid), zap.Error(err))
 		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}

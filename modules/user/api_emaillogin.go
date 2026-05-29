@@ -2,6 +2,7 @@ package user
 
 import (
 	"context"
+	"errors"
 	"runtime/debug"
 	"strings"
 
@@ -65,6 +66,13 @@ func (u *User) emailSendCode(c *wkhttp.Context) {
 
 	emailService := commonapi.NewEmailService(u.ctx, common.EnsureSystemSettings(u.ctx))
 	if err := emailService.SendVerifyCode(context.Background(), req.Email, commonapi.CodeType(req.CodeType)); err != nil {
+		// 1 分钟重发冷却是客户端可处理状态 → 429（文案可见），其余（Redis/SMTP）
+		// 才是 5xx 内部故障。
+		if errors.Is(err, commonapi.ErrEmailSendRateLimited) {
+			u.Warn("邮箱验证码发送过于频繁", zap.String("email", req.Email))
+			respondUserError(c, errcode.ErrUserEmailRateLimited)
+			return
+		}
 		u.Error("发送邮箱验证码失败", zap.String("email", req.Email), zap.Error(err))
 		respondUserError(c, errcode.ErrUserEmailSendFailed)
 		return
@@ -310,8 +318,7 @@ func (u *User) emailLogin(c *wkhttp.Context) {
 
 	result, err := u.execLogin(userInfo, config.DeviceFlag(req.Flag), req.Device, loginSpanCtx)
 	if err != nil {
-		u.Error("邮箱登录 execLogin 失败", zap.String("email", req.Email), zap.Error(err))
-		respondUserError(c, errcode.ErrUserStoreFailed)
+		u.respondExecLoginError(c, err, userInfo)
 		return
 	}
 	c.Response(result)

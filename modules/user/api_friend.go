@@ -725,14 +725,18 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 	key := f.ctx.GetConfig().Cache.FriendApplyTokenCachePrefix + req.Token + loginUID
 	tokenVaule, err := f.ctx.Cache().Get(key) // 获取申请人的uid
 	if err != nil {
+		// 真正的 Redis 读取故障 → 5xx；token 过期/缺失走的是 ("", nil)，由下方
+		// JsonToMap 分支按客户端错误处理。
 		f.Error("获取好友申请token的信息失败！", zap.Error(err), zap.String("key", key))
-		respondUserError(c, errcode.ErrUserDecodeFailed)
+		respondUserError(c, errcode.ErrUserTokenCacheFailed)
 		return
 	}
 	valueMap, err := util.JsonToMap(tokenVaule)
 	if err != nil {
-		f.Error("获取token信息错误", zap.Error(err), zap.String("key", key))
-		respondUserError(c, errcode.ErrUserDecodeFailed)
+		// 过期/缺失的 token 表现为空串或非法 payload —— 属客户端态（链接失效），
+		// 返回 400 而非 500，避免把"好友申请已过期"误报成服务器故障。
+		f.Warn("好友申请 token 无效或已过期", zap.Error(err), zap.String("key", key))
+		respondUserError(c, errcode.ErrUserFriendApplyInvalid)
 		return
 	}
 
