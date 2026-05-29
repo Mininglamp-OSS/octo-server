@@ -407,4 +407,80 @@ var (
 		HTTPStatus:     http.StatusBadRequest,
 		DefaultMessage: "Friend request is invalid or has expired.",
 	})
+
+	// Account deactivation (modules/user/api_destroy.go) codes. Reuse
+	// account_destroying / account_destroyed / destroy_failed above; the codes
+	// below cover the destroy-specific guards.
+
+	ErrUserPasswordNotSet = register(codes.Code{
+		ID:             "err.server.user.password_not_set",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "This account has no password set; identity cannot be verified.",
+	})
+	ErrUserPasswordIncorrect = register(codes.Code{
+		ID:             "err.server.user.password_incorrect",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Incorrect password.",
+	})
+	// ErrUserAccountStateChanged maps the optimistic-lock conflict
+	// (ErrDestroyStateConflict) when a concurrent request changed the
+	// deactivation state out from under this one.
+	ErrUserAccountStateChanged = register(codes.Code{
+		ID:             "err.server.user.account_state_changed",
+		HTTPStatus:     http.StatusConflict,
+		DefaultMessage: "Account status has changed, please refresh and try again.",
+	})
+	ErrUserNotDestroying = register(codes.Code{
+		ID:             "err.server.user.not_destroying",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Account is not pending deactivation.",
+	})
+
+	// Pinned channels (modules/user/api_pinned.go) codes.
+
+	ErrUserPinnedAlreadyExists = register(codes.Code{
+		ID:             "err.server.user.pinned_already_exists",
+		HTTPStatus:     http.StatusConflict,
+		DefaultMessage: "This channel is already pinned.",
+	})
+	ErrUserPinnedLimitExceeded = register(codes.Code{
+		ID:             "err.server.user.pinned_limit_exceeded",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "The pinned channel limit has been reached.",
+		SafeDetailKeys: []string{"max"},
+	})
+	// ErrUserChannelAccessDenied collapses the validateChannelAccess guard
+	// rejections (not a friend / not a group member / bot not added). Internal
+	// check failures inside that helper are logged server-side and also surface
+	// here; splitting them into a 5xx is a follow-up.
+	ErrUserChannelAccessDenied = register(codes.Code{
+		ID:             "err.server.user.channel_access_denied",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "You do not have access to this channel.",
+	})
+	ErrUserPinnedSortInvalid = register(codes.Code{
+		ID:             "err.server.user.pinned_sort_invalid",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Invalid pinned sort request.",
+	})
+
+	// Third-party OAuth login (modules/user/api_gitee.go, api_github.go) codes.
+
+	ErrUserOAuthStateExpired = register(codes.Code{
+		ID:             "err.server.user.oauth_state_expired",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Login session has expired, please try again.",
+	})
+	ErrUserOAuthExchangeFailed = register(codes.Code{
+		ID:             "err.server.user.oauth_exchange_failed",
+		HTTPStatus:     http.StatusBadGateway,
+		DefaultMessage: "Failed to exchange the OAuth access token.",
+		Internal:       true,
+	})
+	ErrUserOAuthProfileFailed = register(codes.Code{
+		ID:             "err.server.user.oauth_profile_failed",
+		HTTPStatus:     http.StatusBadGateway,
+		DefaultMessage: "Failed to fetch the OAuth user profile.",
+		Internal:       true,
+	})
 )

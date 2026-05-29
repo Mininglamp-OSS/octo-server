@@ -280,3 +280,38 @@ other = "好友申请无效或已过期。"
 
 ["err.server.user.device_not_found"]
 other = "未查询到该设备。"
+
+# ---- err.server.user.* (Phase 2.1 destroy / pinned / oauth migration) ----
+
+["err.server.user.password_not_set"]
+other = "当前账号未设置密码，无法验证身份。"
+
+["err.server.user.password_incorrect"]
+other = "密码错误。"
+
+["err.server.user.account_state_changed"]
+other = "账号状态已变化，请刷新后重试。"
+
+["err.server.user.not_destroying"]
+other = "账号未在注销中。"
+
+["err.server.user.pinned_already_exists"]
+other = "该频道已置顶。"
+
+["err.server.user.pinned_limit_exceeded"]
+other = "置顶频道数量已达上限。"
+
+["err.server.user.channel_access_denied"]
+other = "你无权访问该频道。"
+
+["err.server.user.pinned_sort_invalid"]
+other = "置顶排序参数无效。"
+
+["err.server.user.oauth_state_expired"]
+other = "登录状态已过期，请重试。"
+
+["err.server.user.oauth_exchange_failed"]
+other = "获取第三方授权令牌失败。"
+
+["err.server.user.oauth_profile_failed"]
+other = "获取第三方用户信息失败。"

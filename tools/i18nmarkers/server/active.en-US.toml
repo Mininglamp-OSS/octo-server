@@ -69,6 +69,9 @@ other = "This account has been deactivated."
 ["err.server.user.account_destroying"]
 other = "Account is in the deactivation cooldown period, please use a newer client to revoke or check status."
 
+["err.server.user.account_state_changed"]
+other = "Account status has changed, please refresh and try again."
+
 ["err.server.user.already_exists"]
 other = "User already exists."
 
@@ -95,6 +98,9 @@ other = "You cannot add yourself as a friend."
 
 ["err.server.user.cannot_delete_super_admin"]
 other = "The super administrator account cannot be deleted."
+
+["err.server.user.channel_access_denied"]
+other = "You do not have access to this channel."
 
 ["err.server.user.chat_pwd_update_failed"]
 other = "Failed to update chat password."
@@ -174,14 +180,32 @@ other = "The new password must be different from the current one."
 ["err.server.user.not_admin_account"]
 other = "This user is not an administrator account and cannot be deleted."
 
+["err.server.user.not_destroying"]
+other = "Account is not pending deactivation."
+
 ["err.server.user.not_found"]
 other = "User not found."
+
+["err.server.user.oauth_exchange_failed"]
+other = "Failed to exchange the OAuth access token."
+
+["err.server.user.oauth_profile_failed"]
+other = "Failed to fetch the OAuth user profile."
+
+["err.server.user.oauth_state_expired"]
+other = "Login session has expired, please try again."
 
 ["err.server.user.old_password_incorrect"]
 other = "The current password is incorrect."
 
+["err.server.user.password_incorrect"]
+other = "Incorrect password."
+
 ["err.server.user.password_mismatch"]
 other = "The two passwords do not match."
+
+["err.server.user.password_not_set"]
+other = "This account has no password set; identity cannot be verified."
 
 ["err.server.user.password_process_failed"]
 other = "Failed to process password."
@@ -191,6 +215,15 @@ other = "Password must be at least 6 characters."
 
 ["err.server.user.phone_region_unsupported"]
 other = "Only mainland China phone numbers are supported."
+
+["err.server.user.pinned_already_exists"]
+other = "This channel is already pinned."
+
+["err.server.user.pinned_limit_exceeded"]
+other = "The pinned channel limit has been reached."
+
+["err.server.user.pinned_sort_invalid"]
+other = "Invalid pinned sort request."
 
 ["err.server.user.qr_ver_code_missing"]
 other = "User has no QR verification code."
