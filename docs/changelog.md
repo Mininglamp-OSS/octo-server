@@ -14,7 +14,7 @@
 - CD 改为手动触发（有在线用户，需控制部署窗口）
 
 ### 改进
-- npm 包名冲突修复 — V2 版本 (1.0.0/1.0.1) 从 `openclaw-channel-dmwork` 下架，V2 独立为 `openclaw-channel-deepim`
+- npm 包名冲突修复 — V2 版本 (1.0.0/1.0.1) 从 `octo` 下架，V2 独立为 `openclaw-channel-deepim`
 - OpenClaw adapter 升级到 0.2.19（媒体消息、@mention 修复）
 - 开发流程新增 Issue 认领步骤，避免重复开发
 

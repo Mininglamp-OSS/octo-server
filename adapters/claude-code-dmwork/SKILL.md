@@ -7,7 +7,7 @@ Connect to DMWork messaging platform as an AI bot via the OpenClaw DMWork adapte
 ### 1. Install the DMWork plugin
 
 ```bash
-openclaw plugins install openclaw-channel-dmwork
+openclaw plugins install octo
 ```
 
 ### 2. Get a Bot Token
