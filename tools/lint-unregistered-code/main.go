@@ -149,19 +149,28 @@ func isResponseErrorL(e ast.Expr) bool {
 }
 
 // isCodeCompositeLit reports whether the expression is an inline composite
-// literal of type Code / codes.Code (optionally pointer-wrapped).
+// literal of type Code / codes.Code, unwrapping the equivalent forms a caller
+// might use to express the same literal:
+//   - &codes.Code{...}      (*ast.UnaryExpr, address-of)
+//   - (codes.Code{...})     (*ast.ParenExpr, parenthesized — would otherwise
+//                            slip the gate, PR #193 review)
 func isCodeCompositeLit(e ast.Expr) bool {
-	cl, ok := e.(*ast.CompositeLit)
-	if !ok {
-		// Also catch &codes.Code{...}.
-		if u, ok := e.(*ast.UnaryExpr); ok {
-			return isCodeCompositeLit(u.X)
-		}
-		return false
+	switch t := e.(type) {
+	case *ast.ParenExpr:
+		return isCodeCompositeLit(t.X)
+	case *ast.UnaryExpr:
+		return isCodeCompositeLit(t.X)
+	case *ast.CompositeLit:
+		return isCodeType(t.Type)
 	}
-	return isCodeType(cl.Type)
+	return false
 }
 
+// isCodeType matches any type named Code (bare Code or pkg.Code). The match is
+// intentionally loose on the package qualifier: at the only call site
+// (ResponseErrorL's second argument, whose declared type is codes.Code) a
+// composite literal named Code can only be codes.Code, so a false positive is
+// not reachable in practice.
 func isCodeType(e ast.Expr) bool {
 	switch t := e.(type) {
 	case *ast.SelectorExpr:

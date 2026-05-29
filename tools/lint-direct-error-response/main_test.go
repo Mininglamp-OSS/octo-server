@@ -77,6 +77,29 @@ func TestLoadBaseline(t *testing.T) {
 	}
 }
 
+func TestLoadBaseline_TrailingAnnotation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "baseline.txt")
+	// PR #193 review: rows may carry a trailing EXEMPT note / inline comment.
+	writeFile(t, dir, "baseline.txt", `4 modules/webhook/github.go  # EXEMPT: external GH
+9 modules/app_bot/app_bot.go EXEMPT
+8 modules/user/api.go
+`)
+	b, err := loadBaseline(path)
+	if err != nil {
+		t.Fatalf("loadBaseline with annotations: %v", err)
+	}
+	if b["modules/webhook/github.go"] != 4 {
+		t.Fatalf("inline-comment row = %d, want 4", b["modules/webhook/github.go"])
+	}
+	if b["modules/app_bot/app_bot.go"] != 9 {
+		t.Fatalf("trailing-token row = %d, want 9", b["modules/app_bot/app_bot.go"])
+	}
+	if b["modules/user/api.go"] != 8 {
+		t.Fatalf("plain row = %d, want 8", b["modules/user/api.go"])
+	}
+}
+
 func TestLoadBaseline_Malformed(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "baseline.txt")

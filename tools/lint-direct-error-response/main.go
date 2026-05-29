@@ -181,11 +181,19 @@ func loadBaseline(path string) (map[string]int, error) {
 	for sc.Scan() {
 		lineNo++
 		line := strings.TrimSpace(sc.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
+		// Strip a trailing inline comment so rows may carry annotations, e.g.
+		//   4 modules/webhook/github.go  # EXEMPT: external GH webhook
+		if i := strings.Index(line, "#"); i >= 0 {
+			line = strings.TrimSpace(line[:i])
+		}
+		if line == "" {
 			continue
 		}
 		fields := strings.Fields(line)
-		if len(fields) != 2 {
+		// Require at least "<count> <path>"; tolerate trailing tokens (e.g. a
+		// bare EXEMPT marker) so the format can grow annotations without
+		// turning a documentation convention into a CI footgun (PR #193 review).
+		if len(fields) < 2 {
 			return nil, fmt.Errorf("malformed baseline line %d: %q (want '<count> <path>')", lineNo, line)
 		}
 		n, convErr := strconv.Atoi(fields[0])

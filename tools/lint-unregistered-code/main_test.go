@@ -52,6 +52,8 @@ func TestIsCodeCompositeLit(t *testing.T) {
 		`codes.Code{ID: "x"}`:        true,
 		`Code{ID: "x"}`:              true,
 		`&codes.Code{ID: "x"}`:       true,
+		`(codes.Code{ID: "x"})`:      true, // parenthesized — must not slip the gate
+		`(&codes.Code{ID: "x"})`:     true,
 		"errcode.ErrUserStoreFailed": false,
 		"code":                       false,
 		"someStruct{A: 1}":           false,
@@ -111,6 +113,15 @@ func h(c *Ctx) { httperr.ResponseErrorL(c, codes.Code{ID: "err.server.foo"}, nil
 func h(c *Ctx) { httperr.ResponseErrorL(c, &codes.Code{ID: "x"}, nil, nil) }
 `); n != 1 {
 			t.Fatalf("violations=%d, want 1 (&codes.Code literal)", n)
+		}
+	})
+
+	t.Run("parenthesized inline literal flagged", func(t *testing.T) {
+		// PR #193 review: parens must not let a literal slip the gate.
+		if n := scanSrc(t, `package x
+func h(c *Ctx) { httperr.ResponseErrorL(c, (codes.Code{ID: "x"}), nil, nil) }
+`); n != 1 {
+			t.Fatalf("violations=%d, want 1 (parenthesized literal)", n)
 		}
 	})
 
