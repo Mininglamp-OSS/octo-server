@@ -82,6 +82,12 @@ func (d *fakeLangDB) UpdateLanguageByUID(uid, lang string) error {
 		return d.updateErr
 	}
 	d.updates[uid] = lang
+	// Write through to the read map so a subsequent QueryLanguageByUID
+	// observes the new value — models the single DB row that both the
+	// write and read paths hit in production. Existing tests assert on
+	// `updates` (what was written); this keeps those assertions intact
+	// while letting read-after-write convergence tests see the change.
+	d.lang[uid] = lang
 	return nil
 }
 
