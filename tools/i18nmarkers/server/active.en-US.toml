@@ -72,6 +72,9 @@ other = "Account is in the deactivation cooldown period, please use a newer clie
 ["err.server.user.account_state_changed"]
 other = "Account status has changed, please refresh and try again."
 
+["err.server.user.account_unavailable"]
+other = "This account has been deactivated or disabled."
+
 ["err.server.user.already_exists"]
 other = "User already exists."
 
@@ -122,6 +125,18 @@ other = "Failed to deactivate account."
 
 ["err.server.user.device_not_found"]
 other = "Device not found."
+
+["err.server.user.email_invalid"]
+other = "Invalid email address."
+
+["err.server.user.email_login_disabled"]
+other = "Email login is not available."
+
+["err.server.user.email_register_disabled"]
+other = "Email registration is not available."
+
+["err.server.user.email_send_failed"]
+other = "Failed to send the email verification code."
 
 ["err.server.user.file_operation_failed"]
 other = "Failed to process file."
@@ -225,6 +240,12 @@ other = "The pinned channel limit has been reached."
 ["err.server.user.pinned_sort_invalid"]
 other = "Invalid pinned sort request."
 
+["err.server.user.public_key_already_exists"]
+other = "A public key has already been uploaded for this user."
+
+["err.server.user.public_key_not_found"]
+other = "This user has not uploaded a public key."
+
 ["err.server.user.qr_ver_code_missing"]
 other = "User has no QR verification code."
 
@@ -249,6 +270,12 @@ other = "Short ID must start with a letter and contain 6-20 letters, digits, und
 ["err.server.user.short_no_gen_failed"]
 other = "Failed to generate a short ID."
 
+["err.server.user.signature_invalid"]
+other = "Signature verification failed."
+
+["err.server.user.signature_not_found"]
+other = "Signature challenge does not exist or has expired."
+
 ["err.server.user.sms_send_failed"]
 other = "Failed to send SMS."
 
@@ -263,6 +290,15 @@ other = "Token is required."
 
 ["err.server.user.update_not_allowed"]
 other = "This field cannot be updated."
+
+["err.server.user.username_format_invalid"]
+other = "Username must be 8-22 characters."
+
+["err.server.user.username_register_disabled"]
+other = "Username registration is not available."
+
+["err.server.user.verify_type_invalid"]
+other = "Invalid verification type."
 
 ["err.server.user.wechat_exchange_failed"]
 other = "Failed to exchange WeChat access token."

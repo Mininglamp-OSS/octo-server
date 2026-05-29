@@ -483,4 +483,84 @@ var (
 		DefaultMessage: "Failed to fetch the OAuth user profile.",
 		Internal:       true,
 	})
+
+	// Email login / registration (modules/user/api_emaillogin.go) codes. Reuse
+	// registration_closed / local_login_disabled / invalid_credentials /
+	// already_exists / not_found / password_too_short / code_invalid /
+	// register_failed / login_pwd_update_failed / password_process_failed above.
+
+	ErrUserEmailInvalid = register(codes.Code{
+		ID:             "err.server.user.email_invalid",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Invalid email address.",
+	})
+	ErrUserEmailRegisterDisabled = register(codes.Code{
+		ID:             "err.server.user.email_register_disabled",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "Email registration is not available.",
+	})
+	ErrUserEmailLoginDisabled = register(codes.Code{
+		ID:             "err.server.user.email_login_disabled",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "Email login is not available.",
+	})
+	// ErrUserAccountUnavailable covers the code-login branch that surfaces a
+	// deactivated-or-banned account (the password branch unifies onto
+	// invalid_credentials to avoid enumeration).
+	ErrUserAccountUnavailable = register(codes.Code{
+		ID:             "err.server.user.account_unavailable",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "This account has been deactivated or disabled.",
+	})
+	ErrUserEmailSendFailed = register(codes.Code{
+		ID:             "err.server.user.email_send_failed",
+		HTTPStatus:     http.StatusInternalServerError,
+		DefaultMessage: "Failed to send the email verification code.",
+		Internal:       true,
+	})
+
+	// Username / Web3 signature login (modules/user/api_usernamelogin.go) codes.
+	// Reuse registration_closed / local_login_disabled / invalid_credentials /
+	// already_exists / not_found / current_not_found / login_locked /
+	// password_too_short / old_password_incorrect / new_password_same_as_old /
+	// password_process_failed / login_pwd_update_failed / register_failed /
+	// query_failed / store_failed / token_cache_failed above.
+
+	ErrUserUsernameRegisterDisabled = register(codes.Code{
+		ID:             "err.server.user.username_register_disabled",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "Username registration is not available.",
+	})
+	ErrUserUsernameFormatInvalid = register(codes.Code{
+		ID:             "err.server.user.username_format_invalid",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Username must be 8-22 characters.",
+	})
+	ErrUserPublicKeyNotFound = register(codes.Code{
+		ID:             "err.server.user.public_key_not_found",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "This user has not uploaded a public key.",
+	})
+	ErrUserPublicKeyAlreadyExists = register(codes.Code{
+		ID:             "err.server.user.public_key_already_exists",
+		HTTPStatus:     http.StatusConflict,
+		DefaultMessage: "A public key has already been uploaded for this user.",
+	})
+	// ErrUserSignatureNotFound covers a missing / expired Web3 verify-text
+	// challenge (the cached nonce the client must sign is gone or mismatched).
+	ErrUserSignatureNotFound = register(codes.Code{
+		ID:             "err.server.user.signature_not_found",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Signature challenge does not exist or has expired.",
+	})
+	ErrUserSignatureInvalid = register(codes.Code{
+		ID:             "err.server.user.signature_invalid",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Signature verification failed.",
+	})
+	ErrUserVerifyTypeInvalid = register(codes.Code{
+		ID:             "err.server.user.verify_type_invalid",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Invalid verification type.",
+	})
 )

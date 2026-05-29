@@ -315,3 +315,43 @@ other = "获取第三方授权令牌失败。"
 
 ["err.server.user.oauth_profile_failed"]
 other = "获取第三方用户信息失败。"
+
+# ---- err.server.user.* (Phase 2.1 modules/user/api_emaillogin.go migration) ----
+
+["err.server.user.email_invalid"]
+other = "邮箱格式不正确。"
+
+["err.server.user.email_register_disabled"]
+other = "暂不支持邮箱注册。"
+
+["err.server.user.email_login_disabled"]
+other = "暂不支持邮箱登录。"
+
+["err.server.user.account_unavailable"]
+other = "该账号已注销或被禁用。"
+
+["err.server.user.email_send_failed"]
+other = "发送邮箱验证码失败。"
+
+# ---- err.server.user.* (Phase 2.1 modules/user/api_usernamelogin.go migration) ----
+
+["err.server.user.username_register_disabled"]
+other = "暂不支持用户名注册。"
+
+["err.server.user.username_format_invalid"]
+other = "用户名必须为 8-22 位。"
+
+["err.server.user.public_key_not_found"]
+other = "该用户未上传公钥。"
+
+["err.server.user.public_key_already_exists"]
+other = "该用户已上传过公钥信息。"
+
+["err.server.user.signature_not_found"]
+other = "签名校验信息不存在或已过期。"
+
+["err.server.user.signature_invalid"]
+other = "签名校验失败。"
+
+["err.server.user.verify_type_invalid"]
+other = "验证类型不匹配。"
