@@ -118,6 +118,12 @@ func respondManagerForbidden(c *wkhttp.Context) {
 	httperr.ResponseErrorL(c, errSharedForbidden, nil, nil)
 }
 
+// respondUserPinnedLimitExceeded surfaces the per-space pinned-channel cap so
+// the client can render a localized hint without hard-coding the limit.
+func respondUserPinnedLimitExceeded(c *wkhttp.Context, max int) {
+	httperr.ResponseErrorL(c, errcode.ErrUserPinnedLimitExceeded, nil, i18n.Details{"max": max})
+}
+
 // respondUserListFilterConflict reports a pair of mutually-exclusive list
 // filters (e.g. bot_only + exclude_bot). The offending filter and the one it
 // conflicts with are surfaced as details so a frontend dev can spot the bad
