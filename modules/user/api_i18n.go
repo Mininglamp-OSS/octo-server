@@ -74,6 +74,10 @@ func respondUserLockMinuteOutOfRange(c *wkhttp.Context) {
 // than silently rendering an empty envelope at request time.
 var errSharedAuthRequired = mustLookupSharedCode("err.shared.auth.required")
 
+// errSharedForbidden caches the shared 403 code used by the manager role
+// guards (CheckLoginRole / CheckLoginRoleIsSuperAdmin).
+var errSharedForbidden = mustLookupSharedCode("err.shared.auth.forbidden")
+
 func mustLookupSharedCode(id string) codes.Code {
 	c, ok := codes.Lookup(id)
 	if !ok {
@@ -101,4 +105,26 @@ func respondUserNotLoggedIn(c *wkhttp.Context) {
 // layer sentinel extraction is deferred (TODOS L219 follow-up).
 func respondUserServiceError(c *wkhttp.Context) {
 	httperr.ResponseErrorL(c, errcode.ErrUserStoreFailed, nil, nil)
+}
+
+// respondManagerForbidden renders the shared 403 envelope for the management
+// console role guards. wkhttp's CheckLoginRole / CheckLoginRoleIsSuperAdmin
+// return a plain Chinese error ("登录用户角色错误" / "该用户无权执行此操作");
+// both are authorization failures, so they collapse to err.shared.auth.forbidden
+// rather than leaking the raw framework string on the wire. This raises the
+// legacy HTTP 400 to a semantically-correct 403 (consistent with the rest of
+// the Phase 2.1 status-code migration).
+func respondManagerForbidden(c *wkhttp.Context) {
+	httperr.ResponseErrorL(c, errSharedForbidden, nil, nil)
+}
+
+// respondUserListFilterConflict reports a pair of mutually-exclusive list
+// filters (e.g. bot_only + exclude_bot). The offending filter and the one it
+// conflicts with are surfaced as details so a frontend dev can spot the bad
+// query construction.
+func respondUserListFilterConflict(c *wkhttp.Context, filter, conflictsWith string) {
+	httperr.ResponseErrorL(c, errcode.ErrUserListFilterConflict, nil, i18n.Details{
+		"filter":         filter,
+		"conflicts_with": conflictsWith,
+	})
 }
