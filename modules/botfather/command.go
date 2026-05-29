@@ -475,7 +475,7 @@ func (h *commandHandler) handleQuickstart(fromUID string) {
 
 func (h *commandHandler) handleInstall(fromUID string) {
 	h.sm.Clear(fromUID, h.spaceID(fromUID))
-	h.reply(fromUID, "📦 **安装/更新 Octo 插件**\n\n💡 建议先将 OpenClaw 升级到最新版本以获得最佳体验。\n\n📋 **把下面命令发给 OpenClaw 模型执行：**\n\n```\nnpx -y create-openclaw-octo install\n```\n\n安装完成后，使用 /newbot 创建单个 bot 或 /quickstart 批量创建。")
+	h.reply(fromUID, "📦 **安装/更新 Octo 插件**\n\n💡 建议先将 OpenClaw 升级到最新版本以获得最佳体验。\n\n📋 **把下面命令发给 OpenClaw 执行：**\n\n```\nnpx -y create-openclaw-octo install\n```\n\n安装完成后，使用 /newbot 创建单个 bot 或 /quickstart 批量创建。")
 }
 
 func (h *commandHandler) handleHelp(fromUID string) {
