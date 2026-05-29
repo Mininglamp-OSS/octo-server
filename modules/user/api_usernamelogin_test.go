@@ -20,6 +20,7 @@ func TestUsernameLoginBlockedByLocalLoginOff(t *testing.T) {
 	// 的 TestSystemSettings_LocalLoginOff_AutoFalse* 系列。
 	enableFullOIDCForUserTest(t)
 	s, ctx := testutil.NewTestServer()
+	wireI18nRendererForUserTest(s)
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	setSystemSettingForUserTest(t, ctx, "login", "local_off", "1", "bool")
 	require.NoError(t, commonsettings.EnsureSystemSettings(ctx).Reload())
@@ -37,6 +38,7 @@ func TestUsernameLoginBlockedByLocalLoginOff(t *testing.T) {
 
 func TestUsernameRegisterBlockedByRegisterOff(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
+	wireI18nRendererForUserTest(s)
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	setSystemSettingForUserTest(t, ctx, "register", "off", "1", "bool")
 	setSystemSettingForUserTest(t, ctx, "register", "username_on", "1", "bool")
@@ -51,5 +53,5 @@ func TestUsernameRegisterBlockedByRegisterOff(t *testing.T) {
 	setPublicIPForUserTest(req, "9.9.9.9")
 	s.GetRoute().ServeHTTP(w, req)
 
-	assert.Contains(t, w.Body.String(), "注册通道暂不开放")
+	assert.Contains(t, w.Body.String(), "err.server.user.registration_closed")
 }

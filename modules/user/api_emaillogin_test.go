@@ -64,6 +64,7 @@ func simulateCommitFailure() error {
 
 func TestEmailRegisterBlockedByRegisterOff(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
+	wireI18nRendererForUserTest(s)
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	setSystemSettingForUserTest(t, ctx, "register", "off", "1", "bool")
 	setSystemSettingForUserTest(t, ctx, "register", "email_on", "1", "bool")
@@ -79,7 +80,7 @@ func TestEmailRegisterBlockedByRegisterOff(t *testing.T) {
 	setPublicIPForUserTest(req, "8.8.8.8")
 	s.GetRoute().ServeHTTP(w, req)
 
-	assert.Contains(t, w.Body.String(), "注册通道暂不开放")
+	assert.Contains(t, w.Body.String(), "err.server.user.registration_closed")
 }
 
 func TestEmailLoginBlockedByLocalLoginOff(t *testing.T) {
@@ -87,6 +88,7 @@ func TestEmailLoginBlockedByLocalLoginOff(t *testing.T) {
 	// TestUsernameLoginBlockedByLocalLoginOff 的同款注释。
 	enableFullOIDCForUserTest(t)
 	s, ctx := testutil.NewTestServer()
+	wireI18nRendererForUserTest(s)
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	setSystemSettingForUserTest(t, ctx, "login", "local_off", "1", "bool")
 	require.NoError(t, commonsettings.EnsureSystemSettings(ctx).Reload())
@@ -104,6 +106,7 @@ func TestEmailLoginBlockedByLocalLoginOff(t *testing.T) {
 
 func TestEmailLoginBlockedByEmailOn(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
+	wireI18nRendererForUserTest(s)
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	setSystemSettingForUserTest(t, ctx, "register", "email_on", "0", "bool")
 	require.NoError(t, commonsettings.EnsureSystemSettings(ctx).Reload())
@@ -126,6 +129,7 @@ func TestEmailLoginBlockedByEmailOn(t *testing.T) {
 func TestEmailSendCodeForLoginBlockedByLocalLoginOff(t *testing.T) {
 	enableFullOIDCForUserTest(t) // 让 local_off=1 通过安全回退,验证守卫本身
 	s, ctx := testutil.NewTestServer()
+	wireI18nRendererForUserTest(s)
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	setSystemSettingForUserTest(t, ctx, "login", "local_off", "1", "bool")
 	// 把 register.email_on 显式置 1,排除"被另一个开关拦下"的混淆。
@@ -155,6 +159,7 @@ func TestEmailSendCodeForLoginBlockedByLocalLoginOff(t *testing.T) {
 
 func TestEmailSendCodeBlockedByEmailOnForLoginAndRegister(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
+	wireI18nRendererForUserTest(s)
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	setSystemSettingForUserTest(t, ctx, "register", "email_on", "0", "bool")
 	require.NoError(t, commonsettings.EnsureSystemSettings(ctx).Reload())
@@ -174,6 +179,7 @@ func TestEmailSendCodeBlockedByEmailOnForLoginAndRegister(t *testing.T) {
 
 func TestEmailSendRegisterCodeBlockedByRegisterOff(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
+	wireI18nRendererForUserTest(s)
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	setSystemSettingForUserTest(t, ctx, "register", "off", "1", "bool")
 	setSystemSettingForUserTest(t, ctx, "register", "email_on", "1", "bool")
@@ -187,11 +193,12 @@ func TestEmailSendRegisterCodeBlockedByRegisterOff(t *testing.T) {
 	setPublicIPForUserTest(req, "1.0.0.1")
 	s.GetRoute().ServeHTTP(w, req)
 
-	assert.Contains(t, w.Body.String(), "注册通道暂不开放")
+	assert.Contains(t, w.Body.String(), "err.server.user.registration_closed")
 }
 
 func TestEmailForgetPasswordCodeAllowedWhenEmailLoginDisabled(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
+	wireI18nRendererForUserTest(s)
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	setSystemSettingForUserTest(t, ctx, "register", "email_on", "0", "bool")
 	require.NoError(t, commonsettings.EnsureSystemSettings(ctx).Reload())

@@ -71,6 +71,42 @@ func TestManagerAPINoLegacyResponseError(t *testing.T) {
 	}
 }
 
+// TestMigratedUserFilesNoLegacyResponseError pins the Phase 2.1 contract that
+// the remaining migrated modules/user handlers do not regress to legacy
+// octo-lib error responses. Comments are stripped first so commented-out
+// breadcrumbs do not trip the guard. New handler files that still rely on
+// c.ResponseError / c.ResponseErrorf must NOT be added to this list — migrate
+// them instead.
+func TestMigratedUserFilesNoLegacyResponseError(t *testing.T) {
+	files := []string{
+		"api_friend.go", "api_online.go", "api_setting.go", "api_maillist.go",
+		"api_device.go", "api_destroy.go", "api_pinned.go", "api_gitee.go",
+		"api_github.go", "api_emaillogin.go", "api_usernamelogin.go",
+	}
+	for _, f := range files {
+		t.Run(f, func(t *testing.T) {
+			data, err := os.ReadFile(f)
+			if err != nil {
+				t.Fatalf("read %s: %v", f, err)
+			}
+			var clean strings.Builder
+			for _, line := range strings.Split(string(data), "\n") {
+				if idx := strings.Index(line, "//"); idx >= 0 {
+					line = line[:idx]
+				}
+				clean.WriteString(line)
+				clean.WriteByte('\n')
+			}
+			cleaned := clean.String()
+			for _, banned := range []string{".ResponseError(", ".ResponseErrorf("} {
+				if strings.Contains(cleaned, banned) {
+					t.Fatalf("modules/user/%s must use httperr.ResponseErrorL via respond* helpers instead of legacy %s", f, banned)
+				}
+			}
+		})
+	}
+}
+
 // helperHarness mounts a single GET /probe route that invokes the supplied
 // helper. Tests exercise the helper directly without paying the DB / auth
 // setup cost — the contract we care about is what the wkhttp envelope
@@ -322,6 +358,84 @@ func TestRespondUserHelpers(t *testing.T) {
 			wantTransStatus: http.StatusBadRequest,
 			wantContains:    "服务器内部错误",
 			wantNotContains: "short ID",
+		},
+
+		// ---- Phase 2.1 pinned / oauth / web3 / email codes ----
+		{
+			name: "respondUserPinnedLimitExceeded carries the max detail",
+			probe: func(c *wkhttp.Context) {
+				respondUserPinnedLimitExceeded(c, 7)
+			},
+			wantCodeID:      "err.server.user.pinned_limit_exceeded",
+			wantSemStatus:   http.StatusBadRequest,
+			wantTransStatus: http.StatusBadRequest,
+			wantContains:    "置顶频道数量已达上限",
+			wantDetails:     map[string]any{"max": float64(7)},
+		},
+		{
+			name:            "ErrUserChannelAccessDenied surfaces 403 zh-CN copy",
+			probe:           func(c *wkhttp.Context) { respondUserError(c, errcode.ErrUserChannelAccessDenied) },
+			wantCodeID:      "err.server.user.channel_access_denied",
+			wantSemStatus:   http.StatusForbidden,
+			wantTransStatus: http.StatusBadRequest,
+			wantContains:    "无权访问该频道",
+		},
+		{
+			name:            "ErrUserOAuthStateExpired surfaces zh-CN copy",
+			probe:           func(c *wkhttp.Context) { respondUserError(c, errcode.ErrUserOAuthStateExpired) },
+			wantCodeID:      "err.server.user.oauth_state_expired",
+			wantSemStatus:   http.StatusBadRequest,
+			wantTransStatus: http.StatusBadRequest,
+			wantContains:    "登录状态已过期",
+		},
+		{
+			name:            "ErrUserOAuthExchangeFailed (Internal=true, 502) collapses to shared internal copy",
+			probe:           func(c *wkhttp.Context) { respondUserError(c, errcode.ErrUserOAuthExchangeFailed) },
+			wantCodeID:      "err.server.user.oauth_exchange_failed",
+			wantSemStatus:   http.StatusBadGateway,
+			wantTransStatus: http.StatusBadRequest,
+			wantContains:    "服务器内部错误",
+			wantNotContains: "OAuth",
+		},
+		{
+			name:            "ErrUserUsernameFormatInvalid surfaces zh-CN copy",
+			probe:           func(c *wkhttp.Context) { respondUserError(c, errcode.ErrUserUsernameFormatInvalid) },
+			wantCodeID:      "err.server.user.username_format_invalid",
+			wantSemStatus:   http.StatusBadRequest,
+			wantTransStatus: http.StatusBadRequest,
+			wantContains:    "用户名必须为",
+		},
+		{
+			name:            "ErrUserPublicKeyNotFound surfaces zh-CN copy",
+			probe:           func(c *wkhttp.Context) { respondUserError(c, errcode.ErrUserPublicKeyNotFound) },
+			wantCodeID:      "err.server.user.public_key_not_found",
+			wantSemStatus:   http.StatusBadRequest,
+			wantTransStatus: http.StatusBadRequest,
+			wantContains:    "未上传公钥",
+		},
+		{
+			name:            "ErrUserSignatureInvalid surfaces zh-CN copy",
+			probe:           func(c *wkhttp.Context) { respondUserError(c, errcode.ErrUserSignatureInvalid) },
+			wantCodeID:      "err.server.user.signature_invalid",
+			wantSemStatus:   http.StatusBadRequest,
+			wantTransStatus: http.StatusBadRequest,
+			wantContains:    "签名校验失败",
+		},
+		{
+			name:            "ErrUserEmailInvalid surfaces zh-CN copy",
+			probe:           func(c *wkhttp.Context) { respondUserError(c, errcode.ErrUserEmailInvalid) },
+			wantCodeID:      "err.server.user.email_invalid",
+			wantSemStatus:   http.StatusBadRequest,
+			wantTransStatus: http.StatusBadRequest,
+			wantContains:    "邮箱格式不正确",
+		},
+		{
+			name:            "ErrUserAccountUnavailable surfaces 403 zh-CN copy",
+			probe:           func(c *wkhttp.Context) { respondUserError(c, errcode.ErrUserAccountUnavailable) },
+			wantCodeID:      "err.server.user.account_unavailable",
+			wantSemStatus:   http.StatusForbidden,
+			wantTransStatus: http.StatusBadRequest,
+			wantContains:    "已注销或被禁用",
 		},
 	}
 
