@@ -9,7 +9,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
-	"github.com/pkg/errors"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"go.uber.org/zap"
 )
 
@@ -18,7 +18,7 @@ func (u *User) addMaillist(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	var req []*mailListReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("请求数据格式有误！"))
+		respondUserRequestInvalid(c, "")
 		return
 	}
 	result := make([]*mailListResp, 0)
@@ -28,13 +28,14 @@ func (u *User) addMaillist(c *wkhttp.Context) {
 	}
 	loginUser, err := u.db.QueryByUID(loginUID)
 	if err != nil {
-		c.ResponseError(errors.New("查询登录用户信息错误"))
+		u.Error("查询登录用户信息错误", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	tx, err := u.db.session.Begin()
 	if err != nil {
 		u.Error("数据库事物开启失败", zap.Error(err))
-		c.ResponseError(errors.New("数据库事物开启失败"))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	defer func() {
@@ -58,8 +59,8 @@ func (u *User) addMaillist(c *wkhttp.Context) {
 		}, tx)
 		if err != nil {
 			tx.RollbackUnlessCommitted()
-			u.Error("添加用户通讯录联系人错误")
-			c.ResponseError(errors.New("添加用户通讯录联系人错误"))
+			u.Error("添加用户通讯录联系人错误", zap.Error(err))
+			respondUserError(c, errcode.ErrUserStoreFailed)
 			return
 		}
 	}
@@ -67,7 +68,7 @@ func (u *User) addMaillist(c *wkhttp.Context) {
 	if err != nil {
 		tx.Rollback()
 		u.Error("数据库事物提交失败", zap.Error(err))
-		c.ResponseError(errors.New("数据库事物提交失败"))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	c.ResponseOK()
@@ -79,8 +80,8 @@ func (u *User) getMailList(c *wkhttp.Context) {
 	result := make([]*mailListResp, 0)
 	mailLists, err := u.maillistDB.query(loginUID)
 	if err != nil {
-		u.Error("查询用户通讯录数据错误")
-		c.ResponseError(errors.New("查询用户通讯录数据错误"))
+		u.Error("查询用户通讯录数据错误", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if mailLists == nil {
@@ -93,14 +94,14 @@ func (u *User) getMailList(c *wkhttp.Context) {
 	}
 	users, err := u.db.QueryByPhones(phones)
 	if err != nil {
-		u.Error("批量查询用户信息错误")
-		c.ResponseError(errors.New("批量查询用户信息错误"))
+		u.Error("批量查询用户信息错误", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	friends, err := u.friendDB.QueryFriends(loginUID)
 	if err != nil {
-		u.Error("查询用户好友错误")
-		c.ResponseError(errors.New("查询用户好友错误"))
+		u.Error("查询用户好友错误", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	for _, m := range mailLists {

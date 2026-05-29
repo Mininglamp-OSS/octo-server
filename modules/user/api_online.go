@@ -10,7 +10,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
-	"github.com/pkg/errors"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"go.uber.org/zap"
 )
 
@@ -20,14 +20,14 @@ func (u *User) pcQuit(c *wkhttp.Context) {
 	err := u.ctx.QuitUserDevice(c.GetLoginUID(), int(config.Web)) // 退出web
 	if err != nil {
 		u.Error("退出web设备失败", zap.Error(err))
-		c.ResponseError(errors.New("退出web设备失败"))
+		respondUserError(c, errcode.ErrUserIMCallFailed)
 		return
 	}
 
 	err = u.ctx.QuitUserDevice(c.GetLoginUID(), int(config.PC))
 	if err != nil {
 		u.Error("退出PC设备失败", zap.Error(err))
-		c.ResponseError(errors.New("退出PC设备失败"))
+		respondUserError(c, errcode.ErrUserIMCallFailed)
 		return
 	}
 
@@ -38,7 +38,8 @@ func (u *User) pcQuit(c *wkhttp.Context) {
 		CMD:         common.CMDPCQuit,
 	})
 	if err != nil {
-		c.ResponseErrorf("发送指令失败！", err)
+		u.Error("发送指令失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserIMCallFailed)
 		return
 	}
 
@@ -48,7 +49,7 @@ func (u *User) pcQuit(c *wkhttp.Context) {
 func (u *User) onlinelistWithUIDs(c *wkhttp.Context) {
 	var uids []string
 	if err := c.BindJSON(&uids); err != nil {
-		c.ResponseError(err)
+		respondUserRequestInvalid(c, "")
 		return
 	}
 	onlineResps := make([]*userOnlineResp, 0)
@@ -56,7 +57,7 @@ func (u *User) onlinelistWithUIDs(c *wkhttp.Context) {
 		onlines, err := u.onlineDB.queryUserOnlineRecets(uids)
 		if err != nil {
 			u.Error("查询用户在线状态失败！", zap.Error(err))
-			c.ResponseError(errors.New("查询用户在线状态失败！"))
+			respondUserError(c, errcode.ErrUserQueryFailed)
 			return
 		}
 		if len(onlines) > 0 {
@@ -81,7 +82,7 @@ func (u *User) onlineList(c *wkhttp.Context) {
 	friends, err := u.friendDB.QueryFriends(loginUID)
 	if err != nil {
 		u.Error("查询用户好友失败", zap.Error(err))
-		c.ResponseError(errors.New("查询用户好友失败"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	uids := make([]string, 0, len(friends))
@@ -90,19 +91,22 @@ func (u *User) onlineList(c *wkhttp.Context) {
 	}
 	resps, err := u.onlineService.GetUserLastOnlineStatus(uids)
 	if err != nil {
-		c.ResponseErrorf("获取用户在线状态失败！", err)
+		u.Error("获取用户在线状态失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	pcOnlineB, err := u.onlineDB.exist(c.GetLoginUID(), config.PC.Uint8(), 1)
 	if err != nil {
-		c.ResponseErrorf("查询指定在线设备失败！", err)
+		u.Error("查询指定在线设备失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	webOnline := 0
 	if !pcOnlineB {
 		webOnlineB, err := u.onlineDB.exist(c.GetLoginUID(), config.Web.Uint8(), 1)
 		if err != nil {
-			c.ResponseErrorf("查询指定在线设备失败！", err)
+			u.Error("查询指定在线设备失败！", zap.Error(err))
+			respondUserError(c, errcode.ErrUserQueryFailed)
 			return
 		}
 		if webOnlineB {
@@ -113,7 +117,8 @@ func (u *User) onlineList(c *wkhttp.Context) {
 	if pcOnlineB || webOnline == 1 {
 		myM, err := u.db.QueryByUID(c.GetLoginUID())
 		if err != nil {
-			c.ResponseErrorf("获取我的个人数据失败！", err)
+			u.Error("获取我的个人数据失败！", zap.Error(err))
+			respondUserError(c, errcode.ErrUserQueryFailed)
 			return
 		}
 		deviceFlag := config.Web

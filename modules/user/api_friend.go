@@ -19,6 +19,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	"github.com/Mininglamp-OSS/octo-server/modules/source"
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	wkutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
@@ -79,25 +80,25 @@ func (f *Friend) refuseApply(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	toUid := c.Param("to_uid")
 	if toUid == "" {
-		c.ResponseError(errors.New("好友ID不能为空"))
+		respondUserRequestInvalid(c, "uid")
 		return
 	}
 
 	apply, err := f.db.queryApplyWithUidAndToUid(loginUID, toUid)
 	if err != nil {
 		f.Error("查询申请记录错误", zap.Error(err))
-		c.ResponseError(errors.New("查询申请记录错误"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if apply == nil || apply.UID != loginUID {
-		c.ResponseError(errors.New("申请记录不存在"))
+		respondUserError(c, errcode.ErrUserFriendApplyNotFound)
 		return
 	}
 	apply.Status = 2
 	err = f.db.updateApply(apply)
 	if err != nil {
 		f.Error("修改申请记录错误", zap.Error(err))
-		c.ResponseError(errors.New("修改申请记录错误"))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	c.ResponseOK()
@@ -108,13 +109,13 @@ func (f *Friend) deleteApply(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	toUid := c.Param("to_uid")
 	if toUid == "" {
-		c.ResponseError(errors.New("id不能为空"))
+		respondUserRequestInvalid(c, "id")
 		return
 	}
 	err := f.db.deleteApplyWithUidAndToUid(loginUID, toUid)
 	if err != nil {
 		f.Error("删除申请记录错误", zap.Error(err))
-		c.ResponseError(errors.New("删除申请记录错误"))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	c.ResponseOK()
@@ -130,7 +131,7 @@ func (f *Friend) apply(c *wkhttp.Context) {
 	applys, err := f.db.queryApplysWithPage(loginUID, uint64(pageSize), uint64(pageIndex))
 	if err != nil {
 		f.Error("查询好友申请列表错误", zap.Error(err))
-		c.ResponseError(errors.New("查询好友申请列表错误"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	list := make([]*friendApplyResp, 0)
@@ -142,11 +143,11 @@ func (f *Friend) apply(c *wkhttp.Context) {
 		users, err := f.userService.GetUsers(uids)
 		if err != nil {
 			f.Error("查询申请用户信息错误", zap.Error(err))
-			c.ResponseError(errors.New("查询申请用户信息错误"))
+			respondUserError(c, errcode.ErrUserQueryFailed)
 			return
 		}
 		if len(users) == 0 {
-			c.ResponseError(errors.New("申请者不存在"))
+			respondUserError(c, errcode.ErrUserNotFound)
 			return
 		}
 		userMap := make(map[string]string, len(users))
@@ -174,13 +175,13 @@ func (f *Friend) delete(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	uid := c.Param("uid")
 	if uid == "" {
-		c.ResponseError(errors.New("用户uid不能为空"))
+		respondUserRequestInvalid(c, "uid")
 		return
 	}
 	tx, err := f.ctx.DB().Begin()
 	if err != nil {
 		f.Error("开启事务失败！", zap.Error(err))
-		c.ResponseError(errors.New("开启事务失败！"))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	defer func() {
@@ -191,7 +192,8 @@ func (f *Friend) delete(c *wkhttp.Context) {
 	}()
 	version, err := f.ctx.GenSeq(common.FriendSeqKey)
 	if err != nil {
-		c.ResponseError(err)
+		f.Error("生成好友关系序列号失败", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	// err = f.db.updateRelationshipTx(loginUID, uid, 1, 1, "", version, tx) // 不能删除sourceVercode 如果删除了 已有会话发起加好友会提示验证码不为空
@@ -199,14 +201,14 @@ func (f *Friend) delete(c *wkhttp.Context) {
 	if err != nil {
 		util.CheckErr(tx.Rollback())
 		f.Error("删除好友错误", zap.Error(err))
-		c.ResponseError(errors.New("删除好友错误"))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	err = f.db.updateAloneTx(uid, loginUID, 1, tx)
 	if err != nil {
 		util.CheckErr(tx.Rollback())
 		f.Error("修改好友单项关系错误", zap.Error(err))
-		c.ResponseError(errors.New("修改好友单项关系错误"))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	// 发布删除好友事件
@@ -221,14 +223,14 @@ func (f *Friend) delete(c *wkhttp.Context) {
 	if err != nil {
 		f.Error("发送删除好友事件失败", zap.Error(err))
 		tx.Rollback()
-		c.ResponseError(errors.New("发送删除好友事件失败"))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	userSetting, err := f.settingDB.querySettingByUIDAndToUID(loginUID, uid)
 	if err != nil {
 		tx.Rollback()
 		f.Error("查询用户好友设置错误", zap.Error(err))
-		c.ResponseError(errors.New("查询用户好友设置错误"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if userSetting != nil {
@@ -245,14 +247,14 @@ func (f *Friend) delete(c *wkhttp.Context) {
 		if err != nil {
 			tx.Rollback()
 			f.Error("重置好友设置错误", zap.Error(err))
-			c.ResponseError(errors.New("重置好友设置错误"))
+			respondUserError(c, errcode.ErrUserStoreFailed)
 			return
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		tx.RollbackUnlessCommitted()
 		f.Error("提交事务失败！", zap.Error(err))
-		c.ResponseError(errors.New("提交事务失败！"))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	f.ctx.EventCommit(eventID)
@@ -294,55 +296,57 @@ func (f *Friend) friendApply(c *wkhttp.Context) {
 	var req applyReq
 	if err := c.BindJSON(&req); err != nil {
 		f.Error(common.ErrData.Error(), zap.Error(err))
-		c.ResponseError(common.ErrData)
+		respondUserRequestInvalid(c, "")
 		return
 	}
 	if err := req.Check(); err != nil {
-		c.ResponseError(err)
+		// applyReq/sureReq.Check 返回"X 不能为空"类输入校验错误，统一走
+		// request_invalid（不做 per-field 标注，与 /v1/user login 一致）。
+		respondUserRequestInvalid(c, "")
 		return
 	}
 	if fromUID == req.ToUID {
-		c.ResponseError(errors.New("不能添加自己为好友！"))
+		respondUserError(c, errcode.ErrUserCannotAddSelf)
 		return
 	}
 	loginUserInfo, err := f.userDB.QueryByUID(fromUID)
 	if err != nil {
 		f.Error("查询用户信息错误", zap.Error(err))
-		c.ResponseError(errors.New("查询用户信息错误"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if loginUserInfo == nil || loginUserInfo.IsDestroy == IsDestroyDone || loginUserInfo.Status != 1 {
 		f.Error("登录用户不存在！", zap.String("uid", fromUID))
-		c.ResponseError(errors.New("登录用户不存在！"))
+		respondUserError(c, errcode.ErrUserCurrentNotFound)
 		return
 	}
 	// 是否是好友
 	isFriendLoginUser, err := f.db.IsFriend(fromUID, req.ToUID)
 	if err != nil {
 		f.Error("查询是否是好友失败！", zap.Error(err), zap.String("uid", fromUID), zap.String("toUid", req.ToUID))
-		c.ResponseError(errors.New("查询是否是好友失败！"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	isFriendToUser, err := f.db.IsFriend(req.ToUID, fromUID)
 	if err != nil {
 		f.Error("查询是否是好友失败！", zap.Error(err), zap.String("uid", fromUID), zap.String("toUid", req.ToUID))
-		c.ResponseError(errors.New("查询是否是好友失败！"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if isFriendLoginUser && isFriendToUser {
-		c.ResponseError(errors.New("已经是好友，不能再申请！"))
+		respondUserError(c, errcode.ErrUserAlreadyFriend)
 		return
 	}
 
 	toUser, err := f.userDB.QueryByUID(req.ToUID)
 	if err != nil {
 		f.Error("查询接收者用户信息失败！", zap.Error(err), zap.String("uid", fromUID))
-		c.ResponseError(errors.New("查询用户信息失败！"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if toUser == nil || toUser.IsDestroy == IsDestroyDone {
 		f.Error("接收好友请求的用户不存在！", zap.String("to_uid", req.ToUID))
-		c.ResponseError(errors.New("接收好友请求的用户不存在！"))
+		respondUserError(c, errcode.ErrUserNotFound)
 		return
 	}
 	// Bot 用户（robot=1）：检查 Space 隔离，跳过 vercode 验证
@@ -351,7 +355,7 @@ func (f *Friend) friendApply(c *wkhttp.Context) {
 	if isBotTarget && !systemBots[req.ToUID] {
 		commonSpace := space.GetCommonSpaceID(f.ctx, fromUID, req.ToUID)
 		if commonSpace == "" {
-			c.ResponseError(errors.New("该 Bot 不在当前 Space 中，无法添加"))
+			respondUserError(c, errcode.ErrUserBotNotInSpace)
 			return
 		}
 	}
@@ -365,17 +369,17 @@ func (f *Friend) friendApply(c *wkhttp.Context) {
 			friend, err := f.db.queryWithUID(fromUID, req.ToUID)
 			if err != nil {
 				f.Error("查询好友信息错误", zap.String("to_uid", req.ToUID))
-				c.ResponseError(errors.New("查询好友信息错误"))
+				respondUserError(c, errcode.ErrUserQueryFailed)
 				return
 			}
 			if friend == nil {
 				f.Error("好友信息不存在", zap.String("to_uid", req.ToUID))
-				c.ResponseError(errors.New("好友信息不存在"))
+				respondUserError(c, errcode.ErrUserFriendNotFound)
 				return
 			}
 			if friend.SourceVercode == "" {
 				f.Error("验证码不能为空", zap.String("to_uid", req.ToUID))
-				c.ResponseError(errors.New("验证码不能为空"))
+				respondUserRequestInvalid(c, "vercode")
 				return
 			}
 			req.Vercode = friend.SourceVercode
@@ -387,7 +391,7 @@ func (f *Friend) friendApply(c *wkhttp.Context) {
 		//验证code是否有效
 		err = source.CheckRequestAddFriendCode(req.Vercode, fromUID)
 		if err != nil {
-			c.ResponseError(err)
+			respondUserError(c, errcode.ErrUserCodeInvalid)
 			return
 		}
 	}
@@ -433,27 +437,27 @@ func (f *Friend) friendApply(c *wkhttp.Context) {
 	}), f.ctx.GetConfig().Cache.FriendApplyExpire)
 	if err != nil {
 		f.Error("设置申请token失败！", zap.Error(err))
-		c.ResponseError(errors.New("设置申请token失败！"))
+		respondUserError(c, errcode.ErrUserTokenCacheFailed)
 		return
 	}
 	// 查询好友申请记录
 	apply, err := f.db.queryApplyWithUidAndToUid(req.ToUID, fromUID)
 	if err != nil {
 		f.Error("查询好友申请记录错误", zap.String("to_uid", req.ToUID))
-		c.ResponseError(errors.New("查询好友申请记录错误"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	// 查询用户红点
 	userRedDot, err := f.userDB.queryUserRedDot(req.ToUID, UserRedDotCategoryFriendApply)
 	if err != nil {
 		f.Error("查询用户通讯录红点信息错误", zap.String("to_uid", req.ToUID))
-		c.ResponseError(errors.New("查询用户通讯录红点信息错误"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	tx, err := f.ctx.DB().Begin()
 	if err != nil {
 		f.Error("开启事务失败！", zap.Error(err))
-		c.ResponseError(errors.New("开启事务失败！"))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	defer func() {
@@ -474,7 +478,7 @@ func (f *Friend) friendApply(c *wkhttp.Context) {
 		if err != nil {
 			tx.Rollback()
 			f.Error("新增好友申请记录错误", zap.String("to_uid", req.ToUID))
-			c.ResponseError(errors.New("新增好友申请记录错误"))
+			respondUserError(c, errcode.ErrUserStoreFailed)
 			return
 		}
 	} else {
@@ -486,7 +490,7 @@ func (f *Friend) friendApply(c *wkhttp.Context) {
 		if err != nil {
 			tx.Rollback()
 			f.Error("修改好友申请记录错误", zap.String("to_uid", req.ToUID))
-			c.ResponseError(errors.New("修改好友申请记录错误"))
+			respondUserError(c, errcode.ErrUserStoreFailed)
 			return
 		}
 		// }
@@ -503,7 +507,7 @@ func (f *Friend) friendApply(c *wkhttp.Context) {
 		if err != nil {
 			tx.Rollback()
 			f.Error("新增用户通讯录红点信息错误", zap.String("to_uid", req.ToUID))
-			c.ResponseError(errors.New("新增用户通讯录红点信息错误"))
+			respondUserError(c, errcode.ErrUserStoreFailed)
 			return
 		}
 	} else {
@@ -513,7 +517,7 @@ func (f *Friend) friendApply(c *wkhttp.Context) {
 			if err != nil {
 				tx.Rollback()
 				f.Error("修改用户通讯录红点信息错误", zap.String("to_uid", req.ToUID))
-				c.ResponseError(errors.New("修改用户通讯录红点信息错误"))
+				respondUserError(c, errcode.ErrUserStoreFailed)
 				return
 			}
 		}
@@ -522,7 +526,7 @@ func (f *Friend) friendApply(c *wkhttp.Context) {
 	if err = tx.Commit(); err != nil {
 		tx.Rollback()
 		f.Error("提交事物错误", zap.Error(err))
-		c.ResponseError(errors.New("提交事物错误"))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	// 发送消息
@@ -544,7 +548,7 @@ func (f *Friend) friendApply(c *wkhttp.Context) {
 	})
 	if err != nil {
 		f.Error("发送好友申请失败！", zap.Error(err))
-		c.ResponseError(errors.New("发送好友申请失败！"))
+		respondUserError(c, errcode.ErrUserIMCallFailed)
 		return
 	}
 
@@ -679,11 +683,13 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 	var req sureReq
 	if err := c.BindJSON(&req); err != nil {
 		f.Error(common.ErrData.Error(), zap.Error(err))
-		c.ResponseError(common.ErrData)
+		respondUserRequestInvalid(c, "")
 		return
 	}
 	if err := req.Check(); err != nil {
-		c.ResponseError(err)
+		// applyReq/sureReq.Check 返回"X 不能为空"类输入校验错误，统一走
+		// request_invalid（不做 per-field 标注，与 /v1/user login 一致）。
+		respondUserRequestInvalid(c, "")
 		return
 	}
 	// 提取 space_id：body > query > header
@@ -718,38 +724,38 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 	tokenVaule, err := f.ctx.Cache().Get(key) // 获取申请人的uid
 	if err != nil {
 		f.Error("获取好友申请token的信息失败！", zap.Error(err), zap.String("key", key))
-		c.ResponseError(errors.New("获取好友申请token的信息失败！"))
+		respondUserError(c, errcode.ErrUserDecodeFailed)
 		return
 	}
 	valueMap, err := util.JsonToMap(tokenVaule)
 	if err != nil {
 		f.Error("获取token信息错误", zap.Error(err), zap.String("key", key))
-		c.ResponseError(errors.New("获取token信息错误"))
+		respondUserError(c, errcode.ErrUserDecodeFailed)
 		return
 	}
 
 	loginUser, err := f.userDB.QueryByUID(loginUID)
 	if err != nil {
 		f.Error("查询用户信息失败！", zap.Error(err), zap.String("uid", loginUID))
-		c.ResponseError(errors.New("查询用户信息失败！"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if loginUser == nil || loginUser.IsDestroy == IsDestroyDone {
 		f.Error("当前用户不存在或已注销！", zap.String("uid", loginUID))
-		c.ResponseError(errors.New("当前用户不存在或已注销！"))
+		respondUserError(c, errcode.ErrUserCurrentNotFound)
 		return
 	}
 
 	applyUID, ok := valueMap["from_uid"].(string)
 	if !ok {
 		f.Error("好友申请数据无效：from_uid 类型错误或不存在", zap.Any("from_uid", valueMap["from_uid"]))
-		c.ResponseError(errors.New("好友申请数据无效"))
+		respondUserError(c, errcode.ErrUserFriendApplyInvalid)
 		return
 	}
 	vercode, ok := valueMap["vercode"].(string)
 	if !ok {
 		f.Error("好友申请数据无效：vercode 类型错误或不存在", zap.Any("vercode", valueMap["vercode"]))
-		c.ResponseError(errors.New("好友申请数据无效"))
+		respondUserError(c, errcode.ErrUserFriendApplyInvalid)
 		return
 	}
 	remark := ""
@@ -768,19 +774,19 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 	applyUser, err := f.userDB.QueryByUID(applyUID)
 	if err != nil {
 		f.Error("查询申请人用户信息失败！", zap.Error(err))
-		c.ResponseError(errors.New("查询申请人用户信息失败！"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if applyUser == nil || applyUser.IsDestroy == IsDestroyDone {
 		f.Error("申请人不存在或已注销！", zap.String("uid", applyUID))
-		c.ResponseError(errors.New("申请人不存在"))
+		respondUserError(c, errcode.ErrUserNotFound)
 		return
 	}
 	if remark == "" {
 		remark = fmt.Sprintf("我是%s", applyUser.Name)
 	}
 	if strings.TrimSpace(applyUID) == "" || strings.TrimSpace(vercode) == "" {
-		c.ResponseError(errors.New("好友申请无效或已过期！"))
+		respondUserError(c, errcode.ErrUserFriendApplyInvalid)
 		return
 	}
 	channelServiceObj := register.GetService(ChannelServiceName)
@@ -800,14 +806,14 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 	applyFriendModel, err := f.db.queryWithUID(loginUID, applyUID)
 	if err != nil {
 		f.Error("查询是否是好友失败！", zap.Error(err), zap.String("uid", loginUID), zap.String("toUid", applyUID))
-		c.ResponseError(errors.New("查询是否是好友失败！"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	// 添加好友到数据库
 	tx, err := f.ctx.DB().Begin()
 	if err != nil {
 		f.Error("开启事务失败！", zap.Error(err))
-		c.ResponseError(errors.New("开启事务失败！"))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	defer func() {
@@ -818,14 +824,15 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 	}()
 	version, err := f.ctx.GenSeq(common.FriendSeqKey)
 	if err != nil {
-		c.ResponseError(err)
+		f.Error("生成好友关系序列号失败", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	if applyFriendModel == nil {
 		// 验证code
 		err = source.CheckSource(vercode)
 		if err != nil {
-			c.ResponseError(err)
+			respondUserError(c, errcode.ErrUserCodeInvalid)
 			return
 		}
 
@@ -841,14 +848,14 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 		}, tx)
 		if err != nil {
 			tx.Rollback()
-			c.ResponseError(errors.New("添加好友失败！"))
+			respondUserError(c, errcode.ErrUserStoreFailed)
 			return
 		}
 	} else {
 		err = f.db.updateRelationshipTx(loginUID, applyUID, 0, 0, vercode, version, tx)
 		if err != nil {
 			tx.Rollback()
-			c.ResponseError(errors.New("修改好友关系失败"))
+			respondUserError(c, errcode.ErrUserStoreFailed)
 			return
 		}
 	}
@@ -858,7 +865,7 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 	if err != nil {
 		tx.Rollback()
 		f.Error("查询被添加者是否是好友失败！", zap.Error(err), zap.String("uid", loginUID), zap.String("toUid", applyUID))
-		c.ResponseError(errors.New("查询被添加者是否是好友失败！"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if loginFriendModel == nil {
@@ -873,14 +880,14 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 		}, tx)
 		if err != nil {
 			tx.Rollback()
-			c.ResponseError(errors.New("添加好友失败！"))
+			respondUserError(c, errcode.ErrUserStoreFailed)
 			return
 		}
 	} else {
 		err = f.db.updateRelationshipTx(applyUID, loginUID, 0, 0, vercode, version, tx)
 		if err != nil {
 			tx.Rollback()
-			c.ResponseError(errors.New("修改好友关系失败"))
+			respondUserError(c, errcode.ErrUserStoreFailed)
 			return
 		}
 	}
@@ -896,7 +903,7 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 	if err != nil {
 		f.Error("发送好友确认事件失败", zap.Error(err))
 		tx.Rollback()
-		c.ResponseError(errors.New("发送好友确认事件失败"))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	// 查询好友申请记录
@@ -904,7 +911,7 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 	if err != nil {
 		f.Error("查询好友申请记录错误", zap.Error(err))
 		tx.Rollback()
-		c.ResponseError(errors.New("查询好友申请记录错误"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if apply != nil {
@@ -913,13 +920,13 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 		if err != nil {
 			f.Error("修改好友申请记录错误", zap.Error(err))
 			tx.Rollback()
-			c.ResponseError(errors.New("修改好友申请记录错误"))
+			respondUserError(c, errcode.ErrUserStoreFailed)
 			return
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		f.Error("提交事务失败！", zap.Error(err))
-		c.ResponseError(errors.New("提交事务失败！"))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	f.ctx.EventCommit(eventID)
@@ -940,7 +947,7 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 	})
 	if err != nil {
 		f.Error("发送消息失败！", zap.Error(err))
-		c.ResponseError(errors.New("发送消息失败！"))
+		respondUserError(c, errcode.ErrUserIMCallFailed)
 		return
 	}
 	content := "我们已经是好友了，可以愉快的聊天了！"
@@ -964,7 +971,7 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 	))
 	if err != nil {
 		f.Error("发送通过好友请求消息失败！", zap.Error(err))
-		c.ResponseError(errors.New("发送通过好友请求消息失败！"))
+		respondUserError(c, errcode.ErrUserIMCallFailed)
 		return
 	}
 
@@ -981,14 +988,14 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 	))
 	if err != nil {
 		f.Error("发送接受好友请求消息失败！", zap.Error(err))
-		c.ResponseError(errors.New("发送接受好友请求消息失败！"))
+		respondUserError(c, errcode.ErrUserIMCallFailed)
 		return
 	}
 
 	err = f.ctx.Cache().Delete(key)
 	if err != nil {
 		f.Error("删除缓存数据错误", zap.Error(err))
-		c.ResponseError(errors.New("删除缓存数据错误"))
+		respondUserError(c, errcode.ErrUserTokenCacheFailed)
 		return
 	}
 	c.ResponseOK()
@@ -1019,7 +1026,7 @@ func (f *Friend) friendSync(c *wkhttp.Context) {
 		memberUIDs, err := space.GetSpaceMemberUIDs(f.ctx, defaultSpaceID)
 		if err != nil {
 			f.Error("获取 Space 成员失败！", zap.Error(err))
-			c.ResponseError(errors.New("获取 Space 成员失败！"))
+			respondUserError(c, errcode.ErrUserQueryFailed)
 			return
 		}
 		// 排除自己
@@ -1032,7 +1039,7 @@ func (f *Friend) friendSync(c *wkhttp.Context) {
 		userDetails, err := f.userService.GetUserDetails(filteredUIDs, c.GetLoginUID())
 		if err != nil {
 			f.Error("获取用户详情失败！", zap.Error(err))
-			c.ResponseError(errors.New("获取用户详情失败！"))
+			respondUserError(c, errcode.ErrUserQueryFailed)
 			return
 		}
 		resps := make([]*friendResp, 0, len(userDetails))
@@ -1052,7 +1059,7 @@ func (f *Friend) friendSync(c *wkhttp.Context) {
 	friends, err = f.db.SyncFriends(version, uid, limit)
 	if err != nil {
 		f.Error("同步好友信息错误！", zap.Error(err))
-		c.ResponseError(errors.New("同步好友信息错误！"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 
@@ -1065,7 +1072,7 @@ func (f *Friend) friendSync(c *wkhttp.Context) {
 	userDetails, err := f.userService.GetUserDetails(friendUIDs, c.GetLoginUID())
 	if err != nil {
 		f.Error("获取用户详情失败！", zap.Error(err))
-		c.ResponseError(errors.New("获取用户详情失败！"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	userDetailMap := map[string]*UserDetailResp{}
@@ -1101,7 +1108,7 @@ func (f *Friend) friendSearch(c *wkhttp.Context) {
 		memberUIDs, err := space.GetSpaceMemberUIDs(f.ctx, spaceID)
 		if err != nil {
 			f.Error("获取 Space 成员失败！", zap.Error(err))
-			c.ResponseError(errors.New("获取 Space 成员失败！"))
+			respondUserError(c, errcode.ErrUserQueryFailed)
 			return
 		}
 		// 排除自己
@@ -1114,7 +1121,7 @@ func (f *Friend) friendSearch(c *wkhttp.Context) {
 		userDetails, err := f.userService.GetUserDetails(filteredUIDs, c.GetLoginUID())
 		if err != nil {
 			f.Error("获取用户详情失败！", zap.Error(err))
-			c.ResponseError(errors.New("获取用户详情失败！"))
+			respondUserError(c, errcode.ErrUserQueryFailed)
 			return
 		}
 		resps := make([]*friendResp, 0, len(userDetails))
@@ -1136,7 +1143,7 @@ func (f *Friend) friendSearch(c *wkhttp.Context) {
 	friends, err := f.db.QueryFriendsWithKeyword(uid, keyword)
 	if err != nil {
 		f.Error("查询好友数据失败！", zap.Error(err))
-		c.ResponseError(errors.New("查询好友数据失败！"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	resps := make([]*friendResp, 0)
@@ -1160,17 +1167,17 @@ func (f *Friend) remark(c *wkhttp.Context) {
 	var req remarkReq
 	if err := c.BindJSON(&req); err != nil {
 		f.Error(common.ErrData.Error(), zap.Error(err))
-		c.ResponseError(common.ErrData)
+		respondUserRequestInvalid(c, "")
 		return
 	}
 	if req.UID == "" {
-		c.ResponseError(errors.New("用户uid不能为空"))
+		respondUserRequestInvalid(c, "uid")
 		return
 	}
 	settingM, err := f.settingDB.querySettingByUIDAndToUID(loginUID, req.UID)
 	if err != nil {
 		f.Error("查询设置信息失败！", zap.Error(err))
-		c.ResponseError(errors.New("查询设置信息失败！"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if settingM == nil {
@@ -1181,7 +1188,7 @@ func (f *Friend) remark(c *wkhttp.Context) {
 		err = f.settingDB.InsertUserSettingModel(settingM)
 		if err != nil {
 			f.Error("添加用户设置失败！", zap.Error(err))
-			c.ResponseError(errors.New("添加用户设置失败！"))
+			respondUserError(c, errcode.ErrUserStoreFailed)
 			return
 		}
 	} else {
@@ -1189,7 +1196,7 @@ func (f *Friend) remark(c *wkhttp.Context) {
 		err = f.settingDB.UpdateUserSettingModel(settingM)
 		if err != nil {
 			f.Error("修改用户备注错误", zap.Error(err))
-			c.ResponseError(errors.New("修改用户备注错误"))
+			respondUserError(c, errcode.ErrUserStoreFailed)
 			return
 		}
 	}

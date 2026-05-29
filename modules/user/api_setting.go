@@ -5,7 +5,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
-	"github.com/pkg/errors"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"go.uber.org/zap"
 )
 
@@ -28,13 +28,13 @@ func (u *Setting) userSettingUpdate(c *wkhttp.Context) {
 	var settingMap map[string]interface{}
 	if err := c.BindJSON(&settingMap); err != nil {
 		u.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误！"))
+		respondUserRequestInvalid(c, "")
 		return
 	}
 	model, err := u.db.QueryUserSettingModel(toUID, loginUID)
 	if err != nil {
 		u.Error("查询用户设置失败！", zap.Error(err))
-		c.ResponseError(errors.New("查询用户设置失败！"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	insert := false // 是否是插入操作
@@ -86,7 +86,8 @@ func (u *Setting) userSettingUpdate(c *wkhttp.Context) {
 	}
 	version, err := u.ctx.GenSeq(common.UserSettingSeqKey)
 	if err != nil {
-		c.ResponseError(err)
+		u.Error("生成用户设置序列号失败", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	model.Version = version
@@ -94,14 +95,14 @@ func (u *Setting) userSettingUpdate(c *wkhttp.Context) {
 		err = u.db.InsertUserSettingModel(model)
 		if err != nil {
 			u.Error("添加设置失败！", zap.Error(err))
-			c.ResponseError(errors.New("添加设置失败！"))
+			respondUserError(c, errcode.ErrUserStoreFailed)
 			return
 		}
 	} else {
 		err = u.db.UpdateUserSettingModel(model)
 		if err != nil {
 			u.Error("修改设置失败！", zap.Error(err))
-			c.ResponseError(errors.New("修改设置失败！"))
+			respondUserError(c, errcode.ErrUserStoreFailed)
 			return
 		}
 	}
@@ -117,7 +118,7 @@ func (u *Setting) userSettingUpdate(c *wkhttp.Context) {
 	})
 	if err != nil {
 		u.Error("发送频道更新命令失败！", zap.Error(err))
-		c.ResponseError(errors.New("发送频道更新命令失败！"))
+		respondUserError(c, errcode.ErrUserIMCallFailed)
 		return
 	}
 	c.ResponseOK()

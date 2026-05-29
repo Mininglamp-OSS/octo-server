@@ -6,7 +6,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
-	"github.com/pkg/errors"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"go.uber.org/zap"
 )
 
@@ -17,11 +17,11 @@ func (u *User) getDevice(c *wkhttp.Context) {
 	device, err := u.deviceDB.queryDeviceWithUIDAndDeviceID(deviceID, loginUID)
 	if err != nil {
 		u.Error("获取设备信息失败！", zap.Error(err))
-		c.ResponseError(errors.New("获取设备信息失败！"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if device == nil {
-		c.ResponseError(errors.New("未查询到该设备"))
+		respondUserError(c, errcode.ErrUserDeviceNotFound)
 		return
 	}
 	c.Response(&deviceResp{
@@ -38,7 +38,7 @@ func (u *User) deviceDelete(c *wkhttp.Context) {
 	err := u.deviceDB.deleteDeviceWithDeviceIDAndUID(deviceID, c.GetLoginUID())
 	if err != nil {
 		u.Error("删除设备失败！", zap.Error(err))
-		c.ResponseError(errors.New("删除设备失败！"))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	c.ResponseOK()
@@ -62,7 +62,7 @@ func (u *User) deviceList(c *wkhttp.Context) {
 
 	if err != nil {
 		u.Error("查询设备列表失败！", zap.Error(err))
-		c.ResponseError(errors.New("查询设备列表失败！"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 
