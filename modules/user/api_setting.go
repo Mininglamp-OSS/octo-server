@@ -48,40 +48,40 @@ func (u *Setting) userSettingUpdate(c *wkhttp.Context) {
 		switch key {
 		case "mute":
 			if f, ok := value.(float64); ok {
-			model.Mute = int(f)
-		}
+				model.Mute = int(f)
+			}
 		case "top":
 			if f, ok := value.(float64); ok {
-			model.Top = int(f)
-		}
+				model.Top = int(f)
+			}
 		case "chat_pwd_on":
 			if f, ok := value.(float64); ok {
-			model.ChatPwdOn = int(f)
-		}
+				model.ChatPwdOn = int(f)
+			}
 		case "screenshot":
 			if f, ok := value.(float64); ok {
-			model.Screenshot = int(f)
-		}
+				model.Screenshot = int(f)
+			}
 		case "revoke_remind":
 			if f, ok := value.(float64); ok {
-			model.RevokeRemind = int(f)
-		}
+				model.RevokeRemind = int(f)
+			}
 		case "receipt":
 			if f, ok := value.(float64); ok {
-			model.Receipt = int(f)
-		}
+				model.Receipt = int(f)
+			}
 		case "flame":
 			if f, ok := value.(float64); ok {
-			model.Flame = int(f)
-		}
+				model.Flame = int(f)
+			}
 		case "flame_second":
 			if f, ok := value.(float64); ok {
-			model.FlameSecond = int(f)
-		}
+				model.FlameSecond = int(f)
+			}
 		case "remark":
 			if s, ok := value.(string); ok {
-			model.Remark = s
-		}
+				model.Remark = s
+			}
 		}
 	}
 	version, err := u.ctx.GenSeq(common.UserSettingSeqKey)

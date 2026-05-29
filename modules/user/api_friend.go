@@ -192,6 +192,7 @@ func (f *Friend) delete(c *wkhttp.Context) {
 	}()
 	version, err := f.ctx.GenSeq(common.FriendSeqKey)
 	if err != nil {
+		tx.Rollback()
 		f.Error("生成好友关系序列号失败", zap.Error(err))
 		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
@@ -368,7 +369,7 @@ func (f *Friend) friendApply(c *wkhttp.Context) {
 		} else {
 			friend, err := f.db.queryWithUID(fromUID, req.ToUID)
 			if err != nil {
-				f.Error("查询好友信息错误", zap.String("to_uid", req.ToUID))
+				f.Error("查询好友信息错误", zap.Error(err), zap.String("to_uid", req.ToUID))
 				respondUserError(c, errcode.ErrUserQueryFailed)
 				return
 			}
@@ -391,6 +392,7 @@ func (f *Friend) friendApply(c *wkhttp.Context) {
 		//验证code是否有效
 		err = source.CheckRequestAddFriendCode(req.Vercode, fromUID)
 		if err != nil {
+			f.Warn("好友申请验证码校验失败", zap.Error(err), zap.String("uid", fromUID), zap.String("toUid", req.ToUID))
 			respondUserError(c, errcode.ErrUserCodeInvalid)
 			return
 		}
@@ -443,14 +445,14 @@ func (f *Friend) friendApply(c *wkhttp.Context) {
 	// 查询好友申请记录
 	apply, err := f.db.queryApplyWithUidAndToUid(req.ToUID, fromUID)
 	if err != nil {
-		f.Error("查询好友申请记录错误", zap.String("to_uid", req.ToUID))
+		f.Error("查询好友申请记录错误", zap.Error(err), zap.String("to_uid", req.ToUID))
 		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	// 查询用户红点
 	userRedDot, err := f.userDB.queryUserRedDot(req.ToUID, UserRedDotCategoryFriendApply)
 	if err != nil {
-		f.Error("查询用户通讯录红点信息错误", zap.String("to_uid", req.ToUID))
+		f.Error("查询用户通讯录红点信息错误", zap.Error(err), zap.String("to_uid", req.ToUID))
 		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
@@ -477,7 +479,7 @@ func (f *Friend) friendApply(c *wkhttp.Context) {
 		}, tx)
 		if err != nil {
 			tx.Rollback()
-			f.Error("新增好友申请记录错误", zap.String("to_uid", req.ToUID))
+			f.Error("新增好友申请记录错误", zap.Error(err), zap.String("to_uid", req.ToUID))
 			respondUserError(c, errcode.ErrUserStoreFailed)
 			return
 		}
@@ -489,7 +491,7 @@ func (f *Friend) friendApply(c *wkhttp.Context) {
 		err = f.db.updateApplyTx(apply, tx)
 		if err != nil {
 			tx.Rollback()
-			f.Error("修改好友申请记录错误", zap.String("to_uid", req.ToUID))
+			f.Error("修改好友申请记录错误", zap.Error(err), zap.String("to_uid", req.ToUID))
 			respondUserError(c, errcode.ErrUserStoreFailed)
 			return
 		}
@@ -506,7 +508,7 @@ func (f *Friend) friendApply(c *wkhttp.Context) {
 		}, tx)
 		if err != nil {
 			tx.Rollback()
-			f.Error("新增用户通讯录红点信息错误", zap.String("to_uid", req.ToUID))
+			f.Error("新增用户通讯录红点信息错误", zap.Error(err), zap.String("to_uid", req.ToUID))
 			respondUserError(c, errcode.ErrUserStoreFailed)
 			return
 		}
@@ -516,7 +518,7 @@ func (f *Friend) friendApply(c *wkhttp.Context) {
 			err = f.userDB.updateUserRedDotTx(userRedDot, tx)
 			if err != nil {
 				tx.Rollback()
-				f.Error("修改用户通讯录红点信息错误", zap.String("to_uid", req.ToUID))
+				f.Error("修改用户通讯录红点信息错误", zap.Error(err), zap.String("to_uid", req.ToUID))
 				respondUserError(c, errcode.ErrUserStoreFailed)
 				return
 			}
@@ -824,6 +826,7 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 	}()
 	version, err := f.ctx.GenSeq(common.FriendSeqKey)
 	if err != nil {
+		tx.Rollback()
 		f.Error("生成好友关系序列号失败", zap.Error(err))
 		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
@@ -832,6 +835,8 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 		// 验证code
 		err = source.CheckSource(vercode)
 		if err != nil {
+			tx.Rollback()
+			f.Warn("好友确认验证码校验失败", zap.Error(err), zap.String("uid", loginUID), zap.String("toUid", applyUID))
 			respondUserError(c, errcode.ErrUserCodeInvalid)
 			return
 		}
@@ -848,6 +853,7 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 		}, tx)
 		if err != nil {
 			tx.Rollback()
+			f.Error("保存好友关系失败", zap.Error(err), zap.String("uid", loginUID), zap.String("toUid", applyUID))
 			respondUserError(c, errcode.ErrUserStoreFailed)
 			return
 		}
@@ -855,6 +861,7 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 		err = f.db.updateRelationshipTx(loginUID, applyUID, 0, 0, vercode, version, tx)
 		if err != nil {
 			tx.Rollback()
+			f.Error("保存好友关系失败", zap.Error(err), zap.String("uid", loginUID), zap.String("toUid", applyUID))
 			respondUserError(c, errcode.ErrUserStoreFailed)
 			return
 		}
@@ -880,6 +887,7 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 		}, tx)
 		if err != nil {
 			tx.Rollback()
+			f.Error("保存好友关系失败", zap.Error(err), zap.String("uid", loginUID), zap.String("toUid", applyUID))
 			respondUserError(c, errcode.ErrUserStoreFailed)
 			return
 		}
@@ -887,6 +895,7 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 		err = f.db.updateRelationshipTx(applyUID, loginUID, 0, 0, vercode, version, tx)
 		if err != nil {
 			tx.Rollback()
+			f.Error("保存好友关系失败", zap.Error(err), zap.String("uid", loginUID), zap.String("toUid", applyUID))
 			respondUserError(c, errcode.ErrUserStoreFailed)
 			return
 		}

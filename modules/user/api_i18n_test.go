@@ -37,7 +37,7 @@ func TestUserAPINoLegacyResponseError(t *testing.T) {
 		clean.WriteByte('\n')
 	}
 	cleaned := clean.String()
-	for _, banned := range []string{".ResponseError(", ".ResponseErrorf("} {
+	for _, banned := range []string{".ResponseError(", ".ResponseErrorf(", "c.Response(\""} {
 		if strings.Contains(cleaned, banned) {
 			t.Fatalf("modules/user/api.go must use httperr.ResponseErrorL via respondUser* helpers instead of legacy %s", banned)
 		}
@@ -64,7 +64,7 @@ func TestManagerAPINoLegacyResponseError(t *testing.T) {
 		clean.WriteByte('\n')
 	}
 	cleaned := clean.String()
-	for _, banned := range []string{".ResponseError(", ".ResponseErrorf("} {
+	for _, banned := range []string{".ResponseError(", ".ResponseErrorf(", "c.Response(\""} {
 		if strings.Contains(cleaned, banned) {
 			t.Fatalf("modules/user/api_manager.go must use httperr.ResponseErrorL via respond* helpers instead of legacy %s", banned)
 		}
@@ -98,7 +98,7 @@ func TestMigratedUserFilesNoLegacyResponseError(t *testing.T) {
 				clean.WriteByte('\n')
 			}
 			cleaned := clean.String()
-			for _, banned := range []string{".ResponseError(", ".ResponseErrorf("} {
+			for _, banned := range []string{".ResponseError(", ".ResponseErrorf(", "c.Response(\""} {
 				if strings.Contains(cleaned, banned) {
 					t.Fatalf("modules/user/%s must use httperr.ResponseErrorL via respond* helpers instead of legacy %s", f, banned)
 				}

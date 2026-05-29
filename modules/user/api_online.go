@@ -1,8 +1,8 @@
 package user
 
 import (
-	"net/http"
 	"fmt"
+	"net/http"
 	"os"
 	"runtime/debug"
 	"time"

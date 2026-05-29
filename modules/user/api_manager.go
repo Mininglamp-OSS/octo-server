@@ -514,6 +514,7 @@ func (m *Manager) addUser(c *wkhttp.Context) {
 	userModel.Zone = req.Zone
 	hashedPassword, err := HashPassword(req.Password)
 	if err != nil {
+		tx.Rollback()
 		m.Error("密码哈希失败", zap.Error(err))
 		respondUserError(c, errcode.ErrUserPasswordProcessFailed)
 		return

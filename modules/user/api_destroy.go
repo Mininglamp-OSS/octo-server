@@ -91,9 +91,9 @@ func (u *User) destroyApply(c *wkhttp.Context) {
 	}
 	u.Info("用户申请注销", zap.String("uid", loginUID), zap.Time("expire_at", expireAt))
 	c.Response(map[string]interface{}{
-		"destroy_status": IsDestroyApplying,
-		"apply_at":       now.Unix(),
-		"expire_at":      expireAt.Unix(),
+		"destroy_status":   IsDestroyApplying,
+		"apply_at":         now.Unix(),
+		"expire_at":        expireAt.Unix(),
 		"cooling_off_days": days,
 	})
 }
@@ -247,4 +247,3 @@ func remainingDays(expireAt time.Time) int {
 	}
 	return days
 }
-
