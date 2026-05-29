@@ -13,6 +13,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	common2 "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	wkutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
 
@@ -81,18 +82,18 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 func (m *Manager) devices(c *wkhttp.Context) {
 	err := c.CheckLoginRole()
 	if err != nil {
-		c.ResponseError(err)
+		respondManagerForbidden(c)
 		return
 	}
 	uid := c.Query("uid")
 	if uid == "" {
-		c.ResponseError(errors.New("请求用户uid不能为空"))
+		respondUserRequestInvalid(c, "uid")
 		return
 	}
 	devices, err := m.deviceDB.queryDeviceWithUID(uid)
 	if err != nil {
 		m.Error("查询用户设备列表错误", zap.Error(err))
-		c.ResponseError(errors.New("查询用户设备列表错误"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	list := make([]*managerDeviceResp, 0)
@@ -115,18 +116,18 @@ func (m *Manager) devices(c *wkhttp.Context) {
 func (m *Manager) online(c *wkhttp.Context) {
 	err := c.CheckLoginRole()
 	if err != nil {
-		c.ResponseError(err)
+		respondManagerForbidden(c)
 		return
 	}
 	uid := c.Query("uid")
 	if uid == "" {
-		c.ResponseError(errors.New("请求用户uid不能为空"))
+		respondUserRequestInvalid(c, "uid")
 		return
 	}
 	list, err := m.db.queryUserOnline(uid)
 	if err != nil {
 		m.Error("查询用户在线设备信息错误", zap.Error(err))
-		c.ResponseError(errors.New("查询用户在线设备信息错误"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	result := make([]*userOnlineResp, 0)
@@ -164,26 +165,30 @@ func (m *Manager) online(c *wkhttp.Context) {
 func (m *Manager) login(c *wkhttp.Context) {
 	var req managerLoginReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("请求数据格式有误！"))
+		respondUserRequestInvalid(c, "")
 		return
 	}
 	if err := req.Check(); err != nil {
-		c.ResponseError(err)
+		// managerLoginReq.Check returns "用户名/密码不能为空"; both are pure
+		// client-side input gaps with no field tagging (matches /v1/user login).
+		respondUserRequestInvalid(c, "")
 		return
 	}
 	userInfo, err := m.db.queryUserInfoWithNameAndPwd(req.Username)
 	if err != nil {
 		m.Error("登录错误", zap.Error(err))
-		c.ResponseError(errors.New("登录错误！"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
+	// 登录失败统一返回 ErrUserInvalidCredentials，避免攻击者通过"用户不存在"
+	// 与"密码错误"的响应差异枚举有效管理账号（与 /v1/user login 反枚举一致）。
 	if userInfo == nil || userInfo.UID == "" {
-		c.ResponseError(errors.New("登录用户不存在"))
+		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
 	}
 	matched, needsMigration := CheckPassword(req.Password, userInfo.Password)
 	if !matched {
-		c.ResponseError(errors.New("用户名或密码错误"))
+		respondUserError(c, errcode.ErrUserInvalidCredentials)
 		return
 	}
 	// 自动将旧 MD5 密码迁移到 bcrypt
@@ -193,7 +198,7 @@ func (m *Manager) login(c *wkhttp.Context) {
 		}
 	}
 	if userInfo.Role != string(wkhttp.Admin) && userInfo.Role != string(wkhttp.SuperAdmin) {
-		c.ResponseError(errors.New("登录账号未开通管理权限"))
+		respondUserError(c, errcode.ErrUserManagerPermissionRequired)
 		return
 	}
 	token := util.GenerUUID()
@@ -206,20 +211,20 @@ func (m *Manager) login(c *wkhttp.Context) {
 	})
 	if err != nil {
 		m.Error("编码token缓存失败！", zap.Error(err))
-		c.ResponseError(errors.New("设置token缓存失败！"))
+		respondUserError(c, errcode.ErrUserTokenCacheFailed)
 		return
 	}
 	err = m.ctx.Cache().SetAndExpire(m.ctx.GetConfig().Cache.TokenCachePrefix+token, tokenPayload, m.ctx.GetConfig().Cache.TokenExpire)
 	if err != nil {
 		m.Error("设置token缓存失败！", zap.Error(err))
-		c.ResponseError(errors.New("设置token缓存失败！"))
+		respondUserError(c, errcode.ErrUserTokenCacheFailed)
 		return
 	}
 
 	err = m.ctx.Cache().SetAndExpire(fmt.Sprintf("%s%d%s", m.ctx.GetConfig().Cache.UIDTokenCachePrefix, config.Web, userInfo.UID), token, m.ctx.GetConfig().Cache.TokenExpire)
 	if err != nil {
 		m.Error("设置uidtoken缓存失败！", zap.Error(err))
-		c.ResponseError(errors.New("设置token缓存失败！"))
+		respondUserError(c, errcode.ErrUserTokenCacheFailed)
 		return
 	}
 
@@ -235,7 +240,7 @@ func (m *Manager) login(c *wkhttp.Context) {
 func (m *Manager) resetUserPassword(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondManagerForbidden(c)
 		return
 	}
 
@@ -246,42 +251,42 @@ func (m *Manager) resetUserPassword(c *wkhttp.Context) {
 	}
 	var req reqRUP
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("请求数据格式有误！"))
+		respondUserRequestInvalid(c, "")
 		return
 	}
 	if len(req.NewPassword) < 6 {
-		c.ResponseError(errors.New("密码长度必须大于6位"))
+		respondUserError(c, errcode.ErrUserPasswordTooShort)
 		return
 	}
 	if req.NewPassword != req.NewPassswordConfirmation {
-		c.ResponseError(errors.New("两次密码不一致！"))
+		respondUserError(c, errcode.ErrUserPasswordMismatch)
 		return
 	}
 	if req.Uid == "" {
-		c.ResponseError(errors.New("用户uid不能为空！"))
+		respondUserRequestInvalid(c, "uid")
 		return
 	}
 	user, err := m.userDB.QueryByUID(req.Uid)
 	if err != nil {
 		m.Error("查询用户信息错误", zap.Error(err))
-		c.ResponseError(errors.New("查询用户信息错误"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if user == nil {
-		c.ResponseError(errors.New("操作用户不存在"))
+		respondUserError(c, errcode.ErrUserNotFound)
 		return
 	}
 
 	newHash, hashErr := HashPassword(req.NewPassword)
 	if hashErr != nil {
 		m.Error("密码哈希失败", zap.Error(hashErr))
-		c.ResponseError(errors.New("密码处理失败"))
+		respondUserError(c, errcode.ErrUserPasswordProcessFailed)
 		return
 	}
 	err = m.userDB.UpdateUsersWithField("password", newHash, req.Uid)
 	if err != nil {
 		m.Error("重置用户密码错误", zap.Error(err))
-		c.Response("重置用户密码错误")
+		respondUserError(c, errcode.ErrUserLoginPwdUpdateFailed)
 		return
 	}
 	c.ResponseOK()
@@ -291,49 +296,49 @@ func (m *Manager) resetUserPassword(c *wkhttp.Context) {
 func (m *Manager) deleteAdminUsers(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondManagerForbidden(c)
 		return
 	}
 	uid := c.Query("uid")
 	if uid == "" {
-		c.ResponseError(errors.New("删除用户uid不能为空"))
+		respondUserRequestInvalid(c, "uid")
 		return
 	}
 	user, err := m.userDB.QueryByUID(uid)
 	if err != nil {
 		m.Error("查询管理员用户错误", zap.Error(err))
-		c.ResponseError(errors.New("查询管理员用户错误"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if user == nil || len(user.UID) == 0 {
-		c.ResponseError(errors.New("该用户不存在"))
+		respondUserError(c, errcode.ErrUserNotFound)
 		return
 	}
 	if user.Role == "" {
-		c.ResponseError(errors.New("该用户不是管理员账号不能删除"))
+		respondUserError(c, errcode.ErrUserNotAdminAccount)
 		return
 	}
 	if user.Role == string(wkhttp.SuperAdmin) {
-		c.ResponseError(errors.New("超级管理员账号不能删除"))
+		respondUserError(c, errcode.ErrUserCannotDeleteSuperAdmin)
 		return
 	}
 	err = m.db.deleteUserWithUIDAndRole(uid, string(wkhttp.Admin))
 	if err != nil {
 		m.Error("删除管理员错误", zap.Error(err))
-		c.ResponseError(errors.New("删除管理员错误"))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	oldToken, err := m.ctx.Cache().Get(fmt.Sprintf("%s%d%s", m.ctx.GetConfig().Cache.UIDTokenCachePrefix, config.Web, user.UID))
 	if err != nil {
 		m.Error("获取旧token错误", zap.Error(err))
-		c.ResponseError(errors.New("获取旧token错误"))
+		respondUserError(c, errcode.ErrUserTokenCacheFailed)
 		return
 	}
 	if oldToken != "" {
 		err = m.ctx.Cache().Delete(m.ctx.GetConfig().Cache.TokenCachePrefix + oldToken)
 		if err != nil {
 			m.Error("清除旧token数据错误", zap.Error(err))
-			c.ResponseError(errors.New("清除旧token数据错误"))
+			respondUserError(c, errcode.ErrUserTokenCacheFailed)
 			return
 		}
 	}
@@ -344,13 +349,13 @@ func (m *Manager) deleteAdminUsers(c *wkhttp.Context) {
 func (m *Manager) getAdminUsers(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondManagerForbidden(c)
 		return
 	}
 	users, err := m.db.queryUsersWithRole(string(wkhttp.Admin))
 	if err != nil {
 		m.Error("查询管理员用户错误", zap.Error(err))
-		c.ResponseError(errors.New("查询管理员用户错误"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	list := make([]*adminUserResp, 0)
@@ -371,7 +376,7 @@ func (m *Manager) getAdminUsers(c *wkhttp.Context) {
 func (m *Manager) addAdminUser(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondManagerForbidden(c)
 		return
 	}
 	type reqVO struct {
@@ -381,33 +386,33 @@ func (m *Manager) addAdminUser(c *wkhttp.Context) {
 	}
 	var req reqVO
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("请求数据格式有误！"))
+		respondUserRequestInvalid(c, "")
 		return
 	}
 	if req.LoginName == "" {
-		c.ResponseError(errors.New("登录用户名不能为空"))
+		respondUserRequestInvalid(c, "login_name")
 		return
 	}
 	if req.Name == "" {
-		c.ResponseError(errors.New("用户名不能为空"))
+		respondUserRequestInvalid(c, "name")
 		return
 	}
 	if err := ValidateName(req.Name); err != nil {
-		c.ResponseError(err)
+		respondUserRequestInvalid(c, "name")
 		return
 	}
 	if req.Password == "" {
-		c.ResponseError(errors.New("密码不能为空"))
+		respondUserRequestInvalid(c, "password")
 		return
 	}
 	user, err := m.db.queryUserWithNameAndRole(req.LoginName, string(wkhttp.Admin))
 	if err != nil {
 		m.Error("查询用户是否存在错误", zap.String("username", req.LoginName))
-		c.ResponseError(errors.New("查询用户是否存在错误"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if user != nil && len(user.UID) > 0 {
-		c.ResponseError(errors.New("该用户名已存在"))
+		respondUserError(c, errcode.ErrUserAlreadyExists)
 		return
 	}
 	userModel := &Model{}
@@ -422,7 +427,7 @@ func (m *Manager) addAdminUser(c *wkhttp.Context) {
 	hashedPassword, err := HashPassword(req.Password)
 	if err != nil {
 		m.Error("密码哈希失败", zap.Error(err))
-		c.ResponseError(errors.New("密码处理失败"))
+		respondUserError(c, errcode.ErrUserPasswordProcessFailed)
 		return
 	}
 	userModel.Password = hashedPassword
@@ -438,8 +443,8 @@ func (m *Manager) addAdminUser(c *wkhttp.Context) {
 	userModel.Status = int(common.UserAvailable)
 	err = m.userDB.Insert(userModel)
 	if err != nil {
-		m.Error("添加管理员错误", zap.String("username", req.Name))
-		c.ResponseError(err)
+		m.Error("添加管理员错误", zap.String("username", req.Name), zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	c.ResponseOK()
@@ -449,26 +454,26 @@ func (m *Manager) addAdminUser(c *wkhttp.Context) {
 func (m *Manager) addUser(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondManagerForbidden(c)
 		return
 	}
 	var req managerAddUserReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("请求数据格式有误！"))
+		respondUserRequestInvalid(c, "")
 		return
 	}
 	if err := req.checkAddUserReq(); err != nil {
-		c.ResponseError(err)
+		respondUserRequestInvalid(c, "")
 		return
 	}
 	userInfo, err := m.userDB.QueryByUsername(fmt.Sprintf("%s%s", req.Zone, req.Phone))
 	if err != nil {
-		m.Error("查询用户信息失败！", zap.String("username", req.Phone))
-		c.ResponseError(err)
+		m.Error("查询用户信息失败！", zap.String("username", req.Phone), zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if userInfo != nil {
-		c.ResponseError(errors.New("该用户已存在"))
+		respondUserError(c, errcode.ErrUserAlreadyExists)
 		return
 	}
 	uid := util.GenerUUID()
@@ -478,7 +483,7 @@ func (m *Manager) addUser(c *wkhttp.Context) {
 		shortNo, err = m.commonService.GetShortno()
 		if err != nil {
 			m.Error("获取短编号失败！", zap.Error(err))
-			c.ResponseError(errors.New("获取短编号失败！"))
+			respondUserError(c, errcode.ErrUserShortNoGenFailed)
 			return
 		}
 	} else {
@@ -490,7 +495,7 @@ func (m *Manager) addUser(c *wkhttp.Context) {
 	tx, err := m.db.session.Begin()
 	if err != nil {
 		m.Error("开启事物错误", zap.Error(err))
-		c.ResponseError(errors.New("开启事物错误"))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	defer func() {
@@ -510,7 +515,7 @@ func (m *Manager) addUser(c *wkhttp.Context) {
 	hashedPassword, err := HashPassword(req.Password)
 	if err != nil {
 		m.Error("密码哈希失败", zap.Error(err))
-		c.ResponseError(errors.New("密码处理失败"))
+		respondUserError(c, errcode.ErrUserPasswordProcessFailed)
 		return
 	}
 	userModel.Password = hashedPassword
@@ -528,21 +533,23 @@ func (m *Manager) addUser(c *wkhttp.Context) {
 	err = m.userDB.insertTx(userModel, tx)
 	if err != nil {
 		tx.Rollback()
-		m.Error("添加用户错误", zap.String("username", req.Phone))
-		c.ResponseError(err)
+		m.Error("添加用户错误", zap.String("username", req.Phone), zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 
 	err = m.addSystemFriend(uid)
 	if err != nil {
 		tx.Rollback()
-		c.ResponseError(errors.New("添加后台生成用户和系统账号为好友关系失败"))
+		m.Error("添加后台生成用户和系统账号为好友关系失败", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	err = m.addFileHelperFriend(uid)
 	if err != nil {
 		tx.Rollback()
-		c.ResponseError(errors.New("添加后台生成用户和文件助手为好友关系失败"))
+		m.Error("添加后台生成用户和文件助手为好友关系失败", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	//发送用户注册事件
@@ -556,14 +563,14 @@ func (m *Manager) addUser(c *wkhttp.Context) {
 	if err != nil {
 		tx.RollbackUnlessCommitted()
 		m.Error("开启事件失败！", zap.Error(err))
-		c.ResponseError(errors.New("开启事件失败！"))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	err = tx.Commit()
 	if err != nil {
 		tx.Rollback()
 		m.Error("数据库事物提交失败", zap.Error(err))
-		c.ResponseError(errors.New("数据库事物提交失败"))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	m.ctx.EventCommit(eventID)
@@ -574,7 +581,7 @@ func (m *Manager) addUser(c *wkhttp.Context) {
 func (m *Manager) list(c *wkhttp.Context) {
 	err := c.CheckLoginRole()
 	if err != nil {
-		c.ResponseError(err)
+		respondManagerForbidden(c)
 		return
 	}
 	keyword := c.Query("keyword")
@@ -596,11 +603,11 @@ func (m *Manager) list(c *wkhttp.Context) {
 	// 是逻辑矛盾，会得到空结果集。返回 400 让前端及早发现 query 构造 bug，
 	// 比静默返回空更好。允许 bot_only + system_only（交集语义清晰）。
 	if filter.BotOnly && filter.ExcludeBot {
-		c.ResponseError(errors.New("bot_only 与 exclude_bot 互斥"))
+		respondUserListFilterConflict(c, "bot_only", "exclude_bot")
 		return
 	}
 	if filter.SystemOnly && filter.ExcludeSystem {
-		c.ResponseError(errors.New("system_only 与 exclude_system 互斥"))
+		respondUserListFilterConflict(c, "system_only", "exclude_system")
 		return
 	}
 	pageIndex, pageSize := c.GetPage()
@@ -610,28 +617,28 @@ func (m *Manager) list(c *wkhttp.Context) {
 		userList, err = m.db.queryUserListWithPage(uint64(pageSize), uint64(pageIndex), filter)
 		if err != nil {
 			m.Error("查询用户列表报错", zap.Error(err))
-			c.ResponseError(err)
+			respondUserError(c, errcode.ErrUserQueryFailed)
 			return
 		}
 
 		count, err = m.db.queryUserCount(filter)
 		if err != nil {
 			m.Error("查询用户数量错误", zap.Error(err))
-			c.ResponseError(errors.New("查询用户数量错误"))
+			respondUserError(c, errcode.ErrUserQueryFailed)
 			return
 		}
 	} else {
 		userList, err = m.db.queryUserListWithPageAndKeyword(keyword, uint64(pageSize), uint64(pageIndex), filter)
 		if err != nil {
 			m.Error("查询用户列表报错", zap.Error(err))
-			c.ResponseError(err)
+			respondUserError(c, errcode.ErrUserQueryFailed)
 			return
 		}
 
 		count, err = m.db.queryUserCountWithKeyWord(keyword, filter)
 		if err != nil {
 			m.Error("查询用户数量错误", zap.Error(err))
-			c.ResponseError(errors.New("查询用户数量错误"))
+			respondUserError(c, errcode.ErrUserQueryFailed)
 			return
 		}
 	}
@@ -651,13 +658,13 @@ func (m *Manager) list(c *wkhttp.Context) {
 		}
 		if err != nil {
 			m.Error("查询用户在线状态失败", zap.Error(err))
-			c.ResponseError(errors.New("查询用户在线状态失败"))
+			respondUserError(c, errcode.ErrUserQueryFailed)
 			return
 		}
 		devices, err := m.deviceDB.queryDeviceLastLoginWithUids(uids)
 		if err != nil {
 			m.Error("查询用户最后一次登录设备信息错误", zap.Error(err))
-			c.ResponseError(errors.New("查询用户最后一次登录设备信息错误"))
+			respondUserError(c, errcode.ErrUserQueryFailed)
 			return
 		}
 		var i = 0
@@ -730,12 +737,12 @@ func (m *Manager) list(c *wkhttp.Context) {
 func (m *Manager) friends(c *wkhttp.Context) {
 	err := c.CheckLoginRole()
 	if err != nil {
-		c.ResponseError(err)
+		respondManagerForbidden(c)
 		return
 	}
 	uid := c.Query("uid")
 	if uid == "" {
-		c.ResponseError(errors.New("查询用户ID不能为空"))
+		respondUserRequestInvalid(c, "uid")
 		return
 	}
 	sortType := c.Query("sort_type")
@@ -745,8 +752,8 @@ func (m *Manager) friends(c *wkhttp.Context) {
 	sortTypeInt := wkutil.AtoiOrDefault(sortType, 0)
 	list, err := m.friendDB.QueryFriends(uid)
 	if err != nil {
-		m.Error("查询用户好友错误", zap.String("uid", uid))
-		c.ResponseError(err)
+		m.Error("查询用户好友错误", zap.String("uid", uid), zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	result := make([]*managerFriendResp, 0)
@@ -770,7 +777,7 @@ func (m *Manager) friends(c *wkhttp.Context) {
 	conversations, err := m.ctx.IMSyncUserConversation(uid, 0, 1, "", nil)
 	if err != nil {
 		m.Error("同步离线后的最近会话失败！", zap.Error(err), zap.String("loginUID", uid))
-		c.ResponseError(errors.New("同步离线后的最近会话失败！"))
+		respondUserError(c, errcode.ErrUserIMCallFailed)
 		return
 	}
 	if len(conversations) == 0 {
@@ -832,18 +839,18 @@ func (m *Manager) friends(c *wkhttp.Context) {
 func (m *Manager) blacklist(c *wkhttp.Context) {
 	err := c.CheckLoginRole()
 	if err != nil {
-		c.ResponseError(err)
+		respondManagerForbidden(c)
 		return
 	}
 	uid := c.Query("uid")
 	if uid == "" {
-		c.ResponseError(errors.New("查询用户ID不能为空"))
+		respondUserRequestInvalid(c, "uid")
 		return
 	}
 	list, err := m.db.queryUserBlacklists(uid)
 	if err != nil {
 		m.Error("查询黑名单列表失败！", zap.Error(err))
-		c.ResponseError(errors.New("查询黑名单列表失败！"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	blacklists := []*managerBlackUserResp{}
@@ -861,20 +868,20 @@ func (m *Manager) blacklist(c *wkhttp.Context) {
 func (m *Manager) disableUsers(c *wkhttp.Context) {
 	err := c.CheckLoginRole()
 	if err != nil {
-		c.ResponseError(err)
+		respondManagerForbidden(c)
 		return
 	}
 	pageIndex, pageSize := c.GetPage()
 	list, err := m.db.queryUserListWithStatus(int(common.UserDisable), uint64(pageSize), uint64(pageIndex))
 	if err != nil {
 		m.Error("通过状态查询用户列表错误", zap.Error(err))
-		c.ResponseError(errors.New("通过状态查询用户列表错误"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	count, err := m.db.queryUserCountWithStatus(int(common.UserDisable))
 	if err != nil {
 		m.Error("查询用户数量错误", zap.Error(err))
-		c.ResponseError(errors.New("查询用户数量错误"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	result := make([]*managerDisableUserResp, 0)
@@ -901,32 +908,32 @@ func (m *Manager) disableUsers(c *wkhttp.Context) {
 func (m *Manager) liftBanUser(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondManagerForbidden(c)
 		return
 	}
 	uid := c.Param("uid")
 	status := c.Param("status")
 	if uid == "" {
-		c.ResponseError(errors.New("操作用户id不能为空"))
+		respondUserRequestInvalid(c, "uid")
 		return
 	}
 	if status == "" {
-		c.ResponseError(errors.New("修改状态类型不能为空"))
+		respondUserRequestInvalid(c, "status")
 		return
 	}
 	userStatus := wkutil.AtoiOrDefault(status, 0)
 	if userStatus != int(common.UserAvailable) && userStatus != int(common.UserDisable) {
-		c.ResponseError(errors.New("修改状态类型不匹配"))
+		respondUserRequestInvalid(c, "status")
 		return
 	}
 	userInfo, err := m.userDB.QueryByUID(uid)
 	if err != nil {
 		m.Error("查询用户信息失败！", zap.String("uid", uid))
-		c.ResponseError(errors.New("查询用户信息错误"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if userInfo == nil {
-		c.ResponseError(errors.New("操作用户不存在"))
+		respondUserError(c, errcode.ErrUserNotFound)
 		return
 	}
 	if userInfo.Status == userStatus {
@@ -936,7 +943,7 @@ func (m *Manager) liftBanUser(c *wkhttp.Context) {
 	err = m.userDB.UpdateUsersWithField("status", status, uid)
 	if err != nil {
 		m.Error("修改用户状态错误", zap.Error(err))
-		c.ResponseError(errors.New("修改用户状态错误"))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 
@@ -952,13 +959,13 @@ func (m *Manager) liftBanUser(c *wkhttp.Context) {
 	})
 	if err != nil {
 		m.Error("更新WebIM的token失败！", zap.Error(err))
-		c.ResponseError(errors.New("更新IM的token失败！"))
+		respondUserError(c, errcode.ErrUserIMCallFailed)
 		return
 	}
 	err = m.ctx.QuitUserDevice(userInfo.UID, -1)
 	if err != nil {
 		m.Error("下线用户所有登录设备错误", zap.Error(err), zap.String("uid", uid))
-		c.ResponseError(errors.New("下线用户所有登录设备错误"))
+		respondUserError(c, errcode.ErrUserIMCallFailed)
 		return
 	}
 	c.ResponseOK()
@@ -968,7 +975,7 @@ func (m *Manager) liftBanUser(c *wkhttp.Context) {
 func (m *Manager) updatePwd(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondManagerForbidden(c)
 		return
 	}
 	loginUID := c.GetLoginUID()
@@ -978,60 +985,60 @@ func (m *Manager) updatePwd(c *wkhttp.Context) {
 	}
 	var req updatePwdReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("请求数据格式有误！"))
+		respondUserRequestInvalid(c, "")
 		return
 	}
 	if req.Password == "" || req.NewPassword == "" {
-		c.ResponseError(errors.New("密码不能为空"))
+		respondUserRequestInvalid(c, "password")
 		return
 	}
 	user, err := m.userDB.QueryByUID(loginUID)
 	if err != nil {
 		m.Error("查询用户信息错误", zap.Error(err))
-		c.ResponseError(errors.New("查询用户信息错误"))
+		respondUserError(c, errcode.ErrUserQueryFailed)
 		return
 	}
 	if user == nil {
-		c.ResponseError(errors.New("操作用户不存在"))
+		respondUserError(c, errcode.ErrUserNotFound)
 		return
 	}
 	matched, _ := CheckPassword(req.Password, user.Password)
 	if !matched {
-		c.ResponseError(errors.New("原密码错误"))
+		respondUserError(c, errcode.ErrUserOldPasswordIncorrect)
 		return
 	}
 	if len(req.NewPassword) < 6 {
-		c.ResponseError(errors.New("密码长度必须大于6位"))
+		respondUserError(c, errcode.ErrUserPasswordTooShort)
 		return
 	}
 	if req.Password == req.NewPassword {
-		c.ResponseError(errors.New("新密码不能和旧密码一样"))
+		respondUserError(c, errcode.ErrUserNewPasswordSameAsOld)
 		return
 	}
 	newHashedPassword, err := HashPassword(req.NewPassword)
 	if err != nil {
 		m.Error("密码哈希失败", zap.Error(err))
-		c.ResponseError(errors.New("密码处理失败"))
+		respondUserError(c, errcode.ErrUserPasswordProcessFailed)
 		return
 	}
 	err = m.userDB.UpdateUsersWithField("password", newHashedPassword, loginUID)
 	if err != nil {
 		m.Error("修改用户密码错误", zap.Error(err))
-		c.Response("修改用户密码错误")
+		respondUserError(c, errcode.ErrUserLoginPwdUpdateFailed)
 		return
 	}
 	// 清除token缓存
 	oldToken, err := m.ctx.Cache().Get(fmt.Sprintf("%s%d%s", m.ctx.GetConfig().Cache.UIDTokenCachePrefix, config.Web, user.UID))
 	if err != nil {
 		m.Error("获取旧token错误", zap.Error(err))
-		c.ResponseError(errors.New("获取旧token错误"))
+		respondUserError(c, errcode.ErrUserTokenCacheFailed)
 		return
 	}
 	if oldToken != "" {
 		err = m.ctx.Cache().Delete(m.ctx.GetConfig().Cache.TokenCachePrefix + oldToken)
 		if err != nil {
 			m.Error("清除旧token数据错误", zap.Error(err))
-			c.ResponseError(errors.New("清除旧token数据错误"))
+			respondUserError(c, errcode.ErrUserTokenCacheFailed)
 			return
 		}
 	}
