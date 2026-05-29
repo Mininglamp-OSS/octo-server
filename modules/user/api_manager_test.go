@@ -505,6 +505,11 @@ func TestUserListBotAndSystemFlags(t *testing.T) {
 
 	// 互斥校验：bot_only 与 exclude_bot、system_only 与 exclude_system 同时为 1
 	// 是逻辑矛盾，返回 400 比静默返回空更利于前端发现 bug。
+	//
+	// Phase 2.1 迁移后该 400 走 i18n 错误信封（err.server.user.list_filter_conflict）。
+	// 这里只校验 HTTP 状态码不变（回归保护）——此 testutil 服务未装 i18n
+	// ErrorRenderer，故仅输出 legacy {msg,status}；error.code / details 的 v2
+	// 信封与 zh-CN 文案由 TestRespondUserHelpers（helperHarness 装了 renderer）覆盖。
 	conflictCases := []struct {
 		name  string
 		query string

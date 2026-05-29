@@ -44,6 +44,33 @@ func TestUserAPINoLegacyResponseError(t *testing.T) {
 	}
 }
 
+// TestManagerAPINoLegacyResponseError pins the post-Phase-2.1 contract that
+// modules/user/api_manager.go does not regress to legacy octo-lib error
+// responses (the management console migration). Mirrors the api.go guard
+// above; also forbids the `c.Response("<string>")` shape that two handlers
+// used to (mis)use as an error path — those returned HTTP 200 with a bare
+// string body and are now proper httperr.ResponseErrorL envelopes.
+func TestManagerAPINoLegacyResponseError(t *testing.T) {
+	data, err := os.ReadFile("api_manager.go")
+	if err != nil {
+		t.Fatalf("read api_manager.go: %v", err)
+	}
+	var clean strings.Builder
+	for _, line := range strings.Split(string(data), "\n") {
+		if idx := strings.Index(line, "//"); idx >= 0 {
+			line = line[:idx]
+		}
+		clean.WriteString(line)
+		clean.WriteByte('\n')
+	}
+	cleaned := clean.String()
+	for _, banned := range []string{".ResponseError(", ".ResponseErrorf("} {
+		if strings.Contains(cleaned, banned) {
+			t.Fatalf("modules/user/api_manager.go must use httperr.ResponseErrorL via respond* helpers instead of legacy %s", banned)
+		}
+	}
+}
+
 // helperHarness mounts a single GET /probe route that invokes the supplied
 // helper. Tests exercise the helper directly without paying the DB / auth
 // setup cost — the contract we care about is what the wkhttp envelope
@@ -224,6 +251,77 @@ func TestRespondUserHelpers(t *testing.T) {
 			wantTransStatus: http.StatusBadRequest,
 			wantContains:    "服务器内部错误",
 			wantNotContains: "WeChat",
+		},
+
+		// ---- Phase 2.1 api_manager.go migration helpers / codes ----
+		{
+			name:            "respondManagerForbidden routes to shared.auth.forbidden",
+			probe:           func(c *wkhttp.Context) { respondManagerForbidden(c) },
+			wantCodeID:      "err.shared.auth.forbidden",
+			wantSemStatus:   http.StatusForbidden,
+			wantTransStatus: http.StatusBadRequest,
+			wantContains:    "无权执行此操作",
+		},
+		{
+			name: "respondUserListFilterConflict carries both filter names",
+			probe: func(c *wkhttp.Context) {
+				respondUserListFilterConflict(c, "bot_only", "exclude_bot")
+			},
+			wantCodeID:      "err.server.user.list_filter_conflict",
+			wantSemStatus:   http.StatusBadRequest,
+			wantTransStatus: http.StatusBadRequest,
+			wantContains:    "互斥",
+			wantDetails:     map[string]any{"filter": "bot_only", "conflicts_with": "exclude_bot"},
+		},
+		{
+			name:            "ErrUserManagerPermissionRequired surfaces zh-CN copy",
+			probe:           func(c *wkhttp.Context) { respondUserError(c, errcode.ErrUserManagerPermissionRequired) },
+			wantCodeID:      "err.server.user.manager_permission_required",
+			wantSemStatus:   http.StatusForbidden,
+			wantTransStatus: http.StatusBadRequest,
+			wantContains:    "未开通管理权限",
+		},
+		{
+			name:            "ErrUserPasswordTooShort surfaces zh-CN copy",
+			probe:           func(c *wkhttp.Context) { respondUserError(c, errcode.ErrUserPasswordTooShort) },
+			wantCodeID:      "err.server.user.password_too_short",
+			wantSemStatus:   http.StatusBadRequest,
+			wantTransStatus: http.StatusBadRequest,
+			wantContains:    "密码长度必须大于",
+		},
+		{
+			name:            "ErrUserOldPasswordIncorrect surfaces zh-CN copy",
+			probe:           func(c *wkhttp.Context) { respondUserError(c, errcode.ErrUserOldPasswordIncorrect) },
+			wantCodeID:      "err.server.user.old_password_incorrect",
+			wantSemStatus:   http.StatusBadRequest,
+			wantTransStatus: http.StatusBadRequest,
+			wantContains:    "原密码错误",
+		},
+		{
+			name:            "ErrUserCannotDeleteSuperAdmin surfaces zh-CN copy",
+			probe:           func(c *wkhttp.Context) { respondUserError(c, errcode.ErrUserCannotDeleteSuperAdmin) },
+			wantCodeID:      "err.server.user.cannot_delete_super_admin",
+			wantSemStatus:   http.StatusForbidden,
+			wantTransStatus: http.StatusBadRequest,
+			wantContains:    "超级管理员账号不能删除",
+		},
+		{
+			name:            "ErrUserTokenCacheFailed (Internal=true) collapses to shared internal copy",
+			probe:           func(c *wkhttp.Context) { respondUserError(c, errcode.ErrUserTokenCacheFailed) },
+			wantCodeID:      "err.server.user.token_cache_failed",
+			wantSemStatus:   http.StatusInternalServerError,
+			wantTransStatus: http.StatusBadRequest,
+			wantContains:    "服务器内部错误",
+			wantNotContains: "session token",
+		},
+		{
+			name:            "ErrUserShortNoGenFailed (Internal=true) collapses to shared internal copy",
+			probe:           func(c *wkhttp.Context) { respondUserError(c, errcode.ErrUserShortNoGenFailed) },
+			wantCodeID:      "err.server.user.short_no_gen_failed",
+			wantSemStatus:   http.StatusInternalServerError,
+			wantTransStatus: http.StatusBadRequest,
+			wantContains:    "服务器内部错误",
+			wantNotContains: "short ID",
 		},
 	}
 
