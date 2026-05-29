@@ -522,6 +522,9 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 		IsExternal    int    `db:"is_external"`
 		SourceSpaceID string `db:"source_space_id"`
 	}
+	// IFNULL + Limit(1) 都是防御性写法：source_space_id 列是 NOT NULL DEFAULT ''
+	// （见 group/sql/20260424000001_group_legacy01.sql），(group_no, uid) 也有唯一约束、
+	// LoadOne 至多命中一行——这里并非暗示该列可空或可能多行，仅作 belt-and-suspenders。
 	err := c.db.session.Select("is_external", "IFNULL(source_space_id,'') AS source_space_id").
 		From("group_member").
 		Where("group_no=? and uid=? and is_deleted=0", groupNo, loginUID).
@@ -562,6 +565,12 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 	// 对外部群的 `eff == "" → defaultSpaceID`、api_sidebar.sidebarMySourceSpaceID
 	// 同口径。否则这些 legacy 行仍无法归类，且 follow_version / auto_follow_threads
 	// 会写到群归属 Space，与侧边栏读取的默认 Space 不一致——正是 #191 想消灭的漂移。
+	//
+	// 注意 corner case：source_space_id 为空且用户连默认 Space 都没有（无任何
+	// space_member 行，如未绑定 Space 的 bot）时，下面保留 effectiveSpaceID =
+	// groupSpaceID（旧行为），而非像 sidebarMySourceSpaceID 那样解析为 ""。这不是
+	// 严格对齐——但 "" 不会匹配任何分类 Space、等于无法归类，保留旧行为是更宽松且
+	// 不引入回归的选择。读到此处不要误以为这里与 sidebar 解析逐字一致。
 	effectiveSpaceID := groupSpaceID
 	if member.IsExternal == 1 {
 		if member.SourceSpaceID != "" {

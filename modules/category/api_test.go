@@ -1082,7 +1082,7 @@ func TestCategory_MoveExternalGroupToCurrentSpaceCategory(t *testing.T) {
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	resetUIDRateLimit(t, ctx)
 
 	// userSpace = where the current user lives and owns categories.
@@ -1094,7 +1094,7 @@ func TestCategory_MoveExternalGroupToCurrentSpaceCategory(t *testing.T) {
 
 	// category lives under the user's current Space.
 	wc := createCategory(t, route, userSpace, "外部群关注")
-	assert.Equal(t, http.StatusOK, wc.Code)
+	require.Equal(t, http.StatusOK, wc.Code)
 	catID := parseJSON(t, wc)["category_id"].(string)
 
 	// group lives in groupSpace; the current user joined as an external member
@@ -1102,17 +1102,17 @@ func TestCategory_MoveExternalGroupToCurrentSpaceCategory(t *testing.T) {
 	groupNo := "group-ext191-001"
 	_, err = f.db.session.InsertBySql("INSERT INTO `group` (group_no, name, creator, status, space_id) VALUES (?, ?, ?, ?, ?)",
 		groupNo, "外部群", "owner-uid", 1, groupSpace).Exec()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	_, err = f.db.session.InsertInto("group_member").
 		Columns("group_no", "uid", "role", "is_deleted", "status", "is_external", "source_space_id").
 		Values(groupNo, testutil.UID, 0, 0, 1, 1, userSpace).Exec()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// categorizing the external group into the user-Space category must succeed.
 	wm := doRequest(t, route, "PUT", "/v1/groups/"+groupNo+"/category", map[string]string{
 		"category_id": catID,
 	})
-	assert.Equal(t, http.StatusOK, wm.Code)
+	require.Equal(t, http.StatusOK, wm.Code)
 
 	setting, err := f.db.queryGroupSettingForCategory(groupNo, testutil.UID)
 	assert.NoError(t, err)
@@ -1147,7 +1147,7 @@ func TestCategory_MoveExternalGroupEmptySourceSpaceFallsBackToDefaultSpace(t *te
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	resetUIDRateLimit(t, ctx)
 
 	// The user's only Space membership → resolves as their default Space.
@@ -1157,24 +1157,24 @@ func TestCategory_MoveExternalGroupEmptySourceSpaceFallsBackToDefaultSpace(t *te
 	route := s.GetRoute()
 
 	wc := createCategory(t, route, defaultSpace, "外部群关注-legacy")
-	assert.Equal(t, http.StatusOK, wc.Code)
+	require.Equal(t, http.StatusOK, wc.Code)
 	catID := parseJSON(t, wc)["category_id"].(string)
 
 	// External member with EMPTY source_space_id (legacy row).
 	groupNo := "group-ext191-legacy-001"
 	_, err = f.db.session.InsertBySql("INSERT INTO `group` (group_no, name, creator, status, space_id) VALUES (?, ?, ?, ?, ?)",
 		groupNo, "外部群legacy", "owner-uid", 1, groupSpace).Exec()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	_, err = f.db.session.InsertInto("group_member").
 		Columns("group_no", "uid", "role", "is_deleted", "status", "is_external", "source_space_id").
 		Values(groupNo, testutil.UID, 0, 0, 1, 1, "").Exec()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Must succeed by falling back to the user's default Space.
 	wm := doRequest(t, route, "PUT", "/v1/groups/"+groupNo+"/category", map[string]string{
 		"category_id": catID,
 	})
-	assert.Equal(t, http.StatusOK, wm.Code)
+	require.Equal(t, http.StatusOK, wm.Code)
 
 	setting, err := f.db.queryGroupSettingForCategory(groupNo, testutil.UID)
 	assert.NoError(t, err)
