@@ -72,6 +72,9 @@ other = "Account is in the deactivation cooldown period, please use a newer clie
 ["err.server.user.already_exists"]
 other = "User already exists."
 
+["err.server.user.already_friend"]
+other = "You are already friends."
+
 ["err.server.user.auth_code_not_found"]
 other = "Authorization code is invalid or has expired."
 
@@ -83,6 +86,15 @@ other = "Authorization payload is invalid."
 
 ["err.server.user.auth_scanner_mismatch"]
 other = "Scanner and authorizer are not the same user."
+
+["err.server.user.bot_not_in_space"]
+other = "This bot is not in the current space and cannot be added."
+
+["err.server.user.cannot_add_self"]
+other = "You cannot add yourself as a friend."
+
+["err.server.user.cannot_delete_super_admin"]
+other = "The super administrator account cannot be deleted."
 
 ["err.server.user.chat_pwd_update_failed"]
 other = "Failed to update chat password."
@@ -102,8 +114,20 @@ other = "Demo accounts cannot enable device lock."
 ["err.server.user.destroy_failed"]
 other = "Failed to deactivate account."
 
+["err.server.user.device_not_found"]
+other = "Device not found."
+
 ["err.server.user.file_operation_failed"]
 other = "Failed to process file."
+
+["err.server.user.friend_apply_invalid"]
+other = "Friend request is invalid or has expired."
+
+["err.server.user.friend_apply_not_found"]
+other = "Friend request not found."
+
+["err.server.user.friend_not_found"]
+other = "Friend not found."
 
 ["err.server.user.im_call_failed"]
 other = "Failed to call IM service."
@@ -119,6 +143,9 @@ other = "Failed to set language preference."
 
 ["err.server.user.language_unsupported"]
 other = "Unsupported language."
+
+["err.server.user.list_filter_conflict"]
+other = "Conflicting list filters."
 
 ["err.server.user.local_login_disabled"]
 other = "Local login is disabled."
@@ -138,11 +165,29 @@ other = "Too many failed login attempts, account temporarily locked. Please try 
 ["err.server.user.login_pwd_update_failed"]
 other = "Failed to update login password."
 
+["err.server.user.manager_permission_required"]
+other = "This account does not have management permission."
+
+["err.server.user.new_password_same_as_old"]
+other = "The new password must be different from the current one."
+
+["err.server.user.not_admin_account"]
+other = "This user is not an administrator account and cannot be deleted."
+
 ["err.server.user.not_found"]
 other = "User not found."
 
+["err.server.user.old_password_incorrect"]
+other = "The current password is incorrect."
+
+["err.server.user.password_mismatch"]
+other = "The two passwords do not match."
+
 ["err.server.user.password_process_failed"]
 other = "Failed to process password."
+
+["err.server.user.password_too_short"]
+other = "Password must be at least 6 characters."
 
 ["err.server.user.phone_region_unsupported"]
 other = "Only mainland China phone numbers are supported."
@@ -168,11 +213,17 @@ other = "Short ID can only be changed once."
 ["err.server.user.short_no_format_invalid"]
 other = "Short ID must start with a letter and contain 6-20 letters, digits, underscores or hyphens."
 
+["err.server.user.short_no_gen_failed"]
+other = "Failed to generate a short ID."
+
 ["err.server.user.sms_send_failed"]
 other = "Failed to send SMS."
 
 ["err.server.user.store_failed"]
 other = "Failed to persist user data."
+
+["err.server.user.token_cache_failed"]
+other = "Failed to update the session token cache."
 
 ["err.server.user.token_required"]
 other = "Token is required."

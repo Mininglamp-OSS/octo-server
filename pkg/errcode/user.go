@@ -94,6 +94,11 @@ var (
 		HTTPStatus:     http.StatusNotFound,
 		DefaultMessage: "Current user not found.",
 	})
+	ErrUserDeviceNotFound = register(codes.Code{
+		ID:             "err.server.user.device_not_found",
+		HTTPStatus:     http.StatusNotFound,
+		DefaultMessage: "Device not found.",
+	})
 	ErrUserAlreadyExists = register(codes.Code{
 		ID:             "err.server.user.already_exists",
 		HTTPStatus:     http.StatusConflict,
@@ -287,5 +292,119 @@ var (
 		HTTPStatus:     http.StatusInternalServerError,
 		DefaultMessage: "Failed to set language preference.",
 		Internal:       true,
+	})
+
+	// Management-console (modules/user/api_manager.go) codes. Migrated from
+	// the legacy c.ResponseError(errors.New("中文")) sites in Phase 2.1. Shared
+	// auth/param/internal cases reuse err.shared.* (forbidden / param.invalid)
+	// and the generic ErrUser* codes above; the codes below cover the
+	// manager-specific guards that had no existing equivalent.
+
+	// ErrUserManagerPermissionRequired fires at /v1/manager/login after the
+	// password check succeeds but the account carries no admin/superAdmin role.
+	// Distinct from err.shared.auth.forbidden (a route-level role guard) so the
+	// login page can show a login-specific hint.
+	ErrUserManagerPermissionRequired = register(codes.Code{
+		ID:             "err.server.user.manager_permission_required",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "This account does not have management permission.",
+	})
+	ErrUserPasswordTooShort = register(codes.Code{
+		ID:             "err.server.user.password_too_short",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Password must be at least 6 characters.",
+	})
+	ErrUserPasswordMismatch = register(codes.Code{
+		ID:             "err.server.user.password_mismatch",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "The two passwords do not match.",
+	})
+	ErrUserOldPasswordIncorrect = register(codes.Code{
+		ID:             "err.server.user.old_password_incorrect",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "The current password is incorrect.",
+	})
+	ErrUserNewPasswordSameAsOld = register(codes.Code{
+		ID:             "err.server.user.new_password_same_as_old",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "The new password must be different from the current one.",
+	})
+	// ErrUserNotAdminAccount guards the delete-admin endpoint: the target user
+	// exists but is not an administrator account, so it cannot be deleted here.
+	ErrUserNotAdminAccount = register(codes.Code{
+		ID:             "err.server.user.not_admin_account",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "This user is not an administrator account and cannot be deleted.",
+	})
+	ErrUserCannotDeleteSuperAdmin = register(codes.Code{
+		ID:             "err.server.user.cannot_delete_super_admin",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "The super administrator account cannot be deleted.",
+	})
+	// ErrUserListFilterConflict reports mutually-exclusive list filters
+	// (bot_only + exclude_bot, system_only + exclude_system). The conflicting
+	// filter names are surfaced so a frontend dev can spot the bad query.
+	ErrUserListFilterConflict = register(codes.Code{
+		ID:             "err.server.user.list_filter_conflict",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Conflicting list filters.",
+		SafeDetailKeys: []string{"filter", "conflicts_with"},
+	})
+
+	// Internal failures (500, Internal=true).
+
+	// ErrUserTokenCacheFailed covers the session-token cache read/write/delete
+	// failures in the manager login / password-change / delete-admin flows.
+	ErrUserTokenCacheFailed = register(codes.Code{
+		ID:             "err.server.user.token_cache_failed",
+		HTTPStatus:     http.StatusInternalServerError,
+		DefaultMessage: "Failed to update the session token cache.",
+		Internal:       true,
+	})
+	ErrUserShortNoGenFailed = register(codes.Code{
+		ID:             "err.server.user.short_no_gen_failed",
+		HTTPStatus:     http.StatusInternalServerError,
+		DefaultMessage: "Failed to generate a short ID.",
+		Internal:       true,
+	})
+
+	// Friend / contact (modules/user/api_friend.go) codes. Most legacy sites
+	// there are internal DB / IM / cache failures that collapse to the generic
+	// ErrUserQueryFailed / ErrUserStoreFailed / ErrUserIMCallFailed /
+	// ErrUserTokenCacheFailed / ErrUserDecodeFailed codes above; the codes
+	// below cover the friend-specific user-facing business guards.
+
+	ErrUserCannotAddSelf = register(codes.Code{
+		ID:             "err.server.user.cannot_add_self",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "You cannot add yourself as a friend.",
+	})
+	ErrUserAlreadyFriend = register(codes.Code{
+		ID:             "err.server.user.already_friend",
+		HTTPStatus:     http.StatusConflict,
+		DefaultMessage: "You are already friends.",
+	})
+	ErrUserBotNotInSpace = register(codes.Code{
+		ID:             "err.server.user.bot_not_in_space",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "This bot is not in the current space and cannot be added.",
+	})
+	ErrUserFriendApplyNotFound = register(codes.Code{
+		ID:             "err.server.user.friend_apply_not_found",
+		HTTPStatus:     http.StatusNotFound,
+		DefaultMessage: "Friend request not found.",
+	})
+	ErrUserFriendNotFound = register(codes.Code{
+		ID:             "err.server.user.friend_not_found",
+		HTTPStatus:     http.StatusNotFound,
+		DefaultMessage: "Friend not found.",
+	})
+	// ErrUserFriendApplyInvalid covers an expired / malformed friend-request
+	// token or payload (the apply token decoded but its referenced records are
+	// gone or inconsistent).
+	ErrUserFriendApplyInvalid = register(codes.Code{
+		ID:             "err.server.user.friend_apply_invalid",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Friend request is invalid or has expired.",
 	})
 )
