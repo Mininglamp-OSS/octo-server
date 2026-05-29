@@ -42,10 +42,21 @@ env-test:
 #                 expected once translators adopt the goi18n workflow; hashes
 #                 are how goi18n detects source drift requiring re-translation.
 
-.PHONY: i18n-extract i18n-extract-check i18n-merge
+# i18n-lint     : run the Phase 0.10 migration gates locally (the same checks
+#                 CI runs in the "i18n Lint" job):
+#                   - lint-direct-error-response: D23 no-new-AbortWithStatusJSON
+#                     ratchet vs tools/lint-direct-error-response/baseline.txt
+#                   - lint-unregistered-code: no inline codes.Code{} literals
+#                     passed to httperr.ResponseErrorL (registry bypass)
+
+.PHONY: i18n-extract i18n-extract-check i18n-merge i18n-lint
 
 i18n-extract:
 	go run ./pkg/i18n/cmd/octo-i18n-extract
+
+i18n-lint:
+	go run ./tools/lint-direct-error-response
+	go run ./tools/lint-unregistered-code
 
 i18n-extract-check:
 	go run ./pkg/i18n/cmd/octo-i18n-extract -check
