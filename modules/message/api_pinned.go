@@ -12,6 +12,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/gocraft/dbr/v2"
 	"github.com/pkg/errors"
@@ -31,36 +33,36 @@ func (m *Message) pinnedMessage(c *wkhttp.Context) {
 	var req reqVO
 	if err := c.BindJSON(&req); err != nil {
 		m.Error(common.ErrData.Error(), zap.Error(err))
-		c.ResponseError(common.ErrData)
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	if req.ChannelID == "" {
-		c.ResponseError(errors.New("频道ID不能为空"))
+		respondMessageRequestInvalid(c, "channel_id")
 		return
 	}
 	if req.MessageID == "" {
-		c.ResponseError(errors.New("消息ID不能为空"))
+		respondMessageRequestInvalid(c, "message_id")
 		return
 	}
 	if req.MessageSeq <= 0 {
-		c.ResponseError(errors.New("消息seq不合法"))
+		respondMessageRequestInvalid(c, "message_seq")
 		return
 	}
 
 	fakeChannelID := req.ChannelID
 	if req.ChannelType == common.ChannelTypePerson.Uint8() {
 		if loginUID == req.ChannelID {
-			c.ResponseError(errors.New("频道ID不合法"))
+			respondMessageRequestInvalid(c, "channel_id")
 			return
 		}
 		isFriend, err := m.userService.IsFriend(loginUID, req.ChannelID)
 		if err != nil {
 			m.Error("查询好友关系错误", zap.Error(err))
-			c.ResponseError(errors.New("查询好友关系错误"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 		if !isFriend {
-			c.ResponseError(errors.New("无权操作此会话"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageConversationForbidden, nil, nil)
 			return
 		}
 		fakeChannelID = common.GetFakeChannelIDWith(loginUID, req.ChannelID)
@@ -68,21 +70,21 @@ func (m *Message) pinnedMessage(c *wkhttp.Context) {
 		groupInfo, err := m.groupService.GetGroupDetail(req.ChannelID, loginUID)
 		if err != nil {
 			m.Error("查询群组信息错误", zap.Error(err))
-			c.ResponseError(errors.New("查询群组信息错误"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 		if groupInfo == nil || groupInfo.Status != 1 {
-			c.ResponseError(errors.New("群不存在或已删除"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageGroupNotFound, nil, nil)
 			return
 		}
 		isCreatorOrManager, err := m.groupService.IsCreatorOrManager(req.ChannelID, loginUID)
 		if err != nil {
 			m.Error("查询用户在群内权限错误", zap.Error(err))
-			c.ResponseError(errors.New("查询用户在群内权限错误"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 		if !isCreatorOrManager && groupInfo.AllowMemberPinnedMessage == 0 {
-			c.ResponseError(errors.New("普通成员不允许置顶消息"))
+			httperr.ResponseErrorL(c, errcode.ErrMessagePinnedForbidden, nil, nil)
 			return
 		}
 	}
@@ -97,28 +99,28 @@ func (m *Message) pinnedMessage(c *wkhttp.Context) {
 	})
 	if err != nil {
 		m.Error("查询消息错误", zap.Error(err))
-		c.ResponseError(errors.New("查询消息错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	if syncMsg == nil || len(syncMsg.Messages) == 0 {
-		c.ResponseError(errors.New("该消息不存在或已删除"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotFound, nil, nil)
 		return
 	}
 	message := syncMsg.Messages[0]
 	messageExtra, err := m.messageExtraDB.queryWithMessageID(req.MessageID)
 	if err != nil {
 		m.Error("查询消息扩展信息错误", zap.Error(err))
-		c.ResponseError(errors.New("查询消息扩展信息错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	if messageExtra != nil && messageExtra.IsDeleted == 1 {
-		c.ResponseError(errors.New("该消息不存在或已删除"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotFound, nil, nil)
 		return
 	}
 	appConfig, err := m.commonService.GetAppConfig()
 	if err != nil {
 		m.Error("查询配置错误", zap.Error(err))
-		c.ResponseError(errors.New("查询配置错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	var maxCount = 10
@@ -128,24 +130,24 @@ func (m *Message) pinnedMessage(c *wkhttp.Context) {
 	currentCount, err := m.pinnedDB.queryCountWithChannel(fakeChannelID, req.ChannelType)
 	if err != nil {
 		m.Error("查询当前置顶消息数量错误", zap.Error(err))
-		c.ResponseError(errors.New("查询当前置顶消息数量错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	pinnedMessage, err := m.pinnedDB.queryWithMessageId(fakeChannelID, req.ChannelType, req.MessageID)
 	if err != nil {
 		m.Error("查询置顶消息错误", zap.Error(err))
-		c.ResponseError(errors.New("查询置顶消息错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	if currentCount >= int64(maxCount) && (pinnedMessage == nil || pinnedMessage.IsDeleted == 1) {
-		c.ResponseError(errors.New("置顶数量已达到上限"))
+		httperr.ResponseErrorL(c, errcode.ErrMessagePinnedLimitExceeded, nil, nil)
 		return
 	}
 
 	tx, err := m.db.session.Begin()
 	if err != nil {
 		m.Error("开启事务错误", zap.Error(err))
-		c.ResponseError(errors.New("开启事务错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	defer func() {
@@ -168,7 +170,7 @@ func (m *Message) pinnedMessage(c *wkhttp.Context) {
 		if err != nil {
 			tx.Rollback()
 			m.Error("新增置顶消息错误", zap.Error(err))
-			c.ResponseError(errors.New("新增置顶消息错误"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
 		isSendSystemMsg = true
@@ -186,7 +188,7 @@ func (m *Message) pinnedMessage(c *wkhttp.Context) {
 		if err != nil {
 			tx.Rollback()
 			m.Error("取消置顶消息错误", zap.Error(err))
-			c.ResponseError(errors.New("取消置顶消息错误"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
 	}
@@ -194,7 +196,7 @@ func (m *Message) pinnedMessage(c *wkhttp.Context) {
 	if err != nil {
 		tx.Rollback()
 		m.Error("生成消息扩展序列号失败！", zap.Error(err))
-		c.ResponseError(errors.New("生成消息扩展序列号失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	err = m.messageExtraDB.insertOrUpdatePinnedTx(&messageExtraModel{
@@ -207,12 +209,14 @@ func (m *Message) pinnedMessage(c *wkhttp.Context) {
 	}, tx)
 	if err != nil {
 		tx.Rollback()
-		c.ResponseErrorf("更新消息置顶状态失败！", err)
+		m.Error("更新消息置顶状态失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	if err := tx.Commit(); err != nil {
 		tx.Rollback()
-		c.ResponseErrorf("事务提交失败！", err)
+		m.Error("事务提交失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	err = m.ctx.SendCMD(config.MsgCMDReq{
@@ -225,7 +229,7 @@ func (m *Message) pinnedMessage(c *wkhttp.Context) {
 
 	if err != nil {
 		m.Error("发送cmd失败！", zap.Error(err))
-		c.ResponseError(err)
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotifyFailed, nil, nil)
 		return
 	}
 	if isSendSystemMsg {
@@ -305,27 +309,27 @@ func (m *Message) clearPinnedMessage(c *wkhttp.Context) {
 	}
 	if err := c.BindJSON(&req); err != nil {
 		m.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误！"))
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	if req.ChannelID == "" {
-		c.ResponseError(errors.New("频道ID不能为空"))
+		respondMessageRequestInvalid(c, "channel_id")
 		return
 	}
 	fakeChannelID := req.ChannelID
 	if req.ChannelType == common.ChannelTypePerson.Uint8() {
 		if loginUID == req.ChannelID {
-			c.ResponseError(errors.New("频道ID不合法"))
+			respondMessageRequestInvalid(c, "channel_id")
 			return
 		}
 		isFriend, err := m.userService.IsFriend(loginUID, req.ChannelID)
 		if err != nil {
 			m.Error("查询好友关系错误", zap.Error(err))
-			c.ResponseError(errors.New("查询好友关系错误"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 		if !isFriend {
-			c.ResponseError(errors.New("无权操作此会话"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageConversationForbidden, nil, nil)
 			return
 		}
 		fakeChannelID = common.GetFakeChannelIDWith(loginUID, req.ChannelID)
@@ -334,18 +338,18 @@ func (m *Message) clearPinnedMessage(c *wkhttp.Context) {
 		isCreatorOrManager, err := m.groupService.IsCreatorOrManager(req.ChannelID, loginUID)
 		if err != nil {
 			m.Error("查询用户在群内权限错误", zap.Error(err))
-			c.ResponseError(errors.New("查询用户在群内权限错误"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 		if !isCreatorOrManager {
-			c.ResponseError(errors.New("用户无权清空置顶消息"))
+			httperr.ResponseErrorL(c, errcode.ErrMessagePinnedForbidden, nil, nil)
 			return
 		}
 	}
 	pinnedMsgs, err := m.pinnedDB.queryWithUnDeletedMessage(fakeChannelID, req.ChannelType)
 	if err != nil {
 		m.Error("查询置顶消息错误", zap.Error(err))
-		c.ResponseError(errors.New("查询置顶消息错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	messageIds := make([]string, 0)
@@ -360,13 +364,13 @@ func (m *Message) clearPinnedMessage(c *wkhttp.Context) {
 	messageUserExtras, err := m.messageUserExtraDB.queryWithMessageIDsAndUID(messageIds, loginUID)
 	if err != nil {
 		m.Error("查询用户消息扩展字段失败！", zap.Error(err))
-		c.ResponseError(errors.New("查询用户消息扩展字段失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	channelOffsetM, err := m.channelOffsetDB.queryWithUIDAndChannel(loginUID, fakeChannelID, req.ChannelType)
 	if err != nil {
 		m.Error("查询频道偏移量失败！", zap.Error(err))
-		c.ResponseError(errors.New("查询频道偏移量失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	updateModel := make([]*pinnedMessageModel, 0)
@@ -396,7 +400,7 @@ func (m *Message) clearPinnedMessage(c *wkhttp.Context) {
 	tx, err := m.db.session.Begin()
 	if err != nil {
 		m.Error("开启事务错误", zap.Error(err))
-		c.ResponseError(errors.New("开启事务错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	defer func() {
@@ -410,7 +414,7 @@ func (m *Message) clearPinnedMessage(c *wkhttp.Context) {
 		if err != nil {
 			tx.Rollback()
 			m.Error("删除置顶消息错误", zap.Error(err))
-			c.ResponseError(errors.New("删除置顶消息错误"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
 
@@ -418,7 +422,7 @@ func (m *Message) clearPinnedMessage(c *wkhttp.Context) {
 		if err != nil {
 			tx.Rollback()
 			m.Error("生成消息扩展序列号失败！", zap.Error(err))
-			c.ResponseError(errors.New("生成消息扩展序列号失败！"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
 		err = m.messageExtraDB.insertOrUpdatePinnedTx(&messageExtraModel{
@@ -432,14 +436,16 @@ func (m *Message) clearPinnedMessage(c *wkhttp.Context) {
 		if err != nil {
 			tx.Rollback()
 			m.Error("修改消息扩展置顶状态错误", zap.Error(err))
-			c.ResponseErrorf("修改消息扩展置顶状态错误", err)
+			m.Error("修改消息扩展置顶状态错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
 		tx.Rollback()
-		c.ResponseErrorf("事务提交失败！", err)
+		m.Error("事务提交失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	err = m.ctx.SendCMD(config.MsgCMDReq{
@@ -452,7 +458,7 @@ func (m *Message) clearPinnedMessage(c *wkhttp.Context) {
 
 	if err != nil {
 		m.Error("发送cmd失败！", zap.Error(err))
-		c.ResponseError(err)
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotifyFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -467,27 +473,27 @@ func (m *Message) syncPinnedMessage(c *wkhttp.Context) {
 	}
 	if err := c.BindJSON(&req); err != nil {
 		m.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误！"))
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	if req.ChannelID == "" {
-		c.ResponseError(errors.New("频道ID不能为空"))
+		respondMessageRequestInvalid(c, "channel_id")
 		return
 	}
 	fakeChannelID := req.ChannelID
 	if req.ChannelType == common.ChannelTypePerson.Uint8() {
 		if loginUID == req.ChannelID {
-			c.ResponseError(errors.New("频道ID不合法"))
+			respondMessageRequestInvalid(c, "channel_id")
 			return
 		}
 		isFriend, err := m.userService.IsFriend(loginUID, req.ChannelID)
 		if err != nil {
 			m.Error("查询好友关系错误", zap.Error(err))
-			c.ResponseError(errors.New("查询好友关系错误"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 		if !isFriend {
-			c.ResponseError(errors.New("无权操作此会话"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageConversationForbidden, nil, nil)
 			return
 		}
 		fakeChannelID = common.GetFakeChannelIDWith(loginUID, req.ChannelID)
@@ -495,18 +501,18 @@ func (m *Message) syncPinnedMessage(c *wkhttp.Context) {
 		isMember, err := m.groupService.ExistMember(req.ChannelID, loginUID)
 		if err != nil {
 			m.Error("查询群成员失败", zap.Error(err))
-			c.ResponseError(errors.New("查询权限失败"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 		if !isMember {
-			c.ResponseError(errors.New("非群成员，无权访问置顶消息"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageNotGroupMember, nil, nil)
 			return
 		}
 	}
 	pinnedMsgs, err := m.pinnedDB.queryWithChannelIDAndVersion(fakeChannelID, req.ChannelType, req.Version)
 	if err != nil {
 		m.Error("查询置顶消息错误", zap.Error(err))
-		c.ResponseError(errors.New("查询置顶消息错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	messageSeqs := make([]uint32, 0)
@@ -529,7 +535,7 @@ func (m *Message) syncPinnedMessage(c *wkhttp.Context) {
 	resp, err := m.ctx.IMGetWithChannelAndSeqs(req.ChannelID, req.ChannelType, loginUID, messageSeqs)
 	if err != nil {
 		m.Error("查询频道内的消息失败！", zap.Error(err), zap.String("req", util.ToJson(req)))
-		c.ResponseError(errors.New("查询频道内的消息失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 
@@ -544,7 +550,7 @@ func (m *Message) syncPinnedMessage(c *wkhttp.Context) {
 	messageExtras, err := m.messageExtraDB.queryWithMessageIDsAndUID(messageIds, loginUID)
 	if err != nil {
 		m.Error("查询消息扩展字段失败！", zap.Error(err))
-		c.ResponseError(errors.New("查询用户消息扩展错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	messageExtraMap := map[string]*messageExtraDetailModel{}
@@ -557,7 +563,7 @@ func (m *Message) syncPinnedMessage(c *wkhttp.Context) {
 	messageUserExtras, err := m.messageUserExtraDB.queryWithMessageIDsAndUID(messageIds, loginUID)
 	if err != nil {
 		m.Error("查询用户消息扩展字段失败！", zap.Error(err))
-		c.ResponseError(errors.New("查询用户消息扩展字段失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	messageUserExtraMap := map[string]*messageUserExtraModel{}
@@ -570,7 +576,7 @@ func (m *Message) syncPinnedMessage(c *wkhttp.Context) {
 	messageReaction, err := m.messageReactionDB.queryWithMessageIDs(messageIds)
 	if err != nil {
 		m.Error("查询消息回应数据错误", zap.Error(err))
-		c.ResponseError(errors.New("查询消息回应数据错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	messageReactionMap := map[string][]*reactionModel{}
@@ -587,7 +593,7 @@ func (m *Message) syncPinnedMessage(c *wkhttp.Context) {
 	channelOffsetM, err := m.channelOffsetDB.queryWithUIDAndChannel(loginUID, fakeChannelID, req.ChannelType)
 	if err != nil {
 		m.Error("查询频道偏移量失败！", zap.Error(err))
-		c.ResponseError(errors.New("查询频道偏移量失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	// 频道偏移
@@ -596,7 +602,7 @@ func (m *Message) syncPinnedMessage(c *wkhttp.Context) {
 	channelSettings, err := m.channelService.GetChannelSettings(channelIds)
 	if err != nil {
 		m.Error("查询频道设置错误", zap.Error(err), zap.String("req", util.ToJson(req)))
-		c.ResponseError(errors.New("查询频道设置错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	var channelOffsetMessageSeq uint32 = 0
