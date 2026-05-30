@@ -303,6 +303,7 @@ func TestGroupInviteAuthorize_OK(t *testing.T) {
 // invite=1 的群（需审批）不应通过 authorize 生成 auth_code。
 func TestGroupInviteAuthorize_InviteRequired(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
+	wireI18nRendererForGroupTest(s)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -343,6 +344,7 @@ func TestGroupInviteAuthorize_InviteRequired(t *testing.T) {
 // code 已过期 / 不存在：返回错误。
 func TestGroupInviteAuthorize_Expired(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
+	wireI18nRendererForGroupTest(s)
 	_ = New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -671,6 +673,7 @@ func TestGroupInviteAuthorize_Invite1_AlreadyMember(t *testing.T) {
 // 当 already_member 判定 miss 时，invite 判定仍然生效，顺序重排不影响非成员路径）。
 func TestGroupInviteAuthorize_Invite1_NonMember(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
+	wireI18nRendererForGroupTest(s)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)

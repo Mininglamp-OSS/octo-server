@@ -21,8 +21,8 @@ import (
 // 期望：返回 403 且拒绝写入（两人角色都保持 common）。
 func TestManagerAdd_RejectsExternalMember(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
+	wireI18nRendererForGroupTest(s)
 	f := New(ctx)
-
 
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
@@ -83,10 +83,10 @@ func TestManagerAdd_RejectsExternalMember(t *testing.T) {
 	req.Header.Set("token", testutil.Token)
 	s.GetRoute().ServeHTTP(w, req)
 
-	// 期望 403 + 中文错误提示
-	assert.Equal(t, http.StatusForbidden, w.Code, "外部成员应被 403 拦截，body=%s", w.Body.String())
-	assert.True(t, strings.Contains(w.Body.String(), "不能提拔外部成员为管理员"),
-		"响应缺少拒绝提示，body=%s", w.Body.String())
+	// D14: wire status 固定 400；403 语义落在 error.http_status / error.code。
+	assert.Equal(t, http.StatusBadRequest, w.Code, "外部成员应被拦截（400 信封），body=%s", w.Body.String())
+	assert.True(t, strings.Contains(w.Body.String(), "err.server.group.external_cannot_be_admin"),
+		"响应缺少拒绝错误码，body=%s", w.Body.String())
 
 	// 双重保险：确认两个目标用户 role 都没被改动（事务未执行）
 	internalAfter, err := f.db.QueryMemberWithUID("internal-target", groupNo)
@@ -108,8 +108,8 @@ func TestManagerAdd_RejectsExternalMember(t *testing.T) {
 // (YUJ-231 / GH#1289)。
 func TestTransferGrouper_RejectsExternalMember(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
+	wireI18nRendererForGroupTest(s)
 	f := New(ctx)
-
 
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
@@ -154,10 +154,11 @@ func TestTransferGrouper_RejectsExternalMember(t *testing.T) {
 	req.Header.Set("token", testutil.Token)
 	s.GetRoute().ServeHTTP(w, req)
 
-	assert.Equal(t, http.StatusForbidden, w.Code,
-		"转让给外部成员应被 403 拦截，body=%s", w.Body.String())
-	assert.True(t, strings.Contains(w.Body.String(), "不能将群主转让给外部成员"),
-		"响应缺少拒绝提示，body=%s", w.Body.String())
+	// D14: wire status 固定 400；403 语义落在 error.http_status / error.code。
+	assert.Equal(t, http.StatusBadRequest, w.Code,
+		"转让给外部成员应被拦截（400 信封），body=%s", w.Body.String())
+	assert.True(t, strings.Contains(w.Body.String(), "err.server.group.external_cannot_be_owner"),
+		"响应缺少拒绝错误码，body=%s", w.Body.String())
 
 	// creator 未易主，外部成员仍是 common
 	creatorAfter, err := f.db.QueryMemberWithUID(testutil.UID, groupNo)

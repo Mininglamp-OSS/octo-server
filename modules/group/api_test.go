@@ -1241,6 +1241,7 @@ func TestGroupMemberGet_Self(t *testing.T) {
 // TestGroupMemberGet_CallerNotMember 调用方非该群成员 → 403/error
 func TestGroupMemberGet_CallerNotMember(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
+	wireI18nRendererForGroupTest(s)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)

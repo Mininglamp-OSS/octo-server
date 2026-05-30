@@ -81,6 +81,7 @@ func setupBotOwnershipGroup(t *testing.T) (*Group, http.Handler) {
 		Vercode: fmt.Sprintf("%s@1", util.GenerUUID()),
 	})
 	assert.NoError(t, err)
+	wireI18nRendererForGroupTest(s)
 	return f, s.GetRoute()
 }
 
@@ -124,9 +125,11 @@ func TestGroupMemberAdd_BotOwnedByOther(t *testing.T) {
 	insertBotUser(t, f, "yutestspacebot1_bot", "YuTestSpaceBot1", "yts1_bot_sn", "user_a")
 
 	w := postAddMembers(t, h, "g_bot_own", []string{"yutestspacebot1_bot"})
-	assert.Equal(t, http.StatusForbidden, w.Code, "user-c 邀请别人的 bot 应返回 403, got body=%s", w.Body.String())
-	assert.True(t, strings.Contains(w.Body.String(), "no permission to invite this bot"),
-		"响应体应包含明确的权限错误信息, got=%s", w.Body.String())
+	// D14: wire status is fixed at 400 during the compat window; the 403
+	// semantics now live in error.http_status / error.code.
+	assert.Equal(t, http.StatusBadRequest, w.Code, "user-c 邀请别人的 bot 应返回 400 信封, got body=%s", w.Body.String())
+	assert.True(t, strings.Contains(w.Body.String(), "err.server.group.bot_ownership_denied"),
+		"响应体应包含 bot 归属错误码, got=%s", w.Body.String())
 
 	exist, err := f.db.ExistMember("yutestspacebot1_bot", "g_bot_own")
 	assert.NoError(t, err)
@@ -144,7 +147,8 @@ func TestGroupMemberAdd_BotThirdPartyNoCreator(t *testing.T) {
 	insertBotUser(t, f, "ppt_bot", "PPT Bot", "ppt_bot_sn", "")
 
 	w := postAddMembers(t, h, "g_bot_own", []string{"ppt_bot"})
-	assert.Equal(t, http.StatusForbidden, w.Code, "第三方 bot 应返回 403, got body=%s", w.Body.String())
+	assert.Equal(t, http.StatusBadRequest, w.Code, "第三方 bot 应返回 400 信封, got body=%s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "err.server.group.bot_ownership_denied", "got=%s", w.Body.String())
 
 	exist, err := f.db.ExistMember("ppt_bot", "g_bot_own")
 	assert.NoError(t, err)
@@ -164,7 +168,8 @@ func TestGroupMemberAdd_BotOwnershipBlocksMixedBatch(t *testing.T) {
 	insertBotUser(t, f, "spacebottest1_bot", "SpaceBotTest1", "sbt1_bot_sn", "user_b")
 
 	w := postAddMembers(t, h, "g_bot_own", []string{"human_friend", "spacebottest1_bot"})
-	assert.Equal(t, http.StatusForbidden, w.Code, "mixed batch with foreign bot 应返回 403, got body=%s", w.Body.String())
+	assert.Equal(t, http.StatusBadRequest, w.Code, "mixed batch with foreign bot 应返回 400 信封, got body=%s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "err.server.group.bot_ownership_denied", "got=%s", w.Body.String())
 
 	// 混合批次被拒时，所有成员都不应被写入（避免半提交）
 	exist, err := f.db.ExistMember("spacebottest1_bot", "g_bot_own")
