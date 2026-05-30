@@ -16,9 +16,9 @@
 //  5. Append standalone thread ext entries not already in the IM result.
 //  6. Sort:
 //     follow  – category_sort ASC → pinned DESC → follow_sort ASC →
-//               intra-category sort ASC → target_id ASC (Issue #41 — sidebar
-//               drag wins over category-management UI; pin overrides everything
-//               within a category; see sortFollowItems for the full rationale).
+//     intra-category sort ASC → target_id ASC (Issue #41 — sidebar
+//     drag wins over category-management UI; pin overrides everything
+//     within a category; see sortFollowItems for the full rationale).
 //     recent  – pinned DESC, timestamp DESC.
 //  7. Return SidebarSyncResp{Items, Version}.
 //
@@ -47,6 +47,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"go.uber.org/zap"
@@ -107,7 +109,7 @@ type SidebarItem struct {
 	//     conversation 级别保持空避免误锁定。
 	// 客户端 WebSocket 收到群消息时拿这个字段决定渲染到哪个 Space tab，
 	// 与服务端 FilterRawConversationsBySpace 的可见性判定同口径。
-	SpaceID     string `json:"space_id,omitempty"`
+	SpaceID string `json:"space_id,omitempty"`
 	// MySourceSpaceID 是当前用户加入该群的"来源 Space"（外部成员场景）。
 	//   - GROUP: externalGroupMap[channelID]，即 group_external_member.source_space_id；
 	//   - COMMUNITY_TOPIC: externalGroupMap[parentGroupNo]（与父群保持同口径）；
@@ -115,12 +117,12 @@ type SidebarItem struct {
 	// 与 v1 SyncUserConversationResp.MySourceSpaceID 字段口径一致
 	// （GH octo-server#153 Round-2 P1）。客户端在 source Space 下用 sidebar 时
 	// 需要这个字段才能识别"我以哪个 Space 身份加入了这个外部群"。
-	MySourceSpaceID string `json:"my_source_space_id,omitempty"`
-	Timestamp   int64  `json:"timestamp"`
-	Unread      int    `json:"unread"`
-	IsPinned    bool   `json:"is_pinned"`
-	IsFollowed  bool   `json:"is_followed"`
-	CategoryID  *string `json:"category_id,omitempty"`
+	MySourceSpaceID string  `json:"my_source_space_id,omitempty"`
+	Timestamp       int64   `json:"timestamp"`
+	Unread          int     `json:"unread"`
+	IsPinned        bool    `json:"is_pinned"`
+	IsFollowed      bool    `json:"is_followed"`
+	CategoryID      *string `json:"category_id,omitempty"`
 	// CategorySort 暴露给客户端的"类别之间排序权重"，来源是 group_category.sort
 	// （PR #21 review by lml2468 blocker #3）。改类别顺序会 bump follow_version
 	// 并改变这里返回的值，与 /category/sort 接口及 swagger 一致。
@@ -213,11 +215,11 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 	var req sidebarSyncReq
 	if err := c.BindJSON(&req); err != nil {
 		sb.Error("sidebar sync: bad JSON", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误"))
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	if err := validateSidebarRequest(&req); err != nil {
-		c.ResponseError(err)
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 
@@ -249,7 +251,7 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 	rawConversations, err := sb.ctx.IMSyncUserConversation(loginUID, req.Version, req.MsgCount, req.LastMsgSeqs, nil)
 	if err != nil {
 		sb.Error("sidebar sync: IM fetch failed", zap.Error(err))
-		c.ResponseError(errors.New("同步会话失败"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 
@@ -288,7 +290,7 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 		}
 		if isFollowTab {
 			sb.Error("sidebar sync: "+stage+" failed (follow tab fail-closed)", zap.Error(err))
-			c.ResponseError(errors.New("同步会话失败"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return true
 		}
 		sb.Warn("sidebar sync: "+stage+" failed (recent tab non-fatal)", zap.Error(err))
@@ -869,12 +871,12 @@ func buildFollowItems(
 			// CategorySort + intraCategorySort，让 thread 和父群在同一分类块内排序，
 			// 而不是默认全部落到 CategorySort=0 桶（与 DM 混在 follow tab 顶部）。
 			items = append(items, &SidebarItem{
-				TargetType:        int(common.ChannelTypeCommunityTopic),
-				TargetID:          conv.ChannelID,
-				ChannelType:       conv.ChannelType,
-				ChannelID:         conv.ChannelID,
+				TargetType:  int(common.ChannelTypeCommunityTopic),
+				TargetID:    conv.ChannelID,
+				ChannelType: conv.ChannelType,
+				ChannelID:   conv.ChannelID,
 				// thread 继承父群 SpaceID（GH octo-server#153）。
-				SpaceID:           groupSpaceMap[groupNo],
+				SpaceID: groupSpaceMap[groupNo],
 				// thread 同样继承父群的 MySourceSpaceID（GH octo-server#153 Round-2 P1）。
 				// Round-3 (GH#154 Round-2 Finding 2)：父群 source_space_id="" 兜底到 defaultSpaceID。
 				MySourceSpaceID:   sidebarMySourceSpaceID(externalGroupMap, groupNo, defaultSpaceID),
@@ -1032,12 +1034,12 @@ func mergeThreadEntries(
 		}
 		// 与 buildFollowItems thread 分支一致：继承父群 CategorySort + intraCategorySort。
 		result = append(result, &SidebarItem{
-			TargetType:        int(common.ChannelTypeCommunityTopic),
-			TargetID:          ext.TargetID,
-			ChannelType:       common.ChannelTypeCommunityTopic.Uint8(),
-			ChannelID:         ext.TargetID,
+			TargetType:  int(common.ChannelTypeCommunityTopic),
+			TargetID:    ext.TargetID,
+			ChannelType: common.ChannelTypeCommunityTopic.Uint8(),
+			ChannelID:   ext.TargetID,
 			// thread 继承父群 SpaceID（GH octo-server#153）。
-			SpaceID:           groupSpaceMap[groupNo],
+			SpaceID: groupSpaceMap[groupNo],
 			// thread 同样继承父群的 MySourceSpaceID（GH octo-server#153 Round-2 P1）。
 			// Round-3 (GH#154 Round-2 Finding 2)：父群 source_space_id="" 兜底到 defaultSpaceID。
 			MySourceSpaceID:   sidebarMySourceSpaceID(externalGroupMap, groupNo, defaultSpaceID),

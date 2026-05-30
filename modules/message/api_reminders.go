@@ -2,7 +2,6 @@ package message
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -14,6 +13,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"go.uber.org/zap"
 )
 
@@ -21,18 +22,18 @@ import (
 func (m *Message) reminderDone(c *wkhttp.Context) {
 	var ids []int64
 	if err := c.BindJSON(&ids); err != nil {
-		c.ResponseError(errors.New("数据格式有误！"))
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	if len(ids) == 0 {
-		c.ResponseError(errors.New("数据不能为空！"))
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	loginUID := c.GetLoginUID()
 	tx, err := m.ctx.DB().Begin()
 	if err != nil {
 		m.Error("开启事务失败！", zap.Error(err))
-		c.ResponseError(errors.New("开启事务失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	defer func() {
@@ -45,27 +46,28 @@ func (m *Message) reminderDone(c *wkhttp.Context) {
 	if err != nil {
 		tx.Rollback()
 		m.Error("添加done失败！", zap.Error(err))
-		c.ResponseError(errors.New("添加done失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	for _, id := range ids {
 		version, err := m.nextReminderSeq()
 		if err != nil {
-			c.ResponseError(err)
+			m.Error("生成提醒项序列号失败", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
 		err = m.remindersDB.updateVersionTx(version, id, tx)
 		if err != nil {
 			tx.Rollback()
 			m.Error("更新提醒项版本失败！", zap.Error(err))
-			c.ResponseError(errors.New("更新提醒项版本失败！"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		tx.RollbackUnlessCommitted()
 		m.Error("提交事务失败！", zap.Error(err))
-		c.ResponseError(errors.New("提交事务失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	err = m.ctx.SendCMD(config.MsgCMDReq{
@@ -76,7 +78,7 @@ func (m *Message) reminderDone(c *wkhttp.Context) {
 	})
 	if err != nil {
 		m.Error("发送同步提醒项cmd失败！", zap.Error(err))
-		c.ResponseError(errors.New("发送同步提醒项cmd失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotifyFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -91,14 +93,14 @@ func (m *Message) reminderSync(c *wkhttp.Context) {
 	}
 	if err := c.BindJSON(&req); err != nil {
 		m.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误！"))
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	loginUID := c.GetLoginUID()
 	reminders, err := m.remindersDB.sync(loginUID, req.Version, req.Limit, req.ChannelIDs)
 	if err != nil {
 		m.Error("同步提醒项失败！", zap.Error(err))
-		c.ResponseError(errors.New("同步提醒项失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 
@@ -128,7 +130,7 @@ func (m *Message) reminderSync(c *wkhttp.Context) {
 		members, err = m.groupService.GetMembersWithUIDAndGroupIds(loginUID, groupIds)
 		if err != nil {
 			m.Error("查询登录用户加入群成员信息错误", zap.Error(err))
-			c.ResponseError(errors.New("查询登录用户加入群成员信息错误"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 	}

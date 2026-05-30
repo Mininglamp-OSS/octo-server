@@ -12,6 +12,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/gin-gonic/gin"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
@@ -88,12 +90,12 @@ func (m *Message) getGroupMessage(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 
 	if !thread.IsValidGroupNo(groupNo) {
-		c.ResponseError(errors.New("invalid group_no format"))
+		respondMessageRequestInvalid(c, "group_no")
 		return
 	}
 	messageID, ok := parsePositiveMessageID(messageIDStr)
 	if !ok {
-		c.ResponseError(errors.New("invalid message_id"))
+		respondMessageRequestInvalid(c, "message_id")
 		return
 	}
 	if !m.requireGroupMember(c, groupNo, loginUID) {
@@ -110,16 +112,16 @@ func (m *Message) getThreadMessage(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 
 	if !thread.IsValidGroupNo(groupNo) {
-		c.ResponseError(errors.New("invalid group_no format"))
+		respondMessageRequestInvalid(c, "group_no")
 		return
 	}
 	if !thread.IsValidShortID(shortID) {
-		c.ResponseError(errors.New("invalid short_id format"))
+		respondMessageRequestInvalid(c, "short_id")
 		return
 	}
 	messageID, ok := parsePositiveMessageID(messageIDStr)
 	if !ok {
-		c.ResponseError(errors.New("invalid message_id"))
+		respondMessageRequestInvalid(c, "message_id")
 		return
 	}
 	if !m.requireGroupMember(c, groupNo, loginUID) {
@@ -128,7 +130,8 @@ func (m *Message) getThreadMessage(c *wkhttp.Context) {
 	t, err := m.threadDB.QueryByGroupNoAndShortID(groupNo, shortID)
 	if err != nil {
 		m.Error("查询子区失败", zap.Error(err))
-		c.ResponseError(errors.Wrap(err, "查询子区失败"))
+		m.Error("查询子区失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	// 与 IM datasource (modules/thread/1module.go:87)、ExistByGroupNoAndShortID
@@ -173,7 +176,8 @@ func (m *Message) requireGroupMember(c *wkhttp.Context, groupNo, loginUID string
 	g, err := m.groupDB.QueryWithGroupNo(groupNo)
 	if err != nil {
 		m.Error("查询群信息失败", zap.Error(err))
-		c.ResponseError(errors.Wrap(err, "查询群信息失败"))
+		m.Error("查询群信息失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return false
 	}
 	// 白名单语义：只有 GroupStatusNormal 允许通过；Disband / Disabled / 未来新增的
@@ -185,7 +189,8 @@ func (m *Message) requireGroupMember(c *wkhttp.Context, groupNo, loginUID string
 	isActive, err := m.groupDB.ExistMemberActive(loginUID, groupNo)
 	if err != nil {
 		m.Error("检查群成员失败", zap.Error(err))
-		c.ResponseError(errors.Wrap(err, "检查群成员失败"))
+		m.Error("检查群成员失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return false
 	}
 	if !isActive {
@@ -211,7 +216,8 @@ func (m *Message) respondSingleMessage(c *wkhttp.Context, channelID string, chan
 	msgModel, err := m.db.queryMessageByID(channelID, channelType, messageIDStr)
 	if err != nil {
 		m.Error("查询消息失败", zap.Error(err), zap.String("channel_id", channelID), zap.Int64("message_id", messageID))
-		c.ResponseError(errors.Wrap(err, "查询消息失败"))
+		m.Error("查询消息失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	if msgModel == nil {
@@ -231,7 +237,8 @@ func (m *Message) respondSingleMessage(c *wkhttp.Context, channelID string, chan
 
 	extra, userExtra, reactions, err := m.fetchMessageExtras(messageID, loginUID)
 	if err != nil {
-		c.ResponseError(err)
+		m.Error("查询消息扩展失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	if extra != nil && (extra.Revoke == 1 || extra.IsDeleted == 1) {
@@ -250,7 +257,8 @@ func (m *Message) respondSingleMessage(c *wkhttp.Context, channelID string, chan
 	// channel_setting.offset_message_seq 是两张不同的表 / 两套语义，必须都查。
 	if userOffset, err := m.channelOffsetDB.queryWithUIDAndChannel(loginUID, channelID, channelType); err != nil {
 		m.Error("查询用户清理偏移失败", zap.Error(err))
-		c.ResponseError(errors.Wrap(err, "查询用户清理偏移失败"))
+		m.Error("查询用户清理偏移失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	} else if userOffset != nil && msgModel.MessageSeq <= userOffset.MessageSeq {
 		c.JSON(http.StatusNotFound, gin.H{"msg": "message not found"})
@@ -260,7 +268,8 @@ func (m *Message) respondSingleMessage(c *wkhttp.Context, channelID string, chan
 	channelOffsetSeq, err := m.lookupChannelOffsetSeq(channelID, channelType, loginUID)
 	if err != nil {
 		m.Error("查询频道设置失败", zap.Error(err))
-		c.ResponseError(errors.Wrap(err, "查询频道设置失败"))
+		m.Error("查询频道设置失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 

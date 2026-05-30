@@ -7,10 +7,12 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/modules/thread"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"go.uber.org/zap"
 )
 
@@ -137,11 +139,11 @@ func (m *Message) channelFiles(c *wkhttp.Context) {
 	var req channelFilesReq
 	if err := c.BindJSON(&req); err != nil {
 		m.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误！"))
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	if err := req.check(); err != nil {
-		c.ResponseError(err)
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	if req.Page <= 0 {
@@ -166,7 +168,7 @@ func (m *Message) channelFiles(c *wkhttp.Context) {
 		if req.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
 			parentGroupNo, _, perr := thread.ParseChannelID(req.ChannelID)
 			if perr != nil {
-				c.ResponseError(errors.New("无效的话题频道ID"))
+				respondMessageRequestInvalid(c, "channel_id")
 				return
 			}
 			groupNo = parentGroupNo
@@ -174,11 +176,11 @@ func (m *Message) channelFiles(c *wkhttp.Context) {
 		isMember, err := m.groupService.ExistMember(groupNo, loginUID)
 		if err != nil {
 			m.Error("查询群成员关系错误", zap.Error(err))
-			c.ResponseError(errors.New("查询群成员关系错误"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 		if !isMember {
-			c.ResponseError(errors.New("非群成员无法查看文件"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageNotGroupMember, nil, nil)
 			return
 		}
 	} else if req.ChannelType == common.ChannelTypePerson.Uint8() {
@@ -186,16 +188,16 @@ func (m *Message) channelFiles(c *wkhttp.Context) {
 			isFriend, err := m.userService.IsFriend(loginUID, req.ChannelID)
 			if err != nil {
 				m.Error("查询好友关系错误", zap.Error(err))
-				c.ResponseError(errors.New("查询好友关系错误"))
+				httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 				return
 			}
 			if !isFriend {
-				c.ResponseError(errors.New("非好友无法查看文件"))
+				httperr.ResponseErrorL(c, errcode.ErrMessageNotFriend, nil, nil)
 				return
 			}
 		}
 	} else {
-		c.ResponseError(errors.New("不支持的频道类型"))
+		respondMessageRequestInvalid(c, "channel_type")
 		return
 	}
 
@@ -210,7 +212,7 @@ func (m *Message) channelFiles(c *wkhttp.Context) {
 	channelOffsets, err := m.channelOffsetDB.queryWithUIDAndChannelIDs(loginUID, []string{req.ChannelID})
 	if err != nil {
 		m.Error("查询清空消息标记错误", zap.Error(err))
-		c.ResponseError(errors.New("查询消息状态失败"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	var offsetSeq uint32
@@ -251,7 +253,7 @@ func (m *Message) channelFiles(c *wkhttp.Context) {
 		})
 		if err != nil {
 			m.Error("查询文件消息失败", zap.Error(err))
-			c.ResponseError(errors.New("查询文件消息失败"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 		if msgResp == nil || len(msgResp.Messages) == 0 {
@@ -262,7 +264,7 @@ func (m *Message) channelFiles(c *wkhttp.Context) {
 		filtered, err := m.filterMessages(msgResp.Messages, loginUID, offsetSeq)
 		if err != nil {
 			m.Error("过滤消息状态失败", zap.Error(err))
-			c.ResponseError(errors.New("查询消息状态失败"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 
