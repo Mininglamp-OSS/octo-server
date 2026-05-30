@@ -123,6 +123,75 @@ other = "The target user does not exist or has been deactivated."
 ["err.server.group.view_forbidden"]
 other = "You do not have permission to view this."
 
+["err.server.message.banword_not_found"]
+other = "The banned word does not exist."
+
+["err.server.message.cannot_delete_self_conversation"]
+other = "You cannot delete the conversation with yourself."
+
+["err.server.message.channel_access_denied"]
+other = "You do not have permission to operate on this channel."
+
+["err.server.message.conversation_forbidden"]
+other = "You do not have permission to operate on this conversation."
+
+["err.server.message.delete_forbidden"]
+other = "You do not have permission to delete this message."
+
+["err.server.message.edit_own_only"]
+other = "You can only edit your own messages."
+
+["err.server.message.group_not_found"]
+other = "The target group does not exist or has been deleted."
+
+["err.server.message.id_seq_mismatch"]
+other = "Message ID does not match the message sequence."
+
+["err.server.message.not_found"]
+other = "Message not found or already deleted."
+
+["err.server.message.not_friend"]
+other = "You are not friends with this user."
+
+["err.server.message.not_group_member"]
+other = "You are not a member of this group."
+
+["err.server.message.notify_failed"]
+other = "Failed to dispatch the message command."
+
+["err.server.message.peer_not_in_space"]
+other = "The other party is not in this space."
+
+["err.server.message.pinned_forbidden"]
+other = "You do not have permission to pin or unpin messages."
+
+["err.server.message.pinned_limit_exceeded"]
+other = "The pinned-message limit has been reached."
+
+["err.server.message.proxy_send_unsupported"]
+other = "Sending messages on behalf of another user is not supported."
+
+["err.server.message.query_failed"]
+other = "Failed to query message data."
+
+["err.server.message.recall_forbidden"]
+other = "You do not have permission to recall this message."
+
+["err.server.message.recall_time_exceeded"]
+other = "The message is past the recall time window."
+
+["err.server.message.receiver_not_found"]
+other = "The message recipient does not exist."
+
+["err.server.message.request_invalid"]
+other = "Invalid request."
+
+["err.server.message.search_failed"]
+other = "Message search failed."
+
+["err.server.message.store_failed"]
+other = "Failed to persist message data."
+
 ["err.server.thread.creator_cannot_leave"]
 other = "Thread creator cannot leave the thread."
 

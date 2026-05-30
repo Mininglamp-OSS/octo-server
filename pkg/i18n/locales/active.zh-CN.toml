@@ -475,3 +475,72 @@ other = "保存群数据失败。"
 
 ["err.server.group.notify_failed"]
 other = "发送群通知失败。"
+
+["err.server.message.request_invalid"]
+other = "请求参数有误。"
+
+["err.server.message.id_seq_mismatch"]
+other = "消息 ID 与消息序号不匹配。"
+
+["err.server.message.not_friend"]
+other = "你与对方不是好友。"
+
+["err.server.message.peer_not_in_space"]
+other = "对方不在该空间内。"
+
+["err.server.message.conversation_forbidden"]
+other = "你没有权限操作此会话。"
+
+["err.server.message.cannot_delete_self_conversation"]
+other = "不能删除与自己的会话。"
+
+["err.server.message.channel_access_denied"]
+other = "你没有权限操作此频道。"
+
+["err.server.message.not_group_member"]
+other = "你不是该群成员。"
+
+["err.server.message.delete_forbidden"]
+other = "你没有权限删除此消息。"
+
+["err.server.message.recall_forbidden"]
+other = "你没有权限撤回此消息。"
+
+["err.server.message.pinned_forbidden"]
+other = "你没有权限置顶或取消置顶消息。"
+
+["err.server.message.edit_own_only"]
+other = "只能编辑自己发送的消息。"
+
+["err.server.message.proxy_send_unsupported"]
+other = "不支持代发消息。"
+
+["err.server.message.not_found"]
+other = "消息不存在或已删除。"
+
+["err.server.message.group_not_found"]
+other = "目标群不存在或已删除。"
+
+["err.server.message.receiver_not_found"]
+other = "消息接收者不存在。"
+
+["err.server.message.banword_not_found"]
+other = "操作的违禁词不存在。"
+
+["err.server.message.pinned_limit_exceeded"]
+other = "置顶消息数量已达上限。"
+
+["err.server.message.recall_time_exceeded"]
+other = "消息已超过可撤回时限。"
+
+["err.server.message.query_failed"]
+other = "查询消息数据失败。"
+
+["err.server.message.store_failed"]
+other = "保存消息数据失败。"
+
+["err.server.message.notify_failed"]
+other = "发送消息指令失败。"
+
+["err.server.message.search_failed"]
+other = "消息搜索失败。"
