@@ -758,7 +758,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 		// 与同 handler 下 GetGroupsWithMemberUID 失败的处理对称（一次 DB 抖动 →
 		// 500 → 客户端重试），保证 200 响应里的 space_memberships 行级完整。
 		co.Error("查询外部群失败！", zap.Error(externalErr))
-		c.ResponseErrorWithStatus(errors.New("查询外部群失败！"), http.StatusInternalServerError)
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	// defaultSpaceID 是外部群 source_space_id="" 的空值兜底（legacy 外部成员行）。
@@ -772,7 +772,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	defaultSpaceID, defaultSpaceErr := space.GetUserDefaultSpaceIDE(co.ctx, loginUID)
 	if defaultSpaceErr != nil {
 		co.Error("查询用户默认 Space 失败！", zap.Error(defaultSpaceErr))
-		c.ResponseErrorWithStatus(errors.New("查询用户默认 Space 失败！"), http.StatusInternalServerError)
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	fillConversationSpaceIDs(syncUserConversationResps, rawGroupSpaceMap, externalGroupMap, defaultSpaceID)
@@ -782,7 +782,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	joinedGroups, err := co.groupService.GetGroupsWithMemberUID(loginUID)
 	if err != nil {
 		co.Error("查询加入的群聊错误", zap.Error(err))
-		c.ResponseErrorWithStatus(errors.New("查询加入的群聊错误"), http.StatusInternalServerError)
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	callChannelIDs := make([]string, 0)
