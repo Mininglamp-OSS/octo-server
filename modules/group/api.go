@@ -1075,6 +1075,13 @@ func (g *Group) memberAdd(c *wkhttp.Context) {
 		OperatorName: operatorName,
 	})
 	if err != nil {
+		// AddGroupMembers 会返回业务拒绝（如 allow_external=0 群里普通成员邀请
+		// 外部用户）；这类是用户态 403，不能吞成内部错误。沿用 invite.go 的
+		// 字符串判定（服务层 sentinel 抽取是 thread/user 同款 follow-up）。
+		if strings.Contains(err.Error(), "禁止外部成员") {
+			httperr.ResponseErrorL(c, errcode.ErrGroupExternalJoinForbidden, nil, nil)
+			return
+		}
 		g.Error("添加群成员失败", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
@@ -2725,12 +2732,8 @@ func (g *Group) groupExit(c *wkhttp.Context) {
 	groupNo := c.Param("group_no")
 	groupInfo, err := g.getGroupInfo(groupNo)
 	if err != nil {
-		g.Error("查询群资料错误", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
-		return
-	}
-	if groupInfo == nil {
-		httperr.ResponseErrorL(c, errcode.ErrGroupNotFound, nil, nil)
+		// 不存在 / 已解散群 → 404；查询失败 → 500。getGroupInfo 已记录 DB 错误。
+		respondGroupInfoError(c, err)
 		return
 	}
 	// 调用IM的移除订阅者

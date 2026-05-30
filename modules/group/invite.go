@@ -190,6 +190,12 @@ func (g *Group) groupMemberInviteSure(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 		return
 	}
+	// 空串 = auth_code 不存在 / 已过期（30min TTL），是正常用户态而非解码失败；
+	// 必须在 decode 前拦截，否则会落到下面的 store_failed 内部错误分支。
+	if authInfo == "" {
+		httperr.ResponseErrorL(c, errcode.ErrGroupAuthCodeInvalid, nil, nil)
+		return
+	}
 	var authMap map[string]interface{}
 	err = util.ReadJsonByByte([]byte(authInfo), &authMap)
 	if err != nil {
