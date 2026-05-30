@@ -24,6 +24,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"github.com/gin-gonic/gin"
@@ -152,7 +154,7 @@ func (co *Conversation) conversationExtraSync(c *wkhttp.Context) {
 	}
 	if err := c.BindJSON(&req); err != nil {
 		co.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误！"))
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	loginUID := c.GetLoginUID()
@@ -160,7 +162,7 @@ func (co *Conversation) conversationExtraSync(c *wkhttp.Context) {
 	conversationExtraModels, err := co.conversationExtraDB.sync(loginUID, req.Version)
 	if err != nil {
 		co.Error("同步消息扩展失败！", zap.Error(err))
-		c.ResponseError(errors.New("同步消息扩展失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	resps := make([]*conversationExtraResp, 0, len(conversationExtraModels))
@@ -180,7 +182,7 @@ func (co *Conversation) conversationExtraUpdate(c *wkhttp.Context) {
 	}
 	if err := c.BindJSON(&req); err != nil {
 		co.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误！"))
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	channelID := c.Param("channel_id")
@@ -191,7 +193,8 @@ func (co *Conversation) conversationExtraUpdate(c *wkhttp.Context) {
 
 	version, err := co.ctx.GenSeq(common.SyncConversationExtraKey)
 	if err != nil {
-		c.ResponseError(err)
+		co.Error("生成会话扩展序列号失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 
@@ -207,7 +210,7 @@ func (co *Conversation) conversationExtraUpdate(c *wkhttp.Context) {
 	})
 	if err != nil {
 		co.Error("添加或更新最近会话扩展失败！", zap.Error(err))
-		c.ResponseError(errors.New("添加或更新最近会话扩展失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	err = co.ctx.SendCMD(config.MsgCMDReq{
@@ -218,7 +221,7 @@ func (co *Conversation) conversationExtraUpdate(c *wkhttp.Context) {
 	})
 	if err != nil {
 		co.Error("发送同步扩展会话cmd失败！", zap.Error(err))
-		c.ResponseError(errors.New("发送同步扩展会话cmd失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotifyFailed, nil, nil)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -232,11 +235,11 @@ func (co *Conversation) deleteConversation(c *wkhttp.Context) {
 	channelID := c.Param("channel_id")
 	channelType, err := strconv.ParseInt(c.Param("channel_type"), 10, 64)
 	if err != nil {
-		c.ResponseError(errors.New("频道类型格式错误"))
+		respondMessageRequestInvalid(c, "channel_type")
 		return
 	}
 	if strings.TrimSpace(channelID) == "" {
-		c.ResponseError(errors.New("频道ID不能为空"))
+		respondMessageRequestInvalid(c, "channel_id")
 		return
 	}
 
@@ -246,27 +249,27 @@ func (co *Conversation) deleteConversation(c *wkhttp.Context) {
 		isMember, err := co.groupService.ExistMember(channelID, loginUID)
 		if err != nil {
 			co.Error("查询群成员失败", zap.Error(err))
-			c.ResponseError(errors.New("操作失败"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
 		if !isMember {
-			c.ResponseError(errors.New("无权删除此会话"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageConversationForbidden, nil, nil)
 			return
 		}
 	} else if uint8(channelType) == common.ChannelTypePerson.Uint8() {
 		// For person channels, verify channelID is a valid user
 		if channelID == loginUID {
-			c.ResponseError(errors.New("无法删除与自己的会话"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageCannotDeleteSelfConversation, nil, nil)
 			return
 		}
 		userInfo, err := co.userService.GetUser(channelID)
 		if err != nil {
 			co.Error("查询用户信息失败", zap.Error(err))
-			c.ResponseError(errors.New("操作失败"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
 		if userInfo == nil {
-			c.ResponseError(errors.New("会话不存在或无权删除"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageConversationForbidden, nil, nil)
 			return
 		}
 	}
@@ -274,7 +277,7 @@ func (co *Conversation) deleteConversation(c *wkhttp.Context) {
 	err = co.service.DeleteConversation(loginUID, channelID, uint8(channelType))
 	if err != nil {
 		co.Error("删除最近会话失败！", zap.Error(err))
-		c.ResponseError(errors.New("删除最近会话失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -290,7 +293,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	}
 	if err := c.BindJSON(&req); err != nil {
 		co.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误！"))
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 
@@ -311,21 +314,21 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 		cacheVersion, err := co.getDeviceConversationMaxVersion(loginUID, req.DeviceUUID)
 		if err != nil {
 			co.Error("获取缓存的最近会话版本号失败！", zap.Error(err), zap.String("loginUID", loginUID), zap.String("deviceUUID", req.DeviceUUID))
-			c.ResponseError(errors.New("获取缓存的最近会话版本号失败！"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 		if cacheVersion == 0 {
 			userMaxVersion, err := co.getUserConversationMaxVersion(loginUID)
 			if err != nil {
 				co.Error("获取用户最近会很最大版本失败！", zap.Error(err))
-				c.ResponseError(errors.New("获取用户最近会很最大版本失败！"))
+				httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 				return
 			}
 			if userMaxVersion > 0 {
 				err = co.setDeviceConversationMaxVersion(loginUID, req.DeviceUUID, userMaxVersion)
 				if err != nil {
 					co.Error("设置设备最近会话最大版本号失败！", zap.Error(err))
-					c.ResponseError(errors.New("设置设备最近会话最大版本号失败！"))
+					httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 					return
 				}
 			}
@@ -344,7 +347,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 			deviceOffsetModels, err := co.deviceOffsetDB.queryWithUIDAndDeviceUUID(loginUID, req.DeviceUUID)
 			if err != nil {
 				co.Error("查询用户设备偏移量失败！", zap.Error(err))
-				c.ResponseError(errors.New("查询用户设备偏移量失败！"))
+				httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 				return
 			}
 			if len(deviceOffsetModels) > 0 {
@@ -356,7 +359,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 				userLastOffsetModels, err := co.userLastOffsetDB.queryWithUID(loginUID)
 				if err != nil {
 					co.Error("查询用户偏移量失败！", zap.Error(err))
-					c.ResponseError(errors.New("查询用户偏移量失败！"))
+					httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 					return
 				}
 				if len(userLastOffsetModels) > 0 {
@@ -373,7 +376,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 					}
 					err := co.insertDeviceOffsets(deviceOffsetList)
 					if err != nil {
-						c.ResponseError(errors.New("插入设备偏移数据失败！"))
+						httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 						return
 					}
 				}
@@ -388,7 +391,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	largeGroupInfos, err := co.groupService.GetUserSupers(loginUID)
 	if err != nil {
 		co.Error("获取用户超大群失败！", zap.Error(err))
-		c.ResponseError(errors.New("获取用户超大群失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	largeChannels := make([]*config.Channel, 0)
@@ -403,7 +406,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	conversations, err := co.ctx.IMSyncUserConversation(loginUID, version, req.MsgCount, lastMsgSeqs, largeChannels)
 	if err != nil {
 		co.Error("同步离线后的最近会话失败！", zap.Error(err), zap.String("loginUID", loginUID))
-		c.ResponseError(errors.New("同步离线后的最近会话失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	groupNos := make([]string, 0, len(conversations))
@@ -460,7 +463,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 		groupVailds, err = co.groupService.ExistMembers(groupNos, loginUID)
 		if err != nil {
 			co.Error("查询有效群失败！", zap.Error(err))
-			c.ResponseError(errors.New("查询有效群失败！"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 
@@ -494,7 +497,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	conversationExtras, err := co.conversationExtraDB.queryWithChannelIDs(loginUID, channelIDs)
 	if err != nil {
 		co.Error("查询最近会话扩展失败！", zap.Error(err))
-		c.ResponseError(errors.New("查询最近会话扩展失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	if len(conversationExtras) > 0 {
@@ -509,7 +512,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 		users, err = co.userService.GetUserDetails(uids, c.GetLoginUID())
 		if err != nil {
 			co.Error("查询用户信息失败！", zap.Error(err))
-			c.ResponseError(errors.New("查询用户信息失败！"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 		if len(users) > 0 {
@@ -541,7 +544,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 		groups, err = co.groupService.GetGroupDetails(groupNos, c.GetLoginUID())
 		if err != nil {
 			co.Error("查询群设置信息失败！", zap.Error(err))
-			c.ResponseError(errors.New("查询群设置信息失败！"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 		if groups == nil {
@@ -602,7 +605,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 		channelOffsetModels, err := co.channelOffsetDB.queryWithUIDAndChannelIDs(loginUID, channelIDs)
 		if err != nil {
 			co.Error("查询用户频道偏移量失败！", zap.Error(err))
-			c.ResponseError(errors.New("查询用户频道偏移量失败！"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 		if len(channelOffsetModels) > 0 {
@@ -616,7 +619,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	channelSettings, err := co.channelService.GetChannelSettings(channelIDs)
 	if err != nil {
 		co.Error("查询频道设置失败！", zap.Error(err))
-		c.ResponseError(errors.New("查询频道设置失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	channelSettingMessageOffsetMap := make(map[string]uint32)
@@ -793,7 +796,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	friends, err := co.userService.GetFriends(loginUID)
 	if err != nil {
 		co.Error("查询好友错误", zap.Error(err))
-		c.ResponseError(errors.New("查询好友错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	if len(friends) > 0 {
@@ -870,7 +873,7 @@ func (co *Conversation) syncUserConversationAck(c *wkhttp.Context) {
 	}
 	if err := c.BindJSON(&req); err != nil {
 		co.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误！"))
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	if co.ctx.GetConfig().MessageSaveAcrossDevice {
@@ -913,7 +916,7 @@ func (co *Conversation) syncUserConversationAck(c *wkhttp.Context) {
 	if len(userLastOffsetModels) > 0 {
 		err := co.insertUserLastOffsets(userLastOffsetModels)
 		if err != nil {
-			c.ResponseError(errors.New("插入设备偏移数据失败！"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
 	}
@@ -925,7 +928,7 @@ func (co *Conversation) syncUserConversationAck(c *wkhttp.Context) {
 		err := co.setUserConversationMaxVersion(loginUID, version)
 		if err != nil {
 			co.Error("设置设备最近会话最大版本号失败！", zap.Error(err))
-			c.ResponseError(errors.New("设置设备最近会话最大版本号失败！"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
 	}
@@ -1022,7 +1025,7 @@ func (co *Conversation) getConversations(c *wkhttp.Context) {
 	resps, err := co.ctx.IMGetConversations(loginUID)
 	if err != nil {
 		co.Error("获取最近会话失败！", zap.Error(err))
-		c.ResponseError(errors.New("获取最近会话失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	conversationResps := make([]conversationResp, 0, len(resps))
@@ -1044,7 +1047,7 @@ func (co *Conversation) getConversations(c *wkhttp.Context) {
 		channelSettings, err := co.channelService.GetChannelSettings(channelIds)
 		if err != nil {
 			co.Error("查询频道设置错误！", zap.Error(err))
-			c.ResponseError(errors.New("查询频道设置错误！"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 		channelSettingMessageOffsetMap := make(map[string]uint32)
@@ -1073,13 +1076,13 @@ func (co *Conversation) getConversations(c *wkhttp.Context) {
 		userDetails, err := co.userDB.QueryDetailByUIDs(userUIDs, loginUID)
 		if err != nil {
 			co.Error("查询用户详情失败！")
-			c.ResponseError(errors.New("查询用户详情失败！"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 		groupDetails, err := co.groupDB.QueryDetailWithGroupNos(groupNos, loginUID)
 		if err != nil {
 			co.Error("查询用户详情失败！")
-			c.ResponseError(errors.New("查询用户详情失败！"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 
@@ -1113,7 +1116,7 @@ func (co *Conversation) clearConversationUnread(c *wkhttp.Context) {
 	var req clearConversationUnreadReq
 	if err := c.BindJSON(&req); err != nil {
 		co.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(common.ErrData)
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	// if co.ctx.GetConfig().IsVisitorChannel(req.ChannelID) {
@@ -1126,7 +1129,7 @@ func (co *Conversation) clearConversationUnread(c *wkhttp.Context) {
 		groupInfo, err := co.groupService.GetGroupWithGroupNo(req.ChannelID)
 		if err != nil {
 			co.Error("查询群聊信息失败！", zap.Error(err))
-			c.ResponseError(errors.New("查询群聊信息失败！"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 		if groupInfo != nil && groupInfo.GroupType == group.GroupTypeSuper {
@@ -1142,7 +1145,8 @@ func (co *Conversation) clearConversationUnread(c *wkhttp.Context) {
 		MessageSeq:  messageSeq,
 	})
 	if err != nil {
-		c.ResponseError(err)
+		co.Error("清空会话红点失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotifyFailed, nil, nil)
 		return
 	}
 	// 发送清空红点的命令
@@ -1159,7 +1163,7 @@ func (co *Conversation) clearConversationUnread(c *wkhttp.Context) {
 	})
 	if err != nil {
 		co.Error("命令发送失败！", zap.String("cmd", common.CMDConversationUnreadClear))
-		c.ResponseError(errors.New("命令发送失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotifyFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
