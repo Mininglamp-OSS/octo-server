@@ -1075,13 +1075,13 @@ func (co *Conversation) getConversations(c *wkhttp.Context) {
 		}
 		userDetails, err := co.userDB.QueryDetailByUIDs(userUIDs, loginUID)
 		if err != nil {
-			co.Error("查询用户详情失败！")
+			co.Error("查询用户详情失败！", zap.Error(err))
 			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 		groupDetails, err := co.groupDB.QueryDetailWithGroupNos(groupNos, loginUID)
 		if err != nil {
-			co.Error("查询用户详情失败！")
+			co.Error("查询用户详情失败！", zap.Error(err))
 			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}

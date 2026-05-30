@@ -47,6 +47,14 @@ func TestMessageNoLegacyResponseError(t *testing.T) {
 					t.Fatalf("modules/message/%s must use httperr.ResponseErrorL via respondMessage* helpers / errcode.ErrMessage* instead of legacy %s", f, b)
 				}
 			}
+			// Also forbid raw non-OK c.JSON(http.Status…) error responses — these
+			// bypass the i18n envelope just as completely as c.ResponseError but
+			// don't match the substrings above (reviewer finding on api_message_get.go).
+			for _, line := range strings.Split(cleaned, "\n") {
+				if strings.Contains(line, "c.JSON(http.Status") && !strings.Contains(line, "c.JSON(http.StatusOK") {
+					t.Fatalf("modules/message/%s must not emit raw non-OK c.JSON(http.Status…) error responses; use httperr.ResponseErrorL: %s", f, strings.TrimSpace(line))
+				}
+			}
 		})
 	}
 }

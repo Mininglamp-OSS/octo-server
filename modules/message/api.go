@@ -2243,8 +2243,7 @@ func (m *Message) revoke(c *wkhttp.Context) {
 		ClientMsgNos: cliengMsgNos,
 	})
 	if err != nil {
-		m.Error("查询IM消息错误", zap.String("fakeChannelID", fakeChannelID), zap.String("clientMsgNo", clientMsgNo), zap.String("loginUID", c.GetLoginUID()))
-		m.Error("查询IM消息错误", zap.Error(err))
+		m.Error("查询IM消息错误", zap.String("fakeChannelID", fakeChannelID), zap.String("clientMsgNo", clientMsgNo), zap.String("loginUID", c.GetLoginUID()), zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}

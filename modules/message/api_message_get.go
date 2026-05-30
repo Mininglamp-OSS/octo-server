@@ -2,7 +2,6 @@ package message
 
 import (
 	"encoding/json"
-	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -14,7 +13,6 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
-	"github.com/gin-gonic/gin"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 )
@@ -130,7 +128,6 @@ func (m *Message) getThreadMessage(c *wkhttp.Context) {
 	t, err := m.threadDB.QueryByGroupNoAndShortID(groupNo, shortID)
 	if err != nil {
 		m.Error("查询子区失败", zap.Error(err))
-		m.Error("查询子区失败", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
@@ -140,7 +137,7 @@ func (m *Message) getThreadMessage(c *wkhttp.Context) {
 	// 消息，发完自动解档）。
 	// body 用 "message not found"（与其它 404 一致）避免泄露 thread 是否存在的信号。
 	if t == nil || t.Status == thread.ThreadStatusDeleted {
-		c.JSON(http.StatusNotFound, gin.H{"msg": "message not found"})
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotFound, nil, nil)
 		return
 	}
 
@@ -176,25 +173,23 @@ func (m *Message) requireGroupMember(c *wkhttp.Context, groupNo, loginUID string
 	g, err := m.groupDB.QueryWithGroupNo(groupNo)
 	if err != nil {
 		m.Error("查询群信息失败", zap.Error(err))
-		m.Error("查询群信息失败", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return false
 	}
 	// 白名单语义：只有 GroupStatusNormal 允许通过；Disband / Disabled / 未来新增的
 	// 非正常状态一律 fail closed。与 ExistMemberActive 的 status=Normal 一致。
 	if g == nil || g.Status != group.GroupStatusNormal {
-		c.JSON(http.StatusNotFound, gin.H{"msg": "message not found"})
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotFound, nil, nil)
 		return false
 	}
 	isActive, err := m.groupDB.ExistMemberActive(loginUID, groupNo)
 	if err != nil {
 		m.Error("检查群成员失败", zap.Error(err))
-		m.Error("检查群成员失败", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return false
 	}
 	if !isActive {
-		c.JSON(http.StatusNotFound, gin.H{"msg": "message not found"})
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotFound, nil, nil)
 		return false
 	}
 	return true
@@ -216,12 +211,11 @@ func (m *Message) respondSingleMessage(c *wkhttp.Context, channelID string, chan
 	msgModel, err := m.db.queryMessageByID(channelID, channelType, messageIDStr)
 	if err != nil {
 		m.Error("查询消息失败", zap.Error(err), zap.String("channel_id", channelID), zap.Int64("message_id", messageID))
-		m.Error("查询消息失败", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	if msgModel == nil {
-		c.JSON(http.StatusNotFound, gin.H{"msg": "message not found"})
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotFound, nil, nil)
 		return
 	}
 
@@ -231,7 +225,7 @@ func (m *Message) respondSingleMessage(c *wkhttp.Context, channelID string, chan
 	// 拿不到字段、IsDeleted 不会被置 1，依赖"from() 后兜底 IsDeleted"的策略失效，
 	// 非白名单成员能拿到该消息的元数据。原始 payload 解析在所有大小下都正确。
 	if !visiblesAllows(msgModel.Payload, loginUID) {
-		c.JSON(http.StatusNotFound, gin.H{"msg": "message not found"})
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotFound, nil, nil)
 		return
 	}
 
@@ -242,11 +236,11 @@ func (m *Message) respondSingleMessage(c *wkhttp.Context, channelID string, chan
 		return
 	}
 	if extra != nil && (extra.Revoke == 1 || extra.IsDeleted == 1) {
-		c.JSON(http.StatusNotFound, gin.H{"msg": "message not found"})
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotFound, nil, nil)
 		return
 	}
 	if userExtra != nil && userExtra.MessageIsDeleted == 1 {
-		c.JSON(http.StatusNotFound, gin.H{"msg": "message not found"})
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotFound, nil, nil)
 		return
 	}
 
@@ -257,17 +251,15 @@ func (m *Message) respondSingleMessage(c *wkhttp.Context, channelID string, chan
 	// channel_setting.offset_message_seq 是两张不同的表 / 两套语义，必须都查。
 	if userOffset, err := m.channelOffsetDB.queryWithUIDAndChannel(loginUID, channelID, channelType); err != nil {
 		m.Error("查询用户清理偏移失败", zap.Error(err))
-		m.Error("查询用户清理偏移失败", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	} else if userOffset != nil && msgModel.MessageSeq <= userOffset.MessageSeq {
-		c.JSON(http.StatusNotFound, gin.H{"msg": "message not found"})
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotFound, nil, nil)
 		return
 	}
 
 	channelOffsetSeq, err := m.lookupChannelOffsetSeq(channelID, channelType, loginUID)
 	if err != nil {
-		m.Error("查询频道设置失败", zap.Error(err))
 		m.Error("查询频道设置失败", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
@@ -288,7 +280,7 @@ func (m *Message) respondSingleMessage(c *wkhttp.Context, channelID string, chan
 	// 置 1。批量同步把 IsDeleted=1 留给客户端过滤；单条直查不能依赖客户端，
 	// 否则相当于把"白名单消息"在 200 响应里整段下发给非授权用户。
 	if resp.IsDeleted == 1 {
-		c.JSON(http.StatusNotFound, gin.H{"msg": "message not found"})
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotFound, nil, nil)
 		return
 	}
 

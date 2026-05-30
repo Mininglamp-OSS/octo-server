@@ -140,7 +140,7 @@ func (m *Message) pinnedMessage(c *wkhttp.Context) {
 		return
 	}
 	if currentCount >= int64(maxCount) && (pinnedMessage == nil || pinnedMessage.IsDeleted == 1) {
-		httperr.ResponseErrorL(c, errcode.ErrMessagePinnedLimitExceeded, nil, nil)
+		respondMessagePinnedLimitExceeded(c, maxCount)
 		return
 	}
 
@@ -435,7 +435,6 @@ func (m *Message) clearPinnedMessage(c *wkhttp.Context) {
 		}, tx)
 		if err != nil {
 			tx.Rollback()
-			m.Error("修改消息扩展置顶状态错误", zap.Error(err))
 			m.Error("修改消息扩展置顶状态错误", zap.Error(err))
 			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
