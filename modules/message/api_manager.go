@@ -8,9 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
-	"github.com/Mininglamp-OSS/octo-server/modules/group"
-	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/model"
@@ -19,6 +16,11 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkevent"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 )
@@ -64,7 +66,7 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 func (m *Manager) sendMsgToFriends(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondMessageForbidden(c)
 		return
 	}
 	type ReqVO struct {
@@ -75,19 +77,19 @@ func (m *Manager) sendMsgToFriends(c *wkhttp.Context) {
 	var req ReqVO
 	if err := c.BindJSON(&req); err != nil {
 		m.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误！"))
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	if req.UID == "" {
-		c.ResponseError(errors.New("发送者不能为空"))
+		respondMessageRequestInvalid(c, "from_uid")
 		return
 	}
 	if req.Content == "" {
-		c.ResponseError(errors.New("发送内容不能为空"))
+		respondMessageRequestInvalid(c, "content")
 		return
 	}
 	if len(req.ToUIDs) == 0 {
-		c.ResponseError(errors.New("发送消息的订阅者不能为空"))
+		respondMessageRequestInvalid(c, "subscribers")
 		return
 	}
 	go m.sendMessageToFriends(req.ToUIDs, req.UID, req.Content)
@@ -116,7 +118,7 @@ func (m *Manager) delete(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondMessageForbidden(c)
 		return
 	}
 	type msgVO struct {
@@ -132,15 +134,15 @@ func (m *Manager) delete(c *wkhttp.Context) {
 	var req reqVO
 	if err := c.BindJSON(&req); err != nil {
 		m.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误！"))
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	if len(req.List) == 0 {
-		c.ResponseError(errors.New("删除的msgIds不能为空"))
+		respondMessageRequestInvalid(c, "msg_ids")
 		return
 	}
 	if req.ChannelType == uint8(common.ChannelTypePerson) && (req.FromUID == "" || req.ChannelID == req.FromUID) {
-		c.ResponseError(errors.New("单聊fromuid不能为空且不能和channelId一致"))
+		respondMessageRequestInvalid(c, "from_uid")
 		return
 	}
 	fakeChannelID := req.ChannelID
@@ -150,7 +152,7 @@ func (m *Manager) delete(c *wkhttp.Context) {
 	tx, err := m.ctx.DB().Begin()
 	if err != nil {
 		m.Error("开启事务失败！", zap.Error(err))
-		c.ResponseError(errors.New("开启事务失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	defer func() {
@@ -163,7 +165,8 @@ func (m *Manager) delete(c *wkhttp.Context) {
 	for _, msg := range req.List {
 		version, err := m.genMessageExtraSeq(fakeChannelID)
 		if err != nil {
-			c.ResponseError(err)
+			m.Error("生成消息扩展序列号失败", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
 		msgIds = append(msgIds, msg.MessageID)
@@ -178,7 +181,7 @@ func (m *Manager) delete(c *wkhttp.Context) {
 		if err != nil {
 			tx.Rollback()
 			m.Error(common.ErrData.Error(), zap.Error(err))
-			c.ResponseError(errors.New("删除消息错误"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
 	}
@@ -186,7 +189,7 @@ func (m *Manager) delete(c *wkhttp.Context) {
 	if err != nil {
 		tx.Rollback()
 		m.Error("查询置顶消息错误", zap.Error(err))
-		c.ResponseError(errors.New("查询置顶消息错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	isSendSyncPinnedMsgCMD := false
@@ -200,7 +203,7 @@ func (m *Manager) delete(c *wkhttp.Context) {
 				if err != nil {
 					tx.Rollback()
 					m.Error("删除置顶消息错误", zap.Error(err))
-					c.ResponseError(errors.New("删除置顶消息错误"))
+					httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 					return
 				}
 			}
@@ -232,14 +235,14 @@ func (m *Manager) delete(c *wkhttp.Context) {
 		if err != nil {
 			tx.Rollback()
 			m.Error("开启事件失败！", zap.Error(err))
-			c.ResponseError(errors.New("开启事件失败！"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		tx.Rollback()
 		m.Error("提交事务失败！", zap.Error(err))
-		c.ResponseError(errors.New("提交事务失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	if eventID > 0 {
@@ -272,7 +275,7 @@ func (m *Manager) delete(c *wkhttp.Context) {
 
 	if err != nil {
 		m.Error("发送cmd失败！", zap.Error(err))
-		c.ResponseError(err)
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotifyFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -280,39 +283,40 @@ func (m *Manager) delete(c *wkhttp.Context) {
 func (m *Manager) deleteProhibitWords(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondMessageForbidden(c)
 		return
 	}
 	is_deleted := c.Query("is_deleted")
 	isDeleted, _ := strconv.Atoi(is_deleted)
 	id := c.Query("id")
 	if id == "" || (isDeleted != 0 && isDeleted != 1) {
-		c.ResponseError(errors.New("参数错误"))
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	tempID, _ := strconv.Atoi(id)
 	words, err := m.managerDB.queryProhibitWordsWithID(tempID)
 	if err != nil {
 		m.Error(common.ErrData.Error(), zap.Error(err))
-		c.ResponseError(errors.New("查询违禁词错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	if words == nil {
 		m.Error(common.ErrData.Error(), zap.Error(err))
-		c.ResponseError(errors.New("操作的违禁词不存在"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageBanwordNotFound, nil, nil)
 		return
 	}
 	words.IsDeleted = isDeleted
 	genSeqVal, err := m.ctx.GenSeq(common.ProhibitWordKey)
 	if err != nil {
-		c.ResponseError(err)
+		m.Error("生成违禁词序列号失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	words.Version = genSeqVal
 	err = m.managerDB.updateProhibitWord(words)
 	if err != nil {
 		m.Error(common.ErrData.Error(), zap.Error(err))
-		c.ResponseError(errors.New("修改违禁词错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -321,7 +325,7 @@ func (m *Manager) deleteProhibitWords(c *wkhttp.Context) {
 func (m *Manager) prohibitWords(c *wkhttp.Context) {
 	err := c.CheckLoginRole()
 	if err != nil {
-		c.ResponseError(err)
+		respondMessageForbidden(c)
 		return
 	}
 	pageIndex, pageSize := c.GetPage()
@@ -332,27 +336,27 @@ func (m *Manager) prohibitWords(c *wkhttp.Context) {
 		result, err = m.managerDB.queryProhibitWords(uint64(pageIndex), uint64(pageSize))
 		if err != nil {
 			m.Error(common.ErrData.Error(), zap.Error(err))
-			c.ResponseError(errors.New("查询违禁词列表错误"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 		count, err = m.managerDB.queryProhibitWordsCount()
 		if err != nil {
 			m.Error(common.ErrData.Error(), zap.Error(err))
-			c.ResponseError(errors.New("查询违禁词总数错误"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 	} else {
 		result, err = m.managerDB.queryProhibitWordsWithContentAndPage(searchKey, uint64(pageIndex), uint64(pageSize))
 		if err != nil {
 			m.Error(common.ErrData.Error(), zap.Error(err))
-			c.ResponseError(errors.New("搜索查询违禁词列表错误"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 
 		count, err = m.managerDB.queryProhibitWordsCountWithContent(searchKey)
 		if err != nil {
 			m.Error(common.ErrData.Error(), zap.Error(err))
-			c.ResponseError(errors.New("查询搜索违禁词总数错误"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 	}
@@ -378,23 +382,24 @@ func (m *Manager) prohibitWords(c *wkhttp.Context) {
 func (m *Manager) addProhibitWords(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondMessageForbidden(c)
 		return
 	}
 	content := c.Query("content")
 	if content == "" {
-		c.ResponseError(errors.New("违禁词不能为空"))
+		respondMessageRequestInvalid(c, "word")
 		return
 	}
 	model, err := m.managerDB.queryProhibitWordsWithContent(content)
 	if err != nil {
 		m.Error(common.ErrData.Error(), zap.Error(err))
-		c.ResponseError(errors.New("查询违禁词错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	version, err := m.ctx.GenSeq(common.ProhibitWordKey)
 	if err != nil {
-		c.ResponseError(err)
+		m.Error("生成违禁词序列号失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	if model != nil {
@@ -403,7 +408,7 @@ func (m *Manager) addProhibitWords(c *wkhttp.Context) {
 		err = m.managerDB.updateProhibitWord(model)
 		if err != nil {
 			m.Error(common.ErrData.Error(), zap.Error(err))
-			c.ResponseError(errors.New("修改违禁词错误"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
 	} else {
@@ -414,7 +419,7 @@ func (m *Manager) addProhibitWords(c *wkhttp.Context) {
 		})
 		if err != nil {
 			m.Error(common.ErrData.Error(), zap.Error(err))
-			c.ResponseError(errors.New("新增违禁词错误"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
 	}
@@ -423,28 +428,28 @@ func (m *Manager) addProhibitWords(c *wkhttp.Context) {
 func (m *Manager) recordpersonal(c *wkhttp.Context) {
 	err := c.CheckLoginRole()
 	if err != nil {
-		c.ResponseError(err)
+		respondMessageForbidden(c)
 		return
 	}
 	uid := c.Query("uid")
 	touid := c.Query("touid")
 	pageIndex, pageSize := c.GetPage()
 	if strings.TrimSpace(uid) == "" || strings.TrimSpace(touid) == "" {
-		c.ResponseError(errors.New("uid不能为空"))
+		respondMessageRequestInvalid(c, "uid")
 		return
 	}
 	channelID := common.GetFakeChannelIDWith(uid, touid)
 	msgs, err := m.managerDB.queryWithChannelID(channelID, uint64(pageIndex), uint64(pageSize))
 	if err != nil {
 		m.Error(common.ErrData.Error(), zap.Error(err))
-		c.ResponseError(errors.New("查询消息记录错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 
 	count, err := m.managerDB.queryRecordCount(channelID)
 	if err != nil {
 		m.Error(common.ErrData.Error(), zap.Error(err))
-		c.ResponseError(errors.New("查询消息总量错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	list := make([]*recordVO, 0)
@@ -461,13 +466,13 @@ func (m *Manager) recordpersonal(c *wkhttp.Context) {
 	msgExtrs, err := m.managerDB.queryMsgExtrWithMsgIds(msgIds)
 	if err != nil {
 		m.Error(common.ErrData.Error(), zap.Error(err))
-		c.ResponseError(errors.New("查询消息扩展错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	userList, err := m.userService.GetUsers(uids)
 	if err != nil {
 		m.Error(common.ErrData.Error(), zap.Error(err))
-		c.ResponseError(errors.New("查询发送者信息错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	ids := make([]int64, 0)
@@ -564,7 +569,7 @@ func (m *Manager) recordpersonal(c *wkhttp.Context) {
 func (m *Manager) record(c *wkhttp.Context) {
 	err := c.CheckLoginRole()
 	if err != nil {
-		c.ResponseError(err)
+		respondMessageForbidden(c)
 		return
 	}
 	var channelID = c.Query("channel_id")
@@ -572,13 +577,13 @@ func (m *Manager) record(c *wkhttp.Context) {
 	msgs, err := m.managerDB.queryWithChannelID(channelID, uint64(pageIndex), uint64(pageSize))
 	if err != nil {
 		m.Error(common.ErrData.Error(), zap.Error(err))
-		c.ResponseError(errors.New("查询消息记录错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	count, err := m.managerDB.queryRecordCount(channelID)
 	if err != nil {
 		m.Error(common.ErrData.Error(), zap.Error(err))
-		c.ResponseError(errors.New("查询消息总量错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 
@@ -596,13 +601,13 @@ func (m *Manager) record(c *wkhttp.Context) {
 	msgExtrs, err := m.managerDB.queryMsgExtrWithMsgIds(msgIds)
 	if err != nil {
 		m.Error(common.ErrData.Error(), zap.Error(err))
-		c.ResponseError(errors.New("查询消息扩展错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	userList, err := m.userService.GetUsers(uids)
 	if err != nil {
 		m.Error(common.ErrData.Error(), zap.Error(err))
-		c.ResponseError(errors.New("查询发送者信息错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	ids := make([]int64, 0)
@@ -702,7 +707,7 @@ func (m *Manager) record(c *wkhttp.Context) {
 func (m *Manager) sendMsgToAllUsers(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondMessageForbidden(c)
 		return
 	}
 	type SendMsgReq struct {
@@ -711,12 +716,13 @@ func (m *Manager) sendMsgToAllUsers(c *wkhttp.Context) {
 	var req SendMsgReq
 	if err := c.BindJSON(&req); err != nil {
 		m.Error(common.ErrData.Error(), zap.Error(err))
-		c.ResponseError(common.ErrData)
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	userList, err := m.userService.GetAllUsers()
 	if err != nil {
-		c.ResponseError(err)
+		m.Error("查询用户列表失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	uids := make([][]string, 0)
@@ -760,17 +766,17 @@ func (m *Manager) sendMessageBatch(uids [][]string, content string) error {
 func (m *Manager) sendMsg(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondMessageForbidden(c)
 		return
 	}
 	var req managerSendMsgReq
 	if err := c.BindJSON(&req); err != nil {
 		m.Error(common.ErrData.Error(), zap.Error(err))
-		c.ResponseError(common.ErrData)
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	if err := req.check(); err != nil {
-		c.ResponseError(err)
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	var receiverName string = ""
@@ -778,11 +784,11 @@ func (m *Manager) sendMsg(c *wkhttp.Context) {
 		user, err := m.userService.GetUser(req.ReceivedChannelID)
 		if err != nil {
 			m.Error("查询接受的者信息错误", zap.Error(err), zap.String("uid", req.ReceivedChannelID))
-			c.ResponseError(errors.New("查询接受的者信息错误"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 		if user == nil {
-			c.ResponseError(errors.New("消息接受者用户不存在"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageReceiverNotFound, nil, nil)
 			return
 		}
 		receiverName = user.Name
@@ -791,11 +797,11 @@ func (m *Manager) sendMsg(c *wkhttp.Context) {
 		group, err := m.groupService.GetGroupWithGroupNo(req.ReceivedChannelID)
 		if err != nil {
 			m.Error("查询接受群信息错误", zap.Error(err), zap.String("groupNo", req.ReceivedChannelID))
-			c.ResponseError(errors.New("查询接受群信息错误"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 		if group == nil {
-			c.ResponseError(errors.New("消息接受群不存在"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageGroupNotFound, nil, nil)
 			return
 		}
 		receiverName = group.Name
@@ -851,7 +857,7 @@ func (m *Manager) sendMsg(c *wkhttp.Context) {
 	})
 	if err != nil {
 		m.Error("发送消息错误", zap.Error(err))
-		c.ResponseError(errors.New("发送消息错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotifyFailed, nil, nil)
 		return
 	}
 	// 添加发送消息记录
@@ -867,7 +873,7 @@ func (m *Manager) sendMsg(c *wkhttp.Context) {
 	})
 	if err != nil {
 		m.Error("添加发送消息记录错误", zap.Error(err))
-		c.ResponseError(errors.New("添加发送消息记录错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -877,20 +883,20 @@ func (m *Manager) sendMsg(c *wkhttp.Context) {
 func (m *Manager) list(c *wkhttp.Context) {
 	err := c.CheckLoginRole()
 	if err != nil {
-		c.ResponseError(err)
+		respondMessageForbidden(c)
 		return
 	}
 	pageIndex, pageSize := c.GetPage()
 	list, err := m.managerDB.queryMsgWithPage(uint64(pageSize), uint64(pageIndex))
 	if err != nil {
 		m.Error("查询代发消息记录错误", zap.Error(err))
-		c.ResponseError(errors.New("查询代发消息记录错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	count, err := m.managerDB.queryMsgCount()
 	if err != nil {
 		m.Error("查询代发消息总数错误", zap.Error(err))
-		c.ResponseError(errors.New("查询代发消息总数错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	result := make([]*managerSendMsgResp, 0)
