@@ -15,6 +15,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkevent"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -28,17 +30,17 @@ func (g *Group) groupMemberInviteAdd(c *wkhttp.Context) {
 	var req InviteReq
 	if err := c.BindJSON(&req); err != nil {
 		g.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误！"))
+		respondGroupRequestInvalid(c, "")
 		return
 	}
 	if err := req.Check(); err != nil {
-		c.ResponseError(err)
+		respondGroupRequestInvalid(c, "")
 		return
 	}
 
 	_, err := g.getGroupInfo(groupNo)
 	if err != nil {
-		c.ResponseError(err)
+		respondGroupInfoError(c, err)
 		return
 	}
 
@@ -47,18 +49,18 @@ func (g *Group) groupMemberInviteAdd(c *wkhttp.Context) {
 	// 真正的兜底在 addMembersTx 里，这里只是为了更友好的错误提示。
 	if botErr := checkBotOwnership(g.ctx.DB(), loginUID, req.UIDS); botErr != nil {
 		if errors.Is(botErr, ErrBotOwnershipDenied) {
-			c.ResponseErrorWithStatus(ErrBotOwnershipDenied, http.StatusForbidden)
+			httperr.ResponseErrorL(c, errcode.ErrGroupBotOwnershipDenied, nil, nil)
 			return
 		}
 		g.Error("检查 Bot 归属失败", zap.Error(botErr))
-		c.ResponseError(errors.New("检查 Bot 归属失败"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 		return
 	}
 
 	creatorOrManagerUIDS, err := g.db.QueryGroupManagerOrCreatorUIDS(groupNo)
 	if err != nil {
 		g.Error("查询创建者或管理员的uid失败！", zap.String("group_no", groupNo), zap.Error(err))
-		c.ResponseError(errors.New("查询创建者或管理员的uid失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 		return
 	}
 
@@ -67,7 +69,7 @@ func (g *Group) groupMemberInviteAdd(c *wkhttp.Context) {
 	tx, err := g.db.session.Begin()
 	if err != nil {
 		g.Error("开启事务失败！", zap.Error(err))
-		c.ResponseError(errors.New("开启事务失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
 	defer func() {
@@ -91,7 +93,7 @@ func (g *Group) groupMemberInviteAdd(c *wkhttp.Context) {
 	if err != nil {
 		tx.Rollback()
 		g.Error("开启事件失败！", zap.Error(err))
-		c.ResponseError(errors.New("开启事件失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
 	inviteModel := &InviteModel{
@@ -105,7 +107,7 @@ func (g *Group) groupMemberInviteAdd(c *wkhttp.Context) {
 	if err != nil {
 		tx.Rollback()
 		g.Error("添加邀请数据失败！", zap.Error(err))
-		c.ResponseError(errors.New("添加邀请数据失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
 	for _, uid := range req.UIDS {
@@ -120,7 +122,7 @@ func (g *Group) groupMemberInviteAdd(c *wkhttp.Context) {
 		if err != nil {
 			tx.Rollback()
 			g.Error("添加邀请项失败！", zap.Error(err))
-			c.ResponseError(errors.New("添加邀请项失败！"))
+			httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 			return
 		}
 	}
@@ -128,7 +130,7 @@ func (g *Group) groupMemberInviteAdd(c *wkhttp.Context) {
 	if err := tx.Commit(); err != nil {
 		tx.Rollback()
 		g.Error("提交事务失败！", zap.Error(err))
-		c.ResponseError(errors.New("提交事务失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
 	g.ctx.EventCommit(eventID)
@@ -141,23 +143,23 @@ func (g *Group) getToGroupMemberConfirmInviteDetailH5(c *wkhttp.Context) {
 	inviteNo := c.Query("invite_no")
 	loginUID := c.MustGet("uid").(string)
 	if groupNo == "" {
-		c.ResponseError(errors.New("群编号不能为空"))
+		respondGroupRequestInvalid(c, "group_no")
 		return
 	}
 	_, err := g.getGroupInfo(groupNo)
 	if err != nil {
-		c.ResponseError(err)
+		respondGroupInfoError(c, err)
 		return
 	}
 
 	managerOrCreator, err := g.db.QueryIsGroupManagerOrCreator(groupNo, loginUID)
 	if err != nil {
 		g.Error("查询是否管理者或创建者失败！")
-		c.ResponseError(errors.New("查询是否管理者或创建者失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 		return
 	}
 	if !managerOrCreator {
-		c.ResponseError(errors.New("你不是群主或管理员！"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupCreatorOrManagerOnly, nil, nil)
 		return
 	}
 	authCode := util.GenerUUID()
@@ -169,7 +171,7 @@ func (g *Group) getToGroupMemberConfirmInviteDetailH5(c *wkhttp.Context) {
 	}), time.Minute*5)
 	if err != nil {
 		g.Error("缓存授权码失败！", zap.Error(err))
-		c.ResponseError(errors.New("缓存授权码失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
 
@@ -185,33 +187,33 @@ func (g *Group) groupMemberInviteSure(c *wkhttp.Context) {
 	authInfo, err := g.ctx.GetRedisConn().GetString(fmt.Sprintf("%s%s", common.AuthCodeCachePrefix, authCode))
 	if err != nil {
 		g.Error("获取授权信息失败！", zap.Error(err))
-		c.ResponseError(errors.New("获取授权信息失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 		return
 	}
 	var authMap map[string]interface{}
 	err = util.ReadJsonByByte([]byte(authInfo), &authMap)
 	if err != nil {
 		g.Error("解码认证信息的JSON数据失败！", zap.Error(err))
-		c.ResponseError(errors.New("解码认证信息的JSON数据失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
 	authType, ok := authMap["type"].(string)
 	if !ok {
-		c.ResponseError(errors.New("授权码类型无效！"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupAuthCodeInvalid, nil, nil)
 		return
 	}
 	if authType != string(common.AuthCodeTypeGroupMemberInvite) {
-		c.ResponseError(errors.New("授权码不是确认邀请！"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupAuthCodeInvalid, nil, nil)
 		return
 	}
 	inviteNo, ok := authMap["invite_no"].(string)
 	if !ok {
-		c.ResponseError(errors.New("邀请编号无效！"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupAuthCodeInvalid, nil, nil)
 		return
 	}
 	allower, ok := authMap["allower"].(string)
 	if !ok {
-		c.ResponseError(errors.New("授权者信息无效！"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupAuthCodeInvalid, nil, nil)
 		return
 	}
 	/**
@@ -220,7 +222,7 @@ func (g *Group) groupMemberInviteSure(c *wkhttp.Context) {
 	tx, err := g.ctx.DB().Begin()
 	if err != nil {
 		g.Error("开启事务失败！", zap.Error(err))
-		c.ResponseError(errors.New("开启事务失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
 	defer func() {
@@ -236,17 +238,17 @@ func (g *Group) groupMemberInviteSure(c *wkhttp.Context) {
 	if err != nil {
 		tx.Rollback()
 		g.Error("查询邀请详情失败！", zap.Error(err))
-		c.ResponseError(errors.New("查询邀请详情失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 		return
 	}
 	if inviteDetailModel == nil {
 		tx.Rollback()
-		c.ResponseError(errors.New("没有查询到邀请信息！"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupInviteNotFound, nil, nil)
 		return
 	}
 	if inviteDetailModel.Status != InviteStatusWait {
 		tx.Rollback()
-		c.ResponseError(errors.New("邀请信息不是待邀请状态！"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupInviteStatusInvalid, nil, nil)
 		return
 	}
 	/**
@@ -256,12 +258,12 @@ func (g *Group) groupMemberInviteSure(c *wkhttp.Context) {
 	if err != nil {
 		tx.Rollback()
 		g.Error("查询邀请详情失败！", zap.Error(err))
-		c.ResponseError(errors.New("查询邀请详情失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 		return
 	}
 	if inviteItemDetilModels == nil || len(inviteItemDetilModels) <= 0 {
 		tx.Rollback()
-		c.ResponseError(errors.New("没有查到邀请信息！"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupInviteNotFound, nil, nil)
 		return
 	}
 	members := make([]string, 0, len(inviteItemDetilModels))
@@ -272,13 +274,13 @@ func (g *Group) groupMemberInviteSure(c *wkhttp.Context) {
 	}
 	if groupNo == "" {
 		tx.Rollback()
-		c.ResponseError(errors.New("群编号不能为空"))
+		respondGroupRequestInvalid(c, "group_no")
 		return
 	}
 	_, err = g.getGroupInfo(groupNo)
 	if err != nil {
 		tx.Rollback()
-		c.ResponseError(err)
+		respondGroupInfoError(c, err)
 		return
 	}
 	/**
@@ -288,27 +290,27 @@ func (g *Group) groupMemberInviteSure(c *wkhttp.Context) {
 	if err != nil {
 		tx.Rollback()
 		g.Error("查询邀请者的用户信息失败！", zap.Error(err))
-		c.ResponseError(errors.New("查询邀请者的用户信息失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 		return
 	}
 	if inviterUser == nil {
 		tx.Rollback()
 		g.Error("没有查到邀请者的用户信息！")
-		c.ResponseError(errors.New("没有查到邀请者的用户信息！"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupInviteNotFound, nil, nil)
 		return
 	}
 	err = g.db.UpdateInviteStatusTx(allower, InviteStatusOK, inviteNo, tx)
 	if err != nil {
 		tx.Rollback()
 		g.Error("更新邀请信息状态失败！", zap.Error(err))
-		c.ResponseError(errors.New("更新邀请信息状态失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
 	err = g.db.UpdateInviteItemStatusTx(InviteStatusOK, inviteNo, tx)
 	if err != nil {
 		tx.Rollback()
 		g.Error("更新邀请信息项状态失败！", zap.Error(err))
-		c.ResponseError(errors.New("更新邀请信息项状态失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
 	// YUJ-199 / GH#1265：邀请确认调用方携带的 X-Space-ID 才是邀请发起
@@ -322,16 +324,16 @@ func (g *Group) groupMemberInviteSure(c *wkhttp.Context) {
 		g.Error("添加成员失败！", zap.Error(err))
 		// 透出 allow_external 等策略拒绝的具体错误，方便管理员定位；其他底层错误走兜底文案
 		if strings.Contains(err.Error(), "禁止外部成员") {
-			c.ResponseError(err)
+			httperr.ResponseErrorL(c, errcode.ErrGroupExternalJoinForbidden, nil, nil)
 		} else {
-			c.ResponseError(errors.New("添加成员失败！"))
+			httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		}
 		return
 	}
 	if err := tx.Commit(); err != nil {
 		tx.Rollback()
 		g.Error("提交事务失败！", zap.Error(err))
-		c.ResponseError(errors.New("提交事务失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
 
@@ -344,24 +346,24 @@ func (g *Group) groupMemberInviteSure(c *wkhttp.Context) {
 func (g *Group) groupMemberInviteDetail(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	if loginUID == "" {
-		c.ResponseError(errors.New("请先登录！"))
+		respondGroupNotLoggedIn(c)
 		return
 	}
 	inviteNo := c.Param("invite_no")
 	inviteDetilModel, err := g.db.QueryInviteDetail(inviteNo)
 	if err != nil {
 		g.Error("查询邀请详情失败！", zap.Error(err))
-		c.ResponseError(errors.New("查询邀请详情失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 		return
 	}
 	if inviteDetilModel == nil {
-		c.ResponseError(errors.New("没有查到邀请信息！"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupInviteNotFound, nil, nil)
 		return
 	}
 	inviteItems, err := g.db.QueryInviteItemDetail(inviteNo)
 	if err != nil {
 		g.Error("获取邀请项失败！", zap.Error(err))
-		c.ResponseError(errors.New("获取邀请项失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 		return
 	}
 
@@ -380,13 +382,13 @@ func (g *Group) groupMemberInviteDetail(c *wkhttp.Context) {
 		isManager, err := g.db.QueryIsGroupManagerOrCreator(inviteDetilModel.GroupNo, loginUID)
 		if err != nil {
 			g.Error("查询管理员信息失败！", zap.Error(err))
-			c.ResponseError(errors.New("查询管理员信息失败！"))
+			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 			return
 		}
 		isAuthorized = isManager
 	}
 	if !isAuthorized {
-		c.ResponseError(errors.New("您没有权限查看该邀请信息！"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupViewForbidden, nil, nil)
 		return
 	}
 
@@ -398,7 +400,7 @@ func (g *Group) groupMemberInviteDetail(c *wkhttp.Context) {
 	members, err := g.db.QueryMembersWithUids(uids, inviteDetilModel.GroupNo)
 	if err != nil {
 		g.Error("查询成员信息错误", zap.Error(err))
-		c.ResponseError(errors.New("查询成员信息错误"))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 		return
 	}
 	if len(members) == len(inviteItems) {
