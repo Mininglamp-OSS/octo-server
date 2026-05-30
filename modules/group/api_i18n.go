@@ -1,6 +1,8 @@
 package group
 
 import (
+	"errors"
+
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
@@ -69,4 +71,25 @@ func respondGroupNotLoggedIn(c *wkhttp.Context) {
 // manager_only / creator_or_manager_only codes instead.
 func respondGroupForbidden(c *wkhttp.Context) {
 	httperr.ResponseErrorL(c, errSharedForbidden, nil, nil)
+}
+
+// errGroupInfoQueryFailed / errGroupInfoNotFound are getGroupInfo's sentinel
+// returns. Call sites map them to the right envelope via errors.Is
+// (respondGroupInfoError) instead of leaking the underlying Chinese string
+// behind a fixed HTTP 400.
+var (
+	errGroupInfoQueryFailed = errors.New("query group failed")
+	errGroupInfoNotFound    = errors.New("group not found or disbanded")
+)
+
+// respondGroupInfoError maps getGroupInfo's sentinel error to the localized
+// envelope: a missing / disbanded group is 404, any other (query) failure is
+// 500 (Internal). getGroupInfo already logged the underlying DB error, so the
+// query branch does not log again.
+func respondGroupInfoError(c *wkhttp.Context, err error) {
+	if errors.Is(err, errGroupInfoNotFound) {
+		httperr.ResponseErrorL(c, errcode.ErrGroupNotFound, nil, nil)
+		return
+	}
+	httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 }
