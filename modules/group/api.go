@@ -1088,6 +1088,11 @@ func (g *Group) memberAdd(c *wkhttp.Context) {
 			respondGroupRequestInvalid(c, "members")
 			return
 		}
+		// TOCTOU：getGroupInfo 之后群被解散 → 404，而非内部错误。
+		if strings.Contains(err.Error(), "group not found or disbanded") {
+			httperr.ResponseErrorL(c, errcode.ErrGroupNotFound, nil, nil)
+			return
+		}
 		g.Error("添加群成员失败", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
@@ -2620,6 +2625,11 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 		// RemoveGroupMembers 返回业务错误，应是 404 而非存储失败。
 		if strings.Contains(err.Error(), "none of the members are in this group") {
 			httperr.ResponseErrorL(c, errcode.ErrGroupMemberNotInGroup, nil, nil)
+			return
+		}
+		// TOCTOU：getGroupInfo 之后群被解散 → 404，而非内部错误。
+		if strings.Contains(err.Error(), "group not found or disbanded") {
+			httperr.ResponseErrorL(c, errcode.ErrGroupNotFound, nil, nil)
 			return
 		}
 		g.Error("移除群成员失败", zap.Error(err))
