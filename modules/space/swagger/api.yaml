@@ -7,8 +7,92 @@ host: "api.botgate.cn"
 tags:
   - name: "space"
     description: "团队空间"
+  - name: "spaceManager"
+    description: "空间后台管理"
 schemes:
   - "https"
 basePath: "/v1"
 
-paths: {}
+paths:
+  /manager/spaces/{space_id}/members:
+    get:
+      tags:
+        - "spaceManager"
+      summary: "空间成员列表"
+      description: "管理后台分页查询空间成员（含已移除成员）。keyword 支持按昵称/用户名/邮箱/手机号/UID 跨列模糊搜索。可查询已解散空间。"
+      operationId: "space member list page"
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      parameters:
+        - in: "path"
+          name: "space_id"
+          type: string
+          description: "空间ID（可为已解散空间）"
+          required: true
+        - in: "query"
+          name: "keyword"
+          type: string
+          description: "搜索关键字，子串模糊匹配以下任一列：昵称(name)、用户名(username)、邮箱(email)、手机号(phone)、成员UID。为空时不过滤。_/%/\\ 按字面量处理，不作通配符。"
+          required: false
+        - in: "query"
+          name: "page_index"
+          type: integer
+          description: "页码，<=0 归 1，默认 1"
+          required: false
+        - in: "query"
+          name: "page_size"
+          type: integer
+          description: "每页条数，<=0 归 20，默认 20，上限 200"
+          required: false
+      responses:
+        200:
+          description: "返回"
+          schema:
+            type: object
+            properties:
+              count:
+                type: integer
+                description: "符合条件的成员总数"
+              list:
+                type: array
+                items:
+                  $ref: "#/definitions/managerMemberResp"
+        400:
+          description: "错误（空间ID为空 / 空间不存在 / 查询失败）"
+          schema:
+            $ref: "#/definitions/response"
+      security:
+        - token: []
+
+definitions:
+  managerMemberResp:
+    type: object
+    properties:
+      uid:
+        type: string
+        description: "成员UID"
+      name:
+        type: string
+        description: "成员昵称（来自 user.name，缺失为空串）"
+      role:
+        type: integer
+        description: "角色 0.普通成员 1.管理员 2.拥有者(owner)"
+      status:
+        type: integer
+        description: "成员状态 0.已移除 1.正常"
+      created_at:
+        type: string
+        description: "入群时间"
+      updated_at:
+        type: string
+        description: "最后更新时间"
+  response:
+    type: object
+    properties:
+      status:
+        type: integer
+        format: int
+      msg:
+        type: string

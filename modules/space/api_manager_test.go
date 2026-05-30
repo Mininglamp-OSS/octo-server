@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -233,6 +234,89 @@ func TestManager_MembersList(t *testing.T) {
 	// owner (role=2) 应排在最前
 	assert.Equal(t, 2, resp.List[0].Role)
 	assert.Equal(t, "u-owner", resp.List[0].UID)
+}
+
+// seedUserFull 向 user 表写入带 username/email/phone 的完整记录，用于成员搜索测试。
+func seedUserFull(t *testing.T, uid, name, username, email, phone string) {
+	t.Helper()
+	_, err := testCtx.DB().InsertBySql(
+		"INSERT IGNORE INTO `user` (uid, name, username, email, phone) VALUES (?, ?, ?, ?, ?)",
+		uid, name, username, email, phone,
+	).Exec()
+	assert.NoError(t, err)
+}
+
+// TestManager_Members_KeywordSearch 校验成员列表支持 name/username/email/phone/uid 跨列模糊搜索。
+func TestManager_Members_KeywordSearch(t *testing.T) {
+	s, _, err := setup(t)
+	assert.NoError(t, err)
+	token := adminToken(t)
+
+	seedSpace(t, "mgr-search", "search space", "u-owner", 1)
+	// alice：靠 name 命中
+	seedUserFull(t, "u-alice", "Alice Cooper", "alice123", "alice@example.com", "13800001111")
+	// bob：username/email 与 name 完全不同，验证非 name 列也能命中
+	seedUserFull(t, "u-bob", "Bob", "zzqqxx", "bob.unique@corp.io", "13900002222")
+	// carol：仅 phone 区分
+	seedUserFull(t, "u-carol", "Carol", "carol", "carol@example.com", "15512348888")
+	for _, uid := range []string{"u-alice", "u-bob", "u-carol"} {
+		assert.NoError(t, testSpaceDB.insertMemberNoTx(&MemberModel{
+			SpaceId: "mgr-search", UID: uid, Role: 0, Status: 1,
+		}))
+	}
+
+	type searchResp struct {
+		Count int64 `json:"count"`
+		List  []struct {
+			UID  string `json:"uid"`
+			Name string `json:"name"`
+		} `json:"list"`
+	}
+	doSearch := func(keyword string) searchResp {
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/v1/manager/spaces/mgr-search/members?keyword="+url.QueryEscape(keyword), nil)
+		req.Header.Set("token", token)
+		s.GetRoute().ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code)
+		var resp searchResp
+		assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		return resp
+	}
+
+	cases := []struct {
+		name    string
+		keyword string
+		wantUID string
+	}{
+		{"by name", "Alice", "u-alice"},
+		{"by username", "zzqqxx", "u-bob"},
+		{"by email", "bob.unique", "u-bob"},
+		{"by phone", "15512348888", "u-carol"},
+		{"by uid", "u-carol", "u-carol"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := doSearch(tc.keyword)
+			assert.EqualValues(t, 1, resp.Count, "keyword %q should match exactly one member", tc.keyword)
+			if assert.Len(t, resp.List, 1) {
+				assert.Equal(t, tc.wantUID, resp.List[0].UID)
+			}
+		})
+	}
+
+	// list 与 count 必须使用同一套搜索条件，避免分页样本漂移。
+	t.Run("list and count share filter", func(t *testing.T) {
+		resp := doSearch("example.com") // alice + carol 命中 email
+		assert.EqualValues(t, 2, resp.Count)
+		assert.Len(t, resp.List, 2)
+	})
+
+	// LIKE 通配符必须被转义：下划线不应作为单字符通配命中任意字符。
+	t.Run("wildcard escaped", func(t *testing.T) {
+		resp := doSearch("zzqqx_")
+		assert.EqualValues(t, 0, resp.Count, "underscore must be escaped, not matched as wildcard")
+		assert.Len(t, resp.List, 0)
+	})
 }
 
 // ==================== P1 tests ====================

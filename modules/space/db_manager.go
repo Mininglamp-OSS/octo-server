@@ -28,6 +28,25 @@ func buildLikePattern(keyword string) string {
 	return "%" + escapeLike(keyword) + "%"
 }
 
+// memberSearchColumns 管理端成员模糊搜索覆盖的列。
+// email/username 对 SSO / 邮箱登录用户尤为关键：这类用户 username 可能为空，
+// 只能靠 email 定位（与 user 模块 queryUserListWithPageAndKeyword 的取向一致）。
+// u.* 来自 LEFT JOIN 的 user 表，sm.uid 来自 space_member 自身。
+var memberSearchColumns = []string{"u.name", "u.username", "u.email", "u.phone", "sm.uid"}
+
+// memberSearchWhere 按 keyword 组装跨列 OR LIKE 条件及其占位参数。
+// list / count 两处共用，避免搜索范围漂移导致"列表与总数样本不一致"的分页错位。
+func memberSearchWhere(keyword string) (string, []interface{}) {
+	like := buildLikePattern(keyword)
+	clauses := make([]string, len(memberSearchColumns))
+	args := make([]interface{}, len(memberSearchColumns))
+	for i, col := range memberSearchColumns {
+		clauses[i] = col + " LIKE ?" + likeEscapeClause
+		args[i] = like
+	}
+	return strings.Join(clauses, " OR "), args
+}
+
 // placeholders 生成 "?, ?, ?" 形式 placeholder 字符串，n 必须大于 0。
 func placeholders(n int) string {
 	return strings.TrimRight(strings.Repeat("?,", n), ",")
@@ -173,8 +192,8 @@ func (d *managerDB) queryMembersAdmin(spaceId, keyword string, pageSize, pageInd
 		LeftJoin(dbr.I("user").As("u"), "u.uid=sm.uid").
 		Where("sm.space_id=?", spaceId)
 	if keyword != "" {
-		like := buildLikePattern(keyword)
-		builder = builder.Where("u.name LIKE ?"+likeEscapeClause+" OR sm.uid LIKE ?"+likeEscapeClause, like, like)
+		clause, args := memberSearchWhere(keyword)
+		builder = builder.Where(clause, args...)
 	}
 	var list []*managerMemberModel
 	_, err := builder.
@@ -192,8 +211,8 @@ func (d *managerDB) countMembersAdmin(spaceId, keyword string) (int64, error) {
 		LeftJoin(dbr.I("user").As("u"), "u.uid=sm.uid").
 		Where("sm.space_id=?", spaceId)
 	if keyword != "" {
-		like := buildLikePattern(keyword)
-		builder = builder.Where("u.name LIKE ?"+likeEscapeClause+" OR sm.uid LIKE ?"+likeEscapeClause, like, like)
+		clause, args := memberSearchWhere(keyword)
+		builder = builder.Where(clause, args...)
 	}
 	var count int64
 	_, err := builder.Load(&count)
