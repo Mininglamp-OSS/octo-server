@@ -6,6 +6,123 @@
 #
 # CI rejects PRs that change codes.Register input without re-running extract.
 
+["err.server.group.already_member"]
+other = "You are already a member of this group."
+
+["err.server.group.auth_code_invalid"]
+other = "The authorization code is invalid or has expired."
+
+["err.server.group.auth_code_user_mismatch"]
+other = "The authorization code does not match the current user."
+
+["err.server.group.bot_not_in_space"]
+other = "This bot does not belong to your space."
+
+["err.server.group.bot_ownership_denied"]
+other = "You do not have permission to invite this bot."
+
+["err.server.group.cannot_remove_admin"]
+other = "An administrator cannot remove another administrator."
+
+["err.server.group.cannot_remove_owner"]
+other = "An administrator cannot remove the group owner."
+
+["err.server.group.cannot_target_self"]
+other = "You cannot perform this action on yourself."
+
+["err.server.group.category_forbidden"]
+other = "You do not have permission to use this group category."
+
+["err.server.group.category_not_found"]
+other = "Group category not found."
+
+["err.server.group.category_space_mismatch"]
+other = "The group category does not match the space."
+
+["err.server.group.creator_only"]
+other = "Only the group owner can perform this action."
+
+["err.server.group.creator_or_manager_only"]
+other = "Only the group owner or an administrator can perform this action."
+
+["err.server.group.daily_create_limit"]
+other = "You have reached the daily group creation limit."
+
+["err.server.group.external_cannot_be_admin"]
+other = "External members cannot be promoted to administrator."
+
+["err.server.group.external_cannot_be_owner"]
+other = "Group ownership cannot be transferred to an external member."
+
+["err.server.group.external_join_forbidden"]
+other = "This group does not allow external members to join. Please contact a group administrator."
+
+["err.server.group.file_helper_not_allowed"]
+other = "The File Helper cannot be added to a group."
+
+["err.server.group.group_md_content_too_large"]
+other = "The GROUP.md content exceeds the maximum size."
+
+["err.server.group.invite_expired"]
+other = "The invite link has expired."
+
+["err.server.group.invite_mode_cannot_add"]
+other = "Invite mode is enabled; members cannot be added directly."
+
+["err.server.group.invite_mode_cannot_join"]
+other = "Invite mode is enabled; you cannot join the group directly."
+
+["err.server.group.invite_not_found"]
+other = "Invite information not found."
+
+["err.server.group.invite_status_invalid"]
+other = "The invite is not in a pending state."
+
+["err.server.group.manager_only"]
+other = "Only a group administrator can perform this action."
+
+["err.server.group.member_cannot_remove"]
+other = "Regular members cannot remove group members."
+
+["err.server.group.member_not_friend"]
+other = "You can only add a friend to the group. Please add this user as a friend first."
+
+["err.server.group.member_not_in_group"]
+other = "The member is not in this group."
+
+["err.server.group.not_found"]
+other = "Group not found."
+
+["err.server.group.not_group_member"]
+other = "You are not a member of this group."
+
+["err.server.group.notify_failed"]
+other = "Failed to send group notification."
+
+["err.server.group.qrcode_member_only"]
+other = "Only group members can generate a QR code."
+
+["err.server.group.query_failed"]
+other = "Failed to query group data."
+
+["err.server.group.request_invalid"]
+other = "Invalid request."
+
+["err.server.group.store_failed"]
+other = "Failed to update group data."
+
+["err.server.group.target_not_bot"]
+other = "The target member is not a bot."
+
+["err.server.group.too_large_to_sync"]
+other = "This group is too large to sync members."
+
+["err.server.group.transfer_target_not_found"]
+other = "The target user does not exist or has been deactivated."
+
+["err.server.group.view_forbidden"]
+other = "You do not have permission to view this."
+
 ["err.server.thread.creator_cannot_leave"]
 other = "Thread creator cannot leave the thread."
 

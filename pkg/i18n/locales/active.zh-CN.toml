@@ -358,3 +358,120 @@ other = "签名校验失败。"
 
 ["err.server.user.verify_type_invalid"]
 other = "验证类型不匹配。"
+
+["err.server.group.request_invalid"]
+other = "请求参数有误。"
+
+["err.server.group.member_not_friend"]
+other = "添加的用户不是好友，请先添加好友。"
+
+["err.server.group.file_helper_not_allowed"]
+other = "不支持将“文件助手”加入群聊。"
+
+["err.server.group.category_space_mismatch"]
+other = "群聊分组与空间不匹配。"
+
+["err.server.group.target_not_bot"]
+other = "目标成员不是机器人。"
+
+["err.server.group.group_md_content_too_large"]
+other = "GROUP.md 内容超过大小上限。"
+
+["err.server.group.auth_code_invalid"]
+other = "授权码无效或已失效。"
+
+["err.server.group.invite_expired"]
+other = "邀请链接已过期。"
+
+["err.server.group.creator_only"]
+other = "只有群主才能执行此操作。"
+
+["err.server.group.manager_only"]
+other = "只有群管理员才能执行此操作。"
+
+["err.server.group.creator_or_manager_only"]
+other = "只有群主或管理员才能执行此操作。"
+
+["err.server.group.not_group_member"]
+other = "你不是该群成员。"
+
+["err.server.group.view_forbidden"]
+other = "你没有权限查看。"
+
+["err.server.group.member_cannot_remove"]
+other = "普通成员无法移除群成员。"
+
+["err.server.group.cannot_remove_admin"]
+other = "管理员不能移除其他管理员。"
+
+["err.server.group.cannot_remove_owner"]
+other = "管理员不能移除群主。"
+
+["err.server.group.external_cannot_be_admin"]
+other = "不能将外部成员设为管理员。"
+
+["err.server.group.external_cannot_be_owner"]
+other = "不能将群主转让给外部成员。"
+
+["err.server.group.external_join_forbidden"]
+other = "该群已禁止外部成员加入，请联系群管理员。"
+
+["err.server.group.invite_mode_cannot_add"]
+other = "群已开启邀请模式，不能直接添加成员。"
+
+["err.server.group.invite_mode_cannot_join"]
+other = "群已开启邀请模式，不能直接加入群聊。"
+
+["err.server.group.category_forbidden"]
+other = "无权限使用此群聊分组。"
+
+["err.server.group.bot_ownership_denied"]
+other = "你没有权限邀请该机器人。"
+
+["err.server.group.bot_not_in_space"]
+other = "该机器人不属于你的空间。"
+
+["err.server.group.auth_code_user_mismatch"]
+other = "授权码与当前登录用户不匹配。"
+
+["err.server.group.qrcode_member_only"]
+other = "只有群成员才能生成二维码。"
+
+["err.server.group.not_found"]
+other = "群不存在。"
+
+["err.server.group.member_not_in_group"]
+other = "该成员不在群内。"
+
+["err.server.group.category_not_found"]
+other = "群聊分组不存在。"
+
+["err.server.group.transfer_target_not_found"]
+other = "转让的用户不存在或已注销。"
+
+["err.server.group.invite_not_found"]
+other = "未查询到邀请信息。"
+
+["err.server.group.cannot_target_self"]
+other = "不能对自己执行此操作。"
+
+["err.server.group.already_member"]
+other = "你已在群内，无需重复加入。"
+
+["err.server.group.invite_status_invalid"]
+other = "邀请信息不是待邀请状态。"
+
+["err.server.group.too_large_to_sync"]
+other = "超大群不支持同步群成员。"
+
+["err.server.group.daily_create_limit"]
+other = "今日建群数量已达上限。"
+
+["err.server.group.query_failed"]
+other = "查询群数据失败。"
+
+["err.server.group.store_failed"]
+other = "保存群数据失败。"
+
+["err.server.group.notify_failed"]
+other = "发送群通知失败。"
