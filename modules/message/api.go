@@ -30,6 +30,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
@@ -343,7 +345,7 @@ func (m *Message) Route(r *wkhttp.WKHttp) {
 
 func (m *Message) sendMsg(c *wkhttp.Context) {
 	if !m.ctx.GetConfig().Message.SendMessageOn {
-		c.ResponseError(errors.New("不支持代发消息"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageProxySendUnsupported, nil, nil)
 		return
 	}
 	var req struct {
@@ -353,39 +355,39 @@ func (m *Message) sendMsg(c *wkhttp.Context) {
 		Payload            map[string]interface{} `json:"payload"`              // 消息体
 	}
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseErrorf("数据格式有误！", err)
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	if req.Token == "" {
-		c.ResponseError(errors.New("发送者token不能为空"))
+		respondMessageRequestInvalid(c, "token")
 		return
 	}
 	if req.ReceiveChannelID == "" {
-		c.ResponseError(errors.New("接受channelID不能为空"))
+		respondMessageRequestInvalid(c, "channel_id")
 		return
 	}
 	if req.Payload == nil {
-		c.ResponseError(errors.New("消息不能为空"))
+		respondMessageRequestInvalid(c, "payload")
 		return
 	}
 	raw, err := m.ctx.Cache().Get(m.ctx.GetConfig().Cache.TokenCachePrefix + req.Token)
 	if err != nil {
 		m.Error("解析token错误", zap.Error(err))
-		c.ResponseError(errors.New("解析token错误"))
+		respondMessageTokenInvalid(c)
 		return
 	}
 	if strings.TrimSpace(raw) == "" {
-		c.ResponseError(errors.New("请先登录"))
+		respondMessageNotLoggedIn(c)
 		return
 	}
 	info, decodeErr := auth.Decode(raw)
 	if decodeErr != nil {
-		c.ResponseError(errors.New("token错误"))
+		respondMessageTokenInvalid(c)
 		return
 	}
 	uid := info.UID
 	if uid == "" {
-		c.ResponseError(errors.New("发送者不能为空"))
+		respondMessageRequestInvalid(c, "from_uid")
 		return
 	}
 
@@ -396,11 +398,11 @@ func (m *Message) sendMsg(c *wkhttp.Context) {
 			bothOk, err := spacepkg.CheckBothMembers(m.ctx.DB(), spaceID, uid, peerID)
 			if err != nil {
 				m.Error("校验 Space 成员关系错误", zap.Error(err))
-				c.ResponseError(errors.New("校验成员关系错误"))
+				httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 				return
 			}
 			if !bothOk {
-				c.ResponseError(errors.New("对方不在该 Space 内"))
+				httperr.ResponseErrorL(c, errcode.ErrMessagePeerNotInSpace, nil, nil)
 				return
 			}
 		} else {
@@ -408,21 +410,21 @@ func (m *Message) sendMsg(c *wkhttp.Context) {
 			sendUserIsFriend, err := m.userService.IsFriend(uid, req.ReceiveChannelID)
 			if err != nil {
 				m.Error("查询发送者与接受者好友关系错误", zap.Error(err))
-				c.ResponseError(errors.New("查询好友关系错误"))
+				httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 				return
 			}
 			if !sendUserIsFriend {
-				c.ResponseError(errors.New("发送者与接受者不是好友"))
+				httperr.ResponseErrorL(c, errcode.ErrMessageNotFriend, nil, nil)
 				return
 			}
 			recvUserIsFriend, err := m.userService.IsFriend(req.ReceiveChannelID, uid)
 			if err != nil {
 				m.Error("查询接受者与发送者好友关系错误", zap.Error(err))
-				c.ResponseError(errors.New("查询接受者与发送者好友关系错误"))
+				httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 				return
 			}
 			if !recvUserIsFriend {
-				c.ResponseError(errors.New("接受者与发送者不是好友"))
+				httperr.ResponseErrorL(c, errcode.ErrMessageNotFriend, nil, nil)
 				return
 			}
 		}
@@ -431,11 +433,11 @@ func (m *Message) sendMsg(c *wkhttp.Context) {
 		isExist, err := m.groupService.ExistMember(req.ReceiveChannelID, uid)
 		if err != nil {
 			m.Error("查询发送者是否在群内错误", zap.Error(err))
-			c.ResponseError(errors.New("查询发送者是否在群内错误"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 		if !isExist {
-			c.ResponseError(errors.New("未在群内"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageNotGroupMember, nil, nil)
 			return
 		}
 	}
@@ -444,7 +446,8 @@ func (m *Message) sendMsg(c *wkhttp.Context) {
 	senderSpaceID := spacepkg.GetSpaceID(c)
 	err = m.sendMessage(req.ReceiveChannelID, req.ReceiveChannelType, uid, req.Payload, senderSpaceID)
 	if err != nil {
-		c.ResponseError(err)
+		m.Error("发送消息失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotifyFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -675,19 +678,19 @@ func (m *Message) messageEdit(c *wkhttp.Context) {
 		ContentEdit string `json:"content_edit"`
 	}
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseErrorf("数据格式有误！", err)
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	if req.MessageID == "" {
-		c.ResponseError(errors.New("消息ID不能为空！"))
+		respondMessageRequestInvalid(c, "message_id")
 		return
 	}
 	if req.MessageSeq == 0 {
-		c.ResponseError(errors.New("消息序号不能为空！"))
+		respondMessageRequestInvalid(c, "message_seq")
 		return
 	}
 	if req.ChannelID == "" {
-		c.ResponseError(errors.New("频道ID不能为空！"))
+		respondMessageRequestInvalid(c, "channel_id")
 		return
 	}
 
@@ -697,20 +700,20 @@ func (m *Message) messageEdit(c *wkhttp.Context) {
 	resp, err := m.ctx.IMGetWithChannelAndSeqs(req.ChannelID, req.ChannelType, loginUID, messageSeqs)
 	if err != nil {
 		m.Error("查询消息错误", zap.Error(err))
-		c.ResponseError(errors.New("查询消息错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	if resp == nil || len(resp.Messages) == 0 {
-		c.ResponseError(errors.New("消息不存在"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotFound, nil, nil)
 		return
 	}
 	if resp.Messages[0].FromUID != loginUID {
-		c.ResponseError(errors.New("只能编辑自己发送的消息"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageEditOwnOnly, nil, nil)
 		return
 	}
 	// TOCTOU 交叉校验：确保权限检查的消息与待编辑的消息是同一条
 	if req.MessageID != strconv.FormatInt(resp.Messages[0].MessageID, 10) {
-		c.ResponseError(errors.New("消息ID与消息序号不匹配"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageIDSeqMismatch, nil, nil)
 		return
 	}
 
@@ -720,7 +723,7 @@ func (m *Message) messageEdit(c *wkhttp.Context) {
 	exist, err := m.messageExtraDB.existContentEdit(req.MessageID, contentMD5)
 	if err != nil {
 		m.Error("查询是否存在相同正文失败！", zap.Error(err))
-		c.ResponseError(errors.New("查询是否存在相同正文失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	if exist {
@@ -732,7 +735,7 @@ func (m *Message) messageEdit(c *wkhttp.Context) {
 	tx, err := m.db.session.Begin()
 	if err != nil {
 		m.Error("开启事务失败！", zap.Error(err))
-		c.ResponseError(errors.New("开启事务失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	defer tx.RollbackUnlessCommitted()
@@ -749,7 +752,7 @@ func (m *Message) messageEdit(c *wkhttp.Context) {
 	version, err := m.genMessageExtraSeq(fakeChannelID)
 	if err != nil {
 		m.Error("生成消息扩展序列号失败！", zap.Error(err))
-		c.ResponseError(errors.New("生成消息扩展序列号失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	err = m.messageExtraDB.insertOrUpdateContentEditTx(&messageExtraModel{
@@ -764,7 +767,7 @@ func (m *Message) messageEdit(c *wkhttp.Context) {
 	}, tx)
 	if err != nil {
 		m.Error("添加或修改编辑内容失败！", zap.Error(err))
-		c.ResponseError(errors.New("添加或修改编辑内容失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	msgIds := make([]string, 0)
@@ -783,13 +786,14 @@ func (m *Message) messageEdit(c *wkhttp.Context) {
 		if err != nil {
 			tx.Rollback()
 			m.Error("开启事件失败！", zap.Error(err))
-			c.ResponseError(errors.New("开启事件失败！"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		tx.Rollback()
-		c.ResponseErrorf("事务提交失败！", err)
+		m.Error("事务提交失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	if eventID > 0 {
@@ -806,7 +810,7 @@ func (m *Message) messageEdit(c *wkhttp.Context) {
 
 	if err != nil {
 		m.Error("发送cmd失败！", zap.Error(err))
-		c.ResponseError(err)
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotifyFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -821,11 +825,11 @@ func (m *Message) messageReaded(c *wkhttp.Context) {
 		ChannelType uint8    `json:"channel_type"`
 	}
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseErrorf("数据格式有误！", err)
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	if len(req.MessageIDs) == 0 {
-		c.ResponseError(errors.New("message_ids不能为空！"))
+		respondMessageRequestInvalid(c, "message_ids")
 		return
 	}
 	// var cloneNo string
@@ -850,18 +854,19 @@ func (m *Message) messageReaded(c *wkhttp.Context) {
 		LoginUID:    loginUID,
 	})
 	if err != nil {
-		c.ResponseErrorf("查询消息失败！", err)
+		m.Error("查询消息失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	if syncMsg == nil || len(syncMsg.Messages) <= 0 {
 		m.Warn("没有读取到消息！", zap.Strings("messages", req.MessageIDs))
-		c.ResponseError(errors.New("没有读取到消息！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotFound, nil, nil)
 		return
 	}
 	tx, err := m.ctx.DB().Begin()
 	if err != nil {
 		m.Error("开启事务失败！", zap.Error(err))
-		c.ResponseError(errors.New("开启事务失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	defer func() {
@@ -885,12 +890,14 @@ func (m *Message) messageReaded(c *wkhttp.Context) {
 	err = m.memberReadedDB.batchInsertOrUpdateTx(readedModels, tx)
 	if err != nil {
 		tx.Rollback()
-		c.ResponseErrorf("添加已读数据失败！", err)
+		m.Error("添加已读数据失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	if err := tx.Commit(); err != nil {
 		tx.Rollback()
-		c.ResponseErrorf("提交事务失败！", err)
+		m.Error("提交事务失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	// 异步处理 Redis 缓存
@@ -953,7 +960,8 @@ func (m *Message) messageReceiptList(c *wkhttp.Context) {
 	if readed == "1" {
 		memberReadedModels, err := m.memberReadedDB.queryWithMessageIDAndPage(messageIDStr, uint64(pIndex), uint64(pSize))
 		if err != nil {
-			c.ResponseErrorf("查询已读列表失败！", err)
+			m.Error("查询已读列表失败", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 		if len(memberReadedModels) > 0 {
@@ -964,7 +972,8 @@ func (m *Message) messageReceiptList(c *wkhttp.Context) {
 	}
 	userResps, err := m.userService.GetUsers(uids)
 	if err != nil {
-		c.ResponseErrorf("查询用户数据失败！", err)
+		m.Error("查询用户数据失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	userMap := map[string]*user.Resp{}
@@ -1031,7 +1040,7 @@ func (m *Message) syncMessageExtra(c *wkhttp.Context) {
 		Limit        int    `json:"limit"`  // 数据限制
 	}
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseErrorf("数据格式有误！", err)
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 
@@ -1040,7 +1049,7 @@ func (m *Message) syncMessageExtra(c *wkhttp.Context) {
 		exist, err := m.groupService.ExistMember(req.ChannelID, c.GetLoginUID())
 		if err != nil {
 			m.Error("查询是否在群内存在失败！", zap.Error(err))
-			c.ResponseError(errors.New("查询是否在群内存在失败！"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 		if !exist {
@@ -1055,7 +1064,8 @@ func (m *Message) syncMessageExtra(c *wkhttp.Context) {
 	}
 	cacheExtraVersion, err := m.getMessageExtraVersion(c.GetLoginUID(), req.Source, fakeChannelID, req.ChannelType)
 	if err != nil {
-		c.ResponseErrorf("从缓存中获取消息扩展版本失败！", err)
+		m.Error("从缓存中获取消息扩展版本失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	extraVersion := req.ExtraVersion
@@ -1064,7 +1074,8 @@ func (m *Message) syncMessageExtra(c *wkhttp.Context) {
 	} else {
 		err = m.setMessageExtraVersion(c.GetLoginUID(), fakeChannelID, req.ChannelType, req.Source, extraVersion)
 		if err != nil {
-			c.ResponseErrorf("缓存最大的消息扩展版本失败！", err)
+			m.Error("缓存最大的消息扩展版本失败", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
 
@@ -1077,12 +1088,13 @@ func (m *Message) syncMessageExtra(c *wkhttp.Context) {
 		limit = 10000
 	}
 	if strings.TrimSpace(req.ChannelID) == "" {
-		c.ResponseError(errors.New("频道ID不能为空！"))
+		respondMessageRequestInvalid(c, "channel_id")
 		return
 	}
 	extraModels, err := m.messageExtraDB.sync(extraVersion, fakeChannelID, req.ChannelType, uint64(limit), c.GetLoginUID())
 	if err != nil {
-		c.ResponseErrorf("同步消息扩展数据失败！", err)
+		m.Error("同步消息扩展数据失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	resps := make([]*messageExtraResp, 0, len(extraModels))
@@ -1099,7 +1111,7 @@ func (m *Message) syncChannelMessage(c *wkhttp.Context) {
 	var req config.SyncChannelMessageReq
 	if err := c.BindJSON(&req); err != nil {
 		m.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误！"))
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 
@@ -1108,7 +1120,7 @@ func (m *Message) syncChannelMessage(c *wkhttp.Context) {
 		exist, err := m.groupService.ExistMember(req.ChannelID, c.GetLoginUID())
 		if err != nil {
 			m.Error("查询是否在群内存在失败！", zap.Error(err))
-			c.ResponseError(errors.New("查询是否在群内存在失败！"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 		if !exist {
@@ -1125,7 +1137,7 @@ func (m *Message) syncChannelMessage(c *wkhttp.Context) {
 	resp, err := m.ctx.IMSyncChannelMessage(req)
 	if err != nil {
 		m.Error("同步频道内的消息失败！", zap.Error(err), zap.String("req", util.ToJson(req)))
-		c.ResponseError(errors.New("同步频道内的消息失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	fakeChannelID := req.ChannelID
@@ -1137,7 +1149,7 @@ func (m *Message) syncChannelMessage(c *wkhttp.Context) {
 	channelSettings, err := m.channelService.GetChannelSettings(channelIds)
 	if err != nil {
 		m.Error("查询频道设置错误", zap.Error(err), zap.String("req", util.ToJson(req)))
-		c.ResponseError(errors.New("查询频道设置错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	var channelOffsetMessageSeq uint32 = 0
@@ -1184,7 +1196,7 @@ func (m *Message) typing(c *wkhttp.Context) {
 		ChannelType uint8  `json:"channel_type"`
 	}
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(err)
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	channelID := req.ChannelID
@@ -1206,7 +1218,8 @@ func (m *Message) typing(c *wkhttp.Context) {
 		},
 	})
 	if err != nil {
-		c.ResponseError(err)
+		m.Error("发送cmd失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotifyFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -1224,7 +1237,7 @@ func (m *Message) search(c *wkhttp.Context) {
 	}
 	if err := c.BindJSON(&req); err != nil {
 		m.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(err)
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	uid := c.MustGet("uid").(string)
@@ -1246,20 +1259,20 @@ func (m *Message) search(c *wkhttp.Context) {
 	resp, err := network.Post(fmt.Sprintf("%s/message/search", m.ctx.GetConfig().WuKongIM.APIURL), []byte(util.ToJson(req)), headers)
 	if err != nil {
 		m.Error("调用搜索失败！", zap.Error(err))
-		c.ResponseError(errors.New("调用搜索失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageSearchFailed, nil, nil)
 		return
 	}
 	err = m.handlerIMError(resp)
 	if err != nil {
 		m.Error("调用搜索错误！", zap.Error(err))
-		c.ResponseError(errors.New("调用搜索错误！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageSearchFailed, nil, nil)
 		return
 	}
 	var results []map[string]interface{}
 	err = util.ReadJsonByByte([]byte(resp.Body), &results)
 	if err != nil {
 		m.Error("解析搜索数据失败！", zap.Error(err))
-		c.ResponseError(errors.New("解析搜索数据失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageSearchFailed, nil, nil)
 		return
 	}
 
@@ -1268,7 +1281,7 @@ func (m *Message) search(c *wkhttp.Context) {
 		results, err = m.filterResultsBySpace(results, spaceID)
 		if err != nil {
 			m.Error("Space 过滤失败！", zap.Error(err))
-			c.ResponseError(errors.New("Space 过滤失败！"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageSearchFailed, nil, nil)
 			return
 		}
 	}
@@ -1353,11 +1366,11 @@ func (m *Message) matchPayloadSpaceID(msg map[string]interface{}, spaceID string
 func (m *Message) voiceReaded(c *wkhttp.Context) {
 	var req *voiceReadedReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseErrorf("数据格式有误！", err)
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	if err := req.check(); err != nil {
-		c.ResponseError(err)
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	loginUID := c.GetLoginUID()
@@ -1371,7 +1384,8 @@ func (m *Message) voiceReaded(c *wkhttp.Context) {
 		VoiceReaded: 1,
 	})
 	if err != nil {
-		c.ResponseErrorf("修改语音已读状态失败！", err)
+		m.Error("修改语音已读状态失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -1388,7 +1402,7 @@ func (m *Message) syncReaction(c *wkhttp.Context) {
 	}
 	if err := c.BindJSON(&req); err != nil {
 		m.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误！"))
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	// Verify channel membership before syncing reaction data
@@ -1396,11 +1410,11 @@ func (m *Message) syncReaction(c *wkhttp.Context) {
 		isMember, err := m.groupService.ExistMember(req.ChannelID, loginUID)
 		if err != nil {
 			m.Error("查询群成员关系错误", zap.Error(err))
-			c.ResponseError(errors.New("查询群成员关系错误"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 		if !isMember {
-			c.ResponseError(errors.New("没有权限同步此频道的回应数据"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageChannelAccessDenied, nil, nil)
 			return
 		}
 	} else if req.ChannelType == common.ChannelTypePerson.Uint8() {
@@ -1408,11 +1422,11 @@ func (m *Message) syncReaction(c *wkhttp.Context) {
 			isFriend, err := m.userService.IsFriend(loginUID, req.ChannelID)
 			if err != nil {
 				m.Error("查询好友关系错误", zap.Error(err))
-				c.ResponseError(errors.New("查询好友关系错误"))
+				httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 				return
 			}
 			if !isFriend {
-				c.ResponseError(errors.New("没有权限同步此频道的回应数据"))
+				httperr.ResponseErrorL(c, errcode.ErrMessageChannelAccessDenied, nil, nil)
 				return
 			}
 		}
@@ -1443,7 +1457,7 @@ func (m *Message) syncReaction(c *wkhttp.Context) {
 	list, err := m.messageReactionDB.queryReactionWithChannelAndSeq(fakeChannelID, req.ChannelType, req.Seq, limit)
 	if err != nil {
 		m.Error("获取缓存seq错误", zap.Error(err))
-		c.ResponseError(errors.New("获取缓存seq错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 
@@ -1480,7 +1494,7 @@ func (m *Message) addOrCancelReaction(c *wkhttp.Context) {
 	}
 	if err := c.BindJSON(&req); err != nil {
 		m.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误！"))
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	// Verify channel membership before allowing reaction
@@ -1488,11 +1502,11 @@ func (m *Message) addOrCancelReaction(c *wkhttp.Context) {
 		isMember, err := m.groupService.ExistMember(req.ChannelID, loginUID)
 		if err != nil {
 			m.Error("查询群成员关系错误", zap.Error(err))
-			c.ResponseError(errors.New("查询群成员关系错误"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 		if !isMember {
-			c.ResponseError(errors.New("没有权限操作此频道"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageChannelAccessDenied, nil, nil)
 			return
 		}
 	} else if req.ChannelType == common.ChannelTypePerson.Uint8() {
@@ -1500,11 +1514,11 @@ func (m *Message) addOrCancelReaction(c *wkhttp.Context) {
 			isFriend, err := m.userService.IsFriend(loginUID, req.ChannelID)
 			if err != nil {
 				m.Error("查询好友关系错误", zap.Error(err))
-				c.ResponseError(errors.New("查询好友关系错误"))
+				httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 				return
 			}
 			if !isFriend {
-				c.ResponseError(errors.New("没有权限操作此频道"))
+				httperr.ResponseErrorL(c, errcode.ErrMessageChannelAccessDenied, nil, nil)
 				return
 			}
 		}
@@ -1513,7 +1527,7 @@ func (m *Message) addOrCancelReaction(c *wkhttp.Context) {
 	model, err := m.messageReactionDB.queryReactionWithUIDAndMessageID(loginUID, req.MessageID)
 	if err != nil {
 		m.Error("查询登录用户是否回应消息错误", zap.Error(err))
-		c.ResponseError(errors.New("查询登录用户是否回应消息错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	fakeChannelID := req.ChannelID
@@ -1522,7 +1536,8 @@ func (m *Message) addOrCancelReaction(c *wkhttp.Context) {
 	}
 	seq, err := m.genMessageReactionSeq(fakeChannelID) // 下次回复seq
 	if err != nil {
-		c.ResponseError(err)
+		m.Error("生成消息回应序列号失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	if model == nil {
@@ -1539,7 +1554,7 @@ func (m *Message) addOrCancelReaction(c *wkhttp.Context) {
 		})
 		if err != nil {
 			m.Error("新增消息回应错误", zap.Error(err))
-			c.ResponseError(errors.New("新增消息回应错误"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
 	} else {
@@ -1559,7 +1574,7 @@ func (m *Message) addOrCancelReaction(c *wkhttp.Context) {
 		err = m.messageReactionDB.updateReactionStatus(model)
 		if err != nil {
 			m.Error("修改消息回应错误", zap.Error(err))
-			c.ResponseError(errors.New("修改消息回应错误"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
 	}
@@ -1574,7 +1589,8 @@ func (m *Message) addOrCancelReaction(c *wkhttp.Context) {
 	})
 	if err != nil {
 		m.Error("发送同步命令失败！", zap.Error(err))
-		c.ResponseErrorf("发送同步命令失败！", err)
+		m.Error("发送同步命令失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotifyFailed, nil, nil)
 		return
 	}
 
@@ -1603,7 +1619,7 @@ func (m *Message) syncack(c *wkhttp.Context) {
 	lastMessageSeq, err := strconv.ParseUint(lastMessageSeqStr, 10, 64)
 	if err != nil {
 		m.Error("last_message_seq格式有误！", zap.String("last_message_seq", lastMessageSeqStr))
-		c.ResponseError(errors.New("last_message_seq格式有误！"))
+		respondMessageRequestInvalid(c, "last_message_seq")
 		return
 	}
 	err = m.ctx.IMSyncMessageAck(&config.SyncackReq{
@@ -1612,7 +1628,7 @@ func (m *Message) syncack(c *wkhttp.Context) {
 	})
 	if err != nil {
 		m.Error("同步消息回执失败！", zap.Error(err), zap.String("uid", uid), zap.String("last_message_seq", lastMessageSeqStr))
-		c.ResponseError(errors.New("同步消息回执失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -1624,7 +1640,7 @@ func (m *Message) sync(c *wkhttp.Context) {
 	var req syncReq
 	if err := c.BindJSON(&req); err != nil {
 		m.Error(common.ErrData.Error(), zap.Error(err))
-		c.ResponseError(common.ErrData)
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	resps, err := m.ctx.IMSyncMessage(&config.MsgSyncReq{
@@ -1634,7 +1650,7 @@ func (m *Message) sync(c *wkhttp.Context) {
 	})
 	if err != nil {
 		m.Error("同步消息失败！", zap.Error(err), zap.String("uid", uid))
-		c.ResponseError(errors.New("同步消息失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	messageIDs := make([]string, 0, len(resps))
@@ -1668,7 +1684,7 @@ func (m *Message) sync(c *wkhttp.Context) {
 	channelOffsetM, err := m.channelOffsetDB.queryWithUIDAndChannel(c.GetLoginUID(), req.ChannelID, req.ChannelType)
 	if err != nil {
 		m.Error("查询偏移量失败！", zap.Error(err))
-		c.ResponseError(errors.New("查询偏移量失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	// 频道偏移
@@ -1681,7 +1697,7 @@ func (m *Message) sync(c *wkhttp.Context) {
 	channelSettings, err := m.channelService.GetChannelSettings(channelIds)
 	if err != nil {
 		m.Error("查询频道设置错误", zap.Error(err), zap.String("req", util.ToJson(req)))
-		c.ResponseError(errors.New("查询频道设置错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	var channelOffsetMessageSeq uint32 = 0
@@ -1717,11 +1733,11 @@ func (m *Message) mutualDelete(c *wkhttp.Context) {
 	var req deleteReq
 	if err := c.BindJSON(&req); err != nil {
 		m.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误！"))
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	if err := req.check(); err != nil {
-		c.ResponseError(err)
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	messageSeqs := make([]uint32, 0)
@@ -1733,12 +1749,12 @@ func (m *Message) mutualDelete(c *wkhttp.Context) {
 	resp, err := m.ctx.IMGetWithChannelAndSeqs(req.ChannelID, req.ChannelType, loginUID, messageSeqs)
 	if err != nil {
 		m.Error("查询消息错误", zap.Error(err), zap.String("req", util.ToJson(req)))
-		c.ResponseError(errors.New("查询消息错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 
 	if resp == nil || len(resp.Messages) == 0 {
-		c.ResponseError(errors.New("消息不存在"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotFound, nil, nil)
 		return
 	}
 	var (
@@ -1752,14 +1768,14 @@ func (m *Message) mutualDelete(c *wkhttp.Context) {
 		isGroupMember, err = m.groupService.ExistMember(req.ChannelID, loginUID)
 		if err != nil {
 			m.Error("查询群成员关系失败", zap.Error(err))
-			c.ResponseError(errors.New("查询群成员关系失败"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 		if isGroupMember {
 			isGroupManager, err = m.groupService.IsCreatorOrManager(req.ChannelID, loginUID)
 			if err != nil {
 				m.Error("查询登录用户群内权限错误", zap.Error(err))
-				c.ResponseError(errors.New("查询登录用户群内权限错误"))
+				httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 				return
 			}
 		}
@@ -1767,20 +1783,20 @@ func (m *Message) mutualDelete(c *wkhttp.Context) {
 		parentGroupNo, _, perr := thread.ParseChannelID(req.ChannelID)
 		if perr != nil {
 			m.Error("解析子区频道ID失败", zap.Error(perr), zap.String("channelID", req.ChannelID))
-			c.ResponseError(errors.New("用户无权删除此消息"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageDeleteForbidden, nil, nil)
 			return
 		}
 		isParentGroupMember, err = m.groupService.ExistMember(parentGroupNo, loginUID)
 		if err != nil {
 			m.Error("查询父群成员关系失败", zap.Error(err))
-			c.ResponseError(errors.New("查询父群成员关系失败"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
 		if isParentGroupMember {
 			isParentGroupManager, err = m.groupService.IsCreatorOrManager(parentGroupNo, loginUID)
 			if err != nil {
 				m.Error("查询父群管理员身份失败", zap.Error(err))
-				c.ResponseError(errors.New("查询父群管理员身份失败"))
+				httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 				return
 			}
 		}
@@ -1794,19 +1810,19 @@ func (m *Message) mutualDelete(c *wkhttp.Context) {
 		isParentGroupMember,
 		isParentGroupManager,
 	); err != nil {
-		c.ResponseError(err)
+		httperr.ResponseErrorL(c, errcode.ErrMessageDeleteForbidden, nil, nil)
 		return
 	}
 	// TOCTOU 交叉校验：确保权限检查的消息与待删除的消息是同一条
 	resolvedMessageID := strconv.FormatInt(resp.Messages[0].MessageID, 10)
 	if req.MessageID != resolvedMessageID {
-		c.ResponseError(errors.New("消息ID与消息序号不匹配"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageIDSeqMismatch, nil, nil)
 		return
 	}
 	version, err := m.genMessageExtraSeq(fakeChannelID)
 	if err != nil {
 		m.Error("生成消息扩展序列号失败！", zap.Error(err))
-		c.ResponseError(errors.New("生成消息扩展序列号失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	err = m.messageExtraDB.insertOrUpdateDeleted(&messageExtraModel{
@@ -1818,7 +1834,7 @@ func (m *Message) mutualDelete(c *wkhttp.Context) {
 	})
 	if err != nil {
 		m.Error("删除消息错误", zap.Error(err))
-		c.ResponseError(errors.New("删除消息错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	err = m.ctx.SendCMD(config.MsgCMDReq{
@@ -1831,7 +1847,7 @@ func (m *Message) mutualDelete(c *wkhttp.Context) {
 
 	if err != nil {
 		m.Error("发送cmd失败！", zap.Error(err))
-		c.ResponseError(err)
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotifyFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -1843,16 +1859,16 @@ func (m *Message) delete(c *wkhttp.Context) {
 	var reqs []*deleteReq
 	if err := c.BindJSON(&reqs); err != nil {
 		m.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误！"))
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	if len(reqs) == 0 {
-		c.ResponseError(errors.New("参数不能为空！"))
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	for _, req := range reqs {
 		if err := req.check(); err != nil {
-			c.ResponseError(err)
+			respondMessageRequestInvalid(c, "")
 			return
 		}
 	}
@@ -1870,11 +1886,11 @@ func (m *Message) delete(c *wkhttp.Context) {
 			isMember, err := m.groupService.ExistMember(req.ChannelID, loginUID)
 			if err != nil {
 				m.Error("查询群成员失败", zap.Error(err))
-				c.ResponseError(errors.New("查询群成员失败"))
+				httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 				return
 			}
 			if !isMember {
-				c.ResponseError(errors.New("非频道成员，无权操作"))
+				httperr.ResponseErrorL(c, errcode.ErrMessageChannelAccessDenied, nil, nil)
 				return
 			}
 		}
@@ -1883,7 +1899,7 @@ func (m *Message) delete(c *wkhttp.Context) {
 	tx, err := m.ctx.DB().Begin()
 	if err != nil {
 		m.Error("开启事务失败！", zap.Error(err))
-		c.ResponseError(errors.New("开启事务失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	defer func() {
@@ -1904,14 +1920,14 @@ func (m *Message) delete(c *wkhttp.Context) {
 		if err != nil {
 			tx.Rollback()
 			m.Error("删除消息失败！", zap.Error(err))
-			c.ResponseError(errors.New("删除消息失败！"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		tx.Rollback()
 		m.Error("提交事务失败！", zap.Error(err))
-		c.ResponseError(errors.New("提交事务失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 
@@ -1926,7 +1942,7 @@ func (m *Message) delete(c *wkhttp.Context) {
 	})
 	if err != nil {
 		m.Error("发送命令失败", zap.Error(err))
-		c.ResponseError(errors.New("发送命令失败"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotifyFailed, nil, nil)
 		return
 	}
 
@@ -1950,13 +1966,13 @@ func (m *Message) offset(c *wkhttp.Context) {
 	}
 	if err := c.BindJSON(&req); err != nil {
 		m.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误！"))
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 	channelOffsetM, err := m.channelOffsetDB.queryWithUIDAndChannel(c.GetLoginUID(), req.ChannelID, req.ChannelType)
 	if err != nil {
 		m.Error("查询频道偏移数据失败！", zap.Error(err))
-		c.ResponseError(errors.New("查询频道偏移数据失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	if channelOffsetM != nil {
@@ -1974,7 +1990,7 @@ func (m *Message) offset(c *wkhttp.Context) {
 	})
 	if err != nil {
 		m.Error("清除失败！", zap.Error(err))
-		c.ResponseError(errors.New("清除失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	// 清除最近会话的未读数（这里不管有没有未读数都调用清除）
@@ -1992,7 +2008,7 @@ func (m *Message) offset(c *wkhttp.Context) {
 	reminders, err := m.remindersDB.queryWithUIDAndChannel(loginUID, req.ChannelID, req.ChannelType, req.MessageSeq)
 	if err != nil {
 		m.Error("查询用户提醒项失败！", zap.Error(err))
-		c.ResponseError(errors.New("查询用户提醒项失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	reminderIds := make([]int64, 0)
@@ -2008,7 +2024,7 @@ func (m *Message) offset(c *wkhttp.Context) {
 		tx, err := m.ctx.DB().Begin()
 		if err != nil {
 			m.Error("开启事务失败！", zap.Error(err))
-			c.ResponseError(errors.New("开启事务失败！"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
 		defer tx.RollbackUnlessCommitted()
@@ -2021,27 +2037,28 @@ func (m *Message) offset(c *wkhttp.Context) {
 		if err != nil {
 			tx.Rollback()
 			m.Error("更新提醒项状态失败！", zap.Error(err))
-			c.ResponseError(errors.New("更新提醒项状态失败！"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
 		for _, id := range reminderIds {
 			version, err := m.ctx.GenSeq(common.RemindersKey)
 			if err != nil {
-				c.ResponseError(err)
+				m.Error("生成提醒项序列号失败", zap.Error(err))
+				httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 				return
 			}
 			err = m.remindersDB.updateVersionTx(version, id, tx)
 			if err != nil {
 				tx.Rollback()
 				m.Error("更新提醒项版本失败！", zap.Error(err))
-				c.ResponseError(errors.New("更新提醒项版本失败！"))
+				httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 				return
 			}
 		}
 		if err := tx.Commit(); err != nil {
 			tx.Rollback()
 			m.Error("提交事务失败！", zap.Error(err))
-			c.ResponseError(errors.New("提交事务失败！"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
 		err = m.ctx.SendCMD(config.MsgCMDReq{
@@ -2206,7 +2223,7 @@ func (m *Message) revoke(c *wkhttp.Context) {
 	channelType := c.Query("channel_type")
 
 	if strings.TrimSpace(clientMsgNo) == "" {
-		c.ResponseError(errors.New("撤回主键参数错误！"))
+		respondMessageRequestInvalid(c, "")
 		return
 	}
 
@@ -2227,18 +2244,19 @@ func (m *Message) revoke(c *wkhttp.Context) {
 	})
 	if err != nil {
 		m.Error("查询IM消息错误", zap.String("fakeChannelID", fakeChannelID), zap.String("clientMsgNo", clientMsgNo), zap.String("loginUID", c.GetLoginUID()))
-		c.ResponseErrorf("查询IM消息错误", err)
+		m.Error("查询IM消息错误", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	if syncMsgs == nil || len(syncMsgs.Messages) == 0 {
-		c.ResponseErrorf("未查询到撤回消息！", err)
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotFound, nil, nil)
 		return
 	}
 	syncMsg := syncMsgs.Messages[0]
 	// TOCTOU 交叉校验：若用户传入了 message_id，必须与 clientMsgNo 反查到的 messageID 一致，
 	// 防止通过自己消息的 clientMsgNo 配合他人消息的 messageID 撤回任意消息（issue #1048）。
 	if err := verifyRevokeMessageID(messageID, syncMsg.MessageID); err != nil {
-		c.ResponseError(err)
+		httperr.ResponseErrorL(c, errcode.ErrMessageIDSeqMismatch, nil, nil)
 		return
 	}
 	// 下游操作统一改用 IM 反查到的可信 channelID / channelType，
@@ -2262,11 +2280,11 @@ func (m *Message) revoke(c *wkhttp.Context) {
 	allow, err := m.hasRevokePermission(message, c.GetLoginUID())
 	if err != nil {
 		m.Error("权限判断失败！", zap.Error(err))
-		c.ResponseError(errors.New("权限判断失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	if !allow {
-		c.ResponseError(errors.New("无权限撤回此消息！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageRecallForbidden, nil, nil)
 		return
 	}
 
@@ -2276,7 +2294,7 @@ func (m *Message) revoke(c *wkhttp.Context) {
 		messageTime := time.Unix(int64(syncMsg.Timestamp), 0)
 		elapsed := time.Since(messageTime)
 		if elapsed.Seconds() > DefaultRevokeTimeout {
-			c.ResponseError(errors.New("消息已超过撤回时限！"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageRecallTimeExceeded, nil, nil)
 			return
 		}
 	}
@@ -2288,13 +2306,13 @@ func (m *Message) revoke(c *wkhttp.Context) {
 	messageExtra, err := m.messageExtraDB.queryWithMessageID(messageIDStr)
 	if err != nil {
 		m.Error("查询消息扩展错误", zap.Error(err))
-		c.ResponseError(errors.New("查询消息扩展错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	tx, err := m.db.session.Begin()
 	if err != nil {
 		m.Error("开启事务失败！", zap.Error(err))
-		c.ResponseError(errors.New("开启事务失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	defer func() {
@@ -2306,7 +2324,7 @@ func (m *Message) revoke(c *wkhttp.Context) {
 	version, err := m.genMessageExtraSeq(fakeChannelID)
 	if err != nil {
 		m.Error("生成消息扩展序列号失败！", zap.Error(err), zap.String("channelID", fakeChannelID))
-		c.ResponseError(errors.New("生成消息扩展序列号失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	if messageExtra != nil {
@@ -2317,7 +2335,8 @@ func (m *Message) revoke(c *wkhttp.Context) {
 		if err != nil {
 			tx.Rollback()
 			m.Error("更新消息扩展数据失败！", zap.Error(err), zap.String("messageID", messageIDStr), zap.String("channelID", fakeChannelID))
-			c.ResponseErrorf("更新消息为撤回状态失败！", err)
+			m.Error("更新消息为撤回状态失败", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
 	} else {
@@ -2335,7 +2354,8 @@ func (m *Message) revoke(c *wkhttp.Context) {
 		if err != nil {
 			tx.Rollback()
 			m.Error("新增消息扩展数据失败！", zap.Error(err), zap.String("messageID", messageIDStr), zap.String("channelID", fakeChannelID))
-			c.ResponseErrorf("新增消息为撤回状态失败！", err)
+			m.Error("新增消息为撤回状态失败", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
 	}
@@ -2355,18 +2375,20 @@ func (m *Message) revoke(c *wkhttp.Context) {
 		if err != nil {
 			tx.Rollback()
 			m.Error("开启事件失败！", zap.Error(err))
-			c.ResponseError(errors.New("开启事件失败！"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
 	}
 	err = m.deletePinnedMessage(channelID, uint8(channelTypeI), msgIds, loginUID, tx)
 	if err != nil {
-		c.ResponseError(err)
+		m.Error("删除置顶消息失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	if err := tx.Commit(); err != nil {
 		tx.Rollback()
-		c.ResponseErrorf("事务提交失败！", err)
+		m.Error("事务提交失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
 	if eventID > 0 {
@@ -2385,7 +2407,7 @@ func (m *Message) revoke(c *wkhttp.Context) {
 		})
 		if err != nil {
 			m.Error("发送撤回消息失败！", zap.Error(err))
-			c.ResponseError(errors.New("发送撤回消息失败！"))
+			httperr.ResponseErrorL(c, errcode.ErrMessageNotifyFailed, nil, nil)
 			return
 		}
 	}
@@ -2401,7 +2423,7 @@ func (m *Message) syncProhibitWords(c *wkhttp.Context) {
 	list, err := m.db.queryProhibitWordsWithVersion(maxVersion)
 	if err != nil {
 		m.Error("同步违禁词错误", zap.Error(err))
-		c.ResponseError(errors.New("同步违禁词错误"))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
 	result := make([]*ProhibitWordResp, 0)

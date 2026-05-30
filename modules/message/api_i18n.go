@@ -42,6 +42,7 @@ func respondMessagePinnedLimitExceeded(c *wkhttp.Context, max int) {
 var (
 	errSharedAuthRequired = mustLookupSharedCode("err.shared.auth.required")
 	errSharedTokenInvalid = mustLookupSharedCode("err.shared.auth.token_invalid")
+	errSharedForbidden    = mustLookupSharedCode("err.shared.auth.forbidden")
 )
 
 func mustLookupSharedCode(id string) codes.Code {
@@ -63,4 +64,11 @@ func respondMessageNotLoggedIn(c *wkhttp.Context) {
 // proxy-send token-parse guards ("token错误" / "解析token错误").
 func respondMessageTokenInvalid(c *wkhttp.Context) {
 	httperr.ResponseErrorL(c, errSharedTokenInvalid, nil, nil)
+}
+
+// respondMessageForbidden renders the shared 403 envelope for the management
+// console role guards (CheckLoginRoleIsSuperAdmin), mirroring the user/group
+// manager-forbidden mapping.
+func respondMessageForbidden(c *wkhttp.Context) {
+	httperr.ResponseErrorL(c, errSharedForbidden, nil, nil)
 }
