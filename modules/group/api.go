@@ -425,8 +425,10 @@ func (g *Group) avatarUpload(c *wkhttp.Context) {
 	}
 	file, _, err := c.Request.FormFile("file")
 	if err != nil {
+		// FormFile 在 file 字段缺失/为空时返回 http.ErrMissingFile —— 纯客户端
+		// 错误,应为 400,而非内部存储失败。与上面 ParseMultipartForm 分支一致。
 		g.Error("读取文件失败！", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
+		respondGroupRequestInvalid(c, "file")
 		return
 	}
 	defer file.Close()
@@ -2691,8 +2693,9 @@ func (g *Group) groupSettingUpdate(c *wkhttp.Context) {
 			return nil, err
 		}
 		if group == nil {
-			g.Error("修改的群不存在", zap.Error(err))
-			return nil, errors.New("修改的群不存在")
+			// 缺失 / 已解散群 → 404,复用 getGroupInfo 的 not-found sentinel,
+			// 由 respondGroupInfoError 分流,而非塌缩成内部查询失败。
+			return nil, errGroupInfoNotFound
 		}
 		return group, nil
 	}
@@ -2715,6 +2718,11 @@ func (g *Group) groupSettingUpdate(c *wkhttp.Context) {
 			}
 			err = settingActionFnc(ctx, value)
 			if err != nil {
+				// 错类型的设置值是 400 校验错误,不是存储失败。
+				if errors.Is(err, errSettingInvalidValueType) {
+					respondGroupRequestInvalid(c, key)
+					return
+				}
 				g.Error("修改群设置信息错误", zap.Error(err))
 				httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 				return
@@ -2725,8 +2733,8 @@ func (g *Group) groupSettingUpdate(c *wkhttp.Context) {
 		if groupUpdateActionFnc != nil {
 			group, err := getGroupFnc()
 			if err != nil {
-				g.Error("获取群信息失败！", zap.Error(err))
-				httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+				// 群不存在 → 404,查询失败 → 500;getGroupFnc 已记录 DB 错误。
+				respondGroupInfoError(c, err)
 				return
 			}
 			ctx := &groupUpdateContext{
@@ -2737,6 +2745,16 @@ func (g *Group) groupSettingUpdate(c *wkhttp.Context) {
 			}
 			err = groupUpdateActionFnc(ctx, value)
 			if err != nil {
+				// 非管理员/群主 → 403;错类型 / allow_external 越界 → 400 校验错误。
+				// 仅真正的 DB / 事务 / 事件失败才落到 Internal=true 的 store_failed。
+				if errors.Is(err, errGroupUpdateForbidden) {
+					httperr.ResponseErrorL(c, errcode.ErrGroupCreatorOrManagerOnly, nil, nil)
+					return
+				}
+				if errors.Is(err, errSettingInvalidValueType) || errors.Is(err, errSettingAllowExternalRange) {
+					respondGroupRequestInvalid(c, key)
+					return
+				}
 				g.Error("修改群设置信息错误", zap.Error(err))
 				httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 				return

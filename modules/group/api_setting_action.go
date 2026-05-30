@@ -13,6 +13,19 @@ import (
 	"go.uber.org/zap"
 )
 
+// Action-layer sentinel errors. groupSettingUpdate's dispatch classifies these
+// via errors.Is so client-facing failures are not collapsed into Internal=true
+// 500 (ErrGroupStoreFailed). Genuine DB/event failures keep returning their own
+// errors and fall through to the store_failed fallback.
+var (
+	// errSettingInvalidValueType marks a malformed / wrong-typed setting value (client 400).
+	errSettingInvalidValueType = errors.New("invalid value type")
+	// errSettingAllowExternalRange marks an out-of-range allow_external value (client 400).
+	errSettingAllowExternalRange = errors.New("allow_external only accepts 0 or 1")
+	// errGroupUpdateForbidden marks a non-manager/creator attempting a group-attr update (client 403).
+	errGroupUpdateForbidden = errors.New("没有权限！")
+)
+
 // safeIntFromFloat64 safely converts an interface{} to int via float64.
 func safeIntFromFloat64(v interface{}) (int, bool) {
 	f, ok := v.(float64)
@@ -91,7 +104,7 @@ func (g *groupUpdateContext) checkPermissions() error {
 		return err
 	}
 	if !isManager {
-		return errors.New("没有权限！")
+		return errGroupUpdateForbidden
 	}
 	return nil
 }
@@ -153,7 +166,7 @@ var settingActionMap = map[string]groupSettingActionFnc{
 	"mute": func(ctx *settingContext, value interface{}) error { // 免打扰
 		val, ok := safeIntFromFloat64(value)
 		if !ok {
-			return errors.New("invalid value type")
+			return errSettingInvalidValueType
 		}
 		ctx.groupSetting.Mute = val
 		return ctx.updateSettingAndSendCMD()
@@ -161,7 +174,7 @@ var settingActionMap = map[string]groupSettingActionFnc{
 	"top": func(ctx *settingContext, value interface{}) error { // 会话置顶
 		val, ok := safeIntFromFloat64(value)
 		if !ok {
-			return errors.New("invalid value type")
+			return errSettingInvalidValueType
 		}
 		ctx.groupSetting.Top = val
 		return ctx.updateSettingAndSendCMD()
@@ -169,7 +182,7 @@ var settingActionMap = map[string]groupSettingActionFnc{
 	"save": func(ctx *settingContext, value interface{}) error { // 保存群
 		val, ok := safeIntFromFloat64(value)
 		if !ok {
-			return errors.New("invalid value type")
+			return errSettingInvalidValueType
 		}
 		ctx.groupSetting.Save = val
 		return ctx.updateSettingAndSendCMD()
@@ -177,7 +190,7 @@ var settingActionMap = map[string]groupSettingActionFnc{
 	"show_nick": func(ctx *settingContext, value interface{}) error { // 是否显示昵称
 		val, ok := safeIntFromFloat64(value)
 		if !ok {
-			return errors.New("invalid value type")
+			return errSettingInvalidValueType
 		}
 		ctx.groupSetting.ShowNick = val
 		return ctx.updateSettingAndSendCMD()
@@ -185,7 +198,7 @@ var settingActionMap = map[string]groupSettingActionFnc{
 	"chat_pwd_on": func(ctx *settingContext, value interface{}) error { // 聊天密码
 		val, ok := safeIntFromFloat64(value)
 		if !ok {
-			return errors.New("invalid value type")
+			return errSettingInvalidValueType
 		}
 		ctx.groupSetting.ChatPwdOn = val
 		return ctx.updateSettingAndSendCMD()
@@ -193,7 +206,7 @@ var settingActionMap = map[string]groupSettingActionFnc{
 	"screenshot": func(ctx *settingContext, value interface{}) error { // 截屏
 		val, ok := safeIntFromFloat64(value)
 		if !ok {
-			return errors.New("invalid value type")
+			return errSettingInvalidValueType
 		}
 		ctx.groupSetting.Screenshot = val
 		return ctx.updateSettingAndSendCMD()
@@ -201,7 +214,7 @@ var settingActionMap = map[string]groupSettingActionFnc{
 	"join_group_remind": func(ctx *settingContext, value interface{}) error { // 进群提醒
 		val, ok := safeIntFromFloat64(value)
 		if !ok {
-			return errors.New("invalid value type")
+			return errSettingInvalidValueType
 		}
 		ctx.groupSetting.JoinGroupRemind = val
 		return ctx.updateSettingAndSendCMD()
@@ -209,7 +222,7 @@ var settingActionMap = map[string]groupSettingActionFnc{
 	"revoke_remind": func(ctx *settingContext, value interface{}) error { // 撤回提醒
 		val, ok := safeIntFromFloat64(value)
 		if !ok {
-			return errors.New("invalid value type")
+			return errSettingInvalidValueType
 		}
 		ctx.groupSetting.RevokeRemind = val
 		return ctx.updateSettingAndSendCMD()
@@ -217,7 +230,7 @@ var settingActionMap = map[string]groupSettingActionFnc{
 	"receipt": func(ctx *settingContext, value interface{}) error { // 消息已读回执
 		val, ok := safeIntFromFloat64(value)
 		if !ok {
-			return errors.New("invalid value type")
+			return errSettingInvalidValueType
 		}
 		ctx.groupSetting.Receipt = val
 		return ctx.updateSettingAndSendCMD()
@@ -225,7 +238,7 @@ var settingActionMap = map[string]groupSettingActionFnc{
 	"remark": func(ctx *settingContext, value interface{}) error { // 群备注
 		val, ok := safeString(value)
 		if !ok {
-			return errors.New("invalid value type")
+			return errSettingInvalidValueType
 		}
 		ctx.groupSetting.Remark = val
 		return ctx.updateSettingAndSendCMD()
@@ -233,7 +246,7 @@ var settingActionMap = map[string]groupSettingActionFnc{
 	"flame": func(ctx *settingContext, value interface{}) error { // 阅后即焚开启
 		val, ok := safeIntFromFloat64(value)
 		if !ok {
-			return errors.New("invalid value type")
+			return errSettingInvalidValueType
 		}
 		ctx.groupSetting.Flame = val
 		return ctx.updateSettingAndSendCMD()
@@ -241,7 +254,7 @@ var settingActionMap = map[string]groupSettingActionFnc{
 	"flame_second": func(ctx *settingContext, value interface{}) error { // 阅后即焚时间
 		val, ok := safeIntFromFloat64(value)
 		if !ok {
-			return errors.New("invalid value type")
+			return errSettingInvalidValueType
 		}
 		ctx.groupSetting.FlameSecond = val
 		return ctx.updateSettingAndSendCMD()
@@ -255,7 +268,7 @@ var groupUpdateActionMap = map[string]groupUpdateActionFnc{
 		}
 		val, ok := safeIntFromFloat64(value)
 		if !ok {
-			return errors.New("invalid value type")
+			return errSettingInvalidValueType
 		}
 		ctx.groupModel.Forbidden = val
 
@@ -296,7 +309,7 @@ var groupUpdateActionMap = map[string]groupUpdateActionFnc{
 		}
 		val, ok := safeIntFromFloat64(value)
 		if !ok {
-			return errors.New("invalid value type")
+			return errSettingInvalidValueType
 		}
 		ctx.groupModel.ForbiddenAddFriend = val
 		err := ctx.updateGroup()
@@ -315,7 +328,7 @@ var groupUpdateActionMap = map[string]groupUpdateActionFnc{
 		}
 		val, ok := safeIntFromFloat64(value)
 		if !ok {
-			return errors.New("invalid value type")
+			return errSettingInvalidValueType
 		}
 		ctx.groupModel.Invite = val
 
@@ -332,7 +345,7 @@ var groupUpdateActionMap = map[string]groupUpdateActionFnc{
 		}
 		val, ok := safeIntFromFloat64(value)
 		if !ok {
-			return errors.New("invalid value type")
+			return errSettingInvalidValueType
 		}
 		ctx.groupModel.AllowViewHistoryMsg = val
 
@@ -350,7 +363,7 @@ var groupUpdateActionMap = map[string]groupUpdateActionFnc{
 		}
 		val, ok := safeIntFromFloat64(value)
 		if !ok {
-			return errors.New("invalid value type")
+			return errSettingInvalidValueType
 		}
 		ctx.groupModel.AllowMemberPinnedMessage = val
 		err := ctx.updateGroup()
@@ -367,10 +380,10 @@ var groupUpdateActionMap = map[string]groupUpdateActionFnc{
 		}
 		val, ok := safeIntFromFloat64(value)
 		if !ok {
-			return errors.New("invalid value type")
+			return errSettingInvalidValueType
 		}
 		if val != 0 && val != 1 {
-			return errors.New("allow_external only accepts 0 or 1")
+			return errSettingAllowExternalRange
 		}
 		ctx.groupModel.AllowExternal = val
 		if err := ctx.updateGroup(); err != nil {
