@@ -1082,6 +1082,12 @@ func (g *Group) memberAdd(c *wkhttp.Context) {
 			httperr.ResponseErrorL(c, errcode.ErrGroupExternalJoinForbidden, nil, nil)
 			return
 		}
+		// 去重 / trim 后无有效成员（如 members 全是空白串）是 400 校验错误，
+		// 不是存储失败。
+		if strings.Contains(err.Error(), "no valid members") {
+			respondGroupRequestInvalid(c, "members")
+			return
+		}
 		g.Error("添加群成员失败", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
@@ -2610,6 +2616,12 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 		OperatorName: operatorName,
 	})
 	if err != nil {
+		// 后台管理路径会跳过普通成员的目标预校验；若删除的 UID 全不在群内，
+		// RemoveGroupMembers 返回业务错误，应是 404 而非存储失败。
+		if strings.Contains(err.Error(), "none of the members are in this group") {
+			httperr.ResponseErrorL(c, errcode.ErrGroupMemberNotInGroup, nil, nil)
+			return
+		}
 		g.Error("移除群成员失败", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
