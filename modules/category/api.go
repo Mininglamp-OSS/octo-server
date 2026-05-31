@@ -10,6 +10,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	convext "github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"github.com/gocraft/dbr/v2"
@@ -58,36 +60,36 @@ func (c *Category) create(ctx *wkhttp.Context) {
 	isMember, err := spacepkg.CheckMembership(c.db.session, spaceID, loginUID)
 	if err != nil {
 		c.Error("检查空间成员失败", zap.Error(err))
-		ctx.ResponseError(errors.New("检查空间成员失败"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
 		return
 	}
 	if !isMember {
-		ctx.ResponseError(errors.New("你不是该空间成员"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategorySpaceMemberRequired, nil, nil)
 		return
 	}
 
 	var req createCategoryReq
 	if err := ctx.BindJSON(&req); err != nil {
-		ctx.ResponseError(errors.New("请求参数错误"))
+		respondCategoryRequestInvalid(ctx, "")
 		return
 	}
 	if req.Name == "" {
-		ctx.ResponseError(errors.New("类别名称不能为空"))
+		respondCategoryRequestInvalid(ctx, "name")
 		return
 	}
 	if len([]rune(req.Name)) > 100 {
-		ctx.ResponseError(errors.New("类别名称不能超过100个字符"))
+		respondCategoryNameTooLong(ctx, 100)
 		return
 	}
 
 	count, err := c.db.countCategoriesByUIDAndSpaceID(loginUID, spaceID)
 	if err != nil {
 		c.Error("查询类别数量失败", zap.Error(err))
-		ctx.ResponseError(errors.New("查询类别数量失败"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
 		return
 	}
 	if count >= 20 {
-		ctx.ResponseError(errors.New("每个空间最多创建20个分类"))
+		respondCategoryLimitExceeded(ctx, 20)
 		return
 	}
 
@@ -95,7 +97,7 @@ func (c *Category) create(ctx *wkhttp.Context) {
 	nextSort, err := c.db.maxSortByUIDAndSpaceID(loginUID, spaceID)
 	if err != nil {
 		c.Error("查询排序值失败", zap.Error(err))
-		ctx.ResponseError(errors.New("创建类别失败"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
 		return
 	}
 	nextSort++
@@ -109,7 +111,7 @@ func (c *Category) create(ctx *wkhttp.Context) {
 	})
 	if err != nil {
 		c.Error("创建类别失败", zap.Error(err))
-		ctx.ResponseError(errors.New("创建类别失败"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryStoreFailed, nil, nil)
 		return
 	}
 
@@ -130,11 +132,11 @@ func (c *Category) list(ctx *wkhttp.Context) {
 	isMember, err := spacepkg.CheckMembership(c.db.session, spaceID, loginUID)
 	if err != nil {
 		c.Error("检查空间成员失败", zap.Error(err))
-		ctx.ResponseError(errors.New("检查空间成员失败"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
 		return
 	}
 	if !isMember {
-		ctx.ResponseError(errors.New("你不是该空间成员"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategorySpaceMemberRequired, nil, nil)
 		return
 	}
 
@@ -148,14 +150,14 @@ func (c *Category) list(ctx *wkhttp.Context) {
 	categories, err := c.db.queryCategoriesByUIDAndSpaceID(loginUID, spaceID)
 	if err != nil {
 		c.Error("查询类别失败", zap.Error(err))
-		ctx.ResponseError(errors.New("查询类别失败"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
 		return
 	}
 
 	groups, err := c.db.queryUserGroupsInSpace(loginUID, spaceID)
 	if err != nil {
 		c.Error("查询群组失败", zap.Error(err))
-		ctx.ResponseError(errors.New("查询群组失败"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
 		return
 	}
 
@@ -180,14 +182,14 @@ func (c *Category) list(ctx *wkhttp.Context) {
 		defaultCat, err := c.db.queryDefaultCategory(loginUID, spaceID)
 		if err != nil {
 			c.Error("查询默认类别失败", zap.Error(err))
-			ctx.ResponseError(errors.New("查询类别失败"))
+			httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
 			return
 		}
 		if defaultCat == nil {
 			maxSort, err := c.db.maxSortByUIDAndSpaceID(loginUID, spaceID)
 			if err != nil {
 				c.Error("查询排序值失败", zap.Error(err))
-				ctx.ResponseError(errors.New("查询类别失败"))
+				httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
 				return
 			}
 			newDefault := &CategoryModel{
@@ -200,14 +202,14 @@ func (c *Category) list(ctx *wkhttp.Context) {
 			}
 			if err = c.db.insertDefaultCategory(newDefault); err != nil {
 				c.Error("创建默认类别失败", zap.Error(err))
-				ctx.ResponseError(errors.New("创建默认类别失败"))
+				httperr.ResponseErrorL(ctx, errcode.ErrCategoryStoreFailed, nil, nil)
 				return
 			}
 			// INSERT IGNORE 后重查，确保拿到实际行（防并发竞态）
 			categories, err = c.db.queryCategoriesByUIDAndSpaceID(loginUID, spaceID)
 			if err != nil {
 				c.Error("查询类别失败", zap.Error(err))
-				ctx.ResponseError(errors.New("查询类别失败"))
+				httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
 				return
 			}
 		}
@@ -266,40 +268,40 @@ func (c *Category) update(ctx *wkhttp.Context) {
 	cat, err := c.db.queryCategoryByID(categoryID)
 	if err != nil {
 		c.Error("查询类别失败", zap.Error(err))
-		ctx.ResponseError(errors.New("查询类别失败"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
 		return
 	}
 	if cat == nil {
-		ctx.ResponseError(errors.New("分类不存在"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryNotFound, nil, nil)
 		return
 	}
 	if cat.UID != loginUID {
-		ctx.ResponseError(errors.New("无权限修改此分类"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryPermissionDenied, nil, nil)
 		return
 	}
 	if cat.isDefault() {
-		ctx.ResponseError(errors.New("默认分类不可修改"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryDefaultImmutable, nil, nil)
 		return
 	}
 
 	var req updateCategoryReq
 	if err := ctx.BindJSON(&req); err != nil {
-		ctx.ResponseError(errors.New("请求参数错误"))
+		respondCategoryRequestInvalid(ctx, "")
 		return
 	}
 	if req.Name == "" {
-		ctx.ResponseError(errors.New("类别名称不能为空"))
+		respondCategoryRequestInvalid(ctx, "name")
 		return
 	}
 	if len([]rune(req.Name)) > 100 {
-		ctx.ResponseError(errors.New("类别名称不能超过100个字符"))
+		respondCategoryNameTooLong(ctx, 100)
 		return
 	}
 
 	err = c.db.updateCategoryName(categoryID, req.Name)
 	if err != nil {
 		c.Error("更新类别失败", zap.Error(err))
-		ctx.ResponseError(errors.New("更新类别失败"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryStoreFailed, nil, nil)
 		return
 	}
 
@@ -314,26 +316,26 @@ func (c *Category) delete(ctx *wkhttp.Context) {
 	cat, err := c.db.queryCategoryByID(categoryID)
 	if err != nil {
 		c.Error("查询类别失败", zap.Error(err))
-		ctx.ResponseError(errors.New("查询类别失败"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
 		return
 	}
 	if cat == nil {
-		ctx.ResponseError(errors.New("分类不存在"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryNotFound, nil, nil)
 		return
 	}
 	if cat.UID != loginUID {
-		ctx.ResponseError(errors.New("无权限删除此分类"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryPermissionDenied, nil, nil)
 		return
 	}
 	if cat.isDefault() {
-		ctx.ResponseError(errors.New("默认分类不可删除"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryDefaultUndeletable, nil, nil)
 		return
 	}
 
 	tx, err := c.ctx.DB().Begin()
 	if err != nil {
 		c.Error("开启事务失败", zap.Error(err))
-		ctx.ResponseError(errors.New("删除类别失败"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryStoreFailed, nil, nil)
 		return
 	}
 	defer tx.RollbackUnlessCommitted()
@@ -346,7 +348,7 @@ func (c *Category) delete(ctx *wkhttp.Context) {
 		Where("category_id=? AND uid=?", categoryID, loginUID).
 		Exec(); err != nil {
 		c.Error("删除类别失败", zap.Error(err))
-		ctx.ResponseError(errors.New("删除类别失败"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryStoreFailed, nil, nil)
 		return
 	}
 
@@ -361,7 +363,7 @@ func (c *Category) delete(ctx *wkhttp.Context) {
 		categoryID, loginUID,
 	).Load(&groupNos); err != nil {
 		c.Error("查询分组下群列表失败", zap.Error(err))
-		ctx.ResponseError(errors.New("删除类别失败"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryStoreFailed, nil, nil)
 		return
 	}
 
@@ -376,7 +378,7 @@ func (c *Category) delete(ctx *wkhttp.Context) {
 		Where("category_id=? and uid=?", categoryID, loginUID).
 		Exec(); err != nil {
 		c.Error("清理群设置失败", zap.Error(err))
-		ctx.ResponseError(errors.New("删除类别失败"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryStoreFailed, nil, nil)
 		return
 	}
 
@@ -384,7 +386,7 @@ func (c *Category) delete(ctx *wkhttp.Context) {
 	// 与 UpdateSort 同序拿 (version → ext) 锁（PR #21 Round-3 blocker #2）。
 	if _, err := convext.BumpFollowVersionTx(tx, loginUID, cat.SpaceID); err != nil {
 		c.Error("更新 follow_version 失败", zap.Error(err))
-		ctx.ResponseError(errors.New("删除类别失败"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryStoreFailed, nil, nil)
 		return
 	}
 
@@ -393,18 +395,18 @@ func (c *Category) delete(ctx *wkhttp.Context) {
 	//    - DM：DELETE dm_category_id=cat 的 ext 行
 	if err := convext.UnfollowGroupsTx(tx, loginUID, cat.SpaceID, groupNos); err != nil {
 		c.Error("取消关注分组下群失败", zap.Error(err))
-		ctx.ResponseError(errors.New("删除类别失败"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryStoreFailed, nil, nil)
 		return
 	}
 	if err := convext.UnfollowDMsByCategoryTx(tx, loginUID, cat.SpaceID, categoryID); err != nil {
 		c.Error("取消关注分组下私聊失败", zap.Error(err))
-		ctx.ResponseError(errors.New("删除类别失败"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryStoreFailed, nil, nil)
 		return
 	}
 
 	if err = tx.Commit(); err != nil {
 		c.Error("提交事务失败", zap.Error(err))
-		ctx.ResponseError(errors.New("删除类别失败"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryStoreFailed, nil, nil)
 		return
 	}
 
@@ -419,33 +421,33 @@ func (c *Category) sort(ctx *wkhttp.Context) {
 	isMember, err := spacepkg.CheckMembership(c.db.session, spaceID, loginUID)
 	if err != nil {
 		c.Error("检查空间成员失败", zap.Error(err))
-		ctx.ResponseError(errors.New("检查空间成员失败"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
 		return
 	}
 	if !isMember {
-		ctx.ResponseError(errors.New("你不是该空间成员"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategorySpaceMemberRequired, nil, nil)
 		return
 	}
 
 	var req sortCategoriesReq
 	if err := ctx.BindJSON(&req); err != nil {
-		ctx.ResponseError(errors.New("请求参数错误"))
+		respondCategoryRequestInvalid(ctx, "")
 		return
 	}
 	if len(req.CategoryIDs) == 0 {
-		ctx.ResponseError(errors.New("分类列表不能为空"))
+		respondCategoryRequestInvalid(ctx, "category_ids")
 		return
 	}
 
 	categories, err := c.db.queryCategoriesByUIDAndSpaceID(loginUID, spaceID)
 	if err != nil {
 		c.Error("查询类别失败", zap.Error(err))
-		ctx.ResponseError(errors.New("查询类别失败"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
 		return
 	}
 
 	if len(req.CategoryIDs) != len(categories) {
-		ctx.ResponseError(errors.New("分类列表数量不匹配"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategorySortListMismatch, nil, nil)
 		return
 	}
 
@@ -456,12 +458,12 @@ func (c *Category) sort(ctx *wkhttp.Context) {
 	seen := make(map[string]bool, len(req.CategoryIDs))
 	for _, id := range req.CategoryIDs {
 		if seen[id] {
-			ctx.ResponseError(errors.New("分类列表存在重复"))
+			httperr.ResponseErrorL(ctx, errcode.ErrCategorySortListDuplicate, nil, nil)
 			return
 		}
 		seen[id] = true
 		if !catMap[id] {
-			ctx.ResponseError(errors.New("分类不存在或无权限"))
+			httperr.ResponseErrorL(ctx, errcode.ErrCategoryNotFound, nil, nil)
 			return
 		}
 	}
@@ -469,7 +471,7 @@ func (c *Category) sort(ctx *wkhttp.Context) {
 	tx, err := c.ctx.DB().Begin()
 	if err != nil {
 		c.Error("开启事务失败", zap.Error(err))
-		ctx.ResponseError(errors.New("更新排序失败"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryStoreFailed, nil, nil)
 		return
 	}
 	defer tx.RollbackUnlessCommitted()
@@ -481,7 +483,7 @@ func (c *Category) sort(ctx *wkhttp.Context) {
 			Exec()
 		if err != nil {
 			c.Error("更新排序失败", zap.Error(err), zap.String("categoryID", catID))
-			ctx.ResponseError(errors.New("更新排序失败"))
+			httperr.ResponseErrorL(ctx, errcode.ErrCategoryStoreFailed, nil, nil)
 			return
 		}
 	}
@@ -490,13 +492,13 @@ func (c *Category) sort(ctx *wkhttp.Context) {
 	// （sortFollowItems 首主键就是 CategorySort），客户端必须重建 follow 列表。
 	if _, err := convext.BumpFollowVersionTx(tx, loginUID, spaceID); err != nil {
 		c.Error("更新 follow_version 失败", zap.Error(err))
-		ctx.ResponseError(errors.New("更新排序失败"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryStoreFailed, nil, nil)
 		return
 	}
 
 	if err = tx.Commit(); err != nil {
 		c.Error("提交事务失败", zap.Error(err))
-		ctx.ResponseError(errors.New("更新排序失败"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryStoreFailed, nil, nil)
 		return
 	}
 
@@ -510,7 +512,7 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 
 	var req moveGroupToCategoryReq
 	if err := ctx.BindJSON(&req); err != nil {
-		ctx.ResponseError(errors.New("请求参数错误"))
+		respondCategoryRequestInvalid(ctx, "")
 		return
 	}
 
@@ -532,11 +534,11 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 		LoadOne(&member)
 	if err != nil {
 		if errors.Is(err, dbr.ErrNotFound) {
-			ctx.ResponseError(errors.New("你不是该群成员"))
+			httperr.ResponseErrorL(ctx, errcode.ErrCategoryGroupMemberRequired, nil, nil)
 			return
 		}
 		c.Error("查询群成员失败", zap.Error(err))
-		ctx.ResponseError(errors.New("查询群成员失败"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
 		return
 	}
 
@@ -547,11 +549,11 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 		Load(&groupSpaceID)
 	if err != nil {
 		c.Error("查询群信息失败", zap.Error(err))
-		ctx.ResponseError(errors.New("查询群信息失败"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
 		return
 	}
 	if groupSpaceID == "" {
-		ctx.ResponseError(errors.New("该群组不属于任何空间"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryGroupSpaceMissing, nil, nil)
 		return
 	}
 
@@ -578,7 +580,7 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 		} else if defaultSpaceID, derr := spacemod.GetUserDefaultSpaceIDE(c.ctx, loginUID); derr != nil {
 			// fail-closed：DB 查询失败时不要静默落到群 Space（会复现 #191），直接报错。
 			c.Error("查询用户默认空间失败", zap.Error(derr))
-			ctx.ResponseError(errors.New("查询用户默认空间失败"))
+			httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
 			return
 		} else if defaultSpaceID != "" {
 			effectiveSpaceID = defaultSpaceID
@@ -591,7 +593,7 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 	setting, err := c.db.queryGroupSettingForCategory(groupNo, loginUID)
 	if err != nil {
 		c.Error("查询群设置失败", zap.Error(err))
-		ctx.ResponseError(errors.New("查询群设置失败"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
 		return
 	}
 
@@ -601,7 +603,7 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 	tx, err := c.ctx.DB().Begin()
 	if err != nil {
 		c.Error("开启事务失败", zap.Error(err))
-		ctx.ResponseError(errors.New("更新群设置失败"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryStoreFailed, nil, nil)
 		return
 	}
 	defer tx.RollbackUnlessCommitted()
@@ -630,25 +632,25 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 		).LoadOne(&locked)
 		if err != nil {
 			if errors.Is(err, dbr.ErrNotFound) {
-				ctx.ResponseError(errors.New("分类不存在"))
+				httperr.ResponseErrorL(ctx, errcode.ErrCategoryNotFound, nil, nil)
 				return
 			}
 			c.Error("查询类别失败", zap.Error(err))
-			ctx.ResponseError(errors.New("查询类别失败"))
+			httperr.ResponseErrorL(ctx, errcode.ErrCategoryQueryFailed, nil, nil)
 			return
 		}
 		if locked.Status != 1 {
 			// status=2（已删除）等价于"分类不存在"——与旧路径
 			// queryCategoryByID(status=1 过滤) 后 nil 检查保持文案一致。
-			ctx.ResponseError(errors.New("分类不存在"))
+			httperr.ResponseErrorL(ctx, errcode.ErrCategoryNotFound, nil, nil)
 			return
 		}
 		if locked.UID != loginUID {
-			ctx.ResponseError(errors.New("无权限使用此分类"))
+			httperr.ResponseErrorL(ctx, errcode.ErrCategoryPermissionDenied, nil, nil)
 			return
 		}
 		if effectiveSpaceID != locked.SpaceID {
-			ctx.ResponseError(errors.New("群组和分类不在同一空间"))
+			httperr.ResponseErrorL(ctx, errcode.ErrCategorySpaceMismatch, nil, nil)
 			return
 		}
 		categoryIDPtr = &req.CategoryID
@@ -658,7 +660,7 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 		version, err := c.ctx.GenSeq(common.GroupSettingSeqKey)
 		if err != nil {
 			c.Error("生成版本号失败", zap.Error(err))
-			ctx.ResponseError(errors.New("生成版本号失败"))
+			httperr.ResponseErrorL(ctx, errcode.ErrCategoryStoreFailed, nil, nil)
 			return
 		}
 		if _, err := tx.InsertBySql(
@@ -666,7 +668,7 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 			groupNo, loginUID, categoryIDPtr, 0, version,
 		).Exec(); err != nil {
 			c.Error("创建群设置失败", zap.Error(err))
-			ctx.ResponseError(errors.New("创建群设置失败"))
+			httperr.ResponseErrorL(ctx, errcode.ErrCategoryStoreFailed, nil, nil)
 			return
 		}
 	} else {
@@ -675,7 +677,7 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 			Set("category_sort", 0).
 			Where("id=?", setting.Id).Exec(); err != nil {
 			c.Error("更新群设置失败", zap.Error(err))
-			ctx.ResponseError(errors.New("更新群设置失败"))
+			httperr.ResponseErrorL(ctx, errcode.ErrCategoryStoreFailed, nil, nil)
 			return
 		}
 	}
@@ -688,7 +690,7 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 	// version (issue #151 review #4 by an9xyz).
 	if _, err := convext.BumpFollowVersionTx(tx, loginUID, effectiveSpaceID); err != nil {
 		c.Error("更新 follow_version 失败", zap.Error(err))
-		ctx.ResponseError(errors.New("更新群设置失败"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryStoreFailed, nil, nil)
 		return
 	}
 
@@ -712,20 +714,20 @@ func (c *Category) moveGroupToCategory(ctx *wkhttp.Context) {
 	if categoryIDPtr == nil {
 		if err := convext.ClearAutoFollowThreadsTx(tx, loginUID, effectiveSpaceID, []string{groupNo}); err != nil {
 			c.Error("清理 auto_follow_threads 失败", zap.Error(err))
-			ctx.ResponseError(errors.New("更新群设置失败"))
+			httperr.ResponseErrorL(ctx, errcode.ErrCategoryStoreFailed, nil, nil)
 			return
 		}
 	} else {
 		if err := convext.RestoreAutoFollowThreadsTx(tx, loginUID, effectiveSpaceID, []string{groupNo}); err != nil {
 			c.Error("恢复 auto_follow_threads 失败", zap.Error(err))
-			ctx.ResponseError(errors.New("更新群设置失败"))
+			httperr.ResponseErrorL(ctx, errcode.ErrCategoryStoreFailed, nil, nil)
 			return
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
 		c.Error("提交事务失败", zap.Error(err))
-		ctx.ResponseError(errors.New("更新群设置失败"))
+		httperr.ResponseErrorL(ctx, errcode.ErrCategoryStoreFailed, nil, nil)
 		return
 	}
 
