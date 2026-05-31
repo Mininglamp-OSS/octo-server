@@ -1,6 +1,7 @@
 package robot
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"encoding/json"
 	"errors"
@@ -179,6 +180,15 @@ func enqueueBotEventGeneric(ctx *config.Context, robotID string, message *config
 	}
 	if message == nil {
 		return errors.New("robot: nil message, cannot enqueue bot event")
+	}
+	// YUJ-2531 / Mininglamp-OSS/octo-server#208: bot-delivery chokepoint
+	// (synthetic-event path). Mirror saveRobotMessage: strip any bare
+	// legacy `mention.all=1` and inject `mention.humans=1` on a copy so
+	// the bot event queue never carries the legacy broadcast flag.
+	if normalized := stripBareMentionAllForBot(message.Payload); !bytes.Equal(normalized, message.Payload) {
+		cp := *message
+		cp.Payload = normalized
+		message = &cp
 	}
 	seq, err := ctx.GenSeq(fmt.Sprintf("%s%s", common.RobotEventSeqKey, robotID))
 	if err != nil {

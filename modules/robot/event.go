@@ -1,6 +1,7 @@
 package robot
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -336,6 +337,18 @@ func (rb *Robot) autoReadForBot(message *config.MessageResp, robotID string) {
 }
 
 func (rb *Robot) saveRobotMessage(message *config.MessageResp, robotID string) {
+
+	// YUJ-2531 / Mininglamp-OSS/octo-server#208: bot-delivery chokepoint.
+	// Strip any bare legacy `mention.all=1` and inject `mention.humans=1`
+	// so bots never observe the legacy broadcast flag regardless of the
+	// (user-machine-resident, possibly outdated) adapter version. Operates
+	// on a copy of the payload; the original `message.Payload` shared with
+	// the human-client fan-out keeps `all=1` for rendering.
+	if normalized := stripBareMentionAllForBot(message.Payload); !bytes.Equal(normalized, message.Payload) {
+		cp := *message
+		cp.Payload = normalized
+		message = &cp
+	}
 
 	seq, err := rb.ctx.GenSeq(fmt.Sprintf("%s%s", common.RobotEventSeqKey, robotID))
 	if err != nil {
