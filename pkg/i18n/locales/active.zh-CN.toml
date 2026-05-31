@@ -565,3 +565,48 @@ other = "查询工作台数据失败。"
 
 ["err.server.workplace.store_failed"]
 other = "保存工作台数据失败。"
+
+["err.server.category.request_invalid"]
+other = "请求参数有误。"
+
+["err.server.category.name_too_long"]
+other = "类别名称不能超过100个字符。"
+
+["err.server.category.sort_list_mismatch"]
+other = "分类列表数量不匹配。"
+
+["err.server.category.sort_list_duplicate"]
+other = "分类列表存在重复。"
+
+["err.server.category.group_space_missing"]
+other = "该群组不属于任何空间。"
+
+["err.server.category.space_mismatch"]
+other = "群组和分类不在同一空间。"
+
+["err.server.category.space_member_required"]
+other = "你不是该空间成员。"
+
+["err.server.category.group_member_required"]
+other = "你不是该群成员。"
+
+["err.server.category.permission_denied"]
+other = "无权操作此分类。"
+
+["err.server.category.default_immutable"]
+other = "默认分类不可修改。"
+
+["err.server.category.default_undeletable"]
+other = "默认分类不可删除。"
+
+["err.server.category.not_found"]
+other = "分类不存在。"
+
+["err.server.category.limit_exceeded"]
+other = "每个空间最多创建20个分类。"
+
+["err.server.category.query_failed"]
+other = "查询分类数据失败。"
+
+["err.server.category.store_failed"]
+other = "保存分类数据失败。"

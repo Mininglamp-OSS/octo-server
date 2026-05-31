@@ -6,6 +6,51 @@
 #
 # CI rejects PRs that change codes.Register input without re-running extract.
 
+["err.server.category.default_immutable"]
+other = "The default category cannot be modified."
+
+["err.server.category.default_undeletable"]
+other = "The default category cannot be deleted."
+
+["err.server.category.group_member_required"]
+other = "You are not a member of this group."
+
+["err.server.category.group_space_missing"]
+other = "The group does not belong to any space."
+
+["err.server.category.limit_exceeded"]
+other = "You can create at most 20 categories per space."
+
+["err.server.category.name_too_long"]
+other = "The category name cannot exceed 100 characters."
+
+["err.server.category.not_found"]
+other = "Category not found."
+
+["err.server.category.permission_denied"]
+other = "You do not have permission to operate on this category."
+
+["err.server.category.query_failed"]
+other = "Failed to query category data."
+
+["err.server.category.request_invalid"]
+other = "Invalid request."
+
+["err.server.category.sort_list_duplicate"]
+other = "The category list contains duplicates."
+
+["err.server.category.sort_list_mismatch"]
+other = "The category list does not match the existing categories."
+
+["err.server.category.space_member_required"]
+other = "You are not a member of this space."
+
+["err.server.category.space_mismatch"]
+other = "The group and the category are not in the same space."
+
+["err.server.category.store_failed"]
+other = "Failed to update category data."
+
 ["err.server.group.already_member"]
 other = "You are already a member of this group."
 
