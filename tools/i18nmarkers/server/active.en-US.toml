@@ -497,3 +497,24 @@ other = "Failed to fetch WeChat user profile."
 
 ["err.server.user.wechat_response_invalid"]
 other = "WeChat response is malformed."
+
+["err.server.workplace.app_name_exists"]
+other = "An app with this name already exists."
+
+["err.server.workplace.app_not_found"]
+other = "The app does not exist or is unavailable."
+
+["err.server.workplace.category_name_exists"]
+other = "A category with this name already exists."
+
+["err.server.workplace.category_not_found"]
+other = "The category does not exist."
+
+["err.server.workplace.query_failed"]
+other = "Failed to query workplace data."
+
+["err.server.workplace.request_invalid"]
+other = "Invalid request."
+
+["err.server.workplace.store_failed"]
+other = "Failed to update workplace data."

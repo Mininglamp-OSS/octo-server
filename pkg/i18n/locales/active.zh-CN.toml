@@ -544,3 +544,24 @@ other = "发送消息指令失败。"
 
 ["err.server.message.search_failed"]
 other = "消息搜索失败。"
+
+["err.server.workplace.request_invalid"]
+other = "请求参数有误。"
+
+["err.server.workplace.app_not_found"]
+other = "该应用不存在或不可用。"
+
+["err.server.workplace.category_not_found"]
+other = "该分类不存在。"
+
+["err.server.workplace.app_name_exists"]
+other = "该应用名称已存在。"
+
+["err.server.workplace.category_name_exists"]
+other = "该分类名称已存在。"
+
+["err.server.workplace.query_failed"]
+other = "查询工作台数据失败。"
+
+["err.server.workplace.store_failed"]
+other = "保存工作台数据失败。"
