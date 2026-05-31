@@ -115,7 +115,7 @@ func createCategory(t *testing.T, route *wkhttp.WKHttp, spaceID, name string) *h
 
 func TestCategory_Create(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -135,7 +135,7 @@ func TestCategory_Create(t *testing.T) {
 }
 
 func TestCategory_List(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -189,7 +189,7 @@ func TestCategory_List(t *testing.T) {
 }
 
 func TestCategory_Update(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -216,7 +216,7 @@ func TestCategory_Update(t *testing.T) {
 }
 
 func TestCategory_Delete(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -273,7 +273,7 @@ func TestCategory_Delete(t *testing.T) {
 // 群（含 thread 级联）与 DM —— 前端提示「分组下的所有会话将取消关注」对应
 // 的服务端行为。
 func TestCategory_DeleteUnfollowsContents(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -358,7 +358,7 @@ func TestCategory_DeleteUnfollowsContents(t *testing.T) {
 
 func TestCategory_Sort(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -406,7 +406,7 @@ func TestCategory_Sort(t *testing.T) {
 }
 
 func TestCategory_MoveGroupToCategory(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -471,7 +471,7 @@ func TestCategory_MoveGroupToCategory(t *testing.T) {
 // After fix the move-out branch in api.go calls ClearAutoFollowThreadsTx
 // in the same tx, restoring the read/write contract.
 func TestCategory_MoveGroupOutOfCategory_ClearsAutoFollowThreads(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -553,7 +553,7 @@ func TestCategory_MoveGroupOutOfCategory_ClearsAutoFollowThreads(t *testing.T) {
 // future change might over-eagerly clear in every move and break the
 // "default-followed across category-to-category move" contract.
 func TestCategory_MoveGroupBetweenCategories_PreservesAutoFollowThreads(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -607,7 +607,7 @@ func TestCategory_MoveGroupBetweenCategories_PreservesAutoFollowThreads(t *testi
 // selectEligibleForFanoutTx still excludes the user (=0) — phantom missing
 // fan-out.
 func TestCategory_MoveGroupBackIntoCategory_RestoresAutoFollowThreads(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -670,7 +670,7 @@ func TestCategory_MoveGroupBackIntoCategory_RestoresAutoFollowThreads(t *testing
 // auto_follow_threads=1 anyway, and the move-in handler must not
 // short-circuit any subsequent paths or write inappropriate rows.
 func TestCategory_MoveFirstTimeIntoCategory_NoOpRestore(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -712,7 +712,7 @@ func TestCategory_MoveFirstTimeIntoCategory_NoOpRestore(t *testing.T) {
 // ---------- Validation / Error Tests ----------
 
 func TestCategory_CreateLimit(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -731,11 +731,11 @@ func TestCategory_CreateLimit(t *testing.T) {
 	// 21st should fail
 	w := createCategory(t, route, spaceID, "Cat-20")
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "最多创建20个分类")
+	assertCategoryErrorCode(t, w, "err.server.category.limit_exceeded")
 }
 
 func TestCategory_CreateEmptyName(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	_ = New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -747,11 +747,11 @@ func TestCategory_CreateEmptyName(t *testing.T) {
 
 	w := createCategory(t, s.GetRoute(), spaceID, "")
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "类别名称不能为空")
+	assertCategoryErrorCode(t, w, "err.server.category.request_invalid")
 }
 
 func TestCategory_UpdateNotOwner(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -775,11 +775,11 @@ func TestCategory_UpdateNotOwner(t *testing.T) {
 	// try to update it
 	w := doRequest(t, s.GetRoute(), "PUT", "/v1/spaces/"+spaceID+"/categories/"+otherCatID, map[string]string{"name": "我要改"})
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "无权限修改此分类")
+	assertCategoryErrorCode(t, w, "err.server.category.permission_denied")
 }
 
 func TestCategory_DeleteNotOwner(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -803,11 +803,11 @@ func TestCategory_DeleteNotOwner(t *testing.T) {
 	// try to delete it
 	w := doRequest(t, s.GetRoute(), "DELETE", "/v1/spaces/"+spaceID+"/categories/"+otherCatID, nil)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "无权限删除此分类")
+	assertCategoryErrorCode(t, w, "err.server.category.permission_denied")
 }
 
 func TestCategory_MoveGroupNotMember(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -834,11 +834,11 @@ func TestCategory_MoveGroupNotMember(t *testing.T) {
 		"category_id": catID,
 	})
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "你不是该群成员")
+	assertCategoryErrorCode(t, w, "err.server.category.group_member_required")
 }
 
 func TestCategory_NonSpaceMember(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	_ = New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -856,16 +856,16 @@ func TestCategory_NonSpaceMember(t *testing.T) {
 	// try to create a category
 	w := createCategory(t, route, spaceID, "工作")
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "你不是该空间成员")
+	assertCategoryErrorCode(t, w, "err.server.category.space_member_required")
 
 	// try to list categories
 	wl := doRequest(t, route, "GET", "/v1/spaces/"+spaceID+"/categories", nil)
 	assert.Equal(t, http.StatusBadRequest, wl.Code)
-	assert.Contains(t, wl.Body.String(), "你不是该空间成员")
+	assertCategoryErrorCode(t, wl, "err.server.category.space_member_required")
 }
 
 func TestCategory_UpdateNotFound(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -877,11 +877,11 @@ func TestCategory_UpdateNotFound(t *testing.T) {
 	// try to update a non-existent category
 	w := doRequest(t, s.GetRoute(), "PUT", "/v1/spaces/"+spaceID+"/categories/nonexistent-cat", map[string]string{"name": "不存在"})
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "分类不存在")
+	assertCategoryErrorCode(t, w, "err.server.category.not_found")
 }
 
 func TestCategory_DeleteNotFound(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -893,11 +893,11 @@ func TestCategory_DeleteNotFound(t *testing.T) {
 	// try to delete a non-existent category
 	w := doRequest(t, s.GetRoute(), "DELETE", "/v1/spaces/"+spaceID+"/categories/nonexistent-cat", nil)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "分类不存在")
+	assertCategoryErrorCode(t, w, "err.server.category.not_found")
 }
 
 func TestCategory_UpdateEmptyName(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -916,11 +916,11 @@ func TestCategory_UpdateEmptyName(t *testing.T) {
 	// try to update with empty name
 	wu := doRequest(t, route, "PUT", "/v1/spaces/"+spaceID+"/categories/"+catID, map[string]string{"name": ""})
 	assert.Equal(t, http.StatusBadRequest, wu.Code)
-	assert.Contains(t, wu.Body.String(), "类别名称不能为空")
+	assertCategoryErrorCode(t, wu, "err.server.category.request_invalid")
 }
 
 func TestCategory_SortEmptyList(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -934,11 +934,11 @@ func TestCategory_SortEmptyList(t *testing.T) {
 		"category_ids": []string{},
 	})
 	assert.Equal(t, http.StatusBadRequest, ws.Code)
-	assert.Contains(t, ws.Body.String(), "分类列表不能为空")
+	assertCategoryErrorCode(t, ws, "err.server.category.request_invalid")
 }
 
 func TestCategory_SortUnknownCategory(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -957,11 +957,11 @@ func TestCategory_SortUnknownCategory(t *testing.T) {
 		"category_ids": []string{"fake-id-001"},
 	})
 	assert.Equal(t, http.StatusBadRequest, ws.Code)
-	assert.Contains(t, ws.Body.String(), "分类不存在或无权限")
+	assertCategoryErrorCode(t, ws, "err.server.category.not_found")
 }
 
 func TestCategory_SortNonSpaceMember(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	_ = New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -978,11 +978,11 @@ func TestCategory_SortNonSpaceMember(t *testing.T) {
 		"category_ids": []string{"some-id"},
 	})
 	assert.Equal(t, http.StatusBadRequest, ws.Code)
-	assert.Contains(t, ws.Body.String(), "你不是该空间成员")
+	assertCategoryErrorCode(t, ws, "err.server.category.space_member_required")
 }
 
 func TestCategory_MoveGroupCategoryNotFound(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -999,11 +999,11 @@ func TestCategory_MoveGroupCategoryNotFound(t *testing.T) {
 		"category_id": "nonexistent-cat-id",
 	})
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "分类不存在")
+	assertCategoryErrorCode(t, w, "err.server.category.not_found")
 }
 
 func TestCategory_MoveGroupCategoryNotOwner(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -1032,11 +1032,11 @@ func TestCategory_MoveGroupCategoryNotOwner(t *testing.T) {
 		"category_id": otherCatID,
 	})
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "无权限使用此分类")
+	assertCategoryErrorCode(t, w, "err.server.category.permission_denied")
 }
 
 func TestCategory_MoveGroupCrossSpace(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -1064,7 +1064,7 @@ func TestCategory_MoveGroupCrossSpace(t *testing.T) {
 		"category_id": catID,
 	})
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "群组和分类不在同一空间")
+	assertCategoryErrorCode(t, w, "err.server.category.space_mismatch")
 }
 
 // TestCategory_MoveExternalGroupToCurrentSpaceCategory is the regression test
@@ -1078,7 +1078,7 @@ func TestCategory_MoveGroupCrossSpace(t *testing.T) {
 // (not the group's owning Space) so the group surfaces in the follow tab the
 // sidebar queries for the user's current Space.
 func TestCategory_MoveExternalGroupToCurrentSpaceCategory(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -1143,7 +1143,7 @@ func TestCategory_MoveExternalGroupToCurrentSpaceCategory(t *testing.T) {
 // same — otherwise these groups stay un-categorizable and follow_version /
 // auto_follow_threads writes land in the group's owning Space.
 func TestCategory_MoveExternalGroupEmptySourceSpaceFallsBackToDefaultSpace(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -1202,7 +1202,7 @@ func TestCategory_MoveExternalGroupEmptySourceSpaceFallsBackToDefaultSpace(t *te
 // sidebar materialized the ext row — not the group's owning Space. Without the
 // effectiveSpaceID fix this clear would miss the row entirely.
 func TestCategory_MoveExternalGroupOutClearsAutoFollowThreadsInSourceSpace(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -1262,7 +1262,7 @@ func TestCategory_MoveExternalGroupOutClearsAutoFollowThreadsInSourceSpace(t *te
 
 func TestCategory_ListEmpty(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -1283,7 +1283,7 @@ func TestCategory_ListEmpty(t *testing.T) {
 // ---------- Default Category (is_default=1) Tests ----------
 
 func TestCategory_ListAutoCreatesDefault(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -1323,7 +1323,7 @@ func TestCategory_ListAutoCreatesDefault(t *testing.T) {
 }
 
 func TestCategory_ListDefaultIdempotent(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -1349,7 +1349,7 @@ func TestCategory_ListDefaultIdempotent(t *testing.T) {
 }
 
 func TestCategory_ListWithCategoriesAndDefault(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -1397,7 +1397,7 @@ func TestCategory_ListWithCategoriesAndDefault(t *testing.T) {
 }
 
 func TestCategory_DeleteDefaultRejected(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -1417,11 +1417,11 @@ func TestCategory_DeleteDefaultRejected(t *testing.T) {
 	// try to delete — should be rejected
 	wd := doRequest(t, route, "DELETE", "/v1/spaces/"+spaceID+"/categories/"+defaultCatID, nil)
 	assert.Equal(t, http.StatusBadRequest, wd.Code)
-	assert.Contains(t, wd.Body.String(), "默认分类不可删除")
+	assertCategoryErrorCode(t, wd, "err.server.category.default_undeletable")
 }
 
 func TestCategory_UpdateDefaultRejected(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -1441,12 +1441,12 @@ func TestCategory_UpdateDefaultRejected(t *testing.T) {
 	// try to update — should be rejected
 	wu := doRequest(t, route, "PUT", "/v1/spaces/"+spaceID+"/categories/"+defaultCatID, map[string]string{"name": "改名"})
 	assert.Equal(t, http.StatusBadRequest, wu.Code)
-	assert.Contains(t, wu.Body.String(), "默认分类不可修改")
+	assertCategoryErrorCode(t, wu, "err.server.category.default_immutable")
 }
 
 func TestCategory_SortWithDefault(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -1500,7 +1500,7 @@ func TestCategory_SortWithDefault(t *testing.T) {
 }
 
 func TestCategory_DefaultNameFromEnv(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -1524,7 +1524,7 @@ func TestCategory_DefaultNameFromEnv(t *testing.T) {
 
 func TestCategory_DefaultNotCountedInLimit(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -1552,7 +1552,7 @@ func TestCategory_DefaultNotCountedInLimit(t *testing.T) {
 
 func TestCategory_ListNoGroupsNoDefault(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -1576,7 +1576,7 @@ func TestCategory_ListNoGroupsNoDefault(t *testing.T) {
 
 func TestCategory_MoveGroupToDefaultCategory(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -1714,7 +1714,7 @@ func TestCategory_UniqueIndexPreventsDefaultDuplicate(t *testing.T) {
 }
 
 func TestCategory_SortCountMismatch(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -1738,11 +1738,11 @@ func TestCategory_SortCountMismatch(t *testing.T) {
 		"category_ids": []string{cat1["category_id"].(string)},
 	})
 	assert.Equal(t, http.StatusBadRequest, ws.Code)
-	assert.Contains(t, ws.Body.String(), "分类列表数量不匹配")
+	assertCategoryErrorCode(t, ws, "err.server.category.sort_list_mismatch")
 }
 
 func TestCategory_MoveGroupNoSpace(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newCategoryTestServer()
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -1764,5 +1764,5 @@ func TestCategory_MoveGroupNoSpace(t *testing.T) {
 		"category_id": "some-fake-cat",
 	})
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "该群组不属于任何空间")
+	assertCategoryErrorCode(t, w, "err.server.category.group_space_missing")
 }
