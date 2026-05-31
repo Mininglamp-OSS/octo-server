@@ -1,15 +1,16 @@
 package workplace
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"runtime/debug"
 
-	"github.com/Mininglamp-OSS/octo-server/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"github.com/Mininglamp-OSS/octo-server/pkg/log"
 	"go.uber.org/zap"
 )
 
@@ -48,13 +49,13 @@ func (w *Workplace) deleteRecord(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	appId := c.Query("app_id")
 	if appId == "" {
-		c.ResponseError(errors.New("删除的应用ID不能为空"))
+		respondWorkplaceRequestInvalid(c, "app_id")
 		return
 	}
 	err := w.db.deleteRecord(loginUID, appId)
 	if err != nil {
 		w.Error("删除使用记录错误", zap.Error(err))
-		c.ResponseError(errors.New("删除使用记录错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -65,7 +66,7 @@ func (w *Workplace) getRecord(c *wkhttp.Context) {
 	records, err := w.db.queryRecordWithUid(loginUID)
 	if err != nil {
 		w.Error("查询使用记录错误", zap.Error(err))
-		c.ResponseError(errors.New("查询使用记录错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceQueryFailed, nil, nil)
 		return
 	}
 	list := make([]*appResp, 0)
@@ -77,7 +78,7 @@ func (w *Workplace) getRecord(c *wkhttp.Context) {
 		apps, err := w.db.queryAppWithAppIds(appIds)
 		if err != nil {
 			w.Error("查询一批应用错误", zap.Error(err))
-			c.ResponseError(errors.New("查询一批应用错误"))
+			httperr.ResponseErrorL(c, errcode.ErrWorkplaceQueryFailed, nil, nil)
 			return
 		}
 		if len(apps) > 0 {
@@ -85,7 +86,7 @@ func (w *Workplace) getRecord(c *wkhttp.Context) {
 			saveList, err := w.db.queryAppWithUid(loginUID)
 			if err != nil {
 				w.Error("查询用户已保存的应用错误", zap.Error(err))
-				c.ResponseError(errors.New("查询用户已保存的应用错误"))
+				httperr.ResponseErrorL(c, errcode.ErrWorkplaceQueryFailed, nil, nil)
 				return
 			}
 			for _, app := range apps {
@@ -111,23 +112,23 @@ func (w *Workplace) addRecord(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	appId := c.Param("app_id")
 	if appId == "" {
-		c.ResponseError(errors.New("应用ID不能为空"))
+		respondWorkplaceRequestInvalid(c, "app_id")
 		return
 	}
 	app, err := w.db.queryAppWithAppId(appId)
 	if err != nil {
 		w.Error("查询应用错误", zap.Error(err))
-		c.ResponseError(errors.New("查询应用错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceQueryFailed, nil, nil)
 		return
 	}
 	if app == nil || app.Status == 0 {
-		c.ResponseError(errors.New("该应用已删除或不可用"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceAppNotFound, nil, nil)
 		return
 	}
 	record, err := w.db.queryRecordWithUidAndAppId(loginUID, appId)
 	if err != nil {
 		w.Error("查询使用记录错误", zap.Error(err))
-		c.ResponseError(errors.New("查询使用记录错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceQueryFailed, nil, nil)
 		return
 	}
 	if record == nil {
@@ -138,7 +139,7 @@ func (w *Workplace) addRecord(c *wkhttp.Context) {
 		})
 		if err != nil {
 			w.Error("新增使用记录错误", zap.Error(err))
-			c.ResponseError(errors.New("新增使用记录错误"))
+			httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 			return
 		}
 	} else {
@@ -146,7 +147,7 @@ func (w *Workplace) addRecord(c *wkhttp.Context) {
 		err := w.db.updateRecordCount(record)
 		if err != nil {
 			w.Error("修改使用记录错误", zap.Error(err))
-			c.ResponseError(errors.New("修改使用记录错误"))
+			httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 			return
 		}
 	}
@@ -156,13 +157,13 @@ func (w *Workplace) getAppWithCategory(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	categoryNo := c.Param("category_no")
 	if categoryNo == "" {
-		c.ResponseError(errors.New("分类编号不能为空"))
+		respondWorkplaceRequestInvalid(c, "category_no")
 		return
 	}
 	apps, err := w.db.queryAppWithCategroyNo(categoryNo)
 	if err != nil {
 		w.Error("通过分类查询应用错误", zap.Error(err))
-		c.ResponseError(errors.New("通过分类查询应用错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceQueryFailed, nil, nil)
 		return
 	}
 	list := make([]*appResp, 0)
@@ -171,7 +172,7 @@ func (w *Workplace) getAppWithCategory(c *wkhttp.Context) {
 		saveList, err := w.db.queryAppWithUid(loginUID)
 		if err != nil {
 			w.Error("查询用户已保存的应用错误", zap.Error(err))
-			c.ResponseError(errors.New("查询用户已保存的应用错误"))
+			httperr.ResponseErrorL(c, errcode.ErrWorkplaceQueryFailed, nil, nil)
 			return
 		}
 		for _, app := range apps {
@@ -201,19 +202,19 @@ func (w *Workplace) reorderApp(c *wkhttp.Context) {
 	var req reqVO
 	if err := c.BindJSON(&req); err != nil {
 		w.Error(common.ErrData.Error(), zap.Error(err))
-		c.ResponseError(common.ErrData)
+		respondWorkplaceRequestInvalid(c, "")
 		return
 	}
 	tx, err := w.ctx.DB().Begin()
 	if err != nil {
 		w.Error("开启事务失败！", zap.Error(err))
-		c.ResponseError(errors.New("开启事务失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 		return
 	}
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
-			c.ResponseError(errors.New("服务器内部错误"))
+			respondWorkplaceInternal(c)
 			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
@@ -224,7 +225,7 @@ func (w *Workplace) reorderApp(c *wkhttp.Context) {
 		if err != nil {
 			tx.Rollback()
 			w.Error("修改用户app顺序错误", zap.Error(err))
-			c.ResponseError(errors.New("修改用户app顺序错误"))
+			httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 			return
 		}
 		tempSortNum--
@@ -232,7 +233,7 @@ func (w *Workplace) reorderApp(c *wkhttp.Context) {
 	err = tx.Commit()
 	if err != nil {
 		w.Error("数据库事物提交失败", zap.Error(err))
-		c.ResponseError(errors.New("数据库事物提交失败"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 		tx.Rollback()
 		return
 	}
@@ -244,12 +245,12 @@ func (w *Workplace) deleteApp(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	appId := c.Param("app_id")
 	if appId == "" {
-		c.ResponseError(errors.New("appId不能为空"))
+		respondWorkplaceRequestInvalid(c, "app_id")
 		return
 	}
 	err := w.db.deleteUserAppWithAppId(loginUID, appId)
 	if err != nil {
-		c.ResponseError(errors.New("删除用户app错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 		w.Error("删除用户app错误", zap.Error(err))
 		return
 	}
@@ -261,23 +262,23 @@ func (w *Workplace) addApp(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	appId := c.Param("app_id")
 	if appId == "" {
-		c.ResponseError(errors.New("应用ID不能为空"))
+		respondWorkplaceRequestInvalid(c, "app_id")
 		return
 	}
 	app, err := w.db.queryAppWithAppId(appId)
 	if err != nil {
-		c.ResponseError(errors.New("查询应用错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceQueryFailed, nil, nil)
 		w.Error("查询应用错误", zap.Error(err))
 		return
 	}
 	if app == nil || len(app.AppID) == 0 || app.Status == 0 {
-		c.ResponseError(errors.New("该应用不存在或被禁用"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceAppNotFound, nil, nil)
 		w.Error("该应用不存在或被禁用", zap.Error(err))
 		return
 	}
 	userApp, err := w.db.queryUserAppWithAPPId(loginUID, appId)
 	if err != nil {
-		c.ResponseError(errors.New("查询用户某个应用错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceQueryFailed, nil, nil)
 		w.Error("查询用户某个应用错误", zap.Error(err))
 		return
 	}
@@ -287,7 +288,7 @@ func (w *Workplace) addApp(c *wkhttp.Context) {
 	}
 	maxSortNumApp, err := w.db.queryUserAppMaxSortNumWithUID(loginUID)
 	if err != nil {
-		c.ResponseError(errors.New("查询用户最大序号app错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceQueryFailed, nil, nil)
 		w.Error("查询用户最大序号app错误", zap.Error(err))
 		return
 	}
@@ -301,7 +302,7 @@ func (w *Workplace) addApp(c *wkhttp.Context) {
 		AppID:   appId,
 	})
 	if err != nil {
-		c.ResponseError(errors.New("添加用户app错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 		w.Error("添加用户app错误", zap.Error(err))
 		return
 	}
@@ -312,7 +313,7 @@ func (w *Workplace) addApp(c *wkhttp.Context) {
 func (w *Workplace) getCategory(c *wkhttp.Context) {
 	models, err := w.db.queryCategory()
 	if err != nil {
-		c.ResponseError(errors.New("查询分类错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceQueryFailed, nil, nil)
 		w.Error("查询分类错误", zap.Error(err))
 		return
 	}
@@ -333,7 +334,7 @@ func (w *Workplace) getCategory(c *wkhttp.Context) {
 func (w *Workplace) getApps(c *wkhttp.Context) {
 	models, err := w.db.queryUserApp(c.GetLoginUID())
 	if err != nil {
-		c.ResponseError(errors.New("查询用户应用错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceQueryFailed, nil, nil)
 		w.Error("查询用户应用错误", zap.Error(err))
 		return
 	}
@@ -345,7 +346,7 @@ func (w *Workplace) getApps(c *wkhttp.Context) {
 		}
 		apps, err := w.db.queryAppWithAppIds(appIds)
 		if err != nil {
-			c.ResponseError(errors.New("通过应用ID查询应用错误"))
+			httperr.ResponseErrorL(c, errcode.ErrWorkplaceQueryFailed, nil, nil)
 			w.Error("通过应用ID查询应用错误", zap.Error(err))
 			return
 		}
@@ -382,7 +383,7 @@ func (w *Workplace) getApps(c *wkhttp.Context) {
 func (w *Workplace) getBanner(c *wkhttp.Context) {
 	models, err := w.db.queryBanner()
 	if err != nil {
-		c.ResponseError(errors.New("查询横幅数据错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceQueryFailed, nil, nil)
 		w.Error("查询横幅数据错误", zap.Error(err))
 		return
 	}

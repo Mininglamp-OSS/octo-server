@@ -1,7 +1,6 @@
 package workplace
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"runtime/debug"
@@ -11,6 +10,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/log"
 	"github.com/Mininglamp-OSS/octo-server/pkg/util"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
@@ -62,7 +63,7 @@ func (m *manager) Route(r *wkhttp.WKHttp) {
 func (m *manager) reorderBanner(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondWorkplaceForbidden(c)
 		return
 	}
 	type reqVO struct {
@@ -71,19 +72,19 @@ func (m *manager) reorderBanner(c *wkhttp.Context) {
 	var req reqVO
 	if err := c.BindJSON(&req); err != nil {
 		m.Error(common.ErrData.Error(), zap.Error(err))
-		c.ResponseError(common.ErrData)
+		respondWorkplaceRequestInvalid(c, "")
 		return
 	}
 	tx, err := m.ctx.DB().Begin()
 	if err != nil {
 		m.Error("开启事务失败！", zap.Error(err))
-		c.ResponseError(errors.New("开启事务失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 		return
 	}
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
-			c.ResponseError(errors.New("服务器内部错误"))
+			respondWorkplaceInternal(c)
 			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
@@ -93,7 +94,7 @@ func (m *manager) reorderBanner(c *wkhttp.Context) {
 		if err != nil {
 			tx.Rollback()
 			m.Error("修改分类排序错误", zap.Error(err))
-			c.ResponseError(errors.New("修改分类排序错误"))
+			httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 			return
 		}
 		tempSortNum--
@@ -101,7 +102,7 @@ func (m *manager) reorderBanner(c *wkhttp.Context) {
 	err = tx.Commit()
 	if err != nil {
 		m.Error("数据库事物提交失败", zap.Error(err))
-		c.ResponseError(errors.New("数据库事物提交失败"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -111,12 +112,12 @@ func (m *manager) reorderBanner(c *wkhttp.Context) {
 func (m *manager) updateCategory(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondWorkplaceForbidden(c)
 		return
 	}
 	categoryNo := c.Param("category_no")
 	if categoryNo == "" {
-		c.ResponseError(errors.New("分类ID不能为空"))
+		respondWorkplaceRequestInvalid(c, "category_no")
 		return
 	}
 	type reqVO struct {
@@ -125,24 +126,24 @@ func (m *manager) updateCategory(c *wkhttp.Context) {
 	var req reqVO
 	if err := c.BindJSON(&req); err != nil {
 		m.Error(common.ErrData.Error(), zap.Error(err))
-		c.ResponseError(common.ErrData)
+		respondWorkplaceRequestInvalid(c, "")
 		return
 	}
 	category, err := m.db.queryCategoryWithNo(categoryNo)
 	if err != nil {
 		m.Error("获取分类错误", zap.Error(err))
-		c.ResponseError(errors.New("获取分类错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceQueryFailed, nil, nil)
 		return
 	}
 	if category == nil {
-		c.ResponseError(errors.New("该分类不存在"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceCategoryNotFound, nil, nil)
 		return
 	}
 	category.Name = req.Name
 	err = m.db.updateCategory(category)
 	if err != nil {
 		m.Error("修改分类错误", zap.Error(err))
-		c.ResponseError(errors.New("修改分类错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -152,18 +153,18 @@ func (m *manager) updateCategory(c *wkhttp.Context) {
 func (m *manager) deleteCategory(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondWorkplaceForbidden(c)
 		return
 	}
 	categoryNo := c.Param("category_no")
 	if categoryNo == "" {
-		c.ResponseError(errors.New("分类ID不能为空"))
+		respondWorkplaceRequestInvalid(c, "category_no")
 		return
 	}
 	err = m.db.deleteCategory(categoryNo)
 	if err != nil {
 		m.Error("删除分类错误", zap.Error(err))
-		c.ResponseError(errors.New("删除分类错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -172,7 +173,7 @@ func (m *manager) deleteCategory(c *wkhttp.Context) {
 func (m *manager) getApps(c *wkhttp.Context) {
 	err := c.CheckLoginRole()
 	if err != nil {
-		c.ResponseError(err)
+		respondWorkplaceForbidden(c)
 		return
 	}
 	page := c.Query("page_index")
@@ -186,26 +187,26 @@ func (m *manager) getApps(c *wkhttp.Context) {
 		apps, err = m.db.queryAppWithPage(uint64(pageSize), uint64(pageIndex))
 		if err != nil {
 			m.Error("查询所有应用错误", zap.Error(err))
-			c.ResponseError(errors.New("查询所有应用错误"))
+			httperr.ResponseErrorL(c, errcode.ErrWorkplaceQueryFailed, nil, nil)
 			return
 		}
 		count, err = m.db.queryAppCount()
 		if err != nil {
 			m.Error("查询总数量错误", zap.Error(err))
-			c.ResponseError(errors.New("查询总数量错误"))
+			httperr.ResponseErrorL(c, errcode.ErrWorkplaceQueryFailed, nil, nil)
 			return
 		}
 	} else {
 		apps, err = m.db.searchApp(keyword, uint64(pageSize), uint64(pageIndex))
 		if err != nil {
 			m.Error("搜索应用错误", zap.Error(err))
-			c.ResponseError(errors.New("搜索应用错误"))
+			httperr.ResponseErrorL(c, errcode.ErrWorkplaceQueryFailed, nil, nil)
 			return
 		}
 		count, err = m.db.queryAppCountWithKeyWord(keyword)
 		if err != nil {
 			m.Error("查询总数量错误", zap.Error(err))
-			c.ResponseError(errors.New("查询总数量错误"))
+			httperr.ResponseErrorL(c, errcode.ErrWorkplaceQueryFailed, nil, nil)
 			return
 		}
 	}
@@ -236,23 +237,23 @@ func (m *manager) getApps(c *wkhttp.Context) {
 func (m *manager) deleteCategoryApp(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondWorkplaceForbidden(c)
 		return
 	}
 	categoryNo := c.Param("category_no")
 	appId := c.Param("app_id")
 	if categoryNo == "" {
-		c.ResponseError(errors.New("分类编号不能为空"))
+		respondWorkplaceRequestInvalid(c, "category_no")
 		return
 	}
 	if appId == "" {
-		c.ResponseError(errors.New("应用ID不能为空"))
+		respondWorkplaceRequestInvalid(c, "app_id")
 		return
 	}
 	err = m.db.deleteCategoryApp(appId, categoryNo)
 	if err != nil {
 		m.Error("删除分类下app错误", zap.Error(err))
-		c.ResponseError(errors.New("删除分类下app错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -261,7 +262,7 @@ func (m *manager) deleteCategoryApp(c *wkhttp.Context) {
 func (m *manager) addCategoryApp(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondWorkplaceForbidden(c)
 		return
 	}
 	categoryNo := c.Param("category_no")
@@ -271,31 +272,31 @@ func (m *manager) addCategoryApp(c *wkhttp.Context) {
 	var req reqVO
 	if err := c.BindJSON(&req); err != nil {
 		m.Error(common.ErrData.Error(), zap.Error(err))
-		c.ResponseError(common.ErrData)
+		respondWorkplaceRequestInvalid(c, "")
 		return
 	}
 	if categoryNo == "" {
-		c.ResponseError(errors.New("分类编号不能为空"))
+		respondWorkplaceRequestInvalid(c, "category_no")
 		return
 	}
 	if len(req.AppIds) == 0 {
-		c.ResponseError(errors.New("应用ID不能为空"))
+		respondWorkplaceRequestInvalid(c, "app_ids")
 		return
 	}
 	appList, err := m.wpDB.queryAppWithAppIds(req.AppIds)
 	if err != nil {
 		m.Error("查询一批应用错误", zap.Error(err))
-		c.ResponseError(errors.New("查询一批应用错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceQueryFailed, nil, nil)
 		return
 	}
 	if len(appList) != len(req.AppIds) {
-		c.ResponseError(errors.New("添加的应用不存在"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceAppNotFound, nil, nil)
 		return
 	}
 	apps, err := m.wpDB.queryAppWithCategroyNo(categoryNo)
 	if err != nil {
 		m.Error("查询该分类下应用错误", zap.Error(err))
-		c.ResponseError(errors.New("查询该分类下应用错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceQueryFailed, nil, nil)
 		return
 	}
 	saveIds := make([]string, 0)
@@ -320,7 +321,7 @@ func (m *manager) addCategoryApp(c *wkhttp.Context) {
 	maxSortNumApp, err := m.db.queryMaxSortNumCategoryApp(categoryNo)
 	if err != nil {
 		m.Error("查询分类应用最大序号错误", zap.Error(err))
-		c.ResponseError(errors.New("查询分类应用最大序号错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceQueryFailed, nil, nil)
 		return
 	}
 	maxNum := 0
@@ -330,13 +331,13 @@ func (m *manager) addCategoryApp(c *wkhttp.Context) {
 	tx, err := m.ctx.DB().Begin()
 	if err != nil {
 		m.Error("开启事务失败！", zap.Error(err))
-		c.ResponseError(errors.New("开启事务失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 		return
 	}
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
-			c.ResponseError(errors.New("服务器内部错误"))
+			respondWorkplaceInternal(c)
 			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
@@ -350,7 +351,7 @@ func (m *manager) addCategoryApp(c *wkhttp.Context) {
 		if err != nil {
 			tx.Rollback()
 			m.Error("添加分类下app错误", zap.Error(err))
-			c.ResponseError(errors.New("添加分类下app错误"))
+			httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 			return
 		}
 		tempSortNum--
@@ -358,7 +359,7 @@ func (m *manager) addCategoryApp(c *wkhttp.Context) {
 	err = tx.Commit()
 	if err != nil {
 		m.Error("数据库事物提交失败", zap.Error(err))
-		c.ResponseError(errors.New("数据库事物提交失败"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -366,7 +367,7 @@ func (m *manager) addCategoryApp(c *wkhttp.Context) {
 func (m *manager) reorderCategoryApp(c *wkhttp.Context) {
 	err := c.CheckLoginRole()
 	if err != nil {
-		c.ResponseError(err)
+		respondWorkplaceForbidden(c)
 		return
 	}
 	categoryNo := c.Param("category_no")
@@ -376,27 +377,27 @@ func (m *manager) reorderCategoryApp(c *wkhttp.Context) {
 	var req reqVO
 	if err := c.BindJSON(&req); err != nil {
 		m.Error(common.ErrData.Error(), zap.Error(err))
-		c.ResponseError(common.ErrData)
+		respondWorkplaceRequestInvalid(c, "")
 		return
 	}
 	if categoryNo == "" {
-		c.ResponseError(errors.New("分类编号不能为空"))
+		respondWorkplaceRequestInvalid(c, "category_no")
 		return
 	}
 	if len(req.AppIds) == 0 {
-		c.ResponseError(errors.New("应用ID不能为空"))
+		respondWorkplaceRequestInvalid(c, "app_ids")
 		return
 	}
 	tx, err := m.ctx.DB().Begin()
 	if err != nil {
 		m.Error("开启事务失败！", zap.Error(err))
-		c.ResponseError(errors.New("开启事务失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 		return
 	}
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
-			c.ResponseError(errors.New("服务器内部错误"))
+			respondWorkplaceInternal(c)
 			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
@@ -406,7 +407,7 @@ func (m *manager) reorderCategoryApp(c *wkhttp.Context) {
 		if err != nil {
 			tx.Rollback()
 			m.Error("修改分类下app排序错误", zap.Error(err))
-			c.ResponseError(errors.New("修改分类下app排序错误"))
+			httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 			return
 		}
 		tempSortNum--
@@ -414,7 +415,7 @@ func (m *manager) reorderCategoryApp(c *wkhttp.Context) {
 	err = tx.Commit()
 	if err != nil {
 		m.Error("数据库事物提交失败", zap.Error(err))
-		c.ResponseError(errors.New("数据库事物提交失败"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -423,18 +424,18 @@ func (m *manager) reorderCategoryApp(c *wkhttp.Context) {
 func (m *manager) getCategoryApps(c *wkhttp.Context) {
 	err := c.CheckLoginRole()
 	if err != nil {
-		c.ResponseError(err)
+		respondWorkplaceForbidden(c)
 		return
 	}
 	categoryNo := c.Param("category_no")
 	if categoryNo == "" {
-		c.ResponseError(errors.New("分类编号不能为空"))
+		respondWorkplaceRequestInvalid(c, "category_no")
 		return
 	}
 	apps, err := m.wpDB.queryAppWithCategroyNo(categoryNo)
 	if err != nil {
 		m.Error("获取分类下的app错误", zap.Error(err))
-		c.ResponseError(errors.New("获取分类下的app错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceQueryFailed, nil, nil)
 		return
 	}
 
@@ -462,26 +463,26 @@ func (m *manager) getCategoryApps(c *wkhttp.Context) {
 func (m *manager) updateBanner(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondWorkplaceForbidden(c)
 		return
 	}
 	bannerNo := c.Param("banner_no")
 	var req bannerReq
 	if err := c.BindJSON(&req); err != nil {
 		m.Error(common.ErrData.Error(), zap.Error(err))
-		c.ResponseError(common.ErrData)
+		respondWorkplaceRequestInvalid(c, "")
 		return
 	}
 	if bannerNo == "" {
-		c.ResponseError(errors.New("横幅编号不能为空"))
+		respondWorkplaceRequestInvalid(c, "banner_no")
 		return
 	}
 	if strings.TrimSpace(req.Route) == "" {
-		c.ResponseError(errors.New("横幅跳转地址不能为空"))
+		respondWorkplaceRequestInvalid(c, "route")
 		return
 	}
 	if strings.TrimSpace(req.Cover) == "" {
-		c.ResponseError(errors.New("横幅封面不能为空"))
+		respondWorkplaceRequestInvalid(c, "cover")
 		return
 	}
 	err = m.db.updateBanner(&bannerModel{
@@ -494,7 +495,7 @@ func (m *manager) updateBanner(c *wkhttp.Context) {
 	})
 	if err != nil {
 		m.Error("修改横幅错误", zap.Error(err))
-		c.ResponseError(errors.New("修改横幅错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -503,13 +504,13 @@ func (m *manager) updateBanner(c *wkhttp.Context) {
 func (m *manager) getBanners(c *wkhttp.Context) {
 	err := c.CheckLoginRole()
 	if err != nil {
-		c.ResponseError(err)
+		respondWorkplaceForbidden(c)
 		return
 	}
 	banners, err := m.wpDB.queryBanner()
 	if err != nil {
 		m.Error("查询横幅错误", zap.Error(err))
-		c.ResponseError(errors.New("查询横幅错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceQueryFailed, nil, nil)
 		return
 	}
 	list := make([]*bannerResp, 0)
@@ -533,18 +534,18 @@ func (m *manager) getBanners(c *wkhttp.Context) {
 func (m *manager) deleteBanner(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondWorkplaceForbidden(c)
 		return
 	}
 	bannerNo := c.Param("banner_no")
 	if bannerNo == "" {
-		c.ResponseError(errors.New("横幅编号不能为空"))
+		respondWorkplaceRequestInvalid(c, "banner_no")
 		return
 	}
 	err = m.db.deleteBanner(bannerNo)
 	if err != nil {
 		m.Error("删除横幅错误", zap.Error(err))
-		c.ResponseError(errors.New("删除横幅错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -553,14 +554,14 @@ func (m *manager) deleteBanner(c *wkhttp.Context) {
 func (m *manager) getCategory(c *wkhttp.Context) {
 	err := c.CheckLoginRole()
 	if err != nil {
-		c.ResponseError(err)
+		respondWorkplaceForbidden(c)
 		return
 	}
 	list := make([]*categoryResp, 0)
 	models, err := m.db.queryCategory()
 	if err != nil {
 		m.Error("查询所有分类错误", zap.Error(err))
-		c.ResponseError(errors.New("查询所有分类错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceQueryFailed, nil, nil)
 		return
 	}
 	if len(models) > 0 {
@@ -578,21 +579,21 @@ func (m *manager) getCategory(c *wkhttp.Context) {
 func (m *manager) addBanner(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondWorkplaceForbidden(c)
 		return
 	}
 	var req bannerReq
 	if err := c.BindJSON(&req); err != nil {
 		m.Error(common.ErrData.Error(), zap.Error(err))
-		c.ResponseError(common.ErrData)
+		respondWorkplaceRequestInvalid(c, "")
 		return
 	}
 	if strings.TrimSpace(req.Route) == "" {
-		c.ResponseError(errors.New("横幅跳转地址不能为空"))
+		respondWorkplaceRequestInvalid(c, "route")
 		return
 	}
 	if strings.TrimSpace(req.Cover) == "" {
-		c.ResponseError(errors.New("横幅封面不能为空"))
+		respondWorkplaceRequestInvalid(c, "cover")
 		return
 	}
 	err = m.db.insertBanner(&bannerModel{
@@ -605,7 +606,7 @@ func (m *manager) addBanner(c *wkhttp.Context) {
 	})
 	if err != nil {
 		m.Error("新增横幅信息错误", zap.Error(err))
-		c.ResponseError(errors.New("新增横幅信息错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -613,32 +614,32 @@ func (m *manager) addBanner(c *wkhttp.Context) {
 func (m *manager) updateApp(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondWorkplaceForbidden(c)
 		return
 	}
 	appId := c.Param("app_id")
 	var req updateAppReq
 	if err := c.BindJSON(&req); err != nil {
 		m.Error(common.ErrData.Error(), zap.Error(err))
-		c.ResponseError(common.ErrData)
+		respondWorkplaceRequestInvalid(c, "")
 		return
 	}
-	if err := req.checkAddAPP(); err != nil {
-		c.ResponseError(err)
+	if field := req.checkAddAPP(); field != "" {
+		respondWorkplaceRequestInvalid(c, field)
 		return
 	}
 	if strings.TrimSpace(appId) == "" {
-		c.ResponseError(errors.New("修改的应用ID不能为空"))
+		respondWorkplaceRequestInvalid(c, "app_id")
 		return
 	}
 	app, err := m.wpDB.queryAppWithAppId(appId)
 	if err != nil {
 		m.Error("查询应用信息错误", zap.Error(err))
-		c.ResponseError(errors.New("查询应用信息错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceQueryFailed, nil, nil)
 		return
 	}
 	if app == nil {
-		c.ResponseError(errors.New("该应用不存在"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceAppNotFound, nil, nil)
 		return
 	}
 	app.AppCategory = req.AppCategory
@@ -653,7 +654,7 @@ func (m *manager) updateApp(c *wkhttp.Context) {
 	err = m.db.updateApp(app)
 	if err != nil {
 		m.Error("修改应用信息错误", zap.Error(err))
-		c.ResponseError(errors.New("修改应用信息错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -662,18 +663,18 @@ func (m *manager) updateApp(c *wkhttp.Context) {
 func (m *manager) deleteApp(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondWorkplaceForbidden(c)
 		return
 	}
 	appId := c.Param("app_id")
 	if appId == "" {
-		c.ResponseError(errors.New("分类ID和应用ID均不能为空"))
+		respondWorkplaceRequestInvalid(c, "app_id")
 		return
 	}
 	app, err := m.wpDB.queryAppWithAppId(appId)
 	if err != nil {
 		m.Error("查询app信息错误", zap.Error(err))
-		c.ResponseError(errors.New("查询app信息错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceQueryFailed, nil, nil)
 		return
 	}
 	if app == nil {
@@ -683,13 +684,13 @@ func (m *manager) deleteApp(c *wkhttp.Context) {
 	tx, err := m.ctx.DB().Begin()
 	if err != nil {
 		m.Error("开启事务失败！", zap.Error(err))
-		c.ResponseError(errors.New("开启事务失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 		return
 	}
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
-			c.ResponseError(errors.New("服务器内部错误"))
+			respondWorkplaceInternal(c)
 			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
@@ -697,33 +698,33 @@ func (m *manager) deleteApp(c *wkhttp.Context) {
 	if err != nil {
 		tx.Rollback()
 		m.Error("删除应用错误", zap.Error(err))
-		c.ResponseError(errors.New("删除应用错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 		return
 	}
 	err = m.db.deleteCategoryAppTx(appId, tx)
 	if err != nil {
 		tx.Rollback()
 		m.Error("删除分类下应用错误", zap.Error(err))
-		c.ResponseError(errors.New("删除分类下应用错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 		return
 	}
 	err = m.db.deleteUserAppTx(appId, tx)
 	if err != nil {
 		tx.Rollback()
 		m.Error("删除用户app错误", zap.Error(err))
-		c.ResponseError(errors.New("删除用户app错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 		return
 	}
 	err = m.db.deleteUserRecordAppTx(appId, tx)
 	if err != nil {
 		tx.Rollback()
 		m.Error("删除用户app使用记录错误", zap.Error(err))
-		c.ResponseError(errors.New("删除用户app使用记录错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 		return
 	}
 	if err = tx.Commit(); err != nil {
 		m.Error("数据库事物提交失败", zap.Error(err))
-		c.ResponseError(errors.New("数据库事物提交失败"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -732,7 +733,7 @@ func (m *manager) deleteApp(c *wkhttp.Context) {
 func (m *manager) reorderCategory(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondWorkplaceForbidden(c)
 		return
 	}
 	type reqVO struct {
@@ -741,19 +742,19 @@ func (m *manager) reorderCategory(c *wkhttp.Context) {
 	var req reqVO
 	if err := c.BindJSON(&req); err != nil {
 		m.Error(common.ErrData.Error(), zap.Error(err))
-		c.ResponseError(common.ErrData)
+		respondWorkplaceRequestInvalid(c, "")
 		return
 	}
 	tx, err := m.ctx.DB().Begin()
 	if err != nil {
 		m.Error("开启事务失败！", zap.Error(err))
-		c.ResponseError(errors.New("开启事务失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 		return
 	}
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
-			c.ResponseError(errors.New("服务器内部错误"))
+			respondWorkplaceInternal(c)
 			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
@@ -763,7 +764,7 @@ func (m *manager) reorderCategory(c *wkhttp.Context) {
 		if err != nil {
 			tx.Rollback()
 			m.Error("修改分类排序错误", zap.Error(err))
-			c.ResponseError(errors.New("修改分类排序错误"))
+			httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 			return
 		}
 		tempSortNum--
@@ -771,7 +772,7 @@ func (m *manager) reorderCategory(c *wkhttp.Context) {
 	err = tx.Commit()
 	if err != nil {
 		m.Error("数据库事物提交失败", zap.Error(err))
-		c.ResponseError(errors.New("数据库事物提交失败"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -780,27 +781,27 @@ func (m *manager) reorderCategory(c *wkhttp.Context) {
 func (m *manager) addApp(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondWorkplaceForbidden(c)
 		return
 	}
 	var req appReq
 	if err := c.BindJSON(&req); err != nil {
 		m.Error(common.ErrData.Error(), zap.Error(err))
-		c.ResponseError(common.ErrData)
+		respondWorkplaceRequestInvalid(c, "")
 		return
 	}
-	if err := req.checkAddAPP(); err != nil {
-		c.ResponseError(err)
+	if field := req.checkAddAPP(); field != "" {
+		respondWorkplaceRequestInvalid(c, field)
 		return
 	}
 	app, err := m.db.queryAppWithAppNameAndCategoryNo(req.Name)
 	if err != nil {
 		m.Error("查询此分类下app是否存在此名称错误", zap.Error(err))
-		c.ResponseError(errors.New("查询此分类下app是否存在此名称错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceQueryFailed, nil, nil)
 		return
 	}
 	if app != nil && len(app.AppID) > 0 {
-		c.ResponseError(errors.New("此应用名已存在"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceAppNameExists, nil, nil)
 		return
 	}
 
@@ -818,7 +819,7 @@ func (m *manager) addApp(c *wkhttp.Context) {
 	})
 	if err != nil {
 		m.Error("新增应用错误", zap.Error(err))
-		c.ResponseError(errors.New("新增应用错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -827,7 +828,7 @@ func (m *manager) addApp(c *wkhttp.Context) {
 func (m *manager) addCategory(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondWorkplaceForbidden(c)
 		return
 	}
 	type reqVO struct {
@@ -836,23 +837,23 @@ func (m *manager) addCategory(c *wkhttp.Context) {
 	var req reqVO
 	if err := c.BindJSON(&req); err != nil {
 		m.Error(common.ErrData.Error(), zap.Error(err))
-		c.ResponseError(common.ErrData)
+		respondWorkplaceRequestInvalid(c, "")
 		return
 	}
 	category, err := m.db.queryCateogryWithName(req.Name)
 	if err != nil {
 		m.Error("通过分类名查询分类错误", zap.Error(err))
-		c.ResponseError(errors.New("通过分类名查询分类错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceQueryFailed, nil, nil)
 		return
 	}
 	if category != nil && len(category.CategoryNo) > 0 {
-		c.ResponseError(errors.New("该分类名称已存在"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceCategoryNameExists, nil, nil)
 		return
 	}
 	maxSortNumCategory, err := m.db.queryMaxSortNumCategory()
 	if err != nil {
 		m.Error("查询最大序号分类错误", zap.Error(err))
-		c.ResponseError(errors.New("查询最大序号分类错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceQueryFailed, nil, nil)
 		return
 	}
 	var sortNum = 1
@@ -866,23 +867,26 @@ func (m *manager) addCategory(c *wkhttp.Context) {
 	})
 	if err != nil {
 		m.Error("新增分类错误", zap.Error(err))
-		c.ResponseError(errors.New("新增分类错误"))
+		httperr.ResponseErrorL(c, errcode.ErrWorkplaceStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
 }
 
-func (req *appReq) checkAddAPP() error {
+// checkAddAPP validates the app create/update payload and returns the offending
+// JSON field name (empty when valid) so the handler can surface it via the
+// err.server.workplace.request_invalid Details contract instead of a raw string.
+func (req *appReq) checkAddAPP() string {
 	if strings.TrimSpace(req.Name) == "" {
-		return errors.New("应用名称不能为空")
+		return "name"
 	}
 	if strings.TrimSpace(req.AppRoute) == "" {
-		return errors.New("应用打开地址不能为空")
+		return "app_route"
 	}
 	if strings.TrimSpace(req.Icon) == "" {
-		return errors.New("应用logo不能为空")
+		return "icon"
 	}
-	return nil
+	return ""
 }
 
 type updateAppReq struct {
