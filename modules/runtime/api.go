@@ -69,6 +69,7 @@ func (rt *Runtime) Route(r *wkhttp.WKHttp) {
 		auth.GET("/runtimes/bots", rt.listBots)
 		auth.GET("/runtimes/bots/:id", rt.getBot)
 		auth.DELETE("/runtimes/bots/:id", rt.archiveBot)
+		auth.GET("/runtimes/bots/:id/feed", rt.getBotFeed)
 	}
 }
 

@@ -1,11 +1,14 @@
 package runtime
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -505,4 +508,67 @@ func generateBotToken() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
 	return "bf_" + hex.EncodeToString(b)
+}
+
+// GET /v1/runtimes/bots/:id/feed?limit=50
+// Proxies octo-matter /api/v1/internal/bots/:bot_uid/feed.
+// PoC4: derives matter base URL from a recent bot_task row for this bot.
+// If the bot has never run a task there's no callback URL — return empty.
+func (rt *Runtime) getBotFeed(c *wkhttp.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		c.ResponseError(errors.New("invalid id"))
+		return
+	}
+	m, err := rt.db.queryBotByID(id)
+	if err != nil || m == nil {
+		c.ResponseError(errors.New("bot not found"))
+		return
+	}
+	loginUID := c.GetLoginUID()
+	if m.OwnerUID != loginUID {
+		c.ResponseErrorWithStatus(errors.New("no permission"), http.StatusForbidden)
+		return
+	}
+
+	var matterBaseURL string
+	_ = rt.db.session.SelectBySql(
+		`SELECT matter_base_url FROM bot_task WHERE bot_uid=? AND matter_base_url!='' ORDER BY id DESC LIMIT 1`,
+		m.BotUID,
+	).LoadOne(&matterBaseURL)
+	if matterBaseURL == "" {
+		c.Response(gin.H{"items": []any{}})
+		return
+	}
+
+	limit := c.DefaultQuery("limit", "50")
+	token := os.Getenv("NOTIFY_INTERNAL_TOKEN")
+	if token == "" {
+		c.ResponseError(errors.New("NOTIFY_INTERNAL_TOKEN unset on server"))
+		return
+	}
+	endpoint := strings.TrimRight(matterBaseURL, "/") + "/api/v1/internal/bots/" + m.BotUID + "/feed?limit=" + limit
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		c.ResponseError(fmt.Errorf("build proxy request: %v", err))
+		return
+	}
+	req.Header.Set("X-Internal-Token", token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		c.ResponseError(fmt.Errorf("proxy GET: %v", err))
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+	if resp.StatusCode >= 300 {
+		rt.Warn("matter feed proxy non-2xx", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
+		c.ResponseError(fmt.Errorf("matter feed: status %d", resp.StatusCode))
+		return
+	}
+	c.Writer.Header().Set("Content-Type", "application/json")
+	_, _ = c.Writer.Write(body)
 }
