@@ -152,9 +152,9 @@ func loadProvider() (ProviderConfig, error) {
 		ReturnToHosts: getStringSlice("DM_OIDC_RETURN_TO_HOSTS", nil),
 
 		// RP-Initiated Logout(可选):缺省即禁用 end_session 跳转,纯增量不影响存量部署。
-		PostLogoutRedirectURI: getString("DM_OIDC_POST_LOGOUT_REDIRECT_URI", ""),
-		EndSessionURL:         getString("DM_OIDC_PROVIDER_END_SESSION_URL", ""),
-		IDTokenTTL:            getDurationWithAlias("DM_OIDC_PROVIDER_ID_TOKEN_TTL", "", 7*24*time.Hour),
+		PostLogoutRedirectURI: getString("OCTO_OIDC_POST_LOGOUT_REDIRECT_URI", ""),
+		EndSessionURL:         getString("OCTO_OIDC_PROVIDER_END_SESSION_URL", ""),
+		IDTokenTTL:            getDurationWithAlias("OCTO_OIDC_PROVIDER_ID_TOKEN_TTL", "", 7*24*time.Hour),
 	}
 
 	// 用 slice 保证检查顺序稳定,缺多个字段时报第一项固定,排查体验更好。
