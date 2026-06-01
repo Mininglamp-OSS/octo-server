@@ -165,6 +165,7 @@ func (m *MockProvider) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
 		"authorization_endpoint":                m.Issuer + "/authorize",
 		"token_endpoint":                        m.Issuer + "/oauth/token",
 		"userinfo_endpoint":                     m.Issuer + "/userinfo",
+		"end_session_endpoint":                  m.Issuer + "/end_session",
 		"jwks_uri":                              m.Issuer + "/keys",
 		"response_types_supported":              []string{"code"},
 		"subject_types_supported":               []string{"public"},

@@ -145,6 +145,11 @@ type Client struct {
 	verifier *oidc.IDTokenVerifier
 	oauth2   *oauth2.Config
 	http     *http.Client
+
+	// endSession 从 Discovery 文档的 end_session_endpoint 解出(RP-Initiated Logout)。
+	// go-oidc 的 Provider 只暴露 auth/token/userinfo/jwks,end_session 需要额外
+	// 从原始 metadata claims 取。Discovery 未声明时为空,logout 退回 config override 或降级。
+	endSession string
 }
 
 // NewClient 走 Discovery 拉 issuer metadata,构造 Client。
@@ -172,6 +177,14 @@ func NewClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 			return time.Now().Add(-skew)
 		},
 	})
+
+	// end_session_endpoint 不在 go-oidc 的 Provider 公开字段里,从原始 Discovery
+	// metadata 解。解析失败/字段缺失时留空 —— 不阻断 Client 构造,logout 自行降级。
+	var extra struct {
+		EndSessionEndpoint string `json:"end_session_endpoint"`
+	}
+	_ = provider.Claims(&extra)
+
 	return &Client{
 		cfg:      cfg,
 		provider: provider,
@@ -183,9 +196,14 @@ func NewClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 			Endpoint:     provider.Endpoint(),
 			Scopes:       cfg.Scopes,
 		},
-		http: hc,
+		http:       hc,
+		endSession: extra.EndSessionEndpoint,
 	}, nil
 }
+
+// EndSessionEndpoint 返回 Discovery 暴露的 RP-Initiated Logout 端点;
+// IdP 未声明时返回空字符串。
+func (c *Client) EndSessionEndpoint() string { return c.endSession }
 
 // Issuer 返回 issuer URL(便于断言/审计)。
 func (c *Client) Issuer() string { return c.cfg.Issuer }

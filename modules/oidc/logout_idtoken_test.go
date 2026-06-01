@@ -1,0 +1,233 @@
+package oidc
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
+	"github.com/gin-gonic/gin"
+)
+
+// fakeIDTokenStore 内存版 id_token_hint 存取,断言 logout 拼 URL 与一次性消费。
+type fakeIDTokenStore struct {
+	mu      sync.Mutex
+	tokens  map[string]string
+	saveErr error
+	takeErr error
+}
+
+func newFakeIDTokenStore() *fakeIDTokenStore {
+	return &fakeIDTokenStore{tokens: make(map[string]string)}
+}
+
+func (f *fakeIDTokenStore) Save(_ context.Context, uid, idToken string, _ time.Duration) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.saveErr != nil {
+		return f.saveErr
+	}
+	f.tokens[uid] = idToken
+	return nil
+}
+
+func (f *fakeIDTokenStore) Take(_ context.Context, uid string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.takeErr != nil {
+		return "", f.takeErr
+	}
+	v := f.tokens[uid]
+	delete(f.tokens, uid)
+	return v, nil
+}
+
+func (f *fakeIDTokenStore) get(uid string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.tokens[uid]
+}
+
+// runLogout 模拟 AuthMiddleware 已校验,把 uid 注入 gin.Context 后调 logout handler。
+func runLogout(o *OIDC, uid string) *httptest.ResponseRecorder {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.POST("/v1/auth/oidc/aegis/logout", func(c *gin.Context) {
+		if uid != "" {
+			c.Set("uid", uid)
+		}
+		o.logout(wrapWk(c))
+	})
+	req := httptest.NewRequest("POST", "/v1/auth/oidc/aegis/logout", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	return w
+}
+
+func decodeLogoutBody(t *testing.T, w *httptest.ResponseRecorder) map[string]interface{} {
+	t.Helper()
+	var m map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &m); err != nil {
+		t.Fatalf("decode logout body %q: %v", w.Body.String(), err)
+	}
+	return m
+}
+
+// 配置齐全(回跳地址 + end_session 端点 + 存有 id_token)时,logout 应在 200 响应里
+// 返回 end_session_url,带 id_token_hint + post_logout_redirect_uri,且 id_token 被消费。
+func TestAPI_Logout_ReturnsEndSessionURL(t *testing.T) {
+	mp := NewMockProvider(t)
+	o := newTestOIDC(t, mp, &fakeUserLookup{}, newFakeIdentityStore())
+	o.killer = &fakeKiller{}
+	o.revoker = &fakeRevoker{}
+	ids := newFakeIDTokenStore()
+	ids.tokens["u-1"] = "raw-id-token-xyz"
+	o.idTokens = ids
+	o.cfg.Provider.PostLogoutRedirectURI = "https://app.example.com/login"
+
+	w := runLogout(o, "u-1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	raw, _ := decodeLogoutBody(t, w)["end_session_url"].(string)
+	if raw == "" {
+		t.Fatalf("missing end_session_url; body=%s", w.Body.String())
+	}
+	if !strings.HasPrefix(raw, mp.Issuer+"/end_session") {
+		t.Errorf("end_session_url = %q, want prefix %q", raw, mp.Issuer+"/end_session")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("parse end_session_url: %v", err)
+	}
+	if got := u.Query().Get("id_token_hint"); got != "raw-id-token-xyz" {
+		t.Errorf("id_token_hint = %q, want raw-id-token-xyz", got)
+	}
+	if got := u.Query().Get("post_logout_redirect_uri"); got != "https://app.example.com/login" {
+		t.Errorf("post_logout_redirect_uri = %q", got)
+	}
+	if ids.get("u-1") != "" {
+		t.Errorf("id_token should be consumed (one-time) after logout")
+	}
+}
+
+// 没有存 id_token(非 OIDC 登录 / 已过期)时,logout 仍 200 + 踢线 + 吊销,
+// 但不返回 end_session_url —— 前端据此降级为仅清本地。
+func TestAPI_Logout_NoIDToken_OmitsURL(t *testing.T) {
+	mp := NewMockProvider(t)
+	o := newTestOIDC(t, mp, &fakeUserLookup{}, newFakeIdentityStore())
+	killer := &fakeKiller{}
+	revoker := &fakeRevoker{}
+	o.killer = killer
+	o.revoker = revoker
+	o.idTokens = newFakeIDTokenStore() // 空
+	o.cfg.Provider.PostLogoutRedirectURI = "https://app.example.com/login"
+
+	w := runLogout(o, "u-2")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if _, ok := decodeLogoutBody(t, w)["end_session_url"]; ok {
+		t.Errorf("end_session_url should be omitted when no id_token stored")
+	}
+	if got := killer.snapshot(); len(got) != 1 || got[0] != "u-2" {
+		t.Errorf("kick should still happen, got %v", got)
+	}
+}
+
+// 未配置 post_logout_redirect_uri 时,即便有 id_token 也不返回 end_session_url。
+func TestAPI_Logout_NoRedirectConfig_OmitsURL(t *testing.T) {
+	mp := NewMockProvider(t)
+	o := newTestOIDC(t, mp, &fakeUserLookup{}, newFakeIdentityStore())
+	o.killer = &fakeKiller{}
+	o.revoker = &fakeRevoker{}
+	ids := newFakeIDTokenStore()
+	ids.tokens["u-3"] = "tok"
+	o.idTokens = ids
+	// PostLogoutRedirectURI 默认空
+
+	w := runLogout(o, "u-3")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if _, ok := decodeLogoutBody(t, w)["end_session_url"]; ok {
+		t.Errorf("end_session_url should be omitted when redirect URI not configured")
+	}
+}
+
+// callback 成功后应把验签过的 id_token 存进 idTokenStore,供后续 RP-Initiated Logout
+// 取用作 id_token_hint。存储失败不阻断登录(best-effort),此处只断言成功路径存了。
+func TestAPI_Callback_StoresIDTokenForLogout(t *testing.T) {
+	mp := NewMockProvider(t)
+	mp.PrepUser("sub-LT", map[string]interface{}{
+		"email":          "lt@example.com",
+		"email_verified": true,
+		"name":           "LT",
+	})
+	users := &fakeUserLookup{
+		loginResp: &IssueSessionResp{UID: "u-lt", LoginRespJSON: `{"token":"t-lt"}`},
+	}
+	store := newFakeIdentityStore()
+	_ = store.Insert(&IdentityModel{UID: "u-lt", Issuer: mp.Issuer, Subject: "sub-LT"})
+
+	o := newTestOIDC(t, mp, users, store)
+	ids := newFakeIDTokenStore()
+	o.idTokens = ids
+	r := newTestRouter(o)
+
+	req := httptest.NewRequest("GET", "/v1/auth/oidc/aegis/authorize?authcode=ac-lt&return_to=/home", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	authURL, _ := url.Parse(w.Header().Get("Location"))
+	state := authURL.Query().Get("state")
+	mp.PrepCode("code-lt", "sub-LT", authURL.Query().Get("nonce"))
+
+	req2 := httptest.NewRequest("GET", "/v1/auth/oidc/aegis/callback?state="+state+"&code=code-lt", nil)
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusFound {
+		t.Fatalf("callback status = %d, body=%s", w2.Code, w2.Body.String())
+	}
+	if ids.get("u-lt") == "" {
+		t.Errorf("expected id_token stored for uid u-lt after successful callback")
+	}
+}
+
+// buildEndSessionURL 直接单测:EndSessionURL override 生效;已带 query 的端点要保留;
+// id_token_hint / post_logout_redirect_uri 中的特殊字符要正确转义。
+func TestBuildEndSessionURL_OverrideAndEscaping(t *testing.T) {
+	ids := newFakeIDTokenStore()
+	ids.tokens["u"] = "tok with space&amp"
+	o := &OIDC{
+		Log:      log.NewTLog("OIDC-test"),
+		idTokens: ids,
+		cfg: &Config{Provider: ProviderConfig{
+			EndSessionURL:         "https://idp.example.com/end?foo=bar",
+			PostLogoutRedirectURI: "https://app.example.com/login?next=/x y",
+		}},
+	}
+	got := o.buildEndSessionURL(context.Background(), "u")
+	if got == "" {
+		t.Fatal("buildEndSessionURL returned empty")
+	}
+	u, err := url.Parse(got)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	q := u.Query()
+	if q.Get("foo") != "bar" {
+		t.Errorf("pre-existing query foo=bar lost: %q", got)
+	}
+	if q.Get("id_token_hint") != "tok with space&amp" {
+		t.Errorf("id_token_hint not round-tripped: %q", q.Get("id_token_hint"))
+	}
+	if q.Get("post_logout_redirect_uri") != "https://app.example.com/login?next=/x y" {
+		t.Errorf("post_logout_redirect_uri not round-tripped: %q", q.Get("post_logout_redirect_uri"))
+	}
+}

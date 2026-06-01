@@ -72,6 +72,22 @@ type ProviderConfig struct {
 	// (DM_OIDC_RETURN_TO_HOSTS,逗号分隔)。空列表表示禁用 return_to,
 	// 防开放重定向是 P1.2 必须做的硬约束。
 	ReturnToHosts []string
+
+	// ---- RP-Initiated Logout(可选,#215)----
+
+	// PostLogoutRedirectURI logout 成功后让 IdP 回跳的地址(写死的登录页)。
+	// 空时 logout 不生成 end_session_url,前端退回"仅清本地"。安全考量:此值由
+	// 运维写死、不接受前端传入,因此无需在服务端再做 redirect 白名单 —— 单值即白名单。
+	// 上线前需在 IdP 侧注册该回跳地址。
+	PostLogoutRedirectURI string
+
+	// EndSessionURL 覆盖/兜底 IdP 的 end_session 端点。优先级高于 Discovery 解析值,
+	// 仅在 Discovery 未暴露 end_session_endpoint 时才需要配置。
+	EndSessionURL string
+
+	// IDTokenTTL callback 成功后缓存 id_token(供 logout 当 id_token_hint)的 TTL。
+	// 默认对齐 RT 生命周期(7d),覆盖用户登录后较长时间才登出的场景。
+	IDTokenTTL time.Duration
 }
 
 // LoadConfig 从环境变量加载 OIDC 配置
@@ -134,6 +150,11 @@ func loadProvider() (ProviderConfig, error) {
 		SyncConcurrency: getIntWithAlias("DM_OIDC_PROVIDER_SYNC_CONCURRENCY", "DM_OIDC_AEGIS_SYNC_CONCURRENCY", 10),
 
 		ReturnToHosts: getStringSlice("DM_OIDC_RETURN_TO_HOSTS", nil),
+
+		// RP-Initiated Logout(可选):缺省即禁用 end_session 跳转,纯增量不影响存量部署。
+		PostLogoutRedirectURI: getString("DM_OIDC_POST_LOGOUT_REDIRECT_URI", ""),
+		EndSessionURL:         getString("DM_OIDC_PROVIDER_END_SESSION_URL", ""),
+		IDTokenTTL:            getDurationWithAlias("DM_OIDC_PROVIDER_ID_TOKEN_TTL", "", 7*24*time.Hour),
 	}
 
 	// 用 slice 保证检查顺序稳定,缺多个字段时报第一项固定,排查体验更好。
@@ -159,6 +180,12 @@ func loadProvider() (ProviderConfig, error) {
 
 	if !providerIDRe.MatchString(p.ID) {
 		return p, fmt.Errorf("DM_OIDC_PROVIDER_ID %q invalid: must match %s", p.ID, providerIDRe)
+	}
+
+	// IDTokenTTL<=0 会让 Redis SET 的过期变成"永不过期"(go-redis 语义),id_token
+	// 密文将永久驻留。误配 0 / 负值时钳回默认 7d,杜绝该 footgun。
+	if p.IDTokenTTL <= 0 {
+		p.IDTokenTTL = 7 * 24 * time.Hour
 	}
 
 	keyB64 := getString("DM_OIDC_RT_ENC_KEY", "")

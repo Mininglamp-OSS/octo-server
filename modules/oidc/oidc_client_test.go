@@ -50,6 +50,16 @@ func TestClient_Discover(t *testing.T) {
 	}
 }
 
+// EndSessionEndpoint 应从 Discovery 文档的 end_session_endpoint 解出,
+// 供 logout 拼 RP-Initiated Logout URL。
+func TestClient_EndSessionEndpoint_FromDiscovery(t *testing.T) {
+	mp := NewMockProvider(t)
+	c := newTestClient(t, mp)
+	if got, want := c.EndSessionEndpoint(), mp.Issuer+"/end_session"; got != want {
+		t.Errorf("EndSessionEndpoint() = %q, want %q", got, want)
+	}
+}
+
 // Cycle 6 RED: 用 refresh_token 换新 token。
 func TestClient_Refresh(t *testing.T) {
 	mp := NewMockProvider(t)
