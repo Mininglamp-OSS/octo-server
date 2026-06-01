@@ -91,6 +91,8 @@ func TestAPI_Logout_ReturnsEndSessionURL(t *testing.T) {
 	ids.tokens["u-1"] = "raw-id-token-xyz"
 	o.idTokens = ids
 	o.cfg.Provider.PostLogoutRedirectURI = "https://app.example.com/login"
+	// MockProvider 的 end_session 端点是 http(httptest),dev 放宽位允许 http。
+	t.Setenv("OCTO_OIDC_LOGOUT_ALLOW_INSECURE", "1")
 
 	w := runLogout(o, "u-1")
 	if w.Code != http.StatusOK {
@@ -129,6 +131,7 @@ func TestAPI_Logout_NoIDToken_OmitsURL(t *testing.T) {
 	o.revoker = revoker
 	o.idTokens = newFakeIDTokenStore() // 空
 	o.cfg.Provider.PostLogoutRedirectURI = "https://app.example.com/login"
+	t.Setenv("OCTO_OIDC_LOGOUT_ALLOW_INSECURE", "1") // 让流程走到 Take(端点是 http mock)
 
 	w := runLogout(o, "u-2")
 	if w.Code != http.StatusOK {
@@ -193,6 +196,7 @@ func TestAPI_Logout_TakeError_OmitsURL(t *testing.T) {
 	ids.takeErr = errors.New("redis down")
 	o.idTokens = ids
 	o.cfg.Provider.PostLogoutRedirectURI = "https://app.example.com/login"
+	t.Setenv("OCTO_OIDC_LOGOUT_ALLOW_INSECURE", "1") // 让流程走到 Take 才能触发 takeErr
 
 	w := runLogout(o, "u-e")
 	if w.Code != http.StatusOK {

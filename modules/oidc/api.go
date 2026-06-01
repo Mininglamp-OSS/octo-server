@@ -912,12 +912,29 @@ func (o *OIDC) endSessionEndpoint() string {
 //   - 无可用 end_session 端点。
 //
 // 取出 id_token 即一次性消费(Take 内部删除)。不带 state(Aegis Discovery 未声明)。
+//
+// 顺序很关键:先解析+校验端点,再消费 id_token。原因有二:
+//   - 端点非法时不白烧 token(GETDEL 不可逆),logout 仍可重试拿到 end_session_url;
+//   - end_session 端点可能来自 discovery(非 config override,未经启动期校验),这里统一
+//     过一道 https 校验 —— 防 IdP 万一下发 http:// 把带 id_token 的 URL 降级到非 https。
 func (o *OIDC) buildEndSessionURL(ctx context.Context, uid string) string {
 	if o.cfg == nil || o.cfg.Provider.PostLogoutRedirectURI == "" || o.idTokens == nil {
 		return ""
 	}
 	endpoint := o.endSessionEndpoint()
 	if endpoint == "" {
+		return ""
+	}
+	// 校验 + 解析端点(在消费 token 之前)。validateLogoutURL 强制绝对 https
+	// (dev 可 OCTO_OIDC_LOGOUT_ALLOW_INSECURE=1),覆盖 discovery 与 override 两种来源。
+	if err := validateLogoutURL("end_session_endpoint", endpoint); err != nil {
+		o.Error("OIDC logout end_session 端点不合法,跳过 IdP 登出", zap.String("endpoint", endpoint), zap.Error(err))
+		return ""
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		// 只记端点本身,不记含 id_token 的完整 URL。
+		o.Error("OIDC logout 解析 end_session 端点失败", zap.String("endpoint", endpoint), zap.Error(err))
 		return ""
 	}
 	idToken, err := o.idTokens.Take(ctx, uid)
@@ -927,12 +944,6 @@ func (o *OIDC) buildEndSessionURL(ctx context.Context, uid string) string {
 		return ""
 	}
 	if idToken == "" {
-		return ""
-	}
-	u, err := url.Parse(endpoint)
-	if err != nil {
-		// 只记端点本身,不记含 id_token 的完整 URL。
-		o.Error("OIDC logout 解析 end_session 端点失败", zap.String("endpoint", endpoint), zap.Error(err))
 		return ""
 	}
 	q := u.Query()
