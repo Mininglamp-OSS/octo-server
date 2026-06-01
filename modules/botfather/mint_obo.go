@@ -1,0 +1,76 @@
+package botfather
+
+import (
+	"fmt"
+
+	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"go.uber.org/zap"
+)
+
+// MintBotResult is the result of a successful OBO bot mint.
+type MintBotResult struct {
+	BotUID   string // robot_id, also used as IM uid
+	BotToken string // bf_xxx token for /v1/bot/* authentication
+}
+
+// MintBotOBO creates a bot on behalf of ownerUID, scoped to the given space.
+//
+// Unlike the IM /newbot flow (which has space fallback and command-handler
+// state), this is a non-interactive call intended for service-to-service use
+// (e.g. the runtime module creating a bot automatically when a managed agent
+// is provisioned). spaceID is required — no fallback to creator's first space.
+//
+// botToken must be supplied by the caller so that the bot-mint identifier
+// scheme stays in the caller's namespace.
+//
+// Steps mirror tryCreateBotCore + the post-create block of createBot:
+//  1. create app (idempotent on robot_id)
+//  2. insert robot row
+//  3. add user (Robot=1)
+//  4. add bot to space_member (logged-and-continue on failure)
+//  5. friend owner <-> bot bidirectional (logged-and-continue on failure)
+func MintBotOBO(ctx *config.Context, ownerUID, spaceID, displayName, botToken string) (*MintBotResult, error) {
+	if ownerUID == "" {
+		return nil, fmt.Errorf("MintBotOBO: ownerUID required")
+	}
+	if spaceID == "" {
+		return nil, fmt.Errorf("MintBotOBO: spaceID required (OBO mode has no fallback)")
+	}
+	if displayName == "" {
+		return nil, fmt.Errorf("MintBotOBO: displayName required")
+	}
+	if botToken == "" {
+		return nil, fmt.Errorf("MintBotOBO: botToken required")
+	}
+
+	h := newCommandHandler(ctx)
+
+	robotID, err := h.createBotCoreWithRetry(ownerUID, displayName, botToken)
+	if err != nil {
+		return nil, fmt.Errorf("MintBotOBO: createBotCore: %w", err)
+	}
+
+	_, err = h.ctx.DB().InsertBySql(
+		"INSERT IGNORE INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW())",
+		spaceID, robotID,
+	).Exec()
+	if err != nil {
+		h.Warn("MintBotOBO: bot 加入 Space 失败",
+			zap.Error(err), zap.String("bot_uid", robotID), zap.String("space_id", spaceID))
+	}
+
+	if err := h.userService.AddFriend(ownerUID, &user.FriendReq{UID: ownerUID, ToUID: robotID}); err != nil {
+		h.Warn("MintBotOBO: 好友 owner->bot 失败", zap.Error(err))
+	}
+	if err := h.userService.AddFriend(robotID, &user.FriendReq{UID: robotID, ToUID: ownerUID}); err != nil {
+		h.Warn("MintBotOBO: 好友 bot->owner 失败", zap.Error(err))
+	}
+	h.fixFriendVersion(ownerUID, robotID)
+	h.fixFriendVersion(robotID, ownerUID)
+
+	return &MintBotResult{
+		BotUID:   robotID,
+		BotToken: botToken,
+	}, nil
+}

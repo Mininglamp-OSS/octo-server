@@ -48,6 +48,13 @@ func (rt *Runtime) Route(r *wkhttp.WKHttp) {
 		daemon.POST("/deregister", rt.deregister)
 		daemon.POST("/ping/:ping_id", rt.pingReport)
 		daemon.POST("/upgrade/:task_id", rt.upgradeReport)
+		daemon.POST("/managed-agents/:id/ack", rt.ackManagedAgent)
+		daemon.POST("/bot-tasks/:id/ack", rt.ackBotTask)
+	}
+
+	internal := r.Group("/v1/internal", rt.internalTokenAuth())
+	{
+		internal.POST("/bot-tasks", rt.createBotTask)
 	}
 
 	auth := r.Group("/v1", rt.ctx.AuthMiddleware(r))
@@ -58,6 +65,9 @@ func (rt *Runtime) Route(r *wkhttp.WKHttp) {
 		auth.GET("/runtimes/ping/:ping_id", rt.pingGet)
 		auth.POST("/runtimes/upgrade", rt.upgradeInit)
 		auth.GET("/runtimes/upgrade/:task_id", rt.upgradeGet)
+		auth.POST("/runtimes/managed-agents", rt.createManagedAgent)
+		auth.GET("/runtimes/managed-agents/:id", rt.getManagedAgent)
+		auth.POST("/runtimes/:runtime_id/agents/:agent_id/bots", rt.addBotToManagedAgent)
 	}
 }
 
@@ -260,6 +270,20 @@ func (rt *Runtime) heartbeat(c *wkhttp.Context) {
 			"checksum":       claimedUpgrade.Checksum,
 			"metadata":       claimedUpgrade.Metadata,
 		}
+	}
+
+	// Atomically claim a pending managed-agent provisioning command for this
+	// daemon. PoC pull-based dispatch: server marks status=dispatched + sets
+	// claim_token; daemon executes openclaw side-effects then POSTs ack back.
+	claimedAgent, _ := rt.db.claimPendingManagedAgentCommand(existing.DaemonID)
+	if claimedAgent != nil {
+		resp["pending_command"] = rt.buildPendingAgentCommand(claimedAgent)
+	}
+
+	// Same pull pattern for matter-driven bot tasks.
+	claimedTask, _ := rt.db.claimPendingBotTask(existing.DaemonID)
+	if claimedTask != nil {
+		resp["pending_task"] = rt.buildPendingBotTask(claimedTask)
 	}
 
 	c.Response(resp)
