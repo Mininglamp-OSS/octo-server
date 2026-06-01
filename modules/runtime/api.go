@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -41,6 +42,15 @@ func New(ctx *config.Context) *Runtime {
 }
 
 func (rt *Runtime) Route(r *wkhttp.WKHttp) {
+	// PR-A.2: runtime module routes are deprecated in favor of octo-fleet
+	// (see spec docs/superpowers/specs/2026-06-01-octo-fleet-extraction-design.md).
+	// Default OFF — set LEGACY_RUNTIME_ROUTES=true to re-enable (rollback
+	// path during fleet rollout). Schema migrations still apply
+	// unconditionally so a re-enable returns to a working state.
+	if os.Getenv("LEGACY_RUNTIME_ROUTES") != "true" {
+		rt.Info("legacy runtime HTTP routes disabled (set LEGACY_RUNTIME_ROUTES=true to restore)")
+		return
+	}
 	daemon := r.Group("/v1/daemon", rt.authAPIKey())
 	{
 		daemon.POST("/register", rt.register)
