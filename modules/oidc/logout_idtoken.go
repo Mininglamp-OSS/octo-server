@@ -107,3 +107,12 @@ func (s *redisIDTokenStore) Close() error {
 func idTokenKey(uid string) string {
 	return idTokenKeyPrefix + uid
 }
+
+// bindIDTokenKey 自助绑定接管阶段(bind_pending)的暂存键。
+//
+// bind 路径的 callback 还不知道最终 uid,无法按 uid 存;先按 bind token(jti)暂存,
+// confirm/create 拿到 uid 后再迁移(见 OIDC.promoteBindIDToken)。"bind:" 前缀与正常
+// 的 uid 键命名空间隔离 —— uid 不会以 "bind:" 开头。jti 本身已是 32B base64,无注入风险。
+func bindIDTokenKey(jti string) string {
+	return "bind:" + jti
+}

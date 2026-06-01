@@ -335,6 +335,8 @@ func (o *OIDC) bindConfirm(c *wkhttp.Context) {
 		return
 	}
 	m.result = "ok"
+	// bind 完成,迁移 callback 阶段按 jti 暂存的 id_token 到 uid,供 logout 用。
+	o.promoteBindIDToken(ctx, req.Token, resp.UID)
 	// 回填原发起设备的 ThirdAuthcode key,让 A 设备的轮询能拿到 LoginRespJSON
 	// (FR-6.3 跨设备流转)。同设备时这一步与 response body 等价,前端任选其一。
 	// 写失败不致命:用户在 B 设备(当前)已经拿到了 LoginRespJSON。
@@ -483,6 +485,8 @@ func (o *OIDC) bindCreate(c *wkhttp.Context) {
 		return
 	}
 	m.result = "ok"
+	// bind 建号完成,迁移 callback 阶段按 jti 暂存的 id_token 到 uid,供 logout 用。
+	o.promoteBindIDToken(ctx, req.Token, resp.UID)
 	if resp.SD != nil && resp.SD.ClientAuthcode != "" && o.authcode != nil {
 		if e := o.authcode.SetAuthcode(ctx, resp.SD.ClientAuthcode,
 			resp.IssueResp.LoginRespJSON, thirdAuthcodeTTL); e != nil {

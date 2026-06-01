@@ -135,12 +135,16 @@ func New(ctx *config.Context) *OIDC {
 	o.audit = db
 	o.revoker = db
 	o.killer = ctxKiller{ctx: ctx}
-	// id_token 缓存(RP-Initiated Logout)。密钥已在 LoadConfig 校验为 32B,
-	// 这里构造失败仅记日志并禁用 end_session 跳转,不影响登录主流程。
-	if enc, eerr := NewEncryptor(cfg.Provider.RefreshTokenEncryptionKey); eerr != nil {
-		o.Error("构造 id_token Encryptor 失败,RP-Initiated Logout 禁用", zap.Error(eerr))
-	} else {
-		o.idTokens = newRedisIDTokenStore(ctx, enc)
+	// id_token 缓存(RP-Initiated Logout)仅在配置了回跳地址、功能确实可用时才启用。
+	// 缺省未配 PostLogoutRedirectURI 的部署里 buildEndSessionURL 永远返回空,此时不应
+	// 把每次登录的 id_token(含 PII 的签名 JWT)加密写 Redis 存 7 天,也不必白占一个
+	// 连接池。密钥已在 LoadConfig 校验为 32B,构造失败仅记日志降级,不影响登录主流程。
+	if cfg.Provider.PostLogoutRedirectURI != "" {
+		if enc, eerr := NewEncryptor(cfg.Provider.RefreshTokenEncryptionKey); eerr != nil {
+			o.Error("构造 id_token Encryptor 失败,RP-Initiated Logout 禁用", zap.Error(eerr))
+		} else {
+			o.idTokens = newRedisIDTokenStore(ctx, enc)
+		}
 	}
 	o.cbGuard = NewCallbackGuard(
 		ctx.GetRedisConn(),
@@ -575,6 +579,8 @@ func (o *OIDC) callback(c *wkhttp.Context) {
 			jti, ierr := o.bind.IssueWithReason(c.Request.Context(), claims, sd, reason)
 			if ierr == nil {
 				result = "bind_pending" // 已在 callbackResultLabels 注册
+				// bind 接管时尚不知 uid,先按 jti 暂存 id_token,confirm/create 后迁移到 uid。
+				o.saveBindIDTokenHint(c.Request.Context(), jti, rawID)
 				o.writeAudit("bind:"+subHash(jti), EventBindIssued, sd, "")
 				o.redirectToBindPage(c, sd, jti)
 				return
@@ -928,6 +934,39 @@ func (o *OIDC) buildEndSessionURL(ctx context.Context, uid string) string {
 	q.Set("post_logout_redirect_uri", o.cfg.Provider.PostLogoutRedirectURI)
 	u.RawQuery = q.Encode()
 	return u.String()
+}
+
+// saveBindIDTokenHint 在自助绑定接管(callback bind_pending)时,按 bind token(jti)
+// 暂存验签过的 id_token,TTL 对齐 bind session —— bind 路径的 callback 还不知道最终
+// uid,无法直接按 uid 存。confirm/create 成功后由 promoteBindIDToken 迁移到 uid 名下。
+// 仅在 RP-Initiated Logout 启用(idTokens!=nil)时生效;best-effort,失败不阻断绑定。
+func (o *OIDC) saveBindIDTokenHint(ctx context.Context, jti, rawID string) {
+	if o.idTokens == nil || jti == "" || rawID == "" {
+		return
+	}
+	if err := o.idTokens.Save(ctx, bindIDTokenKey(jti), rawID, o.cfg.Bind.TokenTTL); err != nil {
+		o.Warn("OIDC bind 暂存 id_token 失败(不影响绑定,仅 RP-logout 降级)", zap.Error(err))
+	}
+}
+
+// promoteBindIDToken 把 bind 接管阶段按 jti 暂存的 id_token 迁移到已确定的 uid 名下,
+// 供后续 logout 当 id_token_hint。一次性消费 jti 暂存项(Take 内部删除);无值时静默
+// (非 OIDC bind 登录 / 已过期 / 功能未启用)。best-effort,失败不阻断绑定完成。
+func (o *OIDC) promoteBindIDToken(ctx context.Context, jti, uid string) {
+	if o.idTokens == nil || jti == "" || uid == "" {
+		return
+	}
+	raw, err := o.idTokens.Take(ctx, bindIDTokenKey(jti))
+	if err != nil {
+		o.Warn("OIDC bind 取暂存 id_token 失败,跳过 RP-logout 缓存", zap.Error(err))
+		return
+	}
+	if raw == "" {
+		return
+	}
+	if err := o.idTokens.Save(ctx, uid, raw, o.cfg.Provider.IDTokenTTL); err != nil {
+		o.Warn("OIDC bind 迁移 id_token 到 uid 失败", zap.Error(err))
+	}
 }
 
 func (o *OIDC) failWithAuthcode(ctx context.Context, sd *StateData, claims *IDTokenClaims, err error) {

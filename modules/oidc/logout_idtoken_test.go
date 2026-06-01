@@ -161,6 +161,77 @@ func TestAPI_Logout_NoRedirectConfig_OmitsURL(t *testing.T) {
 	}
 }
 
+// idTokens 未启用(nil,缺省未配 PostLogoutRedirectURI)时,logout 仍 200 且不返回
+// end_session_url —— 守住 #1 修复的降级路径。
+func TestAPI_Logout_NilStore_OmitsURL(t *testing.T) {
+	mp := NewMockProvider(t)
+	o := newTestOIDC(t, mp, &fakeUserLookup{}, newFakeIdentityStore())
+	o.killer = &fakeKiller{}
+	o.revoker = &fakeRevoker{}
+	o.idTokens = nil // 功能禁用
+	o.cfg.Provider.PostLogoutRedirectURI = "https://app.example.com/login"
+
+	w := runLogout(o, "u-x")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if _, ok := decodeLogoutBody(t, w)["end_session_url"]; ok {
+		t.Errorf("end_session_url must be omitted when id_token store disabled")
+	}
+}
+
+// 自助绑定接管(callback bind_pending)时,应按 bind token(jti)暂存 id_token,
+// 供 confirm/create 后迁移到 uid。校验暂存键 = bindIDTokenKey(redirect 的 token 参数)。
+func TestAPI_Callback_BindPending_StoresIDTokenUnderBindKey(t *testing.T) {
+	mp := NewMockProvider(t)
+	mp.PrepUser("sub-newcomer", map[string]interface{}{
+		"email": "nobody@example.com", "email_verified": true, "name": "Newcomer",
+	})
+	users := &fakeUserLookup{}
+	store := newFakeIdentityStore()
+	o := newTestOIDC(t, mp, users, store)
+	o.cfg.Provider.AllowNewUser = false
+	o.service = newService(o.cfg.Provider, store, users)
+	o.cfg.Bind = BindConfig{
+		Enabled: true, IssuerAllowlist: []string{mp.Issuer}, TokenTTL: time.Minute,
+		VerifyMax: 5, OTPSendMax: 3, ConfirmMax: 3, UIDFailPerDay: 10,
+		Methods:      []BindMethod{BindMethodPassword, BindMethodSMSOTP},
+		RedirectBase: "https://im.example.com/oidc/bind",
+	}
+	o.bind = newBindService(o.cfg.Bind, newMemoryBindStore(), &fakeBindAuth{}, &fakeBindLocator{
+		byUsername: map[string]string{}, byPhone: map[string][]string{},
+	})
+	ids := newFakeIDTokenStore()
+	o.idTokens = ids
+	r := newTestRouter(o)
+
+	req := httptest.NewRequest("GET", "/v1/auth/oidc/aegis/authorize?authcode=front-bind&return_to=/home", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	authURL, _ := url.Parse(w.Header().Get("Location"))
+	state := authURL.Query().Get("state")
+	mp.PrepCode("idp-code", "sub-newcomer", authURL.Query().Get("nonce"))
+
+	req2 := httptest.NewRequest("GET", "/v1/auth/oidc/aegis/callback?state="+state+"&code=idp-code", nil)
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusFound {
+		t.Fatalf("callback status=%d body=%s", w2.Code, w2.Body.String())
+	}
+	loc, _ := url.Parse(w2.Header().Get("Location"))
+	jti := loc.Query().Get("token")
+	if jti == "" {
+		t.Fatalf("bind redirect missing token; loc=%s", w2.Header().Get("Location"))
+	}
+	if got := ids.get(bindIDTokenKey(jti)); got == "" {
+		t.Errorf("id_token must be stashed under bind key %q during bind_pending", bindIDTokenKey(jti))
+	}
+	// 还没确定 uid,不应有 uid 键
+	if ids.get("u-newcomer") != "" {
+		t.Errorf("must not store under uid before confirm/create")
+	}
+}
+
 // callback 成功后应把验签过的 id_token 存进 idTokenStore,供后续 RP-Initiated Logout
 // 取用作 id_token_hint。存储失败不阻断登录(best-effort),此处只断言成功路径存了。
 func TestAPI_Callback_StoresIDTokenForLogout(t *testing.T) {

@@ -715,6 +715,68 @@ func TestAPI_BindCreate_HappyPath(t *testing.T) {
 	}
 }
 
+// bind/confirm 成功后,应把 callback 阶段按 jti 暂存的 id_token 迁移到 uid 名下
+// (#215 review #2:bind 登录路径也要能拿到 end_session_url),并消费掉 jti 暂存项。
+func TestAPI_BindConfirm_PromotesIDToken(t *testing.T) {
+	o, jti, auth, loc, _, _, users, _ := newTestOIDCWithBindFull(t, defaultBindCfg(), sampleClaims(), false)
+	auth.verifyPasswordResp.matched = true
+	loc.byUsername["alice"] = "u-alice"
+	users.resp = &IssueSessionResp{UID: "u-alice", LoginRespJSON: `{"token":"t-alice"}`}
+	ids := newFakeIDTokenStore()
+	ids.tokens[bindIDTokenKey(jti)] = "raw-bind-idtoken" // 模拟 callback bind_pending 暂存
+	o.idTokens = ids
+	r := newTestBindRouter(o)
+
+	body, _ := json.Marshal(map[string]string{"token": jti, "identifier": "alice", "password": "Pwd@1"})
+	req := httptest.NewRequest("POST", "/v1/auth/oidc/aegis/bind/verify/password", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("verify status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	body2, _ := json.Marshal(map[string]string{"token": jti})
+	req2 := httptest.NewRequest("POST", "/v1/auth/oidc/aegis/bind/confirm", bytes.NewReader(body2))
+	req2.Header.Set("Content-Type", "application/json")
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("confirm status=%d body=%s", w2.Code, w2.Body.String())
+	}
+	if got := ids.get("u-alice"); got != "raw-bind-idtoken" {
+		t.Errorf("id_token not promoted to uid: got %q", got)
+	}
+	if ids.get(bindIDTokenKey(jti)) != "" {
+		t.Errorf("bind-pending id_token must be consumed after confirm")
+	}
+}
+
+// bind/create 成功后同样迁移暂存的 id_token 到新建 uid。
+func TestAPI_BindCreate_PromotesIDToken(t *testing.T) {
+	o, jti, _, _, _, _, users, _ := newTestOIDCWithBindFull(t, defaultBindCfg(), sampleClaims(), false)
+	users.resp = &IssueSessionResp{UID: "u-created", LoginRespJSON: `{"token":"t-created"}`}
+	ids := newFakeIDTokenStore()
+	ids.tokens[bindIDTokenKey(jti)] = "raw-bind-idtoken"
+	o.idTokens = ids
+	r := newTestBindRouter(o)
+
+	body, _ := json.Marshal(map[string]string{"token": jti})
+	req := httptest.NewRequest("POST", "/v1/auth/oidc/aegis/bind/create", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("create status=%d body=%s", w.Code, w.Body.String())
+	}
+	if got := ids.get("u-created"); got != "raw-bind-idtoken" {
+		t.Errorf("id_token not promoted to uid: got %q", got)
+	}
+	if ids.get(bindIDTokenKey(jti)) != "" {
+		t.Errorf("bind-pending id_token must be consumed after create")
+	}
+}
+
 // T31: token 缺失/非法 → 400
 func TestAPI_BindCreate_MissingToken(t *testing.T) {
 	o, _, _, _, _, _, _, _ := newTestOIDCWithBindFull(t, defaultBindCfg(), nil, true)
