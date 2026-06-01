@@ -3,6 +3,7 @@ package oidc
 import (
 	"encoding/base64"
 	"fmt"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -86,7 +87,9 @@ type ProviderConfig struct {
 	EndSessionURL string
 
 	// IDTokenTTL callback 成功后缓存 id_token(供 logout 当 id_token_hint)的 TTL。
-	// 默认对齐 RT 生命周期(7d),覆盖用户登录后较长时间才登出的场景。
+	// 默认对齐 RT 生命周期(7 天 = 168h),覆盖用户登录后较长时间才登出的场景。
+	// 注意 env 值用 time.ParseDuration 解析,只认 h/m/s —— 写 "7d" 会解析失败并静默
+	// 回落默认,要 7 天请填 "168h"。
 	IDTokenTTL time.Duration
 }
 
@@ -188,6 +191,16 @@ func loadProvider() (ProviderConfig, error) {
 		p.IDTokenTTL = 7 * 24 * time.Hour
 	}
 
+	// RP-Initiated Logout 的两个 URL 都会进浏览器顶层跳转(end_session 还携带 id_token),
+	// 启动期 fail-loud 校验为绝对 https,拦相对地址 / javascript: 等,杜绝误配把 token
+	// 发去任意域或在导航时执行脚本。与 validateBindRedirectBase 同模式。空值=功能未开,跳过。
+	if err := validateLogoutURL("OCTO_OIDC_POST_LOGOUT_REDIRECT_URI", p.PostLogoutRedirectURI); err != nil {
+		return p, err
+	}
+	if err := validateLogoutURL("OCTO_OIDC_PROVIDER_END_SESSION_URL", p.EndSessionURL); err != nil {
+		return p, err
+	}
+
 	keyB64 := getString("DM_OIDC_RT_ENC_KEY", "")
 	if keyB64 == "" {
 		return p, fmt.Errorf("required env DM_OIDC_RT_ENC_KEY is empty")
@@ -201,6 +214,33 @@ func loadProvider() (ProviderConfig, error) {
 	}
 	p.RefreshTokenEncryptionKey = key
 	return p, nil
+}
+
+// validateLogoutURL 启动期 fail-loud 校验 RP-Initiated Logout 相关 URL 为绝对 https。
+//
+// 空值视作"功能未开",直接放行(可选配置)。非空时必须是绝对地址且 https,拦
+// 相对地址 / javascript: / data: 等 —— 这两个值最终都会进浏览器顶层跳转,
+// EndSessionURL 还携带 id_token,误配会把 token 发去任意域或在导航时执行脚本。
+// 开发环境可用 OCTO_OIDC_LOGOUT_ALLOW_INSECURE=1 放宽到 http(与 bind 的同名机制对齐)。
+func validateLogoutURL(envName, raw string) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("oidc: invalid %s %q: %w", envName, raw, err)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("oidc: %s %q must be absolute (scheme://host/path)", envName, raw)
+	}
+	if u.Scheme == "https" {
+		return nil
+	}
+	if u.Scheme == "http" && getBool("OCTO_OIDC_LOGOUT_ALLOW_INSECURE", false) {
+		return nil
+	}
+	return fmt.Errorf("oidc: %s %q must use https scheme "+
+		"(set OCTO_OIDC_LOGOUT_ALLOW_INSECURE=1 to allow http for dev)", envName, raw)
 }
 
 func getString(key, def string) string {

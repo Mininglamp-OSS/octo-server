@@ -135,17 +135,6 @@ func New(ctx *config.Context) *OIDC {
 	o.audit = db
 	o.revoker = db
 	o.killer = ctxKiller{ctx: ctx}
-	// id_token 缓存(RP-Initiated Logout)仅在配置了回跳地址、功能确实可用时才启用。
-	// 缺省未配 PostLogoutRedirectURI 的部署里 buildEndSessionURL 永远返回空,此时不应
-	// 把每次登录的 id_token(含 PII 的签名 JWT)加密写 Redis 存 7 天,也不必白占一个
-	// 连接池。密钥已在 LoadConfig 校验为 32B,构造失败仅记日志降级,不影响登录主流程。
-	if cfg.Provider.PostLogoutRedirectURI != "" {
-		if enc, eerr := NewEncryptor(cfg.Provider.RefreshTokenEncryptionKey); eerr != nil {
-			o.Error("构造 id_token Encryptor 失败,RP-Initiated Logout 禁用", zap.Error(eerr))
-		} else {
-			o.idTokens = newRedisIDTokenStore(ctx, enc)
-		}
-	}
 	o.cbGuard = NewCallbackGuard(
 		ctx.GetRedisConn(),
 		callbackGuardThresholdFromEnv(),
@@ -170,6 +159,18 @@ func New(ctx *config.Context) *OIDC {
 		return o
 	}
 	o.client = client
+	// id_token 缓存(RP-Initiated Logout)仅在功能"确实可用"时启用:既配了回跳地址
+	// (PostLogoutRedirectURI),又拿得到 end_session 端点(discovery 或 override)。
+	// 缺任一项时 buildEndSessionURL 永远返回空,此时不应把每次登录的 id_token(含 PII
+	// 的签名 JWT)加密写 Redis,也不必白占连接池。放在 client 构造之后才能判端点可用性。
+	// 密钥已在 LoadConfig 校验为 32B,构造失败仅记日志降级,不影响登录主流程。
+	if cfg.Provider.PostLogoutRedirectURI != "" && o.endSessionEndpoint() != "" {
+		if enc, eerr := NewEncryptor(cfg.Provider.RefreshTokenEncryptionKey); eerr != nil {
+			o.Error("构造 id_token Encryptor 失败,RP-Initiated Logout 禁用", zap.Error(eerr))
+		} else {
+			o.idTokens = newRedisIDTokenStore(ctx, enc)
+		}
+	}
 	return o
 }
 
@@ -824,9 +825,14 @@ func (o *OIDC) Close() error {
 //
 // IdP 端 RP-Initiated Logout(/end_session)的跳转地址由后端拼好后随 200 响应返回
 // (end_session_url 字段),前端做顶层跳转。后端收口的原因:本架构 code→token 在
-// 服务端完成,前端从不持有 id_token,无法自行构造 id_token_hint;且 end_session 端点 /
-// 参数 / 回跳白名单集中在服务端更易维护。真正终止 Aegis 会话仍依赖浏览器顶层跳转
-// 携带 IdP 域 cookie,所以后端只给 URL,不代理跳转。
+// 服务端完成,前端无法自行*构造* id_token_hint(它不经手 token 交换),也不应散落
+// end_session 端点 / 参数 / 回跳白名单这些 IdP 细节 —— 由后端给出单次性 URL 最稳妥。
+// 真正终止 IdP 会话仍依赖浏览器顶层跳转携带 IdP 域 cookie,所以后端只给 URL,不代理跳转。
+//
+// 信任模型说明:end_session_url 里必然带 id_token_hint(RFC 规定的 front-channel 参数),
+// 因此该 id_token 会暴露到前端 JS、浏览器历史、Referer 及 IdP 访问日志 —— 这是
+// RP-Initiated Logout 协议固有的。可接受:它是单次性、不可重放的登出提示(octo-server
+// 自身从不把它当 bearer/assertion 复用),取出即原子作废(luaGetDel)。
 //
 // 配置缺失(未配 PostLogoutRedirectURI / 无 end_session 端点 / 无缓存的 id_token)时
 // 省略 end_session_url,前端降级为仅清本地 —— 纯增量,不影响存量行为。

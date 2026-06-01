@@ -3,6 +3,7 @@ package oidc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -177,6 +178,62 @@ func TestAPI_Logout_NilStore_OmitsURL(t *testing.T) {
 	}
 	if _, ok := decodeLogoutBody(t, w)["end_session_url"]; ok {
 		t.Errorf("end_session_url must be omitted when id_token store disabled")
+	}
+}
+
+// 取 id_token 出错(Redis 抖动)时,logout 仍 200 且省略 end_session_url —— 守住
+// "best-effort 降级"契约的 Take 错误分支。
+func TestAPI_Logout_TakeError_OmitsURL(t *testing.T) {
+	mp := NewMockProvider(t)
+	o := newTestOIDC(t, mp, &fakeUserLookup{}, newFakeIdentityStore())
+	o.killer = &fakeKiller{}
+	o.revoker = &fakeRevoker{}
+	ids := newFakeIDTokenStore()
+	ids.tokens["u-e"] = "tok"
+	ids.takeErr = errors.New("redis down")
+	o.idTokens = ids
+	o.cfg.Provider.PostLogoutRedirectURI = "https://app.example.com/login"
+
+	w := runLogout(o, "u-e")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (best-effort)", w.Code)
+	}
+	if _, ok := decodeLogoutBody(t, w)["end_session_url"]; ok {
+		t.Errorf("end_session_url must be omitted when Take errors")
+	}
+}
+
+// 缓存 id_token 出错(Save 失败)时,callback 仍完成登录(302)—— 守住 Save 错误分支
+// 不阻断登录的契约。
+func TestAPI_Callback_IDTokenSaveError_LoginStillSucceeds(t *testing.T) {
+	mp := NewMockProvider(t)
+	mp.PrepUser("sub-se", map[string]interface{}{
+		"email": "se@example.com", "email_verified": true, "name": "SE",
+	})
+	users := &fakeUserLookup{loginResp: &IssueSessionResp{UID: "u-se", LoginRespJSON: `{"token":"t-se"}`}}
+	store := newFakeIdentityStore()
+	_ = store.Insert(&IdentityModel{UID: "u-se", Issuer: mp.Issuer, Subject: "sub-se"})
+	o := newTestOIDC(t, mp, users, store)
+	ids := newFakeIDTokenStore()
+	ids.saveErr = errors.New("redis down")
+	o.idTokens = ids
+	r := newTestRouter(o)
+
+	req := httptest.NewRequest("GET", "/v1/auth/oidc/aegis/authorize?authcode=ac-se&return_to=/home", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	authURL, _ := url.Parse(w.Header().Get("Location"))
+	state := authURL.Query().Get("state")
+	mp.PrepCode("code-se", "sub-se", authURL.Query().Get("nonce"))
+
+	req2 := httptest.NewRequest("GET", "/v1/auth/oidc/aegis/callback?state="+state+"&code=code-se", nil)
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusFound {
+		t.Fatalf("login must still succeed despite id_token save error; status=%d body=%s", w2.Code, w2.Body.String())
+	}
+	if ids.get("u-se") != "" {
+		t.Errorf("save failed, so nothing should be stored for uid")
 	}
 }
 

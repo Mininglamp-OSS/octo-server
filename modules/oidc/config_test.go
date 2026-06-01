@@ -311,8 +311,104 @@ func clearOIDCEnv(t *testing.T) {
 		"DM_OIDC_AEGIS_AUTO_LINK_BY_PHONE",
 		"DM_OIDC_AEGIS_ALLOW_NEW_USER",
 		"DM_OIDC_RT_ENC_KEY",
+		// RP-Initiated Logout(可选)
+		"OCTO_OIDC_POST_LOGOUT_REDIRECT_URI",
+		"OCTO_OIDC_PROVIDER_END_SESSION_URL",
+		"OCTO_OIDC_PROVIDER_ID_TOKEN_TTL",
+		"OCTO_OIDC_LOGOUT_ALLOW_INSECURE",
 	}
 	for _, k := range keys {
 		t.Setenv(k, "")
+	}
+}
+
+// setRequiredOIDCEnv 设齐 enabled + 必填项,供下面只想验单个可选项的用例复用。
+func setRequiredOIDCEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("DM_OIDC_ENABLED", "true")
+	t.Setenv("DM_OIDC_PROVIDER_ISSUER", "https://accounts.imocto.cn")
+	t.Setenv("DM_OIDC_PROVIDER_CLIENT_ID", "cid")
+	t.Setenv("DM_OIDC_PROVIDER_CLIENT_SECRET", "csecret")
+	t.Setenv("DM_OIDC_PROVIDER_REDIRECT_URI", "https://web.imocto.cn/cb")
+	t.Setenv("DM_OIDC_RT_ENC_KEY", base64.StdEncoding.EncodeToString(make([]byte, 32)))
+}
+
+// TTL:默认 7d=168h;合法 override 生效;"7d"(ParseDuration 不认 d)静默回落默认;
+// 0 / 负值被钳回默认 —— 杜绝 go-redis "永不过期" footgun。
+func TestLoadConfig_IDTokenTTL(t *testing.T) {
+	const def = 7 * 24 * time.Hour
+	cases := []struct {
+		name string
+		set  bool
+		val  string
+		want time.Duration
+	}{
+		{"default", false, "", def},
+		{"override 24h", true, "24h", 24 * time.Hour},
+		{"invalid 7d falls back", true, "7d", def},
+		{"zero clamped", true, "0", def},
+		{"negative clamped", true, "-5h", def},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clearOIDCEnv(t)
+			setRequiredOIDCEnv(t)
+			if tc.set {
+				t.Setenv("OCTO_OIDC_PROVIDER_ID_TOKEN_TTL", tc.val)
+			}
+			cfg, err := LoadConfig()
+			if err != nil {
+				t.Fatalf("LoadConfig: %v", err)
+			}
+			if cfg.Provider.IDTokenTTL != tc.want {
+				t.Errorf("IDTokenTTL = %v, want %v", cfg.Provider.IDTokenTTL, tc.want)
+			}
+		})
+	}
+}
+
+// validateLogoutURL:空=放行(可选);绝对 https 放行;相对/javascript:/非 http(s) 拒绝;
+// http 仅在 OCTO_OIDC_LOGOUT_ALLOW_INSECURE=1 时放行。
+func TestValidateLogoutURL(t *testing.T) {
+	cases := []struct {
+		name     string
+		raw      string
+		insecure bool
+		wantErr  bool
+	}{
+		{"empty ok", "", false, false},
+		{"https ok", "https://app.example.com/login", false, false},
+		{"relative rejected", "/login", false, true},
+		{"javascript rejected", "javascript:alert(1)", false, true},
+		{"ftp rejected", "ftp://host/x", false, true},
+		{"http rejected by default", "http://app.example.com/login", false, true},
+		{"http allowed with dev flag", "http://app.example.com/login", true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.insecure {
+				t.Setenv("OCTO_OIDC_LOGOUT_ALLOW_INSECURE", "1")
+			}
+			err := validateLogoutURL("OCTO_OIDC_POST_LOGOUT_REDIRECT_URI", tc.raw)
+			if tc.wantErr && err == nil {
+				t.Errorf("expected error for %q", tc.raw)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("unexpected error for %q: %v", tc.raw, err)
+			}
+		})
+	}
+}
+
+// LoadConfig 对非法 logout URL 启动期 fail-loud(整模块拒绝加载)。
+func TestLoadConfig_RejectsInsecureLogoutURL(t *testing.T) {
+	clearOIDCEnv(t)
+	setRequiredOIDCEnv(t)
+	t.Setenv("OCTO_OIDC_POST_LOGOUT_REDIRECT_URI", "http://insecure.example.com/login")
+
+	if _, err := LoadConfig(); err == nil {
+		t.Fatal("expected LoadConfig to reject non-https post_logout_redirect_uri")
+	} else if !strings.Contains(err.Error(), "OCTO_OIDC_POST_LOGOUT_REDIRECT_URI") {
+		t.Errorf("error should name the offending env, got: %v", err)
 	}
 }
