@@ -118,6 +118,10 @@ func TestAPI_Logout_ReturnsEndSessionURL(t *testing.T) {
 	if ids.get("u-1") != "" {
 		t.Errorf("id_token should be consumed (one-time) after logout")
 	}
+	// 含 id_token_hint 的响应必须禁缓存。
+	if got := w.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store", got)
+	}
 }
 
 // 没有存 id_token(非 OIDC 登录 / 已过期)时,logout 仍 200 + 踢线 + 吊销,

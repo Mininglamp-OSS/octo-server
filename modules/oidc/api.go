@@ -160,15 +160,23 @@ func New(ctx *config.Context) *OIDC {
 	}
 	o.client = client
 	// id_token 缓存(RP-Initiated Logout)仅在功能"确实可用"时启用:既配了回跳地址
-	// (PostLogoutRedirectURI),又拿得到 end_session 端点(discovery 或 override)。
-	// 缺任一项时 buildEndSessionURL 永远返回空,此时不应把每次登录的 id_token(含 PII
-	// 的签名 JWT)加密写 Redis,也不必白占连接池。放在 client 构造之后才能判端点可用性。
-	// 密钥已在 LoadConfig 校验为 32B,构造失败仅记日志降级,不影响登录主流程。
-	if cfg.Provider.PostLogoutRedirectURI != "" && o.endSessionEndpoint() != "" {
-		if enc, eerr := NewEncryptor(cfg.Provider.RefreshTokenEncryptionKey); eerr != nil {
-			o.Error("构造 id_token Encryptor 失败,RP-Initiated Logout 禁用", zap.Error(eerr))
-		} else {
-			o.idTokens = newRedisIDTokenStore(ctx, enc)
+	// (PostLogoutRedirectURI),又拿得到*合法 https* 的 end_session 端点(discovery 或
+	// override)。端点仅"非空"不够 —— 非法/非 https 端点下 logout 也出不了 URL
+	// (buildEndSessionURL 会拒),此时建池存 PII id_token 纯属浪费。放在 client 之后才能判
+	// 端点可用性。密钥已在 LoadConfig 校验为 32B,构造失败仅记日志降级,不影响登录主流程。
+	if cfg.Provider.PostLogoutRedirectURI != "" {
+		endpoint := o.endSessionEndpoint()
+		switch {
+		case endpoint == "" || validateLogoutURL("end_session_endpoint", endpoint) != nil:
+			// 配了回跳地址却拿不到可用端点:打 Info 让运维可见"为什么 RP-logout 没生效"。
+			o.Info("RP-Initiated Logout 已禁用:end_session 端点不可用(discovery 未提供且未配 override,或非 https)",
+				zap.String("endpoint", endpoint))
+		default:
+			if enc, eerr := NewEncryptor(cfg.Provider.RefreshTokenEncryptionKey); eerr != nil {
+				o.Error("构造 id_token Encryptor 失败,RP-Initiated Logout 禁用", zap.Error(eerr))
+			} else {
+				o.idTokens = newRedisIDTokenStore(ctx, enc)
+			}
 		}
 	}
 	return o
@@ -889,6 +897,9 @@ func (o *OIDC) logout(c *wkhttp.Context) {
 	// 此时省略字段,前端降级为仅清本地。end_session_url 含 id_token,不写日志。
 	if endSessionURL := o.buildEndSessionURL(ctx, uid); endSessionURL != "" {
 		resp["end_session_url"] = endSessionURL
+		// 响应体含 id_token_hint,禁止任何缓存(OAuth/OIDC 安全 BCP、RFC 6749 §5.1)。
+		c.Header("Cache-Control", "no-store")
+		c.Header("Pragma", "no-cache")
 	}
 	c.JSON(http.StatusOK, resp)
 }
