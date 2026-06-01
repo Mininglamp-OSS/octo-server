@@ -1741,6 +1741,39 @@ func TestCategory_SortCountMismatch(t *testing.T) {
 	assertCategoryErrorCode(t, ws, "err.server.category.sort_list_mismatch")
 }
 
+// TestCategory_SortDuplicateIDs covers the repeated-ID branch in sort: a
+// same-length category_ids list that contains a duplicate must be rejected as
+// sort_list_duplicate (not sort_list_mismatch). The duplicate guard runs before
+// the catMap membership check, so the repeat is caught even though every ID is a
+// real category. (PR #214 reviewer-requested endpoint coverage.)
+func TestCategory_SortDuplicateIDs(t *testing.T) {
+	s, ctx := newCategoryTestServer()
+	f := New(ctx)
+
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+	resetUIDRateLimit(t, ctx)
+
+	spaceID := "space-sortdup-001"
+	seedSpaceAndMember(t, f, spaceID, 0)
+	route := s.GetRoute()
+
+	// create 2 categories so the list length matches but contains a repeat
+	wc1 := createCategory(t, route, spaceID, "A")
+	require.Equal(t, http.StatusOK, wc1.Code)
+	cat1 := parseJSON(t, wc1)
+	wc2 := createCategory(t, route, spaceID, "B")
+	require.Equal(t, http.StatusOK, wc2.Code)
+
+	catID1 := cat1["category_id"].(string)
+	// same length (2) as the user's categories, but catID1 is repeated
+	ws := doRequest(t, route, "PUT", "/v1/spaces/"+spaceID+"/categories/sort", map[string]interface{}{
+		"category_ids": []string{catID1, catID1},
+	})
+	assert.Equal(t, http.StatusBadRequest, ws.Code)
+	assertCategoryErrorCode(t, ws, "err.server.category.sort_list_duplicate")
+}
+
 func TestCategory_MoveGroupNoSpace(t *testing.T) {
 	s, ctx := newCategoryTestServer()
 	f := New(ctx)
