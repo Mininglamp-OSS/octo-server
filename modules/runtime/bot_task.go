@@ -141,30 +141,20 @@ func (d *runtimeDB) updateBotTaskStatus(id int64, status, resultSummary, errMsg 
 	return err
 }
 
-// resolveBotBinding looks up which openclaw agent + daemon + runtime a bot is
-// currently bound to. PoC: it uses the managed_runtime_agent table populated
-// by PoC1 (web "Add bot" flow). If a bot was bound out-of-band (e.g. via raw
-// openclaw CLI) it won't be found here and the task will fail at insert time.
-func (d *runtimeDB) resolveBotBinding(spaceID, botUID string) (agentID, daemonID string, runtimeID int64, err error) {
-	type row struct {
-		AgentID   string `db:"agent_id"`
-		DaemonID  string `db:"daemon_id"`
-		RuntimeID int64  `db:"runtime_id"`
-	}
-	var r row
-	count, qerr := d.session.SelectBySql(
-		`SELECT agent_id, daemon_id, runtime_id FROM managed_runtime_agent
-		 WHERE space_id=? AND bot_uid=?
-		 ORDER BY id DESC LIMIT 1`,
-		spaceID, botUID,
-	).Load(&r)
+// resolveBotBinding looks up the bot row by uid. Returns workspace_id
+// (was agent_id in PoC1 schema; kept as named return for caller compat),
+// daemon_id, runtime_id, and runtime_kind. runtime_kind lets the caller
+// short-circuit non-openclaw dispatches before queueing a bot_task that
+// the daemon would never claim.
+func (d *runtimeDB) resolveBotBinding(spaceID, botUID string) (workspaceID, daemonID, runtimeKind string, runtimeID int64, err error) {
+	b, qerr := d.resolveBotByUID(spaceID, botUID)
 	if qerr != nil {
-		return "", "", 0, qerr
+		return "", "", "", 0, qerr
 	}
-	if count == 0 {
-		return "", "", 0, fmt.Errorf("no managed agent has bot_uid=%s in space=%s", botUID, spaceID)
+	if b == nil {
+		return "", "", "", 0, fmt.Errorf("no bot has bot_uid=%s in space=%s", botUID, spaceID)
 	}
-	return r.AgentID, r.DaemonID, r.RuntimeID, nil
+	return b.WorkspaceID, b.DaemonID, b.RuntimeKind, b.RuntimeID, nil
 }
 
 // claimPendingBotTask is the heartbeat side of the pull-based dispatch.
@@ -274,7 +264,7 @@ func (rt *Runtime) createBotTask(c *wkhttp.Context) {
 		row.Prompt = composeBotTaskPrompt(row)
 	}
 
-	agentID, daemonID, runtimeID, err := rt.db.resolveBotBinding(req.SpaceID, req.BotUID)
+	agentID, daemonID, runtimeKind, runtimeID, err := rt.db.resolveBotBinding(req.SpaceID, req.BotUID)
 	if err != nil {
 		// Still insert the row so the requester has an id to reference, but
 		// mark it failed up front. Saves a round-trip and gives the matter
@@ -302,6 +292,36 @@ func (rt *Runtime) createBotTask(c *wkhttp.Context) {
 		c.Response(toBotTaskResp(row))
 		return
 	}
+
+	// PoC4: non-openclaw runtime — bot exists but daemon won't run anything.
+	// Fail-fast with a clear activity message instead of queuing forever.
+	if runtimeKind != runtimeKindOpenclaw {
+		row.Status = btStatusFailed
+		row.ErrorMsg = fmt.Sprintf("runtime %q not supported yet (only openclaw runs tasks in this build)", runtimeKind)
+		row.AgentID = agentID
+		row.DaemonID = daemonID
+		row.RuntimeID = runtimeID
+		id, ierr := rt.db.insertBotTask(row)
+		if ierr != nil {
+			rt.Error("insert inert bot_task", zap.Error(ierr))
+			c.ResponseError(errors.New("create failed"))
+			return
+		}
+		row.Id = id
+		row.CreatedAt = db.Time(time.Now())
+		row.UpdatedAt = row.CreatedAt
+		go func() {
+			if werr := rt.postMatterTimeline(row); werr != nil {
+				rt.Warn("matter timeline writeback (inert) failed", zap.Int64("bot_task_id", row.Id), zap.Error(werr))
+			}
+			if werr := rt.postMatterActivity(row); werr != nil {
+				rt.Warn("matter activity writeback (inert) failed", zap.Int64("bot_task_id", row.Id), zap.Error(werr))
+			}
+		}()
+		c.Response(toBotTaskResp(row))
+		return
+	}
+
 	row.AgentID = agentID
 	row.DaemonID = daemonID
 	row.RuntimeID = runtimeID
