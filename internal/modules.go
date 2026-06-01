@@ -62,6 +62,7 @@ import (
 
 	_ "github.com/Mininglamp-OSS/octo-server/modules/app_bot"
 
+	_ "github.com/Mininglamp-OSS/octo-server/modules/auth_jwt"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/voice_adapter"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/webhook"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/workplace"
