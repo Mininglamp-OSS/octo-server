@@ -220,9 +220,24 @@ func (a *AuthJWT) IssueDaemonToken(uid, spaceID, daemonID string) (string, error
 // Token exchange is the public-facing endpoint; it accepts either a web
 // session token (existing AuthMiddleware semantics) or a daemon api-key.
 // JWKS is unauthenticated and cacheable.
+//
+// PR-A.2 added two cross-service bot endpoints (see bot_api.go):
+//   POST /v1/bot/mint        — web session auth, mints bot OBO
+//   GET  /v1/bot/:uid/token  — daemon JWT auth, returns bot_token
 func (a *AuthJWT) Route(r *wkhttp.WKHttp) {
 	r.GET("/.well-known/jwks.json", a.serveJWKS)
 	r.POST("/v1/auth/token", a.exchangeToken)
+
+	// /v1/bot/mint requires the standard session auth — daemon-scope
+	// JWTs aren't allowed to mint (only browsers do, on behalf of the
+	// logged-in user). a.ctx.AuthMiddleware(r) is octo-lib's session
+	// middleware that's already used elsewhere.
+	authGroup := r.Group("/v1", a.ctx.AuthMiddleware(r))
+	authGroup.POST("/bot/mint", a.mintBot)
+
+	// /v1/bot/:uid/token verifies daemon JWT inline (no group middleware
+	// because the existing AuthMiddleware would reject our Bearer JWT).
+	r.GET("/v1/bot/:uid/token", a.botToken)
 }
 
 func (a *AuthJWT) serveJWKS(c *wkhttp.Context) {
