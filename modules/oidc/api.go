@@ -317,22 +317,28 @@ func (o *OIDC) authorize(c *wkhttp.Context) {
 	}
 	cleanReturnTo, err := ValidateReturnTo(c.Query("return_to"), o.cfg.Provider.ReturnToHosts)
 	if err != nil {
-		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg(err.Error()))
+		// 不回显 err.Error():ValidateReturnTo 的消息可能 echo 客户端传入的
+		// return_to,避免把请求原文反射进响应(纵深防御)。
+		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("invalid return_to"))
 		return
 	}
 	state, err := NewRandomString(32)
 	if err != nil {
-		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg(err.Error()))
+		// 5xx 不向浏览器暴露内部错误细节,具体原因仅记日志。
+		o.Error("OIDC authorize: generate state failed", zap.Error(err))
+		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("internal error"))
 		return
 	}
 	nonce, err := NewRandomString(32)
 	if err != nil {
-		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg(err.Error()))
+		o.Error("OIDC authorize: generate nonce failed", zap.Error(err))
+		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("internal error"))
 		return
 	}
 	verifier, challenge, err := NewPKCEPair()
 	if err != nil {
-		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg(err.Error()))
+		o.Error("OIDC authorize: generate PKCE pair failed", zap.Error(err))
+		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("internal error"))
 		return
 	}
 	deviceFlag := defaultDeviceFlag
@@ -358,7 +364,8 @@ func (o *OIDC) authorize(c *wkhttp.Context) {
 	}
 	authURL, err := o.client.AuthCodeURL(state, nonce, challenge)
 	if err != nil {
-		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg(err.Error()))
+		o.Error("OIDC authorize: build auth code URL failed", zap.Error(err))
+		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("internal error"))
 		return
 	}
 	// EventAuthorize 不携带 uid(此时尚未拿到 IdP claims),仅用于审计统计:
