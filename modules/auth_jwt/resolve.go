@@ -1,9 +1,10 @@
 package auth_jwt
 
 import (
-	"encoding/json"
 	"errors"
 	"strings"
+
+	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 )
 
 // resolveSession verifies a web session token and returns (uid, spaceID).
@@ -14,36 +15,24 @@ import (
 // can request any space they own; downstream middleware (runtime/bot
 // endpoints) re-checks space_member as needed.
 //
-// Supports two on-disk session formats octo-server has produced over
-// time: the legacy `uid@name@...` triple-at string and the newer
-// `v2:{"uid":"...","name":"..."}` JSON envelope. New logins write v2;
-// old sessions still in Redis use the legacy form.
+// Delegates to pkg/auth.Decode for envelope parsing — that helper is the
+// single source of truth for token-cache encoding (handles v2 JSON +
+// legacy uid@name fallback). Avoids parallel mini-decoders that would
+// drift when the envelope schema evolves.
 func (a *AuthJWT) resolveSession(sessionToken, spaceHint string) (string, string, error) {
 	tokenPrefix := a.ctx.GetConfig().Cache.TokenCachePrefix
-	uidAndName, err := a.ctx.Cache().Get(tokenPrefix + sessionToken)
+	raw, err := a.ctx.Cache().Get(tokenPrefix + sessionToken)
 	if err != nil {
 		return "", "", err
 	}
-	if strings.TrimSpace(uidAndName) == "" {
+	if strings.TrimSpace(raw) == "" {
 		return "", "", errors.New("session not found")
 	}
-	if strings.HasPrefix(uidAndName, "v2:") {
-		var payload struct {
-			UID string `json:"uid"`
-		}
-		if jerr := json.Unmarshal([]byte(uidAndName[3:]), &payload); jerr != nil {
-			return "", "", errors.New("malformed v2 session value")
-		}
-		if payload.UID == "" {
-			return "", "", errors.New("malformed v2 session value (no uid)")
-		}
-		return payload.UID, spaceHint, nil
+	info, err := auth.Decode(raw)
+	if err != nil {
+		return "", "", err
 	}
-	parts := strings.Split(uidAndName, "@")
-	if len(parts) < 2 {
-		return "", "", errors.New("malformed session value")
-	}
-	return parts[0], spaceHint, nil
+	return info.UID, spaceHint, nil
 }
 
 // resolveAPIKey looks up the user_api_key row, asserts membership, and

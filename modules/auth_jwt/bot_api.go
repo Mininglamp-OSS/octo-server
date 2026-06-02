@@ -143,6 +143,13 @@ func (a *AuthJWT) requireDaemonJWT(c *wkhttp.Context) (*Claims, error) {
 	// tokens through. Plan AU1 requires "JWT 过期 → 401" — enforce it
 	// here, otherwise a daemon JWT past 30-day TTL could still mint a
 	// bot_token forever.
+	//
+	// Note on clock skew: Time field below is exact wall-clock; we rely
+	// on go-jose's DefaultLeeway (1 min) to tolerate small daemon ↔ server
+	// drift on exp/iat/nbf. If a downstream operator overrides leeway to
+	// 0 (e.g. via a global config), tight-clock daemons could see
+	// spurious failures right around mint time — keep the default unless
+	// you have a hard reason.
 	if err := cl.Validate(jwt.Expected{
 		Issuer: jwtIssuer,
 		Time:   time.Now(),
