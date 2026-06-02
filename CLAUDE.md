@@ -67,6 +67,26 @@ httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 ```
 Do NOT use raw `c.ResponseError(errors.New(...))` — that's legacy pattern.
 
+### Rate Limiting
+
+Use the shared middleware in octo-lib `pkg/wkhttp/ratelimit.go` — do NOT hand-roll Redis `INCR`/TTL counters for request-frequency limiting. Three layers, each sets `X-RateLimit-Limit/Remaining/Scope/Retry-After` headers, returns i18n `rate.limited`, and is **fail-open** on Redis errors:
+
+| Middleware | Scope header | Dimension | Use for |
+|---|---|---|---|
+| `RateLimitMiddleware` | `ip` | global per-IP | DDoS floor — already mounted globally in `main.go` (`route.Use`), don't re-add |
+| `StrictIPRateLimitMiddleware(tag, rps, burst)` | `strict:{tag}` | per-IP, per-endpoint | unauthenticated sensitive endpoints (login/register/sms/search/group_invite/space_invite) |
+| `SharedUIDRateLimiter(r, ctx)` (wraps `UIDRateLimitMiddleware`) | `uid` | per-login-user, shared bucket `ratelimit:uid:{uid}` | **default for authenticated endpoints** |
+
+`SharedUIDRateLimiter` (`pkg/wkhttp/ratelimit_helper.go`) is a process-wide singleton — one quota per UID across all mounted routes (default 2 rps / burst 60, tunable via `DM_API_UID_RATELIMIT_RPS`/`_BURST`). **Mount it AFTER `AuthMiddleware`** on the route group, else it can't read the uid and silently fails open:
+
+```go
+auth := r.Group("/v1/foo", ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, ctx))
+```
+
+**Exception** — per-resource cooldowns keyed by a business identity (phone/email/bind-session), which the IP/UID buckets cannot express, may use a hand-written Redis counter: e.g. `sms_rate_limit:{zone}@{phone}` (`base/common/service_sms.go`), `email_rate_limit:{email}` (`base/common/service_email.go`), OIDC bind attempt caps. These are intentional; generic HTTP request-frequency limiting is not.
+
+Tests that hit UID-limited routes must reset the bucket in setup (`ratelimit:uid:*`) — see `category` test's `resetUIDRateLimit`; the bucket persists in Redis and is NOT cleared by `CleanAllTables`.
+
 ### Database
 
 - ORM: `gocraft/dbr` v2
@@ -88,6 +108,7 @@ Tests require MySQL + Redis + WuKongIM running (see CI or `make env-test` in dmw
 - API routes: prefix `/v1/`
 - New modules: add blank import in `internal/modules.go`
 - Auth: all routes go through `AuthMiddleware` unless explicitly excluded — document why if skipping
+- Rate limiting: mount `SharedUIDRateLimiter` (auth routes) or `StrictIPRateLimitMiddleware` (unauth) — never hand-roll a Redis counter for request-frequency limiting (see Architecture › Rate Limiting)
 - Space isolation: handlers that access user data must go through Space middleware
 - Bot API (`modules/bot_api/`): validate bot ownership before operations
 - Thread (`modules/thread/`): verify parent channel access
