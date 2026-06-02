@@ -33,6 +33,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
+	"github.com/Mininglamp-OSS/octo-server/pkg/richtext"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"github.com/gocraft/dbr/v2"
@@ -463,6 +464,15 @@ func (m *Message) sendMessage(channelID string, channelType uint8, fromUID strin
 	// BEFORE persistence/dispatch. See sanitizeUserIngressPayload below
 	// for the full rationale and unit test surface.
 	sanitizeUserIngressPayload(payload, channelID, channelType, fromUID, m.Warn)
+	// 图文混排 RichText(=14)：派发出口用 content 重算权威顶层 plain，覆盖客户端
+	// 不可信的 plain（契约 §2）。这一步是下游 summary / matter / search / 复制 /
+	// 推送 全部依赖的前置——server 必须在消息落库 / 进 IM 搜索索引前把权威 plain
+	// 写进 payload 字节。非 type=14 的 payload 此 helper 为 no-op，老消息路径不变。
+	// EnsurePlain 内部对回填 plain 后的整条 payload 复检 1MB 上限，超限拒发。
+	if err := richtext.EnsurePlain(payload); err != nil {
+		m.Error("RichText payload plain 生成失败", zap.Error(err), zap.String("channelID", channelID), zap.String("fromUID", fromUID))
+		return err
+	}
 	// YUJ-202 / Mininglamp-OSS#94 / #142 — mention pass-through chokepoint.
 	// The original Plan X §5 design (docs/2026-05-mention-all-chokepoint-audit.md)
 	// rewrote legacy `mention.all=1` to also carry `mention.ais=1` so

@@ -45,6 +45,21 @@ func (s *Search) Route(r *wkhttp.WKHttp) {
 	}
 }
 
+// buildMessageSearchQuery 构造给 WuKongIM usersearch 的 payload 字段匹配集合与
+// 高亮字段集合。除原有 content / name 外，补 payload.plain：图文混排 RichText(=14)
+// 的正文文字承载在 content blocks 内，server 在派发出口把权威纯文本镜像写到顶层
+// plain（含 [图片] 占位），只搜 payload.content 命不中 14 的文字，必须一并搜 plain
+// 才能让富文本消息可被搜索与高亮。
+func buildMessageSearchQuery(keyword string) (map[string]interface{}, []string) {
+	payload := map[string]interface{}{
+		"content": keyword,
+		"name":    keyword,
+		"plain":   keyword,
+	}
+	highlights := []string{"payload.content", "payload.name", "payload.plain"}
+	return payload, highlights
+}
+
 func (s *Search) global(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	var req struct {
@@ -68,11 +83,7 @@ func (s *Search) global(c *wkhttp.Context) {
 	if req.Limit > 100 {
 		req.Limit = 100
 	}
-	payload := map[string]interface{}{
-		"content": req.Keyword,
-		"name":    req.Keyword,
-	}
-	highlights := []string{"payload.content", "payload.name"}
+	payload, highlights := buildMessageSearchQuery(req.Keyword)
 
 	// 查询消息
 	msgResp, err := s.ctx.IMSearchUserMessages(&config.SearchUserMessageReq{

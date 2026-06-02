@@ -31,6 +31,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
+	"github.com/Mininglamp-OSS/octo-server/pkg/richtext"
 	pkgutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis"
@@ -481,6 +482,15 @@ func (rb *Robot) sendMessage(c *wkhttp.Context) {
 		payload = rb.enrichBotPayloadWithSpaceID(robotID, payload)
 	}
 
+	// 图文混排 RichText(=14)：派发出口用 content 重算权威顶层 plain，覆盖客户端
+	// 不可信 plain（契约 §2），供下游 summary / matter / search / 复制 / 推送 复用。
+	// 非 type=14 为 no-op，老消息路径不变；内部对回填后整条 payload 复检 1MB 上限。
+	if err := richtext.EnsurePlain(payload); err != nil {
+		rb.Error("RichText payload plain 生成失败", zap.Error(err), zap.String("robotID", robotID), zap.String("channelID", messageReq.ChannelID))
+		c.ResponseError(fmt.Errorf("无效的payload[%s]", util.ToJson(messageReq.Payload)))
+		return
+	}
+
 	// YUJ-202 / Mininglamp-OSS#94 / #142 — mention pass-through
 	// chokepoint. Same contract as the user and bot API ingresses:
 	// post-#142 the helper no longer infers `mention.ais=1` from
@@ -562,7 +572,18 @@ func (rb *Robot) payloadIsVail(payloadResult maputil.Data) bool {
 	case common.File:
 		return payloadResult.Get("url") != nil
 	case common.RichText:
-		return payloadResult.Get("content") != nil
+		// 图文混排 RichText(=14)：发送端 write-strict 校验。升级为调
+		// common.ValidateRichTextPayload，对序列化后的 payload 做大小上限、
+		// content 必填非空、每个 block 结构合法（text 非空 / image url scheme +
+		// width/height）的完整契约校验，取代旧的仅 content != nil 浅检。
+		raw, err := json.Marshal(map[string]interface{}(payloadResult))
+		if err != nil {
+			return false
+		}
+		if _, err := common.ValidateRichTextPayload(raw); err != nil {
+			return false
+		}
+		return true
 	}
 	return false
 }

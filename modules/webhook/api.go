@@ -127,7 +127,7 @@ func New(ctx *config.Context) *Webhook {
 	}
 }
 func getSupportTypes() []common.ContentType {
-	return []common.ContentType{common.Text, common.Image, common.GIF, common.Voice, common.Video, common.File, common.Location, common.Card, common.MultipleForward, common.VectorSticker, common.EmojiSticker}
+	return []common.ContentType{common.Text, common.Image, common.GIF, common.Voice, common.Video, common.File, common.Location, common.Card, common.MultipleForward, common.VectorSticker, common.EmojiSticker, common.RichText}
 }
 
 // Route 路由配置

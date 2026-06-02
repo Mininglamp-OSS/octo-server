@@ -188,6 +188,13 @@ func getMessageAlert(msg msgOfflineNotify, toUser *user.Resp, ctx *config.Contex
 		alert = "[emoji表情]"
 	case common.MultipleForward:
 		alert = "[聊天记录]"
+	case common.RichText:
+		// 图文混排 RichText(=14)：推送正文取 server 已生成的权威 plain（含 [图片]
+		// 占位）。GetRichTextDisplayText 优先用 payload.plain，缺失时现场遍历
+		// content 兜底，再不行回退到 GetDisplayText(=「富文本消息」)。这里走的是
+		// 「存储后展示路径」，payload 已在派发出口经 EnsurePlain 用 content 重算
+		// 覆盖端上 plain，故信任 plain 是正确且高效的。
+		alert = common.GetRichTextDisplayText(msg.Payload)
 	}
 	return alert, nil
 }
