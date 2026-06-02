@@ -237,6 +237,42 @@ other = "Message search failed."
 ["err.server.message.store_failed"]
 other = "Failed to persist message data."
 
+["err.server.oidc.bind_already_bound"]
+other = "This identity is already bound. Please sign in via OIDC to continue."
+
+["err.server.oidc.bind_already_verified"]
+other = "This binding session has already been verified."
+
+["err.server.oidc.bind_claims_incomplete"]
+other = "The identity provider did not supply the account details required to create an account."
+
+["err.server.oidc.bind_conflict_need_manual"]
+other = "Multiple accounts match; manual resolution is required. Please contact support."
+
+["err.server.oidc.bind_invalid_credentials"]
+other = "Verification failed. Please check your details and try again."
+
+["err.server.oidc.bind_method_disabled"]
+other = "This verification method is currently disabled."
+
+["err.server.oidc.bind_request_invalid"]
+other = "Invalid request."
+
+["err.server.oidc.bind_service_unavailable"]
+other = "The account binding service is temporarily unavailable. Please try again later."
+
+["err.server.oidc.bind_sms_unavailable"]
+other = "SMS verification is not available for this account."
+
+["err.server.oidc.bind_status_conflict"]
+other = "The binding session is in a conflicting state."
+
+["err.server.oidc.bind_token_invalid"]
+other = "The binding session has expired or is invalid. Please start over."
+
+["err.server.oidc.bind_verify_required"]
+other = "Please complete verification before confirming."
+
 ["err.server.thread.creator_cannot_leave"]
 other = "Thread creator cannot leave the thread."
 

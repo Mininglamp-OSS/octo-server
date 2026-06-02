@@ -610,3 +610,41 @@ other = "查询分类数据失败。"
 
 ["err.server.category.store_failed"]
 other = "保存分类数据失败。"
+
+# ---- modules/oidc：自助绑定流程（api_bind.go），保留真实 HTTP 状态码 ----
+
+["err.server.oidc.bind_service_unavailable"]
+other = "账号绑定服务暂时不可用，请稍后再试。"
+
+["err.server.oidc.bind_request_invalid"]
+other = "请求无效。"
+
+["err.server.oidc.bind_sms_unavailable"]
+other = "该账号无法使用短信验证。"
+
+["err.server.oidc.bind_method_disabled"]
+other = "该验证方式当前已停用。"
+
+["err.server.oidc.bind_invalid_credentials"]
+other = "验证失败，请核对信息后重试。"
+
+["err.server.oidc.bind_verify_required"]
+other = "请先完成验证再确认绑定。"
+
+["err.server.oidc.bind_already_verified"]
+other = "该绑定会话已完成验证。"
+
+["err.server.oidc.bind_status_conflict"]
+other = "绑定会话状态冲突。"
+
+["err.server.oidc.bind_already_bound"]
+other = "该身份已绑定，请通过 OIDC 登录以继续。"
+
+["err.server.oidc.bind_conflict_need_manual"]
+other = "匹配到多个账号，需人工处理，请联系支持人员。"
+
+["err.server.oidc.bind_token_invalid"]
+other = "绑定会话已过期或无效，请重新发起。"
+
+["err.server.oidc.bind_claims_incomplete"]
+other = "身份提供方未返回创建账号所需的账号信息。"
