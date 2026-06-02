@@ -2027,7 +2027,11 @@ func (u *User) loginWithAuthCode(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserIMCallFailed)
 		return
 	}
-	if strings.TrimSpace(token) == "" {
+	// 复用 uidtoken 反查到的旧 token 前,必须确认 token:<oldToken> 仍存在,
+	// 否则与并发 logout 删除 token 形成 TOCTOU 竞态,会复活已登出的会话。
+	// 这里只标记是否复用,真正写缓存时用 SET XX 校验(见下方 UpdateIMToken 之前)。
+	reuseExistingToken := strings.TrimSpace(token) != ""
+	if !reuseExistingToken {
 		token = util.GenerUUID()
 	}
 
@@ -2085,6 +2089,44 @@ func (u *User) loginWithAuthCode(c *wkhttp.Context) {
 			}
 		}
 	}
+	// 在调用 IM 之前确定最终 token 并写入缓存。
+	// 复用旧 token 时用 SET XX(SetIfExists):仅当 token:<oldToken> 仍存在才刷新;
+	// 若已被并发 logout 删除,则回退到新 UUID,避免复活已登出的 token。
+	tokenPayload, err := auth.Encode(auth.TokenInfo{
+		UID:      userModel.UID,
+		Name:     userModel.Name,
+		Language: userModel.Language,
+	})
+	if err != nil {
+		u.Error("编码token缓存失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	if reuseExistingToken {
+		refreshed, err := u.refreshExistingLoginToken(
+			u.ctx.GetConfig().Cache.TokenCachePrefix+token,
+			tokenPayload,
+			u.ctx.GetConfig().Cache.TokenExpire,
+		)
+		if err != nil {
+			u.Error("刷新旧token缓存失败！", zap.Error(err))
+			respondUserError(c, errcode.ErrUserStoreFailed)
+			return
+		}
+		if !refreshed {
+			token = util.GenerUUID()
+			reuseExistingToken = false
+		}
+	}
+	if !reuseExistingToken {
+		err = u.ctx.Cache().SetAndExpire(u.ctx.GetConfig().Cache.TokenCachePrefix+token, tokenPayload, u.ctx.GetConfig().Cache.TokenExpire)
+		if err != nil {
+			u.Error("设置token缓存失败！", zap.Error(err))
+			respondUserError(c, errcode.ErrUserStoreFailed)
+			return
+		}
+	}
+
 	imResp, err := u.ctx.UpdateIMToken(config.UpdateIMTokenReq{
 		UID:         scaner,
 		Token:       token,
@@ -2101,22 +2143,6 @@ func (u *User) loginWithAuthCode(c *wkhttp.Context) {
 		return
 	}
 
-	// 将token设置到缓存
-	tokenPayload, err := auth.Encode(auth.TokenInfo{
-		UID:      userModel.UID,
-		Name:     userModel.Name,
-		Language: userModel.Language,
-	})
-	if err != nil {
-		u.Error("编码token缓存失败！", zap.Error(err))
-		return
-	}
-	err = u.ctx.Cache().SetAndExpire(u.ctx.GetConfig().Cache.TokenCachePrefix+token, tokenPayload, u.ctx.GetConfig().Cache.TokenExpire)
-	if err != nil {
-		u.Error("设置token缓存失败！", zap.Error(err))
-		respondUserError(c, errcode.ErrUserStoreFailed)
-		return
-	}
 	err = u.ctx.GetRedisConn().Del(authCodeKey)
 	if err != nil {
 		u.Error("删除授权码失败！", zap.Error(err))
