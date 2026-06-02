@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/botfather"
@@ -137,6 +138,16 @@ func (a *AuthJWT) requireDaemonJWT(c *wkhttp.Context) (*Claims, error) {
 	var cl Claims
 	if err := parsed.Claims(a.pubKey, &cl); err != nil {
 		return nil, fmt.Errorf("verify: %w", err)
+	}
+	// PR-A fix (齐乐 review #3): signature-only verification let expired
+	// tokens through. Plan AU1 requires "JWT 过期 → 401" — enforce it
+	// here, otherwise a daemon JWT past 30-day TTL could still mint a
+	// bot_token forever.
+	if err := cl.Validate(jwt.Expected{
+		Issuer: jwtIssuer,
+		Time:   time.Now(),
+	}); err != nil {
+		return nil, fmt.Errorf("claims invalid: %w", err)
 	}
 	if cl.Scope != "daemon" {
 		return nil, errors.New("daemon scope required")
