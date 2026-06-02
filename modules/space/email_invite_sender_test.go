@@ -26,16 +26,17 @@ type recordingInviteSender struct {
 type sentInviteEmail struct {
 	To      string
 	Subject string
-	Body    string
+	Body    string // htmlBody
+	Plain   string // plainBody
 }
 
 func newRecordingSender() *recordingInviteSender {
 	return &recordingInviteSender{done: make(chan struct{}, 4)}
 }
 
-func (r *recordingInviteSender) SendHTMLEmail(_ context.Context, to, subject, body string) error {
+func (r *recordingInviteSender) SendTransactionalHTML(_ context.Context, to, subject, htmlBody, plainBody string) error {
 	r.mu.Lock()
-	r.calls = append(r.calls, sentInviteEmail{to, subject, body})
+	r.calls = append(r.calls, sentInviteEmail{To: to, Subject: subject, Body: htmlBody, Plain: plainBody})
 	r.mu.Unlock()
 	select {
 	case r.done <- struct{}{}:

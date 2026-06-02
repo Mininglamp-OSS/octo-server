@@ -9,20 +9,24 @@ import (
 
 func TestEmailInviteAcceptURL(t *testing.T) {
 	t.Run("无尾斜杠", func(t *testing.T) {
-		got := emailInviteAcceptURL("https://h5.example.com", "abc")
+		got := emailInviteAcceptURL("https://h5.example.com", "abc", "")
 		assert.Equal(t, "https://h5.example.com/v1/space/email-invite?token=abc", got)
 	})
 	t.Run("有尾斜杠", func(t *testing.T) {
-		got := emailInviteAcceptURL("https://h5.example.com/", "abc")
+		got := emailInviteAcceptURL("https://h5.example.com/", "abc", "")
 		assert.Equal(t, "https://h5.example.com/v1/space/email-invite?token=abc", got)
 	})
 	t.Run("token 走 URL 转义（防止 ?/& 截断查询串）", func(t *testing.T) {
-		got := emailInviteAcceptURL("https://h5.example.com", "a/b?c=d")
+		got := emailInviteAcceptURL("https://h5.example.com", "a/b?c=d", "")
 		assert.Contains(t, got, "token=a%2Fb%3Fc%3Dd")
 	})
+	t.Run("lang 非空时追加 &lang=", func(t *testing.T) {
+		got := emailInviteAcceptURL("https://h5.example.com", "abc", "en-US")
+		assert.Equal(t, "https://h5.example.com/v1/space/email-invite?token=abc&lang=en-US", got)
+	})
 	t.Run("空 base 返回空串", func(t *testing.T) {
-		assert.Equal(t, "", emailInviteAcceptURL("", "abc"))
-		assert.Equal(t, "", emailInviteAcceptURL("   ", "abc"))
+		assert.Equal(t, "", emailInviteAcceptURL("", "abc", "zh-CN"))
+		assert.Equal(t, "", emailInviteAcceptURL("   ", "abc", "zh-CN"))
 	})
 }
 
@@ -34,14 +38,28 @@ func TestBuildOwnerInviteEmail_ContainsKeyFields(t *testing.T) {
 		InviteType:         EmailInviteTypeOwner,
 	}
 	link := "https://h5.example.com/space-email-invite.html?token=tok123"
-	subject, body, err := buildOwnerInviteEmail(inv, "Alice", link)
+	got, err := buildOwnerInviteEmail(inv, "Alice", "zh-CN", link)
 	assert.NoError(t, err)
 
-	assert.Contains(t, subject, "我的团队")
-	assert.Contains(t, body, "我的团队")
-	assert.Contains(t, body, "Alice")
-	assert.Contains(t, body, link)
-	assert.Contains(t, body, "做大事")
+	assert.Contains(t, got.Subject, "我的团队")
+	assert.Contains(t, got.HTML, "我的团队")
+	assert.Contains(t, got.HTML, "Alice")
+	assert.Contains(t, got.HTML, link)
+	assert.Contains(t, got.HTML, "做大事")
+	// plaintext 兜底部分也应带链接与空间名
+	assert.Contains(t, got.Text, link)
+	assert.Contains(t, got.Text, "我的团队")
+}
+
+func TestBuildOwnerInviteEmail_EnglishLang(t *testing.T) {
+	inv := &spaceEmailInviteModel{
+		PlannedName: "My Team",
+		InviteType:  EmailInviteTypeOwner,
+	}
+	got, err := buildOwnerInviteEmail(inv, "Alice", "en-US", "https://h5.example.com/x?token=t")
+	assert.NoError(t, err)
+	assert.Contains(t, got.Subject, "My Team")
+	assert.Contains(t, got.HTML, "invites you to create")
 }
 
 func TestBuildOwnerInviteEmail_EscapesHTML(t *testing.T) {
@@ -50,22 +68,25 @@ func TestBuildOwnerInviteEmail_EscapesHTML(t *testing.T) {
 		PlannedDescription: "<img onerror=x>",
 		InviteType:         EmailInviteTypeOwner,
 	}
-	_, body, err := buildOwnerInviteEmail(inv, "B<o>b", "https://h5.example.com/x?token=t")
+	got, err := buildOwnerInviteEmail(inv, "B<o>b", "zh-CN", "https://h5.example.com/x?token=t")
 	assert.NoError(t, err)
 
-	// 危险标签必须被转义，绝不出现在原文中
-	assert.NotContains(t, body, "<script>alert(1)</script>")
-	assert.NotContains(t, body, "<img onerror=x>")
-	assert.Contains(t, body, "&lt;script&gt;")
-	assert.NotContains(t, body, "B<o>b")
+	// 危险标签必须被转义，绝不出现在 HTML 原文中
+	assert.NotContains(t, got.HTML, "<script>alert(1)</script>")
+	assert.NotContains(t, got.HTML, "<img onerror=x>")
+	assert.Contains(t, got.HTML, "&lt;script&gt;")
+	assert.NotContains(t, got.HTML, "B<o>b")
 }
 
-func TestBuildOwnerInviteEmail_AnonymousInviter(t *testing.T) {
+func TestBuildOwnerInviteEmail_AnonymousInviterLocalized(t *testing.T) {
 	inv := &spaceEmailInviteModel{PlannedName: "X", InviteType: EmailInviteTypeOwner}
-	_, body, err := buildOwnerInviteEmail(inv, "", "https://h5.example.com/?token=t")
+	zh, err := buildOwnerInviteEmail(inv, "", "zh-CN", "https://h5.example.com/?token=t")
 	assert.NoError(t, err)
-	// 匿名时给出兜底文案，不要出现裸 "by " 或空白
-	assert.NotContains(t, body, "by  ")
+	assert.Contains(t, zh.HTML, "Octo 管理员")
+
+	en, err := buildOwnerInviteEmail(inv, "", "en-US", "https://h5.example.com/?token=t")
+	assert.NoError(t, err)
+	assert.Contains(t, en.HTML, "An Octo admin")
 }
 
 func TestBuildMemberInviteEmail_RoleLabel(t *testing.T) {
@@ -73,27 +94,34 @@ func TestBuildMemberInviteEmail_RoleLabel(t *testing.T) {
 
 	t.Run("普通成员", func(t *testing.T) {
 		inv := &spaceEmailInviteModel{Role: EmailInviteRoleMember, InviteType: EmailInviteTypeMember}
-		subj, body, err := buildMemberInviteEmail(inv, "Alice", "Acme", link)
+		got, err := buildMemberInviteEmail(inv, "Alice", "Acme", "zh-CN", link)
 		assert.NoError(t, err)
-		assert.Contains(t, subj, "Acme")
-		assert.Contains(t, body, "Acme")
-		assert.Contains(t, body, link)
-		assert.Contains(t, body, "Alice")
-		assert.True(t, strings.Contains(body, "成员") && !strings.Contains(body, "管理员"))
+		assert.Contains(t, got.Subject, "Acme")
+		assert.Contains(t, got.HTML, "Acme")
+		assert.Contains(t, got.HTML, link)
+		assert.Contains(t, got.HTML, "Alice")
+		assert.True(t, strings.Contains(got.HTML, "成员") && !strings.Contains(got.HTML, "管理员"))
 	})
 
 	t.Run("管理员", func(t *testing.T) {
 		inv := &spaceEmailInviteModel{Role: EmailInviteRoleAdmin, InviteType: EmailInviteTypeMember}
-		_, body, err := buildMemberInviteEmail(inv, "Alice", "Acme", link)
+		got, err := buildMemberInviteEmail(inv, "Alice", "Acme", "zh-CN", link)
 		assert.NoError(t, err)
-		assert.Contains(t, body, "管理员")
+		assert.Contains(t, got.HTML, "管理员")
+	})
+
+	t.Run("英文-管理员", func(t *testing.T) {
+		inv := &spaceEmailInviteModel{Role: EmailInviteRoleAdmin, InviteType: EmailInviteTypeMember}
+		got, err := buildMemberInviteEmail(inv, "Alice", "Acme", "en-US", link)
+		assert.NoError(t, err)
+		assert.Contains(t, got.HTML, "administrator")
 	})
 }
 
 func TestBuildMemberInviteEmail_EscapesHTML(t *testing.T) {
 	inv := &spaceEmailInviteModel{Role: EmailInviteRoleMember, InviteType: EmailInviteTypeMember}
-	_, body, err := buildMemberInviteEmail(inv, "<img>", "<svg/onload=x>", "https://h5.example.com/?token=t")
+	got, err := buildMemberInviteEmail(inv, "<img>", "<svg/onload=x>", "zh-CN", "https://h5.example.com/?token=t")
 	assert.NoError(t, err)
-	assert.NotContains(t, body, "<svg/onload=x>")
-	assert.Contains(t, body, "&lt;svg")
+	assert.NotContains(t, got.HTML, "<svg/onload=x>")
+	assert.Contains(t, got.HTML, "&lt;svg")
 }

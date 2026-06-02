@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html><body style="font-family:Arial,Helvetica,sans-serif;background:#f8fafc;padding:24px;">
+<div style="max-width:520px;margin:0 auto;background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:32px;">
+  <h2 style="color:#7c3aed;margin:0 0 16px;">Octo Space invitation</h2>
+  <p style="color:#111;font-size:15px;line-height:1.6;">
+    {{if .InviterName}}{{.InviterName}}{{else}}An Octo admin{{end}} invites you to join the team space <strong>{{.SpaceName}}</strong> as {{if .IsAdmin}}an <strong>administrator</strong>{{else}}a <strong>member</strong>{{end}}.
+  </p>
+  <p style="text-align:center;margin:28px 0;">
+    <a href="{{.AcceptURL}}" style="display:inline-block;background:#7c3aed;color:#fff;text-decoration:none;padding:12px 28px;border-radius:6px;font-weight:600;">Accept invitation</a>
+  </p>
+  <p style="color:#888;font-size:12px;line-height:1.6;">
+    If the button doesn't work, copy and paste this link into your browser:<br/>
+    <span style="word-break:break-all;color:#555;">{{.AcceptURL}}</span>
+  </p>
+  <p style="color:#aaa;font-size:12px;margin-top:24px;">If you weren't expecting this invitation, you can safely ignore this email.</p>
+</div></body></html>

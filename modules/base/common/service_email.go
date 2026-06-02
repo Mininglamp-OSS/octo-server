@@ -16,6 +16,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
+	"github.com/Mininglamp-OSS/octo-server/modules/base/common/emailtmpl"
 	"go.uber.org/zap"
 )
 
@@ -23,8 +24,9 @@ const CacheKeyEmailCode = "emailcode:"
 
 // IEmailService 邮件服务接口
 type IEmailService interface {
-	// 发送验证码
-	SendVerifyCode(ctx context.Context, email string, codeType CodeType) error
+	// 发送验证码。lang 为收件人内容语言（BCP-47），用于渲染主题与正文；
+	// 调用方通常传 i18n.OutboundLanguage(ctx)，其会兜底到 OCTO_DEFAULT_LANGUAGE。
+	SendVerifyCode(ctx context.Context, email string, codeType CodeType, lang string) error
 	// 验证验证码(销毁缓存)
 	Verify(ctx context.Context, email, code string, codeType CodeType) error
 	// SendHTMLEmail 发送一封 HTML 邮件（不走频率限制 / 验证码缓存，由调用方自己控制）
@@ -72,10 +74,14 @@ func NewEmailService(ctx *config.Context, settings SMTPSettingsProvider) *EmailS
 // 1-minute resend cooldown is still active. It is a client-actionable condition
 // (HTTP 429), not an internal failure — callers should branch on it with
 // errors.Is rather than collapsing it onto a generic send-failure code.
-var ErrEmailSendRateLimited = errors.New("发送过于频繁，请1分钟后再试")
+var ErrEmailSendRateLimited = errors.New("email resend cooldown active, retry in 1 minute")
 
-// SendVerifyCode 发送验证码
-func (s *EmailService) SendVerifyCode(ctx context.Context, email string, codeType CodeType) error {
+// SendVerifyCode 发送验证码。
+//
+// 主题/正文由 emailtmpl 按 lang 渲染（外置 per-lang 模板，issue #221）；走
+// SendTransactionalHTML 而非极简 sendEmail —— 验证码是高价值事务邮件，带
+// plaintext 兜底 + 标准事务邮件 header 可显著降低被反垃圾静默丢弃的概率。
+func (s *EmailService) SendVerifyCode(ctx context.Context, email string, codeType CodeType, lang string) error {
 	// 检查发送频率限制
 	rateLimitKey := fmt.Sprintf("email_rate_limit:%s", email)
 	exists, err := s.ctx.GetRedisConn().GetString(rateLimitKey)
@@ -89,10 +95,18 @@ func (s *EmailService) SendVerifyCode(ctx context.Context, email string, codeTyp
 	// 生成6位验证码
 	code, err := generateSecureVerifyCode(6)
 	if err != nil {
-		s.Error("生成验证码失败", zap.Error(err))
-		return errors.New("系统错误，请稍后重试")
+		s.Error("generate verify code", zap.Error(err))
+		return errors.New("internal error, please retry")
 	}
 	s.Info("发送邮箱验证码", zap.String("email", email))
+
+	rendered, err := emailtmpl.Render(emailtmpl.KeyVerifyCode, lang, emailtmpl.VerifyCodeData{Code: code})
+	if err != nil {
+		// 渲染失败属于配置/构建问题（模板缺失/损坏），不应把验证码写进缓存后
+		// 却发不出邮件 —— 在写缓存与限速之前先 fail。
+		s.Error("render verify-code email", zap.String("lang", lang), zap.Error(err))
+		return errors.New("internal error, please retry")
+	}
 
 	cacheKey := fmt.Sprintf("%s%d@%s", CacheKeyEmailCode, codeType, email)
 	err = s.ctx.GetRedisConn().SetAndExpire(cacheKey, code, time.Minute*5)
@@ -106,16 +120,7 @@ func (s *EmailService) SendVerifyCode(ctx context.Context, email string, codeTyp
 		return err
 	}
 
-	subject := "Octo 验证码"
-	body := fmt.Sprintf(`<div style="max-width:400px;margin:20px auto;font-family:Arial,sans-serif;padding:20px;border:1px solid #e0e0e0;border-radius:8px;">
-<h2 style="color:#7c3aed;margin:0 0 16px;">Octo</h2>
-<p style="color:#333;">您的验证码为：</p>
-<div style="background:#f5f3ff;padding:16px;border-radius:6px;text-align:center;margin:12px 0;">
-<span style="font-size:32px;font-weight:bold;letter-spacing:8px;color:#7c3aed;">%s</span>
-</div>
-<p style="color:#666;font-size:13px;">验证码 5 分钟内有效，请勿泄露给他人。</p>
-</div>`, code)
-	return s.sendEmail(ctx, email, subject, body)
+	return s.SendTransactionalHTML(ctx, email, rendered.Subject, rendered.HTML, rendered.Text)
 }
 
 // SendHTMLEmail 直接发送一封 HTML 邮件。subject/body 由调用方负责，本方法
@@ -129,7 +134,7 @@ func (s *EmailService) SendVerifyCode(ctx context.Context, email string, codeTyp
 // 邮件请改用 SendTransactionalHTML,带 plaintext 兜底和完整事务邮件 header。
 func (s *EmailService) SendHTMLEmail(ctx context.Context, to, subject, htmlBody string) error {
 	if to == "" {
-		return errors.New("收件人不能为空")
+		return errors.New("recipient must not be empty")
 	}
 	return s.sendEmail(ctx, to, subject, htmlBody)
 }
@@ -153,11 +158,11 @@ func (s *EmailService) SendHTMLEmail(ctx context.Context, to, subject, htmlBody 
 // htmlBody 为空时,plaintext 仍会被发出(降级体验,但通路工作)。
 func (s *EmailService) SendTransactionalHTML(ctx context.Context, to, subject, htmlBody, plainBody string) error {
 	if to == "" {
-		return errors.New("收件人不能为空")
+		return errors.New("recipient must not be empty")
 	}
 	smtpAddr, fromAddr, pwd := s.resolveSMTP()
 	if smtpAddr == "" || fromAddr == "" || pwd == "" {
-		return errors.New("邮件服务未配置，请联系管理员")
+		return errors.New("email service not configured")
 	}
 	toSan, fromSan, subjectSan := sanitizeHeader(to), sanitizeHeader(fromAddr), sanitizeHeader(subject)
 	msg, err := buildTransactionalMessage(fromSan, toSan, subjectSan, htmlBody, plainBody)
@@ -173,7 +178,7 @@ func (s *EmailService) sendEmail(ctx context.Context, to, subject, body string) 
 	smtpAddr, fromAddr, pwd := s.resolveSMTP()
 
 	if smtpAddr == "" || fromAddr == "" || pwd == "" {
-		return errors.New("邮件服务未配置，请联系管理员")
+		return errors.New("email service not configured")
 	}
 
 	toSan, fromSan, subjectSan := sanitizeHeader(to), sanitizeHeader(fromAddr), sanitizeHeader(subject)
@@ -370,7 +375,7 @@ func (s *EmailService) Verify(ctx context.Context, email, code string, codeType 
 		return err
 	}
 	if locked != "" {
-		return errors.New("验证失败次数过多，请10分钟后再试")
+		return errors.New("too many failed attempts, locked for 10 minutes")
 	}
 
 	// 支持测试验证码（仅限非 release 模式；release 下即便配置了 SMSCode 也不会匹配）
@@ -406,10 +411,10 @@ func (s *EmailService) Verify(ctx context.Context, email, code string, codeType 
 
 	if failCount >= 3 {
 		s.ctx.GetRedisConn().SetAndExpire(lockKey, "1", time.Minute*10)
-		return errors.New("验证失败次数过多，已锁定10分钟")
+		return errors.New("too many failed attempts, locked for 10 minutes")
 	}
 	s.ctx.GetRedisConn().SetAndExpire(failCountKey, fmt.Sprintf("%d", failCount), time.Minute*10)
 
 	s.Info("邮箱验证码错误", zap.String("email", email))
-	return errors.New("验证码无效！")
+	return errors.New("invalid verification code")
 }

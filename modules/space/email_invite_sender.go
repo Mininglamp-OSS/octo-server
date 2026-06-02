@@ -6,7 +6,9 @@ import (
 	"time"
 
 	commonapi "github.com/Mininglamp-OSS/octo-server/modules/base/common"
+	"github.com/Mininglamp-OSS/octo-server/modules/base/common/emailtmpl"
 	common "github.com/Mininglamp-OSS/octo-server/modules/common"
+	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"go.uber.org/zap"
 )
 
@@ -15,10 +17,13 @@ import (
 const inviteEmailSendTimeout = 30 * time.Second
 
 // inviteEmailSender 抽象掉具体的 SMTP 发送实现，便于在测试中替换为 recorder。
-// 故意保持 1 个方法 —— 发邮件的所有上层细节（subject/html 构造、链接拼接）都
-// 在 dispatchInviteEmail 中完成。
+// 故意保持 1 个方法 —— 发邮件的所有上层细节（subject/html/plain 构造、链接拼接）
+// 都在 dispatchInviteEmail 中完成。
+//
+// 走 SendTransactionalHTML（而非 SendHTMLEmail）：邀请是高价值事务邮件，带
+// plaintext 兜底 + 标准事务邮件 header 可显著降低被反垃圾静默丢弃的概率。
 type inviteEmailSender interface {
-	SendHTMLEmail(ctx context.Context, to, subject, htmlBody string) error
+	SendTransactionalHTML(ctx context.Context, to, subject, htmlBody, plainBody string) error
 }
 
 // inviteEmailSenderOverride 测试钩子：非 nil 时优先于默认 EmailService。
@@ -68,10 +73,16 @@ func (s *Space) dispatchInviteEmail(inv *spaceEmailInviteModel, rawToken string)
 	ctx, cancel := context.WithTimeout(context.Background(), inviteEmailSendTimeout)
 	defer cancel()
 
+	// 收件人语言：邀请是异步发送、收件人未必是已注册用户（无 uid）、且 ≠ 请求
+	// 发起人，因此本期（issue #221 决策 A）统一渲染为 OCTO_DEFAULT_LANGUAGE。
+	// OutboundLanguage 在脱离请求的 background ctx 下自然退回默认语言；lang 参数
+	// 贯穿渲染与链接，将来接入 ResolveUserLanguage(recipient) 即在此处替换。
+	lang := octoi18n.OutboundLanguage(ctx)
+
 	// 落地页由后端在 BaseURL/v1/space/email-invite 提供（emailInvitePage handler）；
 	// H5BaseURL 在多数部署里是独立 H5 服务，不会响应该路径。这里必须用 BaseURL，
 	// 否则邮件链接会 404。修正于 PR #1194 review (W1)。
-	acceptURL := emailInviteAcceptURL(s.ctx.GetConfig().External.BaseURL, rawToken)
+	acceptURL := emailInviteAcceptURL(s.ctx.GetConfig().External.BaseURL, rawToken, lang)
 	if acceptURL == "" {
 		s.Warn("跳过邀请邮件：未配置 External.BaseURL",
 			zap.String("alert", "email_invite_send_skipped_no_base"),
@@ -88,13 +99,12 @@ func (s *Space) dispatchInviteEmail(inv *spaceEmailInviteModel, rawToken string)
 	}
 
 	var (
-		subject string
-		body    string
-		bErr    error
+		rendered emailtmpl.Rendered
+		bErr     error
 	)
 	switch inv.InviteType {
 	case EmailInviteTypeOwner:
-		subject, body, bErr = buildOwnerInviteEmail(inv, inviterName, acceptURL)
+		rendered, bErr = buildOwnerInviteEmail(inv, inviterName, lang, acceptURL)
 	case EmailInviteTypeMember:
 		spaceName := ""
 		sp, sErr := s.db.querySpaceByID(inv.SpaceId)
@@ -104,7 +114,7 @@ func (s *Space) dispatchInviteEmail(inv *spaceEmailInviteModel, rawToken string)
 		} else if sp != nil {
 			spaceName = sp.Name
 		}
-		subject, body, bErr = buildMemberInviteEmail(inv, inviterName, spaceName, acceptURL)
+		rendered, bErr = buildMemberInviteEmail(inv, inviterName, spaceName, lang, acceptURL)
 	default:
 		s.Warn("未知 invite_type，跳过邮件发送", zap.Int("inviteType", inv.InviteType))
 		return
@@ -116,7 +126,9 @@ func (s *Space) dispatchInviteEmail(inv *spaceEmailInviteModel, rawToken string)
 		return
 	}
 
-	if err := s.currentInviteSender().SendHTMLEmail(ctx, inv.Email, subject, body); err != nil {
+	if err := s.currentInviteSender().SendTransactionalHTML(
+		ctx, inv.Email, rendered.Subject, rendered.HTML, rendered.Text,
+	); err != nil {
 		s.Error("发送邀请邮件失败",
 			zap.String("alert", "email_invite_send_failed"),
 			zap.Error(err),

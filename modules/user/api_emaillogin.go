@@ -12,6 +12,7 @@ import (
 	commonapi "github.com/Mininglamp-OSS/octo-server/modules/base/common"
 	common "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/opentracing/opentracing-go"
 	"go.uber.org/zap"
 )
@@ -65,7 +66,11 @@ func (u *User) emailSendCode(c *wkhttp.Context) {
 	}
 
 	emailService := commonapi.NewEmailService(u.ctx, common.EnsureSystemSettings(u.ctx))
-	if err := emailService.SendVerifyCode(context.Background(), req.Email, commonapi.CodeType(req.CodeType)); err != nil {
+	// 验证码场景：请求发起人即收件人，用其请求级语言协商（Accept-Language /
+	// ?lang= / cookie），无信号时 OutboundLanguage 兜底到 OCTO_DEFAULT_LANGUAGE。
+	// 发送 ctx 仍用 Background（脱离请求超时），lang 单独取自请求 ctx。
+	lang := octoi18n.OutboundLanguage(c.Request.Context())
+	if err := emailService.SendVerifyCode(context.Background(), req.Email, commonapi.CodeType(req.CodeType), lang); err != nil {
 		// 1 分钟重发冷却是客户端可处理状态 → 429（文案可见），其余（Redis/SMTP）
 		// 才是 5xx 内部故障。
 		if errors.Is(err, commonapi.ErrEmailSendRateLimited) {

@@ -72,6 +72,23 @@ func LanguageOrDefault(ctx context.Context, fallback string) string {
 	return fallback
 }
 
+// OutboundLanguage 解析「发出方内容」（邮件等）应使用的语言。
+//
+// 与请求响应不同，邮件常在脱离请求 ctx 的路径上生成（异步 goroutine、未登录
+// 的验证码发送），此时 ctx 里没有早期协商决策，也没有 UserInfo。本函数把
+// LanguageFromContext 的结果与 OCTO_DEFAULT_LANGUAGE 兜底合并：拿得到协商语言
+// 就用它，否则退回部署默认语言。
+//
+// 这样调用点写法统一（一行拿 lang），且当未来把请求 ctx 或收件人语言接入这条
+// 链路时无需改动发送层与模板层——结果会自动从 default 切换到真实语言。
+func OutboundLanguage(ctx context.Context) string {
+	def, err := DefaultLanguageFromEnv()
+	if err != nil {
+		def = DefaultLanguage
+	}
+	return LanguageOrDefault(ctx, def)
+}
+
 func languageSourcePriority(source LanguageSource) int {
 	switch source {
 	case LanguageSourceTrustedHeader:
