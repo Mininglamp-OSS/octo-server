@@ -21,9 +21,8 @@ import (
 // registration panics loudly here rather than silently degrading to an empty
 // envelope at request time.
 var (
-	codeSharedRateLimited  = mustLookupSharedCode("err.shared.rate.limited")
-	codeSharedInternal     = mustLookupSharedCode("err.shared.internal")
-	codeSharedAuthRequired = mustLookupSharedCode("err.shared.auth.required")
+	codeSharedRateLimited = mustLookupSharedCode("err.shared.rate.limited")
+	codeSharedInternal    = mustLookupSharedCode("err.shared.internal")
 )
 
 func mustLookupSharedCode(id string) codes.Code {

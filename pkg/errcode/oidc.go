@@ -31,6 +31,12 @@ var (
 	// ErrOIDCBindServiceUnavailable is returned when the bind sub-service failed
 	// to initialise (Discovery failed → o.bind is nil) but the routes are still
 	// mounted. Transient: ops can recover by fixing Discovery / restarting.
+	//
+	// NOTE: Internal=true (5xx hygiene) means the renderer emits the shared
+	// internal-error copy, not this DefaultMessage — the specific text and its
+	// zh-CN translation are intentionally unreachable on the wire. They are kept
+	// to satisfy Register and to document intent; clients distinguish the
+	// transient 503 via error.http_status, not the message.
 	ErrOIDCBindServiceUnavailable = register(codes.Code{
 		ID:             "err.server.oidc.bind_service_unavailable",
 		HTTPStatus:     http.StatusServiceUnavailable,
