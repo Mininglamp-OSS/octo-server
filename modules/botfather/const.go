@@ -47,6 +47,7 @@ const (
 	CmdPending        = "/pending"
 	CmdQuickstart     = "/quickstart"
 	CmdInstall        = "/install"
+	CmdDaemon         = "/daemon"
 )
 
 // 对话状态

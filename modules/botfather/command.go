@@ -176,6 +176,8 @@ func (h *commandHandler) handleCommand(fromUID string, cmd string) {
 		h.handleQuickstart(fromUID)
 	case CmdInstall:
 		h.handleInstall(fromUID)
+	case CmdDaemon:
+		h.handleDaemon(fromUID)
 	case CmdApprove:
 		h.handleApprove(fromUID, strings.TrimPrefix(cmd, command+" "))
 	case CmdReject:
@@ -1116,4 +1118,94 @@ func randomHex(n int) (string, error) {
 		return "", fmt.Errorf("随机数生成失败: %w", err)
 	}
 	return hex.EncodeToString(bytes), nil
+}
+
+// handleDaemon 返回 Agent Runtime 监控守护进程的启动命令
+func (h *commandHandler) handleDaemon(fromUID string) {
+	h.sm.Clear(fromUID, h.spaceID(fromUID))
+	spaceID := h.resolveSpaceID(fromUID)
+	if spaceID == "" {
+		h.reply(fromUID, "请先加入一个 Space 后再使用此命令。")
+		return
+	}
+	realUID := extractRealUID(fromUID)
+	apiKeyModel, err := h.db.queryUserAPIKeyByUIDAndSpaceID(realUID, spaceID)
+	if err != nil {
+		h.Error("查询API Key失败", zap.Error(err))
+		h.reply(fromUID, "查询 API Key 失败，请稍后重试。")
+		return
+	}
+	var apiKey string
+	if apiKeyModel != nil {
+		apiKey = apiKeyModel.APIKey
+	} else {
+		hexStr, hexErr := randomHex(16)
+		if hexErr != nil {
+			h.Error("生成API Key失败", zap.Error(hexErr))
+			h.reply(fromUID, "生成 API Key 失败，请稍后重试。")
+			return
+		}
+		apiKey = UserAPIKeyPrefix + hexStr
+		if err := h.db.insertUserAPIKey(realUID, apiKey, spaceID); err != nil {
+			h.Error("创建API Key失败", zap.Error(err))
+			h.reply(fromUID, "创建 API Key 失败，请稍后重试。")
+			return
+		}
+	}
+	cfg := h.ctx.GetConfig()
+	serverURL := cfg.External.BaseURL
+	if strings.TrimSpace(serverURL) == "" {
+		serverURL = fmt.Sprintf("http://%s:8090", cfg.External.IP)
+	}
+	// daemon 自己拼 /v1/daemon/... 路径，确保 base URL 不带 /api 后缀
+	serverURL = strings.TrimSuffix(serverURL, "/api")
+	serverURL = strings.TrimSuffix(serverURL, "/")
+
+	// PR-A/B: daemon 现在跟 3 个后端通信，需要 4 个 env。
+	// fleet / matter URL 默认按本地 dev 端口推导（同主机不同端口）；
+	// 生产部署 deployment 仓库会通过 docker-compose / nginx 覆盖。
+	// NOTIFY_INTERNAL_TOKEN 是 daemon 写回 matter timeline 时的共享密钥，
+	// 跟 server 自己的 NOTIFY_INTERNAL_TOKEN 同源（运维侧设置一致）。
+	fleetURL := deriveServiceURL(serverURL, ":8092")
+	matterURL := deriveServiceURL(serverURL, ":8080")
+
+	h.reply(fromUID, fmt.Sprintf(
+		"🖥️ **Agent Runtime 监控**\n\n"+
+			"在你的电脑或服务器上运行以下命令，自动检测并上报本机的 AI Agent "+
+			"状态（Claude Code、Codex、OpenClaw、Hermes）：\n\n"+
+			"**1. 安装：**\n"+
+			"```\ngo install github.com/Mininglamp-OSS/octo-daemon-cli@latest\n```\n\n"+
+			"**2. 启动（macOS / Linux）：**\n"+
+			"```\n"+
+			"export OCTO_SERVER_URL=%s\n"+
+			"export OCTO_FLEET_URL=%s\n"+
+			"export OCTO_MATTER_URL=%s\n"+
+			"export NOTIFY_INTERNAL_TOKEN=<找运维拿>\n"+
+			"octo-daemon start --api-key %s --api-url %s\n"+
+			"```\n\n"+
+			"启动后可在 Web 端 Runtimes 页面查看注册的 agent，并在「智能体」"+
+			"tab 创建 bot 派任务给本机的 openclaw。\n\n"+
+			"_注：4 个 URL 是 PR-A/B 拆分后的跨服务通信地址；如果你这台机器跟"+
+			" server 不在同一台主机，把 host 部分换成实际可达的地址。"+
+			"NOTIFY_INTERNAL_TOKEN 是写回 matter timeline 用的共享密钥。_",
+		serverURL, fleetURL, matterURL, apiKey, serverURL,
+	))
+}
+
+// deriveServiceURL takes the server URL (e.g. http://host:8090) and swaps
+// the port suffix to derive sibling-service URLs. Falls back to keeping the
+// hostname only if the URL doesn't end in a recognizable :port. Pure
+// best-effort — operators with non-default deployments should override.
+func deriveServiceURL(serverURL, newPortSuffix string) string {
+	// strip trailing :NNNN if present
+	for i := len(serverURL) - 1; i >= 0; i-- {
+		c := serverURL[i]
+		if c == ':' {
+			return serverURL[:i] + newPortSuffix
+		}
+		if c < '0' || c > '9' {
+			break
+		}
+	}
+	return serverURL + newPortSuffix
 }
