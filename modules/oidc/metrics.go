@@ -44,10 +44,12 @@ func callbackResultLabels() []string {
 	}
 }
 
-func stateConsumeResultLabels() []string  { return []string{"ok", "miss"} }
-func logoutResultLabels() []string        { return []string{"ok", "kick_fail", "revoke_fail"} }
-func syncTickResultLabels() []string      { return []string{"ran", "lock_held", "lock_err"} }
-func syncProcessedResultLabels() []string { return []string{"ok", "invalid_grant", "transient", "panic"} }
+func stateConsumeResultLabels() []string { return []string{"ok", "miss"} }
+func logoutResultLabels() []string       { return []string{"ok", "kick_fail", "token_fail", "revoke_fail"} }
+func syncTickResultLabels() []string     { return []string{"ran", "lock_held", "lock_err"} }
+func syncProcessedResultLabels() []string {
+	return []string{"ok", "invalid_grant", "transient", "panic"}
+}
 func syncVerificationSyncedResultLabels() []string {
 	// YUJ-405:SyncWorker rotate 后 /userinfo → upsert 的结果维度。
 	// YUJ-409 Round 2:新增 sub_mismatch(ownership 校验失败)和 fetch_nil
@@ -137,7 +139,7 @@ var (
 	metricLogoutTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricNamespace,
 		Name:      "logout_total",
-		Help:      "POST /logout outcomes (ok|kick_fail|revoke_fail).",
+		Help:      "POST /logout outcomes (ok|kick_fail|token_fail|revoke_fail).",
 	}, []string{"result"})
 
 	metricSyncTickTotal = promauto.NewCounterVec(prometheus.CounterOpts{

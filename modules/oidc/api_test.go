@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/gin-gonic/gin"
@@ -629,6 +630,64 @@ func TestAPI_Logout_KicksAndRevokesAndAudits(t *testing.T) {
 	}
 	if !foundLogout {
 		t.Errorf("expected EventLogout in audit, got %v", events)
+	}
+}
+
+// logout 只作废当前请求携带的 HTTP token,不影响同 uid 的其他 token。
+func TestAPI_Logout_InvalidatesCurrentHTTPTokenOnly(t *testing.T) {
+	mp := NewMockProvider(t)
+	o := newTestOIDC(t, mp, &fakeUserLookup{}, newFakeIdentityStore())
+	c := common.NewMemoryCache()
+	const (
+		uid          = "u-logout-current"
+		currentToken = "tok-current"
+		otherToken   = "tok-other"
+	)
+	if err := c.Set("token:"+currentToken, "u-logout-current@test"); err != nil {
+		t.Fatalf("seed current token: %v", err)
+	}
+	if err := c.Set("token:"+otherToken, "u-logout-current@test"); err != nil {
+		t.Fatalf("seed other token: %v", err)
+	}
+	if err := c.Set("uidtoken:0"+uid, currentToken); err != nil {
+		t.Fatalf("seed current uidtoken: %v", err)
+	}
+	if err := c.Set("uidtoken:1"+uid, otherToken); err != nil {
+		t.Fatalf("seed other uidtoken: %v", err)
+	}
+	o.tokenKill = cacheCurrentTokenInvalidator{
+		cache:          c,
+		tokenPrefix:    "token:",
+		uidTokenPrefix: "uidtoken:",
+	}
+	o.killer = &fakeKiller{}
+	o.revoker = &fakeRevoker{}
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.POST("/v1/auth/oidc/aegis/logout", func(gc *gin.Context) {
+		gc.Set("uid", uid)
+		o.logout(wrapWk(gc))
+	})
+	req := httptest.NewRequest("POST", "/v1/auth/oidc/aegis/logout", nil)
+	req.Header.Set("token", currentToken)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	if got, _ := c.Get("token:" + currentToken); got != "" {
+		t.Fatalf("current token still cached: %q", got)
+	}
+	if got, _ := c.Get("uidtoken:0" + uid); got != "" {
+		t.Fatalf("current uidtoken index still cached: %q", got)
+	}
+	if got, _ := c.Get("token:" + otherToken); got == "" {
+		t.Fatalf("other token should remain cached")
+	}
+	if got, _ := c.Get("uidtoken:1" + uid); got != otherToken {
+		t.Fatalf("other uidtoken index = %q, want %q", got, otherToken)
 	}
 }
 

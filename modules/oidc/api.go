@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/cache"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/register"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
@@ -63,6 +64,15 @@ type rtRevoker interface {
 	RevokeRefreshByUID(uid string) (int64, error)
 }
 
+// currentTokenInvalidator 作废当前 HTTP 会话 token。
+//
+// logout 的业务语义是"当前设备退出":WuKongIM 的 device_quit 只影响 IM 长连接,
+// HTTP API 仍由 token:<token> Redis key 决定。因此需要显式删除当前请求携带的
+// HTTP token；不能按 uid 粗暴删除所有 token,否则会把其他设备一并踢下线。
+type currentTokenInvalidator interface {
+	InvalidateCurrentToken(ctx context.Context, uid, token string) error
+}
+
 // OIDC OIDC 登录模块。
 //
 // 字段全部包内可见:测试在 New 后可替换 stateStore / authcode 为内存实现。
@@ -80,6 +90,7 @@ type OIDC struct {
 	audit      auditWriter
 	killer     sessionKiller
 	revoker    rtRevoker
+	tokenKill  currentTokenInvalidator
 	// idTokens 缓存登录时验签过的 id_token,供 logout 当 RP-Initiated Logout 的
 	// id_token_hint。nil 时 logout 不生成 end_session_url(降级为仅清本地)。
 	idTokens idTokenStore
@@ -135,6 +146,11 @@ func New(ctx *config.Context) *OIDC {
 	o.audit = db
 	o.revoker = db
 	o.killer = ctxKiller{ctx: ctx}
+	o.tokenKill = cacheCurrentTokenInvalidator{
+		cache:          ctx.Cache(),
+		tokenPrefix:    ctx.GetConfig().Cache.TokenCachePrefix,
+		uidTokenPrefix: ctx.GetConfig().Cache.UIDTokenCachePrefix,
+	}
 	o.cbGuard = NewCallbackGuard(
 		ctx.GetRedisConn(),
 		callbackGuardThresholdFromEnv(),
@@ -864,10 +880,19 @@ func (o *OIDC) logout(c *wkhttp.Context) {
 	// 但指标要区分"成功 / 踢线失败 / 吊销失败",方便定位 IM 或 DB 链路问题。
 	kickFailed := false
 	revokeFailed := false
+	tokenFailed := false
 	if o.killer != nil {
 		if err := o.killer.Kick(ctx, uid); err != nil {
 			kickFailed = true
 			o.Error("OIDC logout 踢线失败",
+				zap.String("trace_id", traceID),
+				zap.Error(err), zap.String("uid", uid))
+		}
+	}
+	if o.tokenKill != nil {
+		if err := o.tokenKill.InvalidateCurrentToken(ctx, uid, c.GetHeader("token")); err != nil {
+			tokenFailed = true
+			o.Error("OIDC logout 作废当前 HTTP token 失败",
 				zap.String("trace_id", traceID),
 				zap.Error(err), zap.String("uid", uid))
 		}
@@ -880,17 +905,20 @@ func (o *OIDC) logout(c *wkhttp.Context) {
 				zap.Error(err), zap.String("uid", uid))
 		}
 	}
-	// 两个失败标签独立计数 —— 同一次 logout 可能 kick 和 revoke 都失败,
-	// 早期 switch/case 写法会把 revoke_fail 吃掉。Counter sum 仍可能 > 总请求数,
-	// 但每个失败维度的趋势准确,运维查"哪条链路在抖"时不会漏报。
+	// 失败标签独立计数 —— 同一次 logout 可能同时出现 token/kick/revoke 多个失败。
+	// Counter sum 仍可能 > 总请求数,但每个失败维度的趋势准确,运维查"哪条链路在抖"
+	// 时不会漏报。
 	switch {
-	case kickFailed && revokeFailed:
-		metricLogoutTotal.WithLabelValues("kick_fail").Inc()
-		metricLogoutTotal.WithLabelValues("revoke_fail").Inc()
-	case kickFailed:
-		metricLogoutTotal.WithLabelValues("kick_fail").Inc()
-	case revokeFailed:
-		metricLogoutTotal.WithLabelValues("revoke_fail").Inc()
+	case kickFailed || revokeFailed || tokenFailed:
+		if kickFailed {
+			metricLogoutTotal.WithLabelValues("kick_fail").Inc()
+		}
+		if tokenFailed {
+			metricLogoutTotal.WithLabelValues("token_fail").Inc()
+		}
+		if revokeFailed {
+			metricLogoutTotal.WithLabelValues("revoke_fail").Inc()
+		}
 	default:
 		metricLogoutTotal.WithLabelValues("ok").Inc()
 	}
@@ -1298,6 +1326,38 @@ type ctxKiller struct{ ctx *config.Context }
 
 func (k ctxKiller) Kick(_ context.Context, uid string) error {
 	return k.ctx.QuitUserDevice(uid, -1)
+}
+
+type cacheCurrentTokenInvalidator struct {
+	cache          cache.Cache
+	tokenPrefix    string
+	uidTokenPrefix string
+}
+
+func (i cacheCurrentTokenInvalidator) InvalidateCurrentToken(_ context.Context, uid, token string) error {
+	token = strings.TrimSpace(token)
+	if i.cache == nil || token == "" {
+		return nil
+	}
+	if err := i.cache.Delete(i.tokenPrefix + token); err != nil {
+		return err
+	}
+	// uidtoken:<flag><uid> 是登录签发时维护的反向索引。它不是枚举所有历史 token
+	// 的可靠来源,但如果它正好指向当前 token,同步删除能避免下一次同 flag 登录
+	// 复用刚 logout 的 token 字符串。
+	for _, flag := range []config.DeviceFlag{config.APP, config.Web, config.PC} {
+		key := fmt.Sprintf("%s%d%s", i.uidTokenPrefix, flag, uid)
+		oldToken, err := i.cache.Get(key)
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(oldToken) == token {
+			if err := i.cache.Delete(key); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func maskEmail(email string) string {

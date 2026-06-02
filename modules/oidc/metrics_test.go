@@ -39,7 +39,7 @@ func TestMetrics_StateConsumeTotal_Labels(t *testing.T) {
 }
 
 func TestMetrics_LogoutTotal_Labels(t *testing.T) {
-	for _, result := range []string{"ok", "kick_fail", "revoke_fail"} {
+	for _, result := range []string{"ok", "kick_fail", "token_fail", "revoke_fail"} {
 		_, err := metricLogoutTotal.GetMetricWithLabelValues(result)
 		assert.NoError(t, err)
 	}
