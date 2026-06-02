@@ -86,3 +86,9 @@ testenv/miniodata/
 
 # TestMakeCompose temporary fixture (modules/file/service_test.go:46)
 modules/file/test.png
+
+# Local binary builds — never commit these
+octo-server
+octo-server-old*
+octo-server-pre-*
+octo-server-prev*
