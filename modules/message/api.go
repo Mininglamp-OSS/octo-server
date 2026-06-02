@@ -2111,29 +2111,53 @@ func (m *Message) hasRevokePermission(messageM *messageModel, loginUID string) (
 			return true, nil
 		}
 	}
-	if messageM.ChannelType == common.ChannelTypeGroup.Uint8() { // 管理者或创建者可以撤回其他成员的消息
-		loginMember, err := m.groupService.GetMember(messageM.ChannelID, loginUID)
-		if err != nil {
-			return false, err
-		}
-		if loginMember == nil {
+	switch messageM.ChannelType {
+	case common.ChannelTypeGroup.Uint8(): // 管理者或创建者可以撤回其他成员的消息
+		return m.groupRoleRevokeAllowed(messageM.ChannelID, messageM.FromUID, loginUID)
+	case common.ChannelTypeCommunityTopic.Uint8():
+		// issue #222: 子区沿用群聊撤回权限，权限判断基于父群角色（与 authorizeMutualDelete
+		// 的子区逻辑对齐）；忽略子区创建人概念，不给创建人额外特权。
+		parentGroupNo, _, perr := thread.ParseChannelID(messageM.ChannelID)
+		if perr != nil {
+			// fail-closed：无法解析出父群即视为无权限（与 delete2 解析失败的处理一致）。
+			m.Warn("解析子区频道ID失败，拒绝撤回",
+				zap.Error(perr), zap.String("channelID", messageM.ChannelID))
 			return false, nil
 		}
-		fromMember, err := m.groupService.GetMember(messageM.ChannelID, messageM.FromUID)
-		if err != nil {
-			return false, err
-		}
-		if fromMember == nil {
-			// 消息发送者已不在群：管理员/创建者可撤回，普通成员不可
-			return loginMember.Role != int(common.GroupMemberRoleNormal), nil
-		}
-		if fromMember.Role == int(common.GroupMemberRoleCreater) || loginMember.Role == int(common.GroupMemberRoleNormal) {
-			return false, nil
-		}
-		if loginMember.Role == int(common.GroupMemberRoleCreater) || (loginMember.Role == int(common.GroupMemberRoleManager) && fromMember.Role == int(common.GroupMemberRoleNormal)) {
-			return true, nil
-		}
+		return m.groupRoleRevokeAllowed(parentGroupNo, messageM.FromUID, loginUID)
+	}
 
+	return false, nil
+}
+
+// groupRoleRevokeAllowed 按群聊撤回权限矩阵判定 loginUID 是否可撤回 fromUID 在
+// groupNo 群内发的消息。子区（CommunityTopic）传入解析出的父群 groupNo 即可复用同一矩阵。
+//   - 群主：可撤回任何人的消息
+//   - 管理员：仅可撤回普通成员的消息，不能撤回其他管理员或群主
+//   - 普通成员：不能撤回他人（撤回自己的消息已在上层短路）
+//
+// 注意：自己发的消息、bot-owner 等短路分支由调用方 hasRevokePermission 在进入此方法前处理。
+func (m *Message) groupRoleRevokeAllowed(groupNo, fromUID, loginUID string) (bool, error) {
+	loginMember, err := m.groupService.GetMember(groupNo, loginUID)
+	if err != nil {
+		return false, err
+	}
+	if loginMember == nil {
+		return false, nil
+	}
+	fromMember, err := m.groupService.GetMember(groupNo, fromUID)
+	if err != nil {
+		return false, err
+	}
+	if fromMember == nil {
+		// 消息发送者已不在群：管理员/创建者可撤回，普通成员不可
+		return loginMember.Role != int(common.GroupMemberRoleNormal), nil
+	}
+	if fromMember.Role == int(common.GroupMemberRoleCreater) || loginMember.Role == int(common.GroupMemberRoleNormal) {
+		return false, nil
+	}
+	if loginMember.Role == int(common.GroupMemberRoleCreater) || (loginMember.Role == int(common.GroupMemberRoleManager) && fromMember.Role == int(common.GroupMemberRoleNormal)) {
+		return true, nil
 	}
 
 	return false, nil
