@@ -8,6 +8,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"go.uber.org/zap"
 )
 
@@ -62,7 +63,7 @@ func (o *OIDC) guardBindReady(c *wkhttp.Context, m *bindMetricRecord) bool {
 		return false
 	}
 	m.result = "not_ready"
-	c.AbortWithStatusJSON(http.StatusServiceUnavailable, errMsg("bind service not ready"))
+	respondBindError(c, errcode.ErrOIDCBindServiceUnavailable)
 	return true
 }
 
@@ -118,7 +119,7 @@ func (o *OIDC) bindInfo(c *wkhttp.Context) {
 	token := c.Query("token")
 	if !authcodeRe.MatchString(token) {
 		m.result = "bad_request"
-		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("token invalid"))
+		respondBindError(c, errcode.ErrOIDCBindRequestInvalid)
 		return
 	}
 	info, err := o.bind.Info(c.Request.Context(), token)
@@ -153,12 +154,12 @@ func (o *OIDC) bindVerifyPassword(c *wkhttp.Context) {
 	}
 	if err := c.BindJSON(&req); err != nil {
 		m.result = "bad_request"
-		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("invalid request body"))
+		respondBindError(c, errcode.ErrOIDCBindRequestInvalid)
 		return
 	}
 	if !authcodeRe.MatchString(req.Token) || req.Identifier == "" || req.Password == "" {
 		m.result = "bad_request"
-		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("token/identifier/password required"))
+		respondBindError(c, errcode.ErrOIDCBindRequestInvalid)
 		return
 	}
 	err := o.bind.VerifyPassword(c.Request.Context(), req.Token, req.Identifier, req.Password)
@@ -194,7 +195,7 @@ func (o *OIDC) bindOTPSend(c *wkhttp.Context) {
 	}
 	if err := c.BindJSON(&req); err != nil || !authcodeRe.MatchString(req.Token) {
 		m.result = "bad_request"
-		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("token required"))
+		respondBindError(c, errcode.ErrOIDCBindRequestInvalid)
 		return
 	}
 	err := o.bind.SendSMS(c.Request.Context(), req.Token)
@@ -228,12 +229,12 @@ func (o *OIDC) bindOTPCheck(c *wkhttp.Context) {
 	}
 	if err := c.BindJSON(&req); err != nil {
 		m.result = "bad_request"
-		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("invalid request body"))
+		respondBindError(c, errcode.ErrOIDCBindRequestInvalid)
 		return
 	}
 	if !authcodeRe.MatchString(req.Token) || req.Code == "" {
 		m.result = "bad_request"
-		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("token/code required"))
+		respondBindError(c, errcode.ErrOIDCBindRequestInvalid)
 		return
 	}
 	err := o.bind.VerifySMS(c.Request.Context(), req.Token, req.Code)
@@ -254,12 +255,12 @@ func (o *OIDC) bindOTPCheck(c *wkhttp.Context) {
 // 单独抽出来是因为多个 handler 共用同一组语义(token 不存在 → 410)。
 func (o *OIDC) handleBindLookupErr(c *wkhttp.Context, path, token string, err error) {
 	if errors.Is(err, ErrBindNotFound) {
-		c.AbortWithStatusJSON(http.StatusGone, errMsg("token expired or not found"))
+		respondBindError(c, errcode.ErrOIDCBindTokenInvalid)
 		return
 	}
 	o.Warn("OIDC bind lookup error",
 		zap.String("path", path), zap.String("token_hash", subHash(token)), zap.Error(err))
-	c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("internal error"))
+	respondBindError(c, codeSharedInternal)
 }
 
 // handleBindVerifyErr verify(密码 / 短信)路径上的统一错误码翻译。
@@ -267,33 +268,33 @@ func (o *OIDC) handleBindLookupErr(c *wkhttp.Context, path, token string, err er
 func (o *OIDC) handleBindVerifyErr(c *wkhttp.Context, path, token string, err error) {
 	switch {
 	case errors.Is(err, ErrBindNotFound):
-		c.AbortWithStatusJSON(http.StatusGone, errMsg("token expired or not found"))
+		respondBindError(c, errcode.ErrOIDCBindTokenInvalid)
 	case errors.Is(err, ErrBindRateLimited):
-		c.AbortWithStatusJSON(http.StatusTooManyRequests, errMsg("too many attempts, try later"))
+		respondBindError(c, codeSharedRateLimited)
 	case errors.Is(err, ErrBindStatusConflict):
 		// status 不可推:多半是重复 verify,客户端应当跳过直接走 confirm。
-		c.AbortWithStatusJSON(http.StatusConflict, errMsg("already verified"))
+		respondBindError(c, errcode.ErrOIDCBindAlreadyVerified)
 	case errors.Is(err, ErrBindConflictNeedManual):
 		// 多 dmwork 账号对应同 phone:自助流程无法判定,提示走 Admin 兜底。
-		c.AbortWithStatusJSON(http.StatusConflict, errMsg("multiple accounts matched; contact support"))
+		respondBindError(c, errcode.ErrOIDCBindConflictNeedManual)
 	case errors.Is(err, ErrBindNoPhone):
 		// claims 无 phone 但客户端硬调 /verify/otp/check —— 业务前提不满足。
 		// metric (bindResultFromErr) 已归到 bad_request,HTTP 同步 400 保持一致。
-		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("sms not available for this account"))
+		respondBindError(c, errcode.ErrOIDCBindSMSUnavailable)
 	case errors.Is(err, ErrBindMethodDisabled):
 		// 运维通过 OCTO_OIDC_BIND_METHODS 关了该方法 —— 客户端不应再 retry。
-		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("verification method disabled"))
+		respondBindError(c, errcode.ErrOIDCBindMethodDisabled)
 	case errors.Is(err, ErrBindAuthRejected):
 		// 业务拒绝(密码错 / OTP 错 / phone 不命中):统一 401 防账号枚举。
 		// 具体 reason 走 zap,客户端只看到通用文案。
 		o.Info("OIDC bind verify rejected",
 			zap.String("path", path), zap.String("token_hash", subHash(token)), zap.Error(err))
-		c.AbortWithStatusJSON(http.StatusUnauthorized, errMsg("invalid credentials"))
+		respondBindError(c, errcode.ErrOIDCBindInvalidCredentials)
 	default:
 		// 未分类 → 500。bindResultFromErr 同步落 internal_error,告警阈值对齐。
 		o.Error("OIDC bind verify internal error",
 			zap.String("path", path), zap.String("token_hash", subHash(token)), zap.Error(err))
-		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("internal error"))
+		respondBindError(c, codeSharedInternal)
 	}
 }
 
@@ -324,7 +325,7 @@ func (o *OIDC) bindConfirm(c *wkhttp.Context) {
 	}
 	if err := c.BindJSON(&req); err != nil || !authcodeRe.MatchString(req.Token) {
 		m.result = "bad_request"
-		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("token required"))
+		respondBindError(c, errcode.ErrOIDCBindRequestInvalid)
 		return
 	}
 	ctx := c.Request.Context()
@@ -368,26 +369,25 @@ func (o *OIDC) handleBindConfirmErr(c *wkhttp.Context, token string, err error) 
 	switch {
 	case errors.Is(err, ErrBindNotFound):
 		o.writeAudit("bind:"+tokenHash, EventBindConfirmFail, stateFromCtx(c), "token expired or not found")
-		c.AbortWithStatusJSON(http.StatusGone, errMsg("token expired or not found"))
+		respondBindError(c, errcode.ErrOIDCBindTokenInvalid)
 	case errors.Is(err, ErrBindRateLimited):
 		o.writeAudit("bind:"+tokenHash, EventBindConfirmFail, stateFromCtx(c), "rate limited")
-		c.AbortWithStatusJSON(http.StatusTooManyRequests, errMsg("too many confirm attempts"))
+		respondBindError(c, codeSharedRateLimited)
 	case errors.Is(err, ErrBindStatusConflict):
 		// 状态不是 verified —— 用户跳过了二次验证,或并发 confirm 撞上(AC-6)。
 		o.writeAudit("bind:"+tokenHash, EventBindConfirmFail, stateFromCtx(c), "status conflict")
-		c.AbortWithStatusJSON(http.StatusUnauthorized, errMsg("verify before confirm"))
+		respondBindError(c, errcode.ErrOIDCBindVerifyRequired)
 	case errors.Is(err, ErrBindAlreadyBound):
 		// 重试 confirm 命中已写 identity 的常见路径(IssueSession 失败后 retry);
 		// 文案引导用户回 OIDC 入口而不是放弃。
 		o.writeAudit("bind:"+tokenHash, EventBindConfirmFail, stateFromCtx(c), "already bound")
-		c.AbortWithStatusJSON(http.StatusConflict,
-			errMsg("identity already bound; sign in again via OIDC to continue"))
+		respondBindError(c, errcode.ErrOIDCBindAlreadyBound)
 	case errors.Is(err, ErrBindAuthRejected):
 		// TOCTOU 复核失败:verify→confirm 之间账号被停用/进入冷静期。
 		// 401 + 通用文案与 verify 路径反枚举一致(不暴露"账号被运维停用"差异);
 		// audit reason 写明区分让 SOC 在 oidc_audit_log 里能区分本因。
 		o.writeAudit("bind:"+tokenHash, EventBindConfirmFail, stateFromCtx(c), "candidate uid not bindable")
-		c.AbortWithStatusJSON(http.StatusUnauthorized, errMsg("invalid credentials"))
+		respondBindError(c, errcode.ErrOIDCBindInvalidCredentials)
 	default:
 		o.Error("OIDC bind confirm failed (internal)",
 			zap.String("token_hash", tokenHash), zap.Error(err))
@@ -395,7 +395,7 @@ func (o *OIDC) handleBindConfirmErr(c *wkhttp.Context, token string, err error) 
 		// 未来误把第三方 wrap 进来意外注入大字符串/凭据片段。256 字符上限和
 		// 其他 callback 失败审计一致(api.go:38)。
 		o.writeAudit("bind:"+tokenHash, EventBindConfirmFail, stateFromCtx(c), auditReason(err.Error()))
-		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("internal error"))
+		respondBindError(c, codeSharedInternal)
 	}
 }
 
@@ -474,7 +474,7 @@ func (o *OIDC) bindCreate(c *wkhttp.Context) {
 	}
 	if err := c.BindJSON(&req); err != nil || !authcodeRe.MatchString(req.Token) {
 		m.result = "bad_request"
-		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("token required"))
+		respondBindError(c, errcode.ErrOIDCBindRequestInvalid)
 		return
 	}
 	ctx := c.Request.Context()
@@ -509,34 +509,32 @@ func (o *OIDC) handleBindCreateErr(c *wkhttp.Context, token string, err error) {
 	switch {
 	case errors.Is(err, ErrBindNotFound):
 		o.writeAudit("bind:"+tokenHash, EventBindCreateFail, stateFromCtx(c), "token expired or not found")
-		c.AbortWithStatusJSON(http.StatusGone, errMsg("token expired or not found"))
+		respondBindError(c, errcode.ErrOIDCBindTokenInvalid)
 	case errors.Is(err, ErrBindRateLimited):
 		o.writeAudit("bind:"+tokenHash, EventBindCreateFail, stateFromCtx(c), "rate limited")
-		c.AbortWithStatusJSON(http.StatusTooManyRequests, errMsg("too many create attempts"))
+		respondBindError(c, codeSharedRateLimited)
 	case errors.Is(err, ErrBindStatusConflict):
 		o.writeAudit("bind:"+tokenHash, EventBindCreateFail, stateFromCtx(c), "status conflict")
-		c.AbortWithStatusJSON(http.StatusConflict, errMsg("token status conflict"))
+		respondBindError(c, errcode.ErrOIDCBindStatusConflict)
 	case errors.Is(err, ErrBindAlreadyBound):
 		// Identity 行已存在(并发 /bind/create 同 (issuer,sub) 触发了竞态)。
 		// 赢家已签发会话;此处只引导客户端重发起 OIDC 登录以拾取赢家会话。
 		// Ghost user 清理(输家创建的 dmwork user)不在本 PR 范围,见 plan §4/§15。
 		o.writeAudit("bind:"+tokenHash, EventBindCreateFail, stateFromCtx(c), "already bound")
-		c.AbortWithStatusJSON(http.StatusConflict,
-			errMsg("identity already bound; sign in via OIDC to continue"))
+		respondBindError(c, errcode.ErrOIDCBindAlreadyBound)
 	case errors.Is(err, ErrBindCreateClaimsIncomplete):
 		o.writeAudit("bind:"+tokenHash, EventBindCreateFail, stateFromCtx(c), "claims incomplete")
-		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, errMsg("claims missing required fields"))
+		respondBindError(c, errcode.ErrOIDCBindClaimsIncomplete)
 	case errors.Is(err, ErrBindCreateConflictNeedManual):
 		// manual-conflict token:claims 命中多条 dmwork 账号,/bind/create
 		// 不允许重复建号,引导走 Admin 人工合并兜底(与 verify 多匹配同语义)。
 		o.writeAudit("bind:"+tokenHash, EventBindCreateFail, stateFromCtx(c), "conflict need manual")
-		c.AbortWithStatusJSON(http.StatusConflict,
-			errMsg("account conflict needs manual resolution"))
+		respondBindError(c, errcode.ErrOIDCBindConflictNeedManual)
 	default:
 		o.Error("OIDC bind create failed (internal)",
 			zap.String("token_hash", tokenHash), zap.Error(err))
 		o.writeAudit("bind:"+tokenHash, EventBindCreateFail, stateFromCtx(c), auditReason(err.Error()))
-		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("internal error"))
+		respondBindError(c, codeSharedInternal)
 	}
 }
 
@@ -602,18 +600,18 @@ func (l dbBindLocator) UIDsByPhone(zone, phone string) ([]string, error) {
 func (o *OIDC) handleBindOTPSendErr(c *wkhttp.Context, token string, err error) {
 	switch {
 	case errors.Is(err, ErrBindNotFound):
-		c.AbortWithStatusJSON(http.StatusGone, errMsg("token expired or not found"))
+		respondBindError(c, errcode.ErrOIDCBindTokenInvalid)
 	case errors.Is(err, ErrBindRateLimited):
-		c.AbortWithStatusJSON(http.StatusTooManyRequests, errMsg("too many otp sends, try later"))
+		respondBindError(c, codeSharedRateLimited)
 	case errors.Is(err, ErrBindNoPhone):
 		// 业务前提不满足:前端应改走密码手段,不要 retry SMS。
-		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("sms not available for this account"))
+		respondBindError(c, errcode.ErrOIDCBindSMSUnavailable)
 	case errors.Is(err, ErrBindMethodDisabled):
-		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("verification method disabled"))
+		respondBindError(c, errcode.ErrOIDCBindMethodDisabled)
 	default:
 		// SMSService 内部 / 网络异常:5xx 报给客户端,运维 dashboard 可见。
 		o.Error("OIDC bind otp send failed (internal)",
 			zap.String("token_hash", subHash(token)), zap.Error(err))
-		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("sms send failed"))
+		respondBindError(c, codeSharedInternal)
 	}
 }

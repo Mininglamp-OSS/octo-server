@@ -26,8 +26,8 @@
 1 modules/botfather/api_bot_thread.go
 9 modules/botfather/api_user.go
 2 modules/notify/api.go
-14 modules/oidc/api.go
-37 modules/oidc/api_bind.go
+14 modules/oidc/api.go  # EXEMPT: OAuth2/OIDC protocol endpoints (authorize/callback/logout) — browser-facing redirect flow, not the dmwork front-end; raw errMsg() kept by design (#220). The err.Error() leaks were closed in #220.
+0 modules/oidc/api_bind.go  # migrated to httperr.ResponseErrorLWithStatus (#220)
 6 modules/robot/api.go
 8 modules/user/api.go
 4 modules/webhook/github.go  # EXEMPT: GitHub webhook signature errors — external GH never reads the localized envelope
