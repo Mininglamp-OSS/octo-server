@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"mime"
 	"net"
 	"net/smtp"
 	"strconv"
@@ -185,7 +186,7 @@ func (s *EmailService) sendEmail(ctx context.Context, to, subject, body string) 
 
 	msg := "From: " + fromSan + "\r\n" +
 		"To: " + toSan + "\r\n" +
-		"Subject: " + subjectSan + "\r\n" +
+		"Subject: " + encodeSubject(subjectSan) + "\r\n" +
 		"MIME-Version: 1.0\r\n" +
 		"Content-Type: text/html; charset=UTF-8\r\n" +
 		"\r\n" +
@@ -201,6 +202,16 @@ func sanitizeHeader(s string) string {
 	s = strings.ReplaceAll(s, "\r", "")
 	s = strings.ReplaceAll(s, "\n", "")
 	return s
+}
+
+// encodeSubject RFC 2047 word-encodes a Subject so non-ASCII content (localized
+// subjects like "Octo 验证码" / "Octo 邀请你加入团队空间「…」", or user-controlled
+// space names) survives strict MTAs and clients instead of risking mojibake.
+// ASCII input is returned unchanged. The encoder only ever emits ASCII, so it
+// cannot reintroduce CRLF header injection; callers still pass CRLF-sanitized
+// input for defense in depth.
+func encodeSubject(s string) string {
+	return mime.QEncoding.Encode("utf-8", s)
 }
 
 // buildTransactionalMessage 拼一份 multipart/alternative 报文,内含两段标准
@@ -229,7 +240,7 @@ func buildTransactionalMessage(fromSan, toSan, subjectSan, htmlBody, plainBody s
 	headers := []string{
 		"From: " + fromSan,
 		"To: " + toSan,
-		"Subject: " + subjectSan,
+		"Subject: " + encodeSubject(subjectSan),
 		"Date: " + time.Now().UTC().Format(time.RFC1123Z),
 		"Message-ID: " + messageID,
 		"MIME-Version: 1.0",

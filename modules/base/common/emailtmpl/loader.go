@@ -44,12 +44,24 @@ const (
 	KeySpaceInviteMember = "space_invite_member"
 )
 
-// fallbackLanguage is the language guaranteed to carry a complete template set
-// and doubles as the source language. lookup() falls back to it when a
-// requested language is missing a file. TestTemplateCompleteness asserts every
-// supported language is fully covered, so this is defensive (e.g. a future
-// language added with a partial set) rather than a production hot path.
+// fallbackLanguage is the source language (en-US), treated as the canonical
+// complete template set. lookup() falls back to it only for an *unsupported*
+// requested language — every *supported* language is guaranteed complete by the
+// load()-time matrix check (see expectedKeys), so a supported language never
+// reaches this fallback.
+//
+// This is intentionally the source language, NOT the runtime
+// OCTO_DEFAULT_LANGUAGE (which may be zh-CN). emailtmpl's contract is "the
+// source language is always fully present"; a missing piece for a *supported*
+// language fails loud at load() rather than silently rendering en-US bodies
+// under a zh-CN-default deployment.
 const fallbackLanguage = octoi18n.SourceLanguage // "en-US"
+
+// expectedKeys is the message-key matrix every supported language must fully
+// provide. Kept explicit (not derived from whatever files happen to exist) so a
+// supported language shipped with zero files is caught at load() time rather
+// than silently falling back to the source language at render time.
+var expectedKeys = []string{KeyVerifyCode, KeySpaceInviteOwner, KeySpaceInviteMember}
 
 // Rendered is the output of Render: the three parts a transactional email
 // needs. Subject is trimmed (no stray trailing newline leaking into the SMTP
@@ -161,13 +173,25 @@ func execHTML(t *htmltemplate.Template, data any) (string, error) {
 	return buf.String(), nil
 }
 
-// load walks the embedded template tree once and compiles every file into the
-// `compiled` map. A parse error or an incomplete set (missing subject/html/text
-// for some key) is captured in loadErr and surfaced on the first Render call —
-// fail-loud at startup rather than rendering a half-built email at runtime.
+// load compiles the embedded template tree once into the package `compiled`
+// map; the result/error are surfaced on the first Render call.
 func load() {
-	compiled = map[string]*compiledSet{}
-	walkErr := fs.WalkDir(templatesFS, "templates", func(path string, d fs.DirEntry, err error) error {
+	compiled, loadErr = loadFrom(templatesFS)
+}
+
+// loadFrom walks fsys, compiles every {key}.{kind}.tmpl file, and then enforces
+// the declared completeness matrix (every supported language × every
+// expectedKey, all three kinds present). A parse error, a stray file, or a
+// missing/partial set for a supported language returns an error — fail-loud
+// rather than rendering a half-built email (or silently falling back to the
+// source language) at runtime.
+//
+// fsys is a parameter (defaulting to the embed in load()) so tests can inject an
+// fstest.MapFS to exercise the incomplete-set guarantee without mutating the
+// shipped templates.
+func loadFrom(fsys fs.FS) (map[string]*compiledSet, error) {
+	sets := map[string]*compiledSet{}
+	walkErr := fs.WalkDir(fsys, "templates", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -185,15 +209,15 @@ func load() {
 		if !ok {
 			return fmt.Errorf("emailtmpl: template %q must be {key}.{kind}.tmpl", path)
 		}
-		data, rerr := templatesFS.ReadFile(path)
+		data, rerr := fs.ReadFile(fsys, path)
 		if rerr != nil {
 			return rerr
 		}
 		setKey := lang + "/" + key
-		cs := compiled[setKey]
+		cs := sets[setKey]
 		if cs == nil {
 			cs = &compiledSet{}
-			compiled[setKey] = cs
+			sets[setKey] = cs
 		}
 		switch kind {
 		case "subject":
@@ -220,17 +244,21 @@ func load() {
 		return nil
 	})
 	if walkErr != nil {
-		loadErr = walkErr
-		return
+		return nil, walkErr
 	}
-	for k, cs := range compiled {
-		if cs.subject == nil || cs.html == nil || cs.text == nil {
-			loadErr = fmt.Errorf(
-				"emailtmpl: incomplete set %q (subject=%t html=%t text=%t)",
-				k, cs.subject != nil, cs.html != nil, cs.text != nil)
-			return
+
+	// Declared-matrix completeness: every supported language must fully provide
+	// every expected key. This is the runtime guarantee that lets lookup()'s
+	// source-language fallback stay defensive-only for supported languages.
+	for _, lang := range octoi18n.SupportedLanguages() {
+		for _, key := range expectedKeys {
+			cs, ok := sets[lang+"/"+key]
+			if !ok || cs.subject == nil || cs.html == nil || cs.text == nil {
+				return nil, fmt.Errorf("emailtmpl: missing or incomplete template set %s/%s", lang, key)
+			}
 		}
 	}
+	return sets, nil
 }
 
 // cutLast splits name on the last occurrence of sep ("verify_code.subject" →

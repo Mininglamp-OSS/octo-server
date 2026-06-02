@@ -4,6 +4,7 @@ import (
 	htmltemplate "html/template"
 	"strings"
 	"testing"
+	"testing/fstest"
 
 	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 )
@@ -187,6 +188,62 @@ func TestRenderLanguageFallback(t *testing.T) {
 		if !strings.Contains(got.HTML, "000000") {
 			t.Errorf("lang=%q fallback render missing code: %q", lang, got.HTML)
 		}
+	}
+}
+
+// buildMatrixFS builds an fstest.MapFS containing a complete supported-language
+// × expected-key × kind matrix of minimal valid templates, for exercising
+// loadFrom's completeness guarantee without touching the shipped embed.
+func buildMatrixFS() fstest.MapFS {
+	m := fstest.MapFS{}
+	for _, lang := range octoi18n.SupportedLanguages() {
+		for _, key := range expectedKeys {
+			for _, kind := range []string{"subject", "html", "text"} {
+				m["templates/"+lang+"/"+key+"."+kind+".tmpl"] = &fstest.MapFile{Data: []byte("x")}
+			}
+		}
+	}
+	return m
+}
+
+func TestLoadFromCompleteMatrixOK(t *testing.T) {
+	if _, err := loadFrom(buildMatrixFS()); err != nil {
+		t.Fatalf("complete matrix should load, got: %v", err)
+	}
+}
+
+// A supported language missing any one part must fail loud at load() — the
+// runtime guarantee that lookup()'s source-language fallback is never silently
+// exercised for a supported language.
+func TestLoadFromIncompleteMatrixFailsLoud(t *testing.T) {
+	m := buildMatrixFS()
+	var victim string
+	for k := range m {
+		if strings.HasSuffix(k, "/verify_code.text.tmpl") {
+			victim = k
+			break
+		}
+	}
+	if victim == "" {
+		t.Fatal("test setup: no verify_code.text.tmpl in matrix")
+	}
+	delete(m, victim)
+	if _, err := loadFrom(m); err == nil {
+		t.Fatalf("missing %s should fail load, got nil error", victim)
+	}
+}
+
+// A parse error in any file must surface as a load error, not a panic.
+func TestLoadFromParseErrorSurfaces(t *testing.T) {
+	m := buildMatrixFS()
+	for k := range m {
+		if strings.HasSuffix(k, "/verify_code.html.tmpl") {
+			m[k] = &fstest.MapFile{Data: []byte("{{.Unclosed")}
+			break
+		}
+	}
+	if _, err := loadFrom(m); err == nil {
+		t.Fatal("malformed template should fail load, got nil error")
 	}
 }
 

@@ -17,7 +17,9 @@ const emailInviteAcceptPath = "/v1/space/email-invite"
 // emailInviteAcceptURL 用 External.BaseURL 拼出邀请接受链接。base 为空时返回空串，
 // 由调用方决定是否跳过发送（典型场景：本地开发未配置 BaseURL）。
 //
-// lang 非空时追加 ?...&lang=<lang>，让落地页与邮件用同一语言渲染（issue #221）。
+// lang 非空时追加 &lang=<lang>，作为前向兼容把语言带给落地页。注意：当前落地页
+// assets/web/space_email_invite.html 仍固定中文、尚未消费该参数，落地页本地化是
+// 独立后续工作；本期邀请语言恒为部署默认（issue #221 决策 A），掩盖了该 gap。
 func emailInviteAcceptURL(base, rawToken, lang string) string {
 	base = strings.TrimSpace(base)
 	if base == "" {

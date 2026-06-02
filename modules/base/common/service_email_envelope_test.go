@@ -1,6 +1,7 @@
 package common
 
 import (
+	"mime"
 	"regexp"
 	"strings"
 	"testing"
@@ -30,7 +31,14 @@ func TestBuildTransactionalMessage_StructureAndHeaders(t *testing.T) {
 	// ---- header block ----
 	assert.Contains(t, s, "From: contact@xming.ai\r\n")
 	assert.Contains(t, s, "To: guobin.a@mininglamp.com\r\n")
-	assert.Contains(t, s, "Subject: [Octo] SMTP 自检\r\n")
+	// Subject is RFC 2047 word-encoded so the non-ASCII "自检" survives strict
+	// MTAs/clients instead of mojibake; it must decode back to the original.
+	subjMatch := regexp.MustCompile(`(?m)^Subject: (.+)\r$`).FindStringSubmatch(s)
+	require.Len(t, subjMatch, 2, "Subject header must be present")
+	assert.Contains(t, subjMatch[1], "=?utf-8?", "non-ASCII subject must be RFC 2047 word-encoded")
+	decodedSubj, derr := new(mime.WordDecoder).DecodeHeader(subjMatch[1])
+	require.NoError(t, derr)
+	assert.Equal(t, "[Octo] SMTP 自检", decodedSubj, "encoded subject must round-trip to the original")
 	assert.Regexp(t, regexp.MustCompile(`(?m)^Date: .+\r$`), s, "Date header must be present")
 	assert.Regexp(t, regexp.MustCompile(`(?m)^Message-ID: <[0-9a-f]+@xming\.ai>\r$`), s,
 		"Message-ID domain should follow From's domain so SPF/DKIM alignment is sane")
