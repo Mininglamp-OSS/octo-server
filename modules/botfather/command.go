@@ -1161,11 +1161,11 @@ func (h *commandHandler) handleDaemon(fromUID string) {
 	serverURL = strings.TrimSuffix(serverURL, "/api")
 	serverURL = strings.TrimSuffix(serverURL, "/")
 
-	// PR-A/B: daemon 现在跟 3 个后端通信，需要 4 个 env。
+	// PR-A/B: daemon 现在跟 3 个后端通信，需要 3 个 URL env。
 	// fleet / matter URL 默认按本地 dev 端口推导（同主机不同端口）；
 	// 生产部署 deployment 仓库会通过 docker-compose / nginx 覆盖。
-	// NOTIFY_INTERNAL_TOKEN 是 daemon 写回 matter timeline 时的共享密钥，
-	// 跟 server 自己的 NOTIFY_INTERNAL_TOKEN 同源（运维侧设置一致）。
+	// daemon 用自己的 JWT（用 api-key 自动换的）调 matter writeback，
+	// 不再需要任何 shared secret — 用户机器上没有内部密钥。
 	fleetURL := deriveServiceURL(serverURL, ":8092")
 	matterURL := deriveServiceURL(serverURL, ":8080")
 
@@ -1180,14 +1180,12 @@ func (h *commandHandler) handleDaemon(fromUID string) {
 			"export OCTO_SERVER_URL=%s\n"+
 			"export OCTO_FLEET_URL=%s\n"+
 			"export OCTO_MATTER_URL=%s\n"+
-			"export NOTIFY_INTERNAL_TOKEN=<找运维拿>\n"+
 			"octo-daemon start --api-key %s --api-url %s\n"+
 			"```\n\n"+
 			"启动后可在 Web 端 Runtimes 页面查看注册的 agent，并在「智能体」"+
 			"tab 创建 bot 派任务给本机的 openclaw。\n\n"+
-			"_注：4 个 URL 是 PR-A/B 拆分后的跨服务通信地址；如果你这台机器跟"+
-			" server 不在同一台主机，把 host 部分换成实际可达的地址。"+
-			"NOTIFY_INTERNAL_TOKEN 是写回 matter timeline 用的共享密钥。_",
+			"_注：3 个 URL 是 PR-A/B 拆分后的跨服务通信地址；如果你这台机器跟"+
+			" server 不在同一台主机，把 host 部分换成实际可达的地址。_",
 		serverURL, fleetURL, matterURL, apiKey, serverURL,
 	))
 }
