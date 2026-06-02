@@ -19,6 +19,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
+	rd "github.com/go-redis/redis"
 	mysql "github.com/go-sql-driver/mysql"
 	"go.uber.org/zap"
 )
@@ -72,6 +74,17 @@ type rtRevoker interface {
 type currentTokenInvalidator interface {
 	InvalidateCurrentToken(ctx context.Context, uid, token string) error
 }
+
+type compareDeleter interface {
+	DeleteIfValue(key, want string) (bool, error)
+}
+
+var luaCompareDel = rd.NewScript(`
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("DEL", KEYS[1])
+end
+return 0
+`)
 
 // OIDC OIDC 登录模块。
 //
@@ -150,6 +163,7 @@ func New(ctx *config.Context) *OIDC {
 		cache:          ctx.Cache(),
 		tokenPrefix:    ctx.GetConfig().Cache.TokenCachePrefix,
 		uidTokenPrefix: ctx.GetConfig().Cache.UIDTokenCachePrefix,
+		indexDel:       newRedisCompareDeleter(ctx),
 	}
 	o.cbGuard = NewCallbackGuard(
 		ctx.GetRedisConn(),
@@ -838,6 +852,14 @@ func (o *OIDC) Close() error {
 		}
 		o.idTokens = nil
 	}
+	if cti, ok := o.tokenKill.(cacheCurrentTokenInvalidator); ok {
+		if rcd, ok := cti.indexDel.(*redisCompareDeleter); ok {
+			if err := rcd.Close(); err != nil {
+				o.Error("关闭 OIDC token invalidator Redis client 失败", zap.Error(err))
+			}
+		}
+		o.tokenKill = nil
+	}
 	if o.stateStore == nil {
 		return nil
 	}
@@ -1332,6 +1354,7 @@ type cacheCurrentTokenInvalidator struct {
 	cache          cache.Cache
 	tokenPrefix    string
 	uidTokenPrefix string
+	indexDel       compareDeleter
 }
 
 func (i cacheCurrentTokenInvalidator) InvalidateCurrentToken(_ context.Context, uid, token string) error {
@@ -1347,17 +1370,62 @@ func (i cacheCurrentTokenInvalidator) InvalidateCurrentToken(_ context.Context, 
 	// 复用刚 logout 的 token 字符串。
 	for _, flag := range []config.DeviceFlag{config.APP, config.Web, config.PC} {
 		key := fmt.Sprintf("%s%d%s", i.uidTokenPrefix, flag, uid)
-		oldToken, err := i.cache.Get(key)
-		if err != nil {
+		if err := i.deleteIndexIfCurrentToken(key, token); err != nil {
 			return err
-		}
-		if strings.TrimSpace(oldToken) == token {
-			if err := i.cache.Delete(key); err != nil {
-				return err
-			}
 		}
 	}
 	return nil
+}
+
+func (i cacheCurrentTokenInvalidator) deleteIndexIfCurrentToken(key, token string) error {
+	if i.indexDel != nil {
+		_, err := i.indexDel.DeleteIfValue(key, token)
+		return err
+	}
+	oldToken, err := i.cache.Get(key)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(oldToken) == token {
+		return i.cache.Delete(key)
+	}
+	return nil
+}
+
+type redisCompareDeleter struct {
+	client *rd.Client
+}
+
+func newRedisCompareDeleter(ctx *config.Context) *redisCompareDeleter {
+	client := rd.NewClient(octoredis.MustBuildOptions(ctx.GetConfig(), func(o *rd.Options) {
+		o.MaxRetries = 3
+		o.ReadTimeout = 3 * time.Second
+		o.WriteTimeout = 3 * time.Second
+		o.DialTimeout = 3 * time.Second
+	}))
+	return &redisCompareDeleter{client: client}
+}
+
+func (d *redisCompareDeleter) DeleteIfValue(key, want string) (bool, error) {
+	if d == nil || d.client == nil || key == "" {
+		return false, nil
+	}
+	res, err := luaCompareDel.Run(d.client, []string{key}, want).Result()
+	if err != nil {
+		return false, err
+	}
+	n, ok := res.(int64)
+	if !ok {
+		return false, fmt.Errorf("oidc: compare-del unexpected lua result type %T", res)
+	}
+	return n > 0, nil
+}
+
+func (d *redisCompareDeleter) Close() error {
+	if d == nil || d.client == nil {
+		return nil
+	}
+	return d.client.Close()
 }
 
 func maskEmail(email string) string {

@@ -691,6 +691,57 @@ func TestAPI_Logout_InvalidatesCurrentHTTPTokenOnly(t *testing.T) {
 	}
 }
 
+type raceyCompareDeleter struct {
+	cache    *common.MemoryCache
+	newToken string
+}
+
+func (d raceyCompareDeleter) DeleteIfValue(key, want string) (bool, error) {
+	if err := d.cache.Set(key, d.newToken); err != nil {
+		return false, err
+	}
+	got, err := d.cache.Get(key)
+	if err != nil {
+		return false, err
+	}
+	if got == want {
+		return true, d.cache.Delete(key)
+	}
+	return false, nil
+}
+
+func TestCurrentTokenInvalidator_DoesNotDeleteConcurrentUIDTokenUpdate(t *testing.T) {
+	c := common.NewMemoryCache()
+	const (
+		uid          = "u-race-index"
+		currentToken = "tok-current"
+		newToken     = "tok-new-login"
+	)
+	if err := c.Set("token:"+currentToken, "u-race-index@test"); err != nil {
+		t.Fatalf("seed current token: %v", err)
+	}
+	if err := c.Set("uidtoken:1"+uid, currentToken); err != nil {
+		t.Fatalf("seed uidtoken: %v", err)
+	}
+	invalidator := cacheCurrentTokenInvalidator{
+		cache:          c,
+		tokenPrefix:    "token:",
+		uidTokenPrefix: "uidtoken:",
+		indexDel:       raceyCompareDeleter{cache: c, newToken: newToken},
+	}
+
+	if err := invalidator.InvalidateCurrentToken(context.Background(), uid, currentToken); err != nil {
+		t.Fatalf("InvalidateCurrentToken: %v", err)
+	}
+
+	if got, _ := c.Get("token:" + currentToken); got != "" {
+		t.Fatalf("current token still cached: %q", got)
+	}
+	if got, _ := c.Get("uidtoken:1" + uid); got != newToken {
+		t.Fatalf("concurrent uidtoken update was deleted: got %q, want %q", got, newToken)
+	}
+}
+
 // 未登录 logout:无 uid → 401,不调踢线/吊销/审计。
 func TestAPI_Logout_NoAuth_Rejected(t *testing.T) {
 	mp := NewMockProvider(t)
