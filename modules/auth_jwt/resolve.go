@@ -1,6 +1,7 @@
 package auth_jwt
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 )
@@ -12,6 +13,11 @@ import (
 // Membership in the requested space is NOT validated here — JWT clients
 // can request any space they own; downstream middleware (runtime/bot
 // endpoints) re-checks space_member as needed.
+//
+// Supports two on-disk session formats octo-server has produced over
+// time: the legacy `uid@name@...` triple-at string and the newer
+// `v2:{"uid":"...","name":"..."}` JSON envelope. New logins write v2;
+// old sessions still in Redis use the legacy form.
 func (a *AuthJWT) resolveSession(sessionToken, spaceHint string) (string, string, error) {
 	tokenPrefix := a.ctx.GetConfig().Cache.TokenCachePrefix
 	uidAndName, err := a.ctx.Cache().Get(tokenPrefix + sessionToken)
@@ -20,6 +26,18 @@ func (a *AuthJWT) resolveSession(sessionToken, spaceHint string) (string, string
 	}
 	if strings.TrimSpace(uidAndName) == "" {
 		return "", "", errors.New("session not found")
+	}
+	if strings.HasPrefix(uidAndName, "v2:") {
+		var payload struct {
+			UID string `json:"uid"`
+		}
+		if jerr := json.Unmarshal([]byte(uidAndName[3:]), &payload); jerr != nil {
+			return "", "", errors.New("malformed v2 session value")
+		}
+		if payload.UID == "" {
+			return "", "", errors.New("malformed v2 session value (no uid)")
+		}
+		return payload.UID, spaceHint, nil
 	}
 	parts := strings.Split(uidAndName, "@")
 	if len(parts) < 2 {
