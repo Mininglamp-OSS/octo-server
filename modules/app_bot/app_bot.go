@@ -19,6 +19,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/bot_api"
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 )
@@ -138,7 +139,10 @@ func (ab *AppBot) Route(r *wkhttp.WKHttp) {
 	r.GET("/v1/app_bot/available", ab.ctx.AuthMiddleware(r), ab.discoverBots)
 
 	// User opt-in: establish friend relationship with App Bot
-	r.POST("/v1/app_bot/apply", ab.ctx.AuthMiddleware(r), ab.applyBot)
+	applyAPI := r.Group("/v1/app_bot", ab.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, ab.ctx))
+	{
+		applyAPI.POST("/apply", ab.applyBot)
+	}
 }
 
 // checkSpaceAdmin verifies the logged-in user is admin/owner of the given space.
@@ -978,28 +982,6 @@ func (ab *AppBot) applyBot(c *wkhttp.Context) {
 	// Validate robot_uid format: must match app_*_bot pattern
 	if !strings.HasPrefix(req.RobotUID, AppBotUIDPrefix) || !strings.HasSuffix(req.RobotUID, AppBotUIDSuffix) {
 		c.ResponseError(errors.New("invalid robot_uid format"))
-		return
-	}
-
-	// Rate limit: 10 apply requests per minute per user
-	rateLimitKey := fmt.Sprintf("app_bot_apply_rate:%s", loginUID)
-	count, redisErr := ab.ctx.GetRedisConn().Incr(rateLimitKey)
-	if redisErr != nil {
-		ab.Error("rate limit Redis error, denying request", zap.Error(redisErr))
-		c.ResponseError(errors.New("服务繁忙，请稍后再试"))
-		return
-	}
-	if count == 1 {
-		// First request in this window — set TTL (fixed window, not sliding).
-		// If SetExpire fails, DEL the key to prevent permanent rate-limiting.
-		if expErr := ab.ctx.GetRedisConn().SetExpire(rateLimitKey, time.Minute); expErr != nil {
-			ab.Error("rate limit SetExpire failed, deleting key to prevent permanent block",
-				zap.Error(expErr), zap.String("key", rateLimitKey))
-			ab.ctx.GetRedisConn().Del(rateLimitKey)
-		}
-	}
-	if count > 10 {
-		c.ResponseError(errors.New("请求过于频繁，请稍后再试"))
 		return
 	}
 
