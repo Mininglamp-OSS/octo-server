@@ -484,9 +484,12 @@ func (rb *Robot) sendMessage(c *wkhttp.Context) {
 
 	// 图文混排 RichText(=14)：派发出口用 content 重算权威顶层 plain，覆盖客户端
 	// 不可信 plain（契约 §2），供下游 summary / matter / search / 复制 / 推送 复用。
-	// 非 type=14 为 no-op，老消息路径不变；内部对回填后整条 payload 复检 1MB 上限。
-	if err := richtext.EnsurePlain(payload); err != nil {
-		rb.Error("RichText payload plain 生成失败", zap.Error(err), zap.String("robotID", robotID), zap.String("channelID", messageReq.ChannelID))
+	// 非 type=14 为 no-op，老消息路径不变。入站 write-strict 校验已由上方
+	// payloadIsVail→common.ValidateRichTextPayload 完成（与 user 路径 richtext.Validate
+	// 对称）；这里只做 plain 权威生成 + 对真实最终 payload（含 enrichBotPayloadWithSpaceID
+	// 注入的顶层字段）的 1MB 复检（PR#232 Jerry-Xin Critical#2）。
+	if err := richtext.Finalize(payload); err != nil {
+		rb.Error("RichText payload plain 生成/复检失败", zap.Error(err), zap.String("robotID", robotID), zap.String("channelID", messageReq.ChannelID))
 		c.ResponseError(fmt.Errorf("无效的payload[%s]", util.ToJson(messageReq.Payload)))
 		return
 	}

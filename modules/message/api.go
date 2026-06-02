@@ -445,6 +445,17 @@ func (m *Message) sendMsg(c *wkhttp.Context) {
 	// YUJ-644 / Mininglamp-OSS#33: 把 SpaceMiddleware 已校验的发送方 SpaceID 透传给
 	// sendMessage，作为 PERSONAL DM 的权威 space_id 注入源（不信客户端 body）。
 	senderSpaceID := spacepkg.GetSpaceID(c)
+	// PR#232 review (Jerry-Xin Critical#1): 主用户入口对 RichText(=14) 补 write-strict
+	// 强校验，与 robot 路径（modules/robot/api.go payloadIsVail→ValidateRichTextPayload）
+	// 对称。拒 缺/空 content、空 text 块、data: 图片 URL、缺图片宽高、未知 block type，
+	// 大小上限作用在原始完整 payload 字节。脏 payload 在派发前以 400 拒绝，不进 IM。
+	// EnsurePlain（plain 权威生成 + enrich 后真实出站 payload 的 1MB 复检）在
+	// sendMessage 内、所有 server 端 enrich 之后由 richtext.Finalize 完成。
+	if err := richtext.Validate(req.Payload); err != nil {
+		m.Error("RichText payload 校验失败", zap.Error(err), zap.String("channelID", req.ReceiveChannelID), zap.String("fromUID", uid))
+		respondMessageRequestInvalid(c, "payload")
+		return
+	}
 	err = m.sendMessage(req.ReceiveChannelID, req.ReceiveChannelType, uid, req.Payload, senderSpaceID)
 	if err != nil {
 		m.Error("发送消息失败", zap.Error(err))
@@ -464,15 +475,6 @@ func (m *Message) sendMessage(channelID string, channelType uint8, fromUID strin
 	// BEFORE persistence/dispatch. See sanitizeUserIngressPayload below
 	// for the full rationale and unit test surface.
 	sanitizeUserIngressPayload(payload, channelID, channelType, fromUID, m.Warn)
-	// 图文混排 RichText(=14)：派发出口用 content 重算权威顶层 plain，覆盖客户端
-	// 不可信的 plain（契约 §2）。这一步是下游 summary / matter / search / 复制 /
-	// 推送 全部依赖的前置——server 必须在消息落库 / 进 IM 搜索索引前把权威 plain
-	// 写进 payload 字节。非 type=14 的 payload 此 helper 为 no-op，老消息路径不变。
-	// EnsurePlain 内部对回填 plain 后的整条 payload 复检 1MB 上限，超限拒发。
-	if err := richtext.EnsurePlain(payload); err != nil {
-		m.Error("RichText payload plain 生成失败", zap.Error(err), zap.String("channelID", channelID), zap.String("fromUID", fromUID))
-		return err
-	}
 	// YUJ-202 / Mininglamp-OSS#94 / #142 — mention pass-through chokepoint.
 	// The original Plan X §5 design (docs/2026-05-mention-all-chokepoint-audit.md)
 	// rewrote legacy `mention.all=1` to also carry `mention.ais=1` so
@@ -496,6 +498,20 @@ func (m *Message) sendMessage(channelID string, channelType uint8, fromUID strin
 	// 直接覆盖客户端 payload.space_id，跨 Space 推送时收端 SpaceFilter 拿到权威值
 	// 立刻丢弃，不再依赖 channelInfo 缓存命中。
 	payload = m.enrichPayloadWithSpaceID(channelID, channelType, payload, senderSpaceID)
+	// 图文混排 RichText(=14)：派发出口用 content 重算权威顶层 plain，覆盖客户端
+	// 不可信的 plain（契约 §2）。这一步是下游 summary / matter / search / 复制 /
+	// 推送 全部依赖的前置——server 必须在消息落库 / 进 IM 搜索索引前把权威 plain
+	// 写进 payload 字节。非 type=14 的 payload 此 helper 为 no-op，老消息路径不变。
+	//
+	// ⚠️ PR#232 review (Jerry-Xin Critical#2)：Finalize 必须排在 *所有* server 端
+	// enrich（sanitize / RewriteMention / enrichPayloadWithSpaceID）之后，且其 1MB
+	// 复检作用在真实最终 payload 上——server 注入 space_id 等顶层字段会把 payload
+	// 撑大，若在 enrich 前复检会放过「enrich 后超限」的 payload。入站 write-strict
+	// 校验已在 sendMsg handler 用 richtext.Validate 完成（与 robot 路径对称）。
+	if err := richtext.Finalize(payload); err != nil {
+		m.Error("RichText payload plain 生成/复检失败", zap.Error(err), zap.String("channelID", channelID), zap.String("fromUID", fromUID))
+		return err
+	}
 	// Mininglamp-OSS/octo-server#144 + PR#145 review follow-up:
 	// second-pass mention chokepoint. When mention.ais=1 in a GROUP
 	// channel, expand mention.uids to include every bot member of the
