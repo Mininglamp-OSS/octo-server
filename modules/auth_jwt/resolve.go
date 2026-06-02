@@ -2,23 +2,25 @@ package auth_jwt
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 )
 
 // resolveSession verifies a web session token and returns (uid, spaceID).
-// spaceID falls back to the caller-supplied hint when the session itself
-// has no canonical space (server-side sessions never store space_id today).
+// spaceID is the caller-supplied hint validated against space_member
+// before being trusted further.
 //
-// Membership in the requested space is NOT validated here — JWT clients
-// can request any space they own; downstream middleware (runtime/bot
-// endpoints) re-checks space_member as needed.
+// Security fix (PR-D.1 #1): historically this trusted the caller-supplied
+// spaceHint blindly, with a comment claiming "downstream middleware
+// re-checks space_member as needed". In practice plan AU3 has downstream
+// (fleet/matter) trust JWT.space_id directly — neither side actually
+// checked. Result: a logged-in user could request a JWT for any space_id
+// and gain cross-space read/write. Enforce membership here so AU3 holds.
 //
-// Delegates to pkg/auth.Decode for envelope parsing — that helper is the
-// single source of truth for token-cache encoding (handles v2 JSON +
-// legacy uid@name fallback). Avoids parallel mini-decoders that would
-// drift when the envelope schema evolves.
+// Delegates to pkg/auth.Decode for envelope parsing (handles v2 JSON +
+// legacy uid@name fallback).
 func (a *AuthJWT) resolveSession(sessionToken, spaceHint string) (string, string, error) {
 	tokenPrefix := a.ctx.GetConfig().Cache.TokenCachePrefix
 	raw, err := a.ctx.Cache().Get(tokenPrefix + sessionToken)
@@ -32,7 +34,35 @@ func (a *AuthJWT) resolveSession(sessionToken, spaceHint string) (string, string
 	if err != nil {
 		return "", "", err
 	}
+	// Empty spaceHint = caller didn't ask for a specific space; let
+	// IssueWebToken decide (today it just embeds whatever we return).
+	// Only validate when caller supplied one.
+	if strings.TrimSpace(spaceHint) != "" {
+		if err := a.assertSpaceMember(info.UID, spaceHint); err != nil {
+			return "", "", err
+		}
+	}
 	return info.UID, spaceHint, nil
+}
+
+// assertSpaceMember returns nil iff uid is an active member of spaceID.
+// Pulled out so both resolveSession and bot mint can share it; mirrors
+// the existing membership check inside resolveAPIKey.
+func (a *AuthJWT) assertSpaceMember(uid, spaceID string) error {
+	if uid == "" || spaceID == "" {
+		return errors.New("assertSpaceMember: uid and space_id required")
+	}
+	var n int
+	if err := a.ctx.DB().SelectBySql(
+		"SELECT COUNT(*) FROM space_member WHERE space_id=? AND uid=? AND status=1",
+		spaceID, uid,
+	).LoadOne(&n); err != nil {
+		return fmt.Errorf("assertSpaceMember: %w", err)
+	}
+	if n == 0 {
+		return errors.New("not a member of requested space")
+	}
+	return nil
 }
 
 // resolveAPIKey looks up the user_api_key row, asserts membership, and
@@ -52,15 +82,9 @@ func (a *AuthJWT) resolveAPIKey(apiKey, daemonHint, _ string) (string, string, s
 	if r.UID == "" {
 		return "", "", "", errors.New("invalid api_key")
 	}
-
-	var n int
-	if err := a.ctx.DB().SelectBySql(
-		"SELECT COUNT(*) FROM space_member WHERE space_id=? AND uid=? AND status=1",
-		r.SpaceID, r.UID,
-	).LoadOne(&n); err != nil {
-		return "", "", "", err
-	}
-	if n == 0 {
+	if err := a.assertSpaceMember(r.UID, r.SpaceID); err != nil {
+		// Same SQL as before, just deduped via helper. Error message
+		// stays specific so logs still distinguish "owner left space".
 		return "", "", "", errors.New("api_key owner no longer in space")
 	}
 	return r.UID, r.SpaceID, daemonHint, nil

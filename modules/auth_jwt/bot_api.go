@@ -62,6 +62,14 @@ func (a *AuthJWT) mintBot(c *wkhttp.Context) {
 		c.ResponseError(errors.New("space_id required"))
 		return
 	}
+	// PR-D.1 #2: caller must actually be in the target space before
+	// MintBotOBO drops a bot into space_member there. Previously this
+	// was unchecked — any logged-in user could mint a bot in any space
+	// they knew the id of and then use that bot to observe groups.
+	if err := a.assertSpaceMember(uid, req.SpaceID); err != nil {
+		c.ResponseErrorWithStatus(err, http.StatusForbidden)
+		return
+	}
 	botToken := req.BotToken
 	if botToken == "" {
 		var err error
