@@ -665,3 +665,26 @@ other = "请求内容过大。"
 
 ["err.server.incomingwebhook.push_delivery_failed"]
 other = "Webhook 消息投递失败。"
+
+# ---- err.server.incomingwebhook.mgmt_* (management endpoints, #246 follow-up) ----
+
+["err.server.incomingwebhook.mgmt_forbidden"]
+other = "仅群主或管理员可管理 webhook。"
+
+["err.server.incomingwebhook.mgmt_request_invalid"]
+other = "请求参数无效。"
+
+["err.server.incomingwebhook.mgmt_group_not_found"]
+other = "群不存在或已解散。"
+
+["err.server.incomingwebhook.mgmt_not_found"]
+other = "webhook 不存在。"
+
+["err.server.incomingwebhook.mgmt_quota_exceeded"]
+other = "每个群最多 {{.max}} 个 webhook。"
+
+["err.server.incomingwebhook.mgmt_query_failed"]
+other = "查询 webhook 信息失败。"
+
+["err.server.incomingwebhook.mgmt_operation_failed"]
+other = "操作失败，请稍后再试。"

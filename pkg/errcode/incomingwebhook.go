@@ -13,8 +13,13 @@ import (
 // The push endpoint is an unauthenticated, token-in-URL surface. Every
 // authentication failure (missing/disabled webhook, bad token, disbanded
 // group) intentionally collapses to the SINGLE push_unauthorized code with a
-// uniform message, so a probe cannot tell "no such webhook" from "wrong token"
-// — see modules/incomingwebhook/api.go respondPushUnauthorized. Migrated off
+// uniform RESPONSE (same code/message/status), so a probe cannot distinguish
+// "no such webhook" from "wrong token" by the response body. Timing is only
+// best-effort, not constant: not-found returns before any hash, wrong-token
+// pays the SHA-256 compare, valid-token+dead-group pays an extra DB round-trip.
+// The 128-bit unguessable webhook_id plus per-IP rate limit make timing-based
+// enumeration impractical; the response-uniformity is the primary defense.
+// See modules/incomingwebhook/api.go pushUnauthorized. Migrated off
 // the raw c.AbortWithStatusJSON pattern to satisfy the D23 i18n lint gate
 // (PR Mininglamp-OSS/octo-server#31, yujiawei review #3).
 var (
@@ -58,6 +63,77 @@ var (
 		ID:             "err.server.incomingwebhook.push_delivery_failed",
 		HTTPStatus:     http.StatusBadGateway,
 		DefaultMessage: "Failed to deliver the webhook message.",
+		Internal:       true,
+	})
+)
+
+// err.server.incomingwebhook.mgmt_* — management-endpoint error codes
+// (create / list / update / delete / regenerate in modules/incomingwebhook/
+// api.go). These are authenticated, admin-only endpoints with no legacy
+// clients, so — like the push path — they are rendered via
+// httperr.ResponseErrorLWithStatus and keep their real semantic HTTP status
+// (403/404/409/400/500). This replaces the legacy raw-string
+// c.ResponseError(errors.New(...)) pattern (#246 follow-up).
+var (
+	// ErrIncomingWebhookForbidden (403) — caller is neither group owner nor
+	// admin; the only role allowed to manage a group's webhooks.
+	ErrIncomingWebhookForbidden = register(codes.Code{
+		ID:             "err.server.incomingwebhook.mgmt_forbidden",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "Only the group owner or an admin can manage webhooks.",
+	})
+
+	// ErrIncomingWebhookRequestInvalid (400) — malformed body or invalid field
+	// (blank/over-long name, status not in {0,1}). The offending field is
+	// surfaced via Details["reason"] (body / name / status).
+	ErrIncomingWebhookRequestInvalid = register(codes.Code{
+		ID:             "err.server.incomingwebhook.mgmt_request_invalid",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Invalid request.",
+		SafeDetailKeys: []string{"reason"},
+	})
+
+	// ErrIncomingWebhookGroupNotFound (404) — group does not exist or is no
+	// longer Normal (disbanded/disabled). Blocks create / enable / regenerate
+	// from reviving webhooks on a dead group.
+	ErrIncomingWebhookGroupNotFound = register(codes.Code{
+		ID:             "err.server.incomingwebhook.mgmt_group_not_found",
+		HTTPStatus:     http.StatusNotFound,
+		DefaultMessage: "The group does not exist or has been disbanded.",
+	})
+
+	// ErrIncomingWebhookNotFound (404) — webhook does not exist or does not
+	// belong to the group in the path (cross-group guard).
+	ErrIncomingWebhookNotFound = register(codes.Code{
+		ID:             "err.server.incomingwebhook.mgmt_not_found",
+		HTTPStatus:     http.StatusNotFound,
+		DefaultMessage: "The webhook does not exist.",
+	})
+
+	// ErrIncomingWebhookQuotaExceeded (409) — the group already holds the
+	// maximum number of webhooks. Params["max"] carries the configured cap.
+	ErrIncomingWebhookQuotaExceeded = register(codes.Code{
+		ID:             "err.server.incomingwebhook.mgmt_quota_exceeded",
+		HTTPStatus:     http.StatusConflict,
+		DefaultMessage: "Each group allows at most {{.max}} webhooks.",
+	})
+
+	// ErrIncomingWebhookQueryFailed (500, Internal) — a read (group / webhook /
+	// list / permission) failed; the underlying error is logged, not surfaced.
+	ErrIncomingWebhookQueryFailed = register(codes.Code{
+		ID:             "err.server.incomingwebhook.mgmt_query_failed",
+		HTTPStatus:     http.StatusInternalServerError,
+		DefaultMessage: "Failed to query webhook information.",
+		Internal:       true,
+	})
+
+	// ErrIncomingWebhookOperationFailed (500, Internal) — a write
+	// (create / update / delete / regenerate / token generation) failed; the
+	// underlying error is logged, not surfaced.
+	ErrIncomingWebhookOperationFailed = register(codes.Code{
+		ID:             "err.server.incomingwebhook.mgmt_operation_failed",
+		HTTPStatus:     http.StatusInternalServerError,
+		DefaultMessage: "The operation failed. Please try again later.",
 		Internal:       true,
 	})
 )

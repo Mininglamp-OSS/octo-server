@@ -141,14 +141,12 @@ func TestCreate_HappyPath(t *testing.T) {
 }
 
 func TestCreate_RejectsEmptyName(t *testing.T) {
-	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	handler, _, groupNo := setupTestEnv(t)
 	w := do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), map[string]interface{}{}))
 	assert.NotEqual(t, http.StatusOK, w.Code)
 }
 
 func TestCreate_NonAdminForbidden(t *testing.T) {
-	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	handler, ctx, groupNo := setupTestEnv(t)
 	// 把当前用户降级为普通成员
 	_, err := ctx.DB().UpdateBySql("UPDATE group_member SET role=0 WHERE group_no=? AND uid=?", groupNo, testutil.UID).Exec()
@@ -165,7 +163,6 @@ func TestCreate_NonAdminForbidden(t *testing.T) {
 // ============================================================
 
 func TestListAndDelete(t *testing.T) {
-	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	handler, _, groupNo := setupTestEnv(t)
 
 	// 创建 2 个
@@ -195,7 +192,6 @@ func TestListAndDelete(t *testing.T) {
 }
 
 func TestRegenerate_RotatesToken(t *testing.T) {
-	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	handler, _, groupNo := setupTestEnv(t)
 	w := do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), map[string]interface{}{
 		"name": "x",
@@ -252,7 +248,6 @@ func TestPush_RejectsDisabledWebhook(t *testing.T) {
 }
 
 func TestPush_RejectsTooLargeBody(t *testing.T) {
-	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	// 用 env 把上限收紧到 1KB，让测试与运行时配置共用同一函数（maxBytes()），
 	// 避免在测试里硬编码 8KB 与生产默认值漂移。
 	t.Setenv("DM_INCOMINGWEBHOOK_MAX_BYTES", "1024")
@@ -273,7 +268,6 @@ func TestPush_RejectsTooLargeBody(t *testing.T) {
 }
 
 func TestPush_RejectsEmptyContent(t *testing.T) {
-	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	handler, _, groupNo := setupTestEnv(t)
 	w := do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), map[string]interface{}{
 		"name": "x",
@@ -292,7 +286,6 @@ func TestPush_RejectsEmptyContent(t *testing.T) {
 // 把 burst 收紧到 2、rps 收紧到 0.01（10s 补 1 个），连发 3 次，第 3 次必拒。
 // 前两次允许的请求可能因 WuKongIM 投递失败返回 502；这里只断言限流分支。
 func TestPush_PerWebhookRateLimitTriggers429(t *testing.T) {
-	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	t.Setenv("DM_INCOMINGWEBHOOK_BURST", "2")
 	t.Setenv("DM_INCOMINGWEBHOOK_RPS", "0.01")
 
@@ -320,7 +313,6 @@ func TestPush_PerWebhookRateLimitTriggers429(t *testing.T) {
 // TestPush_PerWebhookRateLimitIsPerWebhook 验证一个 webhook 被打满不影响另一个 webhook
 // （限流键空间按 webhook_id 隔离）。
 func TestPush_PerWebhookRateLimitIsPerWebhook(t *testing.T) {
-	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	t.Setenv("DM_INCOMINGWEBHOOK_BURST", "1")
 	t.Setenv("DM_INCOMINGWEBHOOK_RPS", "0.01")
 
@@ -348,7 +340,6 @@ func TestPush_PerWebhookRateLimitIsPerWebhook(t *testing.T) {
 }
 
 func TestPush_RegenerateInvalidatesOldToken(t *testing.T) {
-	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	handler, _, groupNo := setupTestEnv(t)
 	w := do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), map[string]interface{}{
 		"name": "x",
@@ -379,12 +370,12 @@ func TestCreate_QuotaEnforced(t *testing.T) {
 		}))
 		assert.Equalf(t, http.StatusOK, w.Code, "i=%d body=%s", i, w.Body.String())
 	}
-	// 第 3 个应当拒绝
+	// 第 3 个应当被配额拒绝：迁移到 typed code 后返回语义化 409 Conflict
+	// （ErrIncomingWebhookQuotaExceeded），不再依赖响应里的中文文案。
 	w := do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), map[string]interface{}{
 		"name": "overflow",
 	}))
-	assert.NotEqual(t, http.StatusOK, w.Code)
-	assert.Contains(t, w.Body.String(), "最多")
+	assert.Equalf(t, http.StatusConflict, w.Code, "quota exceeded must be 409: %s", w.Body.String())
 }
 
 // TestCreate_QuotaConcurrent 验证 insertWithQuota 在并发下守住上限。
@@ -429,7 +420,6 @@ func TestCreate_QuotaConcurrent(t *testing.T) {
 // 状态，create / update(启用) / push 三条路径都必须拒绝，杜绝 stale 管理员
 // 在 handleGroupDisband 异步窗口或之后让 webhook 复活。
 func TestDisbandedGroup_FailsClosed(t *testing.T) {
-	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	handler, ctx, groupNo := setupTestEnv(t)
 
 	// 在群 Normal 状态下先建一个 webhook，方便后续测 update / push
@@ -477,7 +467,6 @@ func TestDisbandedGroup_FailsClosed(t *testing.T) {
 }
 
 func TestUpdate_RejectsCrossGroupAccess(t *testing.T) {
-	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	handler, ctx, groupNoA := setupTestEnv(t)
 
 	// 在群 A 创建一个 webhook

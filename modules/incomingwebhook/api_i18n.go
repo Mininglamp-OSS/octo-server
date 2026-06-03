@@ -50,3 +50,51 @@ func pushDeliveryFailed(c *wkhttp.Context) {
 	httperr.ResponseErrorLWithStatus(c, errcode.ErrIncomingWebhookPushDeliveryFailed, nil, nil)
 	c.Abort()
 }
+
+// ============================================================
+// management-path error responders
+//
+// The admin-only management endpoints (create / list / update / delete /
+// regenerate) also use ResponseErrorLWithStatus and keep their real semantic
+// HTTP status — they are a new feature with no legacy clients keyed to the
+// fixed-400 ResponseErrorL. These replace the legacy raw-string
+// c.ResponseError(errors.New(...)) pattern (#246). Handlers must return
+// immediately after calling one; no c.Abort() is needed at handler level.
+// ============================================================
+
+// mgmtForbidden returns 403 — caller is neither owner nor admin.
+func mgmtForbidden(c *wkhttp.Context) {
+	httperr.ResponseErrorLWithStatus(c, errcode.ErrIncomingWebhookForbidden, nil, nil)
+}
+
+// mgmtRequestInvalid returns 400 for malformed body / invalid field; reason ∈
+// {body, name, status} is surfaced via the safe-listed Details key.
+func mgmtRequestInvalid(c *wkhttp.Context, reason string) {
+	httperr.ResponseErrorLWithStatus(c, errcode.ErrIncomingWebhookRequestInvalid, nil, i18n.Details{"reason": reason})
+}
+
+// mgmtGroupNotFound returns 404 — group missing or not Normal (disbanded).
+func mgmtGroupNotFound(c *wkhttp.Context) {
+	httperr.ResponseErrorLWithStatus(c, errcode.ErrIncomingWebhookGroupNotFound, nil, nil)
+}
+
+// mgmtNotFound returns 404 — webhook missing or cross-group.
+func mgmtNotFound(c *wkhttp.Context) {
+	httperr.ResponseErrorLWithStatus(c, errcode.ErrIncomingWebhookNotFound, nil, nil)
+}
+
+// mgmtQuotaExceeded returns 409 — per-group webhook cap reached; max carries
+// the configured limit for the message.
+func mgmtQuotaExceeded(c *wkhttp.Context, max int) {
+	httperr.ResponseErrorLWithStatus(c, errcode.ErrIncomingWebhookQuotaExceeded, i18n.Params{"max": max}, nil)
+}
+
+// mgmtQueryFailed returns 500 (Internal) — a read failed; real error logged.
+func mgmtQueryFailed(c *wkhttp.Context) {
+	httperr.ResponseErrorLWithStatus(c, errcode.ErrIncomingWebhookQueryFailed, nil, nil)
+}
+
+// mgmtOperationFailed returns 500 (Internal) — a write failed; real error logged.
+func mgmtOperationFailed(c *wkhttp.Context) {
+	httperr.ResponseErrorLWithStatus(c, errcode.ErrIncomingWebhookOperationFailed, nil, nil)
+}

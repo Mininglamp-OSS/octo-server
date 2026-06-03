@@ -1,6 +1,7 @@
 package incomingwebhook
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -65,15 +66,15 @@ func TestBuildPayload_DropsAllExtra(t *testing.T) {
 	req := &pushPayloadReq{
 		Content: "real",
 		Extra: map[string]interface{}{
-			"visibles":   []string{"attacker_uid"}, // 关键：访问控制字段必须被丢弃
-			"mention":    map[string]interface{}{"all": true},
-			"reminder":   "fake",
-			"link":       "https://x",
-			"type":       9999,
-			"content":    "fake",
-			"from":       "fake",
-			"space_id":   "forged",
-			"anything":   "else",
+			"visibles": []string{"attacker_uid"}, // 关键：访问控制字段必须被丢弃
+			"mention":  map[string]interface{}{"all": true},
+			"reminder": "fake",
+			"link":     "https://x",
+			"type":     9999,
+			"content":  "fake",
+			"from":     "fake",
+			"space_id": "forged",
+			"anything": "else",
 		},
 	}
 	p := buildPayload(m, req)
@@ -146,6 +147,32 @@ func TestBuildPayload_TruncateRespectsUTF8(t *testing.T) {
 	gotName := from["name"].(string)
 	assert.LessOrEqualf(t, len(gotName), 64, "byte length capped; got %d", len(gotName))
 	assert.Truef(t, utf8.ValidString(gotName), "truncated name must remain valid UTF-8; got %q", gotName)
+}
+
+// TestTruncateUTF8_FallthroughReturnsEmpty 锁定 max 落在首 rune 内部时的兜底：
+// 返回空串而非切出半个 rune（破坏 UTF-8）。中文 3 字节，max=2 无回退边界。
+func TestTruncateUTF8_FallthroughReturnsEmpty(t *testing.T) {
+	got := truncateUTF8("一二三", 2) // 首 rune 宽 3 > max=2，无 rune 边界可回退
+	assert.Equal(t, "", got, "must return empty, never a half rune")
+	assert.True(t, utf8.ValidString(got))
+}
+
+// TestToResp_NeverLeaksToken 是 #246 的便宜安全回归：对外响应结构体 webhookResp
+// 永远不得包含 token / token_hash 字段。即便 model 持有 TokenHash，序列化后的
+// JSON 也不能出现该哈希或 token 关键字。
+func TestToResp_NeverLeaksToken(t *testing.T) {
+	const secretHash = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+	m := &incomingWebhookModel{
+		WebhookID: "iwh_x",
+		TokenHash: secretHash,
+		GroupNo:   "g_1",
+		Name:      "WH",
+	}
+	raw, err := json.Marshal(toResp(m))
+	assert.NoError(t, err)
+	s := string(raw)
+	assert.NotContainsf(t, s, secretHash, "response must not contain token_hash: %s", s)
+	assert.NotContainsf(t, s, "token", "response must not contain any token field/key: %s", s)
 }
 
 func TestPublicURL(t *testing.T) {

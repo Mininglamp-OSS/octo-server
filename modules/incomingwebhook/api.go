@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -39,6 +38,7 @@ const (
 	envRatePerWebhookBurst = "DM_INCOMINGWEBHOOK_BURST"
 	envIngressIPRPS        = "DM_INCOMINGWEBHOOK_IP_RPS"
 	envIngressIPBurst      = "DM_INCOMINGWEBHOOK_IP_BURST"
+	envMaxContentRunes     = "DM_INCOMINGWEBHOOK_MAX_CONTENT_RUNES"
 
 	defaultMaxPerGroup    = 10
 	defaultMaxBytes       = 8 * 1024
@@ -46,6 +46,10 @@ const (
 	defaultRatePerWHBurst = 10
 	defaultIngressIPRPS   = 30.0
 	defaultIngressIPBurst = 60
+	// content 的语义长度上限（rune 数）。8KB body cap 是字节传输上限，这里再加一道
+	// 业务上限：单条消息正文过长既影响客户端渲染，也无 IM 语义。默认 4000 rune
+	// 介于 Discord(~2k) 与 Slack(~40k) 之间，可经 env 调整。
+	defaultMaxContentRunes = 4000
 )
 
 // 撤回权限说明：webhook 消息的 FromUID 形如 "iwh_xxx"，永远不是群成员。
@@ -61,6 +65,29 @@ type IncomingWebhook struct {
 	db        *incomingWebhookDB
 	groupDB   *group.DB
 	rateRedis *redis.Client
+	// auditSem 给 push 成功后的异步审计(recordSuccess)限并发：每次推送有两次 DB 写，
+	// 无界 `go recordSuccess` 在 Redis 限流 fail-open + 推送洪峰下会无限堆 goroutine、
+	// 压垮 DB 连接池。用带缓冲 channel 作信号量给审计的 DB 操作总并发封顶——满了就**丢弃**
+	// 本次审计（仅 Warn），而不是回落到请求 goroutine 同步执行。审计是非关键路径（失败
+	// 本就只记日志），丢弃换来的是：审计占用的 DB 连接数恒 ≤ 桶容量，洪峰下不会和主流量
+	// 抢连接池。同步回落则会让每个请求 goroutine 各占一条连接，在限流全 fail-open、请求
+	// 并发本身无界时重新压垮连接池——正是这个信号量要避免的（yujiawei review P2）。
+	auditSem chan struct{}
+}
+
+// maxConcurrentAudit 限制异步审计 goroutine 的最大并发数（默认值，可被 env 覆盖）。
+const (
+	envAuditConcurrency     = "DM_INCOMINGWEBHOOK_AUDIT_CONCURRENCY"
+	defaultAuditConcurrency = 64
+)
+
+func auditConcurrency() int {
+	if v := os.Getenv(envAuditConcurrency); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultAuditConcurrency
 }
 
 // rateRedisOnce 让限流用的 redis client 在进程内单例化，避免每次 New() 都开新连接池
@@ -92,6 +119,7 @@ func New(ctx *config.Context) *IncomingWebhook {
 		db:        newDB(ctx),
 		groupDB:   group.NewDB(ctx),
 		rateRedis: sharedRateRedis(ctx.GetConfig()),
+		auditSem:  make(chan struct{}, auditConcurrency()),
 	}
 	// 群解散级联禁用所有 webhook
 	w.ctx.AddEventListener(event.GroupDisband, w.handleGroupDisband)
@@ -143,6 +171,15 @@ func maxBytes() int {
 		}
 	}
 	return defaultMaxBytes
+}
+
+func maxContentRunes() int {
+	if v := os.Getenv(envMaxContentRunes); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultMaxContentRunes
 }
 
 func perWebhookRPS() float64 {
@@ -231,11 +268,11 @@ func (w *IncomingWebhook) requireGroupAdmin(c *wkhttp.Context, groupNo string) (
 	ok, err := w.groupDB.QueryIsGroupManagerOrCreator(groupNo, loginUID)
 	if err != nil {
 		w.Error("query group manager failed", zap.Error(err))
-		c.ResponseError(errors.New("查询群权限失败"))
+		mgmtQueryFailed(c)
 		return "", false
 	}
 	if !ok {
-		c.ResponseErrorWithStatus(errors.New("仅群主或管理员可管理 webhook"), http.StatusForbidden)
+		mgmtForbidden(c)
 		return "", false
 	}
 	return loginUID, true
@@ -254,16 +291,12 @@ func (w *IncomingWebhook) create(c *wkhttp.Context) {
 
 	var req createReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(fmt.Errorf("无效请求: %w", err))
+		mgmtRequestInvalid(c, "body")
 		return
 	}
 	req.Name = strings.TrimSpace(req.Name)
-	if req.Name == "" {
-		c.ResponseError(errors.New("name 不能为空"))
-		return
-	}
-	if len(req.Name) > 64 {
-		c.ResponseError(errors.New("name 长度需 ≤ 64"))
+	if req.Name == "" || len(req.Name) > 64 {
+		mgmtRequestInvalid(c, "name")
 		return
 	}
 
@@ -272,18 +305,18 @@ func (w *IncomingWebhook) create(c *wkhttp.Context) {
 	g, err := w.requireActiveGroup(groupNo)
 	if err != nil {
 		w.Error("query group failed", zap.Error(err))
-		c.ResponseError(errors.New("查询群信息失败"))
+		mgmtQueryFailed(c)
 		return
 	}
 	if g == nil {
-		c.ResponseErrorWithStatus(errors.New("群不存在或已解散"), http.StatusNotFound)
+		mgmtGroupNotFound(c)
 		return
 	}
 
 	token, hash, err := generateToken()
 	if err != nil {
 		w.Error("generate token failed", zap.Error(err))
-		c.ResponseError(errors.New("创建失败"))
+		mgmtOperationFailed(c)
 		return
 	}
 
@@ -298,13 +331,20 @@ func (w *IncomingWebhook) create(c *wkhttp.Context) {
 		Status:     1,
 	}
 	// 配额校验 + 写入在事务内原子完成；FOR UPDATE 锁住 group_no 范围，防止并发越限。
-	if err := w.db.insertWithQuota(m, maxPerGroup()); err != nil {
+	//
+	// TOCTOU 说明：requireActiveGroup 的 status 检查是 insert 事务之前的非事务读，
+	// 事务内仅靠 group 行锁串行化、不重查 status。极小窗口内群被解散仍可能写入一条
+	// status=1 的行，但这**不构成安全问题**：该 webhook 永远推不出消息——push 路径的
+	// requireActiveGroup 重查才是权威闸（群非 Normal 一律 401），且 disband 级联会把
+	// status 翻 0。故此处不在事务内重读 group.status，避免给热路径加锁负担。
+	maxWH := maxPerGroup()
+	if err := w.db.insertWithQuota(m, maxWH); err != nil {
 		if errors.Is(err, ErrQuotaExceeded) {
-			c.ResponseError(fmt.Errorf("每个群最多 %d 个 webhook", maxPerGroup()))
+			mgmtQuotaExceeded(c, maxWH)
 			return
 		}
 		w.Error("insert webhook failed", zap.Error(err))
-		c.ResponseError(errors.New("创建失败"))
+		mgmtOperationFailed(c)
 		return
 	}
 
@@ -324,7 +364,7 @@ func (w *IncomingWebhook) list(c *wkhttp.Context) {
 	list, err := w.db.queryByGroupNo(groupNo)
 	if err != nil {
 		w.Error("list webhooks failed", zap.Error(err))
-		c.ResponseError(errors.New("查询失败"))
+		mgmtQueryFailed(c)
 		return
 	}
 	resps := make([]webhookResp, 0, len(list))
@@ -344,17 +384,17 @@ func (w *IncomingWebhook) update(c *wkhttp.Context) {
 	m, err := w.db.queryByWebhookID(webhookID)
 	if err != nil {
 		w.Error("query webhook failed", zap.Error(err))
-		c.ResponseError(errors.New("查询失败"))
+		mgmtQueryFailed(c)
 		return
 	}
 	if m == nil || m.GroupNo != groupNo {
-		c.ResponseErrorWithStatus(errors.New("webhook 不存在"), http.StatusNotFound)
+		mgmtNotFound(c)
 		return
 	}
 
 	var req updateReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(fmt.Errorf("无效请求: %w", err))
+		mgmtRequestInvalid(c, "body")
 		return
 	}
 
@@ -362,7 +402,7 @@ func (w *IncomingWebhook) update(c *wkhttp.Context) {
 	if req.Name != nil {
 		name := strings.TrimSpace(*req.Name)
 		if name == "" || len(name) > 64 {
-			c.ResponseError(errors.New("name 不合法"))
+			mgmtRequestInvalid(c, "name")
 			return
 		}
 		fields["name"] = name
@@ -372,7 +412,7 @@ func (w *IncomingWebhook) update(c *wkhttp.Context) {
 	}
 	if req.Status != nil {
 		if *req.Status != 0 && *req.Status != 1 {
-			c.ResponseError(errors.New("status 仅允许 0 或 1"))
+			mgmtRequestInvalid(c, "status")
 			return
 		}
 		// 启用 webhook 前必须确认群仍处于 Normal —— 阻断 disband → re-enable 复活路径。
@@ -381,11 +421,11 @@ func (w *IncomingWebhook) update(c *wkhttp.Context) {
 			g, err := w.requireActiveGroup(groupNo)
 			if err != nil {
 				w.Error("query group failed", zap.Error(err))
-				c.ResponseError(errors.New("查询群信息失败"))
+				mgmtQueryFailed(c)
 				return
 			}
 			if g == nil {
-				c.ResponseErrorWithStatus(errors.New("群不存在或已解散，无法启用 webhook"), http.StatusNotFound)
+				mgmtGroupNotFound(c)
 				return
 			}
 		}
@@ -397,7 +437,7 @@ func (w *IncomingWebhook) update(c *wkhttp.Context) {
 	}
 	if err := w.db.updateFields(webhookID, fields); err != nil {
 		w.Error("update webhook failed", zap.Error(err))
-		c.ResponseError(errors.New("更新失败"))
+		mgmtOperationFailed(c)
 		return
 	}
 	updated, qErr := w.db.queryByWebhookID(webhookID)
@@ -418,16 +458,16 @@ func (w *IncomingWebhook) delete(c *wkhttp.Context) {
 	m, err := w.db.queryByWebhookID(webhookID)
 	if err != nil {
 		w.Error("query webhook failed", zap.Error(err))
-		c.ResponseError(errors.New("查询失败"))
+		mgmtQueryFailed(c)
 		return
 	}
 	if m == nil || m.GroupNo != groupNo {
-		c.ResponseErrorWithStatus(errors.New("webhook 不存在"), http.StatusNotFound)
+		mgmtNotFound(c)
 		return
 	}
 	if err := w.db.deleteByWebhookID(webhookID); err != nil {
 		w.Error("delete webhook failed", zap.Error(err))
-		c.ResponseError(errors.New("删除失败"))
+		mgmtOperationFailed(c)
 		return
 	}
 	c.ResponseOK()
@@ -443,32 +483,32 @@ func (w *IncomingWebhook) regenerate(c *wkhttp.Context) {
 	g, err := w.requireActiveGroup(groupNo)
 	if err != nil {
 		w.Error("query group failed", zap.Error(err))
-		c.ResponseError(errors.New("查询群信息失败"))
+		mgmtQueryFailed(c)
 		return
 	}
 	if g == nil {
-		c.ResponseErrorWithStatus(errors.New("群不存在或已解散"), http.StatusNotFound)
+		mgmtGroupNotFound(c)
 		return
 	}
 	m, err := w.db.queryByWebhookID(webhookID)
 	if err != nil {
 		w.Error("query webhook failed", zap.Error(err))
-		c.ResponseError(errors.New("查询失败"))
+		mgmtQueryFailed(c)
 		return
 	}
 	if m == nil || m.GroupNo != groupNo {
-		c.ResponseErrorWithStatus(errors.New("webhook 不存在"), http.StatusNotFound)
+		mgmtNotFound(c)
 		return
 	}
 	token, hash, err := generateToken()
 	if err != nil {
 		w.Error("generate token failed", zap.Error(err))
-		c.ResponseError(errors.New("重置失败"))
+		mgmtOperationFailed(c)
 		return
 	}
 	if err := w.db.updateFields(webhookID, map[string]interface{}{"token_hash": hash}); err != nil {
 		w.Error("update token_hash failed", zap.Error(err))
-		c.ResponseError(errors.New("重置失败"))
+		mgmtOperationFailed(c)
 		return
 	}
 	m.TokenHash = hash
@@ -511,7 +551,8 @@ func (w *IncomingWebhook) push(c *wkhttp.Context) {
 	}
 
 	// 2.5) 群必须仍处于 Normal —— 兜底 handleGroupDisband 的异步窗口期，
-	// 也防止对已解散群继续推送消息。统一返回 401（不区分原因，防探测）。
+	// 也防止对已解散群继续推送消息。统一返回 401（响应体不区分原因——防探测的主防线；
+	// 时序非恒定，仅尽力而为，见 errcode/incomingwebhook.go 注释）。
 	g, err := w.requireActiveGroup(m.GroupNo)
 	if err != nil {
 		w.Error("query group on push failed",
@@ -556,6 +597,12 @@ func (w *IncomingWebhook) push(c *wkhttp.Context) {
 		pushPayloadInvalid(c, "content")
 		return
 	}
+	// content 语义长度上限（按 rune 计），独立于 8KB 字节 body cap：防止单条消息正文
+	// 过长污染所有客户端渲染。超限按 413 拒绝，与 body 超限同语义。
+	if utf8.RuneCountInString(req.Content) > maxContentRunes() {
+		pushPayloadTooLarge(c)
+		return
+	}
 
 	// 5) 构造 payload 并发送
 	payload := buildPayload(m, &req)
@@ -575,12 +622,12 @@ func (w *IncomingWebhook) push(c *wkhttp.Context) {
 		return
 	}
 
-	// 6) 异步审计 + markUsed（失败不影响响应）
+	// 6) 异步审计 + markUsed（失败不影响响应），并发受 auditSem 限制
 	var msgID int64
 	if resp != nil {
 		msgID = resp.MessageID
 	}
-	go w.recordSuccess(m, len(body), c.ClientIP(), msgID)
+	w.submitRecordSuccess(m, len(body), c.ClientIP(), msgID)
 
 	c.Response(map[string]interface{}{
 		"status":     0,
@@ -604,7 +651,10 @@ func truncateUTF8(s string, max int) string {
 			return s[:i]
 		}
 	}
-	return s[:max]
+	// 兜底：max 落在首个 rune 内部（max < 首 rune 宽度）时无回退边界。
+	// 当前 64/255 字节上限远大于任何 rune 宽度，这条不可达；但若未来把上限调到
+	// 个位数，返回空串也好过 s[:max] 切出半个 rune。
+	return ""
 }
 
 // buildPayload 把 webhook 请求映射到群消息 payload。
@@ -646,6 +696,31 @@ func buildPayload(m *incomingWebhookModel, req *pushPayloadReq) map[string]inter
 	}
 }
 
+// submitRecordSuccess 把审计任务投递给有界并发池：未达上限时异步执行；已达上限时
+// **丢弃**本次审计（仅 Warn）。如此审计占用的 DB 连接总数恒 ≤ auditSem 容量，不会在
+// 洪峰下与主流量抢连接池。审计为非关键路径，溢出丢弃优于回落到请求 goroutine 同步执行
+// （后者请求并发无界时会重新压垮连接池）。
+func (w *IncomingWebhook) submitRecordSuccess(m *incomingWebhookModel, byteSize int, ip string, msgID int64) {
+	select {
+	case w.auditSem <- struct{}{}:
+		go func() {
+			defer func() { <-w.auditSem }()
+			w.recordSuccess(m, byteSize, ip, msgID)
+		}()
+	default:
+		// 并发已达上限：丢弃审计，保证总 DB 并发有界、不抢占主流量连接池。
+		w.Warn("audit dropped: concurrency cap reached",
+			zap.String("webhook_id", m.WebhookID))
+	}
+}
+
+// auditWriteTimeout 限定一次审计（markUsed + insertAudit 两次写）的总耗时上限。
+// recordSuccess 始终跑在独立 goroutine 上（submitRecordSuccess 满载时直接丢弃、不回落
+// 到请求 goroutine），所以这个超时**不影响 push 响应延迟**；它的作用是封顶单个 detached
+// 审计 goroutine 在 DB 饱和/故障时持有连接池连接的时长，避免慢 DB 下连接被长期占用。
+// 3s 足够正常写入，又能在故障时快速放手（审计本就是非关键路径，失败仅记日志）。
+const auditWriteTimeout = 3 * time.Second
+
 // recordSuccess 写审计 + 累加调用计数。失败仅记日志，不阻塞主流程。
 func (w *IncomingWebhook) recordSuccess(m *incomingWebhookModel, byteSize int, ip string, msgID int64) {
 	defer func() {
@@ -653,7 +728,10 @@ func (w *IncomingWebhook) recordSuccess(m *incomingWebhookModel, byteSize int, i
 			w.Error("recordSuccess panic", zap.Any("recover", r))
 		}
 	}()
-	if err := w.db.markUsed(m.WebhookID, time.Now()); err != nil {
+	// 两次写共用一个截止时间，封顶单个审计 goroutine 在 DB 饱和/故障时持有连接的时长。
+	ctx, cancel := context.WithTimeout(context.Background(), auditWriteTimeout)
+	defer cancel()
+	if err := w.db.markUsed(ctx, m.WebhookID, time.Now()); err != nil {
 		w.Warn("markUsed failed", zap.String("webhook_id", m.WebhookID), zap.Error(err))
 	}
 	audit := &auditModel{
@@ -663,7 +741,7 @@ func (w *IncomingWebhook) recordSuccess(m *incomingWebhookModel, byteSize int, i
 		ByteSize:  byteSize,
 		MessageID: msgID,
 	}
-	if err := w.db.insertAudit(audit); err != nil {
+	if err := w.db.insertAudit(ctx, audit); err != nil {
 		w.Warn("insert audit failed", zap.String("webhook_id", m.WebhookID), zap.Error(err))
 	}
 }

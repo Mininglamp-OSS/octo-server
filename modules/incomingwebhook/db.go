@@ -1,6 +1,7 @@
 package incomingwebhook
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -121,11 +122,13 @@ func (d *incomingWebhookDB) deleteByWebhookID(webhookID string) error {
 }
 
 // markUsed 累加调用计数并刷新 last_used_at；非关键路径，调用方应忽略错误（最多记日志）。
-func (d *incomingWebhookDB) markUsed(webhookID string, now time.Time) error {
+// 走 ExecContext：审计在 push 路径的同步兜底分支下跑在请求 goroutine 上，必须受 ctx
+// 超时约束，否则 DB 饱和变慢会无限拖住 push 响应。
+func (d *incomingWebhookDB) markUsed(ctx context.Context, webhookID string, now time.Time) error {
 	_, err := d.session.UpdateBySql(
 		"UPDATE incoming_webhook SET call_count = call_count + 1, last_used_at = ? WHERE webhook_id = ?",
 		now, webhookID,
-	).Exec()
+	).ExecContext(ctx)
 	return err
 }
 
@@ -137,9 +140,10 @@ func (d *incomingWebhookDB) disableByGroupNo(groupNo string) error {
 	return err
 }
 
-func (d *incomingWebhookDB) insertAudit(m *auditModel) error {
+// insertAudit 写一条成功推送审计。同样走 ExecContext，理由见 markUsed。
+func (d *incomingWebhookDB) insertAudit(ctx context.Context, m *auditModel) error {
 	_, err := d.session.InsertInto("incoming_webhook_audit").
 		Columns(util.AttrToUnderscore(m)...).
-		Record(m).Exec()
+		Record(m).ExecContext(ctx)
 	return err
 }

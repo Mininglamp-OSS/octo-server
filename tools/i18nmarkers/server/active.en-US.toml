@@ -168,6 +168,27 @@ other = "The target user does not exist or has been deactivated."
 ["err.server.group.view_forbidden"]
 other = "You do not have permission to view this."
 
+["err.server.incomingwebhook.mgmt_forbidden"]
+other = "Only the group owner or an admin can manage webhooks."
+
+["err.server.incomingwebhook.mgmt_group_not_found"]
+other = "The group does not exist or has been disbanded."
+
+["err.server.incomingwebhook.mgmt_not_found"]
+other = "The webhook does not exist."
+
+["err.server.incomingwebhook.mgmt_operation_failed"]
+other = "The operation failed. Please try again later."
+
+["err.server.incomingwebhook.mgmt_query_failed"]
+other = "Failed to query webhook information."
+
+["err.server.incomingwebhook.mgmt_quota_exceeded"]
+other = "Each group allows at most {{.max}} webhooks."
+
+["err.server.incomingwebhook.mgmt_request_invalid"]
+other = "Invalid request."
+
 ["err.server.incomingwebhook.push_delivery_failed"]
 other = "Failed to deliver the webhook message."
 

@@ -20,6 +20,7 @@ import (
 	commonapi "github.com/Mininglamp-OSS/octo-server/modules/base/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/accesslog"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	octodb "github.com/Mininglamp-OSS/octo-server/pkg/db"
 	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
@@ -93,6 +94,13 @@ func main() {
 }
 
 func runAPI(ctx *config.Context) {
+	// 在注册 recovery 之前给 gin 的 panic 输出包一层 token 脱敏 writer：octo-lib 的
+	// server.New → wkhttp.New 内部装 gin.Recovery()。release 模式下 gin 在 broken-pipe
+	// 分支会 dump 整条请求行（含 incoming-webhook 推送路由 path 里的明文 token），panic
+	// value 本身也可能带上该 path——两者都会绕过 access logger 落进 DefaultErrorWriter。
+	// gin.Recovery 在注册时即捕获 DefaultErrorWriter，故必须在 server.New 之前替换（#246）。
+	gin.DefaultErrorWriter = accesslog.NewErrorWriter(gin.DefaultErrorWriter)
+
 	// 创建server
 	s := server.New(ctx)
 	route := s.GetRoute()
@@ -139,6 +147,11 @@ func runAPI(ctx *config.Context) {
 	httpMetrics := metrics.NewHTTPMetrics(prometheus.DefaultRegisterer)
 	route.UseGin(httpMetrics.GinMiddleware())
 	metricsSrv := startMetricsScrapeServer()
+	// 用自定义 LogFormatter 替换 gin 默认 access logger：incoming-webhook 推送路由
+	// /v1/incoming-webhooks/{webhook_id}/{token} 把明文 token 写在 URL path 里，
+	// gin 默认 logger 会把整条 path 落进 access log，泄漏 token。accesslog.Formatter
+	// 与默认行格式一致，但对该 path 的 token 段做脱敏（见 #246）。logger 只构造一次复用。
+	accessLogger := gin.LoggerWithFormatter(accesslog.Formatter)
 	route.UseGin(func(c *gin.Context) {
 		ingorePaths := ingorePaths()
 		for _, ingorePath := range ingorePaths {
@@ -146,7 +159,7 @@ func runAPI(ctx *config.Context) {
 				return
 			}
 		}
-		gin.Logger()(c)
+		accessLogger(c)
 	})
 	// 全局 per-IP 作为 DDoS 底线：办公室共享出网 IP 下 IM 基础量就能到 100+ rps
 	// （每人 1-2 rps × 数十人），200 余量过小；真实 DDoS 常数千 rps+，底线设 500
