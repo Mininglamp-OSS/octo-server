@@ -1234,7 +1234,17 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 		Subscribers: realMemberUIDs,
 	})
 	if err != nil {
-		s.Error("create IM channel failed", zap.Error(err))
+		s.Error("create IM channel failed, performing compensating rollback", zap.Error(err), zap.String("groupNo", groupNo))
+		// Compensating delete: remove group_member and group records that were
+		// already committed. Use s.ctx.DB() (not tx) because the transaction
+		// has already been committed.
+		if _, delErr := s.ctx.DB().DeleteFrom("group_member").Where("group_no=?", groupNo).Exec(); delErr != nil {
+			s.Error("compensating delete group_member failed", zap.Error(delErr), zap.String("groupNo", groupNo))
+		}
+		if _, delErr := s.ctx.DB().DeleteFrom("group").Where("group_no=?", groupNo).Exec(); delErr != nil {
+			s.Error("compensating delete group failed", zap.Error(delErr), zap.String("groupNo", groupNo))
+		}
+		return nil, errors.New("failed to create IM channel, group has been rolled back")
 	}
 
 	// 发送群创建通知
