@@ -15,6 +15,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/go-redis/redis"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 
@@ -63,7 +64,27 @@ func setupTestEnv(t *testing.T) (http.Handler, *config.Context, string) {
 		groupNo, testutil.UID).Exec()
 	assert.NoError(t, err)
 
+	// 管理类路由挂了 SharedUIDRateLimiter（per-login-user 桶 ratelimit:uid:{uid}），
+	// 该桶在 Redis 持久、CleanAllTables 不清，跨测试 / -count=N 累积会撞 burst 触发
+	// 429。每次 setup 清桶，保证每个测试从满桶开始（参考 category 测试同名 helper）。
+	resetUIDRateLimit(t, ctx)
+
 	return s.GetRoute(), ctx, groupNo
+}
+
+// resetUIDRateLimit 清空 per-uid 令牌桶键（ratelimit:uid:{uid}），让后续 HTTP
+// 调用从满桶开始。SharedUIDRateLimiter 的桶不随 CleanAllTables 清理。
+func resetUIDRateLimit(t *testing.T, ctx *config.Context) {
+	t.Helper()
+	rdsClient := redis.NewClient(&redis.Options{
+		Addr:     ctx.GetConfig().DB.RedisAddr,
+		Password: ctx.GetConfig().DB.RedisPass,
+	})
+	defer rdsClient.Close()
+	keys, err := rdsClient.Keys("ratelimit:uid:*").Result()
+	if err == nil && len(keys) > 0 {
+		_ = rdsClient.Del(keys...).Err()
+	}
 }
 
 func authReq(method, path string, body interface{}) *http.Request {

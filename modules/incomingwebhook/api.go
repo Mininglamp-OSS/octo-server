@@ -97,8 +97,10 @@ func New(ctx *config.Context) *IncomingWebhook {
 
 // Route 注册路由。
 func (w *IncomingWebhook) Route(r *wkhttp.WKHttp) {
-	// 管理类：登录用户 + 群管理员校验。
-	mgr := r.Group("/v1/groups", w.ctx.AuthMiddleware(r))
+	// 管理类：登录用户 + 群管理员校验。认证路由默认挂 SharedUIDRateLimiter（须在
+	// AuthMiddleware 之后，否则读不到 uid 会静默 fail-open），与全局 IP floor 叠加，
+	// 给 create/regenerate 等敏感写操作补 per-login-user 限流。
+	mgr := r.Group("/v1/groups", w.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, w.ctx))
 	{
 		mgr.POST("/:group_no/incoming-webhooks", w.create)
 		mgr.GET("/:group_no/incoming-webhooks", w.list)
