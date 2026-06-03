@@ -149,8 +149,8 @@ func (a *AuthJWT) requireDaemonJWT(c *wkhttp.Context) (*Claims, error) {
 	}
 	// PR-A fix (齐乐 review #3): signature-only verification let expired
 	// tokens through. Plan AU1 requires "JWT 过期 → 401" — enforce it
-	// here, otherwise a daemon JWT past 30-day TTL could still mint a
-	// bot_token forever.
+	// here, otherwise a daemon JWT past its TTL (currently 24h) could
+	// still mint a bot_token forever.
 	//
 	// Note on clock skew: Time field below is exact wall-clock; we rely
 	// on go-jose's DefaultLeeway (1 min) to tolerate small daemon ↔ server
