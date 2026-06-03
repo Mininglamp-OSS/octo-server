@@ -46,6 +46,7 @@ type BotFather struct {
 	appService       app.IService
 	fileService      file.IService
 	groupService     group.IService
+	apiKeyService    UserAPIKeyService
 	userDB           *user.DB
 	threadService    thread.IService
 	robotEventPrefix string
@@ -64,6 +65,7 @@ func New(ctx *config.Context) *BotFather {
 		appService:       app.NewService(ctx),
 		fileService:      file.NewService(ctx),
 		groupService:     group.NewService(ctx),
+		apiKeyService:    NewUserAPIKeyService(ctx),
 		userDB:           user.NewDB(ctx),
 		threadService:    thread.NewService(ctx),
 		robotEventPrefix: "robotEvent:",

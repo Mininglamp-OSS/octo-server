@@ -8,6 +8,9 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
@@ -15,6 +18,17 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 )
+
+// botBoundAtFormat 与 octo-lib db.Time 的序列化格式一致，保证 bound_at 在列表/
+// 占用响应里与其它时间字段同构。
+const botBoundAtFormat = "2006-01-02 15:04:05"
+
+// maxAgentRefLen 限制 agent_ref 长度，与 robot.bound_agent_ref 列宽（128）一致。
+const maxAgentRefLen = 128
+
+// bindMaxAttempts 限定 bind 在「CAS 与复查之间被并发 unbind 释放」竞态下的重试次数，
+// 防止极端 bind/unbind 抖动时无限循环。正常路径一次成功。
+const bindMaxAttempts = 3
 
 // ========== User API Key 认证中间件 ==========
 
@@ -26,13 +40,17 @@ func (bf *BotFather) authUserAPIKey() wkhttp.HandlerFunc {
 			return
 		}
 
-		keyModel, err := bf.db.queryUserAPIKeyByKey(token)
+		keyModel, err := bf.apiKeyService.AuthByKey(token)
 		if err != nil {
 			bf.Error("查询User API Key失败", zap.Error(err))
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "认证失败"})
 			return
 		}
 		if keyModel == nil {
+			// key 不存在或非 active（AuthByKey 已按 status=1 过滤）→ 统一 401。
+			// 注意：当前 PR 尚无生产路径把 key 置为 revoked（status=0）；status=1
+			// 过滤是为 PR2 的 DELETE /v1/integrations/oidc/binding 撤销能力预留的
+			// 前瞻防御，届时撤销的 key 会在此被拒为 401。
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "无效的API Key"})
 			return
 		}
@@ -65,14 +83,14 @@ func getAPIKeySpaceID(c *wkhttp.Context) string {
 	return ""
 }
 
-// isBotInSpace checks whether a bot belongs to the given Space.
+// isBotInSpace checks whether a bot belongs to the given (active) Space.
+//
+// Delegates to bf.db.isBotInSpace, which additionally joins space.status=1 so a
+// bot whose space_member row is still active but whose Space is disabled does
+// NOT pass. Kept as a thin wrapper so the existing handler call sites
+// (update/delete/getToken/bind/unbind) need no churn.
 func (bf *BotFather) isBotInSpace(botID, spaceID string) (bool, error) {
-	var count int
-	_, err := bf.db.session.SelectBySql(
-		"SELECT COUNT(*) FROM space_member WHERE space_id=? AND uid=? AND status=1",
-		spaceID, botID,
-	).Load(&count)
-	return count > 0, err
+	return bf.db.isBotInSpace(botID, spaceID)
 }
 
 // setupUserAPIRoutes 注册 User API Key 认证的路由
@@ -84,6 +102,8 @@ func (bf *BotFather) setupUserAPIRoutes(r *wkhttp.WKHttp) {
 		userAPI.PUT("/bots/:bot_id", bf.updateUserBot)
 		userAPI.DELETE("/bots/:bot_id", bf.deleteUserBot)
 		userAPI.GET("/bots/:bot_id/token", bf.getUserBotToken)
+		userAPI.POST("/bots/:bot_id/bind", bf.bindUserBot)
+		userAPI.DELETE("/bots/:bot_id/bind", bf.unbindUserBot)
 	}
 }
 
@@ -279,12 +299,18 @@ func (bf *BotFather) listUserBots(c *wkhttp.Context) {
 		if userResp != nil {
 			name = userResp.Name
 		}
+		var boundAt *string
+		if bot.BoundAt.Valid {
+			s := bot.BoundAt.Time.Format(botBoundAtFormat)
+			boundAt = &s
+		}
 		list = append(list, &UserBotResp{
 			RobotID:       bot.RobotID,
 			Username:      bot.Username,
 			Name:          name,
 			Description:   bot.Description,
-			BotToken:      bot.BotToken,
+			BoundAgentRef: bot.BoundAgentRef,
+			BoundAt:       boundAt,
 			AgentPlatform: bot.AgentPlatform,
 			AgentVersion:  bot.AgentVersion,
 			PluginVersion: bot.PluginVersion,
@@ -490,5 +516,193 @@ func (bf *BotFather) getUserBotToken(c *wkhttp.Context) {
 	c.Response(gin.H{
 		"robot_id":  bot.RobotID,
 		"bot_token": bot.BotToken,
+	})
+}
+
+// ========== Bot 占用 / 绑定 ==========
+
+// bindUserBot POST /v1/user/bots/:bot_id/bind
+//
+// 占用一个自有 Bot。creator 级权限 + 行级 CAS 互斥：多个 Agent 并发抢同一空闲
+// Bot 时 Octo 侧只放行一个；重复传同一 agent_ref 幂等成功；已被他人占用返回
+// 409 并在 error.details.occupied_by 透传当前占用方。
+func (bf *BotFather) bindUserBot(c *wkhttp.Context) {
+	uid := getAPIKeyUID(c)
+	spaceID := getAPIKeySpaceID(c)
+	botID := c.Param("bot_id")
+
+	var req BindBotReq
+	if err := c.BindJSON(&req); err != nil {
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedParamInvalid, nil, i18n.Details{"field": "agent_ref"})
+		return
+	}
+	agentRef := strings.TrimSpace(req.AgentRef)
+	if agentRef == "" || len(agentRef) > maxAgentRefLen {
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedParamInvalid, nil, i18n.Details{"field": "agent_ref"})
+		return
+	}
+
+	// 1) 存在性 + creator 校验：他人创建的 Bot 不可见（按 PM creator 级边界）。
+	bot, err := bf.db.queryRobotByRobotIDAndCreator(botID, uid)
+	if err != nil {
+		bf.Error("查询Bot失败", zap.Error(err))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedInternal, nil, nil)
+		return
+	}
+	if bot == nil {
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedNotFound, nil, nil)
+		return
+	}
+
+	// 2) Space 隔离：key 绑定到 Space 时校验 Bot 属于该 Space。
+	if spaceID != "" {
+		inSpace, sErr := bf.isBotInSpace(botID, spaceID)
+		if sErr != nil {
+			bf.Error("校验Bot Space归属失败", zap.Error(sErr))
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedInternal, nil, nil)
+			return
+		}
+		if !inSpace {
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedForbidden, nil, nil)
+			return
+		}
+	}
+
+	// 3) 行级 CAS 占用。带有界重试，原因见下方各分支注释。
+	for attempt := 0; attempt < bindMaxAttempts; attempt++ {
+		affected, err := bf.db.bindRobotCAS(botID, uid, agentRef)
+		if err != nil {
+			bf.Error("占用Bot失败", zap.Error(err))
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedInternal, nil, nil)
+			return
+		}
+
+		// affected==1：CAS 命中，本次占用确定成功（写入即真相，无需复查——复查会被
+		// 并发 unbind 污染成「已释放」的陈旧视图）。直接按 agentRef 回包；bound_at
+		// best-effort 回读。
+		if affected == 1 {
+			boundAt := ""
+			if cur, rErr := bf.db.queryRobotByRobotIDAndCreator(botID, uid); rErr == nil && cur != nil && cur.BoundAt.Valid {
+				boundAt = cur.BoundAt.Time.Format(botBoundAtFormat)
+			}
+			c.Response(&BindBotResp{RobotID: botID, BoundAgentRef: agentRef, BoundAt: boundAt})
+			return
+		}
+
+		// affected==0：不一定是冲突——MySQL 按「实际改动行数」计，幂等 re-bind（占用方
+		// 未变、同秒 NOW() 也不变）同样返回 0。复查 bound_agent_ref 区分：
+		current, err := bf.db.queryRobotByRobotIDAndCreator(botID, uid)
+		if err != nil {
+			bf.Error("回读占用状态失败", zap.Error(err))
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedInternal, nil, nil)
+			return
+		}
+		switch {
+		case current == nil:
+			// 1)~3) 之间 Bot 被并发删除 → 404（而非 500）。
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedNotFound, nil, nil)
+			return
+		case current.BoundAgentRef == agentRef:
+			// 已是自己持有（幂等成功）。
+			boundAt := ""
+			if current.BoundAt.Valid {
+				boundAt = current.BoundAt.Time.Format(botBoundAtFormat)
+			}
+			c.Response(&BindBotResp{RobotID: botID, BoundAgentRef: current.BoundAgentRef, BoundAt: boundAt})
+			return
+		case current.BoundAgentRef == "":
+			// CAS 时被他人持有（故 affected=0），复查时又被并发 unbind 释放成空闲。
+			// 这是可恢复的竞态：重试 CAS 抢占，而非把空占用方塞进 409。
+			continue
+		default:
+			// 被其他 agent_ref 占用。
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrBotOccupied, nil, i18n.Details{"occupied_by": current.BoundAgentRef})
+			return
+		}
+	}
+
+	// 重试用尽仍未抢到（极端高频 bind/unbind 抖动）：按冲突返回，让调用方退避重试。
+	httperr.ResponseErrorLWithStatus(c, errcode.ErrBotOccupied, nil, nil)
+}
+
+// unbindUserBot DELETE /v1/user/bots/:bot_id/bind
+//
+// 释放占用。creator 级权限 + **agent_ref 归属校验**：只有当前占用方本人（或 Bot
+// 已空闲）才能释放，否则 409。这与 bind 对称，共同保证「一个 Bot 同时只被一个
+// Agent 占用」——否则同一用户的另一 Agent 能用共享 uk_ 把别人的占用清掉再自占。
+// 对占用方幂等（已空闲再次调用仍成功）。
+func (bf *BotFather) unbindUserBot(c *wkhttp.Context) {
+	uid := getAPIKeyUID(c)
+	spaceID := getAPIKeySpaceID(c)
+	botID := c.Param("bot_id")
+
+	var req BindBotReq
+	if err := c.BindJSON(&req); err != nil {
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedParamInvalid, nil, i18n.Details{"field": "agent_ref"})
+		return
+	}
+	agentRef := strings.TrimSpace(req.AgentRef)
+	if agentRef == "" || len(agentRef) > maxAgentRefLen {
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedParamInvalid, nil, i18n.Details{"field": "agent_ref"})
+		return
+	}
+
+	bot, err := bf.db.queryRobotByRobotIDAndCreator(botID, uid)
+	if err != nil {
+		bf.Error("查询Bot失败", zap.Error(err))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedInternal, nil, nil)
+		return
+	}
+	if bot == nil {
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedNotFound, nil, nil)
+		return
+	}
+
+	if spaceID != "" {
+		inSpace, sErr := bf.isBotInSpace(botID, spaceID)
+		if sErr != nil {
+			bf.Error("校验Bot Space归属失败", zap.Error(sErr))
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedInternal, nil, nil)
+			return
+		}
+		if !inSpace {
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedForbidden, nil, nil)
+			return
+		}
+	}
+
+	affected, err := bf.db.unbindRobotCAS(botID, uid, agentRef)
+	if err != nil {
+		bf.Error("释放Bot占用失败", zap.Error(err))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedInternal, nil, nil)
+		return
+	}
+	// affected=0 不一定是冲突：Bot 已空闲（幂等）时 bound_agent_ref 未变也返回 0。
+	// 复查 bound_agent_ref 区分「已空闲（幂等成功）」「被他人占用（409）」「被删（404）」。
+	if affected == 0 {
+		current, reErr := bf.db.queryRobotByRobotIDAndCreator(botID, uid)
+		if reErr != nil {
+			bf.Error("回读占用状态失败", zap.Error(reErr))
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedInternal, nil, nil)
+			return
+		}
+		switch {
+		case current == nil:
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedNotFound, nil, nil)
+			return
+		case current.BoundAgentRef != "" && current.BoundAgentRef != agentRef:
+			// 被其他 Agent 占用：不允许越权释放。
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrBotOccupied, nil, i18n.Details{"occupied_by": current.BoundAgentRef})
+			return
+		}
+		// 否则 Bot 已空闲 → 幂等成功，落到下方统一响应。
+	}
+
+	// bound_at 显式置 null：释放后无占用时间，与 docs §6 的响应形状及 bind 路径
+	// 的 bound_at 字段对齐，避免严格按文档编码的客户端读到 undefined。
+	c.Response(gin.H{
+		"robot_id":        botID,
+		"bound_agent_ref": "",
+		"bound_at":        nil,
 	})
 }

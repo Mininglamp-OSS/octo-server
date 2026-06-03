@@ -28,10 +28,12 @@ func ResponseErrorL(c *wkhttp.Context, code codes.Code, params i18n.Params, deta
 // compatibility 400 (D14).
 //
 // Use this ONLY for endpoints that have NO legacy clients depending on the
-// fixed-400 behavior. The sole current consumer is the OIDC self-service bind
-// flow (modules/oidc/api_bind.go), a recent feature that has always returned
-// semantic status codes (400/401/409/410/422/429/503); pinning those to 400
-// would be a regression and break the bind wizard's status-based branching.
+// fixed-400 behavior. Current consumers:
+//   - the OIDC self-service bind flow (modules/oidc/api_bind.go) — always
+//     returned semantic codes (400/401/409/410/422/429/503);
+//   - the Octo-link Bot bind/unbind endpoints (modules/botfather/api_user.go,
+//     POST/DELETE /v1/user/bots/:bot_id/bind) — new endpoints that must return
+//     real REST status (404/409/…) so external Agents branch on the wire code.
 //
 // The body envelope is byte-for-byte identical to ResponseErrorL; only the
 // transport status differs — here it equals the code's canonical HTTPStatus, so

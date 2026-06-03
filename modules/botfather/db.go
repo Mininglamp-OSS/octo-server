@@ -37,6 +37,11 @@ type robotModel struct {
 	AgentPlatform string // AI Agent 平台名称（如 OpenClaw）
 	AgentVersion  string // Agent 平台版本号
 	PluginVersion string // Octo 插件版本号
+	// BoundAgentRef 占用方不透明标签（如 octopush:agent_xxx）；空=空闲。
+	BoundAgentRef string
+	// BoundAt 占用时间；timestamp NULL，未占用时无效。用 NullTime 承接 NULL，
+	// 否则 Select("*") 把 NULL bound_at 扫进 string 会报错，殃及所有 robot 查询。
+	BoundAt dbr.NullTime
 	db.BaseModel
 }
 
@@ -181,34 +186,36 @@ func (d *botfatherDB) queryAllActiveRobots() ([]*robotModel, error) {
 
 // ========== User API Key ==========
 
-// queryUserAPIKeyByKey 通过API Key查询
-func (d *botfatherDB) queryUserAPIKeyByKey(apiKey string) (*userAPIKeyModel, error) {
+// queryActiveUserAPIKeyByKey 通过明文 API Key 查询 active（status=1）记录（鉴权链路）。
+// 当前 PR 无生产路径把 key 置为 revoked（status=0）；status=1 过滤是为 PR2 的撤销
+// 能力预留的前瞻防御，届时被撤销的 key 在此即时失效。存量行经迁移 DEFAULT 1 回填，
+// 行为不变。
+func (d *botfatherDB) queryActiveUserAPIKeyByKey(apiKey string) (*userAPIKeyModel, error) {
 	if apiKey == "" {
 		return nil, nil
 	}
 	var m *userAPIKeyModel
-	_, err := d.session.Select("*").From("user_api_key").Where("api_key=?", apiKey).Load(&m)
+	_, err := d.session.Select("*").From("user_api_key").
+		Where("api_key=? AND status=?", apiKey, userAPIKeyStatusActive).Load(&m)
 	return m, err
 }
 
-// queryUserAPIKeyByUID 查询用户的无 Space 绑定的 API Key（legacy 回退）
-func (d *botfatherDB) queryUserAPIKeyByUID(uid string) (*userAPIKeyModel, error) {
+// queryActiveUserAPIKey 按 (uid, space_id, client_id) 三元组查询未撤销的 key。
+// spaceID="" 对应无 Space 绑定的 legacy 行（client_id 由迁移 DEFAULT 回填）。
+func (d *botfatherDB) queryActiveUserAPIKey(uid, spaceID, clientID string) (*userAPIKeyModel, error) {
 	var m *userAPIKeyModel
-	_, err := d.session.Select("*").From("user_api_key").Where("uid=? AND space_id=''", uid).Load(&m)
+	_, err := d.session.Select("*").From("user_api_key").
+		Where("uid=? AND space_id=? AND client_id=? AND status=?", uid, spaceID, clientID, userAPIKeyStatusActive).
+		Load(&m)
 	return m, err
 }
 
-// insertUserAPIKey 插入用户API Key（含绑定的Space ID）
-func (d *botfatherDB) insertUserAPIKey(uid, apiKey, spaceID string) error {
-	_, err := d.session.InsertInto("user_api_key").Columns("uid", "api_key", "space_id").Values(uid, apiKey, spaceID).Exec()
+// insertUserAPIKey 插入用户API Key（含绑定的 Space ID 与 client_id 维度）。
+func (d *botfatherDB) insertUserAPIKey(uid, apiKey, spaceID, clientID string) error {
+	_, err := d.session.InsertInto("user_api_key").
+		Columns("uid", "api_key", "space_id", "client_id").
+		Values(uid, apiKey, spaceID, clientID).Exec()
 	return err
-}
-
-// queryUserAPIKeyByUIDAndSpaceID 查询用户在指定Space下的API Key
-func (d *botfatherDB) queryUserAPIKeyByUIDAndSpaceID(uid, spaceID string) (*userAPIKeyModel, error) {
-	var m *userAPIKeyModel
-	_, err := d.session.Select("*").From("user_api_key").Where("uid=? AND space_id=?", uid, spaceID).Load(&m)
-	return m, err
 }
 
 // querySpaceNameByID 查询Space名称
@@ -263,4 +270,46 @@ func (d *botfatherDB) querySpaceIDByRobotID(robotID string) (string, error) {
 		robotID,
 	).LoadOne(&spaceID)
 	return spaceID, err
+}
+
+// ========== Bot 占用 / 绑定 ==========
+
+// bindRobotCAS 行级 CAS 占用 Bot：仅当 Bot 空闲（bound_agent_ref='')或已被
+// 同一 agentRef 占用（幂等）时才写入。返回受影响行数：1=占用成功，0=未命中
+// （不存在 / 非本 creator / 已被他人占用），由调用方复查区分。
+//
+// 互斥完全由这条 UPDATE 的 WHERE 在 DB 层保证，无需额外锁——多个 Agent 并发抢
+// 同一空闲 Bot 时只有一条能把 bound_agent_ref 从 '' 改走，其余 affected=0。
+func (d *botfatherDB) bindRobotCAS(robotID, creatorUID, agentRef string) (int64, error) {
+	res, err := d.session.UpdateBySql(
+		"UPDATE robot SET bound_agent_ref=?, bound_at=NOW() "+
+			"WHERE robot_id=? AND creator_uid=? AND status=1 "+
+			"AND (bound_agent_ref='' OR bound_agent_ref=?)",
+		agentRef, robotID, creatorUID, agentRef,
+	).Exec()
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// unbindRobotCAS 行级 CAS 释放占用：仅当 Bot 已空闲（幂等）或当前占用方正是
+// agentRef 时才清空。返回受影响行数；affected=0 时由调用方复查区分「已空闲（幂等
+// 成功）」「被他人占用（拒绝）」「不存在 / 非本 creator」。
+//
+// 归属校验是互斥不变量的关键一环：uk_ 按 (uid, space, client) 维度，同一用户同一
+// client 的所有 Agent 共享一把 key，若释放不校验 agent_ref，Agent B 就能用同一把
+// key 把 Agent A 的占用清掉再自占——绕过 bind 的抢占互斥。故释放与占用对称地用
+// agent_ref 做 CAS。
+func (d *botfatherDB) unbindRobotCAS(robotID, creatorUID, agentRef string) (int64, error) {
+	res, err := d.session.UpdateBySql(
+		"UPDATE robot SET bound_agent_ref='', bound_at=NULL "+
+			"WHERE robot_id=? AND creator_uid=? AND status=1 "+
+			"AND (bound_agent_ref='' OR bound_agent_ref=?)",
+		robotID, creatorUID, agentRef,
+	).Exec()
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }

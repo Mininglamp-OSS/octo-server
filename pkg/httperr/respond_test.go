@@ -87,6 +87,7 @@ func TestResponseErrorLUnknownCodeFallsBackToInternal(t *testing.T) {
 	}
 }
 
+
 // TestResponseErrorLWithStatusKeepsSemanticStatus verifies the WithStatus facade
 // emits the code's canonical HTTPStatus on the wire (not the legacy 400), while
 // keeping the body envelope identical to ResponseErrorL.
@@ -151,5 +152,37 @@ func TestResponseErrorLWithStatusInternalStays5xx(t *testing.T) {
 		if _, leaked := details["raw_err"]; leaked {
 			t.Fatal("internal code leaked unsafe detail")
 		}
+	}
+}
+
+// TestResponseErrorLWithStatusUsesRealStatus pins the facade on an integration
+// (Octo-link) code: the wire + error.http_status must both be the real 403.
+func TestResponseErrorLWithStatusUsesRealStatus(t *testing.T) {
+	r := wkhttp.New()
+	r.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.SourceLanguage)))
+	r.GET("/x", func(c *wkhttp.Context) {
+		ResponseErrorLWithStatus(c, errcode.ErrIntegrationUserNotLinked, nil, nil)
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("HTTP status = %d, want 403", rec.Code)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if got := body["status"]; got != float64(http.StatusForbidden) {
+		t.Fatalf("status = %v, want 403", got)
+	}
+	errObj := body["error"].(map[string]any)
+	if got := errObj["code"]; got != errcode.ErrIntegrationUserNotLinked.ID {
+		t.Fatalf("error.code = %q", got)
+	}
+	if got := errObj["http_status"]; got != float64(http.StatusForbidden) {
+		t.Fatalf("error.http_status = %v, want 403", got)
 	}
 }

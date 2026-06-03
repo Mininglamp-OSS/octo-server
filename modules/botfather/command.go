@@ -20,24 +20,26 @@ import (
 
 // commandHandler 处理BotFather命令
 type commandHandler struct {
-	ctx          *config.Context
-	db           *botfatherDB
-	sm           *stateMachine
-	userService  user.IService
-	groupService group.IService
-	appService   app.IService
+	ctx           *config.Context
+	db            *botfatherDB
+	sm            *stateMachine
+	userService   user.IService
+	groupService  group.IService
+	appService    app.IService
+	apiKeyService UserAPIKeyService
 	log.Log
 }
 
 func newCommandHandler(ctx *config.Context) *commandHandler {
 	return &commandHandler{
-		ctx:          ctx,
-		db:           newBotfatherDB(ctx),
-		sm:           newStateMachine(ctx),
-		userService:  user.NewService(ctx),
-		groupService: group.NewService(ctx),
-		appService:   app.NewService(ctx),
-		Log:          log.NewTLog("BotFather"),
+		ctx:           ctx,
+		db:            newBotfatherDB(ctx),
+		sm:            newStateMachine(ctx),
+		userService:   user.NewService(ctx),
+		groupService:  group.NewService(ctx),
+		appService:    app.NewService(ctx),
+		apiKeyService: NewUserAPIKeyService(ctx),
+		Log:           log.NewTLog("BotFather"),
 	}
 }
 
@@ -411,56 +413,14 @@ func (h *commandHandler) handleQuickstart(fromUID string) {
 	// 获取当前 Space ID，绑定到 API Key
 	spaceID := h.resolveSpaceID(fromUID)
 
-	// 获取或创建 User API Key（每个 Space 独立一把 Key）
-	var apiKey string
-	if spaceID != "" {
-		// 优先查当前 Space 是否已有 Key
-		existing, err := h.db.queryUserAPIKeyByUIDAndSpaceID(realUID, spaceID)
-		if err != nil {
-			h.Error("查询User API Key失败", zap.Error(err))
-			h.reply(fromUID, "操作失败，请稍后重试。")
-			return
-		}
-		if existing != nil {
-			apiKey = existing.APIKey
-		} else {
-			apiKey, err = generateUserAPIKey()
-			if err != nil {
-				h.Error("生成User API Key失败", zap.Error(err))
-				h.reply(fromUID, "操作失败，请稍后重试。")
-				return
-			}
-			err = h.db.insertUserAPIKey(realUID, apiKey, spaceID)
-			if err != nil {
-				h.Error("保存User API Key失败", zap.Error(err))
-				h.reply(fromUID, "操作失败，请稍后重试。")
-				return
-			}
-		}
-	} else {
-		// 无 Space 场景：回退到按 UID 查询（兼容旧数据）
-		existing, err := h.db.queryUserAPIKeyByUID(realUID)
-		if err != nil {
-			h.Error("查询User API Key失败", zap.Error(err))
-			h.reply(fromUID, "操作失败，请稍后重试。")
-			return
-		}
-		if existing != nil {
-			apiKey = existing.APIKey
-		} else {
-			apiKey, err = generateUserAPIKey()
-			if err != nil {
-				h.Error("生成User API Key失败", zap.Error(err))
-				h.reply(fromUID, "操作失败，请稍后重试。")
-				return
-			}
-			err = h.db.insertUserAPIKey(realUID, apiKey, "")
-			if err != nil {
-				h.Error("保存User API Key失败", zap.Error(err))
-				h.reply(fromUID, "操作失败，请稍后重试。")
-				return
-			}
-		}
+	// 获取或创建 User API Key（每个 (uid, space, client) 独立一把 Key）。
+	// botfather 自身的 client 维度恒为 clientIDBotFather；spaceID="" 的无 Space
+	// 场景由 GetOrCreate 内部按 space_id='' 自然处理（兼容旧数据）。
+	apiKey, err := h.apiKeyService.GetOrCreate(realUID, spaceID, clientIDBotFather)
+	if err != nil {
+		h.Error("获取User API Key失败", zap.Error(err))
+		h.reply(fromUID, "操作失败，请稍后重试。")
+		return
 	}
 
 	cfg := h.ctx.GetConfig()

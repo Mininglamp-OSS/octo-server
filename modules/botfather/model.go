@@ -110,6 +110,8 @@ type userAPIKeyModel struct {
 	UID       string `json:"uid"`
 	APIKey    string `json:"api_key"`
 	SpaceID   string `json:"space_id"`
+	ClientID  string `json:"client_id"`
+	Status    int    `json:"status"`
 	CreatedAt string `json:"created_at"`
 }
 
@@ -137,15 +139,38 @@ type UpdateBotReq struct {
 	Description *string `json:"description"`
 }
 
-// UserBotResp 用户Bot列表项
+// UserBotResp 用户Bot列表项。
+//
+// 安全：列表不批量回填 `bf_` 凭证。为不破坏既有响应契约，保留 bot_token 字段
+// 但**恒为空串**——老客户端读字段不会拿到 undefined，但拿不到真实 token；需要
+// 某个 Bot 的 token 时单独调 GET /v1/user/bots/:bot_id/token。
 type UserBotResp struct {
-	RobotID       string `json:"robot_id"`
-	Username      string `json:"username"`
-	Name          string `json:"name"`
-	Description   string `json:"description"`
-	BotToken      string `json:"bot_token"`
-	CreatedAt     string `json:"created_at"`
-	AgentPlatform string `json:"agent_platform,omitempty"`
+	RobotID     string `json:"robot_id"`
+	Username    string `json:"username"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	// BotToken 出于安全在列表里恒为空串（不批量泄露 `bf_`）；取 token 走单端点。
+	BotToken    string `json:"bot_token"`
+	CreatedAt   string `json:"created_at"`
+	// BoundAgentRef 占用方不透明标签（如 octopush:agent_xxx）；空=空闲。
+	BoundAgentRef string `json:"bound_agent_ref"`
+	// BoundAt 占用时间（timeFormart）；未占用时为 null（*string，与 doc 的
+	// string|null 及 unbind 的显式 null 对齐——不用 omitempty 省略字段）。
+	BoundAt       *string `json:"bound_at"`
+	AgentPlatform string  `json:"agent_platform,omitempty"`
 	AgentVersion  string `json:"agent_version,omitempty"`
 	PluginVersion string `json:"plugin_version,omitempty"`
+}
+
+// BindBotReq 占用（绑定）Bot 请求。
+type BindBotReq struct {
+	// AgentRef 占用方不透明标签（如 octopush:agent_xxx）。Octo 不解析其语义。
+	AgentRef string `json:"agent_ref"`
+}
+
+// BindBotResp 占用（绑定）Bot 响应。
+type BindBotResp struct {
+	RobotID       string `json:"robot_id"`
+	BoundAgentRef string `json:"bound_agent_ref"`
+	BoundAt       string `json:"bound_at"`
 }

@@ -6,6 +6,9 @@
 #
 # CI rejects PRs that change codes.Register input without re-running extract.
 
+["err.server.bot.occupied"]
+other = "Bot is already occupied by another agent."
+
 ["err.server.category.default_immutable"]
 other = "The default category cannot be modified."
 
@@ -203,6 +206,12 @@ other = "Too many requests. Please retry later."
 
 ["err.server.incomingwebhook.push_unauthorized"]
 other = "Unauthorized."
+
+["err.server.integration.disabled"]
+other = "OIDC integration exchange is disabled."
+
+["err.server.integration.user_not_linked"]
+other = "User is not linked to an Octo account."
 
 ["err.server.message.banword_not_found"]
 other = "The banned word does not exist."
