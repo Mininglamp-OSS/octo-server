@@ -168,6 +168,21 @@ other = "The target user does not exist or has been deactivated."
 ["err.server.group.view_forbidden"]
 other = "You do not have permission to view this."
 
+["err.server.incomingwebhook.push_delivery_failed"]
+other = "Failed to deliver the webhook message."
+
+["err.server.incomingwebhook.push_payload_invalid"]
+other = "Invalid request payload."
+
+["err.server.incomingwebhook.push_payload_too_large"]
+other = "Request payload is too large."
+
+["err.server.incomingwebhook.push_rate_limited"]
+other = "Too many requests. Please retry later."
+
+["err.server.incomingwebhook.push_unauthorized"]
+other = "Unauthorized."
+
 ["err.server.message.banword_not_found"]
 other = "The banned word does not exist."
 
