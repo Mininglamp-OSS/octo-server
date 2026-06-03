@@ -743,6 +743,19 @@ func (m *Message) messageEdit(c *wkhttp.Context) {
 		return
 	}
 
+	// 图文混排 RichText(=14)：编辑写入口对 content_edit 做与 send 路径对称的
+	// write-strict 校验 + 权威 plain 重算（契约 §2，plain 服务端重算不信客户端）。
+	// 编辑语义为整体替换 content blocks；canonical JSON 落库后即下游 summary /
+	// search / 复制 的权威来源。非 14 / 非 JSON 体为 no-op，老编辑路径不变。脏/超限
+	// payload 在落库前以 400 拒绝。MD5 去重 hash 落在 normalize 后的 canonical 体上。
+	normalizedEdit, err := richtext.NormalizeContentEdit(req.ContentEdit)
+	if err != nil {
+		m.Error("RichText content_edit 校验失败", zap.Error(err), zap.String("channelID", req.ChannelID), zap.String("messageID", req.MessageID))
+		respondMessageRequestInvalid(c, "content_edit")
+		return
+	}
+	req.ContentEdit = normalizedEdit
+
 	contentEdit := dbr.NewNullString(req.ContentEdit).String
 	contentMD5 := util.MD5(contentEdit)
 
@@ -2265,6 +2278,12 @@ func (m *Message) cancelMentionReminderIfNeed(message *messageModel) {
 }
 
 // 撤回消息
+//
+// 图文混排 RichText(=14) 说明：revoke 路径无需 14 特判 / 不补 plain。撤回只在
+// message_extra 上置 Revoke=1 + Revoker + Version（见下方 updateTx / insertTx 分支），
+// 从不读写消息 Payload 或 content_edit，因此既不会破坏既有 plain，也没有需要重算的
+// content。权威 plain 的生成只发生在写入/编辑 content 的入口（send / robot send /
+// 四个 message edit 入口），撤回不属于其中之一。
 func (m *Message) revoke(c *wkhttp.Context) {
 	loginUID := c.MustGet("uid").(string)
 	messageID := c.Query("message_id")

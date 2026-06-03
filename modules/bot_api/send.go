@@ -14,6 +14,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
+	"github.com/Mininglamp-OSS/octo-server/pkg/richtext"
 	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
 )
@@ -683,11 +684,23 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 		}
 	}
 
+	// 图文混排 RichText(=14)：编辑写入口对 content_edit 做与 send 路径对称的
+	// write-strict 校验 + 权威 plain 重算（契约 §2，plain 服务端重算不信客户端）。
+	// 编辑语义为整体替换 content blocks；非 14 / 非 JSON 体为 no-op。脏/超限 payload
+	// 落库前以错误拒绝。MD5 去重 hash 落在 normalize 后的 canonical 体上。
+	normalizedEdit, err := richtext.NormalizeContentEdit(req.ContentEdit)
+	if err != nil {
+		ba.Error("RichText content_edit 校验失败", zap.Error(err), zap.String("messageID", req.MessageID))
+		c.ResponseError(errors.New("无效的 content_edit"))
+		return
+	}
+	req.ContentEdit = normalizedEdit
+
 	contentEdit := dbr.NewNullString(req.ContentEdit).String
 	contentMD5 := util.MD5(contentEdit)
 
 	var existCount int
-	err := ba.ctx.DB().Select("count(*)").From("message_extra").Where("message_id=? and content_edit_hash=?", req.MessageID, contentMD5).LoadOne(&existCount)
+	err = ba.ctx.DB().Select("count(*)").From("message_extra").Where("message_id=? and content_edit_hash=?", req.MessageID, contentMD5).LoadOne(&existCount)
 	if err != nil {
 		ba.Error("查询是否存在相同正文失败！", zap.Error(err))
 		c.ResponseError(errors.New("查询是否存在相同正文失败！"))

@@ -256,3 +256,93 @@ func TestFinalize_PreservesExtraTopLevelFields(t *testing.T) {
 		t.Fatalf("plain=%q want %q", p["plain"], "hi")
 	}
 }
+
+// ---- NormalizeContentEdit：四个消息编辑写入口共用的 content_edit 收敛 gate ----
+
+// TestNormalizeContentEdit_OverwritesUntrustedPlain 编辑 14 体时，server 必须用
+// content 重算权威 plain 覆盖端上送的伪造 plain，并返回 canonical JSON。
+func TestNormalizeContentEdit_OverwritesUntrustedPlain(t *testing.T) {
+	in := `{"type":14,"plain":"FORGED","content":[
+		{"type":"text","text":"hello "},
+		{"type":"image","url":"https://x/y.png","width":10,"height":10},
+		{"type":"text","text":" world"}
+	]}`
+	out, err := NormalizeContentEdit(in)
+	if err != nil {
+		t.Fatalf("NormalizeContentEdit err: %v", err)
+	}
+	got := payloadFromJSON(t, out)
+	want := "hello " + common.RichTextImagePlaceholder + " world"
+	if got["plain"] != want {
+		t.Fatalf("plain=%q want %q", got["plain"], want)
+	}
+}
+
+// TestNormalizeContentEdit_RejectsDirtyPayload 脏 14 content_edit 必须被拒，
+// 不允许写脏 content / 丢 plain 进库（与 send 路径 Validate 对称）。
+func TestNormalizeContentEdit_RejectsDirtyPayload(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+	}{
+		{"empty_content_array", `{"type":14,"content":[]}`},
+		{"empty_text_block", `{"type":14,"content":[{"type":"text","text":""}]}`},
+		{"data_uri_image", `{"type":14,"content":[{"type":"image","url":"data:image/png;base64,AAAA","width":10,"height":10}]}`},
+		{"image_missing_size", `{"type":14,"content":[{"type":"image","url":"https://x/y.png"}]}`},
+		{"unknown_block_type", `{"type":14,"content":[{"type":"video","text":"hi"}]}`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := NormalizeContentEdit(c.in); err == nil {
+				t.Fatalf("NormalizeContentEdit accepted dirty payload %s", c.in)
+			}
+		})
+	}
+}
+
+// TestNormalizeContentEdit_NonRichTextUnchanged 非 14 编辑体原样返回，老编辑路径
+// 行为不变（不解析、不改 plain、不重排字段）。
+func TestNormalizeContentEdit_NonRichTextUnchanged(t *testing.T) {
+	cases := []string{
+		`{"type":1,"content":"hi","plain":"client-sent"}`,
+		`{"type":1,"content":""}`,
+	}
+	for _, in := range cases {
+		out, err := NormalizeContentEdit(in)
+		if err != nil {
+			t.Fatalf("NormalizeContentEdit err: %v", err)
+		}
+		if out != in {
+			t.Fatalf("non-14 content_edit mutated: in=%q out=%q", in, out)
+		}
+	}
+}
+
+// TestNormalizeContentEdit_NonJSONUnchanged content_edit 不是 JSON 对象（老的/
+// 自由文本编辑体）时原样返回，不报错、不改老行为。
+func TestNormalizeContentEdit_NonJSONUnchanged(t *testing.T) {
+	cases := []string{
+		"",
+		"just plain text",
+		`["a","b"]`,
+		`"a string"`,
+	}
+	for _, in := range cases {
+		out, err := NormalizeContentEdit(in)
+		if err != nil {
+			t.Fatalf("NormalizeContentEdit(%q) err: %v", in, err)
+		}
+		if out != in {
+			t.Fatalf("non-JSON content_edit mutated: in=%q out=%q", in, out)
+		}
+	}
+}
+
+// TestNormalizeContentEdit_OversizeRejected 编辑后超 1MB 的 14 体必须被拒。
+func TestNormalizeContentEdit_OversizeRejected(t *testing.T) {
+	big := strings.Repeat("x", common.RichTextMaxPayloadBytes-200)
+	in := `{"type":14,"content":[{"type":"text","text":"` + big + `"}]}`
+	if _, err := NormalizeContentEdit(in); err == nil {
+		t.Fatalf("NormalizeContentEdit accepted oversize 14 content_edit")
+	}
+}

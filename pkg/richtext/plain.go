@@ -130,3 +130,40 @@ func EnsurePlain(payload map[string]interface{}) error {
 	}
 	return Finalize(payload)
 }
+
+// NormalizeContentEdit 是所有「消息编辑」写入口共用的 RichText(=14) 收敛 gate，
+// 供 user /v1/message/edit、robot /v1/robot/.../message/edit、bot_api & botfather
+// /v1/bot/message/edit 四个入口对称调用。
+//
+// content_edit 以 JSON 字符串承载「完整」替换 payload（与 send payload 同构），
+// 落库后的字节即下游 summary / search / 复制 的权威来源（见 modules/message
+// api_manager.go 与 api.go 把 content_edit 重新解析回 payload map）。编辑语义：
+// 客户端整体替换 content blocks，顶层 plain 由 server 权威重算、不信客户端上送的
+// plain —— 与 send 路径的 Validate + Finalize 对称。
+//
+//   - type=14：跑与 send 同一套 write-strict 校验（拒 缺/空 content、空 text 块、
+//     非 http(s) 图片 URL、缺图片宽高、未知 block type、超 1MB 等脏/超限 payload），
+//     并用 content 重算权威顶层 plain，返回 canonical JSON 供落库。
+//   - 其它情况（非 14 payload，或 content_edit 不是 JSON 对象）：原样返回入参，
+//     保证老编辑路径行为不变。
+//
+// 编辑路径没有 server 端 enrich，故单步 EnsurePlain（Validate 后紧接无 enrich 的
+// Finalize）正是 send 路径「Validate + enrich 后 Finalize」的对称等价物。
+func NormalizeContentEdit(contentEdit string) (string, error) {
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(contentEdit), &payload); err != nil {
+		// 非 JSON 对象（老的/非图文混排编辑体）：保持原样，不改老行为。
+		return contentEdit, nil
+	}
+	if !IsRichTextPayload(payload) {
+		return contentEdit, nil
+	}
+	if err := EnsurePlain(payload); err != nil {
+		return "", err
+	}
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
