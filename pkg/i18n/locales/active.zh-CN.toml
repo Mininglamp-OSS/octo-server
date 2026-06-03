@@ -648,3 +648,20 @@ other = "绑定会话已过期或无效，请重新发起。"
 
 ["err.server.oidc.bind_claims_incomplete"]
 other = "身份提供方未返回创建账号所需的账号信息。"
+
+# ---- err.server.incomingwebhook.* (modules/incomingwebhook push path, PR #31 D23) ----
+
+["err.server.incomingwebhook.push_unauthorized"]
+other = "未授权。"
+
+["err.server.incomingwebhook.push_rate_limited"]
+other = "请求过于频繁，请稍后再试。"
+
+["err.server.incomingwebhook.push_payload_invalid"]
+other = "请求内容无效。"
+
+["err.server.incomingwebhook.push_payload_too_large"]
+other = "请求内容过大。"
+
+["err.server.incomingwebhook.push_delivery_failed"]
+other = "Webhook 消息投递失败。"

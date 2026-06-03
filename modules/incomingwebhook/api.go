@@ -110,9 +110,9 @@ func (w *IncomingWebhook) Route(r *wkhttp.WKHttp) {
 	}
 
 	// 推送类：URL 内 token 鉴权，无 AuthMiddleware；外加 IP 限流防扫 token。
-	ipRPS := appwkhttp.ParseRPSFromEnv(envIngressIPRPS, defaultIngressIPRPS)
-	ipBurst := appwkhttp.ParseBurstFromEnv(envIngressIPBurst, defaultIngressIPBurst)
-	ipLimit := appwkhttp.StrictIPRateLimitMiddleware(context.Background(), w.rateRedis, "incoming_webhook", ipRPS, ipBurst)
+	ipRPS := wkhttp.ParseRPSFromEnv(envIngressIPRPS, defaultIngressIPRPS)
+	ipBurst := wkhttp.ParseBurstFromEnv(envIngressIPBurst, defaultIngressIPBurst)
+	ipLimit := r.StrictIPRateLimitMiddleware(context.Background(), w.rateRedis, "incoming_webhook", ipRPS, ipBurst)
 
 	push := r.Group("/v1")
 	{
@@ -143,11 +143,11 @@ func maxBytes() int {
 }
 
 func perWebhookRPS() float64 {
-	return appwkhttp.ParseRPSFromEnv(envRatePerWebhookRPS, defaultRatePerWHRPS)
+	return wkhttp.ParseRPSFromEnv(envRatePerWebhookRPS, defaultRatePerWHRPS)
 }
 
 func perWebhookBurst() int {
-	return appwkhttp.ParseBurstFromEnv(envRatePerWebhookBurst, defaultRatePerWHBurst)
+	return wkhttp.ParseBurstFromEnv(envRatePerWebhookBurst, defaultRatePerWHBurst)
 }
 
 // ============================================================
@@ -480,14 +480,6 @@ func (w *IncomingWebhook) regenerate(c *wkhttp.Context) {
 // 推送端点
 // ============================================================
 
-// pushErrUnauthorized 用统一文案返回 401，不区分原因（防探测）。
-func pushUnauthorized(c *wkhttp.Context) {
-	c.AbortWithStatusJSON(http.StatusUnauthorized, map[string]interface{}{
-		"status": http.StatusUnauthorized,
-		"msg":    "unauthorized",
-	})
-}
-
 func (w *IncomingWebhook) push(c *wkhttp.Context) {
 	webhookID := c.Param("webhook_id")
 	token := c.Param("token")
@@ -536,10 +528,7 @@ func (w *IncomingWebhook) push(c *wkhttp.Context) {
 		allowed = true
 	}
 	if !allowed {
-		c.AbortWithStatusJSON(http.StatusTooManyRequests, map[string]interface{}{
-			"status": http.StatusTooManyRequests,
-			"msg":    "rate limited",
-		})
+		pushRateLimited(c)
 		return
 	}
 
@@ -547,33 +536,21 @@ func (w *IncomingWebhook) push(c *wkhttp.Context) {
 	limit := maxBytes()
 	body, err := io.ReadAll(io.LimitReader(c.Request.Body, int64(limit)+1))
 	if err != nil {
-		c.AbortWithStatusJSON(http.StatusBadRequest, map[string]interface{}{
-			"status": http.StatusBadRequest,
-			"msg":    "invalid body",
-		})
+		pushPayloadInvalid(c, "body")
 		return
 	}
 	if len(body) > limit {
-		c.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, map[string]interface{}{
-			"status": http.StatusRequestEntityTooLarge,
-			"msg":    "payload too large",
-		})
+		pushPayloadTooLarge(c)
 		return
 	}
 
 	var req pushPayloadReq
 	if err := json.Unmarshal(body, &req); err != nil {
-		c.AbortWithStatusJSON(http.StatusBadRequest, map[string]interface{}{
-			"status": http.StatusBadRequest,
-			"msg":    "invalid json",
-		})
+		pushPayloadInvalid(c, "json")
 		return
 	}
 	if strings.TrimSpace(req.Content) == "" {
-		c.AbortWithStatusJSON(http.StatusBadRequest, map[string]interface{}{
-			"status": http.StatusBadRequest,
-			"msg":    "content required",
-		})
+		pushPayloadInvalid(c, "content")
 		return
 	}
 
@@ -591,10 +568,7 @@ func (w *IncomingWebhook) push(c *wkhttp.Context) {
 	if err != nil {
 		w.Error("send incoming webhook message failed",
 			zap.String("webhook_id", m.WebhookID), zap.Error(err))
-		c.AbortWithStatusJSON(http.StatusBadGateway, map[string]interface{}{
-			"status": http.StatusBadGateway,
-			"msg":    "send failed",
-		})
+		pushDeliveryFailed(c)
 		return
 	}
 

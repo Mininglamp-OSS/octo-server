@@ -7,7 +7,7 @@ import (
 	"github.com/go-redis/redis"
 )
 
-// tokenBucketScript 与 pkg/wkhttp/ratelimit.go 中的脚本同形，单独维护一份是为了
+// tokenBucketScript 与 octo-lib pkg/wkhttp/ratelimit.go 中的脚本同形，单独维护一份是为了
 // 让 incoming webhook 的限流键空间独立、并允许后续按需调优配额而不牵连其他端点。
 const tokenBucketScript = `
 local key = KEYS[1]
