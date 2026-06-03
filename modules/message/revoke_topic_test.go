@@ -30,7 +30,11 @@ const (
 )
 
 func member(uid string, role common.GroupMemberRole) *group.MemberResp {
-	return &group.MemberResp{GroupNo: "PG1", UID: uid, Role: int(role)}
+	// Status 必须显式设为 Normal：groupRoleRevokeAllowed 现在对 loginMember 做
+	// status=Normal 的 fail-safe 校验（黑名单/已退群但 is_deleted=0 的脏数据不视为
+	// 有效管理者）。零值 Status=0 会被判为非 Normal，使所有"应允许"子用例返回 false。
+	// 与 revoke_bot_test.go / is_manager_external_test.go 的 fixture 对齐。
+	return &group.MemberResp{GroupNo: "PG1", UID: uid, Role: int(role), Status: int(common.GroupMemberStatusNormal)}
 }
 
 func TestHasRevokePermission_CommunityTopic_ParentRoleMatrix(t *testing.T) {

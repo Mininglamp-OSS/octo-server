@@ -24,16 +24,19 @@ func newDB(ctx *config.Context) *incomingWebhookDB {
 }
 
 // insertWithQuota 在事务内做"配额校验 + 写入"原子操作：
-//  1. SELECT count(*) ... WHERE group_no=? FOR UPDATE：在 idx_incoming_webhook_group
-//     上对该 group_no 范围加 next-key lock（InnoDB REPEATABLE READ 下覆盖间隙），
-//     并发的同 group 创建请求会被阻塞在此处直到本事务结束。
-//  2. count >= max 返回 ErrQuotaExceeded，事务回滚。
+//  1. SELECT id FROM `group` ... FOR UPDATE：对父群行加 X 记录锁（group_no 命中
+//     UNIQUE 索引 group_groupNo，锁的是必然存在的单行 record lock）。并发的同 group
+//     创建请求在此串行化，逐个进入配额校验+写入。
+//  2. SELECT count(*) FROM incoming_webhook WHERE group_no=?：父群行锁已串行化，
+//     此处普通读即可；count >= max 返回 ErrQuotaExceeded，事务回滚。
 //  3. 显式回填 CreatedAt：dbr 的 InsertInto.Record 不会从 DB 默认值回读时间，
 //     不写就会导致响应里的 created_at = epoch(0)。
 //
-// 替代之前的 countByGroupNo + insert 两步式调用——那种写法在没有锁的情况下并发
-// 创建会同时通过配额检查并都执行 INSERT，绕过 maxPerGroup 上限（lml2468 / Jerry-Xin
-// PR #31 review）。
+// 为何锁父群行而非 `SELECT count(*) FROM incoming_webhook ... FOR UPDATE`：后者在
+// 空群首次插入时只命中 0 行 → 纯 gap lock。gap-X 锁互相兼容，并发事务会全部通过
+// count 检查、各自 INSERT 抢 insert-intention lock 互等 → InnoDB 死锁(1213)，且无
+// 重试，合法并发创建会以不透明的"创建失败"500 收场。锁父群这一必然存在的单行可彻底
+// 串行化而不触发 gap-lock 死锁（PR #31 yujiawei / Jerry-Xin review）。
 func (d *incomingWebhookDB) insertWithQuota(m *incomingWebhookModel, max int) error {
 	tx, err := d.session.Begin()
 	if err != nil {
@@ -41,12 +44,20 @@ func (d *incomingWebhookDB) insertWithQuota(m *incomingWebhookModel, max int) er
 	}
 	defer tx.RollbackUnlessCommitted()
 
+	var gid int
+	if _, err = tx.SelectBySql(
+		"SELECT id FROM `group` WHERE group_no=? FOR UPDATE",
+		m.GroupNo,
+	).Load(&gid); err != nil {
+		return fmt.Errorf("incomingwebhook: lock group for update: %w", err)
+	}
+
 	var count int
 	if _, err = tx.SelectBySql(
-		"SELECT count(*) FROM incoming_webhook WHERE group_no=? FOR UPDATE",
+		"SELECT count(*) FROM incoming_webhook WHERE group_no=?",
 		m.GroupNo,
 	).Load(&count); err != nil {
-		return fmt.Errorf("incomingwebhook: count for update: %w", err)
+		return fmt.Errorf("incomingwebhook: count: %w", err)
 	}
 	if count >= max {
 		return ErrQuotaExceeded
