@@ -43,8 +43,15 @@ const (
 	jwtIssuer    = "octo-server"
 
 	// Token lifetimes — see spec §"技术决策"
-	webTokenTTL    = 30 * time.Minute
-	daemonTokenTTL = 30 * 24 * time.Hour
+	webTokenTTL = 30 * time.Minute
+	// daemon-side EnsureJWT lazy-refreshes at 5min-remaining (see
+	// octo-daemon-cli/internal/client.go EnsureJWT). 24h TTL gives ~23h55min
+	// of safety margin against the refresh floor. Shortening the TTL further
+	// would require revisiting that floor (currently a hardcoded 5 minutes).
+	// Net effect of 24h vs prior 30d: tightens the api_key-revocation window
+	// from 30 days to 1 day. (Per comm protocol decision; will be superseded
+	// if auth session moves to api_key-direct-call path.)
+	daemonTokenTTL = 24 * time.Hour
 )
 
 // AuthJWT is the module entrypoint registered with octo-lib.
@@ -222,8 +229,9 @@ func (a *AuthJWT) IssueDaemonToken(uid, spaceID, daemonID string) (string, error
 // JWKS is unauthenticated and cacheable.
 //
 // PR-A.2 added two cross-service bot endpoints (see bot_api.go):
-//   POST /v1/bot/mint        — web session auth, mints bot OBO
-//   GET  /v1/bot/:uid/token  — daemon JWT auth, returns bot_token
+//
+//	POST /v1/bot/mint        — web session auth, mints bot OBO
+//	GET  /v1/bot/:uid/token  — daemon JWT auth, returns bot_token
 func (a *AuthJWT) Route(r *wkhttp.WKHttp) {
 	r.GET("/.well-known/jwks.json", a.serveJWKS)
 	r.POST("/v1/auth/token", a.exchangeToken)
