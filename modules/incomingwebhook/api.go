@@ -25,6 +25,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"github.com/go-redis/redis"
 	"go.uber.org/zap"
@@ -71,12 +72,14 @@ var (
 
 func sharedRateRedis(cfg *config.Config) *redis.Client {
 	rateRedisOnce.Do(func() {
-		rateRedisClient = redis.NewClient(&redis.Options{
-			Addr:       cfg.DB.RedisAddr,
-			Password:   cfg.DB.RedisPass,
-			MaxRetries: 1,
-			PoolSize:   10,
-		})
+		// 通过 octoredis.MustBuildOptions 构造，确保 cfg.DB.RedisTLS 启用时
+		// （AWS ElastiCache / Azure Cache 等托管 TLS Redis）TLSConfig 不被遗漏。
+		// 否则限流 client 连不上 TLS-only Redis，per-IP / per-webhook 两个限流器
+		// 都会 fail-open，未认证 push 端点的反扫描/防洪泛保护被静默关闭。
+		rateRedisClient = redis.NewClient(octoredis.MustBuildOptions(cfg, func(o *redis.Options) {
+			o.MaxRetries = 1
+			o.PoolSize = 10
+		}))
 	})
 	return rateRedisClient
 }
