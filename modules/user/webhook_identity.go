@@ -1,6 +1,7 @@
 package user
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 
@@ -25,22 +26,33 @@ const (
 )
 
 // resolveWebhookChannel 通过 BussDataSource.ChannelGet 链解析 webhook 合成身份的展示
-// 信息（名称/头像）。未命中（含 webhook 已删除）返回 nil。
-func (u *User) resolveWebhookChannel(uid, loginUID string) *model.ChannelResp {
+// 信息（名称/头像）。
+//
+// 返回值语义（必须区分，否则会把存储故障误判成 not-found）：
+//   - (resp, nil)：命中，resp 为合成的频道详情。
+//   - (nil, nil)：无任何模块处理此 uid（webhook 真正不存在，含已删除）→ 调用方走
+//     not-found / 默认头像降级。
+//   - (nil, err)：某模块返回了真实错误（DB/查询失败）→ 调用方必须返回 5xx，不可降级。
+//
+// datasource 用 register.ErrDatasourceNotProcess 表示"不处理"，用包装后的真实 error
+// 表示故障（见 incomingwebhook 的 newChannelGetDatasource），这里据此区分。
+func (u *User) resolveWebhookChannel(uid, loginUID string) (*model.ChannelResp, error) {
 	for _, m := range register.GetModules(u.ctx) {
 		if m.BussDataSource.ChannelGet == nil {
 			continue
 		}
 		resp, err := m.BussDataSource.ChannelGet(uid, common.ChannelTypePerson.Uint8(), loginUID)
 		if err != nil {
-			// ErrDatasourceNotProcess 等：该模块不处理，继续下一个。
-			continue
+			if errors.Is(err, register.ErrDatasourceNotProcess) {
+				continue // 该模块不处理此 uid，尝试下一个
+			}
+			return nil, err // 真实错误向上传播，禁止降级成 not-found / 默认头像
 		}
 		if resp != nil {
-			return resp
+			return resp, nil
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 // newWebhookUserDetailResp 把 webhook 频道详情合成为最小化用户详情，供 /v1/users/:uid
@@ -57,7 +69,13 @@ func newWebhookUserDetailResp(uid string, ch *model.ChannelResp) *UserDetailResp
 // writeWebhookAvatar 处理 webhook 头像请求：有自定义 http(s) 头像 URL 则 302 重定向，
 // 否则（未设置头像或 webhook 已删除）回退到基于 uid 的默认头像，避免裂图。
 func (u *User) writeWebhookAvatar(c *wkhttp.Context, uid string) {
-	ch := u.resolveWebhookChannel(uid, "")
+	ch, err := u.resolveWebhookChannel(uid, "")
+	if err != nil {
+		// 真实查询故障：返回 500，不可静默回退默认头像（掩盖故障）。
+		u.Error("查询 webhook 头像失败", zap.Error(err), zap.String("uid", uid))
+		c.Writer.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 	avatarURL := ""
 	if ch != nil {
 		if v, ok := ch.Extra[webhookExtraAvatarKey].(string); ok {
@@ -68,6 +86,7 @@ func (u *User) writeWebhookAvatar(c *wkhttp.Context, uid string) {
 		c.Redirect(http.StatusFound, avatarURL)
 		return
 	}
+	// 仅当 webhook 存在但无自定义头像、或 webhook 已删除（ch==nil）时回退默认头像。
 	imageData, genErr := generateDefaultAvatar(uid)
 	if genErr != nil {
 		u.Error("生成 webhook 默认头像失败", zap.Error(genErr), zap.String("uid", uid))

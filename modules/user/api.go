@@ -1074,9 +1074,15 @@ func (u *User) get(c *wkhttp.Context) {
 	}
 
 	// incoming webhook 合成发送者（iwh_ 前缀）不是真实用户，走 datasource 兜底，
-	// 否则会因查不到 user 记录返回错误。webhook 已删除时返回 not_found（优雅降级）。
+	// 否则会因查不到 user 记录返回错误。区分三种情况：真实查询故障→500（不可降级），
+	// webhook 真正不存在（含已删除）→not_found，命中→合成详情。
 	if strings.HasPrefix(uid, webhookUIDPrefix) {
-		ch := u.resolveWebhookChannel(uid, loginUID)
+		ch, err := u.resolveWebhookChannel(uid, loginUID)
+		if err != nil {
+			u.Error("查询 webhook 发送者信息失败", zap.Error(err), zap.String("uid", uid))
+			respondUserErrorWithStatus(c, errcode.ErrUserQueryFailed)
+			return
+		}
 		if ch == nil {
 			respondUserError(c, errcode.ErrUserNotFound)
 			return

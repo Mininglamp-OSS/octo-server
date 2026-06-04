@@ -98,6 +98,36 @@ func TestWebhookRender_AfterDelete_UserGet(t *testing.T) {
 	assert.NotEqualf(t, http.StatusInternalServerError, w.Code, "deleted webhook must degrade gracefully, not 500; body: %s", w.Body.String())
 }
 
+// 真实查询故障必须返回 5xx，不能被降级成 404 / 默认头像（reviewer #250 🔴）。
+// 通过临时重命名 incoming_webhook 表注入 query error，测完 defer 恢复。
+func TestWebhookRender_UserGet_QueryError_Returns5xx(t *testing.T) {
+	handler, ctx, groupNo := setupTestEnv(t)
+	whID := createWebhook(t, handler, groupNo, "WH", "")
+
+	_, err := ctx.DB().UpdateBySql("RENAME TABLE incoming_webhook TO incoming_webhook_bak").Exec()
+	assert.NoError(t, err)
+	defer func() {
+		_, _ = ctx.DB().UpdateBySql("RENAME TABLE incoming_webhook_bak TO incoming_webhook").Exec()
+	}()
+
+	w := do(handler, authReq("GET", fmt.Sprintf("/v1/users/%s?group_no=%s", whID, groupNo), nil))
+	assert.GreaterOrEqualf(t, w.Code, 500, "query failure must surface as 5xx, not be masked as not-found; body: %s", w.Body.String())
+}
+
+func TestWebhookRender_Avatar_QueryError_Returns5xx(t *testing.T) {
+	handler, ctx, groupNo := setupTestEnv(t)
+	whID := createWebhook(t, handler, groupNo, "WH", "https://example.com/a.png")
+
+	_, err := ctx.DB().UpdateBySql("RENAME TABLE incoming_webhook TO incoming_webhook_bak").Exec()
+	assert.NoError(t, err)
+	defer func() {
+		_, _ = ctx.DB().UpdateBySql("RENAME TABLE incoming_webhook_bak TO incoming_webhook").Exec()
+	}()
+
+	w := do(handler, anonReq("GET", fmt.Sprintf("/v1/users/%s/avatar", whID), nil))
+	assert.GreaterOrEqualf(t, w.Code, 500, "query failure must surface as 5xx, not a default avatar; code=%d", w.Code)
+}
+
 // 删除 webhook 后：接口③仍回退默认头像（不裂图、不 404）。
 func TestWebhookRender_AfterDelete_Avatar(t *testing.T) {
 	handler, _, groupNo := setupTestEnv(t)

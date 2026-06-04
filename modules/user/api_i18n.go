@@ -16,6 +16,16 @@ func respondUserError(c *wkhttp.Context, code codes.Code) {
 	httperr.ResponseErrorL(c, code, nil, nil)
 }
 
+// respondUserErrorWithStatus mirrors respondUserError but preserves the code's
+// real HTTP status instead of the compatibility-window fixed 400. Use ONLY on
+// branches with no legacy clients keyed to the 400 — e.g. the incoming-webhook
+// (iwh_) sender resolution path, which never resolved before this change, so a
+// genuine storage/query failure must surface to the caller as 5xx rather than
+// be masked as not-found (PR #250 reviewer feedback).
+func respondUserErrorWithStatus(c *wkhttp.Context, code codes.Code) {
+	httperr.ResponseErrorLWithStatus(c, code, nil, nil)
+}
+
 // respondUserRequestInvalid covers the common "X 不能为空" / "数据格式有误"
 // shape — one code, one optional field detail. An empty field is omitted
 // so the renderer does not surface a noisy empty key to clients.
