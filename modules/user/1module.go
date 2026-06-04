@@ -57,6 +57,11 @@ func init() {
 					if channelType != common.ChannelTypePerson.Uint8() {
 						return nil, register.ErrDatasourceNotProcess
 					}
+					// incoming webhook 合成身份（iwh_ 前缀）不是真实用户，交给
+					// incomingwebhook 模块的 datasource 处理，避免在此误报"用户不存在"。
+					if strings.HasPrefix(channelID, webhookUIDPrefix) {
+						return nil, register.ErrDatasourceNotProcess
+					}
 					userDetailResp, err := api.userService.GetUserDetail(channelID, loginUID)
 					if err != nil {
 						return nil, err

@@ -493,6 +493,13 @@ func (u *User) UserAvatar(c *wkhttp.Context) {
 		return
 	}
 
+	// incoming webhook 合成发送者（iwh_ 前缀）不在 user 表，单独处理头像：有自定义
+	// URL 则重定向，否则回退默认头像，避免裂图（含 webhook 已删除的情况）。
+	if strings.HasPrefix(uid, webhookUIDPrefix) {
+		u.writeWebhookAvatar(c, uid)
+		return
+	}
+
 	userInfo, err := u.db.QueryByUID(uid)
 	if err != nil {
 		u.Error("查询用户信息错误", zap.Error(err))
@@ -1063,6 +1070,18 @@ func (u *User) get(c *wkhttp.Context) {
 	if u.ctx.GetConfig().IsVisitor(uid) { // 访客频道
 		c.Request.URL.Path = fmt.Sprintf("/v1/hotline/visitors/%s/im", uid)
 		u.ctx.GetHttpRoute().HandleContext(c)
+		return
+	}
+
+	// incoming webhook 合成发送者（iwh_ 前缀）不是真实用户，走 datasource 兜底，
+	// 否则会因查不到 user 记录返回错误。webhook 已删除时返回 not_found（优雅降级）。
+	if strings.HasPrefix(uid, webhookUIDPrefix) {
+		ch := u.resolveWebhookChannel(uid, loginUID)
+		if ch == nil {
+			respondUserError(c, errcode.ErrUserNotFound)
+			return
+		}
+		c.Response(newWebhookUserDetailResp(uid, ch))
 		return
 	}
 

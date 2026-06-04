@@ -216,9 +216,9 @@ func generateWebhookID() string {
 	buf := make([]byte, 16)
 	if _, err := rand.Read(buf); err != nil {
 		// crypto/rand 失败概率极低；退化到 UUID 仍可保证唯一性。
-		return "iwh_" + strings.ReplaceAll(util.GenerUUID(), "-", "")
+		return webhookIDPrefix + strings.ReplaceAll(util.GenerUUID(), "-", "")
 	}
-	return "iwh_" + hex.EncodeToString(buf)
+	return webhookIDPrefix + hex.EncodeToString(buf)
 }
 
 func toResp(m *incomingWebhookModel) webhookResp {
