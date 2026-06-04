@@ -747,3 +747,62 @@ other = "生成机器人令牌失败。"
 
 ["err.server.robot.auth_check_failed"]
 other = "机器人鉴权校验失败。"
+
+# ---- err.server.space.* (modules/space: api.go / api_manager.go / api_email_invite*.go) ----
+
+["err.server.space.request_invalid"]
+other = "请求参数有误。"
+
+["err.server.space.field_too_long"]
+other = "字段长度超过限制。"
+
+["err.server.space.batch_too_large"]
+other = "单次处理的成员数量过多。"
+
+["err.server.space.permission_denied"]
+other = "你没有权限执行此操作。"
+
+["err.server.space.not_member"]
+other = "你不是该空间成员。"
+
+["err.server.space.creation_disabled"]
+other = "管理员已关闭空间创建功能。"
+
+["err.server.space.not_found"]
+other = "空间不存在或已解散。"
+
+["err.server.space.apply_not_found"]
+other = "申请记录不存在。"
+
+["err.server.space.invite_code_not_found"]
+other = "邀请码不存在。"
+
+["err.server.space.member_not_found"]
+other = "目标成员不存在或已被移除。"
+
+["err.server.space.invite_code_invalid"]
+other = "邀请码无效或已过期。"
+
+["err.server.space.invite_code_exhausted"]
+other = "邀请码已达到使用次数上限。"
+
+["err.server.space.already_member"]
+other = "你已经是该空间成员。"
+
+["err.server.space.apply_processed"]
+other = "该申请已被处理。"
+
+["err.server.space.full"]
+other = "空间已满。"
+
+["err.server.space.immutable"]
+other = "空间已解散或已封禁，无法修改。"
+
+["err.server.space.owner_constraint"]
+other = "请先转让拥有权后再执行此操作。"
+
+["err.server.space.query_failed"]
+other = "查询空间数据失败。"
+
+["err.server.space.store_failed"]
+other = "更新空间数据失败。"

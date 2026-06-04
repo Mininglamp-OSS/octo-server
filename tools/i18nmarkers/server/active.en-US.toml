@@ -375,6 +375,63 @@ other = "Failed to generate the robot token."
 ["err.server.robot.upload_failed"]
 other = "Failed to process the file."
 
+["err.server.space.already_member"]
+other = "You are already a member of this space."
+
+["err.server.space.apply_not_found"]
+other = "Join application not found."
+
+["err.server.space.apply_processed"]
+other = "This application has already been processed."
+
+["err.server.space.batch_too_large"]
+other = "Too many members in a single request."
+
+["err.server.space.creation_disabled"]
+other = "Space creation has been disabled by the administrator."
+
+["err.server.space.field_too_long"]
+other = "The field exceeds the maximum allowed length."
+
+["err.server.space.full"]
+other = "The space is full."
+
+["err.server.space.immutable"]
+other = "The space has been disbanded or banned and cannot be modified."
+
+["err.server.space.invite_code_exhausted"]
+other = "The invite code has reached its usage limit."
+
+["err.server.space.invite_code_invalid"]
+other = "The invite code is invalid or has expired."
+
+["err.server.space.invite_code_not_found"]
+other = "Invite code not found."
+
+["err.server.space.member_not_found"]
+other = "The target member does not exist or has been removed."
+
+["err.server.space.not_found"]
+other = "Space not found or has been disbanded."
+
+["err.server.space.not_member"]
+other = "You are not a member of this space."
+
+["err.server.space.owner_constraint"]
+other = "Transfer ownership before performing this operation."
+
+["err.server.space.permission_denied"]
+other = "You do not have permission to perform this operation."
+
+["err.server.space.query_failed"]
+other = "Failed to query space data."
+
+["err.server.space.request_invalid"]
+other = "Invalid request."
+
+["err.server.space.store_failed"]
+other = "Failed to update space data."
+
 ["err.server.thread.creator_cannot_leave"]
 other = "Thread creator cannot leave the thread."
 
