@@ -19,3 +19,4 @@ on:
 jobs:
   docker-lint:
     uses: Mininglamp-OSS/.github/.github/workflows/reusable-docker-lint.yml@main
+    # Ref: Mininglamp-OSS workflow optimization T11
