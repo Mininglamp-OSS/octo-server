@@ -20,6 +20,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	commonmod "github.com/Mininglamp-OSS/octo-server/modules/common"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	rd "github.com/go-redis/redis"
@@ -49,11 +51,11 @@ func New(ctx *config.Context) *Space {
 func (s *Space) checkSpaceActive(c *wkhttp.Context, spaceId string) bool {
 	active, err := s.db.isSpaceActive(spaceId)
 	if err != nil {
-		c.ResponseError(errors.New("查询空间状态失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return true
 	}
 	if !active {
-		c.ResponseError(errors.New("空间不存在或已解散"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceNotFound, nil, nil)
 		return true
 	}
 	return false
@@ -178,21 +180,21 @@ type createSpaceResult struct {
 // createSpace 创建空间（用户侧入口）
 func (s *Space) createSpace(c *wkhttp.Context) {
 	if s.isUserCreateDisabled() {
-		c.ResponseErrorWithStatus(errors.New("管理员已关闭空间创建功能"), http.StatusForbidden)
+		httperr.ResponseErrorL(c, errcode.ErrSpaceCreationDisabled, nil, nil)
 		return
 	}
 	loginUID := c.GetLoginUID()
 	var req createSpaceReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("请求参数错误"))
+		respondSpaceRequestInvalid(c, "")
 		return
 	}
 	if req.Name == "" {
-		c.ResponseError(errors.New("空间名称不能为空"))
+		respondSpaceRequestInvalid(c, "name")
 		return
 	}
 	if req.JoinMode < JoinModeDirect || req.JoinMode > JoinModeApproval {
-		c.ResponseError(errors.New("无效的加入模式，仅支持 0(直接加入) 或 1(需要审批)"))
+		respondSpaceRequestInvalid(c, "join_mode")
 		return
 	}
 
@@ -205,7 +207,7 @@ func (s *Space) createSpace(c *wkhttp.Context) {
 	})
 	if err != nil {
 		s.Error("创建空间失败", zap.Error(err), zap.String("loginUID", loginUID))
-		c.ResponseError(errors.New("创建空间失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
 
@@ -311,22 +313,22 @@ func (s *Space) getSpace(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	spaceId := c.Param("space_id")
 	if spaceId == "" {
-		c.ResponseError(errors.New("空间ID不能为空"))
+		respondSpaceRequestInvalid(c, "space_id")
 		return
 	}
 
 	detail, err := s.db.querySpaceDetail(spaceId, loginUID)
 	if err != nil {
-		c.ResponseError(errors.New("查询空间失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	if detail == nil {
-		c.ResponseError(errors.New("空间不存在"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceNotFound, nil, nil)
 		return
 	}
 
 	if detail.Role < 0 {
-		c.ResponseError(errors.New("你不是该空间成员"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceNotMember, nil, nil)
 		return
 	}
 
@@ -366,21 +368,21 @@ func (s *Space) updateSpace(c *wkhttp.Context) {
 
 	member, err := s.db.queryMember(spaceId, loginUID)
 	if err != nil {
-		c.ResponseError(errors.New("查询成员信息失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	if member == nil || member.Role < 1 {
-		c.ResponseError(errors.New("无权限修改空间信息"))
+		httperr.ResponseErrorL(c, errcode.ErrSpacePermissionDenied, nil, nil)
 		return
 	}
 
 	var req updateSpaceReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("请求参数错误"))
+		respondSpaceRequestInvalid(c, "")
 		return
 	}
 	if req.Name == nil && req.Description == nil && req.Logo == nil && req.JoinMode == nil && req.PresetGroupIds == nil {
-		c.ResponseError(errors.New("至少需要提供 name / description / logo / join_mode / preset_group_ids 之一"))
+		respondSpaceRequestInvalid(c, "")
 		return
 	}
 
@@ -389,11 +391,11 @@ func (s *Space) updateSpace(c *wkhttp.Context) {
 	if req.Name != nil {
 		trimmed := strings.TrimSpace(*req.Name)
 		if trimmed == "" {
-			c.ResponseError(errors.New("空间名称不能为空"))
+			respondSpaceRequestInvalid(c, "name")
 			return
 		}
 		if utf8.RuneCountInString(trimmed) > managerSpaceNameMaxChars {
-			c.ResponseError(fmt.Errorf("空间名称不能超过 %d 个字符", managerSpaceNameMaxChars))
+			respondSpaceFieldTooLong(c, "name", managerSpaceNameMaxChars)
 			return
 		}
 		req.Name = &trimmed
@@ -401,22 +403,22 @@ func (s *Space) updateSpace(c *wkhttp.Context) {
 	if req.Description != nil {
 		trimmed := strings.TrimSpace(*req.Description)
 		if utf8.RuneCountInString(trimmed) > managerSpaceDescriptionMaxChars {
-			c.ResponseError(fmt.Errorf("空间描述不能超过 %d 个字符", managerSpaceDescriptionMaxChars))
+			respondSpaceFieldTooLong(c, "description", managerSpaceDescriptionMaxChars)
 			return
 		}
 		req.Description = &trimmed
 	}
 	if req.Logo != nil && utf8.RuneCountInString(*req.Logo) > managerSpaceLogoMaxChars {
-		c.ResponseError(fmt.Errorf("Logo 不能超过 %d 个字符", managerSpaceLogoMaxChars))
+		respondSpaceFieldTooLong(c, "logo", managerSpaceLogoMaxChars)
 		return
 	}
 	if req.JoinMode != nil && (*req.JoinMode < JoinModeDirect || *req.JoinMode > JoinModeApproval) {
-		c.ResponseError(errors.New("无效的加入模式，仅支持 0(直接加入) 或 1(需要审批)"))
+		respondSpaceRequestInvalid(c, "join_mode")
 		return
 	}
 	if req.PresetGroupIds != nil {
 		if err := validatePresetGroupIds(*req.PresetGroupIds); err != nil {
-			c.ResponseError(err)
+			respondSpaceRequestInvalid(c, "preset_group_ids")
 			return
 		}
 	}
@@ -428,19 +430,19 @@ func (s *Space) updateSpace(c *wkhttp.Context) {
 	if err != nil {
 		// 复用管理端 sentinel，并发解散 / 封禁与 active 检查之间的 race 由事务侧裁决。
 		if errors.Is(err, ErrSpaceNotFound) {
-			c.ResponseError(errors.New("空间不存在"))
+			httperr.ResponseErrorL(c, errcode.ErrSpaceNotFound, nil, nil)
 			return
 		}
 		if errors.Is(err, ErrSpaceDisbandedForUpdate) {
-			c.ResponseError(errors.New("空间已解散，无法修改空间信息"))
+			httperr.ResponseErrorL(c, errcode.ErrSpaceImmutable, nil, nil)
 			return
 		}
 		if errors.Is(err, ErrSpaceBannedForUpdate) {
-			c.ResponseError(errors.New("空间已封禁，无法修改空间信息"))
+			httperr.ResponseErrorL(c, errcode.ErrSpaceImmutable, nil, nil)
 			return
 		}
 		s.Error("用户修改空间信息失败", zap.Error(err), zap.String("spaceId", spaceId), zap.String("operator", loginUID))
-		c.ResponseError(errors.New("更新空间信息失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
 
@@ -532,17 +534,17 @@ func (s *Space) disbandSpace(c *wkhttp.Context) {
 
 	member, err := s.db.queryMember(spaceId, loginUID)
 	if err != nil {
-		c.ResponseError(errors.New("查询成员信息失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	if member == nil || member.Role != 2 {
-		c.ResponseError(errors.New("只有拥有者才能解散空间"))
+		httperr.ResponseErrorL(c, errcode.ErrSpacePermissionDenied, nil, nil)
 		return
 	}
 
 	err = s.db.disbandSpace(spaceId)
 	if err != nil {
-		c.ResponseError(errors.New("解散空间失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -555,7 +557,7 @@ func (s *Space) mySpaces(c *wkhttp.Context) {
 	spaces, err := s.db.queryMySpaces(loginUID)
 	if err != nil {
 		s.Error("查询空间列表失败", zap.Error(err), zap.String("loginUID", loginUID))
-		c.ResponseError(errors.New("查询空间列表失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 
@@ -586,11 +588,11 @@ func (s *Space) listMembers(c *wkhttp.Context) {
 
 	member, err := s.db.queryMember(spaceId, loginUID)
 	if err != nil {
-		c.ResponseError(errors.New("查询成员信息失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	if member == nil {
-		c.ResponseError(errors.New("你不是该空间成员"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceNotMember, nil, nil)
 		return
 	}
 
@@ -610,7 +612,7 @@ func (s *Space) listMembers(c *wkhttp.Context) {
 
 	members, err := s.db.queryMembers(spaceId, loginUID, page, limit)
 	if err != nil {
-		c.ResponseError(errors.New("查询成员列表失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 
@@ -638,38 +640,38 @@ func (s *Space) addMembers(c *wkhttp.Context) {
 
 	member, err := s.db.queryMember(spaceId, loginUID)
 	if err != nil {
-		c.ResponseError(errors.New("查询成员信息失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	if member == nil || member.Role < 1 {
-		c.ResponseError(errors.New("无权限添加成员"))
+		httperr.ResponseErrorL(c, errcode.ErrSpacePermissionDenied, nil, nil)
 		return
 	}
 
 	var req addMemberReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("请求参数错误"))
+		respondSpaceRequestInvalid(c, "")
 		return
 	}
 	if len(req.UIDs) == 0 {
-		c.ResponseError(errors.New("成员列表不能为空"))
+		respondSpaceRequestInvalid(c, "members")
 		return
 	}
 
 	// 检查空间人数上限
 	spaceInfo, err := s.db.querySpaceByID(spaceId)
 	if err != nil || spaceInfo == nil {
-		c.ResponseError(errors.New("空间不存在或已解散"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceNotFound, nil, nil)
 		return
 	}
 	if spaceInfo.MaxUsers > 0 {
 		memberCount, countErr := s.db.countActiveMembers(spaceId)
 		if countErr != nil {
-			c.ResponseError(errors.New("查询空间成员数失败"))
+			httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 			return
 		}
 		if memberCount+len(req.UIDs) > spaceInfo.MaxUsers {
-			c.ResponseError(errors.New("空间成员数已达上限"))
+			httperr.ResponseErrorL(c, errcode.ErrSpaceFull, nil, nil)
 			return
 		}
 	}
@@ -678,13 +680,13 @@ func (s *Space) addMembers(c *wkhttp.Context) {
 	for _, uid := range req.UIDs {
 		existing, err := s.db.queryMemberIncludeRemoved(spaceId, uid)
 		if err != nil {
-			c.ResponseError(errors.New("查询成员信息失败"))
+			httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 			return
 		}
 		if existing != nil {
 			if existing.Status == 0 {
 				if err = s.db.reactivateMember(spaceId, uid, 0); err != nil {
-					c.ResponseError(errors.New("重新激活成员失败"))
+					httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 					return
 				}
 				newMembers = append(newMembers, uid)
@@ -697,7 +699,7 @@ func (s *Space) addMembers(c *wkhttp.Context) {
 			Role:    0,
 			Status:  1,
 		}); err != nil {
-			c.ResponseError(errors.New("添加成员失败"))
+			httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 			return
 		}
 		newMembers = append(newMembers, uid)
@@ -732,24 +734,24 @@ func (s *Space) removeMembers(c *wkhttp.Context) {
 
 	member, err := s.db.queryMember(spaceId, loginUID)
 	if err != nil {
-		c.ResponseError(errors.New("查询成员信息失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	if member == nil || member.Role < 1 {
-		c.ResponseError(errors.New("无权限移除成员"))
+		httperr.ResponseErrorL(c, errcode.ErrSpacePermissionDenied, nil, nil)
 		return
 	}
 
 	var req removeMemberReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("请求参数错误"))
+		respondSpaceRequestInvalid(c, "")
 		return
 	}
 
 	for _, uid := range req.UIDs {
 		target, err := s.db.queryMember(spaceId, uid)
 		if err != nil {
-			c.ResponseError(errors.New("查询目标成员失败"))
+			httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 			return
 		}
 		if target == nil {
@@ -762,7 +764,7 @@ func (s *Space) removeMembers(c *wkhttp.Context) {
 			continue // 不能移除同级或更高角色
 		}
 		if err = s.db.removeMember(spaceId, uid); err != nil {
-			c.ResponseError(errors.New("移除成员失败"))
+			httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 			return
 		}
 	}
@@ -784,21 +786,21 @@ func (s *Space) leaveSpace(c *wkhttp.Context) {
 
 	member, err := s.db.queryMember(spaceId, loginUID)
 	if err != nil {
-		c.ResponseError(errors.New("查询成员信息失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	if member == nil {
-		c.ResponseError(errors.New("你不是该空间成员"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceNotMember, nil, nil)
 		return
 	}
 	if member.Role == 2 {
-		c.ResponseError(errors.New("拥有者不能退出空间，请先转让拥有权"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceOwnerConstraint, nil, nil)
 		return
 	}
 
 	err = s.db.removeMember(spaceId, loginUID)
 	if err != nil {
-		c.ResponseError(errors.New("退出空间失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
 	// 失效通知成员缓存
@@ -820,32 +822,32 @@ func (s *Space) updateMemberRole(c *wkhttp.Context) {
 
 	member, err := s.db.queryMember(spaceId, loginUID)
 	if err != nil {
-		c.ResponseError(errors.New("查询成员信息失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	if member == nil || member.Role != 2 {
-		c.ResponseError(errors.New("只有拥有者才能修改成员角色"))
+		httperr.ResponseErrorL(c, errcode.ErrSpacePermissionDenied, nil, nil)
 		return
 	}
 
 	var req updateMemberRoleReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("请求参数错误"))
+		respondSpaceRequestInvalid(c, "")
 		return
 	}
 	if req.Role < 0 || req.Role > 2 {
-		c.ResponseError(errors.New("无效的角色值"))
+		respondSpaceRequestInvalid(c, "role")
 		return
 	}
 
 	// 验证目标成员存在且活跃
 	target, err := s.db.queryMember(spaceId, targetUID)
 	if err != nil {
-		c.ResponseError(errors.New("查询目标成员失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	if target == nil {
-		c.ResponseError(errors.New("目标成员不存在或已被移除"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceMemberNotFound, nil, nil)
 		return
 	}
 
@@ -853,29 +855,29 @@ func (s *Space) updateMemberRole(c *wkhttp.Context) {
 	if req.Role == 2 {
 		tx, txErr := s.ctx.DB().Begin()
 		if txErr != nil {
-			c.ResponseError(errors.New("开启事务失败"))
+			httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 			return
 		}
 		defer tx.RollbackUnlessCommitted()
 
 		// 先提升目标为owner
 		if err = s.db.updateMemberRoleTx(tx, spaceId, targetUID, 2); err != nil {
-			c.ResponseError(errors.New("提升目标角色失败"))
+			httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 			return
 		}
 		// 再把当前owner降为admin
 		if err = s.db.updateMemberRoleTx(tx, spaceId, loginUID, 1); err != nil {
-			c.ResponseError(errors.New("降级当前拥有者失败"))
+			httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 			return
 		}
 		if err = tx.Commit(); err != nil {
-			c.ResponseError(errors.New("提交事务失败"))
+			httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 			return
 		}
 	} else {
 		err = s.db.updateMemberRole(spaceId, targetUID, req.Role)
 		if err != nil {
-			c.ResponseError(errors.New("修改角色失败"))
+			httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 			return
 		}
 	}
@@ -893,11 +895,11 @@ func (s *Space) createInvite(c *wkhttp.Context) {
 
 	member, err := s.db.queryMember(spaceId, loginUID)
 	if err != nil {
-		c.ResponseError(errors.New("查询成员信息失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	if member == nil || member.Role < 1 {
-		c.ResponseError(errors.New("无权限创建邀请链接"))
+		httperr.ResponseErrorL(c, errcode.ErrSpacePermissionDenied, nil, nil)
 		return
 	}
 
@@ -910,7 +912,7 @@ func (s *Space) createInvite(c *wkhttp.Context) {
 	inviteCode, err := s.insertInvitationWithRetry(inviteModel)
 	if err != nil {
 		s.Error("创建邀请链接失败", zap.Error(err), zap.String("spaceId", spaceId))
-		c.ResponseError(errors.New("创建邀请链接失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
 
@@ -925,29 +927,29 @@ func (s *Space) joinSpace(c *wkhttp.Context) {
 
 	var req joinSpaceReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("请求参数错误"))
+		respondSpaceRequestInvalid(c, "")
 		return
 	}
 	if req.InviteCode == "" {
-		c.ResponseError(errors.New("邀请码不能为空"))
+		respondSpaceRequestInvalid(c, "invite_code")
 		return
 	}
 
 	invitation, err := s.db.queryInvitationByCode(req.InviteCode)
 	if err != nil {
-		c.ResponseError(errors.New("查询邀请信息失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	if invitation == nil {
 		// queryInvitationByCode 已在 SQL 层过滤 status!=1 与已过期，命中即有效。
-		c.ResponseError(errors.New("邀请码无效或已过期"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceInviteCodeInvalid, nil, nil)
 		return
 	}
 
 	// 检查空间是否存在
 	space, err := s.db.querySpaceByID(invitation.SpaceId)
 	if err != nil || space == nil {
-		c.ResponseError(errors.New("空间不存在或已解散"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceNotFound, nil, nil)
 		return
 	}
 
@@ -955,25 +957,25 @@ func (s *Space) joinSpace(c *wkhttp.Context) {
 	if space.JoinMode == JoinModeApproval {
 		// 只读校验邀请码次数（不消耗，审批通过时也跳过）
 		if invitation.MaxUses > 0 && invitation.UsedCount >= invitation.MaxUses {
-			c.ResponseError(errors.New("邀请码已达到使用次数上限"))
+			httperr.ResponseErrorL(c, errcode.ErrSpaceInviteCodeExhausted, nil, nil)
 			return
 		}
 
 		// 检查是否已是成员
 		existing, err := s.db.queryMemberIncludeRemoved(invitation.SpaceId, loginUID)
 		if err != nil {
-			c.ResponseError(errors.New("查询成员信息失败"))
+			httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 			return
 		}
 		if existing != nil && existing.Status == 1 {
-			c.ResponseError(errors.New("你已经是该空间成员"))
+			httperr.ResponseErrorL(c, errcode.ErrSpaceAlreadyMember, nil, nil)
 			return
 		}
 
 		// 检查是否已有待处理申请
 		pendingApply, err := s.db.queryPendingApplyBySpaceAndUID(invitation.SpaceId, loginUID)
 		if err != nil {
-			c.ResponseError(errors.New("查询申请信息失败"))
+			httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 			return
 		}
 		if pendingApply != nil {
@@ -992,7 +994,7 @@ func (s *Space) joinSpace(c *wkhttp.Context) {
 			InviteCode: req.InviteCode,
 		})
 		if err != nil {
-			c.ResponseError(errors.New("提交申请失败"))
+			httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 			return
 		}
 
@@ -1010,11 +1012,11 @@ func (s *Space) joinSpace(c *wkhttp.Context) {
 	// 直接加入模式：原子检查并递增使用次数
 	allowed, err := s.db.incrementInviteUsedCountAtomic(req.InviteCode)
 	if err != nil {
-		c.ResponseError(errors.New("检查邀请码使用次数失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	if !allowed {
-		c.ResponseError(errors.New("邀请码已达到使用次数上限"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceInviteCodeExhausted, nil, nil)
 		return
 	}
 
@@ -1030,10 +1032,10 @@ func (s *Space) joinSpace(c *wkhttp.Context) {
 			return
 		}
 		if errors.Is(joinErr, ErrAlreadyMember) {
-			c.ResponseError(errors.New("你已经是该空间成员"))
+			httperr.ResponseErrorL(c, errcode.ErrSpaceAlreadyMember, nil, nil)
 			return
 		}
-		c.ResponseError(errors.New("加入空间失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
 
@@ -1130,23 +1132,23 @@ func (s *Space) joinPresetGroups(uid string, spaceID string, presetGroupIdsJSON 
 func (s *Space) getInviteInfo(c *wkhttp.Context) {
 	inviteCode := c.Param("invite_code")
 	if inviteCode == "" {
-		c.ResponseError(errors.New("邀请码不能为空"))
+		respondSpaceRequestInvalid(c, "invite_code")
 		return
 	}
 
 	invitation, err := s.db.queryInvitationByCode(inviteCode)
 	if err != nil {
-		c.ResponseError(errors.New("查询邀请信息失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	if invitation == nil {
-		c.ResponseError(errors.New("邀请码无效"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceInviteCodeInvalid, nil, nil)
 		return
 	}
 
 	space, err := s.db.querySpaceByID(invitation.SpaceId)
 	if err != nil || space == nil {
-		c.ResponseError(errors.New("空间不存在或已解散"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceNotFound, nil, nil)
 		return
 	}
 
@@ -1190,23 +1192,23 @@ func (s *Space) GetCoMemberUIDs(uid string) ([]string, error) {
 func (s *Space) getInvitePreview(c *wkhttp.Context) {
 	inviteCode := c.Param("invite_code")
 	if inviteCode == "" {
-		c.ResponseError(errors.New("邀请码不能为空"))
+		respondSpaceRequestInvalid(c, "invite_code")
 		return
 	}
 
 	invitation, err := s.db.queryInvitationByCode(inviteCode)
 	if err != nil {
-		c.ResponseError(errors.New("查询邀请信息失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	if invitation == nil {
-		c.ResponseError(errors.New("邀请码无效"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceInviteCodeInvalid, nil, nil)
 		return
 	}
 
 	space, err := s.db.querySpaceByID(invitation.SpaceId)
 	if err != nil || space == nil {
-		c.ResponseError(errors.New("空间不存在或已解散"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceNotFound, nil, nil)
 		return
 	}
 
@@ -1246,36 +1248,36 @@ func (s *Space) updateInvite(c *wkhttp.Context) {
 	// 检查权限（需要管理员或拥有者）
 	member, err := s.db.queryMember(spaceId, loginUID)
 	if err != nil {
-		c.ResponseError(errors.New("查询成员信息失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	if member == nil || member.Role < 1 {
-		c.ResponseError(errors.New("无权限修改邀请码设置"))
+		httperr.ResponseErrorL(c, errcode.ErrSpacePermissionDenied, nil, nil)
 		return
 	}
 
 	var req updateInviteReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("请求参数错误"))
+		respondSpaceRequestInvalid(c, "")
 		return
 	}
 	if req.MaxUses == nil && req.ExpiresAt == nil && req.Status == nil {
-		c.ResponseError(errors.New("至少需要提供 max_uses / expires_at / status 之一"))
+		respondSpaceRequestInvalid(c, "")
 		return
 	}
 	if req.MaxUses != nil && *req.MaxUses < 0 {
-		c.ResponseError(errors.New("max_uses 不能为负"))
+		respondSpaceRequestInvalid(c, "max_uses")
 		return
 	}
 	if req.Status != nil && *req.Status != 0 && *req.Status != 1 {
-		c.ResponseError(errors.New("status 仅支持 0(禁用) 或 1(启用)"))
+		respondSpaceRequestInvalid(c, "status")
 		return
 	}
 
 	// 解析过期时间：与管理端 parseInviteExpiresAt 共用 time.Local 约定，避免双路径写库时区漂移。
 	expiresAt, err := parseInviteExpiresAt(req.ExpiresAt)
 	if err != nil {
-		c.ResponseError(err)
+		respondSpaceRequestInvalid(c, "expires_at")
 		return
 	}
 
@@ -1284,11 +1286,11 @@ func (s *Space) updateInvite(c *wkhttp.Context) {
 	//   - 按 space_id + invite_code 双匹配，天然防跨空间越权
 	affected, err := s.mdb.updateInvitationAdmin(spaceId, code, req.MaxUses, expiresAt, req.Status)
 	if err != nil {
-		c.ResponseError(errors.New("更新邀请码失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
 	if affected == 0 {
-		c.ResponseError(errors.New("邀请码不存在"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceInviteCodeNotFound, nil, nil)
 		return
 	}
 
@@ -1311,11 +1313,11 @@ func (s *Space) listInvites(c *wkhttp.Context) {
 
 	member, err := s.db.queryMember(spaceId, loginUID)
 	if err != nil {
-		c.ResponseError(errors.New("查询成员信息失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	if member == nil || member.Role < 1 {
-		c.ResponseError(errors.New("无权限查看邀请码列表"))
+		httperr.ResponseErrorL(c, errcode.ErrSpacePermissionDenied, nil, nil)
 		return
 	}
 
@@ -1328,13 +1330,13 @@ func (s *Space) listInvites(c *wkhttp.Context) {
 	list, err := s.db.queryInvitesBySpace(spaceId, filter, now, uint64(pageSize), uint64(pageIndex))
 	if err != nil {
 		s.Error("查询邀请码列表失败", zap.Error(err), zap.String("spaceId", spaceId))
-		c.ResponseError(errors.New("查询邀请码列表失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	count, err := s.db.countInvitesBySpace(spaceId, filter, now)
 	if err != nil {
 		s.Error("查询邀请码总数失败", zap.Error(err), zap.String("spaceId", spaceId))
-		c.ResponseError(errors.New("查询邀请码总数失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 
@@ -1373,22 +1375,22 @@ func (s *Space) deleteInvite(c *wkhttp.Context) {
 
 	member, err := s.db.queryMember(spaceId, loginUID)
 	if err != nil {
-		c.ResponseError(errors.New("查询成员信息失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	if member == nil || member.Role < 1 {
-		c.ResponseError(errors.New("无权限禁用邀请码"))
+		httperr.ResponseErrorL(c, errcode.ErrSpacePermissionDenied, nil, nil)
 		return
 	}
 
 	affected, err := s.mdb.disableInvitation(spaceId, code)
 	if err != nil {
 		s.Error("禁用邀请码失败", zap.Error(err), zap.String("code", code))
-		c.ResponseError(errors.New("禁用邀请码失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
 	if affected == 0 {
-		c.ResponseError(errors.New("邀请码不存在"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceInviteCodeNotFound, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -1416,11 +1418,11 @@ func (s *Space) joinApplies(c *wkhttp.Context) {
 
 	member, err := s.db.queryMember(spaceId, loginUID)
 	if err != nil {
-		c.ResponseError(errors.New("查询成员信息失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	if member == nil || member.Role < 1 {
-		c.ResponseError(errors.New("无权限查看申请列表"))
+		httperr.ResponseErrorL(c, errcode.ErrSpacePermissionDenied, nil, nil)
 		return
 	}
 
@@ -1438,12 +1440,12 @@ func (s *Space) joinApplies(c *wkhttp.Context) {
 
 	list, err := s.db.queryPendingAppliesBySpace(spaceId, pageSize, offset)
 	if err != nil {
-		c.ResponseError(errors.New("查询申请列表失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	count, err := s.db.queryPendingApplyCountBySpace(spaceId)
 	if err != nil {
-		c.ResponseError(errors.New("查询申请数量失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 
@@ -1480,48 +1482,48 @@ func (s *Space) approveJoinApply(c *wkhttp.Context) {
 
 	applyID, err := strconv.ParseInt(applyIDStr, 10, 64)
 	if err != nil || applyID <= 0 {
-		c.ResponseError(errors.New("申请ID无效"))
+		respondSpaceRequestInvalid(c, "apply_id")
 		return
 	}
 
 	member, err := s.db.queryMember(spaceId, loginUID)
 	if err != nil {
-		c.ResponseError(errors.New("查询成员信息失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	if member == nil || member.Role < 1 {
-		c.ResponseError(errors.New("无权限审批"))
+		httperr.ResponseErrorL(c, errcode.ErrSpacePermissionDenied, nil, nil)
 		return
 	}
 
 	apply, err := s.db.queryJoinApplyByID(applyID)
 	if err != nil {
-		c.ResponseError(errors.New("查询申请记录失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	if apply == nil {
-		c.ResponseError(errors.New("申请记录不存在"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceApplyNotFound, nil, nil)
 		return
 	}
 	if apply.SpaceId != spaceId {
-		c.ResponseError(errors.New("申请记录不属于当前空间"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceApplyNotFound, nil, nil)
 		return
 	}
 	if apply.Status != 0 {
-		c.ResponseError(errors.New("该申请已被处理"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceApplyProcessed, nil, nil)
 		return
 	}
 
 	space, err := s.db.querySpaceByID(spaceId)
 	if err != nil || space == nil {
-		c.ResponseError(errors.New("空间不存在或已解散"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceNotFound, nil, nil)
 		return
 	}
 
 	// 先更新申请状态（防止并发审批 + 确保加入后状态一致）
 	affected, err := s.db.updateJoinApplyStatus(applyID, 1, loginUID)
 	if err != nil {
-		c.ResponseError(errors.New("更新申请状态失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
 	if affected == 0 {
@@ -1536,14 +1538,14 @@ func (s *Space) approveJoinApply(c *wkhttp.Context) {
 		if _, rbErr := s.db.updateJoinApplyStatusRaw(applyID, 0, ""); rbErr != nil {
 			s.Error("回滚申请状态失败", zap.Error(rbErr), zap.Int64("applyID", applyID))
 		}
-		c.ResponseError(errors.New("检查邀请码使用次数失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	if apply.InviteCode != "" && !inviteConsumed {
 		if _, rbErr := s.db.updateJoinApplyStatusRaw(applyID, 0, ""); rbErr != nil {
 			s.Error("回滚申请状态失败", zap.Error(rbErr), zap.Int64("applyID", applyID))
 		}
-		c.ResponseError(errors.New("该邀请码已用尽或已失效，无法通过此申请"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceInviteCodeExhausted, nil, nil)
 		return
 	}
 
@@ -1552,7 +1554,7 @@ func (s *Space) approveJoinApply(c *wkhttp.Context) {
 	if joinErr != nil {
 		if errors.Is(joinErr, ErrSpaceFull) {
 			s.rollbackApplyAndInvite(applyID, apply.InviteCode, inviteConsumed)
-			c.ResponseError(errors.New("空间已满，无法通过申请"))
+			httperr.ResponseErrorL(c, errcode.ErrSpaceFull, nil, nil)
 			return
 		}
 		if errors.Is(joinErr, ErrAlreadyMember) {
@@ -1564,7 +1566,7 @@ func (s *Space) approveJoinApply(c *wkhttp.Context) {
 			return
 		}
 		s.rollbackApplyAndInvite(applyID, apply.InviteCode, inviteConsumed)
-		c.ResponseError(errors.New("加入空间失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
 
@@ -1610,41 +1612,41 @@ func (s *Space) rejectJoinApply(c *wkhttp.Context) {
 
 	applyID, err := strconv.ParseInt(applyIDStr, 10, 64)
 	if err != nil || applyID <= 0 {
-		c.ResponseError(errors.New("申请ID无效"))
+		respondSpaceRequestInvalid(c, "apply_id")
 		return
 	}
 
 	member, err := s.db.queryMember(spaceId, loginUID)
 	if err != nil {
-		c.ResponseError(errors.New("查询成员信息失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	if member == nil || member.Role < 1 {
-		c.ResponseError(errors.New("无权限审批"))
+		httperr.ResponseErrorL(c, errcode.ErrSpacePermissionDenied, nil, nil)
 		return
 	}
 
 	apply, err := s.db.queryJoinApplyByID(applyID)
 	if err != nil {
-		c.ResponseError(errors.New("查询申请记录失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	if apply == nil {
-		c.ResponseError(errors.New("申请记录不存在"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceApplyNotFound, nil, nil)
 		return
 	}
 	if apply.SpaceId != spaceId {
-		c.ResponseError(errors.New("申请记录不属于当前空间"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceApplyNotFound, nil, nil)
 		return
 	}
 	if apply.Status != 0 {
-		c.ResponseError(errors.New("该申请已被处理"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceApplyProcessed, nil, nil)
 		return
 	}
 
 	_, err = s.db.updateJoinApplyStatus(applyID, 2, loginUID)
 	if err != nil {
-		c.ResponseError(errors.New("更新申请状态失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
 
@@ -1750,7 +1752,7 @@ func (s *Space) notifyApplicantJoinResult(applicantUID, spaceId, spaceName strin
 func (s *Space) joinApprovePage(c *wkhttp.Context) {
 	htmlBytes, err := os.ReadFile("./assets/web/space_join_approve.html")
 	if err != nil {
-		c.ResponseError(errors.New("页面加载失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	safeBaseURL := strconv.Quote(s.ctx.GetConfig().External.BaseURL)
@@ -1762,25 +1764,25 @@ func (s *Space) joinApprovePage(c *wkhttp.Context) {
 func (s *Space) joinApproveDetail(c *wkhttp.Context) {
 	authCode := c.Query("auth_code")
 	if authCode == "" {
-		c.ResponseError(errors.New("auth_code 不能为空"))
+		respondSpaceRequestInvalid(c, "auth_code")
 		return
 	}
 
 	authInfo, err := s.ctx.GetRedisConn().GetString(fmt.Sprintf("%s%s", common.AuthCodeCachePrefix, authCode))
 	if err != nil || authInfo == "" {
-		c.ResponseError(errors.New("授权码无效或已过期"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceInviteCodeInvalid, nil, nil)
 		return
 	}
 
 	var authMap map[string]interface{}
 	if err := util.ReadJsonByByte([]byte(authInfo), &authMap); err != nil {
-		c.ResponseError(errors.New("授权信息解析失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceInviteCodeInvalid, nil, nil)
 		return
 	}
 
 	authType, _ := authMap["type"].(string)
 	if authType != "spaceJoinApprove" {
-		c.ResponseError(errors.New("授权码类型无效"))
+		respondSpaceRequestInvalid(c, "auth_code")
 		return
 	}
 
@@ -1790,7 +1792,7 @@ func (s *Space) joinApproveDetail(c *wkhttp.Context) {
 
 	apply, err := s.db.queryJoinApplyByID(applyID)
 	if err != nil || apply == nil {
-		c.ResponseError(errors.New("申请记录不存在"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceApplyNotFound, nil, nil)
 		return
 	}
 
@@ -1846,18 +1848,18 @@ func (s *Space) joinApproveSure(c *wkhttp.Context) {
 	authCode := c.Query("auth_code")
 	action := c.Query("action")
 	if authCode == "" {
-		c.ResponseError(errors.New("auth_code 不能为空"))
+		respondSpaceRequestInvalid(c, "auth_code")
 		return
 	}
 	if action != "approve" && action != "reject" {
-		c.ResponseError(errors.New("action 必须是 approve 或 reject"))
+		respondSpaceRequestInvalid(c, "action")
 		return
 	}
 
 	cacheKey := fmt.Sprintf("%s%s", common.AuthCodeCachePrefix, authCode)
 	authInfo, err := s.ctx.GetRedisConn().GetString(cacheKey)
 	if err != nil || authInfo == "" {
-		c.ResponseError(errors.New("授权码无效或已过期"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceInviteCodeInvalid, nil, nil)
 		return
 	}
 	// 保留 auth_code 让其自然过期，审批后仍可查看详情
@@ -1865,13 +1867,13 @@ func (s *Space) joinApproveSure(c *wkhttp.Context) {
 
 	var authMap map[string]interface{}
 	if err := util.ReadJsonByByte([]byte(authInfo), &authMap); err != nil {
-		c.ResponseError(errors.New("授权信息解析失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceInviteCodeInvalid, nil, nil)
 		return
 	}
 
 	authType, _ := authMap["type"].(string)
 	if authType != "spaceJoinApprove" {
-		c.ResponseError(errors.New("授权码类型无效"))
+		respondSpaceRequestInvalid(c, "auth_code")
 		return
 	}
 
@@ -1882,28 +1884,28 @@ func (s *Space) joinApproveSure(c *wkhttp.Context) {
 
 	apply, err := s.db.queryJoinApplyByID(applyID)
 	if err != nil || apply == nil {
-		c.ResponseError(errors.New("申请记录不存在"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceApplyNotFound, nil, nil)
 		return
 	}
 	if apply.SpaceId != spaceId {
-		c.ResponseError(errors.New("申请记录不属于当前空间"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceApplyNotFound, nil, nil)
 		return
 	}
 	if apply.Status != 0 {
-		c.ResponseError(errors.New("该申请已被处理"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceApplyProcessed, nil, nil)
 		return
 	}
 
 	space, err := s.db.querySpaceByID(spaceId)
 	if err != nil || space == nil {
-		c.ResponseError(errors.New("空间不存在或已解散"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceNotFound, nil, nil)
 		return
 	}
 
 	if action == "approve" {
 		affected, err := s.db.updateJoinApplyStatus(applyID, 1, reviewerUID)
 		if err != nil {
-			c.ResponseError(errors.New("更新申请状态失败"))
+			httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 			return
 		}
 		if affected == 0 {
@@ -1916,14 +1918,14 @@ func (s *Space) joinApproveSure(c *wkhttp.Context) {
 			if _, rbErr := s.db.updateJoinApplyStatusRaw(applyID, 0, ""); rbErr != nil {
 				s.Error("回滚申请状态失败", zap.Error(rbErr), zap.Int64("applyID", applyID))
 			}
-			c.ResponseError(errors.New("检查邀请码使用次数失败"))
+			httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 			return
 		}
 		if apply.InviteCode != "" && !inviteConsumed {
 			if _, rbErr := s.db.updateJoinApplyStatusRaw(applyID, 0, ""); rbErr != nil {
 				s.Error("回滚申请状态失败", zap.Error(rbErr), zap.Int64("applyID", applyID))
 			}
-			c.ResponseError(errors.New("该邀请码已用尽或已失效，无法通过此申请"))
+			httperr.ResponseErrorL(c, errcode.ErrSpaceInviteCodeExhausted, nil, nil)
 			return
 		}
 
@@ -1931,7 +1933,7 @@ func (s *Space) joinApproveSure(c *wkhttp.Context) {
 		if joinErr != nil {
 			if errors.Is(joinErr, ErrSpaceFull) {
 				s.rollbackApplyAndInvite(applyID, apply.InviteCode, inviteConsumed)
-				c.ResponseError(errors.New("空间已满，无法通过申请"))
+				httperr.ResponseErrorL(c, errcode.ErrSpaceFull, nil, nil)
 				return
 			}
 			if errors.Is(joinErr, ErrAlreadyMember) {
@@ -1941,7 +1943,7 @@ func (s *Space) joinApproveSure(c *wkhttp.Context) {
 				}
 			} else {
 				s.rollbackApplyAndInvite(applyID, apply.InviteCode, inviteConsumed)
-				c.ResponseError(errors.New("加入空间失败"))
+				httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 				return
 			}
 		}
@@ -1950,7 +1952,7 @@ func (s *Space) joinApproveSure(c *wkhttp.Context) {
 	} else {
 		_, err = s.db.updateJoinApplyStatus(applyID, 2, reviewerUID)
 		if err != nil {
-			c.ResponseError(errors.New("更新申请状态失败"))
+			httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 			return
 		}
 		go s.notifyApplicantJoinResult(apply.UID, spaceId, space.Name, false)
