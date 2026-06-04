@@ -688,3 +688,62 @@ other = "查询 webhook 信息失败。"
 
 ["err.server.incomingwebhook.mgmt_operation_failed"]
 other = "操作失败，请稍后再试。"
+
+# ---- err.server.robot.* (modules/robot: api.go / api_manager.go / mention_pref.go) ----
+
+["err.server.robot.request_invalid"]
+other = "请求参数有误。"
+
+["err.server.robot.content_invalid"]
+other = "消息内容无效。"
+
+["err.server.robot.content_type_unsupported"]
+other = "不支持的消息类型。"
+
+["err.server.robot.file_type_unsupported"]
+other = "不支持的文件类型。"
+
+["err.server.robot.file_too_large"]
+other = "文件大小超过限制。"
+
+["err.server.robot.no_fields_to_update"]
+other = "没有需要更新的字段。"
+
+["err.server.robot.creator_only"]
+other = "仅机器人创建者可执行此操作。"
+
+["err.server.robot.message_edit_forbidden"]
+other = "只能编辑自己发送的消息。"
+
+["err.server.robot.channel_send_forbidden"]
+other = "不允许向该频道发送消息。"
+
+["err.server.robot.not_found"]
+other = "机器人不存在。"
+
+["err.server.robot.message_not_found"]
+other = "消息不存在。"
+
+["err.server.robot.auth_failed"]
+other = "机器人鉴权失败。"
+
+["err.server.robot.inline_query_timeout"]
+other = "行内查询超时，请重试。"
+
+["err.server.robot.query_failed"]
+other = "查询机器人数据失败。"
+
+["err.server.robot.store_failed"]
+other = "更新机器人数据失败。"
+
+["err.server.robot.send_failed"]
+other = "消息发送失败。"
+
+["err.server.robot.upload_failed"]
+other = "文件处理失败。"
+
+["err.server.robot.token_gen_failed"]
+other = "生成机器人令牌失败。"
+
+["err.server.robot.auth_check_failed"]
+other = "机器人鉴权校验失败。"
