@@ -151,6 +151,39 @@ var (
 		DefaultMessage: "Transfer ownership before performing this operation.",
 	})
 
+	// ---- email invite (member/owner email-invite accept & manage flows) ------
+
+	// ErrSpaceEmailInviteNotFound covers a missing email invite on the admin
+	// revoke path.
+	ErrSpaceEmailInviteNotFound = register(codes.Code{
+		ID:             "err.server.space.email_invite_not_found",
+		HTTPStatus:     http.StatusNotFound,
+		DefaultMessage: "Email invite not found.",
+	})
+	// ErrSpaceEmailInviteInvalid covers an invite that cannot be accepted because
+	// it is invalid / expired / missing required data / of an unknown type. The
+	// accept endpoint is authenticated (the caller already proved identity and
+	// must match the invited email), so this stays a plain 400.
+	ErrSpaceEmailInviteInvalid = register(codes.Code{
+		ID:             "err.server.space.email_invite_invalid",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "The invite is invalid or has expired.",
+	})
+	// ErrSpaceEmailInviteProcessed covers accepting/revoking an invite that has
+	// already been consumed, revoked, or is no longer pending.
+	ErrSpaceEmailInviteProcessed = register(codes.Code{
+		ID:             "err.server.space.email_invite_processed",
+		HTTPStatus:     http.StatusConflict,
+		DefaultMessage: "This invite has already been processed.",
+	})
+	// ErrSpaceEmailInviteEmailMismatch covers the typed-email / login-account
+	// email not matching the invite target (defense-in-depth identity check).
+	ErrSpaceEmailInviteEmailMismatch = register(codes.Code{
+		ID:             "err.server.space.email_invite_email_mismatch",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "The email does not match the invite.",
+	})
+
 	// ---- internal (500, Internal=true) ---------------------------------------
 
 	// ErrSpaceQueryFailed covers read-path failures (space / member / invite /

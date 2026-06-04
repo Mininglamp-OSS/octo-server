@@ -801,6 +801,18 @@ other = "空间已解散或已封禁，无法修改。"
 ["err.server.space.owner_constraint"]
 other = "请先转让拥有权后再执行此操作。"
 
+["err.server.space.email_invite_not_found"]
+other = "邀请不存在。"
+
+["err.server.space.email_invite_invalid"]
+other = "邀请无效或已过期。"
+
+["err.server.space.email_invite_processed"]
+other = "该邀请已被处理。"
+
+["err.server.space.email_invite_email_mismatch"]
+other = "邮箱与邀请目标不一致。"
+
 ["err.server.space.query_failed"]
 other = "查询空间数据失败。"
 

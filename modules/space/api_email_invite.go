@@ -7,6 +7,8 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/db"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"go.uber.org/zap"
 )
 
@@ -22,12 +24,11 @@ func (s *Space) createMemberEmailInvite(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	spaceId := c.Param("space_id")
 	if spaceId == "" {
-		c.ResponseError(errors.New("空间ID不能为空"))
+		respondSpaceRequestInvalid(c, "space_id")
 		return
 	}
 
-	if err := s.requireSpaceAdmin(spaceId, loginUID); err != nil {
-		c.ResponseError(err)
+	if s.requireSpaceAdmin(c, spaceId, loginUID) {
 		return
 	}
 	if s.checkSpaceActive(c, spaceId) {
@@ -36,23 +37,23 @@ func (s *Space) createMemberEmailInvite(c *wkhttp.Context) {
 
 	var req spaceMemberEmailInviteReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("请求参数错误"))
+		respondSpaceRequestInvalid(c, "")
 		return
 	}
 	if err := validateMemberInviteReq(&req); err != nil {
-		c.ResponseError(err)
+		respondSpaceRequestInvalid(c, "")
 		return
 	}
 	expiresAt, err := parseInviteExpiresAt(req.ExpiresAt)
 	if err != nil {
-		c.ResponseError(err)
+		respondSpaceRequestInvalid(c, "expires_at")
 		return
 	}
 
 	rawToken, tokenHash, err := generateEmailInviteToken()
 	if err != nil {
 		s.Error("生成邀请 token 失败", zap.Error(err))
-		c.ResponseError(errors.New("生成邀请失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
 
@@ -72,7 +73,7 @@ func (s *Space) createMemberEmailInvite(c *wkhttp.Context) {
 	id, err := s.db.insertEmailInvite(model)
 	if err != nil {
 		s.Error("写入 member 邮件邀请失败", zap.Error(err), zap.String("spaceId", spaceId))
-		c.ResponseError(errors.New("创建邀请失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
 	model.Id = id
@@ -95,11 +96,10 @@ func (s *Space) listMemberEmailInvites(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	spaceId := c.Param("space_id")
 	if spaceId == "" {
-		c.ResponseError(errors.New("空间ID不能为空"))
+		respondSpaceRequestInvalid(c, "space_id")
 		return
 	}
-	if err := s.requireSpaceAdmin(spaceId, loginUID); err != nil {
-		c.ResponseError(err)
+	if s.requireSpaceAdmin(c, spaceId, loginUID) {
 		return
 	}
 
@@ -110,7 +110,7 @@ func (s *Space) listMemberEmailInvites(c *wkhttp.Context) {
 	list, count, err := s.db.listEmailInvitesBySpace(spaceId, statusFilter, pageSize, offset)
 	if err != nil {
 		s.Error("查询 member 邀请列表失败", zap.Error(err), zap.String("spaceId", spaceId))
-		c.ResponseError(errors.New("查询邀请列表失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	resp := make([]*managerEmailInviteResp, 0, len(list))
@@ -128,53 +128,56 @@ func (s *Space) revokeMemberEmailInvite(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	spaceId := c.Param("space_id")
 	if spaceId == "" {
-		c.ResponseError(errors.New("空间ID不能为空"))
+		respondSpaceRequestInvalid(c, "space_id")
 		return
 	}
-	if err := s.requireSpaceAdmin(spaceId, loginUID); err != nil {
-		c.ResponseError(err)
+	if s.requireSpaceAdmin(c, spaceId, loginUID) {
 		return
 	}
 
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil || id <= 0 {
-		c.ResponseError(errors.New("邀请ID无效"))
+		respondSpaceRequestInvalid(c, "invite_id")
 		return
 	}
 	inv, err := s.db.queryEmailInviteByID(id)
 	if err != nil {
 		s.Error("查询邀请失败", zap.Error(err), zap.Int64("id", id))
-		c.ResponseError(errors.New("查询邀请失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	if inv == nil || inv.InviteType != EmailInviteTypeMember || inv.SpaceId != spaceId {
-		c.ResponseError(errors.New("邀请不存在"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceEmailInviteNotFound, nil, nil)
 		return
 	}
 	affected, err := s.db.revokeEmailInvite(id)
 	if err != nil {
 		s.Error("撤销邀请失败", zap.Error(err), zap.Int64("id", id))
-		c.ResponseError(errors.New("撤销邀请失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
 	if affected == 0 {
-		c.ResponseError(errors.New("仅 pending 状态邀请可撤销"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceEmailInviteProcessed, nil, nil)
 		return
 	}
 	c.ResponseOK()
 }
 
-// requireSpaceAdmin 校验 loginUID 是 spaceId 下的 admin/owner。
-// 未达要求时返回带说明的 error，调用方直接 ResponseError。
-func (s *Space) requireSpaceAdmin(spaceId, loginUID string) error {
+// requireSpaceAdmin 校验 loginUID 是 spaceId 下的 admin/owner。返回 true 表示已
+// 写出错误响应、调用方应直接 return（与 checkSpaceActive 同模式，避免向调用方
+// 透传服务层错误字符串）。
+func (s *Space) requireSpaceAdmin(c *wkhttp.Context, spaceId, loginUID string) bool {
 	member, err := s.db.queryMember(spaceId, loginUID)
 	if err != nil {
-		return errors.New("查询成员信息失败")
+		s.Error("查询成员信息失败", zap.Error(err), zap.String("spaceId", spaceId))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
+		return true
 	}
 	if member == nil || member.Role < 1 {
-		return errors.New("无权限操作")
+		httperr.ResponseErrorL(c, errcode.ErrSpacePermissionDenied, nil, nil)
+		return true
 	}
-	return nil
+	return false
 }
 
 // validateMemberInviteReq 校验 member 邀请请求参数。

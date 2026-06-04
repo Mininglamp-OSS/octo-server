@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"go.uber.org/zap"
 )
 
@@ -18,7 +20,7 @@ func (s *Space) emailInvitePage(c *wkhttp.Context) {
 	htmlBytes, err := os.ReadFile("./assets/web/space_email_invite.html")
 	if err != nil {
 		s.Error("加载邮件邀请落地页失败", zap.Error(err))
-		c.ResponseError(errors.New("页面加载失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	safeBaseURL := strconv.Quote(s.ctx.GetConfig().External.BaseURL)
@@ -73,13 +75,13 @@ type emailInvitePreviewResp struct {
 func (s *Space) previewEmailInvite(c *wkhttp.Context) {
 	rawToken := c.Param("token")
 	if rawToken == "" {
-		c.ResponseError(errors.New("token 不能为空"))
+		respondSpaceRequestInvalid(c, "token")
 		return
 	}
 	inv, err := s.db.queryEmailInviteByTokenHash(hashEmailInviteToken(rawToken))
 	if err != nil {
 		s.Error("查询邮件邀请失败", zap.Error(err))
-		c.ResponseError(errors.New("查询邀请失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	if inv == nil {
@@ -149,58 +151,58 @@ func (s *Space) acceptEmailInvite(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	rawToken := c.Param("token")
 	if rawToken == "" {
-		c.ResponseError(errors.New("token 不能为空"))
+		respondSpaceRequestInvalid(c, "token")
 		return
 	}
 
 	var req acceptEmailInviteReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("请求参数错误"))
+		respondSpaceRequestInvalid(c, "")
 		return
 	}
 	typedEmail := strings.ToLower(strings.TrimSpace(req.Email))
 	if typedEmail == "" {
-		c.ResponseError(errors.New("请输入邮箱以确认接受"))
+		respondSpaceRequestInvalid(c, "email")
 		return
 	}
 
 	inv, err := s.db.queryEmailInviteByTokenHash(hashEmailInviteToken(rawToken))
 	if err != nil {
 		s.Error("查询邮件邀请失败", zap.Error(err))
-		c.ResponseError(errors.New("查询邀请失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	if inv == nil {
-		c.ResponseError(errors.New("邀请无效"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceEmailInviteInvalid, nil, nil)
 		return
 	}
 	if inv.Status != EmailInviteStatusPending {
-		c.ResponseError(errors.New("邀请已被处理或已撤销"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceEmailInviteProcessed, nil, nil)
 		return
 	}
 	if inv.ExpiresAt != nil && time.Time(*inv.ExpiresAt).Before(time.Now()) {
-		c.ResponseError(errors.New("邀请已过期"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceEmailInviteInvalid, nil, nil)
 		return
 	}
 
 	if inv.Email == "" {
 		// 历史脏数据兜底：邀请记录无邮箱时直接拒绝，避免空字符串自匹配。
-		c.ResponseError(errors.New("邀请缺少邮箱信息，无法接受"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceEmailInviteInvalid, nil, nil)
 		return
 	}
 	if !strings.EqualFold(typedEmail, inv.Email) {
-		c.ResponseError(errors.New("输入的邮箱与邀请目标不一致"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceEmailInviteEmailMismatch, nil, nil)
 		return
 	}
 	loginEmail, err := s.db.queryUserEmail(loginUID)
 	if err != nil {
 		s.Error("查询登录用户邮箱失败", zap.Error(err), zap.String("loginUID", loginUID))
-		c.ResponseError(errors.New("校验邮箱失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	loginEmail = strings.TrimSpace(loginEmail)
 	if loginEmail == "" || !strings.EqualFold(loginEmail, inv.Email) {
-		c.ResponseError(errors.New("当前登录账号邮箱与邀请目标不一致"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceEmailInviteEmailMismatch, nil, nil)
 		return
 	}
 
@@ -210,7 +212,7 @@ func (s *Space) acceptEmailInvite(c *wkhttp.Context) {
 	case EmailInviteTypeMember:
 		s.acceptMemberInvite(c, inv, loginUID)
 	default:
-		c.ResponseError(errors.New("邀请类型未知"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceEmailInviteInvalid, nil, nil)
 	}
 }
 
@@ -218,7 +220,7 @@ func (s *Space) acceptOwnerInvite(c *wkhttp.Context, inv *spaceEmailInviteModel,
 	tx, err := s.ctx.DB().Begin()
 	if err != nil {
 		s.Error("开启事务失败", zap.Error(err))
-		c.ResponseError(errors.New("接受邀请失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
 	defer tx.RollbackUnlessCommitted()
@@ -226,11 +228,11 @@ func (s *Space) acceptOwnerInvite(c *wkhttp.Context, inv *spaceEmailInviteModel,
 	affected, err := s.db.consumeEmailInviteTx(tx, inv.Id, loginUID)
 	if err != nil {
 		s.Error("消费 token 失败", zap.Error(err), zap.Int64("inviteID", inv.Id))
-		c.ResponseError(errors.New("接受邀请失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
 	if affected == 0 {
-		c.ResponseError(errors.New("邀请已被处理或已过期"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceEmailInviteProcessed, nil, nil)
 		return
 	}
 
@@ -245,12 +247,12 @@ func (s *Space) acceptOwnerInvite(c *wkhttp.Context, inv *spaceEmailInviteModel,
 	spaceId, err := s.createSpaceCoreTx(tx, params)
 	if err != nil {
 		s.Error("创建空间失败", zap.Error(err), zap.Int64("inviteID", inv.Id))
-		c.ResponseError(errors.New("创建空间失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
 	if err = tx.Commit(); err != nil {
 		s.Error("提交事务失败", zap.Error(err), zap.Int64("inviteID", inv.Id))
-		c.ResponseError(errors.New("接受邀请失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
 
@@ -265,13 +267,13 @@ func (s *Space) acceptMemberInvite(c *wkhttp.Context, inv *spaceEmailInviteModel
 	space, err := s.db.querySpaceByID(inv.SpaceId)
 	if err != nil {
 		s.Error("查询空间失败", zap.Error(err), zap.String("spaceId", inv.SpaceId))
-		c.ResponseError(errors.New("查询空间失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	if space == nil || space.Status != SpaceStatusNormal {
 		// 显式 defense-in-depth：即使 querySpaceByID 已过滤 status=1，未来若放宽条件也不会
 		// 让 token 在已解散/封禁空间上被消耗。
-		c.ResponseError(errors.New("空间不存在或已解散"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceNotFound, nil, nil)
 		return
 	}
 
@@ -280,7 +282,7 @@ func (s *Space) acceptMemberInvite(c *wkhttp.Context, inv *spaceEmailInviteModel
 	tx, err := s.ctx.DB().Begin()
 	if err != nil {
 		s.Error("开启事务失败", zap.Error(err))
-		c.ResponseError(errors.New("接受邀请失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
 	defer tx.RollbackUnlessCommitted()
@@ -288,16 +290,16 @@ func (s *Space) acceptMemberInvite(c *wkhttp.Context, inv *spaceEmailInviteModel
 	affected, err := s.db.consumeEmailInviteTx(tx, inv.Id, loginUID)
 	if err != nil {
 		s.Error("消费 token 失败", zap.Error(err), zap.Int64("inviteID", inv.Id))
-		c.ResponseError(errors.New("接受邀请失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
 	if affected == 0 {
-		c.ResponseError(errors.New("邀请已被处理或已过期"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceEmailInviteProcessed, nil, nil)
 		return
 	}
 	if err = tx.Commit(); err != nil {
 		s.Error("提交 token 消费失败", zap.Error(err), zap.Int64("inviteID", inv.Id))
-		c.ResponseError(errors.New("接受邀请失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
 
@@ -309,11 +311,11 @@ func (s *Space) acceptMemberInvite(c *wkhttp.Context, inv *spaceEmailInviteModel
 		} else {
 			s.rollbackConsumedInvite(inv.Id, loginUID)
 			if errors.Is(err, ErrSpaceFull) {
-				c.ResponseError(errors.New("空间已满，无法加入"))
+				httperr.ResponseErrorL(c, errcode.ErrSpaceFull, nil, nil)
 				return
 			}
 			s.Error("加入空间失败", zap.Error(err), zap.String("spaceId", inv.SpaceId))
-			c.ResponseError(errors.New("加入空间失败"))
+			httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 			return
 		}
 	}

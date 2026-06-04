@@ -7,6 +7,8 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/db"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"go.uber.org/zap"
 )
 
@@ -49,23 +51,23 @@ func (m *Manager) createSpaceOwnerEmailInvite(c *wkhttp.Context) {
 	}
 	var req managerCreateOwnerEmailInviteReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("请求参数错误"))
+		respondSpaceRequestInvalid(c, "")
 		return
 	}
 	if err := validateOwnerInviteReq(&req); err != nil {
-		c.ResponseError(err)
+		respondSpaceRequestInvalid(c, "")
 		return
 	}
 	expiresAt, err := parseInviteExpiresAt(req.ExpiresAt)
 	if err != nil {
-		c.ResponseError(err)
+		respondSpaceRequestInvalid(c, "expires_at")
 		return
 	}
 
 	rawToken, tokenHash, err := generateEmailInviteToken()
 	if err != nil {
 		m.Error("生成邀请 token 失败", zap.Error(err))
-		c.ResponseError(errors.New("生成邀请失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
 
@@ -88,7 +90,7 @@ func (m *Manager) createSpaceOwnerEmailInvite(c *wkhttp.Context) {
 	id, err := m.db.insertEmailInvite(model)
 	if err != nil {
 		m.Error("写入 owner 邮件邀请失败", zap.Error(err))
-		c.ResponseError(errors.New("创建邀请失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
 	model.Id = id
@@ -115,7 +117,7 @@ func (m *Manager) listSpaceOwnerEmailInvites(c *wkhttp.Context) {
 	)
 	if err != nil {
 		m.Error("查询 owner 邀请列表失败", zap.Error(err))
-		c.ResponseError(errors.New("查询邀请列表失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	resp := make([]*managerEmailInviteResp, 0, len(list))
@@ -136,31 +138,31 @@ func (m *Manager) revokeSpaceOwnerEmailInvite(c *wkhttp.Context) {
 	idStr := c.Param("id")
 	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil || id <= 0 {
-		c.ResponseError(errors.New("邀请ID无效"))
+		respondSpaceRequestInvalid(c, "invite_id")
 		return
 	}
 	inv, err := m.db.queryEmailInviteByID(id)
 	if err != nil {
 		m.Error("查询邀请失败", zap.Error(err), zap.Int64("id", id))
-		c.ResponseError(errors.New("查询邀请失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
 	}
 	if inv == nil || inv.InviteType != EmailInviteTypeOwner {
-		c.ResponseError(errors.New("邀请不存在"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceEmailInviteNotFound, nil, nil)
 		return
 	}
 	if inv.CreatedBy != c.GetLoginUID() {
-		c.ResponseError(errors.New("无权操作该邀请"))
+		httperr.ResponseErrorL(c, errcode.ErrSpacePermissionDenied, nil, nil)
 		return
 	}
 	affected, err := m.db.revokeEmailInvite(id)
 	if err != nil {
 		m.Error("撤销邀请失败", zap.Error(err), zap.Int64("id", id))
-		c.ResponseError(errors.New("撤销邀请失败"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
 	if affected == 0 {
-		c.ResponseError(errors.New("仅 pending 状态邀请可撤销"))
+		httperr.ResponseErrorL(c, errcode.ErrSpaceEmailInviteProcessed, nil, nil)
 		return
 	}
 	c.ResponseOK()

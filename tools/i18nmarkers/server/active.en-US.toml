@@ -390,6 +390,18 @@ other = "Too many members in a single request."
 ["err.server.space.creation_disabled"]
 other = "Space creation has been disabled by the administrator."
 
+["err.server.space.email_invite_email_mismatch"]
+other = "The email does not match the invite."
+
+["err.server.space.email_invite_invalid"]
+other = "The invite is invalid or has expired."
+
+["err.server.space.email_invite_not_found"]
+other = "Email invite not found."
+
+["err.server.space.email_invite_processed"]
+other = "This invite has already been processed."
+
 ["err.server.space.field_too_long"]
 other = "The field exceeds the maximum allowed length."
 
