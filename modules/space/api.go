@@ -1025,10 +1025,7 @@ func (s *Space) joinSpace(c *wkhttp.Context) {
 	if joinErr != nil {
 		s.refundInvite(req.InviteCode)
 		if errors.Is(joinErr, ErrSpaceFull) {
-			c.ResponseWithStatus(http.StatusBadRequest, map[string]interface{}{
-				"status": "SPACE_FULL",
-				"msg":    "空间已满，无法加入",
-			})
+			httperr.ResponseErrorL(c, errcode.ErrSpaceFull, nil, nil)
 			return
 		}
 		if errors.Is(joinErr, ErrAlreadyMember) {

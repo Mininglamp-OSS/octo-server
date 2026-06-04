@@ -35,6 +35,7 @@ func TestSpaceNoLegacyResponseError(t *testing.T) {
 		".ResponseError(",
 		".ResponseErrorf(",
 		".ResponseErrorWithStatus(",
+		".ResponseWithStatus(",
 		".AbortWithStatusJSON(",
 		".AbortWithStatus(",
 		"c.Response(\"",

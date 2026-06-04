@@ -447,9 +447,7 @@ func TestJoinSpaceFullReturnsSpaceFullError(t *testing.T) {
 	s.GetRoute().ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	body := w.Body.String()
-	assert.Contains(t, body, `"status":"SPACE_FULL"`)
-	assert.Contains(t, body, "空间已满")
+	assertSpaceErrorCode(t, w, "err.server.space.full")
 }
 
 func TestJoinSpaceSuccessWithCapacity(t *testing.T) {
