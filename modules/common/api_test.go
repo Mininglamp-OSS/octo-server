@@ -7,10 +7,18 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func cleanAllTablesAndReloadSettings(t *testing.T, ctx *config.Context) {
+	t.Helper()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	require.NoError(t, EnsureSystemSettings(ctx).Reload())
+}
 
 func TestAddVersion(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
@@ -18,8 +26,7 @@ func TestAddVersion(t *testing.T) {
 	f := New(ctx)
 	f.Route(s.GetRoute())
 	//清除数据
-	err := testutil.CleanAllTables(ctx)
-	assert.NoError(t, err)
+	cleanAllTablesAndReloadSettings(t, ctx)
 	w := httptest.NewRecorder()
 	model := &appVersionReq{
 		AppVersion:  "1.0",
@@ -39,9 +46,8 @@ func TestGetNewVersion(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
 	//清除数据
-	err := testutil.CleanAllTables(ctx)
-	assert.NoError(t, err)
-	_, err = f.db.insertAppVersion(&appVersionModel{
+	cleanAllTablesAndReloadSettings(t, ctx)
+	_, err := f.db.insertAppVersion(&appVersionModel{
 		AppVersion:  "1.0",
 		OS:          "android",
 		DownloadURL: "http://www.githubim.com",
@@ -71,9 +77,8 @@ func TestGetAppConfig(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
 	//清除数据
-	err := testutil.CleanAllTables(ctx)
-	assert.NoError(t, err)
-	err = f.appConfigDB.insert(&appConfigModel{
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{
 		WelcomeMessage:                 "欢迎使用DMWork",
 		NewUserJoinSystemGroup:         1,
 		RegisterInviteOn:               1,
@@ -102,9 +107,8 @@ func TestGetAppConfig(t *testing.T) {
 func TestGetAppConfig_SystemBotUIDsOnVersionShortCircuit(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
-	err := testutil.CleanAllTables(ctx)
-	assert.NoError(t, err)
-	err = f.appConfigDB.insert(&appConfigModel{})
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
 	assert.NoError(t, err)
 	w := httptest.NewRecorder()
 	// 带一个极大 version 强制命中短路分支
@@ -125,9 +129,8 @@ func TestGetAppConfig_DisableUserCreateSpace_DefaultsZero(t *testing.T) {
 	t.Setenv("DM_SPACE_DISABLE_USER_CREATE", "")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
-	err := testutil.CleanAllTables(ctx)
-	assert.NoError(t, err)
-	err = f.appConfigDB.insert(&appConfigModel{})
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
 	assert.NoError(t, err)
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
@@ -143,9 +146,8 @@ func TestGetAppConfig_DisableUserCreateSpace_DBOverride(t *testing.T) {
 	t.Setenv("DM_SPACE_DISABLE_USER_CREATE", "")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
-	err := testutil.CleanAllTables(ctx)
-	assert.NoError(t, err)
-	err = f.appConfigDB.insert(&appConfigModel{})
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
 	assert.NoError(t, err)
 
 	settings := EnsureSystemSettings(ctx)
@@ -167,9 +169,8 @@ func TestGetAppConfig_DisableUserCreateSpace_OnVersionShortCircuit(t *testing.T)
 	t.Setenv("DM_SPACE_DISABLE_USER_CREATE", "")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
-	err := testutil.CleanAllTables(ctx)
-	assert.NoError(t, err)
-	err = f.appConfigDB.insert(&appConfigModel{})
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
 	assert.NoError(t, err)
 
 	settings := EnsureSystemSettings(ctx)
@@ -188,9 +189,8 @@ func TestGetAppConfig_DisableUserCreateSpace_OnVersionShortCircuit(t *testing.T)
 func TestGetAppConfig_LocalLoginOff_DefaultsZero(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
-	err := testutil.CleanAllTables(ctx)
-	assert.NoError(t, err)
-	err = f.appConfigDB.insert(&appConfigModel{})
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
 	assert.NoError(t, err)
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
@@ -208,9 +208,8 @@ func TestGetAppConfig_LocalLoginOff_DBOverride(t *testing.T) {
 	enableFullOIDCForTest(t)
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
-	err := testutil.CleanAllTables(ctx)
-	assert.NoError(t, err)
-	err = f.appConfigDB.insert(&appConfigModel{})
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
 	assert.NoError(t, err)
 
 	settings := EnsureSystemSettings(ctx)
@@ -231,9 +230,8 @@ func TestGetAppConfig_LocalLoginOff_OnVersionShortCircuit(t *testing.T) {
 	enableFullOIDCForTest(t)
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
-	err := testutil.CleanAllTables(ctx)
-	assert.NoError(t, err)
-	err = f.appConfigDB.insert(&appConfigModel{})
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
 	assert.NoError(t, err)
 
 	settings := EnsureSystemSettings(ctx)
@@ -265,9 +263,8 @@ func TestGetAppConfig_OIDCProvidersHonoursParseBoolSpellings(t *testing.T) {
 
 			s, ctx := testutil.NewTestServer()
 			f := New(ctx)
-			err := testutil.CleanAllTables(ctx)
-			assert.NoError(t, err)
-			err = f.appConfigDB.insert(&appConfigModel{})
+			cleanAllTablesAndReloadSettings(t, ctx)
+			err := f.appConfigDB.insert(&appConfigModel{})
 			assert.NoError(t, err)
 
 			settings := EnsureSystemSettings(ctx)
@@ -300,9 +297,8 @@ func TestGetAppConfig_LocalLoginOff_SafetyOverrideWithoutSSO(t *testing.T) {
 	ctx.GetConfig().Gitee.ClientID = ""
 	ctx.GetConfig().Gitee.ClientSecret = ""
 	f := New(ctx)
-	err := testutil.CleanAllTables(ctx)
-	assert.NoError(t, err)
-	err = f.appConfigDB.insert(&appConfigModel{})
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
 	assert.NoError(t, err)
 
 	settings := EnsureSystemSettings(ctx)
@@ -324,9 +320,8 @@ func TestGetAppConfig_OIDCURLsExplicit(t *testing.T) {
 	t.Setenv("DM_OIDC_RESET_PASSWORD_URL", "https://accounts.example.com/reset")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
-	err := testutil.CleanAllTables(ctx)
-	assert.NoError(t, err)
-	err = f.appConfigDB.insert(&appConfigModel{})
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
 	assert.NoError(t, err)
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
@@ -346,9 +341,8 @@ func TestGetAppConfig_OIDCAccountURLFallsBackToIssuer(t *testing.T) {
 	t.Setenv("DM_OIDC_RESET_PASSWORD_URL", "")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
-	err := testutil.CleanAllTables(ctx)
-	assert.NoError(t, err)
-	err = f.appConfigDB.insert(&appConfigModel{})
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
 	assert.NoError(t, err)
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
@@ -370,9 +364,8 @@ func TestGetAppConfig_OIDCProvidersWithCustomID(t *testing.T) {
 	t.Setenv("DM_OIDC_RESET_PASSWORD_URL", "https://accounts.google.com/signin/recovery")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
-	err := testutil.CleanAllTables(ctx)
-	assert.NoError(t, err)
-	err = f.appConfigDB.insert(&appConfigModel{})
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
 	assert.NoError(t, err)
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
@@ -396,9 +389,8 @@ func TestGetAppConfig_OIDCProvidersDefaults(t *testing.T) {
 	t.Setenv("DM_OIDC_AEGIS_ISSUER", "https://accounts.imocto.cn")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
-	err := testutil.CleanAllTables(ctx)
-	assert.NoError(t, err)
-	err = f.appConfigDB.insert(&appConfigModel{})
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
 	assert.NoError(t, err)
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
@@ -420,9 +412,8 @@ func TestGetAppConfig_OIDCAccountURLFallsBackToProviderIssuer(t *testing.T) {
 	t.Setenv("DM_OIDC_AEGIS_ISSUER", "")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
-	err := testutil.CleanAllTables(ctx)
-	assert.NoError(t, err)
-	err = f.appConfigDB.insert(&appConfigModel{})
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
 	assert.NoError(t, err)
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
@@ -442,9 +433,8 @@ func TestGetAppConfig_OIDCProvidersInvalidIDFallsBackToDefault(t *testing.T) {
 	t.Setenv("DM_OIDC_PROVIDER_NAME", "Bad")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
-	err := testutil.CleanAllTables(ctx)
-	assert.NoError(t, err)
-	err = f.appConfigDB.insert(&appConfigModel{})
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
 	assert.NoError(t, err)
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
@@ -464,9 +454,8 @@ func TestGetAppConfig_OIDCProvidersDisabledOmitted(t *testing.T) {
 	t.Setenv("DM_OIDC_ACCOUNT_URL", "https://accounts.google.com/")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
-	err := testutil.CleanAllTables(ctx)
-	assert.NoError(t, err)
-	err = f.appConfigDB.insert(&appConfigModel{})
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
 	assert.NoError(t, err)
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
@@ -485,9 +474,8 @@ func TestGetAppConfig_OIDCDisabledOmitsAll(t *testing.T) {
 	t.Setenv("DM_OIDC_RESET_PASSWORD_URL", "https://accounts.example.com/reset")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
-	err := testutil.CleanAllTables(ctx)
-	assert.NoError(t, err)
-	err = f.appConfigDB.insert(&appConfigModel{})
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
 	assert.NoError(t, err)
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
@@ -505,9 +493,8 @@ func TestGetAppConfig_OIDCDisabledOmitsAll(t *testing.T) {
 func TestGetAppConfig_SystemBotUIDsDownstreamed(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
-	err := testutil.CleanAllTables(ctx)
-	assert.NoError(t, err)
-	err = f.appConfigDB.insert(&appConfigModel{})
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
 	assert.NoError(t, err)
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)

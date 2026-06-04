@@ -34,7 +34,22 @@ func TestMain(m *testing.M) {
 		_, _ = rand.Read(key)
 		_ = os.Setenv("OCTO_MASTER_KEY", hex.EncodeToString(key))
 	}
+	primeRegisterModulesForSharedTestDB()
 	os.Exit(m.Run())
+}
+
+func primeRegisterModulesForSharedTestDB() {
+	cfg := config.New()
+	cfg.Test = true
+	cfg.DB.MySQLAddr = "root:demo@tcp(127.0.0.1)/test?charset=utf8mb4&parseTime=true"
+	cfg.DB.Migration = false
+	ctx := config.NewContext(cfg)
+	s := server.New(ctx)
+	s.GetRoute().UseGin(ctx.Tracer().GinMiddle())
+	ctx.SetHttpRoute(s.GetRoute())
+	if err := module.Setup(ctx); err != nil {
+		panic(err)
+	}
 }
 
 // toctouDefaultDB is the isolated MySQL database this test file owns. We
@@ -86,12 +101,18 @@ func newToctouTestServer(t *testing.T) (*server.Server, *config.Context, *Catego
 
 	require.NoError(t, ctx.Cache().Set(cfg.Cache.TokenCachePrefix+testutil.Token, testutil.UID+"@test"), "seed token")
 
+	setupServer := server.New(ctx)
+	setupServer.GetRoute().UseGin(ctx.Tracer().GinMiddle())
+	ctx.SetHttpRoute(setupServer.GetRoute())
+	require.NoError(t, module.Setup(ctx), "module setup")
+
 	s := server.New(ctx)
 	s.GetRoute().UseGin(ctx.Tracer().GinMiddle())
 	ctx.SetHttpRoute(s.GetRoute())
-	require.NoError(t, module.Setup(ctx), "module setup")
+	f := New(ctx)
+	f.Route(s.GetRoute())
 
-	return s, ctx, New(ctx)
+	return s, ctx, f
 }
 
 // ensureToctouDB parses the DSN, opens a connection WITHOUT a DB name, and

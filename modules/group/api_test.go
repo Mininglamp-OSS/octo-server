@@ -13,12 +13,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/config"
 	_ "github.com/go-sql-driver/mysql"
 
-	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestMain(m *testing.M) {
@@ -47,6 +49,25 @@ func TestMain(m *testing.M) {
 		db.Exec("CREATE TABLE IF NOT EXISTS `robot_menu` (`id` BIGINT AUTO_INCREMENT PRIMARY KEY, `robot_id` VARCHAR(40) NOT NULL DEFAULT '', `cmd` VARCHAR(100) NOT NULL DEFAULT '', `remark` VARCHAR(100) NOT NULL DEFAULT '', `type` VARCHAR(100) NOT NULL DEFAULT '', `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci")
 	}
 	os.Exit(m.Run())
+}
+
+func ensureGroupCategorySchema(t *testing.T, ctx *config.Context) {
+	t.Helper()
+
+	_, err := ctx.DB().InsertBySql("CREATE TABLE IF NOT EXISTS `group_category` (`id` BIGINT AUTO_INCREMENT PRIMARY KEY, `category_id` VARCHAR(32) NOT NULL, `space_id` VARCHAR(40) NOT NULL, `uid` VARCHAR(40) NOT NULL, `name` VARCHAR(100) NOT NULL, `sort` INT NOT NULL DEFAULT 0, `status` TINYINT NOT NULL DEFAULT 1, `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP, `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, UNIQUE KEY `uk_category_id` (`category_id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci").Exec()
+	require.NoError(t, err)
+
+	allowDuplicateColumn(t, ctx, "ALTER TABLE `group_setting` ADD COLUMN `category_id` VARCHAR(32) DEFAULT NULL")
+	allowDuplicateColumn(t, ctx, "ALTER TABLE `group_setting` ADD COLUMN `category_sort` INT NOT NULL DEFAULT 0")
+}
+
+func allowDuplicateColumn(t *testing.T, ctx *config.Context, stmt string) {
+	t.Helper()
+
+	_, err := ctx.DB().InsertBySql(stmt).Exec()
+	if err != nil && !strings.Contains(err.Error(), "Duplicate column name") {
+		require.NoError(t, err)
+	}
 }
 
 func TestGroupCreate(t *testing.T) {
@@ -83,10 +104,7 @@ func TestGroupCreate_WithCategoryID(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
 
-	// 确保 group_category 表和 group_setting category 列存在（category 模块迁移可能未执行）
-	ctx.DB().InsertBySql("CREATE TABLE IF NOT EXISTS `group_category` (`id` BIGINT AUTO_INCREMENT PRIMARY KEY, `category_id` VARCHAR(32) NOT NULL, `space_id` VARCHAR(40) NOT NULL, `uid` VARCHAR(40) NOT NULL, `name` VARCHAR(100) NOT NULL, `sort` INT NOT NULL DEFAULT 0, `status` TINYINT NOT NULL DEFAULT 1, `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP, `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, UNIQUE KEY `uk_category_id` (`category_id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4").Exec()
-	ctx.DB().InsertBySql("ALTER TABLE `group_setting` ADD COLUMN `category_id` VARCHAR(32) DEFAULT NULL").Exec()
-	ctx.DB().InsertBySql("ALTER TABLE `group_setting` ADD COLUMN `category_sort` INT NOT NULL DEFAULT 0").Exec()
+	ensureGroupCategorySchema(t, ctx)
 
 	spaceID := "space-create-cat-001"
 	categoryID := "cat-create-001"
@@ -170,6 +188,7 @@ func TestGroupCreate_WithCategoryID_NoSpaceID(t *testing.T) {
 
 func TestGroupCreate_WithCategoryID_NotFound(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
+	ensureGroupCategorySchema(t, ctx)
 
 	spaceID := "space-cat-notfound"
 
@@ -198,6 +217,7 @@ func TestGroupCreate_WithCategoryID_NotFound(t *testing.T) {
 
 func TestGroupCreate_WithCategoryID_NotOwned(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
+	ensureGroupCategorySchema(t, ctx)
 
 	spaceID := "space-cat-notowned"
 	categoryID := "cat-other-user"

@@ -201,7 +201,7 @@ func TestCategory_Update(t *testing.T) {
 
 	// create a category
 	wc := createCategory(t, route, spaceID, "工作")
-	assert.Equal(t, http.StatusOK, wc.Code)
+	require.Equalf(t, http.StatusOK, wc.Code, "create category response: %s", wc.Body.String())
 	cat := parseJSON(t, wc)
 	catID := cat["category_id"].(string)
 
