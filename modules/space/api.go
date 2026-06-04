@@ -180,7 +180,11 @@ type createSpaceResult struct {
 // createSpace 创建空间（用户侧入口）
 func (s *Space) createSpace(c *wkhttp.Context) {
 	if s.isUserCreateDisabled() {
-		httperr.ResponseErrorL(c, errcode.ErrSpaceCreationDisabled, nil, nil)
+		// Preserve the prior real 403: createSpace originally returned
+		// ResponseErrorWithStatus(403). These clients branch on HTTP 403, so use
+		// WithStatus rather than the D14 fixed-400 path (same call as #268's
+		// mention_pref owner guards).
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrSpaceCreationDisabled, nil, nil)
 		return
 	}
 	loginUID := c.GetLoginUID()

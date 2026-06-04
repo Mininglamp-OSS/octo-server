@@ -1593,7 +1593,7 @@ func TestCreateSpace_DisabledBySystemSetting(t *testing.T) {
 	req.Header.Set("token", testutil.Token)
 	s.GetRoute().ServeHTTP(w, req)
 
-	assert.Equal(t, http.StatusBadRequest, w.Code, "DB 开关 ON 时应返回 403, body=%s", w.Body.String())
+	assert.Equal(t, http.StatusForbidden, w.Code, "DB 开关 ON 时应返回 403, body=%s", w.Body.String())
 	assert.Contains(t, w.Body.String(), "已关闭")
 
 	var count int
@@ -1617,7 +1617,7 @@ func TestCreateSpace_DisabledByEnv(t *testing.T) {
 	req.Header.Set("token", testutil.Token)
 	s.GetRoute().ServeHTTP(w, req)
 
-	assert.Equal(t, http.StatusBadRequest, w.Code, "应返回 403")
+	assert.Equal(t, http.StatusForbidden, w.Code, "应返回 403")
 	assert.Contains(t, w.Body.String(), "已关闭")
 
 	// 不应有新空间入库：按 name 反查
@@ -1962,8 +1962,8 @@ func TestE2E_DisableUserCreateSpace_FullChain(t *testing.T) {
 	writeSetting("1")
 	assert.Contains(t, getAppconfig(), `"disable_user_create_space":1`,
 		"manager 写入后 appconfig 必须立刻下发 1")
-	assert.Equal(t, http.StatusBadRequest, createSpace("e2e-off"),
-		"开关 ON 时 createSpace 必须被拒绝（D14 wire 400 + error.http_status 403）")
+	assert.Equal(t, http.StatusForbidden, createSpace("e2e-off"),
+		"开关 ON 时 createSpace 必须 403")
 
 	// --- Step 2: 重新打开 ---
 	writeSetting("0")
