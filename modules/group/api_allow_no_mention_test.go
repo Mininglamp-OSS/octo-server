@@ -52,6 +52,45 @@ func TestGroup_AllowNoMention_UpdateRoundTrips(t *testing.T) {
 	assert.Equal(t, 1, g.AllowNoMention, "Update 应把 allow_no_mention=1 写回")
 }
 
+// TestGroupSettingUpdate_AllowNoMention_FractionalRejected pins YUJ-2996
+// Blocking 2: a fractional JSON value must be rejected up front (400) instead of
+// being truncated into a valid 0/1 and silently flipping the group switch.
+// 0.9 → would have truncated to 0, 1.9 → to 1; both must now fail validation,
+// alongside the plain out-of-range 2 / -1.
+func TestGroupSettingUpdate_AllowNoMention_FractionalRejected(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"0.9 truncates to 0", `{"allow_no_mention":0.9}`},
+		{"1.9 truncates to 1", `{"allow_no_mention":1.9}`},
+		{"2 out of range", `{"allow_no_mention":2}`},
+		{"-1 out of range", `{"allow_no_mention":-1}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f, h := setupBotOwnershipGroup(t)
+
+			// Seed a known switch state (1=allow) so a successful (buggy) write
+			// would be observable as a flip to 0.
+			g, err := f.db.QueryWithGroupNo("g_bot_own")
+			assert.NoError(t, err)
+			g.AllowNoMention = 1
+			assert.NoError(t, f.db.Update(g))
+
+			w := putGroupSetting(t, h, "g_bot_own", tc.body)
+			assert.Equal(t, http.StatusBadRequest, w.Code, "wire status 固定 400, body=%s", w.Body.String())
+			assert.Contains(t, w.Body.String(), "err.server.group.request_invalid",
+				"非法 allow_no_mention 值应是 400 校验错误而非内部错误, body=%s", w.Body.String())
+
+			// The group switch must remain unchanged after a rejected write.
+			g, err = f.db.QueryWithGroupNo("g_bot_own")
+			assert.NoError(t, err)
+			assert.Equal(t, 1, g.AllowNoMention, "被拒的写入不得改动群开关, body=%s", w.Body.String())
+		})
+	}
+}
+
 // TestGroupSettingUpdate_AllowNoMentionRangeIsRequestInvalid pins that an
 // out-of-range allow_no_mention value is a 400 client validation error, not the
 // store_failed (500). The caller is the creator so the range check (which runs

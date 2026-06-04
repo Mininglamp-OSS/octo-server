@@ -66,11 +66,31 @@ func (ba *BotAPI) getMentionPref(c *wkhttp.Context) {
 
 	effective := computeEffectiveNoMention(noMention, groupAllow)
 
+	// Adapter-facing contract (YUJ-2996 Blocking 1, design option A): the
+	// `no_mention` field carries the AND-combined final decision, identical to
+	// `effective`. Legacy adapters that only read `no_mention` then obey the
+	// group manager's switch with zero code change — closing the bypass where
+	// (no_mention=1, allow_no_mention=0) still returned no_mention:1.
+	//   - no_mention            = effective (bot intent AND group switch)
+	//   - effective             = same value, kept for new-adapter clarity
+	//   - group_allow_no_mention = raw group switch, for UI/debugging
+	// Note: this differs from the owner endpoints (modules/robot/mention_pref.go),
+	// which intentionally keep no_mention as the bot owner's raw intent so the
+	// owner UI can show "I enabled it but the group disabled it".
 	c.Response(map[string]interface{}{
-		"no_mention":             noMention,
+		"no_mention":             boolToInt(effective),
 		"group_allow_no_mention": groupAllow,
 		"effective":              effective,
 	})
+}
+
+// boolToInt maps the effective decision back to the legacy 0/1 integer shape of
+// the adapter-facing no_mention field.
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // computeEffectiveNoMention AND-combines the two permission axes: the bot

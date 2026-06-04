@@ -108,8 +108,10 @@ func decodeMentionPref(t *testing.T, w *httptest.ResponseRecorder) mentionPrefBo
 }
 
 // TestGetMentionPref_TruthTable exercises the four (no_mention, allow_no_mention)
-// combinations end-to-end through the HTTP handler against a real DB, asserting
-// the three returned fields and the AND-combined effective flag.
+// combinations end-to-end through the HTTP handler against a real DB. On the
+// adapter-facing endpoint the `no_mention` field carries the AND-combined final
+// decision (YUJ-2996 Blocking 1, option A) — i.e. no_mention == effective — so a
+// legacy adapter reading only no_mention still obeys the group switch.
 func TestGetMentionPref_TruthTable(t *testing.T) {
 	cases := []struct {
 		name          string
@@ -129,9 +131,15 @@ func TestGetMentionPref_TruthTable(t *testing.T) {
 			seedGroupRow(t, ctx, tc.groupAllow)
 
 			b := decodeMentionPref(t, getBotMentionPref(t, handler))
-			assert.Equal(t, tc.noMention, b.NoMention)
+			// adapter-facing no_mention == effective (AND result), NOT raw intent.
+			wantNoMention := 0
+			if tc.wantEffective {
+				wantNoMention = 1
+			}
+			assert.Equal(t, wantNoMention, b.NoMention, "adapter no_mention must equal effective")
 			assert.Equal(t, tc.groupAllow, b.GroupAllowNoMention)
 			assert.Equal(t, tc.wantEffective, b.Effective)
+			assert.Equal(t, b.Effective, b.NoMention == 1, "no_mention and effective must agree")
 		})
 	}
 }

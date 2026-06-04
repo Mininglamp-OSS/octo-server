@@ -3,6 +3,7 @@ package group
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"runtime/debug"
 
@@ -32,6 +33,23 @@ var (
 func safeIntFromFloat64(v interface{}) (int, bool) {
 	f, ok := v.(float64)
 	if !ok {
+		return 0, false
+	}
+	return int(f), true
+}
+
+// strictIntFromFloat64 converts an interface{} to int via float64 but rejects
+// any JSON number carrying a fractional part. Plain safeIntFromFloat64
+// truncates first (0.9→0, 1.9→1), so a fractional value could sneak past a
+// later 0/1 range check and flip a group switch. Used for the allow_no_mention
+// path (YUJ-2996 Blocking 2): a non-integer JSON value is rejected up front so
+// only true integers reach the 0/1 range check.
+func strictIntFromFloat64(v interface{}) (int, bool) {
+	f, ok := v.(float64)
+	if !ok {
+		return 0, false
+	}
+	if f != math.Trunc(f) {
 		return 0, false
 	}
 	return int(f), true
@@ -397,7 +415,10 @@ var groupUpdateActionMap = map[string]groupUpdateActionFnc{
 		if err := ctx.checkPermissions(); err != nil {
 			return err
 		}
-		val, ok := safeIntFromFloat64(value)
+		// strictIntFromFloat64 (not safeIntFromFloat64): reject fractional JSON
+		// values up front so e.g. 0.9 / 1.9 can't truncate into a valid 0/1 and
+		// silently flip the group switch (YUJ-2996 Blocking 2).
+		val, ok := strictIntFromFloat64(value)
 		if !ok {
 			return errSettingInvalidValueType
 		}
