@@ -348,6 +348,9 @@ func (rb *Robot) authRobot() wkhttp.HandlerFunc {
 			return
 		}
 		if robot == nil {
+			// Anti-enumeration: the wire collapses to one 401, but log the
+			// specific reason so operators retain visibility.
+			rb.Warn("robot 鉴权失败：机器人不存在", zap.String("robot_id", robotID))
 			respondRobotAuthFailed(c)
 			return
 		}
@@ -358,10 +361,12 @@ func (rb *Robot) authRobot() wkhttp.HandlerFunc {
 			return
 		}
 		if appM == nil {
+			rb.Warn("robot 鉴权失败：app 不存在", zap.String("robot_id", robotID), zap.String("appID", robot.AppID))
 			respondRobotAuthFailed(c)
 			return
 		}
 		if !hmac.Equal([]byte(appM.AppKey), []byte(appKey)) {
+			rb.Warn("robot 鉴权失败：appKey 不匹配", zap.String("robot_id", robotID), zap.String("appID", robot.AppID))
 			respondRobotAuthFailed(c)
 			return
 		}
@@ -1178,7 +1183,14 @@ func (rb *Robot) setDescription(c *wkhttp.Context) {
 	// 验证操作者是 Bot 创建者
 	var creatorUID string
 	err := rb.ctx.DB().Select("IFNULL(creator_uid,'')").From("robot").Where("robot_id=? AND status=1", robotID).LoadOne(&creatorUID)
-	if err != nil || creatorUID == "" {
+	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
+		// A real DB/scan error must not masquerade as 404 — log + 500 (mirrors
+		// assertRobotOwner in mention_pref.go).
+		rb.Error("查询 robot creator 失败", zap.Error(err), zap.String("robot_id", robotID))
+		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
+		return
+	}
+	if creatorUID == "" {
 		httperr.ResponseErrorL(c, errcode.ErrRobotNotFound, nil, nil)
 		return
 	}
@@ -1212,7 +1224,14 @@ func (rb *Robot) setAutoApprove(c *wkhttp.Context) {
 	// 验证操作者是 Bot 创建者
 	var creatorUID string
 	err := rb.ctx.DB().Select("IFNULL(creator_uid,'')").From("robot").Where("robot_id=? AND status=1", robotID).LoadOne(&creatorUID)
-	if err != nil || creatorUID == "" {
+	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
+		// A real DB/scan error must not masquerade as 404 — log + 500 (mirrors
+		// assertRobotOwner in mention_pref.go).
+		rb.Error("查询 robot creator 失败", zap.Error(err), zap.String("robot_id", robotID))
+		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
+		return
+	}
+	if creatorUID == "" {
 		httperr.ResponseErrorL(c, errcode.ErrRobotNotFound, nil, nil)
 		return
 	}
@@ -1464,8 +1483,11 @@ func (rb *Robot) botUploadFile(c *wkhttp.Context) {
 
 	multipartFile, fileHeader, err := c.Request.FormFile("file")
 	if err != nil {
-		rb.Error("读取上传文件失败", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrRobotUploadFailed, nil, nil)
+		// A missing / malformed multipart "file" part is a client error, not an
+		// upload-backend failure — surface it as request-invalid (400) with a
+		// field detail rather than the Internal=true upload code.
+		rb.Warn("读取上传文件失败", zap.Error(err))
+		respondRobotRequestInvalid(c, "file")
 		return
 	}
 	defer multipartFile.Close()

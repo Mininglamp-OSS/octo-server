@@ -107,10 +107,14 @@ func (rb *Robot) assertRobotOwner(c *wkhttp.Context, robotID, loginUID string) b
 	// ErrNotFound → creatorUID 仍为 ""，decideOwnership 归类为 404。
 	switch decideOwnership(creatorUID, loginUID) {
 	case ownershipNotFound:
-		httperr.ResponseErrorL(c, errcode.ErrRobotNotFound, nil, nil)
+		// Preserve the prior real 404 (these owner endpoints are dmwork-facing
+		// and predate this PR returning ResponseErrorWithStatus(404)); D14
+		// fixed-400 would drift the wire status for existing clients.
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrRobotNotFound, nil, nil)
 		return true
 	case ownershipForbidden:
-		httperr.ResponseErrorL(c, errcode.ErrRobotCreatorOnly, nil, nil)
+		// Preserve the prior real 403 (was ResponseErrorWithStatus(403)).
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrRobotCreatorOnly, nil, nil)
 		return true
 	default:
 		return false

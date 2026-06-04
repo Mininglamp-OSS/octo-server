@@ -2,10 +2,10 @@ package robot
 
 import (
 	"crypto/rand"
-	"os"
-	"runtime/debug"
 	"encoding/hex"
 	"fmt"
+	"os"
+	"runtime/debug"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -41,9 +41,9 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 		auth.PUT("/robot/status/:robot_id/:status", m.updateRobotStatus) // 修改机器人状态
 
 		auth.GET("/robots", m.robotList)                                // 机器人列表（分页）
-		auth.GET("/robots/:robot_id", m.robotDetail)                   // 机器人详情
-		auth.PUT("/robots/:robot_id", m.robotUpdate)                   // 编辑机器人
-		auth.DELETE("/robots/:robot_id", m.robotDelete)                // 删除机器人
+		auth.GET("/robots/:robot_id", m.robotDetail)                    // 机器人详情
+		auth.PUT("/robots/:robot_id", m.robotUpdate)                    // 编辑机器人
+		auth.DELETE("/robots/:robot_id", m.robotDelete)                 // 删除机器人
 		auth.POST("/robots/:robot_id/revoke_token", m.robotRevokeToken) // 重置Token
 	}
 }
