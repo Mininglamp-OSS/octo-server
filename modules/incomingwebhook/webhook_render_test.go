@@ -85,17 +85,36 @@ func TestWebhookRender_Avatar_Default(t *testing.T) {
 	assert.NotEmpty(t, w.Body.Bytes())
 }
 
-// 删除 webhook 后：接口②优雅降级为非 200，且绝不 500。
-func TestWebhookRender_AfterDelete_UserGet(t *testing.T) {
+// 软删除（#254）后：接口②仍返回 200 + 真实发送者名，让该 webhook 的历史消息继续
+// 可渲染（软删除保留行，display datasource 不按 status 过滤）。
+func TestWebhookRender_AfterSoftDelete_UserGet(t *testing.T) {
 	handler, _, groupNo := setupTestEnv(t)
-	whID := createWebhook(t, handler, groupNo, "WH", "")
+	whID := createWebhook(t, handler, groupNo, "GitHub Bot", "")
 
 	w := do(handler, authReq("DELETE", fmt.Sprintf("/v1/groups/%s/incoming-webhooks/%s", groupNo, whID), nil))
 	assert.Equal(t, http.StatusOK, w.Code)
 
 	w = do(handler, authReq("GET", fmt.Sprintf("/v1/users/%s?group_no=%s", whID, groupNo), nil))
-	assert.NotEqual(t, http.StatusOK, w.Code)
-	assert.NotEqualf(t, http.StatusInternalServerError, w.Code, "deleted webhook must degrade gracefully, not 500; body: %s", w.Body.String())
+	assert.Equalf(t, http.StatusOK, w.Code, "soft-deleted webhook must still resolve; body: %s", w.Body.String())
+	res := parseJSON(t, w)
+	assert.Equal(t, whID, res["uid"])
+	assert.Equal(t, "GitHub Bot", res["name"])
+	assert.Equal(t, "webhook", res["category"])
+	assert.NotContains(t, w.Body.String(), "token")
+}
+
+// 软删除（#254）后：接口①仍把 webhook 解析为单聊频道并返回真实名。
+func TestWebhookRender_AfterSoftDelete_ChannelGet(t *testing.T) {
+	handler, _, groupNo := setupTestEnv(t)
+	whID := createWebhook(t, handler, groupNo, "GitHub Bot", "")
+
+	w := do(handler, authReq("DELETE", fmt.Sprintf("/v1/groups/%s/incoming-webhooks/%s", groupNo, whID), nil))
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	w = do(handler, authReq("GET", fmt.Sprintf("/v1/channels/%s/1", whID), nil))
+	assert.Equalf(t, http.StatusOK, w.Code, "soft-deleted webhook channel must still resolve; body: %s", w.Body.String())
+	res := parseJSON(t, w)
+	assert.Equal(t, "GitHub Bot", res["name"])
 }
 
 // 真实查询故障必须返回 5xx，不能被降级成 404 / 默认头像（reviewer #250 🔴）。
@@ -128,15 +147,16 @@ func TestWebhookRender_Avatar_QueryError_Returns5xx(t *testing.T) {
 	assert.GreaterOrEqualf(t, w.Code, 500, "query failure must surface as 5xx, not a default avatar; code=%d", w.Code)
 }
 
-// 删除 webhook 后：接口③仍回退默认头像（不裂图、不 404）。
-func TestWebhookRender_AfterDelete_Avatar(t *testing.T) {
+// 软删除（#254）后：接口③仍 302 重定向到真实头像 URL（头像行保留，不退化为默认图）。
+func TestWebhookRender_AfterSoftDelete_Avatar(t *testing.T) {
 	handler, _, groupNo := setupTestEnv(t)
-	whID := createWebhook(t, handler, groupNo, "WH", "https://example.com/a.png")
+	const avatarURL = "https://example.com/a.png"
+	whID := createWebhook(t, handler, groupNo, "WH", avatarURL)
 
 	w := do(handler, authReq("DELETE", fmt.Sprintf("/v1/groups/%s/incoming-webhooks/%s", groupNo, whID), nil))
 	assert.Equal(t, http.StatusOK, w.Code)
 
 	w = do(handler, anonReq("GET", fmt.Sprintf("/v1/users/%s/avatar", whID), nil))
-	assert.Equal(t, http.StatusOK, w.Code)
-	assert.Equal(t, "image/png", w.Header().Get("Content-Type"))
+	assert.Equalf(t, http.StatusFound, w.Code, "soft-deleted webhook avatar must still redirect; code=%d", w.Code)
+	assert.Equal(t, avatarURL, w.Header().Get("Location"))
 }

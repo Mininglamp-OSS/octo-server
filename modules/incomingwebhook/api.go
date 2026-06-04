@@ -278,6 +278,26 @@ func (w *IncomingWebhook) requireGroupAdmin(c *wkhttp.Context, groupNo string) (
 	return loginUID, true
 }
 
+// queryManageable 查询属于 groupNo 且未被软删除的 webhook，供管理端写操作（update /
+// delete / regenerate）复用。未命中 / 跨群 / 已软删除（statusDeleted）一律按 not-found
+// 写响应；查询故障写 5xx。任一情况返回 (nil, false)，调用方据此提前返回。
+//
+// 把"已删除视为不存在"集中在此一处，保证三个写端点不会遗漏软删除判断而误操作或复活
+// 已删除的 webhook（#254）。
+func (w *IncomingWebhook) queryManageable(c *wkhttp.Context, groupNo, webhookID string) (*incomingWebhookModel, bool) {
+	m, err := w.db.queryByWebhookID(webhookID)
+	if err != nil {
+		w.Error("query webhook failed", zap.Error(err))
+		mgmtQueryFailed(c)
+		return nil, false
+	}
+	if m == nil || m.GroupNo != groupNo || m.Status == statusDeleted {
+		mgmtNotFound(c)
+		return nil, false
+	}
+	return m, true
+}
+
 // ============================================================
 // 管理端点
 // ============================================================
@@ -328,7 +348,7 @@ func (w *IncomingWebhook) create(c *wkhttp.Context) {
 		Name:       req.Name,
 		Avatar:     req.Avatar,
 		CreatorUID: loginUID,
-		Status:     1,
+		Status:     statusEnabled,
 	}
 	// 配额校验 + 写入在事务内原子完成；FOR UPDATE 锁住 group_no 范围，防止并发越限。
 	//
@@ -381,14 +401,8 @@ func (w *IncomingWebhook) update(c *wkhttp.Context) {
 		return
 	}
 
-	m, err := w.db.queryByWebhookID(webhookID)
-	if err != nil {
-		w.Error("query webhook failed", zap.Error(err))
-		mgmtQueryFailed(c)
-		return
-	}
-	if m == nil || m.GroupNo != groupNo {
-		mgmtNotFound(c)
+	m, ok := w.queryManageable(c, groupNo, webhookID)
+	if !ok {
 		return
 	}
 
@@ -411,13 +425,15 @@ func (w *IncomingWebhook) update(c *wkhttp.Context) {
 		fields["avatar"] = *req.Avatar
 	}
 	if req.Status != nil {
-		if *req.Status != 0 && *req.Status != 1 {
+		// 仅接受启用/禁用；statusDeleted(2) 不可经 update 设置——删除只能走 DELETE
+		// 端点（软删除），update 也不能复活已删除行（见下方 queryManageable）。
+		if *req.Status != statusDisabled && *req.Status != statusEnabled {
 			mgmtRequestInvalid(c, "status")
 			return
 		}
 		// 启用 webhook 前必须确认群仍处于 Normal —— 阻断 disband → re-enable 复活路径。
 		// 禁用（status=0）始终允许，便于管理员主动关停。
-		if *req.Status == 1 {
+		if *req.Status == statusEnabled {
 			g, err := w.requireActiveGroup(groupNo)
 			if err != nil {
 				w.Error("query group failed", zap.Error(err))
@@ -455,14 +471,7 @@ func (w *IncomingWebhook) delete(c *wkhttp.Context) {
 	if _, ok := w.requireGroupAdmin(c, groupNo); !ok {
 		return
 	}
-	m, err := w.db.queryByWebhookID(webhookID)
-	if err != nil {
-		w.Error("query webhook failed", zap.Error(err))
-		mgmtQueryFailed(c)
-		return
-	}
-	if m == nil || m.GroupNo != groupNo {
-		mgmtNotFound(c)
+	if _, ok := w.queryManageable(c, groupNo, webhookID); !ok {
 		return
 	}
 	if err := w.db.deleteByWebhookID(webhookID); err != nil {
@@ -490,14 +499,8 @@ func (w *IncomingWebhook) regenerate(c *wkhttp.Context) {
 		mgmtGroupNotFound(c)
 		return
 	}
-	m, err := w.db.queryByWebhookID(webhookID)
-	if err != nil {
-		w.Error("query webhook failed", zap.Error(err))
-		mgmtQueryFailed(c)
-		return
-	}
-	if m == nil || m.GroupNo != groupNo {
-		mgmtNotFound(c)
+	m, ok := w.queryManageable(c, groupNo, webhookID)
+	if !ok {
 		return
 	}
 	token, hash, err := generateToken()
@@ -538,7 +541,7 @@ func (w *IncomingWebhook) push(c *wkhttp.Context) {
 		pushUnauthorized(c)
 		return
 	}
-	if m == nil || m.Status != 1 {
+	if m == nil || m.Status != statusEnabled {
 		pushUnauthorized(c)
 		return
 	}

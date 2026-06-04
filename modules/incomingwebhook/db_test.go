@@ -48,15 +48,99 @@ func TestDisableByGroupNo(t *testing.T) {
 	assert.Equal(t, 1, mb.Status, "groupB webhook must stay enabled (no cross-group impact)")
 }
 
+// TestSoftDelete 验证软删除（#254）的 DB 层语义：deleteByWebhookID 把行标记为
+// statusDeleted 而非物理删除——记录仍可被 queryByWebhookID 解析（供历史消息渲染），
+// 但从 queryByGroupNo 列表隐藏。
+func TestSoftDelete(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer testutil.CleanAllTables(ctx)
+	d := newDB(ctx)
+
+	groupNo := "g_" + util.GenerUUID()[:12]
+	whID := mustInsertWebhook(t, d, groupNo)
+
+	assert.NoError(t, d.deleteByWebhookID(whID))
+
+	// 行仍在，status=statusDeleted（display datasource 据此仍能渲染发送者名/头像）。
+	m, err := d.queryByWebhookID(whID)
+	assert.NoError(t, err)
+	assert.NotNil(t, m, "soft-deleted row must remain for historical message rendering")
+	if m != nil {
+		assert.Equal(t, statusDeleted, m.Status)
+	}
+
+	// 管理列表隐藏已删除项。
+	list, err := d.queryByGroupNo(groupNo)
+	assert.NoError(t, err)
+	assert.Empty(t, list, "soft-deleted webhook must not appear in management list")
+}
+
+// TestSoftDelete_FreesQuota 验证软删除释放每群配额：填满配额后软删一个应能再建一个。
+func TestSoftDelete_FreesQuota(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer testutil.CleanAllTables(ctx)
+	d := newDB(ctx)
+
+	groupNo := "g_" + util.GenerUUID()[:12]
+	const max = 2
+
+	id1 := mustInsertWebhookWithMax(t, d, groupNo, max)
+	mustInsertWebhookWithMax(t, d, groupNo, max)
+
+	// 配额已满：第三个被拒。
+	over := &incomingWebhookModel{WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, Name: "wh", Status: statusEnabled}
+	assert.ErrorIs(t, d.insertWithQuota(over, max), ErrQuotaExceeded)
+
+	// 软删一个释放配额后可再建一个。
+	assert.NoError(t, d.deleteByWebhookID(id1))
+	again := &incomingWebhookModel{WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, Name: "wh", Status: statusEnabled}
+	assert.NoError(t, d.insertWithQuota(again, max), "soft-delete must free per-group quota")
+}
+
+// TestDisableByGroupNo_SkipsDeleted 验证群解散级联禁用不会"复活"已软删除的 webhook：
+// disableByGroupNo 把启用项翻为 statusDisabled，但必须跳过 statusDeleted 行（否则
+// status 2→0 会让它重新出现在列表、重新占配额）。
+func TestDisableByGroupNo_SkipsDeleted(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer testutil.CleanAllTables(ctx)
+	d := newDB(ctx)
+
+	groupNo := "g_" + util.GenerUUID()[:12]
+	enabledID := mustInsertWebhook(t, d, groupNo)
+	deletedID := mustInsertWebhook(t, d, groupNo)
+	assert.NoError(t, d.deleteByWebhookID(deletedID))
+
+	assert.NoError(t, d.disableByGroupNo(groupNo))
+
+	enabled, err := d.queryByWebhookID(enabledID)
+	assert.NoError(t, err)
+	assert.NotNil(t, enabled)
+	if enabled != nil {
+		assert.Equal(t, statusDisabled, enabled.Status, "enabled webhook must be disabled on disband")
+	}
+
+	deleted, err := d.queryByWebhookID(deletedID)
+	assert.NoError(t, err)
+	assert.NotNil(t, deleted)
+	if deleted != nil {
+		assert.Equal(t, statusDeleted, deleted.Status, "soft-deleted webhook must NOT be revived to disabled on disband")
+	}
+}
+
 func mustInsertWebhook(t *testing.T, d *incomingWebhookDB, groupNo string) string {
+	t.Helper()
+	return mustInsertWebhookWithMax(t, d, groupNo, 100)
+}
+
+func mustInsertWebhookWithMax(t *testing.T, d *incomingWebhookDB, groupNo string, max int) string {
 	t.Helper()
 	m := &incomingWebhookModel{
 		WebhookID: generateWebhookID(),
 		TokenHash: "h",
 		GroupNo:   groupNo,
 		Name:      "wh",
-		Status:    1,
+		Status:    statusEnabled,
 	}
-	assert.NoError(t, d.insertWithQuota(m, 100))
+	assert.NoError(t, d.insertWithQuota(m, max))
 	return m.WebhookID
 }

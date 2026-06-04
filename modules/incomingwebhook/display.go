@@ -76,8 +76,10 @@ func newWebhookChannelResp(m *incomingWebhookModel) *model.ChannelResp {
 
 // newChannelGetDatasource 构造 incomingwebhook 模块的 BussDataSource.ChannelGet：
 //   - 仅处理"单聊 + iwh_ 前缀"，其余一律返回 ErrDatasourceNotProcess 交还链路；
-//   - webhook 已删除（记录不存在）时同样返回 ErrDatasourceNotProcess，最终由上层
-//     优雅回落到"频道不存在/未知发送者"，不报 500。
+//   - 软删除（status=statusDeleted）后记录仍保留，且此处刻意不按 status 过滤，因此
+//     已删除 webhook 的历史消息仍能解析出真实发送者名/头像（#254，这正是软删除的目的）；
+//   - 仅当记录真正不存在（伪造或历史硬删除遗留的 iwh_）时返回 ErrDatasourceNotProcess，
+//     由上层优雅回落到"频道不存在/未知发送者"，不报 500。
 func newChannelGetDatasource(d *incomingWebhookDB) func(channelID string, channelType uint8, loginUID string) (*model.ChannelResp, error) {
 	return func(channelID string, channelType uint8, _ string) (*model.ChannelResp, error) {
 		if channelType != common.ChannelTypePerson.Uint8() || !isWebhookUID(channelID) {

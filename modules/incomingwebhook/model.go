@@ -5,6 +5,19 @@ import (
 	"github.com/gocraft/dbr/v2"
 )
 
+// incoming_webhook.status 取值。SQL 列为 SMALLINT，仅 0/1 由 init 迁移注释覆盖；
+// 2 是 #254 引入的软删除标记，复用同一列、无需迁移。
+//
+//   - statusEnabled  正常可推送（push 闸要求 status == statusEnabled）。
+//   - statusDisabled 管理员主动关停，或群解散级联禁用（handleGroupDisband）。
+//   - statusDeleted  软删除：保留行供历史消息渲染（display datasource 不按 status
+//     过滤），同时 push 自动失效、从管理列表隐藏、释放每群配额，且不可经 update 复活。
+const (
+	statusDisabled = 0
+	statusEnabled  = 1
+	statusDeleted  = 2
+)
+
 // incomingWebhookModel 对应 incoming_webhook 表。
 type incomingWebhookModel struct {
 	WebhookID  string
