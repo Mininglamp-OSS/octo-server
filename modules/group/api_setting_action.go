@@ -2,14 +2,14 @@ package group
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"runtime/debug"
-	"fmt"
 
-	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkevent"
+	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	"go.uber.org/zap"
 )
 
@@ -22,6 +22,8 @@ var (
 	errSettingInvalidValueType = errors.New("invalid value type")
 	// errSettingAllowExternalRange marks an out-of-range allow_external value (client 400).
 	errSettingAllowExternalRange = errors.New("allow_external only accepts 0 or 1")
+	// errSettingAllowNoMentionRange marks an out-of-range allow_no_mention value (client 400).
+	errSettingAllowNoMentionRange = errors.New("allow_no_mention only accepts 0 or 1")
 	// errGroupUpdateForbidden marks a non-manager/creator attempting a group-attr update (client 403).
 	errGroupUpdateForbidden = errors.New("没有权限！")
 )
@@ -391,8 +393,30 @@ var groupUpdateActionMap = map[string]groupUpdateActionFnc{
 		}
 		return ctx.commmitGroupUpdateEvent(GroupAttrKeyAllowExternal, fmt.Sprintf("%d", ctx.groupModel.AllowExternal))
 	},
+	GroupAttrKeyAllowNoMention: func(ctx *groupUpdateContext, value interface{}) error { // 群级是否允许免@生效
+		if err := ctx.checkPermissions(); err != nil {
+			return err
+		}
+		val, ok := safeIntFromFloat64(value)
+		if !ok {
+			return errSettingInvalidValueType
+		}
+		if val != 0 && val != 1 {
+			return errSettingAllowNoMentionRange
+		}
+		ctx.groupModel.AllowNoMention = val
+		if err := ctx.updateGroup(); err != nil {
+			return err
+		}
+		return ctx.commmitGroupUpdateEvent(GroupAttrKeyAllowNoMention, fmt.Sprintf("%d", ctx.groupModel.AllowNoMention))
+	},
 }
 
 // GroupAttrKeyAllowExternal 是否允许外部成员加入群的群属性 key。
 // 定义在本模块而非 dmwork-lib.common，因为这是 OCTO 扩展属性，未进入上游 lib。
 const GroupAttrKeyAllowExternal = "allow_external"
+
+// GroupAttrKeyAllowNoMention 群级「允许免@生效」总开关的群属性 key。群主/管理员可控，
+// 与 bot 主人的 bot_mention_pref 两轴 AND：最终免@ = bot主人开了本群免@ AND 群管理员允许本群免@。
+// 同为 OCTO 扩展属性，未进入上游 lib。
+const GroupAttrKeyAllowNoMention = "allow_no_mention"

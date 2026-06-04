@@ -2751,7 +2751,7 @@ func (g *Group) groupSettingUpdate(c *wkhttp.Context) {
 					httperr.ResponseErrorL(c, errcode.ErrGroupCreatorOrManagerOnly, nil, nil)
 					return
 				}
-				if errors.Is(err, errSettingInvalidValueType) || errors.Is(err, errSettingAllowExternalRange) {
+				if errors.Is(err, errSettingInvalidValueType) || errors.Is(err, errSettingAllowExternalRange) || errors.Is(err, errSettingAllowNoMentionRange) {
 					respondGroupRequestInvalid(c, key)
 					return
 				}

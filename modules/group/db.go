@@ -297,6 +297,7 @@ func (d *DB) Update(model *Model) error {
 		"allow_view_history_msg":      model.AllowViewHistoryMsg,
 		"allow_member_pinned_message": model.AllowMemberPinnedMessage,
 		"allow_external":              model.AllowExternal,
+		"allow_no_mention":            model.AllowNoMention,
 	}).Where("id=?", model.Id).Exec()
 	return err
 }
@@ -552,23 +553,24 @@ type DetailModel struct {
 
 // Model 群db model
 type Model struct {
-	GroupNo                  string // 群编号
-	GroupType                int    // 群类型 0.普通群 1.超大群
-	Name                     string // 群名称
-	Avatar                   string // 群头像
-	Notice                   string // 群公告
-	Creator                  string // 创建者uid
-	Status                   int    // 群状态
-	Version                  int64  // 版本号
-	Forbidden                int    // 是否全员禁言
-	Invite                   int    // 是否开启邀请确认 0.否 1.是
-	ForbiddenAddFriend       int    //群内禁止加好友
-	AllowViewHistoryMsg      int    // 是否允许新成员查看历史消息
+	GroupNo                  string     // 群编号
+	GroupType                int        // 群类型 0.普通群 1.超大群
+	Name                     string     // 群名称
+	Avatar                   string     // 群头像
+	Notice                   string     // 群公告
+	Creator                  string     // 创建者uid
+	Status                   int        // 群状态
+	Version                  int64      // 版本号
+	Forbidden                int        // 是否全员禁言
+	Invite                   int        // 是否开启邀请确认 0.否 1.是
+	ForbiddenAddFriend       int        //群内禁止加好友
+	AllowViewHistoryMsg      int        // 是否允许新成员查看历史消息
 	AllowMemberPinnedMessage int        // 是否允许群成员置顶消息
 	Category                 string     // 群分类
 	SpaceID                  string     // Space ID
 	IsExternalGroup          int        // 外部群 0.否 1.是（自动维护）
 	AllowExternal            int        // 是否允许外部成员加入 1.允许(默认) 0.禁止
+	AllowNoMention           int        // 群级是否允许免@生效 1.允许(默认) 0.禁止（bot 在本群必须被@）
 	GroupMd                  *string    // GROUP.md content
 	GroupMdVersion           int64      // GROUP.md version
 	GroupMdUpdatedAt         *time.Time // GROUP.md last update time

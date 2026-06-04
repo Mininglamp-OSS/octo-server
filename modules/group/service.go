@@ -170,9 +170,10 @@ func (s *Service) GetCreatedCountWithDate(date string) (int64, error) {
 // AddGroup 添加一个群
 func (s *Service) AddGroup(model *AddGroupReq) error {
 	err := s.db.Insert(&Model{
-		GroupNo:       model.GroupNo,
-		Name:          model.Name,
-		AllowExternal: 1, // 向后兼容：默认允许外部成员
+		GroupNo:        model.GroupNo,
+		Name:           model.Name,
+		AllowExternal:  1, // 向后兼容：默认允许外部成员
+		AllowNoMention: 1, // 向后兼容：默认允许群级免@
 	})
 	return err
 }
@@ -644,6 +645,7 @@ type InfoResp struct {
 	SpaceID             string    `json:"space_id"`          // Space ID
 	IsExternalGroup     int       `json:"is_external_group"` // 是否外部群
 	AllowExternal       int       `json:"allow_external"`    // 是否允许外部成员 1.允许(默认) 0.禁止
+	AllowNoMention      int       `json:"allow_no_mention"`  // 群级是否允许免@生效 1.允许(默认) 0.禁止
 }
 
 func toInfoResp(m *Model) *InfoResp {
@@ -664,6 +666,7 @@ func toInfoResp(m *Model) *InfoResp {
 		SpaceID:             m.SpaceID,
 		IsExternalGroup:     m.IsExternalGroup,
 		AllowExternal:       m.AllowExternal,
+		AllowNoMention:      m.AllowNoMention,
 	}
 }
 
@@ -771,6 +774,7 @@ type GroupResp struct {
 	SpaceID                  string    `json:"space_id"`                    // Space ID
 	IsExternalGroup          int       `json:"is_external_group"`           // 是否外部群 0.否 1.是
 	AllowExternal            int       `json:"allow_external"`              // 是否允许外部成员 1.允许(默认) 0.禁止
+	AllowNoMention           int       `json:"allow_no_mention"`            // 群级是否允许免@生效 1.允许(默认) 0.禁止
 	CreatedAt                string    `json:"created_at"`
 	UpdatedAt                string    `json:"updated_at"`
 	Version                  int64     `json:"version"` // 群数据版本
@@ -805,6 +809,7 @@ func (g *GroupResp) from(model *DetailModel) *GroupResp {
 		SpaceID:                  model.SpaceID,
 		IsExternalGroup:          model.IsExternalGroup,
 		AllowExternal:            model.AllowExternal,
+		AllowNoMention:           model.AllowNoMention,
 		HasGroupMd:               model.GroupMd != nil && *model.GroupMd != "",
 		GroupMdVersion:           model.GroupMdVersion,
 		CreatedAt:                model.CreatedAt.String(),
@@ -833,6 +838,7 @@ func (g *GroupResp) fromModel(model *Model) *GroupResp {
 		SpaceID:                  model.SpaceID,
 		IsExternalGroup:          model.IsExternalGroup,
 		AllowExternal:            model.AllowExternal,
+		AllowNoMention:           model.AllowNoMention,
 		HasGroupMd:               model.GroupMd != nil && *model.GroupMd != "",
 		GroupMdVersion:           model.GroupMdVersion,
 		CreatedAt:                model.CreatedAt.String(),
@@ -1082,6 +1088,7 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 		AllowViewHistoryMsg: int(common.GroupAllowViewHistoryMsgEnabled),
 		SpaceID:             req.SpaceID,
 		AllowExternal:       1, // 向后兼容：默认允许外部成员
+		AllowNoMention:      1, // 向后兼容：默认允许群级免@
 		IsExternalGroup:     isExternalGroup,
 	}, tx)
 	if err != nil {

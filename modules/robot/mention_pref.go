@@ -251,7 +251,9 @@ func buildMentionPrefPayload(robotID, groupNo string, noMention int) map[string]
 }
 
 // getMentionPref 处理 GET /v1/robot/:robot_id/groups/:group_no/mention_pref。
-// 返回 {"no_mention":0|1}，无记录返回 0。
+// 返回 {"no_mention":0|1, "group_allow_no_mention":0|1}，bot 主人 UI 据此能显示
+// 「我开了但群主关了」的状态。bot_mention_pref 无记录 → no_mention=0；group 无记录
+// 或 allow_no_mention 缺省 → group_allow_no_mention=1（默认允许，零回归）。
 func (rb *Robot) getMentionPref(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	robotID := c.Param("robot_id")
@@ -271,24 +273,44 @@ func (rb *Robot) getMentionPref(c *wkhttp.Context) {
 		c.ResponseError(errors.New("查询失败"))
 		return
 	}
-	c.Response(map[string]interface{}{"no_mention": noMention})
+
+	groupAllow := 1
+	err = rb.ctx.DB().Select("allow_no_mention").From("`group`").
+		Where("group_no=?", groupNo).LoadOne(&groupAllow)
+	if err != nil {
+		if errors.Is(err, dbr.ErrNotFound) {
+			groupAllow = 1
+		} else {
+			rb.Error("查询 group.allow_no_mention 失败", zap.Error(err),
+				zap.String("robot_id", robotID), zap.String("group_no", groupNo))
+			c.ResponseError(errors.New("查询失败"))
+			return
+		}
+	}
+
+	c.Response(map[string]interface{}{
+		"no_mention":             noMention,
+		"group_allow_no_mention": groupAllow,
+	})
 }
 
 // groupScanRow is the raw DB row for listGroups. no_mention scans as int
 // (TINYINT); database/sql does not reliably convert the driver int into a Go
 // bool, so we scan int here and project to bool in groupListItem.
 type groupScanRow struct {
-	ID        int64  `db:"id"`
-	GroupNo   string `db:"group_no"`
-	Name      string `db:"name"`
-	NoMention int    `db:"no_mention"`
+	ID                  int64  `db:"id"`
+	GroupNo             string `db:"group_no"`
+	Name                string `db:"name"`
+	NoMention           int    `db:"no_mention"`
+	GroupAllowNoMention int    `db:"group_allow_no_mention"`
 }
 
 // groupListItem 列群响应单项。
 type groupListItem struct {
-	GroupNo   string `json:"group_no"`
-	Name      string `json:"name"`
-	NoMention bool   `json:"no_mention"`
+	GroupNo             string `json:"group_no"`
+	Name                string `json:"name"`
+	NoMention           bool   `json:"no_mention"`
+	GroupAllowNoMention bool   `json:"group_allow_no_mention"`
 }
 
 // listGroups 处理 GET /v1/robot/:robot_id/groups?limit=30&cursor=<opaque>&q=<可选>。
@@ -311,7 +333,8 @@ func (rb *Robot) listGroups(c *wkhttp.Context) {
 
 	// 多取 1 行判断 has_more。按 gm.id 升序稳定分页。
 	sql := "SELECT gm.id AS id, gm.group_no AS group_no, IFNULL(g.name,'') AS name, " +
-		"IFNULL(p.no_mention,0) AS no_mention " +
+		"IFNULL(p.no_mention,0) AS no_mention, " +
+		"IFNULL(g.allow_no_mention,1) AS group_allow_no_mention " +
 		"FROM group_member gm " +
 		"INNER JOIN `group` g ON gm.group_no = g.group_no " +
 		"LEFT JOIN bot_mention_pref p ON p.robot_id = gm.uid AND p.group_no = gm.group_no " +
@@ -345,9 +368,10 @@ func (rb *Robot) listGroups(c *wkhttp.Context) {
 	list := make([]groupListItem, 0, len(rows))
 	for _, r := range rows {
 		list = append(list, groupListItem{
-			GroupNo:   r.GroupNo,
-			Name:      r.Name,
-			NoMention: r.NoMention == 1,
+			GroupNo:             r.GroupNo,
+			Name:                r.Name,
+			NoMention:           r.NoMention == 1,
+			GroupAllowNoMention: r.GroupAllowNoMention == 1,
 		})
 	}
 

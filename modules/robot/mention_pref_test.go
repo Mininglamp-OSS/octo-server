@@ -1,9 +1,14 @@
 package robot
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -96,4 +101,102 @@ func TestBuildMentionPrefPayload(t *testing.T) {
 		assert.True(t, ok, "mention must be a map")
 		assert.Equal(t, []string{"bot_42"}, mention["uids"])
 	}
+}
+
+// owner-scoped endpoints authenticate via the user-session token (testutil.UID
+// == "10000") and gate on robot.creator_uid == loginUID. These constants wire a
+// bot owned by the test caller into one group carrying allow_no_mention.
+const (
+	ownerListRobotID = "bot_owner_list"
+	ownerListGroupNo = "g_owner_list"
+)
+
+// setupOwnerMentionList builds a real Robot module on a clean DB with a bot
+// owned by testutil.UID that is a member of one group, and seeds that group's
+// allow_no_mention. Returns the router so owner endpoints can be exercised.
+func setupOwnerMentionList(t *testing.T, groupAllowNoMention, ownerNoMention int) http.Handler {
+	t.Helper()
+	s, ctx := testutil.NewTestServer()
+	assert.NoError(t, testutil.CleanAllTables(ctx))
+
+	// Bot owned by the test caller (creator_uid = testutil.UID) so assertRobotOwner passes.
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO robot (robot_id, status, creator_uid) VALUES (?, 1, ?)",
+		ownerListRobotID, testutil.UID,
+	).Exec()
+	assert.NoError(t, err)
+
+	// Group row carrying allow_no_mention.
+	_, err = ctx.DB().InsertBySql(
+		"INSERT INTO `group` (group_no, name, status, version, allow_no_mention) VALUES (?, ?, 0, 1, ?)",
+		ownerListGroupNo, "owner list group", groupAllowNoMention,
+	).Exec()
+	assert.NoError(t, err)
+
+	// Bot is a non-deleted member of the group.
+	_, err = ctx.DB().InsertBySql(
+		"INSERT INTO group_member (group_no, uid, vercode, is_deleted, status, version) VALUES (?, ?, ?, 0, 1, 1)",
+		ownerListGroupNo, ownerListRobotID, util.GenerUUID(),
+	).Exec()
+	assert.NoError(t, err)
+
+	if ownerNoMention != 0 {
+		_, err = ctx.DB().InsertBySql(
+			"INSERT INTO bot_mention_pref (robot_id, group_no, no_mention) VALUES (?, ?, ?)",
+			ownerListRobotID, ownerListGroupNo, ownerNoMention,
+		).Exec()
+		assert.NoError(t, err)
+	}
+
+	return s.GetRoute()
+}
+
+// TestListGroups_CarriesGroupAllowNoMention pins that the owner list endpoint
+// surfaces the group-level switch (group_allow_no_mention) alongside no_mention,
+// so the bot owner UI can show the "I enabled it but the group owner disabled
+// it" state (YUJ-2996).
+func TestListGroups_CarriesGroupAllowNoMention(t *testing.T) {
+	handler := setupOwnerMentionList(t, 0 /* group blocks */, 1 /* owner enabled */)
+
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("GET", "/v1/robot/"+ownerListRobotID+"/groups", nil)
+	assert.NoError(t, err)
+	req.Header.Set("token", token)
+	handler.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
+
+	var resp struct {
+		List []struct {
+			GroupNo             string `json:"group_no"`
+			NoMention           bool   `json:"no_mention"`
+			GroupAllowNoMention bool   `json:"group_allow_no_mention"`
+		} `json:"list"`
+	}
+	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Len(t, resp.List, 1)
+	assert.Equal(t, ownerListGroupNo, resp.List[0].GroupNo)
+	assert.True(t, resp.List[0].NoMention, "owner enabled → no_mention=true")
+	assert.False(t, resp.List[0].GroupAllowNoMention, "group blocked → group_allow_no_mention=false")
+}
+
+// TestGetMentionPref_OwnerCarriesGroupAllow pins the owner single-group read
+// returns both no_mention and group_allow_no_mention, and that a missing group
+// row falls back to allow=1 (zero regression).
+func TestGetMentionPref_OwnerCarriesGroupAllow(t *testing.T) {
+	handler := setupOwnerMentionList(t, 0 /* group blocks */, 1 /* owner enabled */)
+
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("GET", "/v1/robot/"+ownerListRobotID+"/groups/"+ownerListGroupNo+"/mention_pref", nil)
+	assert.NoError(t, err)
+	req.Header.Set("token", token)
+	handler.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
+
+	var resp struct {
+		NoMention           int `json:"no_mention"`
+		GroupAllowNoMention int `json:"group_allow_no_mention"`
+	}
+	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, 1, resp.NoMention)
+	assert.Equal(t, 0, resp.GroupAllowNoMention)
 }
