@@ -1,7 +1,9 @@
 package incomingwebhook
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
@@ -124,6 +126,81 @@ func TestDisableByGroupNo_SkipsDeleted(t *testing.T) {
 	assert.NotNil(t, deleted)
 	if deleted != nil {
 		assert.Equal(t, statusDeleted, deleted.Status, "soft-deleted webhook must NOT be revived to disabled on disband")
+	}
+}
+
+// TestUpdateFields_SkipsDeleted 锁定并发复活漏洞的根因防线（#254 follow-up）：
+// queryManageable 是非事务读，与 updateFields 之间有 TOCTOU 窗口——PUT 先通过校验，
+// 随后并发 DELETE 把行软删，最后 PUT 的 updateFields 把 status 写回 1 即"复活"已删除
+// webhook（重回列表 + 旧 token 复活）。updateFields 必须带 status != statusDeleted
+// 守卫，对已删除行的写入一律落空。这里直接对一个已软删除的行调 updateFields，断言
+// status / 业务字段都【不】被写入。
+func TestUpdateFields_SkipsDeleted(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer testutil.CleanAllTables(ctx)
+	d := newDB(ctx)
+
+	groupNo := "g_" + util.GenerUUID()[:12]
+	whID := mustInsertWebhook(t, d, groupNo)
+	assert.NoError(t, d.deleteByWebhookID(whID)) // status -> statusDeleted
+
+	// 模拟竞态尾部：对已删除行尝试 PUT status=1 + 改名。
+	assert.NoError(t, d.updateFields(whID, map[string]interface{}{
+		"status": statusEnabled,
+		"name":   "revived",
+	}))
+
+	m, err := d.queryByWebhookID(whID)
+	assert.NoError(t, err)
+	assert.NotNil(t, m)
+	if m != nil {
+		assert.Equal(t, statusDeleted, m.Status, "soft-deleted webhook must NOT be revived by a racing updateFields")
+		assert.NotEqual(t, "revived", m.Name, "soft-deleted webhook business fields must not be writable")
+	}
+}
+
+// TestUpdateFields_TokenHash_SkipsDeleted 覆盖 regenerate 路径：不得给已删除 webhook
+// 轮换 token_hash（否则会向调用方返回一个"看似有效"实则指向已删除行的新 token）。
+func TestUpdateFields_TokenHash_SkipsDeleted(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer testutil.CleanAllTables(ctx)
+	d := newDB(ctx)
+
+	groupNo := "g_" + util.GenerUUID()[:12]
+	whID := mustInsertWebhook(t, d, groupNo)
+	before, err := d.queryByWebhookID(whID)
+	assert.NoError(t, err)
+	assert.NotNil(t, before)
+	assert.NoError(t, d.deleteByWebhookID(whID))
+
+	assert.NoError(t, d.updateFields(whID, map[string]interface{}{"token_hash": "newhash"}))
+
+	after, err := d.queryByWebhookID(whID)
+	assert.NoError(t, err)
+	assert.NotNil(t, after)
+	if after != nil && before != nil {
+		assert.Equal(t, before.TokenHash, after.TokenHash, "token_hash of a soft-deleted webhook must not be rotated")
+	}
+}
+
+// TestMarkUsed_SkipsDeleted 锁定纵深防御一致性：push 成功后的异步审计若在行被并发软
+// 删除后才执行，markUsed 不得再给已删除 webhook 记账（call_count 不增）。
+func TestMarkUsed_SkipsDeleted(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer testutil.CleanAllTables(ctx)
+	d := newDB(ctx)
+
+	groupNo := "g_" + util.GenerUUID()[:12]
+	whID := mustInsertWebhook(t, d, groupNo)
+	assert.NoError(t, d.deleteByWebhookID(whID))
+
+	assert.NoError(t, d.markUsed(context.Background(), whID, time.Now()))
+
+	m, err := d.queryByWebhookID(whID)
+	assert.NoError(t, err)
+	assert.NotNil(t, m)
+	if m != nil {
+		assert.Equal(t, int64(0), m.CallCount, "markUsed must not bump a soft-deleted webhook")
 	}
 }
 

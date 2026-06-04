@@ -458,8 +458,17 @@ func (w *IncomingWebhook) update(c *wkhttp.Context) {
 	}
 	updated, qErr := w.db.queryByWebhookID(webhookID)
 	if qErr != nil || updated == nil {
-		// 更新已成功落库，但回读失败/为空时返回更新前数据，不阻塞客户端。
-		c.Response(toResp(m))
+		// 回读失败/行消失：无法确认更新结果（可能已落库，也可能因并发软删除而落空），
+		// 不返回可能失真的更新前快照，按 5xx 交客户端重试，不谎报成功。
+		w.Error("re-read after update failed", zap.Error(qErr))
+		mgmtOperationFailed(c)
+		return
+	}
+	// 并发软删除竞态：updateFields 的 status != statusDeleted 守卫保证不会把已删除行的
+	// 字段写回（杜绝复活）。若回读到 statusDeleted，说明本次 update 与 DELETE 并发且
+	// DELETE 胜出——按 not-found 返回，与"删除即不可再操作"一致。
+	if updated.Status == statusDeleted {
+		mgmtNotFound(c)
 		return
 	}
 	c.Response(toResp(updated))
@@ -499,8 +508,7 @@ func (w *IncomingWebhook) regenerate(c *wkhttp.Context) {
 		mgmtGroupNotFound(c)
 		return
 	}
-	m, ok := w.queryManageable(c, groupNo, webhookID)
-	if !ok {
+	if _, ok := w.queryManageable(c, groupNo, webhookID); !ok {
 		return
 	}
 	token, hash, err := generateToken()
@@ -514,9 +522,23 @@ func (w *IncomingWebhook) regenerate(c *wkhttp.Context) {
 		mgmtOperationFailed(c)
 		return
 	}
-	m.TokenHash = hash
+	// 并发软删除竞态：updateFields 的 status != statusDeleted 守卫保证不会给已删除的
+	// webhook 写新 token_hash。回读确认行仍存活，避免向客户端返回一个实际未落库、
+	// 指向已删除行的"新 token"。
+	updated, qErr := w.db.queryByWebhookID(webhookID)
+	if qErr != nil || updated == nil {
+		// 回读失败/行消失：token 是否落库无法确认，按 5xx 让客户端重试，不误报 404。
+		w.Error("re-read after regenerate failed", zap.Error(qErr))
+		mgmtOperationFailed(c)
+		return
+	}
+	if updated.Status == statusDeleted {
+		// 与并发 DELETE 竞争且 DELETE 胜出：token_hash 未写入已删除行，按 not-found。
+		mgmtNotFound(c)
+		return
+	}
 	c.Response(createResp{
-		webhookResp: toResp(m),
+		webhookResp: toResp(updated),
 		Token:       token,
 		URL:         publicURL(webhookID, token),
 	})

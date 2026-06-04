@@ -274,6 +274,49 @@ func TestDelete_PushFails(t *testing.T) {
 	assert.Equalf(t, http.StatusUnauthorized, w.Code, "push with deleted webhook token must 401: %s", w.Body.String())
 }
 
+// TestDelete_ConcurrentUpdate_NoRevive 端到端回归 TOCTOU 复活漏洞（#254 follow-up）：
+// DELETE 与多个 PUT status=1 并发时，删除必须最终生效——webhook 不得复活进列表，原
+// token 不得再推送。修复后此性质与调度无关恒成立（条件 updateFields 永不写已删除行），
+// 故为稳定断言；修复前命中竞态窗口时会失败。配合 -race 一并探测数据竞争。
+func TestDelete_ConcurrentUpdate_NoRevive(t *testing.T) {
+	handler, _, groupNo := setupTestEnv(t)
+	w := do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), map[string]interface{}{
+		"name": "x",
+	}))
+	assert.Equal(t, http.StatusOK, w.Code)
+	created := parseJSON(t, w)
+	whID := created["webhook_id"].(string)
+	token := created["token"].(string)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		do(handler, authReq("DELETE", fmt.Sprintf("/v1/groups/%s/incoming-webhooks/%s", groupNo, whID), nil))
+	}()
+	statusOne := 1
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			do(handler, authReq("PUT", fmt.Sprintf("/v1/groups/%s/incoming-webhooks/%s", groupNo, whID),
+				map[string]interface{}{"status": statusOne}))
+		}()
+	}
+	wg.Wait()
+
+	// 删除必须最终生效：列表不含该 webhook。
+	w = do(handler, authReq("GET", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), nil))
+	res := parseJSON(t, w)
+	list, _ := res["list"].([]interface{})
+	assert.Emptyf(t, list, "deleted webhook must not be revived into the management list; list=%v", list)
+
+	// 原 token 必须保持失效。
+	body, _ := json.Marshal(pushReq{Content: "hi"})
+	w = do(handler, anonReq("POST", fmt.Sprintf("/v1/incoming-webhooks/%s/%s", whID, token), body))
+	assert.Equalf(t, http.StatusUnauthorized, w.Code, "deleted webhook token must stay revoked, body=%s", w.Body.String())
+}
+
 func TestRegenerate_RotatesToken(t *testing.T) {
 	handler, _, groupNo := setupTestEnv(t)
 	w := do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), map[string]interface{}{

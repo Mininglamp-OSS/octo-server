@@ -103,6 +103,12 @@ var updateFieldsAllowed = map[string]struct{}{
 	"token_hash": {},
 }
 
+// updateFields 更新单个 webhook 的允许列。带 status != statusDeleted 守卫：对已软删除
+// 的行一律不写入——这是并发复活漏洞的根因防线。queryManageable（非事务读）与本次写入
+// 之间有 TOCTOU 窗口，若期间被并发 DELETE 软删，无守卫的写会把 status / token_hash
+// 写回，令已删除 webhook 复活（重回列表 + 旧 token 可推送）。InnoDB 行锁让该条件 UPDATE
+// 与并发 DELETE 的 UPDATE 串行化，保证"一旦删除，任何后续写都落空"。调用方应回读确认
+// 行未被软删除（见 api 层 update / regenerate）。
 func (d *incomingWebhookDB) updateFields(webhookID string, fields map[string]interface{}) error {
 	if len(fields) == 0 {
 		return nil
@@ -114,7 +120,8 @@ func (d *incomingWebhookDB) updateFields(webhookID string, fields map[string]int
 	}
 	_, err := d.session.Update("incoming_webhook").
 		SetMap(fields).
-		Where("webhook_id=?", webhookID).Exec()
+		Where("webhook_id=?", webhookID).
+		Where("status != ?", statusDeleted).Exec()
 	return err
 }
 
@@ -123,20 +130,24 @@ func (d *incomingWebhookDB) updateFields(webhookID string, fields map[string]int
 // 过滤）。push 闸（status != statusEnabled）随之自动失效，列表/配额按 status !=
 // statusDeleted 排除，且 update 不再允许复活已删除行。调用方应先确认目标行存在且
 // 未删除（api 层在 query 后判 statusDeleted 返回 not-found）。
+// status != statusDeleted 守卫使重复软删除幂等：并发两次 DELETE，第二次落空。
 func (d *incomingWebhookDB) deleteByWebhookID(webhookID string) error {
 	_, err := d.session.Update("incoming_webhook").
 		Set("status", statusDeleted).
-		Where("webhook_id=?", webhookID).Exec()
+		Where("webhook_id=?", webhookID).
+		Where("status != ?", statusDeleted).Exec()
 	return err
 }
 
 // markUsed 累加调用计数并刷新 last_used_at；非关键路径，调用方应忽略错误（最多记日志）。
 // 走 ExecContext：审计在 push 路径的同步兜底分支下跑在请求 goroutine 上，必须受 ctx
 // 超时约束，否则 DB 饱和变慢会无限拖住 push 响应。
+// status != statusDeleted 守卫：与其它写路径一致，异步审计执行时行若已被并发软删除，
+// 不再给已删除 webhook 记账（不影响安全，仅保持纵深防御的一致性）。
 func (d *incomingWebhookDB) markUsed(ctx context.Context, webhookID string, now time.Time) error {
 	_, err := d.session.UpdateBySql(
-		"UPDATE incoming_webhook SET call_count = call_count + 1, last_used_at = ? WHERE webhook_id = ?",
-		now, webhookID,
+		"UPDATE incoming_webhook SET call_count = call_count + 1, last_used_at = ? WHERE webhook_id = ? AND status != ?",
+		now, webhookID, statusDeleted,
 	).ExecContext(ctx)
 	return err
 }
