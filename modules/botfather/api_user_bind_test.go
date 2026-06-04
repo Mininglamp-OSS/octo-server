@@ -145,7 +145,8 @@ func TestBindUserBot_Lifecycle(t *testing.T) {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	assert.Equal(t, botID, resp.RobotID)
 	assert.Equal(t, "octopush:agent_A", resp.BoundAgentRef)
-	assert.NotEmpty(t, resp.BoundAt)
+	require.NotNil(t, resp.BoundAt)
+	assert.NotEmpty(t, *resp.BoundAt)
 
 	// 2) Re-bind with the SAME agent_ref is idempotent (200).
 	w = httptest.NewRecorder()

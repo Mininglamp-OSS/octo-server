@@ -6,15 +6,16 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
+	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
-	"github.com/Mininglamp-OSS/octo-lib/common"
-	"github.com/Mininglamp-OSS/octo-lib/config"
-	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
-	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 )
@@ -48,15 +49,29 @@ func (bf *BotFather) authUserAPIKey() wkhttp.HandlerFunc {
 		}
 		if keyModel == nil {
 			// key 不存在或非 active（AuthByKey 已按 status=1 过滤）→ 统一 401。
-			// 注意：当前 PR 尚无生产路径把 key 置为 revoked（status=0）；status=1
-			// 过滤是为 PR2 的 DELETE /v1/integrations/oidc/binding 撤销能力预留的
-			// 前瞻防御，届时撤销的 key 会在此被拒为 401。
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "无效的API Key"})
 			return
 		}
+		if keyModel.ClientID != clientIDBotFather {
+			enabled, err := bf.db.isIntegrationClientEnabled(keyModel.ClientID)
+			if err != nil {
+				bf.Error("查询 integration client 状态失败", zap.String("client_id", keyModel.ClientID), zap.Error(err))
+				httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedInternal, nil, nil)
+				c.Abort()
+				return
+			}
+			if !enabled {
+				httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedTokenInvalid, nil, nil)
+				c.Abort()
+				return
+			}
+		}
 
+		c.Set("uid", keyModel.UID)
 		c.Set("api_key_uid", keyModel.UID)
 		c.Set("api_key_space_id", keyModel.SpaceID)
+		c.Set("api_key_id", keyModel.ID)
+		c.Set("api_key_client_id", keyModel.ClientID)
 		c.Next()
 	}
 }
@@ -95,7 +110,7 @@ func (bf *BotFather) isBotInSpace(botID, spaceID string) (bool, error) {
 
 // setupUserAPIRoutes 注册 User API Key 认证的路由
 func (bf *BotFather) setupUserAPIRoutes(r *wkhttp.WKHttp) {
-	userAPI := r.Group("/v1/user", bf.authUserAPIKey())
+	userAPI := r.Group("/v1/user", bf.authUserAPIKey(), appwkhttp.SharedUIDRateLimiter(r, bf.ctx))
 	{
 		userAPI.POST("/bots", bf.createUserBot)
 		userAPI.GET("/bots", bf.listUserBots)
@@ -288,16 +303,32 @@ func (bf *BotFather) listUserBots(c *wkhttp.Context) {
 		return
 	}
 
+	usernames := make([]string, 0, len(bots))
+	seenUsername := make(map[string]struct{}, len(bots))
+	for _, bot := range bots {
+		if bot.Username == "" {
+			continue
+		}
+		if _, ok := seenUsername[bot.Username]; ok {
+			continue
+		}
+		seenUsername[bot.Username] = struct{}{}
+		usernames = append(usernames, bot.Username)
+	}
+	nameByUsername, err := bf.db.queryUserNamesByUsernames(usernames)
+	if err != nil {
+		bf.Warn("批量查询Bot用户名失败，使用username兜底", zap.Error(err))
+		nameByUsername = map[string]string{}
+	}
+
 	list := make([]*UserBotResp, 0, len(bots))
 	for _, bot := range bots {
 		if bot.Status != 1 {
 			continue
 		}
-		// Get display name from user table
 		name := bot.Username
-		userResp, _ := bf.userService.GetUserWithUsername(bot.Username)
-		if userResp != nil {
-			name = userResp.Name
+		if displayName := nameByUsername[bot.Username]; displayName != "" {
+			name = displayName
 		}
 		var boundAt *string
 		if bot.BoundAt.Valid {
@@ -581,9 +612,10 @@ func (bf *BotFather) bindUserBot(c *wkhttp.Context) {
 		// 并发 unbind 污染成「已释放」的陈旧视图）。直接按 agentRef 回包；bound_at
 		// best-effort 回读。
 		if affected == 1 {
-			boundAt := ""
+			var boundAt *string
 			if cur, rErr := bf.db.queryRobotByRobotIDAndCreator(botID, uid); rErr == nil && cur != nil && cur.BoundAt.Valid {
-				boundAt = cur.BoundAt.Time.Format(botBoundAtFormat)
+				s := cur.BoundAt.Time.Format(botBoundAtFormat)
+				boundAt = &s
 			}
 			c.Response(&BindBotResp{RobotID: botID, BoundAgentRef: agentRef, BoundAt: boundAt})
 			return
@@ -604,9 +636,10 @@ func (bf *BotFather) bindUserBot(c *wkhttp.Context) {
 			return
 		case current.BoundAgentRef == agentRef:
 			// 已是自己持有（幂等成功）。
-			boundAt := ""
+			var boundAt *string
 			if current.BoundAt.Valid {
-				boundAt = current.BoundAt.Time.Format(botBoundAtFormat)
+				s := current.BoundAt.Time.Format(botBoundAtFormat)
+				boundAt = &s
 			}
 			c.Response(&BindBotResp{RobotID: botID, BoundAgentRef: current.BoundAgentRef, BoundAt: boundAt})
 			return

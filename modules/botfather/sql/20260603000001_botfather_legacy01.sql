@@ -99,21 +99,23 @@ DROP PROCEDURE IF EXISTS __botfather_user_api_key_clientdim_down;
 -- +migrate StatementBegin
 CREATE PROCEDURE __botfather_user_api_key_clientdim_down()
 BEGIN
+  -- 回滚到 (uid, space_id) 唯一键前必须确认没有 integration client 数据。
+  -- 一旦特性被使用过，同一 uid+space 下可能存在多个 client 的 key，直接重建旧
+  -- 唯一键会因重复 (uid, space_id) 撞键失败；静默 DELETE 又会不可恢复地删除
+  -- 已签发的 integration uk_。因此这里 loud abort，由人工 runbook 决定迁移或
+  -- 撤销这些 key 后再回滚。
+  IF EXISTS (SELECT 1 FROM information_schema.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_api_key'
+         AND COLUMN_NAME = 'client_id')
+     AND EXISTS (SELECT 1 FROM `user_api_key` WHERE `client_id` <> 'botfather') THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'rollback blocked: non-botfather user_api_key rows exist';
+  END IF;
+
   IF EXISTS (SELECT 1 FROM information_schema.STATISTICS
        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_api_key'
          AND INDEX_NAME = 'uk_uid_space_client') THEN
     ALTER TABLE `user_api_key` DROP INDEX `uk_uid_space_client`;
-  END IF;
-
-  -- 回滚到 (uid, space_id) 唯一键前，先清掉本特性引入的非 botfather client 行：
-  -- 一旦特性被使用过，同一 uid+space 下可能存在多个 client 的 key，直接重建旧
-  -- 唯一键会因重复 (uid, space_id) 撞键失败。删除这些行后 botfather 自有行在
-  -- (uid, space_id) 上仍唯一（旧唯一键时代即如此），重建安全。回滚即移除本特性，
-  -- 删其数据符合语义。client_id 列仍在时才执行（列已不在说明已回滚过）。
-  IF EXISTS (SELECT 1 FROM information_schema.COLUMNS
-       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_api_key'
-         AND COLUMN_NAME = 'client_id') THEN
-    DELETE FROM `user_api_key` WHERE `client_id` <> 'botfather';
   END IF;
 
   IF NOT EXISTS (SELECT 1 FROM information_schema.STATISTICS

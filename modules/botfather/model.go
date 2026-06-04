@@ -87,15 +87,15 @@ type RobotApplySureReq struct {
 
 // RobotApplyResp 申请记录响应
 type RobotApplyResp struct {
-	ID           int64  `json:"id"`
-	UID          string `json:"uid"`
-	RobotUID     string `json:"robot_uid"`
-	RobotName    string `json:"robot_name"`
+	ID            int64  `json:"id"`
+	UID           string `json:"uid"`
+	RobotUID      string `json:"robot_uid"`
+	RobotName     string `json:"robot_name"`
 	ApplicantName string `json:"applicant_name"`
-	OwnerUID     string `json:"owner_uid"`
-	Remark       string `json:"remark"`
-	Status       int    `json:"status"`
-	CreatedAt    string `json:"created_at"`
+	OwnerUID      string `json:"owner_uid"`
+	Remark        string `json:"remark"`
+	Status        int    `json:"status"`
+	CreatedAt     string `json:"created_at"`
 }
 
 // RobotApplyListResp 申请列表响应
@@ -106,13 +106,15 @@ type RobotApplyListResp struct {
 
 // userAPIKeyModel 用户API Key模型
 type userAPIKeyModel struct {
-	ID        int64  `json:"id"`
-	UID       string `json:"uid"`
-	APIKey    string `json:"api_key"`
-	SpaceID   string `json:"space_id"`
-	ClientID  string `json:"client_id"`
-	Status    int    `json:"status"`
-	CreatedAt string `json:"created_at"`
+	ID           int64  `json:"id"`
+	UID          string `json:"uid"`
+	APIKey       string `json:"api_key"`
+	APIKeyHash   string `json:"api_key_hash"`
+	APIKeyCipher string `json:"api_key_cipher"`
+	SpaceID      string `json:"space_id"`
+	ClientID     string `json:"client_id"`
+	Status       int    `json:"status"`
+	CreatedAt    string `json:"created_at"`
 }
 
 // CreateBotReq 通过API Key创建Bot请求
@@ -150,16 +152,16 @@ type UserBotResp struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
 	// BotToken 出于安全在列表里恒为空串（不批量泄露 `bf_`）；取 token 走单端点。
-	BotToken    string `json:"bot_token"`
-	CreatedAt   string `json:"created_at"`
+	BotToken  string `json:"bot_token"`
+	CreatedAt string `json:"created_at"`
 	// BoundAgentRef 占用方不透明标签（如 octopush:agent_xxx）；空=空闲。
 	BoundAgentRef string `json:"bound_agent_ref"`
 	// BoundAt 占用时间（timeFormart）；未占用时为 null（*string，与 doc 的
 	// string|null 及 unbind 的显式 null 对齐——不用 omitempty 省略字段）。
 	BoundAt       *string `json:"bound_at"`
 	AgentPlatform string  `json:"agent_platform,omitempty"`
-	AgentVersion  string `json:"agent_version,omitempty"`
-	PluginVersion string `json:"plugin_version,omitempty"`
+	AgentVersion  string  `json:"agent_version,omitempty"`
+	PluginVersion string  `json:"plugin_version,omitempty"`
 }
 
 // BindBotReq 占用（绑定）Bot 请求。
@@ -170,7 +172,7 @@ type BindBotReq struct {
 
 // BindBotResp 占用（绑定）Bot 响应。
 type BindBotResp struct {
-	RobotID       string `json:"robot_id"`
-	BoundAgentRef string `json:"bound_agent_ref"`
-	BoundAt       string `json:"bound_at"`
+	RobotID       string  `json:"robot_id"`
+	BoundAgentRef string  `json:"bound_agent_ref"`
+	BoundAt       *string `json:"bound_at"`
 }

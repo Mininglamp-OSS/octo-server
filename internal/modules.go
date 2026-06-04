@@ -23,10 +23,13 @@ package modules
 import (
 	_ "github.com/Mininglamp-OSS/octo-server/modules/backup"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/base"
+
 	// `robot` before `botfather`: botfather migrations ALTER the robot table
 	// (历史顺序，非 load-bearing —— 真正排序由 SQL 文件时间戳决定)。
 	_ "github.com/Mininglamp-OSS/octo-server/modules/robot"
+
 	_ "github.com/Mininglamp-OSS/octo-server/modules/botfather"
+
 	_ "github.com/Mininglamp-OSS/octo-server/modules/category"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/channel"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/common"
@@ -34,6 +37,7 @@ import (
 	_ "github.com/Mininglamp-OSS/octo-server/modules/file"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/group"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/incomingwebhook"
+	_ "github.com/Mininglamp-OSS/octo-server/modules/integration"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/message"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/notify"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/oidc"
@@ -49,7 +53,9 @@ import (
 	// also imports bot_api at the Go package level, so register bot_api
 	// before app_bot（历史顺序，非 load-bearing —— Go init() 顺序由依赖图决定）.
 	_ "github.com/Mininglamp-OSS/octo-server/modules/bot_api"
+
 	_ "github.com/Mininglamp-OSS/octo-server/modules/app_bot"
+
 	_ "github.com/Mininglamp-OSS/octo-server/modules/voice_adapter"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/webhook"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/workplace"
