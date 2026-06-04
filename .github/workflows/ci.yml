@@ -107,12 +107,13 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # MySQL and Redis are required by ~10 modules' integration tests
-    # (modules/{user,oidc,thread,group,space,...}). The tests hardcode
-    # 127.0.0.1:3306 (root/demo/test) and 127.0.0.1:6379 — see
+    # MySQL, Redis, and WuKongIM are required by integration tests
+    # (modules/{user,oidc,thread,group,space,botfather,...}). The tests
+    # hardcode 127.0.0.1:3306 (root/demo/test), 127.0.0.1:6379, and
+    # octo-lib's default WuKongIM API URL http://127.0.0.1:5001 — see
     # github.com/Mininglamp-OSS/octo-lib/testutil.NewTestServer and
-    # modules/oidc/callback_guard_test.go. Ports are mapped to the host
-    # so jobs running in the runner VM can reach them via 127.0.0.1.
+    # config.New. Ports are mapped to the host so jobs running in the
+    # runner VM can reach them via 127.0.0.1.
     services:
       mysql:
         image: mysql:8.0
@@ -135,6 +136,29 @@ jobs:
           --health-interval=5s
           --health-timeout=5s
           --health-retries=20
+      wukongim:
+        # Keep this pinned. WuKongIM tags have changed manager-token and
+        # tokenAuthOn behavior across releases; this tag is the docker
+        # stack's validated baseline.
+        image: wukongim/wukongim:v2.2.4-20260313
+        env:
+          WK_MODE: debug
+          # Tests use octo-lib's default empty manager token. Disable IM
+          # token auth explicitly so /channel and /health are reachable
+          # from the runner without test-specific config files.
+          WK_TOKENAUTHON: "false"
+          WK_EXTERNAL_IP: 127.0.0.1
+          WK_EXTERNAL_WSADDR: ws://127.0.0.1:5200
+        ports:
+          - 5001:5001
+          - 5100:5100
+          - 5200:5200
+        options: >-
+          --health-cmd="wget -q -O - http://127.0.0.1:5001/health >/dev/null 2>&1 || wget -q -O - http://127.0.0.1:5001/varz >/dev/null 2>&1"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=12
+          --health-start-period=40s
     env:
       # common.Setup (post 2026-05) refuses to boot without a 32-byte master
       # key; see modules/user/main_test.go for the same pattern. Use a fixed
@@ -174,6 +198,18 @@ jobs:
             sleep 2
           done
           echo "mysql did not become ready" >&2
+          exit 1
+
+      - name: Wait for WuKongIM
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:5001/health >/dev/null || curl -fsS http://127.0.0.1:5001/varz >/dev/null; then
+              echo "wukongim ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "wukongim did not become ready" >&2
           exit 1
 
       - name: Run tests
