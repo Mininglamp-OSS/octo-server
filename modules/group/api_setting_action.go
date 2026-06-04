@@ -429,7 +429,13 @@ var groupUpdateActionMap = map[string]groupUpdateActionFnc{
 		if err := ctx.updateGroup(); err != nil {
 			return err
 		}
-		return ctx.commmitGroupUpdateEvent(GroupAttrKeyAllowNoMention, fmt.Sprintf("%d", ctx.groupModel.AllowNoMention))
+		// 静默群属性开关：只发不可见的频道刷新 cmd（同 mute / AllowViewHistoryMsg /
+		// AllowMemberPinnedMessage），不走 commmitGroupUpdateEvent。后者会发布
+		// GroupUpdate + wkevent.Message，客户端当成系统消息渲染并产生未读红点，而
+		// 客户端没有 allow_no_mention 的本地化模板，结果渲染成「只有用户名、无内容」
+		// 的空白公告（YUJ-3153 Bug 3）。allow_external 仍走 commmitGroupUpdateEvent，
+		// 本单不动以避免回归。
+		return ctx.g.ctx.SendChannelUpdateToGroup(ctx.groupModel.GroupNo)
 	},
 }
 

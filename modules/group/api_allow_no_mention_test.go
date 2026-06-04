@@ -104,7 +104,47 @@ func TestGroupSettingUpdate_AllowNoMentionRangeIsRequestInvalid(t *testing.T) {
 		"allow_no_mention 越界应是 400 校验错误而非内部错误, body=%s", w.Body.String())
 }
 
-// TestGroupSettingUpdate_AllowNoMention_NonManagerForbidden pins that a
+// TestNewChannelResp_CarriesAllowNoMention pins YUJ-3153 Bug 2 root cause: the
+// channel serialization (channels/{uid}/{type}, which feeds the web's
+// channelInfo.orgData) must expose allow_no_mention. Before the fix the field
+// was written to the DB but omitted from extraMap, so the client read undefined,
+// defaulted to 1, and the switch was stuck "on" (refresh bounced it back).
+func TestNewChannelResp_CarriesAllowNoMention(t *testing.T) {
+	for _, want := range []int{0, 1} {
+		resp := newChannelRespWithGroupResp(&GroupResp{
+			GroupNo:        "g-extra",
+			Name:           "extra group",
+			AllowNoMention: want,
+		})
+		got, ok := resp.Extra["allow_no_mention"]
+		assert.True(t, ok, "extra 必须透出 allow_no_mention，否则前端开关关不掉")
+		assert.Equal(t, want, got, "extra.allow_no_mention 应等于群 model 的值")
+	}
+}
+
+// TestGroupSettingUpdate_AllowNoMention_SilentToggleSucceeds pins YUJ-3153 Bug
+// 3: toggling the switch as creator now goes through the silent
+// SendChannelUpdateToGroup path (like mute / allow_view_history_msg) instead of
+// commmitGroupUpdateEvent. The latter published a GroupUpdate + wkevent.Message
+// that rendered as a blank announcement and an unread red dot on every click.
+// A successful 200 + persisted value here proves the toggle no longer routes
+// through the visible-message event path (which nil-derefs ctx.Event in testutil).
+func TestGroupSettingUpdate_AllowNoMention_SilentToggleSucceeds(t *testing.T) {
+	f, h := setupBotOwnershipGroup(t)
+
+	g, err := f.db.QueryWithGroupNo("g_bot_own")
+	assert.NoError(t, err)
+	g.AllowNoMention = 1
+	assert.NoError(t, f.db.Update(g))
+
+	w := putGroupSetting(t, h, "g_bot_own", `{"allow_no_mention":0}`)
+	assert.Equal(t, http.StatusOK, w.Code, "静默开关切换应成功返回 200, body=%s", w.Body.String())
+
+	g, err = f.db.QueryWithGroupNo("g_bot_own")
+	assert.NoError(t, err)
+	assert.Equal(t, 0, g.AllowNoMention, "切换后 allow_no_mention 应持久化为 0")
+}
+
 // non-manager/creator toggling the group-level switch gets 403, not 500. The
 // permission check runs before any DB/event write.
 func TestGroupSettingUpdate_AllowNoMention_NonManagerForbidden(t *testing.T) {
