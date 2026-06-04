@@ -20,19 +20,49 @@ DROP PROCEDURE IF EXISTS __botfather_user_api_key_clientdim;
 -- +migrate StatementBegin
 CREATE PROCEDURE __botfather_user_api_key_clientdim()
 BEGIN
-  -- 列：仅当 client_id 不存在时整体添加。首条 ADD COLUMN 是单条原子 ALTER，
-  -- 要么 8 列全在、要么全不在，故以 client_id 为存在性哨兵即可覆盖整组。
+  -- 列：逐列独立守卫。原始 ADD COLUMN 是单条原子 ALTER（全 8 列或全无），故本
+  -- 特性自身的半应用态用任一哨兵都够；但逐列检查能额外修复「client_id 在、某
+  -- 个同伴列缺失」的任意 schema 漂移（如手工补列或异常中断遗留），不依赖整组同
+  -- 进退的假设。各列按原始列序追加：client_id AFTER space_id、status AFTER
+  -- client_id（前序列此时必已存在），其余 6 列无 AFTER 顺序追加，与原迁移一致。
   IF NOT EXISTS (SELECT 1 FROM information_schema.COLUMNS
-       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_api_key'
-         AND COLUMN_NAME = 'client_id') THEN
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_api_key' AND COLUMN_NAME = 'client_id') THEN
     ALTER TABLE `user_api_key`
-      ADD COLUMN `client_id` varchar(100) NOT NULL DEFAULT 'botfather' COMMENT '外部应用ID；botfather 自身为 botfather' AFTER `space_id`,
-      ADD COLUMN `status` tinyint(4) NOT NULL DEFAULT 1 COMMENT '1=active 0=revoked' AFTER `client_id`,
-      ADD COLUMN `api_key_hash` varchar(64) NOT NULL DEFAULT '' COMMENT '预留：uk_ 明文 SHA-256 hex（鉴权查询用）',
-      ADD COLUMN `api_key_cipher` varchar(255) NOT NULL DEFAULT '' COMMENT '预留：uk_ 明文密文（回显用）',
-      ADD COLUMN `last_used_at` timestamp NULL DEFAULT NULL COMMENT '最近使用时间',
-      ADD COLUMN `last_used_ip` varchar(64) NOT NULL DEFAULT '' COMMENT '最近使用IP',
-      ADD COLUMN `last_used_user_agent` varchar(255) NOT NULL DEFAULT '' COMMENT '最近调用方UA',
+      ADD COLUMN `client_id` varchar(100) NOT NULL DEFAULT 'botfather' COMMENT '外部应用ID；botfather 自身为 botfather' AFTER `space_id`;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_api_key' AND COLUMN_NAME = 'status') THEN
+    ALTER TABLE `user_api_key`
+      ADD COLUMN `status` tinyint(4) NOT NULL DEFAULT 1 COMMENT '1=active 0=revoked' AFTER `client_id`;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_api_key' AND COLUMN_NAME = 'api_key_hash') THEN
+    ALTER TABLE `user_api_key`
+      ADD COLUMN `api_key_hash` varchar(64) NOT NULL DEFAULT '' COMMENT '预留：uk_ 明文 SHA-256 hex（鉴权查询用）';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_api_key' AND COLUMN_NAME = 'api_key_cipher') THEN
+    ALTER TABLE `user_api_key`
+      ADD COLUMN `api_key_cipher` varchar(255) NOT NULL DEFAULT '' COMMENT '预留：uk_ 明文密文（回显用）';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_api_key' AND COLUMN_NAME = 'last_used_at') THEN
+    ALTER TABLE `user_api_key`
+      ADD COLUMN `last_used_at` timestamp NULL DEFAULT NULL COMMENT '最近使用时间';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_api_key' AND COLUMN_NAME = 'last_used_ip') THEN
+    ALTER TABLE `user_api_key`
+      ADD COLUMN `last_used_ip` varchar(64) NOT NULL DEFAULT '' COMMENT '最近使用IP';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_api_key' AND COLUMN_NAME = 'last_used_user_agent') THEN
+    ALTER TABLE `user_api_key`
+      ADD COLUMN `last_used_user_agent` varchar(255) NOT NULL DEFAULT '' COMMENT '最近调用方UA';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_api_key' AND COLUMN_NAME = 'revoked_at') THEN
+    ALTER TABLE `user_api_key`
       ADD COLUMN `revoked_at` timestamp NULL DEFAULT NULL COMMENT '撤销时间';
   END IF;
 
