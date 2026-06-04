@@ -5,15 +5,16 @@ import (
 	"os"
 	"runtime/debug"
 	"encoding/hex"
-	"errors"
 	"fmt"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
-	pkgutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	pkgutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
 	"go.uber.org/zap"
 )
 
@@ -51,17 +52,18 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 func (m *Manager) list(c *wkhttp.Context) {
 	err := c.CheckLoginRole()
 	if err != nil {
-		c.ResponseError(err)
+		respondManagerForbidden(c)
 		return
 	}
 	robotID := c.Query("robot_id")
 	if robotID == "" {
-		c.ResponseError(errors.New("机器人ID不能为空"))
+		respondRobotRequestInvalid(c, "robot_id")
 		return
 	}
 	list, err := m.db.queryMenusWithRobotID(robotID)
 	if err != nil {
-		c.ResponseError(errors.New("查询机器人菜单错误"))
+		m.Error("查询机器人菜单失败", zap.Error(err), zap.String("robot_id", robotID))
+		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
 		return
 	}
 	resps := make([]*robotMenu, 0)
@@ -87,28 +89,29 @@ func (m *Manager) list(c *wkhttp.Context) {
 func (m *Manager) delete(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondManagerForbidden(c)
 		return
 	}
 	robot_id := c.Param("robot_id")
 	id := pkgutil.ParseInt64OrDefault(c.Param("id"), 0)
 	if robot_id == "" {
-		c.ResponseError(errors.New("机器人ID不能为空"))
+		respondRobotRequestInvalid(c, "robot_id")
 		return
 	}
 	robot, err := m.db.queryRobotWithRobtID(robot_id)
 	if err != nil {
-		c.ResponseError(errors.New("查询操作的机器人错误"))
+		m.Error("查询操作的机器人失败", zap.Error(err), zap.String("robot_id", robot_id))
+		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
 		return
 	}
 	if robot == nil {
-		c.ResponseError(errors.New("操作的机器人不存在"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotNotFound, nil, nil)
 		return
 	}
 	tx, err := m.db.session.Begin()
 	if err != nil {
 		m.Error("数据库事物开启失败", zap.Error(err))
-		c.ResponseError(errors.New("数据库事物开启失败"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
 		return
 	}
 	defer func() {
@@ -121,12 +124,13 @@ func (m *Manager) delete(c *wkhttp.Context) {
 	if err != nil {
 		tx.Rollback()
 		m.Error("删除机器人菜单失败", zap.Error(err))
-		c.ResponseError(errors.New("删除机器人菜单失败"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
 		return
 	}
 	genSeqVal, err := m.ctx.GenSeq(common.RobotSeqKey)
 	if err != nil {
-		c.ResponseError(err)
+		m.Error("生成机器人版本号失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
 		return
 	}
 	robot.Version = genSeqVal
@@ -134,14 +138,14 @@ func (m *Manager) delete(c *wkhttp.Context) {
 	if err != nil {
 		tx.Rollback()
 		m.Error("修改机器人版本号错误", zap.Error(err))
-		c.ResponseError(errors.New("修改机器人版本号错误"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
 		return
 	}
 	err = tx.Commit()
 	if err != nil {
 		tx.RollbackUnlessCommitted()
 		m.Error("数据库事物提交失败", zap.Error(err))
-		c.ResponseError(errors.New("数据库事物提交失败"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -151,29 +155,31 @@ func (m *Manager) delete(c *wkhttp.Context) {
 func (m *Manager) updateRobotStatus(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondManagerForbidden(c)
 		return
 	}
 	robot_id := c.Param("robot_id")
 	status := pkgutil.ParseInt64OrDefault(c.Param("status"), 0)
 
 	if robot_id == "" {
-		c.ResponseError(errors.New("机器人ID不能为空"))
+		respondRobotRequestInvalid(c, "robot_id")
 		return
 	}
 	robot, err := m.db.queryRobotWithRobtID(robot_id)
 	if err != nil {
-		c.ResponseError(errors.New("查询操作的机器人错误"))
+		m.Error("查询操作的机器人失败", zap.Error(err), zap.String("robot_id", robot_id))
+		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
 		return
 	}
 	if robot == nil {
-		c.ResponseError(errors.New("操作的机器人不存在"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotNotFound, nil, nil)
 		return
 	}
 	robot.Status = int(status)
 	err = m.db.updateRobot(robot)
 	if err != nil {
-		c.ResponseError(errors.New("修改机器人状态信息错误"))
+		m.Error("修改机器人状态信息失败", zap.Error(err), zap.String("robot_id", robot_id))
+		httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -195,7 +201,7 @@ type robotMenu struct {
 func (m *Manager) robotList(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondManagerForbidden(c)
 		return
 	}
 	pageIndex := pkgutil.AtoiOrDefault(c.Query("page_index"), 1)
@@ -210,13 +216,13 @@ func (m *Manager) robotList(c *wkhttp.Context) {
 	list, err := m.db.queryRobotListPaged(pageIndex, pageSize)
 	if err != nil {
 		m.Error("查询机器人列表失败", zap.Error(err))
-		c.ResponseError(errors.New("查询机器人列表失败"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
 		return
 	}
 	count, err := m.db.queryRobotTotalCount()
 	if err != nil {
 		m.Error("查询机器人总数失败", zap.Error(err))
-		c.ResponseError(errors.New("查询机器人总数失败"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
 		return
 	}
 
@@ -242,22 +248,22 @@ func (m *Manager) robotList(c *wkhttp.Context) {
 func (m *Manager) robotDetail(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondManagerForbidden(c)
 		return
 	}
 	robotID := c.Param("robot_id")
 	if robotID == "" {
-		c.ResponseError(errors.New("机器人ID不能为空"))
+		respondRobotRequestInvalid(c, "robot_id")
 		return
 	}
 	r, err := m.db.queryRobotWithRobtID(robotID)
 	if err != nil {
 		m.Error("查询机器人详情失败", zap.Error(err))
-		c.ResponseError(errors.New("查询机器人详情失败"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
 		return
 	}
 	if r == nil {
-		c.ResponseError(errors.New("机器人不存在"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotNotFound, nil, nil)
 		return
 	}
 	c.Response(&robotDetailResp{
@@ -277,18 +283,18 @@ func (m *Manager) robotDetail(c *wkhttp.Context) {
 func (m *Manager) robotUpdate(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondManagerForbidden(c)
 		return
 	}
 	robotID := c.Param("robot_id")
 	if robotID == "" {
-		c.ResponseError(errors.New("机器人ID不能为空"))
+		respondRobotRequestInvalid(c, "robot_id")
 		return
 	}
 
 	var req robotUpdateReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("数据格式有误"))
+		respondRobotRequestInvalid(c, "")
 		return
 	}
 
@@ -301,14 +307,14 @@ func (m *Manager) robotUpdate(c *wkhttp.Context) {
 	}
 
 	if len(fields) == 0 {
-		c.ResponseError(errors.New("没有需要更新的字段"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotNoFieldsToUpdate, nil, nil)
 		return
 	}
 
 	err = m.db.updateRobotInfo(robotID, fields)
 	if err != nil {
 		m.Error("更新机器人信息失败", zap.Error(err))
-		c.ResponseError(errors.New("更新机器人信息失败"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -318,26 +324,26 @@ func (m *Manager) robotUpdate(c *wkhttp.Context) {
 func (m *Manager) robotDelete(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondManagerForbidden(c)
 		return
 	}
 	robotID := c.Param("robot_id")
 	if robotID == "" {
-		c.ResponseError(errors.New("机器人ID不能为空"))
+		respondRobotRequestInvalid(c, "robot_id")
 		return
 	}
 
 	// 先清理 IM 连接和缓存，再做软删除
 	if err := m.cleanupBotConnection(robotID); err != nil {
 		m.Error("清理机器人连接失败", zap.Error(err))
-		c.ResponseError(errors.New("清理机器人连接失败"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
 		return
 	}
 
 	err = m.db.deleteRobotSoft(robotID)
 	if err != nil {
 		m.Error("删除机器人失败", zap.Error(err))
-		c.ResponseError(errors.New("删除机器人失败"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -375,25 +381,25 @@ func (m *Manager) cleanupBotConnection(robotID string) error {
 func (m *Manager) robotRevokeToken(c *wkhttp.Context) {
 	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
-		c.ResponseError(err)
+		respondManagerForbidden(c)
 		return
 	}
 	robotID := c.Param("robot_id")
 	if robotID == "" {
-		c.ResponseError(errors.New("机器人ID不能为空"))
+		respondRobotRequestInvalid(c, "robot_id")
 		return
 	}
 
 	newToken, err := m.generateUniqueBotToken()
 	if err != nil {
 		m.Error("生成Token失败", zap.Error(err))
-		c.ResponseError(errors.New("生成Token失败，请重试"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotTokenGenFailed, nil, nil)
 		return
 	}
 	err = m.db.updateRobotBotToken(robotID, newToken)
 	if err != nil {
 		m.Error("重置Token失败", zap.Error(err))
-		c.ResponseError(errors.New("重置Token失败"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
 		return
 	}
 

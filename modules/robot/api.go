@@ -30,6 +30,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
 	"github.com/Mininglamp-OSS/octo-server/pkg/richtext"
 	pkgutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
@@ -302,14 +304,14 @@ func (rb *Robot) streamStart(c *wkhttp.Context) {
 	var req config.MessageStreamStartReq
 	if err := c.BindJSON(&req); err != nil {
 		rb.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误！"))
+		respondRobotRequestInvalid(c, "")
 		return
 	}
 
 	streamNo, err := rb.ctx.IMStreamStart(req)
 	if err != nil {
 		rb.Error("发送stream start消息失败！", zap.Error(err))
-		c.ResponseError(errors.New("发送stream start消息失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotSendFailed, nil, nil)
 		return
 	}
 	c.Response(gin.H{
@@ -321,13 +323,13 @@ func (rb *Robot) streamEnd(c *wkhttp.Context) {
 	var req config.MessageStreamEndReq
 	if err := c.BindJSON(&req); err != nil {
 		rb.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误！"))
+		respondRobotRequestInvalid(c, "")
 		return
 	}
 	err := rb.ctx.IMStreamEnd(req)
 	if err != nil {
 		rb.Error("发送stream end消息失败！", zap.Error(err))
-		c.ResponseError(errors.New("发送stream end消息失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotSendFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -342,35 +344,25 @@ func (rb *Robot) authRobot() wkhttp.HandlerFunc {
 		robot, err := rb.db.queryVaildRobotWithRobtID(robotID)
 		if err != nil {
 			rb.Error("查询robot失败！", zap.Error(err))
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"msg": "查询robot失败！",
-			})
+			respondRobotAuthCheckFailed(c)
 			return
 		}
 		if robot == nil {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"msg": "机器人不存在！",
-			})
+			respondRobotAuthFailed(c)
 			return
 		}
 		appM, err := rb.appService.GetApp(robot.AppID)
 		if err != nil {
 			rb.Error("查询app失败！", zap.Error(err), zap.String("appID", robot.AppID))
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"msg": "查询app失败！",
-			})
+			respondRobotAuthCheckFailed(c)
 			return
 		}
 		if appM == nil {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"msg": "app不存在！",
-			})
+			respondRobotAuthFailed(c)
 			return
 		}
 		if !hmac.Equal([]byte(appM.AppKey), []byte(appKey)) {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"msg": "appKey不正确！",
-			})
+			respondRobotAuthFailed(c)
 			return
 		}
 		c.Next()
@@ -381,30 +373,30 @@ func (rb *Robot) typing(c *wkhttp.Context) {
 	var req *TypingReq
 	if err := c.BindJSON(&req); err != nil {
 		rb.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误！"))
+		respondRobotRequestInvalid(c, "")
 		return
 	}
 	if strings.TrimSpace(req.ChannelID) == "" {
-		c.ResponseError(errors.New("channel_id不能为空！"))
+		respondRobotRequestInvalid(c, "channel_id")
 		return
 	}
 	if req.ChannelType == 0 {
-		c.ResponseError(errors.New("channel_type不能为空！"))
+		respondRobotRequestInvalid(c, "channel_type")
 		return
 	}
 	fromUID := c.Param("robot_id")
 	if fromUID == "" {
-		c.ResponseError(errors.New("from_uid不能为空！"))
+		respondRobotRequestInvalid(c, "from_uid")
 		return
 	}
 	if !rb.allowSendToChannel(fromUID, req.ChannelID, req.ChannelType) {
-		c.ResponseError(errors.New("不允许发送消息到此频道！"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotChannelSendForbidden, nil, nil)
 		return
 	}
 	err := rb.ctx.SendTyping(req.ChannelID, req.ChannelType, fromUID)
 	if err != nil {
 		rb.Error("发送typing消息失败！", zap.Error(err))
-		c.ResponseError(errors.New("发送typing消息失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotSendFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -414,29 +406,29 @@ func (rb *Robot) sendMessage(c *wkhttp.Context) {
 	var messageReq *MessageReq
 	if err := c.BindJSON(&messageReq); err != nil {
 		rb.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误！"))
+		respondRobotRequestInvalid(c, "")
 		return
 	}
 	if strings.TrimSpace(messageReq.ChannelID) == "" {
-		c.ResponseError(errors.New("channel_id不能为空！"))
+		respondRobotRequestInvalid(c, "channel_id")
 		return
 	}
 	if messageReq.ChannelType == 0 {
-		c.ResponseError(errors.New("channel_type不能为空！"))
+		respondRobotRequestInvalid(c, "channel_type")
 		return
 	}
 	if len(messageReq.Payload) == 0 {
-		c.ResponseError(errors.New("payload不能为空！"))
+		respondRobotContentInvalid(c, "payload")
 		return
 	}
 
 	robotID := c.Param("robot_id")
 	if robotID == "" {
-		c.ResponseError(errors.New("robot_id不能为空！"))
+		respondRobotRequestInvalid(c, "robot_id")
 		return
 	}
 	if !rb.allowSendToChannel(robotID, messageReq.ChannelID, messageReq.ChannelType) {
-		c.ResponseError(errors.New("不允许发送消息到此频道！"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotChannelSendForbidden, nil, nil)
 		return
 	}
 
@@ -457,27 +449,27 @@ func (rb *Robot) sendMessage(c *wkhttp.Context) {
 	payloadResult := maputil.Data(messageReq.Payload)
 	contentTypeValue := payloadResult.Int("type")
 	if contentTypeValue == 0 {
-		c.ResponseError(errors.New("payload.type不能为空！"))
+		respondRobotContentInvalid(c, "payload.type")
 		return
 	}
 	contentType := common.ContentType(contentTypeValue)
 	if !rb.supportContentType(contentType) {
-		c.ResponseError(fmt.Errorf("不支持的type[%d]", contentType))
+		respondRobotContentTypeUnsupported(c, int(contentType))
 		return
 	}
 
 	if !rb.payloadIsVail(payloadResult) {
-		c.ResponseError(fmt.Errorf("无效的payload[%s]", util.ToJson(messageReq.Payload)))
+		respondRobotContentInvalid(c, "payload")
 		return
 	}
 	userResp, err := rb.userService.GetUserWithUsername(robotID)
 	if err != nil {
 		rb.Error("查询机器人的用户信息失败！", zap.Error(err))
-		c.ResponseError(fmt.Errorf("获取机器人[%s]信息失败！", robotID))
+		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
 		return
 	}
 	if userResp == nil {
-		c.ResponseError(fmt.Errorf("机器人[%s]不存在！", robotID))
+		httperr.ResponseErrorL(c, errcode.ErrRobotNotFound, nil, nil)
 		return
 	}
 	// YUJ-644 / Mininglamp-OSS#33: PERSONAL DM 派发前服务端权威 space_id 注入。
@@ -495,7 +487,7 @@ func (rb *Robot) sendMessage(c *wkhttp.Context) {
 	// 注入的顶层字段）的 1MB 复检（PR#232 Jerry-Xin Critical#2）。
 	if err := richtext.Finalize(payload); err != nil {
 		rb.Error("RichText payload plain 生成/复检失败", zap.Error(err), zap.String("robotID", robotID), zap.String("channelID", messageReq.ChannelID))
-		c.ResponseError(fmt.Errorf("无效的payload[%s]", util.ToJson(messageReq.Payload)))
+		respondRobotContentInvalid(c, "payload")
 		return
 	}
 
@@ -546,7 +538,7 @@ func (rb *Robot) sendMessage(c *wkhttp.Context) {
 	})
 	if err != nil {
 		rb.Error("发送robot消息失败！", zap.Error(err))
-		c.ResponseError(errors.New("发送消息失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotSendFailed, nil, nil)
 		return
 	}
 	c.Response(result)
@@ -619,11 +611,11 @@ func (rb *Robot) answerInlineQuery(c *wkhttp.Context) {
 	var result *InlineQueryResult
 	if err := c.BindJSON(&result); err != nil {
 		rb.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误！"))
+		respondRobotRequestInvalid(c, "")
 		return
 	}
 	if err := result.Check(); err != nil {
-		c.ResponseError(err)
+		respondRobotRequestInvalid(c, "")
 		return
 	}
 	rb.inlineQueryEventResultChanMapLock.Lock()
@@ -648,25 +640,26 @@ func (rb *Robot) inlineQuery(c *wkhttp.Context) {
 	}
 	if err := c.BindJSON(&req); err != nil {
 		rb.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误！"))
+		respondRobotRequestInvalid(c, "")
 		return
 	}
 	if len(req.Username) == 0 {
-		c.ResponseError(errors.New("username不能为空！"))
+		respondRobotRequestInvalid(c, "username")
 		return
 	}
 	robotM, err := rb.db.queryWithUsername(req.Username)
 	if err != nil {
-		c.ResponseErrorf("查询机器人失败！", err)
+		rb.Error("查询机器人失败", zap.Error(err), zap.String("username", req.Username))
+		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
 		return
 	}
 	if robotM == nil {
-		c.ResponseError(errors.New("机器人不存在！"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotNotFound, nil, nil)
 		return
 	}
 	if strings.TrimSpace(robotM.AppID) == "" {
 		rb.Error("机器人没有app_id", zap.String("username", req.Username))
-		c.ResponseError(errors.New("机器人没有app_id！"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotNotFound, nil, nil)
 		return
 	}
 	robotID := robotM.RobotID
@@ -692,7 +685,7 @@ func (rb *Robot) inlineQuery(c *wkhttp.Context) {
 	case result := <-resultChan:
 		c.JSON(http.StatusOK, result)
 	case <-time.After(time.Second * 20):
-		c.AbortWithStatus(http.StatusRequestTimeout)
+		respondRobotInlineQueryTimeout(c)
 	}
 
 	rb.inlineQueryEventResultChanMapLock.Lock()
@@ -831,7 +824,7 @@ func (rb *Robot) getEventsForPost(c *wkhttp.Context) {
 	}
 	if err := c.BindJSON(&req); err != nil {
 		rb.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误！"))
+		respondRobotRequestInvalid(c, "")
 		return
 	}
 	results, err := rb.getEventsResult(robotID, req.EventID, req.Limit)
@@ -883,13 +876,14 @@ func (rb *Robot) eventAck(c *wkhttp.Context) {
 	eventID, err := strconv.ParseInt(c.Param("event_id"), 10, 64)
 	if err != nil {
 		rb.Error("解析event_id参数失败", zap.Error(err), zap.String("value", c.Param("event_id")))
-		c.ResponseError(errors.New("event_id格式错误"))
+		respondRobotRequestInvalid(c, "event_id")
 		return
 	}
 
 	err = rb.removeEvent(robotID, eventID)
 	if err != nil {
-		c.ResponseError(err)
+		rb.Error("移除机器人事件失败", zap.Error(err), zap.Int64("event_id", eventID))
+		httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -963,14 +957,14 @@ func (rb *Robot) insertSystemRobot() error {
 func (rb *Robot) getCommands(c *wkhttp.Context) {
 	robotID := c.Query("robot_id")
 	if strings.TrimSpace(robotID) == "" {
-		c.ResponseError(errors.New("robot_id不能为空"))
+		respondRobotRequestInvalid(c, "robot_id")
 		return
 	}
 
 	botCommands, err := rb.db.queryBotCommandsByRobotID(robotID)
 	if err != nil {
 		rb.Error("查询机器人命令失败", zap.Error(err))
-		c.ResponseError(errors.New("查询机器人命令失败"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
 		return
 	}
 
@@ -982,7 +976,7 @@ func (rb *Robot) getCommands(c *wkhttp.Context) {
 	var commands []interface{}
 	if err := json.Unmarshal([]byte(botCommands), &commands); err != nil {
 		rb.Error("解析机器人命令失败", zap.Error(err), zap.String("botCommands", botCommands))
-		c.ResponseError(errors.New("机器人命令数据损坏"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
 		return
 	}
 	c.Response(commands)
@@ -997,7 +991,7 @@ func (rb *Robot) sync(c *wkhttp.Context) {
 	}
 	var reqs []*req
 	if err := c.BindJSON(&reqs); err != nil {
-		c.ResponseError(errors.New("请求数据格式有误！"))
+		respondRobotRequestInvalid(c, "")
 		return
 	}
 
@@ -1018,14 +1012,14 @@ func (rb *Robot) sync(c *wkhttp.Context) {
 	if len(robotIDs) > 0 {
 		robotList, err = rb.db.queryWithIDs(robotIDs)
 		if err != nil {
-			c.ResponseError(errors.New("批量查询机器人数据错误"))
+			httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
 			rb.Error("批量查询机器人数据错误", zap.Error(err))
 			return
 		}
 	} else if len(usernames) > 0 {
 		robotList, err = rb.db.queryWithUsernames(usernames)
 		if err != nil {
-			c.ResponseError(errors.New("批量通过username查询机器人数据错误"))
+			httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
 			rb.Error("批量通过username查询机器人数据错误", zap.Error(err))
 			return
 		}
@@ -1046,7 +1040,7 @@ func (rb *Robot) sync(c *wkhttp.Context) {
 	}
 	menus, err := rb.db.queryMenusWithRobotIDs(respRobotIDs)
 	if err != nil {
-		c.ResponseError(errors.New("批量查询机器人菜单数据错误"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
 		rb.Error("批量查询机器人菜单数据错误", zap.Error(err))
 		return
 	}
@@ -1177,7 +1171,7 @@ func (rb *Robot) setDescription(c *wkhttp.Context) {
 		Description string `json:"description"`
 	}
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("参数错误"))
+		respondRobotRequestInvalid(c, "")
 		return
 	}
 
@@ -1185,17 +1179,18 @@ func (rb *Robot) setDescription(c *wkhttp.Context) {
 	var creatorUID string
 	err := rb.ctx.DB().Select("IFNULL(creator_uid,'')").From("robot").Where("robot_id=? AND status=1", robotID).LoadOne(&creatorUID)
 	if err != nil || creatorUID == "" {
-		c.ResponseError(errors.New("机器人不存在"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotNotFound, nil, nil)
 		return
 	}
 	if creatorUID != loginUID {
-		c.ResponseError(errors.New("只有创建者可以修改"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotCreatorOnly, nil, nil)
 		return
 	}
 
 	_, err = rb.ctx.DB().Update("robot").Set("description", req.Description).Where("robot_id=?", robotID).Exec()
 	if err != nil {
-		c.ResponseError(errors.New("更新失败"))
+		rb.Error("更新 robot description 失败", zap.Error(err), zap.String("robot_id", robotID))
+		httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -1210,7 +1205,7 @@ func (rb *Robot) setAutoApprove(c *wkhttp.Context) {
 		AutoApprove int `json:"auto_approve"` // 0:需审批 1:自动通过
 	}
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("参数错误"))
+		respondRobotRequestInvalid(c, "")
 		return
 	}
 
@@ -1218,17 +1213,18 @@ func (rb *Robot) setAutoApprove(c *wkhttp.Context) {
 	var creatorUID string
 	err := rb.ctx.DB().Select("IFNULL(creator_uid,'')").From("robot").Where("robot_id=? AND status=1", robotID).LoadOne(&creatorUID)
 	if err != nil || creatorUID == "" {
-		c.ResponseError(errors.New("机器人不存在"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotNotFound, nil, nil)
 		return
 	}
 	if creatorUID != loginUID {
-		c.ResponseError(errors.New("只有创建者可以修改"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotCreatorOnly, nil, nil)
 		return
 	}
 
 	_, err = rb.ctx.DB().Update("robot").Set("auto_approve", req.AutoApprove).Where("robot_id=?", robotID).Exec()
 	if err != nil {
-		c.ResponseError(errors.New("更新失败"))
+		rb.Error("更新 robot auto_approve 失败", zap.Error(err), zap.String("robot_id", robotID))
+		httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -1239,7 +1235,7 @@ func (rb *Robot) spaceBots(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	spaceID := c.Query("space_id")
 	if spaceID == "" {
-		c.ResponseError(errors.New("space_id 不能为空"))
+		respondRobotRequestInvalid(c, "space_id")
 		return
 	}
 
@@ -1267,7 +1263,7 @@ func (rb *Robot) spaceBots(c *wkhttp.Context) {
 	`, spaceID).Load(&bots)
 	if err != nil {
 		rb.Error("查询 Space Bot 列表失败", zap.Error(err))
-		c.ResponseError(errors.New("查询失败"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
 		return
 	}
 
@@ -1387,7 +1383,7 @@ func (rb *Robot) myBots(c *wkhttp.Context) {
 	_, err := rb.ctx.DB().SelectBySql(query, args...).Load(&bots)
 	if err != nil {
 		rb.Error("查询我的 Bot 列表失败", zap.Error(err))
-		c.ResponseError(errors.New("查询失败"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
 		return
 	}
 
@@ -1433,7 +1429,7 @@ func (rb *Robot) myBots(c *wkhttp.Context) {
 func (rb *Robot) proxyFile(c *wkhttp.Context) {
 	ph := c.Param("path")
 	if ph == "" {
-		c.ResponseError(errors.New("文件路径不能为空"))
+		respondRobotRequestInvalid(c, "path")
 		return
 	}
 	// 去掉前导 /
@@ -1442,7 +1438,7 @@ func (rb *Robot) proxyFile(c *wkhttp.Context) {
 	// Sanitize path to prevent directory traversal
 	cleaned := filepath.Clean(ph)
 	if strings.Contains(cleaned, "..") || strings.ContainsAny(cleaned, "\x00") {
-		c.ResponseErrorWithStatus(errors.New("文件路径无效"), http.StatusBadRequest)
+		respondRobotRequestInvalid(c, "path")
 		return
 	}
 	ph = cleaned
@@ -1455,7 +1451,7 @@ func (rb *Robot) proxyFile(c *wkhttp.Context) {
 	downloadURL, err := rb.fileService.DownloadURL(ph, filename)
 	if err != nil {
 		rb.Error("获取文件下载URL失败", zap.Error(err), zap.String("path", ph))
-		c.ResponseError(errors.New("获取文件失败"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotUploadFailed, nil, nil)
 		return
 	}
 	c.Redirect(http.StatusFound, downloadURL)
@@ -1469,7 +1465,7 @@ func (rb *Robot) botUploadFile(c *wkhttp.Context) {
 	multipartFile, fileHeader, err := c.Request.FormFile("file")
 	if err != nil {
 		rb.Error("读取上传文件失败", zap.Error(err))
-		c.ResponseError(errors.New("读取文件失败"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotUploadFailed, nil, nil)
 		return
 	}
 	defer multipartFile.Close()
@@ -1477,14 +1473,14 @@ func (rb *Robot) botUploadFile(c *wkhttp.Context) {
 	// 文件大小限制 100MB
 	const maxSize int64 = 100 * 1024 * 1024
 	if fileHeader.Size > maxSize {
-		c.ResponseError(fmt.Errorf("文件大小不能超过%dMB", maxSize/1024/1024))
+		respondRobotFileTooLarge(c, maxSize/1024/1024)
 		return
 	}
 
 	fileName := fileHeader.Filename
 	ext := strings.ToLower(filepath.Ext(fileName))
 	if ext == "" {
-		c.ResponseError(errors.New("文件必须包含扩展名"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotFileTypeUnsupported, nil, nil)
 		return
 	}
 
@@ -1509,7 +1505,7 @@ func (rb *Robot) botUploadFile(c *wkhttp.Context) {
 	})
 	if err != nil {
 		rb.Error("上传文件失败", zap.Error(err))
-		c.ResponseError(errors.New("上传文件失败"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotUploadFailed, nil, nil)
 		return
 	}
 
@@ -1529,21 +1525,21 @@ func (rb *Robot) botUploadFile(c *wkhttp.Context) {
 func (rb *Robot) botUploadCredentials(c *wkhttp.Context) {
 	filename := c.Query("filename")
 	if strings.TrimSpace(filename) == "" {
-		c.ResponseError(errors.New("filename 不能为空"))
+		respondRobotRequestInvalid(c, "filename")
 		return
 	}
 	filename = filepath.Base(filename)
 
 	ext := strings.ToLower(filepath.Ext(filename))
 	if ext == "" || file.IsBlockedExtension(ext) || !file.IsAllowedExtension(ext) {
-		c.ResponseError(errors.New("不支持的文件类型"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotFileTypeUnsupported, nil, nil)
 		return
 	}
 
 	cosConfig := rb.ctx.GetConfig().COS
 	if cosConfig.SecretID == "" || cosConfig.SecretKey == "" || cosConfig.Bucket == "" {
 		rb.Error("COS 配置不完整")
-		c.ResponseError(errors.New("COS 未配置"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotUploadFailed, nil, nil)
 		return
 	}
 
@@ -1567,7 +1563,7 @@ func (rb *Robot) botUploadCredentials(c *wkhttp.Context) {
 	}
 	if appId == "" {
 		rb.Error("无法从 bucket 名称中提取 appId", zap.String("bucket", bucket))
-		c.ResponseError(errors.New("COS 配置错误：bucket 格式不正确"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotUploadFailed, nil, nil)
 		return
 	}
 
@@ -1589,7 +1585,7 @@ func (rb *Robot) botUploadCredentials(c *wkhttp.Context) {
 	res, err := client.GetCredential(opt)
 	if err != nil {
 		rb.Error("获取 STS 临时密钥失败", zap.Error(err))
-		c.ResponseError(errors.New("获取临时密钥失败"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotUploadFailed, nil, nil)
 		return
 	}
 
@@ -1612,7 +1608,7 @@ func (rb *Robot) botUploadCredentials(c *wkhttp.Context) {
 func (rb *Robot) botUploadPresigned(c *wkhttp.Context) {
 	filename := c.Query("filename")
 	if strings.TrimSpace(filename) == "" {
-		c.ResponseError(errors.New("filename 不能为空"))
+		respondRobotRequestInvalid(c, "filename")
 		return
 	}
 	filename = filepath.Base(filename)
@@ -1622,24 +1618,24 @@ func (rb *Robot) botUploadPresigned(c *wkhttp.Context) {
 	// guard the public file API enforces (see modules/file/api.go).
 	fileSizeRaw := strings.TrimSpace(c.Query("fileSize"))
 	if fileSizeRaw == "" {
-		c.ResponseError(errors.New("fileSize 参数必填，且不能超过最大限制"))
+		respondRobotRequestInvalid(c, "fileSize")
 		return
 	}
 	fileSize, parseErr := strconv.ParseInt(fileSizeRaw, 10, 64)
 	if parseErr != nil || fileSize <= 0 {
-		c.ResponseError(errors.New("fileSize 参数必须为正整数（字节）"))
+		respondRobotRequestInvalid(c, "fileSize")
 		return
 	}
 	if fileSize > file.MaxFileSize {
 		rb.Warn("预签名上传 fileSize 超出限制",
 			zap.Int64("size", fileSize), zap.Int64("max", file.MaxFileSize))
-		c.ResponseError(fmt.Errorf("文件大小不能超过%dMB", file.MaxFileSize/1024/1024))
+		respondRobotFileTooLarge(c, file.MaxFileSize/1024/1024)
 		return
 	}
 
 	ext := strings.ToLower(filepath.Ext(filename))
 	if ext == "" || file.IsBlockedExtension(ext) || !file.IsAllowedExtension(ext) {
-		c.ResponseError(errors.New("不支持的文件类型"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotFileTypeUnsupported, nil, nil)
 		return
 	}
 
@@ -1655,7 +1651,7 @@ func (rb *Robot) botUploadPresigned(c *wkhttp.Context) {
 	uploadURL, downloadURL, err := rb.fileService.PresignedPutURL(objectPath, contentType, contentDisposition, fileSize, expiry)
 	if err != nil {
 		rb.Error("生成预签名上传URL失败", zap.Error(err))
-		c.ResponseError(errors.New("生成上传URL失败"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotUploadFailed, nil, nil)
 		return
 	}
 
@@ -1690,29 +1686,29 @@ func (rb *Robot) botMessageEdit(c *wkhttp.Context) {
 	}
 	if err := c.BindJSON(&req); err != nil {
 		rb.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误！"))
+		respondRobotRequestInvalid(c, "")
 		return
 	}
 	if req.MessageID == "" {
-		c.ResponseError(errors.New("message_id 不能为空"))
+		respondRobotRequestInvalid(c, "message_id")
 		return
 	}
 	if req.MessageSeq == 0 {
-		c.ResponseError(errors.New("message_seq 不能为空"))
+		respondRobotRequestInvalid(c, "message_seq")
 		return
 	}
 	if req.ChannelID == "" {
-		c.ResponseError(errors.New("channel_id 不能为空"))
+		respondRobotRequestInvalid(c, "channel_id")
 		return
 	}
 	if strings.TrimSpace(req.ContentEdit) == "" {
-		c.ResponseError(errors.New("content_edit 不能为空"))
+		respondRobotContentInvalid(c, "content_edit")
 		return
 	}
 
 	robotID := c.Param("robot_id")
 	if robotID == "" {
-		c.ResponseError(errors.New("robot_id 不能为空"))
+		respondRobotRequestInvalid(c, "robot_id")
 		return
 	}
 
@@ -1721,15 +1717,15 @@ func (rb *Robot) botMessageEdit(c *wkhttp.Context) {
 	resp, err := rb.ctx.IMGetWithChannelAndSeqs(req.ChannelID, req.ChannelType, robotID, messageSeqs)
 	if err != nil {
 		rb.Error("查询消息错误", zap.Error(err))
-		c.ResponseError(errors.New("查询消息错误"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
 		return
 	}
 	if resp == nil || len(resp.Messages) == 0 {
-		c.ResponseError(errors.New("消息不存在"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotMessageNotFound, nil, nil)
 		return
 	}
 	if resp.Messages[0].FromUID != robotID {
-		c.ResponseError(errors.New("只能编辑自己发送的消息"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotMessageEditForbidden, nil, nil)
 		return
 	}
 
@@ -1740,7 +1736,7 @@ func (rb *Robot) botMessageEdit(c *wkhttp.Context) {
 	normalizedEdit, err := richtext.NormalizeContentEdit(req.ContentEdit)
 	if err != nil {
 		rb.Error("RichText content_edit 校验失败", zap.Error(err), zap.String("messageID", req.MessageID))
-		c.ResponseError(errors.New("无效的 content_edit"))
+		respondRobotContentInvalid(c, "content_edit")
 		return
 	}
 	req.ContentEdit = normalizedEdit
@@ -1753,7 +1749,7 @@ func (rb *Robot) botMessageEdit(c *wkhttp.Context) {
 	err = rb.ctx.DB().Select("count(*)").From("message_extra").Where("message_id=? and content_edit_hash=?", req.MessageID, contentMD5).LoadOne(&existCount)
 	if err != nil {
 		rb.Error("查询是否存在相同正文失败！", zap.Error(err))
-		c.ResponseError(errors.New("查询是否存在相同正文失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
 		return
 	}
 	if existCount > 0 {
@@ -1772,7 +1768,7 @@ func (rb *Robot) botMessageEdit(c *wkhttp.Context) {
 	version, err := rb.ctx.GenSeq(fmt.Sprintf("%s:%s", common.MessageExtraSeqKey, fakeChannelID))
 	if err != nil {
 		rb.Error("生成消息扩展序列号失败！", zap.Error(err))
-		c.ResponseError(errors.New("生成消息扩展序列号失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
 		return
 	}
 
@@ -1783,7 +1779,7 @@ func (rb *Robot) botMessageEdit(c *wkhttp.Context) {
 	).Exec()
 	if err != nil {
 		rb.Error("添加或修改编辑内容失败！", zap.Error(err))
-		c.ResponseError(errors.New("添加或修改编辑内容失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
 		return
 	}
 
@@ -1797,7 +1793,7 @@ func (rb *Robot) botMessageEdit(c *wkhttp.Context) {
 	})
 	if err != nil {
 		rb.Error("发送 CMD 同步失败！", zap.Error(err))
-		c.ResponseError(errors.New("发送同步命令失败"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotSendFailed, nil, nil)
 		return
 	}
 

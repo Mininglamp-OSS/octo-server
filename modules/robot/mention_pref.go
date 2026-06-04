@@ -11,6 +11,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
 )
@@ -99,16 +101,16 @@ func (rb *Robot) assertRobotOwner(c *wkhttp.Context, robotID, loginUID string) b
 	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
 		// 真实 DB/扫描错误不能伪装成 404，否则会掩盖故障。
 		rb.Error("查询 robot creator 失败", zap.Error(err), zap.String("robot_id", robotID))
-		c.ResponseError(errors.New("查询失败"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
 		return true
 	}
 	// ErrNotFound → creatorUID 仍为 ""，decideOwnership 归类为 404。
 	switch decideOwnership(creatorUID, loginUID) {
 	case ownershipNotFound:
-		c.ResponseErrorWithStatus(errors.New("机器人不存在"), http.StatusNotFound)
+		httperr.ResponseErrorL(c, errcode.ErrRobotNotFound, nil, nil)
 		return true
 	case ownershipForbidden:
-		c.ResponseErrorWithStatus(errors.New("只有创建者可以操作"), http.StatusForbidden)
+		httperr.ResponseErrorL(c, errcode.ErrRobotCreatorOnly, nil, nil)
 		return true
 	default:
 		return false
@@ -126,11 +128,11 @@ func (rb *Robot) setMentionPref(c *wkhttp.Context) {
 		NoMention int `json:"no_mention"`
 	}
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("参数错误"))
+		respondRobotRequestInvalid(c, "")
 		return
 	}
 	if req.NoMention != 0 && req.NoMention != 1 {
-		c.ResponseError(errors.New("no_mention 只能为 0 或 1"))
+		respondRobotRequestInvalid(c, "no_mention")
 		return
 	}
 
@@ -149,7 +151,7 @@ func (rb *Robot) setMentionPref(c *wkhttp.Context) {
 	if err != nil {
 		rb.Error("写入 bot_mention_pref 失败", zap.Error(err),
 			zap.String("robot_id", robotID), zap.String("group_no", groupNo))
-		c.ResponseError(errors.New("更新失败"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
 		return
 	}
 	// 写库成功后即时通知对应 bot 失效缓存（best-effort，异步不阻塞主流程；
@@ -181,7 +183,7 @@ func (rb *Robot) deleteMentionPref(c *wkhttp.Context) {
 	if err != nil {
 		rb.Error("删除 bot_mention_pref 失败", zap.Error(err),
 			zap.String("robot_id", robotID), zap.String("group_no", groupNo))
-		c.ResponseError(errors.New("删除失败"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
 		return
 	}
 	// 删除回退账号级默认即 no_mention=0；同样推事件让 adapter 即时失效缓存
@@ -270,7 +272,7 @@ func (rb *Robot) getMentionPref(c *wkhttp.Context) {
 		// dbr 在无记录时返回 ErrNotFound；其它错误才算真失败。
 		rb.Error("查询 bot_mention_pref 失败", zap.Error(err),
 			zap.String("robot_id", robotID), zap.String("group_no", groupNo))
-		c.ResponseError(errors.New("查询失败"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
 		return
 	}
 
@@ -283,7 +285,7 @@ func (rb *Robot) getMentionPref(c *wkhttp.Context) {
 		} else {
 			rb.Error("查询 group.allow_no_mention 失败", zap.Error(err),
 				zap.String("robot_id", robotID), zap.String("group_no", groupNo))
-			c.ResponseError(errors.New("查询失败"))
+			httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
 			return
 		}
 	}
@@ -351,7 +353,7 @@ func (rb *Robot) listGroups(c *wkhttp.Context) {
 	_, err := rb.ctx.DB().SelectBySql(sql, args...).Load(&rows)
 	if err != nil {
 		rb.Error("列群查询失败", zap.Error(err), zap.String("robot_id", robotID))
-		c.ResponseError(errors.New("查询群组失败"))
+		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
 		return
 	}
 
