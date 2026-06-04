@@ -458,7 +458,7 @@ func TestManager_RemoveMembers(t *testing.T) {
 		req.Header.Set("token", token)
 		s.GetRoute().ServeHTTP(w, req)
 		assert.NotEqual(t, http.StatusOK, w.Code)
-		assert.Contains(t, w.Body.String(), "拥有者")
+		assertSpaceErrorCode(t, w, "err.server.space.owner_constraint")
 		owner, err := testSpaceDB.queryMember("mgr-rm", "u-owner")
 		assert.NoError(t, err)
 		assert.NotNil(t, owner, "owner must remain active")
@@ -501,7 +501,7 @@ func TestManager_UpdateMemberRole(t *testing.T) {
 		req.Header.Set("token", token)
 		s.GetRoute().ServeHTTP(w, req)
 		assert.NotEqual(t, http.StatusOK, w.Code)
-		assert.Contains(t, w.Body.String(), "拥有者")
+		assertSpaceErrorCode(t, w, "err.server.space.owner_constraint")
 
 		mem, err := testSpaceDB.queryMember("mgr-role", "m-target")
 		assert.NoError(t, err)
@@ -1002,7 +1002,7 @@ func TestManager_AuthBoundary(t *testing.T) {
 		req.Header.Set("token", testutil.Token)
 		s.GetRoute().ServeHTTP(w, req)
 		assert.NotEqual(t, http.StatusOK, w.Code)
-		assert.Contains(t, w.Body.String(), "角色")
+		assertSpaceErrorCode(t, w, "err.shared.auth.forbidden")
 	})
 }
 
@@ -1274,32 +1274,32 @@ func TestManager_CreateSpace_ValidationErrors(t *testing.T) {
 	cases := []struct {
 		name string
 		body map[string]interface{}
-		msg  string
+		code string
 	}{
 		{
 			"missing creator_uid",
 			map[string]interface{}{"name": "n"},
-			"creator_uid",
+			"err.server.space.request_invalid",
 		},
 		{
 			"missing name",
 			map[string]interface{}{"creator_uid": "u-ok"},
-			"名称",
+			"err.server.space.request_invalid",
 		},
 		{
 			"invalid join_mode",
 			map[string]interface{}{"creator_uid": "u-ok", "name": "n", "join_mode": 9},
-			"加入模式",
+			"err.server.space.request_invalid",
 		},
 		{
 			"negative max_users",
 			map[string]interface{}{"creator_uid": "u-ok", "name": "n", "max_users": -1},
-			"max_users",
+			"err.server.space.request_invalid",
 		},
 		{
 			"creator not exists",
 			map[string]interface{}{"creator_uid": "ghost", "name": "n"},
-			"用户不存在",
+			"err.server.space.member_not_found",
 		},
 	}
 	for _, tc := range cases {
@@ -1310,7 +1310,7 @@ func TestManager_CreateSpace_ValidationErrors(t *testing.T) {
 			req.Header.Set("token", token)
 			s.GetRoute().ServeHTTP(w, req)
 			assert.NotEqual(t, http.StatusOK, w.Code)
-			assert.Contains(t, w.Body.String(), tc.msg)
+			assertSpaceErrorCode(t, w, tc.code)
 		})
 	}
 }
@@ -1673,7 +1673,7 @@ func TestManager_UpdateSpaceProfile_Validation(t *testing.T) {
 		}
 		w := doPUT(util.ToJson(map[string]interface{}{"max_users": 2}))
 		assert.NotEqual(t, http.StatusOK, w.Code)
-		assert.Contains(t, w.Body.String(), "成员")
+		assertSpaceErrorCode(t, w, "err.server.space.request_invalid")
 	})
 
 	t.Run("reject when space does not exist", func(t *testing.T) {

@@ -20,6 +20,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/server"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	modulescommon "github.com/Mininglamp-OSS/octo-server/modules/common"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -68,7 +69,7 @@ func TestMain(m *testing.M) {
 	db.Close()
 
 	// 创建共享测试服务器（只初始化一次，避免路由重复注册）
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newRenderedTestServer()
 	testSrv = s
 	testCtx = ctx
 	testSpaceDB = NewDB(ctx)
@@ -77,6 +78,17 @@ func TestMain(m *testing.M) {
 }
 
 func strPtr(s string) *string { return &s }
+
+// newRenderedTestServer wraps testutil.NewTestServer and injects the i18n
+// ErrorRenderer (mirrors main.go at boot) so the migrated handlers respond via
+// the dual envelope with a populated error.code. Without it the route falls back
+// to the legacy {msg,status} carrying the English DefaultMessage.
+// testutil.NewTestServer (octo-lib) is intentionally not touched.
+func newRenderedTestServer() (*server.Server, *config.Context) {
+	srv, ctx := testutil.NewTestServer()
+	srv.GetRoute().SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
+	return srv, ctx
+}
 
 // setup 返回共享的测试服务器和 Space 实例，并清理表数据
 func setup(t *testing.T) (*server.Server, *Space, error) {
@@ -88,7 +100,7 @@ func setup(t *testing.T) (*server.Server, *Space, error) {
 
 func TestGetInvitePreview(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newRenderedTestServer()
 	f := New(ctx)
 
 	// 清空旧数据
@@ -145,7 +157,7 @@ func TestGetInvitePreview(t *testing.T) {
 
 func TestGetInvitePreviewWithBots(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newRenderedTestServer()
 	f := New(ctx)
 
 	// 清空旧数据
@@ -231,7 +243,7 @@ func TestGetInvitePreviewInvalidCode(t *testing.T) {
 }
 
 func TestUpdateInvite(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newRenderedTestServer()
 	f := New(ctx)
 
 	// 清空旧数据
@@ -294,7 +306,7 @@ func TestUpdateInvite(t *testing.T) {
 }
 
 func TestUpdateInviteNoPermission(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newRenderedTestServer()
 	f := New(ctx)
 
 	// 清空旧数据
@@ -341,11 +353,11 @@ func TestUpdateInviteNoPermission(t *testing.T) {
 	s.GetRoute().ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "无权限")
+	assertSpaceErrorCode(t, w, "err.server.space.permission_denied")
 }
 
 func TestUpdateInviteInvalidCode(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newRenderedTestServer()
 	f := New(ctx)
 
 	// 清空旧数据
@@ -382,11 +394,11 @@ func TestUpdateInviteInvalidCode(t *testing.T) {
 	s.GetRoute().ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "邀请码不存在")
+	assertSpaceErrorCode(t, w, "err.server.space.invite_code_not_found")
 }
 
 func TestJoinSpaceFullReturnsSpaceFullError(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newRenderedTestServer()
 	f := New(ctx)
 
 	// 清空旧数据
@@ -441,7 +453,7 @@ func TestJoinSpaceFullReturnsSpaceFullError(t *testing.T) {
 }
 
 func TestJoinSpaceSuccessWithCapacity(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newRenderedTestServer()
 	f := New(ctx)
 
 	// 清空旧数据
@@ -499,7 +511,7 @@ func TestJoinSpaceSuccessWithCapacity(t *testing.T) {
 }
 
 func TestJoinSpaceUnlimitedCapacity(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newRenderedTestServer()
 	f := New(ctx)
 
 	// 清空旧数据
@@ -555,7 +567,7 @@ func TestJoinSpaceUnlimitedCapacity(t *testing.T) {
 
 func TestJoinSpaceWithPresetGroup(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newRenderedTestServer()
 	f := New(ctx)
 
 	// 清空旧数据
@@ -620,7 +632,7 @@ func TestJoinSpaceWithPresetGroup(t *testing.T) {
 }
 
 func TestJoinSpaceWithNoPresetGroup(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newRenderedTestServer()
 	f := New(ctx)
 
 	// 清空旧数据
@@ -677,7 +689,7 @@ func TestJoinSpaceWithNoPresetGroup(t *testing.T) {
 }
 
 func TestJoinSpacePresetGroupIdempotent(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newRenderedTestServer()
 	f := New(ctx)
 
 	// 清空旧数据
@@ -748,7 +760,7 @@ func TestJoinSpacePresetGroupIdempotent(t *testing.T) {
 }
 
 func TestJoinSpacePresetGroupDisbanded(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newRenderedTestServer()
 	f := New(ctx)
 
 	// 清空旧数据
@@ -1004,7 +1016,7 @@ func TestJoinApplies_NoPermission(t *testing.T) {
 	s.GetRoute().ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "无权限")
+	assertSpaceErrorCode(t, w, "err.server.space.permission_denied")
 }
 
 func TestApproveJoinApply_Success(t *testing.T) {
@@ -1353,7 +1365,7 @@ func TestRejectJoinApply_CrossSpaceBlocked(t *testing.T) {
 	s.GetRoute().ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusBadRequest, w.Code, "跨空间拒绝应被阻止")
-	assert.Contains(t, w.Body.String(), "不属于当前空间")
+	assertSpaceErrorCode(t, w, "err.server.space.apply_not_found")
 
 	// 验证申请状态未被修改
 	apply, err := f.db.queryJoinApplyByID(applyID)
@@ -1583,7 +1595,7 @@ func TestCreateSpace_DisabledBySystemSetting(t *testing.T) {
 	req.Header.Set("token", testutil.Token)
 	s.GetRoute().ServeHTTP(w, req)
 
-	assert.Equal(t, http.StatusForbidden, w.Code, "DB 开关 ON 时应返回 403, body=%s", w.Body.String())
+	assert.Equal(t, http.StatusBadRequest, w.Code, "DB 开关 ON 时应返回 403, body=%s", w.Body.String())
 	assert.Contains(t, w.Body.String(), "已关闭")
 
 	var count int
@@ -1607,7 +1619,7 @@ func TestCreateSpace_DisabledByEnv(t *testing.T) {
 	req.Header.Set("token", testutil.Token)
 	s.GetRoute().ServeHTTP(w, req)
 
-	assert.Equal(t, http.StatusForbidden, w.Code, "应返回 403")
+	assert.Equal(t, http.StatusBadRequest, w.Code, "应返回 403")
 	assert.Contains(t, w.Body.String(), "已关闭")
 
 	// 不应有新空间入库：按 name 反查
@@ -1731,7 +1743,7 @@ func TestApproveJoinApply_InviteExhaustedBlocksApproval(t *testing.T) {
 	s.GetRoute().ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "已用尽")
+	assertSpaceErrorCode(t, w, "err.server.space.invite_code_exhausted")
 
 	// 申请状态应回滚为 0，保留 owner 后续处理余地
 	updated, err := f.db.queryJoinApplyByID(applyID)
@@ -1775,7 +1787,7 @@ func TestApproveJoinApply_InviteDisabledBlocksApproval(t *testing.T) {
 	s.GetRoute().ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "已失效")
+	assertSpaceErrorCode(t, w, "err.server.space.invite_code_exhausted")
 
 	updated, err := f.db.queryJoinApplyByID(applyID)
 	assert.NoError(t, err)
@@ -1952,8 +1964,8 @@ func TestE2E_DisableUserCreateSpace_FullChain(t *testing.T) {
 	writeSetting("1")
 	assert.Contains(t, getAppconfig(), `"disable_user_create_space":1`,
 		"manager 写入后 appconfig 必须立刻下发 1")
-	assert.Equal(t, http.StatusForbidden, createSpace("e2e-off"),
-		"开关 ON 时 createSpace 必须 403")
+	assert.Equal(t, http.StatusBadRequest, createSpace("e2e-off"),
+		"开关 ON 时 createSpace 必须被拒绝（D14 wire 400 + error.http_status 403）")
 
 	// --- Step 2: 重新打开 ---
 	writeSetting("0")

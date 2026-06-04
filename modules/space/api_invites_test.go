@@ -194,7 +194,7 @@ func TestListInvites_MemberForbidden(t *testing.T) {
 	req.Header.Set("token", testutil.Token)
 	s.GetRoute().ServeHTTP(w, req)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "无权限")
+	assertSpaceErrorCode(t, w, "err.server.space.permission_denied")
 }
 
 // TestListInvites_NonMemberForbidden: 非空间成员完全不可访问。
@@ -213,7 +213,7 @@ func TestListInvites_NonMemberForbidden(t *testing.T) {
 	req.Header.Set("token", testutil.Token)
 	s.GetRoute().ServeHTTP(w, req)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "无权限")
+	assertSpaceErrorCode(t, w, "err.server.space.permission_denied")
 }
 
 // TestDeleteInvite_SoftDisable: admin 可软禁用邀请码。
@@ -256,7 +256,7 @@ func TestDeleteInvite_MemberForbidden(t *testing.T) {
 	req.Header.Set("token", testutil.Token)
 	s.GetRoute().ServeHTTP(w, req)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "无权限")
+	assertSpaceErrorCode(t, w, "err.server.space.permission_denied")
 }
 
 // TestDeleteInvite_CodeNotFound: 删除不存在的邀请码返回错误。
@@ -342,7 +342,7 @@ func TestUpdateInvite_StatusPayload_MemberForbidden(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	s.GetRoute().ServeHTTP(w, req)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "无权限")
+	assertSpaceErrorCode(t, w, "err.server.space.permission_denied")
 
 	// 底层未变
 	var status int

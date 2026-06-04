@@ -7,10 +7,10 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/Mininglamp-OSS/octo-server/pkg/db"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/db"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"go.uber.org/zap"
@@ -84,10 +84,10 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 		auth.GET("/spaces/disabled", m.disableList) // 已解散 / 已封禁空间列表
 
 		// 空间单体
-		auth.GET("/spaces/:space_id", m.detail)                      // 空间详情
-		auth.PUT("/spaces/:space_id", m.updateSpaceProfile)          // 修改基础信息（名称/加入方式/成员上限等）
-		auth.DELETE("/spaces/:space_id", m.forceDisband)             // 强制解散
-		auth.PUT("/spaces/:space_id/status/:status", m.liftBan)      // 封禁(2) / 解禁(1)
+		auth.GET("/spaces/:space_id", m.detail)                 // 空间详情
+		auth.PUT("/spaces/:space_id", m.updateSpaceProfile)     // 修改基础信息（名称/加入方式/成员上限等）
+		auth.DELETE("/spaces/:space_id", m.forceDisband)        // 强制解散
+		auth.PUT("/spaces/:space_id/status/:status", m.liftBan) // 封禁(2) / 解禁(1)
 
 		// 成员
 		auth.GET("/spaces/:space_id/members", m.members)                    // 成员列表

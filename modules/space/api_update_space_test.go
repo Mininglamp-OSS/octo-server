@@ -320,7 +320,7 @@ func TestUserUpdateSpace_Auth(t *testing.T) {
 
 		w := putSpace(t, spaceId, body, testutil.Token)
 		assert.NotEqual(t, http.StatusOK, w.Code)
-		assert.Contains(t, w.Body.String(), "无权限")
+		assertSpaceErrorCode(t, w, "err.server.space.permission_denied")
 	})
 
 	t.Run("role=0 plain member is rejected", func(t *testing.T) {
@@ -342,7 +342,7 @@ func TestUserUpdateSpace_Auth(t *testing.T) {
 
 		w := putSpace(t, spaceId, body, testutil.Token)
 		assert.NotEqual(t, http.StatusOK, w.Code)
-		assert.Contains(t, w.Body.String(), "无权限")
+		assertSpaceErrorCode(t, w, "err.server.space.permission_denied")
 	})
 
 	t.Run("role=1 admin is accepted", func(t *testing.T) {
