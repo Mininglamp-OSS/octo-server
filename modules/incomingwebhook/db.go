@@ -109,6 +109,10 @@ var updateFieldsAllowed = map[string]struct{}{
 // 写回，令已删除 webhook 复活（重回列表 + 旧 token 可推送）。InnoDB 行锁让该条件 UPDATE
 // 与并发 DELETE 的 UPDATE 串行化，保证"一旦删除，任何后续写都落空"。调用方应回读确认
 // 行未被软删除（见 api 层 update / regenerate）。
+//
+// ⚠️ 正确性依赖单语句 autocommit 的当前读（UPDATE ... WHERE 对最新已提交行版本求值）。
+// 若未来把 update + 回读包进同一显式 REPEATABLE READ 事务、改用快照 SELECT，这个
+// "删除后写必落空"的不变量会被破坏，须改用 SELECT ... FOR UPDATE 重新串行化。
 func (d *incomingWebhookDB) updateFields(webhookID string, fields map[string]interface{}) error {
 	if len(fields) == 0 {
 		return nil

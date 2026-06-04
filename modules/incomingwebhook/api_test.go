@@ -317,6 +317,92 @@ func TestDelete_ConcurrentUpdate_NoRevive(t *testing.T) {
 	assert.Equalf(t, http.StatusUnauthorized, w.Code, "deleted webhook token must stay revoked, body=%s", w.Body.String())
 }
 
+// TestDelete_ConcurrentRegenerate_NoRevive 端到端回归 DELETE 与 regenerate 并发：
+// regenerate 有自己的"回读 + 返回新 token"路径，必须同样不能复活已删除 webhook。无论
+// regenerate 是否赢得竞态轮换 token，删除最终生效——webhook 不在列表，且最初的 token
+// 始终失效（要么被某次 regenerate 换掉，要么因 status=2 失效）。
+func TestDelete_ConcurrentRegenerate_NoRevive(t *testing.T) {
+	handler, _, groupNo := setupTestEnv(t)
+	w := do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), map[string]interface{}{
+		"name": "x",
+	}))
+	assert.Equal(t, http.StatusOK, w.Code)
+	created := parseJSON(t, w)
+	whID := created["webhook_id"].(string)
+	token := created["token"].(string)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		do(handler, authReq("DELETE", fmt.Sprintf("/v1/groups/%s/incoming-webhooks/%s", groupNo, whID), nil))
+	}()
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks/%s/regenerate", groupNo, whID), nil))
+		}()
+	}
+	wg.Wait()
+
+	// 删除必须最终生效：列表不含该 webhook。
+	w = do(handler, authReq("GET", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), nil))
+	res := parseJSON(t, w)
+	list, _ := res["list"].([]interface{})
+	assert.Emptyf(t, list, "deleted webhook must not be revived by concurrent regenerate; list=%v", list)
+
+	// 最初的 token 必须保持失效。
+	body, _ := json.Marshal(pushReq{Content: "hi"})
+	w = do(handler, anonReq("POST", fmt.Sprintf("/v1/incoming-webhooks/%s/%s", whID, token), body))
+	assert.Equalf(t, http.StatusUnauthorized, w.Code, "original token must stay revoked, body=%s", w.Body.String())
+}
+
+// TestUpdate_DBError_Returns5xx / TestRegenerate_DBError_Returns5xx 守护本 PR 的语义
+// 变更：update / regenerate 在底层表不可用时按 5xx 失败，绝不退回旧的 stale-200 兜底
+// （那会谎报成功）。
+//
+// 实现说明：通过 RENAME 掉 incoming_webhook 表注入查询故障。黑盒下故障会先命中
+// queryManageable 的前置读（同样返回 5xx），无法单独触发"写后回读"那一支；但本测试仍
+// 锁定了总契约——这些管理写端点在 DB 不可用时一律 5xx，不会返回 stale-200。
+func TestUpdate_DBError_Returns5xx(t *testing.T) {
+	handler, ctx, groupNo := setupTestEnv(t)
+	w := do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), map[string]interface{}{
+		"name": "x",
+	}))
+	assert.Equal(t, http.StatusOK, w.Code)
+	whID := parseJSON(t, w)["webhook_id"].(string)
+
+	_, err := ctx.DB().UpdateBySql("RENAME TABLE incoming_webhook TO incoming_webhook_bak").Exec()
+	assert.NoError(t, err)
+	defer func() {
+		_, _ = ctx.DB().UpdateBySql("RENAME TABLE incoming_webhook_bak TO incoming_webhook").Exec()
+	}()
+
+	name := "x2"
+	w = do(handler, authReq("PUT", fmt.Sprintf("/v1/groups/%s/incoming-webhooks/%s", groupNo, whID),
+		map[string]interface{}{"name": name}))
+	assert.GreaterOrEqualf(t, w.Code, 500, "update must fail as 5xx when the table is unavailable, never stale-200; code=%d body=%s", w.Code, w.Body.String())
+}
+
+func TestRegenerate_DBError_Returns5xx(t *testing.T) {
+	handler, ctx, groupNo := setupTestEnv(t)
+	w := do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), map[string]interface{}{
+		"name": "x",
+	}))
+	assert.Equal(t, http.StatusOK, w.Code)
+	whID := parseJSON(t, w)["webhook_id"].(string)
+
+	_, err := ctx.DB().UpdateBySql("RENAME TABLE incoming_webhook TO incoming_webhook_bak").Exec()
+	assert.NoError(t, err)
+	defer func() {
+		_, _ = ctx.DB().UpdateBySql("RENAME TABLE incoming_webhook_bak TO incoming_webhook").Exec()
+	}()
+
+	w = do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks/%s/regenerate", groupNo, whID), nil))
+	assert.GreaterOrEqualf(t, w.Code, 500, "regenerate must fail as 5xx when the table is unavailable, never stale-200; code=%d body=%s", w.Code, w.Body.String())
+}
+
 func TestRegenerate_RotatesToken(t *testing.T) {
 	handler, _, groupNo := setupTestEnv(t)
 	w := do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), map[string]interface{}{
