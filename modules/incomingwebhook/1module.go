@@ -13,8 +13,9 @@ var sqlFS embed.FS
 func init() {
 	register.AddModule(func(ctx interface{}) register.Module {
 		x := ctx.(*config.Context)
-		// datasource 只需读 incoming_webhook 表，用独立轻量 db session 即可，
-		// 不必提前构造完整 API（避免在注册阶段建 redis 等重资源）。
+		// datasource 只需读 incoming_webhook 表，用 ctx.DB()（进程级共享、mysqlOnce
+		// 守卫的 session）构造一个轻量 db handle 即可，不必提前构造完整 API（避免在
+		// 注册阶段就建 redis 等重资源）。
 		d := newDB(x)
 		return register.Module{
 			Name: "incomingwebhook",

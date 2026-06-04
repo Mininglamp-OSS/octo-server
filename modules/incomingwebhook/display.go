@@ -15,12 +15,21 @@ import (
 // 避免"用户信息不存在/500/头像裂图"。
 const webhookIDPrefix = "iwh_"
 
-// ChannelResp.Extra 里下发的 key 约定。user 模块的头像端点据 ExtraAvatarKey 取原始
+// WebhookIDPrefix / ExtraAvatarKey 是导出的契约常量别名，仅供其它模块的【测试】校验
+// 跨包常量一致性（见 modules/user 的一致性测试）。生产代码请勿跨层 import 本（上层）
+// 模块——user 侧本地复制同值常量以保持分层方向，编译期不可见的漂移由该测试兜底。
+const (
+	WebhookIDPrefix = webhookIDPrefix
+	ExtraAvatarKey  = extraAvatarKey
+)
+
+// ChannelResp.Extra 里下发的 key 约定。user 模块的头像端点据 extraAvatarKey 取原始
 // avatar URL 做重定向；契约在两侧各自定义同名常量（user 模块不 import 本上层模块）。
+// 刻意不下发 group_no：渲染发送者名/头像不需要它，且避免任意登录用户据 iwh_ 反查到
+// webhook 归属群（租户信息最小暴露，PR #250 review）。
 const (
 	extraKindKey   = "kind"           // 固定为 "webhook"，便于客户端识别非真实用户
 	extraAvatarKey = "webhook_avatar" // webhook 创建时填写的原始头像 URL（可能为空）
-	extraGroupKey  = "group_no"       // webhook 归属群
 	extraKindValue = "webhook"
 )
 
@@ -53,11 +62,14 @@ func newWebhookChannelResp(m *incomingWebhookModel) *model.ChannelResp {
 	resp.Name = webhookDisplayName(m)
 	resp.Logo = fmt.Sprintf("users/%s/avatar", m.WebhookID)
 	resp.Category = extraKindValue
+	// Status 固定 1（ChannelResp 语义 0/1 均为"正常"，2 才是黑名单）。webhook 的展示
+	// 身份刻意不反映 enabled/disabled：历史消息无论 webhook 当前是否被禁用（群解散会
+	// disable 而非 delete）都需渲染出发送者名/头像；推送鉴权在 push 路径独立 gate
+	// m.Status，与展示互不影响（PR #250 review，deliberate divergence）。
 	resp.Status = 1
 	resp.Extra = map[string]interface{}{
 		extraKindKey:   extraKindValue,
 		extraAvatarKey: m.Avatar,
-		extraGroupKey:  m.GroupNo,
 	}
 	return resp
 }

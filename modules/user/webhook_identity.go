@@ -25,6 +25,14 @@ const (
 	webhookExtraAvatarKey = "webhook_avatar"
 )
 
+// 导出别名仅供 incomingwebhook 包的测试做跨包契约一致性校验（见其 display_test.go），
+// 把"本地复制的常量"与"上层源头常量"在编译期/测试期绑定，防止任一侧改动后悄悄漂移。
+// 生产代码不依赖这些导出。
+const (
+	WebhookUIDPrefix      = webhookUIDPrefix
+	WebhookExtraAvatarKey = webhookExtraAvatarKey
+)
+
 // resolveWebhookChannel 通过 BussDataSource.ChannelGet 链解析 webhook 合成身份的展示
 // 信息（名称/头像）。
 //
