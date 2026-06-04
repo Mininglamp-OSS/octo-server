@@ -197,7 +197,7 @@ jobs:
             mysql -h 127.0.0.1 -uroot -pdemo -e "DROP DATABASE IF EXISTS test; CREATE DATABASE test CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
             redis-cli -h 127.0.0.1 -p 6379 FLUSHALL >/dev/null
             echo "::group::go test $pkg"
-            if ! go test -race -count=1 -timeout 5m "$pkg"; then
+            if ! go test -race -shuffle=on -count=1 -timeout 5m "$pkg"; then
               fail=1
             fi
             echo "::endgroup::"
