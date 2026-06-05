@@ -15,13 +15,13 @@ ENV GO111MODULE on
 
 WORKDIR /go/cache
 
-ADD go.mod .
-ADD go.sum .
+COPY go.mod .
+COPY go.sum .
 RUN go mod download
 
 WORKDIR /go/release
 
-ADD . .
+COPY . .
 
 RUN GIT_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo unknown) && \
     GIT_COMMIT_DATE=$(git log --date=iso8601-strict -1 --pretty=%ct 2>/dev/null || echo 0) && \
@@ -32,7 +32,7 @@ RUN GIT_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo unknown) && \
       -installsuffix cgo -o app ./main.go
 
 
-FROM alpine AS prod
+FROM alpine:3.21 AS prod
 COPY --from=build /etc/passwd /etc/passwd
 COPY --from=build /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
 RUN mkdir -p /usr/share/zoneinfo/Asia && \

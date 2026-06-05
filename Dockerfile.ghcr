@@ -14,4 +14,4 @@ RUN apt-get update && \
 COPY assets ./assets
 COPY configs ./configs
 COPY --chmod=0755 linux_${TARGETARCH} main
-CMD /app/main
+CMD ["/app/main"]

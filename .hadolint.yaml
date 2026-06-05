@@ -1,0 +1,5 @@
+# DL3008: Pin versions in apt-get install.
+# Pinning Debian package versions is fragile (versions rotate with point releases)
+# and breaks reproducibility more than it helps in practice.
+ignored:
+  - DL3008
