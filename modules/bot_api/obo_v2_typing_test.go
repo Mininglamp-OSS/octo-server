@@ -32,6 +32,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/gin-gonic/gin"
 )
 
@@ -190,7 +191,7 @@ func TestTyping_V2_OBOContextWithoutGrantDenied(t *testing.T) {
 	c := buildTypingCtx(rec, body)
 	ba.typing(c)
 
-	if !strings.Contains(rec.Body.String(), "obo not authorized") {
+	if !strings.Contains(rec.Body.String(), errcode.ErrBotAPIOBONotAuthorized.DefaultMessage) {
 		t.Fatalf("typing on_behalf_of a non-granting user must surface obo-not-authorized; got body=%s", rec.Body.String())
 	}
 	if len(cap.cmds) != 0 {
@@ -205,10 +206,10 @@ func TestTyping_V2_OBOContextWithoutGrantDenied(t *testing.T) {
 func TestTyping_V2_OBOContextDispatchesGroupTypingAsGrantor(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	const (
-		admin    = "user_admin"
-		bot      = "bot_clone_james"
-		groupNo  = "group_42"
-		botKind  = BotKindUser
+		admin   = "user_admin"
+		bot     = "bot_clone_james"
+		groupNo = "group_42"
+		botKind = BotKindUser
 	)
 	s := newFakeOBOStore()
 	gid, _ := s.insertGrant(admin, bot, "auto", "")

@@ -14,6 +14,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/voice_adapter"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 )
@@ -229,7 +230,7 @@ func TestBotPutVoiceContext_Overlength(t *testing.T) {
 	ba.botPutVoiceContext(c)
 
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
-	assert.Contains(t, rec.Body.String(), "max length")
+	assert.Contains(t, rec.Body.String(), errcode.ErrBotAPIContentTooLarge.DefaultMessage)
 }
 
 func TestResolveOwnerAndSpace_AppBotRejected(t *testing.T) {
@@ -248,7 +249,7 @@ func TestResolveOwnerAndSpace_AppBotRejected(t *testing.T) {
 
 	assert.False(t, ok)
 	assert.Equal(t, http.StatusForbidden, rec.Code)
-	assert.Contains(t, rec.Body.String(), "app bot does not support voice")
+	assert.Contains(t, rec.Body.String(), errcode.ErrBotAPIAppBotUnsupported.DefaultMessage)
 }
 
 func TestResolveOwnerAndSpace_NilRobot(t *testing.T) {
@@ -396,7 +397,7 @@ func TestBotTranscribe_UnknownModeRejected(t *testing.T) {
 	ba.botTranscribe(c)
 
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
-	assert.Contains(t, rec.Body.String(), "invalid mode")
+	assert.Contains(t, rec.Body.String(), errcode.ErrBotAPIRequestInvalid.DefaultMessage)
 }
 
 func TestBotTranscribe_MultipleFormFields(t *testing.T) {

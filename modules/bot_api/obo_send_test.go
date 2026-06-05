@@ -25,6 +25,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/gin-gonic/gin"
 )
 
@@ -169,7 +170,7 @@ func TestSendMessage_OBO_Unauthorized_Returns400Body(t *testing.T) {
 	// ResponseError → 400 with body containing the message. Asserting on
 	// the body rather than the code keeps the test independent of the
 	// project's choice of error transport.
-	if !strings.Contains(rec.Body.String(), ErrOBONotAuthorized.Error()) {
+	if !strings.Contains(rec.Body.String(), errcode.ErrBotAPIOBONotAuthorized.DefaultMessage) {
 		t.Fatalf("expected obo-not-authorized in body, got %s", rec.Body.String())
 	}
 	if dc.captured != nil {
@@ -411,7 +412,7 @@ func TestSendMessage_OBO_GrantorReplyBypass_RequiresActiveGrant(t *testing.T) {
 	c.Set(CtxKeyRobot, &robotModel{RobotID: botID, CreatorUID: stranger})
 
 	ba.sendMessage(c)
-	if !strings.Contains(rec.Body.String(), ErrOBONotAuthorized.Error()) {
+	if !strings.Contains(rec.Body.String(), errcode.ErrBotAPIOBONotAuthorized.DefaultMessage) {
 		t.Fatalf("bypass must refuse to fire without a real grant; expected obo-not-authorized, got %s", rec.Body.String())
 	}
 	if dc.captured != nil {
@@ -496,7 +497,7 @@ func TestSendMessage_OBO_GrantorReplyBypass_DoesNotApplyToThirdPartySend(t *test
 	}
 
 	ba.sendMessage(c)
-	if !strings.Contains(rec.Body.String(), ErrOBONotAuthorized.Error()) {
+	if !strings.Contains(rec.Body.String(), errcode.ErrBotAPIOBONotAuthorized.DefaultMessage) {
 		t.Fatalf("third-party OBO send with explicit-disabled scope must still be rejected; got %s", rec.Body.String())
 	}
 	if dc.captured != nil {
@@ -602,7 +603,7 @@ func TestSendMessage_RejectsReservedOBOKey(t *testing.T) {
 
 	ba.sendMessage(c)
 	// Body must carry the reject message; dispatch must NOT fire.
-	if !strings.Contains(rec.Body.String(), "__obo_") {
+	if !strings.Contains(rec.Body.String(), errcode.ErrBotAPIOBOReservedField.DefaultMessage) {
 		t.Fatalf("expected reject body to mention __obo_ prefix, got %s", rec.Body.String())
 	}
 	if dc.captured != nil {
@@ -711,7 +712,7 @@ func TestBotMessage_OBOReservedKeysKept(t *testing.T) {
 
 	// Reject must carry a body that mentions the prefix so bot authors
 	// can grep for it in their logs.
-	if !strings.Contains(rec.Body.String(), "__obo_") {
+	if !strings.Contains(rec.Body.String(), errcode.ErrBotAPIOBOReservedField.DefaultMessage) {
 		t.Fatalf("expected bot-API reject body to mention __obo_ prefix, got %s", rec.Body.String())
 	}
 	// And no dispatch (= the strip-and-pass behavior the user ingress
