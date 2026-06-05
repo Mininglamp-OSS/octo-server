@@ -1,6 +1,7 @@
 package bot_api
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"runtime/debug"
@@ -15,6 +16,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/gin-gonic/gin"
+	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
 )
 
@@ -86,7 +88,12 @@ func (ba *BotAPI) getGroupInfo(c *wkhttp.Context) {
 	_, err = ba.db.session.Select("group_no, name, IFNULL(notice,'') notice, IFNULL(creator,'') creator, status, created_at").
 		From("`group`").Where("group_no=?", groupNo).Load(&grp)
 	if err != nil {
-		httperr.ResponseErrorL(c, errcode.ErrBotAPIGroupNotFound, nil, nil)
+		if errors.Is(err, dbr.ErrNotFound) {
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIGroupNotFound, nil, nil)
+			return
+		}
+		ba.Error("query group info failed", zap.Error(err), zap.String("groupNo", groupNo))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 		return
 	}
 

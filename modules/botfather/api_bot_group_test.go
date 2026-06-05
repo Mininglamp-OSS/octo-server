@@ -11,6 +11,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/stretchr/testify/assert"
 
 	// Ensure dependent modules register SQL migrations and HTTP routes.
@@ -135,7 +136,7 @@ func TestBotGroupCreate_EmptyMembers(t *testing.T) {
 	}))
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "members is required")
+	assert.Contains(t, w.Body.String(), errcode.ErrBotAPIRequestInvalid.DefaultMessage)
 }
 
 func TestBotGroupCreate_EmptyCreator(t *testing.T) {
@@ -621,7 +622,7 @@ func TestBotSpaceMembers_RejectOtherSpace(t *testing.T) {
 	w := doRequest(handler, botReq("GET", fmt.Sprintf("/v1/bot/space/members?space_id=%s", otherSpaceID), botToken, nil))
 
 	assert.Equal(t, http.StatusForbidden, w.Code)
-	assert.Contains(t, w.Body.String(), "not a member of this space")
+	assert.Contains(t, w.Body.String(), errcode.ErrBotAPINotSpaceMember.DefaultMessage)
 }
 
 // TestBotGroupCreate_RejectCreatorOutsideSpace 验证 creator 不在 Space 时应失败
@@ -776,7 +777,7 @@ func TestBotGroupMemberAdd_RejectPureBotMembers(t *testing.T) {
 	}))
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "only human members")
+	assert.Contains(t, w.Body.String(), errcode.ErrBotAPIMemberNotHuman.DefaultMessage)
 }
 
 // TestBotGroupMemberAdd_MixedHumanAndBot 混合传入时 bot 被过滤，人正常添加
