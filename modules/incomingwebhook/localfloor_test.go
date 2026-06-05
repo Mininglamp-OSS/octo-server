@@ -152,10 +152,52 @@ func TestPerIPFloor_MemoryBounded(t *testing.T) {
 	assert.LessOrEqual(t, live, 2*maxEntries, "live per-IP buckets must stay bounded by ~2*maxEntries")
 }
 
-// TestPerIPFloor_PromotionKeepsActiveIPAlive: an IP that keeps pushing across a
-// generation rotation is promoted rather than evicted, so its bucket (and thus
-// its accumulated rate-limit state) survives — otherwise a steady IP would get a
-// fresh full burst on every rotation and the per-IP cap would be meaningless.
+// TestPerIPFloor_CyclingDoesNotGrowBeyondBound is the #288-review regression: a
+// cycling attacker who keeps `prev` warm (re-touches every prev entry to promote
+// it back into `cur`) and then refills `cur` with fresh IPs must NOT be able to
+// grow the live set past ~2*maxEntries. Before the promotion path enforced the
+// cap, each cycle grew live by ~maxEntries without bound. This drives that exact
+// pattern and asserts the bound holds.
+func TestPerIPFloor_CyclingDoesNotGrowBeyondBound(t *testing.T) {
+	const N = 4
+	p := newPerIPFloor(rate.Limit(1000), 1000, N)
+
+	// Seed cur=N, prev=N by churning 2N distinct new IPs.
+	for i := 0; i < 2*N; i++ {
+		p.allow(uniqueIP(i))
+	}
+
+	for cycle := 0; cycle < 10; cycle++ {
+		// Snapshot and re-touch every prev entry, promoting them back into cur.
+		p.mu.Lock()
+		prevKeys := make([]string, 0, len(p.prev))
+		for k := range p.prev {
+			prevKeys = append(prevKeys, k)
+		}
+		p.mu.Unlock()
+		for _, k := range prevKeys {
+			p.allow(k)
+		}
+		// Refill cur with fresh IPs to force the next rotation.
+		for i := 0; i < N; i++ {
+			p.allow(fmt.Sprintf("fresh-%d-%d", cycle, i))
+		}
+
+		p.mu.Lock()
+		live := len(p.cur) + len(p.prev)
+		p.mu.Unlock()
+		assert.LessOrEqualf(t, live, 2*N,
+			"live buckets must stay bounded even under cycling promotion (cycle=%d)", cycle)
+	}
+}
+
+// TestPerIPFloor_PromotionKeepsActiveIPAlive: an IP that keeps pushing is
+// promoted out of `prev` rather than evicted, so it survives AT LEAST the next
+// rotation and keeps its accumulated rate-limit state — otherwise a steady IP
+// would get a fresh full burst on every rotation and the per-IP cap would be
+// meaningless. (The guarantee is "survives one rotation", not "forever": cap
+// enforcement on promotion can still drop a survivor on a LATER rotation — see
+// TestPerIPFloor_CyclingDoesNotGrowBeyondBound for why that trade-off exists.)
 func TestPerIPFloor_PromotionKeepsActiveIPAlive(t *testing.T) {
 	const maxEntries = 4
 	// burst 1, ~no refill: the active IP gets exactly one token for its lifetime.

@@ -22,7 +22,7 @@ import (
 //
 // The floor has TWO Redis-independent layers, checked per request in order:
 //
-//  1. a per-IP in-memory token bucket (perIPFloor, ~50 rps / 100 burst), and
+//  1. a per-IP in-memory token bucket (perIPFloor, 100 rps / 200 burst), and
 //  2. a global per-instance token bucket (200 rps / 400 burst).
 //
 // The per-IP layer is checked FIRST so a single abusive IP can consume at most
@@ -33,9 +33,15 @@ import (
 // (many IPs) under a Redis outage, which is the instance cap's whole point —
 // a pure per-IP floor would lose that.
 //
-// Defaults are deliberately generous: under healthy Redis the per-IP request
-// limiter (100 rps) and per-webhook limiter (5 rps) are lower and bite first,
-// so the floor only engages as a backstop. Tunable via
+// Defaults are deliberately generous so the floor stays a Redis-outage backstop
+// rather than the binding cap under healthy Redis: the global layer (200 rps) is
+// above the Redis per-IP limiter (100 rps), and the per-IP layer is set EQUAL to
+// that Redis per-IP limiter (100 rps / 200 burst) — not below it — so it does not
+// narrow a legitimate high-volume IP's allowance while Redis is healthy (the
+// Redis limiter and this floor bite at the same per-IP threshold), yet it is half
+// the global floor so a single IP can still take at most ~half and never starve
+// others. The per-webhook limiter (5 rps) is lower still and shapes legit traffic
+// first. Tunable via
 // DM_INCOMINGWEBHOOK_LOCAL_RPS / _BURST (global) and
 // DM_INCOMINGWEBHOOK_LOCAL_PERIP_RPS / _BURST / _MAX_IPS (per-IP), read once at
 // construction (no hot reload, matching octo-lib's limiter middlewares).
@@ -53,11 +59,15 @@ const (
 	defaultLocalFloorRPS   = 200.0
 	defaultLocalFloorBurst = 400
 
-	// Per-IP sub-limit: a single IP gets at most ~50 rps / 100 burst of the
-	// global floor, so one IP cannot starve others. Lower than the global cap so
-	// several distinct IPs can coexist under the global ceiling.
-	defaultLocalFloorPerIPRPS   = 50.0
-	defaultLocalFloorPerIPBurst = 100
+	// Per-IP sub-limit: a single IP gets at most 100 rps / 200 burst of the
+	// global floor, so one IP cannot starve others. Set EQUAL to the Redis per-IP
+	// StrictIPRateLimitMiddleware (defaultIngressIPRPS/Burst, 100/200) so under
+	// healthy Redis this always-on floor does not throttle a legit high-volume IP
+	// any tighter than the Redis limiter already would; it is still half the
+	// global cap, so several distinct IPs coexist under the global ceiling and no
+	// single IP drains it. Keep these two in lockstep if either is retuned.
+	defaultLocalFloorPerIPRPS   = 100.0
+	defaultLocalFloorPerIPBurst = 200
 	// Hard cap on the number of distinct per-IP buckets kept in memory, so a
 	// Redis-down DISTRIBUTED flood (many source IPs) cannot grow the map without
 	// bound. At the cap the oldest generation of buckets is dropped wholesale
@@ -121,12 +131,15 @@ const perIPUnknownKey = "__unknown_ip__"
 // perIPFloor is a Redis-independent, memory-bounded set of per-IP token
 // buckets. Memory is capped WITHOUT a background goroutine using a
 // two-generation map: lookups hit `cur` first, then promote from `prev`; when
-// `cur` fills to maxEntries the generations rotate (prev := cur, cur := empty),
-// dropping the coldest buckets wholesale. This bounds live buckets to
-// ~2*maxEntries and keeps actively-pushing IPs alive across rotations, at the
-// cost of being an approximate-LRU rather than exact — acceptable here because
-// the per-IP layer only needs to stop single-IP starvation, while the global
-// floor remains the throughput bound under a distributed flood.
+// `cur` fills to maxEntries — on BOTH the new-IP and the promotion paths — the
+// generations rotate (prev := cur, cur := empty), dropping the coldest buckets
+// wholesale. Enforcing the cap on promotion too is what keeps the bound real: a
+// cycling attacker who re-touches every `prev` entry cannot otherwise inflate
+// `cur` past the cap each round. This bounds live buckets to ~2*maxEntries; an
+// actively-pushing IP survives at least one rotation (promoted out of `prev`)
+// but is not a permanent survivor — acceptable because the per-IP layer only
+// needs to stop single-IP starvation, while the global floor remains the
+// throughput bound under a distributed flood.
 type perIPFloor struct {
 	mu         sync.Mutex
 	rps        rate.Limit
@@ -159,7 +172,19 @@ func (p *perIPFloor) limiterFor(ip string) *rate.Limiter {
 	}
 	if lim, ok := p.prev[ip]; ok {
 		// Promote the survivor into the current generation so a steadily-pushing
-		// IP is never evicted out from under itself.
+		// IP survives AT LEAST one rotation. The cap MUST be enforced here too:
+		// without it, an attacker who keeps prev warm could promote every prev
+		// entry back into cur each cycle (cur→2N, then rotate prev:=cur→2N, …),
+		// growing the live set without bound and defeating the memory cap. So if
+		// cur is already full, rotate first — dropping the rest of the cold prev
+		// generation wholesale — before promoting into a fresh cur. A promoted
+		// survivor can therefore itself be dropped on the NEXT rotation; that is
+		// acceptable: the global floor still bounds throughput, the per-IP layer
+		// only needs to stop single-IP starvation, not be an exact LRU.
+		if len(p.cur) >= p.maxEntries {
+			p.prev = p.cur
+			p.cur = make(map[string]*rate.Limiter, p.maxEntries)
+		}
 		p.cur[ip] = lim
 		delete(p.prev, ip)
 		return lim

@@ -158,7 +158,8 @@ func (w *IncomingWebhook) Route(r *wkhttp.WKHttp) {
 	// 推送类：URL 内 token 鉴权，无 AuthMiddleware。四层限流，由粗到细：
 	//  1) localFloorMiddleware —— 纯内存、不依赖 Redis 的进程级地板，先挡洪峰；Redis
 	//     故障时仍限速，避免对 DB + WuKongIM 的洪泛放大。内含两段（均不依赖 Redis）：
-	//     先按 IP 的内存令牌桶(默认 50rps)，再按全局进程桶(默认 200rps)。per-IP 段在前，
+	//     先按 IP 的内存令牌桶(默认 100rps，与下方 Redis per-IP 限流持平)，再按全局进程桶
+	//     (默认 200rps)。per-IP 段在前，
 	//     使单个滥用 IP 至多吃掉它那份地板配额，避免一个 IP 抽干全局桶、误杀其它 IP 的
 	//     合法推送(#287)；全局段仍封顶 Redis 故障下的分布式洪流(多 IP)，是地板的本意。
 	//  2) ipLimit (StrictIPRateLimitMiddleware) —— 按 IP 对【全部】请求限流(默认 100rps，
