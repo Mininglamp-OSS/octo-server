@@ -19,11 +19,9 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/botfather"
-	"github.com/go-jose/go-jose/v3/jwt"
 	"go.uber.org/zap"
 )
 
@@ -90,11 +88,22 @@ func (a *AuthJWT) mintBot(c *wkhttp.Context) {
 
 // ---------- GET /v1/bot/:uid/token (daemon → server) ----------
 
+// botToken validates a daemon api_key (uk_ Bearer) and returns the
+// bot_token iff the caller is the bot's creator.
+//
+// 合并 plan 决策一+二 Phase 4: 改用 api_key 直连 (不再 JWT exchange).
+// SQL 逻辑跟 /v1/auth/verify-api-key (modules/user/api.go) 同款 — 复用
+// auth_jwt.resolveAPIKey 现有的两步走 (api_key → uid+space_id → membership).
 func (a *AuthJWT) botToken(c *wkhttp.Context) {
-	// Validate JWT inline (no AuthMiddleware on this route — daemon scope)
-	cl, err := a.requireDaemonJWT(c)
+	auth := c.GetHeader("Authorization")
+	if !strings.HasPrefix(auth, "Bearer ") {
+		c.ResponseErrorWithStatus(errors.New("missing Bearer token"), http.StatusUnauthorized)
+		return
+	}
+	apiKey := strings.TrimPrefix(auth, "Bearer ")
+	callerUID, _, _, err := a.resolveAPIKey(apiKey, "", "")
 	if err != nil {
-		c.ResponseErrorWithStatus(err, http.StatusUnauthorized)
+		c.ResponseErrorWithStatus(errors.New("invalid api_key"), http.StatusUnauthorized)
 		return
 	}
 	botUID := c.Param("uid")
@@ -118,8 +127,8 @@ func (a *AuthJWT) botToken(c *wkhttp.Context) {
 		c.ResponseErrorWithStatus(errors.New("bot not found"), http.StatusNotFound)
 		return
 	}
-	if r.CreatorUID != cl.Subject {
-		// Daemon's JWT subject must equal the bot's creator. Anything
+	if r.CreatorUID != callerUID {
+		// Caller's api_key uid must equal the bot's creator. Anything
 		// else means a daemon for one user is asking for another user's
 		// bot — clean 403, no info leak about whether the bot exists.
 		c.ResponseErrorWithStatus(errors.New("not authorized for this bot"), http.StatusForbidden)
@@ -129,45 +138,6 @@ func (a *AuthJWT) botToken(c *wkhttp.Context) {
 		"bot_uid":   botUID,
 		"bot_token": r.BotToken,
 	})
-}
-
-// requireDaemonJWT parses and validates a Bearer token from the request,
-// asserting scope=daemon. Returns parsed Claims.
-func (a *AuthJWT) requireDaemonJWT(c *wkhttp.Context) (*Claims, error) {
-	auth := c.GetHeader("Authorization")
-	if !strings.HasPrefix(auth, "Bearer ") {
-		return nil, errors.New("missing Bearer token")
-	}
-	tok := strings.TrimPrefix(auth, "Bearer ")
-	parsed, err := jwt.ParseSigned(tok)
-	if err != nil {
-		return nil, fmt.Errorf("parse: %w", err)
-	}
-	var cl Claims
-	if err := parsed.Claims(a.pubKey, &cl); err != nil {
-		return nil, fmt.Errorf("verify: %w", err)
-	}
-	// PR-A fix (齐乐 review #3): signature-only verification let expired
-	// tokens through. Plan AU1 requires "JWT 过期 → 401" — enforce it
-	// here, otherwise a daemon JWT past its TTL (currently 24h) could
-	// still mint a bot_token forever.
-	//
-	// Note on clock skew: Time field below is exact wall-clock; we rely
-	// on go-jose's DefaultLeeway (1 min) to tolerate small daemon ↔ server
-	// drift on exp/iat/nbf. If a downstream operator overrides leeway to
-	// 0 (e.g. via a global config), tight-clock daemons could see
-	// spurious failures right around mint time — keep the default unless
-	// you have a hard reason.
-	if err := cl.Validate(jwt.Expected{
-		Issuer: jwtIssuer,
-		Time:   time.Now(),
-	}); err != nil {
-		return nil, fmt.Errorf("claims invalid: %w", err)
-	}
-	if cl.Scope != "daemon" {
-		return nil, errors.New("daemon scope required")
-	}
-	return &cl, nil
 }
 
 // generateBfToken produces a `bf_<32hex>` token matching IM /newbot style.
@@ -185,3 +155,18 @@ func generateBfToken() (string, error) {
 // Tiny indirection so we can unit-test without crypto/rand dep here.
 var readRand = defaultReadRand
 var hexEncode = defaultHexEncode
+
+// Route mounts the two bot endpoints. JWT exchange + JWKS endpoints have
+// been removed (合并 plan 决策一+二 Phase 4) — daemon/web now hit
+// fleet/matter directly with api_key/session tokens.
+//
+//	POST /v1/bot/mint        — web session auth (octo-lib session middleware)
+//	GET  /v1/bot/:uid/token  — daemon api_key Bearer (validated inline)
+func (a *AuthJWT) Route(r *wkhttp.WKHttp) {
+	authGroup := r.Group("/v1", a.ctx.AuthMiddleware(r))
+	authGroup.POST("/bot/mint", a.mintBot)
+
+	// /v1/bot/:uid/token validates api_key inline (no session middleware
+	// here — caller is daemon, not browser).
+	r.GET("/v1/bot/:uid/token", a.botToken)
+}
