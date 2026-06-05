@@ -1,13 +1,14 @@
 package bot_api
 
 import (
-	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botutil"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"go.uber.org/zap"
 )
 
@@ -33,7 +34,7 @@ type BotRegisterResp struct {
 func (ba *BotAPI) register(c *wkhttp.Context) {
 	token := extractBotToken(c)
 	if token == "" {
-		c.ResponseError(errors.New("缺少Authorization头"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIAuthFailed, nil, nil)
 		return
 	}
 
@@ -49,11 +50,11 @@ func (ba *BotAPI) registerUserBot(c *wkhttp.Context, token string) {
 	robot, err := ba.db.queryRobotByBotToken(token)
 	if err != nil {
 		ba.Error("查询机器人失败", zap.Error(err))
-		c.ResponseError(errors.New("认证失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIAuthCheckFailed, nil, nil)
 		return
 	}
 	if robot == nil {
-		c.ResponseError(errors.New("无效的bot token"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIAuthFailed, nil, nil)
 		return
 	}
 
@@ -67,7 +68,7 @@ func (ba *BotAPI) registerUserBot(c *wkhttp.Context, token string) {
 	})
 	if tokenErr != nil || resp.Status != config.UpdateTokenStatusSuccess {
 		ba.Error("获取IM Token失败", zap.Any("error", tokenErr), zap.String("robotID", robot.RobotID), zap.Any("status", resp))
-		c.ResponseError(errors.New("获取IM Token失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIIMTokenFailed, nil, nil)
 		return
 	}
 	if robot.IMTokenCache != imToken {
@@ -129,17 +130,17 @@ func (ba *BotAPI) registerAppBot(c *wkhttp.Context, token string) {
 	appBot, err := ba.db.queryAppBotByToken(token)
 	if err != nil {
 		ba.Error("查询App Bot失败", zap.Error(err))
-		c.ResponseError(errors.New("认证失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIAuthCheckFailed, nil, nil)
 		return
 	}
 	if appBot == nil {
-		c.ResponseError(errors.New("无效的bot token"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIAuthFailed, nil, nil)
 		return
 	}
 
 	// Only published App Bots can register
 	if appBot.Status != 1 {
-		c.ResponseError(errors.New("无效的bot token"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIAuthFailed, nil, nil)
 		return
 	}
 
@@ -157,7 +158,7 @@ func (ba *BotAPI) registerAppBot(c *wkhttp.Context, token string) {
 	})
 	if tokenErr != nil || resp.Status != config.UpdateTokenStatusSuccess {
 		ba.Error("App Bot IM Token注册失败", zap.Any("error", tokenErr), zap.String("uid", appBot.UID), zap.Any("status", resp))
-		c.ResponseError(errors.New("获取IM Token失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIIMTokenFailed, nil, nil)
 		return
 	}
 
@@ -178,4 +179,3 @@ func (ba *BotAPI) registerAppBot(c *wkhttp.Context, token string) {
 		OwnerChannelID: appBot.CreatedBy,
 	})
 }
-

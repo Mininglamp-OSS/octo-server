@@ -1,7 +1,6 @@
 package bot_api
 
 import (
-	"errors"
 	"fmt"
 	"strconv"
 
@@ -9,6 +8,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis"
 	"go.uber.org/zap"
@@ -41,7 +42,7 @@ type messageResp struct {
 func (ba *BotAPI) getEvents(c *wkhttp.Context) {
 	var req BotEventsReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("数据格式有误"))
+		respondBotAPIRequestInvalid(c, "")
 		return
 	}
 
@@ -111,11 +112,11 @@ func (ba *BotAPI) getEventsResult(robotID string, eventID int64, limit int64) ([
 	results := make([]*eventResp, 0)
 	if len(robotEventJsons) > 0 {
 		type robotEvent struct {
-			EventID   int64                    `json:"event_id,omitempty"`
-			Message   *config.MessageResp      `json:"message,omitempty"`
-			EventType string                   `json:"event_type,omitempty"`
-			EventData map[string]interface{}   `json:"event_data,omitempty"`
-			Expire    int64                    `json:"expire,omitempty"`
+			EventID   int64                  `json:"event_id,omitempty"`
+			Message   *config.MessageResp    `json:"message,omitempty"`
+			EventType string                 `json:"event_type,omitempty"`
+			EventData map[string]interface{} `json:"event_data,omitempty"`
+			Expire    int64                  `json:"expire,omitempty"`
 		}
 
 		events := make([]*robotEvent, 0)
@@ -140,7 +141,7 @@ func (ba *BotAPI) getEventsResult(robotID string, eventID int64, limit int64) ([
 					MessageID:  ev.Message.MessageID,
 					MessageSeq: ev.Message.MessageSeq,
 					FromUID:    ev.Message.FromUID,
-					Timestamp:   ev.Message.Timestamp,
+					Timestamp:  ev.Message.Timestamp,
 				}
 				if ev.Message.ChannelType != common.ChannelTypePerson.Uint8() {
 					resp.Message.ChannelID = ev.Message.ChannelID
@@ -167,14 +168,15 @@ func (ba *BotAPI) eventAck(c *wkhttp.Context) {
 	eventIDStr := c.Param("event_id")
 	eventID, err := strconv.ParseInt(eventIDStr, 10, 64)
 	if err != nil {
-		c.ResponseError(errors.New("event_id 格式无效"))
+		respondBotAPIRequestInvalid(c, "event_id")
 		return
 	}
 
 	key := fmt.Sprintf("%s%s", robotEventPrefix, robotID)
 	err = ba.ctx.GetRedisConn().ZRemRangeByScore(key, fmt.Sprintf("%d", eventID), fmt.Sprintf("%d", eventID))
 	if err != nil {
-		c.ResponseError(err)
+		ba.Error("ack event failed", zap.Error(err), zap.String("robotID", robotID), zap.Int64("eventID", eventID))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()

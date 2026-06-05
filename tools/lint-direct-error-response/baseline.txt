@@ -16,11 +16,11 @@
 # envelope) are tagged "# EXEMPT: <why>" so future migrations don't try to
 # zero them; all other rows are migration debt and should ratchet to 0.
 9 modules/app_bot/app_bot.go
-6 modules/bot_api/auth.go
-9 modules/bot_api/groups.go
-5 modules/bot_api/obo_api.go
-1 modules/bot_api/threads.go
-3 modules/bot_api/voice_adapter.go
+0 modules/bot_api/auth.go  # migrated to httperr.ResponseErrorLWithStatus (#276)
+0 modules/bot_api/groups.go  # migrated to httperr.ResponseErrorL / ResponseErrorLWithStatus (#276)
+0 modules/bot_api/obo_api.go  # migrated to httperr.ResponseErrorLWithStatus (#276)
+0 modules/bot_api/threads.go  # migrated to httperr.ResponseErrorLWithStatus (#276)
+0 modules/bot_api/voice_adapter.go  # migrated to httperr.ResponseErrorLWithStatus (#276)
 3 modules/botfather/api.go
 9 modules/botfather/api_bot.go
 1 modules/botfather/api_bot_thread.go

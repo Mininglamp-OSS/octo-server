@@ -1,8 +1,6 @@
 package bot_api
 
 import (
-	"errors"
-	"fmt"
 	"net/http"
 	"runtime/debug"
 	"strings"
@@ -13,6 +11,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 )
@@ -23,25 +23,25 @@ func (ba *BotAPI) validateBotGroupAccess(c *wkhttp.Context) (robotID, groupNo st
 
 	// App Bot is DM-only — deny all group/thread operations
 	if getBotKindFromContext(c) == BotKindApp {
-		c.ResponseError(errors.New("app bot does not support group operations"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIAppBotUnsupported, nil, nil)
 		return "", "", false
 	}
 
 	groupNo = c.Param("group_no")
 
 	if !thread.IsValidGroupNo(groupNo) {
-		c.ResponseError(errors.New("invalid group_no format"))
+		respondBotAPIRequestInvalid(c, "group_no")
 		return "", "", false
 	}
 
 	isMember, err := ba.groupService.ExistMember(groupNo, robotID)
 	if err != nil {
 		ba.Error("检查群成员失败", zap.Error(err))
-		c.ResponseError(errors.New("check group membership failed"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 		return "", "", false
 	}
 	if !isMember {
-		c.ResponseError(errors.New("bot is not a member of this group"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPINotGroupMember, nil, nil)
 		return "", "", false
 	}
 
@@ -57,7 +57,7 @@ func (ba *BotAPI) validateBotThreadAccess(c *wkhttp.Context) (robotID, groupNo, 
 
 	shortID = c.Param("short_id")
 	if !thread.IsValidShortID(shortID) {
-		c.ResponseError(errors.New("invalid short_id format"))
+		respondBotAPIRequestInvalid(c, "short_id")
 		return "", "", "", false
 	}
 
@@ -76,8 +76,7 @@ func (ba *BotAPI) botCreateThread(c *wkhttp.Context) {
 		SourceMessageID *int64 `json:"source_message_id"`
 	}
 	if err := c.BindJSON(&req); err != nil {
-		ba.Error("参数错误", zap.Error(err))
-		c.ResponseError(errors.New("invalid request: name is required"))
+		respondBotAPIRequestInvalid(c, "name")
 		return
 	}
 
@@ -96,7 +95,7 @@ func (ba *BotAPI) botCreateThread(c *wkhttp.Context) {
 	})
 	if err != nil {
 		ba.Error("创建子区失败", zap.Error(err), zap.String("groupNo", groupNo), zap.String("robotID", robotID))
-		c.ResponseError(err)
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
 		return
 	}
 	c.Response(resp)
@@ -120,7 +119,7 @@ func (ba *BotAPI) botListThreads(c *wkhttp.Context) {
 	threads, total, err := ba.threadService.GetThreads(groupNo, nil, pageIndex, pageSize)
 	if err != nil {
 		ba.Error("获取子区列表失败", zap.Error(err), zap.String("groupNo", groupNo))
-		c.ResponseError(err)
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 		return
 	}
 	if !hasPageParam {
@@ -143,7 +142,7 @@ func (ba *BotAPI) botGetThread(c *wkhttp.Context) {
 	resp, err := ba.threadService.GetThread(groupNo, shortID, "")
 	if err != nil {
 		ba.Error("获取子区详情失败", zap.Error(err))
-		c.ResponseError(err)
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 		return
 	}
 	c.Response(resp)
@@ -159,7 +158,7 @@ func (ba *BotAPI) botDeleteThread(c *wkhttp.Context) {
 	err := ba.threadService.DeleteThread(groupNo, shortID, robotID)
 	if err != nil {
 		ba.Error("删除子区失败", zap.Error(err))
-		c.ResponseError(err)
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -175,7 +174,7 @@ func (ba *BotAPI) botListThreadMembers(c *wkhttp.Context) {
 	members, err := ba.threadService.GetMembers(groupNo, shortID)
 	if err != nil {
 		ba.Error("获取成员列表失败", zap.Error(err))
-		c.ResponseError(err)
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 		return
 	}
 	c.Response(members)
@@ -191,7 +190,7 @@ func (ba *BotAPI) botJoinThread(c *wkhttp.Context) {
 	err := ba.threadService.JoinThread(groupNo, shortID, robotID)
 	if err != nil {
 		ba.Error("加入子区失败", zap.Error(err))
-		c.ResponseError(err)
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -207,7 +206,7 @@ func (ba *BotAPI) botLeaveThread(c *wkhttp.Context) {
 	err := ba.threadService.LeaveThread(groupNo, shortID, robotID)
 	if err != nil {
 		ba.Error("离开子区失败", zap.Error(err))
-		c.ResponseError(err)
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -223,7 +222,7 @@ func (ba *BotAPI) botGetThreadMd(c *wkhttp.Context) {
 	result, err := ba.threadService.GetThreadMd(groupNo, shortID)
 	if err != nil {
 		ba.Error("query thread GROUP.md failed", zap.Error(err))
-		c.ResponseError(errors.New("query thread GROUP.md failed"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 		return
 	}
 	if result == nil {
@@ -253,14 +252,11 @@ func (ba *BotAPI) botUpdateThreadMd(c *wkhttp.Context) {
 	isBotAdmin, err := ba.groupService.IsBotAdmin(groupNo, robotID)
 	if err != nil {
 		ba.Error("check bot admin failed", zap.Error(err))
-		c.ResponseError(errors.New("check bot admin failed"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 		return
 	}
 	if !isBotAdmin {
-		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
-			"msg":    "bot is not a bot_admin in this group",
-			"status": 403,
-		})
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPINotGroupAdmin, nil, nil)
 		return
 	}
 
@@ -268,25 +264,25 @@ func (ba *BotAPI) botUpdateThreadMd(c *wkhttp.Context) {
 		Content string `json:"content"`
 	}
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("invalid request body"))
+		respondBotAPIRequestInvalid(c, "")
 		return
 	}
 
 	if strings.TrimSpace(req.Content) == "" {
-		c.ResponseError(errors.New("content must not be empty"))
+		respondBotAPIRequestInvalid(c, "content")
 		return
 	}
 
 	maxSize := group.GetGroupMdMaxSize()
 	if len(req.Content) > maxSize {
-		c.ResponseError(fmt.Errorf("GROUP.md content exceeds max size %d bytes", maxSize))
+		respondBotAPIContentTooLarge(c, "content", maxSize)
 		return
 	}
 
 	newVersion, err := ba.threadService.UpdateThreadMd(groupNo, shortID, req.Content, robotID)
 	if err != nil {
 		ba.Error("update thread GROUP.md failed", zap.Error(err))
-		c.ResponseError(errors.New("update thread GROUP.md failed"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
 		return
 	}
 

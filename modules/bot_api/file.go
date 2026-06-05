@@ -16,6 +16,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	pkgutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
 	"github.com/gin-gonic/gin"
 	sts "github.com/tencentyun/qcloud-cos-sts-sdk/go"
@@ -26,7 +28,7 @@ import (
 func (ba *BotAPI) botProxyFile(c *wkhttp.Context) {
 	ph := c.Param("path")
 	if ph == "" {
-		c.ResponseError(errors.New("文件路径不能为空"))
+		respondBotAPIRequestInvalid(c, "path")
 		return
 	}
 	ph = strings.TrimPrefix(ph, "/")
@@ -34,7 +36,7 @@ func (ba *BotAPI) botProxyFile(c *wkhttp.Context) {
 
 	cleaned := filepath.Clean(ph)
 	if strings.Contains(cleaned, "..") || strings.ContainsAny(cleaned, "\x00") {
-		c.ResponseErrorWithStatus(errors.New("文件路径无效"), http.StatusBadRequest)
+		respondBotAPIRequestInvalid(c, "path")
 		return
 	}
 	ph = cleaned
@@ -47,7 +49,7 @@ func (ba *BotAPI) botProxyFile(c *wkhttp.Context) {
 	downloadURL, err := ba.fileService.DownloadURL(ph, filename)
 	if err != nil {
 		ba.Error("获取文件下载URL失败", zap.Error(err), zap.String("path", ph))
-		c.ResponseErrorWithStatus(errors.New("获取文件失败"), http.StatusNotFound)
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedNotFound, nil, nil)
 		return
 	}
 	c.Redirect(http.StatusFound, downloadURL)
@@ -60,15 +62,14 @@ func (ba *BotAPI) botUploadFile(c *wkhttp.Context) {
 
 	multipartFile, fileHeader, err := c.Request.FormFile("file")
 	if err != nil {
-		ba.Error("读取上传文件失败", zap.Error(err))
-		c.ResponseError(errors.New("读取文件失败"))
+		respondBotAPIRequestInvalid(c, "file")
 		return
 	}
 	defer multipartFile.Close()
 
 	const maxSize int64 = 100 * 1024 * 1024
 	if fileHeader.Size > maxSize {
-		c.ResponseError(fmt.Errorf("文件大小不能超过%dMB", maxSize/1024/1024))
+		respondBotAPIFileTooLarge(c, maxSize/1024/1024)
 		return
 	}
 
@@ -93,7 +94,7 @@ func (ba *BotAPI) botUploadFile(c *wkhttp.Context) {
 	})
 	if err != nil {
 		ba.Error("上传文件失败", zap.Error(err))
-		c.ResponseError(errors.New("上传文件失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIUploadFailed, nil, nil)
 		return
 	}
 
@@ -113,14 +114,14 @@ func (ba *BotAPI) botUploadFile(c *wkhttp.Context) {
 func (ba *BotAPI) botFileDownload(c *wkhttp.Context) {
 	ph := c.Param("path")
 	if ph == "" {
-		c.ResponseError(errors.New("文件路径不能为空"))
+		respondBotAPIRequestInvalid(c, "path")
 		return
 	}
 	ph = strings.TrimPrefix(ph, "/")
 
 	ph, err := sanitizeBotFilePath(ph)
 	if err != nil {
-		c.ResponseErrorWithStatus(errors.New("文件路径无效"), http.StatusBadRequest)
+		respondBotAPIRequestInvalid(c, "path")
 		return
 	}
 
@@ -132,7 +133,7 @@ func (ba *BotAPI) botFileDownload(c *wkhttp.Context) {
 	downloadURL, err := ba.fileService.DownloadURL(ph, filename)
 	if err != nil {
 		ba.Error("获取文件下载URL失败", zap.Error(err), zap.String("path", ph))
-		c.ResponseErrorWithStatus(errors.New("获取文件失败"), http.StatusNotFound)
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedNotFound, nil, nil)
 		return
 	}
 	c.Redirect(http.StatusFound, downloadURL)
@@ -162,21 +163,21 @@ func sanitizeBotFilePath(p string) (string, error) {
 func (ba *BotAPI) botUploadCredentials(c *wkhttp.Context) {
 	filename := c.Query("filename")
 	if strings.TrimSpace(filename) == "" {
-		c.ResponseError(errors.New("filename 不能为空"))
+		respondBotAPIRequestInvalid(c, "filename")
 		return
 	}
 	filename = filepath.Base(filename)
 
 	ext := strings.ToLower(filepath.Ext(filename))
 	if ext == "" || file.IsBlockedExtension(ext) || !file.IsAllowedExtension(ext) {
-		c.ResponseError(errors.New("不支持的文件类型"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIFileTypeUnsupported, nil, nil)
 		return
 	}
 
 	cosConfig := ba.ctx.GetConfig().COS
 	if cosConfig.SecretID == "" || cosConfig.SecretKey == "" || cosConfig.Bucket == "" {
 		ba.Error("COS 配置不完整")
-		c.ResponseError(errors.New("COS 未配置"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIUploadFailed, nil, nil)
 		return
 	}
 
@@ -199,7 +200,7 @@ func (ba *BotAPI) botUploadCredentials(c *wkhttp.Context) {
 	}
 	if appId == "" {
 		ba.Error("无法从 bucket 名称中提取 appId", zap.String("bucket", bucket))
-		c.ResponseError(errors.New("COS 配置错误：bucket 格式不正确"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIUploadFailed, nil, nil)
 		return
 	}
 
@@ -221,7 +222,7 @@ func (ba *BotAPI) botUploadCredentials(c *wkhttp.Context) {
 	res, err := client.GetCredential(opt)
 	if err != nil {
 		ba.Error("获取 STS 临时密钥失败", zap.Error(err))
-		c.ResponseError(errors.New("获取临时密钥失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIUploadFailed, nil, nil)
 		return
 	}
 
@@ -244,7 +245,7 @@ func (ba *BotAPI) botUploadCredentials(c *wkhttp.Context) {
 func (ba *BotAPI) botUploadPresigned(c *wkhttp.Context) {
 	filename := c.Query("filename")
 	if strings.TrimSpace(filename) == "" {
-		c.ResponseError(errors.New("filename 不能为空"))
+		respondBotAPIRequestInvalid(c, "filename")
 		return
 	}
 	filename = filepath.Base(filename)
@@ -254,24 +255,24 @@ func (ba *BotAPI) botUploadPresigned(c *wkhttp.Context) {
 	// guard the public file API enforces (see modules/file/api.go).
 	fileSizeRaw := strings.TrimSpace(c.Query("fileSize"))
 	if fileSizeRaw == "" {
-		c.ResponseError(errors.New("fileSize 参数必填，且不能超过最大限制"))
+		respondBotAPIRequestInvalid(c, "fileSize")
 		return
 	}
 	fileSize, parseErr := strconv.ParseInt(fileSizeRaw, 10, 64)
 	if parseErr != nil || fileSize <= 0 {
-		c.ResponseError(errors.New("fileSize 参数必须为正整数（字节）"))
+		respondBotAPIRequestInvalid(c, "fileSize")
 		return
 	}
 	if fileSize > file.MaxFileSize {
 		ba.Warn("预签名上传 fileSize 超出限制",
 			zap.Int64("size", fileSize), zap.Int64("max", file.MaxFileSize))
-		c.ResponseError(fmt.Errorf("文件大小不能超过%dMB", file.MaxFileSize/1024/1024))
+		respondBotAPIFileTooLarge(c, file.MaxFileSize/1024/1024)
 		return
 	}
 
 	ext := strings.ToLower(filepath.Ext(filename))
 	if ext == "" || file.IsBlockedExtension(ext) || !file.IsAllowedExtension(ext) {
-		c.ResponseError(errors.New("不支持的文件类型"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIFileTypeUnsupported, nil, nil)
 		return
 	}
 
@@ -286,7 +287,7 @@ func (ba *BotAPI) botUploadPresigned(c *wkhttp.Context) {
 	uploadURL, downloadURL, err := ba.fileService.PresignedPutURL(objectPath, contentType, contentDisposition, fileSize, expiry)
 	if err != nil {
 		ba.Error("生成预签名上传URL失败", zap.Error(err))
-		c.ResponseError(errors.New("生成上传URL失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIUploadFailed, nil, nil)
 		return
 	}
 

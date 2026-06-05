@@ -1,11 +1,9 @@
 package bot_api
 
 import (
-	"net/http"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
-	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 )
 
@@ -17,10 +15,10 @@ const (
 
 // Context keys for bot identity.
 const (
-	CtxKeyRobotID      = "robot_id"
-	CtxKeyBotKind      = "bot_kind"
-	CtxKeyRobot        = "robot"         // *robotModel for User Bot
-	CtxKeyAppBotScope  = "app_bot_scope" // "platform" | "space"
+	CtxKeyRobotID       = "robot_id"
+	CtxKeyBotKind       = "bot_kind"
+	CtxKeyRobot         = "robot"         // *robotModel for User Bot
+	CtxKeyAppBotScope   = "app_bot_scope" // "platform" | "space"
 	CtxKeyAppBotSpaceID = "app_bot_space_id"
 )
 
@@ -30,7 +28,7 @@ func (ba *BotAPI) authBot() wkhttp.HandlerFunc {
 	return func(c *wkhttp.Context) {
 		token := extractBotToken(c)
 		if token == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "缺少Authorization头或token无效"})
+			respondBotAPIAuthFailed(c)
 			return
 		}
 
@@ -49,11 +47,11 @@ func (ba *BotAPI) authUserBot(c *wkhttp.Context, token string) {
 	robot, err := ba.db.queryRobotByBotToken(token)
 	if err != nil {
 		ba.Error("查询机器人失败", zap.Error(err))
-		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "认证失败"})
+		respondBotAPIAuthCheckFailed(c)
 		return
 	}
 	if robot == nil {
-		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "无效的bot token"})
+		respondBotAPIAuthFailed(c)
 		return
 	}
 
@@ -83,17 +81,17 @@ func (ba *BotAPI) authAppBot(c *wkhttp.Context, token string) {
 	appBot, err := ba.db.queryAppBotByToken(token)
 	if err != nil {
 		ba.Error("查询App Bot失败", zap.Error(err))
-		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "认证失败"})
+		respondBotAPIAuthCheckFailed(c)
 		return
 	}
 	if appBot == nil {
-		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "无效的bot token"})
+		respondBotAPIAuthFailed(c)
 		return
 	}
 
 	// App Bot must be published (status=1) to serve API requests
 	if appBot.Status != 1 {
-		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "bot not available"})
+		respondBotAPIBotUnavailable(c)
 		return
 	}
 

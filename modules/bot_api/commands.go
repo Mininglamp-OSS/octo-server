@@ -2,13 +2,14 @@ package bot_api
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 )
@@ -22,8 +23,7 @@ func (ba *BotAPI) setCommands(c *wkhttp.Context) {
 		} `json:"commands"`
 	}
 	if err := c.BindJSON(&req); err != nil {
-		ba.Error("数据格式有误", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误"))
+		respondBotAPIRequestInvalid(c, "")
 		return
 	}
 
@@ -38,14 +38,14 @@ func (ba *BotAPI) setCommands(c *wkhttp.Context) {
 	commandsJSON, err := json.Marshal(req.Commands)
 	if err != nil {
 		ba.Error("序列化命令列表失败", zap.Error(err))
-		c.ResponseError(errors.New("序列化命令列表失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
 		return
 	}
 
 	err = ba.db.updateBotCommands(robotID, string(commandsJSON))
 	if err != nil {
 		ba.Error("保存命令列表失败", zap.Error(err))
-		c.ResponseError(errors.New("保存命令列表失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
 		return
 	}
 
@@ -67,15 +67,20 @@ func stripSpacePrefix(uid string) string {
 func (ba *BotAPI) getUserInfo(c *wkhttp.Context) {
 	uid := strings.TrimSpace(c.Query("uid"))
 	if uid == "" {
-		c.ResponseError(errors.New("uid参数不能为空"))
+		respondBotAPIRequestInvalid(c, "uid")
 		return
 	}
 
 	bareUID := stripSpacePrefix(uid)
 
 	userResp, err := ba.userService.GetUser(bareUID)
-	if err != nil || userResp == nil {
-		c.JSON(http.StatusNotFound, gin.H{"msg": "用户不存在"})
+	if err != nil {
+		ba.Error("query user info failed", zap.Error(err), zap.String("uid", bareUID))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+		return
+	}
+	if userResp == nil {
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIUserNotFound, nil, nil)
 		return
 	}
 

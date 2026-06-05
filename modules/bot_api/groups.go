@@ -1,7 +1,6 @@
 package bot_api
 
 import (
-	"errors"
 	"fmt"
 	"net/http"
 	"runtime/debug"
@@ -12,6 +11,9 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 )
@@ -23,7 +25,7 @@ const threadChannelIDSeparator = "____"
 func (ba *BotAPI) getGroups(c *wkhttp.Context) {
 	robotID := getRobotIDFromContext(c)
 	if robotID == "" {
-		c.ResponseError(errors.New("robot_id not found"))
+		ba.respondBotAPIIdentityMissing(c)
 		return
 	}
 
@@ -49,7 +51,7 @@ func (ba *BotAPI) getGroups(c *wkhttp.Context) {
 	}
 	if err != nil {
 		ba.Error("查询机器人群组失败", zap.Error(err))
-		c.ResponseError(errors.New("查询群组失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 		return
 	}
 
@@ -63,8 +65,13 @@ func (ba *BotAPI) getGroupInfo(c *wkhttp.Context) {
 
 	var count int
 	err := ba.db.session.SelectBySql("SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0", groupNo, robotID).LoadOne(&count)
-	if err != nil || count == 0 {
-		c.ResponseError(errors.New("bot is not a member of this group"))
+	if err != nil {
+		ba.Error("query group membership failed", zap.Error(err), zap.String("groupNo", groupNo), zap.String("robotID", robotID))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+		return
+	}
+	if count == 0 {
+		httperr.ResponseErrorL(c, errcode.ErrBotAPINotGroupMember, nil, nil)
 		return
 	}
 
@@ -79,7 +86,7 @@ func (ba *BotAPI) getGroupInfo(c *wkhttp.Context) {
 	_, err = ba.db.session.Select("group_no, name, IFNULL(notice,'') notice, IFNULL(creator,'') creator, status, created_at").
 		From("`group`").Where("group_no=?", groupNo).Load(&grp)
 	if err != nil {
-		c.ResponseError(errors.New("group not found"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIGroupNotFound, nil, nil)
 		return
 	}
 
@@ -100,8 +107,13 @@ func (ba *BotAPI) getGroupMembers(c *wkhttp.Context) {
 
 	var count int
 	err := ba.db.session.SelectBySql("SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0", groupNo, robotID).LoadOne(&count)
-	if err != nil || count == 0 {
-		c.ResponseError(errors.New("bot is not a member of this group"))
+	if err != nil {
+		ba.Error("query group membership failed", zap.Error(err), zap.String("groupNo", groupNo), zap.String("robotID", robotID))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+		return
+	}
+	if count == 0 {
+		httperr.ResponseErrorL(c, errcode.ErrBotAPINotGroupMember, nil, nil)
 		return
 	}
 
@@ -126,7 +138,8 @@ func (ba *BotAPI) getGroupMembers(c *wkhttp.Context) {
 		ORDER BY gm.role DESC, gm.created_at ASC
 	`, groupNo).Load(&members)
 	if err != nil {
-		c.ResponseError(err)
+		ba.Error("query group members failed", zap.Error(err), zap.String("groupNo", groupNo))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 		return
 	}
 
@@ -137,30 +150,30 @@ func (ba *BotAPI) getGroupMembers(c *wkhttp.Context) {
 func (ba *BotAPI) getGroupMd(c *wkhttp.Context) {
 	robotID := getRobotIDFromContext(c)
 	if robotID == "" {
-		c.ResponseError(errors.New("robot_id not found"))
+		ba.respondBotAPIIdentityMissing(c)
 		return
 	}
 	groupNo := c.Param("group_no")
 	if strings.Contains(groupNo, threadChannelIDSeparator) {
-		c.ResponseError(errors.New("thread channel id is not accepted here; use /v1/bot/groups/<group_no>/threads/<short_id>/md instead"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIThreadChannelNotAccepted, nil, nil)
 		return
 	}
 
 	isMember, err := ba.groupService.ExistMember(groupNo, robotID)
 	if err != nil {
 		ba.Error("check group membership failed", zap.Error(err))
-		c.ResponseError(errors.New("check group membership failed"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 		return
 	}
 	if !isMember {
-		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "bot is not a member of this group", "status": 403})
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPINotGroupMember, nil, nil)
 		return
 	}
 
 	result, err := ba.groupService.GetGroupMd(groupNo)
 	if err != nil {
 		ba.Error("query GROUP.md failed", zap.Error(err))
-		c.ResponseError(errors.New("query GROUP.md failed"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 		return
 	}
 	if result == nil {
@@ -184,34 +197,34 @@ func (ba *BotAPI) getGroupMd(c *wkhttp.Context) {
 func (ba *BotAPI) updateGroupMd(c *wkhttp.Context) {
 	robotID := getRobotIDFromContext(c)
 	if robotID == "" {
-		c.ResponseError(errors.New("robot_id not found"))
+		ba.respondBotAPIIdentityMissing(c)
 		return
 	}
 	groupNo := c.Param("group_no")
 	if strings.Contains(groupNo, threadChannelIDSeparator) {
-		c.ResponseError(errors.New("thread channel id is not accepted here; use /v1/bot/groups/<group_no>/threads/<short_id>/md instead"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIThreadChannelNotAccepted, nil, nil)
 		return
 	}
 
 	isMember, err := ba.groupService.ExistMember(groupNo, robotID)
 	if err != nil {
 		ba.Error("check group membership failed", zap.Error(err))
-		c.ResponseError(errors.New("check group membership failed"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 		return
 	}
 	if !isMember {
-		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "bot is not a member of this group", "status": 403})
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPINotGroupMember, nil, nil)
 		return
 	}
 
 	isBotAdmin, err := ba.groupService.IsBotAdmin(groupNo, robotID)
 	if err != nil {
 		ba.Error("check bot admin failed", zap.Error(err))
-		c.ResponseError(errors.New("check bot admin failed"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 		return
 	}
 	if !isBotAdmin {
-		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "bot is not a bot_admin in this group", "status": 403})
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPINotGroupAdmin, nil, nil)
 		return
 	}
 
@@ -219,20 +232,20 @@ func (ba *BotAPI) updateGroupMd(c *wkhttp.Context) {
 		Content string `json:"content"`
 	}
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("invalid request body"))
+		respondBotAPIRequestInvalid(c, "")
 		return
 	}
 
 	maxSize := group.GetGroupMdMaxSize()
 	if len(req.Content) > maxSize {
-		c.ResponseError(fmt.Errorf("GROUP.md content exceeds max size %d bytes", maxSize))
+		respondBotAPIContentTooLarge(c, "content", maxSize)
 		return
 	}
 
 	newVersion, err := ba.groupService.UpdateGroupMd(groupNo, req.Content, robotID)
 	if err != nil {
 		ba.Error("update GROUP.md failed", zap.Error(err))
-		c.ResponseError(errors.New("update GROUP.md failed"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
 		return
 	}
 
@@ -257,7 +270,7 @@ func (ba *BotAPI) updateGroupMd(c *wkhttp.Context) {
 func (ba *BotAPI) botSpaceMembers(c *wkhttp.Context) {
 	robotID := getRobotIDFromContext(c)
 	if robotID == "" {
-		c.ResponseError(errors.New("robot_id not found"))
+		ba.respondBotAPIIdentityMissing(c)
 		return
 	}
 
@@ -297,11 +310,11 @@ func (ba *BotAPI) botSpaceMembers(c *wkhttp.Context) {
 			"SELECT COUNT(*) FROM space_member WHERE space_id=? AND uid=? AND status=1", spaceID, robotID,
 		).LoadOne(&count); spErr != nil {
 			ba.Error("query space membership failed", zap.Error(spErr))
-			c.ResponseError(errors.New("查询空间成员失败"))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 			return
 		}
 		if count == 0 {
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "bot is not a member of this space"})
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPINotSpaceMember, nil, nil)
 			return
 		}
 	}
@@ -323,7 +336,7 @@ func (ba *BotAPI) botSpaceMembers(c *wkhttp.Context) {
 	}
 	if err != nil {
 		ba.Error("query space members failed", zap.Error(err))
-		c.ResponseError(errors.New("failed to query space members"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 		return
 	}
 
@@ -334,13 +347,13 @@ func (ba *BotAPI) botSpaceMembers(c *wkhttp.Context) {
 func (ba *BotAPI) botGroupCreate(c *wkhttp.Context) {
 	robotID := getRobotIDFromContext(c)
 	if robotID == "" {
-		c.ResponseError(errors.New("robot_id not found"))
+		ba.respondBotAPIIdentityMissing(c)
 		return
 	}
 
 	// App Bot is DM-only — deny group operations
 	if getBotKindFromContext(c) == BotKindApp {
-		c.ResponseError(errors.New("app bot does not support group operations"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIAppBotUnsupported, nil, nil)
 		return
 	}
 
@@ -351,15 +364,15 @@ func (ba *BotAPI) botGroupCreate(c *wkhttp.Context) {
 		SpaceID string   `json:"space_id"`
 	}
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("invalid request body"))
+		respondBotAPIRequestInvalid(c, "")
 		return
 	}
 	if len(req.Members) == 0 {
-		c.ResponseError(errors.New("members is required"))
+		respondBotAPIRequestInvalid(c, "members")
 		return
 	}
 	if len(req.Members) > 200 {
-		c.ResponseError(errors.New("members exceeds maximum of 200"))
+		respondBotAPILimitExceeded(c, "members", 200)
 		return
 	}
 
@@ -370,7 +383,7 @@ func (ba *BotAPI) botGroupCreate(c *wkhttp.Context) {
 		).Load(&spaceIDs)
 		if spErr != nil {
 			ba.Error("query bot space failed", zap.Error(spErr))
-			c.ResponseError(errors.New("failed to determine bot space association"))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 			return
 		}
 		if len(spaceIDs) > 0 {
@@ -381,7 +394,7 @@ func (ba *BotAPI) botGroupCreate(c *wkhttp.Context) {
 	memberUsers, err := ba.userDB.QueryByUIDs(req.Members)
 	if err != nil {
 		ba.Error("query member info failed", zap.Error(err))
-		c.ResponseError(errors.New("failed to query member info"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 		return
 	}
 	robotSet := make(map[string]bool)
@@ -397,7 +410,7 @@ func (ba *BotAPI) botGroupCreate(c *wkhttp.Context) {
 		}
 	}
 	if len(humanMembers) == 0 {
-		c.ResponseError(errors.New("only human members can be added through bot API"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIMemberNotHuman, nil, nil)
 		return
 	}
 
@@ -407,15 +420,15 @@ func (ba *BotAPI) botGroupCreate(c *wkhttp.Context) {
 		creatorUser, err := ba.userDB.QueryByUID(req.Creator)
 		if err != nil {
 			ba.Error("query creator info failed", zap.Error(err))
-			c.ResponseError(errors.New("failed to query creator info"))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 			return
 		}
 		if creatorUser == nil {
-			c.ResponseError(errors.New("creator user does not exist"))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIUserNotFound, nil, nil)
 			return
 		}
 		if creatorUser.Robot == 1 {
-			c.ResponseError(errors.New("creator cannot be a bot"))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIMemberNotHuman, nil, i18n.Details{"field": "creator"})
 			return
 		}
 	}
@@ -429,7 +442,7 @@ func (ba *BotAPI) botGroupCreate(c *wkhttp.Context) {
 	})
 	if err != nil {
 		ba.Error("create group failed", zap.Error(err))
-		c.ResponseError(err)
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
 		return
 	}
 
@@ -450,7 +463,7 @@ func (ba *BotAPI) botGroupUpdate(c *wkhttp.Context) {
 
 	// App Bot is DM-only — deny group operations
 	if getBotKindFromContext(c) == BotKindApp {
-		c.ResponseError(errors.New("app bot does not support group operations"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIAppBotUnsupported, nil, nil)
 		return
 	}
 
@@ -459,17 +472,17 @@ func (ba *BotAPI) botGroupUpdate(c *wkhttp.Context) {
 	isMember, err := ba.groupService.ExistMember(groupNo, robotID)
 	if err != nil {
 		ba.Error("check group membership failed", zap.Error(err))
-		c.ResponseError(errors.New("查询群成员失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 		return
 	}
 	if !isMember {
-		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "bot is not a member of this group"})
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPINotGroupMember, nil, nil)
 		return
 	}
 
 	isBotAdmin, err := ba.groupService.IsBotAdmin(groupNo, robotID)
 	if err != nil || !isBotAdmin {
-		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "bot is not a bot_admin in this group"})
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPINotGroupAdmin, nil, nil)
 		return
 	}
 
@@ -478,11 +491,11 @@ func (ba *BotAPI) botGroupUpdate(c *wkhttp.Context) {
 		Notice *string `json:"notice"`
 	}
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("invalid request body"))
+		respondBotAPIRequestInvalid(c, "")
 		return
 	}
 	if req.Name == nil && req.Notice == nil {
-		c.ResponseError(errors.New("at least one of name or notice is required"))
+		respondBotAPIRequestInvalid(c, "")
 		return
 	}
 
@@ -495,7 +508,7 @@ func (ba *BotAPI) botGroupUpdate(c *wkhttp.Context) {
 	})
 	if err != nil {
 		ba.Error("update group failed", zap.Error(err))
-		c.ResponseError(err)
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
 		return
 	}
 
@@ -509,7 +522,7 @@ func (ba *BotAPI) botGroupMemberAdd(c *wkhttp.Context) {
 
 	// App Bot is DM-only — deny group operations
 	if getBotKindFromContext(c) == BotKindApp {
-		c.ResponseError(errors.New("app bot does not support group operations"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIAppBotUnsupported, nil, nil)
 		return
 	}
 
@@ -518,11 +531,11 @@ func (ba *BotAPI) botGroupMemberAdd(c *wkhttp.Context) {
 	isMember, err := ba.groupService.ExistMember(groupNo, robotID)
 	if err != nil {
 		ba.Error("check group membership failed", zap.Error(err))
-		c.ResponseError(errors.New("查询群成员失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 		return
 	}
 	if !isMember {
-		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "bot is not a member of this group"})
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPINotGroupMember, nil, nil)
 		return
 	}
 
@@ -530,19 +543,18 @@ func (ba *BotAPI) botGroupMemberAdd(c *wkhttp.Context) {
 		Members []string `json:"members"`
 	}
 	if err := c.BindJSON(&req); err != nil || len(req.Members) == 0 {
-		c.ResponseError(errors.New("members is required"))
+		respondBotAPIRequestInvalid(c, "members")
 		return
 	}
 	if len(req.Members) > 200 {
-		c.ResponseError(errors.New("members exceeds maximum of 200"))
+		respondBotAPILimitExceeded(c, "members", 200)
 		return
 	}
-
 
 	memberUsers, err := ba.userDB.QueryByUIDs(req.Members)
 	if err != nil {
 		ba.Error("query member info failed", zap.Error(err))
-		c.ResponseError(errors.New("failed to query member info"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 		return
 	}
 	var humanMembers []string
@@ -555,7 +567,7 @@ func (ba *BotAPI) botGroupMemberAdd(c *wkhttp.Context) {
 		humanMembers = append(humanMembers, u.UID)
 	}
 	if len(humanMembers) == 0 {
-		c.ResponseError(errors.New("only human members can be added through bot API"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIMemberNotHuman, nil, nil)
 		return
 	}
 
@@ -567,7 +579,7 @@ func (ba *BotAPI) botGroupMemberAdd(c *wkhttp.Context) {
 	})
 	if err != nil {
 		ba.Error("add group members failed", zap.Error(err))
-		c.ResponseError(err)
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
 		return
 	}
 
@@ -585,7 +597,7 @@ func (ba *BotAPI) botGroupMemberRemove(c *wkhttp.Context) {
 
 	// App Bot is DM-only — deny group operations
 	if getBotKindFromContext(c) == BotKindApp {
-		c.ResponseError(errors.New("app bot does not support group operations"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIAppBotUnsupported, nil, nil)
 		return
 	}
 
@@ -594,17 +606,17 @@ func (ba *BotAPI) botGroupMemberRemove(c *wkhttp.Context) {
 	isMember, err := ba.groupService.ExistMember(groupNo, robotID)
 	if err != nil {
 		ba.Error("check group membership failed", zap.Error(err))
-		c.ResponseError(errors.New("查询群成员失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 		return
 	}
 	if !isMember {
-		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "bot is not a member of this group"})
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPINotGroupMember, nil, nil)
 		return
 	}
 
 	isBotAdmin, err := ba.groupService.IsBotAdmin(groupNo, robotID)
 	if err != nil || !isBotAdmin {
-		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "bot is not a bot_admin in this group"})
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPINotGroupAdmin, nil, nil)
 		return
 	}
 
@@ -612,7 +624,7 @@ func (ba *BotAPI) botGroupMemberRemove(c *wkhttp.Context) {
 		Members []string `json:"members"`
 	}
 	if err := c.BindJSON(&req); err != nil || len(req.Members) == 0 {
-		c.ResponseError(errors.New("members is required"))
+		respondBotAPIRequestInvalid(c, "members")
 		return
 	}
 
@@ -635,7 +647,7 @@ func (ba *BotAPI) botGroupMemberRemove(c *wkhttp.Context) {
 	})
 	if err != nil {
 		ba.Error("remove group members failed", zap.Error(err))
-		c.ResponseError(err)
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
 		return
 	}
 
@@ -675,4 +687,3 @@ func (ba *BotAPI) sendGroupMdNotification(groupNo string, updatedBy string, vers
 		Payload:     []byte(util.ToJson(payload)),
 	})
 }
-

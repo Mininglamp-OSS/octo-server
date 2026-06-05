@@ -4,6 +4,8 @@ import (
 	"errors"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
 )
@@ -24,7 +26,7 @@ import (
 func (ba *BotAPI) getMentionPref(c *wkhttp.Context) {
 	robotID := getRobotIDFromContext(c)
 	if robotID == "" {
-		c.ResponseError(errors.New("robot_id not found"))
+		ba.respondBotAPIIdentityMissing(c)
 		return
 	}
 	groupNo := c.Param("group_no")
@@ -34,8 +36,14 @@ func (ba *BotAPI) getMentionPref(c *wkhttp.Context) {
 		"SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0",
 		groupNo, robotID,
 	).LoadOne(&count)
-	if err != nil || count == 0 {
-		c.ResponseError(errors.New("bot is not a member of this group"))
+	if err != nil {
+		ba.Error("query group membership failed", zap.Error(err),
+			zap.String("robot_id", robotID), zap.String("group_no", groupNo))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+		return
+	}
+	if count == 0 {
+		httperr.ResponseErrorL(c, errcode.ErrBotAPINotGroupMember, nil, nil)
 		return
 	}
 
@@ -45,7 +53,7 @@ func (ba *BotAPI) getMentionPref(c *wkhttp.Context) {
 	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
 		ba.Error("查询 bot_mention_pref 失败", zap.Error(err),
 			zap.String("robot_id", robotID), zap.String("group_no", groupNo))
-		c.ResponseError(errors.New("查询失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 		return
 	}
 
@@ -59,7 +67,7 @@ func (ba *BotAPI) getMentionPref(c *wkhttp.Context) {
 		} else {
 			ba.Error("查询 group.allow_no_mention 失败", zap.Error(err),
 				zap.String("robot_id", robotID), zap.String("group_no", groupNo))
-			c.ResponseError(errors.New("查询失败"))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 			return
 		}
 	}

@@ -1,12 +1,13 @@
 package bot_api
 
 import (
-	"errors"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"go.uber.org/zap"
 )
 
@@ -24,15 +25,15 @@ type BotSyncMessagesReq struct {
 func (ba *BotAPI) syncMessages(c *wkhttp.Context) {
 	var req BotSyncMessagesReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("invalid request body"))
+		respondBotAPIRequestInvalid(c, "")
 		return
 	}
 	if strings.TrimSpace(req.ChannelID) == "" {
-		c.ResponseError(errors.New("channel_id不能为空"))
+		respondBotAPIRequestInvalid(c, "channel_id")
 		return
 	}
 	if req.ChannelType == 0 {
-		c.ResponseError(errors.New("channel_type不能为空"))
+		respondBotAPIRequestInvalid(c, "channel_type")
 		return
 	}
 	if req.Limit <= 0 {
@@ -49,7 +50,7 @@ func (ba *BotAPI) syncMessages(c *wkhttp.Context) {
 		// App Bot is DM-only — deny group sync entirely
 		botKind := getBotKindFromContext(c)
 		if botKind == BotKindApp {
-			c.ResponseError(errors.New("app bot only supports direct messages"))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIAppBotDMOnly, nil, nil)
 			return
 		}
 		var count int
@@ -59,11 +60,11 @@ func (ba *BotAPI) syncMessages(c *wkhttp.Context) {
 		).LoadOne(&count)
 		if err != nil {
 			ba.Error("failed to query group members", zap.Error(err))
-			c.ResponseError(errors.New("failed to query group members"))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 			return
 		}
 		if count == 0 {
-			c.ResponseError(errors.New("bot is not a member of this group"))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPINotGroupMember, nil, nil)
 			return
 		}
 	} else if req.ChannelType == common.ChannelTypePerson.Uint8() {
@@ -73,11 +74,11 @@ func (ba *BotAPI) syncMessages(c *wkhttp.Context) {
 			isFriend, err := ba.userService.IsFriend(robotID, req.ChannelID)
 			if err != nil {
 				ba.Error("failed to verify relationship", zap.Error(err))
-				c.ResponseError(errors.New("failed to verify relationship"))
+				httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 				return
 			}
 			if !isFriend {
-				c.ResponseError(errors.New("user has not started conversation with this bot"))
+				httperr.ResponseErrorL(c, errcode.ErrBotAPIConversationNotStarted, nil, nil)
 				return
 			}
 		case BotKindUser:
@@ -100,11 +101,11 @@ func (ba *BotAPI) syncMessages(c *wkhttp.Context) {
 				allowed, err := ba.isFriendOrOBOBypass(robotID, req.ChannelID, req.ChannelType, false)
 				if err != nil {
 					ba.Error("failed to check friend relationship", zap.Error(err))
-					c.ResponseError(errors.New("failed to check friend relationship"))
+					httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 					return
 				}
 				if !allowed {
-					c.ResponseError(errors.New("bot is not a friend of this user"))
+					httperr.ResponseErrorL(c, errcode.ErrBotAPINotFriend, nil, nil)
 					return
 				}
 			}
@@ -113,12 +114,12 @@ func (ba *BotAPI) syncMessages(c *wkhttp.Context) {
 		// Thread: App Bot denied (DM-only), User Bot must be member of parent group
 		botKind := getBotKindFromContext(c)
 		if botKind == BotKindApp {
-			c.ResponseError(errors.New("app bot only supports direct messages"))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIAppBotDMOnly, nil, nil)
 			return
 		}
 		parts := strings.SplitN(req.ChannelID, threadChannelIDSeparator, 2)
 		if len(parts) != 2 {
-			c.ResponseError(errors.New("invalid thread channel_id format"))
+			respondBotAPIRequestInvalid(c, "channel_id")
 			return
 		}
 		var count int
@@ -128,11 +129,11 @@ func (ba *BotAPI) syncMessages(c *wkhttp.Context) {
 		).LoadOne(&count)
 		if err != nil {
 			ba.Error("failed to query group members", zap.Error(err))
-			c.ResponseError(errors.New("failed to query group members"))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 			return
 		}
 		if count == 0 {
-			c.ResponseError(errors.New("bot is not a member of this group"))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPINotGroupMember, nil, nil)
 			return
 		}
 	}
@@ -150,7 +151,7 @@ func (ba *BotAPI) syncMessages(c *wkhttp.Context) {
 	resp, err := ba.ctx.IMSyncChannelMessage(syncReq)
 	if err != nil {
 		ba.Error("同步消息失败", zap.Error(err))
-		c.ResponseError(errors.New("同步消息失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPISendFailed, nil, nil)
 		return
 	}
 

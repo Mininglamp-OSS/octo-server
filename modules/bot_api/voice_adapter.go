@@ -12,6 +12,8 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/voice_adapter"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/gin-gonic/gin"
 	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
@@ -20,20 +22,14 @@ import (
 func (ba *BotAPI) resolveOwnerAndSpace(c *wkhttp.Context) (string, string, string, bool) {
 	botKind := getBotKindFromContext(c)
 	if botKind == BotKindApp {
-		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
-			"status": http.StatusForbidden,
-			"msg":    "app bot does not support voice operations",
-		})
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIAppBotUnsupported, nil, nil)
 		return "", "", "", false
 	}
 
 	robot := getRobotFromContext(c)
 	if robot == nil {
 		ba.Error("invalid bot token: robot not found in context")
-		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-			"status": http.StatusUnauthorized,
-			"msg":    "invalid bot token",
-		})
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIAuthFailed, nil, nil)
 		return "", "", "", false
 	}
 
@@ -41,7 +37,7 @@ func (ba *BotAPI) resolveOwnerAndSpace(c *wkhttp.Context) (string, string, strin
 	ownerUID := robot.CreatorUID
 	if ownerUID == "" {
 		ba.Error("bot has no owner", zap.String("robotID", robotID))
-		c.ResponseErrorWithStatus(errors.New("bot has no owner"), http.StatusBadRequest)
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIBotNotProvisioned, nil, nil)
 		return "", "", "", false
 	}
 
@@ -49,16 +45,16 @@ func (ba *BotAPI) resolveOwnerAndSpace(c *wkhttp.Context) (string, string, strin
 	if err != nil {
 		if errors.Is(err, dbr.ErrNotFound) {
 			ba.Warn("bot is not in any active space", zap.String("robotID", robotID))
-			c.ResponseErrorWithStatus(errors.New("bot is not in any active space"), http.StatusBadRequest)
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIBotNotProvisioned, nil, nil)
 			return "", "", "", false
 		}
 		ba.Error("query space by robot failed", zap.Error(err), zap.String("robotID", robotID))
-		c.ResponseErrorWithStatus(errors.New("query space failed"), http.StatusInternalServerError)
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 		return "", "", "", false
 	}
 	if spaceID == "" {
 		ba.Warn("bot is not in any active space", zap.String("robotID", robotID))
-		c.ResponseErrorWithStatus(errors.New("bot is not in any active space"), http.StatusBadRequest)
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIBotNotProvisioned, nil, nil)
 		return "", "", "", false
 	}
 	if len(allSpaces) > 1 {
@@ -84,21 +80,18 @@ func (ba *BotAPI) botPutVoiceContext(c *wkhttp.Context) {
 		Context string `json:"context"`
 	}
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseErrorWithStatus(errors.New("invalid request body"), http.StatusBadRequest)
+		respondBotAPIRequestInvalid(c, "")
 		return
 	}
 
 	ctx := strings.TrimSpace(req.Context)
 	if ctx == "" {
-		c.ResponseErrorWithStatus(errors.New("context cannot be empty"), http.StatusBadRequest)
+		respondBotAPIRequestInvalid(c, "context")
 		return
 	}
 
 	if len([]rune(ctx)) > ba.maxVoiceContextLength {
-		c.ResponseErrorWithStatus(
-			fmt.Errorf("context exceeds max length (%d characters)", ba.maxVoiceContextLength),
-			http.StatusBadRequest,
-		)
+		respondBotAPIContentTooLarge(c, "context", ba.maxVoiceContextLength)
 		return
 	}
 
@@ -111,7 +104,7 @@ func (ba *BotAPI) botPutVoiceContext(c *wkhttp.Context) {
 	})
 	if err != nil {
 		ba.Error("put vocabulary failed", zap.Error(err), zap.String("robotID", robotID))
-		c.ResponseErrorWithStatus(errors.New("save voice context failed"), http.StatusInternalServerError)
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIStoreFailed, nil, nil)
 		return
 	}
 
@@ -127,7 +120,7 @@ func (ba *BotAPI) botGetVoiceContext(c *wkhttp.Context) {
 	vocab, err := ba.speechClient.GetVocabulary(c.Request.Context(), ownerUID, "space", spaceID)
 	if err != nil {
 		ba.Error("get vocabulary failed", zap.Error(err), zap.String("robotID", robotID))
-		c.ResponseErrorWithStatus(errors.New("query voice context failed"), http.StatusInternalServerError)
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 		return
 	}
 
@@ -148,7 +141,7 @@ func (ba *BotAPI) botDeleteVoiceContext(c *wkhttp.Context) {
 	err := ba.speechClient.DeleteVocabulary(c.Request.Context(), ownerUID, "space", spaceID)
 	if err != nil {
 		ba.Error("delete vocabulary failed", zap.Error(err), zap.String("robotID", robotID))
-		c.ResponseErrorWithStatus(errors.New("delete voice context failed"), http.StatusInternalServerError)
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIStoreFailed, nil, nil)
 		return
 	}
 
@@ -158,10 +151,7 @@ func (ba *BotAPI) botDeleteVoiceContext(c *wkhttp.Context) {
 func (ba *BotAPI) botTranscribe(c *wkhttp.Context) {
 	botKind := getBotKindFromContext(c)
 	if botKind == BotKindApp {
-		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
-			"status": http.StatusForbidden,
-			"msg":    "app bot does not support voice operations",
-		})
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIAppBotUnsupported, nil, nil)
 		return
 	}
 
@@ -170,10 +160,10 @@ func (ba *BotAPI) botTranscribe(c *wkhttp.Context) {
 	if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
-			c.ResponseErrorWithStatus(errors.New("request body too large"), http.StatusRequestEntityTooLarge)
+			respondBotAPIPayloadTooLarge(c, ba.maxBodySize)
 			return
 		}
-		c.ResponseErrorWithStatus(errors.New("invalid multipart form"), http.StatusBadRequest)
+		respondBotAPIRequestInvalid(c, "")
 		return
 	}
 	defer c.Request.MultipartForm.RemoveAll()
@@ -181,10 +171,7 @@ func (ba *BotAPI) botTranscribe(c *wkhttp.Context) {
 	for _, fileHeaders := range c.Request.MultipartForm.File {
 		for _, fh := range fileHeaders {
 			if fh.Size > ba.maxFileSize {
-				c.ResponseErrorWithStatus(
-					fmt.Errorf("file %s exceeds max size %d bytes", fh.Filename, ba.maxFileSize),
-					http.StatusRequestEntityTooLarge,
-				)
+				respondBotAPIPayloadTooLarge(c, ba.maxFileSize)
 				return
 			}
 		}
@@ -197,10 +184,7 @@ func (ba *BotAPI) botTranscribe(c *wkhttp.Context) {
 	case "edit", "":
 		mode = "smart"
 	default:
-		c.ResponseErrorWithStatus(
-			fmt.Errorf("invalid mode '%s': must be 'append' or 'edit'", mode),
-			http.StatusBadRequest,
-		)
+		respondBotAPIRequestInvalid(c, "mode")
 		return
 	}
 
@@ -215,13 +199,15 @@ func (ba *BotAPI) botTranscribe(c *wkhttp.Context) {
 			modeWritten = true
 		}
 		if err := w.WriteField(key, v); err != nil {
-			c.ResponseErrorWithStatus(errors.New("failed to build request"), http.StatusInternalServerError)
+			ba.Error("build transcribe request failed", zap.Error(err))
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedInternal, nil, nil)
 			return
 		}
 	}
 	if !modeWritten {
 		if err := w.WriteField("mode", mode); err != nil {
-			c.ResponseErrorWithStatus(errors.New("failed to build request"), http.StatusInternalServerError)
+			ba.Error("build transcribe request failed", zap.Error(err))
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedInternal, nil, nil)
 			return
 		}
 	}
@@ -230,7 +216,7 @@ func (ba *BotAPI) botTranscribe(c *wkhttp.Context) {
 		for _, fh := range fileHeaders {
 			src, err := fh.Open()
 			if err != nil {
-				c.ResponseErrorWithStatus(errors.New("failed to read uploaded file"), http.StatusBadRequest)
+				respondBotAPIRequestInvalid(c, "file")
 				return
 			}
 
@@ -246,12 +232,14 @@ func (ba *BotAPI) botTranscribe(c *wkhttp.Context) {
 			dst, err := w.CreatePart(partHeader)
 			if err != nil {
 				src.Close()
-				c.ResponseErrorWithStatus(errors.New("failed to build request"), http.StatusInternalServerError)
+				ba.Error("build transcribe request failed", zap.Error(err))
+				httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedInternal, nil, nil)
 				return
 			}
 			if _, err := io.Copy(dst, src); err != nil {
 				src.Close()
-				c.ResponseErrorWithStatus(errors.New("failed to build request"), http.StatusInternalServerError)
+				ba.Error("build transcribe request failed", zap.Error(err))
+				httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedInternal, nil, nil)
 				return
 			}
 			src.Close()
@@ -262,10 +250,7 @@ func (ba *BotAPI) botTranscribe(c *wkhttp.Context) {
 	resp, err := ba.speechClient.ForwardTranscribeBody(c.Request.Context(), &buf, w.FormDataContentType())
 	if err != nil {
 		ba.Error("forward transcribe failed", zap.Error(err))
-		c.JSON(http.StatusBadGateway, gin.H{
-			"status": http.StatusBadGateway,
-			"msg":    "speech service unavailable",
-		})
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIUpstreamFailed, nil, nil)
 		return
 	}
 	defer resp.Body.Close()

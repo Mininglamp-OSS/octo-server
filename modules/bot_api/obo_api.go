@@ -7,16 +7,17 @@
 // NOT support cross-user persona management in v0 (RFC §2 / out-of-scope).
 //
 // Status code map (kept narrow on purpose):
-//   200 — success (single object or list)
-//   400 — bad request body / missing required fields
-//   401 — no user token (handled by upstream middleware)
-//   403 — (reserved — production currently uses 404 for cross-user attempts
-//          as a user-enumeration defense; see requireOwnedGrant comment.)
-//   404 — grant_id / scope_id not found; cross-user grant/scope access
-//          (existence-leak defense)
-//   409 — duplicate (grantor+grantee already exists / scope already exists,
-//          with no soft-deleted row to reactivate in place)
-//   500 — DB error
+//
+//	200 — success (single object or list)
+//	400 — bad request body / missing required fields
+//	401 — no user token (handled by upstream middleware)
+//	403 — (reserved — production currently uses 404 for cross-user attempts
+//	       as a user-enumeration defense; see requireOwnedGrant comment.)
+//	404 — grant_id / scope_id not found; cross-user grant/scope access
+//	       (existence-leak defense)
+//	409 — duplicate (grantor+grantee already exists / scope already exists,
+//	       with no soft-deleted row to reactivate in place)
+//	500 — DB error
 package bot_api
 
 import (
@@ -24,12 +25,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"go.uber.org/zap"
 )
 
@@ -203,20 +205,20 @@ type oboCreateScopeReq struct {
 func (ba *BotAPI) oboCreateGrant(c *wkhttp.Context) {
 	uid := c.GetLoginUID()
 	if uid == "" {
-		c.AbortWithStatusJSON(http.StatusUnauthorized, gin404("unauthorized"))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPISharedAuthRequired, nil, nil)
 		return
 	}
 	var req oboCreateGrantReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("数据格式有误"))
+		respondBotAPIRequestInvalid(c, "")
 		return
 	}
 	if strings.TrimSpace(req.GranteeBotUID) == "" {
-		c.ResponseError(errors.New("grantee_bot_uid 不能为空"))
+		respondBotAPIRequestInvalid(c, "grantee_bot_uid")
 		return
 	}
 	if req.GranteeBotUID == uid {
-		c.ResponseError(errors.New("grantee_bot_uid 不能等于自己"))
+		respondBotAPIRequestInvalid(c, "grantee_bot_uid")
 		return
 	}
 	mode := req.Mode
@@ -225,7 +227,7 @@ func (ba *BotAPI) oboCreateGrant(c *wkhttp.Context) {
 	}
 	if mode != "auto" {
 		// v0 — see RFC §2 / out-of-scope. Draft mode lands in v1.
-		c.ResponseError(errors.New("mode 仅支持 auto (v0)"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIOBOModeUnsupported, nil, nil)
 		return
 	}
 	// PR#109 / YUJ-1471 — persona_prompt length cap. Fan-out appends
@@ -234,7 +236,7 @@ func (ba *BotAPI) oboCreateGrant(c *wkhttp.Context) {
 	// budget. 4096 bytes is generous for natural-language guidance and
 	// matches the cap UI surfaces (see web persona editor).
 	if len(req.PersonaPrompt) > oboPersonaPromptMaxBytes {
-		c.ResponseError(errors.New("persona_prompt 长度超过上限 (最多 4096 字节)"))
+		respondBotAPIContentTooLarge(c, "persona_prompt", oboPersonaPromptMaxBytes)
 		return
 	}
 
@@ -245,18 +247,18 @@ func (ba *BotAPI) oboCreateGrant(c *wkhttp.Context) {
 	creatorUID, isBot, found, err := ba.oboStoreOrDefault().queryRobotOwner(req.GranteeBotUID)
 	if err != nil {
 		ba.Error("queryRobotOwner failed", zap.Error(err), zap.String("bot", req.GranteeBotUID))
-		c.ResponseError(errors.New("内部错误"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIOBOInternal, nil, nil)
 		return
 	}
 	if !found || !isBot {
-		c.JSON(http.StatusNotFound, gin404("grantee_bot_uid not a registered bot"))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIBotNotRegistered, nil, nil)
 		return
 	}
 	if creatorUID != uid {
 		// Owned by someone else; treat as not-found to avoid telling the
 		// caller "this bot exists but isn't yours". Same posture as
 		// requireOwnedGrant.
-		c.JSON(http.StatusNotFound, gin404("grantee_bot_uid not a registered bot"))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIBotNotRegistered, nil, nil)
 		return
 	}
 
@@ -274,14 +276,14 @@ func (ba *BotAPI) oboCreateGrant(c *wkhttp.Context) {
 	grant, _, err := ba.oboStoreOrDefault().createOrReactivateGrantAtomic(uid, req.GranteeBotUID, mode, req.PersonaPrompt)
 	if err != nil {
 		if errors.Is(err, errOBOGrantAlreadyActive) {
-			c.JSON(http.StatusConflict, gin404("grant already exists"))
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIOBOGrantExists, nil, nil)
 			return
 		}
 		ba.Error("createOrReactivateGrantAtomic failed",
 			zap.Error(err),
 			zap.String("grantor", uid),
 			zap.String("bot", req.GranteeBotUID))
-		c.ResponseError(errors.New("内部错误"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIOBOInternal, nil, nil)
 		return
 	}
 	c.Response(grant)
@@ -292,13 +294,13 @@ func (ba *BotAPI) oboCreateGrant(c *wkhttp.Context) {
 func (ba *BotAPI) oboListGrants(c *wkhttp.Context) {
 	uid := c.GetLoginUID()
 	if uid == "" {
-		c.AbortWithStatusJSON(http.StatusUnauthorized, gin404("unauthorized"))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPISharedAuthRequired, nil, nil)
 		return
 	}
 	grants, err := ba.oboStoreOrDefault().listGrantsByGrantor(uid)
 	if err != nil {
 		ba.Error("listGrants failed", zap.Error(err))
-		c.ResponseError(errors.New("内部错误"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIOBOInternal, nil, nil)
 		return
 	}
 	c.Response(map[string]interface{}{"items": grants})
@@ -318,7 +320,7 @@ func (ba *BotAPI) oboDeleteGrant(c *wkhttp.Context) {
 	}
 	if err := ba.oboStoreOrDefault().revokeGrant(id); err != nil {
 		ba.Error("revokeGrant failed", zap.Error(err), zap.Int64("id", id))
-		c.ResponseError(errors.New("内部错误"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIOBOInternal, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -381,7 +383,7 @@ func (ba *BotAPI) oboUpdateGrant(c *wkhttp.Context) {
 	}
 	var req oboUpdateGrantReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("数据格式有误"))
+		respondBotAPIRequestInvalid(c, "")
 		return
 	}
 	// YUJ-1424 / W1 / YUJ-1735 — paused-vs-revoked gate. See function
@@ -392,7 +394,7 @@ func (ba *BotAPI) oboUpdateGrant(c *wkhttp.Context) {
 			zap.Int64("grant_id", id),
 			zap.String("grantor", uid),
 			zap.Int("active", grant.Active))
-		c.JSON(http.StatusNotFound, gin404("grant not found"))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIOBOGrantNotFound, nil, nil)
 		return
 	}
 	if grant.Active != 1 && req.Active == nil {
@@ -400,17 +402,17 @@ func (ba *BotAPI) oboUpdateGrant(c *wkhttp.Context) {
 			zap.Int64("grant_id", id),
 			zap.String("grantor", uid),
 			zap.Int("active", grant.Active))
-		c.JSON(http.StatusNotFound, gin404("grant not found"))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIOBOGrantNotFound, nil, nil)
 		return
 	}
 	if req.Mode != "" && req.Mode != "auto" {
-		c.ResponseError(errors.New("mode 仅支持 auto (v0)"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIOBOModeUnsupported, nil, nil)
 		return
 	}
 	// PR#109 / YUJ-1471 — persona_prompt length cap. Same rationale as
 	// the create handler; rejected before any DB work hits the row.
 	if req.PersonaPrompt != nil && len(*req.PersonaPrompt) > oboPersonaPromptMaxBytes {
-		c.ResponseError(errors.New("persona_prompt 长度超过上限 (最多 4096 字节)"))
+		respondBotAPIContentTooLarge(c, "persona_prompt", oboPersonaPromptMaxBytes)
 		return
 	}
 	if req.Mode == "" && req.GlobalEnabled == nil && req.PersonaPrompt == nil && req.Active == nil {
@@ -435,14 +437,14 @@ func (ba *BotAPI) oboUpdateGrant(c *wkhttp.Context) {
 		}
 		if err := ba.oboStoreOrDefault().setGrantActive(id, v); err != nil {
 			ba.Error("setGrantActive failed", zap.Error(err), zap.Int64("id", id))
-			c.ResponseError(errors.New("内部错误"))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIOBOInternal, nil, nil)
 			return
 		}
 	}
 	if req.Mode != "" || req.GlobalEnabled != nil || req.PersonaPrompt != nil {
 		if err := ba.oboStoreOrDefault().updateGrant(id, req.Mode, req.GlobalEnabled, req.PersonaPrompt); err != nil {
 			ba.Error("updateGrant failed", zap.Error(err), zap.Int64("id", id))
-			c.ResponseError(errors.New("内部错误"))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIOBOInternal, nil, nil)
 			return
 		}
 	}
@@ -470,16 +472,16 @@ func (ba *BotAPI) oboUpdateGrant(c *wkhttp.Context) {
 func (ba *BotAPI) oboCreateScope(c *wkhttp.Context) {
 	uid := c.GetLoginUID()
 	if uid == "" {
-		c.AbortWithStatusJSON(http.StatusUnauthorized, gin404("unauthorized"))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPISharedAuthRequired, nil, nil)
 		return
 	}
 	var req oboCreateScopeReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("数据格式有误"))
+		respondBotAPIRequestInvalid(c, "")
 		return
 	}
 	if req.GrantID == 0 || strings.TrimSpace(req.ChannelID) == "" || req.ChannelType == 0 {
-		c.ResponseError(errors.New("grant_id / channel_id / channel_type 不能为空"))
+		respondBotAPIRequestInvalid(c, "")
 		return
 	}
 	grant, err := ba.requireOwnedGrant(c, uid, req.GrantID)
@@ -497,7 +499,7 @@ func (ba *BotAPI) oboCreateScope(c *wkhttp.Context) {
 			zap.Error(err), zap.String("grantor", uid),
 			zap.String("channel_id", req.ChannelID),
 			zap.Uint8("channel_type", req.ChannelType))
-		c.ResponseError(errors.New("内部错误"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIOBOInternal, nil, nil)
 		return
 	}
 	if !ok {
@@ -505,7 +507,7 @@ func (ba *BotAPI) oboCreateScope(c *wkhttp.Context) {
 			zap.String("grantor", uid),
 			zap.String("channel_id", req.ChannelID),
 			zap.Uint8("channel_type", req.ChannelType))
-		c.JSON(http.StatusNotFound, gin404("channel not found"))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIOBOChannelNotFound, nil, nil)
 		return
 	}
 
@@ -516,11 +518,11 @@ func (ba *BotAPI) oboCreateScope(c *wkhttp.Context) {
 	id, err := ba.oboStoreOrDefault().insertScope(req.GrantID, req.ChannelID, req.ChannelType, enabled)
 	if err != nil {
 		if isDuplicateKeyErr(err) {
-			c.JSON(http.StatusConflict, gin404("scope already exists"))
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIOBOScopeExists, nil, nil)
 			return
 		}
 		ba.Error("insertScope failed", zap.Error(err))
-		c.ResponseError(errors.New("内部错误"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIOBOInternal, nil, nil)
 		return
 	}
 	c.Response(map[string]interface{}{
@@ -543,7 +545,7 @@ func (ba *BotAPI) oboCreateScope(c *wkhttp.Context) {
 func (ba *BotAPI) oboDeleteScope(c *wkhttp.Context) {
 	uid := c.GetLoginUID()
 	if uid == "" {
-		c.AbortWithStatusJSON(http.StatusUnauthorized, gin404("unauthorized"))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPISharedAuthRequired, nil, nil)
 		return
 	}
 	id, ok := parseIDParam(c, "id")
@@ -553,19 +555,19 @@ func (ba *BotAPI) oboDeleteScope(c *wkhttp.Context) {
 	owner, found, err := ba.oboStoreOrDefault().findScopeOwner(id)
 	if err != nil {
 		ba.Error("scope ownership lookup failed", zap.Error(err), zap.Int64("id", id))
-		c.ResponseError(errors.New("内部错误"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIOBOInternal, nil, nil)
 		return
 	}
 	if !found || owner != uid {
 		// Existence-leak defense: cross-user delete attempts return 404,
 		// indistinguishable from "scope id never existed". Matches the
 		// posture in requireOwnedGrant.
-		c.JSON(http.StatusNotFound, gin404("scope not found"))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIOBOScopeNotFound, nil, nil)
 		return
 	}
 	if err := ba.oboStoreOrDefault().deleteScope(id); err != nil {
 		ba.Error("deleteScope failed", zap.Error(err), zap.Int64("id", id))
-		c.ResponseError(errors.New("内部错误"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIOBOInternal, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -585,7 +587,7 @@ func (ba *BotAPI) oboListScopes(c *wkhttp.Context) {
 	scopes, err := ba.oboStoreOrDefault().listScopesByGrant(id)
 	if err != nil {
 		ba.Error("listScopes failed", zap.Error(err))
-		c.ResponseError(errors.New("内部错误"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIOBOInternal, nil, nil)
 		return
 	}
 	c.Response(map[string]interface{}{"items": scopes})
@@ -623,13 +625,13 @@ type oboBotGetGrantResp struct {
 // Status code map:
 //   - 200 — grant found; body is oboBotGetGrantResp.
 //   - 401 — handled by ba.authBot() upstream (this handler only runs
-//           on authenticated requests; the defensive empty-uid branch
-//           below 500s because reaching it means the middleware broke
-//           its invariant and a 401 would mask that).
+//     on authenticated requests; the defensive empty-uid branch
+//     below 500s because reaching it means the middleware broke
+//     its invariant and a 401 would mask that).
 //   - 404 — no active grant for this bot. Note: "no active grant"
-//           covers both "grant never existed" and "grant was paused
-//           or revoked"; the adapter should treat 404 as "do not
-//           apply a persona" without distinguishing the cause.
+//     covers both "grant never existed" and "grant was paused
+//     or revoked"; the adapter should treat 404 as "do not
+//     apply a persona" without distinguishing the cause.
 //   - 500 — store error.
 //
 // `persona_prompt` round-trips as an empty string when the column is
@@ -642,7 +644,7 @@ func (ba *BotAPI) oboBotGetGrant(c *wkhttp.Context) {
 		// rather than 401 so the misconfiguration is noisy upstream
 		// instead of being silently mis-attributed to an auth failure.
 		ba.Error("oboBotGetGrant: empty robot id from auth context")
-		c.ResponseError(errors.New("内部错误"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIOBOInternal, nil, nil)
 		return
 	}
 	grant, err := ba.oboStoreOrDefault().findActiveGrantByBot(botUID)
@@ -650,11 +652,11 @@ func (ba *BotAPI) oboBotGetGrant(c *wkhttp.Context) {
 		ba.Error("findActiveGrantByBot failed",
 			zap.Error(err),
 			zap.String("bot", botUID))
-		c.ResponseError(errors.New("内部错误"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIOBOInternal, nil, nil)
 		return
 	}
 	if grant == nil {
-		c.JSON(http.StatusNotFound, gin404("no active grant"))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIOBOGrantNotFound, nil, nil)
 		return
 	}
 	c.Response(oboBotGetGrantResp{
@@ -672,23 +674,23 @@ func (ba *BotAPI) oboBotGetGrant(c *wkhttp.Context) {
 // any failure path so callers can simply `return`.
 func (ba *BotAPI) requireOwnedGrant(c *wkhttp.Context, uid string, id int64) (*oboGrantModel, error) {
 	if uid == "" {
-		c.AbortWithStatusJSON(http.StatusUnauthorized, gin404("unauthorized"))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPISharedAuthRequired, nil, nil)
 		return nil, nil
 	}
 	grant, err := ba.oboStoreOrDefault().findGrantByID(id)
 	if err != nil {
 		ba.Error("findGrantByID failed", zap.Error(err), zap.Int64("id", id))
-		c.ResponseError(errors.New("内部错误"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIOBOInternal, nil, nil)
 		return nil, err
 	}
 	if grant == nil {
-		c.JSON(http.StatusNotFound, gin404("grant not found"))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIOBOGrantNotFound, nil, nil)
 		return nil, nil
 	}
 	if grant.GrantorUID != uid {
 		// Treat as 404, not 403, so we don't leak grant existence to
 		// non-owners. (Same logic as classic "user enumeration" defense.)
-		c.JSON(http.StatusNotFound, gin404("grant not found"))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIOBOGrantNotFound, nil, nil)
 		return nil, nil
 	}
 	return grant, nil
@@ -793,7 +795,7 @@ func parseIDParam(c *wkhttp.Context, name string) (int64, bool) {
 	raw := c.Param(name)
 	id, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil || id <= 0 {
-		c.ResponseError(errors.New(name + " 无效"))
+		respondBotAPIRequestInvalid(c, name)
 		return 0, false
 	}
 	return id, true

@@ -13,6 +13,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
 	"github.com/Mininglamp-OSS/octo-server/pkg/richtext"
 	"github.com/gocraft/dbr/v2"
@@ -38,20 +40,19 @@ type BotSendMessageReq struct {
 func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 	var req BotSendMessageReq
 	if err := c.BindJSON(&req); err != nil {
-		ba.Error("数据格式有误", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误"))
+		respondBotAPIRequestInvalid(c, "")
 		return
 	}
 	if strings.TrimSpace(req.ChannelID) == "" {
-		c.ResponseError(errors.New("channel_id不能为空"))
+		respondBotAPIRequestInvalid(c, "channel_id")
 		return
 	}
 	if req.ChannelType == 0 {
-		c.ResponseError(errors.New("channel_type不能为空"))
+		respondBotAPIRequestInvalid(c, "channel_type")
 		return
 	}
 	if len(req.Payload) == 0 {
-		c.ResponseError(errors.New("payload不能为空"))
+		respondBotAPIRequestInvalid(c, "payload")
 		return
 	}
 	// PR#82 review #2 P1-2 + PR#121 R2 + PR#121 R3 — reject any
@@ -76,7 +77,7 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 	// checkSendPermission / checkOBO so the error is fast and the
 	// auth path doesn't run on poisoned input.
 	if payloadHasReservedOBOKey(req.Payload) {
-		c.ResponseError(errors.New("payload 不允许使用 OBO 保留字段（__obo_* 前缀、obo_respond_as/obo_grantor_uid/obo_fanout/obo_origin_*/obo_system_hint，或 actual_sender_uid）"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIOBOReservedField, nil, nil)
 		return
 	}
 
@@ -94,7 +95,7 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 
 	// Permission check based on bot kind
 	if err := ba.checkSendPermission(c, botKind, robotID, req.ChannelID, req.ChannelType, hasOBOContext); err != nil {
-		c.ResponseError(err)
+		respondSendPermissionError(c, err)
 		return
 	}
 
@@ -141,7 +142,7 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 					zap.String("bot", robotID),
 					zap.String("grantor", req.OnBehalfOf),
 					zap.Error(err))
-				c.ResponseError(errors.New("OBO 检查失败"))
+				httperr.ResponseErrorL(c, errcode.ErrBotAPIOBOInternal, nil, nil)
 				return
 			}
 			grantorReplyBypass = hasGrant
@@ -155,10 +156,12 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 						zap.String("on_behalf_of", req.OnBehalfOf),
 						zap.String("channel_id", req.ChannelID),
 						zap.Uint8("channel_type", req.ChannelType))
-					c.ResponseError(ErrOBONotAuthorized)
+					httperr.ResponseErrorL(c, errcode.ErrBotAPIOBONotAuthorized, nil, nil)
 					return
 				}
-				c.ResponseError(errors.New("OBO 检查失败"))
+				ba.Error("OBO check failed", zap.Error(err),
+					zap.String("bot", robotID), zap.String("on_behalf_of", req.OnBehalfOf))
+				httperr.ResponseErrorL(c, errcode.ErrBotAPIOBOInternal, nil, nil)
 				return
 			}
 			fromUID = req.OnBehalfOf
@@ -251,7 +254,7 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 	result, err := ba.dispatchMsgSendReq(msgReq)
 	if err != nil {
 		ba.Error("发送消息失败", zap.Error(err))
-		c.ResponseError(errors.New("发送消息失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPISendFailed, nil, nil)
 		return
 	}
 
@@ -285,29 +288,32 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 	case BotKindApp:
 		// Rule 1: App Bot only supports DM
 		if channelType != common.ChannelTypePerson.Uint8() {
-			return errors.New("app bot only supports direct messages")
+			return errBotSendPermAppBotDMOnly
 		}
 		// Rule 2: Must have friend relationship (user opt-in via /v1/robot/apply)
 		isFriend, err := ba.userService.IsFriend(robotID, channelID)
 		if err != nil {
-			return errors.New("failed to verify relationship")
+			ba.Error("failed to verify relationship", zap.Error(err), zap.String("robotID", robotID))
+			return errBotSendPermCheckFailed
 		}
 		if !isFriend {
-			return errors.New("user has not started conversation with this bot")
+			return errBotSendPermConvNotStarted
 		}
 		// Rule 3: Space bot — user must still be a space member (fail-closed)
 		if scope, _ := c.Get(CtxKeyAppBotScope); scope == "space" {
 			spaceIDStr, _ := c.Get(CtxKeyAppBotSpaceID)
 			sid, _ := spaceIDStr.(string)
 			if sid == "" {
-				return errors.New("internal error: space bot missing space_id")
+				ba.Error("space bot missing space_id in context", zap.String("robotID", robotID))
+				return errBotSendPermCheckFailed
 			}
 			isMember, memberErr := ba.isSpaceMember(channelID, sid)
 			if memberErr != nil {
-				return errors.New("failed to verify space membership")
+				ba.Error("failed to verify space membership", zap.Error(memberErr), zap.String("robotID", robotID))
+				return errBotSendPermCheckFailed
 			}
 			if !isMember {
-				return errors.New("user is no longer a member of bot's space")
+				return errBotSendPermNotSpaceMember
 			}
 		}
 		return nil
@@ -327,10 +333,10 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 				).LoadOne(&count)
 				if err != nil {
 					ba.Error("查询群成员失败", zap.Error(err))
-					return errors.New("查询群成员失败")
+					return errBotSendPermCheckFailed
 				}
 				if count == 0 {
-					return errors.New("bot is not a member of this group")
+					return errBotSendPermNotGroupMember
 				}
 			}
 		} else if channelType == common.ChannelTypeCommunityTopic.Uint8() {
@@ -353,7 +359,7 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 			if !hasOBOContext {
 				parts := strings.SplitN(channelID, threadChannelIDSeparator, 2)
 				if len(parts) != 2 {
-					return errors.New("invalid thread channel_id format")
+					return errBotSendPermBadThreadChan
 				}
 				var count int
 				err := ba.db.session.SelectBySql(
@@ -362,10 +368,10 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 				).LoadOne(&count)
 				if err != nil {
 					ba.Error("查询群成员失败", zap.Error(err))
-					return errors.New("查询群成员失败")
+					return errBotSendPermCheckFailed
 				}
 				if count == 0 {
-					return errors.New("bot is not a member of this group")
+					return errBotSendPermNotGroupMember
 				}
 			}
 		} else if channelType == common.ChannelTypePerson.Uint8() {
@@ -392,17 +398,18 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 				allowed, err := ba.isFriendOrOBOBypass(robotID, channelID, channelType, hasOBOContext)
 				if err != nil {
 					ba.Error("查询好友关系失败", zap.Error(err))
-					return errors.New("查询好友关系失败")
+					return errBotSendPermCheckFailed
 				}
 				if !allowed {
-					return errors.New("bot is not a friend of this user")
+					return errBotSendPermNotFriend
 				}
 			}
 		}
 		return nil
 
 	default:
-		return errors.New("unknown bot kind")
+		ba.Error("unknown bot kind", zap.String("botKind", botKind), zap.String("robotID", robotID))
+		return errBotSendPermCheckFailed
 	}
 }
 
@@ -433,11 +440,11 @@ type BotReadReceiptReq struct {
 func (ba *BotAPI) readReceipt(c *wkhttp.Context) {
 	var req BotReadReceiptReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("数据格式有误"))
+		respondBotAPIRequestInvalid(c, "")
 		return
 	}
 	if strings.TrimSpace(req.ChannelID) == "" {
-		c.ResponseError(errors.New("channel_id不能为空"))
+		respondBotAPIRequestInvalid(c, "channel_id")
 		return
 	}
 
@@ -453,7 +460,7 @@ func (ba *BotAPI) readReceipt(c *wkhttp.Context) {
 	// apply here (hasOBOContext=false).
 	botKind := getBotKindFromContext(c)
 	if err := ba.checkSendPermission(c, botKind, robotID, req.ChannelID, channelType, false); err != nil {
-		c.ResponseError(err)
+		respondSendPermissionError(c, err)
 		return
 	}
 
@@ -465,11 +472,12 @@ func (ba *BotAPI) readReceipt(c *wkhttp.Context) {
 			"SELECT COUNT(*) FROM `group` WHERE group_no=? AND is_deleted=0", req.ChannelID,
 		).LoadOne(&groupCount)
 		if grpErr != nil {
-			c.ResponseError(errors.New("验证频道类型失败"))
+			ba.Error("verify channel type failed", zap.Error(grpErr), zap.String("channelID", req.ChannelID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 			return
 		}
 		if groupCount > 0 {
-			c.ResponseError(errors.New("app bot can only access direct message channels"))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIAppBotDMOnly, nil, nil)
 			return
 		}
 	}
@@ -489,7 +497,7 @@ func (ba *BotAPI) readReceipt(c *wkhttp.Context) {
 
 	// 2. Message-level read receipt
 	if len(req.MessageIDs) > 100 {
-		c.ResponseError(errors.New("message_ids exceeds maximum of 100"))
+		respondBotAPILimitExceeded(c, "message_ids", 100)
 		return
 	}
 	if len(req.MessageIDs) > 0 {
@@ -524,7 +532,7 @@ func (ba *BotAPI) readReceipt(c *wkhttp.Context) {
 		})
 		if err != nil {
 			ba.Error("查询消息失败", zap.Error(err))
-			c.ResponseError(errors.New("查询消息失败"))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 			return
 		}
 		if syncMsg != nil && len(syncMsg.Messages) > 0 {
@@ -539,7 +547,7 @@ func (ba *BotAPI) readReceipt(c *wkhttp.Context) {
 			_, err = ba.db.session.InsertBySql(stmt, valueArgs...).Exec()
 			if err != nil {
 				ba.Error("插入已读记录失败", zap.Error(err))
-				c.ResponseError(errors.New("保存已读记录失败"))
+				httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
 				return
 			}
 
@@ -592,26 +600,25 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 		ContentEdit string `json:"content_edit"`
 	}
 	if err := c.BindJSON(&req); err != nil {
-		ba.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误！"))
+		respondBotAPIRequestInvalid(c, "")
 		return
 	}
 	if req.MessageID == "" {
-		c.ResponseError(errors.New("message_id 不能为空"))
+		respondBotAPIRequestInvalid(c, "message_id")
 		return
 	}
 	if req.ChannelID == "" {
-		c.ResponseError(errors.New("channel_id 不能为空"))
+		respondBotAPIRequestInvalid(c, "channel_id")
 		return
 	}
 	if strings.TrimSpace(req.ContentEdit) == "" {
-		c.ResponseError(errors.New("content_edit 不能为空"))
+		respondBotAPIRequestInvalid(c, "content_edit")
 		return
 	}
 
 	robotID := getRobotIDFromContext(c)
 	if robotID == "" {
-		c.ResponseError(errors.New("robot_id 不能为空"))
+		ba.respondBotAPIIdentityMissing(c)
 		return
 	}
 
@@ -621,11 +628,11 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 		resp, err := ba.ctx.IMGetWithChannelAndSeqs(req.ChannelID, req.ChannelType, robotID, []uint32{req.MessageSeq})
 		if err != nil {
 			ba.Error("查询消息错误", zap.Error(err))
-			c.ResponseError(errors.New("查询消息错误"))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 			return
 		}
 		if resp == nil || len(resp.Messages) == 0 {
-			c.ResponseError(errors.New("消息不存在"))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIMessageNotFound, nil, nil)
 			return
 		}
 		if req.MessageID != strconv.FormatInt(resp.Messages[0].MessageID, 10) {
@@ -639,8 +646,8 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 	} else {
 		msgIDInt, parseErr := strconv.ParseInt(req.MessageID, 10, 64)
 		if parseErr != nil {
-			ba.Error("message_id格式错误", zap.String("message_id", req.MessageID), zap.Error(parseErr))
-			c.ResponseError(errors.New("message_id格式错误"))
+			ba.Warn("message_id格式错误", zap.String("message_id", req.MessageID), zap.Error(parseErr))
+			respondBotAPIRequestInvalid(c, "message_id")
 			return
 		}
 		syncResp, err := ba.ctx.IMSearchMessages(&config.MsgSearchReq{
@@ -651,22 +658,22 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 		})
 		if err != nil {
 			ba.Error("查询消息错误", zap.Error(err))
-			c.ResponseError(errors.New("查询消息错误"))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 			return
 		}
 		if syncResp == nil || len(syncResp.Messages) == 0 {
-			c.ResponseError(errors.New("消息不存在"))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIMessageNotFound, nil, nil)
 			return
 		}
 		if syncResp.Messages[0].MessageSeq == 0 {
-			c.ResponseError(errors.New("消息尚未投递完成，请稍后重试"))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIMessageNotDelivered, nil, nil)
 			return
 		}
 		msgFromUID = syncResp.Messages[0].FromUID
 		req.MessageSeq = syncResp.Messages[0].MessageSeq
 	}
 	if msgFromUID != robotID {
-		c.ResponseError(errors.New("只能编辑自己发送的消息"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIMessageEditForbidden, nil, nil)
 		return
 	}
 
@@ -674,12 +681,12 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 	botKind := getBotKindFromContext(c)
 	if botKind == BotKindApp {
 		if req.ChannelType != common.ChannelTypePerson.Uint8() {
-			c.ResponseError(errors.New("app bot can only edit direct messages"))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIAppBotDMOnly, nil, nil)
 			return
 		}
 		isFriend, fErr := ba.userService.IsFriend(robotID, req.ChannelID)
 		if fErr != nil || !isFriend {
-			c.ResponseError(errors.New("user has not started conversation with this bot"))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIConversationNotStarted, nil, nil)
 			return
 		}
 	}
@@ -690,8 +697,8 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 	// 落库前以错误拒绝。MD5 去重 hash 落在 normalize 后的 canonical 体上。
 	normalizedEdit, err := richtext.NormalizeContentEdit(req.ContentEdit)
 	if err != nil {
-		ba.Error("RichText content_edit 校验失败", zap.Error(err), zap.String("messageID", req.MessageID))
-		c.ResponseError(errors.New("无效的 content_edit"))
+		ba.Warn("RichText content_edit 校验失败", zap.Error(err), zap.String("messageID", req.MessageID))
+		respondBotAPIRequestInvalid(c, "content_edit")
 		return
 	}
 	req.ContentEdit = normalizedEdit
@@ -703,7 +710,7 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 	err = ba.ctx.DB().Select("count(*)").From("message_extra").Where("message_id=? and content_edit_hash=?", req.MessageID, contentMD5).LoadOne(&existCount)
 	if err != nil {
 		ba.Error("查询是否存在相同正文失败！", zap.Error(err))
-		c.ResponseError(errors.New("查询是否存在相同正文失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 		return
 	}
 	if existCount > 0 {
@@ -719,7 +726,7 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 	version, err := ba.ctx.GenSeq(fmt.Sprintf("%s:%s", common.MessageExtraSeqKey, fakeChannelID))
 	if err != nil {
 		ba.Error("生成消息扩展序列号失败！", zap.Error(err))
-		c.ResponseError(errors.New("生成消息扩展序列号失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
 		return
 	}
 
@@ -729,7 +736,7 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 	).Exec()
 	if err != nil {
 		ba.Error("添加或修改编辑内容失败！", zap.Error(err))
-		c.ResponseError(errors.New("添加或修改编辑内容失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
 		return
 	}
 

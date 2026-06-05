@@ -9,8 +9,10 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
-	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	octolibredis "github.com/Mininglamp-OSS/octo-lib/pkg/redis"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"go.uber.org/zap"
 )
 
@@ -37,15 +39,15 @@ type BotTypingReq struct {
 func (ba *BotAPI) typing(c *wkhttp.Context) {
 	var req BotTypingReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("数据格式有误"))
+		respondBotAPIRequestInvalid(c, "")
 		return
 	}
 	if strings.TrimSpace(req.ChannelID) == "" {
-		c.ResponseError(errors.New("channel_id不能为空"))
+		respondBotAPIRequestInvalid(c, "channel_id")
 		return
 	}
 	if req.ChannelType == 0 {
-		c.ResponseError(errors.New("channel_type不能为空"))
+		respondBotAPIRequestInvalid(c, "channel_type")
 		return
 	}
 
@@ -71,7 +73,7 @@ func (ba *BotAPI) typing(c *wkhttp.Context) {
 	// with a user that has not opted in to that bot.
 	botKind := getBotKindFromContext(c)
 	if err := ba.checkSendPermission(c, botKind, robotID, req.ChannelID, req.ChannelType, hasOBOContext); err != nil {
-		c.ResponseError(err)
+		respondSendPermissionError(c, err)
 		return
 	}
 
@@ -95,7 +97,7 @@ func (ba *BotAPI) typing(c *wkhttp.Context) {
 					zap.String("bot", robotID),
 					zap.String("grantor", req.OnBehalfOf),
 					zap.Error(err))
-				c.ResponseError(errors.New("OBO 检查失败"))
+				httperr.ResponseErrorL(c, errcode.ErrBotAPIOBOInternal, nil, nil)
 				return
 			}
 			grantorReplyBypass = hasGrant
@@ -108,11 +110,11 @@ func (ba *BotAPI) typing(c *wkhttp.Context) {
 						zap.String("on_behalf_of", req.OnBehalfOf),
 						zap.String("channel_id", req.ChannelID),
 						zap.Uint8("channel_type", req.ChannelType))
-					c.ResponseError(ErrOBONotAuthorized)
+					httperr.ResponseErrorL(c, errcode.ErrBotAPIOBONotAuthorized, nil, nil)
 					return
 				}
 				ba.Error("OBO typing check failed", zap.Error(err))
-				c.ResponseError(errors.New("OBO 检查失败"))
+				httperr.ResponseErrorL(c, errcode.ErrBotAPIOBOInternal, nil, nil)
 				return
 			}
 			// Typing fromUID becomes the grantor — the typing CMD
@@ -176,9 +178,9 @@ func (ba *BotAPI) typing(c *wkhttp.Context) {
 		paramChannelID = robotID
 	}
 	err := ba.dispatchTypingCMD(config.MsgCMDReq{
-		NoPersist: true,
-		CMD:       common.CMDTyping,
-		ChannelID: channelID,
+		NoPersist:   true,
+		CMD:         common.CMDTyping,
+		ChannelID:   channelID,
 		ChannelType: req.ChannelType,
 		Param: map[string]interface{}{
 			// YUJ-1465 — fromUID is the OBO grantor when on_behalf_of
@@ -193,7 +195,7 @@ func (ba *BotAPI) typing(c *wkhttp.Context) {
 	})
 	if err != nil {
 		ba.Error("发送typing失败", zap.Error(err))
-		c.ResponseError(errors.New("发送typing失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPISendFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -226,7 +228,7 @@ func (ba *BotAPI) heartbeat(c *wkhttp.Context) {
 	err := ba.ctx.GetRedisConn().SetAndExpire(key, "1", time.Second*heartbeatTTL)
 	if err != nil {
 		ba.Error("设置心跳失败", zap.Error(err))
-		c.ResponseError(errors.New("设置心跳失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPISendFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
