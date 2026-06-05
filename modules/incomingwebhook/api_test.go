@@ -69,6 +69,13 @@ func setupTestEnv(t *testing.T) (http.Handler, *config.Context, string) {
 	// 429。每次 setup 清桶，保证每个测试从满桶开始（参考 category 测试同名 helper）。
 	resetUIDRateLimit(t, ctx)
 
+	// 接入 featuregate 后，create 无规则会 fail-closed、push 无规则 fail-open。
+	// 绝大多数测试聚焦各自被测逻辑，这里默认放行两扇闸门；gate 专项测试
+	// （api_gate_test.go）再各自覆盖规则。两个 helper 内部都会清 ft:* 缓存，
+	// 避免固定 feature_key 的缓存跨测试串扰（CleanAllTables 不清 Redis）。
+	setFeatureGate(t, ctx, "incoming_webhook_create", "on")
+	setFeatureGate(t, ctx, "incoming_webhook_push", "on")
+
 	return s.GetRoute(), ctx, groupNo
 }
 

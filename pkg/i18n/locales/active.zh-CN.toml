@@ -666,6 +666,14 @@ other = "请求内容过大。"
 ["err.server.incomingwebhook.push_delivery_failed"]
 other = "Webhook 消息投递失败。"
 
+# ---- 灰度闸门 (feature gate, webhook-feature-flag-rollout) ----
+
+["err.server.incomingwebhook.push_disabled"]
+other = "服务暂不可用，请稍后重试。"
+
+["err.server.incomingwebhook.create_gate_denied"]
+other = "灰度未对该群开放此功能。"
+
 # ---- err.server.incomingwebhook.mgmt_* (management endpoints, #246 follow-up) ----
 
 ["err.server.incomingwebhook.mgmt_forbidden"]

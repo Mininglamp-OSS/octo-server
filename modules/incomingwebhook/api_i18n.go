@@ -98,3 +98,24 @@ func mgmtQueryFailed(c *wkhttp.Context) {
 func mgmtOperationFailed(c *wkhttp.Context) {
 	httperr.ResponseErrorLWithStatus(c, errcode.ErrIncomingWebhookOperationFailed, nil, nil)
 }
+
+// ============================================================
+// feature-gate 灰度闸门 responder（webhook-feature-flag-rollout）
+// ============================================================
+
+// createGateDenied returns 403 — 灰度未对该群开放新建 webhook。管理路径，handler
+// 调用后 return 即可，无需 Abort。
+func createGateDenied(c *wkhttp.Context) {
+	httperr.ResponseErrorLWithStatus(c, errcode.ErrIncomingWebhookCreateGateDenied, nil, nil)
+}
+
+// pushRetryAfterSeconds 是关停 503 给推送方的重试间隔提示（秒）。
+const pushRetryAfterSeconds = "60"
+
+// pushDisabled returns 503 + Retry-After — 推送总开关关停。push 路径，需 Abort 以
+// 阻止后续 handler。Retry-After 让 CI/告警等正规推送方自动重试。
+func pushDisabled(c *wkhttp.Context) {
+	c.Header("Retry-After", pushRetryAfterSeconds)
+	httperr.ResponseErrorLWithStatus(c, errcode.ErrIncomingWebhookPushDisabled, nil, nil)
+	c.Abort()
+}

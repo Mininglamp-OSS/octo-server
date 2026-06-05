@@ -23,6 +23,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	"github.com/Mininglamp-OSS/octo-server/modules/featuregate"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
@@ -65,6 +66,8 @@ type IncomingWebhook struct {
 	db        *incomingWebhookDB
 	groupDB   *group.DB
 	rateRedis *redis.Client
+	// ftSvc 灰度闸门：create 写时门禁（fail-closed）、push 总开关（fail-open）。
+	ftSvc *featuregate.Service
 	// auditSem 给 push 成功后的异步审计(recordSuccess)限并发：每次推送有两次 DB 写，
 	// 无界 `go recordSuccess` 在 Redis 限流 fail-open + 推送洪峰下会无限堆 goroutine、
 	// 压垮 DB 连接池。用带缓冲 channel 作信号量给审计的 DB 操作总并发封顶——满了就**丢弃**
@@ -119,6 +122,7 @@ func New(ctx *config.Context) *IncomingWebhook {
 		db:        newDB(ctx),
 		groupDB:   group.NewDB(ctx),
 		rateRedis: sharedRateRedis(ctx.GetConfig()),
+		ftSvc:     featuregate.NewService(ctx),
 		auditSem:  make(chan struct{}, auditConcurrency()),
 	}
 	// 群解散级联禁用所有 webhook
@@ -310,6 +314,14 @@ func (w *IncomingWebhook) create(c *wkhttp.Context) {
 	}
 	if g == nil {
 		mgmtGroupNotFound(c)
+		return
+	}
+
+	// 灰度写时门禁（fail-closed）：未注册规则 / 存储故障 / kill 一律拒绝创建。维度
+	// 齐全（group_no + space_id + 登录 uid）后评估，按群白名单 / 百分比放量。
+	if !w.ftSvc.AllowCreate(c.Request.Context(), "incoming_webhook_create",
+		featuregate.Dims{SpaceID: g.SpaceID, GroupNo: groupNo, UID: loginUID}) {
+		createGateDenied(c)
 		return
 	}
 
@@ -524,6 +536,16 @@ func (w *IncomingWebhook) regenerate(c *wkhttp.Context) {
 // ============================================================
 
 func (w *IncomingWebhook) push(c *wkhttp.Context) {
+	// 推送总开关（放最前）：关停期所有请求统一 503，连 webhook 都不查 —— 既不泄露
+	// token 正确性（push 防探测主防线是"失败一律 401 不区分"，若关停在 token 校验
+	// 之后返 503 会让"token 对+关停"可被区分），也省去无谓 DB 访问。env kill /
+	// mode=off 时拒绝；存储故障 / 无规则一律 fail-open 继续推，绝不因灰度框架故障
+	// 中断存量推送。
+	if !w.ftSvc.AllowPush(c.Request.Context(), "incoming_webhook_push") {
+		pushDisabled(c)
+		return
+	}
+
 	webhookID := c.Param("webhook_id")
 	token := c.Param("token")
 	if webhookID == "" || token == "" {

@@ -137,3 +137,23 @@ var (
 		Internal:       true,
 	})
 )
+
+// err.server.incomingwebhook.{create_gate_denied,push_disabled} — featuregate
+// 灰度闸门（webhook-feature-flag-rollout）。create_gate_denied 是管理路径写时
+// 门禁（403）；push_disabled 是推送总开关关停（503，由 handler 最前统一返回，
+// 不泄露 token 正确性，正规推送方可凭 Retry-After 重试）。
+var (
+	// ErrIncomingWebhookCreateGateDenied (403) — 灰度未对该群开放新建 webhook。
+	ErrIncomingWebhookCreateGateDenied = register(codes.Code{
+		ID:             "err.server.incomingwebhook.create_gate_denied",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "This feature is not enabled for your group yet.",
+	})
+
+	// ErrIncomingWebhookPushDisabled (503) — 推送功能被灰度/运维关停。
+	ErrIncomingWebhookPushDisabled = register(codes.Code{
+		ID:             "err.server.incomingwebhook.push_disabled",
+		HTTPStatus:     http.StatusServiceUnavailable,
+		DefaultMessage: "The service is temporarily unavailable. Please retry later.",
+	})
+)
