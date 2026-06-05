@@ -36,16 +36,16 @@ const (
 	envBodyMax             = "DM_INCOMINGWEBHOOK_MAX_BYTES"
 	envRatePerWebhookRPS   = "DM_INCOMINGWEBHOOK_RPS"
 	envRatePerWebhookBurst = "DM_INCOMINGWEBHOOK_BURST"
-	envIngressIPRPS        = "DM_INCOMINGWEBHOOK_IP_RPS"
-	envIngressIPBurst      = "DM_INCOMINGWEBHOOK_IP_BURST"
+	envIPFailRPS           = "DM_INCOMINGWEBHOOK_IP_FAIL_RPS"
+	envIPFailBurst         = "DM_INCOMINGWEBHOOK_IP_FAIL_BURST"
 	envMaxContentRunes     = "DM_INCOMINGWEBHOOK_MAX_CONTENT_RUNES"
 
 	defaultMaxPerGroup    = 10
 	defaultMaxBytes       = 8 * 1024
 	defaultRatePerWHRPS   = 5.0
 	defaultRatePerWHBurst = 10
-	defaultIngressIPRPS   = 30.0
-	defaultIngressIPBurst = 60
+	defaultIPFailRPS      = 30.0
+	defaultIPFailBurst    = 60
 	// content 的语义长度上限（rune 数）。8KB body cap 是字节传输上限，这里再加一道
 	// 业务上限：单条消息正文过长既影响客户端渲染，也无 IM 语义。默认 4000 rune
 	// 介于 Discord(~2k) 与 Slack(~40k) 之间，可经 env 调整。
@@ -147,17 +147,18 @@ func (w *IncomingWebhook) Route(r *wkhttp.WKHttp) {
 		mgr.POST("/:group_no/incoming-webhooks/:webhook_id/regenerate", w.regenerate)
 	}
 
-	// 推送类：URL 内 token 鉴权，无 AuthMiddleware；外加 IP 限流防扫 token。
-	ipRPS := wkhttp.ParseRPSFromEnv(envIngressIPRPS, defaultIngressIPRPS)
-	ipBurst := wkhttp.ParseBurstFromEnv(envIngressIPBurst, defaultIngressIPBurst)
-	ipLimit := r.StrictIPRateLimitMiddleware(context.Background(), w.rateRedis, "incoming_webhook", ipRPS, ipBurst)
-
-	// 中间件顺序：localFloorMiddleware（纯内存、最廉价、不依赖 Redis）在前，先于
-	// Redis IP 限流挡住洪峰；ipLimit（Redis）次之。这样 Redis 故障/连接池打满时，
-	// 进程级地板仍能限速，避免对 DB + WuKongIM 的洪泛放大。
+	// 推送类：URL 内 token 鉴权，无 AuthMiddleware。
+	//
+	// 中间件顺序：
+	//  1) localFloorMiddleware —— 纯内存、不依赖 Redis 的进程级地板，先挡洪峰；Redis
+	//     故障时仍限速，避免对 DB + WuKongIM 的洪泛放大。
+	//  2) ipFailureGateMiddleware —— 按 IP 的"鉴权失败预算"闸：只读 peek，拦掉已把失败
+	//     预算烧光的扫 token IP（在进 handler/打 DB 之前）。注意：合法推送(有效 Key)不
+	//     消耗该预算（只有鉴权失败才在 handler 内 penalize），故服务端固定/共享 IP 不会
+	//     被流量误杀；合法流量整形由 handler 内 allowPerWebhook(按 webhook_id) 负责。
 	push := r.Group("/v1")
 	{
-		push.POST("/incoming-webhooks/:webhook_id/:token", w.localFloorMiddleware(), ipLimit, w.push)
+		push.POST("/incoming-webhooks/:webhook_id/:token", w.localFloorMiddleware(), w.ipFailureGateMiddleware(), w.push)
 	}
 }
 
@@ -198,6 +199,18 @@ func perWebhookRPS() float64 {
 
 func perWebhookBurst() int {
 	return wkhttp.ParseBurstFromEnv(envRatePerWebhookBurst, defaultRatePerWHBurst)
+}
+
+// ipFailRPS / ipFailBurst bound the per-IP AUTH-FAILURE budget (not request
+// volume): how fast / how many failed-auth attempts an IP may make before the
+// push gate starts rejecting it. Tunable via DM_INCOMINGWEBHOOK_IP_FAIL_RPS /
+// _BURST.
+func ipFailRPS() float64 {
+	return wkhttp.ParseRPSFromEnv(envIPFailRPS, defaultIPFailRPS)
+}
+
+func ipFailBurst() int {
+	return wkhttp.ParseBurstFromEnv(envIPFailBurst, defaultIPFailBurst)
 }
 
 // ============================================================
@@ -558,22 +571,48 @@ func (w *IncomingWebhook) regenerate(c *wkhttp.Context) {
 // 推送端点
 // ============================================================
 
+// failAuth records a per-IP auth failure (a token-scan signal) then returns the
+// uniform 401. Used only on genuine auth-failure branches — unknown/disabled
+// webhook, bad token, malformed request — never on server-side (DB) errors or
+// post-authentication state failures (valid token, group not Normal), so those
+// never penalize the caller's IP.
+func (w *IncomingWebhook) failAuth(c *wkhttp.Context, ip string) {
+	w.penalizeIPFailure(ip)
+	pushUnauthorized(c)
+}
+
 func (w *IncomingWebhook) push(c *wkhttp.Context) {
+	// 仅用于"鉴权失败才计入"的 per-IP 失败预算（见 failAuth / ipFailureGateMiddleware）。
+	// 用 clientIP（信任代理追加的 X-Real-Ip / 最右 XFF），而非 gin c.ClientIP()——后者在
+	// wkhttp 的 trust-all-proxies 默认下取最左 XFF（客户端可伪造），会让扫描者每次伪造
+	// 新 IP 从而绕过失败预算。
+	ip := clientIP(c.Request)
+
 	webhookID := c.Param("webhook_id")
 	token := c.Param("token")
 	if webhookID == "" || token == "" {
-		pushUnauthorized(c)
+		// 缺参/畸形请求——算作扫描信号，计入 IP 失败预算。
+		w.failAuth(c, ip)
 		return
 	}
 
 	// 1) 查 webhook（queryByWebhookID 已把 ErrNotFound 吸收为 nil/nil）
 	m, err := w.db.queryByWebhookID(webhookID)
 	if err != nil {
+		// 服务端故障，不是调用方扫描——绝不计入 IP 失败预算（否则 DB 抖动会误封 IP）。
 		w.Error("query webhook failed", zap.Error(err))
 		pushUnauthorized(c)
 		return
 	}
-	if m == nil || m.Status != statusEnabled {
+	if m == nil {
+		// 未知 webhook——明确的扫描信号，计入 IP 失败预算。
+		w.failAuth(c, ip)
+		return
+	}
+	if m.Status != statusEnabled {
+		// webhook 存在但被禁用/软删——可能是持有有效 token 的合法调用方在其 webhook 刚被
+		// 管理员禁用后继续推送，无法在 token 校验前区分，故【不】计入 IP 失败预算，避免误封
+		// 共享 IP（响应仍是同一 401，保持反枚举）。
 		pushUnauthorized(c)
 		return
 	}
@@ -581,7 +620,8 @@ func (w *IncomingWebhook) push(c *wkhttp.Context) {
 	// 2) 常量时间比对 token
 	expected := hashToken(token)
 	if subtle.ConstantTimeCompare([]byte(expected), []byte(m.TokenHash)) != 1 {
-		pushUnauthorized(c)
+		// token 不匹配——鉴权失败信号，计入 IP 失败预算。
+		w.failAuth(c, ip)
 		return
 	}
 
@@ -603,7 +643,7 @@ func (w *IncomingWebhook) push(c *wkhttp.Context) {
 	// 3) per-webhook 限流；Redis 故障时显式 fail-open，避免 Redis 抖动导致全量推送被拒。
 	allowed, err := w.allowPerWebhook(c.Request.Context(), webhookID)
 	if err != nil {
-		w.Warn("per-webhook rate limit redis failed, fail-open", zap.Error(err))
+		w.warnDegraded("per-webhook rate limit redis failed, fail-open", err)
 		allowed = true
 	}
 	if !allowed {
@@ -662,7 +702,8 @@ func (w *IncomingWebhook) push(c *wkhttp.Context) {
 	if resp != nil {
 		msgID = resp.MessageID
 	}
-	w.submitRecordSuccess(m, len(body), c.ClientIP(), msgID)
+	// 审计用同一可信 IP（clientIP），而非 gin 可伪造的 c.ClientIP()。
+	w.submitRecordSuccess(m, len(body), ip, msgID)
 
 	c.Response(map[string]interface{}{
 		"status":     0,
