@@ -43,6 +43,7 @@ var (
 // 这些码由 codes 包 init 注册（shared.go），Go 保证被导入包的 init 先于本包 var
 // 初始化执行，故 shared() 查找一定命中。
 var (
+	ErrSharedAuthRequired = shared("err.shared.auth.required")
 	ErrSharedTokenMissing = shared("err.shared.auth.token_missing")
 	ErrSharedTokenInvalid = shared("err.shared.auth.token_invalid")
 	ErrSharedRateLimited  = shared("err.shared.rate.limited")
