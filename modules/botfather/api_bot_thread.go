@@ -1,8 +1,6 @@
 package botfather
 
 import (
-	"errors"
-	"fmt"
 	"net/http"
 	"strings"
 
@@ -12,6 +10,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 )
@@ -23,18 +23,18 @@ func (bf *BotFather) validateBotGroupAccess(c *wkhttp.Context) (robotID, groupNo
 	groupNo = c.Param("group_no")
 
 	if !thread.IsValidGroupNo(groupNo) {
-		c.ResponseError(errors.New("invalid group_no format"))
+		respondBotfatherRequestInvalid(c, "group_no")
 		return "", "", false
 	}
 
 	isMember, err := bf.groupService.ExistMember(groupNo, robotID)
 	if err != nil {
 		bf.Error("检查群成员失败", zap.Error(err))
-		c.ResponseError(errors.New("check group membership failed"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 		return "", "", false
 	}
 	if !isMember {
-		c.ResponseError(errors.New("bot is not a member of this group"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherBotNotGroupMember, nil, nil)
 		return "", "", false
 	}
 
@@ -51,7 +51,7 @@ func (bf *BotFather) validateBotThreadAccess(c *wkhttp.Context) (robotID, groupN
 
 	shortID = c.Param("short_id")
 	if !thread.IsValidShortID(shortID) {
-		c.ResponseError(errors.New("invalid short_id format"))
+		respondBotfatherRequestInvalid(c, "short_id")
 		return "", "", "", false
 	}
 
@@ -72,7 +72,7 @@ func (bf *BotFather) botCreateThread(c *wkhttp.Context) {
 	}
 	if err := c.BindJSON(&req); err != nil {
 		bf.Error("参数错误", zap.Error(err))
-		c.ResponseError(errors.New("invalid request: name is required"))
+		respondBotfatherRequestInvalid(c, "name")
 		return
 	}
 
@@ -92,7 +92,7 @@ func (bf *BotFather) botCreateThread(c *wkhttp.Context) {
 	})
 	if err != nil {
 		bf.Error("创建子区失败", zap.Error(err), zap.String("groupNo", groupNo), zap.String("robotID", robotID))
-		c.ResponseError(err)
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
 		return
 	}
 	c.Response(resp)
@@ -118,7 +118,7 @@ func (bf *BotFather) botListThreads(c *wkhttp.Context) {
 	threads, total, err := bf.threadService.GetThreads(groupNo, nil, pageIndex, pageSize)
 	if err != nil {
 		bf.Error("获取子区列表失败", zap.Error(err), zap.String("groupNo", groupNo))
-		c.ResponseError(err)
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 		return
 	}
 	if !hasPageParam {
@@ -142,7 +142,7 @@ func (bf *BotFather) botGetThread(c *wkhttp.Context) {
 	resp, err := bf.threadService.GetThread(groupNo, shortID, "")
 	if err != nil {
 		bf.Error("获取子区详情失败", zap.Error(err), zap.String("groupNo", groupNo), zap.String("shortID", shortID))
-		c.ResponseError(err)
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 		return
 	}
 	c.Response(resp)
@@ -160,7 +160,7 @@ func (bf *BotFather) botDeleteThread(c *wkhttp.Context) {
 	err := bf.threadService.DeleteThread(groupNo, shortID, robotID)
 	if err != nil {
 		bf.Error("删除子区失败", zap.Error(err), zap.String("groupNo", groupNo), zap.String("shortID", shortID))
-		c.ResponseError(err)
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -177,7 +177,7 @@ func (bf *BotFather) botListThreadMembers(c *wkhttp.Context) {
 	members, err := bf.threadService.GetMembers(groupNo, shortID)
 	if err != nil {
 		bf.Error("获取成员列表失败", zap.Error(err), zap.String("groupNo", groupNo), zap.String("shortID", shortID))
-		c.ResponseError(err)
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 		return
 	}
 	c.Response(members)
@@ -194,7 +194,7 @@ func (bf *BotFather) botJoinThread(c *wkhttp.Context) {
 	err := bf.threadService.JoinThread(groupNo, shortID, robotID)
 	if err != nil {
 		bf.Error("加入子区失败", zap.Error(err), zap.String("groupNo", groupNo), zap.String("shortID", shortID))
-		c.ResponseError(err)
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -211,7 +211,7 @@ func (bf *BotFather) botLeaveThread(c *wkhttp.Context) {
 	err := bf.threadService.LeaveThread(groupNo, shortID, robotID)
 	if err != nil {
 		bf.Error("离开子区失败", zap.Error(err), zap.String("groupNo", groupNo), zap.String("shortID", shortID))
-		c.ResponseError(err)
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -230,7 +230,7 @@ func (bf *BotFather) botGetThreadMd(c *wkhttp.Context) {
 	result, err := bf.threadService.GetThreadMd(groupNo, shortID)
 	if err != nil {
 		bf.Error("query thread GROUP.md failed", zap.Error(err))
-		c.ResponseError(errors.New("query thread GROUP.md failed"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 		return
 	}
 	if result == nil {
@@ -262,14 +262,11 @@ func (bf *BotFather) botUpdateThreadMd(c *wkhttp.Context) {
 	isBotAdmin, err := bf.groupService.IsBotAdmin(groupNo, robotID)
 	if err != nil {
 		bf.Error("check bot admin failed", zap.Error(err))
-		c.ResponseError(errors.New("check bot admin failed"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 		return
 	}
 	if !isBotAdmin {
-		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
-			"msg":    "bot is not a bot_admin in this group",
-			"status": 403,
-		})
+		respondBotfatherBotNotGroupAdmin(c)
 		return
 	}
 
@@ -277,19 +274,19 @@ func (bf *BotFather) botUpdateThreadMd(c *wkhttp.Context) {
 		Content string `json:"content"`
 	}
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("invalid request body"))
+		respondBotfatherRequestInvalid(c, "")
 		return
 	}
 
 	// 校验空内容
 	if strings.TrimSpace(req.Content) == "" {
-		c.ResponseError(errors.New("content must not be empty"))
+		respondBotfatherRequestInvalid(c, "content")
 		return
 	}
 
 	maxSize := group.GetGroupMdMaxSize()
 	if len(req.Content) > maxSize {
-		c.ResponseError(fmt.Errorf("GROUP.md content exceeds max size %d bytes", maxSize))
+		respondBotfatherContentTooLarge(c, "content", maxSize)
 		return
 	}
 
@@ -297,7 +294,7 @@ func (bf *BotFather) botUpdateThreadMd(c *wkhttp.Context) {
 	newVersion, err := bf.threadService.UpdateThreadMd(groupNo, shortID, req.Content, robotID)
 	if err != nil {
 		bf.Error("update thread GROUP.md failed", zap.Error(err))
-		c.ResponseError(errors.New("update thread GROUP.md failed"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
 		return
 	}
 

@@ -28,6 +28,9 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botutil"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/richtext"
 	pkgutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
 	"github.com/gin-gonic/gin"
@@ -453,18 +456,18 @@ func (bf *BotFather) authBot() wkhttp.HandlerFunc {
 	return func(c *wkhttp.Context) {
 		token := extractBotToken(c)
 		if token == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "缺少Authorization头或token无效"})
+			respondBotfatherAuthFailed(c)
 			return
 		}
 
 		robot, err := bf.db.queryRobotByBotToken(token)
 		if err != nil {
 			bf.Error("查询机器人失败", zap.Error(err))
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "认证失败"})
+			respondBotfatherAuthFailed(c)
 			return
 		}
 		if robot == nil {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "无效的bot token"})
+			respondBotfatherAuthFailed(c)
 			return
 		}
 
@@ -520,18 +523,18 @@ func (bf *BotFather) resolveSpaceChannelID(robotID, channelID string, channelTyp
 func (bf *BotFather) register(c *wkhttp.Context) {
 	token := extractBotToken(c)
 	if token == "" {
-		c.ResponseError(errors.New("缺少Authorization头"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherAuthFailed, nil, nil)
 		return
 	}
 
 	robot, err := bf.db.queryRobotByBotToken(token)
 	if err != nil {
 		bf.Error("查询机器人失败", zap.Error(err))
-		c.ResponseError(errors.New("认证失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherAuthFailed, nil, nil)
 		return
 	}
 	if robot == nil {
-		c.ResponseError(errors.New("无效的bot token"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherAuthFailed, nil, nil)
 		return
 	}
 
@@ -546,7 +549,7 @@ func (bf *BotFather) register(c *wkhttp.Context) {
 	})
 	if tokenErr != nil || resp.Status != config.UpdateTokenStatusSuccess {
 		bf.Error("获取IM Token失败", zap.Any("error", tokenErr), zap.String("robotID", robot.RobotID), zap.Any("status", resp))
-		c.ResponseError(errors.New("获取IM Token失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherIMTokenFailed, nil, nil)
 		return
 	}
 	// 更新缓存
@@ -629,19 +632,19 @@ func (bf *BotFather) sendMessage(c *wkhttp.Context) {
 	var req BotSendMessageReq
 	if err := c.BindJSON(&req); err != nil {
 		bf.Error("数据格式有误", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误"))
+		respondBotfatherRequestInvalid(c, "")
 		return
 	}
 	if strings.TrimSpace(req.ChannelID) == "" {
-		c.ResponseError(errors.New("channel_id不能为空"))
+		respondBotfatherRequestInvalid(c, "channel_id")
 		return
 	}
 	if req.ChannelType == 0 {
-		c.ResponseError(errors.New("channel_type不能为空"))
+		respondBotfatherRequestInvalid(c, "channel_type")
 		return
 	}
 	if len(req.Payload) == 0 {
-		c.ResponseError(errors.New("payload不能为空"))
+		respondBotfatherRequestInvalid(c, "payload")
 		return
 	}
 
@@ -657,11 +660,11 @@ func (bf *BotFather) sendMessage(c *wkhttp.Context) {
 		).Load(&count)
 		if err != nil {
 			bf.Error("查询群成员失败", zap.Error(err))
-			c.ResponseError(errors.New("查询群成员失败"))
+			httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 			return
 		}
 		if count == 0 {
-			c.ResponseError(errors.New("bot is not a member of this group"))
+			httperr.ResponseErrorL(c, errcode.ErrBotfatherBotNotGroupMember, nil, nil)
 			return
 		}
 	} else if req.ChannelType == common.ChannelTypePerson.Uint8() {
@@ -672,11 +675,11 @@ func (bf *BotFather) sendMessage(c *wkhttp.Context) {
 			isFriend, err := bf.userService.IsFriend(robotID, req.ChannelID)
 			if err != nil {
 				bf.Error("查询好友关系失败", zap.Error(err))
-				c.ResponseError(errors.New("查询好友关系失败"))
+				httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 				return
 			}
 			if !isFriend {
-				c.ResponseError(errors.New("bot is not a friend of this user"))
+				httperr.ResponseErrorL(c, errcode.ErrSharedForbidden, nil, nil)
 				return
 			}
 		}
@@ -700,7 +703,7 @@ func (bf *BotFather) sendMessage(c *wkhttp.Context) {
 	})
 	if err != nil {
 		bf.Error("发送消息失败", zap.Error(err))
-		c.ResponseError(errors.New("发送消息失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherSendFailed, nil, nil)
 		return
 	}
 
@@ -715,15 +718,15 @@ func (bf *BotFather) sendMessage(c *wkhttp.Context) {
 func (bf *BotFather) typing(c *wkhttp.Context) {
 	var req BotTypingReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("数据格式有误"))
+		respondBotfatherRequestInvalid(c, "")
 		return
 	}
 	if strings.TrimSpace(req.ChannelID) == "" {
-		c.ResponseError(errors.New("channel_id不能为空"))
+		respondBotfatherRequestInvalid(c, "channel_id")
 		return
 	}
 	if req.ChannelType == 0 {
-		c.ResponseError(errors.New("channel_type不能为空"))
+		respondBotfatherRequestInvalid(c, "channel_type")
 		return
 	}
 
@@ -784,7 +787,7 @@ func (bf *BotFather) typing(c *wkhttp.Context) {
 	})
 	if err != nil {
 		bf.Error("发送typing失败", zap.Error(err))
-		c.ResponseError(errors.New("发送typing失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherSendFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -803,11 +806,11 @@ func (bf *BotFather) clearTypingThrottle(robotID string, channelID string, chann
 func (bf *BotFather) readReceipt(c *wkhttp.Context) {
 	var req BotReadReceiptReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("数据格式有误"))
+		respondBotfatherRequestInvalid(c, "")
 		return
 	}
 	if strings.TrimSpace(req.ChannelID) == "" {
-		c.ResponseError(errors.New("channel_id不能为空"))
+		respondBotfatherRequestInvalid(c, "channel_id")
 		return
 	}
 
@@ -928,7 +931,7 @@ func (bf *BotFather) setCommands(c *wkhttp.Context) {
 	}
 	if err := c.BindJSON(&req); err != nil {
 		bf.Error("数据格式有误", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误"))
+		respondBotfatherRequestInvalid(c, "")
 		return
 	}
 
@@ -943,14 +946,14 @@ func (bf *BotFather) setCommands(c *wkhttp.Context) {
 	commandsJSON, err := json.Marshal(req.Commands)
 	if err != nil {
 		bf.Error("序列化命令列表失败", zap.Error(err))
-		c.ResponseError(errors.New("序列化命令列表失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
 		return
 	}
 
 	err = bf.db.updateBotCommands(robotID, string(commandsJSON))
 	if err != nil {
 		bf.Error("保存命令列表失败", zap.Error(err))
-		c.ResponseError(errors.New("保存命令列表失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
 		return
 	}
 
@@ -962,7 +965,7 @@ func (bf *BotFather) setCommands(c *wkhttp.Context) {
 func (bf *BotFather) getEvents(c *wkhttp.Context) {
 	var req BotEventsReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("数据格式有误"))
+		respondBotfatherRequestInvalid(c, "")
 		return
 	}
 
@@ -1060,14 +1063,15 @@ func (bf *BotFather) eventAck(c *wkhttp.Context) {
 	eventIDStr := c.Param("event_id")
 	eventID, err := strconv.ParseInt(eventIDStr, 10, 64)
 	if err != nil {
-		c.ResponseError(errors.New("event_id 格式无效"))
+		respondBotfatherRequestInvalid(c, "event_id")
 		return
 	}
 
 	key := fmt.Sprintf("%s%s", bf.robotEventPrefix, robotID)
 	err = bf.ctx.GetRedisConn().ZRemRangeByScore(key, fmt.Sprintf("%d", eventID), fmt.Sprintf("%d", eventID))
 	if err != nil {
-		c.ResponseError(err)
+		bf.Error("删除事件失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -1081,7 +1085,7 @@ func (bf *BotFather) heartbeat(c *wkhttp.Context) {
 	err := bf.ctx.GetRedisConn().SetAndExpire(key, "1", time.Second*heartbeatTTL)
 	if err != nil {
 		bf.Error("设置心跳失败", zap.Error(err))
-		c.ResponseError(errors.New("设置心跳失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
 		return
 	}
 	c.ResponseOK()
@@ -1093,7 +1097,7 @@ func (bf *BotFather) heartbeat(c *wkhttp.Context) {
 func (bf *BotFather) botProxyFile(c *wkhttp.Context) {
 	ph := c.Param("path")
 	if ph == "" {
-		c.ResponseError(errors.New("文件路径不能为空"))
+		respondBotfatherRequestInvalid(c, "path")
 		return
 	}
 	ph = strings.TrimPrefix(ph, "/")
@@ -1103,7 +1107,7 @@ func (bf *BotFather) botProxyFile(c *wkhttp.Context) {
 	// 路径清洗：防止路径遍历攻击
 	cleaned := filepath.Clean(ph)
 	if strings.Contains(cleaned, "..") || strings.ContainsAny(cleaned, "\x00") {
-		c.ResponseErrorWithStatus(errors.New("文件路径无效"), http.StatusBadRequest)
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotfatherRequestInvalid, nil, i18n.Details{"field": "path"})
 		return
 	}
 	ph = cleaned
@@ -1116,7 +1120,7 @@ func (bf *BotFather) botProxyFile(c *wkhttp.Context) {
 	downloadURL, err := bf.fileService.DownloadURL(ph, filename)
 	if err != nil {
 		bf.Error("获取文件下载URL失败", zap.Error(err), zap.String("path", ph))
-		c.ResponseErrorWithStatus(errors.New("获取文件失败"), http.StatusNotFound)
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedNotFound, nil, nil)
 		return
 	}
 	c.Redirect(http.StatusFound, downloadURL)
@@ -1130,14 +1134,14 @@ func (bf *BotFather) botUploadFile(c *wkhttp.Context) {
 	multipartFile, fileHeader, err := c.Request.FormFile("file")
 	if err != nil {
 		bf.Error("读取上传文件失败", zap.Error(err))
-		c.ResponseError(errors.New("读取文件失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherUploadFailed, nil, nil)
 		return
 	}
 	defer multipartFile.Close()
 
 	const maxSize int64 = 100 * 1024 * 1024
 	if fileHeader.Size > maxSize {
-		c.ResponseError(fmt.Errorf("文件大小不能超过%dMB", maxSize/1024/1024))
+		respondBotfatherFileTooLarge(c, maxSize/1024/1024)
 		return
 	}
 
@@ -1162,7 +1166,7 @@ func (bf *BotFather) botUploadFile(c *wkhttp.Context) {
 	})
 	if err != nil {
 		bf.Error("上传文件失败", zap.Error(err))
-		c.ResponseError(errors.New("上传文件失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherUploadFailed, nil, nil)
 		return
 	}
 
@@ -1182,7 +1186,7 @@ func (bf *BotFather) botUploadFile(c *wkhttp.Context) {
 func (bf *BotFather) botFileDownload(c *wkhttp.Context) {
 	ph := c.Param("path")
 	if ph == "" {
-		c.ResponseError(errors.New("文件路径不能为空"))
+		respondBotfatherRequestInvalid(c, "path")
 		return
 	}
 	ph = strings.TrimPrefix(ph, "/")
@@ -1190,7 +1194,7 @@ func (bf *BotFather) botFileDownload(c *wkhttp.Context) {
 	// 路径清洗：防止路径遍历攻击（defense-in-depth）
 	ph, err := sanitizeBotFilePath(ph)
 	if err != nil {
-		c.ResponseErrorWithStatus(errors.New("文件路径无效"), http.StatusBadRequest)
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotfatherRequestInvalid, nil, i18n.Details{"field": "path"})
 		return
 	}
 
@@ -1202,7 +1206,7 @@ func (bf *BotFather) botFileDownload(c *wkhttp.Context) {
 	downloadURL, err := bf.fileService.DownloadURL(ph, filename)
 	if err != nil {
 		bf.Error("获取文件下载URL失败", zap.Error(err), zap.String("path", ph))
-		c.ResponseErrorWithStatus(errors.New("获取文件失败"), http.StatusNotFound)
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedNotFound, nil, nil)
 		return
 	}
 	c.Redirect(http.StatusFound, downloadURL)
@@ -1285,21 +1289,21 @@ func (bf *BotFather) syncAllBotTokens() {
 func (bf *BotFather) botUploadCredentials(c *wkhttp.Context) {
 	filename := c.Query("filename")
 	if strings.TrimSpace(filename) == "" {
-		c.ResponseError(errors.New("filename 不能为空"))
+		respondBotfatherRequestInvalid(c, "filename")
 		return
 	}
 	filename = filepath.Base(filename)
 
 	ext := strings.ToLower(filepath.Ext(filename))
 	if ext == "" || file.IsBlockedExtension(ext) || !file.IsAllowedExtension(ext) {
-		c.ResponseError(errors.New("不支持的文件类型"))
+		respondBotfatherRequestInvalid(c, "filename")
 		return
 	}
 
 	cosConfig := bf.ctx.GetConfig().COS
 	if cosConfig.SecretID == "" || cosConfig.SecretKey == "" || cosConfig.Bucket == "" {
 		bf.Error("COS 配置不完整")
-		c.ResponseError(errors.New("COS 未配置"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherUploadFailed, nil, nil)
 		return
 	}
 
@@ -1323,7 +1327,7 @@ func (bf *BotFather) botUploadCredentials(c *wkhttp.Context) {
 	}
 	if appId == "" {
 		bf.Error("无法从 bucket 名称中提取 appId", zap.String("bucket", bucket))
-		c.ResponseError(errors.New("COS 配置错误：bucket 格式不正确"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherUploadFailed, nil, nil)
 		return
 	}
 
@@ -1345,7 +1349,7 @@ func (bf *BotFather) botUploadCredentials(c *wkhttp.Context) {
 	res, err := client.GetCredential(opt)
 	if err != nil {
 		bf.Error("获取 STS 临时密钥失败", zap.Error(err))
-		c.ResponseError(errors.New("获取临时密钥失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherUploadFailed, nil, nil)
 		return
 	}
 
@@ -1368,7 +1372,7 @@ func (bf *BotFather) botUploadCredentials(c *wkhttp.Context) {
 func (bf *BotFather) botUploadPresigned(c *wkhttp.Context) {
 	filename := c.Query("filename")
 	if strings.TrimSpace(filename) == "" {
-		c.ResponseError(errors.New("filename 不能为空"))
+		respondBotfatherRequestInvalid(c, "filename")
 		return
 	}
 	filename = filepath.Base(filename)
@@ -1378,24 +1382,24 @@ func (bf *BotFather) botUploadPresigned(c *wkhttp.Context) {
 	// guard the public file API enforces (see modules/file/api.go).
 	fileSizeRaw := strings.TrimSpace(c.Query("fileSize"))
 	if fileSizeRaw == "" {
-		c.ResponseError(errors.New("fileSize 参数必填，且不能超过最大限制"))
+		respondBotfatherRequestInvalid(c, "fileSize")
 		return
 	}
 	fileSize, parseErr := strconv.ParseInt(fileSizeRaw, 10, 64)
 	if parseErr != nil || fileSize <= 0 {
-		c.ResponseError(errors.New("fileSize 参数必须为正整数（字节）"))
+		respondBotfatherRequestInvalid(c, "fileSize")
 		return
 	}
 	if fileSize > file.MaxFileSize {
 		bf.Warn("预签名上传 fileSize 超出限制",
 			zap.Int64("size", fileSize), zap.Int64("max", file.MaxFileSize))
-		c.ResponseError(fmt.Errorf("文件大小不能超过%dMB", file.MaxFileSize/1024/1024))
+		respondBotfatherFileTooLarge(c, file.MaxFileSize/1024/1024)
 		return
 	}
 
 	ext := strings.ToLower(filepath.Ext(filename))
 	if ext == "" || file.IsBlockedExtension(ext) || !file.IsAllowedExtension(ext) {
-		c.ResponseError(errors.New("不支持的文件类型"))
+		respondBotfatherRequestInvalid(c, "filename")
 		return
 	}
 
@@ -1411,7 +1415,7 @@ func (bf *BotFather) botUploadPresigned(c *wkhttp.Context) {
 	uploadURL, downloadURL, err := bf.fileService.PresignedPutURL(objectPath, contentType, contentDisposition, fileSize, expiry)
 	if err != nil {
 		bf.Error("生成预签名上传URL失败", zap.Error(err))
-		c.ResponseError(errors.New("生成上传URL失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherUploadFailed, nil, nil)
 		return
 	}
 
@@ -1446,25 +1450,25 @@ func (bf *BotFather) botMessageEdit(c *wkhttp.Context) {
 	}
 	if err := c.BindJSON(&req); err != nil {
 		bf.Error("数据格式有误！", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误！"))
+		respondBotfatherRequestInvalid(c, "")
 		return
 	}
 	if req.MessageID == "" {
-		c.ResponseError(errors.New("message_id 不能为空"))
+		respondBotfatherRequestInvalid(c, "message_id")
 		return
 	}
 	if req.ChannelID == "" {
-		c.ResponseError(errors.New("channel_id 不能为空"))
+		respondBotfatherRequestInvalid(c, "channel_id")
 		return
 	}
 	if strings.TrimSpace(req.ContentEdit) == "" {
-		c.ResponseError(errors.New("content_edit 不能为空"))
+		respondBotfatherRequestInvalid(c, "content_edit")
 		return
 	}
 
 	robotID := getRobotIDFromContext(c)
 	if robotID == "" {
-		c.ResponseError(errors.New("robot_id 不能为空"))
+		bf.respondBotfatherIdentityMissing(c)
 		return
 	}
 
@@ -1474,16 +1478,16 @@ func (bf *BotFather) botMessageEdit(c *wkhttp.Context) {
 		resp, err := bf.ctx.IMGetWithChannelAndSeqs(req.ChannelID, req.ChannelType, robotID, []uint32{req.MessageSeq})
 		if err != nil {
 			bf.Error("查询消息错误", zap.Error(err))
-			c.ResponseError(errors.New("查询消息错误"))
+			httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 			return
 		}
 		if resp == nil || len(resp.Messages) == 0 {
-			c.ResponseError(errors.New("消息不存在"))
+			httperr.ResponseErrorL(c, errcode.ErrBotfatherMessageNotFound, nil, nil)
 			return
 		}
 		// TOCTOU cross-check: ensure message_id matches message_seq (align with message/api.go:428)
 		if req.MessageID != strconv.FormatInt(resp.Messages[0].MessageID, 10) {
-			c.ResponseError(errors.New("消息ID与消息序号不匹配"))
+			httperr.ResponseErrorL(c, errcode.ErrBotfatherIDSeqMismatch, nil, nil)
 			return
 		}
 		msgFromUID = resp.Messages[0].FromUID
@@ -1492,7 +1496,7 @@ func (bf *BotFather) botMessageEdit(c *wkhttp.Context) {
 		msgIDInt, parseErr := strconv.ParseInt(req.MessageID, 10, 64)
 		if parseErr != nil {
 			bf.Error("message_id格式错误", zap.String("message_id", req.MessageID), zap.Error(parseErr))
-			c.ResponseError(errors.New("message_id格式错误"))
+			respondBotfatherRequestInvalid(c, "message_id")
 			return
 		}
 		syncResp, err := bf.ctx.IMSearchMessages(&config.MsgSearchReq{
@@ -1503,22 +1507,24 @@ func (bf *BotFather) botMessageEdit(c *wkhttp.Context) {
 		})
 		if err != nil {
 			bf.Error("查询消息错误", zap.Error(err))
-			c.ResponseError(errors.New("查询消息错误"))
+			httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 			return
 		}
 		if syncResp == nil || len(syncResp.Messages) == 0 {
-			c.ResponseError(errors.New("消息不存在"))
+			httperr.ResponseErrorL(c, errcode.ErrBotfatherMessageNotFound, nil, nil)
 			return
 		}
 		if syncResp.Messages[0].MessageSeq == 0 {
-			c.ResponseError(errors.New("消息尚未投递完成，请稍后重试"))
+			// message exists but has not finished delivering (seq not yet
+			// assigned) — surface as not-found so the caller retries.
+			httperr.ResponseErrorL(c, errcode.ErrBotfatherMessageNotFound, nil, nil)
 			return
 		}
 		msgFromUID = syncResp.Messages[0].FromUID
 		req.MessageSeq = syncResp.Messages[0].MessageSeq
 	}
 	if msgFromUID != robotID {
-		c.ResponseError(errors.New("只能编辑自己发送的消息"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherMessageEditForbidden, nil, nil)
 		return
 	}
 
@@ -1529,7 +1535,7 @@ func (bf *BotFather) botMessageEdit(c *wkhttp.Context) {
 	normalizedEdit, err := richtext.NormalizeContentEdit(req.ContentEdit)
 	if err != nil {
 		bf.Error("RichText content_edit 校验失败", zap.Error(err), zap.String("messageID", req.MessageID))
-		c.ResponseError(errors.New("无效的 content_edit"))
+		respondBotfatherRequestInvalid(c, "content_edit")
 		return
 	}
 	req.ContentEdit = normalizedEdit
@@ -1542,7 +1548,7 @@ func (bf *BotFather) botMessageEdit(c *wkhttp.Context) {
 	err = bf.ctx.DB().Select("count(*)").From("message_extra").Where("message_id=? and content_edit_hash=?", req.MessageID, contentMD5).LoadOne(&existCount)
 	if err != nil {
 		bf.Error("查询是否存在相同正文失败！", zap.Error(err))
-		c.ResponseError(errors.New("查询是否存在相同正文失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 		return
 	}
 	if existCount > 0 {
@@ -1560,7 +1566,7 @@ func (bf *BotFather) botMessageEdit(c *wkhttp.Context) {
 	version, err := bf.ctx.GenSeq(fmt.Sprintf("%s:%s", common.MessageExtraSeqKey, fakeChannelID))
 	if err != nil {
 		bf.Error("生成消息扩展序列号失败！", zap.Error(err))
-		c.ResponseError(errors.New("生成消息扩展序列号失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
 		return
 	}
 
@@ -1571,7 +1577,7 @@ func (bf *BotFather) botMessageEdit(c *wkhttp.Context) {
 	).Exec()
 	if err != nil {
 		bf.Error("添加或修改编辑内容失败！", zap.Error(err))
-		c.ResponseError(errors.New("添加或修改编辑内容失败！"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
 		return
 	}
 

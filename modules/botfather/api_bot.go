@@ -1,7 +1,6 @@
 package botfather
 
 import (
-	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -12,6 +11,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 )
@@ -20,15 +21,15 @@ import (
 func (bf *BotFather) syncMessages(c *wkhttp.Context) {
 	var req BotSyncMessagesReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("invalid request body"))
+		respondBotfatherRequestInvalid(c, "")
 		return
 	}
 	if strings.TrimSpace(req.ChannelID) == "" {
-		c.ResponseError(errors.New("channel_id不能为空"))
+		respondBotfatherRequestInvalid(c, "channel_id")
 		return
 	}
 	if req.ChannelType == 0 {
-		c.ResponseError(errors.New("channel_type不能为空"))
+		respondBotfatherRequestInvalid(c, "channel_type")
 		return
 	}
 	if req.Limit <= 0 {
@@ -49,11 +50,11 @@ func (bf *BotFather) syncMessages(c *wkhttp.Context) {
 		).Load(&count)
 		if err != nil {
 			bf.Error("failed to query group members", zap.Error(err))
-			c.ResponseError(errors.New("failed to query group members"))
+			httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 			return
 		}
 		if count == 0 {
-			c.ResponseError(errors.New("bot is not a member of this group"))
+			httperr.ResponseErrorL(c, errcode.ErrBotfatherBotNotGroupMember, nil, nil)
 			return
 		}
 	}
@@ -71,7 +72,7 @@ func (bf *BotFather) syncMessages(c *wkhttp.Context) {
 	resp, err := bf.ctx.IMSyncChannelMessage(syncReq)
 	if err != nil {
 		bf.Error("同步消息失败", zap.Error(err))
-		c.ResponseError(errors.New("同步消息失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherSendFailed, nil, nil)
 		return
 	}
 
@@ -82,7 +83,7 @@ func (bf *BotFather) syncMessages(c *wkhttp.Context) {
 func (bf *BotFather) getGroups(c *wkhttp.Context) {
 	robotID := getRobotIDFromContext(c)
 	if robotID == "" {
-		c.ResponseError(errors.New("robot_id not found"))
+		bf.respondBotfatherIdentityMissing(c)
 		return
 	}
 
@@ -108,7 +109,7 @@ func (bf *BotFather) getGroups(c *wkhttp.Context) {
 	}
 	if err != nil {
 		bf.Error("查询机器人群组失败", zap.Error(err))
-		c.ResponseError(errors.New("查询群组失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 		return
 	}
 
@@ -123,8 +124,13 @@ func (bf *BotFather) getGroupInfo(c *wkhttp.Context) {
 	// Verify bot is a member of this group
 	var count int
 	_, err := bf.db.session.SelectBySql("SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0", groupNo, robotID).Load(&count)
-	if err != nil || count == 0 {
-		c.ResponseError(errors.New("bot is not a member of this group"))
+	if err != nil {
+		bf.Error("查询群成员失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
+		return
+	}
+	if count == 0 {
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherBotNotGroupMember, nil, nil)
 		return
 	}
 
@@ -139,7 +145,8 @@ func (bf *BotFather) getGroupInfo(c *wkhttp.Context) {
 	_, err = bf.db.session.Select("group_no, name, IFNULL(notice,'') notice, IFNULL(creator,'') creator, status, created_at").
 		From("`group`").Where("group_no=?", groupNo).Load(&group)
 	if err != nil {
-		c.ResponseError(errors.New("group not found"))
+		bf.Error("查询群信息失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 		return
 	}
 
@@ -161,8 +168,13 @@ func (bf *BotFather) getGroupMembers(c *wkhttp.Context) {
 	// Verify bot is a member
 	var count int
 	_, err := bf.db.session.SelectBySql("SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0", groupNo, robotID).Load(&count)
-	if err != nil || count == 0 {
-		c.ResponseError(errors.New("bot is not a member of this group"))
+	if err != nil {
+		bf.Error("查询群成员失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
+		return
+	}
+	if count == 0 {
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherBotNotGroupMember, nil, nil)
 		return
 	}
 
@@ -187,7 +199,8 @@ func (bf *BotFather) getGroupMembers(c *wkhttp.Context) {
 		ORDER BY gm.role DESC, gm.created_at ASC
 	`, groupNo).Load(&members)
 	if err != nil {
-		c.ResponseError(err)
+		bf.Error("查询群成员列表失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 		return
 	}
 
@@ -203,12 +216,12 @@ const threadChannelIDSeparator = "____"
 func (bf *BotFather) getGroupMd(c *wkhttp.Context) {
 	robotID := getRobotIDFromContext(c)
 	if robotID == "" {
-		c.ResponseError(errors.New("robot_id not found"))
+		bf.respondBotfatherIdentityMissing(c)
 		return
 	}
 	groupNo := c.Param("group_no")
 	if strings.Contains(groupNo, threadChannelIDSeparator) {
-		c.ResponseErrorf("thread channel id is not accepted here; use /v1/bot/groups/<group_no>/threads/<short_id>/md instead", nil)
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherThreadChannelNotAccepted, nil, nil)
 		return
 	}
 
@@ -216,18 +229,18 @@ func (bf *BotFather) getGroupMd(c *wkhttp.Context) {
 	isMember, err := bf.groupService.ExistMember(groupNo, robotID)
 	if err != nil {
 		bf.Error("check group membership failed", zap.Error(err))
-		c.ResponseError(errors.New("check group membership failed"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 		return
 	}
 	if !isMember {
-		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "bot is not a member of this group", "status": 403})
+		respondBotfatherBotNotGroupMember(c)
 		return
 	}
 
 	result, err := bf.groupService.GetGroupMd(groupNo)
 	if err != nil {
 		bf.Error("query GROUP.md failed", zap.Error(err))
-		c.ResponseError(errors.New("query GROUP.md failed"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 		return
 	}
 	if result == nil {
@@ -251,12 +264,12 @@ func (bf *BotFather) getGroupMd(c *wkhttp.Context) {
 func (bf *BotFather) updateGroupMd(c *wkhttp.Context) {
 	robotID := getRobotIDFromContext(c)
 	if robotID == "" {
-		c.ResponseError(errors.New("robot_id not found"))
+		bf.respondBotfatherIdentityMissing(c)
 		return
 	}
 	groupNo := c.Param("group_no")
 	if strings.Contains(groupNo, threadChannelIDSeparator) {
-		c.ResponseErrorf("thread channel id is not accepted here; use /v1/bot/groups/<group_no>/threads/<short_id>/md instead", nil)
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherThreadChannelNotAccepted, nil, nil)
 		return
 	}
 
@@ -264,11 +277,11 @@ func (bf *BotFather) updateGroupMd(c *wkhttp.Context) {
 	isMember, err := bf.groupService.ExistMember(groupNo, robotID)
 	if err != nil {
 		bf.Error("check group membership failed", zap.Error(err))
-		c.ResponseError(errors.New("check group membership failed"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 		return
 	}
 	if !isMember {
-		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "bot is not a member of this group", "status": 403})
+		respondBotfatherBotNotGroupMember(c)
 		return
 	}
 
@@ -276,11 +289,11 @@ func (bf *BotFather) updateGroupMd(c *wkhttp.Context) {
 	isBotAdmin, err := bf.groupService.IsBotAdmin(groupNo, robotID)
 	if err != nil {
 		bf.Error("check bot admin failed", zap.Error(err))
-		c.ResponseError(errors.New("check bot admin failed"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 		return
 	}
 	if !isBotAdmin {
-		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "bot is not a bot_admin in this group", "status": 403})
+		respondBotfatherBotNotGroupAdmin(c)
 		return
 	}
 
@@ -288,20 +301,20 @@ func (bf *BotFather) updateGroupMd(c *wkhttp.Context) {
 		Content string `json:"content"`
 	}
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("invalid request body"))
+		respondBotfatherRequestInvalid(c, "")
 		return
 	}
 
 	maxSize := group.GetGroupMdMaxSize()
 	if len(req.Content) > maxSize {
-		c.ResponseError(fmt.Errorf("GROUP.md content exceeds max size %d bytes", maxSize))
+		respondBotfatherContentTooLarge(c, "content", maxSize)
 		return
 	}
 
 	newVersion, err := bf.groupService.UpdateGroupMd(groupNo, req.Content, robotID)
 	if err != nil {
 		bf.Error("update GROUP.md failed", zap.Error(err))
-		c.ResponseError(errors.New("update GROUP.md failed"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
 		return
 	}
 
@@ -336,7 +349,7 @@ func (bf *BotFather) resolveBotDisplayName(robotID string) string {
 func (bf *BotFather) botSpaceMembers(c *wkhttp.Context) {
 	robotID := getRobotIDFromContext(c)
 	if robotID == "" {
-		c.ResponseError(errors.New("robot_id not found"))
+		bf.respondBotfatherIdentityMissing(c)
 		return
 	}
 
@@ -378,7 +391,8 @@ func (bf *BotFather) botSpaceMembers(c *wkhttp.Context) {
 			"SELECT COUNT(*) FROM space_member WHERE space_id=? AND uid=? AND status=1", spaceID, robotID,
 		).LoadOne(&count)
 		if count == 0 {
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "bot is not a member of this space"})
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrBotfatherBotNotSpaceMember, nil, nil)
+			c.Abort()
 			return
 		}
 	}
@@ -396,7 +410,7 @@ func (bf *BotFather) botSpaceMembers(c *wkhttp.Context) {
 	}
 	if err != nil {
 		bf.Error("query space members failed", zap.Error(err))
-		c.ResponseError(errors.New("failed to query space members"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 		return
 	}
 
@@ -409,7 +423,7 @@ func (bf *BotFather) botSpaceMembers(c *wkhttp.Context) {
 func (bf *BotFather) botGroupCreate(c *wkhttp.Context) {
 	robotID := getRobotIDFromContext(c)
 	if robotID == "" {
-		c.ResponseError(errors.New("robot_id not found"))
+		bf.respondBotfatherIdentityMissing(c)
 		return
 	}
 
@@ -420,11 +434,11 @@ func (bf *BotFather) botGroupCreate(c *wkhttp.Context) {
 		SpaceID string   `json:"space_id"`
 	}
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("invalid request body"))
+		respondBotfatherRequestInvalid(c, "")
 		return
 	}
 	if len(req.Members) == 0 {
-		c.ResponseError(errors.New("members is required"))
+		respondBotfatherRequestInvalid(c, "members")
 		return
 	}
 
@@ -443,7 +457,7 @@ func (bf *BotFather) botGroupCreate(c *wkhttp.Context) {
 	memberUsers, err := bf.userDB.QueryByUIDs(req.Members)
 	if err != nil {
 		bf.Error("query member info failed", zap.Error(err))
-		c.ResponseError(errors.New("failed to query member info"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 		return
 	}
 	// 按原始 req.Members 顺序过滤，保留顺序
@@ -460,7 +474,7 @@ func (bf *BotFather) botGroupCreate(c *wkhttp.Context) {
 		}
 	}
 	if len(humanMembers) == 0 {
-		c.ResponseError(errors.New("only human members can be added through bot API"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherMemberNotHuman, nil, nil)
 		return
 	}
 
@@ -472,11 +486,11 @@ func (bf *BotFather) botGroupCreate(c *wkhttp.Context) {
 		creatorUser, err := bf.userDB.QueryByUID(req.Creator)
 		if err != nil {
 			bf.Error("query creator info failed", zap.Error(err))
-			c.ResponseError(errors.New("failed to query creator info"))
+			httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 			return
 		}
 		if creatorUser != nil && creatorUser.Robot == 1 {
-			c.ResponseError(errors.New("creator cannot be a bot"))
+			httperr.ResponseErrorL(c, errcode.ErrBotfatherCreatorCannotBeBot, nil, nil)
 			return
 		}
 	}
@@ -491,7 +505,7 @@ func (bf *BotFather) botGroupCreate(c *wkhttp.Context) {
 	})
 	if err != nil {
 		bf.Error("create group failed", zap.Error(err))
-		c.ResponseError(err)
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
 		return
 	}
 
@@ -514,14 +528,20 @@ func (bf *BotFather) botGroupUpdate(c *wkhttp.Context) {
 	// 权限检查：Bot 必须是群成员
 	isMember, err := bf.groupService.ExistMember(groupNo, robotID)
 	if err != nil || !isMember {
-		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "bot is not a member of this group"})
+		if err != nil {
+			bf.Error("check group membership failed", zap.Error(err))
+		}
+		respondBotfatherBotNotGroupMember(c)
 		return
 	}
 
 	// 权限检查：Bot 必须是 bot_admin
 	isBotAdmin, err := bf.groupService.IsBotAdmin(groupNo, robotID)
 	if err != nil || !isBotAdmin {
-		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "bot is not a bot_admin in this group"})
+		if err != nil {
+			bf.Error("check bot admin failed", zap.Error(err))
+		}
+		respondBotfatherBotNotGroupAdmin(c)
 		return
 	}
 
@@ -530,11 +550,11 @@ func (bf *BotFather) botGroupUpdate(c *wkhttp.Context) {
 		Notice *string `json:"notice"`
 	}
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("invalid request body"))
+		respondBotfatherRequestInvalid(c, "")
 		return
 	}
 	if req.Name == nil && req.Notice == nil {
-		c.ResponseError(errors.New("at least one of name or notice is required"))
+		respondBotfatherRequestInvalid(c, "")
 		return
 	}
 
@@ -548,7 +568,7 @@ func (bf *BotFather) botGroupUpdate(c *wkhttp.Context) {
 	})
 	if err != nil {
 		bf.Error("update group failed", zap.Error(err))
-		c.ResponseError(err)
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
 		return
 	}
 
@@ -564,7 +584,10 @@ func (bf *BotFather) botGroupMemberAdd(c *wkhttp.Context) {
 	// 权限检查：Bot 必须是群成员
 	isMember, err := bf.groupService.ExistMember(groupNo, robotID)
 	if err != nil || !isMember {
-		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "bot is not a member of this group"})
+		if err != nil {
+			bf.Error("check group membership failed", zap.Error(err))
+		}
+		respondBotfatherBotNotGroupMember(c)
 		return
 	}
 
@@ -572,7 +595,7 @@ func (bf *BotFather) botGroupMemberAdd(c *wkhttp.Context) {
 		Members []string `json:"members"`
 	}
 	if err := c.BindJSON(&req); err != nil || len(req.Members) == 0 {
-		c.ResponseError(errors.New("members is required"))
+		respondBotfatherRequestInvalid(c, "members")
 		return
 	}
 
@@ -580,7 +603,7 @@ func (bf *BotFather) botGroupMemberAdd(c *wkhttp.Context) {
 	memberUsers, err := bf.userDB.QueryByUIDs(req.Members)
 	if err != nil {
 		bf.Error("query member info failed", zap.Error(err))
-		c.ResponseError(errors.New("failed to query member info"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 		return
 	}
 	var humanMembers []string
@@ -593,7 +616,7 @@ func (bf *BotFather) botGroupMemberAdd(c *wkhttp.Context) {
 		humanMembers = append(humanMembers, u.UID)
 	}
 	if len(humanMembers) == 0 {
-		c.ResponseError(errors.New("only human members can be added through bot API"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherMemberNotHuman, nil, nil)
 		return
 	}
 
@@ -606,7 +629,7 @@ func (bf *BotFather) botGroupMemberAdd(c *wkhttp.Context) {
 	})
 	if err != nil {
 		bf.Error("add group members failed", zap.Error(err))
-		c.ResponseError(err)
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
 		return
 	}
 
@@ -626,14 +649,20 @@ func (bf *BotFather) botGroupMemberRemove(c *wkhttp.Context) {
 	// 权限检查：Bot 必须是群成员
 	isMember, err := bf.groupService.ExistMember(groupNo, robotID)
 	if err != nil || !isMember {
-		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "bot is not a member of this group"})
+		if err != nil {
+			bf.Error("check group membership failed", zap.Error(err))
+		}
+		respondBotfatherBotNotGroupMember(c)
 		return
 	}
 
 	// 权限检查：Bot 必须是 bot_admin
 	isBotAdmin, err := bf.groupService.IsBotAdmin(groupNo, robotID)
 	if err != nil || !isBotAdmin {
-		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "bot is not a bot_admin in this group"})
+		if err != nil {
+			bf.Error("check bot admin failed", zap.Error(err))
+		}
+		respondBotfatherBotNotGroupAdmin(c)
 		return
 	}
 
@@ -641,7 +670,7 @@ func (bf *BotFather) botGroupMemberRemove(c *wkhttp.Context) {
 		Members []string `json:"members"`
 	}
 	if err := c.BindJSON(&req); err != nil || len(req.Members) == 0 {
-		c.ResponseError(errors.New("members is required"))
+		respondBotfatherRequestInvalid(c, "members")
 		return
 	}
 
@@ -666,7 +695,7 @@ func (bf *BotFather) botGroupMemberRemove(c *wkhttp.Context) {
 	})
 	if err != nil {
 		bf.Error("remove group members failed", zap.Error(err))
-		c.ResponseError(err)
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
 		return
 	}
 
@@ -728,7 +757,7 @@ func stripSpacePrefix(uid string) string {
 func (bf *BotFather) getUserInfo(c *wkhttp.Context) {
 	uid := strings.TrimSpace(c.Query("uid"))
 	if uid == "" {
-		c.ResponseError(errors.New("uid参数不能为空"))
+		respondBotfatherRequestInvalid(c, "uid")
 		return
 	}
 
@@ -738,7 +767,7 @@ func (bf *BotFather) getUserInfo(c *wkhttp.Context) {
 
 	userResp, err := bf.userService.GetUser(bareUID)
 	if err != nil || userResp == nil {
-		c.JSON(http.StatusNotFound, gin.H{"msg": "用户不存在"})
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotfatherUserNotFound, nil, nil)
 		return
 	}
 

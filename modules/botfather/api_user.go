@@ -1,9 +1,7 @@
 package botfather
 
 import (
-	"errors"
 	"fmt"
-	"net/http"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
@@ -37,19 +35,19 @@ func (bf *BotFather) authUserAPIKey() wkhttp.HandlerFunc {
 	return func(c *wkhttp.Context) {
 		token := extractBotToken(c) // reuse Bearer extraction
 		if token == "" || !strings.HasPrefix(token, UserAPIKeyPrefix) {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "缺少Authorization头或API Key无效"})
+			respondBotfatherAuthFailed(c)
 			return
 		}
 
 		keyModel, err := bf.apiKeyService.AuthByKey(token)
 		if err != nil {
 			bf.Error("查询User API Key失败", zap.Error(err))
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "认证失败"})
+			respondBotfatherAuthFailed(c)
 			return
 		}
 		if keyModel == nil {
 			// key 不存在或非 active（AuthByKey 已按 status=1 过滤）→ 统一 401。
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "无效的API Key"})
+			respondBotfatherAuthFailed(c)
 			return
 		}
 		if keyModel.ClientID != clientIDBotFather {
@@ -129,14 +127,14 @@ func (bf *BotFather) createUserBot(c *wkhttp.Context) {
 	uid := getAPIKeyUID(c)
 	var req CreateBotReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("数据格式有误"))
+		respondBotfatherRequestInvalid(c, "")
 		return
 	}
 
 	// Validate name
 	name := strings.TrimSpace(req.Name)
 	if name == "" || len(name) > 64 {
-		c.ResponseError(errors.New("name 长度需要在 1-64 个字符之间"))
+		respondBotfatherRequestInvalid(c, "name")
 		return
 	}
 
@@ -144,7 +142,7 @@ func (bf *BotFather) createUserBot(c *wkhttp.Context) {
 	botToken, err := bf.cmdHandler.generateUniqueBotToken()
 	if err != nil {
 		bf.Error("生成Bot Token失败", zap.Error(err))
-		c.ResponseError(errors.New("创建失败，请稍后重试"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
 		return
 	}
 	description := ""
@@ -160,18 +158,18 @@ func (bf *BotFather) createUserBot(c *wkhttp.Context) {
 	if reqUsername != "" {
 		reqUsername = strings.TrimSuffix(reqUsername, BotUsernameSuffix)
 		if len(reqUsername) == 0 || len(reqUsername) > 20 {
-			c.ResponseError(errors.New("username 长度需要在 1-20 个字符之间"))
+			respondBotfatherRequestInvalid(c, "username")
 			return
 		}
 		for _, r := range reqUsername {
 			if !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_') {
-				c.ResponseError(errors.New("username 只能包含英文字母、数字和下划线"))
+				respondBotfatherRequestInvalid(c, "username")
 				return
 			}
 		}
 		// 禁止 app_ 前缀以避免与 App Bot UID 命名空间冲突
 		if strings.HasPrefix(reqUsername, "app_") {
-			c.ResponseError(errors.New("username 不能以 app_ 开头，该前缀为应用 Bot 保留"))
+			respondBotfatherRequestInvalid(c, "username")
 			return
 		}
 		reqUsername = reqUsername + BotUsernameSuffix
@@ -179,12 +177,12 @@ func (bf *BotFather) createUserBot(c *wkhttp.Context) {
 		// 唯一性预检
 		exists, _ := bf.db.existRobotByUsername(reqUsername)
 		if exists {
-			c.ResponseErrorWithStatus(fmt.Errorf("username %s 已被占用", reqUsername), http.StatusConflict)
+			respondBotfatherUsernameTaken(c, reqUsername)
 			return
 		}
 		u, _ := bf.userService.GetUserWithUsername(reqUsername)
 		if u != nil {
-			c.ResponseErrorWithStatus(fmt.Errorf("username %s 已被占用", reqUsername), http.StatusConflict)
+			respondBotfatherUsernameTaken(c, reqUsername)
 			return
 		}
 
@@ -195,7 +193,7 @@ func (bf *BotFather) createUserBot(c *wkhttp.Context) {
 	}
 	if createErr != nil {
 		bf.Error("创建Bot失败", zap.Error(createErr))
-		c.ResponseError(errors.New("创建失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
 		return
 	}
 	username := robotID
@@ -299,7 +297,7 @@ func (bf *BotFather) listUserBots(c *wkhttp.Context) {
 	}
 	if err != nil {
 		bf.Error("查询Bot列表失败", zap.Error(err))
-		c.ResponseError(errors.New("查询失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 		return
 	}
 
@@ -359,11 +357,12 @@ func (bf *BotFather) updateUserBot(c *wkhttp.Context) {
 	bot, err := bf.db.queryRobotByRobotIDAndCreator(botID, uid)
 	if err != nil {
 		bf.Error("查询Bot失败", zap.Error(err))
-		c.ResponseError(errors.New("查询失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 		return
 	}
 	if bot == nil {
-		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"msg": "Bot不存在或无权限"})
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotfatherBotNotFound, nil, nil)
+		c.Abort()
 		return
 	}
 
@@ -372,25 +371,26 @@ func (bf *BotFather) updateUserBot(c *wkhttp.Context) {
 		inSpace, sErr := bf.isBotInSpace(botID, spaceID)
 		if sErr != nil {
 			bf.Error("校验Bot Space归属失败", zap.Error(sErr))
-			c.ResponseError(errors.New("查询失败"))
+			httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 			return
 		}
 		if !inSpace {
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "该Bot不属于当前Space"})
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrBotfatherBotNotInSpace, nil, nil)
+			c.Abort()
 			return
 		}
 	}
 
 	var req UpdateBotReq
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("数据格式有误"))
+		respondBotfatherRequestInvalid(c, "")
 		return
 	}
 
 	if req.Name != nil {
 		name := strings.TrimSpace(*req.Name)
 		if name == "" || len(name) > 64 {
-			c.ResponseError(errors.New("name 长度需要在 1-64 个字符之间"))
+			respondBotfatherRequestInvalid(c, "name")
 			return
 		}
 		err = bf.userService.UpdateUser(user.UserUpdateReq{
@@ -399,7 +399,7 @@ func (bf *BotFather) updateUserBot(c *wkhttp.Context) {
 		})
 		if err != nil {
 			bf.Error("更新Bot名称失败", zap.Error(err))
-			c.ResponseError(errors.New("更新失败"))
+			httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
 			return
 		}
 	}
@@ -407,13 +407,13 @@ func (bf *BotFather) updateUserBot(c *wkhttp.Context) {
 	if req.Description != nil {
 		desc := strings.TrimSpace(*req.Description)
 		if len(desc) > 500 {
-			c.ResponseError(errors.New("description 不能超过 500 个字符"))
+			respondBotfatherRequestInvalid(c, "description")
 			return
 		}
 		err = bf.db.updateRobotDescription(botID, desc)
 		if err != nil {
 			bf.Error("更新Bot描述失败", zap.Error(err))
-			c.ResponseError(errors.New("更新失败"))
+			httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
 			return
 		}
 	}
@@ -430,11 +430,12 @@ func (bf *BotFather) deleteUserBot(c *wkhttp.Context) {
 	bot, err := bf.db.queryRobotByRobotIDAndCreator(botID, uid)
 	if err != nil {
 		bf.Error("查询Bot失败", zap.Error(err))
-		c.ResponseError(errors.New("查询失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 		return
 	}
 	if bot == nil {
-		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"msg": "Bot不存在或无权限"})
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotfatherBotNotFound, nil, nil)
+		c.Abort()
 		return
 	}
 
@@ -443,11 +444,12 @@ func (bf *BotFather) deleteUserBot(c *wkhttp.Context) {
 		inSpace, sErr := bf.isBotInSpace(botID, spaceID)
 		if sErr != nil {
 			bf.Error("校验Bot Space归属失败", zap.Error(sErr))
-			c.ResponseError(errors.New("查询失败"))
+			httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 			return
 		}
 		if !inSpace {
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "该Bot不属于当前Space"})
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrBotfatherBotNotInSpace, nil, nil)
+			c.Abort()
 			return
 		}
 	}
@@ -496,7 +498,7 @@ func (bf *BotFather) deleteUserBot(c *wkhttp.Context) {
 	err = bf.db.deleteRobot(botID)
 	if err != nil {
 		bf.Error("删除Bot失败", zap.Error(err))
-		c.ResponseError(errors.New("删除失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
 		return
 	}
 
@@ -522,11 +524,12 @@ func (bf *BotFather) getUserBotToken(c *wkhttp.Context) {
 	bot, err := bf.db.queryRobotByRobotIDAndCreator(botID, uid)
 	if err != nil {
 		bf.Error("查询Bot失败", zap.Error(err))
-		c.ResponseError(errors.New("查询失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 		return
 	}
 	if bot == nil {
-		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"msg": "Bot不存在或无权限"})
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotfatherBotNotFound, nil, nil)
+		c.Abort()
 		return
 	}
 
@@ -535,11 +538,12 @@ func (bf *BotFather) getUserBotToken(c *wkhttp.Context) {
 		inSpace, sErr := bf.isBotInSpace(botID, spaceID)
 		if sErr != nil {
 			bf.Error("校验Bot Space归属失败", zap.Error(sErr))
-			c.ResponseError(errors.New("查询失败"))
+			httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 			return
 		}
 		if !inSpace {
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "该Bot不属于当前Space"})
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrBotfatherBotNotInSpace, nil, nil)
+			c.Abort()
 			return
 		}
 	}

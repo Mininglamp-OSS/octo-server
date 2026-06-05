@@ -1,7 +1,6 @@
 package botfather
 
 import (
-	"errors"
 	"fmt"
 	"strconv"
 
@@ -10,6 +9,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
 )
@@ -24,19 +25,19 @@ const (
 func (bf *BotFather) robotApply(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	if loginUID == "" {
-		c.ResponseError(errors.New("请先登录"))
+		httperr.ResponseErrorL(c, errcode.ErrSharedAuthRequired, nil, nil)
 		return
 	}
 
 	var req RobotApplyReq
 	if err := c.BindJSON(&req); err != nil {
 		bf.Error("数据格式有误", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误"))
+		respondBotfatherRequestInvalid(c, "")
 		return
 	}
 
 	if req.RobotUID == "" {
-		c.ResponseError(errors.New("robot_uid不能为空"))
+		respondBotfatherRequestInvalid(c, "robot_uid")
 		return
 	}
 
@@ -44,17 +45,17 @@ func (bf *BotFather) robotApply(c *wkhttp.Context) {
 	robot, err := bf.db.queryRobotByRobotID(req.RobotUID)
 	if err != nil {
 		bf.Error("查询机器人失败", zap.Error(err))
-		c.ResponseError(errors.New("查询机器人失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 		return
 	}
 	if robot == nil || robot.Status != 1 {
-		c.ResponseError(errors.New("机器人不存在或已被删除"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherRobotNotFound, nil, nil)
 		return
 	}
 
 	// 检查是否是自己的AI
 	if robot.CreatorUID == loginUID {
-		c.ResponseError(errors.New("无需申请使用自己的AI"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherCannotApplyOwnBot, nil, nil)
 		return
 	}
 
@@ -65,7 +66,7 @@ func (bf *BotFather) robotApply(c *wkhttp.Context) {
 		err = bf.createFriendRelation(loginUID, req.RobotUID)
 		if err != nil {
 			bf.Error("创建好友关系失败", zap.Error(err))
-			c.ResponseError(errors.New("创建好友关系失败"))
+			httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
 			return
 		}
 		c.Response(map[string]interface{}{
@@ -79,11 +80,11 @@ func (bf *BotFather) robotApply(c *wkhttp.Context) {
 	isFriend, err := bf.userService.IsFriend(loginUID, req.RobotUID)
 	if err != nil {
 		bf.Error("检查好友关系失败", zap.Error(err))
-		c.ResponseError(errors.New("检查好友关系失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 		return
 	}
 	if isFriend {
-		c.ResponseError(errors.New("你们已经是好友了"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherAlreadyFriends, nil, nil)
 		return
 	}
 
@@ -92,11 +93,11 @@ func (bf *BotFather) robotApply(c *wkhttp.Context) {
 	existingApply, err := applyDB.queryPendingByUIDAndRobot(loginUID, req.RobotUID)
 	if err != nil {
 		bf.Error("查询申请记录失败", zap.Error(err))
-		c.ResponseError(errors.New("查询申请记录失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 		return
 	}
 	if existingApply != nil {
-		c.ResponseError(errors.New("你已提交过申请，请等待Owner审批"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherApplyExists, nil, nil)
 		return
 	}
 
@@ -142,7 +143,7 @@ func (bf *BotFather) robotApply(c *wkhttp.Context) {
 	err = applyDB.insert(apply)
 	if err != nil {
 		bf.Error("创建申请记录失败", zap.Error(err))
-		c.ResponseError(errors.New("创建申请记录失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
 		return
 	}
 	bf.notifyOwnerNewApply(loginUID, req.RobotUID, robot.CreatorUID, req.Remark, applySpaceID)
@@ -157,19 +158,19 @@ func (bf *BotFather) robotApply(c *wkhttp.Context) {
 func (bf *BotFather) robotApplySure(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	if loginUID == "" {
-		c.ResponseError(errors.New("请先登录"))
+		httperr.ResponseErrorL(c, errcode.ErrSharedAuthRequired, nil, nil)
 		return
 	}
 
 	var req RobotApplySureReq
 	if err := c.BindJSON(&req); err != nil {
 		bf.Error("数据格式有误", zap.Error(err))
-		c.ResponseError(errors.New("数据格式有误"))
+		respondBotfatherRequestInvalid(c, "")
 		return
 	}
 
 	if req.ApplyID <= 0 {
-		c.ResponseError(errors.New("apply_id无效"))
+		respondBotfatherRequestInvalid(c, "apply_id")
 		return
 	}
 
@@ -177,23 +178,23 @@ func (bf *BotFather) robotApplySure(c *wkhttp.Context) {
 	apply, err := applyDB.queryByID(req.ApplyID)
 	if err != nil {
 		bf.Error("查询申请记录失败", zap.Error(err))
-		c.ResponseError(errors.New("查询申请记录失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 		return
 	}
 	if apply == nil {
-		c.ResponseError(errors.New("申请记录不存在"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherApplyNotFound, nil, nil)
 		return
 	}
 
 	// 验证Owner身份
 	if apply.OwnerUID != loginUID {
-		c.ResponseError(errors.New("你不是该AI的Owner"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherNotOwner, nil, nil)
 		return
 	}
 
 	// 检查状态
 	if apply.Status != ApplyStatusPending {
-		c.ResponseError(errors.New("该申请已被处理"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherApplyProcessed, nil, nil)
 		return
 	}
 
@@ -201,7 +202,7 @@ func (bf *BotFather) robotApplySure(c *wkhttp.Context) {
 	err = applyDB.updateStatus(req.ApplyID, ApplyStatusApproved)
 	if err != nil {
 		bf.Error("更新申请状态失败", zap.Error(err))
-		c.ResponseError(errors.New("更新申请状态失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
 		return
 	}
 
@@ -209,7 +210,7 @@ func (bf *BotFather) robotApplySure(c *wkhttp.Context) {
 	err = bf.createFriendRelation(apply.UID, apply.RobotUID)
 	if err != nil {
 		bf.Error("创建好友关系失败", zap.Error(err))
-		c.ResponseError(errors.New("创建好友关系失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
 		return
 	}
 
@@ -227,14 +228,14 @@ func (bf *BotFather) robotApplySure(c *wkhttp.Context) {
 func (bf *BotFather) robotApplyRefuse(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	if loginUID == "" {
-		c.ResponseError(errors.New("请先登录"))
+		httperr.ResponseErrorL(c, errcode.ErrSharedAuthRequired, nil, nil)
 		return
 	}
 
 	applyIDStr := c.Param("apply_id")
 	applyID, err := strconv.ParseInt(applyIDStr, 10, 64)
 	if err != nil || applyID <= 0 {
-		c.ResponseError(errors.New("apply_id无效"))
+		respondBotfatherRequestInvalid(c, "apply_id")
 		return
 	}
 
@@ -242,23 +243,23 @@ func (bf *BotFather) robotApplyRefuse(c *wkhttp.Context) {
 	apply, err := applyDB.queryByID(applyID)
 	if err != nil {
 		bf.Error("查询申请记录失败", zap.Error(err))
-		c.ResponseError(errors.New("查询申请记录失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 		return
 	}
 	if apply == nil {
-		c.ResponseError(errors.New("申请记录不存在"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherApplyNotFound, nil, nil)
 		return
 	}
 
 	// 验证Owner身份
 	if apply.OwnerUID != loginUID {
-		c.ResponseError(errors.New("你不是该AI的Owner"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherNotOwner, nil, nil)
 		return
 	}
 
 	// 检查状态
 	if apply.Status != ApplyStatusPending {
-		c.ResponseError(errors.New("该申请已被处理"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherApplyProcessed, nil, nil)
 		return
 	}
 
@@ -266,7 +267,7 @@ func (bf *BotFather) robotApplyRefuse(c *wkhttp.Context) {
 	err = applyDB.updateStatus(applyID, ApplyStatusRejected)
 	if err != nil {
 		bf.Error("更新申请状态失败", zap.Error(err))
-		c.ResponseError(errors.New("更新申请状态失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherStoreFailed, nil, nil)
 		return
 	}
 
@@ -284,7 +285,7 @@ func (bf *BotFather) robotApplyRefuse(c *wkhttp.Context) {
 func (bf *BotFather) robotApplies(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	if loginUID == "" {
-		c.ResponseError(errors.New("请先登录"))
+		httperr.ResponseErrorL(c, errcode.ErrSharedAuthRequired, nil, nil)
 		return
 	}
 
@@ -306,14 +307,14 @@ func (bf *BotFather) robotApplies(c *wkhttp.Context) {
 	list, err := applyDB.queryPendingByOwner(loginUID, pageSize, offset)
 	if err != nil {
 		bf.Error("查询申请列表失败", zap.Error(err))
-		c.ResponseError(errors.New("查询申请列表失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 		return
 	}
 
 	count, err := applyDB.queryPendingCountByOwner(loginUID)
 	if err != nil {
 		bf.Error("查询申请数量失败", zap.Error(err))
-		c.ResponseError(errors.New("查询申请数量失败"))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
 		return
 	}
 
