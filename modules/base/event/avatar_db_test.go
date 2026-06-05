@@ -1,21 +1,23 @@
 package event
 
 import (
+	"database/sql"
+	"fmt"
 	"testing"
+	"time"
 
-	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/stretchr/testify/require"
+
+	_ "github.com/go-sql-driver/mysql"
 )
 
 // TestUpdateGeneratedGroupAvatarProtectsManualUpload 验证自动群头像合成的并发保护契约：
 // updateGeneratedGroupAvatar 带 WHERE is_upload_avatar=0，只在群头像仍为自动管理时写入
 // 合成结果；一旦群主手动上传（is_upload_avatar=1），后到的旧合成事件必须被挡掉、不得覆盖
 // 手动头像。这是本次改动最关键的正确性保证。
-//
-// event 包测试二进制不 link group module 的 migration，这里手动建最小 group 表（真实表的
-// 列子集，覆盖 queryGroupAvatarState / updateGeneratedGroupAvatar 用到的全部列）。
 func TestUpdateGeneratedGroupAvatarProtectsManualUpload(t *testing.T) {
-	_, ctx := testutil.NewTestServer()
+	ctx := newIsolatedAvatarEventTestContext(t)
 	db := NewDB(ctx.DB())
 
 	_, err := ctx.DB().UpdateBySql("CREATE TABLE IF NOT EXISTS `group` (" +
@@ -67,4 +69,27 @@ func TestUpdateGeneratedGroupAvatarProtectsManualUpload(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, manualPath, got.Avatar)
 	require.Equal(t, manualVersion, got.AvatarVersion)
+}
+
+// Keep this test's hand-built `group` table out of the shared test schema so it
+// cannot poison package-level migrations in later go test invocations.
+func newIsolatedAvatarEventTestContext(t *testing.T) *config.Context {
+	t.Helper()
+
+	adminDB, err := sql.Open("mysql", "root:demo@tcp(127.0.0.1)/?charset=utf8mb4&parseTime=true")
+	require.NoError(t, err)
+
+	dbName := fmt.Sprintf("test_event_avatar_%d", time.Now().UnixNano())
+	_, err = adminDB.Exec("CREATE DATABASE `" + dbName + "` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = adminDB.Exec("DROP DATABASE IF EXISTS `" + dbName + "`")
+		_ = adminDB.Close()
+	})
+
+	cfg := config.New()
+	cfg.Test = true
+	cfg.DB.Migration = false
+	cfg.DB.MySQLAddr = fmt.Sprintf("root:demo@tcp(127.0.0.1)/%s?charset=utf8mb4&parseTime=true", dbName)
+	return config.NewContext(cfg)
 }
