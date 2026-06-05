@@ -290,13 +290,10 @@ func TestGetAppConfig_OIDCProvidersHonoursParseBoolSpellings(t *testing.T) {
 // 所有人都进不来。这条用例锁定"appconfig 返回的是 effective 值而不是 DB
 // 原始值"这个语义,与 LocalLoginOff() getter 的安全回退一致。
 func TestGetAppConfig_LocalLoginOff_SafetyOverrideWithoutSSO(t *testing.T) {
-	t.Setenv("DM_OIDC_ENABLED", "")
+	clearOIDCEnvForTest(t)
 	s, ctx := testutil.NewTestServer()
-	ctx.GetConfig().Github.ClientID = ""
-	ctx.GetConfig().Github.ClientSecret = ""
-	ctx.GetConfig().Gitee.ClientID = ""
-	ctx.GetConfig().Gitee.ClientSecret = ""
 	f := New(ctx)
+	disableThirdPartyLoginForTest(t, ctx)
 	cleanAllTablesAndReloadSettings(t, ctx)
 	err := f.appConfigDB.insert(&appConfigModel{})
 	assert.NoError(t, err)

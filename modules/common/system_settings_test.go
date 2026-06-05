@@ -4,6 +4,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -27,21 +28,61 @@ var fullOIDCTestEnv = map[string]string{
 	"DM_OIDC_RT_ENC_KEY": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
 }
 
+var oidcTestEnvKeys = []string{
+	"DM_OIDC_ENABLED",
+	"DM_OIDC_PROVIDER_ID",
+	"DM_OIDC_PROVIDER_NAME",
+	"DM_OIDC_PROVIDER_ISSUER",
+	"DM_OIDC_PROVIDER_CLIENT_ID",
+	"DM_OIDC_PROVIDER_CLIENT_SECRET",
+	"DM_OIDC_PROVIDER_REDIRECT_URI",
+	"DM_OIDC_AEGIS_ISSUER",
+	"DM_OIDC_AEGIS_CLIENT_ID",
+	"DM_OIDC_AEGIS_CLIENT_SECRET",
+	"DM_OIDC_AEGIS_REDIRECT_URI",
+	"DM_OIDC_RT_ENC_KEY",
+	"DM_OIDC_ACCOUNT_URL",
+	"DM_OIDC_RESET_PASSWORD_URL",
+}
+
+func clearOIDCEnvForTest(t *testing.T) {
+	t.Helper()
+	for _, k := range oidcTestEnvKeys {
+		t.Setenv(k, "")
+	}
+}
+
 // enableFullOIDCForTest 调用 t.Setenv 把整张 fullOIDCTestEnv 写进当前测试
-// 的环境,Setenv 在 t.Cleanup 自动复原。先 unset alias(AEGIS_*)防止外部
-// 残留绑定到测试场景,影响断言。
+// 的环境,Setenv 在 t.Cleanup 自动复原。先清空全部 OIDC 相关 env,防止外部
+// 或前置测试残留绑定到测试场景,影响断言。
 func enableFullOIDCForTest(t *testing.T) {
 	t.Helper()
-	for _, alias := range []string{
-		"DM_OIDC_AEGIS_ISSUER",
-		"DM_OIDC_AEGIS_CLIENT_ID",
-		"DM_OIDC_AEGIS_CLIENT_SECRET",
-		"DM_OIDC_AEGIS_REDIRECT_URI",
-	} {
-		t.Setenv(alias, "")
-	}
+	clearOIDCEnvForTest(t)
 	for k, v := range fullOIDCTestEnv {
 		t.Setenv(k, v)
+	}
+}
+
+func clearExternalLoginConfig(cfg *config.Config) {
+	cfg.Github.ClientID = ""
+	cfg.Github.ClientSecret = ""
+	cfg.Gitee.ClientID = ""
+	cfg.Gitee.ClientSecret = ""
+}
+
+func disableThirdPartyLoginForTest(t *testing.T, ctxs ...*config.Context) {
+	t.Helper()
+	clearOIDCEnvForTest(t)
+	for _, ctx := range ctxs {
+		if ctx != nil {
+			clearExternalLoginConfig(ctx.GetConfig())
+		}
+	}
+	sharedMu.Lock()
+	shared := sharedSystemSettings
+	sharedMu.Unlock()
+	if shared != nil {
+		clearExternalLoginConfig(shared.ctx.GetConfig())
 	}
 }
 
@@ -55,6 +96,13 @@ func newTestSystemSettings(t *testing.T, apply func(s *SystemSettings)) *SystemS
 	// here so test order is irrelevant.
 	t.Setenv(masterKeyEnv, "0123456789abcdef0123456789abcdef")
 	_, ctx := testutil.NewTestServer()
+	cfg := ctx.GetConfig()
+	origGithub := cfg.Github
+	origGitee := cfg.Gitee
+	t.Cleanup(func() {
+		cfg.Github = origGithub
+		cfg.Gitee = origGitee
+	})
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	db := newSystemSettingDB(ctx)
 	s := NewSystemSettings(ctx, db)
@@ -114,11 +162,7 @@ func TestSystemSettings_LocalLoginOff_DBValueWins(t *testing.T) {
 // 再修复 SSO 配置；管理面写入也按这个语义验证。
 func TestSystemSettings_LocalLoginOff_AutoFalseWhenNoThirdPartyConfigured(t *testing.T) {
 	s := newTestSystemSettings(t, nil)
-	t.Setenv("DM_OIDC_ENABLED", "")
-	s.ctx.GetConfig().Github.ClientID = ""
-	s.ctx.GetConfig().Github.ClientSecret = ""
-	s.ctx.GetConfig().Gitee.ClientID = ""
-	s.ctx.GetConfig().Gitee.ClientSecret = ""
+	disableThirdPartyLoginForTest(t, s.ctx)
 
 	require.NoError(t, s.db.upsert("login", "local_off", "1", settingTypeBool, ""))
 	require.NoError(t, s.Reload())
@@ -134,6 +178,7 @@ func TestSystemSettings_LocalLoginOff_AutoFalseWhenNoThirdPartyConfigured(t *tes
 // "OIDC 启用 但 config 残缺" 也算"无可用第三方登录"。
 func TestSystemSettings_LocalLoginOff_AutoFalseWhenOIDCEnabledButMisconfigured(t *testing.T) {
 	s := newTestSystemSettings(t, nil)
+	disableThirdPartyLoginForTest(t, s.ctx)
 	t.Setenv("DM_OIDC_ENABLED", "true")
 	// 故意只开 ENABLED,不配 issuer / client_id 等必填项。
 	t.Setenv("DM_OIDC_PROVIDER_ISSUER", "")
@@ -141,15 +186,6 @@ func TestSystemSettings_LocalLoginOff_AutoFalseWhenOIDCEnabledButMisconfigured(t
 	t.Setenv("DM_OIDC_PROVIDER_CLIENT_SECRET", "")
 	t.Setenv("DM_OIDC_PROVIDER_REDIRECT_URI", "")
 	t.Setenv("DM_OIDC_RT_ENC_KEY", "")
-	// aegis alias 也清掉,避免 alias 兜底。
-	t.Setenv("DM_OIDC_AEGIS_ISSUER", "")
-	t.Setenv("DM_OIDC_AEGIS_CLIENT_ID", "")
-	t.Setenv("DM_OIDC_AEGIS_CLIENT_SECRET", "")
-	t.Setenv("DM_OIDC_AEGIS_REDIRECT_URI", "")
-	s.ctx.GetConfig().Github.ClientID = ""
-	s.ctx.GetConfig().Github.ClientSecret = ""
-	s.ctx.GetConfig().Gitee.ClientID = ""
-	s.ctx.GetConfig().Gitee.ClientSecret = ""
 
 	require.NoError(t, s.db.upsert("login", "local_off", "1", settingTypeBool, ""))
 	require.NoError(t, s.Reload())
