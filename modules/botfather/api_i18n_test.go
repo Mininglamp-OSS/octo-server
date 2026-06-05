@@ -8,7 +8,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
@@ -31,12 +30,13 @@ func httperrLWS(c *wkhttp.Context, code codes.Code) {
 // intentionally allowed. Success writes (c.JSON(http.StatusOK,...), c.Response,
 // c.Redirect, c.String) are allowed; only NON-OK c.JSON(...) is banned.
 //
-// Known exemption (tracked as a follow-up, outside D23): getEvents still emits
-// an HTTP-200 in-band error via c.Response(gin.H{"status":0,"msg":err.Error()}),
-// which is not an error *response* (wire 200) and so is not bannable here.
+// After the /v1/bot/* handlers moved to modules/bot_api (#277/#278), the only
+// migrated live HTTP surface left in botfather is Robot Apply (api_apply.go) and
+// User Bot management (api_user.go); api.go now carries only doc/init code with
+// no error responses.
 func TestBotfatherNoLegacyResponseError(t *testing.T) {
 	files := []string{
-		"api.go", "api_bot.go", "api_apply.go", "api_user.go", "api_bot_thread.go",
+		"api_apply.go", "api_user.go",
 	}
 	banned := []string{
 		".ResponseError(",
@@ -101,10 +101,6 @@ func i18nHelperHarness(probe func(c *wkhttp.Context)) *wkhttp.WKHttp {
 }
 
 func TestRespondBotfatherHelpers(t *testing.T) {
-	// bf carries only a logger — enough for the helpers that log (identity
-	// guard) without standing up DB / redis / IM.
-	bf := &BotFather{Log: log.NewTLog("BotFather-i18n-test")}
-
 	cases := []struct {
 		name            string
 		probe           func(c *wkhttp.Context)
@@ -134,33 +130,7 @@ func TestRespondBotfatherHelpers(t *testing.T) {
 			wantContains:    "数据格式有误",
 			wantDetails:     map[string]any{},
 		},
-		{
-			name:            "respondBotfatherContentTooLarge surfaces field + max_bytes",
-			probe:           func(c *wkhttp.Context) { respondBotfatherContentTooLarge(c, "content", 4096) },
-			wantCodeID:      "err.server.botfather.content_too_large",
-			wantSemStatus:   http.StatusBadRequest,
-			wantTransStatus: http.StatusBadRequest,
-			wantContains:    "内容大小超过限制",
-			wantDetails:     map[string]any{"field": "content", "max_bytes": float64(4096)},
-		},
-		{
-			name:            "respondBotfatherFileTooLarge surfaces the MB cap",
-			probe:           func(c *wkhttp.Context) { respondBotfatherFileTooLarge(c, 100) },
-			wantCodeID:      "err.server.botfather.file_too_large",
-			wantSemStatus:   http.StatusBadRequest,
-			wantTransStatus: http.StatusBadRequest,
-			wantContains:    "文件大小超过限制",
-			wantDetails:     map[string]any{"max_mb": float64(100)},
-		},
 		// ---- direct business codes: 400 / 403 / 404 / 409 (D14, wire 400) ----
-		{
-			name:            "ErrBotfatherBotNotGroupMember 403 semantic, wire 400",
-			probe:           func(c *wkhttp.Context) { httperrL(c, errcode.ErrBotfatherBotNotGroupMember) },
-			wantCodeID:      "err.server.botfather.bot_not_group_member",
-			wantSemStatus:   http.StatusForbidden,
-			wantTransStatus: http.StatusBadRequest,
-			wantContains:    "机器人不是该群成员",
-		},
 		{
 			name:            "ErrBotfatherNotOwner 403 semantic, wire 400",
 			probe:           func(c *wkhttp.Context) { httperrL(c, errcode.ErrBotfatherNotOwner) },
@@ -168,22 +138,6 @@ func TestRespondBotfatherHelpers(t *testing.T) {
 			wantSemStatus:   http.StatusForbidden,
 			wantTransStatus: http.StatusBadRequest,
 			wantContains:    "你不是该 AI 的 Owner",
-		},
-		{
-			name:            "ErrBotfatherMessageEditForbidden 403 semantic, wire 400",
-			probe:           func(c *wkhttp.Context) { httperrL(c, errcode.ErrBotfatherMessageEditForbidden) },
-			wantCodeID:      "err.server.botfather.message_edit_forbidden",
-			wantSemStatus:   http.StatusForbidden,
-			wantTransStatus: http.StatusBadRequest,
-			wantContains:    "只能编辑自己发送的消息",
-		},
-		{
-			name:            "ErrBotfatherMemberNotHuman 400",
-			probe:           func(c *wkhttp.Context) { httperrL(c, errcode.ErrBotfatherMemberNotHuman) },
-			wantCodeID:      "err.server.botfather.member_not_human",
-			wantSemStatus:   http.StatusBadRequest,
-			wantTransStatus: http.StatusBadRequest,
-			wantContains:    "只能通过机器人 API 添加真人成员",
 		},
 		{
 			name:            "ErrBotfatherRobotNotFound 404 semantic, wire 400",
@@ -228,33 +182,6 @@ func TestRespondBotfatherHelpers(t *testing.T) {
 			wantContains:    "服务器内部错误",
 			wantNotContains: "update data",
 		},
-		{
-			name:            "ErrBotfatherSendFailed collapses to shared internal copy",
-			probe:           func(c *wkhttp.Context) { httperrL(c, errcode.ErrBotfatherSendFailed) },
-			wantCodeID:      "err.server.botfather.send_failed",
-			wantSemStatus:   http.StatusInternalServerError,
-			wantTransStatus: http.StatusBadRequest,
-			wantContains:    "服务器内部错误",
-			wantNotContains: "send the message",
-		},
-		{
-			name:            "ErrBotfatherUploadFailed collapses to shared internal copy",
-			probe:           func(c *wkhttp.Context) { httperrL(c, errcode.ErrBotfatherUploadFailed) },
-			wantCodeID:      "err.server.botfather.upload_failed",
-			wantSemStatus:   http.StatusInternalServerError,
-			wantTransStatus: http.StatusBadRequest,
-			wantContains:    "服务器内部错误",
-			wantNotContains: "process the file",
-		},
-		{
-			name:            "ErrBotfatherIMTokenFailed collapses to shared internal copy",
-			probe:           func(c *wkhttp.Context) { httperrL(c, errcode.ErrBotfatherIMTokenFailed) },
-			wantCodeID:      "err.server.botfather.im_token_failed",
-			wantSemStatus:   http.StatusInternalServerError,
-			wantTransStatus: http.StatusBadRequest,
-			wantContains:    "服务器内部错误",
-			wantNotContains: "IM token",
-		},
 		// ---- status-preserving middleware helpers (real wire status) ---------
 		{
 			name:            "respondBotfatherAuthFailed preserves 401 (external adapters)",
@@ -264,23 +191,7 @@ func TestRespondBotfatherHelpers(t *testing.T) {
 			wantTransStatus: http.StatusUnauthorized,
 			wantContains:    "机器人认证失败",
 		},
-		{
-			name:            "respondBotfatherBotNotGroupMember preserves 403",
-			probe:           respondBotfatherBotNotGroupMember,
-			wantCodeID:      "err.server.botfather.bot_not_group_member",
-			wantSemStatus:   http.StatusForbidden,
-			wantTransStatus: http.StatusForbidden,
-			wantContains:    "机器人不是该群成员",
-		},
-		{
-			name:            "respondBotfatherBotNotGroupAdmin preserves 403",
-			probe:           respondBotfatherBotNotGroupAdmin,
-			wantCodeID:      "err.server.botfather.bot_not_group_admin",
-			wantSemStatus:   http.StatusForbidden,
-			wantTransStatus: http.StatusForbidden,
-			wantContains:    "机器人不是该群管理员",
-		},
-		// ---- status-preserving direct codes (User-API + getUserInfo) ---------
+		// ---- status-preserving direct codes (User-API) -----------------------
 		{
 			name:            "respondBotfatherUsernameTaken preserves 409 + username detail",
 			probe:           func(c *wkhttp.Context) { respondBotfatherUsernameTaken(c, "demo_bot") },
@@ -306,14 +217,6 @@ func TestRespondBotfatherHelpers(t *testing.T) {
 			wantTransStatus: http.StatusForbidden,
 			wantContains:    "该 Bot 不属于当前 Space",
 		},
-		{
-			name:            "ErrBotfatherUserNotFound preserves 404",
-			probe:           func(c *wkhttp.Context) { httperrLWS(c, errcode.ErrBotfatherUserNotFound) },
-			wantCodeID:      "err.server.botfather.user_not_found",
-			wantSemStatus:   http.StatusNotFound,
-			wantTransStatus: http.StatusNotFound,
-			wantContains:    "用户不存在",
-		},
 		// ---- shared auth-required (apply login guard, wire 400 D14) -----------
 		{
 			name:            "ErrSharedAuthRequired 401 semantic, wire 400",
@@ -322,16 +225,6 @@ func TestRespondBotfatherHelpers(t *testing.T) {
 			wantSemStatus:   http.StatusUnauthorized,
 			wantTransStatus: http.StatusBadRequest,
 			wantContains:    "请先登录",
-		},
-		// ---- defensive identity guard ----------------------------------------
-		{
-			name:            "respondBotfatherIdentityMissing renders generic internal, no leak",
-			probe:           func(c *wkhttp.Context) { bf.respondBotfatherIdentityMissing(c) },
-			wantCodeID:      "err.server.botfather.query_failed",
-			wantSemStatus:   http.StatusInternalServerError,
-			wantTransStatus: http.StatusBadRequest,
-			wantContains:    "服务器内部错误",
-			wantNotContains: "query data",
 		},
 	}
 
