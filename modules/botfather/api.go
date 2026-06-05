@@ -980,9 +980,13 @@ func (bf *BotFather) getEvents(c *wkhttp.Context) {
 
 	results, err := bf.getEventsResult(robotID, req.EventID, limit)
 	if err != nil {
+		// Wire-200 in-band error shape kept for bot-adapter long-poll
+		// compatibility (outside the D23 envelope); the underlying cause is
+		// logged, never returned, so err.Error() no longer leaks to adapters.
+		bf.Error("getEvents failed", zap.Error(err))
 		c.Response(gin.H{
 			"status": 0,
-			"msg":    err.Error(),
+			"msg":    "failed to fetch events",
 		})
 		return
 	}
