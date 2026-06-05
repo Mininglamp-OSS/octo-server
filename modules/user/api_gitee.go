@@ -16,6 +16,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	common "github.com/Mininglamp-OSS/octo-server/modules/common"
+	"github.com/Mininglamp-OSS/octo-server/pkg/avatarversion"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/gin-gonic/gin"
 	"github.com/opentracing/opentracing-go"
@@ -184,7 +185,7 @@ func (u *User) giteeOAuth(c *wkhttp.Context) {
 			imgReader, _ := u.fileService.DownloadImage(userInfo.AvatarURL, timeoutCtx)
 			cancel()
 			if imgReader != nil {
-				avatarVersion := time.Now().UnixNano()
+				avatarVersion := avatarversion.New()
 				_, err = u.fileService.UploadFile(userAvatarFilePath(uid, u.ctx.GetConfig().Avatar.Partition, avatarVersion), "image/png", "", func(w io.Writer) error {
 					_, err := io.Copy(w, imgReader)
 					return err

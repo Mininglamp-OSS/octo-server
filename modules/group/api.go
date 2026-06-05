@@ -29,6 +29,7 @@ import (
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
+	"github.com/Mininglamp-OSS/octo-server/pkg/avatarversion"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
@@ -454,7 +455,7 @@ func (g *Group) avatarUpload(c *wkhttp.Context) {
 		return
 	}
 
-	avatarVersion := time.Now().UnixNano()
+	avatarVersion := avatarversion.New()
 	groupAvatarPath := g.ctx.GetConfig().GetGroupAvatarFilePath(groupNo, avatarVersion)
 	_, err = g.fileService.UploadFile(groupAvatarPath, "image/png", "", func(w io.Writer) error {
 		_, err := io.Copy(w, file)

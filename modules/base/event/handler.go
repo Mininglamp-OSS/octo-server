@@ -9,6 +9,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/pool"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-server/pkg/avatarversion"
 	"go.uber.org/zap"
 )
 
@@ -188,7 +189,7 @@ func (e *Event) handleGroupAvatarUpdateEvent(model *Model) {
 				}
 				downloadURLs = append(downloadURLs, fmt.Sprintf("%s/users/%s/avatar?v=%d", e.ctx.GetConfig().External.APIBaseURL, member, time.Now().UnixNano()))
 			}
-			avatarVersion := time.Now().UnixNano()
+			avatarVersion := avatarversion.New()
 			uploadPath := e.ctx.GetConfig().GetGroupAvatarFilePath(req.GroupNo, avatarVersion)
 			_, err = e.fileService.DownloadAndMakeCompose(uploadPath, downloadURLs)
 			if err != nil {

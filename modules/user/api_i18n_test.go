@@ -107,6 +107,38 @@ func TestMigratedUserFilesNoLegacyResponseError(t *testing.T) {
 	}
 }
 
+func TestUploadAvatarPostCommitNotificationFailuresRespondOK(t *testing.T) {
+	data, err := os.ReadFile("api.go")
+	if err != nil {
+		t.Fatalf("read api.go: %v", err)
+	}
+	source := string(data)
+	start := strings.Index(source, "func (u *User) uploadAvatar")
+	if start < 0 {
+		t.Fatalf("locate uploadAvatar in api.go")
+	}
+	end := strings.Index(source[start:], "\n// 获取用户的IM连接地址")
+	if end < 0 {
+		t.Fatalf("locate end of uploadAvatar in api.go")
+	}
+	body := source[start : start+end]
+
+	for _, marker := range []string{"查询用户好友失败", "发送个人头像更新命令失败"} {
+		idx := strings.Index(body, marker)
+		if idx < 0 {
+			t.Fatalf("uploadAvatar missing post-commit notification branch %q", marker)
+		}
+		after := body[idx:]
+		returnIdx := strings.Index(after, "return")
+		if returnIdx < 0 {
+			t.Fatalf("uploadAvatar branch %q has no return", marker)
+		}
+		if !strings.Contains(after[:returnIdx], "c.ResponseOK()") {
+			t.Fatalf("uploadAvatar branch %q must respond OK after avatar DB update has committed", marker)
+		}
+	}
+}
+
 // helperHarness mounts a single GET /probe route that invokes the supplied
 // helper. Tests exercise the helper directly without paying the DB / auth
 // setup cost — the contract we care about is what the wkhttp envelope

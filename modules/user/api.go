@@ -21,6 +21,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/model"
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/source"
+	"github.com/Mininglamp-OSS/octo-server/pkg/avatarversion"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	rd "github.com/go-redis/redis"
@@ -634,7 +635,7 @@ func (u *User) uploadAvatar(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserFileOperationFailed)
 		return
 	}
-	avatarVersion := time.Now().UnixNano()
+	avatarVersion := avatarversion.New()
 	avatarPath := userAvatarFilePath(targetUID, u.ctx.GetConfig().Avatar.Partition, avatarVersion)
 	_, err = u.fileService.UploadFile(avatarPath, "image/png", "", func(w io.Writer) error {
 		_, err := io.Copy(w, file)
@@ -655,7 +656,8 @@ func (u *User) uploadAvatar(c *wkhttp.Context) {
 	}
 	friends, err := u.friendDB.QueryFriends(targetUID)
 	if err != nil {
-		u.Error("查询用户好友失败")
+		u.Error("查询用户好友失败", zap.String("uid", targetUID), zap.Error(err))
+		c.ResponseOK()
 		return
 	}
 	if len(friends) > 0 {
@@ -672,7 +674,8 @@ func (u *User) uploadAvatar(c *wkhttp.Context) {
 			},
 		})
 		if err != nil {
-			u.Error("发送个人头像更新命令失败！")
+			u.Error("发送个人头像更新命令失败！", zap.String("uid", targetUID), zap.Error(err))
+			c.ResponseOK()
 			return
 		}
 	}
@@ -1324,7 +1327,7 @@ func (u *User) wxLogin(c *wkhttp.Context) {
 			imgReader, _ := u.fileService.DownloadImage(headimgurl, timeoutCtx)
 			cancel()
 			if imgReader != nil {
-				avatarVersion := time.Now().UnixNano()
+				avatarVersion := avatarversion.New()
 				_, err = u.fileService.UploadFile(userAvatarFilePath(uid, u.ctx.GetConfig().Avatar.Partition, avatarVersion), "image/png", "", func(w io.Writer) error {
 					_, err := io.Copy(w, imgReader)
 					return err

@@ -44,4 +44,3 @@ CALL __group_avatar_version_down();
 -- +migrate StatementBegin
 DROP PROCEDURE IF EXISTS __group_avatar_version_down;
 -- +migrate StatementEnd
-
