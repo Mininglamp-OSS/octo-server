@@ -278,8 +278,9 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 		v.POST("/user/login/check_phone", loginLimit, u.loginCheckPhone)           //登录验证设备手机号
 
 		// #################### Token / Bot 认证验证（供 Gateway 调用） ####################
-		v.POST("/auth/verify", verifyLimit, u.authVerifyToken)   // 验证用户 token
-		v.POST("/auth/verify-bot", verifyLimit, u.authVerifyBot) // 验证 Bot API Key
+		v.POST("/auth/verify", verifyLimit, u.authVerifyToken)         // 验证用户 token
+		v.POST("/auth/verify-bot", verifyLimit, u.authVerifyBot)       // 验证 Bot API Key
+		v.POST("/auth/verify-api-key", verifyLimit, u.authVerifyAPIKey) // 验证 daemon API Key (uk_)
 		// ↑ Verify endpoints are rate-limited (1000 req/min/IP). For production,
 		// restrict access at network level (nginx allow internal IPs only) or
 		// add X-Internal-Key header validation.
@@ -3901,5 +3902,68 @@ func (u *User) authVerifyBot(c *wkhttp.Context) {
 		OwnerUID:  botInfo.CreatorUID,
 		OwnerName: ownerName,
 		SpaceID:   spaceID,
+	})
+}
+
+type authVerifyAPIKeyReq struct {
+	APIKey string `json:"api_key"`
+}
+
+type authVerifyAPIKeyResp struct {
+	UID     string `json:"uid"`
+	SpaceID string `json:"space_id"`
+}
+
+// authVerifyAPIKey validates a daemon API key (uk_ prefix) and returns the
+// bound user + space. Used by fleet/matter AuthMiddleware to verify api_key
+// Bearer tokens (合并 plan §3).
+//
+// Returns 200 + {uid, space_id} on success. Returns 401 for any failure
+// (not found / legacy space_id='' / owner left space) — error reason is
+// intentionally not surfaced to reduce info leakage; logs carry detail.
+//
+// space_id='' is explicitly rejected (合并 plan §3 Legacy data migration).
+// BotFather /connect 历史上允许 space=='' 的 legacy 路径产生此类 api_key;
+// 决策二信任模型要求 api_key 必须 user-space 级别, 不再支持无 space 绑定。
+func (u *User) authVerifyAPIKey(c *wkhttp.Context) {
+	var req authVerifyAPIKeyReq
+	if err := c.BindJSON(&req); err != nil {
+		u.Warn("authVerifyAPIKey 请求体格式错误", zap.Error(err))
+		respondUserRequestInvalid(c, "")
+		return
+	}
+	if req.APIKey == "" {
+		respondUserTokenRequired(c, "api_key")
+		return
+	}
+
+	// Step 1: lookup api_key, reject legacy space_id=''.
+	var keyInfo struct {
+		UID     string `db:"uid"`
+		SpaceID string `db:"space_id"`
+	}
+	_, err := u.db.session.Select("uid", "space_id").From("user_api_key").
+		Where("api_key=? AND space_id!=''", req.APIKey).
+		Load(&keyInfo)
+	if err != nil || keyInfo.UID == "" {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "invalid api_key"})
+		return
+	}
+
+	// Step 2: assert owner still member of space (撤销 = 退 space, 同
+	// resolveAPIKey 现有语义).
+	var n int
+	err = u.db.session.SelectBySql(
+		"SELECT COUNT(*) FROM space_member WHERE space_id=? AND uid=? AND status=1",
+		keyInfo.SpaceID, keyInfo.UID,
+	).LoadOne(&n)
+	if err != nil || n == 0 {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "invalid api_key"})
+		return
+	}
+
+	c.Response(authVerifyAPIKeyResp{
+		UID:     keyInfo.UID,
+		SpaceID: keyInfo.SpaceID,
 	})
 }
