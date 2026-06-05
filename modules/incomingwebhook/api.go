@@ -73,6 +73,9 @@ type IncomingWebhook struct {
 	// 抢连接池。同步回落则会让每个请求 goroutine 各占一条连接，在限流全 fail-open、请求
 	// 并发本身无界时重新压垮连接池——正是这个信号量要避免的（yujiawei review P2）。
 	auditSem chan struct{}
+	// floor 是 push 端点的 Redis-independent 进程级限流地板：两个 Redis 限流器在
+	// Redis 故障时 fail-open，floor 用纯内存令牌桶兜底，保证单实例推送速率始终有界。
+	floor *localFloor
 }
 
 // maxConcurrentAudit 限制异步审计 goroutine 的最大并发数（默认值，可被 env 覆盖）。
@@ -103,6 +106,9 @@ func sharedRateRedis(cfg *config.Config) *redis.Client {
 		// （AWS ElastiCache / Azure Cache 等托管 TLS Redis）TLSConfig 不被遗漏。
 		// 否则限流 client 连不上 TLS-only Redis，per-IP / per-webhook 两个限流器
 		// 都会 fail-open，未认证 push 端点的反扫描/防洪泛保护被静默关闭。
+		// PoolSize 显式设 10：令牌桶 Lua 脚本是短事务，与 main.go / user / group /
+		// space / integration 等其它限流 client 的全局约定保持一致。Redis 故障/连接池
+		// 打满导致 fail-open 的兜底由进程内 localFloor 负责，不在此处放大连接池。
 		rateRedisClient = redis.NewClient(octoredis.MustBuildOptions(cfg, func(o *redis.Options) {
 			o.MaxRetries = 1
 			o.PoolSize = 10
@@ -120,6 +126,7 @@ func New(ctx *config.Context) *IncomingWebhook {
 		groupDB:   group.NewDB(ctx),
 		rateRedis: sharedRateRedis(ctx.GetConfig()),
 		auditSem:  make(chan struct{}, auditConcurrency()),
+		floor:     newLocalFloor(),
 	}
 	// 群解散级联禁用所有 webhook
 	w.ctx.AddEventListener(event.GroupDisband, w.handleGroupDisband)
@@ -145,9 +152,12 @@ func (w *IncomingWebhook) Route(r *wkhttp.WKHttp) {
 	ipBurst := wkhttp.ParseBurstFromEnv(envIngressIPBurst, defaultIngressIPBurst)
 	ipLimit := r.StrictIPRateLimitMiddleware(context.Background(), w.rateRedis, "incoming_webhook", ipRPS, ipBurst)
 
+	// 中间件顺序：localFloorMiddleware（纯内存、最廉价、不依赖 Redis）在前，先于
+	// Redis IP 限流挡住洪峰；ipLimit（Redis）次之。这样 Redis 故障/连接池打满时，
+	// 进程级地板仍能限速，避免对 DB + WuKongIM 的洪泛放大。
 	push := r.Group("/v1")
 	{
-		push.POST("/incoming-webhooks/:webhook_id/:token", ipLimit, w.push)
+		push.POST("/incoming-webhooks/:webhook_id/:token", w.localFloorMiddleware(), ipLimit, w.push)
 	}
 }
 

@@ -551,6 +551,39 @@ func TestPush_PerWebhookRateLimitIsPerWebhook(t *testing.T) {
 		"wh2 must not be limited by wh1's bucket; got %d body=%s", w.Code, w.Body.String())
 }
 
+// TestPush_LocalFloorRateLimits_RedisIndependent verifies the process-local
+// push floor caps the public endpoint on its own. The Redis-backed per-webhook
+// and per-IP limiters are left at their generous defaults (5/10 and 30/60), so
+// they would NOT reject these few calls — the 429 therefore comes from the
+// in-memory floor, which is exactly the protection that survives a Redis outage
+// (where both Redis limiters fail open). Floor burst is tightened to 2 via env.
+func TestPush_LocalFloorRateLimits_RedisIndependent(t *testing.T) {
+	t.Setenv("DM_INCOMINGWEBHOOK_LOCAL_BURST", "2")
+	t.Setenv("DM_INCOMINGWEBHOOK_LOCAL_RPS", "0.01") // ~never refills within the test
+
+	handler, _, groupNo := setupTestEnv(t)
+	w := do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), map[string]interface{}{
+		"name": "x",
+	}))
+	created := parseJSON(t, w)
+	whID := created["webhook_id"].(string)
+	token := created["token"].(string)
+
+	body, _ := json.Marshal(pushReq{Content: "hi"})
+	url := fmt.Sprintf("/v1/incoming-webhooks/%s/%s", whID, token)
+
+	// First two consume the floor burst (not rate-limited; result may be 200/502
+	// depending on WuKongIM, the point is only that they pass the floor).
+	for i := 0; i < 2; i++ {
+		w = do(handler, anonReq("POST", url, body))
+		assert.NotEqualf(t, http.StatusTooManyRequests, w.Code, "i=%d body=%s", i, w.Body.String())
+	}
+	// Third exceeds the floor → 429, despite the Redis per-webhook limiter (10
+	// burst) still having capacity. Proves the floor is an independent ceiling.
+	w = do(handler, anonReq("POST", url, body))
+	assert.Equalf(t, http.StatusTooManyRequests, w.Code, "local floor must 429 after its burst; body=%s", w.Body.String())
+}
+
 func TestPush_RegenerateInvalidatesOldToken(t *testing.T) {
 	handler, _, groupNo := setupTestEnv(t)
 	w := do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), map[string]interface{}{
