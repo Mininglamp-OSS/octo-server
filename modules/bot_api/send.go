@@ -685,7 +685,12 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 			return
 		}
 		isFriend, fErr := ba.userService.IsFriend(robotID, req.ChannelID)
-		if fErr != nil || !isFriend {
+		if fErr != nil {
+			ba.Error("verify app bot friend failed", zap.Error(fErr), zap.String("robotID", robotID), zap.String("channelID", req.ChannelID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+			return
+		}
+		if !isFriend {
 			httperr.ResponseErrorL(c, errcode.ErrBotAPIConversationNotStarted, nil, nil)
 			return
 		}

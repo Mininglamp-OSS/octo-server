@@ -488,7 +488,12 @@ func (ba *BotAPI) botGroupUpdate(c *wkhttp.Context) {
 	}
 
 	isBotAdmin, err := ba.groupService.IsBotAdmin(groupNo, robotID)
-	if err != nil || !isBotAdmin {
+	if err != nil {
+		ba.Error("check bot admin failed", zap.Error(err), zap.String("groupNo", groupNo), zap.String("robotID", robotID))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+		return
+	}
+	if !isBotAdmin {
 		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPINotGroupAdmin, nil, nil)
 		return
 	}
@@ -622,7 +627,12 @@ func (ba *BotAPI) botGroupMemberRemove(c *wkhttp.Context) {
 	}
 
 	isBotAdmin, err := ba.groupService.IsBotAdmin(groupNo, robotID)
-	if err != nil || !isBotAdmin {
+	if err != nil {
+		ba.Error("check bot admin failed", zap.Error(err), zap.String("groupNo", groupNo), zap.String("robotID", robotID))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+		return
+	}
+	if !isBotAdmin {
 		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPINotGroupAdmin, nil, nil)
 		return
 	}

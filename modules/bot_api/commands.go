@@ -76,7 +76,7 @@ func (ba *BotAPI) getUserInfo(c *wkhttp.Context) {
 	userResp, err := ba.userService.GetUser(bareUID)
 	if err != nil {
 		ba.Error("query user info failed", zap.Error(err), zap.String("uid", bareUID))
-		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIQueryFailed, nil, nil)
 		return
 	}
 	if userResp == nil {
