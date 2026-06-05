@@ -207,6 +207,17 @@ func (d *DB) UpdateUsersWithField(field string, value string, uid string) error 
 	return err
 }
 
+// UpdateAvatarUploadStatus marks a user avatar as uploaded and stores the
+// server-side object-key version used to avoid CDN query-string cache-key
+// dependencies.
+func (d *DB) UpdateAvatarUploadStatus(uid string, avatarVersion int64) error {
+	_, err := d.session.Update("user").SetMap(map[string]interface{}{
+		"is_upload_avatar": 1,
+		"avatar_version":   avatarVersion,
+	}).Where("uid=?", uid).Exec()
+	return err
+}
+
 // UpdateUsersWithFieldTx 修改用户基本资料（事务版本）
 func (d *DB) UpdateUsersWithFieldTx(field string, value string, uid string, tx *dbr.Tx) error {
 	if !allowedUpdateFields[field] {
@@ -489,23 +500,24 @@ type Model struct {
 	ShockOn           int    //震动0.否1.是
 	OfflineProtection int    // 离线保护
 	Version           int64
-	Status            int    // 状态 0.禁用 1.启用
-	Vercode           string //验证码
-	QRVercode         string // 二维码验证码
-	IsUploadAvatar    int    // 是否上传过头像0:未上传1:已上传
-	Role              string // 角色 admin/superAdmin
-	Robot             int    // 机器人0.否1.是
-	MuteOfApp         int    // app是否禁音（当pc登录的时候app可以设置禁音，当pc登录后有效）
-	IsDestroy         int           // 注销状态 0.正常 1.注销申请中（冷静期） 2.已注销
-	DestroyApplyAt    dbr.NullTime  // 注销申请时间
-	DestroyExpireAt   dbr.NullTime  // 注销到期执行时间
-	WXOpenid          string // 微信openid
-	WXUnionid         string // 微信unionid
-	GiteeUID          string // gitee uid
-	GithubUID         string // github uid
-	Web3PublicKey     string // web3公钥
-	MsgExpireSecond   int64  // 消息过期时长
-	Language          string // 用户语言偏好（BCP 47，空表示沿用 OCTO_DEFAULT_LANGUAGE）
+	Status            int          // 状态 0.禁用 1.启用
+	Vercode           string       //验证码
+	QRVercode         string       // 二维码验证码
+	IsUploadAvatar    int          // 是否上传过头像0:未上传1:已上传
+	AvatarVersion     int64        // 头像对象版本，0 表示旧版稳定路径
+	Role              string       // 角色 admin/superAdmin
+	Robot             int          // 机器人0.否1.是
+	MuteOfApp         int          // app是否禁音（当pc登录的时候app可以设置禁音，当pc登录后有效）
+	IsDestroy         int          // 注销状态 0.正常 1.注销申请中（冷静期） 2.已注销
+	DestroyApplyAt    dbr.NullTime // 注销申请时间
+	DestroyExpireAt   dbr.NullTime // 注销到期执行时间
+	WXOpenid          string       // 微信openid
+	WXUnionid         string       // 微信unionid
+	GiteeUID          string       // gitee uid
+	GithubUID         string       // github uid
+	Web3PublicKey     string       // web3公钥
+	MsgExpireSecond   int64        // 消息过期时长
+	Language          string       // 用户语言偏好（BCP 47，空表示沿用 OCTO_DEFAULT_LANGUAGE）
 	db.BaseModel
 }
 

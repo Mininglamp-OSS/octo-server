@@ -6,7 +6,7 @@ require (
 	firebase.google.com/go/v4 v4.13.0
 	github.com/BurntSushi/toml v1.6.0
 	github.com/DATA-DOG/go-sqlmock v1.5.0
-	github.com/Mininglamp-OSS/octo-lib v0.0.0-20260602143311-8c26a826e07b
+	github.com/Mininglamp-OSS/octo-lib v0.0.0-20260605071834-330ed3ce7e6a
 	github.com/alibabacloud-go/darabonba-openapi v0.2.1
 	github.com/alibabacloud-go/sms-intl-20180501 v1.0.1
 	github.com/alibabacloud-go/tea v1.2.1

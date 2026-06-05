@@ -514,8 +514,7 @@ func (u *User) UserAvatar(c *wkhttp.Context) {
 	ph := ""
 	downloadUrl := ""
 	if userInfo.IsUploadAvatar == 1 {
-		avatarID := crc32.ChecksumIEEE([]byte(uid)) % uint32(u.ctx.GetConfig().Avatar.Partition)
-		ph = fmt.Sprintf("/avatar/%d/%s.png", avatarID, uid)
+		ph = userAvatarFilePath(uid, u.ctx.GetConfig().Avatar.Partition, userInfo.AvatarVersion)
 	} else {
 		// 配置使用本地默认头像
 		if u.ctx.GetConfig().Avatar.Default != "" && strings.TrimSpace(u.ctx.GetConfig().Avatar.DefaultBaseURL) == "" {
@@ -635,8 +634,9 @@ func (u *User) uploadAvatar(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserFileOperationFailed)
 		return
 	}
-	avatarID := crc32.ChecksumIEEE([]byte(targetUID)) % uint32(u.ctx.GetConfig().Avatar.Partition)
-	_, err = u.fileService.UploadFile(fmt.Sprintf("avatar/%d/%s.png", avatarID, targetUID), "image/png", "", func(w io.Writer) error {
+	avatarVersion := time.Now().UnixNano()
+	avatarPath := userAvatarFilePath(targetUID, u.ctx.GetConfig().Avatar.Partition, avatarVersion)
+	_, err = u.fileService.UploadFile(avatarPath, "image/png", "", func(w io.Writer) error {
 		_, err := io.Copy(w, file)
 		return err
 	})
@@ -644,6 +644,13 @@ func (u *User) uploadAvatar(c *wkhttp.Context) {
 	if err != nil {
 		u.Error("上传文件失败！", zap.Error(err))
 		respondUserError(c, errcode.ErrUserFileOperationFailed)
+		return
+	}
+	// 更改用户上传头像状态和服务端版本；CMD 在 DB 成功后再发送，避免客户端收到通知后仍读到旧 path。
+	err = u.db.UpdateAvatarUploadStatus(targetUID, avatarVersion)
+	if err != nil {
+		u.Error("修改用户头像版本错误！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
 	friends, err := u.friendDB.QueryFriends(targetUID)
@@ -668,13 +675,6 @@ func (u *User) uploadAvatar(c *wkhttp.Context) {
 			u.Error("发送个人头像更新命令失败！")
 			return
 		}
-	}
-	//更改用户上传头像状态
-	err = u.db.UpdateUsersWithField("is_upload_avatar", "1", targetUID)
-	if err != nil {
-		u.Error("修改用户是否修改头像错误！", zap.Error(err))
-		respondUserError(c, errcode.ErrUserStoreFailed)
-		return
 	}
 	c.ResponseOK()
 }
@@ -1324,8 +1324,8 @@ func (u *User) wxLogin(c *wkhttp.Context) {
 			imgReader, _ := u.fileService.DownloadImage(headimgurl, timeoutCtx)
 			cancel()
 			if imgReader != nil {
-				avatarID := crc32.ChecksumIEEE([]byte(uid)) % uint32(u.ctx.GetConfig().Avatar.Partition)
-				_, err = u.fileService.UploadFile(fmt.Sprintf("avatar/%d/%s.png", avatarID, uid), "image/png", "", func(w io.Writer) error {
+				avatarVersion := time.Now().UnixNano()
+				_, err = u.fileService.UploadFile(userAvatarFilePath(uid, u.ctx.GetConfig().Avatar.Partition, avatarVersion), "image/png", "", func(w io.Writer) error {
 					_, err := io.Copy(w, imgReader)
 					return err
 				})
@@ -1335,6 +1335,7 @@ func (u *User) wxLogin(c *wkhttp.Context) {
 					// c.ResponseError(errors.New("上传文件失败！"))
 					// return
 					model.IsUploadAvatar = 1
+					model.AvatarVersion = avatarVersion
 				}
 			}
 		}
@@ -3409,6 +3410,7 @@ func (u *User) createUserWithRespAndTx(registerSpanCtx context.Context, createUs
 	userModel.VoiceOn = 1
 	userModel.ShockOn = 1
 	userModel.IsUploadAvatar = createUser.IsUploadAvatar
+	userModel.AvatarVersion = createUser.AvatarVersion
 	userModel.WXOpenid = createUser.WXOpenid
 	userModel.WXUnionid = createUser.WXUnionid
 	userModel.GiteeUID = createUser.GiteeUID
@@ -3535,6 +3537,7 @@ type createUserModel struct {
 	Username       string
 	Flag           int
 	IsUploadAvatar int
+	AvatarVersion  int64
 	Device         *deviceReq
 }
 

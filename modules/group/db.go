@@ -302,9 +302,10 @@ func (d *DB) Update(model *Model) error {
 	return err
 }
 
-func (d *DB) updateAvatar(avatar string, groupNo string) error {
+func (d *DB) updateAvatar(avatar string, avatarVersion int64, groupNo string) error {
 	_, err := d.session.Update("group").SetMap(map[string]interface{}{
 		"avatar":           avatar,
+		"avatar_version":   avatarVersion,
 		"is_upload_avatar": 1,
 	}).Where("group_no=?", groupNo).Exec()
 	return err
@@ -557,6 +558,8 @@ type Model struct {
 	GroupType                int        // 群类型 0.普通群 1.超大群
 	Name                     string     // 群名称
 	Avatar                   string     // 群头像
+	AvatarVersion            int64      // 群头像对象版本，0 表示旧版稳定路径
+	IsUploadAvatar           int        // 群头像是否已经被用户上传
 	Notice                   string     // 群公告
 	Creator                  string     // 创建者uid
 	Status                   int        // 群状态

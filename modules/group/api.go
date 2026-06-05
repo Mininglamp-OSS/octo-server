@@ -388,7 +388,17 @@ func (g *Group) avatarGet(c *wkhttp.Context) {
 		c.Writer.Write(avatarBytes)
 		return
 	}
-	path := g.ctx.GetConfig().GetGroupAvatarFilePath(groupNo)
+	var avatarVersion int64
+	groupInfo, err := g.db.QueryWithGroupNo(groupNo)
+	if err != nil {
+		g.Error("查询群资料错误", zap.String("group_no", groupNo), zap.Error(err))
+		c.Writer.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	if groupInfo != nil {
+		avatarVersion = groupInfo.AvatarVersion
+	}
+	path := g.ctx.GetConfig().GetGroupAvatarFilePath(groupNo, avatarVersion)
 	downloadUrl, err := g.fileService.DownloadURL(path, "")
 	if err != nil {
 		g.Error("获取下载路径失败！", zap.Error(err))
@@ -444,7 +454,8 @@ func (g *Group) avatarUpload(c *wkhttp.Context) {
 		return
 	}
 
-	groupAvatarPath := g.ctx.GetConfig().GetGroupAvatarFilePath(groupNo)
+	avatarVersion := time.Now().UnixNano()
+	groupAvatarPath := g.ctx.GetConfig().GetGroupAvatarFilePath(groupNo, avatarVersion)
 	_, err = g.fileService.UploadFile(groupAvatarPath, "image/png", "", func(w io.Writer) error {
 		_, err := io.Copy(w, file)
 		return err
@@ -454,7 +465,7 @@ func (g *Group) avatarUpload(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
-	err = g.db.updateAvatar(groupAvatarPath, groupNo)
+	err = g.db.updateAvatar(groupAvatarPath, avatarVersion, groupNo)
 	if err != nil {
 		g.Error("头像修改失败！", zap.String("group_no", groupNo), zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)

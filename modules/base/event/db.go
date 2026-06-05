@@ -50,6 +50,31 @@ func (d *DB) QueryAllWait(limit uint64) ([]*Model, error) {
 	return models, err
 }
 
+type groupAvatarState struct {
+	IsUploadAvatar int
+}
+
+func (d *DB) queryGroupAvatarState(groupNo string) (*groupAvatarState, error) {
+	var state *groupAvatarState
+	_, err := d.session.Select("is_upload_avatar").From("`group`").Where("group_no=?", groupNo).Load(&state)
+	return state, err
+}
+
+func (d *DB) updateGeneratedGroupAvatar(groupNo string, avatar string, avatarVersion int64) (bool, error) {
+	result, err := d.session.Update("group").SetMap(map[string]interface{}{
+		"avatar":         avatar,
+		"avatar_version": avatarVersion,
+	}).Where("group_no=? and is_upload_avatar=0", groupNo).Exec()
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
 // ---------- model ----------
 
 // Model 数据库对象
