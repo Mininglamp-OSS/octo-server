@@ -2,10 +2,14 @@ package group
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
@@ -13,6 +17,43 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/stretchr/testify/assert"
 )
+
+type mockAvatarUploadFileService struct {
+	uploadedPath string
+}
+
+func (m *mockAvatarUploadFileService) UploadFile(filePath string, contentType string, contentDisposition string, copyFileWriter func(io.Writer) error) (map[string]interface{}, error) {
+	m.uploadedPath = filePath
+	var buf bytes.Buffer
+	if err := copyFileWriter(&buf); err != nil {
+		return nil, err
+	}
+	return map[string]interface{}{"path": filePath}, nil
+}
+
+func (m *mockAvatarUploadFileService) DownloadURL(path string, filename string) (string, error) {
+	return "", errors.New("unused")
+}
+
+func (m *mockAvatarUploadFileService) GetFile(path string) (io.ReadCloser, string, error) {
+	return nil, "", errors.New("unused")
+}
+
+func (m *mockAvatarUploadFileService) DownloadAndMakeCompose(uploadPath string, downloadURLs []string) (map[string]interface{}, error) {
+	return nil, errors.New("unused")
+}
+
+func (m *mockAvatarUploadFileService) DownloadImage(url string, ctx context.Context) (io.ReadCloser, error) {
+	return io.NopCloser(bytes.NewReader(nil)), nil
+}
+
+func (m *mockAvatarUploadFileService) PresignedPutURL(objectPath string, contentType string, contentDisposition string, fileSize int64, expires time.Duration) (string, string, error) {
+	return "", "", errors.New("unused")
+}
+
+func (m *mockAvatarUploadFileService) PresignedGetURL(objectPath string, filename string, disposition string, expires time.Duration) (string, error) {
+	return "", errors.New("unused")
+}
 
 // putGroupSetting issues a PUT /setting with the given JSON body using the test
 // caller's token.
@@ -196,4 +237,65 @@ func TestGroupAvatarUpload_MissingFileIsRequestInvalid(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, w.Code, "wire status 固定 400, body=%s", w.Body.String())
 	assert.Contains(t, w.Body.String(), "err.server.group.request_invalid",
 		"缺少上传文件应是 400 校验错误而非内部错误, body=%s", w.Body.String())
+}
+
+// TestGroupAvatarUpload_PostCommitNotifyFailureRespondsOK pins the committed
+// upload contract: after object storage and DB update succeed, the IM
+// notification is best-effort and must not make the client retry the upload.
+func TestGroupAvatarUpload_PostCommitNotifyFailureRespondsOK(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	im := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "send failed", http.StatusInternalServerError)
+	}))
+	defer im.Close()
+	ctx.GetConfig().WuKongIM.APIURL = im.URL
+
+	f := New(ctx)
+	mockFS := &mockAvatarUploadFileService{}
+	f.fileService = mockFS
+
+	err = f.userDB.Insert(&user.Model{UID: testutil.UID, Name: "user-c", ShortNo: "uc_avatar"})
+	assert.NoError(t, err)
+	err = f.db.Insert(&Model{
+		GroupNo: "g-avatar-notify",
+		Name:    "avatar notify",
+		Creator: testutil.UID,
+		Status:  GroupStatusNormal,
+		Version: 1,
+	})
+	assert.NoError(t, err)
+	err = f.db.InsertMember(&MemberModel{
+		GroupNo: "g-avatar-notify",
+		UID:     testutil.UID,
+		Role:    MemberRoleCreator,
+		Status:  1,
+		Version: 1,
+		Vercode: "avatar-notify@1",
+	})
+	assert.NoError(t, err)
+
+	r := wkhttp.New()
+	r.POST("/v1/groups/:group_no/avatar", ctx.AuthMiddleware(r), f.avatarUpload)
+
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fw, err := mw.CreateFormFile("file", "avatar.png")
+	assert.NoError(t, err)
+	_, err = fw.Write([]byte("png"))
+	assert.NoError(t, err)
+	assert.NoError(t, mw.Close())
+
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("POST", "/v1/groups/g-avatar-notify/avatar", &buf)
+	assert.NoError(t, err)
+	req.Header.Set("token", testutil.Token)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code, "post-commit notify failure should not fail committed upload, body=%s", w.Body.String())
+	assert.Contains(t, w.Body.String(), `"status":200`)
+	assert.NotEmpty(t, mockFS.uploadedPath)
 }
