@@ -483,7 +483,9 @@ func (g *Group) avatarUpload(c *wkhttp.Context) {
 	})
 	if err != nil {
 		g.Error("发送群头像更新命令失败！", zap.String("groupNo", groupNo), zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrGroupNotifyFailed, nil, nil)
+		// The avatar object and DB version are already committed; the IM
+		// notification is best-effort so clients do not retry a successful upload.
+		c.ResponseOK()
 		return
 	}
 	c.ResponseOK()
