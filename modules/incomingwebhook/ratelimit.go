@@ -206,8 +206,10 @@ func (w *IncomingWebhook) penalizeIPFailure(ip string) {
 
 // ipFailureGateMiddleware rejects (429) requests from an IP that has burned its
 // auth-failure budget, before the handler runs — so a token-scanning IP stops
-// hitting the DB and the shared local floor. Read-only peek; fail-open on Redis
-// error. On pass it calls c.Next() (mirrors StrictIPRateLimitMiddleware).
+// reaching the DB and the per-webhook limiter once cut off. Sits after the floor
+// and per-IP request limiter (which it cannot un-consume), but with a lower,
+// failure-specific budget it cuts a scanner faster and without charging valid
+// traffic. Read-only peek; fail-open on Redis error. On pass it calls c.Next().
 func (w *IncomingWebhook) ipFailureGateMiddleware() wkhttp.HandlerFunc {
 	return func(c *wkhttp.Context) {
 		ok, err := w.ipFailureBudgetOK(clientIP(c.Request))

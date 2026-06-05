@@ -36,6 +36,8 @@ const (
 	envBodyMax             = "DM_INCOMINGWEBHOOK_MAX_BYTES"
 	envRatePerWebhookRPS   = "DM_INCOMINGWEBHOOK_RPS"
 	envRatePerWebhookBurst = "DM_INCOMINGWEBHOOK_BURST"
+	envIngressIPRPS        = "DM_INCOMINGWEBHOOK_IP_RPS"
+	envIngressIPBurst      = "DM_INCOMINGWEBHOOK_IP_BURST"
 	envIPFailRPS           = "DM_INCOMINGWEBHOOK_IP_FAIL_RPS"
 	envIPFailBurst         = "DM_INCOMINGWEBHOOK_IP_FAIL_BURST"
 	envMaxContentRunes     = "DM_INCOMINGWEBHOOK_MAX_CONTENT_RUNES"
@@ -44,6 +46,12 @@ const (
 	defaultMaxBytes       = 8 * 1024
 	defaultRatePerWHRPS   = 5.0
 	defaultRatePerWHBurst = 10
+	// per-IP 请求限流（StrictIPRateLimitMiddleware，计入全部请求）的默认值。刻意高于
+	// 旧值(30/60)、但仍低于进程级 floor(200/400)：合法共享/固定 IP 的正常推送量(受
+	// per-webhook 5rps 约束，单 IP 多 webhook 聚合一般 ≪100rps)不被误杀，同时把"单 IP
+	// 持多有效 token"的洪流封在 floor 之下，避免一个 IP 吃满全局 floor 挤占其它租户。
+	defaultIngressIPRPS   = 100.0
+	defaultIngressIPBurst = 200
 	defaultIPFailRPS      = 30.0
 	defaultIPFailBurst    = 60
 	// content 的语义长度上限（rune 数）。8KB body cap 是字节传输上限，这里再加一道
@@ -147,18 +155,23 @@ func (w *IncomingWebhook) Route(r *wkhttp.WKHttp) {
 		mgr.POST("/:group_no/incoming-webhooks/:webhook_id/regenerate", w.regenerate)
 	}
 
-	// 推送类：URL 内 token 鉴权，无 AuthMiddleware。
-	//
-	// 中间件顺序：
+	// 推送类：URL 内 token 鉴权，无 AuthMiddleware。四层限流，由粗到细：
 	//  1) localFloorMiddleware —— 纯内存、不依赖 Redis 的进程级地板，先挡洪峰；Redis
 	//     故障时仍限速，避免对 DB + WuKongIM 的洪泛放大。
-	//  2) ipFailureGateMiddleware —— 按 IP 的"鉴权失败预算"闸：只读 peek，拦掉已把失败
-	//     预算烧光的扫 token IP（在进 handler/打 DB 之前）。注意：合法推送(有效 Key)不
-	//     消耗该预算（只有鉴权失败才在 handler 内 penalize），故服务端固定/共享 IP 不会
-	//     被流量误杀；合法流量整形由 handler 内 allowPerWebhook(按 webhook_id) 负责。
+	//  2) ipLimit (StrictIPRateLimitMiddleware) —— 按 IP 对【全部】请求限流(默认 100rps，
+	//     低于 floor)，给"单 IP 持多有效 token"的洪流封一个硬天花板，防止一个 IP 吃满
+	//     全局 floor 挤占其它租户。阈值高于旧值，合法共享/固定 IP 的正常量不被误杀。
+	//  3) ipFailureGateMiddleware —— 按 IP 的"鉴权失败预算"闸(默认 60)：只读 peek，把扫
+	//     token 的 IP 在烧光失败预算后【在打 DB 之前】快速切断。合法推送(有效 Key)不消耗
+	//     该预算，故比第 2 层更早、更精准地反扫描，且不误伤合法流量。
+	//  4) allowPerWebhook(handler 内，按 webhook_id) —— 单个 webhook 的合法流量整形(5rps)。
+	ipRPS := wkhttp.ParseRPSFromEnv(envIngressIPRPS, defaultIngressIPRPS)
+	ipBurst := wkhttp.ParseBurstFromEnv(envIngressIPBurst, defaultIngressIPBurst)
+	ipLimit := r.StrictIPRateLimitMiddleware(context.Background(), w.rateRedis, "incoming_webhook", ipRPS, ipBurst)
+
 	push := r.Group("/v1")
 	{
-		push.POST("/incoming-webhooks/:webhook_id/:token", w.localFloorMiddleware(), w.ipFailureGateMiddleware(), w.push)
+		push.POST("/incoming-webhooks/:webhook_id/:token", w.localFloorMiddleware(), ipLimit, w.ipFailureGateMiddleware(), w.push)
 	}
 }
 

@@ -19,8 +19,9 @@ import (
 // Redis down, and a flood is shed before it ever touches Redis.
 //
 // Defaults are deliberately generous (200 rps / 400 burst per instance): under
-// healthy Redis the per-IP (30 rps) and per-webhook (5 rps) limiters are far
-// lower and bite first, so the floor only engages as a backstop. Tunable via
+// healthy Redis the per-IP request limiter (100 rps) and per-webhook limiter
+// (5 rps) are lower and bite first, so the floor only engages as a backstop.
+// Tunable via
 // DM_INCOMINGWEBHOOK_LOCAL_RPS / _BURST, read once at construction (no hot
 // reload, matching octo-lib's limiter middlewares). Fail-safe: the shared env
 // parsers coerce 0 / negative / unparseable values to the generous default, so

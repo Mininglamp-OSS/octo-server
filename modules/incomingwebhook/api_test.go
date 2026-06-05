@@ -121,12 +121,24 @@ func anonReqIP(method, path string, body []byte, ip string) *http.Request {
 // cleared by CleanAllTables (mirrors resetUIDRateLimit).
 func resetIPFailBucket(t *testing.T, ctx *config.Context, ip string) {
 	t.Helper()
+	delRedisKey(t, ctx, "ratelimit:incoming_webhook_ipfail:"+ip)
+}
+
+// resetStrictIPBucket clears the per-IP request limiter bucket
+// (StrictIPRateLimitMiddleware, tag "incoming_webhook") for the same reason.
+func resetStrictIPBucket(t *testing.T, ctx *config.Context, ip string) {
+	t.Helper()
+	delRedisKey(t, ctx, "ratelimit:strict:incoming_webhook:"+ip)
+}
+
+func delRedisKey(t *testing.T, ctx *config.Context, key string) {
+	t.Helper()
 	rdsClient := redis.NewClient(&redis.Options{
 		Addr:     ctx.GetConfig().DB.RedisAddr,
 		Password: ctx.GetConfig().DB.RedisPass,
 	})
 	defer rdsClient.Close()
-	_ = rdsClient.Del("ratelimit:incoming_webhook_ipfail:" + ip).Err()
+	_ = rdsClient.Del(key).Err()
 }
 
 func do(handler http.Handler, req *http.Request) *httptest.ResponseRecorder {
@@ -621,6 +633,7 @@ func TestPush_ValidPushesNotIPLimited(t *testing.T) {
 	handler, ctx, groupNo := setupTestEnv(t)
 	const ip = "203.0.113.7"
 	resetIPFailBucket(t, ctx, ip)
+	resetStrictIPBucket(t, ctx, ip)
 
 	w := do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), map[string]interface{}{
 		"name": "x",
@@ -631,12 +644,53 @@ func TestPush_ValidPushesNotIPLimited(t *testing.T) {
 	body, _ := json.Marshal(pushReq{Content: "hi"})
 	url := fmt.Sprintf("/v1/incoming-webhooks/%s/%s", whID, token)
 
-	// Many valid pushes from one IP, far past the IP burst of 1 — none IP-limited.
+	// Many valid pushes from one IP, far past the failure burst of 1 — none
+	// failure-gated (the per-IP REQUEST limiter stays at its generous default).
 	for i := 0; i < 5; i++ {
 		w = do(handler, anonReqIP("POST", url, body, ip))
 		assert.NotEqualf(t, http.StatusTooManyRequests, w.Code,
-			"valid push %d from a fixed IP must not be IP-limited; body=%s", i, w.Body.String())
+			"valid push %d from a fixed IP must not be failure-limited; body=%s", i, w.Body.String())
 	}
+}
+
+// TestPush_ValidPushesCappedByPerIPRequestLimit locks the layer the reviewers
+// asked to keep: the per-IP REQUEST limiter (StrictIPRateLimitMiddleware) bounds
+// ALL requests from one IP — including valid pushes — so a single IP holding many
+// valid tokens cannot drive the full process floor. Only the per-IP request
+// budget is tightened here; every other layer stays generous, so a 429 can only
+// come from that limiter.
+func TestPush_ValidPushesCappedByPerIPRequestLimit(t *testing.T) {
+	t.Setenv("DM_INCOMINGWEBHOOK_IP_RPS", "0.01")
+	t.Setenv("DM_INCOMINGWEBHOOK_IP_BURST", "2")
+	t.Setenv("DM_INCOMINGWEBHOOK_RPS", "1000")
+	t.Setenv("DM_INCOMINGWEBHOOK_BURST", "1000")
+	t.Setenv("DM_INCOMINGWEBHOOK_LOCAL_BURST", "1000")
+	t.Setenv("DM_INCOMINGWEBHOOK_IP_FAIL_BURST", "1000")
+
+	handler, ctx, groupNo := setupTestEnv(t)
+	const ip = "203.0.113.50"
+	resetStrictIPBucket(t, ctx, ip)
+
+	w := do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), map[string]interface{}{
+		"name": "x",
+	}))
+	created := parseJSON(t, w)
+	whID := created["webhook_id"].(string)
+	token := created["token"].(string)
+	body, _ := json.Marshal(pushReq{Content: "hi"})
+	url := fmt.Sprintf("/v1/incoming-webhooks/%s/%s", whID, token)
+
+	// First two valid pushes consume the per-IP request burst (not 429).
+	for i := 0; i < 2; i++ {
+		w = do(handler, anonReqIP("POST", url, body, ip))
+		assert.NotEqualf(t, http.StatusTooManyRequests, w.Code,
+			"valid push %d should pass the per-IP request burst; body=%s", i, w.Body.String())
+	}
+	// Third valid push exceeds the per-IP request budget → 429, even though the
+	// token is valid (the multi-valid-token-from-one-IP cap).
+	w = do(handler, anonReqIP("POST", url, body, ip))
+	assert.Equalf(t, http.StatusTooManyRequests, w.Code,
+		"per-IP request limiter must cap valid pushes from one IP; body=%s", w.Body.String())
 }
 
 // TestPush_FailedAuthGetsIPLimited verifies the failure path DOES throttle by
