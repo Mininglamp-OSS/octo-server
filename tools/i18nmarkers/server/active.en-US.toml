@@ -9,6 +9,126 @@
 ["err.server.bot.occupied"]
 other = "Bot is already occupied by another agent."
 
+["err.server.bot_api.app_bot_dm_only"]
+other = "App bots can only operate on direct message channels."
+
+["err.server.bot_api.app_bot_unsupported"]
+other = "This operation is not supported for app bots."
+
+["err.server.bot_api.auth_check_failed"]
+other = "Bot authentication check failed."
+
+["err.server.bot_api.auth_failed"]
+other = "Bot authentication failed."
+
+["err.server.bot_api.bot_not_provisioned"]
+other = "The bot is not fully provisioned for this operation."
+
+["err.server.bot_api.bot_not_registered"]
+other = "The grantee is not a registered bot."
+
+["err.server.bot_api.bot_unavailable"]
+other = "The bot is not available."
+
+["err.server.bot_api.content_too_large"]
+other = "The content exceeds the maximum allowed size."
+
+["err.server.bot_api.conversation_not_started"]
+other = "The user has not started a conversation with this bot."
+
+["err.server.bot_api.file_too_large"]
+other = "The file exceeds the maximum allowed size."
+
+["err.server.bot_api.file_type_unsupported"]
+other = "Unsupported file type."
+
+["err.server.bot_api.group_not_found"]
+other = "Group not found."
+
+["err.server.bot_api.im_token_failed"]
+other = "Failed to obtain an IM token."
+
+["err.server.bot_api.limit_exceeded"]
+other = "The request exceeds the maximum allowed items."
+
+["err.server.bot_api.member_not_human"]
+other = "Only human members can be added through the bot API."
+
+["err.server.bot_api.message_edit_forbidden"]
+other = "You can only edit messages you sent."
+
+["err.server.bot_api.message_not_delivered"]
+other = "The message has not finished delivering; please retry."
+
+["err.server.bot_api.message_not_found"]
+other = "Message not found."
+
+["err.server.bot_api.not_friend"]
+other = "The bot is not a friend of this user."
+
+["err.server.bot_api.not_group_admin"]
+other = "The bot is not an admin of this group."
+
+["err.server.bot_api.not_group_member"]
+other = "The bot is not a member of this group."
+
+["err.server.bot_api.not_space_member"]
+other = "Not a member of this space."
+
+["err.server.bot_api.obo_channel_not_found"]
+other = "Channel not found."
+
+["err.server.bot_api.obo_grant_exists"]
+other = "An OBO grant already exists."
+
+["err.server.bot_api.obo_grant_not_found"]
+other = "OBO grant not found."
+
+["err.server.bot_api.obo_internal"]
+other = "OBO operation failed."
+
+["err.server.bot_api.obo_mode_unsupported"]
+other = "Unsupported OBO mode."
+
+["err.server.bot_api.obo_not_authorized"]
+other = "Not authorized to act on behalf of this user."
+
+["err.server.bot_api.obo_reserved_field"]
+other = "The payload uses reserved OBO fields."
+
+["err.server.bot_api.obo_scope_exists"]
+other = "An OBO scope already exists."
+
+["err.server.bot_api.obo_scope_not_found"]
+other = "OBO scope not found."
+
+["err.server.bot_api.payload_too_large"]
+other = "The uploaded file exceeds the maximum allowed size."
+
+["err.server.bot_api.query_failed"]
+other = "Failed to query data."
+
+["err.server.bot_api.request_invalid"]
+other = "Invalid request."
+
+["err.server.bot_api.send_failed"]
+other = "Failed to send the message."
+
+["err.server.bot_api.store_failed"]
+other = "Failed to update data."
+
+["err.server.bot_api.thread_channel_not_accepted"]
+other = "A thread channel id is not accepted here; use the thread GROUP.md endpoint instead."
+
+["err.server.bot_api.upload_failed"]
+other = "Failed to process the file."
+
+["err.server.bot_api.upstream_failed"]
+other = "The upstream service is unavailable."
+
+["err.server.bot_api.user_not_found"]
+other = "User not found."
+
 ["err.server.category.default_immutable"]
 other = "The default category cannot be modified."
 

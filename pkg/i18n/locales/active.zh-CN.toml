@@ -883,3 +883,122 @@ other = "统计请求无效。"
 
 ["err.server.statistics.query_failed"]
 other = "查询统计数据失败。"
+["err.server.bot_api.request_invalid"]
+other = "请求参数有误。"
+
+["err.server.bot_api.limit_exceeded"]
+other = "请求数量超过上限。"
+
+["err.server.bot_api.content_too_large"]
+other = "内容大小超过限制。"
+
+["err.server.bot_api.file_too_large"]
+other = "文件大小超过限制。"
+
+["err.server.bot_api.payload_too_large"]
+other = "上传文件大小超过限制。"
+
+["err.server.bot_api.file_type_unsupported"]
+other = "不支持的文件类型。"
+
+["err.server.bot_api.member_not_human"]
+other = "仅可通过机器人 API 添加真人成员。"
+
+["err.server.bot_api.thread_channel_not_accepted"]
+other = "此处不接受子区频道 ID，请使用子区 GROUP.md 接口。"
+
+["err.server.bot_api.bot_not_provisioned"]
+other = "机器人尚未完成配置，无法执行该操作。"
+
+["err.server.bot_api.obo_mode_unsupported"]
+other = "不支持的 OBO 模式。"
+
+["err.server.bot_api.obo_reserved_field"]
+other = "请求体包含 OBO 保留字段。"
+
+["err.server.bot_api.not_group_member"]
+other = "机器人不是该群成员。"
+
+["err.server.bot_api.not_group_admin"]
+other = "机器人不是该群管理员。"
+
+["err.server.bot_api.not_space_member"]
+other = "不是该空间成员。"
+
+["err.server.bot_api.app_bot_unsupported"]
+other = "应用机器人不支持该操作。"
+
+["err.server.bot_api.app_bot_dm_only"]
+other = "应用机器人仅支持私聊频道操作。"
+
+["err.server.bot_api.not_friend"]
+other = "机器人不是该用户的好友。"
+
+["err.server.bot_api.conversation_not_started"]
+other = "用户尚未与该机器人发起会话。"
+
+["err.server.bot_api.message_edit_forbidden"]
+other = "只能编辑自己发送的消息。"
+
+["err.server.bot_api.obo_not_authorized"]
+other = "无权代表该用户操作。"
+
+["err.server.bot_api.bot_unavailable"]
+other = "机器人不可用。"
+
+["err.server.bot_api.group_not_found"]
+other = "群组不存在。"
+
+["err.server.bot_api.message_not_found"]
+other = "消息不存在。"
+
+["err.server.bot_api.user_not_found"]
+other = "用户不存在。"
+
+["err.server.bot_api.bot_not_registered"]
+other = "被授权方不是已注册的机器人。"
+
+["err.server.bot_api.obo_grant_not_found"]
+other = "OBO 授权不存在。"
+
+["err.server.bot_api.obo_scope_not_found"]
+other = "OBO 授权范围不存在。"
+
+["err.server.bot_api.obo_channel_not_found"]
+other = "频道不存在。"
+
+["err.server.bot_api.obo_grant_exists"]
+other = "OBO 授权已存在。"
+
+["err.server.bot_api.obo_scope_exists"]
+other = "OBO 授权范围已存在。"
+
+["err.server.bot_api.message_not_delivered"]
+other = "消息尚未投递完成，请稍后重试。"
+
+["err.server.bot_api.auth_failed"]
+other = "机器人认证失败。"
+
+["err.server.bot_api.upstream_failed"]
+other = "上游服务不可用。"
+
+["err.server.bot_api.query_failed"]
+other = "查询数据失败。"
+
+["err.server.bot_api.store_failed"]
+other = "更新数据失败。"
+
+["err.server.bot_api.send_failed"]
+other = "消息发送失败。"
+
+["err.server.bot_api.upload_failed"]
+other = "文件处理失败。"
+
+["err.server.bot_api.im_token_failed"]
+other = "获取 IM Token 失败。"
+
+["err.server.bot_api.auth_check_failed"]
+other = "机器人认证校验失败。"
+
+["err.server.bot_api.obo_internal"]
+other = "OBO 操作失败。"
