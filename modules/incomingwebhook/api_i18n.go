@@ -23,8 +23,14 @@ func pushUnauthorized(c *wkhttp.Context) {
 	c.Abort()
 }
 
-// pushRateLimited returns 429 when the per-webhook token bucket rejects.
+// pushRateLimited returns 429 when a push limiter (local floor, per-IP failure
+// gate, or per-webhook bucket) rejects. It sets a conservative Retry-After so
+// machine senders back off instead of hot-looping; the limiters refill within
+// ~1s at their configured rates, so a fixed 1s hint is a safe lower bound. (The
+// per-IP request limiter, StrictIPRateLimitMiddleware, sets its own precise
+// Retry-After / X-RateLimit headers and never reaches here.)
 func pushRateLimited(c *wkhttp.Context) {
+	c.Header("Retry-After", "1")
 	httperr.ResponseErrorLWithStatus(c, errcode.ErrIncomingWebhookPushRateLimited, nil, nil)
 	c.Abort()
 }

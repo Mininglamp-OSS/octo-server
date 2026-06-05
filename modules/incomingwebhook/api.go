@@ -617,15 +617,17 @@ func (w *IncomingWebhook) push(c *wkhttp.Context) {
 		pushUnauthorized(c)
 		return
 	}
-	if m == nil {
-		// 未知 webhook——明确的扫描信号，计入 IP 失败预算。
+	if m == nil || m.Status == statusDeleted {
+		// 未知或【已软删除】的 webhook——没有合法调用方会往不存在/已删除的 URL 推送，
+		// 是明确的扫描/滥用信号，计入 IP 失败预算（否则一个泄露的已删 URL 可无限刷、
+		// 每次一次 DB 读却永不触发失败门）。
 		w.failAuth(c, ip)
 		return
 	}
 	if m.Status != statusEnabled {
-		// webhook 存在但被禁用/软删——可能是持有有效 token 的合法调用方在其 webhook 刚被
-		// 管理员禁用后继续推送，无法在 token 校验前区分，故【不】计入 IP 失败预算，避免误封
-		// 共享 IP（响应仍是同一 401，保持反枚举）。
+		// webhook 存在但被【禁用】（statusDisabled）——可能是持有有效 token 的合法调用方
+		// 在其 webhook 刚被管理员禁用后继续推送，无法在 token 校验前区分，故对禁用态保留
+		// 宽限：【不】计入 IP 失败预算，避免误封共享 IP（响应仍是同一 401，保持反枚举）。
 		pushUnauthorized(c)
 		return
 	}

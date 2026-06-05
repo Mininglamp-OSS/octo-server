@@ -309,6 +309,74 @@ func TestDelete_PushFails(t *testing.T) {
 	assert.Equalf(t, http.StatusUnauthorized, w.Code, "push with deleted webhook token must 401: %s", w.Body.String())
 }
 
+// TestPush_SoftDeletedWebhookSpendsIPBudget locks the P2 refinement: pushing to
+// a soft-deleted webhook_id is a scan/abuse signal (no legit caller pushes to a
+// deleted URL), so it spends the IP failure budget and gets gated — closing the
+// "leaked deleted URL hammered forever, never gated" gap.
+func TestPush_SoftDeletedWebhookSpendsIPBudget(t *testing.T) {
+	t.Setenv("DM_INCOMINGWEBHOOK_IP_FAIL_RPS", "0.01")
+	t.Setenv("DM_INCOMINGWEBHOOK_IP_FAIL_BURST", "2")
+
+	handler, ctx, groupNo := setupTestEnv(t)
+	const ip = "203.0.113.77"
+	resetIPFailBucket(t, ctx, ip)
+	resetStrictIPBucket(t, ctx, ip)
+
+	w := do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), map[string]interface{}{
+		"name": "x",
+	}))
+	created := parseJSON(t, w)
+	whID := created["webhook_id"].(string)
+	token := created["token"].(string)
+	w = do(handler, authReq("DELETE", fmt.Sprintf("/v1/groups/%s/incoming-webhooks/%s", groupNo, whID), nil))
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	body, _ := json.Marshal(pushReq{Content: "hi"})
+	url := fmt.Sprintf("/v1/incoming-webhooks/%s/%s", whID, token)
+	// Two pushes to the deleted webhook spend the budget (401 each).
+	for i := 0; i < 2; i++ {
+		w = do(handler, anonReqIP("POST", url, body, ip))
+		assert.Equalf(t, http.StatusUnauthorized, w.Code, "attempt %d should be 401; body=%s", i, w.Body.String())
+	}
+	// Budget exhausted → the gate now rejects with 429.
+	w = do(handler, anonReqIP("POST", url, body, ip))
+	assert.Equalf(t, http.StatusTooManyRequests, w.Code,
+		"a hammered soft-deleted webhook must spend the IP budget and get gated; body=%s", w.Body.String())
+}
+
+// TestPush_DisabledWebhookKeepsIPGrace is the other half of the asymmetry: a
+// merely DISABLED webhook (a legit caller may still hold a valid token in the
+// window right after an admin disables it) does NOT spend the budget, so it is
+// never gated — only ever a uniform 401.
+func TestPush_DisabledWebhookKeepsIPGrace(t *testing.T) {
+	t.Setenv("DM_INCOMINGWEBHOOK_IP_FAIL_RPS", "0.01")
+	t.Setenv("DM_INCOMINGWEBHOOK_IP_FAIL_BURST", "2")
+
+	handler, ctx, groupNo := setupTestEnv(t)
+	const ip = "203.0.113.88"
+	resetIPFailBucket(t, ctx, ip)
+	resetStrictIPBucket(t, ctx, ip)
+
+	w := do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), map[string]interface{}{
+		"name": "x",
+	}))
+	created := parseJSON(t, w)
+	whID := created["webhook_id"].(string)
+	token := created["token"].(string)
+	// Disable (status=0), not delete.
+	_, err := ctx.DB().UpdateBySql("UPDATE incoming_webhook SET status=0 WHERE webhook_id=?", whID).Exec()
+	assert.NoError(t, err)
+
+	body, _ := json.Marshal(pushReq{Content: "hi"})
+	url := fmt.Sprintf("/v1/incoming-webhooks/%s/%s", whID, token)
+	// Even past the failure burst of 2, a disabled webhook never gates — always 401.
+	for i := 0; i < 4; i++ {
+		w = do(handler, anonReqIP("POST", url, body, ip))
+		assert.Equalf(t, http.StatusUnauthorized, w.Code,
+			"disabled webhook must keep its grace (never 429); attempt %d body=%s", i, w.Body.String())
+	}
+}
+
 // TestDelete_ConcurrentUpdate_NoRevive 端到端回归 TOCTOU 复活漏洞（#254 follow-up）：
 // DELETE 与多个 PUT status=1 并发时，删除必须最终生效——webhook 不得复活进列表，原
 // token 不得再推送。修复后此性质与调度无关恒成立（条件 updateFields 永不写已删除行），

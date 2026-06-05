@@ -2,6 +2,7 @@ package incomingwebhook
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -123,6 +124,11 @@ func (w *IncomingWebhook) runBucketScript(script *redis.Script, key string, args
 	}
 	arr, ok := res.([]interface{})
 	if !ok || len(arr) < 1 {
+		// Unexpected return shape from the Lua script — fail open, but log it
+		// (throttled): on security-sensitive limiter code a silently-swallowed
+		// malformed reply would hide a real bug behind "always allowed".
+		w.warnDegraded("rate limit script returned unexpected shape, fail-open",
+			fmt.Errorf("result type %T", res))
 		return true, nil
 	}
 	allowed, _ := arr[0].(int64)
