@@ -379,7 +379,12 @@ func (bf *BotFather) botSpaceMembers(c *wkhttp.Context) {
 		_, err = bf.ctx.DB().SelectBySql(
 			"SELECT space_id FROM space_member WHERE uid=? AND status=1", robotID,
 		).Load(&spaceIDs)
-		if err != nil || len(spaceIDs) == 0 {
+		if err != nil {
+			bf.Error("query bot spaces failed", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
+			return
+		}
+		if len(spaceIDs) == 0 {
 			c.JSON(http.StatusOK, []MemberInfo{})
 			return
 		}
@@ -387,9 +392,13 @@ func (bf *BotFather) botSpaceMembers(c *wkhttp.Context) {
 	} else {
 		// 校验 bot 是否属于该 Space
 		var count int
-		bf.ctx.DB().SelectBySql(
+		if err := bf.ctx.DB().SelectBySql(
 			"SELECT COUNT(*) FROM space_member WHERE space_id=? AND uid=? AND status=1", spaceID, robotID,
-		).LoadOne(&count)
+		).LoadOne(&count); err != nil {
+			bf.Error("check bot space membership failed", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
+			return
+		}
 		if count == 0 {
 			httperr.ResponseErrorLWithStatus(c, errcode.ErrBotfatherBotNotSpaceMember, nil, nil)
 			c.Abort()
@@ -527,20 +536,24 @@ func (bf *BotFather) botGroupUpdate(c *wkhttp.Context) {
 
 	// 权限检查：Bot 必须是群成员
 	isMember, err := bf.groupService.ExistMember(groupNo, robotID)
-	if err != nil || !isMember {
-		if err != nil {
-			bf.Error("check group membership failed", zap.Error(err))
-		}
+	if err != nil {
+		bf.Error("check group membership failed", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
+		return
+	}
+	if !isMember {
 		respondBotfatherBotNotGroupMember(c)
 		return
 	}
 
 	// 权限检查：Bot 必须是 bot_admin
 	isBotAdmin, err := bf.groupService.IsBotAdmin(groupNo, robotID)
-	if err != nil || !isBotAdmin {
-		if err != nil {
-			bf.Error("check bot admin failed", zap.Error(err))
-		}
+	if err != nil {
+		bf.Error("check bot admin failed", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
+		return
+	}
+	if !isBotAdmin {
 		respondBotfatherBotNotGroupAdmin(c)
 		return
 	}
@@ -583,10 +596,12 @@ func (bf *BotFather) botGroupMemberAdd(c *wkhttp.Context) {
 
 	// 权限检查：Bot 必须是群成员
 	isMember, err := bf.groupService.ExistMember(groupNo, robotID)
-	if err != nil || !isMember {
-		if err != nil {
-			bf.Error("check group membership failed", zap.Error(err))
-		}
+	if err != nil {
+		bf.Error("check group membership failed", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
+		return
+	}
+	if !isMember {
 		respondBotfatherBotNotGroupMember(c)
 		return
 	}
@@ -648,20 +663,24 @@ func (bf *BotFather) botGroupMemberRemove(c *wkhttp.Context) {
 
 	// 权限检查：Bot 必须是群成员
 	isMember, err := bf.groupService.ExistMember(groupNo, robotID)
-	if err != nil || !isMember {
-		if err != nil {
-			bf.Error("check group membership failed", zap.Error(err))
-		}
+	if err != nil {
+		bf.Error("check group membership failed", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
+		return
+	}
+	if !isMember {
 		respondBotfatherBotNotGroupMember(c)
 		return
 	}
 
 	// 权限检查：Bot 必须是 bot_admin
 	isBotAdmin, err := bf.groupService.IsBotAdmin(groupNo, robotID)
-	if err != nil || !isBotAdmin {
-		if err != nil {
-			bf.Error("check bot admin failed", zap.Error(err))
-		}
+	if err != nil {
+		bf.Error("check bot admin failed", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
+		return
+	}
+	if !isBotAdmin {
 		respondBotfatherBotNotGroupAdmin(c)
 		return
 	}
@@ -766,7 +785,12 @@ func (bf *BotFather) getUserInfo(c *wkhttp.Context) {
 	bareUID := stripSpacePrefix(uid)
 
 	userResp, err := bf.userService.GetUser(bareUID)
-	if err != nil || userResp == nil {
+	if err != nil {
+		bf.Error("get user failed", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrBotfatherQueryFailed, nil, nil)
+		return
+	}
+	if userResp == nil {
 		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotfatherUserNotFound, nil, nil)
 		return
 	}
