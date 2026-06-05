@@ -10,6 +10,20 @@ import (
 // Redis / WuKongIM — they exercise the in-memory token bucket directly, so they
 // run in plain `go test` and document the limiter contract.
 
+// countAllowed fires n calls and returns how many were allowed. Used by the
+// default-config tests, where the 200 rps default refill makes an exact "burst
+// then exactly one reject" assertion timing-sensitive on slow CI; a range check
+// (full burst passes, but not 2× burst) is refill-robust instead.
+func countAllowed(f *localFloor, n int) int {
+	allowed := 0
+	for i := 0; i < n; i++ {
+		if f.allow() {
+			allowed++
+		}
+	}
+	return allowed
+}
+
 // TestLocalFloor_AllowsBurstThenBlocks: with a tiny refill rate, exactly `burst`
 // calls pass before the bucket empties and further calls are rejected.
 func TestLocalFloor_AllowsBurstThenBlocks(t *testing.T) {
@@ -32,10 +46,9 @@ func TestLocalFloor_ZeroEnvDoesNotDisable(t *testing.T) {
 	t.Setenv(envLocalFloorBurst, "0")
 
 	f := newLocalFloor()
-	for i := 0; i < defaultLocalFloorBurst; i++ {
-		assert.Truef(t, f.allow(), "coerced-to-default floor must allow up to default burst (i=%d)", i)
-	}
-	assert.False(t, f.allow(), "one past the default burst is still rejected — env 0 did not disable the floor")
+	allowed := countAllowed(f, 2*defaultLocalFloorBurst)
+	assert.GreaterOrEqual(t, allowed, defaultLocalFloorBurst, "coerced-to-default burst must all pass")
+	assert.Less(t, allowed, 2*defaultLocalFloorBurst, "env 0 did not disable the floor; it stays bounded at the default")
 }
 
 // TestLocalFloor_ConfiguredAtConstruction: env is read once when the floor is
@@ -59,8 +72,7 @@ func TestLocalFloor_ConfiguredAtConstruction(t *testing.T) {
 // outage backstop). A burst of default size all passes.
 func TestLocalFloor_DefaultIsBackstop(t *testing.T) {
 	f := newLocalFloor()
-	for i := 0; i < defaultLocalFloorBurst; i++ {
-		assert.Truef(t, f.allow(), "default burst must all pass (i=%d)", i)
-	}
-	assert.False(t, f.allow(), "one past the default burst is rejected")
+	allowed := countAllowed(f, 2*defaultLocalFloorBurst)
+	assert.GreaterOrEqual(t, allowed, defaultLocalFloorBurst, "the full default burst must pass")
+	assert.Less(t, allowed, 2*defaultLocalFloorBurst, "default floor is bounded; not everything passes")
 }

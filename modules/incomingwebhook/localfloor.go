@@ -35,9 +35,10 @@ const (
 	defaultLocalFloorBurst = 400
 )
 
-// localFloor is a process-global in-memory token bucket, built once from env at
-// construction. New() builds a fresh floor per process (and per test server),
-// so the env is read at the same point as the module's other startup config.
+// localFloor is a per-instance in-memory token bucket, built once from env at
+// construction. New() builds a fresh floor per IncomingWebhook (one per process
+// in production, one per test server), so the env is read at the same point as
+// the module's other startup config.
 type localFloor struct {
 	lim *rate.Limiter // nil = disabled
 }
