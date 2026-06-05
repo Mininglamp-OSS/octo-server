@@ -688,3 +688,17 @@ other = "查询 webhook 信息失败。"
 
 ["err.server.incomingwebhook.mgmt_operation_failed"]
 other = "操作失败，请稍后再试。"
+
+# ---- err.server.featuregate.* (modules/featuregate 管理端点) ----
+
+["err.server.featuregate.request_invalid"]
+other = "请求参数无效。"
+
+["err.server.featuregate.not_found"]
+other = "灰度白名单条目不存在。"
+
+["err.server.featuregate.query_failed"]
+other = "查询灰度配置失败。"
+
+["err.server.featuregate.operation_failed"]
+other = "操作失败，请稍后再试。"
