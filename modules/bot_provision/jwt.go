@@ -7,25 +7,25 @@
 //
 // Module should be renamed to e.g. "bot_api" in a follow-up cleanup; the
 // rename touches internal/modules.go import path so it's left for later.
-package auth_jwt
+package bot_provision
 
 import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 )
 
-// AuthJWT is the module entrypoint registered with octo-lib. Only ctx +
+// BotProvision is the module entrypoint registered with octo-lib. Only ctx +
 // logger are needed now — RSA key state was for JWT signing, all gone.
-type AuthJWT struct {
+type BotProvision struct {
 	ctx *config.Context
 	log.Log
 }
 
 // New returns a configured module. No more loadOrGenerateKey since JWT
 // signing was removed in 合并 plan 决策一+二 Phase 4.
-func New(ctx *config.Context) *AuthJWT {
-	return &AuthJWT{
+func New(ctx *config.Context) *BotProvision {
+	return &BotProvision{
 		ctx: ctx,
-		Log: log.NewTLog("AuthJWT"),
+		Log: log.NewTLog("BotProvision"),
 	}
 }

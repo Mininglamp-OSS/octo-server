@@ -12,7 +12,7 @@
 //                              returns {bot_token}. Authz check: the
 //                              daemon's JWT.sub must equal the bot's
 //                              creator_uid (owner-on-behalf-of model).
-package auth_jwt
+package bot_provision
 
 import (
 	"errors"
@@ -39,7 +39,7 @@ type mintResponse struct {
 	BotUID string `json:"bot_uid"`
 }
 
-func (a *AuthJWT) mintBot(c *wkhttp.Context) {
+func (a *BotProvision) mintBot(c *wkhttp.Context) {
 	// Caller is browser; reuse octo-lib session middleware semantics:
 	// AuthMiddleware would have set "uid"; if not present we 401.
 	uid := c.GetLoginUID()
@@ -94,7 +94,7 @@ func (a *AuthJWT) mintBot(c *wkhttp.Context) {
 // 合并 plan 决策一+二 Phase 4: 改用 api_key 直连 (不再 JWT exchange).
 // SQL 逻辑跟 /v1/auth/verify-api-key (modules/user/api.go) 同款 — 复用
 // auth_jwt.resolveAPIKey 现有的两步走 (api_key → uid+space_id → membership).
-func (a *AuthJWT) botToken(c *wkhttp.Context) {
+func (a *BotProvision) botToken(c *wkhttp.Context) {
 	auth := c.GetHeader("Authorization")
 	if !strings.HasPrefix(auth, "Bearer ") {
 		c.ResponseErrorWithStatus(errors.New("missing Bearer token"), http.StatusUnauthorized)
@@ -162,7 +162,7 @@ var hexEncode = defaultHexEncode
 //
 //	POST /v1/bot/mint        — web session auth (octo-lib session middleware)
 //	GET  /v1/bot/:uid/token  — daemon api_key Bearer (validated inline)
-func (a *AuthJWT) Route(r *wkhttp.WKHttp) {
+func (a *BotProvision) Route(r *wkhttp.WKHttp) {
 	authGroup := r.Group("/v1", a.ctx.AuthMiddleware(r))
 	authGroup.POST("/bot/mint", a.mintBot)
 

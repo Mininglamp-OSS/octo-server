@@ -116,6 +116,27 @@ func TestAuthVerifyAPIKey_OwnerLeftSpace(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
+// Case 3b: space_member.status 不是 1 也不是 0 (其他值, 如 2 "pending") →
+// 同样 401. SQL filter 是 `status=1`, 任何非 1 值都被拒, 这个 case 提供
+// 显式覆盖避免 future 改成 `status != 0` 引入 regression.
+func TestAuthVerifyAPIKey_NonActiveStatus(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	seedAPIKeyFixtures(t, ctx)
+	insertAPIKey(t, ctx, testAPIKeyUID, "uk_nonactive_xxxxxxxxxxxxxxxxxxxxxxxx", testAPIKeySpaceA)
+
+	// flip status to 2 (e.g. "pending invitation" — 任何非 1 值)
+	_, err := ctx.DB().Update("space_member").
+		Set("status", 2).
+		Where("space_id=? AND uid=?", testAPIKeySpaceA, testAPIKeyUID).
+		Exec()
+	require.NoError(t, err)
+
+	w := doVerifyAPIKey(t, s, map[string]string{"api_key": "uk_nonactive_xxxxxxxxxxxxxxxxxxxxxxxx"})
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
 // Case 4: legacy space_id='' 的 api_key → 401 (合并 plan §3 显式拒绝)
 func TestAuthVerifyAPIKey_LegacyEmptySpace(t *testing.T) {
 	s, ctx := testutil.NewTestServer()

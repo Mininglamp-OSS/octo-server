@@ -1,4 +1,4 @@
-package auth_jwt
+package bot_provision
 
 import (
 	"errors"
@@ -7,7 +7,7 @@ import (
 
 // assertSpaceMember returns nil iff uid is an active member of spaceID.
 // Used by both mintBot (web caller) and resolveAPIKey (daemon caller).
-func (a *AuthJWT) assertSpaceMember(uid, spaceID string) error {
+func (a *BotProvision) assertSpaceMember(uid, spaceID string) error {
 	if uid == "" || spaceID == "" {
 		return errors.New("assertSpaceMember: uid and space_id required")
 	}
@@ -30,7 +30,7 @@ func (a *AuthJWT) assertSpaceMember(uid, spaceID string) error {
 //
 // 合并 plan 决策一+二 Phase 4: 砍掉 resolveSession (JWT exchange 没了, 没人
 // 调). 这里保留 resolveAPIKey 给 botToken (daemon → bot_token) 用.
-func (a *AuthJWT) resolveAPIKey(apiKey, daemonHint, _ string) (string, string, string, error) {
+func (a *BotProvision) resolveAPIKey(apiKey, daemonHint, _ string) (string, string, string, error) {
 	type row struct {
 		UID     string `db:"uid"`
 		SpaceID string `db:"space_id"`

@@ -54,7 +54,7 @@ import (
 	_ "github.com/Mininglamp-OSS/octo-server/modules/bot_api"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/app_bot"
 	// PR-A: cross-service JWT issuer + bot endpoints (mint / token lookup).
-	_ "github.com/Mininglamp-OSS/octo-server/modules/auth_jwt"
+	_ "github.com/Mininglamp-OSS/octo-server/modules/bot_provision"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/voice_adapter"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/webhook"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/workplace"
