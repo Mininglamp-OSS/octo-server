@@ -1,0 +1,26 @@
+# History check — reject PRs with no common ancestor on the target branch.
+#
+# Calls the org-wide reusable workflow:
+#   Mininglamp-OSS/.github/.github/workflows/reusable-history-check.yml
+#
+# Why: GitHub's merge UI does NOT refuse merges of unrelated histories.
+# An orphan-branch PR (e.g. `git checkout --orphan` or a re-initialized
+# `.git/`) merges cleanly but grafts a parent-less root commit into the
+# target branch, collapsing `git blame` for every file in that snapshot
+# onto a single commit. Precedent: hermes-agent PR #25045 (May 2026).
+
+name: History Check
+
+on:
+  pull_request:
+    branches: [main]
+
+# Caller permissions act as an upper bound for the reusable workflow.
+# The reusable workflow needs `contents: read` to run `actions/checkout`,
+# so we must grant it here too (a top-level `{}` would block startup).
+permissions:
+  contents: read
+
+jobs:
+  history:
+    uses: Mininglamp-OSS/.github/.github/workflows/reusable-history-check.yml@main
