@@ -766,19 +766,43 @@ func (w *IncomingWebhook) push(c *wkhttp.Context) {
 		pushPayloadInvalid(c, "json")
 		return
 	}
-	if strings.TrimSpace(req.Content) == "" {
-		pushPayloadInvalid(c, "content")
-		return
-	}
-	// content 语义长度上限（按 rune 计），独立于 8KB 字节 body cap：防止单条消息正文
-	// 过长污染所有客户端渲染。超限按 413 拒绝，与 body 超限同语义。
-	if utf8.RuneCountInString(req.Content) > maxContentRunes() {
-		pushPayloadTooLarge(c)
+
+	// 5) 按 msg_type 构造 payload。缺省/"text" 走历史纯文本路径（content 必填，客户端
+	//    按 markdown 渲染），完全向后兼容；"richtext" 走图文混排：blocks 翻译为 octo
+	//    原生 RichText(=14) 并由 richtext.Validate/Finalize 权威校验。
+	var payload map[string]interface{}
+	switch strings.ToLower(strings.TrimSpace(req.MsgType)) {
+	case "", msgTypeText:
+		if strings.TrimSpace(req.Content) == "" {
+			pushPayloadInvalid(c, "content")
+			return
+		}
+		// content 语义长度上限（按 rune 计），独立于 8KB 字节 body cap：防止单条消息
+		// 正文过长污染所有客户端渲染。超限按 413 拒绝，与 body 超限同语义。
+		if utf8.RuneCountInString(req.Content) > maxContentRunes() {
+			pushPayloadTooLarge(c)
+			return
+		}
+		payload = buildPayload(m, &req)
+	case msgTypeRichText:
+		p, err := buildRichTextPayload(m, &req)
+		if err != nil {
+			// 仅 >1MB 映射 413（与 body/content 超限同语义）；其余结构性非法（空 content /
+			// 空 text 块 / 非 http(s) 图片 url / 缺图片宽高 / 未知块类型 / 超块数上限）
+			// 一律 400 invalid，reason=blocks 供调用方定位。
+			if errors.Is(err, common.ErrRichTextPayloadTooLarge) {
+				pushPayloadTooLarge(c)
+				return
+			}
+			pushPayloadInvalid(c, "blocks")
+			return
+		}
+		payload = p
+	default:
+		pushPayloadInvalid(c, "msg_type")
 		return
 	}
 
-	// 5) 构造 payload 并发送
-	payload := buildPayload(m, &req)
 	resp, err := w.ctx.SendMessageWithResult(&config.MsgSendReq{
 		// RedDot=1 让 webhook 消息触发未读红点和推送，与 botfather/robot 一致。
 		Header:      config.MsgHeader{RedDot: 1},
@@ -845,21 +869,12 @@ func truncateUTF8(s string, max int) string {
 //   - req.Username / req.AvatarURL 服务端裁剪到 create 侧同样的字节上限。push 路径
 //     原本只受 8KB body cap 约束，调用方可塞 KB 级字符串污染所有客户端 from.* 渲染。
 func buildPayload(m *incomingWebhookModel, req *pushPayloadReq) map[string]interface{} {
-	name := req.Username
-	if name == "" {
-		name = m.Name
-	}
-	avatar := req.AvatarURL
-	if avatar == "" {
-		avatar = m.Avatar
-	}
-	name = truncateUTF8(name, maxFromNameBytes)
-	avatar = truncateUTF8(avatar, maxFromAvatarBytes)
+	name, avatar := resolveFromIdentity(m, req)
 	return map[string]interface{}{
 		"type":    int(common.Text),
 		"content": req.Content,
 		"from": map[string]interface{}{
-			"kind":       "webhook",
+			"kind":       extraKindValue,
 			"webhook_id": m.WebhookID,
 			"name":       name,
 			"avatar":     avatar,
@@ -868,6 +883,22 @@ func buildPayload(m *incomingWebhookModel, req *pushPayloadReq) map[string]inter
 		// 防止 webhook 消息被伪造到其他 Space。
 		"space_id": m.SpaceID,
 	}
+}
+
+// resolveFromIdentity 解析 webhook 消息的展示发送者名/头像：调用方在 push 请求里
+// 覆盖（Username/AvatarURL）优先，否则回落到 webhook 自身配置；两者都裁剪到与
+// create 侧一致的字节上限，防止 push 路径成为绕过列长度约束的旁路。文本与富文本
+// 两条路径共用此函数，保证 from.* 渲染口径一致。
+func resolveFromIdentity(m *incomingWebhookModel, req *pushPayloadReq) (name, avatar string) {
+	name = req.Username
+	if name == "" {
+		name = m.Name
+	}
+	avatar = req.AvatarURL
+	if avatar == "" {
+		avatar = m.Avatar
+	}
+	return truncateUTF8(name, maxFromNameBytes), truncateUTF8(avatar, maxFromAvatarBytes)
 }
 
 // submitRecordSuccess 把审计任务投递给有界并发池：未达上限时异步执行；已达上限时

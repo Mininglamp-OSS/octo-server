@@ -44,11 +44,32 @@ type auditModel struct {
 }
 
 // pushPayloadReq 推送端点的请求体。
+//
+// 兼容两种消息形态，由 MsgType 选择（缺省/"text" 走纯文本，与历史行为一致）：
+//   - 纯文本：Content 必填，客户端按 markdown 渲染（历史契约不变）。
+//   - 富文本/图文混排（MsgType=="richtext"）：Blocks 承载有序图文块，服务端翻译为
+//     octo 原生 RichText(=14) 后走 richtext.Validate/Finalize。对外刻意不暴露内部
+//     ContentType 数字与 plain 等服务端字段——调用方只需描述「文本块 / 图片块」。
 type pushPayloadReq struct {
+	MsgType   string                 `json:"msg_type,omitempty"`
 	Content   string                 `json:"content"`
+	Blocks    []webhookBlock         `json:"blocks,omitempty"`
 	Username  string                 `json:"username,omitempty"`
 	AvatarURL string                 `json:"avatar_url,omitempty"`
 	Extra     map[string]interface{} `json:"extra,omitempty"`
+}
+
+// webhookBlock 是富文本消息的单个有序块（对外契约）。字段刻意与 octo-lib
+// common.RichTextBlock 对齐但独立声明：对外只暴露 text/image 两类块所需的字段，
+// 不让调用方感知内部 ContentType 编号或 plain/size 等服务端派生字段。
+//   - type=="text"  ：Text 必填且非空。
+//   - type=="image" ：URL（仅 http/https）+ Width/Height（>0）必填，供端上占位排版。
+type webhookBlock struct {
+	Type   string `json:"type"`
+	Text   string `json:"text,omitempty"`
+	URL    string `json:"url,omitempty"`
+	Width  int    `json:"width,omitempty"`
+	Height int    `json:"height,omitempty"`
 }
 
 // createReq 管理端创建 webhook 的请求体。
