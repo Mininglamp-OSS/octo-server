@@ -172,6 +172,49 @@ func TestSystemSettings_IncomingWebhookRPS_EnvFallbackWhenDBUnset(t *testing.T) 
 	assert.Equal(t, 7.0, s.IncomingWebhookPerWebhookRPS(), "DB 未配置 → env 生效")
 }
 
+// TestSystemSettings_IncomingWebhook_GetterChain_NoInfra exercises the full
+// snapshot(DB) → env → code-default fallback for the incomingwebhook getters
+// WITHOUT a test server: it drives the snapshot map directly. This lets the
+// core getter logic be verified even where MySQL is unavailable; the DB-backed
+// tests above additionally cover the real Load/Reload path in CI.
+func TestSystemSettings_IncomingWebhook_GetterChain_NoInfra(t *testing.T) {
+	// 1) 空快照 + 无 env → code default。
+	t.Setenv(envIncomingWebhookEnabled, "")
+	t.Setenv(envIncomingWebhookPerWebhookRPS, "")
+	t.Setenv(envIncomingWebhookPerWebhookBurst, "")
+	t.Setenv(envIncomingWebhookMaxPerGroup, "")
+	s := &SystemSettings{}
+	empty := map[string]string{}
+	s.snapshot.Store(&empty)
+	assert.True(t, s.IncomingWebhookEnabled())
+	assert.Equal(t, defaultIncomingWebhookPerWebhookRPS, s.IncomingWebhookPerWebhookRPS())
+	assert.Equal(t, defaultIncomingWebhookPerWebhookBurst, s.IncomingWebhookPerWebhookBurst())
+	assert.Equal(t, defaultIncomingWebhookMaxPerGroup, s.IncomingWebhookMaxPerGroup())
+
+	// 2) env override（snapshot 仍空）。
+	t.Setenv(envIncomingWebhookEnabled, "off")
+	t.Setenv(envIncomingWebhookPerWebhookRPS, "7")
+	t.Setenv(envIncomingWebhookPerWebhookBurst, "3")
+	t.Setenv(envIncomingWebhookMaxPerGroup, "2")
+	assert.False(t, s.IncomingWebhookEnabled())
+	assert.Equal(t, 7.0, s.IncomingWebhookPerWebhookRPS())
+	assert.Equal(t, 3, s.IncomingWebhookPerWebhookBurst())
+	assert.Equal(t, 2, s.IncomingWebhookMaxPerGroup())
+
+	// 3) snapshot(DB) 压制 env。
+	snap := map[string]string{
+		"incomingwebhook.enabled":           "1",
+		"incomingwebhook.per_webhook_rps":   "8.5",
+		"incomingwebhook.per_webhook_burst": "25",
+		"incomingwebhook.max_per_group":     "9",
+	}
+	s.snapshot.Store(&snap)
+	assert.True(t, s.IncomingWebhookEnabled())
+	assert.Equal(t, 8.5, s.IncomingWebhookPerWebhookRPS())
+	assert.Equal(t, 25, s.IncomingWebhookPerWebhookBurst())
+	assert.Equal(t, 9, s.IncomingWebhookMaxPerGroup())
+}
+
 func TestSystemSettings_BoolOverridesYamlWhenSet(t *testing.T) {
 	s := newTestSystemSettings(t, nil)
 	s.ctx.GetConfig().Register.EmailOn = true // yaml says on
