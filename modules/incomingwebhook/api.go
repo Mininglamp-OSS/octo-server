@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -168,6 +169,10 @@ func (w *IncomingWebhook) Route(r *wkhttp.WKHttp) {
 		mgr.PUT("/:group_no/incoming-webhooks/:webhook_id", w.requireMgmtEnabled(), w.update)
 		mgr.DELETE("/:group_no/incoming-webhooks/:webhook_id", w.requireMgmtEnabled(), w.delete)
 		mgr.POST("/:group_no/incoming-webhooks/:webhook_id/regenerate", w.requireMgmtEnabled(), w.regenerate)
+		// 排障：最近投递记录（成功+失败）。只读，与 list 一致不挂 requireMgmtEnabled。
+		mgr.GET("/:group_no/incoming-webhooks/:webhook_id/deliveries", w.deliveries)
+		// 测试推送：管理员一键发一条样例消息验证配置。写操作，挂总开关闸。
+		mgr.POST("/:group_no/incoming-webhooks/:webhook_id/test", w.requireMgmtEnabled(), w.testPush)
 	}
 
 	// 推送类：URL 内 token 鉴权，无 AuthMiddleware。四层限流，由粗到细：
@@ -663,6 +668,119 @@ func (w *IncomingWebhook) regenerate(c *wkhttp.Context) {
 }
 
 // ============================================================
+// 排障 / 测试端点（管理端，群管理员）
+// ============================================================
+
+// deliveries 返回条数控制。
+const (
+	defaultDeliveriesLimit = 50
+	maxDeliveriesLimit     = 100
+)
+
+// testPushContent 是「测试推送」固定文案。webhook 消息本就是任意文本，这里不走 i18n
+// 错误信封（那是错误响应专用）；固定一句中性文案即可，发到群里让管理员确认链路打通。
+const testPushContent = "✅ Incoming Webhook 测试消息：配置成功，链路已打通。"
+
+// deliveries 返回某 webhook 最近的投递记录（成功+失败），供发送方排障。只读、群管理员
+// 可见；绝不返回 token。失败记录的 reason/http_status 与 push 路径返回给调用方的响应
+// 一致，便于对照定位。
+func (w *IncomingWebhook) deliveries(c *wkhttp.Context) {
+	groupNo := c.Param("group_no")
+	webhookID := c.Param("webhook_id")
+	if _, ok := w.requireGroupAdmin(c, groupNo); !ok {
+		return
+	}
+	// 复用 queryManageable：webhook 必须属于该群且未软删除（跨群/不存在→404）。
+	if _, ok := w.queryManageable(c, groupNo, webhookID); !ok {
+		return
+	}
+	limit := defaultDeliveriesLimit
+	if v := c.Query("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > maxDeliveriesLimit {
+		limit = maxDeliveriesLimit
+	}
+	list, err := w.db.queryRecentAudits(webhookID, limit)
+	if err != nil {
+		w.Error("query deliveries failed", zap.String("webhook_id", webhookID), zap.Error(err))
+		mgmtQueryFailed(c)
+		return
+	}
+	resps := make([]deliveryResp, 0, len(list))
+	for _, a := range list {
+		resps = append(resps, deliveryRespFrom(a))
+	}
+	c.Response(map[string]interface{}{"list": resps})
+}
+
+func deliveryRespFrom(a *auditModel) deliveryResp {
+	return deliveryResp{
+		Status:     a.Status,
+		Reason:     a.Reason,
+		HTTPStatus: a.HTTPStatus,
+		Adapter:    a.Adapter,
+		IP:         a.IP,
+		ByteSize:   a.ByteSize,
+		MessageID:  a.MessageID,
+		CreatedAt:  time.Time(a.CreatedAt).Unix(),
+	}
+}
+
+// testPush 由群管理员触发，向群里发一条固定文案的测试消息，端到端验证 webhook 配置
+// （群可达、消息能投递）。走与正式推送相同的 buildPayload(text) → SendMessage 链路，
+// 并记一条 adapter=test 的成功投递，便于在 deliveries 里与真实流量区分。
+func (w *IncomingWebhook) testPush(c *wkhttp.Context) {
+	groupNo := c.Param("group_no")
+	webhookID := c.Param("webhook_id")
+	if _, ok := w.requireGroupAdmin(c, groupNo); !ok {
+		return
+	}
+	// 群必须仍为 Normal —— 不向已解散/禁用群发测试消息（与 create/enable 一致）。
+	g, err := w.requireActiveGroup(groupNo)
+	if err != nil {
+		w.Error("query group failed", zap.Error(err))
+		mgmtQueryFailed(c)
+		return
+	}
+	if g == nil {
+		mgmtGroupNotFound(c)
+		return
+	}
+	m, ok := w.queryManageable(c, groupNo, webhookID)
+	if !ok {
+		return
+	}
+
+	req := &pushPayloadReq{Content: testPushContent}
+	payload := buildPayload(m, req)
+	resp, err := w.ctx.SendMessageWithResult(&config.MsgSendReq{
+		Header:      config.MsgHeader{RedDot: 1},
+		ChannelID:   m.GroupNo,
+		ChannelType: common.ChannelTypeGroup.Uint8(),
+		FromUID:     m.WebhookID,
+		Payload:     []byte(util.ToJson(payload)),
+	})
+	if err != nil {
+		w.Error("send test webhook message failed",
+			zap.String("webhook_id", m.WebhookID), zap.Error(err))
+		mgmtOperationFailed(c)
+		return
+	}
+	var msgID int64
+	if resp != nil {
+		msgID = resp.MessageID
+	}
+	w.submitSuccess(m, len(testPushContent), clientIP(c.Request), msgID, adapterTest)
+	c.Response(map[string]interface{}{
+		"status":     0,
+		"message_id": msgID,
+	})
+}
+
+// ============================================================
 // 推送端点
 // ============================================================
 
@@ -745,6 +863,8 @@ func (w *IncomingWebhook) push(c *wkhttp.Context) {
 		allowed = true
 	}
 	if !allowed {
+		// 鉴权已通过、群为 Normal：失败计入投递审计（body 尚未读，byteSize=0）。
+		w.submitFailure(m, 0, ip, "rate_limited", http.StatusTooManyRequests)
 		pushRateLimited(c)
 		return
 	}
@@ -753,16 +873,19 @@ func (w *IncomingWebhook) push(c *wkhttp.Context) {
 	limit := maxBytes()
 	body, err := io.ReadAll(io.LimitReader(c.Request.Body, int64(limit)+1))
 	if err != nil {
+		w.submitFailure(m, 0, ip, "body", http.StatusBadRequest)
 		pushPayloadInvalid(c, "body")
 		return
 	}
 	if len(body) > limit {
+		w.submitFailure(m, len(body), ip, "too_large", http.StatusRequestEntityTooLarge)
 		pushPayloadTooLarge(c)
 		return
 	}
 
 	var req pushPayloadReq
 	if err := json.Unmarshal(body, &req); err != nil {
+		w.submitFailure(m, len(body), ip, "json", http.StatusBadRequest)
 		pushPayloadInvalid(c, "json")
 		return
 	}
@@ -773,13 +896,19 @@ func (w *IncomingWebhook) push(c *wkhttp.Context) {
 	var payload map[string]interface{}
 	switch strings.ToLower(strings.TrimSpace(req.MsgType)) {
 	case "", msgTypeText:
+		// "text" 是 content 的别名：content 为空时回退，降低从既有集成迁移的改造成本。
+		if req.Content == "" {
+			req.Content = req.Text
+		}
 		if strings.TrimSpace(req.Content) == "" {
+			w.submitFailure(m, len(body), ip, "content", http.StatusBadRequest)
 			pushPayloadInvalid(c, "content")
 			return
 		}
 		// content 语义长度上限（按 rune 计），独立于 8KB 字节 body cap：防止单条消息
 		// 正文过长污染所有客户端渲染。超限按 413 拒绝，与 body 超限同语义。
 		if utf8.RuneCountInString(req.Content) > maxContentRunes() {
+			w.submitFailure(m, len(body), ip, "too_large", http.StatusRequestEntityTooLarge)
 			pushPayloadTooLarge(c)
 			return
 		}
@@ -794,14 +923,17 @@ func (w *IncomingWebhook) push(c *wkhttp.Context) {
 			// 空 text 块 / 非 http(s) 图片 url / 缺图片宽高 / 未知块类型 / 超块数上限）
 			// 一律 400 invalid，reason=blocks 供调用方定位。
 			if errors.Is(err, common.ErrRichTextPayloadTooLarge) {
+				w.submitFailure(m, len(body), ip, "too_large", http.StatusRequestEntityTooLarge)
 				pushPayloadTooLarge(c)
 				return
 			}
+			w.submitFailure(m, len(body), ip, "blocks", http.StatusBadRequest)
 			pushPayloadInvalid(c, "blocks")
 			return
 		}
 		payload = p
 	default:
+		w.submitFailure(m, len(body), ip, "msg_type", http.StatusBadRequest)
 		pushPayloadInvalid(c, "msg_type")
 		return
 	}
@@ -818,6 +950,7 @@ func (w *IncomingWebhook) push(c *wkhttp.Context) {
 	if err != nil {
 		w.Error("send incoming webhook message failed",
 			zap.String("webhook_id", m.WebhookID), zap.Error(err))
+		w.submitFailure(m, len(body), ip, "delivery_failed", http.StatusBadGateway)
 		pushDeliveryFailed(c)
 		return
 	}
@@ -828,7 +961,7 @@ func (w *IncomingWebhook) push(c *wkhttp.Context) {
 		msgID = resp.MessageID
 	}
 	// 审计用同一可信 IP（clientIP），而非 gin 可伪造的 c.ClientIP()。
-	w.submitRecordSuccess(m, len(body), ip, msgID)
+	w.submitSuccess(m, len(body), ip, msgID, adapterNative)
 
 	c.Response(map[string]interface{}{
 		"status":     0,
@@ -904,53 +1037,83 @@ func resolveFromIdentity(m *incomingWebhookModel, req *pushPayloadReq) (name, av
 	return truncateUTF8(name, maxFromNameBytes), truncateUTF8(avatar, maxFromAvatarBytes)
 }
 
-// submitRecordSuccess 把审计任务投递给有界并发池：未达上限时异步执行；已达上限时
-// **丢弃**本次审计（仅 Warn）。如此审计占用的 DB 连接总数恒 ≤ auditSem 容量，不会在
-// 洪峰下与主流量抢连接池。审计为非关键路径，溢出丢弃优于回落到请求 goroutine 同步执行
-// （后者请求并发无界时会重新压垮连接池）。
-func (w *IncomingWebhook) submitRecordSuccess(m *incomingWebhookModel, byteSize int, ip string, msgID int64) {
+// submitSuccess 记录一次成功投递：审计 + 累加调用计数(bumpUsed=true)。adapter 标记
+// 来源（native 推送 / test 测试推送）。
+func (w *IncomingWebhook) submitSuccess(m *incomingWebhookModel, byteSize int, ip string, msgID int64, adapter string) {
+	w.submitDelivery(&auditModel{
+		WebhookID:  m.WebhookID,
+		GroupNo:    m.GroupNo,
+		IP:         ip,
+		ByteSize:   byteSize,
+		MessageID:  msgID,
+		Status:     auditSuccess,
+		HTTPStatus: http.StatusOK,
+		Adapter:    adapter,
+	}, true)
+}
+
+// submitFailure 记录一次【鉴权通过后】的失败投递（限流/payload 非法/体积过大/投递失败）。
+// 不累加调用计数(bumpUsed=false)——call_count 语义是「成功调用次数」。reason/httpStatus
+// 与 push 路径返回给调用方的响应保持一致，供 deliveries 端点排障。
+//
+// ⚠️ 仅在 webhook 已通过 token 鉴权且群为 Normal 之后调用：鉴权失败（未知/错 token/
+// 已解散群）绝不落本表，只进 IP 失败预算，维持 push 路径的反枚举不变量。
+func (w *IncomingWebhook) submitFailure(m *incomingWebhookModel, byteSize int, ip, reason string, httpStatus int) {
+	w.submitDelivery(&auditModel{
+		WebhookID:  m.WebhookID,
+		GroupNo:    m.GroupNo,
+		IP:         ip,
+		ByteSize:   byteSize,
+		Status:     auditFailed,
+		Reason:     reason,
+		HTTPStatus: httpStatus,
+		Adapter:    adapterNative,
+	}, false)
+}
+
+// submitDelivery 把审计任务投递给有界并发池：未达上限时异步执行；已达上限时**丢弃**
+// 本次审计（仅 Warn）。如此审计占用的 DB 连接总数恒 ≤ auditSem 容量，不会在洪峰下与
+// 主流量抢连接池。审计为非关键路径，溢出丢弃优于回落到请求 goroutine 同步执行（后者
+// 请求并发无界时会重新压垮连接池）。
+func (w *IncomingWebhook) submitDelivery(audit *auditModel, bumpUsed bool) {
 	select {
 	case w.auditSem <- struct{}{}:
 		go func() {
 			defer func() { <-w.auditSem }()
-			w.recordSuccess(m, byteSize, ip, msgID)
+			w.recordDelivery(audit, bumpUsed)
 		}()
 	default:
 		// 并发已达上限：丢弃审计，保证总 DB 并发有界、不抢占主流量连接池。
 		w.Warn("audit dropped: concurrency cap reached",
-			zap.String("webhook_id", m.WebhookID))
+			zap.String("webhook_id", audit.WebhookID))
 	}
 }
 
-// auditWriteTimeout 限定一次审计（markUsed + insertAudit 两次写）的总耗时上限。
-// recordSuccess 始终跑在独立 goroutine 上（submitRecordSuccess 满载时直接丢弃、不回落
-// 到请求 goroutine），所以这个超时**不影响 push 响应延迟**；它的作用是封顶单个 detached
+// auditWriteTimeout 限定一次审计（markUsed + insertAudit 最多两次写）的总耗时上限。
+// recordDelivery 始终跑在独立 goroutine 上（submitDelivery 满载时直接丢弃、不回落到
+// 请求 goroutine），所以这个超时**不影响 push 响应延迟**；它的作用是封顶单个 detached
 // 审计 goroutine 在 DB 饱和/故障时持有连接池连接的时长，避免慢 DB 下连接被长期占用。
 // 3s 足够正常写入，又能在故障时快速放手（审计本就是非关键路径，失败仅记日志）。
 const auditWriteTimeout = 3 * time.Second
 
-// recordSuccess 写审计 + 累加调用计数。失败仅记日志，不阻塞主流程。
-func (w *IncomingWebhook) recordSuccess(m *incomingWebhookModel, byteSize int, ip string, msgID int64) {
+// recordDelivery 写一条投递审计；bumpUsed 时额外累加调用计数（仅成功路径）。失败仅记
+// 日志，不阻塞主流程。
+func (w *IncomingWebhook) recordDelivery(audit *auditModel, bumpUsed bool) {
 	defer func() {
 		if r := recover(); r != nil {
-			w.Error("recordSuccess panic", zap.Any("recover", r))
+			w.Error("recordDelivery panic", zap.Any("recover", r))
 		}
 	}()
 	// 两次写共用一个截止时间，封顶单个审计 goroutine 在 DB 饱和/故障时持有连接的时长。
 	ctx, cancel := context.WithTimeout(context.Background(), auditWriteTimeout)
 	defer cancel()
-	if err := w.db.markUsed(ctx, m.WebhookID, time.Now()); err != nil {
-		w.Warn("markUsed failed", zap.String("webhook_id", m.WebhookID), zap.Error(err))
-	}
-	audit := &auditModel{
-		WebhookID: m.WebhookID,
-		GroupNo:   m.GroupNo,
-		IP:        ip,
-		ByteSize:  byteSize,
-		MessageID: msgID,
+	if bumpUsed {
+		if err := w.db.markUsed(ctx, audit.WebhookID, time.Now()); err != nil {
+			w.Warn("markUsed failed", zap.String("webhook_id", audit.WebhookID), zap.Error(err))
+		}
 	}
 	if err := w.db.insertAudit(ctx, audit); err != nil {
-		w.Warn("insert audit failed", zap.String("webhook_id", m.WebhookID), zap.Error(err))
+		w.Warn("insert audit failed", zap.String("webhook_id", audit.WebhookID), zap.Error(err))
 	}
 }
 

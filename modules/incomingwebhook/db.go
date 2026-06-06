@@ -167,10 +167,24 @@ func (d *incomingWebhookDB) disableByGroupNo(groupNo string) error {
 	return err
 }
 
-// insertAudit 写一条成功推送审计。同样走 ExecContext，理由见 markUsed。
+// insertAudit 写一条投递审计（成功或失败）。新增列（status/reason/http_status/adapter）
+// 由 util.AttrToUnderscore + Record 反射自动映射，无需改动。走 ExecContext，理由见 markUsed。
 func (d *incomingWebhookDB) insertAudit(ctx context.Context, m *auditModel) error {
 	_, err := d.session.InsertInto("incoming_webhook_audit").
 		Columns(util.AttrToUnderscore(m)...).
 		Record(m).ExecContext(ctx)
 	return err
+}
+
+// queryRecentAudits 倒序取某 webhook 最近 limit 条投递记录，供管理端 deliveries 排障。
+// 命中 idx_iwa_webhook_time(webhook_id, created_at) 前缀索引：等值 webhook_id + 按
+// created_at 倒序，无需回表全扫。limit 由调用方钳制在合理上限。
+func (d *incomingWebhookDB) queryRecentAudits(webhookID string, limit int) ([]*auditModel, error) {
+	var list []*auditModel
+	_, err := d.session.Select("*").From("incoming_webhook_audit").
+		Where("webhook_id=?", webhookID).
+		OrderDir("created_at", false).
+		Limit(uint64(limit)).
+		Load(&list)
+	return list, err
 }

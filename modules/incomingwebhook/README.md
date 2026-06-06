@@ -33,6 +33,8 @@ Content-Type: application/json
 ```
 
 - `content`：必填，非空；语义长度上限 4000 rune（`DM_INCOMINGWEBHOOK_MAX_CONTENT_RUNES`）。
+- `text`：`content` 的别名（Slack 等平台习惯用 `text`）。`content` 为空时回退到 `text`，
+  降低从既有集成迁移的改造成本；两者都填以 `content` 为准。
 - `username` / `avatar_url`：可选，覆盖该条消息的展示发送者名/头像（不改 webhook 本身配置）。
 
 ### 2. 富文本 / 图文混排（`msg_type` = `"richtext"`）
@@ -86,3 +88,50 @@ Content-Type: application/json
 | 体积过大 | 413 | 超 body cap 或富文本 >1MB |
 | 投递失败 | 502 | 下游发送失败 |
 | 功能停用 | 404 | 全局开关 `incomingwebhook.enabled=0` |
+
+## 管理端点（群主 / 管理员）
+
+需登录态 + 群管理员权限，路径前缀 `/v1/groups/:group_no/incoming-webhooks`。
+除创建/列出/更新/删除/重置外，Phase 2 新增两个：
+
+### 测试推送
+
+```
+POST /v1/groups/:group_no/incoming-webhooks/:webhook_id/test
+```
+
+向群里发一条固定文案的测试消息，端到端验证配置（群可达、消息能投递）。返回
+`{"status":0,"message_id":<int>}`。会记一条 `adapter=test` 的成功投递，便于在
+deliveries 里与真实流量区分。
+
+### 投递记录（排障）
+
+```
+GET /v1/groups/:group_no/incoming-webhooks/:webhook_id/deliveries?limit=50
+```
+
+倒序返回该 webhook 最近的投递记录（**成功 + 失败**），供发送方排障。`limit` 默认 50、
+上限 100。失败记录的 `reason` / `http_status` 与 push 响应一致，便于对照定位。
+
+```json
+{
+  "list": [
+    {
+      "status": 2, "reason": "blocks", "http_status": 400, "adapter": "native",
+      "ip": "203.0.113.10", "byte_size": 84, "message_id": 0, "created_at": 1749200000
+    },
+    {
+      "status": 1, "reason": "", "http_status": 200, "adapter": "native",
+      "ip": "203.0.113.10", "byte_size": 42, "message_id": 123456, "created_at": 1749199900
+    }
+  ]
+}
+```
+
+- `status`：`1`=成功，`2`=失败。
+- `reason`（失败时）：`rate_limited` / `body` / `json` / `content` / `blocks` / `msg_type` /
+  `too_large` / `delivery_failed`。
+- `adapter`：`native`（推送端点）/ `test`（测试推送）。
+
+> **反枚举不变量**：鉴权失败（未知 webhook / 错 token / 已解散群）**不记入** deliveries，
+> 只进 IP 失败预算——只有「鉴权通过后」的投递结果才落审计。

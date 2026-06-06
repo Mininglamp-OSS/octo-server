@@ -204,6 +204,53 @@ func TestMarkUsed_SkipsDeleted(t *testing.T) {
 	}
 }
 
+// TestInsertAndQueryAudit 验证 Phase 2 审计扩展的 DB 层：insertAudit 落库成功+失败两
+// 类记录（新增列 status/reason/http_status/adapter 由反射自动映射），queryRecentAudits
+// 按 webhook 取回并受 limit 钳制。同步路径，不依赖异步 submitDelivery，断言确定。
+func TestInsertAndQueryAudit(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer testutil.CleanAllTables(ctx)
+	d := newDB(ctx)
+
+	groupNo := "g_" + util.GenerUUID()[:12]
+	whID := mustInsertWebhook(t, d, groupNo)
+
+	assert.NoError(t, d.insertAudit(context.Background(), &auditModel{
+		WebhookID: whID, GroupNo: groupNo, IP: "1.2.3.4", ByteSize: 12, MessageID: 99,
+		Status: auditSuccess, HTTPStatus: 200, Adapter: adapterNative,
+	}))
+	assert.NoError(t, d.insertAudit(context.Background(), &auditModel{
+		WebhookID: whID, GroupNo: groupNo, IP: "1.2.3.4",
+		Status: auditFailed, Reason: "rate_limited", HTTPStatus: 429, Adapter: adapterNative,
+	}))
+
+	list, err := d.queryRecentAudits(whID, 10)
+	assert.NoError(t, err)
+	assert.Len(t, list, 2)
+	// created_at 同秒内顺序不保证，只校验集合内容与字段映射。
+	var success, failed int
+	for _, a := range list {
+		assert.Equal(t, adapterNative, a.Adapter)
+		switch a.Status {
+		case auditSuccess:
+			success++
+			assert.Equal(t, 200, a.HTTPStatus)
+			assert.Equal(t, int64(99), a.MessageID)
+		case auditFailed:
+			failed++
+			assert.Equal(t, "rate_limited", a.Reason)
+			assert.Equal(t, 429, a.HTTPStatus)
+		}
+	}
+	assert.Equal(t, 1, success, "should record one success")
+	assert.Equal(t, 1, failed, "should record one failure")
+
+	// limit 钳制。
+	limited, err := d.queryRecentAudits(whID, 1)
+	assert.NoError(t, err)
+	assert.Len(t, limited, 1)
+}
+
 func mustInsertWebhook(t *testing.T, d *incomingWebhookDB, groupNo string) string {
 	t.Helper()
 	return mustInsertWebhookWithMax(t, d, groupNo, 100)

@@ -33,13 +33,31 @@ type incomingWebhookModel struct {
 	db.BaseModel
 }
 
-// auditModel 对应 incoming_webhook_audit 表，记录成功推送的最小审计信息。
+// 审计投递结果（auditModel.Status）。1/2 而非 0/1：避免「未设置即默认 0」被误读为
+// 一个有效结果——历史行与新成功行都应是 auditSuccess(1)，迁移默认值即 1。
+const (
+	auditSuccess = 1
+	auditFailed  = 2
+)
+
+// 投递来源/适配器（auditModel.Adapter）。Phase 3/4 扩展 github/gitlab/wecom/feishu。
+const (
+	adapterNative = "native" // 原生推送端点
+	adapterTest   = "test"   // 管理端「测试推送」
+)
+
+// auditModel 对应 incoming_webhook_audit 表，记录【鉴权通过后】的每次投递结果
+// （成功+失败）。鉴权失败（未知/错 token）不落本表，仅进 IP 失败预算，维持反枚举。
 type auditModel struct {
-	WebhookID string
-	GroupNo   string
-	IP        string
-	ByteSize  int
-	MessageID int64
+	WebhookID  string
+	GroupNo    string
+	IP         string
+	ByteSize   int
+	MessageID  int64
+	Status     int    // auditSuccess / auditFailed
+	Reason     string // 失败原因码；成功为空
+	HTTPStatus int    // 返回给调用方的 HTTP 状态码
+	Adapter    string // 来源/适配器：adapterNative / adapterTest / ...
 	db.BaseModel
 }
 
@@ -51,8 +69,11 @@ type auditModel struct {
 //     octo 原生 RichText(=14) 后走 richtext.Validate/Finalize。对外刻意不暴露内部
 //     ContentType 数字与 plain 等服务端字段——调用方只需描述「文本块 / 图片块」。
 type pushPayloadReq struct {
-	MsgType   string                 `json:"msg_type,omitempty"`
-	Content   string                 `json:"content"`
+	MsgType string `json:"msg_type,omitempty"`
+	Content string `json:"content"`
+	// Text 是 Content 的别名（Slack/部分平台用 "text"）：Content 为空时回退到 Text，
+	// 降低从既有集成迁移的改造成本。两者都填以 Content 为准。
+	Text      string                 `json:"text,omitempty"`
 	Blocks    []webhookBlock         `json:"blocks,omitempty"`
 	Username  string                 `json:"username,omitempty"`
 	AvatarURL string                 `json:"avatar_url,omitempty"`
@@ -106,4 +127,16 @@ type createResp struct {
 	webhookResp
 	Token string `json:"token"`
 	URL   string `json:"url"`
+}
+
+// deliveryResp 是 deliveries 排障端点返回的单条投递记录（成功+失败）。绝不含 token。
+type deliveryResp struct {
+	Status     int    `json:"status"`      // auditSuccess / auditFailed
+	Reason     string `json:"reason"`      // 失败原因码；成功为空
+	HTTPStatus int    `json:"http_status"` // 返回给调用方的 HTTP 状态码
+	Adapter    string `json:"adapter"`     // 来源/适配器
+	IP         string `json:"ip"`
+	ByteSize   int    `json:"byte_size"`
+	MessageID  int64  `json:"message_id"`
+	CreatedAt  int64  `json:"created_at"`
 }
