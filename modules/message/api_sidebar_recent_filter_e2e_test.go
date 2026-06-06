@@ -1,3 +1,5 @@
+//go:build integration
+
 package message
 
 // End-to-end coverage for the configurable recent-tab activity filter
@@ -10,6 +12,17 @@ package message
 // sidebar.* settings have no yaml fallback, so the singleton SystemSettings
 // instance reads the rows we POST regardless of which ctx it was first bound
 // to — the documented binding footgun does not apply here.
+//
+// Build-tagged `integration` (run with `go test -tags=integration`), matching
+// api_sidebar_integration_test.go. These tests spin up testutil.NewTestServer
+// against the shared `test` DB; running them in the default `go test ./...`
+// Test job is order-fragile (a prior test in the package can leave the schema
+// in a state where NewTestServer's module.Setup re-applies a migration whose
+// table already exists and panics, crashing the whole package binary). The
+// per-type filter logic is covered by the unit tests in api_sidebar_test.go,
+// and the system_settings DB read/write path by the common package tests, both
+// of which run in the default Test job; this file is the extra full-stack glue
+// check.
 
 import (
 	"bytes"
