@@ -8,7 +8,7 @@ import (
 func init() {
 	register.AddModule(func(ctx interface{}) register.Module {
 		return register.Module{
-			Name: "auth_jwt",
+			Name: "bot_provision",
 			SetupAPI: func() register.APIRouter {
 				return New(ctx.(*config.Context))
 			},

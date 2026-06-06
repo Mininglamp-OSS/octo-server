@@ -108,7 +108,7 @@ func (a *BotProvision) botToken(c *wkhttp.Context) {
 		return
 	}
 	apiKey := strings.TrimPrefix(auth, "Bearer ")
-	callerUID, callerSpace, _, err := a.resolveAPIKey(apiKey, "", "")
+	callerUID, callerSpace, err := a.resolveAPIKey(apiKey)
 	if err != nil {
 		c.ResponseErrorWithStatus(errors.New("invalid api_key"), http.StatusUnauthorized)
 		return

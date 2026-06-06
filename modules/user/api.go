@@ -3901,21 +3901,42 @@ func (u *User) queryUserSpaceContext(uid string) ([]string, map[string][]string,
 		spaces = append(spaces, r.SpaceID)
 	}
 
-	// (2) bots the user created, joined with each bot's space membership
+	// (2) bots the user created, joined with each bot's space membership.
+	//
+	// v3.2 silent-truncation guard: LIMIT 1001 (not 1000) + warn log when
+	// the result count hits 1001. owned_bots_by_space is fed to fleet/matter
+	// as an authz primitive — silently dropping bots past the limit could
+	// produce "this user owns bot X but the authz cache says they don't",
+	// a notoriously hard-to-diagnose authz hole. We don't raise the limit
+	// (1000 is still the policy cap for one user's bots) but we make the
+	// truncation observable so ops can spot the rare power user hitting it.
 	type botSpaceRow struct {
 		RobotID string `db:"robot_id"`
 		SpaceID string `db:"space_id"`
 	}
+	const ownedBotsLimit = 1000
 	var botRows []botSpaceRow
 	_, err = u.db.session.SelectBySql(
 		`SELECT r.robot_id, sm.space_id FROM robot r
 		 INNER JOIN space_member sm ON sm.uid=r.robot_id AND sm.status=1
 		 WHERE r.creator_uid=? AND r.status=1
-		 LIMIT 1000`,
+		 LIMIT 1001`,
 		uid,
 	).Load(&botRows)
 	if err != nil {
 		return nil, nil, err
+	}
+	if len(botRows) > ownedBotsLimit {
+		// >1000 means we hit the cap. Truncate to the policy limit so
+		// downstream consumers see a deterministic size, but emit a warn
+		// so ops can react. Authz remains fail-safe (extra bots get no
+		// access via owned_bots_by_space; they fall through to the
+		// pre-v2 related_uids / SQL owner_uid filters).
+		u.Warn("queryUserSpaceContext owned_bots truncated at policy limit",
+			zap.String("uid", uid),
+			zap.Int("limit", ownedBotsLimit),
+			zap.Int("returned", len(botRows)))
+		botRows = botRows[:ownedBotsLimit]
 	}
 
 	// Initialize map with one bucket per known space so callers always see
