@@ -58,8 +58,11 @@ Content-Type: application/json
 约束：
 
 - `blocks` 必填且非空；块数量上限默认 50（`DM_INCOMINGWEBHOOK_MAX_BLOCKS`）。
-- 整条消息序列化后 ≤ 1MB（图片仅 URL 引用，不内嵌）。
-- 请求体仍受 8KB body cap 约束（`DM_INCOMINGWEBHOOK_MAX_BYTES`）。
+- **实际生效的上限是 8KB body cap**（`DM_INCOMINGWEBHOOK_MAX_BYTES`）：请求体在解析前即被
+  截断，超出按 413 拒绝。由于图片仅 URL 引用（不内嵌 base64），8KB 足以承载数十个文本/
+  图片块；多图文消息请用 URL 引用，不要内联大体积内容。
+- 服务端另有 1MB 的 RichText 硬上限（octo-lib 契约）兜底，但在默认 8KB body cap 下不会
+  先触达——它是上调 body cap 后才会成为约束的二级护栏。
 
 ## 通用字段与安全
 
