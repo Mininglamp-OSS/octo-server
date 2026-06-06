@@ -3779,6 +3779,15 @@ type authVerifyTokenResp struct {
 	Role      string     `json:"role"`
 	OwnedBots []ownedBot `json:"owned_bots"`
 
+	// v3 §4.5 (fleet fail-closed signal): explicit flag set true when
+	// the caller passed ?include=context AND server is v2-or-later.
+	// Lets fleet/matter distinguish "server returned empty spaces (caller
+	// truly belongs to zero spaces)" from "pre-v2 server omitted the field
+	// because it doesn't speak the contract" — without this, both shapes
+	// look identical after omitempty erases empty []. Fleet uses this to
+	// pick fail-closed (v2) vs fallback (pre-v2) for X-Space-Id checks.
+	ContextIncluded bool `json:"context_included,omitempty"`
+
 	// Populated only when ?include=context. Kept as separate fields so the
 	// default response shape (UID/Name/Role/OwnedBots) is byte-identical to
 	// the pre-v2 contract — old IM clients and admin tools rely on the
@@ -3859,6 +3868,7 @@ func (u *User) authVerifyToken(c *wkhttp.Context) {
 			spaces = []string{}
 			ownedByspace = map[string][]string{}
 		}
+		resp.ContextIncluded = true
 		resp.Spaces = spaces
 		resp.OwnedBotsBySpace = ownedByspace
 	}
@@ -4011,9 +4021,13 @@ type authVerifyAPIKeyReq struct {
 }
 
 type authVerifyAPIKeyResp struct {
-	UID        string              `json:"uid"`
-	SpaceID    string              `json:"space_id"`
-	OwnedBots  map[string][]string `json:"owned_bots,omitempty"` // populated only when ?include=context
+	UID     string `json:"uid"`
+	SpaceID string `json:"space_id"`
+
+	// v3 §4.5: same explicit signal as authVerifyTokenResp so fleet/matter
+	// pick fail-closed vs fallback consistently across token/api_key paths.
+	ContextIncluded bool                `json:"context_included,omitempty"`
+	OwnedBots       map[string][]string `json:"owned_bots,omitempty"` // populated only when ?include=context
 }
 
 // authVerifyAPIKey validates a daemon API key (uk_ prefix) and returns the
@@ -4085,6 +4099,7 @@ func (u *User) authVerifyAPIKey(c *wkhttp.Context) {
 			// bot is missing — better than masking the issue with a 500.
 			ownedBots = []string{}
 		}
+		resp.ContextIncluded = true
 		resp.OwnedBots = map[string][]string{
 			keyInfo.SpaceID: ownedBots,
 		}
