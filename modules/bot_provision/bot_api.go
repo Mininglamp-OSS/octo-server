@@ -102,7 +102,7 @@ func (a *BotProvision) botToken(c *wkhttp.Context) {
 		return
 	}
 	apiKey := strings.TrimPrefix(auth, "Bearer ")
-	callerUID, _, _, err := a.resolveAPIKey(apiKey, "", "")
+	callerUID, callerSpace, _, err := a.resolveAPIKey(apiKey, "", "")
 	if err != nil {
 		c.ResponseErrorWithStatus(errors.New("invalid api_key"), http.StatusUnauthorized)
 		return
@@ -121,8 +121,20 @@ func (a *BotProvision) botToken(c *wkhttp.Context) {
 	// admin disable is the kill switch and shouldn't be bypassable via the
 	// daemon path. Aligns with the sibling /v1/auth/verify-bot which also
 	// filters status=1.
-	_, err = a.ctx.DB().Select("bot_token", "creator_uid").From("robot").
-		Where("robot_id=? AND status=1", botUID).Load(&r)
+	//
+	// v2 cross-space filter (reviewer server#290 P2): bot must be a member
+	// of the caller api_key's bound space. Without the space join, an
+	// api_key bound to SpaceB whose owner is also the bot's creator in
+	// SpaceA could pull SpaceA's bot_token, bypassing the user-space
+	// trust boundary that 决策二 established. bot is itself a user, its
+	// space membership lives in space_member; mirrors the join pattern in
+	// botfather/db.go:71.
+	_, err = a.ctx.DB().SelectBySql(
+		`SELECT r.bot_token, r.creator_uid FROM robot r
+		 INNER JOIN space_member sm ON sm.uid=r.robot_id AND sm.space_id=? AND sm.status=1
+		 WHERE r.robot_id=? AND r.status=1`,
+		callerSpace, botUID,
+	).Load(&r)
 	if err != nil {
 		a.Error("query robot for token", zap.Error(err), zap.String("bot_uid", botUID))
 		c.ResponseError(errors.New("lookup failed"))
