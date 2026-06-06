@@ -55,9 +55,8 @@ func TestE2E_RecentFilter_DefaultsReproduceLegacyBehaviour(t *testing.T) {
 	// defaults here (PR #291 review, lml2468).
 	require.NoError(t, commonapi.EnsureSystemSettings(ctx).Reload())
 
-	sb := &Sidebar{ctx: ctx}
 	now := time.Now()
-	cutoffs := sb.loadRecentCutoffs(now)
+	cutoffs := loadRecentCutoffs(ctx, now)
 
 	assert.Equal(t, daysCutoff(now, 3), cutoffs.group, "群默认 3 天窗口")
 	assert.Equal(t, daysCutoff(now, 3), cutoffs.thread, "话题默认 3 天窗口")
@@ -101,9 +100,8 @@ func TestE2E_RecentFilter_AdminOverrideTakesEffect(t *testing.T) {
 	s.GetRoute().ServeHTTP(w, req)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
-	sb := &Sidebar{ctx: ctx}
 	now := time.Now()
-	cutoffs := sb.loadRecentCutoffs(now)
+	cutoffs := loadRecentCutoffs(ctx, now)
 	assert.Equal(t, int64(0), cutoffs.group, "群窗口关闭 → cutoff 0")
 	assert.Equal(t, daysCutoff(now, 3), cutoffs.thread)
 	assert.Equal(t, daysCutoff(now, 7), cutoffs.person)
