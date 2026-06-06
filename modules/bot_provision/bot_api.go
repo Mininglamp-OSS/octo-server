@@ -217,22 +217,28 @@ func (a *BotProvision) Route(r *wkhttp.WKHttp) {
 	// Removed legacy auth endpoints (决策一+二 Phase 4). 410 Gone so a
 	// straggler client distinguishes "endpoint was removed by design" from
 	// "wrong URL / typo". Each stub returns a stable JSON body pointing at
-	// the replacement path so client owners can fix in place. Sunset +
-	// Deprecation headers per RFC 8594 / draft-ietf-httpapi-deprecation so
-	// automated clients can detect the deprecation programmatically.
+	// the replacement path so client owners can fix in place.
 	//
-	// Sunset date format: HTTP-date (RFC 7231 §7.1.1.1). The placeholder
-	// is updated by the deploy pipeline to (push_date + 7 days). If you
-	// see "<TBD>" in a deployed response, the deploy pipeline missed the
-	// substitution — file a P1 against the rollout runbook.
-	const sunsetTBD = "<TBD: push 日期 +7 天>"
+	// Sunset (RFC 8594) + Deprecation (draft-ietf-httpapi-deprecation):
+	// emitted by gone410Handler so automated clients can detect the
+	// deprecation programmatically.
+	//
+	// v3.3.1 §A.3 (yujiawei P2 三审): the v3 placeholder
+	// "<TBD: push 日期 +7 天>" contained multibyte UTF-8 and was not a
+	// valid RFC 7231 HTTP-date — no deploy pipeline substitution exists
+	// in this repo, so the malformed header would have shipped. Replaced
+	// with a real hardcoded date (push day + 7d). If push slips, update
+	// the constants below in a one-line follow-up commit.
+	//
+	// Deprecation header: v3 emitted boolean "true" (early-draft form);
+	// the current draft mandates "@<unix-seconds>". Emitting the
+	// spec-conformant value so any client implementing the cited spec
+	// recognizes it.
 	r.GET("/.well-known/jwks.json", gone410Handler(
-		sunsetTBD,
 		"JWKS endpoint removed — fleet/matter no longer verify JWTs locally. "+
 			"Use POST /v1/auth/verify (session) or /v1/auth/verify-api-key (daemon) instead.",
 	))
 	r.POST("/v1/auth/token", gone410Handler(
-		sunsetTBD,
 		"Token exchange endpoint removed — daemon no longer exchanges api_key for a JWT. "+
 			"Send api_key directly as Authorization: Bearer to fleet/matter; they will "+
 			"call /v1/auth/verify-api-key for validation.",
@@ -241,12 +247,23 @@ func (a *BotProvision) Route(r *wkhttp.WKHttp) {
 
 // gone410Handler returns a wkhttp handler that always responds with HTTP 410
 // Gone + a structured JSON body describing why the endpoint was removed and
-// where to migrate. Sunset/Deprecation headers (RFC 8594) let automated
-// clients detect the deprecation without parsing the body.
-func gone410Handler(sunsetDate, reason string) func(*wkhttp.Context) {
+// where to migrate. Sunset/Deprecation headers (RFC 8594 / current
+// draft-ietf-httpapi-deprecation) let automated clients detect the
+// deprecation without parsing the body.
+//
+// Sunset constant: real RFC 7231 HTTP-date. Update before each release if
+// the push date shifts.
+// Deprecation constant: "@<unix-seconds>" per current draft (not boolean
+// "true" which was an earlier expired draft).
+const (
+	gone410SunsetDate      = "Fri, 13 Jun 2026 00:00:00 GMT"
+	gone410DeprecationDate = "@1749427200" // 2026-06-09T00:00:00Z (deploy day)
+)
+
+func gone410Handler(reason string) func(*wkhttp.Context) {
 	return func(c *wkhttp.Context) {
-		c.Header("Sunset", sunsetDate)
-		c.Header("Deprecation", "true")
+		c.Header("Sunset", gone410SunsetDate)
+		c.Header("Deprecation", gone410DeprecationDate)
 		c.AbortWithStatusJSON(http.StatusGone, gin.H{
 			"error":   "gone",
 			"message": reason,

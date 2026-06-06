@@ -3,6 +3,7 @@ package user
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -171,6 +172,86 @@ func TestAuthVerifyToken_UnknownIncludeValue_TreatedAsAbsent(t *testing.T) {
 
 	body := w.Body.String()
 	assert.NotContains(t, body, "spaces", "unknown include must fall back to default schema")
+}
+
+// v3.3.1 §A.1 (Jerry-Xin Critical 三审): queryUserSpaceContext query (1)
+// now joins `space ON s.status=1`. Without this, a user with a lingering
+// active space_member row in a soft-deleted space (s.status=0) would
+// surface that space in both `spaces` and `owned_bots_by_space` —
+// inconsistent with the api_key path which v3 §2.3 had already fixed via
+// assertSpaceMember. This test seeds the exact disabled-space case to
+// lock the fix.
+func TestAuthVerifyToken_WithInclude_FiltersDisabledSpace(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	seedVerifyTokenFixtures(t, ctx)
+
+	// disabled space: user is an active member but space.status=0
+	const disabledSpace = "verify_token_space_disabled"
+	_, err := ctx.DB().InsertInto("space").
+		Columns("space_id", "name", "creator", "status").
+		Values(disabledSpace, "Disabled", testutil.UID, 0). // status=0 disabled
+		Exec()
+	require.NoError(t, err)
+	_, err = ctx.DB().InsertInto("space_member").
+		Columns("space_id", "uid", "role", "status").
+		Values(disabledSpace, testutil.UID, 0, 1). // member row still active
+		Exec()
+	require.NoError(t, err)
+
+	// bot exists in disabled space — must not leak through owned_bots_by_space
+	insertBot(t, ctx, "bot_in_disabled", testutil.UID, disabledSpace)
+
+	w := doVerifyToken(t, s, map[string]string{"token": testutil.Token}, true)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	var resp struct {
+		Spaces           []string            `json:"spaces"`
+		OwnedBotsBySpace map[string][]string `json:"owned_bots_by_space"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+
+	// invariant 1: disabled space not in `spaces`
+	assert.NotContains(t, resp.Spaces, disabledSpace,
+		"disabled space (s.status=0) must not appear in spaces — v3.3.1 §A.1")
+
+	// invariant 2: disabled space not a key in `owned_bots_by_space`
+	require.NotNil(t, resp.OwnedBotsBySpace)
+	assert.NotContains(t, resp.OwnedBotsBySpace, disabledSpace,
+		"bots in a disabled space must not surface via owned_bots_by_space")
+}
+
+// v3.3.1 §A.2 (yujiawei P1 三审): when a user is an active member of more
+// than the policy limit (100) of spaces, the over-fetch (LIMIT 101)
+// detects the truncation and slices back to 100. The warn log is fired
+// but we don't assert on log here (would require zap testcore); the
+// behavioral guarantee tested is the slice length cap.
+func TestQueryUserSpaceContext_SpacesTruncatedAtPolicyLimit(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+
+	// seed 105 active spaces with the test user as an active member
+	for i := 0; i < 105; i++ {
+		sid := fmt.Sprintf("st_trunc_space_%03d", i)
+		_, err := ctx.DB().InsertInto("space").
+			Columns("space_id", "name", "creator", "status").
+			Values(sid, "T"+sid, testutil.UID, 1).Exec()
+		require.NoError(t, err)
+		_, err = ctx.DB().InsertInto("space_member").
+			Columns("space_id", "uid", "role", "status").
+			Values(sid, testutil.UID, 0, 1).Exec()
+		require.NoError(t, err)
+	}
+
+	w := doVerifyToken(t, s, map[string]string{"token": testutil.Token}, true)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	var resp struct {
+		Spaces []string `json:"spaces"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Len(t, resp.Spaces, 100,
+		"spaces must be capped at policy limit (100), got %d", len(resp.Spaces))
 }
 
 // v3 §2.4 (yujiawei P2): a bot the caller owns that also lives in a space

@@ -3884,13 +3884,35 @@ func (u *User) authVerifyToken(c *wkhttp.Context) {
 // (bot is itself a user; robot table has no space_id). Mirrors the join
 // pattern in botfather/db.go queryRobotsByCreatorUIDAndSpaceID.
 func (u *User) queryUserSpaceContext(uid string) ([]string, map[string][]string, error) {
-	// (1) spaces the user is an active member of
+	// (1) spaces the user is an active member of.
+	//
+	// v3.3.1 §A.1 (Jerry-Xin Critical 三审): INNER JOIN space ON s.status=1
+	// closes the gap where a soft-deleted space (s.status=0) with a lingering
+	// active space_member row would otherwise surface in `spaces` and
+	// downstream `owned_bots_by_space`. Symmetric with the api_key path
+	// (verify-api-key step 2 + resolve.go assertSpaceMember) which v3 §2.3
+	// already hardened; this is the token-path call site v3 missed in
+	// the same function.
+	//
+	// v3.3.1 §A.2 (yujiawei P1 三审): silent-truncation guard. The previous
+	// LIMIT 100 with no over-fetch + no warn matched the bots query's pre-v3.2
+	// shape; v3.2 had hardened bots with LIMIT 1001 + warn but the symmetric
+	// spaces cap was missed in the same function. spaces feeds the same
+	// derived authz cache (owned_bots_by_space is whitelisted through this
+	// list), so truncation at the spaces side cascades into bots silently.
+	// Over-fetch to LIMIT 101, slice + warn when len > 100. ORDER BY makes
+	// LIMIT deterministic across calls (was random per MySQL engine choice).
 	type spaceRow struct {
 		SpaceID string `db:"space_id"`
 	}
+	const userSpacesLimit = 100
 	var spaceRows []spaceRow
 	_, err := u.db.session.SelectBySql(
-		"SELECT space_id FROM space_member WHERE uid=? AND status=1 LIMIT 100",
+		`SELECT sm.space_id FROM space_member sm
+		 INNER JOIN space s ON s.space_id=sm.space_id AND s.status=1
+		 WHERE sm.uid=? AND sm.status=1
+		 ORDER BY sm.space_id
+		 LIMIT 101`,
 		uid,
 	).Load(&spaceRows)
 	if err != nil {
@@ -3899,6 +3921,13 @@ func (u *User) queryUserSpaceContext(uid string) ([]string, map[string][]string,
 	spaces := make([]string, 0, len(spaceRows))
 	for _, r := range spaceRows {
 		spaces = append(spaces, r.SpaceID)
+	}
+	if len(spaces) > userSpacesLimit {
+		u.Warn("queryUserSpaceContext spaces truncated at policy limit",
+			zap.String("uid", uid),
+			zap.Int("limit", userSpacesLimit),
+			zap.Int("returned", len(spaces)))
+		spaces = spaces[:userSpacesLimit]
 	}
 
 	// (2) bots the user created, joined with each bot's space membership.
@@ -3910,6 +3939,9 @@ func (u *User) queryUserSpaceContext(uid string) ([]string, map[string][]string,
 	// a notoriously hard-to-diagnose authz hole. We don't raise the limit
 	// (1000 is still the policy cap for one user's bots) but we make the
 	// truncation observable so ops can spot the rare power user hitting it.
+	// v3.3.1 §A.2 yujiawei P2: ORDER BY r.robot_id makes the truncated
+	// window deterministic across calls — same root cause as the spaces
+	// query above.
 	type botSpaceRow struct {
 		RobotID string `db:"robot_id"`
 		SpaceID string `db:"space_id"`
@@ -3925,6 +3957,7 @@ func (u *User) queryUserSpaceContext(uid string) ([]string, map[string][]string,
 		`SELECT r.robot_id, sm.space_id FROM robot r
 		 INNER JOIN space_member sm ON sm.uid=r.robot_id AND sm.status=1
 		 WHERE r.creator_uid=? AND r.status=1
+		 ORDER BY r.robot_id
 		 LIMIT 1001`,
 		uid,
 	).Load(&botRows)
