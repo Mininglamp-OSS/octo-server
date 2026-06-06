@@ -348,6 +348,10 @@ func (w *IncomingWebhook) cachedQueryByWebhookID(webhookID string) (*incomingWeb
 // Normal 返回非 nil，否则 (nil,nil)）。只缓存 Normal 结果——非 Normal/不存在不缓存，
 // 既免去负缓存复杂度，也让"群刚解散"在 disband 失效/TTL 后立即走 DB 复核而非被粘住。
 // 仅供 push 使用；管理写路径仍走未缓存的 requireActiveGroup。
+//
+// ⚠️ 群【管理员禁用】(Normal→Disabled, event.GroupUpdate) 不在失效矩阵内：admin 禁用后
+// 群闸在所有实例上最多 stale 一个 TTL 才生效（解散是即时的）。这是经维护者确认接受的
+// 取舍，详见 cache.go 顶部契约注释；TestPush_GroupAdminDisable_TTLBounded 钉住此语义。
 func (w *IncomingWebhook) cachedRequireActiveGroup(groupNo string) (*group.Model, error) {
 	if g, ok := w.groupCache.get(groupNo); ok {
 		return g, nil

@@ -13,12 +13,21 @@ import (
 // 不依赖 Redis 的（与 localFloor 一脉相承——Redis 故障也能命中），命中即 0 DB 读。
 //
 // ⚠️ 鉴权 staleness 契约（#284 验收明确接受秒级 staleness）：
-//   - disable / delete / regenerate 会在【本实例】即时 invalidate 对应 webhook 条目；
-//     群解散在【本实例】即时 invalidate 群条目。
-//   - 跨实例没有主动失效，最多 stale 一个 TTL：刚被禁用/删除/改 token 的 webhook、或
-//     刚解散的群，在 TTL 窗口内对等实例上可能仍按旧状态放行。TTL 默认很短（3s）以把这
-//     个窗口压到秒级。把 TTL 设为 0（DM_INCOMINGWEBHOOK_CACHE_TTL_MS=0）可彻底关闭缓存，
-//     退化为每次直查 DB 的旧行为。
+//   - webhook 变更（disable / delete / regenerate）会在【本实例】即时 invalidate 对应
+//     webhook 条目；群【解散】(event.GroupDisband) 会在【本实例】即时 invalidate 群条目。
+//   - 跨实例没有主动失效，最多 stale 一个 TTL：上述刚变更的 webhook 或刚解散的群，在 TTL
+//     窗口内对等实例上可能仍按旧状态放行。
+//   - **群【管理员禁用】(GroupStatusNormal→Disabled, 走 event.GroupUpdate) 不在失效矩阵
+//     内**：本模块只订阅 GroupDisband，不订阅 GroupUpdate，所以 admin 禁用群后，push 鉴权
+//     的群闸在【所有实例（含执行禁用的那台）】上最多 stale 一个 TTL，而非「本实例即时」。
+//     这是有意为之、经维护者确认接受的取舍（不是「本实例即时、对等 TTL」那一类）：
+//       * 破坏性路径（解散）仍是即时的；admin 禁用是可逆的运营动作，秒级延迟可接受。
+//       * 被禁用的群其 IM 频道同时被 Ban，下游消息投递本就被拦，鉴权闸短暂放行不等于真投递。
+//       * 需要即时生效就把 TTL 调小或设 0。
+//     若日后要求 admin 禁用也即时，最小改动是订阅 event.GroupUpdate 并 invalidate 群条目
+//     （与 handleGroupDisband 对称）。TestPush_GroupAdminDisable_TTLBounded 钉住当前语义。
+//   - TTL 默认很短（3s）以把这些窗口压到秒级。把 TTL 设为 0
+//     （DM_INCOMINGWEBHOOK_CACHE_TTL_MS=0）可彻底关闭缓存，退化为每次直查 DB 的旧行为。
 const (
 	envCacheTTLMs = "DM_INCOMINGWEBHOOK_CACHE_TTL_MS"
 	envCacheMax   = "DM_INCOMINGWEBHOOK_CACHE_MAX"
@@ -26,8 +35,14 @@ const (
 	// 默认 3s：push 鉴权闸可容忍的 staleness 窗口（秒级，见上）。
 	defaultCacheTTL = 3 * time.Second
 	// 条目数上限：超过则整桶清空（粗粒度淘汰）。活跃推送的 webhook/group 工作集很小，
-	// 正常远不触顶；上限只防异常场景的无界增长。**不做负缓存**——不存在/已删的 webhookID
-	// 扫描由 per-IP 失败预算在打 DB 前拦截（#285），缓存它们只会被扫描流量污染。
+	// 正常远不触顶；上限只防异常场景的无界增长。
+	//
+	// **不做负缓存**：指不缓存「未命中」(webhookID 在库里不存在 → queryByWebhookID 返回
+	// nil)，所以不存在的 ID 扫描不会在缓存里占位（这类扫描本就由 per-IP 失败预算在打 DB 前
+	// 拦截，#285）。注意：这【不】等于「只缓存 enabled 行」——查到的存在行无论 status 为
+	// enabled / disabled / deleted 都会被缓存（它们是合法的 DB 行，不是负结果）。安全性不受
+	// 影响：push 路径在 cache 读出后【每次】都重新判 m.Status，disabled/deleted 行照样被拒，
+	// 缓存只省了那次 DB 读、并不绕过状态闸。
 	defaultCacheMax = 10000
 )
 

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
@@ -832,6 +833,57 @@ func TestPush_CacheServesStaleWithinTTL_HandlerInvalidates(t *testing.T) {
 	w = do(handler, anonReqIP("POST", url, body, ip))
 	assert.Equalf(t, http.StatusUnauthorized, w.Code,
 		"after handler delete invalidates the cache, push must be rejected; body=%s", w.Body.String())
+}
+
+// TestPush_GroupAdminDisable_TTLBounded pins the deliberately-accepted staleness
+// for administrative group-disable (#293 review): the module invalidates
+// groupCache only on disband, NOT on admin disable (Normal→Disabled, emitted as
+// event.GroupUpdate, which this module does not subscribe to). So after a group is
+// disabled directly, the cached Normal entry keeps the push auth gate open until
+// the TTL expires, then the gate re-reads the DB and rejects. A short TTL makes the
+// expiry observable; this is the documented trade-off, not immediate enforcement.
+func TestPush_GroupAdminDisable_TTLBounded(t *testing.T) {
+	t.Setenv("DM_INCOMINGWEBHOOK_CACHE_TTL_MS", "2000") // short but generous vs slow CI
+	t.Setenv("DM_INCOMINGWEBHOOK_RPS", "1000")
+	t.Setenv("DM_INCOMINGWEBHOOK_BURST", "1000")
+	t.Setenv("DM_INCOMINGWEBHOOK_IP_RPS", "1000")
+	t.Setenv("DM_INCOMINGWEBHOOK_IP_BURST", "1000")
+	t.Setenv("DM_INCOMINGWEBHOOK_LOCAL_RPS", "1000")
+	t.Setenv("DM_INCOMINGWEBHOOK_LOCAL_BURST", "1000")
+	t.Setenv("DM_INCOMINGWEBHOOK_IP_FAIL_RPS", "1000")
+	t.Setenv("DM_INCOMINGWEBHOOK_IP_FAIL_BURST", "1000")
+
+	handler, ctx, groupNo := setupTestEnv(t)
+	const ip = "203.0.113.91"
+	resetIPFailBucket(t, ctx, ip)
+	resetStrictIPBucket(t, ctx, ip)
+
+	w := do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), map[string]interface{}{
+		"name": "grp-wh",
+	}))
+	created := parseJSON(t, w)
+	url := fmt.Sprintf("/v1/incoming-webhooks/%s/%s", created["webhook_id"].(string), created["token"].(string))
+	body, _ := json.Marshal(pushReq{Content: "hi"})
+
+	// Warm the group cache (Normal) → push authorizes.
+	pw := do(handler, anonReqIP("POST", url, body, ip))
+	assert.NotEqualf(t, http.StatusUnauthorized, pw.Code, "warm push must authorize; body=%s", pw.Body.String())
+
+	// Admin-disable the group directly (Normal→Disabled, GroupStatusDisabled=0),
+	// no disband event/cascade — exactly the path this module does not invalidate.
+	_, err := ctx.DB().UpdateBySql("UPDATE `group` SET status=? WHERE group_no=?", 0, groupNo).Exec()
+	assert.NoError(t, err)
+
+	// Within the TTL: the cached Normal entry still authorizes (documented staleness).
+	pw = do(handler, anonReqIP("POST", url, body, ip))
+	assert.NotEqualf(t, http.StatusUnauthorized, pw.Code,
+		"within TTL the cached Normal group must still authorize after a DB-only disable; body=%s", pw.Body.String())
+
+	// After the TTL: the group gate re-reads the DB, sees non-Normal, rejects (401).
+	time.Sleep(2500 * time.Millisecond) // > TTL(2000ms)
+	pw = do(handler, anonReqIP("POST", url, body, ip))
+	assert.Equalf(t, http.StatusUnauthorized, pw.Code,
+		"after the TTL the admin-disabled group must reject push; body=%s", pw.Body.String())
 }
 
 // TestPush_ValidPushesCappedByPerIPRequestLimit locks the layer the reviewers
