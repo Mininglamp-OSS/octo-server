@@ -221,7 +221,7 @@ func TestInsertAndQueryAudit(t *testing.T) {
 	}))
 	assert.NoError(t, d.insertAudit(context.Background(), &auditModel{
 		WebhookID: whID, GroupNo: groupNo, IP: "1.2.3.4",
-		Status: auditFailed, Reason: "rate_limited", HTTPStatus: 429, Adapter: adapterNative,
+		Status: auditFailed, Reason: "delivery_failed", HTTPStatus: 502, Adapter: adapterNative,
 	}))
 
 	list, err := d.queryRecentAudits(whID, 10)
@@ -238,8 +238,8 @@ func TestInsertAndQueryAudit(t *testing.T) {
 			assert.Equal(t, int64(99), a.MessageID)
 		case auditFailed:
 			failed++
-			assert.Equal(t, "rate_limited", a.Reason)
-			assert.Equal(t, 429, a.HTTPStatus)
+			assert.Equal(t, "delivery_failed", a.Reason)
+			assert.Equal(t, 502, a.HTTPStatus)
 		}
 	}
 	assert.Equal(t, 1, success, "should record one success")

@@ -773,7 +773,8 @@ func (w *IncomingWebhook) testPush(c *wkhttp.Context) {
 	if resp != nil {
 		msgID = resp.MessageID
 	}
-	w.submitSuccess(m, len(testPushContent), clientIP(c.Request), msgID, adapterTest)
+	// bumpUsed=false：测试推送不计入 call_count / last_used_at（adapter=test 已可区分）。
+	w.submitSuccess(m, len(testPushContent), clientIP(c.Request), msgID, adapterTest, false)
 	c.Response(map[string]interface{}{
 		"status":     0,
 		"message_id": msgID,
@@ -863,8 +864,11 @@ func (w *IncomingWebhook) push(c *wkhttp.Context) {
 		allowed = true
 	}
 	if !allowed {
-		// 鉴权已通过、群为 Normal：失败计入投递审计（body 尚未读，byteSize=0）。
-		w.submitFailure(m, 0, ip, "rate_limited", http.StatusTooManyRequests)
+		// 刻意【不】记 rate_limited 审计：429 + X-RateLimit-*/Retry-After 头已把节流信息
+		// 给到调用方；而 rate_limited 是唯一天然高频的失败类型（其余失败都在限流闸之后、
+		// 已被 per-webhook 5rps 收住），逐条落审计会在重试风暴时放大 DB 写入与 auditSem 溢出
+		// 的 Warn 日志，反噬限流「廉价丢弃」的本意。管理员可从 deliveries 里成功记录的稀疏/
+		// 中断间接看出节流（review 跟进）。
 		pushRateLimited(c)
 		return
 	}
@@ -960,8 +964,9 @@ func (w *IncomingWebhook) push(c *wkhttp.Context) {
 	if resp != nil {
 		msgID = resp.MessageID
 	}
-	// 审计用同一可信 IP（clientIP），而非 gin 可伪造的 c.ClientIP()。
-	w.submitSuccess(m, len(body), ip, msgID, adapterNative)
+	// 审计用同一可信 IP（clientIP），而非 gin 可伪造的 c.ClientIP()。bumpUsed=true：
+	// 真实推送成功累加 call_count / last_used_at。
+	w.submitSuccess(m, len(body), ip, msgID, adapterNative, true)
 
 	c.Response(map[string]interface{}{
 		"status":     0,
@@ -1037,9 +1042,10 @@ func resolveFromIdentity(m *incomingWebhookModel, req *pushPayloadReq) (name, av
 	return truncateUTF8(name, maxFromNameBytes), truncateUTF8(avatar, maxFromAvatarBytes)
 }
 
-// submitSuccess 记录一次成功投递：审计 + 累加调用计数(bumpUsed=true)。adapter 标记
-// 来源（native 推送 / test 测试推送）。
-func (w *IncomingWebhook) submitSuccess(m *incomingWebhookModel, byteSize int, ip string, msgID int64, adapter string) {
+// submitSuccess 记录一次成功投递。adapter 标记来源（native 推送 / test 测试推送）。
+// bumpUsed 控制是否累加 call_count / 刷新 last_used_at：native 真实推送为 true，
+// 管理端「测试推送」为 false——测试不是真实流量，不应污染管理列表展示的使用量。
+func (w *IncomingWebhook) submitSuccess(m *incomingWebhookModel, byteSize int, ip string, msgID int64, adapter string, bumpUsed bool) {
 	w.submitDelivery(&auditModel{
 		WebhookID:  m.WebhookID,
 		GroupNo:    m.GroupNo,
@@ -1049,12 +1055,15 @@ func (w *IncomingWebhook) submitSuccess(m *incomingWebhookModel, byteSize int, i
 		Status:     auditSuccess,
 		HTTPStatus: http.StatusOK,
 		Adapter:    adapter,
-	}, true)
+	}, bumpUsed)
 }
 
-// submitFailure 记录一次【鉴权通过后】的失败投递（限流/payload 非法/体积过大/投递失败）。
+// submitFailure 记录一次【鉴权通过后】的失败投递（payload 非法/体积过大/投递失败）。
 // 不累加调用计数(bumpUsed=false)——call_count 语义是「成功调用次数」。reason/httpStatus
 // 与 push 路径返回给调用方的响应保持一致，供 deliveries 端点排障。
+//
+// 刻意【不】覆盖 rate_limited（429）：它在限流闸处直接返回、不入审计——见 push 路径中
+// !allowed 分支的说明（天然高频，逐条落库会反噬限流的廉价丢弃）。
 //
 // ⚠️ 仅在 webhook 已通过 token 鉴权且群为 Normal 之后调用：鉴权失败（未知/错 token/
 // 已解散群）绝不落本表，只进 IP 失败预算，维持 push 路径的反枚举不变量。

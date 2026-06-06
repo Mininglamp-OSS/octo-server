@@ -129,9 +129,13 @@ GET /v1/groups/:group_no/incoming-webhooks/:webhook_id/deliveries?limit=50
 ```
 
 - `status`：`1`=成功，`2`=失败。
-- `reason`（失败时）：`rate_limited` / `body` / `json` / `content` / `blocks` / `msg_type` /
-  `too_large` / `delivery_failed`。
+- `reason`（失败时）：`body` / `json` / `content` / `blocks` / `msg_type` / `too_large` /
+  `delivery_failed`。
 - `adapter`：`native`（推送端点）/ `test`（测试推送）。
+
+> **限流（429）不入审计**：`rate_limited` 是天然高频失败，逐条落库会在重试风暴时放大
+> DB 写入、反噬限流的廉价丢弃；429 + `X-RateLimit-*`/`Retry-After` 头已把信息给到调用方。
+> 节流可从 deliveries 里成功记录的稀疏/中断间接观察。
 
 > **反枚举不变量**：鉴权失败（未知 webhook / 错 token / 已解散群）**不记入** deliveries，
 > 只进 IP 失败预算——只有「鉴权通过后」的投递结果才落审计。

@@ -10,7 +10,7 @@
 -- 历史值未知留 0，adapter 回填 'native'。
 ALTER TABLE `incoming_webhook_audit`
   ADD COLUMN `status`      SMALLINT     NOT NULL DEFAULT 1        COMMENT '投递结果：1=成功,2=失败',
-  ADD COLUMN `reason`      VARCHAR(32)  NOT NULL DEFAULT ''       COMMENT '失败原因码（rate_limited/payload_invalid/too_large/delivery_failed 等）；成功为空',
+  ADD COLUMN `reason`      VARCHAR(32)  NOT NULL DEFAULT ''       COMMENT '失败原因码（body/json/content/blocks/msg_type/too_large/delivery_failed）；成功为空。限流429不入审计',
   ADD COLUMN `http_status` SMALLINT     NOT NULL DEFAULT 0        COMMENT '返回给调用方的 HTTP 状态码',
   ADD COLUMN `adapter`     VARCHAR(16)  NOT NULL DEFAULT 'native' COMMENT '消息来源/适配器：native/test（Phase 3/4 扩展 github/gitlab/wecom/feishu）';
 

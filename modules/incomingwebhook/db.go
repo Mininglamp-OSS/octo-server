@@ -179,11 +179,15 @@ func (d *incomingWebhookDB) insertAudit(ctx context.Context, m *auditModel) erro
 // queryRecentAudits 倒序取某 webhook 最近 limit 条投递记录，供管理端 deliveries 排障。
 // 命中 idx_iwa_webhook_time(webhook_id, created_at) 前缀索引：等值 webhook_id + 按
 // created_at 倒序，无需回表全扫。limit 由调用方钳制在合理上限。
+//
+// 二级排序 id 倒序：created_at 是秒级精度，同秒内多条投递若只按 created_at 排序顺序
+// 不确定（「最近」语义会抖动）；id 自增、单调，作 tiebreaker 给出确定的最近优先顺序。
 func (d *incomingWebhookDB) queryRecentAudits(webhookID string, limit int) ([]*auditModel, error) {
 	var list []*auditModel
 	_, err := d.session.Select("*").From("incoming_webhook_audit").
 		Where("webhook_id=?", webhookID).
 		OrderDir("created_at", false).
+		OrderDir("id", false).
 		Limit(uint64(limit)).
 		Load(&list)
 	return list, err

@@ -28,7 +28,7 @@ func TestDeliveries_Endpoint(t *testing.T) {
 	require.NoError(t, err)
 	_, err = ctx.DB().InsertBySql(
 		"INSERT INTO incoming_webhook_audit(webhook_id, group_no, ip, byte_size, message_id, status, reason, http_status, adapter) VALUES(?,?,?,?,?,?,?,?,?)",
-		whID, groupNo, "1.2.3.4", 0, 0, 2, "rate_limited", 429, "native").Exec()
+		whID, groupNo, "1.2.3.4", 0, 0, 2, "delivery_failed", 502, "native").Exec()
 	require.NoError(t, err)
 
 	w := do(handler, authReq("GET", fmt.Sprintf("/v1/groups/%s/incoming-webhooks/%s/deliveries", groupNo, whID), nil))
@@ -47,8 +47,8 @@ func TestDeliveries_Endpoint(t *testing.T) {
 			assert.Equal(t, float64(200), row["http_status"])
 		case 2:
 			failed++
-			assert.Equal(t, "rate_limited", row["reason"])
-			assert.Equal(t, float64(429), row["http_status"])
+			assert.Equal(t, "delivery_failed", row["reason"])
+			assert.Equal(t, float64(502), row["http_status"])
 		}
 	}
 	assert.Equal(t, 1, success)
