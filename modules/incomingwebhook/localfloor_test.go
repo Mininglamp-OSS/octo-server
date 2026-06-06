@@ -31,6 +31,26 @@ func countAllowedGlobal(f *localFloor, n int) int {
 	return allowed
 }
 
+// TestPerIPFloorDefaultsMatchIngress pins the contract that the per-IP floor
+// defaults mirror the Redis per-IP StrictIPRateLimitMiddleware defaults
+// (defaultIngressIPRPS / defaultIngressIPBurst). The two sets of constants live
+// in different files (localfloor.go vs api.go) on purpose, so this guards
+// against silent drift on a future retune: if the per-IP floor were tuned BELOW
+// the Redis limiter it would silently become the binding per-IP cap under
+// healthy Redis (the yujiawei P2 from PR #288); if tuned ABOVE the global floor
+// it would stop bounding single-IP starvation. Keeping them equal preserves both
+// properties — change both together if either moves.
+func TestPerIPFloorDefaultsMatchIngress(t *testing.T) {
+	assert.Equal(t, defaultIngressIPRPS, defaultLocalFloorPerIPRPS,
+		"per-IP floor rps must match the Redis per-IP limiter so the floor stays a backstop, not a tighter cap")
+	assert.Equal(t, defaultIngressIPBurst, defaultLocalFloorPerIPBurst,
+		"per-IP floor burst must match the Redis per-IP limiter burst")
+	// And the per-IP floor must stay strictly below the global floor, else a
+	// single IP could drain the whole global bucket and starve others.
+	assert.Less(t, defaultLocalFloorPerIPRPS, defaultLocalFloorRPS,
+		"per-IP floor rps must be below the global floor so one IP cannot starve others")
+}
+
 // TestLocalFloor_AllowsBurstThenBlocks: with a tiny refill rate, exactly `burst`
 // calls pass before the GLOBAL bucket empties and further calls are rejected.
 // Distinct IPs keep the per-IP sub-limit out of the way.

@@ -181,23 +181,31 @@ func (p *perIPFloor) limiterFor(ip string) *rate.Limiter {
 		// survivor can therefore itself be dropped on the NEXT rotation; that is
 		// acceptable: the global floor still bounds throughput, the per-IP layer
 		// only needs to stop single-IP starvation, not be an exact LRU.
-		if len(p.cur) >= p.maxEntries {
-			p.prev = p.cur
-			p.cur = make(map[string]*rate.Limiter, p.maxEntries)
-		}
+		p.rotateIfFullLocked()
 		p.cur[ip] = lim
 		delete(p.prev, ip)
 		return lim
 	}
 	// New IP: rotate generations first if the current one is full, dropping the
 	// previous (coldest) generation wholesale to keep memory bounded.
-	if len(p.cur) >= p.maxEntries {
-		p.prev = p.cur
-		p.cur = make(map[string]*rate.Limiter, p.maxEntries)
-	}
+	p.rotateIfFullLocked()
 	lim := rate.NewLimiter(p.rps, p.burst)
 	p.cur[ip] = lim
 	return lim
+}
+
+// rotateIfFullLocked rotates the generations (prev := cur, cur := empty) when cur
+// has reached the cap, dropping the coldest generation wholesale. Caller must
+// hold p.mu. The fresh cur is allocated WITHOUT a size hint so it grows lazily,
+// matching newPerIPFloor's initial map: a `make(map, maxEntries)` here would do a
+// multi-MB pre-allocation inside the hot-path mutex on every rotation — and
+// rotations are triggered precisely by the distinct-IP flood the floor exists to
+// shed, so an attacker could force back-to-back large allocations under the lock.
+func (p *perIPFloor) rotateIfFullLocked() {
+	if len(p.cur) >= p.maxEntries {
+		p.prev = p.cur
+		p.cur = make(map[string]*rate.Limiter)
+	}
 }
 
 func (p *perIPFloor) allow(ip string) bool {
