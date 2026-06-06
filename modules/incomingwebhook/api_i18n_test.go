@@ -19,7 +19,7 @@ import (
 // #246 note in api_i18n.go) don't trip the guard. Add any new handler/limiter
 // file to the list below.
 func TestIncomingWebhookNoLegacyResponseError(t *testing.T) {
-	files := []string{"api.go", "api_i18n.go", "ratelimit.go", "localfloor.go"}
+	files := []string{"api.go", "api_i18n.go", "ratelimit.go", "localfloor.go", "cache.go"}
 	banned := []string{
 		".ResponseError(",
 		".ResponseErrorf(",

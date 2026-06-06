@@ -87,6 +87,12 @@ type IncomingWebhook struct {
 	// env(DM_INCOMINGWEBHOOK_*) → code-default。admin 在管理台改值后 Reload 立即生效，
 	// 多实例 60s 内收敛，无需重启。其余阈值(IP/失败预算/floor/body/content)仍走 env。
 	settings *commonmod.SystemSettings
+	// webhookCache / groupCache 是 push 热路径的进程内短 TTL 缓存（#284 item 2）：
+	// 分别缓存 webhook 行与「群 Normal」结果，命中即 0 DB 读。变更路径（update/delete/
+	// regenerate/handleGroupDisband）即时失效本实例条目，跨实例由 TTL 兜底——staleness
+	// 契约见 cache.go。只缓存存在/Normal 的正向结果，不做负缓存。
+	webhookCache *ttlCache[*incomingWebhookModel]
+	groupCache   *ttlCache[*group.Model]
 }
 
 // maxConcurrentAudit 限制异步审计 goroutine 的最大并发数（默认值，可被 env 覆盖）。
@@ -130,15 +136,18 @@ func sharedRateRedis(cfg *config.Config) *redis.Client {
 
 // New 构造路由模块。
 func New(ctx *config.Context) *IncomingWebhook {
+	cacheTTL, cacheMax := cacheTTL(), cacheMax()
 	w := &IncomingWebhook{
-		ctx:       ctx,
-		Log:       log.NewTLog("IncomingWebhook"),
-		db:        newDB(ctx),
-		groupDB:   group.NewDB(ctx),
-		rateRedis: sharedRateRedis(ctx.GetConfig()),
-		auditSem:  make(chan struct{}, auditConcurrency()),
-		floor:     newLocalFloor(),
-		settings:  commonmod.EnsureSystemSettings(ctx),
+		ctx:          ctx,
+		Log:          log.NewTLog("IncomingWebhook"),
+		db:           newDB(ctx),
+		groupDB:      group.NewDB(ctx),
+		rateRedis:    sharedRateRedis(ctx.GetConfig()),
+		auditSem:     make(chan struct{}, auditConcurrency()),
+		floor:        newLocalFloor(),
+		settings:     commonmod.EnsureSystemSettings(ctx),
+		webhookCache: newTTLCache[*incomingWebhookModel](cacheTTL, cacheMax),
+		groupCache:   newTTLCache[*group.Model](cacheTTL, cacheMax),
 	}
 	// 群解散级联禁用所有 webhook
 	w.ctx.AddEventListener(event.GroupDisband, w.handleGroupDisband)
@@ -313,6 +322,42 @@ func (w *IncomingWebhook) requireActiveGroup(groupNo string) (*group.Model, erro
 	}
 	if g == nil || g.Status != group.GroupStatusNormal {
 		return nil, nil
+	}
+	return g, nil
+}
+
+// cachedQueryByWebhookID 是 push 热路径用的带缓存 webhook 点读：命中即 0 DB 读。
+// 只缓存存在的行（DB 故障与未命中都不写缓存，也不做负缓存——见 cache.go）。
+// 仅供 push 使用；管理写路径（update/delete/regenerate）仍走未缓存的 db.queryByWebhookID
+// 直读最新状态，避免基于陈旧快照做复活/越权判断。
+func (w *IncomingWebhook) cachedQueryByWebhookID(webhookID string) (*incomingWebhookModel, error) {
+	if m, ok := w.webhookCache.get(webhookID); ok {
+		return m, nil
+	}
+	m, err := w.db.queryByWebhookID(webhookID)
+	if err != nil {
+		return nil, err
+	}
+	if m != nil {
+		w.webhookCache.set(webhookID, m)
+	}
+	return m, nil
+}
+
+// cachedRequireActiveGroup 带缓存的群活跃校验，语义同 requireActiveGroup（群存在且
+// Normal 返回非 nil，否则 (nil,nil)）。只缓存 Normal 结果——非 Normal/不存在不缓存，
+// 既免去负缓存复杂度，也让"群刚解散"在 disband 失效/TTL 后立即走 DB 复核而非被粘住。
+// 仅供 push 使用；管理写路径仍走未缓存的 requireActiveGroup。
+func (w *IncomingWebhook) cachedRequireActiveGroup(groupNo string) (*group.Model, error) {
+	if g, ok := w.groupCache.get(groupNo); ok {
+		return g, nil
+	}
+	g, err := w.requireActiveGroup(groupNo)
+	if err != nil {
+		return nil, err
+	}
+	if g != nil {
+		w.groupCache.set(groupNo, g)
 	}
 	return g, nil
 }
@@ -512,6 +557,9 @@ func (w *IncomingWebhook) update(c *wkhttp.Context) {
 		mgmtOperationFailed(c)
 		return
 	}
+	// 本实例即时失效缓存：状态/名称/头像变更后，push 路径不得再命中旧快照（禁用尤其
+	// 关键——必须及时停推）。跨实例由 TTL 兜底。
+	w.webhookCache.invalidate(webhookID)
 	updated, qErr := w.db.queryByWebhookID(webhookID)
 	if qErr != nil || updated == nil {
 		// 回读失败/行消失：无法确认更新结果（可能已落库，也可能因并发软删除而落空），
@@ -544,6 +592,8 @@ func (w *IncomingWebhook) delete(c *wkhttp.Context) {
 		mgmtOperationFailed(c)
 		return
 	}
+	// 软删后即时失效本实例缓存，push 不得再命中旧的 enabled 快照继续推送。
+	w.webhookCache.invalidate(webhookID)
 	c.ResponseOK()
 }
 
@@ -578,6 +628,9 @@ func (w *IncomingWebhook) regenerate(c *wkhttp.Context) {
 		mgmtOperationFailed(c)
 		return
 	}
+	// token 轮换后即时失效本实例缓存：旧 token_hash 不得再被 push 命中（否则旧 token 在
+	// 本实例仍可推送）。跨实例 TTL 窗口内旧 token 仍短暂有效，是已接受的 staleness 契约。
+	w.webhookCache.invalidate(webhookID)
 	// 并发软删除竞态：updateFields 的 status != statusDeleted 守卫保证不会给已删除的
 	// webhook 写新 token_hash。回读确认行仍存活，避免向客户端返回一个实际未落库、
 	// 指向已删除行的"新 token"。
@@ -629,8 +682,9 @@ func (w *IncomingWebhook) push(c *wkhttp.Context) {
 		return
 	}
 
-	// 1) 查 webhook（queryByWebhookID 已把 ErrNotFound 吸收为 nil/nil）
-	m, err := w.db.queryByWebhookID(webhookID)
+	// 1) 查 webhook（cachedQueryByWebhookID 命中即 0 DB 读；未命中回落 db.queryByWebhookID，
+	//    后者已把 ErrNotFound 吸收为 nil/nil）
+	m, err := w.cachedQueryByWebhookID(webhookID)
 	if err != nil {
 		// 服务端故障，不是调用方扫描——绝不计入 IP 失败预算（否则 DB 抖动会误封 IP）。
 		w.Error("query webhook failed", zap.Error(err))
@@ -663,7 +717,7 @@ func (w *IncomingWebhook) push(c *wkhttp.Context) {
 	// 2.5) 群必须仍处于 Normal —— 兜底 handleGroupDisband 的异步窗口期，
 	// 也防止对已解散群继续推送消息。统一返回 401（响应体不区分原因——防探测的主防线；
 	// 时序非恒定，仅尽力而为，见 errcode/incomingwebhook.go 注释）。
-	g, err := w.requireActiveGroup(m.GroupNo)
+	g, err := w.cachedRequireActiveGroup(m.GroupNo)
 	if err != nil {
 		w.Error("query group on push failed",
 			zap.String("webhook_id", m.WebhookID), zap.Error(err))
@@ -868,6 +922,10 @@ func (w *IncomingWebhook) handleGroupDisband(data []byte, commit config.EventCom
 		w.Warn("disable webhooks on group disband failed",
 			zap.String("group_no", req.GroupNo), zap.Error(err))
 	}
+	// 即时失效本实例的群缓存：下次 push 的 cachedRequireActiveGroup 会 miss → 直查 DB →
+	// 群非 Normal → 拒绝。这一道就足以挡住本群所有 webhook（即便它们的 webhook 行缓存仍
+	// 短暂 stale 为 enabled，群闸也会拦下），无需按 webhookID 逐条失效。跨实例 TTL 兜底。
+	w.groupCache.invalidate(req.GroupNo)
 	// 故意 commit(nil)：disable 失败也不重试，避免阻塞事件队列。
 	// 异步窗口期由 push 路径的 requireActiveGroup 兜底（belt + suspenders）：
 	// 即便此处尚未把 webhook.status 改为 0，推送也会因群非 Normal 而 401。

@@ -776,6 +776,64 @@ func TestPush_ValidPushesNotIPLimited(t *testing.T) {
 	}
 }
 
+// TestPush_CacheServesStaleWithinTTL_HandlerInvalidates verifies the push
+// hot-path cache (#284 item 2):
+//   - a warm cache serves the webhook record, so a DB-only status change (made
+//     behind the handler's back) does NOT stop pushes within the TTL window;
+//   - a delete THROUGH the handler invalidates the cache and stops pushes at once.
+//
+// Asserts on the auth outcome (401 vs not-401) rather than 200, so it is robust
+// to whether the downstream send returns 200/502 in the test harness. All
+// limiters are set generous so a 429 can't be mistaken for the auth gate.
+func TestPush_CacheServesStaleWithinTTL_HandlerInvalidates(t *testing.T) {
+	// Long TTL so the cached entry never expires mid-test; cache TTL is read at
+	// module construction, so it must be set before setupTestEnv.
+	t.Setenv("DM_INCOMINGWEBHOOK_CACHE_TTL_MS", "60000")
+	t.Setenv("DM_INCOMINGWEBHOOK_RPS", "1000")
+	t.Setenv("DM_INCOMINGWEBHOOK_BURST", "1000")
+	t.Setenv("DM_INCOMINGWEBHOOK_IP_RPS", "1000")
+	t.Setenv("DM_INCOMINGWEBHOOK_IP_BURST", "1000")
+	t.Setenv("DM_INCOMINGWEBHOOK_LOCAL_RPS", "1000")
+	t.Setenv("DM_INCOMINGWEBHOOK_LOCAL_BURST", "1000")
+	t.Setenv("DM_INCOMINGWEBHOOK_IP_FAIL_RPS", "1000")
+	t.Setenv("DM_INCOMINGWEBHOOK_IP_FAIL_BURST", "1000")
+
+	handler, ctx, groupNo := setupTestEnv(t)
+	const ip = "203.0.113.77"
+	resetIPFailBucket(t, ctx, ip)
+	resetStrictIPBucket(t, ctx, ip)
+
+	w := do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), map[string]interface{}{
+		"name": "cache-wh",
+	}))
+	created := parseJSON(t, w)
+	whID := created["webhook_id"].(string)
+	token := created["token"].(string)
+	url := fmt.Sprintf("/v1/incoming-webhooks/%s/%s", whID, token)
+	body, _ := json.Marshal(pushReq{Content: "hi"})
+
+	// 1) Warm the cache (status=enabled). Auth passes → not 401.
+	w = do(handler, anonReqIP("POST", url, body, ip))
+	assert.NotEqualf(t, http.StatusUnauthorized, w.Code, "warm push must authorize; body=%s", w.Body.String())
+
+	// 2) Disable directly in DB, bypassing the handler so the cache is NOT
+	//    invalidated. The warm cache still serves enabled → push still authorizes
+	//    (non-401) within the TTL window — proving the cache is in effect.
+	_, err := ctx.DB().UpdateBySql("UPDATE incoming_webhook SET status=0 WHERE webhook_id=?", whID).Exec()
+	assert.NoError(t, err)
+	w = do(handler, anonReqIP("POST", url, body, ip))
+	assert.NotEqualf(t, http.StatusUnauthorized, w.Code,
+		"within TTL the cached (enabled) record must still authorize despite the DB-only disable; body=%s", w.Body.String())
+
+	// 3) Delete through the handler → invalidates the cache. Next push misses the
+	//    cache, reads the soft-deleted row, and is rejected (401).
+	w = do(handler, authReq("DELETE", fmt.Sprintf("/v1/groups/%s/incoming-webhooks/%s", groupNo, whID), nil))
+	assert.Equalf(t, http.StatusOK, w.Code, "delete; body=%s", w.Body.String())
+	w = do(handler, anonReqIP("POST", url, body, ip))
+	assert.Equalf(t, http.StatusUnauthorized, w.Code,
+		"after handler delete invalidates the cache, push must be rejected; body=%s", w.Body.String())
+}
+
 // TestPush_ValidPushesCappedByPerIPRequestLimit locks the layer the reviewers
 // asked to keep: the per-IP REQUEST limiter (StrictIPRateLimitMiddleware) bounds
 // ALL requests from one IP — including valid pushes — so a single IP holding many
