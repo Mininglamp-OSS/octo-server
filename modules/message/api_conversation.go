@@ -744,8 +744,12 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	// 因为被过滤掉的会话可能正好是本批最高 version 的那条；用过滤后列表推 cursor
 	// 会让客户端反复拉同一批（与 PR-B #1377 / sidebar B1 同一类死循环）。
 	// per-Space 未读仍基于 raw conversations（见下方 fillPersonSpaceUnread），不受影响。
-	// 系统 Bot 的可见性兜底（EnsureSystemBotsPresent）在 Space 过滤块里、本步之后
-	// 执行，因此即便开启 person 窗口也不会把系统 Bot 误删。
+	//
+	// 系统 Bot 可见性：person 窗口默认 0（不过滤 DM），系统 Bot 默认安全。当
+	// 请求带 space_id 时，EnsureSystemBotsPresent 在 Space 过滤块里、本步之后兜底
+	// 补齐，即便管理员开了 person 窗口也不会丢失系统 Bot —— Web「最近」tab 正是带
+	// space_id 调用，故实际使用安全。仅「不带 space_id + recent_filter=true +
+	// person 窗口>0」这一非常规组合下，安静的系统 Bot DM 可能被本步过滤掉。
 	if req.RecentFilter {
 		cutoffs := loadRecentCutoffs(co.ctx, time.Now())
 		syncUserConversationResps = filterRecentConversations(syncUserConversationResps, cutoffs)
