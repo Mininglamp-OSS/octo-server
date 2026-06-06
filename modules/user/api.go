@@ -3914,6 +3914,11 @@ func (u *User) queryUserSpaceContext(uid string) ([]string, map[string][]string,
 		RobotID string `db:"robot_id"`
 		SpaceID string `db:"space_id"`
 	}
+	// Policy ceiling on owned bots per user. Documented in the
+	// "Heads-up #2" section of the v3 PR comment (server PR #290).
+	// Raising this requires (a) confirming the consumer side
+	// (fleet/matter middleware) is OK with a larger owned_bots_by_space
+	// payload and (b) updating the warn log threshold below.
 	const ownedBotsLimit = 1000
 	var botRows []botSpaceRow
 	_, err = u.db.session.SelectBySql(
