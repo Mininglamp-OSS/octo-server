@@ -1,11 +1,38 @@
 package common
 
+import "strconv"
+
 // Value types accepted by system_setting.value_type.
 const (
 	settingTypeString    = "string"
 	settingTypeBool      = "bool"
 	settingTypeInt       = "int"
 	settingTypeEncrypted = "encrypted"
+)
+
+// settingIntMin / settingIntMax bound every settingTypeInt value, applied both
+// on the admin write path (api_manager_system_setting.go) and in the clamping
+// getters (getIntClamped). Today all int settings are day-window counts
+// (sidebar.recent_filter_*_days), for which [0, 3650] (0 .. ~10 years) is a
+// generous sane range; 0 is the documented "disable filter" sentinel. Adding
+// an int setting that needs a different range should move this to a per-key
+// field on settingDef — until then a single shared bound keeps the write path
+// simple and closes the pre-existing "no bounds check" gap (issue #289).
+const (
+	settingIntMin = 0
+	settingIntMax = 3650
+)
+
+// Sidebar recent-tab activity-filter defaults (issue #289). The recent tab of
+// POST /v1/sidebar/sync hides conversations whose last activity is older than
+// a per-channel-type window. These defaults reproduce the historical
+// hard-coded behaviour exactly (groups/threads = 3-day window, DMs unfiltered)
+// so the feature is zero-impact until an operator opts in. A value of 0
+// disables the window for that channel type (return all, no time limit).
+const (
+	defaultSidebarRecentFilterGroupDays  = 3
+	defaultSidebarRecentFilterThreadDays = 3
+	defaultSidebarRecentFilterPersonDays = 0
 )
 
 // settingDef is the canonical definition of a system_setting key.
@@ -55,6 +82,16 @@ var systemSettingSchema = []settingDef{
 	// 仍作 fallback,DB 行为单一真源。
 	{Category: "space", Key: "disable_user_create", Type: settingTypeBool, Description: "是否关闭普通用户创建空间入口",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.SpaceDisableUserCreate()) }},
+
+	// Sidebar recent-tab activity filter — per-channel-type window in days for
+	// POST /v1/sidebar/sync 的 recent tab。0 = 关闭该类型的时间过滤（全量返回）。
+	// 默认复刻历史硬编码行为：群/话题 3 天窗口、DM 不过滤（issue #289）。
+	{Category: "sidebar", Key: "recent_filter_group_days", Type: settingTypeInt, Description: "最近会话-群聊活跃过滤窗口(天)，0=不过滤",
+		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.SidebarRecentFilterGroupDays()) }},
+	{Category: "sidebar", Key: "recent_filter_thread_days", Type: settingTypeInt, Description: "最近会话-话题(社区话题)活跃过滤窗口(天)，0=不过滤",
+		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.SidebarRecentFilterThreadDays()) }},
+	{Category: "sidebar", Key: "recent_filter_person_days", Type: settingTypeInt, Description: "最近会话-单聊(DM)活跃过滤窗口(天)，0=不过滤(默认)",
+		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.SidebarRecentFilterPersonDays()) }},
 
 	// Email server config — formerly yaml-only (Support.* in config.go).
 	{Category: "support", Key: "email", Type: settingTypeString, Description: "技术支持邮箱（发件人）",

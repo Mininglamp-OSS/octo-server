@@ -43,6 +43,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	commonapi "github.com/Mininglamp-OSS/octo-server/modules/common"
 	convext "github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
@@ -521,7 +522,8 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 			}
 		}
 	case "recent":
-		items = buildRecentItems(conversations, pinnedSet, groupSpaceMap, externalGroupMap, defaultSpaceID)
+		cutoffs := sb.loadRecentCutoffs(time.Now())
+		items = buildRecentItems(conversations, cutoffs, pinnedSet, groupSpaceMap, externalGroupMap, defaultSpaceID)
 	}
 
 	// 4. Enrich pinned flag (follow tab items also need it)
@@ -627,8 +629,58 @@ func (sb *Sidebar) loadThreadLastMsgAt(extRows []*convext.Model) (map[string]*ti
 // Filter helpers
 // ---------------------------------------------------------------------------
 
-// threeDaysAgo returns the unix timestamp 72h ago.
-func threeDaysAgo() int64 { return time.Now().Add(-72 * time.Hour).Unix() }
+// recentCutoffs holds the per-channel-type activity cutoffs (unix seconds) for
+// the recent tab. A conversation is hidden when its timestamp <= the cutoff for
+// its channel type. A cutoff of 0 means "no time filter" — that type is
+// returned in full regardless of age (issue #289).
+type recentCutoffs struct {
+	group  int64
+	thread int64
+	person int64
+}
+
+// daysCutoff converts a day-count window to a unix-second cutoff relative to
+// now. A window of 0 (or negative, defensively) yields 0 = "no filter"; the
+// caller's `cutoff == 0` check then skips filtering entirely. Unifying the
+// "disabled" case as cutoff 0 lets buildRecentItems treat every channel type
+// the same way, including the DM exemption (person window default 0).
+func daysCutoff(now time.Time, days int) int64 {
+	if days <= 0 {
+		return 0
+	}
+	return now.Add(-time.Duration(days) * 24 * time.Hour).Unix()
+}
+
+// loadRecentCutoffs resolves the per-channel-type recent-tab windows from the
+// shared system_settings snapshot (admin-tunable, ~60s reload). Defaults
+// reproduce the historical hard-coded behaviour exactly: groups/threads use a
+// 3-day window, DMs are unfiltered.
+func (sb *Sidebar) loadRecentCutoffs(now time.Time) recentCutoffs {
+	ss := commonapi.EnsureSystemSettings(sb.ctx)
+	return recentCutoffs{
+		group:  daysCutoff(now, ss.SidebarRecentFilterGroupDays()),
+		thread: daysCutoff(now, ss.SidebarRecentFilterThreadDays()),
+		person: daysCutoff(now, ss.SidebarRecentFilterPersonDays()),
+	}
+}
+
+// cutoffFor returns the activity cutoff for a given channel type. Unknown
+// channel types (anything that is not group / thread / DM) return 0 = no
+// filter; the recent tab only ever carries those three types, but defaulting
+// unknown types to "kept" avoids silently dropping a future channel type on an
+// unrelated code path.
+func (c recentCutoffs) cutoffFor(channelType uint8) int64 {
+	switch channelType {
+	case common.ChannelTypeGroup.Uint8():
+		return c.group
+	case common.ChannelTypeCommunityTopic.Uint8():
+		return c.thread
+	case common.ChannelTypePerson.Uint8():
+		return c.person
+	default:
+		return 0
+	}
+}
 
 // channelKey returns a string key for (channelID, channelType).
 func channelKey(channelID string, channelType uint8) string {
@@ -896,28 +948,31 @@ func buildFollowItems(
 
 // buildRecentItems constructs the SidebarItem list for the recent tab.
 // Rules:
-//   - DM: always included (no time window).
-//   - Group / Thread: only included if timestamp > threeDaysAgo().
+//   - Each conversation is filtered against the cutoff for its channel type
+//     (cutoffs.cutoffFor): kept iff cutoff == 0 (window disabled) OR
+//     timestamp > cutoff. With the default cutoffs (groups/threads = 3-day
+//     window, DMs = 0) this reproduces the historical behaviour where DMs are
+//     always shown and groups/threads obey a 72h window — but every type is
+//     now operator-tunable via system_settings (issue #289).
 //   - The returned slice is not yet sorted.
 //
 // Intentional non-rule (PR review Important #6): unfollowed groups
 // (group_unfollowed=1 in user_conversation_ext) are NOT filtered out here.
 // Per PM decision on issue #337 — "取消关注就是移除关注列表，放到最近 tab" —
 // an unfollowed group still belongs in the recent tab as long as it has
-// activity within the 72 h window.  The unfollow blacklist only affects
+// activity within the configured window.  The unfollow blacklist only affects
 // the follow tab.
 func buildRecentItems(
 	convs []*config.SyncUserConversationResp,
+	cutoffs recentCutoffs,
 	pinnedSet map[string]struct{},
 	groupSpaceMap map[string]string,
 	externalGroupMap map[string]string,
 	defaultSpaceID string,
 ) []*SidebarItem {
-	cutoff := threeDaysAgo()
 	items := make([]*SidebarItem, 0, len(convs))
 	for _, conv := range convs {
-		isDM := conv.ChannelType == common.ChannelTypePerson.Uint8()
-		if !isDM && conv.Timestamp <= cutoff {
+		if cutoff := cutoffs.cutoffFor(conv.ChannelType); cutoff != 0 && conv.Timestamp <= cutoff {
 			continue
 		}
 		pinned := false

@@ -222,6 +222,18 @@ func (s *SystemSettings) getInt(category, key string, fallback int) int {
 	return parsed
 }
 
+// getIntClamped is getInt with range enforcement: a value outside
+// [settingIntMin, settingIntMax] — which the admin write path rejects, but a
+// direct DB edit could still introduce — falls back to the code default rather
+// than being served verbatim. Defence in depth for the int settings (D-289).
+func (s *SystemSettings) getIntClamped(category, key string, fallback int) int {
+	v := s.getInt(category, key, fallback)
+	if v < settingIntMin || v > settingIntMax {
+		return fallback
+	}
+	return v
+}
+
 func (s *SystemSettings) getEncrypted(category, key string, fallback string) string {
 	// Encrypted values are stored decrypted in the snapshot, so a plain
 	// lookup is sufficient. The dedicated method exists so callers — and
@@ -480,6 +492,29 @@ func parseSpaceDisableUserCreateEnv(v string) bool {
 		return true
 	}
 	return false
+}
+
+// ----- sidebar recent-tab activity filter (issue #289) -----
+
+// SidebarRecentFilterGroupDays returns the recent-tab activity window for group
+// conversations, in days. 0 disables the window (all groups returned). Defaults
+// to defaultSidebarRecentFilterGroupDays (3) — today's hard-coded behaviour.
+func (s *SystemSettings) SidebarRecentFilterGroupDays() int {
+	return s.getIntClamped("sidebar", "recent_filter_group_days", defaultSidebarRecentFilterGroupDays)
+}
+
+// SidebarRecentFilterThreadDays returns the recent-tab activity window for
+// thread (community topic) conversations, in days. 0 disables the window.
+func (s *SystemSettings) SidebarRecentFilterThreadDays() int {
+	return s.getIntClamped("sidebar", "recent_filter_thread_days", defaultSidebarRecentFilterThreadDays)
+}
+
+// SidebarRecentFilterPersonDays returns the recent-tab activity window for DM
+// conversations, in days. Defaults to 0, which keeps today's "DMs are always
+// shown regardless of age" behaviour; the per-type default makes the historical
+// hard-coded `!isDM` exemption data-driven.
+func (s *SystemSettings) SidebarRecentFilterPersonDays() int {
+	return s.getIntClamped("sidebar", "recent_filter_person_days", defaultSidebarRecentFilterPersonDays)
 }
 
 // SupportEmail returns the From address used by the SMTP sender.

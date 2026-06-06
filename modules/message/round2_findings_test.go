@@ -152,7 +152,7 @@ func TestSpaceID_Round2_Finding3_BuildRecentItems_ExternalGroupMySource(t *testi
 	groupSpaceMap := map[string]string{"g_external": "spaceB"}
 	externalGroupMap := map[string]string{"g_external": "spaceA"}
 
-	items := buildRecentItems(convs, nil, groupSpaceMap, externalGroupMap, "")
+	items := buildRecentItems(convs, recentCutoffs{}, nil, groupSpaceMap, externalGroupMap, "")
 
 	byID := map[string]*SidebarItem{}
 	for _, it := range items {

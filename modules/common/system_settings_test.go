@@ -408,3 +408,53 @@ func TestSystemSettings_ConcurrentReadsAndReloads(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// ---------------------------------------------------------------------------
+// Sidebar recent-tab activity filter windows (issue #289)
+// ---------------------------------------------------------------------------
+
+// Defaults reproduce today's hard-coded behaviour: groups/threads = 3-day
+// window, DMs = unfiltered (0).
+func TestSystemSettings_SidebarRecentFilter_Defaults(t *testing.T) {
+	s := newTestSystemSettings(t, nil)
+	assert.Equal(t, 3, s.SidebarRecentFilterGroupDays(), "group window default 3 天")
+	assert.Equal(t, 3, s.SidebarRecentFilterThreadDays(), "thread window default 3 天")
+	assert.Equal(t, 0, s.SidebarRecentFilterPersonDays(), "DM 默认 0 = 不过滤")
+}
+
+// A configured DB value overrides the code default, including the 0 sentinel
+// that disables the filter for that channel type.
+func TestSystemSettings_SidebarRecentFilter_DBOverrides(t *testing.T) {
+	s := newTestSystemSettings(t, nil)
+	require.NoError(t, s.db.upsert("sidebar", "recent_filter_group_days", "0", settingTypeInt, ""))
+	require.NoError(t, s.db.upsert("sidebar", "recent_filter_thread_days", "7", settingTypeInt, ""))
+	require.NoError(t, s.db.upsert("sidebar", "recent_filter_person_days", "30", settingTypeInt, ""))
+	require.NoError(t, s.Reload())
+
+	assert.Equal(t, 0, s.SidebarRecentFilterGroupDays(), "DB 0 → 关闭群过滤（全量）")
+	assert.Equal(t, 7, s.SidebarRecentFilterThreadDays(), "DB 覆盖话题窗口")
+	assert.Equal(t, 30, s.SidebarRecentFilterPersonDays(), "DB 覆盖 DM 窗口")
+}
+
+// Out-of-range DB values (someone editing the table directly, bypassing the
+// admin API's range check) clamp back to the code default — defence in depth.
+func TestSystemSettings_SidebarRecentFilter_OutOfRangeClampsToDefault(t *testing.T) {
+	s := newTestSystemSettings(t, nil)
+	require.NoError(t, s.db.upsert("sidebar", "recent_filter_group_days", "-5", settingTypeInt, ""))
+	require.NoError(t, s.db.upsert("sidebar", "recent_filter_thread_days", "999999", settingTypeInt, ""))
+	require.NoError(t, s.Reload())
+
+	assert.Equal(t, 3, s.SidebarRecentFilterGroupDays(), "负值越界 → 回退默认 3")
+	assert.Equal(t, 3, s.SidebarRecentFilterThreadDays(), "超上限越界 → 回退默认 3")
+}
+
+// Boundary values exactly on [settingIntMin, settingIntMax] are accepted as-is.
+func TestSystemSettings_SidebarRecentFilter_BoundaryValuesAccepted(t *testing.T) {
+	s := newTestSystemSettings(t, nil)
+	require.NoError(t, s.db.upsert("sidebar", "recent_filter_group_days", "0", settingTypeInt, ""))
+	require.NoError(t, s.db.upsert("sidebar", "recent_filter_thread_days", "3650", settingTypeInt, ""))
+	require.NoError(t, s.Reload())
+
+	assert.Equal(t, 0, s.SidebarRecentFilterGroupDays(), "下界 0 接受")
+	assert.Equal(t, 3650, s.SidebarRecentFilterThreadDays(), "上界 3650 接受")
+}

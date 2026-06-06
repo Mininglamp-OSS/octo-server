@@ -192,7 +192,7 @@ func TestSpaceID_Round3_Finding2_Sidebar_EmptySourceFallback(t *testing.T) {
 	})
 
 	t.Run("buildRecentItems", func(t *testing.T) {
-		items := buildRecentItems(convs, nil, groupSpaceMap, externalGroupMap, defaultSpaceID)
+		items := buildRecentItems(convs, recentCutoffs{}, nil, groupSpaceMap, externalGroupMap, defaultSpaceID)
 		byID := map[string]*SidebarItem{}
 		for _, it := range items {
 			byID[it.TargetID] = it

@@ -201,10 +201,22 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 			}
 			p.value = normalised
 		case settingTypeInt:
+			// Empty value means "reset to default" (the getter treats an empty
+			// snapshot entry as not-configured), so only validate non-empty
+			// payloads. Bounds-check against [settingIntMin, settingIntMax] —
+			// previously this path only ran strconv.Atoi with no range guard,
+			// letting absurd windows (or negatives) reach the DB (issue #289).
 			if item.Value != "" {
-				if _, err := strconv.Atoi(item.Value); err != nil {
+				n, err := strconv.Atoi(item.Value)
+				if err != nil {
 					c.JSON(http.StatusBadRequest, jsonH{
 						"msg": fmt.Sprintf("%s.%s 必须是整数", item.Category, item.Key),
+					})
+					return
+				}
+				if n < settingIntMin || n > settingIntMax {
+					c.JSON(http.StatusBadRequest, jsonH{
+						"msg": fmt.Sprintf("%s.%s 必须在 [%d, %d] 范围内", item.Category, item.Key, settingIntMin, settingIntMax),
 					})
 					return
 				}

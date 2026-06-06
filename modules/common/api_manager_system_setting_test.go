@@ -363,3 +363,73 @@ func TestManagerSystemSetting_UpdatePersistsAndReloads(t *testing.T) {
 	assert.True(t, settings.RegisterEmailOn(), "Reload should run inside the update handler")
 	assert.Equal(t, "smtp.test:587", settings.SupportEmailSmtp())
 }
+
+// --- int range validation (issue #289) -------------------------------------
+
+func TestManagerSystemSetting_UpdateRejectsOutOfRangeInt(t *testing.T) {
+	t.Setenv(masterKeyEnv, "0123456789abcdef0123456789abcdef")
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	require.NoError(t, ctx.Cache().Set(
+		ctx.GetConfig().Cache.TokenCachePrefix+testutil.Token,
+		testutil.UID+"@test@"+string(wkhttp.SuperAdmin),
+	))
+
+	for _, v := range []string{"-1", "3651", "100000"} {
+		body := []byte(`{"items":[{"category":"sidebar","key":"recent_filter_group_days","value":"` + v + `"}]}`)
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", "/v1/manager/common/system_setting", bytes.NewReader(body))
+		req.Header.Set("token", testutil.Token)
+		s.GetRoute().ServeHTTP(w, req)
+		assert.NotEqual(t, http.StatusOK, w.Code, "越界整数 %q 必须被拒绝", v)
+	}
+}
+
+func TestManagerSystemSetting_UpdateRejectsNonInt(t *testing.T) {
+	t.Setenv(masterKeyEnv, "0123456789abcdef0123456789abcdef")
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	require.NoError(t, ctx.Cache().Set(
+		ctx.GetConfig().Cache.TokenCachePrefix+testutil.Token,
+		testutil.UID+"@test@"+string(wkhttp.SuperAdmin),
+	))
+
+	body := []byte(`{"items":[{"category":"sidebar","key":"recent_filter_group_days","value":"abc"}]}`)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/manager/common/system_setting", bytes.NewReader(body))
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.NotEqual(t, http.StatusOK, w.Code)
+}
+
+func TestManagerSystemSetting_UpdateAcceptsInRangeIntBoundaries(t *testing.T) {
+	t.Setenv(masterKeyEnv, "0123456789abcdef0123456789abcdef")
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	require.NoError(t, ctx.Cache().Set(
+		ctx.GetConfig().Cache.TokenCachePrefix+testutil.Token,
+		testutil.UID+"@test@"+string(wkhttp.SuperAdmin),
+	))
+
+	body := []byte(`{"items":[` +
+		`{"category":"sidebar","key":"recent_filter_group_days","value":"0"},` +
+		`{"category":"sidebar","key":"recent_filter_thread_days","value":"3650"},` +
+		`{"category":"sidebar","key":"recent_filter_person_days","value":"7"}` +
+		`]}`)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/manager/common/system_setting", bytes.NewReader(body))
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	db := newSystemSettingDB(ctx)
+	rows, err := db.listAll()
+	require.NoError(t, err)
+	got := map[string]string{}
+	for _, r := range rows {
+		got[schemaKey(r.Category, r.KeyName)] = r.Value
+	}
+	assert.Equal(t, "0", got["sidebar.recent_filter_group_days"])
+	assert.Equal(t, "3650", got["sidebar.recent_filter_thread_days"])
+	assert.Equal(t, "7", got["sidebar.recent_filter_person_days"])
+}
