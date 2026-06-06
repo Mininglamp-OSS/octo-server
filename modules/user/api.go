@@ -3778,9 +3778,25 @@ type authVerifyTokenResp struct {
 	Name      string     `json:"name"`
 	Role      string     `json:"role"`
 	OwnedBots []ownedBot `json:"owned_bots"`
+
+	// Populated only when ?include=context. Kept as separate fields so the
+	// default response shape (UID/Name/Role/OwnedBots) is byte-identical to
+	// the pre-v2 contract — old IM clients and admin tools rely on the
+	// existing schema. fleet/matter middleware passes ?include=context to
+	// get these extra fields and stops reading the legacy OwnedBots list
+	// (which lacks per-space grouping).
+	Spaces           []string            `json:"spaces,omitempty"`
+	OwnedBotsBySpace map[string][]string `json:"owned_bots_by_space,omitempty"`
 }
 
 // authVerifyToken validates a user token and returns identity + owned bots.
+//
+// Query params:
+//   - include=context : also return spaces (server-validated space membership
+//     list) and owned_bots_by_space (map keyed by space_id, listing bot_uids
+//     the user owns in each space). fleet/matter middleware passes this to
+//     enforce X-Space-Id membership and per-handler bot ownership; older
+//     callers (IM, admin) omit the param and keep the original schema.
 func (u *User) authVerifyToken(c *wkhttp.Context) {
 	var req authVerifyTokenReq
 	if err := c.BindJSON(&req); err != nil {
@@ -3830,7 +3846,78 @@ func (u *User) authVerifyToken(c *wkhttp.Context) {
 		}
 	}
 
+	// Opt-in: fleet/matter ask for full context to drive per-request
+	// authorization (X-Space-Id check + bot ownership check). On failure
+	// we leave the new fields empty rather than 500 — middleware will
+	// reject downstream authz that depends on them, which is safer than
+	// masking the issue.
+	if c.Query("include") == "context" {
+		spaces, ownedByspace, ctxErr := u.queryUserSpaceContext(resp.UID)
+		if ctxErr != nil {
+			u.Warn("authVerifyToken include=context 查询失败",
+				zap.Error(ctxErr), zap.String("uid", resp.UID))
+			spaces = []string{}
+			ownedByspace = map[string][]string{}
+		}
+		resp.Spaces = spaces
+		resp.OwnedBotsBySpace = ownedByspace
+	}
+
 	c.Response(resp)
+}
+
+// queryUserSpaceContext fetches (spaces, owned_bots_by_space) for a user
+// in one round trip — two SELECTs but no N+1. Used by authVerifyToken when
+// ?include=context is set.
+//
+// Note: owned_bots are grouped by space_id via the bot's space_member row
+// (bot is itself a user; robot table has no space_id). Mirrors the join
+// pattern in botfather/db.go queryRobotsByCreatorUIDAndSpaceID.
+func (u *User) queryUserSpaceContext(uid string) ([]string, map[string][]string, error) {
+	// (1) spaces the user is an active member of
+	type spaceRow struct {
+		SpaceID string `db:"space_id"`
+	}
+	var spaceRows []spaceRow
+	_, err := u.db.session.SelectBySql(
+		"SELECT space_id FROM space_member WHERE uid=? AND status=1 LIMIT 100",
+		uid,
+	).Load(&spaceRows)
+	if err != nil {
+		return nil, nil, err
+	}
+	spaces := make([]string, 0, len(spaceRows))
+	for _, r := range spaceRows {
+		spaces = append(spaces, r.SpaceID)
+	}
+
+	// (2) bots the user created, joined with each bot's space membership
+	type botSpaceRow struct {
+		RobotID string `db:"robot_id"`
+		SpaceID string `db:"space_id"`
+	}
+	var botRows []botSpaceRow
+	_, err = u.db.session.SelectBySql(
+		`SELECT r.robot_id, sm.space_id FROM robot r
+		 INNER JOIN space_member sm ON sm.uid=r.robot_id AND sm.status=1
+		 WHERE r.creator_uid=? AND r.status=1
+		 LIMIT 1000`,
+		uid,
+	).Load(&botRows)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Initialize map with one bucket per known space so callers always see
+	// a stable map shape (even when a space has no owned bots).
+	ownedByspace := make(map[string][]string, len(spaces))
+	for _, sid := range spaces {
+		ownedByspace[sid] = []string{}
+	}
+	for _, b := range botRows {
+		ownedByspace[b.SpaceID] = append(ownedByspace[b.SpaceID], b.RobotID)
+	}
+	return spaces, ownedByspace, nil
 }
 
 type authVerifyBotReq struct {
@@ -3910,21 +3997,20 @@ type authVerifyAPIKeyReq struct {
 }
 
 type authVerifyAPIKeyResp struct {
-	UID     string `json:"uid"`
-	SpaceID string `json:"space_id"`
+	UID        string              `json:"uid"`
+	SpaceID    string              `json:"space_id"`
+	OwnedBots  map[string][]string `json:"owned_bots,omitempty"` // populated only when ?include=context
 }
 
 // authVerifyAPIKey validates a daemon API key (uk_ prefix) and returns the
 // bound user + space. Used by fleet/matter AuthMiddleware to verify api_key
 // Bearer tokens (合并 plan §3).
 //
-// Returns 200 + {uid, space_id} on success. Returns 401 for any failure
-// (not found / legacy space_id='' / owner left space) — error reason is
-// intentionally not surfaced to reduce info leakage; logs carry detail.
-//
-// space_id='' is explicitly rejected (合并 plan §3 Legacy data migration).
-// BotFather /connect 历史上允许 space=='' 的 legacy 路径产生此类 api_key;
-// 决策二信任模型要求 api_key 必须 user-space 级别, 不再支持无 space 绑定。
+// Query params:
+//   - include=context : also return owned_bots (single-space map keyed on the
+//     api_key's bound space). fleet/matter call with this; other callers do not.
+//     Absent param keeps the original {uid, space_id} schema for callers that
+//     do not need ownership data.
 func (u *User) authVerifyAPIKey(c *wkhttp.Context) {
 	var req authVerifyAPIKeyReq
 	if err := c.BindJSON(&req); err != nil {
@@ -3962,8 +4048,53 @@ func (u *User) authVerifyAPIKey(c *wkhttp.Context) {
 		return
 	}
 
-	c.Response(authVerifyAPIKeyResp{
+	resp := authVerifyAPIKeyResp{
 		UID:     keyInfo.UID,
 		SpaceID: keyInfo.SpaceID,
-	})
+	}
+
+	// Step 3 (opt-in): when ?include=context, fetch owned_bots for the bound
+	// space. Returned as a map for symmetry with /v1/auth/verify response,
+	// even though api_key is bound to exactly one space.
+	if c.Query("include") == "context" {
+		ownedBots, err := u.queryOwnedBotsBySpace(keyInfo.UID, keyInfo.SpaceID)
+		if err != nil {
+			u.Warn("authVerifyAPIKey owned_bots 查询失败", zap.Error(err), zap.String("uid", keyInfo.UID))
+			// Fail-secure: empty list rather than crash. Caller (fleet/matter
+			// middleware) will reject downstream ownership checks if expected
+			// bot is missing — better than masking the issue with a 500.
+			ownedBots = []string{}
+		}
+		resp.OwnedBots = map[string][]string{
+			keyInfo.SpaceID: ownedBots,
+		}
+	}
+
+	c.Response(resp)
+}
+
+// queryOwnedBotsBySpace returns the bot_uids the user owns in the given
+// space. bot is itself a user, and its space membership lives in
+// space_member (robot table has no space_id). Mirrors the join pattern in
+// botfather/db.go queryRobotsByCreatorUIDAndSpaceID.
+func (u *User) queryOwnedBotsBySpace(creatorUID, spaceID string) ([]string, error) {
+	type row struct {
+		RobotID string `db:"robot_id"`
+	}
+	var rows []row
+	_, err := u.db.session.SelectBySql(
+		`SELECT r.robot_id FROM robot r
+		 INNER JOIN space_member sm ON sm.uid=r.robot_id AND sm.space_id=? AND sm.status=1
+		 WHERE r.creator_uid=? AND r.status=1
+		 LIMIT 1000`,
+		spaceID, creatorUID,
+	).Load(&rows)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.RobotID)
+	}
+	return out, nil
 }
