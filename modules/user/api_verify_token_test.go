@@ -172,3 +172,56 @@ func TestAuthVerifyToken_UnknownIncludeValue_TreatedAsAbsent(t *testing.T) {
 	body := w.Body.String()
 	assert.NotContains(t, body, "spaces", "unknown include must fall back to default schema")
 }
+
+// v3 §2.4 (yujiawei P2): a bot the caller owns that also lives in a space
+// the caller is NOT a member of must not leak that foreign space_id into
+// owned_bots_by_space. Otherwise the map disagrees with `spaces` and any
+// consumer that uses the map as a derived authz cache (rather than
+// re-checking `spaces`) gets a foreign key.
+//
+// Original TestAuthVerifyToken_WithInclude_FiltersInactive claimed to cover
+// this but only seeded bots in caller-active spaces; this test adds the
+// missing seed (bot in a space the caller doesn't belong to).
+func TestAuthVerifyToken_WithInclude_DoesNotLeakForeignSpace(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	seedVerifyTokenFixtures(t, ctx)
+
+	// foreign space: exists + active, but caller is NOT a member
+	const foreignSpace = "verify_token_space_foreign"
+	_, err := ctx.DB().InsertInto("space").
+		Columns("space_id", "name", "creator", "status").
+		Values(foreignSpace, "Foreign", "someone_else", 1).Exec()
+	require.NoError(t, err)
+	// (no insert into space_member for testutil.UID into foreignSpace)
+
+	// caller owns bot_shared; bot_shared is a member of SpaceA (caller's
+	// space) AND foreignSpace (caller is NOT a member). After v3 §2.4
+	// fix, foreignSpace must not appear in owned_bots_by_space.
+	insertBot(t, ctx, "bot_shared", testutil.UID, testVerifyTokenSpaceA)
+	_, err = ctx.DB().InsertInto("space_member").
+		Columns("space_id", "uid", "role", "status").
+		Values(foreignSpace, "bot_shared", 0, 1).Exec()
+	require.NoError(t, err)
+
+	w := doVerifyToken(t, s, map[string]string{"token": testutil.Token}, true)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	var resp struct {
+		Spaces           []string            `json:"spaces"`
+		OwnedBotsBySpace map[string][]string `json:"owned_bots_by_space"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+
+	// invariant 1: spaces is the caller's *own* membership only
+	assert.ElementsMatch(t, []string{testVerifyTokenSpaceA, testVerifyTokenSpaceB}, resp.Spaces)
+	assert.NotContains(t, resp.Spaces, foreignSpace, "foreign space must not appear in spaces")
+
+	// invariant 2: owned_bots_by_space stays in lockstep with spaces —
+	// no key for foreignSpace, bot_shared appears only under SpaceA
+	require.NotNil(t, resp.OwnedBotsBySpace)
+	assert.NotContains(t, resp.OwnedBotsBySpace, foreignSpace,
+		"owned_bots_by_space must not leak foreign space_id (v3 §2.4)")
+	assert.Contains(t, resp.OwnedBotsBySpace[testVerifyTokenSpaceA], "bot_shared",
+		"bot in caller's space should still appear")
+}

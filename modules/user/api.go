@@ -3909,13 +3909,27 @@ func (u *User) queryUserSpaceContext(uid string) ([]string, map[string][]string,
 	}
 
 	// Initialize map with one bucket per known space so callers always see
-	// a stable map shape (even when a space has no owned bots).
+	// a stable map shape (even when a space has no owned bots). v3 §2.4
+	// (Jerry-Xin Critical 2 / yujiawei P2): the bot rows are looked up by
+	// the *bot's* membership only, so a bot the caller owns that also
+	// lives in a space the caller is NOT a member of would otherwise leak
+	// a foreign space_id into owned_bots_by_space (which would then
+	// disagree with the `spaces` list, breaking consumers that use
+	// owned_bots as a derived authz cache). Filter through a whitelist of
+	// the caller's *active* spaces from query (1) so the two fields stay
+	// in lockstep — the sibling queryOwnedBotsBySpace (api_key path) does
+	// this correctly via SQL `AND sm.space_id=?`; token path mirrors here
+	// at the Go layer because it iterates over many spaces.
+	validSpaces := make(map[string]struct{}, len(spaces))
 	ownedByspace := make(map[string][]string, len(spaces))
 	for _, sid := range spaces {
+		validSpaces[sid] = struct{}{}
 		ownedByspace[sid] = []string{}
 	}
 	for _, b := range botRows {
-		ownedByspace[b.SpaceID] = append(ownedByspace[b.SpaceID], b.RobotID)
+		if _, ok := validSpaces[b.SpaceID]; ok {
+			ownedByspace[b.SpaceID] = append(ownedByspace[b.SpaceID], b.RobotID)
+		}
 	}
 	return spaces, ownedByspace, nil
 }
@@ -4037,10 +4051,16 @@ func (u *User) authVerifyAPIKey(c *wkhttp.Context) {
 	}
 
 	// Step 2: assert owner still member of space (撤销 = 退 space, 同
-	// resolveAPIKey 现有语义).
+	// resolveAPIKey 现有语义). v3 §2.3 (Jerry-Xin Critical 1): also check
+	// space.status=1 — without this, an api_key whose space was disabled /
+	// soft-deleted (space.status=0) keeps verifying as long as the user's
+	// space_member row was left active. Mirrors modules/space/db.go's
+	// canonical membership pattern (s.status=1 + sm.status=1).
 	var n int
 	err = u.db.session.SelectBySql(
-		"SELECT COUNT(*) FROM space_member WHERE space_id=? AND uid=? AND status=1",
+		`SELECT COUNT(*) FROM space_member sm
+		 INNER JOIN space s ON s.space_id=sm.space_id AND s.status=1
+		 WHERE sm.space_id=? AND sm.uid=? AND sm.status=1`,
 		keyInfo.SpaceID, keyInfo.UID,
 	).LoadOne(&n)
 	if err != nil || n == 0 {

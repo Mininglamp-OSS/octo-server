@@ -5,7 +5,12 @@ import (
 	"fmt"
 )
 
-// assertSpaceMember returns nil iff uid is an active member of spaceID.
+// assertSpaceMember returns nil iff uid is an active member of an active
+// (non-disabled) space. v3 §2.3 (Jerry-Xin Critical 1): joining `space` for
+// status=1 closes the case where a soft-deleted space still has lingering
+// active space_member rows — without it, an api_key bound to a disabled
+// space would keep validating. Mirrors modules/space/db.go canonical
+// (s.status=1 + sm.status=1) pattern.
 // Used by both mintBot (web caller) and resolveAPIKey (daemon caller).
 func (a *BotProvision) assertSpaceMember(uid, spaceID string) error {
 	if uid == "" || spaceID == "" {
@@ -13,7 +18,9 @@ func (a *BotProvision) assertSpaceMember(uid, spaceID string) error {
 	}
 	var n int
 	if err := a.ctx.DB().SelectBySql(
-		"SELECT COUNT(*) FROM space_member WHERE space_id=? AND uid=? AND status=1",
+		`SELECT COUNT(*) FROM space_member sm
+		 INNER JOIN space s ON s.space_id=sm.space_id AND s.status=1
+		 WHERE sm.space_id=? AND sm.uid=? AND sm.status=1`,
 		spaceID, uid,
 	).LoadOne(&n); err != nil {
 		return fmt.Errorf("assertSpaceMember: %w", err)

@@ -1,6 +1,6 @@
 // Cross-service bot endpoints introduced by the fleet split (PR-A.2).
 //
-// Both endpoints sit in auth_jwt rather than botfather because they are
+// Both endpoints sit in bot_provision rather than botfather because they are
 // the new contract surface between octo-server and octo-fleet/daemon —
 // keeping them here makes the eventual deprecation of botfather's older
 // runtime/bot APIs cleaner.
@@ -8,13 +8,17 @@
 //   POST /v1/bot/mint        — web-callable, session-auth, mints a bot
 //                              OBO and returns {bot_uid}. bot_token
 //                              stays in server's robot table.
-//   GET  /v1/bot/:uid/token  — daemon-callable, JWT-auth (scope=daemon),
-//                              returns {bot_token}. Authz check: the
-//                              daemon's JWT.sub must equal the bot's
-//                              creator_uid (owner-on-behalf-of model).
+//   GET  /v1/bot/:uid/token  — daemon-callable, api_key Bearer (uk_ prefix),
+//                              returns {bot_token}. Authz: caller's api_key
+//                              uid must equal the bot's creator_uid AND the
+//                              bot must be a member of the api_key's bound
+//                              space. (Pre-v2 file-top doc described a JWT
+//                              path that no longer exists — JWT teardown
+//                              landed in 决策一+二 Phase 4.)
 package bot_provision
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -22,7 +26,9 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/botfather"
+	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	"github.com/gin-gonic/gin"
+	rd "github.com/go-redis/redis"
 	"go.uber.org/zap"
 )
 
@@ -191,17 +197,42 @@ func (a *BotProvision) Route(r *wkhttp.WKHttp) {
 
 	// /v1/bot/:uid/token validates api_key inline (no session middleware
 	// here — caller is daemon, not browser).
-	r.GET("/v1/bot/:uid/token", a.botToken)
+	//
+	// Rate-limit (v3 §2.1): mounted with the same 1000 req/min/IP "verify"
+	// bucket as /v1/auth/verify-*. Reasoning: this endpoint *returns* a
+	// live bot_token on the happy path, so it's strictly more sensitive
+	// than the verify-* siblings (which only confirm a credential).
+	// Sharing the "verify" tag keeps a single IP keyspace for all
+	// credential-touching paths. Network-level ACL (nginx internal-IP
+	// allowlist / X-Internal-Key) is the documented primary control;
+	// the limiter is defense-in-depth.
+	rlCtx := context.Background()
+	rlRedis := rd.NewClient(octoredis.MustBuildOptions(a.ctx.GetConfig(), func(o *rd.Options) {
+		o.MaxRetries = 1
+		o.PoolSize = 10
+	}))
+	verifyLimit := r.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "verify", 1000.0/60, 100)
+	r.GET("/v1/bot/:uid/token", verifyLimit, a.botToken)
 
 	// Removed legacy auth endpoints (决策一+二 Phase 4). 410 Gone so a
 	// straggler client distinguishes "endpoint was removed by design" from
 	// "wrong URL / typo". Each stub returns a stable JSON body pointing at
-	// the replacement path so client owners can fix in place.
+	// the replacement path so client owners can fix in place. Sunset +
+	// Deprecation headers per RFC 8594 / draft-ietf-httpapi-deprecation so
+	// automated clients can detect the deprecation programmatically.
+	//
+	// Sunset date format: HTTP-date (RFC 7231 §7.1.1.1). The placeholder
+	// is updated by the deploy pipeline to (push_date + 7 days). If you
+	// see "<TBD>" in a deployed response, the deploy pipeline missed the
+	// substitution — file a P1 against the rollout runbook.
+	const sunsetTBD = "<TBD: push 日期 +7 天>"
 	r.GET("/.well-known/jwks.json", gone410Handler(
+		sunsetTBD,
 		"JWKS endpoint removed — fleet/matter no longer verify JWTs locally. "+
 			"Use POST /v1/auth/verify (session) or /v1/auth/verify-api-key (daemon) instead.",
 	))
 	r.POST("/v1/auth/token", gone410Handler(
+		sunsetTBD,
 		"Token exchange endpoint removed — daemon no longer exchanges api_key for a JWT. "+
 			"Send api_key directly as Authorization: Bearer to fleet/matter; they will "+
 			"call /v1/auth/verify-api-key for validation.",
@@ -210,10 +241,12 @@ func (a *BotProvision) Route(r *wkhttp.WKHttp) {
 
 // gone410Handler returns a wkhttp handler that always responds with HTTP 410
 // Gone + a structured JSON body describing why the endpoint was removed and
-// where to migrate. Used for endpoints intentionally retired so old clients
-// get an actionable error rather than a 404.
-func gone410Handler(reason string) func(*wkhttp.Context) {
+// where to migrate. Sunset/Deprecation headers (RFC 8594) let automated
+// clients detect the deprecation without parsing the body.
+func gone410Handler(sunsetDate, reason string) func(*wkhttp.Context) {
 	return func(c *wkhttp.Context) {
+		c.Header("Sunset", sunsetDate)
+		c.Header("Deprecation", "true")
 		c.AbortWithStatusJSON(http.StatusGone, gin.H{
 			"error":   "gone",
 			"message": reason,
