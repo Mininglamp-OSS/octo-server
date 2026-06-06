@@ -57,6 +57,14 @@ func pushDeliveryFailed(c *wkhttp.Context) {
 	c.Abort()
 }
 
+// pushDisabled returns 404 when the feature is globally disabled
+// (system_setting incomingwebhook.enabled=0). Uniform across all pushes — a
+// global state, not a per-webhook signal, so it does not leak webhook existence.
+func pushDisabled(c *wkhttp.Context) {
+	httperr.ResponseErrorLWithStatus(c, errcode.ErrIncomingWebhookPushDisabled, nil, nil)
+	c.Abort()
+}
+
 // ============================================================
 // management-path error responders
 //
@@ -71,6 +79,13 @@ func pushDeliveryFailed(c *wkhttp.Context) {
 // mgmtForbidden returns 403 — caller is neither owner nor admin.
 func mgmtForbidden(c *wkhttp.Context) {
 	httperr.ResponseErrorLWithStatus(c, errcode.ErrIncomingWebhookForbidden, nil, nil)
+}
+
+// mgmtFeatureDisabled returns 403 when the feature is globally disabled
+// (system_setting incomingwebhook.enabled=0). Gates every management write
+// (create/update/delete/regenerate); list (read) stays open.
+func mgmtFeatureDisabled(c *wkhttp.Context) {
+	httperr.ResponseErrorLWithStatus(c, errcode.ErrIncomingWebhookDisabled, nil, nil)
 }
 
 // mgmtRequestInvalid returns 400 for malformed body / invalid field; reason ∈

@@ -23,6 +23,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	commonmod "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
@@ -32,20 +33,17 @@ import (
 
 // 默认配置（可被环境变量覆盖）。
 const (
-	envMaxPerGroup         = "DM_INCOMINGWEBHOOK_MAX_PER_GROUP"
-	envBodyMax             = "DM_INCOMINGWEBHOOK_MAX_BYTES"
-	envRatePerWebhookRPS   = "DM_INCOMINGWEBHOOK_RPS"
-	envRatePerWebhookBurst = "DM_INCOMINGWEBHOOK_BURST"
-	envIngressIPRPS        = "DM_INCOMINGWEBHOOK_IP_RPS"
-	envIngressIPBurst      = "DM_INCOMINGWEBHOOK_IP_BURST"
-	envIPFailRPS           = "DM_INCOMINGWEBHOOK_IP_FAIL_RPS"
-	envIPFailBurst         = "DM_INCOMINGWEBHOOK_IP_FAIL_BURST"
-	envMaxContentRunes     = "DM_INCOMINGWEBHOOK_MAX_CONTENT_RUNES"
+	envBodyMax         = "DM_INCOMINGWEBHOOK_MAX_BYTES"
+	envIngressIPRPS    = "DM_INCOMINGWEBHOOK_IP_RPS"
+	envIngressIPBurst  = "DM_INCOMINGWEBHOOK_IP_BURST"
+	envIPFailRPS       = "DM_INCOMINGWEBHOOK_IP_FAIL_RPS"
+	envIPFailBurst     = "DM_INCOMINGWEBHOOK_IP_FAIL_BURST"
+	envMaxContentRunes = "DM_INCOMINGWEBHOOK_MAX_CONTENT_RUNES"
 
-	defaultMaxPerGroup    = 10
-	defaultMaxBytes       = 8 * 1024
-	defaultRatePerWHRPS   = 5.0
-	defaultRatePerWHBurst = 10
+	defaultMaxBytes = 8 * 1024
+	// 总开关(enabled) 与 per_webhook rps/burst、max_per_group 已迁移到 system_setting
+	// （单一真源在 modules/common.SystemSettings.IncomingWebhook*），运行时可经管理台
+	// 动态调；env DM_INCOMINGWEBHOOK_{ENABLED,RPS,BURST,MAX_PER_GROUP} 仍作 fallback。
 	// per-IP 请求限流（StrictIPRateLimitMiddleware，计入全部请求）的默认值。刻意高于
 	// 旧值(30/60)、但仍低于进程级 floor(200/400)：合法共享/固定 IP 的正常推送量(受
 	// per-webhook 5rps 约束，单 IP 多 webhook 聚合一般 ≪100rps)不被误杀，同时把"单 IP
@@ -84,6 +82,11 @@ type IncomingWebhook struct {
 	// floor 是 push 端点的 Redis-independent 进程级限流地板：两个 Redis 限流器在
 	// Redis 故障时 fail-open，floor 用纯内存令牌桶兜底，保证单实例推送速率始终有界。
 	floor *localFloor
+	// settings 是进程级共享的 system_setting 快照（admin 可动态调）。本模块的总开关
+	// (enabled) 与核心阈值(per_webhook rps/burst、max_per_group) 都走它读取：DB →
+	// env(DM_INCOMINGWEBHOOK_*) → code-default。admin 在管理台改值后 Reload 立即生效，
+	// 多实例 60s 内收敛，无需重启。其余阈值(IP/失败预算/floor/body/content)仍走 env。
+	settings *commonmod.SystemSettings
 }
 
 // maxConcurrentAudit 限制异步审计 goroutine 的最大并发数（默认值，可被 env 覆盖）。
@@ -135,6 +138,7 @@ func New(ctx *config.Context) *IncomingWebhook {
 		rateRedis: sharedRateRedis(ctx.GetConfig()),
 		auditSem:  make(chan struct{}, auditConcurrency()),
 		floor:     newLocalFloor(),
+		settings:  commonmod.EnsureSystemSettings(ctx),
 	}
 	// 群解散级联禁用所有 webhook
 	w.ctx.AddEventListener(event.GroupDisband, w.handleGroupDisband)
@@ -148,11 +152,13 @@ func (w *IncomingWebhook) Route(r *wkhttp.WKHttp) {
 	// 给 create/regenerate 等敏感写操作补 per-login-user 限流。
 	mgr := r.Group("/v1/groups", w.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, w.ctx))
 	{
-		mgr.POST("/:group_no/incoming-webhooks", w.create)
+		// 总开关(system_setting incomingwebhook.enabled)关闭时，写操作一律 403 拒绝，
+		// 仅保留 list 只读——运维仍可查看/排查已存在配置。requireMgmtEnabled 不挂在 list 上。
+		mgr.POST("/:group_no/incoming-webhooks", w.requireMgmtEnabled(), w.create)
 		mgr.GET("/:group_no/incoming-webhooks", w.list)
-		mgr.PUT("/:group_no/incoming-webhooks/:webhook_id", w.update)
-		mgr.DELETE("/:group_no/incoming-webhooks/:webhook_id", w.delete)
-		mgr.POST("/:group_no/incoming-webhooks/:webhook_id/regenerate", w.regenerate)
+		mgr.PUT("/:group_no/incoming-webhooks/:webhook_id", w.requireMgmtEnabled(), w.update)
+		mgr.DELETE("/:group_no/incoming-webhooks/:webhook_id", w.requireMgmtEnabled(), w.delete)
+		mgr.POST("/:group_no/incoming-webhooks/:webhook_id/regenerate", w.requireMgmtEnabled(), w.regenerate)
 	}
 
 	// 推送类：URL 内 token 鉴权，无 AuthMiddleware。四层限流，由粗到细：
@@ -175,22 +181,40 @@ func (w *IncomingWebhook) Route(r *wkhttp.WKHttp) {
 
 	push := r.Group("/v1")
 	{
-		push.POST("/incoming-webhooks/:webhook_id/:token", w.localFloorMiddleware(), ipLimit, w.ipFailureGateMiddleware(), w.push)
+		// requirePushEnabled 在最前：总开关关闭时直接 404，最廉价地短路（甚至不进 floor）。
+		push.POST("/incoming-webhooks/:webhook_id/:token", w.requirePushEnabled(), w.localFloorMiddleware(), ipLimit, w.ipFailureGateMiddleware(), w.push)
+	}
+}
+
+// requirePushEnabled 在总开关(system_setting incomingwebhook.enabled)关闭时让 push
+// 端点返回 404。这是「功能全局停用」语义，对所有请求一致（不区分 webhook 是否存在），
+// 因此与 push 路径的反枚举不变量不冲突。
+func (w *IncomingWebhook) requirePushEnabled() wkhttp.HandlerFunc {
+	return func(c *wkhttp.Context) {
+		if !w.settings.IncomingWebhookEnabled() {
+			pushDisabled(c)
+			return
+		}
+		c.Next()
+	}
+}
+
+// requireMgmtEnabled 在总开关关闭时拒绝所有管理写操作（create/update/delete/
+// regenerate）并返回 403；list 只读不挂此闸。挂在 AuthMiddleware 之后，故仅对已认证的
+// 群管理员生效——总开关是「功能是否开放」而非鉴权，403 语义恰当。
+func (w *IncomingWebhook) requireMgmtEnabled() wkhttp.HandlerFunc {
+	return func(c *wkhttp.Context) {
+		if !w.settings.IncomingWebhookEnabled() {
+			mgmtFeatureDisabled(c)
+			return
+		}
+		c.Next()
 	}
 }
 
 // ============================================================
 // 配置读取（每次读 env，便于运行时调参）
 // ============================================================
-
-func maxPerGroup() int {
-	if v := os.Getenv(envMaxPerGroup); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return n
-		}
-	}
-	return defaultMaxPerGroup
-}
 
 func maxBytes() int {
 	if v := os.Getenv(envBodyMax); v != "" {
@@ -208,14 +232,6 @@ func maxContentRunes() int {
 		}
 	}
 	return defaultMaxContentRunes
-}
-
-func perWebhookRPS() float64 {
-	return wkhttp.ParseRPSFromEnv(envRatePerWebhookRPS, defaultRatePerWHRPS)
-}
-
-func perWebhookBurst() int {
-	return wkhttp.ParseBurstFromEnv(envRatePerWebhookBurst, defaultRatePerWHBurst)
 }
 
 // ipFailRPS / ipFailBurst bound the per-IP AUTH-FAILURE budget (not request
@@ -397,7 +413,7 @@ func (w *IncomingWebhook) create(c *wkhttp.Context) {
 	// status=1 的行，但这**不构成安全问题**：该 webhook 永远推不出消息——push 路径的
 	// requireActiveGroup 重查才是权威闸（群非 Normal 一律 401），且 disband 级联会把
 	// status 翻 0。故此处不在事务内重读 group.status，避免给热路径加锁负担。
-	maxWH := maxPerGroup()
+	maxWH := w.settings.IncomingWebhookMaxPerGroup()
 	if err := w.db.insertWithQuota(m, maxWH); err != nil {
 		if errors.Is(err, ErrQuotaExceeded) {
 			mgmtQuotaExceeded(c, maxWH)

@@ -138,8 +138,8 @@ func (w *IncomingWebhook) runBucketScript(script *redis.Script, key string, args
 // allowPerWebhook 按 webhook_id 维度做令牌桶判定，独立于 IP 限流。
 // Redis 故障时返回 (true, err)，由调用方决定是否记日志（fail-open）。
 func (w *IncomingWebhook) allowPerWebhook(_ context.Context, webhookID string) (bool, error) {
-	rps := perWebhookRPS()
-	burst := perWebhookBurst()
+	rps := w.settings.IncomingWebhookPerWebhookRPS()
+	burst := w.settings.IncomingWebhookPerWebhookBurst()
 	if rps <= 0 || burst <= 0 {
 		return true, nil
 	}

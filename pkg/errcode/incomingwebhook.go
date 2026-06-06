@@ -65,6 +65,16 @@ var (
 		DefaultMessage: "Failed to deliver the webhook message.",
 		Internal:       true,
 	})
+
+	// ErrIncomingWebhookPushDisabled (404) — the incoming-webhook feature is
+	// globally disabled via system_setting incomingwebhook.enabled=0. Returned
+	// for every push while disabled; it is a global state (not per-webhook), so
+	// a uniform 404 does not leak whether any specific webhook exists.
+	ErrIncomingWebhookPushDisabled = register(codes.Code{
+		ID:             "err.server.incomingwebhook.push_disabled",
+		HTTPStatus:     http.StatusNotFound,
+		DefaultMessage: "Not found.",
+	})
 )
 
 // err.server.incomingwebhook.mgmt_* — management-endpoint error codes
@@ -135,5 +145,15 @@ var (
 		HTTPStatus:     http.StatusInternalServerError,
 		DefaultMessage: "The operation failed. Please try again later.",
 		Internal:       true,
+	})
+
+	// ErrIncomingWebhookDisabled (403) — the incoming-webhook feature is globally
+	// disabled via system_setting incomingwebhook.enabled=0. Returned for every
+	// management write (create / update / delete / regenerate) while disabled;
+	// list (read) stays available so operators can still inspect existing config.
+	ErrIncomingWebhookDisabled = register(codes.Code{
+		ID:             "err.server.incomingwebhook.mgmt_disabled",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "The incoming webhook feature is currently disabled.",
 	})
 )

@@ -25,7 +25,7 @@ import (
 	// 缺失任何一个都会导致 module.Setup 在跨模块 ALTER 时报错。
 	// 详见 memory: skill_service_test.md「迁移顺序陷阱」。
 	_ "github.com/Mininglamp-OSS/octo-server/modules/base"
-	_ "github.com/Mininglamp-OSS/octo-server/modules/common"
+	modulescommon "github.com/Mininglamp-OSS/octo-server/modules/common"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/group"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/robot"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/space"
@@ -191,6 +191,54 @@ func TestCreate_NonAdminForbidden(t *testing.T) {
 		"name": "x",
 	}))
 	assert.Equal(t, http.StatusForbidden, w.Code)
+}
+
+// TestFeatureToggle_DisabledStopsPushAndMgmtWrites 验证总开关
+// (system_setting incomingwebhook.enabled=0) 关闭后：push 返回 404、管理写操作
+// (create) 返回 403，而 list 只读仍可用。直接 DB 写 + Reload 共享快照，模拟
+// manager 写路径但避开 admin token（语义同 space.TestCreateSpace_DisabledBySystemSetting）。
+func TestFeatureToggle_DisabledStopsPushAndMgmtWrites(t *testing.T) {
+	handler, ctx, groupNo := setupTestEnv(t)
+	t.Setenv("DM_INCOMINGWEBHOOK_ENABLED", "") // 证明开关纯由 DB 驱动
+
+	// 1) 功能开启时先建一个 webhook，拿到推送 URL。
+	w := do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), map[string]interface{}{
+		"name": "toggle-wh",
+	}))
+	assert.Equalf(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	pushURL, _ := parseJSON(t, w)["url"].(string)
+	assert.True(t, strings.HasPrefix(pushURL, "/v1/incoming-webhooks/"), "url: %s", pushURL)
+
+	// 2) 关闭总开关：DB 写入 incomingwebhook.enabled=0 + Reload 共享快照。
+	_, err := ctx.DB().InsertInto("system_setting").
+		Pair("category", "incomingwebhook").
+		Pair("key_name", "enabled").
+		Pair("value", "0").
+		Pair("value_type", "bool").
+		Pair("description", "").
+		Exec()
+	assert.NoError(t, err)
+	settings := modulescommon.EnsureSystemSettings(ctx)
+	assert.NoError(t, settings.Reload())
+	defer func() {
+		_, _ = ctx.DB().DeleteFrom("system_setting").
+			Where("category=?", "incomingwebhook").Exec()
+		_ = settings.Reload()
+	}()
+
+	// 3) push → 404（功能全局停用，gate 在限流链最前短路）。
+	pw := do(handler, anonReq("POST", pushURL, []byte(`{"content":"hi"}`)))
+	assert.Equalf(t, http.StatusNotFound, pw.Code, "push body: %s", pw.Body.String())
+
+	// 4) 管理写操作 → 403。
+	cw := do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), map[string]interface{}{
+		"name": "blocked",
+	}))
+	assert.Equalf(t, http.StatusForbidden, cw.Code, "create body: %s", cw.Body.String())
+
+	// 5) list 只读仍可用 → 200。
+	lw := do(handler, authReq("GET", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), nil))
+	assert.Equalf(t, http.StatusOK, lw.Code, "list body: %s", lw.Body.String())
 }
 
 // ============================================================

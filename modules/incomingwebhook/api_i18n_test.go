@@ -85,7 +85,9 @@ func TestIncomingWebhookRespondHelpers(t *testing.T) {
 		{"pushPayloadInvalid", func(c *wkhttp.Context) { pushPayloadInvalid(c, "json") }, http.StatusBadRequest, "err.server.incomingwebhook.push_payload_invalid", false},
 		{"pushPayloadTooLarge", pushPayloadTooLarge, http.StatusRequestEntityTooLarge, "err.server.incomingwebhook.push_payload_too_large", false},
 		{"pushDeliveryFailed", pushDeliveryFailed, http.StatusBadGateway, "err.server.incomingwebhook.push_delivery_failed", false},
+		{"pushDisabled", pushDisabled, http.StatusNotFound, "err.server.incomingwebhook.push_disabled", false},
 		{"mgmtForbidden", mgmtForbidden, http.StatusForbidden, "err.server.incomingwebhook.mgmt_forbidden", false},
+		{"mgmtFeatureDisabled", mgmtFeatureDisabled, http.StatusForbidden, "err.server.incomingwebhook.mgmt_disabled", false},
 		{"mgmtNotFound", mgmtNotFound, http.StatusNotFound, "err.server.incomingwebhook.mgmt_not_found", false},
 		{"mgmtQuotaExceeded", func(c *wkhttp.Context) { mgmtQuotaExceeded(c, 10) }, http.StatusConflict, "err.server.incomingwebhook.mgmt_quota_exceeded", false},
 	}

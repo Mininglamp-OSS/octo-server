@@ -333,6 +333,9 @@ other = "The target user does not exist or has been deactivated."
 ["err.server.group.view_forbidden"]
 other = "You do not have permission to view this."
 
+["err.server.incomingwebhook.mgmt_disabled"]
+other = "The incoming webhook feature is currently disabled."
+
 ["err.server.incomingwebhook.mgmt_forbidden"]
 other = "Only the group owner or an admin can manage webhooks."
 
@@ -356,6 +359,9 @@ other = "Invalid request."
 
 ["err.server.incomingwebhook.push_delivery_failed"]
 other = "Failed to deliver the webhook message."
+
+["err.server.incomingwebhook.push_disabled"]
+other = "Not found."
 
 ["err.server.incomingwebhook.push_payload_invalid"]
 other = "Invalid request payload."

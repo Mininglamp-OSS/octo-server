@@ -221,6 +221,15 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 					return
 				}
 			}
+		case settingTypeFloat:
+			if item.Value != "" {
+				if _, err := strconv.ParseFloat(item.Value, 64); err != nil {
+					c.JSON(http.StatusBadRequest, jsonH{
+						"msg": fmt.Sprintf("%s.%s 必须是数字", item.Category, item.Key),
+					})
+					return
+				}
+			}
 		case settingTypeEncrypted:
 			if item.Value == "" || item.Value == secretMask {
 				// Empty payload or the GET mask sentinel preserves the existing

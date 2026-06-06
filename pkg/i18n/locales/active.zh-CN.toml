@@ -666,6 +666,9 @@ other = "请求内容过大。"
 ["err.server.incomingwebhook.push_delivery_failed"]
 other = "Webhook 消息投递失败。"
 
+["err.server.incomingwebhook.push_disabled"]
+other = "未找到。"
+
 # ---- err.server.incomingwebhook.mgmt_* (management endpoints, #246 follow-up) ----
 
 ["err.server.incomingwebhook.mgmt_forbidden"]
@@ -688,6 +691,9 @@ other = "查询 webhook 信息失败。"
 
 ["err.server.incomingwebhook.mgmt_operation_failed"]
 other = "操作失败，请稍后再试。"
+
+["err.server.incomingwebhook.mgmt_disabled"]
+other = "群入站 Webhook 功能当前已关闭。"
 
 # ---- err.server.qrcode.* (modules/qrcode: api.go) ----
 

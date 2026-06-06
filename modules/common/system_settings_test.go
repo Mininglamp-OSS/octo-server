@@ -123,6 +123,55 @@ func TestSystemSettings_BoolFallsBackToYamlWhenUnset(t *testing.T) {
 	assert.False(t, s.RegisterOff(), "DB empty -> fall back to yaml false")
 }
 
+// ----- incomingwebhook settings (总开关 + 核心阈值) -----
+
+func TestSystemSettings_IncomingWebhookEnabled_DefaultsTrue(t *testing.T) {
+	t.Setenv(envIncomingWebhookEnabled, "") // 证明开关纯由 DB / 默认驱动
+	s := newTestSystemSettings(t, nil)
+	assert.True(t, s.IncomingWebhookEnabled(), "DB+env 缺失时默认开启")
+}
+
+func TestSystemSettings_IncomingWebhookEnabled_DBOverridesToFalse(t *testing.T) {
+	t.Setenv(envIncomingWebhookEnabled, "")
+	s := newTestSystemSettings(t, nil)
+	require.NoError(t, s.db.upsert("incomingwebhook", "enabled", "0", settingTypeBool, ""))
+	require.NoError(t, s.Reload())
+	assert.False(t, s.IncomingWebhookEnabled(), "DB 0 必须压制默认 true")
+}
+
+func TestSystemSettings_IncomingWebhookEnabled_EnvFallbackWhenDBUnset(t *testing.T) {
+	t.Setenv(envIncomingWebhookEnabled, "false")
+	s := newTestSystemSettings(t, nil)
+	assert.False(t, s.IncomingWebhookEnabled(), "DB 未配置 → env=false 生效")
+}
+
+func TestSystemSettings_IncomingWebhookThresholds_DefaultsAndDBOverride(t *testing.T) {
+	t.Setenv(envIncomingWebhookPerWebhookRPS, "")
+	t.Setenv(envIncomingWebhookPerWebhookBurst, "")
+	t.Setenv(envIncomingWebhookMaxPerGroup, "")
+	s := newTestSystemSettings(t, nil)
+
+	// DB+env 缺失 → code default。
+	assert.Equal(t, defaultIncomingWebhookPerWebhookRPS, s.IncomingWebhookPerWebhookRPS())
+	assert.Equal(t, defaultIncomingWebhookPerWebhookBurst, s.IncomingWebhookPerWebhookBurst())
+	assert.Equal(t, defaultIncomingWebhookMaxPerGroup, s.IncomingWebhookMaxPerGroup())
+
+	// DB 覆盖（含 float rps）。
+	require.NoError(t, s.db.upsert("incomingwebhook", "per_webhook_rps", "8.5", settingTypeFloat, ""))
+	require.NoError(t, s.db.upsert("incomingwebhook", "per_webhook_burst", "25", settingTypeInt, ""))
+	require.NoError(t, s.db.upsert("incomingwebhook", "max_per_group", "3", settingTypeInt, ""))
+	require.NoError(t, s.Reload())
+	assert.Equal(t, 8.5, s.IncomingWebhookPerWebhookRPS())
+	assert.Equal(t, 25, s.IncomingWebhookPerWebhookBurst())
+	assert.Equal(t, 3, s.IncomingWebhookMaxPerGroup())
+}
+
+func TestSystemSettings_IncomingWebhookRPS_EnvFallbackWhenDBUnset(t *testing.T) {
+	t.Setenv(envIncomingWebhookPerWebhookRPS, "7")
+	s := newTestSystemSettings(t, nil)
+	assert.Equal(t, 7.0, s.IncomingWebhookPerWebhookRPS(), "DB 未配置 → env 生效")
+}
+
 func TestSystemSettings_BoolOverridesYamlWhenSet(t *testing.T) {
 	s := newTestSystemSettings(t, nil)
 	s.ctx.GetConfig().Register.EmailOn = true // yaml says on
