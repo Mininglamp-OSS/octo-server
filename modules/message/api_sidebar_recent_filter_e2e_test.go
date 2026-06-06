@@ -35,6 +35,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	commonapi "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -48,6 +49,11 @@ func TestE2E_RecentFilter_DefaultsReproduceLegacyBehaviour(t *testing.T) {
 	t.Setenv(masterKeyEnvE2E, "0123456789abcdef0123456789abcdef")
 	_, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
+	// Start from a known-good snapshot: the shared SystemSettings singleton may
+	// hold sidebar.* rows written by a prior test (within the ~60s auto-reload
+	// TTL). Reload after wiping the table so "no override" actually means
+	// defaults here (PR #291 review, lml2468).
+	require.NoError(t, commonapi.EnsureSystemSettings(ctx).Reload())
 
 	sb := &Sidebar{ctx: ctx}
 	now := time.Now()

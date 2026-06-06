@@ -12,7 +12,11 @@
 //  4. Apply tab-specific filtering:
 //     follow  – groups with category + not unfollowed; followed DMs; threads
 //     with ext row whose parent group is in the follow set.
-//     recent  – all DMs; groups/threads with timestamp > now-72h.
+//     recent  – per-channel-type activity window from system_settings
+//     (sidebar.recent_filter_{group,thread,person}_days); a window of 0
+//     disables filtering for that type. Defaults reproduce the historical
+//     behaviour for the types the recent tab carries (groups/threads = 3-day
+//     window, DMs unfiltered). See buildRecentItems / loadRecentCutoffs.
 //  5. Append standalone thread ext entries not already in the IM result.
 //  6. Sort:
 //     follow  – category_sort ASC → pinned DESC → follow_sort ASC →
@@ -652,9 +656,16 @@ func daysCutoff(now time.Time, days int) int64 {
 }
 
 // loadRecentCutoffs resolves the per-channel-type recent-tab windows from the
-// shared system_settings snapshot (admin-tunable, ~60s reload). Defaults
-// reproduce the historical hard-coded behaviour exactly: groups/threads use a
-// 3-day window, DMs are unfiltered.
+// shared system_settings snapshot (admin-tunable, ~60s reload). For the channel
+// types the recent tab carries, the defaults reproduce the historical
+// hard-coded behaviour: groups/threads use a 3-day window, DMs are unfiltered.
+// (Unknown types are kept unconditionally — see cutoffFor.)
+//
+// NOTE: EnsureSystemSettings returns a process-wide singleton, so this reads a
+// snapshot shared across the process. Tests that mutate sidebar.* settings must
+// Reload() after wiping the table (see the recent-filter e2e setup), else a
+// stale snapshot from a prior test (within the ~60s auto-reload TTL) can leak
+// in.
 func (sb *Sidebar) loadRecentCutoffs(now time.Time) recentCutoffs {
 	ss := commonapi.EnsureSystemSettings(sb.ctx)
 	return recentCutoffs{

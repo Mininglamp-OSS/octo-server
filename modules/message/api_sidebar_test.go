@@ -373,6 +373,27 @@ func TestBuildRecentItems_PersonWindowFiltersDMs(t *testing.T) {
 	assert.Equal(t, "dm-new", items[0].TargetID)
 }
 
+// Unknown channel types (anything that is not group/thread/DM) are kept
+// unconditionally, even with group/thread/person windows all enabled and an
+// ancient timestamp. This locks the deliberate `cutoffFor` default = 0 (no
+// filter) — a documented divergence from the old "filter every non-DM type by
+// 72h" behaviour (PR #291 review P2). The recent tab does not meaningfully
+// carry these types today; the test guards against silently re-filtering them.
+func TestBuildRecentItems_UnknownChannelType_KeptUnconditionally(t *testing.T) {
+	const unknownChannelType uint8 = 99 // not group(2)/person(1)/communityTopic(5)
+	cutoffs := recentCutoffs{
+		group:  daysCutoff(time.Now(), 3),
+		thread: daysCutoff(time.Now(), 3),
+		person: daysCutoff(time.Now(), 3),
+	}
+	convs := []*config.SyncUserConversationResp{
+		makeIMConv("x-ancient", unknownChannelType, time.Now().Add(-10000*time.Hour).Unix()),
+	}
+	items := buildRecentItems(convs, cutoffs, nil, nil, nil, "")
+	require.Len(t, items, 1, "未知频道类型不应被时间窗口过滤（cutoffFor 默认 0=不过滤）")
+	assert.Equal(t, "x-ancient", items[0].TargetID)
+}
+
 // person cutoff 0 (the default) keeps every DM regardless of age — today's
 // behaviour, now expressed as data rather than an `!isDM` branch.
 func TestBuildRecentItems_PersonCutoffZero_AllDMsKept(t *testing.T) {
