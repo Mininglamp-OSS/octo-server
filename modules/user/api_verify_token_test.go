@@ -74,6 +74,8 @@ func TestAuthVerifyToken_NoInclude_NoNewFields(t *testing.T) {
 	body := w.Body.String()
 	assert.NotContains(t, body, "spaces", "BC: default schema must not include spaces")
 	assert.NotContains(t, body, "owned_bots_by_space", "BC: default schema must not include owned_bots_by_space")
+	assert.NotContains(t, body, "context_included",
+		"v3.3.3 §F: BC default schema must not include context_included (omitempty drops false)")
 	assert.Contains(t, body, `"uid"`)
 	assert.Contains(t, body, `"owned_bots"`, "legacy owned_bots list field must remain in default response")
 }
@@ -93,11 +95,14 @@ func TestAuthVerifyToken_WithInclude_ReturnsSpacesAndOwnedBotsMap(t *testing.T) 
 
 	var resp struct {
 		UID              string              `json:"uid"`
+		ContextIncluded  bool                `json:"context_included"`
 		Spaces           []string            `json:"spaces"`
 		OwnedBotsBySpace map[string][]string `json:"owned_bots_by_space"`
 	}
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	assert.Equal(t, testutil.UID, resp.UID)
+	assert.True(t, resp.ContextIncluded,
+		"v3.3.3 §F: context_included MUST be true on ?include=context — fail-closed vs fallback discriminator")
 	assert.ElementsMatch(t, []string{testVerifyTokenSpaceA, testVerifyTokenSpaceB}, resp.Spaces)
 
 	require.NotNil(t, resp.OwnedBotsBySpace)

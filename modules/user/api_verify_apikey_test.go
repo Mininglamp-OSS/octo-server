@@ -149,6 +149,38 @@ func TestAuthVerifyAPIKey_LegacyEmptySpace(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
+// v3.3.3 §D (yujiawei v3.3.1 stale review #2 三审): api_key path 的 disabled-
+// space 修 (v3 §2.3 加 `INNER JOIN space ON s.status=1`) 没回归 test.
+// 攻击形态: space 已 soft-delete (s.status=0) 但 space_member.status=1
+// 残留 — api_key 仍然能 verify 通过, 给 fleet/matter 一个 disabled space
+// 的 valid uid+space context. 跟 token-path TestAuthVerifyToken_
+// WithInclude_FiltersDisabledSpace 同模板, 这里 api_key path 同款锁住.
+func TestAuthVerifyAPIKey_DisabledSpace_401(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+
+	const disabledSpace = "verify_apikey_disabled_space"
+	const disabledKey = "uk_disabled_space_aaaaaaaaaaaaaaaaaa"
+
+	// seed: space.status=0 (disabled) + space_member.status=1 (active member)
+	_, err := ctx.DB().InsertInto("space").
+		Columns("space_id", "name", "creator", "status").
+		Values(disabledSpace, "Disabled", testAPIKeyUID, 0). // ← status=0
+		Exec()
+	require.NoError(t, err)
+	_, err = ctx.DB().InsertInto("space_member").
+		Columns("space_id", "uid", "role", "status").
+		Values(disabledSpace, testAPIKeyUID, 0, 1). // ← member still active
+		Exec()
+	require.NoError(t, err)
+	insertAPIKey(t, ctx, testAPIKeyUID, disabledKey, disabledSpace)
+
+	w := doVerifyAPIKey(t, s, map[string]string{"api_key": disabledKey})
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code,
+		"api_key bound to a disabled space (s.status=0) must 401 — v3.3.3 §D")
+}
+
 // Case 5: 缺 api_key 字段 → 400 (respondUserTokenRequired 走 400 系列)
 func TestAuthVerifyAPIKey_MissingField(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
@@ -241,6 +273,8 @@ func TestAuthVerifyAPIKey_NoInclude_NoOwnedBotsField(t *testing.T) {
 	// Raw JSON check — must NOT contain "owned_bots" when include not requested.
 	body := w.Body.String()
 	assert.NotContains(t, body, "owned_bots", "BC: default schema must not include owned_bots")
+	assert.NotContains(t, body, "context_included",
+		"v3.3.3 §F: BC default schema must not include context_included (omitempty drops false)")
 	assert.Contains(t, body, `"uid"`)
 	assert.Contains(t, body, `"space_id"`)
 }
@@ -259,13 +293,16 @@ func TestAuthVerifyAPIKey_WithInclude_ReturnsOwnedBotsMap(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 
 	var resp struct {
-		UID       string              `json:"uid"`
-		SpaceID   string              `json:"space_id"`
-		OwnedBots map[string][]string `json:"owned_bots"`
+		UID             string              `json:"uid"`
+		SpaceID         string              `json:"space_id"`
+		ContextIncluded bool                `json:"context_included"`
+		OwnedBots       map[string][]string `json:"owned_bots"`
 	}
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	assert.Equal(t, testAPIKeyUID, resp.UID)
 	assert.Equal(t, testAPIKeySpaceA, resp.SpaceID)
+	assert.True(t, resp.ContextIncluded,
+		"v3.3.3 §F: context_included MUST be true on ?include=context — discriminator that downstream uses for fail-closed vs fallback")
 	require.NotNil(t, resp.OwnedBots)
 	require.Len(t, resp.OwnedBots, 1, "api_key bound to one space → exactly one key in owned_bots map")
 	assert.ElementsMatch(t, []string{"bot_a_1", "bot_a_2"}, resp.OwnedBots[testAPIKeySpaceA])

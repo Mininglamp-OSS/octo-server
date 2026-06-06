@@ -209,6 +209,37 @@ func TestBotToken_NonexistentBot_404(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, w.Code, "body: %s", w.Body.String())
 }
 
+// 8) v3.3.3 §E (yujiawei v3.3.1 stale review #3 三审): daemon path 的
+// disabled-space 修 (assertSpaceMember 加 `INNER JOIN space ON s.status=1`)
+// 也漏 test. 跟 §D 同款攻击形态在 botToken endpoint 上: space soft-deleted
+// (s.status=0) + member 残留 active → api_key 通过 → daemon 拿到 disabled
+// space 的 bot_token. 必须 401.
+func TestBotToken_DisabledSpace_401(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+
+	const disabledSpace = "bp_disabled_space"
+	const disabledKey = "uk_bp_disabled_aaaaaaaaaaaaaaaaaaaa"
+
+	// seed: disabled space + active member (Alice as creator + bot in it)
+	_, err := ctx.DB().InsertInto("space").
+		Columns("space_id", "name", "creator", "status").
+		Values(disabledSpace, "Disabled", bpTestUIDA, 0). // ← status=0
+		Exec()
+	require.NoError(t, err)
+	_, err = ctx.DB().InsertInto("space_member").
+		Columns("space_id", "uid", "role", "status").
+		Values(disabledSpace, bpTestUIDA, 0, 1). // ← member active
+		Exec()
+	require.NoError(t, err)
+	insertAPIKey(t, ctx, bpTestUIDA, disabledKey, disabledSpace)
+	insertBotInSpace(t, ctx, "bot_disabled_space", bpTestUIDA, "bf_tok_ds", disabledSpace, 1)
+
+	w := doBotToken(t, s, "bot_disabled_space", disabledKey)
+	assert.Equal(t, http.StatusUnauthorized, w.Code,
+		"api_key bound to a disabled space (s.status=0) must 401 even on daemon path — v3.3.3 §E")
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // 410 Gone stubs (v3.3.2 reduced to status + body only — Sunset/Deprecation
 // headers dropped, see bot_api.go Route() comment). The v3.3.1 hardcoded
