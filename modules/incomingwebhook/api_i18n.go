@@ -36,7 +36,8 @@ func pushRateLimited(c *wkhttp.Context) {
 }
 
 // pushPayloadInvalid returns 400 for unreadable body / malformed JSON / empty
-// content; reason ∈ {body, json, content} is surfaced via the safe-listed
+// content / malformed rich-text blocks / unknown msg_type; reason ∈
+// {body, json, content, blocks, msg_type} is surfaced via the safe-listed
 // Details key so callers can tell what to fix.
 func pushPayloadInvalid(c *wkhttp.Context, reason string) {
 	httperr.ResponseErrorLWithStatus(c, errcode.ErrIncomingWebhookPushPayloadInvalid, nil, i18n.Details{"reason": reason})

@@ -64,6 +64,9 @@ type pushPayloadReq struct {
 // 不让调用方感知内部 ContentType 编号或 plain/size 等服务端派生字段。
 //   - type=="text"  ：Text 必填且非空。
 //   - type=="image" ：URL（仅 http/https）+ Width/Height（>0）必填，供端上占位排版。
+//
+// ⚠️ 新增块类型时务必与 pkg/richtext（及其底层 common.RichTextBlock 支持的类型）保持
+// 同步：buildRichTextPayload 按白名单逐类翻译，未在此显式支持的块类型会被 Validate 拒绝。
 type webhookBlock struct {
 	Type   string `json:"type"`
 	Text   string `json:"text,omitempty"`

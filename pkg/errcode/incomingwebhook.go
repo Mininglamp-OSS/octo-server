@@ -40,8 +40,9 @@ var (
 	})
 
 	// ErrIncomingWebhookPushPayloadInvalid (400) — unreadable body, malformed
-	// JSON, or empty content. The offending stage is surfaced via
-	// Details["reason"] (body / json / content).
+	// JSON, empty content, malformed rich-text blocks, or an unknown msg_type.
+	// The offending stage is surfaced via Details["reason"]
+	// (body / json / content / blocks / msg_type).
 	ErrIncomingWebhookPushPayloadInvalid = register(codes.Code{
 		ID:             "err.server.incomingwebhook.push_payload_invalid",
 		HTTPStatus:     http.StatusBadRequest,

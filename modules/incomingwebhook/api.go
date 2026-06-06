@@ -785,6 +785,9 @@ func (w *IncomingWebhook) push(c *wkhttp.Context) {
 		}
 		payload = buildPayload(m, &req)
 	case msgTypeRichText:
+		// 注意：richtext 路径【不】套用纯文本的 maxContentRunes(4000) 语义上限——富文本
+		// 由块结构 + 1MB 序列化上限约束，默认 8KB body cap 下不可能逾越。这是与文本路径的
+		// 有意不对称（若运维上调 body cap，富文本仍受 1MB 兜底，不会无界）。
 		p, err := buildRichTextPayload(m, &req)
 		if err != nil {
 			// 仅 >1MB 映射 413（与 body/content 超限同语义）；其余结构性非法（空 content /

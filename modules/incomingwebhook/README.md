@@ -15,6 +15,11 @@ Content-Type: application/json
 
 由 `msg_type` 选择，**缺省即纯文本**，与历史行为完全一致：
 
+> **兼容性提醒**：`msg_type` 现在严格校验——只接受省略 / `"text"` / `"richtext"`，其它非空值
+> （如 `"markdown"`）返回 400 `reason=msg_type`。历史上未知 JSON 字段会被忽略，因此若有旧
+> 客户端误带了别的 `msg_type` 值，升级后需要去掉它（带合法 `content` 也会被拒）。`msg_type`
+> 大小写不敏感（内部做了 lower+trim），但块 `type` 大小写敏感、须为精确小写（`text`/`image`）。
+
 ### 1. 纯文本（`msg_type` 省略或 `"text"`）
 
 `content` 必填，客户端按 markdown 渲染。

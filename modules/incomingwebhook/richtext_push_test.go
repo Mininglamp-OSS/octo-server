@@ -64,6 +64,7 @@ func TestPush_RichText_RejectsEmptyBlocks(t *testing.T) {
 		"blocks":   []map[string]interface{}{},
 	})
 	assert.Equalf(t, http.StatusBadRequest, w.Code, "empty blocks must 400; body=%s", w.Body.String())
+	assert.Containsf(t, w.Body.String(), "blocks", "details.reason should be blocks; body=%s", w.Body.String())
 }
 
 // 图片块缺 width/height → 400。
@@ -78,6 +79,7 @@ func TestPush_RichText_RejectsBadImage(t *testing.T) {
 		},
 	})
 	assert.Equalf(t, http.StatusBadRequest, w.Code, "image without size must 400; body=%s", w.Body.String())
+	assert.Containsf(t, w.Body.String(), "blocks", "details.reason should be blocks; body=%s", w.Body.String())
 }
 
 // 非法 msg_type → 400（reason=msg_type）。
@@ -90,6 +92,7 @@ func TestPush_RejectsUnknownMsgType(t *testing.T) {
 		"content":  "hi",
 	})
 	assert.Equalf(t, http.StatusBadRequest, w.Code, "unknown msg_type must 400; body=%s", w.Body.String())
+	assert.Containsf(t, w.Body.String(), "msg_type", "details.reason should be msg_type; body=%s", w.Body.String())
 }
 
 // 向后兼容：显式 msg_type="text" 与缺省一致，纯文本仍走老路径通过校验。
