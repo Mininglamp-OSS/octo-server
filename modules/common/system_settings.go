@@ -581,7 +581,14 @@ func (s *SystemSettings) IncomingWebhookEnabled() bool {
 // 让 Redis Lua 脚本报错而 fail-open——正是这个 getter 要兜住的。写侧也已拒绝
 // （settingTypeFloat + Positive，见 api_manager_system_setting.go），此处是纵深防御。
 func (s *SystemSettings) IncomingWebhookPerWebhookRPS() float64 {
+	// env fallback 同样消毒：wkhttp.ParseRPSFromEnv 用 strconv.ParseFloat，会接受
+	// NaN / +Inf（DM_INCOMINGWEBHOOK_RPS=NaN 原样透出），所以 def 本身可能非有限。
+	// 若 env 给出非有限/≤0 的 def，回退到永远合法的 code default，避免它穿过下面的
+	// clamp 继续把 NaN 喂给限流器（Jerry-Xin #292 review）。
 	def := wkhttp.ParseRPSFromEnv(envIncomingWebhookPerWebhookRPS, defaultIncomingWebhookPerWebhookRPS)
+	if math.IsNaN(def) || math.IsInf(def, 0) || def <= 0 {
+		def = defaultIncomingWebhookPerWebhookRPS
+	}
 	v := s.getFloat("incomingwebhook", "per_webhook_rps", def)
 	if math.IsNaN(v) || math.IsInf(v, 0) || v <= 0 {
 		return def

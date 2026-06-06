@@ -195,6 +195,17 @@ func TestSystemSettings_IncomingWebhook_ReadSideClamp_NoInfra(t *testing.T) {
 		assert.Equalf(t, defaultIncomingWebhookMaxPerGroup, s.IncomingWebhookMaxPerGroup(), "max_per_group=%q must clamp to default", bad)
 	}
 
+	// env-derived fallback is sanitized too: DM_INCOMINGWEBHOOK_RPS=NaN (which
+	// ParseRPSFromEnv passes through) with no DB row must NOT reach the getter as
+	// NaN — it falls back to the code default (Jerry-Xin #292 review).
+	t.Setenv(envIncomingWebhookPerWebhookRPS, "NaN")
+	emptySnap := &SystemSettings{}
+	em := map[string]string{}
+	emptySnap.snapshot.Store(&em)
+	assert.Equal(t, defaultIncomingWebhookPerWebhookRPS, emptySnap.IncomingWebhookPerWebhookRPS(),
+		"env=NaN with no DB row must fall back to the code default, not NaN")
+	t.Setenv(envIncomingWebhookPerWebhookRPS, "")
+
 	// A valid positive value is served as-is (clamp only catches the bad cases).
 	s := &SystemSettings{}
 	snap := map[string]string{
