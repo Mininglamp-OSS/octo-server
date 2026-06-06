@@ -334,12 +334,15 @@ func (w *IncomingWebhook) cachedQueryByWebhookID(webhookID string) (*incomingWeb
 	if m, ok := w.webhookCache.get(webhookID); ok {
 		return m, nil
 	}
+	// 先捕获代际再读 DB：若读取期间有并发 invalidate（update/delete/regenerate），
+	// setIfGen 会丢弃这次回填，避免用变更前的旧行复活缓存（读-后-失效竞态）。
+	gen := w.webhookCache.loadGen()
 	m, err := w.db.queryByWebhookID(webhookID)
 	if err != nil {
 		return nil, err
 	}
 	if m != nil {
-		w.webhookCache.set(webhookID, m)
+		w.webhookCache.setIfGen(webhookID, m, gen)
 	}
 	return m, nil
 }
@@ -356,12 +359,14 @@ func (w *IncomingWebhook) cachedRequireActiveGroup(groupNo string) (*group.Model
 	if g, ok := w.groupCache.get(groupNo); ok {
 		return g, nil
 	}
+	// 同 cachedQueryByWebhookID：代际守卫关闭 disband 失效与在途 miss 读的回填竞态。
+	gen := w.groupCache.loadGen()
 	g, err := w.requireActiveGroup(groupNo)
 	if err != nil {
 		return nil, err
 	}
 	if g != nil {
-		w.groupCache.set(groupNo, g)
+		w.groupCache.setIfGen(groupNo, g, gen)
 	}
 	return g, nil
 }

@@ -1,6 +1,8 @@
 package incomingwebhook
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -73,6 +75,58 @@ func TestTTLCache_MaxSizeClears(t *testing.T) {
 	v, ok := c.get("c")
 	assert.True(t, ok)
 	assert.Equal(t, 3, v)
+}
+
+// TestTTLCache_SetIfGen_DropsStaleRepopulation pins the read-after-invalidate
+// guard: a miss-load that captured the generation BEFORE a concurrent invalidate
+// must NOT repopulate the cache (its stale value would otherwise resurrect a
+// just-invalidated entry for a full TTL on the mutating instance).
+func TestTTLCache_SetIfGen_DropsStaleRepopulation(t *testing.T) {
+	c := newTTLCache[int](time.Minute, 10)
+
+	gen := c.loadGen()      // captured before the (simulated) DB read
+	c.invalidate("k")       // a concurrent mutation invalidates → bumps gen
+	c.setIfGen("k", 1, gen) // the in-flight load tries to store the pre-mutation value
+	if _, ok := c.get("k"); ok {
+		t.Fatal("stale repopulation across an invalidate must be dropped")
+	}
+
+	// No race in between → the store lands.
+	gen = c.loadGen()
+	c.setIfGen("k", 2, gen)
+	v, ok := c.get("k")
+	assert.True(t, ok)
+	assert.Equal(t, 2, v)
+}
+
+// TestTTLCache_ConcurrentRace hammers the cache from many goroutines mixing
+// get / loadGen+setIfGen / invalidate, so `go test -race` exercises the locking.
+// It asserts no panic/deadlock; correctness of the guard is pinned deterministically
+// by TestTTLCache_SetIfGen_DropsStaleRepopulation above.
+func TestTTLCache_ConcurrentRace(t *testing.T) {
+	c := newTTLCache[int](time.Minute, 64)
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			key := fmt.Sprintf("k%d", n%4)
+			for j := 0; j < 500; j++ {
+				switch j % 4 {
+				case 0:
+					gen := c.loadGen()
+					c.setIfGen(key, n, gen)
+				case 1:
+					c.get(key)
+				case 2:
+					c.invalidate(key)
+				case 3:
+					c.set(key, n)
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
 }
 
 // ----- env parsers (no infra) -----

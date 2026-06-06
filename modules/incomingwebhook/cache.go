@@ -15,6 +15,8 @@ import (
 // ⚠️ 鉴权 staleness 契约（#284 验收明确接受秒级 staleness）：
 //   - webhook 变更（disable / delete / regenerate）会在【本实例】即时 invalidate 对应
 //     webhook 条目；群【解散】(event.GroupDisband) 会在【本实例】即时 invalidate 群条目。
+//     「即时」是严格的：invalidate 自增代际，任何在变更前就开始、读到旧行的在途 miss 读
+//     都会在 setIfGen 时因代际变化被丢弃，不会把旧快照回填回来（读-后-失效竞态已关闭）。
 //   - 跨实例没有主动失效，最多 stale 一个 TTL：上述刚变更的 webhook 或刚解散的群，在 TTL
 //     窗口内对等实例上可能仍按旧状态放行。
 //   - **群【管理员禁用】(GroupStatusNormal→Disabled, 走 event.GroupUpdate) 不在失效矩阵
@@ -78,7 +80,13 @@ type ttlCache[T any] struct {
 	mu      sync.Mutex
 	ttl     time.Duration
 	maxSize int
-	m       map[string]cacheEntry[T]
+	// gen 是单调代际计数，每次 invalidate 自增。配合 loadGen/setIfGen 关闭「读-后-失效」
+	// 回填竞态：cache miss 时先 loadGen 捕获代际，DB 读完用 setIfGen 落库——若期间有任何
+	// invalidate（代际变了），本次落库被丢弃，从而保证「本实例 invalidate 后旧快照不会被
+	// 一个在途的 miss 读重新填回」。粗粒度（任一 key 的 invalidate 都会让在途 set 作废），
+	// 但变更稀少，误丢顶多多读一次 DB，不影响正确性。
+	gen uint64
+	m   map[string]cacheEntry[T]
 }
 
 func newTTLCache[T any](ttl time.Duration, maxSize int) *ttlCache[T] {
@@ -107,8 +115,40 @@ func (c *ttlCache[T]) get(key string) (T, bool) {
 	return e.val, true
 }
 
-// set 写入并打 TTL 戳。超过容量上限且是新键时整桶清空（粗粒度淘汰：工作集小、正常不
-// 触发；触发时最坏退化为下一轮重填，不影响正确性）。
+// loadGen 捕获当前代际，应在 cache miss 后、发起 DB 读【之前】调用，把它传给随后的
+// setIfGen，使并发的 invalidate 能在落库时被检测到。
+func (c *ttlCache[T]) loadGen() uint64 {
+	if !c.enabled() {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.gen
+}
+
+// setIfGen 仅在代际未变（自 loadGen 起没有 invalidate 发生）时落库；否则丢弃。这正是
+// 关闭回填竞态的关键：一个在 mutation 之前就开始的 miss 读，不得用「变更前的旧行」把缓存
+// 重新填上、令刚被禁用/删除/改 token 的条目在本实例上复活一个 TTL。丢弃最多多读一次 DB。
+func (c *ttlCache[T]) setIfGen(key string, val T, gen uint64) {
+	if !c.enabled() {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.gen != gen {
+		return
+	}
+	if len(c.m) >= c.maxSize {
+		if _, exists := c.m[key]; !exists {
+			c.m = make(map[string]cacheEntry[T], c.maxSize)
+		}
+	}
+	c.m[key] = cacheEntry[T]{val: val, exp: time.Now().Add(c.ttl)}
+}
+
+// set 写入并打 TTL 戳（无代际守卫，仅供测试预热缓存用；生产读路径走 loadGen+setIfGen）。
+// 超过容量上限且是新键时整桶清空（粗粒度淘汰：工作集小、正常不触发；触发时最坏退化为
+// 下一轮重填，不影响正确性）。
 func (c *ttlCache[T]) set(key string, val T) {
 	if !c.enabled() {
 		return
@@ -123,12 +163,14 @@ func (c *ttlCache[T]) set(key string, val T) {
 	c.m[key] = cacheEntry[T]{val: val, exp: time.Now().Add(c.ttl)}
 }
 
-// invalidate 删除单个键（变更路径的即时失效入口）。
+// invalidate 删除单个键并自增代际（变更路径的即时失效入口）。自增代际让任何在途的
+// miss 读在随后 setIfGen 时作废，保证失效后旧快照不会被回填——即「本实例即时失效」。
 func (c *ttlCache[T]) invalidate(key string) {
 	if !c.enabled() {
 		return
 	}
 	c.mu.Lock()
+	c.gen++
 	delete(c.m, key)
 	c.mu.Unlock()
 }
