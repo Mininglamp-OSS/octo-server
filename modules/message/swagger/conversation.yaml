@@ -55,6 +55,9 @@ paths:
               device_uuid:
                 type: string
                 description: "设备uuid"
+              recent_filter:
+                type: boolean
+                description: "可选，默认 false。为 true 时对返回的会话列表套用 sidebar recent tab 同款的按频道类型活动窗口过滤（system_settings 的 sidebar.recent_filter_{group,thread,person}_days，0=该类型不过滤）。供 Web「最近」tab 使用；不传则行为与历史完全一致（不过滤）。cursor 推进与 per-Space 未读仍基于过滤前的原始会话。"
       responses:
         200:
           description: "返回"

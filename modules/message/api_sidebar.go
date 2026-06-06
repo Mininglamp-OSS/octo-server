@@ -526,7 +526,7 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 			}
 		}
 	case "recent":
-		cutoffs := sb.loadRecentCutoffs(time.Now())
+		cutoffs := loadRecentCutoffs(sb.ctx, time.Now())
 		items = buildRecentItems(conversations, cutoffs, pinnedSet, groupSpaceMap, externalGroupMap, defaultSpaceID)
 	}
 
@@ -661,13 +661,17 @@ func daysCutoff(now time.Time, days int) int64 {
 // hard-coded behaviour: groups/threads use a 3-day window, DMs are unfiltered.
 // (Unknown types are kept unconditionally — see cutoffFor.)
 //
+// Package-level (not a *Sidebar method) so /v1/conversation/sync can reuse the
+// exact same window resolution when a client opts in to recent filtering
+// (issue #294) — both handlers live in package message.
+//
 // NOTE: EnsureSystemSettings returns a process-wide singleton, so this reads a
 // snapshot shared across the process. Tests that mutate sidebar.* settings must
 // Reload() after wiping the table (see the recent-filter e2e setup), else a
 // stale snapshot from a prior test (within the ~60s auto-reload TTL) can leak
 // in.
-func (sb *Sidebar) loadRecentCutoffs(now time.Time) recentCutoffs {
-	ss := commonapi.EnsureSystemSettings(sb.ctx)
+func loadRecentCutoffs(ctx *config.Context, now time.Time) recentCutoffs {
+	ss := commonapi.EnsureSystemSettings(ctx)
 	return recentCutoffs{
 		group:  daysCutoff(now, ss.SidebarRecentFilterGroupDays()),
 		thread: daysCutoff(now, ss.SidebarRecentFilterThreadDays()),

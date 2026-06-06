@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -290,6 +291,15 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 		LastMsgSeqs string `json:"last_msg_seqs"` // 客户端所有会话的最后一条消息序列号 格式： channelID:channelType:last_msg_seq|channelID:channelType:last_msg_seq
 		MsgCount    int64  `json:"msg_count"`     // 每个会话消息数量
 		DeviceUUID  string `json:"device_uuid"`   // 设备uuid
+		// RecentFilter 为 true 时，对响应会话列表套用 sidebar recent tab 同款的
+		// 按频道类型活动窗口过滤（system_settings 的 sidebar.recent_filter_*_days，
+		// 0=该类型不过滤）。issue #294：Web「最近」tab 走本端点而非 /v1/sidebar/sync，
+		// 需要显式 opt-in 才能让管理员配置的过滤窗口生效。
+		//
+		// 默认 false —— 移动端/桌面端的离线全量同步行为完全不变（PR #291 明确把本
+		// 端点列为 "intentionally untouched"），避免安静群/子区从通用会话同步中消失。
+		// 过滤只作用于响应 list，cursor 推进与 per-Space 未读仍基于过滤前的原始会话。
+		RecentFilter bool `json:"recent_filter"`
 	}
 	if err := c.BindJSON(&req); err != nil {
 		co.Error("数据格式有误！", zap.Error(err))
@@ -724,6 +734,23 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	}
 	co.syncConversationResultCacheLock.Unlock()
 
+	// ---------- recent 活动窗口过滤（opt-in，issue #294） ----------
+	// Web「最近」tab 走本端点（非 /v1/sidebar/sync），需要这里复用 sidebar recent
+	// tab 同款的按频道类型活动窗口过滤，管理员配置的 sidebar.recent_filter_*_days
+	// 才能对它生效。仅在客户端显式 RecentFilter=true 时启用 —— 默认关闭，移动端/
+	// 桌面端的离线全量同步行为完全不变。
+	//
+	// 顺序约束：必须在 cursor 推进（lastVersion，基于 raw conversations）之后，
+	// 因为被过滤掉的会话可能正好是本批最高 version 的那条；用过滤后列表推 cursor
+	// 会让客户端反复拉同一批（与 PR-B #1377 / sidebar B1 同一类死循环）。
+	// per-Space 未读仍基于 raw conversations（见下方 fillPersonSpaceUnread），不受影响。
+	// 系统 Bot 的可见性兜底（EnsureSystemBotsPresent）在 Space 过滤块里、本步之后
+	// 执行，因此即便开启 person 窗口也不会把系统 Bot 误删。
+	if req.RecentFilter {
+		cutoffs := loadRecentCutoffs(co.ctx, time.Now())
+		syncUserConversationResps = filterRecentConversations(syncUserConversationResps, cutoffs)
+	}
+
 	// ---------- 子区 source_message_id ----------
 	co.fillThreadMeta(syncUserConversationResps)
 
@@ -848,6 +875,25 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 		ChannelStates:    channelStates,
 		SpaceMemberships: spaceMemberships,
 	})
+}
+
+// filterRecentConversations drops conversations whose per-channel-type activity
+// window has elapsed, mirroring the sidebar recent tab (buildRecentItems): a
+// conversation is hidden iff its type's cutoff is non-zero AND its Timestamp is
+// at or before that cutoff. A cutoff of 0 means "no filter" for that type, and
+// unknown channel types are kept unconditionally (recentCutoffs.cutoffFor).
+//
+// Returns a new slice — the input is not mutated, so the caller's raw-based
+// cursor/unread computations stay intact (issue #294).
+func filterRecentConversations(resps []*SyncUserConversationResp, cutoffs recentCutoffs) []*SyncUserConversationResp {
+	filtered := make([]*SyncUserConversationResp, 0, len(resps))
+	for _, r := range resps {
+		if cutoff := cutoffs.cutoffFor(r.ChannelType); cutoff != 0 && r.Timestamp <= cutoff {
+			continue
+		}
+		filtered = append(filtered, r)
+	}
+	return filtered
 }
 
 func (co *Conversation) channelMessageSeqJoin(channelID string, channelType uint8, lastMessageSeq uint32) string {
