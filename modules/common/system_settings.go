@@ -3,6 +3,7 @@ package common
 import (
 	"context"
 	"encoding/base64"
+	"math"
 	"os"
 	"regexp"
 	"strconv"
@@ -574,20 +575,41 @@ func (s *SystemSettings) IncomingWebhookEnabled() bool {
 }
 
 // IncomingWebhookPerWebhookRPS 单个 webhook 令牌桶速率(rps)。DB → env → 默认 5。
+//
+// 读侧防御（D-289 同型，覆盖直接改库的旁路）：rps 必须是正有限值；NaN/±Inf/≤0 一律
+// 回退到 env/默认。否则 allowPerWebhook 的 `rps<=0` 短路会把限流器静默关掉，NaN 还会
+// 让 Redis Lua 脚本报错而 fail-open——正是这个 getter 要兜住的。写侧也已拒绝
+// （settingTypeFloat + Positive，见 api_manager_system_setting.go），此处是纵深防御。
 func (s *SystemSettings) IncomingWebhookPerWebhookRPS() float64 {
-	return s.getFloat("incomingwebhook", "per_webhook_rps",
-		wkhttp.ParseRPSFromEnv(envIncomingWebhookPerWebhookRPS, defaultIncomingWebhookPerWebhookRPS))
+	def := wkhttp.ParseRPSFromEnv(envIncomingWebhookPerWebhookRPS, defaultIncomingWebhookPerWebhookRPS)
+	v := s.getFloat("incomingwebhook", "per_webhook_rps", def)
+	if math.IsNaN(v) || math.IsInf(v, 0) || v <= 0 {
+		return def
+	}
+	return v
 }
 
 // IncomingWebhookPerWebhookBurst 单个 webhook 令牌桶突发上限。DB → env → 默认 10。
+// 读侧防御：≤0 回退默认（同 RPS，避免 `burst<=0` 短路静默关掉限流器）。
 func (s *SystemSettings) IncomingWebhookPerWebhookBurst() int {
-	return s.getInt("incomingwebhook", "per_webhook_burst",
-		wkhttp.ParseBurstFromEnv(envIncomingWebhookPerWebhookBurst, defaultIncomingWebhookPerWebhookBurst))
+	def := wkhttp.ParseBurstFromEnv(envIncomingWebhookPerWebhookBurst, defaultIncomingWebhookPerWebhookBurst)
+	v := s.getInt("incomingwebhook", "per_webhook_burst", def)
+	if v <= 0 {
+		return def
+	}
+	return v
 }
 
 // IncomingWebhookMaxPerGroup 单个群可创建的 webhook 数量上限。DB → env → 默认 10。
+// 读侧防御：≤0 回退默认（max_per_group=0 会让每次 create 都 ErrQuotaExceeded，是
+// 总开关之外一种更难诊断的「暗关」）。
 func (s *SystemSettings) IncomingWebhookMaxPerGroup() int {
-	return s.getInt("incomingwebhook", "max_per_group", incomingWebhookMaxPerGroupEnvDefault())
+	def := incomingWebhookMaxPerGroupEnvDefault()
+	v := s.getInt("incomingwebhook", "max_per_group", def)
+	if v <= 0 {
+		return def
+	}
+	return v
 }
 
 // incomingWebhookEnabledEnvDefault 解析 DM_INCOMINGWEBHOOK_ENABLED（缺省/无法识别

@@ -433,3 +433,68 @@ func TestManagerSystemSetting_UpdateAcceptsInRangeIntBoundaries(t *testing.T) {
 	assert.Equal(t, "3650", got["sidebar.recent_filter_thread_days"])
 	assert.Equal(t, "7", got["sidebar.recent_filter_person_days"])
 }
+
+// TestManagerSystemSetting_UpdateRejectsInvalidIncomingWebhookNumerics pins the
+// #292-review hardening: the rate-limit / quota knobs are Positive keys, so the
+// write path must reject 0 / negative / NaN / ±Inf / non-numeric — values that
+// would otherwise silently disable the per-webhook limiter or the quota.
+func TestManagerSystemSetting_UpdateRejectsInvalidIncomingWebhookNumerics(t *testing.T) {
+	t.Setenv(masterKeyEnv, "0123456789abcdef0123456789abcdef")
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	require.NoError(t, ctx.Cache().Set(
+		ctx.GetConfig().Cache.TokenCachePrefix+testutil.Token,
+		testutil.UID+"@test@"+string(wkhttp.SuperAdmin),
+	))
+
+	cases := []struct{ key, value string }{
+		{"per_webhook_rps", "0"}, {"per_webhook_rps", "-1.5"}, {"per_webhook_rps", "NaN"},
+		{"per_webhook_rps", "+Inf"}, {"per_webhook_rps", "-Inf"}, {"per_webhook_rps", "abc"},
+		{"per_webhook_burst", "0"}, {"per_webhook_burst", "-1"},
+		{"max_per_group", "0"}, {"max_per_group", "-5"},
+	}
+	for _, tc := range cases {
+		body := []byte(`{"items":[{"category":"incomingwebhook","key":"` + tc.key + `","value":"` + tc.value + `"}]}`)
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", "/v1/manager/common/system_setting", bytes.NewReader(body))
+		req.Header.Set("token", testutil.Token)
+		s.GetRoute().ServeHTTP(w, req)
+		assert.NotEqualf(t, http.StatusOK, w.Code, "incomingwebhook.%s=%q must be rejected", tc.key, tc.value)
+	}
+}
+
+// TestManagerSystemSetting_UpdateAcceptsPositiveIncomingWebhookNumerics pins that
+// valid positive values are accepted, including a large burst — Positive keys opt
+// out of the shared [0,3650] day-window cap, so there is no artificial upper bound
+// (matching the env semantics they fall back to).
+func TestManagerSystemSetting_UpdateAcceptsPositiveIncomingWebhookNumerics(t *testing.T) {
+	t.Setenv(masterKeyEnv, "0123456789abcdef0123456789abcdef")
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	require.NoError(t, ctx.Cache().Set(
+		ctx.GetConfig().Cache.TokenCachePrefix+testutil.Token,
+		testutil.UID+"@test@"+string(wkhttp.SuperAdmin),
+	))
+
+	body := []byte(`{"items":[` +
+		`{"category":"incomingwebhook","key":"per_webhook_rps","value":"8.5"},` +
+		`{"category":"incomingwebhook","key":"per_webhook_burst","value":"100000"},` +
+		`{"category":"incomingwebhook","key":"max_per_group","value":"50"}` +
+		`]}`)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/manager/common/system_setting", bytes.NewReader(body))
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	db := newSystemSettingDB(ctx)
+	rows, err := db.listAll()
+	require.NoError(t, err)
+	got := map[string]string{}
+	for _, r := range rows {
+		got[schemaKey(r.Category, r.KeyName)] = r.Value
+	}
+	assert.Equal(t, "8.5", got["incomingwebhook.per_webhook_rps"])
+	assert.Equal(t, "100000", got["incomingwebhook.per_webhook_burst"], "no artificial upper bound for Positive keys")
+	assert.Equal(t, "50", got["incomingwebhook.max_per_group"])
+}

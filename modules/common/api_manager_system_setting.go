@@ -3,6 +3,7 @@ package common
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 
@@ -203,7 +204,9 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 		case settingTypeInt:
 			// Empty value means "reset to default" (the getter treats an empty
 			// snapshot entry as not-configured), so only validate non-empty
-			// payloads. Bounds-check against [settingIntMin, settingIntMax] —
+			// payloads. A Positive key (rate-limit / quota knob) must be a
+			// strictly-positive int and skips the shared day-window bound;
+			// otherwise bounds-check against [settingIntMin, settingIntMax] —
 			// previously this path only ran strconv.Atoi with no range guard,
 			// letting absurd windows (or negatives) reach the DB (issue #289).
 			if item.Value != "" {
@@ -214,7 +217,14 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 					})
 					return
 				}
-				if n < settingIntMin || n > settingIntMax {
+				if def.Positive {
+					if n <= 0 {
+						c.JSON(http.StatusBadRequest, jsonH{
+							"msg": fmt.Sprintf("%s.%s 必须是正整数", item.Category, item.Key),
+						})
+						return
+					}
+				} else if n < settingIntMin || n > settingIntMax {
 					c.JSON(http.StatusBadRequest, jsonH{
 						"msg": fmt.Sprintf("%s.%s 必须在 [%d, %d] 范围内", item.Category, item.Key, settingIntMin, settingIntMax),
 					})
@@ -222,10 +232,28 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 				}
 			}
 		case settingTypeFloat:
+			// Reject non-finite (NaN / ±Inf — all of which strconv.ParseFloat
+			// happily accepts) so they can never reach a rate limiter: a NaN rps
+			// errors the Redis Lua script (fail-open) and ±Inf/≤0 short-circuit
+			// the bucket to "always allowed". A Positive key additionally rejects
+			// ≤0. Read side mirrors this (clamp → default) for direct DB edits.
 			if item.Value != "" {
-				if _, err := strconv.ParseFloat(item.Value, 64); err != nil {
+				f, err := strconv.ParseFloat(item.Value, 64)
+				if err != nil {
 					c.JSON(http.StatusBadRequest, jsonH{
 						"msg": fmt.Sprintf("%s.%s 必须是数字", item.Category, item.Key),
+					})
+					return
+				}
+				if math.IsNaN(f) || math.IsInf(f, 0) {
+					c.JSON(http.StatusBadRequest, jsonH{
+						"msg": fmt.Sprintf("%s.%s 必须是有限数字", item.Category, item.Key),
+					})
+					return
+				}
+				if def.Positive && f <= 0 {
+					c.JSON(http.StatusBadRequest, jsonH{
+						"msg": fmt.Sprintf("%s.%s 必须是正数", item.Category, item.Key),
 					})
 					return
 				}

@@ -172,6 +172,42 @@ func TestSystemSettings_IncomingWebhookRPS_EnvFallbackWhenDBUnset(t *testing.T) 
 	assert.Equal(t, 7.0, s.IncomingWebhookPerWebhookRPS(), "DB 未配置 → env 生效")
 }
 
+// TestSystemSettings_IncomingWebhook_ReadSideClamp_NoInfra pins the read-side
+// defence (#292 review): a snapshot carrying NaN / ±Inf / ≤0 — which a direct DB
+// edit could introduce even though the admin write path now rejects them — must
+// clamp back to the env/code default so the rate limiter never sees a value that
+// would silently disable it. Drives the snapshot directly, no infra.
+func TestSystemSettings_IncomingWebhook_ReadSideClamp_NoInfra(t *testing.T) {
+	t.Setenv(envIncomingWebhookPerWebhookRPS, "")   // → default 5
+	t.Setenv(envIncomingWebhookPerWebhookBurst, "") // → default 10
+	t.Setenv(envIncomingWebhookMaxPerGroup, "")     // → default 10
+
+	for _, bad := range []string{"NaN", "+Inf", "-Inf", "0", "-1", "-3.5"} {
+		s := &SystemSettings{}
+		snap := map[string]string{
+			"incomingwebhook.per_webhook_rps":   bad,
+			"incomingwebhook.per_webhook_burst": bad,
+			"incomingwebhook.max_per_group":     bad,
+		}
+		s.snapshot.Store(&snap)
+		assert.Equalf(t, defaultIncomingWebhookPerWebhookRPS, s.IncomingWebhookPerWebhookRPS(), "rps=%q must clamp to default", bad)
+		assert.Equalf(t, defaultIncomingWebhookPerWebhookBurst, s.IncomingWebhookPerWebhookBurst(), "burst=%q must clamp to default", bad)
+		assert.Equalf(t, defaultIncomingWebhookMaxPerGroup, s.IncomingWebhookMaxPerGroup(), "max_per_group=%q must clamp to default", bad)
+	}
+
+	// A valid positive value is served as-is (clamp only catches the bad cases).
+	s := &SystemSettings{}
+	snap := map[string]string{
+		"incomingwebhook.per_webhook_rps":   "8.5",
+		"incomingwebhook.per_webhook_burst": "25",
+		"incomingwebhook.max_per_group":     "3",
+	}
+	s.snapshot.Store(&snap)
+	assert.Equal(t, 8.5, s.IncomingWebhookPerWebhookRPS())
+	assert.Equal(t, 25, s.IncomingWebhookPerWebhookBurst())
+	assert.Equal(t, 3, s.IncomingWebhookMaxPerGroup())
+}
+
 // TestSystemSettings_IncomingWebhook_GetterChain_NoInfra exercises the full
 // snapshot(DB) → env → code-default fallback for the incomingwebhook getters
 // WITHOUT a test server: it drives the snapshot map directly. This lets the

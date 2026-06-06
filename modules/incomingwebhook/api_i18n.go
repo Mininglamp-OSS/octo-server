@@ -84,8 +84,15 @@ func mgmtForbidden(c *wkhttp.Context) {
 // mgmtFeatureDisabled returns 403 when the feature is globally disabled
 // (system_setting incomingwebhook.enabled=0). Gates every management write
 // (create/update/delete/regenerate); list (read) stays open.
+//
+// Unlike the other mgmt responders (which are called from inside a handler that
+// returns immediately after), this one runs from the requireMgmtEnabled
+// MIDDLEWARE, so it MUST c.Abort() — a bare return only exits the middleware
+// closure and Gin would still invoke the downstream write handler, executing
+// the mutation after the 403 was written. Symmetric with pushDisabled.
 func mgmtFeatureDisabled(c *wkhttp.Context) {
 	httperr.ResponseErrorLWithStatus(c, errcode.ErrIncomingWebhookDisabled, nil, nil)
+	c.Abort()
 }
 
 // mgmtRequestInvalid returns 400 for malformed body / invalid field; reason ∈

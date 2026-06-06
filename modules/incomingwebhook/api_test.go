@@ -18,6 +18,7 @@ import (
 	"github.com/go-redis/redis"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	// 该模块自身需注册以触发其 SQL 迁移
 	_ "github.com/Mininglamp-OSS/octo-server/modules/incomingwebhook"
@@ -236,9 +237,15 @@ func TestFeatureToggle_DisabledStopsPushAndMgmtWrites(t *testing.T) {
 	}))
 	assert.Equalf(t, http.StatusForbidden, cw.Code, "create body: %s", cw.Body.String())
 
-	// 5) list 只读仍可用 → 200。
+	// 5) list 只读仍可用 → 200，且必须仍只有最初那 1 个 webhook —— 证明被拒的 create
+	//    没有真正落库（requireMgmtEnabled 必须 c.Abort()，否则 403 之后 create handler
+	//    仍会执行、把 "blocked" 写进去，列表会变成 2 条）。
 	lw := do(handler, authReq("GET", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), nil))
 	assert.Equalf(t, http.StatusOK, lw.Code, "list body: %s", lw.Body.String())
+	list, _ := parseJSON(t, lw)["list"].([]interface{})
+	require.Lenf(t, list, 1, "disabled create must not insert a row; list=%s", lw.Body.String())
+	first, _ := list[0].(map[string]interface{})
+	assert.Equal(t, "toggle-wh", first["name"], "the only webhook must be the original, not the blocked create")
 }
 
 // ============================================================
