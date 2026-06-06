@@ -3039,50 +3039,11 @@ func (g *Group) groupExit(c *wkhttp.Context) {
 
 }
 
-// removeUserFromGroupThreads 移除用户在某群下所有子区的成员记录、IM 订阅和置顶
+// removeUserFromGroupThreads 移除用户在某群下所有子区的成员记录、IM 订阅和置顶。
+// 委托给包级 removeUserFromGroupThreadsCleanup（见 thread_cleanup.go，Issue #27），
+// 保留方法签名以最小化调用方改动。
 func (g *Group) removeUserFromGroupThreads(groupNo, uid, spaceID string) {
-	// 查询用户在该群加入的所有子区（shortID 用于构建 IM channelID）
-	type threadInfo struct {
-		ShortID string `db:"short_id"`
-	}
-	var threads []threadInfo
-	_, err := g.db.session.Select("thread.short_id").
-		From("thread").
-		Join("thread_member", "thread.id = thread_member.thread_id").
-		Where("thread.group_no=? AND thread_member.uid=? AND thread.status!=3", groupNo, uid).
-		Load(&threads)
-	if err != nil {
-		g.Error("查询用户子区失败", zap.Error(err), zap.String("groupNo", groupNo), zap.String("uid", uid))
-		return
-	}
-	if len(threads) == 0 {
-		return
-	}
-
-	// 删除成员记录
-	_, err = g.db.session.DeleteFrom("thread_member").
-		Where("uid=? AND thread_id IN (SELECT id FROM thread WHERE group_no=?)", uid, groupNo).
-		Exec()
-	if err != nil {
-		g.Error("删除子区成员失败", zap.Error(err), zap.String("groupNo", groupNo), zap.String("uid", uid))
-		return
-	}
-
-	// 移除 IM 订阅和置顶
-	for _, t := range threads {
-		// 子区 channelID 格式: {groupNo}____{shortID} (与 thread.BuildChannelID 一致)
-		channelID := groupNo + "____" + t.ShortID
-		if rmErr := g.ctx.IMRemoveSubscriber(&config.SubscriberRemoveReq{
-			ChannelID:   channelID,
-			ChannelType: common.ChannelTypeCommunityTopic.Uint8(),
-			Subscribers: []string{uid},
-		}); rmErr != nil {
-			g.Error("移除子区IM订阅者失败", zap.Error(rmErr), zap.String("channelID", channelID), zap.String("uid", uid))
-		}
-		// 清理用户在该子区的置顶
-		user.RemovePinnedForUserInSpace(uid, spaceID, channelID, common.ChannelTypeCommunityTopic.Uint8())
-		conversation_ext.RemoveConvExtForUserInSpace(uid, spaceID, channelID, common.ChannelTypeCommunityTopic.Uint8())
-	}
+	removeUserFromGroupThreadsCleanup(g.ctx, g.Log, groupNo, uid, spaceID)
 }
 
 // addUsersToGroupThreads 新成员入群时，将其加入该群所有子区的 IM 订阅（允许发消息）

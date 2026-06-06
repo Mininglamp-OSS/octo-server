@@ -660,6 +660,9 @@ func (h *commandHandler) onDeleteConfirm(fromUID string, input string) {
 			if err != nil {
 				h.Error("从IM频道移除Bot失败", zap.String("groupNo", g.GroupNo), zap.Error(err))
 			}
+			// Issue #27：父群订阅之外，还要对齐摘除该 Bot 在群内所有非删除子区的 IM 订阅，
+			// 否则被删除的 Bot 仍会通过 WuKongIM 持续收到子区消息。
+			h.groupService.RemoveUserFromGroupThreads(g.GroupNo, botID, g.SpaceID)
 		}
 	}
 
