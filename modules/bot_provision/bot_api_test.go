@@ -210,11 +210,12 @@ func TestBotToken_NonexistentBot_404(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// 410 Gone stubs (v3.3.1 §A.3) — verify status + Sunset + Deprecation
-// headers + JSON body. yujiawei P2 三审: previous tests didn't cover the
-// 410 stub headers at all; a malformed Sunset placeholder shipped to
-// production without a test catching it. Lock the new (real HTTP-date +
-// spec-conformant Deprecation) shape so a future drift trips CI.
+// 410 Gone stubs (v3.3.2 reduced to status + body only — Sunset/Deprecation
+// headers dropped, see bot_api.go Route() comment). The v3.3.1 hardcoded
+// dates were both wrong (Sunset said Fri but the date is Saturday;
+// Deprecation @1749427200 resolves to 2025-06-09 not 2026), and there is
+// no deploy-pipeline substitution to keep them fresh. Body still carries
+// the actionable migration pointer.
 // ─────────────────────────────────────────────────────────────────────
 
 func doRaw(t *testing.T, s *server.Server, method, path string) *httptest.ResponseRecorder {
@@ -226,56 +227,34 @@ func doRaw(t *testing.T, s *server.Server, method, path string) *httptest.Respon
 	return w
 }
 
-func TestGone410_JWKS_ReturnsStatusSunsetDeprecationBody(t *testing.T) {
+func TestGone410_JWKS_ReturnsStatusAndBody(t *testing.T) {
 	s, _ := testutil.NewTestServer()
 	w := doRaw(t, s, "GET", "/.well-known/jwks.json")
 
 	require.Equal(t, http.StatusGone, w.Code, "JWKS endpoint must respond 410")
 
-	sunset := w.Header().Get("Sunset")
-	assert.NotEmpty(t, sunset, "Sunset header must be present")
-	assert.True(t, isASCII(sunset),
-		"Sunset must be ASCII HTTP-date (RFC 7231) — v3 shipped a multibyte placeholder by mistake")
-	assert.Regexp(t, `^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$`, sunset,
-		"Sunset must match RFC 7231 HTTP-date IMF-fixdate form")
-
-	dep := w.Header().Get("Deprecation")
-	assert.NotEmpty(t, dep, "Deprecation header must be present")
-	assert.Regexp(t, `^@\d+$`, dep,
-		"Deprecation must be @<unix-seconds> per current httpapi-deprecation draft (not boolean true)")
+	// v3.3.2: Sunset/Deprecation headers dropped — assert they are NOT
+	// emitted. Locks the no-header decision in place so a future
+	// "let's re-add Sunset" change has to update this test, and at that
+	// point reviewer can confirm the constants are actually correct.
+	assert.Empty(t, w.Header().Get("Sunset"), "Sunset header must NOT be set (v3.3.2 drop)")
+	assert.Empty(t, w.Header().Get("Deprecation"), "Deprecation header must NOT be set (v3.3.2 drop)")
 
 	body := w.Body.String()
 	assert.Contains(t, body, "JWKS endpoint removed", "body must explain why + where to migrate")
 	assert.Contains(t, body, "verify-api-key", "body must point at the replacement endpoint")
 }
 
-func TestGone410_TokenExchange_ReturnsStatusSunsetDeprecationBody(t *testing.T) {
+func TestGone410_TokenExchange_ReturnsStatusAndBody(t *testing.T) {
 	s, _ := testutil.NewTestServer()
 	w := doRaw(t, s, "POST", "/v1/auth/token")
 
 	require.Equal(t, http.StatusGone, w.Code, "token exchange endpoint must respond 410")
 
-	sunset := w.Header().Get("Sunset")
-	assert.True(t, isASCII(sunset),
-		"Sunset must be ASCII — v3 shipped multibyte placeholder")
-
-	dep := w.Header().Get("Deprecation")
-	assert.Regexp(t, `^@\d+$`, dep,
-		"Deprecation must be @<unix-seconds>")
+	assert.Empty(t, w.Header().Get("Sunset"), "Sunset header must NOT be set (v3.3.2 drop)")
+	assert.Empty(t, w.Header().Get("Deprecation"), "Deprecation header must NOT be set (v3.3.2 drop)")
 
 	body := w.Body.String()
 	assert.Contains(t, body, "Token exchange endpoint removed")
 	assert.Contains(t, body, "Authorization: Bearer")
-}
-
-// isASCII returns true when s contains only ASCII bytes (0-127). RFC 7230
-// header field-values are ASCII-only; multibyte UTF-8 violates the spec
-// and can cause downstream parser misbehavior.
-func isASCII(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] > 127 {
-			return false
-		}
-	}
-	return true
 }

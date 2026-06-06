@@ -4171,16 +4171,26 @@ func (u *User) authVerifyAPIKey(c *wkhttp.Context) {
 // space. bot is itself a user, and its space membership lives in
 // space_member (robot table has no space_id). Mirrors the join pattern in
 // botfather/db.go queryRobotsByCreatorUIDAndSpaceID.
+//
+// v3.3.2 (yujiawei + Jerry-Xin R4 nit): same silent-truncation guard as
+// queryUserSpaceContext (v3.2 bots LIMIT 1001 + v3.3.1 §A.2 spaces
+// LIMIT 101). Over-fetch LIMIT 1001 + ORDER BY r.robot_id (deterministic
+// truncation window) + warn when len > 1000. Authz still fail-safe — a
+// truncated bot falls through to fleet/matter SQL owner_uid filters
+// downstream — but the warn surfaces the rare power user hitting the cap
+// instead of leaving the loss invisible.
 func (u *User) queryOwnedBotsBySpace(creatorUID, spaceID string) ([]string, error) {
 	type row struct {
 		RobotID string `db:"robot_id"`
 	}
+	const ownedBotsLimit = 1000
 	var rows []row
 	_, err := u.db.session.SelectBySql(
 		`SELECT r.robot_id FROM robot r
 		 INNER JOIN space_member sm ON sm.uid=r.robot_id AND sm.space_id=? AND sm.status=1
 		 WHERE r.creator_uid=? AND r.status=1
-		 LIMIT 1000`,
+		 ORDER BY r.robot_id
+		 LIMIT 1001`,
 		spaceID, creatorUID,
 	).Load(&rows)
 	if err != nil {
@@ -4189,6 +4199,14 @@ func (u *User) queryOwnedBotsBySpace(creatorUID, spaceID string) ([]string, erro
 	out := make([]string, 0, len(rows))
 	for _, r := range rows {
 		out = append(out, r.RobotID)
+	}
+	if len(out) > ownedBotsLimit {
+		u.Warn("queryOwnedBotsBySpace owned bots truncated at policy limit",
+			zap.String("uid", creatorUID),
+			zap.String("space_id", spaceID),
+			zap.Int("limit", ownedBotsLimit),
+			zap.Int("returned", len(out)))
+		out = out[:ownedBotsLimit]
 	}
 	return out, nil
 }

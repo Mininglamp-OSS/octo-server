@@ -219,21 +219,17 @@ func (a *BotProvision) Route(r *wkhttp.WKHttp) {
 	// "wrong URL / typo". Each stub returns a stable JSON body pointing at
 	// the replacement path so client owners can fix in place.
 	//
-	// Sunset (RFC 8594) + Deprecation (draft-ietf-httpapi-deprecation):
-	// emitted by gone410Handler so automated clients can detect the
-	// deprecation programmatically.
-	//
-	// v3.3.1 §A.3 (yujiawei P2 三审): the v3 placeholder
-	// "<TBD: push 日期 +7 天>" contained multibyte UTF-8 and was not a
-	// valid RFC 7231 HTTP-date — no deploy pipeline substitution exists
-	// in this repo, so the malformed header would have shipped. Replaced
-	// with a real hardcoded date (push day + 7d). If push slips, update
-	// the constants below in a one-line follow-up commit.
-	//
-	// Deprecation header: v3 emitted boolean "true" (early-draft form);
-	// the current draft mandates "@<unix-seconds>". Emitting the
-	// spec-conformant value so any client implementing the cited spec
-	// recognizes it.
+	// v3.3.2 (Jerry-Xin R4 nit, caster local review): Sunset/Deprecation
+	// headers dropped. v3.3.1 hardcoded both dates wrong — Sunset said
+	// "Fri, 13 Jun 2026" but that day is actually Saturday; Deprecation
+	// said "@1749427200" which resolves to 2025-06-09, off by a year.
+	// Fixing the dates would just invite the next off-by-one when push
+	// slips. There's no deploy-pipeline substitution mechanism in this
+	// repo to keep them current, and zero current consumers depend on
+	// either header. The 410 status + structured JSON body remain — that
+	// is the actionable signal for both humans and automated clients.
+	// If we ever want Sunset back, deploy-time substitution must land
+	// first (separate PR).
 	r.GET("/.well-known/jwks.json", gone410Handler(
 		"JWKS endpoint removed — fleet/matter no longer verify JWTs locally. "+
 			"Use POST /v1/auth/verify (session) or /v1/auth/verify-api-key (daemon) instead.",
@@ -247,23 +243,11 @@ func (a *BotProvision) Route(r *wkhttp.WKHttp) {
 
 // gone410Handler returns a wkhttp handler that always responds with HTTP 410
 // Gone + a structured JSON body describing why the endpoint was removed and
-// where to migrate. Sunset/Deprecation headers (RFC 8594 / current
-// draft-ietf-httpapi-deprecation) let automated clients detect the
-// deprecation without parsing the body.
-//
-// Sunset constant: real RFC 7231 HTTP-date. Update before each release if
-// the push date shifts.
-// Deprecation constant: "@<unix-seconds>" per current draft (not boolean
-// "true" which was an earlier expired draft).
-const (
-	gone410SunsetDate      = "Fri, 13 Jun 2026 00:00:00 GMT"
-	gone410DeprecationDate = "@1749427200" // 2026-06-09T00:00:00Z (deploy day)
-)
-
+// where to migrate. Sunset/Deprecation headers were considered (RFC 8594 /
+// draft-ietf-httpapi-deprecation) but dropped in v3.3.2 — see Route()
+// comment above for the reasoning.
 func gone410Handler(reason string) func(*wkhttp.Context) {
 	return func(c *wkhttp.Context) {
-		c.Header("Sunset", gone410SunsetDate)
-		c.Header("Deprecation", gone410DeprecationDate)
 		c.AbortWithStatusJSON(http.StatusGone, gin.H{
 			"error":   "gone",
 			"message": reason,
