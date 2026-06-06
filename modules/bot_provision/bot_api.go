@@ -22,6 +22,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/botfather"
+	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 )
 
@@ -116,8 +117,12 @@ func (a *BotProvision) botToken(c *wkhttp.Context) {
 		CreatorUID string `db:"creator_uid"`
 	}
 	var r row
+	// status=1 filter: disabled bots (status=0) must not leak their token —
+	// admin disable is the kill switch and shouldn't be bypassable via the
+	// daemon path. Aligns with the sibling /v1/auth/verify-bot which also
+	// filters status=1.
 	_, err = a.ctx.DB().Select("bot_token", "creator_uid").From("robot").
-		Where("robot_id=?", botUID).Load(&r)
+		Where("robot_id=? AND status=1", botUID).Load(&r)
 	if err != nil {
 		a.Error("query robot for token", zap.Error(err), zap.String("bot_uid", botUID))
 		c.ResponseError(errors.New("lookup failed"))
@@ -162,6 +167,12 @@ var hexEncode = defaultHexEncode
 //
 //	POST /v1/bot/mint        — web session auth (octo-lib session middleware)
 //	GET  /v1/bot/:uid/token  — daemon api_key Bearer (validated inline)
+//
+// Also registers 410 Gone stubs for removed legacy auth endpoints so old
+// callers get a deterministic deprecation signal instead of a 404 from an
+// unregistered path. The previous JWT/JWKS pair lived under these paths
+// and was dropped in 决策一+二 Phase 4; the stubs document the change for
+// any straggler client that hasn't been updated.
 func (a *BotProvision) Route(r *wkhttp.WKHttp) {
 	authGroup := r.Group("/v1", a.ctx.AuthMiddleware(r))
 	authGroup.POST("/bot/mint", a.mintBot)
@@ -169,4 +180,31 @@ func (a *BotProvision) Route(r *wkhttp.WKHttp) {
 	// /v1/bot/:uid/token validates api_key inline (no session middleware
 	// here — caller is daemon, not browser).
 	r.GET("/v1/bot/:uid/token", a.botToken)
+
+	// Removed legacy auth endpoints (决策一+二 Phase 4). 410 Gone so a
+	// straggler client distinguishes "endpoint was removed by design" from
+	// "wrong URL / typo". Each stub returns a stable JSON body pointing at
+	// the replacement path so client owners can fix in place.
+	r.GET("/.well-known/jwks.json", gone410Handler(
+		"JWKS endpoint removed — fleet/matter no longer verify JWTs locally. "+
+			"Use POST /v1/auth/verify (session) or /v1/auth/verify-api-key (daemon) instead.",
+	))
+	r.POST("/v1/auth/token", gone410Handler(
+		"Token exchange endpoint removed — daemon no longer exchanges api_key for a JWT. "+
+			"Send api_key directly as Authorization: Bearer to fleet/matter; they will "+
+			"call /v1/auth/verify-api-key for validation.",
+	))
+}
+
+// gone410Handler returns a wkhttp handler that always responds with HTTP 410
+// Gone + a structured JSON body describing why the endpoint was removed and
+// where to migrate. Used for endpoints intentionally retired so old clients
+// get an actionable error rather than a 404.
+func gone410Handler(reason string) func(*wkhttp.Context) {
+	return func(c *wkhttp.Context) {
+		c.AbortWithStatusJSON(http.StatusGone, gin.H{
+			"error":   "gone",
+			"message": reason,
+		})
+	}
 }
