@@ -100,9 +100,10 @@ Content-Type: application/json
 POST /v1/groups/:group_no/incoming-webhooks/:webhook_id/test
 ```
 
-向群里发一条固定文案的测试消息，端到端验证配置（群可达、消息能投递）。返回
-`{"status":0,"message_id":<int>}`。会记一条 `adapter=test` 的成功投递，便于在
-deliveries 里与真实流量区分。
+向群里发一条测试消息，端到端验证配置（群可达、消息能投递）。文案按出站语言本地化
+（en-US / zh-CN，由 `i18n.OutboundLanguage` 协商）。返回 `{"status":0,"message_id":<int>}`。
+会记一条 `adapter=test` 的投递（成功或失败都记，便于在 deliveries 里与真实流量区分），
+且**不**计入 `call_count` / `last_used_at`（测试不是真实流量）。
 
 ### 投递记录（排障）
 
@@ -118,11 +119,11 @@ GET /v1/groups/:group_no/incoming-webhooks/:webhook_id/deliveries?limit=50
   "list": [
     {
       "status": 2, "reason": "blocks", "http_status": 400, "adapter": "native",
-      "ip": "203.0.113.10", "byte_size": 84, "message_id": 0, "created_at": 1749200000
+      "byte_size": 84, "message_id": 0, "created_at": 1749200000
     },
     {
       "status": 1, "reason": "", "http_status": 200, "adapter": "native",
-      "ip": "203.0.113.10", "byte_size": 42, "message_id": 123456, "created_at": 1749199900
+      "byte_size": 42, "message_id": 123456, "created_at": 1749199900
     }
   ]
 }
@@ -132,6 +133,8 @@ GET /v1/groups/:group_no/incoming-webhooks/:webhook_id/deliveries?limit=50
 - `reason`（失败时）：`body` / `json` / `content` / `blocks` / `msg_type` / `too_large` /
   `delivery_failed`。
 - `adapter`：`native`（推送端点）/ `test`（测试推送）。
+- `http_status`：返回给调用方的状态码。**迁移前的历史成功行为 `0`（未知）**——不伪造成 200。
+- **不返回调用方 `ip`**：审计表仍存 ip 作排查上下文，但出于隐私不向群管理员下发（review 决定）。
 
 > **限流（429）不入审计**：`rate_limited` 是天然高频失败，逐条落库会在重试风暴时放大
 > DB 写入、反噬限流的廉价丢弃；429 + `X-RateLimit-*`/`Retry-After` 头已把信息给到调用方。

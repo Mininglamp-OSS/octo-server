@@ -130,12 +130,14 @@ type createResp struct {
 }
 
 // deliveryResp 是 deliveries 排障端点返回的单条投递记录（成功+失败）。绝不含 token。
+//
+// 刻意【不】下发调用方 IP：审计表仍存 ip（限流/排查上下文），但向群管理员暴露来源 IP
+// 是隐私取舍，按 review 决定收敛——deliveries 只回投递结果元数据，不回 IP（PR #299 review）。
 type deliveryResp struct {
 	Status     int    `json:"status"`      // auditSuccess / auditFailed
 	Reason     string `json:"reason"`      // 失败原因码；成功为空
 	HTTPStatus int    `json:"http_status"` // 返回给调用方的 HTTP 状态码
 	Adapter    string `json:"adapter"`     // 来源/适配器
-	IP         string `json:"ip"`
 	ByteSize   int    `json:"byte_size"`
 	MessageID  int64  `json:"message_id"`
 	CreatedAt  int64  `json:"created_at"`

@@ -34,6 +34,8 @@ func TestDeliveries_Endpoint(t *testing.T) {
 	w := do(handler, authReq("GET", fmt.Sprintf("/v1/groups/%s/incoming-webhooks/%s/deliveries", groupNo, whID), nil))
 	require.Equalf(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	assert.NotContains(t, w.Body.String(), "token")
+	// 隐私取舍：deliveries 不下发调用方 IP（review 决定）。
+	assert.NotContains(t, w.Body.String(), "1.2.3.4", "deliveries must not expose caller ip")
 
 	list, _ := parseJSON(t, w)["list"].([]interface{})
 	require.Len(t, list, 2)

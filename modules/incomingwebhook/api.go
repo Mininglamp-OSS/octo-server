@@ -26,6 +26,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	commonmod "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"github.com/go-redis/redis"
@@ -677,9 +678,16 @@ const (
 	maxDeliveriesLimit     = 100
 )
 
-// testPushContent 是「测试推送」固定文案。webhook 消息本就是任意文本，这里不走 i18n
-// 错误信封（那是错误响应专用）；固定一句中性文案即可，发到群里让管理员确认链路打通。
-const testPushContent = "✅ Incoming Webhook 测试消息：配置成功，链路已打通。"
+// testPushMessage 返回「测试推送」文案，按出站语言本地化。webhook 消息是普通消息体、
+// 不走 i18n 错误信封（那是错误响应专用），故采用与 outbound 邮件一致的做法：用
+// i18n.OutboundLanguage(ctx) 解析协商语言，再选对应文案。支持矩阵为 en-US / zh-CN
+// （默认 zh-CN）。
+func testPushMessage(ctx context.Context) string {
+	if i18n.OutboundLanguage(ctx) == "en-US" {
+		return "✅ Incoming Webhook test message: setup works, the delivery path is live."
+	}
+	return "✅ Incoming Webhook 测试消息：配置成功，链路已打通。"
+}
 
 // deliveries 返回某 webhook 最近的投递记录（成功+失败），供发送方排障。只读、群管理员
 // 可见；绝不返回 token。失败记录的 reason/http_status 与 push 路径返回给调用方的响应
@@ -722,7 +730,6 @@ func deliveryRespFrom(a *auditModel) deliveryResp {
 		Reason:     a.Reason,
 		HTTPStatus: a.HTTPStatus,
 		Adapter:    a.Adapter,
-		IP:         a.IP,
 		ByteSize:   a.ByteSize,
 		MessageID:  a.MessageID,
 		CreatedAt:  time.Time(a.CreatedAt).Unix(),
@@ -754,8 +761,10 @@ func (w *IncomingWebhook) testPush(c *wkhttp.Context) {
 		return
 	}
 
-	req := &pushPayloadReq{Content: testPushContent}
+	msg := testPushMessage(c.Request.Context())
+	req := &pushPayloadReq{Content: msg}
 	payload := buildPayload(m, req)
+	ip := clientIP(c.Request)
 	resp, err := w.ctx.SendMessageWithResult(&config.MsgSendReq{
 		Header:      config.MsgHeader{RedDot: 1},
 		ChannelID:   m.GroupNo,
@@ -766,6 +775,12 @@ func (w *IncomingWebhook) testPush(c *wkhttp.Context) {
 	if err != nil {
 		w.Error("send test webhook message failed",
 			zap.String("webhook_id", m.WebhookID), zap.Error(err))
+		// 记一条 adapter=test 的失败投递，让排障故事对称（成功/失败都可见）。bumpUsed=false。
+		w.submitDelivery(&auditModel{
+			WebhookID: m.WebhookID, GroupNo: m.GroupNo, IP: ip, ByteSize: len(msg),
+			Status: auditFailed, Reason: "delivery_failed",
+			HTTPStatus: http.StatusInternalServerError, Adapter: adapterTest,
+		}, false)
 		mgmtOperationFailed(c)
 		return
 	}
@@ -774,7 +789,7 @@ func (w *IncomingWebhook) testPush(c *wkhttp.Context) {
 		msgID = resp.MessageID
 	}
 	// bumpUsed=false：测试推送不计入 call_count / last_used_at（adapter=test 已可区分）。
-	w.submitSuccess(m, len(testPushContent), clientIP(c.Request), msgID, adapterTest, false)
+	w.submitSuccess(m, len(msg), ip, msgID, adapterTest, false)
 	c.Response(map[string]interface{}{
 		"status":     0,
 		"message_id": msgID,
