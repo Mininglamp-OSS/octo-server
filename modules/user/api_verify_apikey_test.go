@@ -27,6 +27,15 @@ const (
 
 func seedAPIKeyFixtures(t *testing.T, ctx *config.Context) {
 	t.Helper()
+	// v3.3.6 §P1: INSERT user row (status=1) is required since the daemon
+	// api_key membership SQL now joins `user` ON u.status=1. Without it,
+	// happy-path tests would 401. INSERT IGNORE keeps the helper idempotent
+	// if testutil.NewTestServer or another helper already seeded the row.
+	_, err := ctx.DB().Exec(
+		"INSERT IGNORE INTO `user` (uid, name, status, short_no) VALUES (?, ?, ?, ?)",
+		testAPIKeyUID, "apikey_test_user", 1, "apikey_test_sn",
+	)
+	require.NoError(t, err)
 	// Two spaces, the test uid is an active member of both.
 	for _, sid := range []string{testAPIKeySpaceA, testAPIKeySpaceB} {
 		_, err := ctx.DB().InsertInto("space").
@@ -375,4 +384,83 @@ func TestAuthVerifyAPIKey_OwnedBots_FiltersDisabled(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	assert.ElementsMatch(t, []string{"bot_active"}, resp.OwnedBots[testAPIKeySpaceA])
+}
+
+// v3.3.6 §P1 regression — yujiawei R2 P1: account ban (user.status=0)
+// MUST revoke daemon api_key. Pre-v3.3.6 the verify-api-key SQL only
+// joined space_member + space, not user, so a globally banned user
+// kept fully valid daemon credentials. liftBanUser
+// (modules/user/api_manager.go:909) sets user.status=0 + QuitUserDevice;
+// the redis token cache clear handles the session-token path, but
+// daemon api_key sits behind no such cache → must be SQL-gated.
+func TestAuthVerifyAPIKey_AccountBanned_401(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	seedAPIKeyFixtures(t, ctx)
+	insertAPIKey(t, ctx, testAPIKeyUID, "uk_banned_aaaaaaaaaaaaaaaaaaaaaaaa", testAPIKeySpaceA)
+
+	// Ban the user (mirrors liftBanUser path: user.status=0, leave
+	// space_member.status=1 to exercise the exact gap the P1 closes).
+	_, err := ctx.DB().Update("user").
+		Set("status", 0).
+		Where("uid=?", testAPIKeyUID).
+		Exec()
+	require.NoError(t, err)
+
+	w := doVerifyAPIKey(t, s, map[string]string{"api_key": "uk_banned_aaaaaaaaaaaaaaaaaaaaaaaa"})
+	assert.Equal(t, http.StatusUnauthorized, w.Code,
+		"v3.3.6 §P1 (yujiawei R2): banned user's daemon api_key MUST be revoked (user.status=0 → 401)")
+}
+
+// v3.3.6 §P2#3 regression — yujiawei R2 P2#3: ?include=context DB-error
+// fail-secure contract. authVerifyAPIKey on context-query err MUST return:
+//   - HTTP 200 (not 500)
+//   - context_included = true (downstream fleet/matter use this as
+//     fail-closed-vs-fallback discriminator; flipping to false would
+//     silently downgrade them to pre-v2 fallback and re-open X-Space-Id
+//     trust)
+//   - owned_bots = empty non-nil map
+//
+// Trigger: RENAME the space_member table away (atomic + defer-restore
+// keeps schema intact for subsequent tests in the same package run).
+// DROP TABLE would also work but CleanAllTables only TRUNCATEs and does
+// not recreate schema → DROP would break every subsequent test in the
+// package.
+func TestAuthVerifyAPIKey_IncludeContext_DBError_FailSecure(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	seedAPIKeyFixtures(t, ctx)
+	insertAPIKey(t, ctx, testAPIKeyUID, "uk_dberr_aaaaaaaaaaaaaaaaaaaaaaaaa", testAPIKeySpaceA)
+
+	// Hide robot so queryOwnedBotsBySpace fails (table not found), while
+// step 2 membership check (space_member + space + user) still PASSes —
+// otherwise step 2 would 401 early and we'd never reach the step 3
+// fail-secure path. RENAME is atomic; defer restore so no test
+// pollution.
+_, err := ctx.DB().Exec("RENAME TABLE robot TO robot_tmp_v336_apikey")
+require.NoError(t, err)
+defer func() {
+    _, _ = ctx.DB().Exec("RENAME TABLE robot_tmp_v336_apikey TO robot")
+}()
+
+	w := doVerifyAPIKeyCtx(t, s, map[string]string{"api_key": "uk_dberr_aaaaaaaaaaaaaaaaaaaaaaaaa"})
+	require.Equal(t, http.StatusOK, w.Code,
+		"DB-err on context query MUST NOT 500 (v3.3.6 §P2#3 fail-secure); body: %s", w.Body.String())
+
+	var resp struct {
+		UID             string              `json:"uid"`
+		SpaceID         string              `json:"space_id"`
+		ContextIncluded bool                `json:"context_included"`
+		OwnedBots       map[string][]string `json:"owned_bots"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+
+	assert.True(t, resp.ContextIncluded,
+		"context_included MUST stay true on DB err — flipping to false would silently downgrade fleet/matter to pre-v2 fallback (opens X-Space-Id trust)")
+	// fail-secure contract: OwnedBots returns map with the bound space
+	// key but empty value list (not entirely empty map — the api_key is
+	// always bound to exactly one space, so the key is the API contract).
+	require.NotNil(t, resp.OwnedBots, "owned_bots map MUST be present on context path even on err")
+	require.Contains(t, resp.OwnedBots, testAPIKeySpaceA, "bound space key MUST be present")
+	assert.Empty(t, resp.OwnedBots[testAPIKeySpaceA], "bot list under bound space MUST be empty on DB err")
 }

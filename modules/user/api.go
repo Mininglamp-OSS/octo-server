@@ -3962,10 +3962,21 @@ func (u *User) queryUserSpaceContext(uid string) ([]string, map[string][]string,
 		RobotID string `db:"robot_id"`
 		SpaceID string `db:"space_id"`
 	}
-	// Policy ceiling on owned bots per user. Documented in the
-	// "Heads-up #2" section of the v3 PR comment (server PR #290).
-	// Raising this requires (a) confirming the consumer side
-	// (fleet/matter middleware) is OK with a larger owned_bots_by_space
+	// Policy ceiling on owned (bot, space) PAIRS per user.
+	//
+	// v3.3.6 §P2#2 (yujiawei R2): the SQL below is `SELECT r.robot_id,
+	// sm.space_id FROM robot r INNER JOIN space_member sm ON sm.uid=
+	// r.robot_id` with NO DISTINCT/GROUP BY — a bot in N spaces yields
+	// N rows. The 1000 cap therefore truncates (bot, space) PAIRS, not
+	// distinct bots: a user with 600 bots × avg 2 spaces = 1200 pairs
+	// hits the cap despite owning only 600 distinct bots. Authz stays
+	// fail-safe (truncated pairs fall through to owner_uid SQL filters),
+	// but the metric is pair-count, not bot-count — keep this in mind
+	// when raising the limit or alerting on the warn below.
+	//
+	// Documented in the "Heads-up #2" section of the v3 PR comment
+	// (server PR #290). Raising this requires (a) confirming consumer
+	// side (fleet/matter middleware) handles a larger owned_bots_by_space
 	// payload and (b) updating the warn log threshold below.
 	const ownedBotsLimit = 1000
 	var botRows []botSpaceRow
@@ -3985,11 +3996,14 @@ func (u *User) queryUserSpaceContext(uid string) ([]string, map[string][]string,
 		// downstream consumers see a deterministic size, but emit a warn
 		// so ops can react. Authz remains fail-safe (extra bots get no
 		// access via owned_bots_by_space; they fall through to the
-		// pre-v2 related_uids / SQL owner_uid filters).
+		// pre-v2 related_uids / SQL owner_uid filters). v3.3.6 §P2#2:
+		// the limit is on (bot, space) pairs — a bot in N spaces counts
+		// as N — distinct-bot count may be lower.
 		u.Warn("queryUserSpaceContext owned_bots truncated at policy limit",
 			zap.String("uid", uid),
-			zap.Int("limit", ownedBotsLimit),
-			zap.Int("returned", len(botRows)))
+			zap.Int("pair_limit", ownedBotsLimit),
+			zap.Int("pairs_returned", len(botRows)),
+			zap.String("note", "limit is (bot,space) pairs, not distinct bots"))
 		botRows = botRows[:ownedBotsLimit]
 	}
 
@@ -4145,10 +4159,21 @@ func (u *User) authVerifyAPIKey(c *wkhttp.Context) {
 	// soft-deleted (space.status=0) keeps verifying as long as the user's
 	// space_member row was left active. Mirrors modules/space/db.go's
 	// canonical membership pattern (s.status=1 + sm.status=1).
+	//
+	// v3.3.6 §P1 (yujiawei R2): also gate on user.status=1 to close the
+	// account-ban bypass. liftBanUser (api_manager.go:909) sets
+	// user.status=0 + ban IM channel + QuitUserDevice; the redis token
+	// cache clear handles session-token path, but daemon api_key sits
+	// behind no such cache — without this join, a globally banned user's
+	// daemon keeps a fully valid api_key. execLogin already gates
+	// userInfo.Status (api.go:1418); v3 verify-api-key sat behind no
+	// equivalent gate. assertSpaceMember (bot_provision/resolve.go) gets
+	// the symmetric fix to cover botToken + mintBot.
 	var n int
 	err = u.db.session.SelectBySql(
 		`SELECT COUNT(*) FROM space_member sm
 		 INNER JOIN space s ON s.space_id=sm.space_id AND s.status=1
+		 INNER JOIN `+"`user`"+` u ON u.uid=sm.uid AND u.status=1
 		 WHERE sm.space_id=? AND sm.uid=? AND sm.status=1`,
 		keyInfo.SpaceID, keyInfo.UID,
 	).LoadOne(&n)

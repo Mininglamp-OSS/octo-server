@@ -58,6 +58,17 @@ const (
 // bot_provision tests.
 func seedBPFixtures(t *testing.T, ctx *config.Context) {
 	t.Helper()
+	// v3.3.6 §P1: INSERT user rows (status=1) for Alice + Bob is required
+	// since assertSpaceMember now joins `user` ON u.status=1. Without these,
+	// every bot_provision test would 401. INSERT IGNORE keeps the helper
+	// idempotent if testutil already seeded.
+	for _, uid := range []string{bpTestUIDA, bpTestUIDB} {
+		_, err := ctx.DB().Exec(
+			"INSERT IGNORE INTO `user` (uid, name, status, short_no) VALUES (?, ?, ?, ?)",
+			uid, uid+"_name", 1, uid+"_sn",
+		)
+		require.NoError(t, err)
+	}
 	// spaces
 	for _, sid := range []string{bpTestSpaceA, bpTestSpaceB} {
 		_, err := ctx.DB().InsertInto("space").
@@ -288,4 +299,33 @@ func TestGone410_TokenExchange_ReturnsStatusAndBody(t *testing.T) {
 	body := w.Body.String()
 	assert.Contains(t, body, "Token exchange endpoint removed")
 	assert.Contains(t, body, "Authorization: Bearer")
+}
+
+// v3.3.6 §P1 regression — yujiawei R2 P1: account ban MUST revoke
+// botToken (daemon api_key path). resolveAPIKey → assertSpaceMember,
+// which now joins `user` ON u.status=1. mintBot is NOT separately
+// tested: it sits behind web session-auth (AuthMiddleware), and the
+// session token's redis cache is cleared by liftBanUser →
+// QuitUserDevice — a banned user can't reach mintBot in the first place.
+// The new assertSpaceMember user.status=1 join is defense-in-depth for
+// mintBot (covers the race where the session cache hasn't yet propagated
+// the ban), documented in assertSpaceMember docstring (resolve.go).
+func TestBotToken_AccountBanned_401(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	seedBPFixtures(t, ctx)
+	insertAPIKey(t, ctx, bpTestUIDA, "uk_bp_banned_aaaaaaaaaaaaaaaaaaaa", bpTestSpaceA)
+	insertBotInSpace(t, ctx, "bot_banned_owner", bpTestUIDA, "bf_tok_ban", bpTestSpaceA, 1)
+
+	// Ban Alice (mirror liftBanUser: user.status=0, leave space_member
+	// active to exercise the exact gap).
+	_, err := ctx.DB().Update("user").
+		Set("status", 0).
+		Where("uid=?", bpTestUIDA).
+		Exec()
+	require.NoError(t, err)
+
+	w := doBotToken(t, s, "bot_banned_owner", "uk_bp_banned_aaaaaaaaaaaaaaaaaaaa")
+	assert.Equal(t, http.StatusUnauthorized, w.Code,
+		"v3.3.6 §P1 (yujiawei R2): banned user (user.status=0) MUST NOT mint bot_token via daemon api_key path")
 }

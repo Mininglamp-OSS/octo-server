@@ -28,10 +28,21 @@ const (
 	testVerifyTokenSpaceB = "verify_token_space_b"
 )
 
-// seedVerifyTokenFixtures adds testutil.UID as an active member of two
-// spaces. Reuses the same helper pattern as seedAPIKeyFixtures.
+// seedVerifyTokenFixtures adds testutil.UID as an active user + active
+// member of two spaces. Reuses the same helper pattern as seedAPIKeyFixtures.
+//
+// v3.3.6 §P1: INSERT user row (status=1) is required since the daemon
+// api_key membership SQL now joins `user` ON u.status=1. Without it, the
+// happy-path tests would 401 because the join finds no matching user row.
+// Tolerate pre-existing user row (testutil.NewTestServer may seed) via
+// INSERT IGNORE — keep the function idempotent.
 func seedVerifyTokenFixtures(t *testing.T, ctx *config.Context) {
 	t.Helper()
+	_, err := ctx.DB().Exec(
+		"INSERT IGNORE INTO `user` (uid, name, status, short_no) VALUES (?, ?, ?, ?)",
+		testutil.UID, "testutil_user", 1, "testutil_sn",
+	)
+	require.NoError(t, err)
 	for _, sid := range []string{testVerifyTokenSpaceA, testVerifyTokenSpaceB} {
 		_, err := ctx.DB().InsertInto("space").
 			Columns("space_id", "name", "creator", "status").
@@ -375,4 +386,58 @@ func TestAuthVerifyToken_WithInclude_StillReturnsTopLevelOwnedBots(t *testing.T)
 	require.NotNil(t, resp.OwnedBotsBySpace)
 	assert.Contains(t, resp.OwnedBotsBySpace, testVerifyTokenSpaceA)
 	assert.Contains(t, resp.OwnedBotsBySpace, testVerifyTokenSpaceB)
+}
+
+// v3.3.6 §P2#3 regression — yujiawei R2 P2#3: ?include=context DB-error
+// fail-secure contract. authVerifyToken on context-query err MUST return:
+//   - HTTP 200 (not 500)
+//   - context_included = true (downstream fleet/matter use this as
+//     fail-closed-vs-fallback discriminator; flipping to false would
+//     silently downgrade them to pre-v2 fallback and re-open X-Space-Id
+//     trust)
+//   - spaces = empty list, owned_bots_by_space = empty non-nil map
+//
+// Trigger: RENAME the space_member table away (atomic + defer-restore
+// keeps schema intact). DROP TABLE would break subsequent tests because
+// CleanAllTables only TRUNCATEs, not recreates schema.
+func TestAuthVerifyToken_IncludeContext_DBError_FailSecure(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	seedVerifyTokenFixtures(t, ctx)
+
+	// Hide robot so the bots query inside queryUserSpaceContext fails
+	// (table not found). Cannot RENAME space_member: the token-path
+	// authVerifyToken doesn't have a separate membership-check step but
+	// queryUserSpaceContext's spaces query joins space_member — RENAME
+	// space_member would still fail-secure, but so would the spaces
+	// query. RENAME robot fails only the bots query, exercising the
+	// same fail-secure branch via err return from queryUserSpaceContext.
+	// RENAME is atomic; defer restore so no test pollution.
+	_, err := ctx.DB().Exec("RENAME TABLE robot TO robot_tmp_v336_token")
+	require.NoError(t, err)
+	defer func() {
+		_, _ = ctx.DB().Exec("RENAME TABLE robot_tmp_v336_token TO robot")
+	}()
+
+	w := doVerifyToken(t, s, map[string]string{"token": testutil.Token}, true)
+	require.Equal(t, http.StatusOK, w.Code,
+		"DB-err on context query MUST NOT 500 (v3.3.6 §P2#3 fail-secure); body: %s", w.Body.String())
+
+	var resp struct {
+		UID              string              `json:"uid"`
+		ContextIncluded  bool                `json:"context_included"`
+		Spaces           []string            `json:"spaces"`
+		OwnedBotsBySpace map[string][]string `json:"owned_bots_by_space"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+
+	assert.True(t, resp.ContextIncluded,
+		"context_included MUST stay true on DB err — flipping to false would silently downgrade fleet/matter to pre-v2 fallback (opens X-Space-Id trust)")
+	// Note: `omitempty` on Spaces/OwnedBotsBySpace makes empty slices/maps
+	// vanish on wire; client unmarshal sees nil. That's fine — both nil
+	// and empty are semantically "no spaces / no bots", authz stays
+	// fail-closed (range over nil = 0 iterations). assert.Empty accepts
+	// both nil and zero-length.
+	assert.Empty(t, resp.Spaces, "spaces MUST be empty (nil or len 0) on DB err")
+	assert.Empty(t, resp.OwnedBotsBySpace, "owned_bots_by_space MUST be empty on DB err")
 }

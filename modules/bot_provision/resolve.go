@@ -6,12 +6,25 @@ import (
 )
 
 // assertSpaceMember returns nil iff uid is an active member of an active
-// (non-disabled) space. v3 §2.3 (Jerry-Xin Critical 1): joining `space` for
-// status=1 closes the case where a soft-deleted space still has lingering
-// active space_member rows — without it, an api_key bound to a disabled
-// space would keep validating. Mirrors modules/space/db.go canonical
-// (s.status=1 + sm.status=1) pattern.
-// Used by both mintBot (web caller) and resolveAPIKey (daemon caller).
+// (non-disabled) space, AND the underlying user account is itself active
+// (user.status=1, not admin-banned). v3 §2.3 (Jerry-Xin Critical 1):
+// joining `space` for status=1 closes the case where a soft-deleted space
+// still has lingering active space_member rows — without it, an api_key
+// bound to a disabled space would keep validating.
+//
+// v3.3.6 §P1 (yujiawei R2): also gate user.status=1 to close the
+// account-ban bypass. liftBanUser (modules/user/api_manager.go:909) sets
+// user.status=0 + QuitUserDevice clears redis token cache (handles
+// session-token path), but daemon api_key sits behind no such cache —
+// without this join, a globally banned user's daemon keeps fully valid
+// credentials (verify-api-key 200, botToken mints live bot_token, mintBot
+// 200). execLogin already gates userInfo.Status (api.go:1418); v3 daemon
+// path sat behind no equivalent gate. Symmetric with authVerifyAPIKey
+// SQL fix (modules/user/api.go).
+//
+// Mirrors modules/space/db.go canonical (s.status=1 + sm.status=1) pattern.
+// Used by both mintBot (web caller, defense-in-depth) and resolveAPIKey
+// (daemon caller — botToken / verify-api-key).
 func (a *BotProvision) assertSpaceMember(uid, spaceID string) error {
 	if uid == "" || spaceID == "" {
 		return errors.New("assertSpaceMember: uid and space_id required")
@@ -20,6 +33,7 @@ func (a *BotProvision) assertSpaceMember(uid, spaceID string) error {
 	if err := a.ctx.DB().SelectBySql(
 		`SELECT COUNT(*) FROM space_member sm
 		 INNER JOIN space s ON s.space_id=sm.space_id AND s.status=1
+		 INNER JOIN `+"`user`"+` u ON u.uid=sm.uid AND u.status=1
 		 WHERE sm.space_id=? AND sm.uid=? AND sm.status=1`,
 		spaceID, uid,
 	).LoadOne(&n); err != nil {
