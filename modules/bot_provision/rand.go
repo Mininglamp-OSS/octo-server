@@ -1,4 +1,4 @@
-package auth_jwt
+package bot_provision
 
 import (
 	"crypto/rand"

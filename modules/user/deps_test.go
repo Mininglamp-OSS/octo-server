@@ -6,6 +6,7 @@ package user_test
 // 这些模块的表/列已存在,所以这里 blank import 触发它们的 init() 注册。
 import (
 	_ "github.com/Mininglamp-OSS/octo-server/modules/base"
+	_ "github.com/Mininglamp-OSS/octo-server/modules/botfather"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/group"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/robot"
 )
