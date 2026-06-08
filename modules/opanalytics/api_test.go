@@ -1,0 +1,406 @@
+package opanalytics
+
+import (
+	"encoding/json"
+	"fmt"
+	"hash/crc32"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/Mininglamp-OSS/octo-lib/common"
+	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+const statDay = "2026-06-01"
+
+// ---- harness ----
+
+func opaSetup(t *testing.T) (*config.Context, *wkhttp.WKHttp, *ETL) {
+	t.Helper()
+	s, ctx := testutil.NewTestServer()
+	route := s.GetRoute()
+	route.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	setSuperAdminToken(t, ctx)
+	createMessageShards(t, ctx)
+	cleanOpaAndShards(t, ctx)
+	return ctx, route, NewETL(ctx)
+}
+
+func setSuperAdminToken(t *testing.T, ctx *config.Context) {
+	t.Helper()
+	require.NoError(t, ctx.Cache().Set(
+		ctx.GetConfig().Cache.TokenCachePrefix+testutil.Token,
+		testutil.UID+"@test@"+string(wkhttp.SuperAdmin)))
+}
+
+func setPlainUserToken(t *testing.T, ctx *config.Context) {
+	t.Helper()
+	require.NoError(t, ctx.Cache().Set(
+		ctx.GetConfig().Cache.TokenCachePrefix+testutil.Token, testutil.UID+"@test"))
+}
+
+func shardTables(ctx *config.Context) []string {
+	count := ctx.GetConfig().TablePartitionConfig.MessageTableCount
+	if count <= 0 {
+		return []string{"message"}
+	}
+	tables := []string{"message"}
+	for i := 1; i < count; i++ {
+		tables = append(tables, fmt.Sprintf("message%d", i))
+	}
+	return tables
+}
+
+func shardFor(ctx *config.Context, channelID string) string {
+	count := ctx.GetConfig().TablePartitionConfig.MessageTableCount
+	if count <= 0 {
+		return "message"
+	}
+	idx := crc32.ChecksumIEEE([]byte(channelID)) % uint32(count)
+	if idx == 0 {
+		return "message"
+	}
+	return fmt.Sprintf("message%d", idx)
+}
+
+// createMessageShards creates the message/message1..N shard tables (WuKongIM owns
+// these in prod; no in-repo migration creates them).
+func createMessageShards(t *testing.T, ctx *config.Context) {
+	t.Helper()
+	for _, tbl := range shardTables(ctx) {
+		_, err := ctx.DB().Exec(fmt.Sprintf("CREATE TABLE IF NOT EXISTS `%s` ("+
+			"id BIGINT NOT NULL PRIMARY KEY AUTO_INCREMENT,"+
+			"message_id VARCHAR(20) NOT NULL DEFAULT '',"+
+			"from_uid VARCHAR(40) NOT NULL DEFAULT '',"+
+			"channel_id VARCHAR(100) NOT NULL DEFAULT '',"+
+			"channel_type SMALLINT NOT NULL DEFAULT 0,"+
+			"`timestamp` BIGINT NOT NULL DEFAULT 0,"+
+			"`signal` INT NOT NULL DEFAULT 0,"+
+			"payload BLOB,"+
+			"is_deleted INT NOT NULL DEFAULT 0,"+
+			"created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP"+
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4", tbl))
+		require.NoError(t, err)
+	}
+}
+
+func cleanOpaAndShards(t *testing.T, ctx *config.Context) {
+	t.Helper()
+	tables := append([]string{
+		"octo_dim_member", "octo_dim_channel",
+		"octo_fact_member_channel_daily", "octo_fact_channel_daily",
+	}, shardTables(ctx)...)
+	for _, tbl := range tables {
+		_, err := ctx.DB().Exec(fmt.Sprintf("DELETE FROM `%s`", tbl))
+		require.NoError(t, err)
+	}
+}
+
+// ---- seed helpers ----
+
+func seedUser(t *testing.T, ctx *config.Context, uid, name, email string, robot int) {
+	t.Helper()
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO `user` (uid,name,email,short_no,robot,status,category) VALUES (?,?,?,?,?,1,'')",
+		uid, name, email, uid, robot).Exec()
+	require.NoError(t, err)
+}
+
+func seedSpace(t *testing.T, ctx *config.Context, spaceID, name string) {
+	t.Helper()
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO space (space_id,name,status) VALUES (?,?,1)", spaceID, name).Exec()
+	require.NoError(t, err)
+}
+
+func seedSpaceMember(t *testing.T, ctx *config.Context, spaceID, uid string) {
+	t.Helper()
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO space_member (space_id,uid,status) VALUES (?,?,1)", spaceID, uid).Exec()
+	require.NoError(t, err)
+}
+
+func seedGroup(t *testing.T, ctx *config.Context, groupNo, name, spaceID string) {
+	t.Helper()
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO `group` (group_no,name,space_id,status) VALUES (?,?,?,1)", groupNo, name, spaceID).Exec()
+	require.NoError(t, err)
+}
+
+func seedGroupMember(t *testing.T, ctx *config.Context, groupNo, uid string, robot int) {
+	t.Helper()
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO `group_member` (group_no,uid,robot,status) VALUES (?,?,?,1)", groupNo, uid, robot).Exec()
+	require.NoError(t, err)
+}
+
+var msgSeq int64
+
+func insertMsgs(t *testing.T, ctx *config.Context, fromUID, channelID string, channelType uint8, ts int64, count, deleted int) {
+	t.Helper()
+	tbl := shardFor(ctx, channelID)
+	for i := 0; i < count; i++ {
+		msgSeq++
+		isDel := 0
+		if i < deleted {
+			isDel = 1
+		}
+		_, err := ctx.DB().InsertBySql(
+			fmt.Sprintf("INSERT INTO `%s` (message_id,from_uid,channel_id,channel_type,`timestamp`,`signal`,is_deleted) VALUES (?,?,?,?,?,0,?)", tbl),
+			fmt.Sprintf("m%d", msgSeq), fromUID, channelID, channelType, ts+int64(i), isDel).Exec()
+		require.NoError(t, err)
+	}
+}
+
+// ---- HTTP helpers ----
+
+func opaGet(t *testing.T, route *wkhttp.WKHttp, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.Header.Set("token", testutil.Token)
+	rec := httptest.NewRecorder()
+	route.ServeHTTP(rec, req)
+	return rec
+}
+
+func decodeOK(t *testing.T, rec *httptest.ResponseRecorder, out interface{}) {
+	t.Helper()
+	require.Equalf(t, http.StatusOK, rec.Code, "body=%s", rec.Body.String())
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), out))
+}
+
+func errorCode(t *testing.T, rec *httptest.ResponseRecorder) string {
+	t.Helper()
+	var env struct {
+		Error struct {
+			Code       string `json:"code"`
+			HTTPStatus int    `json:"http_status"`
+		} `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &env))
+	return env.Error.Code
+}
+
+// ---- the scenario seed ----
+
+// seedScenario builds: 2 spaces, 4 members(3 human + 1 agent), 2 groups, 1 private chat,
+// and a day of messages. Returns the private fakeChannelID.
+func seedScenario(t *testing.T, ctx *config.Context) string {
+	seedSpace(t, ctx, "s1", "Alpha Space")
+	seedSpace(t, ctx, "s2", "Beta Space")
+
+	seedUser(t, ctx, "u_alice", "Alice", "alice@example.com", 0)
+	seedUser(t, ctx, "u_bob", "Bob", "bob@example.com", 0)
+	seedUser(t, ctx, "u_carol", "Carol", "carol@example.com", 0)
+	seedUser(t, ctx, "u_agent", "AgentX", "", 1)
+
+	seedSpaceMember(t, ctx, "s1", "u_alice")
+	seedSpaceMember(t, ctx, "s1", "u_bob")
+	seedSpaceMember(t, ctx, "s1", "u_agent")
+	seedSpaceMember(t, ctx, "s2", "u_carol")
+
+	seedGroup(t, ctx, "g1", "Product Group", "s1")
+	seedGroup(t, ctx, "g2", "Beta Group", "s2")
+	seedGroupMember(t, ctx, "g1", "u_alice", 0)
+	seedGroupMember(t, ctx, "g1", "u_bob", 0)
+	seedGroupMember(t, ctx, "g1", "u_agent", 1)
+	seedGroupMember(t, ctx, "g2", "u_carol", 0)
+
+	start, _, err := dayWindowUnix(statDay)
+	require.NoError(t, err)
+	base := start + 3600 // 当日 01:00，远离边界
+
+	// g1：alice 3(含1撤回)、bob 2、agent 5
+	insertMsgs(t, ctx, "u_alice", "g1", channelTypeGroup, base, 3, 1)
+	insertMsgs(t, ctx, "u_bob", "g1", channelTypeGroup, base+10, 2, 0)
+	insertMsgs(t, ctx, "u_agent", "g1", channelTypeGroup, base+20, 5, 0)
+	// g2：carol 2
+	insertMsgs(t, ctx, "u_carol", "g2", channelTypeGroup, base, 2, 0)
+	// 私聊 alice & bob
+	fc := common.GetFakeChannelIDWith("u_alice", "u_bob")
+	insertMsgs(t, ctx, "u_alice", fc, channelTypePerson, base, 4, 0)
+	insertMsgs(t, ctx, "u_bob", fc, channelTypePerson, base+5, 1, 0)
+	return fc
+}
+
+// ---- tests ----
+
+func TestOpanalyticsETLAndDB(t *testing.T) {
+	ctx, _, etl := opaSetup(t)
+	fc := seedScenario(t, ctx)
+	require.NoError(t, etl.RunDay(statDay))
+
+	// ③ alice 在 g1 含撤回 = 3
+	var aliceMsg int
+	_, err := ctx.DB().Select("msg_count").From("octo_fact_member_channel_daily").
+		Where("channel_id='g1' AND sender_uid='u_alice' AND stat_date=?", statDay).Load(&aliceMsg)
+	require.NoError(t, err)
+	assert.Equal(t, 3, aliceMsg, "撤回消息必须计入")
+
+	// ④ g1
+	var g1 struct {
+		HumanMsg    int    `db:"human_msg_count"`
+		AgentMsg    int    `db:"agent_msg_count"`
+		ActiveHuman int    `db:"active_human_members"`
+		ActiveAgent int    `db:"active_agent_members"`
+		ConvType    uint8  `db:"conv_type"`
+		SpaceID     string `db:"space_id"`
+	}
+	_, err = ctx.DB().Select("human_msg_count", "agent_msg_count", "active_human_members", "active_agent_members", "conv_type", "space_id").
+		From("octo_fact_channel_daily").Where("channel_id='g1' AND stat_date=?", statDay).Load(&g1)
+	require.NoError(t, err)
+	assert.Equal(t, 5, g1.HumanMsg)
+	assert.Equal(t, 5, g1.AgentMsg)
+	assert.Equal(t, 2, g1.ActiveHuman)
+	assert.Equal(t, 1, g1.ActiveAgent)
+	assert.Equal(t, convTypeHAGroup, g1.ConvType)
+	assert.Equal(t, "s1", g1.SpaceID)
+
+	// dim_channel g1 成员数
+	var dimG1 struct {
+		MemberCount int   `db:"member_count"`
+		Human       int   `db:"human_member_count"`
+		Agent       int   `db:"agent_member_count"`
+		LastActive  int64 `db:"last_active_at"`
+	}
+	_, err = ctx.DB().Select("member_count", "human_member_count", "agent_member_count", "last_active_at").
+		From("octo_dim_channel").Where("channel_id='g1'").Load(&dimG1)
+	require.NoError(t, err)
+	assert.Equal(t, 3, dimG1.MemberCount)
+	assert.Equal(t, 2, dimG1.Human)
+	assert.Equal(t, 1, dimG1.Agent)
+	assert.Greater(t, dimG1.LastActive, int64(0))
+
+	// dim_channel 私聊：space_id='' 且 member_a/b 规范化
+	var dimFC struct {
+		ChannelType uint8  `db:"channel_type"`
+		SpaceID     string `db:"space_id"`
+		ConvType    uint8  `db:"conv_type"`
+		MemberA     string `db:"member_a_uid"`
+		MemberB     string `db:"member_b_uid"`
+	}
+	_, err = ctx.DB().Select("channel_type", "space_id", "conv_type", "member_a_uid", "member_b_uid").
+		From("octo_dim_channel").Where("channel_id=?", fc).Load(&dimFC)
+	require.NoError(t, err)
+	assert.Equal(t, channelTypePerson, dimFC.ChannelType)
+	assert.Equal(t, "", dimFC.SpaceID, "私聊不进空间维度")
+	assert.Equal(t, convTypeHHPrivate, dimFC.ConvType)
+	assert.Equal(t, "u_alice", dimFC.MemberA)
+	assert.Equal(t, "u_bob", dimFC.MemberB)
+}
+
+func TestOpanalyticsETLIdempotent(t *testing.T) {
+	ctx, _, etl := opaSetup(t)
+	seedScenario(t, ctx)
+
+	require.NoError(t, etl.RunDay(statDay))
+	rows1, fact1 := countFacts(t, ctx)
+
+	require.NoError(t, etl.RunDay(statDay)) // 重跑
+	rows2, fact2 := countFacts(t, ctx)
+
+	assert.Equal(t, rows1, rows2, "重跑后 ③ 行数应一致")
+	assert.Equal(t, fact1, fact2, "重跑后 ④ 行数应一致")
+
+	// 关键聚合值不变
+	var g1Human int
+	_, err := ctx.DB().Select("human_msg_count").From("octo_fact_channel_daily").
+		Where("channel_id='g1' AND stat_date=?", statDay).Load(&g1Human)
+	require.NoError(t, err)
+	assert.Equal(t, 5, g1Human)
+}
+
+func countFacts(t *testing.T, ctx *config.Context) (int64, int64) {
+	t.Helper()
+	var r3, r4 int64
+	_, err := ctx.DB().Select("count(*)").From("octo_fact_member_channel_daily").Load(&r3)
+	require.NoError(t, err)
+	_, err = ctx.DB().Select("count(*)").From("octo_fact_channel_daily").Load(&r4)
+	require.NoError(t, err)
+	return r3, r4
+}
+
+func TestOpanalyticsEndpoints(t *testing.T) {
+	ctx, route, etl := opaSetup(t)
+	seedScenario(t, ctx)
+	require.NoError(t, etl.RunDay(statDay))
+
+	rng := "?start_date=" + statDay + "&end_date=" + statDay
+
+	// ---- overview ----
+	var ov overviewResp
+	decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/overview"+rng), &ov)
+	assert.Equal(t, int64(2), ov.SpaceTotal)
+	assert.Equal(t, int64(2), ov.GroupTotal)
+	assert.Equal(t, int64(3), ov.HumanMemberTotal)
+	assert.Equal(t, int64(1), ov.AgentTotal)
+	assert.Equal(t, int64(2), ov.ActiveGroups)
+	assert.Equal(t, int64(3), ov.ActiveHumanMembers)
+	assert.Equal(t, int64(1), ov.ActiveAgentMembers)
+	assert.Equal(t, int64(12), ov.HumanMsgCount) // g1:5 + g2:2 + private:5
+	assert.Equal(t, int64(5), ov.AgentMsgCount)
+	assert.Equal(t, int64(1), ov.PrivateActiveCount)
+
+	// ---- spaces (表一) ----
+	var spaces struct {
+		Count int64           `json:"count"`
+		List  []spaceListItem `json:"list"`
+	}
+	decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/spaces"+rng), &spaces)
+	assert.Equal(t, int64(2), spaces.Count)
+	var s1 *spaceListItem
+	for i := range spaces.List {
+		if spaces.List[i].SpaceID == "s1" {
+			s1 = &spaces.List[i]
+		}
+	}
+	require.NotNil(t, s1)
+	assert.Equal(t, int64(1), s1.GroupTotal)
+	assert.Equal(t, int64(2), s1.HumanMemberTotal)
+	assert.Equal(t, int64(1), s1.AgentTotal)
+	assert.Equal(t, int64(5), s1.HumanMsgCount)
+	assert.Equal(t, int64(5), s1.AgentMsgCount)
+	assert.True(t, s1.IsActive)
+
+	// ---- channels (表二，仅群组) ----
+	var channels struct {
+		Count int64             `json:"count"`
+		List  []channelListItem `json:"list"`
+	}
+	decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/spaces/s1/channels"+rng), &channels)
+	assert.Equal(t, int64(1), channels.Count)
+	require.Len(t, channels.List, 1)
+	assert.Equal(t, "g1", channels.List[0].ChannelID)
+	assert.Equal(t, convTypeHAGroup, channels.List[0].ConvType)
+	assert.Equal(t, 3, channels.List[0].MemberCount)
+	assert.Equal(t, int64(5), channels.List[0].HumanMsgCount)
+	assert.Equal(t, int64(5), channels.List[0].AgentMsgCount)
+
+	// 未知 space → 404 (ResponseErrorL：transport 400 + error.code not_found)
+	rec := opaGet(t, route, "/v1/manager/dashboard/spaces/nope/channels"+rng)
+	assert.Equal(t, "err.server.opanalytics.not_found", errorCode(t, rec))
+
+	// ---- global direct chats ----
+	var direct struct {
+		Count int64            `json:"count"`
+		List  []directChatItem `json:"list"`
+	}
+	decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/global/direct-chats"+rng), &direct)
+	assert.Equal(t, int64(1), direct.Count)
+	require.Len(t, direct.List, 1)
+	assert.Equal(t, int64(5), direct.List[0].MsgCount)
+	assert.Equal(t, "Alice", direct.List[0].MemberAName)
+	assert.Equal(t, "Bob", direct.List[0].MemberBName)
+
+	// ---- 非 superAdmin → 403 ----
+	setPlainUserToken(t, ctx)
+	rec = opaGet(t, route, "/v1/manager/dashboard/overview"+rng)
+	assert.Equal(t, "err.server.opanalytics.forbidden", errorCode(t, rec))
+}

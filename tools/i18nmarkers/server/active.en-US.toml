@@ -486,6 +486,18 @@ other = "The binding session has expired or is invalid. Please start over."
 ["err.server.oidc.bind_verify_required"]
 other = "Please complete verification before confirming."
 
+["err.server.opanalytics.forbidden"]
+other = "Only a super admin can access the analytics dashboard."
+
+["err.server.opanalytics.not_found"]
+other = "The space does not exist."
+
+["err.server.opanalytics.query_failed"]
+other = "Failed to query analytics data."
+
+["err.server.opanalytics.request_invalid"]
+other = "Invalid analytics request."
+
 ["err.server.qrcode.group_not_found"]
 other = "Group not found."
 

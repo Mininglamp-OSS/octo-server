@@ -1070,3 +1070,17 @@ other = "该名称匹配到多个密钥，请进一步指明。"
 
 ["err.server.usersecret.resolve_failed"]
 other = "密钥解析失败。"
+
+# ---- modules/opanalytics：运营分析看板（管理端 superAdmin 只读） ----
+
+["err.server.opanalytics.forbidden"]
+other = "仅超级管理员可访问运营看板。"
+
+["err.server.opanalytics.request_invalid"]
+other = "请求参数无效。"
+
+["err.server.opanalytics.not_found"]
+other = "Space 不存在。"
+
+["err.server.opanalytics.query_failed"]
+other = "查询看板数据失败。"
