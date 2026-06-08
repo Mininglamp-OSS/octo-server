@@ -96,6 +96,7 @@ func cleanOpaAndShards(t *testing.T, ctx *config.Context) {
 	tables := append([]string{
 		"octo_dim_member", "octo_dim_channel",
 		"octo_fact_member_channel_daily", "octo_fact_channel_daily",
+		"octo_etl_message_cursor", "octo_etl_dirty_day",
 	}, shardTables(ctx)...)
 	for _, tbl := range tables {
 		_, err := ctx.DB().Exec(fmt.Sprintf("DELETE FROM `%s`", tbl))
@@ -110,6 +111,15 @@ func seedUser(t *testing.T, ctx *config.Context, uid, name, email string, robot 
 	_, err := ctx.DB().InsertBySql(
 		"INSERT INTO `user` (uid,name,email,short_no,robot,status,category) VALUES (?,?,?,?,?,1,'')",
 		uid, name, email, uid, robot).Exec()
+	require.NoError(t, err)
+}
+
+// seedUserCat 同 seedUser 但可指定 category(用于 category='system' 测试账号排除)。
+func seedUserCat(t *testing.T, ctx *config.Context, uid, name string, robot int, category string) {
+	t.Helper()
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO `user` (uid,name,email,short_no,robot,status,category) VALUES (?,?,'',?,?,1,?)",
+		uid, name, uid, robot, category).Exec()
 	require.NoError(t, err)
 }
 
@@ -235,7 +245,7 @@ func seedScenario(t *testing.T, ctx *config.Context) string {
 func TestOpanalyticsETLAndDB(t *testing.T) {
 	ctx, _, etl := opaSetup(t)
 	fc := seedScenario(t, ctx)
-	require.NoError(t, etl.RunDay(statDay))
+	require.NoError(t, etl.RunIncremental())
 
 	// ③ alice 在 g1 含撤回 = 3
 	var aliceMsg int
@@ -300,10 +310,10 @@ func TestOpanalyticsETLIdempotent(t *testing.T) {
 	ctx, _, etl := opaSetup(t)
 	seedScenario(t, ctx)
 
-	require.NoError(t, etl.RunDay(statDay))
+	require.NoError(t, etl.RunIncremental())
 	rows1, fact1 := countFacts(t, ctx)
 
-	require.NoError(t, etl.RunDay(statDay)) // 重跑
+	require.NoError(t, etl.RunIncremental()) // 重跑(游标保证精确一次)
 	rows2, fact2 := countFacts(t, ctx)
 
 	assert.Equal(t, rows1, rows2, "重跑后 ③ 行数应一致")
@@ -330,7 +340,7 @@ func countFacts(t *testing.T, ctx *config.Context) (int64, int64) {
 func TestOpanalyticsEndpoints(t *testing.T) {
 	ctx, route, etl := opaSetup(t)
 	seedScenario(t, ctx)
-	require.NoError(t, etl.RunDay(statDay))
+	require.NoError(t, etl.RunIncremental())
 
 	rng := "?start_date=" + statDay + "&end_date=" + statDay
 
@@ -403,4 +413,133 @@ func TestOpanalyticsEndpoints(t *testing.T) {
 	setPlainUserToken(t, ctx)
 	rec = opaGet(t, route, "/v1/manager/dashboard/overview"+rng)
 	assert.Equal(t, "err.server.opanalytics.forbidden", errorCode(t, rec))
+}
+
+// TestOpanalyticsETLExclusion 验收①：系统机器人(pkg/space.SystemBots，含 notification)与
+// category=system 测试账号，不进总人数/消息/活跃/私聊等核心指标；注入它们后各项与基线一致。
+func TestOpanalyticsETLExclusion(t *testing.T) {
+	ctx, route, etl := opaSetup(t)
+	fc := seedScenario(t, ctx)
+
+	// 注入排除账号：botfather(系统bot，agent) + u_test(category=system，human)。
+	seedUserCat(t, ctx, "botfather", "BotFather", 1, "")
+	seedUserCat(t, ctx, "u_test", "Tester", 0, "system")
+	seedGroupMember(t, ctx, "g1", "botfather", 1) // 系统bot 是群成员，但不应计入成员数
+
+	start, _, err := dayWindowUnix(statDay)
+	require.NoError(t, err)
+	base := start + 7200
+
+	insertMsgs(t, ctx, "botfather", "g1", channelTypeGroup, base, 4, 0) // agent 系统bot → 不计
+	insertMsgs(t, ctx, "u_test", "g1", channelTypeGroup, base+10, 3, 0) // 测试账号 → 不计
+	// 私聊 alice & botfather：一方系统bot → 整条会话丢弃
+	fcBot := common.GetFakeChannelIDWith("u_alice", "botfather")
+	insertMsgs(t, ctx, "u_alice", fcBot, channelTypePerson, base, 2, 0)
+	insertMsgs(t, ctx, "botfather", fcBot, channelTypePerson, base+5, 2, 0)
+
+	require.NoError(t, etl.RunIncremental())
+
+	// ③ 不含被排除账号
+	var excludedRows int64
+	_, err = ctx.DB().Select("count(*)").From("octo_fact_member_channel_daily").
+		Where("sender_uid IN ('botfather','u_test')").Load(&excludedRows)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), excludedRows, "系统/测试账号不得进入 ③")
+
+	// alice@botfather 私聊整条丢弃(③ 无行 + dim 无行)
+	var botDMRows, botDMDim int64
+	_, err = ctx.DB().Select("count(*)").From("octo_fact_member_channel_daily").
+		Where("channel_id=?", fcBot).Load(&botDMRows)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), botDMRows, "含系统bot的私聊不得进入 ③")
+	_, err = ctx.DB().Select("count(*)").From("octo_dim_channel").Where("channel_id=?", fcBot).Load(&botDMDim)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), botDMDim, "含系统bot的私聊不得进入会话维表")
+
+	// ④ g1 各项与基线一致(botfather 的 4 条 + u_test 的 3 条均被排除)
+	var g1 struct {
+		HumanMsg    int `db:"human_msg_count"`
+		AgentMsg    int `db:"agent_msg_count"`
+		ActiveHuman int `db:"active_human_members"`
+		ActiveAgent int `db:"active_agent_members"`
+	}
+	_, err = ctx.DB().Select("human_msg_count", "agent_msg_count", "active_human_members", "active_agent_members").
+		From("octo_fact_channel_daily").Where("channel_id='g1' AND stat_date=?", statDay).Load(&g1)
+	require.NoError(t, err)
+	assert.Equal(t, 5, g1.HumanMsg, "u_test 的群消息不得计入")
+	assert.Equal(t, 5, g1.AgentMsg, "botfather 的群消息不得计入")
+	assert.Equal(t, 2, g1.ActiveHuman)
+	assert.Equal(t, 1, g1.ActiveAgent)
+
+	// dim_channel g1 成员数剔除系统bot
+	var dimG1 struct {
+		MemberCount int `db:"member_count"`
+		Agent       int `db:"agent_member_count"`
+	}
+	_, err = ctx.DB().Select("member_count", "agent_member_count").
+		From("octo_dim_channel").Where("channel_id='g1'").Load(&dimG1)
+	require.NoError(t, err)
+	assert.Equal(t, 3, dimG1.MemberCount, "botfather 不计入群成员数")
+	assert.Equal(t, 1, dimG1.Agent, "botfather 不计入 agent 成员数")
+
+	// overview / 私聊：与基线一致
+	rng := "?start_date=" + statDay + "&end_date=" + statDay
+	var ov overviewResp
+	decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/overview"+rng), &ov)
+	assert.Equal(t, int64(3), ov.HumanMemberTotal, "u_test 不计入总人数")
+	assert.Equal(t, int64(1), ov.AgentTotal, "botfather 不计入 agent 总数")
+	assert.Equal(t, int64(12), ov.HumanMsgCount)
+	assert.Equal(t, int64(5), ov.AgentMsgCount)
+	assert.Equal(t, int64(1), ov.PrivateActiveCount, "含系统bot的私聊不计入活跃私聊数")
+
+	var direct struct {
+		Count int64            `json:"count"`
+		List  []directChatItem `json:"list"`
+	}
+	decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/global/direct-chats"+rng), &direct)
+	assert.Equal(t, int64(1), direct.Count)
+	require.Len(t, direct.List, 1)
+	assert.Equal(t, fc, direct.List[0].ChannelID, "仅 alice&bob 私聊在列")
+}
+
+// TestOpanalyticsETLIncremental 验收③：水位增量——二次运行只累加新增消息(精确一次，不重复计)。
+func TestOpanalyticsETLIncremental(t *testing.T) {
+	ctx, _, etl := opaSetup(t)
+	seedScenario(t, ctx)
+	require.NoError(t, etl.RunIncremental())
+
+	assert.Equal(t, 3, fact3Msg(t, ctx, "g1", "u_alice"), "首轮 alice=3")
+	assert.Equal(t, 5, fact4Human(t, ctx, "g1"), "首轮 g1 human=5")
+
+	// 新增 alice 在 g1 的 2 条(新 id)，增量再跑
+	start, _, err := dayWindowUnix(statDay)
+	require.NoError(t, err)
+	insertMsgs(t, ctx, "u_alice", "g1", channelTypeGroup, start+9000, 2, 0)
+	require.NoError(t, etl.RunIncremental())
+
+	assert.Equal(t, 5, fact3Msg(t, ctx, "g1", "u_alice"), "增量后 alice=5(3+2，非6)")
+	assert.Equal(t, 7, fact4Human(t, ctx, "g1"), "增量后 g1 human=7")
+
+	// 三跑无新消息 → 不变(游标空操作)
+	require.NoError(t, etl.RunIncremental())
+	assert.Equal(t, 5, fact3Msg(t, ctx, "g1", "u_alice"), "无新消息时不变")
+	assert.Equal(t, 7, fact4Human(t, ctx, "g1"))
+}
+
+func fact3Msg(t *testing.T, ctx *config.Context, channelID, senderUID string) int {
+	t.Helper()
+	var n int
+	_, err := ctx.DB().Select("IFNULL(msg_count,0)").From("octo_fact_member_channel_daily").
+		Where("channel_id=? AND sender_uid=? AND stat_date=?", channelID, senderUID, statDay).Load(&n)
+	require.NoError(t, err)
+	return n
+}
+
+func fact4Human(t *testing.T, ctx *config.Context, channelID string) int {
+	t.Helper()
+	var n int
+	_, err := ctx.DB().Select("IFNULL(human_msg_count,0)").From("octo_fact_channel_daily").
+		Where("channel_id=? AND stat_date=?", channelID, statDay).Load(&n)
+	require.NoError(t, err)
+	return n
 }

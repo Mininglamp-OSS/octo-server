@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -32,14 +33,14 @@ func (d *opanalyticsDB) countGroupsTotal() (int64, error) {
 	return n, err
 }
 
-// countMembersByType 全局 human/agent 成员总数(源 dim_member；P0 不按 is_excluded 过滤)。
+// countMembersByType 全局 human/agent 成员总数(源 dim_member；剔除系统/测试账号 is_excluded=1)。
 func (d *opanalyticsDB) countMembersByType() (human int64, agent int64, err error) {
 	var rows []struct {
 		MemberType uint8 `db:"member_type"`
 		Cnt        int64 `db:"cnt"`
 	}
 	_, err = d.session.SelectBySql(
-		"SELECT member_type, COUNT(*) AS cnt FROM octo_dim_member GROUP BY member_type",
+		"SELECT member_type, COUNT(*) AS cnt FROM octo_dim_member WHERE is_excluded=0 GROUP BY member_type",
 	).Load(&rows)
 	if err != nil {
 		return 0, 0, err
@@ -142,11 +143,13 @@ func (d *opanalyticsDB) queryMemberTotalsBySpace() (map[string]spaceMemberTotals
 		Agent   int64  `db:"agent"`
 		Total   int64  `db:"total"`
 	}
+	botClause, botArgs := systemBotExclusion("sm.uid")
 	_, err := d.session.SelectBySql(
-		"SELECT sm.space_id AS space_id, " +
-			"SUM(CASE WHEN m.member_type=2 THEN 1 ELSE 0 END) AS agent, COUNT(*) AS total " +
-			"FROM space_member sm LEFT JOIN octo_dim_member m ON m.uid = sm.uid " +
-			"WHERE sm.status=1 GROUP BY sm.space_id",
+		"SELECT sm.space_id AS space_id, "+
+			"SUM(CASE WHEN m.member_type=2 THEN 1 ELSE 0 END) AS agent, COUNT(*) AS total "+
+			"FROM space_member sm LEFT JOIN octo_dim_member m ON m.uid = sm.uid "+
+			"WHERE sm.status=1 AND COALESCE(m.is_excluded,0)=0"+botClause+" GROUP BY sm.space_id",
+		botArgs...,
 	).Load(&rows)
 	if err != nil {
 		return nil, err
@@ -348,6 +351,19 @@ func (d *opanalyticsDB) queryMemberNames(uids []string) (map[string]string, erro
 }
 
 // ===== 内部辅助 =====
+
+// systemBotExclusion 返回 "AND <col> NOT IN (?,?...)" 片段与对应参数，按单一真源
+// pkg/space.SystemBots(botfather/u_10000/fileHelper/notification) 在成员计数处结构性
+// 剔除系统账号 —— 兜底"系统bot是 space/group 成员但无 user/dim 行致 COALESCE 漏算"的场景。
+func systemBotExclusion(col string) (string, []interface{}) {
+	bots := spacepkg.SystemBotList()
+	ph := strings.TrimSuffix(strings.Repeat("?,", len(bots)), ",")
+	args := make([]interface{}, len(bots))
+	for i, b := range bots {
+		args[i] = b
+	}
+	return " AND " + col + " NOT IN (" + ph + ")", args
+}
 
 func applySpaceFilter(stmt *dbr.SelectStmt, spaceIDs []string) *dbr.SelectStmt {
 	if len(spaceIDs) > 0 {

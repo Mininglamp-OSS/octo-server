@@ -60,12 +60,13 @@ type groupMemberCountRow struct {
 }
 
 // srcMessageRow 分片 message 表读出的单条消息(ETL 只取聚合所需列)。
+// ID 是分片表自增主键，用作增量抽取的 keyset 水位(message 表无 timestamp 索引)。
 type srcMessageRow struct {
+	ID          int64
 	FromUID     string
 	ChannelID   string
 	ChannelType uint8
 	Timestamp   int64 // 发送时间(纪元秒)
-	Signal      int   // 0=明文 1=端到端加密(payload 不可解析)
 }
 
 // ===== 读侧(接口)结果 / 响应 VO =====

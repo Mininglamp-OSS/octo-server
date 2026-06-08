@@ -67,9 +67,10 @@ func TestIsExcludedMember(t *testing.T) {
 		category string
 		want     bool
 	}{
-		{"u_10000", "", true},
-		{"botfather", "", true},
-		{"fileHelper", "", true},
+		{"u_10000", "", true},      // pkg/space.SystemBots
+		{"botfather", "", true},    // pkg/space.SystemBots
+		{"fileHelper", "", true},   // pkg/space.SystemBots
+		{"notification", "", true}, // pkg/space.SystemBots(此前硬编码名单漏掉)
 		{"someone", "system", true},
 		{"someone", "normal", false},
 		{"alice", "", false},
@@ -99,49 +100,65 @@ func TestConvType(t *testing.T) {
 	}
 }
 
-func TestRollupChannelDaily(t *testing.T) {
-	const date = "2026-06-01"
-	meta := map[string]*channelMeta{
-		"g1":      {spaceID: "s1", convType: convTypeHAGroup, channelType: channelTypeGroup},
-		"u_a@u_b": {spaceID: "", convType: convTypeHHPrivate, channelType: channelTypePerson},
+// TestAggregateChunk 校验 chunk 聚合的纯逻辑：排除系统/测试账号、私聊任一方被排除则丢弃、
+// 群消息按 human/agent 归类、脏日去重。
+func TestAggregateChunk(t *testing.T) {
+	const ts = int64(1_780_000_000) // 落在某报告日内
+	day := time.Unix(ts, 0).In(reportLocation()).Format("2006-01-02")
+
+	memberType := map[string]uint8{
+		"alice": memberTypeHuman, "bob": memberTypeHuman, "agentX": memberTypeAgent,
+		"botfather": memberTypeAgent, "u_test": memberTypeHuman,
 	}
-	fact3 := []*factMemberChannelDailyModel{
-		{StatDate: date, ChannelID: "g1", SenderUID: "alice", SenderType: memberTypeHuman, MsgCount: 3, LastMsgAt: 100},
-		{StatDate: date, ChannelID: "g1", SenderUID: "bob", SenderType: memberTypeHuman, MsgCount: 2, LastMsgAt: 200},
-		{StatDate: date, ChannelID: "g1", SenderUID: "agentX", SenderType: memberTypeAgent, MsgCount: 5, LastMsgAt: 150},
-		{StatDate: date, ChannelID: "u_a@u_b", SenderUID: "u_a", SenderType: memberTypeHuman, MsgCount: 4, LastMsgAt: 90},
+	excluded := map[string]bool{"u_test": true} // category=system
+	excludedUID := func(uid string) bool {
+		// 复刻 RunIncremental 里的谓词：系统 bot ∪ excluded 集
+		return uid == "botfather" || uid == "u_10000" || uid == "fileHelper" || uid == "notification" || excluded[uid]
 	}
-	out := rollupChannelDaily(date, fact3, meta)
-	byID := map[string]*factChannelDailyModel{}
-	for _, r := range out {
-		byID[r.ChannelID] = r
+	groupMeta := map[string]groupMetaInfo{
+		"g1": {spaceID: "s1", convType: convTypeHAGroup},
 	}
 
-	g1 := byID["g1"]
-	if g1 == nil {
-		t.Fatal("missing g1 rollup")
-	}
-	if g1.HumanMsgCount != 5 || g1.AgentMsgCount != 5 {
-		t.Fatalf("g1 msg: human=%d agent=%d, want 5/5", g1.HumanMsgCount, g1.AgentMsgCount)
-	}
-	if g1.ActiveHumanMembers != 2 || g1.ActiveAgentMembers != 1 {
-		t.Fatalf("g1 active: human=%d agent=%d, want 2/1", g1.ActiveHumanMembers, g1.ActiveAgentMembers)
-	}
-	if g1.LastMsgAt != 200 {
-		t.Fatalf("g1 last_msg_at = %d, want 200", g1.LastMsgAt)
-	}
-	if g1.SpaceID != "s1" || g1.ConvType != convTypeHAGroup || g1.ChannelType != channelTypeGroup {
-		t.Fatalf("g1 meta wrong: space=%q conv=%d type=%d", g1.SpaceID, g1.ConvType, g1.ChannelType)
+	rows := []*srcMessageRow{
+		{ID: 1, FromUID: "alice", ChannelID: "g1", ChannelType: channelTypeGroup, Timestamp: ts},
+		{ID: 2, FromUID: "bob", ChannelID: "g1", ChannelType: channelTypeGroup, Timestamp: ts + 1},
+		{ID: 3, FromUID: "agentX", ChannelID: "g1", ChannelType: channelTypeGroup, Timestamp: ts + 2},
+		{ID: 4, FromUID: "botfather", ChannelID: "g1", ChannelType: channelTypeGroup, Timestamp: ts + 3},       // 系统bot→剔除
+		{ID: 5, FromUID: "u_test", ChannelID: "g1", ChannelType: channelTypeGroup, Timestamp: ts + 4},          // 测试账号→剔除
+		{ID: 6, FromUID: "alice", ChannelID: "alice@bob", ChannelType: channelTypePerson, Timestamp: ts},       // HH私聊
+		{ID: 7, FromUID: "alice", ChannelID: "alice@botfather", ChannelType: channelTypePerson, Timestamp: ts}, // 一方系统bot→整条丢弃
 	}
 
-	dm := byID["u_a@u_b"]
-	if dm == nil {
-		t.Fatal("missing private rollup")
+	res := aggregateChunk(rows, memberType, excludedUID, groupMeta)
+
+	// ③：g1 仅 alice/bob/agentX，私聊仅 alice@bob 的 alice
+	got := map[string]int{}
+	for _, f := range res.fact3 {
+		got[f.ChannelID+"/"+f.SenderUID] = f.MsgCount
 	}
-	if dm.HumanMsgCount != 4 || dm.AgentMsgCount != 0 || dm.ActiveHumanMembers != 1 {
-		t.Fatalf("private rollup wrong: %+v", dm)
+	want := map[string]int{"g1/alice": 1, "g1/bob": 1, "g1/agentX": 1, "alice@bob/alice": 1}
+	if len(got) != len(want) {
+		t.Fatalf("fact3 keys = %v, want %v", got, want)
 	}
-	if dm.SpaceID != "" || dm.ChannelType != channelTypePerson {
-		t.Fatalf("private meta wrong: space=%q type=%d", dm.SpaceID, dm.ChannelType)
+	for k, v := range want {
+		if got[k] != v {
+			t.Fatalf("fact3[%s] = %d, want %d (full=%v)", k, got[k], v, got)
+		}
+	}
+	if _, ok := got["g1/botfather"]; ok {
+		t.Fatal("system bot must be excluded from fact3")
+	}
+	if _, ok := got["g1/u_test"]; ok {
+		t.Fatal("category=system account must be excluded from fact3")
+	}
+	for _, f := range res.fact3 {
+		if f.ChannelID == "alice@botfather" {
+			t.Fatal("private chat with system bot must be dropped entirely")
+		}
+	}
+
+	// 脏日去重：只有一个 day
+	if len(res.dirtyDays) != 1 || res.dirtyDays[0] != day {
+		t.Fatalf("dirtyDays = %v, want [%s]", res.dirtyDays, day)
 	}
 }

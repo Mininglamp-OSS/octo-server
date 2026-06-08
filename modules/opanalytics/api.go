@@ -32,7 +32,7 @@ func New(ctx *config.Context) *Manager {
 		Log:       log.NewTLog("OpanalyticsManager"),
 		service:   newService(ctx),
 		etl:       etl,
-		scheduler: NewScheduler(etl),
+		scheduler: NewScheduler(ctx, etl),
 	}
 	if !ctx.GetConfig().Test {
 		if err := m.scheduler.Start(); err != nil {
