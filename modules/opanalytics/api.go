@@ -6,6 +6,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"go.uber.org/zap"
 )
 
@@ -43,8 +44,10 @@ func New(ctx *config.Context) *Manager {
 }
 
 // Route 配置路由。统一前缀 /v1/manager/dashboard；逐 handler 校验 superAdmin。
+// SharedUIDRateLimiter 挂在 AuthMiddleware 之后(须先解析出 uid)：这些是跨 Space 聚合的重查询，
+// 防管理端误刷/脚本轮询/token 泄漏把 DB 打满(每登录用户共享桶，见 pkg/wkhttp/ratelimit_helper.go)。
 func (m *Manager) Route(r *wkhttp.WKHttp) {
-	auth := r.Group("/v1/manager/dashboard", m.ctx.AuthMiddleware(r))
+	auth := r.Group("/v1/manager/dashboard", m.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, m.ctx))
 	{
 		auth.GET("/overview", m.overview)                       // 模块A 概览卡片
 		auth.GET("/spaces", m.spaces)                           // 表一 Space 列表

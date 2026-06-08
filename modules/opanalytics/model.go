@@ -41,6 +41,7 @@ type userDimRow struct {
 	Zone     string
 	Robot    int    // 0=human 1=agent
 	Category string // 'system' 等，用于排除判定
+	Status   int    // user.status: 1=正常 其它=禁用/注销(从成员总数剔除)
 }
 
 // groupDimRow 从 group 表读出的会话维表来源行。

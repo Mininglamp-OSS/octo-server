@@ -21,27 +21,48 @@ func newOpanalyticsDB(ctx *config.Context) *opanalyticsDB {
 
 // ===== 概览(模块A) =====
 
-func (d *opanalyticsDB) countSpacesTotal() (int64, error) {
+// countSpacesTotal 空间总数；给定 spaceIDs 时只数其中存在(status=1)者，使概览总数随筛选收敛。
+func (d *opanalyticsDB) countSpacesTotal(spaceIDs []string) (int64, error) {
 	var n int64
-	_, err := d.session.Select("count(*)").From("space").Where("status=1").Load(&n)
+	stmt := d.session.Select("count(*)").From("space").Where("status=1")
+	stmt = applySpaceFilter(stmt, spaceIDs)
+	_, err := stmt.Load(&n)
 	return n, err
 }
 
-func (d *opanalyticsDB) countGroupsTotal() (int64, error) {
+// countGroupsTotal 群组总数；给定 spaceIDs 时只数其中的群。
+func (d *opanalyticsDB) countGroupsTotal(spaceIDs []string) (int64, error) {
 	var n int64
-	_, err := d.session.Select("count(*)").From("`group`").Where("status=1").Load(&n)
+	stmt := d.session.Select("count(*)").From("`group`").Where("status=1")
+	stmt = applySpaceFilter(stmt, spaceIDs)
+	_, err := stmt.Load(&n)
 	return n, err
 }
 
-// countMembersByType 全局 human/agent 成员总数(源 dim_member；剔除系统/测试账号 is_excluded=1)。
-func (d *opanalyticsDB) countMembersByType() (human int64, agent int64, err error) {
+// countMembersByType human/agent 成员总数。spaceIDs 为空=全局(源 dim_member)；非空=选中
+// 空间在册成员去重(space_member ⋈ dim_member)，使总数随空间筛选收敛、活跃比例不失真。
+// 两路都剔除 is_excluded(系统/测试/禁用)与 SystemBots。
+func (d *opanalyticsDB) countMembersByType(spaceIDs []string) (human int64, agent int64, err error) {
 	var rows []struct {
 		MemberType uint8 `db:"member_type"`
 		Cnt        int64 `db:"cnt"`
 	}
-	_, err = d.session.SelectBySql(
-		"SELECT member_type, COUNT(*) AS cnt FROM octo_dim_member WHERE is_excluded=0 GROUP BY member_type",
-	).Load(&rows)
+	if len(spaceIDs) == 0 {
+		_, err = d.session.SelectBySql(
+			"SELECT member_type, COUNT(*) AS cnt FROM octo_dim_member WHERE is_excluded=0 GROUP BY member_type",
+		).Load(&rows)
+	} else {
+		botClause, botArgs := systemBotExclusion("sm.uid")
+		spaceClause, spaceArgs := inClause("sm.space_id", spaceIDs)
+		args := append(botArgs, spaceArgs...)
+		_, err = d.session.SelectBySql(
+			"SELECT m.member_type AS member_type, COUNT(DISTINCT sm.uid) AS cnt "+
+				"FROM space_member sm JOIN octo_dim_member m ON m.uid = sm.uid "+
+				"WHERE sm.status=1 AND m.is_excluded=0"+botClause+" AND "+spaceClause+
+				" GROUP BY m.member_type",
+			args...,
+		).Load(&rows)
+	}
 	if err != nil {
 		return 0, 0, err
 	}
@@ -363,6 +384,16 @@ func systemBotExclusion(col string) (string, []interface{}) {
 		args[i] = b
 	}
 	return " AND " + col + " NOT IN (" + ph + ")", args
+}
+
+// inClause 构造 "<col> IN (?,?...)" 片段与参数(用于 SelectBySql 裸 SQL；调用方需保证非空)。
+func inClause(col string, vals []string) (string, []interface{}) {
+	ph := strings.TrimSuffix(strings.Repeat("?,", len(vals)), ",")
+	args := make([]interface{}, len(vals))
+	for i, v := range vals {
+		args[i] = v
+	}
+	return col + " IN (" + ph + ")", args
 }
 
 func applySpaceFilter(stmt *dbr.SelectStmt, spaceIDs []string) *dbr.SelectStmt {

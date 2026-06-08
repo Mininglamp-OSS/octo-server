@@ -233,13 +233,14 @@ func (d *etlDB) truncateForRebuild() error {
 
 // ===== 维表来源读取 =====
 
-// queryUsersForDim 读 user 表(在册)用于刷新成员维表；robot=1 即 agent。
+// queryUsersForDim 读 user 表**全部**行(不按 status 过滤)用于全量刷新成员维表；robot=1 即 agent。
+// 取全量是为了让禁用/注销用户(status≠1)也能进维表并被打上 is_excluded，从而从总人数剔除，
+// 而非只查 status=1 导致旧行残留无法自愈。
 func (d *etlDB) queryUsersForDim() ([]*userDimRow, error) {
 	var rows []*userDimRow
 	_, err := d.session.
-		Select("uid", "name", "email", "phone", "zone", "robot", "category").
+		Select("uid", "name", "email", "phone", "zone", "robot", "category", "status").
 		From("`user`").
-		Where("status=1").
 		Load(&rows)
 	return rows, err
 }
@@ -273,13 +274,23 @@ func (d *etlDB) queryGroupMemberCounts() ([]*groupMemberCountRow, error) {
 
 // ===== 维表 upsert =====
 
-// upsertDimMembers 批量 upsert 成员维表(维表全刷可用 ODKU；禁令只针对会消失 key 的事实表)。
-func (d *etlDB) upsertDimMembers(rows [][]interface{}) error {
+// replaceDimMembers 在单事务内**全量替换**成员维表(DELETE 全表 + 批量 INSERT 当前 user 全集)。
+// 全量替换而非 upsert：硬删除的 user 行不会残留为陈旧 dim 行(禁用/注销则由 is_excluded 标记)，
+// 总人数因此能自愈。DELETE+INSERT 同事务，MVCC 下并发读者看到的是替换前或后的完整快照，无半态。
+func (d *etlDB) replaceDimMembers(rows [][]interface{}) error {
+	tx, err := d.session.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackUnlessCommitted()
+	if _, err = tx.DeleteBySql("DELETE FROM octo_dim_member").Exec(); err != nil {
+		return err
+	}
 	const cols = "(`uid`,`name`,`email`,`phone`,`zone`,`member_type`,`is_excluded`)"
-	const suffix = " ON DUPLICATE KEY UPDATE " +
-		"`name`=VALUES(`name`),`email`=VALUES(`email`),`phone`=VALUES(`phone`)," +
-		"`zone`=VALUES(`zone`),`member_type`=VALUES(`member_type`),`is_excluded`=VALUES(`is_excluded`)"
-	return execValuesUpsert(d.session, "octo_dim_member", cols, 7, suffix, rows)
+	if err = execValuesUpsert(tx, "octo_dim_member", cols, 7, "", rows); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // upsertDimChannelGroups 批量 upsert 群会话维表。不触碰 last_active_at(由消息活跃单调更新)。

@@ -307,14 +307,20 @@ func resolveChannelMeta(channelID string, channelType uint8, memberType map[stri
 	return &channelMeta{spaceID: "", convType: privateConvType(memberType[a], memberType[b]), channelType: channelTypePerson}
 }
 
-// refreshDimMembers 全量刷新成员维表，返回 uid→member_type 映射与排除集(is_excluded=1 的 uid)。
+// refreshDimMembers 全量替换成员维表，返回 uid→member_type 映射与**消息路径**排除集。
+//
+// 两类排除语义分离：
+//   - dim_member.is_excluded(用于成员总数)= 系统/测试账号 ∪ 禁用/注销(status≠1)。
+//     总数反映"当前在册成员"，故禁用用户应剔除。
+//   - 返回的 excludedForMessages(用于消息计数)= 仅系统/测试账号，**不含** status。
+//     消息计数是 event-time 语义：用户活跃期发的消息照算，事后禁用不回溯。
 func (e *ETL) refreshDimMembers() (map[string]uint8, map[string]bool, error) {
 	users, err := e.db.queryUsersForDim()
 	if err != nil {
 		return nil, nil, err
 	}
 	memberType := make(map[string]uint8, len(users))
-	excluded := make(map[string]bool)
+	excludedForMessages := make(map[string]bool)
 	rows := make([][]interface{}, 0, len(users))
 	for _, u := range users {
 		mt := memberTypeHuman
@@ -322,17 +328,20 @@ func (e *ETL) refreshDimMembers() (map[string]uint8, map[string]bool, error) {
 			mt = memberTypeAgent
 		}
 		memberType[u.UID] = mt
+		noise := isExcludedMember(u.UID, u.Category)
+		if noise {
+			excludedForMessages[u.UID] = true
+		}
 		ex := 0
-		if isExcludedMember(u.UID, u.Category) {
+		if noise || u.Status != 1 {
 			ex = 1
-			excluded[u.UID] = true
 		}
 		rows = append(rows, []interface{}{u.UID, u.Name, u.Email, u.Phone, u.Zone, mt, ex})
 	}
-	if err = e.db.upsertDimMembers(rows); err != nil {
+	if err = e.db.replaceDimMembers(rows); err != nil {
 		return nil, nil, err
 	}
-	return memberType, excluded, nil
+	return memberType, excludedForMessages, nil
 }
 
 // refreshDimChannelGroups 全量刷新群会话维表，返回 group_no→{space_id,conv_type}。

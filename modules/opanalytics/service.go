@@ -20,17 +20,18 @@ func newService(ctx *config.Context) *service {
 	}
 }
 
-// overview 组装模块A 概览卡片。总数=全局系统全量(不随时间/space 变)；活跃/消息量随范围与可选 space。
+// overview 组装模块A 概览卡片。总数与活跃/消息量均随时间范围与可选 space 筛选收敛：选中某 Space
+// 时，总数(space/group/member)也限定到该 Space，前端用"总数+活跃数"算比例才不会失真。
 func (s *service) overview(start, end string, spaceIDs []string) (*overviewResp, error) {
-	spaceTotal, err := s.db.countSpacesTotal()
+	spaceTotal, err := s.db.countSpacesTotal(spaceIDs)
 	if err != nil {
 		return nil, err
 	}
-	groupTotal, err := s.db.countGroupsTotal()
+	groupTotal, err := s.db.countGroupsTotal(spaceIDs)
 	if err != nil {
 		return nil, err
 	}
-	humanTotal, agentTotal, err := s.db.countMembersByType()
+	humanTotal, agentTotal, err := s.db.countMembersByType(spaceIDs)
 	if err != nil {
 		return nil, err
 	}

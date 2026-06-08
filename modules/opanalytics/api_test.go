@@ -13,6 +13,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"github.com/go-redis/redis"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -30,7 +31,22 @@ func opaSetup(t *testing.T) (*config.Context, *wkhttp.WKHttp, *ETL) {
 	setSuperAdminToken(t, ctx)
 	createMessageShards(t, ctx)
 	cleanOpaAndShards(t, ctx)
+	resetUIDRateLimit(t, ctx)
 	return ctx, route, NewETL(ctx)
+}
+
+// resetUIDRateLimit 清空 SharedUIDRateLimiter 的每-uid 令牌桶(ratelimit:uid:*)。该桶持久在
+// Redis、跨测试残留且不被 CleanAllTables 清，须在 setup 重置，否则同一 binary 内靠后的测试会 429。
+func resetUIDRateLimit(t *testing.T, ctx *config.Context) {
+	t.Helper()
+	rds := redis.NewClient(&redis.Options{
+		Addr:     ctx.GetConfig().DB.RedisAddr,
+		Password: ctx.GetConfig().DB.RedisPass,
+	})
+	defer rds.Close()
+	if keys, err := rds.Keys("ratelimit:uid:*").Result(); err == nil && len(keys) > 0 {
+		_ = rds.Del(keys...).Err()
+	}
 }
 
 func setSuperAdminToken(t *testing.T, ctx *config.Context) {
@@ -366,6 +382,19 @@ func TestOpanalyticsEndpoints(t *testing.T) {
 	assert.Equal(t, int64(5), ov.AgentMsgCount)
 	assert.Equal(t, int64(1), ov.PrivateActiveCount)
 
+	// ---- overview 限定 Space=s1：总数也随筛选收敛(否则活跃比例失真) ----
+	var ovS1 overviewResp
+	decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/overview"+rng+"&space_ids=s1"), &ovS1)
+	assert.Equal(t, int64(1), ovS1.SpaceTotal, "选中 s1 → 空间总数=1")
+	assert.Equal(t, int64(1), ovS1.GroupTotal, "s1 仅 g1")
+	assert.Equal(t, int64(2), ovS1.HumanMemberTotal, "s1 在册 human=alice,bob")
+	assert.Equal(t, int64(1), ovS1.AgentTotal, "s1 在册 agent=u_agent")
+	assert.Equal(t, int64(1), ovS1.ActiveGroups)
+	assert.Equal(t, int64(2), ovS1.ActiveHumanMembers)
+	assert.Equal(t, int64(1), ovS1.ActiveAgentMembers)
+	assert.Equal(t, int64(5), ovS1.HumanMsgCount, "私聊/g2 不计入 s1")
+	assert.Equal(t, int64(5), ovS1.AgentMsgCount)
+
 	// ---- spaces (表一) ----
 	var spaces struct {
 		Count int64           `json:"count"`
@@ -598,4 +627,32 @@ func TestOpanalyticsETLRebuild(t *testing.T) {
 	require.NoError(t, etl.Rebuild())
 	assert.Equal(t, 0, fact3Msg(t, ctx, "g1", "u_bob"), "Rebuild 后被排除成员的历史行清除")
 	assert.Equal(t, 3, fact4Human(t, ctx, "g1"), "Rebuild 后 g1 human=3(alice 3，bob 被排除)")
+}
+
+// TestOpanalyticsDimFullRefresh 验收#2(维表全量刷新)：禁用(status≠1)用户从成员总数剔除、
+// 硬删除用户不残留；而其历史消息按 event-time 仍保留。
+func TestOpanalyticsDimFullRefresh(t *testing.T) {
+	ctx, route, etl := opaSetup(t)
+	seedScenario(t, ctx)
+	require.NoError(t, etl.RunIncremental())
+
+	humanTotal := func() int64 {
+		var ov overviewResp
+		decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/overview?start_date="+statDay+"&end_date="+statDay), &ov)
+		return ov.HumanMemberTotal
+	}
+	require.Equal(t, int64(3), humanTotal(), "初始 human 总数=alice,bob,carol")
+
+	// 禁用 carol：全量刷新后从总数剔除，但其 g2 历史消息(event-time)仍在。
+	_, err := ctx.DB().Exec("UPDATE `user` SET status=0 WHERE uid='u_carol'")
+	require.NoError(t, err)
+	require.NoError(t, etl.RunIncremental())
+	assert.Equal(t, int64(2), humanTotal(), "禁用 carol 后 human 总数=2")
+	assert.Equal(t, 2, fact4Human(t, ctx, "g2"), "carol 历史消息按 event-time 保留")
+
+	// 硬删除 alice：全量替换不残留陈旧 dim 行，总数再降。
+	_, err = ctx.DB().Exec("DELETE FROM `user` WHERE uid='u_alice'")
+	require.NoError(t, err)
+	require.NoError(t, etl.RunIncremental())
+	assert.Equal(t, int64(1), humanTotal(), "硬删除 alice 后 human 总数=1(仅 bob)")
 }
