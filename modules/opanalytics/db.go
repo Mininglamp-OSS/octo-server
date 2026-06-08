@@ -94,17 +94,25 @@ func (d *opanalyticsDB) overviewMsgAndGroups(start, end string, spaceIDs []strin
 }
 
 // overviewActiveMembers 范围内活跃 human/agent 成员去重数(可选 space 过滤)。
+// JOIN dim_member 且 is_excluded=0：活跃成员只算**当前在册**的人(剔除事后被禁用/删除/系统账号)，
+// 使"活跃成员 ⊆ 总成员"、活跃率 ≤100%。消息量(volume)仍按 event-time 保留，二者口径有意不同。
 func (d *opanalyticsDB) overviewActiveMembers(start, end string, spaceIDs []string) (human, agent int64, err error) {
 	var res struct {
 		ActiveHuman int64 `db:"active_human"`
 		ActiveAgent int64 `db:"active_agent"`
 	}
-	stmt := d.session.Select(
-		"COUNT(DISTINCT CASE WHEN sender_type=1 THEN sender_uid END) AS active_human",
-		"COUNT(DISTINCT CASE WHEN sender_type=2 THEN sender_uid END) AS active_agent",
-	).From("octo_fact_member_channel_daily").Where("stat_date BETWEEN ? AND ?", start, end)
-	stmt = applySpaceFilter(stmt, spaceIDs)
-	_, err = stmt.Load(&res)
+	sql := "SELECT " +
+		"COUNT(DISTINCT CASE WHEN f.sender_type=1 THEN f.sender_uid END) AS active_human, " +
+		"COUNT(DISTINCT CASE WHEN f.sender_type=2 THEN f.sender_uid END) AS active_agent " +
+		"FROM octo_fact_member_channel_daily f JOIN octo_dim_member m ON m.uid = f.sender_uid " +
+		"WHERE f.stat_date BETWEEN ? AND ? AND m.is_excluded=0"
+	args := []interface{}{start, end}
+	if len(spaceIDs) > 0 {
+		clause, spaceArgs := inClause("f.space_id", spaceIDs)
+		sql += " AND " + clause
+		args = append(args, spaceArgs...)
+	}
+	_, err = d.session.SelectBySql(sql, args...).Load(&res)
 	return res.ActiveHuman, res.ActiveAgent, err
 }
 

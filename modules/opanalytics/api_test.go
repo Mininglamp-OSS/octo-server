@@ -394,6 +394,7 @@ func TestOpanalyticsEndpoints(t *testing.T) {
 	assert.Equal(t, int64(1), ovS1.ActiveAgentMembers)
 	assert.Equal(t, int64(5), ovS1.HumanMsgCount, "私聊/g2 不计入 s1")
 	assert.Equal(t, int64(5), ovS1.AgentMsgCount)
+	assert.Equal(t, int64(0), ovS1.PrivateActiveCount, "选中 Space 时私聊数置 0(私聊无 space 归属)")
 
 	// ---- spaces (表一) ----
 	var spaces struct {
@@ -636,25 +637,29 @@ func TestOpanalyticsDimFullRefresh(t *testing.T) {
 	seedScenario(t, ctx)
 	require.NoError(t, etl.RunIncremental())
 
-	humanTotal := func() int64 {
+	getOverview := func() overviewResp {
 		var ov overviewResp
 		decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/overview?start_date="+statDay+"&end_date="+statDay), &ov)
-		return ov.HumanMemberTotal
+		return ov
 	}
-	require.Equal(t, int64(3), humanTotal(), "初始 human 总数=alice,bob,carol")
+	ov := getOverview()
+	require.Equal(t, int64(3), ov.HumanMemberTotal, "初始 human 总数=alice,bob,carol")
+	require.Equal(t, int64(3), ov.ActiveHumanMembers, "初始活跃 human=alice,bob,carol")
 
-	// 禁用 carol：全量刷新后从总数剔除，但其 g2 历史消息(event-time)仍在。
+	// 禁用 carol：全量刷新后从总数与活跃中剔除(活跃成员只算当前在册)，但其 g2 历史消息量(event-time)仍在。
 	_, err := ctx.DB().Exec("UPDATE `user` SET status=0 WHERE uid='u_carol'")
 	require.NoError(t, err)
 	require.NoError(t, etl.RunIncremental())
-	assert.Equal(t, int64(2), humanTotal(), "禁用 carol 后 human 总数=2")
-	assert.Equal(t, 2, fact4Human(t, ctx, "g2"), "carol 历史消息按 event-time 保留")
+	ov = getOverview()
+	assert.Equal(t, int64(2), ov.HumanMemberTotal, "禁用 carol 后 human 总数=2")
+	assert.Equal(t, int64(2), ov.ActiveHumanMembers, "禁用 carol 后活跃 human=2(活跃⊆在册，率≤100%)")
+	assert.Equal(t, 2, fact4Human(t, ctx, "g2"), "carol 历史消息量按 event-time 保留")
 
 	// 硬删除 alice：全量替换不残留陈旧 dim 行，总数再降。
 	_, err = ctx.DB().Exec("DELETE FROM `user` WHERE uid='u_alice'")
 	require.NoError(t, err)
 	require.NoError(t, etl.RunIncremental())
-	assert.Equal(t, int64(1), humanTotal(), "硬删除 alice 后 human 总数=1(仅 bob)")
+	assert.Equal(t, int64(1), getOverview().HumanMemberTotal, "硬删除 alice 后 human 总数=1(仅 bob)")
 }
 
 // TestOpanalyticsMemberTotalsConsistency 验证概览(Space 路径)与表一的"成员总数"口径一致：
