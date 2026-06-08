@@ -257,6 +257,25 @@ func TestGenerateBotID(t *testing.T) {
 	assert.NotEqual(t, id1, id2)
 }
 
+// TestGenerateBotID_AlwaysLowercase asserts the lowercase invariant on every
+// generated bot ID. util.Ten2Hex is Base62 (charset 0-9 + a-z + A-Z); its
+// uppercase half hits ~50% of timestamp chars, so 200 samples gives near-
+// certainty if the strings.ToLower wrapper in generateBotID() is ever removed.
+//
+// Background: octo-server#302 / openclaw-channel-octo#33 — mixed-case IDs
+// silently mismatch against OpenClaw's lowercase normalize layer.
+func TestGenerateBotID_AlwaysLowercase(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		id := generateBotID()
+		if id != strings.ToLower(id) {
+			t.Fatalf("generateBotID() returned mixed-case ID: %q (iter %d)", id, i)
+		}
+		if !strings.HasSuffix(id, BotUsernameSuffix) {
+			t.Fatalf("generateBotID() missing suffix %q: %q", BotUsernameSuffix, id)
+		}
+	}
+}
+
 func TestBotNameValidation(t *testing.T) {
 	// Pure string-length validation logic — no DB / Redis / IM dependencies.
 	// 模拟 onBotNameInput 中的验证逻辑

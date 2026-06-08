@@ -979,9 +979,15 @@ func (h *commandHandler) sendCreatedPrompt(toUID string, name string, bot *robot
 
 // generateBotID 生成全局唯一的 Bot 标识符
 // 时间戳 Base62 + 4字节随机 hex，即使并发同纳秒也不会碰撞
+//
+// Lowercase the full returned ID so newly-generated bot IDs are case-insensitive-safe
+// against OpenClaw's normalizeOptionalLowercaseString routing layer. randomHex and
+// BotUsernameSuffix are already lowercase today; wrapping the whole concatenation
+// defends against future charset drift in either component.
+// See: octo-server#302, openclaw-channel-octo#33
 func generateBotID() string {
 	suffix, _ := randomHex(4)
-	return util.Ten2Hex(time.Now().UnixNano()) + suffix + BotUsernameSuffix
+	return strings.ToLower(util.Ten2Hex(time.Now().UnixNano()) + suffix + BotUsernameSuffix)
 }
 
 func (h *commandHandler) getBotDisplayName(robotID string) string {
