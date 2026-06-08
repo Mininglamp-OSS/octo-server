@@ -15,6 +15,7 @@ package message
 // =============================================================================
 
 import (
+	"encoding/json"
 	"sort"
 	"strings"
 	"testing"
@@ -23,6 +24,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	convext "github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
+	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -1106,3 +1108,123 @@ func TestParseThreadChannelIDSidebar_Invalid(t *testing.T) {
 
 func strPtr(s string) *string        { return &s }
 func timePtr(t time.Time) *time.Time { return &t }
+
+// ---------------------------------------------------------------------------
+// SidebarItem.Status — thread-only lifecycle status (GH octo-server#310)
+// ---------------------------------------------------------------------------
+
+// Non-thread items (DM / group) must serialize WITHOUT a "status" key so the
+// wire format stays backward compatible (Status=0 + omitempty → absent).
+func TestSidebarItem_JSON_NonThreadOmitsStatus(t *testing.T) {
+	cases := []struct {
+		name string
+		item *SidebarItem
+	}{
+		{
+			name: "DM",
+			item: &SidebarItem{TargetType: int(common.ChannelTypePerson), TargetID: "peer1"},
+		},
+		{
+			name: "group",
+			item: &SidebarItem{TargetType: int(common.ChannelTypeGroup), TargetID: "g1"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b, err := json.Marshal(tc.item)
+			require.NoError(t, err)
+			assert.NotContains(t, string(b), "\"status\"",
+				"non-thread item must not carry a status key (omitempty)")
+		})
+	}
+}
+
+// Thread items must include the status field with the thread lifecycle value.
+func TestSidebarItem_JSON_ThreadIncludesStatus(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		want   string
+	}{
+		{name: "active", status: thread.ThreadStatusActive, want: "\"status\":1"},
+		{name: "archived", status: thread.ThreadStatusArchived, want: "\"status\":2"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			item := &SidebarItem{
+				TargetType: int(common.ChannelTypeCommunityTopic),
+				TargetID:   "g1____th1",
+				Status:     tc.status,
+			}
+			b, err := json.Marshal(item)
+			require.NoError(t, err)
+			assert.Contains(t, string(b), tc.want)
+		})
+	}
+}
+
+// Status semantics must match the thread package enum exactly (GH octo-server#310).
+func TestSidebarItem_StatusEnumMatchesThreadConst(t *testing.T) {
+	assert.Equal(t, 1, thread.ThreadStatusActive)
+	assert.Equal(t, 2, thread.ThreadStatusArchived)
+	assert.Equal(t, 3, thread.ThreadStatusDeleted)
+}
+
+// ---------------------------------------------------------------------------
+// backfillThreadStatus — pure backfill of thread lifecycle status
+// ---------------------------------------------------------------------------
+
+// backfillThreadStatus must set Status on thread items keyed by TargetID, leave
+// non-thread items untouched, and skip thread items absent from the status map.
+func TestBackfillThreadStatus(t *testing.T) {
+	items := []*SidebarItem{
+		{TargetType: int(common.ChannelTypePerson), TargetID: "peer1"},
+		{TargetType: int(common.ChannelTypeGroup), TargetID: "g1"},
+		{TargetType: int(common.ChannelTypeCommunityTopic), TargetID: "g1____active"},
+		{TargetType: int(common.ChannelTypeCommunityTopic), TargetID: "g1____archived"},
+		{TargetType: int(common.ChannelTypeCommunityTopic), TargetID: "g1____unknown"},
+	}
+	statusMap := map[string]int{
+		"g1____active":   thread.ThreadStatusActive,
+		"g1____archived": thread.ThreadStatusArchived,
+	}
+	backfillThreadStatus(items, statusMap)
+
+	got := map[string]int{}
+	for _, it := range items {
+		got[it.TargetID] = it.Status
+	}
+	assert.Equal(t, 0, got["peer1"], "DM must keep Status=0")
+	assert.Equal(t, 0, got["g1"], "group must keep Status=0")
+	assert.Equal(t, thread.ThreadStatusActive, got["g1____active"])
+	assert.Equal(t, thread.ThreadStatusArchived, got["g1____archived"])
+	assert.Equal(t, 0, got["g1____unknown"],
+		"thread absent from status map must keep Status=0 (omitempty)")
+}
+
+// A nil / empty status map must be a no-op (fail-open: recent tab leaves Status unset).
+func TestBackfillThreadStatus_EmptyMapNoOp(t *testing.T) {
+	items := []*SidebarItem{
+		{TargetType: int(common.ChannelTypeCommunityTopic), TargetID: "g1____th1"},
+	}
+	backfillThreadStatus(items, nil)
+	assert.Equal(t, 0, items[0].Status)
+	backfillThreadStatus(items, map[string]int{})
+	assert.Equal(t, 0, items[0].Status)
+}
+
+// Same short_id under two different parent groups must not cross-contaminate:
+// the composite "{groupNo}____{shortID}" key keeps them distinct.
+func TestBackfillThreadStatus_NoCrossGroupMismatch(t *testing.T) {
+	items := []*SidebarItem{
+		{TargetType: int(common.ChannelTypeCommunityTopic), TargetID: "gA____dup"},
+		{TargetType: int(common.ChannelTypeCommunityTopic), TargetID: "gB____dup"},
+	}
+	statusMap := map[string]int{
+		"gA____dup": thread.ThreadStatusActive,
+		"gB____dup": thread.ThreadStatusArchived,
+	}
+	backfillThreadStatus(items, statusMap)
+	assert.Equal(t, thread.ThreadStatusActive, items[0].Status, "gA____dup must be active")
+	assert.Equal(t, thread.ThreadStatusArchived, items[1].Status, "gB____dup must be archived")
+}

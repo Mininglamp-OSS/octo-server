@@ -142,6 +142,9 @@ definitions:
       parent_channel_id:
         type: string
         description: "父群频道 ID（仅子区条目返回）"
+      status:
+        type: integer
+        description: "子区生命周期状态，仅子区条目（target_type=5）返回，取值 1=active（活跃）/ 2=archived（已归档）。DM / 群条目不带该字段。子区条目若缺省该字段，表示状态未知，客户端应回退到 channelInfo（涵盖最近会话 tab 的 fail-open 情况，以及可能仍出现在最近会话 tab 中的已删除子区——已删除子区不会被标记，因此不会返回 status=3）。客户端据此同步过滤已归档子区，无需等待 channelInfo（GH octo-server#310）。"
   response:
     type: "object"
     properties:

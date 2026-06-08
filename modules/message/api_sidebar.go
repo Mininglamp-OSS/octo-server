@@ -138,6 +138,11 @@ type SidebarItem struct {
 	intraCategorySort int
 	FollowSort        int    `json:"follow_sort,omitempty"`
 	ParentChannelID   string `json:"parent_channel_id,omitempty"` // thread only
+	// Status 仅对 thread 条目（target_type=5）有意义：1=active 2=archived
+	// 3=deleted，语义与 modules/thread/const.go 的 ThreadStatus* 枚举一致
+	// （GH octo-server#310）。客户端据此同步过滤已归档子区，无需等待 channelInfo。
+	// omitempty 让 DM / 群条目不带该字段，保持线上协议向后兼容。
+	Status int `json:"status,omitempty"`
 }
 
 // sidebarSyncResp is the JSON response for POST /v1/sidebar/sync.
@@ -462,11 +467,19 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 		// Append standalone thread ext entries not present in IM result.
 		// Pass categorySetting + unfollowedGroups so parent-follow filter applies
 		// to DB-only thread entries as well (PR review Round-3 Blocking #4).
-		lastMsgAtMap, err := sb.loadThreadLastMsgAt(threadExtRows)
+		lastMsgAtMap, threadStatusMap, err := sb.loadThreadLastMsgAt(threadExtRows)
 		if failClosedForFollow("thread last_message_at query", err) {
 			return
 		}
 		items = mergeThreadEntries(items, threadExtRows, lastMsgAtMap, categorySetting, unfollowedGroups, groupSpaceMap, externalGroupMap, defaultSpaceID)
+
+		// GH octo-server#310：把 thread 生命周期状态回填到 thread 条目。statusMap
+		// 来自 loadThreadLastMsgAt（复用 QueryActiveByGroupShortIDs 已 SELECT 的
+		// status，零额外查询），键为 "{groupNo}____{shortID}"，与 thread 条目的
+		// TargetID 同口径。同时覆盖 buildFollowItems（IM-present）与 mergeThreadEntries
+		// （DB-only）两条路径；mergeThreadEntries 已把不在 statusMap 中的 thread
+		// （deleted/missing）skip，所以幸存的 thread 条目必有 status。
+		backfillThreadStatus(items, threadStatusMap)
 
 		// Issue #151 symptom #2 — materialize ext rows for default-followed
 		// groups (categorized but never touched).  Without this, OnThreadCreated
@@ -528,6 +541,15 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 	case "recent":
 		cutoffs := loadRecentCutoffs(sb.ctx, time.Now())
 		items = buildRecentItems(conversations, cutoffs, pinnedSet, groupSpaceMap, externalGroupMap, defaultSpaceID)
+		// GH octo-server#310：recent tab 也要带 thread 生命周期状态。一次性批量
+		// 查询所有 thread 条目的 status（无 N+1），再 backfill。
+		// FAIL-OPEN：查询失败只记 warn 并把 Status 留空（omitempty -> 字段缺省），
+		// 与 recent tab 既有的降级行为一致，绝不 fail-closed。
+		if statusMap, qerr := sb.loadThreadStatuses(items); qerr != nil {
+			sb.Warn("sidebar sync: thread status query failed (recent tab non-fatal, status omitted)", zap.Error(qerr))
+		} else {
+			backfillThreadStatus(items, statusMap)
+		}
 	}
 
 	// 4. Enrich pinned flag (follow tab items also need it)
@@ -602,31 +624,91 @@ func (sb *Sidebar) loadPinnedSet(uid, spaceID string) (map[string]struct{}, erro
 // 在 follow tab 路径下吞掉错误并返回空 map 会让 mergeThreadEntries 把所有 DB-only
 // thread 当 "不活跃" skip，客户端 follow tab 残缺但仍带 follow_version，看上去 fresh —
 // 客户端长期缓存错误结果。所以接口契约改为：错误必须显式上报。
-func (sb *Sidebar) loadThreadLastMsgAt(extRows []*convext.Model) (map[string]*time.Time, error) {
+//
+// GH octo-server#310：QueryActiveByGroupShortIDs 同时 SELECT 了 status，这里把它
+// 一并 surface 出来（statusMap，键同为 "{groupNo}____{shortID}"），让 follow tab
+// 在 backfill 阶段把 thread 生命周期状态回填到 SidebarItem.Status，零额外查询。
+func (sb *Sidebar) loadThreadLastMsgAt(extRows []*convext.Model) (lastMsgAt map[string]*time.Time, statusMap map[string]int, err error) {
 	result := make(map[string]*time.Time, len(extRows))
+	statuses := make(map[string]int, len(extRows))
 	if len(extRows) == 0 {
-		return result, nil
+		return result, statuses, nil
 	}
 	refs := make([]thread.ShortRef, 0, len(extRows))
 	for _, m := range extRows {
-		gno, sid, err := parseThreadChannelIDSidebar(m.TargetID)
+		gno, sid, perr := parseThreadChannelIDSidebar(m.TargetID)
+		if perr != nil {
+			continue
+		}
+		refs = append(refs, thread.ShortRef{GroupNo: gno, ShortID: sid})
+	}
+	if len(refs) == 0 {
+		return result, statuses, nil
+	}
+	threadMap, qerr := sb.threadDB.QueryActiveByGroupShortIDs(refs)
+	if qerr != nil {
+		return nil, nil, fmt.Errorf("sidebar load thread last_message_at: %w", qerr)
+	}
+	// QueryActiveByGroupShortIDs 已经按 "{groupNo}____{shortID}" 做键，直接转写。
+	for key, lite := range threadMap {
+		result[key] = lite.LastMessageAt
+		statuses[key] = lite.Status
+	}
+	return result, statuses, nil
+}
+
+// loadThreadStatuses 批量查询给定 sidebar items 里 thread 条目（target_type=5）
+// 的生命周期 status，返回 map["{groupNo}____{shortID}"]status。供 recent tab 使用：
+// 那里没有现成的 thread DB 结果可复用，必须单独发一次 batched 查询（无 N+1）。
+//
+// 复用 thread.QueryActiveByGroupShortIDs：它已按 (group_no, short_id) 过滤、只返回
+// status != deleted 的行，且只 SELECT 最小列集。不修改它的过滤语义（鉴权路径依赖
+// 它过滤掉 deleted），仅消费它本就返回的 status。
+//
+// 无 thread 条目时返回空 map、不发查询。
+func (sb *Sidebar) loadThreadStatuses(items []*SidebarItem) (map[string]int, error) {
+	refs := make([]thread.ShortRef, 0)
+	for _, it := range items {
+		if it.TargetType != int(common.ChannelTypeCommunityTopic) {
+			continue
+		}
+		gno, sid, err := parseThreadChannelIDSidebar(it.TargetID)
 		if err != nil {
 			continue
 		}
 		refs = append(refs, thread.ShortRef{GroupNo: gno, ShortID: sid})
 	}
 	if len(refs) == 0 {
-		return result, nil
+		return map[string]int{}, nil
 	}
 	threadMap, err := sb.threadDB.QueryActiveByGroupShortIDs(refs)
 	if err != nil {
-		return nil, fmt.Errorf("sidebar load thread last_message_at: %w", err)
+		return nil, fmt.Errorf("sidebar load thread statuses: %w", err)
 	}
-	// QueryActiveByGroupShortIDs 已经按 "{groupNo}____{shortID}" 做键，直接转写。
+	statuses := make(map[string]int, len(threadMap))
 	for key, lite := range threadMap {
-		result[key] = lite.LastMessageAt
+		statuses[key] = lite.Status
 	}
-	return result, nil
+	return statuses, nil
+}
+
+// backfillThreadStatus 把 statusMap 里的 thread 生命周期 status 回填到 thread 条目
+// （target_type=5）的 SidebarItem.Status 上（GH octo-server#310）。statusMap 的键是
+// "{groupNo}____{shortID}"，与 thread 条目的 TargetID 一致。非 thread 条目跳过；
+// statusMap 中没有的 thread 条目保持 Status=0（omitempty -> 字段缺省），由调用方
+// 的 fail-open / fail-closed 语义决定这种情况是否会出现。
+func backfillThreadStatus(items []*SidebarItem, statusMap map[string]int) {
+	if len(statusMap) == 0 {
+		return
+	}
+	for _, it := range items {
+		if it.TargetType != int(common.ChannelTypeCommunityTopic) {
+			continue
+		}
+		if st, ok := statusMap[it.TargetID]; ok {
+			it.Status = st
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
