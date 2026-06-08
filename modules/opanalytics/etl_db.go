@@ -255,8 +255,10 @@ func (d *etlDB) queryGroupsForDim() ([]*groupDimRow, error) {
 	return rows, err
 }
 
-// queryGroupMemberCounts 按群统计在册(status=1)成员数及其中的 agent 数，剔除系统/测试账号。
+// queryGroupMemberCounts 按群统计在册成员数及其中的 agent 数，剔除系统/测试账号。
 // 成员类型优先取 dim_member.member_type，回退 group_member.robot。
+// 在册口径与 group 模块标准查询一致：group_member 有 status(黑名单/正常) 与 is_deleted(是否退群/被移除)
+// **两个独立**字段，必须同时 `status=1 AND is_deleted=0`(只查 status 会把已退群成员算进成员数/误判 HA)。
 // 排除口径：dim_member.is_excluded=1，再按单一真源结构性兜底剔除 SystemBots(防 dim 缺行)。
 func (d *etlDB) queryGroupMemberCounts() ([]*groupMemberCountRow, error) {
 	var rows []*groupMemberCountRow
@@ -266,7 +268,7 @@ func (d *etlDB) queryGroupMemberCounts() ([]*groupMemberCountRow, error) {
 			"SUM(CASE WHEN COALESCE(m.member_type, IF(gm.robot=1,2,1))=2 THEN 1 ELSE 0 END) AS agent_cnt, "+
 			"COUNT(*) AS total_cnt "+
 			"FROM `group_member` gm LEFT JOIN octo_dim_member m ON m.uid = gm.uid "+
-			"WHERE gm.status=1 AND COALESCE(m.is_excluded,0)=0"+botClause+" GROUP BY gm.group_no",
+			"WHERE gm.status=1 AND gm.is_deleted=0 AND COALESCE(m.is_excluded,0)=0"+botClause+" GROUP BY gm.group_no",
 		botArgs...,
 	).Load(&rows)
 	return rows, err

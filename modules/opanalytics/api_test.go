@@ -167,6 +167,14 @@ func seedGroupMember(t *testing.T, ctx *config.Context, groupNo, uid string, rob
 	require.NoError(t, err)
 }
 
+// seedGroupMemberDeleted 插入一个已退群/被移除(is_deleted=1，status 仍为 1)的群成员。
+func seedGroupMemberDeleted(t *testing.T, ctx *config.Context, groupNo, uid string, robot int) {
+	t.Helper()
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO `group_member` (group_no,uid,robot,status,is_deleted) VALUES (?,?,?,1,1)", groupNo, uid, robot).Exec()
+	require.NoError(t, err)
+}
+
 var msgSeq int64
 
 // insertMsgs 落 count 条消息。created_at 设为 NOW()-1天，远早于默认 lag(600s)，使其落在
@@ -773,4 +781,29 @@ func TestOpanalyticsSpaceNameLikeEscape(t *testing.T) {
 	assert.Equal(t, int64(1), resp.Count, "name=a_b 只应精确匹配 'a_b'，不应把 _ 当通配匹配到 'axb'")
 	require.Len(t, resp.List, 1)
 	assert.Equal(t, "s_underscore", resp.List[0].SpaceID)
+}
+
+// TestOpanalyticsGroupMemberDeleted 验收 P0：group_member 有 status 与 is_deleted 两个独立字段，
+// 已退群/被移除(is_deleted=1)的成员不得计入 dim_channel 成员数，也不得把群误判为 HA。
+func TestOpanalyticsGroupMemberDeleted(t *testing.T) {
+	ctx, _, etl := opaSetup(t)
+	seedScenario(t, ctx)
+	// g2(carol，HH 群)加一个已退群的 agent 成员：不得计入、不得使群变 HA。
+	seedUser(t, ctx, "u_leftbot", "LeftBot", "", 1)
+	seedGroupMemberDeleted(t, ctx, "g2", "u_leftbot", 1)
+	require.NoError(t, etl.RunIncremental())
+
+	var dim struct {
+		MemberCount int   `db:"member_count"`
+		Human       int   `db:"human_member_count"`
+		Agent       int   `db:"agent_member_count"`
+		ConvType    uint8 `db:"conv_type"`
+	}
+	_, err := ctx.DB().Select("member_count", "human_member_count", "agent_member_count", "conv_type").
+		From("octo_dim_channel").Where("channel_id='g2'").Load(&dim)
+	require.NoError(t, err)
+	assert.Equal(t, 1, dim.MemberCount, "已退群成员不计入 member_count")
+	assert.Equal(t, 1, dim.Human, "仅 carol")
+	assert.Equal(t, 0, dim.Agent, "已退群 agent 不计入")
+	assert.Equal(t, convTypeHHGroup, dim.ConvType, "已退群 agent 不得把群误判为 HA")
 }
