@@ -158,6 +158,10 @@ type spaceMemberTotals struct {
 	Agent int64
 }
 
+// queryMemberTotalsBySpace 表一每个 Space 的在册 human/agent 成员数。
+// 用 INNER JOIN dim_member(而非 LEFT JOIN+COALESCE)：孤儿 space_member(user 已删、dim 无行)
+// 不计入，与概览 Space 路径 countMembersByType 口径完全一致(同一"成员总数"两接口不打架)。
+// 一个 uid 在一个 space 至多一行，故 COUNT(*) 即去重数。
 func (d *opanalyticsDB) queryMemberTotalsBySpace() (map[string]spaceMemberTotals, error) {
 	var rows []struct {
 		SpaceID string `db:"space_id"`
@@ -168,8 +172,8 @@ func (d *opanalyticsDB) queryMemberTotalsBySpace() (map[string]spaceMemberTotals
 	_, err := d.session.SelectBySql(
 		"SELECT sm.space_id AS space_id, "+
 			"SUM(CASE WHEN m.member_type=2 THEN 1 ELSE 0 END) AS agent, COUNT(*) AS total "+
-			"FROM space_member sm LEFT JOIN octo_dim_member m ON m.uid = sm.uid "+
-			"WHERE sm.status=1 AND COALESCE(m.is_excluded,0)=0"+botClause+" GROUP BY sm.space_id",
+			"FROM space_member sm JOIN octo_dim_member m ON m.uid = sm.uid "+
+			"WHERE sm.status=1 AND m.is_excluded=0"+botClause+" GROUP BY sm.space_id",
 		botArgs...,
 	).Load(&rows)
 	if err != nil {

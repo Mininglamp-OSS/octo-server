@@ -656,3 +656,34 @@ func TestOpanalyticsDimFullRefresh(t *testing.T) {
 	require.NoError(t, etl.RunIncremental())
 	assert.Equal(t, int64(1), humanTotal(), "硬删除 alice 后 human 总数=1(仅 bob)")
 }
+
+// TestOpanalyticsMemberTotalsConsistency 验证概览(Space 路径)与表一的"成员总数"口径一致：
+// 孤儿 space_member(user 表无对应行)在两个接口都不计入(INNER JOIN，而非 LEFT JOIN 误当 human)。
+func TestOpanalyticsMemberTotalsConsistency(t *testing.T) {
+	ctx, route, etl := opaSetup(t)
+	seedScenario(t, ctx)
+	seedSpaceMember(t, ctx, "s1", "u_orphan") // user 表不存在的孤儿成员
+	require.NoError(t, etl.RunIncremental())
+
+	rng := "?start_date=" + statDay + "&end_date=" + statDay
+
+	var ov overviewResp
+	decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/overview"+rng+"&space_ids=s1"), &ov)
+
+	var spaces struct {
+		List []spaceListItem `json:"list"`
+	}
+	decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/spaces"+rng), &spaces)
+	var s1 *spaceListItem
+	for i := range spaces.List {
+		if spaces.List[i].SpaceID == "s1" {
+			s1 = &spaces.List[i]
+		}
+	}
+	require.NotNil(t, s1)
+
+	assert.Equal(t, int64(2), ov.HumanMemberTotal, "概览：孤儿 space_member 不计入")
+	assert.Equal(t, int64(2), s1.HumanMemberTotal, "表一：孤儿 space_member 不计入")
+	assert.Equal(t, ov.HumanMemberTotal, s1.HumanMemberTotal, "概览与表一 human 口径一致")
+	assert.Equal(t, ov.AgentTotal, s1.AgentTotal, "概览与表一 agent 口径一致")
+}
