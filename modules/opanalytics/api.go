@@ -13,7 +13,11 @@ import (
 // maxPageSize 管理端分页上限，防止超大页把全表拉出。
 const maxPageSize = 200
 
-// maxRangeDays 时间范围上限(约 1 年)。
+// maxPageIndex 页码上限：防止超大 page_index 让 (pageIndex-1)*pageSize 溢出成负 offset，
+// 进而在内存分页(spaceList)切片越界 panic / 在 SQL 路径传负 OFFSET。封顶后越界页返回空列表。
+const maxPageIndex = 1_000_000
+
+// maxRangeDays 时间范围上限(含两端约 1 年)。
 const maxRangeDays = 366
 
 // Manager 运营分析看板(管理端 superAdmin 跨 space 只读)。
@@ -193,7 +197,8 @@ func parseDateRange(c *wkhttp.Context) (string, string, bool) {
 	if start.After(end) {
 		return "", "", false
 	}
-	if end.Sub(start) > maxRangeDays*24*time.Hour {
+	// BETWEEN 闭区间：跨度 N 天 = N+1 个自然日。用 >= 使含两端的自然日数封顶为 maxRangeDays。
+	if end.Sub(start) >= maxRangeDays*24*time.Hour {
 		return "", "", false
 	}
 	return start.Format(layout), end.Format(layout), true
@@ -227,10 +232,14 @@ func normalizeActiveStatus(v string) string {
 	}
 }
 
-// clampPage 规范化页码/页大小并执行上限保护(入参直接适配 c.GetPage())。
+// clampPage 规范化页码/页大小并执行上下限保护(入参直接适配 c.GetPage())。
+// 同时封顶 pageIndex，避免 (pageIndex-1)*pageSize 溢出成负 offset 导致切片 panic / 负 OFFSET。
 func clampPage(pageIndex, pageSize int64) (int, int) {
 	if pageIndex <= 0 {
 		pageIndex = 1
+	}
+	if pageIndex > maxPageIndex {
+		pageIndex = maxPageIndex
 	}
 	if pageSize <= 0 {
 		pageSize = 20

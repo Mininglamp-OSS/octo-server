@@ -124,6 +124,10 @@ func (e *ETL) RunIncremental() error {
 //
 // 运维亦可等价地手工执行：TRUNCATE octo_fact_member_channel_daily / octo_fact_channel_daily /
 // octo_etl_message_cursor / octo_etl_dirty_day，下一次定时 RunIncremental 会自动全量回填。
+//
+// 注意：本方法**不持** scheduler 的 Redis ETL 锁。当前未接任何入口(仅供运维/测试直接调用)，
+// 故安全。将来若挂到 ops 端点，必须先获取同一把锁(并暂停 cron)，否则与定时跑并发会在清空游标
+// 与增量重算之间互相踩踏。
 func (e *ETL) Rebuild() error {
 	if err := e.db.truncateForRebuild(); err != nil {
 		return err

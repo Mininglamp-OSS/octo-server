@@ -807,3 +807,31 @@ func TestOpanalyticsGroupMemberDeleted(t *testing.T) {
 	assert.Equal(t, 0, dim.Agent, "已退群 agent 不计入")
 	assert.Equal(t, convTypeHHGroup, dim.ConvType, "已退群 agent 不得把群误判为 HA")
 }
+
+// TestOpanalyticsHugePageIndexNoPanic 验收 P2#1：超大 page_index 不得让分页 offset 溢出成负数
+// 进而内存切片越界 panic，应干净返回空列表(封顶 pageIndex)。
+func TestOpanalyticsHugePageIndexNoPanic(t *testing.T) {
+	ctx, route, etl := opaSetup(t)
+	seedScenario(t, ctx)
+	require.NoError(t, etl.RunIncremental())
+
+	rec := opaGet(t, route, "/v1/manager/dashboard/spaces?start_date="+statDay+"&end_date="+statDay+"&page_index=9000000000000000000")
+	require.Equal(t, http.StatusOK, rec.Code, "超大 page_index 必须干净返回而非 panic→500, body=%s", rec.Body.String())
+	var resp struct {
+		Count int64           `json:"count"`
+		List  []spaceListItem `json:"list"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Empty(t, resp.List, "越界页返回空列表")
+}
+
+// TestOpanalyticsDateRangeCap 验收 P2#5：含两端的自然日数封顶 366(BETWEEN 闭区间)。
+func TestOpanalyticsDateRangeCap(t *testing.T) {
+	_, route, _ := opaSetup(t)
+	// 含两端 366 天(跨度 365 天，2025 非闰年)→ 允许
+	ok := opaGet(t, route, "/v1/manager/dashboard/overview?start_date=2025-01-01&end_date=2026-01-01")
+	assert.Equal(t, http.StatusOK, ok.Code, "366 个自然日应允许, body=%s", ok.Body.String())
+	// 含两端 367 天(跨度 366 天)→ 拒绝
+	bad := opaGet(t, route, "/v1/manager/dashboard/overview?start_date=2025-01-01&end_date=2026-01-02")
+	assert.Equal(t, "err.server.opanalytics.request_invalid", errorCode(t, bad), "367 个自然日应拒绝")
+}

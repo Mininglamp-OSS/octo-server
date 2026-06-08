@@ -186,6 +186,11 @@ func (d *etlDB) loadDirtyDays() ([]string, error) {
 }
 
 // recomputeChannelDay 由 ③ 重算某统计日的 ④，并出队该脏日(单事务，对③最终一致)。
+//
+// 按 (stat_date, channel_id) GROUP BY，故每个(会话,日)恰好一行，④ 的 PK
+// (space_id,stat_date,channel_id) 不会因 space_id 漂移产生重复行。channel_type/space_id/conv_type
+// 取 MAX 是单值聚合——accumulateFact3 的 ON DUPLICATE KEY UPDATE 已把同一(会话,日)所有 ③ 行的
+// 这三个维度收敛到最新值，故 MAX = 该唯一值(非 DB 约束保证，改动写入侧收敛逻辑时需一并审此处)。
 func (d *etlDB) recomputeChannelDay(day string) error {
 	tx, err := d.session.Begin()
 	if err != nil {
