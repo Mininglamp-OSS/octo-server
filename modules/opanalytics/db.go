@@ -94,22 +94,34 @@ func (d *opanalyticsDB) overviewMsgAndGroups(start, end string, spaceIDs []strin
 }
 
 // overviewActiveMembers 范围内活跃 human/agent 成员去重数(可选 space 过滤)。
-// JOIN dim_member 且 is_excluded=0：活跃成员只算**当前在册**的人(剔除事后被禁用/删除/系统账号)，
-// 使"活跃成员 ⊆ 总成员"、活跃率 ≤100%。消息量(volume)仍按 event-time 保留，二者口径有意不同。
+//
+// 与总成数**同口径**，保证 active ⊆ total、率 ≤100%：
+//   - 按**当前** dim_member.member_type 拆 human/agent(不用 ③ 里冻结的 sender_type，否则成员
+//     由 human 转 agent 后会同时撑大 active_human 与 agent_total 而对不齐)。
+//   - is_excluded=0 剔除系统/测试/禁用账号。
+//   - 选中 Space 时再 JOIN space_member(status=1) 约束为该 Space 的**当前在册**成员
+//     (否则"在群里发过言后退出空间"的人会计活跃却不计总数)。
+//   - 消息量(volume)仍按 event-time 保留，与成员口径有意不同。
 func (d *opanalyticsDB) overviewActiveMembers(start, end string, spaceIDs []string) (human, agent int64, err error) {
 	var res struct {
 		ActiveHuman int64 `db:"active_human"`
 		ActiveAgent int64 `db:"active_agent"`
 	}
 	sql := "SELECT " +
-		"COUNT(DISTINCT CASE WHEN f.sender_type=1 THEN f.sender_uid END) AS active_human, " +
-		"COUNT(DISTINCT CASE WHEN f.sender_type=2 THEN f.sender_uid END) AS active_agent " +
-		"FROM octo_fact_member_channel_daily f JOIN octo_dim_member m ON m.uid = f.sender_uid " +
-		"WHERE f.stat_date BETWEEN ? AND ? AND m.is_excluded=0"
-	args := []interface{}{start, end}
+		"COUNT(DISTINCT CASE WHEN m.member_type=1 THEN f.sender_uid END) AS active_human, " +
+		"COUNT(DISTINCT CASE WHEN m.member_type=2 THEN f.sender_uid END) AS active_agent " +
+		"FROM octo_fact_member_channel_daily f JOIN octo_dim_member m ON m.uid = f.sender_uid"
+	var args []interface{}
 	if len(spaceIDs) > 0 {
-		clause, spaceArgs := inClause("f.space_id", spaceIDs)
-		sql += " AND " + clause
+		smClause, smArgs := inClause("sm.space_id", spaceIDs)
+		sql += " JOIN space_member sm ON sm.uid = f.sender_uid AND sm.status=1 AND " + smClause
+		args = append(args, smArgs...)
+	}
+	sql += " WHERE f.stat_date BETWEEN ? AND ? AND m.is_excluded=0"
+	args = append(args, start, end)
+	if len(spaceIDs) > 0 {
+		spaceClause, spaceArgs := inClause("f.space_id", spaceIDs)
+		sql += " AND " + spaceClause
 		args = append(args, spaceArgs...)
 	}
 	_, err = d.session.SelectBySql(sql, args...).Load(&res)
@@ -137,10 +149,16 @@ func (d *opanalyticsDB) querySpaceBase(nameLike string) ([]*spaceBaseRow, error)
 	var rows []*spaceBaseRow
 	stmt := d.session.Select("space_id", "name").From("space").Where("status=1")
 	if nameLike != "" {
-		stmt = stmt.Where("name LIKE ?", "%"+nameLike+"%")
+		// 转义 LIKE 通配符，'!' 作转义符：用户输入里的 % _ 当字面量匹配，不当通配(也避免病态全表扫)。
+		stmt = stmt.Where("name LIKE ? ESCAPE '!'", "%"+escapeLike(nameLike)+"%")
 	}
 	_, err := stmt.Load(&rows)
 	return rows, err
+}
+
+// escapeLike 转义 LIKE 模式中的通配符/转义符，配合 `ESCAPE '!'` 使用。
+func escapeLike(s string) string {
+	return strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(s)
 }
 
 func (d *opanalyticsDB) queryGroupCountBySpace() (map[string]int64, error) {
@@ -248,7 +266,10 @@ func (d *opanalyticsDB) queryChannelList(spaceID, start, end, activeStatus, sort
 	}
 	activeCond := channelActiveCond(activeStatus)
 
+	// INNER JOIN 活的 group 表(status=1)：硬删除的群(无 group 行)与已解散群(status≠1)不再展示。
+	// dim_channel 只 upsert 不删旧群行，故权威存在性/状态以 group 表为准。
 	base := "FROM octo_dim_channel c " +
+		"JOIN `group` g ON g.group_no = c.channel_id AND g.status=1 " +
 		"LEFT JOIN (SELECT channel_id, SUM(human_msg_count) AS hm, SUM(agent_msg_count) AS am " +
 		"FROM octo_fact_channel_daily WHERE stat_date BETWEEN ? AND ? AND space_id=? AND channel_type=2 " +
 		"GROUP BY channel_id) f ON f.channel_id=c.channel_id " +
@@ -299,9 +320,11 @@ func (d *opanalyticsDB) queryChannelList(spaceID, start, end, activeStatus, sort
 	return out, total, nil
 }
 
+// spaceExists 仅在 Space 存在**且 status=1** 时返回 true：与 /spaces 列表口径一致，
+// 软删除的 Space 视为不存在(表二返回 404，而非 200+数据)。
 func (d *opanalyticsDB) spaceExists(spaceID string) (bool, error) {
 	var n int64
-	_, err := d.session.Select("count(*)").From("space").Where("space_id=?", spaceID).Load(&n)
+	_, err := d.session.Select("count(*)").From("space").Where("space_id=? AND status=1", spaceID).Load(&n)
 	return n > 0, err
 }
 

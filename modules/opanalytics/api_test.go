@@ -435,6 +435,12 @@ func TestOpanalyticsEndpoints(t *testing.T) {
 	rec := opaGet(t, route, "/v1/manager/dashboard/spaces/nope/channels"+rng)
 	assert.Equal(t, "err.server.opanalytics.not_found", errorCode(t, rec))
 
+	// 软删除(status=0)的 space 视为不存在 → 404(与 /spaces 列表口径一致)
+	_, err := ctx.DB().Exec("INSERT INTO space (space_id,name,status) VALUES ('s_dead','Dead Space',0)")
+	require.NoError(t, err)
+	rec = opaGet(t, route, "/v1/manager/dashboard/spaces/s_dead/channels"+rng)
+	assert.Equal(t, "err.server.opanalytics.not_found", errorCode(t, rec), "软删除 space 应 404")
+
 	// ---- global direct chats ----
 	var direct struct {
 		Count int64            `json:"count"`
@@ -691,4 +697,80 @@ func TestOpanalyticsMemberTotalsConsistency(t *testing.T) {
 	assert.Equal(t, int64(2), s1.HumanMemberTotal, "表一：孤儿 space_member 不计入")
 	assert.Equal(t, ov.HumanMemberTotal, s1.HumanMemberTotal, "概览与表一 human 口径一致")
 	assert.Equal(t, ov.AgentTotal, s1.AgentTotal, "概览与表一 agent 口径一致")
+}
+
+// TestOpanalyticsActiveRatioOnConversion 验收 P1：成员 human↔agent 转换后，活跃成员按**当前**
+// 类型计，active_human ≤ human_total(率≤100%)。修复前活跃按 ③ 冻结的 sender_type 拆会撑爆比率。
+func TestOpanalyticsActiveRatioOnConversion(t *testing.T) {
+	ctx, route, etl := opaSetup(t)
+	seedScenario(t, ctx)
+	require.NoError(t, etl.RunIncremental())
+
+	overview := func() overviewResp {
+		var o overviewResp
+		decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/overview?start_date="+statDay+"&end_date="+statDay), &o)
+		return o
+	}
+	o := overview()
+	require.Equal(t, int64(3), o.HumanMemberTotal)
+	require.Equal(t, int64(3), o.ActiveHumanMembers)
+
+	// bob 以 human 发言后被转成 agent(robot 0→1)。
+	_, err := ctx.DB().Exec("UPDATE `user` SET robot=1 WHERE uid='u_bob'")
+	require.NoError(t, err)
+	require.NoError(t, etl.RunIncremental())
+
+	o = overview()
+	assert.Equal(t, int64(2), o.HumanMemberTotal, "human 总数=alice,carol")
+	assert.Equal(t, int64(2), o.AgentTotal, "agent 总数=u_agent,bob")
+	assert.Equal(t, int64(2), o.ActiveHumanMembers, "活跃 human 按当前类型=alice,carol(不含已转 agent 的 bob)")
+	assert.Equal(t, int64(2), o.ActiveAgentMembers, "活跃 agent=u_agent,bob")
+	assert.LessOrEqual(t, o.ActiveHumanMembers, o.HumanMemberTotal, "active_human ≤ human_total")
+	assert.LessOrEqual(t, o.ActiveAgentMembers, o.AgentTotal, "active_agent ≤ agent_total")
+}
+
+// TestOpanalyticsStaleGroupHidden 验收 P2：已解散(status=0)/硬删除的群不再出现在表二
+// (读侧 INNER JOIN 活的 group 表 status=1，dim_channel 只 upsert 不删的陈旧行被挡掉)。
+func TestOpanalyticsStaleGroupHidden(t *testing.T) {
+	ctx, route, etl := opaSetup(t)
+	seedScenario(t, ctx)
+	require.NoError(t, etl.RunIncremental())
+
+	channelsOf := func(spaceID string) int64 {
+		var resp struct {
+			Count int64 `json:"count"`
+		}
+		decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/spaces/"+spaceID+"/channels?start_date="+statDay+"&end_date="+statDay), &resp)
+		return resp.Count
+	}
+	require.Equal(t, int64(1), channelsOf("s1"), "初始 s1 有 g1")
+
+	// 解散 g1(group.status=0)：表二不再展示。
+	_, err := ctx.DB().Exec("UPDATE `group` SET status=0 WHERE group_no='g1'")
+	require.NoError(t, err)
+	require.NoError(t, etl.RunIncremental())
+	assert.Equal(t, int64(0), channelsOf("s1"), "解散群不再出现在表二")
+
+	// 硬删除 g1：仍不展示(dim_channel 残留行被 group JOIN 挡掉)。
+	_, err = ctx.DB().Exec("DELETE FROM `group` WHERE group_no='g1'")
+	require.NoError(t, err)
+	require.NoError(t, etl.RunIncremental())
+	assert.Equal(t, int64(0), channelsOf("s1"), "硬删除群不再出现在表二")
+}
+
+// TestOpanalyticsSpaceNameLikeEscape 验收 P2：表一 name 过滤把 % _ 当字面量(转义)而非通配符。
+func TestOpanalyticsSpaceNameLikeEscape(t *testing.T) {
+	ctx, route, etl := opaSetup(t)
+	seedSpace(t, ctx, "s_underscore", "a_b")
+	seedSpace(t, ctx, "s_literal", "axb")
+	require.NoError(t, etl.RunIncremental())
+
+	var resp struct {
+		Count int64           `json:"count"`
+		List  []spaceListItem `json:"list"`
+	}
+	decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/spaces?start_date="+statDay+"&end_date="+statDay+"&name=a_b"), &resp)
+	assert.Equal(t, int64(1), resp.Count, "name=a_b 只应精确匹配 'a_b'，不应把 _ 当通配匹配到 'axb'")
+	require.Len(t, resp.List, 1)
+	assert.Equal(t, "s_underscore", resp.List[0].SpaceID)
 }
