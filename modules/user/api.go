@@ -3838,32 +3838,36 @@ func (u *User) authVerifyToken(c *wkhttp.Context) {
 		OwnedBots: make([]ownedBot, 0),
 	}
 
-	// v3.3.4 N1 (Jerry-Xin P2): skip the legacy unbounded `OwnedBots` load
-	// on the high-frequency `?include=context` path. Callers asking for
-	// context only consume `owned_bots_by_space` (set by the block below);
-	// the old top-level `owned_bots` field is a pre-v3.1 BC shape that
-	// `?include=context` callers (octo-web #294, octo-matter, octo-fleet
-	// — verified by grep, none read `owned_bots` when `ContextIncluded=true`)
-	// don't read. Skipping the N+1 join (robot × user) is pure latency win
-	// on every verify-token call from the modern stack.
+	// Query owned bots: robot.creator_uid = uid
 	//
-	// Legacy callers (no `?include`) still get the old shape unchanged.
-	if c.Query("include") != "context" {
-		// Query owned bots: robot.creator_uid = uid
-		type botRow struct {
-			RobotID string `db:"robot_id"`
-			Name    string `db:"name"`
-		}
-		var bots []botRow
-		_, err := u.db.session.SelectBySql(
-			"SELECT r.robot_id, IFNULL(u.name,'') as name FROM robot r "+
-				"INNER JOIN `user` u ON r.robot_id = u.uid "+
-				"WHERE r.creator_uid = ? AND r.status = 1", resp.UID,
-		).Load(&bots)
-		if err == nil {
-			for _, b := range bots {
-				resp.OwnedBots = append(resp.OwnedBots, ownedBot{UID: b.RobotID, Name: b.Name})
-			}
+	// v3.3.5 — load OwnedBots UNCONDITIONALLY (revert v3.3.4 N1).
+	//
+	// v3.3.4 attempted to skip this load on the `?include=context` path
+	// as a "pure latency win" — assuming context callers only consume
+	// the new `owned_bots_by_space` map. That assumption was wrong:
+	// matter's `applyUserResult` (internal/auth/middleware.go) builds
+	// `related_uids` from top-level `OwnedBots` regardless of
+	// `ContextIncluded`, and `related_uids` feeds the matter-access gate
+	// (`canAccessMatter` → `isCreator`/`HasAccess` with `CallerUIDs IN ?`).
+	// Emptying OwnedBots on the context path fail-closed web user access
+	// to matters created by the user's own bots (yujiawei v3.3.4 P1).
+	//
+	// If we ever want to do this optimization, it must be a coordinated
+	// PR that first migrates matter's applyUserResult to read
+	// `OwnedBotsBySpace` (flatten map values). See plan §9.
+	type botRow struct {
+		RobotID string `db:"robot_id"`
+		Name    string `db:"name"`
+	}
+	var bots []botRow
+	_, err := u.db.session.SelectBySql(
+		"SELECT r.robot_id, IFNULL(u.name,'') as name FROM robot r "+
+			"INNER JOIN `user` u ON r.robot_id = u.uid "+
+			"WHERE r.creator_uid = ? AND r.status = 1", resp.UID,
+	).Load(&bots)
+	if err == nil {
+		for _, b := range bots {
+			resp.OwnedBots = append(resp.OwnedBots, ownedBot{UID: b.RobotID, Name: b.Name})
 		}
 	}
 

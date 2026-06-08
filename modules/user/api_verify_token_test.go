@@ -311,3 +311,68 @@ func TestAuthVerifyToken_WithInclude_DoesNotLeakForeignSpace(t *testing.T) {
 	assert.Contains(t, resp.OwnedBotsBySpace[testVerifyTokenSpaceA], "bot_shared",
 		"bot in caller's space should still appear")
 }
+
+// v3.3.5 regression — `?include=context` MUST still populate top-level
+// `OwnedBots`. matter's applyUserResult builds `related_uids` from
+// top-level `OwnedBots` regardless of `ContextIncluded`, and that feeds
+// the matter-access gate (canAccessMatter → isCreator/HasAccess with
+// CallerUIDs IN ?). v3.3.4 attempted to skip this load on the context
+// path as a "pure latency win" — yujiawei caught it as a fail-closed
+// regression that broke user access to matters created by their own
+// bots.
+//
+// **Note: this test is independent on purpose**, NOT a patch of
+// TestAuthVerifyToken_WithInclude_ReturnsSpacesAndOwnedBotsMap (line 85).
+// That test's resp struct does not declare an `OwnedBots` field, which
+// is exactly why v3.3.4 N1 silent-PASSed there. Patching the existing
+// test to add OwnedBots would change its assertion semantics; we add
+// an explicit regression test instead.
+func TestAuthVerifyToken_WithInclude_StillReturnsTopLevelOwnedBots(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	seedVerifyTokenFixtures(t, ctx)
+	insertBot(t, ctx, "bot_a_1", testutil.UID, testVerifyTokenSpaceA)
+	insertBot(t, ctx, "bot_b_1", testutil.UID, testVerifyTokenSpaceB)
+	// insertBot helper only writes robot + space_member; the OwnedBots
+	// SQL is `SELECT ... FROM robot r INNER JOIN user u ON r.robot_id=u.uid`,
+	// so we must also seed a user row per bot or the join returns empty
+	// (the historical reason existing tests didn't catch v3.3.4 N1 — they
+	// asserted only OwnedBotsBySpace, whose SQL doesn't INNER JOIN user).
+	for _, botUID := range []string{"bot_a_1", "bot_b_1"} {
+		_, err := ctx.DB().InsertInto("user").
+			Columns("uid", "name", "robot", "short_no").
+			Values(botUID, botUID+"_name", 1, botUID+"_sn").Exec()
+		require.NoError(t, err)
+	}
+
+	w := doVerifyToken(t, s, map[string]string{"token": testutil.Token}, true)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	var resp struct {
+		UID             string `json:"uid"`
+		ContextIncluded bool   `json:"context_included"`
+		OwnedBots       []struct {
+			UID  string `json:"uid"`
+			Name string `json:"name"`
+		} `json:"owned_bots"`
+		OwnedBotsBySpace map[string][]string `json:"owned_bots_by_space"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.True(t, resp.ContextIncluded, "context_included MUST be true on ?include=context")
+
+	// Top-level OwnedBots must be populated (the v3.3.4 N1 regression).
+	require.NotEmpty(t, resp.OwnedBots,
+		"v3.3.5 regression (yujiawei v3.3.4 P1): top-level owned_bots MUST be populated on ?include=context — matter applyUserResult reads it for related_uids")
+	gotBots := make(map[string]bool, len(resp.OwnedBots))
+	for _, b := range resp.OwnedBots {
+		gotBots[b.UID] = true
+	}
+	assert.True(t, gotBots["bot_a_1"], "bot_a_1 must appear in top-level OwnedBots")
+	assert.True(t, gotBots["bot_b_1"], "bot_b_1 must appear in top-level OwnedBots")
+
+	// Sanity: OwnedBotsBySpace is also populated (both fields valid on
+	// the context path).
+	require.NotNil(t, resp.OwnedBotsBySpace)
+	assert.Contains(t, resp.OwnedBotsBySpace, testVerifyTokenSpaceA)
+	assert.Contains(t, resp.OwnedBotsBySpace, testVerifyTokenSpaceB)
+}

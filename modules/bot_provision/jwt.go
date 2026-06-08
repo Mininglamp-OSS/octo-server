@@ -1,6 +1,7 @@
-// Module bootstrap for auth_jwt — name kept for git history continuity,
-// but JWT signing / verification / JWKS endpoints have been removed (合并
-// plan 决策一+二 Phase 4). What's left is:
+// Module bootstrap for bot_provision (package name kept for git history
+// continuity from the previous auth_jwt module). JWT signing /
+// verification / JWKS endpoints have been removed (plan 决策一+二 Phase 4).
+// What's left is:
 //
 //   - bot_api.go: mintBot (web session) + botToken (daemon api_key)
 //   - resolve.go: api_key → uid + space_id lookup with membership check

@@ -173,7 +173,7 @@ func (a *BotProvision) botToken(c *wkhttp.Context) {
 // generateBfToken produces a `bf_<32hex>` token matching IM /newbot style.
 func generateBfToken() (string, error) {
 	// Reuse the same RNG-derived hex format as runtime/bot.go's
-	// generateBotToken. Inlined here to keep auth_jwt self-contained
+	// generateBotToken. Inlined here to keep bot_provision self-contained
 	// and avoid importing the soon-to-be-deprecated runtime module.
 	b := make([]byte, 16)
 	if _, err := readRand(b); err != nil {
