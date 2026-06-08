@@ -153,7 +153,15 @@ func seedGroupMember(t *testing.T, ctx *config.Context, groupNo, uid string, rob
 
 var msgSeq int64
 
+// insertMsgs 落 count 条消息。created_at 设为 NOW()-1天，远早于默认 lag(600s)，使其落在
+// 稳定前缀内被 ETL 处理(与机器时钟无关)；message.timestamp(发送时间,用于日切分桶)仍取 ts。
 func insertMsgs(t *testing.T, ctx *config.Context, fromUID, channelID string, channelType uint8, ts int64, count, deleted int) {
+	t.Helper()
+	insertMsgsCreated(t, ctx, fromUID, channelID, channelType, ts, count, deleted, "DATE_SUB(NOW(), INTERVAL 1 DAY)")
+}
+
+// insertMsgsCreated 同 insertMsgs，但显式指定 created_at 的 SQL 表达式(测稳定性闸门用)。
+func insertMsgsCreated(t *testing.T, ctx *config.Context, fromUID, channelID string, channelType uint8, ts int64, count, deleted int, createdAtExpr string) {
 	t.Helper()
 	tbl := shardFor(ctx, channelID)
 	for i := 0; i < count; i++ {
@@ -163,7 +171,7 @@ func insertMsgs(t *testing.T, ctx *config.Context, fromUID, channelID string, ch
 			isDel = 1
 		}
 		_, err := ctx.DB().InsertBySql(
-			fmt.Sprintf("INSERT INTO `%s` (message_id,from_uid,channel_id,channel_type,`timestamp`,`signal`,is_deleted) VALUES (?,?,?,?,?,0,?)", tbl),
+			fmt.Sprintf("INSERT INTO `%s` (message_id,from_uid,channel_id,channel_type,`timestamp`,`signal`,is_deleted,created_at) VALUES (?,?,?,?,?,0,?,%s)", tbl, createdAtExpr),
 			fmt.Sprintf("m%d", msgSeq), fromUID, channelID, channelType, ts+int64(i), isDel).Exec()
 		require.NoError(t, err)
 	}
@@ -542,4 +550,52 @@ func fact4Human(t *testing.T, ctx *config.Context, channelID string) int {
 		Where("channel_id=? AND stat_date=?", channelID, statDay).Load(&n)
 	require.NoError(t, err)
 	return n
+}
+
+// TestOpanalyticsETLWatermarkLag 验收#1：稳定性闸门。created_at 在 lag 窗口内(未稳定)的消息
+// 本轮不处理、游标不越过；待其落库满 lag(此处用 UPDATE 模拟时间流逝)后下一轮被精确补齐，不漏不重。
+func TestOpanalyticsETLWatermarkLag(t *testing.T) {
+	ctx, _, etl := opaSetup(t)
+	seedScenario(t, ctx)
+	require.NoError(t, etl.RunIncremental())
+	require.Equal(t, 3, fact3Msg(t, ctx, "g1", "u_alice"), "稳定消息首轮入账")
+
+	// 新增 2 条"刚落库"(created_at=NOW())的未稳定消息：默认 lag=600s 内，本轮应被跳过。
+	start, _, err := dayWindowUnix(statDay)
+	require.NoError(t, err)
+	insertMsgsCreated(t, ctx, "u_alice", "g1", channelTypeGroup, start+9000, 2, 0, "NOW()")
+	require.NoError(t, etl.RunIncremental())
+	assert.Equal(t, 3, fact3Msg(t, ctx, "g1", "u_alice"), "未稳定(lag内)消息本轮必须不入账")
+
+	// 关键反例：游标不得越过未稳定行。把它们 created_at 拨老(模拟过了 lag)后，下一轮必须补上。
+	g1tbl := shardFor(ctx, "g1")
+	_, err = ctx.DB().Exec(fmt.Sprintf(
+		"UPDATE `%s` SET created_at=DATE_SUB(NOW(), INTERVAL 1 DAY) WHERE channel_id='g1' AND from_uid='u_alice' AND created_at >= DATE_SUB(NOW(), INTERVAL 60 SECOND)", g1tbl))
+	require.NoError(t, err)
+	require.NoError(t, etl.RunIncremental())
+	assert.Equal(t, 5, fact3Msg(t, ctx, "g1", "u_alice"), "稳定后必须精确补齐(3+2=5，不漏不重)")
+}
+
+// TestOpanalyticsETLRebuild 验收#2：口径回溯逃生门。把某成员事后改成 system 排除账号后，
+// 普通增量不回溯历史；Rebuild() 用当前维表全量重算，旧统计被清除。
+func TestOpanalyticsETLRebuild(t *testing.T) {
+	ctx, _, etl := opaSetup(t)
+	seedScenario(t, ctx)
+	require.NoError(t, etl.RunIncremental())
+	require.Equal(t, 2, fact3Msg(t, ctx, "g1", "u_bob"), "bob 初始入账 2")
+	require.Equal(t, 5, fact4Human(t, ctx, "g1"), "g1 human 初始 5")
+
+	// 事后把 bob 标记为 system 排除账号(口径漂移)。
+	_, err := ctx.DB().Exec("UPDATE `user` SET category='system' WHERE uid='u_bob'")
+	require.NoError(t, err)
+
+	// 普通增量不回溯：bob 旧统计仍在(event-time 语义)。
+	require.NoError(t, etl.RunIncremental())
+	assert.Equal(t, 2, fact3Msg(t, ctx, "g1", "u_bob"), "增量不回溯历史口径")
+	assert.Equal(t, 5, fact4Human(t, ctx, "g1"))
+
+	// Rebuild 用当前维表全量重算：bob 被排除，其历史统计清除。
+	require.NoError(t, etl.Rebuild())
+	assert.Equal(t, 0, fact3Msg(t, ctx, "g1", "u_bob"), "Rebuild 后被排除成员的历史行清除")
+	assert.Equal(t, 3, fact4Human(t, ctx, "g1"), "Rebuild 后 g1 human=3(alice 3，bob 被排除)")
 }

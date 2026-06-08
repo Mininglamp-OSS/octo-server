@@ -61,12 +61,14 @@ type groupMemberCountRow struct {
 
 // srcMessageRow 分片 message 表读出的单条消息(ETL 只取聚合所需列)。
 // ID 是分片表自增主键，用作增量抽取的 keyset 水位(message 表无 timestamp 索引)。
+// CreatedUnix 是落库时间(纪元秒)，用于稳定性滞后闸门(见 etlLagSeconds)。
 type srcMessageRow struct {
 	ID          int64
 	FromUID     string
 	ChannelID   string
 	ChannelType uint8
 	Timestamp   int64 // 发送时间(纪元秒)
+	CreatedUnix int64 // 落库时间(纪元秒, = UNIX_TIMESTAMP(created_at))
 }
 
 // ===== 读侧(接口)结果 / 响应 VO =====

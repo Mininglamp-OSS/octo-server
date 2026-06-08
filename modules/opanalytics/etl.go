@@ -29,14 +29,20 @@ const (
 
 // ETL 看板预聚合任务(增量水位，幂等)。
 //
-// 抽取模型(对应验收意见③)：不再按 timestamp 全表扫 message 分片(无该索引)，
-// 改为按主键 id keyset 分页流式增量读取，每条消息精确一次累加进 ③；首次运行
-// 从 id=0 自动全量回填，之后每次只读新增。
+// 抽取模型：不再按 timestamp 全表扫 message 分片(无该索引)，改为按主键 id keyset 分页
+// 流式增量读取，每条消息精确一次累加进 ③；首次运行从 id=0 自动全量回填，之后每次只读新增。
+// 稳定性闸门(created_at ≤ DB_NOW-lag)杜绝"低 id 晚提交被游标越过"的并发漏扫(见 etlLagSeconds)。
+//
+// 口径语义(事件处理时口径 / event-time semantics)：③/④ 是按消息处理当时的维表(成员类型、
+// 排除名单、群成员构成)累加的不可变事实。事后变更维表(如 user.category 改 system、系统 bot
+// 名单扩展、robot 更正、群成员增减)只影响**之后**处理的新消息，不回溯已写入的历史行。如需让
+// 维表变更追溯既往，调用 Rebuild() 安全重建(清事实+水位，下轮用当前维表全量重算)。
 type ETL struct {
 	log.Log
 	ctx   *config.Context
 	db    *etlDB
 	batch int
+	lag   int64
 }
 
 // NewETL 创建 ETL。
@@ -46,6 +52,7 @@ func NewETL(ctx *config.Context) *ETL {
 		ctx:   ctx,
 		db:    newETLDB(ctx),
 		batch: etlBatchSize(),
+		lag:   etlLagSeconds(),
 	}
 }
 
@@ -67,6 +74,11 @@ func (e *ETL) RunIncremental() error {
 	}
 
 	// 3. 逐分片增量抽取并累加 ③(每 chunk 一个事务，FOR UPDATE 串行化多实例)。
+	//    nowUnix 取自 DB，配合 lag 构成稳定性闸门，统一时基避免应用/DB 时钟偏差。
+	nowUnix, err := e.db.dbNowUnix()
+	if err != nil {
+		return err
+	}
 	excludedUID := func(uid string) bool { return spacepkg.IsSystemBot(uid) || excluded[uid] }
 	var totalRows int64
 	for _, table := range e.db.messageTables() {
@@ -74,7 +86,7 @@ func (e *ETL) RunIncremental() error {
 			return err
 		}
 		for {
-			n, cerr := e.db.runChunk(table, e.batch, func(rows []*srcMessageRow) *chunkResult {
+			n, cerr := e.db.runChunk(table, e.batch, nowUnix, e.lag, func(rows []*srcMessageRow) *chunkResult {
 				return aggregateChunk(rows, memberType, excludedUID, groupMeta)
 			})
 			if cerr != nil {
@@ -102,6 +114,22 @@ func (e *ETL) RunIncremental() error {
 		zap.Int64("messages_scanned", totalRows),
 		zap.Int("recomputed_days", len(days)))
 	return nil
+}
+
+// Rebuild 安全重建：清空事实表(③/④)、抽取水位与脏日队列，再用**当前**维表从 id=0 全量重算。
+//
+// 用途——口径回溯(event-time 语义的逃生门)：当成员类型/排除名单/群成员构成等维度发生历史性
+// 修正，需要让既往统计也按新口径重算时，运行此入口。注意这是一次性重读全部 message 历史的重操作，
+// 应在低峰由运维显式触发(非定时路径)。
+//
+// 运维亦可等价地手工执行：TRUNCATE octo_fact_member_channel_daily / octo_fact_channel_daily /
+// octo_etl_message_cursor / octo_etl_dirty_day，下一次定时 RunIncremental 会自动全量回填。
+func (e *ETL) Rebuild() error {
+	if err := e.db.truncateForRebuild(); err != nil {
+		return err
+	}
+	e.Info("opanalytics ETL rebuild: facts/cursor cleared, full recompute starting")
+	return e.RunIncremental()
 }
 
 // groupMetaInfo 群的归属与类型。

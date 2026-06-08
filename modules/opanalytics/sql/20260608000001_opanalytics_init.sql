@@ -84,6 +84,7 @@ CREATE TABLE `octo_fact_channel_daily` (
 -- ⑤ ETL 消息抽取水位：每个 message 分片表一行，记录已处理的最大主键 id。
 -- 增量抽取按 PK `WHERE id>last_id ORDER BY id LIMIT batch` keyset 分页，避免对无 timestamp 索引的
 -- message 分片做全表扫；chunk 内 `SELECT ... FOR UPDATE` 串行化多实例，保证消息精确一次累加。
+-- 水位只推进到"落库已超过 lag(稳定性滞后窗口)"的前缀，杜绝低 id 晚提交被游标越过的并发漏扫。
 CREATE TABLE `octo_etl_message_cursor` (
   `shard_table` VARCHAR(64) NOT NULL          COMMENT 'message 分片表名 (message / message1 / ...)',
   `last_id`     BIGINT      NOT NULL DEFAULT 0 COMMENT '已处理的最大 message.id 水位',

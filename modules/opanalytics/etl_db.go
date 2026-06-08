@@ -50,12 +50,23 @@ func (d *etlDB) ensureCursor(table string) error {
 	return err
 }
 
+// dbNowUnix 返回数据库当前时间(纪元秒)，作为稳定性闸门的统一时基(避免应用/DB 时钟偏差)。
+func (d *etlDB) dbNowUnix() (int64, error) {
+	var now int64
+	err := d.session.SelectBySql("SELECT UNIX_TIMESTAMP()").LoadOne(&now)
+	return now, err
+}
+
 // runChunk 处理某分片的一个抽取 chunk：单事务内 SELECT 水位 FOR UPDATE → keyset 读 batch 行
-// → aggregate(纯函数) → 累加 ③ / 维表 / 脏日 → 推进水位。返回本 chunk 读到的行数。
+// → 按稳定性闸门(created_at ≤ nowUnix-lagSeconds)截取无空洞稳定前缀 → aggregate(纯函数)
+// → 累加 ③ / 维表 / 脏日 → 推进水位到稳定前缀末尾。返回本 chunk 实际处理(已稳定)的行数。
 //
-// FOR UPDATE 锁住该分片水位行，串行化多实例(配合 Redis 锁双保险)；游标与 ③ 累加同事务
-// 提交，保证每条消息精确一次(失败回滚则下次重读，不重复计入)。
-func (d *etlDB) runChunk(table string, batch int, aggregate func([]*srcMessageRow) *chunkResult) (int64, error) {
+// 正确性：① FOR UPDATE 锁住该分片水位行，串行化多实例(配合 Redis 锁双保险)；② 游标与 ③
+// 累加同事务提交，保证每条消息精确一次(失败回滚则下次重读，不重复计入)；③ 稳定性闸门只推进
+// 到"落库已超过 lag、不可能再有更低 id 未提交"的前缀，杜绝"低 id 晚提交被游标越过"的漏扫。
+//
+// 返回行数 < batch 即视为本分片本轮处理完毕(要么读尽，要么触达未稳定尾部)，由调用方停止循环。
+func (d *etlDB) runChunk(table string, batch int, nowUnix, lagSeconds int64, aggregate func([]*srcMessageRow) *chunkResult) (int64, error) {
 	tx, err := d.session.Begin()
 	if err != nil {
 		return 0, err
@@ -70,7 +81,8 @@ func (d *etlDB) runChunk(table string, batch int, aggregate func([]*srcMessageRo
 
 	var rows []*srcMessageRow
 	if _, err = tx.SelectBySql(
-		fmt.Sprintf("SELECT id, from_uid, channel_id, channel_type, `timestamp` FROM `%s` WHERE id>? ORDER BY id ASC LIMIT ?", table),
+		fmt.Sprintf("SELECT id, from_uid, channel_id, channel_type, `timestamp`, UNIX_TIMESTAMP(created_at) AS created_unix "+
+			"FROM `%s` WHERE id>? ORDER BY id ASC LIMIT ?", table),
 		cursor, batch).Load(&rows); err != nil {
 		return 0, err
 	}
@@ -78,12 +90,27 @@ func (d *etlDB) runChunk(table string, batch int, aggregate func([]*srcMessageRo
 		return 0, tx.Commit()
 	}
 
-	res := aggregate(rows)
+	// 截取稳定前缀：created_at ≤ nowUnix-lag。id 与 created_at 近似同序，故首个未稳定行
+	// 之后(更高 id)均未稳定，截断即为无空洞前缀。
+	cutoff := nowUnix - lagSeconds
+	stable := rows
+	for i, r := range rows {
+		if r.CreatedUnix > cutoff {
+			stable = rows[:i]
+			break
+		}
+	}
+	if len(stable) == 0 {
+		// 队首即未稳定：本轮不前进，等其落库满 lag。返回 0 让调用方停止本分片。
+		return 0, tx.Commit()
+	}
+
+	res := aggregate(stable)
 	if err = d.writeChunk(tx, res); err != nil {
 		return 0, err
 	}
 
-	maxID := rows[len(rows)-1].ID
+	maxID := stable[len(stable)-1].ID
 	if _, err = tx.UpdateBySql(
 		"UPDATE octo_etl_message_cursor SET last_id=? WHERE shard_table=?", maxID, table).Exec(); err != nil {
 		return 0, err
@@ -91,7 +118,8 @@ func (d *etlDB) runChunk(table string, batch int, aggregate func([]*srcMessageRo
 	if err = tx.Commit(); err != nil {
 		return 0, err
 	}
-	return int64(len(rows)), nil
+	// 触达未稳定尾部(stable<rows)时返回 stable 长度(必 < batch)，使调用方停止本分片本轮。
+	return int64(len(stable)), nil
 }
 
 // writeChunk 在事务内落库一个 chunk 的聚合结果：③ 累加 + 私聊维表 + 活跃时间 + 脏日入队。
@@ -185,6 +213,22 @@ func (d *etlDB) recomputeChannelDay(day string) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// truncateForRebuild 清空事实表、抽取水位与脏日队列，使下一轮 RunIncremental 从 id=0 起
+// 用**当前**维表全量重算(口径漂移的安全重建入口)。维表由 refresh 阶段全量覆盖，无需清。
+func (d *etlDB) truncateForRebuild() error {
+	for _, tbl := range []string{
+		"octo_fact_member_channel_daily",
+		"octo_fact_channel_daily",
+		"octo_etl_message_cursor",
+		"octo_etl_dirty_day",
+	} {
+		if _, err := d.session.DeleteBySql("DELETE FROM " + tbl).Exec(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ===== 维表来源读取 =====

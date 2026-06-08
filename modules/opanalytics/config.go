@@ -24,6 +24,16 @@ const (
 	defaultETLBatch = 5000
 	minETLBatch     = 100
 	maxETLBatch     = 50000
+
+	// envETLLagSeconds 抽取稳定性滞后窗口(秒)。message.id 在 INSERT 时分配、COMMIT 时
+	// 才可见，而提交顺序≠id 顺序：低 id 的事务可能晚于高 id 提交。若严格按 id>cursor 推进，
+	// 会漏掉"已被游标越过、之后才提交"的低 id 行。对策：只处理 created_at ≤ DB_NOW-lag 的
+	// 已稳定前缀(id 与 created_at 同在 insert 时刻分配、近似同序，故稳定行构成无空洞前缀)，
+	// 游标只推进到该前缀末尾。要求 lag > 单条消息落库事务的最大时长(消息热路径写入近乎即时
+	// 提交，默认 10min 远超之)。设 0 关闭(仅测试/单实例可控场景)。
+	envETLLagSeconds     = "OCTO_OPANALYTICS_ETL_LAG_SECONDS"
+	defaultETLLagSeconds = 600
+	maxETLLagSeconds     = 86400
 )
 
 var (
@@ -72,6 +82,28 @@ func etlBatchSize() int {
 	}
 	if n > maxETLBatch {
 		return maxETLBatch
+	}
+	return n
+}
+
+// etlLagSeconds 返回抽取稳定性滞后窗口秒数(读 OCTO_OPANALYTICS_ETL_LAG_SECONDS，
+// 钳制到 [0,max])。解析失败回退默认值。
+func etlLagSeconds() int64 {
+	v := os.Getenv(envETLLagSeconds)
+	if v == "" {
+		return defaultETLLagSeconds
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		log.Warn("invalid OCTO_OPANALYTICS_ETL_LAG_SECONDS, using default",
+			zap.String("value", v), zap.Int64("default", defaultETLLagSeconds), zap.Error(err))
+		return defaultETLLagSeconds
+	}
+	if n < 0 {
+		return 0
+	}
+	if n > maxETLLagSeconds {
+		return maxETLLagSeconds
 	}
 	return n
 }
