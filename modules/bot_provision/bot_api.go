@@ -98,9 +98,16 @@ func (a *BotProvision) mintBot(c *wkhttp.Context) {
 // botToken validates a daemon api_key (uk_ Bearer) and returns the
 // bot_token iff the caller is the bot's creator.
 //
-// 合并 plan 决策一+二 Phase 4: 改用 api_key 直连 (不再 JWT exchange).
-// SQL 逻辑跟 /v1/auth/verify-api-key (modules/user/api.go) 同款 — 复用
-// auth_jwt.resolveAPIKey 现有的两步走 (api_key → uid+space_id → membership).
+// Endpoint: GET /v1/bot/:uid/token — bot owner uses api_key Bearer to
+// mint a bot session token. Gates (in order):
+//   - Authorization: Bearer uk_<key> (api_key path; resolveAPIKey
+//     returns callerUID + callerSpace from the verified key context).
+//   - bot row exists with status=1 (admin-disabled bots are invisible
+//     to this path; mirrors /v1/auth/verify-bot).
+//   - bot.creator_uid == callerUID (only the bot's creator can mint).
+//   - bot is a member of callerSpace via space_member (cross-space
+//     filter; prevents an api_key bound to SpaceB from minting a
+//     bot_token for a bot whose membership only exists in SpaceA).
 func (a *BotProvision) botToken(c *wkhttp.Context) {
 	auth := c.GetHeader("Authorization")
 	if !strings.HasPrefix(auth, "Bearer ") {

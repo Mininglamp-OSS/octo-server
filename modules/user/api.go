@@ -3838,20 +3838,32 @@ func (u *User) authVerifyToken(c *wkhttp.Context) {
 		OwnedBots: make([]ownedBot, 0),
 	}
 
-	// Query owned bots: robot.creator_uid = uid
-	type botRow struct {
-		RobotID string `db:"robot_id"`
-		Name    string `db:"name"`
-	}
-	var bots []botRow
-	_, err := u.db.session.SelectBySql(
-		"SELECT r.robot_id, IFNULL(u.name,'') as name FROM robot r "+
-			"INNER JOIN `user` u ON r.robot_id = u.uid "+
-			"WHERE r.creator_uid = ? AND r.status = 1", resp.UID,
-	).Load(&bots)
-	if err == nil {
-		for _, b := range bots {
-			resp.OwnedBots = append(resp.OwnedBots, ownedBot{UID: b.RobotID, Name: b.Name})
+	// v3.3.4 N1 (Jerry-Xin P2): skip the legacy unbounded `OwnedBots` load
+	// on the high-frequency `?include=context` path. Callers asking for
+	// context only consume `owned_bots_by_space` (set by the block below);
+	// the old top-level `owned_bots` field is a pre-v3.1 BC shape that
+	// `?include=context` callers (octo-web #294, octo-matter, octo-fleet
+	// — verified by grep, none read `owned_bots` when `ContextIncluded=true`)
+	// don't read. Skipping the N+1 join (robot × user) is pure latency win
+	// on every verify-token call from the modern stack.
+	//
+	// Legacy callers (no `?include`) still get the old shape unchanged.
+	if c.Query("include") != "context" {
+		// Query owned bots: robot.creator_uid = uid
+		type botRow struct {
+			RobotID string `db:"robot_id"`
+			Name    string `db:"name"`
+		}
+		var bots []botRow
+		_, err := u.db.session.SelectBySql(
+			"SELECT r.robot_id, IFNULL(u.name,'') as name FROM robot r "+
+				"INNER JOIN `user` u ON r.robot_id = u.uid "+
+				"WHERE r.creator_uid = ? AND r.status = 1", resp.UID,
+		).Load(&bots)
+		if err == nil {
+			for _, b := range bots {
+				resp.OwnedBots = append(resp.OwnedBots, ownedBot{UID: b.RobotID, Name: b.Name})
+			}
 		}
 	}
 
