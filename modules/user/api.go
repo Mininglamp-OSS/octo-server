@@ -517,6 +517,19 @@ func (u *User) UserAvatar(c *wkhttp.Context) {
 	if userInfo.IsUploadAvatar == 1 {
 		ph = userAvatarFilePath(uid, u.ctx.GetConfig().Avatar.Partition, userInfo.AvatarVersion)
 	} else {
+		if shouldUseBotDefaultAvatar(uid, userInfo) {
+			imageData, avatarErr := readBotDefaultAvatar(uid)
+			if avatarErr != nil {
+				u.Error("读取 Bot 默认头像失败", zap.Error(avatarErr), zap.String("uid", uid))
+			} else {
+				c.Header("Content-Type", "image/png")
+				c.Header("Content-Disposition", "inline; filename=avatar.png")
+				c.Header("Cache-Control", "public, max-age=86400")
+				c.Data(http.StatusOK, "image/png", imageData)
+				return
+			}
+		}
+
 		// 配置使用本地默认头像
 		if u.ctx.GetConfig().Avatar.Default != "" && strings.TrimSpace(u.ctx.GetConfig().Avatar.DefaultBaseURL) == "" {
 			// 读取配置的头像文件
