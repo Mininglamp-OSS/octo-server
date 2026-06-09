@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"sync"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
@@ -60,12 +61,7 @@ func (s *Scheduler) Start() error {
 
 // runOnce 单次触发：抢分布式锁，抢到才执行增量 ETL，结束释放锁。
 func (s *Scheduler) runOnce() {
-	token, err := randomToken()
-	if err != nil {
-		s.Error("opanalytics ETL: gen lock token failed", zap.Error(err))
-		return
-	}
-	acquired, err := s.lock.Acquire(token)
+	token, acquired, err := s.acquireRunLock()
 	if err != nil {
 		// Redis 故障:不强行执行(避免多实例同跑);等下一 tick。
 		s.Error("opanalytics ETL: acquire lock failed, skip this tick", zap.Error(err))
@@ -75,15 +71,76 @@ func (s *Scheduler) runOnce() {
 		s.Info("opanalytics ETL: lock held by another instance, skip")
 		return
 	}
+
+	s.runWithHeldLock(token, "scheduled", zap.String("cron", dailyCronExpr))
+}
+
+// TriggerManualRun 抢同一把 ETL 分布式锁，抢到后异步跑一轮增量 ETL。
+// 返回 (false,nil) 表示已有 cron 或手动任务在运行。
+func (s *Scheduler) TriggerManualRun() (bool, error) {
+	token, acquired, err := s.acquireRunLock()
+	if err != nil || !acquired {
+		return acquired, err
+	}
+
+	go s.runWithHeldLock(token, "manual")
+	return true, nil
+}
+
+func (s *Scheduler) acquireRunLock() (string, bool, error) {
+	token, err := randomToken()
+	if err != nil {
+		return "", false, err
+	}
+	acquired, err := s.lock.Acquire(token)
+	if err != nil {
+		return "", false, err
+	}
+	return token, acquired, nil
+}
+
+func (s *Scheduler) runWithHeldLock(token, source string, fields ...zap.Field) {
+	done := make(chan struct{})
+	go s.renewLockUntilDone(token, source, done)
 	defer func() {
+		close(done)
 		if rerr := s.lock.Release(token); rerr != nil {
 			s.Error("opanalytics ETL: release lock failed", zap.Error(rerr))
 		}
 	}()
 
-	s.Info("scheduled opanalytics ETL triggered", zap.String("cron", dailyCronExpr))
+	fields = append([]zap.Field{zap.String("source", source)}, fields...)
+	s.Info("opanalytics ETL triggered", fields...)
 	if err := s.etl.RunIncremental(); err != nil {
-		s.Error("scheduled opanalytics ETL failed", zap.Error(err))
+		s.Error("opanalytics ETL failed", append(fields, zap.Error(err))...)
+		return
+	}
+	s.Info("opanalytics ETL finished", fields...)
+}
+
+func (s *Scheduler) renewLockUntilDone(token, source string, done <-chan struct{}) {
+	interval := etlRunLockTTL / 3
+	if interval < time.Second {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			renewed, err := s.lock.Renew(token)
+			if err != nil {
+				s.Error("opanalytics ETL: renew lock failed", zap.String("source", source), zap.Error(err))
+				continue
+			}
+			if !renewed {
+				s.Error("opanalytics ETL: lock ownership lost, stop renewing", zap.String("source", source))
+				return
+			}
+		}
 	}
 }
 

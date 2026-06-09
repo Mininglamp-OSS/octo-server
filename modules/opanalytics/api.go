@@ -1,6 +1,7 @@
 package opanalytics
 
 import (
+	"net/http"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -57,6 +58,7 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 		auth.GET("/spaces", m.spaces)                           // 表一 Space 列表
 		auth.GET("/spaces/:space_id/channels", m.spaceChannels) // 表二 群组列表(仅群组)
 		auth.GET("/global/direct-chats", m.globalDirectChats)   // 全局私聊活跃列表
+		auth.POST("/etl/run", m.runETL)                         // 手动触发增量 ETL
 	}
 }
 
@@ -157,6 +159,32 @@ func (m *Manager) globalDirectChats(c *wkhttp.Context) {
 		return
 	}
 	c.Response(map[string]interface{}{"count": total, "list": list})
+}
+
+// runETL 手动触发一轮增量 ETL。首轮可能是长时间全历史回填，因此只接受任务并异步执行。
+func (m *Manager) runETL(c *wkhttp.Context) {
+	if !m.requireSuperAdmin(c) {
+		return
+	}
+
+	accepted, err := m.scheduler.TriggerManualRun()
+	if err != nil {
+		m.Error("manual opanalytics ETL trigger failed",
+			zap.String("uid", c.GetLoginUID()),
+			zap.Error(err))
+		respETLTriggerFailed(c)
+		return
+	}
+	if !accepted {
+		respETLAlreadyRunning(c)
+		return
+	}
+
+	m.Info("manual opanalytics ETL accepted", zap.String("uid", c.GetLoginUID()))
+	c.ResponseWithStatus(http.StatusAccepted, map[string]interface{}{
+		"status": http.StatusAccepted,
+		"state":  "accepted",
+	})
 }
 
 // ===== 参数解析 =====

@@ -486,6 +486,12 @@ other = "The binding session has expired or is invalid. Please start over."
 ["err.server.oidc.bind_verify_required"]
 other = "Please complete verification before confirming."
 
+["err.server.opanalytics.etl_already_running"]
+other = "Analytics ETL is already running."
+
+["err.server.opanalytics.etl_trigger_failed"]
+other = "Failed to trigger analytics ETL."
+
 ["err.server.opanalytics.forbidden"]
 other = "Only a super admin can access the analytics dashboard."
 

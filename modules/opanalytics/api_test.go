@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -35,6 +36,20 @@ func opaSetup(t *testing.T) (*config.Context, *wkhttp.WKHttp, *ETL) {
 	return ctx, route, NewETL(ctx)
 }
 
+func opaRouteOnlySetup(t *testing.T) (*config.Context, *wkhttp.WKHttp) {
+	t.Helper()
+	cfg := config.New()
+	cfg.Test = true
+	ctx := config.NewContext(cfg)
+	route := wkhttp.New()
+	route.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
+	ctx.SetHttpRoute(route)
+	setSuperAdminToken(t, ctx)
+	resetUIDRateLimit(t, ctx)
+	New(ctx).Route(route)
+	return ctx, route
+}
+
 // resetUIDRateLimit 清空 SharedUIDRateLimiter 的每-uid 令牌桶(ratelimit:uid:*)。该桶持久在
 // Redis、跨测试残留且不被 CleanAllTables 清，须在 setup 重置，否则同一 binary 内靠后的测试会 429。
 func resetUIDRateLimit(t *testing.T, ctx *config.Context) {
@@ -47,6 +62,7 @@ func resetUIDRateLimit(t *testing.T, ctx *config.Context) {
 	if keys, err := rds.Keys("ratelimit:uid:*").Result(); err == nil && len(keys) > 0 {
 		_ = rds.Del(keys...).Err()
 	}
+	_ = rds.Del(etlRunLockKey).Err()
 }
 
 func setSuperAdminToken(t *testing.T, ctx *config.Context) {
@@ -212,6 +228,15 @@ func opaGet(t *testing.T, route *wkhttp.WKHttp, path string) *httptest.ResponseR
 	return rec
 }
 
+func opaPost(t *testing.T, route *wkhttp.WKHttp, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, path, nil)
+	req.Header.Set("token", testutil.Token)
+	rec := httptest.NewRecorder()
+	route.ServeHTTP(rec, req)
+	return rec
+}
+
 func decodeOK(t *testing.T, rec *httptest.ResponseRecorder, out interface{}) {
 	t.Helper()
 	require.Equalf(t, http.StatusOK, rec.Code, "body=%s", rec.Body.String())
@@ -228,6 +253,18 @@ func errorCode(t *testing.T, rec *httptest.ResponseRecorder) string {
 	}
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &env))
 	return env.Error.Code
+}
+
+func waitForFact4Human(t *testing.T, ctx *config.Context, channelID string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := fact4Human(t, ctx, channelID); got == want {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	assert.Equal(t, want, fact4Human(t, ctx, channelID))
 }
 
 // ---- the scenario seed ----
@@ -465,6 +502,76 @@ func TestOpanalyticsEndpoints(t *testing.T) {
 	setPlainUserToken(t, ctx)
 	rec = opaGet(t, route, "/v1/manager/dashboard/overview"+rng)
 	assert.Equal(t, "err.server.opanalytics.forbidden", errorCode(t, rec))
+}
+
+func TestOpanalyticsManualETLRunEndpoint(t *testing.T) {
+	ctx, route, _ := opaSetup(t)
+	seedScenario(t, ctx)
+
+	rec := opaPost(t, route, "/v1/manager/dashboard/etl/run")
+	require.Equalf(t, http.StatusAccepted, rec.Code, "body=%s", rec.Body.String())
+	var accepted struct {
+		Status int    `json:"status"`
+		State  string `json:"state"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &accepted))
+	assert.Equal(t, http.StatusAccepted, accepted.Status)
+	assert.Equal(t, "accepted", accepted.State)
+
+	waitForFact4Human(t, ctx, "g1", 5)
+	assert.Equal(t, 3, fact3Msg(t, ctx, "g1", "u_alice"))
+}
+
+func TestOpanalyticsManualETLRunForbiddenAndAlreadyRunning(t *testing.T) {
+	ctx, route := opaRouteOnlySetup(t)
+
+	setPlainUserToken(t, ctx)
+	rec := opaPost(t, route, "/v1/manager/dashboard/etl/run")
+	assert.Equal(t, "err.server.opanalytics.forbidden", errorCode(t, rec))
+
+	setSuperAdminToken(t, ctx)
+	lock := newETLLock(ctx)
+	defer lock.Close()
+	token := "manual-etl-test-lock"
+	acquired, err := lock.Acquire(token)
+	require.NoError(t, err)
+	require.True(t, acquired)
+	defer func() { require.NoError(t, lock.Release(token)) }()
+
+	rec = opaPost(t, route, "/v1/manager/dashboard/etl/run")
+	assert.Equal(t, "err.server.opanalytics.etl_already_running", errorCode(t, rec))
+	acquired, err = lock.Acquire("second-token")
+	require.NoError(t, err)
+	assert.False(t, acquired, "already-running path must not drop or replace the held lock")
+}
+
+func TestETLLockRenewRequiresMatchingToken(t *testing.T) {
+	ctx, _ := opaRouteOnlySetup(t)
+	lock := newETLLock(ctx)
+	defer lock.Close()
+
+	token := "renew-token"
+	acquired, err := lock.Acquire(token)
+	require.NoError(t, err)
+	require.True(t, acquired)
+
+	renewed, err := lock.Renew(token)
+	require.NoError(t, err)
+	require.True(t, renewed)
+
+	renewed, err = lock.Renew("other-token")
+	require.NoError(t, err)
+	require.False(t, renewed)
+
+	acquired, err = lock.Acquire("second-token")
+	require.NoError(t, err)
+	require.False(t, acquired, "wrong-token renew must not drop the held lock")
+
+	require.NoError(t, lock.Release(token))
+	acquired, err = lock.Acquire("second-token")
+	require.NoError(t, err)
+	require.True(t, acquired)
+	require.NoError(t, lock.Release("second-token"))
 }
 
 // TestOpanalyticsETLExclusion 验收①：系统机器人(pkg/space.SystemBots，含 notification)与

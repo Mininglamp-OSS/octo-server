@@ -1084,3 +1084,9 @@ other = "Space 不存在。"
 
 ["err.server.opanalytics.query_failed"]
 other = "查询看板数据失败。"
+
+["err.server.opanalytics.etl_already_running"]
+other = "运营看板 ETL 正在运行，请稍后再试。"
+
+["err.server.opanalytics.etl_trigger_failed"]
+other = "触发运营看板 ETL 失败。"

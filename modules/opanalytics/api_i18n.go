@@ -30,3 +30,13 @@ func respNotFound(c *wkhttp.Context) {
 func respQueryFailed(c *wkhttp.Context) {
 	httperr.ResponseErrorL(c, errcode.ErrOpanalyticsQueryFailed, nil, nil)
 }
+
+// respETLAlreadyRunning 表示已有定时或手动 ETL 正在执行。
+func respETLAlreadyRunning(c *wkhttp.Context) {
+	httperr.ResponseErrorL(c, errcode.ErrOpanalyticsETLAlreadyRunning, nil, nil)
+}
+
+// respETLTriggerFailed 手动触发 ETL 失败 → 500(Internal，调用方须先记 zap 日志)。
+func respETLTriggerFailed(c *wkhttp.Context) {
+	httperr.ResponseErrorL(c, errcode.ErrOpanalyticsETLTriggerFailed, nil, nil)
+}

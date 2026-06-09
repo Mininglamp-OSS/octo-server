@@ -262,6 +262,30 @@ paths:
       security:
         - token: []
 
+  /manager/dashboard/etl/run:
+    post:
+      tags:
+        - "opanalyticsManager"
+      summary: "手动触发增量 ETL"
+      description: >
+        superAdmin 手动触发一轮运营看板增量 ETL。接口只负责抢占与每日调度相同的
+        Redis 锁并异步启动 RunIncremental；首轮全历史回填可能较长，成功时立即返回 202。
+        若 cron 或上一轮手动任务仍在运行，返回 already_running 错误，不会启动第二轮。
+      operationId: "m dashboard etl run"
+      produces:
+        - "application/json"
+      responses:
+        202:
+          description: "已接受，ETL 在后台异步执行"
+          schema:
+            $ref: "#/definitions/etlRunAcceptedResp"
+        400:
+          description: "错误（error.http_status 含真实状态码：403 越权 / 409 已在运行 / 500 触发失败）"
+          schema:
+            $ref: "#/definitions/dashboardError"
+      security:
+        - token: []
+
 securityDefinitions:
   token:
     type: "apiKey"
@@ -439,6 +463,18 @@ definitions:
         format: int64
         description: "最后活跃时间戳（纪元秒）"
 
+  etlRunAcceptedResp:
+    type: object
+    properties:
+      status:
+        type: integer
+        example: 202
+        description: "HTTP 202 Accepted"
+      state:
+        type: string
+        example: "accepted"
+        description: "已接受后台执行"
+
   dashboardError:
     type: object
     description: "i18n 错误信封。传输层 HTTP 状态恒为 400（D14 兼容），真实状态在 error.http_status。"
@@ -451,10 +487,10 @@ definitions:
         properties:
           code:
             type: string
-            description: "错误码，如 err.server.opanalytics.not_found / forbidden / request_invalid / query_failed"
+            description: "错误码，如 err.server.opanalytics.not_found / forbidden / request_invalid / query_failed / etl_already_running / etl_trigger_failed"
           http_status:
             type: integer
-            description: "真实 HTTP 语义状态码（403/404/400/500）"
+            description: "真实 HTTP 语义状态码（400/403/404/409/500）"
           message:
             type: string
             description: "本地化文案（5xx 内部错误隐藏）"

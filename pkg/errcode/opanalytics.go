@@ -32,4 +32,15 @@ var (
 		DefaultMessage: "Failed to query analytics data.",
 		Internal:       true,
 	})
+	ErrOpanalyticsETLAlreadyRunning = register(codes.Code{
+		ID:             "err.server.opanalytics.etl_already_running",
+		HTTPStatus:     http.StatusConflict,
+		DefaultMessage: "Analytics ETL is already running.",
+	})
+	ErrOpanalyticsETLTriggerFailed = register(codes.Code{
+		ID:             "err.server.opanalytics.etl_trigger_failed",
+		HTTPStatus:     http.StatusInternalServerError,
+		DefaultMessage: "Failed to trigger analytics ETL.",
+		Internal:       true,
+	})
 )

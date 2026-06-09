@@ -17,14 +17,23 @@ import (
 // 串行化，故即便锁因 TTL 过期出现短暂并发，消息仍精确一次累加。
 const etlRunLockKey = "opanalytics:etl:run"
 
-// etlRunLockTTL 锁租约。调度每日仅触发一次，TTL 只需覆盖各实例 01:30 同时触发的窗口；
-// 即使单轮(含首次全量回填)超过 TTL，当天也不会有第二个实例再次触发(各实例每 tick 只抢一次)。
+// etlRunLockTTL 锁租约。执行期间由 scheduler/手动触发路径定期续租，用于覆盖首次全量回填
+// 这类可能超过单个 TTL 的长任务；若进程崩溃，TTL 仍会自动释放锁。
 const etlRunLockTTL = 30 * time.Minute
 
 // luaReleaseETLLock CAS-DEL:仅当 token 匹配时才释放(规避 lease 边界误删后继 owner 锁)。
 var luaReleaseETLLock = rd.NewScript(`
 if redis.call("GET", KEYS[1]) == ARGV[1] then
   return redis.call("DEL", KEYS[1])
+else
+  return 0
+end
+`)
+
+// luaRenewETLLock 仅当 token 匹配当前 owner 时续租，避免误延长后继 owner 的锁。
+var luaRenewETLLock = rd.NewScript(`
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("PEXPIRE", KEYS[1], ARGV[2])
 else
   return 0
 end
@@ -61,6 +70,16 @@ func (l *etlLock) Release(token string) error {
 		return fmt.Errorf("opanalytics: etl lock release: %w", err)
 	}
 	return nil
+}
+
+// Renew 在当前 token 仍持有锁时延长租约。返回 false 表示锁已过期或 owner 已变化。
+func (l *etlLock) Renew(token string) (bool, error) {
+	res, err := luaRenewETLLock.Run(l.client, []string{etlRunLockKey}, token, etlRunLockTTL.Milliseconds()).Result()
+	if err != nil && !errors.Is(err, rd.Nil) {
+		return false, fmt.Errorf("opanalytics: etl lock renew: %w", err)
+	}
+	n, ok := res.(int64)
+	return ok && n == 1, nil
 }
 
 // Close 释放底层连接池。

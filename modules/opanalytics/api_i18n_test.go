@@ -78,6 +78,8 @@ func TestOpanalyticsRespondHelpers(t *testing.T) {
 		{"requestInvalid", func(c *wkhttp.Context) { respRequestInvalid(c, "date_range") }, http.StatusBadRequest, "err.server.opanalytics.request_invalid"},
 		{"notFound", respNotFound, http.StatusNotFound, "err.server.opanalytics.not_found"},
 		{"queryFailed", respQueryFailed, http.StatusInternalServerError, "err.server.opanalytics.query_failed"},
+		{"etlAlreadyRunning", respETLAlreadyRunning, http.StatusConflict, "err.server.opanalytics.etl_already_running"},
+		{"etlTriggerFailed", respETLTriggerFailed, http.StatusInternalServerError, "err.server.opanalytics.etl_trigger_failed"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
