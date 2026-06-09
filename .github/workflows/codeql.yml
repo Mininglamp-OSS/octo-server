@@ -1,8 +1,11 @@
 name: CodeQL
 
 on:
-  # Weekly deep scan only — CodeQL is the slow, cross-function security tier.
-  # Per-PR breadth is covered by each repo's own CI (golangci-lint/gosec, eslint).
+  # Weekly deep scan only — CodeQL is the slow, cross-function SAST tier.
+  # NOTE: no per-PR SAST remains after this change. Per-PR CI runs the repo's
+  # own lint + osv-scanner (dependency CVEs); CodeQL moves to a weekly deep scan
+  # + manual dispatch. Findings still land in the Security tab. Detection latency
+  # for new code-level vulnerabilities widens to up to ~7 days.
   schedule:
     - cron: "0 6 * * 1"   # Mondays 06:00 UTC
   workflow_dispatch:
