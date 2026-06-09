@@ -106,9 +106,9 @@ func TestGenerateBotToken_Uniqueness(t *testing.T) {
 
 func TestRandomHex(t *testing.T) {
 	tests := []struct {
-		name     string
-		n        int
-		wantLen  int
+		name    string
+		n       int
+		wantLen int
 	}{
 		{"1 byte", 1, 2},
 		{"4 bytes", 4, 8},
@@ -139,22 +139,16 @@ func TestGenerateSkillMD(t *testing.T) {
 
 	md := generateSkillMD(apiURL, wsURL)
 
-	// 应包含关键内容
+	// /v1/bot/skill.md is kept as a compatibility pointer only; the
+	// canonical Bot API skill lives in openclaw-channel-octo.
 	assert.Contains(t, md, "octo")
 	assert.Contains(t, md, apiURL)
-	assert.Contains(t, md, wsURL)
-	assert.Contains(t, md, "/v1/bot/register")
-	assert.Contains(t, md, "/v1/bot/sendMessage")
-	assert.Contains(t, md, "/v1/bot/events")
-	assert.Contains(t, md, "/v1/bot/heartbeat")
-	assert.Contains(t, md, "/v1/bot/typing")
-	assert.Contains(t, md, "Authorization: Bearer")
-
-	// Thread/子区相关文档必须存在
-	assert.Contains(t, md, "channel_type = 5", "skill.md must document thread channel_type")
-	assert.Contains(t, md, "group_no}____{short_id}", "skill.md must document thread channel_id format")
-	assert.Contains(t, md, "Do NOT split the channel_id", "skill.md must warn against splitting thread channel_id")
-	assert.Contains(t, md, "5 = Thread", "Reference section must list channel_type 5")
+	assert.Contains(t, md, "deprecated")
+	assert.Contains(t, md, "create-openclaw-octo install")
+	assert.Contains(t, md, "openclaw-channel-octo/blob/main/skills/octo-bot-api/SKILL.md")
+	assert.NotContains(t, md, "/v1/bot/file/upload")
+	assert.NotContains(t, md, "Upload a file (multipart/form-data, max 100MB)")
+	assert.NotContains(t, md, "channel_type = 5")
 }
 
 func TestDeriveWSURL(t *testing.T) {
