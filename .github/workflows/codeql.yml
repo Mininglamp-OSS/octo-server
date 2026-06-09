@@ -1,11 +1,12 @@
 name: CodeQL
 
 on:
-  # Weekly deep scan only — CodeQL is the slow, cross-function SAST tier.
-  # NOTE: no per-PR SAST remains after this change. Per-PR CI runs the repo's
-  # own lint + osv-scanner (dependency CVEs); CodeQL moves to a weekly deep scan
-  # + manual dispatch. Findings still land in the Security tab. Detection latency
-  # for new code-level vulnerabilities widens to up to ~7 days.
+  # Weekly deep scan only. CodeQL (cross-function SAST) is intentionally NOT run
+  # per-PR or per-push: this removes pre-merge and per-merge SAST entirely. The
+  # only remaining code-level SAST is this weekly scan + manual dispatch. Per-PR
+  # CI still runs osv-scanner (dependency CVEs) — that is SCA, not SAST. Detection
+  # latency for newly introduced code-level vulnerabilities is up to ~7 days;
+  # findings land in the Security tab.
   schedule:
     - cron: "0 6 * * 1"   # Mondays 06:00 UTC
   workflow_dispatch:
