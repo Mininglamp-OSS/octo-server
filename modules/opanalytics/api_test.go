@@ -309,6 +309,19 @@ func seedScenario(t *testing.T, ctx *config.Context) string {
 	return fc
 }
 
+func seedS1HumanGroup(t *testing.T, ctx *config.Context) {
+	t.Helper()
+	seedUser(t, ctx, "u_dave", "Dave", "dave@example.com", 0)
+	seedSpaceMember(t, ctx, "s1", "u_dave")
+	seedGroup(t, ctx, "g3", "Human Group", "s1")
+	seedGroupMember(t, ctx, "g3", "u_alice", 0)
+	seedGroupMember(t, ctx, "g3", "u_dave", 0)
+
+	start, _, err := dayWindowUnix(statDay)
+	require.NoError(t, err)
+	insertMsgs(t, ctx, "u_dave", "g3", channelTypeGroup, start+5400, 1, 0)
+}
+
 // ---- tests ----
 
 func TestOpanalyticsETLAndDB(t *testing.T) {
@@ -611,6 +624,127 @@ func TestOpanalyticsEndpoints(t *testing.T) {
 	// ---- 非 superAdmin → 403 ----
 	setPlainUserToken(t, ctx)
 	rec = opaGet(t, route, "/v1/manager/dashboard/overview"+rng)
+	assert.Equal(t, "err.server.opanalytics.forbidden", errorCode(t, rec))
+}
+
+func TestOpanalyticsChannelListP1Filters(t *testing.T) {
+	ctx, route, etl := opaSetup(t)
+	seedScenario(t, ctx)
+	seedS1HumanGroup(t, ctx)
+	require.NoError(t, etl.RunIncremental())
+
+	rng := "?start_date=" + statDay + "&end_date=" + statDay
+	channelsOf := func(query string) []channelListItem {
+		var resp struct {
+			Count int64             `json:"count"`
+			List  []channelListItem `json:"list"`
+		}
+		decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/spaces/s1/channels"+rng+query), &resp)
+		require.Equal(t, int64(len(resp.List)), resp.Count)
+		return resp.List
+	}
+
+	all := channelsOf("")
+	require.Len(t, all, 2)
+
+	hhOnly := channelsOf("&conv_types=1")
+	require.Len(t, hhOnly, 1)
+	assert.Equal(t, "g3", hhOnly[0].ChannelID)
+	assert.Equal(t, convTypeHHGroup, hhOnly[0].ConvType)
+
+	haOnly := channelsOf("&conv_types[]=2")
+	require.Len(t, haOnly, 1)
+	assert.Equal(t, "g1", haOnly[0].ChannelID)
+	assert.Equal(t, convTypeHAGroup, haOnly[0].ConvType)
+
+	agentMember := channelsOf("&member_keyword=AgentX")
+	require.Len(t, agentMember, 1)
+	assert.Equal(t, "g1", agentMember[0].ChannelID)
+
+	daveEmail := channelsOf("&member_keyword=dave%40example.com")
+	require.Len(t, daveEmail, 1)
+	assert.Equal(t, "g3", daveEmail[0].ChannelID)
+
+	rec := opaGet(t, route, "/v1/manager/dashboard/spaces/s1/channels"+rng+"&conv_types=bad")
+	assert.Equal(t, "err.server.opanalytics.request_invalid", errorCode(t, rec))
+
+	var direct struct {
+		Count int64            `json:"count"`
+		List  []directChatItem `json:"list"`
+	}
+	decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/global/direct-chats"+rng+"&member_keyword=alice%40example.com"), &direct)
+	assert.Equal(t, int64(1), direct.Count)
+	require.Len(t, direct.List, 1)
+	decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/global/direct-chats"+rng+"&member_keyword=AgentX"), &direct)
+	assert.Zero(t, direct.Count, "direct chat member_keyword only matches its two participants")
+	assert.Empty(t, direct.List)
+}
+
+func TestOpanalyticsChannelMembersEndpoint(t *testing.T) {
+	ctx, route, etl := opaSetup(t)
+	seedScenario(t, ctx)
+	require.NoError(t, etl.RunIncremental())
+
+	type memberItem struct {
+		MemberUID     string  `json:"member_uid"`
+		Name          string  `json:"name"`
+		Email         string  `json:"email"`
+		Phone         string  `json:"phone"`
+		Zone          string  `json:"zone"`
+		MemberType    uint8   `json:"member_type"`
+		TotalMsgCount int64   `json:"total_msg_count"`
+		Percentage    float64 `json:"percentage"`
+	}
+	type membersResp struct {
+		Count         int64        `json:"count"`
+		TotalMsgCount int64        `json:"total_msg_count"`
+		List          []memberItem `json:"list"`
+	}
+	getMembers := func(query string) membersResp {
+		var resp membersResp
+		decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/channels/g1/members?start_date="+statDay+"&end_date="+statDay+query), &resp)
+		return resp
+	}
+
+	resp := getMembers("")
+	assert.Equal(t, int64(3), resp.Count)
+	assert.Equal(t, int64(10), resp.TotalMsgCount)
+	require.Len(t, resp.List, 3)
+	assert.Equal(t, "u_agent", resp.List[0].MemberUID, "default sort is total_msg_count desc")
+	assert.Equal(t, int64(5), resp.List[0].TotalMsgCount)
+	assert.InEpsilon(t, 0.5, resp.List[0].Percentage, 0.0001)
+
+	byUID := make(map[string]memberItem, len(resp.List))
+	for _, item := range resp.List {
+		byUID[item.MemberUID] = item
+	}
+	assert.Equal(t, int64(3), byUID["u_alice"].TotalMsgCount)
+	assert.Equal(t, "alice@example.com", byUID["u_alice"].Email)
+	assert.InEpsilon(t, 0.3, byUID["u_alice"].Percentage, 0.0001)
+	assert.Equal(t, int64(2), byUID["u_bob"].TotalMsgCount)
+	assert.InEpsilon(t, 0.2, byUID["u_bob"].Percentage, 0.0001)
+
+	humans := getMembers("&member_types=human")
+	assert.Equal(t, int64(2), humans.Count)
+	require.Len(t, humans.List, 2)
+	for _, item := range humans.List {
+		assert.Equal(t, memberTypeHuman, item.MemberType)
+	}
+
+	alice := getMembers("&keyword=alice%40example.com")
+	assert.Equal(t, int64(1), alice.Count)
+	require.Len(t, alice.List, 1)
+	assert.Equal(t, "u_alice", alice.List[0].MemberUID)
+
+	asc := getMembers("&sort_by=percentage&order=asc")
+	require.Len(t, asc.List, 3)
+	assert.Equal(t, "u_bob", asc.List[0].MemberUID)
+
+	rec := opaGet(t, route, "/v1/manager/dashboard/channels/nope/members?start_date="+statDay+"&end_date="+statDay)
+	assert.Equal(t, "err.server.opanalytics.not_found", errorCode(t, rec))
+
+	setPlainUserToken(t, ctx)
+	rec = opaGet(t, route, "/v1/manager/dashboard/channels/g1/members?start_date="+statDay+"&end_date="+statDay)
 	assert.Equal(t, "err.server.opanalytics.forbidden", errorCode(t, rec))
 }
 
