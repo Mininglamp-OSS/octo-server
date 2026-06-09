@@ -205,7 +205,7 @@ func (m *Manager) channelMembers(c *wkhttp.Context) {
 	}
 	pageIndex, pageSize := clampPage(c.GetPage())
 	resp, err := m.service.channelMemberList(
-		channelID, start, end, memberTypes, c.Query("keyword"),
+		channelID, start, end, memberTypes, memberKeywordQuery(c),
 		c.Query("sort_by"), c.Query("order"), (pageIndex-1)*pageSize, pageSize)
 	if err != nil {
 		m.Error("channel member list query failed", zap.Error(err))
@@ -398,6 +398,13 @@ func queryListValues(c *wkhttp.Context, names []string) []string {
 		}
 	}
 	return out
+}
+
+func memberKeywordQuery(c *wkhttp.Context) string {
+	if keyword := strings.TrimSpace(c.Query("member_keyword")); keyword != "" {
+		return keyword
+	}
+	return c.Query("keyword")
 }
 
 // normalizeActiveStatus 收敛为 all/active/inactive。

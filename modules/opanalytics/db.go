@@ -517,7 +517,8 @@ func (d *opanalyticsDB) groupChannelExists(channelID string) (bool, error) {
 
 var channelMemberSortColumns = map[string]string{
 	"total_msg_count": "total_msg_count",
-	"percentage":      "total_msg_count",
+	// percentage sorts by the same expression because the denominator is fixed for a channel/date range.
+	"percentage": "total_msg_count",
 }
 
 func (d *opanalyticsDB) queryChannelMemberList(channelID, start, end string, memberTypes []uint8, keyword, sortBy, order string, offset, limit int) ([]*channelMemberListItem, int64, int64, error) {
@@ -561,9 +562,9 @@ func (d *opanalyticsDB) queryChannelMemberList(channelID, start, end string, mem
 		return []*channelMemberListItem{}, 0, totalMsg, nil
 	}
 
-	sel := "SELECT f.sender_uid AS member_uid, m.name, m.email, m.phone, m.zone, m.member_type, " +
+	sel := "SELECT f.sender_uid AS member_uid, m.name, m.email, m.member_type, " +
 		"SUM(f.msg_count) AS total_msg_count " + base +
-		fmt.Sprintf(" GROUP BY f.sender_uid, m.name, m.email, m.phone, m.zone, m.member_type ORDER BY %s %s, f.sender_uid ASC LIMIT ? OFFSET ?", sortExpr, dir)
+		fmt.Sprintf(" GROUP BY f.sender_uid, m.name, m.email, m.member_type ORDER BY %s %s, f.sender_uid ASC LIMIT ? OFFSET ?", sortExpr, dir)
 	listArgs := append(append([]interface{}{}, args...), limit, offset)
 
 	var rows []*channelMemberListItem

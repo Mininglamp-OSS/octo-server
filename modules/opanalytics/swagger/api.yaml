@@ -277,6 +277,7 @@ paths:
         指定正常群组的成员消息统计汇总视图。列表只包含所选时间范围内发过消息的成员；
         percentage = 该成员 total_msg_count / 本会话 total_msg_count，取值范围 0..1。
         成员类型按当前 octo_dim_member 口径；成员搜索仅匹配 name/email，手机号搜索属于 P2。
+        响应不返回 phone/zone，避免在运营分析接口新增手机号/区号暴露面。
       operationId: "m dashboard channel members"
       produces:
         - "application/json"
@@ -308,9 +309,14 @@ paths:
           description: "成员类型筛选；支持 human/agent 或 1/2，多值用 member_types=human&member_types=agent"
           required: false
         - in: "query"
-          name: "keyword"
+          name: "member_keyword"
           type: string
           description: "成员名称/邮箱模糊匹配（% _ 作字面量处理）；P1 不含手机号搜索"
+          required: false
+        - in: "query"
+          name: "keyword"
+          type: string
+          description: "兼容别名；新调用请使用 member_keyword"
           required: false
         - in: "query"
           name: "sort_by"
@@ -687,7 +693,7 @@ definitions:
       total_msg_count:
         type: integer
         format: int64
-        description: "该会话所选时间范围内总消息数（不受 member_types/keyword 筛选影响）"
+        description: "该会话所选时间范围内总消息数（不受 member_types/member_keyword 筛选影响）"
       list:
         type: array
         items:
@@ -701,11 +707,6 @@ definitions:
       name:
         type: string
       email:
-        type: string
-      phone:
-        type: string
-        description: "仅返回展示字段；P1 查询不按手机号筛选"
-      zone:
         type: string
       member_type:
         type: integer

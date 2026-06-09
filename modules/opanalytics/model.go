@@ -161,13 +161,11 @@ type channelMemberListResp struct {
 }
 
 type channelMemberListItem struct {
-	MemberUID     string  `json:"member_uid"`
-	Name          string  `json:"name"`
-	Email         string  `json:"email"`
-	Phone         string  `json:"phone"`
-	Zone          string  `json:"zone"`
-	MemberType    uint8   `json:"member_type"`
-	TotalMsgCount int64   `json:"total_msg_count"`
+	MemberUID     string  `db:"member_uid" json:"member_uid"`
+	Name          string  `db:"name" json:"name"`
+	Email         string  `db:"email" json:"email"`
+	MemberType    uint8   `db:"member_type" json:"member_type"`
+	TotalMsgCount int64   `db:"total_msg_count" json:"total_msg_count"`
 	Percentage    float64 `json:"percentage"`
 }
 
