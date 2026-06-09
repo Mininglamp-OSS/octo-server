@@ -1,0 +1,47 @@
+{{define "friend_bot_not_found"}}❌ 机器人不存在{{end}}
+
+{{define "friend_not_creator"}}❌ 你不是该机器人的创建者{{end}}
+
+{{define "friend_bot_not_in_space"}}❌ 该机器人不属于当前 Space{{end}}
+
+{{define "friend_apply_not_found"}}❌ 好友申请不存在或已过期{{end}}
+
+{{define "friend_add_failed"}}❌ 添加好友失败，请稍后重试。{{end}}
+
+{{define "friend_approved"}}✅ 已通过「{{.ApplyName}}」添加「{{.RobotID}}」的好友申请{{end}}
+
+{{define "friend_rejected"}}❌ 已拒绝「{{.ApplyName}}」添加「{{.RobotID}}」的好友申请{{end}}
+
+{{define "friend_query_failed"}}查询失败，请稍后重试。{{end}}
+
+{{define "friend_pending_empty"}}📋 没有待审批的好友申请{{end}}
+
+{{define "friend_no_pending_for_bot"}}「{{.RobotID}}」没有待审批的好友申请{{end}}
+
+{{define "friend_approve_usage"}}用法：/approve <用户ID> <机器人ID>
+或：/approve all <机器人ID>{{end}}
+
+{{define "friend_reject_usage"}}用法：/reject <用户ID> <机器人ID>
+或：/reject all <机器人ID>{{end}}
+
+{{define "friend_apply_notify"}}📨 **好友申请**
+
+用户「{{.ApplyName}}」(`{{.ApplyUID}}`) 申请添加你的机器人「**{{.RobotID}}**」为好友{{if .Remark}}
+备注：{{.Remark}}{{end}}
+
+/approve {{.ApplyUID}} {{.RobotID}}
+
+/reject {{.ApplyUID}} {{.RobotID}}{{end}}
+
+{{define "friend_pending_list"}}📋 **待审批好友申请**（{{.Count}} 条）：
+
+{{range .Items}}{{.Num}}. **{{.ApplyName}}** → {{.RobotID}} ({{.Ago}}){{if .Remark}}
+备注：{{.Remark}}{{end}}
+/approve {{.ApplyUID}} {{.RobotID}}
+
+{{end}}{{end}}
+
+{{define "friend_ago_just_now"}}刚刚{{end}}
+{{define "friend_ago_days"}}{{.N}}天前{{end}}
+{{define "friend_ago_hours"}}{{.N}}小时前{{end}}
+{{define "friend_ago_minutes"}}{{.N}}分钟前{{end}}

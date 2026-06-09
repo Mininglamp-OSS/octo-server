@@ -1,0 +1,47 @@
+{{define "friend_bot_not_found"}}❌ Bot not found{{end}}
+
+{{define "friend_not_creator"}}❌ You are not the creator of this bot{{end}}
+
+{{define "friend_bot_not_in_space"}}❌ This bot does not belong to the current Space{{end}}
+
+{{define "friend_apply_not_found"}}❌ The friend request does not exist or has expired{{end}}
+
+{{define "friend_add_failed"}}❌ Failed to add friend. Please try again later.{{end}}
+
+{{define "friend_approved"}}✅ Approved "{{.ApplyName}}"'s request to add "{{.RobotID}}"{{end}}
+
+{{define "friend_rejected"}}❌ Rejected "{{.ApplyName}}"'s request to add "{{.RobotID}}"{{end}}
+
+{{define "friend_query_failed"}}Lookup failed. Please try again later.{{end}}
+
+{{define "friend_pending_empty"}}📋 No pending friend requests{{end}}
+
+{{define "friend_no_pending_for_bot"}}"{{.RobotID}}" has no pending friend requests{{end}}
+
+{{define "friend_approve_usage"}}Usage: /approve <user ID> <bot ID>
+Or: /approve all <bot ID>{{end}}
+
+{{define "friend_reject_usage"}}Usage: /reject <user ID> <bot ID>
+Or: /reject all <bot ID>{{end}}
+
+{{define "friend_apply_notify"}}📨 **Friend request**
+
+User "{{.ApplyName}}" (`{{.ApplyUID}}`) wants to add your bot "**{{.RobotID}}**" as a friend{{if .Remark}}
+Note: {{.Remark}}{{end}}
+
+/approve {{.ApplyUID}} {{.RobotID}}
+
+/reject {{.ApplyUID}} {{.RobotID}}{{end}}
+
+{{define "friend_pending_list"}}📋 **Pending friend requests** ({{.Count}}):
+
+{{range .Items}}{{.Num}}. **{{.ApplyName}}** → {{.RobotID}} ({{.Ago}}){{if .Remark}}
+Note: {{.Remark}}{{end}}
+/approve {{.ApplyUID}} {{.RobotID}}
+
+{{end}}{{end}}
+
+{{define "friend_ago_just_now"}}just now{{end}}
+{{define "friend_ago_days"}}{{.N}} {{if eq .N 1}}day{{else}}days{{end}} ago{{end}}
+{{define "friend_ago_hours"}}{{.N}} {{if eq .N 1}}hour{{else}}hours{{end}} ago{{end}}
+{{define "friend_ago_minutes"}}{{.N}} {{if eq .N 1}}minute{{else}}minutes{{end}} ago{{end}}

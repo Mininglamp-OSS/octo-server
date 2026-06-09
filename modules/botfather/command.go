@@ -27,6 +27,7 @@ type commandHandler struct {
 	groupService  group.IService
 	appService    app.IService
 	apiKeyService UserAPIKeyService
+	langSvc       *user.LanguageService // resolves recipient language for replyL
 	log.Log
 }
 
@@ -39,6 +40,7 @@ func newCommandHandler(ctx *config.Context) *commandHandler {
 		groupService:  group.NewService(ctx),
 		appService:    app.NewService(ctx),
 		apiKeyService: NewUserAPIKeyService(ctx),
+		langSvc:       newBotLanguageService(ctx),
 		Log:           log.NewTLog("BotFather"),
 	}
 }
@@ -182,7 +184,7 @@ func (h *commandHandler) handleCommand(fromUID string, cmd string) {
 	case CmdHelp, CmdStart:
 		h.handleHelp(fromUID)
 	default:
-		h.reply(fromUID, "未知命令。发送 /help 查看可用命令。")
+		h.replyL(fromUID, MsgUnknownCommand, nil)
 	}
 }
 
@@ -207,7 +209,7 @@ func (h *commandHandler) handleStatefulInput(fromUID string, input string) {
 	case StateWaitingRevokeConfirm:
 		h.onRevokeConfirm(fromUID, input)
 	default:
-		h.reply(fromUID, "发送 /help 查看可用命令。")
+		h.replyL(fromUID, MsgSendHelpHint, nil)
 	}
 }
 
@@ -225,13 +227,13 @@ func (h *commandHandler) queryBotsForUser(fromUID string) ([]*robotModel, error)
 
 func (h *commandHandler) handleCancel(fromUID string) {
 	h.sm.Clear(fromUID, h.spaceID(fromUID))
-	h.reply(fromUID, "操作已取消。")
+	h.replyL(fromUID, MsgOperationCancelled, nil)
 }
 
 func (h *commandHandler) handleNewBot(fromUID string) {
 	h.sm.Clear(fromUID, h.spaceID(fromUID))
 	h.sm.SetState(fromUID, h.spaceID(fromUID), StateWaitingBotName, CmdNewBot)
-	h.reply(fromUID, "好的，请给你的机器人取一个名字：")
+	h.replyL(fromUID, MsgNewBotPrompt, nil)
 }
 
 func (h *commandHandler) handleMyBots(fromUID string) {
@@ -255,7 +257,7 @@ func (h *commandHandler) handleMyBots(fromUID string) {
 	}
 	if err != nil {
 		h.Error("查询机器人列表失败", zap.Error(err), zap.String("realUID", realUID))
-		h.reply(fromUID, "查询失败，请稍后重试。")
+		h.replyL(fromUID, MsgQueryFailedRetry, nil)
 		return
 	}
 	// Filter out any bots with status != 1 as a defensive measure
@@ -273,32 +275,30 @@ func (h *commandHandler) handleMyBots(fromUID string) {
 
 	if len(bots) == 0 {
 		h.Info("/mybots returned 0 results", zap.String("realUID", realUID))
-		h.reply(fromUID, "你还没有创建机器人。发送 /newbot 创建一个。")
+		h.replyL(fromUID, MsgNoBotsYet, nil)
 		return
 	}
 
-	var sb strings.Builder
-	sb.WriteString("**你的机器人列表：**\n\n")
+	items := make([]botListItem, 0, len(bots))
 	for i, bot := range bots {
-		display := h.formatBotDisplay(bot.RobotID)
-		desc := bot.Description
-		if desc == "" {
-			desc = "无描述"
-		}
-		sb.WriteString(fmt.Sprintf("%d. **%s**\n   %s\n\n", i+1, display, desc))
+		items = append(items, botListItem{
+			Num:     i + 1,
+			Display: h.formatBotDisplay(bot.RobotID),
+			Desc:    bot.Description, // empty → template's localized "no description"
+		})
 	}
-	h.reply(fromUID, sb.String())
+	h.replyL(fromUID, MsgMyBotsList, map[string]any{"Bots": items})
 }
 
 func (h *commandHandler) handleConnect(fromUID string) {
 	bots, err := h.queryBotsForUser(fromUID)
 	if err != nil {
 		h.Error("查询机器人列表失败", zap.Error(err))
-		h.reply(fromUID, "查询失败，请稍后重试。")
+		h.replyL(fromUID, MsgQueryFailedRetry, nil)
 		return
 	}
 	if len(bots) == 0 {
-		h.reply(fromUID, "你还没有创建机器人。发送 /newbot 创建一个。")
+		h.replyL(fromUID, MsgNoBotsYet, nil)
 		return
 	}
 	if len(bots) == 1 {
@@ -306,18 +306,18 @@ func (h *commandHandler) handleConnect(fromUID string) {
 		return
 	}
 	h.sm.SetState(fromUID, h.spaceID(fromUID), StateWaitingSelectBot, CmdConnect)
-	h.sendBotSelectionList(fromUID, bots, "请选择一个机器人获取连接 prompt：")
+	h.sendBotSelectionList(fromUID, bots, MsgSelectBotConnect)
 }
 
 func (h *commandHandler) handleDisconnect(fromUID string) {
 	bots, err := h.queryBotsForUser(fromUID)
 	if err != nil {
 		h.Error("查询机器人列表失败", zap.Error(err))
-		h.reply(fromUID, "查询失败，请稍后重试。")
+		h.replyL(fromUID, MsgQueryFailedRetry, nil)
 		return
 	}
 	if len(bots) == 0 {
-		h.reply(fromUID, "你还没有创建机器人。发送 /newbot 创建一个。")
+		h.replyL(fromUID, MsgNoBotsYet, nil)
 		return
 	}
 	if len(bots) == 1 {
@@ -325,85 +325,85 @@ func (h *commandHandler) handleDisconnect(fromUID string) {
 		return
 	}
 	h.sm.SetState(fromUID, h.spaceID(fromUID), StateWaitingSelectBot, CmdDisconnect)
-	h.sendBotSelectionList(fromUID, bots, "请选择要断开连接的机器人：")
+	h.sendBotSelectionList(fromUID, bots, MsgSelectBotDisconnect)
 }
 
 func (h *commandHandler) handleSetName(fromUID string) {
 	bots, err := h.queryBotsForUser(fromUID)
 	if err != nil || len(bots) == 0 {
-		h.reply(fromUID, "你还没有创建机器人。")
+		h.replyL(fromUID, MsgNoBotsShort, nil)
 		return
 	}
 	if len(bots) == 1 {
 		h.sm.SetState(fromUID, h.spaceID(fromUID), StateWaitingNewName, CmdSetName)
 		h.sm.SetField(fromUID, h.spaceID(fromUID), FieldBotID, bots[0].RobotID)
-		h.reply(fromUID, fmt.Sprintf("请输入 %s 的新名称：", h.formatBotDisplay(bots[0].RobotID)))
+		h.replyL(fromUID, MsgSetNamePrompt, map[string]any{"BotDisplay": h.formatBotDisplay(bots[0].RobotID)})
 		return
 	}
 	h.sm.SetState(fromUID, h.spaceID(fromUID), StateWaitingSelectBot, CmdSetName)
-	h.sendBotSelectionList(fromUID, bots, "请选择要改名的机器人：")
+	h.sendBotSelectionList(fromUID, bots, MsgSelectBotSetName)
 }
 
 func (h *commandHandler) handleSetDescription(fromUID string) {
 	bots, err := h.queryBotsForUser(fromUID)
 	if err != nil || len(bots) == 0 {
-		h.reply(fromUID, "你还没有创建机器人。")
+		h.replyL(fromUID, MsgNoBotsShort, nil)
 		return
 	}
 	if len(bots) == 1 {
 		h.sm.SetState(fromUID, h.spaceID(fromUID), StateWaitingDescription, CmdSetDescription)
 		h.sm.SetField(fromUID, h.spaceID(fromUID), FieldBotID, bots[0].RobotID)
-		h.reply(fromUID, fmt.Sprintf("请输入 %s 的新描述：", h.formatBotDisplay(bots[0].RobotID)))
+		h.replyL(fromUID, MsgSetDescPrompt, map[string]any{"BotDisplay": h.formatBotDisplay(bots[0].RobotID)})
 		return
 	}
 	h.sm.SetState(fromUID, h.spaceID(fromUID), StateWaitingSelectBot, CmdSetDescription)
-	h.sendBotSelectionList(fromUID, bots, "请选择要设置描述的机器人：")
+	h.sendBotSelectionList(fromUID, bots, MsgSelectBotSetDesc)
 }
 
 func (h *commandHandler) handleDeleteBot(fromUID string) {
 	bots, err := h.queryBotsForUser(fromUID)
 	if err != nil || len(bots) == 0 {
-		h.reply(fromUID, "你还没有创建机器人。")
+		h.replyL(fromUID, MsgNoBotsShort, nil)
 		return
 	}
 	if len(bots) == 1 {
 		h.sm.SetState(fromUID, h.spaceID(fromUID), StateWaitingDeleteConfirm, CmdDeleteBot)
 		h.sm.SetField(fromUID, h.spaceID(fromUID), FieldBotID, bots[0].RobotID)
-		h.reply(fromUID, fmt.Sprintf("确定要删除机器人 %s 吗？输入 \"Yes, delete it\" 确认：", h.formatBotDisplay(bots[0].RobotID)))
+		h.replyL(fromUID, MsgDeleteConfirm, map[string]any{"BotDisplay": h.formatBotDisplay(bots[0].RobotID)})
 		return
 	}
 	h.sm.SetState(fromUID, h.spaceID(fromUID), StateWaitingSelectBot, CmdDeleteBot)
-	h.sendBotSelectionList(fromUID, bots, "请选择要删除的机器人：")
+	h.sendBotSelectionList(fromUID, bots, MsgSelectBotDelete)
 }
 
 func (h *commandHandler) handleToken(fromUID string) {
 	bots, err := h.queryBotsForUser(fromUID)
 	if err != nil || len(bots) == 0 {
-		h.reply(fromUID, "你还没有创建机器人。")
+		h.replyL(fromUID, MsgNoBotsShort, nil)
 		return
 	}
 	if len(bots) == 1 {
-		h.reply(fromUID, fmt.Sprintf("机器人 **%s** 的 Token：\n\n`%s`\n\n请妥善保管，不要泄露。", h.formatBotDisplay(bots[0].RobotID), bots[0].BotToken))
+		h.replyL(fromUID, MsgTokenDisplay, map[string]any{"BotDisplay": h.formatBotDisplay(bots[0].RobotID), "Token": bots[0].BotToken})
 		return
 	}
 	h.sm.SetState(fromUID, h.spaceID(fromUID), StateWaitingSelectBot, CmdToken)
-	h.sendBotSelectionList(fromUID, bots, "请选择要查看 Token 的机器人：")
+	h.sendBotSelectionList(fromUID, bots, MsgSelectBotToken)
 }
 
 func (h *commandHandler) handleRevoke(fromUID string) {
 	bots, err := h.queryBotsForUser(fromUID)
 	if err != nil || len(bots) == 0 {
-		h.reply(fromUID, "你还没有创建机器人。")
+		h.replyL(fromUID, MsgNoBotsShort, nil)
 		return
 	}
 	if len(bots) == 1 {
 		h.sm.SetState(fromUID, h.spaceID(fromUID), StateWaitingRevokeConfirm, CmdRevoke)
 		h.sm.SetField(fromUID, h.spaceID(fromUID), FieldBotID, bots[0].RobotID)
-		h.reply(fromUID, fmt.Sprintf("确定要重置 %s 的 Token 吗？旧 Token 将立即失效。输入 \"Yes, revoke it\" 确认：", h.formatBotDisplay(bots[0].RobotID)))
+		h.replyL(fromUID, MsgRevokeConfirm, map[string]any{"BotDisplay": h.formatBotDisplay(bots[0].RobotID)})
 		return
 	}
 	h.sm.SetState(fromUID, h.spaceID(fromUID), StateWaitingSelectBot, CmdRevoke)
-	h.sendBotSelectionList(fromUID, bots, "请选择要重置 Token 的机器人：")
+	h.sendBotSelectionList(fromUID, bots, MsgSelectBotRevoke)
 }
 
 func (h *commandHandler) handleQuickstart(fromUID string) {
@@ -419,7 +419,7 @@ func (h *commandHandler) handleQuickstart(fromUID string) {
 	apiKey, err := h.apiKeyService.GetOrCreate(realUID, spaceID, clientIDBotFather)
 	if err != nil {
 		h.Error("获取User API Key失败", zap.Error(err))
-		h.reply(fromUID, "操作失败，请稍后重试。")
+		h.replyL(fromUID, MsgOperationFailedRetry, nil)
 		return
 	}
 
@@ -429,37 +429,17 @@ func (h *commandHandler) handleQuickstart(fromUID string) {
 		apiURL = fmt.Sprintf("http://%s:8090", cfg.External.IP)
 	}
 
-	h.reply(fromUID, fmt.Sprintf("🚀 **Quickstart**\n\n一键为你的所有 OpenClaw Agent 创建对应的 Octo bot 并完成绑定，让每个 Agent 都能通过 Octo 收发消息。\n\n📋 **把下述内容发给 OpenClaw 执行（未安装插件请先使用 /install）：**\n\n```\n为所有 agent 批量创建并绑定 Octo bot：\nnpx -y create-openclaw-octo quickstart --api-key %s --api-url %s\n```",
-		apiKey, apiURL))
+	h.replyL(fromUID, MsgQuickstart, map[string]any{"APIKey": apiKey, "APIURL": apiURL})
 }
 
 func (h *commandHandler) handleInstall(fromUID string) {
 	h.sm.Clear(fromUID, h.spaceID(fromUID))
-	h.reply(fromUID, "📦 **安装/更新 Octo 插件**\n\n💡 建议先将 OpenClaw 升级到最新版本以获得最佳体验。\n\n📋 **把下面命令发给 OpenClaw 执行：**\n\n```\nnpx -y create-openclaw-octo install\n```\n\n安装完成后，使用 /newbot 创建单个 bot 或 /quickstart 批量创建。")
+	h.replyL(fromUID, MsgInstall, nil)
 }
 
 func (h *commandHandler) handleHelp(fromUID string) {
 	h.sm.Clear(fromUID, h.spaceID(fromUID))
-	h.reply(fromUID, `BotFather 可以帮你创建和管理机器人。
-
-**可用命令：**
-
-- /install — 安装/更新 Octo 插件
-- /quickstart — AI Agent 快速入门（推荐）
-- /newbot — 创建新机器人
-- /mybots — 查看我的机器人
-- /connect — 获取连接 prompt
-- /disconnect — 断开 Agent 连接
-- /setname — 修改机器人名称
-- /setdescription — 修改机器人描述
-- /deletebot — 删除机器人
-- /token — 查看 Token
-- /revoke — 重置 Token
-- /pending — 查看待处理的好友申请
-- /approve — 通过好友申请
-- /reject — 拒绝好友申请
-- /cancel — 取消当前操作
-- /help — 显示帮助`)
+	h.replyL(fromUID, MsgHelp, nil)
 }
 
 // ========== 状态输入处理 ==========
@@ -467,14 +447,14 @@ func (h *commandHandler) handleHelp(fromUID string) {
 func (h *commandHandler) onBotNameInput(fromUID string, name string) {
 	name = strings.TrimSpace(name)
 	if len(name) == 0 || len(name) > 64 {
-		h.reply(fromUID, "名称长度需要在 1-64 个字符之间，请重新输入：")
+		h.replyL(fromUID, MsgNameLengthInvalid, nil)
 		return
 	}
 
 	botToken, err := h.generateUniqueBotToken()
 	if err != nil {
 		h.Error("生成Bot Token失败", zap.Error(err))
-		h.reply(fromUID, "创建失败，请稍后重试。")
+		h.replyL(fromUID, MsgCreateFailedRetry, nil)
 		h.sm.Clear(fromUID, h.spaceID(fromUID))
 		return
 	}
@@ -482,7 +462,7 @@ func (h *commandHandler) onBotNameInput(fromUID string, name string) {
 	err = h.createBot(extractRealUID(fromUID), fromUID, name, "", botToken)
 	if err != nil {
 		h.Error("创建机器人失败", zap.Error(err))
-		h.reply(fromUID, "创建失败，请稍后重试。")
+		h.replyL(fromUID, MsgCreateFailedRetry, nil)
 		h.sm.Clear(fromUID, h.spaceID(fromUID))
 		return
 	}
@@ -491,7 +471,7 @@ func (h *commandHandler) onBotNameInput(fromUID string, name string) {
 
 	bot, err := h.db.queryRobotByBotToken(botToken)
 	if err != nil || bot == nil {
-		h.reply(fromUID, fmt.Sprintf("机器人「%s」创建成功！但获取信息失败，请使用 /connect 获取连接信息。", name))
+		h.replyL(fromUID, MsgBotCreatedNoInfo, map[string]any{"Name": name})
 		return
 	}
 	h.sendCreatedPrompt(fromUID, name, bot)
@@ -503,7 +483,7 @@ func (h *commandHandler) onBotSelection(fromUID string, input string) {
 	// 查找机器人
 	bots, err := h.queryBotsForUser(fromUID)
 	if err != nil || len(bots) == 0 {
-		h.reply(fromUID, "查询失败，操作已取消。")
+		h.replyL(fromUID, MsgQueryFailedCancelled, nil)
 		h.sm.Clear(fromUID, h.spaceID(fromUID))
 		return
 	}
@@ -517,7 +497,7 @@ func (h *commandHandler) onBotSelection(fromUID string, input string) {
 		}
 	}
 	if selectedBot == nil {
-		h.reply(fromUID, "未找到该机器人，请输入序号或机器人ID：")
+		h.replyL(fromUID, MsgBotNotFoundRetry, nil)
 		return
 	}
 
@@ -533,35 +513,35 @@ func (h *commandHandler) onBotSelection(fromUID string, input string) {
 		h.disconnectBot(fromUID, selectedBot)
 	case CmdSetName:
 		h.sm.SetState(fromUID, h.spaceID(fromUID), StateWaitingNewName, CmdSetName)
-		h.reply(fromUID, fmt.Sprintf("请输入 %s 的新名称：", h.formatBotDisplay(selectedBot.RobotID)))
+		h.replyL(fromUID, MsgSetNamePrompt, map[string]any{"BotDisplay": h.formatBotDisplay(selectedBot.RobotID)})
 	case CmdSetDescription:
 		h.sm.SetState(fromUID, h.spaceID(fromUID), StateWaitingDescription, CmdSetDescription)
-		h.reply(fromUID, fmt.Sprintf("请输入 %s 的新描述：", h.formatBotDisplay(selectedBot.RobotID)))
+		h.replyL(fromUID, MsgSetDescPrompt, map[string]any{"BotDisplay": h.formatBotDisplay(selectedBot.RobotID)})
 	case CmdDeleteBot:
 		h.sm.SetState(fromUID, h.spaceID(fromUID), StateWaitingDeleteConfirm, CmdDeleteBot)
-		h.reply(fromUID, fmt.Sprintf("确定要删除 %s 吗？输入 \"Yes, delete it\" 确认：", h.formatBotDisplay(selectedBot.RobotID)))
+		h.replyL(fromUID, MsgDeleteConfirm, map[string]any{"BotDisplay": h.formatBotDisplay(selectedBot.RobotID)})
 	case CmdToken:
 		h.sm.Clear(fromUID, h.spaceID(fromUID))
-		h.reply(fromUID, fmt.Sprintf("机器人 **%s** 的 Token：\n\n`%s`\n\n请妥善保管，不要泄露。", h.formatBotDisplay(selectedBot.RobotID), selectedBot.BotToken))
+		h.replyL(fromUID, MsgTokenDisplay, map[string]any{"BotDisplay": h.formatBotDisplay(selectedBot.RobotID), "Token": selectedBot.BotToken})
 	case CmdRevoke:
 		h.sm.SetState(fromUID, h.spaceID(fromUID), StateWaitingRevokeConfirm, CmdRevoke)
-		h.reply(fromUID, fmt.Sprintf("确定要重置 %s 的 Token 吗？输入 \"Yes, revoke it\" 确认：", h.formatBotDisplay(selectedBot.RobotID)))
+		h.replyL(fromUID, MsgRevokeConfirm, map[string]any{"BotDisplay": h.formatBotDisplay(selectedBot.RobotID)})
 	default:
 		h.sm.Clear(fromUID, h.spaceID(fromUID))
-		h.reply(fromUID, "操作异常，已取消。")
+		h.replyL(fromUID, MsgOperationError, nil)
 	}
 }
 
 func (h *commandHandler) onNewNameInput(fromUID string, name string) {
 	name = strings.TrimSpace(name)
 	if len(name) == 0 || len(name) > 64 {
-		h.reply(fromUID, "名称长度需要在 1-64 个字符之间，请重新输入：")
+		h.replyL(fromUID, MsgNameLengthInvalid, nil)
 		return
 	}
 
 	botID, _ := h.sm.GetBotID(fromUID, h.spaceID(fromUID))
 	if botID == "" {
-		h.reply(fromUID, "操作异常，已取消。")
+		h.replyL(fromUID, MsgOperationError, nil)
 		h.sm.Clear(fromUID, h.spaceID(fromUID))
 		return
 	}
@@ -573,25 +553,25 @@ func (h *commandHandler) onNewNameInput(fromUID string, name string) {
 	})
 	if err != nil {
 		h.Error("更新机器人名称失败", zap.Error(err))
-		h.reply(fromUID, "更新失败，请稍后重试。")
+		h.replyL(fromUID, MsgUpdateFailedRetry, nil)
 		h.sm.Clear(fromUID, h.spaceID(fromUID))
 		return
 	}
 
 	h.sm.Clear(fromUID, h.spaceID(fromUID))
-	h.reply(fromUID, fmt.Sprintf("机器人名称已更新为：%s", name))
+	h.replyL(fromUID, MsgBotNameUpdated, map[string]any{"Name": name})
 }
 
 func (h *commandHandler) onDescriptionInput(fromUID string, desc string) {
 	desc = strings.TrimSpace(desc)
 	if len(desc) > 500 {
-		h.reply(fromUID, "描述不能超过 500 个字符，请重新输入：")
+		h.replyL(fromUID, MsgDescTooLong, nil)
 		return
 	}
 
 	botID, _ := h.sm.GetBotID(fromUID, h.spaceID(fromUID))
 	if botID == "" {
-		h.reply(fromUID, "操作异常，已取消。")
+		h.replyL(fromUID, MsgOperationError, nil)
 		h.sm.Clear(fromUID, h.spaceID(fromUID))
 		return
 	}
@@ -599,25 +579,25 @@ func (h *commandHandler) onDescriptionInput(fromUID string, desc string) {
 	err := h.db.updateRobotDescription(botID, desc)
 	if err != nil {
 		h.Error("更新描述失败", zap.Error(err))
-		h.reply(fromUID, "更新失败，请稍后重试。")
+		h.replyL(fromUID, MsgUpdateFailedRetry, nil)
 		h.sm.Clear(fromUID, h.spaceID(fromUID))
 		return
 	}
 
 	h.sm.Clear(fromUID, h.spaceID(fromUID))
-	h.reply(fromUID, "描述已更新。")
+	h.replyL(fromUID, MsgDescUpdated, nil)
 }
 
 func (h *commandHandler) onDeleteConfirm(fromUID string, input string) {
 	botID, _ := h.sm.GetBotID(fromUID, h.spaceID(fromUID))
 	if botID == "" {
-		h.reply(fromUID, "操作异常，已取消。")
+		h.replyL(fromUID, MsgOperationError, nil)
 		h.sm.Clear(fromUID, h.spaceID(fromUID))
 		return
 	}
 
 	if strings.TrimSpace(input) != "Yes, delete it" {
-		h.reply(fromUID, "删除已取消。")
+		h.replyL(fromUID, MsgDeleteCancelled, nil)
 		h.sm.Clear(fromUID, h.spaceID(fromUID))
 		return
 	}
@@ -711,7 +691,7 @@ func (h *commandHandler) onDeleteConfirm(fromUID string, input string) {
 	err = h.db.deleteRobot(botID)
 	if err != nil {
 		h.Error("删除机器人失败", zap.Error(err))
-		h.reply(fromUID, "删除失败，请稍后重试。")
+		h.replyL(fromUID, MsgDeleteFailedRetry, nil)
 		h.sm.Clear(fromUID, h.spaceID(fromUID))
 		return
 	}
@@ -727,19 +707,19 @@ func (h *commandHandler) onDeleteConfirm(fromUID string, input string) {
 	}
 
 	h.sm.Clear(fromUID, h.spaceID(fromUID))
-	h.reply(fromUID, fmt.Sprintf("机器人 %s 已删除。", botID))
+	h.replyL(fromUID, MsgBotDeleted, map[string]any{"BotID": botID})
 }
 
 func (h *commandHandler) onRevokeConfirm(fromUID string, input string) {
 	botID, _ := h.sm.GetBotID(fromUID, h.spaceID(fromUID))
 	if botID == "" {
-		h.reply(fromUID, "操作异常，已取消。")
+		h.replyL(fromUID, MsgOperationError, nil)
 		h.sm.Clear(fromUID, h.spaceID(fromUID))
 		return
 	}
 
 	if strings.TrimSpace(input) != "Yes, revoke it" {
-		h.reply(fromUID, "操作已取消。")
+		h.replyL(fromUID, MsgOperationCancelled, nil)
 		h.sm.Clear(fromUID, h.spaceID(fromUID))
 		return
 	}
@@ -747,14 +727,14 @@ func (h *commandHandler) onRevokeConfirm(fromUID string, input string) {
 	newToken, err := h.generateUniqueBotToken()
 	if err != nil {
 		h.Error("生成Bot Token失败", zap.Error(err))
-		h.reply(fromUID, "重置失败，请稍后重试。")
+		h.replyL(fromUID, MsgRevokeFailedRetry, nil)
 		h.sm.Clear(fromUID, h.spaceID(fromUID))
 		return
 	}
 	err = h.db.updateRobotBotToken(botID, newToken)
 	if err != nil {
 		h.Error("重置Token失败", zap.Error(err))
-		h.reply(fromUID, "重置失败，请稍后重试。")
+		h.replyL(fromUID, MsgRevokeFailedRetry, nil)
 		h.sm.Clear(fromUID, h.spaceID(fromUID))
 		return
 	}
@@ -783,7 +763,7 @@ func (h *commandHandler) onRevokeConfirm(fromUID string, input string) {
 	h.ctx.GetRedisConn().Del(eventKey)
 
 	h.sm.Clear(fromUID, h.spaceID(fromUID))
-	h.reply(fromUID, fmt.Sprintf("Token 已重置。新 Token：\n\n`%s`\n\n旧 Token 已失效，已连接的 Agent 已被踢下线。", newToken))
+	h.replyL(fromUID, MsgTokenRevoked, map[string]any{"Token": newToken})
 }
 
 // disconnectBot 断开机器人的 Agent 连接
@@ -798,7 +778,7 @@ func (h *commandHandler) disconnectBot(fromUID string, bot *robotModel) {
 	})
 	if err != nil {
 		h.Error("断开连接失败: 更新IM Token", zap.Error(err))
-		h.reply(fromUID, "断开连接失败，请稍后重试。")
+		h.replyL(fromUID, MsgDisconnectFailedRetry, nil)
 		return
 	}
 
@@ -813,7 +793,7 @@ func (h *commandHandler) disconnectBot(fromUID string, bot *robotModel) {
 	eventKey := fmt.Sprintf("robotEvent:%s", bot.RobotID)
 	h.ctx.GetRedisConn().Del(eventKey)
 
-	h.reply(fromUID, fmt.Sprintf("已断开机器人「%s」的连接。\n\n已连接的 Agent 会被踢下线，待处理的消息队列已清空。\n使用 /connect 可重新获取连接信息。", h.formatBotDisplay(bot.RobotID)))
+	h.replyL(fromUID, MsgBotDisconnected, map[string]any{"BotDisplay": h.formatBotDisplay(bot.RobotID)})
 }
 
 // ========== 辅助方法 ==========
@@ -922,14 +902,25 @@ func (h *commandHandler) reply(toUID string, content string) {
 	))
 }
 
-func (h *commandHandler) sendBotSelectionList(fromUID string, bots []*robotModel, prompt string) {
-	var sb strings.Builder
-	sb.WriteString(prompt + "\n\n")
-	for i, bot := range bots {
-		sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, h.formatBotDisplay(bot.RobotID)))
+func (h *commandHandler) sendBotSelectionList(fromUID string, bots []*robotModel, promptKey string) {
+	// Resolve language once, then render both the prompt header and the list in
+	// that language (replyL would re-resolve per call and split the two renders).
+	lang := recipientLanguage(h.langSvc, fromUID)
+	prompt, err := botMessages.Render(promptKey, lang, nil)
+	if err != nil {
+		h.Error("渲染机器人选择提示失败", zap.String("name", promptKey), zap.String("lang", lang), zap.Error(err))
+		return
 	}
-	sb.WriteString("\n请输入序号：")
-	h.reply(fromUID, sb.String())
+	items := make([]botListItem, 0, len(bots))
+	for i, bot := range bots {
+		items = append(items, botListItem{Num: i + 1, Display: h.formatBotDisplay(bot.RobotID)})
+	}
+	content, err := botMessages.Render(MsgBotSelectionList, lang, map[string]any{"Prompt": prompt, "Bots": items})
+	if err != nil {
+		h.Error("渲染机器人选择列表失败", zap.String("lang", lang), zap.Error(err))
+		return
+	}
+	h.reply(fromUID, content)
 }
 
 func (h *commandHandler) sendConnectPrompt(toUID string, bot *robotModel) {
@@ -939,22 +930,12 @@ func (h *commandHandler) sendConnectPrompt(toUID string, bot *robotModel) {
 		apiURL = fmt.Sprintf("http://%s:8090", cfg.External.IP)
 	}
 
-	displayName := h.getBotDisplayName(bot.RobotID)
-	prompt := fmt.Sprintf("📋 机器人「**%s**」的连接信息：\n\n"+
-		"**Bot Name:** %s  \n**Bot ID:** %s  \n**Bot Token:** %s  \n**API Server:** %s\n\n"+
-		"📋 **把下述内容发给 OpenClaw 执行，默认绑定到当前 Session 的 Agent（需先执行 /install 安装插件）：**\n\n"+
-		"```\n"+
-		"将 Octo bot %s 绑定到 Agent。\n"+
-		"默认绑定到当前 Session 的 Agent，agent 标识通过 /status 查看。\n"+
-		"如果用户指定了其他 Agent，使用用户指定的标识替换。\n\n"+
-		"npx -y create-openclaw-octo bind --bot-token %s --api-url %s --account-id %s --agent <agent标识>\n"+
-		"```\n\n"+
-		"💡 **如需绑定到其他 Agent，修改 `--agent` 参数即可。**\n"+
-		"🔌 断开连接请发送 /disconnect",
-		displayName, displayName, bot.RobotID, bot.BotToken, apiURL,
-		bot.RobotID, bot.BotToken, apiURL, bot.RobotID)
-
-	h.reply(toUID, prompt)
+	h.replyL(toUID, MsgConnectPrompt, map[string]any{
+		"DisplayName": h.getBotDisplayName(bot.RobotID),
+		"RobotID":     bot.RobotID,
+		"BotToken":    bot.BotToken,
+		"APIURL":      apiURL,
+	})
 }
 
 func (h *commandHandler) sendCreatedPrompt(toUID string, name string, bot *robotModel) {
@@ -964,20 +945,12 @@ func (h *commandHandler) sendCreatedPrompt(toUID string, name string, bot *robot
 		apiURL = fmt.Sprintf("http://%s:8090", cfg.External.IP)
 	}
 
-	msg := fmt.Sprintf("✅ 机器人「**%s**」创建成功！\n\n"+
-		"**Bot Name:** %s  \n**Bot ID:** %s  \n**Bot Token:** %s  \n**API Server:** %s\n\n"+
-		"📋 **把下述内容发给 OpenClaw 执行，默认绑定到当前 Session 的 Agent（未安装插件请先使用 /install）：**\n\n"+
-		"```\n"+
-		"将 Octo bot %s 绑定到 Agent。\n"+
-		"默认绑定到当前 Session 的 Agent，agent 标识通过 /status 查看。\n"+
-		"如果用户指定了其他 Agent，使用用户指定的标识替换。\n\n"+
-		"npx -y create-openclaw-octo bind --bot-token %s --api-url %s --account-id %s --agent <agent标识>\n"+
-		"```\n\n"+
-		"💡 **如需绑定到其他 Agent，修改 `--agent` 参数即可。**",
-		name, name, bot.RobotID, bot.BotToken, apiURL,
-		bot.RobotID, bot.BotToken, apiURL, bot.RobotID)
-
-	h.reply(toUID, msg)
+	h.replyL(toUID, MsgCreatedPrompt, map[string]any{
+		"Name":     name,
+		"RobotID":  bot.RobotID,
+		"BotToken": bot.BotToken,
+		"APIURL":   apiURL,
+	})
 }
 
 // generateBotID 生成全局唯一的 Bot 标识符

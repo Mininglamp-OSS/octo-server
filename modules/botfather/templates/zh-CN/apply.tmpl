@@ -1,0 +1,17 @@
+{{define "apply_auto_approved"}}已自动通过，可以开始聊天{{end}}
+
+{{define "apply_submitted"}}申请已提交，等待Owner审批{{end}}
+
+{{define "notify_owner_new_apply"}}有人申请使用你的AI
+用户: {{.ApplicantName}} ({{.ApplicantUID}})
+AI: {{.RobotUID}}{{if .Remark}}
+备注: {{.Remark}}{{end}}{{end}}
+
+{{define "notify_applicant_approved"}}你的AI使用申请已通过！
+AI: {{.RobotUID}}
+现在可以开始聊天了{{end}}
+
+{{define "notify_applicant_rejected"}}你的AI使用申请被拒绝
+AI: {{.RobotUID}}{{end}}
+
+{{define "friend_added_tip"}}我们已经是好友了，可以愉快的聊天了！{{end}}

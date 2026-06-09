@@ -1,0 +1,180 @@
+{{define "unknown_command"}}未知命令。发送 /help 查看可用命令。{{end}}
+
+{{define "send_help_hint"}}发送 /help 查看可用命令。{{end}}
+
+{{define "operation_cancelled"}}操作已取消。{{end}}
+
+{{define "operation_error"}}操作异常，已取消。{{end}}
+
+{{define "query_failed_retry"}}查询失败，请稍后重试。{{end}}
+
+{{define "query_failed_cancelled"}}查询失败，操作已取消。{{end}}
+
+{{define "operation_failed_retry"}}操作失败，请稍后重试。{{end}}
+
+{{define "no_bots_yet"}}你还没有创建机器人。发送 /newbot 创建一个。{{end}}
+
+{{define "no_bots_short"}}你还没有创建机器人。{{end}}
+
+{{define "name_length_invalid"}}名称长度需要在 1-64 个字符之间，请重新输入：{{end}}
+
+{{define "newbot_prompt"}}好的，请给你的机器人取一个名字：{{end}}
+
+{{define "create_failed_retry"}}创建失败，请稍后重试。{{end}}
+
+{{define "bot_created_no_info"}}机器人「{{.Name}}」创建成功！但获取信息失败，请使用 /connect 获取连接信息。{{end}}
+
+{{define "bot_not_found_retry"}}未找到该机器人，请输入序号或机器人ID：{{end}}
+
+{{define "set_name_prompt"}}请输入 {{.BotDisplay}} 的新名称：{{end}}
+
+{{define "set_desc_prompt"}}请输入 {{.BotDisplay}} 的新描述：{{end}}
+
+{{define "update_failed_retry"}}更新失败，请稍后重试。{{end}}
+
+{{define "bot_name_updated"}}机器人名称已更新为：{{.Name}}{{end}}
+
+{{define "desc_too_long"}}描述不能超过 500 个字符，请重新输入：{{end}}
+
+{{define "desc_updated"}}描述已更新。{{end}}
+
+{{define "delete_confirm"}}确定要删除机器人 {{.BotDisplay}} 吗？输入 "Yes, delete it" 确认：{{end}}
+
+{{define "delete_cancelled"}}删除已取消。{{end}}
+
+{{define "delete_failed_retry"}}删除失败，请稍后重试。{{end}}
+
+{{define "bot_deleted"}}机器人 {{.BotID}} 已删除。{{end}}
+
+{{define "token_display"}}机器人 **{{.BotDisplay}}** 的 Token：
+
+`{{.Token}}`
+
+请妥善保管，不要泄露。{{end}}
+
+{{define "revoke_confirm"}}确定要重置 {{.BotDisplay}} 的 Token 吗？旧 Token 将立即失效。输入 "Yes, revoke it" 确认：{{end}}
+
+{{define "revoke_failed_retry"}}重置失败，请稍后重试。{{end}}
+
+{{define "token_revoked"}}Token 已重置。新 Token：
+
+`{{.Token}}`
+
+旧 Token 已失效，已连接的 Agent 已被踢下线。{{end}}
+
+{{define "disconnect_failed_retry"}}断开连接失败，请稍后重试。{{end}}
+
+{{define "bot_disconnected"}}已断开机器人「{{.BotDisplay}}」的连接。
+
+已连接的 Agent 会被踢下线，待处理的消息队列已清空。
+使用 /connect 可重新获取连接信息。{{end}}
+
+{{define "select_bot_connect"}}请选择一个机器人获取连接 prompt：{{end}}
+
+{{define "select_bot_disconnect"}}请选择要断开连接的机器人：{{end}}
+
+{{define "select_bot_setname"}}请选择要改名的机器人：{{end}}
+
+{{define "select_bot_setdesc"}}请选择要设置描述的机器人：{{end}}
+
+{{define "select_bot_delete"}}请选择要删除的机器人：{{end}}
+
+{{define "select_bot_token"}}请选择要查看 Token 的机器人：{{end}}
+
+{{define "select_bot_revoke"}}请选择要重置 Token 的机器人：{{end}}
+
+{{define "bot_selection_list"}}{{.Prompt}}
+
+{{range .Bots}}{{.Num}}. {{.Display}}
+{{end}}
+请输入序号：{{end}}
+
+{{define "mybots_list"}}**你的机器人列表：**
+
+{{range .Bots}}{{.Num}}. **{{.Display}}**
+   {{if .Desc}}{{.Desc}}{{else}}无描述{{end}}
+
+{{end}}{{end}}
+
+{{define "quickstart"}}🚀 **Quickstart**
+
+一键为你的所有 OpenClaw Agent 创建对应的 Octo bot 并完成绑定，让每个 Agent 都能通过 Octo 收发消息。
+
+📋 **把下述内容发给 OpenClaw 执行（未安装插件请先使用 /install）：**
+
+```
+为所有 agent 批量创建并绑定 Octo bot：
+npx -y create-openclaw-octo quickstart --api-key {{.APIKey}} --api-url {{.APIURL}}
+```{{end}}
+
+{{define "install"}}📦 **安装/更新 Octo 插件**
+
+💡 建议先将 OpenClaw 升级到最新版本以获得最佳体验。
+
+📋 **把下面命令发给 OpenClaw 执行：**
+
+```
+npx -y create-openclaw-octo install
+```
+
+安装完成后，使用 /newbot 创建单个 bot 或 /quickstart 批量创建。{{end}}
+
+{{define "help"}}BotFather 可以帮你创建和管理机器人。
+
+**可用命令：**
+
+- /install — 安装/更新 Octo 插件
+- /quickstart — AI Agent 快速入门（推荐）
+- /newbot — 创建新机器人
+- /mybots — 查看我的机器人
+- /connect — 获取连接 prompt
+- /disconnect — 断开 Agent 连接
+- /setname — 修改机器人名称
+- /setdescription — 修改机器人描述
+- /deletebot — 删除机器人
+- /token — 查看 Token
+- /revoke — 重置 Token
+- /pending — 查看待处理的好友申请
+- /approve — 通过好友申请
+- /reject — 拒绝好友申请
+- /cancel — 取消当前操作
+- /help — 显示帮助{{end}}
+
+{{define "connect_prompt"}}📋 机器人「**{{.DisplayName}}**」的连接信息：
+
+**Bot Name:** {{.DisplayName}}  
+**Bot ID:** {{.RobotID}}  
+**Bot Token:** {{.BotToken}}  
+**API Server:** {{.APIURL}}
+
+📋 **把下述内容发给 OpenClaw 执行，默认绑定到当前 Session 的 Agent（需先执行 /install 安装插件）：**
+
+```
+将 Octo bot {{.RobotID}} 绑定到 Agent。
+默认绑定到当前 Session 的 Agent，agent 标识通过 /status 查看。
+如果用户指定了其他 Agent，使用用户指定的标识替换。
+
+npx -y create-openclaw-octo bind --bot-token {{.BotToken}} --api-url {{.APIURL}} --account-id {{.RobotID}} --agent <agent标识>
+```
+
+💡 **如需绑定到其他 Agent，修改 `--agent` 参数即可。**
+🔌 断开连接请发送 /disconnect{{end}}
+
+{{define "created_prompt"}}✅ 机器人「**{{.Name}}**」创建成功！
+
+**Bot Name:** {{.Name}}  
+**Bot ID:** {{.RobotID}}  
+**Bot Token:** {{.BotToken}}  
+**API Server:** {{.APIURL}}
+
+📋 **把下述内容发给 OpenClaw 执行，默认绑定到当前 Session 的 Agent（未安装插件请先使用 /install）：**
+
+```
+将 Octo bot {{.RobotID}} 绑定到 Agent。
+默认绑定到当前 Session 的 Agent，agent 标识通过 /status 查看。
+如果用户指定了其他 Agent，使用用户指定的标识替换。
+
+npx -y create-openclaw-octo bind --bot-token {{.BotToken}} --api-url {{.APIURL}} --account-id {{.RobotID}} --agent <agent标识>
+```
+
+💡 **如需绑定到其他 Agent，修改 `--agent` 参数即可。**{{end}}

@@ -20,19 +20,6 @@ var (
 	welcomeSentTTL = 7 * 24 * time.Hour
 )
 
-// DefaultWelcomeMessage is the default welcome message content
-const DefaultWelcomeMessage = `👋 **欢迎来到 Octo！**体验企业级的 Agent-Native 协作平台
-
-在 Octo，AI 不是工具，是你的同事：
-🤝 **AI 是一等公民** — 可管理、可审计、可信任的数字员工
-🔗 **你的 AI 属于你** — 跟着你走，为你工作
-
-我是 BotFather，帮你创建和管理 AI 机器人：
-· /newbot — 创建新机器人
-· /help — 查看所有命令
-
-💡 有想法或建议？进入 Bot 广场，添加「**Octo 产品管家**」反馈！`
-
 // handleUserRegisterEvent handles user registration event to send welcome message
 func (bf *BotFather) handleUserRegisterEvent(data []byte, commit config.EventCommit) {
 	// Parse event data
@@ -101,8 +88,15 @@ func (bf *BotFather) handleUserRegisterEvent(data []byte, commit config.EventCom
 // sendWelcomeMessage sends a welcome message from BotFather to the new user
 // Note: DM always uses bare UID as channelID (WuKongIM DM doesn't support Space prefix)
 func (bf *BotFather) sendWelcomeMessage(toUID string, spaceID string) error {
-	// Use default welcome message
-	welcomeContent := DefaultWelcomeMessage
+	// Localize per recipient. This runs from a lifecycle event (no request ctx),
+	// so language is resolved from the recipient's stored preference, falling
+	// back to OCTO_DEFAULT_LANGUAGE — see recipientLanguage.
+	lang := recipientLanguage(bf.cmdHandler.langSvc, toUID)
+	welcomeContent, err := botMessages.Render(MsgWelcome, lang, nil)
+	if err != nil {
+		bf.Error("渲染欢迎消息失败", zap.String("lang", lang), zap.String("uid", toUID), zap.Error(err))
+		return err
+	}
 
 	// DM must use bare UID — WuKongIM doesn't support Space-prefixed DM channel_id
 	channelID := toUID
@@ -113,7 +107,7 @@ func (bf *BotFather) sendWelcomeMessage(toUID string, spaceID string) error {
 		"content": welcomeContent,
 	}
 	// YUJ-674 / Mininglamp-OSS#37: PERSONAL DM via NewPersonalMsgSendReq builder.
-	_, err := bf.ctx.SendMessageWithResult(config.NewPersonalMsgSendReq(
+	_, err = bf.ctx.SendMessageWithResult(config.NewPersonalMsgSendReq(
 		channelID,
 		BotFatherUID,
 		payload,

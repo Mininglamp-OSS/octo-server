@@ -127,18 +127,18 @@ func (h *commandHandler) approveFriend(ownerUID string, applyUID string, robotID
 	// 1. 验证 bot 归属
 	bot, err := h.db.queryRobotByRobotID(robotID)
 	if err != nil || bot == nil {
-		h.reply(ownerUID, "❌ 机器人不存在")
+		h.replyL(ownerUID, MsgFriendBotNotFound, nil)
 		return
 	}
 	if bot.CreatorUID != ownerUID {
-		h.reply(ownerUID, "❌ 你不是该机器人的创建者")
+		h.replyL(ownerUID, MsgFriendNotCreator, nil)
 		return
 	}
 	// 1.5 Space 隔离校验：bot 必须属于当前 Space
 	if currentSpace := h.resolveSpaceID(ownerUID); currentSpace != "" {
 		inSpace, _ := h.db.isBotInSpace(robotID, currentSpace)
 		if !inSpace {
-			h.reply(ownerUID, "❌ 该机器人不属于当前 Space")
+			h.replyL(ownerUID, MsgFriendBotNotInSpace, nil)
 			return
 		}
 	}
@@ -146,7 +146,7 @@ func (h *commandHandler) approveFriend(ownerUID string, applyUID string, robotID
 	// 2. 检查申请是否存在
 	apply, err := h.GetBotFriendApply(robotID, applyUID)
 	if err != nil || apply == nil {
-		h.reply(ownerUID, "❌ 好友申请不存在或已过期")
+		h.replyL(ownerUID, MsgFriendApplyNotFound, nil)
 		return
 	}
 
@@ -157,7 +157,7 @@ func (h *commandHandler) approveFriend(ownerUID string, applyUID string, robotID
 	})
 	if err != nil {
 		h.Warn("添加好友关系(user->bot)失败", zap.Error(err))
-		h.reply(ownerUID, fmt.Sprintf("❌ 添加好友关系失败: %v", err))
+		h.replyL(ownerUID, MsgFriendAddFailed, nil)
 		return
 	}
 	err = h.userService.AddFriend(robotID, &user.FriendReq{
@@ -166,7 +166,7 @@ func (h *commandHandler) approveFriend(ownerUID string, applyUID string, robotID
 	})
 	if err != nil {
 		h.Warn("添加好友关系(bot->user)失败", zap.Error(err))
-		h.reply(ownerUID, fmt.Sprintf("❌ 添加好友关系失败: %v", err))
+		h.replyL(ownerUID, MsgFriendAddFailed, nil)
 		return
 	}
 
@@ -214,10 +214,15 @@ func (h *commandHandler) approveFriend(ownerUID string, applyUID string, robotID
 		_ = h.updateFriendApplyStatus(robotID, applyUID, 1) // 1=已通过
 	}
 
-	// 7. 通知双方
-	content := "我们已经是好友了，可以愉快的聊天了！"
-	if h.ctx.GetConfig().Friend.AddedTipsText != "" {
-		content = h.ctx.GetConfig().Friend.AddedTipsText
+	// 7. 通知双方：运营配置（Friend.AddedTipsText）优先，未配置时按收件人语言本地化
+	content := h.ctx.GetConfig().Friend.AddedTipsText
+	if content == "" {
+		lang := recipientLanguage(h.langSvc, applyUID)
+		if rendered, err := botMessages.Render(MsgFriendAddedTip, lang, nil); err != nil {
+			h.Error("渲染好友提示失败", zap.String("lang", lang), zap.Error(err))
+		} else {
+			content = rendered
+		}
 	}
 
 	// Send CMD to sync friend list on both clients
@@ -252,32 +257,32 @@ func (h *commandHandler) approveFriend(ownerUID string, applyUID string, robotID
 	_ = h.DeleteBotFriendApply(robotID, applyUID)
 
 	// 9. 回复 owner
-	h.reply(ownerUID, fmt.Sprintf("✅ 已通过「%s」添加「%s」的好友申请", apply.ApplyName, robotID))
+	h.replyL(ownerUID, MsgFriendApproved, map[string]any{"ApplyName": apply.ApplyName, "RobotID": robotID})
 }
 
 // rejectFriend 拒绝好友申请
 func (h *commandHandler) rejectFriend(ownerUID string, applyUID string, robotID string) {
 	bot, err := h.db.queryRobotByRobotID(robotID)
 	if err != nil || bot == nil {
-		h.reply(ownerUID, "❌ 机器人不存在")
+		h.replyL(ownerUID, MsgFriendBotNotFound, nil)
 		return
 	}
 	if bot.CreatorUID != ownerUID {
-		h.reply(ownerUID, "❌ 你不是该机器人的创建者")
+		h.replyL(ownerUID, MsgFriendNotCreator, nil)
 		return
 	}
 	// Space 隔离校验：bot 必须属于当前 Space
 	if currentSpace := h.resolveSpaceID(ownerUID); currentSpace != "" {
 		inSpace, _ := h.db.isBotInSpace(robotID, currentSpace)
 		if !inSpace {
-			h.reply(ownerUID, "❌ 该机器人不属于当前 Space")
+			h.replyL(ownerUID, MsgFriendBotNotInSpace, nil)
 			return
 		}
 	}
 
 	apply, err := h.GetBotFriendApply(robotID, applyUID)
 	if err != nil || apply == nil {
-		h.reply(ownerUID, "❌ 好友申请不存在或已过期")
+		h.replyL(ownerUID, MsgFriendApplyNotFound, nil)
 		return
 	}
 
@@ -287,7 +292,7 @@ func (h *commandHandler) rejectFriend(ownerUID string, applyUID string, robotID 
 	// 清理
 	_ = h.DeleteBotFriendApply(robotID, applyUID)
 
-	h.reply(ownerUID, fmt.Sprintf("❌ 已拒绝「%s」添加「%s」的好友申请", apply.ApplyName, robotID))
+	h.replyL(ownerUID, MsgFriendRejected, map[string]any{"ApplyName": apply.ApplyName, "RobotID": robotID})
 }
 
 // queryFriendApplyRecord 查询好友申请记录
@@ -346,66 +351,83 @@ func notifyOwnerFriendApply(ctx *config.Context, applyUID, applyName, robotID, r
 		return
 	}
 
-	// 通知 owner
-	remarkText := ""
-	if remark != "" {
-		remarkText = fmt.Sprintf("\n备注：%s", remark)
-	}
-
-	msg := fmt.Sprintf("📨 **好友申请**\n\n用户「%s」(`%s`) 申请添加你的机器人「**%s**」为好友%s\n\n/approve %s %s\n\n/reject %s %s",
-		applyName, applyUID, robotID, remarkText,
-		applyUID, robotID,
-		applyUID, robotID,
-	)
-
-	// 设置 Space 上下文后调用 reply，确保通知发送到正确的 Space
+	// 设置 Space 上下文后调用 replyL，确保通知发送到正确的 Space
 	// 此函数从 hook 回调调用（非消息处理链），sync.Map 中无 owner 的 Space 信息
 	if spaceID != "" {
 		cleanup := setSpaceIDFromPayload(bot.CreatorUID, spaceID)
 		defer cleanup()
 	}
-	handler.reply(bot.CreatorUID, msg)
+	// Remark 直接传入；模板在非空时渲染本地化的「备注」行
+	handler.replyL(bot.CreatorUID, MsgFriendApplyNotify, map[string]any{
+		"ApplyName": applyName,
+		"ApplyUID":  applyUID,
+		"RobotID":   robotID,
+		"Remark":    remark,
+	})
 }
 
 // handlePending 处理 /pending 命令
 func (h *commandHandler) handlePending(fromUID string) {
 	applies, err := h.GetAllPendingAppliesForOwner(fromUID)
 	if err != nil {
-		h.reply(fromUID, "查询失败，请稍后重试。")
+		h.replyL(fromUID, MsgFriendQueryFailed, nil)
 		return
 	}
 	if len(applies) == 0 {
-		h.reply(fromUID, "📋 没有待审批的好友申请")
+		h.replyL(fromUID, MsgFriendPendingEmpty, nil)
 		return
 	}
 
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("📋 **待审批好友申请**（%d 条）：\n\n", len(applies)))
+	lang := recipientLanguage(h.langSvc, fromUID)
+	items := make([]pendingApplyItem, 0, len(applies))
 	for i, apply := range applies {
-		ago := time.Since(time.Unix(apply.CreatedAt, 0)).Truncate(time.Minute)
-		agoStr := "刚刚"
-		if ago >= time.Hour*24 {
-			agoStr = fmt.Sprintf("%d天前", int(ago.Hours()/24))
-		} else if ago >= time.Hour {
-			agoStr = fmt.Sprintf("%d小时前", int(ago.Hours()))
-		} else if ago >= time.Minute {
-			agoStr = fmt.Sprintf("%d分钟前", int(ago.Minutes()))
-		}
-
-		sb.WriteString(fmt.Sprintf("%d. **%s** → %s (%s)", i+1, apply.ApplyName, apply.RobotID, agoStr))
-		if apply.Remark != "" {
-			sb.WriteString(fmt.Sprintf("\n备注：%s", apply.Remark))
-		}
-		sb.WriteString(fmt.Sprintf("\n/approve %s %s\n\n", apply.ApplyUID, apply.RobotID))
+		items = append(items, pendingApplyItem{
+			Num:       i + 1,
+			ApplyName: apply.ApplyName,
+			ApplyUID:  apply.ApplyUID,
+			RobotID:   apply.RobotID,
+			Ago:       relativeAgo(lang, apply.CreatedAt),
+			Remark:    apply.Remark,
+		})
 	}
-	h.reply(fromUID, sb.String())
+	content, err := botMessages.Render(MsgFriendPendingList, lang, map[string]any{
+		"Count": len(applies),
+		"Items": items,
+	})
+	if err != nil {
+		h.Error("渲染待审批好友申请列表失败", zap.String("lang", lang), zap.Error(err))
+		return
+	}
+	h.reply(fromUID, content)
+}
+
+// relativeAgo renders a localized relative-time phrase ("just now", "3 days
+// ago", ...) for a past unix-second timestamp. Plural handling lives in the
+// per-language ago templates, so this stays a thin dispatcher.
+func relativeAgo(lang string, createdAt int64) string {
+	ago := time.Since(time.Unix(createdAt, 0)).Truncate(time.Minute)
+	var key string
+	var n int
+	switch {
+	case ago >= time.Hour*24:
+		key, n = MsgFriendAgoDays, int(ago.Hours()/24)
+	case ago >= time.Hour:
+		key, n = MsgFriendAgoHours, int(ago.Hours())
+	case ago >= time.Minute:
+		key, n = MsgFriendAgoMinutes, int(ago.Minutes())
+	default:
+		s, _ := botMessages.Render(MsgFriendAgoJustNow, lang, nil)
+		return s
+	}
+	s, _ := botMessages.Render(key, lang, map[string]any{"N": n})
+	return s
 }
 
 // handleApprove 处理 /approve 命令
 func (h *commandHandler) handleApprove(fromUID string, args string) {
 	parts := strings.Fields(args)
 	if len(parts) < 2 {
-		h.reply(fromUID, "用法：/approve <用户ID> <机器人ID>\n或：/approve all <机器人ID>")
+		h.replyL(fromUID, MsgFriendApproveUsage, nil)
 		return
 	}
 
@@ -416,7 +438,7 @@ func (h *commandHandler) handleApprove(fromUID string, args string) {
 		// 批量通过
 		applies, err := h.GetPendingApplies(robotID)
 		if err != nil || len(applies) == 0 {
-			h.reply(fromUID, fmt.Sprintf("「%s」没有待审批的好友申请", robotID))
+			h.replyL(fromUID, MsgFriendNoPendingForBot, map[string]any{"RobotID": robotID})
 			return
 		}
 		for _, apply := range applies {
@@ -432,7 +454,7 @@ func (h *commandHandler) handleApprove(fromUID string, args string) {
 func (h *commandHandler) handleReject(fromUID string, args string) {
 	parts := strings.Fields(args)
 	if len(parts) < 2 {
-		h.reply(fromUID, "用法：/reject <用户ID> <机器人ID>\n或：/reject all <机器人ID>")
+		h.replyL(fromUID, MsgFriendRejectUsage, nil)
 		return
 	}
 
@@ -442,7 +464,7 @@ func (h *commandHandler) handleReject(fromUID string, args string) {
 	if targetUID == "all" {
 		applies, err := h.GetPendingApplies(robotID)
 		if err != nil || len(applies) == 0 {
-			h.reply(fromUID, fmt.Sprintf("「%s」没有待审批的好友申请", robotID))
+			h.replyL(fromUID, MsgFriendNoPendingForBot, map[string]any{"RobotID": robotID})
 			return
 		}
 		for _, apply := range applies {

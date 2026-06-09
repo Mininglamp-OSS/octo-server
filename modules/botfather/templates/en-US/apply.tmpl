@@ -1,0 +1,17 @@
+{{define "apply_auto_approved"}}Auto-approved — you can start chatting.{{end}}
+
+{{define "apply_submitted"}}Request submitted, awaiting the owner's approval.{{end}}
+
+{{define "notify_owner_new_apply"}}Someone is requesting to use your AI.
+User: {{.ApplicantName}} ({{.ApplicantUID}})
+AI: {{.RobotUID}}{{if .Remark}}
+Note: {{.Remark}}{{end}}{{end}}
+
+{{define "notify_applicant_approved"}}Your AI access request has been approved!
+AI: {{.RobotUID}}
+You can start chatting now.{{end}}
+
+{{define "notify_applicant_rejected"}}Your AI access request was declined.
+AI: {{.RobotUID}}{{end}}
+
+{{define "friend_added_tip"}}We're friends now — let's chat!{{end}}

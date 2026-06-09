@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -154,9 +155,14 @@ func TestSendWelcomeMessage(t *testing.T) {
 	_ = err
 }
 
-func TestDefaultWelcomeMessage(t *testing.T) {
-	// Verify the default welcome message is not empty
-	assert.NotEmpty(t, DefaultWelcomeMessage)
-	assert.Contains(t, DefaultWelcomeMessage, "BotFather")
-	assert.Contains(t, DefaultWelcomeMessage, "/newbot")
+func TestWelcomeMessageRenders(t *testing.T) {
+	// The welcome message must render in every supported language and keep the
+	// stable anchors callers rely on (BotFather identity + the /newbot CTA).
+	for _, lang := range octoi18n.SupportedLanguages() {
+		got, err := botMessages.Render(MsgWelcome, lang, nil)
+		assert.NoError(t, err, "render welcome for %s", lang)
+		assert.NotEmpty(t, got, "welcome for %s", lang)
+		assert.Contains(t, got, "BotFather", "welcome for %s", lang)
+		assert.Contains(t, got, "/newbot", "welcome for %s", lang)
+	}
 }

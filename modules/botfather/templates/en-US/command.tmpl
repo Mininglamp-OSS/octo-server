@@ -1,0 +1,180 @@
+{{define "unknown_command"}}Unknown command. Send /help to see the available commands.{{end}}
+
+{{define "send_help_hint"}}Send /help to see the available commands.{{end}}
+
+{{define "operation_cancelled"}}Operation cancelled.{{end}}
+
+{{define "operation_error"}}Something went wrong — the operation was cancelled.{{end}}
+
+{{define "query_failed_retry"}}Lookup failed. Please try again later.{{end}}
+
+{{define "query_failed_cancelled"}}Lookup failed — the operation was cancelled.{{end}}
+
+{{define "operation_failed_retry"}}Operation failed. Please try again later.{{end}}
+
+{{define "no_bots_yet"}}You haven't created any bots yet. Send /newbot to create one.{{end}}
+
+{{define "no_bots_short"}}You haven't created any bots yet.{{end}}
+
+{{define "name_length_invalid"}}The name must be 1–64 characters. Please try again:{{end}}
+
+{{define "newbot_prompt"}}Great! Please choose a name for your bot:{{end}}
+
+{{define "create_failed_retry"}}Creation failed. Please try again later.{{end}}
+
+{{define "bot_created_no_info"}}Bot "{{.Name}}" created! But fetching its details failed — use /connect to get the connection info.{{end}}
+
+{{define "bot_not_found_retry"}}Bot not found. Please enter the number or the bot ID:{{end}}
+
+{{define "set_name_prompt"}}Enter the new name for {{.BotDisplay}}:{{end}}
+
+{{define "set_desc_prompt"}}Enter the new description for {{.BotDisplay}}:{{end}}
+
+{{define "update_failed_retry"}}Update failed. Please try again later.{{end}}
+
+{{define "bot_name_updated"}}Bot name updated to: {{.Name}}{{end}}
+
+{{define "desc_too_long"}}The description must be 500 characters or fewer. Please try again:{{end}}
+
+{{define "desc_updated"}}Description updated.{{end}}
+
+{{define "delete_confirm"}}Are you sure you want to delete bot {{.BotDisplay}}? Type "Yes, delete it" to confirm:{{end}}
+
+{{define "delete_cancelled"}}Deletion cancelled.{{end}}
+
+{{define "delete_failed_retry"}}Deletion failed. Please try again later.{{end}}
+
+{{define "bot_deleted"}}Bot {{.BotID}} deleted.{{end}}
+
+{{define "token_display"}}Token for bot **{{.BotDisplay}}**:
+
+`{{.Token}}`
+
+Keep it safe and don't share it.{{end}}
+
+{{define "revoke_confirm"}}Are you sure you want to reset the token for {{.BotDisplay}}? The old token will stop working immediately. Type "Yes, revoke it" to confirm:{{end}}
+
+{{define "revoke_failed_retry"}}Reset failed. Please try again later.{{end}}
+
+{{define "token_revoked"}}Token reset. New token:
+
+`{{.Token}}`
+
+The old token is now invalid, and any connected Agent has been disconnected.{{end}}
+
+{{define "disconnect_failed_retry"}}Disconnect failed. Please try again later.{{end}}
+
+{{define "bot_disconnected"}}Disconnected bot "{{.BotDisplay}}".
+
+Any connected Agent has been kicked off and the pending message queue has been cleared.
+Send /connect to get the connection info again.{{end}}
+
+{{define "select_bot_connect"}}Choose a bot to get its connection prompt:{{end}}
+
+{{define "select_bot_disconnect"}}Choose a bot to disconnect:{{end}}
+
+{{define "select_bot_setname"}}Choose a bot to rename:{{end}}
+
+{{define "select_bot_setdesc"}}Choose a bot to set its description:{{end}}
+
+{{define "select_bot_delete"}}Choose a bot to delete:{{end}}
+
+{{define "select_bot_token"}}Choose a bot to view its token:{{end}}
+
+{{define "select_bot_revoke"}}Choose a bot to reset its token:{{end}}
+
+{{define "bot_selection_list"}}{{.Prompt}}
+
+{{range .Bots}}{{.Num}}. {{.Display}}
+{{end}}
+Enter the number:{{end}}
+
+{{define "mybots_list"}}**Your bots:**
+
+{{range .Bots}}{{.Num}}. **{{.Display}}**
+   {{if .Desc}}{{.Desc}}{{else}}No description{{end}}
+
+{{end}}{{end}}
+
+{{define "quickstart"}}🚀 **Quickstart**
+
+Create and bind an Octo bot for every one of your OpenClaw Agents in one shot, so each Agent can send and receive messages through Octo.
+
+📋 **Send the following to OpenClaw to run (run /install first if the plugin isn't installed):**
+
+```
+Batch-create and bind Octo bots for all agents:
+npx -y create-openclaw-octo quickstart --api-key {{.APIKey}} --api-url {{.APIURL}}
+```{{end}}
+
+{{define "install"}}📦 **Install / update the Octo plugin**
+
+💡 We recommend upgrading OpenClaw to the latest version first for the best experience.
+
+📋 **Send the following command to OpenClaw to run:**
+
+```
+npx -y create-openclaw-octo install
+```
+
+Once installed, use /newbot to create a single bot or /quickstart to batch-create.{{end}}
+
+{{define "help"}}BotFather helps you create and manage bots.
+
+**Available commands:**
+
+- /install — install / update the Octo plugin
+- /quickstart — AI Agent quickstart (recommended)
+- /newbot — create a new bot
+- /mybots — view my bots
+- /connect — get the connection prompt
+- /disconnect — disconnect an Agent
+- /setname — change a bot's name
+- /setdescription — change a bot's description
+- /deletebot — delete a bot
+- /token — view a token
+- /revoke — reset a token
+- /pending — view pending friend requests
+- /approve — approve a friend request
+- /reject — reject a friend request
+- /cancel — cancel the current operation
+- /help — show help{{end}}
+
+{{define "connect_prompt"}}📋 Connection info for bot "**{{.DisplayName}}**":
+
+**Bot Name:** {{.DisplayName}}  
+**Bot ID:** {{.RobotID}}  
+**Bot Token:** {{.BotToken}}  
+**API Server:** {{.APIURL}}
+
+📋 **Send the following to OpenClaw to run — it binds to the current Session's Agent by default (run /install to install the plugin first):**
+
+```
+Bind Octo bot {{.RobotID}} to an Agent.
+By default it binds to the current Session's Agent; check the agent id with /status.
+If the user specifies another Agent, replace it with the user-specified id.
+
+npx -y create-openclaw-octo bind --bot-token {{.BotToken}} --api-url {{.APIURL}} --account-id {{.RobotID}} --agent <agent-id>
+```
+
+💡 **To bind to a different Agent, just change the `--agent` argument.**
+🔌 To disconnect, send /disconnect{{end}}
+
+{{define "created_prompt"}}✅ Bot "**{{.Name}}**" created!
+
+**Bot Name:** {{.Name}}  
+**Bot ID:** {{.RobotID}}  
+**Bot Token:** {{.BotToken}}  
+**API Server:** {{.APIURL}}
+
+📋 **Send the following to OpenClaw to run — it binds to the current Session's Agent by default (run /install first if the plugin isn't installed):**
+
+```
+Bind Octo bot {{.RobotID}} to an Agent.
+By default it binds to the current Session's Agent; check the agent id with /status.
+If the user specifies another Agent, replace it with the user-specified id.
+
+npx -y create-openclaw-octo bind --bot-token {{.BotToken}} --api-url {{.APIURL}} --account-id {{.RobotID}} --agent <agent-id>
+```
+
+💡 **To bind to a different Agent, just change the `--agent` argument.**{{end}}
