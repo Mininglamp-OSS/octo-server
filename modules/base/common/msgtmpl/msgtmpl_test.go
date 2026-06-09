@@ -114,6 +114,29 @@ func TestRenderExecuteErrorPropagates(t *testing.T) {
 	}
 }
 
+func TestRenderMissingMapKeyErrors(t *testing.T) {
+	// missingkey=error must reject a data map that omits a referenced field
+	// rather than emit "<no value>". This guards against a call site forgetting
+	// a parameter. Critically it must hold for the Lookup()'d {{define}} block,
+	// not just the root template (Option is per-*Template and does not propagate).
+	files := map[string]string{}
+	for _, lang := range octoi18n.SupportedLanguages() {
+		files["tpl/"+lang+"/m.tmpl"] = `{{define "m"}}hi {{.Name}}{{end}}`
+	}
+	c, err := New(mapFS(files), "tpl")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// Present key renders fine.
+	if got, err := c.Render("m", octoi18n.SourceLanguage, map[string]any{"Name": "x"}); err != nil || got != "hi x" {
+		t.Fatalf("Render with key = %q, %v; want %q", got, err, "hi x")
+	}
+	// Missing key errors.
+	if _, err := c.Render("m", octoi18n.SourceLanguage, map[string]any{}); err == nil {
+		t.Fatalf("missingkey=error must reject a data map missing .Name")
+	}
+}
+
 func TestNamesReturnsSortedUnion(t *testing.T) {
 	c, err := New(mapFS(fullCatalogFiles()), "tpl")
 	if err != nil {

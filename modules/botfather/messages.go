@@ -6,11 +6,16 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/common/msgtmpl"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"go.uber.org/zap"
 )
+
+// msgLog is a package logger for the outbound-message helpers, which are
+// package functions (no commandHandler receiver) and so cannot use h.Log.
+var msgLog = log.NewTLog("BotFather")
 
 // templatesFS holds the per-language BotFather outbound-message templates.
 // Layout: templates/{lang}/{domain}.tmpl, each file a set of {{define "key"}}
@@ -195,14 +200,27 @@ func newBotLanguageService(ctx *config.Context) *user.LanguageService {
 // user_language:{uid} → DB), falling back to the deployment default
 // (OCTO_DEFAULT_LANGUAGE) when unset or unresolvable.
 //
-// toUID may be Space-prefixed (s{space}_{uid}); the real uid is extracted
-// before lookup so the preference keys off the actual user.
+// toUID may be Space-prefixed (s{space}_{uid}). extractRealUID strips the prefix
+// ONLY when this goroutine pre-registered it via setSpacePrefixForUID: the
+// message-processing path always does, while lifecycle events (welcome) pass a
+// bare uid that needs no stripping. A raw s{space}_{uid} handed in WITHOUT that
+// registration would resolve against the prefixed string and fall back to the
+// default language — all current callers are covered, but keep this in mind for
+// any new async entry point that synthesizes a Space-prefixed uid itself.
 func recipientLanguage(langSvc *user.LanguageService, toUID string) string {
 	realUID := extractRealUID(toUID)
 	if langSvc != nil && realUID != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), langResolveTimeout)
 		defer cancel()
-		if lang, err := langSvc.Resolve(ctx, realUID); err == nil && lang != "" {
+		lang, err := langSvc.Resolve(ctx, realUID)
+		switch {
+		case err != nil:
+			// A chronically failing language service would otherwise silently
+			// pin every recipient to the default language with no signal. Debug
+			// (not Warn) keeps transient Redis/DB blips from flooding logs.
+			msgLog.Debug("解析收件人语言失败，回退默认语言",
+				zap.String("uid", realUID), zap.Error(err))
+		case lang != "":
 			return lang
 		}
 	}

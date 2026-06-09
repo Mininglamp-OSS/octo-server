@@ -74,6 +74,15 @@ func New(fsys fs.FS, root string) (*Catalog, error) {
 		if err != nil {
 			return nil, fmt.Errorf("msgtmpl: load language %s (pattern %q): %w", lang, pattern, err)
 		}
+		// missingkey=error turns a "{{.Field}} not in the data map" miss into a
+		// hard render error instead of a silently emitted "<no value>", so a call
+		// site that forgets a parameter fails loudly (and replyL/localizedMessage
+		// log + skip) rather than DMing a half-built message. Option does NOT
+		// propagate from the root template to the Lookup()'d {{define}} blocks
+		// (it is per-*Template), so it must be set on every associated template.
+		for _, assoc := range t.Templates() {
+			assoc.Option("missingkey=error")
+		}
 		set := definedNames(t, lang)
 		if len(set) == 0 {
 			return nil, fmt.Errorf("msgtmpl: language %s defines no message templates under %s", lang, path.Join(root, lang))
