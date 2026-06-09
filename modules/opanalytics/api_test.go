@@ -414,6 +414,18 @@ func compositionByType(items []*messageCompositionItem) map[uint8]*messageCompos
 	return out
 }
 
+func expectedConvTypeOrder() []uint8 {
+	return []uint8{convTypeHHGroup, convTypeHAGroup, convTypeHHPrivate, convTypeHAPrivate}
+}
+
+func compositionTypes(items []*messageCompositionItem) []uint8 {
+	out := make([]uint8, 0, len(items))
+	for _, item := range items {
+		out = append(out, item.ConvType)
+	}
+	return out
+}
+
 func trendByBucket(items []*trendItem) map[string]*trendItem {
 	out := make(map[string]*trendItem, len(items))
 	for _, item := range items {
@@ -428,6 +440,45 @@ func trendConvByType(items []*trendConvTypeMsgItem) map[uint8]*trendConvTypeMsgI
 		out[item.ConvType] = item
 	}
 	return out
+}
+
+func trendConvTypes(items []*trendConvTypeMsgItem) []uint8 {
+	out := make([]uint8, 0, len(items))
+	for _, item := range items {
+		out = append(out, item.ConvType)
+	}
+	return out
+}
+
+func insertLeakedPrivateFactWithSpace(t *testing.T, ctx *config.Context, channelID string, convType uint8, humanMsg, agentMsg int64) {
+	t.Helper()
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO octo_fact_channel_daily "+
+			"(stat_date,channel_id,channel_type,space_id,conv_type,human_msg_count,agent_msg_count,active_human_members,active_agent_members,last_msg_at) "+
+			"VALUES (?,?,?,?,?,?,?,?,?,?)",
+		statDay, channelID, channelTypePerson, "s1", convType, humanMsg, agentMsg, 1, 0, 0,
+	).Exec()
+	require.NoError(t, err)
+}
+
+func seedDimMember(t *testing.T, ctx *config.Context, uid, name string, memberType uint8) {
+	t.Helper()
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO octo_dim_member (uid,name,member_type,is_excluded) VALUES (?,?,?,0)",
+		uid, name, memberType,
+	).Exec()
+	require.NoError(t, err)
+}
+
+func insertLeakedPrivateMemberFactWithSpace(t *testing.T, ctx *config.Context, channelID, senderUID string, convType, senderType uint8) {
+	t.Helper()
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO octo_fact_member_channel_daily "+
+			"(stat_date,channel_id,channel_type,space_id,conv_type,content_type,sender_uid,sender_type,msg_count,last_msg_at) "+
+			"VALUES (?,?,?,?,?,?,?,?,?,?)",
+		statDay, channelID, channelTypePerson, "s1", convType, uint8(0), senderUID, senderType, 1, int64(0),
+	).Exec()
+	require.NoError(t, err)
 }
 
 func TestOpanalyticsEndpoints(t *testing.T) {
@@ -450,6 +501,7 @@ func TestOpanalyticsEndpoints(t *testing.T) {
 	assert.Equal(t, int64(12), ov.HumanMsgCount) // g1:5 + g2:2 + private:5
 	assert.Equal(t, int64(5), ov.AgentMsgCount)
 	assert.Equal(t, int64(1), ov.PrivateActiveCount)
+	assert.Equal(t, expectedConvTypeOrder(), compositionTypes(ov.MessageComposition))
 	ovComp := compositionByType(ov.MessageComposition)
 	require.Len(t, ovComp, 4, "overview composition must always return conv_type 1..4")
 	assert.Equal(t, int64(2), ovComp[convTypeHHGroup].HumanMsgCount)
@@ -479,6 +531,7 @@ func TestOpanalyticsEndpoints(t *testing.T) {
 	assert.Equal(t, int64(5), ovS1.HumanMsgCount, "私聊/g2 不计入 s1")
 	assert.Equal(t, int64(5), ovS1.AgentMsgCount)
 	assert.Equal(t, int64(0), ovS1.PrivateActiveCount, "选中 Space 时私聊数置 0(私聊无 space 归属)")
+	assert.Equal(t, expectedConvTypeOrder(), compositionTypes(ovS1.MessageComposition))
 	ovS1Comp := compositionByType(ovS1.MessageComposition)
 	require.Len(t, ovS1Comp, 4)
 	assert.Equal(t, int64(10), ovS1Comp[convTypeHAGroup].TotalMsgCount)
@@ -490,6 +543,7 @@ func TestOpanalyticsEndpoints(t *testing.T) {
 	// ---- overview 空范围：composition 仍固定 4 类且全部补 0 ----
 	var empty overviewResp
 	decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/overview?start_date=2026-05-31&end_date=2026-05-31"), &empty)
+	assert.Equal(t, expectedConvTypeOrder(), compositionTypes(empty.MessageComposition))
 	emptyComp := compositionByType(empty.MessageComposition)
 	require.Len(t, emptyComp, 4)
 	for _, item := range emptyComp {
@@ -594,6 +648,7 @@ func TestOpanalyticsTrendEndpoint(t *testing.T) {
 	assert.Equal(t, int64(1), jun1.ActiveAgentMembers)
 	assert.Equal(t, int64(2), jun1.ActiveGroups)
 	assert.Equal(t, int64(1), jun1.PrivateActiveCount)
+	assert.Equal(t, expectedConvTypeOrder(), trendConvTypes(jun1.ConvTypeMsgCounts))
 	jun1Conv := trendConvByType(jun1.ConvTypeMsgCounts)
 	require.Len(t, jun1Conv, 4)
 	assert.Equal(t, int64(2), jun1Conv[convTypeHHGroup].TotalMsgCount)
@@ -632,6 +687,24 @@ func TestOpanalyticsTrendEndpoint(t *testing.T) {
 	assert.Equal(t, int64(5), weekConv[convTypeHHPrivate].TotalMsgCount)
 	assert.Zero(t, weekConv[convTypeHAPrivate].TotalMsgCount)
 
+	var partialWeekTrend trendResp
+	decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/trend?start_date=2026-06-02&end_date=2026-06-09&granularity=week"), &partialWeekTrend)
+	assert.Equal(t, "week", partialWeekTrend.Granularity)
+	require.Len(t, partialWeekTrend.List, 2)
+	firstPartial := partialWeekTrend.List[0]
+	assert.Equal(t, "2026-06-01", firstPartial.Bucket, "bucket remains the report-timezone Monday")
+	assert.Equal(t, "2026-06-02", firstPartial.StartDate, "partial week start is clipped to the request")
+	assert.Equal(t, "2026-06-07", firstPartial.EndDate)
+	assert.Equal(t, int64(2), firstPartial.TotalMsgCount)
+	assert.Equal(t, int64(1), firstPartial.ActiveHumanMembers)
+	assert.Equal(t, int64(1), firstPartial.ActiveAgentMembers)
+	assert.Equal(t, int64(1), firstPartial.ActiveGroups)
+	secondPartial := partialWeekTrend.List[1]
+	assert.Equal(t, "2026-06-08", secondPartial.Bucket)
+	assert.Equal(t, "2026-06-08", secondPartial.StartDate)
+	assert.Equal(t, "2026-06-09", secondPartial.EndDate, "partial week end is clipped to the request")
+	assert.Zero(t, secondPartial.TotalMsgCount)
+
 	var s1Trend trendResp
 	decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/trend?start_date="+statDay+"&end_date="+statDay+"&space_ids=s1"), &s1Trend)
 	require.Len(t, s1Trend.List, 1)
@@ -643,6 +716,40 @@ func TestOpanalyticsTrendEndpoint(t *testing.T) {
 	s1Conv := trendConvByType(s1Day.ConvTypeMsgCounts)
 	assert.Equal(t, int64(10), s1Conv[convTypeHAGroup].TotalMsgCount)
 	assert.Zero(t, s1Conv[convTypeHHPrivate].TotalMsgCount, "选中 Space 时私聊 conv_type 置 0")
+
+	insertLeakedPrivateFactWithSpace(t, ctx, "leaked_hh_private", convTypeHHPrivate, 7, 0)
+	insertLeakedPrivateFactWithSpace(t, ctx, "leaked_ha_private", convTypeHAPrivate, 3, 4)
+	seedDimMember(t, ctx, "u_private_only_human", "PrivateOnlyHuman", memberTypeHuman)
+	seedDimMember(t, ctx, "u_private_only_agent", "PrivateOnlyAgent", memberTypeAgent)
+	seedSpaceMember(t, ctx, "s1", "u_private_only_human")
+	seedSpaceMember(t, ctx, "s1", "u_private_only_agent")
+	insertLeakedPrivateMemberFactWithSpace(t, ctx, "leaked_hh_private", "u_private_only_human", convTypeHHPrivate, memberTypeHuman)
+	insertLeakedPrivateMemberFactWithSpace(t, ctx, "leaked_ha_private", "u_private_only_agent", convTypeHAPrivate, memberTypeAgent)
+
+	var guardedOverview overviewResp
+	decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/overview?start_date="+statDay+"&end_date="+statDay+"&space_ids=s1"), &guardedOverview)
+	assert.Equal(t, int64(5), guardedOverview.HumanMsgCount, "service must not mix leaked private rows into space overview totals")
+	assert.Equal(t, int64(5), guardedOverview.AgentMsgCount, "service must not mix leaked private rows into space overview totals")
+	assert.Equal(t, int64(2), guardedOverview.ActiveHumanMembers, "space overview active members must exclude leaked private member facts")
+	assert.Equal(t, int64(1), guardedOverview.ActiveAgentMembers, "space overview active members must exclude leaked private member facts")
+	assert.Zero(t, guardedOverview.PrivateActiveCount)
+	guardedComp := compositionByType(guardedOverview.MessageComposition)
+	assert.Zero(t, guardedComp[convTypeHHPrivate].TotalMsgCount, "service must zero private composition under space filter")
+	assert.Zero(t, guardedComp[convTypeHAPrivate].TotalMsgCount, "service must zero private composition under space filter")
+
+	var guardedTrend trendResp
+	decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/trend?start_date="+statDay+"&end_date="+statDay+"&space_ids=s1"), &guardedTrend)
+	require.Len(t, guardedTrend.List, 1)
+	guardedDay := guardedTrend.List[0]
+	assert.Equal(t, int64(5), guardedDay.HumanMsgCount, "service must not mix leaked private rows into space trend totals")
+	assert.Equal(t, int64(5), guardedDay.AgentMsgCount, "service must not mix leaked private rows into space trend totals")
+	assert.Equal(t, int64(10), guardedDay.TotalMsgCount)
+	assert.Equal(t, int64(2), guardedDay.ActiveHumanMembers, "space trend active members must exclude leaked private member facts")
+	assert.Equal(t, int64(1), guardedDay.ActiveAgentMembers, "space trend active members must exclude leaked private member facts")
+	assert.Zero(t, guardedDay.PrivateActiveCount, "service must zero private trend metrics under space filter")
+	guardedTrendConv := trendConvByType(guardedDay.ConvTypeMsgCounts)
+	assert.Zero(t, guardedTrendConv[convTypeHHPrivate].TotalMsgCount, "service must zero private trend conv_type under space filter")
+	assert.Zero(t, guardedTrendConv[convTypeHAPrivate].TotalMsgCount, "service must zero private trend conv_type under space filter")
 
 	rec := opaGet(t, route, "/v1/manager/dashboard/trend?start_date="+statDay+"&end_date="+statDay+"&granularity=month")
 	assert.Equal(t, "err.server.opanalytics.request_invalid", errorCode(t, rec))

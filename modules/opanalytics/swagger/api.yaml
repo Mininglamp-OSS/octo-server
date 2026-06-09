@@ -65,7 +65,8 @@ paths:
       summary: "趋势图（模块C）"
       description: >
         按 day/week 返回消息量、活跃成员、活跃群、活跃私聊和会话类型消息分布。
-        week 以报告时区周一作为 bucket；缺失日期/周补 0。选中 space 时私聊指标返回 0。
+        week 以报告时区周一作为 bucket；部分周的 bucket 仍是周一，前端展示范围请使用
+        start_date/end_date。缺失日期/周补 0。选中 space 时私聊指标返回 0。
       operationId: "m dashboard trend"
       produces:
         - "application/json"
@@ -431,15 +432,15 @@ definitions:
       bucket:
         type: string
         format: date
-        description: "bucket 起点；day=当天，week=报告时区周一"
+        description: "bucket 起点；day=当天，week=报告时区周一。部分周展示请使用 start_date/end_date"
       start_date:
         type: string
         format: date
-        description: "该 bucket 在请求范围内的起始日期"
+        description: "该 bucket 在请求范围内的起始日期；部分周会裁剪到请求 start_date"
       end_date:
         type: string
         format: date
-        description: "该 bucket 在请求范围内的结束日期"
+        description: "该 bucket 在请求范围内的结束日期；部分周会裁剪到请求 end_date"
       human_msg_count:
         type: integer
         format: int64

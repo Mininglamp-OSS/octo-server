@@ -121,7 +121,7 @@ func (d *opanalyticsDB) overviewActiveMembers(start, end string, spaceIDs []stri
 	args = append(args, start, end)
 	if len(spaceIDs) > 0 {
 		spaceClause, spaceArgs := inClause("f.space_id", spaceIDs)
-		sql += " AND " + spaceClause
+		sql += " AND f.channel_type=2 AND " + spaceClause
 		args = append(args, spaceArgs...)
 	}
 	_, err = d.session.SelectBySql(sql, args...).Load(&res)
@@ -269,7 +269,7 @@ func (d *opanalyticsDB) queryTrendActiveMembers(start, end, granularity string, 
 	args = append(args, start, end)
 	if len(spaceIDs) > 0 {
 		spaceClause, spaceArgs := inClause("f.space_id", spaceIDs)
-		sql += " AND " + spaceClause
+		sql += " AND f.channel_type=2 AND " + spaceClause
 		args = append(args, spaceArgs...)
 	}
 	sql += " GROUP BY bucket"
@@ -290,6 +290,8 @@ func (d *opanalyticsDB) queryTrendActiveMembers(start, end, granularity string, 
 }
 
 func trendBucketSQL(col, granularity string) string {
+	// SECURITY: col is an internal constant from call sites, and granularity is normalized
+	// to the closed enum day/week before service dispatch; no raw user input reaches this SQL fragment.
 	if granularity == "week" {
 		return "DATE_FORMAT(DATE_SUB(" + col + ", INTERVAL WEEKDAY(" + col + ") DAY), '%Y-%m-%d')"
 	}

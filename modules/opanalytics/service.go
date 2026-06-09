@@ -56,6 +56,11 @@ func (s *service) overview(start, end string, spaceIDs []string) (*overviewResp,
 	if err != nil {
 		return nil, err
 	}
+	messageComposition := normalizeMessageComposition(composition)
+	if len(spaceIDs) > 0 {
+		humanMsg, agentMsg = stripPrivateCompositionTotals(humanMsg, agentMsg, messageComposition)
+		zeroPrivateMessageComposition(messageComposition)
+	}
 	return &overviewResp{
 		SpaceTotal:         spaceTotal,
 		GroupTotal:         groupTotal,
@@ -67,7 +72,7 @@ func (s *service) overview(start, end string, spaceIDs []string) (*overviewResp,
 		HumanMsgCount:      humanMsg,
 		AgentMsgCount:      agentMsg,
 		PrivateActiveCount: privateActive,
-		MessageComposition: normalizeMessageComposition(composition),
+		MessageComposition: messageComposition,
 	}, nil
 }
 
@@ -91,6 +96,12 @@ func (s *service) trend(start, end, granularity string, spaceIDs []string) (*tre
 	for _, b := range buckets {
 		ca := channelAgg[b.Bucket]
 		ma := memberAgg[b.Bucket]
+		convTypes := normalizeTrendConvTypes(convAgg[b.Bucket])
+		if len(spaceIDs) > 0 {
+			ca.HumanMsg, ca.AgentMsg = stripPrivateTrendTotals(ca.HumanMsg, ca.AgentMsg, convTypes)
+			ca.PrivateActive = 0
+			zeroPrivateTrendConvTypes(convTypes)
+		}
 		item := &trendItem{
 			Bucket:             b.Bucket,
 			StartDate:          b.StartDate,
@@ -102,7 +113,7 @@ func (s *service) trend(start, end, granularity string, spaceIDs []string) (*tre
 			ActiveAgentMembers: ma.ActiveAgent,
 			ActiveGroups:       ca.ActiveGroups,
 			PrivateActiveCount: ca.PrivateActive,
-			ConvTypeMsgCounts:  normalizeTrendConvTypes(convAgg[b.Bucket]),
+			ConvTypeMsgCounts:  convTypes,
 		}
 		items = append(items, item)
 	}
@@ -186,6 +197,30 @@ func normalizeMessageComposition(rows []*messageCompositionItem) []*messageCompo
 	return out
 }
 
+func stripPrivateCompositionTotals(humanMsg, agentMsg int64, rows []*messageCompositionItem) (int64, int64) {
+	var privateHuman, privateAgent int64
+	for _, row := range rows {
+		if !isPrivateConvType(row.ConvType) {
+			continue
+		}
+		privateHuman += row.HumanMsgCount
+		privateAgent += row.AgentMsgCount
+	}
+	return subtractFloor(humanMsg, privateHuman), subtractFloor(agentMsg, privateAgent)
+}
+
+func zeroPrivateMessageComposition(rows []*messageCompositionItem) {
+	for _, row := range rows {
+		if !isPrivateConvType(row.ConvType) {
+			continue
+		}
+		row.HumanMsgCount = 0
+		row.AgentMsgCount = 0
+		row.TotalMsgCount = 0
+		row.ActiveChannelCount = 0
+	}
+}
+
 func normalizeTrendConvTypes(rows map[uint8]trendConvTypeAgg) []*trendConvTypeMsgItem {
 	out := make([]*trendConvTypeMsgItem, 0, 4)
 	for _, convType := range []uint8{convTypeHHGroup, convTypeHAGroup, convTypeHHPrivate, convTypeHAPrivate} {
@@ -198,6 +233,40 @@ func normalizeTrendConvTypes(rows map[uint8]trendConvTypeAgg) []*trendConvTypeMs
 		})
 	}
 	return out
+}
+
+func stripPrivateTrendTotals(humanMsg, agentMsg int64, rows []*trendConvTypeMsgItem) (int64, int64) {
+	var privateHuman, privateAgent int64
+	for _, row := range rows {
+		if !isPrivateConvType(row.ConvType) {
+			continue
+		}
+		privateHuman += row.HumanMsgCount
+		privateAgent += row.AgentMsgCount
+	}
+	return subtractFloor(humanMsg, privateHuman), subtractFloor(agentMsg, privateAgent)
+}
+
+func zeroPrivateTrendConvTypes(rows []*trendConvTypeMsgItem) {
+	for _, row := range rows {
+		if !isPrivateConvType(row.ConvType) {
+			continue
+		}
+		row.HumanMsgCount = 0
+		row.AgentMsgCount = 0
+		row.TotalMsgCount = 0
+	}
+}
+
+func isPrivateConvType(convType uint8) bool {
+	return convType == convTypeHHPrivate || convType == convTypeHAPrivate
+}
+
+func subtractFloor(total, n int64) int64 {
+	if n >= total {
+		return 0
+	}
+	return total - n
 }
 
 type trendBucket struct {
