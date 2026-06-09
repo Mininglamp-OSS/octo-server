@@ -325,8 +325,8 @@ func mondayOf(d time.Time) time.Time {
 }
 
 // channelList 表二(仅群组)：SQL 侧 LEFT JOIN + 分页。
-func (s *service) channelList(spaceID, start, end, activeStatus, sortBy, order string, offset, limit int) ([]*channelListItem, int64, error) {
-	return s.db.queryChannelList(spaceID, start, end, activeStatus, sortBy, order, offset, limit)
+func (s *service) channelList(spaceID, start, end, activeStatus string, convTypes []uint8, memberKeyword, sortBy, order string, offset, limit int) ([]*channelListItem, int64, error) {
+	return s.db.queryChannelList(spaceID, start, end, activeStatus, convTypes, memberKeyword, sortBy, order, offset, limit)
 }
 
 // spaceExists 判断 Space 是否存在(用于表二 404)。
@@ -334,9 +334,28 @@ func (s *service) spaceExists(spaceID string) (bool, error) {
 	return s.db.spaceExists(spaceID)
 }
 
+// groupChannelExists 判断表三会话是否存在且仍是正常群组。
+func (s *service) groupChannelExists(channelID string) (bool, error) {
+	return s.db.groupChannelExists(channelID)
+}
+
+// channelMemberList 表三子表A：会话内成员消息统计汇总。
+func (s *service) channelMemberList(channelID, start, end string, memberTypes []uint8, keyword, sortBy, order string, offset, limit int) (*channelMemberListResp, error) {
+	items, total, totalMsg, err := s.db.queryChannelMemberList(channelID, start, end, memberTypes, keyword, sortBy, order, offset, limit)
+	if err != nil {
+		return nil, err
+	}
+	if totalMsg > 0 {
+		for _, item := range items {
+			item.Percentage = float64(item.TotalMsgCount) / float64(totalMsg)
+		}
+	}
+	return &channelMemberListResp{Count: total, TotalMsgCount: totalMsg, List: items}, nil
+}
+
 // directChatList 全局私聊活跃列表 + 解析双方展示名。
-func (s *service) directChatList(start, end, sortBy, order string, offset, limit int) ([]*directChatItem, int64, error) {
-	items, total, err := s.db.queryDirectChatList(start, end, sortBy, order, offset, limit)
+func (s *service) directChatList(start, end, memberKeyword, sortBy, order string, offset, limit int) ([]*directChatItem, int64, error) {
+	items, total, err := s.db.queryDirectChatList(start, end, memberKeyword, sortBy, order, offset, limit)
 	if err != nil {
 		return nil, 0, err
 	}

@@ -217,6 +217,20 @@ paths:
           description: "活跃状态筛选"
           required: false
         - in: "query"
+          name: "conv_types"
+          type: array
+          items:
+            type: integer
+            enum: [1, 2, 3, 4]
+          collectionFormat: multi
+          description: "会话类型筛选；多值用 conv_types=1&conv_types=2，也兼容 conv_types[]=1。表二仅展示群组，3/4 会返回空集合"
+          required: false
+        - in: "query"
+          name: "member_keyword"
+          type: string
+          description: "成员名称/邮箱模糊匹配（% _ 作字面量处理）；P1 不含手机号搜索"
+          required: false
+        - in: "query"
           name: "sort_by"
           type: string
           enum: ["last_active", "human_msg_count", "agent_msg_count", "total_msg", "member_count"]
@@ -254,6 +268,88 @@ paths:
       security:
         - token: []
 
+  /manager/dashboard/channels/{channel_id}/members:
+    get:
+      tags:
+        - "opanalyticsManager"
+      summary: "会话成员消息统计（表三子表A汇总）"
+      description: >
+        指定正常群组的成员消息统计汇总视图。列表只包含所选时间范围内发过消息的成员；
+        percentage = 该成员 total_msg_count / 本会话 total_msg_count，取值范围 0..1。
+        成员类型按当前 octo_dim_member 口径；成员搜索仅匹配 name/email，手机号搜索属于 P2。
+      operationId: "m dashboard channel members"
+      produces:
+        - "application/json"
+      parameters:
+        - in: "path"
+          name: "channel_id"
+          type: string
+          description: "群组 channel_id（group_no）；私聊不支持此接口"
+          required: true
+        - in: "query"
+          name: "start_date"
+          type: string
+          format: date
+          description: "起始统计日 YYYY-MM-DD。缺省=近 30 天"
+          required: false
+        - in: "query"
+          name: "end_date"
+          type: string
+          format: date
+          description: "结束统计日 YYYY-MM-DD（含）"
+          required: false
+        - in: "query"
+          name: "member_types"
+          type: array
+          items:
+            type: string
+            enum: ["human", "agent", "1", "2"]
+          collectionFormat: multi
+          description: "成员类型筛选；支持 human/agent 或 1/2，多值用 member_types=human&member_types=agent"
+          required: false
+        - in: "query"
+          name: "keyword"
+          type: string
+          description: "成员名称/邮箱模糊匹配（% _ 作字面量处理）；P1 不含手机号搜索"
+          required: false
+        - in: "query"
+          name: "sort_by"
+          type: string
+          enum: ["total_msg_count", "percentage"]
+          default: "total_msg_count"
+          description: "排序字段（白名单）；percentage 与 total_msg_count 分母相同，排序等价"
+          required: false
+        - in: "query"
+          name: "order"
+          type: string
+          enum: ["asc", "desc"]
+          default: "desc"
+          description: "排序方向"
+          required: false
+        - in: "query"
+          name: "page_index"
+          type: integer
+          default: 1
+          description: "页码（从 1 起，上限 1000000）"
+          required: false
+        - in: "query"
+          name: "page_size"
+          type: integer
+          default: 20
+          description: "每页条数（上限 200）"
+          required: false
+      responses:
+        200:
+          description: "成员消息统计"
+          schema:
+            $ref: "#/definitions/channelMemberListResp"
+        400:
+          description: "错误（error.http_status：404 会话不存在/不是正常群组 / 403 越权 / 400 参数无效 / 500）"
+          schema:
+            $ref: "#/definitions/dashboardError"
+      security:
+        - token: []
+
   /manager/dashboard/global/direct-chats:
     get:
       tags:
@@ -275,6 +371,11 @@ paths:
           type: string
           format: date
           description: "结束统计日 YYYY-MM-DD（含）"
+          required: false
+        - in: "query"
+          name: "member_keyword"
+          type: string
+          description: "私聊双方成员名称/邮箱模糊匹配（% _ 作字面量处理）；P1 不含手机号搜索"
           required: false
         - in: "query"
           name: "sort_by"
@@ -575,6 +676,48 @@ definitions:
       is_active:
         type: boolean
         description: "范围内是否活跃"
+
+  channelMemberListResp:
+    type: object
+    properties:
+      count:
+        type: integer
+        format: int64
+        description: "筛选后的成员统计行数"
+      total_msg_count:
+        type: integer
+        format: int64
+        description: "该会话所选时间范围内总消息数（不受 member_types/keyword 筛选影响）"
+      list:
+        type: array
+        items:
+          $ref: "#/definitions/channelMemberListItem"
+
+  channelMemberListItem:
+    type: object
+    properties:
+      member_uid:
+        type: string
+      name:
+        type: string
+      email:
+        type: string
+      phone:
+        type: string
+        description: "仅返回展示字段；P1 查询不按手机号筛选"
+      zone:
+        type: string
+      member_type:
+        type: integer
+        description: "1=human 2=agent"
+      total_msg_count:
+        type: integer
+        format: int64
+        description: "成员在该会话、该时间范围内发送的消息数"
+      percentage:
+        type: number
+        format: double
+        description: "成员消息占比，0..1"
 
   directChatListResp:
     type: object

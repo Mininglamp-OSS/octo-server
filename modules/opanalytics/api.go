@@ -2,6 +2,8 @@ package opanalytics
 
 import (
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -58,8 +60,9 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 		auth.GET("/trend", m.trend)                             // 模块C 趋势
 		auth.GET("/spaces", m.spaces)                           // 表一 Space 列表
 		auth.GET("/spaces/:space_id/channels", m.spaceChannels) // 表二 群组列表(仅群组)
-		auth.GET("/global/direct-chats", m.globalDirectChats)   // 全局私聊活跃列表
-		auth.POST("/etl/run", m.runETL)                         // 手动触发增量 ETL
+		auth.GET("/channels/:channel_id/members", m.channelMembers)
+		auth.GET("/global/direct-chats", m.globalDirectChats) // 全局私聊活跃列表
+		auth.POST("/etl/run", m.runETL)                       // 手动触发增量 ETL
 	}
 }
 
@@ -153,9 +156,14 @@ func (m *Manager) spaceChannels(c *wkhttp.Context) {
 		respRequestInvalid(c, "date_range")
 		return
 	}
+	convTypes, ok := parseConvTypes(c)
+	if !ok {
+		respRequestInvalid(c, "conv_types")
+		return
+	}
 	pageIndex, pageSize := clampPage(c.GetPage())
 	list, total, err := m.service.channelList(
-		spaceID, start, end, normalizeActiveStatus(c.Query("active_status")),
+		spaceID, start, end, normalizeActiveStatus(c.Query("active_status")), convTypes, c.Query("member_keyword"),
 		c.Query("sort_by"), c.Query("order"), (pageIndex-1)*pageSize, pageSize)
 	if err != nil {
 		m.Error("channel list query failed", zap.Error(err))
@@ -163,6 +171,48 @@ func (m *Manager) spaceChannels(c *wkhttp.Context) {
 		return
 	}
 	c.Response(map[string]interface{}{"count": total, "list": list})
+}
+
+// channelMembers 表三子表A：会话内成员消息统计汇总。
+func (m *Manager) channelMembers(c *wkhttp.Context) {
+	if !m.requireSuperAdmin(c) {
+		return
+	}
+	channelID := c.Param("channel_id")
+	if channelID == "" {
+		respRequestInvalid(c, "channel_id")
+		return
+	}
+	exists, err := m.service.groupChannelExists(channelID)
+	if err != nil {
+		m.Error("channel exists check failed", zap.Error(err))
+		respQueryFailed(c)
+		return
+	}
+	if !exists {
+		respNotFound(c)
+		return
+	}
+	start, end, ok := parseDateRange(c)
+	if !ok {
+		respRequestInvalid(c, "date_range")
+		return
+	}
+	memberTypes, ok := parseMemberTypes(c)
+	if !ok {
+		respRequestInvalid(c, "member_types")
+		return
+	}
+	pageIndex, pageSize := clampPage(c.GetPage())
+	resp, err := m.service.channelMemberList(
+		channelID, start, end, memberTypes, c.Query("keyword"),
+		c.Query("sort_by"), c.Query("order"), (pageIndex-1)*pageSize, pageSize)
+	if err != nil {
+		m.Error("channel member list query failed", zap.Error(err))
+		respQueryFailed(c)
+		return
+	}
+	c.Response(resp)
 }
 
 // globalDirectChats 全局私聊活跃列表(无活跃状态筛选；私聊恒活跃集)。
@@ -177,7 +227,7 @@ func (m *Manager) globalDirectChats(c *wkhttp.Context) {
 	}
 	pageIndex, pageSize := clampPage(c.GetPage())
 	list, total, err := m.service.directChatList(
-		start, end, c.Query("sort_by"), c.Query("order"), (pageIndex-1)*pageSize, pageSize)
+		start, end, c.Query("member_keyword"), c.Query("sort_by"), c.Query("order"), (pageIndex-1)*pageSize, pageSize)
 	if err != nil {
 		m.Error("direct chat list query failed", zap.Error(err))
 		respQueryFailed(c)
@@ -271,6 +321,81 @@ func parseSpaceIDs(c *wkhttp.Context) []string {
 		}
 		seen[id] = struct{}{}
 		out = append(out, id)
+	}
+	return out
+}
+
+func parseConvTypes(c *wkhttp.Context) ([]uint8, bool) {
+	return parseUint8QueryList(c, []string{"conv_types", "conv_types[]"}, map[uint8]struct{}{
+		convTypeHHGroup:   {},
+		convTypeHAGroup:   {},
+		convTypeHHPrivate: {},
+		convTypeHAPrivate: {},
+	})
+}
+
+func parseMemberTypes(c *wkhttp.Context) ([]uint8, bool) {
+	values := queryListValues(c, []string{"member_types", "member_types[]"})
+	if len(values) == 0 {
+		return nil, true
+	}
+	seen := map[uint8]struct{}{}
+	out := make([]uint8, 0, len(values))
+	for _, v := range values {
+		var t uint8
+		switch strings.ToLower(v) {
+		case "1", "human":
+			t = memberTypeHuman
+		case "2", "agent":
+			t = memberTypeAgent
+		default:
+			return nil, false
+		}
+		if _, ok := seen[t]; ok {
+			continue
+		}
+		seen[t] = struct{}{}
+		out = append(out, t)
+	}
+	return out, true
+}
+
+func parseUint8QueryList(c *wkhttp.Context, names []string, allowed map[uint8]struct{}) ([]uint8, bool) {
+	values := queryListValues(c, names)
+	if len(values) == 0 {
+		return nil, true
+	}
+	seen := map[uint8]struct{}{}
+	out := make([]uint8, 0, len(values))
+	for _, v := range values {
+		n, err := strconv.ParseUint(v, 10, 8)
+		if err != nil {
+			return nil, false
+		}
+		u := uint8(n)
+		if _, ok := allowed[u]; !ok {
+			return nil, false
+		}
+		if _, ok := seen[u]; ok {
+			continue
+		}
+		seen[u] = struct{}{}
+		out = append(out, u)
+	}
+	return out, true
+}
+
+func queryListValues(c *wkhttp.Context, names []string) []string {
+	out := make([]string, 0)
+	for _, name := range names {
+		for _, raw := range c.QueryArray(name) {
+			for _, part := range strings.Split(raw, ",") {
+				part = strings.TrimSpace(part)
+				if part != "" {
+					out = append(out, part)
+				}
+			}
+		}
 	}
 	return out
 }

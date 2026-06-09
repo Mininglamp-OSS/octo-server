@@ -415,7 +415,7 @@ var channelSortColumns = map[string]string{
 }
 
 // queryChannelList 表二群组列表(仅 channel_type=2)。activeStatus ∈ {all,active,inactive}。
-func (d *opanalyticsDB) queryChannelList(spaceID, start, end, activeStatus, sortBy, order string, offset, limit int) ([]*channelListItem, int64, error) {
+func (d *opanalyticsDB) queryChannelList(spaceID, start, end, activeStatus string, convTypes []uint8, memberKeyword, sortBy, order string, offset, limit int) ([]*channelListItem, int64, error) {
 	sortExpr, ok := channelSortColumns[sortBy]
 	if !ok {
 		sortExpr = "c.last_active_at"
@@ -434,11 +434,13 @@ func (d *opanalyticsDB) queryChannelList(spaceID, start, end, activeStatus, sort
 		"FROM octo_fact_channel_daily WHERE stat_date BETWEEN ? AND ? AND space_id=? AND channel_type=2 " +
 		"GROUP BY channel_id) f ON f.channel_id=c.channel_id " +
 		"WHERE c.space_id=? AND c.channel_type=2" + activeCond
+	args := []interface{}{start, end, spaceID, spaceID}
+	base = applyUint8FilterSQL(base, &args, "c.conv_type", convTypes)
+	base = applyChannelMemberKeywordSQL(base, &args, memberKeyword)
 
 	// 计数
 	var total int64
-	cntArgs := []interface{}{start, end, spaceID, spaceID}
-	_, err := d.session.SelectBySql("SELECT COUNT(*) "+base, cntArgs...).Load(&total)
+	_, err := d.session.SelectBySql("SELECT COUNT(*) "+base, args...).Load(&total)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -450,7 +452,7 @@ func (d *opanalyticsDB) queryChannelList(spaceID, start, end, activeStatus, sort
 		"c.status, c.last_active_at, IFNULL(f.hm,0) AS human_msg, IFNULL(f.am,0) AS agent_msg, " +
 		"(f.channel_id IS NOT NULL) AS is_active " + base +
 		fmt.Sprintf(" ORDER BY %s %s, c.channel_id ASC LIMIT ? OFFSET ?", sortExpr, dir)
-	listArgs := []interface{}{start, end, spaceID, spaceID, limit, offset}
+	listArgs := append(append([]interface{}{}, args...), limit, offset)
 
 	var rows []struct {
 		ChannelID        string `db:"channel_id"`
@@ -480,12 +482,95 @@ func (d *opanalyticsDB) queryChannelList(spaceID, start, end, activeStatus, sort
 	return out, total, nil
 }
 
+func applyChannelMemberKeywordSQL(base string, args *[]interface{}, keyword string) string {
+	keyword = strings.TrimSpace(keyword)
+	if keyword == "" {
+		return base
+	}
+	like := "%" + escapeLike(keyword) + "%"
+	*args = append(*args, like, like)
+	return base + " AND EXISTS (" +
+		"SELECT 1 FROM group_member gm JOIN octo_dim_member m ON m.uid=gm.uid " +
+		"WHERE gm.group_no=c.channel_id AND gm.status=1 AND gm.is_deleted=0 AND m.is_excluded=0 " +
+		"AND (m.name LIKE ? ESCAPE '!' OR m.email LIKE ? ESCAPE '!'))"
+}
+
 // spaceExists 仅在 Space 存在**且 status=1** 时返回 true：与 /spaces 列表口径一致，
 // 软删除的 Space 视为不存在(表二返回 404，而非 200+数据)。
 func (d *opanalyticsDB) spaceExists(spaceID string) (bool, error) {
 	var n int64
 	_, err := d.session.Select("count(*)").From("space").Where("space_id=? AND status=1", spaceID).Load(&n)
 	return n > 0, err
+}
+
+// groupChannelExists 表三仅开放正常群组；私聊仍走 global/direct-chats。
+func (d *opanalyticsDB) groupChannelExists(channelID string) (bool, error) {
+	var n int64
+	_, err := d.session.SelectBySql(
+		"SELECT COUNT(*) FROM octo_dim_channel c "+
+			"JOIN `group` g ON g.group_no=c.channel_id AND g.status=1 "+
+			"WHERE c.channel_id=? AND c.channel_type=2",
+		channelID,
+	).Load(&n)
+	return n > 0, err
+}
+
+var channelMemberSortColumns = map[string]string{
+	"total_msg_count": "total_msg_count",
+	"percentage":      "total_msg_count",
+}
+
+func (d *opanalyticsDB) queryChannelMemberList(channelID, start, end string, memberTypes []uint8, keyword, sortBy, order string, offset, limit int) ([]*channelMemberListItem, int64, int64, error) {
+	sortExpr, ok := channelMemberSortColumns[sortBy]
+	if !ok {
+		sortExpr = "total_msg_count"
+	}
+	dir := "DESC"
+	if strings.EqualFold(order, "asc") {
+		dir = "ASC"
+	}
+
+	var totalMsg int64
+	_, err := d.session.SelectBySql(
+		"SELECT IFNULL(SUM(f.msg_count),0) FROM octo_fact_member_channel_daily f "+
+			"JOIN octo_dim_member m ON m.uid=f.sender_uid "+
+			"WHERE f.channel_id=? AND f.channel_type=2 AND f.stat_date BETWEEN ? AND ? AND m.is_excluded=0",
+		channelID, start, end,
+	).Load(&totalMsg)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+
+	base := "FROM octo_fact_member_channel_daily f JOIN octo_dim_member m ON m.uid=f.sender_uid " +
+		"WHERE f.channel_id=? AND f.channel_type=2 AND f.stat_date BETWEEN ? AND ? AND m.is_excluded=0"
+	args := []interface{}{channelID, start, end}
+	base = applyUint8FilterSQL(base, &args, "m.member_type", memberTypes)
+	keyword = strings.TrimSpace(keyword)
+	if keyword != "" {
+		like := "%" + escapeLike(keyword) + "%"
+		base += " AND (m.name LIKE ? ESCAPE '!' OR m.email LIKE ? ESCAPE '!')"
+		args = append(args, like, like)
+	}
+
+	var total int64
+	cntSQL := "SELECT COUNT(*) FROM (SELECT f.sender_uid " + base + " GROUP BY f.sender_uid) x"
+	if _, err = d.session.SelectBySql(cntSQL, args...).Load(&total); err != nil {
+		return nil, 0, 0, err
+	}
+	if total == 0 {
+		return []*channelMemberListItem{}, 0, totalMsg, nil
+	}
+
+	sel := "SELECT f.sender_uid AS member_uid, m.name, m.email, m.phone, m.zone, m.member_type, " +
+		"SUM(f.msg_count) AS total_msg_count " + base +
+		fmt.Sprintf(" GROUP BY f.sender_uid, m.name, m.email, m.phone, m.zone, m.member_type ORDER BY %s %s, f.sender_uid ASC LIMIT ? OFFSET ?", sortExpr, dir)
+	listArgs := append(append([]interface{}{}, args...), limit, offset)
+
+	var rows []*channelMemberListItem
+	if _, err = d.session.SelectBySql(sel, listArgs...).Load(&rows); err != nil {
+		return nil, 0, 0, err
+	}
+	return rows, total, totalMsg, nil
 }
 
 // ===== 全局私聊活跃列表(SQL 侧聚合 + 分页) =====
@@ -495,7 +580,7 @@ var directSortColumns = map[string]string{
 	"last_active": "last_active",
 }
 
-func (d *opanalyticsDB) queryDirectChatList(start, end, sortBy, order string, offset, limit int) ([]*directChatItem, int64, error) {
+func (d *opanalyticsDB) queryDirectChatList(start, end, memberKeyword, sortBy, order string, offset, limit int) ([]*directChatItem, int64, error) {
 	sortExpr, ok := directSortColumns[sortBy]
 	if !ok {
 		sortExpr = "last_active"
@@ -505,11 +590,13 @@ func (d *opanalyticsDB) queryDirectChatList(start, end, sortBy, order string, of
 		dir = "ASC"
 	}
 
+	base := "FROM octo_fact_channel_daily f JOIN octo_dim_channel c ON c.channel_id=f.channel_id " +
+		"WHERE f.channel_type=1 AND f.stat_date BETWEEN ? AND ?"
+	args := []interface{}{start, end}
+	base = applyDirectMemberKeywordSQL(base, &args, memberKeyword)
+
 	var total int64
-	_, err := d.session.Select("COUNT(DISTINCT channel_id)").
-		From("octo_fact_channel_daily").
-		Where("channel_type=1 AND stat_date BETWEEN ? AND ?", start, end).
-		Load(&total)
+	_, err := d.session.SelectBySql("SELECT COUNT(DISTINCT f.channel_id) "+base, args...).Load(&total)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -519,10 +606,10 @@ func (d *opanalyticsDB) queryDirectChatList(start, end, sortBy, order string, of
 
 	sel := "SELECT f.channel_id AS channel_id, c.member_a_uid AS member_a_uid, c.member_b_uid AS member_b_uid, " +
 		"c.conv_type AS conv_type, SUM(f.human_msg_count + f.agent_msg_count) AS msg_count, MAX(f.last_msg_at) AS last_active " +
-		"FROM octo_fact_channel_daily f JOIN octo_dim_channel c ON c.channel_id=f.channel_id " +
-		"WHERE f.channel_type=1 AND f.stat_date BETWEEN ? AND ? " +
+		base + " " +
 		"GROUP BY f.channel_id, c.member_a_uid, c.member_b_uid, c.conv_type " +
 		fmt.Sprintf("ORDER BY %s %s, f.channel_id ASC LIMIT ? OFFSET ?", sortExpr, dir)
+	listArgs := append(append([]interface{}{}, args...), limit, offset)
 
 	var rows []struct {
 		ChannelID  string `db:"channel_id"`
@@ -532,7 +619,7 @@ func (d *opanalyticsDB) queryDirectChatList(start, end, sortBy, order string, of
 		MsgCount   int64  `db:"msg_count"`
 		LastActive int64  `db:"last_active"`
 	}
-	if _, err = d.session.SelectBySql(sel, start, end, limit, offset).Load(&rows); err != nil {
+	if _, err = d.session.SelectBySql(sel, listArgs...).Load(&rows); err != nil {
 		return nil, 0, err
 	}
 
@@ -544,6 +631,19 @@ func (d *opanalyticsDB) queryDirectChatList(start, end, sortBy, order string, of
 		})
 	}
 	return out, total, nil
+}
+
+func applyDirectMemberKeywordSQL(base string, args *[]interface{}, keyword string) string {
+	keyword = strings.TrimSpace(keyword)
+	if keyword == "" {
+		return base
+	}
+	like := "%" + escapeLike(keyword) + "%"
+	*args = append(*args, like, like)
+	return base + " AND EXISTS (" +
+		"SELECT 1 FROM octo_dim_member m " +
+		"WHERE m.uid IN (c.member_a_uid, c.member_b_uid) AND m.is_excluded=0 " +
+		"AND (m.name LIKE ? ESCAPE '!' OR m.email LIKE ? ESCAPE '!'))"
 }
 
 // queryMemberNames 批量取 uid→展示名(用于私聊"A & B"展示)。
@@ -589,6 +689,17 @@ func inClause(col string, vals []string) (string, []interface{}) {
 		args[i] = v
 	}
 	return col + " IN (" + ph + ")", args
+}
+
+func applyUint8FilterSQL(base string, args *[]interface{}, col string, vals []uint8) string {
+	if len(vals) == 0 {
+		return base
+	}
+	ph := strings.TrimSuffix(strings.Repeat("?,", len(vals)), ",")
+	for _, v := range vals {
+		*args = append(*args, v)
+	}
+	return base + " AND " + col + " IN (" + ph + ")"
 }
 
 func applySpaceFilter(stmt *dbr.SelectStmt, spaceIDs []string) *dbr.SelectStmt {
