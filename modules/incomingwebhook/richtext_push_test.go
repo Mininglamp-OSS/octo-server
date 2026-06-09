@@ -15,6 +15,10 @@ import (
 // （需 MySQL/Redis/WuKongIM，CI 执行）。成功路径断言「通过校验」而非强求 200：测试
 // 桩下游 SendMessage 可能返回 200 或 502，关键是请求没被 4xx（鉴权/校验）挡下——与
 // 既有 TestPush_* 的鲁棒断言口径一致。
+//
+// 这里只断言 HTTP 状态码、不断言 details.reason：testutil.NewTestServer 未挂 i18n
+// ErrorRenderer，错误体只是 legacy 的 {msg,status}（不含 error.details）。reason 契约
+// 改在 api_i18n_test.go 的 i18n 渲染器 harness 里锁（生产经 main.go 挂了该 renderer）。
 
 // createWebhookWithToken 创建一个 webhook 并返回 (webhook_id, token)。
 func createWebhookWithToken(t *testing.T, handler http.Handler, groupNo string) (string, string) {
@@ -64,7 +68,6 @@ func TestPush_RichText_RejectsEmptyBlocks(t *testing.T) {
 		"blocks":   []map[string]interface{}{},
 	})
 	assert.Equalf(t, http.StatusBadRequest, w.Code, "empty blocks must 400; body=%s", w.Body.String())
-	assert.Containsf(t, w.Body.String(), "blocks", "details.reason should be blocks; body=%s", w.Body.String())
 }
 
 // 图片块缺 width/height → 400。
@@ -79,7 +82,6 @@ func TestPush_RichText_RejectsBadImage(t *testing.T) {
 		},
 	})
 	assert.Equalf(t, http.StatusBadRequest, w.Code, "image without size must 400; body=%s", w.Body.String())
-	assert.Containsf(t, w.Body.String(), "blocks", "details.reason should be blocks; body=%s", w.Body.String())
 }
 
 // 非法 msg_type → 400（reason=msg_type）。
@@ -92,7 +94,6 @@ func TestPush_RejectsUnknownMsgType(t *testing.T) {
 		"content":  "hi",
 	})
 	assert.Equalf(t, http.StatusBadRequest, w.Code, "unknown msg_type must 400; body=%s", w.Body.String())
-	assert.Containsf(t, w.Body.String(), "msg_type", "details.reason should be msg_type; body=%s", w.Body.String())
 }
 
 // 向后兼容：显式 msg_type="text" 与缺省一致，纯文本仍走老路径通过校验。

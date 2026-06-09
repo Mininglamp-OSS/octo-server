@@ -117,3 +117,27 @@ func TestIncomingWebhookRespondHelpers(t *testing.T) {
 		})
 	}
 }
+
+// TestPushPayloadInvalidSurfacesReason locks the external contract that
+// pushPayloadInvalid surfaces details.reason in the i18n error envelope. This is
+// asserted HERE (with the i18n ErrorRenderer wired, as in production via main.go)
+// rather than in the full e2e harness: testutil.NewTestServer renders only the
+// legacy {msg,status} shape, so an e2e body never carries error.details — see the
+// note in richtext_push_test.go. No DB/Redis needed; this only exercises the renderer.
+func TestPushPayloadInvalidSurfacesReason(t *testing.T) {
+	for _, reason := range []string{"blocks", "msg_type", "content", "json"} {
+		t.Run(reason, func(t *testing.T) {
+			r := iwhHelperHarness(func(c *wkhttp.Context) { pushPayloadInvalid(c, reason) })
+			req := httptest.NewRequest(http.MethodGet, "/probe", nil)
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), reason) {
+				t.Fatalf("body must surface details.reason=%q; body=%s", reason, rec.Body.String())
+			}
+		})
+	}
+}
