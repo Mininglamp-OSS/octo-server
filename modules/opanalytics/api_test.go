@@ -689,8 +689,6 @@ func TestOpanalyticsChannelMembersEndpoint(t *testing.T) {
 		MemberUID     string  `json:"member_uid"`
 		Name          string  `json:"name"`
 		Email         string  `json:"email"`
-		Phone         string  `json:"phone"`
-		Zone          string  `json:"zone"`
 		MemberType    uint8   `json:"member_type"`
 		TotalMsgCount int64   `json:"total_msg_count"`
 		Percentage    float64 `json:"percentage"`
@@ -714,6 +712,15 @@ func TestOpanalyticsChannelMembersEndpoint(t *testing.T) {
 	assert.Equal(t, int64(5), resp.List[0].TotalMsgCount)
 	assert.InEpsilon(t, 0.5, resp.List[0].Percentage, 0.0001)
 
+	rawRec := opaGet(t, route, "/v1/manager/dashboard/channels/g1/members?start_date="+statDay+"&end_date="+statDay)
+	var raw struct {
+		List []map[string]interface{} `json:"list"`
+	}
+	decodeOK(t, rawRec, &raw)
+	require.NotEmpty(t, raw.List)
+	assert.NotContains(t, raw.List[0], "phone")
+	assert.NotContains(t, raw.List[0], "zone")
+
 	byUID := make(map[string]memberItem, len(resp.List))
 	for _, item := range resp.List {
 		byUID[item.MemberUID] = item
@@ -735,6 +742,11 @@ func TestOpanalyticsChannelMembersEndpoint(t *testing.T) {
 	assert.Equal(t, int64(1), alice.Count)
 	require.Len(t, alice.List, 1)
 	assert.Equal(t, "u_alice", alice.List[0].MemberUID)
+
+	aliceByMemberKeyword := getMembers("&member_keyword=alice%40example.com")
+	assert.Equal(t, int64(1), aliceByMemberKeyword.Count)
+	require.Len(t, aliceByMemberKeyword.List, 1)
+	assert.Equal(t, "u_alice", aliceByMemberKeyword.List[0].MemberUID)
 
 	asc := getMembers("&sort_by=percentage&order=asc")
 	require.Len(t, asc.List, 3)
