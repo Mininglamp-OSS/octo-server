@@ -138,6 +138,164 @@ func (d *opanalyticsDB) privateActiveCount(start, end string) (int64, error) {
 	return n, err
 }
 
+// queryMessageComposition 返回模块B会话类型分布。固定 conv_type 补齐在 service 层完成。
+func (d *opanalyticsDB) queryMessageComposition(start, end string, spaceIDs []string) ([]*messageCompositionItem, error) {
+	var rows []*messageCompositionItem
+	stmt := d.session.Select(
+		"conv_type",
+		"IFNULL(SUM(human_msg_count),0) AS human_msg_count",
+		"IFNULL(SUM(agent_msg_count),0) AS agent_msg_count",
+		"COUNT(DISTINCT channel_id) AS active_channel_count",
+	).From("octo_fact_channel_daily").
+		Where("stat_date BETWEEN ? AND ?", start, end).
+		Where("conv_type BETWEEN 1 AND 4").
+		GroupBy("conv_type")
+	stmt = applySpaceFilter(stmt, spaceIDs)
+	_, err := stmt.Load(&rows)
+	return rows, err
+}
+
+type trendChannelAgg struct {
+	HumanMsg      int64
+	AgentMsg      int64
+	ActiveGroups  int64
+	PrivateActive int64
+}
+
+type trendMemberAgg struct {
+	ActiveHuman int64
+	ActiveAgent int64
+}
+
+type trendConvTypeAgg struct {
+	HumanMsg int64
+	AgentMsg int64
+}
+
+func (d *opanalyticsDB) queryTrendChannelAgg(start, end, granularity string, spaceIDs []string) (map[string]trendChannelAgg, map[string]map[uint8]trendConvTypeAgg, error) {
+	total, err := d.queryTrendChannelTotals(start, end, granularity, spaceIDs)
+	if err != nil {
+		return nil, nil, err
+	}
+	conv, err := d.queryTrendConvTypeMsg(start, end, granularity, spaceIDs)
+	if err != nil {
+		return nil, nil, err
+	}
+	return total, conv, nil
+}
+
+func (d *opanalyticsDB) queryTrendChannelTotals(start, end, granularity string, spaceIDs []string) (map[string]trendChannelAgg, error) {
+	bucketExpr := trendBucketSQL("stat_date", granularity)
+	sql := "SELECT " + bucketExpr + " AS bucket, " +
+		"IFNULL(SUM(human_msg_count),0) AS human_msg, " +
+		"IFNULL(SUM(agent_msg_count),0) AS agent_msg, " +
+		"COUNT(DISTINCT CASE WHEN channel_type=2 THEN channel_id END) AS active_groups, " +
+		"COUNT(DISTINCT CASE WHEN channel_type=1 THEN channel_id END) AS private_active " +
+		"FROM octo_fact_channel_daily WHERE stat_date BETWEEN ? AND ?"
+	args := []interface{}{start, end}
+	if len(spaceIDs) > 0 {
+		spaceClause, spaceArgs := inClause("space_id", spaceIDs)
+		sql += " AND " + spaceClause
+		args = append(args, spaceArgs...)
+	}
+	sql += " GROUP BY bucket"
+
+	var rows []struct {
+		Bucket        string `db:"bucket"`
+		HumanMsg      int64  `db:"human_msg"`
+		AgentMsg      int64  `db:"agent_msg"`
+		ActiveGroups  int64  `db:"active_groups"`
+		PrivateActive int64  `db:"private_active"`
+	}
+	if _, err := d.session.SelectBySql(sql, args...).Load(&rows); err != nil {
+		return nil, err
+	}
+	out := make(map[string]trendChannelAgg, len(rows))
+	for _, r := range rows {
+		out[r.Bucket] = trendChannelAgg{
+			HumanMsg: r.HumanMsg, AgentMsg: r.AgentMsg,
+			ActiveGroups: r.ActiveGroups, PrivateActive: r.PrivateActive,
+		}
+	}
+	return out, nil
+}
+
+func (d *opanalyticsDB) queryTrendConvTypeMsg(start, end, granularity string, spaceIDs []string) (map[string]map[uint8]trendConvTypeAgg, error) {
+	bucketExpr := trendBucketSQL("stat_date", granularity)
+	sql := "SELECT " + bucketExpr + " AS bucket, conv_type, " +
+		"IFNULL(SUM(human_msg_count),0) AS human_msg, " +
+		"IFNULL(SUM(agent_msg_count),0) AS agent_msg " +
+		"FROM octo_fact_channel_daily WHERE stat_date BETWEEN ? AND ? AND conv_type BETWEEN 1 AND 4"
+	args := []interface{}{start, end}
+	if len(spaceIDs) > 0 {
+		spaceClause, spaceArgs := inClause("space_id", spaceIDs)
+		sql += " AND " + spaceClause
+		args = append(args, spaceArgs...)
+	}
+	sql += " GROUP BY bucket, conv_type"
+
+	var rows []struct {
+		Bucket   string `db:"bucket"`
+		ConvType uint8  `db:"conv_type"`
+		HumanMsg int64  `db:"human_msg"`
+		AgentMsg int64  `db:"agent_msg"`
+	}
+	if _, err := d.session.SelectBySql(sql, args...).Load(&rows); err != nil {
+		return nil, err
+	}
+	out := make(map[string]map[uint8]trendConvTypeAgg, len(rows))
+	for _, r := range rows {
+		if out[r.Bucket] == nil {
+			out[r.Bucket] = map[uint8]trendConvTypeAgg{}
+		}
+		out[r.Bucket][r.ConvType] = trendConvTypeAgg{HumanMsg: r.HumanMsg, AgentMsg: r.AgentMsg}
+	}
+	return out, nil
+}
+
+func (d *opanalyticsDB) queryTrendActiveMembers(start, end, granularity string, spaceIDs []string) (map[string]trendMemberAgg, error) {
+	bucketExpr := trendBucketSQL("f.stat_date", granularity)
+	sql := "SELECT " + bucketExpr + " AS bucket, " +
+		"COUNT(DISTINCT CASE WHEN m.member_type=1 THEN f.sender_uid END) AS active_human, " +
+		"COUNT(DISTINCT CASE WHEN m.member_type=2 THEN f.sender_uid END) AS active_agent " +
+		"FROM octo_fact_member_channel_daily f JOIN octo_dim_member m ON m.uid = f.sender_uid"
+	args := []interface{}{}
+	if len(spaceIDs) > 0 {
+		smClause, smArgs := inClause("sm.space_id", spaceIDs)
+		sql += " JOIN space_member sm ON sm.uid = f.sender_uid AND sm.status=1 AND " + smClause
+		args = append(args, smArgs...)
+	}
+	sql += " WHERE f.stat_date BETWEEN ? AND ? AND m.is_excluded=0"
+	args = append(args, start, end)
+	if len(spaceIDs) > 0 {
+		spaceClause, spaceArgs := inClause("f.space_id", spaceIDs)
+		sql += " AND " + spaceClause
+		args = append(args, spaceArgs...)
+	}
+	sql += " GROUP BY bucket"
+
+	var rows []struct {
+		Bucket      string `db:"bucket"`
+		ActiveHuman int64  `db:"active_human"`
+		ActiveAgent int64  `db:"active_agent"`
+	}
+	if _, err := d.session.SelectBySql(sql, args...).Load(&rows); err != nil {
+		return nil, err
+	}
+	out := make(map[string]trendMemberAgg, len(rows))
+	for _, r := range rows {
+		out[r.Bucket] = trendMemberAgg{ActiveHuman: r.ActiveHuman, ActiveAgent: r.ActiveAgent}
+	}
+	return out, nil
+}
+
+func trendBucketSQL(col, granularity string) string {
+	if granularity == "week" {
+		return "DATE_FORMAT(DATE_SUB(" + col + ", INTERVAL WEEKDAY(" + col + ") DAY), '%Y-%m-%d')"
+	}
+	return "DATE_FORMAT(" + col + ", '%Y-%m-%d')"
+}
+
 // ===== 表一 Space 列表(在内存合并/排序/分页，spaces 数量适中) =====
 
 type spaceBaseRow struct {

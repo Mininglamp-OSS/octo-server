@@ -406,6 +406,30 @@ func countFacts(t *testing.T, ctx *config.Context) (int64, int64) {
 	return r3, r4
 }
 
+func compositionByType(items []*messageCompositionItem) map[uint8]*messageCompositionItem {
+	out := make(map[uint8]*messageCompositionItem, len(items))
+	for _, item := range items {
+		out[item.ConvType] = item
+	}
+	return out
+}
+
+func trendByBucket(items []*trendItem) map[string]*trendItem {
+	out := make(map[string]*trendItem, len(items))
+	for _, item := range items {
+		out[item.Bucket] = item
+	}
+	return out
+}
+
+func trendConvByType(items []*trendConvTypeMsgItem) map[uint8]*trendConvTypeMsgItem {
+	out := make(map[uint8]*trendConvTypeMsgItem, len(items))
+	for _, item := range items {
+		out[item.ConvType] = item
+	}
+	return out
+}
+
 func TestOpanalyticsEndpoints(t *testing.T) {
 	ctx, route, etl := opaSetup(t)
 	seedScenario(t, ctx)
@@ -426,6 +450,21 @@ func TestOpanalyticsEndpoints(t *testing.T) {
 	assert.Equal(t, int64(12), ov.HumanMsgCount) // g1:5 + g2:2 + private:5
 	assert.Equal(t, int64(5), ov.AgentMsgCount)
 	assert.Equal(t, int64(1), ov.PrivateActiveCount)
+	ovComp := compositionByType(ov.MessageComposition)
+	require.Len(t, ovComp, 4, "overview composition must always return conv_type 1..4")
+	assert.Equal(t, int64(2), ovComp[convTypeHHGroup].HumanMsgCount)
+	assert.Equal(t, int64(0), ovComp[convTypeHHGroup].AgentMsgCount)
+	assert.Equal(t, int64(2), ovComp[convTypeHHGroup].TotalMsgCount)
+	assert.Equal(t, int64(1), ovComp[convTypeHHGroup].ActiveChannelCount)
+	assert.Equal(t, int64(5), ovComp[convTypeHAGroup].HumanMsgCount)
+	assert.Equal(t, int64(5), ovComp[convTypeHAGroup].AgentMsgCount)
+	assert.Equal(t, int64(10), ovComp[convTypeHAGroup].TotalMsgCount)
+	assert.Equal(t, int64(1), ovComp[convTypeHAGroup].ActiveChannelCount)
+	assert.Equal(t, int64(5), ovComp[convTypeHHPrivate].HumanMsgCount)
+	assert.Equal(t, int64(0), ovComp[convTypeHHPrivate].AgentMsgCount)
+	assert.Equal(t, int64(5), ovComp[convTypeHHPrivate].TotalMsgCount)
+	assert.Equal(t, int64(1), ovComp[convTypeHHPrivate].ActiveChannelCount)
+	assert.Zero(t, ovComp[convTypeHAPrivate].TotalMsgCount)
 
 	// ---- overview 限定 Space=s1：总数也随筛选收敛(否则活跃比例失真) ----
 	var ovS1 overviewResp
@@ -440,6 +479,23 @@ func TestOpanalyticsEndpoints(t *testing.T) {
 	assert.Equal(t, int64(5), ovS1.HumanMsgCount, "私聊/g2 不计入 s1")
 	assert.Equal(t, int64(5), ovS1.AgentMsgCount)
 	assert.Equal(t, int64(0), ovS1.PrivateActiveCount, "选中 Space 时私聊数置 0(私聊无 space 归属)")
+	ovS1Comp := compositionByType(ovS1.MessageComposition)
+	require.Len(t, ovS1Comp, 4)
+	assert.Equal(t, int64(10), ovS1Comp[convTypeHAGroup].TotalMsgCount)
+	assert.Equal(t, int64(1), ovS1Comp[convTypeHAGroup].ActiveChannelCount)
+	assert.Zero(t, ovS1Comp[convTypeHHGroup].TotalMsgCount)
+	assert.Zero(t, ovS1Comp[convTypeHHPrivate].TotalMsgCount, "选中 Space 时私聊 composition 为 0")
+	assert.Zero(t, ovS1Comp[convTypeHAPrivate].TotalMsgCount, "选中 Space 时私聊 composition 为 0")
+
+	// ---- overview 空范围：composition 仍固定 4 类且全部补 0 ----
+	var empty overviewResp
+	decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/overview?start_date=2026-05-31&end_date=2026-05-31"), &empty)
+	emptyComp := compositionByType(empty.MessageComposition)
+	require.Len(t, emptyComp, 4)
+	for _, item := range emptyComp {
+		assert.Zero(t, item.TotalMsgCount)
+		assert.Zero(t, item.ActiveChannelCount)
+	}
 
 	// ---- spaces (表一) ----
 	var spaces struct {
@@ -501,6 +557,98 @@ func TestOpanalyticsEndpoints(t *testing.T) {
 	// ---- 非 superAdmin → 403 ----
 	setPlainUserToken(t, ctx)
 	rec = opaGet(t, route, "/v1/manager/dashboard/overview"+rng)
+	assert.Equal(t, "err.server.opanalytics.forbidden", errorCode(t, rec))
+}
+
+func TestOpanalyticsTrendEndpoint(t *testing.T) {
+	ctx, route, etl := opaSetup(t)
+	seedScenario(t, ctx)
+	require.NoError(t, etl.RunIncremental())
+
+	nextDay := "2026-06-02"
+	nextStart, _, err := dayWindowUnix(nextDay)
+	require.NoError(t, err)
+	insertMsgs(t, ctx, "u_alice", "g1", channelTypeGroup, nextStart+3600, 1, 0)
+	insertMsgs(t, ctx, "u_agent", "g1", channelTypeGroup, nextStart+3610, 1, 0)
+	require.NoError(t, etl.RunIncremental())
+
+	var dayTrend trendResp
+	decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/trend?start_date=2026-05-31&end_date=2026-06-02&granularity=day"), &dayTrend)
+	assert.Equal(t, "day", dayTrend.Granularity)
+	require.Len(t, dayTrend.List, 3)
+	byDay := trendByBucket(dayTrend.List)
+
+	may31 := byDay["2026-05-31"]
+	require.NotNil(t, may31)
+	assert.Equal(t, "2026-05-31", may31.StartDate)
+	assert.Equal(t, "2026-05-31", may31.EndDate)
+	assert.Zero(t, may31.TotalMsgCount, "missing days must be zero-filled")
+	assert.Zero(t, may31.ActiveHumanMembers)
+
+	jun1 := byDay[statDay]
+	require.NotNil(t, jun1)
+	assert.Equal(t, int64(12), jun1.HumanMsgCount)
+	assert.Equal(t, int64(5), jun1.AgentMsgCount)
+	assert.Equal(t, int64(17), jun1.TotalMsgCount)
+	assert.Equal(t, int64(3), jun1.ActiveHumanMembers)
+	assert.Equal(t, int64(1), jun1.ActiveAgentMembers)
+	assert.Equal(t, int64(2), jun1.ActiveGroups)
+	assert.Equal(t, int64(1), jun1.PrivateActiveCount)
+	jun1Conv := trendConvByType(jun1.ConvTypeMsgCounts)
+	require.Len(t, jun1Conv, 4)
+	assert.Equal(t, int64(2), jun1Conv[convTypeHHGroup].TotalMsgCount)
+	assert.Equal(t, int64(10), jun1Conv[convTypeHAGroup].TotalMsgCount)
+	assert.Equal(t, int64(5), jun1Conv[convTypeHHPrivate].TotalMsgCount)
+	assert.Zero(t, jun1Conv[convTypeHAPrivate].TotalMsgCount)
+
+	jun2 := byDay[nextDay]
+	require.NotNil(t, jun2)
+	assert.Equal(t, int64(1), jun2.HumanMsgCount)
+	assert.Equal(t, int64(1), jun2.AgentMsgCount)
+	assert.Equal(t, int64(2), jun2.TotalMsgCount)
+	assert.Equal(t, int64(1), jun2.ActiveHumanMembers)
+	assert.Equal(t, int64(1), jun2.ActiveAgentMembers)
+	assert.Equal(t, int64(1), jun2.ActiveGroups)
+	assert.Zero(t, jun2.PrivateActiveCount)
+
+	var weekTrend trendResp
+	decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/trend?start_date=2026-06-01&end_date=2026-06-07&granularity=week"), &weekTrend)
+	assert.Equal(t, "week", weekTrend.Granularity)
+	require.Len(t, weekTrend.List, 1)
+	week := weekTrend.List[0]
+	assert.Equal(t, "2026-06-01", week.Bucket, "week bucket is Monday in report timezone")
+	assert.Equal(t, "2026-06-01", week.StartDate)
+	assert.Equal(t, "2026-06-07", week.EndDate)
+	assert.Equal(t, int64(13), week.HumanMsgCount)
+	assert.Equal(t, int64(6), week.AgentMsgCount)
+	assert.Equal(t, int64(19), week.TotalMsgCount)
+	assert.Equal(t, int64(3), week.ActiveHumanMembers, "week active members must be bucket-level distinct, not daily sums")
+	assert.Equal(t, int64(1), week.ActiveAgentMembers)
+	assert.Equal(t, int64(2), week.ActiveGroups, "week active groups must be bucket-level distinct, not daily sums")
+	assert.Equal(t, int64(1), week.PrivateActiveCount)
+	weekConv := trendConvByType(week.ConvTypeMsgCounts)
+	assert.Equal(t, int64(2), weekConv[convTypeHHGroup].TotalMsgCount)
+	assert.Equal(t, int64(12), weekConv[convTypeHAGroup].TotalMsgCount)
+	assert.Equal(t, int64(5), weekConv[convTypeHHPrivate].TotalMsgCount)
+	assert.Zero(t, weekConv[convTypeHAPrivate].TotalMsgCount)
+
+	var s1Trend trendResp
+	decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/trend?start_date="+statDay+"&end_date="+statDay+"&space_ids=s1"), &s1Trend)
+	require.Len(t, s1Trend.List, 1)
+	s1Day := s1Trend.List[0]
+	assert.Equal(t, int64(5), s1Day.HumanMsgCount)
+	assert.Equal(t, int64(5), s1Day.AgentMsgCount)
+	assert.Equal(t, int64(1), s1Day.ActiveGroups)
+	assert.Zero(t, s1Day.PrivateActiveCount, "选中 Space 时私聊趋势置 0")
+	s1Conv := trendConvByType(s1Day.ConvTypeMsgCounts)
+	assert.Equal(t, int64(10), s1Conv[convTypeHAGroup].TotalMsgCount)
+	assert.Zero(t, s1Conv[convTypeHHPrivate].TotalMsgCount, "选中 Space 时私聊 conv_type 置 0")
+
+	rec := opaGet(t, route, "/v1/manager/dashboard/trend?start_date="+statDay+"&end_date="+statDay+"&granularity=month")
+	assert.Equal(t, "err.server.opanalytics.request_invalid", errorCode(t, rec))
+
+	setPlainUserToken(t, ctx)
+	rec = opaGet(t, route, "/v1/manager/dashboard/trend?start_date="+statDay+"&end_date="+statDay)
 	assert.Equal(t, "err.server.opanalytics.forbidden", errorCode(t, rec))
 }
 

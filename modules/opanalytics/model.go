@@ -76,16 +76,53 @@ type srcMessageRow struct {
 
 // overviewResp 模块A 概览卡片(私聊只出活跃数，无总数/占比)。
 type overviewResp struct {
-	SpaceTotal         int64 `json:"space_total"`
-	GroupTotal         int64 `json:"group_total"`
-	HumanMemberTotal   int64 `json:"human_member_total"`
-	AgentTotal         int64 `json:"agent_total"`
-	ActiveGroups       int64 `json:"active_groups"`
-	ActiveHumanMembers int64 `json:"active_human_members"`
-	ActiveAgentMembers int64 `json:"active_agent_members"`
+	SpaceTotal         int64                     `json:"space_total"`
+	GroupTotal         int64                     `json:"group_total"`
+	HumanMemberTotal   int64                     `json:"human_member_total"`
+	AgentTotal         int64                     `json:"agent_total"`
+	ActiveGroups       int64                     `json:"active_groups"`
+	ActiveHumanMembers int64                     `json:"active_human_members"`
+	ActiveAgentMembers int64                     `json:"active_agent_members"`
+	HumanMsgCount      int64                     `json:"human_msg_count"`
+	AgentMsgCount      int64                     `json:"agent_msg_count"`
+	PrivateActiveCount int64                     `json:"private_active_count"` // 私聊活跃数(口径1：不出总数)
+	MessageComposition []*messageCompositionItem `json:"message_composition"`
+}
+
+// messageCompositionItem 模块B 会话类型分布(固定 conv_type=1..4，缺数据补 0)。
+type messageCompositionItem struct {
+	ConvType           uint8 `json:"conv_type"`
 	HumanMsgCount      int64 `json:"human_msg_count"`
 	AgentMsgCount      int64 `json:"agent_msg_count"`
-	PrivateActiveCount int64 `json:"private_active_count"` // 私聊活跃数(口径1：不出总数)
+	TotalMsgCount      int64 `json:"total_msg_count"`
+	ActiveChannelCount int64 `json:"active_channel_count"`
+}
+
+// trendResp 模块C 趋势响应。
+type trendResp struct {
+	Granularity string       `json:"granularity"`
+	List        []*trendItem `json:"list"`
+}
+
+type trendItem struct {
+	Bucket             string                  `json:"bucket"`
+	StartDate          string                  `json:"start_date"`
+	EndDate            string                  `json:"end_date"`
+	HumanMsgCount      int64                   `json:"human_msg_count"`
+	AgentMsgCount      int64                   `json:"agent_msg_count"`
+	TotalMsgCount      int64                   `json:"total_msg_count"`
+	ActiveHumanMembers int64                   `json:"active_human_members"`
+	ActiveAgentMembers int64                   `json:"active_agent_members"`
+	ActiveGroups       int64                   `json:"active_groups"`
+	PrivateActiveCount int64                   `json:"private_active_count"`
+	ConvTypeMsgCounts  []*trendConvTypeMsgItem `json:"conv_type_msg_counts"`
+}
+
+type trendConvTypeMsgItem struct {
+	ConvType      uint8 `json:"conv_type"`
+	HumanMsgCount int64 `json:"human_msg_count"`
+	AgentMsgCount int64 `json:"agent_msg_count"`
+	TotalMsgCount int64 `json:"total_msg_count"`
 }
 
 // spaceListItem 表一 Space 列表行。

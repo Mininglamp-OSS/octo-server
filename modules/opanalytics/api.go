@@ -55,6 +55,7 @@ func (m *Manager) Route(r *wkhttp.WKHttp) {
 	auth := r.Group("/v1/manager/dashboard", m.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, m.ctx))
 	{
 		auth.GET("/overview", m.overview)                       // 模块A 概览卡片
+		auth.GET("/trend", m.trend)                             // 模块C 趋势
 		auth.GET("/spaces", m.spaces)                           // 表一 Space 列表
 		auth.GET("/spaces/:space_id/channels", m.spaceChannels) // 表二 群组列表(仅群组)
 		auth.GET("/global/direct-chats", m.globalDirectChats)   // 全局私聊活跃列表
@@ -75,6 +76,30 @@ func (m *Manager) overview(c *wkhttp.Context) {
 	resp, err := m.service.overview(start, end, parseSpaceIDs(c))
 	if err != nil {
 		m.Error("overview query failed", zap.Error(err))
+		respQueryFailed(c)
+		return
+	}
+	c.Response(resp)
+}
+
+// trend 模块C 趋势(day/week，缺桶补 0)。
+func (m *Manager) trend(c *wkhttp.Context) {
+	if !m.requireSuperAdmin(c) {
+		return
+	}
+	start, end, ok := parseDateRange(c)
+	if !ok {
+		respRequestInvalid(c, "date_range")
+		return
+	}
+	granularity, ok := normalizeGranularity(c.Query("granularity"))
+	if !ok {
+		respRequestInvalid(c, "granularity")
+		return
+	}
+	resp, err := m.service.trend(start, end, granularity, parseSpaceIDs(c))
+	if err != nil {
+		m.Error("trend query failed", zap.Error(err))
 		respQueryFailed(c)
 		return
 	}
@@ -257,6 +282,18 @@ func normalizeActiveStatus(v string) string {
 		return v
 	default:
 		return "all"
+	}
+}
+
+// normalizeGranularity 收敛为 day/week，缺省 day。
+func normalizeGranularity(v string) (string, bool) {
+	switch v {
+	case "", "day":
+		return "day", true
+	case "week":
+		return "week", true
+	default:
+		return "", false
 	}
 }
 

@@ -12,7 +12,7 @@ func respForbidden(c *wkhttp.Context) {
 	httperr.ResponseErrorL(c, errcode.ErrOpanalyticsForbidden, nil, nil)
 }
 
-// respRequestInvalid 请求参数无效(reason ∈ {date_range, space_id, sort})。
+// respRequestInvalid 请求参数无效(reason 如 date_range / granularity / space_id / sort)。
 func respRequestInvalid(c *wkhttp.Context, reason string) {
 	details := i18n.Details{}
 	if reason != "" {

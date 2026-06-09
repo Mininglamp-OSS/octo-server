@@ -2,6 +2,7 @@ package opanalytics
 
 import (
 	"sort"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
@@ -51,6 +52,10 @@ func (s *service) overview(start, end string, spaceIDs []string) (*overviewResp,
 			return nil, err
 		}
 	}
+	composition, err := s.db.queryMessageComposition(start, end, spaceIDs)
+	if err != nil {
+		return nil, err
+	}
 	return &overviewResp{
 		SpaceTotal:         spaceTotal,
 		GroupTotal:         groupTotal,
@@ -62,7 +67,46 @@ func (s *service) overview(start, end string, spaceIDs []string) (*overviewResp,
 		HumanMsgCount:      humanMsg,
 		AgentMsgCount:      agentMsg,
 		PrivateActiveCount: privateActive,
+		MessageComposition: normalizeMessageComposition(composition),
 	}, nil
+}
+
+// trend 组装模块C 趋势。消息/活跃会话走 ④，活跃成员走 ③ join 当前 dim_member；
+// week 桶内活跃成员按 distinct 计算，不能把每日活跃数相加。
+func (s *service) trend(start, end, granularity string, spaceIDs []string) (*trendResp, error) {
+	buckets, err := buildTrendBuckets(start, end, granularity)
+	if err != nil {
+		return nil, err
+	}
+	channelAgg, convAgg, err := s.db.queryTrendChannelAgg(start, end, granularity, spaceIDs)
+	if err != nil {
+		return nil, err
+	}
+	memberAgg, err := s.db.queryTrendActiveMembers(start, end, granularity, spaceIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	items := make([]*trendItem, 0, len(buckets))
+	for _, b := range buckets {
+		ca := channelAgg[b.Bucket]
+		ma := memberAgg[b.Bucket]
+		item := &trendItem{
+			Bucket:             b.Bucket,
+			StartDate:          b.StartDate,
+			EndDate:            b.EndDate,
+			HumanMsgCount:      ca.HumanMsg,
+			AgentMsgCount:      ca.AgentMsg,
+			TotalMsgCount:      ca.HumanMsg + ca.AgentMsg,
+			ActiveHumanMembers: ma.ActiveHuman,
+			ActiveAgentMembers: ma.ActiveAgent,
+			ActiveGroups:       ca.ActiveGroups,
+			PrivateActiveCount: ca.PrivateActive,
+			ConvTypeMsgCounts:  normalizeTrendConvTypes(convAgg[b.Bucket]),
+		}
+		items = append(items, item)
+	}
+	return &trendResp{Granularity: granularity, List: items}, nil
 }
 
 // spaceList 表一：内存合并维表/活跃聚合 → 过滤(活跃状态) → 排序 → 分页。
@@ -122,6 +166,93 @@ func (s *service) spaceList(start, end, name, activeStatus, sortBy, order string
 		end2 = len(items)
 	}
 	return items[offset:end2], total, nil
+}
+
+func normalizeMessageComposition(rows []*messageCompositionItem) []*messageCompositionItem {
+	byType := make(map[uint8]*messageCompositionItem, len(rows))
+	for _, row := range rows {
+		cp := *row
+		cp.TotalMsgCount = cp.HumanMsgCount + cp.AgentMsgCount
+		byType[cp.ConvType] = &cp
+	}
+	out := make([]*messageCompositionItem, 0, 4)
+	for _, convType := range []uint8{convTypeHHGroup, convTypeHAGroup, convTypeHHPrivate, convTypeHAPrivate} {
+		if row := byType[convType]; row != nil {
+			out = append(out, row)
+			continue
+		}
+		out = append(out, &messageCompositionItem{ConvType: convType})
+	}
+	return out
+}
+
+func normalizeTrendConvTypes(rows map[uint8]trendConvTypeAgg) []*trendConvTypeMsgItem {
+	out := make([]*trendConvTypeMsgItem, 0, 4)
+	for _, convType := range []uint8{convTypeHHGroup, convTypeHAGroup, convTypeHHPrivate, convTypeHAPrivate} {
+		row := rows[convType]
+		out = append(out, &trendConvTypeMsgItem{
+			ConvType:      convType,
+			HumanMsgCount: row.HumanMsg,
+			AgentMsgCount: row.AgentMsg,
+			TotalMsgCount: row.HumanMsg + row.AgentMsg,
+		})
+	}
+	return out
+}
+
+type trendBucket struct {
+	Bucket    string
+	StartDate string
+	EndDate   string
+}
+
+func buildTrendBuckets(start, end, granularity string) ([]trendBucket, error) {
+	loc := reportLocation()
+	const layout = "2006-01-02"
+	startDate, err := time.ParseInLocation(layout, start, loc)
+	if err != nil {
+		return nil, err
+	}
+	endDate, err := time.ParseInLocation(layout, end, loc)
+	if err != nil {
+		return nil, err
+	}
+	if granularity == "week" {
+		return buildWeekBuckets(startDate, endDate), nil
+	}
+	out := make([]trendBucket, 0, int(endDate.Sub(startDate)/(24*time.Hour))+1)
+	for d := startDate; !d.After(endDate); d = d.AddDate(0, 0, 1) {
+		day := d.Format(layout)
+		out = append(out, trendBucket{Bucket: day, StartDate: day, EndDate: day})
+	}
+	return out, nil
+}
+
+func buildWeekBuckets(start, end time.Time) []trendBucket {
+	const layout = "2006-01-02"
+	weekStart := mondayOf(start)
+	out := make([]trendBucket, 0)
+	for d := weekStart; !d.After(end); d = d.AddDate(0, 0, 7) {
+		bs := d
+		if bs.Before(start) {
+			bs = start
+		}
+		be := d.AddDate(0, 0, 6)
+		if be.After(end) {
+			be = end
+		}
+		out = append(out, trendBucket{
+			Bucket:    d.Format(layout),
+			StartDate: bs.Format(layout),
+			EndDate:   be.Format(layout),
+		})
+	}
+	return out
+}
+
+func mondayOf(d time.Time) time.Time {
+	offset := (int(d.Weekday()) + 6) % 7 // Go: Sunday=0; desired Monday=0.
+	return d.AddDate(0, 0, -offset)
 }
 
 // channelList 表二(仅群组)：SQL 侧 LEFT JOIN + 分页。

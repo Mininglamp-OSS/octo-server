@@ -58,6 +58,57 @@ paths:
       security:
         - token: []
 
+  /manager/dashboard/trend:
+    get:
+      tags:
+        - "opanalyticsManager"
+      summary: "趋势图（模块C）"
+      description: >
+        按 day/week 返回消息量、活跃成员、活跃群、活跃私聊和会话类型消息分布。
+        week 以报告时区周一作为 bucket；缺失日期/周补 0。选中 space 时私聊指标返回 0。
+      operationId: "m dashboard trend"
+      produces:
+        - "application/json"
+      parameters:
+        - in: "query"
+          name: "start_date"
+          type: string
+          format: date
+          description: "起始统计日 YYYY-MM-DD（报告时区）。缺省=近 30 天；含两端最多 366 天"
+          required: false
+        - in: "query"
+          name: "end_date"
+          type: string
+          format: date
+          description: "结束统计日 YYYY-MM-DD（含）。缺省=今天"
+          required: false
+        - in: "query"
+          name: "space_ids"
+          type: array
+          items:
+            type: string
+          collectionFormat: multi
+          description: "可选空间筛选；多值用 space_ids=a&space_ids=b。为空=全局"
+          required: false
+        - in: "query"
+          name: "granularity"
+          type: string
+          enum: ["day", "week"]
+          default: "day"
+          description: "趋势粒度"
+          required: false
+      responses:
+        200:
+          description: "趋势数据"
+          schema:
+            $ref: "#/definitions/trendResp"
+        400:
+          description: "错误（error.http_status 含真实状态码）"
+          schema:
+            $ref: "#/definitions/dashboardError"
+      security:
+        - token: []
+
   /manager/dashboard/spaces:
     get:
       tags:
@@ -337,6 +388,104 @@ definitions:
         type: integer
         format: int64
         description: "范围内活跃私聊数（全局；选中 space 时为 0）"
+      message_composition:
+        type: array
+        description: "会话类型分布，固定返回 conv_type 1..4；选中 space 时私聊类型为 0"
+        items:
+          $ref: "#/definitions/messageCompositionItem"
+
+  messageCompositionItem:
+    type: object
+    properties:
+      conv_type:
+        type: integer
+        description: "会话类型 1.HH群 2.HA群 3.HH私聊 4.HA私聊"
+      human_msg_count:
+        type: integer
+        format: int64
+      agent_msg_count:
+        type: integer
+        format: int64
+      total_msg_count:
+        type: integer
+        format: int64
+      active_channel_count:
+        type: integer
+        format: int64
+        description: "范围内该类型活跃会话数"
+
+  trendResp:
+    type: object
+    properties:
+      granularity:
+        type: string
+        enum: ["day", "week"]
+      list:
+        type: array
+        items:
+          $ref: "#/definitions/trendItem"
+
+  trendItem:
+    type: object
+    properties:
+      bucket:
+        type: string
+        format: date
+        description: "bucket 起点；day=当天，week=报告时区周一"
+      start_date:
+        type: string
+        format: date
+        description: "该 bucket 在请求范围内的起始日期"
+      end_date:
+        type: string
+        format: date
+        description: "该 bucket 在请求范围内的结束日期"
+      human_msg_count:
+        type: integer
+        format: int64
+      agent_msg_count:
+        type: integer
+        format: int64
+      total_msg_count:
+        type: integer
+        format: int64
+      active_human_members:
+        type: integer
+        format: int64
+        description: "bucket 内活跃 human 成员去重数"
+      active_agent_members:
+        type: integer
+        format: int64
+        description: "bucket 内活跃 agent 成员去重数"
+      active_groups:
+        type: integer
+        format: int64
+        description: "bucket 内活跃群去重数"
+      private_active_count:
+        type: integer
+        format: int64
+        description: "bucket 内活跃私聊去重数；选中 space 时为 0"
+      conv_type_msg_counts:
+        type: array
+        description: "固定返回 conv_type 1..4 的消息量"
+        items:
+          $ref: "#/definitions/trendConvTypeMsgItem"
+
+  trendConvTypeMsgItem:
+    type: object
+    properties:
+      conv_type:
+        type: integer
+        description: "会话类型 1.HH群 2.HA群 3.HH私聊 4.HA私聊"
+      human_msg_count:
+        type: integer
+        format: int64
+      agent_msg_count:
+        type: integer
+        format: int64
+      total_msg_count:
+        type: integer
+        format: int64
 
   spaceListResp:
     type: object
