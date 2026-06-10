@@ -239,19 +239,22 @@ func (h *commandHandler) approveFriend(ownerUID string, applyUID string, robotID
 		Param:       cmdParam,
 	})
 
-	// Send tip message
-	tipPayload := map[string]interface{}{
-		"content": content,
-		"type":    common.Tip,
+	// Send tip message — skip when content is empty so a render failure (logged
+	// above) doesn't push a blank Tip; the CMD above already synced both clients.
+	if content != "" {
+		tipPayload := map[string]interface{}{
+			"content": content,
+			"type":    common.Tip,
+		}
+		// YUJ-674 / Mininglamp-OSS#37: PERSONAL DM via NewPersonalMsgSendReq builder.
+		_ = h.ctx.SendMessage(config.NewPersonalMsgSendReq(
+			applyUID,
+			robotID,
+			tipPayload,
+			applySpaceID,
+			config.PersonalMsgOptions{Header: config.MsgHeader{RedDot: 1}},
+		))
 	}
-	// YUJ-674 / Mininglamp-OSS#37: PERSONAL DM via NewPersonalMsgSendReq builder.
-	_ = h.ctx.SendMessage(config.NewPersonalMsgSendReq(
-		applyUID,
-		robotID,
-		tipPayload,
-		applySpaceID,
-		config.PersonalMsgOptions{Header: config.MsgHeader{RedDot: 1}},
-	))
 
 	// 8. 清理 Redis
 	_ = h.DeleteBotFriendApply(robotID, applyUID)
@@ -403,23 +406,26 @@ func (h *commandHandler) handlePending(fromUID string) {
 
 // relativeAgo renders a localized relative-time phrase ("just now", "3 days
 // ago", ...) for a past unix-second timestamp. Plural handling lives in the
-// per-language ago templates, so this stays a thin dispatcher.
+// per-language ago templates, so this stays a thin dispatcher. A render error
+// (structurally impossible given the startup completeness matrix) is logged at
+// Debug and yields an empty phrase rather than failing the whole list.
 func relativeAgo(lang string, createdAt int64) string {
 	ago := time.Since(time.Unix(createdAt, 0)).Truncate(time.Minute)
-	var key string
-	var n int
+	key := MsgFriendAgoJustNow
+	var data map[string]any
 	switch {
 	case ago >= time.Hour*24:
-		key, n = MsgFriendAgoDays, int(ago.Hours()/24)
+		key, data = MsgFriendAgoDays, map[string]any{"N": int(ago.Hours() / 24)}
 	case ago >= time.Hour:
-		key, n = MsgFriendAgoHours, int(ago.Hours())
+		key, data = MsgFriendAgoHours, map[string]any{"N": int(ago.Hours())}
 	case ago >= time.Minute:
-		key, n = MsgFriendAgoMinutes, int(ago.Minutes())
-	default:
-		s, _ := botMessages.Render(MsgFriendAgoJustNow, lang, nil)
-		return s
+		key, data = MsgFriendAgoMinutes, map[string]any{"N": int(ago.Minutes())}
 	}
-	s, _ := botMessages.Render(key, lang, map[string]any{"N": n})
+	s, err := botMessages.Render(key, lang, data)
+	if err != nil {
+		msgLog.Debug("渲染相对时间短语失败",
+			zap.String("key", key), zap.String("lang", lang), zap.Error(err))
+	}
 	return s
 }
 

@@ -4,6 +4,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 )
@@ -89,6 +90,37 @@ func TestNotifyOwnerNewApplyNoRemarkLine(t *testing.T) {
 	}
 	if strings.Contains(got, "备注") {
 		t.Errorf("empty remark must not render the 备注 line:\n%s", got)
+	}
+}
+
+// TestRelativeAgo pins the plural dispatch of the relative-time phrase
+// independently of the /pending list render: singular vs plural for en-US, the
+// no-plural zh-CN form, and each time bucket including just-now.
+func TestRelativeAgo(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		name    string
+		lang    string
+		created time.Time
+		want    string
+	}{
+		{"en days plural", "en-US", now.Add(-73 * time.Hour), "3 days ago"},
+		{"en days singular", "en-US", now.Add(-25 * time.Hour), "1 day ago"},
+		{"zh days", "zh-CN", now.Add(-73 * time.Hour), "3天前"},
+		{"en hours plural", "en-US", now.Add(-2 * time.Hour), "2 hours ago"},
+		{"en hours singular", "en-US", now.Add(-65 * time.Minute), "1 hour ago"},
+		{"en minutes plural", "en-US", now.Add(-5 * time.Minute), "5 minutes ago"},
+		{"en minutes singular", "en-US", now.Add(-90 * time.Second), "1 minute ago"},
+		{"en just now", "en-US", now.Add(-10 * time.Second), "just now"},
+		{"zh just now", "zh-CN", now.Add(-10 * time.Second), "刚刚"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := relativeAgo(c.lang, c.created.Unix())
+			if got != c.want {
+				t.Errorf("relativeAgo(%q, %s ago) = %q, want %q", c.lang, c.name, got, c.want)
+			}
+		})
 	}
 }
 

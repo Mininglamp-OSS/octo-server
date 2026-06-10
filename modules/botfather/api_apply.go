@@ -422,18 +422,23 @@ func (bf *BotFather) createFriendRelation(userUID, robotUID string) error {
 			content = rendered
 		}
 	}
-	bfTipPayload := map[string]interface{}{
-		"content": content,
-		"type":    common.Tip,
+	// Skip the tip when content is empty — a render failure (already logged
+	// above) must not send a blank Tip. The friend relation / whitelist / CMD
+	// are already done, so this only drops the cosmetic greeting.
+	if content != "" {
+		bfTipPayload := map[string]interface{}{
+			"content": content,
+			"type":    common.Tip,
+		}
+		// YUJ-674 / Mininglamp-OSS#37: PERSONAL DM via NewPersonalMsgSendReq builder.
+		_ = bf.ctx.SendMessage(config.NewPersonalMsgSendReq(
+			userUID,
+			robotUID,
+			bfTipPayload,
+			spaceID,
+			config.PersonalMsgOptions{Header: config.MsgHeader{RedDot: 1}},
+		))
 	}
-	// YUJ-674 / Mininglamp-OSS#37: PERSONAL DM via NewPersonalMsgSendReq builder.
-	_ = bf.ctx.SendMessage(config.NewPersonalMsgSendReq(
-		userUID,
-		robotUID,
-		bfTipPayload,
-		spaceID,
-		config.PersonalMsgOptions{Header: config.MsgHeader{RedDot: 1}},
-	))
 
 	return nil
 }
