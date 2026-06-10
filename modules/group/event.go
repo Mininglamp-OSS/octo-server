@@ -739,10 +739,12 @@ func (g *Group) handleOrgEmployeeExit(data []byte, commit config.EventCommit) {
 		return
 	}
 	realGroups := make([]string, 0)
+	spaceIDByGroupNo := make(map[string]string, len(groups))
 	for _, groupNo := range req.GroupNos {
 		for _, group := range groups {
 			if groupNo == group.GroupNo {
 				realGroups = append(realGroups, groupNo)
+				spaceIDByGroupNo[groupNo] = group.SpaceID
 				break
 			}
 		}
@@ -805,6 +807,9 @@ func (g *Group) handleOrgEmployeeExit(data []byte, commit config.EventCommit) {
 			commit(err)
 			return
 		}
+		// Issue #27 同型：组织退出也必须摘除该用户在群内所有非删除子区的
+		// IM 订阅，与踢人/退群路径对齐（helper 为 best-effort，失败只记日志）。
+		g.removeUserFromGroupThreads(groupNo, req.Operator, spaceIDByGroupNo[groupNo])
 		// 发送群成员更新命令
 		err = g.ctx.SendCMD(config.MsgCMDReq{
 			ChannelID:   groupNo,
