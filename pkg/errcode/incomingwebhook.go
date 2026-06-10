@@ -40,9 +40,10 @@ var (
 	})
 
 	// ErrIncomingWebhookPushPayloadInvalid (400) — unreadable body, malformed
-	// JSON, empty content, malformed rich-text blocks, or an unknown msg_type.
-	// The offending stage is surfaced via Details["reason"]
-	// (body / json / content / blocks / msg_type).
+	// JSON, empty content, malformed rich-text blocks, an unknown msg_type, or a
+	// platform-adapter request that cannot be translated (missing X-GitHub-Event
+	// header, unsupported WeCom msgtype). The offending stage is surfaced via
+	// Details["reason"] (body / json / content / blocks / msg_type / event).
 	ErrIncomingWebhookPushPayloadInvalid = register(codes.Code{
 		ID:             "err.server.incomingwebhook.push_payload_invalid",
 		HTTPStatus:     http.StatusBadRequest,

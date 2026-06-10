@@ -197,7 +197,16 @@ func (w *IncomingWebhook) Route(r *wkhttp.WKHttp) {
 	push := r.Group("/v1")
 	{
 		// requirePushEnabled 在最前：总开关关闭时直接 404，最廉价地短路（甚至不进 floor）。
-		push.POST("/incoming-webhooks/:webhook_id/:token", w.requirePushEnabled(), w.localFloorMiddleware(), ipLimit, w.ipFailureGateMiddleware(), w.push)
+		// 三种推送形态（native / github / wecom）共享同一条中间件链与同一组限流桶：
+		// 适配器只是 body 解析方式不同，不是新的攻击面，不单独开配额（见 adapter.go）。
+		chain := func(h wkhttp.HandlerFunc) []wkhttp.HandlerFunc {
+			return []wkhttp.HandlerFunc{w.requirePushEnabled(), w.localFloorMiddleware(), ipLimit, w.ipFailureGateMiddleware(), h}
+		}
+		push.POST("/incoming-webhooks/:webhook_id/:token", chain(w.push)...)
+		// 平台适配器（#297 Phase 3）：GitHub 事件 / 企业微信群机器人格式。鉴权、限流、
+		// 群校验与 native 完全一致，仅 body 解析不同（adapter_github.go / adapter_wecom.go）。
+		push.POST("/incoming-webhooks/:webhook_id/:token/github", chain(w.pushGitHub)...)
+		push.POST("/incoming-webhooks/:webhook_id/:token/wecom", chain(w.pushWeCom)...)
 	}
 }
 
@@ -312,6 +321,17 @@ func toResp(m *incomingWebhookModel) webhookResp {
 // publicURL 构造对外推送 URL（不含 host，由前端拼接基础域名）。
 func publicURL(webhookID, token string) string {
 	return fmt.Sprintf("/v1/incoming-webhooks/%s/%s", webhookID, token)
+}
+
+// publicURLs 构造各推送形态的对外路径（#297 顺延的 onboarding 项）：native 即历史
+// 契约的 url 字段，github / wecom 为平台适配器后缀。与 publicURL 一样不含 host。
+func publicURLs(webhookID, token string) map[string]string {
+	base := publicURL(webhookID, token)
+	return map[string]string{
+		"native": base,
+		"github": base + "/github",
+		"wecom":  base + "/wecom",
+	}
 }
 
 // ============================================================
@@ -488,6 +508,7 @@ func (w *IncomingWebhook) create(c *wkhttp.Context) {
 		webhookResp: toResp(m),
 		Token:       token,
 		URL:         publicURL(m.WebhookID, token),
+		URLs:        publicURLs(m.WebhookID, token),
 	}
 	c.Response(resp)
 }
@@ -665,6 +686,7 @@ func (w *IncomingWebhook) regenerate(c *wkhttp.Context) {
 		webhookResp: toResp(updated),
 		Token:       token,
 		URL:         publicURL(webhookID, token),
+		URLs:        publicURLs(webhookID, token),
 	})
 }
 
@@ -810,7 +832,13 @@ func (w *IncomingWebhook) failAuth(c *wkhttp.Context, ip string) {
 	pushUnauthorized(c)
 }
 
-func (w *IncomingWebhook) push(c *wkhttp.Context) {
+// push / pushGitHub / pushWeCom 是三种推送形态的路由入口，全部走 handlePush 流水线，
+// 只差 body 解析（pushAdapter.parse，见 adapter.go）。
+func (w *IncomingWebhook) push(c *wkhttp.Context)       { w.handlePush(c, nativeAdapter) }
+func (w *IncomingWebhook) pushGitHub(c *wkhttp.Context) { w.handlePush(c, githubAdapter) }
+func (w *IncomingWebhook) pushWeCom(c *wkhttp.Context)  { w.handlePush(c, wecomAdapter) }
+
+func (w *IncomingWebhook) handlePush(c *wkhttp.Context, ad pushAdapter) {
 	// 仅用于"鉴权失败才计入"的 per-IP 失败预算（见 failAuth / ipFailureGateMiddleware）。
 	// 用 clientIP（信任代理追加的 X-Real-Ip / 最右 XFF），而非 gin c.ClientIP()——后者在
 	// wkhttp 的 trust-all-proxies 默认下取最左 XFF（客户端可伪造），会让扫描者每次伪造
@@ -892,24 +920,33 @@ func (w *IncomingWebhook) push(c *wkhttp.Context) {
 	limit := maxBytes()
 	body, err := io.ReadAll(io.LimitReader(c.Request.Body, int64(limit)+1))
 	if err != nil {
-		w.submitFailure(m, 0, ip, "body", http.StatusBadRequest)
+		w.submitFailure(m, 0, ip, ad.name, "body", http.StatusBadRequest)
 		pushPayloadInvalid(c, "body")
 		return
 	}
 	if len(body) > limit {
-		w.submitFailure(m, len(body), ip, "too_large", http.StatusRequestEntityTooLarge)
+		w.submitFailure(m, len(body), ip, ad.name, "too_large", http.StatusRequestEntityTooLarge)
 		pushPayloadTooLarge(c)
 		return
 	}
 
-	var req pushPayloadReq
-	if err := json.Unmarshal(body, &req); err != nil {
-		w.submitFailure(m, len(body), ip, "json", http.StatusBadRequest)
-		pushPayloadInvalid(c, "json")
+	// 5) 适配器解析：native 直接反序列化 pushPayloadReq；github/wecom 把平台格式翻译
+	//    成等价请求（见 adapter.go），之后三种形态共用同一条构造/投递/审计路径。
+	req, skipReason, invalidReason := ad.parse(c.Request.Header, body)
+	if invalidReason != "" {
+		w.submitFailure(m, len(body), ip, ad.name, invalidReason, http.StatusBadRequest)
+		pushPayloadInvalid(c, invalidReason)
+		return
+	}
+	if skipReason != "" {
+		// 已接收、刻意不投递（GitHub ping / 渲染子集之外的事件）：返回 200 让平台侧
+		// 显示投递成功，落 auditSkipped 让群管理员在 deliveries 里确认链路连通。
+		w.submitSkipped(m, len(body), ip, ad.name, skipReason)
+		c.Response(successBody(ad, 0, skipReason))
 		return
 	}
 
-	// 5) 按 msg_type 构造 payload。缺省/"text" 走历史纯文本路径（content 必填，客户端
+	// 6) 按 msg_type 构造 payload。缺省/"text" 走历史纯文本路径（content 必填，客户端
 	//    按 markdown 渲染），完全向后兼容；"richtext" 走图文混排：blocks 翻译为 octo
 	//    原生 RichText(=14) 并由 richtext.Validate/Finalize 权威校验。
 	var payload map[string]interface{}
@@ -920,39 +957,39 @@ func (w *IncomingWebhook) push(c *wkhttp.Context) {
 			req.Content = req.Text
 		}
 		if strings.TrimSpace(req.Content) == "" {
-			w.submitFailure(m, len(body), ip, "content", http.StatusBadRequest)
+			w.submitFailure(m, len(body), ip, ad.name, "content", http.StatusBadRequest)
 			pushPayloadInvalid(c, "content")
 			return
 		}
 		// content 语义长度上限（按 rune 计），独立于 8KB 字节 body cap：防止单条消息
 		// 正文过长污染所有客户端渲染。超限按 413 拒绝，与 body 超限同语义。
 		if utf8.RuneCountInString(req.Content) > maxContentRunes() {
-			w.submitFailure(m, len(body), ip, "too_large", http.StatusRequestEntityTooLarge)
+			w.submitFailure(m, len(body), ip, ad.name, "too_large", http.StatusRequestEntityTooLarge)
 			pushPayloadTooLarge(c)
 			return
 		}
-		payload = buildPayload(m, &req)
+		payload = buildPayload(m, req)
 	case msgTypeRichText:
 		// 注意：richtext 路径【不】套用纯文本的 maxContentRunes(4000) 语义上限——富文本
 		// 由块结构 + 1MB 序列化上限约束，默认 8KB body cap 下不可能逾越。这是与文本路径的
 		// 有意不对称（若运维上调 body cap，富文本仍受 1MB 兜底，不会无界）。
-		p, err := buildRichTextPayload(m, &req)
+		p, err := buildRichTextPayload(m, req)
 		if err != nil {
 			// 仅 >1MB 映射 413（与 body/content 超限同语义）；其余结构性非法（空 content /
 			// 空 text 块 / 非 http(s) 图片 url / 缺图片宽高 / 未知块类型 / 超块数上限）
 			// 一律 400 invalid，reason=blocks 供调用方定位。
 			if errors.Is(err, common.ErrRichTextPayloadTooLarge) {
-				w.submitFailure(m, len(body), ip, "too_large", http.StatusRequestEntityTooLarge)
+				w.submitFailure(m, len(body), ip, ad.name, "too_large", http.StatusRequestEntityTooLarge)
 				pushPayloadTooLarge(c)
 				return
 			}
-			w.submitFailure(m, len(body), ip, "blocks", http.StatusBadRequest)
+			w.submitFailure(m, len(body), ip, ad.name, "blocks", http.StatusBadRequest)
 			pushPayloadInvalid(c, "blocks")
 			return
 		}
 		payload = p
 	default:
-		w.submitFailure(m, len(body), ip, "msg_type", http.StatusBadRequest)
+		w.submitFailure(m, len(body), ip, ad.name, "msg_type", http.StatusBadRequest)
 		pushPayloadInvalid(c, "msg_type")
 		return
 	}
@@ -969,24 +1006,21 @@ func (w *IncomingWebhook) push(c *wkhttp.Context) {
 	if err != nil {
 		w.Error("send incoming webhook message failed",
 			zap.String("webhook_id", m.WebhookID), zap.Error(err))
-		w.submitFailure(m, len(body), ip, "delivery_failed", http.StatusBadGateway)
+		w.submitFailure(m, len(body), ip, ad.name, "delivery_failed", http.StatusBadGateway)
 		pushDeliveryFailed(c)
 		return
 	}
 
-	// 6) 异步审计 + markUsed（失败不影响响应），并发受 auditSem 限制
+	// 7) 异步审计 + markUsed（失败不影响响应），并发受 auditSem 限制
 	var msgID int64
 	if resp != nil {
 		msgID = resp.MessageID
 	}
 	// 审计用同一可信 IP（clientIP），而非 gin 可伪造的 c.ClientIP()。bumpUsed=true：
 	// 真实推送成功累加 call_count / last_used_at。
-	w.submitSuccess(m, len(body), ip, msgID, adapterNative, true)
+	w.submitSuccess(m, len(body), ip, msgID, ad.name, true)
 
-	c.Response(map[string]interface{}{
-		"status":     0,
-		"message_id": msgID,
-	})
+	c.Response(successBody(ad, msgID, ""))
 }
 
 // 与 create/update 路径的 webhook 名称/头像列长度约束一致，避免 push 路径成为绕过。
@@ -1075,14 +1109,14 @@ func (w *IncomingWebhook) submitSuccess(m *incomingWebhookModel, byteSize int, i
 
 // submitFailure 记录一次【鉴权通过后】的失败投递（payload 非法/体积过大/投递失败）。
 // 不累加调用计数(bumpUsed=false)——call_count 语义是「成功调用次数」。reason/httpStatus
-// 与 push 路径返回给调用方的响应保持一致，供 deliveries 端点排障。
+// 与 push 路径返回给调用方的响应保持一致，供 deliveries 端点排障；adapter 标记推送形态。
 //
 // 刻意【不】覆盖 rate_limited（429）：它在限流闸处直接返回、不入审计——见 push 路径中
 // !allowed 分支的说明（天然高频，逐条落库会反噬限流的廉价丢弃）。
 //
 // ⚠️ 仅在 webhook 已通过 token 鉴权且群为 Normal 之后调用：鉴权失败（未知/错 token/
 // 已解散群）绝不落本表，只进 IP 失败预算，维持 push 路径的反枚举不变量。
-func (w *IncomingWebhook) submitFailure(m *incomingWebhookModel, byteSize int, ip, reason string, httpStatus int) {
+func (w *IncomingWebhook) submitFailure(m *incomingWebhookModel, byteSize int, ip, adapter, reason string, httpStatus int) {
 	w.submitDelivery(&auditModel{
 		WebhookID:  m.WebhookID,
 		GroupNo:    m.GroupNo,
@@ -1091,7 +1125,24 @@ func (w *IncomingWebhook) submitFailure(m *incomingWebhookModel, byteSize int, i
 		Status:     auditFailed,
 		Reason:     reason,
 		HTTPStatus: httpStatus,
-		Adapter:    adapterNative,
+		Adapter:    adapter,
+	}, false)
+}
+
+// submitSkipped 记录一次「已接收、刻意不投递」的结果（GitHub ping / 渲染子集之外的
+// 事件类型）。响应是 200，但没有消息进群——单列 auditSkipped 状态而非伪装成成功或
+// 失败（语义见 model.go auditSkipped）。bumpUsed=false：call_count 语义是「成功投递
+// 次数」。鉴权前置约束与 submitFailure 相同（反枚举不变量）。
+func (w *IncomingWebhook) submitSkipped(m *incomingWebhookModel, byteSize int, ip, adapter, reason string) {
+	w.submitDelivery(&auditModel{
+		WebhookID:  m.WebhookID,
+		GroupNo:    m.GroupNo,
+		IP:         ip,
+		ByteSize:   byteSize,
+		Status:     auditSkipped,
+		Reason:     reason,
+		HTTPStatus: http.StatusOK,
+		Adapter:    adapter,
 	}, false)
 }
 

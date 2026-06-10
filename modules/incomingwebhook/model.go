@@ -38,12 +38,18 @@ type incomingWebhookModel struct {
 const (
 	auditSuccess = 1
 	auditFailed  = 2
+	// auditSkipped 「已接收、刻意不投递」：GitHub ping / 渲染子集之外的事件等，响应
+	// 200（平台侧显示投递成功）但没有消息进群。单列一种状态而非伪装成成功（message_id=0
+	// 的"成功"会误导排障）或失败（调用方无需修复任何东西）。
+	auditSkipped = 3
 )
 
-// 投递来源/适配器（auditModel.Adapter）。Phase 3/4 扩展 github/gitlab/wecom/feishu。
+// 投递来源/适配器（auditModel.Adapter）。后续扩展 gitlab/feishu。
 const (
 	adapterNative = "native" // 原生推送端点
 	adapterTest   = "test"   // 管理端「测试推送」
+	adapterGitHub = "github" // GitHub 事件适配器（#297 Phase 3）
+	adapterWeCom  = "wecom"  // 企业微信群机器人格式适配器（#297 Phase 3）
 )
 
 // auditModel 对应 incoming_webhook_audit 表，记录【鉴权通过后】的每次投递结果
@@ -54,10 +60,10 @@ type auditModel struct {
 	IP         string
 	ByteSize   int
 	MessageID  int64
-	Status     int    // auditSuccess / auditFailed
-	Reason     string // 失败原因码；成功为空
+	Status     int    // auditSuccess / auditFailed / auditSkipped
+	Reason     string // 失败/跳过原因码；成功为空
 	HTTPStatus int    // 返回给调用方的 HTTP 状态码
-	Adapter    string // 来源/适配器：adapterNative / adapterTest / ...
+	Adapter    string // 来源/适配器：adapterNative / adapterTest / adapterGitHub / adapterWeCom
 	db.BaseModel
 }
 
@@ -127,6 +133,10 @@ type createResp struct {
 	webhookResp
 	Token string `json:"token"`
 	URL   string `json:"url"`
+	// URLs 各推送形态的路径（native / github / wecom），与 URL 一样不含 host、由前端
+	// 拼接基础域名。token 仅在 create/regenerate 时可见，故完整推送路径也只在这两处
+	// 下发（list 不回显 token，自然也不回推送 URL）。
+	URLs map[string]string `json:"urls"`
 }
 
 // deliveryResp 是 deliveries 排障端点返回的单条投递记录（成功+失败）。绝不含 token。
@@ -134,8 +144,8 @@ type createResp struct {
 // 刻意【不】下发调用方 IP：审计表仍存 ip（限流/排查上下文），但向群管理员暴露来源 IP
 // 是隐私取舍，按 review 决定收敛——deliveries 只回投递结果元数据，不回 IP（PR #299 review）。
 type deliveryResp struct {
-	Status     int    `json:"status"`      // auditSuccess / auditFailed
-	Reason     string `json:"reason"`      // 失败原因码；成功为空
+	Status     int    `json:"status"`      // auditSuccess / auditFailed / auditSkipped
+	Reason     string `json:"reason"`      // 失败/跳过原因码；成功为空
 	HTTPStatus int    `json:"http_status"` // 返回给调用方的 HTTP 状态码
 	Adapter    string `json:"adapter"`     // 来源/适配器
 	ByteSize   int    `json:"byte_size"`

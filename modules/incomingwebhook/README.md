@@ -4,12 +4,16 @@
 由群主或管理员调用，详见 `api.go`。本文聚焦**推送端点**的请求契约。
 
 ```
-POST /v1/incoming-webhooks/:webhook_id/:token
+POST /v1/incoming-webhooks/:webhook_id/:token            # native（本文主体）
+POST /v1/incoming-webhooks/:webhook_id/:token/github     # GitHub 事件适配器
+POST /v1/incoming-webhooks/:webhook_id/:token/wecom      # 企业微信群机器人格式适配器
 Content-Type: application/json
 ```
 
 鉴权走 URL 内的 token（SHA-256 存储、常量时间比对），无需登录态。所有鉴权失败统一
-返回 401（反枚举），并受多层限流约束。
+返回 401（反枚举），并受多层限流约束。三种形态共享同一条鉴权/限流/群校验链，适配器
+只是 body 解析不同（见下文「平台适配器」）。create/regenerate 响应的 `urls` 字段
+按形态给出全部三个路径。
 
 ## 消息形态
 
@@ -71,6 +75,64 @@ Content-Type: application/json
 - 服务端另有 1MB 的 RichText 硬上限（octo-lib 契约）兜底，但在默认 8KB body cap 下不会
   先触达——它是上调 body cap 后才会成为约束的二级护栏。
 
+## 平台适配器（#297 Phase 3）
+
+适配器把第三方平台的原生格式翻译成上面的 native 消息，鉴权/限流/审计与 native 完全
+一致。适配器消息不支持 `username`/`avatar_url` 覆盖（展示身份固定为 webhook 配置）。
+
+### GitHub
+
+```
+POST /v1/incoming-webhooks/:webhook_id/:token/github
+```
+
+在 GitHub 仓库 **Settings → Webhooks** 把 Payload URL 配成上述地址、Content type 选
+`application/json` 即可。鉴权靠 URL 内 128-bit token（不强制 HMAC；`X-Hub-Signature-256`
+校验留作后续可选项）。
+
+按 `X-GitHub-Event` 渲染为 markdown，当前渲染子集：
+
+| 事件 | 渲染的动作 | 说明 |
+|------|-----------|------|
+| `ping` | — | 返回 200 不发消息（GitHub 创建 webhook 时的连通性测试） |
+| `push` | — | 分支/标签 push、删除、force-push；最多列 5 条提交 |
+| `pull_request` | `opened` / `closed`(含 merged) / `reopened` / `ready_for_review` | `synchronize` 等刷屏动作跳过 |
+| `issues` | `opened` / `closed` / `reopened` | |
+| `issue_comment` | `created` | 评论摘要压成单行、截断 300 rune |
+| `release` | `published` | |
+
+**子集之外的事件/动作返回 200 + `{"skipped":"event"}`**（GitHub 侧显示投递成功、
+不标红；deliveries 里以 `status=3` 可见），缺 `X-GitHub-Event` 头则按 400
+`reason=event` 拒绝。事件里的超长字段（标题/提交信息/评论）服务端截断，GitHub 流量
+不会触发 413。
+
+### 企业微信（WeCom 群机器人格式）
+
+```
+POST /v1/incoming-webhooks/:webhook_id/:token/wecom
+```
+
+接受企业微信「群机器人」的出站消息格式——已配置向企微机器人推送的工具只需**换 URL**
+即可迁移，消息体零改动。成功响应附带 `errcode=0`/`errmsg=ok`（多数企微 SDK 以此判定
+成功）。
+
+| `msgtype` | 处理 |
+|-----------|------|
+| `text` / `markdown` / `markdown_v2` | → 文本消息（客户端按 markdown 渲染）；`mentioned_list`/`mentioned_mobile_list` 降级丢弃 |
+| `news` | 降级 markdown：每篇文章「标题链接 + 描述」一段；`picurl` 丢弃 |
+| `template_card` | 降级 markdown：主标题 + 描述 + 副标题 + 跳转链接；按钮等交互元素丢弃 |
+| `image` / `file` / `voice` 等素材类 | **400 `reason=msg_type`**：base64/media_id 素材无法转存，显式失败优于静默丢弃 |
+
+> 高保真卡片渲染不可行，降级策略经 #297 确认。`content` 超过语义上限（4000 rune）按
+> 既有 413 拒绝——与 GitHub 适配器不同，企微格式的消息体由调用方自行编写，可以修短。
+
+```bash
+# 迁移示例：把企微机器人 URL 换成 octo 即可
+curl -X POST "$BASE/v1/incoming-webhooks/$WEBHOOK_ID/$TOKEN/wecom" \
+  -H 'Content-Type: application/json' \
+  -d '{"msgtype":"markdown","markdown":{"content":"**Build #123** passed"}}'
+```
+
 ## 通用字段与安全
 
 - `username` / `avatar_url`：两种形态通用，服务端裁剪到字节上限（名 64B / 头像 255B）。
@@ -81,10 +143,11 @@ Content-Type: application/json
 
 | 场景 | HTTP | 说明 |
 |------|------|------|
-| 成功 | 200 | `{"status":0,"message_id":<int>}` |
+| 成功 | 200 | `{"status":0,"message_id":<int>}`（wecom 路由额外带 `errcode`/`errmsg`） |
+| 已接收、刻意不投递 | 200 | `{"status":0,"message_id":0,"skipped":"ping"\|"event"}`（仅适配器路由） |
 | 鉴权失败 | 401 | 统一响应，不区分原因（反枚举） |
 | 限流 | 429 | 带 `Retry-After` |
-| 请求非法 | 400 | `details.reason` ∈ `body`/`json`/`content`/`blocks`/`msg_type` |
+| 请求非法 | 400 | `details.reason` ∈ `body`/`json`/`content`/`blocks`/`msg_type`/`event` |
 | 体积过大 | 413 | 超 body cap 或富文本 >1MB |
 | 投递失败 | 502 | 下游发送失败 |
 | 功能停用 | 404 | 全局开关 `incomingwebhook.enabled=0` |
@@ -92,6 +155,11 @@ Content-Type: application/json
 ## 管理端点（群主 / 管理员）
 
 需登录态 + 群管理员权限，路径前缀 `/v1/groups/:group_no/incoming-webhooks`。
+
+创建 / 重置（regenerate）响应除历史的 `url`（native 路径）外，还带 `urls` 对象，
+按推送形态给出全部路径（`native` / `github` / `wecom`，不含 host，由前端拼接）。
+token 仅在这两处出现一次，list 不回显 token、也不回推送 URL。
+
 除创建/列出/更新/删除/重置外，Phase 2 新增两个：
 
 ### 测试推送
@@ -129,10 +197,11 @@ GET /v1/groups/:group_no/incoming-webhooks/:webhook_id/deliveries?limit=50
 }
 ```
 
-- `status`：`1`=成功，`2`=失败。
-- `reason`（失败时）：`body` / `json` / `content` / `blocks` / `msg_type` / `too_large` /
-  `delivery_failed`。
-- `adapter`：`native`（推送端点）/ `test`（测试推送）。
+- `status`：`1`=成功，`2`=失败，`3`=跳过（已接收、刻意不投递：GitHub `ping` / 渲染
+  子集之外的事件，响应 200 但没有消息进群）。
+- `reason`（失败/跳过时）：`body` / `json` / `content` / `blocks` / `msg_type` /
+  `too_large` / `delivery_failed` / `event` / `ping`。
+- `adapter`：`native`（推送端点）/ `test`（测试推送）/ `github` / `wecom`（平台适配器）。
 - `http_status`：返回给调用方的状态码。**迁移前的历史成功行为 `0`（未知）**——不伪造成 200。
 - **不返回调用方 `ip`**：审计表仍存 ip 作排查上下文，但出于隐私不向群管理员下发（review 决定）。
 
