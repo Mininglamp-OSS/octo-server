@@ -519,7 +519,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	// ---------- 用户设置 ----------
 	users := make([]*user.UserDetailResp, 0)
 	if len(uids) > 0 {
-		users, err = co.userService.GetUserDetails(uids, c.GetLoginUID())
+		users, err = co.userService.GetUserDetails(c.Request.Context(), uids, c.GetLoginUID())
 		if err != nil {
 			co.Error("查询用户信息失败！", zap.Error(err))
 			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)

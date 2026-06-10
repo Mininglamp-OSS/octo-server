@@ -8,11 +8,13 @@
 // only carry ONE language, therefore localization happens in two layers:
 //
 //   - startup (botfather.registerBotFatherCommands) writes the blob in the
-//     deployment default language — the floor served by every path without a
-//     request context (admin robot detail, batch user-detail enrichment);
-//   - the menu-bearing read endpoints (channel info extra.bot_commands,
-//     /v1/robot/commands, /v1/users/:uid) override the blob per request via
-//     JSON(i18n.OutboundLanguage(ctx)), for the BotFather UID only.
+//     deployment default language — the floor served by paths that genuinely
+//     have no request context (admin robot detail, future context-less reads);
+//   - every request-bearing read of the blob overrides it per request via
+//     JSON(i18n.OutboundLanguage(ctx)), for the BotFather UID only: channel
+//     info extra.bot_commands, /v1/robot/commands, /v1/users/:uid, and the
+//     batch user-detail fill (user.Service.GetUserDetails) behind friend
+//     sync / friend search / search / conversation enrichment.
 //
 // This package is deliberately a LEAF (msgtmpl + pkg/i18n only): botfather
 // imports user, so the read-side modules (user, channel, robot) can only share

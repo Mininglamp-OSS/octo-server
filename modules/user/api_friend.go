@@ -1049,7 +1049,7 @@ func (f *Friend) friendSync(c *wkhttp.Context) {
 				filteredUIDs = append(filteredUIDs, m)
 			}
 		}
-		userDetails, err := f.userService.GetUserDetails(filteredUIDs, c.GetLoginUID())
+		userDetails, err := f.userService.GetUserDetails(c.Request.Context(), filteredUIDs, c.GetLoginUID())
 		if err != nil {
 			f.Error("获取用户详情失败！", zap.Error(err))
 			respondUserError(c, errcode.ErrUserQueryFailed)
@@ -1082,7 +1082,7 @@ func (f *Friend) friendSync(c *wkhttp.Context) {
 			friendUIDs = append(friendUIDs, f.ToUID)
 		}
 	}
-	userDetails, err := f.userService.GetUserDetails(friendUIDs, c.GetLoginUID())
+	userDetails, err := f.userService.GetUserDetails(c.Request.Context(), friendUIDs, c.GetLoginUID())
 	if err != nil {
 		f.Error("获取用户详情失败！", zap.Error(err))
 		respondUserError(c, errcode.ErrUserQueryFailed)
@@ -1131,7 +1131,7 @@ func (f *Friend) friendSearch(c *wkhttp.Context) {
 				filteredUIDs = append(filteredUIDs, m)
 			}
 		}
-		userDetails, err := f.userService.GetUserDetails(filteredUIDs, c.GetLoginUID())
+		userDetails, err := f.userService.GetUserDetails(c.Request.Context(), filteredUIDs, c.GetLoginUID())
 		if err != nil {
 			f.Error("获取用户详情失败！", zap.Error(err))
 			respondUserError(c, errcode.ErrUserQueryFailed)

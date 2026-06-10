@@ -85,6 +85,33 @@ func TestJSONWireShape(t *testing.T) {
 	}
 }
 
+// TestJSONStoredByteShapeUnchanged pins JSON("zh-CN") byte-for-byte against
+// the pre-migration json.Marshal([]map[string]string{...}) output that clients
+// parse and the startup write persists — a struct-tag or marshaling change
+// that drifts the stored bytes must fail here even if the decoded values
+// still match.
+func TestJSONStoredByteShapeUnchanged(t *testing.T) {
+	want := `[{"command":"/install","description":"安装/更新 Octo 插件"},` +
+		`{"command":"/quickstart","description":"AI Agent 快速入门"},` +
+		`{"command":"/newbot","description":"创建新机器人"},` +
+		`{"command":"/mybots","description":"查看我的机器人"},` +
+		`{"command":"/connect","description":"获取连接 prompt"},` +
+		`{"command":"/disconnect","description":"断开 Agent 连接"},` +
+		`{"command":"/setname","description":"修改机器人名称"},` +
+		`{"command":"/setdescription","description":"修改机器人描述"},` +
+		`{"command":"/deletebot","description":"删除机器人"},` +
+		`{"command":"/token","description":"查看 Token"},` +
+		`{"command":"/revoke","description":"重置 Token"},` +
+		`{"command":"/approve","description":"通过好友申请"},` +
+		`{"command":"/reject","description":"拒绝好友申请"},` +
+		`{"command":"/pending","description":"查看待审批好友申请"},` +
+		`{"command":"/help","description":"显示帮助"},` +
+		`{"command":"/cancel","description":"取消当前操作"}]`
+	if got := JSON("zh-CN"); got != want {
+		t.Errorf("JSON(\"zh-CN\") stored byte shape drifted:\ngot  %s\nwant %s", got, want)
+	}
+}
+
 // TestLanguageFallback asserts unsupported/empty tags fall back to the source
 // language and region-less tags match their supported variant, mirroring the
 // msgtmpl normalization contract.

@@ -228,7 +228,7 @@ func (s *Search) global(c *wkhttp.Context) {
 	}
 	if len(uids) > 0 {
 		realUids := util.RemoveRepeatedElement(uids)
-		users, err = s.userService.GetUserDetails(realUids, loginUID)
+		users, err = s.userService.GetUserDetails(c.Request.Context(), realUids, loginUID)
 		if err != nil {
 			s.Error("查询用户列表错误", zap.Error(err))
 			httperr.ResponseErrorL(c, errcode.ErrSearchUserQueryFailed, nil, nil)

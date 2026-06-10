@@ -8,8 +8,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-server/modules/botfather/cmdmenu"
 	"github.com/Mininglamp-OSS/octo-server/modules/source"
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
+	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
@@ -25,8 +27,9 @@ type IService interface {
 	GetUser(uid string) (*Resp, error)
 	// 获取用户详情（包括与loginUID的关系等等）
 	GetUserDetail(uid string, loginUID string) (*UserDetailResp, error)
-	// 批量获取用户详情
-	GetUserDetails(uids []string, loginUID string) ([]*UserDetailResp, error)
+	// 批量获取用户详情。ctx 用于按请求协商语言渲染 BotFather 命令菜单（#335），
+	// 无请求上下文的调用方传 context.Background() 即回退部署默认语言。
+	GetUserDetails(ctx context.Context, uids []string, loginUID string) ([]*UserDetailResp, error)
 	// 通过用户名获取用户
 	GetUserWithUsername(username string) (*Resp, error)
 	// 通过用户名获取用户uid集合
@@ -563,7 +566,7 @@ func (s *Service) GetUserDetail(uid string, loginUID string) (*UserDetailResp, e
 	return resp, nil
 }
 
-func (s *Service) GetUserDetails(uids []string, loginUID string) ([]*UserDetailResp, error) {
+func (s *Service) GetUserDetails(ctx context.Context, uids []string, loginUID string) ([]*UserDetailResp, error) {
 
 	userDetails, err := s.db.QueryDetailByUIDs(uids, loginUID)
 	if err != nil {
@@ -794,6 +797,12 @@ func (s *Service) GetUserDetails(uids []string, loginUID string) ([]*UserDetailR
 					if d, ok := botMap[resp.UID]; ok {
 						if d.BotCommands != "" {
 							resp.BotCommands = d.BotCommands
+							// BotFather 的命令菜单是服务端自有文案，按请求协商语言重渲染
+							//（#335）；库存值只是部署默认语言兜底，门控与单查路径一致
+							//（仅库存非空时覆盖）。其余 bot 的 commands 是创建者内容，不覆盖。
+							if resp.UID == cmdmenu.BotFatherUID {
+								resp.BotCommands = cmdmenu.JSON(octoi18n.OutboundLanguage(ctx))
+							}
 						}
 						resp.BotDescription = d.Description
 						resp.BotCreatorUID = d.CreatorUID
