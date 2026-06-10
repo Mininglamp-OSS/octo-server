@@ -22,7 +22,13 @@
 
 - 管理员判定走 `group_member.role`（`QueryIsGroupManagerOrCreator`），对人和 bot
   一视同仁——**bot 被设为群管理员即与人类管理员同权**。外部成员（is_external=1）
-  与非正常状态成员一律 403。
+  与非正常状态成员一律 403。能力来自 `group_member` 行，不来自 token 类型或
+  scope——App Bot（`app_` token）能过 authBot 鉴权，但当前无法入群（不在
+  space_member，space 群加成员校验会拒绝），因此本管理面实际仅 **User Bot**
+  （`bf_`）可用，App Bot 恒 403；若未来放开 App Bot 入群，权限矩阵自动成立。
+- 隐私提示：list 响应包含每个 webhook 的 `creator_uid`（供客户端判断"是否我创建的"
+  并展示归属），即任意群成员可见全群 webhook 的创建者身份——群成员名册本就互相可见，
+  属有意设计；token / 推送 URL 绝不出现在 list 中。对隐私敏感的部署请知悉此暴露面。
 - 配额双层：群级 `max_per_group`（默认 10）对所有人生效；普通成员/bot 另受
   per-creator 配额（system_setting `incomingwebhook.max_per_creator`，默认 5，env
   `DM_INCOMINGWEBHOOK_MAX_PER_CREATOR`）约束，管理员豁免。超限 409。

@@ -183,6 +183,44 @@ func TestBotWebhook_OwnershipAndMembershipGates(t *testing.T) {
 	assert.Equalf(t, http.StatusForbidden, w.Code, "outsider list body: %s", w.Body.String())
 }
 
+// App Bot（app_ token，authBot 的另一条鉴权分支）在本管理面的现实行为：鉴权可过，
+// 但一律 403（PR #340 review，Jerry-Xin 建议钉住 app_ 分支）。
+//
+// 原因：权限判定只认 group_member 行，而 App Bot 当前【无法入群】——createBot 不写
+// space_member（见 modules/app_bot/app_bot.go addFriend 处的注释），space 群加成员
+// 对 bot 强制校验 space 成员资格（modules/group/api.go ErrGroupBotNotInSpace），
+// 所以 App Bot 永远没有 group_member 行。本管理面实际仅 User Bot 可用；若未来放开
+// App Bot 入群，resolveActor 按 uid 判定、不特判 token 类型，权限矩阵自动成立。
+//
+// 经 in-memory Registry 热路径鉴权（authAppBot 的首选分支，生产由 app_bot 模块在
+// 启动时灌注）：bot_api 测试包不能 blank-import app_bot（会成 prod→test 导入环），
+// 故不走 app_bot 表的 DB fallback 分支。
+func TestBotWebhook_AppBotAlwaysForbidden(t *testing.T) {
+	handler, _ := setupBotWebhookEnv(t)
+
+	const (
+		appBotUID   = "app_iwh_bot_uid"
+		appBotToken = "app_iwh_token"
+	)
+	adapter := NewAppBotRegistryAdapter()
+	adapter.Add(appBotToken, &AppBotRegistrySpec{UID: appBotUID, Scope: "platform"})
+	prev := GetAppBotRegistry()
+	SetAppBotRegistry(adapter)
+	t.Cleanup(func() {
+		if prev != nil {
+			SetAppBotRegistry(prev)
+		} else {
+			SetAppBotRegistry(NewAppBotRegistryAdapter()) // atomic.Value 不可存 nil，置空注册表即可
+		}
+	})
+
+	// 鉴权通过（非 401），但非群成员 → 创建/列表一律 403。
+	w := doBot(handler, botReq(t, "POST", botWebhookBase(), appBotToken, map[string]interface{}{}))
+	assert.Equalf(t, http.StatusForbidden, w.Code, "app bot create body: %s", w.Body.String())
+	w = doBot(handler, botReq(t, "GET", botWebhookBase(), appBotToken, nil))
+	assert.Equalf(t, http.StatusForbidden, w.Code, "app bot list body: %s", w.Body.String())
+}
+
 // 管理员 bot 与人类管理员同权：可设头像、管理任意成员 bot 的 webhook。
 func TestBotWebhook_AdminBotManagesAny(t *testing.T) {
 	handler, _ := setupBotWebhookEnv(t)
