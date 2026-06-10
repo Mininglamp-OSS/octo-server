@@ -74,3 +74,19 @@ func respondL(c *wkhttp.Context, code codes.Code, params i18n.Params, details i1
 		Internal:        registered.Internal,
 	})
 }
+
+// ErrorResp mirrors the error envelope wire shape rendered by the injected
+// wkhttp.ErrorRenderer (pkg/i18n/renderer.go) for both facades above. It is
+// referenced by swag @Failure annotations so the generated OpenAPI schema
+// matches what handlers actually send (R1: top-level `error`); `msg` and
+// `status` are the legacy D14 compatibility siblings.
+type ErrorResp struct {
+	Error struct {
+		Code       string         `json:"code"`
+		Message    string         `json:"message"`
+		Details    map[string]any `json:"details"`
+		HTTPStatus int            `json:"http_status"`
+	} `json:"error"`
+	Msg    string `json:"msg"`
+	Status int    `json:"status"`
+}

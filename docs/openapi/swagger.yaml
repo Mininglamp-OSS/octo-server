@@ -1,0 +1,79 @@
+components:
+  schemas:
+    httperr.ErrorResp:
+      properties:
+        error:
+          properties:
+            code:
+              type: string
+            details:
+              additionalProperties: {}
+              type: object
+            http_status:
+              type: integer
+            message:
+              type: string
+          type: object
+        msg:
+          type: string
+        status:
+          type: integer
+      type: object
+    user.qrcodeMyResp:
+      properties:
+        data:
+          description: QR code info URL
+          type: string
+      type: object
+  securitySchemes:
+    Bearer:
+      in: header
+      name: Authorization
+      type: apiKey
+info:
+  contact:
+    name: Mininglamp-OSS
+    url: https://github.com/Mininglamp-OSS/octo-server
+  description: |-
+    Octo Server — Go backend for the DMWork enterprise IM platform.
+    Core IM / collaboration HTTP API (users, groups, messages, threads, common).
+  title: Octo Server API
+  version: 1.0.0
+openapi: 3.1.0
+paths:
+  /user/qrcode:
+    get:
+      description: Return the QR code info URL for the current user. The URL embeds
+        the user's current vercode; resetting the vercode invalidates previously issued
+        URLs.
+      operationId: user.qrcode.get
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/user.qrcodeMyResp'
+          description: QR code info URL
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/httperr.ErrorResp'
+          description: 'business failure — D14: wire status pinned to 400, semantic
+            status in error.http_status'
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/httperr.ErrorResp'
+          description: missing or invalid token
+      security:
+      - Bearer: []
+      summary: Get my QR code URL
+      tags:
+      - user
+servers:
+- url: /v1
+tags:
+- description: User profile, settings, contacts and personal resources.
+  name: user

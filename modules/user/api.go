@@ -705,6 +705,22 @@ func (u *User) userIM(c *wkhttp.Context) {
 	c.JSON(resp.StatusCode, resultMap)
 }
 
+// qrcodeMyResp is the success envelope for GET /user/qrcode (R1: top-level `data`).
+type qrcodeMyResp struct {
+	Data string `json:"data"` // QR code info URL
+}
+
+// qrcodeMy godoc
+// @Summary      Get my QR code URL
+// @Description  Return the QR code info URL for the current user. The URL embeds the user's current vercode; resetting the vercode invalidates previously issued URLs.
+// @Tags         user
+// @ID           user.qrcode.get
+// @Produce      json
+// @Security     Bearer
+// @Success      200 {object} qrcodeMyResp "QR code info URL"
+// @Failure      400 {object} httperr.ErrorResp "business failure — D14: wire status pinned to 400, semantic status in error.http_status"
+// @Failure      401 {object} httperr.ErrorResp "missing or invalid token"
+// @Router       /user/qrcode [get]
 func (u *User) qrcodeMy(c *wkhttp.Context) {
 	userModel, err := u.db.QueryByUID(c.GetLoginUID())
 	if err != nil {
@@ -721,8 +737,8 @@ func (u *User) qrcodeMy(c *wkhttp.Context) {
 		return
 	}
 	path := strings.ReplaceAll(u.ctx.GetConfig().QRCodeInfoURL, ":code", fmt.Sprintf("vercode_%s", userModel.QRVercode))
-	c.Response(gin.H{
-		"data": fmt.Sprintf("%s/%s", u.ctx.GetConfig().External.BaseURL, path),
+	c.Response(qrcodeMyResp{
+		Data: fmt.Sprintf("%s/%s", u.ctx.GetConfig().External.BaseURL, path),
 	})
 }
 

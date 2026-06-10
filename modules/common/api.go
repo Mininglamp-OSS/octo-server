@@ -528,6 +528,8 @@ func destroyCoolingOffDaysOrDefault(v int) int {
 	return 7
 }
 
+// countriesList 裸返数组，不符合 R1 envelope（顶层须有 `data`）——改形态对
+// 存量客户端是 breaking，迁移前不加 swag 注解（lint 只检查已注解端点）。
 func (cn *Common) countriesList(c *wkhttp.Context) {
 	c.JSON(http.StatusOK, Countrys())
 }

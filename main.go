@@ -51,6 +51,18 @@ func loadConfigFromFile(cfgFile string) *viper.Viper {
 	return vp
 }
 
+// @title           Octo Server API
+// @version          1.0.0
+// @description      Octo Server — Go backend for the DMWork enterprise IM platform.
+// @description      Core IM / collaboration HTTP API (users, groups, messages, threads, common).
+// @contact.name     Mininglamp-OSS
+// @contact.url      https://github.com/Mininglamp-OSS/octo-server
+// @BasePath         /v1
+// @tag.name         user
+// @tag.description  User profile, settings, contacts and personal resources.
+// @securityDefinitions.apikey Bearer
+// @in               header
+// @name             Authorization
 func main() {
 	var CfgFile string //config file
 	flag.StringVar(&CfgFile, "config", "configs/tsdd.yaml", "config file")
