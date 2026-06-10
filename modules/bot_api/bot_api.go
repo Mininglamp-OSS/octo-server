@@ -214,6 +214,7 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 		botAPI.POST("/heartbeat", ba.heartbeat)
 		botAPI.POST("/messages/sync", ba.syncMessages)
 		botAPI.GET("/groups", ba.getGroups)
+		botAPI.GET("/resolve/targets", ba.botResolveTargets)
 		botAPI.GET("/groups/:group_no", ba.getGroupInfo)
 		botAPI.GET("/groups/:group_no/members", ba.getGroupMembers)
 		botAPI.GET("/groups/:group_no/mention_pref", ba.getMentionPref) // 群级免@偏好读（octo-server#237）

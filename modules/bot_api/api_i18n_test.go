@@ -36,7 +36,7 @@ func TestBotAPINoLegacyResponseError(t *testing.T) {
 	files := []string{
 		"auth.go", "register.go", "commands.go", "events.go", "mention_pref.go",
 		"sync.go", "typing.go", "send.go", "threads.go", "file.go", "groups.go",
-		"voice_adapter.go", "obo_api.go",
+		"voice_adapter.go", "obo_api.go", "resolve_targets.go",
 	}
 	banned := []string{
 		".ResponseError(",
