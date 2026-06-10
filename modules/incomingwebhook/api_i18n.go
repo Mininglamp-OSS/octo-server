@@ -119,6 +119,18 @@ func mgmtQuotaExceeded(c *wkhttp.Context, max int) {
 	httperr.ResponseErrorLWithStatus(c, errcode.ErrIncomingWebhookQuotaExceeded, i18n.Params{"max": max}, nil)
 }
 
+// mgmtCreatorQuotaExceeded returns 409 — the calling member/bot reached its
+// per-creator cap (admins are exempt); max carries the configured limit.
+func mgmtCreatorQuotaExceeded(c *wkhttp.Context, max int) {
+	httperr.ResponseErrorLWithStatus(c, errcode.ErrIncomingWebhookCreatorQuotaExceeded, i18n.Params{"max": max}, nil)
+}
+
+// mgmtCreatorLeft returns 409 — the webhook's creator is no longer in the
+// group; enable / regenerate / test push are refused (delete stays available).
+func mgmtCreatorLeft(c *wkhttp.Context) {
+	httperr.ResponseErrorLWithStatus(c, errcode.ErrIncomingWebhookCreatorLeft, nil, nil)
+}
+
 // mgmtQueryFailed returns 500 (Internal) — a read failed; real error logged.
 func mgmtQueryFailed(c *wkhttp.Context) {
 	httperr.ResponseErrorLWithStatus(c, errcode.ErrIncomingWebhookQueryFailed, nil, nil)

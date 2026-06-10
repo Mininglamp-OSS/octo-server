@@ -95,9 +95,12 @@ func (u *User) writeWebhookAvatar(c *wkhttp.Context, uid string) {
 		return
 	}
 	// 仅当 webhook 存在但无自定义头像、或 webhook 已删除（ch==nil）时回退默认头像。
-	imageData, genErr := generateDefaultAvatar(uid)
+	// 复用 bot 默认头像逻辑（crc32(uid) 确定性选 13 色内置 PNG）：webhook 与 bot 同属
+	// "非真实用户"发送者，视觉口径保持一致；成员/bot 自助创建的 webhook 不可自定义
+	// 头像（#member-perms），即默认全部落在这条 palette 路径上。
+	imageData, genErr := readBotDefaultAvatar(uid)
 	if genErr != nil {
-		u.Error("生成 webhook 默认头像失败", zap.Error(genErr), zap.String("uid", uid))
+		u.Error("读取 webhook 默认头像失败", zap.Error(genErr), zap.String("uid", uid))
 		c.Writer.WriteHeader(http.StatusInternalServerError)
 		return
 	}

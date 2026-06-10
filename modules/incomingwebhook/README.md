@@ -1,7 +1,41 @@
 # Incoming Webhook 推送契约
 
-外部服务通过带 token 的 URL 向指定群推送消息。管理端点（创建/列出/更新/删除/重置）
-由群主或管理员调用，详见 `api.go`。本文聚焦**推送端点**的请求契约。
+外部服务通过带 token 的 URL 向指定群推送消息。本文先给出**管理端点的权限模型**
+（#member-perms），随后聚焦**推送端点**的请求契约；管理端点实现详见 `api.go`。
+
+## 管理端点权限模型
+
+管理端点有两个挂载面，处理器与权限矩阵完全一致（一套 Service、两个门）：
+
+```
+/v1/groups/:group_no/incoming-webhooks[...]       # 用户登录态（AuthMiddleware）
+/v1/bot/groups/:group_no/incoming-webhooks[...]   # bot token（authBot，robot_id 即操作者）
+```
+
+| 操作 | 群主/管理员（含管理员 bot） | 普通成员 / 成员 bot（内部、正常状态） |
+|------|------|------|
+| create | ✅（可自定义名称+头像） | ✅ 名称可自定义（缺省自动命名 `Webhook-xxxxxx`）；头像不可设置（400） |
+| update | ✅ 任意 webhook | ✅ 仅自己创建的；可改名称/状态，头像不可改（400） |
+| delete / regenerate / test | ✅ 任意 webhook | ✅ 仅自己创建的（其余 403） |
+| list | ✅ | ✅ 只读全量可见（不回显 token/推送 URL） |
+| deliveries | ✅ 任意 webhook | ✅ 仅自己创建的（其余 403） |
+
+- 管理员判定走 `group_member.role`（`QueryIsGroupManagerOrCreator`），对人和 bot
+  一视同仁——**bot 被设为群管理员即与人类管理员同权**。外部成员（is_external=1）
+  与非正常状态成员一律 403。
+- 配额双层：群级 `max_per_group`（默认 10）对所有人生效；普通成员/bot 另受
+  per-creator 配额（system_setting `incomingwebhook.max_per_creator`，默认 5，env
+  `DM_INCOMINGWEBHOOK_MAX_PER_CREATOR`）约束，管理员豁免。超限 409。
+- **创建者退群即失效**：push 路径校验创建者仍是群内（内部、正常）成员，不满足则
+  统一 401 并把该 webhook 懒级联禁用（status→0）；启用/regenerate/测试推送对
+  创建者已退群的 webhook 返回 409（`mgmt_creator_left`），只能删除重建。创建者
+  重新入群后可由创建者/管理员重新启用。
+- 撤回不对称（已知契约）：webhook 消息的 FromUID 是 `iwh_*`，仅群主/管理员可撤回
+  （见 api.go 顶部注释）；普通成员创建者撤不了自己 webhook 发出的消息，止血手段是
+  立即禁用该 webhook。
+- 头像：成员/bot 创建的 webhook 无自定义头像，头像端点（`/v1/users/iwh_*/avatar`）
+  按 `crc32(webhook_id)` 确定性回退到 bot 默认头像 13 色 palette（与 bot 视觉口径
+  一致）；管理员可为任意 webhook 设置自定义头像 URL（302 重定向）。
 
 ```
 POST /v1/incoming-webhooks/:webhook_id/:token            # native（本文主体）

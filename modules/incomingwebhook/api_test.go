@@ -177,16 +177,25 @@ func TestCreate_HappyPath(t *testing.T) {
 	assert.Greater(t, int64(createdAt), int64(0), "created_at must be populated, not zero/epoch")
 }
 
-func TestCreate_RejectsEmptyName(t *testing.T) {
+// 名称缺省时服务端自动命名（Webhook-xxxxxx，后缀取自 webhook_id），不再 400
+// （#member-perms：成员/bot 创建路径需要一个无参可用的缺省，管理员同享该缺省）。
+func TestCreate_EmptyNameAutoGenerates(t *testing.T) {
 	handler, _, groupNo := setupTestEnv(t)
 	w := do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), map[string]interface{}{}))
-	assert.NotEqual(t, http.StatusOK, w.Code)
+	assert.Equalf(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	res := parseJSON(t, w)
+	name, _ := res["name"].(string)
+	assert.Regexp(t, `^Webhook-[0-9a-f]{6}$`, name)
+	whID, _ := res["webhook_id"].(string)
+	assert.Contains(t, whID, strings.TrimPrefix(name, "Webhook-"))
 }
 
-func TestCreate_NonAdminForbidden(t *testing.T) {
+// 非群成员不可创建。注意：普通成员现在【可以】创建（自动命名 + display_locked），
+// 见 api_member_test.go 的成员权限矩阵；这里只钉"完全不在群内 → 403"。
+func TestCreate_NonMemberForbidden(t *testing.T) {
 	handler, ctx, groupNo := setupTestEnv(t)
-	// 把当前用户降级为普通成员
-	_, err := ctx.DB().UpdateBySql("UPDATE group_member SET role=0 WHERE group_no=? AND uid=?", groupNo, testutil.UID).Exec()
+	// 把当前用户移出群（软删成员行）
+	_, err := ctx.DB().UpdateBySql("UPDATE group_member SET is_deleted=1 WHERE group_no=? AND uid=?", groupNo, testutil.UID).Exec()
 	assert.NoError(t, err)
 
 	w := do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo), map[string]interface{}{

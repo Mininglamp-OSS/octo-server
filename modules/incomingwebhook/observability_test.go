@@ -73,15 +73,16 @@ func TestDeliveries_LimitParam(t *testing.T) {
 	assert.Len(t, list, 2)
 }
 
-// 非群管理员不可看 deliveries。
-func TestDeliveries_RequiresAdmin(t *testing.T) {
+// deliveries 是创建者或管理员可见：创建者被降级为普通成员后仍可见（创建者权限），
+// 非创建者普通成员的 403 见 api_member_test.go TestMemberManage_OwnOnly。
+func TestDeliveries_DemotedCreatorStillAllowed(t *testing.T) {
 	handler, ctx, groupNo := setupTestEnv(t)
 	whID, _ := createWebhookWithToken(t, handler, groupNo)
 	_, err := ctx.DB().UpdateBySql("UPDATE group_member SET role=0 WHERE group_no=? AND uid=?", groupNo, testutil.UID).Exec()
 	require.NoError(t, err)
 
 	w := do(handler, authReq("GET", fmt.Sprintf("/v1/groups/%s/incoming-webhooks/%s/deliveries", groupNo, whID), nil))
-	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.Equalf(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 }
 
 // 不存在 / 跨群 webhook → 404。
@@ -138,15 +139,17 @@ func TestDeliveries_AuthFailureNotRecorded(t *testing.T) {
 
 // --- 测试推送端点 ---
 
-// 非管理员不可触发测试推送。
-func TestTestPush_RequiresAdmin(t *testing.T) {
+// 测试推送是创建者或管理员可用：创建者被降级为普通成员后仍可用（创建者权限，
+// 下游投递在测试桩下可能 200/500，只断言不是 403）。非创建者普通成员的 403 见
+// api_member_test.go TestMemberManage_OwnOnly。
+func TestTestPush_DemotedCreatorStillAllowed(t *testing.T) {
 	handler, ctx, groupNo := setupTestEnv(t)
 	whID, _ := createWebhookWithToken(t, handler, groupNo)
 	_, err := ctx.DB().UpdateBySql("UPDATE group_member SET role=0 WHERE group_no=? AND uid=?", groupNo, testutil.UID).Exec()
 	require.NoError(t, err)
 
 	w := do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks/%s/test", groupNo, whID), nil))
-	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.NotEqualf(t, http.StatusForbidden, w.Code, "body: %s", w.Body.String())
 }
 
 // 不存在的 webhook → 404。

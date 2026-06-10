@@ -116,6 +116,7 @@ type updateReq struct {
 }
 
 // webhookResp 对外暴露的 webhook 元信息（不含 token / token_hash）。
+// creator_uid 与登录 uid 对比可判断"是否我创建的"（成员仅可管理自己创建的）。
 type webhookResp struct {
 	WebhookID  string `json:"webhook_id"`
 	GroupNo    string `json:"group_no"`

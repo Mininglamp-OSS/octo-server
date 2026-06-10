@@ -270,6 +270,10 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 	// User-token endpoints under /v1/obo. Implementation in obo_api.go;
 	// the call is split out so this Route function doesn't grow further.
 	ba.registerOBORoutes(r)
+
+	// 群入站 Webhook 管理（bot token 面），与用户路由共用 incomingwebhook 实例与
+	// 权限矩阵（管理员 bot 同权人类管理员）。实现在 incoming_webhook.go。
+	ba.registerIncomingWebhookRoutes(r)
 }
 
 // ==================== Helper Functions ====================

@@ -333,11 +333,17 @@ other = "The target user does not exist or has been deactivated."
 ["err.server.group.view_forbidden"]
 other = "You do not have permission to view this."
 
+["err.server.incomingwebhook.mgmt_creator_left"]
+other = "The webhook's creator has left the group; it can no longer be enabled. Delete it and create a new one."
+
+["err.server.incomingwebhook.mgmt_creator_quota_exceeded"]
+other = "You can create at most {{.max}} webhooks in this group."
+
 ["err.server.incomingwebhook.mgmt_disabled"]
 other = "The incoming webhook feature is currently disabled."
 
 ["err.server.incomingwebhook.mgmt_forbidden"]
-other = "Only the group owner or an admin can manage webhooks."
+other = "You do not have permission to manage this webhook."
 
 ["err.server.incomingwebhook.mgmt_group_not_found"]
 other = "The group does not exist or has been disbanded."

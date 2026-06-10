@@ -560,11 +560,13 @@ const (
 	envIncomingWebhookPerWebhookRPS   = "DM_INCOMINGWEBHOOK_RPS"
 	envIncomingWebhookPerWebhookBurst = "DM_INCOMINGWEBHOOK_BURST"
 	envIncomingWebhookMaxPerGroup     = "DM_INCOMINGWEBHOOK_MAX_PER_GROUP"
+	envIncomingWebhookMaxPerCreator   = "DM_INCOMINGWEBHOOK_MAX_PER_CREATOR"
 
 	defaultIncomingWebhookEnabled         = true
 	defaultIncomingWebhookPerWebhookRPS   = 5.0
 	defaultIncomingWebhookPerWebhookBurst = 10
 	defaultIncomingWebhookMaxPerGroup     = 10
+	defaultIncomingWebhookMaxPerCreator   = 5
 )
 
 // IncomingWebhookEnabled 是群入站 Webhook 功能的总开关。关闭后 push 端点返回 404、
@@ -645,4 +647,27 @@ func incomingWebhookMaxPerGroupEnvDefault() int {
 		}
 	}
 	return defaultIncomingWebhookMaxPerGroup
+}
+
+// IncomingWebhookMaxPerCreator 单个普通成员/bot 在一个群内可创建的 webhook 数量
+// 上限（群主/管理员豁免，仅受群级 max_per_group 约束）。DB → env → 默认 5。
+// 读侧防御：≤0 回退默认（同 max_per_group，避免误配成"任何成员都建不了"的暗关）。
+func (s *SystemSettings) IncomingWebhookMaxPerCreator() int {
+	def := incomingWebhookMaxPerCreatorEnvDefault()
+	v := s.getInt("incomingwebhook", "max_per_creator", def)
+	if v <= 0 {
+		return def
+	}
+	return v
+}
+
+// incomingWebhookMaxPerCreatorEnvDefault 解析 DM_INCOMINGWEBHOOK_MAX_PER_CREATOR；
+// 仅接受正整数，否则回退默认值。
+func incomingWebhookMaxPerCreatorEnvDefault() int {
+	if v := os.Getenv(envIncomingWebhookMaxPerCreator); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultIncomingWebhookMaxPerCreator
 }

@@ -672,7 +672,7 @@ other = "未找到。"
 # ---- err.server.incomingwebhook.mgmt_* (management endpoints, #246 follow-up) ----
 
 ["err.server.incomingwebhook.mgmt_forbidden"]
-other = "仅群主或管理员可管理 webhook。"
+other = "你没有权限管理此 webhook。"
 
 ["err.server.incomingwebhook.mgmt_request_invalid"]
 other = "请求参数无效。"
@@ -685,6 +685,12 @@ other = "webhook 不存在。"
 
 ["err.server.incomingwebhook.mgmt_quota_exceeded"]
 other = "每个群最多 {{.max}} 个 webhook。"
+
+["err.server.incomingwebhook.mgmt_creator_quota_exceeded"]
+other = "你在该群最多可创建 {{.max}} 个 webhook。"
+
+["err.server.incomingwebhook.mgmt_creator_left"]
+other = "该 webhook 的创建者已退出群聊，无法再启用；请删除后重新创建。"
 
 ["err.server.incomingwebhook.mgmt_query_failed"]
 other = "查询 webhook 信息失败。"

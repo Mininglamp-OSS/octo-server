@@ -95,6 +95,11 @@ type IncomingWebhook struct {
 	// 契约见 cache.go。只缓存存在/Normal 的正向结果，不做负缓存。
 	webhookCache *ttlCache[*incomingWebhookModel]
 	groupCache   *ttlCache[*group.Model]
+	// memberCache 缓存「创建者仍是群内（内部、正常）成员」的正向结果，key 为
+	// groupNo+"|"+uid。push 路径的创建者在群闸（cachedCreatorIsMember）用它把
+	// 每次推送的 group_member 点读压到 0；只缓存 true（退群后最多 stale 一个 TTL，
+	// 之后懒级联禁用把 webhook 翻为 disabled，彻底关闸）。
+	memberCache *ttlCache[bool]
 }
 
 // maxConcurrentAudit 限制异步审计 goroutine 的最大并发数（默认值，可被 env 覆盖）。
@@ -136,10 +141,35 @@ func sharedRateRedis(cfg *config.Config) *redis.Client {
 	return rateRedisClient
 }
 
-// New 构造路由模块。
+// New 构造路由模块（完整实例：注册 push/管理路由 + GroupDisband 事件监听）。
 func New(ctx *config.Context) *IncomingWebhook {
+	w := newIncomingWebhook(ctx)
+	// 群解散级联禁用所有 webhook。只在模块主实例上注册——bot 管理面
+	// （NewManagementFacade）不重复订阅，避免一次 disband 触发两份级联写。
+	w.ctx.AddEventListener(event.GroupDisband, w.handleGroupDisband)
+	return w
+}
+
+// NewManagementFacade 构造 bot_api 挂载管理端点（MountManagementRoutes）用的轻量
+// 实例：与 New 同构（同一套 handler / DB / 审计池），但不注册事件监听（disband
+// 级联由模块主实例负责），也不会被挂 push 路由。
+//
+// ⚠️ 缓存一致性契约：facade 与模块主实例【各持一份】push 热路径缓存。bot 面的管理
+// 写操作（update/delete/regenerate）即时失效的是 facade 自己的缓存，主实例的 push
+// 缓存最多 stale 一个 TTL（默认 3s）——与既有「跨实例无主动失效、TTL 兜底」的
+// staleness 契约（cache.go）同级，等同把 bot 面视作一个对等实例；需要更快收敛就
+// 调小 DM_INCOMINGWEBHOOK_CACHE_TTL_MS。
+//
+// 刻意【不】按 ctx 记忆化共享单实例：octo-lib 的模块注册器以首个 ctx 调用各模块的
+// 创建闭包，按-ctx 记忆化会把测试进程里的多个 test server 折叠成单实例，串掉
+// per-server 的 env 派生配置（内存限流地板、缓存 TTL 等）。
+func NewManagementFacade(ctx *config.Context) *IncomingWebhook {
+	return newIncomingWebhook(ctx)
+}
+
+func newIncomingWebhook(ctx *config.Context) *IncomingWebhook {
 	cacheTTL, cacheMax := cacheTTL(), cacheMax()
-	w := &IncomingWebhook{
+	return &IncomingWebhook{
 		ctx:          ctx,
 		Log:          log.NewTLog("IncomingWebhook"),
 		db:           newDB(ctx),
@@ -150,31 +180,20 @@ func New(ctx *config.Context) *IncomingWebhook {
 		settings:     commonmod.EnsureSystemSettings(ctx),
 		webhookCache: newTTLCache[*incomingWebhookModel](cacheTTL, cacheMax),
 		groupCache:   newTTLCache[*group.Model](cacheTTL, cacheMax),
+		memberCache:  newTTLCache[bool](cacheTTL, cacheMax),
 	}
-	// 群解散级联禁用所有 webhook
-	w.ctx.AddEventListener(event.GroupDisband, w.handleGroupDisband)
-	return w
 }
 
 // Route 注册路由。
 func (w *IncomingWebhook) Route(r *wkhttp.WKHttp) {
-	// 管理类：登录用户 + 群管理员校验。认证路由默认挂 SharedUIDRateLimiter（须在
-	// AuthMiddleware 之后，否则读不到 uid 会静默 fail-open），与全局 IP floor 叠加，
-	// 给 create/regenerate 等敏感写操作补 per-login-user 限流。
-	mgr := r.Group("/v1/groups", w.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, w.ctx))
-	{
-		// 总开关(system_setting incomingwebhook.enabled)关闭时，写操作一律 403 拒绝，
-		// 仅保留 list 只读——运维仍可查看/排查已存在配置。requireMgmtEnabled 不挂在 list 上。
-		mgr.POST("/:group_no/incoming-webhooks", w.requireMgmtEnabled(), w.create)
-		mgr.GET("/:group_no/incoming-webhooks", w.list)
-		mgr.PUT("/:group_no/incoming-webhooks/:webhook_id", w.requireMgmtEnabled(), w.update)
-		mgr.DELETE("/:group_no/incoming-webhooks/:webhook_id", w.requireMgmtEnabled(), w.delete)
-		mgr.POST("/:group_no/incoming-webhooks/:webhook_id/regenerate", w.requireMgmtEnabled(), w.regenerate)
-		// 排障：最近投递记录（成功+失败）。只读，与 list 一致不挂 requireMgmtEnabled。
-		mgr.GET("/:group_no/incoming-webhooks/:webhook_id/deliveries", w.deliveries)
-		// 测试推送：管理员一键发一条样例消息验证配置。写操作，挂总开关闸。
-		mgr.POST("/:group_no/incoming-webhooks/:webhook_id/test", w.requireMgmtEnabled(), w.testPush)
-	}
+	// 管理类：登录用户 + 群成员/角色校验（resolveActor）。认证路由默认挂
+	// SharedUIDRateLimiter（须在 AuthMiddleware 之后，否则读不到 uid 会静默
+	// fail-open），与全局 IP floor 叠加，给 create/regenerate 等敏感写操作补
+	// per-login-user 限流。bot 侧的同一组端点由 bot_api 模块经
+	// MountManagementRoutes 挂到 /v1/bot/groups/:group_no/incoming-webhooks。
+	mgr := r.Group("/v1/groups/:group_no/incoming-webhooks",
+		w.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, w.ctx))
+	w.MountManagementRoutes(mgr)
 
 	// 推送类：URL 内 token 鉴权，无 AuthMiddleware。四层限流，由粗到细：
 	//  1) localFloorMiddleware —— 纯内存、不依赖 Redis 的进程级地板，先挡洪峰；Redis
@@ -208,6 +227,27 @@ func (w *IncomingWebhook) Route(r *wkhttp.WKHttp) {
 		push.POST("/incoming-webhooks/:webhook_id/:token/github", chain(w.pushGitHub)...)
 		push.POST("/incoming-webhooks/:webhook_id/:token/wecom", chain(w.pushWeCom)...)
 	}
+}
+
+// MountManagementRoutes 把管理端点（create/list/update/delete/regenerate/
+// deliveries/test）注册到 g 上。g 的路径必须已携带 :group_no（形如
+// /v1/groups/:group_no/incoming-webhooks），且调用方负责挂好鉴权中间件并保证
+// 处理器可从 c.MustGet("uid") 取到操作者身份：
+//   - 用户侧（本模块 Route）：AuthMiddleware 写入登录 uid；
+//   - bot 侧（bot_api 模块）：authBot 后由适配中间件把 robot_id 写入 "uid"。
+// 权限矩阵由 resolveActor + 各 handler 的所有权判断统一实施，与挂载面无关。
+func (w *IncomingWebhook) MountManagementRoutes(g *wkhttp.RouterGroup) {
+	// 总开关(system_setting incomingwebhook.enabled)关闭时，写操作一律 403 拒绝，
+	// 仅保留 list 只读——运维仍可查看/排查已存在配置。requireMgmtEnabled 不挂在 list 上。
+	g.POST("", w.requireMgmtEnabled(), w.create)
+	g.GET("", w.list)
+	g.PUT("/:webhook_id", w.requireMgmtEnabled(), w.update)
+	g.DELETE("/:webhook_id", w.requireMgmtEnabled(), w.delete)
+	g.POST("/:webhook_id/regenerate", w.requireMgmtEnabled(), w.regenerate)
+	// 排障：最近投递记录（成功+失败）。只读，与 list 一致不挂 requireMgmtEnabled。
+	g.GET("/:webhook_id/deliveries", w.deliveries)
+	// 测试推送：创建者/管理员一键发一条样例消息验证配置。写操作，挂总开关闸。
+	g.POST("/:webhook_id/test", w.requireMgmtEnabled(), w.testPush)
 }
 
 // requirePushEnabled 在总开关(system_setting incomingwebhook.enabled)关闭时让 push
@@ -299,6 +339,17 @@ func generateWebhookID() string {
 		return webhookIDPrefix + strings.ReplaceAll(util.GenerUUID(), "-", "")
 	}
 	return webhookIDPrefix + hex.EncodeToString(buf)
+}
+
+// autoWebhookName 在创建时未提供名称的情况下生成服务端默认名：
+// "Webhook-" + webhook_id 随机段前 6 位 hex。确定性、可与 webhook_id 对账，
+// 不引入第二个随机源。
+func autoWebhookName(webhookID string) string {
+	suffix := strings.TrimPrefix(webhookID, webhookIDPrefix)
+	if len(suffix) > 6 {
+		suffix = suffix[:6]
+	}
+	return "Webhook-" + suffix
 }
 
 func toResp(m *incomingWebhookModel) webhookResp {
@@ -397,21 +448,93 @@ func (w *IncomingWebhook) cachedRequireActiveGroup(groupNo string) (*group.Model
 	return g, nil
 }
 
-// requireGroupAdmin 校验登录用户是否为群主或管理员，是则返回 (loginUID, true)；
-// 否则已写入 4xx 响应。
-func (w *IncomingWebhook) requireGroupAdmin(c *wkhttp.Context, groupNo string) (string, bool) {
-	loginUID := c.MustGet("uid").(string)
-	ok, err := w.groupDB.QueryIsGroupManagerOrCreator(groupNo, loginUID)
+// cachedCreatorIsMember 带缓存判断创建者是否仍是群的内部正常成员，push 热路径专用。
+// 只缓存 true（与 groupCache 同理：负结果不粘住，退群后最多 stale 一个 TTL）。
+// 退群没有跨模块事件可订阅（group.memberremove 事件常量无发布方），所以这里是
+// 该规则的权威闸：闸不过 → push 401 + 懒级联禁用（见 handlePush）。
+func (w *IncomingWebhook) cachedCreatorIsMember(groupNo, uid string) (bool, error) {
+	key := groupNo + "|" + uid
+	if ok, hit := w.memberCache.get(key); hit {
+		return ok, nil
+	}
+	gen := w.memberCache.loadGen()
+	ok, err := w.db.isActiveInternalMember(groupNo, uid)
+	if err != nil {
+		return false, err
+	}
+	if ok {
+		w.memberCache.setIfGen(key, true, gen)
+	}
+	return ok, nil
+}
+
+// mgmtActor 是管理端点的操作者身份：用户登录态或 bot token 鉴权后的统一抽象。
+//   - isAdmin：群主或管理员（QueryIsGroupManagerOrCreator，人/bot 同一查询）——
+//     可管理群内任意 webhook、可自定义展示身份、不受 per-creator 配额限制；
+//   - 非 admin 的内部正常成员（含成员 bot）：可创建（展示身份服务端固定）、
+//     只能管理自己创建的（creator_uid == uid）。
+type mgmtActor struct {
+	uid     string
+	isAdmin bool
+}
+
+// resolveActor 解析并校验操作者：必须是群的【内部、正常状态】成员（管理员判定
+// 自带该 fail-safe 过滤）。失败时已写入 4xx/5xx 响应并返回 ok=false。
+// uid 来源于 "uid" 上下文键：用户路由由 AuthMiddleware 写入；bot 路由由 bot_api
+// 的适配中间件把 robot_id 写入同名键，两个挂载面共用本判定。
+func (w *IncomingWebhook) resolveActor(c *wkhttp.Context, groupNo string) (mgmtActor, bool) {
+	uid := c.MustGet("uid").(string)
+	isAdmin, err := w.groupDB.QueryIsGroupManagerOrCreator(groupNo, uid)
 	if err != nil {
 		w.Error("query group manager failed", zap.Error(err))
 		mgmtQueryFailed(c)
-		return "", false
+		return mgmtActor{}, false
+	}
+	if isAdmin {
+		return mgmtActor{uid: uid, isAdmin: true}, true
+	}
+	isMember, err := w.db.isActiveInternalMember(groupNo, uid)
+	if err != nil {
+		w.Error("query group member failed", zap.Error(err))
+		mgmtQueryFailed(c)
+		return mgmtActor{}, false
+	}
+	if !isMember {
+		mgmtForbidden(c)
+		return mgmtActor{}, false
+	}
+	return mgmtActor{uid: uid}, true
+}
+
+// requireOwnership 校验 actor 对 m 的管理权：管理员放行任意，普通成员/bot 仅放行
+// 自己创建的；否则写 403。返回 false 时调用方应立即返回。
+//
+// 刻意用 403 而非 404：list 对全员只读可见，webhook 的存在性在群内不是秘密，
+// "看得到但不能动"用 Forbidden 语义更诚实（跨群/不存在仍由 queryManageable 404）。
+func (w *IncomingWebhook) requireOwnership(c *wkhttp.Context, actor mgmtActor, m *incomingWebhookModel) bool {
+	if actor.isAdmin || m.CreatorUID == actor.uid {
+		return true
+	}
+	mgmtForbidden(c)
+	return false
+}
+
+// requireCreatorInGroup 校验 webhook 创建者仍是群的内部正常成员。enable /
+// regenerate / testPush 这些"让 webhook 可推送/保持可推送"的操作都必须过这一关：
+// 创建者退群后 webhook 永久失效（push 路径懒级联禁用兜底），只能删除重建。
+// 失败时已写入响应（409 或 5xx）。
+func (w *IncomingWebhook) requireCreatorInGroup(c *wkhttp.Context, m *incomingWebhookModel) bool {
+	ok, err := w.db.isActiveInternalMember(m.GroupNo, m.CreatorUID)
+	if err != nil {
+		w.Error("query creator membership failed", zap.Error(err))
+		mgmtQueryFailed(c)
+		return false
 	}
 	if !ok {
-		mgmtForbidden(c)
-		return "", false
+		mgmtCreatorLeft(c)
+		return false
 	}
-	return loginUID, true
+	return true
 }
 
 // queryManageable 查询属于 groupNo 且未被软删除的 webhook，供管理端写操作（update /
@@ -440,7 +563,7 @@ func (w *IncomingWebhook) queryManageable(c *wkhttp.Context, groupNo, webhookID 
 
 func (w *IncomingWebhook) create(c *wkhttp.Context) {
 	groupNo := c.Param("group_no")
-	loginUID, ok := w.requireGroupAdmin(c, groupNo)
+	actor, ok := w.resolveActor(c, groupNo)
 	if !ok {
 		return
 	}
@@ -451,8 +574,14 @@ func (w *IncomingWebhook) create(c *wkhttp.Context) {
 		return
 	}
 	req.Name = strings.TrimSpace(req.Name)
-	if req.Name == "" || len(req.Name) > 64 {
+	if len(req.Name) > 64 {
 		mgmtRequestInvalid(c, "name")
+		return
+	}
+	// 头像仅管理员可设置：普通成员/bot 的 webhook 走头像端点的确定性默认头像
+	// （bot 13 色 palette），不接受自定义，防止任意成员借头像伪装他人。
+	if !actor.isAdmin && req.Avatar != "" {
+		mgmtRequestInvalid(c, "avatar")
 		return
 	}
 
@@ -476,14 +605,20 @@ func (w *IncomingWebhook) create(c *wkhttp.Context) {
 		return
 	}
 
+	webhookID := generateWebhookID()
+	if req.Name == "" {
+		// 名称缺省时服务端自动命名（Webhook-xxxxxx，后缀取自 webhook_id，可追溯）。
+		req.Name = autoWebhookName(webhookID)
+	}
+
 	m := &incomingWebhookModel{
-		WebhookID:  generateWebhookID(),
+		WebhookID:  webhookID,
 		TokenHash:  hash,
 		GroupNo:    groupNo,
 		SpaceID:    g.SpaceID,
 		Name:       req.Name,
 		Avatar:     req.Avatar,
-		CreatorUID: loginUID,
+		CreatorUID: actor.uid,
 		Status:     statusEnabled,
 	}
 	// 配额校验 + 写入在事务内原子完成；FOR UPDATE 锁住 group_no 范围，防止并发越限。
@@ -493,10 +628,21 @@ func (w *IncomingWebhook) create(c *wkhttp.Context) {
 	// status=1 的行，但这**不构成安全问题**：该 webhook 永远推不出消息——push 路径的
 	// requireActiveGroup 重查才是权威闸（群非 Normal 一律 401），且 disband 级联会把
 	// status 翻 0。故此处不在事务内重读 group.status，避免给热路径加锁负担。
+	//
+	// 配额双层：群级 max_per_group 对所有人生效；per-creator 仅约束普通成员/bot
+	// （管理员能删任意 webhook，对其限个人额度无安全意义）。
 	maxWH := w.settings.IncomingWebhookMaxPerGroup()
-	if err := w.db.insertWithQuota(m, maxWH); err != nil {
+	maxPerCreator := 0
+	if !actor.isAdmin {
+		maxPerCreator = w.settings.IncomingWebhookMaxPerCreator()
+	}
+	if err := w.db.insertWithQuota(m, maxWH, maxPerCreator); err != nil {
 		if errors.Is(err, ErrQuotaExceeded) {
 			mgmtQuotaExceeded(c, maxWH)
+			return
+		}
+		if errors.Is(err, ErrCreatorQuotaExceeded) {
+			mgmtCreatorQuotaExceeded(c, maxPerCreator)
 			return
 		}
 		w.Error("insert webhook failed", zap.Error(err))
@@ -513,9 +659,11 @@ func (w *IncomingWebhook) create(c *wkhttp.Context) {
 	c.Response(resp)
 }
 
+// list 对任意（内部、正常）群成员只读开放：响应不含 token / token_hash / 推送 URL，
+// 看得到不等于推得了；成员据 creator_uid 识别哪些是自己创建的。
 func (w *IncomingWebhook) list(c *wkhttp.Context) {
 	groupNo := c.Param("group_no")
-	if _, ok := w.requireGroupAdmin(c, groupNo); !ok {
+	if _, ok := w.resolveActor(c, groupNo); !ok {
 		return
 	}
 	list, err := w.db.queryByGroupNo(groupNo)
@@ -534,12 +682,16 @@ func (w *IncomingWebhook) list(c *wkhttp.Context) {
 func (w *IncomingWebhook) update(c *wkhttp.Context) {
 	groupNo := c.Param("group_no")
 	webhookID := c.Param("webhook_id")
-	if _, ok := w.requireGroupAdmin(c, groupNo); !ok {
+	actor, ok := w.resolveActor(c, groupNo)
+	if !ok {
 		return
 	}
 
 	m, ok := w.queryManageable(c, groupNo, webhookID)
 	if !ok {
+		return
+	}
+	if !w.requireOwnership(c, actor, m) {
 		return
 	}
 
@@ -559,6 +711,12 @@ func (w *IncomingWebhook) update(c *wkhttp.Context) {
 		fields["name"] = name
 	}
 	if req.Avatar != nil {
+		// 头像仅管理员可改（与 create 一致）：成员/bot 的 webhook 固定走头像端点的
+		// 确定性默认头像。
+		if !actor.isAdmin {
+			mgmtRequestInvalid(c, "avatar")
+			return
+		}
 		fields["avatar"] = *req.Avatar
 	}
 	if req.Status != nil {
@@ -568,8 +726,9 @@ func (w *IncomingWebhook) update(c *wkhttp.Context) {
 			mgmtRequestInvalid(c, "status")
 			return
 		}
-		// 启用 webhook 前必须确认群仍处于 Normal —— 阻断 disband → re-enable 复活路径。
-		// 禁用（status=0）始终允许，便于管理员主动关停。
+		// 启用 webhook 前必须确认群仍处于 Normal —— 阻断 disband → re-enable 复活路径；
+		// 且创建者必须仍在群内 —— 阻断"创建者退群后被第三方复活"的旁路（push 的懒级联
+		// 禁用 + 此闸构成 belt & suspenders）。禁用（status=0）始终允许，便于主动关停。
 		if *req.Status == statusEnabled {
 			g, err := w.requireActiveGroup(groupNo)
 			if err != nil {
@@ -579,6 +738,9 @@ func (w *IncomingWebhook) update(c *wkhttp.Context) {
 			}
 			if g == nil {
 				mgmtGroupNotFound(c)
+				return
+			}
+			if !w.requireCreatorInGroup(c, m) {
 				return
 			}
 		}
@@ -617,10 +779,16 @@ func (w *IncomingWebhook) update(c *wkhttp.Context) {
 func (w *IncomingWebhook) delete(c *wkhttp.Context) {
 	groupNo := c.Param("group_no")
 	webhookID := c.Param("webhook_id")
-	if _, ok := w.requireGroupAdmin(c, groupNo); !ok {
+	actor, ok := w.resolveActor(c, groupNo)
+	if !ok {
 		return
 	}
-	if _, ok := w.queryManageable(c, groupNo, webhookID); !ok {
+	m, ok := w.queryManageable(c, groupNo, webhookID)
+	if !ok {
+		return
+	}
+	// 删除不挂 requireCreatorInGroup：创建者退群后管理员必须仍能清理（#member-perms）。
+	if !w.requireOwnership(c, actor, m) {
 		return
 	}
 	if err := w.db.deleteByWebhookID(webhookID); err != nil {
@@ -636,7 +804,8 @@ func (w *IncomingWebhook) delete(c *wkhttp.Context) {
 func (w *IncomingWebhook) regenerate(c *wkhttp.Context) {
 	groupNo := c.Param("group_no")
 	webhookID := c.Param("webhook_id")
-	if _, ok := w.requireGroupAdmin(c, groupNo); !ok {
+	actor, ok := w.resolveActor(c, groupNo)
+	if !ok {
 		return
 	}
 	// 与 create / update(启用) 保持一致：群非 Normal 不允许颁发新 token。
@@ -650,7 +819,16 @@ func (w *IncomingWebhook) regenerate(c *wkhttp.Context) {
 		mgmtGroupNotFound(c)
 		return
 	}
-	if _, ok := w.queryManageable(c, groupNo, webhookID); !ok {
+	m, ok := w.queryManageable(c, groupNo, webhookID)
+	if !ok {
+		return
+	}
+	if !w.requireOwnership(c, actor, m) {
+		return
+	}
+	// 创建者已退群的 webhook 不再颁发新 token（它无论如何推不出消息，新 token 只会
+	// 造成"为什么一直 401"的排障困惑）。
+	if !w.requireCreatorInGroup(c, m) {
 		return
 	}
 	token, hash, err := generateToken()
@@ -711,17 +889,23 @@ func testPushMessage(ctx context.Context) string {
 	return "✅ Incoming Webhook 测试消息：配置成功，链路已打通。"
 }
 
-// deliveries 返回某 webhook 最近的投递记录（成功+失败），供发送方排障。只读、群管理员
-// 可见；绝不返回 token。失败记录的 reason/http_status 与 push 路径返回给调用方的响应
-// 一致，便于对照定位。
+// deliveries 返回某 webhook 最近的投递记录（成功+失败），供发送方排障。只读、
+// 【创建者或群管理员】可见——投递元数据（失败原因/字节数/时间）只与排障相关，
+// 其他成员没有查看他人 webhook 投递明细的业务需要；绝不返回 token。失败记录的
+// reason/http_status 与 push 路径返回给调用方的响应一致，便于对照定位。
 func (w *IncomingWebhook) deliveries(c *wkhttp.Context) {
 	groupNo := c.Param("group_no")
 	webhookID := c.Param("webhook_id")
-	if _, ok := w.requireGroupAdmin(c, groupNo); !ok {
+	actor, ok := w.resolveActor(c, groupNo)
+	if !ok {
 		return
 	}
 	// 复用 queryManageable：webhook 必须属于该群且未软删除（跨群/不存在→404）。
-	if _, ok := w.queryManageable(c, groupNo, webhookID); !ok {
+	m, ok := w.queryManageable(c, groupNo, webhookID)
+	if !ok {
+		return
+	}
+	if !w.requireOwnership(c, actor, m) {
 		return
 	}
 	limit := defaultDeliveriesLimit
@@ -758,13 +942,15 @@ func deliveryRespFrom(a *auditModel) deliveryResp {
 	}
 }
 
-// testPush 由群管理员触发，向群里发一条固定文案的测试消息，端到端验证 webhook 配置
-// （群可达、消息能投递）。走与正式推送相同的 buildPayload(text) → SendMessage 链路，
-// 并记一条 adapter=test 的成功投递，便于在 deliveries 里与真实流量区分。
+// testPush 由创建者或群管理员触发，向群里发一条固定文案的测试消息，端到端验证
+// webhook 配置（群可达、消息能投递）。走与正式推送相同的 buildPayload(text) →
+// SendMessage 链路，并记一条 adapter=test 的成功投递，便于在 deliveries 里与真实
+// 流量区分。
 func (w *IncomingWebhook) testPush(c *wkhttp.Context) {
 	groupNo := c.Param("group_no")
 	webhookID := c.Param("webhook_id")
-	if _, ok := w.requireGroupAdmin(c, groupNo); !ok {
+	actor, ok := w.resolveActor(c, groupNo)
+	if !ok {
 		return
 	}
 	// 群必须仍为 Normal —— 不向已解散/禁用群发测试消息（与 create/enable 一致）。
@@ -780,6 +966,13 @@ func (w *IncomingWebhook) testPush(c *wkhttp.Context) {
 	}
 	m, ok := w.queryManageable(c, groupNo, webhookID)
 	if !ok {
+		return
+	}
+	if !w.requireOwnership(c, actor, m) {
+		return
+	}
+	// 与 push 路径的创建者在群闸同口径：创建者已退群的 webhook 连测试消息也不发。
+	if !w.requireCreatorInGroup(c, m) {
 		return
 	}
 
@@ -896,6 +1089,30 @@ func (w *IncomingWebhook) handlePush(c *wkhttp.Context, ad pushAdapter) {
 		return
 	}
 	if g == nil {
+		pushUnauthorized(c)
+		return
+	}
+
+	// 2.6) 创建者必须仍是群的内部正常成员（#member-perms）：成员/bot 可自助创建
+	// webhook 后，"退群即失效"是该权限模型的安全底线（离开的人不能继续向群里发声）。
+	// 退群没有可订阅的跨模块事件，这里即权威闸；闸不过时【懒级联禁用】该 webhook
+	// （status→disabled，幂等、不触碰软删除行），让管理列表如实反映失效状态，后续
+	// push 在 status 闸即被拒。响应仍是统一 401（持有效 token 的调用方，与群闸同
+	// 口径，不计 IP 失败预算、不入审计）。
+	ok, err := w.cachedCreatorIsMember(m.GroupNo, m.CreatorUID)
+	if err != nil {
+		// 服务端故障：拒绝但不禁用（fail closed on push, no destructive write）。
+		w.Error("query creator membership on push failed",
+			zap.String("webhook_id", m.WebhookID), zap.Error(err))
+		pushUnauthorized(c)
+		return
+	}
+	if !ok {
+		if dErr := w.db.disableEnabledByWebhookID(m.WebhookID); dErr != nil {
+			w.Warn("lazy-disable webhook on creator-left failed",
+				zap.String("webhook_id", m.WebhookID), zap.Error(dErr))
+		}
+		w.webhookCache.invalidate(m.WebhookID)
 		pushUnauthorized(c)
 		return
 	}

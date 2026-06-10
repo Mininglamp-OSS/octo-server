@@ -91,12 +91,12 @@ func TestSoftDelete_FreesQuota(t *testing.T) {
 
 	// 配额已满：第三个被拒。
 	over := &incomingWebhookModel{WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, Name: "wh", Status: statusEnabled}
-	assert.ErrorIs(t, d.insertWithQuota(over, max), ErrQuotaExceeded)
+	assert.ErrorIs(t, d.insertWithQuota(over, max, 0), ErrQuotaExceeded)
 
 	// 软删一个释放配额后可再建一个。
 	assert.NoError(t, d.deleteByWebhookID(id1))
 	again := &incomingWebhookModel{WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, Name: "wh", Status: statusEnabled}
-	assert.NoError(t, d.insertWithQuota(again, max), "soft-delete must free per-group quota")
+	assert.NoError(t, d.insertWithQuota(again, max, 0), "soft-delete must free per-group quota")
 }
 
 // TestDisableByGroupNo_SkipsDeleted 验证群解散级联禁用不会"复活"已软删除的 webhook：
@@ -265,6 +265,6 @@ func mustInsertWebhookWithMax(t *testing.T, d *incomingWebhookDB, groupNo string
 		Name:      "wh",
 		Status:    statusEnabled,
 	}
-	assert.NoError(t, d.insertWithQuota(m, max))
+	assert.NoError(t, d.insertWithQuota(m, max, 0))
 	return m.WebhookID
 }
