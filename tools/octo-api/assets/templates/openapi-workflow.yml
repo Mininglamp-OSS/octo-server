@@ -105,7 +105,6 @@ jobs:
               - 'modules/**/*.go'
               - 'tools/octo-api/**'
               - 'docs/openapi/swagger.yaml'
-              - 'docs/openapi/swagger.json'
               - '.github/workflows/openapi.yml'
             toolchain:
               - 'tools/octo-api/**'
@@ -170,15 +169,15 @@ jobs:
           # Use porcelain to catch both "modified tracked file" and
           # "new untracked file" cases — `git diff --exit-code` alone
           # misses untracked baselines on first introduction.
-          DRIFT=$(git status --porcelain -- docs/openapi/swagger.yaml docs/openapi/swagger.json docs/openapi/docs.go)
+          DRIFT=$(git status --porcelain -- docs/openapi/swagger.yaml)
           if [ -n "$DRIFT" ]; then
-            echo "::error title=OpenAPI spec drift::The generated spec does not match the committed baseline. Run 'make openapi-gen' locally and commit docs/openapi/swagger.{yaml,json,docs.go}."
+            echo "::error title=OpenAPI spec drift::The generated spec does not match the committed baseline. Run 'make openapi-gen' locally and commit docs/openapi/swagger.yaml."
             echo ""
             echo "Drifted files:"
             echo "$DRIFT"
             echo ""
             echo "Diff (truncated to first 200 lines):"
-            git --no-pager diff -- docs/openapi/swagger.yaml docs/openapi/swagger.json docs/openapi/docs.go | head -200 || true
+            git --no-pager diff -- docs/openapi/swagger.yaml | head -200 || true
             exit 1
           fi
           echo "✅ Generated spec matches committed baseline"
@@ -189,8 +188,6 @@ jobs:
           name: openapi-spec
           path: |
             docs/openapi/swagger.yaml
-            docs/openapi/swagger.json
-            docs/openapi/docs.go
           retention-days: 7
 
   # --------------------------------------------------------------------

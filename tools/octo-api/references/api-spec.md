@@ -345,7 +345,7 @@ httperr.ResponseErrorL(c, errcode.ErrValidation,
 | `@Description` | ✅ | 1-3 句补充，不重复 Summary；含幂等性/副作用提示 |
 | `@Tags` | ✅ | 单值，lowercase snake_case，跟 module 名一致 |
 | `@ID` | ✅ | operationId，`<resource>.<verb>` 或 `<resource>.<sub>.<verb>` |
-| `@Accept` / `@Produce` | ✅ | 一般 `json`（文件上传时 `multipart/form-data`）|
+| `@Accept` / `@Produce` | ✅ | **响应只允许 `application/json`**（lint 强制：`octo-response-success-json-only` / `octo-response-error-json-only`）。请求侧文件上传照常 `multipart/form-data`。真实字节流端点（文件/语音下载）对 2xx 走仓库级 spectral override 显式豁免并在 PR review 说明；**错误响应必须 JSON，无豁免**；302 重定向无 body 不受影响 |
 | `@Security` | ✅（鉴权时）| 用 `Bearer` |
 | `@Param` | ✅（有参时）| 所有 path/query/body 参数都列 |
 | `@Success` | ✅ | 至少 1 个 + envelope 类型 |

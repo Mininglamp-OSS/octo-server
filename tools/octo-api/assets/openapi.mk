@@ -11,10 +11,14 @@
 # Override-able variables:
 #   SWAG_VERSION       swag CLI version pin (default v2.0.0-rc5)
 #   OPENAPI_OUT_DIR    spec output directory (default docs/openapi)
+#   OPENAPI_OUT_TYPES  swag output types (default yaml — single source of
+#                      truth; add go for the runtime /swagger registrar,
+#                      json for consumers that need it, e.g. yaml,go)
 #   BASE_REF           git ref for openapi-diff (default origin/main)
 #   OCTO_API_DIR       skill package root (default tools/octo-api)
 
 SWAG_VERSION    ?= v2.0.0-rc5
+OPENAPI_OUT_TYPES ?= yaml
 OASDIFF_VERSION ?= v1.18.5
 OPENAPI_OUT_DIR ?= docs/openapi
 OCTO_API_DIR    ?= tools/octo-api
@@ -25,7 +29,7 @@ OCTO_API_DIR    ?= tools/octo-api
 openapi-help:
 	@echo "OpenAPI toolchain — available targets:"
 	@echo "  make openapi-check     一键 4 道闸（coverage → verify → lint）"
-	@echo "  make openapi-gen       重生 $(OPENAPI_OUT_DIR)/swagger.{yaml,json,docs.go}"
+	@echo "  make openapi-gen       重生 $(OPENAPI_OUT_DIR)/swagger.yaml（OPENAPI_OUT_TYPES 可加 json/go）"
 	@echo "  make openapi-lint      单独跑 spectral 校验"
 	@echo "  make openapi-verify    gen + drift 检测"
 	@echo "  make openapi-coverage  检查 handler 是否都有 @Router"
@@ -41,10 +45,9 @@ openapi-help:
 SWAG    := $(shell command -v swag    2>/dev/null || echo $$(go env GOPATH)/bin/swag)
 OASDIFF := $(shell command -v oasdiff 2>/dev/null || echo $$(go env GOPATH)/bin/oasdiff)
 
-OPENAPI_SPEC_FILES := \
-	$(OPENAPI_OUT_DIR)/swagger.yaml \
-	$(OPENAPI_OUT_DIR)/swagger.json \
-	$(OPENAPI_OUT_DIR)/docs.go
+# Derived from OPENAPI_OUT_TYPES: yaml→swagger.yaml json→swagger.json go→docs.go
+comma := ,
+OPENAPI_SPEC_FILES := $(foreach t,$(subst $(comma), ,$(OPENAPI_OUT_TYPES)),$(if $(filter go,$(t)),$(OPENAPI_OUT_DIR)/docs.go,$(OPENAPI_OUT_DIR)/swagger.$(t)))
 
 # ----------------------------------------------------------------------
 # Install swag v2 CLI if missing
@@ -69,7 +72,7 @@ openapi-coverage:
 # still needs a (blank) import of that package; see api-spec.md §B.
 # ----------------------------------------------------------------------
 openapi-gen: openapi-doctor-gen openapi-install
-	$(SWAG) init -g main.go -d ./ -o $(OPENAPI_OUT_DIR) --v3.1 --parseDependencyLevel 1
+	$(SWAG) init -g main.go -d ./ -o $(OPENAPI_OUT_DIR) --v3.1 --parseDependencyLevel 1 --outputTypes $(OPENAPI_OUT_TYPES)
 	@bash $(OCTO_API_DIR)/scripts/normalize-spec.sh $(OPENAPI_OUT_DIR)
 	@echo "💡 Tip: 'make openapi-preview' renders the spec to a local HTML page."
 
@@ -94,7 +97,7 @@ openapi-verify: openapi-gen
 	  echo "❌ OpenAPI spec drift detected:"; \
 	  echo "$$DRIFT"; \
 	  echo ""; \
-	  echo "Run 'make openapi-gen' and commit $(OPENAPI_OUT_DIR)/swagger.{yaml,json,docs.go}."; \
+	  echo "Run 'make openapi-gen' and commit $(OPENAPI_SPEC_FILES)."; \
 	  exit 1; \
 	fi
 	@echo "✅ Generated spec matches committed baseline"

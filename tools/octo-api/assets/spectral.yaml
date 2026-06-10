@@ -221,6 +221,29 @@ rules:
       function: truthy
       message: "4xx/5xx response must wrap payload in envelope.Error (top-level `error` property required) (R1)"
 
+  # All response bodies are application/json (R13 @Produce hardened).
+  # Split success/error so a genuine byte-stream endpoint can carry a
+  # repo-level spectral override for its 2xx WITHOUT exempting its
+  # error responses — errors are JSON envelopes with no exceptions.
+  # 302 redirects declare no content, so they are unaffected.
+  octo-response-success-json-only:
+    description: 2xx response content must be application/json; byte-stream endpoints need an explicit repo-level override (R13)
+    severity: error
+    given: "$.paths[*][*].responses[?(@property.match(/^2/))].content[*]~"
+    then:
+      function: pattern
+      functionOptions:
+        match: "^application/json$"
+
+  octo-response-error-json-only:
+    description: 4xx/5xx response content must be application/json — no exceptions (R13)
+    severity: error
+    given: "$.paths[*][*].responses[?(@property.match(/^[45]/))].content[*]~"
+    then:
+      function: pattern
+      functionOptions:
+        match: "^application/json$"
+
   # @Success is mandatory (R13: "@Success ✅ 至少 1 个") — every operation
   # must declare at least one 2xx response.
   octo-success-response-required:

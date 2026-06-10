@@ -8,7 +8,7 @@
 |---|---|---|
 | `make openapi-help` | 列所有 `openapi-*` 命令 + 一句话说明 | 忘记某个命令时 |
 | `make openapi-check` | 一键校验：coverage → verify (gen + drift) → lint。**跑完全部闸再汇总**，不在第一道失败就停（存量仓库 coverage 长期红时不遮蔽 lint/verify 结果） | 提交代码前 |
-| `make openapi-gen` | 重生 `docs/openapi/swagger.{yaml,json,docs.go}` | 改了 API 注释后 |
+| `make openapi-gen` | 重生 `docs/openapi/swagger.yaml`（默认只产 yaml，单一事实来源）| 改了 API 注释后 |
 | `make openapi-lint` | 单独跑 spectral 校验 | debug lint 错误时迭代用 |
 | `make openapi-verify` | gen + drift 检测 | 单独验证 spec 跟 git 同步 |
 | `make openapi-coverage` | 检查 handler 是否都有 `@Router` | 排查 coverage 失败 |
@@ -29,6 +29,7 @@
 | 变量 | 默认值 | 何时改 |
 |---|---|---|
 | `OPENAPI_OUT_DIR` | `docs/openapi` | spec 想放别的目录（如 `api/`）|
+| `OPENAPI_OUT_TYPES` | `yaml` | 默认只产 swagger.yaml；需要运行时 /swagger 注册器加 `go`（如 `yaml,go`），需要 json 给下游消费加 `json` |
 | `SWAG_VERSION` | `v2.0.0-rc5` | 升级 swag |
 | `BASE_REF` | `origin/main` | `make openapi-diff` 对比其它分支 / tag |
 | `OCTO_API_DIR` | `tools/octo-api` | skill 包根目录位置（罕见改动）|
@@ -59,8 +60,8 @@ include tools/octo-api/assets/openapi.mk
 | 项 | 路径 / 说明 |
 |---|---|
 | 输出目录 | `docs/openapi/`（机器生成产物，跟人工写的 `docs/*.md` 不混）|
-| spec 文件 | `swagger.yaml` / `swagger.json` —— swag 工具的硬编码命名，**内容是 OpenAPI 3.1**（非 Swagger 2.0）|
-| `docs.go` | swag 生成的 Go 注册器代码 —— 见下节"运行时暴露 /swagger endpoint" |
+| spec 文件 | `swagger.yaml` —— swag 工具的硬编码命名，**内容是 OpenAPI 3.1**（非 Swagger 2.0）。`swagger.json` 默认不再生成（`OPENAPI_OUT_TYPES` 加 `json` 启用）|
+| `docs.go` | swag 的 Go 注册器代码，默认不生成 —— 需要时 `OPENAPI_OUT_TYPES=yaml,go`，见下节"运行时暴露 /swagger endpoint" |
 | `index.html` | `make openapi-preview` 生成的本地预览，不 commit（加到 `.gitignore`）|
 
 ## CI 集成（可选）
@@ -74,7 +75,7 @@ include tools/octo-api/assets/openapi.mk
 | Detect changed paths | docs-only PR 跳过整套 | — |
 | Swag Annotation Coverage | handler @Router 覆盖 | ✅ |
 | Generate & Verify OpenAPI 3.1 | swag 生成 + drift 检测 | ✅ |
-| Spectral Lint | 30 条 OCTO 规则 + spectral:oas | ✅ |
+| Spectral Lint | 32 条 OCTO 规则 + spectral:oas | ✅ |
 | Breaking Change Check | oasdiff 检测 breaking | ✅ on error |
 | Toolchain Self-Test | 工具链自身回归 | ✅ |
 
@@ -82,4 +83,4 @@ repo admin 把 5 个 ✅ 的 job 加入 branch ruleset 的 required check 即生
 
 ## 运行时暴露 /swagger endpoint
 
-默认未启用（`docs/openapi/docs.go` swag 自动生成但没人 import）。若需运行时让客户端拉 spec（SDK 生成器 / 在线 viewer），按 [swag 官方文档](https://github.com/swaggo/swag#general-api-info) 在 `main.go` 加 import + 在 router 加 `r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))`。
+默认未启用（且 `docs.go` 默认不再生成 —— 先设 `OPENAPI_OUT_TYPES := yaml,go` 重新 gen）。若需运行时让客户端拉 spec（SDK 生成器 / 在线 viewer），按 [swag 官方文档](https://github.com/swaggo/swag#general-api-info) 在 `main.go` 加 import + 在 router 加 `r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))`。

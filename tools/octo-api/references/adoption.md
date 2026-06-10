@@ -10,7 +10,7 @@
 | 2 | `main.go` 加 swag 全局注解 | 开发者 | `@title` / `@version` / `@host` / `@BasePath` / Bearer 等 —— 模板见 `api-spec.md` E 章节末尾 |
 | 3 | 至少一个 handler 加完整 swag 注释 | 开发者 | 按 `SKILL.md` 1 章工作流走一遍 |
 | 4 | 生成首份 baseline | 开发者 | `make openapi-gen`（首次自动装 swag v2 CLI）|
-| 5 | 提交 baseline | 开发者 | `git add docs/openapi/ && git commit -m "chore: add openapi baseline"` |
+| 5 | 提交 baseline | 开发者 | `git add docs/openapi/swagger.yaml && git commit -m "chore: add openapi baseline"` |
 | 6 | 验证接入 | 开发者 | `make openapi-check` 全过 |
 
 做完 6 项 = 本地能跑 `make openapi-check` / `diff` / `gen` / `lint` 全套。
