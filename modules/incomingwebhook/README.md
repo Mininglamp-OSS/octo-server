@@ -106,6 +106,11 @@ POST /v1/incoming-webhooks/:webhook_id/:token/github
 `reason=event` 拒绝。事件里的超长字段（标题/提交信息/评论）服务端截断，GitHub 流量
 不会触发 413。
 
+**body 上限独立于 native**：GitHub 事件 JSON 由平台生成（真实 push/PR 事件普遍
+>8KiB，发送方无法修短），github 路由的请求体上限默认 **1MiB**
+（`DM_INCOMINGWEBHOOK_GITHUB_MAX_BYTES`）；native/wecom 的 body 由调用方编写，
+仍是 8KiB。该读取发生在 token 鉴权 + per-webhook 限流之后，不构成放大面。
+
 ### 企业微信（WeCom 群机器人格式）
 
 ```

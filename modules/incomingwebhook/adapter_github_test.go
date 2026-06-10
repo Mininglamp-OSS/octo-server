@@ -83,7 +83,7 @@ func TestParseGitHubPush_PushVariants(t *testing.T) {
 			"**bob** created branch `dev`"},
 		{"force push", `{"ref":"refs/heads/main","forced":true,"commits":[{"id":"abc","message":"m","url":"u"}],"sender":{"login":"bob"}}`,
 			"force-pushed 1 commit(s)"},
-		{"missing sender falls back", `{"ref":"refs/heads/main","commits":[],"sender":{}}`,
+		{"missing sender falls back", `{"ref":"refs/heads/main","commits":[{"id":"abc","message":"m","url":"u"}],"sender":{}}`,
 			"**someone** pushed"},
 	}
 	for _, tc := range cases {
@@ -93,6 +93,21 @@ func TestParseGitHubPush_PushVariants(t *testing.T) {
 			assert.Contains(t, req.Content, tc.want)
 		})
 	}
+}
+
+// 非 create/delete 且无提交的退化 ref 更新不渲染 "pushed 0 commit(s)"，走 skip。
+func TestParseGitHubPush_NoCommitRefUpdateSkipped(t *testing.T) {
+	body := `{"ref":"refs/heads/main","commits":[],"sender":{"login":"bob"}}`
+	req, skip, invalid := parseGitHubPush(ghHeader("push"), []byte(body))
+	assert.Nil(t, req)
+	assert.Equal(t, "event", skip)
+	assert.Empty(t, invalid)
+}
+
+// GitHub 事件 body 是平台生成的（普遍 >8KiB 且发送方无法修短），其上限必须宽于
+// native 的调用方编写上限——钉住 review 阻断项的修复不被回退。
+func TestGitHubMaxBytes_ExceedsNativeCap(t *testing.T) {
+	assert.Greater(t, githubMaxBytes(), maxBytes())
 }
 
 func TestParseGitHubPush_CommitListTruncated(t *testing.T) {

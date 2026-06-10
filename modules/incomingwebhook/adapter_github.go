@@ -21,11 +21,32 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 )
 
 // 渲染的提交列表上限：push 事件单次最多带 20 个 commit（GitHub 截断），全列会刷屏。
 const maxRenderedCommits = 5
+
+// GitHub 事件 body 的字节上限。native 的 8KiB cap 约束的是调用方自己编写的 body，
+// 而 GitHub 事件 JSON 由平台生成：真实 push / pull_request 事件（携带完整 repository
+// 对象、提交列表）普遍在几十 KiB 量级，发送方无法修短，套用 8KiB 会把合法流量 413
+// （PR #330 review 阻断项）。默认 1MiB：远高于现实事件（99% < 100KiB），仍是硬界——
+// 且 body 读取发生在 token 鉴权 + per-webhook 5rps 限流之后，不构成放大面。
+const (
+	envGitHubBodyMax      = "DM_INCOMINGWEBHOOK_GITHUB_MAX_BYTES"
+	defaultGitHubMaxBytes = 1 << 20 // 1MiB
+)
+
+func githubMaxBytes() int {
+	if v := os.Getenv(envGitHubBodyMax); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultGitHubMaxBytes
+}
 
 type ghUser struct {
 	Login string `json:"login"`
@@ -159,6 +180,11 @@ func renderGitHubPush(body []byte) (string, error) {
 		return ghWithRepo(fmt.Sprintf("**%s** deleted branch `%s`", who, ref), ev.Repository), nil
 	case ev.Created && len(ev.Commits) == 0:
 		return ghWithRepo(fmt.Sprintf("**%s** created branch `%s`", who, ref), ev.Repository), nil
+	case len(ev.Commits) == 0:
+		// 非 create/delete 且无提交的退化 ref 更新（如 force-push 回相同内容）：渲染
+		// "pushed 0 commit(s)" 只会制造噪音——返回空走 skip 路径（review 跟进，两位
+		// reviewer 同时指出）。
+		return "", nil
 	}
 
 	verb := "pushed"

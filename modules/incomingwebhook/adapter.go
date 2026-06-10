@@ -33,14 +33,20 @@ type pushAdapter struct {
 	// errmsg），让按平台 SDK 校验响应的既有工具不改代码即可迁移。key 与 native 的
 	// status / message_id 不重叠，纯追加。
 	successExtra map[string]interface{}
+	// bodyLimit 该形态的请求体字节上限。native / wecom 的 body 由调用方编写，沿用
+	// 8KiB 的 maxBytes()——上限本就是约束调用方的；github 的 body 是平台生成的事件
+	// JSON，真实 push / PR 事件普遍 >8KiB 且发送方无法修短，必须用更宽的专属上限
+	//（githubMaxBytes，见 adapter_github.go；PR #330 review 阻断项）。
+	bodyLimit func() int
 }
 
 var (
-	nativeAdapter = pushAdapter{name: adapterNative, parse: parseNativePush}
-	githubAdapter = pushAdapter{name: adapterGitHub, parse: parseGitHubPush}
+	nativeAdapter = pushAdapter{name: adapterNative, parse: parseNativePush, bodyLimit: maxBytes}
+	githubAdapter = pushAdapter{name: adapterGitHub, parse: parseGitHubPush, bodyLimit: githubMaxBytes}
 	wecomAdapter  = pushAdapter{
-		name:  adapterWeCom,
-		parse: parseWeComPush,
+		name:      adapterWeCom,
+		parse:     parseWeComPush,
+		bodyLimit: maxBytes,
 		// 企业微信调用方普遍校验 errcode==0，附带平台习惯字段降低迁移摩擦。
 		successExtra: map[string]interface{}{"errcode": 0, "errmsg": "ok"},
 	}

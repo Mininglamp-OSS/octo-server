@@ -1,9 +1,11 @@
 package incomingwebhook_test
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -118,6 +120,42 @@ func TestPush_AdapterRoute_AuthEnforced(t *testing.T) {
 			map[string]string{"X-GitHub-Event": "push"})
 		assert.Equalf(t, http.StatusUnauthorized, w.Code, "%s: bad token must 401; body=%s", suffix, w.Body.String())
 	}
+}
+
+// 真实 GitHub 事件 JSON 普遍超过 native 的 8KiB body cap 且发送方无法修短——github
+// 路由使用独立宽上限，>8KiB 的合法 push 事件必须被接受并渲染（PR #330 review 阻断项）；
+// 同一 payload 打 native 路由仍须 413，宽上限只属于平台事件形态。
+func TestPush_GitHubLargePayload_Not413(t *testing.T) {
+	handler, _, groupNo := setupTestEnv(t)
+	whID, token := createWebhookWithToken(t, handler, groupNo)
+
+	// 20 个提交 × ~1KiB 提交信息 ≈ >20KiB body，模拟真实大 push 事件。
+	longMsg := strings.Repeat("x", 1024)
+	commits := make([]map[string]interface{}, 0, 20)
+	for i := 0; i < 20; i++ {
+		commits = append(commits, map[string]interface{}{
+			"id":      fmt.Sprintf("sha%037d", i),
+			"message": fmt.Sprintf("c%d: %s", i, longMsg),
+			"url":     fmt.Sprintf("https://github.com/o/r/commit/%d", i),
+		})
+	}
+	body, err := json.Marshal(map[string]interface{}{
+		"ref":        "refs/heads/main",
+		"commits":    commits,
+		"repository": map[string]interface{}{"full_name": "o/r", "html_url": "https://github.com/o/r"},
+		"sender":     map[string]interface{}{"login": "alice"},
+	})
+	require.NoError(t, err)
+	require.Greater(t, len(body), 8*1024, "fixture must exceed the native body cap")
+
+	w := pushAdapterRaw(handler, whID, token, "github", body, map[string]string{"X-GitHub-Event": "push"})
+	assert.NotEqualf(t, http.StatusRequestEntityTooLarge, w.Code, "github events beyond 8KiB must not 413; body=%s", w.Body.String())
+	assert.NotEqualf(t, http.StatusBadRequest, w.Code, "valid event must render; body=%s", w.Body.String())
+	assert.NotEqualf(t, http.StatusUnauthorized, w.Code, "valid token must authorize; body=%s", w.Body.String())
+
+	// 对照组：native 路由对同一 payload 仍按 8KiB cap 413。
+	wn := do(handler, anonReq("POST", fmt.Sprintf("/v1/incoming-webhooks/%s/%s", whID, token), body))
+	assert.Equalf(t, http.StatusRequestEntityTooLarge, wn.Code, "native route keeps the caller-authored cap; body=%s", wn.Body.String())
 }
 
 // 企微 text 格式通过鉴权/翻译；成功响应附带 errcode=0（平台 SDK 兼容）。

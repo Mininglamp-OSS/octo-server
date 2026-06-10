@@ -916,8 +916,11 @@ func (w *IncomingWebhook) handlePush(c *wkhttp.Context, ad pushAdapter) {
 		return
 	}
 
-	// 4) 读 body 并按统一上限拒绝过大请求。LimitReader 多读 1 字节用于判超。
-	limit := maxBytes()
+	// 4) 读 body 并按【该形态】的上限拒绝过大请求。LimitReader 多读 1 字节用于判超。
+	// native / wecom 是调用方编写的 body（8KiB 足够且应当约束）；github 是平台生成的
+	// 事件 JSON，普遍超过 8KiB 且发送方无法修短，用更宽的专属上限（见 pushAdapter.
+	// bodyLimit）。此处已通过 token 鉴权 + per-webhook 限流，宽上限不构成放大面。
+	limit := ad.bodyLimit()
 	body, err := io.ReadAll(io.LimitReader(c.Request.Body, int64(limit)+1))
 	if err != nil {
 		w.submitFailure(m, 0, ip, ad.name, "body", http.StatusBadRequest)
