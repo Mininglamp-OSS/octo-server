@@ -27,7 +27,6 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/botfather"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
-	"github.com/gin-gonic/gin"
 	rd "github.com/go-redis/redis"
 	"go.uber.org/zap"
 )
@@ -115,16 +114,16 @@ func (a *BotProvision) botToken(c *wkhttp.Context) {
 		return
 	}
 	apiKey := strings.TrimPrefix(auth, "Bearer ")
+	if apiKey == "" {
+		c.ResponseErrorWithStatus(errors.New("empty Bearer token"), http.StatusUnauthorized)
+		return
+	}
 	callerUID, callerSpace, err := a.resolveAPIKey(apiKey)
 	if err != nil {
 		c.ResponseErrorWithStatus(errors.New("invalid api_key"), http.StatusUnauthorized)
 		return
 	}
 	botUID := c.Param("uid")
-	if botUID == "" {
-		c.ResponseError(errors.New("uid required"))
-		return
-	}
 	type row struct {
 		BotToken   string `db:"bot_token"`
 		CreatorUID string `db:"creator_uid"`
@@ -187,17 +186,11 @@ var readRand = defaultReadRand
 var hexEncode = defaultHexEncode
 
 // Route mounts the two bot endpoints. JWT exchange + JWKS endpoints have
-// been removed (合并 plan 决策一+二 Phase 4) — daemon/web now hit
-// fleet/matter directly with api_key/session tokens.
+// been removed in Phase 4 — daemon/web now hit fleet/matter directly with
+// api_key/session tokens.
 //
 //	POST /v1/bot/mint        — web session auth (octo-lib session middleware)
 //	GET  /v1/bot/:uid/token  — daemon api_key Bearer (validated inline)
-//
-// Also registers 410 Gone stubs for removed legacy auth endpoints so old
-// callers get a deterministic deprecation signal instead of a 404 from an
-// unregistered path. The previous JWT/JWKS pair lived under these paths
-// and was dropped in 决策一+二 Phase 4; the stubs document the change for
-// any straggler client that hasn't been updated.
 func (a *BotProvision) Route(r *wkhttp.WKHttp) {
 	authGroup := r.Group("/v1", a.ctx.AuthMiddleware(r))
 	authGroup.POST("/bot/mint", a.mintBot)
@@ -220,44 +213,4 @@ func (a *BotProvision) Route(r *wkhttp.WKHttp) {
 	}))
 	verifyLimit := r.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "verify", 1000.0/60, 100)
 	r.GET("/v1/bot/:uid/token", verifyLimit, a.botToken)
-
-	// Removed legacy auth endpoints (决策一+二 Phase 4). 410 Gone so a
-	// straggler client distinguishes "endpoint was removed by design" from
-	// "wrong URL / typo". Each stub returns a stable JSON body pointing at
-	// the replacement path so client owners can fix in place.
-	//
-	// v3.3.2 (Jerry-Xin R4 nit, caster local review): Sunset/Deprecation
-	// headers dropped. v3.3.1 hardcoded both dates wrong — Sunset said
-	// "Fri, 13 Jun 2026" but that day is actually Saturday; Deprecation
-	// said "@1749427200" which resolves to 2025-06-09, off by a year.
-	// Fixing the dates would just invite the next off-by-one when push
-	// slips. There's no deploy-pipeline substitution mechanism in this
-	// repo to keep them current, and zero current consumers depend on
-	// either header. The 410 status + structured JSON body remain — that
-	// is the actionable signal for both humans and automated clients.
-	// If we ever want Sunset back, deploy-time substitution must land
-	// first (separate PR).
-	r.GET("/.well-known/jwks.json", gone410Handler(
-		"JWKS endpoint removed — fleet/matter no longer verify JWTs locally. "+
-			"Use POST /v1/auth/verify (session) or /v1/auth/verify-api-key (daemon) instead.",
-	))
-	r.POST("/v1/auth/token", gone410Handler(
-		"Token exchange endpoint removed — daemon no longer exchanges api_key for a JWT. "+
-			"Send api_key directly as Authorization: Bearer to fleet/matter; they will "+
-			"call /v1/auth/verify-api-key for validation.",
-	))
-}
-
-// gone410Handler returns a wkhttp handler that always responds with HTTP 410
-// Gone + a structured JSON body describing why the endpoint was removed and
-// where to migrate. Sunset/Deprecation headers were considered (RFC 8594 /
-// draft-ietf-httpapi-deprecation) but dropped in v3.3.2 — see Route()
-// comment above for the reasoning.
-func gone410Handler(reason string) func(*wkhttp.Context) {
-	return func(c *wkhttp.Context) {
-		c.AbortWithStatusJSON(http.StatusGone, gin.H{
-			"error":   "gone",
-			"message": reason,
-		})
-	}
 }
