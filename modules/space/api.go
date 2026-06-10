@@ -855,6 +855,20 @@ func (s *Space) updateMemberRole(c *wkhttp.Context) {
 		return
 	}
 
+	// 防无主空间：owner 不能被直接降级（本接口仅 owner 可调，即禁止自降级）。
+	// 转让所有权必须通过把其他成员设为 role=2 触发下方的原子对调，
+	// 与管理端 updateMemberRole 的约束一致（见 api_manager.go）。
+	if target.Role == 2 && req.Role != 2 {
+		httperr.ResponseErrorL(c, errcode.ErrSpaceOwnerConstraint, nil, nil)
+		return
+	}
+	// 幂等：目标已是该角色时直接成功。该分支同时挡住「转让给自己」——
+	// 否则下方事务会把唯一 owner 先升后降（同一行），产生无主空间。
+	if target.Role == req.Role {
+		c.ResponseOK()
+		return
+	}
+
 	// 如果要转让owner，使用事务保证原子性
 	if req.Role == 2 {
 		tx, txErr := s.ctx.DB().Begin()
