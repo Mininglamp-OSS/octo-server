@@ -767,6 +767,58 @@ func TestOpanalyticsChannelMembersEndpoint(t *testing.T) {
 	assert.Equal(t, "err.server.opanalytics.forbidden", errorCode(t, rec))
 }
 
+func TestOpanalyticsChannelMembersKeepEventTimeMessagesForDisabledSender(t *testing.T) {
+	ctx, route, etl := opaSetup(t)
+	seedScenario(t, ctx)
+	require.NoError(t, etl.RunIncremental())
+
+	_, err := ctx.DB().Exec("UPDATE `user` SET status=0 WHERE uid='u_bob'")
+	require.NoError(t, err)
+	require.NoError(t, etl.RunIncremental())
+
+	rng := "?start_date=" + statDay + "&end_date=" + statDay
+	var channels struct {
+		List []channelListItem `json:"list"`
+	}
+	decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/spaces/s1/channels"+rng), &channels)
+	var g1 channelListItem
+	for _, item := range channels.List {
+		if item.ChannelID == "g1" {
+			g1 = item
+			break
+		}
+	}
+	require.Equal(t, "g1", g1.ChannelID)
+	assert.Equal(t, int64(10), g1.HumanMsgCount+g1.AgentMsgCount)
+
+	var members struct {
+		Count         int64 `json:"count"`
+		TotalMsgCount int64 `json:"total_msg_count"`
+		List          []struct {
+			MemberUID     string  `json:"member_uid"`
+			TotalMsgCount int64   `json:"total_msg_count"`
+			Percentage    float64 `json:"percentage"`
+		} `json:"list"`
+	}
+	decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/channels/g1/members"+rng), &members)
+	assert.Equal(t, int64(3), members.Count)
+	assert.Equal(t, int64(10), members.TotalMsgCount)
+
+	byUID := make(map[string]struct {
+		TotalMsgCount int64
+		Percentage    float64
+	}, len(members.List))
+	for _, item := range members.List {
+		byUID[item.MemberUID] = struct {
+			TotalMsgCount int64
+			Percentage    float64
+		}{TotalMsgCount: item.TotalMsgCount, Percentage: item.Percentage}
+	}
+	require.Contains(t, byUID, "u_bob")
+	assert.Equal(t, int64(2), byUID["u_bob"].TotalMsgCount)
+	assert.InEpsilon(t, 0.2, byUID["u_bob"].Percentage, 0.0001)
+}
+
 func TestOpanalyticsTrendEndpoint(t *testing.T) {
 	ctx, route, etl := opaSetup(t)
 	seedScenario(t, ctx)
