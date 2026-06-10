@@ -39,9 +39,11 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/base/app"
 	commonapi "github.com/Mininglamp-OSS/octo-server/modules/base/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	"github.com/Mininglamp-OSS/octo-server/modules/botfather/cmdmenu"
 	common2 "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/gin-gonic/gin"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
@@ -1116,6 +1118,11 @@ func (u *User) get(c *wkhttp.Context) {
 	if userDetailResp == nil {
 		respondUserError(c, errcode.ErrUserNotFound)
 		return
+	}
+	// BotFather 的命令菜单是服务端自有文案，按请求协商语言重渲染（#335）；
+	// 库存值只是部署默认语言兜底。其余 bot 的 commands 是创建者内容，不覆盖。
+	if uid == cmdmenu.BotFatherUID && userDetailResp.BotCommands != "" {
+		userDetailResp.BotCommands = cmdmenu.JSON(octoi18n.OutboundLanguage(c.Request.Context()))
 	}
 	isShowShortNo := false
 	vercode := ""

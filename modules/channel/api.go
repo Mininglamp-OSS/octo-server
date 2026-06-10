@@ -11,8 +11,10 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/register"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/modules/botfather/cmdmenu"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/Mininglamp-OSS/octo-server/pkg/util"
 	"go.uber.org/zap"
@@ -212,6 +214,14 @@ func (ch *Channel) channelGet(c *wkhttp.Context) {
 		}
 		if channelSettingM.MsgAutoDelete > 0 {
 			channelResp.Extra["msg_auto_delete"] = channelSettingM.MsgAutoDelete
+		}
+	}
+
+	// BotFather 的命令菜单是服务端自有文案：库里只存部署默认语言的兜底，这里按
+	// 请求协商语言重渲染（#335）。其余 bot 的 commands 是创建者内容，原样透传。
+	if channelType == common.ChannelTypePerson.Uint8() && channelID == cmdmenu.BotFatherUID && channelResp.Extra != nil {
+		if _, ok := channelResp.Extra["bot_commands"]; ok {
+			channelResp.Extra["bot_commands"] = cmdmenu.JSON(octoi18n.OutboundLanguage(c.Request.Context()))
 		}
 	}
 

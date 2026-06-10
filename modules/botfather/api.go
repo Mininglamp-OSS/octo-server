@@ -1,7 +1,7 @@
 package botfather
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
@@ -13,11 +13,13 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/app"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	"github.com/Mininglamp-OSS/octo-server/modules/botfather/cmdmenu"
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botutil"
+	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/tidwall/gjson"
 	"go.uber.org/zap"
 )
@@ -289,36 +291,20 @@ func (bf *BotFather) initBotFatherUser() {
 }
 
 // registerBotFatherCommands 注册BotFather自身的命令列表
+//
+// 库里这份 blob 只承载一种语言：部署默认语言（OCTO_DEFAULT_LANGUAGE）。它是
+// 所有拿不到请求上下文的读取面（管理端 robot 详情、批量用户详情填充）的兜底；
+// 面向用户的菜单端点会按请求协商语言用 cmdmenu 重新渲染（#335）。每次启动
+// 无条件覆写，所以部署默认语言变更后存量数据自愈，无需迁移。
 func (bf *BotFather) registerBotFatherCommands() {
-	commands := []map[string]string{
-		{"command": CmdInstall, "description": "安装/更新 Octo 插件"},
-		{"command": CmdQuickstart, "description": "AI Agent 快速入门"},
-		{"command": CmdNewBot, "description": "创建新机器人"},
-		{"command": CmdMyBots, "description": "查看我的机器人"},
-		{"command": CmdConnect, "description": "获取连接 prompt"},
-		{"command": CmdDisconnect, "description": "断开 Agent 连接"},
-		{"command": CmdSetName, "description": "修改机器人名称"},
-		{"command": CmdSetDescription, "description": "修改机器人描述"},
-		{"command": CmdDeleteBot, "description": "删除机器人"},
-		{"command": CmdToken, "description": "查看 Token"},
-		{"command": CmdRevoke, "description": "重置 Token"},
-		{"command": CmdApprove, "description": "通过好友申请"},
-		{"command": CmdReject, "description": "拒绝好友申请"},
-		{"command": CmdPending, "description": "查看待审批好友申请"},
-		{"command": CmdHelp, "description": "显示帮助"},
-		{"command": CmdCancel, "description": "取消当前操作"},
-	}
-	commandsJSON, err := json.Marshal(commands)
-	if err != nil {
-		bf.Error("序列化BotFather命令列表失败", zap.Error(err))
-		return
-	}
-	err = bf.db.updateBotCommands(BotFatherUID, string(commandsJSON))
+	// background ctx 没有协商语言，OutboundLanguage 即返回部署默认语言。
+	lang := octoi18n.OutboundLanguage(context.Background())
+	err := bf.db.updateBotCommands(BotFatherUID, cmdmenu.JSON(lang))
 	if err != nil {
 		bf.Error("注册BotFather命令列表失败", zap.Error(err))
 		return
 	}
-	bf.Info("BotFather命令列表注册成功")
+	bf.Info("BotFather命令列表注册成功", zap.String("lang", lang))
 }
 
 // ensureBotFatherFriends 批量为缺少BotFather好友关系的用户添加

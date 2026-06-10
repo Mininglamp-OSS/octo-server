@@ -27,11 +27,13 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/app"
+	"github.com/Mininglamp-OSS/octo-server/modules/botfather/cmdmenu"
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
 	"github.com/Mininglamp-OSS/octo-server/pkg/richtext"
 	pkgutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
@@ -963,6 +965,13 @@ func (rb *Robot) getCommands(c *wkhttp.Context) {
 	robotID := c.Query("robot_id")
 	if strings.TrimSpace(robotID) == "" {
 		respondRobotRequestInvalid(c, "robot_id")
+		return
+	}
+
+	// BotFather 自身的菜单是服务端自有文案，按请求协商语言渲染（#335）；库存
+	// blob 只是部署默认语言兜底。其余 bot 的 commands 是创建者内容，照旧读库。
+	if robotID == cmdmenu.BotFatherUID {
+		c.Response(cmdmenu.Commands(octoi18n.OutboundLanguage(c.Request.Context())))
 		return
 	}
 

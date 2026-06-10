@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-server/modules/botfather/cmdmenu"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botutil"
 	"github.com/stretchr/testify/assert"
 )
@@ -318,6 +319,24 @@ func TestAllCommandsStartWithSlash(t *testing.T) {
 		assert.True(t, strings.HasPrefix(cmd, "/"), "command %q should start with /", cmd)
 		assert.Greater(t, len(cmd), 1, "command should not be just /")
 	}
+}
+
+// TestCmdMenuMatchesCommandConstants pins the cmdmenu leaf package (which
+// cannot import this package and so carries its own command literals) to the
+// Cmd* constants: same commands, same pre-migration menu order (#335).
+func TestCmdMenuMatchesCommandConstants(t *testing.T) {
+	want := []string{
+		CmdInstall, CmdQuickstart, CmdNewBot, CmdMyBots,
+		CmdConnect, CmdDisconnect, CmdSetName, CmdSetDescription,
+		CmdDeleteBot, CmdToken, CmdRevoke, CmdApprove,
+		CmdReject, CmdPending, CmdHelp, CmdCancel,
+	}
+	menu := cmdmenu.Commands("zh-CN")
+	got := make([]string, 0, len(menu))
+	for _, entry := range menu {
+		got = append(got, entry.Command)
+	}
+	assert.Equal(t, want, got)
 }
 
 func TestStateTTL_Reasonable(t *testing.T) {
