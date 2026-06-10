@@ -162,60 +162,8 @@ func TestGetSettingsWithUIDs_Empty(t *testing.T) {
 	assert.Len(t, settings, 0)
 }
 
-// 用户退群时应清理其 thread_setting,避免重新入群时老 mute 静默生效
-func TestRemoveUserFromGroupThreads_CleansSettings(t *testing.T) {
-	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	svc, groupNo := setupServiceTestData(t)
-	thread, err := svc.CreateThread(&CreateThreadReq{
-		GroupNo: groupNo, Name: "s1", CreatorUID: testutil.UID, CreatorName: "用户1",
-	})
-	assert.NoError(t, err)
-
-	// user2 加入子区并设置 mute
-	assert.NoError(t, svc.JoinThread(groupNo, thread.ShortID, "user2"))
-	assert.NoError(t, svc.UpdateSetting(groupNo, thread.ShortID, "user2", map[string]interface{}{
-		"mute": float64(1),
-	}))
-
-	// 退群前确认设置存在
-	settings, err := svc.GetSettingsWithUIDs(groupNo, thread.ShortID, []string{"user2"})
-	assert.NoError(t, err)
-	assert.Len(t, settings, 1)
-
-	// 退群
-	assert.NoError(t, svc.RemoveUserFromGroupThreads(groupNo, "user2"))
-
-	// 设置应被清理
-	settings, err = svc.GetSettingsWithUIDs(groupNo, thread.ShortID, []string{"user2"})
-	assert.NoError(t, err)
-	assert.Len(t, settings, 0, "退群后 thread_setting 应被清理")
-}
-
-// 用户未加入任何子区,但设置了 mute,退群时也应清理(不应被 early return 跳过)
-func TestRemoveUserFromGroupThreads_CleansSettingsWithoutMembership(t *testing.T) {
-	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	svc, groupNo := setupServiceTestData(t)
-	thread, err := svc.CreateThread(&CreateThreadReq{
-		GroupNo: groupNo, Name: "s1", CreatorUID: testutil.UID, CreatorName: "用户1",
-	})
-	assert.NoError(t, err)
-
-	// user2 仅设置 mute,但未 JoinThread
-	assert.NoError(t, svc.UpdateSetting(groupNo, thread.ShortID, "user2", map[string]interface{}{
-		"mute": float64(1),
-	}))
-	settings, err := svc.GetSettingsWithUIDs(groupNo, thread.ShortID, []string{"user2"})
-	assert.NoError(t, err)
-	assert.Len(t, settings, 1)
-
-	// 退群
-	assert.NoError(t, svc.RemoveUserFromGroupThreads(groupNo, "user2"))
-
-	// 设置应被清理
-	settings, err = svc.GetSettingsWithUIDs(groupNo, thread.ShortID, []string{"user2"})
-	assert.NoError(t, err)
-	assert.Len(t, settings, 0)
-}
+// 退群清理 thread_setting 的回归(含 mute 而未 join 的场景)已随清理逻辑迁往
+// modules/group/thread_cleanup_test.go(removeUserFromGroupThreadsCleanup,Issue #331)。
 
 func TestGetSettingsWithUIDs_Batch(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")

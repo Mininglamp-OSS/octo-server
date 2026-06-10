@@ -520,32 +520,6 @@ func (d *DB) QueryByID(id int64) (*Model, error) {
 	return model, err
 }
 
-// QueryThreadsByGroupNoAndUID 查询用户在某群下加入的所有子区
-func (d *DB) QueryThreadsByGroupNoAndUID(groupNo, uid string) ([]*Model, error) {
-	var models []*Model
-	_, err := d.session.Select("t.*").
-		From(dbr.I("thread").As("t")).
-		Join(dbr.I("thread_member").As("tm"), "t.id = tm.thread_id").
-		Where("t.group_no=? AND tm.uid=? AND t.status!=?", groupNo, uid, ThreadStatusDeleted).
-		Load(&models)
-	return models, err
-}
-
-// DeleteMembersByGroupNoAndUIDTx 事务中删除用户在某群下所有子区的成员记录
-func (d *DB) DeleteMembersByGroupNoAndUIDTx(groupNo, uid string, tx *dbr.Tx) error {
-	_, err := tx.DeleteFrom("thread_member").
-		Where("uid=? AND thread_id IN (SELECT id FROM thread WHERE group_no=?)", uid, groupNo).
-		Exec()
-	return err
-}
-
-// DeleteSettingsByGroupNoAndUIDTx 事务中删除用户在某群下所有子区的个人设置
-func (d *DB) DeleteSettingsByGroupNoAndUIDTx(groupNo, uid string, tx *dbr.Tx) error {
-	_, err := tx.DeleteFrom("thread_setting").
-		Where("group_no=? AND uid=?", groupNo, uid).Exec()
-	return err
-}
-
 // MemberModel 子区成员数据模型
 type MemberModel struct {
 	ID       int64  `json:"id"`

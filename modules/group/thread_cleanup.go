@@ -40,10 +40,11 @@ func queryThreadShortIDsForCleanup(ctx *config.Context, groupNo string) ([]strin
 	return out, nil
 }
 
-// removeUserFromGroupThreadsCleanup 是被踢/退群路径上“清理某用户在某群所有子区的 thread_member
-// 记录、IM 订阅和置顶”的统一入口。原本 (*Group).removeUserFromGroupThreads 与
+// removeUserFromGroupThreadsCleanup 是被踢/退群路径上“清理某用户在某群所有子区的 thread_member、
+// thread_setting 记录、IM 订阅和置顶”的统一入口。原本 (*Group).removeUserFromGroupThreads 与
 // (*Service).removeUserFromGroupThreads 是两份逐字重复的实现且各自带 Issue #27 的同型 bug；
-// 这里合并到一处，避免下次再“修一处漏一处”。
+// 这里合并到一处，避免下次再“修一处漏一处”。thread 模块曾有一份同名导出方法，IM 退订同样
+// 被 JOIN thread_member 限定（#27 同型隐患），已随 Issue #331 移除——群/Bot 移除路径只能走这里。
 //
 // 失败只记日志、不中断（与原行为一致）。logger 由调用方传入以保留各自的 module 标签。
 func removeUserFromGroupThreadsCleanup(ctx *config.Context, logger log.Log, groupNo, uid, spaceID string) {
@@ -55,16 +56,20 @@ func removeUserFromGroupThreadsCleanup(ctx *config.Context, logger log.Log, grou
 		logger.Error("查询群子区失败", zap.Error(err), zap.String("groupNo", groupNo), zap.String("uid", uid))
 		return
 	}
-	if len(shortIDs) == 0 {
-		return
-	}
 
-	// best-effort 删除 thread_member 行：DELETE 按 uid 过滤，没有匹配行也是 0 rows affected。
-	// 即使删除失败也要继续摘 IM 订阅 —— 不能让 DB 异常导致订阅泄漏。
+	// best-effort 删除 thread_member / thread_setting 行：DELETE 按 uid 过滤，没有匹配行也是
+	// 0 rows affected。即使删除失败也要继续摘 IM 订阅 —— 不能让 DB 异常导致订阅泄漏。
+	// 两条 DELETE 不 gate 在 len(shortIDs) 上：用户可能只 mute 过子区而从未 JoinThread
+	// （Issue #331），thread_setting 必须按 group_no+uid 直删，连同已删除子区的残留行一并清掉。
 	if _, err := ctx.DB().DeleteFrom("thread_member").
 		Where("uid=? AND thread_id IN (SELECT id FROM thread WHERE group_no=?)", uid, groupNo).
 		Exec(); err != nil {
 		logger.Error("删除子区成员记录失败", zap.Error(err), zap.String("groupNo", groupNo), zap.String("uid", uid))
+	}
+	if _, err := ctx.DB().DeleteFrom("thread_setting").
+		Where("group_no=? AND uid=?", groupNo, uid).
+		Exec(); err != nil {
+		logger.Error("删除子区个人设置失败", zap.Error(err), zap.String("groupNo", groupNo), zap.String("uid", uid))
 	}
 
 	for _, shortID := range shortIDs {

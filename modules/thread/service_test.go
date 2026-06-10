@@ -582,8 +582,6 @@ func TestUpdateMessageStats(t *testing.T) {
 	assert.Equal(t, "sender2", thread.LastMessageSenderUID)
 }
 
-// ==================== RemoveUserFromGroupThreads 测试 ====================
-
 func setupServiceTestData(t *testing.T) (*Service, string) {
 	_, ctx := testutil.NewTestServer()
 	err := testutil.CleanAllTables(ctx)
@@ -608,53 +606,6 @@ func setupServiceTestData(t *testing.T) (*Service, string) {
 
 	svc := NewService(ctx).(*Service)
 	return svc, groupNo
-}
-
-func TestRemoveUserFromGroupThreads(t *testing.T) {
-	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	svc, groupNo := setupServiceTestData(t)
-
-	// 创建两个子区
-	thread1, err := svc.CreateThread(&CreateThreadReq{GroupNo: groupNo, Name: "子区1", CreatorUID: testutil.UID, CreatorName: "用户1"})
-	assert.NoError(t, err)
-	thread2, err := svc.CreateThread(&CreateThreadReq{GroupNo: groupNo, Name: "子区2", CreatorUID: testutil.UID, CreatorName: "用户1"})
-	assert.NoError(t, err)
-
-	// user2 加入两个子区
-	err = svc.JoinThread(groupNo, thread1.ShortID, "user2")
-	assert.NoError(t, err)
-	err = svc.JoinThread(groupNo, thread2.ShortID, "user2")
-	assert.NoError(t, err)
-
-	// 确认 user2 是两个子区的成员
-	isMember1, _ := svc.IsMember(groupNo, thread1.ShortID, "user2")
-	isMember2, _ := svc.IsMember(groupNo, thread2.ShortID, "user2")
-	assert.True(t, isMember1)
-	assert.True(t, isMember2)
-
-	// 执行批量移除
-	err = svc.RemoveUserFromGroupThreads(groupNo, "user2")
-	assert.NoError(t, err)
-
-	// 验证 user2 已从所有子区移除
-	isMember1, _ = svc.IsMember(groupNo, thread1.ShortID, "user2")
-	isMember2, _ = svc.IsMember(groupNo, thread2.ShortID, "user2")
-	assert.False(t, isMember1)
-	assert.False(t, isMember2)
-
-	// 验证创建者(testutil.UID)不受影响
-	isCreator1, _ := svc.IsMember(groupNo, thread1.ShortID, testutil.UID)
-	isCreator2, _ := svc.IsMember(groupNo, thread2.ShortID, testutil.UID)
-	assert.True(t, isCreator1)
-	assert.True(t, isCreator2)
-}
-
-func TestRemoveUserFromGroupThreads_NoThreads(t *testing.T) {
-	svc, groupNo := setupServiceTestData(t)
-
-	// user2 没加入任何子区，调用应无副作用
-	err := svc.RemoveUserFromGroupThreads(groupNo, "user2")
-	assert.NoError(t, err)
 }
 
 // ==================== UpdateName 测试 ====================
@@ -740,44 +691,6 @@ func TestUpdateName_TooLong(t *testing.T) {
 	err = svc.UpdateName(groupNo, thread.ShortID, testutil.UID, longName)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "name")
-}
-
-func TestRemoveUserFromGroupThreads_OnlyAffectsTargetGroup(t *testing.T) {
-	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	svc, groupNo1 := setupServiceTestData(t)
-
-	// 创建第二个群
-	groupNo2 := strings.ReplaceAll(util.GenerUUID(), "-", "")
-	groupDB := group.NewDB(svc.ctx)
-	err := groupDB.Insert(&group.Model{GroupNo: groupNo2, Name: "群2", Creator: testutil.UID, Status: 1, Version: 1})
-	assert.NoError(t, err)
-	err = groupDB.InsertMember(&group.MemberModel{GroupNo: groupNo2, UID: testutil.UID, Role: group.MemberRoleCreator, Status: 1, Version: 1, Vercode: util.GenerUUID()})
-	assert.NoError(t, err)
-	err = groupDB.InsertMember(&group.MemberModel{GroupNo: groupNo2, UID: "user2", Role: group.MemberRoleCommon, Status: 1, Version: 1, Vercode: util.GenerUUID()})
-	assert.NoError(t, err)
-
-	// 两个群各创建一个子区，user2 都加入
-	t1, err := svc.CreateThread(&CreateThreadReq{GroupNo: groupNo1, Name: "群1子区", CreatorUID: testutil.UID, CreatorName: "用户1"})
-	assert.NoError(t, err)
-	t2, err := svc.CreateThread(&CreateThreadReq{GroupNo: groupNo2, Name: "群2子区", CreatorUID: testutil.UID, CreatorName: "用户1"})
-	assert.NoError(t, err)
-
-	err = svc.JoinThread(groupNo1, t1.ShortID, "user2")
-	assert.NoError(t, err)
-	err = svc.JoinThread(groupNo2, t2.ShortID, "user2")
-	assert.NoError(t, err)
-
-	// 只移除群1的子区成员
-	err = svc.RemoveUserFromGroupThreads(groupNo1, "user2")
-	assert.NoError(t, err)
-
-	// 群1子区已移除
-	isMember1, _ := svc.IsMember(groupNo1, t1.ShortID, "user2")
-	assert.False(t, isMember1)
-
-	// 群2子区不受影响
-	isMember2, _ := svc.IsMember(groupNo2, t2.ShortID, "user2")
-	assert.True(t, isMember2)
 }
 
 // ==================== DB 层 ThreadMd 测试 ====================

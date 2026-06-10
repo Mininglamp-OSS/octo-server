@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// ensureThreadTables 为 group 模块的测试脚手架补上 thread / thread_member 表。
+// ensureThreadTables 为 group 模块的测试脚手架补上 thread / thread_member / thread_setting 表。
 // group 模块的测试不会自动运行 thread 模块的迁移，沿用 TestMain 里手工建表的同款做法。
 func ensureThreadTables(t *testing.T, f *Group) {
 	t.Helper()
@@ -40,7 +40,20 @@ func ensureThreadTables(t *testing.T, f *Group) {
 		UNIQUE KEY uk_thread_uid (thread_id, uid)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`).Exec()
 	require.NoError(t, err)
+	_, err = f.ctx.DB().UpdateBySql(`CREATE TABLE IF NOT EXISTS thread_setting (
+		id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+		group_no VARCHAR(40) NOT NULL DEFAULT '',
+		short_id VARCHAR(32) NOT NULL DEFAULT '',
+		uid VARCHAR(40) NOT NULL DEFAULT '',
+		mute TINYINT NOT NULL DEFAULT 0,
+		version BIGINT NOT NULL DEFAULT 0,
+		created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+		UNIQUE KEY uk_thread_uid (group_no, short_id, uid)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`).Exec()
+	require.NoError(t, err)
 	// CleanAllTables 之后再 delete 一遍，保证干净
+	_, _ = f.ctx.DB().DeleteFrom("thread_setting").Exec()
 	_, _ = f.ctx.DB().DeleteFrom("thread_member").Exec()
 	_, _ = f.ctx.DB().DeleteFrom("thread").Exec()
 }

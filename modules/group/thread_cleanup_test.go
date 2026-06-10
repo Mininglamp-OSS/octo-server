@@ -124,6 +124,60 @@ func TestRemoveUserFromGroupThreadsCleanup_DeletesMemberWithoutOwnRow(t *testing
 	assert.Equal(t, 1, otherCount, "cleanup 只能按 uid 删除，不能波及其他用户的 thread_member")
 }
 
+// TestRemoveUserFromGroupThreadsCleanup_CleansSettingWithoutMembership 是 Issue #331（item 2）
+// 的回归：用户只对子区设置过 mute（thread_setting 有行）但从未 JoinThread（thread_member 无行），
+// 被移出群后 setting 行必须被清掉，否则重新入群时老 mute 静默生效。同时断言按 uid / group_no
+// 隔离：其他用户的 setting、该用户在其他群的 setting 都不受影响。
+func TestRemoveUserFromGroupThreadsCleanup_CleansSettingWithoutMembership(t *testing.T) {
+	svc, _ := setupServiceTest(t)
+	s := svc.(*Service)
+	f := New(s.ctx)
+	ensureThreadTables(t, f)
+
+	const groupNo = "g_issue331_setting"
+	const targetUID = "mute_only_user"
+	_, err := f.ctx.DB().InsertInto("thread").
+		Columns("short_id", "group_no", "name", "creator_uid", "status", "version").
+		Values("th_331", groupNo, "setting", "owner", 1, 1).Exec()
+	require.NoError(t, err)
+
+	// target 只 mute、未 join：thread_setting 有行，thread_member 无行
+	_, err = f.ctx.DB().InsertInto("thread_setting").
+		Columns("group_no", "short_id", "uid", "mute", "version").
+		Values(groupNo, "th_331", targetUID, 1, 1).Exec()
+	require.NoError(t, err)
+	// 其他用户在同子区的 setting —— 不能被波及
+	_, err = f.ctx.DB().InsertInto("thread_setting").
+		Columns("group_no", "short_id", "uid", "mute", "version").
+		Values(groupNo, "th_331", "someone_else", 1, 1).Exec()
+	require.NoError(t, err)
+	// target 在另一个群的 setting —— 不能被波及
+	_, err = f.ctx.DB().InsertInto("thread_setting").
+		Columns("group_no", "short_id", "uid", "mute", "version").
+		Values("g_other_331", "th_other_331", targetUID, 1, 1).Exec()
+	require.NoError(t, err)
+
+	s.removeUserFromGroupThreads(groupNo, targetUID, "sp_331")
+
+	var targetCount int
+	_, err = f.ctx.DB().Select("count(*)").From("thread_setting").
+		Where("group_no=? AND uid=?", groupNo, targetUID).Load(&targetCount)
+	require.NoError(t, err)
+	assert.Equal(t, 0, targetCount, "mute 而未 join 的用户被移出群后，thread_setting 必须被清理（Issue #331）")
+
+	var otherUserCount int
+	_, err = f.ctx.DB().Select("count(*)").From("thread_setting").
+		Where("group_no=? AND uid=?", groupNo, "someone_else").Load(&otherUserCount)
+	require.NoError(t, err)
+	assert.Equal(t, 1, otherUserCount, "cleanup 只能按 uid 删除，不能波及其他用户的 thread_setting")
+
+	var otherGroupCount int
+	_, err = f.ctx.DB().Select("count(*)").From("thread_setting").
+		Where("group_no=? AND uid=?", "g_other_331", targetUID).Load(&otherGroupCount)
+	require.NoError(t, err)
+	assert.Equal(t, 1, otherGroupCount, "cleanup 只能按 group_no 删除，不能波及该用户在其他群的 thread_setting")
+}
+
 // TestRemoveUserFromGroupThreadsCleanup_EmptyInputs 验证 uid/groupNo 防御守卫：
 // 空 uid 或空 groupNo 时直接 no-op，绝不下发任何 SQL/IM 调用。
 func TestRemoveUserFromGroupThreadsCleanup_EmptyInputs(t *testing.T) {
@@ -142,6 +196,10 @@ func TestRemoveUserFromGroupThreadsCleanup_EmptyInputs(t *testing.T) {
 		Columns("thread_id", "uid", "role", "version").
 		Values(threadID, "u", 0, 1).Exec()
 	require.NoError(t, err)
+	_, err = f.ctx.DB().InsertInto("thread_setting").
+		Columns("group_no", "short_id", "uid", "mute", "version").
+		Values("g_guard", "th_guard", "u", 1, 1).Exec()
+	require.NoError(t, err)
 
 	removeUserFromGroupThreadsCleanup(s.ctx, s.Log, "", "u", "sp")
 	removeUserFromGroupThreadsCleanup(s.ctx, s.Log, "g_guard", "", "sp")
@@ -151,4 +209,10 @@ func TestRemoveUserFromGroupThreadsCleanup_EmptyInputs(t *testing.T) {
 		Where("thread_id=? AND uid=?", threadID, "u").Load(&count)
 	require.NoError(t, err)
 	assert.Equal(t, 1, count, "空参数时 helper 必须立即返回、不下发 DELETE/IMRemoveSubscriber")
+
+	var settingCount int
+	_, err = f.ctx.DB().Select("count(*)").From("thread_setting").
+		Where("group_no=? AND uid=?", "g_guard", "u").Load(&settingCount)
+	require.NoError(t, err)
+	assert.Equal(t, 1, settingCount, "空参数时 helper 不得删除 thread_setting")
 }
