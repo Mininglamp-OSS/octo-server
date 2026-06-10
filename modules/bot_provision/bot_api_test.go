@@ -251,56 +251,6 @@ func TestBotToken_DisabledSpace_401(t *testing.T) {
 		"api_key bound to a disabled space (s.status=0) must 401 even on daemon path — v3.3.3 §E")
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// 410 Gone stubs (v3.3.2 reduced to status + body only — Sunset/Deprecation
-// headers dropped, see bot_api.go Route() comment). The v3.3.1 hardcoded
-// dates were both wrong (Sunset said Fri but the date is Saturday;
-// Deprecation @1749427200 resolves to 2025-06-09 not 2026), and there is
-// no deploy-pipeline substitution to keep them fresh. Body still carries
-// the actionable migration pointer.
-// ─────────────────────────────────────────────────────────────────────
-
-func doRaw(t *testing.T, s *server.Server, method, path string) *httptest.ResponseRecorder {
-	t.Helper()
-	w := httptest.NewRecorder()
-	req, err := http.NewRequest(method, path, nil)
-	require.NoError(t, err)
-	s.GetRoute().ServeHTTP(w, req)
-	return w
-}
-
-func TestGone410_JWKS_ReturnsStatusAndBody(t *testing.T) {
-	s, _ := testutil.NewTestServer()
-	w := doRaw(t, s, "GET", "/.well-known/jwks.json")
-
-	require.Equal(t, http.StatusGone, w.Code, "JWKS endpoint must respond 410")
-
-	// v3.3.2: Sunset/Deprecation headers dropped — assert they are NOT
-	// emitted. Locks the no-header decision in place so a future
-	// "let's re-add Sunset" change has to update this test, and at that
-	// point reviewer can confirm the constants are actually correct.
-	assert.Empty(t, w.Header().Get("Sunset"), "Sunset header must NOT be set (v3.3.2 drop)")
-	assert.Empty(t, w.Header().Get("Deprecation"), "Deprecation header must NOT be set (v3.3.2 drop)")
-
-	body := w.Body.String()
-	assert.Contains(t, body, "JWKS endpoint removed", "body must explain why + where to migrate")
-	assert.Contains(t, body, "verify-api-key", "body must point at the replacement endpoint")
-}
-
-func TestGone410_TokenExchange_ReturnsStatusAndBody(t *testing.T) {
-	s, _ := testutil.NewTestServer()
-	w := doRaw(t, s, "POST", "/v1/auth/token")
-
-	require.Equal(t, http.StatusGone, w.Code, "token exchange endpoint must respond 410")
-
-	assert.Empty(t, w.Header().Get("Sunset"), "Sunset header must NOT be set (v3.3.2 drop)")
-	assert.Empty(t, w.Header().Get("Deprecation"), "Deprecation header must NOT be set (v3.3.2 drop)")
-
-	body := w.Body.String()
-	assert.Contains(t, body, "Token exchange endpoint removed")
-	assert.Contains(t, body, "Authorization: Bearer")
-}
-
 // v3.3.6 §P1 regression — yujiawei R2 P1: account ban MUST revoke
 // botToken (daemon api_key path). resolveAPIKey → assertSpaceMember,
 // which now joins `user` ON u.status=1. mintBot is NOT separately

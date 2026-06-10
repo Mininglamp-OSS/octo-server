@@ -18,6 +18,12 @@
 // `user` test set; adding a second would conflict ("multiple definitions
 // of TestMain"). A bare blank-import in any test file is enough to
 // trigger init() at test binary load.
+//
+// Supersedes the deprecated deps_test.go (removed in v3.4 cleanup): that
+// file only blank-imported a 4-module subset (base/botfather/group/robot)
+// which is a strict subset of what `internal` already pulls. Keeping
+// both was redundant — this single file fully covers the migration
+// registry requirement.
 package user_test
 
 import (

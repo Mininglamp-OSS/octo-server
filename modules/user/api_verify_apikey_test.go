@@ -16,8 +16,12 @@ import (
 )
 
 // authVerifyAPIKey: POST /v1/auth/verify-api-key
-// 合并 plan §3 covers 6 cases: valid / unknown / owner-left-space /
-// legacy-empty-space / missing-field / multi-space.
+// 15 test cases covering: valid / unknown / owner-left-space /
+// non-active-membership / legacy-empty-space / disabled-space /
+// missing-field / multi-space / no-include (default shape) /
+// with-include (owned_bots map) / owned-bots only-in-bound-space /
+// owned-bots empty / owned-bots filters-disabled-bot /
+// account-banned (v3.3.6 §P1) / include-context DB-error fail-secure.
 
 const (
 	testAPIKeySpaceA = "verify_apikey_space_a"
