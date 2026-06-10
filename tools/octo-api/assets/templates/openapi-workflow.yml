@@ -1,0 +1,296 @@
+# OpenAPI schema check pipeline for Go API repositories.
+#
+# Installed by octo-openapi-dev-skill (https://github.com/liuooo/octo-openapi-dev-skill).
+# Copy this file to .github/workflows/openapi.yml in your repo.
+#
+# Six gates run on every PR targeting main or release/**:
+#   0. Changes           - preflight that skips the pipeline on docs-only PRs
+#   1. Coverage          - all gin handlers have @Router swag annotation
+#   2. Generate + Verify - swag v2 produces docs/openapi/swagger.yaml (OpenAPI 3.1)
+#                          AND the result matches the committed baseline
+#   3. Lint              - spectral validates the yaml against R1-R13 rules
+#   4. Breaking Check    - PR only; diffs against base branch spec, outputs
+#                          to step summary for human / AI review (non-blocking
+#                          until oasdiff is integrated)
+#   5. Toolchain Self-Test - regression for tools/octo-api/ itself
+#                            (spectral.yaml / octo-list-check.js / coverage script)
+#
+# ⚠️ TODO (repo admin) — add as required status checks
+# ----------------------------------------------------------------------
+# The five job names below must be configured as required status checks
+# in the branch ruleset for `main` and `release/**`. Without this,
+# PRs can merge without ever running this pipeline.
+#
+# Repo Settings → Rules → Rulesets → (rule for main / release/**) →
+# "Require status checks to pass" → add:
+#   - Detect changed paths
+#   - Swag Annotation Coverage
+#   - Generate & Verify OpenAPI 3.1
+#   - Spectral Lint
+#   - Toolchain Self-Test
+#
+# Pair these with any other required checks your repo already has.
+
+name: OpenAPI
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review, converted_to_draft]
+    # No paths-ignore here — workflow-level path filtering would prevent
+    # GitHub from creating any check run, which deadlocks required-status
+    # checks on docs-only PRs. Path-based skipping is handled by the
+    # `changes` preflight job below (dorny/paths-filter produces "skipped"
+    # statuses that GitHub counts as passing).
+    branches:
+      - main
+      - 'release/**'
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - ".github/ISSUE_TEMPLATE/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: '1.25.x'
+  NODE_VERSION: '20'
+  SWAG_VERSION: 'v2.0.0-rc5'
+
+jobs:
+  # --------------------------------------------------------------------
+  # Gate 0: Detect changed paths
+  # --------------------------------------------------------------------
+  # Mirrors ci.yml's `changes` job. A PR that only edits docs/*.md,
+  # .github/ISSUE_TEMPLATE/**, or other purely-documentation paths sets
+  # `spec=false` and the downstream jobs become `if: false` (GitHub
+  # reports them as "skipped", which counts as passing for required
+  # checks). Push events default to running the full pipeline.
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      spec: ${{ github.event_name == 'pull_request' && steps.filter.outputs.spec || 'true' }}
+      toolchain: ${{ github.event_name == 'pull_request' && steps.filter.outputs.toolchain || 'true' }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        if: github.event_name == 'pull_request'
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@6852f92c20ea7fd3b0c25de3b5112db3a98da050 # v3
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          # `spec` = anything that could change the generated openapi.yaml
+          #   (Go source, swag annotations, swag config, ruleset).
+          # `toolchain` = anything that could change the lint toolchain
+          #   (ruleset, custom functions, fixtures, coverage script).
+          # A PR that only edits docs/*.md / templates matches neither
+          # and skips the pipeline.
+          predicate-quantifier: 'some'
+          filters: |
+            spec:
+              - 'main.go'
+              - 'modules/**/*.go'
+              - 'tools/octo-api/**'
+              - 'docs/openapi/swagger.yaml'
+              - 'docs/openapi/swagger.json'
+              - '.github/workflows/openapi.yml'
+            toolchain:
+              - 'tools/octo-api/**'
+              - '.github/workflows/openapi.yml'
+
+  # --------------------------------------------------------------------
+  # Gate 1: Coverage check
+  # --------------------------------------------------------------------
+  # Validates that every gin handler function (signature with
+  # `c *wkhttp.Context` or `c *gin.Context`) has a corresponding @Router
+  # swag annotation. Spectral cannot see this — it only inspects the
+  # generated openapi.yaml, which silently drops endpoints whose handlers
+  # lack annotations.
+  coverage:
+    name: Swag Annotation Coverage
+    needs: [changes]
+    if: needs.changes.outputs.spec == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Check annotation coverage
+        run: bash tools/octo-api/check-swag-coverage.sh modules
+
+  # --------------------------------------------------------------------
+  # Gate 2: Generate openapi.yaml via swag v2 + verify it matches baseline
+  # --------------------------------------------------------------------
+  # Pinned to v2.0.0-rc5; upgrading swag version requires a separate PR
+  # so reviewers can audit the resulting schema diff before merge.
+  #
+  # Drift check: after `swag init`, compare against the committed
+  # docs/openapi/swagger.{yaml,json}. If they differ, the PR added/changed an
+  # API surface but did not regenerate the baseline — fail with a hint
+  # so the author runs `make openapi-gen` and commits the result.
+  generate:
+    name: Generate & Verify OpenAPI 3.1
+    needs: [changes, coverage]
+    if: needs.changes.outputs.spec == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install swag v2
+        run: go install github.com/swaggo/swag/v2/cmd/swag@${{ env.SWAG_VERSION }}
+
+      - name: Generate OpenAPI 3.1
+        run: swag init -g main.go -d ./ -o docs/openapi --v3.1
+
+      - name: Verify generated spec matches committed baseline
+        run: |
+          set -e
+          # Use porcelain to catch both "modified tracked file" and
+          # "new untracked file" cases — `git diff --exit-code` alone
+          # misses untracked baselines on first introduction.
+          DRIFT=$(git status --porcelain -- docs/openapi/swagger.yaml docs/openapi/swagger.json docs/openapi/docs.go)
+          if [ -n "$DRIFT" ]; then
+            echo "::error title=OpenAPI spec drift::The generated spec does not match the committed baseline. Run 'make openapi-gen' locally and commit docs/openapi/swagger.{yaml,json,docs.go}."
+            echo ""
+            echo "Drifted files:"
+            echo "$DRIFT"
+            echo ""
+            echo "Diff (truncated to first 200 lines):"
+            git --no-pager diff -- docs/openapi/swagger.yaml docs/openapi/swagger.json docs/openapi/docs.go | head -200 || true
+            exit 1
+          fi
+          echo "✅ Generated spec matches committed baseline"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
+        with:
+          name: openapi-spec
+          path: |
+            docs/openapi/swagger.yaml
+            docs/openapi/swagger.json
+            docs/openapi/docs.go
+          retention-days: 7
+
+  # --------------------------------------------------------------------
+  # Gate 3: Spectral lint
+  # --------------------------------------------------------------------
+  # Validates the generated openapi.yaml against tools/octo-api/spectral.yaml
+  # rules (R1-R13 expressed as OpenAPI lint rules). `--fail-severity error`
+  # treats warnings as non-blocking so style nudges (e.g. plural resource
+  # names) surface without breaking the build. `--format github-actions`
+  # emits ::error:: / ::warning:: annotations so violations are pinned to
+  # the diff in PR review instead of buried in logs.
+  lint:
+    name: Spectral Lint
+    needs: [changes, generate]
+    if: needs.changes.outputs.spec == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          name: openapi-spec
+          path: docs/
+
+      - name: Spectral lint
+        run: |
+          npx -y @stoplight/spectral-cli@latest lint docs/openapi/swagger.yaml \
+            --ruleset tools/octo-api/spectral.yaml \
+            --fail-severity error \
+            --format github-actions
+
+  # --------------------------------------------------------------------
+  # Gate 4: Breaking change check (PR only)
+  # --------------------------------------------------------------------
+  # Runs oasdiff against the PR base branch's committed spec. Fails on
+  # any 'error' severity change (breaking); warnings / infos are written
+  # to the step summary but do not fail the build.
+  breaking-check:
+    name: Breaking Change Check
+    needs: [changes, generate]
+    if: github.event_name == 'pull_request' && needs.changes.outputs.spec == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0  # need history to access PR base ref's spec
+          persist-credentials: false
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          name: openapi-spec
+          path: .
+
+      - name: Install oasdiff
+        run: go install github.com/oasdiff/oasdiff@latest
+
+      - name: oasdiff breaking against PR base
+        run: |
+          echo "## OpenAPI Breaking Change Check vs \`${{ github.event.pull_request.base.ref }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          bash tools/octo-api/scripts/diff-openapi.sh "origin/${{ github.event.pull_request.base.ref }}" 2>&1 | tee -a $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  # --------------------------------------------------------------------
+  # Gate 5: Toolchain self-test (parallel with spec pipeline)
+  # --------------------------------------------------------------------
+  # Regression for tools/octo-api/ itself — runs the four-stage
+  # `make openapi-toolchain-test` suite (coverage script unit test, octo-list-check
+  # JS unit test, spectral rule fire-test against violations.yaml,
+  # spectral clean-test against valid.yaml). This catches a broken
+  # ruleset / function / coverage script BEFORE the main pipeline runs
+  # against it. Independent of the spec pipeline so a regression here
+  # surfaces even when the spec happens to pass.
+  toolchain-self-test:
+    name: Toolchain Self-Test
+    needs: [changes]
+    if: needs.changes.outputs.toolchain == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Run openapi toolchain self-tests
+        run: make openapi-toolchain-test

@@ -79,3 +79,6 @@ i18n-merge: i18n-extract
 	  tools/i18nmarkers/shared/active.en-US.toml \
 	  tools/i18nmarkers/server/active.en-US.toml \
 	  pkg/i18n/locales/active.zh-CN.toml
+
+# OpenAPI toolchain (installed by octo-openapi-dev-skill main)
+include tools/octo-api/assets/openapi.mk

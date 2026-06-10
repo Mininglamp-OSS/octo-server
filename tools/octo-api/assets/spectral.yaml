@@ -1,0 +1,439 @@
+# Octo API OpenAPI lint ruleset
+# Reference: https://docs.stoplight.io/docs/spectral
+#
+# This ruleset enforces R1-R13 rules on the generated openapi.yaml.
+# Pairs with scripts/check-swag-coverage.sh (which validates source-level
+# annotation coverage that spectral cannot see).
+#
+# Usage:
+#   npx @stoplight/spectral-cli@latest lint docs/openapi.yaml --ruleset .spectral.yaml
+
+extends:
+  - spectral:oas
+
+functions:
+  - octo-list-check
+  - octo-pagination-check
+  - octo-description-distinct
+
+functionsDir: ./functions
+
+aliases:
+  Operation:
+    - "$.paths[*][get,post,put,patch,delete]"
+
+rules:
+  # ============================================================
+  # Built-in rule overrides (from spectral:oas)
+  # ============================================================
+  # spectral:oas rules default to warn — bump key ones to error.
+  # Other built-in rules (operation-operationId-unique, operation-tags-alphabetical,
+  # etc.) remain at their default severity.
+  operation-operationId: error
+  operation-tags: error
+  operation-tag-defined: error
+  no-$ref-siblings: error
+  # @Description is mandatory per R13 ("@Description ✅ 必带")
+  operation-description: error
+  # Every @tag.name must carry @tag.description (R13)
+  tag-description: error
+  # Generated specs always carry servers (from @BasePath) — its absence
+  # means the /v1 version contract was silently lost (R12)
+  oas3-api-servers: warn
+
+  # ============================================================
+  # A. @Summary (R13)
+  # ============================================================
+  octo-summary-required:
+    description: Operation must have a summary (R13)
+    severity: error
+    given: "#Operation"
+    then:
+      field: summary
+      function: truthy
+
+  octo-summary-length-exceeded:
+    description: Summary must not exceed 80 characters (R13)
+    severity: error
+    given: "#Operation"
+    then:
+      field: summary
+      function: length
+      functionOptions:
+        max: 80
+
+  octo-summary-english-verb:
+    description: Summary should start with an English verb (capital letter)
+    severity: warn
+    given: "#Operation.summary"
+    then:
+      function: pattern
+      functionOptions:
+        match: "^[A-Z][a-zA-Z]"
+
+  # @Description must ADD information beyond @Summary (R13 anti-pattern:
+  # "@Description 跟 @Summary 重复"). Presence itself is enforced by the
+  # built-in operation-description (bumped to error above).
+  octo-description-distinct:
+    description: Description must not merely repeat the summary (R13)
+    severity: warn
+    given: "#Operation"
+    then:
+      function: octo-description-distinct
+
+  # ============================================================
+  # C. @Tags (R10, R13)
+  # ============================================================
+  octo-tags-single:
+    description: Each operation must have exactly one tag (R13)
+    severity: error
+    given: "#Operation"
+    then:
+      field: tags
+      function: length
+      functionOptions:
+        min: 1
+        max: 1
+
+  octo-tags-lowercase:
+    description: Tag must be lowercase snake_case (R13)
+    severity: error
+    given: "#Operation.tags[*]"
+    then:
+      function: pattern
+      functionOptions:
+        match: "^[a-z][a-z0-9_]*$"
+
+  # ============================================================
+  # D. @ID / operationId (R10)
+  # ============================================================
+  octo-operation-id-format:
+    description: operationId must be <resource>.<verb> snake_case (R10)
+    severity: error
+    given: "#Operation"
+    then:
+      field: operationId
+      function: pattern
+      functionOptions:
+        match: "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*){1,2}$"
+
+  # ============================================================
+  # E. URL Path (R6, format only)
+  # ============================================================
+  # The spec gives URL design guidance in api-spec.md §A — four segment
+  # roles (resource / domain qualifier / audience prefix / resource action),
+  # plurality conventions, anti-patterns. These are SUGGESTIONS, enforced
+  # by PR review, not by lint. The only thing the rule checks here is
+  # purely syntactic: path segments are snake_case.
+  octo-path-snake-case:
+    description: Path segments must be snake_case (R6)
+    severity: error
+    given: "$.paths"
+    then:
+      field: "@key"
+      function: pattern
+      functionOptions:
+        match: "^/[a-z0-9_/{}]+$"
+        notMatch: "[A-Z]"
+
+  # @Router must be RELATIVE — @BasePath /v1 already becomes servers:[{url:/v1}],
+  # so a /v1-prefixed path doubles into /v1/v1/... on the client (api-spec §E ⚠️,
+  # regression guard for issue #2).
+  octo-path-no-version-prefix:
+    description: Paths must not carry a /v{n} prefix — @Router is relative to @BasePath (R12)
+    severity: error
+    given: "$.paths"
+    then:
+      field: "@key"
+      function: pattern
+      functionOptions:
+        notMatch: "^/v[0-9]+(/|$)"
+
+  # ============================================================
+  # F. Path Parameters (R7)
+  # ============================================================
+  octo-path-param-id-suffix:
+    description: Path parameter must use <resource>_id naming (R7)
+    severity: error
+    given: "$.paths[*][*].parameters[?(@.in=='path')]"
+    then:
+      field: name
+      function: pattern
+      functionOptions:
+        match: "_id$"
+
+  octo-path-param-no-uid:
+    description: Path parameter must not use legacy naming (R7)
+    severity: error
+    given: "$.paths[*][*].parameters[?(@.in=='path')]"
+    then:
+      field: name
+      function: octo-list-check
+      functionOptions:
+        mode: forbidden
+        list:
+          - uid
+          - short_id
+          - group_no
+          - category_no
+          - robot_id
+        message: "path parameter uses legacy naming — see R7 for replacements"
+
+  # ============================================================
+  # G. @Success / @Failure with envelope (R1)
+  # ============================================================
+  # Status codes are listed explicitly because spectral's jsonpath
+  # implementation (jsonpath-plus) doesn't reliably support
+  # `responses[?(@property.match(...))]` for property-name filtering.
+  # Structural envelope check (R1): the response body must literally
+  # have a `data` property (for 2xx) or `error` property (for 4xx/5xx)
+  # at the top level. resolved: true follows $ref to the actual schema,
+  # so any of these forms get caught:
+  #   - bare array (type: array, no `data`) → fails 2xx rule
+  #   - bare inline object (type: object + custom properties) → fails
+  #   - $ref to non-envelope type → resolved schema lacks `data`/`error`
+  #   - wrong envelope direction (Error in 200, Data in 4xx) → fails
+  # The previous name-based check (`$ref` contains "Data"/"Error") was a
+  # proxy that passed any name happening to contain those substrings;
+  # this version is the literal spec contract.
+  octo-response-success-shape:
+    description: |
+      2xx response body must be an envelope with `data` property at top
+      level (envelope.Data / envelope.CursorList / envelope.OffsetList).
+      Bare arrays / inline objects / non-envelope $refs all fail (R1).
+    severity: error
+    resolved: true
+    given: "$.paths[*][*].responses[?(@property.match(/^2/))].content[*].schema"
+    then:
+      field: properties.data
+      function: truthy
+      message: "2xx response must wrap payload in envelope (top-level `data` property required) (R1)"
+
+  octo-response-error-shape:
+    description: |
+      4xx/5xx response body must be an envelope with `error` property at
+      top level (envelope.Error). Bare or non-envelope responses fail (R1).
+    severity: error
+    resolved: true
+    given: "$.paths[*][*].responses[?(@property.match(/^[45]/))].content[*].schema"
+    then:
+      field: properties.error
+      function: truthy
+      message: "4xx/5xx response must wrap payload in envelope.Error (top-level `error` property required) (R1)"
+
+  # @Success is mandatory (R13: "@Success ✅ 至少 1 个") — every operation
+  # must declare at least one 2xx response.
+  octo-success-response-required:
+    description: Operation must declare at least one 2xx response (R13)
+    severity: error
+    given: "#Operation"
+    then:
+      field: responses
+      function: octo-list-check
+      functionOptions:
+        mode: required-key-prefix
+        list:
+          - "2"
+        message: "operation must declare at least one 2xx success response (R13)"
+
+  # ============================================================
+  # G2. Pagination (R5)
+  # ============================================================
+  # The `pagination` envelope property must follow exactly one of the two
+  # R5 shapes. Also catches the "cursor + total" anti-pattern.
+  octo-pagination-shape:
+    description: |
+      pagination must be cursor {has_more, next_cursor} or offset
+      {total, page, page_size}; cursor pagination must not return total (R5)
+    severity: error
+    resolved: true
+    given: "$.paths[*][*].responses[?(@property.match(/^2/))].content[*].schema.properties.pagination"
+    then:
+      function: octo-pagination-check
+      functionOptions:
+        mode: shape
+
+  octo-pagination-params-match:
+    description: |
+      Paginated list operations must declare the matching query parameters —
+      cursor mode needs `cursor`, offset mode needs `page` (R5)
+    severity: warn
+    resolved: true
+    given: "#Operation"
+    then:
+      function: octo-pagination-check
+      functionOptions:
+        mode: params
+
+  # ============================================================
+  # G3. Batch operations (R11)
+  # ============================================================
+  # `_batch` endpoints are POST-only ("URL 模板: POST /v1/<resource>/_batch").
+  # Non-method path-item keys (parameters/summary/description/servers) are allowed.
+  octo-batch-post-only:
+    description: _batch endpoints must only define POST (R11)
+    severity: error
+    given: "$.paths[?(@property.match(/_batch$/))][*]~"
+    then:
+      function: pattern
+      functionOptions:
+        match: "^(post|parameters|summary|description|servers)$"
+
+  # Batch payload always travels in the POST body (R11 anti-pattern:
+  # "用 query 参数传批量数据").
+  octo-batch-requires-body:
+    description: _batch POST must declare a requestBody (R11)
+    severity: error
+    given: "$.paths[?(@property.match(/_batch$/))].post"
+    then:
+      field: requestBody
+      function: truthy
+      message: "_batch POST must carry the batch payload in requestBody (R11)"
+
+  # ============================================================
+  # G4. Error code enum (R2)
+  # ============================================================
+  # 4xx/5xx response descriptions should name one of the 12 fixed error
+  # codes (D chapter) so readers/SDKs see which code to expect. \b guards
+  # reject made-up codes like USER_NOT_FOUND (underscore is a word char,
+  # so \bNOT_FOUND\b does not match inside it).
+  octo-error-description-known-code:
+    description: 4xx/5xx response description should name one of the 12 R2 error codes
+    severity: warn
+    given: "$.paths[*][*].responses[?(@property.match(/^[45]/))]"
+    then:
+      field: description
+      function: pattern
+      functionOptions:
+        match: "\\b(AUTH_REQUIRED|FORBIDDEN|NOT_FOUND|CONFLICT|DUPLICATE|VALIDATION_ERROR|PAYLOAD_TOO_LARGE|UNSUPPORTED_MEDIA_TYPE|CLIENT_VERSION_TOO_OLD|RATE_LIMITED|INTERNAL_ERROR|UPSTREAM_UNAVAILABLE)\\b"
+
+  # ============================================================
+  # H. @Security (R4)
+  # ============================================================
+  octo-auth-has-401:
+    description: Authenticated operations should declare 401 response (R4)
+    severity: warn
+    given: "$.paths[*][?(@.security)]"
+    then:
+      field: responses.401
+      function: truthy
+
+  octo-auth-has-403:
+    description: Authenticated operations should declare 403 response (R4)
+    severity: warn
+    given: "$.paths[*][?(@.security)]"
+    then:
+      field: responses.403
+      function: truthy
+
+  # R13 @Failure: "至少 401/403/404/500 齐" — complete the mandated set.
+  octo-auth-has-404:
+    description: Authenticated operations should declare 404 response (R4, R13)
+    severity: warn
+    given: "$.paths[*][?(@.security)]"
+    then:
+      field: responses.404
+      function: truthy
+
+  octo-auth-has-500:
+    description: Authenticated operations should declare 500 response (R4, R13)
+    severity: warn
+    given: "$.paths[*][?(@.security)]"
+    then:
+      field: responses.500
+      function: truthy
+
+  # ============================================================
+  # I. Schema field naming (R3, R8)
+  # ============================================================
+  octo-schema-property-snake-case:
+    description: Schema properties must be snake_case (R8)
+    severity: error
+    given: "$.components.schemas[*].properties[*]~"
+    then:
+      function: pattern
+      functionOptions:
+        match: "^[a-z][a-z0-9_]*$"
+        notMatch: "[A-Z]"
+
+  octo-schema-time-at-suffix:
+    description: Time fields (date-time format) should end with _at (R3)
+    severity: warn
+    given: "$.components.schemas[*].properties[?(@.format=='date-time')]~"
+    then:
+      function: octo-list-check
+      functionOptions:
+        mode: required-suffix
+        list:
+          - _at
+          - _date
+          - deadline
+        message: "time field should end with _at suffix (R3)"
+
+  octo-schema-url-suffix:
+    description: URL fields (uri format) should end with _url (R8)
+    severity: warn
+    given: "$.components.schemas[*].properties[?(@.format=='uri')]~"
+    then:
+      function: pattern
+      functionOptions:
+        match: "_url$"
+
+  octo-schema-boolean-prefix:
+    description: Boolean fields should start with is_/has_/can_ (R8)
+    severity: warn
+    given: "$.components.schemas[*].properties[?(@.type=='boolean')]~"
+    then:
+      function: octo-list-check
+      functionOptions:
+        mode: required-prefix
+        list:
+          - is_
+          - has_
+          - can_
+        message: "boolean field should start with is_/has_/can_ (R8)"
+
+  # R3 anti-patterns: created_time / created_ts / created_timestamp — time
+  # fields must use the _at suffix. (Catches them even without a date-time
+  # format, which octo-schema-time-at-suffix cannot see.)
+  octo-schema-no-legacy-time-suffix:
+    description: Time fields must use _at, not _time/_ts/_timestamp (R3)
+    severity: warn
+    given: "$.components.schemas[*].properties[*]~"
+    then:
+      function: octo-list-check
+      functionOptions:
+        mode: forbidden-suffix
+        list:
+          - _time
+          - _ts
+          - _timestamp
+        message: "time field must end with _at, not _time/_ts/_timestamp (R3)"
+
+  # ============================================================
+  # J. Deprecation (H chapter)
+  # ============================================================
+  # A deprecated operation's description must state the replacement and/or
+  # removal plan (H anti-pattern: "Description 没说替代方案 / 移除日期").
+  octo-deprecated-needs-guidance:
+    description: Deprecated operations must state replacement / removal plan in description (H)
+    severity: warn
+    given: "$.paths[*][?(@.deprecated == true)]"
+    then:
+      field: description
+      function: pattern
+      functionOptions:
+        match: "/(instead|removal|removed|sunset|successor|replaced by|use\\s)/i"
+
+  # ============================================================
+  # OpenAPI version (R9)
+  # ============================================================
+  octo-openapi-version:
+    description: OpenAPI document must be 3.1.x (R9)
+    severity: error
+    given: "$"
+    then:
+      field: openapi
+      function: pattern
+      functionOptions:
+        match: "^3\\.1\\."
