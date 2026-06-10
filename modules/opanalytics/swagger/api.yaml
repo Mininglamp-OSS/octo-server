@@ -223,7 +223,7 @@ paths:
             type: integer
             enum: [1, 2, 3, 4]
           collectionFormat: multi
-          description: "会话类型筛选；多值用 conv_types=1&conv_types=2，也兼容 conv_types[]=1。表二仅展示群组，3/4 会返回空集合"
+          description: "会话类型筛选；多值用 conv_types=1&conv_types=2，也兼容 conv_types[]=1 和 conv_types=1,2。表二仅展示群组，3/4 会返回空集合"
           required: false
         - in: "query"
           name: "member_keyword"
@@ -306,7 +306,7 @@ paths:
             type: string
             enum: ["human", "agent", "1", "2"]
           collectionFormat: multi
-          description: "成员类型筛选；支持 human/agent 或 1/2，多值用 member_types=human&member_types=agent"
+          description: "成员类型筛选；支持 human/agent 或 1/2，多值用 member_types=human&member_types=agent，也兼容 member_types=human,agent"
           required: false
         - in: "query"
           name: "member_keyword"

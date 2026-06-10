@@ -718,6 +718,7 @@ func TestOpanalyticsChannelMembersEndpoint(t *testing.T) {
 	}
 	decodeOK(t, rawRec, &raw)
 	require.NotEmpty(t, raw.List)
+	// NotContains on a map asserts the wire response key is absent, not only zero-valued.
 	assert.NotContains(t, raw.List[0], "phone")
 	assert.NotContains(t, raw.List[0], "zone")
 
@@ -751,6 +752,12 @@ func TestOpanalyticsChannelMembersEndpoint(t *testing.T) {
 	asc := getMembers("&sort_by=percentage&order=asc")
 	require.Len(t, asc.List, 3)
 	assert.Equal(t, "u_bob", asc.List[0].MemberUID)
+
+	page2 := getMembers("&page_size=2&page_index=2")
+	assert.Equal(t, int64(3), page2.Count)
+	assert.Equal(t, int64(10), page2.TotalMsgCount)
+	require.Len(t, page2.List, 1)
+	assert.Equal(t, "u_bob", page2.List[0].MemberUID)
 
 	rec := opaGet(t, route, "/v1/manager/dashboard/channels/nope/members?start_date="+statDay+"&end_date="+statDay)
 	assert.Equal(t, "err.server.opanalytics.not_found", errorCode(t, rec))
