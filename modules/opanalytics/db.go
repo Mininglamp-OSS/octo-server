@@ -534,22 +534,21 @@ func (d *opanalyticsDB) queryChannelMemberList(channelID, start, end string, mem
 	var totalMsg int64
 	_, err := d.session.SelectBySql(
 		"SELECT IFNULL(SUM(f.msg_count),0) FROM octo_fact_member_channel_daily f "+
-			"JOIN octo_dim_member m ON m.uid=f.sender_uid "+
-			"WHERE f.channel_id=? AND f.channel_type=2 AND f.stat_date BETWEEN ? AND ? AND m.is_excluded=0",
+			"WHERE f.channel_id=? AND f.channel_type=2 AND f.stat_date BETWEEN ? AND ?",
 		channelID, start, end,
 	).Load(&totalMsg)
 	if err != nil {
 		return nil, 0, 0, err
 	}
 
-	base := "FROM octo_fact_member_channel_daily f JOIN octo_dim_member m ON m.uid=f.sender_uid " +
-		"WHERE f.channel_id=? AND f.channel_type=2 AND f.stat_date BETWEEN ? AND ? AND m.is_excluded=0"
+	base := "FROM octo_fact_member_channel_daily f LEFT JOIN octo_dim_member m ON m.uid=f.sender_uid " +
+		"WHERE f.channel_id=? AND f.channel_type=2 AND f.stat_date BETWEEN ? AND ?"
 	args := []interface{}{channelID, start, end}
-	base = applyUint8FilterSQL(base, &args, "m.member_type", memberTypes)
+	base = applyUint8FilterSQL(base, &args, "COALESCE(m.member_type, f.sender_type)", memberTypes)
 	keyword = strings.TrimSpace(keyword)
 	if keyword != "" {
 		like := "%" + escapeLike(keyword) + "%"
-		base += " AND (m.name LIKE ? ESCAPE '!' OR m.email LIKE ? ESCAPE '!')"
+		base += " AND (COALESCE(m.name,'') LIKE ? ESCAPE '!' OR COALESCE(m.email,'') LIKE ? ESCAPE '!')"
 		args = append(args, like, like)
 	}
 
@@ -562,9 +561,10 @@ func (d *opanalyticsDB) queryChannelMemberList(channelID, start, end string, mem
 		return []*channelMemberListItem{}, 0, totalMsg, nil
 	}
 
-	sel := "SELECT f.sender_uid AS member_uid, m.name, m.email, m.member_type, " +
+	sel := "SELECT f.sender_uid AS member_uid, COALESCE(m.name,'') AS name, COALESCE(m.email,'') AS email, " +
+		"COALESCE(m.member_type, f.sender_type) AS member_type, " +
 		"SUM(f.msg_count) AS total_msg_count " + base +
-		fmt.Sprintf(" GROUP BY f.sender_uid, m.name, m.email, m.member_type ORDER BY %s %s, f.sender_uid ASC LIMIT ? OFFSET ?", sortExpr, dir)
+		fmt.Sprintf(" GROUP BY f.sender_uid, COALESCE(m.name,''), COALESCE(m.email,''), COALESCE(m.member_type, f.sender_type) ORDER BY %s %s, f.sender_uid ASC LIMIT ? OFFSET ?", sortExpr, dir)
 	listArgs := append(append([]interface{}{}, args...), limit, offset)
 
 	var rows []*channelMemberListItem

@@ -276,7 +276,8 @@ paths:
       description: >
         指定正常群组的成员消息统计汇总视图。列表只包含所选时间范围内发过消息的成员；
         percentage = 该成员 total_msg_count / 本会话 total_msg_count，取值范围 0..1。
-        成员类型按当前 octo_dim_member 口径；成员搜索仅匹配 name/email，手机号搜索属于 P2。
+        消息量沿用 event-time 口径，保留禁用/注销用户历史消息；成员类型优先按当前 octo_dim_member，缺失时回退事实表 sender_type。
+        成员搜索仅匹配当前维表 name/email，手机号搜索属于 P2。
         响应不返回 phone/zone，避免在运营分析接口新增手机号/区号暴露面。
       operationId: "m dashboard channel members"
       produces:

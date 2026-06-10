@@ -817,6 +817,27 @@ func TestOpanalyticsChannelMembersKeepEventTimeMessagesForDisabledSender(t *test
 	require.Contains(t, byUID, "u_bob")
 	assert.Equal(t, int64(2), byUID["u_bob"].TotalMsgCount)
 	assert.InEpsilon(t, 0.2, byUID["u_bob"].Percentage, 0.0001)
+
+	_, err = ctx.DB().Exec("DELETE FROM `user` WHERE uid='u_alice'")
+	require.NoError(t, err)
+	require.NoError(t, etl.RunIncremental())
+
+	decodeOK(t, opaGet(t, route, "/v1/manager/dashboard/channels/g1/members"+rng), &members)
+	assert.Equal(t, int64(3), members.Count)
+	assert.Equal(t, int64(10), members.TotalMsgCount)
+	byUID = make(map[string]struct {
+		TotalMsgCount int64
+		Percentage    float64
+	}, len(members.List))
+	for _, item := range members.List {
+		byUID[item.MemberUID] = struct {
+			TotalMsgCount int64
+			Percentage    float64
+		}{TotalMsgCount: item.TotalMsgCount, Percentage: item.Percentage}
+	}
+	require.Contains(t, byUID, "u_alice")
+	assert.Equal(t, int64(3), byUID["u_alice"].TotalMsgCount)
+	assert.InEpsilon(t, 0.3, byUID["u_alice"].Percentage, 0.0001)
 }
 
 func TestOpanalyticsTrendEndpoint(t *testing.T) {
