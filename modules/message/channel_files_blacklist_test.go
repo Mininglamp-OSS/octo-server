@@ -27,6 +27,10 @@ func TestChannelFiles_TopicBlacklist(t *testing.T) {
 	// 与本文件 TestChannelFiles_WithFiles 手建 message_extra 等表的写法一致。
 	_, err := ctx.DB().UpdateBySql("CREATE TABLE IF NOT EXISTS group_member (id INTEGER PRIMARY KEY AUTO_INCREMENT, group_no VARCHAR(40), uid VARCHAR(40), status INT DEFAULT 1, is_deleted INT DEFAULT 0)").Exec()
 	assert.NoError(t, err)
+	// 正常成员放行后会走到 channel_offset 查询；手建最小表让 200 放行路径可达
+	// （mockIM 返回空文件列表，无需 message_extra 等下游表）。
+	_, err = ctx.DB().UpdateBySql("CREATE TABLE IF NOT EXISTS channel_offset (id INTEGER PRIMARY KEY AUTO_INCREMENT, uid VARCHAR(40), channel_id VARCHAR(100), channel_type SMALLINT DEFAULT 0, message_seq BIGINT DEFAULT 0)").Exec()
+	assert.NoError(t, err)
 
 	// 父群 channelID：32 hex groupNo + 合法 snowflake shortID
 	parentGroupNo := strings.ReplaceAll(util.GenerUUID(), "-", "")
@@ -59,12 +63,13 @@ func TestChannelFiles_TopicBlacklist(t *testing.T) {
 	assert.NotEqual(t, http.StatusOK, w.Code, "被拉黑用户必须被门禁拦截")
 	assert.Contains(t, w.Body.String(), "not a member", "应被识别为非活跃成员")
 
-	// 升级为正常成员 → 放行（不再被成员门禁拦截）。
-	// 注：本测试只验证子区父群成员门禁，不验证下游 IM/文件解析，故只断言
-	// 「不再返回 not a member」，避免耦合下游表结构。
+	// 升级为正常成员 → 放行：mockIM 已配置返回空文件列表，正常成员应一路到
+	// http.StatusOK（Jerry-Xin 非阻塞建议：把断言从「不再返回 not a member」加强
+	// 到完整放行）。
 	_, err = ctx.DB().UpdateBySql("UPDATE group_member SET status=? WHERE group_no=? AND uid=?",
 		int(common.GroupMemberStatusNormal), parentGroupNo, uid).Exec()
 	assert.NoError(t, err)
 	w = doReq()
+	assert.Equal(t, http.StatusOK, w.Code, "正常成员应一路放行至 200")
 	assert.NotContains(t, w.Body.String(), "not a member", "正常成员不应被成员门禁 over-block")
 }

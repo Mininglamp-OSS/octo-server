@@ -146,7 +146,12 @@ func (c *threadAuthChecker) AuthorizeThreadFollow(uid, spaceID, groupNo, shortID
 		return convext.ErrThreadForbidden
 	}
 	// 1. Channel-level checks (membership + Space visibility) — shared with FollowChannel.
-	if err := c.checkChannelAccess(uid, spaceID, groupNo); err != nil {
+	//    FollowThread 关注的是子区(CommunityTopic)，授权来自「父群活跃成员」身份：
+	//    被拉黑(status=Blacklist、is_deleted=0)的父群成员不应能 follow 子区、被
+	//    OnThreadCreated fanout 物化子区 ext 行、收新子区创建通知。因此这里 require
+	//    active membership（ExistMemberActive），与 #345 把所有子区门禁切到 active
+	//    语义保持一致。GROUP 分支（AuthorizeChannelFollow）保留 permissive ExistMember。
+	if err := c.checkChannelAccess(uid, spaceID, groupNo, true); err != nil {
 		// 已是 ErrChannelForbidden 时，对 thread API 仍翻译为 ErrThreadForbidden，
 		// 让 handler 走原有 403 路径，客户端无需感知两套 sentinel。
 		if errors.Is(err, convext.ErrChannelForbidden) {
@@ -177,22 +182,39 @@ func (c *threadAuthChecker) AuthorizeThreadFollow(uid, spaceID, groupNo, shortID
 // 引入背景（PR #123 round-1 by Jerry-Xin / yujiawei P1）：FollowChannel 现在会
 // 物化 thread ext + 挂 OnThreadCreated fanout 订阅，必须先校验 caller 能"看到"
 // 这个群，否则同 Space 内私有群的子区元数据会泄露。
+//
+// 注意：FollowChannel 关注的是 GROUP 本身（写群级 auto_follow ext 行），授权语义
+// 保持 permissive ExistMember——与 server 各处 GROUP 分支一致，绝不 over-block 正常
+// 群成员。子区(CommunityTopic)分支的 active 校验只发生在 AuthorizeThreadFollow。
 func (c *threadAuthChecker) AuthorizeChannelFollow(uid, spaceID, groupNo string) error {
-	return c.checkChannelAccess(uid, spaceID, groupNo)
+	return c.checkChannelAccess(uid, spaceID, groupNo, false)
 }
 
 // checkChannelAccess 复用 FollowThread 既有逻辑的群级访问校验：
 //  1. spaceID 非空
-//  2. caller 是 group 成员
+//  2. caller 是 group 成员（requireActive=false 用 permissive ExistMember；
+//     requireActive=true 用 ExistMemberActive，额外排除被拉黑成员）
 //  3. group 在请求 Space 可见（内部群 same-space / 外部群 sourceSpaceID-match / 旧群 wildcard）
 //
+// requireActive 区分调用方语义：
+//   - GROUP 分支（AuthorizeChannelFollow / DefaultFollowedGroupGuard）传 false，
+//     保留 ExistMember 原语义，不 over-block 正常群成员。
+//   - 子区(CommunityTopic)分支（AuthorizeThreadFollow）传 true，被拉黑父群成员
+//     fail-closed 拒绝，关掉 follow 子区 / 收新子区创建通知的剩余缺口。
+//
 // 鉴权失败返回 convext.ErrChannelForbidden；基础设施错误 wrap 后上传。
-func (c *threadAuthChecker) checkChannelAccess(uid, spaceID, groupNo string) error {
+func (c *threadAuthChecker) checkChannelAccess(uid, spaceID, groupNo string, requireActive bool) error {
 	if spaceID == "" {
 		return convext.ErrChannelForbidden
 	}
-	// 1. Membership check.
-	isMember, err := c.groupSvc.ExistMember(groupNo, uid)
+	// 1. Membership check. 子区分支要求 active（排除黑名单）；GROUP 分支保留 permissive。
+	var isMember bool
+	var err error
+	if requireActive {
+		isMember, err = c.groupSvc.ExistMemberActive(groupNo, uid)
+	} else {
+		isMember, err = c.groupSvc.ExistMember(groupNo, uid)
+	}
 	if err != nil {
 		return err
 	}
