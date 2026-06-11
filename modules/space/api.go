@@ -882,6 +882,8 @@ func (s *Space) updateMemberRole(c *wkhttp.Context) {
 			return
 		}
 	} else {
+		// 残余竞态（pre-check 后目标被并发转让升为 owner）由 updateMemberRole
+		// 的 role<>2 SQL 守卫兜底（PR #339 review F1）
 		err = s.db.updateMemberRole(spaceId, targetUID, req.Role)
 		if err != nil {
 			s.Error("修改成员角色失败", zap.Error(err), zap.String("spaceId", spaceId), zap.String("targetUID", targetUID), zap.Int("role", req.Role))

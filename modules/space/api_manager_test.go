@@ -492,8 +492,7 @@ func TestManager_UpdateMemberRole(t *testing.T) {
 	t.Run("reject demoting owner directly", func(t *testing.T) {
 		// 此前已通过子测试 "promote to admin" 把 m-target 提到 admin
 		// 先把 m-target 提成 owner 来构造"降级 owner"场景
-		err := testSpaceDB.updateMemberRole("mgr-role", "m-target", 2)
-		assert.NoError(t, err)
+		setMemberRoleRaw(t, "mgr-role", "m-target", 2)
 
 		body := util.ToJson(map[string]interface{}{"role": 0})
 		w := httptest.NewRecorder()
@@ -508,10 +507,8 @@ func TestManager_UpdateMemberRole(t *testing.T) {
 		assert.Equal(t, 2, mem.Role, "owner role must not be dropped")
 
 		// 恢复：把 owner 转回 u-owner 以免影响后续子测试
-		err = testSpaceDB.updateMemberRole("mgr-role", "m-target", 1)
-		assert.NoError(t, err)
-		err = testSpaceDB.updateMemberRole("mgr-role", "u-owner", 2)
-		assert.NoError(t, err)
+		setMemberRoleRaw(t, "mgr-role", "m-target", 1)
+		setMemberRoleRaw(t, "mgr-role", "u-owner", 2)
 	})
 
 	t.Run("transfer ownership demotes previous owner", func(t *testing.T) {

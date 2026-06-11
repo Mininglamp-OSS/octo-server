@@ -272,6 +272,36 @@ func TestRemoveMembersSkipsOwnerAndPeers(t *testing.T) {
 	assert.Nil(t, low, "lower role must be removed")
 }
 
+// setMemberRoleRaw 测试 fixture 专用：绕过生产侧 updateMemberRole 的
+// role<>2 守卫直接改角色，用于构造（含非法的）任意角色状态。
+func setMemberRoleRaw(t *testing.T, spaceId, uid string, role int) {
+	t.Helper()
+	_, err := testSpaceDB.session.Update("space_member").
+		Set("role", role).
+		Where("space_id=? and uid=?", spaceId, uid).Exec()
+	assert.NoError(t, err)
+}
+
+// TestUpdateMemberRoleDBGuardSkipsOwner 守卫回归（PR #339 review F1）：
+// updateMemberRole 的 WHERE 带 role<>2。模拟「pre-check 读到 role<2 后，
+// 目标被并发转让升为 owner」的最终态——降级 UPDATE 必须空转，owner 不被降级。
+func TestUpdateMemberRoleDBGuardSkipsOwner(t *testing.T) {
+	_, f, err := setup(t)
+	assert.NoError(t, err)
+	spaceId := "role-db-guard"
+	memberRoleFixture(t, f, spaceId, 2, 0)
+
+	// 并发转让的最终态：m-target 已是 owner（raw 直写，绕过守卫构造场景）
+	setMemberRoleRaw(t, spaceId, "m-target", 2)
+
+	// 此刻才落地的降级 UPDATE（pre-check 早已通过）必须被 SQL 守卫挡住
+	err = f.db.updateMemberRole(spaceId, "m-target", 1)
+	assert.NoError(t, err)
+	mem, err := f.db.queryMember(spaceId, "m-target")
+	assert.NoError(t, err)
+	assert.Equal(t, 2, mem.Role, "owner must not be demoted by the bare update path")
+}
+
 // TestUpdateMemberRoleTargetNotFound 目标非空间成员时返回 member_not_found。
 func TestUpdateMemberRoleTargetNotFound(t *testing.T) {
 	_, f, err := setup(t)
