@@ -21,6 +21,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/model"
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/source"
+	"github.com/Mininglamp-OSS/octo-server/pkg/avatarrender"
 	"github.com/Mininglamp-OSS/octo-server/pkg/avatarversion"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
@@ -553,16 +554,57 @@ func (u *User) UserAvatar(c *wkhttp.Context) {
 			ph = fmt.Sprintf("/avatar/default/test (%d).jpg", avatarID)
 			downloadUrl = strings.ReplaceAll(u.ctx.GetConfig().Avatar.DefaultBaseURL, "{avatar}", fmt.Sprintf("%d", avatarID))
 		} else {
-			// 本地生成基于 UID 的彩色圆形默认头像
+			// 本地生成默认头像：固定色板按 uid 取色（改名不变色）+ 昵称后两字白字。
+			// 昵称为空、或截出的文字含本字体无字形的字符（典型是纯 emoji）时，回退到
+			// 基于 uid 的 ASCII 兜底图，保证不裂图、不出豆腐块。
+			//
+			// 默认头像内容随昵称变化，但 URL 是稳定的 users/{uid}/avatar。因此用
+			// 短缓存 + must-revalidate + 内容相关 ETag：改名后端换 ?v 立即生效，
+			// 不换 URL 的访问（共享缓存/直接访问/非好友）也最多 5 分钟内 revalidate
+			// 到新头像，避免按 max-age 长达一天继续展示旧昵称头像。
+			//
+			// ETag 只依赖 uid+昵称（无需渲染），因此先算 ETag 并在命中 If-None-Match
+			// 时直接 304，避免对每次缓存 revalidation 重复执行昂贵的渲染/PNG 编码。
+			// ETag/Cache-Control 在 304 与 200 都要带；Content-Type 由下面返回图像的
+			// c.Data 统一设置（304 无 body 不需要），避免重复设置。
+			setAvatarHeaders := func(etag string) {
+				c.Header("Content-Disposition", "inline; filename=avatar.png")
+				c.Header("ETag", etag)
+				c.Header("Cache-Control", "public, max-age=300, must-revalidate")
+			}
+
+			text := avatarrender.IndividualText(userInfo.Name)
+			nameMode := avatarrender.Renderable(text)
+			// ETag 覆盖决定内容的因子：渲染模式版本 + uid(决定颜色) + 展示文字。
+			etag := avatarETag("ascii-v1", uid)
+			if nameMode {
+				etag = avatarETag("name-v1", uid, text)
+			}
+			setAvatarHeaders(etag)
+			if ifNoneMatchSatisfied(c.GetHeader("If-None-Match"), etag) {
+				c.Status(http.StatusNotModified)
+				return
+			}
+
+			if nameMode {
+				imageData, genErr := avatarrender.Render(avatarrender.Options{
+					Text: text,
+					Bg:   avatarrender.ColorForSeed(uid),
+				})
+				if genErr == nil {
+					c.Data(http.StatusOK, "image/png", imageData)
+					return
+				}
+				// 渲染失败不直接 500，记录后回退 ASCII 兜底；ETag 改回 ASCII 模式与内容一致。
+				u.Error("生成昵称默认头像失败，回退兜底", zap.Error(genErr), zap.String("uid", uid))
+				c.Header("ETag", avatarETag("ascii-v1", uid))
+			}
 			imageData, genErr := generateDefaultAvatar(uid)
 			if genErr != nil {
 				u.Error("生成默认头像失败", zap.Error(genErr))
 				c.Writer.WriteHeader(http.StatusInternalServerError)
 				return
 			}
-			c.Header("Content-Type", "image/png")
-			c.Header("Content-Disposition", "inline; filename=avatar.png")
-			c.Header("Cache-Control", "public, max-age=86400")
 			c.Data(http.StatusOK, "image/png", imageData)
 			return
 		}
@@ -3827,14 +3869,36 @@ func (u *User) applyRealnameToAuthCodeMap(m map[string]interface{}, uid string) 
 	}
 }
 
-// ValidateName checks that a display name does not contain the @ character,
-// which is used as delimiter in token cache entries (uid@name@role).
+// ValidateName checks that a display name is non-blank and does not contain the
+// @ character, which is used as delimiter in token cache entries (uid@name@role).
 // Allowing @ in names would enable privilege escalation via role injection.
+//
+// 非空校验（需求模块3）：去除空白、控制字符、零宽/格式字符后无可见内容则拒绝。
+// ValidateName 是昵称写入的统一守门（注册、改名、管理员建/改号都经过它），
+// 第三方登录刻意绕开本函数，故此处加非空不影响第三方 nickname 为空的登录流程。
 func ValidateName(name string) error {
+	if isBlankName(name) {
+		return errors.New("名字不能为空！")
+	}
 	if strings.Contains(name, "@") {
 		return errors.New("名字不能包含@字符！")
 	}
 	return nil
+}
+
+// isBlankName 报告 name 去除所有空白、控制字符、Unicode 格式字符（零宽连接符、
+// BOM 等）后是否无可见内容。
+func isBlankName(name string) bool {
+	for _, r := range name {
+		switch {
+		case unicode.IsSpace(r): // 半角/全角空格、Tab、换行、不间断空格等
+		case unicode.Is(unicode.Cc, r): // 控制字符
+		case unicode.Is(unicode.Cf, r): // 格式字符：ZWSP/ZWNJ/ZWJ/BOM/WJ 等
+		default:
+			return false // 命中一个可见字符
+		}
+	}
+	return true
 }
 
 // ==================== Aegis OIDC Phase 2d — verify-token 翻译层 ====================

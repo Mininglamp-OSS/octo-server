@@ -172,6 +172,39 @@ func getAvatarForTest(t *testing.T, handler http.Handler, uid string) *httptest.
 	return w
 }
 
+// TestUserAvatarDefaultETag 覆盖默认头像的缓存语义：内容随昵称变化但 URL 稳定，
+// 必须带内容相关 ETag + must-revalidate，且改名（昵称不同）会改变 ETag，使缓存失效。
+func TestUserAvatarDefaultETag(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	ctx.GetConfig().Avatar.Default = ""
+	ctx.GetConfig().Avatar.DefaultBaseURL = ""
+
+	u := New(ctx)
+	require.NoError(t, u.db.Insert(&Model{UID: "etag_u1", Name: "张三丰", Username: "etag_u1", ShortNo: "etagu1", Status: 1}))
+	require.NoError(t, u.db.Insert(&Model{UID: "etag_u2", Name: "李四", Username: "etag_u2", ShortNo: "etagu2", Status: 1}))
+
+	// 1. 默认头像带 ETag，且缓存策略为短缓存 + must-revalidate（不是长达一天）。
+	w1 := getAvatarForTest(t, s.GetRoute(), "etag_u1")
+	etag1 := w1.Header().Get("ETag")
+	require.NotEmpty(t, etag1)
+	cc := w1.Header().Get("Cache-Control")
+	assert.Contains(t, cc, "must-revalidate")
+	assert.NotContains(t, cc, "max-age=86400")
+
+	// 2. 带 If-None-Match 命中 → 304，且无 body。
+	w2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodGet, "/v1/users/etag_u1/avatar", nil)
+	req2.Header.Set("If-None-Match", etag1)
+	s.GetRoute().ServeHTTP(w2, req2)
+	assert.Equal(t, http.StatusNotModified, w2.Code)
+	assert.Empty(t, w2.Body.Bytes())
+
+	// 3. 不同昵称的用户 → 不同 ETag（等价于「改名后 ETag 变」，因为 ETag 由昵称决定）。
+	w3 := getAvatarForTest(t, s.GetRoute(), "etag_u2")
+	assert.NotEqual(t, etag1, w3.Header().Get("ETag"))
+}
+
 func assertGeneratedDefaultAvatarForTest(t *testing.T, w *httptest.ResponseRecorder) {
 	t.Helper()
 	cfg, err := png.DecodeConfig(bytes.NewReader(w.Body.Bytes()))
