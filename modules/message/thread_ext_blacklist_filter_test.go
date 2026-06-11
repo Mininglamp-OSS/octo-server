@@ -9,8 +9,12 @@ package message
 // is_deleted=0）的父群成员两条路径都不应再收到子区 ext 行（元数据/通知层泄漏；
 // 内容读已被 ExistMemberActive 门禁兜住）。
 //
-// 非 integration tag：CI 的 go test 直接跑（MySQL/Redis service 已就绪），
-// 避免 #353 指出的「integration-tagged 测试 CI 永不编译」缺口在本修复上重演。
+// 测试基建约定（PR #356 round-1 CI 红的教训）：本包非 integration-tag 测试一律
+// 不跑 sql-migrate（包内既有 testutil.NewTestServer 用例全部 t.Skip，而
+// channel_files_blacklist_test.go 等用例手建最小表——若本文件经 module.Setup 跑
+// 迁移，shuffle 把手建表用例排在前面时 sql-migrate 会撞 Error 1050 Table already
+// exists）。因此这里照搬 integration e2e helper 的做法：手建最小表 + 裸 INSERT
+// 种子 + 显式装配 service（wiring 与 1module.go 注入逻辑逐行对齐）。
 // =============================================================================
 
 import (
@@ -20,52 +24,156 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
-	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	convext "github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
-	"github.com/Mininglamp-OSS/octo-server/modules/group"
-	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 const extBlSpaceID = "s_ext_bl"
 
-// setupThreadExtBlacklistData 建一个父群（space_id 为空 → legacy wildcard 可见），
-// 两个正常成员 normalUID / victimUID，返回 ctx 与已装配好的 conversation_ext 单例。
-// 装配（ThreadAuthChecker / ChannelAuthChecker / ThreadEnumerator / ActiveMemberFilter）
-// 由 testutil.NewTestServer → module.Setup 跑本包 1module.go 的注入逻辑完成，
-// 与生产 boot 同一条 wiring 路径。
+// extBlNewCtx 构造指向测试 MySQL 的 *config.Context（config.New 默认 DSN 即
+// root:demo@…/test，与 CI service 一致），显式 Migration=false——不经 module.Setup。
+func extBlNewCtx(t *testing.T) *config.Context {
+	t.Helper()
+	cfg := config.New()
+	cfg.Test = true
+	cfg.DB.Migration = false
+	return config.NewContext(cfg)
+}
+
+// extBlEnsureTables 手建本测试用到的最小表（DDL 与 modules/group、
+// modules/conversation_ext、modules/thread 的迁移文件中本测试触达的列对齐；
+// 写法照搬 default_followed_group_guard_e2e_test.go / thread_follow_blacklist_
+// e2e_test.go 的同名 helper）。DROP + CREATE 而非 IF NOT EXISTS：其它用例
+// （如 channel_files_blacklist_test.go）可能先以更窄的列集建过 group_member，
+// 必须重建保证本测试的列都在；表只装每用例自种数据，破坏性 DDL 安全。
+func extBlEnsureTables(t *testing.T, ctx *config.Context) {
+	t.Helper()
+	for _, tbl := range []string{"user_conversation_ext", "user_follow_version", "thread", "group_member", "`group`"} {
+		_, err := ctx.DB().Exec("DROP TABLE IF EXISTS " + tbl)
+		require.NoError(t, err, "drop %s", tbl)
+	}
+	stmts := []string{
+		// modules/group/sql/20191106000002 起的 group 表（仅本测试触达的列，
+		// 与 default_followed_group_guard_e2e_test.go ensureGuardE2ETables 一致）。
+		"CREATE TABLE `group` (" +
+			"  `id` INT NOT NULL AUTO_INCREMENT PRIMARY KEY," +
+			"  `group_no` VARCHAR(40) NOT NULL DEFAULT ''," +
+			"  `name` VARCHAR(40) NOT NULL DEFAULT ''," +
+			"  `creator` VARCHAR(40) NOT NULL DEFAULT ''," +
+			"  `status` SMALLINT NOT NULL DEFAULT 0," +
+			"  `version` BIGINT NOT NULL DEFAULT 0," +
+			"  `group_type` SMALLINT NOT NULL DEFAULT 0," +
+			"  `space_id` VARCHAR(40) DEFAULT ''," +
+			"  `is_external_group` SMALLINT NOT NULL DEFAULT 0," +
+			"  `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP," +
+			"  `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP," +
+			"  UNIQUE KEY `group_groupNo` (`group_no`)" +
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+		"CREATE TABLE `group_member` (" +
+			"  `id` INT NOT NULL AUTO_INCREMENT PRIMARY KEY," +
+			"  `group_no` VARCHAR(40) NOT NULL DEFAULT ''," +
+			"  `uid` VARCHAR(40) NOT NULL DEFAULT ''," +
+			"  `role` SMALLINT NOT NULL DEFAULT 0," +
+			"  `version` BIGINT NOT NULL DEFAULT 0," +
+			"  `is_deleted` SMALLINT NOT NULL DEFAULT 0," +
+			"  `status` SMALLINT NOT NULL DEFAULT 1," +
+			"  `vercode` VARCHAR(100) NOT NULL DEFAULT ''," +
+			"  `robot` SMALLINT NOT NULL DEFAULT 0," +
+			"  `is_external` SMALLINT NOT NULL DEFAULT 0," +
+			"  `source_space_id` VARCHAR(40) NOT NULL DEFAULT ''," +
+			"  `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP," +
+			"  `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP," +
+			"  UNIQUE KEY `group_no_uid` (`group_no`, `uid`)" +
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+		// modules/thread 迁移中的 thread 表（最小列集，与 thread_follow_blacklist_
+		// e2e_test.go ensureThreadE2ETable 一致）。
+		"CREATE TABLE `thread` (" +
+			"  `id` INT NOT NULL AUTO_INCREMENT PRIMARY KEY," +
+			"  `group_no` VARCHAR(40) NOT NULL DEFAULT ''," +
+			"  `short_id` VARCHAR(40) NOT NULL DEFAULT ''," +
+			"  `name` VARCHAR(100) NOT NULL DEFAULT ''," +
+			"  `creator_uid` VARCHAR(40) NOT NULL DEFAULT ''," +
+			"  `status` INT NOT NULL DEFAULT 1," +
+			"  `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP," +
+			"  `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP," +
+			"  UNIQUE KEY `uk_short` (`short_id`)" +
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+		// modules/conversation_ext/sql/20260513000001 + 20260514000001(dm_category_id
+		// VARCHAR) + 20260514000002(去 version 列) + 20260522000001(auto_follow_threads
+		// + idx_channel_auto_follow) 的合成结果。
+		"CREATE TABLE `user_conversation_ext` (" +
+			"  `id` BIGINT AUTO_INCREMENT PRIMARY KEY," +
+			"  `uid` VARCHAR(40) NOT NULL," +
+			"  `space_id` VARCHAR(40) NOT NULL DEFAULT ''," +
+			"  `target_type` TINYINT NOT NULL," +
+			"  `target_id` VARCHAR(100) NOT NULL," +
+			"  `followed_dm` TINYINT NOT NULL DEFAULT 0," +
+			"  `dm_category_id` VARCHAR(32) NULL," +
+			"  `group_unfollowed` TINYINT NOT NULL DEFAULT 0," +
+			"  `follow_sort` INT NOT NULL DEFAULT 0," +
+			"  `auto_follow_threads` TINYINT(1) NOT NULL DEFAULT 0," +
+			"  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP," +
+			"  `updated_at` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP," +
+			"  UNIQUE KEY `uk` (`uid`, `space_id`, `target_type`, `target_id`)," +
+			"  KEY `idx_channel_auto_follow` (`target_type`, `target_id`, `auto_follow_threads`)" +
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+		// modules/conversation_ext/sql/20260513000002。
+		"CREATE TABLE `user_follow_version` (" +
+			"  `uid` VARCHAR(40) NOT NULL," +
+			"  `space_id` VARCHAR(40) NOT NULL DEFAULT ''," +
+			"  `version` BIGINT NOT NULL DEFAULT 0," +
+			"  `updated_at` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP," +
+			"  PRIMARY KEY (`uid`, `space_id`)" +
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+	}
+	for _, s := range stmts {
+		_, err := ctx.DB().Exec(s)
+		require.NoError(t, err, "extBlEnsureTables: %s", s[:40])
+	}
+}
+
+// setupThreadExtBlacklistData 建一个父群（space_id 为空 → legacy wildcard 可见）+
+// 两个正常成员 normalUID / victimUID，并按 1module.go 的注入逻辑显式装配
+// conversation_ext.Service（ThreadAuthChecker / ChannelAuthChecker /
+// ThreadEnumerator / ActiveMemberFilter 同源 wiring）。
 func setupThreadExtBlacklistData(t *testing.T) (*config.Context, *convext.Service, string, string, string) {
 	t.Helper()
-	_, ctx := testutil.NewTestServer()
-	require.NoError(t, testutil.CleanAllTables(ctx))
+	ctx := extBlNewCtx(t)
+	extBlEnsureTables(t, ctx)
 
-	svc := convext.GetGlobalConvExtService()
-	require.NotNil(t, svc, "conversation_ext 单例应已由 module.Setup 初始化并完成注入")
+	svc := convext.NewService(ctx)
+	checker := newThreadAuthChecker(ctx)
+	svc.SetThreadAuthChecker(checker)
+	svc.SetChannelAuthChecker(checker)
+	svc.SetThreadEnumerator(newThreadEnumerator(ctx))
+	svc.SetActiveMemberFilter(checker)
 
 	groupNo := strings.ReplaceAll(util.GenerUUID(), "-", "")
 	normalUID := "u_ext_normal_" + util.GenerUUID()[:8]
 	victimUID := "u_ext_victim_" + util.GenerUUID()[:8]
 
-	groupDB := group.NewDB(ctx)
-	require.NoError(t, groupDB.Insert(&group.Model{
-		GroupNo: groupNo, Name: "父群", Creator: normalUID, Status: 1, Version: 1,
-	}))
+	_, err := ctx.DB().Exec(
+		"INSERT INTO `group` (group_no, name, creator, status, version, space_id) VALUES (?, '父群', ?, 1, 1, '')",
+		groupNo, normalUID,
+	)
+	require.NoError(t, err, "seed group")
 	for _, u := range []string{normalUID, victimUID} {
-		require.NoError(t, groupDB.InsertMember(&group.MemberModel{
-			GroupNo: groupNo, UID: u,
-			Status: int(common.GroupMemberStatusNormal), Version: 1, Vercode: util.GenerUUID(),
-		}))
+		_, err = ctx.DB().Exec(
+			"INSERT INTO group_member (group_no, uid, vercode, is_deleted, status, version) VALUES (?, ?, ?, 0, ?, 1)",
+			groupNo, u, util.GenerUUID(), int(common.GroupMemberStatusNormal),
+		)
+		require.NoError(t, err, "seed member %s", u)
 	}
 	return ctx, svc, groupNo, normalUID, victimUID
 }
 
-func blacklistMemberExtBl(t *testing.T, ctx *config.Context, groupNo, uid string) {
+func extBlSetMemberStatus(t *testing.T, ctx *config.Context, groupNo, uid string, status common.GroupMemberStatus) {
 	t.Helper()
-	_, err := ctx.DB().UpdateBySql(
+	_, err := ctx.DB().Exec(
 		"UPDATE group_member SET status=? WHERE group_no=? AND uid=?",
-		int(common.GroupMemberStatusBlacklist), groupNo, uid,
-	).Exec()
+		int(status), groupNo, uid,
+	)
 	require.NoError(t, err)
 }
 
@@ -80,13 +188,14 @@ func hasThreadExtRow(t *testing.T, ctx *config.Context, uid, channelID string) b
 	return count > 0
 }
 
-// seedActiveThread 在 thread 表插入一个 active 子区，返回 channelID。
+// seedActiveThread 在 thread 表插入一个 active(status=1) 子区，返回 channelID。
 func seedActiveThread(t *testing.T, ctx *config.Context, groupNo, shortID string) string {
 	t.Helper()
-	require.NoError(t, thread.NewDB(ctx).Insert(&thread.Model{
-		ShortID: shortID, GroupNo: groupNo, Name: "topic", CreatorUID: "creator",
-		Status: thread.ThreadStatusActive,
-	}))
+	_, err := ctx.DB().Exec(
+		"INSERT INTO thread (group_no, short_id, name, creator_uid, status) VALUES (?, ?, 'topic', 'creator', 1)",
+		groupNo, shortID,
+	)
+	require.NoError(t, err, "seed thread %s/%s", groupNo, shortID)
 	return groupNo + "____" + shortID
 }
 
@@ -101,7 +210,7 @@ func TestOnThreadCreated_BlacklistedMemberExcludedFromFanout(t *testing.T) {
 	require.NoError(t, svc.FollowChannel(victimUID, extBlSpaceID, groupNo))
 
 	// victim 被拉黑后新建子区。
-	blacklistMemberExtBl(t, ctx, groupNo, victimUID)
+	extBlSetMemberStatus(t, ctx, groupNo, victimUID, common.GroupMemberStatusBlacklist)
 	sid1 := "1489104291682713601"
 	require.NoError(t, svc.OnThreadCreated(groupNo, sid1))
 
@@ -111,11 +220,7 @@ func TestOnThreadCreated_BlacklistedMemberExcludedFromFanout(t *testing.T) {
 		"被拉黑成员不应收到新子区 ext 行（issue #351 元数据泄漏）")
 
 	// 解除拉黑 → 下一条新子区恢复 fanout（auto_follow_threads=1 保留的语义）。
-	_, err := ctx.DB().UpdateBySql(
-		"UPDATE group_member SET status=? WHERE group_no=? AND uid=?",
-		int(common.GroupMemberStatusNormal), groupNo, victimUID,
-	).Exec()
-	require.NoError(t, err)
+	extBlSetMemberStatus(t, ctx, groupNo, victimUID, common.GroupMemberStatusNormal)
 	sid2 := "1489104291682713602"
 	require.NoError(t, svc.OnThreadCreated(groupNo, sid2))
 	assert.True(t, hasThreadExtRow(t, ctx, victimUID, groupNo+"____"+sid2),
@@ -130,7 +235,7 @@ func TestFollowChannel_BlacklistedMemberSkipsExistingThreadMaterialization(t *te
 
 	existingChannelID := seedActiveThread(t, ctx, groupNo, "1489104291682713603")
 
-	blacklistMemberExtBl(t, ctx, groupNo, victimUID)
+	extBlSetMemberStatus(t, ctx, groupNo, victimUID, common.GroupMemberStatusBlacklist)
 
 	// 被拉黑成员 FollowChannel：GROUP 行写入放行（permissive 语义不变），但
 	// 不得物化既有子区 ext 行。
