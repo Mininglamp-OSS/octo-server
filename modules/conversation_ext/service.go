@@ -101,6 +101,23 @@ type DefaultFollowedGroupGuard interface {
 	FilterDefaultFollowed(uid, spaceID string, candidateGroupNos []string) ([]string, error)
 }
 
+// ActiveMemberFilter 把一批 uid 过滤为「仍是 groupNo 活跃成员」（is_deleted=0 AND
+// status=Normal，排除被拉黑成员）的子集。窄接口、依赖倒置，由 message/1module.go
+// 注入实现（group.IService），避免 conversation_ext 直接 import group 形成循环依赖。
+//
+// 引入背景（issue #351 / PR #345 mandatory follow-up）：AuthorizeChannelFollow
+// 对 GROUP follow 有意保持 permissive ExistMember，但 FollowChannel 不是纯群操作——
+// 它写 auto_follow_threads=1 并物化既有子区 ext 行；OnThreadCreated fanout 也只
+// re-check ext flag（auto_follow_threads=1 AND group_unfollowed=0），不查群成员
+// 状态。被拉黑的父群成员因此持续收到既有/新建子区的 ext 行与创建通知（元数据层
+// 泄漏；内容读已被 ExistMemberActive 门禁拦住）。本接口用于在这两条子区物化写
+// 路径上按 active membership 过滤：GROUP 行本身的语义不变。
+type ActiveMemberFilter interface {
+	// FilterActiveMemberUIDs 返回 uids 中当前是 groupNo 活跃成员的子集。
+	// 实现不要求保序，也不要求去重输入。
+	FilterActiveMemberUIDs(groupNo string, uids []string) ([]string, error)
+}
+
 // ThreadEnumerator 是 FollowChannel 级联物化子区时使用的窄接口。
 // 与 ThreadAuthChecker 一样采用依赖倒置，避免 conversation_ext 直接 import thread。
 // 由 message/1module.go 启动时通过 SetThreadEnumerator 注入；nil 时跳过物化
@@ -158,6 +175,11 @@ type Service struct {
 	// DefaultFollowedGroups 直接返回空——fail-closed 比放过更安全。
 	defaultFollowedGuard  DefaultFollowedGroupGuard
 	defaultFollowedGuardM sync.RWMutex
+	// activeMemberFilter 是子区 ext 物化写路径（FollowChannel Phase 2/3 +
+	// OnThreadCreated fanout）的活跃成员过滤钩子（issue #351）。由 message/1module.go
+	// 启动时注入；nil 时跳过过滤（仅供单测 / 迁移期使用，与 threadAuth 同约定）。
+	activeMemberFilter  ActiveMemberFilter
+	activeMemberFilterM sync.RWMutex
 	log.Log
 }
 
@@ -235,6 +257,24 @@ func (s *Service) getDefaultFollowedGroupGuard() DefaultFollowedGroupGuard {
 	g := s.defaultFollowedGuard
 	s.defaultFollowedGuardM.RUnlock()
 	return g
+}
+
+// SetActiveMemberFilter injects the active-membership filter used by the two
+// thread-ext materialization write paths (FollowChannel Phase 2/3 and the
+// OnThreadCreated fanout) — issue #351.  Safe for concurrent use; intended to
+// be called once at startup from message/1module.go after the group module
+// has initialised.
+func (s *Service) SetActiveMemberFilter(f ActiveMemberFilter) {
+	s.activeMemberFilterM.Lock()
+	s.activeMemberFilter = f
+	s.activeMemberFilterM.Unlock()
+}
+
+func (s *Service) getActiveMemberFilter() ActiveMemberFilter {
+	s.activeMemberFilterM.RLock()
+	f := s.activeMemberFilter
+	s.activeMemberFilterM.RUnlock()
+	return f
 }
 
 // AuthorizeAndMaterializeDefaultFollowedGroups is the pre-flight step the
@@ -399,6 +439,25 @@ func (s *Service) FollowChannel(uid, spaceID, groupNo string) error {
 		return nil
 	}); err != nil {
 		return err
+	}
+
+	// issue #351（PR #345 mandatory follow-up）：子区 ext 物化只面向「活跃父群成员」。
+	// GROUP follow 本身保持 permissive（Phase 1 已写群行，与 AuthorizeChannelFollow
+	// 的 GROUP 语义一致），但被拉黑成员不得借 FollowChannel 重新物化既有子区 ext 行
+	// （元数据泄漏——removeUserFromGroupThreadsCleanup 在拉黑时已删过一轮）。
+	// auto_follow_threads=1 保留：OnThreadCreated fanout 侧同样按 active 过滤，flag
+	// 残留期间无泄漏；解除拉黑后新子区 fanout 自动恢复，无需用户重新操作。
+	// nil filter 仅用于单测 / 迁移期（与 threadAuth / channelAuth 同约定）。
+	if filter := s.getActiveMemberFilter(); filter != nil {
+		activeUIDs, err := filter.FilterActiveMemberUIDs(groupNo, []string{uid})
+		if err != nil {
+			// Phase 1 已 commit（群行语义不受影响）；过滤失败 fail-closed 跳过物化，
+			// 错误向上返回让调用方记录。缺失的子区行由下次 FollowChannel / fanout 补齐。
+			return fmt.Errorf("FollowChannel filter active member: %w", err)
+		}
+		if len(activeUIDs) == 0 {
+			return nil
+		}
 	}
 
 	enum := s.getThreadEnumerator()
@@ -624,6 +683,22 @@ func (s *Service) OnThreadCreated(groupNo, shortID string) error {
 		return nil
 	}
 
+	// 1.5 issue #351（PR #345 mandatory follow-up）：按「活跃父群成员」过滤 fanout
+	//     目标。auto_follow_threads=1 只代表用户曾关注 channel，不代表当前仍可见——
+	//     被拉黑（status=Blacklist）成员的群行 flag 仍在，但不应再收到新子区的 ext
+	//     行 / 创建通知（元数据层泄漏；内容读已被 ExistMemberActive 门禁兜住）。
+	//     与初始 SELECT 一样在 tx 外执行（快照语义，不延长锁窗口）；解除拉黑后
+	//     从下一条新子区起自动恢复 fanout。nil filter 仅用于单测 / 迁移期。
+	if filter := s.getActiveMemberFilter(); filter != nil {
+		targets, err = filterFanoutTargetsByActiveMembership(filter, groupNo, targets)
+		if err != nil {
+			return fmt.Errorf("OnThreadCreated filter active members: %w", err)
+		}
+		if len(targets) == 0 {
+			return nil
+		}
+	}
+
 	threadChannelID := groupNo + threadSeparator + shortID
 
 	// 2. 按 batch 切分，每 batch 一个 tx：
@@ -721,6 +796,37 @@ func isRetriableMySQLLockErr(err error) bool {
 type onThreadCreatedTarget = struct {
 	UID     string `db:"uid"`
 	SpaceID string `db:"space_id"`
+}
+
+// filterFanoutTargetsByActiveMembership 把 OnThreadCreated 的 fanout 目标过滤为
+// 「仍是 groupNo 活跃成员」的子集（issue #351）。同一 uid 可能带多个 space_id 行，
+// 先按 uid 去重再批量查询，过滤结果保持 targets 原有顺序（ORDER BY uid, space_id
+// 的锁序约定不被破坏）。
+func filterFanoutTargetsByActiveMembership(filter ActiveMemberFilter, groupNo string, targets []onThreadCreatedTarget) ([]onThreadCreatedTarget, error) {
+	uids := make([]string, 0, len(targets))
+	seen := make(map[string]struct{}, len(targets))
+	for _, t := range targets {
+		if _, ok := seen[t.UID]; ok {
+			continue
+		}
+		seen[t.UID] = struct{}{}
+		uids = append(uids, t.UID)
+	}
+	activeUIDs, err := filter.FilterActiveMemberUIDs(groupNo, uids)
+	if err != nil {
+		return nil, err
+	}
+	activeSet := make(map[string]struct{}, len(activeUIDs))
+	for _, u := range activeUIDs {
+		activeSet[u] = struct{}{}
+	}
+	filtered := make([]onThreadCreatedTarget, 0, len(targets))
+	for _, t := range targets {
+		if _, ok := activeSet[t.UID]; ok {
+			filtered = append(filtered, t)
+		}
+	}
+	return filtered, nil
 }
 
 // bulkBumpFollowVersionTx 批量给一批已排序的 (uid, space_id) +1 follow_version。

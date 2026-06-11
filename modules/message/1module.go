@@ -80,6 +80,11 @@ func init() {
 			// 子区前必须校验 caller 是群成员 + 群在 Space 可见。复用同一个 struct
 			// 实现，共享 checkChannelAccess 逻辑。
 			svc.SetChannelAuthChecker(checker)
+			// 注入 ActiveMemberFilter（issue #351）：子区 ext 物化写路径（FollowChannel
+			// Phase 2/3 + OnThreadCreated fanout）按「活跃父群成员」过滤，被拉黑成员
+			// 不再收到既有/新建子区的 ext 行。GROUP 行语义不变（AuthorizeChannelFollow
+			// 保持 permissive）。复用同一个 threadAuthChecker，共享 group.IService 实例。
+			svc.SetActiveMemberFilter(checker)
 			// 注入 DefaultFollowedGroupGuard：/v1/follow/sort 的 target_type=2
 			// 候选必须先经过 (成员 + Space 可见性 + 非 Disband + category_id) 完整
 			// 校验链才能被物化为 ext 行。没有这一步，恶意客户端可借 sort 接口给
@@ -188,6 +193,47 @@ func (c *threadAuthChecker) AuthorizeThreadFollow(uid, spaceID, groupNo, shortID
 // 群成员。子区(CommunityTopic)分支的 active 校验只发生在 AuthorizeThreadFollow。
 func (c *threadAuthChecker) AuthorizeChannelFollow(uid, spaceID, groupNo string) error {
 	return c.checkChannelAccess(uid, spaceID, groupNo, false)
+}
+
+// FilterActiveMemberUIDs implements convext.ActiveMemberFilter (issue #351).
+//
+// 返回 uids 中当前是 groupNo「活跃成员」（is_deleted=0 AND status=Normal，排除
+// 被拉黑成员）的子集，供 conversation_ext 的子区 ext 物化写路径（FollowChannel
+// Phase 2/3 + OnThreadCreated fanout）过滤目标。
+//
+//   - 单 uid（FollowChannel 路径）：直查 ExistMemberActive，避免拉全群成员列表；
+//   - 多 uid（fanout 路径）：一次 GetSubscribableMemberUIDs（status=Normal AND
+//     is_deleted=0，与 #343 的 IM 订阅数据源同语义）后在内存里取交集——fanout
+//     单批最多 1000 目标，逐个 ExistMemberActive 会放大 N 倍查询。
+func (c *threadAuthChecker) FilterActiveMemberUIDs(groupNo string, uids []string) ([]string, error) {
+	switch len(uids) {
+	case 0:
+		return nil, nil
+	case 1:
+		active, err := c.groupSvc.ExistMemberActive(groupNo, uids[0])
+		if err != nil {
+			return nil, err
+		}
+		if !active {
+			return nil, nil
+		}
+		return []string{uids[0]}, nil
+	}
+	activeUIDs, err := c.groupSvc.GetSubscribableMemberUIDs(groupNo)
+	if err != nil {
+		return nil, err
+	}
+	activeSet := make(map[string]struct{}, len(activeUIDs))
+	for _, u := range activeUIDs {
+		activeSet[u] = struct{}{}
+	}
+	out := make([]string, 0, len(uids))
+	for _, u := range uids {
+		if _, ok := activeSet[u]; ok {
+			out = append(out, u)
+		}
+	}
+	return out, nil
 }
 
 // checkChannelAccess 复用 FollowThread 既有逻辑的群级访问校验：
