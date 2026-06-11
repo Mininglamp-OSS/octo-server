@@ -341,15 +341,30 @@ func generateWebhookID() string {
 	return webhookIDPrefix + hex.EncodeToString(buf)
 }
 
+// memberWebhookNamePrefix 是非管理员（成员/bot）所设 webhook 展示名的强制前缀：
+// 成员可以自定义名称，但名称必须以 "Webhook-" 开头（缺省自动命名本就是该形态），
+// 防止成员把 webhook 命名成"HR 公告"或他人姓名冒充真实发送者（PR #340 review，
+// yujiawei P2）。管理员命名不受限（历史行为，管理员本就可信）。
+const memberWebhookNamePrefix = "Webhook-"
+
+// prefixedWebhookName 给非管理员提交的名称补强制前缀；已带前缀则原样返回（幂等，
+// 避免成员保存自己 webhook 时被二次加前缀）。
+func prefixedWebhookName(name string) string {
+	if strings.HasPrefix(name, memberWebhookNamePrefix) {
+		return name
+	}
+	return memberWebhookNamePrefix + name
+}
+
 // autoWebhookName 在创建时未提供名称的情况下生成服务端默认名：
-// "Webhook-" + webhook_id 随机段前 6 位 hex。确定性、可与 webhook_id 对账，
+// 前缀 + webhook_id 随机段前 6 位 hex。确定性、可与 webhook_id 对账，
 // 不引入第二个随机源。
 func autoWebhookName(webhookID string) string {
 	suffix := strings.TrimPrefix(webhookID, webhookIDPrefix)
 	if len(suffix) > 6 {
 		suffix = suffix[:6]
 	}
-	return "Webhook-" + suffix
+	return memberWebhookNamePrefix + suffix
 }
 
 func toResp(m *incomingWebhookModel) webhookResp {
@@ -574,6 +589,11 @@ func (w *IncomingWebhook) create(c *wkhttp.Context) {
 		return
 	}
 	req.Name = strings.TrimSpace(req.Name)
+	// 成员/bot 自定义名称强制带 "Webhook-" 前缀（先补前缀再做长度校验，上限对
+	// 最终落库值生效）；管理员命名不受限。
+	if !actor.isAdmin && req.Name != "" {
+		req.Name = prefixedWebhookName(req.Name)
+	}
 	if len(req.Name) > 64 {
 		mgmtRequestInvalid(c, "name")
 		return
@@ -704,7 +724,15 @@ func (w *IncomingWebhook) update(c *wkhttp.Context) {
 	fields := map[string]interface{}{}
 	if req.Name != nil {
 		name := strings.TrimSpace(*req.Name)
-		if name == "" || len(name) > 64 {
+		if name == "" {
+			mgmtRequestInvalid(c, "name")
+			return
+		}
+		// 与 create 同口径：成员/bot 改名强制带前缀（幂等），长度校验对最终值生效。
+		if !actor.isAdmin {
+			name = prefixedWebhookName(name)
+		}
+		if len(name) > 64 {
 			mgmtRequestInvalid(c, "name")
 			return
 		}

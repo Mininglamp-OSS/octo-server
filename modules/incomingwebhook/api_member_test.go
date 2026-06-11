@@ -97,11 +97,17 @@ func TestMemberCreate_AutoNameWhenOmitted(t *testing.T) {
 	whID, _ := created["webhook_id"].(string)
 	assert.Contains(t, whID, name[len("Webhook-"):])
 
-	// 自定义名称 → 200 且名称生效。
+	// 自定义名称 → 200，落库时强制带 "Webhook-" 前缀（防冒充真实成员/部门）。
 	w := do(handler, userReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo),
 		map[string]interface{}{"name": "my ci bot"}, memberAToken))
 	require.Equalf(t, http.StatusOK, w.Code, "named create body: %s", w.Body.String())
-	assert.Equal(t, "my ci bot", parseJSON(t, w)["name"])
+	assert.Equal(t, "Webhook-my ci bot", parseJSON(t, w)["name"])
+
+	// 已带前缀的名称不被二次加前缀（幂等）。
+	w = do(handler, userReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo),
+		map[string]interface{}{"name": "Webhook-already"}, memberAToken))
+	require.Equalf(t, http.StatusOK, w.Code, "prefixed create body: %s", w.Body.String())
+	assert.Equal(t, "Webhook-already", parseJSON(t, w)["name"])
 }
 
 // 普通成员自定义头像 → 400（头像仅管理员可设置）。
@@ -209,7 +215,7 @@ func TestMemberUpdate_NameAllowedAvatarRejected(t *testing.T) {
 
 	w := do(handler, userReq("PUT", base, map[string]interface{}{"name": "deploy-bot"}, memberAToken))
 	require.Equalf(t, http.StatusOK, w.Code, "rename body: %s", w.Body.String())
-	assert.Equal(t, "deploy-bot", parseJSON(t, w)["name"])
+	assert.Equal(t, "Webhook-deploy-bot", parseJSON(t, w)["name"])
 
 	w = do(handler, userReq("PUT", base, map[string]interface{}{"avatar": "https://x/y.png"}, memberAToken))
 	assert.Equalf(t, http.StatusBadRequest, w.Code, "avatar body: %s", w.Body.String())

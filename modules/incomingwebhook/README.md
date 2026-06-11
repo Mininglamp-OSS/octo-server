@@ -14,8 +14,8 @@
 
 | 操作 | 群主/管理员（含管理员 bot） | 普通成员 / 成员 bot（内部、正常状态） |
 |------|------|------|
-| create | ✅（可自定义名称+头像） | ✅ 名称可自定义（缺省自动命名 `Webhook-xxxxxx`）；头像不可设置（400） |
-| update | ✅ 任意 webhook | ✅ 仅自己创建的；可改名称/状态，头像不可改（400） |
+| create | ✅（可自定义名称+头像） | ✅ 名称可自定义但强制带 `Webhook-` 前缀（缺省自动命名 `Webhook-xxxxxx`）；头像不可设置（400） |
+| update | ✅ 任意 webhook | ✅ 仅自己创建的；可改名称（强制 `Webhook-` 前缀）/状态，头像不可改（400） |
 | delete / regenerate / test | ✅ 任意 webhook | ✅ 仅自己创建的（其余 403） |
 | list | ✅ | ✅ 只读全量可见（不回显 token/推送 URL） |
 | deliveries | ✅ 任意 webhook | ✅ 仅自己创建的（其余 403） |
