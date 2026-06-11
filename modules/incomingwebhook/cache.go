@@ -28,8 +28,17 @@ import (
 //       * 需要即时生效就把 TTL 调小或设 0。
 //     若日后要求 admin 禁用也即时，最小改动是订阅 event.GroupUpdate 并 invalidate 群条目
 //     （与 handleGroupDisband 对称）。TestPush_GroupAdminDisable_TTLBounded 钉住当前语义。
+//   - **创建者退群 / 管理员降级（memberCache）同属 TTL 兜底**：创建者在群闸与 push
+//     覆盖判权（cachedCreatorMembership）只缓存正向结果（false 绝不缓存——安全不变量，
+//     由 TestCreatorMembershipCache_NeverCachesNegative 钉住），退群/降级后旧的
+//     member/admin 快照最多再活一个 TTL，随后懒级联禁用 / 覆盖权限收回即生效。
+//     退群没有可订阅的跨模块事件，TTL 是唯一收敛机制。
 //   - TTL 默认很短（3s）以把这些窗口压到秒级。把 TTL 设为 0
 //     （DM_INCOMINGWEBHOOK_CACHE_TTL_MS=0）可彻底关闭缓存，退化为每次直查 DB 的旧行为。
+//
+// ⚠️ 因此 DM_INCOMINGWEBHOOK_CACHE_TTL_MS 是【安全参数】而不只是性能旋钮：调大它会
+// 同步拉长上述全部鉴权类 staleness 窗口（刚退群成员的 webhook 继续可推、旧 token
+// 残存、对等实例放行已解散群）。运维上调前须明确接受这一取舍。
 const (
 	envCacheTTLMs = "DM_INCOMINGWEBHOOK_CACHE_TTL_MS"
 	envCacheMax   = "DM_INCOMINGWEBHOOK_CACHE_MAX"

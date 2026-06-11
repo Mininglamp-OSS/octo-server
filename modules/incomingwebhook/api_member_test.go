@@ -108,6 +108,27 @@ func TestMemberCreate_AutoNameWhenOmitted(t *testing.T) {
 		map[string]interface{}{"name": "Webhook-already"}, memberAToken))
 	require.Equalf(t, http.StatusOK, w.Code, "prefixed create body: %s", w.Body.String())
 	assert.Equal(t, "Webhook-already", parseJSON(t, w)["name"])
+
+	// 恰好等于裸前缀（无有效内容）视同未填 → 自动命名。
+	w = do(handler, userReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo),
+		map[string]interface{}{"name": "Webhook-"}, memberAToken))
+	require.Equalf(t, http.StatusOK, w.Code, "bare-prefix create body: %s", w.Body.String())
+	assert.Regexp(t, autoNameRe, parseJSON(t, w)["name"])
+}
+
+// 成员的 webhook push 时 username/avatar_url 覆盖被忽略（创建者非管理员 →
+// resolveFromIdentity 判权关闭），推送本身仍成功——管理面的前缀/头像限制不可被
+// push 路径绕过（PR #340 review，yujiawei P1）。展示字段的口径由 in-package 的
+// TestResolveFromIdentity 钉住，这里钉 E2E 不拒绝（覆盖被静默忽略而非 4xx）。
+func TestPush_MemberWebhookOverrideSilentlyIgnored(t *testing.T) {
+	handler, _, groupNo := setupMemberEnv(t)
+	created := memberCreate(t, handler, groupNo)
+	pushURL := fmt.Sprintf("/v1/incoming-webhooks/%s/%s", created["webhook_id"], created["token"])
+
+	pw := do(handler, anonReq("POST", pushURL,
+		[]byte(`{"content":"hi","username":"HR 公告","avatar_url":"https://evil.example.com/ceo.png"}`)))
+	assert.NotEqualf(t, http.StatusUnauthorized, pw.Code, "push body: %s", pw.Body.String())
+	assert.NotEqualf(t, http.StatusBadRequest, pw.Code, "push body: %s", pw.Body.String())
 }
 
 // 普通成员自定义头像 → 400（头像仅管理员可设置）。

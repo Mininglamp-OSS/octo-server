@@ -452,6 +452,7 @@ func TestManagerSystemSetting_UpdateRejectsInvalidIncomingWebhookNumerics(t *tes
 		{"per_webhook_rps", "+Inf"}, {"per_webhook_rps", "-Inf"}, {"per_webhook_rps", "abc"},
 		{"per_webhook_burst", "0"}, {"per_webhook_burst", "-1"},
 		{"max_per_group", "0"}, {"max_per_group", "-5"},
+		{"max_per_creator", "0"}, {"max_per_creator", "-3"},
 	}
 	for _, tc := range cases {
 		body := []byte(`{"items":[{"category":"incomingwebhook","key":"` + tc.key + `","value":"` + tc.value + `"}]}`)

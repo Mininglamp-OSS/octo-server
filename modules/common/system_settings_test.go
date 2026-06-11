@@ -149,21 +149,31 @@ func TestSystemSettings_IncomingWebhookThresholds_DefaultsAndDBOverride(t *testi
 	t.Setenv(envIncomingWebhookPerWebhookRPS, "")
 	t.Setenv(envIncomingWebhookPerWebhookBurst, "")
 	t.Setenv(envIncomingWebhookMaxPerGroup, "")
+	t.Setenv(envIncomingWebhookMaxPerCreator, "")
 	s := newTestSystemSettings(t, nil)
 
 	// DB+env 缺失 → code default。
 	assert.Equal(t, defaultIncomingWebhookPerWebhookRPS, s.IncomingWebhookPerWebhookRPS())
 	assert.Equal(t, defaultIncomingWebhookPerWebhookBurst, s.IncomingWebhookPerWebhookBurst())
 	assert.Equal(t, defaultIncomingWebhookMaxPerGroup, s.IncomingWebhookMaxPerGroup())
+	assert.Equal(t, defaultIncomingWebhookMaxPerCreator, s.IncomingWebhookMaxPerCreator())
 
 	// DB 覆盖（含 float rps）。
 	require.NoError(t, s.db.upsert("incomingwebhook", "per_webhook_rps", "8.5", settingTypeFloat, ""))
 	require.NoError(t, s.db.upsert("incomingwebhook", "per_webhook_burst", "25", settingTypeInt, ""))
 	require.NoError(t, s.db.upsert("incomingwebhook", "max_per_group", "3", settingTypeInt, ""))
+	require.NoError(t, s.db.upsert("incomingwebhook", "max_per_creator", "2", settingTypeInt, ""))
 	require.NoError(t, s.Reload())
 	assert.Equal(t, 8.5, s.IncomingWebhookPerWebhookRPS())
 	assert.Equal(t, 25, s.IncomingWebhookPerWebhookBurst())
 	assert.Equal(t, 3, s.IncomingWebhookMaxPerGroup())
+	assert.Equal(t, 2, s.IncomingWebhookMaxPerCreator())
+}
+
+func TestSystemSettings_IncomingWebhookMaxPerCreator_EnvFallbackWhenDBUnset(t *testing.T) {
+	t.Setenv(envIncomingWebhookMaxPerCreator, "7")
+	s := newTestSystemSettings(t, nil)
+	assert.Equal(t, 7, s.IncomingWebhookMaxPerCreator(), "DB 未配置 → env 生效")
 }
 
 func TestSystemSettings_IncomingWebhookRPS_EnvFallbackWhenDBUnset(t *testing.T) {
@@ -181,6 +191,7 @@ func TestSystemSettings_IncomingWebhook_ReadSideClamp_NoInfra(t *testing.T) {
 	t.Setenv(envIncomingWebhookPerWebhookRPS, "")   // → default 5
 	t.Setenv(envIncomingWebhookPerWebhookBurst, "") // → default 10
 	t.Setenv(envIncomingWebhookMaxPerGroup, "")     // → default 10
+	t.Setenv(envIncomingWebhookMaxPerCreator, "")   // → default 5
 
 	for _, bad := range []string{"NaN", "+Inf", "-Inf", "0", "-1", "-3.5"} {
 		s := &SystemSettings{}
@@ -188,11 +199,13 @@ func TestSystemSettings_IncomingWebhook_ReadSideClamp_NoInfra(t *testing.T) {
 			"incomingwebhook.per_webhook_rps":   bad,
 			"incomingwebhook.per_webhook_burst": bad,
 			"incomingwebhook.max_per_group":     bad,
+			"incomingwebhook.max_per_creator":   bad,
 		}
 		s.snapshot.Store(&snap)
 		assert.Equalf(t, defaultIncomingWebhookPerWebhookRPS, s.IncomingWebhookPerWebhookRPS(), "rps=%q must clamp to default", bad)
 		assert.Equalf(t, defaultIncomingWebhookPerWebhookBurst, s.IncomingWebhookPerWebhookBurst(), "burst=%q must clamp to default", bad)
 		assert.Equalf(t, defaultIncomingWebhookMaxPerGroup, s.IncomingWebhookMaxPerGroup(), "max_per_group=%q must clamp to default", bad)
+		assert.Equalf(t, defaultIncomingWebhookMaxPerCreator, s.IncomingWebhookMaxPerCreator(), "max_per_creator=%q must clamp to default", bad)
 	}
 
 	// env-derived fallback is sanitized too: DM_INCOMINGWEBHOOK_RPS=NaN (which

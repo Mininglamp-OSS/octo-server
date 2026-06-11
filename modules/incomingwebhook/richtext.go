@@ -50,7 +50,7 @@ func maxBlocks() int {
 //
 // 校验失败返回错误，由 push 路径映射：common.ErrRichTextPayloadTooLarge → 413，
 // 其余（含 errTooManyBlocks 与 Validate 的各类结构错误）→ 400 invalid(reason=blocks)。
-func buildRichTextPayload(m *incomingWebhookModel, req *pushPayloadReq) (map[string]interface{}, error) {
+func buildRichTextPayload(m *incomingWebhookModel, req *pushPayloadReq, allowOverride bool) (map[string]interface{}, error) {
 	if len(req.Blocks) > maxBlocks() {
 		return nil, errTooManyBlocks
 	}
@@ -78,7 +78,7 @@ func buildRichTextPayload(m *incomingWebhookModel, req *pushPayloadReq) (map[str
 		}
 	}
 
-	name, avatar := resolveFromIdentity(m, req)
+	name, avatar := resolveFromIdentity(m, req, allowOverride)
 	payload := map[string]interface{}{
 		"type":    int(common.RichText),
 		"content": content,

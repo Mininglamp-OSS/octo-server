@@ -79,7 +79,11 @@ Content-Type: application/json
 - `content`：必填，非空；语义长度上限 4000 rune（`DM_INCOMINGWEBHOOK_MAX_CONTENT_RUNES`）。
 - `text`：`content` 的别名（Slack 等平台习惯用 `text`）。`content` 为空时回退到 `text`，
   降低从既有集成迁移的改造成本；两者都填以 `content` 为准。
-- `username` / `avatar_url`：可选，覆盖该条消息的展示发送者名/头像（不改 webhook 本身配置）。
+- `username` / `avatar_url`：可选，覆盖该条消息的展示发送者名/头像（不改 webhook 本身
+  配置）。**仅当 webhook 创建者当前是群主/管理员时生效**；成员/bot 创建的 webhook 这
+  两个字段被静默忽略（推送仍成功），展示固定为存量名称（必带 `Webhook-` 前缀）+ 默认
+  头像——否则管理面的防冒充限制会被 push 路径整体绕过。判权结果随创建者现任角色，
+  变更生效延迟 ≤ 一个缓存 TTL（默认 3s）。
 
 ### 2. 富文本 / 图文混排（`msg_type` = `"richtext"`）
 

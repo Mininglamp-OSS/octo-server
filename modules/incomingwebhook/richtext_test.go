@@ -36,7 +36,7 @@ func TestBuildRichTextPayload_TextOnly(t *testing.T) {
 	m := sampleWebhook()
 	req := &pushPayloadReq{MsgType: msgTypeRichText, Blocks: []webhookBlock{textBlock("Build #123 passed")}}
 
-	payload, err := buildRichTextPayload(m, req)
+	payload, err := buildRichTextPayload(m, req, true)
 	require.NoError(t, err)
 
 	assert.Equal(t, int(common.RichText), payload["type"])
@@ -62,7 +62,7 @@ func TestBuildRichTextPayload_Image(t *testing.T) {
 		imageBlock("https://example.com/chart.png", 800, 400),
 	}}
 
-	payload, err := buildRichTextPayload(m, req)
+	payload, err := buildRichTextPayload(m, req, true)
 	require.NoError(t, err)
 
 	content, _ := payload["content"].([]map[string]interface{})
@@ -83,7 +83,7 @@ func TestBuildRichTextPayload_MixedOrderPreserved(t *testing.T) {
 		textBlock(" after"),
 	}}
 
-	payload, err := buildRichTextPayload(m, req)
+	payload, err := buildRichTextPayload(m, req, true)
 	require.NoError(t, err)
 
 	content, _ := payload["content"].([]map[string]interface{})
@@ -103,7 +103,7 @@ func TestBuildRichTextPayload_FromOverride(t *testing.T) {
 		Username:  "Override Name",
 		AvatarURL: "https://example.com/override.png",
 	}
-	payload, err := buildRichTextPayload(m, req)
+	payload, err := buildRichTextPayload(m, req, true)
 	require.NoError(t, err)
 	from, _ := payload["from"].(map[string]interface{})
 	assert.Equal(t, "Override Name", from["name"])
@@ -115,7 +115,7 @@ func TestBuildRichTextPayload_FromOverride(t *testing.T) {
 func TestBuildRichTextPayload_SpaceIDNotForgeable(t *testing.T) {
 	m := sampleWebhook()
 	req := &pushPayloadReq{MsgType: msgTypeRichText, Blocks: []webhookBlock{textBlock("hi")}}
-	payload, err := buildRichTextPayload(m, req)
+	payload, err := buildRichTextPayload(m, req, true)
 	require.NoError(t, err)
 	assert.Equal(t, "space_42", payload["space_id"])
 }
@@ -124,7 +124,7 @@ func TestBuildRichTextPayload_SpaceIDNotForgeable(t *testing.T) {
 func TestBuildRichTextPayload_NoTokenLeak(t *testing.T) {
 	m := sampleWebhook()
 	req := &pushPayloadReq{MsgType: msgTypeRichText, Blocks: []webhookBlock{textBlock("hi")}}
-	payload, err := buildRichTextPayload(m, req)
+	payload, err := buildRichTextPayload(m, req, true)
 	require.NoError(t, err)
 	assert.NotContains(t, util.ToJson(payload), "SECRET_SHOULD_NOT_LEAK")
 }
@@ -146,7 +146,7 @@ func TestBuildRichTextPayload_Rejects(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := buildRichTextPayload(m, &pushPayloadReq{MsgType: msgTypeRichText, Blocks: tc.blocks})
+			_, err := buildRichTextPayload(m, &pushPayloadReq{MsgType: msgTypeRichText, Blocks: tc.blocks}, true)
 			assert.Error(t, err, "应拒绝非法 blocks: %s", tc.name)
 		})
 	}
@@ -157,7 +157,7 @@ func TestBuildRichTextPayload_TooManyBlocks(t *testing.T) {
 	t.Setenv(envMaxBlocks, "2")
 	m := sampleWebhook()
 	blocks := []webhookBlock{textBlock("a"), textBlock("b"), textBlock("c")}
-	_, err := buildRichTextPayload(m, &pushPayloadReq{MsgType: msgTypeRichText, Blocks: blocks})
+	_, err := buildRichTextPayload(m, &pushPayloadReq{MsgType: msgTypeRichText, Blocks: blocks}, true)
 	assert.ErrorIs(t, err, errTooManyBlocks)
 }
 
@@ -166,22 +166,31 @@ func TestBuildRichTextPayload_UnknownBlockDropsExtraFields(t *testing.T) {
 	m := sampleWebhook()
 	// type=text 合法块 + 一个未知块（携带看似合法的 url/width/height）：整体必须被拒。
 	blocks := []webhookBlock{textBlock("ok"), {Type: "image_v2", URL: "https://x/y", Width: 1, Height: 1}}
-	_, err := buildRichTextPayload(m, &pushPayloadReq{MsgType: msgTypeRichText, Blocks: blocks})
+	_, err := buildRichTextPayload(m, &pushPayloadReq{MsgType: msgTypeRichText, Blocks: blocks}, true)
 	assert.Error(t, err)
 }
 
-// resolveFromIdentity：覆盖优先、回落 webhook 配置、超长裁剪到字节上限。
+// resolveFromIdentity：管理员（allowOverride=true）覆盖优先、回落 webhook 配置、
+// 超长裁剪到字节上限；成员/bot（allowOverride=false）覆盖一律忽略——否则管理面的
+// Webhook- 前缀与头像锁会被 push 路径整体绕过（PR #340 review，yujiawei P1）。
 func TestResolveFromIdentity(t *testing.T) {
 	m := &incomingWebhookModel{Name: "WH", Avatar: "https://a/x.png"}
 
-	name, avatar := resolveFromIdentity(m, &pushPayloadReq{})
+	name, avatar := resolveFromIdentity(m, &pushPayloadReq{}, true)
 	assert.Equal(t, "WH", name)
 	assert.Equal(t, "https://a/x.png", avatar)
 
-	name, _ = resolveFromIdentity(m, &pushPayloadReq{Username: "Override"})
+	name, _ = resolveFromIdentity(m, &pushPayloadReq{Username: "Override"}, true)
 	assert.Equal(t, "Override", name)
 
 	longName := strings.Repeat("x", maxFromNameBytes+10)
-	name, _ = resolveFromIdentity(m, &pushPayloadReq{Username: longName})
+	name, _ = resolveFromIdentity(m, &pushPayloadReq{Username: longName}, true)
 	assert.LessOrEqual(t, len(name), maxFromNameBytes)
+
+	// 成员/bot 的 webhook：覆盖被忽略，展示固定为存量（已带前缀的）配置。
+	spoof := &pushPayloadReq{Username: "HR 公告", AvatarURL: "https://evil/ceo.png"}
+	lockedM := &incomingWebhookModel{Name: "Webhook-abc123", Avatar: ""}
+	name, avatar = resolveFromIdentity(lockedM, spoof, false)
+	assert.Equal(t, "Webhook-abc123", name)
+	assert.Equal(t, "", avatar)
 }

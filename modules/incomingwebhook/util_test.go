@@ -35,7 +35,7 @@ func TestBuildPayload_DefaultsToWebhookNameAvatar(t *testing.T) {
 		Avatar:    "https://avatar/x.png",
 	}
 	req := &pushPayloadReq{Content: "hi"}
-	p := buildPayload(m, req)
+	p := buildPayload(m, req, true)
 
 	assert.Equal(t, int(common.Text), p["type"])
 	assert.Equal(t, "hi", p["content"])
@@ -52,7 +52,7 @@ func TestBuildPayload_OverrideUsernameAndAvatar(t *testing.T) {
 		Content:  "hi",
 		Username: "GitHub Bot", AvatarURL: "https://gh/a.png",
 	}
-	from := buildPayload(m, req)["from"].(map[string]interface{})
+	from := buildPayload(m, req, true)["from"].(map[string]interface{})
 	assert.Equal(t, "GitHub Bot", from["name"])
 	assert.Equal(t, "https://gh/a.png", from["avatar"])
 }
@@ -77,7 +77,7 @@ func TestBuildPayload_DropsAllExtra(t *testing.T) {
 			"anything": "else",
 		},
 	}
-	p := buildPayload(m, req)
+	p := buildPayload(m, req, true)
 	// 核心字段保持服务端值
 	assert.Equal(t, int(common.Text), p["type"])
 	assert.Equal(t, "real", p["content"])
@@ -101,14 +101,14 @@ func TestBuildPayload_SpaceIDFromModelNotExtra(t *testing.T) {
 			"space_id": "forged_space",
 		},
 	}
-	p := buildPayload(m, req)
+	p := buildPayload(m, req, true)
 	assert.Equal(t, "real_space", p["space_id"], "space_id must come from model, not Extra")
 }
 
 func TestBuildPayload_SpaceIDSetEvenWhenExtraOmitsIt(t *testing.T) {
 	m := &incomingWebhookModel{WebhookID: "iwh_x", Name: "WH", SpaceID: "real_space"}
 	req := &pushPayloadReq{Content: "hi"}
-	p := buildPayload(m, req)
+	p := buildPayload(m, req, true)
 	assert.Equal(t, "real_space", p["space_id"])
 }
 
@@ -125,7 +125,7 @@ func TestBuildPayload_TruncatesLongUsernameAvatar(t *testing.T) {
 		Username:  longName,
 		AvatarURL: longAvatar,
 	}
-	p := buildPayload(m, req)
+	p := buildPayload(m, req, true)
 	from := p["from"].(map[string]interface{})
 	gotName := from["name"].(string)
 	gotAvatar := from["avatar"].(string)
@@ -142,7 +142,7 @@ func TestBuildPayload_TruncateRespectsUTF8(t *testing.T) {
 		Content:  "hi",
 		Username: strings.Repeat("一", 100), // 100 × 3 = 300 字节
 	}
-	p := buildPayload(m, req)
+	p := buildPayload(m, req, true)
 	from := p["from"].(map[string]interface{})
 	gotName := from["name"].(string)
 	assert.LessOrEqualf(t, len(gotName), 64, "byte length capped; got %d", len(gotName))

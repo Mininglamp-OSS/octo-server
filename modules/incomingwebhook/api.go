@@ -96,9 +96,10 @@ type IncomingWebhook struct {
 	webhookCache *ttlCache[*incomingWebhookModel]
 	groupCache   *ttlCache[*group.Model]
 	// memberCache 缓存「创建者仍是群内（内部、正常）成员」的正向结果，key 为
-	// groupNo+"|"+uid。push 路径的创建者在群闸（cachedCreatorIsMember）用它把
-	// 每次推送的 group_member 点读压到 0；只缓存 true（退群后最多 stale 一个 TTL，
-	// 之后懒级联禁用把 webhook 翻为 disabled，彻底关闸）。
+	// groupNo+"|"+uid，条目值为「创建者当前是否群管理员」（供 push 覆盖判权）。
+	// push 路径的创建者在群闸（cachedCreatorMembership）用它把每次推送的
+	// group_member 点读压到 0；【负结果绝不缓存】（安全不变量，退群后最多 stale
+	// 一个 TTL，之后懒级联禁用把 webhook 翻为 disabled，彻底关闸）。
 	memberCache *ttlCache[bool]
 }
 
@@ -154,11 +155,12 @@ func New(ctx *config.Context) *IncomingWebhook {
 // 实例：与 New 同构（同一套 handler / DB / 审计池），但不注册事件监听（disband
 // 级联由模块主实例负责），也不会被挂 push 路由。
 //
-// ⚠️ 缓存一致性契约：facade 与模块主实例【各持一份】push 热路径缓存。bot 面的管理
-// 写操作（update/delete/regenerate）即时失效的是 facade 自己的缓存，主实例的 push
-// 缓存最多 stale 一个 TTL（默认 3s）——与既有「跨实例无主动失效、TTL 兜底」的
-// staleness 契约（cache.go）同级，等同把 bot 面视作一个对等实例；需要更快收敛就
-// 调小 DM_INCOMINGWEBHOOK_CACHE_TTL_MS。
+// ⚠️ 缓存一致性契约：facade 不挂 push 路由，它持有的几份热路径缓存实际从不被读取
+// （仅因复用同一构造器而存在，开销可忽略）。要点只有一个：bot 面的管理写操作
+// （update/delete/regenerate）无法失效【主实例】的 push 缓存，主实例最多 stale 一个
+// TTL（默认 3s）——与既有「跨实例无主动失效、TTL 兜底」的 staleness 契约（cache.go）
+// 同级，等同把 bot 面视作一个对等实例；需要更快收敛就调小
+// DM_INCOMINGWEBHOOK_CACHE_TTL_MS。
 //
 // 刻意【不】按 ctx 记忆化共享单实例：octo-lib 的模块注册器以首个 ctx 调用各模块的
 // 创建闭包，按-ctx 记忆化会把测试进程里的多个 test server 折叠成单实例，串掉
@@ -463,24 +465,31 @@ func (w *IncomingWebhook) cachedRequireActiveGroup(groupNo string) (*group.Model
 	return g, nil
 }
 
-// cachedCreatorIsMember 带缓存判断创建者是否仍是群的内部正常成员，push 热路径专用。
-// 只缓存 true（与 groupCache 同理：负结果不粘住，退群后最多 stale 一个 TTL）。
+// cachedCreatorMembership 带缓存判断创建者是否仍是群的内部正常成员、以及当前是否
+// 群管理员，push 热路径专用。缓存【只存在于 member=true 时】（条目命中即 member=true，
+// 条目值为 isAdmin）——负结果绝不缓存（false-never-cached 是创建者退群闸的安全不变量，
+// 由 TestCreatorMembershipCache_NeverCachesNegative 钉住），退群后最多 stale 一个 TTL。
 // 退群没有跨模块事件可订阅（group.memberremove 事件常量无发布方），所以这里是
 // 该规则的权威闸：闸不过 → push 401 + 懒级联禁用（见 handlePush）。
-func (w *IncomingWebhook) cachedCreatorIsMember(groupNo, uid string) (bool, error) {
+//
+// isAdmin 供 push 的展示身份覆盖判权（resolveFromIdentity）：创建者【当前】是管理员
+// 才允许 username/avatar_url 覆盖。采用"当前角色"而非创建时快照——免迁移列，且管理员
+// 被降级后其 webhook 的覆盖能力随之收回（权限跟随现任角色，语义更严）；角色变更的
+// 生效延迟同样 ≤ 一个 TTL。
+func (w *IncomingWebhook) cachedCreatorMembership(groupNo, uid string) (member, admin bool, err error) {
 	key := groupNo + "|" + uid
-	if ok, hit := w.memberCache.get(key); hit {
-		return ok, nil
+	if isAdmin, hit := w.memberCache.get(key); hit {
+		return true, isAdmin, nil
 	}
 	gen := w.memberCache.loadGen()
-	ok, err := w.db.isActiveInternalMember(groupNo, uid)
+	member, admin, err = w.db.queryMemberRole(groupNo, uid)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
-	if ok {
-		w.memberCache.setIfGen(key, true, gen)
+	if member {
+		w.memberCache.setIfGen(key, admin, gen)
 	}
-	return ok, nil
+	return member, admin, nil
 }
 
 // mgmtActor 是管理端点的操作者身份：用户登录态或 bot token 鉴权后的统一抽象。
@@ -499,16 +508,10 @@ type mgmtActor struct {
 // 的适配中间件把 robot_id 写入同名键，两个挂载面共用本判定。
 func (w *IncomingWebhook) resolveActor(c *wkhttp.Context, groupNo string) (mgmtActor, bool) {
 	uid := c.MustGet("uid").(string)
-	isAdmin, err := w.groupDB.QueryIsGroupManagerOrCreator(groupNo, uid)
-	if err != nil {
-		w.Error("query group manager failed", zap.Error(err))
-		mgmtQueryFailed(c)
-		return mgmtActor{}, false
-	}
-	if isAdmin {
-		return mgmtActor{uid: uid, isAdmin: true}, true
-	}
-	isMember, err := w.db.isActiveInternalMember(groupNo, uid)
+	// 单查询同时拿成员资格 + 管理员身份（queryMemberRole 与
+	// group.QueryIsGroupManagerOrCreator 同一组 fail-safe 过滤），省掉非管理员
+	// 路径的二连击（PR #340 review，Octo-Q F1）。
+	isMember, isAdmin, err := w.db.queryMemberRole(groupNo, uid)
 	if err != nil {
 		w.Error("query group member failed", zap.Error(err))
 		mgmtQueryFailed(c)
@@ -518,7 +521,7 @@ func (w *IncomingWebhook) resolveActor(c *wkhttp.Context, groupNo string) (mgmtA
 		mgmtForbidden(c)
 		return mgmtActor{}, false
 	}
-	return mgmtActor{uid: uid}, true
+	return mgmtActor{uid: uid, isAdmin: isAdmin}, true
 }
 
 // requireOwnership 校验 actor 对 m 的管理权：管理员放行任意，普通成员/bot 仅放行
@@ -539,7 +542,7 @@ func (w *IncomingWebhook) requireOwnership(c *wkhttp.Context, actor mgmtActor, m
 // 创建者退群后 webhook 永久失效（push 路径懒级联禁用兜底），只能删除重建。
 // 失败时已写入响应（409 或 5xx）。
 func (w *IncomingWebhook) requireCreatorInGroup(c *wkhttp.Context, m *incomingWebhookModel) bool {
-	ok, err := w.db.isActiveInternalMember(m.GroupNo, m.CreatorUID)
+	ok, _, err := w.db.queryMemberRole(m.GroupNo, m.CreatorUID)
 	if err != nil {
 		w.Error("query creator membership failed", zap.Error(err))
 		mgmtQueryFailed(c)
@@ -590,9 +593,13 @@ func (w *IncomingWebhook) create(c *wkhttp.Context) {
 	}
 	req.Name = strings.TrimSpace(req.Name)
 	// 成员/bot 自定义名称强制带 "Webhook-" 前缀（先补前缀再做长度校验，上限对
-	// 最终落库值生效）；管理员命名不受限。
+	// 最终落库值生效）；管理员命名不受限。恰好等于裸前缀（无有效内容）视同未填，
+	// 走下方的自动命名（PR #340 review，yujiawei P2#9）。
 	if !actor.isAdmin && req.Name != "" {
 		req.Name = prefixedWebhookName(req.Name)
+		if req.Name == memberWebhookNamePrefix {
+			req.Name = ""
+		}
 	}
 	if len(req.Name) > 64 {
 		mgmtRequestInvalid(c, "name")
@@ -728,9 +735,15 @@ func (w *IncomingWebhook) update(c *wkhttp.Context) {
 			mgmtRequestInvalid(c, "name")
 			return
 		}
-		// 与 create 同口径：成员/bot 改名强制带前缀（幂等），长度校验对最终值生效。
+		// 与 create 同口径：成员/bot 改名强制带前缀（幂等），长度校验对最终值生效；
+		// 裸前缀（无有效内容）按空名拒绝——update 没有自动命名回退（既有名字是已
+		// 确立的身份，静默换成自动名会让调用方意外）。
 		if !actor.isAdmin {
 			name = prefixedWebhookName(name)
+			if name == memberWebhookNamePrefix {
+				mgmtRequestInvalid(c, "name")
+				return
+			}
 		}
 		if len(name) > 64 {
 			mgmtRequestInvalid(c, "name")
@@ -1006,7 +1019,8 @@ func (w *IncomingWebhook) testPush(c *wkhttp.Context) {
 
 	msg := testPushMessage(c.Request.Context())
 	req := &pushPayloadReq{Content: msg}
-	payload := buildPayload(m, req)
+	// 测试推送的请求体不含覆盖字段，覆盖判权传 false 即可（展示固定为 webhook 配置）。
+	payload := buildPayload(m, req, false)
 	ip := clientIP(c.Request)
 	resp, err := w.ctx.SendMessageWithResult(&config.MsgSendReq{
 		Header:      config.MsgHeader{RedDot: 1},
@@ -1121,30 +1135,6 @@ func (w *IncomingWebhook) handlePush(c *wkhttp.Context, ad pushAdapter) {
 		return
 	}
 
-	// 2.6) 创建者必须仍是群的内部正常成员（#member-perms）：成员/bot 可自助创建
-	// webhook 后，"退群即失效"是该权限模型的安全底线（离开的人不能继续向群里发声）。
-	// 退群没有可订阅的跨模块事件，这里即权威闸；闸不过时【懒级联禁用】该 webhook
-	// （status→disabled，幂等、不触碰软删除行），让管理列表如实反映失效状态，后续
-	// push 在 status 闸即被拒。响应仍是统一 401（持有效 token 的调用方，与群闸同
-	// 口径，不计 IP 失败预算、不入审计）。
-	ok, err := w.cachedCreatorIsMember(m.GroupNo, m.CreatorUID)
-	if err != nil {
-		// 服务端故障：拒绝但不禁用（fail closed on push, no destructive write）。
-		w.Error("query creator membership on push failed",
-			zap.String("webhook_id", m.WebhookID), zap.Error(err))
-		pushUnauthorized(c)
-		return
-	}
-	if !ok {
-		if dErr := w.db.disableEnabledByWebhookID(m.WebhookID); dErr != nil {
-			w.Warn("lazy-disable webhook on creator-left failed",
-				zap.String("webhook_id", m.WebhookID), zap.Error(dErr))
-		}
-		w.webhookCache.invalidate(m.WebhookID)
-		pushUnauthorized(c)
-		return
-	}
-
 	// 3) per-webhook 限流；Redis 故障时显式 fail-open，避免 Redis 抖动导致全量推送被拒。
 	allowed, err := w.allowPerWebhook(c.Request.Context(), webhookID)
 	if err != nil {
@@ -1158,6 +1148,39 @@ func (w *IncomingWebhook) handlePush(c *wkhttp.Context, ad pushAdapter) {
 		// 的 Warn 日志，反噬限流「廉价丢弃」的本意。管理员可从 deliveries 里成功记录的稀疏/
 		// 中断间接看出节流（review 跟进）。
 		pushRateLimited(c)
+		return
+	}
+
+	// 3.5) 创建者必须仍是群的内部正常成员（#member-perms）：成员/bot 可自助创建
+	// webhook 后，"退群即失效"是该权限模型的安全底线（离开的人不能继续向群里发声）。
+	// 退群没有可订阅的跨模块事件，这里即权威闸；闸不过时【懒级联禁用】该 webhook
+	// （status→disabled，幂等、不触碰软删除行），让管理列表如实反映失效状态，后续
+	// push 在 status 闸即被拒。响应仍是统一 401（持有效 token 的调用方，与群闸同
+	// 口径，不计 IP 失败预算、不入审计）。
+	//
+	// 刻意放在 per-webhook 限流【之后】：缓存只存正向结果，创建者已退群的 webhook 每次
+	// push 都会回源 group_member 点读 + 对等实例上重复幂等 disable 写，挂在 5rps 限流闸
+	// 之后让这部分 DB 负载继承限流上限（PR #340 review，yujiawei P2#2；闸在 token 鉴权
+	// 之后，语义安全）。
+	//
+	// creatorIsAdmin 顺带取自同一查询：决定 push 请求的 username/avatar_url 展示覆盖
+	// 是否生效（见 resolveFromIdentity——创建者当前是管理员才允许覆盖，堵住成员经
+	// push 路径绕过管理面前缀/头像限制的冒充旁路，PR #340 review，yujiawei P1）。
+	creatorIsMember, creatorIsAdmin, err := w.cachedCreatorMembership(m.GroupNo, m.CreatorUID)
+	if err != nil {
+		// 服务端故障：拒绝但不禁用（fail closed on push, no destructive write）。
+		w.Error("query creator membership on push failed",
+			zap.String("webhook_id", m.WebhookID), zap.Error(err))
+		pushUnauthorized(c)
+		return
+	}
+	if !creatorIsMember {
+		if dErr := w.db.disableEnabledByWebhookID(m.WebhookID); dErr != nil {
+			w.Warn("lazy-disable webhook on creator-left failed",
+				zap.String("webhook_id", m.WebhookID), zap.Error(dErr))
+		}
+		w.webhookCache.invalidate(m.WebhookID)
+		pushUnauthorized(c)
 		return
 	}
 
@@ -1216,12 +1239,12 @@ func (w *IncomingWebhook) handlePush(c *wkhttp.Context, ad pushAdapter) {
 			pushPayloadTooLarge(c)
 			return
 		}
-		payload = buildPayload(m, req)
+		payload = buildPayload(m, req, creatorIsAdmin)
 	case msgTypeRichText:
 		// 注意：richtext 路径【不】套用纯文本的 maxContentRunes(4000) 语义上限——富文本
 		// 由块结构 + 1MB 序列化上限约束，默认 8KB body cap 下不可能逾越。这是与文本路径的
 		// 有意不对称（若运维上调 body cap，富文本仍受 1MB 兜底，不会无界）。
-		p, err := buildRichTextPayload(m, req)
+		p, err := buildRichTextPayload(m, req, creatorIsAdmin)
 		if err != nil {
 			// 仅 >1MB 映射 413（与 body/content 超限同语义）；其余结构性非法（空 content /
 			// 空 text 块 / 非 http(s) 图片 url / 缺图片宽高 / 未知块类型 / 超块数上限）
@@ -1306,8 +1329,8 @@ func truncateUTF8(s string, max int) string {
 //     显式列入允许字段（且明确该字段无访问控制语义），不要再走透传。
 //   - req.Username / req.AvatarURL 服务端裁剪到 create 侧同样的字节上限。push 路径
 //     原本只受 8KB body cap 约束，调用方可塞 KB 级字符串污染所有客户端 from.* 渲染。
-func buildPayload(m *incomingWebhookModel, req *pushPayloadReq) map[string]interface{} {
-	name, avatar := resolveFromIdentity(m, req)
+func buildPayload(m *incomingWebhookModel, req *pushPayloadReq, allowOverride bool) map[string]interface{} {
+	name, avatar := resolveFromIdentity(m, req, allowOverride)
 	return map[string]interface{}{
 		"type":    int(common.Text),
 		"content": req.Content,
@@ -1323,16 +1346,28 @@ func buildPayload(m *incomingWebhookModel, req *pushPayloadReq) map[string]inter
 	}
 }
 
-// resolveFromIdentity 解析 webhook 消息的展示发送者名/头像：调用方在 push 请求里
-// 覆盖（Username/AvatarURL）优先，否则回落到 webhook 自身配置；两者都裁剪到与
-// create 侧一致的字节上限，防止 push 路径成为绕过列长度约束的旁路。文本与富文本
-// 两条路径共用此函数，保证 from.* 渲染口径一致。
-func resolveFromIdentity(m *incomingWebhookModel, req *pushPayloadReq) (name, avatar string) {
-	name = req.Username
+// resolveFromIdentity 解析 webhook 消息的展示发送者名/头像。
+//
+// allowOverride 是 push 请求 Username/AvatarURL 覆盖的判权结果（创建者【当前】是
+// 群管理员，取自 cachedCreatorMembership）：
+//   - true（管理员创建/持有）：覆盖优先，否则回落到 webhook 自身配置——历史的
+//     Slack/GitHub 兼容行为，管理员可信；
+//   - false（成员/bot 的 webhook）：覆盖一律【忽略】，固定用存量 Name/Avatar。
+//     没有这道闸，管理面的 Webhook- 前缀与头像锁就会被 push 路径整体绕过——成员拿着
+//     自己 webhook 的 token 即可以"HR 公告"+任意头像发声（PR #340 review，yujiawei
+//     P1：don't ship a half-control）。存量 Name 必然已带前缀（create/update 强制），
+//     无需在此重复加工。
+//
+// 两者都裁剪到与 create 侧一致的字节上限，防止 push 路径成为绕过列长度约束的旁路。
+// 文本与富文本两条路径共用此函数，保证 from.* 渲染口径一致。
+func resolveFromIdentity(m *incomingWebhookModel, req *pushPayloadReq, allowOverride bool) (name, avatar string) {
+	if allowOverride {
+		name = req.Username
+		avatar = req.AvatarURL
+	}
 	if name == "" {
 		name = m.Name
 	}
-	avatar = req.AvatarURL
 	if avatar == "" {
 		avatar = m.Avatar
 	}
