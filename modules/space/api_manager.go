@@ -747,6 +747,12 @@ func (m *Manager) updateMemberRole(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrSpaceOwnerConstraint, nil, nil)
 		return
 	}
+	// 幂等：目标已是该角色直接成功，与用户侧守卫对称（PR #339 P2），
+	// 同时避免「转让给现任 owner」空转一次降级/提升事务。
+	if target.Role == req.Role {
+		c.ResponseOK()
+		return
+	}
 	if req.Role == 2 {
 		if err = m.managerDB.transferOwnerAdmin(spaceId, targetUID); err != nil {
 			if errors.Is(err, ErrTransferTargetMissing) {

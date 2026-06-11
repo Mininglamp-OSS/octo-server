@@ -162,7 +162,7 @@ func TestTransferOwnerAdminTargetRemoved(t *testing.T) {
 	memberRoleFixture(t, f, spaceId, 2, 1)
 
 	// 目标被移除（status=0），等价于 pre-check 与事务之间被并发踢出
-	err = f.db.removeMember(spaceId, "m-target")
+	err = f.db.removeMemberLocked(spaceId, "m-target", 2)
 	assert.NoError(t, err)
 
 	err = f.db.transferOwnerAdmin(spaceId, "m-target")
@@ -173,6 +173,103 @@ func TestTransferOwnerAdminTargetRemoved(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotNil(t, owner)
 	assert.Equal(t, 2, owner.Role)
+}
+
+// TestRemoveMemberLockedGuards 移除原语的锁内角色守卫（PR #339 review）：
+// owner 拒绝（ErrCannotRemoveOwner）、同级及更高拒绝（ErrRemoveHierarchy）、
+// 更低角色移除成功、目标不存在幂等返回 nil。
+// 模拟「pre-check 读到低角色后目标被并发提升」的最终态——锁内重读必须兜住。
+func TestRemoveMemberLockedGuards(t *testing.T) {
+	_, f, err := setup(t)
+	assert.NoError(t, err)
+	spaceId := "remove-locked"
+	memberRoleFixture(t, f, spaceId, 2, 1) // testutil.UID=owner, m-target=admin
+
+	// owner 不可移除，无论调用方上限是多少
+	err = f.db.removeMemberLocked(spaceId, testutil.UID, 2)
+	assert.ErrorIs(t, err, ErrCannotRemoveOwner)
+	owner, _ := f.db.queryMember(spaceId, testutil.UID)
+	assert.Equal(t, 2, owner.Role)
+
+	// 操作者 admin(1) 移除 admin(1)：同级拒绝
+	err = f.db.removeMemberLocked(spaceId, "m-target", 1)
+	assert.ErrorIs(t, err, ErrRemoveHierarchy)
+	target, _ := f.db.queryMember(spaceId, "m-target")
+	assert.NotNil(t, target)
+
+	// 操作者 owner(2) 移除 admin(1)：成功
+	err = f.db.removeMemberLocked(spaceId, "m-target", 2)
+	assert.NoError(t, err)
+	target, _ = f.db.queryMember(spaceId, "m-target")
+	assert.Nil(t, target)
+
+	// 目标已不存在：幂等 nil
+	err = f.db.removeMemberLocked(spaceId, "m-target", 2)
+	assert.NoError(t, err)
+}
+
+// TestLeaveSpace 退出空间：普通成员/管理员可退出；owner 必须先转让。
+func TestLeaveSpace(t *testing.T) {
+	_, f, err := setup(t)
+	assert.NoError(t, err)
+	spaceId := "leave-ok"
+	memberRoleFixture(t, f, spaceId, 1, 2) // testutil.UID=admin，m-target=owner 保证空间有主
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/space/"+spaceId+"/leave", nil)
+	req.Header.Set("token", testutil.Token)
+	testSrv.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	mem, err := f.db.queryMember(spaceId, testutil.UID)
+	assert.NoError(t, err)
+	assert.Nil(t, mem)
+}
+
+// TestLeaveSpaceOwnerRejected owner 退出被 owner_constraint 拒绝。
+func TestLeaveSpaceOwnerRejected(t *testing.T) {
+	_, f, err := setup(t)
+	assert.NoError(t, err)
+	spaceId := "leave-owner"
+	memberRoleFixture(t, f, spaceId, 2, 0)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/space/"+spaceId+"/leave", nil)
+	req.Header.Set("token", testutil.Token)
+	testSrv.GetRoute().ServeHTTP(w, req)
+	assert.NotEqual(t, http.StatusOK, w.Code)
+	assertSpaceErrorCode(t, w, "err.server.space.owner_constraint")
+	owner, _ := f.db.queryMember(spaceId, testutil.UID)
+	assert.Equal(t, 2, owner.Role)
+}
+
+// TestRemoveMembersSkipsOwnerAndPeers 管理员批量移除：owner 与同级管理员
+// 静默跳过（既有语义），更低角色移除成功。
+func TestRemoveMembersSkipsOwnerAndPeers(t *testing.T) {
+	_, f, err := setup(t)
+	assert.NoError(t, err)
+	spaceId := "remove-batch"
+	memberRoleFixture(t, f, spaceId, 1, 2) // testutil.UID=admin 操作者，m-target=owner
+	err = f.db.insertMemberNoTx(&MemberModel{SpaceId: spaceId, UID: "m-peer", Role: 1, Status: 1})
+	assert.NoError(t, err)
+	err = f.db.insertMemberNoTx(&MemberModel{SpaceId: spaceId, UID: "m-low", Role: 0, Status: 1})
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/space/"+spaceId+"/members/remove",
+		bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
+			"uids": []string{"m-target", "m-peer", "m-low"},
+		}))))
+	req.Header.Set("token", testutil.Token)
+	testSrv.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	ownerMem, _ := f.db.queryMember(spaceId, "m-target")
+	assert.NotNil(t, ownerMem, "owner must be skipped")
+	assert.Equal(t, 2, ownerMem.Role)
+	peer, _ := f.db.queryMember(spaceId, "m-peer")
+	assert.NotNil(t, peer, "peer admin must be skipped")
+	low, _ := f.db.queryMember(spaceId, "m-low")
+	assert.Nil(t, low, "lower role must be removed")
 }
 
 // TestUpdateMemberRoleTargetNotFound 目标非空间成员时返回 member_not_found。

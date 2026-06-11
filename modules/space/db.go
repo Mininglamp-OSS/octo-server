@@ -161,11 +161,10 @@ func (d *DB) queryMembers(spaceId string, loginUID string, page uint64, limit ui
 	return models, err
 }
 
-func (d *DB) removeMember(spaceId string, uid string) error {
-	_, err := d.session.Update("space_member").Set("status", 0).
-		Set("updated_at", time.Now()).
-		Where("space_id=? and uid=?", spaceId, uid).Exec()
-	return err
+// removeMemberLocked 锁内重读角色后移除成员，防并发转让产生无主空间，
+// 见 db_manager.go removeMemberLocked。
+func (d *DB) removeMemberLocked(spaceId, uid string, rejectRoleAtOrAbove int) error {
+	return removeMemberLocked(d.session, spaceId, uid, rejectRoleAtOrAbove)
 }
 
 func (d *DB) reactivateMember(spaceId string, uid string, role int) error {

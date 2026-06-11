@@ -753,21 +753,14 @@ func (s *Space) removeMembers(c *wkhttp.Context) {
 	}
 
 	for _, uid := range req.UIDs {
-		target, err := s.db.queryMember(spaceId, uid)
-		if err != nil {
-			httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
-			return
-		}
-		if target == nil {
-			continue
-		}
-		if target.Role == 2 {
-			continue // 不能移除owner
-		}
-		if member.Role <= target.Role {
-			continue // 不能移除同级或更高角色
-		}
-		if err = s.db.removeMember(spaceId, uid); err != nil {
+		// 角色校验在锁内完成（removeMemberLocked 事务内重读 role）：
+		// owner 与同级及更高角色静默跳过，与既有语义一致；锁内重读
+		// 防止 pre-check 后目标被并发转让升为 owner 仍被移除（PR #339 review）。
+		if err = s.db.removeMemberLocked(spaceId, uid, member.Role); err != nil {
+			if errors.Is(err, ErrCannotRemoveOwner) || errors.Is(err, ErrRemoveHierarchy) {
+				continue
+			}
+			s.Error("移除空间成员失败", zap.Error(err), zap.String("spaceId", spaceId), zap.String("uid", uid))
 			httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 			return
 		}
@@ -802,8 +795,14 @@ func (s *Space) leaveSpace(c *wkhttp.Context) {
 		return
 	}
 
-	err = s.db.removeMember(spaceId, loginUID)
+	// 锁内重读角色：pre-check 与移除之间可能被并发转让升为 owner（PR #339 review）
+	err = s.db.removeMemberLocked(spaceId, loginUID, 2)
 	if err != nil {
+		if errors.Is(err, ErrCannotRemoveOwner) {
+			httperr.ResponseErrorL(c, errcode.ErrSpaceOwnerConstraint, nil, nil)
+			return
+		}
+		s.Error("退出空间失败", zap.Error(err), zap.String("spaceId", spaceId), zap.String("uid", loginUID))
 		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
@@ -885,6 +884,7 @@ func (s *Space) updateMemberRole(c *wkhttp.Context) {
 	} else {
 		err = s.db.updateMemberRole(spaceId, targetUID, req.Role)
 		if err != nil {
+			s.Error("修改成员角色失败", zap.Error(err), zap.String("spaceId", spaceId), zap.String("targetUID", targetUID), zap.Int("role", req.Role))
 			httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 			return
 		}
