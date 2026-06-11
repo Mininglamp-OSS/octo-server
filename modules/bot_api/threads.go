@@ -34,7 +34,12 @@ func (ba *BotAPI) validateBotGroupAccess(c *wkhttp.Context) (robotID, groupNo st
 		return "", "", false
 	}
 
-	isMember, err := ba.groupService.ExistMember(groupNo, robotID)
+	// issue #352（PR #345 mandatory follow-up）：所有 bot 子区端点共享本门禁，
+	// 必须用 ExistMemberActive（is_deleted=0 AND status=Normal，排除被拉黑成员）。
+	// permissive ExistMember 会让被拉黑的 bot 继续通过 bot API 读写子区，
+	// 与 #343/#345 落地的「子区门禁 = 活跃父群成员」语义矛盾。
+	// GROUP 级端点（groups.go）保持 permissive ExistMember，by design 不动。
+	isMember, err := ba.groupService.ExistMemberActive(groupNo, robotID)
 	if err != nil {
 		ba.Error("检查群成员失败", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
