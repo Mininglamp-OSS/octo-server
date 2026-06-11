@@ -413,13 +413,20 @@ func (d *managerDB) removeMembersForce(spaceId string, uids []string) error {
 // ErrTransferTargetMissing 目标成员不存在或已被移除，不能成为新 owner
 var ErrTransferTargetMissing = errors.New("transfer target not found or already removed")
 
-// transferOwnerAdmin 将 newOwner 置为 owner(2)，将当前所有 owner 降为 admin(1)。
+// transferOwnerAdmin 管理端转让所有权，见 transferOwnerAdminLocked。
+func (d *managerDB) transferOwnerAdmin(spaceId, newOwnerUID string) error {
+	return transferOwnerAdminLocked(d.session, spaceId, newOwnerUID)
+}
+
+// transferOwnerAdminLocked 将 newOwner 置为 owner(2)，将当前所有 owner 降为 admin(1)。
+// 管理端与用户侧转让共用此原语（PR #339 review：用户侧内联事务缺行锁，
+// 目标被并发移除后 UPDATE 影响 0 行仍降级 owner，产生无主空间）。
 //
 // 事务开始时先用 SELECT ... FOR UPDATE 锁定目标行并确认其 status=1，
 // 避免「先降老 owner → 目标被并发 remove → 后续 UPDATE 影响 0 行」导致空间无主。
 // 若目标不存在 / 已被移除，整个事务回滚并返回 ErrTransferTargetMissing。
-func (d *managerDB) transferOwnerAdmin(spaceId, newOwnerUID string) error {
-	tx, err := d.session.Begin()
+func transferOwnerAdminLocked(sess *dbr.Session, spaceId, newOwnerUID string) error {
+	tx, err := sess.Begin()
 	if err != nil {
 		return err
 	}

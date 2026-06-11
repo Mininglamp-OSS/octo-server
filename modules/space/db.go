@@ -183,11 +183,10 @@ func (d *DB) updateMemberRole(spaceId string, uid string, role int) error {
 	return err
 }
 
-func (d *DB) updateMemberRoleTx(tx *dbr.Tx, spaceId string, uid string, role int) error {
-	_, err := tx.Update("space_member").Set("role", role).
-		Set("updated_at", time.Now()).
-		Where("space_id=? and uid=? and status=1", spaceId, uid).Exec()
-	return err
+// transferOwnerAdmin 用户侧转让所有权，复用管理端的行锁原语，
+// 防止目标被并发移除后仍把当前 owner 降级产生无主空间。
+func (d *DB) transferOwnerAdmin(spaceId, newOwnerUID string) error {
+	return transferOwnerAdminLocked(d.session, spaceId, newOwnerUID)
 }
 
 // queryCoMemberUIDs 查询与指定用户同在至少一个空间的所有用户UID

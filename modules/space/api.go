@@ -869,26 +869,16 @@ func (s *Space) updateMemberRole(c *wkhttp.Context) {
 		return
 	}
 
-	// 如果要转让owner，使用事务保证原子性
+	// 转让 owner：复用带 SELECT ... FOR UPDATE 行锁的原语（与管理端一致）。
+	// 不在 handler 层内联事务——目标行不加锁的话，pre-check 通过后目标被并发
+	// 移除，提升 UPDATE 影响 0 行而降级仍执行，会产生无主空间（PR #339 review）。
 	if req.Role == 2 {
-		tx, txErr := s.ctx.DB().Begin()
-		if txErr != nil {
-			httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
-			return
-		}
-		defer tx.RollbackUnlessCommitted()
-
-		// 先提升目标为owner
-		if err = s.db.updateMemberRoleTx(tx, spaceId, targetUID, 2); err != nil {
-			httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
-			return
-		}
-		// 再把当前owner降为admin
-		if err = s.db.updateMemberRoleTx(tx, spaceId, loginUID, 1); err != nil {
-			httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
-			return
-		}
-		if err = tx.Commit(); err != nil {
+		if err = s.db.transferOwnerAdmin(spaceId, targetUID); err != nil {
+			if errors.Is(err, ErrTransferTargetMissing) {
+				httperr.ResponseErrorL(c, errcode.ErrSpaceMemberNotFound, nil, nil)
+				return
+			}
+			s.Error("转让空间所有权失败", zap.Error(err), zap.String("spaceId", spaceId), zap.String("targetUID", targetUID))
 			httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 			return
 		}

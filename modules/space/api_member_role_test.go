@@ -151,6 +151,30 @@ func TestUpdateMemberRoleIdempotent(t *testing.T) {
 	assert.Equal(t, 1, mem.Role)
 }
 
+// TestTransferOwnerAdminTargetRemoved 防无主空间（并发路径回归，PR #339 review）：
+// 转让原语在事务内用 FOR UPDATE 确认目标 status=1；目标已被移除时必须整体
+// 回滚返回 ErrTransferTargetMissing，owner 不得被降级。
+// 模拟的是「handler pre-check 通过后、事务提交前目标被并发移除」的最终态。
+func TestTransferOwnerAdminTargetRemoved(t *testing.T) {
+	_, f, err := setup(t)
+	assert.NoError(t, err)
+	spaceId := "role-transfer-race"
+	memberRoleFixture(t, f, spaceId, 2, 1)
+
+	// 目标被移除（status=0），等价于 pre-check 与事务之间被并发踢出
+	err = f.db.removeMember(spaceId, "m-target")
+	assert.NoError(t, err)
+
+	err = f.db.transferOwnerAdmin(spaceId, "m-target")
+	assert.ErrorIs(t, err, ErrTransferTargetMissing)
+
+	// owner 必须保持 role=2，不能出现「目标没升、自己已降」的无主状态
+	owner, err := f.db.queryMember(spaceId, testutil.UID)
+	assert.NoError(t, err)
+	assert.NotNil(t, owner)
+	assert.Equal(t, 2, owner.Role)
+}
+
 // TestUpdateMemberRoleTargetNotFound 目标非空间成员时返回 member_not_found。
 func TestUpdateMemberRoleTargetNotFound(t *testing.T) {
 	_, f, err := setup(t)
