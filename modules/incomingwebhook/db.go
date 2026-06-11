@@ -76,6 +76,9 @@ func (d *incomingWebhookDB) insertWithQuota(m *incomingWebhookModel, max, maxPer
 	if maxPerCreator > 0 {
 		var creatorCount int
 		if _, err = tx.SelectBySql(
+			// 与群级配额同口径：只排除软删除（statusDeleted）。【禁用】的 webhook 刻意
+			// 仍占个人配额——否则成员可用 disable→create→disable→create 循环无限囤积
+			// 可随时启用的 webhook，配额就形同虚设。释放名额只能走删除。
 			"SELECT count(*) FROM incoming_webhook WHERE group_no=? AND creator_uid=? AND status != ?",
 			m.GroupNo, m.CreatorUID, statusDeleted,
 		).Load(&creatorCount); err != nil {

@@ -334,7 +334,7 @@ other = "The target user does not exist or has been deactivated."
 other = "You do not have permission to view this."
 
 ["err.server.incomingwebhook.mgmt_creator_left"]
-other = "The webhook's creator has left the group; it can no longer be enabled. Delete it and create a new one."
+other = "The webhook's creator has left the group, so it cannot be enabled. It can be re-enabled after the creator rejoins, or deleted and recreated by someone in the group."
 
 ["err.server.incomingwebhook.mgmt_creator_quota_exceeded"]
 other = "You can create at most {{.max}} webhooks in this group."

@@ -690,7 +690,7 @@ other = "每个群最多 {{.max}} 个 webhook。"
 other = "你在该群最多可创建 {{.max}} 个 webhook。"
 
 ["err.server.incomingwebhook.mgmt_creator_left"]
-other = "该 webhook 的创建者已退出群聊，无法再启用；请删除后重新创建。"
+other = "该 webhook 的创建者已退出群聊，暂时无法启用；待创建者重新入群后可再启用，或删除后由群内成员重新创建。"
 
 ["err.server.incomingwebhook.mgmt_query_failed"]
 other = "查询 webhook 信息失败。"

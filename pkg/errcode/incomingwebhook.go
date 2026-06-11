@@ -146,11 +146,14 @@ var (
 	// an (internal, active) member of the group, so operations that would make
 	// or keep it pushable (enable / regenerate / test push) are refused. The
 	// webhook can still be deleted; pushes are lazily disabled by the push
-	// path's creator-membership gate.
+	// path's creator-membership gate. Recovery: the creator rejoins the group,
+	// after which the creator or an admin can re-enable it — the message must
+	// state that path and offer deletion only as the cleanup option (PR #340
+	// review, Jerry-Xin: do not tell users delete-and-recreate is the only way).
 	ErrIncomingWebhookCreatorLeft = register(codes.Code{
 		ID:             "err.server.incomingwebhook.mgmt_creator_left",
 		HTTPStatus:     http.StatusConflict,
-		DefaultMessage: "The webhook's creator has left the group; it can no longer be enabled. Delete it and create a new one.",
+		DefaultMessage: "The webhook's creator has left the group, so it cannot be enabled. It can be re-enabled after the creator rejoins, or deleted and recreated by someone in the group.",
 	})
 
 	// ErrIncomingWebhookQueryFailed (500, Internal) — a read (group / webhook /
