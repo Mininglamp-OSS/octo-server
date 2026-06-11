@@ -322,8 +322,8 @@ func (t *Thread) listThreads(c *wkhttp.Context) {
 		return
 	}
 
-	// 验证是群成员
-	isMember, err := t.groupService.ExistMember(groupNo, loginUID)
+	// 验证是活跃父群成员（排除黑名单，被拉黑用户不应越权读子区内容）
+	isMember, err := t.groupService.ExistMemberActive(groupNo, loginUID)
 	if err != nil {
 		t.Error("检查群成员失败", zap.Error(err))
 		respondThreadServiceError(c, err)
@@ -402,8 +402,8 @@ func (t *Thread) getThread(c *wkhttp.Context) {
 		return
 	}
 
-	// 验证是群成员
-	isMember, err := t.groupService.ExistMember(groupNo, loginUID)
+	// 验证是活跃父群成员（排除黑名单，被拉黑用户不应越权读子区内容）
+	isMember, err := t.groupService.ExistMemberActive(groupNo, loginUID)
 	if err != nil {
 		t.Error("检查群成员失败", zap.Error(err))
 		respondThreadServiceError(c, err)
@@ -492,8 +492,8 @@ func (t *Thread) listMembers(c *wkhttp.Context) {
 		return
 	}
 
-	// 验证是群成员
-	isMember, err := t.groupService.ExistMember(groupNo, loginUID)
+	// 验证是活跃父群成员（排除黑名单，被拉黑用户不应越权读子区内容）
+	isMember, err := t.groupService.ExistMemberActive(groupNo, loginUID)
 	if err != nil {
 		t.Error("检查群成员失败", zap.Error(err))
 		respondThreadServiceError(c, err)
@@ -616,8 +616,8 @@ func (t *Thread) threadMdGet(c *wkhttp.Context) {
 		return
 	}
 
-	// 权限：必须是父群成员
-	isMember, err := t.groupService.ExistMember(groupNo, loginUID)
+	// 权限：必须是活跃父群成员（排除黑名单，threadMdGet 返回 GROUP.md 正文，防越权读）
+	isMember, err := t.groupService.ExistMemberActive(groupNo, loginUID)
 	if err != nil {
 		t.Error("check group member failed", zap.Error(err))
 		respondThreadError(c, errcode.ErrThreadStoreFailed, nil)
@@ -914,8 +914,8 @@ func (t *Thread) getThreadSimple(c *wkhttp.Context) {
 		return
 	}
 
-	// 验证是父群成员
-	isMember, err := t.groupService.ExistMember(thread.GroupNo, loginUID)
+	// 验证是活跃父群成员（排除黑名单）
+	isMember, err := t.groupService.ExistMemberActive(thread.GroupNo, loginUID)
 	if err != nil {
 		respondThreadServiceError(c, err)
 		return

@@ -165,7 +165,10 @@ func (m *Message) channelFiles(c *wkhttp.Context) {
 	// 群聊/话题校验成员身份
 	if req.ChannelType == common.ChannelTypeGroup.Uint8() || req.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
 		groupNo := req.ChannelID
-		if req.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
+		// isTopic 为真时走子区父群门禁，需排除黑名单(ExistMemberActive)；
+		// GROUP 分支保留 ExistMember 既有语义，避免误杀正常群成员。
+		isTopic := req.ChannelType == common.ChannelTypeCommunityTopic.Uint8()
+		if isTopic {
 			parentGroupNo, _, perr := thread.ParseChannelID(req.ChannelID)
 			if perr != nil {
 				respondMessageRequestInvalid(c, "channel_id")
@@ -173,7 +176,13 @@ func (m *Message) channelFiles(c *wkhttp.Context) {
 			}
 			groupNo = parentGroupNo
 		}
-		isMember, err := m.groupService.ExistMember(groupNo, loginUID)
+		var isMember bool
+		var err error
+		if isTopic {
+			isMember, err = m.groupService.ExistMemberActive(groupNo, loginUID)
+		} else {
+			isMember, err = m.groupService.ExistMember(groupNo, loginUID)
+		}
 		if err != nil {
 			m.Error("查询群成员关系错误", zap.Error(err))
 			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)

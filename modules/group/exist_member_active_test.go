@@ -106,3 +106,52 @@ func TestExistMembersActive_ExcludesBlacklist(t *testing.T) {
 	assert.ElementsMatch(t, []string{gNormal}, active,
 		"existMembersActive 必须排除黑名单 / 已删除 / 非成员群（子区批量越权读门禁）")
 }
+
+// TestExistMemberActive 验证子区(CommunityTopic)读/写门禁所依赖的活跃成员判定：
+// status=Normal AND is_deleted=0 才放行；Blacklist / Quit / 已删除一律 fail-closed。
+// 这是 YUJ-4219 把 thread 模块 + channel_files + mutualDelete 子区分支统一切到
+// ExistMemberActive 后，所有这些门禁共享的授权原语，故在 DB 层兜底双向覆盖。
+func TestExistMemberActive(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	assert.NoError(t, testutil.CleanAllTables(ctx))
+
+	db := NewDB(ctx)
+	groupNo := "g-yuj4219-active"
+
+	// 正常成员
+	assert.NoError(t, db.InsertMember(&MemberModel{
+		GroupNo: groupNo,
+		UID:     "normal",
+		Role:    MemberRoleCommon,
+		Status:  int(common.GroupMemberStatusNormal),
+		Version: 1,
+	}))
+	// 被拉黑成员（is_deleted=0，仅 status=Blacklist）—— 越权读的核心攻击面
+	assert.NoError(t, db.InsertMember(&MemberModel{
+		GroupNo: groupNo,
+		UID:     "blacklisted",
+		Role:    MemberRoleCommon,
+		Status:  int(common.GroupMemberStatusBlacklist),
+		Version: 2,
+	}))
+
+	// normal → 放行
+	ok, err := db.ExistMemberActive("normal", groupNo)
+	assert.NoError(t, err)
+	assert.True(t, ok, "正常成员应放行")
+
+	// blacklist → 拒
+	ok, err = db.ExistMemberActive("blacklisted", groupNo)
+	assert.NoError(t, err)
+	assert.False(t, ok, "被拉黑成员(is_deleted=0,status=Blacklist)必须拒绝越权读")
+
+	// 不存在的用户 → 拒
+	ok, err = db.ExistMemberActive("ghost", groupNo)
+	assert.NoError(t, err)
+	assert.False(t, ok, "非成员应拒绝")
+
+	// 对照：旧的 permissive ExistMember 对被拉黑成员仍会放行，证明二者语义差异
+	permissive, err := db.ExistMember("blacklisted", groupNo)
+	assert.NoError(t, err)
+	assert.True(t, permissive, "ExistMember(permissive) 对被拉黑成员仍 true —— 正是必须改用 Active 的原因")
+}

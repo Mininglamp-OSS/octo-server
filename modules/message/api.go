@@ -1881,7 +1881,7 @@ func (m *Message) mutualDelete(c *wkhttp.Context) {
 			httperr.ResponseErrorL(c, errcode.ErrMessageDeleteForbidden, nil, nil)
 			return
 		}
-		isParentGroupMember, err = m.groupService.ExistMember(parentGroupNo, loginUID)
+		isParentGroupMember, err = m.groupService.ExistMemberActive(parentGroupNo, loginUID)
 		if err != nil {
 			m.Error("查询父群成员关系失败", zap.Error(err))
 			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)

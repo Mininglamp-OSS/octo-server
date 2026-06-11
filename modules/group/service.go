@@ -80,8 +80,9 @@ type IService interface {
 	GetMemberTotalAndOnlineCount(groupNo string) (int, int, error)
 	// 是否存在群成员
 	ExistMember(groupNo string, uid string) (bool, error)
-	// ExistMemberActive 是否存在「活跃」群成员（is_deleted=0 AND status=Normal），
-	// 排除被拉黑成员，供绕过 IM 直查本地分表的读/发门禁使用
+	// ExistMemberActive 是否存在「活跃」群成员（is_deleted=0 AND status=Normal，
+	// 白名单语义、fail-closed），排除被拉黑成员。供绕过 IM 直查本地分表的读/发门禁，
+	// 以及子区(CommunityTopic)解析父群后的读/写门禁使用，防止被拉黑用户越权读子区内容。
 	ExistMemberActive(groupNo string, uid string) (bool, error)
 	// 成员是否在某群里存在 返回对应在群里的群编号
 	ExistMembers(groupNos []string, uid string) ([]string, error)
