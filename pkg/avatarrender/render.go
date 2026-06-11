@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"image/draw"
 	"image/png"
+	"math"
 	"sync"
 
 	xdraw "golang.org/x/image/draw"
@@ -65,8 +67,22 @@ const (
 	// supersample 是超采样倍数：先在 size*ss 上以硬边渲染，再高质量缩小，
 	// 一次性得到圆形与文字的抗锯齿效果。
 	supersample = 4
-	// fontSizeRatio 取自设计稿：32px 容器内字号 10px。
-	fontSizeRatio = 10.0 / 32.0
+
+	// 动态字号：在参考字号下测量文字墨迹包围盒，再线性缩放进目标墨迹盒。
+	// 设计稿只标注了 CJK 双字场景（32px 容器内 10px 字号，墨迹宽约占 60%）；
+	// 拉丁字母墨迹远窄于 CJK，同字号下视觉明显偏小（"er" 墨迹仅占 ~30%），
+	// 因此按实际墨迹自适应，而不是所有文字一个固定 em 比例。
+	//
+	//  - maxInkWidthRatio：墨迹宽度上限。两个 CJK 字符（墨迹 ~1.9em）在此
+	//    约束下解出 em ≈ 0.34·size，与设计稿的 10/32 ≈ 0.31 基本一致；
+	//  - maxInkHeightRatio：墨迹高度上限，约束高瘦文字；
+	//  - maxFontEmRatio：字号硬上限。窄墨迹文字（单字母、"er"）按宽度放大
+	//    会失控，用它封顶，同时也保证墨迹盒四角不出圆。
+	maxInkWidthRatio  = 0.64
+	maxInkHeightRatio = 0.42
+	maxFontEmRatio    = 0.46
+	// baseFontEmRatio 是墨迹测量失败时的兜底字号（设计稿 32px 容器内 10px）。
+	baseFontEmRatio = 10.0 / 32.0
 )
 
 // Options 描述一次头像渲染。
@@ -79,7 +95,9 @@ type Options struct {
 	Size int
 }
 
-// Render 渲染一张「纯色圆 + 居中白色文字」的 PNG（圆外透明），返回编码后的字节。
+// Render 渲染一张「白底 + 纯色圆 + 居中白色文字」的 PNG，返回编码后的字节。
+// 圆外为白色，输出不透明（整图 alpha 全 255，png.Encode 会编码为不带 alpha
+// 通道的 RGB PNG）——与旧 ASCII 兜底、13 色 Bot 头像一致。
 // 文字颜色固定为白色（与设计稿一致，不做对比度切换）。
 func Render(opts Options) ([]byte, error) {
 	if opts.Text == "" {
@@ -96,8 +114,11 @@ func Render(opts Options) ([]byte, error) {
 
 	big := size * supersample
 
-	// 1. 在放大画布上画硬边圆（圆外保持透明）。
+	// 1. 先用白底铺满画布，再画硬边圆。圆外保持白色，使输出为不透明 PNG
+	//（与旧 ASCII 兜底、13 色 Bot 头像一致），客户端在任意背景下都不会透出底色。
+	// 整图 alpha 全 255 → png.Encode 自动编码为不带 alpha 通道的 RGB PNG。
 	canvas := image.NewRGBA(image.Rect(0, 0, big, big))
+	draw.Draw(canvas, canvas.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
 	drawCircle(canvas, opts.Bg)
 
 	// 2. 居中渲染白色文字。
@@ -116,7 +137,7 @@ func Render(opts Options) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// drawCircle 在 img 上填充一个充满边界的实心圆，圆外像素保持透明。
+// drawCircle 在 img 上填充一个充满边界的实心圆；圆外像素保持调用方预先铺好的底色。
 func drawCircle(img *image.RGBA, c color.RGBA) {
 	b := img.Bounds()
 	d := float64(b.Dx())
@@ -134,9 +155,37 @@ func drawCircle(img *image.RGBA, c color.RGBA) {
 	}
 }
 
+// fitFontPx 返回 text 在 size×size 画布上应使用的字号（像素）：在参考字号下
+// 测量墨迹包围盒，线性缩放到目标墨迹盒（maxInkWidthRatio × maxInkHeightRatio）
+// 内，再施加 maxFontEmRatio 硬上限。CJK 双字先触宽度约束（结果≈设计稿的
+// 10/32），窄墨迹的拉丁字母则放大到字号上限，避免同字号下视觉偏小。
+// 测量失败或墨迹为空（理论上不会：调用方已用 Renderable 过滤）回退 baseFontEmRatio。
+func fitFontPx(fnt *sfnt.Font, text string, size int) float64 {
+	s := float64(size)
+	// 参考字号任取即可：无 hinting 时字形度量随字号线性缩放。
+	const probePx = 100.0
+	face, err := opentype.NewFace(fnt, &opentype.FaceOptions{
+		Size:    probePx,
+		DPI:     72,
+		Hinting: font.HintingNone,
+	})
+	if err != nil {
+		return s * baseFontEmRatio
+	}
+	defer face.Close()
+	bounds, _ := (&font.Drawer{Face: face}).BoundString(text)
+	inkW := float64(bounds.Max.X-bounds.Min.X) / 64
+	inkH := float64(bounds.Max.Y-bounds.Min.Y) / 64
+	if inkW <= 0 || inkH <= 0 {
+		return s * baseFontEmRatio
+	}
+	scale := math.Min(s*maxInkWidthRatio/inkW, s*maxInkHeightRatio/inkH)
+	return math.Min(probePx*scale, s*maxFontEmRatio)
+}
+
 // drawCenteredText 在 size×size 画布上水平+垂直居中渲染白色文字。
 func drawCenteredText(img *image.RGBA, fnt *sfnt.Font, text string, size int) error {
-	fontPx := float64(size) * fontSizeRatio
+	fontPx := fitFontPx(fnt, text, size)
 	face, err := opentype.NewFace(fnt, &opentype.FaceOptions{
 		Size:    fontPx,
 		DPI:     72, // DPI=72 时 Size 即像素

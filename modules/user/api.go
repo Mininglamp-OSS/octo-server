@@ -497,6 +497,18 @@ func (u *User) UserAvatar(c *wkhttp.Context) {
 		return
 	}
 
+	// 系统 Bot 品牌化专属头像（botfather 等）：固定静态图，优先级与
+	// u_10000/fileHelper 同级——查库前返回，不依赖 DB 记录，也不走 13 色随机
+	// 头像或昵称首字母渲染。未配专属图的系统 Bot 返回 ok=false，继续走下面的
+	// 默认逻辑。
+	if imageData, ok := systemBotAvatar(uid); ok {
+		c.Header("Content-Type", "image/png")
+		c.Header("Content-Disposition", "inline; filename=avatar.png")
+		c.Header("Cache-Control", "public, max-age=86400")
+		c.Data(http.StatusOK, "image/png", imageData)
+		return
+	}
+
 	// incoming webhook 合成发送者（iwh_ 前缀）不在 user 表，单独处理头像：有自定义
 	// URL 则重定向，否则回退默认头像，避免裂图（含 webhook 已删除的情况）。
 	if strings.HasPrefix(uid, webhookUIDPrefix) {
@@ -578,7 +590,7 @@ func (u *User) UserAvatar(c *wkhttp.Context) {
 			// ETag 覆盖决定内容的因子：渲染模式版本 + uid(决定颜色) + 展示文字。
 			etag := avatarETag("ascii-v1", uid)
 			if nameMode {
-				etag = avatarETag("name-v1", uid, text)
+				etag = avatarETag("name-v3", uid, text)
 			}
 			setAvatarHeaders(etag)
 			if ifNoneMatchSatisfied(c.GetHeader("If-None-Match"), etag) {
