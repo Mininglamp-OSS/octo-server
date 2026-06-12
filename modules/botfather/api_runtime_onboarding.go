@@ -68,13 +68,12 @@ func (bf *BotFather) runtimeOnboarding(c *wkhttp.Context) {
 	}
 
 	// query 优先 / header 备选 — 跟 SpaceMiddleware (pkg/space/middleware.go)
-	// 顺序对齐, 减少认知负担.
+	// 顺序对齐, 减少认知负担. HTTP header 大小写不敏感, GetHeader 内部用
+	// textproto.CanonicalMIMEHeaderKey 规范化, X-Space-Id 跟 X-Space-ID
+	// 都吃 (不需要查两次).
 	spaceID := strings.TrimSpace(c.Query("space_id"))
 	if spaceID == "" {
 		spaceID = strings.TrimSpace(c.GetHeader("X-Space-Id"))
-	}
-	if spaceID == "" {
-		spaceID = strings.TrimSpace(c.GetHeader("X-Space-ID"))
 	}
 	if spaceID == "" {
 		c.ResponseErrorWithStatus(errors.New("space_id required (query ?space_id= or header X-Space-Id)"), http.StatusBadRequest)
@@ -88,7 +87,7 @@ func (bf *BotFather) runtimeOnboarding(c *wkhttp.Context) {
 	// api_key, 一旦 row 写下去后续 verify-api-key 会显式查 user.status=1
 	// 堵住, 但当下这次写入仍会"成功" — 给 banned user lazy-create 一行
 	// dead row 是数据污染, 这里加 belt-and-braces).
-	ok, err := spacepkg.CheckMembership(bf.ctx.DB().NewSession(nil), spaceID, uid)
+	ok, err := spacepkg.CheckMembership(bf.ctx.DB(), spaceID, uid)
 	if err != nil {
 		bf.Error("runtime-onboarding: check membership", zap.Error(err))
 		c.ResponseErrorWithStatus(errors.New("internal error"), http.StatusInternalServerError)
@@ -101,7 +100,7 @@ func (bf *BotFather) runtimeOnboarding(c *wkhttp.Context) {
 	// user.status=1 二重 gate (D11): banned user 应被堵在这一层, 不能落
 	// 库 lazy-create dead api_key row.
 	var userActive int
-	if qerr := bf.ctx.DB().NewSession(nil).
+	if qerr := bf.ctx.DB().
 		SelectBySql("SELECT COUNT(*) FROM user WHERE uid=? AND status=1", uid).
 		LoadOne(&userActive); qerr != nil {
 		bf.Error("runtime-onboarding: check user status", zap.Error(qerr))
@@ -137,13 +136,15 @@ func (bf *BotFather) runtimeOnboarding(c *wkhttp.Context) {
 	}
 
 	// commands.start 是 standalone 可复制可跑的 multi-line block: 含 3 个
-	// OCTO_*_URL export 让 daemon-cli 能拿到 server/fleet/matter, 末尾才是
-	// octo-daemon start 行. caller 直接复制 commands.start 就跑得起来,
-	// 不用再去 env_vars 字段二次拼接 (env_vars 单独保留供想 set 到 shell rc
-	// 文件而非 inline 的场景).
+	// OCTO_*_URL export 让 daemon 各 service 调用走 env (fleet / server /
+	// matter 各走各), 末尾 octo-daemon start 行的 --api-url 用 serverURL —
+	// 跟旧 BotFather /daemon 命令一致 (cfg.APIURL 在 daemon 内只是 env 缺
+	// 失时的 fallback, env 全设了 cfg.APIURL 不会被读). caller 直接复制
+	// commands.start 就跑得起来, 不用再去 env_vars 字段二次拼接 (env_vars
+	// 单独保留供想 set 到 shell rc 而非 inline 的场景).
 	startBlock := fmt.Sprintf(
 		"export OCTO_SERVER_URL=%s\nexport OCTO_FLEET_URL=%s\nexport OCTO_MATTER_URL=%s\nocto-daemon start --api-key %s --api-url %s",
-		serverURL, fleetURL, matterURL, apiKey, fleetURL,
+		serverURL, fleetURL, matterURL, apiKey, serverURL,
 	)
 
 	resp := runtimeOnboardingResp{
