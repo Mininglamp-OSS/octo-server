@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
@@ -684,4 +685,68 @@ func TestDeleteAdminUser(t *testing.T) {
 	s.GetRoute().ServeHTTP(w, req)
 	// assert.Equal(t, http.StatusOK, w.Code)
 	panic(w.Body)
+}
+
+// TestManager_DeleteAdminUser_RevokesSessionsAndRoleCache pins the issue #363
+// fast-follow: deleting an admin must invalidate the user_role:{uid} hot cache
+// AND revoke that admin's tokens on every device flag (not just Web), so the
+// removal takes effect on the next request instead of waiting out RoleCacheTTL.
+func TestManager_DeleteAdminUser_RevokesSessionsAndRoleCache(t *testing.T) {
+	// testutil.NewTestServer already registers every module's routes via
+	// module.Setup, so the DELETE handler is live — don't call m.Route (double
+	// registration panics). NewDB(ctx) is only for seeding rows; the request is
+	// served by the module.Setup-constructed Manager, whose roleService shares
+	// the same Redis namespace as our assertions.
+	s, ctx := testutil.NewTestServer()
+	defer testutil.CleanAllTables(ctx)
+	assert.NoError(t, testutil.CleanAllTables(ctx))
+
+	userDB := NewDB(ctx)
+	cacheCfg := ctx.GetConfig().Cache
+
+	// caller must be superAdmin (deleteAdminUsers requires it)
+	callerTok := "user-mgr-superadmin-caller"
+	assert.NoError(t, ctx.Cache().Set(cacheCfg.TokenCachePrefix+callerTok, "root-uid@root@"+string(wkhttp.SuperAdmin)))
+
+	// victim admin with live sessions on every device flag + a hot role cache
+	adminUID := "admin-victim-uid"
+	assert.NoError(t, userDB.Insert(&Model{
+		UID:      adminUID,
+		Name:     "管理员X",
+		Role:     string(wkhttp.Admin),
+		Username: "admin-victim",
+	}))
+	deviceTokens := map[config.DeviceFlag]string{
+		config.APP: "victim-tok-app",
+		config.Web: "victim-tok-web",
+		config.PC:  "victim-tok-pc",
+	}
+	for flag, tok := range deviceTokens {
+		assert.NoError(t, ctx.Cache().Set(fmt.Sprintf("%s%d%s", cacheCfg.UIDTokenCachePrefix, flag, adminUID), tok))
+		assert.NoError(t, ctx.Cache().Set(cacheCfg.TokenCachePrefix+tok, adminUID+"@管理员X@"+string(wkhttp.Admin)))
+	}
+	assert.NoError(t, ctx.Cache().Set(RoleCacheKeyPrefix+adminUID, string(wkhttp.Admin)))
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("DELETE", "/v1/manager/user/admin?uid="+adminUID, nil)
+	req.Header.Set("token", callerTok)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	// role hot cache invalidated
+	roleCached, err := ctx.Cache().Get(RoleCacheKeyPrefix + adminUID)
+	assert.NoError(t, err)
+	assert.Empty(t, roleCached, "user_role hot cache must be invalidated after deletion")
+
+	// every device session revoked: both the token:{token} payload and the
+	// UIDToken:{flag}{uid} reverse mapping
+	for flag, tok := range deviceTokens {
+		payload, err := ctx.Cache().Get(cacheCfg.TokenCachePrefix + tok)
+		assert.NoError(t, err)
+		assert.Empty(t, payload, "device token payload (flag %d) must be revoked", flag)
+
+		uidMap, err := ctx.Cache().Get(fmt.Sprintf("%s%d%s", cacheCfg.UIDTokenCachePrefix, flag, adminUID))
+		assert.NoError(t, err)
+		assert.Empty(t, uidMap, "UIDToken mapping (flag %d) must be cleared", flag)
+	}
 }

@@ -25,6 +25,12 @@ const RoleCacheTTL = 60 * time.Second
 // cache miss ("" → query DB) from a confirmed "no role" (negative hit → skip
 // DB), so the hot path does not hammer MySQL for every normal-user request.
 // A bare '-' is unambiguous because it is not a valid role string.
+//
+// IMPORTANT for future authors: any code path that MUTATES user.role on an
+// *existing* uid (today only addAdminUser, which writes role on a brand-new
+// uid, and deleteAdminUsers, which calls Invalidate) MUST call Invalidate(uid)
+// afterwards. Otherwise a cached negative marker (or a stale positive role)
+// suppresses the change for up to RoleCacheTTL.
 const roleNegativeMarker = "-"
 
 // roleReader is the read surface RoleService needs from the user DB layer,

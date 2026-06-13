@@ -97,6 +97,29 @@ func TestRoleServiceResolveCacheMissEmptyPopulatesNegativeMarker(t *testing.T) {
 	}
 }
 
+// TestRoleServiceResolveCacheErrorFallsThroughToDB pins the security-sensitive
+// degradation branch: a Redis Get error must NOT be treated as "no role" — it
+// falls through to the authoritative DB read so a momentary cache outage can't
+// silently strip (or grant) privileges.
+func TestRoleServiceResolveCacheErrorFallsThroughToDB(t *testing.T) {
+	c := newFakeLangCache()
+	c.getErr = errors.New("redis down")
+	db := newFakeRoleDB()
+	db.role["u1"] = "superAdmin"
+	svc := NewRoleService(db, c)
+
+	got, err := svc.ResolveRole(context.Background(), "u1")
+	if err != nil {
+		t.Fatalf("ResolveRole: %v", err)
+	}
+	if got != "superAdmin" {
+		t.Fatalf("role = %q, want superAdmin (cache error must fall through to DB truth)", got)
+	}
+	if db.queryCalls != 1 {
+		t.Fatalf("expected exactly 1 DB query on cache error, got %d", db.queryCalls)
+	}
+}
+
 func TestRoleServiceResolvePropagatesDBError(t *testing.T) {
 	c := newFakeLangCache()
 	db := newFakeRoleDB()

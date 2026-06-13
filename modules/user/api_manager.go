@@ -36,6 +36,7 @@ type Manager struct {
 	friendDB      *friendDB
 	onlineService IOnlineService
 	commonService common2.IService
+	roleService   *RoleService
 }
 
 // NewManager NewManager
@@ -50,6 +51,7 @@ func NewManager(ctx *config.Context) *Manager {
 		userSettingDB: NewSettingDB(ctx.DB()),
 		onlineService: NewOnlineService(ctx),
 		commonService: common2.NewService(ctx),
+		roleService:   NewRoleService(NewDB(ctx), ctx.Cache()),
 	}
 	m.createManagerAccount()
 	return m
@@ -328,21 +330,43 @@ func (m *Manager) deleteAdminUsers(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
-	oldToken, err := m.ctx.Cache().Get(fmt.Sprintf("%s%d%s", m.ctx.GetConfig().Cache.UIDTokenCachePrefix, config.Web, user.UID))
-	if err != nil {
-		m.Error("获取旧token错误", zap.Error(err))
+	// 撤销该管理员在所有设备端（APP/Web/PC）的登录态，而不只是 Web —— 否则一个
+	// 仍存活的非 Web token 在 RoleCacheTTL 窗口内仍可能按旧角色放行。
+	if err := m.revokeAllDeviceTokens(user.UID); err != nil {
+		m.Error("清除管理员token数据错误", zap.Error(err), zap.String("uid", user.UID))
 		respondUserError(c, errcode.ErrUserTokenCacheFailed)
 		return
 	}
-	if oldToken != "" {
-		err = m.ctx.Cache().Delete(m.ctx.GetConfig().Cache.TokenCachePrefix + oldToken)
+	// 立即失效角色热缓存：即便上面漏删了某个 token，下一请求经 RoleResolver 也会
+	// 从 DB（该 uid 已删，role 为空）解析出"无系统角色"，把降权窗口收敛到一次往返
+	// 而非等 RoleCacheTTL 自愈。
+	m.roleService.Invalidate(user.UID)
+	c.ResponseOK()
+}
+
+// revokeAllDeviceTokens 清除某 uid 在所有设备端（APP/Web/PC）的登录态：既删
+// token:{token} 让旧 token 立即失效，也删 UIDToken:{flag}{uid} 反查映射，避免
+// 残留。任一删除失败即返回错误，调用方据此报错（不静默吞，以免"以为已吊销实则
+// 残留"）。
+func (m *Manager) revokeAllDeviceTokens(uid string) error {
+	cacheCfg := m.ctx.GetConfig().Cache
+	for _, flag := range []config.DeviceFlag{config.APP, config.Web, config.PC} {
+		uidKey := fmt.Sprintf("%s%d%s", cacheCfg.UIDTokenCachePrefix, flag, uid)
+		token, err := m.ctx.Cache().Get(uidKey)
 		if err != nil {
-			m.Error("清除旧token数据错误", zap.Error(err))
-			respondUserError(c, errcode.ErrUserTokenCacheFailed)
-			return
+			return err
+		}
+		if token == "" {
+			continue
+		}
+		if err := m.ctx.Cache().Delete(cacheCfg.TokenCachePrefix + token); err != nil {
+			return err
+		}
+		if err := m.ctx.Cache().Delete(uidKey); err != nil {
+			return err
 		}
 	}
-	c.ResponseOK()
+	return nil
 }
 
 // 查询管理员列表

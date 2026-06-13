@@ -608,6 +608,10 @@ func (m *Manager) updateSpaceProfile(c *wkhttp.Context) {
 // addMembers 管理员强制添加成员（绕过 max_users 限制）。
 // 注意：此操作绕过了 executeJoinSpace 的业务副作用（SpaceMemberJoin 事件、预设群组），
 // 属于 low-level 管理操作；常规入口请走 /v1/space/join。
+//
+// 仍保持 requireAdmin（而非 requireSuperAdmin）是有意为之：强制"添加"是可逆的
+// （随后可移除），而强制解散/封禁/移除/改角色不可逆，故只把后者收紧到 superAdmin。
+// 若日后判定强制加人也需收紧，改成 requireSuperAdmin 即可。
 func (m *Manager) addMembers(c *wkhttp.Context) {
 	if !m.requireAdmin(c) {
 		return

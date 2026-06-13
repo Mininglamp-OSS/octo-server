@@ -9,10 +9,54 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// TestAddAppVersion_RequiresSuperAdmin pins the issue #363 gate: POST
+// /v1/common/appversion (sets the client download source — supply-chain
+// sensitive) must reject a plain admin and only let superAdmin through. The
+// denial goes through the generic forbidden envelope (anti-enumeration).
+func TestAddAppVersion_RequiresSuperAdmin(t *testing.T) {
+	// testutil.NewTestServer already registers every module's routes via
+	// module.Setup, so the appversion handler is live — don't call cn.Route
+	// (double registration panics). It also does not wire the i18n renderer, so
+	// mirror main.go here to get a populated error.code in the envelope.
+	s, ctx := testutil.NewTestServer()
+	defer testutil.CleanAllTables(ctx)
+	s.GetRoute().SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
+
+	cacheCfg := ctx.GetConfig().Cache
+	body := util.ToJson(&appVersionReq{
+		AppVersion:  "9.9",
+		OS:          "android",
+		DownloadURL: "http://example.com/x.apk",
+		IsForce:     1,
+		UpdateDesc:  "x",
+	})
+
+	// plain admin → rejected by the generic forbidden envelope
+	adminTok := "common-appver-admin"
+	require.NoError(t, ctx.Cache().Set(cacheCfg.TokenCachePrefix+adminTok, "admin-uid@admin@"+string(wkhttp.Admin)))
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/common/appversion", bytes.NewReader([]byte(body)))
+	req.Header.Set("token", adminTok)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Contains(t, w.Body.String(), "err.shared.auth.forbidden", "plain admin must be rejected: %s", w.Body.String())
+
+	// superAdmin → passes the role gate (downstream insert outcome is irrelevant
+	// to this assertion; we only prove the gate let it through)
+	superTok := "common-appver-superadmin"
+	require.NoError(t, ctx.Cache().Set(cacheCfg.TokenCachePrefix+superTok, "root-uid@root@"+string(wkhttp.SuperAdmin)))
+	w2 := httptest.NewRecorder()
+	req2, _ := http.NewRequest("POST", "/v1/common/appversion", bytes.NewReader([]byte(body)))
+	req2.Header.Set("token", superTok)
+	s.GetRoute().ServeHTTP(w2, req2)
+	assert.NotContains(t, w2.Body.String(), "err.shared.auth.forbidden", "superAdmin must pass the role gate: %s", w2.Body.String())
+}
 
 func cleanAllTablesAndReloadSettings(t *testing.T, ctx *config.Context) {
 	t.Helper()

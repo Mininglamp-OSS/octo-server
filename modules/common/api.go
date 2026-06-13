@@ -20,6 +20,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -537,10 +539,11 @@ func (cn *Common) countriesList(c *wkhttp.Context) {
 // 发版会设置客户端的下载来源（DownloadURL），属供应链敏感写操作，因此要求
 // superAdmin —— 普通 admin 定位为只读运营位，不应能改动全体用户的客户端来源。
 // 路由仍保留在 /v1/common（历史调用方依赖），仅收紧角色门槛。
+// 拒绝路径走 i18n 信封并返回通用 403（ErrSharedForbidden），不泄露"需要更高
+// 角色"的具体原因（反枚举），与 space 管理端的 requireSuperAdmin 保持一致。
 func (cn *Common) addAppVersion(c *wkhttp.Context) {
-	err := c.CheckLoginRoleIsSuperAdmin()
-	if err != nil {
-		c.ResponseError(err)
+	if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
+		httperr.ResponseErrorL(c, errcode.ErrSharedForbidden, nil, nil)
 		return
 	}
 	var req appVersionReq
@@ -548,12 +551,11 @@ func (cn *Common) addAppVersion(c *wkhttp.Context) {
 		c.ResponseError(errors.New("请求数据格式有误！"))
 		return
 	}
-	err = cn.check(req)
-	if err != nil {
+	if err := cn.check(req); err != nil {
 		c.ResponseError(err)
 		return
 	}
-	_, err = cn.db.insertAppVersion(&appVersionModel{
+	_, err := cn.db.insertAppVersion(&appVersionModel{
 		AppVersion:  req.AppVersion,
 		OS:          req.OS,
 		IsForce:     req.IsForce,
