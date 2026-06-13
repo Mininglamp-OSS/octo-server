@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -748,5 +749,30 @@ func TestManager_DeleteAdminUser_RevokesSessionsAndRoleCache(t *testing.T) {
 		uidMap, err := ctx.Cache().Get(fmt.Sprintf("%s%d%s", cacheCfg.UIDTokenCachePrefix, flag, adminUID))
 		assert.NoError(t, err)
 		assert.Empty(t, uidMap, "UIDToken mapping (flag %d) must be cleared", flag)
+	}
+}
+
+// TestRevokeDeviceTokensInCache_BestEffort pins that a Redis error on one device
+// flag does not abort revocation of the others (PR #364 review F2): the loop
+// attempts all three flags and reports a failure per error rather than bailing
+// on the first. Uses the shared fakeLangCache (implements cache.Cache).
+func TestRevokeDeviceTokensInCache_BestEffort(t *testing.T) {
+	c := newFakeLangCache()
+	const uidTokenPrefix, tokenPrefix, uid = "UIDTOKEN:", "TOKEN:", "u1"
+	for _, fl := range []config.DeviceFlag{config.APP, config.Web, config.PC} {
+		tok := fmt.Sprintf("tok-%d", fl)
+		c.store[fmt.Sprintf("%s%d%s", uidTokenPrefix, fl, uid)] = tok
+		c.store[tokenPrefix+tok] = uid + "@x@admin"
+	}
+	// Every Delete fails: a fail-fast loop would stop after flag 0; best-effort
+	// must still attempt all three.
+	c.delErr = errors.New("redis down")
+
+	failures := revokeDeviceTokensInCache(c, uidTokenPrefix, tokenPrefix, uid)
+	if len(failures) != 3 {
+		t.Fatalf("best-effort revoke must attempt all 3 device flags despite errors, got %d failures", len(failures))
+	}
+	if len(c.deletes) < 3 {
+		t.Fatalf("expected a Delete attempt per device flag, got %d", len(c.deletes))
 	}
 }
