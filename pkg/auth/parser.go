@@ -19,6 +19,20 @@ type LanguageResolver interface {
 	Resolve(ctx context.Context, uid string) (string, error)
 }
 
+// RoleResolver hydrates UserInfo.Role with the user's *current* system role
+// (Redis cache → DB → "") instead of the value snapshotted into the token at
+// issuance. Without it, a system role baked into the token at login keeps
+// granting admin / superAdmin access until the token expires — a demotion or
+// admin-account removal cannot be honoured promptly. Resolving per request
+// bounds that staleness to the resolver's cache TTL.
+//
+// Like LanguageResolver it is shaped at the consumer side so pkg/auth stays
+// free of DB / Redis imports; the concrete implementation lives in
+// modules/user (RoleService).
+type RoleResolver interface {
+	ResolveRole(ctx context.Context, uid string) (string, error)
+}
+
 // CacheTokenParser implements octo-lib's wkhttp.TokenParser using the shared
 // pkg/auth codec. It supersedes octo-lib's legacyTokenParser so that octo-server
 // can write v2 JSON envelopes while still decoding any legacy uid@name[@role]
@@ -34,9 +48,10 @@ type LanguageResolver interface {
 // Construct once at boot and register with WKHttp.SetTokenParser; the parser
 // is safe for concurrent use as long as the underlying cache + resolver are.
 type CacheTokenParser struct {
-	Cache    cache.Cache
-	Prefix   string
-	resolver LanguageResolver
+	Cache        cache.Cache
+	Prefix       string
+	resolver     LanguageResolver
+	roleResolver RoleResolver
 }
 
 // ParserOption configures optional CacheTokenParser behaviour.
@@ -49,6 +64,18 @@ func WithLanguageResolver(r LanguageResolver) ParserOption {
 	return func(p *CacheTokenParser) {
 		if r != nil {
 			p.resolver = r
+		}
+	}
+}
+
+// WithRoleResolver wires a RoleResolver into the parser; nil resolver is a
+// no-op so callers (and tests) can pass an interface value that may be unset
+// without an extra guard. When unset, Parse falls back to the role snapshot
+// decoded from the token — i.e. legacy behaviour.
+func WithRoleResolver(r RoleResolver) ParserOption {
+	return func(p *CacheTokenParser) {
+		if r != nil {
+			p.roleResolver = r
 		}
 	}
 }
@@ -109,10 +136,29 @@ func (p *CacheTokenParser) Parse(ctx context.Context, token string) (wkhttp.User
 			language = resolved
 		}
 	}
+	role := info.Role
+	if p.roleResolver != nil {
+		// Authoritative source for the system role:
+		//   * rerr != nil → keep the token snapshot. Authentication must not
+		//     5xx because the role cache / DB is momentarily unreachable; the
+		//     snapshot is the agreed last-resort fallback (fail-open to the
+		//     token's role, identical degradation philosophy to language).
+		//   * resolved == "" (no error) → the user holds no system role right
+		//     now (normal user, or demoted since the token was minted). Drop
+		//     the snapshot so a token minted while the user was admin stops
+		//     granting admin the moment the DB says otherwise — this is the
+		//     whole point of resolving per request rather than trusting the
+		//     baked-in role.
+		//   * resolved != "" → use the fresh authoritative role.
+		resolved, rerr := p.roleResolver.ResolveRole(ctx, info.UID)
+		if rerr == nil {
+			role = resolved
+		}
+	}
 	return wkhttp.UserInfo{
 		UID:      info.UID,
 		Name:     info.Name,
-		Role:     info.Role,
+		Role:     role,
 		Language: language,
 	}, nil
 }

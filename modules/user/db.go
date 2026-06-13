@@ -129,6 +129,17 @@ func (d *DB) UpdateLanguageByUID(uid, language string) error {
 	return err
 }
 
+// QueryRoleByUID returns the user's system role column only ("superAdmin" /
+// "admin" / "" for a normal user). Used by RoleService as the authoritative
+// source behind the per-request role resolver — only SELECTs the single
+// column to keep the auth hot path light, mirroring QueryLanguageByUID.
+// (uid 不存在时返回 ("", nil)，语义即"无系统角色"。)
+func (d *DB) QueryRoleByUID(uid string) (string, error) {
+	var role string
+	_, err := d.session.Select("role").From("user").Where("uid=?", uid).Load(&role)
+	return role, err
+}
+
 // QueryByVercode 通过用户vercode查询用户信息
 func (d *DB) QueryByVercode(vercode string) (*Model, error) {
 	var model *Model

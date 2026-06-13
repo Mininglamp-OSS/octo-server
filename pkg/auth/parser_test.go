@@ -223,3 +223,98 @@ func TestNewCacheTokenParserPanicsOnNilCache(t *testing.T) {
 	}()
 	_ = NewCacheTokenParser(nil, testPrefix)
 }
+
+// stubRoleResolver exercises the RoleResolver hook without pulling modules/user
+// into pkg/auth's test deps.
+type stubRoleResolver struct {
+	role   string
+	err    error
+	gotUID string
+}
+
+func (s *stubRoleResolver) ResolveRole(_ context.Context, uid string) (string, error) {
+	s.gotUID = uid
+	return s.role, s.err
+}
+
+// TestCacheTokenParserRoleResolverOverridesSnapshot pins the core revocation
+// fix: the role returned to AuthMiddleware comes from the resolver (DB truth),
+// not the value baked into the token at issuance.
+func TestCacheTokenParserRoleResolverOverridesSnapshot(t *testing.T) {
+	t.Parallel()
+	c := newFakeCache()
+	// Token was minted while the user was superAdmin...
+	encoded, _ := Encode(TokenInfo{UID: "u1", Name: "alice", Role: "superAdmin"})
+	_ = c.Set(testPrefix+"tok1", encoded)
+
+	// ...but the DB now says plain admin (partial demotion).
+	resolver := &stubRoleResolver{role: "admin"}
+	p := NewCacheTokenParser(c, testPrefix, WithRoleResolver(resolver))
+	got, err := p.Parse(context.Background(), "tok1")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got.Role != "admin" {
+		t.Fatalf("Role = %q, want resolver value admin (token snapshot superAdmin must not win)", got.Role)
+	}
+	if resolver.gotUID != "u1" {
+		t.Fatalf("resolver got uid %q, want u1", resolver.gotUID)
+	}
+}
+
+// TestCacheTokenParserRoleResolverEmptyDropsRole covers full demotion: a token
+// minted while admin must stop granting admin the moment the DB role is empty.
+func TestCacheTokenParserRoleResolverEmptyDropsRole(t *testing.T) {
+	t.Parallel()
+	c := newFakeCache()
+	encoded, _ := Encode(TokenInfo{UID: "u1", Name: "alice", Role: "admin"})
+	_ = c.Set(testPrefix+"tok1", encoded)
+
+	resolver := &stubRoleResolver{role: ""}
+	p := NewCacheTokenParser(c, testPrefix, WithRoleResolver(resolver))
+	got, err := p.Parse(context.Background(), "tok1")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got.Role != "" {
+		t.Fatalf("Role = %q, want \"\" (resolver authoritative empty must drop the baked-in admin role)", got.Role)
+	}
+}
+
+// TestCacheTokenParserRoleResolverFailureKeepsSnapshot pins fail-open: a
+// cache/DB outage must not 5xx auth, so the token's role snapshot is preserved.
+func TestCacheTokenParserRoleResolverFailureKeepsSnapshot(t *testing.T) {
+	t.Parallel()
+	c := newFakeCache()
+	encoded, _ := Encode(TokenInfo{UID: "u1", Name: "alice", Role: "admin"})
+	_ = c.Set(testPrefix+"tok1", encoded)
+
+	resolver := &stubRoleResolver{err: errors.New("redis down")}
+	p := NewCacheTokenParser(c, testPrefix, WithRoleResolver(resolver))
+	got, err := p.Parse(context.Background(), "tok1")
+	if err != nil {
+		t.Fatalf("Parse must not surface resolver failure, got %v", err)
+	}
+	if got.Role != "admin" {
+		t.Fatalf("Role = %q, want snapshot admin (resolver failed)", got.Role)
+	}
+}
+
+func TestWithRoleResolverNilIsNoOp(t *testing.T) {
+	t.Parallel()
+	c := newFakeCache()
+	encoded, _ := Encode(TokenInfo{UID: "u1", Name: "alice", Role: "admin"})
+	_ = c.Set(testPrefix+"tok1", encoded)
+
+	p := NewCacheTokenParser(c, testPrefix, WithRoleResolver(nil))
+	if p.roleResolver != nil {
+		t.Fatal("nil role resolver option must not set the field")
+	}
+	got, err := p.Parse(context.Background(), "tok1")
+	if err != nil {
+		t.Fatalf("Parse should still succeed without a role resolver, got %v", err)
+	}
+	if got.Role != "admin" {
+		t.Fatalf("without a resolver the token snapshot role must pass through, got %q", got.Role)
+	}
+}

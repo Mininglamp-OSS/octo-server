@@ -117,11 +117,16 @@ func runAPI(ctx *config.Context) {
 	// 解析 cache value，支持 v2 JSON envelope 与 "uid@name[@role]" 旧格式（i18n D19/D21）。
 	// 同时注入 LanguageResolver，让 AuthMiddleware 把 user_language:{uid} → DB 的
 	// 真相源结果写到 UserInfo.Language 上，供 i18n.LanguageFromContext 读侧合并。
+	// 同时注入 RoleResolver：系统角色（admin/superAdmin）此前烧死在 token 里，
+	// 降权 / 删除管理员要到 token 过期才生效。这里在 Parse 时按 uid 实时解析 DB
+	// 角色（user_role:{uid} 热缓存 → DB），把降权生效窗口收敛到缓存 TTL。
 	userLangSvc := user.NewLanguageService(user.NewDB(ctx), ctx.Cache())
+	userRoleSvc := user.NewRoleService(user.NewDB(ctx), ctx.Cache())
 	route.SetTokenParser(auth.NewCacheTokenParser(
 		ctx.Cache(),
 		ctx.GetConfig().Cache.TokenCachePrefix,
 		auth.WithLanguageResolver(userLangSvc),
+		auth.WithRoleResolver(userRoleSvc),
 	))
 	// 替换web下的配置文件
 	replaceWebConfig(ctx.GetConfig())

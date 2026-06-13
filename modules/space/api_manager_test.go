@@ -19,12 +19,25 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// adminToken 在 token 缓存中注入一个带 admin 角色的 token，供管理接口测试使用。
+// adminToken 在 token 缓存中注入一个带 admin 角色的 token，供只读 / 低风险管理
+// 接口测试使用。高危/不可逆操作（强制解散、封禁、移除成员、改角色）已收敛到
+// superAdmin，对应测试请用 superAdminToken。
 func adminToken(t *testing.T) string {
 	t.Helper()
 	token := "space-mgr-admin-token"
 	cfg := testCtx.GetConfig()
 	err := testCtx.Cache().Set(cfg.Cache.TokenCachePrefix+token, testutil.UID+"@admin@"+string(wkhttp.Admin))
+	assert.NoError(t, err)
+	return token
+}
+
+// superAdminToken 注入一个带 superAdmin 角色的 token，供仅限超级管理员的高危
+// 管理接口测试使用。
+func superAdminToken(t *testing.T) string {
+	t.Helper()
+	token := "space-mgr-superadmin-token"
+	cfg := testCtx.GetConfig()
+	err := testCtx.Cache().Set(cfg.Cache.TokenCachePrefix+token, testutil.UID+"@superadmin@"+string(wkhttp.SuperAdmin))
 	assert.NoError(t, err)
 	return token
 }
@@ -172,7 +185,7 @@ func TestManager_SpaceDetail(t *testing.T) {
 func TestManager_ForceDisband(t *testing.T) {
 	s, _, err := setup(t)
 	assert.NoError(t, err)
-	token := adminToken(t)
+	token := superAdminToken(t)
 
 	seedSpace(t, "mgr-force", "about to die", "u-owner", 1)
 	err = testSpaceDB.insertMemberNoTx(&MemberModel{
@@ -324,7 +337,7 @@ func TestManager_Members_KeywordSearch(t *testing.T) {
 func TestManager_LiftBan(t *testing.T) {
 	s, _, err := setup(t)
 	assert.NoError(t, err)
-	token := adminToken(t)
+	token := superAdminToken(t)
 
 	seedSpace(t, "mgr-ban-target", "to be banned", "u-owner", SpaceStatusNormal)
 
@@ -426,7 +439,7 @@ func TestManager_AddMembers(t *testing.T) {
 func TestManager_RemoveMembers(t *testing.T) {
 	s, _, err := setup(t)
 	assert.NoError(t, err)
-	token := adminToken(t)
+	token := superAdminToken(t)
 
 	seedSpace(t, "mgr-rm", "remove members", "u-owner", SpaceStatusNormal)
 	for _, uid := range []string{"rm-1", "rm-2", "rm-3"} {
@@ -468,7 +481,7 @@ func TestManager_RemoveMembers(t *testing.T) {
 func TestManager_UpdateMemberRole(t *testing.T) {
 	s, _, err := setup(t)
 	assert.NoError(t, err)
-	token := adminToken(t)
+	token := superAdminToken(t)
 
 	seedSpace(t, "mgr-role", "role ops", "u-owner", SpaceStatusNormal)
 	err = testSpaceDB.insertMemberNoTx(&MemberModel{
@@ -1003,6 +1016,39 @@ func TestManager_AuthBoundary(t *testing.T) {
 	})
 }
 
+// TestManager_DestructiveOpsRequireSuperAdmin 固化 issue #363 item 2 的边界：
+// 强制解散 / 封禁 / 移除成员 / 改成员角色这些跨空间高危操作只放行 superAdmin，
+// 普通 admin（只读运营位）一律 403。superAdmin 放行路径由各操作的成功用例覆盖。
+func TestManager_DestructiveOpsRequireSuperAdmin(t *testing.T) {
+	s, _, err := setup(t)
+	assert.NoError(t, err)
+	token := adminToken(t) // 仅 admin，非 superAdmin
+
+	seedSpace(t, "mgr-su-guard", "guard", "u-owner", SpaceStatusNormal)
+
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+	}{
+		{"forceDisband", "DELETE", "/v1/manager/spaces/mgr-su-guard", ""},
+		{"ban", "PUT", "/v1/manager/spaces/mgr-su-guard/status/2", ""},
+		{"removeMembers", "DELETE", "/v1/manager/spaces/mgr-su-guard/members", `{"uids":["u-owner"]}`},
+		{"updateMemberRole", "PUT", "/v1/manager/spaces/mgr-su-guard/members/u-owner/role", `{"role":1}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+			req.Header.Set("token", token)
+			s.GetRoute().ServeHTTP(w, req)
+			// admin 被拒：通用 403，不泄露"需要更高角色"的具体原因（反枚举）。
+			assertSpaceErrorCode(t, w, "err.shared.auth.forbidden")
+		})
+	}
+}
+
 func TestManager_DisableListIncludesBanned(t *testing.T) {
 	s, _, err := setup(t)
 	assert.NoError(t, err)
@@ -1104,7 +1150,7 @@ func TestManager_LiftBanRefreshesCache(t *testing.T) {
 	// 验证 liftBan 成功后会异步调用 loadKnownSpaceIDs 刷新 pkg/space 缓存
 	s, _, err := setup(t)
 	assert.NoError(t, err)
-	token := adminToken(t)
+	token := superAdminToken(t)
 
 	seedSpace(t, "mgr-ban-cache", "cache", "u-owner-c", SpaceStatusBanned)
 
@@ -1140,7 +1186,7 @@ func TestManager_AddMembersOnDisbandedSpace(t *testing.T) {
 func TestManager_RemoveMembersOnNonExistentSpace(t *testing.T) {
 	s, _, err := setup(t)
 	assert.NoError(t, err)
-	token := adminToken(t)
+	token := superAdminToken(t)
 
 	body := util.ToJson(map[string]interface{}{"uids": []string{"any"}})
 	w := httptest.NewRecorder()
@@ -1708,7 +1754,7 @@ func TestManager_UpdateSpaceProfile_Validation(t *testing.T) {
 func TestManager_UpdateMemberRoleIdempotent(t *testing.T) {
 	s, _, err := setup(t)
 	assert.NoError(t, err)
-	token := adminToken(t)
+	token := superAdminToken(t)
 
 	seedSpace(t, "mgr-role-idem", "role idem", "u-owner", SpaceStatusNormal)
 	err = testSpaceDB.insertMemberNoTx(&MemberModel{

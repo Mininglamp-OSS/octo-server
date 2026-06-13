@@ -533,8 +533,12 @@ func (cn *Common) countriesList(c *wkhttp.Context) {
 }
 
 // 添加app版本
+//
+// 发版会设置客户端的下载来源（DownloadURL），属供应链敏感写操作，因此要求
+// superAdmin —— 普通 admin 定位为只读运营位，不应能改动全体用户的客户端来源。
+// 路由仍保留在 /v1/common（历史调用方依赖），仅收紧角色门槛。
 func (cn *Common) addAppVersion(c *wkhttp.Context) {
-	err := c.CheckLoginRole()
+	err := c.CheckLoginRoleIsSuperAdmin()
 	if err != nil {
 		c.ResponseError(err)
 		return
