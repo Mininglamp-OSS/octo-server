@@ -20,10 +20,10 @@ func textRow(id int64, mid, content string, createdUnix int64) *srcMessageRow {
 // 游标 maxID 取稳定前缀末（含 raw_excluded/dlq 行的 id，必须计入水位）。
 func TestPlanChunk_StablePrefixAndRouting(t *testing.T) {
 	rows := []*srcMessageRow{
-		textRow(1, "a", "hi", 100),                                              // OK → main
+		textRow(1, "a", "hi", 100), // OK → main
 		{ID: 2, MessageID: "b", Signal: 1, CreatedUnix: 110, Payload: []byte("x")}, // signal → main(raw_excluded)
 		{ID: 3, MessageID: "c", CreatedUnix: 120, Payload: []byte("{bad")},         // bad json → dlq
-		textRow(4, "d", "late", 250),                                            // 未稳定 → 截断
+		textRow(4, "d", "late", 250),                                               // 未稳定 → 截断
 	}
 	plan := planChunk(rows, 200)
 	if plan.stableCount != 3 {
@@ -229,4 +229,77 @@ func TestRunChunk_SignalNotInDLQ(t *testing.T) {
 		t.Fatalf("cursor must advance past signal msg, got %d", store.advancedTo)
 	}
 	_ = common.Text
+}
+
+// TestRunChunk_LockLostAfterProduceNoAdvance 🔴 C3：投递成功后、推进游标前锁丢失（lockCtx 取消）
+// → 不推进游标（advanceCursor 零调用），返回 ctx 错误。已投消息靠 message_id 幂等 + ES _id
+// upsert 下轮重投覆盖；绝不在失锁后推进游标（失锁不双算）。
+func TestRunChunk_LockLostAfterProduceNoAdvance(t *testing.T) {
+	store := &fakeStore{cursor: 0, rows: []*srcMessageRow{textRow(1, "a", "x", 100)}}
+	// sink 在投递成功后取消 ctx，模拟「投递与推进之间续租失败」。
+	ctx, cancel := context.WithCancel(context.Background())
+	sink := &cancelSink{cancel: cancel}
+	_, n, err := runChunk(ctx, store, sink, "message", 200, 5000, lg())
+	if err == nil {
+		t.Fatalf("expected ctx error after lock loss")
+	}
+	if n != 0 {
+		t.Fatalf("lock-lost chunk must report 0 progress, got %d", n)
+	}
+	if store.advanceCalls != 0 {
+		t.Fatalf("advanceCursor must NOT be called after lock loss, got %d", store.advanceCalls)
+	}
+	if store.cursor != 0 {
+		t.Fatalf("cursor must stay at 0 (re-produce next tick), got %d", store.cursor)
+	}
+	if sink.mainCalls != 1 {
+		t.Fatalf("produce should have happened once before loss, got %d", sink.mainCalls)
+	}
+}
+
+// cancelSink 在 produceBatch 成功后取消传入的 ctx，模拟投递与游标推进之间的失锁。
+type cancelSink struct {
+	cancel    context.CancelFunc
+	mainCalls int
+}
+
+func (s *cancelSink) produceBatch(ctx context.Context, msgs []searchmsg.Message) error {
+	s.mainCalls++
+	s.cancel() // 投递成功后立即失锁
+	return nil
+}
+
+func (s *cancelSink) produceDLQ(ctx context.Context, msgs []searchmsg.Message) error {
+	return nil
+}
+
+// TestRunChunk_CASMissNoAdvance 🔴 C3 fence：投递成功后游标已被另一持锁副本推进（CAS 失配，
+// advanceCursor 返回 false）→ 本轮不计已投、不报错，下轮从新水位续跑。这是失锁竞态的安全收口：
+// 即便本 owner 失锁后仍跑到 advanceCursor，游标行 CAS（WHERE last_id=expected）也挡住越权推进。
+func TestRunChunk_CASMissNoAdvance(t *testing.T) {
+	store := &casMissStore{cursor: 0, rows: []*srcMessageRow{textRow(1, "a", "x", 100)}}
+	sink := &fakeSink{}
+	_, n, err := runChunk(context.Background(), store, sink, "message", 200, 5000, lg())
+	if err != nil {
+		t.Fatalf("CAS miss must not error, got %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("CAS-miss chunk must report 0 progress, got %d", n)
+	}
+	if sink.mainCalls != 1 {
+		t.Fatalf("produce should have happened once, got %d", sink.mainCalls)
+	}
+}
+
+// casMissStore 的 advanceCursor 恒返回 (false,nil)，模拟「游标已被另一持锁副本推进」。
+type casMissStore struct {
+	cursor int64
+	rows   []*srcMessageRow
+}
+
+func (s *casMissStore) readStableBatchTx(table string, batch int) (int64, []*srcMessageRow, error) {
+	return s.cursor, s.rows, nil
+}
+func (s *casMissStore) advanceCursor(table string, expected, newID int64) (bool, error) {
+	return false, nil // CAS 失配：另一副本已推进游标
 }

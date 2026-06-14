@@ -44,3 +44,20 @@ func TestRunIncremental_ReentrancyGuard(t *testing.T) {
 		t.Fatalf("reentrant run must short-circuit to nil, got err=%v", err)
 	}
 }
+
+// TestRunIncremental_LockAcquireMissSkipsBeforeDB 🔴 C3：Kafka.On=true 时，run-lock 抢不到
+// （别副本在跑）→ RunIncremental 立即跳过返回 nil，**不读 DB、不投 Kafka**。证明锁横跨整 tick：
+// 抢锁发生在任何 DB/Kafka 工作之前（若锁未先行，runTick 会调 dbNowUnix 在无 DB 时报错/超时）。
+func TestRunIncremental_LockAcquireMissSkipsBeforeDB(t *testing.T) {
+	cfg := config.New()
+	cfg.Kafka.On = true
+	cfg.Kafka.Brokers = []string{"127.0.0.1:0"}
+	ctx := config.NewContext(cfg)
+	etl := NewETL(ctx)
+	// 注入抢不到的假锁（模拟另一副本持锁）。
+	etl.newLock = func(*config.Context) runLock { return &fakeLock{acquireOK: false} }
+
+	if err := etl.RunIncremental(context.Background()); err != nil {
+		t.Fatalf("lock-miss must short-circuit to nil (no DB access), got err=%v", err)
+	}
+}
