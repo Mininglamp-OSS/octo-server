@@ -895,6 +895,35 @@ other = "统计请求无效。"
 
 ["err.server.statistics.query_failed"]
 other = "查询统计数据失败。"
+# ---- err.server.app_bot.* (modules/app_bot: app_bot.go) ----
+
+["err.server.app_bot.request_invalid"]
+other = "请求参数有误。"
+
+["err.server.app_bot.id_invalid"]
+other = "机器人 ID 无效。"
+
+["err.server.app_bot.not_found"]
+other = "机器人不存在。"
+
+["err.server.app_bot.id_conflict"]
+other = "该机器人 ID 已被占用。"
+
+["err.server.app_bot.token_rotation_conflict"]
+other = "令牌已被其他请求轮换，请重试。"
+
+["err.server.app_bot.query_failed"]
+other = "查询数据失败。"
+
+["err.server.app_bot.store_failed"]
+other = "更新数据失败。"
+
+["err.server.app_bot.im_token_failed"]
+other = "获取 IM 令牌失败。"
+
+["err.server.app_bot.internal"]
+other = "服务器内部错误。"
+
 ["err.server.bot_api.request_invalid"]
 other = "请求参数有误。"
 

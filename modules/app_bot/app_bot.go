@@ -294,7 +294,7 @@ func (ab *AppBot) createPlatformBot(c *wkhttp.Context) {
 func (ab *AppBot) createSpaceBot(c *wkhttp.Context) {
 	spaceID := c.Param("space_id")
 	if err := ab.checkSpaceAdmin(c, spaceID); err != nil {
-		respondAppBotSpaceForbidden(c)
+		respondAppBotForbidden(c)
 		return
 	}
 	ab.createBot(c, "space", spaceID)
@@ -308,17 +308,17 @@ func (ab *AppBot) createBot(c *wkhttp.Context, scope, spaceID string) {
 		WelcomeMsg  string `json:"welcome_msg"`
 	}
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("invalid request body"))
+		respondAppBotRequestInvalid(c, "")
 		return
 	}
 
 	// Validate ID format
 	if !idPattern.MatchString(req.ID) {
-		c.ResponseError(errors.New("id must match ^[a-z0-9][a-z0-9_-]{0,29}$"))
+		respondAppBotIDInvalid(c)
 		return
 	}
 	if reservedIDs[req.ID] {
-		c.ResponseError(errors.New("id is reserved"))
+		respondAppBotIDInvalid(c)
 		return
 	}
 
@@ -331,7 +331,7 @@ func (ab *AppBot) createBot(c *wkhttp.Context, scope, spaceID string) {
 	token, err := generateAppBotToken()
 	if err != nil {
 		ab.Error("generate token failed", zap.Error(err))
-		c.ResponseError(errors.New("generate token failed"))
+		respondAppBotInternal(c)
 		return
 	}
 
@@ -351,11 +351,11 @@ func (ab *AppBot) createBot(c *wkhttp.Context, scope, spaceID string) {
 
 	if err := ab.db.insertAppBot(bot); err != nil {
 		if errors.Is(err, ErrIDAlreadyInUse) {
-			c.ResponseError(errors.New("id already in use"))
+			respondAppBotIDConflict(c)
 			return
 		}
 		ab.Error("insert app_bot failed", zap.Error(err))
-		c.ResponseError(errors.New("create app bot failed"))
+		respondAppBotStoreFailed(c)
 		return
 	}
 
@@ -370,7 +370,7 @@ func (ab *AppBot) createBot(c *wkhttp.Context, scope, spaceID string) {
 		// Rollback DB
 		ab.db.deleteAppBot(req.ID)
 		ab.Error("register IM token failed", zap.Any("error", tokenErr), zap.String("uid", uid))
-		c.ResponseError(errors.New("register IM token failed"))
+		respondAppBotIMTokenFailed(c)
 		return
 	}
 
@@ -402,7 +402,7 @@ func (ab *AppBot) createBot(c *wkhttp.Context, scope, spaceID string) {
 			ab.Warn("rollback UpdateIMToken failed", zap.Error(imErr), zap.String("uid", uid))
 		}
 		ab.Error("create user record for app bot failed, rolled back", zap.Error(err), zap.String("uid", uid))
-		c.ResponseError(errors.New("create app bot failed: user record creation failed"))
+		respondAppBotStoreFailed(c)
 		return
 	}
 
@@ -432,7 +432,7 @@ func (ab *AppBot) listPlatformBots(c *wkhttp.Context) {
 	bots, total, err := ab.db.queryBotsByScope("platform", "", pageIndex, pageSize, keyword, statusFilter)
 	if err != nil {
 		ab.Error("query platform bots failed", zap.Error(err))
-		c.ResponseError(errors.New("query failed"))
+		respondAppBotQueryFailed(c)
 		return
 	}
 	c.Response(gin.H{"count": total, "list": ab.toBotListResp(bots)})
@@ -442,7 +442,7 @@ func (ab *AppBot) listPlatformBots(c *wkhttp.Context) {
 func (ab *AppBot) listSpaceBots(c *wkhttp.Context) {
 	spaceID := c.Param("space_id")
 	if err := ab.checkSpaceAdmin(c, spaceID); err != nil {
-		respondAppBotSpaceForbidden(c)
+		respondAppBotForbidden(c)
 		return
 	}
 	pageIndex, pageSize := c.GetPage()
@@ -458,7 +458,7 @@ func (ab *AppBot) listSpaceBots(c *wkhttp.Context) {
 	bots, total, err := ab.db.queryBotsByScope("space", spaceID, pageIndex, pageSize, keyword, statusFilter)
 	if err != nil {
 		ab.Error("query space bots failed", zap.Error(err))
-		c.ResponseError(errors.New("query failed"))
+		respondAppBotQueryFailed(c)
 		return
 	}
 	c.Response(gin.H{"count": total, "list": ab.toBotListResp(bots)})
@@ -471,7 +471,7 @@ func (ab *AppBot) getBotDetail(c *wkhttp.Context) {
 
 	if spaceID != "" {
 		if err := ab.checkSpaceAdmin(c, spaceID); err != nil {
-			respondAppBotSpaceForbidden(c)
+			respondAppBotForbidden(c)
 			return
 		}
 	} else {
@@ -483,12 +483,12 @@ func (ab *AppBot) getBotDetail(c *wkhttp.Context) {
 
 	bot, err := ab.db.queryBotByID(id)
 	if err != nil || bot == nil {
-		c.JSON(http.StatusNotFound, gin.H{"msg": "bot not found"})
+		respondAppBotNotFound(c)
 		return
 	}
 
 	if spaceID != "" && (bot.Scope != "space" || bot.SpaceID != spaceID) {
-		c.JSON(http.StatusNotFound, gin.H{"msg": "bot not found"})
+		respondAppBotNotFound(c)
 		return
 	}
 
@@ -523,7 +523,7 @@ func (ab *AppBot) updateBot(c *wkhttp.Context) {
 
 	if spaceID != "" {
 		if err := ab.checkSpaceAdmin(c, spaceID); err != nil {
-			respondAppBotSpaceForbidden(c)
+			respondAppBotForbidden(c)
 			return
 		}
 	} else {
@@ -539,18 +539,18 @@ func (ab *AppBot) updateBot(c *wkhttp.Context) {
 		WelcomeMsg  *string `json:"welcome_msg"`
 	}
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("invalid request body"))
+		respondAppBotRequestInvalid(c, "")
 		return
 	}
 
 	if spaceID != "" {
 		existing, qerr := ab.db.queryBotByID(id)
 		if qerr != nil || existing == nil {
-			c.JSON(http.StatusNotFound, gin.H{"msg": "bot not found"})
+			respondAppBotNotFound(c)
 			return
 		}
 		if existing.Scope != "space" || existing.SpaceID != spaceID {
-			c.JSON(http.StatusNotFound, gin.H{"msg": "bot not found"})
+			respondAppBotNotFound(c)
 			return
 		}
 	}
@@ -566,13 +566,13 @@ func (ab *AppBot) updateBot(c *wkhttp.Context) {
 		updates["welcome_msg"] = *req.WelcomeMsg
 	}
 	if len(updates) == 0 {
-		c.ResponseError(errors.New("nothing to update"))
+		respondAppBotRequestInvalid(c, "")
 		return
 	}
 
 	if err := ab.db.updateAppBot(id, updates); err != nil {
 		ab.Error("update app_bot failed", zap.Error(err))
-		c.ResponseError(errors.New("update failed"))
+		respondAppBotStoreFailed(c)
 		return
 	}
 
@@ -611,7 +611,7 @@ func (ab *AppBot) deleteBot(c *wkhttp.Context) {
 
 	if spaceID != "" {
 		if err := ab.checkSpaceAdmin(c, spaceID); err != nil {
-			respondAppBotSpaceForbidden(c)
+			respondAppBotForbidden(c)
 			return
 		}
 	} else {
@@ -623,19 +623,19 @@ func (ab *AppBot) deleteBot(c *wkhttp.Context) {
 
 	bot, err := ab.db.queryBotByID(id)
 	if err != nil || bot == nil {
-		c.JSON(http.StatusNotFound, gin.H{"msg": "bot not found"})
+		respondAppBotNotFound(c)
 		return
 	}
 
 	if spaceID != "" && (bot.Scope != "space" || bot.SpaceID != spaceID) {
-		c.JSON(http.StatusNotFound, gin.H{"msg": "bot not found"})
+		respondAppBotNotFound(c)
 		return
 	}
 
 	// Delete from DB first; only after success remove from registries
 	if err := ab.db.deleteAppBot(id); err != nil {
 		ab.Error("delete app_bot failed", zap.Error(err))
-		c.ResponseError(errors.New("delete failed"))
+		respondAppBotStoreFailed(c)
 		return
 	}
 
@@ -671,7 +671,7 @@ func (ab *AppBot) rotateToken(c *wkhttp.Context) {
 
 	if spaceID != "" {
 		if err := ab.checkSpaceAdmin(c, spaceID); err != nil {
-			respondAppBotSpaceForbidden(c)
+			respondAppBotForbidden(c)
 			return
 		}
 	} else {
@@ -683,30 +683,30 @@ func (ab *AppBot) rotateToken(c *wkhttp.Context) {
 
 	bot, err := ab.db.queryBotByID(id)
 	if err != nil || bot == nil {
-		c.JSON(http.StatusNotFound, gin.H{"msg": "bot not found"})
+		respondAppBotNotFound(c)
 		return
 	}
 
 	if spaceID != "" && (bot.Scope != "space" || bot.SpaceID != spaceID) {
-		c.JSON(http.StatusNotFound, gin.H{"msg": "bot not found"})
+		respondAppBotNotFound(c)
 		return
 	}
 
 	newToken, err := generateAppBotToken()
 	if err != nil {
 		ab.Error("generate token failed", zap.Error(err))
-		c.ResponseError(errors.New("generate token failed"))
+		respondAppBotInternal(c)
 		return
 	}
 
 	// Update DB with optimistic lock (WHERE token=oldToken prevents TOCTOU race)
 	if err := ab.db.rotateAppBotToken(id, bot.Token, newToken); err != nil {
 		if errors.Is(err, ErrTokenRotationConflict) {
-			c.ResponseError(errors.New("token was rotated by another request, please retry"))
+			respondAppBotTokenRotationConflict(c)
 			return
 		}
 		ab.Error("update token failed", zap.Error(err))
-		c.ResponseError(errors.New("update token failed"))
+		respondAppBotStoreFailed(c)
 		return
 	}
 
@@ -724,7 +724,7 @@ func (ab *AppBot) rotateToken(c *wkhttp.Context) {
 				zap.String("bot_id", id), zap.Error(rbErr))
 		}
 		ab.Error("register new IM token failed", zap.Any("error", tokenErr))
-		c.ResponseError(errors.New("register IM token failed"))
+		respondAppBotIMTokenFailed(c)
 		return
 	}
 
@@ -761,7 +761,7 @@ func (ab *AppBot) revealToken(c *wkhttp.Context) {
 
 	if spaceID != "" {
 		if err := ab.checkSpaceAdmin(c, spaceID); err != nil {
-			respondAppBotSpaceForbidden(c)
+			respondAppBotForbidden(c)
 			return
 		}
 	} else {
@@ -773,12 +773,12 @@ func (ab *AppBot) revealToken(c *wkhttp.Context) {
 
 	bot, err := ab.db.queryBotByID(id)
 	if err != nil || bot == nil {
-		c.JSON(http.StatusNotFound, gin.H{"msg": "bot not found"})
+		respondAppBotNotFound(c)
 		return
 	}
 
 	if spaceID != "" && (bot.Scope != "space" || bot.SpaceID != spaceID) {
-		c.JSON(http.StatusNotFound, gin.H{"msg": "bot not found"})
+		respondAppBotNotFound(c)
 		return
 	}
 
@@ -799,7 +799,7 @@ func (ab *AppBot) publishBot(c *wkhttp.Context) {
 
 	if spaceID != "" {
 		if err := ab.checkSpaceAdmin(c, spaceID); err != nil {
-			respondAppBotSpaceForbidden(c)
+			respondAppBotForbidden(c)
 			return
 		}
 	} else {
@@ -811,12 +811,12 @@ func (ab *AppBot) publishBot(c *wkhttp.Context) {
 
 	bot, err := ab.db.queryBotByID(id)
 	if err != nil || bot == nil {
-		c.JSON(http.StatusNotFound, gin.H{"msg": "bot not found"})
+		respondAppBotNotFound(c)
 		return
 	}
 
 	if spaceID != "" && (bot.Scope != "space" || bot.SpaceID != spaceID) {
-		c.JSON(http.StatusNotFound, gin.H{"msg": "bot not found"})
+		respondAppBotNotFound(c)
 		return
 	}
 	if bot.Status == StatusPublished {
@@ -826,7 +826,7 @@ func (ab *AppBot) publishBot(c *wkhttp.Context) {
 
 	if err := ab.db.updateAppBot(id, map[string]interface{}{"status": StatusPublished}); err != nil {
 		ab.Error("publish app_bot failed", zap.Error(err))
-		c.ResponseError(errors.New("publish failed"))
+		respondAppBotStoreFailed(c)
 		return
 	}
 
@@ -854,7 +854,7 @@ func (ab *AppBot) unpublishBot(c *wkhttp.Context) {
 
 	if spaceID != "" {
 		if err := ab.checkSpaceAdmin(c, spaceID); err != nil {
-			respondAppBotSpaceForbidden(c)
+			respondAppBotForbidden(c)
 			return
 		}
 	} else {
@@ -866,12 +866,12 @@ func (ab *AppBot) unpublishBot(c *wkhttp.Context) {
 
 	bot, err := ab.db.queryBotByID(id)
 	if err != nil || bot == nil {
-		c.JSON(http.StatusNotFound, gin.H{"msg": "bot not found"})
+		respondAppBotNotFound(c)
 		return
 	}
 
 	if spaceID != "" && (bot.Scope != "space" || bot.SpaceID != spaceID) {
-		c.JSON(http.StatusNotFound, gin.H{"msg": "bot not found"})
+		respondAppBotNotFound(c)
 		return
 	}
 	if bot.Status == StatusUnpublished {
@@ -881,7 +881,7 @@ func (ab *AppBot) unpublishBot(c *wkhttp.Context) {
 
 	if err := ab.db.updateAppBot(id, map[string]interface{}{"status": StatusUnpublished}); err != nil {
 		ab.Error("unpublish app_bot failed", zap.Error(err))
-		c.ResponseError(errors.New("unpublish failed"))
+		respondAppBotStoreFailed(c)
 		return
 	}
 
@@ -931,7 +931,7 @@ func (ab *AppBot) discoverBots(c *wkhttp.Context) {
 	bots, err := ab.db.queryAvailableBots(loginUID, spaceIDFilter)
 	if err != nil {
 		ab.Error("query available bots failed", zap.Error(err))
-		c.ResponseError(errors.New("query failed"))
+		respondAppBotQueryFailed(c)
 		return
 	}
 
@@ -973,7 +973,7 @@ func (ab *AppBot) applyBot(c *wkhttp.Context) {
 		RobotUID string `json:"robot_uid" binding:"required"`
 	}
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(errors.New("invalid request body"))
+		respondAppBotRequestInvalid(c, "")
 		return
 	}
 
@@ -981,7 +981,7 @@ func (ab *AppBot) applyBot(c *wkhttp.Context) {
 
 	// Validate robot_uid format: must match app_*_bot pattern
 	if !strings.HasPrefix(req.RobotUID, AppBotUIDPrefix) || !strings.HasSuffix(req.RobotUID, AppBotUIDSuffix) {
-		c.ResponseError(errors.New("invalid robot_uid format"))
+		respondAppBotRequestInvalid(c, "robot_uid")
 		return
 	}
 
@@ -989,18 +989,20 @@ func (ab *AppBot) applyBot(c *wkhttp.Context) {
 	bot, err := ab.db.queryBotByUID(req.RobotUID)
 	if err != nil {
 		ab.Error("query app_bot failed", zap.Error(err))
-		c.ResponseError(errors.New("\u67e5\u8be2\u673a\u5668\u4eba\u5931\u8d25"))
+		respondAppBotQueryFailed(c)
 		return
 	}
 	if bot == nil || bot.Status != StatusPublished {
-		c.ResponseError(errors.New("\u673a\u5668\u4eba\u4e0d\u5b58\u5728\u6216\u672a\u53d1\u5e03"))
+		respondAppBotNotFound(c)
 		return
 	}
 
 	// Space bot: verify user is space member (fail-closed if SpaceID is unexpectedly empty)
 	if bot.Scope == "space" {
 		if bot.SpaceID == "" {
-			c.ResponseError(errors.New("internal error: space bot missing space_id"))
+			ab.Error("app_bot invariant violated: space bot missing space_id",
+				zap.String("bot_id", bot.ID), zap.String("bot_uid", bot.UID))
+			respondAppBotInternal(c)
 			return
 		}
 		var memberCount int
@@ -1010,11 +1012,11 @@ func (ab *AppBot) applyBot(c *wkhttp.Context) {
 		).LoadOne(&memberCount)
 		if err != nil {
 			ab.Error("query space membership failed", zap.Error(err))
-			c.ResponseError(errors.New("\u67e5\u8be2\u7a7a\u95f4\u6210\u5458\u5931\u8d25"))
+			respondAppBotQueryFailed(c)
 			return
 		}
 		if memberCount == 0 {
-			c.ResponseError(errors.New("\u4f60\u4e0d\u662f\u8be5\u7a7a\u95f4\u7684\u6210\u5458"))
+			respondAppBotForbidden(c)
 			return
 		}
 	}
@@ -1023,7 +1025,7 @@ func (ab *AppBot) applyBot(c *wkhttp.Context) {
 	isFriend, err := ab.userService.IsFriend(loginUID, req.RobotUID)
 	if err != nil {
 		ab.Error("check friend failed", zap.Error(err))
-		c.ResponseError(errors.New("\u68c0\u67e5\u597d\u53cb\u5173\u7cfb\u5931\u8d25"))
+		respondAppBotQueryFailed(c)
 		return
 	}
 	if isFriend {
@@ -1036,7 +1038,7 @@ func (ab *AppBot) applyBot(c *wkhttp.Context) {
 	err = ab.userService.AddFriend(loginUID, &user.FriendReq{UID: loginUID, ToUID: req.RobotUID})
 	if err != nil {
 		ab.Error("add friend (user->bot) failed", zap.Error(err))
-		c.ResponseError(errors.New("\u521b\u5efa\u597d\u53cb\u5173\u7cfb\u5931\u8d25"))
+		respondAppBotStoreFailed(c)
 		return
 	}
 	err = ab.userService.AddFriend(req.RobotUID, &user.FriendReq{UID: req.RobotUID, ToUID: loginUID})
@@ -1047,7 +1049,7 @@ func (ab *AppBot) applyBot(c *wkhttp.Context) {
 			ab.Error("friend rollback failed — one-directional friend record may remain",
 				zap.String("uid", loginUID), zap.String("toUID", req.RobotUID), zap.Error(rbErr))
 		}
-		c.ResponseError(errors.New("\u521b\u5efa\u597d\u53cb\u5173\u7cfb\u5931\u8d25"))
+		respondAppBotStoreFailed(c)
 		return
 	}
 

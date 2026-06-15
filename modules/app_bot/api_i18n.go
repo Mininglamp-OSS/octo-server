@@ -2,42 +2,77 @@ package app_bot
 
 import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
-	"github.com/Mininglamp-OSS/octo-server/pkg/i18n/codes"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 )
 
-// errSharedForbidden caches the shared 403 code used by the platform-level
-// (/v1/admin/app_bot) role guards. Looked up at package init so a missing
-// registration panics loudly here rather than rendering an empty envelope at
-// request time.
-var errSharedForbidden = mustLookupSharedCode("err.shared.auth.forbidden")
+// This file localizes the app_bot error responses. Every handler used to return
+// raw, unlocalized strings — c.ResponseError(errors.New("...")),
+// c.AbortWithStatusJSON(403, err.Error()) and c.JSON(40x, {"msg": "..."}) —
+// which leaked English/Chinese framework text straight onto the wire and could
+// not be language-negotiated. They now route through these helpers onto a
+// registered errcode + the i18n envelope. Status-preserving codes (404/409/403/
+// 500) use ResponseErrorLWithStatus so the console keeps branching on the real
+// wire status; validation stays at 400.
 
-func mustLookupSharedCode(id string) codes.Code {
-	c, ok := codes.Lookup(id)
-	if !ok {
-		panic("modules/app_bot: shared code not registered: " + id)
-	}
-	return c
-}
-
-// respondAppBotForbidden renders the localized shared forbidden envelope for the
-// platform /v1/admin/app_bot role guards. It replaces the legacy
-// c.ResponseError(err) that forwarded wkhttp's raw, unlocalized framework string
-// ("该用户无权执行此操作") straight onto the wire. ResponseErrorL keeps the
-// legacy fixed-400 wire status these guards already returned (D14). The guards
-// collapse to one generic forbidden code (anti-enumeration): the specific role
-// reason stays in logs, never on the client.
+// respondAppBotForbidden renders the localized shared 403 for every app_bot
+// authorization guard: the platform /v1/admin/app_bot system-role gates, the
+// space-scoped checkSpaceAdmin gates, and the apply-flow space-membership check.
+// All collapse to one generic forbidden code (anti-enumeration) — the specific
+// role/membership reason stays in logs, never on the client.
 func respondAppBotForbidden(c *wkhttp.Context) {
-	httperr.ResponseErrorL(c, errSharedForbidden, nil, nil)
+	httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedForbidden, nil, nil)
 }
 
-// respondAppBotSpaceForbidden renders the same localized shared forbidden
-// envelope for the space-scoped /v1/space/:space_id/app_bot guards, which
-// replaced a raw c.AbortWithStatusJSON(403, err.Error()) that leaked
-// checkSpaceAdmin's English string ("no permission: requires space admin").
-// Unlike the platform guards, these already returned a real 403, so this uses
-// ResponseErrorLWithStatus to preserve that status (the code's real 403) rather
-// than collapse it to the legacy 400 — no client-visible status change.
-func respondAppBotSpaceForbidden(c *wkhttp.Context) {
-	httperr.ResponseErrorLWithStatus(c, errSharedForbidden, nil, nil)
+// respondAppBotRequestInvalid covers malformed / empty request input (BindJSON
+// failure, invalid robot_uid, empty update). An empty field is omitted so the
+// renderer does not surface a noisy empty key.
+func respondAppBotRequestInvalid(c *wkhttp.Context, field string) {
+	details := i18n.Details{}
+	if field != "" {
+		details["field"] = field
+	}
+	httperr.ResponseErrorL(c, errcode.ErrAppBotRequestInvalid, nil, details)
+}
+
+// respondAppBotIDInvalid covers a bot id failing the format rule or colliding
+// with a reserved id.
+func respondAppBotIDInvalid(c *wkhttp.Context) {
+	httperr.ResponseErrorL(c, errcode.ErrAppBotIDInvalid, nil, nil)
+}
+
+// respondAppBotNotFound renders the status-preserving 404 for a missing or
+// scope-mismatched bot.
+func respondAppBotNotFound(c *wkhttp.Context) {
+	httperr.ResponseErrorLWithStatus(c, errcode.ErrAppBotNotFound, nil, nil)
+}
+
+// respondAppBotIDConflict renders the 409 for a create colliding with an in-use id.
+func respondAppBotIDConflict(c *wkhttp.Context) {
+	httperr.ResponseErrorLWithStatus(c, errcode.ErrAppBotIDConflict, nil, nil)
+}
+
+// respondAppBotTokenRotationConflict renders the 409 for a lost token-rotation race.
+func respondAppBotTokenRotationConflict(c *wkhttp.Context) {
+	httperr.ResponseErrorLWithStatus(c, errcode.ErrAppBotTokenRotationConflict, nil, nil)
+}
+
+// respondAppBotQueryFailed / StoreFailed / IMTokenFailed / Internal render the
+// status-preserving 500. Internal=true hides the message — callers MUST log the
+// underlying err (zap.Error) with context before calling these.
+func respondAppBotQueryFailed(c *wkhttp.Context) {
+	httperr.ResponseErrorLWithStatus(c, errcode.ErrAppBotQueryFailed, nil, nil)
+}
+
+func respondAppBotStoreFailed(c *wkhttp.Context) {
+	httperr.ResponseErrorLWithStatus(c, errcode.ErrAppBotStoreFailed, nil, nil)
+}
+
+func respondAppBotIMTokenFailed(c *wkhttp.Context) {
+	httperr.ResponseErrorLWithStatus(c, errcode.ErrAppBotIMTokenFailed, nil, nil)
+}
+
+func respondAppBotInternal(c *wkhttp.Context) {
+	httperr.ResponseErrorLWithStatus(c, errcode.ErrAppBotInternal, nil, nil)
 }

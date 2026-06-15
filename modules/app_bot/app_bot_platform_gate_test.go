@@ -61,11 +61,10 @@ func TestPlatformAppBot_AdminAllowed(t *testing.T) {
 	route.ServeHTTP(w, req)
 
 	body := w.Body.String()
-	// admin reaches request validation (proves the gate let it through), and the
-	// response is NOT a forbidden envelope.
-	assert.Contains(t, body, "invalid request body", "admin must pass the gate and reach handler validation")
-	assert.NotContains(t, body, "permission", "admin must not be forbidden")
-	assert.NotContains(t, body, "无权", "admin must not be forbidden")
+	// admin reaches request validation (proves the gate let it through), now the
+	// localized "Invalid request." envelope — and NOT a forbidden envelope.
+	assert.Contains(t, body, "Invalid request", "admin must pass the gate and reach handler validation")
+	assert.NotContains(t, body, "You do not have permission", "admin must not be forbidden")
 }
 
 // TestPlatformAppBot_PlainUserForbiddenLocalized pins both the gate (a user with
@@ -87,6 +86,23 @@ func TestPlatformAppBot_PlainUserForbiddenLocalized(t *testing.T) {
 	// unlocalized wkhttp framework string the legacy c.ResponseError(err) leaked.
 	assert.NotContains(t, body, "该用户无权执行此操作", "must not leak the raw wkhttp framework string")
 	assert.Contains(t, body, "permission", "renders the localized shared-forbidden message")
+}
+
+// TestPlatformAppBot_NotFoundLocalized pins the correct-semantics migration of
+// the not-found path: an admin querying a missing bot gets a real 404 with the
+// localized "Bot not found." envelope (was a raw c.JSON(404, {"msg":"bot not
+// found"})).
+func TestPlatformAppBot_NotFoundLocalized(t *testing.T) {
+	route, cleanup := newPlatformGateRoute(t, string(wkhttp.Admin))
+	defer cleanup()
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/admin/app_bot/does-not-exist", nil)
+	req.Header.Set("token", testutil.Token)
+	route.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusNotFound, w.Code, "missing bot returns a real 404")
+	assert.Contains(t, w.Body.String(), "Bot not found", "localized not-found message")
 }
 
 // TestSpaceAppBot_ForbiddenLocalized pins the space-scoped guard migration: a

@@ -6,6 +6,33 @@
 #
 # CI rejects PRs that change codes.Register input without re-running extract.
 
+["err.server.app_bot.id_conflict"]
+other = "The bot id is already in use."
+
+["err.server.app_bot.id_invalid"]
+other = "Invalid bot id."
+
+["err.server.app_bot.im_token_failed"]
+other = "Failed to obtain an IM token."
+
+["err.server.app_bot.internal"]
+other = "Internal error."
+
+["err.server.app_bot.not_found"]
+other = "Bot not found."
+
+["err.server.app_bot.query_failed"]
+other = "Failed to query data."
+
+["err.server.app_bot.request_invalid"]
+other = "Invalid request."
+
+["err.server.app_bot.store_failed"]
+other = "Failed to update data."
+
+["err.server.app_bot.token_rotation_conflict"]
+other = "The token was rotated by another request; please retry."
+
 ["err.server.bot.occupied"]
 other = "Bot is already occupied by another agent."
 
