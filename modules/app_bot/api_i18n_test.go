@@ -52,6 +52,30 @@ func TestAppBotNoLegacyResponseError(t *testing.T) {
 	}
 }
 
+// TestAppBotNotFoundPinnedIsWire400 pins the apply-path responder: it carries the
+// real 404 in the envelope but keeps the legacy fixed-400 wire status (D14), so
+// existing /v1/app_bot/apply SDK clients that branch on 400 don't break.
+func TestAppBotNotFoundPinnedIsWire400(t *testing.T) {
+	r := appBotHelperHarness(respondAppBotNotFoundPinned)
+	req := httptest.NewRequest(http.MethodGet, "/probe", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("wire status = %d, want 400 (D14 pinned for the apply path); body=%s", rec.Code, rec.Body.String())
+	}
+	var env appBotEnvelope
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode envelope: %v; body=%s", err, rec.Body.String())
+	}
+	if env.Error.Code != "err.server.app_bot.not_found" {
+		t.Fatalf("error.code = %q, want err.server.app_bot.not_found", env.Error.Code)
+	}
+	if env.Error.HTTPStatus != http.StatusNotFound {
+		t.Fatalf("error.http_status = %d, want 404 (envelope keeps the real status)", env.Error.HTTPStatus)
+	}
+}
+
 // appBotEnvelope is the partial shape of an httperr.ResponseErrorL* response.
 type appBotEnvelope struct {
 	Error struct {

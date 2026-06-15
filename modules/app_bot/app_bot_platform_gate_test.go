@@ -21,7 +21,7 @@ import (
 // token. The harness wires no RoleResolver, so the token role is authoritative
 // (same approach as newApplyBotRateLimitTestRoute). DB is sqlmock — the gate is
 // the first thing each handler does, so the role tests never reach a query.
-func newPlatformGateRoute(t *testing.T, role string) (*wkhttp.WKHttp, func()) {
+func newPlatformGateRouteWithMock(t *testing.T, role string) (*wkhttp.WKHttp, sqlmock.Sqlmock, func()) {
 	t.Helper()
 	cfg := config.New()
 	cfg.Test = true
@@ -33,7 +33,7 @@ func newPlatformGateRoute(t *testing.T, role string) (*wkhttp.WKHttp, func()) {
 	}
 	require.NoError(t, ctx.Cache().Set(cfg.Cache.TokenCachePrefix+testutil.Token, val))
 
-	rawDB, _, err := sqlmock.New()
+	rawDB, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	conn := &dbr.Connection{DB: rawDB, EventReceiver: &dbr.NullEventReceiver{}, Dialect: dialect.MySQL}
 
@@ -44,7 +44,50 @@ func newPlatformGateRoute(t *testing.T, role string) (*wkhttp.WKHttp, func()) {
 		Log: log.NewTLog("AppBotPlatformGateTest"),
 	}
 	ab.Route(route)
-	return route, func() { _ = rawDB.Close() }
+	return route, mock, func() { _ = rawDB.Close() }
+}
+
+func newPlatformGateRoute(t *testing.T, role string) (*wkhttp.WKHttp, func()) {
+	t.Helper()
+	route, _, cleanup := newPlatformGateRouteWithMock(t, role)
+	return route, cleanup
+}
+
+// TestBotInRouteScope pins the cross-tenant scope boundary: the platform route
+// (spaceID=="") admits only platform bots, the space route only its own space's
+// bots. The false case on row 2 is the IDOR guard — a platform-route caller must
+// not reach a space-scoped bot.
+func TestBotInRouteScope(t *testing.T) {
+	platform := &appBotModel{Scope: "platform"}
+	spaceX := &appBotModel{Scope: "space", SpaceID: "X"}
+
+	assert.True(t, botInRouteScope(platform, ""), "platform route admits a platform bot")
+	assert.False(t, botInRouteScope(spaceX, ""), "platform route must NOT admit a space bot (cross-tenant IDOR guard)")
+	assert.True(t, botInRouteScope(spaceX, "X"), "space route admits its own space's bot")
+	assert.False(t, botInRouteScope(spaceX, "Y"), "space route must NOT admit another space's bot")
+	assert.False(t, botInRouteScope(platform, "X"), "space route must NOT admit a platform bot")
+}
+
+// TestPlatformAppBot_SpaceBotViaPlatformRouteRejected is the regression test for
+// the cross-tenant token-exposure path: an admin hitting the platform
+// reveal-token route with a SPACE bot's (global) id must get 404, and the space
+// bot's raw token must never be returned.
+func TestPlatformAppBot_SpaceBotViaPlatformRouteRejected(t *testing.T) {
+	route, mock, cleanup := newPlatformGateRouteWithMock(t, string(wkhttp.Admin))
+	defer cleanup()
+
+	mock.ExpectQuery("app_bot").WithArgs("space-bot-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "scope", "space_id", "status", "token"}).
+			AddRow("space-bot-1", "space", "X", 1, "super-secret-space-token"))
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/admin/app_bot/space-bot-1/token/reveal", nil)
+	req.Header.Set("token", testutil.Token)
+	route.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusNotFound, w.Code, "platform route must not reach a space bot")
+	assert.NotContains(t, w.Body.String(), "super-secret-space-token",
+		"a space bot's token must never be revealed via the platform route")
 }
 
 // TestPlatformAppBot_AdminAllowed pins the loosening: platform bot management is

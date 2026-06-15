@@ -107,7 +107,7 @@ func NewAppBot(ctx *config.Context) *AppBot {
 
 // Route registers all App Bot management routes.
 func (ab *AppBot) Route(r *wkhttp.WKHttp) {
-	// Platform Admin API (requires login, super admin check in handlers)
+	// Platform Admin API (requires login, admin∪superAdmin role check in handlers)
 	adminAPI := r.Group("/v1/admin/app_bot", ab.ctx.AuthMiddleware(r))
 	{
 		adminAPI.POST("", ab.createPlatformBot)
@@ -158,6 +158,20 @@ func (ab *AppBot) checkSpaceAdmin(c *wkhttp.Context, spaceID string) error {
 		return errors.New("no permission: requires space admin")
 	}
 	return nil
+}
+
+// botInRouteScope reports whether bot belongs to the route it was reached
+// through, so a handler that loaded a bot by its (global) id can reject one that
+// lives outside the caller's authority. The platform route (/v1/admin/app_bot,
+// spaceID=="") manages ONLY platform-scoped bots; the space route only its own
+// space's bots. Without the platform-side half of this check an admin on the
+// platform route could read/rotate any space's bot token by global id (a
+// cross-tenant IDOR) — the space route already enforced its half.
+func botInRouteScope(bot *appBotModel, spaceID string) bool {
+	if spaceID == "" {
+		return bot.Scope == "platform"
+	}
+	return bot.Scope == "space" && bot.SpaceID == spaceID
 }
 
 // ==================== Registry ====================
@@ -482,12 +496,15 @@ func (ab *AppBot) getBotDetail(c *wkhttp.Context) {
 	}
 
 	bot, err := ab.db.queryBotByID(id)
+	if err != nil {
+		ab.Error("query app_bot failed", zap.Error(err), zap.String("id", id))
+	}
 	if err != nil || bot == nil {
 		respondAppBotNotFound(c)
 		return
 	}
 
-	if spaceID != "" && (bot.Scope != "space" || bot.SpaceID != spaceID) {
+	if !botInRouteScope(bot, spaceID) {
 		respondAppBotNotFound(c)
 		return
 	}
@@ -543,16 +560,17 @@ func (ab *AppBot) updateBot(c *wkhttp.Context) {
 		return
 	}
 
-	if spaceID != "" {
-		existing, qerr := ab.db.queryBotByID(id)
-		if qerr != nil || existing == nil {
-			respondAppBotNotFound(c)
-			return
-		}
-		if existing.Scope != "space" || existing.SpaceID != spaceID {
-			respondAppBotNotFound(c)
-			return
-		}
+	existing, qerr := ab.db.queryBotByID(id)
+	if qerr != nil {
+		ab.Error("query app_bot failed", zap.Error(qerr), zap.String("id", id))
+	}
+	if qerr != nil || existing == nil {
+		respondAppBotNotFound(c)
+		return
+	}
+	if !botInRouteScope(existing, spaceID) {
+		respondAppBotNotFound(c)
+		return
 	}
 
 	updates := make(map[string]interface{})
@@ -622,12 +640,15 @@ func (ab *AppBot) deleteBot(c *wkhttp.Context) {
 	}
 
 	bot, err := ab.db.queryBotByID(id)
+	if err != nil {
+		ab.Error("query app_bot failed", zap.Error(err), zap.String("id", id))
+	}
 	if err != nil || bot == nil {
 		respondAppBotNotFound(c)
 		return
 	}
 
-	if spaceID != "" && (bot.Scope != "space" || bot.SpaceID != spaceID) {
+	if !botInRouteScope(bot, spaceID) {
 		respondAppBotNotFound(c)
 		return
 	}
@@ -682,12 +703,15 @@ func (ab *AppBot) rotateToken(c *wkhttp.Context) {
 	}
 
 	bot, err := ab.db.queryBotByID(id)
+	if err != nil {
+		ab.Error("query app_bot failed", zap.Error(err), zap.String("id", id))
+	}
 	if err != nil || bot == nil {
 		respondAppBotNotFound(c)
 		return
 	}
 
-	if spaceID != "" && (bot.Scope != "space" || bot.SpaceID != spaceID) {
+	if !botInRouteScope(bot, spaceID) {
 		respondAppBotNotFound(c)
 		return
 	}
@@ -772,12 +796,15 @@ func (ab *AppBot) revealToken(c *wkhttp.Context) {
 	}
 
 	bot, err := ab.db.queryBotByID(id)
+	if err != nil {
+		ab.Error("query app_bot failed", zap.Error(err), zap.String("id", id))
+	}
 	if err != nil || bot == nil {
 		respondAppBotNotFound(c)
 		return
 	}
 
-	if spaceID != "" && (bot.Scope != "space" || bot.SpaceID != spaceID) {
+	if !botInRouteScope(bot, spaceID) {
 		respondAppBotNotFound(c)
 		return
 	}
@@ -810,12 +837,15 @@ func (ab *AppBot) publishBot(c *wkhttp.Context) {
 	}
 
 	bot, err := ab.db.queryBotByID(id)
+	if err != nil {
+		ab.Error("query app_bot failed", zap.Error(err), zap.String("id", id))
+	}
 	if err != nil || bot == nil {
 		respondAppBotNotFound(c)
 		return
 	}
 
-	if spaceID != "" && (bot.Scope != "space" || bot.SpaceID != spaceID) {
+	if !botInRouteScope(bot, spaceID) {
 		respondAppBotNotFound(c)
 		return
 	}
@@ -865,12 +895,15 @@ func (ab *AppBot) unpublishBot(c *wkhttp.Context) {
 	}
 
 	bot, err := ab.db.queryBotByID(id)
+	if err != nil {
+		ab.Error("query app_bot failed", zap.Error(err), zap.String("id", id))
+	}
 	if err != nil || bot == nil {
 		respondAppBotNotFound(c)
 		return
 	}
 
-	if spaceID != "" && (bot.Scope != "space" || bot.SpaceID != spaceID) {
+	if !botInRouteScope(bot, spaceID) {
 		respondAppBotNotFound(c)
 		return
 	}
@@ -993,7 +1026,7 @@ func (ab *AppBot) applyBot(c *wkhttp.Context) {
 		return
 	}
 	if bot == nil || bot.Status != StatusPublished {
-		respondAppBotNotFound(c)
+		respondAppBotNotFoundPinned(c)
 		return
 	}
 

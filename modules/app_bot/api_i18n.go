@@ -48,6 +48,14 @@ func respondAppBotNotFound(c *wkhttp.Context) {
 	httperr.ResponseErrorLWithStatus(c, errcode.ErrAppBotNotFound, nil, nil)
 }
 
+// respondAppBotNotFoundPinned renders the same not-found code at the legacy
+// fixed-400 wire status (D14), for the user-facing /v1/app_bot/apply endpoint
+// whose SDK clients may branch on 400. The management-console paths use
+// respondAppBotNotFound (real 404) instead.
+func respondAppBotNotFoundPinned(c *wkhttp.Context) {
+	httperr.ResponseErrorL(c, errcode.ErrAppBotNotFound, nil, nil)
+}
+
 // respondAppBotIDConflict renders the 409 for a create colliding with an in-use id.
 func respondAppBotIDConflict(c *wkhttp.Context) {
 	httperr.ResponseErrorLWithStatus(c, errcode.ErrAppBotIDConflict, nil, nil)
