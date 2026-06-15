@@ -183,29 +183,28 @@ func (d *integrationDB) queryGroupCreatedAt(groupNo string) (time.Time, error) {
 	return createdAt, nil
 }
 
-// queryGroupStatus returns the group's status, scoped to the given space, and explicitly
-// distinguishes "group not in this space / not found" (found=false, err=nil) from a DB
-// failure (err!=nil). Scoping by space_id keeps the existence check inside the uk_ key's
-// space binding — a key for space A must not confirm groups that live in space B.
-func (d *integrationDB) queryGroupStatus(groupNo, spaceID string) (status int, found bool, err error) {
-	e := d.session.Select("status").From("`group`").
-		Where("group_no=? AND space_id=?", groupNo, spaceID).LoadOne(&status)
+// queryGroupStatus returns the group's status and creator, scoped to the given space, and
+// explicitly distinguishes "group not in this space / not found" (found=false, err=nil) from
+// a DB failure (err!=nil). Scoping by space_id keeps the existence check inside the uk_ key's
+// space binding — a key for space A must not confirm groups that live in space B. The creator
+// is returned so the existence check can be owner-scoped (creator==uid), not merely
+// member-scoped.
+func (d *integrationDB) queryGroupStatus(groupNo, spaceID string) (status int, creator string, found bool, err error) {
+	var row struct {
+		Status  int    `db:"status"`
+		Creator string `db:"creator"`
+	}
+	e := d.session.Select("status", "creator").From("`group`").
+		Where("group_no=? AND space_id=?", groupNo, spaceID).LoadOne(&row)
 	if errors.Is(e, dbr.ErrNotFound) {
-		return 0, false, nil
+		return 0, "", false, nil
 	}
 	if e != nil {
-		return 0, false, fmt.Errorf("integration: query group status %q: %w", groupNo, e)
+		return 0, "", false, fmt.Errorf("integration: query group status %q: %w", groupNo, e)
 	}
-	return status, true, nil
+	return row.Status, row.Creator, true, nil
 }
 
-// queryOwnedActiveBotIDs returns the robot_ids that group.CreateGroup will actually
-// insert as members for this owner+space: owned (creator_uid) and active (robot.status=1),
-// active in the space (space_member.status=1), AND backed by a usable user row — it exists
-// and is not finalized-destroyed (is_destroy<>IsDestroyDone). This mirrors CreateGroup's
-// insertion source (QueryByUIDs on the user table + the IsDestroyDone skip), so validating
-// member_robot_ids against this set up front turns an unusable bot into a 404 *before* any
-// group is created, instead of a created-then-500 that leaks an orphaned group.
 // isHumanUser reports whether uid is a human account (user row exists with robot=0). Bots
 // never obtain a uk_ key (they don't go through OIDC exchange) and AuthByKey only checks
 // account activity, not the robot flag — so this is the guard that keeps a team group's
@@ -225,6 +224,18 @@ func (d *integrationDB) isHumanUser(uid string) (bool, error) {
 	return robot == 0, nil
 }
 
+// queryOwnedActiveBotIDs returns the robot_ids that group.CreateGroup will actually insert as
+// members for this owner+space: owned (creator_uid) and active (robot.status=1), active in the
+// space (space_member.status=1), AND backed by a usable user row — it exists and is not
+// finalized-destroyed (is_destroy<>IsDestroyDone). This mirrors CreateGroup's insertion source
+// (QueryByUIDs on the user table + the IsDestroyDone skip), so validating member_robot_ids
+// against this set up front turns an unusable bot into a 404 *before* any group is created,
+// instead of a created-then-500 that leaks an orphaned group.
+//
+// Intentionally does NOT filter on robot.bound_agent_ref (unlike the sibling
+// queryAvailableBotSpaces, which lists only unoccupied bots for the exchange picker):
+// agent-occupation and team-group membership are orthogonal — a user may put their own bot in
+// a team group regardless of whether it is currently bound to an agent.
 func (d *integrationDB) queryOwnedActiveBotIDs(uid, spaceID string) (map[string]bool, error) {
 	out := make(map[string]bool)
 	if uid == "" || spaceID == "" {

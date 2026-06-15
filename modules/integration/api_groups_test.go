@@ -403,6 +403,75 @@ func TestIntegrationTeamGroupExistsIsSpaceScoped(t *testing.T) {
 	assert.True(t, exists(keyB), "the space-B key must see its own group")
 }
 
+// TestIntegrationTeamGroupEndpointsRejectUnauthenticated pins that both endpoints sit behind
+// userAPIKeyAuth — a missing, malformed, or unknown token is rejected with 401 before any
+// handler logic runs. Guards against a future refactor accidentally dropping the auth.
+func TestIntegrationTeamGroupEndpointsRejectUnauthenticated(t *testing.T) {
+	route, _, _ := setupIntegrationAPITest(t)
+	endpoints := []struct {
+		method, path string
+		body         interface{}
+	}{
+		{http.MethodPost, "/v1/integrations/oidc/groups", map[string]interface{}{"name": "x", "member_robot_ids": []string{"b"}}},
+		{http.MethodGet, "/v1/integrations/oidc/groups/grp_x", nil},
+	}
+	for _, ep := range endpoints {
+		for _, token := range []string{"", "garbage-no-prefix", "uk_does_not_exist"} {
+			w := httptest.NewRecorder()
+			route.ServeHTTP(w, integrationRequest(t, ep.method, ep.path, token, ep.body))
+			require.Equal(t, http.StatusUnauthorized, w.Code, "%s %s token=%q: %s", ep.method, ep.path, token, w.Body.String())
+			assert.Equal(t, "err.shared.auth.token_invalid", decodeErrCode(t, w))
+		}
+	}
+}
+
+// TestIntegrationTeamGroupExistsIsOwnerScoped verifies the existence check is owner-scoped, not
+// merely member-scoped: a same-space active member who is NOT the group creator gets
+// exists:false, while the creator gets exists:true.
+func TestIntegrationTeamGroupExistsIsOwnerScoped(t *testing.T) {
+	route, ctx, mp := setupIntegrationAPITest(t)
+	subjA := "sub-owner-a"
+	uidA := seedIntegrationUser(t, ctx, mp.Issuer, subjA)
+	space := "sp_" + util.GenerUUID()[:8]
+	seedSpaceMembership(t, ctx, uidA, space, "Team", 1, "2026-01-01 10:00:00")
+	bot := "bot_" + util.GenerUUID()[:8]
+	seedOwnBot(t, ctx, uidA, space, bot, "")
+	keyA := exchangeTeamGroupKey(t, route, mp, subjA, space)
+
+	w := httptest.NewRecorder()
+	route.ServeHTTP(w, integrationRequest(t, http.MethodPost, "/v1/integrations/oidc/groups", keyA, map[string]interface{}{
+		"name":             "团队群",
+		"member_robot_ids": []string{bot},
+	}))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var created createGroupResp
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &created))
+	groupNo := created.GroupID
+
+	// User B: active member of the same space AND an active member of A's group, but not creator.
+	subjB := "sub-member-b"
+	uidB := seedIntegrationUser(t, ctx, mp.Issuer, subjB)
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW())",
+		space, uidB,
+	).Exec()
+	require.NoError(t, err)
+	_, err = ctx.DB().InsertBySql("INSERT INTO `group_member` (group_no, uid) VALUES (?, ?)", groupNo, uidB).Exec()
+	require.NoError(t, err)
+	keyB := exchangeTeamGroupKey(t, route, mp, subjB, space)
+
+	exists := func(apiKey string) bool {
+		ww := httptest.NewRecorder()
+		route.ServeHTTP(ww, integrationRequest(t, http.MethodGet, "/v1/integrations/oidc/groups/"+groupNo, apiKey, nil))
+		require.Equal(t, http.StatusOK, ww.Code, ww.Body.String())
+		var r groupExistsResp
+		require.NoError(t, json.Unmarshal(ww.Body.Bytes(), &r))
+		return r.Exists
+	}
+	assert.False(t, exists(keyB), "a non-creator active member must not see the group as existing")
+	assert.True(t, exists(keyA), "the creator must see their own group")
+}
+
 // decodeErrCode extracts error.code from the shared i18n error envelope.
 func decodeErrCode(t *testing.T, w *httptest.ResponseRecorder) string {
 	t.Helper()

@@ -72,6 +72,20 @@ func (it *Integration) createGroup(c *wkhttp.Context) {
 		return
 	}
 
+	// 幂等（可选，Stripe 式）：仅当客户端带 Idempotency-Key 才启用。关键顺序——先按 body 指纹
+	// 查幂等记录（回放/冲突/in-flight），放在下面 membership / human / bot 这些「可变」校验之前：
+	// 首次成功后即便调用者成员身份或 bot 状态变了，同 key + 同 body 的重试仍能回放原结果，
+	// 而不是撞 403/404（满足回放契约）。
+	idemKey := strings.TrimSpace(c.GetHeader(idempotencyKeyHeader))
+	var redisKey, payloadSHA string
+	if idemKey != "" {
+		payloadSHA = teamGroupPayloadSHA(name, robotIDs)
+		redisKey = teamGroupIdemRedisKey(key.ClientID, key.UID, key.SpaceID, idemKey)
+		if it.idemLookup(c, redisKey, payloadSHA) {
+			return // 已写出：回放 200 / 冲突 409 / in-flight 409
+		}
+	}
+
 	// 3. owner 在 Space：前置以拿到 403；否则 CreateGroup 内部的同名校验只会冒泡成 500。
 	member, err := pkgspace.CheckMembership(it.ctx.DB(), key.SpaceID, key.UID)
 	if err != nil {
@@ -114,24 +128,23 @@ func (it *Integration) createGroup(c *wkhttp.Context) {
 		}
 	}
 
-	// 幂等（可选）：仅当客户端带 Idempotency-Key 才启用。
-	idemKey := strings.TrimSpace(c.GetHeader(idempotencyKeyHeader))
-	payloadSHA := teamGroupPayloadSHA(name, robotIDs)
-	var redisKey string
+	// 首次请求才占坑（reserve）：上面 idemLookup 已排除回放/冲突/in-flight；这里 SETNX 兜住
+	// 并发首次请求的竞争。
 	reserved := false
 	if idemKey != "" {
-		redisKey = teamGroupIdemRedisKey(key.ClientID, key.UID, key.SpaceID, idemKey)
-		handled, holding := it.idemBegin(c, redisKey, payloadSHA)
+		handled, holding := it.idemReserve(c, redisKey, payloadSHA)
 		if handled {
-			return // 响应已写出（回放 200 / 冲突 400 / in-flight 429）
+			return // 与并发首次请求竞争失败 → 已写出回放/冲突/in-flight
 		}
 		reserved = holding
 	}
 
 	resp, err := it.doCreateTeamGroup(key.UID, key.SpaceID, name, robotIDs)
 	if err != nil {
+		// 仅「建群提交前」失败会走到这里（doCreateTeamGroup 在 CreateGroup 提交后不再返回错误），
+		// 群未落库，可安全释放 pending 让同 key 重试；提交后的组装失败不会到这、也就不会重复建群。
 		if reserved {
-			it.rateRedis.Del(redisKey) // 放行同 key 重试
+			it.rateRedis.Del(redisKey)
 		}
 		it.Error("integration createGroup failed", zap.Error(err),
 			zap.String("uid", key.UID), zap.String("space", key.SpaceID))
@@ -146,6 +159,10 @@ func (it *Integration) createGroup(c *wkhttp.Context) {
 }
 
 // doCreateTeamGroup 调底层建群并组装响应。
+//
+// 关键不变量：CreateGroup 一旦返回成功，群就已提交落库；此后**绝不**再返回 error。否则调用方
+// 会把「提交后的组装失败」当成建群失败去 Del 幂等 pending key，导致同 key 重试再建一个群。
+// 因此 CreateGroup 之后的两次读（成员实况 / created_at）都做成 best-effort 降级。
 func (it *Integration) doCreateTeamGroup(uid, spaceID, name string, robotIDs []string) (*createGroupResp, error) {
 	createResp, err := it.groupService.CreateGroup(&group.CreateGroupServiceReq{
 		Creator: uid,
@@ -155,31 +172,37 @@ func (it *Integration) doCreateTeamGroup(uid, spaceID, name string, robotIDs []s
 		BotUID:  "", // 不指定 bot_admin
 	})
 	if err != nil {
-		return nil, err
+		return nil, err // 提交前失败（已回滚），可安全释放幂等 key 重试
 	}
 
 	// 响应只回真正入群的 bot（与 group_member 实况一致），绝不 echo 一个实际没进群的成员。
-	// pre-validation（queryOwnedActiveBotIDs）已保证常态下请求的 bot 全部入群；这里读回实况
-	// 仅为兜住「校验与建群之间 bot 被注销」这类极窄 TOCTOU 竞态——此时如实少回，而非建出
-	// 一个名不副实的群或回 500。
-	members, err := it.groupService.GetMembers(createResp.GroupNo)
-	if err != nil {
-		return nil, fmt.Errorf("verify group members: %w", err)
-	}
-	joined := make(map[string]bool, len(members))
-	for _, m := range members {
-		joined[m.UID] = true
-	}
-	actualBots := make([]string, 0, len(robotIDs))
-	for _, id := range robotIDs {
-		if joined[id] {
-			actualBots = append(actualBots, id)
+	// pre-validation（queryOwnedActiveBotIDs）已保证常态下请求的 bot 全部入群；读回实况兜住
+	// 「校验与建群之间 bot 被注销」这类极窄 TOCTOU 竞态。读失败 → 退回请求集合（best-effort）。
+	actualBots := robotIDs
+	if members, mErr := it.groupService.GetMembers(createResp.GroupNo); mErr != nil {
+		it.Warn("integration createGroup verify members failed; echoing requested",
+			zap.Error(mErr), zap.String("groupNo", createResp.GroupNo))
+	} else {
+		joined := make(map[string]bool, len(members))
+		for _, m := range members {
+			joined[m.UID] = true
 		}
+		filtered := make([]string, 0, len(robotIDs))
+		for _, id := range robotIDs {
+			if joined[id] {
+				filtered = append(filtered, id)
+			}
+		}
+		actualBots = filtered
 	}
 
-	createdAt, err := it.db.queryGroupCreatedAt(createResp.GroupNo)
-	if err != nil {
-		return nil, err
+	// created_at 取 DB 真实建群时间；读失败 → 退回服务端当前时刻（best-effort）。
+	createdAt := time.Now()
+	if t, cErr := it.db.queryGroupCreatedAt(createResp.GroupNo); cErr != nil {
+		it.Warn("integration createGroup read created_at failed; using server time",
+			zap.Error(cErr), zap.String("groupNo", createResp.GroupNo))
+	} else {
+		createdAt = t
 	}
 
 	return &createGroupResp{
@@ -214,16 +237,21 @@ func (it *Integration) groupExists(c *wkhttp.Context) {
 	c.Response(groupExistsResp{GroupID: groupNo, Exists: exists})
 }
 
-// teamGroupExists 判定 owner 当前是否还能访问该群：群属于 key 绑定的 Space、状态 normal，且
-// owner 仍是活跃成员（未被移出 / 拉黑）。按 spaceID 限定，避免一把绑定 Space A 的 uk_ key 借
-// 用户在 Space B 的成员身份探测 Space B 的群（与建群同源的 Space 隔离）。真 DB 错误向上冒泡
-// （→ 500），仅「不在本 Space / 不存在 / 非成员」返回 exists=false。
+// teamGroupExists 判定 owner 当前是否还能访问该群。语义是「创建者态」而非「成员态」：群属于
+// key 绑定的 Space、状态 normal、**调用者就是群主（group.creator==uid）**，且其仍是活跃成员
+// （未被移出 / 拉黑）。
+//
+//   - 按 spaceID 限定：避免一把绑定 Space A 的 uk_ key 探测 Space B 的群。
+//   - 要求 creator==uid：避免「调用者只是同 Space 某群的普通成员」也被判 true——存在性检测的
+//     契约是「我创建的群是否还在」，不是「我是不是某群成员」。
+//
+// 真 DB 错误向上冒泡（→ 500）；「不在本 Space / 不存在 / 非创建者 / 非活跃成员」均 exists=false。
 func (it *Integration) teamGroupExists(groupNo, spaceID, uid string) (bool, error) {
-	status, found, err := it.db.queryGroupStatus(groupNo, spaceID)
+	status, creator, found, err := it.db.queryGroupStatus(groupNo, spaceID)
 	if err != nil {
 		return false, err
 	}
-	if !found || status != group.GroupStatusNormal {
+	if !found || status != group.GroupStatusNormal || creator != uid {
 		return false, nil
 	}
 	active, err := it.groupService.ExistMemberActive(groupNo, uid)
@@ -233,13 +261,24 @@ func (it *Integration) teamGroupExists(groupNo, spaceID, uid string) (bool, erro
 	return active, nil
 }
 
-// idemBegin 尝试占坑。返回 (handled, reserved)：
-//   - handled=true  → 响应已写出（回放 / 冲突 / in-flight），调用方应直接 return。
-//   - handled=false → 调用方继续建群；reserved 表示是否持有 pending 锁（需 finalize/release）。
+// idemLookup 只读地查已存在的幂等记录并处理回放/冲突/in-flight，不占坑。返回 handled=true 表示
+// 已写出响应（调用方直接 return）。无记录或 Redis 故障 → handled=false（fail-open，继续建群）。
+// 放在 mutable 校验之前调用，保证首次成功后即便状态变化，同 key+同 body 仍能回放。
+func (it *Integration) idemLookup(c *wkhttp.Context, redisKey, payloadSHA string) (handled bool) {
+	cur, err := it.rateRedis.Get(redisKey).Result()
+	if err != nil {
+		// redis.Nil（无记录）或瞬时错误 → 继续走首次流程。
+		return false
+	}
+	return it.idemHandleRecord(c, cur, payloadSHA)
+}
+
+// idemReserve 原子占坑（SETNX pending，带 TTL）。返回：
+//   - handled=true  → 与并发首次请求竞争失败，已按现存记录写出回放/冲突/in-flight，调用方 return。
+//   - reserved=true → 成功持有 pending 锁（需 finalize 或失败时 release）。
 //
-// Redis 故障一律 fail-open（handled=false, reserved=false）：退化为不保证幂等而非阻断建群，
-// 与 integration 其余链路（限流 fail-open）一致。
-func (it *Integration) idemBegin(c *wkhttp.Context, redisKey, payloadSHA string) (handled, reserved bool) {
+// Redis 故障一律 fail-open（handled=false, reserved=false）：退化为不保证幂等而非阻断建群。
+func (it *Integration) idemReserve(c *wkhttp.Context, redisKey, payloadSHA string) (handled, reserved bool) {
 	pending, _ := json.Marshal(idemRecord{State: idemStatePending, SHA: payloadSHA})
 	set, err := it.rateRedis.SetNX(redisKey, pending, idempotencyPendingTTL).Result()
 	if err != nil {
@@ -249,33 +288,38 @@ func (it *Integration) idemBegin(c *wkhttp.Context, redisKey, payloadSHA string)
 	if set {
 		return false, true // 首次，持锁
 	}
-
+	// 竞争失败：lookup 与此处之间有人占坑/完成。重读并按现存记录处理。
 	cur, err := it.rateRedis.Get(redisKey).Result()
 	if err != nil {
 		it.Warn("integration idempotency GET failed, proceeding", zap.Error(err))
 		return false, false
 	}
+	return it.idemHandleRecord(c, cur, payloadSHA), false
+}
+
+// idemHandleRecord 解析一条现存记录并写出对应响应。返回是否写出（true → 调用方 return）。
+func (it *Integration) idemHandleRecord(c *wkhttp.Context, cur, payloadSHA string) bool {
 	var existing idemRecord
 	if err := json.Unmarshal([]byte(cur), &existing); err != nil {
 		it.Warn("integration idempotency record corrupt, proceeding", zap.Error(err))
-		return false, false
+		return false
 	}
 	switch existing.State {
 	case idemStatePending:
 		// in-flight：同 key 仍在处理 → 409 + Retry-After（可重试，区别于终态冲突）。
 		c.Header("Retry-After", "2")
 		httperr.ResponseErrorLWithStatus(c, errcode.ErrIntegrationIdempotencyInFlight, nil, nil)
-		return true, false
+		return true
 	case idemStateDone:
 		if existing.SHA == payloadSHA && existing.Resp != nil {
 			c.Response(existing.Resp) // 回放
-			return true, false
+			return true
 		}
 		// 同 key 不同 payload → 409 终态冲突（不可重试）。
 		httperr.ResponseErrorLWithStatus(c, errcode.ErrIntegrationIdempotencyConflict, nil, nil)
-		return true, false
+		return true
 	default:
-		return false, false
+		return false
 	}
 }
 
@@ -321,8 +365,11 @@ func teamGroupPayloadSHA(name string, robotIDs []string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// teamGroupIdemRedisKey namespaces the idempotency record by client/uid/space so a
-// key is only ever replayed for the same integration client that created it.
+// teamGroupIdemRedisKey namespaces the idempotency record by client/uid/space so a key is
+// only ever replayed for the same integration client that created it. The client-supplied
+// Idempotency-Key is hashed (not concatenated raw) so the Redis key has a fixed, bounded
+// size regardless of how long a header the caller sends.
 func teamGroupIdemRedisKey(clientID, uid, spaceID, idemKey string) string {
-	return fmt.Sprintf("octo:idem:%s:groupcreate:%s:%s:%s", clientID, uid, spaceID, idemKey)
+	sum := sha256.Sum256([]byte(idemKey))
+	return fmt.Sprintf("octo:idem:%s:groupcreate:%s:%s:%s", clientID, uid, spaceID, hex.EncodeToString(sum[:]))
 }
