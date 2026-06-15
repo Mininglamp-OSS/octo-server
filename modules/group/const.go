@@ -10,6 +10,11 @@ const (
 	GroupStatusDisband = 2
 )
 
+// MaxGroupNameLen 群名最大长度（按 rune 计）。Web / Bot / Integration 建群与改名共用，
+// 超长一律静默截断到此长度（API 层可前置 reject 给出明确错误）。配套的 `group`.`name`
+// 列宽由迁移加宽到 VARCHAR(50)，两者必须一致，否则 MySQL 严格模式下会报 Data too long。
+const MaxGroupNameLen = 50
+
 // 群成员角色
 const (
 	// MemberRoleCommon 普通成员

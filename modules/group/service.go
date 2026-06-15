@@ -1081,8 +1081,8 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 		groupName = strings.Join(names, "、")
 	}
 	nameRunes := []rune(groupName)
-	if len(nameRunes) > 20 {
-		groupName = string(nameRunes[:20])
+	if len(nameRunes) > MaxGroupNameLen {
+		groupName = string(nameRunes[:MaxGroupNameLen])
 	}
 
 	// 生成群编号和版本号
@@ -1776,8 +1776,8 @@ func (s *Service) UpdateGroupInfo(req *UpdateGroupInfoServiceReq) error {
 	// 更新字段
 	if req.Name != nil {
 		nameRunes := []rune(*req.Name)
-		if len(nameRunes) > 20 {
-			*req.Name = string(nameRunes[:20])
+		if len(nameRunes) > MaxGroupNameLen {
+			*req.Name = string(nameRunes[:MaxGroupNameLen])
 		}
 		groupModel.Name = *req.Name
 	}
