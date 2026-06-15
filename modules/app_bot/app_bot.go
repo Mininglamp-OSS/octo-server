@@ -294,7 +294,7 @@ func (ab *AppBot) createPlatformBot(c *wkhttp.Context) {
 func (ab *AppBot) createSpaceBot(c *wkhttp.Context) {
 	spaceID := c.Param("space_id")
 	if err := ab.checkSpaceAdmin(c, spaceID); err != nil {
-		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": err.Error()})
+		respondAppBotSpaceForbidden(c)
 		return
 	}
 	ab.createBot(c, "space", spaceID)
@@ -442,7 +442,7 @@ func (ab *AppBot) listPlatformBots(c *wkhttp.Context) {
 func (ab *AppBot) listSpaceBots(c *wkhttp.Context) {
 	spaceID := c.Param("space_id")
 	if err := ab.checkSpaceAdmin(c, spaceID); err != nil {
-		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": err.Error()})
+		respondAppBotSpaceForbidden(c)
 		return
 	}
 	pageIndex, pageSize := c.GetPage()
@@ -471,7 +471,7 @@ func (ab *AppBot) getBotDetail(c *wkhttp.Context) {
 
 	if spaceID != "" {
 		if err := ab.checkSpaceAdmin(c, spaceID); err != nil {
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": err.Error()})
+			respondAppBotSpaceForbidden(c)
 			return
 		}
 	} else {
@@ -523,7 +523,7 @@ func (ab *AppBot) updateBot(c *wkhttp.Context) {
 
 	if spaceID != "" {
 		if err := ab.checkSpaceAdmin(c, spaceID); err != nil {
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": err.Error()})
+			respondAppBotSpaceForbidden(c)
 			return
 		}
 	} else {
@@ -611,7 +611,7 @@ func (ab *AppBot) deleteBot(c *wkhttp.Context) {
 
 	if spaceID != "" {
 		if err := ab.checkSpaceAdmin(c, spaceID); err != nil {
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": err.Error()})
+			respondAppBotSpaceForbidden(c)
 			return
 		}
 	} else {
@@ -671,7 +671,7 @@ func (ab *AppBot) rotateToken(c *wkhttp.Context) {
 
 	if spaceID != "" {
 		if err := ab.checkSpaceAdmin(c, spaceID); err != nil {
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": err.Error()})
+			respondAppBotSpaceForbidden(c)
 			return
 		}
 	} else {
@@ -761,7 +761,7 @@ func (ab *AppBot) revealToken(c *wkhttp.Context) {
 
 	if spaceID != "" {
 		if err := ab.checkSpaceAdmin(c, spaceID); err != nil {
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": err.Error()})
+			respondAppBotSpaceForbidden(c)
 			return
 		}
 	} else {
@@ -799,7 +799,7 @@ func (ab *AppBot) publishBot(c *wkhttp.Context) {
 
 	if spaceID != "" {
 		if err := ab.checkSpaceAdmin(c, spaceID); err != nil {
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": err.Error()})
+			respondAppBotSpaceForbidden(c)
 			return
 		}
 	} else {
@@ -854,7 +854,7 @@ func (ab *AppBot) unpublishBot(c *wkhttp.Context) {
 
 	if spaceID != "" {
 		if err := ab.checkSpaceAdmin(c, spaceID); err != nil {
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": err.Error()})
+			respondAppBotSpaceForbidden(c)
 			return
 		}
 	} else {

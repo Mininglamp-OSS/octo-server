@@ -88,3 +88,23 @@ func TestPlatformAppBot_PlainUserForbiddenLocalized(t *testing.T) {
 	assert.NotContains(t, body, "该用户无权执行此操作", "must not leak the raw wkhttp framework string")
 	assert.Contains(t, body, "permission", "renders the localized shared-forbidden message")
 }
+
+// TestSpaceAppBot_ForbiddenLocalized pins the space-scoped guard migration: a
+// caller who is not a space admin (here a system admin, which is independent of
+// space role) is rejected with the localized shared-forbidden envelope at a
+// preserved real 403 — not the raw "no permission: requires space admin" string
+// the legacy c.AbortWithStatusJSON leaked.
+func TestSpaceAppBot_ForbiddenLocalized(t *testing.T) {
+	route, cleanup := newPlatformGateRoute(t, string(wkhttp.Admin))
+	defer cleanup()
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/space/space-x/app_bot", nil)
+	req.Header.Set("token", testutil.Token)
+	route.ServeHTTP(w, req)
+
+	body := w.Body.String()
+	assert.Equal(t, http.StatusForbidden, w.Code, "space forbidden preserves the real 403")
+	assert.NotContains(t, body, "no permission: requires space admin", "raw checkSpaceAdmin string must be gone")
+	assert.Contains(t, body, "You do not have permission", "localized shared-forbidden message")
+}

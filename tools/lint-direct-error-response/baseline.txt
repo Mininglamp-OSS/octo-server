@@ -15,7 +15,7 @@
 # i18n value — external/infra consumers that never read the localized
 # envelope) are tagged "# EXEMPT: <why>" so future migrations don't try to
 # zero them; all other rows are migration debt and should ratchet to 0.
-9 modules/app_bot/app_bot.go
+0 modules/app_bot/app_bot.go  # forbidden guards migrated to httperr.ResponseErrorL / ResponseErrorLWithStatus
 0 modules/bot_api/auth.go  # migrated to httperr.ResponseErrorLWithStatus (#276)
 0 modules/bot_api/groups.go  # migrated to httperr.ResponseErrorL / ResponseErrorLWithStatus (#276)
 0 modules/bot_api/obo_api.go  # migrated to httperr.ResponseErrorLWithStatus (#276)
