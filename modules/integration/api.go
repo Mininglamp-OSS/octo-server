@@ -10,6 +10,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/botfather"
+	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/oidc"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
@@ -39,6 +40,7 @@ type Integration struct {
 	oidcDB        *oidc.DB
 	oidcClient    *oidc.Client
 	apiKeyService botfather.UserAPIKeyService
+	groupService  group.IService
 	rateRedis     *rd.Client
 	log.Log
 }
@@ -49,6 +51,7 @@ func New(ctx *config.Context) *Integration {
 		db:            newIntegrationDB(ctx),
 		oidcDB:        oidc.NewDB(ctx),
 		apiKeyService: botfather.NewUserAPIKeyService(ctx),
+		groupService:  group.NewService(ctx),
 		rateRedis:     sharedIntegrationRateRedis(ctx.GetConfig()),
 		Log:           log.NewTLog("Integration"),
 	}
@@ -100,6 +103,8 @@ func (it *Integration) Route(r *wkhttp.WKHttp) {
 	base.GET("/spaces", it.oidcAuth(), uidLimit, it.listSpaces)
 	base.POST("/exchange", it.oidcAuth(), uidLimit, it.exchange)
 	base.DELETE("/binding", it.userAPIKeyAuth(), uidLimit, it.deleteBinding)
+	base.POST("/groups", it.userAPIKeyAuth(), uidLimit, it.createGroup)
+	base.GET("/groups/:group_no", it.userAPIKeyAuth(), uidLimit, it.groupExists)
 
 	manager := r.Group("/v1/manager", it.ctx.AuthMiddleware(r), uidLimit)
 	manager.PUT("/integrations/oidc/client", it.upsertManagerClient)

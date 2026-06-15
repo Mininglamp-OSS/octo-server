@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -162,6 +163,84 @@ func (d *integrationDB) queryAvailableBotSpaces(uid string, spaceIDs []string) (
 	).Load(&ids)
 	if err != nil {
 		return nil, fmt.Errorf("integration: query available bot spaces uid=%q: %w", uid, err)
+	}
+	for _, id := range ids {
+		out[id] = true
+	}
+	return out, nil
+}
+
+// queryGroupCreatedAt 读取群的真实建群时间（time.Time）。CreateGroupServiceResp 不含
+// created_at，且 group.IService.GetGroupWithGroupNo 的 InfoResp.CreatedAt 是 time.Time.String()
+// 格式（非 RFC3339），故这里直读原始列，由调用方 .Format(time.RFC3339) 对齐 exchange 风格。
+func (d *integrationDB) queryGroupCreatedAt(groupNo string) (time.Time, error) {
+	var createdAt time.Time
+	err := d.session.Select("created_at").From("`group`").
+		Where("group_no=?", groupNo).LoadOne(&createdAt)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("integration: query group created_at %q: %w", groupNo, err)
+	}
+	return createdAt, nil
+}
+
+// queryGroupStatus returns the group's status, scoped to the given space, and explicitly
+// distinguishes "group not in this space / not found" (found=false, err=nil) from a DB
+// failure (err!=nil). Scoping by space_id keeps the existence check inside the uk_ key's
+// space binding — a key for space A must not confirm groups that live in space B.
+func (d *integrationDB) queryGroupStatus(groupNo, spaceID string) (status int, found bool, err error) {
+	e := d.session.Select("status").From("`group`").
+		Where("group_no=? AND space_id=?", groupNo, spaceID).LoadOne(&status)
+	if errors.Is(e, dbr.ErrNotFound) {
+		return 0, false, nil
+	}
+	if e != nil {
+		return 0, false, fmt.Errorf("integration: query group status %q: %w", groupNo, e)
+	}
+	return status, true, nil
+}
+
+// queryOwnedActiveBotIDs returns the robot_ids that group.CreateGroup will actually
+// insert as members for this owner+space: owned (creator_uid) and active (robot.status=1),
+// active in the space (space_member.status=1), AND backed by a usable user row — it exists
+// and is not finalized-destroyed (is_destroy<>IsDestroyDone). This mirrors CreateGroup's
+// insertion source (QueryByUIDs on the user table + the IsDestroyDone skip), so validating
+// member_robot_ids against this set up front turns an unusable bot into a 404 *before* any
+// group is created, instead of a created-then-500 that leaks an orphaned group.
+// isHumanUser reports whether uid is a human account (user row exists with robot=0). Bots
+// never obtain a uk_ key (they don't go through OIDC exchange) and AuthByKey only checks
+// account activity, not the robot flag — so this is the guard that keeps a team group's
+// owner/creator always a human member.
+func (d *integrationDB) isHumanUser(uid string) (bool, error) {
+	if uid == "" {
+		return false, nil
+	}
+	var robot int
+	err := d.session.Select("robot").From("user").Where("uid=?", uid).LoadOne(&robot)
+	if errors.Is(err, dbr.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("integration: query user robot flag uid=%q: %w", uid, err)
+	}
+	return robot == 0, nil
+}
+
+func (d *integrationDB) queryOwnedActiveBotIDs(uid, spaceID string) (map[string]bool, error) {
+	out := make(map[string]bool)
+	if uid == "" || spaceID == "" {
+		return out, nil
+	}
+	var ids []string
+	_, err := d.session.SelectBySql(`
+		SELECT r.robot_id
+		FROM robot r
+		INNER JOIN space_member sm ON sm.uid=r.robot_id AND sm.space_id=? AND sm.status=1
+		INNER JOIN `+"`user`"+` u ON u.uid=r.robot_id AND u.is_destroy<>?
+		WHERE r.creator_uid=? AND r.status=1`,
+		spaceID, user.IsDestroyDone, uid,
+	).Load(&ids)
+	if err != nil {
+		return nil, fmt.Errorf("integration: query owned active bots uid=%q space=%q: %w", uid, spaceID, err)
 	}
 	for _, id := range ids {
 		out[id] = true

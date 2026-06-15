@@ -35,6 +35,23 @@ var (
 		DefaultMessages: map[string]string{"zh-CN": "该 Bot 已被其他 Agent 占用。"},
 		SafeDetailKeys:  []string{"occupied_by"},
 	})
+
+	// ErrIntegrationIdempotencyInFlight —— 同一 Idempotency-Key 的建群请求仍在处理中（可重试，
+	// 响应带 Retry-After）。与冲突区分开：这是「稍后重试」，不是「键被误用」。
+	ErrIntegrationIdempotencyInFlight = register(codes.Code{
+		ID:              "err.server.integration.idempotency_in_flight",
+		HTTPStatus:      http.StatusConflict,
+		DefaultMessage:  "A request with this idempotency key is still in progress; please retry.",
+		DefaultMessages: map[string]string{"zh-CN": "相同 Idempotency-Key 的请求仍在处理中，请稍后重试。"},
+	})
+
+	// ErrIntegrationIdempotencyConflict —— 同一 Idempotency-Key 复用于不同的请求体（终态冲突，不可重试）。
+	ErrIntegrationIdempotencyConflict = register(codes.Code{
+		ID:              "err.server.integration.idempotency_conflict",
+		HTTPStatus:      http.StatusConflict,
+		DefaultMessage:  "This idempotency key was already used with a different request.",
+		DefaultMessages: map[string]string{"zh-CN": "该 Idempotency-Key 已用于不同的请求。"},
+	})
 )
 
 // 复用 pkg/i18n/codes 已注册的 err.shared.* 码：integration / Octo-link 与 Bot

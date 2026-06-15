@@ -49,6 +49,29 @@ type exchangeResp struct {
 	Bots      []exchangeBotResp `json:"bots,omitempty"`
 }
 
+// createGroupReq —— 用 uk_ key 建团队群的请求体。owner / space / client 全部来自服务端
+// 解析的 key 上下文，body 仅这两个字段且不携带任何信任边界。
+type createGroupReq struct {
+	Name           string   `json:"name"`
+	MemberRobotIDs []string `json:"member_robot_ids"`
+}
+
+// createGroupResp —— 建群响应（时间 RFC3339，对齐 exchange 风格）。
+type createGroupResp struct {
+	GroupID        string   `json:"group_id"`
+	SpaceID        string   `json:"space_id"`
+	OwnerUserID    string   `json:"owner_user_id"`
+	MemberRobotIDs []string `json:"member_robot_ids"`
+	Name           string   `json:"name"`
+	CreatedAt      string   `json:"created_at"`
+}
+
+// groupExistsResp —— 用户态存在性检测响应（恒 200，不存在时 exists=false 而非 404）。
+type groupExistsResp struct {
+	GroupID string `json:"group_id"`
+	Exists  bool   `json:"exists"`
+}
+
 type managerIntegrationClientReq struct {
 	Name   string `json:"name"`
 	Status *int   `json:"status"`

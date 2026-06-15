@@ -1,0 +1,221 @@
+openapi: 3.0.3
+info:
+  title: Octo Integration API
+  version: 1.0.0
+  description: >-
+    Integration endpoints for partner platforms. All routes authenticate with a
+    user-scoped API key (`uk_` prefix) issued via
+    `POST /v1/integrations/oidc/exchange`. The owner, space and client are all
+    resolved server-side from the key context; the request body carries no trust
+    boundary. Errors use the shared i18n envelope (`{ "error": { "code", ... } }`).
+
+servers:
+  - url: https://api.botgate.cn/v1
+    description: Production
+
+tags:
+  - name: integration
+    description: 集成方团队群能力
+
+security:
+  - UserAPIKey: []
+
+paths:
+  /integrations/oidc/groups:
+    post:
+      tags: [integration]
+      summary: 创建团队群
+      description: >-
+        Create a team group whose members are the calling user (owner) plus the
+        specified team bots. The bots must belong to the caller and be active in
+        the caller's space. No bot is promoted to bot admin. Pass an optional
+        `Idempotency-Key` header to make retries safe (Stripe-style).
+      operationId: createTeamGroup
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateGroupRequest'
+      responses:
+        '200':
+          description: 群创建成功（或幂等回放）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateGroupResponse'
+        '400':
+          description: 参数非法 / 群名超长 / 成员为空
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          description: 鉴权失败（缺失/无效 uk_ key，或 client 无权调用）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '403':
+          description: owner 非该 Space 成员
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: member_robot_ids 中存在不存在/不归属/不在该 Space 的 bot（统一 not found）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '409':
+          description: >-
+            Idempotency-Key 冲突。两种情形均返回 409，用 error.code 区分：
+            err.server.integration.idempotency_in_flight（同 key 仍在处理中，可重试，
+            见 Retry-After）与 err.server.integration.idempotency_conflict（同 key 复用于
+            不同请求体，不可重试）。
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+              description: in-flight 情形下建议的重试等待秒数
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '429':
+          description: 触发限流（IP/UID 层）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '500':
+          description: 内部错误
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /integrations/oidc/groups/{group_no}:
+    get:
+      tags: [integration]
+      summary: 团队群存在性检测
+      description: >-
+        User-scoped existence check: returns `exists=true` only when the group is
+        in normal status and the owner is still an active member (not removed or
+        blacklisted). Always returns HTTP 200; a missing/inaccessible group is
+        reported as `exists=false` rather than 404.
+      operationId: teamGroupExists
+      parameters:
+        - in: path
+          name: group_no
+          required: true
+          description: 群编号
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 存在性检测结果（恒 200）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GroupExistsResponse'
+        '401':
+          description: 鉴权失败
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '500':
+          description: 内部错误
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+components:
+  securitySchemes:
+    UserAPIKey:
+      type: http
+      scheme: bearer
+      description: Bearer user API key, e.g. `Authorization: Bearer uk_xxx`.
+
+  parameters:
+    IdempotencyKey:
+      in: header
+      name: Idempotency-Key
+      required: false
+      description: >-
+        Optional idempotency token. Replaying the same key with the same body
+        returns the original result; reusing it with a different body is
+        rejected; an in-flight retry is told to back off.
+      schema:
+        type: string
+
+  schemas:
+    CreateGroupRequest:
+      type: object
+      required: [name, member_robot_ids]
+      properties:
+        name:
+          type: string
+          description: 群名称，trim 后非空，长度 ≤ 50（按 Unicode rune 计）
+          maxLength: 50
+          example: 团队群名称
+        member_robot_ids:
+          type: array
+          description: 团队 bot 的 robot_id 列表，非空、自动去重，数量 ≤ 50
+          minItems: 1
+          maxItems: 50
+          items:
+            type: string
+          example: [bot_a, bot_b, bot_c]
+
+    CreateGroupResponse:
+      type: object
+      properties:
+        group_id:
+          type: string
+          description: 群编号
+        space_id:
+          type: string
+        owner_user_id:
+          type: string
+        member_robot_ids:
+          type: array
+          items:
+            type: string
+        name:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+          description: 建群时间，RFC3339
+          example: '2026-06-15T10:00:00+08:00'
+
+    GroupExistsResponse:
+      type: object
+      properties:
+        group_id:
+          type: string
+        exists:
+          type: boolean
+
+    ErrorEnvelope:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+              description: 稳定错误码，如 err.shared.param.invalid
+            message:
+              type: string
+            http_status:
+              type: integer
+            details:
+              type: object
+              additionalProperties: true

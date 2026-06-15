@@ -414,6 +414,12 @@ other = "Unauthorized."
 ["err.server.integration.disabled"]
 other = "OIDC integration exchange is disabled."
 
+["err.server.integration.idempotency_conflict"]
+other = "This idempotency key was already used with a different request."
+
+["err.server.integration.idempotency_in_flight"]
+other = "A request with this idempotency key is still in progress; please retry."
+
 ["err.server.integration.user_not_linked"]
 other = "User is not linked to an Octo account."
 
