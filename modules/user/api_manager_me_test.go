@@ -25,7 +25,7 @@ func TestManagerCapabilities(t *testing.T) {
 		"users.write", "users.manage_admin", "groups.write",
 	}
 	adminTier := []string{
-		"appversion.read", "dashboard.read", "users.read", "groups.read", "space.read",
+		"appversion.read", "dashboard.read", "users.read", "groups.read", "space.read", "space.write",
 	}
 
 	for _, k := range superOnly {
@@ -88,7 +88,13 @@ func TestManagerMe_RejectsPlainUser(t *testing.T) {
 
 	loginAsRole(t, ctx, "") // no system role
 	w := getManagerMe(s.GetRoute())
-	assert.NotEqual(t, http.StatusOK, w.Code, "plain user must not access /v1/manager/me")
+	// Assert the specific forbidden outcome, not merely "not 200": respondManagerForbidden
+	// renders err.shared.auth.forbidden, pinned to wire 400 (D14) with the shared
+	// permission message. This rejects a 500/panic, 404 (route regression) or 401
+	// masquerading as a passing auth test.
+	assert.Equal(t, http.StatusBadRequest, w.Code, "forbidden is pinned to wire 400 (D14)")
+	assert.Contains(t, w.Body.String(), "permission",
+		"plain user must be rejected for the role reason (forbidden), not some other failure")
 }
 
 // TestManagerMe_AdminGetsReadCapsNotWrite verifies an admin is admitted and the
@@ -108,9 +114,11 @@ func TestManagerMe_AdminGetsReadCapsNotWrite(t *testing.T) {
 	assert.Equal(t, string(wkhttp.Admin), resp.Role)
 	assert.True(t, resp.Capabilities["users.read"], "admin should have users.read")
 	assert.True(t, resp.Capabilities["groups.read"], "admin should have groups.read")
+	assert.True(t, resp.Capabilities["space.write"], "admin should have space.write (admin-allowed space writes)")
 	assert.False(t, resp.Capabilities["users.write"], "admin must NOT have users.write")
 	assert.False(t, resp.Capabilities["users.manage_admin"], "admin must NOT have users.manage_admin")
 	assert.False(t, resp.Capabilities["groups.write"], "admin must NOT have groups.write")
+	assert.False(t, resp.Capabilities["space.destructive"], "admin must NOT have space.destructive")
 	assert.False(t, resp.Capabilities["system_setting"], "admin must NOT have system_setting")
 }
 

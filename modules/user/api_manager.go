@@ -116,14 +116,19 @@ func (m *Manager) me(c *wkhttp.Context) {
 // 已通过 CheckLoginRole（admin∪superAdmin），故 admin 档位项恒 true；superAdmin
 // 专属项取 isSuper。键名是与前端的稳定约定。
 //
-// 读/写分档：凡是某个领域里读端点 admin 可达、但写/销毁端点要 superAdmin 的，都拆成
-// `<域>.read`（恒 true）与 `<域>.write`（isSuper），避免前端拿单一粗标志去渲染会被后端
-// 403 的写按钮（confused-deputy UI）。当前已按各端点真实 gate 拆分：
+// 读/写分档：每个能力键按该组操作的真实 gate 取值——admin 可达的读/写恒 true，
+// superAdmin 专属的写/销毁取 isSuper——既避免前端拿单一粗标志去渲染会被后端 403 的
+// 写按钮（confused-deputy UI），也避免反过来把 admin 实际能做的操作藏掉。注意有的域
+// 是三档（读=admin、写=admin、销毁=superAdmin，如 space），不要漏掉 admin 写这一档。
+// 当前已按各端点真实 gate 拆分：
 //   - users.read   = list/friends/blacklist/disableUsers/devices/online（CheckLoginRole）
 //   - users.write  = resetUserPassword/addUser/liftBanUser/updatePwd（CheckLoginRoleIsSuperAdmin）
 //   - users.manage_admin = get/add/delete 管理员账号（CheckLoginRoleIsSuperAdmin）
 //   - groups.read  = list/disablelist/members/blacklist（CheckLoginRole）
 //   - groups.write = leftbangroup/forbidden/removeMember（CheckLoginRoleIsSuperAdmin）
+//   - space.read        = 空间/成员/邀请/入群申请 列表查询（requireAdmin）
+//   - space.write       = 建空间/改资料/加成员/邀请增改禁用/通过拒绝入群申请（requireAdmin，故恒 true）
+//   - space.destructive = 强制解散/封禁/强制移除/改成员角色（requireSuperAdmin）
 //
 // TODO(#366 Part 2): 目前这张表按各端点当前档位手工维护；集中式 authz 策略表落地
 // 后，应改为由同一份 route→role 真源派生，彻底消除前后端漂移。
@@ -144,6 +149,7 @@ func managerCapabilities(isSuper bool) map[string]bool {
 		"users.read":      true, // 用户列表 / 好友 / 黑名单 / 禁用 / 设备 / 在线
 		"groups.read":     true, // 群组列表 / 禁用群 / 群成员 / 群黑名单
 		"space.read":      true, // 空间查看 / 列表
+		"space.write":     true, // 建空间 / 改资料 / 加成员 / 邀请增改禁用 / 通过拒绝入群申请（requireAdmin）
 	}
 }
 

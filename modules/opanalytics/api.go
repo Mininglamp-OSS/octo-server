@@ -272,8 +272,10 @@ func (m *Manager) requireSuperAdmin(c *wkhttp.Context) bool {
 	return true
 }
 
-// requireAdmin 放行 admin∪superAdmin，用于看板只读端点。看板是 admin 已有的跨
-// space 读面（用户/群/空间列表）的聚合视图，放给 admin 一致；手动触发类写操作
+// requireAdmin 放行 admin∪superAdmin，用于看板只读端点。看板读面不比 admin 已有的
+// 访问更敏感：含私聊元数据的 globalDirectChats 也只是"谁跟谁聊过、几条、何时"，而 admin
+// 经 message 模块的 recordpersonal/record 早已能读任意 (uid,touid) 的私聊正文，元数据
+// 严格更弱；用户/群/空间列表同样早是 admin 读面。故放给 admin 一致；手动触发类写操作
 // （runETL）仍走 requireSuperAdmin。
 func (m *Manager) requireAdmin(c *wkhttp.Context) bool {
 	if err := c.CheckLoginRole(); err != nil {
