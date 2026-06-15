@@ -154,7 +154,7 @@ func (bf *BotFather) runtimeOnboarding(c *wkhttp.Context) {
 		FleetURL:  fleetURL,
 		MatterURL: matterURL,
 		Commands: onboardingCmds{
-			Install: "go install github.com/Mininglamp-OSS/octo-daemon-cli@latest",
+			Install: "npm install -g @mininglamp-oss/octo-daemon",
 			Start:   startBlock,
 		},
 		EnvVars: map[string]string{
