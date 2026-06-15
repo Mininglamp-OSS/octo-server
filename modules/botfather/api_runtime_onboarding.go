@@ -135,16 +135,18 @@ func (bf *BotFather) runtimeOnboarding(c *wkhttp.Context) {
 		return
 	}
 
-	// commands.start 是 standalone 可复制可跑的 multi-line block: 含 3 个
-	// OCTO_*_URL export 让 daemon 各 service 调用走 env (fleet / server /
-	// matter 各走各), 末尾 octo-daemon start 行的 --api-url 用 serverURL —
-	// 跟旧 BotFather /daemon 命令一致 (cfg.APIURL 在 daemon 内只是 env 缺
-	// 失时的 fallback, env 全设了 cfg.APIURL 不会被读). caller 直接复制
-	// commands.start 就跑得起来, 不用再去 env_vars 字段二次拼接 (env_vars
-	// 单独保留供想 set 到 shell rc 而非 inline 的场景).
+	// commands.start 是 standalone 可复制可跑的 multi-line block: 2 个
+	// OCTO_*_URL export 让 daemon 各 service 调用走 env (fleet 走 runtime/bot
+	// 端点, server 走 auth/bot_token 端点), 末尾 octo-daemon start 行的
+	// --api-url 用 serverURL — 跟旧 BotFather /daemon 命令一致 (cfg.APIURL 在
+	// daemon 内只是 env 缺失时的 fallback, env 全设了 cfg.APIURL 不会被读).
+	// 不下发 OCTO_MATTER_URL: daemon 二进制不读该 env (它不直接调 matter),
+	// 且 matter 当前未上线. caller 直接复制 commands.start 就跑得起来, 不用
+	// 再去 env_vars 字段二次拼接 (env_vars 单独保留供想 set 到 shell rc 而非
+	// inline 的场景).
 	startBlock := fmt.Sprintf(
-		"export OCTO_SERVER_URL=%s\nexport OCTO_FLEET_URL=%s\nexport OCTO_MATTER_URL=%s\nocto-daemon start --api-key %s --api-url %s",
-		serverURL, fleetURL, matterURL, apiKey, serverURL,
+		"export OCTO_SERVER_URL=%s\nexport OCTO_FLEET_URL=%s\nocto-daemon start --api-key %s --api-url %s",
+		serverURL, fleetURL, apiKey, serverURL,
 	)
 
 	resp := runtimeOnboardingResp{
@@ -160,7 +162,6 @@ func (bf *BotFather) runtimeOnboarding(c *wkhttp.Context) {
 		EnvVars: map[string]string{
 			"OCTO_SERVER_URL": serverURL,
 			"OCTO_FLEET_URL":  fleetURL,
-			"OCTO_MATTER_URL": matterURL,
 		},
 	}
 	c.JSON(http.StatusOK, resp)
