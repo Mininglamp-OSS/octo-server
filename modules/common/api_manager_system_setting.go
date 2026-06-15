@@ -68,11 +68,11 @@ type systemSettingGetResp struct {
 
 // listSystemSettings handles GET /v1/manager/common/system_setting.
 //
-// Read access uses CheckLoginRole — any authenticated admin can view the
-// effective config (encrypted columns are masked). Writes require
-// SuperAdmin (see updateSystemSettings).
+// Read access requires SuperAdmin — the system configuration surface is
+// SuperAdmin-only for both read and write (encrypted columns are masked
+// regardless). Writes also require SuperAdmin (see updateSystemSettings).
 func (m *Manager) listSystemSettings(c *wkhttp.Context) {
-	if err := c.CheckLoginRole(); err != nil {
+	if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
 		c.ResponseError(err)
 		return
 	}

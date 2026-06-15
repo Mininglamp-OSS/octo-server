@@ -165,6 +165,29 @@ func TestManagerSystemSetting_UpdateRequiresSuperAdmin(t *testing.T) {
 	assert.NotEqual(t, http.StatusOK, w.Code, "non-superAdmin must not be able to write")
 }
 
+// TestManagerSystemSetting_ListRequiresSuperAdmin pins the read-side gate: the
+// system configuration surface is SuperAdmin-only for read as well as write, so
+// a plain admin token (which passes CheckLoginRole but not
+// CheckLoginRoleIsSuperAdmin) must be rejected on GET.
+func TestManagerSystemSetting_ListRequiresSuperAdmin(t *testing.T) {
+	t.Setenv(masterKeyEnv, "0123456789abcdef0123456789abcdef")
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+
+	// admin (not superAdmin) — previously allowed to read, now rejected.
+	require.NoError(t, ctx.Cache().Set(
+		ctx.GetConfig().Cache.TokenCachePrefix+testutil.Token,
+		testutil.UID+"@test@"+string(wkhttp.Admin),
+	))
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/manager/common/system_setting", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.NotEqual(t, http.StatusOK, w.Code, "admin must not be able to read system settings (superAdmin only)")
+}
+
 func TestManagerSystemSetting_UpdateRejectsUnknownKey(t *testing.T) {
 	t.Setenv(masterKeyEnv, "0123456789abcdef0123456789abcdef")
 	s, ctx := testutil.NewTestServer()
