@@ -1029,7 +1029,7 @@ func (ab *AppBot) applyBot(c *wkhttp.Context) {
 		return
 	}
 	if isFriend {
-		c.Response(gin.H{"status": "approved", "message": "\u5df2\u7ecf\u662f\u597d\u53cb\u4e86"})
+		c.Response(gin.H{"status": "approved", "message": ab.localizedMessage(c, "already_friend")})
 		return
 	}
 
@@ -1132,7 +1132,7 @@ func (ab *AppBot) applyBot(c *wkhttp.Context) {
 		config.PersonalMsgOptions{Header: config.MsgHeader{RedDot: 1}},
 	))
 
-	c.Response(gin.H{"status": "approved", "message": "\u5df2\u81ea\u52a8\u901a\u8fc7\uff0c\u53ef\u4ee5\u5f00\u59cb\u804a\u5929"})
+	c.Response(gin.H{"status": "approved", "message": ab.localizedMessage(c, "auto_approved")})
 }
 
 // fixFriendVersion updates friend version for SDK incremental sync.
