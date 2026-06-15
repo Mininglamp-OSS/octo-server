@@ -116,21 +116,33 @@ func (m *Manager) me(c *wkhttp.Context) {
 // 已通过 CheckLoginRole（admin∪superAdmin），故 admin 档位项恒 true；superAdmin
 // 专属项取 isSuper。键名是与前端的稳定约定。
 //
+// 读/写分档：凡是某个领域里读端点 admin 可达、但写/销毁端点要 superAdmin 的，都拆成
+// `<域>.read`（恒 true）与 `<域>.write`（isSuper），避免前端拿单一粗标志去渲染会被后端
+// 403 的写按钮（confused-deputy UI）。当前已按各端点真实 gate 拆分：
+//   - users.read   = list/friends/blacklist/disableUsers/devices/online（CheckLoginRole）
+//   - users.write  = resetUserPassword/addUser/liftBanUser/updatePwd（CheckLoginRoleIsSuperAdmin）
+//   - users.manage_admin = get/add/delete 管理员账号（CheckLoginRoleIsSuperAdmin）
+//   - groups.read  = list/disablelist/members/blacklist（CheckLoginRole）
+//   - groups.write = leftbangroup/forbidden/removeMember（CheckLoginRoleIsSuperAdmin）
+//
 // TODO(#366 Part 2): 目前这张表按各端点当前档位手工维护；集中式 authz 策略表落地
 // 后，应改为由同一份 route→role 真源派生，彻底消除前后端漂移。
 func managerCapabilities(isSuper bool) map[string]bool {
 	return map[string]bool{
 		// superAdmin 专属
-		"system_setting":    isSuper, // 系统配置：读写均超管
-		"backup":            isSuper, // 备份管理：读写均超管
-		"appversion.write":  isSuper, // 版本发布 / 下载源设置
-		"dashboard.trigger": isSuper, // 手动触发 ETL
-		"space.destructive": isSuper, // 强制解散/封禁/强制移除/改成员角色
+		"system_setting":     isSuper, // 系统配置：读写均超管
+		"backup":             isSuper, // 备份管理：读写均超管
+		"appversion.write":   isSuper, // 版本发布 / 下载源设置
+		"dashboard.trigger":  isSuper, // 手动触发 ETL
+		"space.destructive":  isSuper, // 强制解散/封禁/强制移除/改成员角色
+		"users.write":        isSuper, // 重置密码 / 新增用户 / 解封 / 改密
+		"users.manage_admin": isSuper, // 管理员账号 增/查/删
+		"groups.write":       isSuper, // 解散封禁群 / 强制移除成员
 		// admin ∪ superAdmin（此处恒 true，列出供前端统一读取）
 		"appversion.read": true, // 版本列表
 		"dashboard.read":  true, // 运营看板查看
-		"users":           true, // 用户管理
-		"groups":          true, // 群组管理
+		"users.read":      true, // 用户列表 / 好友 / 黑名单 / 禁用 / 设备 / 在线
+		"groups.read":     true, // 群组列表 / 禁用群 / 群成员 / 群黑名单
 		"space.read":      true, // 空间查看 / 列表
 	}
 }
