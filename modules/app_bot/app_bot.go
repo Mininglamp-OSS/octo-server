@@ -283,8 +283,8 @@ func (ab *AppBot) loadRegistryFromDB(authRegistry *bot_api.AppBotRegistryAdapter
 
 // createPlatformBot handles POST /v1/admin/app_bot.
 func (ab *AppBot) createPlatformBot(c *wkhttp.Context) {
-	if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
-		c.ResponseError(err)
+	if err := c.CheckLoginRole(); err != nil {
+		respondAppBotForbidden(c)
 		return
 	}
 	ab.createBot(c, "platform", "")
@@ -415,8 +415,8 @@ func (ab *AppBot) createBot(c *wkhttp.Context, scope, spaceID string) {
 
 // listPlatformBots handles GET /v1/admin/app_bot.
 func (ab *AppBot) listPlatformBots(c *wkhttp.Context) {
-	if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
-		c.ResponseError(err)
+	if err := c.CheckLoginRole(); err != nil {
+		respondAppBotForbidden(c)
 		return
 	}
 	pageIndex, pageSize := c.GetPage()
@@ -475,8 +475,8 @@ func (ab *AppBot) getBotDetail(c *wkhttp.Context) {
 			return
 		}
 	} else {
-		if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
-			c.ResponseError(err)
+		if err := c.CheckLoginRole(); err != nil {
+			respondAppBotForbidden(c)
 			return
 		}
 	}
@@ -527,8 +527,8 @@ func (ab *AppBot) updateBot(c *wkhttp.Context) {
 			return
 		}
 	} else {
-		if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
-			c.ResponseError(err)
+		if err := c.CheckLoginRole(); err != nil {
+			respondAppBotForbidden(c)
 			return
 		}
 	}
@@ -615,8 +615,8 @@ func (ab *AppBot) deleteBot(c *wkhttp.Context) {
 			return
 		}
 	} else {
-		if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
-			c.ResponseError(err)
+		if err := c.CheckLoginRole(); err != nil {
+			respondAppBotForbidden(c)
 			return
 		}
 	}
@@ -675,8 +675,8 @@ func (ab *AppBot) rotateToken(c *wkhttp.Context) {
 			return
 		}
 	} else {
-		if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
-			c.ResponseError(err)
+		if err := c.CheckLoginRole(); err != nil {
+			respondAppBotForbidden(c)
 			return
 		}
 	}
@@ -765,8 +765,8 @@ func (ab *AppBot) revealToken(c *wkhttp.Context) {
 			return
 		}
 	} else {
-		if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
-			c.ResponseError(err)
+		if err := c.CheckLoginRole(); err != nil {
+			respondAppBotForbidden(c)
 			return
 		}
 	}
@@ -803,8 +803,8 @@ func (ab *AppBot) publishBot(c *wkhttp.Context) {
 			return
 		}
 	} else {
-		if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
-			c.ResponseError(err)
+		if err := c.CheckLoginRole(); err != nil {
+			respondAppBotForbidden(c)
 			return
 		}
 	}
@@ -858,8 +858,8 @@ func (ab *AppBot) unpublishBot(c *wkhttp.Context) {
 			return
 		}
 	} else {
-		if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
-			c.ResponseError(err)
+		if err := c.CheckLoginRole(); err != nil {
+			respondAppBotForbidden(c)
 			return
 		}
 	}

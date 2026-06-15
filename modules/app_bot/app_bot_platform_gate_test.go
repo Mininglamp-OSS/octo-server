@@ -1,0 +1,90 @@
+package app_bot
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/gocraft/dbr/v2"
+	"github.com/gocraft/dbr/v2/dialect"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// newPlatformGateRoute mounts the AppBot routes with `role` baked into the
+// token. The harness wires no RoleResolver, so the token role is authoritative
+// (same approach as newApplyBotRateLimitTestRoute). DB is sqlmock — the gate is
+// the first thing each handler does, so the role tests never reach a query.
+func newPlatformGateRoute(t *testing.T, role string) (*wkhttp.WKHttp, func()) {
+	t.Helper()
+	cfg := config.New()
+	cfg.Test = true
+	ctx := config.NewContext(cfg)
+
+	val := testutil.UID + "@test"
+	if role != "" {
+		val += "@" + role
+	}
+	require.NoError(t, ctx.Cache().Set(cfg.Cache.TokenCachePrefix+testutil.Token, val))
+
+	rawDB, _, err := sqlmock.New()
+	require.NoError(t, err)
+	conn := &dbr.Connection{DB: rawDB, EventReceiver: &dbr.NullEventReceiver{}, Dialect: dialect.MySQL}
+
+	route := wkhttp.New()
+	ab := &AppBot{
+		ctx: ctx,
+		db:  &appBotDB{ctx: ctx, session: conn.NewSession(nil)},
+		Log: log.NewTLog("AppBotPlatformGateTest"),
+	}
+	ab.Route(route)
+	return route, func() { _ = rawDB.Close() }
+}
+
+// TestPlatformAppBot_AdminAllowed pins the loosening: platform bot management is
+// delegated to admin (operations). An admin must pass the /v1/admin/app_bot gate
+// (previously superAdmin-only) — proven by reaching request validation rather
+// than the forbidden envelope.
+func TestPlatformAppBot_AdminAllowed(t *testing.T) {
+	route, cleanup := newPlatformGateRoute(t, string(wkhttp.Admin))
+	defer cleanup()
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/admin/app_bot", strings.NewReader("not-json"))
+	req.Header.Set("token", testutil.Token)
+	route.ServeHTTP(w, req)
+
+	body := w.Body.String()
+	// admin reaches request validation (proves the gate let it through), and the
+	// response is NOT a forbidden envelope.
+	assert.Contains(t, body, "invalid request body", "admin must pass the gate and reach handler validation")
+	assert.NotContains(t, body, "permission", "admin must not be forbidden")
+	assert.NotContains(t, body, "无权", "admin must not be forbidden")
+}
+
+// TestPlatformAppBot_PlainUserForbiddenLocalized pins both the gate (a user with
+// no system role is rejected) and the i18n fix (the forbidden response is the
+// localized shared envelope, not the raw wkhttp framework string that the legacy
+// c.ResponseError(err) leaked).
+func TestPlatformAppBot_PlainUserForbiddenLocalized(t *testing.T) {
+	route, cleanup := newPlatformGateRoute(t, "") // no system role
+	defer cleanup()
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/admin/app_bot", nil)
+	req.Header.Set("token", testutil.Token)
+	route.ServeHTTP(w, req)
+
+	body := w.Body.String()
+	// i18n fix: the forbidden response is now the localized shared-forbidden
+	// message rendered from the registered code (en-US source here), NOT the raw
+	// unlocalized wkhttp framework string the legacy c.ResponseError(err) leaked.
+	assert.NotContains(t, body, "该用户无权执行此操作", "must not leak the raw wkhttp framework string")
+	assert.Contains(t, body, "permission", "renders the localized shared-forbidden message")
+}
