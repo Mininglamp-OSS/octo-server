@@ -78,6 +78,13 @@ func setPlainUserToken(t *testing.T, ctx *config.Context) {
 		ctx.GetConfig().Cache.TokenCachePrefix+testutil.Token, testutil.UID+"@test"))
 }
 
+func setAdminToken(t *testing.T, ctx *config.Context) {
+	t.Helper()
+	require.NoError(t, ctx.Cache().Set(
+		ctx.GetConfig().Cache.TokenCachePrefix+testutil.Token,
+		testutil.UID+"@test@"+string(wkhttp.Admin)))
+}
+
 func shardTables(ctx *config.Context) []string {
 	count := ctx.GetConfig().TablePartitionConfig.MessageTableCount
 	if count <= 0 {
@@ -1024,6 +1031,26 @@ func TestOpanalyticsManualETLRunForbiddenAndAlreadyRunning(t *testing.T) {
 	acquired, err = lock.Acquire("second-token")
 	require.NoError(t, err)
 	assert.False(t, acquired, "already-running path must not drop or replace the held lock")
+}
+
+// TestOpanalyticsDashboardReadAdminTriggerSuperAdmin pins the split role policy:
+// the read-only dashboard endpoints accept admin∪superAdmin, while the manual
+// ETL trigger stays superAdmin-only.
+func TestOpanalyticsDashboardReadAdminTriggerSuperAdmin(t *testing.T) {
+	ctx, route := opaRouteOnlySetup(t)
+	rng := "?start_date=2026-06-01&end_date=2026-06-02"
+
+	setAdminToken(t, ctx)
+	// admin passes the read gate (it must NOT be rejected for role; the query
+	// itself may then succeed or fail on data, neither of which is forbidden).
+	rec := opaGet(t, route, "/v1/manager/dashboard/overview"+rng)
+	assert.NotEqual(t, "err.server.opanalytics.forbidden", errorCode(t, rec),
+		"admin must pass the dashboard read gate")
+
+	// admin must NOT trigger the ETL — that stays superAdmin-only.
+	rec = opaPost(t, route, "/v1/manager/dashboard/etl/run")
+	assert.Equal(t, "err.server.opanalytics.forbidden", errorCode(t, rec),
+		"manual ETL trigger must stay superAdmin-only")
 }
 
 func TestETLLockRenewRequiresMatchingToken(t *testing.T) {
