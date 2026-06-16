@@ -47,6 +47,28 @@ func memberSearchWhere(keyword string) (string, []interface{}) {
 	return strings.Join(clauses, " OR "), args
 }
 
+// memberSearchActiveColumns 空间侧 members/search 端点的检索列。与管理端
+// memberSearchColumns 的区别：
+//   - email 明文匹配、明文返回（工作邮箱，无需掩码）；
+//   - phone 仅匹配后 4 位（RIGHT(u.phone,4)），使「可检索粒度 == 可见粒度」
+//     （响应仅显示 138****5678），admin 无法通过子串查询逐位探测/重建完整号码。
+//
+// 前端注意：phone 检索只匹配后 4 位，传完整号码不会命中——按手机号查找请用后 4 位。
+var memberSearchActiveColumns = []string{"u.name", "u.username", "u.email", "RIGHT(u.phone,4)", "sm.uid"}
+
+// memberSearchActiveWhere 为空间侧 members/search 组装跨列 OR LIKE 条件。
+// list / count 共用同一条件，避免搜索范围漂移导致分页错位。
+func memberSearchActiveWhere(keyword string) (string, []interface{}) {
+	like := buildLikePattern(keyword)
+	clauses := make([]string, len(memberSearchActiveColumns))
+	args := make([]interface{}, len(memberSearchActiveColumns))
+	for i, col := range memberSearchActiveColumns {
+		clauses[i] = col + " LIKE ?" + likeEscapeClause
+		args[i] = like
+	}
+	return strings.Join(clauses, " OR "), args
+}
+
 // placeholders 生成 "?, ?, ?" 形式 placeholder 字符串，n 必须大于 0。
 func placeholders(n int) string {
 	return strings.TrimRight(strings.Repeat("?,", n), ",")
@@ -262,8 +284,8 @@ var ErrSpaceBannedForUpdate = errors.New("space is banned and caller disallowed 
 // 状态守卫契约（事务内强制，关闭 handler 层 guard 与 UPDATE 之间的 TOCTOU 窗口）：
 //   - SpaceStatusDisbanded 永远拒绝（ErrSpaceDisbandedForUpdate）
 //   - SpaceStatusBanned 由 allowBanned 控制：
-//       allowBanned=true（管理端）  → 放行，允许对封禁空间执行修复性更新
-//       allowBanned=false（用户端）→ 拒绝（ErrSpaceBannedForUpdate）
+//     allowBanned=true（管理端）  → 放行，允许对封禁空间执行修复性更新
+//     allowBanned=false（用户端）→ 拒绝（ErrSpaceBannedForUpdate）
 //
 // 用户端 handler 必须传 allowBanned=false：仅在入口用 checkSpaceActive 挡 banned 不够，
 // 入口检查与事务之间存在 race 窗口（manager 并发 ban），事务侧必须再挡一次才闭环。

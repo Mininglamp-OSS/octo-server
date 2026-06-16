@@ -161,6 +161,47 @@ func (d *DB) queryMembers(spaceId string, loginUID string, page uint64, limit ui
 	return models, err
 }
 
+func (d *DB) searchMembers(spaceId, keyword string, pageIndex, pageSize int) ([]*memberSearchModel, error) {
+	builder := d.session.Select(
+		"sm.*",
+		"IFNULL(u.name,'') as name",
+		"IFNULL(u.username,'') as username",
+		"IFNULL(u.email,'') as email",
+		"IFNULL(u.phone,'') as phone",
+		"CASE WHEN r.robot_id IS NOT NULL AND r.status=1 THEN 1 ELSE 0 END as robot",
+	).From(dbr.I("space_member").As("sm")).
+		LeftJoin(dbr.I("user").As("u"), "u.uid=sm.uid").
+		LeftJoin(dbr.I("robot").As("r"), "r.robot_id=sm.uid").
+		Where("sm.space_id=? AND sm.status=1", spaceId)
+	if keyword != "" {
+		clause, args := memberSearchActiveWhere(keyword)
+		builder = builder.Where(clause, args...)
+	}
+	var list []*memberSearchModel
+	_, err := builder.
+		OrderDir("sm.role", false).
+		OrderAsc("sm.created_at").
+		OrderAsc("sm.uid").
+		Limit(uint64(pageSize)).
+		Offset(uint64((pageIndex - 1) * pageSize)).
+		Load(&list)
+	return list, err
+}
+
+func (d *DB) countSearchMembers(spaceId, keyword string) (int64, error) {
+	builder := d.session.Select("COUNT(*)").
+		From(dbr.I("space_member").As("sm")).
+		LeftJoin(dbr.I("user").As("u"), "u.uid=sm.uid").
+		Where("sm.space_id=? AND sm.status=1", spaceId)
+	if keyword != "" {
+		clause, args := memberSearchActiveWhere(keyword)
+		builder = builder.Where(clause, args...)
+	}
+	var count int64
+	_, err := builder.Load(&count)
+	return count, err
+}
+
 // removeMemberLocked 锁内重读角色后移除成员，防并发转让产生无主空间，
 // 见 db_manager.go removeMemberLocked。
 func (d *DB) removeMemberLocked(spaceId, uid string, rejectRoleAtOrAbove int) error {

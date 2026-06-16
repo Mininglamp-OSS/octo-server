@@ -18,16 +18,16 @@ const (
 
 // SpaceModel 空间表模型
 type SpaceModel struct {
-	SpaceId        string // 空间ID
-	Name           string // 空间名称
-	Description    string // 空间描述
-	Logo           string // 空间Logo
-	Creator        string // 创建者uid
+	SpaceId        string  // 空间ID
+	Name           string  // 空间名称
+	Description    string  // 空间描述
+	Logo           string  // 空间Logo
+	Creator        string  // 创建者uid
 	MaxUsers       int     // 最大成员数 0.不限制
 	PresetGroupIds *string // 预设群组ID列表（JSON数组）
 	JoinMode       int     // 加入模式 0=直接加入 1=需要审批
 	Status         int     // 状态 1.正常 0.已解散
-	Version        int64  // 版本号
+	Version        int64   // 版本号
 	db.BaseModel
 }
 
@@ -41,15 +41,24 @@ type MemberModel struct {
 	db.BaseModel
 }
 
+type memberSearchModel struct {
+	MemberModel
+	Name     string
+	Username string
+	Email    string
+	Phone    string
+	Robot    int
+}
+
 // InvitationModel 邀请表模型
 type InvitationModel struct {
-	SpaceId    string  // 空间ID
-	InviteCode string  // 邀请码
-	Creator    string  // 创建者uid
-	MaxUses    int     // 最大使用次数
-	UsedCount  int     // 已使用次数
+	SpaceId    string   // 空间ID
+	InviteCode string   // 邀请码
+	Creator    string   // 创建者uid
+	MaxUses    int      // 最大使用次数
+	UsedCount  int      // 已使用次数
 	ExpiresAt  *db.Time // 过期时间
-	Status     int     // 状态 1.有效 0.无效
+	Status     int      // 状态 1.有效 0.无效
 	db.BaseModel
 }
 
@@ -169,6 +178,17 @@ type spaceResp struct {
 type memberResp struct {
 	UID       string `json:"uid"`
 	Name      string `json:"name"`
+	Role      int    `json:"role"`
+	Robot     int    `json:"robot"`
+	CreatedAt string `json:"created_at"`
+}
+
+type memberSearchResp struct {
+	UID       string `json:"uid"`
+	Name      string `json:"name"`
+	Username  string `json:"username"`
+	Email     string `json:"email"`
+	Phone     string `json:"phone"`
 	Role      int    `json:"role"`
 	Robot     int    `json:"robot"`
 	CreatedAt string `json:"created_at"`

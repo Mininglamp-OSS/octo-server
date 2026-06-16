@@ -14,6 +14,54 @@ schemes:
 basePath: "/v1"
 
 paths:
+  /space/{space_id}/members/search:
+    get:
+      tags:
+        - "space"
+      summary: "空间成员检索（空间 admin/owner）"
+      description: "空间 admin/owner 分页检索本空间在册成员；keyword 跨列模糊匹配 昵称/用户名/邮箱/手机号/UID。email/phone 返回掩码。含机器人。"
+      produces:
+        - "application/json"
+      parameters:
+        - in: "path"
+          name: "space_id"
+          type: string
+          required: true
+        - in: "query"
+          name: "keyword"
+          type: string
+          required: false
+          description: "子串模糊匹配 name/username/email(明文)/uid；phone 仅匹配后 4 位(传完整号码不命中，前端按手机号检索请用后 4 位)；_/%/\\ 按字面量；为空不过滤"
+        - in: "query"
+          name: "page_index"
+          type: integer
+          required: false
+          description: "页码，<=0 归 1"
+        - in: "query"
+          name: "page_size"
+          type: integer
+          required: false
+          description: "每页条数，省略或 <=0 时为 15，上限 200"
+      responses:
+        200:
+          description: "返回"
+          schema:
+            type: object
+            properties:
+              count:
+                type: integer
+                description: "符合条件的成员总数"
+              list:
+                type: array
+                items:
+                  $ref: "#/definitions/memberSearchResp"
+        400:
+          description: "非成员 / 无权限 / 查询失败"
+          schema:
+            $ref: "#/definitions/response"
+      security:
+        - token: []
+
   /manager/spaces/{space_id}/members:
     get:
       tags:
@@ -67,6 +115,30 @@ paths:
         - token: []
 
 definitions:
+  memberSearchResp:
+    type: object
+    properties:
+      uid:
+        type: string
+      name:
+        type: string
+        description: "昵称"
+      username:
+        type: string
+      email:
+        type: string
+        description: "邮箱（明文，工作邮箱不掩码）"
+      phone:
+        type: string
+        description: "手机号，掩码为 前3+****+后4（如 138****5678）；仅后 4 位可检索"
+      role:
+        type: integer
+        description: "0.普通成员 1.管理员 2.拥有者"
+      robot:
+        type: integer
+        description: "1=机器人 0=否"
+      created_at:
+        type: string
   managerMemberResp:
     type: object
     properties:

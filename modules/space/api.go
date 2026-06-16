@@ -24,6 +24,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
+	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	rd "github.com/go-redis/redis"
 	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
@@ -94,6 +95,11 @@ func (s *Space) Route(r *wkhttp.WKHttp) {
 		auth.POST("/:space_id/email-invites", s.createMemberEmailInvite)
 		auth.GET("/:space_id/email-invites", s.listMemberEmailInvites)
 		auth.DELETE("/:space_id/email-invites/:id", s.revokeMemberEmailInvite)
+	}
+
+	search := r.Group("/v1/space", s.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, s.ctx))
+	{
+		search.GET("/:space_id/members/search", s.searchMembers)
 	}
 
 	// 邀请码预览端点（公开无认证）严格 per-IP 限流：防枚举 + 暴破（issue #1000）。
