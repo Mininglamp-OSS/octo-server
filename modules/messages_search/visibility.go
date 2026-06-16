@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/message"
 	"github.com/olivere/elastic"
 )
@@ -272,6 +273,25 @@ func (h *Handler) paginateWithFilter(
 	osQuery osQueryFn,
 	project projectFn,
 ) ([]*elastic.SearchHit, bool, string, error) {
+	return h.paginateWithFilterDepth(ctx, loginUID, channelID, pageSize, 0, initialSearchAfter, isRelevanceSort, osQuery, project)
+}
+
+// paginateWithFilterDepth is paginateWithFilter plus the cumulative result
+// depth already served before this page (decoded from the request cursor). The
+// returned next_cursor encodes priorDepth + len(returned page) so the
+// max-pagination-depth cap (enforced in the handler via decodeCursorWithDepth)
+// is measured on the cumulative count, not page_size — shrinking/growing
+// page_size between requests cannot walk past the cap.
+func (h *Handler) paginateWithFilterDepth(
+	ctx context.Context,
+	loginUID, channelID string,
+	pageSize int,
+	priorDepth int64,
+	initialSearchAfter []any,
+	isRelevanceSort bool,
+	osQuery osQueryFn,
+	project projectFn,
+) ([]*elastic.SearchHit, bool, string, error) {
 	collected := make([]*elastic.SearchHit, 0, pageSize)
 	searchAfter := initialSearchAfter
 	fetchSize := pageSize * oversampleMultiplier
@@ -364,10 +384,61 @@ func (h *Handler) paginateWithFilter(
 			// cleanly. Caller can retry the request to get fresher state.
 			hasMore = false
 		} else {
-			nextCursor = encodeCursor(h.cfg, ts, msgID, score)
+			// Carry the cumulative depth so the next request's cap check sees
+			// the running total, independent of the page_size used to get here.
+			nextDepth := priorDepth + int64(len(collected))
+			nextCursor = encodeCursorWithDepth(h.cfg, ts, msgID, score, nextDepth)
 		}
 	}
 	return collected, hasMore, nextCursor, nil
+}
+
+// resolveCursorDepth decodes the cumulative result depth carried in the
+// request cursor and enforces the max-pagination-depth cap. The bool return is
+// "continue": false means a DEPTH_EXCEEDED response was already written and the
+// handler must abort. An empty cursor (first page) has depth 0.
+//
+// The cap is checked against the cumulative depth INCLUDING the page about to
+// be served (priorDepth + pageSize), NOT page_size alone, so a caller sitting
+// just under the cap cannot pick a larger page_size to read past it: a request
+// whose window would cross maxPaginationDepth is rejected before any OS
+// round-trip.
+//
+// Integrity note (codex P2): the depth is HMAC-signed into the cursor, so a
+// well-behaved deployment (OCTO_SEARCH_CURSOR_HMAC set) cannot have its depth
+// forged back to 0. When the secret is UNSET the cursor falls back to the
+// published default key (api.go New() logs a loud WARN at startup), which makes
+// BOTH the depth AND the search_after position forgeable — but forging depth
+// buys nothing an attacker doesn't already get by forging search_after
+// directly: every page still passes the per-request channel-access +
+// filterVisible gates and the bounded oversample loop (loopBudget rounds), so
+// the depth cap is a resource-protection limit, not a security boundary. The
+// correct hardening is to require the per-deployment secret in production
+// (already surfaced as a startup WARN); we deliberately do not reject
+// depth-carrying cursors under the default key here because that would break
+// the existing time_*/relevance cursors that share the same signing path.
+func (h *Handler) resolveCursorDepth(c *wkhttp.Context, cursor string, pageSize int) (int64, bool) {
+	var depth int64
+	if cursor != "" {
+		_, _, _, d, err := decodeCursorWithDepth(h.cfg, cursor)
+		if err != nil {
+			// Mirrors decodeCursorAsSearchAfter's contract: malformed cursors
+			// map to VALIDATION_ERROR(field=cursor) upstream. Callers already
+			// validate the cursor via validateBase, so this is defense-in-depth.
+			respondValidation(c, "cursor", "malformed")
+			return 0, false
+		}
+		depth = d
+	}
+	// Reject when this request's window would carry the cumulative depth past
+	// the cap. Using pageSize (not the post-filter count) keeps the check
+	// page_size-driven and pre-OS, so it cannot be bypassed by choosing a
+	// larger page near the boundary.
+	if depth+int64(pageSize) > maxPaginationDepth {
+		respondDepthExceeded(c)
+		return 0, false
+	}
+	return depth, true
 }
 
 // decodeCursorAsSearchAfter rebuilds the OpenSearch SearchAfter tuple from

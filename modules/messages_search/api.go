@@ -9,6 +9,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
+	"github.com/Mininglamp-OSS/octo-server/pkg/searchbackend"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 )
 
@@ -32,6 +33,10 @@ type Handler struct {
 
 	limiter *uidLimiter
 	cache   *senderCache
+	// mode is the resolved OCTO_SEARCH_BACKEND posture. When mode.ESServe is
+	// false the backendGate middleware refuses every _search* request with
+	// SEARCH_DISABLED — the OS path never serves under zinc/disabled.
+	mode searchbackend.Mode
 }
 
 // New constructs the Handler. ES client setup is deferred to first request so
@@ -51,6 +56,7 @@ func New(ctx *config.Context) *Handler {
 		visibility:     newMessageVisibilityProbe(msgSvc),
 		limiter:        newUIDLimiter(cfg.RateLimit.QPS, cfg.RateLimit.Burst),
 		cache:          newSenderCache(senderCacheCapacity, senderCacheTTL),
+		mode:           searchbackend.Resolve(ctx.GetConfig().ZincSearch.SearchOn),
 	}
 	if cfg.CursorHMAC == "" {
 		// The fallback key in cursor.go is a published constant, so cursors
@@ -73,6 +79,12 @@ func New(ctx *config.Context) *Handler {
 // auth/space/uid-limit chain plus the per-user search rate limiter and the
 // audit middleware (PRM-02). Individual handlers are wired in their own
 // search_*.go files via the registerHandler helper.
+//
+// The backendGate middleware runs INSIDE the chain (after auth + rate limit +
+// audit) so a disabled / zinc deployment still meters and audits the refusal
+// — an attacker cannot enumerate channels through an unmetered "search off"
+// reply (V9). When the backend is not `es` every _search* endpoint returns
+// SEARCH_DISABLED uniformly.
 func (h *Handler) Route(r *wkhttp.WKHttp) {
 	g := r.Group("/v1/messages",
 		h.ctx.AuthMiddleware(r),
@@ -80,9 +92,25 @@ func (h *Handler) Route(r *wkhttp.WKHttp) {
 		spacepkg.SpaceMiddleware(h.ctx),
 		h.searchRateLimiter(),
 		h.auditMiddleware(),
+		h.backendGate(),
 	)
 	for _, mount := range routeMounters {
 		mount(h, g)
+	}
+}
+
+// backendGate refuses every _search* request with SEARCH_DISABLED unless the
+// resolved backend is `es`. It sits after the rate-limiter + audit middleware
+// so the refusal is still counted and logged (V9: failure paths must not be a
+// free enumeration oracle).
+func (h *Handler) backendGate() wkhttp.HandlerFunc {
+	return func(c *wkhttp.Context) {
+		if !h.mode.ESServe {
+			respondSearchDisabled(c)
+			c.Abort()
+			return
+		}
+		c.Next()
 	}
 }
 

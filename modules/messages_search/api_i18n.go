@@ -63,6 +63,23 @@ func respondNotFound(c *wkhttp.Context, resource string) {
 	httperr.ResponseErrorL(c, errcode.ErrMessagesSearchNotFound, nil, d)
 }
 
+// respondSearchDisabled emits SEARCH_DISABLED — the deployment has
+// OCTO_SEARCH_BACKEND=disabled so no search surface serves. Used by the
+// backendGate middleware (and mirrored by the legacy surfaces) so every
+// search entry point refuses uniformly instead of 500/panic/leaking.
+func respondSearchDisabled(c *wkhttp.Context) {
+	httperr.ResponseErrorL(c, errcode.ErrMessagesSearchDisabled, nil, nil)
+}
+
+// respondDepthExceeded emits DEPTH_EXCEEDED — the cumulative pagination depth
+// cap (max_result_window) was reached. Carries the cap so clients can surface
+// a meaningful "narrow your search" hint.
+func respondDepthExceeded(c *wkhttp.Context) {
+	httperr.ResponseErrorL(c, errcode.ErrMessagesSearchDepthExceeded, nil, i18n.Details{
+		"max_depth": maxPaginationDepth,
+	})
+}
+
 // classifyOSError categorises an error returned by the olivere/elastic client
 // into one of our R2 buckets. Returns the responder helper to invoke.
 //

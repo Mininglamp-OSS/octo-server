@@ -22,6 +22,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"github.com/Mininglamp-OSS/octo-server/pkg/searchbackend"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -401,6 +402,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 			SystemBotUIDs:          spacepkg.SystemBotList(),
 			LocalLoginOff:          boolToFlag(cn.systemSettings.LocalLoginOff()),
 			DisableUserCreateSpace: boolToFlag(cn.systemSettings.SpaceDisableUserCreate()),
+			SearchEnabled:          searchbackend.Resolve(cn.ctx.GetConfig().ZincSearch.SearchOn).SearchEnabled(),
 		})
 		return
 	}
@@ -439,6 +441,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 		SystemBotUIDs:          spacepkg.SystemBotList(),
 		LocalLoginOff:          boolToFlag(cn.systemSettings.LocalLoginOff()),
 		DisableUserCreateSpace: boolToFlag(cn.systemSettings.SpaceDisableUserCreate()),
+		SearchEnabled:          searchbackend.Resolve(cn.ctx.GetConfig().ZincSearch.SearchOn).SearchEnabled(),
 	})
 }
 
@@ -753,6 +756,14 @@ type appConfigResp struct {
 	// 实时性。后端 POST /v1/space/create 也走同一个 getter 校验,客户端隐藏
 	// 与服务端拒绝由单一真源驱动,不存在前后端漂移。
 	DisableUserCreateSpace int `json:"disable_user_create_space"`
+
+	// SearchEnabled 告知客户端当前部署是否启用消息搜索（OCTO_SEARCH_BACKEND
+	// != disabled）。为 false 时前端应隐藏搜索入口，而不是每次调用搜索接口
+	// 再吃一个 SEARCH_DISABLED 错误（YUJ-4667 步骤 2 / YUJ-4662 §7-#10）。
+	//
+	// 与 app_config.version 解耦的原因同 LocalLoginOff / DisableUserCreateSpace：
+	// 运维切 backend 后老客户端命中 version 短路分支也必须拿到最新值。
+	SearchEnabled bool `json:"search_enabled"`
 }
 
 type oidcProviderResp struct {

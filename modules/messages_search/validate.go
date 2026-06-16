@@ -68,6 +68,19 @@ type SearchFilesReq struct {
 // shape as _search; keyword required.
 type SearchAllReq = SearchMessagesReq
 
+// SearchAroundReq is the request body for POST /v1/messages/_search_around.
+// It locates a known anchor message and returns the chronological window
+// around it (older + anchor + newer). There is no keyword, sort, or cursor:
+// the window is anchored on a specific message_id and always returned in
+// time_asc order so the client can render a contiguous conversation slice.
+type SearchAroundReq struct {
+	ChannelType     uint8         `json:"channel_type"`
+	ChannelID       string        `json:"channel_id"`
+	AnchorMessageID string        `json:"anchor_message_id"`
+	Filters         SearchFilters `json:"filters,omitempty"`
+	PageSize        int           `json:"page_size,omitempty"`
+}
+
 // validateBase covers the fields shared across all four endpoints:
 // channel_type/id form, sender_ids count, time window order, page_size, sort
 // enum, cursor signature.

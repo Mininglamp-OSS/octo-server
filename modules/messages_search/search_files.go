@@ -80,6 +80,10 @@ func (h *Handler) searchFiles(c *wkhttp.Context) {
 		respondValidation(c, "cursor", "malformed")
 		return
 	}
+	priorDepth, ok := h.resolveCursorDepth(c, req.Cursor, pageSize)
+	if !ok {
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), h.cfg.Timeout)
 	defer cancel()
@@ -105,8 +109,8 @@ func (h *Handler) searchFiles(c *wkhttp.Context) {
 		return res.Hits.Hits, nil
 	}
 
-	filtered, hasMore, nextCursor, err := h.paginateWithFilter(
-		ctx, loginUID, req.ChannelID, pageSize, initialAfter, isRelevance, osQuery, projectDocRef(req.ChannelID),
+	filtered, hasMore, nextCursor, err := h.paginateWithFilterDepth(
+		ctx, loginUID, req.ChannelID, pageSize, priorDepth, initialAfter, isRelevance, osQuery, projectDocRef(req.ChannelID),
 	)
 	if err != nil {
 		if responder := classifyOSError(err); responder != nil {

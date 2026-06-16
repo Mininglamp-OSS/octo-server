@@ -235,7 +235,99 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
+  /messages/_search_around:
+    post:
+      tags:
+        - "messages_search"
+      operationId: "message.search_around"
+      summary: "Locate the context window around an anchor message"
+      description: "Returns the chronological window (older + anchor + newer) around a known anchor message in a single channel. The anchor is pre-validated through the same channel-access, Space-scope, and visibility gates as a normal read: a revoked / deleted / cross-Space / not-found anchor returns 404 and no context is fetched."
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: body
+          name: body
+          required: true
+          schema:
+            $ref: "#/definitions/SearchAroundReq"
+      responses:
+        "200":
+          description: "OK"
+          schema:
+            $ref: "#/definitions/AroundResult"
+        "400":
+          description: "Validation error"
+          schema:
+            $ref: "#/definitions/Error"
+        "401":
+          description: "Unauthenticated"
+          schema:
+            $ref: "#/definitions/Error"
+        "403":
+          description: "Forbidden"
+          schema:
+            $ref: "#/definitions/Error"
+        "404":
+          description: "Anchor / channel not visible (also covers cross-Space and revoked anchor)"
+          schema:
+            $ref: "#/definitions/Error"
+        "429":
+          description: "Rate limited"
+          schema:
+            $ref: "#/definitions/Error"
+        "500":
+          description: "Internal error"
+          schema:
+            $ref: "#/definitions/Error"
+        "503":
+          description: "Search backend unavailable / disabled"
+          schema:
+            $ref: "#/definitions/Error"
+
 definitions:
+  SearchAroundReq:
+    type: object
+    required:
+      - channel_type
+      - channel_id
+      - anchor_message_id
+    properties:
+      channel_type:
+        type: integer
+        description: "1=p2p, 2=group, 5=thread."
+      channel_id:
+        type: string
+      anchor_message_id:
+        type: string
+        description: "Decimal-string snowflake id of the anchor message."
+      filters:
+        $ref: "#/definitions/SearchFilters"
+      page_size:
+        type: integer
+        description: "Max hits per wing (before / after), 1-100, default 20."
+  AroundResult:
+    type: object
+    properties:
+      before:
+        type: array
+        description: "Messages older than the anchor, oldest-first."
+        items:
+          $ref: "#/definitions/MessageHit"
+      anchor:
+        $ref: "#/definitions/MessageHit"
+      after:
+        type: array
+        description: "Messages newer than the anchor, oldest-first."
+        items:
+          $ref: "#/definitions/MessageHit"
+      has_more_before:
+        type: boolean
+      has_more_after:
+        type: boolean
   SearchFilters:
     type: object
     properties:

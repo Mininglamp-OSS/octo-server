@@ -53,4 +53,30 @@ var (
 		DefaultMessage: "Channel or resource not found for search.",
 		SafeDetailKeys: []string{"resource"},
 	})
+
+	// SEARCH_DISABLED — the deployment has OCTO_SEARCH_BACKEND=disabled, so
+	// every search surface (the new _search* endpoints, the legacy
+	// /v1/message/search path, and modules/search global search) refuses
+	// uniformly instead of 500/panic/leaking results. Core IM stays fully
+	// functional; the client uses appconfig.search_enabled to hide the search
+	// box rather than probe this code per request.
+	ErrMessagesSearchDisabled = register(codes.Code{
+		ID:             "err.server.messages_search.disabled",
+		HTTPStatus:     http.StatusServiceUnavailable,
+		DefaultMessage: "Search is not enabled on this deployment.",
+	})
+
+	// DEPTH_EXCEEDED — the caller paged past the maximum cumulative result
+	// depth (aligned with OpenSearch max_result_window=10000). The cap is on
+	// the cumulative number of results already returned (encoded in the
+	// cursor), NOT on the per-request page_size, so shrinking/growing
+	// page_size cannot be used to walk past it. Clients that hit this should
+	// narrow the query (keyword / time window / sender) instead of paging
+	// deeper.
+	ErrMessagesSearchDepthExceeded = register(codes.Code{
+		ID:             "err.server.messages_search.depth_exceeded",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Search pagination depth limit reached; narrow your query.",
+		SafeDetailKeys: []string{"max_depth"},
+	})
 )

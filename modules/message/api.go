@@ -34,6 +34,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
 	"github.com/Mininglamp-OSS/octo-server/pkg/richtext"
+	"github.com/Mininglamp-OSS/octo-server/pkg/searchbackend"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"github.com/gocraft/dbr/v2"
@@ -1322,6 +1323,17 @@ func (m *Message) typing(c *wkhttp.Context) {
 
 // 搜索消息
 func (m *Message) search(c *wkhttp.Context) {
+	// search.backend 三态收口（YUJ-4667 步骤 2）：旧 /v1/message/search 走
+	// WuKongIM→Zinc，只有显式声明 backend=zinc 时才服务。
+	//   - disabled：搜索全关，统一返回 SEARCH_DISABLED（与新 _search* 表面一致）。
+	//   - es：OpenSearch 路径为权威读路径，旧 Zinc 路径不再服务（绝不让 es
+	//     部署把流量悄悄落回 Zinc 读到陈旧索引）；客户端应改打 _search*。
+	//   - zinc：维持旧行为（迁移/回滚过渡态）。
+	backend := searchbackend.Resolve(m.ctx.GetConfig().ZincSearch.SearchOn)
+	if !backend.LegacyZinc {
+		httperr.ResponseErrorL(c, errcode.ErrMessagesSearchDisabled, nil, nil)
+		return
+	}
 	var req struct {
 		UID         string `json:"uid"` // 搜索的消息限定这某个用户内
 		ChannelID   string `json:"channel_id"`
@@ -1431,7 +1443,15 @@ func (m *Message) filterResultsBySpace(results []map[string]interface{}, spaceID
 				filtered = append(filtered, r)
 			}
 		default:
-			filtered = append(filtered, r)
+			// 安全收口（fail-CLOSED）：未知 channel_type 无法判定其 Space 归属，
+			// 一律剔除，绝不放行。此前 `default: append` 会把任何无法识别的
+			// channel_type 直接放进结果，构成跨 Space 越权暴露面（搜索 A Space
+			// 时可命中 B Space / 未加入频道的消息）。新链 modules/messages_search
+			// 已 fail-CLOSED，此处把旧 Zinc/WuKongIM 读路径对齐到同一安全语义。
+			m.Warn("搜索结果命中未知 channel_type，已按 fail-closed 剔除",
+				zap.Int("channel_type", channelType),
+				zap.String("channel_id", chID),
+				zap.String("space_id", spaceID))
 		}
 	}
 	return filtered, nil

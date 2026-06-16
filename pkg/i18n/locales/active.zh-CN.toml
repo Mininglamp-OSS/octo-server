@@ -1145,3 +1145,9 @@ other = "搜索请求过于频繁，请稍后再试。"
 
 ["err.server.messages_search.not_found"]
 other = "未找到对应频道或资源。"
+
+["err.server.messages_search.disabled"]
+other = "当前部署未启用搜索功能。"
+
+["err.server.messages_search.depth_exceeded"]
+other = "搜索翻页已达最大深度上限，请缩小搜索范围。"

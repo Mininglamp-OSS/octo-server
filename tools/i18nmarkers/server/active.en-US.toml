@@ -492,6 +492,12 @@ other = "Message search failed."
 ["err.server.message.store_failed"]
 other = "Failed to persist message data."
 
+["err.server.messages_search.depth_exceeded"]
+other = "Search pagination depth limit reached; narrow your query."
+
+["err.server.messages_search.disabled"]
+other = "Search is not enabled on this deployment."
+
 ["err.server.messages_search.internal"]
 other = "Internal search error."
 

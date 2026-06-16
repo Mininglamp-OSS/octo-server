@@ -15,6 +15,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/log"
+	"github.com/Mininglamp-OSS/octo-server/pkg/searchbackend"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/Mininglamp-OSS/octo-server/pkg/util"
 	"go.uber.org/zap"
@@ -62,6 +63,18 @@ func buildMessageSearchQuery(keyword string) (map[string]interface{}, []string) 
 }
 
 func (s *Search) global(c *wkhttp.Context) {
+	// search.backend 三态收口（YUJ-4667 步骤 2 / codex P1）。
+	//   - disabled：全局搜索表面与新 _search* / 旧 /v1/message/search 一致返回
+	//     SEARCH_DISABLED，不做 500/panic/部分结果。
+	//   - es：消息检索权威读路径是 OpenSearch（modules/messages_search）。本端点
+	//     的**消息**部分走旧 WuKongIM→Zinc，es 下绝不再跑（否则等于让第三个
+	//     Zinc 消息检索表面绕过 ES 的 space/可见性过滤）；好友/群（MySQL）不受影响。
+	//   - zinc：维持旧行为（含 Zinc 消息检索，迁移/回滚过渡态）。
+	mode := searchbackend.Resolve(s.ctx.GetConfig().ZincSearch.SearchOn)
+	if !mode.SearchEnabled() {
+		httperr.ResponseErrorL(c, errcode.ErrMessagesSearchDisabled, nil, nil)
+		return
+	}
 	loginUID := c.GetLoginUID()
 	var req struct {
 		OnlyMessage int    `json:"only_message"` // 只加载消息
@@ -86,24 +99,29 @@ func (s *Search) global(c *wkhttp.Context) {
 	}
 	payload, highlights := buildMessageSearchQuery(req.Keyword)
 
-	// 查询消息
-	msgResp, err := s.ctx.IMSearchUserMessages(&config.SearchUserMessageReq{
-		UID:          loginUID,
-		Payload:      payload,
-		PayloadTypes: req.ContentType,
-		Limit:        req.Limit,
-		Page:         req.Page,
-		FromUID:      req.FromUID,
-		ChannelID:    req.ChannelID,
-		ChannelType:  req.ChannelType,
-		Topic:        req.Topic,
-		StartTime:    req.StartTime,
-		EndTime:      req.EndTime,
-		Highlights:   highlights,
-	})
-	if err != nil {
-		s.Warn("查询悟空IM消息错误（不影响好友和群搜索）", zap.Error(err))
-		msgResp = nil
+	// 查询消息（仅在 backend=zinc 时走旧 Zinc 消息检索；es/默认-es 下跳过，
+	// 让消息检索归口到 OpenSearch _search*，本端点只回好友/群结果）。
+	var msgResp *config.SearchUserMessageResp
+	if mode.LegacyZinc {
+		var err error
+		msgResp, err = s.ctx.IMSearchUserMessages(&config.SearchUserMessageReq{
+			UID:          loginUID,
+			Payload:      payload,
+			PayloadTypes: req.ContentType,
+			Limit:        req.Limit,
+			Page:         req.Page,
+			FromUID:      req.FromUID,
+			ChannelID:    req.ChannelID,
+			ChannelType:  req.ChannelType,
+			Topic:        req.Topic,
+			StartTime:    req.StartTime,
+			EndTime:      req.EndTime,
+			Highlights:   highlights,
+		})
+		if err != nil {
+			s.Warn("查询悟空IM消息错误（不影响好友和群搜索）", zap.Error(err))
+			msgResp = nil
+		}
 	}
 	channelIds := make([]string, 0)
 	messageIds := make([]string, 0)
