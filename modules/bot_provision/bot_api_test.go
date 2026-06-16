@@ -98,6 +98,18 @@ func insertAPIKey(t *testing.T, ctx *config.Context, uid, apiKey, spaceID string
 	require.NoError(t, err)
 }
 
+// insertAPIKeyFull inserts a user_api_key row with explicit status/client_id
+// (the 3-col insertAPIKey relies on the column DEFAULTs status=1 /
+// client_id='botfather'). Used to seed revoked keys and legacy plaintext
+// non-botfather rows the daemon botToken path must reject.
+func insertAPIKeyFull(t *testing.T, ctx *config.Context, uid, apiKey, spaceID string, status int, clientID string) {
+	t.Helper()
+	_, err := ctx.DB().InsertInto("user_api_key").
+		Columns("uid", "api_key", "space_id", "status", "client_id").
+		Values(uid, apiKey, spaceID, status, clientID).Exec()
+	require.NoError(t, err)
+}
+
 // insertBotInSpace creates a robot row (creator, bot_token, status) and a
 // space_member row putting the bot in spaceID. Mirrors botfather/db.go's
 // MintBotOBO write pattern at the SQL level so tests bypass the OBO logic.
@@ -191,6 +203,36 @@ func TestBotToken_LegacyEmptySpace_401(t *testing.T) {
 	insertBotInSpace(t, ctx, "bot_legacy", bpTestUIDA, "bf_tok_lg", bpTestSpaceA, 1)
 
 	w := doBotToken(t, s, "bot_legacy", "uk_bp_legacy_xxxxxxxxxxxxxxxxxxxxxxxx")
+	assert.Equal(t, http.StatusUnauthorized, w.Code, "body: %s", w.Body.String())
+}
+
+// 5b) user_api_key.status=0 (revoked daemon key) → 401. resolveAPIKey's
+// status=1 filter is the kill switch; without it a revoked key still mints
+// bot_token.
+func TestBotToken_RevokedKey_401(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	seedBPFixtures(t, ctx)
+	insertAPIKeyFull(t, ctx, bpTestUIDA, "uk_bp_revoked_xxxxxxxxxxxxxxxxxxxxxx", bpTestSpaceA, 0, "botfather")
+	insertBotInSpace(t, ctx, "bot_revoked", bpTestUIDA, "bf_tok_rv", bpTestSpaceA, 1)
+
+	w := doBotToken(t, s, "bot_revoked", "uk_bp_revoked_xxxxxxxxxxxxxxxxxxxxxx")
+	assert.Equal(t, http.StatusUnauthorized, w.Code, "body: %s", w.Body.String())
+}
+
+// 5c) legacy plaintext key owned by a non-botfather client → 401. The daemon
+// botToken path is native-only; integration-client keys must not mint
+// bot_token. Seeded as a PLAINTEXT row (not via the service, which stores
+// integration keys as a "hash:" digest) so the api_key=? match still hits —
+// only client_id='botfather' rejects it, proving that filter works.
+func TestBotToken_NonBotfatherClient_401(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	seedBPFixtures(t, ctx)
+	insertAPIKeyFull(t, ctx, bpTestUIDA, "uk_bp_integration_xxxxxxxxxxxxxxxxxx", bpTestSpaceA, 1, "some-integration")
+	insertBotInSpace(t, ctx, "bot_integ", bpTestUIDA, "bf_tok_ig", bpTestSpaceA, 1)
+
+	w := doBotToken(t, s, "bot_integ", "uk_bp_integration_xxxxxxxxxxxxxxxxxx")
 	assert.Equal(t, http.StatusUnauthorized, w.Code, "body: %s", w.Body.String())
 }
 

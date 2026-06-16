@@ -4343,12 +4343,19 @@ func (u *User) authVerifyAPIKey(c *wkhttp.Context) {
 	}
 
 	// Step 1: lookup api_key, reject legacy space_id=''.
+	// status=1 / client_id='botfather' gate the post-main schema additions:
+	// status filters out revoked keys (status=0), and client_id restricts
+	// verify-api-key to native octo keys — integration-client keys
+	// (client_id != 'botfather') must not validate on the daemon path.
+	// Literals mirror user_api_key's active status + native client; the
+	// canonical botfather constants are unexported and the user package
+	// cannot import botfather (botfather -> user import cycle).
 	var keyInfo struct {
 		UID     string `db:"uid"`
 		SpaceID string `db:"space_id"`
 	}
 	_, err := u.db.session.Select("uid", "space_id").From("user_api_key").
-		Where("api_key=? AND space_id!=''", req.APIKey).
+		Where("api_key=? AND space_id!='' AND status=? AND client_id=?", req.APIKey, 1, "botfather").
 		Load(&keyInfo)
 	if err != nil || keyInfo.UID == "" {
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "invalid api_key"})

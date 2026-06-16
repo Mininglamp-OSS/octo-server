@@ -62,6 +62,18 @@ func insertAPIKey(t *testing.T, ctx *config.Context, uid, apiKey, spaceID string
 	require.NoError(t, err)
 }
 
+// insertAPIKeyFull inserts a user_api_key row with explicit status/client_id
+// (the 3-col insertAPIKey relies on the column DEFAULTs status=1 /
+// client_id='botfather'). Used to seed revoked keys and legacy plaintext
+// non-botfather rows the daemon path must reject.
+func insertAPIKeyFull(t *testing.T, ctx *config.Context, uid, apiKey, spaceID string, status int, clientID string) {
+	t.Helper()
+	_, err := ctx.DB().InsertInto("user_api_key").
+		Columns("uid", "api_key", "space_id", "status", "client_id").
+		Values(uid, apiKey, spaceID, status, clientID).Exec()
+	require.NoError(t, err)
+}
+
 func doVerifyAPIKey(t *testing.T, s *server.Server, body interface{}) *httptest.ResponseRecorder {
 	t.Helper()
 	var reqBody *bytes.Reader
@@ -146,6 +158,38 @@ func TestAuthVerifyAPIKey_NonActiveStatus(t *testing.T) {
 	require.NoError(t, err)
 
 	w := doVerifyAPIKey(t, s, map[string]string{"api_key": "uk_nonactive_xxxxxxxxxxxxxxxxxxxxxxxx"})
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
+// Case 3c: user_api_key.status=0 (revoked key) → 401. Distinct from the
+// space_member.status cases above — this gates the KEY's own revocation
+// flag (added with the client-dimension migration). Without the SQL
+// `status=1` filter a revoked daemon key keeps verifying.
+func TestAuthVerifyAPIKey_RevokedKey_401(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	seedAPIKeyFixtures(t, ctx)
+	insertAPIKeyFull(t, ctx, testAPIKeyUID, "uk_revoked_xxxxxxxxxxxxxxxxxxxxxxxxxx", testAPIKeySpaceA, 0, "botfather")
+
+	w := doVerifyAPIKey(t, s, map[string]string{"api_key": "uk_revoked_xxxxxxxxxxxxxxxxxxxxxxxxxx"})
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
+// Case 3d: a legacy plaintext row owned by a non-botfather client → 401.
+// verify-api-key is the native daemon path and must only accept botfather
+// keys; integration-client keys belong to external apps. Seeded as a
+// PLAINTEXT row (not via the service, which stores integration keys as a
+// "hash:" digest) precisely so the api_key=? match would still hit — only
+// the client_id='botfather' filter rejects it, proving that filter works.
+func TestAuthVerifyAPIKey_NonBotfatherClient_401(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	seedAPIKeyFixtures(t, ctx)
+	insertAPIKeyFull(t, ctx, testAPIKeyUID, "uk_integration_xxxxxxxxxxxxxxxxxxxxxx", testAPIKeySpaceA, 1, "some-integration")
+
+	w := doVerifyAPIKey(t, s, map[string]string{"api_key": "uk_integration_xxxxxxxxxxxxxxxxxxxxxx"})
 
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
