@@ -23,9 +23,13 @@ const (
 	maxTeamGroupMembers = 50
 	// idempotencyKeyHeader 客户端可选幂等 header（Stripe 式，缺省不保证幂等）。
 	idempotencyKeyHeader = "Idempotency-Key"
-	// idempotencyPendingTTL in-flight 占位 TTL；进程在「建群成功」与「写终值」之间崩溃
-	// 时最多保留这么久（之后过期，同 key 重试可能再建一个群——已知边界，可接受）。
-	idempotencyPendingTTL = 60 * time.Second
+	// idempotencyPendingTTL in-flight 占位锁的存活时间，需覆盖一次建群请求从占坑到写终值的最坏
+	// 处理时长。但 IMCreateOrUpdateChannel 走无客户端超时的 HTTP（IM 退化时服务端 goroutine 可长时间
+	// 阻塞），建群延迟没有硬上界，故不存在「绝对安全」的固定值。这里取一个工程上足以覆盖现实退化的
+	// 值，把「慢建群致 pending 锁提前过期 → 并发同 key 重试重复建群」的窗口收窄到极小。代价是进程在
+	// 「建群成功、未写终值」之间崩溃后，同 key 重试在该 TTL 内拿 409 in-flight 而非回放（宁可让客户端
+	// 稍后重试也不重复建群）。要彻底消除需给 IM 调用加超时或持锁续租——见 #381。
+	idempotencyPendingTTL = 5 * time.Minute
 	// idempotencyDoneTTL 终值（可回放）记录 TTL。
 	idempotencyDoneTTL = 24 * time.Hour
 )
