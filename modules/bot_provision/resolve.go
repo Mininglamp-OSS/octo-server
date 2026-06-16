@@ -64,8 +64,14 @@ func (a *BotProvision) resolveAPIKey(apiKey string) (string, string, error) {
 		SpaceID string `db:"space_id"`
 	}
 	var r row
+	// status=1 / client_id='botfather' gate the post-main schema additions:
+	// status filters out revoked keys (status=0), and client_id restricts
+	// the daemon path to native octo keys — integration-client keys
+	// (client_id != 'botfather') must not authenticate a daemon. Literals
+	// mirror user_api_key's active status + native client; the canonical
+	// botfather constants are unexported and unreachable here.
 	_, err := a.ctx.DB().Select("uid", "space_id").From("user_api_key").
-		Where("api_key=? AND space_id!=''", apiKey).Load(&r)
+		Where("api_key=? AND space_id!='' AND status=? AND client_id=?", apiKey, 1, "botfather").Load(&r)
 	if err != nil {
 		return "", "", err
 	}
