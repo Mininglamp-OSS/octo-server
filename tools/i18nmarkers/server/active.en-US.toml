@@ -159,6 +159,21 @@ other = "The upstream service is unavailable."
 ["err.server.bot_api.user_not_found"]
 other = "User not found."
 
+["err.server.bot_provision.auth_failed"]
+other = "Authentication failed."
+
+["err.server.bot_provision.bot_forbidden"]
+other = "Not authorized for this bot."
+
+["err.server.bot_provision.bot_not_found"]
+other = "Bot not found."
+
+["err.server.bot_provision.request_invalid"]
+other = "Invalid request."
+
+["err.server.bot_provision.space_forbidden"]
+other = "You are not a member of this space."
+
 ["err.server.botfather.already_friends"]
 other = "You are already friends."
 
@@ -827,6 +842,9 @@ other = "User already exists."
 
 ["err.server.user.already_friend"]
 other = "You are already friends."
+
+["err.server.user.api_key_invalid"]
+other = "Invalid api_key."
 
 ["err.server.user.auth_code_not_found"]
 other = "Authorization code is invalid or has expired."

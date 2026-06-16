@@ -296,6 +296,14 @@ func TestRespondUserHelpers(t *testing.T) {
 			wantContains:    "不支持的语言",
 		},
 		{
+			name:            "respondUserAPIKeyInvalid is a status-preserving 401 (daemon verify-api-key)",
+			probe:           func(c *wkhttp.Context) { respondUserAPIKeyInvalid(c) },
+			wantCodeID:      "err.server.user.api_key_invalid",
+			wantSemStatus:   http.StatusUnauthorized,
+			wantTransStatus: http.StatusUnauthorized,
+			wantContains:    "api_key",
+		},
+		{
 			name:            "ErrUserAccountBanned surfaces zh-CN copy",
 			probe:           func(c *wkhttp.Context) { respondUserError(c, errcode.ErrUserAccountBanned) },
 			wantCodeID:      "err.server.user.account_banned",
