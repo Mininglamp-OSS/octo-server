@@ -122,6 +122,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/GroupExistsResponse'
+        '400':
+          description: group_no 为空 / 仅空白
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
         '401':
           description: 鉴权失败
           content:

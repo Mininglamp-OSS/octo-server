@@ -10,9 +10,11 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	libwkhttp "github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/botfather"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/oidc"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -470,6 +472,105 @@ func TestIntegrationTeamGroupExistsIsOwnerScoped(t *testing.T) {
 	}
 	assert.False(t, exists(keyB), "a non-creator active member must not see the group as existing")
 	assert.True(t, exists(keyA), "the creator must see their own group")
+}
+
+// TestIntegrationCreateTeamGroupKeepsIdempotencyKeyOnCreateFailure pins the P1 fix: because
+// group.CreateGroup can return an error *after* it has committed (its post-commit IM-channel
+// create fails and the compensating delete is best-effort), the handler must NOT release the
+// pending idempotency key on a CreateGroup error — otherwise a same-key retry could create a
+// second group. Here we force the IM call to fail and assert the pending key survives and a
+// same-key retry is told it's in-flight (409) rather than creating again.
+func TestIntegrationCreateTeamGroupKeepsIdempotencyKeyOnCreateFailure(t *testing.T) {
+	_, ctx, mp := setupIntegrationAPITest(t)
+	subject := "sub-im-fail"
+	uid := seedIntegrationUser(t, ctx, mp.Issuer, subject)
+	space := "sp_" + util.GenerUUID()[:8]
+	seedSpaceMembership(t, ctx, uid, space, "Team", 1, "2026-01-01 10:00:00")
+	bot := "bot_" + util.GenerUUID()[:8]
+	seedOwnBot(t, ctx, uid, space, bot, "")
+
+	// The shared test route's handler is cached (register.GetModules uses sync.Once) and may be
+	// bound to an earlier test's ctx, so mutating this ctx's config wouldn't reach it. Build a
+	// FRESH integration handler bound to THIS ctx, whose WuKongIM URL points at a dead port, so
+	// CreateGroup's post-commit IMCreateOrUpdateChannel deterministically fails — exercising the
+	// "CreateGroup can error after commit" path the P1 fix is about.
+	ctx.GetConfig().WuKongIM.APIURL = "http://127.0.0.1:1"
+	route := libwkhttp.New()
+	route.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.SourceLanguage)))
+	New(ctx).Route(route)
+	apiKey := exchangeTeamGroupKey(t, route, mp, subject, space)
+
+	idemKey := "idem-imfail-" + util.GenerUUID()[:8]
+	doReq := func() *httptest.ResponseRecorder {
+		req := integrationRequest(t, http.MethodPost, "/v1/integrations/oidc/groups", apiKey, map[string]interface{}{
+			"name":             "团队群",
+			"member_robot_ids": []string{bot},
+		})
+		req.Header.Set(idempotencyKeyHeader, idemKey)
+		w := httptest.NewRecorder()
+		route.ServeHTTP(w, req)
+		return w
+	}
+
+	// First attempt fails at the (post-commit) IM channel step -> 500.
+	w1 := doReq()
+	require.Equal(t, http.StatusInternalServerError, w1.Code, w1.Body.String())
+	assert.Equal(t, "err.shared.internal", decodeErrCode(t, w1))
+
+	// The pending idempotency key must still be present (not released).
+	rkey := teamGroupIdemRedisKey(defaultClientID, uid, space, idemKey)
+	val, err := sharedIntegrationRateRedis(ctx.GetConfig()).Get(rkey).Result()
+	require.NoError(t, err, "pending idempotency key must survive a CreateGroup failure (not released)")
+	assert.Contains(t, val, idemStatePending)
+
+	// Same-key retry -> in-flight 409, not a second create attempt.
+	w2 := doReq()
+	require.Equal(t, http.StatusConflict, w2.Code, w2.Body.String())
+	assert.Equal(t, "err.server.integration.idempotency_in_flight", decodeErrCode(t, w2))
+}
+
+// TestIntegrationCreateTeamGroupReplaysAfterStateChange exercises the replay ordering: a stored
+// "done" record must replay even after the caller's mutable eligibility changed. We create with
+// an Idempotency-Key, then remove the owner from the space and disable the bot (which would make
+// a fresh request 403/404), and assert the same key + body still replays the original 200.
+func TestIntegrationCreateTeamGroupReplaysAfterStateChange(t *testing.T) {
+	route, ctx, mp := setupIntegrationAPITest(t)
+	subject := "sub-replay-change"
+	uid := seedIntegrationUser(t, ctx, mp.Issuer, subject)
+	space := "sp_" + util.GenerUUID()[:8]
+	seedSpaceMembership(t, ctx, uid, space, "Team", 1, "2026-01-01 10:00:00")
+	bot := "bot_" + util.GenerUUID()[:8]
+	seedOwnBot(t, ctx, uid, space, bot, "")
+	apiKey := exchangeTeamGroupKey(t, route, mp, subject, space)
+
+	idemKey := "idem-replay-" + util.GenerUUID()[:8]
+	body := map[string]interface{}{"name": "团队群", "member_robot_ids": []string{bot}}
+	doReq := func() *httptest.ResponseRecorder {
+		req := integrationRequest(t, http.MethodPost, "/v1/integrations/oidc/groups", apiKey, body)
+		req.Header.Set(idempotencyKeyHeader, idemKey)
+		w := httptest.NewRecorder()
+		route.ServeHTTP(w, req)
+		return w
+	}
+
+	w1 := doReq()
+	require.Equal(t, http.StatusOK, w1.Code, w1.Body.String())
+	var r1 createGroupResp
+	require.NoError(t, json.Unmarshal(w1.Body.Bytes(), &r1))
+
+	// Mutate state so the mutable checks would now fail: owner removed from space (-> 403),
+	// bot disabled (-> 404).
+	_, err := ctx.DB().Update("space_member").Set("status", 0).Where("space_id=? AND uid=?", space, uid).Exec()
+	require.NoError(t, err)
+	_, err = ctx.DB().Update("robot").Set("status", 0).Where("robot_id=?", bot).Exec()
+	require.NoError(t, err)
+
+	// Same key + same body must still replay the original 200 (lookup runs before mutable checks).
+	w2 := doReq()
+	require.Equal(t, http.StatusOK, w2.Code, w2.Body.String())
+	var r2 createGroupResp
+	require.NoError(t, json.Unmarshal(w2.Body.Bytes(), &r2))
+	assert.Equal(t, r1.GroupID, r2.GroupID, "same key+body must replay the original group even after state changed")
 }
 
 // decodeErrCode extracts error.code from the shared i18n error envelope.

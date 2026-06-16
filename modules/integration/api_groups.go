@@ -141,11 +141,11 @@ func (it *Integration) createGroup(c *wkhttp.Context) {
 
 	resp, err := it.doCreateTeamGroup(key.UID, key.SpaceID, name, robotIDs)
 	if err != nil {
-		// 仅「建群提交前」失败会走到这里（doCreateTeamGroup 在 CreateGroup 提交后不再返回错误），
-		// 群未落库，可安全释放 pending 让同 key 重试；提交后的组装失败不会到这、也就不会重复建群。
-		if reserved {
-			it.rateRedis.Del(redisKey)
-		}
+		// CreateGroup 返回 error **不保证**群未落库：它会在 tx.Commit() 之后调
+		// IMCreateOrUpdateChannel，失败时做 best-effort 补偿删除（补偿删除自身失败则群行残留）
+		// 再返回 error。因此这里**不**释放 pending 幂等 key —— 释放会让同 key 重试再建一个群
+		// （重复 / 孤立群）。让 pending 随 TTL 自然过期后才允许重试，把重复窗口收敛到与进程崩溃
+		// 窗口同级（已知可接受边界）。同 key 在此期间重试 → idemLookup 命中 pending → 409 in-flight。
 		it.Error("integration createGroup failed", zap.Error(err),
 			zap.String("uid", key.UID), zap.String("space", key.SpaceID))
 		httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedInternal, nil, nil)
@@ -160,9 +160,14 @@ func (it *Integration) createGroup(c *wkhttp.Context) {
 
 // doCreateTeamGroup 调底层建群并组装响应。
 //
-// 关键不变量：CreateGroup 一旦返回成功，群就已提交落库；此后**绝不**再返回 error。否则调用方
-// 会把「提交后的组装失败」当成建群失败去 Del 幂等 pending key，导致同 key 重试再建一个群。
-// 因此 CreateGroup 之后的两次读（成员实况 / created_at）都做成 best-effort 降级。
+// 注意 group.CreateGroup 的真实契约（review #377：Jerry-Xin/yujiawei/lml2468 P1）：返回 nil err
+// 表示群已提交；但返回**非 nil err 并不保证群未创建**——它在 tx.Commit() 之后还会调
+// IMCreateOrUpdateChannel，失败时做 best-effort 补偿删除（补偿删除失败则群行残留）再返回 error。
+// 所以本函数：
+//   - CreateGroup 返回 error 直接上抛，调用方据此**不会**释放幂等 key（不能把它当「提交前、可安全
+//     重试」），见 createGroup 的错误分支；
+//   - CreateGroup 成功后的成员实况 / created_at 两次读做 best-effort 降级，绝不因这些读失败而把一个
+//     已落库的群当成失败。
 func (it *Integration) doCreateTeamGroup(uid, spaceID, name string, robotIDs []string) (*createGroupResp, error) {
 	createResp, err := it.groupService.CreateGroup(&group.CreateGroupServiceReq{
 		Creator: uid,
@@ -172,7 +177,7 @@ func (it *Integration) doCreateTeamGroup(uid, spaceID, name string, robotIDs []s
 		BotUID:  "", // 不指定 bot_admin
 	})
 	if err != nil {
-		return nil, err // 提交前失败（已回滚），可安全释放幂等 key 重试
+		return nil, err // 注意：不保证群未落库（见上）；调用方不得据此释放幂等 key
 	}
 
 	// 响应只回真正入群的 bot（与 group_member 实况一致），绝不 echo 一个实际没进群的成员。
@@ -196,13 +201,14 @@ func (it *Integration) doCreateTeamGroup(uid, spaceID, name string, robotIDs []s
 		actualBots = filtered
 	}
 
-	// created_at 取 DB 真实建群时间；读失败 → 退回服务端当前时刻（best-effort）。
-	createdAt := time.Now()
-	if t, cErr := it.db.queryGroupCreatedAt(createResp.GroupNo); cErr != nil {
+	// created_at 取 DB 真实建群时间；读失败 → 退回服务端当前时刻（best-effort）。两个分支都归一到
+	// UTC 再格式化，避免 fallback 与 DB 值在时区/RFC3339 偏移上漂移。
+	createdAt := time.Now().UTC()
+	if t, cErr := it.db.queryGroupCreatedAt(createResp.GroupNo, spaceID); cErr != nil {
 		it.Warn("integration createGroup read created_at failed; using server time",
 			zap.Error(cErr), zap.String("groupNo", createResp.GroupNo))
 	} else {
-		createdAt = t
+		createdAt = t.UTC()
 	}
 
 	return &createGroupResp{

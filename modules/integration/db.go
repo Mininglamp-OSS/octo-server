@@ -172,11 +172,12 @@ func (d *integrationDB) queryAvailableBotSpaces(uid string, spaceIDs []string) (
 
 // queryGroupCreatedAt 读取群的真实建群时间（time.Time）。CreateGroupServiceResp 不含
 // created_at，且 group.IService.GetGroupWithGroupNo 的 InfoResp.CreatedAt 是 time.Time.String()
-// 格式（非 RFC3339），故这里直读原始列，由调用方 .Format(time.RFC3339) 对齐 exchange 风格。
-func (d *integrationDB) queryGroupCreatedAt(groupNo string) (time.Time, error) {
+// 格式（非 RFC3339），故这里直读原始列，由调用方 .UTC().Format(time.RFC3339) 输出。按 space_id
+// 一并限定，与同模块 queryGroupStatus 的 Space 隔离口径一致（防御性，避免跨 Space 直读）。
+func (d *integrationDB) queryGroupCreatedAt(groupNo, spaceID string) (time.Time, error) {
 	var createdAt time.Time
 	err := d.session.Select("created_at").From("`group`").
-		Where("group_no=?", groupNo).LoadOne(&createdAt)
+		Where("group_no=? AND space_id=?", groupNo, spaceID).LoadOne(&createdAt)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("integration: query group created_at %q: %w", groupNo, err)
 	}
@@ -224,13 +225,20 @@ func (d *integrationDB) isHumanUser(uid string) (bool, error) {
 	return robot == 0, nil
 }
 
-// queryOwnedActiveBotIDs returns the robot_ids that group.CreateGroup will actually insert as
-// members for this owner+space: owned (creator_uid) and active (robot.status=1), active in the
-// space (space_member.status=1), AND backed by a usable user row — it exists and is not
-// finalized-destroyed (is_destroy<>IsDestroyDone). This mirrors CreateGroup's insertion source
-// (QueryByUIDs on the user table + the IsDestroyDone skip), so validating member_robot_ids
-// against this set up front turns an unusable bot into a 404 *before* any group is created,
-// instead of a created-then-500 that leaks an orphaned group.
+// queryOwnedActiveBotIDs returns the eligible team-bot set for this owner+space: owned
+// (creator_uid) and active (robot.status=1), active in the space (space_member.status=1), AND
+// backed by a usable user row — it exists and is not finalized-destroyed
+// (is_destroy<>IsDestroyDone). Validating member_robot_ids against this set up front turns an
+// unusable bot into a 404 *before* any group is created, instead of a created-then-500 that
+// leaks an orphaned group.
+//
+// This is a SUPERSET-tightening of CreateGroup's own insertion filter, not a byte-for-byte
+// mirror: CreateGroup inserts from userDB.QueryByUIDs (existence) + an IsDestroyDone skip, and
+// does NOT itself re-check robot.status=1 / space_member.status=1. The overlapping, load-bearing
+// predicate is "user row exists and is not finalized-destroyed"; the extra robot/space-active
+// joins here only further restrict the set, so a bot that passes this query is always insertable
+// by CreateGroup. (The remaining gap is a destroy racing in between validation and insert — a
+// narrow TOCTOU the response's actual-members read-back already tolerates.)
 //
 // Intentionally does NOT filter on robot.bound_agent_ref (unlike the sibling
 // queryAvailableBotSpaces, which lists only unoccupied bots for the exchange picker):
