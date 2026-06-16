@@ -80,8 +80,13 @@ func TestIntegrationCreateTeamGroupSuccess(t *testing.T) {
 	assert.Equal(t, uid, resp.OwnerUserID)
 	assert.Equal(t, "团队群", resp.Name)
 	assert.ElementsMatch(t, []string{botA, botB}, resp.MemberRobotIDs)
-	_, err := time.Parse(time.RFC3339, resp.CreatedAt)
+	createdAt, err := time.Parse(time.RFC3339, resp.CreatedAt)
 	assert.NoError(t, err, "created_at must be RFC3339, got %q", resp.CreatedAt)
+	// 0001-01-01T00:00:00Z (Go zero time) is itself valid RFC3339, so the parse check alone
+	// would pass on the regression. Require a real, recent timestamp instead.
+	assert.False(t, createdAt.IsZero(), "created_at must not be the zero time, got %q", resp.CreatedAt)
+	assert.WithinDuration(t, time.Now(), createdAt, 5*time.Minute,
+		"created_at must be close to now, got %q", resp.CreatedAt)
 
 	// 落库断言：owner=creator role，bot role=common + robot=1，无 bot_admin。
 	members := queryTeamGroupMembers(t, ctx, resp.GroupID)
@@ -361,6 +366,49 @@ func TestIntegrationTeamGroupExists(t *testing.T) {
 		Where("group_no=?", groupNo).Exec()
 	require.NoError(t, err)
 	assert.False(t, checkExists(groupNo).Exists)
+}
+
+// TestIntegrationTeamGroupExistsRejectsRobotCreator is the existence-side mirror of
+// TestIntegrationCreateTeamGroupRejectsRobotOwner: createGroup refuses a robot owner up front,
+// so groupExists must apply the same human guard to keep the two endpoints symmetric. We
+// create a group as a human, then flip the OIDC-linked account to a robot (AuthByKey still
+// authenticates — it ignores the robot flag) and assert the group no longer "exists".
+func TestIntegrationTeamGroupExistsRejectsRobotCreator(t *testing.T) {
+	route, ctx, mp := setupIntegrationAPITest(t)
+	subject := "sub-exists-robot"
+	uid := seedIntegrationUser(t, ctx, mp.Issuer, subject)
+	spaceID := "sp_" + util.GenerUUID()[:8]
+	seedSpaceMembership(t, ctx, uid, spaceID, "Team", 1, "2026-01-01 10:00:00")
+	bot := "bot_" + util.GenerUUID()[:8]
+	seedOwnBot(t, ctx, uid, spaceID, bot, "")
+	apiKey := exchangeTeamGroupKey(t, route, mp, subject, spaceID)
+
+	w := httptest.NewRecorder()
+	route.ServeHTTP(w, integrationRequest(t, http.MethodPost, "/v1/integrations/oidc/groups", apiKey, map[string]interface{}{
+		"name":             "团队群",
+		"member_robot_ids": []string{bot},
+	}))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var created createGroupResp
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &created))
+
+	checkExists := func() bool {
+		ww := httptest.NewRecorder()
+		route.ServeHTTP(ww, integrationRequest(t, http.MethodGet, "/v1/integrations/oidc/groups/"+created.GroupID, apiKey, nil))
+		require.Equal(t, http.StatusOK, ww.Code, ww.Body.String())
+		var r groupExistsResp
+		require.NoError(t, json.Unmarshal(ww.Body.Bytes(), &r))
+		return r.Exists
+	}
+
+	// Human creator + active member → exists:true.
+	assert.True(t, checkExists())
+
+	// Flip the creator's account to a robot. The key still authenticates (AuthByKey ignores the
+	// robot flag), but the human guard in teamGroupExists must now report exists:false.
+	_, err := ctx.DB().Update("user").Set("robot", 1).Where("uid=?", uid).Exec()
+	require.NoError(t, err)
+	assert.False(t, checkExists(), "a robot creator must not confirm the group (symmetric with create)")
 }
 
 // TestIntegrationTeamGroupExistsIsSpaceScoped verifies the existence check stays inside the

@@ -260,6 +260,16 @@ func (it *Integration) teamGroupExists(groupNo, spaceID, uid string) (bool, erro
 	if !found || status != group.GroupStatusNormal || creator != uid {
 		return false, nil
 	}
+	// 防御性对称（与 createGroup 的 owner 必须是人类一致）：建群时已校验 creator 是真人，正常情况
+	// 下 creator==uid 即意味着 uid 是人类；这里再复核 uid 当前仍是人类账号，让两个端点的人类约束
+	// 对称，兜住「账号被改成 robot 标记」这类极罕见的事后变更（非人类账号一律 exists=false）。
+	human, err := it.db.isHumanUser(uid)
+	if err != nil {
+		return false, err
+	}
+	if !human {
+		return false, nil
+	}
 	active, err := it.groupService.ExistMemberActive(groupNo, uid)
 	if err != nil {
 		return false, err

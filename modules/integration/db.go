@@ -175,13 +175,26 @@ func (d *integrationDB) queryAvailableBotSpaces(uid string, spaceIDs []string) (
 // 格式（非 RFC3339），故这里直读原始列，由调用方 .UTC().Format(time.RFC3339) 输出。按 space_id
 // 一并限定，与同模块 queryGroupStatus 的 Space 隔离口径一致（防御性，避免跨 Space 直读）。
 func (d *integrationDB) queryGroupCreatedAt(groupNo, spaceID string) (time.Time, error) {
-	var createdAt time.Time
+	// Must scan into a struct field (mirroring queryGroupStatus), NOT a bare time.Time:
+	// time.Time is itself a struct and implements no sql.Scanner, so dbr's reflection treats
+	// LoadOne(&t) as "find a column named created_at inside time.Time", finds none, scans into
+	// a throwaway dummy dest, and yields the zero value with a nil error. dbr only binds the
+	// column when it can match it to a named field of a wrapper struct.
+	var row struct {
+		CreatedAt time.Time `db:"created_at"`
+	}
 	err := d.session.Select("created_at").From("`group`").
-		Where("group_no=? AND space_id=?", groupNo, spaceID).LoadOne(&createdAt)
+		Where("group_no=? AND space_id=?", groupNo, spaceID).LoadOne(&row)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("integration: query group created_at %q: %w", groupNo, err)
 	}
-	return createdAt, nil
+	if row.CreatedAt.IsZero() {
+		// Defense-in-depth: a zero timestamp is never a real group creation time. Signal a read
+		// failure so the caller's server-time fallback fires instead of leaking the Go zero time
+		// (0001-01-01T00:00:00Z) into the response contract.
+		return time.Time{}, fmt.Errorf("integration: query group created_at %q: scanned zero time", groupNo)
+	}
+	return row.CreatedAt, nil
 }
 
 // queryGroupStatus returns the group's status and creator, scoped to the given space, and
