@@ -1,15 +1,21 @@
 package group
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	migrate "github.com/rubenv/sql-migrate"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// groupNameWidenMigrationFile is the migration whose Up DDL this test exercises. Kept as a
+// named constant so the test fails loudly (file-not-found) if the migration is ever renamed.
+const groupNameWidenMigrationFile = "20260615000001_group_name_widen.sql"
 
 // TestGroupNameWidenMigration genuinely exercises the VARCHAR(40)->(50) in-place widen
 // against PRE-EXISTING data, rather than just asserting a 40-rune string fits a 50-wide
@@ -38,10 +44,28 @@ func TestGroupNameWidenMigration(t *testing.T) {
 	}
 	modifyNameWidth := func(width int) {
 		// DDL column length can't be a bound placeholder; width is a controlled int constant.
+		// Used only as test scaffolding (shrink to the pre-widen world / restore on cleanup) —
+		// the widen under test runs the migration file's OWN Up DDL via applyMigrationUp below.
 		_, err := ctx.DB().UpdateBySql(
 			fmt.Sprintf("ALTER TABLE `group` MODIFY `name` VARCHAR(%d) NOT NULL DEFAULT ''", width),
 		).Exec()
 		require.NoError(t, err)
+	}
+	// applyMigrationUp parses the real migration file from the embedded sql FS and executes its
+	// Up statements verbatim — the same source rubenv/sql-migrate runs in production. This is
+	// what keeps the test honest: if 20260615000001_group_name_widen.sql ever drifts (different
+	// width, added clause, etc.), the assertions below run against the changed DDL instead of a
+	// stale hand-inlined copy.
+	applyMigrationUp := func(filename string) {
+		data, err := sqlFS.ReadFile("sql/" + filename)
+		require.NoError(t, err, "read migration %s from embedded sql FS", filename)
+		m, err := migrate.ParseMigration(filename, bytes.NewReader(data))
+		require.NoError(t, err, "parse migration %s", filename)
+		require.NotEmpty(t, m.Up, "migration %s has no Up statements", filename)
+		for _, stmt := range m.Up {
+			_, err := ctx.DB().UpdateBySql(stmt).Exec()
+			require.NoError(t, err, "exec Up stmt of %s: %s", filename, stmt)
+		}
 	}
 
 	// Migration applied → column is already VARCHAR(50).
@@ -56,8 +80,8 @@ func TestGroupNameWidenMigration(t *testing.T) {
 	_, err := ctx.DB().InsertBySql("INSERT INTO `group` (group_no, name) VALUES (?, ?)", legacyNo, name40).Exec()
 	require.NoError(t, err)
 
-	// Run the widen (the migration's Up DDL) over the existing data.
-	modifyNameWidth(MaxGroupNameLen)
+	// Run the widen by executing the migration file's OWN Up DDL (not a hand-inlined copy).
+	applyMigrationUp(groupNameWidenMigrationFile)
 	require.Equal(t, MaxGroupNameLen, colLen(), "widen must take effect")
 
 	// Existing 40-rune data survives the in-place widen untouched.
