@@ -19,13 +19,14 @@ package bot_provision
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"net/http"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/botfather"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	rd "github.com/go-redis/redis"
 	"go.uber.org/zap"
@@ -50,20 +51,21 @@ func (a *BotProvision) mintBot(c *wkhttp.Context) {
 	// AuthMiddleware would have set "uid"; if not present we 401.
 	uid := c.GetLoginUID()
 	if uid == "" {
-		c.ResponseErrorWithStatus(errors.New("login required"), http.StatusUnauthorized)
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedAuthRequired, nil, nil)
 		return
 	}
 	var req mintRequest
 	if err := c.BindJSON(&req); err != nil {
-		c.ResponseError(fmt.Errorf("invalid body: %w", err))
+		a.Error("mintBot: bind body", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrBotProvisionRequestInvalid, nil, nil)
 		return
 	}
 	if strings.TrimSpace(req.DisplayName) == "" {
-		c.ResponseError(errors.New("display_name required"))
+		httperr.ResponseErrorL(c, errcode.ErrBotProvisionRequestInvalid, nil, i18n.Details{"field": "display_name"})
 		return
 	}
 	if strings.TrimSpace(req.SpaceID) == "" {
-		c.ResponseError(errors.New("space_id required"))
+		httperr.ResponseErrorL(c, errcode.ErrBotProvisionRequestInvalid, nil, i18n.Details{"field": "space_id"})
 		return
 	}
 	// PR-D.1 #2: caller must actually be in the target space before
@@ -71,7 +73,8 @@ func (a *BotProvision) mintBot(c *wkhttp.Context) {
 	// was unchecked — any logged-in user could mint a bot in any space
 	// they knew the id of and then use that bot to observe groups.
 	if err := a.assertSpaceMember(uid, req.SpaceID); err != nil {
-		c.ResponseErrorWithStatus(err, http.StatusForbidden)
+		a.Error("mintBot: space membership check", zap.Error(err))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotProvisionSpaceForbidden, nil, nil)
 		return
 	}
 	botToken := req.BotToken
@@ -79,14 +82,15 @@ func (a *BotProvision) mintBot(c *wkhttp.Context) {
 		var err error
 		botToken, err = generateBfToken()
 		if err != nil {
-			c.ResponseError(fmt.Errorf("gen token: %w", err))
+			a.Error("mintBot: gen bot token", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
 			return
 		}
 	}
 	res, err := botfather.MintBotOBO(a.ctx, uid, req.SpaceID, req.DisplayName, botToken)
 	if err != nil {
 		a.Error("MintBotOBO failed", zap.Error(err))
-		c.ResponseError(fmt.Errorf("mint: %w", err))
+		httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
 		return
 	}
 	c.JSON(http.StatusOK, mintResponse{BotUID: res.BotUID})
@@ -110,17 +114,20 @@ func (a *BotProvision) mintBot(c *wkhttp.Context) {
 func (a *BotProvision) botToken(c *wkhttp.Context) {
 	auth := c.GetHeader("Authorization")
 	if !strings.HasPrefix(auth, "Bearer ") {
-		c.ResponseErrorWithStatus(errors.New("missing Bearer token"), http.StatusUnauthorized)
+		a.Warn("botToken: missing Bearer token")
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotProvisionAuthFailed, nil, nil)
 		return
 	}
 	apiKey := strings.TrimPrefix(auth, "Bearer ")
 	if apiKey == "" {
-		c.ResponseErrorWithStatus(errors.New("empty Bearer token"), http.StatusUnauthorized)
+		a.Warn("botToken: empty Bearer token")
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotProvisionAuthFailed, nil, nil)
 		return
 	}
 	callerUID, callerSpace, err := a.resolveAPIKey(apiKey)
 	if err != nil {
-		c.ResponseErrorWithStatus(errors.New("invalid api_key"), http.StatusUnauthorized)
+		a.Error("botToken: resolve api_key", zap.Error(err))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotProvisionAuthFailed, nil, nil)
 		return
 	}
 	botUID := c.Param("uid")
@@ -149,18 +156,18 @@ func (a *BotProvision) botToken(c *wkhttp.Context) {
 	).Load(&r)
 	if err != nil {
 		a.Error("query robot for token", zap.Error(err), zap.String("bot_uid", botUID))
-		c.ResponseError(errors.New("lookup failed"))
+		httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
 		return
 	}
 	if r.BotToken == "" {
-		c.ResponseErrorWithStatus(errors.New("bot not found"), http.StatusNotFound)
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotProvisionBotNotFound, nil, nil)
 		return
 	}
 	if r.CreatorUID != callerUID {
 		// Caller's api_key uid must equal the bot's creator. Anything
 		// else means a daemon for one user is asking for another user's
 		// bot — clean 403, no info leak about whether the bot exists.
-		c.ResponseErrorWithStatus(errors.New("not authorized for this bot"), http.StatusForbidden)
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotProvisionBotForbidden, nil, nil)
 		return
 	}
 	c.JSON(http.StatusOK, map[string]string{

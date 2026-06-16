@@ -56,6 +56,15 @@ var (
 		HTTPStatus:     http.StatusUnauthorized,
 		DefaultMessage: "Invalid username or password.",
 	})
+	// ErrUserAPIKeyInvalid is the anti-enumeration 401 for the daemon
+	// verify-api-key endpoint: both an unresolvable/unknown key and a key whose
+	// owner is not a member of the bound space collapse here, so a caller cannot
+	// probe which factor was wrong. The specific reason is logged, never returned.
+	ErrUserAPIKeyInvalid = register(codes.Code{
+		ID:             "err.server.user.api_key_invalid",
+		HTTPStatus:     http.StatusUnauthorized,
+		DefaultMessage: "Invalid api_key.",
+	})
 	ErrUserCodeInvalid = register(codes.Code{
 		ID:             "err.server.user.code_invalid",
 		HTTPStatus:     http.StatusBadRequest,

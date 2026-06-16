@@ -4358,7 +4358,8 @@ func (u *User) authVerifyAPIKey(c *wkhttp.Context) {
 		Where("api_key=? AND space_id!='' AND status=? AND client_id=?", req.APIKey, 1, "botfather").
 		Load(&keyInfo)
 	if err != nil || keyInfo.UID == "" {
-		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "invalid api_key"})
+		u.Warn("authVerifyAPIKey: api_key not resolvable", zap.Error(err))
+		respondUserAPIKeyInvalid(c)
 		return
 	}
 
@@ -4387,7 +4388,8 @@ func (u *User) authVerifyAPIKey(c *wkhttp.Context) {
 		keyInfo.SpaceID, keyInfo.UID,
 	).LoadOne(&n)
 	if err != nil || n == 0 {
-		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "invalid api_key"})
+		u.Warn("authVerifyAPIKey: api_key owner not a member of bound space", zap.Error(err))
+		respondUserAPIKeyInvalid(c)
 		return
 	}
 
