@@ -395,14 +395,24 @@ func isExcludedMember(uid, category string) bool {
 	return spacepkg.IsSystemBot(uid) || category == "system"
 }
 
-// normalizePrivatePair 反解 fakeChannelID 双方并按字典序规范化(成员对去重一致)。
+// normalizePrivatePair 反解 fakeChannelID 双方为**裸 uid**并按字典序规范化(成员对去重一致)。
 // 任一段为空或不是两段(uid 含 @)→ ok=false。
+//
+// 私聊 channel_id 两端在 Space/适配器场景下带前缀(s{spaceId}_uid，如
+// s{32hex}_uid 或 sminglue_default_uid)，而 dim_member.uid 是裸 user.uid。若直接用带前缀
+// 的两端写 member_a/b_uid、或据其查 memberType/排除集，则永远 JOIN 不上 dim_member——
+// 私聊 HH/HA 分类、成员归属、名称展示全部静默错算(issue #392)。故先用 space.ParseChannelID
+// 反解出裸 peer uid(裸 uid 不含前缀时原样返回)，再规范化。
 func normalizePrivatePair(channelID string) (string, string, bool) {
 	parts := strings.Split(channelID, "@")
 	if len(parts) != privateMemberSize || parts[0] == "" || parts[1] == "" {
 		return "", "", false
 	}
-	a, b := parts[0], parts[1]
+	_, a := spacepkg.ParseChannelID(parts[0])
+	_, b := spacepkg.ParseChannelID(parts[1])
+	if a == "" || b == "" {
+		return "", "", false
+	}
 	if a > b {
 		a, b = b, a
 	}

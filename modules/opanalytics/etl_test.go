@@ -3,6 +3,8 @@ package opanalytics
 import (
 	"testing"
 	"time"
+
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 )
 
 func TestDayWindowUnix(t *testing.T) {
@@ -51,6 +53,35 @@ func TestNormalizePrivatePair(t *testing.T) {
 		{"u_a@", "", "", false, "empty second"},
 		{"@u_b", "", "", false, "empty first"},
 		{"noat", "", "", false, "no @"},
+	}
+	for _, c := range cases {
+		a, b, ok := normalizePrivatePair(c.in)
+		if ok != c.wantOK || a != c.wantA || b != c.wantB {
+			t.Fatalf("%s: normalizePrivatePair(%q) = (%q,%q,%v), want (%q,%q,%v)",
+				c.scenario, c.in, a, b, ok, c.wantA, c.wantB, c.wantOK)
+		}
+	}
+}
+
+// TestNormalizePrivatePairStripsSpacePrefix 覆盖 issue #392 语义修复：私聊 channel_id
+// 两端带 Space/适配器前缀(s{32hex}_uid / sminglue_default_uid)时，须反解为裸 uid 再规范化，
+// 以对齐 dim_member.uid。hex 空间走正则回退无需注册；命名空间需注册才能反解。
+func TestNormalizePrivatePairStripsSpacePrefix(t *testing.T) {
+	const hex32 = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"
+	spacepkg.RegisterSpaceIDs([]string{"minglue_default"})
+	defer spacepkg.RegisterSpaceIDs(nil)
+
+	cases := []struct {
+		in           string
+		wantA, wantB string
+		wantOK       bool
+		scenario     string
+	}{
+		{"s" + hex32 + "_u_alice@s" + hex32 + "_u_bob", "u_alice", "u_bob", true, "both space-prefixed (regex fallback)"},
+		{"s" + hex32 + "_u_bob@s" + hex32 + "_u_alice", "u_alice", "u_bob", true, "prefixed + hash-order swapped -> lexical"},
+		{"u_alice@s" + hex32 + "_u_bob", "u_alice", "u_bob", true, "mixed bare + prefixed"},
+		{"sminglue_default_botfather@u_alice", "botfather", "u_alice", true, "bot-adapter prefix via registered named space"},
+		{"u_alice@u_bob", "u_alice", "u_bob", true, "both bare (unchanged)"},
 	}
 	for _, c := range cases {
 		a, b, ok := normalizePrivatePair(c.in)

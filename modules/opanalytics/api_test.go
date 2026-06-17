@@ -14,6 +14,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/go-redis/redis"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -393,6 +394,60 @@ func TestOpanalyticsETLAndDB(t *testing.T) {
 	assert.Equal(t, convTypeHHPrivate, dimFC.ConvType)
 	assert.Equal(t, "u_alice", dimFC.MemberA)
 	assert.Equal(t, "u_bob", dimFC.MemberB)
+}
+
+// TestOpanalyticsETLStripsSpacePrefixForPrivateMembers 验证 issue #392 的语义修复(端到端)：
+// 私聊 channel_id 两端带 Space 前缀时，ETL 反解为裸 uid 写入 member_a/b_uid，使其能 JOIN
+// dim_member——成员归属、HH/HA 分类不再因前缀静默错算。发送方 from_uid 取裸 uid(与生产证据
+// 一致：sender_uid 未溢出)，故仅 channel 派生的 member_*_uid 受前缀影响。
+func TestOpanalyticsETLStripsSpacePrefixForPrivateMembers(t *testing.T) {
+	ctx, _, etl := opaSetup(t)
+	spacepkg.RegisterSpaceIDs(nil) // 仅用正则回退反解 s{32hex}_ 前缀，避免依赖全局注册
+	defer spacepkg.RegisterSpaceIDs(nil)
+
+	const hex32 = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"
+	seedUser(t, ctx, "u_alice", "Alice", "alice@example.com", 0)
+	seedUser(t, ctx, "u_agent", "AgentX", "", 1)
+
+	aPrefixed := "s" + hex32 + "_u_alice"
+	agentPrefixed := "s" + hex32 + "_u_agent"
+	fc := common.GetFakeChannelIDWith(aPrefixed, agentPrefixed)
+
+	start, _, err := dayWindowUnix(statDay)
+	require.NoError(t, err)
+	insertMsgs(t, ctx, "u_alice", fc, channelTypePerson, start+3600, 3, 0)
+
+	require.NoError(t, etl.RunIncremental())
+
+	var dim struct {
+		MemberA  string `db:"member_a_uid"`
+		MemberB  string `db:"member_b_uid"`
+		ConvType uint8  `db:"conv_type"`
+	}
+	_, err = ctx.DB().Select("member_a_uid", "member_b_uid", "conv_type").
+		From("octo_dim_channel").Where("channel_id=?", fc).Load(&dim)
+	require.NoError(t, err)
+	// 反解 Space 前缀 + 字典序规范化后为裸 uid(对齐 dim_member.uid)。
+	assert.Equal(t, "u_agent", dim.MemberA)
+	assert.Equal(t, "u_alice", dim.MemberB)
+	// 含 agent → HA 私聊；前缀若未反解，memberType 查不到会误判为 HH。
+	assert.Equal(t, convTypeHAPrivate, dim.ConvType)
+
+	// 裸 member_*_uid 能 JOIN dim_member.uid(私聊"A & B"展示与关键词搜索依赖此 JOIN)。
+	var joined []struct {
+		UID  string `db:"uid"`
+		Name string `db:"name"`
+	}
+	_, err = ctx.DB().SelectBySql(
+		"SELECT m.uid AS uid, m.name AS name FROM octo_dim_channel c "+
+			"JOIN octo_dim_member m ON m.uid IN (c.member_a_uid, c.member_b_uid) "+
+			"WHERE c.channel_id=? ORDER BY m.uid", fc).Load(&joined)
+	require.NoError(t, err)
+	require.Len(t, joined, 2, "两端裸 uid 均应 JOIN 命中 dim_member")
+	assert.Equal(t, "u_agent", joined[0].UID)
+	assert.Equal(t, "AgentX", joined[0].Name)
+	assert.Equal(t, "u_alice", joined[1].UID)
+	assert.Equal(t, "Alice", joined[1].Name)
 }
 
 func TestOpanalyticsETLIdempotent(t *testing.T) {
