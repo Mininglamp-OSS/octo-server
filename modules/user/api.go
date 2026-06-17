@@ -25,6 +25,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/avatarversion"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
+	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	rd "github.com/go-redis/redis"
 	"github.com/gocraft/dbr/v2"
 	"github.com/opentracing/opentracing-go"
@@ -208,7 +209,11 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 	{
 
 		auth.GET("/users/:uid", u.get)             // 根据uid查询用户信息
-		auth.POST("/users/batch", u.batchGetUsers) // 批量获取用户（仅 uid/name/avatar 白名单投影）
+		// batch is an amplification endpoint (one request fans out to up to 200
+		// lookups), so guard call frequency with a per-route per-uid limiter on
+		// top of the request-size cap. AuthMiddleware (group) runs first, so the
+		// uid is in context before SharedUIDRateLimiter reads it.
+		auth.POST("/users/batch", appwkhttp.SharedUIDRateLimiter(r, u.ctx), u.batchGetUsers) // 批量获取用户（仅 uid/name/avatar 白名单投影）
 		// 获取用户的会话信息
 		// auth.GET("/users/:uid/conversation", u.userConversationInfoGet)
 
