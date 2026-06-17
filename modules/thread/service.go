@@ -14,6 +14,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/pushcache"
 	"go.uber.org/zap"
 )
 
@@ -408,6 +409,13 @@ func (s *Service) UpdateName(groupNo, shortID, operatorUID, name string) error {
 			return errors.New("thread has been deleted")
 		}
 		return fmt.Errorf("update thread name: %w", err)
+	}
+
+	// 子区改名后失效离线推送标题缓存（推送标题含子区名），否则手机推送会沿用旧子区名直到
+	// TTL 过期。best-effort：失败仅告警，TTL 兜底。
+	channelID := BuildChannelID(groupNo, shortID)
+	if err := pushcache.InvalidateThreadName(s.ctx.GetRedisConn(), channelID); err != nil {
+		s.Warn("失效子区名推送缓存失败", zap.String("channel_id", channelID), zap.Error(err))
 	}
 	return nil
 }

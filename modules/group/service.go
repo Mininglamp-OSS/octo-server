@@ -17,6 +17,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	spacemod "github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/pushcache"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
@@ -1806,6 +1807,12 @@ func (s *Service) UpdateGroupInfo(req *UpdateGroupInfoServiceReq) error {
 
 	// 发布群更新事件（name 和 notice 分开发送）
 	if req.Name != nil {
+		// 群名变更后失效离线推送标题缓存（modules/webhook 侧按群名缓存推送标题），否则手机
+		// 推送标题会沿用旧名直到 TTL 过期（最长 Cache.NameCacheExpire）。best-effort：缓存
+		// 已落库的改名是事实，失效失败仅告警，TTL 仍是兜底。必须在事务提交后执行。
+		if err := pushcache.InvalidateGroupName(s.ctx.GetRedisConn(), req.GroupNo); err != nil {
+			s.Warn("失效群名推送缓存失败", zap.String("group_no", req.GroupNo), zap.Error(err))
+		}
 		s.ctx.SendGroupUpdate(&config.MsgGroupUpdateReq{
 			GroupNo:      req.GroupNo,
 			Operator:     req.OperatorUID,

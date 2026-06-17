@@ -10,6 +10,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/pushcache"
 	"github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
 )
@@ -36,9 +37,7 @@ const EventOnlineStatus = "user.onlinestatus"
 const EventMsgNotify = "msg.notify"
 
 const (
-	nameCachePrefix        string = "name:"
-	groupNameCachePrefix   string = "groupName:"
-	threadTitleCachePrefix string = "threadTitle:"
+	nameCachePrefix string = "name:"
 )
 
 type PayloadInfo struct {
@@ -106,7 +105,7 @@ func ParsePushInfo(msgResp msgOfflineNotify, ctx *config.Context, toUser *user.R
 	if msgResp.ChannelType == common.ChannelTypePerson.Uint8() {
 		payloadInfo.Title = fromName
 	} else if msgResp.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
-		threadTitle, err := getAndCacheThreadTitle(msgResp, ctx)
+		threadTitle, err := getThreadPushTitle(msgResp, ctx)
 		if err != nil {
 			log.Error("获取子区推送标题失败", zap.Error(err), zap.String("channel_id", msgResp.ChannelID))
 			return nil, err
@@ -122,7 +121,7 @@ func ParsePushInfo(msgResp msgOfflineNotify, ctx *config.Context, toUser *user.R
 		content = formatGroupPushBody(ctx, threadGroupNo, msgResp.FromUID, fromName, content)
 	} else {
 		var groupName string
-		groupName, err = getAndCacheGroupName(msgResp, ctx)
+		groupName, err = getCachedGroupName(msgResp.ChannelID, ctx)
 		if err != nil {
 			log.Error("获取群名失败！", zap.Error(err), zap.String("group_no", msgResp.ChannelID))
 			return nil, err
@@ -283,29 +282,30 @@ func getAndCacheShowNameForFromUID(msgResp msgOfflineNotify, ctx *config.Context
 	return name, nil
 }
 
-// 获取和缓存群名
-func getAndCacheGroupName(msgResp msgOfflineNotify, ctx *config.Context) (string, error) {
-	db := getWebhookDB(ctx)
-
-	key := fmt.Sprintf("%s%s", groupNameCachePrefix, msgResp.ChannelID)
+// getCachedGroupName 读取群名（用作推送标题），命中缓存直接返回，否则回源 DB 并写入
+// 带 TTL 的缓存。缓存 key 由 pushcache 统一定义，群改名时由 modules/group 主动失效，
+// 避免推送标题在 TTL 到期前一直沿用旧名。
+func getCachedGroupName(groupNo string, ctx *config.Context) (string, error) {
+	key := pushcache.GroupNameKey(groupNo)
 	groupName, err := ctx.GetRedisConn().GetString(key)
 	if err != nil {
 		return "", err
 	}
-	if groupName == "" {
-		groupName, err = db.GetGroupName(msgResp.ChannelID)
-		if err != nil {
-			return "", err
-		}
-		err = ctx.GetRedisConn().Set(key, groupName)
-		if err != nil {
-			return "", err
-		}
-		err = ctx.GetRedisConn().Expire(key, ctx.GetConfig().Cache.NameCacheExpire)
-		if err != nil {
-			log.Error("设置群名过期时间失败！", zap.String("key", key), zap.Error(err))
-			return "", err
-		}
+	if groupName != "" {
+		return groupName, nil
+	}
+
+	groupName, err = getWebhookDB(ctx).GetGroupName(groupNo)
+	if err != nil {
+		return "", err
+	}
+	if err = ctx.GetRedisConn().Set(key, groupName); err != nil {
+		return "", err
+	}
+	// Expire 失败不影响本次取名：群名已成功取到（并已写入缓存，只是少了 TTL）。失败仅告警、
+	// 继续返回，避免一次瞬时 Redis 错误把整条推送打挂（群推送和子区推送共用本函数）。
+	if err = ctx.GetRedisConn().Expire(key, ctx.GetConfig().Cache.NameCacheExpire); err != nil {
+		log.Warn("设置群名过期时间失败", zap.String("key", key), zap.Error(err))
 	}
 	return groupName, nil
 }
@@ -331,44 +331,53 @@ func BuildThreadTitle(channelID, threadName, groupName string) string {
 	return channelID
 }
 
-// getAndCacheThreadTitle 获取子区推送标题，格式：#子区名,群名
-func getAndCacheThreadTitle(msgResp msgOfflineNotify, ctx *config.Context) (string, error) {
-	key := fmt.Sprintf("%s%s", threadTitleCachePrefix, msgResp.ChannelID)
-	title, err := ctx.GetRedisConn().GetString(key)
-	if err != nil {
-		return "", err
-	}
-	if title != "" {
-		return title, nil
-	}
-
+// getThreadPushTitle 组装子区推送标题，格式：#子区名,群名。
+//
+// 子区名和群名分别独立缓存（见 getCachedThreadName / getCachedGroupName），标题在读取时
+// 现场拼接，而不是把拼好的整串冻结进缓存。这样群改名时只需失效 groupName: 单个 key，群推送
+// 标题和该群下所有子区推送标题就会一起刷新，无需遍历子区、也不依赖 Redis KEYS 扫描。
+func getThreadPushTitle(msgResp msgOfflineNotify, ctx *config.Context) (string, error) {
 	groupNo, shortID, ok := parseThreadChannelID(msgResp.ChannelID)
 	if !ok {
 		return msgResp.ChannelID, nil
 	}
 
-	db := getWebhookDB(ctx)
-
-	threadName, err := db.GetThreadName(groupNo, shortID)
+	threadName, err := getCachedThreadName(msgResp.ChannelID, groupNo, shortID, ctx)
 	if err != nil {
-		return "", fmt.Errorf("failed to get thread name: %w", err)
+		return "", err
 	}
-
-	groupName, err := db.GetGroupName(groupNo)
+	groupName, err := getCachedGroupName(groupNo, ctx)
 	if err != nil {
 		return "", fmt.Errorf("failed to get group name: %w", err)
 	}
 
-	title = BuildThreadTitle(msgResp.ChannelID, threadName, groupName)
+	return BuildThreadTitle(msgResp.ChannelID, threadName, groupName), nil
+}
 
-	if err = ctx.GetRedisConn().Set(key, title); err != nil {
+// getCachedThreadName 读取子区名，命中缓存直接返回，否则回源 DB 并写入带 TTL 的缓存。
+// 缓存 key 由 pushcache 统一定义，子区改名时由 modules/thread 主动失效。
+func getCachedThreadName(channelID, groupNo, shortID string, ctx *config.Context) (string, error) {
+	key := pushcache.ThreadNameKey(channelID)
+	threadName, err := ctx.GetRedisConn().GetString(key)
+	if err != nil {
+		return "", err
+	}
+	if threadName != "" {
+		return threadName, nil
+	}
+
+	threadName, err = getWebhookDB(ctx).GetThreadName(groupNo, shortID)
+	if err != nil {
+		return "", fmt.Errorf("failed to get thread name: %w", err)
+	}
+	if err = ctx.GetRedisConn().Set(key, threadName); err != nil {
 		return "", err
 	}
 	if err = ctx.GetRedisConn().Expire(key, ctx.GetConfig().Cache.NameCacheExpire); err != nil {
-		log.Warn("设置子区标题过期时间失败", zap.String("key", key), zap.Error(err))
+		log.Warn("设置子区名过期时间失败", zap.String("key", key), zap.Error(err))
 	}
 
-	return title, nil
+	return threadName, nil
 }
 
 func getUserBadge(uid string, ctx *config.Context) (int, error) {

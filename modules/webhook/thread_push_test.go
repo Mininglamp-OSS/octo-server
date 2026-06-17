@@ -1,7 +1,6 @@
 package webhook
 
 import (
-	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -112,10 +111,4 @@ func TestParseThreadChannelID(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestThreadTitleCacheKey(t *testing.T) {
-	channelID := "groupNo____shortID"
-	key := fmt.Sprintf("%s%s", threadTitleCachePrefix, channelID)
-	assert.Equal(t, "threadTitle:groupNo____shortID", key)
 }
