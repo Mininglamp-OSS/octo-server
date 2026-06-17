@@ -82,6 +82,7 @@ func TestMigratedUserFilesNoLegacyResponseError(t *testing.T) {
 		"api_friend.go", "api_online.go", "api_setting.go", "api_maillist.go",
 		"api_device.go", "api_destroy.go", "api_pinned.go", "api_gitee.go",
 		"api_github.go", "api_emaillogin.go", "api_usernamelogin.go",
+		"api_batch.go",
 	}
 	for _, f := range files {
 		t.Run(f, func(t *testing.T) {
