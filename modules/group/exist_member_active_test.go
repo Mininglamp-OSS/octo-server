@@ -14,7 +14,7 @@ import (
 // 仍返回 true（被拉黑用户可越权读子区历史/会话）。ExistMemberActive 必须额外要求
 // status=Normal，把黑名单成员挡在门外（YUJ-4212 CR 整改）。
 func TestExistMemberActive_ExcludesBlacklist(t *testing.T) {
-	_, ctx := testutil.NewTestServer()
+	_, ctx := newTestServer(t)
 	require.NoError(t, testutil.CleanAllTables(ctx))
 
 	db := NewDB(ctx)
@@ -64,7 +64,7 @@ func TestExistMemberActive_ExcludesBlacklist(t *testing.T) {
 // 仍透出子区。ExistMembersActive 必须只返回 status=Normal AND is_deleted=0 的群编号
 // （YUJ-4212 CR 整改）。
 func TestExistMembersActive_ExcludesBlacklist(t *testing.T) {
-	_, ctx := testutil.NewTestServer()
+	_, ctx := newTestServer(t)
 	require.NoError(t, testutil.CleanAllTables(ctx))
 
 	db := NewDB(ctx)
@@ -112,7 +112,7 @@ func TestExistMembersActive_ExcludesBlacklist(t *testing.T) {
 // 这是 YUJ-4219 把 thread 模块 + channel_files + mutualDelete 子区分支统一切到
 // ExistMemberActive 后，所有这些门禁共享的授权原语，故在 DB 层兜底双向覆盖。
 func TestExistMemberActive(t *testing.T) {
-	_, ctx := testutil.NewTestServer()
+	_, ctx := newTestServer(t)
 	assert.NoError(t, testutil.CleanAllTables(ctx))
 
 	db := NewDB(ctx)

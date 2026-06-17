@@ -12,7 +12,7 @@ import (
 // （后者是阻止旧的自动合成事件覆盖手动头像的关键标志）。QueryWithGroupNo
 // 读回这些字段，avatarGet 据此选择 versioned/legacy path。
 func TestGroupAvatarVersionDBRoundTrip(t *testing.T) {
-	_, ctx := testutil.NewTestServer()
+	_, ctx := newTestServer(t)
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	g := New(ctx)
 

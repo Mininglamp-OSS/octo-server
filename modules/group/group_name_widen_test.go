@@ -28,7 +28,7 @@ const groupNameWidenMigrationFile = "20260615000001_group_name_widen.sql"
 // fits. A defer restores the column to 50 so a mid-test failure can't leave the shared test
 // schema narrowed for later tests.
 func TestGroupNameWidenMigration(t *testing.T) {
-	_, ctx := testutil.NewTestServer()
+	_, ctx := newTestServer(t)
 	defer testutil.CleanAllTables(ctx)
 
 	require.Equal(t, 50, MaxGroupNameLen, "MaxGroupNameLen and the column width must move together")

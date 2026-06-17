@@ -73,7 +73,7 @@ func allowDuplicateColumn(t *testing.T, ctx *config.Context, stmt string) {
 func TestGroupCreate(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 	f.Route(s.GetRoute())
 
@@ -101,7 +101,7 @@ func TestGroupCreate(t *testing.T) {
 }
 
 func TestGroupCreate_WithCategoryID(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	ensureGroupCategorySchema(t, ctx)
@@ -171,7 +171,7 @@ func TestGroupCreate_WithCategoryID(t *testing.T) {
 }
 
 func TestGroupCreate_WithCategoryID_NoSpaceID(t *testing.T) {
-	s, _ := testutil.NewTestServer()
+	s, _ := newTestServer(t)
 
 	// 传 category_id 但不传 space_id → 应报错
 	w := httptest.NewRecorder()
@@ -187,7 +187,7 @@ func TestGroupCreate_WithCategoryID_NoSpaceID(t *testing.T) {
 }
 
 func TestGroupCreate_WithCategoryID_NotFound(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	ensureGroupCategorySchema(t, ctx)
 
 	spaceID := "space-cat-notfound"
@@ -216,7 +216,7 @@ func TestGroupCreate_WithCategoryID_NotFound(t *testing.T) {
 }
 
 func TestGroupCreate_WithCategoryID_NotOwned(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	ensureGroupCategorySchema(t, ctx)
 
 	spaceID := "space-cat-notowned"
@@ -253,7 +253,7 @@ func TestGroupCreate_WithCategoryID_NotOwned(t *testing.T) {
 
 func TestGroupGet(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 	f.Route(s.GetRoute())
 
@@ -295,7 +295,7 @@ func TestGroupGet(t *testing.T) {
 
 func TestGroupMemberAdd(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 	f.Route(s.GetRoute())
 
@@ -346,7 +346,7 @@ func TestGroupMemberAdd(t *testing.T) {
 // TestGroupMemberAdd_NonMemberForbidden 回归测试 issue#1018:
 // 非群成员的任意用户不能向 Invite==0 的群添加成员
 func TestGroupMemberAdd_NonMemberForbidden(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -396,7 +396,7 @@ func TestGroupMemberAdd_NonMemberForbidden(t *testing.T) {
 // TestGroupMemberAdd_KickedMemberForbidden 回归测试 issue#1018:
 // 曾经是群成员但已被移除(is_deleted=1)的用户,不能再通过 memberAdd 添加他人
 func TestGroupMemberAdd_KickedMemberForbidden(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -449,7 +449,7 @@ func TestGroupMemberAdd_KickedMemberForbidden(t *testing.T) {
 
 func TestGroupMemberRemove(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 	f.Route(s.GetRoute())
 
@@ -490,7 +490,7 @@ func TestGroupMemberRemove(t *testing.T) {
 
 func TestSyncMembers(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 	f.Route(s.GetRoute())
 
@@ -543,7 +543,7 @@ func TestSyncMembers(t *testing.T) {
 
 func TestGroupSettingUpdate(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 	f.Route(s.GetRoute())
 
@@ -581,7 +581,7 @@ func TestGroupSettingUpdate(t *testing.T) {
 
 func TestGroupUpdate(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 	f.Route(s.GetRoute())
 
@@ -616,7 +616,7 @@ func TestGroupUpdate(t *testing.T) {
 }
 func TestList(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 	f.Route(s.GetRoute())
 
@@ -651,7 +651,7 @@ func TestList(t *testing.T) {
 // TestGroupExit 测试退出群聊
 func TestGroupExit(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 	f.Route(s.GetRoute())
 
@@ -686,7 +686,7 @@ func TestGroupExit(t *testing.T) {
 // TestGroupDisband 测试解散群组
 func TestGroupDisband(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 	f.Route(s.GetRoute())
 
@@ -720,7 +720,7 @@ func TestGroupDisband(t *testing.T) {
 // TestGroupManagerAdd 测试添加管理员
 func TestGroupManagerAdd(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 	f.Route(s.GetRoute())
 
@@ -770,7 +770,7 @@ func TestGroupManagerAdd(t *testing.T) {
 // TestGroupManagerRemove 测试移除管理员
 func TestGroupManagerRemove(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 	f.Route(s.GetRoute())
 
@@ -820,7 +820,7 @@ func TestGroupManagerRemove(t *testing.T) {
 // TestGroupTransfer 测试群主转让
 func TestGroupTransfer(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 	f.Route(s.GetRoute())
 
@@ -868,7 +868,7 @@ func TestGroupTransfer(t *testing.T) {
 // TestGroupForbidden 测试群组全员禁言
 func TestGroupForbidden(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 	f.Route(s.GetRoute())
 
@@ -911,7 +911,7 @@ func TestGroupForbidden(t *testing.T) {
 // TestGroupMembersGet 测试获取群成员列表
 func TestGroupMembersGet(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 	f.Route(s.GetRoute())
 
@@ -958,7 +958,7 @@ func TestGroupMembersGet(t *testing.T) {
 
 func TestGroupDetailGet_MemberCanAccess(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 	f.Route(s.GetRoute())
 
@@ -995,7 +995,7 @@ func TestGroupDetailGet_MemberCanAccess(t *testing.T) {
 
 func TestGroupDetailGet_NonMemberDenied(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 	f.Route(s.GetRoute())
 
@@ -1024,7 +1024,7 @@ func TestGroupDetailGet_NonMemberDenied(t *testing.T) {
 
 func TestGroupDetailGet_UnauthenticatedDenied(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 	f.Route(s.GetRoute())
 
@@ -1052,7 +1052,7 @@ func TestGroupDetailGet_UnauthenticatedDenied(t *testing.T) {
 // members with ForbiddenExpirTime == 0, not all requested UIDs (issue #482)
 func TestBlacklistRemoveUsesFilteredUIDs(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 	f.Route(s.GetRoute())
 
@@ -1145,7 +1145,7 @@ func TestBlacklistRemoveUsesFilteredUIDs(t *testing.T) {
 
 // TestGroupMemberGet_Hit 调用方是成员，目标 uid 是在群成员 → exists=true 且返回 member
 func TestGroupMemberGet_Hit(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -1177,7 +1177,7 @@ func TestGroupMemberGet_Hit(t *testing.T) {
 
 // TestGroupMemberGet_Miss 调用方是成员，目标 uid 不在群 → exists=false
 func TestGroupMemberGet_Miss(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -1204,7 +1204,7 @@ func TestGroupMemberGet_Miss(t *testing.T) {
 
 // TestGroupMemberGet_Deleted 目标 uid 之前在群但 is_deleted=1 → exists=false
 func TestGroupMemberGet_Deleted(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -1234,7 +1234,7 @@ func TestGroupMemberGet_Deleted(t *testing.T) {
 
 // TestGroupMemberGet_Self 调用方查询自己 → exists=true 且返回自身成员信息
 func TestGroupMemberGet_Self(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -1260,7 +1260,7 @@ func TestGroupMemberGet_Self(t *testing.T) {
 
 // TestGroupMemberGet_CallerNotMember 调用方非该群成员 → 403/error
 func TestGroupMemberGet_CallerNotMember(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	wireI18nRendererForGroupTest(s)
 	f := New(ctx)
 

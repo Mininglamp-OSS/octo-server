@@ -13,7 +13,7 @@ import (
 // (allow). This mirrors how the ALTER TABLE migration backfills existing rows,
 // so deploying this feature does not silently turn off any existing no-@ bot.
 func TestGroup_AllowNoMention_DefaultsTo1(t *testing.T) {
-	_, ctx := testutil.NewTestServer()
+	_, ctx := newTestServer(t)
 	assert.NoError(t, testutil.CleanAllTables(ctx))
 
 	groupNo := "g-default-nomention"
@@ -148,7 +148,7 @@ func TestGroupSettingUpdate_AllowNoMention_SilentToggleSucceeds(t *testing.T) {
 // non-manager/creator toggling the group-level switch gets 403, not 500. The
 // permission check runs before any DB/event write.
 func TestGroupSettingUpdate_AllowNoMention_NonManagerForbidden(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	wireI18nRendererForGroupTest(s)
 	f := New(ctx)
 

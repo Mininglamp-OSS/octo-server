@@ -72,7 +72,7 @@ func putGroupSetting(t *testing.T, handler http.Handler, groupNo, body string) *
 // because it ignored getGroupInfo's not-found sentinel. The exit of a
 // non-existent group is a user-facing 404, not an internal error.
 func TestGroupExit_NotFoundGroup(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	wireI18nRendererForGroupTest(s)
 	_ = New(ctx)
 
@@ -95,7 +95,7 @@ func TestGroupExit_NotFoundGroup(t *testing.T) {
 // JSON-decode failure mapped to store_failed (500). An expired authorization
 // code is a normal user-facing state and must surface as auth_code_invalid.
 func TestGroupMemberInviteSure_ExpiredCode(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	wireI18nRendererForGroupTest(s)
 	_ = New(ctx)
 
@@ -129,7 +129,7 @@ func TestGroupMemberAdd_BlankMembersIsRequestInvalid(t *testing.T) {
 // RemoveGroupMembers return "none of the members are in this group" — a 404
 // business error, not the store_failed (500) it was being mapped to.
 func TestManagerMemberRemove_NotInGroupIsNotFound(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	wireI18nRendererForGroupTest(s)
 	f := New(ctx)
 
@@ -194,7 +194,7 @@ func TestGroupSettingUpdate_AllowExternalRangeIsRequestInvalid(t *testing.T) {
 // checkPermissions's "没有权限！" collapsed into store_failed (500). Updating a
 // group attribute without permission is a 403, not an internal error.
 func TestGroupSettingUpdate_NonManagerForbidden(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	wireI18nRendererForGroupTest(s)
 	f := New(ctx)
 
@@ -243,7 +243,7 @@ func TestGroupAvatarUpload_MissingFileIsRequestInvalid(t *testing.T) {
 // upload contract: after object storage and DB update succeed, the IM
 // notification is best-effort and must not make the client retry the upload.
 func TestGroupAvatarUpload_PostCommitNotifyFailureRespondsOK(t *testing.T) {
-	_, ctx := testutil.NewTestServer()
+	_, ctx := newTestServer(t)
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
 

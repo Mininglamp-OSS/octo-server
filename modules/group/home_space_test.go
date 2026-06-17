@@ -16,7 +16,7 @@ import (
 // 且一次调用内合并了 source_space_name 回填（Jerry-Xin review #1209 优化 1：
 // 只打 1 次 group 查询兜底 + 1 次 space WHERE IN 批量）。
 func TestFillSpaceRelatedFields_ExternalAndInternal(t *testing.T) {
-	_, ctx := testutil.NewTestServer()
+	_, ctx := newTestServer(t)
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
 
@@ -85,7 +85,7 @@ func TestFillSpaceRelatedFields_ExternalAndInternal(t *testing.T) {
 // fillSpaceRelatedFields 不应查询群资料也不应写 group space，纯按 source 计算。
 // 这个用例保证即便 group 行意外缺失也不会 panic / 被错误填充。
 func TestFillSpaceRelatedFields_NoInternalMembers(t *testing.T) {
-	_, ctx := testutil.NewTestServer()
+	_, ctx := newTestServer(t)
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
 
@@ -116,7 +116,7 @@ func TestFillSpaceRelatedFields_NoInternalMembers(t *testing.T) {
 // fillSpaceRelatedFields 不应再做 group 表查询，依然正确填充内部成员的 home_space_*。
 // 为了证明没有 fallback 到 group 表，故意传一个数据库里不存在的 groupNo。
 func TestFillSpaceRelatedFields_GroupSpaceIDPassedIn(t *testing.T) {
-	_, ctx := testutil.NewTestServer()
+	_, ctx := newTestServer(t)
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
 
@@ -146,7 +146,7 @@ func TestFillSpaceRelatedFields_GroupSpaceIDPassedIn(t *testing.T) {
 // TestGetMemberExternalMarkers_HomeSpace 验证 Service 层 GetMemberExternalMarkers
 // 同时暴露 HomeSpaceID / HomeSpaceName，供消息同步热路径使用（YUJ-63 / #1208）。
 func TestGetMemberExternalMarkers_HomeSpace(t *testing.T) {
-	_, ctx := testutil.NewTestServer()
+	_, ctx := newTestServer(t)
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
 

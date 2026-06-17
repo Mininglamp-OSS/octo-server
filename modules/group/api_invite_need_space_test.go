@@ -56,7 +56,7 @@ func seedDefaultSpaceForTestUID(t *testing.T, ctx *config.Context) string {
 // （allow_external=1）邀请码 → authorize 必须短路返回 need_space，不生成 auth_code。
 // 这是 GH #1319 的核心回归：Direction A 决策后，任何入群路径都必须前置检查。
 func TestGroupInviteAuthorize_NeedSpace_ExternalGroup(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -106,7 +106,7 @@ func TestGroupInviteAuthorize_NeedSpace_ExternalGroup(t *testing.T) {
 // 而不是 external_blocked。need_space 是用户侧修复路径（加 Space 后重试），
 // 比群级 external_blocked 更根本、更可操作，三端才能正确引导用户。
 func TestGroupInviteAuthorize_NeedSpace_PriorityOverExternalBlocked(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -164,7 +164,7 @@ func TestGroupInviteAuthorize_NeedSpace_PriorityOverExternalBlocked(t *testing.T
 // 有 Space 的登录用户扫外部群邀请码 → 正常流程（不被 need_space 误杀），
 // 生成 auth_code。回归保护：避免 need_space 条件误把所有用户挡在外面。
 func TestGroupInviteAuthorize_HasSpaceGoesNormalPath(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -215,7 +215,7 @@ func TestGroupInviteAuthorize_HasSpaceGoesNormalPath(t *testing.T) {
 // 未登录访问者（loginUID=""）不触发，保持公共预览体验（回归保护：
 // TestGroupInviteDetail_Joinable / TestGroupInviteDetail_ExternalBlocked 无 token）。
 func TestGroupInviteDetail_NeedSpace_OptionalAuth(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)

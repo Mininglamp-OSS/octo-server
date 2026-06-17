@@ -30,7 +30,7 @@ import (
 )
 
 func TestE2E_Issue27_RemovedBotStopsReceivingThreadMessages(t *testing.T) {
-	_, ctx := testutil.NewTestServer()
+	_, ctx := newTestServer(t)
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	f := New(ctx)
 	ensureThreadTables(t, f)

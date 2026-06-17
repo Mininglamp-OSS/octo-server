@@ -41,7 +41,7 @@ func insertBotUser(t *testing.T, f *Group, uid, name, shortNo, creatorUID string
 // No external bots are owned by user-c by default; individual tests insert
 // the bots they need.
 func setupBotOwnershipGroup(t *testing.T) (*Group, http.Handler) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	// NB: module.Setup(ctx) inside NewTestServer already constructs a Group
 	// instance and registers its routes on s.GetRoute(). Calling
 	// f.Route(s.GetRoute()) again would double-register the same paths and
@@ -183,7 +183,7 @@ func TestGroupMemberAdd_BotOwnershipBlocksMixedBatch(t *testing.T) {
 // TestCheckBotOwnership_SkipsNonBots exercises the pure helper: non-bot UIDs
 // pass through untouched regardless of inviter.
 func TestCheckBotOwnership_SkipsNonBots(t *testing.T) {
-	_, ctx := testutil.NewTestServer()
+	_, ctx := newTestServer(t)
 	assert.NoError(t, testutil.CleanAllTables(ctx))
 
 	_, err := ctx.DB().InsertInto("user").

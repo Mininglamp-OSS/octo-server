@@ -35,7 +35,7 @@ import (
 
 // 群挂在 Space 下：detail 必须下发真实 space_id + space_name，前端才能渲染归属行。
 func TestGroupInviteDetail_IncludesSpaceID_WithSpace(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -89,7 +89,7 @@ func TestGroupInviteDetail_IncludesSpaceID_WithSpace(t *testing.T) {
 // 公共群（无 SpaceID）：space_id 必须为空串而非缺省，前端按空串隐藏归属行，
 // 且保证旧客户端 JSON.parse 看到的是稳定字段集合（向后兼容）。
 func TestGroupInviteDetail_IncludesSpaceID_PublicGroup(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -136,7 +136,7 @@ func TestGroupInviteDetail_IncludesSpaceID_PublicGroup(t *testing.T) {
 // external_blocked 状态同样需要下发 space_id + space_name，
 // 前端状态页据此渲染「你不是「XX」Space 的成员」。
 func TestGroupInviteDetail_ExternalBlocked_IncludesSpaceInfo(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -191,7 +191,7 @@ func TestGroupInviteDetail_ExternalBlocked_IncludesSpaceInfo(t *testing.T) {
 // 落地页 HTML 必须包含归属行元素 + external_blocked 额外提示锚点，
 // 保证前端代码不会被后端模板替换误伤。用 grep 测试钉字面量。
 func TestGroupInvitePage_RendersSpaceLandingElements(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	_ = New(ctx)
 
 	wd, err := os.Getwd()

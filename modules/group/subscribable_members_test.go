@@ -15,7 +15,7 @@ import (
 // WuKongIM 重载订阅时把被拉黑用户加回订阅列表 → 拉黑不自愈。GetSubscribableMemberUIDs
 // 必须只返回 status=normal AND is_deleted=0 的成员。
 func TestGetSubscribableMemberUIDs_ExcludesBlacklist(t *testing.T) {
-	_, ctx := testutil.NewTestServer()
+	_, ctx := newTestServer(t)
 	require.NoError(t, testutil.CleanAllTables(ctx))
 
 	db := NewDB(ctx)
@@ -62,7 +62,7 @@ func TestGetSubscribableMemberUIDs_ExcludesBlacklist(t *testing.T) {
 
 // TestGetSubscribableMemberUIDs_ExcludesDeleted 防御：is_deleted=1 的成员同样排除。
 func TestGetSubscribableMemberUIDs_ExcludesDeleted(t *testing.T) {
-	_, ctx := testutil.NewTestServer()
+	_, ctx := newTestServer(t)
 	require.NoError(t, testutil.CleanAllTables(ctx))
 
 	db := NewDB(ctx)

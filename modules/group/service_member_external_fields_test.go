@@ -9,7 +9,7 @@ import (
 
 // TestGetMemberExternalFields_External YUJ-206 单成员版：外部成员 → home = source。
 func TestGetMemberExternalFields_External(t *testing.T) {
-	_, ctx := testutil.NewTestServer()
+	_, ctx := newTestServer(t)
 	assert.NoError(t, testutil.CleanAllTables(ctx))
 
 	groupSpaceID := "space-home-206"
@@ -39,7 +39,7 @@ func TestGetMemberExternalFields_External(t *testing.T) {
 
 // TestGetMemberExternalFields_Internal YUJ-206 单成员版：内部成员 → home = 群 Space。
 func TestGetMemberExternalFields_Internal(t *testing.T) {
-	_, ctx := testutil.NewTestServer()
+	_, ctx := newTestServer(t)
 	assert.NoError(t, testutil.CleanAllTables(ctx))
 
 	groupSpaceID := "space-home-206-int"
@@ -69,7 +69,7 @@ func TestGetMemberExternalFields_Internal(t *testing.T) {
 // TestGetMemberExternalFields_MissingOrEmpty 覆盖空入参 / 不存在成员 / 群无 Space
 // 三类边界，确保都返回全零值 + nil error，不抛异常。
 func TestGetMemberExternalFields_MissingOrEmpty(t *testing.T) {
-	_, ctx := testutil.NewTestServer()
+	_, ctx := newTestServer(t)
 	assert.NoError(t, testutil.CleanAllTables(ctx))
 
 	s := NewService(ctx).(*Service)

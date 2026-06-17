@@ -13,7 +13,7 @@ import (
 // 的成员（例如 managerAdd 外部成员校验加入前遗留的数据），
 // QueryIsGroupManagerOrCreator 也必须返回 false，从而在角色判定层阻断 8 项敏感操作。
 func TestQueryIsGroupManagerOrCreator_ExternalMemberFailSafe(t *testing.T) {
-	_, ctx := testutil.NewTestServer()
+	_, ctx := newTestServer(t)
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
 

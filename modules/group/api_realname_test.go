@@ -141,7 +141,7 @@ func seedUserVerification(t *testing.T, f *Group, uid, realName string, verified
 // 和 :227 的已验证 setup 模式。漏这一行三个测试会打到 404 路径,所谓的 pass
 // 其实是 vacuous,证明不了 feature works（Jerry + lml2468 R6 独立 confirm）。
 func setupMembersGroup(t *testing.T) (*Group, http.Handler, string, string) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 	f.Route(s.GetRoute())
 	require.NoError(t, testutil.CleanAllTables(ctx))

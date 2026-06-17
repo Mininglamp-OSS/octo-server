@@ -13,7 +13,7 @@ import (
 
 func setupServiceTest(t *testing.T) (IService, *user.DB) {
 	t.Helper()
-	_, ctx := testutil.NewTestServer()
+	_, ctx := newTestServer(t)
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
 	userDB := user.NewDB(ctx)
@@ -24,7 +24,7 @@ func setupServiceTest(t *testing.T) (IService, *user.DB) {
 // setupServiceTestWithCtx exposes ctx so tests can seed space/space_member/group fixtures directly.
 func setupServiceTestWithCtx(t *testing.T) (IService, *user.DB, *config.Context) {
 	t.Helper()
-	_, ctx := testutil.NewTestServer()
+	_, ctx := newTestServer(t)
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
 	userDB := user.NewDB(ctx)

@@ -16,7 +16,7 @@ import (
 //
 // 场景：同一个群内 1 个人类外部成员 + 1 个 bot 外部成员 → 计数应为 1。
 func TestQueryExternalMemberCount_ExcludesBots(t *testing.T) {
-	_, ctx := testutil.NewTestServer()
+	_, ctx := newTestServer(t)
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
 
@@ -57,7 +57,7 @@ func TestQueryExternalMemberCount_ExcludesBots(t *testing.T) {
 // （人类外部成员都已退群）时，计数为 0 —— 这正是 T-bot-5 E2E 复现的关键路径：
 // refreshIsExternalGroup 应据此把 is_external_group 改回 0。
 func TestQueryExternalMemberCount_OnlyBotsReturnsZero(t *testing.T) {
-	_, ctx := testutil.NewTestServer()
+	_, ctx := newTestServer(t)
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
 
@@ -84,7 +84,7 @@ func TestQueryExternalMemberCount_OnlyBotsReturnsZero(t *testing.T) {
 
 // TestQueryExternalMemberCount_EmptyGroup 边界：空群（0 成员）应返回 0。
 func TestQueryExternalMemberCount_EmptyGroup(t *testing.T) {
-	_, ctx := testutil.NewTestServer()
+	_, ctx := newTestServer(t)
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
 
@@ -101,7 +101,7 @@ func TestQueryExternalMemberCount_EmptyGroup(t *testing.T) {
 // TestQueryExternalMemberCount_MixedMulti 多成员混合场景：
 // 2 human external + 3 bot external + 1 human internal → 只返回 human external 数（2）。
 func TestQueryExternalMemberCount_MixedMulti(t *testing.T) {
-	_, ctx := testutil.NewTestServer()
+	_, ctx := newTestServer(t)
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
 
@@ -140,7 +140,7 @@ func TestQueryExternalMemberCount_MixedMulti(t *testing.T) {
 // TestQueryExternalMemberCount_DeletedHuman 软删除的人类外部成员必须排除
 // （is_deleted=1 AND is_external=1 AND robot=0 → 不算）。
 func TestQueryExternalMemberCount_DeletedHuman(t *testing.T) {
-	_, ctx := testutil.NewTestServer()
+	_, ctx := newTestServer(t)
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
 

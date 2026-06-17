@@ -33,7 +33,7 @@ import (
 
 // 群挂在 Space 下，登录者本身是该 Space 成员 → 只显示 space_name，不标外部。
 func TestGroupDetailGet_WithSpace_SameSpaceMember(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -76,7 +76,7 @@ func TestGroupDetailGet_WithSpace_SameSpaceMember(t *testing.T) {
 
 // 群挂在 Space 下但登录者不在该 Space 成员表中 → is_external=1，前端渲染外部徽标。
 func TestGroupDetailGet_WithSpace_CrossSpaceViewer(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -123,7 +123,7 @@ func TestGroupDetailGet_WithSpace_CrossSpaceViewer(t *testing.T) {
 
 // 群无 SpaceID（App 内创建的普通群） → space_name="" / is_external=0，前端完全不渲染。
 func TestGroupDetailGet_NoSpace(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -156,7 +156,7 @@ func TestGroupDetailGet_NoSpace(t *testing.T) {
 
 // 公开接口永远没有登录态，is_external 只会是 0；但 space_name 仍然要下发。
 func TestGroupInviteDetail_IncludesSpaceName_Anonymous(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -207,7 +207,7 @@ func TestGroupInviteDetail_IncludesSpaceName_Anonymous(t *testing.T) {
 
 // 群无 Space 时公开接口返回的 space_name 应为空字符串，前端不渲染 Space 信息。
 func TestGroupInviteDetail_NoSpace(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -250,7 +250,7 @@ func TestGroupInviteDetail_NoSpace(t *testing.T) {
 
 // 群挂 Space，登录的被邀请者不是该 Space 成员 → is_external=1 + space_name 下发。
 func TestGroupMemberInviteDetail_CrossSpaceViewer(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -306,7 +306,7 @@ func TestGroupMemberInviteDetail_CrossSpaceViewer(t *testing.T) {
 
 // 群无 Space 时邀请详情 space_name 为空，is_external 为 0。
 func TestGroupMemberInviteDetail_NoSpace(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)

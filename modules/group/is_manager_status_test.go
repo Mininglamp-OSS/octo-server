@@ -16,7 +16,7 @@ import (
 //
 // 配对 [[is_manager_external_test]]：两条 fail-safe 都在同一处 WHERE 上叠加。
 func TestQueryIsGroupManagerOrCreator_BlacklistedFailSafe(t *testing.T) {
-	_, ctx := testutil.NewTestServer()
+	_, ctx := newTestServer(t)
 	err := testutil.CleanAllTables(ctx)
 	assert.NoError(t, err)
 

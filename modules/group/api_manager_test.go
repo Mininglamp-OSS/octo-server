@@ -13,7 +13,7 @@ import (
 
 func TestGroupList(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	m := NewManager(ctx)
 	m.Route(s.GetRoute())
 	//清除数据
@@ -35,7 +35,7 @@ func TestGroupList(t *testing.T) {
 
 func TestGroupCount(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	m := NewManager(ctx)
 	m.Route(s.GetRoute())
 	//清除数据
@@ -55,7 +55,7 @@ func TestGroupCount(t *testing.T) {
 }
 func TestDisableList(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	m := NewManager(ctx)
 	m.Route(s.GetRoute())
 	//清除数据
@@ -82,7 +82,7 @@ func TestDisableList(t *testing.T) {
 
 func TestBlackList(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	m := NewManager(ctx)
 	m.Route(s.GetRoute())
 	//清除数据

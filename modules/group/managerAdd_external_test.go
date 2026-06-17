@@ -20,7 +20,7 @@ import (
 // 构造：creator + 1 个内部成员 + 1 个外部成员；creator 一次请求提拔两人。
 // 期望：返回 403 且拒绝写入（两人角色都保持 common）。
 func TestManagerAdd_RejectsExternalMember(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	wireI18nRendererForGroupTest(s)
 	f := New(ctx)
 
@@ -107,7 +107,7 @@ func TestManagerAdd_RejectsExternalMember(t *testing.T) {
 // 外部成员时，返回 403。防止外部成员获得 creator 角色从而取得所有敏感操作权限
 // (YUJ-231 / GH#1289)。
 func TestTransferGrouper_RejectsExternalMember(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	wireI18nRendererForGroupTest(s)
 	f := New(ctx)
 

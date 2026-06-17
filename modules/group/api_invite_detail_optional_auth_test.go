@@ -36,7 +36,7 @@ import (
 // 合法 token + 同 Space 成员：detail 应该返回 joinable，让前端显示加入按钮。
 // 这是 YUJ-39 的核心正向路径——修复 PR#1174 遗留 UX 短板。
 func TestGroupInviteDetail_OptionalAuth_SameSpaceMember_Joinable(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -96,7 +96,7 @@ func TestGroupInviteDetail_OptionalAuth_SameSpaceMember_Joinable(t *testing.T) {
 // 合法 token + 同 Space 成员 + invite=1：detail 应该返回 invite_required，
 // 而不是被 external_blocked 盖住。验证可选鉴权后 invite_required 状态也能正常透出。
 func TestGroupInviteDetail_OptionalAuth_SameSpaceMember_InviteRequired(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -152,7 +152,7 @@ func TestGroupInviteDetail_OptionalAuth_SameSpaceMember_InviteRequired(t *testin
 // 合法 token + 跨 Space 访问者：detail 仍返回 external_blocked 并标记 is_external=1。
 // 回归保护：可选鉴权不得让跨 Space 用户错误获得 joinable。
 func TestGroupInviteDetail_OptionalAuth_CrossSpace_Blocked(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -222,7 +222,7 @@ func TestGroupInviteDetail_OptionalAuth_CrossSpace_Blocked(t *testing.T) {
 // 无效 / 过期 token：detail 应降级为匿名路径（external_blocked + is_external=0），
 // 不得因为脏 token 崩溃或泄漏敏感状态。
 func TestGroupInviteDetail_OptionalAuth_InvalidToken_Degrades(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)

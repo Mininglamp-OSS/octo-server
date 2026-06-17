@@ -16,7 +16,7 @@ import (
 )
 
 func setupGroupMdTest(t *testing.T) (*Group, *server.Server) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 	f.Route(s.GetRoute())
 	err := testutil.CleanAllTables(ctx)

@@ -36,7 +36,7 @@ func deterministicIPSuffix(name string) int {
 }
 
 func TestGroupInviteDetail_Joinable(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -79,7 +79,7 @@ func TestGroupInviteDetail_Joinable(t *testing.T) {
 }
 
 func TestGroupInviteDetail_InviteRequired(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -116,7 +116,7 @@ func TestGroupInviteDetail_InviteRequired(t *testing.T) {
 }
 
 func TestGroupInviteDetail_Expired(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	_ = New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -132,7 +132,7 @@ func TestGroupInviteDetail_Expired(t *testing.T) {
 }
 
 func TestGroupInviteDetail_NotFound(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -168,7 +168,7 @@ func TestGroupInviteDetail_NotFound(t *testing.T) {
 }
 
 func TestGroupInviteDetail_EmptyCode(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	_ = New(ctx)
 
 	w := httptest.NewRecorder()
@@ -178,7 +178,7 @@ func TestGroupInviteDetail_EmptyCode(t *testing.T) {
 
 // 非 group 类型的二维码（如 scanLogin）应返回 expired，避免跨类型数据被透出。
 func TestGroupInviteDetail_WrongQRCodeType(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	_ = New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -206,7 +206,7 @@ func TestGroupInviteDetail_WrongQRCodeType(t *testing.T) {
 // 落地页渲染需要从 repo 根目录读取 assets/web/group_invite.html。
 // 测试时 cwd 是 modules/group/，所以临时切到 repo 根再切回。
 func TestGroupInvitePage_RendersHTMLWithAPIBase(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	_ = New(ctx)
 
 	wd, err := os.Getwd()
@@ -246,7 +246,7 @@ func TestGroupInvitePage_RendersHTMLWithAPIBase(t *testing.T) {
 
 // 已登录用户用公开 code 换取 auth_code：基础路径。
 func TestGroupInviteAuthorize_OK(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -302,7 +302,7 @@ func TestGroupInviteAuthorize_OK(t *testing.T) {
 
 // invite=1 的群（需审批）不应通过 authorize 生成 auth_code。
 func TestGroupInviteAuthorize_InviteRequired(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	wireI18nRendererForGroupTest(s)
 	f := New(ctx)
 
@@ -343,7 +343,7 @@ func TestGroupInviteAuthorize_InviteRequired(t *testing.T) {
 
 // code 已过期 / 不存在：返回错误。
 func TestGroupInviteAuthorize_Expired(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	wireI18nRendererForGroupTest(s)
 	_ = New(ctx)
 
@@ -363,7 +363,7 @@ func TestGroupInviteAuthorize_Expired(t *testing.T) {
 
 // 未登录：AuthMiddleware 直接拦截。
 func TestGroupInviteAuthorize_RequiresAuth(t *testing.T) {
-	s, _ := testutil.NewTestServer()
+	s, _ := newTestServer(t)
 
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("POST", "/v1/group/invite/authorize?code=foo", nil)
@@ -375,7 +375,7 @@ func TestGroupInviteAuthorize_RequiresAuth(t *testing.T) {
 // 落地页 HTML 应包含「加入群聊」按钮与 authorize 端点引用，
 // 确保前端改动不会被后端模板替换误伤。
 func TestGroupInvitePage_ContainsJoinButton(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	_ = New(ctx)
 
 	wd, err := os.Getwd()
@@ -401,7 +401,7 @@ func TestGroupInvitePage_ContainsJoinButton(t *testing.T) {
 // 这两个字面量钉死：任何人再把按钮加回来都会挂 CI。
 func TestGroupInvitePage_NoDmworkScheme(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	_ = New(ctx)
 
 	wd, err := os.Getwd()
@@ -430,7 +430,7 @@ func TestGroupInvitePage_NoDmworkScheme(t *testing.T) {
 // 那是 pkg/wkhttp/ratelimit_test.go 的职责，此处避开依赖 SharedUIDRateLimiter
 // 的进程级单例 + 环境变量带来的耦合。
 func TestGroupInviteAuthorize_HasUIDRateLimit(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -478,7 +478,7 @@ func TestGroupInviteAuthorize_HasUIDRateLimit(t *testing.T) {
 // 让 H5 落地页直接给明确提示、藏掉「加入群聊」按钮，而不是等用户点了才被
 // groupScanJoin 拒绝。
 func TestGroupInviteDetail_ExternalBlocked(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -522,7 +522,7 @@ func TestGroupInviteDetail_ExternalBlocked(t *testing.T) {
 // allow_external=1（默认）或群无 SpaceID 时不应触发 external_blocked。
 // 这里确保我们没把默认路径（App 内创建的无 Space 群）误伤。
 func TestGroupInviteDetail_NoSpaceNotExternalBlocked(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -566,7 +566,7 @@ func TestGroupInviteDetail_NoSpaceNotExternalBlocked(t *testing.T) {
 // Redis auth_code（与 qrcode/api.go handleJoinGroup 的预检对齐，避免
 // scanjoin 回「已经在群内」的模糊错误 + 白占 30min TTL）。
 func TestGroupInviteAuthorize_AlreadyMember(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -619,7 +619,7 @@ func TestGroupInviteAuthorize_AlreadyMember(t *testing.T) {
 // 这固化「already_member 判定必须早于 invite 判定」的顺序约定，
 // 与 qrcode/api.go handleJoinGroup 对齐。
 func TestGroupInviteAuthorize_Invite1_AlreadyMember(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -672,7 +672,7 @@ func TestGroupInviteAuthorize_Invite1_AlreadyMember(t *testing.T) {
 // 拦截（与 TestGroupInviteAuthorize_InviteRequired 互为对照：这里显式断言
 // 当 already_member 判定 miss 时，invite 判定仍然生效，顺序重排不影响非成员路径）。
 func TestGroupInviteAuthorize_Invite1_NonMember(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	wireI18nRendererForGroupTest(s)
 	f := New(ctx)
 
@@ -716,7 +716,7 @@ func TestGroupInviteAuthorize_Invite1_NonMember(t *testing.T) {
 // 群属于某 Space 且 allow_external=0 时，authorize 应短路返回 external_blocked，
 // 不生成 auth_code。这是 H5 版本错位时的兜底路径（正常情况下 detail 已经藏掉按钮）。
 func TestGroupInviteAuthorize_ExternalBlocked(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -765,7 +765,7 @@ func TestGroupInviteAuthorize_ExternalBlocked(t *testing.T) {
 // 跨 Space 用户扫 AllowExternal=0 群邀请码：authorize 短路返回 external_blocked。
 // 这显式覆盖「登录用户不是该 Space 成员」的分支（回归 YUJ-38 修复）。
 func TestGroupInviteAuthorize_ExternalBlocked_NonSpaceMember(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
@@ -825,7 +825,7 @@ func TestGroupInviteAuthorize_ExternalBlocked_NonSpaceMember(t *testing.T) {
 // 同 Space 成员扫 AllowExternal=0 群邀请码：authorize 不再误杀为 external_blocked，
 // 应继续走正常流程并生成 auth_code（回归 YUJ-38 Critical 修复）。
 func TestGroupInviteAuthorize_SameSpaceMemberNotBlocked(t *testing.T) {
-	s, ctx := testutil.NewTestServer()
+	s, ctx := newTestServer(t)
 	f := New(ctx)
 
 	err := testutil.CleanAllTables(ctx)
