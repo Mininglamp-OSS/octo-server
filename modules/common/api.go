@@ -396,13 +396,18 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 	if err != nil && versionStr != "" {
 		cn.Warn("解析版本号失败", zap.String("version", versionStr), zap.Error(err))
 	}
+	// 消息搜索开关：search_enabled / messages_search_on 同源同值。前者保留向后兼容，
+	// 后者是收敛后的真源 key（与 octo-web ChannelSearch、octo-admin messages_search
+	// 命名一致）。两个分支共用同一计算结果，避免 Resolve 被调用多次。
+	searchEnabled := searchbackend.Resolve(cn.ctx.GetConfig().ZincSearch.SearchOn).SearchEnabled()
 	if versionI64 != 0 && int(versionI64) >= appConfigM.Version {
 		c.JSON(http.StatusOK, &appConfigResp{
 			Version:                appConfigM.Version,
 			SystemBotUIDs:          spacepkg.SystemBotList(),
 			LocalLoginOff:          boolToFlag(cn.systemSettings.LocalLoginOff()),
 			DisableUserCreateSpace: boolToFlag(cn.systemSettings.SpaceDisableUserCreate()),
-			SearchEnabled:          searchbackend.Resolve(cn.ctx.GetConfig().ZincSearch.SearchOn).SearchEnabled(),
+			SearchEnabled:          searchEnabled,
+			MessagesSearchOn:       searchEnabled,
 		})
 		return
 	}
@@ -441,7 +446,8 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 		SystemBotUIDs:          spacepkg.SystemBotList(),
 		LocalLoginOff:          boolToFlag(cn.systemSettings.LocalLoginOff()),
 		DisableUserCreateSpace: boolToFlag(cn.systemSettings.SpaceDisableUserCreate()),
-		SearchEnabled:          searchbackend.Resolve(cn.ctx.GetConfig().ZincSearch.SearchOn).SearchEnabled(),
+		SearchEnabled:          searchEnabled,
+		MessagesSearchOn:       searchEnabled,
 	})
 }
 
@@ -764,6 +770,13 @@ type appConfigResp struct {
 	// 与 app_config.version 解耦的原因同 LocalLoginOff / DisableUserCreateSpace：
 	// 运维切 backend 后老客户端命中 version 短路分支也必须拿到最新值。
 	SearchEnabled bool `json:"search_enabled"`
+
+	// MessagesSearchOn 与 SearchEnabled 同源同值，是消息搜索功能开关下发给前端
+	// 的「收敛后」key。Web 端 (octo-web ChannelSearch) 读 messages_search_on，
+	// 与 octo-admin 的 messages_search 命名保持一致；旧端仍读 search_enabled。
+	// 两字段并存：search_enabled 保留作向后兼容，messages_search_on 为新真源 key。
+	// 下发 bool，前端 parseRemoteBool(true) 即可正确开关，无需 0/1 特判。
+	MessagesSearchOn bool `json:"messages_search_on"`
 }
 
 type oidcProviderResp struct {

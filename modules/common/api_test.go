@@ -167,6 +167,66 @@ func TestGetAppConfig_SystemBotUIDsOnVersionShortCircuit(t *testing.T) {
 	assert.Contains(t, body, `"fileHelper"`)
 }
 
+// 消息搜索开关下发：search_enabled 与 messages_search_on 必须同源同值。
+// messages_search_on 是收敛后的真源 key（octo-web ChannelSearch 读它，与
+// octo-admin messages_search 命名一致），search_enabled 保留作向后兼容。
+// OCTO_SEARCH_BACKEND=es → 两者都为 true。
+func TestGetAppConfig_MessagesSearchOn_Enabled(t *testing.T) {
+	t.Setenv("OCTO_SEARCH_BACKEND", "es")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+	assert.Contains(t, body, `"messages_search_on":true`)
+	assert.Contains(t, body, `"search_enabled":true`)
+}
+
+// OCTO_SEARCH_BACKEND=disabled → messages_search_on 与 search_enabled 均为
+// false，前端据此隐藏 ChannelSearch 入口。
+func TestGetAppConfig_MessagesSearchOn_Disabled(t *testing.T) {
+	t.Setenv("OCTO_SEARCH_BACKEND", "disabled")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+	assert.Contains(t, body, `"messages_search_on":false`)
+	assert.Contains(t, body, `"search_enabled":false`)
+}
+
+// version 短路分支同样要下发 messages_search_on：老客户端命中版本短路也必须
+// 拿到当前开关，否则被缓存住失去实时性（与 search_enabled / disable_user_create_space
+// 同样的「与 app_config.version 解耦」约束）。
+func TestGetAppConfig_MessagesSearchOn_OnVersionShortCircuit(t *testing.T) {
+	t.Setenv("OCTO_SEARCH_BACKEND", "es")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig?version=99999999", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+	assert.Contains(t, body, `"messages_search_on":true`)
+	assert.Contains(t, body, `"search_enabled":true`)
+}
+
 // appconfig 必须下发 disable_user_create_space：默认 0（缺 system_setting 行且
 // env 未设置）。客户端据此显示/隐藏「创建空间」入口；缺省必须保持开放。
 func TestGetAppConfig_DisableUserCreateSpace_DefaultsZero(t *testing.T) {
