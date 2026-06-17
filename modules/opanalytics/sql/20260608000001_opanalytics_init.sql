@@ -15,7 +15,7 @@ CREATE TABLE `octo_dim_member` (
   KEY `idx_type` (`member_type`),
   KEY `idx_excluded` (`is_excluded`),
   KEY `idx_name` (`name`),
-  KEY `idx_email` (`email`),
+  KEY `idx_email` (`email`(191)),
   KEY `idx_phone` (`zone`,`phone`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='看板成员维表';
 
