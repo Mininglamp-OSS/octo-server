@@ -254,8 +254,31 @@ type spaceInviteListResp struct {
 // MemberDetailModel 带用户名的成员详情
 type MemberDetailModel struct {
 	MemberModel
-	Name  string // 用户名称
-	Robot int    // 是否机器人 1=是 0=否
+	Name     string // 用户名称（user.name）
+	RealName string // 实名兜底（user_verification.real_name），仅作 name 为空时的回退源
+	Robot    int    // 是否机器人 1=是 0=否
+}
+
+// memberDisplayNamePlaceholderPrefix 是成员展示名的稳定占位符前缀。
+// 当 user.name 与 user_verification.real_name 均为空时，用 "<前缀><uid>" 作为
+// 可读且稳定的占位符，避免前端渲染空白行。uid 已经在 memberResp 里返回，故
+// 用它兜底不泄露新信息——但禁止用 short_no / username 兜底（privacy-gated）。
+const memberDisplayNamePlaceholderPrefix = "User "
+
+// DisplayName 返回成员的展示名，按 issue #344 的兜底链解析：
+//  1. user.name 非空 → 原样返回；
+//  2. 否则 user_verification.real_name 非空 → 返回实名；
+//  3. 都空 → 返回稳定占位符 "User <uid>"。
+//
+// 任何分支都不会返回空串，也不会暴露 short_no / username。
+func (m *MemberDetailModel) DisplayName() string {
+	if m.Name != "" {
+		return m.Name
+	}
+	if m.RealName != "" {
+		return m.RealName
+	}
+	return memberDisplayNamePlaceholderPrefix + m.UID
 }
 
 // SpaceDetailModel 带成员数和角色的空间详情（MaxUsers 从 SpaceModel 继承）

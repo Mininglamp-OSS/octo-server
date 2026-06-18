@@ -630,7 +630,7 @@ func (s *Space) listMembers(c *wkhttp.Context) {
 	for _, m := range members {
 		resps = append(resps, memberResp{
 			UID:       m.UID,
-			Name:      m.Name,
+			Name:      m.DisplayName(),
 			Role:      m.Role,
 			Robot:     m.Robot,
 			CreatedAt: m.CreatedAt.String(),

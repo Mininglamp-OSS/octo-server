@@ -145,11 +145,17 @@ func (d *DB) queryMemberIncludeRemoved(spaceId string, uid string) (*MemberModel
 
 func (d *DB) queryMembers(spaceId string, loginUID string, page uint64, limit uint64) ([]*MemberDetailModel, error) {
 	var models []*MemberDetailModel
+	// name 兜底链（issue #344）：u.name 为空时回退 user_verification.real_name，
+	// 二者皆空时由 mapping 层（MemberDetailModel.DisplayName）给稳定占位符。
+	// 这里只多挂一个只读 LEFT JOIN uv；Space + bot 归属过滤（WHERE 子句）保持不变，
+	// 不放宽任何隔离边界。禁止用 short_no / username 兜底（privacy-gated）。
 	_, err := d.session.SelectBySql(`
 		SELECT sm.*, IFNULL(u.name,'') as name,
+			IFNULL(uv.real_name,'') as real_name,
 			CASE WHEN r.robot_id IS NOT NULL AND r.status=1 THEN 1 ELSE 0 END as robot
 		FROM space_member sm
 		LEFT JOIN user u ON u.uid=sm.uid
+		LEFT JOIN user_verification uv ON uv.user_id=sm.uid
 		LEFT JOIN robot r ON r.robot_id=sm.uid
 		WHERE sm.space_id=? AND sm.status=1 AND (
 			r.robot_id IS NULL

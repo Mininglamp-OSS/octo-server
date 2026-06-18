@@ -1,0 +1,63 @@
+# octospec context — records which rules were injected for this task and why.
+# Resolution: brief.md load-bearing tags ∪ touched file paths → matched rules
+# (see .octospec/rules/_index.yaml inject_when).
+schema_version: 1
+task: member-list-name-fallback
+brief: .octospec/tasks/member-list-name-fallback/brief.md
+issue: octo-server#344
+
+# Files this change touches (drives path-based injection).
+touched_paths:
+  - modules/space/db.go            # queryMembers: add real_name fallback join
+  - modules/space/model.go         # MemberDetailModel: RealName field + mapping helper
+  - modules/space/api.go           # listMembers: map resolved display name
+  - modules/space/db_member_name_fallback_test.go  # new tests
+
+# Load-bearing tags declared in the brief.
+load_bearing_tags: [space, wire-contract, acl]
+
+# Rules injected (full text read and followed). Each entry: why it matched.
+injected_rules:
+  - id: space-isolation
+    priority: 92
+    load_bearing: true
+    matched_by:
+      paths: ["modules/**/*.go"]
+      touches: ["space", "acl"]
+    why: >
+      queryMembers is Space-scoped (sm.space_id, sm.status=1) with a bot
+      creator-ownership filter. The real_name fallback must not widen the WHERE
+      clause or weaken Space/owner isolation — it only adds a read-only LEFT JOIN
+      on user_verification for a display string. No new fail-open path.
+  - id: error-handling
+    priority: 85
+    load_bearing: true
+    matched_by:
+      paths: ["modules/**/*.go"]
+      touches: ["wire-contract", "i18n"]
+    why: >
+      memberResp.name is a wire-contract field consumed by web + mobile. The
+      fallback keeps it a non-null string and introduces no raw error response;
+      listMembers already routes errors through httperr.ResponseErrorL. The
+      placeholder is a deterministic display string (not a user-facing error
+      envelope), so no new errcode/i18n marker is required, but the i18n-lint
+      gate is run to prove no raw error response slipped in.
+  - id: testing
+    priority: 70
+    load_bearing: false
+    matched_by:
+      paths: ["**/*_test.go"]
+      touches: ["test"]
+    why: >
+      Risk-proportional tests added in modules/space/ via the standard
+      testutil.NewTestServer + CleanAllTables setup, covering the three fallback
+      branches (real_name hit / placeholder / unchanged name).
+
+# Rules deliberately NOT injected.
+not_injected:
+  - id: rate-limit
+    why: No new throttling/Redis-counter logic; listMembers route already mounts
+      the shared UID rate limiter upstream. Out of scope for a read-only fallback.
+  - id: commit-style
+    why: Always-on convention (English Conventional Commits, Fixes #344);
+      followed at PR time, no code-level injection needed.
