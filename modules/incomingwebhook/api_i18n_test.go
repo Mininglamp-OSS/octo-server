@@ -20,7 +20,8 @@ import (
 // file to the list below.
 func TestIncomingWebhookNoLegacyResponseError(t *testing.T) {
 	files := []string{"api.go", "api_i18n.go", "ratelimit.go", "localfloor.go", "cache.go",
-		"adapter.go", "adapter_github.go", "adapter_wecom.go", "adapter_multica.go"}
+		"adapter.go", "adapter_github.go", "adapter_wecom.go", "adapter_multica.go",
+		"adapter_gitlab.go", "adapter_feishu.go"}
 	banned := []string{
 		".ResponseError(",
 		".ResponseErrorf(",

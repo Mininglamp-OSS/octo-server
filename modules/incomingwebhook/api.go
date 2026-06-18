@@ -218,18 +218,20 @@ func (w *IncomingWebhook) Route(r *wkhttp.WKHttp) {
 	push := r.Group("/v1")
 	{
 		// requirePushEnabled 在最前：总开关关闭时直接 404，最廉价地短路（甚至不进 floor）。
-		// 三种推送形态（native / github / wecom）共享同一条中间件链与同一组限流桶：
-		// 适配器只是 body 解析方式不同，不是新的攻击面，不单独开配额（见 adapter.go）。
+		// 所有推送形态（native / github / wecom / gitlab / feishu）共享同一条中间件链与
+		// 同一组限流桶：适配器只是 body 解析方式不同，不是新的攻击面，不单独开配额
+		// （见 adapter.go）。
 		chain := func(h wkhttp.HandlerFunc) []wkhttp.HandlerFunc {
 			return []wkhttp.HandlerFunc{w.requirePushEnabled(), w.localFloorMiddleware(), ipLimit, w.ipFailureGateMiddleware(), h}
 		}
 		push.POST("/incoming-webhooks/:webhook_id/:token", chain(w.push)...)
-		// 平台适配器（#297 Phase 3 / #426）：GitHub 事件 / 企业微信群机器人格式 / Multica
-		// 出站 webhook。鉴权、限流、群校验与 native 完全一致，仅 body 解析不同
-		// （adapter_github.go / adapter_wecom.go / adapter_multica.go）。
+		// 平台适配器（#297 Phase 3/4、#426）：GitHub / 企业微信 / Multica / GitLab / 飞书。
+		// 鉴权、限流、群校验与 native 完全一致，仅 body 解析不同（adapter_*.go）。
 		push.POST("/incoming-webhooks/:webhook_id/:token/github", chain(w.pushGitHub)...)
 		push.POST("/incoming-webhooks/:webhook_id/:token/wecom", chain(w.pushWeCom)...)
 		push.POST("/incoming-webhooks/:webhook_id/:token/multica", chain(w.pushMultica)...)
+		push.POST("/incoming-webhooks/:webhook_id/:token/gitlab", chain(w.pushGitLab)...)
+		push.POST("/incoming-webhooks/:webhook_id/:token/feishu", chain(w.pushFeishu)...)
 	}
 }
 
@@ -394,8 +396,9 @@ func publicURL(webhookID, token string) string {
 	return fmt.Sprintf("/v1/incoming-webhooks/%s/%s", webhookID, token)
 }
 
-// publicURLs 构造各推送形态的对外路径（#297 顺延的 onboarding 项 / #426）：native 即
-// 历史契约的 url 字段，github / wecom / multica 为平台适配器后缀。与 publicURL 一样不含 host。
+// publicURLs 构造各推送形态的对外路径（#297 onboarding 项 / Phase 4 / #426）：native 即
+// 历史契约的 url 字段，github / wecom / multica / gitlab / feishu 为平台适配器后缀。
+// 与 publicURL 一样不含 host。
 func publicURLs(webhookID, token string) map[string]string {
 	base := publicURL(webhookID, token)
 	return map[string]string{
@@ -403,6 +406,8 @@ func publicURLs(webhookID, token string) map[string]string {
 		"github":  base + "/github",
 		"wecom":   base + "/wecom",
 		"multica": base + "/multica",
+		"gitlab":  base + "/gitlab",
+		"feishu":  base + "/feishu",
 	}
 }
 
@@ -1071,12 +1076,15 @@ func (w *IncomingWebhook) failAuth(c *wkhttp.Context, ip string) {
 	pushUnauthorized(c)
 }
 
-// push / pushGitHub / pushWeCom / pushMultica 是各种推送形态的路由入口，全部走 handlePush
-// 流水线，仅在 adapter（body 解析 / bodyLimit / successExtra）上分叉。
+// push / pushGitHub / pushWeCom / pushMultica / pushGitLab / pushFeishu 是各推送形态的
+// 路由入口，全部走 handlePush 流水线，仅在 adapter（body 解析 / bodyLimit / successExtra）
+// 上分叉。
 func (w *IncomingWebhook) push(c *wkhttp.Context)        { w.handlePush(c, nativeAdapter) }
 func (w *IncomingWebhook) pushGitHub(c *wkhttp.Context)  { w.handlePush(c, githubAdapter) }
 func (w *IncomingWebhook) pushWeCom(c *wkhttp.Context)   { w.handlePush(c, wecomAdapter) }
 func (w *IncomingWebhook) pushMultica(c *wkhttp.Context) { w.handlePush(c, multicaAdapter) }
+func (w *IncomingWebhook) pushGitLab(c *wkhttp.Context)  { w.handlePush(c, gitlabAdapter) }
+func (w *IncomingWebhook) pushFeishu(c *wkhttp.Context)  { w.handlePush(c, feishuAdapter) }
 
 func (w *IncomingWebhook) handlePush(c *wkhttp.Context, ad pushAdapter) {
 	// 仅用于"鉴权失败才计入"的 per-IP 失败预算（见 failAuth / ipFailureGateMiddleware）。
@@ -1185,6 +1193,17 @@ func (w *IncomingWebhook) handlePush(c *wkhttp.Context, ad pushAdapter) {
 				zap.String("webhook_id", m.WebhookID), zap.Error(dErr))
 		}
 		w.webhookCache.invalidate(m.WebhookID)
+		pushUnauthorized(c)
+		return
+	}
+
+	// 3.6) 平台 header token 二次校验（目前仅 GitLab 的 X-Gitlab-Token，须等于 URL token）。
+	// 此闸在 URL token 已验证、creator 成员资格已确认之后——能到这里说明调用方已持有
+	// webhook 真正的密钥，故 header 不匹配是【配置错误】而非枚举探测：落审计
+	// （reason=token，byteSize=0，body 尚未读）便于管理员在 deliveries 里定位，返回统一
+	// 401（不计 IP 失败预算——调用方持有效 URL token，非攻击者）。
+	if ad.verifyToken != nil && !ad.verifyToken(c.Request.Header, token) {
+		w.submitFailure(m, 0, ip, ad.name, "token", http.StatusUnauthorized)
 		pushUnauthorized(c)
 		return
 	}

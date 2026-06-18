@@ -44,13 +44,15 @@ const (
 	auditSkipped = 3
 )
 
-// 投递来源/适配器（auditModel.Adapter）。后续扩展 gitlab/feishu。
+// 投递来源/适配器（auditModel.Adapter）。
 const (
 	adapterNative  = "native"  // 原生推送端点
 	adapterTest    = "test"    // 管理端「测试推送」
 	adapterGitHub  = "github"  // GitHub 事件适配器（#297 Phase 3）
 	adapterWeCom   = "wecom"   // 企业微信群机器人格式适配器（#297 Phase 3）
 	adapterMultica = "multica" // Multica 出站 webhook 适配器（#426）
+	adapterGitLab  = "gitlab"  // GitLab 事件适配器（#297 Phase 4）
+	adapterFeishu  = "feishu"  // 飞书自定义机器人格式适配器（#297 Phase 4）
 )
 
 // auditModel 对应 incoming_webhook_audit 表，记录【鉴权通过后】的每次投递结果

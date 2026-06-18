@@ -32,14 +32,19 @@ type pushAdapter struct {
 	//   - invalid 非空：解析失败原因码，映射 400 invalid(reason=...) 并落审计。
 	parse func(header http.Header, body []byte) (req *pushPayloadReq, skip string, invalid string)
 	// successExtra 合并进成功 / skip 响应体的平台兼容字段（如企业微信的 errcode /
-	// errmsg），让按平台 SDK 校验响应的既有工具不改代码即可迁移。key 与 native 的
-	// status / message_id 不重叠，纯追加。
+	// errmsg、飞书的 code / msg），让按平台 SDK 校验响应的既有工具不改代码即可迁移。
+	// key 与 native 的 status / message_id 不重叠，纯追加。
 	successExtra map[string]interface{}
-	// bodyLimit 该形态的请求体字节上限。native / wecom 的 body 由调用方编写，沿用
-	// 8KiB 的 maxBytes()——上限本就是约束调用方的；github 的 body 是平台生成的事件
-	// JSON，真实 push / PR 事件普遍 >8KiB 且发送方无法修短，必须用更宽的专属上限
-	//（githubMaxBytes，见 adapter_github.go；PR #330 review 阻断项）。
+	// bodyLimit 该形态的请求体字节上限。native / wecom / feishu 的 body 由调用方编写，
+	// 沿用 8KiB 的 maxBytes()——上限本就是约束调用方的；github / gitlab 的 body 是平台
+	// 生成的事件 JSON，真实事件普遍 >8KiB 且发送方无法修短，必须用更宽的专属上限
+	//（githubMaxBytes / gitlabMaxBytes）。
 	bodyLimit func() int
+	// verifyToken（可选）在 URL token 已校验通过后，对平台在 header 里回传的 token 再做
+	// 一次常量时间比对（目前仅 GitLab 的 X-Gitlab-Token）。返回 false → 401。能走到这里
+	// 说明 URL token 已验证、调用方已持有 webhook 真正密钥，故不匹配是配置错误而非枚举
+	// 探测（见 handlePush）。nil 表示该形态无需 header token 二次校验。
+	verifyToken func(header http.Header, urlToken string) bool
 }
 
 var (
@@ -56,6 +61,20 @@ var (
 	// 的固定 JSON envelope）。multica envelope 比 GitHub 事件紧凑（不嵌入
 	// repository 对象），8 KiB 足够，沿用 native 的 bodyLimit。
 	multicaAdapter = pushAdapter{name: adapterMultica, parse: parseMulticaPush, bodyLimit: maxBytes}
+	gitlabAdapter  = pushAdapter{
+		name:      adapterGitLab,
+		parse:     parseGitLabPush,
+		bodyLimit: gitlabMaxBytes,
+		// GitLab 额外要求把项目 Secret token 设为 URL token，经 X-Gitlab-Token 回传。
+		verifyToken: verifyGitLabToken,
+	}
+	feishuAdapter = pushAdapter{
+		name:      adapterFeishu,
+		parse:     parseFeishuPush,
+		bodyLimit: maxBytes,
+		// 飞书调用方普遍校验 code==0，附带平台习惯字段降低迁移摩擦。
+		successExtra: map[string]interface{}{"code": 0, "msg": "success"},
+	}
 )
 
 // parseNativePush 是 native 形态的 parse：body 即 pushPayloadReq JSON 本身。
@@ -107,6 +126,14 @@ func firstLine(s string) string {
 		s = s[:i]
 	}
 	return strings.TrimSpace(s)
+}
+
+// isHTTPURL 判断字符串是否是 http(s) URL（大小写不敏感）。用于把外部提供的链接
+// 目标限制到安全 scheme——非 http(s)（如 `javascript:` / `data:`）的「链接」会被降级
+// 为纯文本，杜绝 scheme 注入（#423 review）。
+func isHTTPURL(s string) bool {
+	l := strings.ToLower(strings.TrimSpace(s))
+	return strings.HasPrefix(l, "http://") || strings.HasPrefix(l, "https://")
 }
 
 // oneLine 把多行文本压成单行，避免标题 / 评论里的换行破坏 markdown 链接结构。

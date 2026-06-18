@@ -48,6 +48,8 @@ POST /v1/incoming-webhooks/:webhook_id/:token            # native（本文主体
 POST /v1/incoming-webhooks/:webhook_id/:token/github     # GitHub 事件适配器
 POST /v1/incoming-webhooks/:webhook_id/:token/wecom      # 企业微信群机器人格式适配器
 POST /v1/incoming-webhooks/:webhook_id/:token/multica    # Multica 出站 webhook 适配器
+POST /v1/incoming-webhooks/:webhook_id/:token/gitlab     # GitLab 事件适配器
+POST /v1/incoming-webhooks/:webhook_id/:token/feishu     # 飞书自定义机器人格式适配器
 Content-Type: application/json
 ```
 
@@ -120,10 +122,11 @@ Content-Type: application/json
 - 服务端另有 1MB 的 RichText 硬上限（octo-lib 契约）兜底，但在默认 8KB body cap 下不会
   先触达——它是上调 body cap 后才会成为约束的二级护栏。
 
-## 平台适配器（#297 Phase 3）
+## 平台适配器（#297 Phase 3 / 4）
 
 适配器把第三方平台的原生格式翻译成上面的 native 消息，鉴权/限流/审计与 native 完全
 一致。适配器消息不支持 `username`/`avatar_url` 覆盖（展示身份固定为 webhook 配置）。
+GitHub / 企业微信为 Phase 3，GitLab / 飞书为 Phase 4。
 
 ### GitHub
 
@@ -224,6 +227,58 @@ curl -X POST "$BASE/v1/incoming-webhooks/$WEBHOOK_ID/$TOKEN/multica" \
        "previous_status":"todo"}'
 ```
 
+### GitLab（#297 Phase 4）
+
+```
+POST /v1/incoming-webhooks/:webhook_id/:token/gitlab
+```
+
+在 GitLab 项目 **Settings → Webhooks** 把 URL 配成上述地址。**鉴权除 URL 内的 token 外，
+还须把该 webhook 的「Secret token」字段也设为同一个 token**——GitLab 以 `X-Gitlab-Token`
+头回传，服务端在 URL token 校验通过后再常量时间比对一次；不一致返回 401（落审计
+`reason=token`，便于在 deliveries 里定位配置错误）。
+
+按 `X-Gitlab-Event` 渲染为 markdown，当前渲染子集：
+
+| 事件 | 渲染的动作 | 说明 |
+|------|-----------|------|
+| `Push Hook` | — | 分支 push、建/删分支；最多列 5 条提交 |
+| `Tag Push Hook` | — | 建/删标签 |
+| `Merge Request Hook` | `open` / `merge` / `close` / `reopen` | `update`/`approved` 等刷屏动作跳过 |
+| `Issue Hook` | `open` / `close` / `reopen` | `update` 跳过 |
+| `Note Hook` | 评论（MR / Issue / Commit） | 评论摘要压成单行、截断 300 rune |
+| `Pipeline Hook` | `success` / `failed` / `canceled` | `running`/`pending` 等非终态跳过 |
+
+子集之外的事件/动作返回 200 + `{"skipped":"event"}`（GitLab 侧投递成功、不标红），缺
+`X-Gitlab-Event` 头按 400 `reason=no_event` 拒绝（与 github 同口径，可在 deliveries 里
+与「不在渲染子集」的 200 skip 分开看）。**body 上限独立于 native**：事件 JSON 由平台
+生成，默认 **1MiB**（`DM_INCOMINGWEBHOOK_GITLAB_MAX_BYTES`）。
+
+### 飞书（自定义机器人格式，#297 Phase 4）
+
+```
+POST /v1/incoming-webhooks/:webhook_id/:token/feishu
+```
+
+接受飞书「自定义机器人」的出站消息格式——已配置向飞书机器人推送的工具只需**换 URL**
+即可迁移。成功响应附带 `code=0`/`msg=success`（多数飞书 SDK 以此判定成功）。
+
+> **鉴权说明**：飞书自定义机器人原生的 `timestamp`/`sign`（基于 secret 的防重放 HMAC）
+> 字段被**忽略**，鉴权一律走 URL 内的 token（与 native/wecom 一致，经 #297 确认）。这意味着
+> URL token 是**唯一凭证**——不像 GitLab 还有 `X-Gitlab-Token` 二道闸，URL 泄漏即失防护，
+> 请按密码强度妥善保管、必要时用 regenerate 轮换。
+
+| `msg_type` | 处理 |
+|-----------|------|
+| `text` | → 文本消息（客户端按 markdown 渲染） |
+| `post`（富文本） | 降级 markdown：标题加粗，每行 `text`/`a`(链接)/`at`(@) 内联拼接；`img` 丢弃（image_key 无法转存） |
+| `interactive`（卡片） | 降级 markdown：标题 + `div`/`markdown` 元素文本逐行拼接；按钮/图片等交互元素丢弃 |
+| `image` / `share_chat` 等素材类 | **400 `reason=msg_type`**：素材无法转存，显式失败优于静默丢弃 |
+
+> 高保真卡片渲染不可行，降级策略经 #297 确认（与 WeCom 同一契约）。`post` 刻意走文本
+> 路径而非 RichText：富文本 `text` 块不渲染 markdown，链接会失去可点击性，文本路径反而
+> 更保真，且飞书图文用 image_key 无法转为 RichText 的 URL 图片块。
+
 ## 通用字段与安全
 
 - `username` / `avatar_url`：两种形态通用，服务端裁剪到字节上限（名 64B / 头像 255B）。
@@ -236,7 +291,7 @@ curl -X POST "$BASE/v1/incoming-webhooks/$WEBHOOK_ID/$TOKEN/multica" \
 |------|------|------|
 | 成功 | 200 | `{"status":0,"message_id":<int>}`（wecom 路由额外带 `errcode`/`errmsg`） |
 | 已接收、刻意不投递 | 200 | `{"status":0,"message_id":0,"skipped":"ping"\|"event"}`（仅适配器路由） |
-| 鉴权失败 | 401 | 统一响应，不区分原因（反枚举） |
+| 鉴权失败 | 401 | 统一响应，不区分原因（反枚举）；含 GitLab `X-Gitlab-Token` 与 URL token 不匹配（落审计 `reason=token`） |
 | 限流 | 429 | 带 `Retry-After` |
 | 请求非法 | 400 | `details.reason` ∈ `body`/`json`/`content`/`blocks`/`msg_type`/`no_event`（缺 `X-GitHub-Event` 头） |
 | 体积过大 | 413 | 超 body cap 或富文本 >1MB |
@@ -248,8 +303,8 @@ curl -X POST "$BASE/v1/incoming-webhooks/$WEBHOOK_ID/$TOKEN/multica" \
 需登录态 + 群管理员权限，路径前缀 `/v1/groups/:group_no/incoming-webhooks`。
 
 创建 / 重置（regenerate）响应除历史的 `url`（native 路径）外，还带 `urls` 对象，
-按推送形态给出全部路径（`native` / `github` / `wecom` / `multica`，不含 host，由前端拼接）。
-token 仅在这两处出现一次，list 不回显 token、也不回推送 URL。
+按推送形态给出全部路径（`native` / `github` / `wecom` / `multica` / `gitlab` / `feishu`，
+不含 host，由前端拼接）。token 仅在这两处出现一次，list 不回显 token、也不回推送 URL。
 
 除创建/列出/更新/删除/重置外，Phase 2 新增两个：
 
