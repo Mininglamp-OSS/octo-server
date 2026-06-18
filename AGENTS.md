@@ -215,3 +215,26 @@ middleware, auth, rate limiting, or database migrations.
   new abstractions.
 - Keep changes scoped to the requested behavior and avoid unrelated refactors.
 - Run `gofmt` on edited Go files.
+
+<!-- octospec:begin -->
+## octo-spec engineering standard
+
+This repo carries shared engineering rules in `.octospec/`, readable by any
+coding agent working in this checkout (Claude Code, Codex, OpenClaw, or others).
+
+- **Rules**: `.octospec/rules/` (+ index `.octospec/rules/_index.yaml`) — the
+  source of truth for this repo's conventions: error-handling, rate-limit,
+  space-isolation, testing, commit-style.
+- **Before changing load-bearing behavior**, read the rules whose `inject_when`
+  matches the files you touch.
+- **Tasks**: capture goal / load-bearing list / out-of-scope / acceptance in
+  `.octospec/tasks/<slug>/brief.md`.
+- **PRs**: fill Linked Spec + the COMPREHENSION three questions for load-bearing,
+  architectural, or P0 changes; trivial changes (typo/docs/lint/config) are exempt.
+
+Claude Code users also have `/octospec-plan|go|check|finish` slash commands
+(committed under `.claude/commands/`). Other agents read the same `.octospec/`
+files directly.
+
+This region is managed by octospec; edit outside the markers.
+<!-- octospec:end -->
