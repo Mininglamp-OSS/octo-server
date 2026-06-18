@@ -232,6 +232,24 @@ func fallbackSyntheticSenderName(ctx *config.Context, fromUID, name string) (res
 	return resolved, true
 }
 
+// repairEmptyCachedName 处理"缓存命中但 name 为空"的存量场景：修复前已对某合成发送者
+// （如 iwh_）缓存过空名的条目，命中后会直接返回空名、绕过 miss 分支的兜底，导致存量
+// iwh_ 发送者在旧缓存 TTL 到期前仍显示空发件人名。这里在命中时同样补一次兜底解析，并
+// 就地修复缓存的 name 字段（只改 name，不动 remark/name_in_group，也不重置 TTL），根治
+// 存量、无需等旧 TTL。解析失败或无人处理则保持空名（下次再试），不影响本次推送。
+func repairEmptyCachedName(ctx *config.Context, key, fromUID, name string) string {
+	if name != "" {
+		return name
+	}
+	resolved, cacheable := fallbackSyntheticSenderName(ctx, fromUID, name)
+	if cacheable && resolved != "" {
+		if err := ctx.GetRedisConn().Hset(key, "name", resolved); err != nil {
+			log.Warn("修复发送者名缓存失败", zap.String("key", key), zap.Error(err))
+		}
+	}
+	return resolved
+}
+
 func getAndCacheShowNameForFromUID(msgResp msgOfflineNotify, ctx *config.Context) (string, error) {
 	db := getWebhookDB(ctx)
 
@@ -248,6 +266,7 @@ func getAndCacheShowNameForFromUID(msgResp msgOfflineNotify, ctx *config.Context
 		if len(nameMap) > 0 { // 存在缓存，直接取出
 			name = nameMap["name"]
 			remark = nameMap["remark"]
+			name = repairEmptyCachedName(ctx, key, msgResp.FromUID, name)
 		} else { // 不存在缓存，从DB获取，然后再缓存
 			name, remark, _, err = db.GetThirdName(msgResp.FromUID, msgResp.ToUID, "")
 			if err != nil {
@@ -279,6 +298,7 @@ func getAndCacheShowNameForFromUID(msgResp msgOfflineNotify, ctx *config.Context
 			name = nameMap["name"]
 			remark = nameMap["remark"]
 			nameInGroup = nameMap["name_in_group"]
+			name = repairEmptyCachedName(ctx, key, msgResp.FromUID, name)
 		} else { // 不存在缓存，从DB获取，然后再缓存
 			name, remark, nameInGroup, err = db.GetThirdName(msgResp.FromUID, msgResp.ToUID, msgResp.ChannelID)
 			if err != nil {
