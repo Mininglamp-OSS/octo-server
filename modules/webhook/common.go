@@ -212,6 +212,26 @@ func getWebhookDB(ctx *config.Context) *DB {
 }
 
 // 获取和缓存发送者的显示名称
+// fallbackSyntheticSenderName 在 GetThirdName 取不到常用名（name 为空）时，尝试解析合成
+// 发送者的展示名。典型场景：incoming webhook 的虚拟发送者（iwh_xxx）在 user 表里没有行，
+// 直查 user 表得到空名，推送就没有发件人名字。这里复用 user 模块基于 BussDataSource 的
+// 解析器(不在推送层硬编码 iwh_ 前缀)。
+//
+// 返回 cacheable 表示结果是否可写入缓存：解析发生瞬时故障（datasource 报错）时返回原值
+// 且 cacheable=false，让下一次推送重试，避免把空名冻结到 TTL（最长 NameCacheExpire）。
+// 解析成功（含"无人处理"返回空名，如已删除 webhook）则 cacheable=true。失败不影响推送。
+func fallbackSyntheticSenderName(ctx *config.Context, fromUID, name string) (resolved string, cacheable bool) {
+	if name != "" {
+		return name, true
+	}
+	resolved, err := user.ResolveWebhookDisplayName(ctx, fromUID)
+	if err != nil {
+		log.Warn("解析合成发送者名失败", zap.String("from_uid", fromUID), zap.Error(err))
+		return name, false
+	}
+	return resolved, true
+}
+
 func getAndCacheShowNameForFromUID(msgResp msgOfflineNotify, ctx *config.Context) (string, error) {
 	db := getWebhookDB(ctx)
 
@@ -233,15 +253,19 @@ func getAndCacheShowNameForFromUID(msgResp msgOfflineNotify, ctx *config.Context
 			if err != nil {
 				return "", err
 			}
-			err = ctx.GetRedisConn().Hmset(key, "name", name, "remark", remark)
-			if err != nil {
-				log.Error("缓存名字失败！", zap.Error(err))
-				return "", err
-			}
-			err = ctx.GetRedisConn().Expire(key, ctx.GetConfig().Cache.NameCacheExpire)
-			if err != nil {
-				log.Error("设置过期时间失败！", zap.String("key", key), zap.Error(err))
-				return "", err
+			var cacheable bool
+			name, cacheable = fallbackSyntheticSenderName(ctx, msgResp.FromUID, name)
+			if cacheable {
+				err = ctx.GetRedisConn().Hmset(key, "name", name, "remark", remark)
+				if err != nil {
+					log.Error("缓存名字失败！", zap.Error(err))
+					return "", err
+				}
+				err = ctx.GetRedisConn().Expire(key, ctx.GetConfig().Cache.NameCacheExpire)
+				if err != nil {
+					log.Error("设置过期时间失败！", zap.String("key", key), zap.Error(err))
+					return "", err
+				}
 			}
 		}
 	} else {
@@ -260,15 +284,19 @@ func getAndCacheShowNameForFromUID(msgResp msgOfflineNotify, ctx *config.Context
 			if err != nil {
 				return "", err
 			}
-			err = ctx.GetRedisConn().Hmset(key, "name", name, "remark", remark, "name_in_group", nameInGroup)
-			if err != nil {
-				log.Error("缓存名字失败！", zap.Error(err))
-				return "", err
-			}
-			err = ctx.GetRedisConn().Expire(key, ctx.GetConfig().Cache.NameCacheExpire)
-			if err != nil {
-				log.Error("设置过期时间失败！", zap.String("key", key), zap.Error(err))
-				return "", err
+			var cacheable bool
+			name, cacheable = fallbackSyntheticSenderName(ctx, msgResp.FromUID, name)
+			if cacheable {
+				err = ctx.GetRedisConn().Hmset(key, "name", name, "remark", remark, "name_in_group", nameInGroup)
+				if err != nil {
+					log.Error("缓存名字失败！", zap.Error(err))
+					return "", err
+				}
+				err = ctx.GetRedisConn().Expire(key, ctx.GetConfig().Cache.NameCacheExpire)
+				if err != nil {
+					log.Error("设置过期时间失败！", zap.String("key", key), zap.Error(err))
+					return "", err
+				}
 			}
 		}
 

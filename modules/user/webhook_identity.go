@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
+	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/model"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/register"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
@@ -45,7 +46,15 @@ const (
 // datasource 用 register.ErrDatasourceNotProcess 表示"不处理"，用包装后的真实 error
 // 表示故障（见 incomingwebhook 的 newChannelGetDatasource），这里据此区分。
 func (u *User) resolveWebhookChannel(uid, loginUID string) (*model.ChannelResp, error) {
-	for _, m := range register.GetModules(u.ctx) {
+	return resolveWebhookChannelVia(u.ctx, uid, loginUID)
+}
+
+// resolveWebhookChannelVia 是 resolveWebhookChannel 的 ctx 版实现，供 *User 的 HTTP
+// 处理器与包级 ResolveWebhookDisplayName（推送链路无 *User 实例，只有 ctx）共用，避免
+// 复制 datasource 遍历与 (resp,nil)/(nil,nil)/(nil,err) 的错误语义。语义见
+// resolveWebhookChannel 的注释。
+func resolveWebhookChannelVia(ctx *config.Context, uid, loginUID string) (*model.ChannelResp, error) {
+	for _, m := range register.GetModules(ctx) {
 		if m.BussDataSource.ChannelGet == nil {
 			continue
 		}
@@ -61,6 +70,23 @@ func (u *User) resolveWebhookChannel(uid, loginUID string) (*model.ChannelResp, 
 		}
 	}
 	return nil, nil
+}
+
+// ResolveWebhookDisplayName 返回合成发送者（如 incoming webhook 的 iwh_xxx，user 表里
+// 没有对应行）的展示名，通过 BussDataSource.ChannelGet 注册链解析。离线推送链路用它兜底
+// 渲染发送者名，避免 webhook 消息推送出来没有发件人名字。
+//
+// 返回 ("", nil) 表示没有任何模块处理该 uid（不是 webhook，或已删除）；("", err) 仅在
+// datasource 真实故障时返回。调用方应把空名当作"无兜底"，把 err 当作可记录的非致命错误。
+func ResolveWebhookDisplayName(ctx *config.Context, uid string) (string, error) {
+	ch, err := resolveWebhookChannelVia(ctx, uid, "")
+	if err != nil {
+		return "", err
+	}
+	if ch == nil {
+		return "", nil
+	}
+	return ch.Name, nil
 }
 
 // newWebhookUserDetailResp 把 webhook 频道详情合成为最小化用户详情，供 /v1/users/:uid
