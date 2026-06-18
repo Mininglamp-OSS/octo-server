@@ -152,3 +152,23 @@ Tests require MySQL + Redis + WuKongIM running (see CI or `make env-test` in dmw
 - Space isolation: handlers that access user data must go through Space middleware
 - Bot API (`modules/bot_api/`): validate bot ownership before operations
 - Thread (`modules/thread/`): verify parent channel access
+
+<!-- octospec:begin -->
+## octo-spec workflow
+
+This repo participates in the [octo-spec](https://github.com/Mininglamp-OSS/octo-spec)
+engineering standard. Shared rules live in `.octospec/`.
+
+- **Rules**: `.octospec/rules/` — the source of truth for this repo's conventions
+  (error-handling, rate-limit, space-isolation, testing, commit-style). The global
+  "constitution" rules are pulled into git-ignored `.octospec/_global/` via
+  `octospec-sync` (pin in `.octospec/manifest.yaml`).
+- **Before changing load-bearing behavior**: read the rules whose `inject_when`
+  matches the files you are touching (see `.octospec/rules/_index.yaml`).
+- **Tasks**: capture goal / load-bearing list / out-of-scope / acceptance in
+  `.octospec/tasks/<slug>/brief.md` (template: `tasks/_brief.template.md`).
+- **PRs**: fill Linked Spec + the COMPREHENSION three questions for load-bearing,
+  architectural, or P0 changes. Trivial changes (typo/docs/lint/config) are exempt.
+
+This region is managed by octospec-sync; edit outside the markers.
+<!-- octospec:end -->

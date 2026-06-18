@@ -1,0 +1,42 @@
+# Rule index for octo-server .octospec/rules/
+# Mirrors each rule's frontmatter so tooling can resolve injection without
+# parsing every file.
+#
+# Resolution semantics:
+#   - id is globally unique (including inherited global rules).
+#   - a repo-tier rule with the same id overrides the global one.
+#   - inject_when = paths glob OR touches tag (union); injected once.
+#   - over budget: keep load_bearing first, then priority desc; truncated rules
+#     inject only their summary line.
+
+rules:
+  - id: error-handling
+    priority: 85
+    load_bearing: true
+    inject_when:
+      paths: ["modules/**/*.go", "base/**/*.go", "pkg/errcode/**", "pkg/**/httperr/**"]
+      touches: ["error-response", "i18n", "wire-contract"]
+  - id: rate-limit
+    priority: 80
+    load_bearing: true
+    inject_when:
+      paths: ["modules/**/*.go", "base/common/service_*.go", "internal/**/*.go"]
+      touches: ["rate-limit", "throttle"]
+  - id: space-isolation
+    priority: 92
+    load_bearing: true
+    inject_when:
+      paths: ["modules/**/*.go", "internal/**/*.go"]
+      touches: ["space", "isolation", "auth", "bot-api", "thread", "acl"]
+  - id: testing
+    priority: 70
+    load_bearing: false
+    inject_when:
+      paths: ["modules/**/*_test.go", "**/*_test.go"]
+      touches: ["test", "testing"]
+  - id: commit-style
+    priority: 60
+    load_bearing: false
+    inject_when:
+      paths: ["**"]
+      touches: ["commit", "git"]
