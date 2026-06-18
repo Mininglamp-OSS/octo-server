@@ -110,3 +110,16 @@ func oneLine(s string) string {
 	s = strings.ReplaceAll(s, "\r", " ")
 	return strings.TrimSpace(s)
 }
+
+// mdLinkTextEscaper 转义会破坏 markdown 链接结构的字符：放进 `[text](url)` 的文本里
+// 出现 `]` 会提前闭合链接、`[` 会引入嵌套——而 PR / issue 标题、评论、release 名乃至
+// 仓库名都来自公开仓库的外部输入，必须转义后再拼进链接文本，否则攻击者可用一个带 `]`
+// 的标题把后续 URL 暴露成可见文本甚至错位渲染（PR #330 review 跟进）。`\` 先于括号
+// 转义，避免二次转义。
+var mdLinkTextEscaper = strings.NewReplacer(`\`, `\\`, `[`, `\[`, `]`, `\]`)
+
+// mdLinkText 把外部文本钳到 max rune 后转义为安全的 markdown 链接文本。先钳后转义：
+// 钳约束的是可见长度，转义引入的反斜杠不该挤占可见字符预算。
+func mdLinkText(s string, max int) string {
+	return mdLinkTextEscaper.Replace(clipRunes(oneLine(s), max))
+}

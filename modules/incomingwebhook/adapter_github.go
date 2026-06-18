@@ -37,15 +37,24 @@ const maxRenderedCommits = 5
 const (
 	envGitHubBodyMax      = "DM_INCOMINGWEBHOOK_GITHUB_MAX_BYTES"
 	defaultGitHubMaxBytes = 1 << 20 // 1MiB
+	// GitHub 自身把单次 webhook delivery 的 payload 上限定在 25MB，超过这个值的配置
+	// 必然是手误（多打几个 0）。给 env 钳一个硬顶，避免一个被误填的巨大值把单请求的
+	// body 缓冲放大到危险量级——上限本就是防御性的，不该因配置失误反而失去防御
+	//（PR #330 review 跟进）。
+	maxGitHubMaxBytes = 25 << 20 // 25MiB
 )
 
 func githubMaxBytes() int {
+	n := defaultGitHubMaxBytes
 	if v := os.Getenv(envGitHubBodyMax); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return n
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			n = parsed
 		}
 	}
-	return defaultGitHubMaxBytes
+	if n > maxGitHubMaxBytes {
+		return maxGitHubMaxBytes
+	}
+	return n
 }
 
 type ghUser struct {
@@ -127,8 +136,11 @@ func parseGitHubPush(header http.Header, body []byte) (*pushPayloadReq, string, 
 	event := strings.TrimSpace(header.Get("X-GitHub-Event"))
 	if event == "" {
 		// 不带事件头的请求不可能来自 GitHub——按非法请求拒绝而非静默跳过，
-		// 让误把 native 流量打到 /github 后缀的调用方立刻发现配置错误。
-		return nil, "", "event"
+		// 让误把 native 流量打到 /github 后缀的调用方立刻发现配置错误。用独立的
+		// no_event 与「事件在渲染子集之外」的 200 skipped(reason=event) 区分开：
+		// 二者语义不同（前者是配置错误，后者是正常但不渲染），deliveries 里只看
+		// reason 即可分辨，不必再去比对 status/http_status（PR #330 review 跟进）。
+		return nil, "", "no_event"
 	}
 
 	var content string
@@ -227,7 +239,7 @@ func renderGitHubPullRequest(body []byte) (string, error) {
 	}
 	return ghWithRepo(fmt.Sprintf("**%s** %s pull request [#%d %s](%s)",
 		ghLogin(ev.Sender), verb, ev.PullRequest.Number,
-		clipRunes(oneLine(ev.PullRequest.Title), 200), ev.PullRequest.HTMLURL),
+		mdLinkText(ev.PullRequest.Title, 200), ev.PullRequest.HTMLURL),
 		ev.Repository), nil
 }
 
@@ -243,7 +255,7 @@ func renderGitHubIssues(body []byte) (string, error) {
 	}
 	return ghWithRepo(fmt.Sprintf("**%s** %s issue [#%d %s](%s)",
 		ghLogin(ev.Sender), ev.Action, ev.Issue.Number,
-		clipRunes(oneLine(ev.Issue.Title), 200), ev.Issue.HTMLURL),
+		mdLinkText(ev.Issue.Title, 200), ev.Issue.HTMLURL),
 		ev.Repository), nil
 }
 
@@ -257,7 +269,7 @@ func renderGitHubIssueComment(body []byte) (string, error) {
 	}
 	line := ghWithRepo(fmt.Sprintf("**%s** commented on [#%d %s](%s)",
 		ghLogin(ev.Sender), ev.Issue.Number,
-		clipRunes(oneLine(ev.Issue.Title), 200), ev.Comment.HTMLURL),
+		mdLinkText(ev.Issue.Title, 200), ev.Comment.HTMLURL),
 		ev.Repository)
 	if snippet := clipRunes(oneLine(ev.Comment.Body), 300); snippet != "" {
 		line += "\n> " + snippet
@@ -278,7 +290,7 @@ func renderGitHubRelease(body []byte) (string, error) {
 		title = ev.Release.TagName
 	}
 	return ghWithRepo(fmt.Sprintf("**%s** published release [%s](%s)",
-		ghLogin(ev.Sender), clipRunes(oneLine(title), 200), ev.Release.HTMLURL),
+		ghLogin(ev.Sender), mdLinkText(title, 200), ev.Release.HTMLURL),
 		ev.Repository), nil
 }
 

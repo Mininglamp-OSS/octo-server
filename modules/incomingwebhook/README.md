@@ -147,13 +147,16 @@ POST /v1/incoming-webhooks/:webhook_id/:token/github
 
 **子集之外的事件/动作返回 200 + `{"skipped":"event"}`**（GitHub 侧显示投递成功、
 不标红；deliveries 里以 `status=3` 可见），缺 `X-GitHub-Event` 头则按 400
-`reason=event` 拒绝。事件里的超长字段（标题/提交信息/评论）服务端截断，GitHub 流量
-不会触发 413。
+`reason=no_event` 拒绝——配置错误与「正常但不渲染」用不同 reason 区分，deliveries 里
+只看 reason 即可分辨。事件里的超长字段（标题/提交信息/评论）服务端截断；GitHub 可控的
+链接文本（PR/issue/release 标题）里的 `]`/`[` 会被转义，防止破坏渲染出的链接。GitHub
+流量不会触发 413。
 
 **body 上限独立于 native**：GitHub 事件 JSON 由平台生成（真实 push/PR 事件普遍
 >8KiB，发送方无法修短），github 路由的请求体上限默认 **1MiB**
-（`DM_INCOMINGWEBHOOK_GITHUB_MAX_BYTES`）；native/wecom 的 body 由调用方编写，
-仍是 8KiB。该读取发生在 token 鉴权 + per-webhook 限流之后，不构成放大面。
+（`DM_INCOMINGWEBHOOK_GITHUB_MAX_BYTES`，上限钳到 25MiB 硬顶防手误巨值）；native/wecom
+的 body 由调用方编写，仍是 8KiB。该读取发生在 token 鉴权 + per-webhook 限流之后，不构成
+放大面。
 
 ### 企业微信（WeCom 群机器人格式）
 
@@ -168,7 +171,7 @@ POST /v1/incoming-webhooks/:webhook_id/:token/wecom
 | `msgtype` | 处理 |
 |-----------|------|
 | `text` / `markdown` / `markdown_v2` | → 文本消息（客户端按 markdown 渲染）；`mentioned_list`/`mentioned_mobile_list` 降级丢弃 |
-| `news` | 降级 markdown：每篇文章「标题链接 + 描述」一段；`picurl` 丢弃 |
+| `news` | 降级 markdown：每篇文章「标题链接 + 描述」一段；`picurl` 丢弃。建议单条 `news` 文章数控制在 **15–20 篇以内**，避免拼接后超过 4000 rune 的语义上限被 413 拒绝 |
 | `template_card` | 降级 markdown：主标题 + 描述 + 副标题 + 跳转链接；按钮等交互元素丢弃 |
 | `image` / `file` / `voice` 等素材类 | **400 `reason=msg_type`**：base64/media_id 素材无法转存，显式失败优于静默丢弃 |
 
@@ -196,7 +199,7 @@ curl -X POST "$BASE/v1/incoming-webhooks/$WEBHOOK_ID/$TOKEN/wecom" \
 | 已接收、刻意不投递 | 200 | `{"status":0,"message_id":0,"skipped":"ping"\|"event"}`（仅适配器路由） |
 | 鉴权失败 | 401 | 统一响应，不区分原因（反枚举） |
 | 限流 | 429 | 带 `Retry-After` |
-| 请求非法 | 400 | `details.reason` ∈ `body`/`json`/`content`/`blocks`/`msg_type`/`event` |
+| 请求非法 | 400 | `details.reason` ∈ `body`/`json`/`content`/`blocks`/`msg_type`/`no_event`（缺 `X-GitHub-Event` 头） |
 | 体积过大 | 413 | 超 body cap 或富文本 >1MB |
 | 投递失败 | 502 | 下游发送失败 |
 | 功能停用 | 404 | 全局开关 `incomingwebhook.enabled=0` |

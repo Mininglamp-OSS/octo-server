@@ -126,7 +126,7 @@ func TestIncomingWebhookRespondHelpers(t *testing.T) {
 // legacy {msg,status} shape, so an e2e body never carries error.details — see the
 // note in richtext_push_test.go. No DB/Redis needed; this only exercises the renderer.
 func TestPushPayloadInvalidSurfacesReason(t *testing.T) {
-	for _, reason := range []string{"blocks", "msg_type", "content", "json", "event"} {
+	for _, reason := range []string{"blocks", "msg_type", "content", "json", "no_event"} {
 		t.Run(reason, func(t *testing.T) {
 			r := iwhHelperHarness(func(c *wkhttp.Context) { pushPayloadInvalid(c, reason) })
 			req := httptest.NewRequest(http.MethodGet, "/probe", nil)

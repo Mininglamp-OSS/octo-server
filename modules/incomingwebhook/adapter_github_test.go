@@ -3,6 +3,7 @@ package incomingwebhook
 import (
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -26,7 +27,9 @@ func TestParseGitHubPush_HeaderGate(t *testing.T) {
 		req, skip, invalid := parseGitHubPush(http.Header{}, []byte(`{}`))
 		assert.Nil(t, req)
 		assert.Empty(t, skip)
-		assert.Equal(t, "event", invalid)
+		// 缺事件头是配置错误 → 独立 no_event，与「渲染子集之外」的 200 skipped(event)
+		// 分开，deliveries 里只看 reason 即可分辨二者（PR #330 review 跟进）。
+		assert.Equal(t, "no_event", invalid)
 	})
 	t.Run("ping is skipped", func(t *testing.T) {
 		req, skip, invalid := parseGitHubPush(ghHeader("ping"), []byte(`{"zen":"Design for failure."}`))
@@ -105,9 +108,32 @@ func TestParseGitHubPush_NoCommitRefUpdateSkipped(t *testing.T) {
 }
 
 // GitHub 事件 body 是平台生成的（普遍 >8KiB 且发送方无法修短），其上限必须宽于
-// native 的调用方编写上限——钉住 review 阻断项的修复不被回退。
+// native 的调用方编写上限——钉住 review 阻断项的修复不被回退。两个 cap 的 env 都用
+// t.Setenv 清空钉到各自默认值，结果不再依赖宿主机的环境变量（PR #330 review 跟进）。
 func TestGitHubMaxBytes_ExceedsNativeCap(t *testing.T) {
+	t.Setenv(envBodyMax, "")
+	t.Setenv(envGitHubBodyMax, "")
 	assert.Greater(t, githubMaxBytes(), maxBytes())
+	assert.Equal(t, defaultGitHubMaxBytes, githubMaxBytes())
+}
+
+// env 被手误填成天文数字时，githubMaxBytes 钳到 25MiB 硬顶，不让单请求 body 缓冲被
+// 放大到危险量级；合理的自定义值（如 4MiB）仍原样生效（PR #330 review 跟进）。
+func TestGitHubMaxBytes_ClampsHugeEnv(t *testing.T) {
+	t.Run("fat-fingered huge value is clamped", func(t *testing.T) {
+		t.Setenv(envGitHubBodyMax, "999999999999")
+		assert.Equal(t, maxGitHubMaxBytes, githubMaxBytes())
+	})
+	t.Run("reasonable custom value passes through", func(t *testing.T) {
+		t.Setenv(envGitHubBodyMax, strconv.Itoa(4<<20))
+		assert.Equal(t, 4<<20, githubMaxBytes())
+	})
+	t.Run("invalid / non-positive falls back to default", func(t *testing.T) {
+		t.Setenv(envGitHubBodyMax, "-1")
+		assert.Equal(t, defaultGitHubMaxBytes, githubMaxBytes())
+		t.Setenv(envGitHubBodyMax, "garbage")
+		assert.Equal(t, defaultGitHubMaxBytes, githubMaxBytes())
+	})
 }
 
 func TestParseGitHubPush_CommitListTruncated(t *testing.T) {
@@ -203,6 +229,54 @@ func TestParseGitHubPush_Release(t *testing.T) {
 		assert.Nil(t, req)
 		assert.Equal(t, "event", skip)
 	})
+}
+
+// 公开仓库可控的链接文本（PR/issue/release 标题）里的 `]`/`[` 必须转义，否则一个
+// 形如 `evil]( ` 的标题会提前闭合 `[...]` 把后续 URL 暴露成可见文本甚至错位渲染
+//（PR #330 review 跟进）。
+func TestParseGitHubPush_LinkTextEscaped(t *testing.T) {
+	// 标题里塞入会破坏链接结构的字符；断言渲染结果里这些字符已被反斜杠转义，
+	// 且原始的 URL 边界 `](` 不会被标题内容提前引入。
+	const evil = `pwn](http://evil) [x`
+	cases := []struct {
+		name  string
+		event string
+		body  string
+		url   string
+	}{
+		{
+			"pull_request title", "pull_request",
+			fmt.Sprintf(`{"action":"opened","pull_request":{"number":1,"title":%q,"html_url":"https://safe/pr/1"},"sender":{"login":"a"}}`, evil),
+			"https://safe/pr/1",
+		},
+		{
+			"issue title", "issues",
+			fmt.Sprintf(`{"action":"opened","issue":{"number":2,"title":%q,"html_url":"https://safe/i/2"},"sender":{"login":"a"}}`, evil),
+			"https://safe/i/2",
+		},
+		{
+			"release name", "release",
+			fmt.Sprintf(`{"action":"published","release":{"tag_name":"v1","name":%q,"html_url":"https://safe/rel"},"sender":{"login":"a"}}`, evil),
+			"https://safe/rel",
+		},
+		{
+			"issue_comment issue title", "issue_comment",
+			fmt.Sprintf(`{"action":"created","issue":{"number":3,"title":%q},"comment":{"html_url":"https://safe/c","body":"hi"},"sender":{"login":"a"}}`, evil),
+			"https://safe/c",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, skip, invalid := parseGitHubPush(ghHeader(tc.event), []byte(tc.body))
+			require.NotNil(t, req, "skip=%q invalid=%q", skip, invalid)
+			assert.Contains(t, req.Content, `\]`, "closing bracket in title must be escaped")
+			assert.Contains(t, req.Content, `\[`, "opening bracket in title must be escaped")
+			// 真正的链接边界紧贴受控 URL，标题没能提前注入一个 `](`。
+			assert.Contains(t, req.Content, "]("+tc.url+")")
+			// 标题里紧跟 "pwn" 的 `]` 已被转义为 `\]`，不再是未转义的链接闭合。
+			assert.NotContains(t, req.Content, "pwn](", "title's closing bracket must be escaped, not left raw")
+		})
+	}
 }
 
 // 平台事件里的超长字段被钳制，绝不让 GitHub 流量撞 413（调用方无法修短一个事件）。

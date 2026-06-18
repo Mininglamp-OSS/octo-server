@@ -43,7 +43,10 @@ var (
 	// JSON, empty content, malformed rich-text blocks, an unknown msg_type, or a
 	// platform-adapter request that cannot be translated (missing X-GitHub-Event
 	// header, unsupported WeCom msgtype). The offending stage is surfaced via
-	// Details["reason"] (body / json / content / blocks / msg_type / event).
+	// Details["reason"] (body / json / content / blocks / msg_type / no_event).
+	// Note: no_event is the missing-X-GitHub-Event 400; a GitHub event that is
+	// merely outside the rendered subset is NOT an error — it answers 200 with
+	// skipped=event (see modules/incomingwebhook/adapter_github.go).
 	ErrIncomingWebhookPushPayloadInvalid = register(codes.Code{
 		ID:             "err.server.incomingwebhook.push_payload_invalid",
 		HTTPStatus:     http.StatusBadRequest,
@@ -52,7 +55,11 @@ var (
 	})
 
 	// ErrIncomingWebhookPushPayloadTooLarge (413) — body exceeds the configured
-	// byte cap (DM_INCOMINGWEBHOOK_MAX_BYTES).
+	// per-shape byte cap: native/wecom use DM_INCOMINGWEBHOOK_MAX_BYTES (8KiB
+	// default, caller-authored bodies), GitHub events use the wider
+	// DM_INCOMINGWEBHOOK_GITHUB_MAX_BYTES (1MiB default, clamped to 25MiB; the
+	// platform-generated event JSON the sender cannot shorten). Rich-text payloads
+	// also 413 here when finalized output exceeds the richtext size limit.
 	ErrIncomingWebhookPushPayloadTooLarge = register(codes.Code{
 		ID:             "err.server.incomingwebhook.push_payload_too_large",
 		HTTPStatus:     http.StatusRequestEntityTooLarge,
