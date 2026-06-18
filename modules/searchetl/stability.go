@@ -18,3 +18,21 @@ func stablePrefix(rows []*srcMessageRow, cutoff int64) []*srcMessageRow {
 	}
 	return rows
 }
+
+// firstNonAscendingByID 返回首个**未严格按 id 升序**的行下标（即 rows[i].ID <= rows[i-1].ID），
+// 无违规返回 -1。
+//
+// 期序 debug 断言（YUJ-5012 票4a / ReviewBot §4 额外发现）：stablePrefix 与游标推进的全部
+// 无空洞/无漏读保证都建立在「读出的批严格按 id 升序」这一前提上（readStableBatchTx 的
+// `ORDER BY id ASC`）。若索引/DB 版本变更或 SQL 改写悄悄破坏了返回序，stablePrefix 会在错误
+// 位置截断 → 静默漏读，且 message_id 幂等也补不回（这些行从未被 produce）。本函数是把该前提
+// 从「隐式假设」变成「可观测的运行期 tripwire」：调用方在 debug 期校验并大声告警，不改正确性
+// 路径（纯检测）。O(n) 线性扫描，开销可忽略。
+func firstNonAscendingByID(rows []*srcMessageRow) int {
+	for i := 1; i < len(rows); i++ {
+		if rows[i].ID <= rows[i-1].ID {
+			return i
+		}
+	}
+	return -1
+}

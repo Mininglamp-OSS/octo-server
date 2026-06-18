@@ -174,6 +174,17 @@ func runChunk(ctx context.Context, store chunkStore, sink chunkSink, table strin
 		return chunkPlan{}, 0, nil
 	}
 
+	// 期序 debug 断言（票4a / ReviewBot §4）：stablePrefix 的无空洞截断依赖「批严格按 id 升序」
+	// （readStableBatchTx 的 ORDER BY id ASC）。若索引/DB 版本变更破坏返回序，会在错误位置截断
+	// → 静默漏读。这里只检测 + 大声告警（不改正确性路径），把隐式前提变成可观测 tripwire。
+	if bad := firstNonAscendingByID(rows); bad >= 0 {
+		lg.Warn("searchetl: stable batch not strictly ascending by id — index/DB version may have broken return order (silent missed-read risk)",
+			zap.String("table", table),
+			zap.Int("at_index", bad),
+			zap.Int64("prev_id", rows[bad-1].ID),
+			zap.Int64("curr_id", rows[bad].ID))
+	}
+
 	plan := planChunk(rows, cutoff)
 	if !plan.advanced {
 		// 队首即未稳定：本轮不推进，等其落库满 lag。返回 0 让调用方停止本分片。

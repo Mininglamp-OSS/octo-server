@@ -59,3 +59,34 @@ func TestStablePrefix_Empty(t *testing.T) {
 		t.Fatalf("want 0 on empty, got %d", len(got))
 	}
 }
+
+// TestFirstNonAscendingByID_StrictAscending 严格升序 → 无违规（返回 -1）。
+func TestFirstNonAscendingByID_StrictAscending(t *testing.T) {
+	rows := []*srcMessageRow{row(1, 0), row(2, 0), row(5, 0), row(9, 0)}
+	if got := firstNonAscendingByID(rows); got != -1 {
+		t.Fatalf("strictly ascending must return -1, got %d", got)
+	}
+}
+
+// TestFirstNonAscendingByID_DetectsViolation 期序断言核心：返回序破坏（回退或重复 id）→
+// 报告首个违规下标。防索引/DB 版本变更悄悄破坏 ORDER BY id ASC 导致 stablePrefix 错位漏读。
+func TestFirstNonAscendingByID_DetectsViolation(t *testing.T) {
+	// id 在下标 2 处回退（5 -> 3）。
+	if got := firstNonAscendingByID([]*srcMessageRow{row(1, 0), row(5, 0), row(3, 0)}); got != 2 {
+		t.Fatalf("descending at index 2 must be reported, got %d", got)
+	}
+	// 重复 id（非严格升序）也算违规。
+	if got := firstNonAscendingByID([]*srcMessageRow{row(1, 0), row(2, 0), row(2, 0)}); got != 2 {
+		t.Fatalf("duplicate id at index 2 must be reported, got %d", got)
+	}
+}
+
+// TestFirstNonAscendingByID_ShortInputs 空/单行无违规。
+func TestFirstNonAscendingByID_ShortInputs(t *testing.T) {
+	if got := firstNonAscendingByID(nil); got != -1 {
+		t.Fatalf("nil must return -1, got %d", got)
+	}
+	if got := firstNonAscendingByID([]*srcMessageRow{row(7, 0)}); got != -1 {
+		t.Fatalf("single row must return -1, got %d", got)
+	}
+}
