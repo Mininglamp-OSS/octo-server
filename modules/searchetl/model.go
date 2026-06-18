@@ -9,6 +9,7 @@ package searchetl
 type srcMessageRow struct {
 	ID          int64
 	MessageID   string
+	MessageSeq  uint64 // 频道内消息序号（message.message_seq BIGINT 列，全精度）——reader「清空会话」channel_offset gate 依赖；契约 v2 字段亦为 uint64
 	FromUID     string
 	ChannelID   string
 	ChannelType uint8

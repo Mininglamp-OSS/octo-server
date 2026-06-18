@@ -28,13 +28,21 @@ const (
 //
 // P1-d 规则：
 //   - Signal 加密（setting 的 Signal 位 或 signal 列为真）→ payload 非明文 JSON，
-//     直接 raw_excluded（不尝试解析，避免把密文当损坏 JSON 误判进 DLQ）。
+//     直接 raw_excluded（不尝试解析，避免把密文当损坏 JSON 误判进 DLQ）。spaceId/visibles
+//     留空走 reader fail-closed（安全：正文本就 raw_excluded，不可检索）。
 //   - 非 Signal → payload 应是明文 JSON。解析失败（本应可解析却失败）→ DLQ。
 //   - 解析成功后按 type 三态（float64/int/json.Number，复用 message.CoerceTextPayloadContent
 //     的兼容口径）取 content：
 //       · type=Text 且 content 为 string → 取该 string 作正文。
 //       · 非 Text 或 content 非 string（媒体/富文本/结构化对象）→ 本期保守 raw_excluded
 //         （阶段 4+ 可细化为序列化可检索文本，契约字段不变）。
+//
+// 🔴 v2 富化 + fail-closed 可见性（防 #1124 重演）：非加密消息额外用 octo-lib 共享的
+// searchmsg.ExtractVisibility 从 payload 抽 SpaceID/Visibles 填进契约 v2 字段。一旦可见性
+// 无法可信解析（payload 非 JSON 对象、visibles 键在却 unparseable 或 valid-but-empty）→
+// **整条落 DLQ**，绝不写空 Visibles —— 否则 reader(visibility.go) 把空 visibles 当 fail-OPEN
+// （普通成员搜出「仅指定成员可见」的群定向系统消息）。MessageSeq 从 message.message_seq 列取。
+// producer 与 backfill 共用同一 ExtractVisibility + 同一组 fail-closed 向量锁口径（验收门 ii）。
 //
 // 返回的 Message 已填 SchemaVersion / Source / 可见性字段；outcome 决定投正文 topic 还是 DLQ。
 func extractMessage(row *srcMessageRow) (searchmsg.Message, extractOutcome) {
@@ -46,11 +54,13 @@ func extractMessage(row *srcMessageRow) (searchmsg.Message, extractOutcome) {
 		FromUID:       row.FromUID,
 		MsgTimestamp:  row.Timestamp,
 		CreatedAt:     row.CreatedUnix,
+		MessageSeq:    row.MessageSeq,
 		Source:        searchmsg.SourceETLMessageTable,
 	}
 
 	if isSignalEncrypted(row) {
-		// Signal 加密 DM：payload 是密文，解不出明文是预期行为，非异常。
+		// Signal 加密 DM：payload 是密文，解不出明文是预期行为，非异常。spaceId/visibles 留空
+		// （reader fail-closed，安全）。
 		msg.RawExcluded = true
 		msg.Content = nil
 		return msg, outcomeRawExcluded
@@ -61,6 +71,15 @@ func extractMessage(row *srcMessageRow) (searchmsg.Message, extractOutcome) {
 		// 非加密消息本应是明文 JSON，解析失败/空 map 属真异常 → DLQ（游标仍推进）。
 		return msg, outcomeDLQ
 	}
+
+	// 🔴 富化可见性（fail-closed）：可见性是 access-control ACL。无法可信解析 → 整条 DLQ，
+	// 绝不写空 Visibles 让 reader fail-OPEN。space_id 非字符串类型不连累合法 visibles（V3b 隔离）。
+	spaceID, visibles, verr := searchmsg.ExtractVisibility(row.Payload)
+	if verr != nil {
+		return msg, outcomeDLQ
+	}
+	msg.SpaceID = spaceID
+	msg.Visibles = visibles
 
 	contentType, isText := payloadType(m)
 	msg.ContentType = contentType

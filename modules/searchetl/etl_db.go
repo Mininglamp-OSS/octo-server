@@ -78,7 +78,7 @@ func (d *etlDB) maxID(table string) (int64, error) {
 func (d *etlDB) readBatch(table string, cursor int64, batch int) ([]*srcMessageRow, error) {
 	var rows []*srcMessageRow
 	_, err := d.session.SelectBySql(
-		fmt.Sprintf("SELECT id, message_id, from_uid, channel_id, channel_type, setting, `signal`, "+
+		fmt.Sprintf("SELECT id, message_id, message_seq, from_uid, channel_id, channel_type, setting, `signal`, "+
 			"`timestamp`, UNIX_TIMESTAMP(created_at) AS created_unix, payload "+
 			"FROM `%s` WHERE id>? ORDER BY id ASC LIMIT ?", table),
 		cursor, batch).Load(&rows)
@@ -105,7 +105,7 @@ func (d *etlDB) readStableBatchTx(table string, batch int) (cursor int64, rows [
 		return 0, nil, err
 	}
 	if _, err = tx.SelectBySql(
-		fmt.Sprintf("SELECT id, message_id, from_uid, channel_id, channel_type, setting, `signal`, "+
+		fmt.Sprintf("SELECT id, message_id, message_seq, from_uid, channel_id, channel_type, setting, `signal`, "+
 			"`timestamp`, UNIX_TIMESTAMP(created_at) AS created_unix, payload "+
 			"FROM `%s` WHERE id>? ORDER BY id ASC LIMIT ?", table),
 		cursor, batch).Load(&rows); err != nil {
