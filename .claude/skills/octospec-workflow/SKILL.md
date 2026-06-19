@@ -61,6 +61,8 @@ manually; as a skill you perform the same steps.
 ### 4. Finish
 - Run the final gate once more.
 - Write `.octospec/journal/shared/<slug>.md` (what was done + any learning).
+  Start it with OKF frontmatter (`type: Journal` + title/description/tags/
+  timestamp) and add a dated entry to `.octospec/log.md`.
 - If a learning is worth reusing, stage it in `.octospec/learnings/pending/`
   (promotion into `rules/` is a separate reviewed PR — do not auto-edit rules).
 - Open a PR. Fill the PR template's **Linked Spec** (→ the brief) and the

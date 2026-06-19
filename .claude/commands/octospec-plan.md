@@ -11,7 +11,9 @@ Task: $ARGUMENTS
 2. Read `.octospec/tasks/_brief.template.md` for the required shape.
 3. Inspect the relevant existing code to ground the brief in reality (you may
    draft the brief from the code; the human will confirm it).
-4. Write `.octospec/tasks/<slug>/brief.md` filling every section:
+4. Write `.octospec/tasks/<slug>/brief.md` filling every section (including the
+   OKF frontmatter from the template — set `type: Task`, `title`, `description`,
+   `tags`, `timestamp`):
    - **Goal** — what behavior changes and why.
    - **Load-bearing list** — existing behaviors/contracts this touches. Use the
      same tags as `.octospec/rules/_index.yaml` `inject_when.touches` where they

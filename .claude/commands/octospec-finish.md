@@ -7,7 +7,10 @@ You are running the octospec **Finish** phase for task `$ARGUMENTS`.
 
 1. Run the final verification gate one more time (lint / type-check / tests).
 2. Write `.octospec/journal/shared/$ARGUMENTS.md` — a short, team-visible record:
-   what was done, any structural learning, any gotcha worth remembering.
+   what was done, any structural learning, any gotcha worth remembering. Start
+   the file with OKF frontmatter (`type: Journal`, plus `title`/`description`/
+   `tags`/`timestamp`) so it stays a valid OKF unit and passes `octospec-lint`.
+   Also add a dated entry to `.octospec/log.md` (create it if missing).
 3. If a learning is worth promoting into a reusable rule, drop a candidate in
    `.octospec/learnings/pending/$ARGUMENTS.md`. Promotion into `rules/` is a
    separate, reviewed PR — do not auto-edit `rules/`.

@@ -20,3 +20,8 @@ change-log convention (§7). Newest first.
   `rate-limit`, `space-isolation`, `testing`, `commit-style`; manifest, task
   templates, slash commands (PR #418).
 - **Creation** — Dogfood task `member-list-name-fallback` (#344 → PR #420).
+
+## 2026-06-19 (tooling)
+
+- **Update** — Synced OKF-aware slash commands, workflow skill, and task brief
+  template from octo-spec 1.1.0 so generated briefs/journals stay conformant.
