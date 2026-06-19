@@ -1,4 +1,10 @@
 ---
+type: Rule
+title: Error handling & i18n
+description: User-facing errors must use the localized error envelope.
+tags: ["error-response", "i18n", "wire-contract"]
+timestamp: 2026-06-19T00:00:00Z
+# --- octospec extension fields (OKF-permitted; consumers must preserve) ---
 id: error-handling
 tier: repo
 priority: 85

@@ -3,7 +3,7 @@ schema_version: 1
 
 # Which global ("constitution") version this repo inherits.
 # Pin an exact semver; upgrade = bump this + re-run octospec-sync.
-inherits: octo-spec@1.0.0
+inherits: octo-spec@1.1.0
 
 # Repo tier is always "repo" here (the global layer lives in octo-spec).
 tier: repo

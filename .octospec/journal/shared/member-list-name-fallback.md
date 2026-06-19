@@ -1,3 +1,13 @@
+---
+type: Journal
+title: "Journal: member-list-name-fallback (octo-server #344)"
+description: Record of the member-list empty-name fallback fix and the rules it honored.
+tags: ["space", "member-list", "name-fallback"]
+timestamp: 2026-06-19T00:00:00Z
+# --- octospec extension fields ---
+task: member-list-name-fallback
+source: self
+---
 # Journal: member-list-name-fallback (octo-server #344)
 
 ## What was done

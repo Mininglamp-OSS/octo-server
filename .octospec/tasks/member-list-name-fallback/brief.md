@@ -1,3 +1,14 @@
+---
+type: Task
+title: "Task: member-list-name-fallback"
+description: Add a display-name fallback so the space member list never renders a blank name.
+tags: ["space", "member-list", "name-fallback"]
+timestamp: 2026-06-19T00:00:00Z
+# --- octospec extension fields ---
+slug: member-list-name-fallback
+upstream: "octo-server#344"
+source: self
+---
 # Task: member-list-name-fallback
 
 > One task = one `.octospec/tasks/<slug>/` directory. This brief is the spec for

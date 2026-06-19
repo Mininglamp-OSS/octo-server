@@ -1,4 +1,10 @@
 ---
+type: Rule
+title: Testing conventions
+description: Test setup must bound the DB connection pool and clean up; coverage expectations.
+tags: ["test", "testing"]
+timestamp: 2026-06-19T00:00:00Z
+# --- octospec extension fields (OKF-permitted; consumers must preserve) ---
 id: testing
 tier: repo
 priority: 70

@@ -1,4 +1,10 @@
 ---
+type: Rule
+title: Space isolation & access control
+description: Queries and access checks must enforce space isolation; no cross-space leakage.
+tags: ["space", "isolation", "auth", "bot-api", "thread", "acl"]
+timestamp: 2026-06-19T00:00:00Z
+# --- octospec extension fields (OKF-permitted; consumers must preserve) ---
 id: space-isolation
 tier: repo
 priority: 92

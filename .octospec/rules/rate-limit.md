@@ -1,4 +1,10 @@
 ---
+type: Rule
+title: Rate limiting
+description: Per-UID/per-route rate limiting requirements for service endpoints.
+tags: ["rate-limit", "throttle"]
+timestamp: 2026-06-19T00:00:00Z
+# --- octospec extension fields (OKF-permitted; consumers must preserve) ---
 id: rate-limit
 tier: repo
 priority: 80
