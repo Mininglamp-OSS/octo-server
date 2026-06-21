@@ -47,9 +47,6 @@ import (
 	_ "github.com/Mininglamp-OSS/octo-server/modules/qrcode"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/report"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/search"
-	// searchetl: 消息检索增量 ETL（读 message 分表 → Kafka → es-indexer → OpenSearch，YUJ-4530）。
-	// 阶段 1 仅注册迁移（独立游标表 octo_etl_es_cursor），不启动 scheduler、不接 Kafka。
-	_ "github.com/Mininglamp-OSS/octo-server/modules/searchetl"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/space"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/statistics"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/thread"

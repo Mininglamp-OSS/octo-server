@@ -41,7 +41,6 @@ require (
 	github.com/robfig/cron v1.2.0
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/rubenv/sql-migrate v1.5.2
-	github.com/segmentio/kafka-go v0.4.51
 	github.com/sendgrid/rest v2.6.9+incompatible
 	github.com/sideshow/apns2 v0.23.0
 	github.com/sourcegraph/syntaxhighlight v0.0.0-20170531221838-bd320f5d308e
@@ -65,7 +64,6 @@ require (
 require (
 	github.com/liuzl/cedar-go v0.0.0-20170805034717-80a9c64b256d // indirect
 	github.com/liuzl/da v0.0.0-20180704015230-14771aad5b1d // indirect
-	github.com/pierrec/lz4/v4 v4.1.15 // indirect
 )
 
 require (

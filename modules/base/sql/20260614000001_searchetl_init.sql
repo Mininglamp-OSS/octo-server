@@ -1,5 +1,15 @@
 -- +migrate Up
 
+-- NOTE: The built-in producer module (formerly modules/searchetl) has been removed.
+-- This migration is retained ONLY to keep the gorp_migrations ID sequence continuous:
+-- the migration ID is the bare filename and is already recorded in gorp_migrations, so
+-- deleting the file would make sql-migrate panic on boot (unknown migration in database,
+-- IgnoreUnknown=false). The file was moved here (DB-neutral; the ID is unchanged) when
+-- modules/searchetl was deleted, and base is always loaded (blank-imported + embeds sql/).
+-- Because the ID is already applied, sql-migrate skips this migration on every boot — the
+-- CREATE TABLE below never re-runs. The octo_etl_es_cursor table is now owned by the
+-- standalone searchetl-producer.
+--
 -- searchetl 消息检索 ETL 抽取水位（YUJ-4530 ETL→Kafka→ES indexer）。
 -- 每个 message 分片表一行，记录已投递到 Kafka 的最大主键 id 水位。
 --
