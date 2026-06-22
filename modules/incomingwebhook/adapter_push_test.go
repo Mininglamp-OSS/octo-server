@@ -41,6 +41,7 @@ func TestCreate_ReturnsAdapterURLs(t *testing.T) {
 	assert.Equal(t, created["url"], native, "urls.native must equal the legacy url field")
 	assert.Equal(t, native+"/github", urls["github"])
 	assert.Equal(t, native+"/wecom", urls["wecom"])
+	assert.Equal(t, native+"/multica", urls["multica"])
 }
 
 // GitHub ping：200 + skipped，不投递消息，且异步记一条 status=3(skipped) 的投递。
@@ -114,7 +115,7 @@ func TestPush_AdapterRoute_AuthEnforced(t *testing.T) {
 	handler, _, groupNo := setupTestEnv(t)
 	whID, _ := createWebhookWithToken(t, handler, groupNo)
 
-	for _, suffix := range []string{"github", "wecom"} {
+	for _, suffix := range []string{"github", "wecom", "multica"} {
 		w := pushAdapterRaw(handler, whID, "wrong-token", suffix,
 			[]byte(`{"msgtype":"text","text":{"content":"hi"}}`),
 			map[string]string{"X-GitHub-Event": "push"})
@@ -180,4 +181,49 @@ func TestPush_WeComImage_Rejected(t *testing.T) {
 	w := pushAdapterRaw(handler, whID, token, "wecom",
 		[]byte(`{"msgtype":"image","image":{"base64":"...","md5":"..."}}`), nil)
 	assert.Equalf(t, http.StatusBadRequest, w.Code, "wecom image must 400; body=%s", w.Body.String())
+}
+
+// Multica issue.status_changed envelope 通过鉴权/翻译；成功响应含 message_id
+// 且不带平台兼容字段（multica 适配器无 successExtra）。
+func TestPush_MulticaIssueStatusChanged_Delivers(t *testing.T) {
+	handler, _, groupNo := setupTestEnv(t)
+	whID, token := createWebhookWithToken(t, handler, groupNo)
+
+	w := pushAdapterRaw(handler, whID, token, "multica",
+		[]byte(`{"event":"issue.status_changed","actor":{"type":"member","id":"u-1"},`+
+			`"issue":{"identifier":"MUL-123","title":"Fix login redirect","status":"in_progress"},`+
+			`"previous_status":"todo"}`), nil)
+	assert.NotEqualf(t, http.StatusBadRequest, w.Code, "valid multica envelope must translate; body=%s", w.Body.String())
+	assert.NotEqualf(t, http.StatusUnauthorized, w.Code, "valid token must authorize; body=%s", w.Body.String())
+	if w.Code == http.StatusOK {
+		assert.Contains(t, w.Body.String(), "message_id")
+		// multica 不附带 errcode/errmsg（与 native 同，区别于 wecom）。
+		assert.NotContains(t, w.Body.String(), `"errcode"`)
+	}
+}
+
+// 渲染子集之外的 multica 事件（issue.created 等）→ 200 + skipped=event，
+// 与 github 适配器对称。
+func TestPush_MulticaUnsupportedEvent_Skipped(t *testing.T) {
+	handler, _, groupNo := setupTestEnv(t)
+	whID, token := createWebhookWithToken(t, handler, groupNo)
+
+	w := pushAdapterRaw(handler, whID, token, "multica",
+		[]byte(`{"event":"issue.created","issue":{"identifier":"MUL-1","title":"new","status":"todo"}}`),
+		nil)
+	require.Equalf(t, http.StatusOK, w.Code, "unsupported event must 200; body=%s", w.Body.String())
+	assert.Contains(t, w.Body.String(), `"skipped":"event"`)
+}
+
+// 缺 event 字段 → 400 invalid（reason=no_event，与 github 适配器对称——
+// 误配置要立刻可见，而非折叠成通用 json 错误）。
+func TestPush_MulticaMissingEvent_NoEventReason(t *testing.T) {
+	handler, _, groupNo := setupTestEnv(t)
+	whID, token := createWebhookWithToken(t, handler, groupNo)
+
+	w := pushAdapterRaw(handler, whID, token, "multica",
+		[]byte(`{"issue":{"identifier":"MUL-1","title":"x","status":"todo"}}`), nil)
+	require.Equalf(t, http.StatusBadRequest, w.Code, "missing event must 400; body=%s", w.Body.String())
+	assert.Contains(t, w.Body.String(), `"reason":"no_event"`,
+		"missing event must use the same no_event reason as github adapter (yujiawei review P2-2)")
 }

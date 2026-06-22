@@ -76,6 +76,68 @@ func TestParseMulticaPush_TitleEscaping(t *testing.T) {
 	assert.Contains(t, req.Content, `\[enter\]`, "brackets must be markdown-escaped (mdLinkText)")
 }
 
+// 非链接上下文的字段（identifier 在 bold、actor.type 在 plain text）必须经
+// mdInertText 转义；status 在 backtick code span 走 mdCodeSpanText 单独 strip
+// 反引号。否则一个带 `*` 的 identifier 可以提前闭合 **...**、带反引号的 status
+// 可以逃出 code span、带 `[...](url)` 的 actor 可以注入链接。三位 reviewer
+// (Jerry-Xin / yujiawei / mochashanyao) 都点了这道防御。
+func TestParseMulticaPush_IdentifierMarkdownEscaping(t *testing.T) {
+	body := []byte(`{
+		"event": "issue.status_changed",
+		"issue": {"identifier": "MUL-1** [phish](http://evil.com) **", "title": "ok", "status": "done"},
+		"previous_status": "todo"
+	}`)
+	req, skip, invalid := parseMulticaPush(http.Header{}, body)
+	require.NotNil(t, req, "skip=%q invalid=%q", skip, invalid)
+	// `*` 必须被反斜杠转义，否则会提前关闭 **...** 的粗体并让后面的 `[phish](...)`
+	// 渲染成 markdown 链接。
+	assert.Contains(t, req.Content, `\*\*`,
+		"asterisks in identifier must be escaped to prevent bold-break + link injection")
+	assert.Contains(t, req.Content, `\[phish\]`,
+		"square brackets in identifier must be escaped to prevent link injection")
+	assert.NotContains(t, req.Content, `[phish](`,
+		"un-escaped link syntax must not leak through")
+}
+
+func TestParseMulticaPush_StatusBacktickStripping(t *testing.T) {
+	// status 渲染在 `...` code span 内；嵌入反引号无法用 \\` 安全转义
+	// （单 backtick fence 里 \\` 仍是字面反斜杠），按契约 strip 反引号
+	// （mdCodeSpanText 行为）。
+	body := []byte(`{
+		"event": "issue.status_changed",
+		"issue": {"identifier": "MUL-1", "title": "x", "status": "in_pro` + "`" + `gress"},
+		"previous_status": "to` + "`" + `do"
+	}`)
+	req, _, _ := parseMulticaPush(http.Header{}, body)
+	require.NotNil(t, req)
+	// 反引号被剥后 status="in_progress"、prev="todo"，渲染成 `todo` → `in_progress`。
+	// 关键不变量：原始反引号不能在最终 content 中以「跨 code-span 的 ` 字符」形式
+	// 出现，否则就破坏了 code span。
+	assert.Contains(t, req.Content, "`todo` → `in_progress`",
+		"backticks inside status/previous_status must be stripped, restoring the normal display")
+	// 进一步钉一下：内容里 ` 的总数必须是偶数（成对开闭 code span），
+	// 不应因 strip 出现奇数个反引号导致开/闭不平衡。
+	assert.Equalf(t, 0, strings.Count(req.Content, "`")%2,
+		"backticks must remain balanced (got odd count): %q", req.Content)
+}
+
+func TestParseMulticaPush_ActorTypeMarkdownEscaping(t *testing.T) {
+	// actor.type 在 `(by X)` 纯文本上下文；带 `[label](url)` 的恶意值必须
+	// 不能拼出可点链接。
+	body := []byte(`{
+		"event": "issue.status_changed",
+		"actor": {"type": "agent [click](http://evil.com)", "id": "a-1"},
+		"issue": {"identifier": "MUL-2", "title": "x", "status": "done"},
+		"previous_status": "todo"
+	}`)
+	req, _, _ := parseMulticaPush(http.Header{}, body)
+	require.NotNil(t, req)
+	assert.Contains(t, req.Content, `\[click\]`,
+		"square brackets in actor.type must be escaped to prevent link injection")
+	assert.NotContains(t, req.Content, `(click)(http`,
+		"the un-escaped link syntax must not survive")
+}
+
 func TestParseMulticaPush_LongTitleIsClipped(t *testing.T) {
 	// 标题字段由 multica 端控制，长度理论上不受 8KB body cap 约束（短信封下仍能塞下
 	// 几 KB title）；adapter 必须把过长内容钳到 mdLinkText 的 200 rune 范围内，
@@ -109,7 +171,9 @@ func TestParseMulticaPush_MissingEvent(t *testing.T) {
 	req, skip, invalid := parseMulticaPush(http.Header{}, body)
 	assert.Nil(t, req)
 	assert.Empty(t, skip)
-	assert.Equal(t, "json", invalid, "缺 event 字段按 json 拒绝（不是合法 multica 出站流量）")
+	// 与 github 适配器缺 X-GitHub-Event 头同语义——deliveries 里 reason=no_event
+	// 让运维一眼区分「配置错误」vs「事件不在渲染子集内」(yujiawei review P2-2)。
+	assert.Equal(t, "no_event", invalid)
 }
 
 func TestParseMulticaPush_MalformedJSON(t *testing.T) {

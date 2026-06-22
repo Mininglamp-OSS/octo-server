@@ -65,7 +65,7 @@ const (
 //   - skip    非空：合法但刻意不投递（事件类型不在渲染子集内 → "event"），
 //     返回 200 + auditSkipped，管理端 deliveries 里 reason=event 可见；
 //   - invalid 非空：解析失败 → 400 + auditFailed，reason 同 native：
-//     "json" / "content"（事件已识别但渲染结果为空）。
+//     "json" / "no_event" / "content"（事件已识别但渲染结果为空）。
 //
 // header 当前未使用（X-Multica-Event 仅作辅助；事件分发以 body.event 为准，
 // 防止 header/body 不一致导致渲染走偏）。保留参数以匹配 pushAdapter.parse 签名，
@@ -77,10 +77,12 @@ func parseMulticaPush(_ http.Header, body []byte) (*pushPayloadReq, string, stri
 	}
 	event := strings.TrimSpace(ev.Event)
 	if event == "" {
-		// 缺 event 字段是配置错误（不像合法 multica 出站流量），按 json 拒绝。
-		// 与 github 的 no_event 不同：github 那边事件名在 header，缺 header 与
-		// 缺 body 字段语义有别；multica 全在 body 里，统一走 json 即可。
-		return nil, "", "json"
+		// 缺 event 字段是「配置错误」（不像合法 multica 出站流量），与 github
+		// 适配器缺 X-GitHub-Event 头同语义——复用同一个 no_event 原因码，让
+		// deliveries 排障口径跨适配器一致（yujiawei review P2-2）：跟「事件已识别但
+		// 不在渲染子集内」的 200 skip(event) 区分开。reason 字典在 #330 时已经为
+		// no_event 注册了 i18n / DB 注释，无须新增。
+		return nil, "", "no_event"
 	}
 
 	var content string
@@ -98,8 +100,10 @@ func parseMulticaPush(_ http.Header, body []byte) (*pushPayloadReq, string, stri
 		// 排查 payload 是否构造错（与 native content 为空的语义一致）。
 		return nil, "", "content"
 	}
-	// envelope 里的 title 长度由 multica 端控制（理论上可达 MySQL TEXT
-	// 上限）；钳到 maxContentRunes 内，绝不让 multica 流量 413。
+	// 8 KiB body cap 已经在 handlePush 第 4 步前置拦掉超长 body（足够大的 title
+	// 会先 413，而不是到这里），所以此处的 clipRunes 不是「保 title 不被 413」的
+	// 兜底，而是渲染层对 maxContentRunes(4000 rune) 上限的本地约束——避免拼装后
+	// 的最终 content 越过 push 路径下游对 RichText 字数的语义钳位。
 	return &pushPayloadReq{Content: clipRunes(content, maxContentRunes())}, "", ""
 }
 
@@ -120,6 +124,19 @@ func parseMulticaPush(_ http.Header, body []byte) (*pushPayloadReq, string, stri
 //     未显示触发者类型的情况下省略尾注。
 //   - 标题里的 `[` / `]` 经 mdLinkText 转义（即便当前没拼成链接也防御性
 //     处理，未来加链接时不必再回头改）。
+//   - 其余进 markdown 的字段按上下文走对应 helper（详见 adapter.go 注释）：
+//   - identifier 在 `**...**` 粗体里 → mdInertText（转义 `*` 防止 bold-break，
+//     转义 `[]` 防止 link injection）；
+//   - status / previous_status 在 “ `...` “ code span 里 → mdCodeSpanText
+//     （只剥反引号防止逃逸 code span；`_`/`*` 在 code span 内本就不被解释，
+//     不转义否则会回显 `\_` 破坏显示）；
+//   - actor.type 在 `(by ...)` 纯文本上下文 → mdInertText（全量转义）。
+//     这些字段按 multica 契约都是受控枚举/标识符，escape 是 defense-in-depth
+//     （PR #427 review by yujiawei / mochashanyao / Jerry-Xin）。
+//   - 字段长度统一钳到 64 rune：identifier/status/actor 在 multica 端是短
+//     标识符（identifier 形如 "MUL-12345"、status 是枚举、actor.type 是
+//     "member"/"agent"），64 足够覆盖正常上限并把异常长度截短防御。title
+//     仍用 200 rune（与 GitHub PR/issue 标题钳值对齐）。
 func renderMulticaIssueStatusChanged(ev muEnvelope) string {
 	id := strings.TrimSpace(ev.Issue.Identifier)
 	title := strings.TrimSpace(ev.Issue.Title)
@@ -131,8 +148,10 @@ func renderMulticaIssueStatusChanged(ev muEnvelope) string {
 		return ""
 	}
 
+	const shortFieldMax = 64
+
 	var b strings.Builder
-	fmt.Fprintf(&b, "**%s**", id)
+	fmt.Fprintf(&b, "**%s**", mdInertText(id, shortFieldMax))
 	if title != "" {
 		// 钳到 200 rune 与 GitHub PR/issue 标题渲染保持一致。
 		b.WriteString(" ")
@@ -140,14 +159,16 @@ func renderMulticaIssueStatusChanged(ev muEnvelope) string {
 	}
 	b.WriteString(": ")
 	if prev != "" && prev != status {
-		fmt.Fprintf(&b, "`%s` → `%s`", prev, status)
+		fmt.Fprintf(&b, "`%s` → `%s`",
+			mdCodeSpanText(prev, shortFieldMax),
+			mdCodeSpanText(status, shortFieldMax))
 	} else {
 		// 新建 issue 或事件 payload 缺 previous_status 时只显示当前状态，
 		// 不画"→ X"那种暗示状态变化的尾巴。
-		fmt.Fprintf(&b, "`%s`", status)
+		fmt.Fprintf(&b, "`%s`", mdCodeSpanText(status, shortFieldMax))
 	}
 	if actorType := strings.TrimSpace(ev.Actor.Type); actorType != "" {
-		fmt.Fprintf(&b, " (by %s)", actorType)
+		fmt.Fprintf(&b, " (by %s)", mdInertText(actorType, shortFieldMax))
 	}
 	return b.String()
 }

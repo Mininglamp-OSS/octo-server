@@ -22,7 +22,8 @@ import (
 
 // pushAdapter 描述一种推送形态。
 type pushAdapter struct {
-	// name 写入审计 adapter 列（adapterNative / adapterGitHub / adapterWeCom）。
+	// name 写入审计 adapter 列（adapterNative / adapterGitHub / adapterWeCom /
+	// adapterMultica）。新增适配器时把对应常量加进列表。
 	name string
 	// parse 把平台原始 body 翻译成 native 推送请求。三个返回值恰有一个生效：
 	//   - req     非 nil：照常走 msg_type 构造 / 投递；
@@ -127,4 +128,55 @@ var mdLinkTextEscaper = strings.NewReplacer(`\`, `\\`, `[`, `\[`, `]`, `\]`)
 // 钳约束的是可见长度，转义引入的反斜杠不该挤占可见字符预算。
 func mdLinkText(s string, max int) string {
 	return mdLinkTextEscaper.Replace(clipRunes(oneLine(s), max))
+}
+
+// mdInertTextEscaper 转义会让外部文本"越界"激活 markdown 语法的字符。覆盖：
+//   - 链接相关 `\` / `[` / `]`：与 mdLinkText 同源，避免拼成意外链接；
+//   - 强调相关 `*` / `_`：放进 `**X**`/`__X__` 包装或纯文本时不能让自身字符提前闭合
+//     或反生成强调；
+//   - HTML / 自动链接 `<` / `>`：CommonMark 会把 `<http://…>` 渲染成链接，
+//     `<script>` 在部分宽松渲染器里也会被转 HTML；
+//   - 表格管道 `|`：进表格单元格的字段不能裸传 `|`。
+//
+// 反引号「不转义、直接剥离」：CommonMark 单 backtick span 里 `\` 是字面反斜杠，
+// 用 `\“ 不能把反引号嵌进去；而双 backtick fence 又会引入二次转义难题。本模块
+// 用 mdInertText 处理的字段（multica 的 identifier / actor.type 等短标识符）按
+// 契约都是不含反引号的，剥离比转义更稳——与 GitHub adapter 处理短字段
+// （branch、sender.login）的口径一致。
+//
+// ⚠️ 不要把 mdInertText 用在 `...` code span 的内部：code span 内 `_` / `*`
+// 不被 markdown 解释，反斜杠转义会让客户端把 `\_` 当字面显示出来（in\_progress
+// 而非 in_progress）。code span 内只需 strip 反引号，请用 mdCodeSpanText。
+var mdInertTextEscaper = strings.NewReplacer(
+	`\`, `\\`,
+	"`", "",
+	`*`, `\*`,
+	`_`, `\_`,
+	`[`, `\[`,
+	`]`, `\]`,
+	`<`, `\<`,
+	`>`, `\>`,
+	`|`, `\|`,
+)
+
+// mdInertText 把不该激活 markdown 语法的短字段（identifier / 标签 / actor 类型）
+// 钳到 max rune 后转义为「inert」文本——拼到 `**X**` 或 `(by X)` 纯文本都不能
+// 逃出去开新 span / 链接。先钳后转义同 mdLinkText。
+//
+// 仅用于 **非** code span 上下文；code span 内字段请用 mdCodeSpanText（否则
+// `\_` 等转义序列会以字面形式回显，破坏显示）。
+func mdInertText(s string, max int) string {
+	return mdInertTextEscaper.Replace(clipRunes(oneLine(s), max))
+}
+
+// mdCodeSpanText 专用于 `...` 单反引号 code span 内部字段：只剥离反引号
+// （没法在单 backtick span 内安全转义反引号），其余字符在 code span 内不被
+// markdown 解释（`_` `*` `\` 都会按字面显示），无须转义——也绝不可转义，否则
+// 客户端会回显 `\_` 而非 `_`，破坏 status 等可读性。
+//
+// 与 mdInertText 不同：用法严格限定到 “ `X` “ 上下文，不要拿出去拼别处。
+var mdCodeSpanStripper = strings.NewReplacer("`", "")
+
+func mdCodeSpanText(s string, max int) string {
+	return mdCodeSpanStripper.Replace(clipRunes(oneLine(s), max))
 }

@@ -204,7 +204,9 @@ POST /v1/incoming-webhooks/:webhook_id/:token/multica
 
 子集之外的事件（`issue.created` / `comment.created` 等未来事件）返回 200 +
 `{"skipped":"event"}`（deliveries 里 `status=3`/`reason=event` 可见，与 github
-适配器一致）；payload 解析失败 → 400 `reason=json`；事件已识别但 issue 关键
+适配器一致）；缺 `event` 字段（配置错误）→ 400 `reason=no_event`（与 github 缺
+`X-GitHub-Event` 同语义，可在 deliveries 里与「不在渲染子集」的 200 skip 分开看）；
+payload 解析失败 → 400 `reason=json`；事件已识别但 issue 关键
 字段（identifier / status）缺失 → 400 `reason=content`。
 
 **body 上限：** 与 native 同为 8 KiB——Multica 信封比 GitHub 事件紧凑（只嵌
