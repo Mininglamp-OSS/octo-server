@@ -1,6 +1,7 @@
 package incomingwebhook
 
 import (
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
@@ -65,7 +66,8 @@ func TestParseMulticaPush_NoActorType(t *testing.T) {
 }
 
 func TestParseMulticaPush_TitleEscaping(t *testing.T) {
-	// 标题里出现 `[` / `]`：未来若改为渲染成链接文本必须转义，现在已先转义防御。
+	// 标题里出现 `[` / `]`：mdInertText 会把 `[` / `]` 转义成 `\[` / `\]`，
+	// 即便未来 title 改为渲染成链接文本也安全。
 	body := []byte(`{
 		"event": "issue.status_changed",
 		"issue": {"identifier": "MUL-77", "title": "Crash on [enter] key", "status": "done"},
@@ -73,7 +75,85 @@ func TestParseMulticaPush_TitleEscaping(t *testing.T) {
 	}`)
 	req, _, _ := parseMulticaPush(http.Header{}, body)
 	require.NotNil(t, req)
-	assert.Contains(t, req.Content, `\[enter\]`, "brackets must be markdown-escaped (mdLinkText)")
+	assert.Contains(t, req.Content, `\[enter\]`, "brackets must be markdown-escaped")
+}
+
+// title 在「**identifier** title:」上下文是裸文本（不在 `[text](url)` 链接里），
+// 必须用 mdInertText 而非 mdLinkText 才能把 `*` / 反引号 / `<` / `|` 等元字符
+// 也防住。yujiawei review P1 给出了 4 个具体注入向量，每个要 hold。
+func TestParseMulticaPush_TitleInjectionVectors(t *testing.T) {
+	cases := []struct {
+		name        string
+		title       string
+		mustContain []string // 修复后期望出现的转义序列
+		mustNot     []string // 修复前漏掉的原始注入串
+	}{
+		{
+			name:        "asterisk_pair_injects_bold",
+			title:       "**hijack**",
+			mustContain: []string{`\*\*hijack\*\*`},
+			mustNot:     []string{"**hijack**"},
+		},
+		{
+			name:    "backtick_breaks_status_code_span",
+			title:   "a `b",
+			mustNot: []string{"a `b"}, // 反引号必须被剥（mdInertText 行为），否则总反引号数变奇数
+		},
+		{
+			name:        "html_autolink",
+			title:       "<script>alert(1)</script>",
+			mustContain: []string{`\<script\>`, `\</script\>`},
+		},
+		{
+			name:        "pipe_breaks_tables",
+			title:       "a | b",
+			mustContain: []string{`a \| b`},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body, err := json.Marshal(map[string]any{
+				"event":           "issue.status_changed",
+				"actor":           map[string]any{"type": "member", "id": "u-1"},
+				"issue":           map[string]any{"identifier": "MUL-1", "title": tc.title, "status": "in_progress"},
+				"previous_status": "todo",
+			})
+			require.NoError(t, err)
+			req, _, _ := parseMulticaPush(http.Header{}, body)
+			require.NotNil(t, req)
+			for _, want := range tc.mustContain {
+				assert.Containsf(t, req.Content, want,
+					"escape must produce %q; got %q", want, req.Content)
+			}
+			for _, bad := range tc.mustNot {
+				assert.NotContainsf(t, req.Content, bad,
+					"raw injection sequence %q must not survive; got %q", bad, req.Content)
+			}
+			// 总反引号数始终偶数（成对开闭）—— mdCodeSpanText 已经在 status 字段
+			// 把反引号剥光；现在 title 也走 mdInertText 同样剥光，所以一个含反
+			// 引号的 title 不会让 content 反引号总数变奇数破坏 status code-span。
+			assert.Equalf(t, 0, strings.Count(req.Content, "`")%2,
+				"backticks must remain balanced (got odd count): %q", req.Content)
+		})
+	}
+}
+
+// 事件名 lower+trim 后匹配——与 msg_type 处理保持一致，避免大小写变体被静默
+// 折叠成 skip(event)（yujiawei review P2-2）。
+func TestParseMulticaPush_EventCaseInsensitive(t *testing.T) {
+	for _, name := range []string{"Issue.Status_Changed", "ISSUE.STATUS_CHANGED", " issue.status_changed "} {
+		t.Run(name, func(t *testing.T) {
+			body, err := json.Marshal(map[string]any{
+				"event":           name,
+				"actor":           map[string]any{"type": "member", "id": "u-1"},
+				"issue":           map[string]any{"identifier": "MUL-1", "title": "x", "status": "done"},
+				"previous_status": "todo",
+			})
+			require.NoError(t, err)
+			req, skip, invalid := parseMulticaPush(http.Header{}, body)
+			require.NotNilf(t, req, "case-variant event must render; skip=%q invalid=%q", skip, invalid)
+		})
+	}
 }
 
 // 非链接上下文的字段（identifier 在 bold、actor.type 在 plain text）必须经

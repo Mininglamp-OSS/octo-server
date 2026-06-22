@@ -75,7 +75,11 @@ func parseMulticaPush(_ http.Header, body []byte) (*pushPayloadReq, string, stri
 	if err := json.Unmarshal(body, &ev); err != nil {
 		return nil, "", "json"
 	}
-	event := strings.TrimSpace(ev.Event)
+	// lower+trim 与 api.go 里的 msg_type 处理保持一致——避免发送方误用大小写
+	// 变体把合法事件（"Issue.Status_Changed"）静默降级成 200 skip(event)
+	// (yujiawei review P2-2)。事件名按 multica 契约本就是 lowercase-dotted 枚举，
+	// 这里做规范化只是 defense-in-depth。
+	event := strings.ToLower(strings.TrimSpace(ev.Event))
 	if event == "" {
 		// 缺 event 字段是「配置错误」（不像合法 multica 出站流量），与 github
 		// 适配器缺 X-GitHub-Event 头同语义——复用同一个 no_event 原因码，让
@@ -122,8 +126,12 @@ func parseMulticaPush(_ http.Header, body []byte) (*pushPayloadReq, string, stri
 //     当作斜体。
 //   - actor 名当前不在 envelope 里，只渲染 type（"by agent" / "by member"）；
 //     未显示触发者类型的情况下省略尾注。
-//   - 标题里的 `[` / `]` 经 mdLinkText 转义（即便当前没拼成链接也防御性
-//     处理，未来加链接时不必再回头改）。
+//   - title 在 `** identifier ** title:` 的「裸文本」上下文（注意：与 github
+//     适配器的 title 不同——github 把 title 包进 `[text](url)` 链接里，所以那边
+//     用只转 `\[]` 的 mdLinkText 是对的；这里 title 不进链接，必须用
+//     mdInertText 才能把 `*`/反引号/`<`/`|` 等元字符也防住，否则一个含反引号
+//     的 title 会让 content 里反引号总数变奇数、把后面的 status code-span 切坏，
+//     一个含 `**` 的 title 会注入真粗体（yujiawei review P1）。
 //   - 其余进 markdown 的字段按上下文走对应 helper（详见 adapter.go 注释）：
 //   - identifier 在 `**...**` 粗体里 → mdInertText（转义 `*` 防止 bold-break，
 //     转义 `[]` 防止 link injection）；
@@ -153,9 +161,11 @@ func renderMulticaIssueStatusChanged(ev muEnvelope) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "**%s**", mdInertText(id, shortFieldMax))
 	if title != "" {
-		// 钳到 200 rune 与 GitHub PR/issue 标题渲染保持一致。
+		// 钳到 200 rune 与 GitHub PR/issue 标题渲染保持一致；用 mdInertText 而
+		// 非 mdLinkText——title 在这里是裸文本，不在 `[text](url)` 里（详见上方
+		// 设计取舍）。
 		b.WriteString(" ")
-		b.WriteString(mdLinkText(title, 200))
+		b.WriteString(mdInertText(title, 200))
 	}
 	b.WriteString(": ")
 	if prev != "" && prev != status {
