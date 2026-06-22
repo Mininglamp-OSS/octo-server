@@ -135,7 +135,7 @@ type createResp struct {
 	webhookResp
 	Token string `json:"token"`
 	URL   string `json:"url"`
-	// URLs 各推送形态的路径（native / github / wecom），与 URL 一样不含 host、由前端
+	// URLs 各推送形态的路径（native / github / wecom / multica），与 URL 一样不含 host、由前端
 	// 拼接基础域名。token 仅在 create/regenerate 时可见，故完整推送路径也只在这两处
 	// 下发（list 不回显 token，自然也不回推送 URL）。
 	URLs map[string]string `json:"urls"`
