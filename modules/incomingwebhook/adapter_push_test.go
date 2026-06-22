@@ -215,8 +215,11 @@ func TestPush_MulticaUnsupportedEvent_Skipped(t *testing.T) {
 	assert.Contains(t, w.Body.String(), `"skipped":"event"`)
 }
 
-// 缺 event 字段 → 400 invalid（reason=no_event，与 github 适配器对称——
-// 误配置要立刻可见，而非折叠成通用 json 错误）。
+// 缺 event 字段 → 400 invalid（reason=no_event 由 pushPayloadInvalid 路由，
+// 在 TestPushPayloadInvalidSurfacesReason 钉死；此处 e2e 不能断言 body 里的
+// reason 字段——testutil.NewTestServer 不挂 i18n ErrorRenderer，e2e 响应只
+// 渲染成 legacy {msg,status} 形态，details 不出现，详见 api_i18n_test.go
+// TestPushPayloadInvalidSurfacesReason 旁的注释）。
 func TestPush_MulticaMissingEvent_NoEventReason(t *testing.T) {
 	handler, _, groupNo := setupTestEnv(t)
 	whID, token := createWebhookWithToken(t, handler, groupNo)
@@ -224,6 +227,4 @@ func TestPush_MulticaMissingEvent_NoEventReason(t *testing.T) {
 	w := pushAdapterRaw(handler, whID, token, "multica",
 		[]byte(`{"issue":{"identifier":"MUL-1","title":"x","status":"todo"}}`), nil)
 	require.Equalf(t, http.StatusBadRequest, w.Code, "missing event must 400; body=%s", w.Body.String())
-	assert.Contains(t, w.Body.String(), `"reason":"no_event"`,
-		"missing event must use the same no_event reason as github adapter (yujiawei review P2-2)")
 }
