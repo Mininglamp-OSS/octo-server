@@ -1,13 +1,14 @@
 package incomingwebhook
 
-// 推送形态适配层（#297 Phase 3）。
+// 推送形态适配层（#297 Phase 3 / #426）。
 //
-// 三种推送形态共享同一条鉴权 / 限流 / 群校验 / 投递 / 审计流水线（api.go handlePush），
+// 多种推送形态共享同一条鉴权 / 限流 / 群校验 / 投递 / 审计流水线（api.go handlePush），
 // 彼此只差「如何把请求 body 翻译成 native 推送请求」这一步：
 //
 //   - native（历史契约）   POST /v1/incoming-webhooks/:webhook_id/:token
 //   - GitHub 事件          POST .../:token/github   （adapter_github.go）
 //   - 企业微信群机器人格式  POST .../:token/wecom    （adapter_wecom.go）
+//   - Multica 出站事件     POST .../:token/multica  （adapter_multica.go）
 //
 // 适配器不是新的攻击面：URL token 鉴权、四层限流、群 Normal 校验、payload 白名单
 // 构造（buildPayload / buildRichTextPayload 注入 from.kind=webhook 与服务端 space_id）
@@ -50,6 +51,10 @@ var (
 		// 企业微信调用方普遍校验 errcode==0，附带平台习惯字段降低迁移摩擦。
 		successExtra: map[string]interface{}{"errcode": 0, "errmsg": "ok"},
 	}
+	// multicaAdapter 接收 multica 出站 webhook（issue.status_changed 等事件
+	// 的固定 JSON envelope）。multica envelope 比 GitHub 事件紧凑（不嵌入
+	// repository 对象），8 KiB 足够，沿用 native 的 bodyLimit。
+	multicaAdapter = pushAdapter{name: adapterMultica, parse: parseMulticaPush, bodyLimit: maxBytes}
 )
 
 // parseNativePush 是 native 形态的 parse：body 即 pushPayloadReq JSON 本身。

@@ -224,10 +224,12 @@ func (w *IncomingWebhook) Route(r *wkhttp.WKHttp) {
 			return []wkhttp.HandlerFunc{w.requirePushEnabled(), w.localFloorMiddleware(), ipLimit, w.ipFailureGateMiddleware(), h}
 		}
 		push.POST("/incoming-webhooks/:webhook_id/:token", chain(w.push)...)
-		// 平台适配器（#297 Phase 3）：GitHub 事件 / 企业微信群机器人格式。鉴权、限流、
-		// 群校验与 native 完全一致，仅 body 解析不同（adapter_github.go / adapter_wecom.go）。
+		// 平台适配器（#297 Phase 3 / #426）：GitHub 事件 / 企业微信群机器人格式 / Multica
+		// 出站 webhook。鉴权、限流、群校验与 native 完全一致，仅 body 解析不同
+		// （adapter_github.go / adapter_wecom.go / adapter_multica.go）。
 		push.POST("/incoming-webhooks/:webhook_id/:token/github", chain(w.pushGitHub)...)
 		push.POST("/incoming-webhooks/:webhook_id/:token/wecom", chain(w.pushWeCom)...)
+		push.POST("/incoming-webhooks/:webhook_id/:token/multica", chain(w.pushMultica)...)
 	}
 }
 
@@ -237,6 +239,7 @@ func (w *IncomingWebhook) Route(r *wkhttp.WKHttp) {
 // 处理器可从 c.MustGet("uid") 取到操作者身份：
 //   - 用户侧（本模块 Route）：AuthMiddleware 写入登录 uid；
 //   - bot 侧（bot_api 模块）：authBot 后由适配中间件把 robot_id 写入 "uid"。
+//
 // 权限矩阵由 resolveActor + 各 handler 的所有权判断统一实施，与挂载面无关。
 func (w *IncomingWebhook) MountManagementRoutes(g *wkhttp.RouterGroup) {
 	// 总开关(system_setting incomingwebhook.enabled)关闭时，写操作一律 403 拒绝，
@@ -391,14 +394,15 @@ func publicURL(webhookID, token string) string {
 	return fmt.Sprintf("/v1/incoming-webhooks/%s/%s", webhookID, token)
 }
 
-// publicURLs 构造各推送形态的对外路径（#297 顺延的 onboarding 项）：native 即历史
-// 契约的 url 字段，github / wecom 为平台适配器后缀。与 publicURL 一样不含 host。
+// publicURLs 构造各推送形态的对外路径（#297 顺延的 onboarding 项 / #426）：native 即
+// 历史契约的 url 字段，github / wecom / multica 为平台适配器后缀。与 publicURL 一样不含 host。
 func publicURLs(webhookID, token string) map[string]string {
 	base := publicURL(webhookID, token)
 	return map[string]string{
-		"native": base,
-		"github": base + "/github",
-		"wecom":  base + "/wecom",
+		"native":  base,
+		"github":  base + "/github",
+		"wecom":   base + "/wecom",
+		"multica": base + "/multica",
 	}
 }
 
@@ -1067,11 +1071,12 @@ func (w *IncomingWebhook) failAuth(c *wkhttp.Context, ip string) {
 	pushUnauthorized(c)
 }
 
-// push / pushGitHub / pushWeCom 是三种推送形态的路由入口，全部走 handlePush 流水线，
-// 只差 body 解析（pushAdapter.parse，见 adapter.go）。
-func (w *IncomingWebhook) push(c *wkhttp.Context)       { w.handlePush(c, nativeAdapter) }
-func (w *IncomingWebhook) pushGitHub(c *wkhttp.Context) { w.handlePush(c, githubAdapter) }
-func (w *IncomingWebhook) pushWeCom(c *wkhttp.Context)  { w.handlePush(c, wecomAdapter) }
+// push / pushGitHub / pushWeCom / pushMultica 是各种推送形态的路由入口，全部走 handlePush
+// 流水线，仅在 adapter（body 解析 / bodyLimit / successExtra）上分叉。
+func (w *IncomingWebhook) push(c *wkhttp.Context)        { w.handlePush(c, nativeAdapter) }
+func (w *IncomingWebhook) pushGitHub(c *wkhttp.Context)  { w.handlePush(c, githubAdapter) }
+func (w *IncomingWebhook) pushWeCom(c *wkhttp.Context)   { w.handlePush(c, wecomAdapter) }
+func (w *IncomingWebhook) pushMultica(c *wkhttp.Context) { w.handlePush(c, multicaAdapter) }
 
 func (w *IncomingWebhook) handlePush(c *wkhttp.Context, ad pushAdapter) {
 	// 仅用于"鉴权失败才计入"的 per-IP 失败预算（见 failAuth / ipFailureGateMiddleware）。

@@ -47,6 +47,7 @@
 POST /v1/incoming-webhooks/:webhook_id/:token            # native（本文主体）
 POST /v1/incoming-webhooks/:webhook_id/:token/github     # GitHub 事件适配器
 POST /v1/incoming-webhooks/:webhook_id/:token/wecom      # 企业微信群机器人格式适配器
+POST /v1/incoming-webhooks/:webhook_id/:token/multica    # Multica 出站 webhook 适配器
 Content-Type: application/json
 ```
 
@@ -185,6 +186,42 @@ curl -X POST "$BASE/v1/incoming-webhooks/$WEBHOOK_ID/$TOKEN/wecom" \
   -d '{"msgtype":"markdown","markdown":{"content":"**Build #123** passed"}}'
 ```
 
+### Multica（出站 webhook 格式）
+
+```
+POST /v1/incoming-webhooks/:webhook_id/:token/multica
+```
+
+接受 [Multica](https://github.com/multica-ai/multica) 出站 webhook 的固定 JSON
+信封——在 Multica 工作区 Settings → Webhooks 把 URL 配成上述地址即可，无需中间
+转换层。鉴权沿用 URL 内 token；Multica 出站请求会带 `X-Multica-Signature-256`
+（与 GitHub 的 `X-Hub-Signature-256` 同算法），与 github 适配器对称——目前不校验，
+留作后续可选项。
+
+| `event` | 渲染 |
+|---------|------|
+| `issue.status_changed` | `**MUL-123** Title: ` + 状态变化（如 `` `todo` → `in_progress` ``） + actor 类型尾注 |
+
+子集之外的事件（`issue.created` / `comment.created` 等未来事件）返回 200 +
+`{"skipped":"event"}`（deliveries 里 `status=3`/`reason=event` 可见，与 github
+适配器一致）；payload 解析失败 → 400 `reason=json`；事件已识别但 issue 关键
+字段（identifier / status）缺失 → 400 `reason=content`。
+
+**body 上限：** 与 native 同为 8 KiB——Multica 信封比 GitHub 事件紧凑（只嵌
+单个 issue），不需要 github 那种 1 MiB 上限。
+
+**展示身份：** 与其它适配器一致，固定为 webhook 配置；信封里没有 `username` /
+`avatar_url` 字段。
+
+```bash
+# 把 Multica outbound webhook URL 配成 octo 适配器路径即可
+curl -X POST "$BASE/v1/incoming-webhooks/$WEBHOOK_ID/$TOKEN/multica" \
+  -H 'Content-Type: application/json' \
+  -d '{"event":"issue.status_changed","actor":{"type":"member","id":"u-1"},
+       "issue":{"identifier":"MUL-123","title":"Fix login","status":"in_progress"},
+       "previous_status":"todo"}'
+```
+
 ## 通用字段与安全
 
 - `username` / `avatar_url`：两种形态通用，服务端裁剪到字节上限（名 64B / 头像 255B）。
@@ -209,7 +246,7 @@ curl -X POST "$BASE/v1/incoming-webhooks/$WEBHOOK_ID/$TOKEN/wecom" \
 需登录态 + 群管理员权限，路径前缀 `/v1/groups/:group_no/incoming-webhooks`。
 
 创建 / 重置（regenerate）响应除历史的 `url`（native 路径）外，还带 `urls` 对象，
-按推送形态给出全部路径（`native` / `github` / `wecom`，不含 host，由前端拼接）。
+按推送形态给出全部路径（`native` / `github` / `wecom` / `multica`，不含 host，由前端拼接）。
 token 仅在这两处出现一次，list 不回显 token、也不回推送 URL。
 
 除创建/列出/更新/删除/重置外，Phase 2 新增两个：
