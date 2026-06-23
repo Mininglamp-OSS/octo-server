@@ -41,6 +41,10 @@ var Commit string     // git commit id
 var CommitDate string // git commit date
 var TreeState string  // git tree state
 
+func globalRateLimitExcludePaths() []string {
+	return []string{"/v1/ping", "/v1/health", "/v1/ready"}
+}
+
 func loadConfigFromFile(cfgFile string) *viper.Viper {
 	vp := viper.New()
 	vp.SetConfigFile(cfgFile)
@@ -182,7 +186,7 @@ func runAPI(ctx *config.Context) {
 		o.MaxRetries = 1
 		o.PoolSize = 10
 	}))
-	route.Use(route.RateLimitMiddleware(context.Background(), rlRedis, rps, burst, "/v1/ping"))
+	route.Use(route.RateLimitMiddleware(context.Background(), rlRedis, rps, burst, globalRateLimitExcludePaths()...))
 	// CORS 白名单覆盖：dmwork-lib 的 server.New 默认注入 "*" + Credentials:true，
 	// 本中间件在其后执行，按 DM_CORS_ALLOWED_ORIGINS 重写/剥离 Allow-Origin/Credentials。
 	// 未配置时等价于禁用跨域（剥离所有 CORS 响应头），仅允许同源调用。

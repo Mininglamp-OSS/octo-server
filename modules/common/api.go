@@ -32,10 +32,11 @@ import (
 type Common struct {
 	ctx *config.Context
 	log.Log
-	db             *db
-	appConfigDB    *appConfigDB
-	systemSettings *SystemSettings
-	threadOn       int // 缓存 DM_THREAD_ON 环境变量
+	db               *db
+	appConfigDB      *appConfigDB
+	systemSettings   *SystemSettings
+	readinessChecker readinessChecker
+	threadOn         int // 缓存 DM_THREAD_ON 环境变量
 }
 
 // New New
@@ -44,13 +45,15 @@ func New(ctx *config.Context) *Common {
 	if t := strings.ToLower(os.Getenv("DM_THREAD_ON")); t == "true" || t == "1" {
 		threadOn = 1
 	}
+	database := newDB(ctx.DB())
 	return &Common{
-		ctx:            ctx,
-		db:             newDB(ctx.DB()),
-		appConfigDB:    newAppConfigDB(ctx),
-		systemSettings: EnsureSystemSettings(ctx),
-		Log:            log.NewTLog("common"),
-		threadOn:       threadOn,
+		ctx:              ctx,
+		db:               database,
+		appConfigDB:      newAppConfigDB(ctx),
+		systemSettings:   EnsureSystemSettings(ctx),
+		readinessChecker: newDependencyReadinessChecker(ctx, database),
+		Log:              log.NewTLog("common"),
+		threadOn:         threadOn,
 	}
 }
 
@@ -82,37 +85,8 @@ func (cn *Common) Route(r *wkhttp.WKHttp) {
 		commonNoAuth.GET("/changelog", cn.changelog)           // 版本更新日志（公开）
 	}
 
-	r.GET("/v1/health", func(c *wkhttp.Context) {
-		var (
-			statusMap = map[string]string{
-				"status": "up",
-				"db":     "up",
-				"redis":  "up",
-			}
-			lastError error
-		)
-
-		err := cn.db.session.Ping()
-		if err != nil {
-			cn.Error("db ping error", zap.Error(err))
-			lastError = err
-			statusMap["db"] = "down"
-		}
-
-		_, err = cn.ctx.GetRedisConn().Ping()
-		if err != nil {
-			cn.Error("redis ping error", zap.Error(err))
-			lastError = err
-			statusMap["redis"] = "down"
-		}
-
-		if lastError != nil {
-			statusMap["status"] = "down"
-			statusMap["error"] = lastError.Error()
-		}
-
-		c.JSON(http.StatusOK, statusMap)
-	})
+	r.GET("/v1/health", cn.health)
+	r.GET("/v1/ready", cn.ready)
 
 	appConfigM, err := cn.insertAppConfigIfNeed()
 	if err != nil {
