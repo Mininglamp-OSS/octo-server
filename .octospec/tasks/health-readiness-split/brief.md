@@ -44,6 +44,7 @@ MySQL `Ping()`, and Redis `Ping()`.
 - `/v1/ready` checks DB/Redis with bounded timeout and returns `503` when any
   dependency is down.
 - `/v1/ready` response includes safe `up/down` status fields only.
-- `/v1/health` and `/v1/ready` are excluded from the global Redis-backed IP
-  limiter.
+- `/v1/health` is excluded from the global Redis-backed IP limiter; `/v1/ready`
+  keeps the global limiter because it touches DB/Redis dependencies.
+- `/v1/health` and `/v1/ready` are excluded from high-volume access logging.
 - Focused Go tests pass for `./modules/common`.

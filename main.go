@@ -42,7 +42,7 @@ var CommitDate string // git commit date
 var TreeState string  // git tree state
 
 func globalRateLimitExcludePaths() []string {
-	return []string{"/v1/ping", "/v1/health", "/v1/ready"}
+	return []string{"/v1/ping", "/v1/health"}
 }
 
 func loadConfigFromFile(cfgFile string) *viper.Viper {
@@ -357,6 +357,8 @@ func ingorePaths() []string {
 	return []string{
 		"/v1/robots/:robot_id/:app_key/events",
 		"/v1/ping",
+		"/v1/health",
+		"/v1/ready",
 	}
 }
 
