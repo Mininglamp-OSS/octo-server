@@ -56,7 +56,11 @@ func readinessRedisOptions(cfg *config.Config) *rd.Options {
 }
 
 func (cn *Common) health(c *wkhttp.Context) {
-	c.JSON(http.StatusOK, map[string]string{"status": healthStatusUp})
+	c.JSON(http.StatusOK, map[string]string{
+		"status": healthStatusUp,
+		"db":     healthStatusUp,
+		"redis":  healthStatusUp,
+	})
 }
 
 func (cn *Common) ready(c *wkhttp.Context) {

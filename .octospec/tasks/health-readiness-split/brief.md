@@ -41,7 +41,8 @@ MySQL `Ping()`, and Redis `Ping()`.
 
 ## Acceptance
 
-- `/v1/health` does not call DB or Redis and returns `200 {"status":"up"}`.
+- `/v1/health` does not call DB or Redis and keeps the legacy success shape:
+  `200 {"status":"up","db":"up","redis":"up"}`.
 - `/v1/ready` checks DB/Redis with bounded timeout and returns `503` when any
   dependency is down.
 - `/v1/ready` response includes safe `up/down` status fields only.

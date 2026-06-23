@@ -46,7 +46,7 @@ func TestHealthIsPureLiveness(t *testing.T) {
 	r.ServeHTTP(w, req)
 
 	require.Equal(t, http.StatusOK, w.Code)
-	require.JSONEq(t, `{"status":"up"}`, w.Body.String())
+	require.JSONEq(t, `{"status":"up","db":"up","redis":"up"}`, w.Body.String())
 	require.Equal(t, int32(0), atomic.LoadInt32(&checker.calls), "liveness must not call dependency readiness checker")
 }
 
