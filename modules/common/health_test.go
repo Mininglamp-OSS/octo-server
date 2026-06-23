@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/stretchr/testify/require"
 )
@@ -98,4 +99,33 @@ func TestReadyBoundsCheckerWithTimeout(t *testing.T) {
 	require.Equal(t, http.StatusServiceUnavailable, w.Code)
 	require.Less(t, time.Since(started), time.Second, "readiness timeout must stay bounded")
 	require.Equal(t, int32(1), atomic.LoadInt32(&checker.calls))
+}
+
+func TestReadyReturnsWhenCheckerIgnoresContext(t *testing.T) {
+	checker := &fakeReadinessChecker{
+		check: func(context.Context) readinessResult {
+			time.Sleep(readinessProbeTimeout * 2)
+			return readinessResult{Status: healthStatusUp}
+		},
+	}
+	cn := &Common{readinessChecker: checker}
+	r := wkhttp.New()
+	r.GET("/v1/ready", cn.ready)
+
+	started := time.Now()
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/ready", nil)
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, w.Code)
+	require.Less(t, time.Since(started), 750*time.Millisecond, "readiness must return on its own deadline even if a checker ignores ctx")
+	require.JSONEq(t, `{"status":"down","dependencies":{"db":"down","redis":"down"}}`, w.Body.String())
+	require.Equal(t, int32(1), atomic.LoadInt32(&checker.calls))
+}
+
+func TestReadinessRedisOptionsUseBoundedPoolTimeout(t *testing.T) {
+	opts := readinessRedisOptions(config.New())
+
+	require.Equal(t, readinessRedisPoolTimeout, opts.PoolTimeout)
+	require.Less(t, opts.PoolTimeout, readinessProbeTimeout)
 }

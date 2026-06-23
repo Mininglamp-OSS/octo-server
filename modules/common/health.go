@@ -18,7 +18,8 @@ const (
 	healthStatusUp   = "up"
 	healthStatusDown = "down"
 
-	readinessProbeTimeout = 500 * time.Millisecond
+	readinessProbeTimeout     = 500 * time.Millisecond
+	readinessRedisPoolTimeout = 100 * time.Millisecond
 )
 
 type readinessResult struct {
@@ -37,17 +38,21 @@ type dependencyReadinessChecker struct {
 }
 
 func newDependencyReadinessChecker(ctx *config.Context, db *db) readinessChecker {
-	redisClient := rd.NewClient(octoredis.MustBuildOptions(ctx.GetConfig(), func(o *rd.Options) {
+	return &dependencyReadinessChecker{
+		db:          db,
+		redisClient: rd.NewClient(readinessRedisOptions(ctx.GetConfig())),
+	}
+}
+
+func readinessRedisOptions(cfg *config.Config) *rd.Options {
+	return octoredis.MustBuildOptions(cfg, func(o *rd.Options) {
 		o.MaxRetries = 0
 		o.PoolSize = 2
 		o.DialTimeout = readinessProbeTimeout
 		o.ReadTimeout = readinessProbeTimeout
 		o.WriteTimeout = readinessProbeTimeout
-	}))
-	return &dependencyReadinessChecker{
-		db:          db,
-		redisClient: redisClient,
-	}
+		o.PoolTimeout = readinessRedisPoolTimeout
+	})
 }
 
 func (cn *Common) health(c *wkhttp.Context) {
@@ -72,7 +77,24 @@ func (cn *Common) ready(c *wkhttp.Context) {
 		return
 	}
 
-	result := checker.Check(ctx)
+	resultCh := make(chan readinessResult, 1)
+	go func() {
+		resultCh <- checker.Check(ctx)
+	}()
+
+	var result readinessResult
+	select {
+	case result = <-resultCh:
+	case <-ctx.Done():
+		result = readinessResult{
+			Status: healthStatusDown,
+			Dependencies: map[string]string{
+				"db":    healthStatusDown,
+				"redis": healthStatusDown,
+			},
+			Errors: map[string]error{"readiness": ctx.Err()},
+		}
+	}
 	cn.logReadinessErrors(result.Errors)
 	statusCode := http.StatusOK
 	if result.Status != healthStatusUp {

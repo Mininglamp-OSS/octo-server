@@ -27,8 +27,9 @@ MySQL `Ping()`, and Redis `Ping()`.
 - `/v1/health` response semantics change from dependency probe to process
   liveness.
 - Add `/v1/ready` as the dependency readiness endpoint.
-- Global Redis-backed rate limiting must not add Redis latency to health or
-  readiness probe paths.
+- Global Redis-backed rate limiting must not add Redis latency to the liveness
+  probe path. Readiness intentionally keeps the global limiter because it
+  touches DB/Redis dependencies.
 - Dependency errors must be logged server-side and not exposed as raw response
   strings.
 
