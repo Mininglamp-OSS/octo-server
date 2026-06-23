@@ -26,7 +26,9 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	commonmod "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/robot"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"github.com/go-redis/redis"
@@ -70,9 +72,14 @@ const (
 type IncomingWebhook struct {
 	ctx *config.Context
 	log.Log
-	db        *incomingWebhookDB
-	groupDB   *group.DB
-	rateRedis *redis.Client
+	db      *incomingWebhookDB
+	groupDB *group.DB
+	// groupService / robotService 仅服务 @所有 AI 的展开（fetchBotMemberUIDs：
+	// GetMembers + ExistRobot）。复用与 message / bot_api 入口相同的这对接口，保证
+	// webhook 的 @所有 AI 与其它入口解析出的 bot 集合一致（parity）。
+	groupService group.IService
+	robotService robot.IService
+	rateRedis    *redis.Client
 	// auditSem 给 push 成功后的异步审计(recordSuccess)限并发：每次推送有两次 DB 写，
 	// 无界 `go recordSuccess` 在 Redis 限流 fail-open + 推送洪峰下会无限堆 goroutine、
 	// 压垮 DB 连接池。用带缓冲 channel 作信号量给审计的 DB 操作总并发封顶——满了就**丢弃**
@@ -176,6 +183,8 @@ func newIncomingWebhook(ctx *config.Context) *IncomingWebhook {
 		Log:          log.NewTLog("IncomingWebhook"),
 		db:           newDB(ctx),
 		groupDB:      group.NewDB(ctx),
+		groupService: group.NewService(ctx),
+		robotService: robot.NewService(ctx),
 		rateRedis:    sharedRateRedis(ctx.GetConfig()),
 		auditSem:     make(chan struct{}, auditConcurrency()),
 		floor:        newLocalFloor(),
@@ -376,14 +385,16 @@ func autoWebhookName(webhookID string) string {
 
 func toResp(m *incomingWebhookModel) webhookResp {
 	r := webhookResp{
-		WebhookID:  m.WebhookID,
-		GroupNo:    m.GroupNo,
-		Name:       m.Name,
-		Avatar:     m.Avatar,
-		CreatorUID: m.CreatorUID,
-		Status:     m.Status,
-		CallCount:  m.CallCount,
-		CreatedAt:  time.Time(m.CreatedAt).Unix(),
+		WebhookID:        m.WebhookID,
+		GroupNo:          m.GroupNo,
+		Name:             m.Name,
+		Avatar:           m.Avatar,
+		CreatorUID:       m.CreatorUID,
+		Status:           m.Status,
+		AllowMentionAll:  m.AllowMentionAll,
+		AllowMentionBots: m.AllowMentionBots,
+		CallCount:        m.CallCount,
+		CreatedAt:        time.Time(m.CreatedAt).Unix(),
 	}
 	if m.LastUsedAt.Valid {
 		r.LastUsedAt = m.LastUsedAt.Time.Unix()
@@ -620,6 +631,9 @@ func (w *IncomingWebhook) create(c *wkhttp.Context) {
 		mgmtRequestInvalid(c, "avatar")
 		return
 	}
+	// 广播能力位（@所有人 / @所有 AI）可由任意合法成员在自建 webhook 上开启——与「成员可
+	// 自建/自管 webhook」一致。能力位仍是 per-webhook 粒度、默认关、需显式打开，作为广播
+	// 这类高噪声能力的唯一闸（不再额外要求管理员授予）。
 
 	// 查询 group 拿 space_id；同时确保群处于 Normal 状态。
 	// 已解散/已禁用的群禁止创建新 webhook，避免 disband 后被 stale 管理员复活。
@@ -648,14 +662,16 @@ func (w *IncomingWebhook) create(c *wkhttp.Context) {
 	}
 
 	m := &incomingWebhookModel{
-		WebhookID:  webhookID,
-		TokenHash:  hash,
-		GroupNo:    groupNo,
-		SpaceID:    g.SpaceID,
-		Name:       req.Name,
-		Avatar:     req.Avatar,
-		CreatorUID: actor.uid,
-		Status:     statusEnabled,
+		WebhookID:        webhookID,
+		TokenHash:        hash,
+		GroupNo:          groupNo,
+		SpaceID:          g.SpaceID,
+		Name:             req.Name,
+		Avatar:           req.Avatar,
+		CreatorUID:       actor.uid,
+		Status:           statusEnabled,
+		AllowMentionAll:  boolToInt(boolPtrTrue(req.AllowMentionAll)),
+		AllowMentionBots: boolToInt(boolPtrTrue(req.AllowMentionBots)),
 	}
 	// 配额校验 + 写入在事务内原子完成；FOR UPDATE 锁住 group_no 范围，防止并发越限。
 	//
@@ -795,6 +811,15 @@ func (w *IncomingWebhook) update(c *wkhttp.Context) {
 			}
 		}
 		fields["status"] = *req.Status
+	}
+	// 广播能力位可由 webhook 的合法成员自行开关（requireOwnership 已确认调用方是创建者
+	// 或管理员，即只能改自己有权管理的 webhook）——与 create 同口径，能力位仍默认关、
+	// per-webhook 粒度、需显式打开。
+	if req.AllowMentionAll != nil {
+		fields["allow_mention_all"] = boolToInt(*req.AllowMentionAll)
+	}
+	if req.AllowMentionBots != nil {
+		fields["allow_mention_bots"] = boolToInt(*req.AllowMentionBots)
 	}
 	if len(fields) == 0 {
 		c.Response(toResp(m))
@@ -1289,6 +1314,33 @@ func (w *IncomingWebhook) handlePush(c *wkhttp.Context, ad pushAdapter) {
 		return
 	}
 
+	// 6.5) @ 提及：仅 native 形态处理（ad.allowMention）。buildMention 把调用方的
+	// mention{uids,all,bots} 翻译成消息 payload 的 mention 子对象——定向 uids 过群成员闸、
+	// 广播位过 per-webhook 能力位；mention 作为【显式白名单字段】挂进 payload（绝不走 Extra
+	// 透传，见 buildPayload 注释）。挂上后对 @所有 AI 调 ExpandAisToBotUIDs 展开为群内全部
+	// bot 成员 UID（GROUP-only，与 message/bot_api 入口同一 helper，bot 集合一致）。
+	// 其余 mention 语义（真人红点、唤起 bot）全由下游既有 message 监听器完成，本模块零参与。
+	// mention 与 msg_type 无关：text / richtext 两条 native 路径都接 @（语义一致）。
+	var mentionIgnored []string
+	if ad.allowMention {
+		// 广播放行策略（即时可收回，无需迁移）：system_setting member_can_broadcast 开，
+		// 或该 webhook 的创建者当前仍是群管理员（creatorIsAdmin，取自上面的成员闸查询）。
+		// 关掉设置即把全部【成员】创建的 webhook 的广播位立即剥离；管理员建的不受影响。
+		// 定向 @uid 不走此闸（不是广播、风险低）。
+		broadcastPermitted := w.settings.IncomingWebhookMemberCanBroadcast() || creatorIsAdmin
+		mention, ignored := w.buildMention(m, req, broadcastPermitted)
+		mentionIgnored = ignored
+		if mention != nil {
+			payload[mentionrewrite.MentionKey] = mention
+			// 与 message/robot/bot_api 入口一致：在 clone 上做 ais→bot uid 展开，避免就地
+			// 改写共享 map（本路径 payload 随即序列化、当前无下游读取，但仍守该约定，PR #145）。
+			wire := mentionrewrite.CloneForExpansion(payload)
+			wire = mentionrewrite.ExpandAisToBotUIDs(
+				wire, common.ChannelTypeGroup.Uint8(), m.GroupNo, w.fetchBotMemberUIDs)
+			payload = wire
+		}
+	}
+
 	resp, err := w.ctx.SendMessageWithResult(&config.MsgSendReq{
 		// RedDot=1 让 webhook 消息触发未读红点和推送，与 botfather/robot 一致。
 		Header:      config.MsgHeader{RedDot: 1},
@@ -1315,7 +1367,13 @@ func (w *IncomingWebhook) handlePush(c *wkhttp.Context, ad pushAdapter) {
 	// 真实推送成功累加 call_count / last_used_at。
 	w.submitSuccess(m, len(body), ip, msgID, ad.name, true)
 
-	c.Response(successBody(ad, msgID, ""))
+	respBody := successBody(ad, msgID, "")
+	// mention_ignored 回报因能力位未开而被忽略的广播位（all / bots），便于调用方排障；
+	// 定向 uids 中的非成员已在 buildMention 静默丢弃（反枚举），不在此回显。
+	if len(mentionIgnored) > 0 {
+		respBody["mention_ignored"] = mentionIgnored
+	}
+	c.Response(respBody)
 }
 
 // 与 create/update 路径的 webhook 名称/头像列长度约束一致，避免 push 路径成为绕过。

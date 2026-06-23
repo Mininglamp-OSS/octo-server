@@ -126,10 +126,12 @@ func (d *incomingWebhookDB) queryByGroupNo(groupNo string) ([]*incomingWebhookMo
 // updateFieldsAllowed 限定 updateFields 可写的列，防御未来调用方误传用户输入作 key
 // 触发任意列改写。新增可更新列时显式在此追加。
 var updateFieldsAllowed = map[string]struct{}{
-	"name":       {},
-	"avatar":     {},
-	"status":     {},
-	"token_hash": {},
+	"name":               {},
+	"avatar":             {},
+	"status":             {},
+	"token_hash":         {},
+	"allow_mention_all":  {},
+	"allow_mention_bots": {},
 }
 
 // updateFields 更新单个 webhook 的允许列。带 status != statusDeleted 守卫：对已软删除
@@ -195,6 +197,40 @@ func (d *incomingWebhookDB) queryMemberRole(groupNo, uid string) (isMember, isAd
 		return false, false, err
 	}
 	return true, roles[0] == group.MemberRoleCreator || roles[0] == group.MemberRoleManager, nil
+}
+
+// filterGroupMembers 返回 uids 中【当前是 groupNo 内部正常成员】的子集（成员闸）。
+// 用于 push 路径的定向 @ 校验：webhook token 是写进 CI/平台配置的低信任共享密钥，必须
+// 把 @ 目标收敛到本群成员，杜绝「泄露的 token @ 任意平台用户 / 跨 Space 身份」以及借
+// 「@<uid> 是否被保留」探测成员归属。成员定义与 queryMemberRole 同口径（is_deleted=0
+// + is_external=0 + status=Normal）——外部成员在 v1 刻意不可被 @（空间隔离保守取舍）。
+//
+// 直接点读 group_member 表（与 queryMemberRole 一致，该表已是跨模块既有读取面），用
+// IN 一次取回命中子集；uids 由调用方先去重并钳到上限，IN 列表有界。空入参短路返回。
+//
+// ⚠️ 与 @所有 AI 的非对称是【有意】的：定向 @uid 走本闸、排除外部成员（保守）；而
+// @所有 AI(ais) 的 bot 展开走 fetchBotMemberUIDs→GetMembers，与 message/bot_api 入口
+// 同源、只排除已删成员（故可能含外部 bot 成员）——广播侧取 parity。两条路径都不越群/
+// 越 Space（都以本群成员为界，外部 bot 也确是本群成员），差异仅是「定向保守 vs 广播对齐
+// 其它入口」的取舍，非遗漏。
+func (d *incomingWebhookDB) filterGroupMembers(groupNo string, uids []string) (map[string]struct{}, error) {
+	out := make(map[string]struct{}, len(uids))
+	if groupNo == "" || len(uids) == 0 {
+		return out, nil
+	}
+	var got []string
+	_, err := d.session.Select("uid").From("group_member").
+		Where("group_no=?", groupNo).
+		Where("uid in ?", uids).
+		Where("is_deleted=0 AND is_external=0 AND status=?", int(common.GroupMemberStatusNormal)).
+		Load(&got)
+	if err != nil {
+		return nil, err
+	}
+	for _, u := range got {
+		out[u] = struct{}{}
+	}
+	return out, nil
 }
 
 // disableEnabledByWebhookID 把【仍处于启用态】的单个 webhook 置为禁用，用于 push

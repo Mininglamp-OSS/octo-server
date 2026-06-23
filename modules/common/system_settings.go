@@ -561,12 +561,15 @@ const (
 	envIncomingWebhookPerWebhookBurst = "DM_INCOMINGWEBHOOK_BURST"
 	envIncomingWebhookMaxPerGroup     = "DM_INCOMINGWEBHOOK_MAX_PER_GROUP"
 	envIncomingWebhookMaxPerCreator   = "DM_INCOMINGWEBHOOK_MAX_PER_CREATOR"
+	// 控制非管理员成员创建的 webhook 是否可用广播型 @（@所有人 / @所有 AI）。
+	envIncomingWebhookMemberCanBroadcast = "OCTO_INCOMINGWEBHOOK_MEMBER_CAN_BROADCAST"
 
-	defaultIncomingWebhookEnabled         = true
-	defaultIncomingWebhookPerWebhookRPS   = 5.0
-	defaultIncomingWebhookPerWebhookBurst = 10
-	defaultIncomingWebhookMaxPerGroup     = 10
-	defaultIncomingWebhookMaxPerCreator   = 5
+	defaultIncomingWebhookEnabled            = true
+	defaultIncomingWebhookPerWebhookRPS      = 5.0
+	defaultIncomingWebhookPerWebhookBurst    = 10
+	defaultIncomingWebhookMaxPerGroup        = 10
+	defaultIncomingWebhookMaxPerCreator      = 5
+	defaultIncomingWebhookMemberCanBroadcast = true
 )
 
 // IncomingWebhookEnabled 是群入站 Webhook 功能的总开关。关闭后 push 端点返回 404、
@@ -574,6 +577,15 @@ const (
 // 回退链：DB → env(DM_INCOMINGWEBHOOK_ENABLED) → 默认开启(true)。
 func (s *SystemSettings) IncomingWebhookEnabled() bool {
 	return s.getBool("incomingwebhook", "enabled", incomingWebhookEnabledEnvDefault())
+}
+
+// IncomingWebhookMemberCanBroadcast 控制【非管理员成员】创建的 webhook 是否可使用广播型
+// @（@所有人 / @所有 AI）。关闭后，成员建的 webhook 即便已置 allow_mention_* 能力位，其
+// 广播也在 push 读路径被剥离（mention_ignored 回报）；【管理员创建】的 webhook 不受影响。
+// 因为是 push 读侧 AND（参见 incomingwebhook.buildMention），翻此开关可【即时收回】全部成员
+// 广播、无需迁移存量列。回退链：DB → env(OCTO_INCOMINGWEBHOOK_MEMBER_CAN_BROADCAST) → 默认开启(true)。
+func (s *SystemSettings) IncomingWebhookMemberCanBroadcast() bool {
+	return s.getBool("incomingwebhook", "member_can_broadcast", incomingWebhookMemberCanBroadcastEnvDefault())
 }
 
 // IncomingWebhookPerWebhookRPS 单个 webhook 令牌桶速率(rps)。DB → env → 默认 5。
@@ -636,6 +648,22 @@ func incomingWebhookEnabledEnvDefault() bool {
 		return true
 	}
 	return defaultIncomingWebhookEnabled
+}
+
+// incomingWebhookMemberCanBroadcastEnvDefault 解析 OCTO_INCOMINGWEBHOOK_MEMBER_CAN_BROADCAST
+// （缺省/无法识别视为开启），作为 DB 未配置时的 fallback。语义同 incomingWebhookEnabledEnvDefault。
+func incomingWebhookMemberCanBroadcastEnvDefault() bool {
+	v := strings.TrimSpace(os.Getenv(envIncomingWebhookMemberCanBroadcast))
+	if v == "" {
+		return defaultIncomingWebhookMemberCanBroadcast
+	}
+	switch strings.ToLower(v) {
+	case "0", "false", "no", "off":
+		return false
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return defaultIncomingWebhookMemberCanBroadcast
 }
 
 // incomingWebhookMaxPerGroupEnvDefault 解析 DM_INCOMINGWEBHOOK_MAX_PER_GROUP；仅

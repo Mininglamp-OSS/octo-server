@@ -1,0 +1,38 @@
+slug: incoming-webhook-mention
+rules_injected:
+  - id: trust-boundary
+    tier: repo
+    load_bearing: true
+    why: incomingwebhook push is attacker-controlled ingress; mention is a whitelisted
+         structured field (never extra passthrough); uids bounded + member-gated;
+         feature gated to native adapter (parity preserved — structured UIDs, not markdown).
+  - id: space-isolation
+    tier: repo
+    load_bearing: true
+    why: mention targets filtered to current internal-normal members of the webhook's
+         group_no; a group-scoped token cannot ping arbitrary or cross-Space identities.
+  - id: error-handling
+    tier: repo
+    load_bearing: true
+    why: management-side capability gate reuses mgmtRequestInvalid (ErrIncomingWebhookRequestInvalid);
+         no new error codes added; push-side ignored/dropped feedback is non-fatal 200 body, not an error.
+  - id: testing
+    tier: repo
+    load_bearing: false
+    why: new mention_test.go + extend TestIncomingWebhookNoLegacyResponseError file list.
+  - id: commit-style
+    tier: repo
+    load_bearing: false
+    why: Conventional Commits, English.
+files_touched:
+  - modules/incomingwebhook/model.go        # mentionReq, model+req+resp switch fields
+  - modules/incomingwebhook/api.go          # struct wiring, handlePush mention attach, create/update gates, toResp
+  - modules/incomingwebhook/adapter.go      # pushAdapter.allowMention (native-only)
+  - modules/incomingwebhook/mention.go      # buildMention + helpers (new)
+  - modules/incomingwebhook/mention_expand.go # fetchBotMemberUIDs composer (new)
+  - modules/incomingwebhook/db.go           # filterGroupMembers
+  - modules/incomingwebhook/sql/20260623000001_incomingwebhook_mention_switches.sql # new columns
+parity_decisions:
+  - "@所有 AI expansion reuses pkg/mentionrewrite.ExpandAisToBotUIDs with GetMembers+ExistRobot, identical to modules/bot_api + modules/message ingresses."
+  - "wire mention shape {uids:[]interface{}, humans:1, ais:1} matches message/api_reminders.go getMention + pkg/mentionrewrite keys."
+  - "reminders/red-dot/bot-summon happen downstream via the sender-agnostic message listener — no message-module change."

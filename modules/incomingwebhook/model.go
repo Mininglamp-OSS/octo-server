@@ -1,6 +1,8 @@
 package incomingwebhook
 
 import (
+	"encoding/json"
+
 	"github.com/Mininglamp-OSS/octo-lib/pkg/db"
 	"github.com/gocraft/dbr/v2"
 )
@@ -28,8 +30,16 @@ type incomingWebhookModel struct {
 	Avatar     string
 	CreatorUID string
 	Status     int
-	LastUsedAt dbr.NullTime
-	CallCount  int64
+	// AllowMentionAll / AllowMentionBots 是【广播型 @】的 per-webhook 能力位
+	// （0=否[默认] / 1=是）：分别授权该 webhook 推送 @所有人(真人广播,→mention.humans)
+	// 与 @所有 AI(bot 广播,→mention.ais)。广播会刷全群红点 / 唤起全部 bot，是高噪声能力，
+	// 故默认关闭、需显式打开；由 webhook 的合法成员（创建者，或群管理员）在 create/update
+	// 时开关——与「成员可自建/自管 webhook」一致，能力位本身即该广播能力的唯一闸。
+	// 定向 @uid（指定一个/多个成员）不受这两个开关约束，但受「群成员闸 + 去重 + 上限」。
+	AllowMentionAll  int
+	AllowMentionBots int
+	LastUsedAt       dbr.NullTime
+	CallCount        int64
 	db.BaseModel
 }
 
@@ -87,6 +97,30 @@ type pushPayloadReq struct {
 	Username  string                 `json:"username,omitempty"`
 	AvatarURL string                 `json:"avatar_url,omitempty"`
 	Extra     map[string]interface{} `json:"extra,omitempty"`
+	// Mention 让调用方 @ 群成员（用户/bot 同一 UID 命名空间，一个或多个）并可选广播。
+	// 仅 native 端点解析（pushAdapter.allowMention），适配器(企业微信/飞书/GitHub…)不支持。
+	// 服务端把它翻译成消息 payload 的 mention 子对象（buildMention），定向 uids 经群成员闸
+	// 过滤、广播位经 per-webhook 能力位放行；其余 mention 语义（红点/唤起 bot）全由下游
+	// 既有 message 监听器完成。绝不透传到 payload，与 Extra 被丢弃同源（见 buildPayload）。
+	//
+	// 类型刻意是 json.RawMessage 而非 *mentionReq：mention 是【可选】字段，其形状非法
+	// （如 uids 传成字符串）不能把整条推送 400 掉——否则相邻的合法 content 也被连累丢弃，
+	// 违反 acceptance #6「malformed mention.uids → no panic, no mention key, 消息照投」。
+	// 故此处只做惰性捕获，真正的宽松解码在 buildMention/decodeMention：解码失败即降级为
+	// 「无 mention」、消息照常投递。
+	Mention json.RawMessage `json:"mention,omitempty"`
+}
+
+// mentionReq 是 native 推送请求里的 @ 描述（对外契约）。刻意不暴露内部线协议的
+// humans/ais/entities 字段名：调用方只描述「@ 谁(uids) / @所有人(all) / @所有 AI(bots)」，
+// 由服务端 buildMention 翻译为 mention.{uids,humans,ais} 并做权限/成员校验。
+//   - Uids ：要 @ 的成员 UID（用户或 bot），去重后受上限约束，且必须是本群当前成员。
+//   - All  ：@所有人（真人广播），受 webhook 的 allow_mention_all 能力位约束。
+//   - Bots ：@所有 AI（bot 广播），受 webhook 的 allow_mention_bots 能力位约束。
+type mentionReq struct {
+	Uids []string `json:"uids,omitempty"`
+	All  bool     `json:"all,omitempty"`
+	Bots bool     `json:"bots,omitempty"`
 }
 
 // webhookBlock 是富文本消息的单个有序块（对外契约）。字段刻意与 octo-lib
@@ -106,16 +140,22 @@ type webhookBlock struct {
 }
 
 // createReq 管理端创建 webhook 的请求体。
+// AllowMention* 为广播能力位，任意合法成员均可设置；缺省/false 即默认关闭。
 type createReq struct {
-	Name   string `json:"name"`
-	Avatar string `json:"avatar,omitempty"`
+	Name             string `json:"name"`
+	Avatar           string `json:"avatar,omitempty"`
+	AllowMentionAll  *bool  `json:"allow_mention_all,omitempty"`
+	AllowMentionBots *bool  `json:"allow_mention_bots,omitempty"`
 }
 
 // updateReq 修改 webhook 的请求体。零值字段不更新。
+// AllowMention* 由 webhook 的合法成员（创建者/管理员）可改。
 type updateReq struct {
-	Name   *string `json:"name,omitempty"`
-	Avatar *string `json:"avatar,omitempty"`
-	Status *int    `json:"status,omitempty"`
+	Name             *string `json:"name,omitempty"`
+	Avatar           *string `json:"avatar,omitempty"`
+	Status           *int    `json:"status,omitempty"`
+	AllowMentionAll  *bool   `json:"allow_mention_all,omitempty"`
+	AllowMentionBots *bool   `json:"allow_mention_bots,omitempty"`
 }
 
 // webhookResp 对外暴露的 webhook 元信息（不含 token / token_hash）。
@@ -127,9 +167,12 @@ type webhookResp struct {
 	Avatar     string `json:"avatar"`
 	CreatorUID string `json:"creator_uid"`
 	Status     int    `json:"status"`
-	LastUsedAt int64  `json:"last_used_at"`
-	CallCount  int64  `json:"call_count"`
-	CreatedAt  int64  `json:"created_at"`
+	// AllowMentionAll / AllowMentionBots 回显广播能力位（0/1），便于管理端 UI 渲染开关。
+	AllowMentionAll  int   `json:"allow_mention_all"`
+	AllowMentionBots int   `json:"allow_mention_bots"`
+	LastUsedAt       int64 `json:"last_used_at"`
+	CallCount        int64 `json:"call_count"`
+	CreatedAt        int64 `json:"created_at"`
 }
 
 // createResp 创建/重置返回；token 仅此一次出现。

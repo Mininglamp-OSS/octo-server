@@ -145,6 +145,26 @@ func TestSystemSettings_IncomingWebhookEnabled_EnvFallbackWhenDBUnset(t *testing
 	assert.False(t, s.IncomingWebhookEnabled(), "DB 未配置 → env=false 生效")
 }
 
+func TestSystemSettings_IncomingWebhookMemberCanBroadcast_DefaultsTrue(t *testing.T) {
+	t.Setenv(envIncomingWebhookMemberCanBroadcast, "")
+	s := newTestSystemSettings(t, nil)
+	assert.True(t, s.IncomingWebhookMemberCanBroadcast(), "DB+env 缺失时默认开启")
+}
+
+func TestSystemSettings_IncomingWebhookMemberCanBroadcast_DBOverridesToFalse(t *testing.T) {
+	t.Setenv(envIncomingWebhookMemberCanBroadcast, "")
+	s := newTestSystemSettings(t, nil)
+	require.NoError(t, s.db.upsert("incomingwebhook", "member_can_broadcast", "0", settingTypeBool, ""))
+	require.NoError(t, s.Reload())
+	assert.False(t, s.IncomingWebhookMemberCanBroadcast(), "DB 0 必须压制默认 true")
+}
+
+func TestSystemSettings_IncomingWebhookMemberCanBroadcast_EnvFallbackWhenDBUnset(t *testing.T) {
+	t.Setenv(envIncomingWebhookMemberCanBroadcast, "false")
+	s := newTestSystemSettings(t, nil)
+	assert.False(t, s.IncomingWebhookMemberCanBroadcast(), "DB 未配置 → env=false 生效")
+}
+
 func TestSystemSettings_IncomingWebhookThresholds_DefaultsAndDBOverride(t *testing.T) {
 	t.Setenv(envIncomingWebhookPerWebhookRPS, "")
 	t.Setenv(envIncomingWebhookPerWebhookBurst, "")
