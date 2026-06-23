@@ -53,8 +53,14 @@ type redisPoolCollector struct {
 func newRedisPoolCollector(clients map[string]*rd.Client) *redisPoolCollector {
 	const ns, sub = metricNamespace, "redis_pool"
 	labels := []string{"client"}
+	// 复制一份调用方传入的 map,避免后续调用方动态增删该 map 时影响 Collect
+	// 读取的 client 集合(Jerry-Xin #442 review)。
+	owned := make(map[string]*rd.Client, len(clients))
+	for name, c := range clients {
+		owned[name] = c
+	}
 	return &redisPoolCollector{
-		clients: clients,
+		clients: owned,
 		totalConns: prometheus.NewDesc(prometheus.BuildFQName(ns, sub, "total_connections"),
 			"Current total number of connections in the redis pool.", labels, nil),
 		idleConns: prometheus.NewDesc(prometheus.BuildFQName(ns, sub, "idle_connections"),

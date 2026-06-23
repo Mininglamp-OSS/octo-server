@@ -155,7 +155,6 @@ func runAPI(ctx *config.Context) {
 	// 指标走全局 DefaultRegisterer, 与 modules/oidc/metrics.go 共享 /metrics 端点。
 	httpMetrics := metrics.NewHTTPMetrics(prometheus.DefaultRegisterer)
 	route.UseGin(httpMetrics.GinMiddleware())
-	metricsSrv := startMetricsScrapeServer()
 	// 用自定义 LogFormatter 替换 gin 默认 access logger：incoming-webhook 推送路由
 	// /v1/incoming-webhooks/{webhook_id}/{token} 把明文 token 写在 URL path 里，
 	// gin 默认 logger 会把整条 path 落进 access log，泄漏 token。accesslog.Formatter
@@ -195,6 +194,9 @@ func runAPI(ctx *config.Context) {
 	metrics.RegisterPoolCollectors(prometheus.DefaultRegisterer, ctx.DB().DB, map[string]*rd.Client{
 		"ratelimit": rlRedis,
 	})
+	// 在所有指标族注册完成后再起 scrape 端点,避免启动窗口内的 scrape 漏掉
+	// 依赖/连接池指标族(Jerry-Xin #442 review)。
+	metricsSrv := startMetricsScrapeServer()
 	// CORS 白名单覆盖：dmwork-lib 的 server.New 默认注入 "*" + Credentials:true，
 	// 本中间件在其后执行，按 DM_CORS_ALLOWED_ORIGINS 重写/剥离 Allow-Origin/Credentials。
 	// 未配置时等价于禁用跨域（剥离所有 CORS 响应头），仅允许同源调用。

@@ -4,10 +4,14 @@ import (
 	"errors"
 	"io"
 	"testing"
+
+	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // fakeUploadService 是 IUploadService 的桩,记录调用并返回预设结果,用于验证
-// Service.UploadFile / Service.GetFile 的计时包裹对返回值/错误完全透明。
+// Service.UploadFile / Service.GetFile 的计时包裹对返回值/错误完全透明,
+// 并且发出预期的依赖指标。
 type fakeUploadService struct {
 	// upload
 	uploadRes   map[string]interface{}
@@ -36,7 +40,42 @@ func (f *fakeUploadService) GetFile(path string) (io.ReadCloser, string, error) 
 	return f.getRC, f.getCT, f.getErr
 }
 
-func TestServiceUploadFile_Transparent(t *testing.T) {
+// newDepRegistry 装一个独立 registry 作为依赖指标的进程默认,供断言指标发射。
+// 返回的 registry 用于 Gather;返回的 restore 在测试结束时恢复包级默认,避免
+// 跨测试污染(metrics 包未导出 reset,故用 NewDependencyMetrics 重设 + cleanup)。
+func newDepRegistry(t *testing.T) *prometheus.Registry {
+	t.Helper()
+	reg := prometheus.NewRegistry()
+	metrics.NewDependencyMetrics(reg) // 同时把该实例设为包级默认
+	return reg
+}
+
+// depOpSampleCount 返回 dmwork_dependency_duration_seconds 上带指定 op label 的
+// 观测次数(SampleCount)。找不到该 op 序列返回 0。
+func depOpSampleCount(t *testing.T, reg *prometheus.Registry, op string) uint64 {
+	t.Helper()
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n uint64
+	for _, mf := range mfs {
+		if mf.GetName() != "dmwork_dependency_duration_seconds" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "op" && l.GetValue() == op {
+					n += m.GetHistogram().GetSampleCount()
+				}
+			}
+		}
+	}
+	return n
+}
+
+func TestServiceUploadFile_TransparentAndObserved(t *testing.T) {
+	reg := newDepRegistry(t)
 	res := map[string]interface{}{"path": "chat/x.png"}
 	fake := &fakeUploadService{uploadRes: res}
 	s := &Service{uploadService: fake, backend: "minio"}
@@ -51,9 +90,14 @@ func TestServiceUploadFile_Transparent(t *testing.T) {
 	if fake.uploadCalls != 1 {
 		t.Fatalf("backend called %d times, want 1", fake.uploadCalls)
 	}
+	// 指标:恰好 1 次 op=upload_file 观测。
+	if c := depOpSampleCount(t, reg, metrics.OpUploadFile); c != 1 {
+		t.Fatalf("op=upload_file sample count = %d, want 1", c)
+	}
 }
 
 func TestServiceUploadFile_TransparentError(t *testing.T) {
+	reg := newDepRegistry(t)
 	wantErr := errors.New("put failed")
 	fake := &fakeUploadService{uploadErr: wantErr}
 	s := &Service{uploadService: fake, backend: "oss"}
@@ -65,9 +109,14 @@ func TestServiceUploadFile_TransparentError(t *testing.T) {
 	if got != nil {
 		t.Fatalf("result = %v, want nil on error", got)
 	}
+	// 错误路径也计入(status=error 由观测层区分),仍是 op=upload_file。
+	if c := depOpSampleCount(t, reg, metrics.OpUploadFile); c != 1 {
+		t.Fatalf("op=upload_file sample count = %d, want 1", c)
+	}
 }
 
-func TestServiceGetFile_Transparent(t *testing.T) {
+func TestServiceGetFile_TransparentAndObserved(t *testing.T) {
+	reg := newDepRegistry(t)
 	rc := io.NopCloser(nil)
 	fake := &fakeUploadService{getRC: rc, getCT: "image/png"}
 	s := &Service{uploadService: fake, backend: "minio"}
@@ -82,13 +131,17 @@ func TestServiceGetFile_Transparent(t *testing.T) {
 	if gotRC != rc {
 		t.Fatal("ReadCloser not propagated unchanged")
 	}
-	// 参数原样透传,仅调用一次(包裹不重复调用后端)。
 	if fake.getCalls != 1 || fake.gotGetPath != "avatar/u1.png" {
 		t.Fatalf("backend called %d times with %q", fake.getCalls, fake.gotGetPath)
+	}
+	// 指标:恰好 1 次 op=get_file 观测。
+	if c := depOpSampleCount(t, reg, metrics.OpGetFile); c != 1 {
+		t.Fatalf("op=get_file sample count = %d, want 1", c)
 	}
 }
 
 func TestServiceGetFile_TransparentError(t *testing.T) {
+	reg := newDepRegistry(t)
 	wantErr := errors.New("get failed")
 	fake := &fakeUploadService{getErr: wantErr}
 	s := &Service{uploadService: fake, backend: "s3"}
@@ -100,11 +153,16 @@ func TestServiceGetFile_TransparentError(t *testing.T) {
 	if gotRC != nil {
 		t.Fatal("ReadCloser should be nil on error")
 	}
-	// 指标默认实例未初始化时 ObserveObjectStore 是 no-op,不影响结果。
+	if c := depOpSampleCount(t, reg, metrics.OpGetFile); c != 1 {
+		t.Fatalf("op=get_file sample count = %d, want 1", c)
+	}
 }
 
-// DownloadURL 不再打点(本地拼串无 I/O,#442 P1-1);仍验证其行为透明。
-func TestServiceDownloadURL_StillTransparentNoMetric(t *testing.T) {
+// DownloadURL 是本地拼串、无 I/O,不应打点(#442 P1-1)。这条测试是 load-bearing:
+// 它既验证返回值透明,又断言调用后注册表里**不存在** op=download_url 序列 ——
+// 若有人误把 DownloadURL 重新包上 ObserveObjectStore,这里会失败。
+func TestServiceDownloadURL_TransparentAndNoMetric(t *testing.T) {
+	reg := newDepRegistry(t)
 	fake := &fakeUploadService{}
 	s := &Service{uploadService: fake, backend: "seaweedfs"}
 
@@ -114,5 +172,9 @@ func TestServiceDownloadURL_StillTransparentNoMetric(t *testing.T) {
 	}
 	if got != "https://cdn.example/chat/x.png" {
 		t.Fatalf("url = %q", got)
+	}
+	// 关键断言:DownloadURL 不发任何 op=download_url 指标。
+	if c := depOpSampleCount(t, reg, "download_url"); c != 0 {
+		t.Fatalf("op=download_url sample count = %d, want 0 (DownloadURL must not be instrumented)", c)
 	}
 }
