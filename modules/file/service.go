@@ -24,6 +24,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	limlog "github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
 	"github.com/disintegration/imaging"
 	"go.uber.org/zap"
 )
@@ -57,15 +58,22 @@ type IService interface {
 // NewService NewService
 func NewService(ctx *config.Context) IService {
 	var uploadService IUploadService
+	// backend 是对象存储后端的稳定标签名(低基数枚举),用作依赖指标的 backend
+	// label;与下面的分发分支一一对应,fallback 与 uploadService 同为 seaweedfs。
+	var backend string
 	service := ctx.GetConfig().FileService
 	if service == config.FileServiceMinio {
 		uploadService = NewServiceMinio(ctx)
+		backend = "minio"
 	} else if service == config.FileServiceAliyunOSS {
 		uploadService = NewServiceOSS(ctx)
+		backend = "oss"
 	} else if service == config.FileServiceQiniu {
 		uploadService = NewServiceQiniu(ctx)
+		backend = "qiniu"
 	} else if service == config.FileServiceTencentCOS {
 		uploadService = NewServiceCOS(ctx)
+		backend = "cos"
 	} else if service == fileServiceAwsS3 {
 		// octo-lib has not (yet) declared a FileServiceAwsS3 constant;
 		// the local fileServiceAwsS3 (see const.go) collapses the
@@ -74,8 +82,10 @@ func NewService(ctx *config.Context) IService {
 		// upstream PR will add the typed constant and both sites will
 		// switch over together.
 		uploadService = NewServiceS3(ctx)
+		backend = "s3"
 	} else {
 		uploadService = NewSeaweedFS(ctx)
+		backend = "seaweedfs"
 	}
 	return &Service{
 		Log: log.NewTLog("Service"),
@@ -84,6 +94,7 @@ func NewService(ctx *config.Context) IService {
 			Timeout: time.Second * 30,
 		},
 		uploadService: uploadService,
+		backend:       backend,
 	}
 	// return NewServiceMinio(ctx)
 }
@@ -94,6 +105,8 @@ type Service struct {
 	log.Log
 	ctx           *config.Context
 	uploadService IUploadService
+	// backend 是 uploadService 对应的对象存储后端名,用作依赖指标 backend label。
+	backend string
 }
 
 func (s *Service) UploadFile(filePath string, contentType string, contentDisposition string, copyFileWriter func(io.Writer) error) (map[string]interface{}, error) {
@@ -101,8 +114,12 @@ func (s *Service) UploadFile(filePath string, contentType string, contentDisposi
 }
 
 func (s *Service) DownloadURL(path string, filename string) (string, error) {
-
-	return s.uploadService.DownloadURL(path, filename)
+	// 计时透明包裹:返回值与 error 原样透传,只在调用前后打点(time.Since 级开销),
+	// 不改变任何下载语义。指标关闭时 ObserveObjectStore 为 no-op。
+	start := time.Now()
+	url, err := s.uploadService.DownloadURL(path, filename)
+	metrics.ObserveObjectStore(metrics.OpDownloadURL, s.backend, start, err)
+	return url, err
 }
 
 func (s *Service) GetFile(path string) (io.ReadCloser, string, error) {

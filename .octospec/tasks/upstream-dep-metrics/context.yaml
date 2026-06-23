@@ -1,0 +1,34 @@
+slug: upstream-dep-metrics
+upstream: Mininglamp-OSS/octo-server#440
+rules_injected:
+  - id: error-handling
+    tier: repo
+    load_bearing: true
+    why: "modules/file/service.go matches paths glob; constraint = DownloadURL error must stay transparently propagated, no errcode/i18n touched."
+    outcome: "compliant — wrapper returns (url, err) unchanged; no user-facing error response added."
+  - id: space-isolation
+    tier: repo
+    load_bearing: true
+    why: "modules/**/*.go path glob; no query/handler/cross-space access added."
+    outcome: "n/a — no isolation surface touched."
+  - id: rate-limit
+    tier: repo
+    load_bearing: true
+    why: "modules/**/*.go path glob; we read rlRedis.PoolStats() only."
+    outcome: "n/a — no rate limiting added, no hand-rolled counter."
+  - id: testing
+    tier: repo
+    load_bearing: false
+    why: "new *_test.go files."
+    outcome: "unit tests use prometheus/testutil + fresh registry; no MySQL/Redis/WuKongIM needed."
+integration_points:
+  db_pool: "ctx.DB().DB (*sql.DB, see main.go:201) -> collectors.NewDBStatsCollector -> go_sql_*"
+  redis_pool: "rlRedis (*redis.Client v6, main.go:181) -> custom scrape-time Collector -> dmwork_redis_pool_*"
+  objectstore_latency: "file.Service.DownloadURL facade (modules/file/service.go:103) -> dmwork_dependency_duration_seconds; backend from NewService switch (config.FileService)"
+decisions:
+  - "scrape-time Collectors, no background goroutine (supersedes #440 sampler)."
+  - "DB pool uses standard go_sql_* via client_golang DBStatsCollector, not dmwork_db_pool_*."
+  - "Redis pool limited to repo-owned *redis.Client; lib GetRedisConn() returns *redis.Conn (no PoolStats), excluded."
+libs:
+  redis: "github.com/go-redis/redis v6.15.9 (alias rd); PoolStats has Hits/Misses/Timeouts/TotalConns/IdleConns/StaleConns"
+  client_golang: "v1.17.0; collectors.NewDBStatsCollector available"

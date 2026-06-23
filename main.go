@@ -187,6 +187,14 @@ func runAPI(ctx *config.Context) {
 		o.PoolSize = 10
 	}))
 	route.Use(route.RateLimitMiddleware(context.Background(), rlRedis, rps, burst, globalRateLimitExcludePaths()...))
+	// 上游依赖可观测性(issue #440 P0-a):依赖调用延迟 + 连接池指标,均注册到
+	// DefaultRegisterer,经 /metrics 暴露(与 httpMetrics 同一端点)。连接池用
+	// scrape 时读取的 Collector,不起后台 goroutine。此处 rlRedis 与 ctx.DB().DB
+	// 均已就绪,且在 api.Route 之前完成注册。
+	metrics.NewDependencyMetrics(prometheus.DefaultRegisterer)
+	metrics.RegisterPoolCollectors(prometheus.DefaultRegisterer, ctx.DB().DB, map[string]*rd.Client{
+		"ratelimit": rlRedis,
+	})
 	// CORS 白名单覆盖：dmwork-lib 的 server.New 默认注入 "*" + Credentials:true，
 	// 本中间件在其后执行，按 DM_CORS_ALLOWED_ORIGINS 重写/剥离 Allow-Origin/Credentials。
 	// 未配置时等价于禁用跨域（剥离所有 CORS 响应头），仅允许同源调用。

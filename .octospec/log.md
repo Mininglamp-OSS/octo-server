@@ -4,6 +4,16 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-06-23
+
+- **Add** — Task `upstream-dep-metrics` (#440 P0-a): upstream-dependency
+  observability. Added `dmwork_dependency_duration_seconds` (object-storage
+  `DownloadURL` latency) and connection-pool metrics (`go_sql_*` via
+  DBStatsCollector + `dmwork_redis_pool_*` via a scrape-time collector). No
+  background goroutine, no `octo-lib` change, no business-logic change. Brief +
+  context + journal under `.octospec/tasks/upstream-dep-metrics/` and
+  `.octospec/journal/shared/upstream-dep-metrics.md`.
+
 ## 2026-06-19
 
 - **Update** — Adopted OKF v0.1 compatible frontmatter across all repo rules
