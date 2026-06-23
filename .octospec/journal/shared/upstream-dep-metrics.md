@@ -59,3 +59,26 @@ is built, served by the existing `/metrics` scrape endpoint.
 ## Out of scope (P0-b, tracked on #440)
 Per-query SQL timing (needs octo-lib `EventReceiver`), WuKongIM call timing (no
 unified client), Redis command-level timing (v6 no hooks), lib redis pool stats.
+
+## Revision — review round 1 (#442 P1-1)
+Reviewer `yujiawei` requested changes with a correct finding: the object-storage
+half initially wrapped `Service.DownloadURL`, but **every backend's `DownloadURL`
+is local URL string-building with no network I/O** (verified across
+minio/oss/s3/seaweedfs/qiniu/cos — all `url.JoinPath` / `publicURL`). The
+histogram thus measured sub-µs work (all in `le=0.001`) and was *misleading*
+("objectstore latency <1ms"), while the real I/O paths went uninstrumented.
+
+This error traced back to a wrong premise carried from the original latency
+investigation (treating `DownloadURL` as a network round-trip / URL-signing call).
+**Correction:** re-targeted instrumentation to the facade methods that actually
+round-trip to storage — `UploadFile` (PutObject) and `GetFile` (GetObject +
+`obj.Stat()`, where `Stat()` forces the request and sidesteps minio's lazy
+`GetObject`). `DownloadURL` left un-instrumented. op label `download_url` →
+`upload_file` / `get_file`. Also fixed P2-1 (test now snapshots/restores the
+package-default observer via `t.Cleanup`) and noted P2-2 (hardcoded `"main"` db
+name). P1-2 (merge conflict) was already resolved by the earlier rebase onto main.
+
+**Learning:** before wrapping a method in a latency metric, verify it actually
+performs the I/O the metric claims to measure — a facade method name
+(`DownloadURL`) can be I/O-free even when its dependency category (object storage)
+suggests otherwise. Candidate for promotion to an observability rule.

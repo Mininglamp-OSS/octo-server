@@ -110,20 +110,30 @@ type Service struct {
 }
 
 func (s *Service) UploadFile(filePath string, contentType string, contentDisposition string, copyFileWriter func(io.Writer) error) (map[string]interface{}, error) {
-	return s.uploadService.UploadFile(filePath, contentType, contentDisposition, copyFileWriter)
+	// 计时透明包裹:返回值与 error 原样透传,只在调用前后打点(time.Since 级开销)。
+	// UploadFile 在各后端是真正的对象存储写(PutObject 等网络往返),指标有意义。
+	// 指标关闭时 ObserveObjectStore 为 no-op。
+	start := time.Now()
+	res, err := s.uploadService.UploadFile(filePath, contentType, contentDisposition, copyFileWriter)
+	metrics.ObserveObjectStore(metrics.OpUploadFile, s.backend, start, err)
+	return res, err
 }
 
 func (s *Service) DownloadURL(path string, filename string) (string, error) {
-	// 计时透明包裹:返回值与 error 原样透传,只在调用前后打点(time.Since 级开销),
-	// 不改变任何下载语义。指标关闭时 ObserveObjectStore 为 no-op。
-	start := time.Now()
-	url, err := s.uploadService.DownloadURL(path, filename)
-	metrics.ObserveObjectStore(metrics.OpDownloadURL, s.backend, start, err)
-	return url, err
+	// 不打点:各后端 DownloadURL 只是从 config 本地拼出公开/CDN URL,不触达对象存储,
+	// 计时会产生误导性的 "objectstore latency"(见 #442 P1-1)。真正的 I/O 在
+	// UploadFile / GetFile。
+	return s.uploadService.DownloadURL(path, filename)
 }
 
 func (s *Service) GetFile(path string) (io.ReadCloser, string, error) {
-	return s.uploadService.GetFile(path)
+	// 计时透明包裹:GetFile 在 minio/s3/cos 后端是 GetObject + Stat 的真实网络往返
+	// (Stat 强制 round-trip,避免 minio lazy-GetObject 测不到 I/O 的陷阱);
+	// 计时覆盖到拿到对象句柄为止,不含后续读流。返回值/error 原样透传。
+	start := time.Now()
+	rc, contentType, err := s.uploadService.GetFile(path)
+	metrics.ObserveObjectStore(metrics.OpGetFile, s.backend, start, err)
+	return rc, contentType, err
 }
 
 type PresignedPutter interface {

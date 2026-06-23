@@ -35,8 +35,8 @@ func TestDependencyMetrics_ObserveOKAndError(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewDependencyMetrics(reg)
 
-	m.Observe(DependencyObjectStore, OpDownloadURL, "minio", time.Now(), nil)
-	m.Observe(DependencyObjectStore, OpDownloadURL, "minio", time.Now(), errors.New("boom"))
+	m.Observe(DependencyObjectStore, OpGetFile, "minio", time.Now(), nil)
+	m.Observe(DependencyObjectStore, OpGetFile, "minio", time.Now(), errors.New("boom"))
 
 	if got := histSampleCount(t, reg, dependencyStatusOK); got != 1 {
 		t.Fatalf("ok sample count = %d, want 1", got)
@@ -47,18 +47,22 @@ func TestDependencyMetrics_ObserveOKAndError(t *testing.T) {
 }
 
 func TestObserveObjectStore_NoDefaultIsNoop(t *testing.T) {
+	// 快照并在结束时恢复包级默认,避免污染同一 run 内后续测试(#442 P2-1)。
+	prev := defaultDependencyMetrics.Load()
+	t.Cleanup(func() { defaultDependencyMetrics.Store(prev) })
 	// 重置包级默认,模拟"未初始化"(指标关闭 / 进程未注册)场景。
 	defaultDependencyMetrics.Store(nil)
 	// 不应 panic,纯 no-op。
-	ObserveObjectStore(OpDownloadURL, "minio", time.Now(), nil)
+	ObserveObjectStore(OpGetFile, "minio", time.Now(), nil)
 }
 
 func TestObserveObjectStore_UsesDefault(t *testing.T) {
+	prev := defaultDependencyMetrics.Load()
+	t.Cleanup(func() { defaultDependencyMetrics.Store(prev) })
 	reg := prometheus.NewRegistry()
 	NewDependencyMetrics(reg) // 同时把自己设为包级默认
-	t.Cleanup(func() { defaultDependencyMetrics.Store(nil) })
 
-	ObserveObjectStore(OpDownloadURL, "oss", time.Now(), nil)
+	ObserveObjectStore(OpUploadFile, "oss", time.Now(), nil)
 
 	if got := histSampleCount(t, reg, dependencyStatusOK); got != 1 {
 		t.Fatalf("default observer recorded %d ok samples, want 1", got)
@@ -68,7 +72,7 @@ func TestObserveObjectStore_UsesDefault(t *testing.T) {
 func TestDependencyMetrics_Naming(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewDependencyMetrics(reg)
-	m.Observe(DependencyObjectStore, OpDownloadURL, "minio", time.Now(), nil)
+	m.Observe(DependencyObjectStore, OpGetFile, "minio", time.Now(), nil)
 
 	const want = "dmwork_dependency_duration_seconds"
 	mfs, err := reg.Gather()

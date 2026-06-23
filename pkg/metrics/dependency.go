@@ -21,8 +21,12 @@ const (
 
 	// DependencyObjectStore 是对象存储类依赖的 dependency label 值。
 	DependencyObjectStore = "objectstore"
-	// OpDownloadURL 是「换取下载地址」操作的 op label 值。
-	OpDownloadURL = "download_url"
+	// OpUploadFile / OpGetFile 是对象存储上「真正发生网络 I/O」的两个操作的 op
+	// label 值:上传(PutObject 等)与读取对象(GetObject+Stat 等)。
+	// 注意:不为 DownloadURL 打点 —— 各后端的 DownloadURL 只是从 config 本地拼出
+	// 公开/CDN URL,不触达对象存储,给它打 latency 会产生误导性指标(见 #442 P1-1)。
+	OpUploadFile = "upload_file"
+	OpGetFile    = "get_file"
 )
 
 // DependencyMetrics 持有依赖调用指标。每进程一个实例,注册到一个 Registerer。
@@ -74,9 +78,9 @@ func (m *DependencyMetrics) Observe(dependency, op, backend string, start time.T
 // 用法:
 //
 //	start := time.Now()
-//	url, err := backend.DownloadURL(path, name)
-//	metrics.ObserveObjectStore(metrics.OpDownloadURL, backendLabel, start, err)
-//	return url, err
+//	res, err := backend.UploadFile(...)
+//	metrics.ObserveObjectStore(metrics.OpUploadFile, backendLabel, start, err)
+//	return res, err
 func ObserveObjectStore(op, backend string, start time.Time, err error) {
 	if m := defaultDependencyMetrics.Load(); m != nil {
 		m.Observe(DependencyObjectStore, op, backend, start, err)

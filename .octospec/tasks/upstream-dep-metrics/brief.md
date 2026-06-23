@@ -21,7 +21,18 @@ Deliver **P0-a only**: parts self-contained in this repo, no `octo-lib` change,
 no business-logic change. Two additions:
 
 1. **Connection-pool metrics** for MySQL and the repo-owned Redis client.
-2. **Object-storage operation latency** via the `file.Service.DownloadURL` facade.
+2. **Object-storage operation latency** for the `file.Service` operations that
+   actually perform storage I/O — `UploadFile` (PutObject) and `GetFile`
+   (GetObject+Stat). **NOT** `DownloadURL` (see Revision below).
+
+> **Revision (post-review, #442 P1-1):** the first cut instrumented
+> `Service.DownloadURL`, but every backend's `DownloadURL` is pure local URL
+> string-building (no network I/O), so the histogram only measured sub-µs string
+> work and was *misleading* ("objectstore latency <1ms"). Re-targeted to the
+> facade methods that genuinely round-trip to storage: `UploadFile` and
+> `GetFile` (`GetFile`'s `obj.Stat()` forces the request, avoiding minio's
+> lazy-GetObject trap). `DownloadURL` is left un-instrumented. op label is now
+> `upload_file` / `get_file`, not `download_url`.
 
 ## Background
 - Upstream issue: Mininglamp-OSS/octo-server#440.
@@ -29,10 +40,11 @@ no business-logic change. Two additions:
   the standalone `/metrics` scrape server (`pkg/metrics`, wired in `main.go:152-154`,
   gated by `DM_METRICS_ENABLED`).
 - `ctx.DB().DB` is already used as a `*sql.DB` (`main.go:201`), so `.Stats()` is reachable.
-- `file.Service.DownloadURL` (`modules/file/service.go:103`) is a single dispatch
-  point delegating to `uploadService.DownloadURL` — wrapping here covers all
-  backends (minio/oss/qiniu/cos/s3/seaweedfs) in one place. Backend is chosen in
-  the `NewService` switch (`service.go:58-86`).
+- `file.Service` (`modules/file/service.go`) is the facade delegating to the
+  backend `uploadService`; wrapping a method here covers all backends
+  (minio/oss/qiniu/cos/s3/seaweedfs) in one place. Backend is chosen in the
+  `NewService` switch. **Only `UploadFile`/`GetFile` do storage I/O**;
+  `DownloadURL` is local URL assembly (see Revision).
 
 ### Design decisions (note: refine #440's wording)
 - **Pool metrics use scrape-time custom Collectors, NOT a background sampler.**
@@ -52,11 +64,12 @@ no business-logic change. Two additions:
   dependencies by adding label values rather than new metrics.
 
 ## Load-bearing list
-- **`file.Service.DownloadURL` contract** (`file-service` facade): the timing
-  wrapper MUST be transparent — same return values, same error propagated
-  unchanged, no swallowing, no added latency beyond a `time.Since`. Used by the
-  avatar path and many handlers. (path glob hits `error-handling`, `space-isolation`,
-  `rate-limit` rules — confirm none are actually affected.)
+- **`file.Service` facade contracts** (`UploadFile` / `GetFile` / `DownloadURL`):
+  each timing wrapper MUST be transparent — same return values, same error
+  propagated unchanged, no swallowing, no added latency beyond a `time.Since`.
+  Used by the avatar path, upload handlers, and non-public-bucket reads. (path
+  glob hits `error-handling`, `space-isolation`, `rate-limit` rules — confirm
+  none are actually affected.)
 - **`/metrics` registry contract**: register on `DefaultRegisterer` exactly once;
   `MustRegister` panics on dup. Must not collide with existing `dmwork_http_*` or
   oidc metrics. Naming follows existing `dmwork_` namespace (except DB → `go_sql_*`).
@@ -80,11 +93,13 @@ no business-logic change. Two additions:
       MySQL `*sql.DB`).
 - [ ] `dmwork_redis_pool_*` series present at `/metrics`, sourced from
       `rlRedis.PoolStats()` via a scrape-time Collector.
-- [ ] `dmwork_dependency_duration_seconds{dependency="objectstore",op="download_url",backend,status}`
-      observed on every `DownloadURL` call, `status` distinguishing ok/error,
-      buckets reaching 1ms: `.001 .0025 .005 .01 .025 .05 .1 .25 .5 1 2.5 5`.
-- [ ] `DownloadURL` behavior byte-for-byte unchanged (return + error transparent);
-      proven by test.
+- [ ] `dmwork_dependency_duration_seconds{dependency="objectstore",op,backend,status}`
+      observed on every `UploadFile` (op=`upload_file`) and `GetFile`
+      (op=`get_file`) call, `status` distinguishing ok/error, buckets reaching
+      1ms: `.001 .0025 .005 .01 .025 .05 .1 .25 .5 1 2.5 5`. `DownloadURL` is NOT
+      instrumented (local URL build, no I/O — #442 P1-1).
+- [ ] `UploadFile` / `GetFile` / `DownloadURL` behavior unchanged (return + error
+      transparent); proven by test.
 - [ ] No background goroutine introduced (collectors read on scrape).
 - [ ] Unit tests: dependency wrapper records ok+error paths & preserves return;
       redis collector emits expected series (via `prometheus/testutil`); register

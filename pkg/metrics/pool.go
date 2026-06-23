@@ -28,6 +28,8 @@ import (
 // panic(prometheus 库契约)。
 func RegisterPoolCollectors(reg prometheus.Registerer, db *sql.DB, redisClients map[string]*rd.Client) {
 	if db != nil {
+		// "main" 是单库现状下的固定 db name label。若将来引入读副本/第二连接池,
+		// 这里需参数化以免重复注册冲突(#442 P2-2,当前单库无需处理)。
 		reg.MustRegister(collectors.NewDBStatsCollector(db, "main"))
 	}
 	if len(redisClients) > 0 {
