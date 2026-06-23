@@ -56,6 +56,7 @@ func readinessRedisOptions(cfg *config.Config) *rd.Options {
 }
 
 func (cn *Common) health(c *wkhttp.Context) {
+	// db/redis are static legacy-shape fields; liveness must stay dependency-free.
 	c.JSON(http.StatusOK, map[string]string{
 		"status": healthStatusUp,
 		"db":     healthStatusUp,
