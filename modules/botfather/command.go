@@ -15,6 +15,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/base/app"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botutil"
 	"go.uber.org/zap"
 )
 
@@ -423,18 +424,16 @@ func (h *commandHandler) handleQuickstart(fromUID string) {
 		return
 	}
 
-	cfg := h.ctx.GetConfig()
-	apiURL := cfg.External.BaseURL
-	if strings.TrimSpace(apiURL) == "" {
-		apiURL = fmt.Sprintf("http://%s:8090", cfg.External.IP)
-	}
-
-	h.replyL(fromUID, MsgQuickstart, map[string]any{"APIKey": apiKey, "APIURL": apiURL})
+	h.replyL(fromUID, MsgQuickstart, map[string]any{
+		"APIKey":        apiKey,
+		"APIURL":        botutil.DeriveAPIURL(h.ctx.GetConfig()),
+		"PluginPackage": botutil.PluginPackage(),
+	})
 }
 
 func (h *commandHandler) handleInstall(fromUID string) {
 	h.sm.Clear(fromUID, h.spaceID(fromUID))
-	h.replyL(fromUID, MsgInstall, nil)
+	h.replyL(fromUID, MsgInstall, map[string]any{"PluginPackage": botutil.PluginPackage()})
 }
 
 func (h *commandHandler) handleHelp(fromUID string) {
@@ -924,32 +923,22 @@ func (h *commandHandler) sendBotSelectionList(fromUID string, bots []*robotModel
 }
 
 func (h *commandHandler) sendConnectPrompt(toUID string, bot *robotModel) {
-	cfg := h.ctx.GetConfig()
-	apiURL := cfg.External.BaseURL
-	if strings.TrimSpace(apiURL) == "" {
-		apiURL = fmt.Sprintf("http://%s:8090", cfg.External.IP)
-	}
-
 	h.replyL(toUID, MsgConnectPrompt, map[string]any{
-		"DisplayName": h.getBotDisplayName(bot.RobotID),
-		"RobotID":     bot.RobotID,
-		"BotToken":    bot.BotToken,
-		"APIURL":      apiURL,
+		"DisplayName":   h.getBotDisplayName(bot.RobotID),
+		"RobotID":       bot.RobotID,
+		"BotToken":      bot.BotToken,
+		"APIURL":        botutil.DeriveAPIURL(h.ctx.GetConfig()),
+		"PluginPackage": botutil.PluginPackage(),
 	})
 }
 
 func (h *commandHandler) sendCreatedPrompt(toUID string, name string, bot *robotModel) {
-	cfg := h.ctx.GetConfig()
-	apiURL := cfg.External.BaseURL
-	if strings.TrimSpace(apiURL) == "" {
-		apiURL = fmt.Sprintf("http://%s:8090", cfg.External.IP)
-	}
-
 	h.replyL(toUID, MsgCreatedPrompt, map[string]any{
-		"Name":     name,
-		"RobotID":  bot.RobotID,
-		"BotToken": bot.BotToken,
-		"APIURL":   apiURL,
+		"Name":          name,
+		"RobotID":       bot.RobotID,
+		"BotToken":      bot.BotToken,
+		"APIURL":        botutil.DeriveAPIURL(h.ctx.GetConfig()),
+		"PluginPackage": botutil.PluginPackage(),
 	})
 }
 

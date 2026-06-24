@@ -19,6 +19,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/bot_api"
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botutil"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -421,9 +422,10 @@ func (ab *AppBot) createBot(c *wkhttp.Context, scope, spaceID string) {
 	}
 
 	c.Response(gin.H{
-		"id":    req.ID,
-		"uid":   uid,
-		"token": token,
+		"id":      req.ID,
+		"uid":     uid,
+		"token":   token,
+		"connect": ab.connectInfo(),
 	})
 }
 
@@ -530,6 +532,7 @@ func (ab *AppBot) getBotDetail(c *wkhttp.Context) {
 		"created_by":   bot.CreatedBy,
 		"created_at":   bot.CreatedAt,
 		"updated_at":   bot.UpdatedAt,
+		"connect":      ab.connectInfo(),
 	})
 }
 
@@ -983,6 +986,19 @@ func (ab *AppBot) discoverBots(c *wkhttp.Context) {
 }
 
 // ==================== Helpers ====================
+
+// connectInfo returns the backend-owned facts the frontend needs to assemble the
+// Bot connect guide: the OpenClaw plugin package an Agent runs and this
+// environment's public Bot API entry. Both are server-owned (config/env), so a
+// package rename, canary rollout, or host change never requires a frontend
+// redeploy. It carries data only — the localized guide prose stays in the
+// frontend, and it never includes the token or any other secret.
+func (ab *AppBot) connectInfo() gin.H {
+	return gin.H{
+		"plugin_package": botutil.PluginPackage(),
+		"api_url":        botutil.DeriveAPIURL(ab.ctx.GetConfig()),
+	}
+}
 
 func (ab *AppBot) toBotListResp(bots []*appBotModel) []gin.H {
 	result := make([]gin.H, 0, len(bots))

@@ -104,7 +104,7 @@
 
 ```
 为所有 agent 批量创建并绑定 Octo bot：
-npx -y create-openclaw-octo quickstart --api-key {{.APIKey}} --api-url {{.APIURL}}
+npx -y {{.PluginPackage}} quickstart --api-key {{.APIKey}} --api-url {{.APIURL}}
 ```{{end}}
 
 {{define "install"}}📦 **安装/更新 Octo 插件**
@@ -114,7 +114,7 @@ npx -y create-openclaw-octo quickstart --api-key {{.APIKey}} --api-url {{.APIURL
 📋 **把下面命令发给 OpenClaw 执行：**
 
 ```
-npx -y create-openclaw-octo install
+npx -y {{.PluginPackage}} install
 ```
 
 安装完成后，使用 /newbot 创建单个 bot 或 /quickstart 批量创建。{{end}}
@@ -154,7 +154,7 @@ npx -y create-openclaw-octo install
 默认绑定到当前 Session 的 Agent，agent 标识通过 /status 查看。
 如果用户指定了其他 Agent，使用用户指定的标识替换。
 
-npx -y create-openclaw-octo bind --bot-token {{.BotToken}} --api-url {{.APIURL}} --account-id {{.RobotID}} --agent <agent标识>
+npx -y {{.PluginPackage}} bind --bot-token {{.BotToken}} --api-url {{.APIURL}} --account-id {{.RobotID}} --agent <agent标识>
 ```
 
 💡 **如需绑定到其他 Agent，修改 `--agent` 参数即可。**
@@ -174,7 +174,7 @@ npx -y create-openclaw-octo bind --bot-token {{.BotToken}} --api-url {{.APIURL}}
 默认绑定到当前 Session 的 Agent，agent 标识通过 /status 查看。
 如果用户指定了其他 Agent，使用用户指定的标识替换。
 
-npx -y create-openclaw-octo bind --bot-token {{.BotToken}} --api-url {{.APIURL}} --account-id {{.RobotID}} --agent <agent标识>
+npx -y {{.PluginPackage}} bind --bot-token {{.BotToken}} --api-url {{.APIURL}} --account-id {{.RobotID}} --agent <agent标识>
 ```
 
 💡 **如需绑定到其他 Agent，修改 `--agent` 参数即可。**{{end}}

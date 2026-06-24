@@ -23,6 +23,7 @@ func renderProbe() map[string]any {
 		"DisplayName":   "probe",
 		"RobotID":       "probe",
 		"BotToken":      "probe",
+		"PluginPackage": "create-openclaw-octo",
 		"Prompt":        "probe",
 		"ApplicantName": "probe",
 		"ApplicantUID":  "probe",
@@ -48,9 +49,9 @@ func TestKeyMessageInterpolation(t *testing.T) {
 		data map[string]any
 		want []string // substrings that must appear
 	}{
-		{MsgCreatedPrompt, "en-US", map[string]any{"Name": "Alice", "RobotID": "bot_42", "BotToken": "tok_xyz", "APIURL": "https://api.x"},
+		{MsgCreatedPrompt, "en-US", map[string]any{"Name": "Alice", "RobotID": "bot_42", "BotToken": "tok_xyz", "APIURL": "https://api.x", "PluginPackage": "create-openclaw-octo"},
 			[]string{"Alice", "bot_42", "tok_xyz", "https://api.x", "npx -y create-openclaw-octo bind", "```"}},
-		{MsgCreatedPrompt, "zh-CN", map[string]any{"Name": "小爱", "RobotID": "bot_42", "BotToken": "tok_xyz", "APIURL": "https://api.x"},
+		{MsgCreatedPrompt, "zh-CN", map[string]any{"Name": "小爱", "RobotID": "bot_42", "BotToken": "tok_xyz", "APIURL": "https://api.x", "PluginPackage": "create-openclaw-octo"},
 			[]string{"小爱", "bot_42", "绑定"}},
 		{MsgNotifyOwnerNewApply, "en-US", map[string]any{"ApplicantName": "Bob", "ApplicantUID": "u_9", "RobotUID": "bot_1", "Remark": "please"},
 			[]string{"Bob", "u_9", "bot_1", "Note: please"}},
@@ -76,6 +77,40 @@ func TestKeyMessageInterpolation(t *testing.T) {
 			}
 		}
 		t.Logf("\n----- %s / %s -----\n%s\n", c.key, c.lang, got)
+	}
+}
+
+// TestConnectGuidePackageParameterized proves the OpenClaw package name is no
+// longer frozen in the localized templates: every connect-guide command (bind /
+// install / quickstart) renders the injected PluginPackage, so a backend rename
+// or canary flows into the DM prose without editing the i18n templates — and the
+// old hardcoded literal no longer appears.
+func TestConnectGuidePackageParameterized(t *testing.T) {
+	const pkg = "create-openclaw-canary"
+	cases := []struct {
+		key  string
+		data map[string]any
+		want string
+	}{
+		{MsgCreatedPrompt, map[string]any{"Name": "A", "RobotID": "b", "BotToken": "t", "APIURL": "u", "PluginPackage": pkg}, "npx -y create-openclaw-canary bind"},
+		{MsgConnectPrompt, map[string]any{"DisplayName": "A", "RobotID": "b", "BotToken": "t", "APIURL": "u", "PluginPackage": pkg}, "npx -y create-openclaw-canary bind"},
+		{MsgInstall, map[string]any{"PluginPackage": pkg}, "npx -y create-openclaw-canary install"},
+		{MsgQuickstart, map[string]any{"APIKey": "k", "APIURL": "u", "PluginPackage": pkg}, "npx -y create-openclaw-canary quickstart"},
+	}
+	for _, lang := range []string{"en-US", "zh-CN"} {
+		for _, c := range cases {
+			got, err := botMessages.Render(c.key, lang, c.data)
+			if err != nil {
+				t.Errorf("Render(%q,%q): %v", c.key, lang, err)
+				continue
+			}
+			if !strings.Contains(got, c.want) {
+				t.Errorf("Render(%q,%q) missing %q in:\n%s", c.key, lang, c.want, got)
+			}
+			if strings.Contains(got, "create-openclaw-octo") {
+				t.Errorf("Render(%q,%q) still carries the hardcoded create-openclaw-octo:\n%s", c.key, lang, got)
+			}
+		}
 	}
 }
 
