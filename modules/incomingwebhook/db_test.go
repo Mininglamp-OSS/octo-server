@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/stretchr/testify/assert"
@@ -249,6 +250,69 @@ func TestInsertAndQueryAudit(t *testing.T) {
 	limited, err := d.queryRecentAudits(whID, 1)
 	assert.NoError(t, err)
 	assert.Len(t, limited, 1)
+}
+
+// TestThreadWebhookSharesParentGroupQuota 子区 webhook 与群 webhook 共用父群 max_per_group
+// 配额池：insertWithQuota 按 group_no 计数、不按 thread_short_id 细分，避免「每子区独立配额」
+// 让单群 webhook 总量失控（acceptance：共享父群配额）。
+func TestThreadWebhookSharesParentGroupQuota(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer testutil.CleanAllTables(ctx)
+	d := newDB(ctx)
+
+	groupNo := "g_" + util.GenerUUID()[:12]
+	const max = 2
+	mustInsertWebhookWithMax(t, d, groupNo, max)                          // 1 个群 webhook
+	mustInsertThreadWebhookWithMax(t, d, groupNo, "100000000000001", max) // 1 个子区 webhook —— 共用池已满 2
+
+	// 第三个（无论群 / 子区）都应被同一父群配额拒绝。
+	overGroup := &incomingWebhookModel{WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, Name: "wh", Status: statusEnabled}
+	assert.ErrorIs(t, d.insertWithQuota(overGroup, max, 0), ErrQuotaExceeded, "group webhook must hit the shared parent-group quota")
+	overThread := &incomingWebhookModel{
+		WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, Name: "wh", Status: statusEnabled,
+		ChannelType: int(common.ChannelTypeCommunityTopic.Uint8()), ThreadShortID: "100000000000002",
+	}
+	assert.ErrorIs(t, d.insertWithQuota(overThread, max, 0), ErrQuotaExceeded, "thread webhook must hit the same shared parent-group quota")
+}
+
+// TestDisableByGroupNo_CoversThreadWebhook 群解散级联禁用覆盖子区 webhook（同 group_no）：
+// disableByGroupNo 仅按 group_no 过滤，子区 webhook 锚父群，故一并翻为 statusDisabled。
+func TestDisableByGroupNo_CoversThreadWebhook(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer testutil.CleanAllTables(ctx)
+	d := newDB(ctx)
+
+	groupNo := "g_" + util.GenerUUID()[:12]
+	groupWH := mustInsertWebhook(t, d, groupNo)
+	threadWH := mustInsertThreadWebhookWithMax(t, d, groupNo, "100000000000003", 100)
+
+	assert.NoError(t, d.disableByGroupNo(groupNo))
+
+	for _, id := range []string{groupWH, threadWH} {
+		m, err := d.queryByWebhookID(id)
+		assert.NoError(t, err)
+		assert.NotNil(t, m)
+		if m != nil {
+			assert.Equalf(t, statusDisabled, m.Status, "disband must disable webhook %s (incl. thread-bound)", id)
+		}
+	}
+}
+
+// mustInsertThreadWebhookWithMax 插入一个绑定到子区的 webhook（channel_type=社区话题 +
+// thread_short_id），供子区维度的配额 / 级联 DB 层断言复用。
+func mustInsertThreadWebhookWithMax(t *testing.T, d *incomingWebhookDB, groupNo, shortID string, max int) string {
+	t.Helper()
+	m := &incomingWebhookModel{
+		WebhookID:     generateWebhookID(),
+		TokenHash:     "h",
+		GroupNo:       groupNo,
+		Name:          "wh",
+		Status:        statusEnabled,
+		ChannelType:   int(common.ChannelTypeCommunityTopic.Uint8()),
+		ThreadShortID: shortID,
+	}
+	assert.NoError(t, d.insertWithQuota(m, max, 0))
+	return m.WebhookID
 }
 
 func mustInsertWebhook(t *testing.T, d *incomingWebhookDB, groupNo string) string {

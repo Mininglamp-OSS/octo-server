@@ -163,6 +163,31 @@ func TestBotWebhook_MemberCreateAndManageOwn(t *testing.T) {
 }
 
 // 成员 bot 不可动他人创建的（403）；非成员 bot 一切操作 403。
+// TestBotWebhook_ThreadScopedCreate 子区挂载面（bot）：成员 bot 在子区上创建 webhook → 200，
+// creator=bot、回显 thread_short_id；与群面同一 MountManagementRoutes 处理器、同权限矩阵。
+// 子区面 list 仅返回该子区自己的 webhook（作用域隔离在 bot 面同样成立）。
+func TestBotWebhook_ThreadScopedCreate(t *testing.T) {
+	handler, ctx := setupBotWebhookEnv(t)
+
+	const shortID = "100000000000010"
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO thread (short_id, group_no, name, creator_uid, status, version) VALUES (?, ?, ?, ?, 1, 1)",
+		shortID, iwhGroupNo, "bot-thread", iwhBotID).Exec()
+	require.NoError(t, err)
+
+	path := fmt.Sprintf("/v1/bot/groups/%s/threads/%s/incoming-webhooks", iwhGroupNo, shortID)
+	w := doBot(handler, botReq(t, "POST", path, iwhBotToken, map[string]interface{}{}))
+	require.Equalf(t, http.StatusOK, w.Code, "bot thread create body: %s", w.Body.String())
+	res := decodeBody(t, w)
+	assert.Equal(t, iwhBotID, res["creator_uid"])
+	assert.Equal(t, shortID, res["thread_short_id"])
+
+	lw := doBot(handler, botReq(t, "GET", path, iwhBotToken, nil))
+	require.Equalf(t, http.StatusOK, lw.Code, "bot thread list body: %s", lw.Body.String())
+	list, _ := decodeBody(t, lw)["list"].([]interface{})
+	assert.Lenf(t, list, 1, "thread-face list must show only this thread's webhook; body: %s", lw.Body.String())
+}
+
 func TestBotWebhook_OwnershipAndMembershipGates(t *testing.T) {
 	handler, _ := setupBotWebhookEnv(t)
 
