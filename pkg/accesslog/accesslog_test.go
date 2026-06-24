@@ -95,6 +95,28 @@ func TestScrubPath(t *testing.T) {
 	}
 }
 
+// TestTokenInText_CoversEveryPrefix pins the single-source invariant flagged in
+// PR #456 review: webhookPushPrefixes (used by ScrubPath) and the panic-dump
+// tokenInText regex independently encode the set of webhook push prefixes. They
+// must stay in sync — a prefix added to the slice but not covered by the regex
+// would silently leak tokens from the gin.Recovery panic dump. This fails loudly
+// if the regex stops covering any prefix in the slice.
+func TestTokenInText_CoversEveryPrefix(t *testing.T) {
+	const token = "SyncGuardTokenMustMask"
+	for _, prefix := range webhookPushPrefixes {
+		line := []byte("POST " + prefix + "wid123/" + token + " HTTP/1.1")
+		got := string(tokenInText.ReplaceAll(line, []byte("${1}***")))
+		if strings.Contains(got, token) {
+			t.Fatalf("prefix %q: panic-dump regex must mask the token but did not "+
+				"(regex out of sync with webhookPushPrefixes); got %q", prefix, got)
+		}
+		want := prefix + "wid123/***"
+		if !strings.Contains(got, want) {
+			t.Fatalf("prefix %q: expected masked path %q in %q", prefix, want, got)
+		}
+	}
+}
+
 // TestScrubPath_NeverLeaksToken guards the security invariant: for any push
 // path, the plaintext token must not survive scrubbing.
 func TestScrubPath_NeverLeaksToken(t *testing.T) {

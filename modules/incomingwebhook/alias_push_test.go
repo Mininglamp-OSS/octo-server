@@ -61,3 +61,28 @@ func TestAliasPush_GitHubPing_SkippedLikeCanonical(t *testing.T) {
 	require.Equalf(t, http.StatusOK, w.Code, "alias github ping must 200; body=%s", w.Body.String())
 	assert.Contains(t, w.Body.String(), `"skipped"`, "alias ping must mark delivery skipped, same as canonical")
 }
+
+// 别名前缀下全部 6 条推送形态（native + 5 个适配器）都已注册并走同一条鉴权链：错误 token
+// 一律 401，证明每条别名路由都存在且经过 token 校验。#456 review (Octo-Q P2) 指出 wecom/
+// multica/gitlab/feishu 4 个适配器后缀未在别名上单测——mountPush 闭包让 6 条统一注册、
+// 结构上不可能漏挂，这条遍历测试把该不变量显式钉死（belt & suspenders）。
+func TestAliasPush_AllPushRoutesRegistered(t *testing.T) {
+	handler, ctx, groupNo := setupTestEnv(t)
+	whID, _ := createWebhookWithToken(t, handler, groupNo)
+
+	// 固定 IP + 重置失败/限流桶：6 次错误 token 会消耗 per-IP 失败预算（默认 burst 60，
+	// 6 次远未触顶），固定 IP 让本测试与并发的其它匿名推送测试互不串桶。
+	const ip = "203.0.113.201"
+	resetIPFailBucket(t, ctx, ip)
+	resetStrictIPBucket(t, ctx, ip)
+
+	for _, suffix := range []string{"", "github", "wecom", "multica", "gitlab", "feishu"} {
+		path := fmt.Sprintf("/v1/webhooks/%s/%s", whID, "wrong-token")
+		if suffix != "" {
+			path += "/" + suffix
+		}
+		w := do(handler, anonReqIP("POST", path, []byte(`{"content":"x"}`), ip))
+		assert.Equalf(t, http.StatusUnauthorized, w.Code,
+			"alias route %q must be registered and reject a wrong token with 401; body=%s", path, w.Body.String())
+	}
+}

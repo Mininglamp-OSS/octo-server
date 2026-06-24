@@ -76,7 +76,10 @@ func ScrubPath(path string) string {
 // Case-insensitive ((?i)) for the same reason as ScrubPath — a non-canonical
 // path casing must not slip a token past the mask. Matches BOTH the canonical
 // /v1/incoming-webhooks/ and the /v1/webhooks/ alias (#455) via the optional
-// "incoming-" group; keep this in sync with webhookPushPrefixes.
+// "incoming-" group. This regex and webhookPushPrefixes are two independent
+// encodings of the same prefix set — TestTokenInText_CoversEveryPrefix enforces
+// that the regex masks every prefix in the slice, so adding a prefix to the
+// slice without widening the regex fails the build (PR #456 review).
 var tokenInText = regexp.MustCompile(`(?i)(/v1/(?:incoming-)?webhooks/[^/\s?"']+/)[^\s?"']+`)
 
 // scrubbingErrorWriter wraps an io.Writer and masks incoming-webhook tokens in
