@@ -76,6 +76,16 @@ const HumansKey = "humans"
 // client; it is no longer inferred from legacy `all=1`.
 const AIsKey = "ais"
 
+// EntitiesKey is the render-layer mention span list inside the `mention`
+// sub-map: an array of `{uid, offset, length}` objects that bind a visible
+// `@name` substring of the message text to a member uid. `offset`/`length`
+// are UTF-16 code units relative to the message text — the unit JS
+// (`String.length`/`substring`), Java/Kotlin `String`, and ObjC `NSRange`
+// all index by, NOT bytes and NOT runes. The chokepoint helpers
+// (RewriteMention / ExpandAisToBotUIDs) pass this field through untouched;
+// it is exposed so callers and tests share one constant.
+const EntitiesKey = "entities"
+
 // RewriteMention is the (now pass-through) normalizer for the
 // payload's `mention` sub-map. The signature is preserved so all three
 // ingress chokepoints (modules/message/api.go, modules/bot_api/send.go,

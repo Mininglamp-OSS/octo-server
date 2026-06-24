@@ -234,3 +234,44 @@ func TestMentionPush_NoMentionFieldBackwardCompatible(t *testing.T) {
 	_, hasIgnored := parseJSON(t, pw)["mention_ignored"]
 	assert.False(t, hasIgnored)
 }
+
+// TestMentionPush_EntitiesAccepted：native 文本路径带【调用方提供的】mention.entities
+// （渲染层 @ 区间 {uid,offset,length}）→ 200 且无 mention_ignored。entities 不受广播能力位
+// 约束（定向渲染，非广播），非成员 entity 静默丢弃。entities 是否落到 wire、是否按成员闸
+// 过滤是【刻意不经 HTTP 回显】的（反枚举 + 落在 WuKongIM payload），由纯单测 finalizeEntities
+// 穷举（含 UTF-16 offset parity），此处只冒烟覆盖 push 路径接受 entities 不出错。
+func TestMentionPush_EntitiesAccepted(t *testing.T) {
+	handler, _, groupNo := setupMemberEnv(t)
+	created := adminCreateWebhook(t, handler, groupNo, map[string]interface{}{"name": "ci"})
+	pushURL := fmt.Sprintf("/v1/incoming-webhooks/%s/%s", created["webhook_id"], created["token"])
+
+	// content "@x ok"：@(0)x(1) → entity offset0 length2 指向 "@x"，uid 为本群成员。
+	body := fmt.Sprintf(
+		`{"content":"@x ok","mention":{"uids":["%s"],"entities":[{"uid":"%s","offset":0,"length":2}]}}`,
+		memberAUID, memberAUID)
+	pw := do(handler, anonReq("POST", pushURL, []byte(body)))
+	require.Equalf(t, http.StatusOK, pw.Code, "push body: %s", pw.Body.String())
+	_, hasIgnored := parseJSON(t, pw)["mention_ignored"]
+	assert.False(t, hasIgnored, "entities are not capability-gated; non-members dropped silently")
+}
+
+// TestMentionPush_MalformedEntitiesDelivered：entities 形状非法不得把推送 400（acceptance #6）。
+//   - entities 为非数组标量 → 整个 mention 降级为「无」、消息照投；
+//   - entities 数组里单条非法（offset 类型错 / 空对象）→ 仅丢该条，不连累其余 mention 字段。
+func TestMentionPush_MalformedEntitiesDelivered(t *testing.T) {
+	handler, _, groupNo := setupMemberEnv(t)
+	created := adminCreateWebhook(t, handler, groupNo, map[string]interface{}{"name": "ci"})
+	pushURL := fmt.Sprintf("/v1/incoming-webhooks/%s/%s", created["webhook_id"], created["token"])
+
+	for _, body := range []string{
+		`{"content":"hi","mention":{"entities":"garbage"}}`,
+		fmt.Sprintf(`{"content":"@x ok","mention":{"uids":["%s"],"entities":[{"uid":"x","offset":"y"}]}}`, memberAUID),
+		fmt.Sprintf(`{"content":"@x ok","mention":{"uids":["%s"],"entities":[{}]}}`, memberAUID),
+	} {
+		pw := do(handler, anonReq("POST", pushURL, []byte(body)))
+		require.Equalf(t, http.StatusOK, pw.Code,
+			"malformed entities must still deliver (200), body=%s resp=%s", body, pw.Body.String())
+		_, hasIgnored := parseJSON(t, pw)["mention_ignored"]
+		assert.Falsef(t, hasIgnored, "malformed entities are dropped, not reported: %s", body)
+	}
+}

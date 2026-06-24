@@ -5,6 +5,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"unicode/utf16"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
 	"go.uber.org/zap"
@@ -80,9 +81,23 @@ func (w *IncomingWebhook) buildMention(m *incomingWebhookModel, req *pushPayload
 	// 全部定向 @），仅记 Warn、不让整条推送失败。纯决策（能力位放行 / 装配线协议）下沉到
 	// assembleMention，无 DB 依赖，便于单测穷举各分支。
 	uids := dedupNonEmpty(mr.Uids, maxMentionUIDs())
+	// 渲染层 entities（调用方传入的 @ 区间）【仅 text 路径】处理：offset/length 是对纯文本
+	// content 的 UTF-16 偏移，richtext 的块结构参考系不同（且跨端已知 caption/plain 错位），
+	// 本期不碰。逐条宽松解码后，其 uid 也并入下面同一次成员闸查询，避免二次查询。
+	var ents []mentionEntity
+	if isTextMention(req) {
+		ents = decodeEntities(mr.Entities, maxMentionUIDs())
+	}
+	gateUIDs := uids
+	if len(ents) > 0 {
+		// 上限 2*maxMentionUIDs：uids 与 entity uids 各自已先钳到 maxMentionUIDs，合并去重后
+		// 成员闸 IN 查询最多约 2N 个 uid（仍有界、量级与单查询无异），换取「定向 uids + entities
+		// 一次查询」而非两次。
+		gateUIDs = dedupNonEmpty(append(append([]string{}, uids...), entityUIDsOf(ents)...), maxMentionUIDs()*2)
+	}
 	members := map[string]struct{}{}
-	if len(uids) > 0 {
-		got, err := w.db.filterGroupMembers(m.GroupNo, uids)
+	if len(gateUIDs) > 0 {
+		got, err := w.db.filterGroupMembers(m.GroupNo, gateUIDs)
 		if err != nil {
 			w.Warn("filter group members for mention failed; dropping targeted @uids",
 				zap.String("webhook_id", m.WebhookID), zap.Error(err))
@@ -93,10 +108,159 @@ func (w *IncomingWebhook) buildMention(m *incomingWebhookModel, req *pushPayload
 	// 广播位有效性 = webhook 能力位 AND 策略放行（broadcastPermitted = system_setting
 	// member_can_broadcast || 创建者当前为管理员，由 handlePush 计算）。关掉设置即可即时
 	// 收回成员 webhook 的广播（管理员建的因 creatorIsAdmin 仍放行），无需迁移存量列。
-	return assembleMention(uids, members,
+	mention, ignored := assembleMention(uids, members,
 		mr.All, mr.Bots,
 		m.AllowMentionAll == 1 && broadcastPermitted,
 		m.AllowMentionBots == 1 && broadcastPermitted)
+
+	// 校验通过的 entities 原样挂到 mention.entities（与 uids 正交，ExpandAisToBotUIDs 只动
+	// uids、不碰 entities）。ents 仅在 text 路径非空，故此处无需再判 msg_type；content 在
+	// text 路径原样透传（PR-1 不改写 content），offset 与落地一致。
+	if len(ents) > 0 {
+		if validEnts := finalizeEntities(ents, members, req.Content); len(validEnts) > 0 {
+			if mention == nil {
+				mention = map[string]interface{}{}
+			}
+			mention[mentionrewrite.EntitiesKey] = validEnts
+		}
+	}
+	return mention, ignored
+}
+
+// mentionEntity 是调用方传入的单条【渲染层】@ 区间（线协议 mention.entities 的元素）：
+// offset/length 单位是 UTF-16 码元、相对消息文本，uid 必须是本群成员。
+type mentionEntity struct {
+	UID    string `json:"uid"`
+	Offset int    `json:"offset"`
+	Length int    `json:"length"`
+}
+
+// entity 线协议字段名（与 web/Android 解析、用户给的 native 示例一致：{uid,offset,length}）。
+const (
+	entityKeyUID    = "uid"
+	entityKeyOffset = "offset"
+	entityKeyLength = "length"
+)
+
+// decodeEntities 逐条宽松解码 mention.entities：单条 JSON 形状非法 / uid 空 / offset<0 /
+// length<=0 只丢该条，绝不影响其余 entity 或 mention 的 uids/all/bots（acceptance #6 的延伸）。
+// 这里只做结构 + 基本数值 sanity；成员闸与「offset 越界 / 指向 '@'」校验在 finalizeEntities
+// （那两步需要成员集 + content）。limit<=0 不限；>0 时按出现顺序最多保留 limit 条（兜底膨胀）。
+func decodeEntities(raw []json.RawMessage, limit int) []mentionEntity {
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make([]mentionEntity, 0, len(raw))
+	for _, r := range raw {
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+		var e mentionEntity
+		if err := json.Unmarshal(r, &e); err != nil {
+			continue
+		}
+		if e.UID == "" || e.Offset < 0 || e.Length <= 0 {
+			continue
+		}
+		out = append(out, e)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// entityUIDsOf 抽出 entities 的 uid 列表，用于并入成员闸查询（顺序无关，后续会去重）。
+func entityUIDsOf(ents []mentionEntity) []string {
+	if len(ents) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(ents))
+	for _, e := range ents {
+		out = append(out, e.UID)
+	}
+	return out
+}
+
+// finalizeEntities 把已基本解码的 entities 做【权威校验】并构造线协议形态。每条须满足：
+//   - uid 是本群成员（复用成员闸结果；非成员【静默丢弃】，与定向 uids 反枚举同源）；
+//   - offset/length 落在 content 的 UTF-16 码元范围内（offset 指向真实码元、length 不越界）；
+//   - content 在 offset 处确为 '@'（与 Android plain[offset]=='@' 对齐，挡掉调用方算错的偏移、
+//     避免把气泡错绑到非 @ 文本）；
+//   - 区间不与已接受的 entity 重叠（首条占位者胜）——去重/防重叠，与 uids 的 dedupNonEmpty
+//     对称，且与端上 dedup（web parseMentionWithEntities 的 lastEnd 跳过、Android claimed[]）
+//     一致，避免同一段文本叠多个气泡。
+//
+// 单位刻意用 UTF-16 码元——与 web(String.substring/.length)/Android(Kotlin String)/iOS(NSRange)
+// 一致；故用 utf16.Encode 量度，【绝不能】用字节 len() 或 rune 数（含 emoji 时三者分叉）。
+// 返回 []interface{}（每项 map{uid,offset,length}），可直接挂到 mention[EntitiesKey]；无合法项 → nil。
+func finalizeEntities(ents []mentionEntity, members map[string]struct{}, content string) []interface{} {
+	if len(ents) == 0 {
+		return nil
+	}
+	u16 := utf16.Encode([]rune(content))
+	claimed := make([]bool, len(u16)) // 已被先前 entity 覆盖的码元位，用于防重叠/重复
+	out := make([]interface{}, 0, len(ents))
+	for _, e := range ents {
+		if e.UID == "" {
+			continue
+		}
+		if _, ok := members[e.UID]; !ok {
+			continue
+		}
+		if e.Offset < 0 || e.Length <= 0 {
+			continue
+		}
+		// 越界判断写成减法形式，避免 offset+length 在异常大入参下整型溢出。
+		if e.Offset >= len(u16) || e.Length > len(u16)-e.Offset {
+			continue
+		}
+		if u16[e.Offset] != '@' {
+			continue
+		}
+		if rangeClaimed(claimed, e.Offset, e.Length) {
+			continue // 与已接受区间重叠 / 完全重复 → 丢弃
+		}
+		markClaimed(claimed, e.Offset, e.Length)
+		out = append(out, map[string]interface{}{
+			entityKeyUID:    e.UID,
+			entityKeyOffset: e.Offset,
+			entityKeyLength: e.Length,
+		})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// rangeClaimed 报告 [offset, offset+length) 内是否有任一码元已被占用。调用前提：区间已通过
+// finalizeEntities 的越界校验，故下标恒在 claimed 范围内。
+func rangeClaimed(claimed []bool, offset, length int) bool {
+	for i := offset; i < offset+length; i++ {
+		if claimed[i] {
+			return true
+		}
+	}
+	return false
+}
+
+// markClaimed 把 [offset, offset+length) 标记为已占用。
+func markClaimed(claimed []bool, offset, length int) {
+	for i := offset; i < offset+length; i++ {
+		claimed[i] = true
+	}
+}
+
+// isTextMention 报告本次推送是否走纯文本路径（mention.entities 仅在该路径校验/透传）。
+// 与 handlePush 的 msg_type 分发同口径：缺省 / "text" 即文本。
+func isTextMention(req *pushPayloadReq) bool {
+	switch strings.ToLower(strings.TrimSpace(req.MsgType)) {
+	case "", msgTypeText:
+		return true
+	default:
+		return false
+	}
 }
 
 // assembleMention 是 mention 装配的【纯决策核心】（无 IO，便于单测）：把已去重的定向

@@ -121,6 +121,17 @@ type mentionReq struct {
 	Uids []string `json:"uids,omitempty"`
 	All  bool     `json:"all,omitempty"`
 	Bots bool     `json:"bots,omitempty"`
+	// Entities 是【渲染层】的 @ 区间（线协议 mention.entities：[{uid,offset,length}]），
+	// 与 uids（路由层）正交：调用方自带 content 文本与每个 @ 的 offset/length，服务端只校验
+	// 每条 entity 的 uid 是本群成员、offset/length 落在 content 的 UTF-16 码元范围内且 offset
+	// 处确为 '@'，合法者原样透传到线协议供端上权威渲染气泡（web 用 entities 精确绑定、Android
+	// 校验后保留、iOS 忽略改按位置解析）。offset/length 单位是 UTF-16 码元（= JS .length /
+	// Java/Kotlin String / NSString），不是字节、也不是 rune。
+	//
+	// 类型是 []json.RawMessage 以做【逐条】宽松解码：单条形状非法（如 offset 传字符串）只丢
+	// 该条，不连累其余 entity，也不影响 mention 的 uids/all/bots——与 decodeMention 的宽松
+	// 契约（malformed → 降级、不 400、不丢消息）一致。
+	Entities []json.RawMessage `json:"entities,omitempty"`
 }
 
 // webhookBlock 是富文本消息的单个有序块（对外契约）。字段刻意与 octo-lib
