@@ -11,6 +11,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
 	"go.uber.org/zap"
+	"golang.org/x/text/unicode/norm"
 )
 
 // decodeMention 宽松解码 native 请求里的 mention 原始字节（acceptance #6）：
@@ -76,13 +77,29 @@ var broadcastLabels = map[string]struct{}{
 	"所有人": {}, "所有ai": {}, "all": {}, "all people": {}, "all ais": {},
 }
 
-// isBroadcastLikeName 报告 name（trim+小写后）会不会被端上当成广播 token——不止【精确】命中标签集,
-// 还包括「以广播标签开头、其后紧跟非字边界」。因为 iOS 按 @\S+ 切词:名 "所有人 X" 会切出独立
-// token "@所有人"、名 "所有人:" 同理,都会渲染成广播气泡(伪造一次绕过 allow_mention_* 的全员广播)。
-// 仅当标签后紧跟字母/数字/CJK 时(如 "所有人事部"/"allen")才是另一个真实词、不算广播,照常渲染定向气泡。
-// 单字标签(所有人/所有ai/all)即覆盖多字标签(all people/all ais)的边界,因 iOS 首个 @\S+ token 止于空格。
+// stripFormatRunes 删除 Unicode 格式字符（category Cf：零宽 ZWSP/ZWNJ/ZWJ、BOM、word-joiner
+// 及 LRE/RLE/PDF/LRI… 等 bidi 控制符）。它们不可见,昵称可借此把零宽字符塞进广播标签【内部】
+// （"所有<U+200B>人"）骗过 HasPrefix 比对、却渲染成视觉一模一样的 "@所有人"。guard 比对与渲染昵称
+// 都先过它,确保比对不被绕过、且生成的气泡文本绝不携带不可见混淆字符。
+func stripFormatRunes(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.Is(unicode.Cf, r) {
+			return -1 // 丢弃
+		}
+		return r
+	}, s)
+}
+
+// isBroadcastLikeName 报告 name 会不会被端上当成广播 token——不止【精确】命中标签集,还包括
+// 「以广播标签开头、其后紧跟非字边界」。因为 iOS 按 @\S+ 切词:"所有人 X" 会切出独立 token
+// "@所有人"、"所有人:" 同理,都会渲染成广播气泡(伪造一次绕过 allow_mention_* 的全员广播)。
+// 仅当标签后紧跟字母/数字/CJK 时(如 "所有人事部"/"allen")才是另一个真实词、不算广播,照常渲染。
+// 单字标签(所有人/所有ai/all)即覆盖多字标签(all people/all ais)的边界,因 iOS 首个 token 止于空格。
+//
+// 比对前先 NFKC 折叠(全角 "ａｌｌ"→"all" 等【可见】混淆)+ stripFormatRunes(剥离【不可见】混淆)
+// + 小写,把零宽/bidi/全角 confusable 都收敛到 canonical 形式再比,杜绝绕过(yujiawei/Jerry-Xin #450)。
 func isBroadcastLikeName(name string) bool {
-	n := strings.ToLower(strings.TrimSpace(name))
+	n := strings.ToLower(strings.TrimSpace(stripFormatRunes(norm.NFKC.String(name))))
 	if n == "" {
 		return false
 	}
@@ -160,9 +177,11 @@ func composeMentionContent(content string, wantAll, wantBots, allowAll, allowBot
 			if _, dup := seen[uid]; dup {
 				continue
 			}
-			name := strings.TrimSpace(namesByUID[uid])
+			// 先剥离不可见格式字符（零宽/bidi）再 trim：渲染出的气泡不带不可见混淆字符，且下面
+			// 的 broadcast-like 比对看到的是 canonical 形式（"所有<U+200B>人"→"所有人"，无法夹零宽绕过）。
+			name := strings.TrimSpace(stripFormatRunes(namesByUID[uid]))
 			if name == "" {
-				continue // 非成员 / 未解析到昵称 → 不渲染（绝不补 "@ "）
+				continue // 非成员 / 未解析到昵称 / 仅由格式字符构成 → 不渲染（绝不补 "@ "）
 			}
 			if isBroadcastLikeName(name) || strings.Contains(name, "@") {
 				continue // 防伪造广播 / 嵌入式 @：昵称会被端上当成广播 token 或破坏 @ 分词

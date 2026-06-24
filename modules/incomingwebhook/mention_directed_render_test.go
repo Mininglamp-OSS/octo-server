@@ -88,7 +88,7 @@ func TestComposeMentionContentDirected(t *testing.T) {
 
 	t.Run("broadcast-like names skipped (exact + boundary + embedded '@'); real names still render", func(t *testing.T) {
 		// Skipped: exact label (所有人 / All AIs), label + non-word boundary (所有人 X / 所有人: / all-hands —
-		// iOS @\S+ would emit a standalone @所有人 / @all broadcast token), and any name containing '@'.
+		// iOS @-token scanning would emit a standalone @所有人 / @all broadcast token), and any name with '@'.
 		// Rendered: a label that continues into a longer word (所有人事部 = HR dept; allen) is a real name.
 		nm := map[string]string{
 			"a": "所有人", "b": "所有人 X", "c": "所有人:", "d": "All AIs", "e": "@x", "f": "all-hands",
@@ -100,6 +100,26 @@ func TestComposeMentionContentDirected(t *testing.T) {
 		require.Len(t, ents, 2)
 		assert.Equal(t, "g", ents[0].(map[string]interface{})[entityKeyUID])
 		assert.Equal(t, "h", ents[1].(map[string]interface{})[entityKeyUID])
+	})
+
+	t.Run("invisible/bidi/full-width confusables: folded for the guard, stripped from the pill", func(t *testing.T) {
+		// zwsp/rlo are built via rune() so there are no literal invisible bytes in source. A ZWSP *inside*
+		// a label, an RLO bidi prefix, and a full-width spelling all fold to a broadcast label and are
+		// skipped; a real name still renders but with the invisible rune stripped from the pill.
+		zwsp, rlo := string(rune(0x200B)), string(rune(0x202E))
+		nm := map[string]string{
+			"a": "所有" + zwsp + "人", // ZWSP (U+200B) inside the label -> folds to 所有人 -> skipped
+			"b": rlo + "所有AI",      // RLO (U+202E) bidi prefix -> 所有AI -> skipped
+			"c": "ａｌｌ",             // full-width letters -> NFKC "all" -> skipped
+			"d": "Bob" + zwsp,      // ZWSP in a real name -> renders, invisible stripped from the pill
+		}
+		c, _, ents := composeMentionContent("body", false, false, false, false, true,
+			[]string{"a", "b", "c", "d"}, nm, 0)
+		assert.Equal(t, "@Bob body", c, "confusable broadcast-likes skipped; real name renders with the invisible rune stripped")
+		require.Len(t, ents, 1)
+		e := ents[0].(map[string]interface{})
+		assert.Equal(t, "d", e[entityKeyUID])
+		assert.Equal(t, 4, e[entityKeyLength]) // "@Bob" = 4 UTF-16 (ZWSP gone)
 	})
 }
 
@@ -178,4 +198,50 @@ func TestBuildMentionDirectedRender(t *testing.T) {
 		assert.Nil(t, mention)
 		assert.Empty(t, ignored)
 	})
+}
+
+// TestAssemblePushPayload_DirectedRenderReachesWire is the handler→wire seam (needs MySQL, no
+// WuKongIM): it asserts the composed content + generated entities actually land in the payload
+// map that handlePush hands to SendMessageWithResult — closing the wire-bytes gap reviewers
+// flagged on #450 (buildMention's return was asserted one layer below this).
+func TestAssemblePushPayload_DirectedRenderReachesWire(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer testutil.CleanAllTables(ctx)
+	w := newIncomingWebhook(ctx)
+
+	const groupNo = "g_wire"
+	const uid = "u_wire_bot"
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO group_member(group_no, uid, role, status, is_deleted, version) VALUES(?, ?, 0, 1, 0, 1)",
+		groupNo, uid).Exec()
+	require.NoError(t, err)
+	_, err = ctx.DB().InsertInto("user").Columns("uid", "name", "username", "short_no", "status").
+		Values(uid, "我的天", uid, "sn_"+uid, 1).Exec()
+	require.NoError(t, err)
+
+	m := &incomingWebhookModel{WebhookID: "iwh_wire", GroupNo: groupNo}
+	req := &pushPayloadReq{
+		Content: "执行吧",
+		Mention: json.RawMessage(fmt.Sprintf(`{"uids":["%s"],"render":true}`, uid)),
+	}
+	// base payload mirrors the text-path payload handlePush builds before mention assembly.
+	base := map[string]interface{}{payloadContentKey: req.Content}
+
+	payload, ignored := w.assemblePushPayload(m, req, base, false)
+	assert.Empty(t, ignored)
+
+	// composed content reached the wire payload under the shared content key.
+	assert.Equal(t, "@我的天 执行吧", payload[payloadContentKey])
+
+	mention, ok := payload[mentionrewrite.MentionKey].(map[string]interface{})
+	require.Truef(t, ok, "mention attached to payload; got %v", payload)
+	uids, _ := mention[mentionrewrite.UIDsKey].([]interface{})
+	assert.Contains(t, uids, uid, "uid carried for routing")
+	ents, ok := mention[mentionrewrite.EntitiesKey].([]interface{})
+	require.True(t, ok, "generated entities reached the wire")
+	require.Len(t, ents, 1)
+	e := ents[0].(map[string]interface{})
+	assert.Equal(t, uid, e[entityKeyUID])
+	assert.Equal(t, 0, e[entityKeyOffset])
+	assert.Equal(t, 4, e[entityKeyLength])
 }
