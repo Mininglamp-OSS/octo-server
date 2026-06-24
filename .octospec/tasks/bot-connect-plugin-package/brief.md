@@ -71,6 +71,12 @@ stops owning these facts:
   probe must supply `PluginPackage`. (rules: error-handling — i18n)
 - **secret-handling**: `connect` must never carry the bot token; the masked
   top-level `token` field stays unchanged.
+- **api_url single-source-of-truth**: `DeriveAPIURL(cfg)` replaces every inline
+  `External.BaseURL` / `http://<ip>:8090` copy across `app_bot`, `botfather`
+  (`command.go` + `api.go`) and `bot_api` (`register.go` + `commands.go`) —
+  behavior-identical, so the connect guide, BotFather docs, and `/bot/register`
+  stay consistent and a future derivation change touches exactly one place.
+  (rules: testing — `TestDeriveAPIURL`)
 
 ## Out of scope
 - octo-admin frontend (`connectGuide.ts`) — `bot.connect?.plugin_package ?? …` /
@@ -78,8 +84,6 @@ stops owning these facts:
 - `modules/botfather/skill.go` — the deprecated, static skill-doc generator still
   hardcodes `create-openclaw-octo`; it is not part of the i18n connect-guide
   catalog and is left for a separate decision.
-- `modules/bot_api/register.go` inline `api_url` fallback — behaviorally identical
-  to `DeriveAPIURL`, left unconsolidated to keep scope to app_bot + botfather.
 - octo-lib `config.Config` changes — the package name is a module-level env knob,
   no cross-repo change.
 - Returning the localized guide prose from the backend (explicitly forbidden by #446).
@@ -100,6 +104,8 @@ stops owning these facts:
     different package is injected.
 - `go build ./...`, `go vet ./...`, `golangci-lint run`, `make i18n-extract-check`,
   `make i18n-lint` all pass.
+- No inline `api_url` derivation remains: a grep for the `External.BaseURL` /
+  `http://<ip>:8090` fallback returns only `botutil.DeriveAPIURL`.
 - Full affected suites green under the CI recipe (master key + per-package DB
   reset + `-race`): `pkg/botutil`, `modules/app_bot`, `modules/botfather`,
   `modules/bot_api`.

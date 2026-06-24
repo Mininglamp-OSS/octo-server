@@ -2,7 +2,6 @@ package botfather
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -107,10 +106,7 @@ func (bf *BotFather) Route(r *wkhttp.WKHttp) {
 // skillMD 返回skill.md文档
 func (bf *BotFather) skillMD(c *wkhttp.Context) {
 	cfg := bf.ctx.GetConfig()
-	apiURL := cfg.External.BaseURL
-	if strings.TrimSpace(apiURL) == "" {
-		apiURL = fmt.Sprintf("http://%s:8090", cfg.External.IP)
-	}
+	apiURL := botutil.DeriveAPIURL(cfg)
 	wsURL := botutil.DeriveWSURL(cfg)
 	content := generateSkillMD(apiURL, wsURL)
 	c.Header("Content-Type", "text/markdown; charset=utf-8")
@@ -126,11 +122,7 @@ func (bf *BotFather) cliGuideMD(c *wkhttp.Context) {
 
 // setupNewbotMD 返回 /newbot 设置流程文档
 func (bf *BotFather) setupNewbotMD(c *wkhttp.Context) {
-	cfg := bf.ctx.GetConfig()
-	apiURL := cfg.External.BaseURL
-	if strings.TrimSpace(apiURL) == "" {
-		apiURL = fmt.Sprintf("http://%s:8090", cfg.External.IP)
-	}
+	apiURL := botutil.DeriveAPIURL(bf.ctx.GetConfig())
 	content := generateSetupNewbotMD(apiURL)
 	c.Header("Content-Type", "text/markdown; charset=utf-8")
 	c.String(http.StatusOK, content)
@@ -138,11 +130,7 @@ func (bf *BotFather) setupNewbotMD(c *wkhttp.Context) {
 
 // setupQuickstartMD 返回 /quickstart 设置流程文档
 func (bf *BotFather) setupQuickstartMD(c *wkhttp.Context) {
-	cfg := bf.ctx.GetConfig()
-	apiURL := cfg.External.BaseURL
-	if strings.TrimSpace(apiURL) == "" {
-		apiURL = fmt.Sprintf("http://%s:8090", cfg.External.IP)
-	}
+	apiURL := botutil.DeriveAPIURL(bf.ctx.GetConfig())
 	content := generateSetupQuickstartMD(apiURL)
 	c.Header("Content-Type", "text/markdown; charset=utf-8")
 	c.String(http.StatusOK, content)

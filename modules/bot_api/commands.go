@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botutil"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/gin-gonic/gin"
@@ -84,11 +85,7 @@ func (ba *BotAPI) getUserInfo(c *wkhttp.Context) {
 		return
 	}
 
-	cfg := ba.ctx.GetConfig()
-	apiURL := cfg.External.BaseURL
-	if strings.TrimSpace(apiURL) == "" {
-		apiURL = fmt.Sprintf("http://%s:8090", cfg.External.IP)
-	}
+	apiURL := botutil.DeriveAPIURL(ba.ctx.GetConfig())
 
 	c.JSON(http.StatusOK, gin.H{
 		"uid":    userResp.UID,

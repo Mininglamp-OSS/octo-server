@@ -1,7 +1,6 @@
 package bot_api
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -103,10 +102,7 @@ func (ba *BotAPI) registerUserBot(c *wkhttp.Context, token string) {
 	}
 
 	cfg := ba.ctx.GetConfig()
-	apiURL := cfg.External.BaseURL
-	if strings.TrimSpace(apiURL) == "" {
-		apiURL = fmt.Sprintf("http://%s:8090", cfg.External.IP)
-	}
+	apiURL := botutil.DeriveAPIURL(cfg)
 	wsURL := botutil.DeriveWSURL(cfg)
 
 	botName := ""
@@ -163,10 +159,7 @@ func (ba *BotAPI) registerAppBot(c *wkhttp.Context, token string) {
 	}
 
 	cfg := ba.ctx.GetConfig()
-	apiURL := cfg.External.BaseURL
-	if strings.TrimSpace(apiURL) == "" {
-		apiURL = fmt.Sprintf("http://%s:8090", cfg.External.IP)
-	}
+	apiURL := botutil.DeriveAPIURL(cfg)
 	wsURL := botutil.DeriveWSURL(cfg)
 
 	c.Response(&BotRegisterResp{
