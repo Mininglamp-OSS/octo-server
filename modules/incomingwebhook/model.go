@@ -119,11 +119,22 @@ type pushPayloadReq struct {
 //   - Uids     ：要 @ 的成员 UID（用户或 bot），去重后受上限约束，且必须是本群当前成员。
 //   - All      ：@所有人（真人广播），受 webhook 的 allow_mention_all 能力位约束。
 //   - Bots     ：@所有 AI（bot 广播），受 webhook 的 allow_mention_bots 能力位约束。
+//   - Render   ：opt-in，请求服务端把 Uids 解析成可见 @昵称气泡（详见字段注释）。
 //   - Entities ：渲染层 @ 区间（详见字段注释）；定向渲染、不受广播能力位约束。
 type mentionReq struct {
 	Uids []string `json:"uids,omitempty"`
 	All  bool     `json:"all,omitempty"`
 	Bots bool     `json:"bots,omitempty"`
+	// Render 是【定向 @ 昵称渲染】的 opt-in 开关（默认 false）。置 true 时，服务端把 Uids 里
+	// 的【本群成员】解析成展示昵称（group_member LEFT JOIN user → user.name，与群成员列表口径
+	// 一致）、在【纯文本】content 文首补 "@<昵称> "、并【生成】对应的线协议 mention.entities
+	// 元素（offset/length 为 UTF-16 码元）——让只传 uid 的调用方也能渲染出可点击 @气泡，而无需
+	// 自己写昵称文本与偏移（那是 Entities 的【调用方自管】路径）。
+	//
+	// 默认关：#445 老调用方传 uids 只为刷红点 / 唤起 bot、不期望 content 被改写,opt-in 保其行为
+	// 不变。它是【请求侧】字段、不进线协议,客户端不感知;关闭时 content 与 payload 完全不变。
+	// 与 Entities 互斥:调用方自带 Entities 时以其为准、Render 不再自动生成(见 buildMention)。
+	Render bool `json:"render,omitempty"`
 	// Entities 是【渲染层】的 @ 区间（线协议 mention.entities：[{uid,offset,length}]），
 	// 与 uids（路由层）正交：调用方自带 content 文本与每个 @ 的 offset/length，服务端只校验
 	// 每条 entity 的 uid 是本群成员、offset/length 落在 content 的 UTF-16 码元范围内且 offset

@@ -1,0 +1,44 @@
+slug: incoming-webhook-mention-directed-render
+rules_injected:
+  - id: trust-boundary
+    tier: repo
+    load_bearing: true
+    why: webhook push is attacker-controlled ingress. The composed "@<name>" name comes from
+         server-side group data (user.name of a CURRENT internal-normal member), not caller strings —
+         the caller only supplies the boolean render flag + the (member-gated) uid list. ADVERSARIAL
+         REVIEW HARDENING:a member display name that is itself a broadcast label (所有人/所有AI/
+         All People/All AIs/all) or contains '@' is SKIPPED, else "@<name>" would render as a forged
+         @所有人/@所有AI broadcast pill bypassing the allow_mention_* capability gate. Render-side
+         sanitization (web rehypeSanitize + isSafeUrl) remains the boundary for markdown in names —
+         identical to how any @-mention / message author name is already rendered (no new surface).
+  - id: space-isolation
+    tier: repo
+    load_bearing: true
+    why: names resolved ONLY for current internal-normal members of the webhook's group_no (same gate
+         as #445/#449; LEFT JOIN user only adds the name column, does not widen the row set). A token
+         cannot resolve/render a cross-group or cross-Space identity; non-members drop silently.
+  - id: error-handling
+    tier: repo
+    load_bearing: true
+    why: no new error codes; render is non-fatal render-layer text (never an error response). render is
+         a request-only field, not on the wire; NoLegacyResponseError guard holds (no new handler file).
+  - id: testing
+    tier: repo
+    load_bearing: false
+    why: pure composeMentionContent directed tests (order / skip / idempotency / budget / broadcast-combo /
+         broadcast-label+@ guard) + integration via buildMention with seeded group_member + user rows.
+  - id: commit-style
+    tier: repo
+    load_bearing: false
+    why: Conventional Commits, English.
+files_touched:
+  - modules/incomingwebhook/model.go        # mentionReq.Render request flag (opt-in)
+  - modules/incomingwebhook/db.go           # filterGroupMembers → map[uid]name (LEFT JOIN user.name)
+  - modules/incomingwebhook/mention.go      # composeMentionContent (unified broadcast+directed+budget+guard); buildMention render wiring
+  - modules/incomingwebhook/mention_directed_render_test.go  # NEW pure + integration tests
+  - modules/incomingwebhook/mention_broadcast_test.go        # compose tests updated to composeMentionContent
+parity_decisions:
+  - "Display name source = user.name via group_member LEFT JOIN user (IFNULL(user.name,'')), matching modules/group's member-list resolution. remark (viewer-specific) and verified-real_name (#344 space-list refinement) are out of scope for v1."
+  - "Generated entity shape {uid,offset,length} (UTF-16) mirrors what octo-web mentionSendParse emits when a user @s a member — so the server-rendered directed @ is wire-identical to a client-sent one (web offset-authoritative, Android validates, iOS positional)."
+  - "render is opt-in (default off) and NOT capability-gated — directed @ is not a broadcast; it is bounded by the member gate. Broadcast flags (humans/ais) remain capability-gated and independent."
+  - "Adversarial-review hardening (3 finder agents): forged-broadcast guard (name==broadcast label / contains '@'); O(n²)→incremental prefix length tracking; rune budget keeps composed content ≤ maxContentRunes (utf8mb4 byte size ≤~4× but well under serialization cap, documented); iOS truncates spaced-name pill text but still binds by position (documented, == #449). WeChat-nickname '@' non-sanitization is a PRE-EXISTING modules/user gap (out of scope); the render '@'-skip guard defends this module regardless."

@@ -21,55 +21,61 @@ import (
 
 func TestComposeBroadcastContent(t *testing.T) {
 	const content = "deploy done"
+	// broadcast-only compose (render off): assert no entities are generated, return (content, prefixLen).
+	compose := func(c string, all, bots, allowAll, allowBots bool) (string, int) {
+		got, n, ents := composeMentionContent(c, all, bots, allowAll, allowBots, false, nil, nil, 0)
+		require.Nil(t, ents, "broadcast-only compose must not generate entities")
+		return got, n
+	}
 
 	t.Run("permitted all, no literal -> prepend @所有人 + space (5 utf16)", func(t *testing.T) {
-		got, n := composeBroadcastContent(content, true, false, true, false)
+		got, n := compose(content, true, false, true, false)
 		assert.Equal(t, "@所有人 "+content, got)
 		assert.Equal(t, 5, n) // @所有人 + space = 5 UTF-16 code units
 		assert.True(t, strings.HasPrefix(got, broadcastTokenAll+broadcastTokenSep))
 	})
 
 	t.Run("permitted bots, no literal -> prepend @所有AI + space (6 utf16)", func(t *testing.T) {
-		got, n := composeBroadcastContent(content, false, true, false, true)
+		got, n := compose(content, false, true, false, true)
 		assert.Equal(t, "@所有AI "+content, got)
 		assert.Equal(t, 6, n)
 	})
 
 	t.Run("both permitted -> humans first then ais (11 utf16)", func(t *testing.T) {
-		got, n := composeBroadcastContent(content, true, true, true, true)
+		got, n := compose(content, true, true, true, true)
 		assert.Equal(t, "@所有人 @所有AI "+content, got)
 		assert.Equal(t, 11, n)
 	})
 
 	t.Run("wanted but not permitted -> no prepend, zero shift", func(t *testing.T) {
-		got, n := composeBroadcastContent(content, true, true, false, false)
+		got, n := compose(content, true, true, false, false)
 		assert.Equal(t, content, got)
 		assert.Equal(t, 0, n)
 	})
 
 	t.Run("permitted but not wanted -> no prepend", func(t *testing.T) {
-		got, n := composeBroadcastContent(content, false, false, true, true)
+		got, n := compose(content, false, false, true, true)
 		assert.Equal(t, content, got)
 		assert.Equal(t, 0, n)
 	})
 
 	t.Run("idempotent: literal already present anywhere -> token not re-prepended", func(t *testing.T) {
 		c := "ping @所有人 now"
-		got, n := composeBroadcastContent(c, true, false, true, false)
+		got, n := compose(c, true, false, true, false)
 		assert.Equal(t, c, got)
 		assert.Equal(t, 0, n)
 	})
 
 	t.Run("idempotent per token: all present, ais absent -> prepend only @所有AI", func(t *testing.T) {
 		c := "ping @所有人 now"
-		got, n := composeBroadcastContent(c, true, true, true, true)
+		got, n := compose(c, true, true, true, true)
 		assert.Equal(t, "@所有AI "+c, got)
 		assert.Equal(t, 6, n)
 		assert.Equal(t, 1, strings.Count(got, broadcastTokenAll), "existing @所有人 not duplicated")
 	})
 
 	t.Run("no-op returns original (byte-identical, backward compat)", func(t *testing.T) {
-		got, n := composeBroadcastContent(content, false, false, false, false)
+		got, n := compose(content, false, false, false, false)
 		assert.Equal(t, content, got)
 		assert.Equal(t, 0, n)
 	})

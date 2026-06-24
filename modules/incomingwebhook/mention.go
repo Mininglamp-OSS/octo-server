@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
 	"go.uber.org/zap"
@@ -66,41 +67,106 @@ const (
 	broadcastTokenSep = " "     // 定界空格（见上）
 )
 
-// composeBroadcastContent 在【获批】的广播位生效时，把对应的 canonical 广播字面量前置到
-// content，使三端渲染出广播气泡。返回（可能改写后的 content，本次前置前缀的 UTF-16 码元长度）。
+// broadcastLabels 是端上识别的广播标签集（@ 去前缀、小写；与 web/iOS/Android 的
+// isBroadcastMentionName 同口径：中文 canonical + 英文别名）。定向 render 时昵称命中此集 → 跳过，
+// 否则 "@<昵称>" 会被端上当成广播 token 渲染成 @所有人/@所有AI 气泡——伪造一次绕过
+// allow_mention_* 能力位的全员广播。
+var broadcastLabels = map[string]struct{}{
+	"所有人": {}, "所有ai": {}, "all": {}, "all people": {}, "all ais": {},
+}
+
+// isBroadcastLabel 报告 name（trim+小写后）是否命中端上广播标签集。
+func isBroadcastLabel(name string) bool {
+	_, ok := broadcastLabels[strings.ToLower(strings.TrimSpace(name))]
+	return ok
+}
+
+// utf16Len 返回 s 的 UTF-16 码元长度（= JS String.length / NSString length / Kotlin
+// String length），与端上 mention.entities 的 offset/length 单位一致——【绝不能】用字节
+// len() 或 rune 数（含 emoji 时三者分叉）。
+func utf16Len(s string) int {
+	return len(utf16.Encode([]rune(s)))
+}
+
+// composeMentionContent 把服务端生成的 @ 前缀补到 content 文首，使三端渲染气泡。两类前缀按
+// 固定顺序拼成一段、一次性前置（广播在前、定向在后、原 content 最后）：
 //
-// prefixU16Len 供调用方把定向 entities(#449) 的 offset 整体右移——前置改变了 content 文本，
-// 而 entities 的 offset 是相对 content 的 UTF-16 码元绝对位置，必须同步右移才不会错绑气泡。
+//   - 广播字面量（@所有人/@所有AI，#448 ②）：want* && allow*（= AllowMention*==1 &&
+//     broadcastPermitted）且 content 未含该 canonical 时前置。广播气泡由端上据 humans/ais
+//     标志位 + 文本里的字面量渲染，故【不】生成 entity。
+//   - 定向昵称（render，#448 ① b）：把 renderUIDs（已是本群成员、按调用方顺序）逐个解析昵称、
+//     前置 "@<昵称> "，并【生成】对应线协议 entity（offset/length 为 UTF-16 码元、指向前缀里该
+//     @ 段）——让只传 uid 的调用方也能渲染可点击 @气泡。
 //
-//   - 仅当 want* 且 allow*（= AllowMention*==1 && broadcastPermitted）同时成立才前置；未获批的
-//     广播位不前置（它已进 mention_ignored，没有真正广播、不应出现气泡）。
-//   - 幂等：content 已含该 canonical 字面量则不再前置该 token（否则三端会渲染两个气泡）。用
-//     strings.Contains（任意位置）而非仅前缀：调用方可能把 @所有人 写在句中，仍应避免重复气泡。
-//     （极端误判：文本恰含 "@所有人" 子串如成员名 "@所有人事部" 时会保守地不前置——此时端上同样
-//     不会把该子串当广播 token 高亮，结果一致：无自动气泡、标志位仍照常路由。）
-//   - humans 在前、ais 在后（稳定顺序）。
-//   - 仅文本路径调用（richtext 无顶层 content，调用方据 isTextMention 决定是否调用）。
+// 返回（改写后的 content，前缀的 UTF-16 码元长度，定向 render 生成的 entities）。前缀为空 →
+// (content, 0, nil)，保证无补文案的历史调用 payload 字节不变（向后兼容）。
 //
-// 前缀是服务端定值（≤11 UTF-16 码元）：刻意在 handlePush 的 maxContentRunes 上限校验【之后】追加，
-// 相对默认 4000 上限可忽略、且 8KB body / 序列化上限仍兜底——故不为这点定长前缀重算上限。
-//
-// 不前置任何 token 时返回 (content, 0)——原样字符串、零位移，保证无广播位的历史调用 payload
-// 完全不变（向后兼容）。
-func composeBroadcastContent(content string, wantAll, wantBots, allowAll, allowBots bool) (string, int) {
+// 不变量与边界：
+//   - prefixU16 供调用方把【调用方自带】的 entities(#449) 整体右移（前置改变了 content）；render
+//     与自带 entities 互斥，故二者不会同时出现。
+//   - 防伪造广播：昵称命中端上广播标签集（isBroadcastLabel）或含 '@'（WeChat 昵称路径不过滤 @）时
+//     【跳过】render——否则 "@<昵称>" 会被端上当成 @所有人/@所有AI 广播 token 渲染，伪造一次绕过
+//     allow_mention_* 能力位的全员广播气泡。命中者仍按 uid 路由、只是不出气泡。
+//   - 幂等：广播按 canonical 字面量、定向按 "@<昵称>" 在【原始 content】里 Contains 去重（避免双
+//     气泡）。子串误判（名是另一段文本的前缀，如名 "张" 撞 "@张三"）会保守跳过该气泡、uid 仍路由——可接受。
+//   - 空昵称（非成员/未 join 到 user.name）跳过——绝不补 "@ "。
+//   - 含空格的昵称（如 "Bob Smith"）：web/Android 用 entity 精确绑定整段；iOS 忽略 entity、按 @\S+
+//     定位，气泡文本会截到首个空格（点击仍按位次绑定到正确 uid）——与 #449 的 iOS 已知行为一致、非错绑。
+//   - 预算 maxRunes>0：增量维护 prefixRunes（含已前置的广播段，故定向段按剩余额度收敛），补每个
+//     @昵称前估算「前缀+原文」总 rune 数，超限即停止再补（剩余 uid 仍由 mention.uids 路由）,保证
+//     补文案后 content 不破 maxContentRunes。rune 数有界（≤maxContentRunes）；utf8mb4 昵称下字节
+//     最坏约 4×，仍远低于下游序列化上限。
+func composeMentionContent(content string, wantAll, wantBots, allowAll, allowBots, render bool, renderUIDs []string, namesByUID map[string]string, maxRunes int) (string, int, []interface{}) {
 	var prefix strings.Builder
+	prefixU16, prefixRunes := 0, 0 // 增量维护，避免每轮重算 prefix.String()（O(n²)）
+	appendToken := func(tok string) {
+		prefix.WriteString(tok)
+		prefixU16 += utf16Len(tok)
+		prefixRunes += utf8.RuneCountInString(tok)
+	}
 	if wantAll && allowAll && !strings.Contains(content, broadcastTokenAll) {
-		prefix.WriteString(broadcastTokenAll)
-		prefix.WriteString(broadcastTokenSep)
+		appendToken(broadcastTokenAll + broadcastTokenSep)
 	}
 	if wantBots && allowBots && !strings.Contains(content, broadcastTokenAIs) {
-		prefix.WriteString(broadcastTokenAIs)
-		prefix.WriteString(broadcastTokenSep)
+		appendToken(broadcastTokenAIs + broadcastTokenSep)
 	}
-	p := prefix.String()
-	if p == "" {
-		return content, 0
+	var genEntities []interface{}
+	if render {
+		contentRunes := utf8.RuneCountInString(content)
+		seen := make(map[string]struct{}, len(renderUIDs))
+		for _, uid := range renderUIDs {
+			if _, dup := seen[uid]; dup {
+				continue
+			}
+			name := strings.TrimSpace(namesByUID[uid])
+			if name == "" {
+				continue // 非成员 / 未解析到昵称 → 不渲染（绝不补 "@ "）
+			}
+			if isBroadcastLabel(name) || strings.Contains(name, "@") {
+				continue // 防伪造广播 / 嵌入式 @：昵称会被端上当成广播 token 或破坏 @ 分词
+			}
+			atName := "@" + name
+			if strings.Contains(content, atName) {
+				continue // 幂等：调用方已把该 @昵称写进 content
+			}
+			seg := atName + broadcastTokenSep
+			// 预算：补这一段后「前缀+原文」rune 数不得超过 maxContentRunes（prefixRunes 已含广播段）。
+			if maxRunes > 0 && prefixRunes+utf8.RuneCountInString(seg)+contentRunes > maxRunes {
+				break // 余下 uid 不再出气泡，仍由 mention.uids 路由
+			}
+			seen[uid] = struct{}{}
+			genEntities = append(genEntities, map[string]interface{}{
+				entityKeyUID:    uid,
+				entityKeyOffset: prefixU16, // 该 @ 段在前缀里的 UTF-16 起点（append 前捕获）
+				entityKeyLength: utf16Len(atName),
+			})
+			appendToken(seg)
+		}
 	}
-	return p + content, len(utf16.Encode([]rune(p)))
+	if prefix.Len() == 0 {
+		return content, 0, nil
+	}
+	return prefix.String() + content, prefixU16, genEntities
 }
 
 // buildMention 把 native 推送请求里的 mentionReq 翻译成消息 payload 的 mention 子对象
@@ -114,8 +180,11 @@ func composeBroadcastContent(content string, wantAll, wantBots, allowAll, allowB
 //  2. @所有人(All)：webhook 的 allow_mention_all 开【且 broadcastPermitted】则写 humans=1，否则记入 ignored。
 //  3. @所有 AI(Bots)：allow_mention_bots 开【且 broadcastPermitted】则写 ais=1（稍后由调用方
 //     ExpandAisToBotUIDs 展开为群内全部 bot 成员 UID），否则记入 ignored。
-//  4. 广播补文案（仅 text 路径）：获批的 all/bots 还会把 canonical 字面量(@所有人/@所有AI)
-//     前置到 content，使三端渲染出可见广播气泡（见 composeBroadcastContent）；未获批不前置。
+//  4. 广播补文案（仅 text 路径）：获批的 all/bots 把 canonical 字面量(@所有人/@所有AI)前置到
+//     content，使三端渲染出可见广播气泡（见 composeMentionContent）；未获批不前置。
+//  5. 定向昵称渲染（mention.render，opt-in，仅 text 路径）：把【本群成员】uids 解析成展示昵称、
+//     前置 "@<昵称> " 并生成对应 entities，让只传 uid 的调用方也渲染出 @气泡；与调用方自带
+//     entities 互斥（后者权威，见 composeMentionContent）。
 //
 // broadcastPermitted 由调用方传入：system_setting member_can_broadcast || 创建者当前为管理员。
 // 关掉该设置即可即时收回所有【成员】创建的 webhook 的广播能力，管理员创建的不受影响。
@@ -152,8 +221,9 @@ func (w *IncomingWebhook) buildMention(m *incomingWebhookModel, req *pushPayload
 	// 渲染层 entities（调用方传入的 @ 区间）【仅 text 路径】处理：offset/length 是对纯文本
 	// content 的 UTF-16 偏移，richtext 的块结构参考系不同（且跨端已知 caption/plain 错位），
 	// 本期不碰。逐条宽松解码后，其 uid 也并入下面同一次成员闸查询，避免二次查询。
+	isText := isTextMention(req)
 	var ents []mentionEntity
-	if isTextMention(req) {
+	if isText {
 		ents = decodeEntities(mr.Entities, maxMentionUIDs())
 	}
 	gateUIDs := uids
@@ -163,32 +233,63 @@ func (w *IncomingWebhook) buildMention(m *incomingWebhookModel, req *pushPayload
 		// 一次查询」而非两次。
 		gateUIDs = dedupNonEmpty(append(append([]string{}, uids...), entityUIDsOf(ents)...), maxMentionUIDs()*2)
 	}
-	members := map[string]struct{}{}
+	// 成员闸：返回 uid→展示昵称（key 即成员归属判定；昵称仅 render 取用）。失败即降级为空集
+	// （→丢弃全部定向 @），仅记 Warn、不让整条推送失败。
+	membersByName := map[string]string{}
 	if len(gateUIDs) > 0 {
 		got, err := w.db.filterGroupMembers(m.GroupNo, gateUIDs)
 		if err != nil {
 			w.Warn("filter group members for mention failed; dropping targeted @uids",
 				zap.String("webhook_id", m.WebhookID), zap.Error(err))
 		} else {
-			members = got
+			membersByName = got
 		}
 	}
-	// 广播补文案【仅 text 路径】：获批的 all/bots 把 canonical 字面量前置到 content，使三端
-	// 渲染广播气泡（richtext 无顶层 content → isTextMention=false → 不补、content 原样）。
-	// prefixU16 用于把下面定向 entities 的 offset 整体右移（前置改变了 content）。
+	// 成员集（key 即成员）供 assembleMention / finalizeEntities 判定归属；昵称仅 render 取用。
+	members := make(map[string]struct{}, len(membersByName))
+	for u := range membersByName {
+		members[u] = struct{}{}
+	}
+
+	// 定向昵称渲染（opt-in、仅 text 路径、且与调用方自带 entities 互斥——后者权威）。renderUIDs 是
+	// uids 里的本群成员、保持调用方顺序，由 composeMentionContent 逐个解析昵称、前置 "@<昵称> "
+	// 并生成对应 entity。
+	renderEffective := mr.Render && isText && len(ents) == 0
+	var renderUIDs []string
+	if renderEffective {
+		for _, u := range uids {
+			if _, ok := membersByName[u]; ok {
+				renderUIDs = append(renderUIDs, u)
+			}
+		}
+	}
+
+	// 服务端补 @ 前缀【仅 text 路径】：广播字面量（获批的 all/bots）+ 定向 @昵称（render）。
+	// content 为改写后的正文；prefixU16 供下面把调用方自带 entities 右移；genEntities 是 render
+	// 生成的定向 entities。richtext（isText=false）不补、content 原样、payload 字节不变。
 	content := req.Content
 	prefixU16 := 0
-	if isTextMention(req) {
-		content, prefixU16 = composeBroadcastContent(req.Content, mr.All, mr.Bots, allowAll, allowBots)
+	var genEntities []interface{}
+	if isText {
+		content, prefixU16, genEntities = composeMentionContent(
+			req.Content, mr.All, mr.Bots, allowAll, allowBots,
+			renderEffective, renderUIDs, membersByName, maxContentRunes())
 	}
 
 	mention, ignored := assembleMention(uids, members, mr.All, mr.Bots, allowAll, allowBots)
 
-	// 校验通过的 entities 原样挂到 mention.entities（与 uids 正交，ExpandAisToBotUIDs 只动
-	// uids、不碰 entities）。ents 仅在 text 路径非空，故此处无需再判 msg_type。校验【相对原始
-	// req.Content】（offset/'@' 锚点都按未前置文本），再把存活区间整体右移 prefixU16——前置只在
-	// 文首插入，故 offset+prefixU16 仍精确指向同一 '@'（广播补文案与定向气泡共存时不错绑）。
-	if len(ents) > 0 {
+	// mention.entities 二选一（render 与调用方自带 entities 互斥）：
+	//   - render 生成的定向 entities：offset 已含全部前缀长度（compose 内按前缀位置算），无需再移；
+	//   - 调用方自带 entities（#449）：相对【原始 req.Content】校验（offset/'@' 锚点按未前置文本），
+	//     再整体右移 prefixU16——前置只在文首插入，故 offset+prefixU16 仍精确指向同一 '@'。
+	// 与 uids 正交，ExpandAisToBotUIDs 只动 uids、不碰 entities。
+	switch {
+	case len(genEntities) > 0:
+		if mention == nil {
+			mention = map[string]interface{}{}
+		}
+		mention[mentionrewrite.EntitiesKey] = genEntities
+	case len(ents) > 0:
 		if validEnts := finalizeEntities(ents, members, req.Content); len(validEnts) > 0 {
 			shiftEntityOffsets(validEnts, prefixU16)
 			if mention == nil {

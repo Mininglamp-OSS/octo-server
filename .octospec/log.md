@@ -14,6 +14,16 @@ change-log convention (§7). Newest first.
   length. Text-path only; routing / red-dot / bot-summon unchanged. Brief +
   context + journal under `.octospec/tasks/incoming-webhook-mention-broadcast/`
   and `.octospec/journal/shared/incoming-webhook-mention-broadcast.md`.
+- **Add** — Task `incoming-webhook-mention-directed-render` (#448 item ① b):
+  opt-in server-side directed @mention name-resolution. `mention.render:true`
+  resolves each member uid → `user.name`, prepends `@<name> ` to text content, and
+  generates the UTF-16 `mention.entities`. Refactored the broadcast compose into one
+  `composeMentionContent`. Adversarial review added a forged-broadcast guard (skip
+  names that are broadcast labels or contain `@`), incremental budget tracking, and
+  cap/iOS/byte-size docs. Ships in the same PR as the broadcast half (#450) → the
+  two close #448. Brief + context + journal under
+  `.octospec/tasks/incoming-webhook-mention-directed-render/` and
+  `.octospec/journal/shared/incoming-webhook-mention-directed-render.md`.
 
 ## 2026-06-23
 

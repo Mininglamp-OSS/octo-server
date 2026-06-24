@@ -199,36 +199,48 @@ func (d *incomingWebhookDB) queryMemberRole(groupNo, uid string) (isMember, isAd
 	return true, roles[0] == group.MemberRoleCreator || roles[0] == group.MemberRoleManager, nil
 }
 
-// filterGroupMembers 返回 uids 中【当前是 groupNo 内部正常成员】的子集（成员闸）。
-// 用于 push 路径的定向 @ 校验：webhook token 是写进 CI/平台配置的低信任共享密钥，必须
-// 把 @ 目标收敛到本群成员，杜绝「泄露的 token @ 任意平台用户 / 跨 Space 身份」以及借
-// 「@<uid> 是否被保留」探测成员归属。成员定义与 queryMemberRole 同口径（is_deleted=0
-// + is_external=0 + status=Normal）——外部成员在 v1 刻意不可被 @（空间隔离保守取舍）。
+// filterGroupMembers 返回 uids 中【当前是 groupNo 内部正常成员】的子集,映射到各自的
+// 展示昵称(uid → user.name)。返回值【既是成员闸又是昵称表】:key 存在 = 是本群成员
+// (assembleMention / finalizeEntities 只看 key 判归属),value = 昵称(仅 mention.render 的
+// 定向 @气泡渲染用,可能为空串——未 join 到 user 行时)。
 //
-// 直接点读 group_member 表（与 queryMemberRole 一致，该表已是跨模块既有读取面），用
-// IN 一次取回命中子集；uids 由调用方先去重并钳到上限，IN 列表有界。空入参短路返回。
+// 用于 push 路径的定向 @ 校验:webhook token 是写进 CI/平台配置的低信任共享密钥,必须
+// 把 @ 目标收敛到本群成员,杜绝「泄露的 token @ 任意平台用户 / 跨 Space 身份」以及借
+// 「@<uid> 是否被保留」探测成员归属。成员定义与 queryMemberRole 同口径(is_deleted=0
+// + is_external=0 + status=Normal)——外部成员在 v1 刻意不可被 @(空间隔离保守取舍)。
 //
-// ⚠️ 与 @所有 AI 的非对称是【有意】的：定向 @uid 走本闸、排除外部成员（保守）；而
-// @所有 AI(ais) 的 bot 展开走 fetchBotMemberUIDs→GetMembers，与 message/bot_api 入口
-// 同源、只排除已删成员（故可能含外部 bot 成员）——广播侧取 parity。两条路径都不越群/
-// 越 Space（都以本群成员为界，外部 bot 也确是本群成员），差异仅是「定向保守 vs 广播对齐
-// 其它入口」的取舍，非遗漏。
-func (d *incomingWebhookDB) filterGroupMembers(groupNo string, uids []string) (map[string]struct{}, error) {
-	out := make(map[string]struct{}, len(uids))
+// 昵称口径与群成员列表一致:LEFT JOIN user → IFNULL(user.name,”)(见 group/db.go 的
+// queryMembers*)。LEFT JOIN 不影响成员判定(只 group_member 的 WHERE 决定行集),仅补昵称;
+// 未 join 到 user 行(如某些 bot)→ 空串,render 侧据此跳过、绝不渲染 "@ "。uids 由调用方
+// 先去重并钳到上限,IN 列表有界。空入参短路返回。
+//
+// ⚠️ 与 @所有 AI 的非对称是【有意】的:定向 @uid 走本闸、排除外部成员(保守);而
+// @所有 AI(ais) 的 bot 展开走 fetchBotMemberUIDs→GetMembers,与 message/bot_api 入口
+// 同源、只排除已删成员(故可能含外部 bot 成员)——广播侧取 parity。两条路径都不越群/
+// 越 Space(都以本群成员为界,外部 bot 也确是本群成员),差异仅是「定向保守 vs 广播对齐
+// 其它入口」的取舍,非遗漏。
+func (d *incomingWebhookDB) filterGroupMembers(groupNo string, uids []string) (map[string]string, error) {
+	out := make(map[string]string, len(uids))
 	if groupNo == "" || len(uids) == 0 {
 		return out, nil
 	}
-	var got []string
-	_, err := d.session.Select("uid").From("group_member").
-		Where("group_no=?", groupNo).
-		Where("uid in ?", uids).
-		Where("is_deleted=0 AND is_external=0 AND status=?", int(common.GroupMemberStatusNormal)).
+	type memberRow struct {
+		UID  string `db:"uid"`
+		Name string `db:"name"`
+	}
+	var got []memberRow
+	_, err := d.session.Select("group_member.uid", "IFNULL(user.name,'') AS name").
+		From("group_member").
+		LeftJoin("user", "group_member.uid=user.uid").
+		Where("group_member.group_no=?", groupNo).
+		Where("group_member.uid in ?", uids).
+		Where("group_member.is_deleted=0 AND group_member.is_external=0 AND group_member.status=?", int(common.GroupMemberStatusNormal)).
 		Load(&got)
 	if err != nil {
 		return nil, err
 	}
-	for _, u := range got {
-		out[u] = struct{}{}
+	for _, r := range got {
+		out[r.UID] = r.Name
 	}
 	return out, nil
 }
