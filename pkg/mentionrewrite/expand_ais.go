@@ -64,7 +64,10 @@ const UIDsKey = "uids"
 //     scope per the issue body — bots in DMs have a different
 //     dispatch path, and community-topic bots are out of v0.
 //  2. ONLY `mention.uids` is touched. `mention.all`, `mention.humans`,
-//     and `mention.ais` are forwarded untouched. The issue body
+//     `mention.ais`, and `mention.entities` are forwarded untouched —
+//     `entities` (the render-layer @-span list) MUST stay verbatim so the
+//     shallow copy in CloneForExpansion remains safe and the caller-supplied
+//     offsets keep pointing at the unchanged message text. The issue body
 //     constraint "Do NOT modify mention.all, mention.humans, or
 //     mention.ais — only mention.uids" is intentional: those fields
 //     drive other read-side behaviors (legacy `@所有人` rendering,

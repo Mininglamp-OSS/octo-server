@@ -99,6 +99,11 @@ func CloneForExpansion(payload map[string]interface{}) map[string]interface{} {
 	if !ok {
 		return out
 	}
+	// Only `uids` is deep-copied below because it is the only key
+	// ExpandAisToBotUIDs mutates. Other mention keys (humans / ais /
+	// entities) are shared by reference — safe precisely because the
+	// helper forwards them untouched (see ExpandAisToBotUIDs clause 2). If a
+	// future helper starts mutating e.g. `entities`, deep-copy it here too.
 	mentionCopy := make(map[string]interface{}, len(mention))
 	for k, v := range mention {
 		mentionCopy[k] = v
