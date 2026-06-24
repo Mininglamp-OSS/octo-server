@@ -67,11 +67,24 @@ func TestAliasPush_GitHubPing_SkippedLikeCanonical(t *testing.T) {
 // multica/gitlab/feishu 4 个适配器后缀未在别名上单测——mountPush 闭包让 6 条统一注册、
 // 结构上不可能漏挂，这条遍历测试把该不变量显式钉死（belt & suspenders）。
 func TestAliasPush_AllPushRoutesRegistered(t *testing.T) {
+	// 固定宽松的限流 env，让本测试自包含、不受 CI 全局调低 burst 影响（#456 review
+	// Jerry-Xin 🟡）：6 次错误 token 在默认 burst(60) 下本就安全，但若某环境全局压低
+	// IP_FAIL_BURST / IP_BURST / local-floor 桶，401 可能翻成 429。strict 限流器与
+	// local floor 在 Route()/New() 构造时读 env，故必须在 setupTestEnv 之前 Setenv。
+	t.Setenv("DM_INCOMINGWEBHOOK_IP_FAIL_RPS", "10000")
+	t.Setenv("DM_INCOMINGWEBHOOK_IP_FAIL_BURST", "10000")
+	t.Setenv("DM_INCOMINGWEBHOOK_IP_RPS", "10000")
+	t.Setenv("DM_INCOMINGWEBHOOK_IP_BURST", "10000")
+	t.Setenv("DM_INCOMINGWEBHOOK_LOCAL_RPS", "10000")
+	t.Setenv("DM_INCOMINGWEBHOOK_LOCAL_BURST", "10000")
+	t.Setenv("DM_INCOMINGWEBHOOK_LOCAL_PERIP_RPS", "10000")
+	t.Setenv("DM_INCOMINGWEBHOOK_LOCAL_PERIP_BURST", "10000")
+
 	handler, ctx, groupNo := setupTestEnv(t)
 	whID, _ := createWebhookWithToken(t, handler, groupNo)
 
-	// 固定 IP + 重置失败/限流桶：6 次错误 token 会消耗 per-IP 失败预算（默认 burst 60，
-	// 6 次远未触顶），固定 IP 让本测试与并发的其它匿名推送测试互不串桶。
+	// 固定 IP + 重置失败/限流桶：6 次错误 token 走同一 IP，重置桶让本测试与并发的其它
+	// 匿名推送测试互不串桶（env 已宽松，桶容量也足够）。
 	const ip = "203.0.113.201"
 	resetIPFailBucket(t, ctx, ip)
 	resetStrictIPBucket(t, ctx, ip)
