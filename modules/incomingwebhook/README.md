@@ -1,6 +1,6 @@
 # Incoming Webhook 推送契约
 
-外部服务通过带 token 的 URL 向指定群推送消息。本文先给出**管理端点的权限模型**
+外部服务通过带 token 的 URL 向指定**群或子区**推送消息。本文先给出**管理端点的权限模型**
 （#member-perms），随后聚焦**推送端点**的请求契约；管理端点实现详见 `api.go`。
 
 ## 管理端点权限模型
@@ -11,6 +11,30 @@
 /v1/groups/:group_no/incoming-webhooks[...]       # 用户登录态（AuthMiddleware）
 /v1/bot/groups/:group_no/incoming-webhooks[...]   # bot token（authBot，robot_id 即操作者）
 ```
+
+### 投递到子区（thread）
+
+webhook 可被创建为绑定到某个子区，推送即投递进子区频道（而非父群）。子区在**创建时**
+绑定、之后不可改，落在行的 `channel_type`/`thread_short_id` 两列上。管理端点多一个子区
+挂载面（同一套 handler，仅多带 `:short_id`）：
+
+```
+/v1/groups/:group_no/threads/:short_id/incoming-webhooks[...]       # 用户登录态
+/v1/bot/groups/:group_no/threads/:short_id/incoming-webhooks[...]   # bot token
+```
+
+- **作用域隔离**：群面只列/只管群自身的 webhook（`thread_short_id=''`）；子区面只列/只管该
+  子区的 webhook。跨作用域访问一律 404（`mgmt_not_found`）。
+- **创建校验**：子区须存在、活跃且归属路径里的 `group_no`（`GetThread` 双条件查询）；否则
+  404 `mgmt_thread_not_found`；`short_id` 格式非法 → 400 `reason=short_id`。
+- **一切仍锚父群**：鉴权/成员/配额（共用父群 `max_per_group`）/群解散级联、`@` 成员闸与
+  `@所有 AI` 展开都仍以父群 `group_no` 为准（子区成员完全派生自父群）。唯一变化是消息投递
+  的目标频道。
+- **推送方零适配**：推送 URL（`/v1/incoming-webhooks/:webhook_id/:token[/<adapter>]`）与请求
+  body 与群 webhook **完全一致**；子区目标只存在于行上、由服务端 `targetChannel()` 解析，
+  **绝不**出现在 URL/query/body 里（body 里带子区标识会被忽略，与 `space_id` 同源丢弃）。
+- **生命周期（v1）**：群解散会级联禁用其下子区 webhook；子区单独删除/归档**不**主动级联
+  （TODO：子区删除事件监听器），推送到已删除子区由下游 502 兜底。
 
 | 操作 | 群主/管理员（含管理员 bot） | 普通成员 / 成员 bot（内部、正常状态） |
 |------|------|------|
