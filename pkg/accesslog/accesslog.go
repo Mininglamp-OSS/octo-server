@@ -3,9 +3,10 @@
 //
 // Motivation: the incoming-webhook push route is /v1/incoming-webhooks/
 // {webhook_id}/{token} — a Discord-style URL with a PLAINTEXT bearer token in
-// the path (#246). gin's default access logger writes the full request path,
-// which would persist live tokens into access logs. Formatter mirrors gin's
-// default line format exactly but masks the token segment.
+// the path (#246). It is also reachable via the shorter /v1/webhooks/ alias
+// (#455). gin's default access logger writes the full request path, which would
+// persist live tokens into access logs. Formatter mirrors gin's default line
+// format exactly but masks the token segment for BOTH prefixes.
 package accesslog
 
 import (
@@ -21,18 +22,26 @@ import (
 const (
 	// maskedToken replaces a plaintext token segment in logged paths.
 	maskedToken = "***"
-	// incomingWebhookPrefix is the push route whose trailing path segment is a
-	// plaintext webhook token.
-	incomingWebhookPrefix = "/v1/incoming-webhooks/"
 )
+
+// webhookPushPrefixes are the push-route prefixes whose trailing path segment is
+// a plaintext webhook token and therefore must be masked. The canonical path is
+// /v1/incoming-webhooks/; /v1/webhooks/ is the shorter alias (#455). Both reach
+// the same token-bearing handlers, so both must be scrubbed — masking only one
+// would leak tokens via the alias (the #246 token-in-path concern).
+var webhookPushPrefixes = []string{
+	"/v1/incoming-webhooks/",
+	"/v1/webhooks/",
+}
 
 // ScrubPath masks secrets embedded in a request path before it is logged.
 //
-// It targets the incoming-webhook push route
-// /v1/incoming-webhooks/{webhook_id}/{token}: the trailing {token} segment (and
-// anything after it, e.g. a stray query string) is replaced with "***". The
-// non-secret {webhook_id} is preserved so logs remain useful for correlation.
-// Any path without the prefix, or with no token segment, is returned unchanged.
+// It targets the incoming-webhook push routes
+// /v1/incoming-webhooks/{webhook_id}/{token} and the /v1/webhooks/... alias: the
+// trailing {token} segment (and anything after it, e.g. a stray query string) is
+// replaced with "***". The non-secret {webhook_id} is preserved so logs remain
+// useful for correlation. Any path without a push prefix, or with no token
+// segment, is returned unchanged.
 //
 // The prefix match is case-INSENSITIVE: gin logs c.Request.URL.Path verbatim
 // for every request including 404s (the access logger runs after c.Next()
@@ -42,18 +51,21 @@ const (
 // path-casing variants. Original casing of the prefix/webhook_id is preserved
 // in the output; only the token segment is replaced.
 func ScrubPath(path string) string {
-	if len(path) < len(incomingWebhookPrefix) ||
-		!strings.EqualFold(path[:len(incomingWebhookPrefix)], incomingWebhookPrefix) {
-		return path
+	for _, prefix := range webhookPushPrefixes {
+		if len(path) < len(prefix) || !strings.EqualFold(path[:len(prefix)], prefix) {
+			continue
+		}
+		rest := path[len(prefix):]
+		// rest == "{webhook_id}/{token}[?query]". The token is everything after
+		// the first '/'. No '/' means only {webhook_id} is present — nothing to
+		// mask.
+		slash := strings.IndexByte(rest, '/')
+		if slash < 0 {
+			return path
+		}
+		return path[:len(prefix)] + rest[:slash] + "/" + maskedToken
 	}
-	rest := path[len(incomingWebhookPrefix):]
-	// rest == "{webhook_id}/{token}[?query]". The token is everything after the
-	// first '/'. No '/' means only {webhook_id} is present — nothing to mask.
-	slash := strings.IndexByte(rest, '/')
-	if slash < 0 {
-		return path
-	}
-	return path[:len(incomingWebhookPrefix)] + rest[:slash] + "/" + maskedToken
+	return path
 }
 
 // tokenInText matches a webhook push path embedded anywhere in free-form log
@@ -62,8 +74,10 @@ func ScrubPath(path string) string {
 // Used to scrub tokens from the gin.Recovery panic dump, which writes the full
 // request line (httputil.DumpRequest) including the token-bearing path.
 // Case-insensitive ((?i)) for the same reason as ScrubPath — a non-canonical
-// path casing must not slip a token past the mask.
-var tokenInText = regexp.MustCompile(`(?i)(/v1/incoming-webhooks/[^/\s?"']+/)[^\s?"']+`)
+// path casing must not slip a token past the mask. Matches BOTH the canonical
+// /v1/incoming-webhooks/ and the /v1/webhooks/ alias (#455) via the optional
+// "incoming-" group; keep this in sync with webhookPushPrefixes.
+var tokenInText = regexp.MustCompile(`(?i)(/v1/(?:incoming-)?webhooks/[^/\s?"']+/)[^\s?"']+`)
 
 // scrubbingErrorWriter wraps an io.Writer and masks incoming-webhook tokens in
 // everything written through it. ScrubPath only covers the access-log line;

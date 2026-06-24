@@ -248,14 +248,26 @@ func (w *IncomingWebhook) Route(r *wkhttp.WKHttp) {
 		chain := func(h wkhttp.HandlerFunc) []wkhttp.HandlerFunc {
 			return []wkhttp.HandlerFunc{w.requirePushEnabled(), w.localFloorMiddleware(), ipLimit, w.ipFailureGateMiddleware(), h}
 		}
-		push.POST("/incoming-webhooks/:webhook_id/:token", chain(w.push)...)
-		// 平台适配器（#297 Phase 3/4、#426）：GitHub / 企业微信 / Multica / GitLab / 飞书。
-		// 鉴权、限流、群校验与 native 完全一致，仅 body 解析不同（adapter_*.go）。
-		push.POST("/incoming-webhooks/:webhook_id/:token/github", chain(w.pushGitHub)...)
-		push.POST("/incoming-webhooks/:webhook_id/:token/wecom", chain(w.pushWeCom)...)
-		push.POST("/incoming-webhooks/:webhook_id/:token/multica", chain(w.pushMultica)...)
-		push.POST("/incoming-webhooks/:webhook_id/:token/gitlab", chain(w.pushGitLab)...)
-		push.POST("/incoming-webhooks/:webhook_id/:token/feishu", chain(w.pushFeishu)...)
+		// 把全部推送形态（native + 5 个平台适配器）一次性挂到给定前缀上。两个前缀共用
+		// 【同一组】中间件链与限流桶，保证 canonical 与 alias 行为字节级一致（#455）：别名
+		// 只是多接受一条路径，不是新攻击面，不单独开鉴权/限流/配额。
+		mountPush := func(prefix string) {
+			base := prefix + "/:webhook_id/:token"
+			push.POST(base, chain(w.push)...)
+			// 平台适配器（#297 Phase 3/4、#426）：GitHub / 企业微信 / Multica / GitLab / 飞书。
+			// 鉴权、限流、群校验与 native 完全一致，仅 body 解析不同（adapter_*.go）。
+			push.POST(base+"/github", chain(w.pushGitHub)...)
+			push.POST(base+"/wecom", chain(w.pushWeCom)...)
+			push.POST(base+"/multica", chain(w.pushMultica)...)
+			push.POST(base+"/gitlab", chain(w.pushGitLab)...)
+			push.POST(base+"/feishu", chain(w.pushFeishu)...)
+		}
+		// canonical 路径（历史契约，不变）+ /v1/webhooks 短别名（#455）。别名为纯附加、
+		// 向后兼容；canonical 仍是 publicURL/publicURLs 对外广告的形态。/v1/webhooks（复数）
+		// 此前未被占用，且 /v1/ 同层全是静态段，新增静态段 webhooks 不与任何通配冲突，
+		// 故无路由注册 panic（详见 #455 冲突分析）。
+		mountPush("/incoming-webhooks")
+		mountPush("/webhooks")
 	}
 }
 

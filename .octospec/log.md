@@ -6,6 +6,12 @@ change-log convention (§7). Newest first.
 
 ## 2026-06-24
 
+- **Add** — Task `incomingwebhook-webhooks-alias` (#455): `/v1/webhooks/{id}/{token}`
+  push-route alias for the canonical `/v1/incoming-webhooks/...` (native + 5
+  adapters), reusing the identical middleware chain. Generalized `pkg/accesslog`
+  token scrubbing (`ScrubPath` + panic-dump regex) to mask BOTH prefixes (#246
+  parity). Brief + context under `.octospec/tasks/incomingwebhook-webhooks-alias/`,
+  journal `.octospec/journal/shared/incomingwebhook-webhooks-alias.md`.
 - **Add** — Task `incoming-webhook-mention-broadcast` (#448 item ②): broadcast-pill
   auto-compose on the native incoming-webhook push endpoint. When a permitted
   `mention.all`/`mention.bots` is set, the server prepends the canonical broadcast

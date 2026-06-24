@@ -1,0 +1,24 @@
+slug: incomingwebhook-webhooks-alias
+upstream: Mininglamp-OSS/octo-server#455
+rules_applied:
+  - id: trust-boundary
+    tier: repo
+    load_bearing: true
+    why: >
+      Push ingress is the unauthenticated token-in-URL attack surface. Alias must
+      inherit the identical middleware chain (parity), and the access-log token
+      scrubbing (#246) must cover the new prefix too — a defense for one path must
+      hold for its sibling.
+  - id: testing
+    tier: repo
+    load_bearing: false
+    why: Alias push e2e tests + accesslog table cases for both prefixes.
+  - id: commit-style
+    tier: repo
+    load_bearing: false
+    why: Conventional Commits, English.
+files_touched:
+  - modules/incomingwebhook/api.go        # mount push routes for both prefixes
+  - pkg/accesslog/accesslog.go            # generalize ScrubPath + tokenInText to both prefixes
+  - modules/incomingwebhook/api_test.go   # alias push e2e (native + adapter)
+  - pkg/accesslog/accesslog_test.go       # alias scrub table cases
