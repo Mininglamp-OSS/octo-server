@@ -118,8 +118,12 @@ server emits (existing wire fields only — zero client change):
   `maxContentRunes`.
 - **forged-broadcast guard** (adversarial-review hardening): a member whose display
   name is a broadcast label (`所有人`/`所有AI`/`All People`/`All AIs`/`all`,
-  case-insensitive) or contains `@` is **skipped** for render — else `@<name>`
+  case-insensitive), **or starts with one at a non-word boundary** (e.g. `所有人 X`
+  / `所有人:` / `all-hands` — iOS `@\S+` would emit a standalone `@所有人`/`@all`
+  broadcast token), or contains `@`, is **skipped** for render — else `@<name>`
   would render as a broadcast pill and bypass the `allow_mention_*` capability gate
   (or break client `@`-tokenization); the uid still routes via `mention.uids`.
+  Names that merely continue a label into a longer word (`所有人事部`, `allen`) still
+  render (boundary check, not prefix match).
 - `go test ./modules/incomingwebhook/...` passes incl. new render tests +
   `TestIncomingWebhookNoLegacyResponseError`; `golangci-lint` clean.

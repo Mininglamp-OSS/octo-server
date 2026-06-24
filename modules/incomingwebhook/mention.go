@@ -5,6 +5,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf16"
 	"unicode/utf8"
 
@@ -75,10 +76,30 @@ var broadcastLabels = map[string]struct{}{
 	"所有人": {}, "所有ai": {}, "all": {}, "all people": {}, "all ais": {},
 }
 
-// isBroadcastLabel 报告 name（trim+小写后）是否命中端上广播标签集。
-func isBroadcastLabel(name string) bool {
-	_, ok := broadcastLabels[strings.ToLower(strings.TrimSpace(name))]
-	return ok
+// isBroadcastLikeName 报告 name（trim+小写后）会不会被端上当成广播 token——不止【精确】命中标签集,
+// 还包括「以广播标签开头、其后紧跟非字边界」。因为 iOS 按 @\S+ 切词:名 "所有人 X" 会切出独立
+// token "@所有人"、名 "所有人:" 同理,都会渲染成广播气泡(伪造一次绕过 allow_mention_* 的全员广播)。
+// 仅当标签后紧跟字母/数字/CJK 时(如 "所有人事部"/"allen")才是另一个真实词、不算广播,照常渲染定向气泡。
+// 单字标签(所有人/所有ai/all)即覆盖多字标签(all people/all ais)的边界,因 iOS 首个 @\S+ token 止于空格。
+func isBroadcastLikeName(name string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	if n == "" {
+		return false
+	}
+	for label := range broadcastLabels {
+		if !strings.HasPrefix(n, label) {
+			continue
+		}
+		rest := n[len(label):]
+		if rest == "" {
+			return true // 精确命中
+		}
+		// 标签后紧跟非字（字母/数字/CJK 之外）→ 端上会把 "@<label>" 切成独立广播 token。
+		if r, _ := utf8.DecodeRuneInString(rest); !unicode.IsLetter(r) && !unicode.IsDigit(r) {
+			return true
+		}
+	}
+	return false
 }
 
 // utf16Len 返回 s 的 UTF-16 码元长度（= JS String.length / NSString length / Kotlin
@@ -104,9 +125,10 @@ func utf16Len(s string) int {
 // 不变量与边界：
 //   - prefixU16 供调用方把【调用方自带】的 entities(#449) 整体右移（前置改变了 content）；render
 //     与自带 entities 互斥，故二者不会同时出现。
-//   - 防伪造广播：昵称命中端上广播标签集（isBroadcastLabel）或含 '@'（WeChat 昵称路径不过滤 @）时
-//     【跳过】render——否则 "@<昵称>" 会被端上当成 @所有人/@所有AI 广播 token 渲染，伪造一次绕过
-//     allow_mention_* 能力位的全员广播气泡。命中者仍按 uid 路由、只是不出气泡。
+//   - 防伪造广播：昵称会被端上当成广播 token（isBroadcastLikeName：精确命中标签集，或以标签开头且
+//     后接非字边界如 "所有人 X"/"所有人:"——iOS @\S+ 会切出独立 "@所有人"）或含 '@'（WeChat 昵称
+//     路径不过滤 @）时【跳过】render——否则 "@<昵称>" 会被渲染成 @所有人/@所有AI 气泡，伪造一次绕过
+//     allow_mention_* 能力位的全员广播。命中者仍按 uid 路由、只是不出气泡。
 //   - 幂等：广播按 canonical 字面量、定向按 "@<昵称>" 在【原始 content】里 Contains 去重（避免双
 //     气泡）。子串误判（名是另一段文本的前缀，如名 "张" 撞 "@张三"）会保守跳过该气泡、uid 仍路由——可接受。
 //   - 空昵称（非成员/未 join 到 user.name）跳过——绝不补 "@ "。
@@ -142,7 +164,7 @@ func composeMentionContent(content string, wantAll, wantBots, allowAll, allowBot
 			if name == "" {
 				continue // 非成员 / 未解析到昵称 → 不渲染（绝不补 "@ "）
 			}
-			if isBroadcastLabel(name) || strings.Contains(name, "@") {
+			if isBroadcastLikeName(name) || strings.Contains(name, "@") {
 				continue // 防伪造广播 / 嵌入式 @：昵称会被端上当成广播 token 或破坏 @ 分词
 			}
 			atName := "@" + name

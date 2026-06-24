@@ -86,14 +86,20 @@ func TestComposeMentionContentDirected(t *testing.T) {
 		assert.Equal(t, "@AAAA body", c)
 	})
 
-	t.Run("name == broadcast label or containing '@' is skipped (no forged broadcast pill)", func(t *testing.T) {
-		// 所有人 / All AIs collide with broadcast tokens; "@x" would break @-tokenization. Only 我的天 is safe.
-		nm := map[string]string{"a": "所有人", "b": "All AIs", "c": "@x", "d": "我的天"}
+	t.Run("broadcast-like names skipped (exact + boundary + embedded '@'); real names still render", func(t *testing.T) {
+		// Skipped: exact label (所有人 / All AIs), label + non-word boundary (所有人 X / 所有人: / all-hands —
+		// iOS @\S+ would emit a standalone @所有人 / @all broadcast token), and any name containing '@'.
+		// Rendered: a label that continues into a longer word (所有人事部 = HR dept; allen) is a real name.
+		nm := map[string]string{
+			"a": "所有人", "b": "所有人 X", "c": "所有人:", "d": "All AIs", "e": "@x", "f": "all-hands",
+			"g": "所有人事部", "h": "allen",
+		}
 		c, _, ents := composeMentionContent("body", false, false, false, false, true,
-			[]string{"a", "b", "c", "d"}, nm, 0)
-		assert.Equal(t, "@我的天 body", c, "broadcast-label and @-containing names skipped; only the safe name renders")
-		require.Len(t, ents, 1)
-		assert.Equal(t, "d", ents[0].(map[string]interface{})[entityKeyUID])
+			[]string{"a", "b", "c", "d", "e", "f", "g", "h"}, nm, 0)
+		assert.Equal(t, "@所有人事部 @allen body", c, "only non-broadcast-like names render, in caller order")
+		require.Len(t, ents, 2)
+		assert.Equal(t, "g", ents[0].(map[string]interface{})[entityKeyUID])
+		assert.Equal(t, "h", ents[1].(map[string]interface{})[entityKeyUID])
 	})
 }
 
