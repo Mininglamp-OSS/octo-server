@@ -1328,8 +1328,16 @@ func (w *IncomingWebhook) handlePush(c *wkhttp.Context, ad pushAdapter) {
 		// 关掉设置即把全部【成员】创建的 webhook 的广播位立即剥离；管理员建的不受影响。
 		// 定向 @uid 不走此闸（不是广播、风险低）。
 		broadcastPermitted := w.settings.IncomingWebhookMemberCanBroadcast() || creatorIsAdmin
-		mention, ignored := w.buildMention(m, req, broadcastPermitted)
+		mention, content, ignored := w.buildMention(m, req, broadcastPermitted)
 		mentionIgnored = ignored
+		// 广播补文案可能在 content 文首前置了 @所有人/@所有AI（仅 text 路径）。仅当 content 确被
+		// 改写（!= req.Content）才回写 payload[content]，使前置后的正文进入 wire。
+		// 这个守卫【必须保留】：richtext 路径 payload[content] 存的是 blocks 数组（buildRichTextPayload），
+		// 而 buildMention 对 richtext 不补文案（content==req.Content）→ 守卫为假、不覆盖，数组得以保全；
+		// 去掉守卫会把数组覆盖成字符串、毁掉富文本消息。无补文案时同样不触发覆盖，payload 字节不变。
+		if content != req.Content {
+			payload[payloadContentKey] = content
+		}
 		if mention != nil {
 			payload[mentionrewrite.MentionKey] = mention
 			// 与 message/robot/bot_api 入口一致：在 clone 上做 ais→bot uid 展开，避免就地
@@ -1398,6 +1406,12 @@ func truncateUTF8(s string, max int) string {
 	return ""
 }
 
+// payloadContentKey 是群消息 payload 的正文键。抽成常量是因为有【两个】写点必须一致：
+// buildPayload（text 路径初次写入）与 handlePush 的广播补文案回写——后者写到一个错键会让
+// 前置的 @所有人/@所有AI 静默不进 wire（气泡永不出现），编译器不会报错。用同一常量把这层
+// 耦合交给编译器，免去手写「与 buildPayload 一致」的口头不变量。
+const payloadContentKey = "content"
+
 // buildPayload 把 webhook 请求映射到群消息 payload。
 //   - WuKongIM 只有 Text 类型，所有 webhook 消息都用 Text(1) 投递。
 //   - 注入 from.kind=webhook 元信息，便于客户端识别非真实用户消息；
@@ -1414,8 +1428,8 @@ func truncateUTF8(s string, max int) string {
 func buildPayload(m *incomingWebhookModel, req *pushPayloadReq, allowOverride bool) map[string]interface{} {
 	name, avatar := resolveFromIdentity(m, req, allowOverride)
 	return map[string]interface{}{
-		"type":    int(common.Text),
-		"content": req.Content,
+		"type":            int(common.Text),
+		payloadContentKey: req.Content,
 		"from": map[string]interface{}{
 			"kind":       extraKindValue,
 			"webhook_id": m.WebhookID,

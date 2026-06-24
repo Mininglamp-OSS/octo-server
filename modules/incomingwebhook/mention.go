@@ -44,8 +44,69 @@ func maxMentionUIDs() int {
 	return defaultMaxMentionUIDs
 }
 
+// 三态广播的【中文 canonical】@ 字面量 + 末尾定界空格。
+//
+// 为什么是这两个字面量、为什么必须带空格：
+//   - web/iOS/Android 三端渲染广播气泡都要求 content 文本里【存在】该字面量——没有任何一端
+//     仅凭 mention.humans/ais 标志位凭空合成气泡（web 的 buildMessageMentions 合成的是「若文本
+//     里出现 @所有人 就高亮」的元数据，segmentText 仍按文本匹配；iOS/Android 直接扫 content）。
+//     故服务端在标志位获批时把字面量【前置】到 content，三端即可渲染气泡。
+//   - 端上识别的广播 token 集是 locale-independent 的（中文 @所有人/@所有AI + 英文别名
+//     @All People/@All AIs/@all）；选择器插入、服务端发出的都是【中文 canonical】，所有端都
+//     识别，无需按 locale 切换。
+//   - 末尾空格是【必须】的定界符：Android 高亮命中后会检查下一字符不是字母/数字/_（CJK 视作
+//     字母，"@所有人执行" 会被跳过不高亮）；iOS @\S+/\b、web 正则同样需要定界。
+//   - 这两个 label 与 mentionrewrite.HumansKey/AIsKey 一一对应：标志位驱动路由/红点/bot 展开，
+//     label 驱动可见气泡。label 刻意留在本模块（而非 mentionrewrite）——它是「广播补文案」这个
+//     render 行为的实现细节、目前仅本模块 compose，且三端各自也硬编码同一套 token；mentionrewrite
+//     只拥有 wire key 词汇表（humans/ais/...），不拥有渲染 label。
+const (
+	broadcastTokenAll = "@所有人"  // 真人广播（mention.humans）
+	broadcastTokenAIs = "@所有AI" // AI 广播（mention.ais）
+	broadcastTokenSep = " "     // 定界空格（见上）
+)
+
+// composeBroadcastContent 在【获批】的广播位生效时，把对应的 canonical 广播字面量前置到
+// content，使三端渲染出广播气泡。返回（可能改写后的 content，本次前置前缀的 UTF-16 码元长度）。
+//
+// prefixU16Len 供调用方把定向 entities(#449) 的 offset 整体右移——前置改变了 content 文本，
+// 而 entities 的 offset 是相对 content 的 UTF-16 码元绝对位置，必须同步右移才不会错绑气泡。
+//
+//   - 仅当 want* 且 allow*（= AllowMention*==1 && broadcastPermitted）同时成立才前置；未获批的
+//     广播位不前置（它已进 mention_ignored，没有真正广播、不应出现气泡）。
+//   - 幂等：content 已含该 canonical 字面量则不再前置该 token（否则三端会渲染两个气泡）。用
+//     strings.Contains（任意位置）而非仅前缀：调用方可能把 @所有人 写在句中，仍应避免重复气泡。
+//     （极端误判：文本恰含 "@所有人" 子串如成员名 "@所有人事部" 时会保守地不前置——此时端上同样
+//     不会把该子串当广播 token 高亮，结果一致：无自动气泡、标志位仍照常路由。）
+//   - humans 在前、ais 在后（稳定顺序）。
+//   - 仅文本路径调用（richtext 无顶层 content，调用方据 isTextMention 决定是否调用）。
+//
+// 前缀是服务端定值（≤11 UTF-16 码元）：刻意在 handlePush 的 maxContentRunes 上限校验【之后】追加，
+// 相对默认 4000 上限可忽略、且 8KB body / 序列化上限仍兜底——故不为这点定长前缀重算上限。
+//
+// 不前置任何 token 时返回 (content, 0)——原样字符串、零位移，保证无广播位的历史调用 payload
+// 完全不变（向后兼容）。
+func composeBroadcastContent(content string, wantAll, wantBots, allowAll, allowBots bool) (string, int) {
+	var prefix strings.Builder
+	if wantAll && allowAll && !strings.Contains(content, broadcastTokenAll) {
+		prefix.WriteString(broadcastTokenAll)
+		prefix.WriteString(broadcastTokenSep)
+	}
+	if wantBots && allowBots && !strings.Contains(content, broadcastTokenAIs) {
+		prefix.WriteString(broadcastTokenAIs)
+		prefix.WriteString(broadcastTokenSep)
+	}
+	p := prefix.String()
+	if p == "" {
+		return content, 0
+	}
+	return p + content, len(utf16.Encode([]rune(p)))
+}
+
 // buildMention 把 native 推送请求里的 mentionReq 翻译成消息 payload 的 mention 子对象
-// （线协议 {uids,humans,ais}），返回值可直接挂到 payload[mentionrewrite.MentionKey]。
+// （线协议 {uids,humans,ais,entities}）。返回 (mention, content, ignored)：mention 可直接挂到
+// payload[mentionrewrite.MentionKey]；content 是【可能前置了广播补文案的】正文，调用方据此
+// 覆盖 payload 的 content（无补文案时与 req.Content 全等，payload 字节不变）。
 //
 // 处理（每步都对应 brief 的 acceptance）：
 //  1. 定向 uids：去重 + 钳到上限 → 经群成员闸过滤（只保留本群当前成员），命中集做成
@@ -53,6 +114,8 @@ func maxMentionUIDs() int {
 //  2. @所有人(All)：webhook 的 allow_mention_all 开【且 broadcastPermitted】则写 humans=1，否则记入 ignored。
 //  3. @所有 AI(Bots)：allow_mention_bots 开【且 broadcastPermitted】则写 ais=1（稍后由调用方
 //     ExpandAisToBotUIDs 展开为群内全部 bot 成员 UID），否则记入 ignored。
+//  4. 广播补文案（仅 text 路径）：获批的 all/bots 还会把 canonical 字面量(@所有人/@所有AI)
+//     前置到 content，使三端渲染出可见广播气泡（见 composeBroadcastContent）；未获批不前置。
 //
 // broadcastPermitted 由调用方传入：system_setting member_can_broadcast || 创建者当前为管理员。
 // 关掉该设置即可即时收回所有【成员】创建的 webhook 的广播能力，管理员创建的不受影响。
@@ -66,7 +129,7 @@ func maxMentionUIDs() int {
 //
 // best-effort：成员闸查询失败时降级为「不带定向 @」（仅记 Warn），绝不因此让整条推送失败
 // ——这与 mention 其余环节的「失败即降级、不丢消息」一致。
-func (w *IncomingWebhook) buildMention(m *incomingWebhookModel, req *pushPayloadReq, broadcastPermitted bool) (map[string]interface{}, []string) {
+func (w *IncomingWebhook) buildMention(m *incomingWebhookModel, req *pushPayloadReq, broadcastPermitted bool) (map[string]interface{}, string, []string) {
 	mr, ok := decodeMention(req.Mention)
 	if !ok {
 		// 缺省即无 mention；【存在但畸形】按 acceptance #6 降级为无 mention（消息照投），
@@ -75,8 +138,13 @@ func (w *IncomingWebhook) buildMention(m *incomingWebhookModel, req *pushPayload
 			w.Warn("malformed mention payload ignored; delivering message without mention",
 				zap.String("webhook_id", m.WebhookID))
 		}
-		return nil, nil
+		return nil, req.Content, nil
 	}
+	// 广播位有效性 = webhook 能力位 AND 策略放行（broadcastPermitted = system_setting
+	// member_can_broadcast || 创建者当前为管理员，由 handlePush 计算）。compose（补文案）与
+	// assemble（置 humans/ais 标志位）共用这对布尔，保证二者严格同条件触发。
+	allowAll := m.AllowMentionAll == 1 && broadcastPermitted
+	allowBots := m.AllowMentionBots == 1 && broadcastPermitted
 	// IO 步骤：去重+钳上限后，把定向 uids 过一遍群成员闸。失败即降级为空成员集（→丢弃
 	// 全部定向 @），仅记 Warn、不让整条推送失败。纯决策（能力位放行 / 装配线协议）下沉到
 	// assembleMention，无 DB 依赖，便于单测穷举各分支。
@@ -105,26 +173,31 @@ func (w *IncomingWebhook) buildMention(m *incomingWebhookModel, req *pushPayload
 			members = got
 		}
 	}
-	// 广播位有效性 = webhook 能力位 AND 策略放行（broadcastPermitted = system_setting
-	// member_can_broadcast || 创建者当前为管理员，由 handlePush 计算）。关掉设置即可即时
-	// 收回成员 webhook 的广播（管理员建的因 creatorIsAdmin 仍放行），无需迁移存量列。
-	mention, ignored := assembleMention(uids, members,
-		mr.All, mr.Bots,
-		m.AllowMentionAll == 1 && broadcastPermitted,
-		m.AllowMentionBots == 1 && broadcastPermitted)
+	// 广播补文案【仅 text 路径】：获批的 all/bots 把 canonical 字面量前置到 content，使三端
+	// 渲染广播气泡（richtext 无顶层 content → isTextMention=false → 不补、content 原样）。
+	// prefixU16 用于把下面定向 entities 的 offset 整体右移（前置改变了 content）。
+	content := req.Content
+	prefixU16 := 0
+	if isTextMention(req) {
+		content, prefixU16 = composeBroadcastContent(req.Content, mr.All, mr.Bots, allowAll, allowBots)
+	}
+
+	mention, ignored := assembleMention(uids, members, mr.All, mr.Bots, allowAll, allowBots)
 
 	// 校验通过的 entities 原样挂到 mention.entities（与 uids 正交，ExpandAisToBotUIDs 只动
-	// uids、不碰 entities）。ents 仅在 text 路径非空，故此处无需再判 msg_type；content 在
-	// text 路径原样透传（PR-1 不改写 content），offset 与落地一致。
+	// uids、不碰 entities）。ents 仅在 text 路径非空，故此处无需再判 msg_type。校验【相对原始
+	// req.Content】（offset/'@' 锚点都按未前置文本），再把存活区间整体右移 prefixU16——前置只在
+	// 文首插入，故 offset+prefixU16 仍精确指向同一 '@'（广播补文案与定向气泡共存时不错绑）。
 	if len(ents) > 0 {
 		if validEnts := finalizeEntities(ents, members, req.Content); len(validEnts) > 0 {
+			shiftEntityOffsets(validEnts, prefixU16)
 			if mention == nil {
 				mention = map[string]interface{}{}
 			}
 			mention[mentionrewrite.EntitiesKey] = validEnts
 		}
 	}
-	return mention, ignored
+	return mention, content, ignored
 }
 
 // mentionEntity 是调用方传入的单条【渲染层】@ 区间（线协议 mention.entities 的元素）：
@@ -249,6 +322,25 @@ func rangeClaimed(claimed []bool, offset, length int) bool {
 func markClaimed(claimed []bool, offset, length int) {
 	for i := offset; i < offset+length; i++ {
 		claimed[i] = true
+	}
+}
+
+// shiftEntityOffsets 把 finalizeEntities 产出的线协议 entities 的 offset 整体右移 by 个
+// UTF-16 码元（就地）。广播补文案在文首前置了前缀、改变了 content 时，定向 entities 的 offset
+// 必须右移同样长度，否则 web/Android 会按旧 offset 把气泡错绑到前缀文本上。by<=0 为空操作；
+// 只移 offset、不动 length（区间长度不变），uid 不变。
+func shiftEntityOffsets(ents []interface{}, by int) {
+	if by <= 0 || len(ents) == 0 {
+		return
+	}
+	for _, e := range ents {
+		m, ok := e.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if off, ok := m[entityKeyOffset].(int); ok {
+			m[entityKeyOffset] = off + by
+		}
 	}
 }
 

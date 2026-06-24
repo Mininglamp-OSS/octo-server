@@ -1,0 +1,44 @@
+slug: incoming-webhook-mention-broadcast
+rules_injected:
+  - id: trust-boundary
+    tier: repo
+    load_bearing: true
+    why: incomingwebhook push is attacker-controlled ingress; the prepended broadcast
+         literal is a server-controlled compile-time CONSTANT (@所有人/@所有AI) with no
+         markdown/regex metacharacters — the caller only flips a boolean flag, so no new
+         escape/injection surface; compose is gated to the native adapter (parity preserved:
+         siblings neither set the flags nor compose) and bounded (~11 UTF-16 units max).
+  - id: error-handling
+    tier: repo
+    load_bearing: true
+    why: no new error codes; compose is non-fatal render-layer text and never produces an
+         error response; an un-permitted flag keeps its existing non-fatal mention_ignored
+         200-body feedback. No legacy/raw responses added (NoLegacyResponseError guard holds).
+  - id: space-isolation
+    tier: repo
+    load_bearing: true
+    why: compose adds no new identity/data access — it touches only content text and the
+         already-gated humans/ais flags; the member gate / Space scoping from #445/#449 is
+         unchanged.
+  - id: testing
+    tier: repo
+    load_bearing: false
+    why: new mention_broadcast_test.go (pure compose unit tests) + entity offset-shift parity
+         in mention_entities_test.go + e2e cases in mention_e2e_test.go; extend
+         TestIncomingWebhookNoLegacyResponseError file list if a new handler file is added
+         (none expected — compose lives in mention.go).
+  - id: commit-style
+    tier: repo
+    load_bearing: false
+    why: Conventional Commits, English.
+files_touched:
+  - modules/incomingwebhook/mention.go          # composeBroadcastContent + constants; buildMention returns composed content; finalizeEntities baseOffset shift
+  - modules/incomingwebhook/api.go              # handlePush: consume composed content into payload[content] (text path)
+  - modules/incomingwebhook/mention_broadcast_test.go  # NEW: compose unit tests (gate/idempotency/order/trailing-space/text-only)
+  - modules/incomingwebhook/mention_entities_test.go   # entity offset-shift (baseOffset) parity + emoji/CJK prefix
+  - modules/incomingwebhook/mention_e2e_test.go        # e2e: pill prepended; not-permitted no-prepend; richtext no-prepend; backward-compat byte-identical
+parity_decisions:
+  - "Canonical broadcast literals @所有人 (humans) / @所有AI (ais) confirmed against octo-ios WKMentionService.m, octo-android WKUIChatMsgItemEntity.java + strings.xml, octo-web mentionRender.ts/MarkdownContent.tsx — all three require the literal in content text to render a pill (none fabricate from the flag)."
+  - "Trailing ASCII space after the literal is mandatory: Android skips a highlight whose next char is letter/digit/_ (CJK is a letter); iOS @\\S+/\\b and web regex need the delimiter."
+  - "Directed-entity (#449) offsets are UTF-16 code units and bound authoritatively on web/Android; a prepend shifts them by the prefix's UTF-16 length (finalizeEntities baseOffset). iOS binds positionally and skips broadcast tokens for the uids index → unaffected."
+  - "Compose is text-path only (mirrors entities); richtext keeps flags-only behavior. Routing (red-dot/notify/ExpandAisToBotUIDs) unchanged — pure render layer."

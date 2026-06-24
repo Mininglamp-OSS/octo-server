@@ -4,6 +4,17 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-06-24
+
+- **Add** — Task `incoming-webhook-mention-broadcast` (#448 item ②): broadcast-pill
+  auto-compose on the native incoming-webhook push endpoint. When a permitted
+  `mention.all`/`mention.bots` is set, the server prepends the canonical broadcast
+  literal (`@所有人`/`@所有AI`) + a space to the text content so all three clients
+  render a pill; directed-entity (#449) offsets shift by the prefix's UTF-16
+  length. Text-path only; routing / red-dot / bot-summon unchanged. Brief +
+  context + journal under `.octospec/tasks/incoming-webhook-mention-broadcast/`
+  and `.octospec/journal/shared/incoming-webhook-mention-broadcast.md`.
+
 ## 2026-06-23
 
 - **Add** — Task `upstream-dep-metrics` (#440 P0-a): upstream-dependency
