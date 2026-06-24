@@ -9,8 +9,9 @@ import (
 
 // Redis-independent, process-local rate ceiling for the public push endpoint.
 //
-// `POST /v1/incoming-webhooks/:webhook_id/:token` is the only unauthenticated,
-// publicly reachable route in this module. Its per-IP and per-webhook limiters
+// `POST /v1/incoming-webhooks/:webhook_id/:token` (and its shorter alias
+// `/v1/webhooks/:webhook_id/:token`, #455) are the only unauthenticated,
+// publicly reachable routes in this module. Their per-IP and per-webhook limiters
 // are both Redis-backed and fail-open: when Redis is unavailable (or its
 // connection pool is saturated) they silently stop limiting, leaving the
 // endpoint — which still performs 2 DB reads + 1 WuKongIM send per call — open

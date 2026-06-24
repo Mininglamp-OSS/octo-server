@@ -20,5 +20,5 @@ rules_applied:
 files_touched:
   - modules/incomingwebhook/api.go        # mount push routes for both prefixes
   - pkg/accesslog/accesslog.go            # generalize ScrubPath + tokenInText to both prefixes
-  - modules/incomingwebhook/api_test.go   # alias push e2e (native + adapter)
+  - modules/incomingwebhook/alias_push_test.go  # alias push e2e (native + adapter)
   - pkg/accesslog/accesslog_test.go       # alias scrub table cases
