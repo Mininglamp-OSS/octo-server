@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -57,10 +58,11 @@ func serveGetBotDetail(t *testing.T, id string) *httptest.ResponseRecorder {
 	return w
 }
 
-// TestGetBotDetail_IncludesConnect is the endpoint-level proof that the four App
-// Bot read/create endpoints (getBotDetail covers both GETs) now return a connect
-// object, that it carries no secret, and — via the env override — that the
-// package name is server-configured, the core of issue #446.
+// TestGetBotDetail_IncludesConnect is the read-path proof: getBotDetail backs
+// both GET /v1/admin/app_bot/:id and GET /v1/space/:space_id/app_bot/:id, and
+// must return a connect object that carries no secret — and, via the env
+// override, that the package name is server-configured (the core of #446). The
+// create path (POST) is pinned separately by TestCreatePlatformBot_IncludesConnect_E2E.
 func TestGetBotDetail_IncludesConnect(t *testing.T) {
 	w := serveGetBotDetail(t, "bot-1")
 	require.Equal(t, http.StatusOK, w.Code, "admin reaches the bot detail")
@@ -92,4 +94,46 @@ func TestGetBotDetail_ConnectHonorsPackageOverride(t *testing.T) {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	assert.Equal(t, "create-openclaw-canary", resp.Connect["plugin_package"],
 		"a configured package name reaches the client without a frontend change")
+}
+
+// TestCreatePlatformBot_IncludesConnect_E2E pins the create-side wire contract
+// (POST /v1/admin/app_bot) against the full server + real MySQL/IM
+// (NewTestServer): a successful create returns the same connect object, data
+// only, with the freshly-minted token never leaking into connect. Complements
+// the read-path coverage in TestGetBotDetail_IncludesConnect.
+func TestCreatePlatformBot_IncludesConnect_E2E(t *testing.T) {
+	t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
+
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+
+	// Log in as a system admin (the test server wires no RoleResolver, so the
+	// token's baked role is authoritative).
+	require.NoError(t, ctx.Cache().Set(
+		ctx.GetConfig().Cache.TokenCachePrefix+testutil.Token,
+		testutil.UID+"@test@"+string(wkhttp.Admin)))
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/v1/admin/app_bot",
+		strings.NewReader(`{"id":"connect-create-e2e","display_name":"Connect Create"}`))
+	req.Header.Set("token", testutil.Token)
+	req.Header.Set("Content-Type", "application/json")
+	s.GetRoute().ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, "admin create should succeed: %s", w.Body.String())
+
+	var resp struct {
+		Token   string         `json:"token"`
+		Connect map[string]any `json:"connect"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.NotNil(t, resp.Connect, "create response carries a connect object")
+	assert.Equal(t, "create-openclaw-octo", resp.Connect["plugin_package"])
+	assert.NotEmpty(t, resp.Connect["api_url"], "api_url resolves to the public Bot API entry")
+	// Data only: exactly the two public keys, and the freshly-minted token
+	// (returned at top level on create) must never appear inside connect.
+	assert.Len(t, resp.Connect, 2)
+	assert.NotContains(t, resp.Connect, "token")
+	assert.NotEqual(t, resp.Token, resp.Connect["api_url"])
+	assert.NotEqual(t, resp.Token, resp.Connect["plugin_package"])
 }
