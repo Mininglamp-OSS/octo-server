@@ -91,6 +91,7 @@ func TestIncomingWebhookRespondHelpers(t *testing.T) {
 		{"mgmtForbidden", mgmtForbidden, http.StatusForbidden, "err.server.incomingwebhook.mgmt_forbidden", false},
 		{"mgmtFeatureDisabled", mgmtFeatureDisabled, http.StatusForbidden, "err.server.incomingwebhook.mgmt_disabled", false},
 		{"mgmtNotFound", mgmtNotFound, http.StatusNotFound, "err.server.incomingwebhook.mgmt_not_found", false},
+		{"mgmtThreadNotFound", mgmtThreadNotFound, http.StatusNotFound, "err.server.incomingwebhook.mgmt_thread_not_found", false},
 		{"mgmtQuotaExceeded", func(c *wkhttp.Context) { mgmtQuotaExceeded(c, 10) }, http.StatusConflict, "err.server.incomingwebhook.mgmt_quota_exceeded", false},
 	}
 	for _, tc := range cases {

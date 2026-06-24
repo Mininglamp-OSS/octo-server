@@ -680,13 +680,27 @@ func (w *IncomingWebhook) create(c *wkhttp.Context) {
 			mgmtRequestInvalid(c, "short_id")
 			return
 		}
-		// GetThread 按 group_no+short_id 双条件查询：跨群/不存在/已删除返回 error，已归档
-		// 则 Status!=Active——任一非活跃都拒绝绑定。GetThread 不区分「不存在/已删」与 DB
-		// 故障（无类型化哨兵），create 是冷路径，统一按「子区不可用」404 并记日志。
+		// 先用 ExistThread 把【DB/服务故障】与【确实不存在/跨群】分开：前者返回 500
+		// （mgmtQueryFailed），让调用方据实重试、运维能据 5xx 告警，而非被一个误导性的 404
+		// 掩盖（#454 review）。ExistThread 按 group_no+short_id 双条件查询，跨群天然为
+		// false → 404。
+		exists, terr := w.threadService.ExistThread(groupNo, shortID)
+		if terr != nil {
+			w.Error("thread existence check failed",
+				zap.String("group_no", groupNo), zap.String("short_id", shortID), zap.Error(terr))
+			mgmtQueryFailed(c)
+			return
+		}
+		if !exists {
+			mgmtThreadNotFound(c)
+			return
+		}
+		// 子区存在；再取详情确认【活跃】（已归档/已删除不可绑定）。残余 error 窗口极小
+		// （两次查询之间被删，或二次 DB 抖动），按「子区不可用」404 收口即可。
 		tr, terr := w.threadService.GetThread(groupNo, shortID, "")
 		if terr != nil || tr == nil || tr.Status != thread.ThreadStatusActive {
 			if terr != nil {
-				w.Warn("thread lookup for webhook bind failed",
+				w.Warn("thread lookup after existence check failed",
 					zap.String("group_no", groupNo), zap.String("short_id", shortID), zap.Error(terr))
 			}
 			mgmtThreadNotFound(c)
