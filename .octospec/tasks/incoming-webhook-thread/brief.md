@@ -36,6 +36,19 @@ thing that changes is the SendMessage channel**: every authorization, membership
 quota, and lifecycle gate stays **anchored on the parent `group_no`**, because a
 thread's membership and permissions are fully derived from its parent group.
 
+**Push-caller zero-adaptation invariant.** The thread target is encoded ONLY on
+the persisted row and bound at create time; it is NOT in the push URL, query, or
+body. A thread webhook is pushed with the **exact same** URL shape
+(`/v1/incoming-webhooks/:webhook_id/:token[/<adapter>]`) and the **exact same**
+body as a group webhook — `handlePush` resolves `(channelID, channelType)` from
+the row keyed by `webhook_id`. External callers (CI/platform/scripts) migrate by
+swapping one `webhook_id`/`token`; nothing else. The IM client also needs no
+adaptation: the message is a normal Text message delivered into the thread
+channel (channelType=5), rendered by the existing thread message path, with the
+`iwh_` sender identity resolved by the existing `ChannelGet` display datasource.
+The ONLY new URL is the **management create** endpoint (nested route), used once
+by the admin UI to provision the webhook — never by the push caller or renderer.
+
 ## Background
 
 - **Why group-only today.** The `incoming_webhook` table
@@ -149,6 +162,11 @@ thread's membership and permissions are fully derived from its parent group.
   `(group_no____short_id, ChannelTypeCommunityTopic)`; a group-bound webhook push
   still delivers to `(group_no, ChannelTypeGroup)` (asserted on the captured
   `MsgSendReq`).
+- **Push caller requires zero changes**: a thread webhook is pushed with the same
+  URL (`/v1/incoming-webhooks/:webhook_id/:token`, incl. adapter suffixes) and the
+  same body as a group webhook; the target is resolved server-side from the row.
+  No thread identifier appears in the push URL, query, or body, and supplying one
+  in the body is ignored (anti-forgery, same as `space_id`/`extra`).
 - `testPush` for a thread webhook delivers into the thread channel and records an
   `adapter=test` audit row.
 - Creator-left lazy-disable, group-disband cascade, and group-not-Normal gates
