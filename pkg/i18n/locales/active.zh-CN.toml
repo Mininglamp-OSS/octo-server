@@ -683,6 +683,9 @@ other = "群不存在或已解散。"
 ["err.server.incomingwebhook.mgmt_not_found"]
 other = "webhook 不存在。"
 
+["err.server.incomingwebhook.mgmt_thread_not_found"]
+other = "子区不存在或不可用。"
+
 ["err.server.incomingwebhook.mgmt_quota_exceeded"]
 other = "每个群最多 {{.max}} 个 webhook。"
 

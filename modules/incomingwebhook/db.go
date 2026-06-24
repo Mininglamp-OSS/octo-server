@@ -112,11 +112,29 @@ func (d *incomingWebhookDB) queryByWebhookID(webhookID string) (*incomingWebhook
 	return m, err
 }
 
-// queryByGroupNo 列出群下 webhook 供管理端展示，隐藏软删除（statusDeleted）项（#254）。
+// queryByGroupNo 列出群【自身】(thread_short_id=”)的 webhook 供群维度管理端展示，隐藏
+// 软删除（statusDeleted）项（#254）。绑定到子区的 webhook 走 queryByThreadScope，不在
+// 群列表回显——两个挂载面各管各的作用域（见 api.go list / queryManageable）。命中
+// idx_incoming_webhook_thread(group_no, thread_short_id, status) 前缀。
 func (d *incomingWebhookDB) queryByGroupNo(groupNo string) ([]*incomingWebhookModel, error) {
 	var list []*incomingWebhookModel
 	_, err := d.session.Select("*").From("incoming_webhook").
 		Where("group_no=?", groupNo).
+		Where("thread_short_id=?", "").
+		Where("status != ?", statusDeleted).
+		OrderDir("created_at", false).
+		Load(&list)
+	return list, err
+}
+
+// queryByThreadScope 列出绑定到某子区(group_no + thread_short_id)的 webhook，供子区维度
+// 管理端展示，隐藏软删除项。与 queryByGroupNo 对称、作用域互斥。命中
+// idx_incoming_webhook_thread(group_no, thread_short_id, status)。
+func (d *incomingWebhookDB) queryByThreadScope(groupNo, threadShortID string) ([]*incomingWebhookModel, error) {
+	var list []*incomingWebhookModel
+	_, err := d.session.Select("*").From("incoming_webhook").
+		Where("group_no=?", groupNo).
+		Where("thread_short_id=?", threadShortID).
 		Where("status != ?", statusDeleted).
 		OrderDir("created_at", false).
 		Load(&list)

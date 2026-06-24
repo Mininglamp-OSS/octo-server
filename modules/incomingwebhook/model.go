@@ -22,14 +22,24 @@ const (
 
 // incomingWebhookModel 对应 incoming_webhook 表。
 type incomingWebhookModel struct {
-	WebhookID  string
-	TokenHash  string
-	GroupNo    string
-	SpaceID    string
-	Name       string
-	Avatar     string
-	CreatorUID string
-	Status     int
+	WebhookID string
+	TokenHash string
+	GroupNo   string
+	SpaceID   string
+	// ChannelType / ThreadShortID 定义投递目标频道（创建时绑定、之后不可改；不在
+	// updateFieldsAllowed 内）：
+	//   - ChannelType==ChannelTypeGroup(2) 且 ThreadShortID=="" → 投递到父群 GroupNo（默认/存量语义）；
+	//   - ChannelType==ChannelTypeCommunityTopic(5) 且 ThreadShortID!="" → 投递到子区频道
+	//     thread.BuildChannelID(GroupNo, ThreadShortID)。
+	// 由 targetChannel()（api.go）统一解析；存量行 channel_type 默认 2、thread_short_id 默认
+	// 空，即「投递到父群」，向后兼容。鉴权/成员/配额/级联仍一律锚父群 GroupNo，子区成员
+	// 完全派生自父群——只有最终 SendMessage 的频道由此两列决定。
+	ChannelType   int
+	ThreadShortID string
+	Name          string
+	Avatar        string
+	CreatorUID    string
+	Status        int
 	// AllowMentionAll / AllowMentionBots 是【广播型 @】的 per-webhook 能力位
 	// （0=否[默认] / 1=是）：分别授权该 webhook 推送 @所有人(真人广播,→mention.humans)
 	// 与 @所有 AI(bot 广播,→mention.ais)。广播会刷全群红点 / 唤起全部 bot，是高噪声能力，
@@ -186,12 +196,15 @@ type updateReq struct {
 // webhookResp 对外暴露的 webhook 元信息（不含 token / token_hash）。
 // creator_uid 与登录 uid 对比可判断"是否我创建的"（成员仅可管理自己创建的）。
 type webhookResp struct {
-	WebhookID  string `json:"webhook_id"`
-	GroupNo    string `json:"group_no"`
-	Name       string `json:"name"`
-	Avatar     string `json:"avatar"`
-	CreatorUID string `json:"creator_uid"`
-	Status     int    `json:"status"`
+	WebhookID string `json:"webhook_id"`
+	GroupNo   string `json:"group_no"`
+	// ThreadShortID 回显该 webhook 绑定的子区 short_id（仅子区 webhook 非空，群 webhook
+	// 省略），供管理端 UI 展示「投递到子区 X」。绝不影响推送 URL（仍按 webhook_id/token）。
+	ThreadShortID string `json:"thread_short_id,omitempty"`
+	Name          string `json:"name"`
+	Avatar        string `json:"avatar"`
+	CreatorUID    string `json:"creator_uid"`
+	Status        int    `json:"status"`
 	// AllowMentionAll / AllowMentionBots 回显广播能力位（0/1），便于管理端 UI 渲染开关。
 	AllowMentionAll  int   `json:"allow_mention_all"`
 	AllowMentionBots int   `json:"allow_mention_bots"`

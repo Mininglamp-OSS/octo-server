@@ -25,6 +25,14 @@ func (ba *BotAPI) registerIncomingWebhookRoutes(r *wkhttp.WKHttp) {
 	g := r.Group("/v1/bot/groups/:group_no/incoming-webhooks",
 		ba.authBot(), ba.botActorUID(), appwkhttp.SharedUIDRateLimiter(r, ba.ctx))
 	iwh.MountManagementRoutes(g)
+
+	// 子区维度的同一组管理端点（与用户面 /v1/groups/:group_no/threads/:short_id/...
+	// 对称）：复用同一套 handler，仅多带 :short_id——create 据此把 webhook 绑定到子区，
+	// list/queryManageable 按 (group_no, short_id) 作用域隔离。权限矩阵不变（bot 须是父群
+	// 成员；管理员 bot 同管理员同权）。
+	threadG := r.Group("/v1/bot/groups/:group_no/threads/:short_id/incoming-webhooks",
+		ba.authBot(), ba.botActorUID(), appwkhttp.SharedUIDRateLimiter(r, ba.ctx))
+	iwh.MountManagementRoutes(threadG)
 }
 
 // botActorUID 把 authBot 解析出的 robot_id 适配到 "uid" 上下文键（incomingwebhook

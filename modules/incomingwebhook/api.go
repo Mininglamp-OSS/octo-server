@@ -27,6 +27,7 @@ import (
 	commonmod "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/robot"
+	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
@@ -79,7 +80,11 @@ type IncomingWebhook struct {
 	// webhook 的 @所有 AI 与其它入口解析出的 bot 集合一致（parity）。
 	groupService group.IService
 	robotService robot.IService
-	rateRedis    *redis.Client
+	// threadService 仅供 create 在【子区挂载面】校验目标子区存在且活跃、且归属本群
+	// （GetThread 按 group_no+short_id 双条件查询，跨群天然被拒）。push 热路径不调用它
+	// （投递目标由行上 channel_type/thread_short_id 经 targetChannel() 派生，不再查子区）。
+	threadService thread.IService
+	rateRedis     *redis.Client
 	// auditSem 给 push 成功后的异步审计(recordSuccess)限并发：每次推送有两次 DB 写，
 	// 无界 `go recordSuccess` 在 Redis 限流 fail-open + 推送洪峰下会无限堆 goroutine、
 	// 压垮 DB 连接池。用带缓冲 channel 作信号量给审计的 DB 操作总并发封顶——满了就**丢弃**
@@ -179,19 +184,20 @@ func NewManagementFacade(ctx *config.Context) *IncomingWebhook {
 func newIncomingWebhook(ctx *config.Context) *IncomingWebhook {
 	cacheTTL, cacheMax := cacheTTL(), cacheMax()
 	return &IncomingWebhook{
-		ctx:          ctx,
-		Log:          log.NewTLog("IncomingWebhook"),
-		db:           newDB(ctx),
-		groupDB:      group.NewDB(ctx),
-		groupService: group.NewService(ctx),
-		robotService: robot.NewService(ctx),
-		rateRedis:    sharedRateRedis(ctx.GetConfig()),
-		auditSem:     make(chan struct{}, auditConcurrency()),
-		floor:        newLocalFloor(),
-		settings:     commonmod.EnsureSystemSettings(ctx),
-		webhookCache: newTTLCache[*incomingWebhookModel](cacheTTL, cacheMax),
-		groupCache:   newTTLCache[*group.Model](cacheTTL, cacheMax),
-		memberCache:  newTTLCache[bool](cacheTTL, cacheMax),
+		ctx:           ctx,
+		Log:           log.NewTLog("IncomingWebhook"),
+		db:            newDB(ctx),
+		groupDB:       group.NewDB(ctx),
+		groupService:  group.NewService(ctx),
+		robotService:  robot.NewService(ctx),
+		threadService: thread.NewService(ctx),
+		rateRedis:     sharedRateRedis(ctx.GetConfig()),
+		auditSem:      make(chan struct{}, auditConcurrency()),
+		floor:         newLocalFloor(),
+		settings:      commonmod.EnsureSystemSettings(ctx),
+		webhookCache:  newTTLCache[*incomingWebhookModel](cacheTTL, cacheMax),
+		groupCache:    newTTLCache[*group.Model](cacheTTL, cacheMax),
+		memberCache:   newTTLCache[bool](cacheTTL, cacheMax),
 	}
 }
 
@@ -205,6 +211,15 @@ func (w *IncomingWebhook) Route(r *wkhttp.WKHttp) {
 	mgr := r.Group("/v1/groups/:group_no/incoming-webhooks",
 		w.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, w.ctx))
 	w.MountManagementRoutes(mgr)
+
+	// 子区维度的同一组管理端点：复用 MountManagementRoutes 的同一套 handler，仅多带
+	// :short_id 路由参数——create 据此把 webhook 绑定到子区并校验，list/queryManageable
+	// 按 (group_no, short_id) 作用域隔离（群面与子区面各管各的，互不串）。push/管理鉴权、
+	// 限流、配额、级联全部仍锚父群 group_no，与群面完全一致。bot 侧对称端点由 bot_api 经
+	// MountManagementRoutes 挂到 /v1/bot/groups/:group_no/threads/:short_id/incoming-webhooks。
+	threadMgr := r.Group("/v1/groups/:group_no/threads/:short_id/incoming-webhooks",
+		w.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, w.ctx))
+	w.MountManagementRoutes(threadMgr)
 
 	// 推送类：URL 内 token 鉴权，无 AuthMiddleware。四层限流，由粗到细：
 	//  1) localFloorMiddleware —— 纯内存、不依赖 Redis 的进程级地板，先挡洪峰；Redis
@@ -387,6 +402,7 @@ func toResp(m *incomingWebhookModel) webhookResp {
 	r := webhookResp{
 		WebhookID:        m.WebhookID,
 		GroupNo:          m.GroupNo,
+		ThreadShortID:    m.ThreadShortID,
 		Name:             m.Name,
 		Avatar:           m.Avatar,
 		CreatorUID:       m.CreatorUID,
@@ -575,11 +591,16 @@ func (w *IncomingWebhook) requireCreatorInGroup(c *wkhttp.Context, m *incomingWe
 	return true
 }
 
-// queryManageable 查询属于 groupNo 且未被软删除的 webhook，供管理端写操作（update /
-// delete / regenerate）复用。未命中 / 跨群 / 已软删除（statusDeleted）一律按 not-found
-// 写响应；查询故障写 5xx。任一情况返回 (nil, false)，调用方据此提前返回。
+// queryManageable 查询属于当前作用域且未被软删除的 webhook，供管理端写操作（update /
+// delete / regenerate / deliveries / testPush）复用。未命中 / 跨群 / 跨作用域 / 已软删除
+// （statusDeleted）一律按 not-found 写响应；查询故障写 5xx。任一情况返回 (nil, false)，
+// 调用方据此提前返回。
 //
-// 把"已删除视为不存在"集中在此一处，保证三个写端点不会遗漏软删除判断而误操作或复活
+// 作用域隔离：除跨群守卫（m.GroupNo != groupNo）外，还要求 webhook 的绑定子区与路径
+// :short_id 一致（群面 short_id==” 仅匹配群 webhook；子区面仅匹配该子区的 webhook）。
+// 于是群 webhook 不能经子区路径管理，子区 webhook 也不能经群路径或别的子区路径管理。
+//
+// 把"已删除视为不存在"集中在此一处，保证写端点不会遗漏软删除判断而误操作或复活
 // 已删除的 webhook（#254）。
 func (w *IncomingWebhook) queryManageable(c *wkhttp.Context, groupNo, webhookID string) (*incomingWebhookModel, bool) {
 	m, err := w.db.queryByWebhookID(webhookID)
@@ -588,7 +609,7 @@ func (w *IncomingWebhook) queryManageable(c *wkhttp.Context, groupNo, webhookID 
 		mgmtQueryFailed(c)
 		return nil, false
 	}
-	if m == nil || m.GroupNo != groupNo || m.Status == statusDeleted {
+	if m == nil || m.GroupNo != groupNo || m.ThreadShortID != c.Param("short_id") || m.Status == statusDeleted {
 		mgmtNotFound(c)
 		return nil, false
 	}
@@ -648,6 +669,33 @@ func (w *IncomingWebhook) create(c *wkhttp.Context) {
 		return
 	}
 
+	// 投递目标频道：默认群（与历史一致）。子区挂载面（路径带 :short_id）把 webhook 绑定
+	// 到子区——校验子区存在、活跃且归属本群后盖戳 channel_type=子区 / thread_short_id。
+	// 绑定在此处一次性确定、之后不可改（不在 updateFieldsAllowed）；push 不再查子区存活，
+	// 投递目标全由行上这两列经 targetChannel() 派生。鉴权/成员/配额仍走父群 group_no。
+	channelType := int(common.ChannelTypeGroup.Uint8())
+	threadShortID := ""
+	if shortID := c.Param("short_id"); shortID != "" {
+		if !thread.IsValidShortID(shortID) {
+			mgmtRequestInvalid(c, "short_id")
+			return
+		}
+		// GetThread 按 group_no+short_id 双条件查询：跨群/不存在/已删除返回 error，已归档
+		// 则 Status!=Active——任一非活跃都拒绝绑定。GetThread 不区分「不存在/已删」与 DB
+		// 故障（无类型化哨兵），create 是冷路径，统一按「子区不可用」404 并记日志。
+		tr, terr := w.threadService.GetThread(groupNo, shortID, "")
+		if terr != nil || tr == nil || tr.Status != thread.ThreadStatusActive {
+			if terr != nil {
+				w.Warn("thread lookup for webhook bind failed",
+					zap.String("group_no", groupNo), zap.String("short_id", shortID), zap.Error(terr))
+			}
+			mgmtThreadNotFound(c)
+			return
+		}
+		channelType = int(common.ChannelTypeCommunityTopic.Uint8())
+		threadShortID = shortID
+	}
+
 	token, hash, err := generateToken()
 	if err != nil {
 		w.Error("generate token failed", zap.Error(err))
@@ -666,6 +714,8 @@ func (w *IncomingWebhook) create(c *wkhttp.Context) {
 		TokenHash:        hash,
 		GroupNo:          groupNo,
 		SpaceID:          g.SpaceID,
+		ChannelType:      channelType,
+		ThreadShortID:    threadShortID,
 		Name:             req.Name,
 		Avatar:           req.Avatar,
 		CreatorUID:       actor.uid,
@@ -713,12 +763,21 @@ func (w *IncomingWebhook) create(c *wkhttp.Context) {
 
 // list 对任意（内部、正常）群成员只读开放：响应不含 token / token_hash / 推送 URL，
 // 看得到不等于推得了；成员据 creator_uid 识别哪些是自己创建的。
+//
+// 作用域隔离：群面（路径无 :short_id）只列群自身 webhook（thread_short_id=”）；子区面
+// 只列该子区绑定的 webhook。两面各管各的，互不串（与 queryManageable 同口径）。
 func (w *IncomingWebhook) list(c *wkhttp.Context) {
 	groupNo := c.Param("group_no")
 	if _, ok := w.resolveActor(c, groupNo); !ok {
 		return
 	}
-	list, err := w.db.queryByGroupNo(groupNo)
+	var list []*incomingWebhookModel
+	var err error
+	if shortID := c.Param("short_id"); shortID != "" {
+		list, err = w.db.queryByThreadScope(groupNo, shortID)
+	} else {
+		list, err = w.db.queryByGroupNo(groupNo)
+	}
 	if err != nil {
 		w.Error("list webhooks failed", zap.Error(err))
 		mgmtQueryFailed(c)
@@ -1056,10 +1115,12 @@ func (w *IncomingWebhook) testPush(c *wkhttp.Context) {
 	// 测试推送的请求体不含覆盖字段，覆盖判权传 false 即可（展示固定为 webhook 配置）。
 	payload := buildPayload(m, req, false)
 	ip := clientIP(c.Request)
+	// 投递目标由行派生：群 webhook → 父群；子区 webhook → 子区频道。与正式推送同口径。
+	channelID, channelType := m.targetChannel()
 	resp, err := w.ctx.SendMessageWithResult(&config.MsgSendReq{
 		Header:      config.MsgHeader{RedDot: 1},
-		ChannelID:   m.GroupNo,
-		ChannelType: common.ChannelTypeGroup.Uint8(),
+		ChannelID:   channelID,
+		ChannelType: channelType,
 		FromUID:     m.WebhookID,
 		Payload:     []byte(util.ToJson(payload)),
 	})
@@ -1362,11 +1423,14 @@ func (w *IncomingWebhook) handlePush(c *wkhttp.Context, ad pushAdapter) {
 		payload, mentionIgnored = w.assemblePushPayload(m, req, payload, broadcastPermitted)
 	}
 
+	// 投递目标由行派生：群 webhook → (group_no, 群)；子区 webhook → (group_no____short_id,
+	// 子区)。这是 URL/body 之外唯一随绑定变化的东西——推送方零适配（见 targetChannel()）。
+	channelID, channelType := m.targetChannel()
 	resp, err := w.ctx.SendMessageWithResult(&config.MsgSendReq{
 		// RedDot=1 让 webhook 消息触发未读红点和推送，与 botfather/robot 一致。
 		Header:      config.MsgHeader{RedDot: 1},
-		ChannelID:   m.GroupNo,
-		ChannelType: common.ChannelTypeGroup.Uint8(),
+		ChannelID:   channelID,
+		ChannelType: channelType,
 		// WebhookID 已经自带 "iwh_" 前缀，这里直接用即可，避免双前缀。
 		FromUID: m.WebhookID,
 		Payload: []byte(util.ToJson(payload)),
@@ -1424,6 +1488,21 @@ func truncateUTF8(s string, max int) string {
 // 前置的 @所有人/@所有AI 静默不进 wire（气泡永不出现），编译器不会报错。用同一常量把这层
 // 耦合交给编译器，免去手写「与 buildPayload 一致」的口头不变量。
 const payloadContentKey = "content"
+
+// targetChannel 解析该 webhook 的投递目标频道（创建时绑定、之后不可改；不在
+// updateFieldsAllowed）。这是投递目标的【唯一来源】——handlePush / testPush 都经它取
+// (channelID, channelType)，推送 URL / body 完全不参与（推送方零适配）：
+//   - 子区绑定（ChannelType==CommunityTopic 且 ThreadShortID 非空）→ 子区频道
+//     thread.BuildChannelID(GroupNo, ThreadShortID) + ChannelTypeCommunityTopic；
+//   - 其余（群 webhook、含 channel_type 缺省的存量行）→ 父群 GroupNo + ChannelTypeGroup。
+//
+// 防御性默认：任何非「子区绑定」组合都落到群，绝不会发到一个半成品的子区频道。
+func (m *incomingWebhookModel) targetChannel() (channelID string, channelType uint8) {
+	if m.ChannelType == int(common.ChannelTypeCommunityTopic.Uint8()) && m.ThreadShortID != "" {
+		return thread.BuildChannelID(m.GroupNo, m.ThreadShortID), common.ChannelTypeCommunityTopic.Uint8()
+	}
+	return m.GroupNo, common.ChannelTypeGroup.Uint8()
+}
 
 // buildPayload 把 webhook 请求映射到群消息 payload。
 //   - WuKongIM 只有 Text 类型，所有 webhook 消息都用 Text(1) 投递。
@@ -1585,6 +1664,13 @@ func (w *IncomingWebhook) recordDelivery(audit *auditModel, bumpUsed bool) {
 }
 
 // handleGroupDisband 群解散时禁用所有 webhook（事件 payload 包含 group_no）。
+// disableByGroupNo 按 group_no 级联，子区 webhook（同 group_no）一并被禁用。
+//
+// TODO(thread-cascade): 子区单独【删除/归档】目前没有可订阅的跨模块事件，绑定其上的
+// webhook 不会被主动禁用——推送到已删除子区（WuKongIM ban=1）会在下游失败、返回 502
+// (push_delivery_failed) 兜底；推送到绑定后被归档的子区仍会投递并自动解档（既有子区
+// 消息语义）。后续可加一个子区删除事件监听器，按 (group_no, thread_short_id) 级联禁用，
+// 与本群解散级联对称。
 func (w *IncomingWebhook) handleGroupDisband(data []byte, commit config.EventCommit) {
 	var req config.MsgGroupDisband
 	if err := json.Unmarshal(data, &req); err != nil || req.GroupNo == "" {

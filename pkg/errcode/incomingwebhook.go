@@ -124,6 +124,18 @@ var (
 		DefaultMessage: "The group does not exist or has been disbanded.",
 	})
 
+	// ErrIncomingWebhookThreadNotFound (404) — the target thread (子区) does not
+	// exist, is not under the path group, or is not active (archived/deleted).
+	// Returned by create on the thread-scoped mount
+	// (/v1/groups/:group_no/threads/:short_id/incoming-webhooks). One generic 404
+	// for every "thread unavailable" reason — kept simple and consistent with
+	// mgmt_group_not_found / mgmt_not_found; the precise reason is not surfaced.
+	ErrIncomingWebhookThreadNotFound = register(codes.Code{
+		ID:             "err.server.incomingwebhook.mgmt_thread_not_found",
+		HTTPStatus:     http.StatusNotFound,
+		DefaultMessage: "The thread does not exist or is not available.",
+	})
+
 	// ErrIncomingWebhookNotFound (404) — webhook does not exist or does not
 	// belong to the group in the path (cross-group guard).
 	ErrIncomingWebhookNotFound = register(codes.Code{

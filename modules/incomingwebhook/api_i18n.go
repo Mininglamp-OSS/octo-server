@@ -113,6 +113,13 @@ func mgmtNotFound(c *wkhttp.Context) {
 	httperr.ResponseErrorLWithStatus(c, errcode.ErrIncomingWebhookNotFound, nil, nil)
 }
 
+// mgmtThreadNotFound returns 404 — the target thread (子区) is missing, not under
+// the path group, or not active (archived/deleted). Used by the thread-scoped
+// create mount before any DB write.
+func mgmtThreadNotFound(c *wkhttp.Context) {
+	httperr.ResponseErrorLWithStatus(c, errcode.ErrIncomingWebhookThreadNotFound, nil, nil)
+}
+
 // mgmtQuotaExceeded returns 409 — per-group webhook cap reached; max carries
 // the configured limit for the message.
 func mgmtQuotaExceeded(c *wkhttp.Context, max int) {

@@ -393,6 +393,9 @@ other = "Each group allows at most {{.max}} webhooks."
 ["err.server.incomingwebhook.mgmt_request_invalid"]
 other = "Invalid request."
 
+["err.server.incomingwebhook.mgmt_thread_not_found"]
+other = "The thread does not exist or is not available."
+
 ["err.server.incomingwebhook.push_delivery_failed"]
 other = "Failed to deliver the webhook message."
 
