@@ -23,7 +23,7 @@ const DefaultPluginPackage = "create-openclaw-octo"
 const PluginPackageEnv = "OCTO_BOT_PLUGIN_PACKAGE"
 
 // PluginPackage returns the configured OpenClaw plugin package name, honoring
-// the DM_BOT_PLUGIN_PACKAGE override and falling back to DefaultPluginPackage.
+// the OCTO_BOT_PLUGIN_PACKAGE override and falling back to DefaultPluginPackage.
 func PluginPackage() string {
 	if v := strings.TrimSpace(os.Getenv(PluginPackageEnv)); v != "" {
 		return v
