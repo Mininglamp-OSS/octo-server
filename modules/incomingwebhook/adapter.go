@@ -1,14 +1,18 @@
 package incomingwebhook
 
-// 推送形态适配层（#297 Phase 3 / #426）。
+// 推送形态适配层（#297 Phase 3/4 / #426）。
 //
 // 多种推送形态共享同一条鉴权 / 限流 / 群校验 / 投递 / 审计流水线（api.go handlePush），
-// 彼此只差「如何把请求 body 翻译成 native 推送请求」这一步：
+// 彼此只差「如何把请求 body 翻译成 native 推送请求」这一步。下列路径同时挂在 canonical
+// 前缀 /v1/incoming-webhooks 与短别名 /v1/webhooks 上（#455，两前缀共用同一套 handler/
+// 中间件，见 api.go 的 mountPush）：
 //
 //   - native（历史契约）   POST /v1/incoming-webhooks/:webhook_id/:token
 //   - GitHub 事件          POST .../:token/github   （adapter_github.go）
 //   - 企业微信群机器人格式  POST .../:token/wecom    （adapter_wecom.go）
 //   - Multica 出站事件     POST .../:token/multica  （adapter_multica.go）
+//   - GitLab 事件          POST .../:token/gitlab   （adapter_gitlab.go）
+//   - 飞书自定义机器人格式  POST .../:token/feishu   （adapter_feishu.go）
 //
 // 适配器不是新的攻击面：URL token 鉴权、四层限流、群 Normal 校验、payload 白名单
 // 构造（buildPayload / buildRichTextPayload 注入 from.kind=webhook 与服务端 space_id）
