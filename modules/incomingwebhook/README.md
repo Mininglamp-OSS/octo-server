@@ -146,6 +146,33 @@ Content-Type: application/json
 - 服务端另有 1MB 的 RichText 硬上限（octo-lib 契约）兜底，但在默认 8KB body cap 下不会
   先触达——它是上调 body cap 后才会成为约束的二级护栏。
 
+## @ 提及（在创建/修改 webhook 时配置）
+
+@ 目标**不由推送方在 body 里传**，而是在**创建/修改 webhook 时配置**——推送端点对 body 里的
+`mention` 字段一律忽略（带了不报错、也不生效）。因此 @ 与消息形态、与推送形态都无关：**native
+与全部平台适配器**（github/wecom/gitlab/feishu/multica）的每次推送都按该 webhook 的配置 @。
+
+配置项（create / update 请求体；管理端点见下文）：
+
+| 字段 | 含义 | 约束 |
+|------|------|------|
+| `mention_uids` | 定向 @ 的成员/bot UID 列表（用户与 bot 同一命名空间） | 必须是本群【当前】成员；去重；上限 50（`OCTO_INCOMINGWEBHOOK_MAX_MENTION_UIDS`）。非成员 / 超限 → 400 `reason=mention_uids`。空/缺省即不 @ |
+| `allow_mention_all` | 每次推送是否 @所有人（真人广播 → `mention.humans`） | `0`=否(默认) / `1`=是；高噪声能力，需显式打开 |
+| `allow_mention_bots` | 每次推送是否 @所有 AI（bot 广播 → `mention.ais`） | `0`=否(默认) / `1`=是 |
+
+行为：
+
+- **定向 `mention_uids`**：推送时再过一遍【当前】群成员闸（配置后退群者自动剔除），命中成员进
+  `mention.uids` 路由，并在【纯文本】content 文首渲染成 `@<昵称>` 气泡（服务端解析 `user.name`
+  并生成 `mention.entities`）。不受广播能力位约束，只受成员闸 + 去重 + 上限。
+- **广播 `allow_mention_*`**：开了即每条推送都带对应广播；另受策略闸 system_setting
+  `incomingwebhook.member_can_broadcast`——关掉即收回所有【成员】创建的 webhook 的广播能力
+  （管理员创建的不受影响），无需改能力位列。未放行时推送仍 200，响应体 `mention_ignored`
+  数组回报被忽略的广播位（`all` / `bots`）。
+- 红点 / 唤起 bot / `@所有 AI` 展开为群内全部 bot 等下游语义，全由既有 message 监听器完成，
+  本模块只产出 well-formed 的 `mention` 子对象。richtext 路径只路由、不补气泡。
+- 反枚举：定向 `mention_uids` 里的非成员在推送时【静默丢弃】，不回显具体 uid。
+
 ## 平台适配器（#297 Phase 3 / 4）
 
 适配器把第三方平台的原生格式翻译成上面的 native 消息，鉴权/限流/审计与 native 完全
@@ -306,6 +333,8 @@ POST /v1/incoming-webhooks/:webhook_id/:token/feishu
 ## 通用字段与安全
 
 - `username` / `avatar_url`：两种形态通用，服务端裁剪到字节上限（名 64B / 头像 255B）。
+- 推送 body 里的 `mention` 字段一律**忽略**：@ 目标改为在创建/修改 webhook 时配置
+  （见「@ 提及」），不接受推送方逐条指定，防止泄露的 token 任意 @ 人。
 - 其它任意字段（含 `extra`、`space_id`）一律**丢弃**：消息归属的 Space 由服务端从群派生，
   不接受调用方覆盖，防止伪造到其它 Space。
 
