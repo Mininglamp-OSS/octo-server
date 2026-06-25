@@ -1198,6 +1198,13 @@ func (w *IncomingWebhook) testPush(c *wkhttp.Context) {
 	req := &pushPayloadReq{Content: msg}
 	// 测试推送的请求体不含覆盖字段，覆盖判权传 false 即可（展示固定为 webhook 配置）。
 	payload := buildPayload(m, req, false)
+	// 测试推送同样按 webhook 配置补 mention（定向 @uid 渲染 + 广播位），与正式推送同口径，
+	// 端到端验证 @ 配置——否则管理员配了 mention_uids/allow_mention_* 却在测试消息里看不到 @，
+	// 会误以为配置失效。广播放行 = member_can_broadcast 或创建者当前是管理员；创建者已确认在群内
+	// （requireCreatorInGroup），此处再取其管理员身份，查询失败则按未放行处理（fail-closed）。
+	_, creatorIsAdmin, _ := w.db.queryMemberRole(m.GroupNo, m.CreatorUID)
+	broadcastPermitted := w.settings.IncomingWebhookMemberCanBroadcast() || creatorIsAdmin
+	payload, _ = w.assemblePushPayload(m, req, payload, broadcastPermitted)
 	ip := clientIP(c.Request)
 	// 投递目标由行派生：群 webhook → 父群；子区 webhook → 子区频道。与正式推送同口径。
 	channelID, channelType := m.targetChannel()

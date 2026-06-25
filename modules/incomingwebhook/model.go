@@ -53,8 +53,10 @@ type incomingWebhookModel struct {
 	//
 	// Go 字段刻意命名 MentionUids（非 MentionUIDs）：UnderscoreName / dbr camelCaseToSnakeCase
 	// 把 "MentionUids"→"mention_uids"，而 "MentionUIDs" 会被切成 "mention_ui_ds"（连续大写陷阱），
-	// 与列名对不上导致读写静默落空。
-	MentionUids      string
+	// 与列名对不上导致读写静默落空。显式 `db:"mention_uids"` tag 兜底读路径：即便将来有人为
+	// 「命名一致」把字段改成 MentionUIDs，dbr Load 仍按 tag 命中列（写路径的 AttrToUnderscore 会
+	// 产出 mention_ui_ds 列名、INSERT 直接报错暴露，不会静默）。
+	MentionUids      string `db:"mention_uids"`
 	LastUsedAt       dbr.NullTime
 	CallCount        int64
 	db.BaseModel

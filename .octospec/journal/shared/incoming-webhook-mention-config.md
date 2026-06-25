@@ -68,3 +68,31 @@ direct consequence of body-sourced targets).
 - `go test ./modules/bot_api/ -run 'IncomingWebhook|Webhook'` — ok (fresh DB).
 - `make i18n-extract-check`, `make i18n-lint`, `golangci-lint run
   ./modules/incomingwebhook/...` — all clean. `go build ./...` — ok.
+
+## Code review (max-effort) — follow-up fixes
+
+A 10-angle adversarial review surfaced three issues worth fixing before merge
+(rest were nits / accepted design):
+
+1. **Broadcast switch semantic change was silently retroactive.** `allow_mention_*`
+   meant "may broadcast when the caller asks" (#445/#448); this change makes them
+   "broadcast on every push". Existing rows with the switch set would have started
+   spamming the whole group on upgrade. Fix: the migration now **zeroes existing
+   `allow_mention_all`/`allow_mention_bots` values** and **updates the column
+   COMMENTs** (the old comment "是否允许推送" now contradicted runtime). Operators
+   re-opt-in under the new, clearly-documented semantics.
+2. **Test push ignored configured mention.** `testPush` built the payload via
+   `buildPayload` only, so a configured `@` never appeared in the test message —
+   admins would think the config was broken. Fix: `testPush` now runs the same
+   `assemblePushPayload` (directed pills + broadcast, same `broadcastPermitted`
+   rule). Smoke test `TestTestPush_AppliesConfiguredMention` added.
+3. **Field-name footgun guard.** Added an explicit `db:"mention_uids"` tag to the
+   `MentionUids` model field so a future "consistency" rename to `MentionUIDs`
+   can't silently break the read path (it would map to `mention_ui_ds`).
+
+Accepted-as-is (noted, not changed): per-push member-gate / `@所有 AI` fan-out on
+configured webhooks (behind the rate limiter); render-always-on for configured
+targets (matches the PRD intent); `VARCHAR(4096)` is safe at the default 50-uid
+cap (raising `OCTO_INCOMINGWEBHOOK_MAX_MENTION_UIDS` far past the default is the
+only way to overflow it — documented bound). richtext + broadcast switch fires a
+group red-dot with no visible literal (pre-existing, now config-driven).

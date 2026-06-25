@@ -264,3 +264,22 @@ func TestMentionPush_BroadcastDeniedByPolicyAcrossAdapters(t *testing.T) {
 	_, adminIgnored := parseJSON(t, ap)["mention_ignored"]
 	assert.Falsef(t, adminIgnored, "admin-created webhook broadcast must be unaffected, body: %s", ap.Body.String())
 }
+
+// TestTestPush_AppliesConfiguredMention pins the review fix: the management "test push" now runs
+// the same mention assembly as a real push (previously it only called buildPayload and silently
+// dropped the configured @, misleading admins). e2e can't read back the WuKongIM payload, so this
+// is a smoke assertion that a webhook with configured directed @ + a broadcast switch tests
+// end-to-end (200) without the new member-gate/compose wiring erroring; the mention-lands-on-wire
+// correctness is exhausted by the directed-render / broadcast unit tests.
+func TestTestPush_AppliesConfiguredMention(t *testing.T) {
+	handler, _, groupNo := setupMemberEnv(t)
+	created := adminCreateWebhook(t, handler, groupNo, map[string]interface{}{
+		"name":              "ci",
+		"mention_uids":      []string{memberAUID},
+		"allow_mention_all": true,
+	})
+	whID, _ := created["webhook_id"].(string)
+	w := do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks/%s/test", groupNo, whID), nil))
+	require.Equalf(t, http.StatusOK, w.Code,
+		"test push with configured mention must succeed end-to-end; body: %s", w.Body.String())
+}
