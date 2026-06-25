@@ -220,8 +220,8 @@ func (d *incomingWebhookDB) queryMemberRole(groupNo, uid string) (isMember, isAd
 
 // filterGroupMembers 返回 uids 中【当前是 groupNo 内部正常成员】的子集,映射到各自的
 // 展示昵称(uid → user.name)。返回值【既是成员闸又是昵称表】:key 存在 = 是本群成员
-// (assembleMention / finalizeEntities 只看 key 判归属),value = 昵称(仅 mention.render 的
-// 定向 @气泡渲染用,可能为空串——未 join 到 user 行时)。
+// (assembleMention 只看 key 判归属),value = 昵称(仅定向 @气泡渲染用,可能为空串——
+// 未 join 到 user 行时)。
 //
 // 用于 push 路径的定向 @ 校验:webhook token 是写进 CI/平台配置的低信任共享密钥,必须
 // 把 @ 目标收敛到本群成员,杜绝「泄露的 token @ 任意平台用户 / 跨 Space 身份」以及借

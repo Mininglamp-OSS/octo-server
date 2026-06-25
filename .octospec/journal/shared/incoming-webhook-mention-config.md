@@ -100,3 +100,37 @@ targets (matches the PRD intent); `VARCHAR(4096)` is safe at the default 50-uid
 cap (raising `OCTO_INCOMINGWEBHOOK_MAX_MENTION_UIDS` far past the default is the
 only way to overflow it — documented bound). richtext + broadcast switch fires a
 group red-dot with no visible literal (pre-existing, now config-driven).
+
+## Review integration (PR #465 — 4 approvals, no P0/P1)
+
+Four independent reviews on PR #465 all returned APPROVE (OctoBoooot byte-verified
+all 11 PR claims; Octo-Q full data-flow trace; yujiawei spec+quality; Jerry-Xin
+project-scope). No P0/P1. Deduped the findings and acted:
+
+**Applied (this follow-up commit):**
+- **Column-width guard** (consensus — Octo-Q P2 + Jerry-Xin warning): `mention_uids`
+  is `VARCHAR(4096)` but `maxMentionUIDs()` is env-tunable; raising the env cap far
+  enough could let `validateMentionUIDs` accept a list whose JSON overflows the
+  column, failing at DB-write instead of cleanly. Added `mentionUIDsColumnChars`
+  (= 4096) + a post-marshal length check → clean `400 reason=mention_uids`. This
+  supersedes the previously "accepted-as-is" VARCHAR bound.
+- **Stale doc comment** (yujiawei nit): `db.go` `filterGroupMembers` comment still
+  named the removed `finalizeEntities` / `mention.render`; reworded to current state.
+- **Two tests** (Octo-Q + Jerry-Xin suggestions): `TestMentionPush_BodyMentionIgnoredWhenConfigured`
+  (body broadcast ignored even when the webhook is configured — proven via a denied
+  policy, so a wrongly-honored body broadcast would surface as `mention_ignored`);
+  `TestMention_UpdateRejectsNonMemberUID` (update path rejects non-member targets,
+  matching the create-path guard).
+
+**Reviewed, not changed (out of scope / deliberate):**
+- Render-always-on for configured targets — deliberate per PRD (no caller `render`
+  opt-in remains, by design).
+- Two **pre-existing** P2s yujiawei confirmed are on `main`, not introduced here:
+  `assemblePushPayload` expands `mention.ais` with the parent `GroupNo` for
+  thread-bound webhooks (from #445; bot UIDs stay parent-group members, no Space
+  crossing); the Feishu adapter can render attacker-supplied `at.user_name` as
+  literal `@所有人` text (sets no `mention.humans`, so cannot forge a real broadcast).
+  Tracked as follow-ups, not blockers for this change.
+
+Re-verified after the follow-up: `go test ./modules/incomingwebhook/...` ok (25.7s),
+`golangci-lint` 0 issues, `make i18n-extract-check` + `make i18n-lint` clean.

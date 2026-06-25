@@ -468,6 +468,13 @@ func (w *IncomingWebhook) validateMentionUIDs(c *wkhttp.Context, groupNo string,
 		mgmtOperationFailed(c)
 		return "", false
 	}
+	// 列宽兜底：mention_uids 落库为 VARCHAR(mentionUIDsColumnChars)。默认上限下远未触顶，但
+	// maxMentionUIDs 经 env 调高后 JSON 可能超列宽；写入前按列宽校验，超出即干净 400（与超限
+	// 同口径），避免落到 DB 写入才脏失败/截断。uid 为 ASCII，len(字节)==字符数，与 VARCHAR 计数一致。
+	if len(b) > mentionUIDsColumnChars {
+		mgmtRequestInvalid(c, "mention_uids")
+		return "", false
+	}
 	return string(b), true
 }
 

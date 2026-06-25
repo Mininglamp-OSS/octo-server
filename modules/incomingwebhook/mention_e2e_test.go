@@ -283,3 +283,57 @@ func TestTestPush_AppliesConfiguredMention(t *testing.T) {
 	require.Equalf(t, http.StatusOK, w.Code,
 		"test push with configured mention must succeed end-to-end; body: %s", w.Body.String())
 }
+
+// TestMentionPush_BodyMentionIgnoredWhenConfigured locks the non-interaction property the existing
+// TestMentionPush_BodyMentionIgnored couldn't prove on its own (an admin webhook with no config):
+// a push body's broadcast request must NOT be honored even when the webhook already carries its own
+// (directed) config. The webhook is member-created with broadcast policy DENIED, so *if* the body's
+// all/bots were (wrongly) read, the denied broadcast would surface as mention_ignored — asserting
+// its absence proves the body was dropped, not merged with the webhook config.
+func TestMentionPush_BodyMentionIgnoredWhenConfigured(t *testing.T) {
+	handler, ctx, groupNo := setupMemberEnv(t)
+	t.Setenv("OCTO_INCOMINGWEBHOOK_MEMBER_CAN_BROADCAST", "") // 纯由 DB 策略驱动
+
+	// 成员 webhook：配置定向 @A，广播开关【关】。
+	mw := do(handler, userReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo),
+		map[string]interface{}{"mention_uids": []string{memberAUID}}, memberAToken))
+	require.Equalf(t, http.StatusOK, mw.Code, "member create: %s", mw.Body.String())
+	mRes := parseJSON(t, mw)
+	pushURL := fmt.Sprintf("/v1/incoming-webhooks/%s/%s", mRes["webhook_id"], mRes["token"])
+
+	// 收回广播策略：member_can_broadcast=0（这样若 body 广播被误读，必被拒并回报 ignored）。
+	_, err := ctx.DB().InsertInto("system_setting").
+		Pair("category", "incomingwebhook").Pair("key_name", "member_can_broadcast").
+		Pair("value", "0").Pair("value_type", "bool").Pair("description", "").Exec()
+	require.NoError(t, err)
+	settings := modulescommon.EnsureSystemSettings(ctx)
+	require.NoError(t, settings.Reload())
+	defer func() {
+		_, _ = ctx.DB().DeleteFrom("system_setting").Where("category=?", "incomingwebhook").Exec()
+		_ = settings.Reload()
+	}()
+
+	// body 请求 all+bots+另一个 uid —— 全部必须被忽略（仅 webhook 配置说了算）。
+	body := fmt.Sprintf(`{"content":"hi","mention":{"all":true,"bots":true,"uids":["%s"]}}`, memberBUID)
+	pw := do(handler, anonReq("POST", pushURL, []byte(body)))
+	require.Equalf(t, http.StatusOK, pw.Code, "push body: %s", pw.Body.String())
+	_, hasIgnored := parseJSON(t, pw)["mention_ignored"]
+	assert.Falsef(t, hasIgnored,
+		"body broadcast must be ignored even when the webhook is configured; honoring it would report ignored under the denied policy, body: %s", pw.Body.String())
+}
+
+// TestMention_UpdateRejectsNonMemberUID: update 与 create 同口径，必须把 @ 目标收敛到本群当前
+// 成员，非成员 → 400（create 由 TestMention_CreateRejectsNonMemberUID 覆盖，这里锁 update 契约）。
+func TestMention_UpdateRejectsNonMemberUID(t *testing.T) {
+	handler, _, groupNo := setupMemberEnv(t)
+	created := adminCreateWebhook(t, handler, groupNo, map[string]interface{}{
+		"name":         "ci",
+		"mention_uids": []string{memberAUID},
+	})
+	whID, _ := created["webhook_id"].(string)
+
+	w := do(handler, authReq("PUT", fmt.Sprintf("/v1/groups/%s/incoming-webhooks/%s", groupNo, whID),
+		map[string]interface{}{"mention_uids": []string{"ghost_not_member"}}))
+	assert.Equalf(t, http.StatusBadRequest, w.Code,
+		"update with non-member @ target must be rejected, body: %s", w.Body.String())
+}

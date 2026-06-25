@@ -34,6 +34,12 @@ func parseMentionUIDs(raw string) []string {
 const (
 	envMaxMentionUIDs     = "OCTO_INCOMINGWEBHOOK_MAX_MENTION_UIDS"
 	defaultMaxMentionUIDs = 50
+
+	// mentionUIDsColumnChars 是 mention_uids 落库列宽（migration 20260625000001：VARCHAR(4096)）。
+	// validateMentionUIDs 写入前用它兜底：默认 50-uid 上限下 JSON ≈ 2.2KB 远未触顶，但
+	// OCTO_INCOMINGWEBHOOK_MAX_MENTION_UIDS 可被运维调高到 JSON 超列宽——此时按列宽干净 400，
+	// 而不是等 DB 写入才脏失败/截断。改列宽须同步此常量。
+	mentionUIDsColumnChars = 4096
 )
 
 func maxMentionUIDs() int {
