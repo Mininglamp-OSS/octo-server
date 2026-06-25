@@ -176,6 +176,36 @@ func TestIsAllowedExtension_BlockedTakesPriority(t *testing.T) {
 	}
 }
 
+func TestIsAllowedExtension_NewlyAddedExtensions(t *testing.T) {
+	// 新增的低/无执行风险扩展名应被允许上传
+	added := []string{
+		// Apple iWork
+		".key", ".numbers", ".pages",
+		// 现代图片
+		".heic", ".heif", ".tiff", ".tif",
+		// OpenDocument 演示文稿
+		".odp",
+		// 电子书
+		".epub", ".mobi",
+		// 纯文本/数据
+		".toml", ".ini", ".log", ".tsv", ".ndjson",
+		// 字幕
+		".srt", ".vtt", ".ass",
+		// 音频
+		".opus", ".aiff",
+	}
+	for _, ext := range added {
+		assert.True(t, IsAllowedExtension(ext), "%s should be allowed", ext)
+		assert.False(t, IsBlockedExtension(ext), "%s should not be blocked", ext)
+	}
+
+	// 有执行/XSS 风险，刻意排除的扩展名不应被允许
+	excluded := []string{".svg", ".xlsm", ".docm", ".pptm", ".iso", ".img"}
+	for _, ext := range excluded {
+		assert.False(t, IsAllowedExtension(ext), "%s should not be allowed", ext)
+	}
+}
+
 func TestSanitizeFilename(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -317,9 +347,15 @@ func TestIsBlockedExtension_AllEntries(t *testing.T) {
 func TestIsAllowedExtension_AllEntries(t *testing.T) {
 	allAllowed := []string{
 		".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".ico",
+		".heic", ".heif", ".tiff", ".tif",
 		".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-		".txt", ".csv", ".rtf", ".odt", ".ods", ".md", ".html", ".htm",
+		".txt", ".csv", ".rtf", ".odt", ".ods", ".odp", ".md", ".html", ".htm",
+		".key", ".numbers", ".pages",
+		".epub", ".mobi",
+		".toml", ".ini", ".log", ".tsv", ".ndjson",
+		".srt", ".vtt", ".ass",
 		".mp3", ".wav", ".aac", ".flac", ".ogg", ".wma", ".m4a", ".amr",
+		".opus", ".aiff",
 		".mp4", ".avi", ".mov", ".wmv", ".flv", ".mkv", ".webm", ".m4v",
 		".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz",
 		".json", ".xml", ".yaml", ".yml",
