@@ -124,7 +124,7 @@ var systemSettingSchema = []settingDef{
 	// DEL 失败 / 极窄的失效-回填竞态（见 modules/bot_api/registry_redis.go）。实时热更新
 	// 无需重启；读取侧再夹紧到 [30, 86400]，超界回落默认值。标记 Positive 以放开
 	// settingTypeInt 默认的 [0,3650] 上界（本键上限 86400）。
-	{Category: "app_bot", Key: "auth_cache_ttl_seconds", Type: settingTypeInt, Description: "App Bot 鉴权缓存安全网 TTL(秒)，吊销即时生效，此值仅兜底失效竞态；调高会按比例拉长被吊销 token 在该竞态下仍可全簇鉴权的最坏窗口；有效范围[30,86400]，超出范围的写入会被接受但运行时回落默认 60s", Positive: true,
+	{Category: "app_bot", Key: "auth_cache_ttl_seconds", Type: settingTypeInt, Description: "App Bot 鉴权缓存安全网 TTL(秒)，吊销经共享墓碑即时生效，此值仅兜底孤儿键/撤销写失败；调高会按比例拉长撤销写失败时被吊销 token 仍可全簇鉴权的最坏窗口；有效范围[30,600]，超出范围的写入会被接受但运行时回落默认 60s", Positive: true,
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.AppBotAuthCacheTTLSeconds()) }},
 
 	// Email server config — formerly yaml-only (Support.* in config.go).

@@ -715,8 +715,11 @@ const (
 	defaultAppBotAuthCacheTTLSeconds = 60
 	// appBotAuthCacheTTLMinSeconds / Max bound an admin override to a sane window
 	// (does not use getIntClamped, whose [0,3650] range is tuned for "days").
+	// Revocation propagates instantly via the shared tombstone, so this TTL is only
+	// an orphan / failed-revocation-write backstop — the max is kept tight (10 min)
+	// so a misconfiguration can't widen the worst-case revoked-token window.
 	appBotAuthCacheTTLMinSeconds = 30
-	appBotAuthCacheTTLMaxSeconds = 86400
+	appBotAuthCacheTTLMaxSeconds = 600
 )
 
 // AppBotAuthCacheTTLSeconds is the safety-net TTL (seconds) written with each

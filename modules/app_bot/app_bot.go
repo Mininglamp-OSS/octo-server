@@ -280,7 +280,10 @@ func (ab *AppBot) loadRegistryFromDB(authRegistry bot_api.AppBotRegistryInterfac
 			Token:       bot.Token,
 			CreatedBy:   bot.CreatedBy,
 		})
-		authRegistry.Add(bot.Token, &bot_api.AppBotRegistrySpec{
+		// Warm (best-effort SETNX), not Add: startup loads the published set, but a
+		// bot could be concurrently revoked while this loop runs. SETNX won't clobber
+		// that revocation's tombstone, so startup can't resurrect a just-revoked bot.
+		authRegistry.Warm(bot.Token, &bot_api.AppBotRegistrySpec{
 			UID:     bot.UID,
 			Scope:   bot.Scope,
 			SpaceID: bot.SpaceID,

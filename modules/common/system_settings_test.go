@@ -252,6 +252,44 @@ func TestSystemSettings_IncomingWebhook_ReadSideClamp_NoInfra(t *testing.T) {
 	assert.Equal(t, 3, s.IncomingWebhookMaxPerGroup())
 }
 
+// TestSystemSettings_AppBotAuthCacheTTL_ReadSideClamp_NoInfra pins the read-side
+// defence for app_bot.auth_cache_ttl_seconds: an in-range value is served as-is,
+// and anything outside the tightened [30, 600] window (incl. the old 24h max, 0,
+// negative, non-int) falls back to the 60s default rather than being honored.
+// Drives the snapshot directly, no infra.
+func TestSystemSettings_AppBotAuthCacheTTL_ReadSideClamp_NoInfra(t *testing.T) {
+	const key = "app_bot.auth_cache_ttl_seconds"
+
+	// In-range value served verbatim.
+	s := &SystemSettings{}
+	snap := map[string]string{key: "120"}
+	s.snapshot.Store(&snap)
+	assert.Equal(t, 120, s.AppBotAuthCacheTTLSeconds())
+
+	// Out-of-range / non-int → default (60). "86400" pins the lowered max bound.
+	for _, bad := range []string{"29", "601", "0", "-5", "86400", "abc"} {
+		s := &SystemSettings{}
+		snap := map[string]string{key: bad}
+		s.snapshot.Store(&snap)
+		assert.Equalf(t, defaultAppBotAuthCacheTTLSeconds, s.AppBotAuthCacheTTLSeconds(),
+			"ttl=%q must fall back to the default", bad)
+	}
+
+	// Boundary values are accepted.
+	for in, want := range map[string]int{"30": 30, "600": 600} {
+		s := &SystemSettings{}
+		snap := map[string]string{key: in}
+		s.snapshot.Store(&snap)
+		assert.Equalf(t, want, s.AppBotAuthCacheTTLSeconds(), "boundary ttl=%q must be accepted", in)
+	}
+
+	// Missing key → default.
+	empty := &SystemSettings{}
+	em := map[string]string{}
+	empty.snapshot.Store(&em)
+	assert.Equal(t, defaultAppBotAuthCacheTTLSeconds, empty.AppBotAuthCacheTTLSeconds())
+}
+
 // TestSystemSettings_IncomingWebhook_GetterChain_NoInfra exercises the full
 // snapshot(DB) → env → code-default fallback for the incomingwebhook getters
 // WITHOUT a test server: it drives the snapshot map directly. This lets the

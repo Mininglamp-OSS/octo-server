@@ -90,17 +90,50 @@ window):
   (`MySQLMaxOpenConns=2 / MaxIdleConns=1`) so it stops aggravating the parallel-CI
   "Error 1040: Too many connections" flake (#419).
 
+## P1 closure — tombstone revocation (review round)
+
+A re-review (yujiawei, CHANGES_REQUESTED) escalated the re-populate race to a P1
+on the auth boundary: because the new auth-path write-through repopulate (`go
+reg.Add`) wrote unconditionally and the cache-hit path never re-validates, a
+warm-up that read the DB as valid just before a concurrent **delete/unpublish**
+could re-create the just-revoked key cluster-wide for up to the TTL — and a failed
+revocation DEL was silently honored until TTL. Maintainer decision: **close before
+merge** (not accept the residual). Implemented:
+
+- **Revocation writes a TOMBSTONE, not a DEL** (`RedisAppBotRegistry.Remove`):
+  `SET key=<sentinel> EX ttl`. A tombstone positively denies on every replica and
+  `FindByToken` returns nil on it (→ authoritative DB fallback → rejected). Bounded
+  retry + loud-on-failure so a transient blip can't silently delay revocation.
+- **Warm-ups use SETNX** (`RedisAppBotRegistry.Warm`, used by the auth-path
+  repopulate and startup `loadRegistryFromDB`): they only fill an ABSENT key, so a
+  delayed warm-up can never overwrite a tombstone → **resurrection race closed**
+  regardless of interleaving (tombstone-then-warm: SETNX no-ops; warm-then-revoke:
+  the revoke's authoritative SET overwrites).
+- **Authoritative `Add`** (publish / rotate-new) stays an unconditional SET so a
+  re-publish clears the tombstone at once. The write asymmetry — best-effort Warm
+  is circuit-gated, authoritative Add/Remove are not — is now explicit.
+- **Max TTL tightened 86400s → 600s**: revocation no longer relies on TTL expiry
+  (the tombstone is instant), so the TTL is only an orphan / failed-write backstop;
+  a tight max bounds the worst-case misconfiguration window.
+- **Regression coverage:** `TestAppBotWarmDoesNotResurrectRevokedToken` (a late
+  warm-up after delete + revoke leaves the token rejected on the peer) and
+  `TestAppBotRepublishClearsTombstone`; plus a no-infra read-side clamp test for
+  the tightened TTL bound in `modules/common`.
+
 ## Learnings / decisions
 
 - **Fail-safe direction matters for an auth cache.** A cache backend error must
   degrade to the authoritative DB (return nil → fallback), never fail open. This
   is the load-bearing space-isolation/auth invariant for the whole change.
-- **Documented bounded-staleness residual** (mirrors
-  `modules/incomingwebhook/cache.go`): an auth miss that read the DB as valid
-  immediately before a concurrent revocation can re-populate the just-deleted
-  key; it expires within the safety-net TTL. Instant revocation still holds for
-  the overwhelming common case via the shared DEL; the TTL also self-heals a
-  failed DEL.
+- **A shared write-through cache on an auth path must not let a best-effort write
+  outrace a revocation.** The first cut repopulated the cache from the auth
+  fallback with an unconditional write; on a shared store that re-introduced a
+  (smaller) instance of the very cross-replica staleness #309 set out to fix. The
+  tombstone + SETNX pairing makes revocation strictly win the race without needing
+  a DB re-check on every cache hit.
+- **Residual (now much narrower):** a revocation *write* that fails on a transient
+  Redis error after retries; bounded by the key TTL and moot when Redis is fully
+  down (FindByToken then errors → DB fallback → rejected).
 - **Out of scope (follow-up):** the app_bot internal `ab.registry`
   (`byUID`/`byID`, used by `user.SetAppBotResolver` for display-name resolution)
   has the same cross-instance staleness but only affects a cosmetic display name,

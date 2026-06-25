@@ -29,11 +29,27 @@ const appBotDegradeWarnInterval = 30 * time.Second
 
 // appBotDegradedCooldown is how long a Redis-command failure keeps the
 // best-effort write circuit open: while open, the DB-fallback cache warm-up
-// (Add) is skipped so a sustained Redis outage can't launch one blocking SET
+// (Warm) is skipped so a sustained Redis outage can't launch one blocking SETNX
 // (dial/write timeout × retries + pool wait) per auth request. The very request
 // that observes the failure trips the circuit before its own warm-up runs, so no
-// SET storm accumulates; writes resume once Redis has been healthy this long.
+// write storm accumulates; warm-ups resume once Redis has been healthy this long.
+// Authoritative writes (Add publish / Remove revoke) are NOT gated by it.
 const appBotDegradedCooldown = 5 * time.Second
+
+// appBotTombstone is the sentinel value a revocation writes to the shared key
+// instead of deleting it. A tombstone (a) positively denies the token on every
+// replica immediately, and (b) survives a racing best-effort Warm — which uses
+// SETNX and so cannot overwrite it — closing the repopulate-resurrection race
+// (a delayed auth-path warm-up landing just after a delete/unpublish DEL used to
+// re-create the just-revoked key). It is not valid spec JSON, so FindByToken
+// distinguishes it with an exact-value check before unmarshalling.
+const appBotTombstone = "\x00appbot:revoked"
+
+// appBotRevokeMaxAttempts bounds the retry on a revocation (tombstone) write so a
+// transient Redis blip doesn't silently leave a revoked token authenticating
+// until its key TTL. Kept small (the go-redis client already retries internally)
+// so an admin revoke isn't blocked too long on a degraded backend.
+const appBotRevokeMaxAttempts = 2
 
 // RedisAppBotRegistry is a SHARED, write-through Redis cache for App Bot auth
 // (issue #309). Replacing the per-process in-memory map with one shared store
@@ -43,20 +59,25 @@ const appBotDegradedCooldown = 5 * time.Second
 //
 // Authority model: the app_bot table (queryAppBotByToken + status==1 gate) is
 // the source of truth. This cache is a fast path in front of it:
-//   - FindByToken miss OR any Redis error -> nil -> authAppBot's DB fallback
-//     runs (fail safe; a Redis outage degrades to a correct, slower DB lookup,
-//     never to serving a stale/revoked spec).
-//   - mutators are best-effort write-through; the DB write in the admin handler
-//     already happened and is authoritative, so a Redis write error only costs
-//     a bounded window of staleness (keys carry the safety-net TTL below).
+//   - FindByToken miss, tombstone, OR any Redis error -> nil -> authAppBot's DB
+//     fallback runs (fail safe; a Redis outage degrades to a correct, slower DB
+//     lookup, never to serving a stale/revoked spec).
 //
-// Bounded-staleness contract (mirrors modules/incomingwebhook/cache.go):
-//   - Revocation is instant cross-instance via the shared DEL.
-//   - The only residual is a narrow cache-invalidation race: an auth miss that
-//     read the DB as still-valid immediately before a concurrent revocation can
-//     re-populate the just-deleted key. That re-add is bounded by the safety-net
-//     TTL (ttl()), after which the key expires and the next auth re-validates
-//     against the DB. The TTL also self-heals any drift from a failed DEL.
+// Write model (the asymmetry is load-bearing):
+//   - Add (authoritative publish / rotate-new): SET, overwrites any tombstone.
+//   - Warm (best-effort warm-up: auth-path repopulate + startup load): SETNX,
+//     never overwrites a tombstone or a fresher spec; circuit-gated so a Redis
+//     outage can't pile up blocking writes on the auth hot path.
+//   - Remove (revoke: unpublish / delete / rotate-old): writes a short-lived
+//     TOMBSTONE (not a DEL), with bounded retry + loud-on-failure.
+//
+// Revocation-resurrection is closed by the tombstone + SETNX pairing: a delayed
+// auth-path Warm can no longer re-create a just-revoked key, because Remove left
+// a tombstone there and SETNX won't overwrite it (and FindByToken denies on a
+// tombstone regardless). The only residual is a failed revocation WRITE on a
+// transient Redis error after retries — bounded by the key TTL, and moot when
+// Redis is fully down (FindByToken then errors -> DB fallback -> rejected). The
+// safety-net TTL (ttl(), clamped) also self-heals any orphaned key.
 type RedisAppBotRegistry struct {
 	log.Log
 	client *rd.Client
@@ -110,6 +131,11 @@ func (r *RedisAppBotRegistry) FindByToken(token string) *AppBotRegistrySpec {
 		r.noteRedisFailure("app bot auth cache GET failed, fail-safe to DB", err)
 		return nil
 	}
+	if val == appBotTombstone {
+		// Revoked: deny the cache hit and fall through to the DB, which is
+		// authoritative and will reject the deleted/unpublished bot.
+		return nil
+	}
 	var spec AppBotRegistrySpec
 	if uerr := json.Unmarshal([]byte(val), &spec); uerr != nil {
 		// Corrupt entry: drop it and miss to DB rather than trusting garbage.
@@ -120,45 +146,23 @@ func (r *RedisAppBotRegistry) FindByToken(token string) *AppBotRegistrySpec {
 	return &spec
 }
 
-// Add write-throughs a spec with the safety-net TTL. Best-effort: a failure is
-// logged (throttled) and ignored — the DB remains authoritative. The write and
-// the degraded-circuit skip both happen in set().
+// Add authoritatively write-throughs a spec (publish / rotate-new): an
+// unconditional SET that overwrites any tombstone so a re-publish re-enables the
+// token cluster-wide at once. Not circuit-gated — it is a low-frequency admin
+// write that must establish authoritative state even on a slow backend.
 func (r *RedisAppBotRegistry) Add(token string, spec *AppBotRegistrySpec) {
 	r.set(token, spec)
 }
 
-// Remove deletes the shared key, instantly revoking the token on every replica.
-func (r *RedisAppBotRegistry) Remove(token string) {
-	if token == "" {
-		return
-	}
-	if err := r.client.Del(appBotAuthKey(token)).Err(); err != nil {
-		// A failed DEL leaves a stale key until its TTL expires; log so ops can
-		// see it, but the bounded TTL is the backstop. Also trips the write circuit
-		// so concurrent warm-ups stop hammering a backend that's clearly degraded.
-		r.noteRedisFailure("app bot auth cache DEL failed (stale until TTL)", err)
-	}
-}
-
-// Update revokes the old token and write-throughs the new one. The DEL+SET are
-// not atomic, but each is on the shared store, so peers converge immediately;
-// the brief window only affects the rotating bot's own old/new tokens.
-func (r *RedisAppBotRegistry) Update(oldToken, newToken string, spec *AppBotRegistrySpec) {
-	r.Remove(oldToken)
-	r.set(newToken, spec)
-}
-
-func (r *RedisAppBotRegistry) set(token string, spec *AppBotRegistrySpec) {
+// Warm is a best-effort cache warm-up (DB-fallback auth-path repopulate + startup
+// load). It uses SETNX so it only ever fills an ABSENT key — it never overwrites
+// a concurrent revocation's tombstone or a fresher authoritative spec, so a
+// delayed warm-up cannot resurrect a just-revoked token. Circuit-gated so a Redis
+// outage can't pile up blocking writes on the auth hot path.
+func (r *RedisAppBotRegistry) Warm(token string, spec *AppBotRegistrySpec) {
 	if token == "" || spec == nil {
 		return
 	}
-	// Skip the best-effort write while the circuit is open (a recent Redis-command
-	// failure). This bounds BOTH the hot-path warm-up (Add, called via `go reg.Add`
-	// on the DB-fallback auth path) AND the rotate path (Update's new-token SET):
-	// under a sustained outage neither launches a doomed blocking SET (dial/write
-	// timeout × retries + pool wait); the DB is already authoritative and the next
-	// miss re-attempts once Redis heals. Remove's revocation DEL is deliberately NOT
-	// gated, so opening the circuit can never suppress a revocation's propagation.
 	if r.writesDegraded() {
 		return
 	}
@@ -167,8 +171,54 @@ func (r *RedisAppBotRegistry) set(token string, spec *AppBotRegistrySpec) {
 		r.warnDegraded("app bot auth spec marshal failed", err)
 		return
 	}
+	if err := r.client.SetNX(appBotAuthKey(token), payload, r.safeTTL()).Err(); err != nil {
+		r.noteRedisFailure("app bot auth cache warm (SETNX) failed", err)
+	}
+}
+
+// Remove revokes a token by writing a short-lived TOMBSTONE (not a DEL), so every
+// replica denies it immediately AND a racing Warm (SETNX) can't re-create the key.
+// Bounded retry + loud-on-failure: a transient blip must not silently leave the
+// token authenticating until TTL. Not circuit-gated — a revocation must always be
+// attempted, even when the backend is degraded.
+func (r *RedisAppBotRegistry) Remove(token string) {
+	if token == "" {
+		return
+	}
 	ttl := r.safeTTL()
-	if err := r.client.Set(appBotAuthKey(token), payload, ttl).Err(); err != nil {
+	var err error
+	for attempt := 1; attempt <= appBotRevokeMaxAttempts; attempt++ {
+		if err = r.client.Set(appBotAuthKey(token), appBotTombstone, ttl).Err(); err == nil {
+			return
+		}
+	}
+	// All attempts failed. When Redis is fully unreachable, FindByToken also errors
+	// → DB fallback → the revoked bot is rejected anyway; the only exposed case is a
+	// transient failure leaving an earlier spec key readable, bounded by its TTL.
+	r.noteRedisFailure("app bot auth cache revoke (tombstone SET) failed after retries; token may auth until key TTL", err)
+}
+
+// Update revokes the old token (tombstone) and authoritatively write-throughs the
+// new one. The two writes are not atomic, but each is on the shared store so peers
+// converge immediately; the new token is brand-new (no tombstone) so the SET wins.
+func (r *RedisAppBotRegistry) Update(oldToken, newToken string, spec *AppBotRegistrySpec) {
+	r.Remove(oldToken)
+	r.set(newToken, spec)
+}
+
+// set is the authoritative SET shared by Add and Update's new-token write. It is
+// NOT circuit-gated (see Add); a marshal failure is non-availability so it only
+// warns. A Redis-command failure trips the circuit (so best-effort Warms back off).
+func (r *RedisAppBotRegistry) set(token string, spec *AppBotRegistrySpec) {
+	if token == "" || spec == nil {
+		return
+	}
+	payload, err := json.Marshal(spec)
+	if err != nil {
+		r.warnDegraded("app bot auth spec marshal failed", err)
+		return
+	}
+	if err := r.client.Set(appBotAuthKey(token), payload, r.safeTTL()).Err(); err != nil {
 		r.noteRedisFailure("app bot auth cache SET failed", err)
 	}
 }

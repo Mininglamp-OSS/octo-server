@@ -96,32 +96,28 @@ func (ba *BotAPI) authAppBot(c *wkhttp.Context, token string) {
 		return
 	}
 
-	// Write-through repopulate the shared cache after an authoritative DB hit so
+	// Write-through WARM the shared cache after an authoritative DB hit so
 	// subsequent auths for this (valid, published) token are served from cache.
-	// Only ever caches a DB-confirmed valid+published spec, so a revoked token —
-	// whose DB row is gone (delete/rotate) or status!=1 (unpublish) — is rejected
-	// above and never re-added here. (Bounded-staleness note: a concurrent
-	// revocation landing between the DB read and this Add can briefly re-add the
-	// just-deleted key; it expires within the safety-net TTL — see
-	// RedisAppBotRegistry.)
 	//
-	// FIRE-AND-FORGET: this Add is a best-effort cache warm-up off the hot auth
-	// path. Running it inline would block every DB-fallback auth on a Redis SET —
-	// and when Redis is degraded (the exact case driving the fallback), that adds
-	// the client's write-timeout to each request. The DB lookup already produced
-	// the authoritative answer this request needs, so the repopulate runs in the
-	// background and the handler proceeds immediately.
+	// Warm (not Add) is deliberate and load-bearing: it is a best-effort SETNX that
+	// only fills an ABSENT key. A concurrent revoke writes a tombstone, which Warm
+	// won't overwrite (and FindByToken denies), so a warm-up that read the DB as
+	// valid just before a concurrent delete/unpublish can NOT resurrect the
+	// just-revoked key — closing the cross-replica repopulate race.
 	//
-	// The detached goroutine can't pile up under a sustained Redis outage:
-	// RedisAppBotRegistry.Add drops the write while its circuit is open (a recent
-	// Redis-command failure), so the goroutine returns without touching the pool.
+	// FIRE-AND-FORGET: running it inline would block every DB-fallback auth on a
+	// Redis write — and when Redis is degraded (the exact case driving the
+	// fallback), that adds the client's write-timeout to each request. The DB lookup
+	// already produced the authoritative answer this request needs, so the warm-up
+	// runs in the background. It can't pile up under a sustained outage either:
+	// RedisAppBotRegistry.Warm drops the write while its circuit is open.
 	if reg := GetAppBotRegistry(); reg != nil {
 		spec := &AppBotRegistrySpec{
 			UID:     appBot.UID,
 			Scope:   appBot.Scope,
 			SpaceID: appBot.SpaceID,
 		}
-		go reg.Add(token, spec)
+		go reg.Warm(token, spec)
 	}
 
 	c.Set(CtxKeyRobotID, appBot.UID)

@@ -24,7 +24,14 @@ type AppBotRegistrySpec struct {
 // safe, never serve a stale spec when the backend is degraded.
 type AppBotRegistryInterface interface {
 	FindByToken(token string) *AppBotRegistrySpec
+	// Add is an AUTHORITATIVE write (publish / rotate-new): it must establish the
+	// spec, overwriting any prior value (e.g. a revocation tombstone on re-publish).
 	Add(token string, spec *AppBotRegistrySpec)
+	// Warm is a BEST-EFFORT, NON-BLOCKING/BOUNDED warm-up (auth-path repopulate +
+	// startup load). It must never overwrite a concurrent revocation, and callers
+	// may invoke it from a detached goroutine on the hot path — implementations
+	// must keep it bounded (never an unbounded blocking write per call).
+	Warm(token string, spec *AppBotRegistrySpec)
 	Remove(token string)
 	Update(oldToken, newToken string, spec *AppBotRegistrySpec)
 }
@@ -81,6 +88,13 @@ func (a *AppBotRegistryAdapter) Add(token string, spec *AppBotRegistrySpec) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.byToken[token] = spec
+}
+
+// Warm mirrors Add for the in-memory adapter: it is single-process, so the
+// tombstone / SETNX semantics the shared Redis registry needs to close the
+// cross-replica resurrection race don't apply here.
+func (a *AppBotRegistryAdapter) Warm(token string, spec *AppBotRegistrySpec) {
+	a.Add(token, spec)
 }
 
 // Remove removes a spec by token.

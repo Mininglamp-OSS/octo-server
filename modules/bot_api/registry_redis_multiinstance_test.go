@@ -315,8 +315,92 @@ func TestAppBotDeletePropagatesToPeer(t *testing.T) {
 	}
 	regA.Remove(token)
 
-	// FIX assertion: peer rejects the deleted token (shared DEL -> DB fallback -> no row).
+	// FIX assertion: peer rejects the deleted token (shared revoke -> DB fallback -> no row).
 	if got := authStatus(t, ba, regB, token); got == http.StatusOK {
 		t.Errorf("🔴 peer replica still authorizes a DELETED token (HTTP %d)", got)
+	}
+}
+
+// TestAppBotWarmDoesNotResurrectRevokedToken is the regression for the P1 race:
+// a DB-fallback warm-up that read the bot as valid just before a concurrent
+// delete/unpublish must NOT re-create the just-revoked key cluster-wide. The fix:
+// a revoke writes a tombstone and Warm uses SETNX, so a late warm-up is a no-op and
+// FindByToken denies the tombstone. (Pre-fix, the warm-up was an unconditional SET
+// and would resurrect the key until TTL — authorizing a deleted bot on every peer.)
+func TestAppBotWarmDoesNotResurrectRevokedToken(t *testing.T) {
+	ctx := redisRegCtx(t)
+	ensureAppBotTable(t, ctx)
+	ba := &BotAPI{ctx: ctx, db: newBotAPIDB(ctx), Log: log.NewTLog("repro-309-resurrect")}
+	sqlDB := ctx.DB().DB
+
+	const (
+		id    = "repro309res_bot"
+		uid   = "repro309res_uid"
+		token = "app_res_309_tok_11111111"
+	)
+	spec := &AppBotRegistrySpec{UID: uid, Scope: "platform"}
+	regA := NewRedisAppBotRegistry(ctx, ttl5min)
+	regB := NewRedisAppBotRegistry(ctx, ttl5min)
+
+	cleanup := func() {
+		_, _ = sqlDB.Exec("DELETE FROM app_bot WHERE id=? OR uid=?", id, uid)
+		regA.Remove(token)
+	}
+	cleanup()
+	defer cleanup()
+
+	if _, err := sqlDB.Exec(
+		"INSERT INTO app_bot (id,uid,display_name,scope,space_id,status,token,created_by) "+
+			"VALUES (?,?,?,?,'',1,?,?)",
+		id, uid, "Repro 309 Resurrect Bot", "platform", token, "admin",
+	); err != nil {
+		t.Fatalf("insert app_bot: %v", err)
+	}
+	regA.Add(token, spec) // published + warm (authoritative SET clears the cleanup tombstone)
+
+	// Baseline: peer authorizes the published token (shared cache hit).
+	if got := authStatus(t, ba, regB, token); got != http.StatusOK {
+		t.Fatalf("baseline: peer should authorize published token, got HTTP %d", got)
+	}
+
+	// ---- Delete the bot on replica A: DB row removed + shared revoke (tombstone) ----
+	if _, err := sqlDB.Exec("DELETE FROM app_bot WHERE id=?", id); err != nil {
+		t.Fatalf("delete DB: %v", err)
+	}
+	regA.Remove(token)
+
+	// ---- A DELAYED warm-up now lands (model: a peer's auth read the DB as valid
+	// just before the delete and is only now repopulating). It must be a no-op. ----
+	regB.Warm(token, spec)
+
+	// The tombstone must survive the warm-up (SETNX did not overwrite it)...
+	if s := regB.FindByToken(token); s != nil {
+		t.Errorf("🔴 resurrection: warm-up re-created a revoked key (FindByToken returned %+v)", s)
+	}
+	// ...and auth must reject the deleted token on every replica.
+	if got := authStatus(t, ba, regB, token); got == http.StatusOK {
+		t.Errorf("🔴 resurrection: peer still authorizes a DELETED token after a racing warm-up (HTTP %d)", got)
+	}
+}
+
+// TestAppBotRepublishClearsTombstone asserts the authoritative Add (publish) path
+// overwrites a revocation tombstone, so a re-published token is served from the
+// cache again — i.e. the publish path must NOT use Warm's SETNX (which would leave
+// the tombstone in place until TTL).
+func TestAppBotRepublishClearsTombstone(t *testing.T) {
+	ctx := redisRegCtx(t)
+	reg := NewRedisAppBotRegistry(ctx, ttl5min)
+
+	const token = "app_republish_309_tok_22222222"
+	spec := &AppBotRegistrySpec{UID: "repub_uid", Scope: "platform"}
+	defer reg.Remove(token)
+
+	reg.Remove(token) // revoke -> tombstone
+	if s := reg.FindByToken(token); s != nil {
+		t.Fatalf("after revoke, FindByToken should deny (nil), got %+v", s)
+	}
+	reg.Add(token, spec) // authoritative re-publish overwrites the tombstone
+	if got := reg.FindByToken(token); got == nil || got.UID != "repub_uid" {
+		t.Errorf("re-publish should clear the tombstone and serve the spec, got %+v", got)
 	}
 }
