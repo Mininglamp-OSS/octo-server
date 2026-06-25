@@ -1,6 +1,8 @@
 package bot_api
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"sync"
 	"time"
@@ -13,7 +15,11 @@ import (
 )
 
 // appBotAuthKeyPrefix namespaces the App Bot auth cache in Redis. One key per
-// token: appbot:auth:{token} -> JSON(AppBotRegistrySpec).
+// token: appbot:auth:{sha256hex(token)} -> JSON(AppBotRegistrySpec). The token
+// is HASHED rather than embedded verbatim so a live bearer credential never
+// lands in a Redis key (visible to KEYS/MONITOR/RDB dumps/ops tooling). SHA-256
+// over the high-entropy token is sufficient — no salt needed, and the hash is
+// stable so every replica derives the same key.
 const appBotAuthKeyPrefix = "appbot:auth:"
 
 // degradeWarnInterval throttles fail-open warnings so a sustained Redis outage
@@ -73,7 +79,12 @@ func NewRedisAppBotRegistry(ctx *config.Context, ttl func() time.Duration) *Redi
 	}
 }
 
-func appBotAuthKey(token string) string { return appBotAuthKeyPrefix + token }
+// appBotAuthKey derives the Redis key for a token. The token is SHA-256 hashed
+// so the raw bearer credential never appears in a Redis key (see prefix doc).
+func appBotAuthKey(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return appBotAuthKeyPrefix + hex.EncodeToString(sum[:])
+}
 
 // FindByToken reads the shared cache. Miss (redis.Nil) and any other Redis error
 // both return nil so the caller falls through to the authoritative DB lookup —
@@ -141,7 +152,7 @@ func (r *RedisAppBotRegistry) set(token string, spec *AppBotRegistrySpec) {
 	}
 }
 
-// safeTTL coerces a missing/invalid TTL provider result to a 5-minute floor so a
+// safeTTL coerces a missing/invalid TTL provider result to a sane floor so a
 // misconfiguration can never write a never-expiring (0) or negative key.
 func (r *RedisAppBotRegistry) safeTTL() time.Duration {
 	if r.ttl == nil {
@@ -156,8 +167,8 @@ func (r *RedisAppBotRegistry) safeTTL() time.Duration {
 
 // defaultAppBotAuthCacheTTL is the fallback safety-net expiry when the injected
 // provider yields a non-positive value. Kept in sync with the system-settings
-// default in modules/common.
-const defaultAppBotAuthCacheTTL = 5 * time.Minute
+// default (defaultAppBotAuthCacheTTLSeconds) in modules/common.
+const defaultAppBotAuthCacheTTL = 60 * time.Second
 
 func (r *RedisAppBotRegistry) warnDegraded(msg string, err error) {
 	r.degradeMu.Lock()

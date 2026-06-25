@@ -29,21 +29,30 @@ type AppBotRegistryInterface interface {
 	Update(oldToken, newToken string, spec *AppBotRegistrySpec)
 }
 
-// appBotRegistryValue stores AppBotRegistryInterface, set by the app_bot module on init.
-var appBotRegistryValue atomic.Value
+// regHolder wraps the registry interface so the global can be stored through an
+// atomic.Pointer of a single concrete type. Using atomic.Value directly would
+// type-lock the slot to the first concrete implementation stored and panic if a
+// later Store used a different one (or nil) — which a test that swaps the
+// registry and then restores the previous (possibly nil) value needs to do.
+type regHolder struct{ r AppBotRegistryInterface }
+
+// appBotRegistry stores the global App Bot registry, set by the app_bot module
+// on init. Lock-free reads on the bot-auth hot path; Store(nil-holder safe).
+var appBotRegistry atomic.Pointer[regHolder]
 
 // SetAppBotRegistry sets the global App Bot registry (called by app_bot module).
+// A nil r is allowed (clears the slot back to "no registry").
 func SetAppBotRegistry(r AppBotRegistryInterface) {
-	appBotRegistryValue.Store(r)
+	appBotRegistry.Store(&regHolder{r: r})
 }
 
-// GetAppBotRegistry returns the global App Bot registry.
+// GetAppBotRegistry returns the global App Bot registry, or nil if unset/cleared.
 func GetAppBotRegistry() AppBotRegistryInterface {
-	v := appBotRegistryValue.Load()
-	if v == nil {
+	h := appBotRegistry.Load()
+	if h == nil {
 		return nil
 	}
-	return v.(AppBotRegistryInterface)
+	return h.r
 }
 
 // AppBotRegistryAdapter adapts an external registry to AppBotRegistryInterface.

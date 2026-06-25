@@ -708,9 +708,11 @@ const (
 	// defaultAppBotAuthCacheTTLSeconds is the safety-net expiry (seconds) for the
 	// shared Redis App Bot auth cache. Revocation is instant via the shared DEL;
 	// this TTL only bounds drift / the narrow re-populate race (see
-	// modules/bot_api/registry_redis.go). 5 min balances a tight revocation bound
-	// against re-validating active tokens against the DB only ~once per TTL.
-	defaultAppBotAuthCacheTTLSeconds = 300
+	// modules/bot_api/registry_redis.go). 60s keeps the worst-case staleness
+	// window (a failed DEL, or the re-populate race) tight while still serving
+	// active tokens from cache between DB re-validations. Kept in sync with
+	// defaultAppBotAuthCacheTTL in modules/bot_api/registry_redis.go.
+	defaultAppBotAuthCacheTTLSeconds = 60
 	// appBotAuthCacheTTLMinSeconds / Max bound an admin override to a sane window
 	// (does not use getIntClamped, whose [0,3650] range is tuned for "days").
 	appBotAuthCacheTTLMinSeconds = 30

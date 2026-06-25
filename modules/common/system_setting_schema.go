@@ -120,6 +120,13 @@ var systemSettingSchema = []settingDef{
 	{Category: "incomingwebhook", Key: "member_can_broadcast", Type: settingTypeBool, Description: "非管理员成员创建的 Webhook 是否可用广播型 @（@所有人/@所有 AI）；关闭后即时收回成员广播，管理员创建的不受影响",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.IncomingWebhookMemberCanBroadcast()) }},
 
+	// App Bot 共享鉴权缓存的安全网 TTL（秒）。吊销靠共享 DEL 即时生效，此 TTL 仅兜底
+	// DEL 失败 / 极窄的失效-回填竞态（见 modules/bot_api/registry_redis.go）。实时热更新
+	// 无需重启；读取侧再夹紧到 [30, 86400]，超界回落默认值。标记 Positive 以放开
+	// settingTypeInt 默认的 [0,3650] 上界（本键上限 86400）。
+	{Category: "app_bot", Key: "auth_cache_ttl_seconds", Type: settingTypeInt, Description: "App Bot 鉴权缓存安全网 TTL(秒)，吊销即时生效，此值仅兜底失效竞态；范围[30,86400]", Positive: true,
+		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.AppBotAuthCacheTTLSeconds()) }},
+
 	// Email server config — formerly yaml-only (Support.* in config.go).
 	{Category: "support", Key: "email", Type: settingTypeString, Description: "技术支持邮箱（发件人）",
 		Effective: func(s *SystemSettings) string { return s.SupportEmail() }},

@@ -41,6 +41,13 @@ func redisRegCtx(t *testing.T) *config.Context {
 	cfg := config.New()
 	cfg.DB.MySQLAddr = envOr("DM_REPRO_MYSQL", "root:demo@tcp(127.0.0.1:3306)/test?charset=utf8mb4&parseTime=true")
 	cfg.DB.RedisAddr = envOr("DM_REPRO_REDIS", "127.0.0.1:6379")
+	// Bound the pool: this test opens a fresh *config.Context (its own pool) on top
+	// of whatever the rest of the suite holds, all against one MySQL. The default
+	// 100 max-open conns × N such contexts can exhaust max_connections under the
+	// CI's parallel job (the "Error 1040: Too many connections" flake, #419). Two
+	// connections is plenty for this serial probe.
+	cfg.DB.MySQLMaxOpenConns = 2
+	cfg.DB.MySQLMaxIdleConns = 1
 	ctx := config.NewContext(cfg)
 	if err := ctx.DB().DB.Ping(); err != nil {
 		t.Skipf("MySQL unreachable (%s): %v", cfg.DB.MySQLAddr, err)
@@ -79,6 +86,11 @@ func ensureAppBotTable(t *testing.T, ctx *config.Context) {
 // reg, with the given bearer token. 200 = authorized, non-200 = rejected.
 func authStatus(t *testing.T, ba *BotAPI, reg AppBotRegistryInterface, token string) int {
 	t.Helper()
+	// Save and restore the process-global registry so this test doesn't leak its
+	// RedisAppBotRegistry into sibling tests in the package (restoring a nil prev
+	// is safe now that the slot is an atomic.Pointer holder).
+	prev := GetAppBotRegistry()
+	t.Cleanup(func() { SetAppBotRegistry(prev) })
 	SetAppBotRegistry(reg) // route the request to "this replica"
 
 	r := wkhttp.New()

@@ -58,6 +58,38 @@ Option A by the maintainer:
   + `make i18n-lint` clean (no new error codes / raw responses); existing
   bot_api adapter unit tests pass.
 
+## Review hardening (PR #458)
+
+Four reviewer approvals surfaced fixes folded into the same PR (no behaviour
+change to the fix's contract; all reduce blast radius / tighten the staleness
+window):
+
+- **Token never stored verbatim in a Redis key.** `appBotAuthKey` now hashes the
+  bearer token with SHA-256 (`appbot:auth:{sha256hex(token)}`) so a live
+  credential can't leak via `KEYS`/`MONITOR`/RDB dumps. The hash is stable, so
+  every replica still derives the same key.
+- **Default safety-net TTL lowered 300s → 60s** (both `defaultAppBotAuthCacheTTL`
+  in registry_redis.go and `defaultAppBotAuthCacheTTLSeconds` in
+  modules/common, kept in sync). Tightens the worst-case window for a failed DEL
+  or the re-populate race from 5 min to 1 min; operators can still retune via
+  `app_bot.auth_cache_ttl_seconds` (clamped [30, 86400]).
+- **The TTL knob is now registered in `systemSettingSchema`** (category `app_bot`,
+  `Positive: true` to opt out of the day-window [0,3650] int bound) so the admin
+  API accepts writes to it instead of rejecting an unknown key.
+- **DB-fallback write-through Add is fire-and-forget** (`go reg.Add(...)`). The DB
+  lookup already produced the authoritative answer; the cache warm-up must not
+  block the auth response on a Redis SET — critical when Redis is degraded (the
+  exact condition that drove the fallback), where an inline SET would add the
+  client write-timeout to every request.
+- **Global registry slot switched to `atomic.Pointer[regHolder]`** so it accepts a
+  nil/clearing Store and differing concrete types — `atomic.Value` type-locked the
+  slot to the first implementation stored, which prevented a test from restoring
+  the previous (possibly nil) registry. Lock-free reads on the hot path preserved.
+- **Test hygiene:** the multi-instance test now `t.Cleanup`-restores the global
+  registry (no leak into sibling tests) and bounds its `*config.Context` pool
+  (`MySQLMaxOpenConns=2 / MaxIdleConns=1`) so it stops aggravating the parallel-CI
+  "Error 1040: Too many connections" flake (#419).
+
 ## Learnings / decisions
 
 - **Fail-safe direction matters for an auth cache.** A cache backend error must

@@ -103,12 +103,20 @@ func (ba *BotAPI) authAppBot(c *wkhttp.Context, token string) {
 	// revocation landing between the DB read and this Add can briefly re-add the
 	// just-deleted key; it expires within the safety-net TTL — see
 	// RedisAppBotRegistry.)
+	//
+	// FIRE-AND-FORGET: this Add is a best-effort cache warm-up off the hot auth
+	// path. Running it inline would block every DB-fallback auth on a Redis SET —
+	// and when Redis is degraded (the exact case driving the fallback), that adds
+	// the client's write-timeout to each request. The DB lookup already produced
+	// the authoritative answer this request needs, so the repopulate runs in the
+	// background and the handler proceeds immediately.
 	if reg := GetAppBotRegistry(); reg != nil {
-		reg.Add(token, &AppBotRegistrySpec{
+		spec := &AppBotRegistrySpec{
 			UID:     appBot.UID,
 			Scope:   appBot.Scope,
 			SpaceID: appBot.SpaceID,
-		})
+		}
+		go reg.Add(token, spec)
 	}
 
 	c.Set(CtxKeyRobotID, appBot.UID)
