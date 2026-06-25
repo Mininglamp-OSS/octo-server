@@ -17,6 +17,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/bot_api"
+	octocommon "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botutil"
@@ -88,9 +89,15 @@ func NewAppBot(ctx *config.Context) *AppBot {
 		return spec.DisplayName
 	})
 
-	// Eagerly initialize auth registry so operations never encounter nil.
-	// loadRegistryFromDB will populate this same adapter from DB.
-	authRegistry := bot_api.NewAppBotRegistryAdapter()
+	// Eagerly initialize the shared Redis auth registry so operations never
+	// encounter nil; loadRegistryFromDB warms it from DB. Using a SHARED Redis
+	// store (instead of a per-process map) is what makes token revocation take
+	// effect on every replica immediately — see issue #309. The safety-net TTL is
+	// pulled live from system_settings so an operator can retune it without a
+	// deploy (bot_api stays decoupled from the settings package via this closure).
+	authRegistry := bot_api.NewRedisAppBotRegistry(ctx, func() time.Duration {
+		return time.Duration(octocommon.EnsureSystemSettings(ctx).AppBotAuthCacheTTLSeconds()) * time.Second
+	})
 	bot_api.SetAppBotRegistry(authRegistry)
 
 	// Populate registry from DB in background
@@ -243,8 +250,8 @@ func (r *Registry) Remove(id, uid string) {
 	delete(r.byID, id)
 }
 
-// loadRegistryFromDB loads all published App Bots into memory.
-func (ab *AppBot) loadRegistryFromDB(authRegistry *bot_api.AppBotRegistryAdapter) {
+// loadRegistryFromDB warms the shared auth registry with all published App Bots.
+func (ab *AppBot) loadRegistryFromDB(authRegistry bot_api.AppBotRegistryInterface) {
 	var bots []*appBotModel
 	var err error
 	for attempt := 1; attempt <= 3; attempt++ {
@@ -928,9 +935,11 @@ func (ab *AppBot) unpublishBot(c *wkhttp.Context) {
 	c.ResponseOK()
 }
 
-// syncAuthRegistry adds an app bot to the bot_api auth registry.
+// syncAuthRegistry write-throughs an app bot into the shared auth registry.
+// Goes through the interface (not a concrete type) so the production Redis
+// registry and the in-memory test adapter are both driven identically.
 func (ab *AppBot) syncAuthRegistry(token, uid, scope, spaceID string) {
-	if r, ok := bot_api.GetAppBotRegistry().(*bot_api.AppBotRegistryAdapter); ok && r != nil {
+	if r := bot_api.GetAppBotRegistry(); r != nil {
 		r.Add(token, &bot_api.AppBotRegistrySpec{
 			UID:     uid,
 			Scope:   scope,
@@ -939,16 +948,16 @@ func (ab *AppBot) syncAuthRegistry(token, uid, scope, spaceID string) {
 	}
 }
 
-// removeAuthRegistry removes an app bot from the bot_api auth registry.
+// removeAuthRegistry revokes an app bot's token in the shared auth registry.
 func (ab *AppBot) removeAuthRegistry(token string) {
-	if r, ok := bot_api.GetAppBotRegistry().(*bot_api.AppBotRegistryAdapter); ok && r != nil {
+	if r := bot_api.GetAppBotRegistry(); r != nil {
 		r.Remove(token)
 	}
 }
 
-// updateAuthRegistry atomically swaps a spec from oldToken to newToken in the bot_api auth registry.
+// updateAuthRegistry revokes oldToken and write-throughs newToken in the shared auth registry.
 func (ab *AppBot) updateAuthRegistry(oldToken, newToken, uid, scope, spaceID string) {
-	if r, ok := bot_api.GetAppBotRegistry().(*bot_api.AppBotRegistryAdapter); ok && r != nil {
+	if r := bot_api.GetAppBotRegistry(); r != nil {
 		r.Update(oldToken, newToken, &bot_api.AppBotRegistrySpec{
 			UID:     uid,
 			Scope:   scope,

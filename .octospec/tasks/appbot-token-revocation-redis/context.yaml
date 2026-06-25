@@ -1,0 +1,50 @@
+# Rules resolved for this task (octospec Implement phase).
+slug: appbot-token-revocation-redis
+resolved_at: 2026-06-25T01:52:00Z
+
+rules_injected:
+  - id: space-isolation
+    tier: repo
+    load_bearing: true
+    why: >
+      App Bot auth resolves token -> {UID, Scope, SpaceID}; Scope/SpaceID gate
+      space-scoped bot send permission downstream. The cached value must stay
+      consistent with the DB row and must fail SAFE (Redis error -> authoritative
+      DB fallback, never fail-open on a revoked token). Bot ownership/identity is
+      the security boundary.
+    applied:
+      - Redis FindByToken returns nil on miss AND on Redis error -> existing DB
+        fallback (queryAppBotByToken + status==1 gate) remains the authority.
+      - Revocation (rotate/unpublish/delete) DELs the shared Redis key so all
+        replicas stop serving the spec; DB stays source of truth.
+  - id: error-handling
+    tier: repo
+    load_bearing: true
+    why: modules/bot_api/auth.go is touched; auth-failure responses are a client wire contract.
+    applied:
+      - No new error codes; auth path keeps existing i18n helpers
+        (respondBotAPIAuthFailed / AuthCheckFailed / BotUnavailable).
+      - Redis cache errors are internal (logged, throttled), never surfaced as a
+        new user-facing error; anti-enumeration single-failure response unchanged.
+      - Run make i18n-extract-check + i18n-lint (expect clean; no code changes).
+  - id: testing
+    tier: repo
+    load_bearing: false
+    applied:
+      - Regression test bounds its own DB pool via config; cleans app_bot rows.
+      - Requires MySQL(+MariaDB-compatible) + Redis; gated by env, skips otherwise.
+  - id: commit-style
+    tier: repo
+    load_bearing: false
+    applied:
+      - Conventional Commits (fix:), English; PR links Fixes #309.
+
+notes:
+  - bot_api stays decoupled from modules/common: the TTL is injected as a
+    func() time.Duration provider; app_bot (which wires the registry) builds the
+    closure over common.EnsureSystemSettings(ctx).
+  - Accepted, documented residual: a cache-invalidation race where an auth miss
+    that read the DB as valid just before a concurrent revocation can re-populate
+    the just-deleted key; bounded by the safety-net TTL (system_settings
+    app_bot.auth_cache_ttl_seconds, default 300s). Mirrors the documented
+    bounded-staleness contract of modules/incomingwebhook/cache.go.

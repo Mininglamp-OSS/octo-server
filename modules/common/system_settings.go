@@ -699,3 +699,33 @@ func incomingWebhookMaxPerCreatorEnvDefault() int {
 	}
 	return defaultIncomingWebhookMaxPerCreator
 }
+
+// ---------------------------------------------------------------------------
+// App Bot auth cache (issue #309)
+// ---------------------------------------------------------------------------
+
+const (
+	// defaultAppBotAuthCacheTTLSeconds is the safety-net expiry (seconds) for the
+	// shared Redis App Bot auth cache. Revocation is instant via the shared DEL;
+	// this TTL only bounds drift / the narrow re-populate race (see
+	// modules/bot_api/registry_redis.go). 5 min balances a tight revocation bound
+	// against re-validating active tokens against the DB only ~once per TTL.
+	defaultAppBotAuthCacheTTLSeconds = 300
+	// appBotAuthCacheTTLMinSeconds / Max bound an admin override to a sane window
+	// (does not use getIntClamped, whose [0,3650] range is tuned for "days").
+	appBotAuthCacheTTLMinSeconds = 30
+	appBotAuthCacheTTLMaxSeconds = 86400
+)
+
+// AppBotAuthCacheTTLSeconds is the safety-net TTL (seconds) written with each
+// shared App Bot auth cache key. Read from system_setting (category "app_bot",
+// key "auth_cache_ttl_seconds"); hot-reloaded with the rest of the snapshot, so
+// an operator can retune it without a deploy. Out-of-range values fall back to
+// the code default rather than being served verbatim (defence in depth).
+func (s *SystemSettings) AppBotAuthCacheTTLSeconds() int {
+	v := s.getInt("app_bot", "auth_cache_ttl_seconds", defaultAppBotAuthCacheTTLSeconds)
+	if v < appBotAuthCacheTTLMinSeconds || v > appBotAuthCacheTTLMaxSeconds {
+		return defaultAppBotAuthCacheTTLSeconds
+	}
+	return v
+}

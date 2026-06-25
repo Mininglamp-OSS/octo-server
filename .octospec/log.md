@@ -4,6 +4,15 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-06-25
+
+- **Add** — Task `appbot-token-revocation-redis` (#309): replace the per-process
+  in-memory App Bot auth registry with a shared Redis write-through cache so
+  token revocation (rotate/unpublish/delete) takes effect on every replica
+  immediately; DB stays authoritative (auth fails safe to DB on Redis error).
+  Safety-net TTL via system_settings (`app_bot.auth_cache_ttl_seconds`, no new
+  env var). Regression test asserts a revoked token is rejected on a peer replica.
+
 ## 2026-06-24
 
 - **Add** — Task `incomingwebhook-webhooks-alias` (#455): `/v1/webhooks/{id}/{token}`

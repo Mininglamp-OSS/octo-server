@@ -95,6 +95,22 @@ func (ba *BotAPI) authAppBot(c *wkhttp.Context, token string) {
 		return
 	}
 
+	// Write-through repopulate the shared cache after an authoritative DB hit so
+	// subsequent auths for this (valid, published) token are served from cache.
+	// Only ever caches a DB-confirmed valid+published spec, so a revoked token —
+	// whose DB row is gone (delete/rotate) or status!=1 (unpublish) — is rejected
+	// above and never re-added here. (Bounded-staleness note: a concurrent
+	// revocation landing between the DB read and this Add can briefly re-add the
+	// just-deleted key; it expires within the safety-net TTL — see
+	// RedisAppBotRegistry.)
+	if reg := GetAppBotRegistry(); reg != nil {
+		reg.Add(token, &AppBotRegistrySpec{
+			UID:     appBot.UID,
+			Scope:   appBot.Scope,
+			SpaceID: appBot.SpaceID,
+		})
+	}
+
 	c.Set(CtxKeyRobotID, appBot.UID)
 	c.Set(CtxKeyBotKind, BotKindApp)
 	c.Set(CtxKeyAppBotScope, appBot.Scope)

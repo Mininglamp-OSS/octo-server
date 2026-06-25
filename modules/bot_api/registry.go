@@ -12,9 +12,21 @@ type AppBotRegistrySpec struct {
 	SpaceID string
 }
 
-// AppBotRegistryInterface is the interface for App Bot in-memory registry lookup.
+// AppBotRegistryInterface is the App Bot auth registry: a token -> spec lookup
+// plus the mutators the app_bot admin handlers call on publish/rotate/unpublish/
+// delete. Two implementations satisfy it: AppBotRegistryAdapter (in-memory,
+// single-process — used by unit tests) and RedisAppBotRegistry (shared write-
+// through cache — used in production so revocations propagate across replicas;
+// see issue #309).
+//
+// FindByToken returns nil on a miss AND on any backend error, so the caller
+// (authAppBot) falls through to the authoritative DB lookup — auth must fail
+// safe, never serve a stale spec when the backend is degraded.
 type AppBotRegistryInterface interface {
 	FindByToken(token string) *AppBotRegistrySpec
+	Add(token string, spec *AppBotRegistrySpec)
+	Remove(token string)
+	Update(oldToken, newToken string, spec *AppBotRegistrySpec)
 }
 
 // appBotRegistryValue stores AppBotRegistryInterface, set by the app_bot module on init.
