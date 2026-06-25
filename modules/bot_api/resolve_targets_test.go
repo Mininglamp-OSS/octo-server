@@ -339,13 +339,9 @@ func TestResolveTargets_AppBotReturnsEmpty(t *testing.T) {
 	reg.Add(appToken, &AppBotRegistrySpec{UID: "appbot_rt_uid", Scope: "platform"})
 	prev := GetAppBotRegistry()
 	SetAppBotRegistry(reg)
-	t.Cleanup(func() {
-		if prev != nil {
-			SetAppBotRegistry(prev)
-		} else {
-			SetAppBotRegistry(NewAppBotRegistryAdapter())
-		}
-	})
+	// Restore unconditionally — the registry slot is an atomic.Pointer[regHolder],
+	// so SetAppBotRegistry(nil) is safe (restores the "no registry" state).
+	t.Cleanup(func() { SetAppBotRegistry(prev) })
 
 	// Seed a group with a matching name but no app-bot membership.
 	seedGroup(t, ctx, "g_rt_app", "应用群", "space_1")

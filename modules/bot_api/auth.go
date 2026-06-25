@@ -62,8 +62,9 @@ func (ba *BotAPI) authUserBot(c *wkhttp.Context, token string) {
 }
 
 // authAppBot authenticates an App Bot.
-// Primary path: O(1) in-memory Registry lookup (design doc §4.1).
-// Fallback: DB query (covers startup race where registry not yet loaded).
+// Primary path: O(1) shared registry/cache lookup (design doc §4.1).
+// Fallback: DB query (covers a cache miss/error or a startup race where the
+// registry is not yet loaded); the DB row + status==1 gate stays authoritative.
 func (ba *BotAPI) authAppBot(c *wkhttp.Context, token string) {
 	// Try in-memory Registry first (O(1))
 	if spec := ba.lookupAppBotRegistry(token); spec != nil {
@@ -132,8 +133,9 @@ func (ba *BotAPI) authAppBot(c *wkhttp.Context, token string) {
 	c.Next()
 }
 
-// lookupAppBotRegistry queries the global App Bot Registry (O(1) memory lookup).
-// Returns nil if registry not initialized or token not found.
+// lookupAppBotRegistry queries the global App Bot registry (O(1) shared
+// registry/cache lookup). Returns nil if the registry is not initialized or the
+// token is not found (a miss/error falls through to the authoritative DB lookup).
 func (ba *BotAPI) lookupAppBotRegistry(token string) *AppBotRegistrySpec {
 	reg := GetAppBotRegistry()
 	if reg == nil {

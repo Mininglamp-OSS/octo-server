@@ -121,19 +121,9 @@ func (r *RedisAppBotRegistry) FindByToken(token string) *AppBotRegistrySpec {
 }
 
 // Add write-throughs a spec with the safety-net TTL. Best-effort: a failure is
-// logged (throttled) and ignored — the DB remains authoritative.
-//
-// While the write circuit is open (a recent Redis-command failure), the warm-up
-// is skipped entirely. The DB-fallback auth path calls Add via `go reg.Add(...)`;
-// without this guard a sustained Redis outage would spawn one goroutine blocking
-// on a doomed SET (dial/write timeout × retries + pool wait) per auth request,
-// piling up goroutines and pool waiters for the exact failure this cache rides
-// out. Dropping the warm-up is harmless — the DB already produced the
-// authoritative answer, and the next miss re-attempts once Redis heals.
+// logged (throttled) and ignored — the DB remains authoritative. The write and
+// the degraded-circuit skip both happen in set().
 func (r *RedisAppBotRegistry) Add(token string, spec *AppBotRegistrySpec) {
-	if r.writesDegraded() {
-		return
-	}
 	r.set(token, spec)
 }
 
@@ -160,6 +150,16 @@ func (r *RedisAppBotRegistry) Update(oldToken, newToken string, spec *AppBotRegi
 
 func (r *RedisAppBotRegistry) set(token string, spec *AppBotRegistrySpec) {
 	if token == "" || spec == nil {
+		return
+	}
+	// Skip the best-effort write while the circuit is open (a recent Redis-command
+	// failure). This bounds BOTH the hot-path warm-up (Add, called via `go reg.Add`
+	// on the DB-fallback auth path) AND the rotate path (Update's new-token SET):
+	// under a sustained outage neither launches a doomed blocking SET (dial/write
+	// timeout × retries + pool wait); the DB is already authoritative and the next
+	// miss re-attempts once Redis heals. Remove's revocation DEL is deliberately NOT
+	// gated, so opening the circuit can never suppress a revocation's propagation.
+	if r.writesDegraded() {
 		return
 	}
 	payload, err := json.Marshal(spec)
