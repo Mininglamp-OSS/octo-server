@@ -200,6 +200,26 @@ jobs:
           echo "mysql did not become ready" >&2
           exit 1
 
+      - name: Raise MySQL max_connections
+        # Flaky "Error 1040: Too many connections" guard (#419).
+        #
+        # testutil.NewTestServer (octo-lib) builds a fresh *config.Context per
+        # call, each lazily opening its own *sql.DB pool sized 100 max / 10 idle
+        # (config.New() default — hardcoded, NOT env-tunable) with a 4h conn
+        # lifetime and no idle-reap. Nothing closes those pools, so a heavy
+        # package that calls NewTestServer dozens of times (modules/user ≈ 34)
+        # accumulates ~8 lingering connections per call and intermittently
+        # exhausts the mysql:8.0 default max_connections=151 — whichever test is
+        # unlucky under -shuffle=on then panics. Reproduced locally: the suite
+        # crosses 151 around the 19th NewTestServer call; at a 1000 ceiling it
+        # plateaus near the observed peak (~300) and stays green.
+        #
+        # max_connections is a dynamic GLOBAL, so set it at runtime (root is
+        # available and mysql-client is installed above). This unblocks every
+        # package at once; the proper O(1) fix — idle-reap in octo-lib testutil
+        # — is tracked upstream.
+        run: mysql -h 127.0.0.1 -uroot -pdemo -e "SET GLOBAL max_connections = 1000;"
+
       - name: Wait for WuKongIM
         run: |
           for _ in $(seq 1 30); do
