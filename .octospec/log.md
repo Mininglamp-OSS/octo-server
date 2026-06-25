@@ -6,6 +6,16 @@ change-log convention (§7). Newest first.
 
 ## 2026-06-25
 
+- **Add** — Task `incoming-webhook-mention-config`: moved the incoming-webhook
+  `@mention` from a caller-supplied push-body param to webhook create/update
+  config (new `mention_uids` column + `AllowMention*` switches). The push
+  endpoint no longer reads `mention` from the body; targets are validated at the
+  management boundary and re-filtered to current members at push time. Removing
+  the body-source also removed the native-only `allowMention` gate, so mention
+  now applies across **all** adapter endpoints (native + github/wecom/gitlab/
+  feishu/multica). Deleted the now-dead caller-supplied entity machinery. Brief +
+  context under `.octospec/tasks/incoming-webhook-mention-config/`, journal
+  `.octospec/journal/shared/incoming-webhook-mention-config.md`.
 - **Add** — Task `appbot-token-revocation-redis` (#309): replace the per-process
   in-memory App Bot auth registry with a shared Redis write-through cache so
   token revocation (rotate/unpublish/delete) takes effect on every replica

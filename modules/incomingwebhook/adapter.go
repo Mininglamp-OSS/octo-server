@@ -49,16 +49,17 @@ type pushAdapter struct {
 	// 说明 URL token 已验证、调用方已持有 webhook 真正密钥，故不匹配是配置错误而非枚举
 	// 探测（见 handlePush）。nil 表示该形态无需 header token 二次校验。
 	verifyToken func(header http.Header, urlToken string) bool
-	// allowMention 标记该形态是否处理请求里的 mention（@ 群成员/广播）。仅 native 置真：
-	// @ 由调用方在 native payload 里显式描述（mentionReq），平台适配器(github/wecom/…)
-	// 的 body 是平台生成的事件、没有 octo 成员 UID 语义，强行支持 @ 需要平台身份↔群成员
-	// 的映射表，超出本期范围。置假的形态即便 parse 出 req.Mention 也一律忽略（防御纵深）。
-	allowMention bool
 }
 
+// 说明：@ 提及不再有 per-adapter 开关。@ 目标改为【创建/修改 webhook 时配置】
+// （incomingWebhookModel.MentionUids + AllowMention* 开关），不再来自请求 body，因此与
+// body 解析方式无关——handlePush 对【所有】推送形态（native + github/wecom/gitlab/feishu/
+// multica）一律按 webhook 配置构造 mention。这正是「配置驱动」相对「body 驱动」的收益：
+// 平台适配器的 body 是平台生成事件、没有 octo 成员 UID 语义，过去无法支持 @，现在 @ 由
+// 配置提供，所有适配器都能携带（见 #297 历史注释与本次需求调整）。
+
 var (
-	// 仅 native 形态支持 @：调用方在 payload 里用 mention{uids,all,bots} 显式描述。
-	nativeAdapter = pushAdapter{name: adapterNative, parse: parseNativePush, bodyLimit: maxBytes, allowMention: true}
+	nativeAdapter = pushAdapter{name: adapterNative, parse: parseNativePush, bodyLimit: maxBytes}
 	githubAdapter = pushAdapter{name: adapterGitHub, parse: parseGitHubPush, bodyLimit: githubMaxBytes}
 	wecomAdapter  = pushAdapter{
 		name:      adapterWeCom,

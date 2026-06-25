@@ -1,7 +1,6 @@
 package incomingwebhook
 
 import (
-	"encoding/json"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
@@ -11,8 +10,8 @@ import (
 )
 
 // mention 核心逻辑的纯单测（无 DB/Redis/IM 依赖）：装配决策矩阵、去重/上限、布尔助手、
-// native body 解析，以及【与 ExpandAisToBotUIDs 的 parity】——装配出的线协议形态必须能被
-// 真实展开器消费。IO（成员闸 filterGroupMembers / fetchBotMemberUIDs）由集成测试覆盖。
+// 配置列解析（parseMentionUIDs），以及【与 ExpandAisToBotUIDs 的 parity】——装配出的线协议
+// 形态必须能被真实展开器消费。IO（成员闸 filterGroupMembers）由集成测试覆盖。
 
 func memberSet(uids ...string) map[string]struct{} {
 	m := make(map[string]struct{}, len(uids))
@@ -135,6 +134,19 @@ func TestDedupNonEmpty(t *testing.T) {
 	})
 }
 
+// TestParseMentionUIDs pins the lenient decode of the config column mention_uids
+// (a JSON array string). Empty / malformed → nil ("no targeted @"); valid → the
+// list (config is validated at write time, so read-side leniency is just defense
+// in depth — a bad row must never break a push).
+func TestParseMentionUIDs(t *testing.T) {
+	assert.Nil(t, parseMentionUIDs(""), "empty → no @")
+	assert.Equal(t, []string{"u1", "bot_b"}, parseMentionUIDs(`["u1","bot_b"]`))
+	assert.Equal(t, []string{}, parseMentionUIDs(`[]`), "empty array decodes to empty slice")
+	for _, bad := range []string{`not json`, `{"uids":["a"]}`, `["a",1]`, `"a"`, `123`} {
+		assert.Nilf(t, parseMentionUIDs(bad), "malformed %q → nil", bad)
+	}
+}
+
 func TestBoolHelpers(t *testing.T) {
 	tr, fa := true, false
 	assert.False(t, boolPtrTrue(nil))
@@ -161,79 +173,49 @@ func TestMaxMentionUIDs(t *testing.T) {
 	})
 }
 
-// TestParseNativePushMention verifies the `mention` field is captured as raw JSON
-// by the native parser and — crucially — that a MALFORMED mention never fails the
-// parse (acceptance #6: it must degrade to "no mention", not 400 the whole push).
-func TestParseNativePushMention(t *testing.T) {
-	t.Run("valid mention captured raw and decodes", func(t *testing.T) {
-		req, skip, invalid := parseNativePush(nil,
-			[]byte(`{"content":"hi","mention":{"uids":["u1","u2"],"all":true,"bots":true}}`))
-		require.NotNil(t, req)
-		assert.Empty(t, skip)
-		assert.Empty(t, invalid)
-		mr, ok := decodeMention(req.Mention)
-		require.True(t, ok)
-		assert.Equal(t, []string{"u1", "u2"}, mr.Uids)
-		assert.True(t, mr.All)
-		assert.True(t, mr.Bots)
-	})
-	t.Run("mention absent -> empty raw, decode not ok (backward compatible)", func(t *testing.T) {
-		req, _, invalid := parseNativePush(nil, []byte(`{"content":"hi"}`))
-		require.NotNil(t, req)
-		assert.Empty(t, invalid)
-		assert.Empty(t, req.Mention)
-		_, ok := decodeMention(req.Mention)
-		assert.False(t, ok)
-	})
-	t.Run("malformed mention does NOT fail the parse (acceptance #6)", func(t *testing.T) {
-		for _, body := range []string{
-			`{"content":"hi","mention":"please"}`,
-			`{"content":"hi","mention":{"uids":"alice"}}`,
-			`{"content":"hi","mention":{"uids":[1,2]}}`,
-			`{"content":"hi","mention":{"all":1}}`,
-			`{"content":"hi","mention":[]}`,
-		} {
-			req, _, invalid := parseNativePush(nil, []byte(body))
-			require.NotNilf(t, req, "body=%s", body)
-			assert.Emptyf(t, invalid, "malformed mention must not invalidate the parse: %s", body)
-			_, ok := decodeMention(req.Mention)
-			assert.Falsef(t, ok, "malformed mention must decode as not-ok: %s", body)
-		}
-	})
+func TestIsTextMention(t *testing.T) {
+	assert.True(t, isTextMention(&pushPayloadReq{MsgType: ""}))
+	assert.True(t, isTextMention(&pushPayloadReq{MsgType: "text"}))
+	assert.True(t, isTextMention(&pushPayloadReq{MsgType: "  Text "}))
+	assert.False(t, isTextMention(&pushPayloadReq{MsgType: "richtext"}))
 }
 
-// TestDecodeMention pins the lenient decode contract used by buildMention.
-func TestDecodeMention(t *testing.T) {
-	_, ok := decodeMention(nil)
-	assert.False(t, ok, "absent → not ok")
+// TestMentionEntitiesSurviveAisExpansion is the integration-seam guard: the way
+// server-generated entities reach the wire is handlePush's `CloneForExpansion` →
+// `ExpandAisToBotUIDs` chain. This proves entities pass through verbatim
+// (offset/length/uid unchanged) even when ais-expansion appends bot UIDs to
+// mention.uids, AND that the clone isolates the original payload (no in-place
+// mutation). No DB/WuKongIM needed — it locks the only transformation between the
+// generated entity and the serialized wire.
+func TestMentionEntitiesSurviveAisExpansion(t *testing.T) {
+	entity := map[string]interface{}{entityKeyUID: "u1", entityKeyOffset: 0, entityKeyLength: 3}
+	mention := map[string]interface{}{
+		mentionrewrite.UIDsKey:     []interface{}{"u1"},
+		mentionrewrite.AIsKey:      1,
+		mentionrewrite.EntitiesKey: []interface{}{entity},
+	}
+	payload := map[string]interface{}{mentionrewrite.MentionKey: mention}
 
-	mr, ok := decodeMention(json.RawMessage(`null`))
-	assert.True(t, ok, "explicit null is valid JSON → ok with zero value")
-	assert.Nil(t, mr.Uids)
+	wire := mentionrewrite.CloneForExpansion(payload)
+	wire = mentionrewrite.ExpandAisToBotUIDs(
+		wire, common.ChannelTypeGroup.Uint8(), "g1",
+		func(string) ([]string, error) { return []string{"bot_x"}, nil })
 
-	mr, ok = decodeMention(json.RawMessage(`{"uids":["a"],"all":true}`))
+	mm, ok := wire[mentionrewrite.MentionKey].(map[string]interface{})
 	require.True(t, ok)
-	assert.Equal(t, []string{"a"}, mr.Uids)
-	assert.True(t, mr.All)
 
-	for _, bad := range []string{`"x"`, `[]`, `{"uids":3}`, `{"uids":["a",1]}`, `{"all":1}`} {
-		_, ok := decodeMention(json.RawMessage(bad))
-		assert.Falsef(t, ok, "malformed %s → not ok", bad)
-	}
-}
+	// entities survive verbatim through clone + ais expansion.
+	ents, ok := mm[mentionrewrite.EntitiesKey].([]interface{})
+	require.Truef(t, ok, "entities must survive clone+expand; mention=%v", mm)
+	require.Len(t, ents, 1)
+	assert.Equal(t, entity, ents[0])
 
-// TestOnlyNativeAdapterAllowsMention pins acceptance #4: mention is processed only
-// by the native adapter; every sibling adapter must keep allowMention=false so a
-// future edit to a platform adapter can't silently start emitting mentions.
-func TestOnlyNativeAdapterAllowsMention(t *testing.T) {
-	assert.True(t, nativeAdapter.allowMention, "native adapter must process mention")
-	for name, ad := range map[string]pushAdapter{
-		"wecom":   wecomAdapter,
-		"github":  githubAdapter,
-		"gitlab":  gitlabAdapter,
-		"feishu":  feishuAdapter,
-		"multica": multicaAdapter,
-	} {
-		assert.Falsef(t, ad.allowMention, "%s adapter must NOT process mention (acceptance #4)", name)
-	}
+	// ais expansion appended the bot uid; the directed uid is still there.
+	uids, _ := mm[mentionrewrite.UIDsKey].([]interface{})
+	assert.Contains(t, uids, "u1")
+	assert.Contains(t, uids, "bot_x")
+
+	// clone isolation: the original payload's uids are NOT mutated by the wire expansion.
+	origUIDs, _ := mention[mentionrewrite.UIDsKey].([]interface{})
+	assert.NotContains(t, origUIDs, "bot_x", "wire expansion must not mutate the original payload")
 }

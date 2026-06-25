@@ -411,6 +411,11 @@ func autoWebhookName(webhookID string) string {
 }
 
 func toResp(m *incomingWebhookModel) webhookResp {
+	// 定向 @ 目标恒回显为数组（无配置时为空数组 []，而非 null），与 allow_mention_* 一致。
+	muids := parseMentionUIDs(m.MentionUids)
+	if muids == nil {
+		muids = []string{}
+	}
 	r := webhookResp{
 		WebhookID:        m.WebhookID,
 		GroupNo:          m.GroupNo,
@@ -421,6 +426,7 @@ func toResp(m *incomingWebhookModel) webhookResp {
 		Status:           m.Status,
 		AllowMentionAll:  m.AllowMentionAll,
 		AllowMentionBots: m.AllowMentionBots,
+		MentionUIDs:      muids,
 		CallCount:        m.CallCount,
 		CreatedAt:        time.Time(m.CreatedAt).Unix(),
 	}
@@ -428,6 +434,41 @@ func toResp(m *incomingWebhookModel) webhookResp {
 		r.LastUsedAt = m.LastUsedAt.Time.Unix()
 	}
 	return r
+}
+
+// validateMentionUIDs 校验创建/修改时配置的定向 @ 目标列表，返回落库用的 JSON 数组字符串。
+// 去重后必须 ≤ 上限且全部是本群【当前】成员（与 push 成员闸同口径：内部、正常、非删除、非外部）；
+// 超限或含非成员 → 400 reason=mention_uids，查询故障 → 500；空/缺省 → ("", true)（即不 @）。
+// 写入时校验只是即时反馈：成员可能在配置后退群，push 每次推送都会经 buildMention 再过成员闸。
+func (w *IncomingWebhook) validateMentionUIDs(c *wkhttp.Context, groupNo string, in []string) (string, bool) {
+	uids := dedupNonEmpty(in, 0) // 不在此钳上限，以便把「超限」与「正常」区分反馈
+	if len(uids) == 0 {
+		return "", true
+	}
+	if len(uids) > maxMentionUIDs() {
+		mgmtRequestInvalid(c, "mention_uids")
+		return "", false
+	}
+	membersByName, err := w.db.filterGroupMembers(groupNo, uids)
+	if err != nil {
+		w.Error("filter group members for mention config failed", zap.Error(err))
+		mgmtQueryFailed(c)
+		return "", false
+	}
+	for _, u := range uids {
+		if _, ok := membersByName[u]; !ok {
+			mgmtRequestInvalid(c, "mention_uids")
+			return "", false
+		}
+	}
+	b, err := json.Marshal(uids)
+	if err != nil {
+		// []string marshal 实际不会失败；保险按内部错误处理，绝不写入半成品。
+		w.Error("marshal mention_uids failed", zap.Error(err))
+		mgmtOperationFailed(c)
+		return "", false
+	}
+	return string(b), true
 }
 
 // publicURL 构造对外推送 URL（不含 host，由前端拼接基础域名）。
@@ -722,6 +763,13 @@ func (w *IncomingWebhook) create(c *wkhttp.Context) {
 		threadShortID = shortID
 	}
 
+	// 定向 @ 目标（创建时配置；push body 不再接受 mention）：校验为本群当前成员 + 去重 + 上限，
+	// 落库为 JSON 数组字符串。每次推送由服务端据此 @（见 buildMention）。
+	mentionUIDsJSON, ok := w.validateMentionUIDs(c, groupNo, req.MentionUids)
+	if !ok {
+		return
+	}
+
 	token, hash, err := generateToken()
 	if err != nil {
 		w.Error("generate token failed", zap.Error(err))
@@ -748,6 +796,7 @@ func (w *IncomingWebhook) create(c *wkhttp.Context) {
 		Status:           statusEnabled,
 		AllowMentionAll:  boolToInt(boolPtrTrue(req.AllowMentionAll)),
 		AllowMentionBots: boolToInt(boolPtrTrue(req.AllowMentionBots)),
+		MentionUids:      mentionUIDsJSON,
 	}
 	// 配额校验 + 写入在事务内原子完成；FOR UPDATE 锁住 group_no 范围，防止并发越限。
 	//
@@ -905,6 +954,15 @@ func (w *IncomingWebhook) update(c *wkhttp.Context) {
 	}
 	if req.AllowMentionBots != nil {
 		fields["allow_mention_bots"] = boolToInt(*req.AllowMentionBots)
+	}
+	// 定向 @ 目标：指针区分「未提供」(nil，不动) 与「显式设置/清空」(非 nil，含空数组)。
+	// 校验同 create（本群当前成员 + 去重 + 上限）；清空即存空串（不 @）。
+	if req.MentionUids != nil {
+		mentionUIDsJSON, ok := w.validateMentionUIDs(c, groupNo, *req.MentionUids)
+		if !ok {
+			return
+		}
+		fields["mention_uids"] = mentionUIDsJSON
 	}
 	if len(fields) == 0 {
 		c.Response(toResp(m))
@@ -1432,22 +1490,20 @@ func (w *IncomingWebhook) handlePush(c *wkhttp.Context, ad pushAdapter) {
 		return
 	}
 
-	// 6.5) @ 提及：仅 native 形态处理（ad.allowMention）。buildMention 把调用方的
-	// mention{uids,all,bots} 翻译成消息 payload 的 mention 子对象——定向 uids 过群成员闸、
-	// 广播位过 per-webhook 能力位；mention 作为【显式白名单字段】挂进 payload（绝不走 Extra
-	// 透传，见 buildPayload 注释）。挂上后对 @所有 AI 调 ExpandAisToBotUIDs 展开为群内全部
-	// bot 成员 UID（GROUP-only，与 message/bot_api 入口同一 helper，bot 集合一致）。
+	// 6.5) @ 提及：据 webhook 配置（MentionUids + AllowMention* 开关）构造 mention 子对象，
+	// 【对所有推送形态生效】——不再限于 native。@ 目标来自配置而非 body，与适配器 body 解析
+	// 方式无关（这正是「配置驱动」相对旧「body 驱动」的收益，见 adapter.go 注释）。buildMention
+	// 把定向 uids 过【当前】群成员闸、广播位过 per-webhook 能力位 + 策略闸；mention 作为【显式
+	// 白名单字段】挂进 payload（绝不走 Extra 透传，见 buildPayload）。挂上后对 @所有 AI 调
+	// ExpandAisToBotUIDs 展开为群内全部 bot 成员 UID（与 message/bot_api 入口同一 helper）。
 	// 其余 mention 语义（真人红点、唤起 bot）全由下游既有 message 监听器完成，本模块零参与。
-	// mention 与 msg_type 无关：text / richtext 两条 native 路径都接 @（语义一致）。
-	var mentionIgnored []string
-	if ad.allowMention {
-		// 广播放行策略（即时可收回，无需迁移）：system_setting member_can_broadcast 开，
-		// 或该 webhook 的创建者当前仍是群管理员（creatorIsAdmin，取自上面的成员闸查询）。
-		// 关掉设置即把全部【成员】创建的 webhook 的广播位立即剥离；管理员建的不受影响。
-		// 定向 @uid 不走此闸（不是广播、风险低）。
-		broadcastPermitted := w.settings.IncomingWebhookMemberCanBroadcast() || creatorIsAdmin
-		payload, mentionIgnored = w.assemblePushPayload(m, req, payload, broadcastPermitted)
-	}
+	// skip 形态（github ping / 子集外事件）在上面已 return，天然不 @ 人。
+	//
+	// 广播放行策略（即时可收回，无需迁移）：system_setting member_can_broadcast 开，或该 webhook
+	// 的创建者当前仍是群管理员（creatorIsAdmin，取自上面的成员闸查询）。关掉设置即把全部【成员】
+	// 创建的 webhook 的广播位立即剥离；管理员建的不受影响。定向 @uid 不走此闸（不是广播、风险低）。
+	broadcastPermitted := w.settings.IncomingWebhookMemberCanBroadcast() || creatorIsAdmin
+	payload, mentionIgnored := w.assemblePushPayload(m, req, payload, broadcastPermitted)
 
 	// 投递目标由行派生：群 webhook → (group_no, 群)；子区 webhook → (group_no____short_id,
 	// 子区)。这是 URL/body 之外唯一随绑定变化的东西——推送方零适配（见 targetChannel()）。

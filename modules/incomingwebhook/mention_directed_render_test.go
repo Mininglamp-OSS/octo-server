@@ -1,8 +1,6 @@
 package incomingwebhook
 
 import (
-	"encoding/json"
-	"fmt"
 	"testing"
 	"unicode/utf16"
 
@@ -12,9 +10,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// 定向 @ 昵称渲染（#448 ① b, mention.render）的测试：把【本群成员】uid 解析成展示昵称、
-// 前置 "@<昵称> " 并【生成】对应 entity。compose 是纯函数(给定 namesByUID,无 DB);buildMention
-// 的「成员闸取昵称 → 渲染」端到端走 infra(种 group_member + user 行,LEFT JOIN user.name)。
+// 定向 @ 昵称渲染的测试：把【本群成员】uid 解析成展示昵称、前置 "@<昵称> " 并【生成】对应
+// entity。@ 目标改为创建/修改时配置（model.MentionUids），render 默认开。compose 是纯函数
+// (给定 namesByUID,无 DB)；buildMention 的「成员闸取昵称 → 渲染」端到端走 infra(种 group_member
+// + user 行,LEFT JOIN user.name)。
 
 func TestComposeMentionContentDirected(t *testing.T) {
 	names := map[string]string{"u1": "我的天", "u2": "Bob", "u3": ""}
@@ -123,9 +122,10 @@ func TestComposeMentionContentDirected(t *testing.T) {
 	})
 }
 
-// TestBuildMentionDirectedRender is the end-to-end seam (needs MySQL): a bare uid + render:true
-// resolves the member's display name (group_member LEFT JOIN user.name), prepends "@<name> ", and
-// generates the entity — asserting buildMention's returned content/mention directly.
+// TestBuildMentionDirectedRender is the end-to-end seam (needs MySQL): a configured
+// uid (model.MentionUids) resolves the member's display name (group_member LEFT JOIN
+// user.name), prepends "@<name> ", and generates the entity — asserting buildMention's
+// returned content/mention directly. render is default-on for configured targets.
 func TestBuildMentionDirectedRender(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	defer testutil.CleanAllTables(ctx)
@@ -143,14 +143,10 @@ func TestBuildMentionDirectedRender(t *testing.T) {
 		Values(uid, name, uid, "sn_"+uid, 1).Exec()
 	require.NoError(t, err)
 
-	m := &incomingWebhookModel{WebhookID: "iwh_render", GroupNo: groupNo}
-
-	t.Run("uid + render:true -> @name composed + entity generated; uid still routes", func(t *testing.T) {
-		req := &pushPayloadReq{
-			Content: "执行吧",
-			Mention: json.RawMessage(fmt.Sprintf(`{"uids":["%s"],"render":true}`, uid)),
-		}
-		// render is NOT capability-gated (directed, not broadcast) -> broadcastPermitted=false is fine.
+	t.Run("configured uid -> @name composed + entity generated; uid still routes", func(t *testing.T) {
+		m := &incomingWebhookModel{WebhookID: "iwh_render", GroupNo: groupNo, MentionUids: `["` + uid + `"]`}
+		req := &pushPayloadReq{Content: "执行吧"}
+		// directed @ is NOT capability-gated -> broadcastPermitted=false is fine.
 		mention, content, ignored := w.buildMention(m, req, false)
 		require.NotNil(t, mention)
 		assert.Empty(t, ignored)
@@ -170,29 +166,9 @@ func TestBuildMentionDirectedRender(t *testing.T) {
 		assert.Equal(t, uint16('@'), u16[0])
 	})
 
-	t.Run("render + caller entities -> caller entities win, no auto-generate, no prepend", func(t *testing.T) {
-		// caller wrote their own "@x" + supplied the entity; #449 path is authoritative -> render is ignored.
-		req := &pushPayloadReq{
-			Content: "@x hi",
-			Mention: json.RawMessage(fmt.Sprintf(
-				`{"uids":["%s"],"render":true,"entities":[{"uid":"%s","offset":0,"length":2}]}`, uid, uid)),
-		}
-		mention, content, _ := w.buildMention(m, req, false)
-		require.NotNil(t, mention)
-		assert.Equal(t, "@x hi", content, "caller entities present -> render does not prepend names")
-		ents, ok := mention[mentionrewrite.EntitiesKey].([]interface{})
-		require.True(t, ok)
-		require.Len(t, ents, 1)
-		e := ents[0].(map[string]interface{})
-		assert.Equal(t, 0, e[entityKeyOffset], "caller offset preserved (no prepend, no shift)")
-		assert.Equal(t, 2, e[entityKeyLength])
-	})
-
-	t.Run("render:true but uid is a non-member -> no pill, nothing routed", func(t *testing.T) {
-		req := &pushPayloadReq{
-			Content: "执行吧",
-			Mention: json.RawMessage(`{"uids":["ghost_not_member"],"render":true}`),
-		}
+	t.Run("configured non-member uid -> no pill, nothing routed", func(t *testing.T) {
+		m := &incomingWebhookModel{WebhookID: "iwh_render2", GroupNo: groupNo, MentionUids: `["ghost_not_member"]`}
+		req := &pushPayloadReq{Content: "执行吧"}
 		mention, content, ignored := w.buildMention(m, req, false)
 		assert.Equal(t, "执行吧", content, "non-member resolves no name -> no compose")
 		assert.Nil(t, mention)
@@ -202,8 +178,7 @@ func TestBuildMentionDirectedRender(t *testing.T) {
 
 // TestAssemblePushPayload_DirectedRenderReachesWire is the handler→wire seam (needs MySQL, no
 // WuKongIM): it asserts the composed content + generated entities actually land in the payload
-// map that handlePush hands to SendMessageWithResult — closing the wire-bytes gap reviewers
-// flagged on #450 (buildMention's return was asserted one layer below this).
+// map that handlePush hands to SendMessageWithResult, for a config-driven directed @.
 func TestAssemblePushPayload_DirectedRenderReachesWire(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	defer testutil.CleanAllTables(ctx)
@@ -219,11 +194,8 @@ func TestAssemblePushPayload_DirectedRenderReachesWire(t *testing.T) {
 		Values(uid, "我的天", uid, "sn_"+uid, 1).Exec()
 	require.NoError(t, err)
 
-	m := &incomingWebhookModel{WebhookID: "iwh_wire", GroupNo: groupNo}
-	req := &pushPayloadReq{
-		Content: "执行吧",
-		Mention: json.RawMessage(fmt.Sprintf(`{"uids":["%s"],"render":true}`, uid)),
-	}
+	m := &incomingWebhookModel{WebhookID: "iwh_wire", GroupNo: groupNo, MentionUids: `["` + uid + `"]`}
+	req := &pushPayloadReq{Content: "执行吧"}
 	// base payload mirrors the text-path payload handlePush builds before mention assembly.
 	base := map[string]interface{}{payloadContentKey: req.Content}
 

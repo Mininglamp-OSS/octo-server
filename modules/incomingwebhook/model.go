@@ -1,8 +1,6 @@
 package incomingwebhook
 
 import (
-	"encoding/json"
-
 	"github.com/Mininglamp-OSS/octo-lib/pkg/db"
 	"github.com/gocraft/dbr/v2"
 )
@@ -48,6 +46,15 @@ type incomingWebhookModel struct {
 	// 定向 @uid（指定一个/多个成员）不受这两个开关约束，但受「群成员闸 + 去重 + 上限」。
 	AllowMentionAll  int
 	AllowMentionBots int
+	// MentionUids 是【创建/修改时配置】的定向 @ 目标列表（JSON 数组字符串，如
+	// `["uid_a","bot_b"]`；空串=不 @）。push body 不再接受 mention——每次推送服务端把
+	// 这份列表过【当前】群成员闸后渲染成 @气泡 + 路由。定向 @uid 不受 AllowMention* 广播
+	// 开关约束（受群成员闸 + 去重 + 上限 maxMentionUIDs）。
+	//
+	// Go 字段刻意命名 MentionUids（非 MentionUIDs）：UnderscoreName / dbr camelCaseToSnakeCase
+	// 把 "MentionUids"→"mention_uids"，而 "MentionUIDs" 会被切成 "mention_ui_ds"（连续大写陷阱），
+	// 与列名对不上导致读写静默落空。
+	MentionUids      string
 	LastUsedAt       dbr.NullTime
 	CallCount        int64
 	db.BaseModel
@@ -107,55 +114,10 @@ type pushPayloadReq struct {
 	Username  string                 `json:"username,omitempty"`
 	AvatarURL string                 `json:"avatar_url,omitempty"`
 	Extra     map[string]interface{} `json:"extra,omitempty"`
-	// Mention 让调用方 @ 群成员（用户/bot 同一 UID 命名空间，一个或多个）并可选广播。
-	// 仅 native 端点解析（pushAdapter.allowMention），适配器(企业微信/飞书/GitHub…)不支持。
-	// 服务端把它翻译成消息 payload 的 mention 子对象（buildMention），定向 uids 经群成员闸
-	// 过滤、广播位经 per-webhook 能力位放行；其余 mention 语义（红点/唤起 bot）全由下游
-	// 既有 message 监听器完成。绝不透传到 payload，与 Extra 被丢弃同源（见 buildPayload）。
-	//
-	// 类型刻意是 json.RawMessage 而非 *mentionReq：mention 是【可选】字段，其形状非法
-	// （如 uids 传成字符串）不能把整条推送 400 掉——否则相邻的合法 content 也被连累丢弃，
-	// 违反 acceptance #6「malformed mention.uids → no panic, no mention key, 消息照投」。
-	// 故此处只做惰性捕获，真正的宽松解码在 buildMention/decodeMention：解码失败即降级为
-	// 「无 mention」、消息照常投递。
-	Mention json.RawMessage `json:"mention,omitempty"`
-}
-
-// mentionReq 是 native 推送请求里的 @ 描述（对外契约）。两个广播位刻意不暴露内部线协议的
-// humans/ais 字段名：调用方只写「@所有人(all) / @所有 AI(bots)」，由服务端 buildMention 翻译
-// 为 mention.{humans,ais} 并做能力位校验。Entities 则【直接以线协议字段名 entities 接收】——
-// 它是渲染层 [{uid,offset,length}]，本就是端上要消费的形态、无可翻译语义，服务端只做成员闸 +
-// 越界/锚点校验后原样透传（见 Entities 字段注释）。
-//   - Uids     ：要 @ 的成员 UID（用户或 bot），去重后受上限约束，且必须是本群当前成员。
-//   - All      ：@所有人（真人广播），受 webhook 的 allow_mention_all 能力位约束。
-//   - Bots     ：@所有 AI（bot 广播），受 webhook 的 allow_mention_bots 能力位约束。
-//   - Render   ：opt-in，请求服务端把 Uids 解析成可见 @昵称气泡（详见字段注释）。
-//   - Entities ：渲染层 @ 区间（详见字段注释）；定向渲染、不受广播能力位约束。
-type mentionReq struct {
-	Uids []string `json:"uids,omitempty"`
-	All  bool     `json:"all,omitempty"`
-	Bots bool     `json:"bots,omitempty"`
-	// Render 是【定向 @ 昵称渲染】的 opt-in 开关（默认 false）。置 true 时，服务端把 Uids 里
-	// 的【本群成员】解析成展示昵称（group_member LEFT JOIN user → user.name，与群成员列表口径
-	// 一致）、在【纯文本】content 文首补 "@<昵称> "、并【生成】对应的线协议 mention.entities
-	// 元素（offset/length 为 UTF-16 码元）——让只传 uid 的调用方也能渲染出可点击 @气泡，而无需
-	// 自己写昵称文本与偏移（那是 Entities 的【调用方自管】路径）。
-	//
-	// 默认关：#445 老调用方传 uids 只为刷红点 / 唤起 bot、不期望 content 被改写,opt-in 保其行为
-	// 不变。它是【请求侧】字段、不进线协议,客户端不感知;关闭时 content 与 payload 完全不变。
-	// 与 Entities 互斥:调用方自带 Entities 时以其为准、Render 不再自动生成(见 buildMention)。
-	Render bool `json:"render,omitempty"`
-	// Entities 是【渲染层】的 @ 区间（线协议 mention.entities：[{uid,offset,length}]），
-	// 与 uids（路由层）正交：调用方自带 content 文本与每个 @ 的 offset/length，服务端只校验
-	// 每条 entity 的 uid 是本群成员、offset/length 落在 content 的 UTF-16 码元范围内且 offset
-	// 处确为 '@'，合法者原样透传到线协议供端上权威渲染气泡（web 用 entities 精确绑定、Android
-	// 校验后保留、iOS 忽略改按位置解析）。offset/length 单位是 UTF-16 码元（= JS .length /
-	// Java/Kotlin String / NSString），不是字节、也不是 rune。
-	//
-	// 类型是 []json.RawMessage 以做【逐条】宽松解码：单条形状非法（如 offset 传字符串）只丢
-	// 该条，不连累其余 entity，也不影响 mention 的 uids/all/bots——与 decodeMention 的宽松
-	// 契约（malformed → 降级、不 400、不丢消息）一致。
-	Entities []json.RawMessage `json:"entities,omitempty"`
+	// 注意：push body 不再接受 mention 字段。@ 目标（定向 @uid/bot_id + @所有人/@所有 AI 广播）
+	// 改为【创建/修改 webhook 时配置】（incomingWebhookModel.MentionUids + AllowMention* 开关），
+	// 每次推送由服务端从 webhook 配置构造 mention（见 buildMention）。调用方 body 里若仍带
+	// mention，会被 json.Unmarshal 当未知字段静默忽略——既不报错也不生效（向后兼容）。
 }
 
 // webhookBlock 是富文本消息的单个有序块（对外契约）。字段刻意与 octo-lib
@@ -176,21 +138,25 @@ type webhookBlock struct {
 
 // createReq 管理端创建 webhook 的请求体。
 // AllowMention* 为广播能力位，任意合法成员均可设置；缺省/false 即默认关闭。
+// MentionUids 为定向 @ 目标（每次推送自动 @ 这些成员/bot），缺省即不 @。
 type createReq struct {
-	Name             string `json:"name"`
-	Avatar           string `json:"avatar,omitempty"`
-	AllowMentionAll  *bool  `json:"allow_mention_all,omitempty"`
-	AllowMentionBots *bool  `json:"allow_mention_bots,omitempty"`
+	Name             string   `json:"name"`
+	Avatar           string   `json:"avatar,omitempty"`
+	AllowMentionAll  *bool    `json:"allow_mention_all,omitempty"`
+	AllowMentionBots *bool    `json:"allow_mention_bots,omitempty"`
+	MentionUids      []string `json:"mention_uids,omitempty"`
 }
 
 // updateReq 修改 webhook 的请求体。零值字段不更新。
-// AllowMention* 由 webhook 的合法成员（创建者/管理员）可改。
+// AllowMention* / MentionUids 由 webhook 的合法成员（创建者/管理员）可改。
+// MentionUids 用指针区分「未提供」(nil，不动) 与「显式清空」([]，置为不 @)。
 type updateReq struct {
-	Name             *string `json:"name,omitempty"`
-	Avatar           *string `json:"avatar,omitempty"`
-	Status           *int    `json:"status,omitempty"`
-	AllowMentionAll  *bool   `json:"allow_mention_all,omitempty"`
-	AllowMentionBots *bool   `json:"allow_mention_bots,omitempty"`
+	Name             *string   `json:"name,omitempty"`
+	Avatar           *string   `json:"avatar,omitempty"`
+	Status           *int      `json:"status,omitempty"`
+	AllowMentionAll  *bool     `json:"allow_mention_all,omitempty"`
+	AllowMentionBots *bool     `json:"allow_mention_bots,omitempty"`
+	MentionUids      *[]string `json:"mention_uids,omitempty"`
 }
 
 // webhookResp 对外暴露的 webhook 元信息（不含 token / token_hash）。
@@ -206,11 +172,14 @@ type webhookResp struct {
 	CreatorUID    string `json:"creator_uid"`
 	Status        int    `json:"status"`
 	// AllowMentionAll / AllowMentionBots 回显广播能力位（0/1），便于管理端 UI 渲染开关。
-	AllowMentionAll  int   `json:"allow_mention_all"`
-	AllowMentionBots int   `json:"allow_mention_bots"`
-	LastUsedAt       int64 `json:"last_used_at"`
-	CallCount        int64 `json:"call_count"`
-	CreatedAt        int64 `json:"created_at"`
+	AllowMentionAll  int `json:"allow_mention_all"`
+	AllowMentionBots int `json:"allow_mention_bots"`
+	// MentionUIDs 回显定向 @ 目标列表（创建/修改时配置），供管理端 UI 渲染。始终为数组
+	// （无配置时为空数组 []，不是 null），与 allow_mention_* 一样恒回显。
+	MentionUIDs []string `json:"mention_uids"`
+	LastUsedAt  int64    `json:"last_used_at"`
+	CallCount   int64    `json:"call_count"`
+	CreatedAt   int64    `json:"created_at"`
 }
 
 // createResp 创建/重置返回；token 仅此一次出现。

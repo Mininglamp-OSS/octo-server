@@ -1,0 +1,52 @@
+slug: incoming-webhook-mention-config
+rules_injected:
+  - id: trust-boundary
+    tier: repo
+    load_bearing: true
+    why: push is attacker-controlled, token-in-URL ingress. Caller body `mention` becomes untrusted
+         noise and is DROPPED (field removed from pushPayloadReq → json.Unmarshal ignores it). The
+         config `mention_uids` is the only @ source; validated at the management boundary (member gate
+         + dedup + cap) AND re-filtered to current group members at push time. Adapter parity FLIPS in
+         the safe direction — the native-only `allowMention` gate is removed so mention runs identically
+         for every adapter (config-sourced UIDs carry no platform-identity mapping problem).
+  - id: space-isolation
+    tier: repo
+    load_bearing: true
+    why: mention_uids confined to CURRENT internal-normal members of the webhook's group_no via
+         filterGroupMembers (is_deleted=0 + is_external=0 + status=Normal), at BOTH config-write time
+         (reject non-members 400) and push time (silent re-filter). A token cannot @ a cross-group /
+         cross-Space identity; departed members drop automatically.
+  - id: error-handling
+    tier: repo
+    load_bearing: true
+    why: create/update reuse httperr.ResponseErrorLWithStatus + existing ErrIncomingWebhookRequestInvalid
+         with details.reason="mention_uids" (no new code; "reason" already SafeDetailKeys). push-side
+         broadcast "ignored" stays non-fatal data in the 200 body. NoLegacyResponseError guard holds
+         (no new handler file; mention.go already listed).
+  - id: testing
+    tier: repo
+    load_bearing: false
+    why: pure composeMentionContent / assembleMention / dedup / parseMentionUIDs unit tests retained;
+         buildMention integration tests reworked to source from the model (config) instead of req body;
+         e2e reworked to config-driven + adapter-parity + body-mention-ignored.
+  - id: commit-style
+    tier: repo
+    load_bearing: false
+    why: Conventional Commits, English.
+files_touched:
+  - modules/incomingwebhook/sql/20260625000001_incomingwebhook_mention_uids.sql  # NEW column mention_uids
+  - modules/incomingwebhook/model.go        # +MentionUids col; createReq/updateReq/webhookResp +mention_uids; drop pushPayloadReq.Mention + mentionReq
+  - modules/incomingwebhook/mention.go      # buildMention reads config; +parseMentionUIDs; remove caller-entity machinery (decodeMention/decodeEntities/finalizeEntities/...)
+  - modules/incomingwebhook/adapter.go      # remove pushAdapter.allowMention (mention now adapter-agnostic)
+  - modules/incomingwebhook/db.go           # updateFieldsAllowed += mention_uids
+  - modules/incomingwebhook/api.go          # create/update validate+persist mention_uids; toResp surfaces it; handlePush runs mention for all adapters
+  - modules/incomingwebhook/mention_test.go # drop decode/parse/allowMention tests; +parseMentionUIDs, +isTextMention, +ais-expansion survivor
+  - modules/incomingwebhook/mention_broadcast_test.go        # broadcast from model flags; drop shiftEntityOffsets/caller-entity tests
+  - modules/incomingwebhook/mention_directed_render_test.go  # uids from model.MentionUids; render default
+  - modules/incomingwebhook/mention_entities_test.go         # DELETE (caller entities removed)
+  - modules/incomingwebhook/mention_e2e_test.go              # config-driven + adapter parity + body-ignored
+parity_decisions:
+  - "@ targets move from push body to webhook row (column mention_uids, JSON array of octo UIDs). Go field MentionUids → column mention_uids (UnderscoreName/dbr camelCaseToSnakeCase agree; 'MentionUIDs' would wrongly map to mention_ui_ds, so the field is deliberately MentionUids)."
+  - "Broadcast switches (allow_mention_*) now mean 'this webhook @所有人/@所有AI on every push' (no body flag to ask). broadcastPermitted (member_can_broadcast || creator-is-admin) policy gate unchanged."
+  - "Directed render is now default-on for configured uids (server resolves user.name → @name pill + UTF-16 entity), reusing composeMentionContent. Caller-supplied entities removed entirely."
+  - "Mention is adapter-agnostic: handlePush runs assemblePushPayload for every adapter; the native-only allowMention flag is deleted. Adapter content is markdown text → text-path compose prepends pills; skip events (github ping) return before assembly → @ nobody."

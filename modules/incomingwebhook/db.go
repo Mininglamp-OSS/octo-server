@@ -150,6 +150,7 @@ var updateFieldsAllowed = map[string]struct{}{
 	"token_hash":         {},
 	"allow_mention_all":  {},
 	"allow_mention_bots": {},
+	"mention_uids":       {},
 }
 
 // updateFields 更新单个 webhook 的允许列。带 status != statusDeleted 守卫：对已软删除
