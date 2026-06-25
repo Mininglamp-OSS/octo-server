@@ -231,13 +231,9 @@ func TestBotWebhook_AppBotAlwaysForbidden(t *testing.T) {
 	adapter.Add(appBotToken, &AppBotRegistrySpec{UID: appBotUID, Scope: "platform"})
 	prev := GetAppBotRegistry()
 	SetAppBotRegistry(adapter)
-	t.Cleanup(func() {
-		if prev != nil {
-			SetAppBotRegistry(prev)
-		} else {
-			SetAppBotRegistry(NewAppBotRegistryAdapter()) // atomic.Value 不可存 nil，置空注册表即可
-		}
-	})
+	// Restore unconditionally — the registry slot is an atomic.Pointer[regHolder],
+	// so SetAppBotRegistry(nil) is safe (restores the "no registry" state).
+	t.Cleanup(func() { SetAppBotRegistry(prev) })
 
 	// 鉴权通过（非 401），但非群成员 → 创建/列表一律 403。
 	w := doBot(handler, botReq(t, "POST", botWebhookBase(), appBotToken, map[string]interface{}{}))

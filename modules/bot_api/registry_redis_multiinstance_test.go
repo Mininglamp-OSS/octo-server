@@ -216,3 +216,107 @@ func TestAppBotAuthFailsSafeWhenRedisDown(t *testing.T) {
 		t.Errorf("with Redis down, unknown token must be rejected, got HTTP %d", got)
 	}
 }
+
+// TestAppBotUnpublishPropagatesToPeer covers the #309 acceptance criterion for the
+// UNPUBLISH path, which is structurally distinct from rotate/delete: unpublish only
+// flips status (the DB row REMAINS), so the peer's rejection depends entirely on the
+// published-status gate in authAppBot (status!=1 -> BotUnavailable), not on a missing
+// row. That cross-replica status-gate rejection had no coverage before this test.
+func TestAppBotUnpublishPropagatesToPeer(t *testing.T) {
+	ctx := redisRegCtx(t)
+	ensureAppBotTable(t, ctx)
+	ba := &BotAPI{ctx: ctx, db: newBotAPIDB(ctx), Log: log.NewTLog("repro-309-unpub")}
+	sqlDB := ctx.DB().DB
+
+	const (
+		id    = "repro309up_bot"
+		uid   = "repro309up_uid"
+		token = "app_unpub_309_tok_eeeeeeee"
+	)
+	regA := NewRedisAppBotRegistry(ctx, ttl5min)
+	regB := NewRedisAppBotRegistry(ctx, ttl5min)
+
+	cleanup := func() {
+		_, _ = sqlDB.Exec("DELETE FROM app_bot WHERE id=? OR uid=?", id, uid)
+		regA.Remove(token)
+	}
+	cleanup()
+	defer cleanup()
+
+	// Publish: DB row (status=1) + warm the shared cache.
+	if _, err := sqlDB.Exec(
+		"INSERT INTO app_bot (id,uid,display_name,scope,space_id,status,token,created_by) "+
+			"VALUES (?,?,?,?,'',1,?,?)",
+		id, uid, "Repro 309 Unpub Bot", "platform", token, "admin",
+	); err != nil {
+		t.Fatalf("insert app_bot: %v", err)
+	}
+	regA.Add(token, &AppBotRegistrySpec{UID: uid, Scope: "platform"})
+
+	// Baseline: peer authorizes the published token (shared cache hit).
+	if got := authStatus(t, ba, regB, token); got != http.StatusOK {
+		t.Fatalf("baseline: peer should authorize published token, got HTTP %d", got)
+	}
+
+	// ---- Unpublish on replica A: DB status -> 2 (row stays) + shared-cache Remove (DEL) ----
+	if _, err := sqlDB.Exec("UPDATE app_bot SET status=2 WHERE id=?", id); err != nil {
+		t.Fatalf("unpublish DB: %v", err)
+	}
+	regA.Remove(token)
+
+	// FIX assertion: peer rejects the unpublished token. Shared DEL -> peer misses ->
+	// DB fallback finds the row but status!=1 -> respondBotAPIBotUnavailable.
+	if got := authStatus(t, ba, regB, token); got == http.StatusOK {
+		t.Errorf("🔴 peer replica still authorizes an UNPUBLISHED token (HTTP %d) — cross-replica status gate not enforced", got)
+	}
+}
+
+// TestAppBotDeletePropagatesToPeer covers the #309 acceptance criterion for the
+// DELETE path: after a delete on one replica (DB row removed + shared DEL), the peer
+// rejects the token via DB fallback (no row -> AuthFailed).
+func TestAppBotDeletePropagatesToPeer(t *testing.T) {
+	ctx := redisRegCtx(t)
+	ensureAppBotTable(t, ctx)
+	ba := &BotAPI{ctx: ctx, db: newBotAPIDB(ctx), Log: log.NewTLog("repro-309-del")}
+	sqlDB := ctx.DB().DB
+
+	const (
+		id    = "repro309del_bot"
+		uid   = "repro309del_uid"
+		token = "app_del_309_tok_ffffffff"
+	)
+	regA := NewRedisAppBotRegistry(ctx, ttl5min)
+	regB := NewRedisAppBotRegistry(ctx, ttl5min)
+
+	cleanup := func() {
+		_, _ = sqlDB.Exec("DELETE FROM app_bot WHERE id=? OR uid=?", id, uid)
+		regA.Remove(token)
+	}
+	cleanup()
+	defer cleanup()
+
+	if _, err := sqlDB.Exec(
+		"INSERT INTO app_bot (id,uid,display_name,scope,space_id,status,token,created_by) "+
+			"VALUES (?,?,?,?,'',1,?,?)",
+		id, uid, "Repro 309 Del Bot", "platform", token, "admin",
+	); err != nil {
+		t.Fatalf("insert app_bot: %v", err)
+	}
+	regA.Add(token, &AppBotRegistrySpec{UID: uid, Scope: "platform"})
+
+	// Baseline: peer authorizes the published token.
+	if got := authStatus(t, ba, regB, token); got != http.StatusOK {
+		t.Fatalf("baseline: peer should authorize published token, got HTTP %d", got)
+	}
+
+	// ---- Delete on replica A: DB row removed + shared-cache Remove (DEL) ----
+	if _, err := sqlDB.Exec("DELETE FROM app_bot WHERE id=?", id); err != nil {
+		t.Fatalf("delete DB: %v", err)
+	}
+	regA.Remove(token)
+
+	// FIX assertion: peer rejects the deleted token (shared DEL -> DB fallback -> no row).
+	if got := authStatus(t, ba, regB, token); got == http.StatusOK {
+		t.Errorf("🔴 peer replica still authorizes a DELETED token (HTTP %d)", got)
+	}
+}

@@ -27,6 +27,14 @@ const appBotAuthKeyPrefix = "appbot:auth:"
 // request (mirrors modules/incomingwebhook warnDegraded).
 const appBotDegradeWarnInterval = 30 * time.Second
 
+// appBotDegradedCooldown is how long a Redis-command failure keeps the
+// best-effort write circuit open: while open, the DB-fallback cache warm-up
+// (Add) is skipped so a sustained Redis outage can't launch one blocking SET
+// (dial/write timeout × retries + pool wait) per auth request. The very request
+// that observes the failure trips the circuit before its own warm-up runs, so no
+// SET storm accumulates; writes resume once Redis has been healthy this long.
+const appBotDegradedCooldown = 5 * time.Second
+
 // RedisAppBotRegistry is a SHARED, write-through Redis cache for App Bot auth
 // (issue #309). Replacing the per-process in-memory map with one shared store
 // makes token revocation (rotate / unpublish / delete) take effect on every
@@ -57,8 +65,9 @@ type RedisAppBotRegistry struct {
 	// system-settings package; app_bot wires it over the hot-reloaded snapshot.
 	ttl func() time.Duration
 
-	degradeMu   sync.Mutex
-	degradeLast time.Time
+	degradeMu     sync.Mutex
+	degradeLast   time.Time // last WARN emit (log throttle)
+	degradedUntil time.Time // best-effort writes are skipped until this instant after a Redis-command failure
 }
 
 // NewRedisAppBotRegistry builds the shared registry. The Redis client is built
@@ -98,7 +107,7 @@ func (r *RedisAppBotRegistry) FindByToken(token string) *AppBotRegistrySpec {
 		return nil // genuine miss -> DB fallback populates it
 	}
 	if err != nil {
-		r.warnDegraded("app bot auth cache GET failed, fail-safe to DB", err)
+		r.noteRedisFailure("app bot auth cache GET failed, fail-safe to DB", err)
 		return nil
 	}
 	var spec AppBotRegistrySpec
@@ -113,7 +122,18 @@ func (r *RedisAppBotRegistry) FindByToken(token string) *AppBotRegistrySpec {
 
 // Add write-throughs a spec with the safety-net TTL. Best-effort: a failure is
 // logged (throttled) and ignored — the DB remains authoritative.
+//
+// While the write circuit is open (a recent Redis-command failure), the warm-up
+// is skipped entirely. The DB-fallback auth path calls Add via `go reg.Add(...)`;
+// without this guard a sustained Redis outage would spawn one goroutine blocking
+// on a doomed SET (dial/write timeout × retries + pool wait) per auth request,
+// piling up goroutines and pool waiters for the exact failure this cache rides
+// out. Dropping the warm-up is harmless — the DB already produced the
+// authoritative answer, and the next miss re-attempts once Redis heals.
 func (r *RedisAppBotRegistry) Add(token string, spec *AppBotRegistrySpec) {
+	if r.writesDegraded() {
+		return
+	}
 	r.set(token, spec)
 }
 
@@ -124,8 +144,9 @@ func (r *RedisAppBotRegistry) Remove(token string) {
 	}
 	if err := r.client.Del(appBotAuthKey(token)).Err(); err != nil {
 		// A failed DEL leaves a stale key until its TTL expires; log so ops can
-		// see it, but the bounded TTL is the backstop.
-		r.warnDegraded("app bot auth cache DEL failed (stale until TTL)", err)
+		// see it, but the bounded TTL is the backstop. Also trips the write circuit
+		// so concurrent warm-ups stop hammering a backend that's clearly degraded.
+		r.noteRedisFailure("app bot auth cache DEL failed (stale until TTL)", err)
 	}
 }
 
@@ -148,7 +169,7 @@ func (r *RedisAppBotRegistry) set(token string, spec *AppBotRegistrySpec) {
 	}
 	ttl := r.safeTTL()
 	if err := r.client.Set(appBotAuthKey(token), payload, ttl).Err(); err != nil {
-		r.warnDegraded("app bot auth cache SET failed", err)
+		r.noteRedisFailure("app bot auth cache SET failed", err)
 	}
 }
 
@@ -170,6 +191,9 @@ func (r *RedisAppBotRegistry) safeTTL() time.Duration {
 // default (defaultAppBotAuthCacheTTLSeconds) in modules/common.
 const defaultAppBotAuthCacheTTL = 60 * time.Second
 
+// warnDegraded emits a throttled WARN without tripping the write circuit. Used
+// for non-availability problems (corrupt cache entry, spec marshal failure) where
+// the backend is reachable and pausing warm-up writes would be pointless.
 func (r *RedisAppBotRegistry) warnDegraded(msg string, err error) {
 	r.degradeMu.Lock()
 	if !r.degradeLast.IsZero() && time.Since(r.degradeLast) < appBotDegradeWarnInterval {
@@ -179,4 +203,30 @@ func (r *RedisAppBotRegistry) warnDegraded(msg string, err error) {
 	r.degradeLast = time.Now()
 	r.degradeMu.Unlock()
 	r.Warn(msg, zap.Error(err))
+}
+
+// noteRedisFailure records an actual Redis-command failure (GET/SET/DEL): it
+// opens the best-effort write circuit for appBotDegradedCooldown (so warm-up
+// Adds are skipped, preventing a per-request SET storm under a sustained outage)
+// AND emits the same throttled WARN as warnDegraded.
+func (r *RedisAppBotRegistry) noteRedisFailure(msg string, err error) {
+	now := time.Now()
+	r.degradeMu.Lock()
+	r.degradedUntil = now.Add(appBotDegradedCooldown)
+	shouldWarn := r.degradeLast.IsZero() || now.Sub(r.degradeLast) >= appBotDegradeWarnInterval
+	if shouldWarn {
+		r.degradeLast = now
+	}
+	r.degradeMu.Unlock()
+	if shouldWarn {
+		r.Warn(msg, zap.Error(err))
+	}
+}
+
+// writesDegraded reports whether a recent Redis-command failure still has the
+// best-effort write circuit open (skip warm-up writes until the cooldown lapses).
+func (r *RedisAppBotRegistry) writesDegraded() bool {
+	r.degradeMu.Lock()
+	defer r.degradeMu.Unlock()
+	return !r.degradedUntil.IsZero() && time.Now().Before(r.degradedUntil)
 }

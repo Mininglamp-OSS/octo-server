@@ -46,5 +46,5 @@ notes:
   - Accepted, documented residual: a cache-invalidation race where an auth miss
     that read the DB as valid just before a concurrent revocation can re-populate
     the just-deleted key; bounded by the safety-net TTL (system_settings
-    app_bot.auth_cache_ttl_seconds, default 300s). Mirrors the documented
+    app_bot.auth_cache_ttl_seconds, default 60s). Mirrors the documented
     bounded-staleness contract of modules/incomingwebhook/cache.go.

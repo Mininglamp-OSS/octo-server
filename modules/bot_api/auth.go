@@ -110,6 +110,10 @@ func (ba *BotAPI) authAppBot(c *wkhttp.Context, token string) {
 	// the client's write-timeout to each request. The DB lookup already produced
 	// the authoritative answer this request needs, so the repopulate runs in the
 	// background and the handler proceeds immediately.
+	//
+	// The detached goroutine can't pile up under a sustained Redis outage:
+	// RedisAppBotRegistry.Add drops the write while its circuit is open (a recent
+	// Redis-command failure), so the goroutine returns without touching the pool.
 	if reg := GetAppBotRegistry(); reg != nil {
 		spec := &AppBotRegistrySpec{
 			UID:     appBot.UID,

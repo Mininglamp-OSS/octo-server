@@ -40,7 +40,7 @@ Option A by the maintainer:
   (it previously didn't), so an active token returns to O(1) after a miss while
   only ever caching a DB-confirmed valid+published spec.
 - The safety-net key TTL is read live from **system_settings**
-  (`AppBotAuthCacheTTLSeconds`, category `app_bot`, default 300s, clamped
+  (`AppBotAuthCacheTTLSeconds`, category `app_bot`, default 60s, clamped
   [30, 86400]) — no new env var; injected into bot_api as a
   `func() time.Duration` so bot_api stays decoupled from modules/common.
 
