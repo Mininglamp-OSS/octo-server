@@ -83,9 +83,13 @@ A 10-angle adversarial review surfaced three issues worth fixing before merge
    re-opt-in under the new, clearly-documented semantics.
 2. **Test push ignored configured mention.** `testPush` built the payload via
    `buildPayload` only, so a configured `@` never appeared in the test message —
-   admins would think the config was broken. Fix: `testPush` now runs the same
-   `assemblePushPayload` (directed pills + broadcast, same `broadcastPermitted`
-   rule). Smoke test `TestTestPush_AppliesConfiguredMention` added.
+   admins would think the config was broken. Fix: `testPush` now runs
+   `assemblePushPayload` with **broadcast suppressed** (`broadcastPermitted=false`)
+   — it renders/pings the directed `mention_uids` (the part most likely to be
+   misconfigured, and the thing worth eyeballing in a test) but does NOT fire
+   `@所有人`/`@所有 AI`, so clicking "test" repeatedly can't all-hands-spam the
+   group (broadcast is a boolean switch — no need to test it). Smoke test
+   `TestTestPush_AppliesConfiguredMention` added.
 3. **Field-name footgun guard.** Added an explicit `db:"mention_uids"` tag to the
    `MentionUids` model field so a future "consistency" rename to `MentionUIDs`
    can't silently break the read path (it would map to `mention_ui_ds`).
