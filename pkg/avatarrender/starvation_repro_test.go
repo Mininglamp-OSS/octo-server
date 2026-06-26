@@ -118,8 +118,18 @@ func TestRenderFanoutStarvesVictim(t *testing.T) {
 		workers  = 16 // 成员列表扇出的并发渲染数(远超 2 个 P)
 	)
 
+	// warmup:先跑一轮丢弃,稳定计时/字体缓存,降低首测抖动(PR#481 评审 P2-3)。
+	_ = victimWork(ioRounds, ioRTT)
+
 	// 1) 基线:无洪峰。
 	base := medianVictim(samples, ioRounds, ioRTT)
+
+	// 若基线本身已远高于理想值,说明 runner 已被其它负载/cgroup 压制,GOMAXPROCS=2
+	// 下的洪峰对比失去意义(还会压低 under/base 比值导致误判)。跳过而非误报。
+	ideal := time.Duration(ioRounds) * ioRTT
+	if base > 3*ideal {
+		t.Skipf("runner 过载:基线 %v 已远高于理想 %v,跳过 timing 对比", base, ideal)
+	}
 
 	// 2) 洪峰下。
 	stop, rendered := startRenderFanout(t, workers)

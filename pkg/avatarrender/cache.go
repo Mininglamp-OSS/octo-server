@@ -1,6 +1,7 @@
 package avatarrender
 
 import (
+	"fmt"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
@@ -19,8 +20,12 @@ import (
 //
 // key 由调用方按"决定图像内容的全部因子"生成(与 ETag 同源),Cache 不关心其语义。
 
-// DefaultCacheSize 是未配置时的 LRU 容量(条目数)。默认头像是 200×200 的简单 PNG
-// (数 KB 量级),数千条目的常驻内存在十几 MB 级,足够覆盖活跃用户集。
+// DefaultCacheSize 是未配置时的 LRU 容量(条目数)。
+//
+// 注意:LRU 按**条目数**而非字节计 bound。当前所有渲染输出都是 200×200 的简单 PNG
+// (数 KB 量级),故 4096 条目 ≈ 十几 MB,足够覆盖活跃用户集。若将来有调用方(如
+// #478 群头像)缓存尺寸差异很大的图,常驻内存会随 entries×单图尺寸增长,届时应改为
+// 按字节预算的缓存或下调容量(PR#481 评审)。
 const DefaultCacheSize = 4096
 
 // Hooks 是可观测性回调,全部可选(nil 即 no-op)。刻意用函数字段而非接口,使本包
@@ -136,7 +141,7 @@ func (c *Cache) GetOrRender(key string, render func() ([]byte, error)) ([]byte, 
 }
 
 // renderWithSem 在渲染信号量(若配置)约束下执行一次渲染,并打点等待/耗时/inflight。
-func (c *Cache) renderWithSem(render func() ([]byte, error)) ([]byte, error) {
+func (c *Cache) renderWithSem(render func() ([]byte, error)) (b []byte, err error) {
 	if c.sem != nil {
 		start := time.Now()
 		c.sem <- struct{}{}
@@ -146,10 +151,17 @@ func (c *Cache) renderWithSem(render func() ([]byte, error)) ([]byte, error) {
 	c.hooks.OnInflight(1)
 	defer c.hooks.OnInflight(-1)
 
+	// 用 defer 记录渲染耗时/结果,这样 render() panic 时指标也能落点(否则 Prometheus
+	// 看不到系统性渲染崩溃)。捕获后原样重抛,保持 panic 传播语义不变(PR#481 评审 P2)。
 	start := time.Now()
-	b, err := render()
-	c.hooks.OnRender(time.Since(start), err)
-	return b, err
+	defer func() {
+		if r := recover(); r != nil {
+			c.hooks.OnRender(time.Since(start), fmt.Errorf("avatarrender: render panicked: %v", r))
+			panic(r)
+		}
+		c.hooks.OnRender(time.Since(start), err)
+	}()
+	return render()
 }
 
 // Len 返回当前缓存的条目数(测试/诊断用)。nil 接收者返回 0。

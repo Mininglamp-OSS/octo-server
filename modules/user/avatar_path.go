@@ -29,6 +29,19 @@ func avatarETag(parts ...string) string {
 	return fmt.Sprintf(`W/"%08x"`, h.Sum32())
 }
 
+// avatarCacheKey 为进程级共享渲染缓存（avatarrender.Cache）算 key。parts 与
+// avatarETag 取同一组决定图像内容的因子（渲染版本、uid→颜色、展示文字）。
+//
+// 关键：这里**不能**复用 avatarETag 的 CRC32 摘要。avatarETag 是 32 位 CRC32，
+// 作弱 ETag 没问题（HTTP 304 撞了顶多多渲一次，无害）；但缓存 key 是**跨所有用户
+// 的进程级 []byte 存储身份**，一旦碰撞就会把 A 用户已缓存的头像返回给 B 用户
+// （串图 / 轻度信息泄露）。而且 text=昵称末两字用户可控、CRC32 线性可构造，可被
+// 对抗性投毒。故 key 用 NUL 分隔的完整原始 parts（单射），把碰撞域从 2^32 降到
+// 实际不可碰撞；ETag 头仍用 CRC32 不变。详见 PR#481 评审。
+func avatarCacheKey(parts ...string) string {
+	return strings.Join(parts, "\x00")
+}
+
 // ifNoneMatchSatisfied 报告 If-None-Match 头是否匹配 etag（RFC 7232 §3.2 弱比较：
 // 忽略 W/ 前缀）。支持逗号分隔的多个验证符与通配 "*"。
 func ifNoneMatchSatisfied(header, etag string) bool {
