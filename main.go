@@ -24,6 +24,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/accesslog"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
+	"github.com/Mininglamp-OSS/octo-server/pkg/avatarrender"
 	octodb "github.com/Mininglamp-OSS/octo-server/pkg/db"
 	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
@@ -208,6 +209,29 @@ func runAPI(ctx *config.Context) {
 	// scrape 时读取的 Collector,不起后台 goroutine。此处 rlRedis 与 ctx.DB().DB
 	// 均已就绪,且在 api.Route 之前完成注册。
 	metrics.NewDependencyMetrics(prometheus.DefaultRegisterer)
+	// 头像渲染缓存指标(issue#480):命中率 / 渲染耗时 / inflight / 信号量等待 /
+	// singleflight 合并 / 304。由 modules/user 的 avatarCache 经包级 Observe 函数灌入;
+	// 此处注册即可,未注册前这些 Observe 为 no-op,不影响已构造的 cache。
+	metrics.NewAvatarMetrics(prometheus.DefaultRegisterer)
+	// 构造进程级共享头像渲染缓存,并把观测 hooks 接到上面注册的头像指标。所有头像端点
+	// (user 的 UserAvatar;群组头像渲染合并后亦然——#478)经 avatarrender.GetOrRender
+	// 共用这一个实例:共享 LRU + 同一个渲染信号量(后者唯一,才是真正的进程级渲染并发
+	// 上限)。hooks 在组合根注入,使 pkg/avatarrender 不依赖 pkg/metrics。构造失败则不设
+	// 默认,GetOrRender 退化为直接渲染,不阻断启动。
+	avatarCfg := avatarrender.ConfigFromEnv()
+	avatarCfg.Hooks = avatarrender.Hooks{
+		OnHit:           metrics.ObserveAvatarCacheHit,
+		OnMiss:          metrics.ObserveAvatarCacheMiss,
+		OnShared:        metrics.ObserveAvatarSingleflightShared,
+		OnRender:        metrics.ObserveAvatarRender,
+		OnSemaphoreWait: metrics.ObserveAvatarSemaphoreWait,
+		OnInflight:      metrics.AddAvatarRenderInflight,
+	}
+	if avatarCache, err := avatarrender.NewCache(avatarCfg); err != nil {
+		log.Warn("构造头像渲染缓存失败,退化为无缓存", zap.Error(err))
+	} else {
+		avatarrender.SetDefaultCache(avatarCache)
+	}
 	// 把 octo-lib 客户端接缝的耗时回调接到 DependencyMetrics:
 	//   - MySQL: db.NewMySQL 的 connect/query 计时 → dependency="mysql"
 	//   - Redis: pkg/redis 客户端每条命令计时 → dependency="redis"

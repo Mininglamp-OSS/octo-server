@@ -23,6 +23,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/source"
 	"github.com/Mininglamp-OSS/octo-server/pkg/avatarrender"
 	"github.com/Mininglamp-OSS/octo-server/pkg/avatarversion"
+	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	rd "github.com/go-redis/redis"
@@ -594,14 +595,22 @@ func (u *User) UserAvatar(c *wkhttp.Context) {
 			}
 			setAvatarHeaders(etag)
 			if ifNoneMatchSatisfied(c.GetHeader("If-None-Match"), etag) {
+				metrics.ObserveAvatarNotModified()
 				c.Status(http.StatusNotModified)
 				return
 			}
 
+			// 非条件 GET（disable-cache / 首屏 / 共享缓存 miss）会绕过上面的 304 快路径，
+			// 落到这里真渲染。成员列表扇出下大量并发非条件 GET 会把 CPU 打满、饿死同机
+			// 其它请求（issue#480）。渲染统一走 avatarCache：相同内容 key 命中复用字节、
+			// singleflight 合并并发冷渲染、渲染信号量限并发，确保一次扇出最多渲一张。
+			// key 复用上面算好的 ETag —— 它已覆盖决定图像内容的全部因子，语义与缓存一致。
 			if nameMode {
-				imageData, genErr := avatarrender.Render(avatarrender.Options{
-					Text: text,
-					Bg:   avatarrender.ColorForSeed(uid),
+				imageData, genErr := avatarrender.GetOrRender(etag, func() ([]byte, error) {
+					return avatarrender.Render(avatarrender.Options{
+						Text: text,
+						Bg:   avatarrender.ColorForSeed(uid),
+					})
 				})
 				if genErr == nil {
 					c.Data(http.StatusOK, "image/png", imageData)
@@ -611,7 +620,10 @@ func (u *User) UserAvatar(c *wkhttp.Context) {
 				u.Error("生成昵称默认头像失败，回退兜底", zap.Error(genErr), zap.String("uid", uid))
 				c.Header("ETag", avatarETag("ascii-v1", uid))
 			}
-			imageData, genErr := generateDefaultAvatar(uid)
+			asciiETag := avatarETag("ascii-v1", uid)
+			imageData, genErr := avatarrender.GetOrRender(asciiETag, func() ([]byte, error) {
+				return generateDefaultAvatar(uid)
+			})
 			if genErr != nil {
 				u.Error("生成默认头像失败", zap.Error(genErr))
 				c.Writer.WriteHeader(http.StatusInternalServerError)
