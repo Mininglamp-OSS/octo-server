@@ -44,6 +44,38 @@ func TestCreate_ReturnsAdapterURLs(t *testing.T) {
 	assert.Equal(t, native+"/multica", urls["multica"])
 }
 
+func TestCreate_ReturnsLocalizedAdapterExamples(t *testing.T) {
+	handler, _, groupNo := setupTestEnv(t)
+	w := do(handler, authReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks?lang=en-US", groupNo), map[string]interface{}{
+		"name": "adapter-examples-wh",
+	}))
+	require.Equalf(t, http.StatusOK, w.Code, "create body: %s", w.Body.String())
+	created := parseJSON(t, w)
+
+	urls, ok := created["urls"].(map[string]interface{})
+	require.True(t, ok, "create response must carry urls; body=%s", w.Body.String())
+	rawExamples, ok := created["adapter_examples"].([]interface{})
+	require.True(t, ok, "create response must carry adapter_examples; body=%s", w.Body.String())
+
+	keys := make([]string, 0, len(rawExamples))
+	for _, raw := range rawExamples {
+		ex, ok := raw.(map[string]interface{})
+		require.True(t, ok, "adapter example must be object: %#v", raw)
+		key, _ := ex["key"].(string)
+		keys = append(keys, key)
+		assert.Equal(t, urls[key], ex["url"], "example URL must match urls[%s]", key)
+		assert.Equal(t, "application/json", ex["content_type"])
+		assert.NotEmpty(t, ex["title"])
+		assert.NotEmpty(t, ex["description"])
+		steps, ok := ex["steps"].([]interface{})
+		require.True(t, ok, "steps must be array for %s", key)
+		assert.NotEmpty(t, steps)
+	}
+	assert.Equal(t, []string{"github", "gitlab", "feishu", "multica", "wecom"}, keys)
+	firstDescription, _ := rawExamples[0].(map[string]interface{})["description"].(string)
+	assert.Contains(t, firstDescription, "repository")
+}
+
 // GitHub ping：200 + skipped，不投递消息，且异步记一条 status=3(skipped) 的投递。
 func TestPush_GitHubPing_SkippedAndAudited(t *testing.T) {
 	handler, _, groupNo := setupTestEnv(t)

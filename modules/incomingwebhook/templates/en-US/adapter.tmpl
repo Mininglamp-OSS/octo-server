@@ -1,0 +1,39 @@
+{{define "adapter.github.title"}}GitHub Events{{end}}
+{{define "adapter.github.description"}}Register the following Payload URL in the GitHub repository Webhook settings; no curl wrapper is required.{{end}}
+{{define "adapter.github.steps"}}
+Open the repository -> Settings -> Webhooks -> Add webhook
+Paste the Payload URL, and set Content type to {{.ContentType}}
+Select the events to receive, such as push and pull_request, then save
+{{end}}
+
+{{define "adapter.gitlab.title"}}GitLab Events{{end}}
+{{define "adapter.gitlab.description"}}Add the following URL in the GitLab project Webhooks settings, and set Secret token to the same webhook token.{{end}}
+{{define "adapter.gitlab.steps"}}
+Open the project -> Settings -> Webhooks
+Paste the URL, and set Secret token to this webhook token
+Select the events to receive, such as push and Merge Request, then save
+{{end}}
+
+{{define "adapter.feishu.title"}}Feishu Bot Compatible{{end}}
+{{define "adapter.feishu.description"}}Compatible with Feishu custom bot payloads; replace the existing Feishu bot URL with the following URL without changing the message body.{{end}}
+{{define "adapter.feishu.steps"}}
+Open the existing Feishu custom bot configuration
+Replace the bot Webhook URL with the following URL
+Keep the existing message body and sender logic unchanged
+{{end}}
+
+{{define "adapter.multica.title"}}Multica Events{{end}}
+{{define "adapter.multica.description"}}Add the following URL in the Multica workspace Webhooks settings to receive issue status change events and related updates.{{end}}
+{{define "adapter.multica.steps"}}
+Open the Multica workspace Settings -> Webhooks
+Paste the following URL and save
+Select the issue events to receive
+{{end}}
+
+{{define "adapter.wecom.title"}}WeCom Bot Compatible{{end}}
+{{define "adapter.wecom.description"}}Compatible with WeCom custom bot payloads; replace the existing WeCom bot URL with the following URL to migrate.{{end}}
+{{define "adapter.wecom.steps"}}
+Open the existing WeCom custom bot configuration
+Replace the bot Webhook URL with the following URL
+Keep the existing message body and sender logic unchanged
+{{end}}

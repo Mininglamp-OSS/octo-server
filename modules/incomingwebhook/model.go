@@ -56,9 +56,9 @@ type incomingWebhookModel struct {
 	// 与列名对不上导致读写静默落空。显式 `db:"mention_uids"` tag 兜底读路径：即便将来有人为
 	// 「命名一致」把字段改成 MentionUIDs，dbr Load 仍按 tag 命中列（写路径的 AttrToUnderscore 会
 	// 产出 mention_ui_ds 列名、INSERT 直接报错暴露，不会静默）。
-	MentionUids      string `db:"mention_uids"`
-	LastUsedAt       dbr.NullTime
-	CallCount        int64
+	MentionUids string `db:"mention_uids"`
+	LastUsedAt  dbr.NullTime
+	CallCount   int64
 	db.BaseModel
 }
 
@@ -193,6 +193,9 @@ type createResp struct {
 	// 拼接基础域名。token 仅在 create/regenerate 时可见，故完整推送路径也只在这两处
 	// 下发（list 不回显 token，自然也不回推送 URL）。
 	URLs map[string]string `json:"urls"`
+	// AdapterExamples 是管理端「更多适配器」的本地化接入示例。它复用 URLs 的同一组
+	// path，不含 host；仅在 token 可见的 create/regenerate 响应返回。
+	AdapterExamples []adapterExampleResp `json:"adapter_examples"`
 }
 
 // deliveryResp 是 deliveries 排障端点返回的单条投递记录（成功+失败）。绝不含 token。

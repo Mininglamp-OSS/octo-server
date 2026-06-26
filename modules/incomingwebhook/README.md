@@ -355,9 +355,14 @@ POST /v1/incoming-webhooks/:webhook_id/:token/feishu
 
 需登录态 + 群管理员权限，路径前缀 `/v1/groups/:group_no/incoming-webhooks`。
 
-创建 / 重置（regenerate）响应除历史的 `url`（native 路径）外，还带 `urls` 对象，
-按推送形态给出全部路径（`native` / `github` / `wecom` / `multica` / `gitlab` / `feishu`，
-不含 host，由前端拼接）。token 仅在这两处出现一次，list 不回显 token、也不回推送 URL。
+创建 / 重置（regenerate）响应除历史的 `url`（native 路径）外，还带：
+
+- `urls`：按推送形态给出全部路径（`native` / `github` / `wecom` / `multica` / `gitlab` /
+  `feishu`），不含 host，由前端拼接。
+- `adapter_examples`：面向管理端「更多适配器」区域的本地化接入示例（title /
+  description / steps / auth / content_type），URL 与 `urls` 共享同一组 path。
+
+token 仅在这两处出现一次，list 不回显 token、推送 URL 或 `adapter_examples`。
 
 除创建/列出/更新/删除/重置外，Phase 2 新增两个：
 

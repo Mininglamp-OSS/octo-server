@@ -1,0 +1,39 @@
+{{define "adapter.github.title"}}GitHub 事件{{end}}
+{{define "adapter.github.description"}}GitHub 仓库事件无需 curl，把下面这个 Payload URL 登记到仓库 Webhook 设置。{{end}}
+{{define "adapter.github.steps"}}
+进入仓库 -> Settings -> Webhooks -> Add webhook
+把 Payload URL 填入，Content type 选择 {{.ContentType}}
+勾选需要接收的事件，如 push、pull_request，保存
+{{end}}
+
+{{define "adapter.gitlab.title"}}GitLab 事件{{end}}
+{{define "adapter.gitlab.description"}}在 GitLab 项目 Webhooks 中填入下面地址，并把 Secret token 设为同一 token。{{end}}
+{{define "adapter.gitlab.steps"}}
+进入项目 -> Settings -> Webhooks
+填入 URL，并将 Secret token 设为该 webhook token
+勾选需要接收的事件，如 push、Merge Request，保存
+{{end}}
+
+{{define "adapter.feishu.title"}}飞书机器人兼容{{end}}
+{{define "adapter.feishu.description"}}兼容飞书自定义机器人格式，把现有飞书机器人 URL 换成下面地址即可迁移，消息体无需改动。{{end}}
+{{define "adapter.feishu.steps"}}
+打开已有飞书自定义机器人配置
+将机器人 Webhook URL 替换为下面地址
+保持原消息体和发送逻辑不变
+{{end}}
+
+{{define "adapter.multica.title"}}Multica 事件{{end}}
+{{define "adapter.multica.description"}}在 Multica 工作区 Webhooks 中填入下面地址，接收议题状态变更等事件。{{end}}
+{{define "adapter.multica.steps"}}
+进入 Multica 工作区 Settings -> Webhooks
+填入下面地址并保存
+选择需要接收的议题事件
+{{end}}
+
+{{define "adapter.wecom.title"}}企业微信机器人兼容{{end}}
+{{define "adapter.wecom.description"}}兼容企业微信自定义机器人格式，把现有企业微信机器人 URL 换成下面地址即可迁移。{{end}}
+{{define "adapter.wecom.steps"}}
+打开已有企业微信自定义机器人配置
+将机器人 Webhook URL 替换为下面地址
+保持原消息体和发送逻辑不变
+{{end}}

@@ -488,14 +488,15 @@ func publicURL(webhookID, token string) string {
 // 与 publicURL 一样不含 host。
 func publicURLs(webhookID, token string) map[string]string {
 	base := publicURL(webhookID, token)
-	return map[string]string{
-		"native":  base,
-		"github":  base + "/github",
-		"wecom":   base + "/wecom",
-		"multica": base + "/multica",
-		"gitlab":  base + "/gitlab",
-		"feishu":  base + "/feishu",
+	urls := make(map[string]string, len(publicAdapterCatalog))
+	for _, def := range publicAdapterCatalog {
+		if def.Suffix == "" {
+			urls[def.Key] = base
+			continue
+		}
+		urls[def.Key] = base + "/" + def.Suffix
 	}
+	return urls
 }
 
 // ============================================================
@@ -835,10 +836,11 @@ func (w *IncomingWebhook) create(c *wkhttp.Context) {
 	}
 
 	resp := createResp{
-		webhookResp: toResp(m),
-		Token:       token,
-		URL:         publicURL(m.WebhookID, token),
-		URLs:        publicURLs(m.WebhookID, token),
+		webhookResp:     toResp(m),
+		Token:           token,
+		URL:             publicURL(m.WebhookID, token),
+		URLs:            publicURLs(m.WebhookID, token),
+		AdapterExamples: renderPublicAdapterExamples(w, c, m.WebhookID, token),
 	}
 	c.Response(resp)
 }
@@ -1086,10 +1088,11 @@ func (w *IncomingWebhook) regenerate(c *wkhttp.Context) {
 		return
 	}
 	c.Response(createResp{
-		webhookResp: toResp(updated),
-		Token:       token,
-		URL:         publicURL(webhookID, token),
-		URLs:        publicURLs(webhookID, token),
+		webhookResp:     toResp(updated),
+		Token:           token,
+		URL:             publicURL(webhookID, token),
+		URLs:            publicURLs(webhookID, token),
+		AdapterExamples: renderPublicAdapterExamples(w, c, webhookID, token),
 	})
 }
 
