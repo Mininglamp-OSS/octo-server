@@ -197,8 +197,15 @@ func runAPI(ctx *config.Context) {
 	//   - MySQL: db.NewMySQL 的 connect/query 计时 → dependency="mysql"
 	//   - Redis: pkg/redis 客户端每条命令计时 → dependency="redis"
 	// observer 在调用时按 atomic 解析,construct 时即已挂 hook,故放在此处(指标族
-	// 注册之后、serve 之前)即可,不会漏掉后续流量。注:限流用的 rlRedis 是裸
-	// *rd.Client,绕过 pkg/redis,其单命令延迟不在此覆盖(池指标已覆盖),见 octo-lib#96。
+	// 注册之后、serve 之前)即可,不会漏掉后续流量。
+	//
+	// 覆盖范围(重要):dependency="redis" 只覆盖经 pkg/redis 构造的客户端 ——
+	// 主要是共享缓存 ctx.GetRedisConn()(数据面大头)。全仓还有约 15 处裸
+	// rd.NewClient(octoredis.MustBuildOptions(...))(限流 rlRedis、OIDC state/bind/
+	// logout/sync_lock、bot registry、user/group/space auth、health、各类 Lua 锁等),
+	// 它们需要 Eval/Script/SetNX 等 pkg/redis 包装未暴露的原语,因此都绕过插桩,
+	// 其单命令延迟不进本指标(连接池指标仍覆盖)。在 dependency="redis" 上做告警时
+	// 要知道 auth/OIDC/限流/锁/health 这些路径不可见。通用治理见 octo-lib#96。
 	libdb.SetDBObserver(metrics.ObserveDB)
 	libredis.SetRedisObserver(metrics.ObserveRedisCmd)
 	metrics.RegisterPoolCollectors(prometheus.DefaultRegisterer, ctx.DB().DB, map[string]*rd.Client{

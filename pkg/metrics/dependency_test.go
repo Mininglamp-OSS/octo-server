@@ -69,13 +69,16 @@ func TestObserveObjectStore_UsesDefault(t *testing.T) {
 	}
 }
 
-// histSampleCountByDepOp 返回带指定 dependency+op label 的 histogram 观测次数。
+// histSampleCountByDepOp 返回带指定 dependency+op label 的 histogram 观测次数,
+// 跨 status 累加。dependency+op 下可能同时存在 status=ok 与 status=error 两条序列;
+// 若只取首个匹配会按 protobuf 顺序漏数,故这里把所有匹配序列的 SampleCount 相加。
 func histSampleCountByDepOp(t *testing.T, reg *prometheus.Registry, dependency, op string) uint64 {
 	t.Helper()
 	mfs, err := reg.Gather()
 	if err != nil {
 		t.Fatal(err)
 	}
+	var total uint64
 	for _, mf := range mfs {
 		if mf.GetName() != "dmwork_dependency_duration_seconds" {
 			continue
@@ -91,11 +94,11 @@ func histSampleCountByDepOp(t *testing.T, reg *prometheus.Registry, dependency, 
 				}
 			}
 			if gotDep == dependency && gotOp == op {
-				return m.GetHistogram().GetSampleCount()
+				total += m.GetHistogram().GetSampleCount()
 			}
 		}
 	}
-	return 0
+	return total
 }
 
 func TestDependencyMetrics_ObserveDuration(t *testing.T) {

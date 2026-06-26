@@ -65,10 +65,6 @@ github.com/HdrHistogram/hdrhistogram-go v1.1.2 h1:5IcZpTvzydCQeHzK4Ef/D5rrSqwxob
 github.com/HdrHistogram/hdrhistogram-go v1.1.2/go.mod h1:yDgFjdqOqDEKOvasDdhWNXYg9BVp4O+o5f6V/ehm6Oo=
 github.com/MicahParks/keyfunc v1.9.0 h1:lhKd5xrFHLNOWrDc4Tyb/Q1AJ4LCzQ48GVJyVIID3+o=
 github.com/MicahParks/keyfunc v1.9.0/go.mod h1:IdnCilugA0O/99dW+/MkvlyrsX8+L8+x95xuVNtM5jw=
-github.com/Mininglamp-OSS/octo-lib v0.0.0-20260626053045-e53d3c79ba8a h1:mrq/juKm1hnZOoyPUkbGr8Frp86cjHZAfxLCuZGm7ZM=
-github.com/Mininglamp-OSS/octo-lib v0.0.0-20260626053045-e53d3c79ba8a/go.mod h1:uOCTTI3QdG0ETKZ6uluRWUZgKexee/pY1pQYWyIEvZ0=
-github.com/Mininglamp-OSS/octo-lib v0.0.0-20260626061615-1dd2fe0df345 h1:rvTUY535L2kELV8MPKzgqBZfkSjJDULAWCQm7m9zY3k=
-github.com/Mininglamp-OSS/octo-lib v0.0.0-20260626061615-1dd2fe0df345/go.mod h1:uOCTTI3QdG0ETKZ6uluRWUZgKexee/pY1pQYWyIEvZ0=
 github.com/Mininglamp-OSS/octo-lib v0.0.0-20260626063251-cff4d7a48f55 h1:2reLrd1tHsMwGRaGVXbHVpIzqnlVajkOPwn8hclDraI=
 github.com/Mininglamp-OSS/octo-lib v0.0.0-20260626063251-cff4d7a48f55/go.mod h1:uOCTTI3QdG0ETKZ6uluRWUZgKexee/pY1pQYWyIEvZ0=
 github.com/RichardKnop/logging v0.0.0-20190827224416-1a693bdd4fae h1:DcFpTQBYQ9Ct2d6sC7ol0/ynxc2pO1cpGUM+f4t5adg=
