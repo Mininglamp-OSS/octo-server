@@ -168,34 +168,13 @@ func (bf *BotFather) runtimeOnboarding(c *wkhttp.Context) {
 }
 
 // getOrCreateUserAPIKey looks up the (uid, space_id) api_key row, or
-// creates one with a freshly-generated `uk_<32hex>` token if missing.
-// Extracted from the now-deleted handleDaemon so both the new HTTP
-// endpoint and any future caller can share the same lazy-init semantics.
+// creates one with a freshly-generated `uk_` token if missing.
+// Delegates to the shared UserAPIKeyService so onboarding goes through
+// the same hash/cipher/rotation path as /quickstart (blank clientID
+// defaults to botfather). Extracted from the now-deleted handleDaemon so
+// both the new HTTP endpoint and any future caller share lazy-init.
 func (bf *BotFather) getOrCreateUserAPIKey(uid, spaceID string) (string, error) {
-	existing, err := bf.db.queryUserAPIKeyByUIDAndSpaceID(uid, spaceID)
-	if err != nil {
-		return "", fmt.Errorf("query api_key: %w", err)
-	}
-	if existing != nil {
-		return existing.APIKey, nil
-	}
-	hex, err := randomHex(16)
-	if err != nil {
-		return "", fmt.Errorf("generate api_key: %w", err)
-	}
-	apiKey := UserAPIKeyPrefix + hex
-	if err := bf.db.insertUserAPIKey(uid, apiKey, spaceID); err != nil {
-		// Race: another concurrent caller may have inserted in between.
-		// Re-query — if a row is present now, the other side won the
-		// race and we return their key. If still empty, the INSERT
-		// failed for some other reason (e.g. DB error) and we surface
-		// that.
-		if again, qerr := bf.db.queryUserAPIKeyByUIDAndSpaceID(uid, spaceID); qerr == nil && again != nil {
-			return again.APIKey, nil
-		}
-		return "", fmt.Errorf("insert api_key: %w", err)
-	}
-	return apiKey, nil
+	return bf.apiKeyService.GetOrCreate(uid, spaceID, "")
 }
 
 // deriveOnboardingURLs returns the (server, fleet, matter) URLs the daemon
