@@ -151,7 +151,7 @@ func runAPI(ctx *config.Context) {
 	// token parser 读）。让 GIN access log / token 解析 / handler / service 四条
 	// 分段慢日志能按 trace_id 串到同一次请求。复用入站 X-Request-ID（若有）。
 	route.UseGin(func(c *gin.Context) {
-		id := strings.TrimSpace(c.GetHeader("X-Request-ID"))
+		id := reqid.Sanitize(c.GetHeader("X-Request-ID"))
 		if id == "" {
 			id = reqid.New()
 		}

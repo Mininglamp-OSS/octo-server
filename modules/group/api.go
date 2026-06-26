@@ -996,10 +996,16 @@ func (g *Group) memberAdd(c *wkhttp.Context) {
 	// 一次往返，单独计时。pre_checks 各步的 *_ms 是「取连接 + 执行」之和；本探针把
 	// 「取连接」这一段单拎出来——若 conn_acquire_ms 很小但 get_group_ms 等仍大，说明
 	// 慢在查询执行；若本探针本身就大，说明慢在连接获取 / 复用到被服务端掐死的连接后重连。
+	var connProbeErr string
 	if sqlDB := g.ctx.DB().Connection.DB; sqlDB != nil {
 		tProbe := time.Now()
-		if conn, cErr := sqlDB.Conn(c.Request.Context()); cErr == nil {
-			_ = conn.PingContext(c.Request.Context())
+		conn, cErr := sqlDB.Conn(c.Request.Context())
+		if cErr != nil {
+			connProbeErr = cErr.Error()
+		} else {
+			if pErr := conn.PingContext(c.Request.Context()); pErr != nil {
+				connProbeErr = pErr.Error()
+			}
 			_ = conn.Close() // 归还连接池
 		}
 		connAcquireMs = time.Since(tProbe).Milliseconds()
@@ -1174,6 +1180,7 @@ func (g *Group) memberAdd(c *wkhttp.Context) {
 			zap.Int("requested", len(req.Members)),
 			zap.Int64("pre_checks_ms", preChecksMs),
 			zap.Int64("conn_acquire_ms", connAcquireMs),
+			zap.String("conn_probe_err", connProbeErr),
 			zap.Int64("get_group_ms", getGroupMs),
 			zap.Int64("exist_member_ms", existMemberMs),
 			zap.Int64("bot_ownership_ms", botOwnerMs),
