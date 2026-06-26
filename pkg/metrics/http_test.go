@@ -156,7 +156,7 @@ func TestGinMiddleware_RecordsRequest(t *testing.T) {
 			rec := httptest.NewRecorder()
 			r.ServeHTTP(rec, req)
 
-			got := histogramSampleCount(t, reg, "dmwork_http_request_duration_seconds",
+			got := histogramSampleCount(t, reg, "octo_server_http_request_duration_seconds",
 				map[string]string{
 					"method": tc.wantMethod,
 					"path":   tc.wantPath,
@@ -184,7 +184,7 @@ func TestGinMiddleware_SkipsMetricsEndpoint(t *testing.T) {
 		t.Fatalf("gather: %v", err)
 	}
 	for _, mf := range families {
-		if mf.GetName() == "dmwork_http_request_duration_seconds" {
+		if mf.GetName() == "octo_server_http_request_duration_seconds" {
 			t.Errorf("expected no histogram samples after /metrics scrape, got %d series",
 				len(mf.GetMetric()))
 		}
@@ -264,9 +264,9 @@ func TestNewHTTPMetrics_RegistersOnProvidedRegistry(t *testing.T) {
 		t.Fatalf("gather: %v", err)
 	}
 	want := map[string]bool{
-		"dmwork_http_request_duration_seconds": false,
-		"dmwork_http_requests_in_flight":       false,
-		"dmwork_http_business_error_total":     false,
+		"octo_server_http_request_duration_seconds": false,
+		"octo_server_http_requests_in_flight":       false,
+		"octo_server_http_business_error_total":     false,
 	}
 	for _, mf := range families {
 		if _, ok := want[mf.GetName()]; ok {
@@ -365,7 +365,7 @@ func TestBusinessError_FromEnvelopeStatus(t *testing.T) {
 			r.ServeHTTP(rec, req)
 
 			if tc.wantIncrease {
-				got := counterValue(t, reg, "dmwork_http_business_error_total",
+				got := counterValue(t, reg, "octo_server_http_business_error_total",
 					map[string]string{"path": tc.wantPath, "code": tc.wantCode})
 				if got != 1 {
 					t.Errorf("expected counter=1 for {path=%s, code=%s}, got %v",
@@ -374,7 +374,7 @@ func TestBusinessError_FromEnvelopeStatus(t *testing.T) {
 			} else {
 				families, _ := reg.Gather()
 				for _, mf := range families {
-					if mf.GetName() == "dmwork_http_business_error_total" && len(mf.GetMetric()) > 0 {
+					if mf.GetName() == "octo_server_http_business_error_total" && len(mf.GetMetric()) > 0 {
 						t.Errorf("expected no business_error_total samples, got %d series",
 							len(mf.GetMetric()))
 					}
@@ -399,7 +399,7 @@ func TestBusinessError_FallbackToHTTPStatus(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
-	got := counterValue(t, reg, "dmwork_http_business_error_total",
+	got := counterValue(t, reg, "octo_server_http_business_error_total",
 		map[string]string{"path": "/v1/auth", "code": "401"})
 	if got != 1 {
 		t.Errorf("expected counter=1 for {path=/v1/auth, code=401}, got %v", got)
@@ -416,7 +416,7 @@ func TestBusinessError_PanicCountedAs500(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
-	got := counterValue(t, reg, "dmwork_http_business_error_total",
+	got := counterValue(t, reg, "octo_server_http_business_error_total",
 		map[string]string{"path": "/v1/panic", "code": "500"})
 	if got != 1 {
 		t.Errorf("expected counter=1 for {path=/v1/panic, code=500}, got %v", got)
@@ -439,7 +439,7 @@ func TestBusinessError_SuccessPathNotCounted(t *testing.T) {
 
 	families, _ := reg.Gather()
 	for _, mf := range families {
-		if mf.GetName() == "dmwork_http_business_error_total" && len(mf.GetMetric()) > 0 {
+		if mf.GetName() == "octo_server_http_business_error_total" && len(mf.GetMetric()) > 0 {
 			t.Errorf("expected no business_error_total samples on 200, got %d series",
 				len(mf.GetMetric()))
 		}
@@ -468,7 +468,7 @@ func TestBusinessError_TruncatedBodyFallsBack(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
-	got := counterValue(t, reg, "dmwork_http_business_error_total",
+	got := counterValue(t, reg, "octo_server_http_business_error_total",
 		map[string]string{"path": "/v1/big", "code": "400"})
 	if got != 1 {
 		t.Errorf("expected fallback counter=1 for truncated body, got %v", got)
@@ -484,7 +484,7 @@ func TestBusinessError_UnmatchedRouteUses404(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
-	got := counterValue(t, reg, "dmwork_http_business_error_total",
+	got := counterValue(t, reg, "octo_server_http_business_error_total",
 		map[string]string{"path": "unmatched", "code": "404"})
 	if got != 1 {
 		t.Errorf("expected counter=1 for {path=unmatched, code=404}, got %v", got)

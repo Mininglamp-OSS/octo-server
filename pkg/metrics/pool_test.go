@@ -24,12 +24,12 @@ func TestRedisPoolCollector_EmitsSeries(t *testing.T) {
 	// 六个序列(total/idle gauge + hits/misses/timeouts/stale counter)均应出现,
 	// 且带 client="ratelimit" label。
 	wantNames := []string{
-		"dmwork_redis_pool_total_connections",
-		"dmwork_redis_pool_idle_connections",
-		"dmwork_redis_pool_hits_total",
-		"dmwork_redis_pool_misses_total",
-		"dmwork_redis_pool_timeouts_total",
-		"dmwork_redis_pool_stale_connections_total",
+		"octo_server_redis_pool_total_connections",
+		"octo_server_redis_pool_idle_connections",
+		"octo_server_redis_pool_hits_total",
+		"octo_server_redis_pool_misses_total",
+		"octo_server_redis_pool_timeouts_total",
+		"octo_server_redis_pool_stale_connections_total",
 	}
 	mfs, err := reg.Gather()
 	if err != nil {
@@ -75,7 +75,7 @@ func TestRegisterPoolCollectors_NoInputsNoPanic(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, mf := range mfs {
-		if strings.HasPrefix(mf.GetName(), "dmwork_redis_pool") || strings.HasPrefix(mf.GetName(), "go_sql") {
+		if strings.HasPrefix(mf.GetName(), "octo_server_redis_pool") || strings.HasPrefix(mf.GetName(), "go_sql") {
 			t.Errorf("unexpected family %q registered with no inputs", mf.GetName())
 		}
 	}

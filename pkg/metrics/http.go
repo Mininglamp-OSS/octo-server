@@ -1,4 +1,4 @@
-// Package metrics 收集 dmwork 进程级 Prometheus 指标。
+// Package metrics 收集 octo-server 进程级 Prometheus 指标。
 //
 // HTTP 中间件提供 per-route 的延迟直方图、并发请求计数,
 // 以及"业务错误"计数 —— 后者通过解析响应 body 的 envelope `status` 字段
@@ -23,7 +23,9 @@ import (
 )
 
 const (
-	metricNamespace = "dmwork"
+	// metricNamespace 是所有 pkg/metrics 指标名的前缀(BuildFQName 以 _ 连接,
+	// 故必须是合法 Prometheus 标识符 —— 用下划线形式 octo_server,不能用连字符)。
+	metricNamespace = "octo_server"
 	metricSubsystem = "http"
 
 	// metricsEndpointPath 抓取端点本身在中间件中跳过埋点,

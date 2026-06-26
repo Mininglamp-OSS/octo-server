@@ -194,6 +194,14 @@ func runAPI(ctx *config.Context) {
 	metrics.RegisterPoolCollectors(prometheus.DefaultRegisterer, ctx.DB().DB, map[string]*rd.Client{
 		"ratelimit": rlRedis,
 	})
+	// 合成探针(连接层过路费 SLI):周期性 Ping MySQL / Redis,把「取/建连接 + 一次
+	// 往返」的耗时打进 dependency 直方图(dependency="ping")。线上 health 的 db.Ping
+	// 偶发卡 ~2s,而 SQL 执行很快——这把那笔过路费做成常开、可告警的指标,与慢请求
+	// 时间线对照。复用既有 DependencyMetrics,不新增指标族。15s 一轮、单次 3s 超时。
+	metrics.NewPingProber(15*time.Second, 3*time.Second).
+		Add("mysql", func(c context.Context) error { return ctx.DB().DB.PingContext(c) }).
+		Add("redis_ratelimit", func(context.Context) error { return rlRedis.Ping().Err() }).
+		Start(context.Background())
 	// 在所有指标族注册完成后再起 scrape 端点,避免启动窗口内的 scrape 漏掉
 	// 依赖/连接池指标族(Jerry-Xin #442 review)。
 	metricsSrv := startMetricsScrapeServer()

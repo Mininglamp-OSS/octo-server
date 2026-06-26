@@ -8,7 +8,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// histSampleCount 在 reg 中找 dmwork_dependency_duration_seconds,返回带指定
+// histSampleCount 在 reg 中找 octo_server_dependency_duration_seconds,返回带指定
 // status label 的 histogram 的观测次数(SampleCount)。找不到返回 0。
 func histSampleCount(t *testing.T, reg *prometheus.Registry, status string) uint64 {
 	t.Helper()
@@ -17,7 +17,7 @@ func histSampleCount(t *testing.T, reg *prometheus.Registry, status string) uint
 		t.Fatal(err)
 	}
 	for _, mf := range mfs {
-		if mf.GetName() != "dmwork_dependency_duration_seconds" {
+		if mf.GetName() != "octo_server_dependency_duration_seconds" {
 			continue
 		}
 		for _, m := range mf.GetMetric() {
@@ -74,7 +74,7 @@ func TestDependencyMetrics_Naming(t *testing.T) {
 	m := NewDependencyMetrics(reg)
 	m.Observe(DependencyObjectStore, OpGetFile, "minio", time.Now(), nil)
 
-	const want = "dmwork_dependency_duration_seconds"
+	const want = "octo_server_dependency_duration_seconds"
 	mfs, err := reg.Gather()
 	if err != nil {
 		t.Fatal(err)
