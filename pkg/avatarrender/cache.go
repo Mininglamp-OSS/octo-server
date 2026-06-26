@@ -119,11 +119,16 @@ func (c *Cache) GetOrRender(key string, render func() ([]byte, error)) ([]byte, 
 	}
 	c.hooks.OnMiss()
 
+	// ranRender 标记本次调用是否真的执行了渲染。singleflight 只会运行 leader 的闭包,
+	// 故只有 leader 这里被置 true;等待者的闭包不运行,保持 false。各 goroutine 持有
+	// 自己的局部 ranRender,无跨协程访问,无需同步。
+	ranRender := false
 	v, err, shared := c.group.Do(key, func() (interface{}, error) {
 		// 双检:在等待 singleflight 期间,可能已有同 key 的先行渲染填好了缓存。
 		if v, ok := c.lru.Get(key); ok {
 			return v, nil
 		}
+		ranRender = true
 		b, rerr := c.renderWithSem(render)
 		if rerr != nil {
 			return nil, rerr
@@ -131,7 +136,10 @@ func (c *Cache) GetOrRender(key string, render func() ([]byte, error)) ([]byte, 
 		c.lru.Add(key, b)
 		return b, nil
 	})
-	if shared {
+	// singleflight 的 shared 对 leader 也为 true。OnShared 只应计"被合并到他人渲染
+	// 上的请求"(真正搭便车的等待者),故排除自己执行了渲染的 leader,避免每次 flight
+	// 多计一次(PR#481 评审)。
+	if shared && !ranRender {
 		c.hooks.OnShared()
 	}
 	if err != nil {
@@ -145,8 +153,10 @@ func (c *Cache) renderWithSem(render func() ([]byte, error)) (b []byte, err erro
 	if c.sem != nil {
 		start := time.Now()
 		c.sem <- struct{}{}
-		c.hooks.OnSemaphoreWait(time.Since(start))
+		// 先注册释放,再打点等待耗时:即使 OnSemaphoreWait hook panic,已获取的令牌
+		// 也必被归还,不会泄漏导致信号量逐渐枯竭/死锁(PR#481 评审,防御性)。
 		defer func() { <-c.sem }()
+		c.hooks.OnSemaphoreWait(time.Since(start))
 	}
 	c.hooks.OnInflight(1)
 	defer c.hooks.OnInflight(-1)

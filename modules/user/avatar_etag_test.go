@@ -100,6 +100,20 @@ func TestAvatarCacheKeyDistinguishesFactors(t *testing.T) {
 	}
 }
 
+// TestAvatarCacheKeyInjectiveAcrossPartBoundaries pins the PR#481 hardening:
+// the key encoding must stay injective even when a part contains the separator
+// byte. A naive strings.Join(parts, "\x00") would map these two distinct
+// factor lists to the same key; length-framing keeps them distinct.
+func TestAvatarCacheKeyInjectiveAcrossPartBoundaries(t *testing.T) {
+	if avatarCacheKey("name-v3", "u", "a\x00b") == avatarCacheKey("name-v3", "u\x00a", "b") {
+		t.Fatal("cache key must stay injective across part boundaries (NUL in a part)")
+	}
+	// Empty-vs-absent part must also not alias.
+	if avatarCacheKey("x", "") == avatarCacheKey("x") {
+		t.Fatal("trailing empty part must change the key")
+	}
+}
+
 func TestIfNoneMatchSatisfied(t *testing.T) {
 	etag := `W/"abc12345"`
 	tests := []struct {
