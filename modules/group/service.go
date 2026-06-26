@@ -136,6 +136,21 @@ type Service struct {
 	userDB    *user.DB
 }
 
+// inviteSlowLogThresholdMS 是「邀请成员入群链路耗时」慢日志的阈值（毫秒）：
+// 只有 total_ms ≥ 该值时才打一条 Warn 分段耗时，正常流量不打日志，避免噪音。
+// 这是长期保留的观测，不是一次性探针；阈值可用环境变量
+// DM_GROUP_INVITE_SLOW_LOG_MS 覆盖（缺省 1000ms，<=0 表示每次都打，便于临时排查）。
+var inviteSlowLogThresholdMS = parseInviteSlowLogThresholdMS()
+
+func parseInviteSlowLogThresholdMS() int64 {
+	if v := os.Getenv("DM_GROUP_INVITE_SLOW_LOG_MS"); v != "" {
+		if ms, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return ms
+		}
+	}
+	return 1000
+}
+
 // NewService NewService
 func NewService(ctx *config.Context) IService {
 	return &Service{
@@ -1556,23 +1571,27 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 		go s.notifyBotJoinedGroup(memberUsers, addedUIDSet, req.GroupNo, req.OperatorUID, req.OperatorName)
 	}
 
-	// 邀请成员入群链路分段耗时。字段单位均为毫秒，便于在日志系统里按 total_ms
-	// 排序定位慢请求，再看具体是 im_add_subscriber_ms / send_member_add_ms /
-	// send_cmd_ms 哪一跳吃掉了时间（DB 阶段见 db_ms）。
+	// 邀请成员入群链路分段耗时（仅慢请求落日志）。字段单位均为毫秒，便于在日志
+	// 系统里按 total_ms 排序定位慢请求，再看具体是 im_add_subscriber_ms /
+	// send_member_add_ms / send_cmd_ms 哪一跳吃掉了时间（DB 阶段见 db_ms）。
+	// 正常（<阈值）请求不打日志，长期保留也不会产生噪音。
 	total := time.Since(startedAt)
-	s.Info("邀请成员入群链路耗时",
-		zap.String("group_no", req.GroupNo),
-		zap.String("operator", req.OperatorUID),
-		zap.Int("requested", len(req.Members)),
-		zap.Int("added", len(addedUIDs)),
-		zap.Int64("db_ms", dbDur.Milliseconds()),
-		zap.Int64("channel_update_ms", channelUpdateDur.Milliseconds()),
-		zap.Int64("im_add_subscriber_ms", imSubscriberDur.Milliseconds()),
-		zap.Int64("send_member_add_ms", sendMemberAddDur.Milliseconds()),
-		zap.Int64("send_cmd_ms", sendCMDDur.Milliseconds()),
-		zap.Int64("add_to_threads_ms", addToThreadsDur.Milliseconds()),
-		zap.Int64("total_ms", total.Milliseconds()),
-	)
+	if total.Milliseconds() >= inviteSlowLogThresholdMS {
+		s.Warn("邀请成员入群链路耗时偏高",
+			zap.String("group_no", req.GroupNo),
+			zap.String("operator", req.OperatorUID),
+			zap.Int("requested", len(req.Members)),
+			zap.Int("added", len(addedUIDs)),
+			zap.Int64("db_ms", dbDur.Milliseconds()),
+			zap.Int64("channel_update_ms", channelUpdateDur.Milliseconds()),
+			zap.Int64("im_add_subscriber_ms", imSubscriberDur.Milliseconds()),
+			zap.Int64("send_member_add_ms", sendMemberAddDur.Milliseconds()),
+			zap.Int64("send_cmd_ms", sendCMDDur.Milliseconds()),
+			zap.Int64("add_to_threads_ms", addToThreadsDur.Milliseconds()),
+			zap.Int64("total_ms", total.Milliseconds()),
+			zap.Int64("threshold_ms", inviteSlowLogThresholdMS),
+		)
+	}
 
 	return &AddGroupMembersServiceResp{
 		Added: len(addedUIDs),
