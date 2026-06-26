@@ -13,7 +13,9 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/module"
+	libdb "github.com/Mininglamp-OSS/octo-lib/pkg/db"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
+	libredis "github.com/Mininglamp-OSS/octo-lib/pkg/redis"
 	libwkhttp "github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/server"
 	_ "github.com/Mininglamp-OSS/octo-server/internal"
@@ -191,6 +193,14 @@ func runAPI(ctx *config.Context) {
 	// scrape 时读取的 Collector,不起后台 goroutine。此处 rlRedis 与 ctx.DB().DB
 	// 均已就绪,且在 api.Route 之前完成注册。
 	metrics.NewDependencyMetrics(prometheus.DefaultRegisterer)
+	// 把 octo-lib 客户端接缝的耗时回调接到 DependencyMetrics:
+	//   - MySQL: db.NewMySQL 的 connect/query 计时 → dependency="mysql"
+	//   - Redis: pkg/redis 客户端每条命令计时 → dependency="redis"
+	// observer 在调用时按 atomic 解析,construct 时即已挂 hook,故放在此处(指标族
+	// 注册之后、serve 之前)即可,不会漏掉后续流量。注:限流用的 rlRedis 是裸
+	// *rd.Client,绕过 pkg/redis,其单命令延迟不在此覆盖(池指标已覆盖),见 octo-lib#96。
+	libdb.SetDBObserver(metrics.ObserveDB)
+	libredis.SetRedisObserver(metrics.ObserveRedisCmd)
 	metrics.RegisterPoolCollectors(prometheus.DefaultRegisterer, ctx.DB().DB, map[string]*rd.Client{
 		"ratelimit": rlRedis,
 	})

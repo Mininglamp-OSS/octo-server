@@ -21,6 +21,15 @@ const (
 
 	// DependencyObjectStore 是对象存储类依赖的 dependency label 值。
 	DependencyObjectStore = "objectstore"
+	// DependencyMySQL / DependencyRedis 是 DB / 缓存依赖的 dependency label 值,
+	// 由 octo-lib 客户端接缝(db.SetDBObserver / redis.SetRedisObserver)灌入。
+	DependencyMySQL = "mysql"
+	DependencyRedis = "redis"
+
+	// backendMain 是单库 / 单缓存现状下 mysql/redis 的固定 backend label。
+	// 这两类依赖没有像对象存储那样的多后端实现,固定一个低基数值即可;若将来引入
+	// 读副本 / 多缓存实例,再按实例参数化。
+	backendMain = "main"
 	// OpUploadFile / OpGetFile 是对象存储上「真正发生网络 I/O」的两个操作的 op
 	// label 值:上传(PutObject 等)与读取对象(GetObject+Stat 等)。
 	// 注意:不为 DownloadURL 打点 —— 各后端的 DownloadURL 只是从 config 本地拼出
@@ -65,11 +74,17 @@ func NewDependencyMetrics(reg prometheus.Registerer) *DependencyMetrics {
 
 // Observe 记录一次依赖调用。status 由 err 是否为 nil 决定。
 func (m *DependencyMetrics) Observe(dependency, op, backend string, start time.Time, err error) {
+	m.ObserveDuration(dependency, op, backend, time.Since(start), err)
+}
+
+// ObserveDuration 同 Observe,但直接接收耗时而非起始时间。用于适配 octo-lib 客户端
+// 接缝的 observer 回调签名(dbr 给的是纳秒耗时,而非 start time)。
+func (m *DependencyMetrics) ObserveDuration(dependency, op, backend string, dur time.Duration, err error) {
 	status := dependencyStatusOK
 	if err != nil {
 		status = dependencyStatusError
 	}
-	m.Duration.WithLabelValues(dependency, op, backend, status).Observe(time.Since(start).Seconds())
+	m.Duration.WithLabelValues(dependency, op, backend, status).Observe(dur.Seconds())
 }
 
 // ObserveObjectStore 是对象存储调用的包级便捷入口,供 modules/file 等调用方使用,
@@ -84,5 +99,23 @@ func (m *DependencyMetrics) Observe(dependency, op, backend string, start time.T
 func ObserveObjectStore(op, backend string, start time.Time, err error) {
 	if m := defaultDependencyMetrics.Load(); m != nil {
 		m.Observe(DependencyObjectStore, op, backend, start, err)
+	}
+}
+
+// ObserveDB 是 MySQL 客户端调用的包级入口,签名精确匹配 octo-lib 的 db.DBObserver。
+// 在 main 里用 db.SetDBObserver(metrics.ObserveDB) 注入。op 取值 "connect" / "query"。
+// 未初始化默认实例时为 no-op。
+func ObserveDB(op string, dur time.Duration, err error) {
+	if m := defaultDependencyMetrics.Load(); m != nil {
+		m.ObserveDuration(DependencyMySQL, op, backendMain, dur, err)
+	}
+}
+
+// ObserveRedisCmd 是 Redis 命令的包级入口,签名精确匹配 octo-lib 的 redis.RedisObserver。
+// 在 main 里用 redis.SetRedisObserver(metrics.ObserveRedisCmd) 注入。op 为命令名(已小写)。
+// 未初始化默认实例时为 no-op。
+func ObserveRedisCmd(op string, dur time.Duration, err error) {
+	if m := defaultDependencyMetrics.Load(); m != nil {
+		m.ObserveDuration(DependencyRedis, op, backendMain, dur, err)
 	}
 }
