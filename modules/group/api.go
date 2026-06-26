@@ -961,6 +961,20 @@ func (g *Group) groupUpdate(c *wkhttp.Context) {
 
 // 添加成员
 func (g *Group) memberAdd(c *wkhttp.Context) {
+	// 链路耗时定位（邀请成员 POST 慢排查）：handlerStart 覆盖整个 handler。
+	// service 内 AddGroupMembers 的分段日志只量到 service 那一段，handler 在
+	// 调 service 之前的写前校验（getGroupInfo / ExistMember / checkBotOwnership
+	// / GetAppConfig / Bot Space 隔离循环）此前没人测——这里把那段补齐，
+	// 复用 inviteSlowLogThresholdMS 同一慢阈值，仅慢请求落日志。
+	handlerStart := time.Now()
+	var (
+		getGroupMs    int64
+		existMemberMs int64
+		botOwnerMs    int64
+		appConfigMs   int64
+		botSpaceMs    int64
+		preChecksMs   int64
+	)
 	operator := c.MustGet("uid").(string)
 	operatorName := c.MustGet("name").(string)
 	var req memberAddReq
@@ -977,13 +991,17 @@ func (g *Group) memberAdd(c *wkhttp.Context) {
 	/**
 	判断群是否存在
 	**/
+	tStep := time.Now()
 	group, err := g.getGroupInfo(groupNo)
+	getGroupMs = time.Since(tStep).Milliseconds()
 	if err != nil {
 		respondGroupInfoError(c, err)
 		return
 	}
 	// 校验操作者是群成员,防止任意用户向任意群添加成员(issue#1018)
+	tStep = time.Now()
 	isMember, err := g.db.ExistMember(operator, groupNo)
+	existMemberMs = time.Since(tStep).Milliseconds()
 	if err != nil {
 		g.Error("查询群成员关系失败", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
@@ -1001,7 +1019,10 @@ func (g *Group) memberAdd(c *wkhttp.Context) {
 	// 白名单，一律走 creator 路径。参见 checkBotOwnership 函数注释。
 	// 注意：该检查故意放在系统账号 / Invite 模式等策略检查之前，以最小化
 	// 攻击面——非授权方对 bot 的探测请求应尽早被拒绝。
-	if botErr := checkBotOwnership(g.ctx.DB(), operator, req.Members); botErr != nil {
+	tStep = time.Now()
+	botErr := checkBotOwnership(g.ctx.DB(), operator, req.Members)
+	botOwnerMs = time.Since(tStep).Milliseconds()
+	if botErr != nil {
 		if errors.Is(botErr, ErrBotOwnershipDenied) {
 			httperr.ResponseErrorL(c, errcode.ErrGroupBotOwnershipDenied, nil, nil)
 			return
@@ -1012,7 +1033,9 @@ func (g *Group) memberAdd(c *wkhttp.Context) {
 	}
 
 	// 判断是否允许系统账号进入群聊
+	tStep = time.Now()
 	appConfig, err := g.commonService.GetAppConfig()
+	appConfigMs = time.Since(tStep).Milliseconds()
 	if err != nil {
 		g.Error("查询应用设置错误", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
@@ -1049,6 +1072,7 @@ func (g *Group) memberAdd(c *wkhttp.Context) {
 
 	// Bot Space 隔离检查：如果群属于某个 Space，Bot 必须在邀请人的有效 Space 中
 	// （内部成员：群的 Space；外部成员：来源 Space）
+	tStep = time.Now()
 	if group.SpaceID != "" {
 		inviterSpaceID := group.SpaceID
 		operatorMember, opErr := g.db.QueryMemberWithUID(operator, groupNo)
@@ -1083,6 +1107,11 @@ func (g *Group) memberAdd(c *wkhttp.Context) {
 		}
 	}
 
+	botSpaceMs = time.Since(tStep).Milliseconds()
+
+	// 至此为 handler 在调 service 之前的全部写前校验耗时。
+	preChecksMs = time.Since(handlerStart).Milliseconds()
+
 	// 调用 Service 添加群成员
 	_, err = g.groupService.AddGroupMembers(&AddGroupMembersServiceReq{
 		GroupNo:      groupNo,
@@ -1112,6 +1141,27 @@ func (g *Group) memberAdd(c *wkhttp.Context) {
 		g.Error("添加群成员失败", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
+	}
+
+	// handler 级链路耗时（仅慢请求落日志）。与 GIN 访问日志的总耗时对照：
+	//   GIN_total - handler_total ≈ 中间件耗时；
+	//   handler_total - service total_ms ≈ handler 写前校验耗时（= pre_checks_ms）。
+	// pre_checks_ms 再按 get_group / exist_member / bot_ownership / app_config /
+	// bot_space 分摊，定位「埋点之外那 ~4.5s」到底卡在哪一步。
+	if handlerTotalMs := time.Since(handlerStart).Milliseconds(); handlerTotalMs >= inviteSlowLogThresholdMS {
+		g.Warn("邀请成员 handler 链路耗时偏高",
+			zap.String("group_no", groupNo),
+			zap.String("operator", operator),
+			zap.Int("requested", len(req.Members)),
+			zap.Int64("pre_checks_ms", preChecksMs),
+			zap.Int64("get_group_ms", getGroupMs),
+			zap.Int64("exist_member_ms", existMemberMs),
+			zap.Int64("bot_ownership_ms", botOwnerMs),
+			zap.Int64("app_config_ms", appConfigMs),
+			zap.Int64("bot_space_ms", botSpaceMs),
+			zap.Int64("handler_total_ms", handlerTotalMs),
+			zap.Int64("threshold_ms", inviteSlowLogThresholdMS),
+		)
 	}
 
 	c.ResponseOK()

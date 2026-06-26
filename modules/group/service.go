@@ -1369,6 +1369,7 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 	// 同时当群的 AllowExternal==0 时，非 admin/creator 不能邀请外部成员。
 	externalMap := make(map[string]bool)
 	sourceSpaceMap := make(map[string]string)
+	spaceCheckStart := time.Now()
 	if groupModel.SpaceID != "" {
 		var operatorMember *MemberModel
 		if req.OperatorUID != "" {
@@ -1397,6 +1398,7 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 			}
 		}
 	}
+	spaceCheckMs := time.Since(spaceCheckStart).Milliseconds()
 
 	// 查询用户信息
 	memberUsers, err := s.userDB.QueryByUIDs(uniqueUIDs)
@@ -1426,6 +1428,7 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 	}
 
 	// 开启事务
+	txStart := time.Now()
 	tx, err := s.ctx.DB().Begin()
 	if err != nil {
 		s.Error("begin transaction failed", zap.Error(err))
@@ -1505,7 +1508,10 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 		s.Error("commit transaction failed", zap.Error(err))
 		return nil, errors.New("failed to commit transaction")
 	}
-	// DB 阶段（查询 + 校验 + 事务）耗时——与下面的 IM 阶段分段对比。
+	// 事务（GenSeq + insert/recover + commit）耗时。
+	txMs := time.Since(txStart).Milliseconds()
+	// DB 阶段（查询 + 校验 + 事务）总耗时——与下面的 IM 阶段分段对比。
+	// db_ms 进一步拆成 space_check_ms（每成员 CheckMembership 循环）与 tx_ms。
 	dbDur := time.Since(startedAt)
 
 	var (
@@ -1583,6 +1589,8 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 			zap.Int("requested", len(req.Members)),
 			zap.Int("added", len(addedUIDs)),
 			zap.Int64("db_ms", dbDur.Milliseconds()),
+			zap.Int64("space_check_ms", spaceCheckMs),
+			zap.Int64("tx_ms", txMs),
 			zap.Int64("channel_update_ms", channelUpdateDur.Milliseconds()),
 			zap.Int64("im_add_subscriber_ms", imSubscriberDur.Milliseconds()),
 			zap.Int64("send_member_add_ms", sendMemberAddDur.Milliseconds()),
