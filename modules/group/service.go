@@ -1319,6 +1319,10 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 		return nil, errors.New("members is required")
 	}
 
+	// 链路耗时定位（邀请成员入群慢排查）：startedAt 覆盖整条 AddGroupMembers，
+	// 配合事务提交点与各 WuKongIM 调用的分段计时，区分 DB 阶段 vs IM 阶段。
+	startedAt := time.Now()
+
 	// 群存在性 + 状态检查
 	groupModel, err := s.db.QueryWithGroupNo(req.GroupNo)
 	if err != nil {
@@ -1486,14 +1490,28 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 		s.Error("commit transaction failed", zap.Error(err))
 		return nil, errors.New("failed to commit transaction")
 	}
+	// DB 阶段（查询 + 校验 + 事务）耗时——与下面的 IM 阶段分段对比。
+	dbDur := time.Since(startedAt)
+
+	var (
+		channelUpdateDur time.Duration
+		imSubscriberDur  time.Duration
+		sendMemberAddDur time.Duration
+		sendCMDDur       time.Duration
+		addToThreadsDur  time.Duration
+	)
 
 	if markedExternal {
+		t0 := time.Now()
 		s.ctx.SendChannelUpdateToGroup(req.GroupNo)
+		channelUpdateDur = time.Since(t0)
 	}
 
-	// IM 操作（事务提交之后）
+	// IM 操作（事务提交之后）。这一段是同步、串行、对 WuKongIM 的阻塞 HTTP 调用，
+	// 也是「邀请成员慢」的主要嫌疑段；逐跳计时以便从日志定位是哪一跳慢。
 	if len(addedUIDs) > 0 {
 		// 添加 IM 订阅
+		t0 := time.Now()
 		if err := s.ctx.IMAddSubscriber(&config.SubscriberAddReq{
 			ChannelID:   req.GroupNo,
 			ChannelType: common.ChannelTypeGroup.Uint8(),
@@ -1501,16 +1519,20 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 		}); err != nil {
 			s.Error("add IM subscriber failed", zap.Error(err))
 		}
+		imSubscriberDur = time.Since(t0)
 
 		// 发布成员添加事件
+		t0 = time.Now()
 		s.ctx.SendGroupMemberAdd(&config.MsgGroupMemberAddReq{
 			Operator:     req.OperatorUID,
 			OperatorName: req.OperatorName,
 			GroupNo:      req.GroupNo,
 			Members:      addedVos,
 		})
+		sendMemberAddDur = time.Since(t0)
 
 		// 发送群成员更新 CMD
+		t0 = time.Now()
 		s.ctx.SendCMD(config.MsgCMDReq{
 			ChannelID:   req.GroupNo,
 			ChannelType: common.ChannelTypeGroup.Uint8(),
@@ -1519,9 +1541,12 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 				"group_no": req.GroupNo,
 			},
 		})
+		sendCMDDur = time.Since(t0)
 
 		// 同步新成员到群内所有子区的 IM 订阅（直接 SQL 查 thread 表）
+		t0 = time.Now()
 		s.addUsersToGroupThreads(req.GroupNo, addedUIDs)
+		addToThreadsDur = time.Since(t0)
 
 		// 检查新增成员中是否有 Bot，推送 bot_joined_group 事件
 		addedUIDSet := make(map[string]bool, len(addedUIDs))
@@ -1530,6 +1555,24 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 		}
 		go s.notifyBotJoinedGroup(memberUsers, addedUIDSet, req.GroupNo, req.OperatorUID, req.OperatorName)
 	}
+
+	// 邀请成员入群链路分段耗时。字段单位均为毫秒，便于在日志系统里按 total_ms
+	// 排序定位慢请求，再看具体是 im_add_subscriber_ms / send_member_add_ms /
+	// send_cmd_ms 哪一跳吃掉了时间（DB 阶段见 db_ms）。
+	total := time.Since(startedAt)
+	s.Info("邀请成员入群链路耗时",
+		zap.String("group_no", req.GroupNo),
+		zap.String("operator", req.OperatorUID),
+		zap.Int("requested", len(req.Members)),
+		zap.Int("added", len(addedUIDs)),
+		zap.Int64("db_ms", dbDur.Milliseconds()),
+		zap.Int64("channel_update_ms", channelUpdateDur.Milliseconds()),
+		zap.Int64("im_add_subscriber_ms", imSubscriberDur.Milliseconds()),
+		zap.Int64("send_member_add_ms", sendMemberAddDur.Milliseconds()),
+		zap.Int64("send_cmd_ms", sendCMDDur.Milliseconds()),
+		zap.Int64("add_to_threads_ms", addToThreadsDur.Milliseconds()),
+		zap.Int64("total_ms", total.Milliseconds()),
+	)
 
 	return &AddGroupMembersServiceResp{
 		Added: len(addedUIDs),
