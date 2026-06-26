@@ -194,7 +194,7 @@ func TestBotToken_NoBearer_401(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, w.Code, "body: %s", w.Body.String())
 }
 
-// 5) api_key.space_id='' (legacy pre-v2 rows) → 401 (resolveAPIKey filters)
+// 5) api_key.space_id="" (legacy pre-v2 rows) -> 401 (resolveAPIKey filters)
 func TestBotToken_LegacyEmptySpace_401(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))

@@ -5,16 +5,16 @@
 // keeping them here makes the eventual deprecation of botfather's older
 // runtime/bot APIs cleaner.
 //
-//   POST /v1/bot/mint        — web-callable, session-auth, mints a bot
-//                              OBO and returns {bot_uid}. bot_token
-//                              stays in server's robot table.
-//   GET  /v1/bot/:uid/token  — daemon-callable, api_key Bearer (uk_ prefix),
-//                              returns {bot_token}. Authz: caller's api_key
-//                              uid must equal the bot's creator_uid AND the
-//                              bot must be a member of the api_key's bound
-//                              space. (Pre-v2 file-top doc described a JWT
-//                              path that no longer exists — JWT teardown
-//                              landed in 决策一+二 Phase 4.)
+//	POST /v1/bot/mint        — web-callable, session-auth, mints a bot
+//	                           OBO and returns {bot_uid}. bot_token
+//	                           stays in server's robot table.
+//	GET  /v1/bot/:uid/token  — daemon-callable, api_key Bearer (uk_ prefix),
+//	                           returns {bot_token}. Authz: caller's api_key
+//	                           uid must equal the bot's creator_uid AND the
+//	                           bot must be a member of the api_key's bound
+//	                           space. (Pre-v2 file-top doc described a JWT
+//	                           path that no longer exists — JWT teardown
+//	                           landed in 决策一+二 Phase 4.)
 package bot_provision
 
 import (

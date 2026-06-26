@@ -194,7 +194,7 @@ func TestAuthVerifyAPIKey_NonBotfatherClient_401(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
-// Case 4: legacy space_id='' 的 api_key → 401 (合并 plan §3 显式拒绝)
+// Case 4: legacy space_id="" api_key -> 401 (merge plan section 3 rejects it)
 func TestAuthVerifyAPIKey_LegacyEmptySpace(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
@@ -481,15 +481,15 @@ func TestAuthVerifyAPIKey_IncludeContext_DBError_FailSecure(t *testing.T) {
 	insertAPIKey(t, ctx, testAPIKeyUID, "uk_dberr_aaaaaaaaaaaaaaaaaaaaaaaaa", testAPIKeySpaceA)
 
 	// Hide robot so queryOwnedBotsBySpace fails (table not found), while
-// step 2 membership check (space_member + space + user) still PASSes —
-// otherwise step 2 would 401 early and we'd never reach the step 3
-// fail-secure path. RENAME is atomic; defer restore so no test
-// pollution.
-_, err := ctx.DB().Exec("RENAME TABLE robot TO robot_tmp_v336_apikey")
-require.NoError(t, err)
-defer func() {
-    _, _ = ctx.DB().Exec("RENAME TABLE robot_tmp_v336_apikey TO robot")
-}()
+	// step 2 membership check (space_member + space + user) still PASSes —
+	// otherwise step 2 would 401 early and we'd never reach the step 3
+	// fail-secure path. RENAME is atomic; defer restore so no test
+	// pollution.
+	_, err := ctx.DB().Exec("RENAME TABLE robot TO robot_tmp_v336_apikey")
+	require.NoError(t, err)
+	defer func() {
+		_, _ = ctx.DB().Exec("RENAME TABLE robot_tmp_v336_apikey TO robot")
+	}()
 
 	w := doVerifyAPIKeyCtx(t, s, map[string]string{"api_key": "uk_dberr_aaaaaaaaaaaaaaaaaaaaaaaaa"})
 	require.Equal(t, http.StatusOK, w.Code,

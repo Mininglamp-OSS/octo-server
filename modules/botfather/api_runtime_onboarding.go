@@ -16,8 +16,8 @@ import (
 	"net/http"
 	"strings"
 
-	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
 )
 
@@ -48,12 +48,12 @@ type onboardingCmds struct {
 //
 // Behavior mirrors the now-removed handleDaemon (formerly BotFather IM
 // `/daemon` command):
-//   1. Resolve caller uid + space_id
-//   2. Verify caller is an active member of an active space + active user
-//      (D11 撤销链路审计: token cache 路径 + DB SQL gate 双层防护)
-//   3. getOrCreate user_api_key for (uid, space_id)
-//   4. Derive server / fleet / matter URLs from server config
-//   5. Pre-render install + start command strings for display
+//  1. Resolve caller uid + space_id
+//  2. Verify caller is an active member of an active space + active user
+//     (D11 撤销链路审计: token cache 路径 + DB SQL gate 双层防护)
+//  3. getOrCreate user_api_key for (uid, space_id)
+//  4. Derive server / fleet / matter URLs from server config
+//  5. Pre-render install + start command strings for display
 //
 // space_id source: the request must carry a verified space context (either
 // via X-Space-Id header set by middleware or query param ?space_id=). If

@@ -304,8 +304,8 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 		v.POST("/user/login/check_phone", loginLimit, u.loginCheckPhone)           //登录验证设备手机号
 
 		// #################### Token / Bot 认证验证（供 Gateway 调用） ####################
-		v.POST("/auth/verify", verifyLimit, u.authVerifyToken)         // 验证用户 token
-		v.POST("/auth/verify-bot", verifyLimit, u.authVerifyBot)       // 验证 Bot API Key
+		v.POST("/auth/verify", verifyLimit, u.authVerifyToken)          // 验证用户 token
+		v.POST("/auth/verify-bot", verifyLimit, u.authVerifyBot)        // 验证 Bot API Key
 		v.POST("/auth/verify-api-key", verifyLimit, u.authVerifyAPIKey) // 验证 daemon API Key (uk_)
 		// ↑ Verify endpoints are rate-limited (1000 req/min/IP). For production,
 		// restrict access at network level (nginx allow internal IPs only) or
