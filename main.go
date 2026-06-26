@@ -28,6 +28,7 @@ import (
 	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
+	"github.com/Mininglamp-OSS/octo-server/pkg/reqid"
 	"github.com/gin-gonic/gin"
 	rd "github.com/go-redis/redis"
 	"github.com/judwhite/go-svc"
@@ -145,6 +146,20 @@ func runAPI(ctx *config.Context) {
 	if err != nil {
 		panic(err)
 	}
+	// trace_id 中间件（最前）：为每次请求生成/透传一个 trace_id，写进 gin.Context
+	// （供 access-log formatter 与 handler 读）和 request context（供 pkg/auth 的
+	// token parser 读）。让 GIN access log / token 解析 / handler / service 四条
+	// 分段慢日志能按 trace_id 串到同一次请求。复用入站 X-Request-ID（若有）。
+	route.UseGin(func(c *gin.Context) {
+		id := strings.TrimSpace(c.GetHeader("X-Request-ID"))
+		if id == "" {
+			id = reqid.New()
+		}
+		c.Set(reqid.GinKey, id)
+		c.Request = c.Request.WithContext(reqid.WithTraceID(c.Request.Context(), id))
+		c.Writer.Header().Set("X-Request-ID", id)
+		c.Next()
+	})
 	route.UseGin(octoi18n.EarlyMiddleware(octoi18n.MiddlewareOptions{
 		DefaultLanguage:        defaultLanguage,
 		TrustedLangHeaderCIDRs: trustedLangCIDRs,

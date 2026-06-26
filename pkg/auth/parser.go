@@ -4,11 +4,34 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/cache"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/reqid"
+	"go.uber.org/zap"
 )
+
+// authSlowLog 仅在 token 解析整体耗时超阈值时打一行，定位 AuthMiddleware 在
+// 「~3.3s 中间件缺口」里的占比：token_ms=Cache.Get(Redis)、lang_ms=语言 resolver
+// （热缓存→DB）、role_ms=角色 resolver（热缓存→DB）。正常请求不打日志。
+var authSlowLog = log.NewTLog("authParser")
+
+// authSlowLogThresholdMS 慢阈值（毫秒），env DM_AUTH_SLOWLOG_MS 可调，默认 200ms。
+var authSlowLogThresholdMS = parseAuthSlowLogThresholdMS()
+
+func parseAuthSlowLogThresholdMS() int64 {
+	if v := strings.TrimSpace(os.Getenv("DM_AUTH_SLOWLOG_MS")); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 200
+}
 
 // LanguageResolver hydrates UserInfo.Language with the freshest user-language
 // preference (Redis cache → DB → ""). It is intentionally a tiny interface
@@ -101,7 +124,11 @@ func (p *CacheTokenParser) Parse(ctx context.Context, token string) (wkhttp.User
 	if strings.TrimSpace(token) == "" {
 		return wkhttp.UserInfo{}, wkhttp.ErrTokenMissing
 	}
+	parseStart := time.Now()
+	var tokenMs, langMs, roleMs int64
+	tokenStart := time.Now()
 	raw, err := p.Cache.Get(p.Prefix + token)
+	tokenMs = time.Since(tokenStart).Milliseconds()
 	if err != nil {
 		return wkhttp.UserInfo{}, fmt.Errorf("auth: load token from cache: %w", err)
 	}
@@ -131,7 +158,9 @@ func (p *CacheTokenParser) Parse(ctx context.Context, token string) (wkhttp.User
 		//     — a stale-read regression worth a dedicated test, see
 		//     parser_test.go::TestCacheTokenParserResolverEmptyClearsSnapshot.
 		//   * resolved != ""  → use the fresh authoritative value.
+		langStart := time.Now()
 		resolved, rerr := p.resolver.Resolve(ctx, info.UID)
+		langMs = time.Since(langStart).Milliseconds()
 		if rerr == nil {
 			language = resolved
 		}
@@ -150,10 +179,23 @@ func (p *CacheTokenParser) Parse(ctx context.Context, token string) (wkhttp.User
 		//     whole point of resolving per request rather than trusting the
 		//     baked-in role.
 		//   * resolved != "" → use the fresh authoritative role.
+		roleStart := time.Now()
 		resolved, rerr := p.roleResolver.ResolveRole(ctx, info.UID)
+		roleMs = time.Since(roleStart).Milliseconds()
 		if rerr == nil {
 			role = resolved
 		}
+	}
+	if totalMs := time.Since(parseStart).Milliseconds(); totalMs >= authSlowLogThresholdMS {
+		authSlowLog.Warn("token 解析链路耗时偏高",
+			zap.String("trace_id", reqid.FromContext(ctx)),
+			zap.String("uid", info.UID),
+			zap.Int64("token_ms", tokenMs),
+			zap.Int64("lang_ms", langMs),
+			zap.Int64("role_ms", roleMs),
+			zap.Int64("total_ms", totalMs),
+			zap.Int64("threshold_ms", authSlowLogThresholdMS),
+		)
 	}
 	return wkhttp.UserInfo{
 		UID:      info.UID,

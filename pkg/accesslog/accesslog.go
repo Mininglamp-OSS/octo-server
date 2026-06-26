@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-server/pkg/reqid"
 	"github.com/gin-gonic/gin"
 )
 
@@ -126,11 +127,15 @@ func Formatter(param gin.LogFormatterParams) string {
 	if param.Latency > time.Minute {
 		param.Latency = param.Latency.Truncate(time.Second)
 	}
-	return fmt.Sprintf("[GIN] %v |%s %3d %s| %13v | %15s |%s %-7s %s %#v\n%s",
+	// trace_id 串联同一次请求的各分段慢日志(auth/handler/service);由 reqid
+	// 中间件写入 gin.Context,经 param.Keys 透出。缺失时留空,不影响原格式。
+	traceID, _ := param.Keys[reqid.GinKey].(string)
+	return fmt.Sprintf("[GIN] %v |%s %3d %s| %13v | %15s | trace_id=%s |%s %-7s %s %#v\n%s",
 		param.TimeStamp.Format("2006/01/02 - 15:04:05"),
 		statusColor, param.StatusCode, resetColor,
 		param.Latency,
 		param.ClientIP,
+		traceID,
 		methodColor, param.Method, resetColor,
 		ScrubPath(param.Path),
 		param.ErrorMessage,

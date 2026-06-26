@@ -33,6 +33,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
+	"github.com/Mininglamp-OSS/octo-server/pkg/reqid"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"github.com/gin-gonic/gin"
@@ -974,7 +975,9 @@ func (g *Group) memberAdd(c *wkhttp.Context) {
 		appConfigMs   int64
 		botSpaceMs    int64
 		preChecksMs   int64
+		connAcquireMs int64
 	)
+	traceID := c.GetString(reqid.GinKey)
 	operator := c.MustGet("uid").(string)
 	operatorName := c.MustGet("name").(string)
 	var req memberAddReq
@@ -988,6 +991,20 @@ func (g *Group) memberAdd(c *wkhttp.Context) {
 		return
 	}
 	groupNo := c.Param("group_no")
+
+	// 连接获取探针（邀请慢二级定位）：显式从连接池取一条连接并 PingContext 强制
+	// 一次往返，单独计时。pre_checks 各步的 *_ms 是「取连接 + 执行」之和；本探针把
+	// 「取连接」这一段单拎出来——若 conn_acquire_ms 很小但 get_group_ms 等仍大，说明
+	// 慢在查询执行；若本探针本身就大，说明慢在连接获取 / 复用到被服务端掐死的连接后重连。
+	if sqlDB := g.ctx.DB().Connection.DB; sqlDB != nil {
+		tProbe := time.Now()
+		if conn, cErr := sqlDB.Conn(c.Request.Context()); cErr == nil {
+			_ = conn.PingContext(c.Request.Context())
+			_ = conn.Close() // 归还连接池
+		}
+		connAcquireMs = time.Since(tProbe).Milliseconds()
+	}
+
 	/**
 	判断群是否存在
 	**/
@@ -1118,6 +1135,7 @@ func (g *Group) memberAdd(c *wkhttp.Context) {
 		Members:      req.Members,
 		OperatorUID:  operator,
 		OperatorName: operatorName,
+		TraceID:      traceID,
 	})
 	if err != nil {
 		// AddGroupMembers 会返回业务拒绝（如 allow_external=0 群里普通成员邀请
@@ -1150,10 +1168,12 @@ func (g *Group) memberAdd(c *wkhttp.Context) {
 	// bot_space 分摊，定位「埋点之外那 ~4.5s」到底卡在哪一步。
 	if handlerTotalMs := time.Since(handlerStart).Milliseconds(); handlerTotalMs >= inviteSlowLogThresholdMS {
 		g.Warn("邀请成员 handler 链路耗时偏高",
+			zap.String("trace_id", traceID),
 			zap.String("group_no", groupNo),
 			zap.String("operator", operator),
 			zap.Int("requested", len(req.Members)),
 			zap.Int64("pre_checks_ms", preChecksMs),
+			zap.Int64("conn_acquire_ms", connAcquireMs),
 			zap.Int64("get_group_ms", getGroupMs),
 			zap.Int64("exist_member_ms", existMemberMs),
 			zap.Int64("bot_ownership_ms", botOwnerMs),

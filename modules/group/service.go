@@ -966,6 +966,7 @@ type AddGroupMembersServiceReq struct {
 	Members      []string // 待添加成员 UID 列表
 	OperatorUID  string   // 操作者 UID
 	OperatorName string   // 操作者名称
+	TraceID      string   // 请求级 trace_id（reqid），用于串联 handler/service/auth/GIN 分段慢日志
 }
 
 // AddGroupMembersServiceResp 添加群成员响应
@@ -1338,8 +1339,19 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 	// 配合事务提交点与各 WuKongIM 调用的分段计时，区分 DB 阶段 vs IM 阶段。
 	startedAt := time.Now()
 
+	// db_ms 细分（邀请慢二级定位）：
+	//   query_ms   = 事务前的只读查询（群 / 用户 / 已存在成员 / 黑名单）累加；
+	//   genseq_ms  = GenSeq 累加——进程级 seqLock 全局锁 + 步长耗尽时查/写 seq 表，
+	//                锁竞争或 seq 表 I/O 慢会集中体现在这里；
+	//   insert_ms  = 事务内 ExistMemberDelete + Insert/recover + 外部群标记累加；
+	//   commit_ms  = tx.Commit()，含半同步复制等待 slave ACK。
+	// 四者 + space_check_ms 拼出 db_ms，定位 DB 阶段慢在读 / 取号 / 写 / 提交哪一段。
+	var queryMs, genSeqMs, insertMs, commitMs int64
+
 	// 群存在性 + 状态检查
+	qStart := time.Now()
 	groupModel, err := s.db.QueryWithGroupNo(req.GroupNo)
+	queryMs += time.Since(qStart).Milliseconds()
 	if err != nil {
 		s.Error("query group failed", zap.Error(err))
 		return nil, errors.New("failed to query group")
@@ -1401,14 +1413,18 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 	spaceCheckMs := time.Since(spaceCheckStart).Milliseconds()
 
 	// 查询用户信息
+	qStart = time.Now()
 	memberUsers, err := s.userDB.QueryByUIDs(uniqueUIDs)
+	queryMs += time.Since(qStart).Milliseconds()
 	if err != nil {
 		s.Error("query member info failed", zap.Error(err))
 		return nil, errors.New("failed to query member info")
 	}
 
 	// 过滤已在群内的成员
+	qStart = time.Now()
 	existingMembers, err := s.db.QueryMembersWithUids(uniqueUIDs, req.GroupNo)
+	queryMs += time.Since(qStart).Milliseconds()
 	if err != nil {
 		s.Error("query existing members failed", zap.Error(err))
 		return nil, errors.New("failed to query existing members")
@@ -1421,7 +1437,9 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 	}
 
 	// 过滤黑名单
+	qStart = time.Now()
 	blacklistMembers, _ := s.db.QueryMembersWithStatus(req.GroupNo, int(common.GroupMemberStatusBlacklist))
+	queryMs += time.Since(qStart).Milliseconds()
 	blacklistSet := make(map[string]bool)
 	for _, m := range blacklistMembers {
 		blacklistSet[m.UID] = true
@@ -1446,7 +1464,9 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 		if existingSet[memberUser.UID] || blacklistSet[memberUser.UID] {
 			continue
 		}
+		genStart := time.Now()
 		memberVersion, err := s.ctx.GenSeq(common.GroupMemberSeqKey)
+		genSeqMs += time.Since(genStart).Milliseconds()
 		if err != nil {
 			s.Error("generate member version failed", zap.Error(err))
 			return nil, err
@@ -1460,6 +1480,7 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 		}
 
 		// 检查是否之前被删除过（需要恢复）
+		insStart := time.Now()
 		existDelete, _ := s.db.ExistMemberDelete(memberUser.UID, req.GroupNo)
 		newMember := &MemberModel{
 			GroupNo:       req.GroupNo,
@@ -1478,6 +1499,7 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 		} else {
 			err = s.db.InsertMemberTx(newMember, tx)
 		}
+		insertMs += time.Since(insStart).Milliseconds()
 		if err != nil {
 			s.Error("add group member failed", zap.Error(err), zap.String("uid", memberUser.UID))
 			continue
@@ -1496,7 +1518,10 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 	// 首次出现外部成员时，在事务内将群标记为外部群，确保成员/群标记一致提交
 	markedExternal := false
 	if hasNewExternal && groupModel.IsExternalGroup == 0 {
-		if updateErr := s.db.UpdateIsExternalGroupTx(req.GroupNo, 1, tx); updateErr != nil {
+		updStart := time.Now()
+		updateErr := s.db.UpdateIsExternalGroupTx(req.GroupNo, 1, tx)
+		insertMs += time.Since(updStart).Milliseconds()
+		if updateErr != nil {
 			s.Error("update is_external_group failed", zap.Error(updateErr), zap.String("group_no", req.GroupNo))
 			return nil, errors.New("failed to update external group flag")
 		}
@@ -1504,8 +1529,11 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 	}
 
 	// 提交事务
-	if err := tx.Commit(); err != nil {
-		s.Error("commit transaction failed", zap.Error(err))
+	commitStart := time.Now()
+	commitErr := tx.Commit()
+	commitMs = time.Since(commitStart).Milliseconds()
+	if commitErr != nil {
+		s.Error("commit transaction failed", zap.Error(commitErr))
 		return nil, errors.New("failed to commit transaction")
 	}
 	// 事务（GenSeq + insert/recover + commit）耗时。
@@ -1584,12 +1612,17 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 	total := time.Since(startedAt)
 	if total.Milliseconds() >= inviteSlowLogThresholdMS {
 		s.Warn("邀请成员入群链路耗时偏高",
+			zap.String("trace_id", req.TraceID),
 			zap.String("group_no", req.GroupNo),
 			zap.String("operator", req.OperatorUID),
 			zap.Int("requested", len(req.Members)),
 			zap.Int("added", len(addedUIDs)),
 			zap.Int64("db_ms", dbDur.Milliseconds()),
 			zap.Int64("space_check_ms", spaceCheckMs),
+			zap.Int64("query_ms", queryMs),
+			zap.Int64("genseq_ms", genSeqMs),
+			zap.Int64("insert_ms", insertMs),
+			zap.Int64("commit_ms", commitMs),
 			zap.Int64("tx_ms", txMs),
 			zap.Int64("channel_update_ms", channelUpdateDur.Milliseconds()),
 			zap.Int64("im_add_subscriber_ms", imSubscriberDur.Milliseconds()),
