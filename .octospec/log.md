@@ -4,6 +4,19 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-06-27
+
+- **Add** — Task `default-avatar-text-rule`: script-aware 2-glyph text rule for
+  group + personal default avatars. Mixed script → Han only; pure English →
+  initials (camelCase/sep split, ≤2, upper); pure digits → 2; empty/symbol/emoji
+  → icon (group two-person) / ascii (personal) fallback. New
+  `avatarrender.GroupNameText` (前2) + rewritten `IndividualText` (后2) over a
+  shared core; `GroupText` kept as the custom-`avatar_text` normalizer (≤4) and
+  `writeGroupDefaultAvatar` splits custom-text vs auto-name. Cache-version bumped
+  `group-name-v3→v4` and `name-v4→v5` (ETag + CacheKey). Brief + context under
+  `.octospec/tasks/default-avatar-text-rule/`, journal
+  `.octospec/journal/shared/default-avatar-text-rule.md`.
+
 ## 2026-06-25
 
 - **Add** — Task `incoming-webhook-mention-config`: moved the incoming-webhook

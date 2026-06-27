@@ -7,7 +7,7 @@ import (
 )
 
 // TestGenerateGroupSamples 仅在设置 AVATAR_GROUP_SAMPLE_DIR 时运行，写出群默认头像
-// 样张供肉眼比对设计稿（重点验证 4 字布局/字号不出圆），含文字模式与图标兜底。例：
+// 样张供肉眼比对设计稿（文字模式 + 图标兜底）。例：
 //
 //	AVATAR_GROUP_SAMPLE_DIR=.context/group-samples go test ./pkg/avatarrender/ -run TestGenerateGroupSamples -v
 func TestGenerateGroupSamples(t *testing.T) {
@@ -18,34 +18,36 @@ func TestGenerateGroupSamples(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// (group_no, 群名) — group_no 决定派生色，群名前 4 字决定文字。
+	// (group_no, 群名) — group_no 决定派生色，群名按 GroupNameText 自动取字
+	// (script 感知前 2：汉字前2 / 纯数字前2 / 纯英文首字母缩写 / 否则空→图标)。
 	samples := []struct{ groupNo, name string }{
-		{"g01", "后端架构讨论"},  // 5 字 → 前 4「后端架构」
-		{"g02", "架构讨论"},    // 4 字
-		{"g03", "三个字"},     // 3 字
-		{"g04", "开发"},      // 2 字
-		{"g05", "发"},       // 1 字
-		{"g06", "abcd"},    // 4 拉丁
-		{"g07", "efgh"},    // 4 拉丁
-		{"g08", "产品需求评审组"}, // 前 4「产品需求」
+		{"g01", "后端架构讨论"},      // 含汉字 → 前 2「后端」
+		{"g02", "Bug反馈群"},      // 混排 → 只取汉字「反馈」
+		{"g03", "2024春招群"},     // 数字+汉字 → 「春招」
+		{"g04", "Backend Team"}, // 纯英文 → 首字母缩写「BT」
+		{"g05", "Sales"},        // 单个单词 → 「S」
+		{"g06", "2024"},         // 纯数字 → 前 2「20」
+		{"g07", "🎉🎉"},           // emoji 无法成字 → 图标兜底
+		{"g08", ""},             // 空名 → 图标兜底
 	}
 	for _, s := range samples {
-		text := GroupText(s.name)
+		text := GroupNameText(s.name)
+		if text == "" {
+			// 空/纯符号/emoji → 回退群组双人图标。
+			data, err := RenderIcon(GroupStyleForSeed(s.groupNo))
+			if err != nil {
+				t.Fatalf("render icon %s: %v", s.groupNo, err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, s.groupNo+"_icon.png"), data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
 		data, err := RenderGroup(text, GroupStyleForSeed(s.groupNo), 200)
 		if err != nil {
 			t.Fatalf("render %s: %v", s.name, err)
 		}
 		if err := os.WriteFile(filepath.Join(dir, s.groupNo+"_"+text+".png"), data, 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// 图标兜底样张（群名为空），覆盖几个色板色。
-	for _, gno := range []string{"icon_a", "icon_b", "icon_c"} {
-		data, err := RenderIcon(GroupStyleForSeed(gno))
-		if err != nil {
-			t.Fatalf("render icon %s: %v", gno, err)
-		}
-		if err := os.WriteFile(filepath.Join(dir, gno+".png"), data, 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
