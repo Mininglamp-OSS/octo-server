@@ -234,3 +234,20 @@ PR #486 评审,**必修阻断项**:渲染字节变了但 **ETag/cache 版本 tag
 - 验证:`go build ./...`;avatarrender(timing 默认 skip)+ group + user 头像端点全绿;golangci-lint
   0 issues;i18n-lint 过。stale-test-DB 迁移 panic 是既有 harness 状态问题(非本改动),drop+recreate
   `test` 库后各模块单独跑均过。
+
+### PR #486 评审第二轮:端点版本 pin 测试(Jerry-Xin 非阻塞建议)
+d169ffc7 后 4 位 reviewer 全 Approve,唯一开放项是 Jerry-Xin(两轮均提)的非阻塞 🔵:现有测试覆盖
+ETag **函数**,但没有任何测试 pin 端点实际接线的版本段。真实缺口——若后人把 handler 里
+`group-name-v3`/`group-icon-v3`/`name-v4` 误改回旧版(或下次改渲染漏 bump),当前无测试会挂,客户端
+会 304 到陈旧图(正是上一轮的阻断根因)。补两个端点级 pin:
+- `modules/group/avatar_version_pin_test.go` `TestGroupAvatarGetPinsRenderVersion`:命名群→断言响应
+  ETag == `avatarrender.ETag("group-name-v3", groupNo, "seed", GroupText(name))`;空名→图标兜底→断言
+  == `ETag("group-icon-v3", groupNo, "seed")`。
+- `modules/user/avatar_version_pin_test.go` `TestUserAvatarGetPinsRenderVersion`:可渲染昵称→断言响应
+  ETag == `avatarETag("name-v4", uid, IndividualText(name))`。`ascii-v1` 故意不 pin(走未改的
+  `generateDefaultAvatar`)。
+- 设计:测试里的版本字面量与 handler 内联字面量**相互独立**,故单边漂移即不等→失败(非同源恒真);
+  `GroupText`/`IndividualText` 复用 handler 同一函数,取字规则将来合法变更时测试与 handler 同步移动,
+  **只 pin 版本段**。复用现有 `doAvatarGet`/`getAvatarForTest` 端点桩,无新 handler→不触 NoLegacy 守卫。
+- 验证:`go vet`、`go build ./...`、两端点 pin + 既有 avatar 测试全绿、NoLegacyResponseError 守卫
+  group/user 均 ok、golangci-lint 0 issues。
