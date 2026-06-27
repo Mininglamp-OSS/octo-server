@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"image"
 	"image/color"
-	"image/draw"
 	"image/png"
 	"math"
 	"sync"
@@ -99,9 +98,8 @@ type Options struct {
 	Size int
 }
 
-// Render 渲染一张「白底 + 纯色圆 + 居中白色文字」的 PNG，返回编码后的字节。
-// 圆外为白色，输出不透明（整图 alpha 全 255，png.Encode 会编码为不带 alpha
-// 通道的 RGB PNG）——与旧 ASCII 兜底、13 色 Bot 头像一致。
+// Render 渲染一张「纯色圆 + 居中白色文字」的 PNG，返回编码后的字节。圆外**透明**
+//（png.Encode 输出带 alpha 通道的 RGBA PNG），客户端在任意背景上合成时圆外不出白方块。
 // 文字颜色固定为白色（与设计稿一致，不做对比度切换）。
 func Render(opts Options) ([]byte, error) {
 	if opts.Text == "" {
@@ -118,11 +116,9 @@ func Render(opts Options) ([]byte, error) {
 
 	big := size * supersample
 
-	// 1. 先用白底铺满画布，再画硬边圆。圆外保持白色，使输出为不透明 PNG
-	//（与旧 ASCII 兜底、13 色 Bot 头像一致），客户端在任意背景下都不会透出底色。
-	// 整图 alpha 全 255 → png.Encode 自动编码为不带 alpha 通道的 RGB PNG。
+	// 1. 画布零值即全透明，不铺底色，直接画硬边圆。圆外保持透明，png.Encode 自动输出
+	// 带 alpha 通道的 RGBA PNG（客户端在任意背景上合成时圆外不出白方块）。
 	canvas := image.NewRGBA(image.Rect(0, 0, big, big))
-	draw.Draw(canvas, canvas.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
 	drawCircle(canvas, opts.Bg)
 
 	// 2. 居中渲染白色文字。
@@ -141,7 +137,7 @@ func Render(opts Options) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// drawCircle 在 img 上填充一个充满边界的实心圆；圆外像素保持调用方预先铺好的底色。
+// drawCircle 在 img 上填充一个充满边界的实心圆；圆外像素不动（画布零值即透明，调用方不铺底色）。
 func drawCircle(img *image.RGBA, c color.RGBA) {
 	b := img.Bounds()
 	d := float64(b.Dx())
@@ -160,7 +156,7 @@ func drawCircle(img *image.RGBA, c color.RGBA) {
 }
 
 // drawCircleFilledStroked 在 img 上绘制群头像专用圆：浅色填充 + 主题色描边。
-// img 应由调用方先铺白底；本函数只改圆内像素，圆外保持原底色。
+// 本函数只改圆内像素，圆外不动（画布零值即透明，调用方不铺底色）。
 func drawCircleFilledStroked(img *image.RGBA, fill, stroke color.RGBA, strokeRatio float64) {
 	b := img.Bounds()
 	d := float64(b.Dx())
@@ -275,7 +271,7 @@ func loadGroupIconMasks() (image.Image, image.Image, error) {
 	return groupIconFrontImg, groupIconBackImg, groupIconErr
 }
 
-// RenderIcon 渲染「白底 + 浅底描边圆 + 双色群组图标」的 PNG，用于群名为空或
+// RenderIcon 渲染「浅底描边圆 + 双色群组图标」的 PNG，圆外**透明**，用于群名为空或
 // 无法取字时的兜底。style 来自群头像专用色板，不影响个人头像 Render。
 func RenderIcon(style GroupStyle) ([]byte, error) {
 	return renderIconSized(style, DefaultSize)
@@ -291,8 +287,8 @@ func renderIconSized(style GroupStyle, size int) ([]byte, error) {
 	}
 
 	big := size * supersample
+	// 画布零值即全透明，不铺白底：圆外保持透明，输出带 alpha 的 RGBA PNG。
 	canvas := image.NewRGBA(image.Rect(0, 0, big, big))
-	draw.Draw(canvas, canvas.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
 	drawCircleFilledStroked(canvas, style.Fill, style.Main, groupCircleStrokeRatio)
 
 	backTint := tintMask(back, style.IconBack)

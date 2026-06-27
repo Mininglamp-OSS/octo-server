@@ -456,9 +456,12 @@ func (g *Group) writeGroupDefaultAvatar(c *wkhttp.Context, groupNo string, group
 
 	// ETag 覆盖决定图像内容的因子：渲染模式版本 + group_no(派生色) + 实际色 + 文字。
 	// 改名/改自定义文字 → text 变 → ETag 变；改自定义色 → colorTag 变 → ETag 变。
-	etag := avatarrender.ETag("group-icon-v2", groupNo, colorTag)
+	// 渲染**视觉**改动(像素变但因子不变，如 #486 透明四角)必须 bump 版本段(…-v2→…-v3)，
+	// 否则已缓存旧图的客户端 If-None-Match 命中同一 ETag → 304 → 一直返旧图。
+
+	etag := avatarrender.ETag("group-icon-v3", groupNo, colorTag)
 	if renderable {
-		etag = avatarrender.ETag("group-name-v2", groupNo, colorTag, text)
+		etag = avatarrender.ETag("group-name-v3", groupNo, colorTag, text)
 	}
 	c.Header("Content-Disposition", "inline; filename=avatar.png")
 	c.Header("ETag", etag)
@@ -475,7 +478,7 @@ func (g *Group) writeGroupDefaultAvatar(c *wkhttp.Context, groupNo string, group
 	// 一张。缓存 key 用 CacheKey（完整原始因子，与 ETag 同因子但**非** CRC32 弱指纹），
 	// 避免 32 位碰撞跨群串图。
 	if renderable {
-		nameKey := avatarrender.CacheKey("group-name-v2", groupNo, colorTag, text)
+		nameKey := avatarrender.CacheKey("group-name-v3", groupNo, colorTag, text)
 		imageData, genErr := avatarrender.GetOrRender(nameKey, func() ([]byte, error) {
 			return avatarrender.RenderGroup(text, style, avatarrender.DefaultSize)
 		})
@@ -485,11 +488,11 @@ func (g *Group) writeGroupDefaultAvatar(c *wkhttp.Context, groupNo string, group
 		}
 		// 渲染失败不直接 500，记录后回退群组图标；ETag 改回 icon 模式与内容一致。
 		g.Error("生成群名默认头像失败，回退群组图标", zap.Error(genErr), zap.String("group_no", groupNo))
-		c.Header("ETag", avatarrender.ETag("group-icon-v2", groupNo, colorTag))
+		c.Header("ETag", avatarrender.ETag("group-icon-v3", groupNo, colorTag))
 	}
 
 	// 群名为空 / 不可渲染（如纯 emoji）/ 渲染失败 → 群组图标。
-	iconKey := avatarrender.CacheKey("group-icon-v2", groupNo, colorTag)
+	iconKey := avatarrender.CacheKey("group-icon-v3", groupNo, colorTag)
 	iconData, iconErr := avatarrender.GetOrRender(iconKey, func() ([]byte, error) {
 		return avatarrender.RenderIcon(style)
 	})
