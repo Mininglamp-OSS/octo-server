@@ -137,7 +137,7 @@ func Render(opts Options) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// drawCircle 在 img 上填充一个充满边界的实心圆；圆外像素保持调用方预先铺好的底色。
+// drawCircle 在 img 上填充一个充满边界的实心圆；圆外像素不动（画布零值即透明，调用方不铺底色）。
 func drawCircle(img *image.RGBA, c color.RGBA) {
 	b := img.Bounds()
 	d := float64(b.Dx())
@@ -156,7 +156,7 @@ func drawCircle(img *image.RGBA, c color.RGBA) {
 }
 
 // drawCircleFilledStroked 在 img 上绘制群头像专用圆：浅色填充 + 主题色描边。
-// img 应由调用方先铺白底；本函数只改圆内像素，圆外保持原底色。
+// 本函数只改圆内像素，圆外不动（画布零值即透明，调用方不铺底色）。
 func drawCircleFilledStroked(img *image.RGBA, fill, stroke color.RGBA, strokeRatio float64) {
 	b := img.Bounds()
 	d := float64(b.Dx())

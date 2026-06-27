@@ -216,3 +216,21 @@ draw.Src)` 铺白底再画圆(当年为「任意背景不透底色」+ 输出无
   group/icon 各加圆外 alpha=0 断言;`inkBox` 仅采圆内核心区不受影响,仅更注释。group/user 端点
   逐字节比对(handler==Render*)两边同源保持一致。**不在本次范围**:未命名群→双人图标、取字规则
   (`Bug反`→`Bu`/`g反`,待设计)。
+
+### PR #486 评审轮修复(6 位 reviewer)
+PR #486 评审,**必修阻断项**:渲染字节变了但 **ETag/cache 版本 tag 没 bump** —— ETag 是对**因子串**
+做 CRC32(非像素),同因子→同 ETag→已缓存旧图的客户端 `If-None-Match` 命中→304→`must-revalidate`
+下**永远返旧白角图**(进程 LRU 同样陈旧到重启)。这正是 #349 当初加白底时 bump 到 `name-v3` 的同
+类动作。修复:
+- bump 渲染版本 tag(ETag + CacheKey 两处同步):`modules/group/api.go` `group-name-v2`→`v3`、
+  `group-icon-v2`→`v3`;`modules/user/api.go` `name-v3`→`v4`。**`ascii-v1` 不动** —— ASCII 兜底
+  `generateDefaultAvatar` 本次未改、字节没变(Octo-Q/QA/yujiawei 三方确认;只在像素真变时才 bump)。
+  两处 ETag 站点加注释:视觉改动(像素变因子不变)必须 bump 版本段。
+- 修两处 stale helper 注释(`render.go` `drawCircle`/`drawCircleFilledStroked`「调用方先铺白底」)——
+  它们是 precondition 措辞,后人照做会把白底加回、静默回归。
+- gate `starvation_repro_test.go` 两个 wall-clock timing 测试(`TestRenderFanoutStarvesVictim`、
+  `TestCacheEliminatesStarvation`)到 `OCTO_TIMING_TESTS=1`,对齐 #478 的群版。QA 实测后者在 main
+  基线一样挂(newFailures=0,既有噪声非回归),gate 后 `go test ./pkg/avatarrender/...` 不再 flake。
+- 验证:`go build ./...`;avatarrender(timing 默认 skip)+ group + user 头像端点全绿;golangci-lint
+  0 issues;i18n-lint 过。stale-test-DB 迁移 panic 是既有 harness 状态问题(非本改动),drop+recreate
+  `test` 库后各模块单独跑均过。
