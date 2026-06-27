@@ -11,12 +11,14 @@
 package botfather
 
 import (
-	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
 )
@@ -63,7 +65,7 @@ type onboardingCmds struct {
 func (bf *BotFather) runtimeOnboarding(c *wkhttp.Context) {
 	uid := c.GetLoginUID()
 	if uid == "" {
-		c.ResponseErrorWithStatus(errors.New("login required"), http.StatusUnauthorized)
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrSharedAuthRequired, nil, nil)
 		return
 	}
 
@@ -76,7 +78,7 @@ func (bf *BotFather) runtimeOnboarding(c *wkhttp.Context) {
 		spaceID = strings.TrimSpace(c.GetHeader("X-Space-Id"))
 	}
 	if spaceID == "" {
-		c.ResponseErrorWithStatus(errors.New("space_id required (query ?space_id= or header X-Space-Id)"), http.StatusBadRequest)
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotfatherRuntimeOnboardingSpaceRequired, nil, i18n.Details{"field": "space_id"})
 		return
 	}
 
@@ -90,11 +92,11 @@ func (bf *BotFather) runtimeOnboarding(c *wkhttp.Context) {
 	ok, err := spacepkg.CheckMembership(bf.ctx.DB(), spaceID, uid)
 	if err != nil {
 		bf.Error("runtime-onboarding: check membership", zap.Error(err))
-		c.ResponseErrorWithStatus(errors.New("internal error"), http.StatusInternalServerError)
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotfatherRuntimeOnboardingFailed, nil, nil)
 		return
 	}
 	if !ok {
-		c.ResponseErrorWithStatus(errors.New("not a member of this space"), http.StatusForbidden)
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotfatherRuntimeOnboardingForbidden, nil, nil)
 		return
 	}
 	// user.status=1 二重 gate (D11): banned user 应被堵在这一层, 不能落
@@ -104,11 +106,11 @@ func (bf *BotFather) runtimeOnboarding(c *wkhttp.Context) {
 		SelectBySql("SELECT COUNT(*) FROM user WHERE uid=? AND status=1", uid).
 		LoadOne(&userActive); qerr != nil {
 		bf.Error("runtime-onboarding: check user status", zap.Error(qerr))
-		c.ResponseErrorWithStatus(errors.New("internal error"), http.StatusInternalServerError)
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotfatherRuntimeOnboardingFailed, nil, nil)
 		return
 	}
 	if userActive == 0 {
-		c.ResponseErrorWithStatus(errors.New("user not active"), http.StatusForbidden)
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotfatherRuntimeOnboardingForbidden, nil, nil)
 		return
 	}
 
@@ -121,7 +123,7 @@ func (bf *BotFather) runtimeOnboarding(c *wkhttp.Context) {
 	apiKey, err := bf.getOrCreateUserAPIKey(uid, spaceID)
 	if err != nil {
 		bf.Error("runtime-onboarding: get/create api_key", zap.Error(err))
-		c.ResponseErrorWithStatus(errors.New("failed to allocate api_key"), http.StatusInternalServerError)
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotfatherRuntimeOnboardingFailed, nil, nil)
 		return
 	}
 
@@ -131,7 +133,7 @@ func (bf *BotFather) runtimeOnboarding(c *wkhttp.Context) {
 		// broken URL, 给前端展示也是误导, 直接报 500 + log 提示运维.
 		bf.Error("runtime-onboarding: server URL config missing (External.BaseURL + External.IP both empty)",
 			zap.String("server", serverURL), zap.String("fleet", fleetURL), zap.String("matter", matterURL))
-		c.ResponseErrorWithStatus(errors.New("server URL not configured"), http.StatusInternalServerError)
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotfatherRuntimeOnboardingConfigInvalid, nil, nil)
 		return
 	}
 

@@ -34,8 +34,8 @@ mode: "debug" #   运行模式 debug or release
 #  asynctaskRedisAddr: "" # 异步任务的redis地址 不写默认为RedisAddr的地址
 
 ##################### 外网配置 ####################
-external:
-  ip: "localhost" # 外网ip
+#external:
+#  ip: "" # 外网ip
 #  baseURL: "" # 外网访问地址 例如 http://192.0.2.1:8090
 #  webLoginURL: "" # web im的登录地址 例如 https://web.tangsengdaodao.com
 
@@ -132,18 +132,6 @@ smsCode: "123456" # 测试短信验证码， 如果不为空，则短信验证�
 #minio: # minio配置
 #  url: "" # minio地址 格式：http://xx.xx.xx.xx:9000 (server-internal endpoint)
 #  uploadURL: ""    # 可选：服务端上传基地址，留空则回退到 url。仅服务端使用。
-
-# ─── PoC local dev: enable MinIO with testenv-minio-1 container ─────────────
-# This block uncommented for local dev only. Production should set proper
-# AccessKey/SecretKey via env vars, not commit creds.
-fileService: "minio"
-minio:
-  url: "http://127.0.0.1:9000"
-  uploadURL: "http://127.0.0.1:9000"
-  downloadURL: "http://127.0.0.1:9000"
-  accessKeyID: "admin"
-  secretAccessKey: "12345678"
-
 #  downloadURL: ""  # 浏览器可访问的 MinIO 基地址，用于签发预签名 PUT/GET URL。
 #                   # SigV4 将 host 与 canonical URI 纳入签名，因此该值必须就是
 #                   # 浏览器实际请求的主机；留空则回退到 url，仅当 Go 进程与浏览器

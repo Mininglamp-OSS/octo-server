@@ -38,6 +38,15 @@ var (
 		HTTPStatus:     http.StatusBadRequest,
 		DefaultMessage: "No need to apply for a bot you own.",
 	})
+	// ErrBotfatherRuntimeOnboardingSpaceRequired covers missing space context
+	// on GET /v1/runtime-onboarding. The route intentionally has no implicit
+	// "first space" fallback because the api_key it returns is space-bound.
+	ErrBotfatherRuntimeOnboardingSpaceRequired = register(codes.Code{
+		ID:             "err.server.botfather.runtime_onboarding_space_required",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Space is required.",
+		SafeDetailKeys: []string{"field"},
+	})
 
 	// ---- permission / authorization (403) ------------------------------------
 
@@ -55,6 +64,14 @@ var (
 		ID:             "err.server.botfather.bot_not_in_space",
 		HTTPStatus:     http.StatusForbidden,
 		DefaultMessage: "The bot does not belong to the current space.",
+	})
+	// ErrBotfatherRuntimeOnboardingForbidden covers a session user who cannot
+	// create onboarding material for the requested space (not an active member
+	// or the account is inactive).
+	ErrBotfatherRuntimeOnboardingForbidden = register(codes.Code{
+		ID:             "err.server.botfather.runtime_onboarding_forbidden",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "You cannot create runtime onboarding for this space.",
 	})
 
 	// ---- not found (404) -----------------------------------------------------
@@ -147,6 +164,22 @@ var (
 		ID:             "err.server.botfather.store_failed",
 		HTTPStatus:     http.StatusInternalServerError,
 		DefaultMessage: "Failed to update data.",
+		Internal:       true,
+	})
+	// ErrBotfatherRuntimeOnboardingFailed covers internal failures preparing
+	// onboarding material, such as membership/user lookups or api_key allocation.
+	ErrBotfatherRuntimeOnboardingFailed = register(codes.Code{
+		ID:             "err.server.botfather.runtime_onboarding_failed",
+		HTTPStatus:     http.StatusInternalServerError,
+		DefaultMessage: "Failed to prepare runtime onboarding.",
+		Internal:       true,
+	})
+	// ErrBotfatherRuntimeOnboardingConfigInvalid covers a deployment missing
+	// enough external URL config to render runnable daemon commands.
+	ErrBotfatherRuntimeOnboardingConfigInvalid = register(codes.Code{
+		ID:             "err.server.botfather.runtime_onboarding_config_invalid",
+		HTTPStatus:     http.StatusInternalServerError,
+		DefaultMessage: "Runtime onboarding is not configured.",
 		Internal:       true,
 	})
 )

@@ -210,6 +210,18 @@ other = "Invalid request."
 ["err.server.botfather.robot_not_found"]
 other = "The bot does not exist or has been deleted."
 
+["err.server.botfather.runtime_onboarding_config_invalid"]
+other = "Runtime onboarding is not configured."
+
+["err.server.botfather.runtime_onboarding_failed"]
+other = "Failed to prepare runtime onboarding."
+
+["err.server.botfather.runtime_onboarding_forbidden"]
+other = "You cannot create runtime onboarding for this space."
+
+["err.server.botfather.runtime_onboarding_space_required"]
+other = "Space is required."
+
 ["err.server.botfather.store_failed"]
 other = "Failed to update data."
 

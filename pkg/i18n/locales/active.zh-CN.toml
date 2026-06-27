@@ -1107,6 +1107,18 @@ other = "机器人认证失败。"
 ["err.server.botfather.query_failed"]
 other = "查询数据失败。"
 
+["err.server.botfather.runtime_onboarding_config_invalid"]
+other = "运行时接入配置未完成。"
+
+["err.server.botfather.runtime_onboarding_failed"]
+other = "生成运行时接入配置失败。"
+
+["err.server.botfather.runtime_onboarding_forbidden"]
+other = "你无权为该空间创建运行时接入配置。"
+
+["err.server.botfather.runtime_onboarding_space_required"]
+other = "请选择空间。"
+
 ["err.server.botfather.store_failed"]
 other = "更新数据失败。"
 

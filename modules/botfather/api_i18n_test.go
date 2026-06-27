@@ -36,7 +36,7 @@ func httperrLWS(c *wkhttp.Context, code codes.Code) {
 // no error responses.
 func TestBotfatherNoLegacyResponseError(t *testing.T) {
 	files := []string{
-		"api_apply.go", "api_user.go",
+		"api_apply.go", "api_user.go", "api_runtime_onboarding.go",
 	}
 	banned := []string{
 		".ResponseError(",

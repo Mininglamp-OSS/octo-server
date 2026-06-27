@@ -29,6 +29,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
+	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	rd "github.com/go-redis/redis"
 	"go.uber.org/zap"
 )
@@ -193,8 +194,8 @@ var hexEncode = defaultHexEncode
 //	POST /v1/bot/mint        — web session auth (octo-lib session middleware)
 //	GET  /v1/bot/:uid/token  — daemon api_key Bearer (validated inline)
 func (a *BotProvision) Route(r *wkhttp.WKHttp) {
-	authGroup := r.Group("/v1", a.ctx.AuthMiddleware(r))
-	authGroup.POST("/bot/mint", a.mintBot)
+	mintAPI := r.Group("/v1", a.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, a.ctx))
+	mintAPI.POST("/bot/mint", a.mintBot)
 
 	// /v1/bot/:uid/token validates api_key inline (no session middleware
 	// here — caller is daemon, not browser).
