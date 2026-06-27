@@ -280,7 +280,16 @@ func decideConvKeepInSpace(
 			return true
 		}
 		if !botSet[channelID] {
-			return hasSpaceMsg != nil && hasSpaceMsg(filterSpaceID)
+			// GH#484 fix: regular (non-bot) DM conversations are always visible in
+			// every Space. DM is a single physical channel shared across Spaces; using
+			// the Recents window (personConvHasSpaceMessages) to decide visibility was
+			// unreliable because both Spaces share the same Recents, so whichever Space
+			// was active most recently would evict the other's tagged messages and make
+			// the conversation disappear. Message-level filtering
+			// (filterPersonMessagesBySpace) still ensures only relevant messages are
+			// shown per Space. Until a product decision introduces real per-(contact,
+			// Space) conversations, DMs are visible in all Spaces.
+			return true
 		}
 	}
 	return false

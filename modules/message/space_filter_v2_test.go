@@ -86,7 +86,10 @@ func TestDecideConvKeepInSpace_DM_DefaultSpace_KeepBareConv(t *testing.T) {
 	assert.True(t, keep, "bare DM stays in user's default space when no bot match")
 }
 
-func TestDecideConvKeepInSpace_DM_NonDefaultSpace_NoSpaceMsg_Excluded(t *testing.T) {
+// GH#484: DMs are always visible in every Space (single-channel architecture).
+// Previously this asserted False — relying on the Recents window for visibility
+// caused conversations to disappear when the other Space was more recently active.
+func TestDecideConvKeepInSpace_DM_NonDefaultSpace_AlwaysVisible(t *testing.T) {
 	keep := decideConvKeepInSpace(
 		"peer1", common.ChannelTypePerson.Uint8(), "",
 		"spaceB", "spaceA",
@@ -94,7 +97,8 @@ func TestDecideConvKeepInSpace_DM_NonDefaultSpace_NoSpaceMsg_Excluded(t *testing
 		map[string]bool{}, map[string]bool{}, false, false, false,
 		func(string) bool { return false },
 	)
-	assert.False(t, keep, "DM with no payload.space_id match must NOT appear in non-default space")
+	assert.True(t, keep,
+		"GH#484: regular DM must always be visible in every Space (single-channel DM architecture)")
 }
 
 func TestDecideConvKeepInSpace_DM_NonDefaultSpace_HasSpaceMsg_Visible(t *testing.T) {
@@ -106,6 +110,22 @@ func TestDecideConvKeepInSpace_DM_NonDefaultSpace_HasSpaceMsg_Visible(t *testing
 		func(target string) bool { return target == "spaceB" },
 	)
 	assert.True(t, keep, "DM with payload.space_id == filter must appear in that space")
+}
+
+// GH#484 regression: when the Recents window contains no messages tagged with the
+// target Space (because the other Space was more recently active and evicted them),
+// the DM conversation must still be visible. Previously this returned false.
+func TestDecideConvKeepInSpace_DM_NonDefaultSpace_RecentsEvicted_StillVisible(t *testing.T) {
+	// hasSpaceMsg simulates Recents window with no spaceB messages (evicted by spaceA activity)
+	keep := decideConvKeepInSpace(
+		"peer1", common.ChannelTypePerson.Uint8(), "",
+		"spaceB", "spaceA",
+		nil, nil,
+		map[string]bool{}, map[string]bool{}, false, false, false,
+		func(target string) bool { return false }, // Recents has no spaceB messages
+	)
+	assert.True(t, keep,
+		"GH#484 regression: DM must remain visible even when Recents window has no space-tagged messages for that Space")
 }
 
 func TestDecideConvKeepInSpace_DM_BotInSpace(t *testing.T) {
