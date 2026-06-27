@@ -7,7 +7,8 @@
 //
 //	POST /v1/bot/mint        — web-callable, session-auth, mints a bot
 //	                           OBO and returns {bot_uid}. bot_token
-//	                           stays in server's robot table.
+//	                           is server-generated and stays in the
+//	                           server's robot table.
 //	GET  /v1/bot/:uid/token  — daemon-callable, api_key Bearer (uk_ prefix),
 //	                           returns {bot_token}. Authz: caller's api_key
 //	                           uid must equal the bot's creator_uid AND the
@@ -37,9 +38,6 @@ import (
 type mintRequest struct {
 	DisplayName string `json:"display_name"`
 	SpaceID     string `json:"space_id"`
-	// BotToken — optional. If empty, server generates a random one.
-	// Callers may supply their own so the token namespace stays caller-side.
-	BotToken string `json:"bot_token"`
 }
 
 type mintResponse struct {
@@ -77,15 +75,11 @@ func (a *BotProvision) mintBot(c *wkhttp.Context) {
 		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotProvisionSpaceForbidden, nil, nil)
 		return
 	}
-	botToken := req.BotToken
-	if botToken == "" {
-		var err error
-		botToken, err = generateBfToken()
-		if err != nil {
-			a.Error("mintBot: gen bot token", zap.Error(err))
-			httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
-			return
-		}
+	botToken, err := generateBfToken()
+	if err != nil {
+		a.Error("mintBot: gen bot token", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+		return
 	}
 	res, err := botfather.MintBotOBO(a.ctx, uid, req.SpaceID, req.DisplayName, botToken)
 	if err != nil {
