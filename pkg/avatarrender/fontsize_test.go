@@ -22,8 +22,8 @@ func decodePNG(t *testing.T, data []byte) image.Image {
 }
 
 // inkBox 返回白色文字墨迹的包围盒及其相对边长的宽高比例。仅在圆内核心区采样，
-// 排除圆外底色（不透明输出后圆外为白）与圆边抗锯齿环——文字受墨迹盒/字号上限
-// 约束，恒落在核心区内。背景须为非白色（testBg）。
+// 排除圆外（现为透明）与圆边抗锯齿环——文字受墨迹盒/字号上限约束，恒落在核心区内。
+// 背景圆须为非白色（testBg）。
 func inkBox(t *testing.T, data []byte) (minX, minY, maxX, maxY int, wRatio, hRatio float64) {
 	t.Helper()
 	img := decodePNG(t, data)
@@ -117,10 +117,9 @@ func TestInkStaysInsideCircle(t *testing.T) {
 	}
 }
 
-// TestRenderOpaque 输出必须不透明（圆外为白底，非透明）——与旧 ASCII 兜底、
-// 13 色 Bot 头像一致，客户端在任意背景下都不会透出底色。验证四角为不透明白、
-// 且整图 Opaque。
-func TestRenderOpaque(t *testing.T) {
+// TestRenderTransparentCorners 输出圆外必须**透明**（带 alpha 通道的 RGBA PNG）：四角
+// alpha=0，且整图非 Opaque——客户端在任意背景上合成时圆外不出白方块。
+func TestRenderTransparentCorners(t *testing.T) {
 	for _, text := range []string{"一序", "aw", "王", "W序"} {
 		data, err := Render(Options{Text: text, Bg: testBg, Size: 200})
 		if err != nil {
@@ -135,14 +134,13 @@ func TestRenderOpaque(t *testing.T) {
 			{b.Max.X - 1, b.Max.Y - 1},
 		}
 		for _, c := range corners {
-			r, g, bb, a := img.At(c[0], c[1]).RGBA()
-			if a != 0xffff || r < 0xe000 || g < 0xe000 || bb < 0xe000 {
-				t.Errorf("text %q: corner (%d,%d) not opaque white: rgba=%04x,%04x,%04x,%04x",
-					text, c[0], c[1], r, g, bb, a)
+			_, _, _, a := img.At(c[0], c[1]).RGBA()
+			if a != 0 {
+				t.Errorf("text %q: corner (%d,%d) not transparent: alpha=%04x", text, c[0], c[1], a)
 			}
 		}
-		if oi, ok := img.(interface{ Opaque() bool }); ok && !oi.Opaque() {
-			t.Errorf("text %q: rendered image is not opaque", text)
+		if oi, ok := img.(interface{ Opaque() bool }); ok && oi.Opaque() {
+			t.Errorf("text %q: rendered image must not be opaque (corners should be transparent)", text)
 		}
 	}
 }

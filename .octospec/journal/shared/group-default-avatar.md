@@ -201,3 +201,18 @@ i18n-lint + 源码守卫；全仓无残留引用（仅说明性注释）。
 判为非阻断(group_no 是不可枚举 UUID;与已上线的 user-avatar 渲染昵称同型;本 PR 反而以
 disband/不存在→404 收紧了面),但因 security-sensitive 标签,留待人类显式 ack。其余延后项
 同前(groupUpdate 跨步原子性、强 ETag、公开端点限流与 UserAvatar 一起做)。
+
+## Post-merge 跟进:透明四角(group + user 头像)
+合并后线上观察:渲染的默认头像**圆外是不透明白底**,在不裁圆/深色 surface 上露白方块。
+根因:`RenderGroup`/`RenderIcon`/`Render` 三个函数都先 `draw.Draw(canvas, …, color.White, …,
+draw.Src)` 铺白底再画圆(当年为「任意背景不透底色」+ 输出无 alpha 的 RGB,与旧 ASCII/bot
+头像一致)。`image.NewRGBA` 零值即全透明,故**删掉那行铺白底**即可:圆外保持透明,`png.Encode`
+自动输出带 alpha 的 RGBA PNG。三函数各删一行 + 去掉随之 unused 的 `image/draw` import + 改文档
+注释。**范围 group + user 一起**(`avatarrender.Render` 生产仅 `modules/user/api.go` 调,波及干净)。
+- 方案选型:服务端直接透明 vs 客户端加遮罩 → 取**服务端透明**。描边圆环已把形状焊死成圆
+  (裁成非圆会切坏环),客户端遮罩换形状是伪需求;服务端一次改、所有 surface 立即正确、不依赖
+  各端正确裁圆、零副作用。
+- 测试:`TestRenderOpaque`→`TestRenderTransparentCorners`(四角 alpha=0 + 整图非 Opaque);
+  group/icon 各加圆外 alpha=0 断言;`inkBox` 仅采圆内核心区不受影响,仅更注释。group/user 端点
+  逐字节比对(handler==Render*)两边同源保持一致。**不在本次范围**:未命名群→双人图标、取字规则
+  (`Bug反`→`Bu`/`g反`,待设计)。

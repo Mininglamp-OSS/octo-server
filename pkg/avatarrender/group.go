@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"image"
 	"image/color"
-	"image/draw"
 	"image/png"
 	"math"
 
@@ -57,9 +56,10 @@ func isWideRune(r rune) bool {
 		(r >= 0xFF00 && r <= 0xFF60) // 全角 ASCII 变体
 }
 
-// RenderGroup 渲染群默认头像「白底 + 浅底描边圆 + 居中主题色文字」，文字按
-// GroupAvatarLines 决定单行或两行（2×2）。个人头像继续走 Render（单行实心圆），
-// 本函数仅供群头像使用，故可独立调整视觉而不影响个人头像。
+// RenderGroup 渲染群默认头像「浅底描边圆 + 居中主题色文字」，圆外**透明**（输出带 alpha
+// 通道的 RGBA PNG，客户端在任意背景上合成时圆外不出白方块），文字按 GroupAvatarLines
+// 决定单行或两行（2×2）。个人头像继续走 Render（单行实心圆），本函数仅供群头像使用，
+// 故可独立调整视觉而不影响个人头像。
 func RenderGroup(text string, style GroupStyle, size int) ([]byte, error) {
 	if text == "" {
 		return nil, fmt.Errorf("avatarrender: empty text")
@@ -74,8 +74,8 @@ func RenderGroup(text string, style GroupStyle, size int) ([]byte, error) {
 	lines := GroupAvatarLines(text)
 
 	big := size * supersample
+	// 画布零值即全透明，不再铺白底：圆外保持透明，png.Encode 自动输出带 alpha 的 RGBA PNG。
 	canvas := image.NewRGBA(image.Rect(0, 0, big, big))
-	draw.Draw(canvas, canvas.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
 	drawCircleFilledStroked(canvas, style.Fill, style.Main, groupCircleStrokeRatio)
 
 	if err := drawCenteredLines(canvas, fnt, lines, big, style.Main); err != nil {
