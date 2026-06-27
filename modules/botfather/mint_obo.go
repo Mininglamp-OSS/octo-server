@@ -28,7 +28,7 @@ type MintBotResult struct {
 //  1. create app (idempotent on robot_id)
 //  2. insert robot row
 //  3. add user (Robot=1)
-//  4. add bot to space_member (logged-and-continue on failure)
+//  4. add bot to space_member (required; this is authorization state)
 //  5. friend owner <-> bot bidirectional (logged-and-continue on failure)
 func MintBotOBO(ctx *config.Context, ownerUID, spaceID, displayName, botToken string) (*MintBotResult, error) {
 	if ownerUID == "" {
@@ -58,6 +58,7 @@ func MintBotOBO(ctx *config.Context, ownerUID, spaceID, displayName, botToken st
 	if err != nil {
 		h.Warn("MintBotOBO: bot 加入 Space 失败",
 			zap.Error(err), zap.String("bot_uid", robotID), zap.String("space_id", spaceID))
+		return nil, fmt.Errorf("MintBotOBO: add bot to space: %w", err)
 	}
 
 	if err := h.userService.AddFriend(ownerUID, &user.FriendReq{UID: ownerUID, ToUID: robotID}); err != nil {
