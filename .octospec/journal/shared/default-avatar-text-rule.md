@@ -64,3 +64,37 @@ bytes — not only pixel/style changes (#486 transparent corners) but **text-rul
 changes too (this task). The ETag is CRC32 over content *factors*, so a text-rule
 change with unchanged factors would otherwise serve stale 304s. Encoded at the
 ETag call sites; the endpoint version-pin tests guard it.
+
+## PR #494 评审轮:批量修复(4 位 reviewer)
+4 位 reviewer(Jerry-Xin / Octo-Q / OctoBoooot / yujiawei)全 Approve(非阻塞)。按
+用户指示「等一波齐了一次性修」,合并为一轮:
+
+**`initials` 两处真 bug(测试碰巧没盖到)**
+- **空格未在切词**:`visibleRunes` 在分词前剥了空格,只剩驼峰/标点在切 → `dev team→D`
+  (应 `DT`)。修:`initials` 改吃**原始 name**(保留空格)。`Backend Team→BT` 原是靠
+  驼峰边界蒙对的。
+- **数字阻断驼峰**:`prev` 记成了数字 → `Web3Team→W`(应 `WT`)。修:跟踪上一个**字母**
+  的大小写(顺带消除 Octo-Q 的 prev-scope nit)。
+
+**D — 非汉字脚本塌成 1 字(产品定:日韩一起修)**
+`extractAvatarText` 的 CJK 分支从 `unicode.Han` 扩到 **Han + Hangul + Hiragana +
+Katakana**(`isCJKGlyph`):`김철수→김철`/`철수`、`さとう→さと`/`とう`、片假名同。拉丁仍走
+缩写;西里尔/阿拉伯/泰文等「无空格的有大小写字母」单词仍塌 1 字,文档标注为已知限制
+(超出 zh-CN/en-US+CJK 范围)。
+
+**无需再 bump 版本**:v4/v5 尚未发布,B/C/D 都并入这首个携带新规则的版本,旧 v3/name-v4
+缓存在部署时一并失效,中间没有 v4-without-BCD 上过线。
+
+**测试/注释补强**
+- `TestGroupAvatarGetCustomTextNotTruncated`:4 字自定义 `研发中心` 原样渲染、不被截成
+  前 2(Jerry-Xin 🟡,守 custom/auto 分流)。
+- `TestGroupNameText`/`TestIndividualText` 增 D(日韩假名)/B(`dev team`、`HR BP`)/
+  C(`Web3Team`)/`张123`/西里尔限制 用例。
+- 清理 stale「群名前 4 字」注释 → 「前 2 字」(service.go/db.go/const.go/api.go/swagger;
+  自定义 ≤4 的「4 个字符」措辞不动;迁移文件历史记录不改)。
+
+**验证**(测试环境本地真起:MySQL8 + Redis + WuKongIM):取字单测 + 群/个人端点(含 A1
++ pin v4/v5)全绿;#480 饿死 21.8x→0.9x 无回归;go vet 0、golangci-lint 0、i18n-lint、
+NoLegacy 守卫全过。
+
+**无 action**:Octo-Q `2024春招群→春招`(digit+Han 设计,已签)。

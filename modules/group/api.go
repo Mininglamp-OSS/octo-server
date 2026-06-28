@@ -399,7 +399,7 @@ func (g *Group) avatarGet(c *wkhttp.Context) {
 	}
 	// 群不存在或已解散 → 404（与 UserAvatar 对未知用户、以及本模块 getGroupInfo /
 	// UpdateGroupAvatarCustom 等对 GroupStatusDisband 的处理一致），不再为其渲染默认图：
-	// 否则公开未鉴权端点会把已解散群的群名前 4 字渲成 PNG（信息泄露 + 可区分「已解散」与
+	// 否则公开未鉴权端点会把已解散群的群名前 2 字渲成 PNG（信息泄露 + 可区分「已解散」与
 	// 「从未存在」的枚举面）。系统群 / org_ / dept_ 已在上方静态分支处理，到这里必为普通群。
 	if groupInfo == nil || groupInfo.Status == GroupStatusDisband {
 		c.Writer.WriteHeader(http.StatusNotFound)
@@ -424,12 +424,12 @@ func (g *Group) avatarGet(c *wkhttp.Context) {
 	}
 
 	// 无自定义上传（含历史合成群、新建群）：服务端实时渲染默认头像——
-	// 浅底描边圆 + 群名前 4 字（或自定义文字），群名为空/不可渲染时回退群组图标。
+	// 浅底描边圆 + 群名前 2 字（或自定义文字），群名为空/不可渲染时回退群组图标。
 	g.writeGroupDefaultAvatar(c, groupNo, groupInfo)
 }
 
 // writeGroupDefaultAvatar 服务端渲染并返回群默认头像（无自定义上传时）。文字优先
-// 自定义 avatar_text，否则群名前 4 字；颜色优先自定义 avatar_color，否则按 group_no
+// 自定义 avatar_text，否则群名前 2 字；颜色优先自定义 avatar_color，否则按 group_no
 // 稳定派生（改名不变色、跨页面一致）。群名为空或不可渲染时回退群组图标。
 //
 // URL 稳定为 groups/{group_no}/avatar，内容随群名/自定义变化，故用内容相关弱 ETag +
@@ -4181,7 +4181,7 @@ func (g groupReq) Check() error {
 
 // checkAvatar 校验二次弹窗的自定义头像参数，返回越界字段名（供 Details.field）。
 // ok=true 表示合法。两者均为可选：avatar_text 空、avatar_color 不传即“未自定义”，
-// 渲染时分别回退到群名前 4 字 / ColorForSeed(group_no)。不静默截断，超限直接拒绝。
+// 渲染时分别回退到群名前 2 字 / ColorForSeed(group_no)。不静默截断，超限直接拒绝。
 //
 // 哨兵约定（创建 vs 改群刻意不对称）：创建无既有值可清除，故 avatar_color 仅接受
 // [0,palette)（-1 在此被拒）；改群额外接受 "-1" / "" 表示清除自定义色回退派生。

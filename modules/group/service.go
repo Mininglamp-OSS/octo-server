@@ -796,7 +796,7 @@ type GroupResp struct {
 	GroupType                GroupType `json:"group_type"`                  // 群类型
 	Category                 string    `json:"category"`                    // 群分类
 	Name                     string    `json:"name"`                        // 群名称
-	AvatarText               string    `json:"avatar_text"`                 // 自定义群头像文字（空=用群名前 4 字派生）
+	AvatarText               string    `json:"avatar_text"`                 // 自定义群头像文字（空=用群名前 2 字派生）
 	AvatarColor              *int      `json:"avatar_color"`                // 自定义群头像色板下标（null=按 group_no 派生）
 	Remark                   string    `json:"remark"`                      // 群备注
 	Notice                   string    `json:"notice"`                      // 群公告
@@ -956,7 +956,7 @@ type CreateGroupServiceReq struct {
 	SpaceID     string   // Space ID（可为空）
 	BotUID      string   // Bot UID（可为空；非空时自动加入群并设为 bot_admin）
 	CategoryID  string   // 群聊分组 ID（可为空；非空时自动设置创建者的 group_setting）
-	AvatarText  string   // 自定义群头像文字（可为空；空=渲染时用群名前 4 字派生）
+	AvatarText  string   // 自定义群头像文字（可为空；空=渲染时用群名前 2 字派生）
 	AvatarColor *int     // 自定义群头像色板下标（nil=渲染时按 group_no 派生）
 }
 
@@ -1166,7 +1166,7 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 		AllowExternal:       1, // 向后兼容：默认允许外部成员
 		AllowNoMention:      1, // 向后兼容：默认允许群级免@
 		IsExternalGroup:     isExternalGroup,
-		AvatarText:          req.AvatarText,  // 空=渲染时回退群名前 4 字
+		AvatarText:          req.AvatarText,  // 空=渲染时回退群名前 2 字
 		AvatarColor:         req.AvatarColor, // nil=渲染时按 group_no 派生
 	}, tx)
 	if err != nil {

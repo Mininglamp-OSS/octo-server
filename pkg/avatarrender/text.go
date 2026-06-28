@@ -3,30 +3,36 @@ package avatarrender
 import "unicode"
 
 // extractAvatarText derives the ≤limit-glyph display text for a default avatar
-// from a free-form name, script-aware (命中即止):
-//  1. strip invisible chars (space/Cc/Cf); empty → "" (caller falls back to icon)
-//  2. any Han → Han chars only (drop Latin/digits/symbols), clamp to limit
+// from a free-form name, script-aware (first match wins):
+//  1. strip invisible (space/Cc/Cf); empty → "" (caller falls back to an icon)
+//  2. any CJK glyph (Han / Hangul / Hiragana / Katakana) → those glyphs only
+//     (drop Latin/digits/symbols/other scripts), clamp to limit
 //  3. else pure digits → clamp to limit
-//  4. else has a letter → initials (first letter per token, ≤limit, uppercase)
-//  5. else (pure symbol / emoji) → "" (caller falls back to icon)
+//  4. else has a letter → initials (first letter per token; tokens split on
+//     whitespace, separators, and camelCase; ≤limit, uppercase)
+//  5. else (pure symbol / emoji) → "" (icon)
 //
-// fromEnd picks trailing glyphs in the Han/digit cases (personal 后N); initials
-// are always leading. The result may still contain a rune with no glyph in the
-// avatar font (rare Han); callers pair this with Renderable and fall back to an
-// icon when it is not renderable.
+// fromEnd picks trailing glyphs in the CJK/digit cases (personal 后N); initials
+// are always leading. Known limitation: a cased-but-non-Latin alphabet *without*
+// word spaces — a single Cyrillic / Greek / Arabic / Thai word — falls into the
+// initials branch and collapses to one glyph (e.g. "Анна"→"А"); that is outside
+// the zh-CN/en-US + CJK scope this rule targets. The result may still contain a
+// rune with no glyph in the avatar font (rare Han); callers pair this with
+// Renderable and fall back to an icon when it is not renderable.
 func extractAvatarText(name string, fromEnd bool, limit int) string {
 	rs := visibleRunes(name)
 	if len(rs) == 0 {
 		return ""
 	}
-	han := make([]rune, 0, len(rs))
+	// CJK ideographic/syllabic scripts (no word spaces) → take those glyphs only.
+	cjk := make([]rune, 0, len(rs))
 	for _, r := range rs {
-		if unicode.Is(unicode.Han, r) {
-			han = append(han, r)
+		if isCJKGlyph(r) {
+			cjk = append(cjk, r)
 		}
 	}
-	if len(han) > 0 {
-		return string(clampRunes(han, fromEnd, limit))
+	if len(cjk) > 0 {
+		return string(clampRunes(cjk, fromEnd, limit))
 	}
 	allDigit := true
 	for _, r := range rs {
@@ -40,10 +46,21 @@ func extractAvatarText(name string, fromEnd bool, limit int) string {
 	}
 	for _, r := range rs {
 		if unicode.IsLetter(r) {
-			return initials(rs, limit)
+			// Pass the original name (whitespace preserved) so initials splits on it.
+			return initials(name, limit)
 		}
 	}
 	return ""
+}
+
+// isCJKGlyph reports whether r is a CJK ideographic/syllabic glyph that should be
+// rendered 1:1 (taken N-at-a-time) rather than abbreviated to an initial: Han
+// (Chinese / Japanese kanji), Hangul (Korean), and Japanese Hiragana / Katakana.
+func isCJKGlyph(r rune) bool {
+	return unicode.Is(unicode.Han, r) ||
+		unicode.Is(unicode.Hangul, r) ||
+		unicode.Is(unicode.Hiragana, r) ||
+		unicode.Is(unicode.Katakana, r)
 }
 
 // clampRunes returns at most limit runes, trailing when fromEnd else leading.
@@ -57,51 +74,41 @@ func clampRunes(rs []rune, fromEnd bool, limit int) []rune {
 	return rs[:limit]
 }
 
-// initials returns up to limit uppercase first-letters, one per token. Tokens
-// split on any run of non-letter/digit chars and on camelCase (lower→Upper)
-// boundaries; a token with no letter contributes nothing. So "Backend Team" →
-// "BT", "Sales" → "S", "myCoolGroup" → "MC".
-func initials(rs []rune, limit int) string {
-	var toks [][]rune
-	var cur []rune
-	var prev rune
-	for _, r := range rs {
-		if !(unicode.IsLetter(r) || unicode.IsDigit(r)) {
-			if len(cur) > 0 {
-				toks = append(toks, cur)
-				cur = nil
-			}
-			prev = r
+// initials returns up to limit uppercase first-letters, one per token. Tokens are
+// split on whitespace, on any other non-letter/digit run (punctuation/symbols), and
+// on camelCase boundaries (a lowercase letter followed by an uppercase one). The
+// boundary tracks the previous *letter's* case, so a digit between words does not
+// suppress the split ("Web3Team" → "WT"). A token with no letter contributes nothing.
+// Examples: "Backend Team"→"BT", "dev team"→"DT", "my-team"→"MT", "myCoolGroup"→"MC".
+func initials(name string, limit int) string {
+	out := make([]rune, 0, limit)
+	var prevLetter rune // last letter in the current token; 0 at a token boundary
+	took := false       // already emitted an initial for the current token
+	for _, r := range name {
+		if isInvisible(r) || !(unicode.IsLetter(r) || unicode.IsDigit(r)) {
+			took, prevLetter = false, 0 // separator → end token
 			continue
 		}
-		if unicode.IsUpper(r) && len(cur) > 0 && unicode.IsLower(prev) {
-			toks = append(toks, cur)
-			cur = nil
+		if unicode.IsUpper(r) && unicode.IsLower(prevLetter) {
+			took = false // camelCase boundary → new token
 		}
-		cur = append(cur, r)
-		prev = r
-	}
-	if len(cur) > 0 {
-		toks = append(toks, cur)
-	}
-	out := make([]rune, 0, limit)
-	for _, t := range toks {
-		for _, r := range t {
-			if unicode.IsLetter(r) {
-				out = append(out, unicode.ToUpper(r))
-				break
+		if !took && unicode.IsLetter(r) {
+			out = append(out, unicode.ToUpper(r))
+			took = true
+			if len(out) == limit {
+				return string(out)
 			}
 		}
-		if len(out) == limit {
-			break
+		if unicode.IsLetter(r) {
+			prevLetter = r
 		}
 	}
 	return string(out)
 }
 
 // GroupNameText derives a group's default-avatar text from its NAME: script-aware,
-// leading 2 glyphs —— 汉字前2 / 纯数字前2 / 纯英文首字母缩写(≤2、大写) / 否则空
-// (回退群组图标)。混排有汉字时只取汉字(忽略拉丁/数字/符号)。
+// leading 2 glyphs —— CJK(汉字/假名/谚文)前2 / 纯数字前2 / 纯拉丁等取首字母缩写
+// (≤2、大写) / 否则空(回退群组图标)。混排有 CJK 时只取 CJK(忽略拉丁/数字/符号)。
 //
 // 仅用于「群名自动取字」。用户显式设置的自定义头像文字走 GroupText(原样渲染、≤4),
 // 不经过本规则。返回结果可能仍含本字体无字形的字符(罕见生僻字),调用方应配合
@@ -111,8 +118,8 @@ func GroupNameText(name string) string {
 }
 
 // IndividualText 返回个人默认头像应显示的文字:script 感知、**后** 2 字 ——
-// 汉字取后2(混排时只取汉字)、纯数字后2、纯英文取首字母缩写(≤2、大写)、否则空
-// (调用方回退 ASCII 兜底)。
+// CJK(汉字/假名/谚文)取后2(混排时只取 CJK)、纯数字后2、纯拉丁等取首字母缩写
+// (≤2、大写)、否则空(调用方回退 ASCII 兜底)。
 //
 // 个人取**后**两字(区别于群名 GroupNameText 取前2):中文昵称后缀(名)更具辨识度
 // (张三丰→三丰、王小明→小明,同钉钉/飞书)。空白/控制/零宽字符在计数前剔除。结果可能

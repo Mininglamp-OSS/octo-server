@@ -105,6 +105,33 @@ func TestGroupAvatarGetCustomOverrides(t *testing.T) {
 	require.Equal(t, want, w.Body.Bytes(), "custom text+color must override name/seed")
 }
 
+// TestGroupAvatarGetCustomTextNotTruncated 回归 PR#494 评审(Jerry-Xin):用户显式
+// 自定义文字必须**原样渲染**(≤4),不得被群名自动取字规则(script 感知前 2)截断 ——
+// 4 字自定义渲染全 4 字「研发中心」,而非前 2「研发」。
+func TestGroupAvatarGetCustomTextNotTruncated(t *testing.T) {
+	s, ctx := newTestServer(t)
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	g := New(ctx)
+
+	const groupNo = "avatar_custom_4char_1"
+	require.NoError(t, g.db.Insert(&Model{
+		GroupNo: groupNo, Name: "原始群名", Creator: "c1", Status: 1,
+		AvatarText: "研发中心", // 4 个可见 rune
+	}))
+
+	w := doAvatarGet(t, s.GetRoute(), groupNo, "")
+	require.Equal(t, http.StatusOK, w.Code)
+
+	style := avatarrender.GroupStyleForSeed(groupNo)
+	asIs, err := avatarrender.RenderGroup("研发中心", style, avatarrender.DefaultSize)
+	require.NoError(t, err)
+	require.Equal(t, asIs, w.Body.Bytes(), "custom avatar_text must render as-is (≤4), not auto-derived")
+
+	truncated, err := avatarrender.RenderGroup("研发", style, avatarrender.DefaultSize)
+	require.NoError(t, err)
+	require.NotEqual(t, truncated, w.Body.Bytes(), "custom text must NOT be GroupNameText-truncated to 2")
+}
+
 // TestGroupAvatarGetUploadedRedirects 覆盖群主已上传自定义头像（is_upload_avatar=1）
 // → 维持历史行为：重定向到对象存储，不进服务端渲染。
 func TestGroupAvatarGetUploadedRedirects(t *testing.T) {

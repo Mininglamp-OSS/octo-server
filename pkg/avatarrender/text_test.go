@@ -20,6 +20,18 @@ func TestIndividualText(t *testing.T) {
 		{"latin two words initials", "John Smith", "JS"},
 		{"latin camelCase initials", "johnSmith", "JS"},
 		{"long latin single word one initial", "Alexander", "A"},
+		// D — CJK syllabaries now take two glyphs (was: collapsed to one initial).
+		{"hangul last two", "김철수", "철수"},
+		{"hiragana last two", "さとう", "とう"},
+		{"katakana last two", "サトウ", "トウ"},
+		{"han kana mixed last two", "田中さくら", "くら"},
+		{"hangul drops latin keeps cjk", "Lee김철", "김철"},
+		// B — whitespace splits initials tokens.
+		{"space splits lowercase multiword", "dev team", "DT"},
+		// C — a digit between camelCase words no longer suppresses the split.
+		{"digit between camel words", "Web3Team", "WT"},
+		// Known limitation: a single cased non-Latin word collapses to one initial.
+		{"cyrillic single word one initial", "Анна", "А"},
 		{"pure digits last two", "123456", "56"},
 		{"trim surrounding space", "  李雷  ", "李雷"},
 		{"trim then take last two", "  张三丰  ", "三丰"},
@@ -57,6 +69,18 @@ func TestGroupNameText(t *testing.T) {
 		{"latin two words initials", "Backend Team", "BT"},
 		{"latin single word one initial", "Sales", "S"},
 		{"latin camelCase initials", "myCoolGroup", "MC"},
+		// D — CJK syllabaries take two glyphs (leading, group direction).
+		{"hangul first two", "김철수", "김철"},
+		{"hiragana first two", "さとう", "さと"},
+		{"katakana first two", "サトウ", "サト"},
+		{"han with trailing digits one cjk", "张123", "张"},
+		// B — whitespace splits initials tokens.
+		{"space splits lowercase multiword", "dev team", "DT"},
+		{"space splits allcaps multiword", "HR BP", "HB"},
+		// C — a digit between camelCase words no longer suppresses the split.
+		{"digit between camel words", "Web3Team", "WT"},
+		// Known limitation: a single cased non-Latin word collapses to one initial.
+		{"cyrillic single word one initial", "Анна", "А"},
 		{"pure digits first two", "2024", "20"},
 		{"trim surrounding space", "  产品群  ", "产品"},
 		{"strip inner space keeps cjk", "前 端 U I", "前端"},
