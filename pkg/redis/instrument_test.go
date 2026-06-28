@@ -66,6 +66,9 @@ func TestInstrumentedClientFromOptionsInstruments(t *testing.T) {
 		MaxRetries:  0,
 		DialTimeout: 200 * time.Millisecond,
 	})
+	if c == nil {
+		t.Fatal("InstrumentedClientFromOptions returned nil")
+	}
 	defer func() { _ = c.Close() }()
 
 	_ = c.Get("k").Err()

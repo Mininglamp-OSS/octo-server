@@ -73,7 +73,10 @@ func NewInstrumentedClient(cfg *config.Config, overrides ...OptionsOverride) *rd
 // 供少数已自行拼好 Options 的场景（如 health 探针）使用；一般情况优先用
 // NewInstrumentedClient。
 func InstrumentedClientFromOptions(opts *rd.Options) *rd.Client {
-	c := rd.NewClient(opts)
+	// 防御性复制：go-redis 会就地写入若干默认值，不复制可能在调用方复用同一
+	// *rd.Options 时串改。与 octo-lib redis.NewWithOptions 的处理保持一致。
+	local := *opts
+	c := rd.NewClient(&local)
 	liboredis.Instrument(c)
 	return c
 }
