@@ -40,7 +40,7 @@ type dependencyReadinessChecker struct {
 func newDependencyReadinessChecker(ctx *config.Context, db *db) readinessChecker {
 	return &dependencyReadinessChecker{
 		db:          db,
-		redisClient: rd.NewClient(readinessRedisOptions(ctx.GetConfig())),
+		redisClient: octoredis.InstrumentedClientFromOptions(readinessRedisOptions(ctx.GetConfig())),
 	}
 }
 

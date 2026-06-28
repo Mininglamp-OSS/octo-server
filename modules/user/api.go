@@ -161,9 +161,9 @@ func New(ctx *config.Context) *User {
 		spaceSettingDB:           NewSpaceSettingDB(ctx.DB()),
 		verificationDB:           newVerificationDB(ctx),
 		existingTokenSetter: redisExistingTokenSetter{
-			client: rd.NewClient(octoredis.MustBuildOptions(ctx.GetConfig(), func(o *rd.Options) {
+			client: octoredis.NewInstrumentedClient(ctx.GetConfig(), func(o *rd.Options) {
 				o.PoolSize = 10
-			})),
+			}),
 		},
 	}
 	// LanguageService 与 main.go 注入到 CacheTokenParser 的实例独立构造，但共享
@@ -193,10 +193,10 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 	rlCtx := context.Background()
 	// 限流状态存 Redis，多副本共享配额；生命周期跟随进程，与 main.go 的做法一致
 	// PoolSize 显式设 10：理由同 main.go——限流 Lua 脚本短事务，不需要大池。
-	rlRedis := rd.NewClient(octoredis.MustBuildOptions(u.ctx.GetConfig(), func(o *rd.Options) {
+	rlRedis := octoredis.NewInstrumentedClient(u.ctx.GetConfig(), func(o *rd.Options) {
 		o.MaxRetries = 1
 		o.PoolSize = 10
-	}))
+	})
 	// burst 取小值：人类正常重试容忍 + 不给攻击者初始白嫖窗口
 	// tag 用稳定字符串分离 keyspace；注意 register 和 sms 参数相同但语义不同，必须分开
 	loginLimit := r.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "login", 10.0/60, 5)       // 10 req/min, burst 5

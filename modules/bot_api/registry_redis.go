@@ -96,12 +96,12 @@ type RedisAppBotRegistry struct {
 // process config). ttl supplies the safety-net key expiry; a non-positive value
 // is coerced to a sane floor in set().
 func NewRedisAppBotRegistry(ctx *config.Context, ttl func() time.Duration) *RedisAppBotRegistry {
-	client := rd.NewClient(octoredis.MustBuildOptions(ctx.GetConfig(), func(o *rd.Options) {
+	client := octoredis.NewInstrumentedClient(ctx.GetConfig(), func(o *rd.Options) {
 		o.MaxRetries = 2
 		o.DialTimeout = 3 * time.Second
 		o.ReadTimeout = 2 * time.Second
 		o.WriteTimeout = 2 * time.Second
-	}))
+	})
 	return &RedisAppBotRegistry{
 		Log:    log.NewTLog("RedisAppBotRegistry"),
 		client: client,

@@ -1397,12 +1397,12 @@ type redisCompareDeleter struct {
 }
 
 func newRedisCompareDeleter(ctx *config.Context) *redisCompareDeleter {
-	client := rd.NewClient(octoredis.MustBuildOptions(ctx.GetConfig(), func(o *rd.Options) {
+	client := octoredis.NewInstrumentedClient(ctx.GetConfig(), func(o *rd.Options) {
 		o.MaxRetries = 3
 		o.ReadTimeout = 3 * time.Second
 		o.WriteTimeout = 3 * time.Second
 		o.DialTimeout = 3 * time.Second
-	}))
+	})
 	return &redisCompareDeleter{client: client}
 }
 

@@ -199,10 +199,10 @@ func runAPI(ctx *config.Context) {
 	// 生命周期：跟随进程存续，不显式 Close——与 lib 自身的 redis.Conn 处理方式一致。
 	// PoolSize 显式设 10：令牌桶 Lua 脚本是短事务，Redis 端 <1ms，不需要大池；
 	// go-redis v6 默认 10*NumCPU 在大核机上会失控（多副本 × 多 client 连接数叠加）。
-	rlRedis := rd.NewClient(octoredis.MustBuildOptions(ctx.GetConfig(), func(o *rd.Options) {
+	rlRedis := octoredis.NewInstrumentedClient(ctx.GetConfig(), func(o *rd.Options) {
 		o.MaxRetries = 1
 		o.PoolSize = 10
-	}))
+	})
 	route.Use(route.RateLimitMiddleware(context.Background(), rlRedis, rps, burst, globalRateLimitExcludePaths()...))
 	// 上游依赖可观测性(issue #440 P0-a):依赖调用延迟 + 连接池指标,均注册到
 	// DefaultRegisterer,经 /metrics 暴露(与 httpMetrics 同一端点)。连接池用
@@ -238,13 +238,12 @@ func runAPI(ctx *config.Context) {
 	// observer 在调用时按 atomic 解析,construct 时即已挂 hook,故放在此处(指标族
 	// 注册之后、serve 之前)即可,不会漏掉后续流量。
 	//
-	// 覆盖范围(重要):dependency="redis" 只覆盖经 pkg/redis 构造的客户端 ——
-	// 主要是共享缓存 ctx.GetRedisConn()(数据面大头)。全仓还有约 15 处裸
-	// rd.NewClient(octoredis.MustBuildOptions(...))(限流 rlRedis、OIDC state/bind/
-	// logout/sync_lock、bot registry、user/group/space auth、health、各类 Lua 锁等),
-	// 它们需要 Eval/Script/SetNX 等 pkg/redis 包装未暴露的原语,因此都绕过插桩,
-	// 其单命令延迟不进本指标(连接池指标仍覆盖)。在 dependency="redis" 上做告警时
-	// 要知道 auth/OIDC/限流/锁/health 这些路径不可见。通用治理见 octo-lib#96。
+	// 覆盖范围:dependency="redis" 覆盖共享缓存 ctx.GetRedisConn()(数据面大头),
+	// 以及所有需要 Eval/Script/SetNX 而走裸 *rd.Client 的控制面客户端(限流 rlRedis、
+	// OIDC state/bind/logout/sync_lock、bot registry、user/group/space auth、health、
+	// 各类 Lua 锁等)—— 后者统一经 octoredis.NewInstrumentedClient/InstrumentedClientFromOptions
+	// 构造,在构造时即插桩(octo-lib#104)。仍在覆盖外的只有绕过 octoredis 直接
+	// rd.NewClient 的极少数场景(若有),用连接池指标兜底。
 	libdb.SetDBObserver(metrics.ObserveDB)
 	libredis.SetRedisObserver(metrics.ObserveRedisCmd)
 	metrics.RegisterPoolCollectors(prometheus.DefaultRegisterer, ctx.DB().DB, map[string]*rd.Client{

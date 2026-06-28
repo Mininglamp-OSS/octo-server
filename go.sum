@@ -67,6 +67,8 @@ github.com/MicahParks/keyfunc v1.9.0 h1:lhKd5xrFHLNOWrDc4Tyb/Q1AJ4LCzQ48GVJyVIID
 github.com/MicahParks/keyfunc v1.9.0/go.mod h1:IdnCilugA0O/99dW+/MkvlyrsX8+L8+x95xuVNtM5jw=
 github.com/Mininglamp-OSS/octo-lib v0.0.0-20260626063251-cff4d7a48f55 h1:2reLrd1tHsMwGRaGVXbHVpIzqnlVajkOPwn8hclDraI=
 github.com/Mininglamp-OSS/octo-lib v0.0.0-20260626063251-cff4d7a48f55/go.mod h1:uOCTTI3QdG0ETKZ6uluRWUZgKexee/pY1pQYWyIEvZ0=
+github.com/Mininglamp-OSS/octo-lib v0.0.0-20260628015025-0c34e6f108c4 h1:We9RyaYNEerDC/V5Zq0wFl+uvUFp9S0eHB5Jz6sz4fk=
+github.com/Mininglamp-OSS/octo-lib v0.0.0-20260628015025-0c34e6f108c4/go.mod h1:uOCTTI3QdG0ETKZ6uluRWUZgKexee/pY1pQYWyIEvZ0=
 github.com/RichardKnop/logging v0.0.0-20190827224416-1a693bdd4fae h1:DcFpTQBYQ9Ct2d6sC7ol0/ynxc2pO1cpGUM+f4t5adg=
 github.com/RichardKnop/logging v0.0.0-20190827224416-1a693bdd4fae/go.mod h1:rJJ84PyA/Wlmw1hO+xTzV2wsSUon6J5ktg0g8BF2PuU=
 github.com/RichardKnop/machinery/v2 v2.0.11 h1:BTfLGOmOju3W/OtlZmLX26OjYNZsU4PJo04pQReycdc=

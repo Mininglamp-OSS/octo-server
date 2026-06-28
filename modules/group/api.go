@@ -150,10 +150,10 @@ func (g *Group) Route(r *wkhttp.WKHttp) {
 	//   - DM_API_GROUP_INVITE_RPS   每秒填充速率（float，缺省 60.0）
 	//   - DM_API_GROUP_INVITE_BURST 桶容量（int，缺省 200）
 	// 生产环境如需收紧，在部署时设置 env（如 RPS=0.1667 / BURST=5 恢复到 10 req/min）。
-	rlRedis := redis.NewClient(octoredis.MustBuildOptions(g.ctx.GetConfig(), func(o *redis.Options) {
+	rlRedis := octoredis.NewInstrumentedClient(g.ctx.GetConfig(), func(o *redis.Options) {
 		o.MaxRetries = 1
 		o.PoolSize = 10
-	}))
+	})
 	inviteRPS := wkhttp.ParseRPSFromEnv("DM_API_GROUP_INVITE_RPS", 60.0) // 默认 60 rps ≈ 3600 req/min
 	inviteBurst := wkhttp.ParseBurstFromEnv("DM_API_GROUP_INVITE_BURST", 200)
 	groupInviteLimit := r.StrictIPRateLimitMiddleware(context.Background(), rlRedis, "group_invite", inviteRPS, inviteBurst)

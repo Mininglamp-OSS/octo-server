@@ -209,10 +209,10 @@ func (a *BotProvision) Route(r *wkhttp.WKHttp) {
 	// allowlist / X-Internal-Key) is the documented primary control;
 	// the limiter is defense-in-depth.
 	rlCtx := context.Background()
-	rlRedis := rd.NewClient(octoredis.MustBuildOptions(a.ctx.GetConfig(), func(o *rd.Options) {
+	rlRedis := octoredis.NewInstrumentedClient(a.ctx.GetConfig(), func(o *rd.Options) {
 		o.MaxRetries = 1
 		o.PoolSize = 10
-	}))
+	})
 	verifyLimit := r.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "verify", 1000.0/60, 100)
 	r.GET("/v1/bot/:uid/token", verifyLimit, a.botToken)
 }

@@ -106,10 +106,10 @@ func (s *Space) Route(r *wkhttp.WKHttp) {
 	// 两个端点共享同一 limiter，使同一 IP 跨端点总配额受控。
 	// 阈值与 user 模块 login 同档（10 req/min, burst 5），详见 PR #1090。
 	// PoolSize=10：Lua 脚本短事务，与 user 模块 / main.go 保持一致。
-	rlRedis := rd.NewClient(octoredis.MustBuildOptions(s.ctx.GetConfig(), func(o *rd.Options) {
+	rlRedis := octoredis.NewInstrumentedClient(s.ctx.GetConfig(), func(o *rd.Options) {
 		o.MaxRetries = 1
 		o.PoolSize = 10
-	}))
+	})
 	invitePreviewLimit := r.StrictIPRateLimitMiddleware(context.Background(), rlRedis, "space_invite", 10.0/60, 5)
 
 	open := r.Group("/v1/space")

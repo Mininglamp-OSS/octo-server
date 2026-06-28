@@ -64,10 +64,10 @@ func SharedUIDRateLimiter(r *libwkhttp.WKHttp, ctx *config.Context) libwkhttp.Ha
 	// Eval/Script 接口，令牌桶 Lua 脚本必须走原生 go-redis。生命周期跟随进程。
 	// ctx 传 context.Background()：go-redis v6 的 Script.Run 不接受 context；
 	// 即便未来升级到 v8+ 也不应传请求 ctx（token 消耗不可因客户端断连回退）。
-	client := rd.NewClient(octoredis.MustBuildOptions(ctx.GetConfig(), func(o *rd.Options) {
+	client := octoredis.NewInstrumentedClient(ctx.GetConfig(), func(o *rd.Options) {
 		o.MaxRetries = 1
 		o.PoolSize = uidRateLimitPoolSize
-	}))
+	})
 	if r == nil {
 		r = libwkhttp.New()
 	}
