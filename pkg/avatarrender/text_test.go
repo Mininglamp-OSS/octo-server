@@ -30,6 +30,8 @@ func TestIndividualText(t *testing.T) {
 		{"space splits lowercase multiword", "dev team", "DT"},
 		// C — a digit between camelCase words no longer suppresses the split.
 		{"digit between camel words", "Web3Team", "WT"},
+		{"digit not a separator lowercase", "dev2team", "D"},
+		{"digit not a separator acronym", "API2Gateway", "A"},
 		// Known limitation: a single cased non-Latin word collapses to one initial.
 		{"cyrillic single word one initial", "Анна", "А"},
 		{"pure digits last two", "123456", "56"},
@@ -79,6 +81,8 @@ func TestGroupNameText(t *testing.T) {
 		{"space splits allcaps multiword", "HR BP", "HB"},
 		// C — a digit between camelCase words no longer suppresses the split.
 		{"digit between camel words", "Web3Team", "WT"},
+		{"digit not a separator lowercase", "dev2team", "D"},
+		{"digit not a separator acronym", "API2Gateway", "A"},
 		// Known limitation: a single cased non-Latin word collapses to one initial.
 		{"cyrillic single word one initial", "Анна", "А"},
 		{"pure digits first two", "2024", "20"},

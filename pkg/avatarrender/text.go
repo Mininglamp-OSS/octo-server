@@ -8,8 +8,10 @@ import "unicode"
 //  2. any CJK glyph (Han / Hangul / Hiragana / Katakana) → those glyphs only
 //     (drop Latin/digits/symbols/other scripts), clamp to limit
 //  3. else pure digits → clamp to limit
-//  4. else has a letter → initials (first letter per token; tokens split on
-//     whitespace, separators, and camelCase; ≤limit, uppercase)
+//  4. else has a letter → initials over the *original* name (whitespace,
+//     separators, and camelCase split tokens; invisible chars are ignored); the
+//     CJK/digit branches above use the invisible-stripped runes — only this branch
+//     needs the raw name so spaces act as word separators
 //  5. else (pure symbol / emoji) → "" (icon)
 //
 // fromEnd picks trailing glyphs in the CJK/digit cases (personal 后N); initials
@@ -74,12 +76,18 @@ func clampRunes(rs []rune, fromEnd bool, limit int) []rune {
 	return rs[:limit]
 }
 
-// initials returns up to limit uppercase first-letters, one per token. Tokens are
-// split on whitespace, on any other non-letter/digit run (punctuation/symbols), and
-// on camelCase boundaries (a lowercase letter followed by an uppercase one). The
-// boundary tracks the previous *letter's* case, so a digit between words does not
-// suppress the split ("Web3Team" → "WT"). A token with no letter contributes nothing.
-// Examples: "Backend Team"→"BT", "dev team"→"DT", "my-team"→"MT", "myCoolGroup"→"MC".
+// initials returns up to limit uppercase first-letters, one per token. Tokens split
+// on whitespace, on any other non-letter/digit run (punctuation/symbols), and on
+// camelCase boundaries (a lowercase letter immediately followed by an uppercase one).
+// A digit is NOT a word separator: it stays in the token and only preserves the
+// previous letter's case, so a *subsequent* lower→Upper boundary still splits
+// ("Web3Team"→"WT"), but a digit between same-case letters does not ("dev2team"→"D",
+// "API2Gateway"→"A"). A token with no letter contributes nothing. Examples:
+// "Backend Team"→"BT", "dev team"→"DT", "my-team"→"MT", "myCoolGroup"→"MC".
+//
+// The returned initials are upper-cased and may include a non-renderable letter (a
+// single Cyrillic/Greek word → one glyph); callers pair this with Renderable and fall
+// back to an icon, the same as the other extractAvatarText branches.
 func initials(name string, limit int) string {
 	out := make([]rune, 0, limit)
 	var prevLetter rune // last letter in the current token; 0 at a token boundary

@@ -567,7 +567,7 @@ func (u *User) UserAvatar(c *wkhttp.Context) {
 			ph = fmt.Sprintf("/avatar/default/test (%d).jpg", avatarID)
 			downloadUrl = strings.ReplaceAll(u.ctx.GetConfig().Avatar.DefaultBaseURL, "{avatar}", fmt.Sprintf("%d", avatarID))
 		} else {
-			// 本地生成默认头像：固定色板按 uid 取色（改名不变色）+ 昵称后两字白字。
+			// 本地生成默认头像：固定色板按 uid 取色（改名不变色）+ 昵称取字（script 感知后 2）白字。
 			// 昵称为空、或截出的文字含本字体无字形的字符（典型是纯 emoji）时，回退到
 			// 基于 uid 的 ASCII 兜底图，保证不裂图、不出豆腐块。
 			//
