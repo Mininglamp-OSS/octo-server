@@ -8,10 +8,11 @@ import "unicode"
 //  2. any CJK glyph (Han / Hangul / Hiragana / Katakana) → those glyphs only
 //     (drop Latin/digits/symbols/other scripts), clamp to limit
 //  3. else pure digits → clamp to limit
-//  4. else has a letter → initials over the *original* name (whitespace,
-//     separators, and camelCase split tokens; invisible chars are ignored); the
-//     CJK/digit branches above use the invisible-stripped runes — only this branch
-//     needs the raw name so spaces act as word separators
+//  4. else has a letter → initials over the *original* name: whitespace and
+//     punctuation split tokens (plus camelCase), while zero-width/control chars are
+//     ignored — so a space separates words but a zero-width char inside one does not;
+//     ≤limit, uppercase. (The CJK/digit branches above run on the invisible-stripped
+//     runes; only initials needs the raw name, for the whitespace split.)
 //  5. else (pure symbol / emoji) → "" (icon)
 //
 // fromEnd picks trailing glyphs in the CJK/digit cases (personal 后N); initials
@@ -76,14 +77,25 @@ func clampRunes(rs []rune, fromEnd bool, limit int) []rune {
 	return rs[:limit]
 }
 
+// isZeroWidth reports whether r is a non-whitespace control/format rune (Cc/Cf, e.g.
+// ZWSP U+200B or BOM U+FEFF) — an invisible character that should be ignored rather
+// than treated as a word boundary. Whitespace (which IS a word separator) is excluded.
+func isZeroWidth(r rune) bool {
+	return !unicode.IsSpace(r) && (unicode.Is(unicode.Cc, r) || unicode.Is(unicode.Cf, r))
+}
+
 // initials returns up to limit uppercase first-letters, one per token. Tokens split
-// on whitespace, on any other non-letter/digit run (punctuation/symbols), and on
+// on whitespace and on any other non-letter/digit run (punctuation/symbols), plus on
 // camelCase boundaries (a lowercase letter immediately followed by an uppercase one).
-// A digit is NOT a word separator: it stays in the token and only preserves the
-// previous letter's case, so a *subsequent* lower→Upper boundary still splits
-// ("Web3Team"→"WT"), but a digit between same-case letters does not ("dev2team"→"D",
-// "API2Gateway"→"A"). A token with no letter contributes nothing. Examples:
-// "Backend Team"→"BT", "dev team"→"DT", "my-team"→"MT", "myCoolGroup"→"MC".
+// Zero-width / control chars (Cc/Cf, e.g. ZWSP/BOM) are ignored, not word breaks —
+// matching the invisible-stripping in the CJK/digit branches — so a zero-width char
+// inside a word does not split it. A digit is not a separator either: it only
+// preserves the previous letter's case, so a subsequent lower→Upper boundary still
+// splits ("Web3Team"→"WT") but a digit between same-case letters does not
+// ("dev2team"→"D"). An all-uppercase acronym has no camelCase boundary, so it stays
+// one token ("API2Gateway"→"A", "APIGateway"→"A"). A token with no letter contributes
+// nothing. Examples: "Backend Team"→"BT", "dev team"→"DT", "my-team"→"MT",
+// "myCoolGroup"→"MC".
 //
 // The returned initials are upper-cased and may include a non-renderable letter (a
 // single Cyrillic/Greek word → one glyph); callers pair this with Renderable and fall
@@ -93,8 +105,11 @@ func initials(name string, limit int) string {
 	var prevLetter rune // last letter in the current token; 0 at a token boundary
 	took := false       // already emitted an initial for the current token
 	for _, r := range name {
-		if isInvisible(r) || !(unicode.IsLetter(r) || unicode.IsDigit(r)) {
-			took, prevLetter = false, 0 // separator → end token
+		if isZeroWidth(r) {
+			continue // zero-width / control: ignored, not a word break
+		}
+		if unicode.IsSpace(r) || !(unicode.IsLetter(r) || unicode.IsDigit(r)) {
+			took, prevLetter = false, 0 // whitespace or punctuation → end token
 			continue
 		}
 		if unicode.IsUpper(r) && unicode.IsLower(prevLetter) {

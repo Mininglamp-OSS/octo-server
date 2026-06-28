@@ -98,3 +98,18 @@ Katakana**(`isCJKGlyph`):`김철수→김철`/`철수`、`さとう→さと`/`�
 NoLegacy 守卫全过。
 
 **无 action**:Octo-Q `2024春招群→春招`(digit+Han 设计,已签)。
+
+### PR #494 评审第三批:ZWSP 修复 + 甄别两条 false finding
+重审 doc-sweep 头(fa4c8d8a)又出几条,逐一甄别:
+- **ZWSP 真 bug(且是 doc-sweep 自己引入的 doc-vs-code 矛盾)**:`initials` 把零宽符
+  (Cc/Cf 非空白)也当词分隔符 → `dev<ZWSP>ops→DO`(本该 D),既和我加的「invisible
+  chars are ignored」注释相反、也和 CJK 分支(剥零宽符)不一致。修:`initials` 里零宽符
+  改成**忽略**(新增 `isZeroWidth`;空格/标点仍分词)→ `dev<ZWSP>ops→D`,对齐文档 + CJK
+  分支语义。加 `dev<ZWSP>ops→D` pin(双 suite)。无需 bump 版本(v4/v5 未发布)。
+- **甄别掉两条 false finding**(没动代码):Octo-Q P2-1「`API2Gateway→AG`、测试该 FAIL」
+  —— 实测 `→A`、子测试 PASS(重跑确认),**不能改成 AG**(改了才会挂);OctoBoooot 自己
+  随后也更正。Octo-Q P2-3「custom/auto 共用 CacheKey 碰撞」—— `text` 是 key 因子,文字
+  相同→像素相同→复用本就正确,CacheKey 长度分帧单射,非问题(OctoBoooot byte-verify)。
+- doc nit:`initials` 注释补 `APIGateway→A`、`group.go:18` 区分自动名(≤2)/自定义(≤4)。
+- 验证:全 avatarrender 单测(含新 ZWSP 用例)+ 群/个人端点 + #480 饿死(0.9x)全绿;
+  vet/lint/i18n/NoLegacy 守卫过。

@@ -32,6 +32,7 @@ func TestIndividualText(t *testing.T) {
 		{"digit between camel words", "Web3Team", "WT"},
 		{"digit not a separator lowercase", "dev2team", "D"},
 		{"digit not a separator acronym", "API2Gateway", "A"},
+		{"zero width inside word ignored", "dev" + zwsp + "ops", "D"},
 		// Known limitation: a single cased non-Latin word collapses to one initial.
 		{"cyrillic single word one initial", "Анна", "А"},
 		{"pure digits last two", "123456", "56"},
@@ -83,6 +84,7 @@ func TestGroupNameText(t *testing.T) {
 		{"digit between camel words", "Web3Team", "WT"},
 		{"digit not a separator lowercase", "dev2team", "D"},
 		{"digit not a separator acronym", "API2Gateway", "A"},
+		{"zero width inside word ignored", "dev" + zwsp + "ops", "D"},
 		// Known limitation: a single cased non-Latin word collapses to one initial.
 		{"cyrillic single word one initial", "Анна", "А"},
 		{"pure digits first two", "2024", "20"},
