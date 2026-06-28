@@ -567,7 +567,7 @@ func (u *User) UserAvatar(c *wkhttp.Context) {
 			ph = fmt.Sprintf("/avatar/default/test (%d).jpg", avatarID)
 			downloadUrl = strings.ReplaceAll(u.ctx.GetConfig().Avatar.DefaultBaseURL, "{avatar}", fmt.Sprintf("%d", avatarID))
 		} else {
-			// 本地生成默认头像：固定色板按 uid 取色（改名不变色）+ 昵称后两字白字。
+			// 本地生成默认头像：固定色板按 uid 取色（改名不变色）+ 昵称取字（script 感知后 2）白字。
 			// 昵称为空、或截出的文字含本字体无字形的字符（典型是纯 emoji）时，回退到
 			// 基于 uid 的 ASCII 兜底图，保证不裂图、不出豆腐块。
 			//
@@ -589,11 +589,12 @@ func (u *User) UserAvatar(c *wkhttp.Context) {
 			text := avatarrender.IndividualText(userInfo.Name)
 			nameMode := avatarrender.Renderable(text)
 			// ETag 覆盖决定内容的因子：渲染模式版本 + uid(决定颜色) + 展示文字。
-			// 渲染**视觉**改动(像素变但因子不变，如 #486 透明四角)必须 bump 版本段(name-v3→
-			// name-v4)；ascii-v1 走 generateDefaultAvatar，本次未改其像素，故不 bump。
+			// 渲染**视觉/取字规则**改动(像素变但因子不变，如 #486 透明四角、本次取字改版)必须
+			// bump 版本段；ascii-v1 走 generateDefaultAvatar，本次未改其像素，故不 bump。
+			// name-v5: 昵称取字改为 script 感知(混排只取中文、纯英文首字母缩写)，原 v4 取后 2。
 			etag := avatarETag("ascii-v1", uid)
 			if nameMode {
-				etag = avatarETag("name-v4", uid, text)
+				etag = avatarETag("name-v5", uid, text)
 			}
 			setAvatarHeaders(etag)
 			if ifNoneMatchSatisfied(c.GetHeader("If-None-Match"), etag) {
@@ -611,7 +612,7 @@ func (u *User) UserAvatar(c *wkhttp.Context) {
 			// ETag 是 32 位弱指纹，作共享缓存身份会碰撞→跨用户串图（PR#481 评审）。
 			// 两者覆盖同一组因子（渲染版本/uid→色/文字），仅 ETag 头继续用 CRC32。
 			if nameMode {
-				nameKey := avatarCacheKey("name-v4", uid, text)
+				nameKey := avatarCacheKey("name-v5", uid, text)
 				imageData, genErr := avatarrender.GetOrRender(nameKey, func() ([]byte, error) {
 					return avatarrender.Render(avatarrender.Options{
 						Text: text,

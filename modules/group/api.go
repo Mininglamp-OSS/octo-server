@@ -399,7 +399,7 @@ func (g *Group) avatarGet(c *wkhttp.Context) {
 	}
 	// 群不存在或已解散 → 404（与 UserAvatar 对未知用户、以及本模块 getGroupInfo /
 	// UpdateGroupAvatarCustom 等对 GroupStatusDisband 的处理一致），不再为其渲染默认图：
-	// 否则公开未鉴权端点会把已解散群的群名前 4 字渲成 PNG（信息泄露 + 可区分「已解散」与
+	// 否则公开未鉴权端点会把已解散群的群名前 2 字渲成 PNG（信息泄露 + 可区分「已解散」与
 	// 「从未存在」的枚举面）。系统群 / org_ / dept_ 已在上方静态分支处理，到这里必为普通群。
 	if groupInfo == nil || groupInfo.Status == GroupStatusDisband {
 		c.Writer.WriteHeader(http.StatusNotFound)
@@ -424,25 +424,30 @@ func (g *Group) avatarGet(c *wkhttp.Context) {
 	}
 
 	// 无自定义上传（含历史合成群、新建群）：服务端实时渲染默认头像——
-	// 浅底描边圆 + 群名前 4 字（或自定义文字），群名为空/不可渲染时回退群组图标。
+	// 浅底描边圆 + 群名前 2 字（或自定义文字），群名为空/不可渲染时回退群组图标。
 	g.writeGroupDefaultAvatar(c, groupNo, groupInfo)
 }
 
 // writeGroupDefaultAvatar 服务端渲染并返回群默认头像（无自定义上传时）。文字优先
-// 自定义 avatar_text，否则群名前 4 字；颜色优先自定义 avatar_color，否则按 group_no
+// 自定义 avatar_text，否则群名前 2 字；颜色优先自定义 avatar_color，否则按 group_no
 // 稳定派生（改名不变色、跨页面一致）。群名为空或不可渲染时回退群组图标。
 //
 // URL 稳定为 groups/{group_no}/avatar，内容随群名/自定义变化，故用内容相关弱 ETag +
 // 短缓存 + must-revalidate：改名后最多 5 分钟内 revalidate 到新图，并支持 304 省渲染。
 // ETag 只依赖输入（无需渲染），故先算 ETag 命中 If-None-Match 时直接 304。
 func (g *Group) writeGroupDefaultAvatar(c *wkhttp.Context, groupNo string, groupInfo *Model) {
-	source := ""
 	style := avatarrender.GroupStyleForSeed(groupNo)
 	colorTag := "seed"
+	var text string
 	if groupInfo != nil {
-		source = groupInfo.Name
 		if groupInfo.AvatarText != "" {
-			source = groupInfo.AvatarText
+			// 用户**显式设置**的自定义文字：原样渲染(写入时已按 ≤4 规范化)，不走群名
+			// 自动取字规则(不截成 2 字、不做首字母缩写)。
+			text = avatarrender.GroupText(groupInfo.AvatarText)
+		} else {
+			// 无自定义文字：按群名**自动取字**(script 感知 —— 汉字前2 / 纯数字前2 /
+			// 纯英文首字母缩写 / 否则空→回退群组图标)。
+			text = avatarrender.GroupNameText(groupInfo.Name)
 		}
 		if groupInfo.AvatarColor != nil {
 			if customStyle, ok := avatarrender.GroupStyleByIndex(*groupInfo.AvatarColor); ok {
@@ -451,17 +456,17 @@ func (g *Group) writeGroupDefaultAvatar(c *wkhttp.Context, groupNo string, group
 			}
 		}
 	}
-	text := avatarrender.GroupText(source)
 	renderable := avatarrender.Renderable(text)
 
 	// ETag 覆盖决定图像内容的因子：渲染模式版本 + group_no(派生色) + 实际色 + 文字。
 	// 改名/改自定义文字 → text 变 → ETag 变；改自定义色 → colorTag 变 → ETag 变。
-	// 渲染**视觉**改动(像素变但因子不变，如 #486 透明四角)必须 bump 版本段(…-v2→…-v3)，
-	// 否则已缓存旧图的客户端 If-None-Match 命中同一 ETag → 304 → 一直返旧图。
+	// 渲染**视觉/取字规则**改动(像素变但因子不变，如 #486 透明四角、本次取字改版)必须
+	// bump 版本段，否则已缓存旧图的客户端 If-None-Match 命中同一 ETag → 304 → 一直返旧图。
+	// group-name-v4: 群名取字改为 script 感知前 2 字(原 v3 取前 4)。
 
 	etag := avatarrender.ETag("group-icon-v3", groupNo, colorTag)
 	if renderable {
-		etag = avatarrender.ETag("group-name-v3", groupNo, colorTag, text)
+		etag = avatarrender.ETag("group-name-v4", groupNo, colorTag, text)
 	}
 	c.Header("Content-Disposition", "inline; filename=avatar.png")
 	c.Header("ETag", etag)
@@ -478,7 +483,7 @@ func (g *Group) writeGroupDefaultAvatar(c *wkhttp.Context, groupNo string, group
 	// 一张。缓存 key 用 CacheKey（完整原始因子，与 ETag 同因子但**非** CRC32 弱指纹），
 	// 避免 32 位碰撞跨群串图。
 	if renderable {
-		nameKey := avatarrender.CacheKey("group-name-v3", groupNo, colorTag, text)
+		nameKey := avatarrender.CacheKey("group-name-v4", groupNo, colorTag, text)
 		imageData, genErr := avatarrender.GetOrRender(nameKey, func() ([]byte, error) {
 			return avatarrender.RenderGroup(text, style, avatarrender.DefaultSize)
 		})
@@ -4176,7 +4181,7 @@ func (g groupReq) Check() error {
 
 // checkAvatar 校验二次弹窗的自定义头像参数，返回越界字段名（供 Details.field）。
 // ok=true 表示合法。两者均为可选：avatar_text 空、avatar_color 不传即“未自定义”，
-// 渲染时分别回退到群名前 4 字 / ColorForSeed(group_no)。不静默截断，超限直接拒绝。
+// 渲染时分别回退到群名前 2 字 / ColorForSeed(group_no)。不静默截断，超限直接拒绝。
 //
 // 哨兵约定（创建 vs 改群刻意不对称）：创建无既有值可清除，故 avatar_color 仅接受
 // [0,palette)（-1 在此被拒）；改群额外接受 "-1" / "" 表示清除自定义色回退派生。

@@ -321,7 +321,7 @@ func (d *DB) updateAvatar(avatar string, avatarVersion int64, groupNo string) er
 // updateAvatarCustom 更新自定义群头像文字/颜色与群版本（不触碰 is_upload_avatar：
 // 自定义文字/色仍是「默认头像」范畴，渲染时实时出图，不同于上传图片）。color 为
 // *int，nil → NULL（清除自定义色，回退按 group_no 派生）。text 为空串表示清除自定义
-// 文字（回退群名前 4 字）。
+// 文字（回退群名前 2 字）。
 // updateAvatarCustom 只更新本次实际提供的列：text 非 nil 时写 avatar_text，setColor
 // 为 true 时写 avatar_color（*int，nil → NULL 清除自定义色）；始终 bump version。
 // 列级更新避免「读-改-写」竞态——并发只改文字 / 只改色不会互相覆盖对方的列。
@@ -596,7 +596,7 @@ type Model struct {
 	Avatar                   string     // 群头像
 	AvatarVersion            int64      // 群头像对象版本，0 表示旧版稳定路径
 	IsUploadAvatar           int        // 群头像是否已经被用户上传
-	AvatarText               string     // 自定义群头像文字，空表示用群名前 4 字派生
+	AvatarText               string     // 自定义群头像文字，空表示用群名前 2 字派生
 	AvatarColor              *int       // 自定义群头像色板下标，nil(NULL) 表示按 group_no 派生
 	Notice                   string     // 群公告
 	Creator                  string     // 创建者uid

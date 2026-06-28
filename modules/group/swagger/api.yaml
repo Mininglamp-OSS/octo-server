@@ -320,7 +320,7 @@ paths:
                   description: "成员名称"
               avatar_text:
                 type: string
-                description: "自定义群头像文字（≤4 可见字符；空/缺省时取群名前 4 字渲染默认头像）"
+                description: "自定义群头像文字（≤4 可见字符；空/缺省时取群名前 2 字（script 感知取字）渲染默认头像）"
               avatar_color:
                 type: integer
                 description: "自定义群头像色板下标 [0, 调色板大小)；缺省时按 group_no 派生颜色"
@@ -528,7 +528,7 @@ paths:
                 description: "修改群名称 notice(修改群备注) invite(是否开启进群邀请) 等"
               avatar_text:
                 type: string
-                description: "自定义群头像文字（≤4 可见字符；空串清除→回退群名前 4 字）"
+                description: "自定义群头像文字（≤4 可见字符；空串清除→回退群名前 2 字（script 感知取字））"
               avatar_color:
                 type: integer
                 description: "自定义群头像色板下标 [0, 调色板大小)；空串或 -1 清除→回退按 group_no 派生"
@@ -1216,7 +1216,7 @@ paths:
       summary: "获取群头像"
       description: >-
         公开（不鉴权）端点。未上传自定义头像的群在服务端实时渲染默认头像（彩色描边圆 +
-        群名前 4 字，或自定义 avatar_text/avatar_color；空名回退群组图标），返回 image/png。
+        群名前 2 字（script 感知取字），或自定义 avatar_text/avatar_color；空名回退群组图标），返回 image/png。
         已上传头像（is_upload_avatar=1）的群 302 重定向到对象存储。群不存在或已解散返回
         404。响应带内容相关弱 ETag，命中 If-None-Match 时返回 304。
       operationId: "get avatar"
@@ -1414,7 +1414,7 @@ definitions:
         description: "群数据版本"
       avatar_text:
         type: string
-        description: "自定义群头像文字（空表示未自定义，按群名前 4 字派生）"
+        description: "自定义群头像文字（空表示未自定义，按群名前 2 字（script 感知取字）派生）"
       avatar_color:
         type: integer
         description: "自定义群头像色板下标（null 表示未自定义，按 group_no 派生）"

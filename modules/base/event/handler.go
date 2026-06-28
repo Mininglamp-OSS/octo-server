@@ -155,7 +155,7 @@ func (e *Event) handleGroupMemberRemoveEvent(model *Model) {
 }
 
 // 群默认头像不再由「成员头像九宫格合成」异步生成（旧 handleGroupAvatarUpdateEvent）。
-// 现在 modules/group avatarGet 在请求时服务端渲染「色块圆 + 群名前 4 字 / 群组图标」，
+// 现在 modules/group avatarGet 在请求时服务端渲染「色块圆 + 群名取字（script 感知前 2）/ 群组图标」，
 // 历史合成图不再被读取，故合成事件链路（含 GroupAvatarUpdate 事件、queryGroupAvatarState、
 // updateGeneratedGroupAvatar）已整体移除。
 
