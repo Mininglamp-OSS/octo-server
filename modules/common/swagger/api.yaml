@@ -598,6 +598,40 @@ paths:
           description: "错误"
           schema:
             $ref: "#/definitions/response"
+  /common/emojis:
+    get:
+      tags:
+        - "common"
+      summary: "内置自定义表情清单"
+      description: "内置自定义表情清单(公开，无需鉴权)。客户端按 version 缓存并据此动态渲染 [xxx] token，取代各端硬编码。支持 ETag / If-None-Match → 304。"
+      operationId: "common emojis"
+      produces:
+        - "application/json"
+      responses:
+        200:
+          description: "返回"
+          schema:
+            type: object
+            properties:
+              version:
+                type: integer
+                description: "清单版本，任意改动需自增；客户端据此判定缓存是否失效"
+              list:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    key:
+                      type: string
+                      description: "消息正文 token，如 [使命必达]（wire 格式，不可改名）"
+                    name:
+                      type: string
+                      description: "人类可读标签，如 使命必达"
+                    url:
+                      type: string
+                      description: "图片地址；内置表情留空，客户端复用本地图"
+        304:
+          description: "未变更(If-None-Match 命中)"
 
 securityDefinitions:
   token:

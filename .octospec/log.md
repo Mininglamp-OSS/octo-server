@@ -4,6 +4,17 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-06-29
+
+- **Add** — Task `common-builtin-emoji-manifest`: public, cacheable
+  `GET /v1/common/emojis` returning the built-in custom emoji manifest
+  (`{version, list:[{key,name,url}]}`) from an embedded JSON single source of
+  truth, mirroring the `avatar_palette` (#500) pattern (content ETag +
+  `must-revalidate` + 304). Clients fetch + cache instead of hardcoding the
+  `[xxx]` emoji list. `url` optional per item (built-ins reuse client bundle);
+  no DB / errcode / i18n added. New `modules/common/emoji.go`,
+  `modules/common/emojis/manifest.json`, `emoji_test.go`, swagger entry.
+
 ## 2026-06-27
 
 - **Add** — Task `default-avatar-text-rule`: script-aware 2-glyph text rule for

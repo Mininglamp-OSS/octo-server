@@ -1,0 +1,37 @@
+slug: common-builtin-emoji-manifest
+rules_injected:
+  - id: error-handling
+    load_bearing: true
+    why: new public JSON wire-contract in modules/common
+    how_applied: >
+      Handler has no error path (in-memory data after one-time embed parse, like
+      avatar_palette), so no new pkg/errcode code and no raw/legacy error response
+      are introduced. Success uses c.Response(...). No i18n marker needed.
+  - id: space-isolation
+    load_bearing: true
+    why: route registration under modules/common; auth-skip decision
+    how_applied: >
+      Endpoint is public (no AuthMiddleware), explicitly documented in the route
+      comment: data is non-sensitive, accesses no user data and no Space, and is
+      needed before login. Mirrors sibling public reads (/v1/common/countries,
+      /changelog) and GET /v1/group/avatar_palette. No Space middleware applies
+      (no per-user/per-space data).
+  - id: rate-limit
+    load_bearing: true
+    why: path glob matches modules/**/*.go
+    how_applied: >
+      No middleware mounted. The rule's "unauth -> StrictIPRateLimitMiddleware" is
+      reserved (per CLAUDE.md) for SENSITIVE unauth endpoints (login/register/sms/
+      search/invite). This manifest is non-sensitive, static, and 304-cacheable;
+      the global per-IP RateLimitMiddleware floor (main.go) already applies. Matches
+      the precedent of sibling public reads and avatar_palette (no strict limiter).
+      No hand-rolled Redis counter.
+  - id: testing
+    load_bearing: false
+    how_applied: >
+      New modules/common/api_emoji_test.go uses testutil.NewTestServer() +
+      CleanAllTables; asserts list contents, [xxx] token shape, and the 304 path.
+reused:
+  - pkg/avatarrender.ETag / IfNoneMatch (generic crc32 weak-ETag helpers)
+  - modules/common commonNoAuth route group + c.Response envelope
+  - modules/common //go:embed pattern (1module.go embeds sql/, swagger)

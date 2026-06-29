@@ -83,6 +83,7 @@ func (cn *Common) Route(r *wkhttp.WKHttp) {
 		commonNoAuth.GET("/updater/:os/:version", cn.updater)  // 版本更新检查（兼容tauri）
 		commonNoAuth.GET("/pcupdater/:os", cn.getPCNewVersion) // pc版本更新检查
 		commonNoAuth.GET("/changelog", cn.changelog)           // 版本更新日志（公开）
+		commonNoAuth.GET("/emojis", cn.emojiManifest)          // 内置自定义表情清单（公开，客户端动态渲染，见 emoji.go）
 	}
 
 	r.GET("/v1/health", cn.health)
