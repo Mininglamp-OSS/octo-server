@@ -1,0 +1,20 @@
+injected:
+  - id: error-handling
+    source: repo
+    why: new module errors must use httperr.ResponseErrorL + registered errcode; i18n extract/lint; guard test
+  - id: rate-limit
+    source: repo
+    why: /v1/sticker/user mounts SharedUIDRateLimiter after AuthMiddleware
+  - id: space-isolation
+    source: repo
+    why: sticker rows keyed by login uid; ownership-checked delete; blank import in internal/modules.go
+  - id: trust-boundary
+    source: repo
+    why: matched via wire-contract tag; substance is adapter/markdown escaping (N/A), but "bound the payload" applies — enforce upload size/format limits
+  - id: testing
+    source: repo
+    why: testutil.NewTestServer + CleanAllTables; reset ratelimit:uid:* in setup
+  - id: commit-style
+    source: repo
+    why: English Conventional Commits; link #26
+brief: .octospec/tasks/custom-sticker-management/brief.md

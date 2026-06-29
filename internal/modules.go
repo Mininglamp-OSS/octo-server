@@ -53,6 +53,7 @@ import (
 	_ "github.com/Mininglamp-OSS/octo-server/modules/search"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/space"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/statistics"
+	_ "github.com/Mininglamp-OSS/octo-server/modules/sticker"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/thread"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/user"
 	// usersecret 提供用户外部密钥别名表 + write-only CRUD + resolve;resolve

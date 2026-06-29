@@ -127,6 +127,31 @@ const (
 // MaxFileSize 最大文件大小（100MB）
 const MaxFileSize int64 = 100 * 1024 * 1024
 
+// StickerMaxFileSize 自定义贴纸单文件上限（1MB）。贴纸是高频内联渲染的小图，
+// 收紧到 1MB（对标业界：Discord 贴纸 512KB、微信 ~1MB），避免大图占用与卡顿。
+const StickerMaxFileSize int64 = 1 * 1024 * 1024
+
+// stickerUploadExts 自定义贴纸允许的存储扩展名（位图）。Lottie/TGS 不在其列：
+// 用户无法自制，留给内置动画贴纸。
+var stickerUploadExts = map[string]bool{
+	".gif":  true,
+	".png":  true,
+	".jpg":  true,
+	".jpeg": true,
+	".webp": true,
+}
+
+// stickerUploadExt 从客户端上传文件名挑选贴纸的存储扩展名，限定在
+// stickerUploadExts。文件名缺失 / 无扩展名 / 不在白名单一律回退 ".gif"
+// —— 历史默认，不传 filename 的老客户端因此保持原有行为不变。
+func stickerUploadExt(filename string) string {
+	ext := strings.ToLower(filepath.Ext(sanitizeFilename(filename)))
+	if stickerUploadExts[ext] {
+		return ext
+	}
+	return ".gif"
+}
+
 // allowedExtensions 允许上传的文件扩展名
 var allowedExtensions = map[string]bool{
 	// 图片

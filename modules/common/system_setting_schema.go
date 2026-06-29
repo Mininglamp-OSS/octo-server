@@ -127,6 +127,12 @@ var systemSettingSchema = []settingDef{
 	{Category: "app_bot", Key: "auth_cache_ttl_seconds", Type: settingTypeInt, Description: "App Bot 鉴权缓存安全网 TTL(秒)，吊销经共享墓碑即时生效，此值仅兜底孤儿键/撤销写失败；调高会按比例拉长撤销写失败时被吊销 token 仍可全簇鉴权的最坏窗口；有效范围[30,600]，超出范围的写入会被接受但运行时回落默认 60s", Positive: true,
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.AppBotAuthCacheTTLSeconds()) }},
 
+	// 每用户自定义贴纸数量上限（modules/sticker）。Positive 放开 settingTypeInt
+	// 默认的 [0,3650] 上界并要求写入为正整数 —— 配额=0/负数会让用户一张都加不了
+	// （暗关）。读取侧再夹紧（≤0 回落默认）。默认 100，无 env fallback。
+	{Category: "sticker", Key: "user_max_count", Type: settingTypeInt, Description: "每个用户可创建的自定义贴纸数量上限", Positive: true,
+		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.StickerUserMaxCount()) }},
+
 	// Email server config — formerly yaml-only (Support.* in config.go).
 	{Category: "support", Key: "email", Type: settingTypeString, Description: "技术支持邮箱（发件人）",
 		Effective: func(s *SystemSettings) string { return s.SupportEmail() }},

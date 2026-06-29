@@ -780,6 +780,24 @@ other = "Failed to query statistics data."
 ["err.server.statistics.request_invalid"]
 other = "Invalid statistics request."
 
+["err.server.sticker.format_unsupported"]
+other = "Unsupported sticker format. Allowed: gif, png, jpg, jpeg, webp."
+
+["err.server.sticker.not_found"]
+other = "Sticker not found."
+
+["err.server.sticker.query_failed"]
+other = "Failed to query sticker data."
+
+["err.server.sticker.quota_exceeded"]
+other = "You have reached the maximum number of custom stickers."
+
+["err.server.sticker.request_invalid"]
+other = "Invalid request."
+
+["err.server.sticker.store_failed"]
+other = "Failed to update sticker data."
+
 ["err.server.thread.creator_cannot_leave"]
 other = "Thread creator cannot leave the thread."
 

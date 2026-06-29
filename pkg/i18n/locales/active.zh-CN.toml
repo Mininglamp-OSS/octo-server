@@ -614,6 +614,26 @@ other = "查询分类数据失败。"
 ["err.server.category.store_failed"]
 other = "保存分类数据失败。"
 
+# ---- modules/sticker：用户自定义贴纸 ----
+
+["err.server.sticker.request_invalid"]
+other = "请求参数有误。"
+
+["err.server.sticker.format_unsupported"]
+other = "不支持的贴纸格式，仅支持 gif、png、jpg、jpeg、webp。"
+
+["err.server.sticker.not_found"]
+other = "贴纸不存在。"
+
+["err.server.sticker.quota_exceeded"]
+other = "自定义贴纸数量已达上限。"
+
+["err.server.sticker.query_failed"]
+other = "查询贴纸数据失败。"
+
+["err.server.sticker.store_failed"]
+other = "保存贴纸数据失败。"
+
 # ---- modules/oidc：自助绑定流程（api_bind.go），保留真实 HTTP 状态码 ----
 
 ["err.server.oidc.bind_service_unavailable"]

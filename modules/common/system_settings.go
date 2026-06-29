@@ -734,3 +734,24 @@ func (s *SystemSettings) AppBotAuthCacheTTLSeconds() int {
 	}
 	return v
 }
+
+// ---------------------------------------------------------------------------
+// Custom stickers (modules/sticker)
+// ---------------------------------------------------------------------------
+
+// defaultStickerUserMaxCount is the per-user custom-sticker cap when the admin
+// has not overridden system_setting sticker.user_max_count. Admin-tunable via
+// POST /v1/manager/common/system_setting; hot-reloaded with the snapshot.
+const defaultStickerUserMaxCount = 100
+
+// StickerUserMaxCount is the maximum number of custom stickers a single user may
+// keep. Read-side defence: a non-positive value (only reachable via a direct DB
+// edit — the admin write path enforces Positive) falls back to the default
+// rather than silently locking the user out of adding any sticker.
+func (s *SystemSettings) StickerUserMaxCount() int {
+	v := s.getInt("sticker", "user_max_count", defaultStickerUserMaxCount)
+	if v <= 0 {
+		return defaultStickerUserMaxCount
+	}
+	return v
+}

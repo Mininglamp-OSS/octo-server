@@ -114,8 +114,10 @@ func (f *File) getFilePath(c *wkhttp.Context) {
 		// 动态封面
 		path = fmt.Sprintf("%s/file/upload?type=%s&path=/%s.png", f.ctx.GetConfig().External.APIBaseURL, fileType, loginUID)
 	} else if Type(fileType) == TypeSticker {
-		// 自定义表情
-		path = fmt.Sprintf("%s/file/upload?type=%s&path=/%s/%s.gif", f.ctx.GetConfig().External.APIBaseURL, fileType, loginUID, util.GenerUUID())
+		// 自定义表情：扩展名由客户端上传文件名（filename query）推导，限定在
+		// gif/png/jpg/jpeg/webp；缺省 / 不在白名单 → 回退 .gif（保持历史行为，
+		// 不传 filename 的老客户端不受影响）。
+		path = fmt.Sprintf("%s/file/upload?type=%s&path=/%s/%s%s", f.ctx.GetConfig().External.APIBaseURL, fileType, loginUID, util.GenerUUID(), stickerUploadExt(c.Query("filename")))
 	} else if Type(fileType) == TypeWorkplaceBanner {
 		// 工作台横幅
 		path = fmt.Sprintf("%s/file/upload?type=%s&path=/workplace/banner/%s", f.ctx.GetConfig().External.APIBaseURL, fileType, path)
@@ -169,6 +171,14 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 	if fileHeader.Size > MaxFileSize {
 		f.Warn("文件大小超出限制", zap.Int64("size", fileHeader.Size), zap.Int64("max", MaxFileSize))
 		c.ResponseError(fmt.Errorf("文件大小不能超过%dMB", MaxFileSize/1024/1024))
+		return
+	}
+	// 自定义贴纸单独收紧上限（StickerMaxFileSize），贴纸是高频内联渲染的小图，
+	// 不应允许到通用 MaxFileSize。错误用 c.ResponseError 以与本（未迁移 i18n 的）
+	// file 模块其余响应保持一致。
+	if Type(fileType) == TypeSticker && fileHeader.Size > StickerMaxFileSize {
+		f.Warn("贴纸文件超出大小限制", zap.Int64("size", fileHeader.Size), zap.Int64("max", StickerMaxFileSize))
+		c.ResponseError(fmt.Errorf("贴纸大小不能超过%dMB", StickerMaxFileSize/1024/1024))
 		return
 	}
 
