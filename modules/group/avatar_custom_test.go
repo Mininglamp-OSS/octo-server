@@ -60,7 +60,7 @@ func TestGroupReqCheckAvatar(t *testing.T) {
 
 // TestGroupAvatarCustomDBRoundTrip 覆盖自定义头像文字/颜色的落库读回：
 //   - 默认建群（未自定义）写入 avatar_text=” / avatar_color=NULL（*int=nil），
-//     这是渲染时回退“群名前 2 字（script 感知取字）+ ColorForSeed(group_no)”的哨兵；
+//     这是渲染时回退“is_named 规则(老群群名前2字/新群双人图标) + ColorForSeed(group_no)”的哨兵；
 //   - 显式自定义写入文字与色板下标，QueryWithGroupNo 原样读回。
 //
 // *int 的 nil→NULL 依赖 dbr Record() 对指针字段的处理（与 group_md *string 同理）。
