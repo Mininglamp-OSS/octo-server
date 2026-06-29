@@ -102,6 +102,28 @@ func TestGroupAvatarGetCustomOverrides(t *testing.T) {
 	require.Equal(t, want, w.Body.Bytes(), "custom text+color must override name/seed")
 }
 
+// TestGroupAvatarGetCustomColorIconNoText 覆盖 S2:设了自定义颜色但**无**自定义文字 →
+// 渲染该颜色的双人图标(默认头像与群名无关,但自定义颜色仍被尊重)。
+func TestGroupAvatarGetCustomColorIconNoText(t *testing.T) {
+	s, ctx := newTestServer(t)
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	g := New(ctx)
+
+	const groupNo = "avatar_get_coloricon_1"
+	require.NoError(t, g.db.Insert(&Model{
+		GroupNo: groupNo, Name: "有名群", Creator: "c1", Status: 1, AvatarColor: intPtr(7),
+	}))
+
+	w := doAvatarGet(t, s.GetRoute(), groupNo, "")
+	require.Equal(t, http.StatusOK, w.Code)
+
+	style, ok := avatarrender.GroupStyleByIndex(7)
+	require.True(t, ok)
+	wantIcon, err := avatarrender.RenderIcon(style)
+	require.NoError(t, err)
+	require.Equal(t, wantIcon, w.Body.Bytes(), "custom color + no text must render the two-person icon in that color")
+}
+
 // TestGroupAvatarGetCustomTextNotTruncated 回归 PR#494 评审(Jerry-Xin):用户显式
 // 自定义文字必须**原样渲染**(≤4),不得被群名自动取字规则(script 感知前 2)截断 ——
 // 4 字自定义渲染全 4 字「研发中心」,而非前 2「研发」。

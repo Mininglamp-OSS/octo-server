@@ -531,11 +531,22 @@ type avatarPaletteResp struct {
 func (g *Group) avatarPalette(c *wkhttp.Context) {
 	hex := avatarrender.PaletteHex()
 	colors := make([]avatarPaletteColorResp, len(hex))
+	// 内容相关弱 ETag：把色板版本段 + 全部色值作为因子，色板任意改动即 ETag 变 → 已缓存
+	// 客户端 revalidate 到新色（不会被长缓存钉死旧色，对齐「单一数据源、不漂移」目标）。
+	etagParts := make([]string, 0, len(hex)*3+1)
+	etagParts = append(etagParts, "avatar-palette-v1")
 	for i, h := range hex {
 		colors[i] = avatarPaletteColorResp{Index: h.Index, Main: h.Main, Fill: h.Fill, IconBack: h.IconBack}
+		etagParts = append(etagParts, h.Main, h.Fill, h.IconBack)
 	}
-	// 固定设计 token，可长缓存（含共享缓存）。
-	c.Header("Cache-Control", "public, max-age=86400")
+	etag := avatarrender.ETag(etagParts...)
+	// 固定设计 token：可缓存，但带内容 ETag + must-revalidate，色板变更可及时失效。
+	c.Header("ETag", etag)
+	c.Header("Cache-Control", "public, max-age=300, must-revalidate")
+	if avatarrender.IfNoneMatch(c.GetHeader("If-None-Match"), etag) {
+		c.Status(http.StatusNotModified)
+		return
+	}
 	c.Response(avatarPaletteResp{Size: len(colors), Colors: colors})
 }
 

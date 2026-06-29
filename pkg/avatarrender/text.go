@@ -136,6 +136,9 @@ func initials(name string, limit int) string {
 // 仅用于「群名自动取字」。用户显式设置的自定义头像文字走 GroupText(原样渲染、≤4),
 // 不经过本规则。返回结果可能仍含本字体无字形的字符(罕见生僻字),调用方应配合
 // Renderable 判断,对不可渲染的结果回退到群组图标。
+//
+// NOTE(2026-06-29):「默认群头像改为双人图标(与群名无关)」后,本函数已无生产调用方
+// (仅单测保留);默认头像不再按群名取字。保留以备将来可能重新启用。
 func GroupNameText(name string) string {
 	return extractAvatarText(name, false, 2)
 }

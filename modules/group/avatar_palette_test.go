@@ -47,4 +47,15 @@ func TestGroupAvatarPalette(t *testing.T) {
 	}
 	// 钉死设计稿首档，捕获顺序/取值漂移。
 	require.Equal(t, "#14C0FF", resp.Colors[0].Main)
+
+	// 内容相关弱 ETag + 304：带命中的 If-None-Match → 304 无 body（色板变更才会换 ETag）。
+	etag := w.Header().Get("ETag")
+	require.NotEmpty(t, etag)
+	w2 := httptest.NewRecorder()
+	req2, err := http.NewRequest("GET", "/v1/group/avatar_palette", nil)
+	require.NoError(t, err)
+	req2.Header.Set("If-None-Match", etag)
+	s.GetRoute().ServeHTTP(w2, req2)
+	require.Equal(t, http.StatusNotModified, w2.Code)
+	require.Empty(t, w2.Body.Bytes())
 }
