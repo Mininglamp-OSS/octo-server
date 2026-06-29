@@ -1003,9 +1003,9 @@ func (g *Group) groupUpdate(c *wkhttp.Context) {
 		respondGroupRequestInvalid(c, "")
 		return
 	}
-	// 查询群信息
-	group, err := g.getGroupInfo(groupNo)
-	if err != nil {
+	// 群存在性 + 状态检查（不缓存整行：下方 invite 分支改用列级写，避免用旧快照全列回写
+	// 覆盖掉 name 分支刚提交的 name/is_named，见 DB.UpdateInviteTx 注释）。
+	if _, err := g.getGroupInfo(groupNo); err != nil {
 		respondGroupInfoError(c, err)
 		return
 	}
@@ -1091,17 +1091,16 @@ func (g *Group) groupUpdate(c *wkhttp.Context) {
 		}
 	}
 
-	// invite 属性单独处理（保留原有事务逻辑）
+	// invite 属性单独处理（保留原有事务逻辑）。列级写仅更新 invite/version，避免覆盖
+	// name 分支刚提交的 name/is_named（见 DB.UpdateInviteTx）。
 	if hasInvite {
 		invite, _ := strconv.ParseInt(inviteValue, 10, 64)
-		group.Invite = int(invite)
 		version, err := g.ctx.GenSeq(common.GroupSeqKey)
 		if err != nil {
 			g.Error("生成序列号失败", zap.Error(err))
 			httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 			return
 		}
-		group.Version = version
 
 		tx, err := g.ctx.DB().Begin()
 		if err != nil {
@@ -1115,10 +1114,10 @@ func (g *Group) groupUpdate(c *wkhttp.Context) {
 				fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 			}
 		}()
-		err = g.db.UpdateTx(group, tx)
+		err = g.db.UpdateInviteTx(groupNo, int(invite), version, tx)
 		if err != nil {
 			tx.Rollback()
-			g.Error("更新群信息失败！", zap.Error(err), zap.String("group_no", group.GroupNo))
+			g.Error("更新群信息失败！", zap.Error(err), zap.String("group_no", groupNo))
 			httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 			return
 		}

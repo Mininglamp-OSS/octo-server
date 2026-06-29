@@ -126,6 +126,65 @@ func TestUpdateGroupInfo_RenameMarksIsNamed(t *testing.T) {
 	assert.Equal(t, 1, model.IsNamed, "用户显式改名 → is_named=1（默认头像改取新群名）")
 }
 
+// TestRenameThenInviteUpdate_KeepsIsNamed 回归 PR#500 P1（yujiawei / OctoBoooot 复核确认）：
+// groupUpdate 同一请求同时带 name 与 invite 时——name 分支（UpdateGroupInfo，fresh load）
+// 已提交 name/is_named=1，invite 分支若再用建链旧快照经**全列** UpdateTx 回写，会把 name 与
+// is_named 打回旧值（改名 + is_named 被回滚成 0 → 默认头像静默退回双人图标）。改用列级
+// UpdateInviteTx（仅动 invite/version）后，两者必须保留。本测试复刻该两步写序（name 分支
+// → invite 分支），因 invite 分支真身依赖未在 testutil 初始化的 ctx.Event，故在 service/DB
+// 层验证修复的核心性质（列级写不回写 name/is_named）。
+func TestRenameThenInviteUpdate_KeepsIsNamed(t *testing.T) {
+	svc, userDB, ctx := setupServiceTestWithCtx(t)
+	insertTestUsers(t, userDB, testutil.UID)
+	s := svc.(*Service)
+
+	const groupNo = "rename_then_invite_1"
+	// 自动名群（is_named=0），invite=0。
+	assert.NoError(t, s.db.Insert(&Model{
+		GroupNo: groupNo, Name: "张三、李四", Creator: testutil.UID, Status: 1, Version: 1, IsNamed: 0, Invite: 0,
+	}))
+
+	// name 分支：改名 → is_named=1 落库。
+	newName := "后端架构讨论"
+	assert.NoError(t, svc.UpdateGroupInfo(&UpdateGroupInfoServiceReq{
+		GroupNo: groupNo, OperatorUID: testutil.UID, OperatorName: "op", Name: &newName,
+	}))
+
+	// invite 分支（修复后）：列级写，仅动 invite/version。
+	tx, err := ctx.DB().Begin()
+	assert.NoError(t, err)
+	assert.NoError(t, s.db.UpdateInviteTx(groupNo, 1, 999, tx))
+	assert.NoError(t, tx.Commit())
+
+	model, err := s.db.QueryWithGroupNo(groupNo)
+	assert.NoError(t, err)
+	assert.Equal(t, newName, model.Name, "invite 更新不得回写旧 name")
+	assert.Equal(t, 1, model.IsNamed, "invite 更新不得把 is_named 打回 0（P1 回归）")
+	assert.Equal(t, 1, model.Invite, "invite 必须落库为 1")
+	assert.Equal(t, int64(999), model.Version)
+}
+
+// TestAddGroup_SetsIsNamed 回归 PR#500（Jerry-Xin / OctoBoooot）：非 CreateGroup 的直插建群
+// 路径（Service.AddGroup）也须按是否有显式名设置 is_named，否则命名群漏置 0 → 默认头像退回
+// 双人图标。系统群 / org_ / dept_ 直插路径（event.go）同此修复，但它们在 avatarGet 被前缀
+// 静态 PNG 分支拦截、不进 is_named 渲染路径，故此处以可独立验证的 AddGroup 锁定该不变式。
+func TestAddGroup_SetsIsNamed(t *testing.T) {
+	svc, _ := setupServiceTest(t)
+	s := svc.(*Service)
+
+	const namedNo = "addgroup_named_1"
+	assert.NoError(t, s.AddGroup(&AddGroupReq{GroupNo: namedNo, Name: "产品评审群"}))
+	m, err := s.db.QueryWithGroupNo(namedNo)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, m.IsNamed, "显式名 → is_named=1（命名群默认头像取群名）")
+
+	const autoNo = "addgroup_auto_1"
+	assert.NoError(t, s.AddGroup(&AddGroupReq{GroupNo: autoNo, Name: ""}))
+	m, err = s.db.QueryWithGroupNo(autoNo)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, m.IsNamed, "空名 → is_named=0（回退双人图标）")
+}
+
 func TestCreateGroup_DeduplicateMembers(t *testing.T) {
 	svc, userDB := setupServiceTest(t)
 	insertTestUsers(t, userDB, testutil.UID, "m1")

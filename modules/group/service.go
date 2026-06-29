@@ -198,9 +198,16 @@ func (s *Service) GetCreatedCountWithDate(date string) (int64, error) {
 
 // AddGroup 添加一个群
 func (s *Service) AddGroup(model *AddGroupReq) error {
+	// 显式传名 → 命名群（is_named=1，默认头像取群名前2字）；空名 → 0（回退双人图标）。
+	// 与 CreateGroup 的 is_named 推断口径一致，避免直插路径漏置导致命名群退回图标。
+	isNamed := 0
+	if strings.TrimSpace(model.Name) != "" {
+		isNamed = 1
+	}
 	err := s.db.Insert(&Model{
 		GroupNo:        model.GroupNo,
 		Name:           model.Name,
+		IsNamed:        isNamed,
 		AllowExternal:  1, // 向后兼容：默认允许外部成员
 		AllowNoMention: 1, // 向后兼容：默认允许群级免@
 	})
@@ -796,6 +803,7 @@ type GroupResp struct {
 	GroupType                GroupType `json:"group_type"`                  // 群类型
 	Category                 string    `json:"category"`                    // 群分类
 	Name                     string    `json:"name"`                        // 群名称
+	IsNamed                  int       `json:"is_named"`                    // 群名是否用户显式起名(1)/成员拼接自动名(0)；客户端据此本地预判默认头像取名字/双人图标
 	AvatarText               string    `json:"avatar_text"`                 // 自定义群头像文字（空=按 is_named 回退：命名群群名/自动名群双人图标）
 	AvatarColor              *int      `json:"avatar_color"`                // 自定义群头像色板下标（null=按 group_no 派生）
 	Remark                   string    `json:"remark"`                      // 群备注
@@ -842,6 +850,7 @@ func (g *GroupResp) from(model *DetailModel) *GroupResp {
 		GroupType:                GroupType(model.GroupType),
 		Category:                 model.Category,
 		Name:                     model.Name,
+		IsNamed:                  model.IsNamed,
 		AvatarText:               model.AvatarText,
 		AvatarColor:              model.AvatarColor,
 		Notice:                   model.Notice,
@@ -886,6 +895,7 @@ func (g *GroupResp) fromModel(model *Model) *GroupResp {
 		GroupType:                GroupType(model.GroupType),
 		Category:                 model.Category,
 		Name:                     model.Name,
+		IsNamed:                  model.IsNamed,
 		AvatarText:               model.AvatarText,
 		AvatarColor:              model.AvatarColor,
 		Notice:                   model.Notice,

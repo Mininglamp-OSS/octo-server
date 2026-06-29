@@ -75,6 +75,10 @@ func TestGroupAvatarGetNamedRendersNameText(t *testing.T) {
 
 	w := doAvatarGet(t, s.GetRoute(), groupNo, "")
 	require.Equal(t, http.StatusOK, w.Code)
+	// 命名群也走内容相关弱 ETag：保护改名 / 切自定义触发的缓存失效契约（Jerry-Xin 🔵）。
+	etag := w.Header().Get("ETag")
+	require.True(t, strings.HasPrefix(etag, `W/"`), "named group avatar must carry a weak ETag, got %q", etag)
+	require.Contains(t, w.Header().Get("Cache-Control"), "must-revalidate")
 
 	want, err := avatarrender.RenderGroup(
 		avatarrender.GroupNameText("后端架构讨论"),
@@ -84,6 +88,11 @@ func TestGroupAvatarGetNamedRendersNameText(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, want, w.Body.Bytes(),
 		"named group (is_named=1) without custom text must render script-aware first-2 of the name")
+
+	// 命中的 If-None-Match → 304 无 body（命名群路径同样支持条件请求省渲染）。
+	w2 := doAvatarGet(t, s.GetRoute(), groupNo, etag)
+	require.Equal(t, http.StatusNotModified, w2.Code)
+	require.Empty(t, w2.Body.Bytes())
 }
 
 // TestGroupAvatarGetIconFallback 覆盖群名为空 → 同样回退双人图标渲染。

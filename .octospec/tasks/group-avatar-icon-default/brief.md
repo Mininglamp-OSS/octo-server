@@ -67,6 +67,29 @@ Two server changes:
   *before* the member-concat fallback overwrites `groupName`. Rename
   (`UpdateGroupInfo`, `req.Name != nil`) → `is_named = 1`; persisted by adding
   `is_named` to `DB.UpdateTx`'s `SetMap` (it used an explicit column list).
+- **All direct creation paths set `is_named` (review #500, Jerry-Xin + OctoBoooot
+  🔴).** `CreateGroup` is not the only insert path: `event.go` system-group
+  (`handleRegisterUserEvent`) + org/dept (`handleOrgOrDeptCreateEvent`) and
+  `Service.AddGroup` insert named groups directly; left at the Go zero value they
+  persist `is_named=0`. Set `IsNamed: 1` on the system/org/dept inserts (they carry
+  an explicit configured name) and `AddGroup` infers it from `TrimSpace(name)!=""`.
+  Note: system/`org_`/`dept_` groups are served *static PNGs* by the prefix-gated
+  branches in `avatarGet` (`api.go:360-394`) and never reach the `is_named` render
+  path, so this is data-correctness/robustness, not a live avatar regression — but
+  the persisted flag must still be right (a removed prefix-branch would otherwise
+  silently break them).
+- **Combined `{name, invite}` update must not revert the rename / `is_named`
+  (review #500 P1, yujiawei + OctoBoooot).** `groupUpdate` (`api.go`) loads the row
+  once, then the name branch commits `name`+`is_named=1` via `UpdateGroupInfo`
+  (its own fresh load) and the invite branch wrote the **stale** snapshot back via
+  the full-column `UpdateTx` — clobbering both. Fix: invite branch uses a
+  column-scoped `DB.UpdateInviteTx` (only `invite`+`version`); the handler no longer
+  caches the full row (existence-check only). This also removes the pre-existing
+  `name`-revert on the same path and the read-modify-write race.
+- **`GroupResp.is_named` exposed (review #500 🟡).** Read-only `is_named` added to
+  `GroupResp` (both `from`/`fromModel` populators) so web clients can locally
+  predict name-text vs icon for an existing group when clearing `avatar_text`
+  (preview parity). Additive, backward-compatible.
 - **Avatar ETag / cache identity.** ETag is CRC32 over content *factors*
   (mode-version + group_no + color + text), not pixels. Named groups use the
   `group-name-v4` factor set (with text); auto-named/empty use `group-icon-v3`

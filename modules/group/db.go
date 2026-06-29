@@ -291,6 +291,20 @@ func (d *DB) UpdateTx(model *Model, tx *dbr.Tx) error {
 	return err
 }
 
+// UpdateInviteTx 仅更新「进群邀请开关」与群版本（列级写，事务内）。
+// 不能用 UpdateTx 整行回写：groupUpdate 在同一请求里若同时带 name 与 invite，name 分支
+// 已通过 UpdateGroupInfo（独立 fresh load）提交 name/is_named=1，而 invite 分支若再用
+// 建链时载入的旧快照经 UpdateTx 全列回写，会把刚提交的 name/is_named 用旧值覆盖回去
+// （改名 + is_named 被回滚成 0 → 头像静默退回双人图标）。列级写只动 invite/version，
+// 与并发的改名互不踩踏，也消除该读改写竞态。
+func (d *DB) UpdateInviteTx(groupNo string, invite int, version int64, tx *dbr.Tx) error {
+	_, err := tx.Update("group").SetMap(map[string]interface{}{
+		"invite":  invite,
+		"version": version,
+	}).Where("group_no=?", groupNo).Exec()
+	return err
+}
+
 // Update 更新群信息
 func (d *DB) Update(model *Model) error {
 	_, err := d.session.Update("group").SetMap(map[string]interface{}{
