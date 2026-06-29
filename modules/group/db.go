@@ -280,7 +280,7 @@ func (d *DB) queryUserSupers(uid string) ([]*Model, error) {
 func (d *DB) UpdateTx(model *Model, tx *dbr.Tx) error {
 	_, err := tx.Update("group").SetMap(map[string]interface{}{
 		"name":      model.Name,
-		"is_named":  model.IsNamed, // 改名置 1（用户起名）；其它更新原样回写当前值
+		"is_named":  model.IsNamed, // 原样回写当前值（改名不再改动 is_named；仅 #500 迁移回填存量老群为 1）
 		"notice":    model.Notice,
 		"creator":   model.Creator,
 		"status":    model.Status,
