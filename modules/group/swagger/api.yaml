@@ -1395,6 +1395,9 @@ definitions:
       name:
         type: string
         description: "群名称"
+      is_named:
+        type: integer
+        description: "群名是否用户显式起名(1)/成员拼接自动名(0)；客户端据此本地预判默认头像取群名前2字 vs 双人图标"
       remark:
         type: string
         description: "群备注"
@@ -1469,7 +1472,7 @@ definitions:
         description: "群数据版本"
       avatar_text:
         type: string
-        description: "自定义群头像文字（空表示未自定义，按群名前 2 字（script 感知取字）派生）"
+        description: "自定义群头像文字（空=未自定义，按 is_named 回退：命名群(is_named=1)取群名前 2 字（script 感知取字），自动名群(is_named=0)回退双人图标）"
       avatar_color:
         type: integer
         description: "自定义群头像色板下标（null 表示未自定义，按 group_no 派生）"
