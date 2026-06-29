@@ -32,6 +32,10 @@ func TestRenderIconUsesGroupStyleAndTwoToneGlyph(t *testing.T) {
 	}
 	assertCloseColor(t, img.At(100, 20), style.Fill, "icon circle fill")
 	assertCloseColor(t, img.At(100, 2), style.Main, "icon circle stroke")
+	// 圆外透明（alpha=0）：图标头像同样不铺白底，输出带 alpha 通道的 RGBA PNG。
+	if _, _, _, a := img.At(0, 0).RGBA(); a != 0 {
+		t.Errorf("icon corner (0,0) not transparent: alpha=%04x", a)
+	}
 	if got := countClosePixels(img, style.IconBack); got < 30 {
 		t.Fatalf("icon back color pixels = %d, want >= 30", got)
 	}

@@ -64,7 +64,8 @@ func TestRenderGroupUsesGroupStyleFillAndStroke(t *testing.T) {
 	}
 	assertCloseColor(t, img.At(100, 20), style.Fill, "circle fill")
 	assertCloseColor(t, img.At(100, 2), style.Main, "circle stroke")
-	assertCloseColor(t, img.At(0, 0), color.RGBA{R: 0xff, G: 0xff, B: 0xff, A: 0xff}, "outside circle")
+	// 圆外透明（alpha=0）：不再铺白底，输出带 alpha 通道的 RGBA PNG。
+	assertCloseColor(t, img.At(0, 0), color.RGBA{R: 0, G: 0, B: 0, A: 0}, "outside circle transparent")
 }
 
 func TestRenderGroupEmptyTextErrors(t *testing.T) {

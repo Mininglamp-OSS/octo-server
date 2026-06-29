@@ -45,11 +45,19 @@ type muActor struct {
 
 // muEnvelope 是 multica 出站 webhook 的固定信封（见 multica
 // server/internal/integrations/outwebhook/dispatcher.go outboundPayload）。
+//
+// issue_url / assignee_type / assignee_name 是 multica 侧富集字段（后端用
+// PublicURL+slug+identifier 拼好 url、join 出 assignee 显示名后发来）——octo
+// 侧无法从 UUID/workspace_id 自行推断,所以直接消费。三者都是【加性】的:
+// 旧版 multica 不发 → 留空,渲染降级（无链接 / 无指派行）。
 type muEnvelope struct {
 	Event          string  `json:"event"`
 	WorkspaceID    string  `json:"workspace_id"`
 	Actor          muActor `json:"actor"`
 	Issue          muIssue `json:"issue"`
+	IssueURL       string  `json:"issue_url"`
+	AssigneeType   string  `json:"assignee_type"`
+	AssigneeName   string  `json:"assignee_name"`
 	PreviousStatus string  `json:"previous_status"`
 }
 
@@ -113,43 +121,25 @@ func parseMulticaPush(_ http.Header, body []byte) (*pushPayloadReq, string, stri
 
 // renderMulticaIssueStatusChanged 渲染 issue.status_changed 事件。
 //
-// 输出形如（markdown，客户端会渲染）：
+// 输出形如（markdown，客户端会渲染），多行结构化：
 //
-//	**MUL-123** Fix login redirect: `todo` → `in_progress` (by agent)
+//	**[MUL-123 Fix login redirect](https://app.multica.ai/acme/issues/MUL-123)**
+//	状态: `todo` → `in_progress`
+//	指派: 张三 · 触发: agent
 //
-// 设计取舍：
-//   - 不拼 issue URL：envelope 当前不带 URL；服务端无法可靠推断 multica
-//     部署域名（self-hosted 路径多种）。需要可点链接时由 multica 后续在
-//     envelope 加 issue.url 字段，渲染层加链接即可，不破坏既有契约。
-//   - 标题与 identifier 之间用空格分隔，与 GitHub 适配器的 issue 渲染风格
-//     一致；状态用反引号包起来，避免下划线（in_progress）被 markdown 误
-//     当作斜体。
-//   - actor 名当前不在 envelope 里，只渲染 type（"by agent" / "by member"）；
-//     未显示触发者类型的情况下省略尾注。
-//   - title 在 `** identifier ** title:` 的「裸文本」上下文（注意：与 github
-//     适配器的 title 不同——github 把 title 包进 `[text](url)` 链接里，所以那边
-//     用只转 `\[]` 的 mdLinkText 是对的；这里 title 不进链接，必须用
-//     mdInertText 才能把 `*`/反引号/`<`/`|` 等元字符也防住，否则一个含反引号
-//     的 title 会让 content 里反引号总数变奇数、把后面的 status code-span 切坏，
-//     一个含 `**` 的 title 会注入真粗体（yujiawei review P1）。
-//   - 其余进 markdown 的字段按上下文走对应 helper（详见 adapter.go 注释）：
-//   - identifier 在 `**...**` 粗体里 → mdInertText（转义 `*` 防止 bold-break，
-//     转义 `[]` 防止 link injection）；
-//   - status / previous_status 在 “ `...` “ code span 里 → mdCodeSpanText
-//     （只剥反引号防止逃逸 code span；`_`/`*` 在 code span 内本就不被解释，
-//     不转义否则会回显 `\_` 破坏显示）；
-//   - actor.type 在 `(by ...)` 纯文本上下文 → mdInertText（全量转义）。
-//     这些字段按 multica 契约都是受控枚举/标识符，escape 是 defense-in-depth
-//     （PR #427 review by yujiawei / mochashanyao / Jerry-Xin）。
-//   - 字段长度统一钳到 64 rune：identifier/status/actor 在 multica 端是短
-//     标识符（identifier 形如 "MUL-12345"、status 是枚举、actor.type 是
-//     "member"/"agent"），64 足够覆盖正常上限并把异常长度截短防御。title
-//     仍用 200 rune（与 GitHub PR/issue 标题钳值对齐）。
+// 三行分别是「标题（带链接）/ 状态变更 / 指派·触发」；缺字段的行自动省略。
+// issue_url 与 assignee_name 是 multica 侧富集字段（octo 无法从 UUID/
+// workspace_id 自行推断域名、slug、人名），渲染层直接消费、并对 url 做
+// http(s) 白名单。各字段的转义/钳长策略见函数内逐行注释。
 func renderMulticaIssueStatusChanged(ev muEnvelope) string {
 	id := strings.TrimSpace(ev.Issue.Identifier)
 	title := strings.TrimSpace(ev.Issue.Title)
 	status := strings.TrimSpace(ev.Issue.Status)
 	prev := strings.TrimSpace(ev.PreviousStatus)
+	issueURL := strings.TrimSpace(ev.IssueURL)
+	assignee := strings.TrimSpace(ev.AssigneeName)
+	assigneeType := strings.TrimSpace(ev.AssigneeType)
+	actorType := strings.TrimSpace(ev.Actor.Type)
 	// id 与 status 是渲染所必需的最小集；缺失任一无法生成可读消息，回退
 	// 让上层走 reason=content 而非凭空生造。
 	if id == "" || status == "" {
@@ -159,26 +149,64 @@ func renderMulticaIssueStatusChanged(ev muEnvelope) string {
 	const shortFieldMax = 64
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "**%s**", mdInertText(id, shortFieldMax))
-	if title != "" {
-		// 钳到 200 rune 与 GitHub PR/issue 标题渲染保持一致；用 mdInertText 而
-		// 非 mdLinkText——title 在这里是裸文本，不在 `[text](url)` 里（详见上方
-		// 设计取舍）。
-		b.WriteString(" ")
-		b.WriteString(mdInertText(title, 200))
+
+	// --- 标题行 ---
+	// 链接文本是 "{identifier} {title}"（title 可空）。有合法 url 时整体包成
+	// markdown 链接；否则降级纯文本。
+	//   - 链接文本用 mdInertText（不是 mdLinkText）：CommonMark 会在链接文本
+	//     内部解析强调/代码 span,所以文本里的 `*`/反引号/`[]` 必须按 inert 处理,
+	//     否则一个含 `**` 的 title 注入真粗体、一个含反引号的 title 把后面 status
+	//     code-span 切坏（#496 yujiawei/OctoBoooot review）。mdInertText 转义
+	//     `*_[]<>|` 并剥反引号——转义后的 `\]` 是字面右括号,不会闭合链接,对链接
+	//     文本同样安全。
+	//   - 链接目标用 safeMarkdownURL:仅 isHTTPURL 不够,目标是独立注入上下文,
+	//     `https://ok/) [phish](https://evil` 会闭合链接再注入第二个链接
+	//     （#496 Jerry-Xin/OctoBoooot review）。校验失败则降级纯文本标题。
+	if safeURL, ok := safeMarkdownURL(issueURL); ok {
+		linkText := id
+		if title != "" {
+			linkText = id + " " + title
+		}
+		fmt.Fprintf(&b, "**[%s](%s)**", mdInertText(linkText, 200), safeURL)
+	} else {
+		fmt.Fprintf(&b, "**%s**", mdInertText(id, shortFieldMax))
+		if title != "" {
+			b.WriteString(" ")
+			b.WriteString(mdInertText(title, 200))
+		}
 	}
-	b.WriteString(": ")
+
+	// --- 状态行 ---
+	// 反引号包起来避免下划线（in_progress）被当斜体；prev 缺失或与 status 相同
+	// 时只显示当前状态，不画 "→ X" 暗示变化的尾巴。
+	b.WriteString("\n状态: ")
 	if prev != "" && prev != status {
 		fmt.Fprintf(&b, "`%s` → `%s`",
 			mdCodeSpanText(prev, shortFieldMax),
 			mdCodeSpanText(status, shortFieldMax))
 	} else {
-		// 新建 issue 或事件 payload 缺 previous_status 时只显示当前状态，
-		// 不画"→ X"那种暗示状态变化的尾巴。
 		fmt.Fprintf(&b, "`%s`", mdCodeSpanText(status, shortFieldMax))
 	}
-	if actorType := strings.TrimSpace(ev.Actor.Type); actorType != "" {
-		fmt.Fprintf(&b, " (by %s)", mdInertText(actorType, shortFieldMax))
+
+	// --- 指派 / 触发行（任一非空才渲染整行）---
+	// assignee_name 由 multica 富集发来（octo 只收到 UUID，无法自解析人名）。
+	// assignee_type（member/agent/squad）附在名字后,让群里能区分指派给「人」
+	// 还是「Agent/Squad」(#496 yujiawei review:type 之前解析了却没用)。
+	var meta []string
+	if assignee != "" {
+		label := "指派: " + mdInertText(assignee, shortFieldMax)
+		if assigneeType != "" {
+			label += " (" + mdInertText(assigneeType, shortFieldMax) + ")"
+		}
+		meta = append(meta, label)
 	}
+	if actorType != "" {
+		meta = append(meta, "触发: "+mdInertText(actorType, shortFieldMax))
+	}
+	if len(meta) > 0 {
+		b.WriteString("\n")
+		b.WriteString(strings.Join(meta, " · "))
+	}
+
 	return b.String()
 }

@@ -1,0 +1,31 @@
+# octospec context — task default-avatar-text-rule
+slug: default-avatar-text-rule
+
+rules_injected:
+  - id: error-handling      # paths: modules/**/*.go (group/user avatar handlers)
+    used: kept existing fallbacks, added NO new raw error responses; Test{Group,User}NoLegacyResponseError green, i18n-lint OK.
+  - id: testing             # paths: **/*_test.go
+    used: unit tests for the new script-aware rule + bumped version-pin tests.
+  - id: commit-style        # paths: **
+    used: Conventional Commits (feat:).
+
+rules_path_matched_but_not_applicable:
+  - id: rate-limit          # no request-frequency limiting touched
+  - id: space-isolation     # avatar GET is public read-only; no auth/space/data-access change
+
+load_bearing:
+  - "pkg/avatarrender/text.go: new GroupNameText (前2) + rewritten IndividualText (后2) over a shared script-aware core; GroupText kept unchanged (custom avatar_text normalizer, ≤4)."
+  - "render-cache identity: group-name-v3->v4 and name-v4->v5 at BOTH ETag and CacheKey; group-icon-v3 and ascii-v1 unchanged (renderers untouched)."
+  - "modules/group/api.go writeGroupDefaultAvatar: split custom-text (GroupText) vs auto-name (GroupNameText)."
+
+gates_local_green:
+  - go build ./...
+  - go vet (pkg/avatarrender, modules/group, modules/user)
+  - go test ./pkg/avatarrender/ (text-rule units: GroupNameText/IndividualText/GroupText)
+  - golangci-lint (touched pkgs) — 0 issues
+  - make i18n-lint / i18n-extract-check
+  - Test{Group,User}NoLegacyResponseError source guards
+
+gates_deferred_to_ci:
+  reason: local MySQL/Redis/WuKongIM infra was reclaimed mid-session (ephemeral env); cannot run NewTestServer locally.
+  tests: [group avatar endpoint tests, user avatar endpoint tests, Test{Group,User}AvatarGetPinsRenderVersion]

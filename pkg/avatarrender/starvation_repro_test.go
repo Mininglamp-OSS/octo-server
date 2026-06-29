@@ -1,6 +1,7 @@
 package avatarrender
 
 import (
+	"os"
 	"runtime"
 	"sort"
 	"sync"
@@ -108,6 +109,12 @@ func TestRenderFanoutStarvesVictim(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skip starvation repro in -short")
 	}
+	// 本测断言 wall-clock 放大倍数(ratio>=2x)，在共享/受压 runner 上抖动(快/空闲机不饿死、
+	// 慢机更饿)，会让 `go test ./pkg/avatarrender/...` flaky(#486 评审实测)。它**演示** #480
+	// 饿死、不在 CI 钉死任何不变量，故默认跳过，仅 OCTO_TIMING_TESTS=1 手动复现。
+	if os.Getenv("OCTO_TIMING_TESTS") != "1" {
+		t.Skip("set OCTO_TIMING_TESTS=1 to run the wall-clock starvation repro (timing-fragile on shared runners)")
+	}
 	prev := runtime.GOMAXPROCS(2) // 模拟生产 2 核 pod
 	defer runtime.GOMAXPROCS(prev)
 
@@ -159,6 +166,12 @@ func TestRenderFanoutStarvesVictim(t *testing.T) {
 func TestCacheEliminatesStarvation(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skip cache validation in -short")
+	}
+	// 同 TestRenderFanoutStarvesVictim：断言 under/base 放大倍数(<=1.8x)，在受压 runner 上
+	// 抖动误报(#486 评审实测在 main 基线上一样挂 ~2.5x，newFailures=0 → 既有噪声非回归)。
+	// 缓存收敛的确定性证明见 group_starvation_test.go 的 TestGroupRenderCacheCollapsesRenders。
+	if os.Getenv("OCTO_TIMING_TESTS") != "1" {
+		t.Skip("set OCTO_TIMING_TESTS=1 to run the wall-clock cache-vs-starvation validation (timing-fragile on shared runners)")
 	}
 	prev := runtime.GOMAXPROCS(2)
 	defer runtime.GOMAXPROCS(prev)

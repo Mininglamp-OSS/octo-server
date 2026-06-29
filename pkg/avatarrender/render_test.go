@@ -54,7 +54,7 @@ func TestGenerateSamples(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// (uid, 昵称) — uid 决定颜色，昵称后两字决定文字。
+	// (uid, 昵称) — uid 决定颜色，昵称取字（script 感知后 2）决定文字。
 	samples := []struct{ uid, name string }{
 		{"u01", "刘一"},
 		{"u02", "张三丰"},

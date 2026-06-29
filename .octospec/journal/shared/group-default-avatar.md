@@ -201,3 +201,53 @@ i18n-lint + 源码守卫；全仓无残留引用（仅说明性注释）。
 判为非阻断(group_no 是不可枚举 UUID;与已上线的 user-avatar 渲染昵称同型;本 PR 反而以
 disband/不存在→404 收紧了面),但因 security-sensitive 标签,留待人类显式 ack。其余延后项
 同前(groupUpdate 跨步原子性、强 ETag、公开端点限流与 UserAvatar 一起做)。
+
+## Post-merge 跟进:透明四角(group + user 头像)
+合并后线上观察:渲染的默认头像**圆外是不透明白底**,在不裁圆/深色 surface 上露白方块。
+根因:`RenderGroup`/`RenderIcon`/`Render` 三个函数都先 `draw.Draw(canvas, …, color.White, …,
+draw.Src)` 铺白底再画圆(当年为「任意背景不透底色」+ 输出无 alpha 的 RGB,与旧 ASCII/bot
+头像一致)。`image.NewRGBA` 零值即全透明,故**删掉那行铺白底**即可:圆外保持透明,`png.Encode`
+自动输出带 alpha 的 RGBA PNG。三函数各删一行 + 去掉随之 unused 的 `image/draw` import + 改文档
+注释。**范围 group + user 一起**(`avatarrender.Render` 生产仅 `modules/user/api.go` 调,波及干净)。
+- 方案选型:服务端直接透明 vs 客户端加遮罩 → 取**服务端透明**。描边圆环已把形状焊死成圆
+  (裁成非圆会切坏环),客户端遮罩换形状是伪需求;服务端一次改、所有 surface 立即正确、不依赖
+  各端正确裁圆、零副作用。
+- 测试:`TestRenderOpaque`→`TestRenderTransparentCorners`(四角 alpha=0 + 整图非 Opaque);
+  group/icon 各加圆外 alpha=0 断言;`inkBox` 仅采圆内核心区不受影响,仅更注释。group/user 端点
+  逐字节比对(handler==Render*)两边同源保持一致。**不在本次范围**:未命名群→双人图标、取字规则
+  (`Bug反`→`Bu`/`g反`,待设计)。
+
+### PR #486 评审轮修复(6 位 reviewer)
+PR #486 评审,**必修阻断项**:渲染字节变了但 **ETag/cache 版本 tag 没 bump** —— ETag 是对**因子串**
+做 CRC32(非像素),同因子→同 ETag→已缓存旧图的客户端 `If-None-Match` 命中→304→`must-revalidate`
+下**永远返旧白角图**(进程 LRU 同样陈旧到重启)。这正是 #349 当初加白底时 bump 到 `name-v3` 的同
+类动作。修复:
+- bump 渲染版本 tag(ETag + CacheKey 两处同步):`modules/group/api.go` `group-name-v2`→`v3`、
+  `group-icon-v2`→`v3`;`modules/user/api.go` `name-v3`→`v4`。**`ascii-v1` 不动** —— ASCII 兜底
+  `generateDefaultAvatar` 本次未改、字节没变(Octo-Q/QA/yujiawei 三方确认;只在像素真变时才 bump)。
+  两处 ETag 站点加注释:视觉改动(像素变因子不变)必须 bump 版本段。
+- 修两处 stale helper 注释(`render.go` `drawCircle`/`drawCircleFilledStroked`「调用方先铺白底」)——
+  它们是 precondition 措辞,后人照做会把白底加回、静默回归。
+- gate `starvation_repro_test.go` 两个 wall-clock timing 测试(`TestRenderFanoutStarvesVictim`、
+  `TestCacheEliminatesStarvation`)到 `OCTO_TIMING_TESTS=1`,对齐 #478 的群版。QA 实测后者在 main
+  基线一样挂(newFailures=0,既有噪声非回归),gate 后 `go test ./pkg/avatarrender/...` 不再 flake。
+- 验证:`go build ./...`;avatarrender(timing 默认 skip)+ group + user 头像端点全绿;golangci-lint
+  0 issues;i18n-lint 过。stale-test-DB 迁移 panic 是既有 harness 状态问题(非本改动),drop+recreate
+  `test` 库后各模块单独跑均过。
+
+### PR #486 评审第二轮:端点版本 pin 测试(Jerry-Xin 非阻塞建议)
+d169ffc7 后 4 位 reviewer 全 Approve,唯一开放项是 Jerry-Xin(两轮均提)的非阻塞 🔵:现有测试覆盖
+ETag **函数**,但没有任何测试 pin 端点实际接线的版本段。真实缺口——若后人把 handler 里
+`group-name-v3`/`group-icon-v3`/`name-v4` 误改回旧版(或下次改渲染漏 bump),当前无测试会挂,客户端
+会 304 到陈旧图(正是上一轮的阻断根因)。补两个端点级 pin:
+- `modules/group/avatar_version_pin_test.go` `TestGroupAvatarGetPinsRenderVersion`:命名群→断言响应
+  ETag == `avatarrender.ETag("group-name-v3", groupNo, "seed", GroupText(name))`;空名→图标兜底→断言
+  == `ETag("group-icon-v3", groupNo, "seed")`。
+- `modules/user/avatar_version_pin_test.go` `TestUserAvatarGetPinsRenderVersion`:可渲染昵称→断言响应
+  ETag == `avatarETag("name-v4", uid, IndividualText(name))`。`ascii-v1` 故意不 pin(走未改的
+  `generateDefaultAvatar`)。
+- 设计:测试里的版本字面量与 handler 内联字面量**相互独立**,故单边漂移即不等→失败(非同源恒真);
+  `GroupText`/`IndividualText` 复用 handler 同一函数,取字规则将来合法变更时测试与 handler 同步移动,
+  **只 pin 版本段**。复用现有 `doAvatarGet`/`getAvatarForTest` 端点桩,无新 handler→不触 NoLegacy 守卫。
+- 验证:`go vet`、`go build ./...`、两端点 pin + 既有 avatar 测试全绿、NoLegacyResponseError 守卫
+  group/user 均 ok、golangci-lint 0 issues。

@@ -47,7 +47,7 @@ const (
 // 群信息更新（PUT /v1/group/:group_no）中自定义群头像的 map key，与创建接口
 // groupReq 的 JSON 字段名保持一致。avatar_color 值为色板下标字符串，"" 或 "-1"
 // 表示清除自定义色（回退按 group_no 派生）；avatar_text 为空字符串表示清除自定义
-// 文字（回退群名前 4 字）。
+// 文字（回退群名前 2 字）。
 const (
 	attrKeyAvatarText  = "avatar_text"
 	attrKeyAvatarColor = "avatar_color"
