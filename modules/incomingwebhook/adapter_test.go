@@ -60,3 +60,35 @@ func TestFirstLineAndOneLine(t *testing.T) {
 	assert.Equal(t, "no newline", firstLine("no newline"))
 	assert.Equal(t, "a b c", oneLine("a\r\nb\nc"))
 }
+
+func TestSafeMarkdownURL(t *testing.T) {
+	ok := []string{
+		"https://app.multica.ai/acme/issues/MUL-1",
+		"http://localhost:3000/x/issues/Y-2",
+		"https://app.multica.ai/acme%20corp/issues/MUL%207", // pre-escaped segments
+	}
+	for _, u := range ok {
+		got, valid := safeMarkdownURL(u)
+		assert.Truef(t, valid, "%q should be accepted", u)
+		assert.Equal(t, u, got)
+	}
+
+	bad := []string{
+		"",
+		"javascript:alert(1)",                       // non-http scheme
+		"data:text/html,x",                          // non-http scheme
+		"https://ok.com/) [phish](https://evil.com", // link-destination injection
+		"https://ok.com/issue)",                     // trailing paren ends destination
+		"https://ok.com/a b",                        // embedded space
+		"https://ok.com/a\nb",                       // newline
+		"https://ok.com/<script>",                   // angle brackets
+		"https://ok.com/]x",                         // bracket
+		"https://",                                  // no host
+		"https://例子.com/x",                          // non-ASCII (IDN) — reject rather than mis-render
+	}
+	for _, u := range bad {
+		got, valid := safeMarkdownURL(u)
+		assert.Falsef(t, valid, "%q should be rejected", u)
+		assert.Empty(t, got)
+	}
+}
