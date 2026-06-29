@@ -29,12 +29,84 @@ func TestParseMulticaPush_IssueStatusChanged_FullEnvelope(t *testing.T) {
 	}`)
 	req, skip, invalid := parseMulticaPush(http.Header{}, body)
 	require.NotNil(t, req, "skip=%q invalid=%q", skip, invalid)
-	// 期望渲染：**MUL-123** Fix login redirect on mobile: `todo` → `in_progress` (by agent)
+	// 多行渲染：
+	//   **MUL-123** Fix login redirect on mobile
+	//   状态: `todo` → `in_progress`
+	//   触发: agent
 	assert.Contains(t, req.Content, "**MUL-123**")
 	assert.Contains(t, req.Content, "Fix login redirect on mobile")
-	assert.Contains(t, req.Content, "`todo` → `in_progress`")
-	assert.Contains(t, req.Content, "(by agent)")
+	assert.Contains(t, req.Content, "状态: `todo` → `in_progress`")
+	assert.Contains(t, req.Content, "触发: agent")
 	assert.Empty(t, req.MsgType, "adapters emit the plain-text path")
+}
+
+func TestParseMulticaPush_IssueStatusChanged_WithLinkAndAssignee(t *testing.T) {
+	// multica 富集 issue_url + assignee_name 时：标题成可点链接，多一行指派。
+	body := []byte(`{
+		"event": "issue.status_changed",
+		"workspace_id": "550e8400-e29b-41d4-a716-446655440000",
+		"actor": {"type": "agent", "id": "agent-7"},
+		"issue": {
+			"identifier": "MUL-123",
+			"title": "Fix login redirect",
+			"status": "in_progress"
+		},
+		"issue_url": "https://app.multica.ai/acme/issues/MUL-123",
+		"assignee_type": "member",
+		"assignee_name": "张三",
+		"previous_status": "todo"
+	}`)
+	req, skip, invalid := parseMulticaPush(http.Header{}, body)
+	require.NotNil(t, req, "skip=%q invalid=%q", skip, invalid)
+	// 标题行渲染成 markdown 链接，链接文本是 "identifier title"。
+	assert.Contains(t, req.Content, "**[MUL-123 Fix login redirect](https://app.multica.ai/acme/issues/MUL-123)**")
+	// 指派与触发同在一行，用 " · " 连接。
+	assert.Contains(t, req.Content, "指派: 张三 · 触发: agent")
+}
+
+func TestParseMulticaPush_AssigneeWithoutActor(t *testing.T) {
+	// 只有 assignee_name、没有 actor.type：指派行只渲染指派段，不带 " · 触发"。
+	body := []byte(`{
+		"event": "issue.status_changed",
+		"issue": {"identifier": "MUL-5", "title": "x", "status": "done"},
+		"assignee_type": "agent",
+		"assignee_name": "Codex Bot",
+		"previous_status": "todo"
+	}`)
+	req, _, _ := parseMulticaPush(http.Header{}, body)
+	require.NotNil(t, req)
+	assert.Contains(t, req.Content, "指派: Codex Bot")
+	assert.NotContains(t, req.Content, "·", "no separator when actor is absent")
+	assert.NotContains(t, req.Content, "触发:")
+}
+
+func TestParseMulticaPush_MaliciousIssueURLDowngraded(t *testing.T) {
+	// issue_url 必须过 http(s) 白名单：javascript: 等 scheme 不能渲染成链接，
+	// 标题降级为纯文本（identifier 加粗），且恶意 url 不出现在 content 里。
+	body := []byte(`{
+		"event": "issue.status_changed",
+		"issue": {"identifier": "MUL-9", "title": "evil", "status": "done"},
+		"issue_url": "javascript:alert(1)",
+		"previous_status": "todo"
+	}`)
+	req, _, _ := parseMulticaPush(http.Header{}, body)
+	require.NotNil(t, req)
+	assert.NotContains(t, req.Content, "javascript:", "non-http(s) url must not be rendered")
+	assert.NotContains(t, req.Content, "](", "url must not become a markdown link")
+	assert.Contains(t, req.Content, "**MUL-9**", "title falls back to bold plain text")
+}
+
+func TestParseMulticaPush_NoIssueURL_PlainTextTitle(t *testing.T) {
+	// 无 issue_url（旧版 multica）：标题回退纯文本 `**id** title`，不是链接。
+	body := []byte(`{
+		"event": "issue.status_changed",
+		"issue": {"identifier": "MUL-4", "title": "no link", "status": "done"},
+		"previous_status": "todo"
+	}`)
+	req, _, _ := parseMulticaPush(http.Header{}, body)
+	require.NotNil(t, req)
+	assert.Contains(t, req.Content, "**MUL-4** no link")
+	assert.NotContains(t, req.Content, "](", "no link without issue_url")
 }
 
 func TestParseMulticaPush_IssueStatusChanged_NoPreviousStatus(t *testing.T) {
@@ -50,11 +122,11 @@ func TestParseMulticaPush_IssueStatusChanged_NoPreviousStatus(t *testing.T) {
 	assert.Contains(t, req.Content, "First issue")
 	assert.Contains(t, req.Content, "`todo`")
 	assert.NotContains(t, req.Content, "→", "no arrow when previous_status is absent")
-	assert.Contains(t, req.Content, "(by member)")
+	assert.Contains(t, req.Content, "触发: member")
 }
 
 func TestParseMulticaPush_NoActorType(t *testing.T) {
-	// actor.type 缺失：不渲染 "(by …)" 尾巴。
+	// actor.type 缺失且无 assignee：整个指派/触发行省略。
 	body := []byte(`{
 		"event": "issue.status_changed",
 		"issue": {"identifier": "MUL-3", "title": "no actor", "status": "done"},
@@ -62,7 +134,8 @@ func TestParseMulticaPush_NoActorType(t *testing.T) {
 	}`)
 	req, _, _ := parseMulticaPush(http.Header{}, body)
 	require.NotNil(t, req)
-	assert.NotContains(t, req.Content, "(by")
+	assert.NotContains(t, req.Content, "触发:")
+	assert.NotContains(t, req.Content, "指派:")
 }
 
 func TestParseMulticaPush_TitleEscaping(t *testing.T) {
