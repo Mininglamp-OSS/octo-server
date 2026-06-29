@@ -146,10 +146,10 @@ func sharedRateRedis(cfg *config.Config) *redis.Client {
 		// PoolSize 显式设 10：令牌桶 Lua 脚本是短事务，与 main.go / user / group /
 		// space / integration 等其它限流 client 的全局约定保持一致。Redis 故障/连接池
 		// 打满导致 fail-open 的兜底由进程内 localFloor 负责，不在此处放大连接池。
-		rateRedisClient = redis.NewClient(octoredis.MustBuildOptions(cfg, func(o *redis.Options) {
+		rateRedisClient = octoredis.NewInstrumentedClient(cfg, func(o *redis.Options) {
 			o.MaxRetries = 1
 			o.PoolSize = 10
-		}))
+		})
 	})
 	return rateRedisClient
 }

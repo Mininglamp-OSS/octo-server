@@ -45,12 +45,12 @@ type etlLock struct {
 }
 
 func newETLLock(ctx *config.Context) *etlLock {
-	client := rd.NewClient(octoredis.MustBuildOptions(ctx.GetConfig(), func(o *rd.Options) {
+	client := octoredis.NewInstrumentedClient(ctx.GetConfig(), func(o *rd.Options) {
 		o.MaxRetries = 3
 		o.ReadTimeout = 3 * time.Second
 		o.WriteTimeout = 3 * time.Second
 		o.DialTimeout = 3 * time.Second
-	}))
+	})
 	return &etlLock{client: client}
 }
 

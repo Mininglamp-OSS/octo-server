@@ -82,10 +82,10 @@ func New(ctx *config.Context) *Integration {
 
 func sharedIntegrationRateRedis(cfg *config.Config) *rd.Client {
 	integrationRateRedisOnce.Do(func() {
-		integrationRateRedisClient = rd.NewClient(octoredis.MustBuildOptions(cfg, func(o *rd.Options) {
+		integrationRateRedisClient = octoredis.NewInstrumentedClient(cfg, func(o *rd.Options) {
 			o.MaxRetries = 1
 			o.PoolSize = integrationRateLimitPoolSize
-		}))
+		})
 	})
 	return integrationRateRedisClient
 }

@@ -48,10 +48,10 @@ func sharedRateRedis(cfg *config.Config) *rd.Client {
 		// 经 octoredis.MustBuildOptions 构造,确保 RedisTLS 启用(托管 TLS Redis)时
 		// TLSConfig 不被遗漏,否则限流 client 连不上、fail-open 静默关掉防护。
 		// PoolSize 显式设 10:令牌桶 Lua 是短事务,与其它限流 client 全局约定一致。
-		rateRedisClient = rd.NewClient(octoredis.MustBuildOptions(cfg, func(o *rd.Options) {
+		rateRedisClient = octoredis.NewInstrumentedClient(cfg, func(o *rd.Options) {
 			o.MaxRetries = 1
 			o.PoolSize = 10
-		}))
+		})
 	})
 	return rateRedisClient
 }

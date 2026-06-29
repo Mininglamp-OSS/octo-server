@@ -7,7 +7,6 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
-	rd "github.com/go-redis/redis"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -26,7 +25,7 @@ import (
 func TestRedisExistingTokenSetter_SetXX_RealRedis(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	setter := redisExistingTokenSetter{
-		client: rd.NewClient(octoredis.MustBuildOptions(ctx.GetConfig())),
+		client: octoredis.NewInstrumentedClient(ctx.GetConfig()),
 	}
 	prefix := ctx.GetConfig().Cache.TokenCachePrefix
 

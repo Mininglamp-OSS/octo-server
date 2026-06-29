@@ -54,3 +54,29 @@ func MustBuildOptions(cfg *config.Config, overrides ...OptionsOverride) *rd.Opti
 	}
 	return opts
 }
+
+// NewInstrumentedClient 用 cfg(+overrides) 构造一个裸 *rd.Client，并在返回前挂上
+// octo-lib 的每条命令计时 hook（liboredis.Instrument），使其命令进入
+// dependency="redis" 指标。
+//
+// octo-server 内所有需要裸 *rd.Client 的场景（限流令牌桶、OIDC 锁、health 探针等
+// 需要 Eval/Script/SetNX、无法用 lib 的 Conn 包装的地方）都应通过本函数构造 —— 既
+// 统一了 TLS（经 BuildOptions），又确保插桩不被漏掉。插桩在构造时、client 被共享
+// 前完成，满足 octo-lib Instrument 的「共享前插桩」契约。
+//
+// 与 MustBuildOptions 一样，TLS 配置错误属启动期配置错误，直接 panic。
+func NewInstrumentedClient(cfg *config.Config, overrides ...OptionsOverride) *rd.Client {
+	return InstrumentedClientFromOptions(MustBuildOptions(cfg, overrides...))
+}
+
+// InstrumentedClientFromOptions 用调用方预构造的 *rd.Options 建裸 *rd.Client 并插桩。
+// 供少数已自行拼好 Options 的场景（如 health 探针）使用；一般情况优先用
+// NewInstrumentedClient。
+func InstrumentedClientFromOptions(opts *rd.Options) *rd.Client {
+	// 防御性复制：go-redis 会就地写入若干默认值，不复制可能在调用方复用同一
+	// *rd.Options 时串改。与 octo-lib redis.NewWithOptions 的处理保持一致。
+	local := *opts
+	c := rd.NewClient(&local)
+	liboredis.Instrument(c)
+	return c
+}

@@ -31,7 +31,9 @@ func NewWithOptions(opts *rd.Options) *Conn {
 	if opts.MaxRetries == 0 {
 		opts.MaxRetries = 3
 	}
-	return &Conn{client: rd.NewClient(opts)}
+	// 经 InstrumentedClientFromOptions 构造，使这个 Conn 的命令也进入 dependency="redis"
+	// 指标（与裸 client 一致）。
+	return &Conn{client: InstrumentedClientFromOptions(opts)}
 }
 
 func (rc *Conn) Ping() (string, error) {
