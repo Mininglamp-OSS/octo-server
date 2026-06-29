@@ -77,6 +77,7 @@ func TestCreateGroup_Success(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "测试群", model.Name)
 	assert.Equal(t, testutil.UID, model.Creator)
+	assert.Equal(t, 1, model.IsNamed, "建群传了 name → is_named=1（默认头像取群名）")
 
 	members, err := s.db.QueryMembersFirstNine(resp.GroupNo)
 	assert.NoError(t, err)
@@ -94,6 +95,35 @@ func TestCreateGroup_AutoGenerateName(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotEmpty(t, resp.Name)
 	assert.Contains(t, resp.Name, "user_")
+
+	// 没传 name → 成员名拼接的自动默认名 → is_named=0（默认头像回退双人图标）。
+	s := svc.(*Service)
+	model, err := s.db.QueryWithGroupNo(resp.GroupNo)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, model.IsNamed, "未传 name → is_named=0（默认头像双人图标）")
+}
+
+// TestUpdateGroupInfo_RenameMarksIsNamed 验证用户改名后 is_named 置 1：自动名群（图标）
+// 被显式改名后变为命名群，默认头像随即可按新群名取字（改名→新默认头像的前提）。
+func TestUpdateGroupInfo_RenameMarksIsNamed(t *testing.T) {
+	svc, userDB := setupServiceTest(t)
+	insertTestUsers(t, userDB, testutil.UID)
+	s := svc.(*Service)
+
+	const groupNo = "grp_rename_isnamed"
+	assert.NoError(t, s.db.Insert(&Model{
+		GroupNo: groupNo, Name: "张三、李四", Creator: testutil.UID, Status: 1, Version: 1, IsNamed: 0,
+	}))
+
+	newName := "后端架构讨论"
+	assert.NoError(t, svc.UpdateGroupInfo(&UpdateGroupInfoServiceReq{
+		GroupNo: groupNo, OperatorUID: testutil.UID, OperatorName: "op", Name: &newName,
+	}))
+
+	model, err := s.db.QueryWithGroupNo(groupNo)
+	assert.NoError(t, err)
+	assert.Equal(t, newName, model.Name)
+	assert.Equal(t, 1, model.IsNamed, "用户显式改名 → is_named=1（默认头像改取新群名）")
 }
 
 func TestCreateGroup_DeduplicateMembers(t *testing.T) {

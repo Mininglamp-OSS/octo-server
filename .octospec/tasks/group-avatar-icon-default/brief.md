@@ -19,13 +19,18 @@ source: self
 ## Goal
 Two server changes:
 
-1. **S2 — default avatar is the two-person icon, independent of the group name.**
-   Today an un-uploaded group with no custom `avatar_text` renders its name's
-   leading 2 glyphs (`GroupNameText`), falling back to the two-person icon only
-   when the name yields no renderable glyphs (PR #494). Product (2026-06-29) has
-   reversed this: the default avatar must be the two-person icon **regardless of
-   the group name**; text is rendered **only** when the user has explicitly set a
-   custom `avatar_text` via the 修改头像 dialog.
+1. **S2 — default avatar follows a *user-given* name; an auto-generated
+   (member-concat) name renders the two-person icon.** Today an un-uploaded group
+   with no custom `avatar_text` always renders its `name`'s leading 2 glyphs
+   (`GroupNameText`), including the member-concatenated default name like
+   `张三、李四、王五` (PR #494). Product (2026-06-29): the default avatar should take
+   the name's first 2 glyphs **only when the user explicitly named the group**; a
+   group left on the auto member-concat name renders the two-person icon (don't
+   render a concat name as avatar text). A new `is_named` flag distinguishes the
+   two (set at create from whether `name` was provided, and on rename). Priority:
+   custom `avatar_text` > named-group name (`is_named=1`) > two-person icon.
+   Existing groups are backfilled `is_named=1` (conservative — no existing avatar
+   changes; only new auto-named groups get the icon).
 
 2. **S1 — expose the avatar color palette over HTTP.** The 10-color palette
    (`main` / `fill` / `iconBack`) lives only in `pkg/avatarrender/palette.go`.
@@ -38,38 +43,39 @@ Two server changes:
   shipped in PRs #478 / #486 / #494 (journals: `group-default-avatar`,
   `default-avatar-text-rule`). Default rendering decision is in
   `modules/group/api.go` `writeGroupDefaultAvatar`.
-- The default-avatar-text-rule journal already flagged "unnamed groups → icon" as
-  a deferred follow-up needing an `is_named` flag. S2 makes that flag unnecessary:
-  **all** un-customized groups (named or not) use the icon.
+- The default-avatar-text-rule journal flagged "unnamed/auto-member-name groups
+  using the icon instead of text" as a deferred follow-up needing an `is_named`
+  flag. S2 implements exactly that: `is_named` is added now (migration backfills
+  existing rows to 1).
 - Web research: there is no avatar dialog in octo-web today (image upload only);
   the create flow (`OrganizationalGroupNew`) sends members only — no name/avatar.
   Those are the web follow-up, not this task.
 
 ## Load-bearing list
-- `writeGroupDefaultAvatar` text-selection branch (`modules/group/api.go`) — the
-  exact behavior being changed. Custom-text path (`GroupText`, ≤4, as-is) is
-  unchanged; only the no-custom-text fallback flips from `GroupNameText(name)` to
-  empty → icon.
+- `writeGroupDefaultAvatar` text-selection branch (`modules/group/api.go`):
+  `avatar_text` → as-is; else `is_named==1` → `GroupNameText(name)`; else icon.
+- **`is_named` lifecycle.** New column (migration `20260629000001`, backfill
+  existing → 1). `CreateGroup`: `is_named = (trimmed req.Name != "")` computed
+  *before* the member-concat fallback overwrites `groupName`. Rename
+  (`UpdateGroupInfo`, `req.Name != nil`) → `is_named = 1`; persisted by adding
+  `is_named` to `DB.UpdateTx`'s `SetMap` (it used an explicit column list).
 - **Avatar ETag / cache identity.** ETag is CRC32 over content *factors*
-  (mode-version + group_no + color + text), not pixels. Named groups switch from
-  the `group-name-v4` factor set (with text) to the `group-icon-v3` factor set
-  (no text) → the ETag **changes** on its own, so a stale `If-None-Match` cannot
-  match → clients revalidate to the fresh icon. The `RenderIcon` bytes are NOT
-  touched, so **no version bump is required** (contrast #486: there the icon
-  *pixels* changed). `group-name-v4` is retained for the custom-text path.
-- `GroupNameText` (`pkg/avatarrender/text.go`) — no longer called by the handler
-  after S2; kept (still unit-tested, may serve future use). No behavior change to
-  the function itself.
-- Stale comments in `modules/group/{api.go,db.go,service.go}` that say
-  "空=渲染时回退群名前 2 字派生" — updated to "空=双人图标(默认头像与群名无关)"
-  so future readers don't re-introduce name derivation.
+  (mode-version + group_no + color + text), not pixels. Named groups use the
+  `group-name-v4` factor set (with text); auto-named/empty use `group-icon-v3`
+  (no text) — different modes → different factor strings, so a rename or an
+  is_named flip changes the text factor and the ETag on its own; clients
+  revalidate to the fresh image. `RenderIcon`/`RenderGroup` bytes are untouched →
+  **no version bump required** (contrast #486: there the icon *pixels* changed).
+- `GroupNameText` (`pkg/avatarrender/text.go`) — still called by the handler for
+  `is_named=1` groups; unchanged behavior.
+- Comments in `modules/group/{api.go,db.go,service.go,const.go}` + swagger updated
+  to the is_named rule ("空=按 is_named 回退：命名群群名/自动名群双人图标").
 - **Wire contract (new):** `GET /v1/group/avatar_palette` (public, static design
   tokens — mirrors the already-public avatar render endpoint). Response:
   `{ "size": 10, "colors": [ { "index", "main", "fill", "icon_back" } ... ] }`,
   hex `#RRGGBB`, ordered by palette index. Pure read, no error path → no errcode.
 
 ## Out of scope
-- Server default-render rule per named/unnamed distinction (`is_named`) — obviated.
 - Any change to custom `avatar_text`/`avatar_color` create/update APIs, validation,
   upload path, or the palette *values*/order.
 - All octo-web work (修改头像 dialog, 发起群聊 dialog, local preview component,
@@ -77,15 +83,18 @@ Two server changes:
 - Render version bump (intentionally none — see load-bearing list).
 
 ## Acceptance
-- `writeGroupDefaultAvatar`: with no custom `avatar_text`, renders `RenderIcon`
-  (two-person icon) for BOTH a named and an empty-name group; renders text ONLY
-  when `avatar_text` is set. Custom color still honored for the icon.
+- `writeGroupDefaultAvatar` with no custom `avatar_text`: `is_named=1` group →
+  `RenderGroup(GroupNameText(name))` (name first-2); `is_named=0` group (or empty
+  name) → `RenderIcon` (two-person). Custom color honored in both. Custom
+  `avatar_text` always overrides.
+- `CreateGroup`: explicit `name` → `is_named=1`; omitted (member-concat) →
+  `is_named=0`. `UpdateGroupInfo` with a name → `is_named=1` (persisted).
 - `GET /v1/group/avatar_palette` returns `PaletteSize()` (=10) entries; each entry's
   `main`/`fill`/`icon_back` equals `avatarrender.PaletteHex()`; `colors[0].main == "#14C0FF"`.
-- Updated `TestGroupAvatarGet*` (named, no custom text → icon) and
-  `TestGroupAvatarGetPinsRenderVersion` (text-render version pinned via a
-  custom-text group, since name no longer triggers text). Custom-text not-truncated
-  + uploaded-redirect + 404/disband regressions still pass.
+- Tests: `TestGroupAvatarGetAutoNamedRendersIcon`, `TestGroupAvatarGetNamedRendersNameText`,
+  `TestCreateGroup_{Success,AutoGenerateName}` is_named asserts,
+  `TestUpdateGroupInfo_RenameMarksIsNamed`; custom-text/uploaded/404/disband + palette
+  + version-pin regressions still pass.
 - `go build ./...`, `go vet`, `golangci-lint`, `make i18n-lint` +
   `i18n-extract-check`, `TestGroupNoLegacyResponseError` guard all green.
   (Endpoint tests needing MySQL/Redis/WuKongIM run in CI per prior increments.)

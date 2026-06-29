@@ -25,17 +25,17 @@ func doAvatarGet(t *testing.T, h http.Handler, groupNo, ifNoneMatch string) *htt
 	return w
 }
 
-// TestGroupAvatarGetNamedNoCustomRendersIcon 覆盖核心规则（产品 2026-06-29 定稿）：
-// 无自定义上传、无自定义文字时，**无论群名是否有内容**都渲染双人图标——默认头像与群名
-// 无关，区别于历史「群名取字前 2」行为。带弱 ETag + must-revalidate；命中 If-None-Match 时 304。
-func TestGroupAvatarGetNamedNoCustomRendersIcon(t *testing.T) {
+// TestGroupAvatarGetAutoNamedRendersIcon 覆盖核心规则（产品 2026-06-29 定稿）：成员名
+// 拼接的**自动默认名**（is_named=0）且无自定义文字 → 双人图标（不把拼接名渲成头像文字），
+// 即使 name 字段非空。带弱 ETag + must-revalidate；命中 If-None-Match 时 304。
+func TestGroupAvatarGetAutoNamedRendersIcon(t *testing.T) {
 	s, ctx := newTestServer(t)
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	g := New(ctx)
 
-	const groupNo = "avatar_get_named_1"
+	const groupNo = "avatar_get_autoname_1"
 	require.NoError(t, g.db.Insert(&Model{
-		GroupNo: groupNo, Name: "后端架构讨论", Creator: "c1", Status: 1,
+		GroupNo: groupNo, Name: "张三、李四、王五", Creator: "c1", Status: 1, IsNamed: 0,
 	}))
 
 	w := doAvatarGet(t, s.GetRoute(), groupNo, "")
@@ -49,17 +49,41 @@ func TestGroupAvatarGetNamedNoCustomRendersIcon(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, avatarrender.DefaultSize, img.Bounds().Dx())
 
-	// 默认头像与群名无关：有群名但无自定义文字 → 双人图标（按 group_no 派生色），
-	// 而非历史的「群名前 2 字」。
+	// 自动名（is_named=0）→ 双人图标（按 group_no 派生色），不渲染拼接名文字。
 	wantIcon, err := avatarrender.RenderIcon(avatarrender.GroupStyleForSeed(groupNo))
 	require.NoError(t, err)
 	require.Equal(t, wantIcon, w.Body.Bytes(),
-		"named group without custom text must render the two-person icon, not name-derived text")
+		"auto-named group (is_named=0) without custom text must render the two-person icon")
 
 	// 304：带命中的 If-None-Match → 304 无 body。
 	w2 := doAvatarGet(t, s.GetRoute(), groupNo, etag)
 	require.Equal(t, http.StatusNotModified, w2.Code)
 	require.Empty(t, w2.Body.Bytes())
+}
+
+// TestGroupAvatarGetNamedRendersNameText 覆盖：用户**显式起名**（is_named=1）且无自定义
+// 文字 → 取群名前 2 字（script 感知）渲染文字，而非双人图标。
+func TestGroupAvatarGetNamedRendersNameText(t *testing.T) {
+	s, ctx := newTestServer(t)
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	g := New(ctx)
+
+	const groupNo = "avatar_get_named_text_1"
+	require.NoError(t, g.db.Insert(&Model{
+		GroupNo: groupNo, Name: "后端架构讨论", Creator: "c1", Status: 1, IsNamed: 1,
+	}))
+
+	w := doAvatarGet(t, s.GetRoute(), groupNo, "")
+	require.Equal(t, http.StatusOK, w.Code)
+
+	want, err := avatarrender.RenderGroup(
+		avatarrender.GroupNameText("后端架构讨论"),
+		avatarrender.GroupStyleForSeed(groupNo),
+		avatarrender.DefaultSize,
+	)
+	require.NoError(t, err)
+	require.Equal(t, want, w.Body.Bytes(),
+		"named group (is_named=1) without custom text must render script-aware first-2 of the name")
 }
 
 // TestGroupAvatarGetIconFallback 覆盖群名为空 → 同样回退双人图标渲染。
