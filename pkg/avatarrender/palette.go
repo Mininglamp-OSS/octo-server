@@ -1,6 +1,7 @@
 package avatarrender
 
 import (
+	"fmt"
 	"hash/crc32"
 	"image/color"
 )
@@ -107,4 +108,35 @@ func ColorByIndex(i int) (color.RGBA, bool) {
 		return color.RGBA{}, false
 	}
 	return palette[i], true
+}
+
+// GroupColorHex 是一档群头像配色的十六进制（#RRGGBB）形式，供**客户端本地渲染**
+// （如「修改头像」实时预览、色圈选择）使用：客户端用 Index 选色、用 Main/Fill/IconBack
+// 复刻服务端 PNG 的视觉（主色描边/文字、浅底圆、图标后景人），保证预览与建群/改群后
+// 服务端渲染出的真图一致。
+type GroupColorHex struct {
+	Index    int    // 色板下标 [0,PaletteSize)，与 avatar_color 取值一致
+	Main     string // 主题主色：圆描边 + 文字 + 图标前景人
+	Fill     string // 圆填充浅色
+	IconBack string // 图标兜底（双人剪影）后景人浅色
+}
+
+// PaletteHex 返回整套群头像色板的十六进制形式（按下标 0..PaletteSize 顺序），作为
+// 色板的**唯一数据源**对客户端暴露——前端不再硬编码色值，避免与服务端 palette.go 漂移。
+func PaletteHex() []GroupColorHex {
+	out := make([]GroupColorHex, len(palette))
+	for i := range palette {
+		out[i] = GroupColorHex{
+			Index:    i,
+			Main:     hexOf(palette[i]),
+			Fill:     hexOf(groupFillPalette[i]),
+			IconBack: hexOf(groupIconBackPalette[i]),
+		}
+	}
+	return out
+}
+
+// hexOf 把 RGBA 主色格式化为 #RRGGBB（忽略 alpha——色板均为不透明设计色）。
+func hexOf(c color.RGBA) string {
+	return fmt.Sprintf("#%02X%02X%02X", c.R, c.G, c.B)
 }

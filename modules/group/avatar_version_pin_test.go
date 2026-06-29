@@ -20,22 +20,23 @@ import (
 // Existing endpoint tests assert the ETag is present / weak / changes on rename, but
 // none pin the version literal. This recomputes the expected ETag with the expected
 // version string and asserts the endpoint emits exactly it, so any token drift fails
-// loudly here. GroupNameText is the same helper the handler uses, so a legitimate
-// change to the script-aware text rule moves test and handler in lockstep — only the
-// version segment is pinned.
+// loudly here. GroupText is the same helper the handler uses for custom text, so a
+// legitimate change to the normalize rule moves test and handler in lockstep — only
+// the version segment is pinned.
 func TestGroupAvatarGetPinsRenderVersion(t *testing.T) {
 	s, ctx := newTestServer(t)
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	g := New(ctx)
 
-	// Named, renderable group, no custom color -> name render mode, default colorTag "seed".
+	// Custom avatar_text is the ONLY path to text-render now that the group name no
+	// longer drives the default avatar -> name render mode, default colorTag "seed".
 	const namedNo = "avatar_pin_named_1"
-	require.NoError(t, g.db.Insert(&Model{GroupNo: namedNo, Name: "后端架构讨论", Creator: "c1", Status: 1}))
+	require.NoError(t, g.db.Insert(&Model{GroupNo: namedNo, Name: "后端架构讨论", Creator: "c1", Status: 1, AvatarText: "研发"}))
 	named := doAvatarGet(t, s.GetRoute(), namedNo, "")
 	require.Equal(t, http.StatusOK, named.Code)
-	wantName := avatarrender.ETag("group-name-v4", namedNo, "seed", avatarrender.GroupNameText("后端架构讨论"))
+	wantName := avatarrender.ETag("group-name-v4", namedNo, "seed", avatarrender.GroupText("研发"))
 	require.Equal(t, wantName, named.Header().Get("ETag"),
-		"group name-avatar endpoint must wire render version group-name-v4 (keep in sync with the rendered bytes)")
+		"group text-avatar endpoint must wire render version group-name-v4 (keep in sync with the rendered bytes)")
 
 	// Empty name -> icon fallback mode -> "group-icon-v3".
 	const iconNo = "avatar_pin_icon_1"
