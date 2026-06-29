@@ -29,13 +29,13 @@ const (
 // BotAPI is the public Bot API gateway module.
 // It handles all bot-facing endpoints (/v1/bot/*) with unified auth.
 type BotAPI struct {
-	ctx                   *config.Context
-	db                    *botAPIDB
-	userService           user.IService
-	fileService           file.IService
-	groupService          group.IService
-	userDB                *user.DB
-	threadService         thread.IService
+	ctx           *config.Context
+	db            *botAPIDB
+	userService   user.IService
+	fileService   file.IService
+	groupService  group.IService
+	userDB        *user.DB
+	threadService thread.IService
 	// robotService gives the OBO fan-out path a way to enqueue synthetic
 	// events directly into a grantee bot's /v1/bot/events queue. The
 	// webhook layer drops NoPersist=1 messages before NotifyMessagesListeners
@@ -118,6 +118,13 @@ type BotAPI struct {
 	// path (nil override) goes through ba.ctx.SendCMD verbatim, so
 	// behaviour outside of tests is unchanged.
 	typingCMDDispatch func(req config.MsgCMDReq) error
+	// reactionCMDDispatch — #111 Sprint B. Test seam for the reaction
+	// handler's ctx.SendCMD call, mirroring typingCMDDispatch. Production
+	// path (nil) goes through ba.ctx.SendCMD verbatim.
+	reactionCMDDispatch func(req config.MsgCMDReq) error
+	// reactionStoreOverride — #111 Sprint B. Test seam letting handler-level
+	// tests drive applyReaction with a fake store (no live DB). Nil in prod.
+	reactionStoreOverride reactionStorer
 	// friendCheckOverride lets unit tests stub userService.IsFriend for the
 	// friend-gate decision in checkSendPermission / syncMessages, and for
 	// the OBO friend-gate bypass (see obo_friend_gate.go). Production path
@@ -213,6 +220,9 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 		botAPI.POST("/events/:event_id/ack", ba.eventAck)
 		botAPI.POST("/heartbeat", ba.heartbeat)
 		botAPI.POST("/messages/sync", ba.syncMessages)
+		// #111 Sprint B — bot message reactions
+		botAPI.POST("/messages/:message_id/reactions", ba.addReaction)
+		botAPI.DELETE("/messages/:message_id/reactions/:emoji", ba.removeReaction)
 		botAPI.GET("/groups", ba.getGroups)
 		botAPI.GET("/resolve/targets", ba.botResolveTargets)
 		botAPI.GET("/groups/:group_no", ba.getGroupInfo)
@@ -291,6 +301,9 @@ func (ba *BotAPI) resolveSpaceChannelID(robotID, channelID string, channelType u
 
 // resolveBotDisplayName queries the bot's display name, falls back to robotID.
 func (ba *BotAPI) resolveBotDisplayName(robotID string) string {
+	if ba.userDB == nil {
+		return robotID
+	}
 	botUser, err := ba.userDB.QueryByUID(robotID)
 	if err == nil && botUser != nil && botUser.Name != "" {
 		return botUser.Name
