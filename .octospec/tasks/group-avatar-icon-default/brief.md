@@ -55,7 +55,15 @@ Two server changes:
 - `writeGroupDefaultAvatar` text-selection branch (`modules/group/api.go`):
   `avatar_text` → as-is; else `is_named==1` → `GroupNameText(name)`; else icon.
 - **`is_named` lifecycle.** New column (migration `20260629000001`, backfill
-  existing → 1). `CreateGroup`: `is_named = (trimmed req.Name != "")` computed
+  existing → 1). The migration is **recovery-safe** (review #500, Jerry-Xin +
+  OctoBoooot 🔴): because MySQL `ALTER TABLE` auto-commits, the backfill must NOT
+  live inside the column-exists guard (a crash between the committed ALTER and the
+  backfill would skip it on retry, leaving existing rows at `DEFAULT 0` =
+  auto-named → icon, violating "no existing avatar changes"). Pattern: (1) add
+  column **NULL** (no default) → existing rows = NULL sentinel; (2) `UPDATE ... SET
+  is_named=1 WHERE is_named IS NULL` run unconditionally (idempotent, only touches
+  not-yet-backfilled rows, converges on any partial-failure retry); (3) `MODIFY` to
+  `NOT NULL DEFAULT 0` for new inserts. `CreateGroup`: `is_named = (trimmed req.Name != "")` computed
   *before* the member-concat fallback overwrites `groupName`. Rename
   (`UpdateGroupInfo`, `req.Name != nil`) → `is_named = 1`; persisted by adding
   `is_named` to `DB.UpdateTx`'s `SetMap` (it used an explicit column list).

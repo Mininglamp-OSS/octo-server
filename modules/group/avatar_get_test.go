@@ -126,8 +126,9 @@ func TestGroupAvatarGetCustomOverrides(t *testing.T) {
 	require.Equal(t, want, w.Body.Bytes(), "custom text+color must override name/seed")
 }
 
-// TestGroupAvatarGetCustomColorIconNoText 覆盖 S2:设了自定义颜色但**无**自定义文字 →
-// 渲染该颜色的双人图标(默认头像与群名无关,但自定义颜色仍被尊重)。
+// TestGroupAvatarGetCustomColorIconNoText 覆盖 S2:自动名群(is_named=0)设了自定义颜色但
+// **无**自定义文字 → 渲染该颜色的双人图标(自动名群默认头像与群名无关,但自定义颜色仍被
+// 尊重)。fixture 显式 IsNamed=0,名字取「自动名群」以贴合意图(避免与 is_named=1 混淆)。
 func TestGroupAvatarGetCustomColorIconNoText(t *testing.T) {
 	s, ctx := newTestServer(t)
 	require.NoError(t, testutil.CleanAllTables(ctx))
@@ -135,7 +136,7 @@ func TestGroupAvatarGetCustomColorIconNoText(t *testing.T) {
 
 	const groupNo = "avatar_get_coloricon_1"
 	require.NoError(t, g.db.Insert(&Model{
-		GroupNo: groupNo, Name: "有名群", Creator: "c1", Status: 1, AvatarColor: intPtr(7),
+		GroupNo: groupNo, Name: "自动名群", Creator: "c1", Status: 1, IsNamed: 0, AvatarColor: intPtr(7),
 	}))
 
 	w := doAvatarGet(t, s.GetRoute(), groupNo, "")
@@ -145,7 +146,35 @@ func TestGroupAvatarGetCustomColorIconNoText(t *testing.T) {
 	require.True(t, ok)
 	wantIcon, err := avatarrender.RenderIcon(style)
 	require.NoError(t, err)
-	require.Equal(t, wantIcon, w.Body.Bytes(), "custom color + no text must render the two-person icon in that color")
+	require.Equal(t, wantIcon, w.Body.Bytes(), "auto-named group (is_named=0) with custom color + no text must render the two-person icon in that color")
+}
+
+// TestGroupAvatarGetNamedCustomColorRendersNameText 锁定三因子交互(Octo-Q P2-1 建议):
+// 命名群(is_named=1) + 自定义颜色 + **无**自定义文字 → 以该自定义颜色渲染群名前 2 字
+// (而非派生色、而非图标)。补全 is_named=1 与 custom_color 的组合覆盖。
+func TestGroupAvatarGetNamedCustomColorRendersNameText(t *testing.T) {
+	s, ctx := newTestServer(t)
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	g := New(ctx)
+
+	const groupNo = "avatar_get_named_color_1"
+	require.NoError(t, g.db.Insert(&Model{
+		GroupNo: groupNo, Name: "后端架构讨论", Creator: "c1", Status: 1, IsNamed: 1, AvatarColor: intPtr(7),
+	}))
+
+	w := doAvatarGet(t, s.GetRoute(), groupNo, "")
+	require.Equal(t, http.StatusOK, w.Code)
+
+	style, ok := avatarrender.GroupStyleByIndex(7)
+	require.True(t, ok)
+	want, err := avatarrender.RenderGroup(
+		avatarrender.GroupNameText("后端架构讨论"),
+		style,
+		avatarrender.DefaultSize,
+	)
+	require.NoError(t, err)
+	require.Equal(t, want, w.Body.Bytes(),
+		"named group (is_named=1) with custom color + no text must render name first-2 in that custom color")
 }
 
 // TestGroupAvatarGetCustomTextNotTruncated 回归 PR#494 评审(Jerry-Xin):用户显式

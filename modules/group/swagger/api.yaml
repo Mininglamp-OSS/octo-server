@@ -320,7 +320,7 @@ paths:
                   description: "成员名称"
               avatar_text:
                 type: string
-                description: "自定义群头像文字（≤4 可见字符；空/缺省时取群名前 2 字（script 感知取字）渲染默认头像）"
+                description: "自定义群头像文字（≤4 可见字符；空/缺省时按 is_named 回退：传入 name(命名群)取群名前 2 字（script 感知取字），未传 name(成员拼接自动名)回退双人图标）"
               avatar_color:
                 type: integer
                 description: "自定义群头像色板下标 [0, 调色板大小)；缺省时按 group_no 派生颜色"
@@ -1215,8 +1215,9 @@ paths:
         - "group"
       summary: "获取群头像"
       description: >-
-        公开（不鉴权）端点。未上传自定义头像的群在服务端实时渲染默认头像（彩色描边圆 +
-        群名前 2 字（script 感知取字），或自定义 avatar_text/avatar_color；空名回退群组图标），返回 image/png。
+        公开（不鉴权）端点。未上传自定义头像的群在服务端实时渲染默认头像（彩色描边圆）：
+        优先自定义 avatar_text；否则按 is_named 回退——命名群(is_named=1)取群名前 2 字
+        （script 感知取字），自动名群(is_named=0)或空名回退双人图标；avatar_color 控制配色。返回 image/png。
         已上传头像（is_upload_avatar=1）的群 302 重定向到对象存储。群不存在或已解散返回
         404。响应带内容相关弱 ETag，命中 If-None-Match 时返回 304。
       operationId: "get avatar"
@@ -1244,6 +1245,34 @@ paths:
           description: "If-None-Match 命中，内容未变更"
         404:
           description: "群不存在或已解散"
+  /group/avatar_palette:
+    get:
+      tags:
+        - "group"
+      summary: "获取群头像色板"
+      description: >-
+        公开（不鉴权）端点。返回服务端固定的群头像设计色板（main/fill/icon_back，#RRGGBB），
+        作为唯一数据源供前端「修改头像」色圈与本地实时预览使用，使预览配色与服务端渲染的
+        PNG 完全一致、不漂移。无入参、无敏感数据，按下标有序。响应带内容相关弱 ETag 与
+        Cache-Control: public, max-age=300, must-revalidate；命中 If-None-Match 时返回 304。
+      operationId: "get avatar palette"
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      parameters:
+        - in: "header"
+          name: "If-None-Match"
+          type: string
+          description: "条件请求；与当前弱 ETag 匹配时返回 304"
+          required: false
+      responses:
+        200:
+          description: "固定群头像色板"
+          schema:
+            $ref: "#/definitions/avatarPaletteResp"
+        304:
+          description: "If-None-Match 命中，色板未变更"
   /groups/{group_no}/scanjoin:
     get:
       tags:
@@ -1283,6 +1312,32 @@ securityDefinitions:
     description: "用户token"
 
 definitions:
+  avatarPaletteColorResp:
+    type: object
+    properties:
+      index:
+        type: integer
+        description: "色板下标，与 avatar_color 取值一致"
+      main:
+        type: string
+        description: "主题主色 #RRGGBB"
+      fill:
+        type: string
+        description: "圆填充浅色 #RRGGBB"
+      icon_back:
+        type: string
+        description: "双人图标后景人浅色 #RRGGBB"
+  avatarPaletteResp:
+    type: object
+    properties:
+      size:
+        type: integer
+        description: "色板档数（= avatar_color 合法上界）"
+      colors:
+        type: array
+        description: "按下标 0..size 有序的色板项"
+        items:
+          $ref: "#/definitions/avatarPaletteColorResp"
   memberManagerResp:
     type: object
     properties:
