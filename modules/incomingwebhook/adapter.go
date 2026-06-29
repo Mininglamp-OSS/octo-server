@@ -21,7 +21,9 @@ package incomingwebhook
 import (
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"strings"
+	"unicode"
 )
 
 // pushAdapter 描述一种推送形态。
@@ -145,6 +147,45 @@ func firstLine(s string) string {
 func isHTTPURL(s string) bool {
 	l := strings.ToLower(strings.TrimSpace(s))
 	return strings.HasPrefix(l, "http://") || strings.HasPrefix(l, "https://")
+}
+
+// safeMarkdownURL validates an externally-supplied URL for safe interpolation
+// into a markdown link DESTINATION `](url)`. isHTTPURL alone is insufficient:
+// the destination is a distinct injection context — a value like
+// `https://ok/) [phish](https://evil` passes a scheme prefix check yet closes
+// the intended link and injects a second attacker-controlled link into the
+// message (#496 review). CommonMark also forbids/encodes spaces and control
+// chars in a bare destination, and a literal `)` ends it.
+//
+// Returns (url, true) only when the value: parses via net/url, is http(s), is
+// host-bearing, and contains no ASCII space, control char, or any of the
+// destination-breaking metacharacters `< > ( ) [ ] " \`. Otherwise (",", false)
+// so the caller downgrades to a plain-text (non-link) title — same degrade
+// contract as a non-http scheme.
+func safeMarkdownURL(raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	if !isHTTPURL(raw) {
+		return "", false
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "", false
+	}
+	for _, r := range raw {
+		if r > unicode.MaxASCII {
+			// Non-ASCII (e.g. an IDN host or a unicode path) can't appear in a
+			// bare destination unescaped; reject rather than risk mis-rendering.
+			return "", false
+		}
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return "", false
+		}
+		switch r {
+		case '<', '>', '(', ')', '[', ']', '"', '\\':
+			return "", false
+		}
+	}
+	return raw, true
 }
 
 // oneLine 把多行文本压成单行，避免标题 / 评论里的换行破坏 markdown 链接结构。

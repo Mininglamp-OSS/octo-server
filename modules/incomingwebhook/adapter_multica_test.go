@@ -60,8 +60,8 @@ func TestParseMulticaPush_IssueStatusChanged_WithLinkAndAssignee(t *testing.T) {
 	require.NotNil(t, req, "skip=%q invalid=%q", skip, invalid)
 	// 标题行渲染成 markdown 链接，链接文本是 "identifier title"。
 	assert.Contains(t, req.Content, "**[MUL-123 Fix login redirect](https://app.multica.ai/acme/issues/MUL-123)**")
-	// 指派与触发同在一行，用 " · " 连接。
-	assert.Contains(t, req.Content, "指派: 张三 · 触发: agent")
+	// 指派(带 type)与触发同在一行，用 " · " 连接。
+	assert.Contains(t, req.Content, "指派: 张三 (member) · 触发: agent")
 }
 
 func TestParseMulticaPush_AssigneeWithoutActor(t *testing.T) {
@@ -107,6 +107,68 @@ func TestParseMulticaPush_NoIssueURL_PlainTextTitle(t *testing.T) {
 	require.NotNil(t, req)
 	assert.Contains(t, req.Content, "**MUL-4** no link")
 	assert.NotContains(t, req.Content, "](", "no link without issue_url")
+}
+
+// TestParseMulticaPush_IssueURLDestinationInjection is the #496 blocker regression:
+// a URL that passes a naive http(s) prefix check but carries link-breaking
+// characters (`)`, space, etc.) must NOT be rendered as a link — it would close
+// the intended destination and inject a second attacker-controlled link.
+func TestParseMulticaPush_IssueURLDestinationInjection(t *testing.T) {
+	cases := []struct {
+		name string
+		url  string
+	}{
+		{"close_and_inject", "https://ok.com/) [phish](https://evil.com"},
+		{"trailing_paren", "https://ok.com/issue)"},
+		{"embedded_space", "https://ok.com/a b"},
+		{"newline", "https://ok.com/a\nb"},
+		{"angle_brackets", "https://ok.com/<script>"},
+		{"bracket", "https://ok.com/]injected"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body, err := json.Marshal(map[string]any{
+				"event":           "issue.status_changed",
+				"issue":           map[string]any{"identifier": "MUL-1", "title": "hi", "status": "done"},
+				"issue_url":       tc.url,
+				"previous_status": "todo",
+			})
+			require.NoError(t, err)
+			req, _, _ := parseMulticaPush(http.Header{}, body)
+			require.NotNil(t, req)
+			// The malicious destination must never be rendered as a markdown link.
+			assert.NotContains(t, req.Content, "](", "unsafe url must not become a markdown link: %q", req.Content)
+			assert.NotContains(t, req.Content, "[phish]", "second injected link must not appear")
+			// Degrades to a plain-text bold identifier instead.
+			assert.Contains(t, req.Content, "**MUL-1**", "title falls back to bold plain text")
+		})
+	}
+}
+
+// TestParseMulticaPush_LinkTextInjection is the #496 second blocker: when the
+// title IS rendered inside a link (`[text](url)`), CommonMark still parses
+// emphasis/code spans in the text, so a title with `**` or a backtick must be
+// neutralized — the link-text path uses mdInertText (escapes `*`, strips
+// backtick), not mdLinkText (which only escapes `\[]`).
+func TestParseMulticaPush_LinkTextInjection(t *testing.T) {
+	body, err := json.Marshal(map[string]any{
+		"event":           "issue.status_changed",
+		"issue":           map[string]any{"identifier": "MUL-1", "title": "a **bold** `tick", "status": "in_progress"},
+		"issue_url":       "https://app.multica.ai/acme/issues/MUL-1",
+		"previous_status": "todo",
+	})
+	require.NoError(t, err)
+	req, _, _ := parseMulticaPush(http.Header{}, body)
+	require.NotNil(t, req)
+	// asterisks escaped → no injected bold inside the link text.
+	assert.Contains(t, req.Content, `\*\*bold\*\*`, "asterisks in link text must be escaped")
+	assert.NotContains(t, req.Content, "a **bold**", "raw bold must not survive in link text")
+	// Backticks remain balanced (the title's lone backtick is stripped), so the
+	// downstream status code-span is not corrupted.
+	assert.Equalf(t, 0, strings.Count(req.Content, "`")%2,
+		"backticks must remain balanced (got odd count): %q", req.Content)
+	// Still a valid single link to the safe destination.
+	assert.Contains(t, req.Content, "](https://app.multica.ai/acme/issues/MUL-1)")
 }
 
 func TestParseMulticaPush_IssueStatusChanged_NoPreviousStatus(t *testing.T) {

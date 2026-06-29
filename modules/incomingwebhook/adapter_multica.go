@@ -138,6 +138,7 @@ func renderMulticaIssueStatusChanged(ev muEnvelope) string {
 	prev := strings.TrimSpace(ev.PreviousStatus)
 	issueURL := strings.TrimSpace(ev.IssueURL)
 	assignee := strings.TrimSpace(ev.AssigneeName)
+	assigneeType := strings.TrimSpace(ev.AssigneeType)
 	actorType := strings.TrimSpace(ev.Actor.Type)
 	// id 与 status 是渲染所必需的最小集；缺失任一无法生成可读消息，回退
 	// 让上层走 reason=content 而非凭空生造。
@@ -150,16 +151,23 @@ func renderMulticaIssueStatusChanged(ev muEnvelope) string {
 	var b strings.Builder
 
 	// --- 标题行 ---
-	// 链接文本是 "{identifier} {title}"（title 可空）。有合法 http(s) url 时整体
-	// 包成 markdown 链接（mdLinkText 防 `]` 闭合）；否则降级纯文本（identifier
-	// 加粗，mdInertText 防 `*`/反引号 注入）。url 过 isHTTPURL 白名单杜绝
-	// `javascript:` 等 scheme 注入。
-	if issueURL != "" && isHTTPURL(issueURL) {
+	// 链接文本是 "{identifier} {title}"（title 可空）。有合法 url 时整体包成
+	// markdown 链接；否则降级纯文本。
+	//   - 链接文本用 mdInertText（不是 mdLinkText）：CommonMark 会在链接文本
+	//     内部解析强调/代码 span,所以文本里的 `*`/反引号/`[]` 必须按 inert 处理,
+	//     否则一个含 `**` 的 title 注入真粗体、一个含反引号的 title 把后面 status
+	//     code-span 切坏（#496 yujiawei/OctoBoooot review）。mdInertText 转义
+	//     `*_[]<>|` 并剥反引号——转义后的 `\]` 是字面右括号,不会闭合链接,对链接
+	//     文本同样安全。
+	//   - 链接目标用 safeMarkdownURL:仅 isHTTPURL 不够,目标是独立注入上下文,
+	//     `https://ok/) [phish](https://evil` 会闭合链接再注入第二个链接
+	//     （#496 Jerry-Xin/OctoBoooot review）。校验失败则降级纯文本标题。
+	if safeURL, ok := safeMarkdownURL(issueURL); ok {
 		linkText := id
 		if title != "" {
 			linkText = id + " " + title
 		}
-		fmt.Fprintf(&b, "**[%s](%s)**", mdLinkText(linkText, 200), issueURL)
+		fmt.Fprintf(&b, "**[%s](%s)**", mdInertText(linkText, 200), safeURL)
 	} else {
 		fmt.Fprintf(&b, "**%s**", mdInertText(id, shortFieldMax))
 		if title != "" {
@@ -182,9 +190,15 @@ func renderMulticaIssueStatusChanged(ev muEnvelope) string {
 
 	// --- 指派 / 触发行（任一非空才渲染整行）---
 	// assignee_name 由 multica 富集发来（octo 只收到 UUID，无法自解析人名）。
+	// assignee_type（member/agent/squad）附在名字后,让群里能区分指派给「人」
+	// 还是「Agent/Squad」(#496 yujiawei review:type 之前解析了却没用)。
 	var meta []string
 	if assignee != "" {
-		meta = append(meta, "指派: "+mdInertText(assignee, shortFieldMax))
+		label := "指派: " + mdInertText(assignee, shortFieldMax)
+		if assigneeType != "" {
+			label += " (" + mdInertText(assigneeType, shortFieldMax) + ")"
+		}
+		meta = append(meta, label)
 	}
 	if actorType != "" {
 		meta = append(meta, "触发: "+mdInertText(actorType, shortFieldMax))
