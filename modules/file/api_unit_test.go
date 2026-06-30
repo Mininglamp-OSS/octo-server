@@ -5,11 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/png"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -1296,6 +1299,16 @@ func newMultipartFile(t *testing.T, filename string, content []byte) (*bytes.Buf
 	return &buf, w.FormDataContentType()
 }
 
+// pngOfSize encodes a real (blank) PNG of the given pixel dimensions, so
+// image.DecodeConfig in uploadFile reads a genuine W×H for the sticker
+// dimension guard. Blank RGBA compresses tiny, well under StickerMaxFileSize.
+func pngOfSize(t *testing.T, w, h int) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	require.NoError(t, png.Encode(&buf, image.NewRGBA(image.Rect(0, 0, w, h))))
+	return buf.Bytes()
+}
+
 // TestUploadFile_StickerHandleMinted is the file-side half of the upload-handle
 // (PR#508 follow-up): a successful type=sticker upload must return a
 // `sticker_handle` that verifies against (uploader uid, returned path) — the
@@ -1310,9 +1323,9 @@ func TestUploadFile_StickerHandleMinted(t *testing.T) {
 	mockSvc := &mockService{downloadURL: downloadURL}
 	f := &File{Log: log.NewTLog("FileTest"), service: mockSvc}
 
-	// Minimal valid PNG header so ValidateMagicNumber(".png", …) passes.
-	png := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x00}
-	body, contentType := newMultipartFile(t, "abc.png", png)
+	// A real, small PNG so both ValidateMagicNumber and the dimension guard
+	// (image.DecodeConfig) pass.
+	body, contentType := newMultipartFile(t, "abc.png", pngOfSize(t, 64, 64))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -1346,8 +1359,7 @@ func TestUploadFile_NonStickerNoHandle(t *testing.T) {
 	mockSvc := &mockService{downloadURL: "https://cdn.example.com/dm/chat/10000/abc.png"}
 	f := &File{Log: log.NewTLog("FileTest"), service: mockSvc}
 
-	png := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x00}
-	body, contentType := newMultipartFile(t, "abc.png", png)
+	body, contentType := newMultipartFile(t, "abc.png", pngOfSize(t, 64, 64))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -1363,4 +1375,97 @@ func TestUploadFile_NonStickerNoHandle(t *testing.T) {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	_, has := resp["sticker_handle"]
 	require.False(t, has, "non-sticker upload must not carry a sticker_handle")
+}
+
+// TestUploadFile_StickerRejectsOversizeDimensions is the decompression-bomb
+// guard: a type=sticker upload whose decoded dimensions exceed
+// StickerMaxDimension (512) on either side is refused, even though the file is
+// tiny and passes the magic-number + size checks. Stickers render inline and are
+// sent to peers, so an oversized bitmap is a cross-user memory-DoS vector.
+func TestUploadFile_StickerRejectsOversizeDimensions(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
+
+	cases := []struct {
+		name string
+		w, h int
+	}{
+		{"both sides over", 513, 513},
+		{"width over only", 600, 10},
+		{"height over only", 10, 600},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mockSvc := &mockService{downloadURL: "https://cdn.example.com/dm/sticker/10000/x.png"}
+			f := &File{Log: log.NewTLog("FileTest"), service: mockSvc}
+
+			body, contentType := newMultipartFile(t, "x.png", pngOfSize(t, tc.w, tc.h))
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			c.Request, _ = http.NewRequest(http.MethodPost, "/v1/file/upload?type=sticker&path=/10000/x.png", body)
+			c.Request.Header.Set("Content-Type", contentType)
+			c.Set("uid", "10000")
+
+			f.uploadFile(&wkhttp.Context{Context: c})
+
+			require.Equal(t, http.StatusBadRequest, rec.Code,
+				"%dx%d sticker must be rejected; body: %s", tc.w, tc.h, rec.Body.String())
+		})
+	}
+}
+
+// TestUploadFile_StickerAcceptsMaxDimensions: exactly 512×512 is the boundary and
+// must be accepted (and still mint a handle).
+func TestUploadFile_StickerAcceptsMaxDimensions(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
+
+	mockSvc := &mockService{downloadURL: "https://cdn.example.com/dm/sticker/10000/x.png"}
+	f := &File{Log: log.NewTLog("FileTest"), service: mockSvc}
+
+	body, contentType := newMultipartFile(t, "x.png", pngOfSize(t, StickerMaxDimension, StickerMaxDimension))
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request, _ = http.NewRequest(http.MethodPost, "/v1/file/upload?type=sticker&path=/10000/x.png", body)
+	c.Request.Header.Set("Content-Type", contentType)
+	c.Set("uid", "10000")
+
+	f.uploadFile(&wkhttp.Context{Context: c})
+
+	require.Equal(t, http.StatusOK, rec.Code, "512x512 sticker must be accepted; body: %s", rec.Body.String())
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	_, has := resp["sticker_handle"]
+	require.True(t, has, "accepted sticker upload should still mint a handle")
+}
+
+// TestUploadFile_StickerAcceptsWebp proves the webp decode path survives the
+// dimension guard: image.DecodeConfig must read a webp's W×H via the
+// golang.org/x/image/webp registration (blank-imported in api.go). Without that
+// registration every webp sticker would fail to decode and be wrongly rejected.
+// Fixture is a real 150×100 lossy webp (≤512), so it is accepted.
+func TestUploadFile_StickerAcceptsWebp(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
+
+	webpBytes, err := os.ReadFile("testdata/sticker_sample.webp")
+	require.NoError(t, err)
+
+	mockSvc := &mockService{downloadURL: "https://cdn.example.com/dm/sticker/10000/x.webp"}
+	f := &File{Log: log.NewTLog("FileTest"), service: mockSvc}
+
+	body, contentType := newMultipartFile(t, "x.webp", webpBytes)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request, _ = http.NewRequest(http.MethodPost, "/v1/file/upload?type=sticker&path=/10000/x.webp", body)
+	c.Request.Header.Set("Content-Type", contentType)
+	c.Set("uid", "10000")
+
+	f.uploadFile(&wkhttp.Context{Context: c})
+
+	require.Equal(t, http.StatusOK, rec.Code, "valid webp sticker must be accepted; body: %s", rec.Body.String())
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	_, has := resp["sticker_handle"]
+	require.True(t, has, "accepted webp sticker should mint a handle")
 }

@@ -1,7 +1,7 @@
 ---
 type: Task
 title: "Task: sticker-upload-handle"
-description: Cryptographic upload handle binding a custom-sticker object to its uploader, closing the path-shape check's tail-match residual.
+description: Harden custom-sticker uploads — a cryptographic upload handle binding the object to its uploader (closes the path-shape tail-match residual), plus a decode-time pixel-dimension cap (decompression-bomb defense).
 tags: ["sticker", "security", "wire-contract", "fullstack"]
 timestamp: 2026-06-30T00:00:00Z
 # --- octospec extension fields ---
@@ -22,6 +22,12 @@ client-supplied `path` was produced by THIS user's content-validated
 `type=sticker` upload — not merely that the path *looks* like a sticker object.
 `modules/file` signs `(uploaderUID, storedPath)` with an HMAC at upload time and
 returns it as `sticker_handle`; `sticker.add` verifies it.
+
+Additionally, bound the **decoded** pixel dimensions of a sticker upload. The
+1MB file-size cap limits compressed bytes but not decoded resolution, so a
+small, highly-compressed image can decode to an enormous bitmap and OOM the
+inline renderer — and because stickers are sent to peers, that is a cross-user
+DoS. Cap each side at 512px, read header-only via `image.DecodeConfig`.
 
 ## Background
 
@@ -44,6 +50,13 @@ is independent of every other use of that master key.
   `uploadFile` gains one response field, `sticker_handle`, emitted ONLY for
   `type=sticker` and ONLY when a master key is configured. No change to existing
   fields (`path`/`name`/`size`/`ext`/`sha512`) or to any non-sticker type.
+- **Sticker decode-dimension cap** (touches: `wire-contract`) — for
+  `type=sticker`, after the magic-number check, `uploadFile` reads W×H via
+  `image.DecodeConfig` (header-only, no full decode) and rejects either side >
+  `StickerMaxDimension` (512). Decoders for gif/png/jpeg (stdlib) and webp
+  (`golang.org/x/image/webp`, already a dep) are blank-imported so the registry
+  covers every accepted sticker format. A file whose dimensions can't be read is
+  rejected. The pointer is reset afterward so the upload copy is unaffected.
 - **`modules/sticker` registration guard** (touches: `auth`, `acl`,
   `wire-contract`) — `add` keeps `validateStickerPath` ALWAYS (defense in depth)
   and, when `stickersig.Enabled()`, additionally requires a valid handle. Both
@@ -64,8 +77,11 @@ is independent of every other use of that master key.
   and grants no capability the uploader lacks. No timestamp is signed.
 - Pinning the storage host/origin — unchanged from #508; the handle makes host
   pinning unnecessary for provenance.
-- Decode-time resolution/pixel-dimension cap (decompression-bomb defense) —
-  tracked separately; the handle does not address it.
+- Server-side transcoding/normalization/resizing of oversized stickers — they
+  are rejected, not down-scaled (validate-and-store only, per the parent task).
+- Animated-frame-count / total-pixel-budget limits beyond the per-side cap — the
+  512² cap plus the 1MB byte cap bound worst-case memory; finer budgeting is not
+  attempted here.
 - Deriving the stored extension from magic bytes rather than filename — the
   upload already validates content against the declared ext via
   `ValidateMagicNumber`, and `validateStickerPath` pins `path-ext == format`.
@@ -78,6 +94,10 @@ is independent of every other use of that master key.
 - `modules/file`: a `type=sticker` upload returns a `sticker_handle` that
   verifies for `(uploaderUID, returned path)` and not for a different uid; a
   non-sticker upload carries no handle.
+- `modules/file`: a `type=sticker` upload whose decoded dimensions exceed 512 on
+  either side is rejected (tested at 513×513, 600×10, 10×600); exactly 512×512 is
+  accepted; a real webp decodes and is accepted (proving webp registration), so
+  the cap never silently rejects a valid webp.
 - `modules/sticker` (integration, DB-backed): a shape-valid path is accepted
   WITH a valid handle and refused WITHOUT one or with a tampered one; the forged
   tail-match path `…/chat/sticker/{uid}/x.gif` passes the shape check yet is

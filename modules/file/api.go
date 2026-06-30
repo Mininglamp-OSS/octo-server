@@ -5,6 +5,12 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"image"
+	// Register the raster decoders so image.DecodeConfig can read W×H for the
+	// sticker dimension guard (header-only, no full bitmap decode).
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
 	"mime"
 	"net/http"
@@ -22,6 +28,7 @@ import (
 	pkgutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
+	_ "golang.org/x/image/webp" // register webp for image.DecodeConfig
 )
 
 // File 文件操作
@@ -242,6 +249,31 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 		f.Error("重置文件指针失败", zap.Error(err))
 		c.ResponseError(errors.New("文件处理失败"))
 		return
+	}
+
+	// 自定义贴纸：限制解码后的像素尺寸。StickerMaxFileSize(1MB) 只约束压缩后的
+	// 字节数，不约束解码维度——一张高压缩比的小文件可解出极大位图把内联渲染端
+	// 撑爆内存，而贴纸会发送给会话对方，等同跨用户 DoS。用 image.DecodeConfig 只读
+	// 图像头拿 W×H（不解整图），任一边超过 StickerMaxDimension(512) 即拒。此时 ext
+	// 已限定在 gif/png/jpg/jpeg/webp，对应解码器均已注册。
+	if Type(fileType) == TypeSticker {
+		cfg, _, decErr := image.DecodeConfig(file)
+		if decErr != nil {
+			f.Warn("贴纸无法解析图像尺寸", zap.String("ext", ext), zap.Error(decErr))
+			c.ResponseError(errors.New("无法解析贴纸图像，可能已损坏或格式不受支持"))
+			return
+		}
+		if cfg.Width > StickerMaxDimension || cfg.Height > StickerMaxDimension {
+			f.Warn("贴纸尺寸超出限制", zap.Int("width", cfg.Width), zap.Int("height", cfg.Height), zap.Int("max", StickerMaxDimension))
+			c.ResponseError(fmt.Errorf("贴纸尺寸不能超过 %d×%d 像素", StickerMaxDimension, StickerMaxDimension))
+			return
+		}
+		// DecodeConfig 读掉了图像头，复位指针供后续签名/上传读取完整内容。
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			f.Error("重置文件指针失败", zap.Error(err))
+			c.ResponseError(errors.New("文件处理失败"))
+			return
+		}
 	}
 
 	contentType = inferContentType(contentType, ext)

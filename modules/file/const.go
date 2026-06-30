@@ -41,7 +41,7 @@ var fileMagicNumbers = map[string][][]byte{
 	".wav":  {{0x52, 0x49, 0x46, 0x46}},                                                   // RIFF
 	".flac": {{0x66, 0x4C, 0x61, 0x43}},                                                   // fLaC
 	".ogg":  {{0x4F, 0x67, 0x67, 0x53}},                                                   // OggS
-	".m4a":  {}, // ftyp container, handled separately
+	".m4a":  {},                                                                           // ftyp container, handled separately
 	".aac":  {{0xFF, 0xF1}, {0xFF, 0xF9}},
 	// 视频
 	".mp4":  {}, // ftyp container, handled separately
@@ -138,6 +138,12 @@ const MaxFileSize int64 = 100 * 1024 * 1024
 // StickerMaxFileSize 自定义贴纸单文件上限（1MB）。贴纸是高频内联渲染的小图，
 // 收紧到 1MB（对标业界：Discord 贴纸 512KB、微信 ~1MB），避免大图占用与卡顿。
 const StickerMaxFileSize int64 = 1 * 1024 * 1024
+
+// StickerMaxDimension 自定义贴纸解码后单边像素上限（512×512）。文件大小上限并不
+// 约束解码维度：一张高压缩比的小文件可解出极大位图（decompression bomb），把内联
+// 渲染端的内存撑爆——而贴纸会发送给会话对方，等于跨用户 DoS。上传时用
+// image.DecodeConfig 只读图像头拿 W×H（不解整图）并卡死此上限。
+const StickerMaxDimension = 512
 
 // stickerUploadExts 自定义贴纸允许的存储扩展名（位图）。Lottie/TGS 不在其列：
 // 用户无法自制，留给内置动画贴纸。
