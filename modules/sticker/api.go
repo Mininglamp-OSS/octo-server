@@ -35,12 +35,22 @@ type Sticker struct {
 // New 创建 Sticker 实例。settings 走进程内共享单例，配额变更（管理端写
 // system_setting）经其 60s 快照在多实例间收敛。
 func New(ctx *config.Context) *Sticker {
-	return &Sticker{
+	s := &Sticker{
 		ctx:      ctx,
 		Log:      log.NewTLog("Sticker"),
 		db:       newStickerDB(ctx),
 		settings: commonmod.EnsureSystemSettings(ctx),
 	}
+	// 运营可见性：上传句柄（stickersig）是阻断「跨 type / 他人 / 外部对象注册成贴纸」
+	// 的强保护，仅当 OCTO_MASTER_KEY 配成恰好 32 字节时生效；否则 add() 退化为仅路径
+	// 形状校验。把这个降级姿态在启动时打一条 WARN，使「未配 / 配错长度」对运营可见，
+	// 而不是埋在 leaf 包的注释里。一次性、进程级；未配 key 是 brief 记录的受支持部署，
+	// 但安全降级仍值得提示。
+	if !stickersig.Enabled() {
+		s.Warn("OCTO_MASTER_KEY 未配置或非恰好 32 字节：自定义贴纸上传句柄校验已禁用，" +
+			"注册退化为仅路径形状校验（配置 32 字节 OCTO_MASTER_KEY 可启用密码学来源绑定）")
+	}
+	return s
 }
 
 // Route 路由配置。所有路由经 AuthMiddleware（个人维度，按 login uid 隔离），

@@ -83,6 +83,33 @@ func TestDisabled_WhenNoMasterKey(t *testing.T) {
 	}
 }
 
+// A master key that is not exactly 32 bytes is treated as unconfigured, mirroring
+// modules/common's exact-32 contract (key_encryption.go). A short value would
+// yield a low-entropy HMAC subkey, so we disable (fall back to the shape check)
+// rather than mint a brute-forceable handle; an over-length value is likewise
+// rejected so there is a single definition of a valid OCTO_MASTER_KEY.
+func TestDisabled_WhenMasterKeyWrongLength(t *testing.T) {
+	cases := map[string]string{
+		"too short": "short",
+		"31 bytes":  "0123456789abcdef0123456789abcde",   // one short of 32
+		"33 bytes":  "0123456789abcdef0123456789abcdef0", // one over 32
+	}
+	for name, key := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(masterKeyEnv, key)
+			if Enabled() {
+				t.Fatalf("Enabled() is true for a %d-byte key", len(key))
+			}
+			if _, ok := Sign("10000", "file/preview/sticker/10000/abc.png"); ok {
+				t.Fatal("Sign returned ok=true for a wrong-length key")
+			}
+			if Verify("10000", "file/preview/sticker/10000/abc.png", "anything") {
+				t.Fatal("Verify accepted a handle with a wrong-length key")
+			}
+		})
+	}
+}
+
 // A handle minted under one master key must not verify under another (e.g. after
 // a key rotation), confirming the subkey actually binds to OCTO_MASTER_KEY.
 func TestVerify_RejectsHandleFromDifferentKey(t *testing.T) {

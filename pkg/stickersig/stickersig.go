@@ -2,7 +2,7 @@
 // proves a custom-sticker object was produced by a specific user's
 // content-validated upload.
 //
-// Why this exists
+// # Why this exists
 //
 // A custom sticker is registered (POST /v1/sticker/user) by handing the server
 // a `path` that a prior multipart upload (GET/POST /v1/file/upload?type=sticker)
@@ -21,17 +21,17 @@
 // bypass and the other-user / foreign-host cases are all refused regardless of
 // the path's shape.
 //
-// Key material
+// # Key material
 //
 // The HMAC key is derived from OCTO_MASTER_KEY (the same 32-byte master key
 // modules/common requires at boot) via one HMAC-SHA256 pass over a fixed
 // domain-separation label, so the sticker-handle subkey is independent of every
 // other use of the master key (e.g. common's AES-GCM key encryption): a handle
 // can never be confused with — or forged from — another subsystem's MAC. When
-// OCTO_MASTER_KEY is unset, signing is disabled (Enabled reports false) and
-// callers fall back to the non-cryptographic path-shape check — the same posture
-// as before handles existed, so deployments without a master key are not
-// regressed.
+// OCTO_MASTER_KEY is unset or not exactly 32 bytes, signing is disabled (Enabled
+// reports false) and callers fall back to the non-cryptographic path-shape check
+// — the same posture as before handles existed, so deployments without a master
+// key are not regressed.
 package stickersig
 
 import (
@@ -55,11 +55,19 @@ const masterKeyEnv = "OCTO_MASTER_KEY"
 // invalidates any in-flight handle (the client re-uploads).
 var derivationLabel = []byte("octo/sticker-upload-handle/v1")
 
-// subkey derives the HMAC key from the master key, or returns nil when no master
-// key is configured.
+// subkey derives the HMAC key from the master key, or returns nil when no usable
+// master key is configured. A master key is usable only when it is exactly 32
+// bytes — the same contract modules/common enforces for its AES-256-GCM key
+// (key_encryption.go rejects len != 32). Mirroring it here keeps ONE definition
+// of "valid OCTO_MASTER_KEY" across subsystems and stops a short, low-entropy
+// value from minting brute-forceable handles: a wrong-length key is treated
+// exactly like an unset one (signing disabled → callers fall back to the
+// path-shape check). common validates lazily (on first encrypt/decrypt), so a
+// deployment that sets a malformed key but never exercises key-encryption would
+// otherwise reach this code with a weak key.
 func subkey() []byte {
 	master := os.Getenv(masterKeyEnv)
-	if master == "" {
+	if len(master) != 32 {
 		return nil
 	}
 	mac := hmac.New(sha256.New, []byte(master))
@@ -68,8 +76,9 @@ func subkey() []byte {
 }
 
 // Enabled reports whether handle signing/verification is active, i.e. whether
-// OCTO_MASTER_KEY is configured. sticker.add uses this to decide between the
-// cryptographic handle check (enabled) and the path-shape fallback (disabled).
+// OCTO_MASTER_KEY is configured as a usable (exactly 32-byte) key. sticker.add
+// uses this to decide between the cryptographic handle check (enabled) and the
+// path-shape fallback (disabled).
 func Enabled() bool {
 	return subkey() != nil
 }
