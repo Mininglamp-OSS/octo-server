@@ -3,9 +3,11 @@ package common
 import (
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
@@ -51,9 +53,11 @@ var (
 // handler 也会调用它,首次之后是 no-op。
 func loadEmojiManifest() {
 	emojiManifestOnce.Do(func() {
-		if err := json.Unmarshal(emojiManifestJSON, &emojiManifestValue); err != nil {
-			panic(fmt.Errorf("common: parse embedded emoji manifest: %w", err))
+		m, err := parseEmojiManifest(emojiManifestJSON)
+		if err != nil {
+			panic(fmt.Errorf("common: invalid embedded emoji manifest: %w", err))
 		}
+		emojiManifestValue = m
 		// 内容相关弱 ETag:把 version + 每个条目的 key/name/url 都作为因子,清单任一改动即
 		// ETag 变 → 已缓存客户端 revalidate 到新清单(不会被 max-age 钉死旧表)。
 		parts := make([]string, 0, len(emojiManifestValue.List)*3+1)
@@ -63,6 +67,42 @@ func loadEmojiManifest() {
 		}
 		emojiManifestETag = avatarrender.ETag(parts...)
 	})
+}
+
+// parseEmojiManifest 解析内嵌清单并做语义校验(纯函数,便于单测)。除 JSON 合法外还要求:
+// version>=1、list 非空、每个 key 是 [xxx] token、key 全局唯一、name 非空。任一不满足即返回
+// error,由 loadEmojiManifest 在启动期 panic —— 即便将来 manifest 被改坏且测试被弱化,也能
+// fail-fast,守住"无运行时错误分支"的前提。URL 允许为空(内置表情复用本地图),不在校验之列。
+func parseEmojiManifest(data []byte) (emojiManifestResp, error) {
+	var m emojiManifestResp
+	if err := json.Unmarshal(data, &m); err != nil {
+		return emojiManifestResp{}, fmt.Errorf("parse json: %w", err)
+	}
+	if m.Version < 1 {
+		return emojiManifestResp{}, fmt.Errorf("version must be >= 1, got %d", m.Version)
+	}
+	if len(m.List) == 0 {
+		return emojiManifestResp{}, errors.New("list must not be empty")
+	}
+	seen := make(map[string]struct{}, len(m.List))
+	for i, e := range m.List {
+		if !isEmojiToken(e.Key) {
+			return emojiManifestResp{}, fmt.Errorf("list[%d] key %q must be a [xxx] token", i, e.Key)
+		}
+		if _, dup := seen[e.Key]; dup {
+			return emojiManifestResp{}, fmt.Errorf("duplicate key %q", e.Key)
+		}
+		seen[e.Key] = struct{}{}
+		if e.Name == "" {
+			return emojiManifestResp{}, fmt.Errorf("list[%d] (%s) has empty name", i, e.Key)
+		}
+	}
+	return m, nil
+}
+
+// isEmojiToken 报告 s 是否为 [xxx] 形式的消息正文 token:以 [ 开头、] 结尾,中间非空且不含 ]。
+func isEmojiToken(s string) bool {
+	return len(s) >= 3 && s[0] == '[' && s[len(s)-1] == ']' && !strings.Contains(s[1:len(s)-1], "]")
 }
 
 // emojiManifest 返回内置自定义表情清单(公开、无鉴权)。客户端启动时拉取并按 version 缓存,

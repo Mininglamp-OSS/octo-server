@@ -39,6 +39,29 @@ func TestEmojiManifest_Embedded(t *testing.T) {
 	assert.Equal(t, wantKeys, gotKeys, "内置表情集合/顺序与真源一致")
 }
 
+// TestParseEmojiManifest_Validation 锁定启动期语义校验:合法清单通过,各类非法清单(坏 JSON、
+// version<1、空 list、非 [xxx] token、重复 key、空 name)都被拒 —— 即便将来 manifest 被改坏
+// 且 endpoint 测试被弱化,New() 里的 loadEmojiManifest 也会 fail-fast。
+func TestParseEmojiManifest_Validation(t *testing.T) {
+	if _, err := parseEmojiManifest([]byte(`{"version":1,"list":[{"key":"[a]","name":"A","url":""}]}`)); err != nil {
+		t.Fatalf("valid manifest should parse, got: %v", err)
+	}
+	bad := map[string]string{
+		"bad json":      `{`,
+		"version < 1":   `{"version":0,"list":[{"key":"[a]","name":"A","url":""}]}`,
+		"empty list":    `{"version":1,"list":[]}`,
+		"empty key":     `{"version":1,"list":[{"key":"","name":"A","url":""}]}`,
+		"non-token key": `{"version":1,"list":[{"key":"a","name":"A","url":""}]}`,
+		"empty name":    `{"version":1,"list":[{"key":"[a]","name":"","url":""}]}`,
+		"duplicate key": `{"version":1,"list":[{"key":"[a]","name":"A","url":""},{"key":"[a]","name":"B","url":""}]}`,
+	}
+	for name, body := range bad {
+		if _, err := parseEmojiManifest([]byte(body)); err == nil {
+			t.Errorf("%s: expected validation error, got nil", name)
+		}
+	}
+}
+
 // newEmojiTestRouter 构造一个仅挂载 emoji 清单公开路由的最小 wkhttp 路由。emojiManifest
 // 不读取任何 *Common 字段,故零值 &Common{} 即可,无需 DB/Redis —— 让本地与 CI 都能跑。
 func newEmojiTestRouter() *wkhttp.WKHttp {
