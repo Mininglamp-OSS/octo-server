@@ -11,6 +11,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/message"
 	"github.com/Mininglamp-OSS/octo-server/modules/robot"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
@@ -36,6 +37,11 @@ type BotAPI struct {
 	groupService  group.IService
 	userDB        *user.DB
 	threadService thread.IService
+	// messageService resolves whether a message_id actually belongs to a
+	// channel, so the reaction handler can reject cross-channel message ids
+	// (see messageChannelChecker / applyReaction). Narrow interface, satisfied
+	// by *message.Service, to avoid widening message.IService for external fakes.
+	messageService messageChannelChecker
 	// robotService gives the OBO fan-out path a way to enqueue synthetic
 	// events directly into a grantee bot's /v1/bot/events queue. The
 	// webhook layer drops NoPersist=1 messages before NotifyMessagesListeners
@@ -125,6 +131,10 @@ type BotAPI struct {
 	// reactionStoreOverride — #111 Sprint B. Test seam letting handler-level
 	// tests drive applyReaction with a fake store (no live DB). Nil in prod.
 	reactionStoreOverride reactionStorer
+	// messageExistsOverride — #111 Sprint B. Test seam for the cross-channel
+	// reaction guard: handler-level tests inject message existence without a
+	// live message store. Nil in prod (goes through ba.messageService).
+	messageExistsOverride func(channelID string, channelType uint8, messageID string) (bool, error)
 	// friendCheckOverride lets unit tests stub userService.IsFriend for the
 	// friend-gate decision in checkSendPermission / syncMessages, and for
 	// the OBO friend-gate bypass (see obo_friend_gate.go). Production path
@@ -188,6 +198,7 @@ func NewBotAPI(ctx *config.Context) *BotAPI {
 		groupService:          group.NewService(ctx),
 		userDB:                user.NewDB(ctx),
 		threadService:         thread.NewService(ctx),
+		messageService:        message.NewService(ctx),
 		robotService:          robot.NewService(ctx),
 		speechClient:          voice_adapter.NewSpeechClient(speechURL, speechKey, time.Duration(timeoutSec)*time.Second),
 		maxVoiceContextLength: maxCtxLen,

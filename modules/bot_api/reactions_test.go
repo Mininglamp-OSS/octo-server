@@ -256,6 +256,7 @@ func TestReaction_Handler_DM_AddBroadcastsOriginalChannelID(t *testing.T) {
 		Log:                   log.NewTLog("BotAPI-reaction-test"),
 		reactionCMDDispatch:   cap.hook,
 		reactionStoreOverride: fs,
+		messageExistsOverride: func(string, uint8, string) (bool, error) { return true, nil },
 	}
 	peer := "u_bob"
 	// User Bot DM where the peer is the bot's creator → permission passes via
@@ -290,6 +291,7 @@ func TestReaction_Handler_NoOpSkipsCMD(t *testing.T) {
 		Log:                   log.NewTLog("BotAPI-reaction-test"),
 		reactionCMDDispatch:   cap.hook,
 		reactionStoreOverride: fs,
+		messageExistsOverride: func(string, uint8, string) (bool, error) { return true, nil },
 	}
 	peer := "u_bob"
 	c := buildReactionCtx(t, "bot1", BotKindUser, "m1",
@@ -297,6 +299,34 @@ func TestReaction_Handler_NoOpSkipsCMD(t *testing.T) {
 	ba.addReaction(c)
 	if cap.called {
 		t.Fatal("re-adding the same emoji is a no-op and must not broadcast a CMD")
+	}
+}
+
+// TestReaction_Handler_MessageNotInChannel_Rejected — a bot with send
+// permission to the request channel must NOT be able to react to a message_id
+// that does not belong to that channel (cross-channel reaction injection
+// guard). No store write, no CMD broadcast.
+func TestReaction_Handler_MessageNotInChannel_Rejected(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cap := &reactionCMDCapture{}
+	fs := &fakeReactionStore{}
+	ba := &BotAPI{
+		Log:                   log.NewTLog("BotAPI-reaction-test"),
+		reactionCMDDispatch:   cap.hook,
+		reactionStoreOverride: fs,
+		// Permission passes (peer == bot creator), but the message does not
+		// live in this conversation.
+		messageExistsOverride: func(string, uint8, string) (bool, error) { return false, nil },
+	}
+	peer := "u_bob"
+	c := buildReactionCtx(t, "bot1", BotKindUser, "m_in_other_channel",
+		[]byte(`{"channel_id":"`+peer+`","channel_type":1,"emoji":"👍"}`), "", peer)
+	ba.addReaction(c)
+	if cap.called {
+		t.Fatal("must not broadcast a CMD for a message_id that is not in this channel")
+	}
+	if fs.inserted != nil || fs.updated != nil {
+		t.Fatalf("must not write a reaction row for a cross-channel message_id, got inserted=%+v updated=%+v", fs.inserted, fs.updated)
 	}
 }
 

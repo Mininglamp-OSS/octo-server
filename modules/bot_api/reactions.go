@@ -82,6 +82,23 @@ func (ba *BotAPI) removeReaction(c *wkhttp.Context) {
 	ba.applyReaction(c, messageID, channelID, channelType, emoji, true)
 }
 
+// messageChannelChecker is the narrow slice of message.Service the reaction
+// handler depends on: confirm a message_id belongs to a (channel_id, type).
+// Kept local (not message.IService) so adding it never forces external
+// IService fakes to grow a method.
+type messageChannelChecker interface {
+	MessageExistsInChannel(channelID string, channelType uint8, messageID string) (bool, error)
+}
+
+// messageExistsInChannel routes the cross-channel guard through the test seam
+// when set, else the live message service. Mirrors the other reaction seams.
+func (ba *BotAPI) messageExistsInChannel(channelID string, channelType uint8, messageID string) (bool, error) {
+	if ba.messageExistsOverride != nil {
+		return ba.messageExistsOverride(channelID, channelType, messageID)
+	}
+	return ba.messageService.MessageExistsInChannel(channelID, channelType, messageID)
+}
+
 // applyReaction is the shared add/remove state machine. Permission and the
 // channel-id store mapping mirror the user-facing reaction path so bot and
 // user reactions are indistinguishable to clients.
@@ -102,6 +119,28 @@ func (ba *BotAPI) applyReaction(c *wkhttp.Context, messageID, channelID string, 
 	// so reaction_users rows land in the same per-conversation bucket and the
 	// reaction seq stream is shared with the user path.
 	storeChannelID := resolveReactionStoreChannelID(channelID, channelType, robotID)
+
+	// Cross-channel guard: checkSendPermission only proved the bot may post to
+	// the REQUEST channel, but reaction_users rows are keyed by message_id and
+	// the message-load path joins reactions by message_id alone (no channel
+	// filter — see modules/message db_message_reaction.queryWithMessageIDs). So
+	// a bot could otherwise attach a reaction to a message in a channel it has
+	// no access to, just by knowing that message's id. Require the message to
+	// actually live in this conversation (storeChannelID matches the message
+	// table's per-conversation key, incl. the DM fake channel id) before any
+	// write or broadcast.
+	exists, err := ba.messageExistsInChannel(storeChannelID, channelType, messageID)
+	if err != nil {
+		ba.Error("校验消息归属失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+		return
+	}
+	if !exists {
+		// Not a message of this conversation — reject as invalid input without
+		// revealing whether it exists elsewhere.
+		respondBotAPIRequestInvalid(c, "message_id")
+		return
+	}
 
 	store := ba.newReactionStorer()
 	existing, err := store.queryByActorAndMessage(robotID, messageID)
