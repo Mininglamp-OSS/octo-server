@@ -1,6 +1,7 @@
 package file
 
 import (
+	"context"
 	"crypto/sha512"
 	"encoding/base64"
 	"errors"
@@ -15,6 +16,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -25,11 +27,20 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
+	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	"github.com/Mininglamp-OSS/octo-server/pkg/stickersig"
 	pkgutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
+	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"github.com/gin-gonic/gin"
+	rd "github.com/go-redis/redis"
 	"go.uber.org/zap"
 	_ "golang.org/x/image/webp" // register webp for image.DecodeConfig
+)
+
+const (
+	defaultStickerUploadIPRateLimitRPS   = 1.0
+	defaultStickerUploadIPRateLimitBurst = 60
+	stickerUploadRateLimitPoolSize       = 10
 )
 
 // File 文件操作
@@ -51,18 +62,50 @@ func New(ctx *config.Context) *File {
 // Route 路由
 func (f *File) Route(r *wkhttp.WKHttp) {
 	auth := r.Group("/v1/file", f.ctx.AuthMiddleware(r))
+	stickerUploadHandlers := f.stickerUploadHandlers(r)
 	{
 		// 获取文件（需认证，防止未授权访问用户文件）
 		auth.GET("/preview/*path", f.getFile)
 		//获取上传文件地址
 		auth.GET("/upload", f.getFilePath)
 		//上传文件
-		auth.POST("/upload", f.uploadFile)
+		auth.POST("/upload", stickerUploadHandlers...)
 		// 预签名上传 URL 签发
 		auth.GET("/upload/presigned", f.getUploadCredentials)
 		auth.GET("/upload/credentials", f.getUploadCredentials) // 兼容旧路径
 		// 预签名下载 URL
 		auth.GET("/download/url", f.getDownloadURL)
+	}
+}
+
+func (f *File) stickerUploadHandlers(r *wkhttp.WKHttp) []wkhttp.HandlerFunc {
+	handlers := make([]wkhttp.HandlerFunc, 0, 3)
+	if stickerUploadIPRateLimitEnabled() {
+		rps := wkhttp.ParseRPSFromEnv("DM_API_STICKER_UPLOAD_IP_RATELIMIT_RPS", defaultStickerUploadIPRateLimitRPS)
+		burst := wkhttp.ParseBurstFromEnv("DM_API_STICKER_UPLOAD_IP_RATELIMIT_BURST", defaultStickerUploadIPRateLimitBurst)
+		client := octoredis.NewInstrumentedClient(f.ctx.GetConfig(), func(o *rd.Options) {
+			o.MaxRetries = 1
+			o.PoolSize = stickerUploadRateLimitPoolSize
+		})
+		handlers = append(handlers, stickerOnlyLimiter(r.StrictIPRateLimitMiddleware(context.Background(), client, "sticker_upload", rps, burst)))
+	}
+	handlers = append(handlers, stickerOnlyLimiter(appwkhttp.SharedUIDRateLimiter(r, f.ctx)))
+	handlers = append(handlers, f.uploadFile)
+	return handlers
+}
+
+func stickerUploadIPRateLimitEnabled() bool {
+	v := strings.TrimSpace(os.Getenv("DM_API_STICKER_UPLOAD_IP_RATELIMIT_ENABLED"))
+	return v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
+}
+
+func stickerOnlyLimiter(limiter wkhttp.HandlerFunc) wkhttp.HandlerFunc {
+	return func(c *wkhttp.Context) {
+		if Type(c.Query("type")) != TypeSticker {
+			c.Next()
+			return
+		}
+		limiter(c)
 	}
 }
 
@@ -145,13 +188,16 @@ func (f *File) getFilePath(c *wkhttp.Context) {
 func (f *File) uploadFile(c *wkhttp.Context) {
 	uploadPath := c.Query("path")
 	fileType := c.Query("type")
+	typedFile := Type(fileType)
+	isStickerUpload := typedFile == TypeSticker
+	loginUID := c.GetLoginUID()
 	signature := c.Query("signature") // 是否返回签名
 	var signatureInt int64 = 0
 	if signature != "" {
 		signatureInt, _ = strconv.ParseInt(signature, 10, 64)
 	}
 	contentType := c.DefaultPostForm("contenttype", "application/octet-stream")
-	err := f.checkReq(Type(fileType), uploadPath)
+	err := f.checkReq(typedFile, uploadPath)
 	if err != nil {
 		c.ResponseError(err)
 		return
@@ -160,6 +206,9 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 		var sanitizeErr error
 		uploadPath, sanitizeErr = sanitizePath(uploadPath)
 		if sanitizeErr != nil {
+			if isStickerUpload {
+				observeStickerUpload("path_rejected")
+			}
 			c.ResponseError(errors.New("无效的文件路径"))
 			return
 		}
@@ -169,7 +218,7 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 	// violatesStickerKeyspace）。否则在 OSS.BucketName 等于该类型前缀的部署里，归一化
 	// 会把 type=chat&path=/sticker/{uid}/x 覆盖到合法贴纸的同一对象 key，且不使其
 	// upload handle 失效——keyed 态也能绕过贴纸门。在上传边界堵死该覆盖向量。
-	if violatesStickerKeyspace(Type(fileType), uploadPath) {
+	if violatesStickerKeyspace(typedFile, uploadPath) {
 		f.Warn("非贴纸上传不得写入 sticker/ keyspace",
 			zap.String("type", fileType), zap.String("path", uploadPath))
 		c.ResponseError(errors.New("无效的文件路径"))
@@ -181,11 +230,13 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 	// 故已认证用户可用 path=/{victimUID}/{uuid}.ext 上传自己的合法图覆盖他人贴纸对象
 	// （字节变、URL 与受害者 handle 不变 → 跨用户内容劫持；贴纸 URL 会发给会话对端，
 	// key 可知）。在上传边界绑定 uid，闭合同类型跨用户覆盖（与上面跨类型覆盖同一 bug 类）。
-	if Type(fileType) == TypeSticker {
-		loginUID := c.GetLoginUID()
+	if isStickerUpload {
 		if loginUID == "" || !strings.HasPrefix(uploadPath, "/"+loginUID+"/") {
+			observeStickerUpload("path_rejected")
 			f.Warn("贴纸上传路径 uid 段与登录用户不一致",
-				zap.String("path", uploadPath), zap.String("uid", loginUID))
+				zap.String("path", uploadPath),
+				zap.String("uid", loginUID),
+				zap.Bool("handle_required", stickersig.Enabled()))
 			c.ResponseError(errors.New("无效的文件路径"))
 			return
 		}
@@ -196,6 +247,9 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 
 	file, fileHeader, err := c.Request.FormFile("file")
 	if err != nil {
+		if isStickerUpload {
+			observeStickerUpload("read_failed")
+		}
 		f.Error("读取文件失败！", zap.Error(err))
 		c.ResponseError(errors.New("读取文件失败！"))
 		return
@@ -204,6 +258,9 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 
 	// 文件大小检查
 	if fileHeader.Size > MaxFileSize {
+		if isStickerUpload {
+			observeStickerUpload("size_rejected")
+		}
 		f.Warn("文件大小超出限制", zap.Int64("size", fileHeader.Size), zap.Int64("max", MaxFileSize))
 		c.ResponseError(fmt.Errorf("文件大小不能超过%dMB", MaxFileSize/1024/1024))
 		return
@@ -211,8 +268,13 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 	// 自定义贴纸单独收紧上限（StickerMaxFileSize），贴纸是高频内联渲染的小图，
 	// 不应允许到通用 MaxFileSize。错误用 c.ResponseError 以与本（未迁移 i18n 的）
 	// file 模块其余响应保持一致。
-	if Type(fileType) == TypeSticker && fileHeader.Size > StickerMaxFileSize {
-		f.Warn("贴纸文件超出大小限制", zap.Int64("size", fileHeader.Size), zap.Int64("max", StickerMaxFileSize))
+	if isStickerUpload && fileHeader.Size > StickerMaxFileSize {
+		observeStickerUpload("size_rejected")
+		f.Warn("贴纸文件超出大小限制",
+			zap.String("uid", loginUID),
+			zap.Int64("size", fileHeader.Size),
+			zap.Int64("max", StickerMaxFileSize),
+			zap.Bool("handle_required", stickersig.Enabled()))
 		c.ResponseError(fmt.Errorf("贴纸大小不能超过%dMB", StickerMaxFileSize/1024/1024))
 		return
 	}
@@ -221,24 +283,39 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 	fileName := sanitizeFilename(fileHeader.Filename)
 	ext := strings.ToLower(filepath.Ext(fileName))
 	if ext == "" {
+		if isStickerUpload {
+			observeStickerUpload("format_rejected")
+		}
 		f.Warn("上传的文件没有扩展名", zap.String("filename", fileName))
 		c.ResponseError(errors.New("文件必须包含扩展名"))
 		return
 	}
 	if IsBlockedExtension(ext) {
+		if isStickerUpload {
+			observeStickerUpload("format_rejected")
+		}
 		f.Warn("上传了禁止的文件类型", zap.String("filename", fileName), zap.String("ext", ext))
 		c.ResponseError(fmt.Errorf("禁止上传%s类型的文件", ext))
 		return
 	}
 	if !IsAllowedExtension(ext) {
+		if isStickerUpload {
+			observeStickerUpload("format_rejected")
+		}
 		f.Warn("上传了不支持的文件类型", zap.String("filename", fileName), zap.String("ext", ext))
 		c.ResponseError(fmt.Errorf("不支持上传%s类型的文件", ext))
 		return
 	}
 	// 贴纸只接受位图格式（stickerUploadExts：gif/png/jpg/jpeg/webp）。全局
 	// allowlist 还允许 pdf/zip/mp4 等，不收紧会让非图对象落入 sticker 桶。
-	if Type(fileType) == TypeSticker && !stickerUploadExts[ext] {
-		f.Warn("贴纸不支持的格式", zap.String("filename", fileName), zap.String("ext", ext))
+	if isStickerUpload && !stickerUploadExts[ext] {
+		observeStickerUpload("format_rejected")
+		f.Warn("贴纸不支持的格式",
+			zap.String("uid", loginUID),
+			zap.String("filename", fileName),
+			zap.String("ext", ext),
+			zap.Int64("size", fileHeader.Size),
+			zap.Bool("handle_required", stickersig.Enabled()))
 		c.ResponseError(fmt.Errorf("贴纸仅支持 gif/png/jpg/jpeg/webp，不支持%s", ext))
 		return
 	}
@@ -258,6 +335,9 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 	magicHeader := make([]byte, 16)
 	n, err := file.Read(magicHeader)
 	if err != nil && err.Error() != "EOF" {
+		if isStickerUpload {
+			observeStickerUpload("read_failed")
+		}
 		f.Error("读取文件头部失败", zap.Error(err))
 		c.ResponseError(errors.New("读取文件失败"))
 		return
@@ -266,7 +346,14 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 
 	// 验证文件魔数是否与扩展名匹配
 	if !ValidateMagicNumber(ext, magicHeader) {
-		f.Warn("文件内容与扩展名不匹配", zap.String("filename", fileName), zap.String("ext", ext))
+		if isStickerUpload {
+			observeStickerUpload("magic_rejected")
+		}
+		f.Warn("文件内容与扩展名不匹配",
+			zap.String("uid", loginUID),
+			zap.String("filename", fileName),
+			zap.String("ext", ext),
+			zap.Int64("size", fileHeader.Size))
 		c.ResponseError(errors.New("文件内容与扩展名不匹配"))
 		return
 	}
@@ -278,11 +365,15 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 	// 会登记出「format=png / 实际是 gif」的错配元数据。此处是唯一同时掌握 path 与
 	// 已校验 ext 的点，收口使 format==pathExt==内容 ext 三者一致。错误用
 	// c.ResponseError 与本（未迁移 i18n 的）file 模块其余响应保持一致。
-	if Type(fileType) == TypeSticker {
+	if isStickerUpload {
 		pathExt := strings.ToLower(filepath.Ext(uploadPath))
 		if pathExt != ext {
+			observeStickerUpload("format_rejected")
 			f.Warn("贴纸存储路径扩展名与文件内容不一致",
-				zap.String("path_ext", pathExt), zap.String("content_ext", ext))
+				zap.String("uid", loginUID),
+				zap.String("path_ext", pathExt),
+				zap.String("content_ext", ext),
+				zap.Int64("size", fileHeader.Size))
 			c.ResponseError(errors.New("贴纸路径扩展名与文件内容不一致"))
 			return
 		}
@@ -290,6 +381,9 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 
 	// 重置文件指针到开头
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		if isStickerUpload {
+			observeStickerUpload("read_failed")
+		}
 		f.Error("重置文件指针失败", zap.Error(err))
 		c.ResponseError(errors.New("文件处理失败"))
 		return
@@ -300,20 +394,33 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 	// 撑爆内存，而贴纸会发送给会话对方，等同跨用户 DoS。用 image.DecodeConfig 只读
 	// 图像头拿 W×H（不解整图），任一边超过 StickerMaxDimension(512) 即拒。此时 ext
 	// 已限定在 gif/png/jpg/jpeg/webp，对应解码器均已注册。
-	if Type(fileType) == TypeSticker {
+	if isStickerUpload {
 		cfg, _, decErr := image.DecodeConfig(file)
 		if decErr != nil {
-			f.Warn("贴纸无法解析图像尺寸", zap.String("ext", ext), zap.Error(decErr))
+			observeStickerUpload("dimension_rejected")
+			f.Warn("贴纸无法解析图像尺寸",
+				zap.String("uid", loginUID),
+				zap.String("ext", ext),
+				zap.Int64("size", fileHeader.Size),
+				zap.Error(decErr))
 			c.ResponseError(errors.New("无法解析贴纸图像，可能已损坏或格式不受支持"))
 			return
 		}
 		if cfg.Width > StickerMaxDimension || cfg.Height > StickerMaxDimension {
-			f.Warn("贴纸尺寸超出限制", zap.Int("width", cfg.Width), zap.Int("height", cfg.Height), zap.Int("max", StickerMaxDimension))
+			observeStickerUpload("dimension_rejected")
+			f.Warn("贴纸尺寸超出限制",
+				zap.String("uid", loginUID),
+				zap.String("ext", ext),
+				zap.Int64("size", fileHeader.Size),
+				zap.Int("width", cfg.Width),
+				zap.Int("height", cfg.Height),
+				zap.Int("max", StickerMaxDimension))
 			c.ResponseError(fmt.Errorf("贴纸尺寸不能超过 %d×%d 像素", StickerMaxDimension, StickerMaxDimension))
 			return
 		}
 		// DecodeConfig 读掉了图像头，复位指针供后续签名/上传读取完整内容。
 		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			observeStickerUpload("read_failed")
 			f.Error("重置文件指针失败", zap.Error(err))
 			c.ResponseError(errors.New("文件处理失败"))
 			return
@@ -343,6 +450,9 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 		h := sha512.New()
 		_, err := io.Copy(h, file)
 		if err != nil {
+			if isStickerUpload {
+				observeStickerUpload("read_failed")
+			}
 			f.Error("签名复制文件错误", zap.Error(err))
 			c.ResponseError(errors.New("签名复制文件错误"))
 			return
@@ -360,6 +470,9 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 		return err
 	})
 	if err != nil {
+		if isStickerUpload {
+			observeStickerUpload("upload_failed")
+		}
 		f.Error("上传文件失败！", zap.Error(err))
 		c.ResponseError(errors.New("上传文件失败！"))
 		return
@@ -386,11 +499,20 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 	// (上传者 uid, 存储 path) 并随响应下发；sticker.add 校验它即可证明该对象确由
 	// 本人经贴纸上传产生，杜绝把 type=chat(100MB/宽松白名单)/他人/外部对象注册成
 	// 贴纸。未配置 OCTO_MASTER_KEY 时不下发，sticker 侧回退到路径形状校验（不回归）。
-	if Type(fileType) == TypeSticker {
+	if isStickerUpload {
 		if handle, ok := stickersig.Sign(c.GetLoginUID(), fullURL); ok {
 			resp["sticker_handle"] = handle
 			metrics.ObserveStickerUploadHandleIssued()
+			observeStickerUploadHandle("issued")
+		} else {
+			observeStickerUploadHandle("disabled")
 		}
+		observeStickerUpload("success")
+		f.Info("贴纸上传成功",
+			zap.String("uid", loginUID),
+			zap.String("format", strings.TrimPrefix(ext, ".")),
+			zap.Int64("size", fileHeader.Size),
+			zap.Bool("handle_required", stickersig.Enabled()))
 	}
 	c.Response(resp)
 }

@@ -98,6 +98,7 @@ func (s *Sticker) Route(r *wkhttp.WKHttp) {
 	{
 		auth.GET("/user", s.list)
 		auth.POST("/user", s.add)
+		auth.PUT("/user/:sticker_id", s.update)
 		auth.DELETE("/user/:sticker_id", s.delete)
 	}
 }
@@ -128,19 +129,23 @@ func (s *Sticker) add(ctx *wkhttp.Context) {
 
 	var req addStickerReq
 	if err := ctx.BindJSON(&req); err != nil {
+		observeStickerRegister("validation_failed")
 		respondStickerRequestInvalid(ctx, "")
 		return
 	}
 	if req.Path == "" {
+		observeStickerRegister("validation_failed")
 		respondStickerRequestInvalid(ctx, "path")
 		return
 	}
 	if len(req.Path) > maxStickerPathLen {
+		observeStickerRegister("validation_failed")
 		respondStickerRequestInvalid(ctx, "path")
 		return
 	}
 	format := normalizeStickerFormat(req.Format)
 	if !isAllowedStickerFormat(format) {
+		observeStickerRegister("validation_failed")
 		respondStickerFormatUnsupported(ctx, format)
 		return
 	}
@@ -175,6 +180,7 @@ func (s *Sticker) add(ctx *wkhttp.Context) {
 	enabled := stickersig.Enabled()
 	if required && !enabled {
 		metrics.ObserveStickerRegister(metrics.StickerRegisterRejectedNoCapability)
+		observeStickerRegister("no_capability")
 		s.Error("拒绝注册：sticker.handle_required=true 但 OCTO_MASTER_KEY 未配置或非恰好 32 字节，"+
 			"无签名能力无法校验 handle，fail-closed 拒绝；请配置 32 字节 OCTO_MASTER_KEY 或关闭 handle_required",
 			zap.String("uid", loginUID))
@@ -184,16 +190,19 @@ func (s *Sticker) add(ctx *wkhttp.Context) {
 	switch classifyStickerPath(req.Path, loginUID, format, req.Handle, enabled) {
 	case stickerPathInvalid:
 		metrics.ObserveStickerRegister(metrics.StickerRegisterRejectedPath)
+		observeStickerRegister("path_invalid")
 		respondStickerRequestInvalid(ctx, "path")
 		return
 	case stickerHandleInvalid:
 		metrics.ObserveStickerRegister(metrics.StickerRegisterRejectedInvalid)
+		observeStickerRegister("invalid_handle")
 		s.Warn("拒绝注册：贴纸 handle 非法或与 path 不匹配", zap.String("uid", loginUID))
 		respondStickerRequestInvalid(ctx, "path")
 		return
 	case stickerHandleMissing:
 		if required {
 			metrics.ObserveStickerRegister(metrics.StickerRegisterRejectedMissing)
+			observeStickerRegister("missing_handle")
 			s.Warn("拒绝注册：强制模式下缺少贴纸 handle", zap.String("uid", loginUID))
 			respondStickerRequestInvalid(ctx, "path")
 			return
@@ -209,6 +218,7 @@ func (s *Sticker) add(ctx *wkhttp.Context) {
 		// 给 stickerPathClass 加分类却漏处理，宁可拒绝并告警，也不默认放行落库。安全门控
 		// 不允许 fail-open）。
 		metrics.ObserveStickerRegister(metrics.StickerRegisterRejectedPath)
+		observeStickerRegister("path_invalid")
 		s.Error("拒绝注册：未识别的 path 分类（疑似漏处理的 stickerPathClass）", zap.String("uid", loginUID))
 		respondStickerRequestInvalid(ctx, "path")
 		return
@@ -218,7 +228,25 @@ func (s *Sticker) add(ctx *wkhttp.Context) {
 		placeholder = defaultStickerPlaceholder
 	}
 	if len([]rune(placeholder)) > maxStickerPlaceholderLen {
+		observeStickerRegister("validation_failed")
 		respondStickerRequestInvalid(ctx, "placeholder")
+		return
+	}
+	if req.Sort < 0 {
+		observeStickerRegister("validation_failed")
+		respondStickerRequestInvalid(ctx, "sort")
+		return
+	}
+	shortcode, ok := normalizeStickerShortcode(req.Shortcode)
+	if !ok {
+		observeStickerRegister("validation_failed")
+		respondStickerShortcodeInvalid(ctx)
+		return
+	}
+	keywordsStore, _, ok := normalizeStickerKeywords(req.Keywords)
+	if !ok {
+		observeStickerRegister("validation_failed")
+		respondStickerKeywordsInvalid(ctx)
 		return
 	}
 
@@ -228,6 +256,93 @@ func (s *Sticker) add(ctx *wkhttp.Context) {
 	// 超额。锁 user 行（唯一索引上的记录锁）而非对 sticker 子表 count(*) FOR UPDATE
 	// （非唯一索引 → gap 锁，首插死锁），见 db.go lockUserRowTx 说明。
 	max := s.settings.StickerUserMaxCount()
+
+	tx, err := s.ctx.DB().Begin()
+	if err != nil {
+		s.Error("开启事务失败", zap.Error(err))
+		observeStickerRegister("store_failed")
+		httperr.ResponseErrorL(ctx, errcode.ErrStickerStoreFailed, nil, nil)
+		return
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	if err := s.db.lockUserRowTx(tx, loginUID); err != nil {
+		s.Error("锁定用户行失败", zap.Error(err))
+		observeStickerRegister("store_failed")
+		httperr.ResponseErrorL(ctx, errcode.ErrStickerStoreFailed, nil, nil)
+		return
+	}
+
+	count, err := s.db.countByUIDTx(tx, loginUID)
+	if err != nil {
+		s.Error("查询贴纸数量失败", zap.Error(err))
+		observeStickerRegister("query_failed")
+		httperr.ResponseErrorL(ctx, errcode.ErrStickerQueryFailed, nil, nil)
+		return
+	}
+	if count >= max {
+		observeStickerRegister("quota_exceeded")
+		respondStickerQuotaExceeded(ctx, max)
+		return
+	}
+	conflict, err := s.db.shortcodeExistsTx(tx, loginUID, shortcode, "")
+	if err != nil {
+		s.Error("查询贴纸 shortcode 冲突失败", zap.Error(err), zap.String("uid", loginUID))
+		observeStickerRegister("query_failed")
+		httperr.ResponseErrorL(ctx, errcode.ErrStickerQueryFailed, nil, nil)
+		return
+	}
+	if conflict {
+		observeStickerRegister("shortcode_conflict")
+		respondStickerShortcodeConflict(ctx)
+		return
+	}
+
+	m := &StickerModel{
+		StickerID:   util.GenerUUID(),
+		UID:         loginUID,
+		Path:        req.Path,
+		Placeholder: placeholder,
+		Format:      format,
+		Sort:        req.Sort,
+		Shortcode:   shortcode,
+		Keywords:    keywordsStore,
+		Status:      1,
+	}
+	if err := s.db.insertTx(tx, m); err != nil {
+		s.Error("新增贴纸失败", zap.Error(err))
+		observeStickerRegister("store_failed")
+		httperr.ResponseErrorL(ctx, errcode.ErrStickerStoreFailed, nil, nil)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		s.Error("提交事务失败", zap.Error(err))
+		observeStickerRegister("store_failed")
+		httperr.ResponseErrorL(ctx, errcode.ErrStickerStoreFailed, nil, nil)
+		return
+	}
+
+	observeStickerRegister("success")
+	s.Info("贴纸注册成功",
+		zap.String("uid", loginUID),
+		zap.String("format", format),
+		zap.Bool("handle_required", stickersig.Enabled()),
+		zap.Bool("shortcode_set", shortcode != ""),
+		zap.Int("keyword_count", len(decodeStickerKeywords(keywordsStore))))
+	ctx.Response(toStickerResp(m))
+}
+
+// update partially updates the current user's sticker metadata. Missing fields
+// keep their previous values; empty placeholder restores the default fallback.
+func (s *Sticker) update(ctx *wkhttp.Context) {
+	loginUID := ctx.GetLoginUID()
+	stickerID := ctx.Param("sticker_id")
+
+	var req updateStickerReq
+	if err := ctx.BindJSON(&req); err != nil {
+		respondStickerRequestInvalid(ctx, "")
+		return
+	}
 
 	tx, err := s.ctx.DB().Begin()
 	if err != nil {
@@ -243,27 +358,65 @@ func (s *Sticker) add(ctx *wkhttp.Context) {
 		return
 	}
 
-	count, err := s.db.countByUIDTx(tx, loginUID)
+	m, err := s.db.queryByIDAndUIDTx(tx, stickerID, loginUID)
 	if err != nil {
-		s.Error("查询贴纸数量失败", zap.Error(err))
+		s.Error("查询贴纸失败", zap.Error(err), zap.String("sticker_id", stickerID), zap.String("uid", loginUID))
 		httperr.ResponseErrorL(ctx, errcode.ErrStickerQueryFailed, nil, nil)
 		return
 	}
-	if count >= max {
-		respondStickerQuotaExceeded(ctx, max)
+	if m == nil {
+		httperr.ResponseErrorL(ctx, errcode.ErrStickerNotFound, nil, nil)
 		return
 	}
 
-	m := &StickerModel{
-		StickerID:   util.GenerUUID(),
-		UID:         loginUID,
-		Path:        req.Path,
-		Placeholder: placeholder,
-		Format:      format,
-		Status:      1,
+	if req.Placeholder != nil {
+		placeholder := *req.Placeholder
+		if placeholder == "" {
+			placeholder = defaultStickerPlaceholder
+		}
+		if len([]rune(placeholder)) > maxStickerPlaceholderLen {
+			respondStickerRequestInvalid(ctx, "placeholder")
+			return
+		}
+		m.Placeholder = placeholder
 	}
-	if err := s.db.insertTx(tx, m); err != nil {
-		s.Error("新增贴纸失败", zap.Error(err))
+	if req.Sort != nil {
+		if *req.Sort < 0 {
+			respondStickerRequestInvalid(ctx, "sort")
+			return
+		}
+		m.Sort = *req.Sort
+	}
+	if req.Shortcode != nil {
+		shortcode, ok := normalizeStickerShortcode(*req.Shortcode)
+		if !ok {
+			respondStickerShortcodeInvalid(ctx)
+			return
+		}
+		m.Shortcode = shortcode
+	}
+	if req.Keywords != nil {
+		keywordsStore, _, ok := normalizeStickerKeywords(*req.Keywords)
+		if !ok {
+			respondStickerKeywordsInvalid(ctx)
+			return
+		}
+		m.Keywords = keywordsStore
+	}
+
+	conflict, err := s.db.shortcodeExistsTx(tx, loginUID, m.Shortcode, m.StickerID)
+	if err != nil {
+		s.Error("查询贴纸 shortcode 冲突失败", zap.Error(err), zap.String("uid", loginUID), zap.String("sticker_id", stickerID))
+		httperr.ResponseErrorL(ctx, errcode.ErrStickerQueryFailed, nil, nil)
+		return
+	}
+	if conflict {
+		respondStickerShortcodeConflict(ctx)
+		return
+	}
+
+	if err := s.db.updateMetadataTx(tx, m); err != nil {
+		s.Error("更新贴纸失败", zap.Error(err), zap.String("sticker_id", stickerID), zap.String("uid", loginUID))
 		httperr.ResponseErrorL(ctx, errcode.ErrStickerStoreFailed, nil, nil)
 		return
 	}

@@ -562,6 +562,38 @@ func TestGetUploadCredentials_FallbackWithoutFilename(t *testing.T) {
 	assert.Equal(t, "", mockSvc.lastContentDisp)
 }
 
+func TestStickerOnlyLimiterScopesToStickerUploads(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var hits int
+	limiter := func(c *wkhttp.Context) {
+		hits++
+		c.Header("X-Test-Limiter", "hit")
+		c.Next()
+	}
+	terminal := func(c *wkhttp.Context) {
+		c.Response(map[string]bool{"ok": true})
+	}
+	r := wkhttp.New()
+	r.POST("/v1/file/upload", stickerOnlyLimiter(limiter), terminal)
+
+	nonSticker := httptest.NewRecorder()
+	req, err := http.NewRequest(http.MethodPost, "/v1/file/upload?type=chat", nil)
+	require.NoError(t, err)
+	r.ServeHTTP(nonSticker, req)
+	require.Equal(t, http.StatusOK, nonSticker.Code)
+	assert.Equal(t, 0, hits)
+	assert.Empty(t, nonSticker.Header().Get("X-Test-Limiter"))
+
+	sticker := httptest.NewRecorder()
+	req, err = http.NewRequest(http.MethodPost, "/v1/file/upload?type=sticker", nil)
+	require.NoError(t, err)
+	r.ServeHTTP(sticker, req)
+	require.Equal(t, http.StatusOK, sticker.Code)
+	assert.Equal(t, 1, hits)
+	assert.Equal(t, "hit", sticker.Header().Get("X-Test-Limiter"))
+}
+
 func TestBuildContentDisposition_UsesInline(t *testing.T) {
 	// Verify that BuildContentDisposition uses "inline" not "attachment"
 	tests := []string{"report.pdf", "photo.jpg", "报告.pdf", "test file.txt"}

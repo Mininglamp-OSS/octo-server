@@ -32,6 +32,18 @@ var (
 		DefaultMessage: "Unsupported sticker format. Allowed: gif, png, jpg, jpeg, webp.",
 		SafeDetailKeys: []string{"field", "format"},
 	})
+	ErrStickerShortcodeInvalid = register(codes.Code{
+		ID:             "err.server.sticker.shortcode_invalid",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Invalid sticker shortcode.",
+		SafeDetailKeys: []string{"field"},
+	})
+	ErrStickerKeywordsInvalid = register(codes.Code{
+		ID:             "err.server.sticker.keywords_invalid",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Invalid sticker keywords.",
+		SafeDetailKeys: []string{"field"},
+	})
 
 	// ---- not found (404) -----------------------------------------------------
 
@@ -54,6 +66,12 @@ var (
 		HTTPStatus:     http.StatusConflict,
 		DefaultMessage: "You have reached the maximum number of custom stickers.",
 		SafeDetailKeys: []string{"max"},
+	})
+	ErrStickerShortcodeConflict = register(codes.Code{
+		ID:             "err.server.sticker.shortcode_conflict",
+		HTTPStatus:     http.StatusConflict,
+		DefaultMessage: "Sticker shortcode already exists.",
+		SafeDetailKeys: []string{"field"},
 	})
 
 	// ---- internal (500, Internal=true) ---------------------------------------

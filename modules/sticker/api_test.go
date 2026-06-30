@@ -372,7 +372,8 @@ func TestSticker_ShortcodeConflictScopedToUID(t *testing.T) {
 }
 
 func TestSticker_RegisterMetrics(t *testing.T) {
-	route, _, _ := setupSticker(t)
+	route, ctx, _ := setupSticker(t)
+	setStickerHandleRequired(t, ctx, true)
 
 	beforeMissing := promtestutil.ToFloat64(metricStickerRegisterTotal.WithLabelValues("missing_handle"))
 	w := doRequest(t, route, "POST", "/v1/sticker/user", map[string]string{

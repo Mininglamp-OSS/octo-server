@@ -792,6 +792,9 @@ other = "Invalid statistics request."
 ["err.server.sticker.format_unsupported"]
 other = "Unsupported sticker format. Allowed: gif, png, jpg, jpeg, webp."
 
+["err.server.sticker.keywords_invalid"]
+other = "Invalid sticker keywords."
+
 ["err.server.sticker.not_found"]
 other = "Sticker not found."
 
@@ -803,6 +806,12 @@ other = "You have reached the maximum number of custom stickers."
 
 ["err.server.sticker.request_invalid"]
 other = "Invalid request."
+
+["err.server.sticker.shortcode_conflict"]
+other = "Sticker shortcode already exists."
+
+["err.server.sticker.shortcode_invalid"]
+other = "Invalid sticker shortcode."
 
 ["err.server.sticker.store_failed"]
 other = "Failed to update sticker data."

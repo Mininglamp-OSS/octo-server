@@ -25,11 +25,13 @@ func (d *stickerDB) insert(m *StickerModel) error {
 	return err
 }
 
-// listByUID returns the user's live stickers, newest first.
+// listByUID returns the user's live stickers ordered by explicit sort first and
+// then newest-first for legacy/default sort=0 ties.
 func (d *stickerDB) listByUID(uid string) ([]*StickerModel, error) {
 	var models []*StickerModel
 	_, err := d.session.Select("*").From("sticker").
 		Where("uid=? and status=1", uid).
+		OrderAsc("sort").
 		OrderDesc("id").
 		Load(&models)
 	return models, err
@@ -78,12 +80,60 @@ func (d *stickerDB) countByUIDTx(tx *dbr.Tx, uid string) (int, error) {
 	return count, err
 }
 
+func (d *stickerDB) queryByIDAndUIDTx(tx *dbr.Tx, stickerID, uid string) (*StickerModel, error) {
+	var model *StickerModel
+	_, err := tx.Select("*").From("sticker").
+		Where("sticker_id=? and uid=? and status=1", stickerID, uid).
+		Load(&model)
+	if errors.Is(err, dbr.ErrNotFound) {
+		return nil, nil
+	}
+	return model, err
+}
+
 func (d *stickerDB) queryByID(stickerID string) (*StickerModel, error) {
 	var model *StickerModel
 	_, err := d.session.Select("*").From("sticker").
 		Where("sticker_id=? and status=1", stickerID).
 		Load(&model)
+	if errors.Is(err, dbr.ErrNotFound) {
+		return nil, nil
+	}
 	return model, err
+}
+
+func (d *stickerDB) shortcodeExistsTx(tx *dbr.Tx, uid, shortcode, excludeStickerID string) (bool, error) {
+	if shortcode == "" {
+		return false, nil
+	}
+	args := []interface{}{uid, shortcode}
+	sql := "SELECT sticker_id FROM sticker WHERE uid=? AND status=1 AND shortcode=?"
+	if excludeStickerID != "" {
+		sql += " AND sticker_id<>?"
+		args = append(args, excludeStickerID)
+	}
+	sql += " LIMIT 1"
+
+	var stickerID string
+	_, err := tx.SelectBySql(sql, args...).Load(&stickerID)
+	if errors.Is(err, dbr.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return stickerID != "", nil
+}
+
+func (d *stickerDB) updateMetadataTx(tx *dbr.Tx, m *StickerModel) error {
+	_, err := tx.Update("sticker").
+		Set("placeholder", m.Placeholder).
+		Set("sort", m.Sort).
+		Set("shortcode", m.Shortcode).
+		Set("keywords", m.Keywords).
+		Where("sticker_id=? and uid=? and status=1", m.StickerID, m.UID).
+		Exec()
+	return err
 }
 
 // softDelete marks the sticker deleted. The uid predicate is a defensive

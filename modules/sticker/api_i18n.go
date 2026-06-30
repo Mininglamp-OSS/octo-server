@@ -44,3 +44,21 @@ func respondStickerQuotaExceeded(ctx *wkhttp.Context, max int) {
 		"max": max,
 	})
 }
+
+func respondStickerShortcodeInvalid(ctx *wkhttp.Context) {
+	httperr.ResponseErrorL(ctx, errcode.ErrStickerShortcodeInvalid, nil, i18n.Details{
+		"field": "shortcode",
+	})
+}
+
+func respondStickerKeywordsInvalid(ctx *wkhttp.Context) {
+	httperr.ResponseErrorL(ctx, errcode.ErrStickerKeywordsInvalid, nil, i18n.Details{
+		"field": "keywords",
+	})
+}
+
+func respondStickerShortcodeConflict(ctx *wkhttp.Context) {
+	httperr.ResponseErrorL(ctx, errcode.ErrStickerShortcodeConflict, nil, i18n.Details{
+		"field": "shortcode",
+	})
+}

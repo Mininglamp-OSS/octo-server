@@ -628,11 +628,20 @@ other = "请求参数有误。"
 ["err.server.sticker.format_unsupported"]
 other = "不支持的贴纸格式，仅支持 gif、png、jpg、jpeg、webp。"
 
+["err.server.sticker.shortcode_invalid"]
+other = "贴纸快捷码格式有误。"
+
+["err.server.sticker.keywords_invalid"]
+other = "贴纸关键词格式有误。"
+
 ["err.server.sticker.not_found"]
 other = "贴纸不存在。"
 
 ["err.server.sticker.quota_exceeded"]
 other = "自定义贴纸数量已达上限。"
+
+["err.server.sticker.shortcode_conflict"]
+other = "贴纸快捷码已存在。"
 
 ["err.server.sticker.query_failed"]
 other = "查询贴纸数据失败。"
