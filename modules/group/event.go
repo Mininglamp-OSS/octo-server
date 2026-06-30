@@ -11,8 +11,6 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/pool"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
-	"github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
-	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"go.uber.org/zap"
 )
 
@@ -57,60 +55,34 @@ func (g *Group) handleGroupDisbandEvent(data []byte, commit config.EventCommit) 
 		})),
 	})
 	if err != nil {
-		// YUJ-4185 P1-1：解散提示是装饰性通知，best-effort 即可。绝不能因它失败就
-		// return —— 否则后续频道删除 / 子区订阅清理被跳过，群处于“半解散”状态：
-		// 成员仍订阅父群 / 子区频道，继续收消息（越权读）。只记日志，继续清理。
+		// 解散提示是装饰性通知，best-effort 即可，失败只记日志。
 		g.Error("发送解散群消息错误", zap.Error(err))
 	}
-	// 删除channel
-	err = g.ctx.IMDelChannel(&config.ChannelDeleteReq{
+	// WuKongIM disband flag 推送由 disband() 的第二阶段（api.go）同步负责
+	// （fail-closed，失败返回 500，客户端可重试走幂等分支）。
+	// 事件处理器不再重复推送 IM disband，避免每次解散做 2×(1+N) 次 WuKongIM RPC。
+	//
+	// 这里只负责：
+	//   1. 发送解散提示消息（上方已发送）
+	//   2. 发送 channelUpdate CMD 通知前端即时置灰
+	//
+	// 前端即时置灰：发 channelUpdate CMD，确保前端收到 CMD 后
+	// refetch channelInfo 拿到的是已解散态（disband=1）。前端 channelUpdate handler
+	// 会触发 Conversation 重渲染——收成员栏、置灰发送框、灰头像；子区会话由父群这条
+	// CMD 经前端 isParentGroup 分支覆盖。
+	err = g.ctx.SendCMD(config.MsgCMDReq{
 		ChannelID:   req.GroupNo,
 		ChannelType: common.ChannelTypeGroup.Uint8(),
+		CMD:         common.CMDChannelUpdate,
+		Param: map[string]interface{}{
+			"channel_id":   req.GroupNo,
+			"channel_type": common.ChannelTypeGroup.Uint8(),
+		},
 	})
 	if err != nil {
-		g.Error("删除IM频道失败", zap.Error(err))
-		commit(err)
-		return
+		// best-effort：CMD 失败只影响"即时置灰"，用户重进会话/刷新仍会拿到解散态。
+		g.Error("解散群发送 channelUpdate cmd 失败", zap.String("groupNo", req.GroupNo), zap.Error(err))
 	}
-	// YUJ-4185 P1-1：群解散必须连同所有子区(CommunityTopic)频道一起销毁，否则子区的
-	// IM 频道仍存活、成员订阅未摘 → 解散后成员仍能通过子区频道收/拉历史消息（越权读）。
-	// 直接 IMDelChannel 每个非删除子区频道（频道删除即断所有订阅），再清成员对子区的
-	// 置顶 / 会话扩展。best-effort：单个子区清理失败只记日志，不阻塞父群解散。
-	threadShortIDs, threadErr := queryThreadShortIDsForCleanup(g.ctx, req.GroupNo)
-	if threadErr != nil {
-		g.Error("查询群子区失败（解散清理）", zap.Error(threadErr), zap.String("groupNo", req.GroupNo))
-	}
-	for _, shortID := range threadShortIDs {
-		threadChannelID := req.GroupNo + "____" + shortID
-		if delErr := g.ctx.IMDelChannel(&config.ChannelDeleteReq{
-			ChannelID:   threadChannelID,
-			ChannelType: common.ChannelTypeCommunityTopic.Uint8(),
-		}); delErr != nil {
-			g.Error("删除子区IM频道失败（解散清理）", zap.Error(delErr), zap.String("channelID", threadChannelID))
-		}
-		user.RemovePinnedForChannel(threadChannelID, common.ChannelTypeCommunityTopic.Uint8())
-		conversation_ext.RemoveConvExtForChannel(threadChannelID, common.ChannelTypeCommunityTopic.Uint8())
-	}
-	// 删除该群所有子区的成员 / 个人设置行，避免解散后残留脏数据（频道已销毁，
-	// 这些行不再有意义）。best-effort：失败只记日志。
-	// 不 gate 在 len(threadShortIDs) > 0 上：对齐 removeUserFromGroupThreadsCleanup
-	// 的“不 gate 扫残留”约定 —— 用户可能只 mute 过子区而从未 JoinThread（Issue #331），
-	// 或子区已被删除（不在 queryThreadShortIDsForCleanup 的存活集合里）但 thread_member /
-	// thread_setting 仍有残留行。这两条 DELETE 按 group_no 直删，把残留一并清掉。
-	// req.GroupNo 非空已在函数开头守卫，子查询不会退化为全表。
-	if _, delErr := g.ctx.DB().DeleteFrom("thread_member").
-		Where("thread_id IN (SELECT id FROM thread WHERE group_no=?)", req.GroupNo).
-		Exec(); delErr != nil {
-		g.Error("删除子区成员记录失败（解散清理）", zap.Error(delErr), zap.String("groupNo", req.GroupNo))
-	}
-	if _, delErr := g.ctx.DB().DeleteFrom("thread_setting").
-		Where("group_no=?", req.GroupNo).
-		Exec(); delErr != nil {
-		g.Error("删除子区个人设置失败（解散清理）", zap.Error(delErr), zap.String("groupNo", req.GroupNo))
-	}
-	// 清理所有用户对该群的置顶
-	user.RemovePinnedForChannel(req.GroupNo, common.ChannelTypeGroup.Uint8())
-	conversation_ext.RemoveConvExtForChannel(req.GroupNo, common.ChannelTypeGroup.Uint8())
 	commit(nil)
 }
 
@@ -886,3 +858,4 @@ func (g *Group) handleOrgEmployeeExit(data []byte, commit config.EventCommit) {
 	}
 	commit(nil)
 }
+

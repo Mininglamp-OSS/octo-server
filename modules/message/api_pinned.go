@@ -12,6 +12,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
@@ -67,6 +68,17 @@ func (m *Message) pinnedMessage(c *wkhttp.Context) {
 		}
 		fakeChannelID = common.GetFakeChannelIDWith(loginUID, req.ChannelID)
 	} else if req.ChannelType == common.ChannelTypeGroup.Uint8() {
+		// 解散守卫（企业微信式只读）：群解散后禁止置顶/取消置顶。
+		disbanded, derr := m.isGroupDisbanded(req.ChannelID)
+		if derr != nil {
+			m.Error("查询群是否已解散错误", zap.Error(derr))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		if disbanded {
+			httperr.ResponseErrorL(c, errcode.ErrMessageGroupDisbanded, nil, nil)
+			return
+		}
 		groupInfo, err := m.groupService.GetGroupDetail(req.ChannelID, loginUID)
 		if err != nil {
 			m.Error("查询群组信息错误", zap.Error(err))
@@ -85,6 +97,24 @@ func (m *Message) pinnedMessage(c *wkhttp.Context) {
 		}
 		if !isCreatorOrManager && groupInfo.AllowMemberPinnedMessage == 0 {
 			httperr.ResponseErrorL(c, errcode.ErrMessagePinnedForbidden, nil, nil)
+			return
+		}
+	} else if req.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
+		// 解散守卫（企业微信式只读）：子区置顶需要检查父群是否解散
+		parentGroupNo, _, perr := thread.ParseChannelID(req.ChannelID)
+		if perr != nil {
+			m.Error("解析子区频道ID失败", zap.Error(perr))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		disbanded, derr := m.isGroupDisbanded(parentGroupNo)
+		if derr != nil {
+			m.Error("查询父群是否已解散错误", zap.Error(derr))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		if disbanded {
+			httperr.ResponseErrorL(c, errcode.ErrMessageGroupDisbanded, nil, nil)
 			return
 		}
 	}
@@ -334,6 +364,37 @@ func (m *Message) clearPinnedMessage(c *wkhttp.Context) {
 		}
 		fakeChannelID = common.GetFakeChannelIDWith(loginUID, req.ChannelID)
 	} else {
+		// 解散守卫（企业微信式只读）：群解散后禁止清空置顶。
+		if req.ChannelType == common.ChannelTypeGroup.Uint8() {
+			disbanded, derr := m.isGroupDisbanded(req.ChannelID)
+			if derr != nil {
+				m.Error("查询群是否已解散错误", zap.Error(derr))
+				httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+				return
+			}
+			if disbanded {
+				httperr.ResponseErrorL(c, errcode.ErrMessageGroupDisbanded, nil, nil)
+				return
+			}
+		} else if req.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
+			// 解散守卫（企业微信式只读）：子区清空置顶需要检查父群是否解散
+			parentGroupNo, _, perr := thread.ParseChannelID(req.ChannelID)
+			if perr != nil {
+				m.Error("解析子区频道ID失败", zap.Error(perr))
+				httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+				return
+			}
+			disbanded, derr := m.isGroupDisbanded(parentGroupNo)
+			if derr != nil {
+				m.Error("查询父群是否已解散错误", zap.Error(derr))
+				httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+				return
+			}
+			if disbanded {
+				httperr.ResponseErrorL(c, errcode.ErrMessageGroupDisbanded, nil, nil)
+				return
+			}
+		}
 		// 查询权限
 		isCreatorOrManager, err := m.groupService.IsCreatorOrManager(req.ChannelID, loginUID)
 		if err != nil {

@@ -818,6 +818,35 @@ func (d *DB) UpsertSetting(m *SettingModel) error {
 	return err
 }
 
+// DeleteThreadAndMembers 删除子区及其所有成员记录（用于并发创建后父群解散的清理场景）
+func (d *DB) DeleteThreadAndMembers(threadID int64) error {
+	tx, err := d.session.Begin()
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	// 删除 thread_member 记录
+	if _, err = tx.DeleteBySql("DELETE FROM thread_member WHERE thread_id=?", threadID).Exec(); err != nil {
+		return fmt.Errorf("delete thread members: %w", err)
+	}
+
+	// 删除 thread 记录
+	if _, err = tx.DeleteBySql("DELETE FROM thread WHERE id=?", threadID).Exec(); err != nil {
+		return fmt.Errorf("delete thread: %w", err)
+	}
+
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit transaction: %w", err)
+	}
+
+	return nil
+}
+
 func (d *DB) getMessageTable(channelID string) string {
 	tableCount := d.ctx.GetConfig().TablePartitionConfig.MessageTableCount
 	if tableCount <= 0 {

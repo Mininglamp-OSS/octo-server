@@ -17,7 +17,7 @@ package conversation_ext
 //
 // Scenarios covered here (scenes not covered by existing unit tests):
 //   1. Leave-group cascade: RemoveConvExtForUserInSpace clears group row + all child thread rows
-//   2. Disband-group cascade: RemoveConvExtForChannel clears all user rows + all child threads
+//   2. Channel cascade: RemoveConvExtForChannel clears all user rows + all child threads
 //   3. Delete-friend cascade: RemoveConvExtForUser clears bidirectional DM ext rows
 //   4. FollowThread implicit re-follow: UnfollowChannel + FollowThread atomically clears blacklist
 //   6. v1 zero-regression: ext table writes do not mutate the conv_ext read-query result set
@@ -132,7 +132,12 @@ func TestIntegration_LeaveGroup_OnlyAffectsLeavingUser(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Scene 2: Disband-group cascade
+// Scene 2: RemoveConvExtForChannel cascade (group + child threads)
+//
+// 这里测试的是 RemoveConvExtForChannel 这个通用级联清理 helper 本身（按 channel
+// 删群 ext 行 + 级联删该群所有子区 ext 行），它仍被删子区 / 删好友等收缩性流程
+// 复用。注意：企业微信式群解散（产品决策 2026-06）已**不再**调用本 helper——解散
+// 后会话与历史保留可看；本用例只校验 helper 的级联语义，不代表解散流程行为。
 //
 // Setup  : group A has 5 members; every member has followed it (ext row) and
 //          the group has 3 child threads; each member also has thread ext rows.
@@ -141,7 +146,7 @@ func TestIntegration_LeaveGroup_OnlyAffectsLeavingUser(t *testing.T) {
 //          unrelated channel rows preserved.
 // ---------------------------------------------------------------------------
 
-func TestIntegration_DisbandGroup_CascadesClearsAllUsersAndThreads(t *testing.T) {
+func TestIntegration_RemoveConvExtForChannel_CascadesGroupAndThreads(t *testing.T) {
 	db, _ := newIntegrationDB(t)
 
 	const space = "sp3"
@@ -165,17 +170,17 @@ func TestIntegration_DisbandGroup_CascadesClearsAllUsersAndThreads(t *testing.T)
 		}
 	}
 
-	// Action: disband the group.
+	// Action: cascade-clear the group channel's ext rows.
 	RemoveConvExtForChannel(groupA, targetTypeGroup)
 
 	// All member group rows must be gone.
 	assert.Equal(t, 0, countRowsByChannel(t, db, targetTypeGroup, groupA),
-		"all group ext rows must be deleted after disband")
+		"all group ext rows must be deleted by the cascade helper")
 
 	// All thread rows under the group must be gone.
 	for _, tid := range threadIDs {
 		assert.Equal(t, 0, countRowsByChannel(t, db, targetTypeThread, tid),
-			"thread ext row %q must be cascade-deleted after group disband", tid)
+			"thread ext row %q must be cascade-deleted with its parent group", tid)
 	}
 
 	// Unrelated group row must survive.

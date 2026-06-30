@@ -117,6 +117,17 @@ var (
 		HTTPStatus:     http.StatusForbidden,
 		DefaultMessage: "The bot is not a member of this group.",
 	})
+	// ErrBotAPIGroupDisbanded covers the disbanded-group send guard: after a
+	// group is disbanded (WeChat-Work style — history preserved, everyone
+	// read-only), no one (including bots) may send. The deployed WuKongIM
+	// /message/send returns HTTP 200 with no failure signal on a disband
+	// rejection, so octo-server self-checks group.status here and returns this
+	// explicit error instead of letting the bot believe the send succeeded.
+	ErrBotAPIGroupDisbanded = register(codes.Code{
+		ID:             "err.server.bot_api.group_disbanded",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "The group has been disbanded; messages can no longer be sent.",
+	})
 	// ErrBotAPINotGroupAdmin covers the bot-not-a-group-admin guard.
 	ErrBotAPINotGroupAdmin = register(codes.Code{
 		ID:             "err.server.bot_api.not_group_admin",

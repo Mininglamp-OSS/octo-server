@@ -310,6 +310,33 @@ func (rb *Robot) streamStart(c *wkhttp.Context) {
 		return
 	}
 
+	// 解散守卫：群或子区解散后禁止开始流式消息
+	if req.ChannelType == common.ChannelTypeGroup.Uint8() {
+		if disbanded, err := rb.isGroupDisbanded(req.ChannelID); err != nil {
+			rb.Error("查询群是否已解散错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
+			return
+		} else if disbanded {
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrRobotGroupDisbanded, nil, nil)
+			return
+		}
+	} else if req.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
+		parentGroupNo, err := rb.resolveParentGroupNo(req.ChannelID)
+		if err != nil {
+			rb.Error("解析子区父群错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
+			return
+		}
+		if disbanded, err := rb.isGroupDisbanded(parentGroupNo); err != nil {
+			rb.Error("查询群是否已解散错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
+			return
+		} else if disbanded {
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrRobotGroupDisbanded, nil, nil)
+			return
+		}
+	}
+
 	streamNo, err := rb.ctx.IMStreamStart(req)
 	if err != nil {
 		rb.Error("发送stream start消息失败！", zap.Error(err))
@@ -328,6 +355,34 @@ func (rb *Robot) streamEnd(c *wkhttp.Context) {
 		respondRobotRequestInvalid(c, "")
 		return
 	}
+
+	// 解散守卫：群或子区解散后禁止结束流式消息
+	if req.ChannelType == common.ChannelTypeGroup.Uint8() {
+		if disbanded, err := rb.isGroupDisbanded(req.ChannelID); err != nil {
+			rb.Error("查询群是否已解散错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
+			return
+		} else if disbanded {
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrRobotGroupDisbanded, nil, nil)
+			return
+		}
+	} else if req.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
+		parentGroupNo, err := rb.resolveParentGroupNo(req.ChannelID)
+		if err != nil {
+			rb.Error("解析子区父群错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
+			return
+		}
+		if disbanded, err := rb.isGroupDisbanded(parentGroupNo); err != nil {
+			rb.Error("查询群是否已解散错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
+			return
+		} else if disbanded {
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrRobotGroupDisbanded, nil, nil)
+			return
+		}
+	}
+
 	err := rb.ctx.IMStreamEnd(req)
 	if err != nil {
 		rb.Error("发送stream end消息失败！", zap.Error(err))
@@ -400,6 +455,34 @@ func (rb *Robot) typing(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrRobotChannelSendForbidden, nil, nil)
 		return
 	}
+
+	// 解散守卫（企业微信式只读）：群或子区解散后禁止 robot 发送 typing 指示
+	if req.ChannelType == common.ChannelTypeGroup.Uint8() {
+		if disbanded, err := rb.isGroupDisbanded(req.ChannelID); err != nil {
+			rb.Error("查询群是否已解散错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
+			return
+		} else if disbanded {
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrRobotGroupDisbanded, nil, nil)
+			return
+		}
+	} else if req.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
+		parentGroupNo, err := rb.resolveParentGroupNo(req.ChannelID)
+		if err != nil {
+			rb.Error("解析子区父群错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
+			return
+		}
+		if disbanded, err := rb.isGroupDisbanded(parentGroupNo); err != nil {
+			rb.Error("查询父群是否已解散错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
+			return
+		} else if disbanded {
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrRobotGroupDisbanded, nil, nil)
+			return
+		}
+	}
+
 	err := rb.ctx.SendTyping(req.ChannelID, req.ChannelType, fromUID)
 	if err != nil {
 		rb.Error("发送typing消息失败！", zap.Error(err))
@@ -437,6 +520,33 @@ func (rb *Robot) sendMessage(c *wkhttp.Context) {
 	if !rb.allowSendToChannel(robotID, messageReq.ChannelID, messageReq.ChannelType) {
 		httperr.ResponseErrorL(c, errcode.ErrRobotChannelSendForbidden, nil, nil)
 		return
+	}
+
+	// 解散守卫（企业微信式只读）：群或子区解散后禁止 robot 发送消息
+	if messageReq.ChannelType == common.ChannelTypeGroup.Uint8() {
+		if disbanded, err := rb.isGroupDisbanded(messageReq.ChannelID); err != nil {
+			rb.Error("查询群是否已解散错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
+			return
+		} else if disbanded {
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrRobotGroupDisbanded, nil, nil)
+			return
+		}
+	} else if messageReq.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
+		parentGroupNo, err := rb.resolveParentGroupNo(messageReq.ChannelID)
+		if err != nil {
+			rb.Error("解析子区父群错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
+			return
+		}
+		if disbanded, err := rb.isGroupDisbanded(parentGroupNo); err != nil {
+			rb.Error("查询父群是否已解散错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
+			return
+		} else if disbanded {
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrRobotGroupDisbanded, nil, nil)
+			return
+		}
 	}
 
 	// YUJ-1393 / PR#82 review #2 R1 (Jerry-Xin 2026-05-19 follow-up):
@@ -1745,6 +1855,33 @@ func (rb *Robot) botMessageEdit(c *wkhttp.Context) {
 		return
 	}
 
+	// 解散守卫（企业微信式只读）：群或子区解散后禁止 robot 编辑消息
+	if req.ChannelType == common.ChannelTypeGroup.Uint8() {
+		if disbanded, err := rb.isGroupDisbanded(req.ChannelID); err != nil {
+			rb.Error("查询群是否已解散错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
+			return
+		} else if disbanded {
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrRobotGroupDisbanded, nil, nil)
+			return
+		}
+	} else if req.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
+		parentGroupNo, err := rb.resolveParentGroupNo(req.ChannelID)
+		if err != nil {
+			rb.Error("解析子区父群错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
+			return
+		}
+		if disbanded, err := rb.isGroupDisbanded(parentGroupNo); err != nil {
+			rb.Error("查询父群是否已解散错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
+			return
+		} else if disbanded {
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrRobotGroupDisbanded, nil, nil)
+			return
+		}
+	}
+
 	// 权限检查：只允许 Bot 编辑自己发送的消息
 	messageSeqs := []uint32{req.MessageSeq}
 	resp, err := rb.ctx.IMGetWithChannelAndSeqs(req.ChannelID, req.ChannelType, robotID, messageSeqs)
@@ -1831,4 +1968,28 @@ func (rb *Robot) botMessageEdit(c *wkhttp.Context) {
 	}
 
 	c.ResponseOK()
+}
+
+// isGroupDisbanded 查询群是否已解散（status=2），用于 robot 模块的解散守卫。
+func (rb *Robot) isGroupDisbanded(groupNo string) (bool, error) {
+	var status int
+	err := rb.ctx.DB().SelectBySql(
+		"SELECT status FROM `group` WHERE group_no=?",
+		groupNo,
+	).LoadOne(&status)
+	if err != nil {
+		rb.Error("isGroupDisbanded query failed", zap.String("groupNo", groupNo), zap.Error(err))
+		return false, err
+	}
+	return status == group.GroupStatusDisband, nil
+}
+
+// resolveParentGroupNo 从子区 channelID 解析父群号。
+// 子区 channelID 格式：groupNo____threadID（4个下划线分隔）
+func (rb *Robot) resolveParentGroupNo(channelID string) (string, error) {
+	parts := strings.SplitN(channelID, "____", 2)
+	if len(parts) != 2 {
+		return "", fmt.Errorf("invalid community topic channelID format: %s", channelID)
+	}
+	return parts[0], nil
 }

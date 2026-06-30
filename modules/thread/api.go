@@ -128,6 +128,8 @@ func classifyThreadError(err error) codes.Code {
 	switch {
 	case strings.Contains(msg, "not a group member"):
 		return errcode.ErrThreadNotGroupMember
+	case strings.Contains(msg, "group has been disbanded"):
+		return errcode.ErrThreadGroupDisbanded
 	case strings.Contains(msg, "no permission"):
 		return errcode.ErrThreadPermissionDenied
 	case strings.Contains(msg, "creator cannot leave"):

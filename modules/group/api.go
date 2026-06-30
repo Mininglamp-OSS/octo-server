@@ -186,8 +186,8 @@ func (g *Group) disband(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 		return
 	}
-	if group == nil || group.Status == GroupStatusDisband {
-		c.ResponseOK()
+	if group == nil {
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 		return
 	}
 	loginMember, err := g.db.QueryMemberWithUID(loginUID, groupNo)
@@ -201,8 +201,21 @@ func (g *Group) disband(c *wkhttp.Context) {
 		respondGroupForbidden(c)
 		return
 	}
+	// 幂等重试入口：群已解散（上次 MySQL commit 成功但 WuKongIM 推送可能失败）。
+	// 跳过 MySQL 事务，直接补偿推送 WuKongIM disband flag，确保 fail-closed。
+	if group.Status == GroupStatusDisband {
+		if retryErr := g.retryWuKongIMDisbandPush(groupNo, group.GroupType); retryErr != nil {
+			g.Error("重试解散推送失败", zap.String("groupNo", groupNo), zap.Error(retryErr))
+			httperr.ResponseErrorL(c, errcode.ErrGroupNotifyFailed, nil, nil)
+			return
+		}
+		c.ResponseOK()
+		return
+	}
 
-	// todo
+	// ====== 第一阶段：MySQL 事务（DB 为权威状态源） ======
+	// 先提交 group.status=Disband 到 MySQL，这是原子边界。
+	// 之后 ensureGroupNotDisbanded 会拒绝新的 CreateThread，消除竞态窗口。
 	tx, err := g.ctx.DB().Begin()
 	if err != nil {
 		g.Error("开启事务失败！", zap.Error(err))
@@ -215,6 +228,27 @@ func (g *Group) disband(c *wkhttp.Context) {
 			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
+	// 行锁序列化：SELECT FOR UPDATE 锁住 group 行，与 CreateThread 的 FOR UPDATE 互斥
+	var lockStatus int
+	if serr := tx.SelectBySql("SELECT status FROM `group` WHERE group_no=? FOR UPDATE", groupNo).LoadOne(&lockStatus); serr != nil {
+		tx.RollbackUnlessCommitted()
+		g.Error("disband 行锁查询失败", zap.Error(serr))
+		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
+		return
+	}
+	if lockStatus == GroupStatusDisband {
+		tx.RollbackUnlessCommitted()
+		// 并发竞态：请求 A 已提交 MySQL 但 WuKongIM 推送可能部分失败，
+		// 请求 B 在行锁等待后看到 Disband，必须也跑补偿推送——否则 A 的
+		// 部分失败不会被补偿，某些 channel 仍接受发送。
+		if retryErr := g.retryWuKongIMDisbandPush(groupNo, group.GroupType); retryErr != nil {
+			g.Error("并发 disband 补偿推送失败", zap.String("groupNo", groupNo), zap.Error(retryErr))
+			httperr.ResponseErrorL(c, errcode.ErrGroupNotifyFailed, nil, nil)
+			return
+		}
+		c.ResponseOK()
+		return
+	}
 	group.Status = GroupStatusDisband
 	err = g.db.UpdateTx(group, tx)
 	if err != nil {
@@ -223,14 +257,7 @@ func (g *Group) disband(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
 		return
 	}
-	// err = g.db.deleteMembersWithGroupNOTx(groupNo, tx)
-	// if err != nil {
-	// 	tx.Rollback()
-	// 	g.Error("删除群成员错误", zap.Error(err))
-	// 	c.ResponseError(errors.New("删除群成员错误"))
-	// 	return
-	// }
-	// 发布群解散事件
+	// 发布群解散事件（用于异步清理：系统消息、成员清理、置顶清理等）
 	eventID, err := g.ctx.EventBegin(&wkevent.Data{
 		Event: event.GroupDisband,
 		Type:  wkevent.Message,
@@ -253,7 +280,104 @@ func (g *Group) disband(c *wkhttp.Context) {
 		return
 	}
 	g.ctx.EventCommit(eventID)
+
+	// ====== 第二阶段：推送 WuKongIM disband flag（fail-closed） ======
+	// MySQL 已提交，现在推送 IM disband。重新查询 thread IDs 以捕获所有子区。
+	// WuKongIM 推送失败时返回错误（fail-closed），客户端可重试（MySQL 已提交，
+	// 重试时会走上方 Status==Disband 的幂等重试分支）。
+	threadShortIDs, err := g.db.queryThreadShortIDsByGroup(groupNo)
+	if err != nil {
+		g.Error("重新查询子区列表失败（fail-closed：必须推送所有子区）",
+			zap.String("groupNo", groupNo), zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
+		return
+	}
+
+	// 1. 推送父群 disband
+	if pushErr := g.pushWuKongIMDisbandWithRetry(groupNo, common.ChannelTypeGroup.Uint8(), group.GroupType, "父群"); pushErr != nil {
+		g.Error("解散群 WuKongIM 父群推送失败（MySQL 已提交，客户端可重试）",
+			zap.String("groupNo", groupNo), zap.Error(pushErr))
+		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
+		return
+	}
+
+	// 2. 推送所有子区 disband
+	for _, shortID := range threadShortIDs {
+		threadChannelID := groupNo + "____" + shortID
+		if pushErr := g.pushWuKongIMDisbandWithRetry(threadChannelID, common.ChannelTypeCommunityTopic.Uint8(), group.GroupType, "子区"); pushErr != nil {
+			g.Error("解散群 WuKongIM 子区推送失败（MySQL 已提交，客户端可重试）",
+				zap.String("groupNo", groupNo),
+				zap.String("threadChannelID", threadChannelID),
+				zap.Error(pushErr))
+			httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
+			return
+		}
+	}
+
 	c.ResponseOK()
+}
+
+// retryWuKongIMDisbandPush 幂等重试：群已在 MySQL 标记解散，补偿推送 WuKongIM disband flag。
+// 用于上次 disband 调用 MySQL commit 成功但 WuKongIM 推送失败的场景。
+// WuKongIM IMCreateOrUpdateChannelInfo 是 upsert 幂等操作，重复推送安全。
+// 返回 error 表示推送失败（调用方应返回错误给客户端，确保 fail-closed）。
+func (g *Group) retryWuKongIMDisbandPush(groupNo string, groupType int) error {
+	threadShortIDs, err := g.db.queryThreadShortIDsByGroup(groupNo)
+	if err != nil {
+		g.Error("重试解散推送：查询子区列表失败（fail-closed：必须推送所有子区）",
+			zap.String("groupNo", groupNo), zap.Error(err))
+		return fmt.Errorf("query thread short IDs for retry: %w", err)
+	}
+	// 推送父群 disband
+	if pushErr := g.pushWuKongIMDisbandWithRetry(groupNo, common.ChannelTypeGroup.Uint8(), groupType, "父群(重试)"); pushErr != nil {
+		g.Error("重试解散推送：父群 WuKongIM 推送失败",
+			zap.String("groupNo", groupNo), zap.Error(pushErr))
+		return pushErr
+	}
+	// 推送所有子区 disband
+	for _, shortID := range threadShortIDs {
+		threadChannelID := groupNo + "____" + shortID
+		if pushErr := g.pushWuKongIMDisbandWithRetry(threadChannelID, common.ChannelTypeCommunityTopic.Uint8(), groupType, "子区(重试)"); pushErr != nil {
+			g.Error("重试解散推送：子区 WuKongIM 推送失败",
+				zap.String("groupNo", groupNo),
+				zap.String("threadChannelID", threadChannelID),
+				zap.Error(pushErr))
+			return pushErr
+		}
+	}
+	return nil
+}
+
+// pushWuKongIMDisbandWithRetry 带重试的 WuKongIM disband 推送（fail-closed）。
+// 用于 MySQL 已提交后的 IM 同步，失败时指数退避重试。
+// 返回 error 表示所有重试均失败（调用方应返回错误给客户端，确保 fail-closed）。
+func (g *Group) pushWuKongIMDisbandWithRetry(channelID string, channelType uint8, groupType int, label string) error {
+	const maxRetries = 3
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if err := g.ctx.IMCreateOrUpdateChannelInfo(&config.ChannelInfoCreateReq{
+			ChannelID:   channelID,
+			ChannelType: channelType,
+			Disband:     1,
+			Large:       groupType,
+		}); err != nil {
+			if attempt < maxRetries-1 {
+				g.Warn("推送 disband 到 WuKongIM 失败，将重试",
+					zap.String("label", label),
+					zap.String("channelID", channelID),
+					zap.Int("attempt", attempt+1),
+					zap.Error(err))
+				time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
+				continue
+			}
+			g.Error("推送 disband 到 WuKongIM 最终失败（fail-closed：返回错误给客户端）",
+				zap.String("label", label),
+				zap.String("channelID", channelID),
+				zap.Error(err))
+			return fmt.Errorf("push disband to WuKongIM failed for %s (%s): %w", label, channelID, err)
+		}
+		return nil // 成功
+	}
+	return nil
 }
 
 func (g *Group) membersGet(c *wkhttp.Context) {
@@ -996,6 +1120,16 @@ func (g *Group) groupUpdate(c *wkhttp.Context) {
 	loginName := c.MustGet("name").(string)
 	groupNo := c.Param("group_no")
 
+	// 解散守卫（企业微信式只读）：群解散后禁止修改群信息。
+	if disbanded, derr := g.isGroupDisbanded(groupNo); derr != nil {
+		g.Error("查询群是否已解散错误", zap.Error(derr))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+		return
+	} else if disbanded {
+		httperr.ResponseErrorL(c, errcode.ErrGroupNotFound, nil, nil)
+		return
+	}
+
 	var groupMap map[string]string
 	if err := c.BindJSON(&groupMap); err != nil {
 		g.Error("数据格式有误！", zap.Error(err))
@@ -1193,6 +1327,16 @@ func (g *Group) memberAdd(c *wkhttp.Context) {
 		return
 	}
 	groupNo := c.Param("group_no")
+
+	// 解散守卫（企业微信式只读）：群解散后禁止添加成员。
+	if disbanded, derr := g.isGroupDisbanded(groupNo); derr != nil {
+		g.Error("查询群是否已解散错误", zap.Error(derr))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+		return
+	} else if disbanded {
+		httperr.ResponseErrorL(c, errcode.ErrGroupNotFound, nil, nil)
+		return
+	}
 
 	// 连接获取探针（邀请慢二级定位）：显式从连接池取一条连接并 PingContext 强制
 	// 一次往返，单独计时。pre_checks 各步的 *_ms 是「取连接 + 执行」之和；本探针把
@@ -1810,6 +1954,15 @@ func (g *Group) managerAdd(c *wkhttp.Context) {
 		}
 	}
 	groupNo := c.Param("group_no")
+	// 解散守卫（企业微信式只读）：群解散后禁止管理/配置写操作。
+	if disbanded, derr := g.isGroupDisbanded(groupNo); derr != nil {
+		g.Error("查询群是否已解散错误", zap.Error(derr))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+		return
+	} else if disbanded {
+		httperr.ResponseErrorL(c, errcode.ErrGroupNotFound, nil, nil)
+		return
+	}
 	isCreator, err := g.db.QueryIsGroupCreator(groupNo, loginUID)
 	if err != nil {
 		g.Error("查询是否是创建者失败！", zap.Error(err))
@@ -1930,6 +2083,15 @@ func (g *Group) managerRemove(c *wkhttp.Context) {
 		}
 	}
 	groupNo := c.Param("group_no")
+	// 解散守卫（企业微信式只读）：群解散后禁止管理/配置写操作。
+	if disbanded, derr := g.isGroupDisbanded(groupNo); derr != nil {
+		g.Error("查询群是否已解散错误", zap.Error(derr))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+		return
+	} else if disbanded {
+		httperr.ResponseErrorL(c, errcode.ErrGroupNotFound, nil, nil)
+		return
+	}
 
 	isCreator, err := g.db.QueryIsGroupCreator(groupNo, loginUID)
 	if err != nil {
@@ -2011,6 +2173,15 @@ func (g *Group) groupForbidden(c *wkhttp.Context) {
 	loginUID := c.MustGet("uid").(string)
 	loginName := c.MustGet("name").(string)
 	groupNo := c.Param("group_no")
+	// 解散守卫（企业微信式只读）：群解散后禁止全员禁言操作。
+	if disbanded, derr := g.isGroupDisbanded(groupNo); derr != nil {
+		g.Error("查询群是否已解散错误", zap.Error(derr))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+		return
+	} else if disbanded {
+		httperr.ResponseErrorL(c, errcode.ErrGroupNotFound, nil, nil)
+		return
+	}
 	on := c.Param("on")
 	isCreatorOrManager, err := g.db.QueryIsGroupManagerOrCreator(groupNo, loginUID)
 	if err != nil {
@@ -2670,6 +2841,15 @@ func (g *Group) memberUpdate(c *wkhttp.Context) {
 		respondGroupRequestInvalid(c, "")
 		return
 	}
+	// 解散守卫（企业微信式只读）：群解散后禁止修改成员信息。
+	if disbanded, derr := g.isGroupDisbanded(groupNo); derr != nil {
+		g.Error("查询群是否已解散错误", zap.Error(derr))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+		return
+	} else if disbanded {
+		httperr.ResponseErrorL(c, errcode.ErrGroupNotFound, nil, nil)
+		return
+	}
 	_, err := g.getGroupInfo(groupNo)
 	if err != nil {
 		respondGroupInfoError(c, err)
@@ -2754,6 +2934,16 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 	}
 	groupNo := c.Param("group_no")
 	req.Members = util.RemoveRepeatedElement(req.Members)
+
+	// 解散守卫（企业微信式只读）：群解散后禁止移除成员。
+	if disbanded, derr := g.isGroupDisbanded(groupNo); derr != nil {
+		g.Error("查询群是否已解散错误", zap.Error(derr))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+		return
+	} else if disbanded {
+		httperr.ResponseErrorL(c, errcode.ErrGroupNotFound, nil, nil)
+		return
+	}
 
 	// 判断群是否存在
 	_, err := g.getGroupInfo(groupNo)
@@ -2856,10 +3046,22 @@ func (g *Group) groupSettingUpdate(c *wkhttp.Context) {
 		c.ResponseOK()
 		return
 	}
-	_, err := g.getGroupInfo(groupNo)
-	if err != nil {
-		respondGroupInfoError(c, err)
-		return
+	// 仅当本次提交包含「群级别」改动(groupUpdateActionMap)时才做存在性/解散校验。
+	// 纯个人本地偏好(remark/top/save/mute 等,见 settingActionMap)写的是 group_setting
+	// 表的 (group_no, uid) 行,不依赖群是否存在 —— 这些项在已解散群上仍应可用(对齐企业微信)。
+	// 群级别改动各自在循环内的 getGroupFnc 里仍会校验存在性,故此处不会漏拦。
+	containsGroupUpdate := false
+	for key := range resultMap {
+		if groupUpdateActionMap[key] != nil {
+			containsGroupUpdate = true
+			break
+		}
+	}
+	if containsGroupUpdate {
+		if _, err := g.getGroupInfo(groupNo); err != nil {
+			respondGroupInfoError(c, err)
+			return
+		}
 	}
 	getSettingFnc := func() (*Setting, bool, error) {
 		setting, err := g.settingDB.QuerySetting(groupNo, loginUID)
@@ -2890,7 +3092,7 @@ func (g *Group) groupSettingUpdate(c *wkhttp.Context) {
 			g.Error("查询群信息失败", zap.Error(err))
 			return nil, err
 		}
-		if group == nil {
+		if group == nil || group.Status == GroupStatusDisband {
 			// 缺失 / 已解散群 → 404,复用 getGroupInfo 的 not-found sentinel,
 			// 由 respondGroupInfoError 分流,而非塌缩成内部查询失败。
 			return nil, errGroupInfoNotFound
@@ -3741,6 +3943,15 @@ func (g *Group) groupMdGet(c *wkhttp.Context) {
 func (g *Group) groupMdUpdate(c *wkhttp.Context) {
 	groupNo := c.Param("group_no")
 	loginUID := c.GetLoginUID()
+	// 解散守卫（企业微信式只读）：群解散后禁止管理/配置写操作。
+	if disbanded, derr := g.isGroupDisbanded(groupNo); derr != nil {
+		g.Error("查询群是否已解散错误", zap.Error(derr))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+		return
+	} else if disbanded {
+		httperr.ResponseErrorL(c, errcode.ErrGroupNotFound, nil, nil)
+		return
+	}
 
 	isManagerOrCreator, err := g.db.QueryIsGroupManagerOrCreator(groupNo, loginUID)
 	if err != nil {
@@ -3793,6 +4004,15 @@ func (g *Group) groupMdUpdate(c *wkhttp.Context) {
 func (g *Group) groupMdDelete(c *wkhttp.Context) {
 	groupNo := c.Param("group_no")
 	loginUID := c.GetLoginUID()
+	// 解散守卫（企业微信式只读）：群解散后禁止管理/配置写操作。
+	if disbanded, derr := g.isGroupDisbanded(groupNo); derr != nil {
+		g.Error("查询群是否已解散错误", zap.Error(derr))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+		return
+	} else if disbanded {
+		httperr.ResponseErrorL(c, errcode.ErrGroupNotFound, nil, nil)
+		return
+	}
 
 	isManagerOrCreator, err := g.db.QueryIsGroupManagerOrCreator(groupNo, loginUID)
 	if err != nil {
@@ -3830,6 +4050,15 @@ func (g *Group) botAdminSet(c *wkhttp.Context) {
 	groupNo := c.Param("group_no")
 	targetUID := c.Param("uid")
 	loginUID := c.GetLoginUID()
+	// 解散守卫（企业微信式只读）：群解散后禁止管理/配置写操作。
+	if disbanded, derr := g.isGroupDisbanded(groupNo); derr != nil {
+		g.Error("查询群是否已解散错误", zap.Error(derr))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+		return
+	} else if disbanded {
+		httperr.ResponseErrorL(c, errcode.ErrGroupNotFound, nil, nil)
+		return
+	}
 
 	isManagerOrCreator, err := g.db.QueryIsGroupManagerOrCreator(groupNo, loginUID)
 	if err != nil {
@@ -3879,6 +4108,15 @@ func (g *Group) botAdminRemove(c *wkhttp.Context) {
 	groupNo := c.Param("group_no")
 	targetUID := c.Param("uid")
 	loginUID := c.GetLoginUID()
+	// 解散守卫（企业微信式只读）：群解散后禁止管理/配置写操作。
+	if disbanded, derr := g.isGroupDisbanded(groupNo); derr != nil {
+		g.Error("查询群是否已解散错误", zap.Error(derr))
+		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+		return
+	} else if disbanded {
+		httperr.ResponseErrorL(c, errcode.ErrGroupNotFound, nil, nil)
+		return
+	}
 
 	isManagerOrCreator, err := g.db.QueryIsGroupManagerOrCreator(groupNo, loginUID)
 	if err != nil {
@@ -4597,4 +4835,19 @@ func (g *Group) groupInviteAuthorize(c *wkhttp.Context) {
 		"group_no":  groupNo,
 		"auth_code": authCode,
 	})
+}
+
+// isGroupDisbanded 报告 groupNo 对应的群是否处于已解散（只读）状态。
+// 供群写操作端点做解散守卫——解散后禁止所有管理/配置写操作。
+// 走 db.QueryWithGroupNo 查 group.status，与 message.isGroupDisbanded 语义对齐。
+func (g *Group) isGroupDisbanded(groupNo string) (bool, error) {
+	info, err := g.db.QueryWithGroupNo(groupNo)
+	if err != nil {
+		return false, err
+	}
+	if info == nil {
+		// 群不存在，fail-closed：不允许操作
+		return false, fmt.Errorf("group %s not found", groupNo)
+	}
+	return info.Status == GroupStatusDisband, nil
 }

@@ -64,6 +64,17 @@ var (
 		HTTPStatus:     http.StatusForbidden,
 		DefaultMessage: "You are not a member of this group.",
 	})
+	// ErrMessageGroupDisbanded covers the disbanded-group send guard on the
+	// regular user path (/v1/message/send). After a group is disbanded
+	// (WeChat-Work style — history preserved, everyone read-only), no one may
+	// send. The deployed WuKongIM /message/send returns HTTP 200 with no
+	// failure signal on a disband rejection, so octo-server self-checks
+	// group.status here (parity with the bot path's ErrBotAPIGroupDisbanded).
+	ErrMessageGroupDisbanded = register(codes.Code{
+		ID:             "err.server.message.group_disbanded",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "The group has been disbanded; messages can no longer be sent.",
+	})
 	ErrMessageDeleteForbidden = register(codes.Code{
 		ID:             "err.server.message.delete_forbidden",
 		HTTPStatus:     http.StatusForbidden,

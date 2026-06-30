@@ -4,7 +4,6 @@ import (
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
-	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
@@ -34,11 +33,11 @@ import (
 //     read. Own-bot path skips blacklist (a user can't blacklist their
 //     own bot meaningfully).
 //
-//   - group (2) — group must exist AND not be disbanded AND caller must be
-//     an *active* member. Disband is checked BEFORE membership because
-//     bookkeeping bugs (or a race during the disband flow) could leave a
-//     group_member row pointing at a disbanded group; gating on membership
-//     alone would leak history of a disbanded group.
+//   - group (2) — group must exist AND caller must be an *active* member.
+//     Disbanded groups are NOT rejected: 企业微信式 disband 语义（产品决策 2026-06）
+//     keeps history & search readable after disband. A leftover group_member row
+//     on a disbanded group does not leak access because ExistMemberActive
+//     excludes removed (is_deleted=1) / blacklisted (status!=Normal) users.
 //
 //   - thread (5) — channel_id must parse, the thread must still exist
 //     (GetThread maps "not found" + "deleted" to err), AND caller must be
@@ -209,10 +208,13 @@ func (h *Handler) checkP2PAccess(c *wkhttp.Context, peerUID, loginUID string) bo
 	return true
 }
 
-// checkGroupAccess fail-closes if the group is missing or disbanded BEFORE
-// consulting membership, so leftover group_member rows on a disbanded
-// group cannot hand back read access. Status check matches the
-// fail-closed templates in group/service.go:1327, :1553, :1764.
+// checkGroupAccess fail-closes if the group is missing, then gates on active
+// membership. Disbanded groups are NOT rejected here: per the 企业微信式 disband
+// semantics (产品决策 2026-06), history & search stay readable after disband —
+// 发消息由 WuKongIM 的 disband flag 拦截，搜索是只读路径。Leftover group_member
+// rows cannot leak read access to non-members because ExistMemberActive below
+// excludes removed/blacklisted users; disband does not clear member rows but a
+// removed member's row is is_deleted=1 so ExistMemberActive returns false.
 func (h *Handler) checkGroupAccess(c *wkhttp.Context, groupNo, loginUID string) bool {
 	groupModel, err := h.groupService.GetGroupWithGroupNo(groupNo)
 	if err != nil {
@@ -222,7 +224,7 @@ func (h *Handler) checkGroupAccess(c *wkhttp.Context, groupNo, loginUID string) 
 		respondInternal(c)
 		return false
 	}
-	if groupModel == nil || groupModel.Status == group.GroupStatusDisband {
+	if groupModel == nil {
 		respondNotFound(c, "channel")
 		return false
 	}

@@ -13,6 +13,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
@@ -320,6 +321,19 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 
 	case BotKindUser:
 		if channelType == common.ChannelTypeGroup.Uint8() {
+			// Disband guard (WeChat-Work style read-only): once the group is
+			// disbanded everyone is read-only, bots included — even an OBO send
+			// on behalf of the (former) owner. The deployed WuKongIM
+			// /message/send returns HTTP 200 with no failure signal on a disband
+			// rejection, so the bot would otherwise believe its send succeeded.
+			// We self-check group.status here and return an explicit error.
+			// Placed BEFORE the OBO/membership branch so it applies regardless
+			// of OBO context.
+			if disbanded, err := ba.isGroupDisbanded(channelID); err != nil {
+				return err
+			} else if disbanded {
+				return errBotSendPermGroupDisbanded
+			}
 			// OBO bypass: when the bot acts on behalf of a grantor who IS a
 			// group member, skip the bot's own membership check. The downstream
 			// checkOBO validates that the grantor has a legitimate grant+scope
@@ -341,6 +355,20 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 			}
 		} else if channelType == common.ChannelTypeCommunityTopic.Uint8() {
 			// Thread: extract parent group_no and verify membership.
+			//
+			// Disband guard (parity with ChannelTypeGroup above): a disbanded
+			// parent group makes its threads read-only too. Parse the parent
+			// group_no and self-check status BEFORE the OBO/membership branch so
+			// it applies regardless of OBO context.
+			topicParts := strings.SplitN(channelID, threadChannelIDSeparator, 2)
+			if len(topicParts) != 2 {
+				return errBotSendPermBadThreadChan
+			}
+			if disbanded, err := ba.isGroupDisbanded(topicParts[0]); err != nil {
+				return err
+			} else if disbanded {
+				return errBotSendPermGroupDisbanded
+			}
 			//
 			// PR#121 R7 (YUJ-1671) — OBO bypass parity with Group above.
 			// CommunityTopic fan-out (`obo_fanout.go` / mention-gated)
@@ -425,6 +453,31 @@ func (ba *BotAPI) isSpaceMember(uid, spaceID string) (bool, error) {
 		return false, err
 	}
 	return count > 0, nil
+}
+
+// isGroupDisbanded reports whether the group identified by groupNo is in the
+// disbanded (read-only) state. Used by checkSendPermission to block bot sends
+// to disbanded groups/threads — the deployed WuKongIM /message/send gives no
+// failure signal on a disband rejection, so octo-server must self-check.
+// Infra failures are logged and surfaced as errBotSendPermCheckFailed (fail
+// closed) rather than letting a DB hiccup silently allow the send.
+func (ba *BotAPI) isGroupDisbanded(groupNo string) (bool, error) {
+	// db 未初始化时（如单元测试 stub 不注入 db），无法查询群状态。
+	// 跳过 disband 检查而非 fail-closed：调用方（fanoutForMessage）在没有
+	// 完整 DB 的环境下不应被 disband guard 阻断。生产环境 db 始终已初始化。
+	if ba.db == nil || ba.db.session == nil {
+		return false, nil
+	}
+	var status int
+	err := ba.db.session.SelectBySql(
+		"SELECT status FROM `group` WHERE group_no=?",
+		groupNo,
+	).LoadOne(&status)
+	if err != nil {
+		ba.Error("isGroupDisbanded query failed", zap.String("groupNo", groupNo), zap.Error(err))
+		return false, errBotSendPermCheckFailed
+	}
+	return status == group.GroupStatusDisband, nil
 }
 
 // ==================== Read Receipt ====================
@@ -620,6 +673,35 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 	if robotID == "" {
 		ba.respondBotAPIIdentityMissing(c)
 		return
+	}
+
+	// 解散守卫（企业微信式只读）：群解散后禁止 bot 编辑历史消息。
+	if req.ChannelType == common.ChannelTypeGroup.Uint8() {
+		if disbanded, err := ba.isGroupDisbanded(req.ChannelID); err != nil {
+			ba.Error("查询群是否已解散错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+			return
+		} else if disbanded {
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIGroupDisbanded, nil, nil)
+			return
+		}
+	} else if req.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
+		parts := strings.SplitN(req.ChannelID, "____", 2)
+		if len(parts) != 2 || parts[0] == "" {
+			// fail-closed：畸形 thread channel_id 拒绝操作，
+			// 与 message/api.go 的 thread disband guard 保持一致。
+			ba.Error("解析子区频道ID失败（edit）", zap.String("channelID", req.ChannelID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+			return
+		}
+		if disbanded, err := ba.isGroupDisbanded(parts[0]); err != nil {
+			ba.Error("查询父群是否已解散错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+			return
+		} else if disbanded {
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIGroupDisbanded, nil, nil)
+			return
+		}
 	}
 
 	// Permission: bot can only edit its own messages

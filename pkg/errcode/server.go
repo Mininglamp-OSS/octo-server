@@ -49,6 +49,11 @@ var (
 		HTTPStatus:     http.StatusForbidden,
 		DefaultMessage: "You are not a group member.",
 	})
+	ErrThreadGroupDisbanded = register(codes.Code{
+		ID:             "err.server.thread.group_disbanded",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "The group has been disbanded.",
+	})
 	ErrThreadPermissionDenied = register(codes.Code{
 		ID:             "err.server.thread.permission_denied",
 		HTTPStatus:     http.StatusForbidden,

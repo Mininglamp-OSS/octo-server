@@ -442,6 +442,20 @@ func (m *Message) sendMsg(c *wkhttp.Context) {
 			httperr.ResponseErrorL(c, errcode.ErrMessageNotGroupMember, nil, nil)
 			return
 		}
+		// 解散守卫（企业微信式只读）：群解散后所有人只读，不得发送。
+		// 部署版 WuKongIM /message/send 对解散群拒发不返回失败信号（HTTP 200），
+		// 故 octo-server 自查 group.status。与 bot 路径 isGroupDisbanded 对齐；
+		// 普通用户路径此前漏检（CR），解散后仍能发群消息。
+		disbanded, err := m.isGroupDisbanded(req.ReceiveChannelID)
+		if err != nil {
+			m.Error("查询群是否已解散错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		if disbanded {
+			httperr.ResponseErrorL(c, errcode.ErrMessageGroupDisbanded, nil, nil)
+			return
+		}
 	}
 	if req.ReceiveChannelType == common.ChannelTypeCommunityTopic.Uint8() {
 		// YUJ-4185 P1-3：代发到子区(CommunityTopic)必须校验 sender 仍是父群成员
@@ -463,6 +477,18 @@ func (m *Message) sendMsg(c *wkhttp.Context) {
 		}
 		if !isExist {
 			httperr.ResponseErrorL(c, errcode.ErrMessageNotGroupMember, nil, nil)
+			return
+		}
+		// 解散守卫（与上方 ChannelTypeGroup 对齐）：父群解散后子区只读，不得代发。
+		// 复用已解析的 parentGroupNo 自查 status，避免依赖 WuKongIM 的拒发信号。
+		disbanded, err := m.isGroupDisbanded(parentGroupNo)
+		if err != nil {
+			m.Error("查询父群是否已解散错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		if disbanded {
+			httperr.ResponseErrorL(c, errcode.ErrMessageGroupDisbanded, nil, nil)
 			return
 		}
 	}
@@ -487,6 +513,29 @@ func (m *Message) sendMsg(c *wkhttp.Context) {
 		return
 	}
 	c.ResponseOK()
+}
+
+// isGroupDisbanded 报告 groupNo 对应的群是否处于已解散（只读）状态。
+// 供 sendMsg 的群 / 子区发送路径做解散守卫——部署版 WuKongIM /message/send
+// 对解散群拒发不返回失败信号，故 octo-server 自查 group.status。
+// 走 groupService 接口（不直接拼 SQL），与 bot_api.isGroupDisbanded 语义对齐。
+// 群不存在时 GetGroupWithGroupNo 返回 error，向上透传按查询失败处理（fail-closed）。
+func (m *Message) isGroupDisbanded(groupNo string) (bool, error) {
+	info, err := m.groupService.GetGroupWithGroupNo(groupNo)
+	if err != nil {
+		return false, err
+	}
+	return info.Status == group.GroupStatusDisband, nil
+}
+
+// resolveParentGroupNo 从子区 channelID 解析出父群 group_no。
+// 子区 channelID 格式为 "groupNo____shortId"（四个下划线分隔）。
+func (m *Message) resolveParentGroupNo(channelID string) (string, error) {
+	parts := strings.SplitN(channelID, "____", 2)
+	if len(parts) != 2 {
+		return "", fmt.Errorf("invalid community topic channelID format: %s", channelID)
+	}
+	return parts[0], nil
 }
 
 // sendMessage 派发消息。senderSpaceID 是 SpaceMiddleware 已校验的发送方 SpaceID
@@ -765,6 +814,37 @@ func (m *Message) messageEdit(c *wkhttp.Context) {
 	if req.MessageID != strconv.FormatInt(resp.Messages[0].MessageID, 10) {
 		httperr.ResponseErrorL(c, errcode.ErrMessageIDSeqMismatch, nil, nil)
 		return
+	}
+
+	// 解散守卫（企业微信式只读）：群解散后禁止编辑消息。
+	if req.ChannelType == common.ChannelTypeGroup.Uint8() {
+		disbanded, err := m.isGroupDisbanded(req.ChannelID)
+		if err != nil {
+			m.Error("查询群是否已解散错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		if disbanded {
+			httperr.ResponseErrorL(c, errcode.ErrMessageGroupDisbanded, nil, nil)
+			return
+		}
+	} else if req.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
+		parentGroupNo, _, perr := thread.ParseChannelID(req.ChannelID)
+		if perr != nil || parentGroupNo == "" {
+			m.Error("解析子区频道ID失败（edit）", zap.Error(perr), zap.String("channelID", req.ChannelID))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		disbanded, err := m.isGroupDisbanded(parentGroupNo)
+		if err != nil {
+			m.Error("查询父群是否已解散错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		if disbanded {
+			httperr.ResponseErrorL(c, errcode.ErrMessageGroupDisbanded, nil, nil)
+			return
+		}
 	}
 
 	// 图文混排 RichText(=14)：编辑写入口对 content_edit 做与 send 路径对称的
@@ -1295,6 +1375,32 @@ func (m *Message) typing(c *wkhttp.Context) {
 		respondMessageRequestInvalid(c, "")
 		return
 	}
+	// 解散守卫：群或子区解散后禁止发送 typing
+	if req.ChannelType == common.ChannelTypeGroup.Uint8() {
+		if disbanded, err := m.isGroupDisbanded(req.ChannelID); err != nil {
+			m.Error("查询群是否已解散错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		} else if disbanded {
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrMessageGroupDisbanded, nil, nil)
+			return
+		}
+	} else if req.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
+		parentGroupNo, err := m.resolveParentGroupNo(req.ChannelID)
+		if err != nil {
+			m.Error("解析子区父群错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		if disbanded, err := m.isGroupDisbanded(parentGroupNo); err != nil {
+			m.Error("查询父群是否已解散错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		} else if disbanded {
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrMessageGroupDisbanded, nil, nil)
+			return
+		}
+	}
 	channelID := req.ChannelID
 	channelType := req.ChannelType
 	if req.ChannelType == common.ChannelTypePerson.Uint8() {
@@ -1639,6 +1745,37 @@ func (m *Message) addOrCancelReaction(c *wkhttp.Context) {
 		}
 	}
 
+	// 解散守卫（企业微信式只读）：群解散后禁止添加/取消回应。
+	if req.ChannelType == common.ChannelTypeGroup.Uint8() {
+		disbanded, err := m.isGroupDisbanded(req.ChannelID)
+		if err != nil {
+			m.Error("查询群是否已解散错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		if disbanded {
+			httperr.ResponseErrorL(c, errcode.ErrMessageGroupDisbanded, nil, nil)
+			return
+		}
+	} else if req.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
+		parentGroupNo, _, perr := thread.ParseChannelID(req.ChannelID)
+		if perr != nil || parentGroupNo == "" {
+			m.Error("解析子区频道ID失败（reaction）", zap.Error(perr), zap.String("channelID", req.ChannelID))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		disbanded, err := m.isGroupDisbanded(parentGroupNo)
+		if err != nil {
+			m.Error("查询父群是否已解散错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		if disbanded {
+			httperr.ResponseErrorL(c, errcode.ErrMessageGroupDisbanded, nil, nil)
+			return
+		}
+	}
+
 	model, err := m.messageReactionDB.queryReactionWithUIDAndMessageID(loginUID, req.MessageID)
 	if err != nil {
 		m.Error("查询登录用户是否回应消息错误", zap.Error(err))
@@ -1928,6 +2065,37 @@ func (m *Message) mutualDelete(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrMessageDeleteForbidden, nil, nil)
 		return
 	}
+
+	// 解散守卫（企业微信式只读）：群解散后禁止互删消息。
+	if req.ChannelType == common.ChannelTypeGroup.Uint8() {
+		disbanded, err := m.isGroupDisbanded(req.ChannelID)
+		if err != nil {
+			m.Error("查询群是否已解散错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		if disbanded {
+			httperr.ResponseErrorL(c, errcode.ErrMessageGroupDisbanded, nil, nil)
+			return
+		}
+	} else if req.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
+		parentGroupNo, _, perr := thread.ParseChannelID(req.ChannelID)
+		if perr != nil || parentGroupNo == "" {
+			m.Error("解析子区频道ID失败（revoke）", zap.Error(perr), zap.String("channelID", req.ChannelID))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		disbanded, err := m.isGroupDisbanded(parentGroupNo)
+		if err != nil {
+			m.Error("查询父群是否已解散错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		if disbanded {
+			httperr.ResponseErrorL(c, errcode.ErrMessageGroupDisbanded, nil, nil)
+			return
+		}
+	}
 	// TOCTOU 交叉校验：确保权限检查的消息与待删除的消息是同一条
 	resolvedMessageID := strconv.FormatInt(resp.Messages[0].MessageID, 10)
 	if req.MessageID != resolvedMessageID {
@@ -2006,6 +2174,35 @@ func (m *Message) delete(c *wkhttp.Context) {
 			}
 			if !isMember {
 				httperr.ResponseErrorL(c, errcode.ErrMessageChannelAccessDenied, nil, nil)
+				return
+			}
+			// 解散守卫（企业微信式只读）：群解散后禁止删除消息。
+			disbanded, err := m.isGroupDisbanded(req.ChannelID)
+			if err != nil {
+				m.Error("查询群是否已解散错误", zap.Error(err))
+				httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+				return
+			}
+			if disbanded {
+				httperr.ResponseErrorL(c, errcode.ErrMessageGroupDisbanded, nil, nil)
+				return
+			}
+		} else if req.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
+			// 子区消息：解析父群并检查解散状态
+			parentGroupNo, _, perr := thread.ParseChannelID(req.ChannelID)
+			if perr != nil || parentGroupNo == "" {
+				m.Error("解析子区频道ID失败（delete）", zap.Error(perr), zap.String("channelID", req.ChannelID))
+				httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+				return
+			}
+			disbanded, err := m.isGroupDisbanded(parentGroupNo)
+			if err != nil {
+				m.Error("查询父群是否已解散错误", zap.Error(err))
+				httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+				return
+			}
+			if disbanded {
+				httperr.ResponseErrorL(c, errcode.ErrMessageGroupDisbanded, nil, nil)
 				return
 			}
 		}
@@ -2421,6 +2618,38 @@ func (m *Message) revoke(c *wkhttp.Context) {
 	if uint8(channelTypeI) == common.ChannelTypePerson.Uint8() {
 		fakeChannelID = common.GetFakeChannelIDWith(channelID, loginUID)
 	}
+
+	// 解散守卫（企业微信式只读）：群解散后禁止撤回消息。
+	if syncMsg.ChannelType == common.ChannelTypeGroup.Uint8() {
+		disbanded, err := m.isGroupDisbanded(syncMsg.ChannelID)
+		if err != nil {
+			m.Error("查询群是否已解散错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		if disbanded {
+			httperr.ResponseErrorL(c, errcode.ErrMessageGroupDisbanded, nil, nil)
+			return
+		}
+	} else if syncMsg.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
+		parentGroupNo, _, perr := thread.ParseChannelID(syncMsg.ChannelID)
+		if perr != nil || parentGroupNo == "" {
+			m.Error("解析子区频道ID失败（revoke）", zap.Error(perr), zap.String("channelID", syncMsg.ChannelID))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		disbanded, err := m.isGroupDisbanded(parentGroupNo)
+		if err != nil {
+			m.Error("查询父群是否已解散错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		if disbanded {
+			httperr.ResponseErrorL(c, errcode.ErrMessageGroupDisbanded, nil, nil)
+			return
+		}
+	}
+
 	message := &messageModel{
 		ChannelID:   syncMsg.ChannelID,
 		ChannelType: syncMsg.ChannelType,

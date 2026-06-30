@@ -187,4 +187,14 @@ var (
 		DefaultMessage: "Robot authentication check failed.",
 		Internal:       true,
 	})
+
+	// ErrRobotGroupDisbanded covers the disbanded-group guard for legacy robot
+	// endpoints: after a group is disbanded (group.status=2), robot write
+	// operations (sendMessage, streamStart, streamEnd, botMessageEdit) are
+	// rejected with 403 Forbidden (parity with ErrBotAPIGroupDisbanded).
+	ErrRobotGroupDisbanded = register(codes.Code{
+		ID:             "err.server.robot.group_disbanded",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "This group has been disbanded and is read-only.",
+	})
 )

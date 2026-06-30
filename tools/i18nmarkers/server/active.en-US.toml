@@ -72,6 +72,9 @@ other = "The file exceeds the maximum allowed size."
 ["err.server.bot_api.file_type_unsupported"]
 other = "Unsupported file type."
 
+["err.server.bot_api.group_disbanded"]
+other = "The group has been disbanded; messages can no longer be sent."
+
 ["err.server.bot_api.group_not_found"]
 other = "Group not found."
 
@@ -471,6 +474,9 @@ other = "You do not have permission to delete this message."
 ["err.server.message.edit_own_only"]
 other = "You can only edit your own messages."
 
+["err.server.message.group_disbanded"]
+other = "The group has been disbanded; messages can no longer be sent."
+
 ["err.server.message.group_not_found"]
 other = "The target group does not exist or has been deleted."
 
@@ -660,6 +666,9 @@ other = "The file exceeds the maximum allowed size."
 ["err.server.robot.file_type_unsupported"]
 other = "Unsupported file type."
 
+["err.server.robot.group_disbanded"]
+other = "This group has been disbanded and is read-only."
+
 ["err.server.robot.inline_query_timeout"]
 other = "The inline query timed out."
 
@@ -803,6 +812,9 @@ other = "Thread creator cannot leave the thread."
 
 ["err.server.thread.deleted"]
 other = "Thread has been deleted."
+
+["err.server.thread.group_disbanded"]
+other = "The group has been disbanded."
 
 ["err.server.thread.group_md_content_empty"]
 other = "GROUP.md content must not be empty."

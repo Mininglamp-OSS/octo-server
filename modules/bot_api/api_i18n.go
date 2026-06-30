@@ -116,6 +116,7 @@ var (
 	errBotSendPermNotFriend      = errors.New("bot is not a friend of this user")
 	errBotSendPermConvNotStarted = errors.New("user has not started conversation with this bot")
 	errBotSendPermNotGroupMember = errors.New("bot is not a member of this group")
+	errBotSendPermGroupDisbanded = errors.New("the group has been disbanded")
 	errBotSendPermNotSpaceMember = errors.New("user is no longer a member of bot's space")
 	errBotSendPermBadThreadChan  = errors.New("invalid thread channel_id format")
 	errBotSendPermCheckFailed    = errors.New("permission check failed")
@@ -134,6 +135,8 @@ func respondSendPermissionError(c *wkhttp.Context, err error) {
 		httperr.ResponseErrorL(c, errcode.ErrBotAPIConversationNotStarted, nil, nil)
 	case errors.Is(err, errBotSendPermNotGroupMember):
 		httperr.ResponseErrorL(c, errcode.ErrBotAPINotGroupMember, nil, nil)
+	case errors.Is(err, errBotSendPermGroupDisbanded):
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIGroupDisbanded, nil, nil)
 	case errors.Is(err, errBotSendPermNotSpaceMember):
 		httperr.ResponseErrorL(c, errcode.ErrBotAPINotSpaceMember, nil, nil)
 	case errors.Is(err, errBotSendPermBadThreadChan):

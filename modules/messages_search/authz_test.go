@@ -565,12 +565,33 @@ func TestCheckChannelAccess_GroupNonMemberDenied(t *testing.T) {
 	}
 }
 
-// TestCheckChannelAccess_GroupDisbandedDeniedEvenIfMember — disband must
-// short-circuit BEFORE membership, so leftover member rows can't leak
-// access on a disbanded group.
-func TestCheckChannelAccess_GroupDisbandedDeniedEvenIfMember(t *testing.T) {
+// TestCheckChannelAccess_GroupDisbandedAllowedForActiveMember — 企业微信式
+// disband 语义（产品决策 2026-06）：解散群历史与搜索保持可读，活跃成员仍可访问。
+// disband 不再短路成员校验——访问权交给 ExistMemberActive（移出/拉黑成员 is_deleted=1
+// 或 status!=Normal，仍会被拒）。
+func TestCheckChannelAccess_GroupDisbandedAllowedForActiveMember(t *testing.T) {
 	gSvc := &stubAuthzGroupSvc{
-		activeMembers: map[string]bool{"G1": true}, // bookkeeping says member
+		activeMembers: map[string]bool{"G1": true}, // 仍是活跃成员
+		groupModels: map[string]*group.InfoResp{
+			"G1": {GroupNo: "G1", Status: group.GroupStatusDisband},
+		},
+	}
+	h := newAuthzHandler(gSvc)
+	c, _ := newAuthzCtx(t)
+
+	if !h.checkChannelAccess(c, channelTypeGroup, "G1", "me") {
+		t.Fatalf("解散群的活跃成员必须被放行（历史/搜索可读）")
+	}
+	if gSvc.memberCalls == 0 {
+		t.Fatalf("disband 不再短路：必须仍调用 ExistMemberActive 把关成员资格")
+	}
+}
+
+// TestCheckChannelAccess_GroupDisbandedDeniedForNonMember — 解散后被移出/非成员
+// 仍应被拒（ExistMemberActive 返回 false），不能借残留 group_member 行越权读。
+func TestCheckChannelAccess_GroupDisbandedDeniedForNonMember(t *testing.T) {
+	gSvc := &stubAuthzGroupSvc{
+		activeMembers: map[string]bool{}, // 非活跃成员（已移出 / 被拉黑）
 		groupModels: map[string]*group.InfoResp{
 			"G1": {GroupNo: "G1", Status: group.GroupStatusDisband},
 		},
@@ -579,10 +600,7 @@ func TestCheckChannelAccess_GroupDisbandedDeniedEvenIfMember(t *testing.T) {
 	c, rec := newAuthzCtx(t)
 
 	if h.checkChannelAccess(c, channelTypeGroup, "G1", "me") {
-		t.Fatalf("disbanded group must be denied even with stale active membership")
-	}
-	if gSvc.memberCalls != 0 {
-		t.Fatalf("disband must short-circuit before ExistMemberActive; got %d member calls", gSvc.memberCalls)
+		t.Fatalf("解散群的非成员必须被拒")
 	}
 	if rec.Body.Len() == 0 {
 		t.Fatalf("denial must write a response")

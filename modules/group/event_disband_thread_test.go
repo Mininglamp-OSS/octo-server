@@ -10,11 +10,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestHandleGroupDisbandEvent_CleansThreadMembers 回归 YUJ-4185 P1-1：群解散原本
-// 只 IMDelChannel 父群 + 清父群 pinned，不遍历子区 —— 子区频道仍存活、成员订阅未摘，
-// 解散后成员仍能经子区频道收/拉历史（越权读）。修复后解散遍历所有非删除子区，
-// 删除子区 IM 频道并清成员订阅 / 置顶。DB-level 断言：thread_member 被清空。
-func TestHandleGroupDisbandEvent_CleansThreadMembers(t *testing.T) {
+// TestHandleGroupDisbandEvent_PreservesThreadMembers 验证企业微信式解散语义
+// （产品决策 2026-06，语义相对 YUJ-4185 反转）：群解散后频道与历史**保留**，
+// 子区结构 / thread_member / thread_setting 不再被清空——成员仍能查看历史、
+// 会话仍留在 sidebar。发送拦截改由 WuKongIM 的 disband flag 承担（见
+// modules/group/1module.go 与 modules/thread/1module.go 的 ChannelInfo datasource），
+// 不再 IMDelChannel。
+//
+// DB-level 断言：解散事件提交后 thread_member 行仍在。
+func TestHandleGroupDisbandEvent_PreservesThreadMembers(t *testing.T) {
 	svc, userDB := setupServiceTest(t)
 	s := svc.(*Service)
 	f := New(s.ctx)
@@ -37,7 +41,7 @@ func TestHandleGroupDisbandEvent_CleansThreadMembers(t *testing.T) {
 		Status: 1, Version: 1, Vercode: fmt.Sprintf("%s@1", util.GenerUUID()),
 	}))
 
-	// 两个子区（active + archived），都要被清理
+	// 两个子区（active + archived），解散后都应保留（历史可看）
 	resActive, err := f.ctx.DB().InsertInto("thread").
 		Columns("short_id", "group_no", "name", "creator_uid", "status", "version").
 		Values("disband_active", groupNo, "active-sub", "db_owner", 1, 1).Exec()
@@ -72,11 +76,18 @@ func TestHandleGroupDisbandEvent_CleansThreadMembers(t *testing.T) {
 	require.True(t, committed, "handler 必须调用 commit")
 	require.NoError(t, commitErr, "群解散处理不应报错")
 
-	// 核心断言：所有子区成员记录被清理（active + archived）
+	// 核心断言：所有子区成员记录被保留（active + archived），历史可看。
 	var postCount int
 	_, err = f.ctx.DB().Select("count(*)").From("thread_member").
 		Where("uid=? AND thread_id IN (SELECT id FROM thread WHERE group_no=?)", "db_member", groupNo).
 		Load(&postCount)
 	require.NoError(t, err)
-	assert.Equal(t, 0, postCount, "群解散必须清理所有子区成员/订阅（YUJ-4185 P1-1）")
+	assert.Equal(t, 2, postCount, "企业微信式解散：子区成员记录必须保留（历史可看）")
+
+	// 子区行本身也应保留（结构不删）
+	var threadCount int
+	_, err = f.ctx.DB().Select("count(*)").From("thread").
+		Where("group_no=?", groupNo).Load(&threadCount)
+	require.NoError(t, err)
+	assert.Equal(t, 2, threadCount, "企业微信式解散：子区结构必须保留")
 }

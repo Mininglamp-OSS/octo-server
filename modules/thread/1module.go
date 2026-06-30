@@ -119,6 +119,23 @@ func init() {
 					}
 					channelInfoMap["status"] = thread.Status
 
+					// 父群解散后，子区频道与历史保留（成员仍可查看），但任何人（含群主）
+					// 都不能再发消息。与父群 datasource（modules/group/1module.go 的
+					// ChannelInfo：Status==Disband 时吐 disband=1）对齐，让 WuKongIM 在
+					// 发送权限检查最前面就拒绝所有发送者。子区的 Whitelist 只继承父群
+					// Forbidden（禁言），不感知解散，所以解散拦截必须由这里的 disband
+					// flag 承担。
+					// fail-closed：查询父群状态出错时直接返回错误，不能吐一个不带
+					// disband 的 channelInfoMap——否则 WuKongIM 会缓存「未解散」态，
+					// 解散群的子区在缓存有效期内仍可发消息（CR 阻塞项）。
+					groupInfo, gErr := groupService.GetGroupWithGroupNo(groupNo)
+					if gErr != nil {
+						return nil, gErr
+					}
+					if groupInfo != nil && groupInfo.Status == group.GroupStatusDisband {
+						channelInfoMap["disband"] = 1
+					}
+
 					return channelInfoMap, nil
 				},
 				Subscribers: func(channelID string, channelType uint8) ([]string, error) {

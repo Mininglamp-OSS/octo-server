@@ -60,6 +60,9 @@ other = "子区状态无效。"
 ["err.server.thread.not_group_member"]
 other = "你不是群成员。"
 
+["err.server.thread.group_disbanded"]
+other = "群聊已解散。"
+
 ["err.server.thread.permission_denied"]
 other = "无权执行此子区操作。"
 
@@ -503,6 +506,9 @@ other = "你没有权限操作此频道。"
 ["err.server.message.not_group_member"]
 other = "你不是该群成员。"
 
+["err.server.message.group_disbanded"]
+other = "群聊已解散，无法发送消息。"
+
 ["err.server.message.delete_forbidden"]
 other = "你没有权限删除此消息。"
 
@@ -829,6 +835,9 @@ other = "生成机器人令牌失败。"
 ["err.server.robot.auth_check_failed"]
 other = "机器人鉴权校验失败。"
 
+["err.server.robot.group_disbanded"]
+other = "群组已解散，只能查看。"
+
 # ---- err.server.space.* (modules/space: api.go / api_manager.go / api_email_invite*.go) ----
 
 ["err.server.space.request_invalid"]
@@ -1000,6 +1009,9 @@ other = "请求体包含 OBO 保留字段。"
 
 ["err.server.bot_api.not_group_member"]
 other = "机器人不是该群成员。"
+
+["err.server.bot_api.group_disbanded"]
+other = "群聊已解散，无法发送消息。"
 
 ["err.server.bot_api.not_group_admin"]
 other = "机器人不是该群管理员。"

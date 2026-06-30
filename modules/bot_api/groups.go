@@ -213,6 +213,16 @@ func (ba *BotAPI) updateGroupMd(c *wkhttp.Context) {
 		return
 	}
 
+	// 解散守卫（企业微信式只读）：群解散后禁止 bot 写 GROUP.md。
+	if disbanded, err := ba.isGroupDisbanded(groupNo); err != nil {
+		ba.Error("查询群是否已解散错误", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+		return
+	} else if disbanded {
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIGroupDisbanded, nil, nil)
+		return
+	}
+
 	isMember, err := ba.groupService.ExistMember(groupNo, robotID)
 	if err != nil {
 		ba.Error("check group membership failed", zap.Error(err))
@@ -474,6 +484,16 @@ func (ba *BotAPI) botGroupUpdate(c *wkhttp.Context) {
 		return
 	}
 
+	// 解散守卫（企业微信式只读）：群解散后禁止 bot 修改群信息。
+	if disbanded, err := ba.isGroupDisbanded(groupNo); err != nil {
+		ba.Error("查询群是否已解散错误", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+		return
+	} else if disbanded {
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIGroupDisbanded, nil, nil)
+		return
+	}
+
 	botName := ba.resolveBotDisplayName(robotID)
 
 	isMember, err := ba.groupService.ExistMember(groupNo, robotID)
@@ -535,6 +555,16 @@ func (ba *BotAPI) botGroupMemberAdd(c *wkhttp.Context) {
 	// App Bot is DM-only — deny group operations
 	if getBotKindFromContext(c) == BotKindApp {
 		httperr.ResponseErrorL(c, errcode.ErrBotAPIAppBotUnsupported, nil, nil)
+		return
+	}
+
+	// 解散守卫（企业微信式只读）：群解散后禁止 bot 添加成员。
+	if disbanded, err := ba.isGroupDisbanded(groupNo); err != nil {
+		ba.Error("查询群是否已解散错误", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+		return
+	} else if disbanded {
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIGroupDisbanded, nil, nil)
 		return
 	}
 
@@ -610,6 +640,16 @@ func (ba *BotAPI) botGroupMemberRemove(c *wkhttp.Context) {
 	// App Bot is DM-only — deny group operations
 	if getBotKindFromContext(c) == BotKindApp {
 		httperr.ResponseErrorL(c, errcode.ErrBotAPIAppBotUnsupported, nil, nil)
+		return
+	}
+
+	// 解散守卫（企业微信式只读）：群解散后禁止 bot 移除成员。
+	if disbanded, err := ba.isGroupDisbanded(groupNo); err != nil {
+		ba.Error("查询群是否已解散错误", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+		return
+	} else if disbanded {
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIGroupDisbanded, nil, nil)
 		return
 	}
 

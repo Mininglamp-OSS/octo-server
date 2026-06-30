@@ -350,23 +350,25 @@ func TestQueryMessageByID_UsesIndex(t *testing.T) {
 	assert.NotEqual(t, "ALL", planType, "string-bound query 必须命中索引，不能 type=ALL，否则上线会全表扫")
 }
 
-// 群解散后 group_member 记录不会清理，仅 group.status=GroupStatusDisband。
-// 单查 ExistMember 不够，必须再查群状态，否则解散群历史能被本地直查接口读出。
-func TestGetGroupMessage_DisbandedGroup_404(t *testing.T) {
+// 企业微信式解散语义（产品决策 2026-06）：群解散后频道与历史保留，活跃成员仍能
+// 按 ID 直查历史消息。requireGroupMember 放行 Disband（仅 Disabled 等其它非正常
+// 状态 fail closed），成员资格仍由 ExistMemberActive 把关。
+func TestGetGroupMessage_DisbandedGroup_StillReadable(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx, groupNo := setupGroupTestData(t)
 	const mid int64 = 7201
 	insertGroupMessage(t, ctx, groupNo, common.ChannelTypeGroup.Uint8(), mid)
 
-	// 在拿到合法 200 之后再解散群，模拟"消息发出后群被解散"的场景。
+	// 解散前可查
 	w := doGet(t, s, fmt.Sprintf("/v1/groups/%s/messages/%d", groupNo, mid))
 	assert.Equal(t, http.StatusOK, w.Code, "前置条件：解散前应能查到")
 
 	_, err := ctx.DB().UpdateBySql("UPDATE `group` SET status=? WHERE group_no=?", group.GroupStatusDisband, groupNo).Exec()
 	assert.NoError(t, err)
 
+	// 解散后历史仍可读（活跃成员）
 	w = doGet(t, s, fmt.Sprintf("/v1/groups/%s/messages/%d", groupNo, mid))
-	assert.Equal(t, http.StatusNotFound, w.Code, w.Body.String())
+	assert.Equal(t, http.StatusOK, w.Code, "企业微信式解散：活跃成员解散后仍能读历史")
 }
 
 // message 表自身 is_deleted=1（双向删除写到这里）也要返回 404。

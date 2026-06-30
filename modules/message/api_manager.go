@@ -794,17 +794,24 @@ func (m *Manager) sendMsg(c *wkhttp.Context) {
 		receiverName = user.Name
 	}
 	if req.ReceivedChannelType == int(common.ChannelTypeGroup) {
-		group, err := m.groupService.GetGroupWithGroupNo(req.ReceivedChannelID)
+		groupInfo, err := m.groupService.GetGroupWithGroupNo(req.ReceivedChannelID)
 		if err != nil {
 			m.Error("查询接受群信息错误", zap.Error(err), zap.String("groupNo", req.ReceivedChannelID))
 			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
-		if group == nil {
+		if groupInfo == nil {
 			httperr.ResponseErrorL(c, errcode.ErrMessageGroupNotFound, nil, nil)
 			return
 		}
-		receiverName = group.Name
+		// 解散守卫：群解散后只读，超管代发也不例外（与用户路径 /v1/message/send、
+		// bot 路径 bot_api/send.go 一致）。部署版 WuKongIM 对解散群拒发不返回失败
+		// 信号，故此处自查 group.status，避免超管绕过解散限制。
+		if groupInfo.Status == group.GroupStatusDisband {
+			httperr.ResponseErrorL(c, errcode.ErrMessageGroupDisbanded, nil, nil)
+			return
+		}
+		receiverName = groupInfo.Name
 	}
 	// YUJ-660 Medium-1 partial: super-admin sendMsg path also needs server-
 	// authoritative payload.space_id. /v1/manager has no SpaceMiddleware

@@ -165,6 +165,11 @@ func (s *Service) CreateThread(req *CreateThreadReq) (*ThreadResp, error) {
 		return nil, errors.New("not a group member")
 	}
 
+	// 父群已解散则禁止建子区（企业微信式解散：历史保留可看，但禁止任何写操作）。
+	if err := s.ensureGroupNotDisbanded(req.GroupNo); err != nil {
+		return nil, err
+	}
+
 	// 生成 shortID（snowflake ID）
 	shortID := fmt.Sprintf("%d", s.ctx.UserIDGen.Generate().Int64())
 
@@ -216,6 +221,17 @@ func (s *Service) CreateThread(req *CreateThreadReq) (*ThreadResp, error) {
 		return nil, fmt.Errorf("insert creator as member: %w", err)
 	}
 
+	// 事务内再次检查父群是否已解散（缩小竞态窗口：commit 前检查 group.status）
+	var groupStatus int
+	if serr := tx.SelectBySql("SELECT status FROM `group` WHERE group_no=? FOR UPDATE", req.GroupNo).LoadOne(&groupStatus); serr != nil {
+		_ = tx.Rollback()
+		return nil, fmt.Errorf("re-check group status in tx: %w", serr)
+	}
+	if groupStatus == group.GroupStatusDisband {
+		_ = tx.Rollback()
+		return nil, errGroupDisbanded
+	}
+
 	if err = tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit transaction: %w", err)
 	}
@@ -240,6 +256,36 @@ func (s *Service) CreateThread(req *CreateThreadReq) (*ThreadResp, error) {
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create IM channel: %w", err)
+	}
+
+	// Post-creation safety check: 如果父群在 thread 创建期间被并发解散，
+	// 清理新建的 thread 记录并返回错误（而不是只推 Disband:1 就完事）。
+	if perr := s.ensureGroupNotDisbanded(req.GroupNo); perr != nil {
+		if errors.Is(perr, errGroupDisbanded) {
+			s.Warn("CreateThread 后检测到父群已解散，清理新建子区",
+				zap.String("groupNo", req.GroupNo),
+				zap.String("channelID", channelID))
+			// 推送 Disband:1 到新子区 IM channel（幂等，确保 WuKongIM 层也标记）
+			if pushErr := s.ctx.IMCreateOrUpdateChannelInfo(&config.ChannelInfoCreateReq{
+				ChannelID:   channelID,
+				ChannelType: common.ChannelTypeCommunityTopic.Uint8(),
+				Disband:     1,
+			}); pushErr != nil {
+				s.Error("推送新子区 disband flag 失败", zap.Error(pushErr))
+			}
+			// 清理数据库中新建的 thread 和 member 记录
+			if delErr := s.db.DeleteThreadAndMembers(threadID); delErr != nil {
+				s.Error("清理并发创建的子区失败", zap.Error(delErr), zap.Int64("threadID", threadID))
+			}
+			return nil, errGroupDisbanded
+		}
+		// 非 sentinel 错误（DB 故障等）也 fail-closed，不放行已创建的子区。
+		s.Error("CreateThread 后检查父群解散状态失败（fail-closed）",
+			zap.String("groupNo", req.GroupNo), zap.Error(perr))
+		if delErr := s.db.DeleteThreadAndMembers(threadID); delErr != nil {
+			s.Error("清理并发创建的子区失败", zap.Error(delErr), zap.Int64("threadID", threadID))
+		}
+		return nil, fmt.Errorf("post-creation disband recheck: %w", perr)
 	}
 
 	// 给所有"已对父 channel 开启 auto_follow_threads=1"的用户 fanout 一行 thread ext。
@@ -380,6 +426,11 @@ func (s *Service) UpdateName(groupNo, shortID, operatorUID, name string) error {
 	if thread.Status == ThreadStatusDeleted {
 		return errors.New("thread has been deleted")
 	}
+
+	// 企业微信式解散语义（产品决策 2026-06）：子区改名属低风险写，解散后仍允许——
+	// 对齐会话置顶（group/api.go:groupSettingUpdate 的 settingActionMap 豁免解散校验）。
+	// 故此处不再调 ensureGroupNotDisbanded；改名仍受下方「父群活跃成员 + creator/admin」
+	// 权限校验保护。建子区 / 加入 / 归档 / 删除 / GROUP.md 仍由各自守卫拦截。
 
 	// 子区操作权来自「父群活跃成员」身份：被拉黑/移出父群的用户即使是子区创建者也
 	// 无权改名。必须在授予 creator/admin 特权之前先校验。fail-closed。
@@ -684,10 +735,35 @@ func (s *Service) ExistThread(groupNo, shortID string) (bool, error) {
 	return exist, nil
 }
 
+// errGroupDisbanded 是父群已解散时所有子区写操作返回的 sentinel error。
+// 字符串 "group has been disbanded" 被 classifyThreadError（api.go）映射到
+// errcode.ErrThreadGroupDisbanded（403）。企业微信式解散语义：解散后子区历史
+// 与频道保留可看，但禁止建子区 / 加入 / 改名 / 归档 / 删除等任何写操作。
+var errGroupDisbanded = errors.New("group has been disbanded")
+
+// ensureGroupNotDisbanded 在子区写操作前校验父群未解散。
+// fail-closed：查询出错时一并拒绝（返回原始错误），避免解散群在 DB 抖动窗口被写入。
+func (s *Service) ensureGroupNotDisbanded(groupNo string) error {
+	groupInfo, err := s.groupService.GetGroupWithGroupNo(groupNo)
+	if err != nil {
+		return fmt.Errorf("query group status: %w", err)
+	}
+	if groupInfo != nil && groupInfo.Status == group.GroupStatusDisband {
+		return errGroupDisbanded
+	}
+	return nil
+}
+
 // canOperate 检查是否有操作权限（创建者或群管理员）
 // 注：此方法存在 TOCTOU 竞态条件，但实际删除/归档操作会再次检查状态，
 // 最坏情况仅是在极短时间窗口内返回已过期的权限判断，风险可接受。
 func (s *Service) canOperate(groupNo, shortID, uid string) (bool, error) {
+	// 父群已解散则禁止任何子区写操作（改名 / 归档 / 解档 / 删除 / GROUP.md 编辑）。
+	// 返回 errGroupDisbanded 而非 (false, nil)，让 API 层映射到 group_disbanded(403)
+	// 而非笼统的 permission_denied，与建子区 / 加入子区的拒绝语义一致。
+	if err := s.ensureGroupNotDisbanded(groupNo); err != nil {
+		return false, err
+	}
 	thread, err := s.db.QueryByGroupNoAndShortID(groupNo, shortID)
 	if err != nil {
 		return false, fmt.Errorf("query thread: %w", err)
@@ -880,6 +956,11 @@ func (s *Service) JoinThread(groupNo, shortID, uid string) error {
 		return errors.New("not a group member")
 	}
 
+	// 父群已解散则禁止加入子区。
+	if err := s.ensureGroupNotDisbanded(groupNo); err != nil {
+		return err
+	}
+
 	// 获取子区
 	thread, err := s.db.QueryByGroupNoAndShortID(groupNo, shortID)
 	if err != nil {
@@ -926,6 +1007,9 @@ func (s *Service) JoinThread(groupNo, shortID, uid string) error {
 
 // LeaveThread 离开子区
 func (s *Service) LeaveThread(groupNo, shortID, uid string) error {
+	if err := s.ensureGroupNotDisbanded(groupNo); err != nil {
+		return err
+	}
 	thread, err := s.db.QueryByGroupNoAndShortID(groupNo, shortID)
 	if err != nil {
 		return fmt.Errorf("query thread: %w", err)
@@ -1012,6 +1096,7 @@ func (s *Service) IsMember(groupNo, shortID, uid string) (bool, error) {
 
 // UpdateSetting 更新用户对某子区的个人设置(目前支持 mute)
 // 权限: 必须是活跃父群成员(排除黑名单); 无需是子区成员(与群聊 setting 行为保持一致)
+// 注意: 这是个人偏好设置，不是群组内容，解散后仍然允许操作
 func (s *Service) UpdateSetting(groupNo, shortID, uid string, settings map[string]interface{}) error {
 	isGroupMember, err := s.groupService.ExistMemberActive(groupNo, uid)
 	if err != nil {

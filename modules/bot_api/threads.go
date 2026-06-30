@@ -254,6 +254,16 @@ func (ba *BotAPI) botUpdateThreadMd(c *wkhttp.Context) {
 		return
 	}
 
+	// 解散守卫：与用户端 threadMdUpdate 对齐，父群已解散时禁止 bot 写子区 GROUP.md。
+	if disbanded, err := ba.isGroupDisbanded(groupNo); err != nil {
+		ba.Error("check group disband status failed", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+		return
+	} else if disbanded {
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIGroupDisbanded, nil, nil)
+		return
+	}
+
 	isBotAdmin, err := ba.groupService.IsBotAdmin(groupNo, robotID)
 	if err != nil {
 		ba.Error("check bot admin failed", zap.Error(err))

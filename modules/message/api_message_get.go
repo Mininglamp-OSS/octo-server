@@ -176,9 +176,12 @@ func (m *Message) requireGroupMember(c *wkhttp.Context, groupNo, loginUID string
 		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return false
 	}
-	// 白名单语义：只有 GroupStatusNormal 允许通过；Disband / Disabled / 未来新增的
-	// 非正常状态一律 fail closed。与 ExistMemberActive 的 status=Normal 一致。
-	if g == nil || g.Status != group.GroupStatusNormal {
+	// 读历史白名单：Normal 正常群 + Disband 已解散群都放行。
+	// 企业微信式"解散"语义（产品决策 2026-06）：群解散后频道与历史保留，活跃成员
+	// 仍可查看历史消息（发消息由 WuKongIM 的 disband flag 拦截，不在本读路径处理）。
+	// Disabled（管理员禁用）及未来新增的非正常状态仍 fail closed。成员身份与黑名单
+	// 仍由下面的 ExistMemberActive 把关。
+	if g == nil || (g.Status != group.GroupStatusNormal && g.Status != group.GroupStatusDisband) {
 		httperr.ResponseErrorL(c, errcode.ErrMessageNotFound, nil, nil)
 		return false
 	}
