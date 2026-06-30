@@ -335,10 +335,12 @@ func TestGetUploadCredentials_ObjectKeyWithFilename(t *testing.T) {
 			wantContentDisp:    false,
 		},
 		{
-			name:            "sticker type with filename",
+			// 贴纸禁止走预签名直传（绕过 StickerMaxFileSize + 魔数 + 格式校验），
+			// 必须走 multipart /v1/file/upload —— 此处固化 400 回归（PR #508 review）。
+			name:            "sticker type is rejected on the presigned path",
 			queryParams:     "type=sticker&filename=sticker.gif&fileSize=512",
-			wantStatus:      http.StatusOK,
-			wantContentDisp: true,
+			wantStatus:      http.StatusBadRequest,
+			wantContentDisp: false,
 		},
 		{
 			name:            "path and filename both provided uses path for key and filename for disposition",
