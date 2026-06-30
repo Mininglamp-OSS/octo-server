@@ -96,6 +96,14 @@ func (s *Sticker) add(ctx *wkhttp.Context) {
 		respondStickerFormatUnsupported(ctx, format)
 		return
 	}
+	// path 必须指向「本人」走 type=sticker 强约束上传产生的对象
+	// （sticker/{loginUID}/<name>.<ext>，且 ext == format）。否则客户端可上传
+	// type=chat（100MB/宽松白名单）再把该 URL 注册成贴纸，绕过 1MB + 仅位图的
+	// 上传契约；或注册他人/外部对象（PR#508 review）。
+	if !validateStickerPath(req.Path, loginUID, format) {
+		respondStickerRequestInvalid(ctx, "path")
+		return
+	}
 	placeholder := req.Placeholder
 	if placeholder == "" {
 		placeholder = defaultStickerPlaceholder
@@ -105,9 +113,11 @@ func (s *Sticker) add(ctx *wkhttp.Context) {
 		return
 	}
 
-	// 配额：管理端可配 system_setting sticker.user_max_count，默认 100。计数与
-	// 插入放进同一事务，并对该用户已有贴纸行加 FOR UPDATE 锁，消除 count→insert
-	// 的 TOCTOU —— 否则并发 POST 可同时通过校验、双双插入而超额。
+	// 配额：管理端可配 system_setting sticker.user_max_count，默认 100。计数与插入
+	// 放进同一事务，并先对「本人 user 行」加 FOR UPDATE 记录锁串行化同一用户的并发
+	// 新增，消除 count→insert 的 TOCTOU —— 否则并发 POST 可同时通过校验、双双插入而
+	// 超额。锁 user 行（唯一索引上的记录锁）而非对 sticker 子表 count(*) FOR UPDATE
+	// （非唯一索引 → gap 锁，首插死锁），见 db.go lockUserRowTx 说明。
 	max := s.settings.StickerUserMaxCount()
 
 	tx, err := s.ctx.DB().Begin()
@@ -118,7 +128,13 @@ func (s *Sticker) add(ctx *wkhttp.Context) {
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	count, err := s.db.countByUIDForUpdateTx(tx, loginUID)
+	if err := s.db.lockUserRowTx(tx, loginUID); err != nil {
+		s.Error("锁定用户行失败", zap.Error(err))
+		httperr.ResponseErrorL(ctx, errcode.ErrStickerStoreFailed, nil, nil)
+		return
+	}
+
+	count, err := s.db.countByUIDTx(tx, loginUID)
 	if err != nil {
 		s.Error("查询贴纸数量失败", zap.Error(err))
 		httperr.ResponseErrorL(ctx, errcode.ErrStickerQueryFailed, nil, nil)

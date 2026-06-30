@@ -27,7 +27,7 @@ var fileMagicNumbers = map[string][][]byte{
 	".png":  {{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}},
 	".gif":  {{0x47, 0x49, 0x46, 0x38, 0x37, 0x61}, {0x47, 0x49, 0x46, 0x38, 0x39, 0x61}}, // GIF87a, GIF89a
 	".bmp":  {{0x42, 0x4D}},
-	".webp": {{0x52, 0x49, 0x46, 0x46}}, // RIFF header (need to check WEBP at offset 8)
+	".webp": {{0x52, 0x49, 0x46, 0x46}}, // RIFF header; the "WEBP" fourCC at bytes 8-11 is verified separately in ValidateMagicNumber
 	".ico":  {{0x00, 0x00, 0x01, 0x00}},
 	// 文档
 	".pdf": {{0x25, 0x50, 0x44, 0x46}}, // %PDF
@@ -80,6 +80,14 @@ func ValidateMagicNumber(ext string, header []byte) bool {
 			return true
 		}
 		return false
+	}
+
+	// .webp 是 RIFF 容器：仅匹配 RIFF 前缀会放过同样以 RIFF 开头的 .wav/.avi（它们在
+	// fileMagicNumbers 里注册的也是裸 RIFF）。WebP 在 bytes 8-11 携带 "WEBP" fourCC，
+	// 必须一并校验，否则非 WebP 的 RIFF 流改名 .webp 就能冒充贴纸位图过白名单
+	// （PR#508 review: Jerry-Xin / yujiawei / OctoBoooot）。
+	if ext == ".webp" {
+		return len(header) >= 12 && string(header[0:4]) == "RIFF" && string(header[8:12]) == "WEBP"
 	}
 
 	signatures, exists := fileMagicNumbers[ext]

@@ -13,7 +13,7 @@ source: self
 # Task: custom-sticker-management
 
 > One task = one `.octospec/tasks/<slug>/` directory. This brief is the spec for
-> the work. AI may draft it from existing code; a human confirms it.
+> the work, reviewed and confirmed by a maintainer.
 
 ## Goal
 

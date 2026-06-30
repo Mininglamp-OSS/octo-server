@@ -404,6 +404,14 @@ func TestValidateMagicNumber(t *testing.T) {
 		{"valid gif89a", ".gif", []byte{0x47, 0x49, 0x46, 0x38, 0x39, 0x61}, true},
 		{"invalid gif", ".gif", []byte{0xFF, 0xD8, 0xFF}, false},
 
+		// WebP (RIFF container — must also carry the "WEBP" fourCC at bytes 8-11,
+		// else WAV/AVI RIFF streams renamed .webp would pass; PR#508 review).
+		{"valid webp", ".webp", []byte{'R', 'I', 'F', 'F', 0x10, 0x00, 0x00, 0x00, 'W', 'E', 'B', 'P'}, true},
+		{"webp riff but wav fourcc", ".webp", []byte{'R', 'I', 'F', 'F', 0x10, 0x00, 0x00, 0x00, 'W', 'A', 'V', 'E'}, false},
+		{"webp riff but avi fourcc", ".webp", []byte{'R', 'I', 'F', 'F', 0x10, 0x00, 0x00, 0x00, 'A', 'V', 'I', 0x20}, false},
+		{"webp riff prefix only too short", ".webp", []byte{'R', 'I', 'F', 'F'}, false},
+		{"webp non-riff", ".webp", []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}, false},
+
 		// PDF
 		{"valid pdf", ".pdf", []byte{0x25, 0x50, 0x44, 0x46, 0x2D}, true},
 		{"invalid pdf", ".pdf", []byte{0x50, 0x4B, 0x03, 0x04}, false},

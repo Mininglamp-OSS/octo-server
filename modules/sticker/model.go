@@ -1,6 +1,7 @@
 package sticker
 
 import (
+	"regexp"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/db"
@@ -44,6 +45,47 @@ func normalizeStickerFormat(format string) string {
 // isAllowedStickerFormat reports whether format (already normalized) is accepted.
 func isAllowedStickerFormat(format string) bool {
 	return allowedStickerFormats[format]
+}
+
+// stickerObjectKeyRe matches the object-key tail the multipart uploader always
+// produces for a sticker: ".../sticker/<uid>/<name>.<ext>" (see
+// modules/file/api.go getFilePath TypeSticker → key "sticker/{loginUID}/{uuid}.ext").
+// Matching the stable key segment lets us validate ownership without resolving
+// each storage backend's URL shape, so it works whether req.Path is a relative
+// preview key or an absolute S3/MinIO/OSS/COS/CDN download URL.
+var stickerObjectKeyRe = regexp.MustCompile(`(?:^|/)sticker/([^/]+)/[^/]+\.([A-Za-z0-9]+)$`)
+
+// validateStickerPath reports whether path refers to an object produced by THIS
+// user's sticker-hardened upload: its object key must be
+// "sticker/{loginUID}/<name>.<ext>" with <ext> an allowed raster format equal to
+// the (already normalized) declared format. This closes the cross-type
+// registration bypass — uploading via type=chat (looser 100MB cap + general
+// allowlist) and registering that URL as a sticker — and the foreign/other-user
+// path case, without a per-backend URL normalizer.
+//
+// Pragmatic prefix check, by design (PR#508, maintainer-approved): an absolute
+// URL on an UNCONFIGURED origin that happens to carry the right
+// ".../sticker/{loginUID}/x.gif" tail still passes — we deliberately do NOT pin
+// the host to configured storage origins. The residual is self-scoped: the
+// forged sticker only ever renders back to the registering user's own list (no
+// server-side consumer reads sticker.path for another user, and the message-send
+// path already accepts client-supplied sticker URLs unvalidated), so it grants
+// no capability the sender does not already have.
+func validateStickerPath(path, loginUID, format string) bool {
+	// Strip query/fragment so a signed download URL (…?X-Amz-Signature=…) still
+	// matches on its key tail.
+	if i := strings.IndexAny(path, "?#"); i >= 0 {
+		path = path[:i]
+	}
+	m := stickerObjectKeyRe.FindStringSubmatch(path)
+	if m == nil {
+		return false
+	}
+	if m[1] != loginUID {
+		return false
+	}
+	ext := normalizeStickerFormat(m[2])
+	return ext == format && isAllowedStickerFormat(ext)
 }
 
 // ---------- Request ----------
