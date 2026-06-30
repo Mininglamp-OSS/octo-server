@@ -200,6 +200,13 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 		c.ResponseError(fmt.Errorf("不支持上传%s类型的文件", ext))
 		return
 	}
+	// 贴纸只接受位图格式（stickerUploadExts：gif/png/jpg/jpeg/webp）。全局
+	// allowlist 还允许 pdf/zip/mp4 等，不收紧会让非图对象落入 sticker 桶。
+	if Type(fileType) == TypeSticker && !stickerUploadExts[ext] {
+		f.Warn("贴纸不支持的格式", zap.String("filename", fileName), zap.String("ext", ext))
+		c.ResponseError(fmt.Errorf("贴纸仅支持 gif/png/jpg/jpeg/webp，不支持%s", ext))
+		return
+	}
 
 	// If contentType is the default octet-stream, try to infer from file extension
 	if contentType == "application/octet-stream" {
@@ -451,6 +458,14 @@ func (f *File) getUploadCredentials(c *wkhttp.Context) {
 	filename := c.Query("filename")
 	contentType := c.Query("contentType")
 	fileSizeRaw := strings.TrimSpace(c.Query("fileSize"))
+
+	// 贴纸必须走 multipart /v1/file/upload —— 该路径强制 StickerMaxFileSize(1MB)
+	// + 魔数 + 格式白名单。预签名直传绕过服务端内容校验，若放行 type=sticker，
+	// 用户可签发超额/非图对象直传后再注册为贴纸 URL，绕开 1MB 上限与格式约束。
+	if Type(fileType) == TypeSticker {
+		c.ResponseError(errors.New("贴纸请使用 multipart 上传接口，不支持预签名直传"))
+		return
+	}
 
 	// fileSize is REQUIRED — without it the presigned PUT would have no
 	// signed Content-Length and the client could upload arbitrary bytes

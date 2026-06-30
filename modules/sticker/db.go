@@ -33,11 +33,20 @@ func (d *stickerDB) listByUID(uid string) ([]*StickerModel, error) {
 	return models, err
 }
 
-func (d *stickerDB) countByUID(uid string) (int, error) {
+// insertTx inserts within an existing transaction. add() wraps the quota
+// count and this insert in one tx so the per-user cap is enforced atomically.
+func (d *stickerDB) insertTx(tx *dbr.Tx, m *StickerModel) error {
+	_, err := tx.InsertInto("sticker").Columns(util.AttrToUnderscore(m)...).Record(m).Exec()
+	return err
+}
+
+// countByUIDForUpdateTx counts the user's live stickers while taking row/gap
+// locks (FOR UPDATE) on the (uid,status) index range, so a concurrent add for
+// the same uid serializes behind it — closing the count→insert TOCTOU on the
+// quota check.
+func (d *stickerDB) countByUIDForUpdateTx(tx *dbr.Tx, uid string) (int, error) {
 	var count int
-	_, err := d.session.Select("count(*)").From("sticker").
-		Where("uid=? and status=1", uid).
-		Load(&count)
+	_, err := tx.SelectBySql("SELECT count(*) FROM sticker WHERE uid=? AND status=1 FOR UPDATE", uid).Load(&count)
 	return count, err
 }
 

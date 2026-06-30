@@ -12,7 +12,7 @@ import (
 	"go.uber.org/zap"
 )
 
-// field-length caps. path is bounded by the sticker.path column (VARCHAR 255);
+// field-length caps. path is bounded by the sticker.path column (VARCHAR 512);
 // placeholder by sticker.placeholder (VARCHAR 100). Enforced in Go so an
 // oversized value gets a clean 400 instead of a DB truncation/error.
 const (
@@ -105,14 +105,25 @@ func (s *Sticker) add(ctx *wkhttp.Context) {
 		return
 	}
 
-	// 配额校验：管理端可配 system_setting sticker.user_max_count，默认 100。
-	count, err := s.db.countByUID(loginUID)
+	// 配额：管理端可配 system_setting sticker.user_max_count，默认 100。计数与
+	// 插入放进同一事务，并对该用户已有贴纸行加 FOR UPDATE 锁，消除 count→insert
+	// 的 TOCTOU —— 否则并发 POST 可同时通过校验、双双插入而超额。
+	max := s.settings.StickerUserMaxCount()
+
+	tx, err := s.ctx.DB().Begin()
+	if err != nil {
+		s.Error("开启事务失败", zap.Error(err))
+		httperr.ResponseErrorL(ctx, errcode.ErrStickerStoreFailed, nil, nil)
+		return
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	count, err := s.db.countByUIDForUpdateTx(tx, loginUID)
 	if err != nil {
 		s.Error("查询贴纸数量失败", zap.Error(err))
 		httperr.ResponseErrorL(ctx, errcode.ErrStickerQueryFailed, nil, nil)
 		return
 	}
-	max := s.settings.StickerUserMaxCount()
 	if count >= max {
 		respondStickerQuotaExceeded(ctx, max)
 		return
@@ -126,8 +137,13 @@ func (s *Sticker) add(ctx *wkhttp.Context) {
 		Format:      format,
 		Status:      1,
 	}
-	if err := s.db.insert(m); err != nil {
+	if err := s.db.insertTx(tx, m); err != nil {
 		s.Error("新增贴纸失败", zap.Error(err))
+		httperr.ResponseErrorL(ctx, errcode.ErrStickerStoreFailed, nil, nil)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		s.Error("提交事务失败", zap.Error(err))
 		httperr.ResponseErrorL(ctx, errcode.ErrStickerStoreFailed, nil, nil)
 		return
 	}

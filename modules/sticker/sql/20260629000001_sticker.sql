@@ -1,6 +1,6 @@
 -- +migrate Up
 
-CREATE TABLE `sticker` (
+CREATE TABLE IF NOT EXISTS `sticker` (
     `id` BIGINT AUTO_INCREMENT PRIMARY KEY,
     `sticker_id` VARCHAR(32) NOT NULL COMMENT '贴纸ID',
     `uid` VARCHAR(40) NOT NULL COMMENT '拥有者UID',
