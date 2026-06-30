@@ -32,6 +32,33 @@
 // reports false) and callers fall back to the non-cryptographic path-shape check
 // — the same posture as before handles existed, so deployments without a master
 // key are not regressed.
+//
+// # Capability vs enforcement policy
+//
+// Enabled() reports the server CAPABILITY to mint/verify handles (i.e. whether a
+// usable OCTO_MASTER_KEY is present). It must NOT be conflated with the
+// enforcement POLICY of whether sticker registration REQUIRES a handle — because
+// OCTO_MASTER_KEY is a mandatory production contract (modules/common also needs
+// it to encrypt the IM RSA private key at rest), so Enabled() is effectively
+// always true in production. Tying enforcement to Enabled() would silently flip
+// the sticker-registration protocol the moment a master key exists and break
+// older clients that do not yet send a handle.
+//
+// Required() is therefore a SEPARATE, independent switch (OCTO_STICKER_HANDLE_REQUIRED,
+// default false) so enforcement can be rolled out as an observable, reversible
+// gradual rollout rather than an implicit protocol flip. The two are deliberately
+// orthogonal and are never derived from one another.
+//
+// # Two-step client flow
+//
+//  1. Upload the image: POST /v1/file/upload?type=sticker → response carries
+//     `path` and (when Enabled) `sticker_handle`.
+//  2. Register the sticker: POST /v1/sticker/user with `path` and pass the
+//     `sticker_handle` value as the `handle` field.
+//
+// Stickers do NOT support presigned uploads: the handle can only be minted at the
+// point modules/file has both the authenticated uploader and the content-validated
+// bytes, so the image must transit the multipart upload endpoint.
 package stickersig
 
 import (
@@ -41,6 +68,7 @@ import (
 	"encoding/binary"
 	"hash"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -48,6 +76,14 @@ import (
 // than imported because this is a leaf package (modules/file must depend on it
 // without dragging in modules/common). The env var is a deployment contract.
 const masterKeyEnv = "OCTO_MASTER_KEY"
+
+// requiredEnv is the enforcement-policy switch, independent of masterKeyEnv (the
+// capability). When truthy, sticker registration REQUIRES a valid upload handle;
+// when absent/false (the default) a missing handle is allowed through during the
+// compatibility rollout (still recorded), so older clients are not broken the
+// moment a master key is present. See the package doc "Capability vs enforcement
+// policy".
+const requiredEnv = "OCTO_STICKER_HANDLE_REQUIRED"
 
 // derivationLabel domain-separates the sticker-upload-handle subkey from every
 // other use of OCTO_MASTER_KEY. The "/v1" suffix leaves room to rotate the
@@ -81,6 +117,22 @@ func subkey() []byte {
 // path-shape fallback (disabled).
 func Enabled() bool {
 	return subkey() != nil
+}
+
+// Required reports whether sticker registration must reject a missing handle,
+// i.e. whether OCTO_STICKER_HANDLE_REQUIRED is truthy. It is read live (os.Getenv)
+// like Enabled() and parsed leniently via strconv.ParseBool ("1"/"t"/"true"/"TRUE"
+// etc. → true); an empty or unparseable value is false (default off, backward
+// compatible). This is the enforcement POLICY and is deliberately independent of
+// the signing CAPABILITY (Enabled) — see the package doc. When Required() is true
+// but Enabled() is false the two are in conflict; callers surface that as a
+// startup warning rather than deriving one from the other.
+func Required() bool {
+	v, err := strconv.ParseBool(strings.TrimSpace(os.Getenv(requiredEnv)))
+	if err != nil {
+		return false
+	}
+	return v
 }
 
 // Sign returns a base64url upload handle binding the uploader uid to the stored

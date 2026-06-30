@@ -24,6 +24,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
 	"github.com/Mininglamp-OSS/octo-server/pkg/stickersig"
 	pkgutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
 	"github.com/gin-gonic/gin"
@@ -388,6 +389,7 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 	if Type(fileType) == TypeSticker {
 		if handle, ok := stickersig.Sign(c.GetLoginUID(), fullURL); ok {
 			resp["sticker_handle"] = handle
+			metrics.ObserveStickerUploadHandleIssued()
 		}
 	}
 	c.Response(resp)

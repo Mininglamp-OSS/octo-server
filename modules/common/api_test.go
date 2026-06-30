@@ -609,3 +609,54 @@ func TestGetAppConfig_SystemBotUIDsDownstreamed(t *testing.T) {
 	assert.Contains(t, body, `"fileHelper"`)
 	assert.Contains(t, body, `"u_10000"`)
 }
+
+// appconfig 必须下发 sticker_handle_required：值来源于部署策略开关
+// OCTO_STICKER_HANDLE_REQUIRED（stickersig.Required），与 OCTO_MASTER_KEY 能力解耦。
+// 默认（未设置）为 false，老客户端据此知道无需携带 handle。
+func TestGetAppConfig_StickerHandleRequired_DefaultFalse(t *testing.T) {
+	t.Setenv("OCTO_STICKER_HANDLE_REQUIRED", "")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"sticker_handle_required":false`)
+}
+
+// OCTO_STICKER_HANDLE_REQUIRED=true → appconfig 下发 true，客户端据此强制带 handle。
+func TestGetAppConfig_StickerHandleRequired_True(t *testing.T) {
+	t.Setenv("OCTO_STICKER_HANDLE_REQUIRED", "true")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"sticker_handle_required":true`)
+}
+
+// version 短路分支同样要下发 sticker_handle_required：老客户端命中版本短路也必须
+// 拿到当前策略，否则被本地缓存住失去实时性（与 messages_search_on 同样的解耦约束）。
+func TestGetAppConfig_StickerHandleRequired_OnVersionShortCircuit(t *testing.T) {
+	t.Setenv("OCTO_STICKER_HANDLE_REQUIRED", "true")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig?version=99999999", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"sticker_handle_required":true`)
+}

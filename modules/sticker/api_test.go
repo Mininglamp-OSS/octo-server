@@ -359,7 +359,13 @@ func TestSticker_AddConcurrentQuota(t *testing.T) {
 // raster-only sticker upload contract. The handle closes it: the client cannot
 // mint a valid handle for an object it didn't upload via type=sticker, so the
 // registration is refused even though the shape passes.
+//
+// NOTE: this strong guarantee holds only under enforcement (required=true). In
+// compatibility mode (required=false) a missing handle is allowed through (see
+// TestSticker_CompatModeAllowsMissingHandle), so the cross-type bypass defense
+// degrades during the rollout window — that is the intended, reversible trade-off.
 func TestSticker_AddRejectsForgedTailMatchPath(t *testing.T) {
+	t.Setenv("OCTO_STICKER_HANDLE_REQUIRED", "true")
 	route, _, _ := setupSticker(t)
 
 	forged := "file/preview/chat/sticker/" + testutil.UID + "/x.gif"
@@ -374,9 +380,11 @@ func TestSticker_AddRejectsForgedTailMatchPath(t *testing.T) {
 	assertStickerErrorCode(t, w, "err.server.sticker.request_invalid")
 }
 
-// TestSticker_AddRejectsMissingHandle: a perfectly shaped sticker path is still
-// refused when no handle accompanies it (handle signing is active in tests).
+// TestSticker_AddRejectsMissingHandle: under enforcement (required=true) a
+// perfectly shaped sticker path is still refused when no handle accompanies it
+// (handle signing is active in tests).
 func TestSticker_AddRejectsMissingHandle(t *testing.T) {
+	t.Setenv("OCTO_STICKER_HANDLE_REQUIRED", "true")
 	route, _, _ := setupSticker(t)
 
 	w := doRequest(t, route, "POST", "/v1/sticker/user", map[string]string{
@@ -385,15 +393,40 @@ func TestSticker_AddRejectsMissingHandle(t *testing.T) {
 	assertStickerErrorCode(t, w, "err.server.sticker.request_invalid")
 }
 
-// TestSticker_AddRejectsTamperedHandle: a handle minted for a DIFFERENT object
-// must not authorize this path (the HMAC binds uid+path).
-func TestSticker_AddRejectsTamperedHandle(t *testing.T) {
+// TestSticker_CompatModeAllowsMissingHandle: in compatibility mode (the default,
+// required=false) a shape-valid path with NO handle is allowed through so older
+// clients keep working during the rollout. The missing handle is recorded
+// (compat_missing metric); behavior here is the allow + persisted-sticker outcome.
+func TestSticker_CompatModeAllowsMissingHandle(t *testing.T) {
+	// OCTO_STICKER_HANDLE_REQUIRED unset → Required() is false. Pin empty to be
+	// robust against an externally-provided value leaking in from the shell/CI.
+	t.Setenv("OCTO_STICKER_HANDLE_REQUIRED", "")
 	route, _, _ := setupSticker(t)
 
 	w := doRequest(t, route, "POST", "/v1/sticker/user", map[string]string{
-		"path":   validStickerPath("real.png"),
-		"format": "png",
-		"handle": validStickerHandle(t, validStickerPath("other.png")),
+		"path": validStickerPath("legacy.png"), "format": "png",
 	})
-	assertStickerErrorCode(t, w, "err.server.sticker.request_invalid")
+	require.Equal(t, http.StatusOK, w.Code, "compat mode must allow a missing handle: %s", w.Body.String())
+	body := parseJSON(t, w)
+	assert.NotEmpty(t, body["sticker_id"], "allowed registration must return the new sticker")
+}
+
+// TestSticker_AddRejectsTamperedHandle: a tampered/forged handle (non-empty but
+// not verifiable — here, one minted for a DIFFERENT object) is rejected
+// regardless of the required policy — invalid handles are never compat-allowed.
+// Asserted under BOTH modes.
+func TestSticker_AddRejectsTamperedHandle(t *testing.T) {
+	for _, required := range []string{"", "true"} {
+		t.Run("required="+required, func(t *testing.T) {
+			t.Setenv("OCTO_STICKER_HANDLE_REQUIRED", required)
+			route, _, _ := setupSticker(t)
+
+			w := doRequest(t, route, "POST", "/v1/sticker/user", map[string]string{
+				"path":   validStickerPath("real.png"),
+				"format": "png",
+				"handle": validStickerHandle(t, validStickerPath("other.png")),
+			})
+			assertStickerErrorCode(t, w, "err.server.sticker.request_invalid")
+		})
+	}
 }

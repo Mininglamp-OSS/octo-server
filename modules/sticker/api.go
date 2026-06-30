@@ -1,3 +1,24 @@
+// Package sticker implements per-user custom sticker management.
+//
+// # Two-step registration contract (API)
+//
+//  1. Upload the image: POST /v1/file/upload?type=sticker (multipart). The
+//     response carries `path` and — when the server has signing capability
+//     (OCTO_MASTER_KEY configured) — `sticker_handle`.
+//  2. Register: POST /v1/sticker/user with body {path, format, placeholder,
+//     handle}, passing the upload's `sticker_handle` value as `handle`.
+//
+// Stickers do NOT support presigned uploads: the upload handle can only be
+// minted where modules/file holds both the authenticated uploader and the
+// content-validated bytes, so the image must transit the multipart endpoint.
+//
+// # Handle enforcement (capability vs policy)
+//
+// Whether `handle` is REQUIRED is governed by the OCTO_STICKER_HANDLE_REQUIRED
+// policy switch (stickersig.Required), independent of the signing capability
+// (OCTO_MASTER_KEY / stickersig.Enabled). Clients read the effective policy from
+// GET /v1/common/appconfig → `sticker_handle_required`. See the stickersig
+// package doc for the rollout rationale and the per-outcome behavior matrix.
 package sticker
 
 import (
@@ -8,6 +29,7 @@ import (
 	commonmod "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
 	"github.com/Mininglamp-OSS/octo-server/pkg/stickersig"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"go.uber.org/zap"
@@ -41,12 +63,20 @@ func New(ctx *config.Context) *Sticker {
 		db:       newStickerDB(ctx),
 		settings: commonmod.EnsureSystemSettings(ctx),
 	}
-	// 运营可见性：上传句柄（stickersig）是阻断「跨 type / 他人 / 外部对象注册成贴纸」
-	// 的强保护，仅当 OCTO_MASTER_KEY 配成恰好 32 字节时生效；否则 add() 退化为仅路径
-	// 形状校验。把这个降级姿态在启动时打一条 WARN，使「未配 / 配错长度」对运营可见，
-	// 而不是埋在 leaf 包的注释里。一次性、进程级；未配 key 是 brief 记录的受支持部署，
-	// 但安全降级仍值得提示。
-	if !stickersig.Enabled() {
+	// 运营可见性：签发/校验 handle 的「能力」由 OCTO_MASTER_KEY 决定（stickersig.Enabled），
+	// 「是否强制客户端必须带 handle」的「策略」由 OCTO_STICKER_HANDLE_REQUIRED 决定
+	// （stickersig.Required），两者正交、互不派生（详见 stickersig 包 doc）。把两类降级/
+	// 冲突姿态在启动时打日志，使运营对部署可见，而不是埋在 leaf 包注释里。一次性、进程级。
+	switch {
+	case stickersig.Required() && !stickersig.Enabled():
+		// 配置冲突：声明要求 handle，却没有有效 OCTO_MASTER_KEY 提供签名/校验能力。
+		// 不 panic（不让贴纸策略误配拖垮整个服务启动、也不与 master key 生命周期强行
+		// 关联）；改打 ERROR 强告警 + handle_policy gauge 暴露之。此时 add() 因无能力无法
+		// 校验 handle，运行时退化为仅路径形状校验放行（见 classifyStickerPath），即强制
+		// 策略实际无法生效——靠本告警 + 指标驱动运营尽快修复（补 32 字节 OCTO_MASTER_KEY）。
+		s.Error("配置冲突：OCTO_STICKER_HANDLE_REQUIRED=true 但 OCTO_MASTER_KEY 未配置或非恰好 32 字节，" +
+			"无有效签名能力，贴纸 handle 强制策略将无法生效；请配置 32 字节 OCTO_MASTER_KEY 或关闭 REQUIRED")
+	case !stickersig.Enabled():
 		s.Warn("OCTO_MASTER_KEY 未配置或非恰好 32 字节：自定义贴纸上传句柄校验已禁用，" +
 			"注册退化为仅路径形状校验（配置 32 字节 OCTO_MASTER_KEY 可启用密码学来源绑定）")
 	}
@@ -114,9 +144,42 @@ func (s *Sticker) add(ctx *wkhttp.Context) {
 	//      Path 确由本人经 type=sticker 上传门（1MB + 魔数 + 仅位图）产生。这层封死
 	//      (1) 的尾匹配残留：形如 "chat/sticker/{uid}/x.gif" 能过形状校验，但客户端
 	//      无法为未经贴纸上传的对象伪造句柄，故被拒——堵住「以 type=chat(100MB/宽松
-	//      白名单)上传再注册成贴纸」的旁路。未配置 master key 时退化为仅 (1)，与引入
-	//      句柄前一致（不回归）。两类失败都收敛到同一 request_invalid，不暴露具体原因。
-	if !stickerPathTrusted(req.Path, loginUID, format, req.Handle) {
+	//      白名单)上传再注册成贴纸」的旁路。
+	//
+	// 是否「强制」带 handle 由 OCTO_STICKER_HANDLE_REQUIRED 策略决定（与 master key
+	// 能力解耦）：required=false 兼容期内缺 handle 暂放行（记 compat_missing 指标 + INFO
+	// 日志，供灰度观察老客户端缺失率），此时 (2) 的强防护降级为仅 (1)；required=true 时
+	// 缺/非法 handle 一律拒。非法 handle 无论策略恒拒。各拒因都收敛到同一 request_invalid，
+	// 不暴露具体原因（anti-enumeration），原因只进指标/日志。
+	switch classifyStickerPath(req.Path, loginUID, format, req.Handle) {
+	case stickerPathInvalid:
+		metrics.ObserveStickerRegister(metrics.StickerRegisterRejectedPath)
+		respondStickerRequestInvalid(ctx, "path")
+		return
+	case stickerHandleInvalid:
+		metrics.ObserveStickerRegister(metrics.StickerRegisterRejectedInvalid)
+		s.Warn("拒绝注册：贴纸 handle 非法或与 path 不匹配", zap.String("uid", loginUID))
+		respondStickerRequestInvalid(ctx, "path")
+		return
+	case stickerHandleMissing:
+		if stickersig.Required() {
+			metrics.ObserveStickerRegister(metrics.StickerRegisterRejectedMissing)
+			s.Warn("拒绝注册：强制模式下缺少贴纸 handle", zap.String("uid", loginUID))
+			respondStickerRequestInvalid(ctx, "path")
+			return
+		}
+		// 兼容模式（required=false）：放行但记录，供切强制前观察老客户端缺失率归零。
+		metrics.ObserveStickerRegister(metrics.StickerRegisterCompatMissing)
+		s.Info("兼容模式放行：注册缺少贴纸 handle（待 OCTO_STICKER_HANDLE_REQUIRED 切 true 后将被拒）",
+			zap.String("uid", loginUID))
+	case stickerOK:
+		metrics.ObserveStickerRegister(metrics.StickerRegisterOK)
+	default:
+		// fail-closed：classifyStickerPath 返回了未识别的分类（理论上不可达——若将来
+		// 给 stickerPathClass 加分类却漏处理，宁可拒绝并告警，也不默认放行落库。安全门控
+		// 不允许 fail-open）。
+		metrics.ObserveStickerRegister(metrics.StickerRegisterRejectedPath)
+		s.Error("拒绝注册：未识别的 path 分类（疑似漏处理的 stickerPathClass）", zap.String("uid", loginUID))
 		respondStickerRequestInvalid(ctx, "path")
 		return
 	}
@@ -183,22 +246,51 @@ func (s *Sticker) add(ctx *wkhttp.Context) {
 	ctx.Response(toStickerResp(m))
 }
 
-// stickerPathTrusted authorizes a client-supplied sticker object path for
+// stickerPathClass is the outcome of authorizing a client-supplied sticker
+// object path for registration. It separates the path-shape verdict from the
+// handle verdict so add() can apply the enforcement policy (required vs compat)
+// and emit a precise metric per outcome.
+type stickerPathClass int
+
+const (
+	// stickerOK: path shape passed AND (when signing is enabled) a valid handle
+	// was supplied — or signing is disabled and the shape passed.
+	stickerOK stickerPathClass = iota
+	// stickerPathInvalid: the path-shape check failed (wrong uid segment / not a
+	// sticker key / missing or mismatched extension). Always rejected.
+	stickerPathInvalid
+	// stickerHandleMissing: signing is enabled, the shape passed, but no handle
+	// was supplied. add() rejects under required=true, allows (recorded) otherwise.
+	stickerHandleMissing
+	// stickerHandleInvalid: signing is enabled, the shape passed, a handle was
+	// supplied but it does not verify (forged / minted for another object).
+	// Always rejected regardless of the required policy.
+	stickerHandleInvalid
+)
+
+// classifyStickerPath authorizes a client-supplied sticker object path for
 // registration. It always applies the path-shape check (validateStickerPath);
 // when upload-handle signing is active (OCTO_MASTER_KEY configured) it
-// additionally requires a valid HMAC handle minted by modules/file at upload
-// time, which cryptographically proves the object was produced by THIS user's
-// content-validated (1MB + magic-number + raster-only) sticker upload — closing
-// the tail-match residual of the shape check. When no master key is configured
-// it degrades to the shape check alone, matching the pre-handle posture.
-func stickerPathTrusted(path, loginUID, format, handle string) bool {
+// classifies the handle as OK / missing / invalid. When no master key is
+// configured it cannot verify a handle and degrades to the shape check alone
+// (matching the pre-handle posture; the required-but-no-capability conflict is
+// surfaced as a startup ERROR in New, not enforced here, so a misconfiguration
+// never wedges registration). The enforcement decision (reject vs compat-allow
+// on a missing handle) is made by the caller from stickersig.Required().
+func classifyStickerPath(path, loginUID, format, handle string) stickerPathClass {
 	if !validateStickerPath(path, loginUID, format) {
-		return false
+		return stickerPathInvalid
 	}
-	if stickersig.Enabled() {
-		return stickersig.Verify(loginUID, path, handle)
+	if !stickersig.Enabled() {
+		return stickerOK
 	}
-	return true
+	if handle == "" {
+		return stickerHandleMissing
+	}
+	if !stickersig.Verify(loginUID, path, handle) {
+		return stickerHandleInvalid
+	}
+	return stickerOK
 }
 
 // delete 软删除当前用户名下的一张贴纸。删除他人贴纸或不存在的贴纸一律按
