@@ -1,6 +1,7 @@
 package common
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -81,12 +82,22 @@ func TestEmojiManifest_Endpoint(t *testing.T) {
 	r.ServeHTTP(w, req)
 
 	require.Equal(t, http.StatusOK, w.Code)
-	body := w.Body.String()
-	assert.Contains(t, body, `"version":`)
-	assert.Contains(t, body, `"list":`)
-	for _, k := range []string{"使命必达", "崇尚行动", "有品位", "尚方宝剑"} {
-		assert.Contains(t, body, k, "响应应包含内置表情 %q", k)
+	// 反序列化整个响应体,断言**精确契约**而非子串:顶层就是 {version, list}(c.Response 即
+	// 原样 JSON,无 {status,data,msg} 信封)。若将来被信封包裹,Unmarshal 出来的 List 会为空,
+	// gotKeys 与 wantKeys 不等,本用例即报错 —— 作为 wire 形状的回归护栏。
+	var got emojiManifestResp
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got), "响应应为顶层 {version,list}: %s", w.Body.String())
+	assert.GreaterOrEqual(t, got.Version, 1, "version 必须 >=1")
+	wantKeys := []string{"[使命必达]", "[崇尚行动]", "[有品位]", "[尚方宝剑]"}
+	gotKeys := make([]string, 0, len(got.List))
+	for _, e := range got.List {
+		gotKeys = append(gotKeys, e.Key)
+		assert.Regexp(t, tokenShape, e.Key, "key 必须是 [xxx] token: %q", e.Key)
+		assert.NotEmpty(t, e.Name, "name 不应为空: %q", e.Key)
+		assert.Empty(t, e.URL, "内置表情 URL 应留空: %q", e.Key)
 	}
+	assert.Equal(t, wantKeys, gotKeys, "响应的 key 集合/顺序与内置真源一致")
+
 	assert.NotEmpty(t, w.Header().Get("ETag"), "应返回 ETag")
 	assert.Equal(t, "public, max-age=300, must-revalidate", w.Header().Get("Cache-Control"))
 }
