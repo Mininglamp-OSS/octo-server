@@ -94,6 +94,11 @@ type addStickerReq struct {
 	Path        string `json:"path"`
 	Format      string `json:"format"`
 	Placeholder string `json:"placeholder"`
+	// Handle is the HMAC upload handle returned by /v1/file/upload?type=sticker
+	// (response field "sticker_handle"). When OCTO_MASTER_KEY is configured it is
+	// REQUIRED and proves Path was produced by this caller's content-validated
+	// sticker upload; see stickerPathTrusted.
+	Handle string `json:"handle"`
 }
 
 // ---------- Response ----------

@@ -8,6 +8,7 @@ import (
 	commonmod "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"github.com/Mininglamp-OSS/octo-server/pkg/stickersig"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"go.uber.org/zap"
 )
@@ -96,11 +97,16 @@ func (s *Sticker) add(ctx *wkhttp.Context) {
 		respondStickerFormatUnsupported(ctx, format)
 		return
 	}
-	// path 必须指向「本人」走 type=sticker 强约束上传产生的对象
-	// （sticker/{loginUID}/<name>.<ext>，且 ext == format）。否则客户端可上传
-	// type=chat（100MB/宽松白名单）再把该 URL 注册成贴纸，绕过 1MB + 仅位图的
-	// 上传契约；或注册他人/外部对象（PR#508 review）。
-	if !validateStickerPath(req.Path, loginUID, format) {
+	// path 必须指向「本人」走 type=sticker 强约束上传产生的对象。两层防护：
+	//  (1) 路径形状校验 validateStickerPath（始终执行）——挡住他人 uid 段 / 非
+	//      sticker 桶 / 缺扩展名 / ext≠format 等明显非法路径；
+	//  (2) 上传句柄 stickersig.Verify（配置了 OCTO_MASTER_KEY 时附加）——密码学证明
+	//      Path 确由本人经 type=sticker 上传门（1MB + 魔数 + 仅位图）产生。这层封死
+	//      (1) 的尾匹配残留：形如 "chat/sticker/{uid}/x.gif" 能过形状校验，但客户端
+	//      无法为未经贴纸上传的对象伪造句柄，故被拒——堵住「以 type=chat(100MB/宽松
+	//      白名单)上传再注册成贴纸」的旁路。未配置 master key 时退化为仅 (1)，与引入
+	//      句柄前一致（不回归）。两类失败都收敛到同一 request_invalid，不暴露具体原因。
+	if !stickerPathTrusted(req.Path, loginUID, format, req.Handle) {
 		respondStickerRequestInvalid(ctx, "path")
 		return
 	}
@@ -165,6 +171,24 @@ func (s *Sticker) add(ctx *wkhttp.Context) {
 	}
 
 	ctx.Response(toStickerResp(m))
+}
+
+// stickerPathTrusted authorizes a client-supplied sticker object path for
+// registration. It always applies the path-shape check (validateStickerPath);
+// when upload-handle signing is active (OCTO_MASTER_KEY configured) it
+// additionally requires a valid HMAC handle minted by modules/file at upload
+// time, which cryptographically proves the object was produced by THIS user's
+// content-validated (1MB + magic-number + raster-only) sticker upload — closing
+// the tail-match residual of the shape check. When no master key is configured
+// it degrades to the shape check alone, matching the pre-handle posture.
+func stickerPathTrusted(path, loginUID, format, handle string) bool {
+	if !validateStickerPath(path, loginUID, format) {
+		return false
+	}
+	if stickersig.Enabled() {
+		return stickersig.Verify(loginUID, path, handle)
+	}
+	return true
 }
 
 // delete 软删除当前用户名下的一张贴纸。删除他人贴纸或不存在的贴纸一律按

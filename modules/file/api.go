@@ -18,6 +18,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/stickersig"
 	pkgutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -303,6 +304,16 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 	if signatureInt == 1 {
 		encoded := base64.StdEncoding.EncodeToString(sign[:])
 		resp["sha512"] = encoded
+	}
+	// 自定义贴纸：签发上传句柄。此处是唯一同时掌握「认证上传者」与「内容已过
+	// type=sticker 门(1MB + 魔数 + 仅位图)」的点，故在这里用 HMAC 绑定
+	// (上传者 uid, 存储 path) 并随响应下发；sticker.add 校验它即可证明该对象确由
+	// 本人经贴纸上传产生，杜绝把 type=chat(100MB/宽松白名单)/他人/外部对象注册成
+	// 贴纸。未配置 OCTO_MASTER_KEY 时不下发，sticker 侧回退到路径形状校验（不回归）。
+	if Type(fileType) == TypeSticker {
+		if handle, ok := stickersig.Sign(c.GetLoginUID(), fullURL); ok {
+			resp["sticker_handle"] = handle
+		}
 	}
 	c.Response(resp)
 }

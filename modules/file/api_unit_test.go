@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -17,6 +18,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-server/pkg/stickersig"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -202,6 +204,11 @@ type mockService struct {
 	lastFileSize       int64
 	presignedGetErr    error
 	lastGetDisposition string
+	// downloadURL/downloadURLErr let a test control what DownloadURL returns
+	// (the value uploadFile reports as `path`). Zero values preserve the legacy
+	// ("", nil) behavior every existing test relies on.
+	downloadURL    string
+	downloadURLErr error
 }
 
 func (m *mockService) DownloadAndMakeCompose(uploadPath string, downloadURLs []string) (map[string]interface{}, error) {
@@ -217,7 +224,10 @@ func (m *mockService) UploadFile(filePath string, contentType string, contentDis
 }
 
 func (m *mockService) DownloadURL(path string, filename string) (string, error) {
-	return "", nil
+	if m.downloadURLErr != nil {
+		return "", m.downloadURLErr
+	}
+	return m.downloadURL, nil
 }
 
 func (m *mockService) GetFile(path string) (io.ReadCloser, string, error) {
@@ -1271,4 +1281,86 @@ func TestGetDownloadURL_S3_BarePathLeadingSlashTrimmed(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code,
 		"bare path with leading slash must be normalized before signing; pre-fix this returned 500 because validatePresignObjectKey rejected the leading-slash key. body=%s",
 		w.Body.String())
+}
+
+// newMultipartFile builds a multipart/form-data body with a single "file" part.
+func newMultipartFile(t *testing.T, filename string, content []byte) (*bytes.Buffer, string) {
+	t.Helper()
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	part, err := w.CreateFormFile("file", filename)
+	require.NoError(t, err)
+	_, err = part.Write(content)
+	require.NoError(t, err)
+	require.NoError(t, w.Close())
+	return &buf, w.FormDataContentType()
+}
+
+// TestUploadFile_StickerHandleMinted is the file-side half of the upload-handle
+// (PR#508 follow-up): a successful type=sticker upload must return a
+// `sticker_handle` that verifies against (uploader uid, returned path) — the
+// exact tuple sticker.add checks. This closes the loop with the sticker-side
+// integration tests, which only mint handles synthetically.
+func TestUploadFile_StickerHandleMinted(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
+
+	const uid = "10000"
+	downloadURL := "https://cdn.example.com/dm/sticker/" + uid + "/abc.png"
+	mockSvc := &mockService{downloadURL: downloadURL}
+	f := &File{Log: log.NewTLog("FileTest"), service: mockSvc}
+
+	// Minimal valid PNG header so ValidateMagicNumber(".png", …) passes.
+	png := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x00}
+	body, contentType := newMultipartFile(t, "abc.png", png)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request, _ = http.NewRequest(http.MethodPost, "/v1/file/upload?type=sticker&path=/"+uid+"/abc.png", body)
+	c.Request.Header.Set("Content-Type", contentType)
+	c.Set("uid", uid) // simulate AuthMiddleware
+
+	wkCtx := &wkhttp.Context{Context: c}
+	f.uploadFile(wkCtx)
+
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+
+	path, _ := resp["path"].(string)
+	require.Equal(t, downloadURL, path)
+	handle, ok := resp["sticker_handle"].(string)
+	require.True(t, ok && handle != "", "type=sticker upload must return a sticker_handle; got %s", w.Body.String())
+	require.True(t, stickersig.Verify(uid, path, handle),
+		"minted handle must verify for (uid, returned path) — the tuple sticker.add checks")
+	// And it must NOT verify for a different uid (the handle binds the uploader).
+	require.False(t, stickersig.Verify("99999", path, handle))
+}
+
+// TestUploadFile_NonStickerNoHandle: non-sticker uploads must not carry a
+// sticker_handle (the field is sticker-specific).
+func TestUploadFile_NonStickerNoHandle(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
+
+	mockSvc := &mockService{downloadURL: "https://cdn.example.com/dm/chat/10000/abc.png"}
+	f := &File{Log: log.NewTLog("FileTest"), service: mockSvc}
+
+	png := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x00}
+	body, contentType := newMultipartFile(t, "abc.png", png)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request, _ = http.NewRequest(http.MethodPost, "/v1/file/upload?type=chat&path=/10000/abc.png", body)
+	c.Request.Header.Set("Content-Type", contentType)
+	c.Set("uid", "10000")
+
+	wkCtx := &wkhttp.Context{Context: c}
+	f.uploadFile(wkCtx)
+
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	_, has := resp["sticker_handle"]
+	require.False(t, has, "non-sticker upload must not carry a sticker_handle")
 }

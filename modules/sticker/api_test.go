@@ -17,6 +17,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	commonmod "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"github.com/Mininglamp-OSS/octo-server/pkg/stickersig"
 	redis "github.com/go-redis/redis"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -80,6 +81,17 @@ func validStickerPath(name string) string {
 	return "file/preview/sticker/" + testutil.UID + "/" + name
 }
 
+// validStickerHandle mints the HMAC upload handle that /v1/file/upload would
+// have returned for this user's upload of `path`. TestMain sets OCTO_MASTER_KEY,
+// so handle signing is active and add() requires it: a shape-valid path with no
+// (or a wrong) handle is refused — see TestSticker_AddRejectsForgedTailMatchPath.
+func validStickerHandle(t *testing.T, path string) string {
+	t.Helper()
+	h, ok := stickersig.Sign(testutil.UID, path)
+	require.True(t, ok, "OCTO_MASTER_KEY must be set in TestMain so Sign mints a handle")
+	return h
+}
+
 func doRequest(t *testing.T, route *wkhttp.WKHttp, method, path string, body interface{}) *httptest.ResponseRecorder {
 	t.Helper()
 	var reqBody *bytes.Reader
@@ -132,6 +144,7 @@ func TestSticker_AddAndList(t *testing.T) {
 		"path":        validStickerPath("abc.png"),
 		"format":      "png",
 		"placeholder": "[笑]",
+		"handle":      validStickerHandle(t, validStickerPath("abc.png")),
 	})
 	assert.Equal(t, http.StatusOK, add.Code)
 	ab := parseJSON(t, add)
@@ -176,11 +189,13 @@ func TestSticker_QuotaExceeded(t *testing.T) {
 
 	w1 := doRequest(t, route, "POST", "/v1/sticker/user", map[string]string{
 		"path": validStickerPath("a.png"), "format": "png",
+		"handle": validStickerHandle(t, validStickerPath("a.png")),
 	})
 	assert.Equal(t, http.StatusOK, w1.Code)
 
 	w2 := doRequest(t, route, "POST", "/v1/sticker/user", map[string]string{
 		"path": validStickerPath("b.png"), "format": "png",
+		"handle": validStickerHandle(t, validStickerPath("b.png")),
 	})
 	env := decodeErrEnvelope(t, w2.Body.Bytes())
 	assert.Equal(t, "err.server.sticker.quota_exceeded", env.Error.Code)
@@ -193,6 +208,7 @@ func TestSticker_DeleteOwnership(t *testing.T) {
 
 	add := doRequest(t, route, "POST", "/v1/sticker/user", map[string]string{
 		"path": validStickerPath("a.png"), "format": "png",
+		"handle": validStickerHandle(t, validStickerPath("a.png")),
 	})
 	require.Equal(t, http.StatusOK, add.Code)
 	mineID := parseJSON(t, add)["sticker_id"].(string)
@@ -261,9 +277,11 @@ func TestSticker_AddPathRejected(t *testing.T) {
 func TestSticker_AddAcceptsAbsoluteDownloadURL(t *testing.T) {
 	route, _, _ := setupSticker(t)
 
+	absURL := "https://cdn.example.com/dm-bucket/sticker/" + testutil.UID + "/abc123.gif?X-Amz-Signature=deadbeef"
 	w := doRequest(t, route, "POST", "/v1/sticker/user", map[string]string{
-		"path":   "https://cdn.example.com/dm-bucket/sticker/" + testutil.UID + "/abc123.gif?X-Amz-Signature=deadbeef",
+		"path":   absURL,
 		"format": "gif",
+		"handle": validStickerHandle(t, absURL),
 	})
 	assert.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 }
@@ -285,6 +303,15 @@ func TestSticker_AddConcurrentQuota(t *testing.T) {
 	const concurrency = 10
 	setStickerQuota(t, ctx, quota)
 
+	// Mint paths + handles on the test goroutine (validStickerHandle asserts via
+	// require, which must not run off the main test goroutine).
+	paths := make([]string, concurrency)
+	handles := make([]string, concurrency)
+	for i := 0; i < concurrency; i++ {
+		paths[i] = validStickerPath(fmt.Sprintf("c%d.png", i))
+		handles[i] = validStickerHandle(t, paths[i])
+	}
+
 	statuses := make([]int, concurrency)
 	var wg sync.WaitGroup
 	for i := 0; i < concurrency; i++ {
@@ -292,8 +319,9 @@ func TestSticker_AddConcurrentQuota(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			w := doRequest(t, route, "POST", "/v1/sticker/user", map[string]string{
-				"path":   validStickerPath(fmt.Sprintf("c%d.png", i)),
+				"path":   paths[i],
 				"format": "png",
+				"handle": handles[i],
 			})
 			statuses[i] = w.Code
 		}(i)
@@ -321,4 +349,51 @@ func TestSticker_AddConcurrentQuota(t *testing.T) {
 	stickers, err := f.db.listByUID(testutil.UID)
 	require.NoError(t, err)
 	assert.Equal(t, quota, len(stickers))
+}
+
+// TestSticker_AddRejectsForgedTailMatchPath is the core regression for the
+// upload-handle (PR#508 follow-up). The pragmatic path-shape check accepts a
+// ".../sticker/{uid}/x.ext" tail ANYWHERE in the key — including a chat-bucket
+// object "chat/sticker/{uid}/x.gif" — which is its documented residual and would
+// let a 100MB type=chat upload be re-registered as a sticker, dodging the 1MB +
+// raster-only sticker upload contract. The handle closes it: the client cannot
+// mint a valid handle for an object it didn't upload via type=sticker, so the
+// registration is refused even though the shape passes.
+func TestSticker_AddRejectsForgedTailMatchPath(t *testing.T) {
+	route, _, _ := setupSticker(t)
+
+	forged := "file/preview/chat/sticker/" + testutil.UID + "/x.gif"
+	// Sanity: the forged path DOES pass the shape check (the residual)...
+	require.True(t, validateStickerPath(forged, testutil.UID, "gif"),
+		"precondition: forged tail-match path must pass the shape check")
+
+	// ...yet without a server-minted handle it is refused.
+	w := doRequest(t, route, "POST", "/v1/sticker/user", map[string]string{
+		"path": forged, "format": "gif",
+	})
+	assertStickerErrorCode(t, w, "err.server.sticker.request_invalid")
+}
+
+// TestSticker_AddRejectsMissingHandle: a perfectly shaped sticker path is still
+// refused when no handle accompanies it (handle signing is active in tests).
+func TestSticker_AddRejectsMissingHandle(t *testing.T) {
+	route, _, _ := setupSticker(t)
+
+	w := doRequest(t, route, "POST", "/v1/sticker/user", map[string]string{
+		"path": validStickerPath("nohandle.png"), "format": "png",
+	})
+	assertStickerErrorCode(t, w, "err.server.sticker.request_invalid")
+}
+
+// TestSticker_AddRejectsTamperedHandle: a handle minted for a DIFFERENT object
+// must not authorize this path (the HMAC binds uid+path).
+func TestSticker_AddRejectsTamperedHandle(t *testing.T) {
+	route, _, _ := setupSticker(t)
+
+	w := doRequest(t, route, "POST", "/v1/sticker/user", map[string]string{
+		"path":   validStickerPath("real.png"),
+		"format": "png",
+		"handle": validStickerHandle(t, validStickerPath("other.png")),
+	})
+	assertStickerErrorCode(t, w, "err.server.sticker.request_invalid")
 }
