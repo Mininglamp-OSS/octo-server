@@ -1032,7 +1032,7 @@ func (g *Group) groupUpdate(c *wkhttp.Context) {
 	// 自定义群头像文字/颜色（二次弹窗保存）：先在任何 mutation 之前完成解析与校验，构造
 	// avatarReq。这样非法的 avatar 字段会在 name/notice/invite 落库之前返回 400，避免
 	// 「返回 400 却已部分写入群名」的非原子部分写入。avatar_text 空串清除自定义文字（回退
-	// 群名），avatar_color "" / "-1" 清除自定义色（回退派生）。超限直接拒绝，不静默截断。
+	// is_named 规则:老群群名/新群双人图标），avatar_color "" / "-1" 清除自定义色（回退派生）。超限直接拒绝，不静默截断。
 	avatarTextValue, hasAvatarText := groupMap[attrKeyAvatarText]
 	avatarColorValue, hasAvatarColor := groupMap[attrKeyAvatarColor]
 	var avatarReq *UpdateGroupAvatarCustomServiceReq

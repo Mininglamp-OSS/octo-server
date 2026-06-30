@@ -75,8 +75,25 @@ legacy avatars (rename would no longer follow).
 - **Migration `20260629000001` is reused as-is, not modified.** Its backfill-to-1
   is exactly the legacy marker this task needs. The file is already merged/applied;
   its in-file comments still describe the #500 "user-named" intent (now reinterpreted
-  as "legacy") — left as the historical record; the Go `Model.IsNamed` comment is
-  the source of truth.
+  as "legacy"). Since several reviewers flagged the stale *live* column COMMENTs
+  (schema introspection would carry old guidance), a follow-up **comment-only
+  migration `20260629000002`** `MODIFY COLUMN`s `is_named` + `avatar_text` to refresh
+  their COMMENTs to the legacy/new semantic (no type/constraint/data change,
+  reentrant via INFORMATION_SCHEMA guard). The historical migration files' `--`
+  comments stay as the record; the Go `Model.IsNamed` comment + the live column
+  COMMENT are the source of truth.
+
+## Follow-ups (out of scope — separate PR/issue)
+- **`UpdateGroupInfo` full-row `UpdateTx` → column-level** (yujiawei, non-blocking):
+  a rename's full-row writeback could clobber a concurrent `invite` toggle with a
+  stale loaded value (the inverse of #500's P1, which was fixed for the invite
+  branch only). Pre-existing; converting `UpdateGroupInfo` to a column-scoped write
+  closes the remaining read-modify-write window.
+- **Public avatar endpoint enumeration / name-prefix disclosure** (yujiawei,
+  non-blocking): the unauthenticated `GET /:group_no/avatar` distinguishes
+  existing vs nonexistent/disbanded groups and renders a legacy group's first-2
+  name glyphs. Pre-existing and intentionally preserved by grandfather; hardening
+  (auth or constant-shape response) is separate scope.
 
 ## Out of scope
 - Any change to the render logic, `avatar_text`/`avatar_color` APIs, validation,

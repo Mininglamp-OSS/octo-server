@@ -1015,7 +1015,7 @@ type UpdateGroupAvatarCustomServiceReq struct {
 	GroupNo      string
 	OperatorUID  string
 	OperatorName string
-	// AvatarText：nil 表示不更新文字；非 nil（含 ""）表示设置，"" 即清除自定义文字（回退群名）。
+	// AvatarText：nil 表示不更新文字；非 nil（含 ""）表示设置，"" 即清除自定义文字（回退 is_named 规则:老群群名/新群双人图标）。
 	AvatarText *string
 	// SetAvatarColor：是否更新颜色。为 true 时按 AvatarColor 设置：nil 清除（NULL，回退派生），
 	// 非 nil 为色板下标。为 false 时不动颜色。
