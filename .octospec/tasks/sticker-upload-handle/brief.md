@@ -50,6 +50,16 @@ is independent of every other use of that master key.
   `uploadFile` gains one response field, `sticker_handle`, emitted ONLY for
   `type=sticker` and ONLY when a master key is configured. No change to existing
   fields (`path`/`name`/`size`/`ext`/`sha512`) or to any non-sticker type.
+- **`sticker/` keyspace reservation** (touches: `auth`, `acl`) — both upload
+  entry points (`uploadFile` and the presigned `getUploadCredentials`) reject a
+  NON-`type=sticker` upload whose path lands in the `sticker/` object keyspace.
+  Closes the cross-type overwrite (PR#509 review): on an OSS backend whose
+  `BucketName` equals an upload-type prefix (e.g. `chat`), `ossNormalizeObjectKey`
+  strips the leading `<bucket>/`, so `type=chat&path=/sticker/{uid}/x` would
+  canonicalize onto a real sticker's object key and overwrite it with un-gated
+  content while the already-minted handle (bound to the unchanged URL) still
+  verifies — defeating the guard even in the keyed posture. Backend-agnostic; a
+  no-op on backends that don't strip a prefix.
 - **Sticker decode-dimension cap** (touches: `wire-contract`) — for
   `type=sticker`, after the magic-number check, `uploadFile` reads W×H via
   `image.DecodeConfig` (header-only, no full decode) and rejects either side >

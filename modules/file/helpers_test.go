@@ -214,3 +214,40 @@ func TestOSSNormalizeObjectKey(t *testing.T) {
 		})
 	}
 }
+
+// TestViolatesStickerKeyspace pins the cross-type sticker-overwrite guard
+// (PR#509 review): a non-sticker upload that targets the sticker/ keyspace is
+// rejected, while sticker uploads and non-sticker uploads to their own keyspace
+// are allowed.
+func TestViolatesStickerKeyspace(t *testing.T) {
+	cases := []struct {
+		name     string
+		fileType Type
+		path     string
+		want     bool
+	}{
+		// --- rejected: non-sticker type aimed at sticker/ ---
+		{"chat into sticker root (leading slash)", TypeChat, "/sticker/10000/x.gif", true},
+		{"chat into sticker root (no leading slash)", TypeChat, "sticker/10000/x.gif", true},
+		{"moment into sticker root", TypeMoment, "/sticker/10000/x.png", true},
+		{"common into sticker root", TypeCommon, "/sticker/abc.webp", true},
+
+		// --- allowed: sticker itself owns the keyspace ---
+		{"sticker into its own keyspace", TypeSticker, "/sticker/10000/x.gif", false},
+		{"sticker plain path", TypeSticker, "/10000/x.gif", false},
+
+		// --- allowed: non-sticker types staying out of sticker/ ---
+		{"chat into chat keyspace", TypeChat, "/chat/2025/x.png", false},
+		{"chat nested path mentioning sticker mid-key", TypeChat, "/x/sticker/10000/y.gif", false},
+		{"chat empty path", TypeChat, "", false},
+		{"prefix lookalike not a segment", TypeChat, "/stickers/10000/x.gif", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := violatesStickerKeyspace(tc.fileType, tc.path); got != tc.want {
+				t.Fatalf("violatesStickerKeyspace(%q, %q) = %v, want %v",
+					tc.fileType, tc.path, got, tc.want)
+			}
+		})
+	}
+}

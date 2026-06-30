@@ -77,3 +77,29 @@ func ossNormalizeObjectKey(bucketName, objectPath string) string {
 	prefix := bucketName + "/"
 	return strings.TrimPrefix(objectPath, prefix)
 }
+
+// violatesStickerKeyspace reports whether a NON-sticker upload to objectPath
+// would land in the sticker object keyspace (`sticker/…`), which the sticker
+// module exclusively owns.
+//
+// Why this guard exists (cross-type overwrite, PR#509 review): a custom-sticker
+// object lives at key `sticker/{uid}/{uuid}.ext` and is bound to an HMAC upload
+// handle over (uid, public URL). On an OSS backend whose `BucketName` equals an
+// upload type's prefix (e.g. `chat` — a documented, supported config; see
+// ossNormalizeObjectKey), `ossNormalizeObjectKey` strips the leading `<bucket>/`
+// segment on PUT. So a `type=chat` upload to `path=/sticker/{uid}/{uuid}.ext`
+// stores `chat/sticker/{uid}/{uuid}.ext` → canonicalizes to the SAME key as the
+// legitimate sticker — overwriting it with content that passed NONE of the
+// type=sticker gates (1MB cap / magic number / raster-only / 512² dimension),
+// while the already-minted handle (bound to the unchanged URL) still verifies.
+// Reserving the keyspace at the upload boundary closes that overwrite on every
+// backend; on backends that do not strip a prefix a non-sticker key never starts
+// with `sticker/`, so this is a no-op there. Sticker uploads themselves are
+// exempt (they ARE the owner). Match is the literal lowercase `sticker/` — the
+// only form the sticker module and validateStickerPath ever produce/accept.
+func violatesStickerKeyspace(fileType Type, objectPath string) bool {
+	if fileType == TypeSticker {
+		return false
+	}
+	return strings.HasPrefix(strings.TrimPrefix(objectPath, "/"), "sticker/")
+}

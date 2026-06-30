@@ -356,6 +356,14 @@ func TestGetUploadCredentials_ObjectKeyWithFilename(t *testing.T) {
 			wantContentDisp: false,
 		},
 		{
+			// 非贴纸类型不得预签名直传到 sticker/ keyspace —— 否则 OSS bucket==类型 时
+			// 会覆盖合法贴纸对象（PR #509 review，violatesStickerKeyspace）。
+			name:            "non-sticker presigned upload into sticker/ keyspace is rejected",
+			queryParams:     "type=chat&path=/sticker/10000/x.gif&fileSize=512",
+			wantStatus:      http.StatusBadRequest,
+			wantContentDisp: false,
+		},
+		{
 			name:            "path and filename both provided uses path for key and filename for disposition",
 			queryParams:     "type=chat&path=/custom/abc123.jpg&filename=photo.jpg&fileSize=4096",
 			wantStatus:      http.StatusOK,
@@ -1375,6 +1383,31 @@ func TestUploadFile_NonStickerNoHandle(t *testing.T) {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	_, has := resp["sticker_handle"]
 	require.False(t, has, "non-sticker upload must not carry a sticker_handle")
+}
+
+// TestUploadFile_NonStickerRejectedFromStickerKeyspace pins the cross-type
+// overwrite guard (PR#509 review) on the multipart path: a non-sticker upload
+// (here type=chat) targeting a /sticker/... path is refused before any content
+// is read, so it can never overwrite a real sticker object (the OSS
+// bucket==type canonicalization vector). A valid PNG body is used to prove the
+// rejection is the keyspace guard, not a content check.
+func TestUploadFile_NonStickerRejectedFromStickerKeyspace(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	mockSvc := &mockService{downloadURL: "https://cdn.example.com/dm/chat/10000/x.png"}
+	f := &File{Log: log.NewTLog("FileTest"), service: mockSvc}
+
+	body, contentType := newMultipartFile(t, "x.png", pngOfSize(t, 64, 64))
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request, _ = http.NewRequest(http.MethodPost, "/v1/file/upload?type=chat&path=/sticker/10000/x.png", body)
+	c.Request.Header.Set("Content-Type", contentType)
+	c.Set("uid", "10000")
+
+	f.uploadFile(&wkhttp.Context{Context: c})
+
+	require.Equal(t, http.StatusBadRequest, rec.Code,
+		"non-sticker upload into sticker/ keyspace must be rejected; body: %s", rec.Body.String())
 }
 
 // TestUploadFile_StickerRejectsOversizeDimensions is the decompression-bomb

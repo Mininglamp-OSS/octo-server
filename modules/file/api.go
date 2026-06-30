@@ -164,6 +164,17 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 		}
 	}
 
+	// 保留 sticker/ keyspace：非贴纸类型不得写入 sticker/ 路径（见
+	// violatesStickerKeyspace）。否则在 OSS.BucketName 等于该类型前缀的部署里，归一化
+	// 会把 type=chat&path=/sticker/{uid}/x 覆盖到合法贴纸的同一对象 key，且不使其
+	// upload handle 失效——keyed 态也能绕过贴纸门。在上传边界堵死该覆盖向量。
+	if violatesStickerKeyspace(Type(fileType), uploadPath) {
+		f.Warn("非贴纸上传不得写入 sticker/ keyspace",
+			zap.String("type", fileType), zap.String("path", uploadPath))
+		c.ResponseError(errors.New("无效的文件路径"))
+		return
+	}
+
 	// 限制请求体大小，防止大文件 DoS
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, MaxFileSize+1024*1024)
 
@@ -595,6 +606,15 @@ func (f *File) getUploadCredentials(c *wkhttp.Context) {
 		}
 		if !strings.HasPrefix(sanitized, "/") {
 			sanitized = "/" + sanitized
+		}
+		// 同 uploadFile：预签名直传也必须保留 sticker/ keyspace，否则 type=chat 预签名
+		// PUT 到 /sticker/... 可在 OSS bucket==类型 时覆盖合法贴纸对象（见
+		// violatesStickerKeyspace）。贴纸本就已在上面被拒走预签名，这里覆盖其它类型。
+		if violatesStickerKeyspace(Type(fileType), sanitized) {
+			f.Warn("非贴纸预签名上传不得写入 sticker/ keyspace",
+				zap.String("type", fileType), zap.String("path", sanitized))
+			c.ResponseError(errors.New("无效的文件路径"))
+			return
 		}
 		objectKey = fileType + sanitized
 	} else if filename != "" {
