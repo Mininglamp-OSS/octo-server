@@ -45,9 +45,10 @@ var (
 	emojiManifestETag  string
 )
 
-// loadEmojiManifest 解析内置清单并预计算其内容相关弱 ETag(只做一次)。内嵌 JSON 损坏属
-// 编译进二进制的资产 bug,直接 panic 暴露(与 common 启动期其它资产校验一致),不进入运行时
-// 错误分支 —— 故此特性无需注册新的 errcode / i18n 文案。
+// loadEmojiManifest 解析内置清单并预计算其内容相关弱 ETag(只做一次)。New() 在启动期会主动
+// 调用一次做 fail-fast:内嵌 JSON 损坏属编译进二进制的资产 bug,直接 panic 暴露(与 common
+// 启动期其它资产校验一致),不进入运行时错误分支 —— 故此特性无需注册新的 errcode / i18n 文案。
+// handler 也会调用它,首次之后是 no-op。
 func loadEmojiManifest() {
 	emojiManifestOnce.Do(func() {
 		if err := json.Unmarshal(emojiManifestJSON, &emojiManifestValue); err != nil {

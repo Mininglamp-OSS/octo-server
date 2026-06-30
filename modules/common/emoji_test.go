@@ -16,7 +16,7 @@ import (
 
 // tokenShape 锁定 wire 契约:每个 key 必须是 [xxx] 形式的消息正文 token。老消息/老客户端
 // 依赖它逐字节不变,清单里出现非 [xxx] 的 key 即是破坏性改动。
-var tokenShape = regexp.MustCompile(`^\[.+\]$`)
+var tokenShape = regexp.MustCompile(`^\[[^\]]+\]$`)
 
 // TestEmojiManifest_Embedded 校验内嵌真源能被解析,且内容符合契约:非空、版本 >=1、
 // 每个 key 是 [xxx] token、内置项 URL 留空(客户端复用本地图)、ETag 非空。纯内存,无需 DB。

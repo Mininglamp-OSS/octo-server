@@ -607,9 +607,22 @@ paths:
       operationId: "common emojis"
       produces:
         - "application/json"
+      parameters:
+        - name: "If-None-Match"
+          in: "header"
+          required: false
+          type: "string"
+          description: "上次响应的 ETag。命中当前清单时返回 304(无 body)。"
       responses:
         200:
           description: "返回"
+          headers:
+            ETag:
+              type: "string"
+              description: "内容相关弱 ETag，清单任意改动即变化"
+            Cache-Control:
+              type: "string"
+              description: "public, max-age=300, must-revalidate"
           schema:
             type: object
             properties:
