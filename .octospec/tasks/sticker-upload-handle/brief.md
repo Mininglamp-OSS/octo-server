@@ -86,6 +86,35 @@ is independent of every other use of that master key.
   upload already validates content against the declared ext via
   `ValidateMagicNumber`, and `validateStickerPath` pins `path-ext == format`.
 
+## Deployment / rollout
+
+**The handle guard activates implicitly when `OCTO_MASTER_KEY` becomes a valid
+(exactly-32-byte) key — and that key is SHARED with `modules/common`'s IM
+private-key encryption.** So a deployment that sets the key for encryption (its
+primary purpose) also turns on sticker-handle enforcement: from that point
+`sticker.add` REQUIRES a valid `handle`, and any caller that omits it (an
+`addStickerReq` with `handle==""`) is refused (`stickersig.Verify` returns false
+on an empty handle). There is no separate enable flag — enforcement is coupled to
+key presence by design (keeps the surface minimal; the feature has no released
+clients yet).
+
+Consequence and required rollout order:
+
+1. **Ship the client first.** octo-web must forward `sticker_handle` (upload
+   response) as `handle` (registration request) BEFORE the server runs with a
+   valid `OCTO_MASTER_KEY`. The companion octo-web PR (#496) must land together
+   with / ahead of enabling the key, or sticker registration breaks for every
+   client.
+2. **Key-less / wrong-length deployments are not regressed.** With no key (or a
+   non-32-byte key) `stickersig.Enabled()` is false and `add` degrades to the
+   path-shape check alone — the pre-handle posture. `sticker.New` emits a one-time
+   startup WARN in this state so the degraded posture is visible to operators.
+3. **No decoupling toggle was added.** A future `OCTO_STICKER_HANDLE_REQUIRED`
+   switch (enforce independently of key presence) was considered and deferred —
+   it is only worth adding if a deployment needs the key for encryption while
+   intentionally keeping sticker enforcement off; revisit if that scenario
+   appears.
+
 ## Acceptance
 
 - `pkg/stickersig`: sign/verify round-trips; rejects tampered uid/path, malformed
