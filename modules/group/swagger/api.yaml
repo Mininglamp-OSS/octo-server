@@ -320,7 +320,7 @@ paths:
                   description: "成员名称"
               avatar_text:
                 type: string
-                description: "自定义群头像文字（≤4 可见字符；空/缺省时按 is_named 回退：传入 name(命名群)取群名前 2 字（script 感知取字），未传 name(成员拼接自动名)回退双人图标）"
+                description: "自定义群头像文字（≤4 可见字符；空/缺省时按 is_named 回退：老群(is_named=1，改版前存量群)取群名前 2 字，新群(is_named=0)回退双人图标。新建群恒为新群→双人图标，群名不作为头像文字）"
               avatar_color:
                 type: integer
                 description: "自定义群头像色板下标 [0, 调色板大小)；缺省时按 group_no 派生颜色"
@@ -528,7 +528,7 @@ paths:
                 description: "修改群名称 notice(修改群备注) invite(是否开启进群邀请) 等"
               avatar_text:
                 type: string
-                description: "自定义群头像文字（≤4 可见字符；空串清除→按 is_named 回退：命名群取群名前2字、自动名群双人图标）"
+                description: "自定义群头像文字（≤4 可见字符；空串清除→按 is_named 回退：老群取群名前2字、新群双人图标）"
               avatar_color:
                 type: integer
                 description: "自定义群头像色板下标 [0, 调色板大小)；空串或 -1 清除→回退按 group_no 派生"
@@ -1216,8 +1216,9 @@ paths:
       summary: "获取群头像"
       description: >-
         公开（不鉴权）端点。未上传自定义头像的群在服务端实时渲染默认头像（彩色描边圆）：
-        优先自定义 avatar_text；否则按 is_named 回退——命名群(is_named=1)取群名前 2 字
-        （script 感知取字），自动名群(is_named=0)或空名回退双人图标；avatar_color 控制配色。返回 image/png。
+        优先自定义 avatar_text；否则按 is_named 回退——老群(is_named=1，改版前存量群)取群名前 2 字
+        （script 感知取字，grandfather 保留其原头像），新群(is_named=0)或空名回退双人图标；avatar_color
+        控制配色。返回 image/png。注：新建群恒为新群→双人图标，群名不作为头像文字（产品 2026-06-29 改版）。
         已上传头像（is_upload_avatar=1）的群 302 重定向到对象存储。群不存在或已解散返回
         404。响应带内容相关弱 ETag，命中 If-None-Match 时返回 304。
       operationId: "get avatar"
@@ -1397,7 +1398,7 @@ definitions:
         description: "群名称"
       is_named:
         type: integer
-        description: "群名是否用户显式起名(1)/成员拼接自动名(0)；客户端据此本地预判默认头像取群名前2字 vs 双人图标"
+        description: "1=改版前老群(默认渲染群名文字)/0=新群(默认双人图标)；由 #500 迁移回填，新建群恒为 0；客户端可据此本地预判默认头像取群名文字 vs 双人图标"
       remark:
         type: string
         description: "群备注"
@@ -1472,7 +1473,7 @@ definitions:
         description: "群数据版本"
       avatar_text:
         type: string
-        description: "自定义群头像文字（空=未自定义，按 is_named 回退：命名群(is_named=1)取群名前 2 字（script 感知取字），自动名群(is_named=0)回退双人图标）"
+        description: "自定义群头像文字（空=未自定义，按 is_named 回退：老群(is_named=1)取群名前 2 字，新群(is_named=0)回退双人图标）"
       avatar_color:
         type: integer
         description: "自定义群头像色板下标（null 表示未自定义，按 group_no 派生）"

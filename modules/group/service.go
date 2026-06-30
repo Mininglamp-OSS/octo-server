@@ -198,16 +198,12 @@ func (s *Service) GetCreatedCountWithDate(date string) (int64, error) {
 
 // AddGroup 添加一个群
 func (s *Service) AddGroup(model *AddGroupReq) error {
-	// 显式传名 → 命名群（is_named=1，默认头像取群名前2字）；空名 → 0（回退双人图标）。
-	// 与 CreateGroup 的 is_named 推断口径一致，避免直插路径漏置导致命名群退回图标。
-	isNamed := 0
-	if strings.TrimSpace(model.Name) != "" {
-		isNamed = 1
-	}
+	// 新建群一律 is_named=0 → 默认头像双人图标（产品 2026-06-29 改版，与 CreateGroup 口径
+	// 一致）。is_named=1 仅由 #500 迁移回填给改版前的存量老群，使其保留群名文字头像。
 	err := s.db.Insert(&Model{
 		GroupNo:        model.GroupNo,
 		Name:           model.Name,
-		IsNamed:        isNamed,
+		IsNamed:        0, // 新群默认 0 → 双人图标；is_named=1 仅存量老群（#500 迁移回填）
 		AllowExternal:  1, // 向后兼容：默认允许外部成员
 		AllowNoMention: 1, // 向后兼容：默认允许群级免@
 	})
@@ -803,8 +799,8 @@ type GroupResp struct {
 	GroupType                GroupType `json:"group_type"`                  // 群类型
 	Category                 string    `json:"category"`                    // 群分类
 	Name                     string    `json:"name"`                        // 群名称
-	IsNamed                  int       `json:"is_named"`                    // 群名是否用户显式起名(1)/成员拼接自动名(0)；客户端据此本地预判默认头像取名字/双人图标
-	AvatarText               string    `json:"avatar_text"`                 // 自定义群头像文字（空=按 is_named 回退：命名群群名/自动名群双人图标）
+	IsNamed                  int       `json:"is_named"`                    // 1=改版前老群(默认渲染群名文字)/0=新群(默认双人图标)；由 #500 迁移回填，新群恒为 0；客户端可据此本地预判默认头像取群名文字 vs 双人图标
+	AvatarText               string    `json:"avatar_text"`                 // 自定义群头像文字（空=按 is_named 回退：老群渲染群名/新群双人图标）
 	AvatarColor              *int      `json:"avatar_color"`                // 自定义群头像色板下标（null=按 group_no 派生）
 	Remark                   string    `json:"remark"`                      // 群备注
 	Notice                   string    `json:"notice"`                      // 群公告
@@ -966,7 +962,7 @@ type CreateGroupServiceReq struct {
 	SpaceID     string   // Space ID（可为空）
 	BotUID      string   // Bot UID（可为空；非空时自动加入群并设为 bot_admin）
 	CategoryID  string   // 群聊分组 ID（可为空；非空时自动设置创建者的 group_setting）
-	AvatarText  string   // 自定义群头像文字（可为空；空=按 is_named 回退：命名群群名/自动名群双人图标）
+	AvatarText  string   // 自定义群头像文字（可为空；空=按 is_named 回退：老群渲染群名/新群双人图标）
 	AvatarColor *int     // 自定义群头像色板下标（nil=渲染时按 group_no 派生）
 }
 
@@ -1019,7 +1015,7 @@ type UpdateGroupAvatarCustomServiceReq struct {
 	GroupNo      string
 	OperatorUID  string
 	OperatorName string
-	// AvatarText：nil 表示不更新文字；非 nil（含 ""）表示设置，"" 即清除自定义文字（回退群名）。
+	// AvatarText：nil 表示不更新文字；非 nil（含 ""）表示设置，"" 即清除自定义文字（回退 is_named 规则:老群群名/新群双人图标）。
 	AvatarText *string
 	// SetAvatarColor：是否更新颜色。为 true 时按 AvatarColor 设置：nil 清除（NULL，回退派生），
 	// 非 nil 为色板下标。为 false 时不动颜色。
@@ -1118,13 +1114,12 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 		return nil, errors.New("no valid member found")
 	}
 
-	// 群名生成。建群传了 name = 用户显式起名(is_named=1，默认头像取群名前2字)；没传 =
-	// 用成员名拼接的自动默认名(is_named=0，默认头像回退双人图标，不把拼接名渲成文字)。
+	// 群名生成。建群传了 name = 用户显式起名；没传 = 用成员名拼接的自动默认名。
+	// 注(产品 2026-06-29 改版)：新建群一律 is_named=0 → 默认头像双人图标，群名不作为头像
+	// 文字；用户在「修改头像」填了 avatar_text 才渲染文字。is_named=1 不再由建群产生——它
+	// 仅由 #500 迁移回填给「改版前的存量老群」，使这些老群保留其原有的群名文字头像
+	// （grandfather，避免存量群一夜全变小人）。
 	groupName := strings.TrimSpace(req.Name)
-	isNamedVal := 0
-	if groupName != "" {
-		isNamedVal = 1
-	}
 	if groupName == "" {
 		names := make([]string, 0, len(memberUsers))
 		for _, u := range memberUsers {
@@ -1173,7 +1168,7 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 	err = s.db.InsertTx(&Model{
 		GroupNo:             groupNo,
 		Name:                groupName,
-		IsNamed:             isNamedVal,
+		IsNamed:             0, // 新群默认 0 → 双人图标；is_named=1 仅存量老群（#500 迁移回填）
 		Creator:             req.Creator,
 		Status:              GroupStatusNormal,
 		Version:             version,
@@ -1182,7 +1177,7 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 		AllowExternal:       1, // 向后兼容：默认允许外部成员
 		AllowNoMention:      1, // 向后兼容：默认允许群级免@
 		IsExternalGroup:     isExternalGroup,
-		AvatarText:          req.AvatarText,  // 空=按 is_named 回退（命名群群名/自动名群双人图标）
+		AvatarText:          req.AvatarText,  // 空=按 is_named 回退（老群渲染群名/新群双人图标）
 		AvatarColor:         req.AvatarColor, // nil=渲染时按 group_no 派生
 	}, tx)
 	if err != nil {
@@ -1887,7 +1882,9 @@ func (s *Service) UpdateGroupInfo(req *UpdateGroupInfoServiceReq) error {
 			*req.Name = string(nameRunes[:MaxGroupNameLen])
 		}
 		groupModel.Name = *req.Name
-		groupModel.IsNamed = 1 // 用户显式改名 → 命名群（默认头像改取新群名前 2 字）
+		// 改名不再改动 is_named（产品 2026-06-29 改版）：is_named 是「改版前老群」标记，
+		// 不随改名翻转。老群(is_named=1)改名后仍渲染新群名文字；新群(is_named=0)改名后仍是
+		// 双人图标（群名不作为头像文字，要文字请设 avatar_text）。保留 groupModel 的既有值回写。
 	}
 	if req.Notice != nil {
 		groupModel.Notice = *req.Notice

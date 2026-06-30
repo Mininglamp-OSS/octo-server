@@ -425,12 +425,14 @@ func (g *Group) avatarGet(c *wkhttp.Context) {
 	}
 
 	// 无自定义上传（含历史合成群、新建群）：服务端实时渲染默认头像——有自定义文字则渲染
-	// 该文字；否则命名群（is_named=1）取群名前 2 字，自动名群（is_named=0）回退双人图标。
+	// 该文字；否则老群（is_named=1，改版前存量群）取群名前 2 字，新群（is_named=0）回退双人图标。
 	g.writeGroupDefaultAvatar(c, groupNo, groupInfo)
 }
 
 // writeGroupDefaultAvatar 服务端渲染并返回群默认头像（无自定义上传时）。文字优先级：
-// 自定义 avatar_text > 命名群（is_named=1）的群名前 2 字 > 空（自动名群 → 双人图标）。
+// 自定义 avatar_text > 老群（is_named=1，改版前存量群）的群名前 2 字 > 空（新群 is_named=0
+// → 双人图标）。产品 2026-06-29 改版：新建群默认双人图标、群名不作为头像文字，仅 avatar_text
+// 才渲染文字；is_named=1 仅由 #500 迁移回填给存量老群，让它们保留原群名文字头像（grandfather）。
 // 颜色优先自定义 avatar_color，否则按 group_no 稳定派生（改名不变色、跨页面一致）。
 //
 // URL 稳定为 groups/{group_no}/avatar，内容随群名/自定义变化，故用内容相关弱 ETag +
@@ -441,11 +443,12 @@ func (g *Group) writeGroupDefaultAvatar(c *wkhttp.Context, groupNo string, group
 	colorTag := "seed"
 	var text string
 	if groupInfo != nil {
-		// 默认头像取字规则(产品 2026-06-29 定稿)：
+		// 默认头像取字规则(产品 2026-06-29 改版)：
 		//   1. 用户在「修改头像」显式设了自定义文字 → 原样渲染(写入时已 ≤4 规范化、不取字);
-		//   2. 否则群是用户**显式起名**(is_named=1) → 取群名前 2 字(script 感知);
-		//   3. 否则(成员名拼接的自动默认名 is_named=0) → text 留空 → 回退双人图标
-		//      (不把「张三、李四、王五」这类拼接名渲成头像文字)。
+		//   2. 否则是**改版前的存量老群**(is_named=1) → 取群名前 2 字(script 感知)，保留其原有
+		//      群名文字头像(grandfather，避免老群一夜全变小人);
+		//   3. 否则(新群 is_named=0) → text 留空 → 回退双人图标(群名不作为头像文字，要文字请设
+		//      avatar_text)。
 		if groupInfo.AvatarText != "" {
 			text = avatarrender.GroupText(groupInfo.AvatarText)
 		} else if groupInfo.IsNamed == 1 {
@@ -461,10 +464,10 @@ func (g *Group) writeGroupDefaultAvatar(c *wkhttp.Context, groupNo string, group
 	renderable := avatarrender.Renderable(text)
 
 	// ETag 覆盖决定图像内容的因子：渲染模式版本 + group_no(派生色) + 实际色 + 文字。
-	// 改名/改自定义文字/改 is_named → text 变(或在 name 模式与 icon 模式间切换) → ETag 变；
-	// 改自定义色 → colorTag 变 → ETag 变。命名群走 group-name-v4(+text)、自动名群走
-	// group-icon-v3(无 text)，模式不同因子串天然不同，故两类切换无需 bump 版本。渲染
-	// **视觉**改动(像素变但因子不变，如 #486 透明四角)才必须 bump 版本段。
+	// 老群改名 → text 变 → ETag 变；改/清自定义文字(或在 text 模式与 icon 模式间切换) →
+	// ETag 变；改自定义色 → colorTag 变 → ETag 变。有文字(老群群名/自定义)走 group-name-v4
+	// (+text)、无文字(新群)走 group-icon-v3(无 text)，模式不同因子串天然不同，故两类切换无需
+	// bump 版本。渲染**视觉**改动(像素变但因子不变，如 #486 透明四角)才必须 bump 版本段。
 
 	etag := avatarrender.ETag("group-icon-v3", groupNo, colorTag)
 	if renderable {
@@ -1029,7 +1032,7 @@ func (g *Group) groupUpdate(c *wkhttp.Context) {
 	// 自定义群头像文字/颜色（二次弹窗保存）：先在任何 mutation 之前完成解析与校验，构造
 	// avatarReq。这样非法的 avatar 字段会在 name/notice/invite 落库之前返回 400，避免
 	// 「返回 400 却已部分写入群名」的非原子部分写入。avatar_text 空串清除自定义文字（回退
-	// 群名），avatar_color "" / "-1" 清除自定义色（回退派生）。超限直接拒绝，不静默截断。
+	// is_named 规则:老群群名/新群双人图标），avatar_color "" / "-1" 清除自定义色（回退派生）。超限直接拒绝，不静默截断。
 	avatarTextValue, hasAvatarText := groupMap[attrKeyAvatarText]
 	avatarColorValue, hasAvatarColor := groupMap[attrKeyAvatarColor]
 	var avatarReq *UpdateGroupAvatarCustomServiceReq
@@ -4210,7 +4213,7 @@ type groupReq struct {
 	Members     []string `json:"members"`      // 成员uid
 	SpaceID     string   `json:"space_id"`     // Space ID（可选）
 	CategoryID  string   `json:"category_id"`  // 群聊分组 ID（可选，需配合 space_id 使用）
-	AvatarText  string   `json:"avatar_text"`  // 自定义群头像文字（可选，最多 4 个中文/英文字符；空=按 is_named 回退：命名群群名/自动名群双人图标）
+	AvatarText  string   `json:"avatar_text"`  // 自定义群头像文字（可选，最多 4 个中文/英文字符；空=按 is_named 回退：老群渲染群名/新群双人图标）
 	AvatarColor *int     `json:"avatar_color"` // 自定义群头像色板下标（可选，[0,palette)；不传=按 group_no 派生）
 }
 
@@ -4223,7 +4226,8 @@ func (g groupReq) Check() error {
 
 // checkAvatar 校验二次弹窗的自定义头像参数，返回越界字段名（供 Details.field）。
 // ok=true 表示合法。两者均为可选：avatar_text 空、avatar_color 不传即“未自定义”，
-// 渲染时分别回退到群名前 2 字 / ColorForSeed(group_no)。不静默截断，超限直接拒绝。
+// 渲染时分别回退到 is_named 规则(老群群名前2字/新群双人图标) / ColorForSeed(group_no)。
+// 不静默截断，超限直接拒绝。
 //
 // 哨兵约定（创建 vs 改群刻意不对称）：创建无既有值可清除，故 avatar_color 仅接受
 // [0,palette)（-1 在此被拒）；改群额外接受 "-1" / "" 表示清除自定义色回退派生。

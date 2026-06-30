@@ -28,8 +28,9 @@ func TestGroupAvatarGetPinsRenderVersion(t *testing.T) {
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	g := New(ctx)
 
-	// Custom avatar_text is the ONLY path to text-render now that the group name no
-	// longer drives the default avatar -> name render mode, default colorTag "seed".
+	// This fixture uses custom avatar_text -> name render mode, default colorTag "seed".
+	// (Legacy is_named=1 groups also render group-name text; new groups fall back to icon.
+	//  This test pins the version segment of the text-render mode, regardless of text source.)
 	const namedNo = "avatar_pin_named_1"
 	require.NoError(t, g.db.Insert(&Model{GroupNo: namedNo, Name: "后端架构讨论", Creator: "c1", Status: 1, AvatarText: "研发"}))
 	named := doAvatarGet(t, s.GetRoute(), namedNo, "")

@@ -173,7 +173,7 @@ func (g *Group) handleRegisterUserEvent(data []byte, commit config.EventCommit) 
 		err = g.db.InsertTx(&Model{
 			GroupNo:        g.ctx.GetConfig().Account.SystemGroupID,
 			Name:           g.ctx.GetConfig().Account.SystemGroupName,
-			IsNamed:        1, // 系统群有显式配置名 → 命名群（与 CreateGroup 的 is_named 语义一致）
+			IsNamed:        0, // 新群默认 0（与 CreateGroup 口径一致）；系统群本就走静态 PNG，不经 is_named 渲染路径
 			Creator:        g.ctx.GetConfig().Account.SystemUID,
 			Status:         GroupStatusNormal,
 			Version:        version,
@@ -316,7 +316,7 @@ func (g *Group) handleOrgOrDeptCreateEvent(data []byte, commit config.EventCommi
 		err = g.db.InsertTx(&Model{
 			GroupNo:             req.GroupNo,
 			Name:                req.Name,
-			IsNamed:             1, // 组织/部门群有显式名 → 命名群（与 CreateGroup 的 is_named 语义一致）
+			IsNamed:             0, // 新群默认 0（与 CreateGroup 口径一致）；org_/dept_ 群本就走静态 PNG，不经 is_named 渲染路径
 			Creator:             req.Operator,
 			Status:              GroupStatusNormal,
 			Version:             version,

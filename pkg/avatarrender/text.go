@@ -137,8 +137,8 @@ func initials(name string, limit int) string {
 // 不经过本规则。返回结果可能仍含本字体无字形的字符(罕见生僻字),调用方应配合
 // Renderable 判断,对不可渲染的结果回退到群组图标。
 //
-// 仅用于「命名群(is_named=1)」的群名自动取字;成员拼接的自动名(is_named=0)不调用本函数、
-// 直接回退双人图标(见 modules/group writeGroupDefaultAvatar)。
+// 仅用于「改版前的存量老群(is_named=1)」的群名自动取字;新群(is_named=0)不调用本函数、
+// 直接回退双人图标(见 modules/group writeGroupDefaultAvatar，2026-06-29 改版)。
 func GroupNameText(name string) string {
 	return extractAvatarText(name, false, 2)
 }

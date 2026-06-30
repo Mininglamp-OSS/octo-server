@@ -280,7 +280,7 @@ func (d *DB) queryUserSupers(uid string) ([]*Model, error) {
 func (d *DB) UpdateTx(model *Model, tx *dbr.Tx) error {
 	_, err := tx.Update("group").SetMap(map[string]interface{}{
 		"name":      model.Name,
-		"is_named":  model.IsNamed, // 改名置 1（用户起名）；其它更新原样回写当前值
+		"is_named":  model.IsNamed, // 原样回写当前值（改名不再改动 is_named；仅 #500 迁移回填存量老群为 1）
 		"notice":    model.Notice,
 		"creator":   model.Creator,
 		"status":    model.Status,
@@ -293,10 +293,9 @@ func (d *DB) UpdateTx(model *Model, tx *dbr.Tx) error {
 
 // UpdateInviteTx 仅更新「进群邀请开关」与群版本（列级写，事务内）。
 // 不能用 UpdateTx 整行回写：groupUpdate 在同一请求里若同时带 name 与 invite，name 分支
-// 已通过 UpdateGroupInfo（独立 fresh load）提交 name/is_named=1，而 invite 分支若再用
-// 建链时载入的旧快照经 UpdateTx 全列回写，会把刚提交的 name/is_named 用旧值覆盖回去
-// （改名 + is_named 被回滚成 0 → 头像静默退回双人图标）。列级写只动 invite/version，
-// 与并发的改名互不踩踏，也消除该读改写竞态。
+// 已通过 UpdateGroupInfo（独立 fresh load）提交了新 name，而 invite 分支若再用建链时载入
+// 的旧快照经 UpdateTx 全列回写，会把刚提交的 name 用旧值覆盖回去（改名被静默回滚）。
+// 列级写只动 invite/version，与并发的改名互不踩踏，也消除该读改写竞态。
 func (d *DB) UpdateInviteTx(groupNo string, invite int, version int64, tx *dbr.Tx) error {
 	_, err := tx.Update("group").SetMap(map[string]interface{}{
 		"invite":  invite,
@@ -336,7 +335,7 @@ func (d *DB) updateAvatar(avatar string, avatarVersion int64, groupNo string) er
 // updateAvatarCustom 更新自定义群头像文字/颜色与群版本（不触碰 is_upload_avatar：
 // 自定义文字/色仍是「默认头像」范畴，渲染时实时出图，不同于上传图片）。color 为
 // *int，nil → NULL（清除自定义色，回退按 group_no 派生）。text 为空串表示清除自定义
-// 文字（回退：命名群取群名前 2 字，自动名群双人图标）。
+// 文字（回退：老群取群名前 2 字，新群双人图标）。
 // updateAvatarCustom 只更新本次实际提供的列：text 非 nil 时写 avatar_text，setColor
 // 为 true 时写 avatar_color（*int，nil → NULL 清除自定义色）；始终 bump version。
 // 列级更新避免「读-改-写」竞态——并发只改文字 / 只改色不会互相覆盖对方的列。
@@ -608,11 +607,11 @@ type Model struct {
 	GroupNo                  string     // 群编号
 	GroupType                int        // 群类型 0.普通群 1.超大群
 	Name                     string     // 群名称
-	IsNamed                  int        // 群名是否用户显式起名(1)/成员拼接自动名(0)；默认头像取字仅对 1 生效
+	IsNamed                  int        // 1=改版前老群/0=新群；由 #500 迁移回填，新群恒为 0。默认头像取群名文字仅对 1 生效（grandfather 老群），新群一律双人图标
 	Avatar                   string     // 群头像
 	AvatarVersion            int64      // 群头像对象版本，0 表示旧版稳定路径
 	IsUploadAvatar           int        // 群头像是否已经被用户上传
-	AvatarText               string     // 自定义群头像文字；空时按 is_named 回退（命名群取群名前2字，自动名群双人图标）
+	AvatarText               string     // 自定义群头像文字；空时按 is_named 回退（老群取群名前2字，新群双人图标）
 	AvatarColor              *int       // 自定义群头像色板下标，nil(NULL) 表示按 group_no 派生
 	Notice                   string     // 群公告
 	Creator                  string     // 创建者uid
