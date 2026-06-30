@@ -23,6 +23,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/Mininglamp-OSS/octo-server/pkg/stickersig"
 	"github.com/gin-gonic/gin"
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -1334,6 +1335,8 @@ func TestUploadFile_StickerHandleMinted(t *testing.T) {
 	// A real, small PNG so both ValidateMagicNumber and the dimension guard
 	// (image.DecodeConfig) pass.
 	body, contentType := newMultipartFile(t, "abc.png", pngOfSize(t, 64, 64))
+	beforeUpload := promtestutil.ToFloat64(metricStickerUploadTotal.WithLabelValues("success"))
+	beforeHandle := promtestutil.ToFloat64(metricStickerUploadHandleTotal.WithLabelValues("issued"))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -1356,6 +1359,8 @@ func TestUploadFile_StickerHandleMinted(t *testing.T) {
 		"minted handle must verify for (uid, returned path) — the tuple sticker.add checks")
 	// And it must NOT verify for a different uid (the handle binds the uploader).
 	require.False(t, stickersig.Verify("99999", path, handle))
+	assert.Equal(t, beforeUpload+1, promtestutil.ToFloat64(metricStickerUploadTotal.WithLabelValues("success")))
+	assert.Equal(t, beforeHandle+1, promtestutil.ToFloat64(metricStickerUploadHandleTotal.WithLabelValues("issued")))
 }
 
 // TestUploadFile_NonStickerNoHandle: non-sticker uploads must not carry a
@@ -1458,6 +1463,7 @@ func TestUploadFile_StickerRejectsOversizeDimensions(t *testing.T) {
 		{"width over only", 600, 10},
 		{"height over only", 10, 600},
 	}
+	beforeRejected := promtestutil.ToFloat64(metricStickerUploadTotal.WithLabelValues("dimension_rejected"))
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			mockSvc := &mockService{downloadURL: "https://cdn.example.com/dm/sticker/10000/x.png"}
@@ -1476,6 +1482,7 @@ func TestUploadFile_StickerRejectsOversizeDimensions(t *testing.T) {
 				"%dx%d sticker must be rejected; body: %s", tc.w, tc.h, rec.Body.String())
 		})
 	}
+	assert.Equal(t, beforeRejected+float64(len(cases)), promtestutil.ToFloat64(metricStickerUploadTotal.WithLabelValues("dimension_rejected")))
 }
 
 // TestUploadFile_StickerRejectsPathExtMismatch is the format-integrity guard: a

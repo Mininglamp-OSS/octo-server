@@ -19,6 +19,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/stickersig"
 	redis "github.com/go-redis/redis"
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -178,6 +179,215 @@ func TestSticker_AddAndList(t *testing.T) {
 	assert.Equal(t, validStickerPath("abc.png"), item["path"])
 	assert.Equal(t, "user", item["category"])
 	assert.Equal(t, "[笑]", item["placeholder"])
+}
+
+func TestSticker_UpdatePartialAndListSortOrder(t *testing.T) {
+	route, _, _ := setupSticker(t)
+
+	addA := doRequest(t, route, "POST", "/v1/sticker/user", map[string]string{
+		"path":        validStickerPath("older.png"),
+		"format":      "png",
+		"placeholder": "[旧]",
+		"handle":      validStickerHandle(t, validStickerPath("older.png")),
+	})
+	require.Equal(t, http.StatusOK, addA.Code)
+	olderID := parseJSON(t, addA)["sticker_id"].(string)
+
+	addB := doRequest(t, route, "POST", "/v1/sticker/user", map[string]string{
+		"path":        validStickerPath("newer.png"),
+		"format":      "png",
+		"placeholder": "[新]",
+		"handle":      validStickerHandle(t, validStickerPath("newer.png")),
+	})
+	require.Equal(t, http.StatusOK, addB.Code)
+	newerID := parseJSON(t, addB)["sticker_id"].(string)
+
+	updateA := doRequest(t, route, "PUT", "/v1/sticker/user/"+olderID, map[string]interface{}{
+		"sort": 5,
+	})
+	require.Equal(t, http.StatusOK, updateA.Code, "body: %s", updateA.Body.String())
+	updatedA := parseJSON(t, updateA)
+	assert.Equal(t, "[旧]", updatedA["placeholder"], "omitted placeholder must keep the old value")
+	assert.Equal(t, float64(5), updatedA["sort"])
+
+	updateB := doRequest(t, route, "PUT", "/v1/sticker/user/"+newerID, map[string]interface{}{
+		"placeholder": "",
+		"sort":        10,
+	})
+	require.Equal(t, http.StatusOK, updateB.Code, "body: %s", updateB.Body.String())
+	updatedB := parseJSON(t, updateB)
+	assert.Equal(t, defaultStickerPlaceholder, updatedB["placeholder"], "empty placeholder restores the default")
+	assert.Equal(t, float64(10), updatedB["sort"])
+
+	w := doRequest(t, route, "GET", "/v1/sticker/user", nil)
+	require.Equal(t, http.StatusOK, w.Code)
+	body := parseJSON(t, w)
+	list := body["list"].([]interface{})
+	require.Len(t, list, 2)
+	first := list[0].(map[string]interface{})
+	second := list[1].(map[string]interface{})
+	assert.Equal(t, olderID, first["sticker_id"], "sort ASC must outrank legacy id DESC ordering")
+	assert.Equal(t, float64(5), first["sort"])
+	assert.Equal(t, newerID, second["sticker_id"])
+	assert.Equal(t, float64(10), second["sort"])
+}
+
+func TestSticker_UpdateOwnershipAndValidation(t *testing.T) {
+	route, _, f := setupSticker(t)
+
+	other := &StickerModel{
+		StickerID:   util.GenerUUID(),
+		UID:         "other-uid",
+		Path:        "file/preview/sticker/other-uid/x.png",
+		Placeholder: "[别人的]",
+		Format:      "png",
+		Status:      1,
+	}
+	require.NoError(t, f.db.insert(other))
+
+	wOther := doRequest(t, route, "PUT", "/v1/sticker/user/"+other.StickerID, map[string]interface{}{
+		"placeholder": "[改]",
+		"sort":        1,
+	})
+	assertStickerErrorCode(t, wOther, "err.server.sticker.not_found")
+
+	stillThere, err := f.db.queryByID(other.StickerID)
+	require.NoError(t, err)
+	require.NotNil(t, stillThere)
+	assert.Equal(t, "[别人的]", stillThere.Placeholder)
+
+	add := doRequest(t, route, "POST", "/v1/sticker/user", map[string]string{
+		"path": validStickerPath("mine.png"), "format": "png",
+		"handle": validStickerHandle(t, validStickerPath("mine.png")),
+	})
+	require.Equal(t, http.StatusOK, add.Code)
+	mineID := parseJSON(t, add)["sticker_id"].(string)
+
+	wBadSort := doRequest(t, route, "PUT", "/v1/sticker/user/"+mineID, map[string]interface{}{"sort": -1})
+	assertStickerErrorCode(t, wBadSort, "err.server.sticker.request_invalid")
+
+	wLongPlaceholder := doRequest(t, route, "PUT", "/v1/sticker/user/"+mineID, map[string]interface{}{
+		"placeholder": string([]rune("一二三四五六七八九十")) + string(make([]rune, maxStickerPlaceholderLen)),
+	})
+	assertStickerErrorCode(t, wLongPlaceholder, "err.server.sticker.request_invalid")
+}
+
+func TestSticker_ShortcodeKeywordsCreateListAndUpdate(t *testing.T) {
+	route, _, _ := setupSticker(t)
+
+	add := doRequest(t, route, "POST", "/v1/sticker/user", map[string]interface{}{
+		"path":        validStickerPath("meta.png"),
+		"format":      "png",
+		"placeholder": "[笑哭]",
+		"handle":      validStickerHandle(t, validStickerPath("meta.png")),
+		"shortcode":   "XiaoKu",
+		"keywords":    []string{"笑哭", "哈哈", "笑哭", " "},
+	})
+	require.Equal(t, http.StatusOK, add.Code, "body: %s", add.Body.String())
+	ab := parseJSON(t, add)
+	id := ab["sticker_id"].(string)
+	assert.Equal(t, "xiaoku", ab["shortcode"])
+	assert.Equal(t, []interface{}{"笑哭", "哈哈"}, ab["keywords"])
+
+	list := parseJSON(t, doRequest(t, route, "GET", "/v1/sticker/user", nil))["list"].([]interface{})
+	require.Len(t, list, 1)
+	item := list[0].(map[string]interface{})
+	assert.Equal(t, "xiaoku", item["shortcode"])
+	assert.Equal(t, []interface{}{"笑哭", "哈哈"}, item["keywords"])
+
+	update := doRequest(t, route, "PUT", "/v1/sticker/user/"+id, map[string]interface{}{
+		"shortcode": "rofl_1",
+		"keywords":  []string{"ROFL", "笑哭"},
+	})
+	require.Equal(t, http.StatusOK, update.Code, "body: %s", update.Body.String())
+	ub := parseJSON(t, update)
+	assert.Equal(t, "rofl_1", ub["shortcode"])
+	assert.Equal(t, []interface{}{"ROFL", "笑哭"}, ub["keywords"])
+}
+
+func TestSticker_ShortcodeValidationAndConflict(t *testing.T) {
+	route, _, _ := setupSticker(t)
+
+	invalid := doRequest(t, route, "POST", "/v1/sticker/user", map[string]interface{}{
+		"path":      validStickerPath("invalid.png"),
+		"format":    "png",
+		"handle":    validStickerHandle(t, validStickerPath("invalid.png")),
+		"shortcode": "笑哭",
+	})
+	assertStickerErrorCode(t, invalid, "err.server.sticker.shortcode_invalid")
+
+	tooManyKeywords := doRequest(t, route, "POST", "/v1/sticker/user", map[string]interface{}{
+		"path":     validStickerPath("keywords.png"),
+		"format":   "png",
+		"handle":   validStickerHandle(t, validStickerPath("keywords.png")),
+		"keywords": []string{"1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"},
+	})
+	assertStickerErrorCode(t, tooManyKeywords, "err.server.sticker.keywords_invalid")
+
+	addA := doRequest(t, route, "POST", "/v1/sticker/user", map[string]interface{}{
+		"path":      validStickerPath("a.png"),
+		"format":    "png",
+		"handle":    validStickerHandle(t, validStickerPath("a.png")),
+		"shortcode": "rofl",
+	})
+	require.Equal(t, http.StatusOK, addA.Code, "body: %s", addA.Body.String())
+	idA := parseJSON(t, addA)["sticker_id"].(string)
+
+	addDup := doRequest(t, route, "POST", "/v1/sticker/user", map[string]interface{}{
+		"path":      validStickerPath("b.png"),
+		"format":    "png",
+		"handle":    validStickerHandle(t, validStickerPath("b.png")),
+		"shortcode": "rofl",
+	})
+	assertStickerErrorCode(t, addDup, "err.server.sticker.shortcode_conflict")
+
+	del := doRequest(t, route, "DELETE", "/v1/sticker/user/"+idA, nil)
+	require.Equal(t, http.StatusOK, del.Code)
+
+	addAfterDelete := doRequest(t, route, "POST", "/v1/sticker/user", map[string]interface{}{
+		"path":      validStickerPath("c.png"),
+		"format":    "png",
+		"handle":    validStickerHandle(t, validStickerPath("c.png")),
+		"shortcode": "rofl",
+	})
+	assert.Equal(t, http.StatusOK, addAfterDelete.Code, "deleted sticker must release shortcode; body: %s", addAfterDelete.Body.String())
+}
+
+func TestSticker_ShortcodeConflictScopedToUID(t *testing.T) {
+	route, ctx, _ := setupSticker(t)
+
+	_, err := ctx.DB().InsertInto("sticker").
+		Columns("sticker_id", "uid", "path", "placeholder", "format", "shortcode", "keywords", "status").
+		Values(util.GenerUUID(), "other-uid", "file/preview/sticker/other-uid/x.png", "[别人的]", "png", "shared", `["other"]`, 1).
+		Exec()
+	require.NoError(t, err)
+
+	w := doRequest(t, route, "POST", "/v1/sticker/user", map[string]interface{}{
+		"path":      validStickerPath("mine-shared.png"),
+		"format":    "png",
+		"handle":    validStickerHandle(t, validStickerPath("mine-shared.png")),
+		"shortcode": "shared",
+	})
+	assert.Equal(t, http.StatusOK, w.Code, "different users may reuse the same shortcode; body: %s", w.Body.String())
+}
+
+func TestSticker_RegisterMetrics(t *testing.T) {
+	route, _, _ := setupSticker(t)
+
+	beforeMissing := promtestutil.ToFloat64(metricStickerRegisterTotal.WithLabelValues("missing_handle"))
+	w := doRequest(t, route, "POST", "/v1/sticker/user", map[string]string{
+		"path": validStickerPath("nohandle-metric.png"), "format": "png",
+	})
+	assertStickerErrorCode(t, w, "err.server.sticker.request_invalid")
+	assert.Equal(t, beforeMissing+1, promtestutil.ToFloat64(metricStickerRegisterTotal.WithLabelValues("missing_handle")))
+
+	path := validStickerPath("metric-ok.png")
+	beforeSuccess := promtestutil.ToFloat64(metricStickerRegisterTotal.WithLabelValues("success"))
+	ok := doRequest(t, route, "POST", "/v1/sticker/user", map[string]string{
+		"path": path, "format": "png", "handle": validStickerHandle(t, path),
+	})
+	require.Equal(t, http.StatusOK, ok.Code, "body: %s", ok.Body.String())
+	assert.Equal(t, beforeSuccess+1, promtestutil.ToFloat64(metricStickerRegisterTotal.WithLabelValues("success")))
 }
 
 func TestSticker_AddFormatRejected(t *testing.T) {
