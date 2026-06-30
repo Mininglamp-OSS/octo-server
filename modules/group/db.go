@@ -321,6 +321,19 @@ func (d *DB) UpdateInviteTx(groupNo string, invite int, version int64, tx *dbr.T
 	return err
 }
 
+// UpdateStatusTx 仅更新「群状态」与群版本（列级写，事务内）。
+// disband() 不能用 UpdateTx 整行回写：行 183 的 SELECT 无锁，FOR UPDATE 行 233 只读
+// status 不刷新其他列，若并发 groupUpdate（改名/公告/禁言等）在窗口内提交了新值，
+// UpdateTx 全列回写会用旧快照覆盖并发修改（lost-update）。列级写只动 status/version，
+// 与并发的群设置变更互不踩踏，对齐 UpdateInviteTx 的设计。
+func (d *DB) UpdateStatusTx(groupNo string, status int, version int64, tx *dbr.Tx) error {
+	_, err := tx.Update("group").SetMap(map[string]interface{}{
+		"status":  status,
+		"version": version,
+	}).Where("group_no=?", groupNo).Exec()
+	return err
+}
+
 // Update 更新群信息
 func (d *DB) Update(model *Model) error {
 	_, err := d.session.Update("group").SetMap(map[string]interface{}{

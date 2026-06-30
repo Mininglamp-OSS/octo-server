@@ -251,26 +251,19 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 	//     是解散守卫最薄弱的路径，不应 fail-open。
 	if m.ChannelType == common.ChannelTypeGroup.Uint8() ||
 		m.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
-		// 解析 disband 检查的目标 group_no：
-		//   - Group: 直接用 ChannelID
-		//   - CommunityTopic: 从 group_no____thread_id 中提取父群号；
-		//     不含分隔符的旧格式 / 非标准 topic channel_id 无法关联父群，
-		//     跳过 disband guard（不 fail-closed）。
-		disbandGroupNo := ""
-		if m.ChannelType == common.ChannelTypeGroup.Uint8() {
-			disbandGroupNo = m.ChannelID
-		} else if strings.Contains(m.ChannelID, threadChannelIDSeparator) {
+		disbandGroupNo := m.ChannelID
+		if m.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
 			parts := strings.SplitN(m.ChannelID, threadChannelIDSeparator, 2)
 			if len(parts) == 2 && parts[0] != "" {
 				disbandGroupNo = parts[0]
 			} else {
-				// fail-closed：确实含分隔符但解析出空父群号 → 畸形 ID，丢弃。
+				// fail-closed：畸形 thread channel_id 丢弃转发，
+				// 与 message/api.go 的 thread disband guard 保持一致。
 				ba.Error("OBO fan-out: 解析子区频道ID失败，丢弃转发",
 					zap.String("channel_id", m.ChannelID))
 				return 0
 			}
 		}
-		// disbandGroupNo 非空时执行群解散检查；为空时（非标准 topic ID）跳过。
 		if disbandGroupNo != "" {
 			if disbanded, err := ba.isGroupDisbanded(disbandGroupNo); err != nil {
 				// fail-closed：DB 查询失败时丢弃转发，与 bot_api/send.go 的

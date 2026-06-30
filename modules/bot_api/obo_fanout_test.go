@@ -987,7 +987,7 @@ func TestFanout_DispatchReq_NoConflict_ChannelOrSubscribers(t *testing.T) {
 			name: "community_topic",
 			ct:   common.ChannelTypeCommunityTopic.Uint8(),
 			setupScope: func() (string, *fakeOBOStore) {
-				ch := "topic_99"
+				ch := "group_42____topic_99"
 				return ch, seedGrantWithScope(t, ch, common.ChannelTypeCommunityTopic.Uint8())
 			},
 			setupMsg: func(scope string) *config.MessageResp {

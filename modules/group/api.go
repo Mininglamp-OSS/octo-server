@@ -249,8 +249,17 @@ func (g *Group) disband(c *wkhttp.Context) {
 		c.ResponseOK()
 		return
 	}
-	group.Status = GroupStatusDisband
-	err = g.db.UpdateTx(group, tx)
+	// 列级写：只更新 status + version，不用 UpdateTx 全行回写，
+	// 避免并发 groupUpdate（改名/公告/禁言等）在窗口内的修改被旧快照覆盖。
+	// 对齐 UpdateInviteTx / UpdateForbiddenTx 的设计模式。
+	newVersion, verr := g.ctx.GenSeq(common.GroupSeqKey)
+	if verr != nil {
+		tx.Rollback()
+		g.Error("生成群版本序列号失败", zap.Error(verr))
+		httperr.ResponseErrorL(c, errcode.ErrGroupStoreFailed, nil, nil)
+		return
+	}
+	err = g.db.UpdateStatusTx(groupNo, GroupStatusDisband, newVersion, tx)
 	if err != nil {
 		tx.Rollback()
 		g.Error("修改群状态错误", zap.Error(err))

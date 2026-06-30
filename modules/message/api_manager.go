@@ -18,6 +18,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
@@ -148,6 +149,37 @@ func (m *Manager) delete(c *wkhttp.Context) {
 	fakeChannelID := req.ChannelID
 	if req.ChannelType == common.ChannelTypePerson.Uint8() {
 		fakeChannelID = common.GetFakeChannelIDWith(req.ChannelID, req.FromUID)
+	}
+	// 解散守卫（企业微信式只读）：群解散后禁止删除消息，超管路径也不例外。
+	// 与用户路径 Message.delete（api.go:2179-2208）及 Manager.sendMsg（同文件 :810）对齐。
+	if req.ChannelType == common.ChannelTypeGroup.Uint8() {
+		groupInfo, err := m.groupService.GetGroupWithGroupNo(req.ChannelID)
+		if err != nil {
+			m.Error("查询群信息失败（delete）", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		if groupInfo != nil && groupInfo.Status == group.GroupStatusDisband {
+			httperr.ResponseErrorL(c, errcode.ErrMessageGroupDisbanded, nil, nil)
+			return
+		}
+	} else if req.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
+		parentGroupNo, _, perr := thread.ParseChannelID(req.ChannelID)
+		if perr != nil || parentGroupNo == "" {
+			m.Error("解析子区频道ID失败（delete）", zap.Error(perr), zap.String("channelID", req.ChannelID))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		groupInfo, err := m.groupService.GetGroupWithGroupNo(parentGroupNo)
+		if err != nil {
+			m.Error("查询父群信息失败（delete）", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		if groupInfo != nil && groupInfo.Status == group.GroupStatusDisband {
+			httperr.ResponseErrorL(c, errcode.ErrMessageGroupDisbanded, nil, nil)
+			return
+		}
 	}
 	tx, err := m.ctx.DB().Begin()
 	if err != nil {
