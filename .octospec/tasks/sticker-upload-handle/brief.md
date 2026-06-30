@@ -60,6 +60,15 @@ is independent of every other use of that master key.
   content while the already-minted handle (bound to the unchanged URL) still
   verifies — defeating the guard even in the keyed posture. Backend-agnostic; a
   no-op on backends that don't strip a prefix.
+- **Upload-side sticker uid binding** (touches: `auth`, `acl`) — `uploadFile`
+  requires a `type=sticker` upload's `path` to start with `/{loginUID}/`, so a
+  user can only write into their OWN `sticker/{uid}/…` keyspace. Closes the
+  cross-USER same-type overwrite (PR#509 review): registration
+  (`validateStickerPath`) already pinned `uid==loginUID`, but the upload endpoint
+  did not, so an authenticated peer who knows a victim's sticker object key could
+  overwrite its bytes (the minted handle binds the URL, not the content, so the
+  swap is invisible to the provenance check). Same bug class as the cross-type
+  reservation above, for the cross-user case.
 - **Sticker decode-dimension cap** (touches: `wire-contract`) — for
   `type=sticker`, after the magic-number check, `uploadFile` reads W×H via
   `image.DecodeConfig` (header-only, no full decode) and rejects either side >

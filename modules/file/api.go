@@ -175,6 +175,21 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 		return
 	}
 
+	// 自定义贴纸：path 首段必须等于认证上传者 uid。getFilePath 按 /{loginUID}/{uuid}.ext
+	// 生成贴纸路径、validateStickerPath 在注册时校验 uid==loginUID，但上传侧此前不校验，
+	// 故已认证用户可用 path=/{victimUID}/{uuid}.ext 上传自己的合法图覆盖他人贴纸对象
+	// （字节变、URL 与受害者 handle 不变 → 跨用户内容劫持；贴纸 URL 会发给会话对端，
+	// key 可知）。在上传边界绑定 uid，闭合同类型跨用户覆盖（与上面跨类型覆盖同一 bug 类）。
+	if Type(fileType) == TypeSticker {
+		loginUID := c.GetLoginUID()
+		if loginUID == "" || !strings.HasPrefix(uploadPath, "/"+loginUID+"/") {
+			f.Warn("贴纸上传路径 uid 段与登录用户不一致",
+				zap.String("path", uploadPath), zap.String("uid", loginUID))
+			c.ResponseError(errors.New("无效的文件路径"))
+			return
+		}
+	}
+
 	// 限制请求体大小，防止大文件 DoS
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, MaxFileSize+1024*1024)
 

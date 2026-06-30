@@ -1410,6 +1410,37 @@ func TestUploadFile_NonStickerRejectedFromStickerKeyspace(t *testing.T) {
 		"non-sticker upload into sticker/ keyspace must be rejected; body: %s", rec.Body.String())
 }
 
+// TestUploadFile_StickerRejectsForeignUIDPath pins the cross-user overwrite
+// guard (PR#509 review): an authenticated user may only upload a sticker into
+// their OWN uid segment. Targeting another user's sticker object key
+// (path=/{victim}/...) is refused before any content is read, so a peer who
+// knows a victim's sticker URL cannot overwrite its bytes (the minted handle
+// binds the URL string, not the content, so the swap would otherwise be
+// invisible). A valid PNG body proves the rejection is the uid guard.
+func TestUploadFile_StickerRejectsForeignUIDPath(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	mockSvc := &mockService{downloadURL: "https://cdn.example.com/dm/sticker/20000/x.png"}
+	f := &File{Log: log.NewTLog("FileTest"), service: mockSvc}
+
+	body, contentType := newMultipartFile(t, "x.png", pngOfSize(t, 64, 64))
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	// Authenticated as 10000, but the path targets victim 20000's keyspace.
+	c.Request, _ = http.NewRequest(http.MethodPost, "/v1/file/upload?type=sticker&path=/20000/x.png", body)
+	c.Request.Header.Set("Content-Type", contentType)
+	c.Set("uid", "10000")
+
+	f.uploadFile(&wkhttp.Context{Context: c})
+
+	require.Equal(t, http.StatusBadRequest, rec.Code,
+		"sticker upload into another user's uid segment must be rejected; body: %s", rec.Body.String())
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	_, has := resp["sticker_handle"]
+	require.False(t, has, "rejected upload must not mint a handle")
+}
+
 // TestUploadFile_StickerRejectsOversizeDimensions is the decompression-bomb
 // guard: a type=sticker upload whose decoded dimensions exceed
 // StickerMaxDimension (512) on either side is refused, even though the file is
