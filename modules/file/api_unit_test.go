@@ -1414,6 +1414,40 @@ func TestUploadFile_StickerRejectsOversizeDimensions(t *testing.T) {
 	}
 }
 
+// TestUploadFile_StickerRejectsPathExtMismatch is the format-integrity guard: a
+// type=sticker upload whose storage path extension differs from the
+// content-validated file extension is refused. Magic-number validation binds the
+// multipart filename ext (here .png, matching PNG content), but the storage path
+// is a separate ?path= query (here .gif). Letting them diverge would let
+// sticker.add register format=gif against png bytes (validateStickerPath derives
+// format from the path ext) — a metadata/content mismatch. The upload point is
+// the only place that holds both, so it closes the loop here.
+func TestUploadFile_StickerRejectsPathExtMismatch(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
+
+	mockSvc := &mockService{downloadURL: "https://cdn.example.com/dm/sticker/10000/x.gif"}
+	f := &File{Log: log.NewTLog("FileTest"), service: mockSvc}
+
+	// PNG content + .png filename passes the magic-number check, but the storage
+	// path declares .gif — the mismatch must be rejected.
+	body, contentType := newMultipartFile(t, "x.png", pngOfSize(t, 64, 64))
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request, _ = http.NewRequest(http.MethodPost, "/v1/file/upload?type=sticker&path=/10000/x.gif", body)
+	c.Request.Header.Set("Content-Type", contentType)
+	c.Set("uid", "10000")
+
+	f.uploadFile(&wkhttp.Context{Context: c})
+
+	require.Equal(t, http.StatusBadRequest, rec.Code,
+		"sticker with path ext != content ext must be rejected; body: %s", rec.Body.String())
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	_, has := resp["sticker_handle"]
+	require.False(t, has, "rejected upload must not mint a handle")
+}
+
 // TestUploadFile_StickerAcceptsMaxDimensions: exactly 512×512 is the boundary and
 // must be accepted (and still mint a handle).
 func TestUploadFile_StickerAcceptsMaxDimensions(t *testing.T) {

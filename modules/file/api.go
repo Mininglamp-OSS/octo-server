@@ -244,6 +244,23 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 		return
 	}
 
+	// 自定义贴纸：存储 path 的扩展名必须等于「内容已过魔数校验」的扩展名。魔数
+	// 校验绑定的是文件名 ext（fileName），而存储 path 来自独立的 ?path= query，二者
+	// 可被构造成不一致（如 path=/uid/x.png 配 gif 内容 + gif 文件名）。若放行，注册侧
+	// sticker.add 以 path 的 ext 当作 format（validateStickerPath 要求 ext==format），
+	// 会登记出「format=png / 实际是 gif」的错配元数据。此处是唯一同时掌握 path 与
+	// 已校验 ext 的点，收口使 format==pathExt==内容 ext 三者一致。错误用
+	// c.ResponseError 与本（未迁移 i18n 的）file 模块其余响应保持一致。
+	if Type(fileType) == TypeSticker {
+		pathExt := strings.ToLower(filepath.Ext(uploadPath))
+		if pathExt != ext {
+			f.Warn("贴纸存储路径扩展名与文件内容不一致",
+				zap.String("path_ext", pathExt), zap.String("content_ext", ext))
+			c.ResponseError(errors.New("贴纸路径扩展名与文件内容不一致"))
+			return
+		}
+	}
+
 	// 重置文件指针到开头
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		f.Error("重置文件指针失败", zap.Error(err))
