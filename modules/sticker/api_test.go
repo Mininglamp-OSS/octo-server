@@ -73,6 +73,23 @@ func setStickerQuota(t *testing.T, ctx *config.Context, n int) {
 	require.NoError(t, commonmod.EnsureSystemSettings(ctx).Reload())
 }
 
+// setStickerHandleRequired upserts the admin-tunable enforcement policy
+// (system_setting sticker.handle_required) and reloads the shared snapshot so the
+// handler sees it immediately. Enforcement now lives in system_setting (DB), not
+// an env var, so tests write the row rather than t.Setenv.
+func setStickerHandleRequired(t *testing.T, ctx *config.Context, required bool) {
+	t.Helper()
+	v := "0"
+	if required {
+		v = "1"
+	}
+	_, err := ctx.DB().InsertInto("system_setting").
+		Columns("category", "key_name", "value", "value_type").
+		Values("sticker", "handle_required", v, "bool").Exec()
+	require.NoError(t, err)
+	require.NoError(t, commonmod.EnsureSystemSettings(ctx).Reload())
+}
+
 // validStickerPath builds an object key shaped like the multipart uploader's
 // output for the test login user (sticker/{uid}/<name>), so add() accepts it.
 // add() validates that req.Path names THIS user's sticker upload, so test
@@ -365,8 +382,8 @@ func TestSticker_AddConcurrentQuota(t *testing.T) {
 // TestSticker_CompatModeAllowsMissingHandle), so the cross-type bypass defense
 // degrades during the rollout window — that is the intended, reversible trade-off.
 func TestSticker_AddRejectsForgedTailMatchPath(t *testing.T) {
-	t.Setenv("OCTO_STICKER_HANDLE_REQUIRED", "true")
-	route, _, _ := setupSticker(t)
+	route, ctx, _ := setupSticker(t)
+	setStickerHandleRequired(t, ctx, true)
 
 	forged := "file/preview/chat/sticker/" + testutil.UID + "/x.gif"
 	// Sanity: the forged path DOES pass the shape check (the residual)...
@@ -384,8 +401,8 @@ func TestSticker_AddRejectsForgedTailMatchPath(t *testing.T) {
 // perfectly shaped sticker path is still refused when no handle accompanies it
 // (handle signing is active in tests).
 func TestSticker_AddRejectsMissingHandle(t *testing.T) {
-	t.Setenv("OCTO_STICKER_HANDLE_REQUIRED", "true")
-	route, _, _ := setupSticker(t)
+	route, ctx, _ := setupSticker(t)
+	setStickerHandleRequired(t, ctx, true)
 
 	w := doRequest(t, route, "POST", "/v1/sticker/user", map[string]string{
 		"path": validStickerPath("nohandle.png"), "format": "png",
@@ -398,9 +415,8 @@ func TestSticker_AddRejectsMissingHandle(t *testing.T) {
 // clients keep working during the rollout. The missing handle is recorded
 // (compat_missing metric); behavior here is the allow + persisted-sticker outcome.
 func TestSticker_CompatModeAllowsMissingHandle(t *testing.T) {
-	// OCTO_STICKER_HANDLE_REQUIRED unset → Required() is false. Pin empty to be
-	// robust against an externally-provided value leaking in from the shell/CI.
-	t.Setenv("OCTO_STICKER_HANDLE_REQUIRED", "")
+	// Default posture: setupSticker cleans system_setting, so
+	// sticker.handle_required is absent → StickerHandleRequired() is false.
 	route, _, _ := setupSticker(t)
 
 	w := doRequest(t, route, "POST", "/v1/sticker/user", map[string]string{
@@ -416,10 +432,10 @@ func TestSticker_CompatModeAllowsMissingHandle(t *testing.T) {
 // regardless of the required policy — invalid handles are never compat-allowed.
 // Asserted under BOTH modes.
 func TestSticker_AddRejectsTamperedHandle(t *testing.T) {
-	for _, required := range []string{"", "true"} {
-		t.Run("required="+required, func(t *testing.T) {
-			t.Setenv("OCTO_STICKER_HANDLE_REQUIRED", required)
-			route, _, _ := setupSticker(t)
+	for _, required := range []bool{false, true} {
+		t.Run(fmt.Sprintf("required=%v", required), func(t *testing.T) {
+			route, ctx, _ := setupSticker(t)
+			setStickerHandleRequired(t, ctx, required)
 
 			w := doRequest(t, route, "POST", "/v1/sticker/user", map[string]string{
 				"path":   validStickerPath("real.png"),

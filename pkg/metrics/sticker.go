@@ -8,8 +8,8 @@ import (
 
 // 自定义贴纸 handle 上线观测指标（P0: Sticker Handle Enforcement Rollout）。
 // #509 给贴纸上传加了签名句柄；本组指标支撑把「强制 handle」从隐式开关变成
-// 可灰度、可回滚、可观测的上线：在切到强制（OCTO_STICKER_HANDLE_REQUIRED=true）
-// 之前，先观察老客户端「缺 handle」的注册占比是否归零。
+// 可灰度、可回滚、可观测的上线：在切到强制（system_setting sticker.handle_required
+// = true）之前，先观察老客户端「缺 handle」的注册占比是否归零。
 //
 // 跨模块共享：签发发生在 modules/file（上传成功后下发 sticker_handle），注册
 // 校验发生在 modules/sticker。两者都依赖 leaf 包 pkg/metrics，故指标定义在此，

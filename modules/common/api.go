@@ -24,7 +24,6 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/searchbackend"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
-	"github.com/Mininglamp-OSS/octo-server/pkg/stickersig"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 )
@@ -388,7 +387,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 			DisableUserCreateSpace: boolToFlag(cn.systemSettings.SpaceDisableUserCreate()),
 			SearchEnabled:          searchEnabled,
 			MessagesSearchOn:       searchEnabled,
-			StickerHandleRequired:  stickersig.Required(),
+			StickerHandleRequired:  cn.systemSettings.StickerHandleRequired(),
 		})
 		return
 	}
@@ -429,7 +428,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 		DisableUserCreateSpace: boolToFlag(cn.systemSettings.SpaceDisableUserCreate()),
 		SearchEnabled:          searchEnabled,
 		MessagesSearchOn:       searchEnabled,
-		StickerHandleRequired:  stickersig.Required(),
+		StickerHandleRequired:  cn.systemSettings.StickerHandleRequired(),
 	})
 }
 
@@ -762,10 +761,11 @@ type appConfigResp struct {
 
 	// StickerHandleRequired 告知客户端：新增自定义贴纸（POST /v1/sticker/user）时是否
 	// 必须携带上传句柄 handle（即 /v1/file/upload?type=sticker 返回的 sticker_handle）。
-	// 值来源于部署策略开关 OCTO_STICKER_HANDLE_REQUIRED（stickersig.Required），与签名
-	// 「能力」OCTO_MASTER_KEY 解耦——master key 在场不代表强制带 handle，避免老客户端被
+	// 值来源于 system_setting sticker.handle_required（SystemSettings.StickerHandleRequired），
+	// 与签名「能力」OCTO_MASTER_KEY 解耦——master key 在场不代表强制带 handle，避免老客户端被
 	// 隐式打挂（P0: Sticker Handle Enforcement Rollout）。为 true 时客户端必须先上传拿
 	// sticker_handle 再注册；为 false（兼容期/默认）客户端可不带，服务端暂放行并观测。
+	// 放 system_setting 而非 env 的原因：策略可在管理台热切、60s 多实例收敛、免重启回滚。
 	//
 	// 与 app_config.version 解耦的原因同 LocalLoginOff / SearchEnabled：运维切策略后老
 	// 客户端命中 version 短路分支也必须拿到最新值，否则被本地缓存住失去实时性，故两个

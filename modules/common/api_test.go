@@ -64,6 +64,23 @@ func cleanAllTablesAndReloadSettings(t *testing.T, ctx *config.Context) {
 	require.NoError(t, EnsureSystemSettings(ctx).Reload())
 }
 
+// setStickerHandleRequiredSetting upserts system_setting sticker.handle_required
+// and reloads the shared snapshot. Enforcement policy lives in the DB (not env),
+// so tests write the row. Call AFTER cleanAllTablesAndReloadSettings (which wipes
+// system_setting).
+func setStickerHandleRequiredSetting(t *testing.T, ctx *config.Context, required bool) {
+	t.Helper()
+	v := "0"
+	if required {
+		v = "1"
+	}
+	_, err := ctx.DB().InsertInto("system_setting").
+		Columns("category", "key_name", "value", "value_type").
+		Values("sticker", "handle_required", v, "bool").Exec()
+	require.NoError(t, err)
+	require.NoError(t, EnsureSystemSettings(ctx).Reload())
+}
+
 func TestAddVersion(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
@@ -610,14 +627,13 @@ func TestGetAppConfig_SystemBotUIDsDownstreamed(t *testing.T) {
 	assert.Contains(t, body, `"u_10000"`)
 }
 
-// appconfig 必须下发 sticker_handle_required：值来源于部署策略开关
-// OCTO_STICKER_HANDLE_REQUIRED（stickersig.Required），与 OCTO_MASTER_KEY 能力解耦。
-// 默认（未设置）为 false，老客户端据此知道无需携带 handle。
+// appconfig 必须下发 sticker_handle_required：值来源于 system_setting
+// sticker.handle_required（SystemSettings.StickerHandleRequired），与 OCTO_MASTER_KEY
+// 能力解耦。默认（无该行）为 false，老客户端据此知道无需携带 handle。
 func TestGetAppConfig_StickerHandleRequired_DefaultFalse(t *testing.T) {
-	t.Setenv("OCTO_STICKER_HANDLE_REQUIRED", "")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
-	cleanAllTablesAndReloadSettings(t, ctx)
+	cleanAllTablesAndReloadSettings(t, ctx) // wipes system_setting → handle_required absent → false
 	err := f.appConfigDB.insert(&appConfigModel{})
 	assert.NoError(t, err)
 	w := httptest.NewRecorder()
@@ -628,12 +644,12 @@ func TestGetAppConfig_StickerHandleRequired_DefaultFalse(t *testing.T) {
 	assert.Contains(t, w.Body.String(), `"sticker_handle_required":false`)
 }
 
-// OCTO_STICKER_HANDLE_REQUIRED=true → appconfig 下发 true，客户端据此强制带 handle。
+// system_setting sticker.handle_required=true → appconfig 下发 true，客户端据此强制带 handle。
 func TestGetAppConfig_StickerHandleRequired_True(t *testing.T) {
-	t.Setenv("OCTO_STICKER_HANDLE_REQUIRED", "true")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
 	cleanAllTablesAndReloadSettings(t, ctx)
+	setStickerHandleRequiredSetting(t, ctx, true)
 	err := f.appConfigDB.insert(&appConfigModel{})
 	assert.NoError(t, err)
 	w := httptest.NewRecorder()
@@ -647,10 +663,10 @@ func TestGetAppConfig_StickerHandleRequired_True(t *testing.T) {
 // version 短路分支同样要下发 sticker_handle_required：老客户端命中版本短路也必须
 // 拿到当前策略，否则被本地缓存住失去实时性（与 messages_search_on 同样的解耦约束）。
 func TestGetAppConfig_StickerHandleRequired_OnVersionShortCircuit(t *testing.T) {
-	t.Setenv("OCTO_STICKER_HANDLE_REQUIRED", "true")
 	s, ctx := testutil.NewTestServer()
 	f := New(ctx)
 	cleanAllTablesAndReloadSettings(t, ctx)
+	setStickerHandleRequiredSetting(t, ctx, true)
 	err := f.appConfigDB.insert(&appConfigModel{})
 	assert.NoError(t, err)
 	w := httptest.NewRecorder()

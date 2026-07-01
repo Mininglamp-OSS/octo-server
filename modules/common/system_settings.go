@@ -755,3 +755,16 @@ func (s *SystemSettings) StickerUserMaxCount() int {
 	}
 	return v
 }
+
+// StickerHandleRequired reports whether custom-sticker registration must reject a
+// missing upload handle (POST /v1/sticker/user). This is the enforcement POLICY,
+// deliberately independent of the signing CAPABILITY (OCTO_MASTER_KEY): it lives
+// in system_setting (DB, hot-reloaded) so it can be toggled from the admin
+// console and converge across replicas within the snapshot TTL — a gradual,
+// reversible rollout without a redeploy/restart. Default false (backward
+// compatible: missing handles are allowed through during the compat window and
+// only recorded). See modules/sticker classifyStickerPath and the appconfig
+// sticker_handle_required bit.
+func (s *SystemSettings) StickerHandleRequired() bool {
+	return s.getBool("sticker", "handle_required", false)
+}

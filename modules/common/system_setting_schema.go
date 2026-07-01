@@ -133,6 +133,15 @@ var systemSettingSchema = []settingDef{
 	{Category: "sticker", Key: "user_max_count", Type: settingTypeInt, Description: "每个用户可创建的自定义贴纸数量上限", Positive: true,
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.StickerUserMaxCount()) }},
 
+	// 自定义贴纸上传句柄强制开关（P0: Sticker Handle Enforcement Rollout）。这是「强制
+	// 策略」，与「签名能力」OCTO_MASTER_KEY 彻底解耦——能力是部署级 env，策略是运营可
+	// 在管理台热切的 DB 真源，互不派生。关闭（默认）= 兼容期：缺 handle 暂放行并记
+	// compat_missing 指标；开启 = 强制：缺/伪造 handle 一律拒。放 DB 而非 env 才能灰度
+	// toggle + 60s 多实例收敛 + 免重启回滚。客户端经 GET /v1/common/appconfig 的
+	// sticker_handle_required 读取实时策略。
+	{Category: "sticker", Key: "handle_required", Type: settingTypeBool, Description: "新增自定义贴纸是否强制校验上传句柄 handle（关闭=兼容期放行缺失句柄并观测，开启=缺/伪造一律拒；需服务端配有效 OCTO_MASTER_KEY 才有校验能力）",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.StickerHandleRequired()) }},
+
 	// Email server config — formerly yaml-only (Support.* in config.go).
 	{Category: "support", Key: "email", Type: settingTypeString, Description: "技术支持邮箱（发件人）",
 		Effective: func(s *SystemSettings) string { return s.SupportEmail() }},

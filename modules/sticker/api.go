@@ -14,11 +14,14 @@
 //
 // # Handle enforcement (capability vs policy)
 //
-// Whether `handle` is REQUIRED is governed by the OCTO_STICKER_HANDLE_REQUIRED
-// policy switch (stickersig.Required), independent of the signing capability
-// (OCTO_MASTER_KEY / stickersig.Enabled). Clients read the effective policy from
-// GET /v1/common/appconfig → `sticker_handle_required`. See the stickersig
-// package doc for the rollout rationale and the per-outcome behavior matrix.
+// Whether `handle` is REQUIRED is governed by the system_setting
+// `sticker.handle_required` (SystemSettings.StickerHandleRequired) — a DB-backed,
+// admin-toggleable policy independent of the signing capability (OCTO_MASTER_KEY
+// / stickersig.Enabled). It lives in system_setting rather than an env var so the
+// rollout can be toggled and rolled back from the admin console without a
+// restart (converging across replicas within the snapshot TTL). Clients read the
+// effective policy from GET /v1/common/appconfig → `sticker_handle_required`. See
+// the stickersig package doc for the rollout rationale and behavior matrix.
 package sticker
 
 import (
@@ -63,19 +66,23 @@ func New(ctx *config.Context) *Sticker {
 		db:       newStickerDB(ctx),
 		settings: commonmod.EnsureSystemSettings(ctx),
 	}
-	// 运营可见性：签发/校验 handle 的「能力」由 OCTO_MASTER_KEY 决定（stickersig.Enabled），
-	// 「是否强制客户端必须带 handle」的「策略」由 OCTO_STICKER_HANDLE_REQUIRED 决定
-	// （stickersig.Required），两者正交、互不派生（详见 stickersig 包 doc）。把两类降级/
-	// 冲突姿态在启动时打日志，使运营对部署可见，而不是埋在 leaf 包注释里。一次性、进程级。
+	// 运营可见性：签发/校验 handle 的「能力」由 OCTO_MASTER_KEY 决定（stickersig.Enabled，
+	// 部署级 env），「是否强制客户端必须带 handle」的「策略」由 system_setting
+	// sticker.handle_required 决定（s.settings.StickerHandleRequired，运营可热切的 DB 真源），
+	// 两者正交、互不派生、连配置载体都不同（详见 stickersig 包 doc）。把两类降级/冲突姿态
+	// 在启动时打日志并落到 handle_policy gauge，使运营对部署可见。一次性、进程级；策略为
+	// DB 运行时可变，故 gauge 的 required 维度是「启动快照」，实时值以 appconfig 为准。
+	required := s.settings.StickerHandleRequired()
+	metrics.SetStickerHandlePolicy(stickersig.Enabled(), required)
 	switch {
-	case stickersig.Required() && !stickersig.Enabled():
-		// 配置冲突：声明要求 handle，却没有有效 OCTO_MASTER_KEY 提供签名/校验能力。
+	case required && !stickersig.Enabled():
+		// 配置冲突：策略声明要求 handle，却没有有效 OCTO_MASTER_KEY 提供签名/校验能力。
 		// 不 panic（不让贴纸策略误配拖垮整个服务启动、也不与 master key 生命周期强行
 		// 关联）；改打 ERROR 强告警 + handle_policy gauge 暴露之。此时 add() 因无能力无法
 		// 校验 handle，运行时退化为仅路径形状校验放行（见 classifyStickerPath），即强制
 		// 策略实际无法生效——靠本告警 + 指标驱动运营尽快修复（补 32 字节 OCTO_MASTER_KEY）。
-		s.Error("配置冲突：OCTO_STICKER_HANDLE_REQUIRED=true 但 OCTO_MASTER_KEY 未配置或非恰好 32 字节，" +
-			"无有效签名能力，贴纸 handle 强制策略将无法生效；请配置 32 字节 OCTO_MASTER_KEY 或关闭 REQUIRED")
+		s.Error("配置冲突：system_setting sticker.handle_required=true 但 OCTO_MASTER_KEY 未配置或非恰好 32 字节，" +
+			"无有效签名能力，贴纸 handle 强制策略将无法生效；请配置 32 字节 OCTO_MASTER_KEY 或关闭 handle_required")
 	case !stickersig.Enabled():
 		s.Warn("OCTO_MASTER_KEY 未配置或非恰好 32 字节：自定义贴纸上传句柄校验已禁用，" +
 			"注册退化为仅路径形状校验（配置 32 字节 OCTO_MASTER_KEY 可启用密码学来源绑定）")
@@ -146,8 +153,8 @@ func (s *Sticker) add(ctx *wkhttp.Context) {
 	//      无法为未经贴纸上传的对象伪造句柄，故被拒——堵住「以 type=chat(100MB/宽松
 	//      白名单)上传再注册成贴纸」的旁路。
 	//
-	// 是否「强制」带 handle 由 OCTO_STICKER_HANDLE_REQUIRED 策略决定（与 master key
-	// 能力解耦）：required=false 兼容期内缺 handle 暂放行（记 compat_missing 指标 + INFO
+	// 是否「强制」带 handle 由 system_setting sticker.handle_required 策略决定（与 master
+	// key 能力解耦）：required=false 兼容期内缺 handle 暂放行（记 compat_missing 指标 + INFO
 	// 日志，供灰度观察老客户端缺失率），此时 (2) 的强防护降级为仅 (1)；required=true 时
 	// 缺/非法 handle 一律拒。非法 handle 无论策略恒拒。各拒因都收敛到同一 request_invalid，
 	// 不暴露具体原因（anti-enumeration），原因只进指标/日志。
@@ -162,15 +169,15 @@ func (s *Sticker) add(ctx *wkhttp.Context) {
 		respondStickerRequestInvalid(ctx, "path")
 		return
 	case stickerHandleMissing:
-		if stickersig.Required() {
+		if s.settings.StickerHandleRequired() {
 			metrics.ObserveStickerRegister(metrics.StickerRegisterRejectedMissing)
 			s.Warn("拒绝注册：强制模式下缺少贴纸 handle", zap.String("uid", loginUID))
 			respondStickerRequestInvalid(ctx, "path")
 			return
 		}
-		// 兼容模式（required=false）：放行但记录，供切强制前观察老客户端缺失率归零。
+		// 兼容模式（sticker.handle_required=false）：放行但记录，供切强制前观察老客户端缺失率归零。
 		metrics.ObserveStickerRegister(metrics.StickerRegisterCompatMissing)
-		s.Info("兼容模式放行：注册缺少贴纸 handle（待 OCTO_STICKER_HANDLE_REQUIRED 切 true 后将被拒）",
+		s.Info("兼容模式放行：注册缺少贴纸 handle（待 system_setting sticker.handle_required 切 true 后将被拒）",
 			zap.String("uid", loginUID))
 	case stickerOK:
 		metrics.ObserveStickerRegister(metrics.StickerRegisterOK)
@@ -276,7 +283,8 @@ const (
 // (matching the pre-handle posture; the required-but-no-capability conflict is
 // surfaced as a startup ERROR in New, not enforced here, so a misconfiguration
 // never wedges registration). The enforcement decision (reject vs compat-allow
-// on a missing handle) is made by the caller from stickersig.Required().
+// on a missing handle) is made by the caller from
+// SystemSettings.StickerHandleRequired().
 func classifyStickerPath(path, loginUID, format, handle string) stickerPathClass {
 	if !validateStickerPath(path, loginUID, format) {
 		return stickerPathInvalid
