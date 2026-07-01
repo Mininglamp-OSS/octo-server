@@ -78,11 +78,11 @@ func New(ctx *config.Context) *Sticker {
 	case required && !stickersig.Enabled():
 		// 配置冲突：策略声明要求 handle，却没有有效 OCTO_MASTER_KEY 提供签名/校验能力。
 		// 不 panic（不让贴纸策略误配拖垮整个服务启动、也不与 master key 生命周期强行
-		// 关联）；改打 ERROR 强告警 + handle_policy gauge 暴露之。此时 add() 因无能力无法
-		// 校验 handle，运行时退化为仅路径形状校验放行（见 classifyStickerPath），即强制
-		// 策略实际无法生效——靠本告警 + 指标驱动运营尽快修复（补 32 字节 OCTO_MASTER_KEY）。
+		// 关联）；改打 ERROR 强告警 + handle_policy gauge 暴露之。运行时 add() 对该冲突
+		// fail-closed：拒绝新增贴纸并记 rejected_no_capability（见 add()），既不静默放行也
+		// 不拖垮服务——靠本告警 + 指标驱动运营尽快修复（补 32 字节 OCTO_MASTER_KEY）。
 		s.Error("配置冲突：system_setting sticker.handle_required=true 但 OCTO_MASTER_KEY 未配置或非恰好 32 字节，" +
-			"无有效签名能力，贴纸 handle 强制策略将无法生效；请配置 32 字节 OCTO_MASTER_KEY 或关闭 handle_required")
+			"无有效签名能力，贴纸新增将 fail-closed 拒绝；请配置 32 字节 OCTO_MASTER_KEY 或关闭 handle_required")
 	case !stickersig.Enabled():
 		s.Warn("OCTO_MASTER_KEY 未配置或非恰好 32 字节：自定义贴纸上传句柄校验已禁用，" +
 			"注册退化为仅路径形状校验（配置 32 字节 OCTO_MASTER_KEY 可启用密码学来源绑定）")
@@ -158,7 +158,30 @@ func (s *Sticker) add(ctx *wkhttp.Context) {
 	// 日志，供灰度观察老客户端缺失率），此时 (2) 的强防护降级为仅 (1)；required=true 时
 	// 缺/非法 handle 一律拒。非法 handle 无论策略恒拒。各拒因都收敛到同一 request_invalid，
 	// 不暴露具体原因（anti-enumeration），原因只进指标/日志。
-	switch classifyStickerPath(req.Path, loginUID, format, req.Handle) {
+	//
+	// 配置冲突 fail-closed：策略要求 handle（required=true）但服务端无有效 OCTO_MASTER_KEY
+	// 提供校验能力（!Enabled）——此时既无法验签，策略又要求必须验，唯一正确姿态是拒绝
+	// 而非静默放行（放行会让 appconfig/dashboard 声称已强制、实则每个缺/伪造 handle 都放过，
+	// 是最坏的静默安全洞）。故在分类前显式拦截：拒绝该次注册并记 rejected_no_capability。
+	// 这只拒「新增贴纸」这一个操作，不 panic、不拖垮服务启动（启动另有 ERROR 强告警），
+	// 是安全控制误配应有的响亮失败——运营补上 32 字节 OCTO_MASTER_KEY 即恢复。
+	// 注意 required=false（兼容/裸跑）时 !Enabled 仍走下方 classify 的路径形状放行（不回归）。
+	//
+	// 请求内一致性：required（策略，system_setting 60s 热重载）与 enabled（能力，env）各在
+	// 本请求内快照一次并贯穿始终，避免 add() 与 classifyStickerPath 多点各读一次、被中途快照
+	// 刷新割裂（TOCTOU）。两向都安全（fail-closed↔compat-allow，绝不 fail-open），此处显式化
+	// 以免疫将来可能引入的运行时 env-reload。
+	required := s.settings.StickerHandleRequired()
+	enabled := stickersig.Enabled()
+	if required && !enabled {
+		metrics.ObserveStickerRegister(metrics.StickerRegisterRejectedNoCapability)
+		s.Error("拒绝注册：sticker.handle_required=true 但 OCTO_MASTER_KEY 未配置或非恰好 32 字节，"+
+			"无签名能力无法校验 handle，fail-closed 拒绝；请配置 32 字节 OCTO_MASTER_KEY 或关闭 handle_required",
+			zap.String("uid", loginUID))
+		respondStickerRequestInvalid(ctx, "path")
+		return
+	}
+	switch classifyStickerPath(req.Path, loginUID, format, req.Handle, enabled) {
 	case stickerPathInvalid:
 		metrics.ObserveStickerRegister(metrics.StickerRegisterRejectedPath)
 		respondStickerRequestInvalid(ctx, "path")
@@ -169,7 +192,7 @@ func (s *Sticker) add(ctx *wkhttp.Context) {
 		respondStickerRequestInvalid(ctx, "path")
 		return
 	case stickerHandleMissing:
-		if s.settings.StickerHandleRequired() {
+		if required {
 			metrics.ObserveStickerRegister(metrics.StickerRegisterRejectedMissing)
 			s.Warn("拒绝注册：强制模式下缺少贴纸 handle", zap.String("uid", loginUID))
 			respondStickerRequestInvalid(ctx, "path")
@@ -279,17 +302,21 @@ const (
 // registration. It always applies the path-shape check (validateStickerPath);
 // when upload-handle signing is active (OCTO_MASTER_KEY configured) it
 // classifies the handle as OK / missing / invalid. When no master key is
-// configured it cannot verify a handle and degrades to the shape check alone
-// (matching the pre-handle posture; the required-but-no-capability conflict is
-// surfaced as a startup ERROR in New, not enforced here, so a misconfiguration
-// never wedges registration). The enforcement decision (reject vs compat-allow
-// on a missing handle) is made by the caller from
-// SystemSettings.StickerHandleRequired().
-func classifyStickerPath(path, loginUID, format, handle string) stickerPathClass {
+// configured it cannot verify a handle and returns stickerOK on the shape check
+// alone (matching the pre-handle posture) — this branch is reached ONLY in the
+// compat case (handle_required=false); the caller (add) intercepts the
+// required-but-no-capability conflict BEFORE calling this and fails closed, so a
+// missing capability never silently allows an enforced registration. The
+// enforcement decision (reject vs compat-allow on a missing handle) is made by
+// the caller from SystemSettings.StickerHandleRequired(). `enabled` is the
+// caller's per-request snapshot of stickersig.Enabled() (threaded in for
+// request-scoped consistency); Verify still reads the master key internally, but
+// it is only reached when enabled is true, so the key is present.
+func classifyStickerPath(path, loginUID, format, handle string, enabled bool) stickerPathClass {
 	if !validateStickerPath(path, loginUID, format) {
 		return stickerPathInvalid
 	}
-	if !stickersig.Enabled() {
+	if !enabled {
 		return stickerOK
 	}
 	if handle == "" {

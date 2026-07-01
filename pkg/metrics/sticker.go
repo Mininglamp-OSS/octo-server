@@ -33,6 +33,11 @@ const (
 	StickerRegisterRejectedInvalid = "rejected_invalid"
 	// StickerRegisterRejectedPath 路径形状校验失败被拒（先于 handle 判定）。
 	StickerRegisterRejectedPath = "rejected_path"
+	// StickerRegisterRejectedNoCapability 配置冲突被拒（fail-closed）：策略要求 handle
+	// （sticker.handle_required=true）但服务端无有效 OCTO_MASTER_KEY 提供校验能力，无法
+	// 兑现强制，故拒绝而非静默放行。这条与 ok 区分开，dashboard 才能看出「声称强制却
+	// 因缺能力在异常拒绝」的 misconfig，而不是被计成正常成功掩盖。
+	StickerRegisterRejectedNoCapability = "rejected_no_capability"
 )
 
 // stickerRegisterResults 是 Register 的全部 result 取值，用于启动预热成 0 值序列。
@@ -43,6 +48,7 @@ func stickerRegisterResults() []string {
 		StickerRegisterRejectedMissing,
 		StickerRegisterRejectedInvalid,
 		StickerRegisterRejectedPath,
+		StickerRegisterRejectedNoCapability,
 	}
 }
 
@@ -78,7 +84,7 @@ func NewStickerMetrics(reg prometheus.Registerer) *StickerMetrics {
 			Namespace: metricNamespace,
 			Subsystem: "sticker",
 			Name:      "register_total",
-			Help:      "Custom-sticker registration outcomes (ok|compat_missing|rejected_missing|rejected_invalid|rejected_path).",
+			Help:      "Custom-sticker registration outcomes (ok|compat_missing|rejected_missing|rejected_invalid|rejected_path|rejected_no_capability).",
 		}, []string{"result"}),
 		HandlePolicy: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: metricNamespace,
@@ -92,6 +98,11 @@ func NewStickerMetrics(reg prometheus.Registerer) *StickerMetrics {
 	for _, r := range stickerRegisterResults() {
 		m.Register.WithLabelValues(r).Add(0)
 	}
+	// 同理预热 handle_policy 两个维度（enabled/required）为 0；虽然启动即被
+	// SetStickerHandlePolicy 覆盖，但与上面 result 序列「零 vs 缺失」的一致性对齐，
+	// 且避免 SetStickerHandlePolicy 因故未调用时该 gauge 完全缺席。
+	m.HandlePolicy.WithLabelValues("enabled").Set(0)
+	m.HandlePolicy.WithLabelValues("required").Set(0)
 	defaultStickerMetrics.Store(m)
 	return m
 }

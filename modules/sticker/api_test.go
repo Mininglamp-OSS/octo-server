@@ -446,3 +446,25 @@ func TestSticker_AddRejectsTamperedHandle(t *testing.T) {
 		})
 	}
 }
+
+// TestSticker_RequiredWithoutCapability_FailsClosed pins the config-conflict
+// contract (brief acceptance): when the policy demands a handle
+// (sticker.handle_required=true) but the server has NO signing capability
+// (OCTO_MASTER_KEY absent), registration must be REJECTED (fail-closed), not
+// silently allowed on the path-shape check. The server boots with a key (common
+// setup needs it to encrypt the IM private key); stickersig reads the env live,
+// so unsetting it here makes Enabled() false at request time — exactly the
+// misconfig: enforcement on, capability gone.
+func TestSticker_RequiredWithoutCapability_FailsClosed(t *testing.T) {
+	route, ctx, _ := setupSticker(t)
+	setStickerHandleRequired(t, ctx, true)
+	t.Setenv("OCTO_MASTER_KEY", "") // drop the signing capability at request time
+	require.False(t, stickersig.Enabled(), "precondition: no signing capability")
+
+	// A shape-valid path (here without a handle; a handle would be equally
+	// unverifiable) must be refused rather than allowed through.
+	w := doRequest(t, route, "POST", "/v1/sticker/user", map[string]string{
+		"path": validStickerPath("nokey.png"), "format": "png",
+	})
+	assertStickerErrorCode(t, w, "err.server.sticker.request_invalid")
+}

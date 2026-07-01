@@ -51,6 +51,10 @@ dropped to ~zero before flipping enforcement on.
   - path-shape invalid → reject (always).
   - handle invalid/mismatched → reject (always, both modes).
   - handle missing + policy on → reject; + compat → allow + record.
+  - policy on + no signing capability (no valid OCTO_MASTER_KEY) → reject
+    (fail-closed, recorded as `rejected_no_capability`); intercepted in add()
+    before classification so a missing capability never silently allows an
+    enforced registration.
   - ok → allow.
   Unknown classification is fail-closed (reject). **Compatibility-mode caveat:**
   with `required=false`, a missing handle is allowed, so the #509 cross-type
@@ -90,8 +94,9 @@ dropped to ~zero before flipping enforcement on.
   that value as `handle` succeeds (`result=ok`).
 - `GET /v1/common/appconfig` returns `sticker_handle_required` matching the setting,
   in both the version-short-circuit and full branches.
-- `required=true` with no/invalid master key produces a startup ERROR, not a
-  panic, and registration is fail-closed.
+- `required=true` with no/invalid master key produces a startup ERROR (not a
+  panic) AND rejects registration at the request path (fail-closed), recorded as
+  `rejected_no_capability`. Pinned by TestSticker_RequiredWithoutCapability_FailsClosed.
 - `go test ./pkg/stickersig/... ./pkg/metrics/... ./modules/sticker/...
   ./modules/common/... ./modules/file/...`, `make i18n-extract-check`,
   `make i18n-lint`, and `golangci-lint run` all pass.
