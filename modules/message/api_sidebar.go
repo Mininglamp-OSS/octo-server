@@ -824,13 +824,30 @@ func extractGroupNos(convs []*config.SyncUserConversationResp) []string {
 // 前显式按父群 space_id 过滤，规则与 FilterRawConversationsBySpace 的 group 分支一致：
 //   - 内部群：parent.space_id == spaceID 才保留
 //   - 外部群：当前 user 作为外部成员加入该群且 sourceSpaceID == spaceID 才保留
-//   - 旧群 (parent.space_id == "")：保留（沿用历史"所有 Space 可见"语义）
+//   - 旧群 (parent.space_id == "")：只在用户默认 Space 保留（issue #484 follow-up，
+//     与 filterThreadConvCore 同口径；此前"所有 Space 可见"是串空间路径）
 //
-// fail-closed：群表查询失败时返回 error，调用方 follow tab 整体退避，避免半结果泄露。
+// fail-closed：群表 / 外部群查询失败时返回 error，调用方 follow tab 整体退避，避免
+// 半结果泄露——这两个查询划定真正的跨 Space 鉴权边界（内部群 parent.space_id==spaceID、
+// 外部群 sourceSpaceID==spaceID）。
+//
+// 例外——默认 Space 查询（GetUserDefaultSpaceIDE）只用于「空 space_id 父群露在哪个
+// Space」这个软启发式，不是鉴权边界，故单独 fail-open（视 filterSpaceID 为默认，与
+// FilterConversationsBySpace 同口径）：空 space_id 群此时归到当前 Space，是 legacy
+// 「全 Space 可见」的子集、不构成跨 Space 泄露；一次 space_member 抖动不再把整个
+// follow tab 打黑（#519 reviewer 反馈：默认 Space 查询失败拖垮 follow tab）。
 func (sb *Sidebar) filterThreadExtsBySpace(rows []*convext.Model, spaceID, loginUID string) ([]*convext.Model, error) {
 	parentNos := uniqueThreadParentGroupNos(rows)
 	if len(parentNos) == 0 {
 		return rows, nil
+	}
+	defaultSpaceID, err := space.GetUserDefaultSpaceIDE(sb.ctx, loginUID)
+	if err != nil {
+		// 软启发式查询失败 → fail-open（不牵连整个 follow tab），空 space_id 父群按
+		// 当前 Space 归属；真正的边界（群表/外部群查询）仍在下方 fail-closed。
+		sb.Warn("sidebar sync: thread ext default-space lookup failed, fail-open to current space",
+			zap.Error(err), zap.String("loginUID", loginUID))
+		defaultSpaceID = spaceID
 	}
 	groupInfos, err := sb.groupService.GetGroups(parentNos)
 	if err != nil {
@@ -858,8 +875,11 @@ func (sb *Sidebar) filterThreadExtsBySpace(rows []*convext.Model, spaceID, login
 			continue
 		}
 		if parentSpaceID == "" {
-			// Legacy group without space_id: keep (mirrors v1 visibility).
-			kept = append(kept, ext)
+			// issue #484 follow-up：空 space_id 父群只在默认 Space 露出（与
+			// filterThreadConvCore 同口径），不再全 Space 可见。
+			if spaceID == defaultSpaceID {
+				kept = append(kept, ext)
+			}
 			continue
 		}
 		if parentSpaceID == spaceID {

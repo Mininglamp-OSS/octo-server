@@ -1,0 +1,43 @@
+slug: dm-space-isolation-484
+upstream: Mininglamp-OSS/octo-server#484
+rules_applied:
+  - id: space-isolation
+    tier: repo
+    load_bearing: true
+    why: >
+      The whole change is a Space-isolation correctness fix for DMs. Visibility is
+      now decided by an authoritative per-(pair, space) presence index instead of
+      scanning the shared Recents window, and untagged DM history is confined to
+      the default Space. The presence read fails open to the existing Recents
+      scan (never worse than today); the write is authoritative from the
+      server-injected payload.space_id. Conversation/message handlers still go
+      through the existing Space middleware (unchanged).
+  - id: trust-boundary
+    tier: repo
+    load_bearing: true
+    why: >
+      The presence write is added inside the HMAC-authenticated WuKongIM message
+      webhook (handleMessageNotify). It only reads a server-injected authoritative
+      field (payload.space_id) and writes an internal index key — no external
+      content is rendered/echoed, no markdown/URL emitted. Best-effort post-commit
+      so it can never roll back message persistence.
+  - id: testing
+    tier: repo
+    load_bearing: false
+    why: >
+      Unit tests for the symptom-1 default-Space drop and the symptom-2
+      presence-driven visibility; integration repro flipped to post-fix
+      assertions driving the REAL webhook write + both read paths.
+  - id: commit-style
+    tier: repo
+    load_bearing: false
+    why: Conventional Commits, English.
+files_touched:
+  - modules/space/sql/20260627000001_dm_space_presence.sql   # new dm_space_presence table
+  - pkg/space/dm_presence.go                                 # UpsertDMSpacePresence + DMSpacePresenceSet
+  - modules/webhook/api.go                                   # authoritative presence write at ingest (post-commit, best-effort)
+  - modules/message/space_filter.go                          # resolveDMPresence + OR into decideConvKeepInSpace; default-Space untagged policy
+  - modules/message/api.go                                   # pass defaultSpaceID into filterPersonMessagesBySpace; import modules/space
+  - modules/message/space_filter_test.go                     # signature updates + symptom-1 drop / symptom-2 presence cases
+  - modules/message/space_filter_v2_test.go                  # decideConvKeepInSpace dmPresentSet param + presence case
+  - modules/message/dm_cross_space_repro_test.go             # post-fix integration repro (real webhook + sync handlers)

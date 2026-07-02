@@ -231,6 +231,30 @@ func (w *Webhook) messageNotify(c *wkhttp.Context) {
 
 }
 
+// dmSpacePresencePair 是一条待写入 dm_space_presence 的 DM-Space 存在性记录
+// （issue #484）。在消息事务内收集，事务提交后再 best-effort 落库。
+type dmSpacePresencePair struct {
+	fakeChannelID string
+	spaceID       string
+	timestamp     int64
+}
+
+// dmPayloadSpaceID 从 DM 消息 payload（原始 JSON 字节）中读取 space_id。
+// 非 JSON / 缺字段 / 类型不符均返回 ""（调用方据此跳过，不写存在性索引）。
+func dmPayloadSpaceID(payload []byte) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	m, err := util.JsonToMap(string(payload))
+	if err != nil {
+		return ""
+	}
+	if v, ok := m["space_id"].(string); ok {
+		return v
+	}
+	return ""
+}
+
 func (w *Webhook) handleMessageNotify(messages []MsgResp) ([]string, error) {
 	messageIDs := make([]string, 0, len(messages))
 	if len(messages) <= 0 {
@@ -238,6 +262,9 @@ func (w *Webhook) handleMessageNotify(messages []MsgResp) ([]string, error) {
 	}
 
 	confMessages := make([]*config.MessageResp, 0, len(messages))
+	// DM per-Space 存在性索引（issue #484）：在事务内收集，提交后再写，避免
+	// 辅助索引拖累消息持久化主链路。
+	var dmPresencePairs []dmSpacePresencePair
 
 	tx, err := w.ctx.DB().Begin()
 	if err != nil {
@@ -270,6 +297,18 @@ func (w *Webhook) handleMessageNotify(messages []MsgResp) ([]string, error) {
 		}
 		confMessages = append(confMessages, message.toConfigMessageResp())
 
+		// DM per-Space 存在性（issue #484）：仅对带权威 space_id 的非加密 Person
+		// 消息记录 (fakeChannelID, space_id)。加密消息 payload 不可解析，跳过。
+		if message.ChannelType == common.ChannelTypePerson.Uint8() &&
+			!config.SettingFromUint8(message.Setting).Signal {
+			if sid := dmPayloadSpaceID(message.Payload); sid != "" {
+				dmPresencePairs = append(dmPresencePairs, dmSpacePresencePair{
+					fakeChannelID: fakeChannelID,
+					spaceID:       sid,
+					timestamp:     int64(message.Timestamp),
+				})
+			}
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		_ = tx.Rollback()
@@ -280,6 +319,16 @@ func (w *Webhook) handleMessageNotify(messages []MsgResp) ([]string, error) {
 	// 通知消息监听者
 	if len(confMessages) > 0 {
 		w.ctx.NotifyMessagesListeners(confMessages)
+	}
+
+	// DM per-Space 存在性索引（issue #484）：事务提交后 best-effort 写入，失败
+	// 仅记日志——绝不回滚已持久化的消息。读侧（modules/message/space_filter.go）
+	// 把本索引与 Recents 窗口扫描 OR，漏写在下一条消息到达时自愈。
+	for _, p := range dmPresencePairs {
+		if err := spacepkg.UpsertDMSpacePresence(w.ctx.DB(), p.fakeChannelID, p.spaceID, p.timestamp); err != nil {
+			w.Warn("写 dm_space_presence 失败（忽略，best-effort）", zap.Error(err),
+				zap.String("fakeChannelID", p.fakeChannelID), zap.String("spaceID", p.spaceID))
+		}
 	}
 	return messageIDs, nil
 }

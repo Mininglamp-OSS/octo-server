@@ -20,7 +20,7 @@ func TestDecideConvKeepInSpace_Group_DirectSpaceMatch(t *testing.T) {
 		"grp1", common.ChannelTypeGroup.Uint8(), "",
 		"spaceA", "spaceA",
 		map[string]string{"grp1": "spaceA"}, nil,
-		nil, nil, false, false, false, nil,
+		nil, nil, false, false, false, nil, nil,
 	)
 	assert.True(t, keep, "group in spaceA must be kept when filter=spaceA")
 }
@@ -30,19 +30,28 @@ func TestDecideConvKeepInSpace_Group_SpaceMismatch_Excluded(t *testing.T) {
 		"grp1", common.ChannelTypeGroup.Uint8(), "",
 		"spaceB", "spaceA",
 		map[string]string{"grp1": "spaceA"}, nil,
-		nil, nil, false, false, false, nil,
+		nil, nil, false, false, false, nil, nil,
 	)
 	assert.False(t, keep, "group in spaceA must NOT leak into spaceB sidebar request")
 }
 
-func TestDecideConvKeepInSpace_Group_LegacyNoSpace_VisibleEverywhere(t *testing.T) {
-	keep := decideConvKeepInSpace(
+func TestDecideConvKeepInSpace_Group_LegacyNoSpace_DefaultSpaceOnly(t *testing.T) {
+	// issue #484 follow-up：无法归属的群只在默认 Space 露出，不再全 Space 可见。
+	keepNonDefault := decideConvKeepInSpace(
 		"old-grp", common.ChannelTypeGroup.Uint8(), "",
 		"spaceB", "spaceA",
 		map[string]string{}, nil,
-		nil, nil, false, false, false, nil,
+		nil, nil, false, false, false, nil, nil,
 	)
-	assert.True(t, keep, "legacy group without space_id stays visible everywhere")
+	assert.False(t, keepNonDefault, "legacy group without space_id must NOT show in a non-default Space")
+
+	keepDefault := decideConvKeepInSpace(
+		"old-grp", common.ChannelTypeGroup.Uint8(), "",
+		"spaceA", "spaceA",
+		map[string]string{}, nil,
+		nil, nil, false, false, false, nil, nil,
+	)
+	assert.True(t, keepDefault, "legacy group without space_id stays visible in the default Space")
 }
 
 func TestDecideConvKeepInSpace_Group_ExternalSourceSpace(t *testing.T) {
@@ -51,7 +60,7 @@ func TestDecideConvKeepInSpace_Group_ExternalSourceSpace(t *testing.T) {
 		"spaceX", "spaceA",
 		map[string]string{"grp1": "spaceB"},
 		map[string]string{"grp1": "spaceX"},
-		nil, nil, false, false, false, nil,
+		nil, nil, false, false, false, nil, nil,
 	)
 	assert.True(t, keep, "external group must surface in its source space")
 }
@@ -62,7 +71,7 @@ func TestDecideConvKeepInSpace_Thread_FollowsParentSpace(t *testing.T) {
 		"grp1____thr1", common.ChannelTypeCommunityTopic.Uint8(), "",
 		"spaceA", "spaceA",
 		map[string]string{"grp1": "spaceA"}, nil,
-		nil, nil, false, false, false, nil,
+		nil, nil, false, false, false, nil, nil,
 	)
 	assert.True(t, keep, "thread inherits parent group's space visibility")
 
@@ -70,7 +79,7 @@ func TestDecideConvKeepInSpace_Thread_FollowsParentSpace(t *testing.T) {
 		"grp1____thr1", common.ChannelTypeCommunityTopic.Uint8(), "",
 		"spaceB", "spaceA",
 		map[string]string{"grp1": "spaceA"}, nil,
-		nil, nil, false, false, false, nil,
+		nil, nil, false, false, false, nil, nil,
 	)
 	assert.False(t, keep, "thread of spaceA parent must not appear in spaceB sidebar")
 }
@@ -81,6 +90,7 @@ func TestDecideConvKeepInSpace_DM_DefaultSpace_KeepBareConv(t *testing.T) {
 		"spaceA", "spaceA",
 		nil, nil,
 		map[string]bool{}, map[string]bool{}, false, false, false,
+		nil,
 		func(string) bool { return false },
 	)
 	assert.True(t, keep, "bare DM stays in user's default space when no bot match")
@@ -92,6 +102,7 @@ func TestDecideConvKeepInSpace_DM_NonDefaultSpace_NoSpaceMsg_Excluded(t *testing
 		"spaceB", "spaceA",
 		nil, nil,
 		map[string]bool{}, map[string]bool{}, false, false, false,
+		nil,
 		func(string) bool { return false },
 	)
 	assert.False(t, keep, "DM with no payload.space_id match must NOT appear in non-default space")
@@ -103,9 +114,24 @@ func TestDecideConvKeepInSpace_DM_NonDefaultSpace_HasSpaceMsg_Visible(t *testing
 		"spaceB", "spaceA",
 		nil, nil,
 		map[string]bool{}, map[string]bool{}, false, false, false,
+		nil,
 		func(target string) bool { return target == "spaceB" },
 	)
 	assert.True(t, keep, "DM with payload.space_id == filter must appear in that space")
+}
+
+func TestDecideConvKeepInSpace_DM_PresenceSet_VisibleWindowIndependent(t *testing.T) {
+	// issue #484：非默认 Space 下，即使 Recents 窗口扫描（hasSpaceMsg）返回 false，
+	// 只要 dm_space_presence 命中（dmPresentSet[channelID]），DM 也应可见。
+	keep := decideConvKeepInSpace(
+		"peer1", common.ChannelTypePerson.Uint8(), "",
+		"spaceB", "spaceA",
+		nil, nil,
+		map[string]bool{}, map[string]bool{}, false, false, false,
+		map[string]bool{"peer1": true},     // presence: peer1 在 spaceB 有过消息
+		func(string) bool { return false }, // Recents 窗口里没有 spaceB
+	)
+	assert.True(t, keep, "DM with persisted presence in target space must be visible regardless of Recents window")
 }
 
 func TestDecideConvKeepInSpace_DM_BotInSpace(t *testing.T) {
@@ -114,6 +140,7 @@ func TestDecideConvKeepInSpace_DM_BotInSpace(t *testing.T) {
 		"spaceB", "spaceA",
 		nil, nil,
 		map[string]bool{"bot1": true}, map[string]bool{"bot1": true}, false, false, false,
+		nil,
 		nil,
 	)
 	assert.True(t, keep, "bot DM is visible when bot is a member of the target space")
@@ -126,6 +153,7 @@ func TestDecideConvKeepInSpace_DM_BotNotInSpace_Excluded(t *testing.T) {
 		nil, nil,
 		map[string]bool{"bot1": true}, map[string]bool{"bot1": false}, false, false, false,
 		nil,
+		nil,
 	)
 	assert.False(t, keep, "bot not in target space must be hidden in that space's sidebar")
 }
@@ -136,7 +164,7 @@ func TestDecideConvKeepInSpace_SkipGroupFilter_v1FailOpen(t *testing.T) {
 		"grp1", common.ChannelTypeGroup.Uint8(), "",
 		"spaceB", "spaceA",
 		nil, nil,
-		nil, nil, true, false, false /*v1 兼容: fail-open*/, nil,
+		nil, nil, true, false, false /*v1 兼容: fail-open*/, nil, nil,
 	)
 	assert.True(t, keep, "v1: skipGroupFilter must keep groups (兼容历史)")
 }
@@ -146,7 +174,7 @@ func TestDecideConvKeepInSpace_SkipGroupFilter_v2FailClosed_Group(t *testing.T) 
 		"grp1", common.ChannelTypeGroup.Uint8(), "",
 		"spaceB", "spaceA",
 		nil, nil,
-		nil, nil, true, false, true /*v2: fail-closed*/, nil,
+		nil, nil, true, false, true /*v2: fail-closed*/, nil, nil,
 	)
 	assert.False(t, keep,
 		"v2: skipGroupFilter 时 group 必须 drop，否则一次 GetGroups 抖动会让 Space A 群泄露到 Space B 请求")
@@ -157,7 +185,7 @@ func TestDecideConvKeepInSpace_SkipGroupFilter_v2FailClosed_Thread(t *testing.T)
 		"grp1____thr1", common.ChannelTypeCommunityTopic.Uint8(), "",
 		"spaceB", "spaceA",
 		nil, nil,
-		nil, nil, true, false, true, nil,
+		nil, nil, true, false, true, nil, nil,
 	)
 	assert.False(t, keep,
 		"v2: skipGroupFilter 时 thread 必须 drop（与父群同样语义）")

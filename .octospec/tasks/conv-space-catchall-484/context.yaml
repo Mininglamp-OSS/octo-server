@@ -1,0 +1,33 @@
+# What was injected/consulted while implementing conv-space-catchall-484.
+task: conv-space-catchall-484
+rules_used:
+  - id: space-isolation   # load_bearing; both fixes tighten the space boundary
+  - id: trust-boundary    # webhook presence write (byte-identical to reviewed #484 code)
+  - id: testing           # testutil.NewTestServer + CleanAllTables harness conventions
+  - id: commit-style      # conventional commits
+code_read:
+  - modules/message/space_filter.go          # decideConvKeepInSpace / filterThreadConvCore / v1+v2 entries
+  - modules/message/api_sidebar.go           # filterThreadExtsBySpace (third spaceless fail-open)
+  - modules/message/api_conversation.go      # topic liveness whitelist (QueryActiveShortIDs), member gates
+  - modules/message/space_unread.go          # confirmed window-scan only — NOT a durable presence substitute
+  - modules/group/db.go                      # ExistMembersActive whitelist (status=GroupMemberStatusNormal)
+  - modules/thread/const.go, modules/thread/sql/  # ThreadStatusActive=1, thread schema for test seeding
+  - pkg/space/dm_presence.go                 # accessor idiom to mirror in DMSpacePresenceAnySet
+decisions:
+  - base: origin/main (236b78b), per user choice "纯 main,两个都修"; presence infra
+    (migration + pkg/space/dm_presence.go + webhook write) re-introduced BYTE-IDENTICAL
+    to fix/dm-space-isolation-484 so a future merge dedupes as identical add-add;
+    all genuinely new code lives in NEW files to minimize the conflict surface.
+  - fix 1 (DM catch-all) is a post-filter pass, NOT a decideConvKeepInSpace signature
+    change — keeps existing unit-test call sites intact and conflict surface small.
+  - hide requires positive durable evidence: presence rows exist AND none for the
+    default Space AND no untagged/default-tagged Recents counter-evidence; system
+    bots exempt; bots exempt (catch-all bot sub-check remains the authority);
+    skipBotFilter or any presence/default-space query failure disables the pass.
+  - fix 2 attributes spaceless groups/topics (conv core + thread core + sidebar
+    thread-ext) to the default Space only; default-space lookup failure falls open
+    per request (defaultSpaceID=filterSpaceID) in conv filters, fail-closed in
+    filterThreadExtsBySpace per that function's existing error contract.
+out_of_scope_confirmed:
+  - missing-space_id skip (documented legacy-client compat, YUJ-226) untouched.
+  - no conversation-level space_id emitted for DMs (separate structural task).

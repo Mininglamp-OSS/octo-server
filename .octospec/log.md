@@ -4,6 +4,21 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-02
+
+- **Change** — Task `conv-space-catchall-484` (issue #484 follow-up): closed the
+  two deterministically reproducible cross-Space paths in the recent-conversation
+  list. (1) The default-Space DM catch-all no longer lists a bare DM whose
+  `dm_space_presence` rows point exclusively at other Spaces (positive-evidence
+  post-pass; legacy no-presence DMs keep the catch-all; system bots exempt; any
+  query failure disables the pass). (2) Groups with empty `group.space_id` — and
+  their topics, in the conv filter AND sidebar thread-ext filter — now show only
+  in the user's default Space instead of every Space (same policy as #337 bare
+  DMs / #484 untagged history). This branch also carries the base
+  `dm-space-isolation-484` fix (merged in — see the 2026-06-27 entry below), so
+  the presence infra is authored once here. Journal:
+  `journal/shared/conv-space-catchall-484.md`.
+
 ## 2026-06-29
 
 - **Change** — Task `group-avatar-name-no-text` (client-coordination; repurposes
@@ -41,6 +56,12 @@ change-log convention (§7). Newest first.
   `group-name-v3→v4` and `name-v4→v5` (ETag + CacheKey). Brief + context under
   `.octospec/tasks/default-avatar-text-rule/`, journal
   `.octospec/journal/shared/default-avatar-text-rule.md`.
+- **Fix** — Task `dm-space-isolation-484` (#484): authoritative per-Space DM
+  presence index (`dm_space_presence`, written at the WuKongIM message webhook,
+  read by the conversation Space filter) — fixes cross-Space DM history leak
+  (symptom 1, via default-Space policy for untagged messages) and DMs mutually
+  hiding between Spaces (symptom 2, window-independent visibility OR-ed with the
+  legacy Recents scan). Server-only; no client change.
 
 ## 2026-06-25
 

@@ -27,6 +27,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/robot"
+	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
@@ -1356,7 +1357,17 @@ func (m *Message) syncChannelMessage(c *wkhttp.Context) {
 	// 否则 hardening 会被绕过。
 	if req.ChannelType == common.ChannelTypePerson.Uint8() {
 		if spaceID := spacepkg.GetSpaceID(c); spaceID != "" {
-			syncResp.Messages = filterPersonMessagesBySpace(syncResp.Messages, req.ChannelID, spaceID)
+			// issue #484：无标签 DM 历史只在用户默认 Space 保留，避免跨 Space 泄漏。
+			// 用 error-returning 变体：默认 Space 查询失败时无法判定归属，按兼容
+			// 口径 fail-open（defaultSpaceID=spaceID → 保留无标签历史）并记日志，
+			// 避免一次 DB 抖动静默截断合法 DM 历史（与会话过滤“不比现状更差”同口径）。
+			defaultSpaceID, derr := space.GetUserDefaultSpaceIDE(m.ctx, req.LoginUID)
+			if derr != nil {
+				m.Warn("查询默认 Space 失败，DM 无标签历史按兼容口径保留",
+					zap.Error(derr), zap.String("loginUID", req.LoginUID))
+				defaultSpaceID = spaceID
+			}
+			syncResp.Messages = filterPersonMessagesBySpace(syncResp.Messages, req.ChannelID, spaceID, defaultSpaceID)
 		}
 	}
 
