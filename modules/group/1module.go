@@ -1,6 +1,7 @@
 package group
 
 import (
+	"context"
 	"embed"
 	"fmt"
 	"time"
@@ -30,8 +31,30 @@ func init() {
 		// source_space_* / home_space_* 字段，让 Web/Android/iOS UserInfo 能区分
 		// "同 Space 非好友 → 直接发消息" vs "跨 Space 外部成员 → 仅可在群内交流"。
 		user.RegisterGroupMemberExternalProvider(api.groupService.GetMemberExternalFields)
+
+		// #394：孤儿群频道 reconcile worker。CreateGroup 在 IM 频道创建失败 / 补偿删除失败 /
+		// 崩溃窗口可能残留 channel_synced=0 的群；worker 周期性扫描并幂等补建频道，收敛为
+		// 最终一致。默认关闭（DM_GROUP_CHANNEL_RECONCILE_ENABLED），灰度友好。
+		reconcileWorker := NewReconcileWorker(ctx.(*config.Context), LoadReconcileConfig())
+		// workerCancel 每次 Start 重建，让未来的 graceful-reload 拿到新鲜 ctx；框架当前只
+		// Start 一次，这里的幂等是防误用（与 thread archive worker 同策略）。
+		var workerCancel context.CancelFunc
+
 		return register.Module{
 			Name: "group",
+			Start: func() error {
+				workerCtx, cancel := context.WithCancel(context.Background())
+				workerCancel = cancel
+				reconcileWorker.Start(workerCtx)
+				return nil
+			},
+			Stop: func() error {
+				if workerCancel != nil {
+					workerCancel()
+				}
+				reconcileWorker.Stop()
+				return nil
+			},
 			SetupAPI: func() register.APIRouter {
 				return api
 			},

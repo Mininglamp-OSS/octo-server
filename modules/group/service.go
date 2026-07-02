@@ -1185,6 +1185,16 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 		return nil, errors.New("failed to insert group record")
 	}
 
+	// #394：把新群标记为「IM 频道待确认」(channel_synced=0)。Model 不含该列，InsertTx
+	// 落库走 DEFAULT 1，故这里在**同一事务内**显式翻 0——使「群已提交、频道未确认」这一
+	// 中间态随事务一起持久化。只有下方 IMCreateOrUpdateChannel 确认成功后才翻回 1；否则
+	// （补偿删除失败 / commit 与 IM 创建之间崩溃）该行留在 0，由 reconcile worker 兜底补建，
+	// 杜绝「可查询但无 backing 频道」的永久孤儿群。
+	if err := s.db.SetChannelSyncedTx(groupNo, 0, tx); err != nil {
+		s.Error("mark group channel_synced=0 failed", zap.Error(err), zap.String("groupNo", groupNo))
+		return nil, errors.New("failed to mark group channel unsynced")
+	}
+
 	// 插入成员
 	realMemberUIDs := make([]string, 0, len(memberUsers))
 	memberVos := make([]*config.UserBaseVo, 0, len(memberUsers))
@@ -1322,6 +1332,14 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 			s.Error("compensating delete group failed", zap.Error(delErr), zap.String("groupNo", groupNo))
 		}
 		return nil, errors.New("failed to create IM channel, group has been rolled back")
+	}
+
+	// #394：IM 频道确认创建成功——翻 channel_synced=1，把该群移出 reconcile worker 的
+	// 扫描集。best-effort：若这里失败，行仍停在 0，worker 下个 tick 会发现它、确认频道已在
+	// （IMCreateOrUpdateChannel 幂等）后补翻 1，最终一致，不影响本次建群成功返回。
+	if err := s.db.SetChannelSynced(groupNo, 1); err != nil {
+		s.Error("mark group channel_synced=1 failed (reconcile worker will heal)",
+			zap.Error(err), zap.String("groupNo", groupNo))
 	}
 
 	// 发送群创建通知

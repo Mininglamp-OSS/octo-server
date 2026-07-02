@@ -38,6 +38,35 @@ func (d *DB) Insert(m *Model) error {
 	return err
 }
 
+// SetChannelSyncedTx 在事务内把某群的 channel_synced 置为指定值（#394）。
+// CreateGroup 在插入群记录后立刻置 0（Model 不含该列，落库走 DEFAULT 1，故需显式翻 0），
+// 使「群已提交、IM 频道尚未确认」这一状态持久可见，交给 reconcile worker 兜底补建。
+func (d *DB) SetChannelSyncedTx(groupNo string, synced int, tx *dbr.Tx) error {
+	_, err := tx.Update("group").Set("channel_synced", synced).Where("group_no=?", groupNo).Exec()
+	return err
+}
+
+// SetChannelSynced 事务外把某群 channel_synced 置为指定值（#394）。
+// CreateGroup 在 IM 频道创建**确认成功**后置 1；reconcile worker 补建成功后同样置 1。
+// 幂等：重复置同一值无副作用。
+func (d *DB) SetChannelSynced(groupNo string, synced int) error {
+	_, err := d.session.Update("group").Set("channel_synced", synced).Where("group_no=?", groupNo).Exec()
+	return err
+}
+
+// QueryUnsyncedChannelGroups 返回 channel_synced=0 且 created_at < cutoff 的群编号（#394）。
+// cutoff 是「宽限截止时刻」：只有创建超过宽限期仍未确认的群才被视作孤儿候选，避免和正在
+// 进行中的建群事务（尚未走到置 1）竞争。按 id 升序 + LIMIT 分批，配合复合索引
+// group_channel_synced_created 走 index range。
+func (d *DB) QueryUnsyncedChannelGroups(cutoff time.Time, limit int) ([]string, error) {
+	var groupNos []string
+	_, err := d.session.SelectBySql(
+		"SELECT group_no FROM `group` WHERE channel_synced=0 AND created_at < ? ORDER BY id ASC LIMIT ?",
+		cutoff.Format("2006-01-02 15:04:05"), limit,
+	).Load(&groupNos)
+	return groupNos, err
+}
+
 // 修改群类型
 func (d *DB) UpdateGroupTypeTx(groupNo string, groupType GroupType, tx *dbr.Tx) error {
 	_, err := tx.Update("group").Set("group_type", int(groupType)).Where("group_no=?", groupNo).Exec()
