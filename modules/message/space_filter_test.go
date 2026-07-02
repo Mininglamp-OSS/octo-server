@@ -47,23 +47,25 @@ func TestFilterConversationsBySpace_SystemBotsVisible(t *testing.T) {
 }
 
 func TestFilterConversationsBySpace_DefaultSpaceBareConvs(t *testing.T) {
-	// 裸 UID 旧会话只在默认 Space 显示
+	// GH#484: 裸 UID 旧 DM 会话在所有 Space 恒可见（不再只在默认 Space 显示）。
 	convs := []*SyncUserConversationResp{
 		{ChannelID: "user1", ChannelType: common.ChannelTypePerson.Uint8(), SpaceID: ""},
 		{ChannelID: "user2", ChannelType: common.ChannelTypePerson.Uint8(), SpaceID: ""},
 	}
 
-	// filterSpaceID == defaultSpaceID → 旧会话保留
+	// filterSpaceID == defaultSpaceID → 可见
 	result := filterConversationsCore(convs, "spaceA", "spaceA", nil, nil, nil, nil, false, false)
 	assert.Len(t, result, 2)
 
-	// filterSpaceID != defaultSpaceID → 无 Recents 匹配 → 不显示
+	// filterSpaceID != defaultSpaceID → GH#484 修复后仍可见（普通 DM 全 Space 可见）
 	result = filterConversationsCore(convs, "spaceB", "spaceA", nil, nil, nil, nil, false, false)
-	assert.Len(t, result, 0)
+	assert.Len(t, result, 2)
 }
 
-func TestFilterConversationsBySpace_NonDefaultSpaceDMVisible(t *testing.T) {
-	// 非默认 Space 中，普通 DM 需有 Recents 中 space_id 匹配才显示
+func TestFilterConversationsBySpace_NonDefaultSpace_AllNonBotDMsVisible(t *testing.T) {
+	// GH#484: 非默认 Space 中，普通 (非 bot) DM 无论 Recents 是否有 space_id 匹配
+	// 都恒可见（原契约要求 Recents 匹配，因单一物理 channel + 共享 Recents 而不可靠）。
+	// Bot DM 隔离不变：Bot 在此 Space → 可见；Bot 不在此 Space → 不可见。
 	convs := []*SyncUserConversationResp{
 		{
 			ChannelID: "user1", ChannelType: common.ChannelTypePerson.Uint8(), SpaceID: "",
@@ -83,21 +85,60 @@ func TestFilterConversationsBySpace_NonDefaultSpaceDMVisible(t *testing.T) {
 	// filterSpaceID=spaceB != defaultSpaceID=spaceA
 	result := filterConversationsCore(convs, "spaceB", "spaceA", nil, nil, botSet, botInSpace, false, false)
 
-	// user1（Recents 有 spaceB 消息）保留；user2（Recents 只有 spaceA）过滤；
-	// bot_in_space（Bot 在此 Space）保留；custom_bot（Bot 不在此 Space）不保留
-	assert.Len(t, result, 2)
+	// user1 + user2（普通 DM 全 Space 可见）+ bot_in_space（Bot 在此 Space）保留；
+	// custom_bot（Bot 不在此 Space）不保留。
+	assert.Len(t, result, 3)
 	ids := make([]string, len(result))
 	for i, r := range result {
 		ids[i] = r.ChannelID
 	}
 	assert.Contains(t, ids, "user1")
+	assert.Contains(t, ids, "user2")
 	assert.Contains(t, ids, "bot_in_space")
-	assert.NotContains(t, ids, "user2")
 	assert.NotContains(t, ids, "custom_bot")
 }
 
-func TestFilterConversationsBySpace_NewSpaceCleanSlate(t *testing.T) {
-	// 全新 Space：所有 DM 的 Recents 都没有该 Space 的消息 → 全部过滤
+func TestFilterConversationsBySpace_NonDefaultSpace_ScrubsCrossSpaceRecents(t *testing.T) {
+	// GH#484 P1 回归 (reviewer Jerry-Xin / yujiawei, PR #490): 普通 DM 现在在所有
+	// Space 可见，但 conversation-list 的 Recents 必须按当前 Space 过滤，否则会把
+	// 另一 Space 的消息内容（预览）泄露到本 Space。断言：会话保留可见，但只带
+	// 本 Space 标签的消息 + 无标签老消息，跨 Space 标签的消息被剔除。
+	convs := []*SyncUserConversationResp{
+		{
+			ChannelID: "peer_uid", ChannelType: common.ChannelTypePerson.Uint8(), SpaceID: "",
+			Recents: []*MsgSyncResp{
+				{Payload: map[string]interface{}{"space_id": "spaceA", "content": "secret from space A"}},
+				{Payload: map[string]interface{}{"space_id": "spaceB", "content": "hi in space B"}},
+				{Payload: map[string]interface{}{"content": "legacy untagged"}},
+			},
+		},
+	}
+
+	// 从 spaceB 视角拉列表（spaceB != defaultSpaceID=spaceA）。
+	result := filterConversationsCore(convs, "spaceB", "spaceA", nil, nil, map[string]bool{}, map[string]bool{}, false, false)
+
+	// 会话仍然可见（symptom 2 已修）。
+	assert.Len(t, result, 1)
+	assert.Equal(t, "peer_uid", result[0].ChannelID)
+
+	// Recents 已按 spaceB 过滤：spaceA 标签的消息被剔除（不泄露），
+	// spaceB 标签 + 无标签老消息保留。
+	contents := make([]string, 0, len(result[0].Recents))
+	for _, m := range result[0].Recents {
+		if c, ok := m.Payload["content"].(string); ok {
+			contents = append(contents, c)
+		}
+	}
+	assert.NotContains(t, contents, "secret from space A")
+	assert.Contains(t, contents, "hi in space B")
+	assert.Contains(t, contents, "legacy untagged")
+	assert.Len(t, result[0].Recents, 2)
+}
+
+func TestFilterConversationsBySpace_NewSpace_DMsAlwaysVisible(t *testing.T) {
+	// GH#484: 在一个全新 Space 里，即便没有任何 DM 的 Recents 命中该 Space，
+	// 普通 DM 依然全部可见（不再有 DM 的 "clean slate"）。消息级过滤仍会
+	// 决定每个 Space 内展示哪些消息（见 ScrubsCrossSpaceRecents 回归测试）。
 	convs := []*SyncUserConversationResp{
 		{
 			ChannelID: "user1", ChannelType: common.ChannelTypePerson.Uint8(), SpaceID: "",
@@ -115,8 +156,8 @@ func TestFilterConversationsBySpace_NewSpaceCleanSlate(t *testing.T) {
 
 	result := filterConversationsCore(convs, "spaceNew", "spaceA", nil, nil, map[string]bool{}, map[string]bool{}, false, false)
 
-	// 新 Space 没有任何 DM 有匹配消息 → clean slate
-	assert.Len(t, result, 0)
+	// 普通 DM 全 Space 可见 → 三条会话都保留。
+	assert.Len(t, result, 3)
 }
 
 func TestPersonConvHasSpaceMessages(t *testing.T) {

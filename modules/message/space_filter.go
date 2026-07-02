@@ -198,6 +198,21 @@ func filterConversationsCore(
 			func(target string) bool { return personConvHasSpaceMessages(conv, target) },
 		)
 		if keep {
+			// GH#484 P1 (reviewer Jerry-Xin / yujiawei, PR #490): DM conversations are
+			// now visible in every Space, but the conversation-list Recents are NOT
+			// otherwise space-filtered on this path — unlike /v1/message/channel/sync,
+			// which runs filterPersonMessagesBySpace (api.go). Without scrubbing here, a
+			// DM kept in a non-active Space would ship its raw Recents (including
+			// messages tagged for another Space), re-opening cross-Space message-content
+			// exposure in the conversation-list preview. Scrub Recents with the same
+			// message-level rule so the preview matches exactly what channel/sync would
+			// return for this DM in this Space. filterPersonMessagesBySpace is a no-op
+			// when filterSpaceID == "" and only removes cross-Space-tagged / sysbot-only
+			// messages, so untagged legacy messages (symptom 1, pending product decision)
+			// are unchanged.
+			if filterSpaceID != "" && conv.ChannelType == common.ChannelTypePerson.Uint8() {
+				conv.Recents = filterPersonMessagesBySpace(conv.Recents, conv.ChannelID, filterSpaceID)
+			}
 			filtered = append(filtered, conv)
 		}
 	}
@@ -212,8 +227,11 @@ func filterConversationsCore(
 // 参数：
 //   - convSpaceID: 调用方已对 channel_id 做过 ParseChannelID 后得到的 space_id。
 //     可为空，群聊/子区会进一步查 groupSpaceMap。
-//   - hasSpaceMsg: 仅对非默认 Space 的 Person DM 生效，判断 conv.Recents 内是否
-//     有 payload.space_id == targetSpaceID 的消息。
+//   - hasSpaceMsg: TODO(#484) 现已不参与常规 DM 可见性判定。GH#484 修复后普通
+//     (非 bot) DM 在所有 Space 恒可见（见下方 ChannelTypePerson 分支），不再按
+//     conv.Recents 内是否有 payload.space_id == targetSpaceID 的消息来决定。该参数
+//     与两个调用方的闭包暂时保留：若后续产品决策引入真正的 per-(contact, Space)
+//     会话维度，Recents-scan 判定可能回归。目前是“按决策待定而有意保留”，非遗漏。
 //   - failClosedOnUnknownGroupSpace: 当 skipGroupFilter=true（group service 查询
 //     失败、无法确认群的 space_id）时的语义切换。
 //     - false（v1 兼容默认）：保留群/子区，不让一次 DB 抖动影响存量行为。
