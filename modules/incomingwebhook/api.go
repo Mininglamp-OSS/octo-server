@@ -1368,7 +1368,7 @@ func (w *IncomingWebhook) handlePush(c *wkhttp.Context, ad pushAdapter) {
 	//
 	// creatorIsAdmin 顺带取自同一查询：决定 push 请求的 username/avatar_url 展示覆盖
 	// 是否生效（见 resolveFromIdentity——创建者当前是管理员才允许覆盖，堵住成员经
-	// push 路径绕过管理面前缀/头像限制的冒充旁路，PR #340 review，yujiawei P1）。
+	// push 路径绕过管理面头像锁/已落库名称的冒充旁路，PR #340 review，yujiawei P1）。
 	creatorIsMember, creatorIsAdmin, err := w.cachedCreatorMembership(m.GroupNo, m.CreatorUID)
 	if err != nil {
 		// 服务端故障：拒绝但不禁用（fail closed on push, no destructive write）。

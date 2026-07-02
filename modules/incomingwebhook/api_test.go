@@ -190,7 +190,7 @@ func TestCreate_EmptyNameAutoGenerates(t *testing.T) {
 	assert.Contains(t, whID, strings.TrimPrefix(name, "Webhook-"))
 }
 
-// 非群成员不可创建。注意：普通成员现在【可以】创建（自动命名 + display_locked），
+// 非群成员不可创建。注意：普通成员现在【可以】创建（名称可自定义、头像仅管理员），
 // 见 api_member_test.go 的成员权限矩阵；这里只钉"完全不在群内 → 403"。
 func TestCreate_NonMemberForbidden(t *testing.T) {
 	handler, ctx, groupNo := setupTestEnv(t)

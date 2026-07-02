@@ -141,10 +141,10 @@ func TestBotWebhook_MemberCreateAndManageOwn(t *testing.T) {
 	require.NotEmpty(t, created["token"])
 	whID := created["webhook_id"].(string)
 
-	// 自定义名称 → 200，强制带 "Webhook-" 前缀；自定义头像 → 400（仅管理员可设头像）。
+	// 自定义名称 → 200，原样保存（不再强制加 "Webhook-" 前缀）；自定义头像 → 400（仅管理员可设头像）。
 	w = doBot(handler, botReq(t, "POST", botWebhookBase(), iwhBotToken, map[string]interface{}{"name": "ci-bot-wh"}))
 	require.Equalf(t, http.StatusOK, w.Code, "named create body: %s", w.Body.String())
-	assert.Equal(t, "Webhook-ci-bot-wh", decodeBody(t, w)["name"])
+	assert.Equal(t, "ci-bot-wh", decodeBody(t, w)["name"])
 	w = doBot(handler, botReq(t, "POST", botWebhookBase(), iwhBotToken, map[string]interface{}{"avatar": "https://x/a.png"}))
 	assert.Equalf(t, http.StatusBadRequest, w.Code, "avatar create body: %s", w.Body.String())
 

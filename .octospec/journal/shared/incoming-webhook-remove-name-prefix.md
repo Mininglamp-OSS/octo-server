@@ -72,6 +72,20 @@ sender. Product explicitly asked to remove it after being shown the tradeoff.
   both edited locale JSON files parse. Recommend running `pnpm lint` +
   `cd apps/web && pnpm test` before merge.
 
+## Review follow-up (same branch, second commit)
+An adversarial review pass over the first commit found:
+- **P1**: `modules/bot_api/incoming_webhook_test.go` mounts the *same*
+  `create()` handler via `MountManagementRoutes` and still asserted
+  `"Webhook-ci-bot-wh"` — would have failed CI deterministically. Fixed to
+  assert the verbatim name. The initial grep inventory only swept
+  `modules/incomingwebhook/`; the handler is mounted cross-module.
+- **P2**: stale "前缀/头像限制" comment at the `cachedCreatorMembership`
+  call in the push handler — updated.
+- **nit**: stale `display_locked` term in an `api_test.go` comment — updated.
+
 ## Learning
-None promoted — this was a scoped removal of an existing, well-documented
-control; no new reusable pattern.
+When a handler is mounted by more than one module (here: incomingwebhook
+management routes re-mounted under `/v1/bot/...` by bot_api), sweep for
+behavior-pinning tests by grepping the *behavior* (the literal asserted
+value, e.g. `"Webhook-"`) across the whole repo, not just the owning
+module's directory.

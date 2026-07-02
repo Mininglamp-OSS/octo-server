@@ -16,3 +16,6 @@ files_touched:
   - modules/incomingwebhook/api_test.go
   - modules/incomingwebhook/richtext_test.go
   - modules/incomingwebhook/README.md
+  # found by post-implementation adversarial review: cross-module test in
+  # bot_api mounts the same create() handler and asserted the old prefix
+  - modules/bot_api/incoming_webhook_test.go
