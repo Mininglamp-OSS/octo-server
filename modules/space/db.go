@@ -168,15 +168,23 @@ func (d *DB) queryMembers(spaceId string, loginUID string, page uint64, limit ui
 }
 
 func (d *DB) searchMembers(spaceId, keyword string, pageIndex, pageSize int) ([]*memberSearchModel, error) {
+	// name 兜底链（issue #344 / #434）：与 queryMembers 对齐，u.name 为空时回退
+	// user_verification.real_name，映射层（memberSearchModel.DisplayName）再给稳定
+	// 占位符。uv JOIN 显式 COLLATE utf8mb4_general_ci：user_verification 被 compat-repair
+	// 强制转成 general_ci，而 space_member 只继承库默认；非规范 collation 部署下二者
+	// 直接比较会触发 Illegal mix of collations (1267)（见 #482），这里固定 general_ci
+	// 保证搜索路径不引入同一 500 风险。
 	builder := d.session.Select(
 		"sm.*",
 		"IFNULL(u.name,'') as name",
+		"IFNULL(uv.real_name,'') as real_name",
 		"IFNULL(u.username,'') as username",
 		"IFNULL(u.email,'') as email",
 		"IFNULL(u.phone,'') as phone",
 		"CASE WHEN r.robot_id IS NOT NULL AND r.status=1 THEN 1 ELSE 0 END as robot",
 	).From(dbr.I("space_member").As("sm")).
 		LeftJoin(dbr.I("user").As("u"), "u.uid=sm.uid").
+		LeftJoin(dbr.I("user_verification").As("uv"), "uv.user_id=sm.uid COLLATE utf8mb4_general_ci").
 		LeftJoin(dbr.I("robot").As("r"), "r.robot_id=sm.uid").
 		Where("sm.space_id=? AND sm.status=1", spaceId)
 	if keyword != "" {
@@ -195,9 +203,13 @@ func (d *DB) searchMembers(spaceId, keyword string, pageIndex, pageSize int) ([]
 }
 
 func (d *DB) countSearchMembers(spaceId, keyword string) (int64, error) {
+	// list / count 共用 memberSearchActiveWhere（含 uv.real_name），故 count 侧也要挂
+	// 同一 uv JOIN，否则关键字命中 real_name 时两侧口径漂移导致分页错位 / 计数不符。
+	// COLLATE 理由同 searchMembers。
 	builder := d.session.Select("COUNT(*)").
 		From(dbr.I("space_member").As("sm")).
 		LeftJoin(dbr.I("user").As("u"), "u.uid=sm.uid").
+		LeftJoin(dbr.I("user_verification").As("uv"), "uv.user_id=sm.uid COLLATE utf8mb4_general_ci").
 		Where("sm.space_id=? AND sm.status=1", spaceId)
 	if keyword != "" {
 		clause, args := memberSearchActiveWhere(keyword)

@@ -69,8 +69,10 @@ func (s *Space) searchMembers(c *wkhttp.Context) {
 	resps := make([]memberSearchResp, 0, len(members))
 	for _, m := range members {
 		resps = append(resps, memberSearchResp{
-			UID:       m.UID,
-			Name:      m.Name,
+			UID: m.UID,
+			// name 兜底链（issue #344 / #434）：空 user.name 回退 real_name，
+			// 再回退稳定占位符，与成员列表口径一致，避免搜索结果展示空名。
+			Name:      m.DisplayName(),
 			Username:  m.Username,
 			Email:     m.Email,
 			Phone:     maskPhone(m.Phone),
