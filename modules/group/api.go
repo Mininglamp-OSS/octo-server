@@ -718,14 +718,17 @@ func (g *Group) avatarUpload(c *wkhttp.Context) {
 	}
 	defer file.Close()
 
-	isCreator, err := g.db.QueryIsGroupCreator(groupNo, loginUID)
+	// 群头像上传与群名 / 设置 / 群公告(GROUP.md)一致，放行给创建者或管理员
+	// (octo-server#520)。QueryIsGroupManagerOrCreator 额外要求 is_external=0 且
+	// status=normal，因此非正常态的创建者(外部/黑名单)会被拒绝——本就不应执行该操作。
+	isCreatorOrManager, err := g.db.QueryIsGroupManagerOrCreator(groupNo, loginUID)
 	if err != nil {
-		g.Error("查询群创建者失败！", zap.Error(err))
+		g.Error("查询群管理者或创建者失败！", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 		return
 	}
-	if !isCreator {
-		httperr.ResponseErrorL(c, errcode.ErrGroupCreatorOnly, nil, nil)
+	if !isCreatorOrManager {
+		httperr.ResponseErrorL(c, errcode.ErrGroupCreatorOrManagerOnly, nil, nil)
 		return
 	}
 
@@ -1176,7 +1179,9 @@ func (g *Group) groupUpdate(c *wkhttp.Context) {
 			return
 		}
 		if !isManager {
-			httperr.ResponseErrorL(c, errcode.ErrGroupManagerOnly, nil, nil)
+			// 决策用 QueryIsGroupManagerOrCreator(创建者或管理员均可)，错误码需与之一致，
+			// 而非只提管理员的 ErrGroupManagerOnly (octo-server#520)。
+			httperr.ResponseErrorL(c, errcode.ErrGroupCreatorOrManagerOnly, nil, nil)
 			return
 		}
 	} else {

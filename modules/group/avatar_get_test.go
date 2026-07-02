@@ -213,7 +213,7 @@ func TestGroupAvatarGetCustomTextNotTruncated(t *testing.T) {
 	require.NotEqual(t, truncated, w.Body.Bytes(), "custom text must NOT be GroupNameText-truncated to 2")
 }
 
-// TestGroupAvatarGetUploadedRedirects 覆盖群主已上传自定义头像（is_upload_avatar=1）
+// TestGroupAvatarGetUploadedRedirects 覆盖群主/管理员已上传自定义头像（is_upload_avatar=1）
 // → 维持历史行为：重定向到对象存储，不进服务端渲染。
 func TestGroupAvatarGetUploadedRedirects(t *testing.T) {
 	s, ctx := newTestServer(t)

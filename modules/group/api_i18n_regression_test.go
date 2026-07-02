@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
@@ -298,4 +299,90 @@ func TestGroupAvatarUpload_PostCommitNotifyFailureRespondsOK(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code, "post-commit notify failure should not fail committed upload, body=%s", w.Body.String())
 	assert.Contains(t, w.Body.String(), `"status":200`)
 	assert.NotEmpty(t, mockFS.uploadedPath)
+}
+
+// newAvatarUploadServer wires a group with `testutil.UID` as a member of the
+// given role and returns a router serving only avatarUpload plus the mock file
+// service. Role/status/isExternal let a caller reproduce the admin, non-member
+// and abnormal-owner permission boundaries around octo-server#520.
+func newAvatarUploadServer(t *testing.T, groupNo, creator string, role, status, isExternal int) (http.Handler, *mockAvatarUploadFileService) {
+	t.Helper()
+	_, ctx := newTestServer(t)
+	assert.NoError(t, testutil.CleanAllTables(ctx))
+
+	f := New(ctx)
+	mockFS := &mockAvatarUploadFileService{}
+	f.fileService = mockFS
+
+	assert.NoError(t, f.userDB.Insert(&user.Model{UID: testutil.UID, Name: "uploader", ShortNo: "up_" + groupNo}))
+	assert.NoError(t, f.db.Insert(&Model{
+		GroupNo: groupNo,
+		Name:    "avatar perm",
+		Creator: creator,
+		Status:  GroupStatusNormal,
+		Version: 1,
+	}))
+	// role < 0 means "not a member" — skip the group_member row entirely.
+	if role >= 0 {
+		assert.NoError(t, f.db.InsertMember(&MemberModel{
+			GroupNo:    groupNo,
+			UID:        testutil.UID,
+			Role:       role,
+			Status:     status,
+			IsExternal: isExternal,
+			Version:    1,
+			Vercode:    groupNo + "@1",
+		}))
+	}
+
+	r := wkhttp.New()
+	r.POST("/v1/groups/:group_no/avatar", ctx.AuthMiddleware(r), f.avatarUpload)
+	return r, mockFS
+}
+
+// postAvatar builds a valid multipart body carrying a "file" field and issues
+// the upload as testutil.UID.
+func postAvatar(t *testing.T, handler http.Handler, groupNo string) *httptest.ResponseRecorder {
+	t.Helper()
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fw, err := mw.CreateFormFile("file", "avatar.png")
+	assert.NoError(t, err)
+	_, err = fw.Write([]byte("png"))
+	assert.NoError(t, err)
+	assert.NoError(t, mw.Close())
+
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("POST", "/v1/groups/"+groupNo+"/avatar", &buf)
+	assert.NoError(t, err)
+	req.Header.Set("token", testutil.Token)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	handler.ServeHTTP(w, req)
+	return w
+}
+
+// TestGroupAvatarUpload_AdminSucceeds pins the octo-server#520 fix: a group
+// admin (role=manager, normal/internal) may upload the group avatar, aligning
+// avatar upload with group name / settings / notice. Before the fix the
+// QueryIsGroupCreator gate returned 403 for anyone but the owner.
+func TestGroupAvatarUpload_AdminSucceeds(t *testing.T) {
+	handler, mockFS := newAvatarUploadServer(t, "g-avatar-admin", "other-owner", MemberRoleManager, int(common.GroupMemberStatusNormal), 0)
+
+	w := postAvatar(t, handler, "g-avatar-admin")
+	assert.Equal(t, http.StatusOK, w.Code, "群管理员上传头像应成功, body=%s", w.Body.String())
+	assert.Contains(t, w.Body.String(), `"status":200`)
+	assert.NotEmpty(t, mockFS.uploadedPath, "成功路径应真正上传对象")
+}
+
+// TestGroupAvatarUpload_NonManagerForbidden pins that a regular member (neither
+// owner nor admin) still gets 403, now surfaced with the aligned
+// creator_or_manager_only error ID rather than the old creator_only.
+func TestGroupAvatarUpload_NonManagerForbidden(t *testing.T) {
+	handler, mockFS := newAvatarUploadServer(t, "g-avatar-common", "other-owner", MemberRoleCommon, int(common.GroupMemberStatusNormal), 0)
+
+	w := postAvatar(t, handler, "g-avatar-common")
+	assert.Equal(t, http.StatusBadRequest, w.Code, "wire status 固定 400, body=%s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "err.server.group.creator_or_manager_only",
+		"普通成员上传头像应是 403 creator_or_manager_only, body=%s", w.Body.String())
+	assert.Empty(t, mockFS.uploadedPath, "被拒绝时不应上传任何对象")
 }

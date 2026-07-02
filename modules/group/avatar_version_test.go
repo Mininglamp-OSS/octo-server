@@ -7,7 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestGroupAvatarVersionDBRoundTrip 覆盖群主手动上传头像的落库路径：
+// TestGroupAvatarVersionDBRoundTrip 覆盖群主/管理员手动上传头像的落库路径：
 // updateAvatar 必须写入版本化对象 path、版本号，并把 is_upload_avatar 置 1
 // （后者是阻止旧的自动合成事件覆盖手动头像的关键标志）。QueryWithGroupNo
 // 读回这些字段，avatarGet 据此选择 versioned/legacy path。
@@ -31,7 +31,7 @@ func TestGroupAvatarVersionDBRoundTrip(t *testing.T) {
 	require.Equal(t, 0, before.IsUploadAvatar)
 	require.Equal(t, int64(0), before.AvatarVersion)
 
-	// 群主手动上传：写版本化 path + 版本号 + is_upload_avatar=1。
+	// 群主/管理员手动上传：写版本化 path + 版本号 + is_upload_avatar=1。
 	const version int64 = 1733300000000000002
 	avatarPath := ctx.GetConfig().GetGroupAvatarFilePath(groupNo, version)
 	require.NoError(t, g.db.updateAvatar(avatarPath, version, groupNo))
