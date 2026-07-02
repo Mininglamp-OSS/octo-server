@@ -150,17 +150,22 @@ func (d *DB) queryMembers(spaceId string, loginUID string, page uint64, limit ui
 	// 这里只多挂一个只读 LEFT JOIN uv；Space + bot 归属过滤（WHERE 子句）保持不变，
 	// 不放宽任何隔离边界。禁止用 short_no / username 兜底（privacy-gated）。
 	//
-	// Defense-in-depth collation (issue #482): the uv JOIN pins utf8mb4_general_ci
-	// so it survives on deployments where space_member inherited utf8mb4_0900_ai_ci
-	// (MySQL 8 default) and the compat-repair migration hasn't run yet.
+	// Collation robustness (issue #482): space_member.uid, user.uid and
+	// robot.robot_id inherit the DB-default collation, while user_verification
+	// was force-converted to utf8mb4_general_ci by the OSS compat-repair
+	// migration (20260512). On a MySQL-8 utf8mb4_0900_ai_ci-default deployment
+	// every one of these sm.uid JOINs becomes a cross-collation comparison that
+	// raises Error 1267 → the member list 500s. We pin COLLATE utf8mb4_general_ci
+	// on each sm.uid-keyed JOIN so the query is collation-independent and does
+	// not depend on any implicit "DB default == general_ci" assumption.
 	_, err := d.session.SelectBySql(`
 		SELECT sm.*, IFNULL(u.name,'') as name,
 			IFNULL(uv.real_name,'') as real_name,
 			CASE WHEN r.robot_id IS NOT NULL AND r.status=1 THEN 1 ELSE 0 END as robot
 		FROM space_member sm
-		LEFT JOIN user u ON u.uid=sm.uid
+		LEFT JOIN user u ON u.uid=sm.uid COLLATE utf8mb4_general_ci
 		LEFT JOIN user_verification uv ON uv.user_id=sm.uid COLLATE utf8mb4_general_ci
-		LEFT JOIN robot r ON r.robot_id=sm.uid
+		LEFT JOIN robot r ON r.robot_id=sm.uid COLLATE utf8mb4_general_ci
 		WHERE sm.space_id=? AND sm.status=1 AND (
 			r.robot_id IS NULL
 			OR r.creator_uid = ?
@@ -180,8 +185,9 @@ func (d *DB) searchMembers(spaceId, keyword string, pageIndex, pageSize int) ([]
 		"IFNULL(u.phone,'') as phone",
 		"CASE WHEN r.robot_id IS NOT NULL AND r.status=1 THEN 1 ELSE 0 END as robot",
 	).From(dbr.I("space_member").As("sm")).
-		LeftJoin(dbr.I("user").As("u"), "u.uid=sm.uid").
-		LeftJoin(dbr.I("robot").As("r"), "r.robot_id=sm.uid").
+		// Collation pin (issue #482): keep sm.uid JOINs collation-independent, see queryMembers.
+		LeftJoin(dbr.I("user").As("u"), "u.uid=sm.uid COLLATE utf8mb4_general_ci").
+		LeftJoin(dbr.I("robot").As("r"), "r.robot_id=sm.uid COLLATE utf8mb4_general_ci").
 		Where("sm.space_id=? AND sm.status=1", spaceId)
 	if keyword != "" {
 		clause, args := memberSearchActiveWhere(keyword)
@@ -201,7 +207,8 @@ func (d *DB) searchMembers(spaceId, keyword string, pageIndex, pageSize int) ([]
 func (d *DB) countSearchMembers(spaceId, keyword string) (int64, error) {
 	builder := d.session.Select("COUNT(*)").
 		From(dbr.I("space_member").As("sm")).
-		LeftJoin(dbr.I("user").As("u"), "u.uid=sm.uid").
+		// Collation pin (issue #482): mirror searchMembers so the COUNT twin stays consistent.
+		LeftJoin(dbr.I("user").As("u"), "u.uid=sm.uid COLLATE utf8mb4_general_ci").
 		Where("sm.space_id=? AND sm.status=1", spaceId)
 	if keyword != "" {
 		clause, args := memberSearchActiveWhere(keyword)
@@ -351,8 +358,8 @@ func (d *DB) querySpaceBots(spaceId string) ([]*BotDetailModel, error) {
 	_, err := d.session.SelectBySql(`
 		SELECT r.robot_id, IFNULL(u.name,'') as name, IFNULL(u.avatar,'') as avatar
 		FROM space_member sm
-		INNER JOIN robot r ON r.robot_id=sm.uid AND r.status=1
-		LEFT JOIN user u ON u.uid=sm.uid
+		INNER JOIN robot r ON r.robot_id=sm.uid COLLATE utf8mb4_general_ci AND r.status=1
+		LEFT JOIN user u ON u.uid=sm.uid COLLATE utf8mb4_general_ci
 		WHERE sm.space_id=? AND sm.status=1
 		ORDER BY sm.created_at ASC
 	`, spaceId).Load(&models)
