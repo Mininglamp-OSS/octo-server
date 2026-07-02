@@ -540,7 +540,7 @@ func (g *Group) avatarGet(c *wkhttp.Context) {
 		return
 	}
 
-	// 群主已上传自定义头像：重定向到版本化对象存储（沿用历史逻辑）。
+	// 已上传自定义头像（群主或管理员上传）：重定向到版本化对象存储（沿用历史逻辑）。
 	if groupInfo.IsUploadAvatar == 1 {
 		path := g.ctx.GetConfig().GetGroupAvatarFilePath(groupNo, groupInfo.AvatarVersion)
 		downloadUrl, err := g.fileService.DownloadURL(path, "")
@@ -718,14 +718,17 @@ func (g *Group) avatarUpload(c *wkhttp.Context) {
 	}
 	defer file.Close()
 
-	isCreator, err := g.db.QueryIsGroupCreator(groupNo, loginUID)
+	// 群主与群管理员均可修改群头像，与改群名 / 群设置 / 群公告(GROUP.md)的权限档位
+	// 对齐(#520)。注意 QueryIsGroupManagerOrCreator 额外要求 is_external=0 且
+	// status=normal，故异常状态(外部/非正常)的群主会被拒——这是有意的(异常状态本不应操作)。
+	isManagerOrCreator, err := g.db.QueryIsGroupManagerOrCreator(groupNo, loginUID)
 	if err != nil {
-		g.Error("查询群创建者失败！", zap.Error(err))
+		g.Error("查询群管理员或创建者失败！", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 		return
 	}
-	if !isCreator {
-		httperr.ResponseErrorL(c, errcode.ErrGroupCreatorOnly, nil, nil)
+	if !isManagerOrCreator {
+		httperr.ResponseErrorL(c, errcode.ErrGroupCreatorOrManagerOnly, nil, nil)
 		return
 	}
 
@@ -1163,7 +1166,7 @@ func (g *Group) groupUpdate(c *wkhttp.Context) {
 		return
 	}
 	if !isManager {
-		httperr.ResponseErrorL(c, errcode.ErrGroupManagerOnly, nil, nil)
+		httperr.ResponseErrorL(c, errcode.ErrGroupCreatorOrManagerOnly, nil, nil)
 		return
 	}
 
@@ -2872,7 +2875,7 @@ func (g *Group) memberUpdate(c *wkhttp.Context) {
 	}
 	if !isManager && loginUID != memberUID {
 		g.Error("只有管理员才能修改其他人的成员信息！")
-		httperr.ResponseErrorL(c, errcode.ErrGroupManagerOnly, nil, nil)
+		httperr.ResponseErrorL(c, errcode.ErrGroupCreatorOrManagerOnly, nil, nil)
 		return
 	}
 	memberModel, err := g.db.QueryMemberWithUID(memberUID, groupNo)
@@ -3511,7 +3514,7 @@ func (g *Group) blacklist(c *wkhttp.Context) {
 		return
 	}
 	if !isManager {
-		httperr.ResponseErrorL(c, errcode.ErrGroupManagerOnly, nil, nil)
+		httperr.ResponseErrorL(c, errcode.ErrGroupCreatorOrManagerOnly, nil, nil)
 		return
 	}
 	// #354 · Bot 跟人走：拉黑/解除拉黑级联到目标用户名下在群的 bot
