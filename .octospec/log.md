@@ -18,6 +18,16 @@ change-log convention (§7). Newest first.
   `dm-space-isolation-484` fix (merged in — see the 2026-06-27 entry below), so
   the presence infra is authored once here. Journal:
   `journal/shared/conv-space-catchall-484.md`.
+- **Remove** — Task `incoming-webhook-remove-name-prefix`: dropped the
+  server-enforced `Webhook-` name prefix that was force-prepended to
+  non-admin (member/bot) submitted incoming-webhook display names
+  (originally added anti-impersonation, PR #340 review). Members can now
+  set any name, same as admins. Kept: avatar lock for non-admins, default
+  auto-naming (`Webhook-xxxxxx`) when no name is submitted, and the
+  push-time `Username`/`AvatarURL` override block for non-admin webhooks
+  (separate control, unaffected). Paired frontend change in octo-web
+  removed the now-stale hint text. Brief under
+  `.octospec/tasks/incoming-webhook-remove-name-prefix/`.
 
 ## 2026-06-29
 

@@ -1,0 +1,18 @@
+slug: incoming-webhook-remove-name-prefix
+rules_injected:
+  - id: trust-boundary
+    reason: "modules/incomingwebhook/**/*.go matches inject_when.paths"
+    applied: false
+    note: >
+      Read in full. Rule governs escaping/adapter-parity for externally
+      supplied content; this change is a display-name authorization policy
+      change (which caller can set which name), not a content-escaping
+      change, so no trust-boundary rule item required a code change beyond
+      what's already covered by keeping the avatar lock and push-override
+      block in place.
+files_touched:
+  - modules/incomingwebhook/api.go
+  - modules/incomingwebhook/api_member_test.go
+  - modules/incomingwebhook/api_test.go
+  - modules/incomingwebhook/richtext_test.go
+  - modules/incomingwebhook/README.md

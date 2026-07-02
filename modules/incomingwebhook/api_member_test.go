@@ -12,8 +12,8 @@ import (
 )
 
 // 成员权限模型测试（#member-perms）：
-//   - 任意（内部、正常状态）群成员可创建 webhook：名称可自定义（缺省自动命名
-//     Webhook-xxxxxx），头像仅管理员可设置/修改；
+//   - 任意（内部、正常状态）群成员可创建 webhook：名称可自定义、原样保存（缺省
+//     自动命名 Webhook-xxxxxx），头像仅管理员可设置/修改；
 //   - update/delete/regenerate/deliveries/test：创建者或群管理员；其他成员 403；
 //   - list：任意成员只读可见（token 永不回显）；
 //   - 普通成员受 per-creator 配额约束（管理员豁免，仅受群级配额）；
@@ -97,29 +97,25 @@ func TestMemberCreate_AutoNameWhenOmitted(t *testing.T) {
 	whID, _ := created["webhook_id"].(string)
 	assert.Contains(t, whID, name[len("Webhook-"):])
 
-	// 自定义名称 → 200，落库时强制带 "Webhook-" 前缀（防冒充真实成员/部门）。
+	// 自定义名称 → 200，落库时原样保存，不再强制加 "Webhook-" 前缀。
 	w := do(handler, userReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo),
 		map[string]interface{}{"name": "my ci bot"}, memberAToken))
 	require.Equalf(t, http.StatusOK, w.Code, "named create body: %s", w.Body.String())
-	assert.Equal(t, "Webhook-my ci bot", parseJSON(t, w)["name"])
+	assert.Equal(t, "my ci bot", parseJSON(t, w)["name"])
 
-	// 已带前缀的名称不被二次加前缀（幂等）。
-	w = do(handler, userReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo),
-		map[string]interface{}{"name": "Webhook-already"}, memberAToken))
-	require.Equalf(t, http.StatusOK, w.Code, "prefixed create body: %s", w.Body.String())
-	assert.Equal(t, "Webhook-already", parseJSON(t, w)["name"])
-
-	// 恰好等于裸前缀（无有效内容）视同未填 → 自动命名。
+	// 名称恰好等于自动命名前缀 "Webhook-" 也是合法的字面量名称，原样保存
+	// （不再有"裸前缀视同未填、回落自动命名"的特殊处理）。
 	w = do(handler, userReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo),
 		map[string]interface{}{"name": "Webhook-"}, memberAToken))
-	require.Equalf(t, http.StatusOK, w.Code, "bare-prefix create body: %s", w.Body.String())
-	assert.Regexp(t, autoNameRe, parseJSON(t, w)["name"])
+	require.Equalf(t, http.StatusOK, w.Code, "literal-prefix create body: %s", w.Body.String())
+	assert.Equal(t, "Webhook-", parseJSON(t, w)["name"])
 }
 
 // 成员的 webhook push 时 username/avatar_url 覆盖被忽略（创建者非管理员 →
-// resolveFromIdentity 判权关闭），推送本身仍成功——管理面的前缀/头像限制不可被
-// push 路径绕过（PR #340 review，yujiawei P1）。展示字段的口径由 in-package 的
-// TestResolveFromIdentity 钉住，这里钉 E2E 不拒绝（覆盖被静默忽略而非 4xx）。
+// resolveFromIdentity 判权关闭），推送本身仍成功——管理面已配置的 Name/Avatar
+// 不可被 push 路径绕过（PR #340 review，yujiawei P1）。展示字段的口径由
+// in-package 的 TestResolveFromIdentity 钉住，这里钉 E2E 不拒绝（覆盖被静默
+// 忽略而非 4xx）。
 func TestPush_MemberWebhookOverrideSilentlyIgnored(t *testing.T) {
 	handler, _, groupNo := setupMemberEnv(t)
 	created := memberCreate(t, handler, groupNo)
@@ -236,7 +232,7 @@ func TestMemberUpdate_NameAllowedAvatarRejected(t *testing.T) {
 
 	w := do(handler, userReq("PUT", base, map[string]interface{}{"name": "deploy-bot"}, memberAToken))
 	require.Equalf(t, http.StatusOK, w.Code, "rename body: %s", w.Body.String())
-	assert.Equal(t, "Webhook-deploy-bot", parseJSON(t, w)["name"])
+	assert.Equal(t, "deploy-bot", parseJSON(t, w)["name"])
 
 	w = do(handler, userReq("PUT", base, map[string]interface{}{"avatar": "https://x/y.png"}, memberAToken))
 	assert.Equalf(t, http.StatusBadRequest, w.Code, "avatar body: %s", w.Body.String())

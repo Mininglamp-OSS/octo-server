@@ -384,20 +384,10 @@ func generateWebhookID() string {
 	return webhookIDPrefix + hex.EncodeToString(buf)
 }
 
-// memberWebhookNamePrefix 是非管理员（成员/bot）所设 webhook 展示名的强制前缀：
-// 成员可以自定义名称，但名称必须以 "Webhook-" 开头（缺省自动命名本就是该形态），
-// 防止成员把 webhook 命名成"HR 公告"或他人姓名冒充真实发送者（PR #340 review，
-// yujiawei P2）。管理员命名不受限（历史行为，管理员本就可信）。
-const memberWebhookNamePrefix = "Webhook-"
-
-// prefixedWebhookName 给非管理员提交的名称补强制前缀；已带前缀则原样返回（幂等，
-// 避免成员保存自己 webhook 时被二次加前缀）。
-func prefixedWebhookName(name string) string {
-	if strings.HasPrefix(name, memberWebhookNamePrefix) {
-		return name
-	}
-	return memberWebhookNamePrefix + name
-}
+// autoWebhookNamePrefix 是创建时未提供名称时，服务端自动生成的默认展示名前缀
+// （形如 "Webhook-xxxxxx"）。仅用于默认命名；成员/bot 自定义名称不再被强制加此
+// 前缀（历史上曾强制加前缀防冒充，PR #340 review yujiawei P2，产品决定移除）。
+const autoWebhookNamePrefix = "Webhook-"
 
 // autoWebhookName 在创建时未提供名称的情况下生成服务端默认名：
 // 前缀 + webhook_id 随机段前 6 位 hex。确定性、可与 webhook_id 对账，
@@ -407,7 +397,7 @@ func autoWebhookName(webhookID string) string {
 	if len(suffix) > 6 {
 		suffix = suffix[:6]
 	}
-	return memberWebhookNamePrefix + suffix
+	return autoWebhookNamePrefix + suffix
 }
 
 func toResp(m *incomingWebhookModel) webhookResp {
@@ -694,15 +684,8 @@ func (w *IncomingWebhook) create(c *wkhttp.Context) {
 		return
 	}
 	req.Name = strings.TrimSpace(req.Name)
-	// 成员/bot 自定义名称强制带 "Webhook-" 前缀（先补前缀再做长度校验，上限对
-	// 最终落库值生效）；管理员命名不受限。恰好等于裸前缀（无有效内容）视同未填，
-	// 走下方的自动命名（PR #340 review，yujiawei P2#9）。
-	if !actor.isAdmin && req.Name != "" {
-		req.Name = prefixedWebhookName(req.Name)
-		if req.Name == memberWebhookNamePrefix {
-			req.Name = ""
-		}
-	}
+	// 成员/bot 可自定义名称，与管理员同口径，不再强制前缀（产品决定移除
+	// PR #340 引入的 "Webhook-" 强制前缀）。
 	if len(req.Name) > 64 {
 		mgmtRequestInvalid(c, "name")
 		return
@@ -903,16 +886,7 @@ func (w *IncomingWebhook) update(c *wkhttp.Context) {
 			mgmtRequestInvalid(c, "name")
 			return
 		}
-		// 与 create 同口径：成员/bot 改名强制带前缀（幂等），长度校验对最终值生效；
-		// 裸前缀（无有效内容）按空名拒绝——update 没有自动命名回退（既有名字是已
-		// 确立的身份，静默换成自动名会让调用方意外）。
-		if !actor.isAdmin {
-			name = prefixedWebhookName(name)
-			if name == memberWebhookNamePrefix {
-				mgmtRequestInvalid(c, "name")
-				return
-			}
-		}
+		// 与 create 同口径：成员/bot 改名不再强制带前缀，长度校验对最终值生效。
 		if len(name) > 64 {
 			mgmtRequestInvalid(c, "name")
 			return
@@ -1638,10 +1612,10 @@ func buildPayload(m *incomingWebhookModel, req *pushPayloadReq, allowOverride bo
 //   - true（管理员创建/持有）：覆盖优先，否则回落到 webhook 自身配置——历史的
 //     Slack/GitHub 兼容行为，管理员可信；
 //   - false（成员/bot 的 webhook）：覆盖一律【忽略】，固定用存量 Name/Avatar。
-//     没有这道闸，管理面的 Webhook- 前缀与头像锁就会被 push 路径整体绕过——成员拿着
-//     自己 webhook 的 token 即可以"HR 公告"+任意头像发声（PR #340 review，yujiawei
-//     P1：don't ship a half-control）。存量 Name 必然已带前缀（create/update 强制），
-//     无需在此重复加工。
+//     没有这道闸，管理面的头像锁（及 create/update 走鉴权、留存修改记录的 Name）
+//     就会被 push 路径整体绕过——成员拿着自己 webhook 的 token 即可在每次推送时
+//     临时冒充任意名称/头像，而不必经过有身份校验、留痕的管理端点（PR #340
+//     review，yujiawei P1：don't ship a half-control）。
 //
 // 两者都裁剪到与 create 侧一致的字节上限，防止 push 路径成为绕过列长度约束的旁路。
 // 文本与富文本两条路径共用此函数，保证 from.* 渲染口径一致。

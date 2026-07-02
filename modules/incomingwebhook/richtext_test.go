@@ -171,8 +171,8 @@ func TestBuildRichTextPayload_UnknownBlockDropsExtraFields(t *testing.T) {
 }
 
 // resolveFromIdentity：管理员（allowOverride=true）覆盖优先、回落 webhook 配置、
-// 超长裁剪到字节上限；成员/bot（allowOverride=false）覆盖一律忽略——否则管理面的
-// Webhook- 前缀与头像锁会被 push 路径整体绕过（PR #340 review，yujiawei P1）。
+// 超长裁剪到字节上限；成员/bot（allowOverride=false）覆盖一律忽略——否则管理面已
+// 配置的 Name/Avatar 会被 push 路径整体绕过（PR #340 review，yujiawei P1）。
 func TestResolveFromIdentity(t *testing.T) {
 	m := &incomingWebhookModel{Name: "WH", Avatar: "https://a/x.png"}
 
@@ -187,10 +187,10 @@ func TestResolveFromIdentity(t *testing.T) {
 	name, _ = resolveFromIdentity(m, &pushPayloadReq{Username: longName}, true)
 	assert.LessOrEqual(t, len(name), maxFromNameBytes)
 
-	// 成员/bot 的 webhook：覆盖被忽略，展示固定为存量（已带前缀的）配置。
+	// 成员/bot 的 webhook：覆盖被忽略，展示固定为存量配置（任意名称，不要求带前缀）。
 	spoof := &pushPayloadReq{Username: "HR 公告", AvatarURL: "https://evil/ceo.png"}
-	lockedM := &incomingWebhookModel{Name: "Webhook-abc123", Avatar: ""}
+	lockedM := &incomingWebhookModel{Name: "Deploy Bot", Avatar: ""}
 	name, avatar = resolveFromIdentity(lockedM, spoof, false)
-	assert.Equal(t, "Webhook-abc123", name)
+	assert.Equal(t, "Deploy Bot", name)
 	assert.Equal(t, "", avatar)
 }
