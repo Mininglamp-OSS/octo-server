@@ -888,7 +888,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	// Space 过滤
 	if hasSpaceFilter {
 		// Person 频道：计算 per-Space 未读计数（在过滤之前，需要原始会话数据）
-		fillPersonSpaceUnread(syncUserConversationResps, conversations, filterSpaceID, loginUID, co.ctx)
+		fillPersonSpaceUnread(syncUserConversationResps, conversations, filterSpaceID, defaultSpaceID, loginUID, co.ctx)
 
 		syncUserConversationResps = FilterConversationsBySpace(
 			syncUserConversationResps, filterSpaceID, loginUID, co.ctx, co.groupService,

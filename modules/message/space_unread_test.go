@@ -29,15 +29,15 @@ func TestCountSpaceUnreadFromMessages_Basic(t *testing.T) {
 		makeMessageResp(1, "spaceA"),
 		makeMessageResp(2, "spaceB"),
 		makeMessageResp(3, "spaceA"),
-		makeMessageResp(4, ""),       // 无 space_id
+		makeMessageResp(4, ""), // 无 space_id
 		makeMessageResp(5, "spaceA"),
 	}
 
 	// readSeq=0 → 所有消息都是未读
-	count := countSpaceUnreadFromMessages(messages, "spaceA", 0)
+	count := countSpaceUnreadFromMessages(messages, "spaceA", "", 0)
 	assert.Equal(t, 3, count)
 
-	count = countSpaceUnreadFromMessages(messages, "spaceB", 0)
+	count = countSpaceUnreadFromMessages(messages, "spaceB", "", 0)
 	assert.Equal(t, 1, count)
 }
 
@@ -51,7 +51,7 @@ func TestCountSpaceUnreadFromMessages_ReadSeqFilters(t *testing.T) {
 	}
 
 	// readSeq=3 → 只有 seq 4,5 是未读
-	count := countSpaceUnreadFromMessages(messages, "spaceA", 3)
+	count := countSpaceUnreadFromMessages(messages, "spaceA", "", 3)
 	assert.Equal(t, 2, count)
 }
 
@@ -63,15 +63,15 @@ func TestCountSpaceUnreadFromMessages_NoSpaceID(t *testing.T) {
 		makeMessageResp(3, ""),
 	}
 
-	count := countSpaceUnreadFromMessages(messages, "spaceA", 0)
+	count := countSpaceUnreadFromMessages(messages, "spaceA", "", 0)
 	assert.Equal(t, 0, count)
 }
 
 func TestCountSpaceUnreadFromMessages_EmptyMessages(t *testing.T) {
-	count := countSpaceUnreadFromMessages(nil, "spaceA", 0)
+	count := countSpaceUnreadFromMessages(nil, "spaceA", "", 0)
 	assert.Equal(t, 0, count)
 
-	count = countSpaceUnreadFromMessages([]*config.MessageResp{}, "spaceA", 0)
+	count = countSpaceUnreadFromMessages([]*config.MessageResp{}, "spaceA", "", 0)
 	assert.Equal(t, 0, count)
 }
 
@@ -82,7 +82,7 @@ func TestCountSpaceUnreadFromMessages_InvalidPayload(t *testing.T) {
 		makeMessageResp(3, "spaceA"), // 有效消息
 	}
 
-	count := countSpaceUnreadFromMessages(messages, "spaceA", 0)
+	count := countSpaceUnreadFromMessages(messages, "spaceA", "", 0)
 	assert.Equal(t, 1, count)
 }
 
@@ -93,15 +93,15 @@ func TestCountSpaceUnreadFromMessages_MixedSpaces(t *testing.T) {
 		makeMessageResp(11, "spaceB"),
 		makeMessageResp(12, "spaceA"),
 		makeMessageResp(13, "spaceB"),
-		makeMessageResp(14, ""),       // 无 space_id 的老消息
+		makeMessageResp(14, ""), // 无 space_id 的老消息
 		makeMessageResp(15, "spaceA"),
 	}
 
 	// readSeq=12 → 未读: seq 13(spaceB), 14(none), 15(spaceA)
-	count := countSpaceUnreadFromMessages(messages, "spaceA", 12)
+	count := countSpaceUnreadFromMessages(messages, "spaceA", "", 12)
 	assert.Equal(t, 1, count)
 
-	count = countSpaceUnreadFromMessages(messages, "spaceB", 12)
+	count = countSpaceUnreadFromMessages(messages, "spaceB", "", 12)
 	assert.Equal(t, 1, count)
 }
 
@@ -123,7 +123,7 @@ func TestFillPersonSpaceUnread_OnlyPersonChannels(t *testing.T) {
 		},
 	}
 
-	fillPersonSpaceUnread(convs, rawConvs, "spaceA", "me", nil)
+	fillPersonSpaceUnread(convs, rawConvs, "spaceA", "", "me", nil)
 
 	// Group 不应有 space_unread
 	assert.Nil(t, convs[0].SpaceUnread)
@@ -140,7 +140,7 @@ func TestFillPersonSpaceUnread_ZeroUnread(t *testing.T) {
 		{ChannelID: "user1", ChannelType: common.ChannelTypePerson.Uint8(), Unread: 0, LastMsgSeq: 10},
 	}
 
-	fillPersonSpaceUnread(convs, rawConvs, "spaceA", "me", nil)
+	fillPersonSpaceUnread(convs, rawConvs, "spaceA", "", "me", nil)
 	assert.Nil(t, convs[0].SpaceUnread)
 }
 
@@ -149,7 +149,7 @@ func TestFillPersonSpaceUnread_EmptySpaceID(t *testing.T) {
 		{ChannelID: "user1", ChannelType: common.ChannelTypePerson.Uint8(), Unread: 3},
 	}
 
-	fillPersonSpaceUnread(convs, nil, "", "me", nil)
+	fillPersonSpaceUnread(convs, nil, "", "", "me", nil)
 	assert.Nil(t, convs[0].SpaceUnread)
 }
 
@@ -173,7 +173,7 @@ func TestFillPersonSpaceUnread_RecentsCoversAllUnread(t *testing.T) {
 	}
 
 	// readSeq = 20 - 3 = 17, 未读: seq 18(A), 19(B), 20(A) → spaceA=2
-	fillPersonSpaceUnread(convs, rawConvs, "spaceA", "me", nil)
+	fillPersonSpaceUnread(convs, rawConvs, "spaceA", "", "me", nil)
 	assert.NotNil(t, convs[0].SpaceUnread)
 	assert.Equal(t, 2, *convs[0].SpaceUnread)
 }
@@ -194,7 +194,7 @@ func TestFillPersonSpaceUnread_AllUnreadInDifferentSpace(t *testing.T) {
 	}
 
 	// readSeq = 5 - 2 = 3, 未读 seq 4(B) 5(B) → spaceA=0
-	fillPersonSpaceUnread(convs, rawConvs, "spaceA", "me", nil)
+	fillPersonSpaceUnread(convs, rawConvs, "spaceA", "", "me", nil)
 	assert.NotNil(t, convs[0].SpaceUnread)
 	assert.Equal(t, 0, *convs[0].SpaceUnread)
 }
@@ -206,7 +206,7 @@ func TestFillPersonSpaceUnread_NoRawConversation(t *testing.T) {
 	}
 	rawConvs := []*config.SyncUserConversationResp{}
 
-	fillPersonSpaceUnread(convs, rawConvs, "spaceA", "me", nil)
+	fillPersonSpaceUnread(convs, rawConvs, "spaceA", "", "me", nil)
 	assert.Nil(t, convs[0].SpaceUnread)
 }
 
@@ -218,23 +218,23 @@ func TestFindSpaceLastMessage_Basic(t *testing.T) {
 	}
 
 	// spaceA 的最后一条是 seq=3
-	result := findSpaceLastMessage(recents, "spaceA")
+	result := findSpaceLastMessage(recents, "spaceA", "")
 	assert.NotNil(t, result)
 	assert.Equal(t, uint32(3), result.MessageSeq)
 
 	// spaceB 的最后一条是 seq=2
-	result = findSpaceLastMessage(recents, "spaceB")
+	result = findSpaceLastMessage(recents, "spaceB", "")
 	assert.NotNil(t, result)
 	assert.Equal(t, uint32(2), result.MessageSeq)
 
 	// spaceC 没有消息
-	result = findSpaceLastMessage(recents, "spaceC")
+	result = findSpaceLastMessage(recents, "spaceC", "")
 	assert.Nil(t, result)
 }
 
 func TestFindSpaceLastMessage_EmptyRecents(t *testing.T) {
-	assert.Nil(t, findSpaceLastMessage(nil, "spaceA"))
-	assert.Nil(t, findSpaceLastMessage([]*MsgSyncResp{}, "spaceA"))
+	assert.Nil(t, findSpaceLastMessage(nil, "spaceA", ""))
+	assert.Nil(t, findSpaceLastMessage([]*MsgSyncResp{}, "spaceA", ""))
 }
 
 func TestFindSpaceLastMessage_NilPayload(t *testing.T) {
@@ -242,7 +242,49 @@ func TestFindSpaceLastMessage_NilPayload(t *testing.T) {
 		{MessageSeq: 1, Payload: nil},
 		{MessageSeq: 2, Payload: map[string]interface{}{"content": "no space"}},
 	}
-	assert.Nil(t, findSpaceLastMessage(recents, "spaceA"))
+	assert.Nil(t, findSpaceLastMessage(recents, "spaceA", ""))
+}
+
+// TestFindSpaceLastMessage_DefaultSpaceMatchesUntagged locks the fix: when the
+// queried Space IS the default Space, an untagged DM message (no payload.space_id)
+// counts as a default-Space message, so the preview resolves to it instead of
+// leaking the channel's global-last message from another Space.
+func TestFindSpaceLastMessage_DefaultSpaceMatchesUntagged(t *testing.T) {
+	recents := []*MsgSyncResp{
+		{MessageSeq: 1, Payload: map[string]interface{}{"content": "default-hello"}},              // untagged
+		{MessageSeq: 2, Payload: map[string]interface{}{"content": "1111", "space_id": "spaceB"}}, // non-default, globally-latest
+	}
+
+	// Default-Space query: the untagged message belongs to the default Space.
+	got := findSpaceLastMessage(recents, "spaceDefault", "spaceDefault")
+	assert.NotNil(t, got)
+	assert.Equal(t, uint32(1), got.MessageSeq)
+	assert.Equal(t, "default-hello", got.Payload["content"])
+
+	// Non-default query still returns only its explicitly-tagged message; the
+	// untagged (default) message must NOT leak into a non-default Space.
+	got = findSpaceLastMessage(recents, "spaceB", "spaceDefault")
+	assert.NotNil(t, got)
+	assert.Equal(t, uint32(2), got.MessageSeq)
+
+	// A non-default Space with no tagged message here stays empty.
+	assert.Nil(t, findSpaceLastMessage(recents, "spaceC", "spaceDefault"))
+}
+
+// TestCountSpaceUnread_DefaultSpaceCountsUntagged: the same untagged=default rule
+// applies to per-Space unread counting.
+func TestCountSpaceUnread_DefaultSpaceCountsUntagged(t *testing.T) {
+	messages := []*config.MessageResp{
+		makeMessageResp(1, ""), // untagged → default
+		makeMessageResp(2, "spaceB"),
+		makeMessageResp(3, ""), // untagged → default
+		makeMessageResp(4, "spaceB"),
+	}
+
+	// Default Space counts the two untagged messages (not the spaceB ones).
+	assert.Equal(t, 2, countSpaceUnreadFromMessages(messages, "spaceDefault", "spaceDefault", 0))
+	// Non-default Space counts only its own tagged messages; untagged excluded.
+	assert.Equal(t, 2, countSpaceUnreadFromMessages(messages, "spaceB", "spaceDefault", 0))
 }
 
 func TestFillPersonSpaceUnread_SetsSpaceLastMessage(t *testing.T) {
@@ -258,7 +300,7 @@ func TestFillPersonSpaceUnread_SetsSpaceLastMessage(t *testing.T) {
 		},
 	}
 
-	fillPersonSpaceUnread(convs, nil, "spaceA", "login", nil)
+	fillPersonSpaceUnread(convs, nil, "spaceA", "", "login", nil)
 
 	// SpaceLastMessage 应为 spaceA 的消息 "111"
 	assert.NotNil(t, convs[0].SpaceLastMessage)

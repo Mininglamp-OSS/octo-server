@@ -2,30 +2,27 @@
 
 package message
 
-// Reproduction for the default-Space DM conversation-preview leak observed on
-// the deployed test env (main) via
+// Regression guard for the default-Space DM conversation-preview leak observed
+// on the deployed test env (main) via
 //   POST /v1/conversation/sync?space_id=:space_id
 //
 // Scenario (mirrors the real capture): one physical DM channel whose history is
 //   - an UNTAGGED message  (no payload.space_id → belongs to the DEFAULT space)
 //   - a message TAGGED with a NON-default space (the globally-latest one)
 //
-// Hypothesis under test:
-//   1. Query the NON-default space  → space_last_message is that space's message
-//      (correct — it is explicitly tagged).
-//   2. Query the DEFAULT space      → space_last_message is ABSENT (nil), because
-//      findSpaceLastMessage matches strictly on payload.space_id == filterSpaceID
-//      and the default-space messages are UNTAGGED, so nothing matches. The client
-//      then falls back to recents[last] = the channel's GLOBAL last message, which
-//      is tagged for the OTHER space → the preview leaks a wrong-space message.
+// Behaviour after the fix (fillPersonSpaceUnread/findSpaceLastMessage now take
+// defaultSpaceID and treat an untagged DM message as a default-Space message):
+//   1. Query the NON-default space → space_last_message is that space's message
+//      (explicitly tagged); the untagged default message never leaks in.
+//   2. Query the DEFAULT space     → space_last_message is the untagged default
+//      message (NOT the other space's globally-latest one). Before the fix this
+//      was nil, so the client fell back to recents[last] and leaked a wrong-space
+//      preview.
 //
 // This drives the REAL handler (syncUserConversation) through the registered
 // /v1/conversation route (which mounts spacepkg.SpaceMiddleware, reading
 // ?space_id=). WuKongIM is the shared httptest fake from
-// conversation_recent_filter_e2e_test.go (same package/build tag): it returns
-// our canned conversation for /conversation/sync and {} for /channel/messagesync
-// (so the findSpaceLastMessageFallback path also finds no default-tagged message
-// — same strict-match blind spot, exercised below as a pure-function check).
+// conversation_recent_filter_e2e_test.go (same package/build tag).
 
 import (
 	"encoding/json"
@@ -117,9 +114,9 @@ func findConv(convs []*SyncUserConversationResp, channelID string) *SyncUserConv
 	return nil
 }
 
-// TestRepro_SpaceLastMessage_DefaultSpaceLeak confirms the hypothesis end-to-end
+// TestFix_SpaceLastMessage_DefaultSpaceUsesUntagged verifies the fix end-to-end
 // through POST /v1/conversation/sync?space_id=.
-func TestRepro_SpaceLastMessage_DefaultSpaceLeak(t *testing.T) {
+func TestFix_SpaceLastMessage_DefaultSpaceUsesUntagged(t *testing.T) {
 	const (
 		dmChannel   = "dm-peer-repro"
 		spaceB      = "space-b-repro"       // a non-default space
@@ -153,45 +150,46 @@ func TestRepro_SpaceLastMessage_DefaultSpaceLeak(t *testing.T) {
 		"non-default space: preview is the spaceB-tagged message")
 	assert.Equal(t, spaceB, convB.SpaceLastMessage.Payload["space_id"])
 
-	// ---- (2) DEFAULT space: preview is WRONG (leaks the spaceB message) ----
+	// ---- (2) DEFAULT space: preview is now the untagged default message ----
 	convD := findConv(callConvSyncSpace(t, s, spaceDefaul), dmChannel)
-	require.NotNil(t, convD, "DM is (correctly) visible in the default space via catch-all")
+	require.NotNil(t, convD, "DM is visible in the default space")
 
-	// The bug: no per-space preview could be computed for the default space,
-	// because its messages are UNTAGGED and findSpaceLastMessage matches strictly
-	// on space_id == defaultSpaceID.
-	assert.Nil(t, convD.SpaceLastMessage,
-		"BUG: default-space space_last_message is nil — untagged default messages never match the strict space_id filter")
-
-	// With space_last_message absent, the client falls back to recents[last] =
-	// the channel's global-last message, which belongs to the OTHER space.
-	require.NotEmpty(t, convD.Recents, "recents present")
-	lastRecent := convD.Recents[len(convD.Recents)-1]
-	assert.Equal(t, "1111", lastRecent.Payload["content"],
-		"LEAK: default-space fallback preview is the spaceB message content")
-	assert.Equal(t, spaceB, lastRecent.Payload["space_id"],
-		"LEAK: default-space fallback preview carries the WRONG space_id (spaceB, not the default space)")
+	// Fixed: the untagged message counts as a default-Space message, so the
+	// per-Space preview resolves to it instead of leaking the spaceB message.
+	require.NotNil(t, convD.SpaceLastMessage,
+		"default-space space_last_message is now populated from the untagged default message")
+	assert.Equal(t, "default-space-hello", convD.SpaceLastMessage.Payload["content"],
+		"default-space preview is the untagged (default) message, not the spaceB one")
+	_, hasSpaceID := convD.SpaceLastMessage.Payload["space_id"]
+	assert.False(t, hasSpaceID,
+		"the default-space preview message carries no space_id (it is the untagged one)")
 }
 
-// TestRepro_FindSpaceLastMessage_StrictMatchBlindSpot isolates the root cause:
-// findSpaceLastMessage / the fallback both match strictly on payload.space_id ==
-// spaceID, so for the DEFAULT space (whose DM messages are UNTAGGED) they return
-// nil even when the default-space message IS in the scanned set. This is why the
-// 200-message fallback in findSpaceLastMessageFallback cannot rescue it either.
-func TestRepro_FindSpaceLastMessage_StrictMatchBlindSpot(t *testing.T) {
-	const spaceB = "space-b-repro"
+// TestFix_FindSpaceLastMessage_DefaultMatchesUntagged pins the root-cause fix at
+// the helper level: findSpaceLastMessage now takes defaultSpaceID and treats an
+// untagged DM message as a default-Space message (the same predicate the 200-msg
+// fallback uses), while non-default queries stay strict.
+func TestFix_FindSpaceLastMessage_DefaultMatchesUntagged(t *testing.T) {
+	const (
+		spaceB       = "space-b-repro"
+		spaceDefault = "space-default-repro"
+	)
 	recents := []*MsgSyncResp{
 		{MessageSeq: 11, Payload: map[string]interface{}{"type": float64(1), "content": "default-space-hello"}}, // UNTAGGED
 		{MessageSeq: 12, Payload: map[string]interface{}{"type": float64(1), "content": "1111", "space_id": spaceB}},
 	}
 
-	// Non-default space: the tagged message is found.
-	got := findSpaceLastMessage(recents, spaceB)
+	// Non-default space: the tagged message is found; the untagged one never leaks.
+	got := findSpaceLastMessage(recents, spaceB, spaceDefault)
 	require.NotNil(t, got)
 	assert.Equal(t, uint32(12), got.MessageSeq)
 
-	// Default space: the untagged default message exists in the set but is NOT
-	// matched (no space_id key) → nil. Same strict predicate the fallback uses.
-	assert.Nil(t, findSpaceLastMessage(recents, "space-default-repro"),
-		"strict space_id match cannot find the untagged default-space message")
+	// Default space: the untagged default message is now matched (was nil before).
+	got = findSpaceLastMessage(recents, spaceDefault, spaceDefault)
+	require.NotNil(t, got, "untagged default-space message is now resolved")
+	assert.Equal(t, uint32(11), got.MessageSeq)
+
+	// Guard: with no default configured (defaultSpaceID==""), the untagged=default
+	// convention is off and a non-default query stays strict.
+	assert.Nil(t, findSpaceLastMessage(recents, spaceDefault, ""))
 }
