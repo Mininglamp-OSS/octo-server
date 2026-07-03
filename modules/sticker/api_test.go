@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 
@@ -156,7 +157,7 @@ func TestSticker_ListEmpty(t *testing.T) {
 }
 
 func TestSticker_AddAndList(t *testing.T) {
-	route, _, _ := setupSticker(t)
+	route, _, f := setupSticker(t)
 
 	add := doRequest(t, route, "POST", "/v1/sticker/user", map[string]string{
 		"path":        validStickerPath("abc.png"),
@@ -176,7 +177,12 @@ func TestSticker_AddAndList(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, 1, len(list))
 	item := list[0].(map[string]interface{})
-	assert.Equal(t, validStickerPath("abc.png"), item["path"])
+	// path is normalized to a client-renderable URL (same transform the handler
+	// applies), never the raw auth-gated file/preview/ key.
+	wantPath := f.renderablePath(validStickerPath("abc.png"))
+	assert.Equal(t, wantPath, item["path"])
+	assert.False(t, strings.HasPrefix(item["path"].(string), "file/preview/"),
+		"list path must be a renderable URL, not the auth-gated preview key")
 	assert.Equal(t, "user", item["category"])
 	assert.Equal(t, "[笑]", item["placeholder"])
 }
@@ -196,7 +202,12 @@ func TestSticker_CollectForeignPathIdempotent(t *testing.T) {
 	require.Equal(t, http.StatusOK, first.Code, "body: %s", first.Body.String())
 	firstBody := parseJSON(t, first)
 	firstID := firstBody["sticker_id"].(string)
-	assert.Equal(t, sourcePath, firstBody["path"])
+	// Collect stores the bare object key; the response path is the normalized
+	// renderable URL (never the auth-gated file/preview/ key the client sent).
+	sourceKey := "sticker/source-uid/foreign.png"
+	assert.Equal(t, f.renderablePath(sourceKey), firstBody["path"])
+	assert.False(t, strings.HasPrefix(firstBody["path"].(string), "file/preview/"),
+		"collect path must be a renderable URL, not the auth-gated preview key")
 	assert.Equal(t, "png", firstBody["format"])
 	assert.Equal(t, "[收藏]", firstBody["placeholder"])
 	assert.Equal(t, "fav_one", firstBody["shortcode"])
@@ -216,7 +227,8 @@ func TestSticker_CollectForeignPathIdempotent(t *testing.T) {
 	stickers, err := f.db.listByUID(testutil.UID)
 	require.NoError(t, err)
 	require.Len(t, stickers, 1)
-	assert.Equal(t, sourcePath, stickers[0].Path)
+	assert.Equal(t, sourceKey, stickers[0].Path, "collect stores the bare object key, not the preview path")
+	assert.Equal(t, sourceKey, stickers[0].SourcePath)
 	assert.NotEmpty(t, stickers[0].SourcePathHash)
 }
 
