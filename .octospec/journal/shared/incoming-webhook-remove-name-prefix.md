@@ -130,8 +130,20 @@ A subsequent bot re-review (OctoBoooot, delta `0c973ef9`→`40ddac1`)
 confirmed `api.go` is byte-identical to what was already reviewed and
 reframed yujiawei's two 🟡 notes as pre-existing/out-of-scope for this
 PR, not regressions it introduces — no further action triggered.
-alone per the user's instruction to only act on reviewer-raised code
-issues, not CI/governance gates.
+
+## Review follow-up 4 (GitHub PR #526, automated review — Octo-Q)
+Full re-review at head `aebce7f5` (after the README fix above), verdict
+APPROVED, one remaining Nit: the just-added README wording still hedged
+with "通常" (avatar is "usually" the member-path default) where the
+actual invariant is unconditional — whatever `m.Avatar` is stored at
+create/update time (default or admin-set custom URL) is what push
+renders, full stop. Trimmed the hedge: reworded to state the invariant
+directly for both cases instead of qualifying one as the common case.
+
+Reviews at heads `40ddac1`→`aebce7f5` (OctoBoooot) and `0c973ef9`→
+`aebce7f5` (Jerry-Xin) both re-confirmed via blob comparison that no
+`.go` production file changed since round 1 — no further code action
+from either.
 
 ## Learning
 When a handler is mounted by more than one module (here: incomingwebhook
