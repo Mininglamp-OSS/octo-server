@@ -1,7 +1,10 @@
 package sticker
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"net/url"
 	"regexp"
 	"strings"
 
@@ -24,7 +27,12 @@ type StickerModel struct {
 	Sort        int
 	Shortcode   string
 	Keywords    string
-	Status      int
+	SourcePath  string
+	// SourcePathHash is set only for "collect from message" records. Direct
+	// upload registrations keep it empty so the collect-only unique key does not
+	// affect existing custom-sticker creation.
+	SourcePathHash string
+	Status         int
 	db.BaseModel
 }
 
@@ -159,6 +167,63 @@ func validateStickerPath(path, loginUID, format string) bool {
 	return ext == format && isAllowedStickerFormat(ext)
 }
 
+type collectStickerSource struct {
+	SourceKey   string
+	DisplayPath string
+	Format      string
+}
+
+var (
+	stickerSourceObjectKeyExactRe = regexp.MustCompile(`^sticker/([^/]+)/([^/]+)\.([A-Za-z0-9]+)$`)
+	stickerSourceObjectKeyTailRe  = regexp.MustCompile(`(?:^|/)sticker/([^/]+)/([^/]+)\.([A-Za-z0-9]+)$`)
+)
+
+func parseCollectStickerSourcePath(raw string) (collectStickerSource, bool) {
+	pathValue := strings.TrimSpace(raw)
+	if pathValue == "" {
+		return collectStickerSource{}, false
+	}
+	if i := strings.IndexAny(pathValue, "?#"); i >= 0 {
+		pathValue = pathValue[:i]
+	}
+
+	candidate := pathValue
+	if u, err := url.Parse(pathValue); err == nil && u.Scheme != "" && u.Host != "" {
+		candidate = u.Path
+	}
+	candidate = strings.TrimPrefix(candidate, "/")
+
+	if strings.HasPrefix(candidate, "file/preview/") {
+		return parseCollectStickerObjectKey(strings.TrimPrefix(candidate, "file/preview/"), stickerSourceObjectKeyExactRe)
+	}
+	if strings.HasPrefix(candidate, "sticker/") {
+		return parseCollectStickerObjectKey(candidate, stickerSourceObjectKeyExactRe)
+	}
+	return parseCollectStickerObjectKey(candidate, stickerSourceObjectKeyTailRe)
+}
+
+func parseCollectStickerObjectKey(candidate string, re *regexp.Regexp) (collectStickerSource, bool) {
+	m := re.FindStringSubmatch(candidate)
+	if m == nil {
+		return collectStickerSource{}, false
+	}
+	format := normalizeStickerFormat(m[3])
+	if !isAllowedStickerFormat(format) {
+		return collectStickerSource{}, false
+	}
+	sourceKey := "sticker/" + m[1] + "/" + m[2] + "." + m[3]
+	return collectStickerSource{
+		SourceKey:   sourceKey,
+		DisplayPath: "file/preview/" + sourceKey,
+		Format:      format,
+	}, true
+}
+
+func stickerSourcePathHash(sourceKey string) string {
+	sum := sha256.Sum256([]byte(sourceKey))
+	return hex.EncodeToString(sum[:])
+}
+
 // ---------- Request ----------
 
 type addStickerReq struct {
@@ -177,6 +242,14 @@ type addStickerReq struct {
 	// always rejected; a missing handle is rejected only when the policy is on. See
 	// classifyStickerPath.
 	Handle string `json:"handle"`
+}
+
+type collectStickerReq struct {
+	Path        string   `json:"path"`
+	Placeholder string   `json:"placeholder"`
+	Sort        int      `json:"sort"`
+	Shortcode   string   `json:"shortcode"`
+	Keywords    []string `json:"keywords"`
 }
 
 type updateStickerReq struct {

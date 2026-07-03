@@ -43,6 +43,7 @@ import (
 // oversized value gets a clean 400 instead of a DB truncation/error.
 const (
 	maxStickerPathLen        = 512
+	maxStickerCollectPathLen = 2048
 	maxStickerPlaceholderLen = 100
 	// defaultStickerPlaceholder is stored when the client sends no placeholder,
 	// so conversation digests / push notifications have a sensible fallback.
@@ -98,6 +99,7 @@ func (s *Sticker) Route(r *wkhttp.WKHttp) {
 	{
 		auth.GET("/user", s.list)
 		auth.POST("/user", s.add)
+		auth.POST("/user/collect", s.collect)
 		auth.PUT("/user/:sticker_id", s.update)
 		auth.DELETE("/user/:sticker_id", s.delete)
 	}
@@ -327,6 +329,154 @@ func (s *Sticker) add(ctx *wkhttp.Context) {
 		zap.String("uid", loginUID),
 		zap.String("format", format),
 		zap.Bool("handle_required", stickersig.Enabled()),
+		zap.Bool("shortcode_set", shortcode != ""),
+		zap.Int("keyword_count", len(decodeStickerKeywords(keywordsStore))))
+	ctx.Response(toStickerResp(m))
+}
+
+// collect adds a sticker sent by another user into the caller's personal
+// sticker list. Unlike add(), the source path is not required to belong to the
+// caller; it must still point at the reserved sticker object keyspace. The
+// stored path is a stable authenticated preview URL for that source object, and
+// SourcePathHash makes repeat taps idempotent without charging quota again.
+func (s *Sticker) collect(ctx *wkhttp.Context) {
+	loginUID := ctx.GetLoginUID()
+
+	var req collectStickerReq
+	if err := ctx.BindJSON(&req); err != nil {
+		respondStickerRequestInvalid(ctx, "")
+		return
+	}
+	if req.Path == "" {
+		respondStickerRequestInvalid(ctx, "path")
+		return
+	}
+	if len(req.Path) > maxStickerCollectPathLen {
+		respondStickerRequestInvalid(ctx, "path")
+		return
+	}
+	source, ok := parseCollectStickerSourcePath(req.Path)
+	if !ok {
+		respondStickerRequestInvalid(ctx, "path")
+		return
+	}
+	if len(source.DisplayPath) > maxStickerPathLen || len(source.SourceKey) > maxStickerPathLen {
+		respondStickerRequestInvalid(ctx, "path")
+		return
+	}
+	placeholder := req.Placeholder
+	if placeholder == "" {
+		placeholder = defaultStickerPlaceholder
+	}
+	if len([]rune(placeholder)) > maxStickerPlaceholderLen {
+		respondStickerRequestInvalid(ctx, "placeholder")
+		return
+	}
+	if req.Sort < 0 {
+		respondStickerRequestInvalid(ctx, "sort")
+		return
+	}
+	shortcode, ok := normalizeStickerShortcode(req.Shortcode)
+	if !ok {
+		respondStickerShortcodeInvalid(ctx)
+		return
+	}
+	keywordsStore, _, ok := normalizeStickerKeywords(req.Keywords)
+	if !ok {
+		respondStickerKeywordsInvalid(ctx)
+		return
+	}
+
+	sourceHash := stickerSourcePathHash(source.SourceKey)
+	max := s.settings.StickerUserMaxCount()
+
+	tx, err := s.ctx.DB().Begin()
+	if err != nil {
+		s.Error("开启事务失败", zap.Error(err))
+		httperr.ResponseErrorL(ctx, errcode.ErrStickerStoreFailed, nil, nil)
+		return
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	if err := s.db.lockUserRowTx(tx, loginUID); err != nil {
+		s.Error("锁定用户行失败", zap.Error(err))
+		httperr.ResponseErrorL(ctx, errcode.ErrStickerStoreFailed, nil, nil)
+		return
+	}
+
+	existing, err := s.db.queryByUIDAndSourcePathHashTx(tx, loginUID, sourceHash)
+	if err != nil {
+		s.Error("查询已收藏贴纸失败", zap.Error(err), zap.String("uid", loginUID))
+		httperr.ResponseErrorL(ctx, errcode.ErrStickerQueryFailed, nil, nil)
+		return
+	}
+	if existing == nil {
+		existing, err = s.db.queryByUIDAndPathTx(tx, loginUID, source.DisplayPath)
+		if err != nil {
+			s.Error("按 path 查询已收藏贴纸失败", zap.Error(err), zap.String("uid", loginUID))
+			httperr.ResponseErrorL(ctx, errcode.ErrStickerQueryFailed, nil, nil)
+			return
+		}
+	}
+	if existing != nil {
+		if err := tx.Commit(); err != nil {
+			s.Error("提交事务失败", zap.Error(err))
+			httperr.ResponseErrorL(ctx, errcode.ErrStickerStoreFailed, nil, nil)
+			return
+		}
+		ctx.Response(toStickerResp(existing))
+		return
+	}
+
+	count, err := s.db.countByUIDTx(tx, loginUID)
+	if err != nil {
+		s.Error("查询贴纸数量失败", zap.Error(err))
+		httperr.ResponseErrorL(ctx, errcode.ErrStickerQueryFailed, nil, nil)
+		return
+	}
+	if count >= max {
+		respondStickerQuotaExceeded(ctx, max)
+		return
+	}
+	conflict, err := s.db.shortcodeExistsTx(tx, loginUID, shortcode, "")
+	if err != nil {
+		s.Error("查询贴纸 shortcode 冲突失败", zap.Error(err), zap.String("uid", loginUID))
+		httperr.ResponseErrorL(ctx, errcode.ErrStickerQueryFailed, nil, nil)
+		return
+	}
+	if conflict {
+		respondStickerShortcodeConflict(ctx)
+		return
+	}
+
+	m := &StickerModel{
+		StickerID:      util.GenerUUID(),
+		UID:            loginUID,
+		Path:           source.DisplayPath,
+		Placeholder:    placeholder,
+		Format:         source.Format,
+		Sort:           req.Sort,
+		Shortcode:      shortcode,
+		Keywords:       keywordsStore,
+		SourcePath:     source.SourceKey,
+		SourcePathHash: sourceHash,
+		Status:         1,
+	}
+	if err := s.db.insertTx(tx, m); err != nil {
+		s.Error("收藏贴纸失败", zap.Error(err), zap.String("uid", loginUID), zap.String("source_path", source.SourceKey))
+		httperr.ResponseErrorL(ctx, errcode.ErrStickerStoreFailed, nil, nil)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		s.Error("提交事务失败", zap.Error(err))
+		httperr.ResponseErrorL(ctx, errcode.ErrStickerStoreFailed, nil, nil)
+		return
+	}
+
+	s.Info("贴纸收藏成功",
+		zap.String("uid", loginUID),
+		zap.String("source_path", source.SourceKey),
+		zap.String("format", source.Format),
 		zap.Bool("shortcode_set", shortcode != ""),
 		zap.Int("keyword_count", len(decodeStickerKeywords(keywordsStore))))
 	ctx.Response(toStickerResp(m))

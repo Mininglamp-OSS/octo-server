@@ -80,6 +80,33 @@ func (d *stickerDB) countByUIDTx(tx *dbr.Tx, uid string) (int, error) {
 	return count, err
 }
 
+func (d *stickerDB) queryByUIDAndSourcePathHashTx(tx *dbr.Tx, uid, sourcePathHash string) (*StickerModel, error) {
+	if sourcePathHash == "" {
+		return nil, nil
+	}
+	var model *StickerModel
+	_, err := tx.Select("*").From("sticker").
+		Where("uid=? and status=1 and source_path_hash=?", uid, sourcePathHash).
+		Limit(1).
+		Load(&model)
+	if errors.Is(err, dbr.ErrNotFound) {
+		return nil, nil
+	}
+	return model, err
+}
+
+func (d *stickerDB) queryByUIDAndPathTx(tx *dbr.Tx, uid, path string) (*StickerModel, error) {
+	var model *StickerModel
+	_, err := tx.Select("*").From("sticker").
+		Where("uid=? and status=1 and path=?", uid, path).
+		Limit(1).
+		Load(&model)
+	if errors.Is(err, dbr.ErrNotFound) {
+		return nil, nil
+	}
+	return model, err
+}
+
 func (d *stickerDB) queryByIDAndUIDTx(tx *dbr.Tx, stickerID, uid string) (*StickerModel, error) {
 	var model *StickerModel
 	_, err := tx.Select("*").From("sticker").

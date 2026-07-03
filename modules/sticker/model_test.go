@@ -45,3 +45,72 @@ func TestValidateStickerPath(t *testing.T) {
 		})
 	}
 }
+
+func TestParseCollectStickerSourcePath(t *testing.T) {
+	cases := []struct {
+		name        string
+		path        string
+		wantOK      bool
+		wantKey     string
+		wantDisplay string
+		wantFormat  string
+	}{
+		{
+			name:        "relative preview path",
+			path:        "file/preview/sticker/source-uid/abc.png",
+			wantOK:      true,
+			wantKey:     "sticker/source-uid/abc.png",
+			wantDisplay: "file/preview/sticker/source-uid/abc.png",
+			wantFormat:  "png",
+		},
+		{
+			name:        "absolute CDN URL strips query and prefix",
+			path:        "https://cdn.example.com/bucket/sticker/source-uid/abc.webp?X-Amz-Signature=deadbeef",
+			wantOK:      true,
+			wantKey:     "sticker/source-uid/abc.webp",
+			wantDisplay: "file/preview/sticker/source-uid/abc.webp",
+			wantFormat:  "webp",
+		},
+		{
+			name:        "raw object key",
+			path:        "sticker/source-uid/abc.GIF",
+			wantOK:      true,
+			wantKey:     "sticker/source-uid/abc.GIF",
+			wantDisplay: "file/preview/sticker/source-uid/abc.GIF",
+			wantFormat:  "gif",
+		},
+		{name: "non sticker URL", path: "https://example.com/avatar/abc.png", wantOK: false},
+		{name: "nested sticker object rejected", path: "file/preview/sticker/source-uid/nested/abc.png", wantOK: false},
+		{name: "unsupported format rejected", path: "file/preview/sticker/source-uid/abc.tiff", wantOK: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := parseCollectStickerSourcePath(tc.path)
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
+			}
+			if !ok {
+				return
+			}
+			if got.SourceKey != tc.wantKey || got.DisplayPath != tc.wantDisplay || got.Format != tc.wantFormat {
+				t.Fatalf("parseCollectStickerSourcePath(%q) = %+v, want key=%q display=%q format=%q",
+					tc.path, got, tc.wantKey, tc.wantDisplay, tc.wantFormat)
+			}
+		})
+	}
+}
+
+func TestStickerSourcePathHashStable(t *testing.T) {
+	a := stickerSourcePathHash("sticker/source-uid/abc.png")
+	b := stickerSourcePathHash("sticker/source-uid/abc.png")
+	c := stickerSourcePathHash("sticker/source-uid/other.png")
+	if a == "" || len(a) != 64 {
+		t.Fatalf("hash length = %d, want 64", len(a))
+	}
+	if a != b {
+		t.Fatalf("hash must be stable for the same source path")
+	}
+	if a == c {
+		t.Fatalf("hash must differ for different source paths")
+	}
+}
