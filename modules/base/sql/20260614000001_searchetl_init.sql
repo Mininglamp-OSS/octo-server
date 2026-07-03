@@ -6,9 +6,11 @@
 -- deleting the file would make sql-migrate panic on boot (unknown migration in database,
 -- IgnoreUnknown=false). The file was moved here (DB-neutral; the ID is unchanged) when
 -- modules/searchetl was deleted, and base is always loaded (blank-imported + embeds sql/).
--- Because the ID is already applied, sql-migrate skips this migration on every boot — the
--- CREATE TABLE below never re-runs. The octo_etl_es_cursor table is now owned by the
--- standalone searchetl-producer.
+-- The octo_etl_es_cursor table is now owned by the standalone searchetl-producer
+-- (octo-search-indexer), which shares this database. Because that component may create the
+-- table BEFORE octo-server has recorded this migration ID (new DB / first boot), the Up DDL
+-- can still execute against an already-existing table — so it MUST stay idempotent
+-- (CREATE TABLE IF NOT EXISTS) to avoid an Error 1050 panic on boot. See octo-server#528.
 --
 -- searchetl 消息检索 ETL 抽取水位（YUJ-4530 ETL→Kafka→ES indexer）。
 -- 每个 message 分片表一行，记录已投递到 Kafka 的最大主键 id 水位。
@@ -17,7 +19,7 @@
 -- 增量抽取按 PK `WHERE id>last_id ORDER BY id LIMIT batch` keyset 分页；水位只推进到
 -- 「落库已超过 lag（稳定性滞后窗口）」的稳定前缀末尾，杜绝低 id 晚提交被游标越过的并发漏扫。
 -- 撤回/删除态不走该游标（路线甲：读时回 MySQL join 过滤），本游标只跑正文一条流。
-CREATE TABLE `octo_etl_es_cursor` (
+CREATE TABLE IF NOT EXISTS `octo_etl_es_cursor` (
   `shard_table` VARCHAR(64) NOT NULL          COMMENT 'message 分片表名 (message / message1 / ...)',
   `last_id`     BIGINT      NOT NULL DEFAULT 0 COMMENT '已投递到 Kafka 的最大 message.id 水位',
   `updated_at`  TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '行更新时间',
