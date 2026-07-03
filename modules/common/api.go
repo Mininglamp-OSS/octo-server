@@ -387,6 +387,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 			DisableUserCreateSpace: boolToFlag(cn.systemSettings.SpaceDisableUserCreate()),
 			SearchEnabled:          searchEnabled,
 			MessagesSearchOn:       searchEnabled,
+			StickerCustomEnabled:   cn.systemSettings.StickerCustomEnabled(),
 			StickerHandleRequired:  cn.systemSettings.StickerHandleRequired(),
 		})
 		return
@@ -428,6 +429,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 		DisableUserCreateSpace: boolToFlag(cn.systemSettings.SpaceDisableUserCreate()),
 		SearchEnabled:          searchEnabled,
 		MessagesSearchOn:       searchEnabled,
+		StickerCustomEnabled:   cn.systemSettings.StickerCustomEnabled(),
 		StickerHandleRequired:  cn.systemSettings.StickerHandleRequired(),
 	})
 }
@@ -758,6 +760,14 @@ type appConfigResp struct {
 	// 两字段并存：search_enabled 保留作向后兼容，messages_search_on 为新真源 key。
 	// 下发 bool，前端 parseRemoteBool(true) 即可正确开关，无需 0/1 特判。
 	MessagesSearchOn bool `json:"messages_search_on"`
+
+	// StickerCustomEnabled 告知客户端是否展示自定义贴纸管理入口。值来源于
+	// system_setting sticker.custom_enabled；默认 false,便于新能力先隐藏、再从
+	// 管理台灰度放开。本字段只表达展示策略，不改变 /v1/sticker/user 的服务端权限。
+	//
+	// 与 app_config.version 解耦的原因同 LocalLoginOff / SearchEnabled：运维切展示
+	// 策略后老客户端命中 version 短路分支也必须拿到最新值，故两个分支都下发。
+	StickerCustomEnabled bool `json:"sticker_custom_enabled"`
 
 	// StickerHandleRequired 告知客户端：新增自定义贴纸（POST /v1/sticker/user）时是否
 	// 必须携带上传句柄 handle（即 /v1/file/upload?type=sticker 返回的 sticker_handle）。

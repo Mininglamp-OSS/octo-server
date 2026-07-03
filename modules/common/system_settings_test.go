@@ -668,3 +668,17 @@ func TestSystemSettings_SidebarRecentFilter_BoundaryValuesAccepted(t *testing.T)
 	assert.Equal(t, 0, s.SidebarRecentFilterGroupDays(), "下界 0 接受")
 	assert.Equal(t, 3650, s.SidebarRecentFilterThreadDays(), "上界 3650 接受")
 }
+
+func TestSystemSettings_StickerCustomEnabled_DefaultsFalse(t *testing.T) {
+	s := newTestSystemSettings(t, nil)
+
+	assert.False(t, s.StickerCustomEnabled(), "DB empty -> custom sticker management hidden by default")
+}
+
+func TestSystemSettings_StickerCustomEnabled_DBTrueWins(t *testing.T) {
+	s := newTestSystemSettings(t, nil)
+	require.NoError(t, s.db.upsert("sticker", "custom_enabled", "1", settingTypeBool, ""))
+	require.NoError(t, s.Reload())
+
+	assert.True(t, s.StickerCustomEnabled(), "DB true -> custom sticker management enabled")
+}

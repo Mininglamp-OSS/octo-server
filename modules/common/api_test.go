@@ -81,6 +81,22 @@ func setStickerHandleRequiredSetting(t *testing.T, ctx *config.Context, required
 	require.NoError(t, EnsureSystemSettings(ctx).Reload())
 }
 
+// setStickerCustomEnabledSetting upserts system_setting sticker.custom_enabled
+// and reloads the shared snapshot. This is the appconfig-facing display toggle
+// for custom sticker management.
+func setStickerCustomEnabledSetting(t *testing.T, ctx *config.Context, enabled bool) {
+	t.Helper()
+	v := "0"
+	if enabled {
+		v = "1"
+	}
+	_, err := ctx.DB().InsertInto("system_setting").
+		Columns("category", "key_name", "value", "value_type").
+		Values("sticker", "custom_enabled", v, "bool").Exec()
+	require.NoError(t, err)
+	require.NoError(t, EnsureSystemSettings(ctx).Reload())
+}
+
 func TestAddVersion(t *testing.T) {
 	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
 	s, ctx := testutil.NewTestServer()
@@ -675,4 +691,53 @@ func TestGetAppConfig_StickerHandleRequired_OnVersionShortCircuit(t *testing.T) 
 	s.GetRoute().ServeHTTP(w, req)
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Contains(t, w.Body.String(), `"sticker_handle_required":true`)
+}
+
+// appconfig 必须下发 sticker_custom_enabled：值来源于 system_setting
+// sticker.custom_enabled。默认 false,客户端据此隐藏自定义贴纸管理入口。
+func TestGetAppConfig_StickerCustomEnabled_DefaultFalse(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"sticker_custom_enabled":false`)
+}
+
+// system_setting sticker.custom_enabled=true → appconfig 下发 true，客户端展示自定义贴纸管理入口。
+func TestGetAppConfig_StickerCustomEnabled_True(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setStickerCustomEnabledSetting(t, ctx, true)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"sticker_custom_enabled":true`)
+}
+
+// version 短路分支同样要下发 sticker_custom_enabled：展示开关需要与
+// app_config.version 解耦，避免 admin 切换后老客户端命中版本短路而继续使用旧值。
+func TestGetAppConfig_StickerCustomEnabled_OnVersionShortCircuit(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setStickerCustomEnabledSetting(t, ctx, true)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig?version=99999999", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"sticker_custom_enabled":true`)
 }

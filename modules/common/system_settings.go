@@ -756,6 +756,14 @@ func (s *SystemSettings) StickerUserMaxCount() int {
 	return v
 }
 
+// StickerCustomEnabled reports whether clients should show the custom-sticker
+// management entry. This is a presentation toggle only; server-side CRUD
+// authorization remains governed by the /v1/sticker/user route middleware and
+// handler checks. Default false supports a controlled client rollout.
+func (s *SystemSettings) StickerCustomEnabled() bool {
+	return s.getBool("sticker", "custom_enabled", false)
+}
+
 // StickerHandleRequired reports whether custom-sticker registration must reject a
 // missing upload handle (POST /v1/sticker/user). This is the enforcement POLICY,
 // deliberately independent of the signing CAPABILITY (OCTO_MASTER_KEY): it lives

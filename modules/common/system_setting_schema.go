@@ -133,6 +133,11 @@ var systemSettingSchema = []settingDef{
 	{Category: "sticker", Key: "user_max_count", Type: settingTypeInt, Description: "每个用户可创建的自定义贴纸数量上限", Positive: true,
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.StickerUserMaxCount()) }},
 
+	// 自定义贴纸管理入口展示开关。仅用于通过 appconfig 告诉客户端是否展示入口，
+	// 不改变 /v1/sticker/user 已有服务端读写权限；默认关闭，便于新能力灰度放量。
+	{Category: "sticker", Key: "custom_enabled", Type: settingTypeBool, Description: "是否向客户端展示自定义贴纸管理入口",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.StickerCustomEnabled()) }},
+
 	// 自定义贴纸上传句柄强制开关（P0: Sticker Handle Enforcement Rollout）。这是「强制
 	// 策略」，与「签名能力」OCTO_MASTER_KEY 彻底解耦——能力是部署级 env，策略是运营可
 	// 在管理台热切的 DB 真源，互不派生。关闭（默认）= 兼容期：缺 handle 暂放行并记
