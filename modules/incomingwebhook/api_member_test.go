@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -109,6 +110,32 @@ func TestMemberCreate_AutoNameWhenOmitted(t *testing.T) {
 		map[string]interface{}{"name": "Webhook-"}, memberAToken))
 	require.Equalf(t, http.StatusOK, w.Code, "literal-prefix create body: %s", w.Body.String())
 	assert.Equal(t, "Webhook-", parseJSON(t, w)["name"])
+}
+
+// 成员自定义名称的字节上限（与管理员同口径，create/update 都要钉住）：
+//   - 64 字节以内的多字节名称（中文 + emoji）原样保存，不因去掉强制前缀而在
+//     长度校验上引入 rune/byte 混淆；
+//   - 超过 64 字节 → 400，且 create、update 两条路径独立校验（本 PR 把两条路径的
+//     校验逻辑改成同一形状，这里各钉一次防止只改一侧）。
+func TestMemberCreate_NameByteBoundaries(t *testing.T) {
+	handler, _, groupNo := setupMemberEnv(t)
+
+	unicodeName := "客服机器人🤖" // 19 字节（UTF-8），验证多字节名称不被截断/转义
+	w := do(handler, userReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo),
+		map[string]interface{}{"name": unicodeName}, memberAToken))
+	require.Equalf(t, http.StatusOK, w.Code, "unicode create body: %s", w.Body.String())
+	created := parseJSON(t, w)
+	assert.Equal(t, unicodeName, created["name"])
+	whID, _ := created["webhook_id"].(string)
+
+	tooLong := strings.Repeat("a", 65) // 65 字节，超出上限 1 字节
+	w = do(handler, userReq("POST", fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo),
+		map[string]interface{}{"name": tooLong}, memberAToken))
+	assert.Equalf(t, http.StatusBadRequest, w.Code, "too-long create body: %s", w.Body.String())
+
+	base := fmt.Sprintf("/v1/groups/%s/incoming-webhooks/%s", groupNo, whID)
+	w = do(handler, userReq("PUT", base, map[string]interface{}{"name": tooLong}, memberAToken))
+	assert.Equalf(t, http.StatusBadRequest, w.Code, "too-long update body: %s", w.Body.String())
 }
 
 // 成员的 webhook push 时 username/avatar_url 覆盖被忽略（创建者非管理员 →

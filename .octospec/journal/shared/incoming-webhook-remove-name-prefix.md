@@ -83,6 +83,24 @@ An adversarial review pass over the first commit found:
   call in the push handler — updated.
 - **nit**: stale `display_locked` term in an `api_test.go` comment — updated.
 
+## Review follow-up 2 (GitHub PR #526, automated review round 1)
+`code-reviewer`/`qa-engineer` flagged (P3, non-blocking) that the 64-byte
+name cap on the member path — a boundary this PR's diff directly touches in
+both `create()` and `update()` — had no test coverage, and asked for a
+unicode/emoji verbatim-name case to confirm the byte-vs-rune distinction
+doesn't silently mangle multi-byte names now that the forced-prefix
+rewrite is gone. Added `TestMemberCreate_NameByteBoundaries` to
+`api_member_test.go`: a 19-byte CJK+emoji name stored verbatim, and a
+65-byte ASCII name rejected with 400 on **both** create and update
+(independent checks, since this PR reshaped both call sites to the same
+form). `go vet` + `golangci-lint` clean; could not run `go test` in this
+sandbox (no MySQL/Redis).
+
+The separate `check-sprint` CI question the same review raised is a
+governance/merge-gate question for a human, not a code change — left
+alone per the user's instruction to only act on reviewer-raised code
+issues, not CI/governance gates.
+
 ## Learning
 When a handler is mounted by more than one module (here: incomingwebhook
 management routes re-mounted under `/v1/bot/...` by bot_api), sweep for
