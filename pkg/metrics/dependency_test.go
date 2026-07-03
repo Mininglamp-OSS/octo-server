@@ -69,6 +69,37 @@ func TestObserveObjectStore_UsesDefault(t *testing.T) {
 	}
 }
 
+// ObserveWuKongIM 走包级默认实例,按 dependency="wukongim"+op 记录,并区分 ok/error。
+// 签名匹配 octo-lib config.IMObserver(在 main 里 config.SetIMObserver 注入)。
+func TestObserveWuKongIM_UsesDefaultAndLabels(t *testing.T) {
+	prev := defaultDependencyMetrics.Load()
+	t.Cleanup(func() { defaultDependencyMetrics.Store(prev) })
+	reg := prometheus.NewRegistry()
+	NewDependencyMetrics(reg) // 同时把自己设为包级默认
+
+	ObserveWuKongIM("send_message", time.Millisecond, nil)
+	ObserveWuKongIM("send_message", time.Millisecond, errors.New("boom"))
+
+	// dependency="wukongim",op="send_message" 应记录 2 次(ok + error 各一)。
+	if got := histSampleCountByDepOp(t, reg, DependencyWuKongIM, "send_message"); got != 2 {
+		t.Fatalf("wukongim send_message sample count = %d, want 2", got)
+	}
+	if got := histSampleCount(t, reg, dependencyStatusOK); got != 1 {
+		t.Fatalf("ok sample count = %d, want 1", got)
+	}
+	if got := histSampleCount(t, reg, dependencyStatusError); got != 1 {
+		t.Fatalf("error sample count = %d, want 1", got)
+	}
+}
+
+// 未初始化包级默认时(指标关闭 / 进程未注册)ObserveWuKongIM 必须是安全 no-op。
+func TestObserveWuKongIM_NoDefaultIsNoop(t *testing.T) {
+	prev := defaultDependencyMetrics.Load()
+	t.Cleanup(func() { defaultDependencyMetrics.Store(prev) })
+	defaultDependencyMetrics.Store(nil)
+	ObserveWuKongIM("send_message", time.Millisecond, nil) // 不应 panic
+}
+
 // histSampleCountByDepOp 返回带指定 dependency+op label 的 histogram 观测次数,
 // 跨 status 累加。dependency+op 下可能同时存在 status=ok 与 status=error 两条序列;
 // 若只取首个匹配会按 protobuf 顺序漏数,故这里把所有匹配序列的 SampleCount 相加。

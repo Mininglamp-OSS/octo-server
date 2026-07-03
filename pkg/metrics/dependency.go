@@ -25,6 +25,9 @@ const (
 	// 由 octo-lib 客户端接缝(db.SetDBObserver / redis.SetRedisObserver)灌入。
 	DependencyMySQL = "mysql"
 	DependencyRedis = "redis"
+	// DependencyWuKongIM 是 WuKongIM 出站调用的 dependency label 值,由 octo-lib
+	// config 接缝(config.SetIMObserver)灌入。IM 是消息传输核心依赖。
+	DependencyWuKongIM = "wukongim"
 
 	// backendMain 是单库 / 单缓存现状下 mysql/redis 的固定 backend label。
 	// 这两类依赖没有像对象存储那样的多后端实现,固定一个低基数值即可;若将来引入
@@ -117,5 +120,15 @@ func ObserveDB(op string, dur time.Duration, err error) {
 func ObserveRedisCmd(op string, dur time.Duration, err error) {
 	if m := defaultDependencyMetrics.Load(); m != nil {
 		m.ObserveDuration(DependencyRedis, op, backendMain, dur, err)
+	}
+}
+
+// ObserveWuKongIM 是 WuKongIM 出站调用的包级入口,签名精确匹配 octo-lib 的
+// config.IMObserver。在 main 里用 config.SetIMObserver(metrics.ObserveWuKongIM) 注入。
+// op 为 IM 端点的低基数枚举(config 侧 opXxx 常量,如 "send_message")。backend 固定
+// backendMain —— octo-server 视角下只有一个 IM 集群。未初始化默认实例时为 no-op。
+func ObserveWuKongIM(op string, dur time.Duration, err error) {
+	if m := defaultDependencyMetrics.Load(); m != nil {
+		m.ObserveDuration(DependencyWuKongIM, op, backendMain, dur, err)
 	}
 }

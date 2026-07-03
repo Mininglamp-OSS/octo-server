@@ -253,6 +253,10 @@ func runAPI(ctx *config.Context) {
 	// rd.NewClient 的极少数场景(若有),用连接池指标兜底。
 	libdb.SetDBObserver(metrics.ObserveDB)
 	libredis.SetRedisObserver(metrics.ObserveRedisCmd)
+	// WuKongIM 出站调用延迟(dependency="wukongim"):接 octo-lib config 的 IM 客户端
+	// 接缝,把每次 IM API 调用(消息收发/频道/会话等 ~30 端点)的耗时 + ok/error 灌进
+	// 同一个 DependencyMetrics。WuKongIM 是消息传输核心依赖,此前是依赖指标里唯一盲区。
+	config.SetIMObserver(metrics.ObserveWuKongIM)
 	metrics.RegisterPoolCollectors(prometheus.DefaultRegisterer, ctx.DB().DB, map[string]*rd.Client{
 		"ratelimit": rlRedis,
 	})
