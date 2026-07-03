@@ -339,28 +339,40 @@ func (s *Sticker) add(ctx *wkhttp.Context) {
 // caller; it must still point at the reserved sticker object keyspace. The
 // stored path is a stable authenticated preview URL for that source object, and
 // SourcePathHash makes repeat taps idempotent without charging quota again.
+//
+// collect intentionally does not require the upload handle even when
+// sticker.handle_required=true: the endpoint is for a sticker URL already
+// carried in a message, and the only accepted source is the reserved sticker/
+// keyspace that file upload protects from non-sticker writes. With the current
+// path-only contract this is a collect-specific trust boundary, not a general
+// replacement for add()'s same-user upload-handle proof.
 func (s *Sticker) collect(ctx *wkhttp.Context) {
 	loginUID := ctx.GetLoginUID()
 
 	var req collectStickerReq
 	if err := ctx.BindJSON(&req); err != nil {
+		observeStickerCollect("validation_failed")
 		respondStickerRequestInvalid(ctx, "")
 		return
 	}
 	if req.Path == "" {
+		observeStickerCollect("path_invalid")
 		respondStickerRequestInvalid(ctx, "path")
 		return
 	}
 	if len(req.Path) > maxStickerCollectPathLen {
+		observeStickerCollect("path_invalid")
 		respondStickerRequestInvalid(ctx, "path")
 		return
 	}
 	source, ok := parseCollectStickerSourcePath(req.Path)
 	if !ok {
+		observeStickerCollect("path_invalid")
 		respondStickerRequestInvalid(ctx, "path")
 		return
 	}
 	if len(source.DisplayPath) > maxStickerPathLen || len(source.SourceKey) > maxStickerPathLen {
+		observeStickerCollect("path_invalid")
 		respondStickerRequestInvalid(ctx, "path")
 		return
 	}
@@ -369,20 +381,24 @@ func (s *Sticker) collect(ctx *wkhttp.Context) {
 		placeholder = defaultStickerPlaceholder
 	}
 	if len([]rune(placeholder)) > maxStickerPlaceholderLen {
+		observeStickerCollect("validation_failed")
 		respondStickerRequestInvalid(ctx, "placeholder")
 		return
 	}
 	if req.Sort < 0 {
+		observeStickerCollect("validation_failed")
 		respondStickerRequestInvalid(ctx, "sort")
 		return
 	}
 	shortcode, ok := normalizeStickerShortcode(req.Shortcode)
 	if !ok {
+		observeStickerCollect("validation_failed")
 		respondStickerShortcodeInvalid(ctx)
 		return
 	}
 	keywordsStore, _, ok := normalizeStickerKeywords(req.Keywords)
 	if !ok {
+		observeStickerCollect("validation_failed")
 		respondStickerKeywordsInvalid(ctx)
 		return
 	}
@@ -393,6 +409,7 @@ func (s *Sticker) collect(ctx *wkhttp.Context) {
 	tx, err := s.ctx.DB().Begin()
 	if err != nil {
 		s.Error("开启事务失败", zap.Error(err))
+		observeStickerCollect("store_failed")
 		httperr.ResponseErrorL(ctx, errcode.ErrStickerStoreFailed, nil, nil)
 		return
 	}
@@ -400,6 +417,7 @@ func (s *Sticker) collect(ctx *wkhttp.Context) {
 
 	if err := s.db.lockUserRowTx(tx, loginUID); err != nil {
 		s.Error("锁定用户行失败", zap.Error(err))
+		observeStickerCollect("store_failed")
 		httperr.ResponseErrorL(ctx, errcode.ErrStickerStoreFailed, nil, nil)
 		return
 	}
@@ -407,23 +425,18 @@ func (s *Sticker) collect(ctx *wkhttp.Context) {
 	existing, err := s.db.queryByUIDAndSourcePathHashTx(tx, loginUID, sourceHash)
 	if err != nil {
 		s.Error("查询已收藏贴纸失败", zap.Error(err), zap.String("uid", loginUID))
+		observeStickerCollect("query_failed")
 		httperr.ResponseErrorL(ctx, errcode.ErrStickerQueryFailed, nil, nil)
 		return
-	}
-	if existing == nil {
-		existing, err = s.db.queryByUIDAndPathTx(tx, loginUID, source.DisplayPath)
-		if err != nil {
-			s.Error("按 path 查询已收藏贴纸失败", zap.Error(err), zap.String("uid", loginUID))
-			httperr.ResponseErrorL(ctx, errcode.ErrStickerQueryFailed, nil, nil)
-			return
-		}
 	}
 	if existing != nil {
 		if err := tx.Commit(); err != nil {
 			s.Error("提交事务失败", zap.Error(err))
+			observeStickerCollect("store_failed")
 			httperr.ResponseErrorL(ctx, errcode.ErrStickerStoreFailed, nil, nil)
 			return
 		}
+		observeStickerCollect("idempotent_hit")
 		ctx.Response(toStickerResp(existing))
 		return
 	}
@@ -431,20 +444,24 @@ func (s *Sticker) collect(ctx *wkhttp.Context) {
 	count, err := s.db.countByUIDTx(tx, loginUID)
 	if err != nil {
 		s.Error("查询贴纸数量失败", zap.Error(err))
+		observeStickerCollect("query_failed")
 		httperr.ResponseErrorL(ctx, errcode.ErrStickerQueryFailed, nil, nil)
 		return
 	}
 	if count >= max {
+		observeStickerCollect("quota_exceeded")
 		respondStickerQuotaExceeded(ctx, max)
 		return
 	}
 	conflict, err := s.db.shortcodeExistsTx(tx, loginUID, shortcode, "")
 	if err != nil {
 		s.Error("查询贴纸 shortcode 冲突失败", zap.Error(err), zap.String("uid", loginUID))
+		observeStickerCollect("query_failed")
 		httperr.ResponseErrorL(ctx, errcode.ErrStickerQueryFailed, nil, nil)
 		return
 	}
 	if conflict {
+		observeStickerCollect("shortcode_conflict")
 		respondStickerShortcodeConflict(ctx)
 		return
 	}
@@ -464,15 +481,18 @@ func (s *Sticker) collect(ctx *wkhttp.Context) {
 	}
 	if err := s.db.insertTx(tx, m); err != nil {
 		s.Error("收藏贴纸失败", zap.Error(err), zap.String("uid", loginUID), zap.String("source_path", source.SourceKey))
+		observeStickerCollect("store_failed")
 		httperr.ResponseErrorL(ctx, errcode.ErrStickerStoreFailed, nil, nil)
 		return
 	}
 	if err := tx.Commit(); err != nil {
 		s.Error("提交事务失败", zap.Error(err))
+		observeStickerCollect("store_failed")
 		httperr.ResponseErrorL(ctx, errcode.ErrStickerStoreFailed, nil, nil)
 		return
 	}
 
+	observeStickerCollect("success")
 	s.Info("贴纸收藏成功",
 		zap.String("uid", loginUID),
 		zap.String("source_path", source.SourceKey),
