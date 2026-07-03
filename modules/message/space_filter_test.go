@@ -611,22 +611,18 @@ func newMsgWithSpaceID(messageID int64, spaceID string) *MsgSyncResp {
 }
 
 func TestFilterPersonMessagesBySpace_SystemBot(t *testing.T) {
-	// channelID = "botfather"（SystemBot）
-	// 当前 Space = spaceA，按规则：
-	//   - spaceA 消息保留
-	//   - spaceB 消息丢弃
-	//   - 无 space_id 消息丢弃（SystemBot 老消息默认隐藏，对齐 Android filterSystemBotMessages）
+	// channelID = "botfather"（SystemBot）与 Space 无关，历史全量可见，不做 Space
+	// 过滤 —— 系统 Bot 是全局单会话，EnsureSystemBotsPresent 已保证其在每个 Space
+	// 的会话列表出现，历史同理。修复「带 X-Space-ID 时 botfather 历史返回空」。
 	msgs := []*MsgSyncResp{
 		newMsgWithSpaceID(1, "spaceA"),
 		newMsgWithSpaceID(2, "spaceB"),
-		newMsgWithSpaceID(3, ""), // 老 SystemBot 消息
+		newMsgWithSpaceID(3, ""), // 无 space_id 的系统 Bot 消息（此前 bug 会被丢弃）
 		newMsgWithSpaceID(4, "spaceA"),
 	}
 
 	got := filterPersonMessagesBySpace(msgs, "botfather", "spaceA", "spaceA")
-	assert.Len(t, got, 2)
-	assert.Equal(t, int64(1), got[0].MessageID)
-	assert.Equal(t, int64(4), got[1].MessageID)
+	assert.Equal(t, msgs, got, "系统 Bot 历史不按 Space 过滤，原样全部返回")
 }
 
 func TestFilterPersonMessagesBySpace_OrdinaryDMLegacyCompat(t *testing.T) {
@@ -728,24 +724,29 @@ func TestFilterPersonMessagesBySpace_NilMessagesSkipped(t *testing.T) {
 
 func TestFilterPersonMessagesBySpace_PayloadSpaceIDWrongType(t *testing.T) {
 	// payload.space_id 不是字符串（例如异常数据）→ 视为空值，按"无 space_id"
-	// 分支处理（普通 DM 保留 / SystemBot 丢弃）。
+	// 分支处理（普通 DM 在默认 Space 保留）。
 	msgA := &MsgSyncResp{MessageID: 60, Payload: map[string]interface{}{"space_id": 123}}
 
-	// 普通 DM：保留
+	// 普通 DM（默认 Space）：保留
 	got := filterPersonMessagesBySpace([]*MsgSyncResp{msgA}, "peer_uid", "spaceA", "spaceA")
 	assert.Len(t, got, 1)
 
-	// SystemBot：丢弃
+	// SystemBot：与 Space 无关，历史全量可见（不因 space_id 异常类型被丢）
 	got = filterPersonMessagesBySpace([]*MsgSyncResp{msgA}, "fileHelper", "spaceA", "spaceA")
-	assert.Len(t, got, 0)
+	assert.Len(t, got, 1, "系统 Bot 消息豁免 Space 过滤")
 }
 
 func TestFilterPersonMessagesBySpace_SystemBotListCoverage(t *testing.T) {
-	// 保证三个已知系统 Bot 都走 SystemBot 分支（老消息被丢弃）。
+	// 所有已知系统 Bot 都豁免 Space 过滤：无 space_id 的历史消息在任意 Space（默认
+	// 或非默认）都保留 —— 修复「带 X-Space-ID 时 botfather/fileHelper/u_10000 历史
+	// 返回空」。非默认 Space（filterSpaceID != defaultSpaceID）正是线上复现场景。
 	msgs := []*MsgSyncResp{newMsgWithSpaceID(70, "")}
 	for _, bot := range spacepkg.SystemBotList() {
-		got := filterPersonMessagesBySpace(msgs, bot, "spaceA", "spaceA")
-		assert.Emptyf(t, got, "SystemBot %s 的无 space_id 消息应被丢弃", bot)
+		gotNonDefault := filterPersonMessagesBySpace(msgs, bot, "spaceB", "spaceDefault")
+		assert.Lenf(t, gotNonDefault, 1, "SystemBot %s 的无 space_id 历史在非默认 Space 也应保留", bot)
+
+		gotDefault := filterPersonMessagesBySpace(msgs, bot, "spaceDefault", "spaceDefault")
+		assert.Lenf(t, gotDefault, 1, "SystemBot %s 的无 space_id 历史在默认 Space 应保留", bot)
 	}
 }
 

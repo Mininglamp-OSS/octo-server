@@ -4,6 +4,20 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-03
+
+- **Fix** — Task `system-bot-dm-history`: system-bot DM history was returned empty
+  from `/v1/message/channel/sync` whenever the request carried an `X-Space-ID`.
+  `filterPersonMessagesBySpace` now early-returns the full list for system bots
+  (`botfather`/`u_10000`/`fileHelper`/`notification`) — they are Space-independent
+  and already forced into every Space's conversation list by `EnsureSystemBotsPresent`,
+  so their history must not be Space-filtered. Root cause is YUJ-219-A / #1283
+  (`e39b69f`), **not** #484 (verified by diff: #484 only touched the regular-DM
+  branch). Read-time filter only — no data loss, no backfill. Flipped 3 YUJ-219-A
+  tests that locked the drop behavior; added non-default-Space coverage. Brief +
+  journal under `.octospec/tasks/system-bot-dm-history/` and
+  `.octospec/journal/shared/system-bot-dm-history.md`.
+
 ## 2026-07-02
 
 - **Change** — Task `conv-space-catchall-484` (issue #484 follow-up): closed the

@@ -512,14 +512,17 @@ func newSystemBotPlaceholder(uid string) *SyncUserConversationResp {
 // 本函数仅针对 Person (DM) 路径：
 //   - GROUP channel_id 本身做 Space 隔离（不同 Space 的群 channel_id 不同），
 //     对历史消息再过滤反而会误杀老群，因此 GROUP/COMMUNITY_TOPIC 路径不走这里。
-//   - 规则（issue #484 后；与三端 SpaceFilter 口径对齐）：
-//     1) payload.space_id == spaceID                         → 保留（精确匹配）
-//     2) payload.space_id == "" && !isSystemBot && 默认Space  → 保留（无标签 DM
-//     历史只在用户默认 Space 向前兼容，避免出现在每个 Space —— 症状1）
-//     3) payload.space_id == "" && !isSystemBot && 非默认Space→ 丢弃（不再 fail-open）
-//     4) payload.space_id == "" &&  isSystemBot               → 丢弃（SystemBot 无
-//     space 标签的老消息默认隐藏，避免 fileHelper/u_10000 老消息跨 Space 泄露）
-//     5) payload.space_id != "" && != spaceID                → 丢弃（跨 Space 污染）
+//   - 系统 Bot（botfather/u_10000/fileHelper/notification）豁免：与 Space 无关，
+//     必须始终对客户端可见（pkg/space query.go 的不变量；会话列表侧由
+//     EnsureSystemBotsPresent 保证其在每个 Space 出现）。系统 Bot 的 DM 是全局
+//     单会话，历史同样不按 Space 过滤 —— 否则会话列表里有 botfather、点进去
+//     /message/channel/sync 却返回空。全局单会话不存在"跨 Space 泄露"。
+//   - 普通 DM 规则（issue #484 后；与三端 SpaceFilter 口径对齐）：
+//     1) payload.space_id == spaceID          → 保留（精确匹配）
+//     2) payload.space_id == "" && 默认Space   → 保留（无标签 DM 历史只在用户默认
+//     Space 向前兼容，避免出现在每个 Space —— 症状1）
+//     3) payload.space_id == "" && 非默认Space → 丢弃（不再 fail-open）
+//     4) payload.space_id != "" && != spaceID  → 丢弃（跨 Space 污染）
 //
 // 调用方需保证 spaceID != ""（空串视为未启用 Space 过滤，直接返回原列表），
 // 传入 defaultSpaceID（用户默认 Space，决定规则 2/3），并只对 ChannelTypePerson 调用。
@@ -527,7 +530,13 @@ func filterPersonMessagesBySpace(msgs []*MsgSyncResp, channelID, spaceID, defaul
 	if spaceID == "" || len(msgs) == 0 {
 		return msgs
 	}
-	isSysBot := spacepkg.IsSystemBot(channelID)
+	// 系统 Bot 与 Space 无关，历史全量可见（见函数注释）。早返回，避免其无
+	// space_id 的消息被下方规则一刀切隐藏 —— 修复「带 X-Space-ID 时 botfather /
+	// fileHelper / u_10000 历史返回空」。与 EnsureSystemBotsPresent / query.go 的
+	// 「系统 Bot 必须始终可见」不变量对齐。
+	if spacepkg.IsSystemBot(channelID) {
+		return msgs
+	}
 	filtered := make([]*MsgSyncResp, 0, len(msgs))
 	for _, m := range msgs {
 		if m == nil {
@@ -538,21 +547,16 @@ func filterPersonMessagesBySpace(msgs []*MsgSyncResp, channelID, spaceID, defaul
 		case msid == spaceID:
 			// 精确匹配当前 Space → 保留
 			filtered = append(filtered, m)
-		case msid == "" && !isSysBot && spaceID == defaultSpaceID:
+		case msid == "" && spaceID == defaultSpaceID:
 			// issue #484：无 space_id 的普通 DM 消息（发送方未带 X-Space-ID、
 			// Space 化之前的老消息、转发/名片）只在用户默认 Space 向前兼容保留，
 			// 不再出现在每个 Space —— 修复症状1（跨 Space 历史泄漏）。
 			filtered = append(filtered, m)
-		case msid == "" && !isSysBot:
+		case msid == "":
 			// 非默认 Space：无标签 DM 消息不再 fail-open 放行，丢弃。
 			continue
-		case msid == "" && isSysBot:
-			// 系统 Bot 的无 space_id 历史消息一律隐藏。对齐 Android
-			// filterSystemBotMessages 和 iOS filterMessagesBySpace，避免
-			// 老的 botfather/fileHelper/u_10000 对话全量跨 Space 暴露。
-			continue
-		case msid != spaceID:
-			// 明确跨 Space，丢弃。
+		default:
+			// 明确跨 Space（msid != "" 且 != spaceID），丢弃。
 			continue
 		}
 	}
