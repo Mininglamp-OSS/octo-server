@@ -6,6 +6,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
 )
 
@@ -41,8 +42,12 @@ func fillPersonSpaceUnread(
 			continue
 		}
 
+		// 系统 Bot 的无标签历史在 filterPersonMessagesBySpace rule 4 里被隐藏，
+		// 预览/未读须同口径（见 dmSpaceMatch）。按频道身份判定一次即可。
+		isSysBot := spacepkg.IsSystemBot(conv.ChannelID)
+
 		// 从 Recents 中找该 Space 的最后一条消息作为预览
-		spaceLastMsg := findSpaceLastMessage(conv.Recents, spaceID, defaultSpaceID)
+		spaceLastMsg := findSpaceLastMessage(conv.Recents, spaceID, defaultSpaceID, isSysBot)
 		if spaceLastMsg != nil {
 			conv.SpaceLastMessage = spaceLastMsg
 		}
@@ -55,7 +60,7 @@ func fillPersonSpaceUnread(
 			if raw != nil && raw.LastMsgSeq > 0 {
 				fallbackMsg := findSpaceLastMessageFallback(
 					conv.ChannelID, conv.ChannelType,
-					loginUID, spaceID, defaultSpaceID, uint32(raw.LastMsgSeq), ctx,
+					loginUID, spaceID, defaultSpaceID, isSysBot, uint32(raw.LastMsgSeq), ctx,
 				)
 				if fallbackMsg != nil {
 					conv.SpaceLastMessage = fallbackMsg
@@ -105,7 +110,7 @@ func fillPersonSpaceUnread(
 			messages = resp.Messages
 		}
 
-		count := countSpaceUnreadFromMessages(messages, spaceID, defaultSpaceID, readSeq)
+		count := countSpaceUnreadFromMessages(messages, spaceID, defaultSpaceID, isSysBot, readSeq)
 		conv.SpaceUnread = &count
 	}
 }
@@ -123,26 +128,32 @@ func dmMessageSpaceID(payload map[string]interface{}) string {
 }
 
 // dmSpaceMatch 判断一条 space_id 为 msgSpaceID 的 DM 消息是否归属 targetSpaceID，
-// 遵循「无标签 = 默认 Space」约定：未打标（无 payload.space_id）的 DM 消息归属用户
-// 默认 Space。这与可见性兜底 (decideConvKeepInSpace) 和历史过滤
-// (filterPersonMessagesBySpace) 对未打标 DM 消息的处理保持一致。
-// defaultSpaceID == "" 时约定关闭（仅严格等值），非默认 Space 查询不受影响。
-func dmSpaceMatch(msgSpaceID, targetSpaceID, defaultSpaceID string) bool {
+// 与历史过滤 filterPersonMessagesBySpace 的 rule 2 / rule 4 逐条对齐：
+//   - msgSpaceID == targetSpaceID：显式打标，归属该 Space；
+//   - 未打标（msgSpaceID == ""）且 targetSpaceID 为默认 Space 且**非系统 Bot**：
+//     归属默认 Space（rule 2）；
+//   - 未打标且**是系统 Bot**：一律不归属（rule 4）—— 系统 Bot（botfather /
+//     fileHelper / notification / u_10000）的无标签历史在 /message/channel/sync
+//     里被隐藏，预览/未读必须同口径,否则默认 Space 会出现清不掉的幽灵未读 +
+//     历史里不存在的预览（PR #532 review by yujiawei/mochashanyao/OctoBoooot）。
+//
+// defaultSpaceID == "" 时兜底分支关闭（仅严格等值），非默认 Space 查询不受影响。
+func dmSpaceMatch(msgSpaceID, targetSpaceID, defaultSpaceID string, isSysBot bool) bool {
 	if msgSpaceID == targetSpaceID {
 		return true
 	}
-	return msgSpaceID == "" && targetSpaceID == defaultSpaceID
+	return !isSysBot && msgSpaceID == "" && targetSpaceID == defaultSpaceID
 }
 
 // findSpaceLastMessage 从 Recents 中倒序查找最后一条归属 spaceID 的消息。
 // 用于会话列表的消息预览，确保每个 Space 显示该 Space 的最后一条消息。
-func findSpaceLastMessage(recents []*MsgSyncResp, spaceID, defaultSpaceID string) *MsgSyncResp {
+func findSpaceLastMessage(recents []*MsgSyncResp, spaceID, defaultSpaceID string, isSysBot bool) *MsgSyncResp {
 	for i := len(recents) - 1; i >= 0; i-- {
 		msg := recents[i]
 		if msg.Payload == nil {
 			continue
 		}
-		if dmSpaceMatch(dmMessageSpaceID(msg.Payload), spaceID, defaultSpaceID) {
+		if dmSpaceMatch(dmMessageSpaceID(msg.Payload), spaceID, defaultSpaceID, isSysBot) {
 			return msg
 		}
 	}
@@ -154,7 +165,7 @@ func findSpaceLastMessage(recents []*MsgSyncResp, spaceID, defaultSpaceID string
 func findSpaceLastMessageFallback(
 	channelID string, channelType uint8,
 	loginUID string, spaceID, defaultSpaceID string,
-	lastMsgSeq uint32, ctx *config.Context,
+	isSysBot bool, lastMsgSeq uint32, ctx *config.Context,
 ) *MsgSyncResp {
 	if lastMsgSeq == 0 {
 		return nil
@@ -194,7 +205,7 @@ func findSpaceLastMessageFallback(
 		if err != nil || payloadMap == nil {
 			continue
 		}
-		if dmSpaceMatch(dmMessageSpaceID(payloadMap), spaceID, defaultSpaceID) {
+		if dmSpaceMatch(dmMessageSpaceID(payloadMap), spaceID, defaultSpaceID, isSysBot) {
 			return msgRespToSyncResp(msg)
 		}
 	}
@@ -222,8 +233,8 @@ func msgRespToSyncResp(msg *config.MessageResp) *MsgSyncResp {
 }
 
 // countSpaceUnreadFromMessages 遍历消息列表，统计 seq > readSeq 且归属 spaceID 的消息数
-// （归属判断含「无标签 = 默认 Space」约定，见 dmSpaceMatch）。
-func countSpaceUnreadFromMessages(messages []*config.MessageResp, spaceID, defaultSpaceID string, readSeq int64) int {
+// （归属判断含「无标签 = 默认 Space」约定 + 系统 Bot 例外，见 dmSpaceMatch）。
+func countSpaceUnreadFromMessages(messages []*config.MessageResp, spaceID, defaultSpaceID string, isSysBot bool, readSeq int64) int {
 	count := 0
 	for _, msg := range messages {
 		if int64(msg.MessageSeq) <= readSeq {
@@ -233,7 +244,7 @@ func countSpaceUnreadFromMessages(messages []*config.MessageResp, spaceID, defau
 		if err != nil || payloadMap == nil {
 			continue
 		}
-		if dmSpaceMatch(dmMessageSpaceID(payloadMap), spaceID, defaultSpaceID) {
+		if dmSpaceMatch(dmMessageSpaceID(payloadMap), spaceID, defaultSpaceID, isSysBot) {
 			count++
 		}
 	}

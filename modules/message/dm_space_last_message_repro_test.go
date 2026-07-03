@@ -165,6 +165,38 @@ func TestFix_SpaceLastMessage_DefaultSpaceUsesUntagged(t *testing.T) {
 		"the default-space preview message carries no space_id (it is the untagged one)")
 }
 
+// TestFix_SystemBotUntaggedNotInDefaultPreview is the system-bot parity regression
+// guard (PR #532 review by yujiawei/mochashanyao/Jerry-Xin/OctoBoooot): a system-bot
+// DM (botfather) whose default-Space history is untagged must NOT surface a
+// default-Space space_last_message or unread badge — mirroring the history filter's
+// rule-4 drop, so preview/badge can't show what /v1/message/channel/sync hides.
+func TestFix_SystemBotUntaggedNotInDefaultPreview(t *testing.T) {
+	const (
+		botChannel  = "botfather" // spacepkg.IsSystemBot(botfather) == true
+		spaceDefaul = "space-default-bot"
+	)
+	now := time.Now()
+	// Untagged system-bot history (default-Space by the regular-DM convention, but
+	// rule 4 drops it for system bots).
+	m1 := dmMsgRepro(botChannel, 11, now.Add(-2*time.Hour).Unix(), `{"type":1,"content":"bot-a"}`)
+	m2 := dmMsgRepro(botChannel, 12, now.Add(-1*time.Hour).Unix(), `{"type":1,"content":"bot-b"}`)
+	conv := dmIMConvMulti(botChannel, now.Add(-1*time.Hour).Unix(), 100, []*config.MessageResp{m1, m2})
+	conv.Unread = 2 // exercise the unread-count path
+	convs := []*config.SyncUserConversationResp{conv}
+
+	s, ctx := setupConvSyncE2E(t, convs)
+	seedSpaceMemberRepro(t, ctx, spaceDefaul, testutil.UID, "2020-01-01 00:00:00")
+
+	convD := findConv(callConvSyncSpace(t, s, spaceDefaul), botChannel)
+	require.NotNil(t, convD, "system-bot DM stays visible in the conversation list")
+	assert.Nil(t, convD.SpaceLastMessage,
+		"untagged system-bot messages must not become the default-space preview (rule-4 parity)")
+	if convD.SpaceUnread != nil {
+		assert.Equal(t, 0, *convD.SpaceUnread,
+			"untagged system-bot messages must not be counted as default-space unread")
+	}
+}
+
 // TestFix_FindSpaceLastMessage_DefaultMatchesUntagged pins the root-cause fix at
 // the helper level: findSpaceLastMessage now takes defaultSpaceID and treats an
 // untagged DM message as a default-Space message (the same predicate the 200-msg
@@ -180,16 +212,16 @@ func TestFix_FindSpaceLastMessage_DefaultMatchesUntagged(t *testing.T) {
 	}
 
 	// Non-default space: the tagged message is found; the untagged one never leaks.
-	got := findSpaceLastMessage(recents, spaceB, spaceDefault)
+	got := findSpaceLastMessage(recents, spaceB, spaceDefault, false)
 	require.NotNil(t, got)
 	assert.Equal(t, uint32(12), got.MessageSeq)
 
 	// Default space: the untagged default message is now matched (was nil before).
-	got = findSpaceLastMessage(recents, spaceDefault, spaceDefault)
+	got = findSpaceLastMessage(recents, spaceDefault, spaceDefault, false)
 	require.NotNil(t, got, "untagged default-space message is now resolved")
 	assert.Equal(t, uint32(11), got.MessageSeq)
 
 	// Guard: with no default configured (defaultSpaceID==""), the untagged=default
 	// convention is off and a non-default query stays strict.
-	assert.Nil(t, findSpaceLastMessage(recents, spaceDefault, ""))
+	assert.Nil(t, findSpaceLastMessage(recents, spaceDefault, "", false))
 }
