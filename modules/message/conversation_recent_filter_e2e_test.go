@@ -53,9 +53,10 @@ const masterKeyEnvConvE2E = "OCTO_MASTER_KEY"
 // with a mutable response slice keeps the URL stable and alive across all tests.
 // Tests run sequentially (no t.Parallel), so the shared slice needs no lock.
 var (
-	fakeIMOnce  sync.Once
-	fakeIMSrv   *httptest.Server
-	fakeIMConvs []*config.SyncUserConversationResp
+	fakeIMOnce       sync.Once
+	fakeIMSrv        *httptest.Server
+	fakeIMConvs      []*config.SyncUserConversationResp
+	fakeIMChannelMsg []*config.MessageResp // served for /channel/messagesync (fallback path)
 )
 
 func sharedFakeIM() *httptest.Server {
@@ -64,6 +65,10 @@ func sharedFakeIM() *httptest.Server {
 			w.Header().Set("Content-Type", "application/json")
 			if strings.HasSuffix(r.URL.Path, "/conversation/sync") {
 				_, _ = w.Write([]byte(util.ToJson(fakeIMConvs)))
+				return
+			}
+			if strings.HasSuffix(r.URL.Path, "/channel/messagesync") {
+				_, _ = w.Write([]byte(util.ToJson(config.SyncChannelMessageResp{Messages: fakeIMChannelMsg})))
 				return
 			}
 			_, _ = w.Write([]byte("{}"))
@@ -112,6 +117,7 @@ func setupConvSyncE2E(t *testing.T, convs []*config.SyncUserConversationResp) (*
 	// Point the IM at the shared fake and load this test's conversation slice
 	// before any NewTestServer so the very first ctx already sees the live URL.
 	fakeIMConvs = convs
+	fakeIMChannelMsg = nil // default: fallback /channel/messagesync returns no messages
 	imURL := sharedFakeIM().URL
 
 	s, ctx := testutil.NewTestServer()

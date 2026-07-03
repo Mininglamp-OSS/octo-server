@@ -165,6 +165,50 @@ func TestFix_SpaceLastMessage_DefaultSpaceUsesUntagged(t *testing.T) {
 		"the default-space preview message carries no space_id (it is the untagged one)")
 }
 
+// TestFix_DefaultSpacePreview_ViaFallback_OutOfRecentsWindow reproduces the exact
+// production capture: the Recents window contains ONLY the channel's global-last
+// message (a non-default-Space tagged msg), while the default-Space message the
+// user actually sent ("串消息") sits below the window (seq 11) — reachable only via
+// the /channel/messagesync fallback pull. Asserts the default-Space preview
+// resolves to that message, not the leaked non-default one.
+func TestFix_DefaultSpacePreview_ViaFallback_OutOfRecentsWindow(t *testing.T) {
+	const (
+		dmChannel = "dm-fallback-peer"
+		spaceB    = "space-b-668cc9"  // non-default (the 668cc9 in the capture)
+		spaceA    = "space-a-default" // default Space (earliest membership)
+	)
+	now := time.Now()
+	// Global-last (seq 12) is a spaceB-tagged message and the ONLY thing in the
+	// Recents window — mirrors the capture recents=[{"content":"1111",spaceB}].
+	tagged12 := dmMsgRepro(dmChannel, 12, now.Add(-1*time.Hour).Unix(),
+		`{"type":1,"content":"1111","space_id":"`+spaceB+`"}`)
+	convOnlySeq12 := dmIMConvMulti(dmChannel, now.Add(-1*time.Hour).Unix(), 100, []*config.MessageResp{tagged12})
+
+	s, ctx := setupConvSyncE2E(t, []*config.SyncUserConversationResp{convOnlySeq12})
+	seedSpaceMemberRepro(t, ctx, spaceA, testutil.UID, "2020-01-01 00:00:00") // default
+	seedSpaceMemberRepro(t, ctx, spaceB, testutil.UID, "2020-06-01 00:00:00")
+
+	// The user's default-Space message ("串消息") is UNTAGGED and BELOW the recents
+	// window (seq 11); only the /channel/messagesync fallback can surface it.
+	untagged11 := dmMsgRepro(dmChannel, 11, now.Add(-2*time.Hour).Unix(),
+		`{"type":1,"content":"chuan-msg"}`)
+	fakeIMChannelMsg = []*config.MessageResp{untagged11, tagged12}
+
+	// DEFAULT space (A): preview must be the untagged space-A message via fallback.
+	convA := findConv(callConvSyncSpace(t, s, spaceA), dmChannel)
+	require.NotNil(t, convA, "DM visible in the default space")
+	require.NotNil(t, convA.SpaceLastMessage,
+		"default-space preview must be found via the /channel/messagesync fallback")
+	assert.Equal(t, "chuan-msg", convA.SpaceLastMessage.Payload["content"],
+		"default-space preview is the untagged space-A message, not the leaked spaceB '1111'")
+
+	// spaceB: its message is in the recents window → fast path.
+	convB := findConv(callConvSyncSpace(t, s, spaceB), dmChannel)
+	require.NotNil(t, convB)
+	require.NotNil(t, convB.SpaceLastMessage)
+	assert.Equal(t, "1111", convB.SpaceLastMessage.Payload["content"])
+}
+
 // TestFix_SystemBotUntaggedNotInDefaultPreview is the system-bot parity regression
 // guard (PR #532 review by yujiawei/mochashanyao/Jerry-Xin/OctoBoooot): a system-bot
 // DM (botfather) whose default-Space history is untagged must NOT surface a
