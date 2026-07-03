@@ -212,11 +212,36 @@ func parseCollectStickerObjectKey(candidate string, re *regexp.Regexp) (collectS
 		return collectStickerSource{}, false
 	}
 	sourceKey := "sticker/" + m[1] + "/" + m[2] + "." + m[3]
+	// Reject path-traversal / relative segments before the key is ever stored.
+	// The regex's `[^/]+` matches "." and "..", so `sticker/../a.png` parses to
+	// SourceKey "sticker/../a.png". That key is later resolved by renderablePath
+	// via DownloadURL → url.JoinPath, which RESOLVES "..", collapsing the
+	// "sticker/" prefix and escaping the sticker keyspace to the bucket root
+	// (e.g. "<base>/bucket/a.png"). Confining at ingress keeps traversal keys out
+	// of the DB and out of every downstream consumer (this one and file/preview).
+	if hasUnsafeSegment(sourceKey) {
+		return collectStickerSource{}, false
+	}
 	return collectStickerSource{
 		SourceKey:   sourceKey,
 		DisplayPath: "file/preview/" + sourceKey,
 		Format:      format,
 	}, true
+}
+
+// hasUnsafeSegment reports whether key contains a "." or ".." path segment. A
+// ".." segment lets url.JoinPath (used by every storage backend's DownloadURL)
+// escape the object key's intended prefix; "." is normalized away and never
+// legitimate in a generated sticker key. Percent-encoded forms ("%2e%2e") are
+// intentionally NOT decoded here: url.JoinPath leaves them literal (verified),
+// so they cannot traverse — only literal segments can.
+func hasUnsafeSegment(key string) bool {
+	for _, seg := range strings.Split(key, "/") {
+		if seg == "." || seg == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 func stickerSourcePathHash(sourceKey string) string {

@@ -170,6 +170,12 @@ func TestSticker_AddAndList(t *testing.T) {
 	assert.NotEmpty(t, ab["sticker_id"])
 	assert.Equal(t, "user", ab["category"])
 	assert.Equal(t, "png", ab["format"])
+	// The immediate add response is normalized too (all four endpoints funnel
+	// through toResp), not just the later list read.
+	wantPath := f.renderablePath(validStickerPath("abc.png"))
+	assert.Equal(t, wantPath, ab["path"])
+	assert.False(t, strings.HasPrefix(ab["path"].(string), "file/preview/"),
+		"add response path must be a renderable URL, not the auth-gated preview key")
 
 	w := doRequest(t, route, "GET", "/v1/sticker/user", nil)
 	body := parseJSON(t, w)
@@ -179,7 +185,6 @@ func TestSticker_AddAndList(t *testing.T) {
 	item := list[0].(map[string]interface{})
 	// path is normalized to a client-renderable URL (same transform the handler
 	// applies), never the raw auth-gated file/preview/ key.
-	wantPath := f.renderablePath(validStickerPath("abc.png"))
 	assert.Equal(t, wantPath, item["path"])
 	assert.False(t, strings.HasPrefix(item["path"].(string), "file/preview/"),
 		"list path must be a renderable URL, not the auth-gated preview key")
@@ -293,6 +298,12 @@ func TestSticker_CollectRejectsInvalidSourcePath(t *testing.T) {
 		{"unsupported extension", "file/preview/sticker/source-uid/x.tiff"},
 		{"missing extension", "file/preview/sticker/source-uid/x"},
 		{"nested object", "file/preview/sticker/source-uid/nested/x.png"},
+		// Path-traversal keys must be rejected at ingress so they never reach
+		// storage or renderablePath → DownloadURL (which would resolve ".." and
+		// escape the sticker/ keyspace to the bucket root).
+		{"parent traversal segment", "sticker/../x.png"},
+		{"parent traversal via preview prefix", "file/preview/sticker/../x.png"},
+		{"parent traversal via absolute url", "https://cdn.example.com/bucket/sticker/../x.png"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

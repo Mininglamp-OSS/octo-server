@@ -149,8 +149,21 @@ func (s *Sticker) renderablePath(stored string) string {
 		return stored
 	}
 	key := strings.TrimPrefix(stored, "file/preview/")
+	// Defense-in-depth against keyspace escape: never hand a "."/".." segment to
+	// DownloadURL (url.JoinPath resolves "..", escaping the sticker/ prefix). The
+	// collect ingress already rejects such keys, but this also confines any
+	// legacy row or the self-upload path. A traversal key falls back to the
+	// stored value (a broken but non-escaping render), matching pre-change
+	// behavior where /v1/file/preview rejected "..".
+	if hasUnsafeSegment(key) {
+		return stored
+	}
 	url, err := s.fileURL.DownloadURL(key, "")
 	if err != nil || url == "" {
+		// Fail open, but make silent degradation observable: on a misconfigured
+		// backend every list item would quietly return its raw stored value.
+		// Low-cardinality — the error, never the per-user path, is logged.
+		s.Warn("解析贴纸渲染 URL 失败，回退到存储原值", zap.Error(err))
 		return stored
 	}
 	return url
