@@ -98,6 +98,38 @@ sandbox (no MySQL/Redis).
 
 The separate `check-sprint` CI question the same review raised is a
 governance/merge-gate question for a human, not a code change — left
+alone.
+
+## Review follow-up 3 (GitHub PR #526, human review — yujiawei)
+Full re-review at head `0c973ef9`, verdict APPROVED, three P2/advisory
+findings:
+- **README push-override wording** (`README.md:111`): the text implied
+  member/bot webhooks always display a fixed "default avatar," but an
+  admin can set a custom avatar on any webhook (including member-created
+  ones) and that value is what's actually locked in at push time — the
+  wording conflated "default" with "stored." Fixed: now says "存量
+  Name/Avatar" and cross-references the avatar section for the
+  admin-can-override-default case.
+- **E2E push test asserts status only, not dispatched payload**
+  (`TestPush_MemberWebhookOverrideSilentlyIgnored`): reviewer suggested
+  asserting `from.name`/`from.avatar` end-to-end, not just "not
+  rejected." **Not done** — the actual message dispatch goes through
+  `ctx.SendMessageWithResult` (real WuKongIM call in this suite, per
+  CLAUDE.md), and there's no existing capture/mock seam for it; every
+  other `from.*` assertion in this package (`richtext_test.go`,
+  `util_test.go`, `TestResolveFromIdentity`) tests `buildPayload`/
+  `resolveFromIdentity` directly rather than through a live HTTP push.
+  Building that capture path is new test infrastructure, not a small
+  fix, and the property is already pinned at the unit level
+  (`TestResolveFromIdentity` with a spoof attempt) — reviewer's own note
+  confirms this. Left as a genuine follow-up suggestion, not applied.
+- **Bare `"Webhook-"` accepted as literal name**: reviewer explicitly
+  flagged "intentional and tested... awareness only" — no action.
+
+A subsequent bot re-review (OctoBoooot, delta `0c973ef9`→`40ddac1`)
+confirmed `api.go` is byte-identical to what was already reviewed and
+reframed yujiawei's two 🟡 notes as pre-existing/out-of-scope for this
+PR, not regressions it introduces — no further action triggered.
 alone per the user's instruction to only act on reviewer-raised code
 issues, not CI/governance gates.
 
