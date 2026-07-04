@@ -776,3 +776,13 @@ func (s *SystemSettings) StickerCustomEnabled() bool {
 func (s *SystemSettings) StickerHandleRequired() bool {
 	return s.getBool("sticker", "handle_required", false)
 }
+
+// DocsEnabled reports whether clients should surface the docs module (backed by
+// the new octo-docs-backend service). This is a presentation toggle only: it
+// gates client-side display of the docs entry and does not itself grant or
+// enforce any server-side authorization. Default false so the module stays
+// hidden until octo-docs-backend is live and the admin flips docs.enabled for a
+// controlled rollout. Value source: system_setting docs.enabled (DB, hot-reloaded).
+func (s *SystemSettings) DocsEnabled() bool {
+	return s.getBool("docs", "enabled", false)
+}

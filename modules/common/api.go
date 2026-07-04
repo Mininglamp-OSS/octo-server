@@ -389,6 +389,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 			MessagesSearchOn:       searchEnabled,
 			StickerCustomEnabled:   cn.systemSettings.StickerCustomEnabled(),
 			StickerHandleRequired:  cn.systemSettings.StickerHandleRequired(),
+			DocsOn:                 cn.systemSettings.DocsEnabled(),
 		})
 		return
 	}
@@ -431,6 +432,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 		MessagesSearchOn:       searchEnabled,
 		StickerCustomEnabled:   cn.systemSettings.StickerCustomEnabled(),
 		StickerHandleRequired:  cn.systemSettings.StickerHandleRequired(),
+		DocsOn:                 cn.systemSettings.DocsEnabled(),
 	})
 }
 
@@ -781,6 +783,14 @@ type appConfigResp struct {
 	// 客户端命中 version 短路分支也必须拿到最新值，否则被本地缓存住失去实时性，故两个
 	// 分支都下发。
 	StickerHandleRequired bool `json:"sticker_handle_required"`
+
+	// DocsOn 告知客户端是否展示文档(docs)模块入口。值来源于 system_setting
+	// docs.enabled；默认 false —— 新增的 octo-docs-backend 服务尚未上线，先隐藏入口，
+	// 上线后由管理台切 docs.enabled 灰度放开。本字段只表达展示策略，不承担服务端鉴权。
+	//
+	// 与 app_config.version 解耦的原因同 LocalLoginOff / SearchEnabled：运维切展示
+	// 策略后老客户端命中 version 短路分支也必须拿到最新值，故两个分支都下发。
+	DocsOn bool `json:"docs_on"`
 }
 
 type oidcProviderResp struct {

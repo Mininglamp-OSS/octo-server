@@ -682,3 +682,17 @@ func TestSystemSettings_StickerCustomEnabled_DBTrueWins(t *testing.T) {
 
 	assert.True(t, s.StickerCustomEnabled(), "DB true -> custom sticker management enabled")
 }
+
+func TestSystemSettings_DocsEnabled_DefaultsFalse(t *testing.T) {
+	s := newTestSystemSettings(t, nil)
+
+	assert.False(t, s.DocsEnabled(), "DB empty -> docs module hidden by default")
+}
+
+func TestSystemSettings_DocsEnabled_DBTrueWins(t *testing.T) {
+	s := newTestSystemSettings(t, nil)
+	require.NoError(t, s.db.upsert("docs", "enabled", "1", settingTypeBool, ""))
+	require.NoError(t, s.Reload())
+
+	assert.True(t, s.DocsEnabled(), "DB true -> docs module shown")
+}

@@ -147,6 +147,12 @@ var systemSettingSchema = []settingDef{
 	{Category: "sticker", Key: "handle_required", Type: settingTypeBool, Description: "新增自定义贴纸是否强制校验上传句柄 handle（关闭=兼容期放行缺失句柄并观测，开启=缺/伪造一律拒；需服务端配有效 OCTO_MASTER_KEY 才有校验能力）",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.StickerHandleRequired()) }},
 
+	// docs 模块展示开关（客户端据此决定是否展示 docs 入口）。新增的 octo-docs-backend
+	// 服务尚未上线，默认关闭；上线后由管理台切 docs.enabled 灰度放量。仅表达展示策略，
+	// 不承担任何服务端鉴权。经 GET /v1/common/appconfig 的 docs_on 下发给客户端。
+	{Category: "docs", Key: "enabled", Type: settingTypeBool, Description: "是否向客户端展示文档(docs)模块入口（octo-docs-backend 上线前默认关闭）",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.DocsEnabled()) }},
+
 	// Email server config — formerly yaml-only (Support.* in config.go).
 	{Category: "support", Key: "email", Type: settingTypeString, Description: "技术支持邮箱（发件人）",
 		Effective: func(s *SystemSettings) string { return s.SupportEmail() }},
