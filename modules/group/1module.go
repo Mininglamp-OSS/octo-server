@@ -1,6 +1,7 @@
 package group
 
 import (
+	"context"
 	"embed"
 	"fmt"
 	"time"
@@ -30,8 +31,27 @@ func init() {
 		// source_space_* / home_space_* 字段，让 Web/Android/iOS UserInfo 能区分
 		// "同 Space 非好友 → 直接发消息" vs "跨 Space 外部成员 → 仅可在群内交流"。
 		user.RegisterGroupMemberExternalProvider(api.groupService.GetMemberExternalFields)
+
+		// #394 孤儿群对账 worker：收口 CreateGroup「commit 后建频道」失败留下的孤儿群。
+		// workerCancel 每次 Start 重建，给未来 graceful-reload 留余地（当前框架只 Start 一次）。
+		reconciler := NewChannelReconciler(ctx.(*config.Context), LoadChannelReconcileConfig())
+		var reconcilerCancel context.CancelFunc
+
 		return register.Module{
 			Name: "group",
+			Start: func() error {
+				workerCtx, cancel := context.WithCancel(context.Background())
+				reconcilerCancel = cancel
+				reconciler.Start(workerCtx)
+				return nil
+			},
+			Stop: func() error {
+				if reconcilerCancel != nil {
+					reconcilerCancel()
+				}
+				reconciler.Stop()
+				return nil
+			},
 			SetupAPI: func() register.APIRouter {
 				return api
 			},

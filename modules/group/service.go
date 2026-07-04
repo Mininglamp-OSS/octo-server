@@ -1185,6 +1185,14 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 		return nil, errors.New("failed to insert group record")
 	}
 
+	// 标记 IM 频道尚未确认创建：本群走「commit 后建频道」路径，提交后若建频道失败且
+	// 补偿删除也失败（或进程崩在 commit 与建频道之间），残留群行的 channel_synced 停在 0，
+	// 由 ChannelReconciler 发现并重建频道 / 硬删除，闭合孤儿窗口。#394
+	if err := s.db.MarkChannelUnsyncedTx(groupNo, tx); err != nil {
+		s.Error("mark channel unsynced failed", zap.Error(err), zap.String("groupNo", groupNo))
+		return nil, errors.New("failed to mark channel unsynced")
+	}
+
 	// 插入成员
 	realMemberUIDs := make([]string, 0, len(memberUsers))
 	memberVos := make([]*config.UserBaseVo, 0, len(memberUsers))
@@ -1322,6 +1330,14 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 			s.Error("compensating delete group failed", zap.Error(delErr), zap.String("groupNo", groupNo))
 		}
 		return nil, errors.New("failed to create IM channel, group has been rolled back")
+	}
+
+	// IM 频道创建确认成功 → 标记 channel_synced=1，使对账 worker 不再扫这条群。
+	// best-effort：标记失败只记日志——频道已建成，下轮对账会再跑一次（IMCreate 幂等），
+	// 无害；绝不能因标记失败而回滚已成功的建群。#394
+	if err := s.db.MarkChannelSynced(groupNo); err != nil {
+		s.Error("mark channel synced failed (channel created OK; reconciler will re-sync)",
+			zap.Error(err), zap.String("groupNo", groupNo))
 	}
 
 	// 发送群创建通知

@@ -50,6 +50,56 @@ func (d *DB) UpdateGroupType(groupNo string, groupType GroupType) error {
 	return err
 }
 
+// MarkChannelUnsyncedTx 在事务内把 group.channel_synced 置 0（IM 频道尚未确认创建）。
+// CreateGroup 在群行插入后、commit 前调用；提交后的建频道失败若补偿删除也失败，
+// 残留的群行 channel_synced 停在 0，被 ChannelReconciler 发现并收口。#394
+func (d *DB) MarkChannelUnsyncedTx(groupNo string, tx *dbr.Tx) error {
+	_, err := tx.Update("group").Set("channel_synced", 0).Where("group_no=?", groupNo).Exec()
+	return err
+}
+
+// MarkChannelSynced 把 group.channel_synced 置 1（IM 频道已确认创建）。
+func (d *DB) MarkChannelSynced(groupNo string) error {
+	_, err := d.session.Update("group").Set("channel_synced", 1).Where("group_no=?", groupNo).Exec()
+	return err
+}
+
+// QueryUnsyncedGroupNos 返回 channel_synced=0 且 created_at < before 的群编号（最多 limit 个）。
+// before 是宽限期上界：跳过刚建、IM 创建可能仍在途的新群，避免与建群主路径抢跑。
+func (d *DB) QueryUnsyncedGroupNos(before time.Time, limit int) ([]string, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	var groupNos []string
+	_, err := d.session.Select("group_no").
+		From("group").
+		Where("channel_synced=0 AND created_at < ?", before).
+		OrderDir("created_at", true).
+		Limit(uint64(limit)).
+		Load(&groupNos)
+	return groupNos, err
+}
+
+// QueryMemberUIDsWithGroupNo 返回某群全部未删除成员 uid（对账重建 IM 频道订阅者用）。
+func (d *DB) QueryMemberUIDsWithGroupNo(groupNo string) ([]string, error) {
+	var uids []string
+	_, err := d.session.Select("uid").
+		From("group_member").
+		Where("group_no=? AND is_deleted=0", groupNo).
+		Load(&uids)
+	return uids, err
+}
+
+// DeleteOrphanGroup 硬删除孤儿群行（连同残留 group_member）。用于补偿删除部分成功
+// （group_member 已删、group 行残留）→ 群已无有效成员、不可恢复的场景。
+func (d *DB) DeleteOrphanGroup(groupNo string) error {
+	if _, err := d.session.DeleteFrom("group_member").Where("group_no=?", groupNo).Exec(); err != nil {
+		return err
+	}
+	_, err := d.session.DeleteFrom("group").Where("group_no=?", groupNo).Exec()
+	return err
+}
+
 // InsertMemberTx 插入群成员信息(带事务)
 func (d *DB) InsertMemberTx(m *MemberModel, tx *dbr.Tx) error {
 	_, err := tx.InsertInto("group_member").Columns(util.AttrToUnderscore(m)...).Record(m).Exec()
