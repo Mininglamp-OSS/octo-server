@@ -167,6 +167,15 @@ func (d *DB) queryMembers(spaceId string, loginUID string, page uint64, limit ui
 	return models, err
 }
 
+// memberVerificationJoinOn 是 space_member → user_verification 的 collation-safe
+// LEFT JOIN 条件。user_verification 被 modules/base 的 compat-repair 迁移强制
+// utf8mb4_general_ci，而 space_member 无显式 COLLATE、继承 DB 默认；在以 MySQL 8.0
+// 服务器默认（utf8mb4_0900_ai_ci）建库的部署上，裸的 uv.user_id = sm.uid 比较会抛
+// Illegal mix of collations (1267)（见 #482：queryMembers 已上 main 的同类风险）。
+// 显式 COLLATE 把 sm.uid 归一到 general_ci，使搜索路径不复刻同一 500 风险，且在
+// 规范 general_ci 库上是 no-op。
+const memberVerificationJoinOn = "uv.user_id = sm.uid COLLATE utf8mb4_general_ci"
+
 func (d *DB) searchMembers(spaceId, keyword string, pageIndex, pageSize int) ([]*memberSearchModel, error) {
 	builder := d.session.Select(
 		"sm.*",
@@ -174,9 +183,11 @@ func (d *DB) searchMembers(spaceId, keyword string, pageIndex, pageSize int) ([]
 		"IFNULL(u.username,'') as username",
 		"IFNULL(u.email,'') as email",
 		"IFNULL(u.phone,'') as phone",
+		"IFNULL(uv.real_name,'') as real_name",
 		"CASE WHEN r.robot_id IS NOT NULL AND r.status=1 THEN 1 ELSE 0 END as robot",
 	).From(dbr.I("space_member").As("sm")).
 		LeftJoin(dbr.I("user").As("u"), "u.uid=sm.uid").
+		LeftJoin(dbr.I("user_verification").As("uv"), memberVerificationJoinOn).
 		LeftJoin(dbr.I("robot").As("r"), "r.robot_id=sm.uid").
 		Where("sm.space_id=? AND sm.status=1", spaceId)
 	if keyword != "" {
@@ -198,6 +209,7 @@ func (d *DB) countSearchMembers(spaceId, keyword string) (int64, error) {
 	builder := d.session.Select("COUNT(*)").
 		From(dbr.I("space_member").As("sm")).
 		LeftJoin(dbr.I("user").As("u"), "u.uid=sm.uid").
+		LeftJoin(dbr.I("user_verification").As("uv"), memberVerificationJoinOn).
 		Where("sm.space_id=? AND sm.status=1", spaceId)
 	if keyword != "" {
 		clause, args := memberSearchActiveWhere(keyword)

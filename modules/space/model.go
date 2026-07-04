@@ -47,6 +47,7 @@ type memberSearchModel struct {
 	Username string
 	Email    string
 	Phone    string
+	RealName string // 实名兜底（user_verification.real_name），仅作 name 为空时的回退源
 	Robot    int
 }
 
@@ -272,13 +273,31 @@ const memberDisplayNamePlaceholderPrefix = "User "
 //
 // 任何分支都不会返回空串，也不会暴露 short_no / username。
 func (m *MemberDetailModel) DisplayName() string {
-	if m.Name != "" {
-		return m.Name
+	return resolveMemberDisplayName(m.Name, m.RealName, m.UID)
+}
+
+// DisplayName 让成员搜索路径（issue #434）复用与成员列表相同的兜底链，
+// 避免空名成员在搜索结果里渲染成空白行。见 resolveMemberDisplayName。
+func (m *memberSearchModel) DisplayName() string {
+	return resolveMemberDisplayName(m.Name, m.RealName, m.UID)
+}
+
+// resolveMemberDisplayName 是成员展示名兜底链的纯函数实现（issue #344、#434）：
+//  1. name 非空 → 原样返回；
+//  2. 否则 realName 非空 → 返回实名；
+//  3. 都空 → 返回稳定占位符 "<memberDisplayNamePlaceholderPrefix><uid>"。
+//
+// 成员列表（MemberDetailModel）与成员搜索（memberSearchModel）两条路径共用它，
+// 避免兜底链被各自重新实现而在演进中漂移。任何分支都不返回空串，也绝不读
+// short_no / username（privacy-gated）。
+func resolveMemberDisplayName(name, realName, uid string) string {
+	if name != "" {
+		return name
 	}
-	if m.RealName != "" {
-		return m.RealName
+	if realName != "" {
+		return realName
 	}
-	return memberDisplayNamePlaceholderPrefix + m.UID
+	return memberDisplayNamePlaceholderPrefix + uid
 }
 
 // SpaceDetailModel 带成员数和角色的空间详情（MaxUsers 从 SpaceModel 继承）

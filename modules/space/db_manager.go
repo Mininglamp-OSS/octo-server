@@ -54,7 +54,9 @@ func memberSearchWhere(keyword string) (string, []interface{}) {
 //     （响应仅显示 138****5678），admin 无法通过子串查询逐位探测/重建完整号码。
 //
 // 前端注意：phone 检索只匹配后 4 位，传完整号码不会命中——按手机号查找请用后 4 位。
-var memberSearchActiveColumns = []string{"u.name", "u.username", "u.email", "RIGHT(u.phone,4)", "sm.uid"}
+// uv.real_name 让空 user.name 的成员可按实名被搜到（issue #434）；对应的 uv LEFT JOIN
+// 由 searchMembers / countSearchMembers 以 collation-safe 方式挂入（memberVerificationJoinOn）。
+var memberSearchActiveColumns = []string{"u.name", "u.username", "u.email", "RIGHT(u.phone,4)", "sm.uid", "uv.real_name"}
 
 // memberSearchActiveWhere 为空间侧 members/search 组装跨列 OR LIKE 条件。
 // list / count 共用同一条件，避免搜索范围漂移导致分页错位。
