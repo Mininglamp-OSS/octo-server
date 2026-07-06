@@ -442,6 +442,55 @@ func personConvHasSpaceMessages(conv *SyncUserConversationResp, targetSpaceID st
 	return false
 }
 
+// spaceizePersonRecents 把每条 Person (DM) 会话的 Recents 收敛到当前 Space —— 直接复用
+// filterPersonMessagesBySpace（/v1/message/channel/sync 的同一份 DM 空间归属规则：精确匹配，
+// 或「无标签 = 默认 Space」的裸 DM 约定；系统 Bot 走 rule 4，只保留精确打标当前 Space 的消息）。
+// 复用而非再抄一遍判定逻辑，避免与历史过滤漂移出两套「哪条消息属于哪个 Space」的口径。
+//
+// 背景（本 PR 修复的会话缺失 bug）：客户端 SpaceFilter 按会话「最后一条消息」（recents[0]）的
+// payload.space_id 判定该会话归属哪个 Space；而服务端此前把 WuKongIM 的 Recents（物理频道的
+// 全局最新窗口，与 Space 无关）原样透传。于是一条在 Space A、Space B 都有消息的 DM，其全局最新
+// 一条属于 B，客户端就把整条会话过滤出 Space A —— 即便服务端 decideConvKeepInSpace 已判定它属于
+// Space A（presence / hasSpaceMsg），也会在客户端消失。这与历史过滤 filterPersonMessagesBySpace
+// 是同一类问题，只是会话同步的 Recents 之前漏做了空间化。
+//
+// 空间化后窗口里每一条都属于当前 Space，recents[0]（无论客户端把哪端当「最新」）恒为当前 Space
+// 的消息，可见性判定不再被跨 Space 的最新消息带偏。过滤后为空（当前 Space 的消息在窗口外）时
+// Recents 保持为空：客户端读不到跨 Space 的 recents[0]，不再误隐藏该会话（它已被
+// decideConvKeepInSpace 判定属于当前 Space，会以空预览行正常展示 —— 时间/排序走会话级 timestamp、
+// 未读走 space_unread、预览走 space_last_message）。不用 SpaceLastMessage 回填 recents：预览已由
+// space_last_message 承载，空 recents 也不会触发隐藏；回填反而会把一条绕过 channelOffset/
+// deviceOffset、缺富化字段的兜底消息塞进 recents[0]，与其余 recents 口径不一致。
+//
+// 隔离安全（space-isolation 规则）：只放行归属当前 Space 的消息，不会把 Space B 的消息内容泄漏进
+// Space A 的响应；当前 Space 无消息时收敛为空（fail-closed，宁可空预览也不泄漏跨 Space 消息）。
+//
+// 仅处理 ChannelTypePerson；Group / CommunityTopic 的 Space 隔离在 channel_id 层完成，其 Recents
+// 不受影响。系统 Bot（botfather / fileHelper / u_10000 等）同样空间化：filterPersonMessagesBySpace
+// 内部按 isSysBot 走 rule 4，untagged 历史一律不归属任何 Space、只保留精确打标当前 Space 的消息，
+// 与预览/未读 (fillPersonSpaceUnread) 同口径。系统 Bot 的会话可见性另由 EnsureSystemBotsPresent +
+// 客户端豁免保证（始终展示，与本收敛无关）；这里只收敛其 Recents，避免历史里被隐藏的 untagged /
+// 跨 Space 消息经 recents[0] 当预览漏出（#532 同口径）。
+//
+// 会话级 last_msg_seq / last_client_msg_no 不改动：它们是 WuKongIM 增量同步游标（客户端据其推进
+// version），须保持全局口径；Web/扩展端不读它们做 Space 过滤，跨端 Space 判定的权威信号是消息级
+// payload.space_id（即 Recents）。
+//
+// 必须在 fillPersonSpaceUnread 与 FilterConversationsBySpace 之后调用：两者都读原始（未收窄）
+// Recents —— 前者据此算 space_last_message / space_unread，后者据此做 keep 判定（hasSpaceMsg），
+// 提前收窄会破坏它们。
+func spaceizePersonRecents(conversations []*SyncUserConversationResp, spaceID, defaultSpaceID string) {
+	if spaceID == "" {
+		return
+	}
+	for _, conv := range conversations {
+		if conv == nil || conv.ChannelType != common.ChannelTypePerson.Uint8() {
+			continue
+		}
+		conv.Recents = filterPersonMessagesBySpace(conv.Recents, conv.ChannelID, spaceID, defaultSpaceID)
+	}
+}
+
 // EnsureSystemBotsPresent 保证 Space-scoped sync 响应中一定包含系统 Bot
 // （目前 botfather / u_10000 / fileHelper）的 conversation entry。
 //

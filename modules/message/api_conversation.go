@@ -894,6 +894,13 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 			syncUserConversationResps, filterSpaceID, loginUID, co.ctx, co.groupService,
 		)
 
+		// 把保留下来的 Person DM 的 Recents 空间化：只保留当前 Space 的消息，使
+		// recents[0]（客户端 SpaceFilter 读取的「最后一条消息」）恒属于当前 Space，
+		// 修复「DM 在按空间的最近会话列表中缺失」—— 客户端此前按全局最新（跨 Space）
+		// 消息的 space_id 把整条会话过滤掉。必须在 fillPersonSpaceUnread（算
+		// SpaceLastMessage）与 FilterConversationsBySpace（keep 判定读原始 Recents）之后。
+		spaceizePersonRecents(syncUserConversationResps, filterSpaceID, defaultSpaceID)
+
 		// YUJ-216 / GH#1280: 系统 Bot（botfather 等）在所有 Space 都应可见。
 		// IM 核心按 version 增量返回 conversation，若系统 Bot 在此次 window 内
 		// 没有新消息，Space 过滤后就会缺席；移动端没有前端兜底，会直接丢失 entry。
