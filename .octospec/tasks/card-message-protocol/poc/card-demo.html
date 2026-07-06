@@ -108,21 +108,21 @@
 <body>
 <div class="shell">
   <div class="tabs" id="tabs">
-    <button data-tab="t1" class="active">Demo 1 · 静态卡片(P1)</button>
-    <button data-tab="t2">Demo 2 · 交互闭环(P2)</button>
+    <button data-tab="t12" class="active">Demo 1&amp;2 · 卡片 + 交互</button>
     <button data-tab="t3">Demo 3 · Agent 执行态</button>
+    <button data-tab="t4">Demo 4 · 任务状态与进度</button>
   </div>
-  <div class="tab-panel active" id="t1">
-    <div class="chat-title">octo/v1 展示卡 · 降级链 · 渲染门禁(零依赖自研渲染器,决策 B)</div>
-    <div id="chat1"></div>
-  </div>
-  <div class="tab-panel" id="t2">
-    <div class="chat-title">点击“通过”→ 幂等提交 → bot 整卡重写;卡片下方可查看变更历史</div>
-    <div id="chat2"></div>
+  <div class="tab-panel active" id="t12">
+    <div class="chat-title">一张 octo/v1 展示卡(P1)+ 一个 octo/v2 交互实例(P2):点“通过”→ 幂等提交 → bot 整卡重写 → 变更历史</div>
+    <div id="chat12"></div>
   </div>
   <div class="tab-panel" id="t3">
     <div class="chat-title">thinking → tool_call → tool_result → final;D9 乱序帧拒绝;connector 超纲降级</div>
     <div id="chat3"></div>
+  </div>
+  <div class="tab-panel" id="t4">
+    <div class="chat-title">类 Matter 任务卡:状态流转 + 进度展示;里程碑帧入历史,细粒度进度 transient 不入史(D10)</div>
+    <div id="chat4"></div>
   </div>
 </div>
 <div class="rev-drawer" id="revDrawer">
@@ -342,10 +342,10 @@ document.getElementById('tabs').addEventListener('click', e => {
 const demoUser = { name: '演示用户', color: '#00b42a', isBot: false, time: '10:02' };
 const ciBot    = { name: 'CI 助手',   color: '#165dff', isBot: true,  time: '10:01' };
 
-/* ================= Tab 1:静态卡片 ================= */
-const chat1 = document.getElementById('chat1');
-chat1.appendChild(messageItem(demoUser, plainBubble('帮我盯一下 #525 的 CI')));
-chat1.appendChild(messageItem(ciBot, renderCard({
+/* ============ Tab 1&2(合并):一张展示卡 + 一个交互实例 ============ */
+const chat12 = document.getElementById('chat12');
+chat12.appendChild(messageItem(demoUser, plainBubble('帮我盯一下 #525 的 CI')));
+chat12.appendChild(messageItem(ciBot, renderCard({
   type: 17, card_version: '1.5', profile: 'octo/v1',
   plain: 'PR #525 merged\n仓库: octo-server\n作者: demo-user\n状态: ✅ 已合并',
   card: {
@@ -371,34 +371,6 @@ chat1.appendChild(messageItem(ciBot, renderCard({
     ],
   },
 }, true)));
-chat1.appendChild(messageItem(ciBot, renderCard({
-  type: 17, card_version: '1.5', profile: 'octo/v1',
-  plain: '📊 本周部署报告\n成功: 47 次\n失败: 2 次',
-  card: {
-    type: 'AdaptiveCard', version: '1.5',
-    selectAction: { type: 'Action.OpenUrl', url: 'https://example.com/deploy-report' },
-    body: [
-      { type: 'TextBlock', weight: 'Bolder', text: '📊 本周部署报告(点卡片查看)' },
-      { type: 'FactSet', facts: [
-        { title: '成功', value: '47 次' }, { title: '失败', value: '2 次' },
-      ] },
-    ],
-  },
-}, true)));
-chat1.appendChild(messageItem(ciBot, renderCard({
-  type: 17, card_version: '1.5', profile: 'octo/v2',
-  plain: '审批单 #42:市场部预算调整,等待你的审批',
-  card: { /* 含 Action.Submit,P1 端不渲染 */ },
-}, true)));
-chat1.appendChild(messageItem(demoUser, renderCard({
-  type: 17, card_version: '1.5', profile: 'octo/v1',
-  plain: '⚠ 中奖通知:点击领取',
-  card: { type: 'AdaptiveCard', version: '1.5', body: [
-    { type: 'TextBlock', text: '你中奖了!' } ] },
-}, false)));
-
-/* ================= Tab 2:交互闭环 + 变更历史 ================= */
-const chat2 = document.getElementById('chat2');
 const P2_PROFILES = ['octo/v1', 'octo/v2'];
 const approvalBot = { name: '审批助手', color: '#7c3aed', isBot: true, time: '10:05' };
 const approvalEnvelope = {
@@ -430,7 +402,7 @@ approvalHint.className = 'octo-card__hint';
 approvalHint.textContent = '契约:防重复=服务端幂等(D4)+状态随整卡重写(D6)+本地瞬时禁用(D8,10s 超时恢复);900ms 模拟 bot 轮询+回写延迟';
 approvalMain.appendChild(approvalHint);
 const refreshApprovalRev = revisionLink('approval', approvalMain);
-chat2.appendChild(approvalItem);
+chat12.appendChild(approvalItem);
 
 function onApprovalAction(actionId, inputs, cardRoot, done) {
   setTimeout(() => {   // 模拟 bot 轮询到 card_action 并回写(真实延迟=bot 轮询节奏,D5)
@@ -480,10 +452,11 @@ function openclawOutput(fallback, card) {
   return `${fallback}\n\n${CARD_OPEN}${JSON.stringify(card)}${CARD_CLOSE}`;
 }
 
+/* mock botMessageEdit 的 D9 card_seq CAS;store 为该消息的 message_extra 模拟 */
 const mockExtra = { storedSeq: 0 };
-function mockBotMessageEdit(env) {
-  if (env.card_seq !== undefined && env.card_seq <= mockExtra.storedSeq) return { ok: false, status: 409 };
-  mockExtra.storedSeq = env.card_seq ?? mockExtra.storedSeq;
+function mockBotMessageEdit(store, env) {
+  if (env.card_seq !== undefined && env.card_seq <= store.storedSeq) return { ok: false, status: 409 };
+  store.storedSeq = env.card_seq ?? store.storedSeq;
   return { ok: true };
 }
 
@@ -538,7 +511,7 @@ function applyFrame(openclawText, profile, seq, label, transient) {
     agentCardNode.replaceWith(node); agentCardNode = node;
     return;
   }
-  const res = mockBotMessageEdit(out.env);
+  const res = mockBotMessageEdit(mockExtra, out.env);
   if (!res.ok) {
     logFrame(`✗ frame seq=${seq}(${label})迟到于 seq=${mockExtra.storedSeq} → 409 card_seq conflict,已拒绝(D9)`, true);
     return;
@@ -586,6 +559,91 @@ chat3.appendChild(chartItem);
   const node = plainBubble(out.fallback, 'ⓘ 卡片超纲被拒,connector 已降级为纯文本');
   chartNode.replaceWith(node);
 })();
+
+/* ================= Tab 4:任务状态与进度(类 Matter 任务卡) =================
+   验证点:状态/进度这类「看板型」内容不需要专用元素 —— octo/v1 白名单原语
+   (TextBlock/ColumnSet/FactSet/Container)拼装即可;状态流转 = D6 整帧替换;
+   细粒度进度帧 transient 不入史、里程碑帧入史(D10);频率遵循 milestone-cadence
+   指南(≥2-5s 或 ≥25% 步进),不做每秒进度条。 */
+const chat4 = document.getElementById('chat4');
+const taskBot = { name: '任务助手', color: '#0fc6c2', isBot: true, time: '10:12' };
+const progressBar = p => '█'.repeat(Math.round(p / 10)) + '░'.repeat(10 - Math.round(p / 10)) + `  ${p}%`;
+
+function taskFrame({ seq, badge, status, pct, steps, transient, extraFacts }) {
+  const env = {
+    type: 17, card_version: '1.5', profile: 'octo/v1', card_seq: seq,
+    plain: `任务 OCTO-291:客户端渲染门禁\n状态: ${status} · 进度: ${pct}%`,
+    card: {
+      type: 'AdaptiveCard', version: '1.5',
+      body: [
+        { type: 'ColumnSet', columns: [
+          { items: [ { type: 'TextBlock', weight: 'Bolder', text: '🗂 OCTO-291 · 客户端渲染门禁' } ] },
+          { width: 'auto', items: [ { type: 'TextBlock', text: badge } ] },
+        ] },
+        { type: 'TextBlock', text: progressBar(pct) },
+        { type: 'FactSet', facts: [
+          { title: '负责人', value: '员工甲' },
+          { title: '截止',   value: '07-20' },
+          ...(extraFacts || []),
+        ] },
+        { type: 'Container', items: steps.map(([done, label]) =>
+          ({ type: 'TextBlock', text: `${done ? '☑' : '☐'} ${label}` })) },
+      ],
+      actions: [ { type: 'Action.OpenUrl', title: '查看任务', url: 'https://example.com/tasks/OCTO-291' } ],
+    },
+  };
+  if (transient) env.transient = true;
+  return env;
+}
+
+const TASK_FRAMES = [
+  { label: '任务创建(入历史)', env: taskFrame({ seq: 1, badge: '⚪ 待办', status: '待办', pct: 0,
+      steps: [[false, '需求评审'], [false, 'iOS 实现'], [false, 'Android 实现'], [false, 'Web 实现']] }) },
+  { label: '进度 25%(transient)', env: taskFrame({ seq: 2, transient: true, badge: '🔵 进行中', status: '进行中', pct: 25,
+      steps: [[true, '需求评审'], [false, 'iOS 实现'], [false, 'Android 实现'], [false, 'Web 实现']] }) },
+  { label: '进度 50%(transient)', env: taskFrame({ seq: 3, transient: true, badge: '🔵 进行中', status: '进行中', pct: 50,
+      steps: [[true, '需求评审'], [true, 'iOS 实现'], [false, 'Android 实现'], [false, 'Web 实现']] }) },
+  { label: '里程碑:双端实现完成(入历史)', env: taskFrame({ seq: 4, badge: '🔵 进行中', status: '进行中', pct: 75,
+      steps: [[true, '需求评审'], [true, 'iOS 实现'], [true, 'Android 实现'], [false, 'Web 实现']],
+      extraFacts: [{ title: '里程碑', value: '双端实现完成' }] }) },
+  { label: '已完成(入历史)', env: taskFrame({ seq: 5, badge: '🟢 已完成', status: '已完成', pct: 100,
+      steps: [[true, '需求评审'], [true, 'iOS 实现'], [true, 'Android 实现'], [true, 'Web 实现']],
+      extraFacts: [{ title: '完成于', value: '07-06 10:14' }] }) },
+];
+
+const taskExtra = { storedSeq: 0 };
+let taskCardNode = plainBubble('…');
+const taskItem = messageItem(taskBot, taskCardNode);
+const taskMain = taskItem.querySelector('.wk-message-item__main');
+const taskHint = document.createElement('div');
+taskHint.className = 'octo-card__hint';
+taskHint.textContent = '契约映射:状态与进度即卡片内容(无独立状态存储,D6)· 进度帧 transient 不入史 / 里程碑帧入史(D10)· card_seq 单调递增(D9)';
+taskMain.appendChild(taskHint);
+const taskLog = document.createElement('div');
+taskLog.className = 'frame-log';
+taskMain.appendChild(taskLog);
+const refreshTaskRev = revisionLink('task', taskMain);
+chat4.appendChild(taskItem);
+
+function applyTaskFrame(i) {
+  const { label, env } = TASK_FRAMES[i];
+  const res = mockBotMessageEdit(taskExtra, env);
+  const line = document.createElement('div');
+  if (!res.ok) {
+    line.className = 'rej';
+    line.textContent = `✗ frame seq=${env.card_seq}(${label})≤ 已存 seq=${taskExtra.storedSeq} → 409(D9)`;
+  } else {
+    recordRevision('task', env, '任务助手');
+    refreshTaskRev();
+    const node = renderCard(env, true, P2_PROFILES);
+    taskCardNode.replaceWith(node); taskCardNode = node;
+    line.textContent = `${env.transient ? '◌' : '✓'} frame seq=${env.card_seq} 应用:${label}`;
+  }
+  taskLog.appendChild(line);
+}
+
+if (!MANUAL3) TASK_FRAMES.forEach((_, i) => setTimeout(() => applyTaskFrame(i), i * 900));
+window.__demo4 = { apply: applyTaskFrame, total: TASK_FRAMES.length };
 </script>
 </body>
 </html>
