@@ -70,6 +70,12 @@ type IService interface {
 	// synthetic events transparently. Returns an error only when the
 	// Redis ZADD / GenSeq call fails.
 	EnqueueBotEvent(robotID string, message *config.MessageResp) error
+	// EnqueueBotTypedEvent appends a typed (event_type/event_data) event
+	// for `robotID` to the same queue. card-message-interaction P2 D5:
+	// card_action 事件经此入队 —— 增量事件类型，bot SDK 须容忍未知
+	// event_type。与 EnqueueBotEvent 共用 GenSeq/ZAdd/Expire chokepoint，
+	// 队列语义不可漂移。
+	EnqueueBotTypedEvent(robotID, eventType string, eventData map[string]interface{}) error
 	// ExistRobot reports whether `uid` identifies an active robot
 	// (robot.status=1). Mininglamp-OSS/octo-server#144: the ingress
 	// chokepoint that expands `mention.ais=1` into `mention.uids` uses
@@ -151,6 +157,16 @@ func (rb *Robot) EnqueueBotEvent(robotID string, message *config.MessageResp) er
 	return enqueueBotEventGeneric(rb.ctx, robotID, message)
 }
 
+// EnqueueBotTypedEvent — IService — Service variant（card_action 等类型化事件）。
+func (s *Service) EnqueueBotTypedEvent(robotID, eventType string, eventData map[string]interface{}) error {
+	return enqueueBotTypedEventGeneric(s.ctx, robotID, eventType, eventData)
+}
+
+// EnqueueBotTypedEvent — IService — *Robot variant.
+func (rb *Robot) EnqueueBotTypedEvent(robotID, eventType string, eventData map[string]interface{}) error {
+	return enqueueBotTypedEventGeneric(rb.ctx, robotID, eventType, eventData)
+}
+
 // ExistRobot — IService — Service variant. Delegates to the same
 // robotDB.exist helper used by /v1/manager/robots etc., scoped to
 // `status=1` (active robots only). See the IService docstring for the
@@ -212,6 +228,42 @@ func enqueueBotEventGeneric(ctx *config.Context, robotID string, message *config
 	if err := ctx.GetRedisConn().Expire(key, ctx.GetConfig().Robot.MessageExpire); err != nil {
 		// Best-effort TTL refresh — do not fail the enqueue. Mirrors
 		// saveRobotMessage which also only logs on Expire failure.
+		return nil
+	}
+	return nil
+}
+
+// enqueueBotTypedEventGeneric 是类型化事件（event_type/event_data，如 P2 的
+// card_action）的入队 helper。与 enqueueBotEventGeneric 共用 GenSeq / ZAdd /
+// Expire 形状（同一 seq 序列、同一 key、同一 TTL），/v1/bot/events 消费端
+// （bot_api events.go 的 robotEvent 解析结构）对两类条目透明。
+// event_data 形状由 card-message-interaction brief 冻结：实现只许增字段。
+func enqueueBotTypedEventGeneric(ctx *config.Context, robotID, eventType string, eventData map[string]interface{}) error {
+	if ctx == nil {
+		return errors.New("robot: nil ctx, cannot enqueue bot event")
+	}
+	if strings.TrimSpace(robotID) == "" {
+		return errors.New("robot: empty robotID, cannot enqueue bot event")
+	}
+	if strings.TrimSpace(eventType) == "" {
+		return errors.New("robot: empty eventType, cannot enqueue bot event")
+	}
+	seq, err := ctx.GenSeq(fmt.Sprintf("%s%s", common.RobotEventSeqKey, robotID))
+	if err != nil {
+		return err
+	}
+	eventJson := util.ToJson(&robotEvent{
+		EventID:   seq,
+		EventType: eventType,
+		EventData: eventData,
+		Expire:    time.Now().Add(ctx.GetConfig().Robot.MessageExpire).Unix(),
+	})
+	key := fmt.Sprintf("robotEvent:%s", robotID)
+	if err := ctx.GetRedisConn().ZAdd(key, float64(seq), eventJson); err != nil {
+		return err
+	}
+	if err := ctx.GetRedisConn().Expire(key, ctx.GetConfig().Robot.MessageExpire); err != nil {
+		// Best-effort TTL refresh — 与 enqueueBotEventGeneric 同口径。
 		return nil
 	}
 	return nil

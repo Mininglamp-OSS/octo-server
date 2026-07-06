@@ -27,6 +27,19 @@ var (
 		HTTPStatus:     http.StatusBadRequest,
 		DefaultMessage: "Card messages cannot be edited.",
 	})
+	// ErrMessageCardActionInvalid P2 D3 的单一 400（防枚举：非卡片 / sender 非
+	// bot / action_id 不在生效帧 / 功能未启用 统一归并，具体原因只进日志）。
+	ErrMessageCardActionInvalid = register(codes.Code{
+		ID:             "err.server.message.card_action_invalid",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Invalid card action.",
+	})
+	// ErrMessageCardActionDenied P2 D3 成员资格校验失败（403）。
+	ErrMessageCardActionDenied = register(codes.Code{
+		ID:             "err.server.message.card_action_denied",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "You cannot act on this card.",
+	})
 
 	// ---- modules/bot_api（bot ingress / 编辑路径）--------------------------
 
@@ -57,6 +70,13 @@ var (
 		ID:             "err.server.bot_api.card_edit_forbidden",
 		HTTPStatus:     http.StatusBadRequest,
 		DefaultMessage: "Card messages cannot be edited yet.",
+	})
+	// ErrBotAPICardSeqConflict P2 D9：card_seq CAS 拒绝乱序帧（fail-closed，
+	// bot 据此得知自己竞态了；不带 card_seq 的编辑维持 last-write-wins）。
+	ErrBotAPICardSeqConflict = register(codes.Code{
+		ID:             "err.server.bot_api.card_seq_conflict",
+		HTTPStatus:     http.StatusConflict,
+		DefaultMessage: "Card was updated concurrently; retry with a newer card_seq.",
 	})
 
 	// ---- modules/robot（robot 编辑路径）------------------------------------

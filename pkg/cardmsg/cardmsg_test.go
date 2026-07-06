@@ -163,10 +163,13 @@ func TestValidateURLAllowlist(t *testing.T) {
 }
 
 func TestValidateProfileNegotiation(t *testing.T) {
+	// 注:正式实现按 brief 分期,P1 服务端只接受 {octo/v1};本 POC 分支同时携带
+	// P1+P2,接受集为 {octo/v1, octo/v2}(v2 白名单见 interactive_test.go),
+	// 故此处断言"未知 profile 被拒"。
 	env := envelope(nil)
-	env["profile"] = "octo/v2"
+	env["profile"] = "octo/v3"
 	if err := Validate(env); !errors.Is(err, ErrCardProfileUnsupported) {
-		t.Errorf("octo/v2 在 P1 应被拒, err=%v", err)
+		t.Errorf("未知 profile 应被拒, err=%v", err)
 	}
 	env2 := envelope(nil)
 	env2["card_version"] = "1.6"

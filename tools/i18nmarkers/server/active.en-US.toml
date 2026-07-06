@@ -72,6 +72,9 @@ other = "Invalid card payload."
 ["err.server.bot_api.card_obo_forbidden"]
 other = "Card messages cannot be sent on behalf of a user."
 
+["err.server.bot_api.card_seq_conflict"]
+other = "Card was updated concurrently; retry with a newer card_seq."
+
 ["err.server.bot_api.content_too_large"]
 other = "The content exceeds the maximum allowed size."
 
@@ -473,6 +476,12 @@ other = "The banned word does not exist."
 
 ["err.server.message.cannot_delete_self_conversation"]
 other = "You cannot delete the conversation with yourself."
+
+["err.server.message.card_action_denied"]
+other = "You cannot act on this card."
+
+["err.server.message.card_action_invalid"]
+other = "Invalid card action."
 
 ["err.server.message.card_edit_forbidden"]
 other = "Card messages cannot be edited."

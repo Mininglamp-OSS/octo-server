@@ -299,6 +299,28 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 	c.Response(result)
 }
 
+// cardSeqStale 实现 P2 D9 的 card_seq CAS：seq ≤ 已存值 → stale=true（乱序帧，
+// 调用方以 409 拒绝）；否则记录新值。
+// ⚠️ POC 实现走 Redis GetString+SetAndExpire（octo-lib 包装器无 SETNX，存在
+// 竞态窗口）；正式实现按 brief 挪 message_extra 列 + 条件 UPDATE 原子化。
+func (ba *BotAPI) cardSeqStale(messageID string, seq int64) (bool, error) {
+	key := fmt.Sprintf("cardseq:%s", messageID)
+	stored, err := ba.ctx.GetRedisConn().GetString(key)
+	if err != nil {
+		return false, err
+	}
+	if stored != "" {
+		cur, parseErr := strconv.ParseInt(stored, 10, 64)
+		if parseErr == nil && seq <= cur {
+			return true, nil
+		}
+	}
+	if err := ba.ctx.GetRedisConn().SetAndExpire(key, strconv.FormatInt(seq, 10), 30*24*time.Hour); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
 // ensureMap returns a non-nil map, allocating one if needed. Used by the
 // OBO marker logic in sendMessage so we never NPE on a payload that arrived
 // nil (validation above rejects len==0 but not nil-vs-empty after enrich).
@@ -740,6 +762,7 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 
 	// Permission: bot can only edit its own messages
 	var msgFromUID string
+	var msgPayload []byte // 原消息 payload（card D6 跨类型变异守卫需要）
 	if req.MessageSeq > 0 {
 		resp, err := ba.ctx.IMGetWithChannelAndSeqs(req.ChannelID, req.ChannelType, robotID, []uint32{req.MessageSeq})
 		if err != nil {
@@ -759,6 +782,7 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 			)
 		}
 		msgFromUID = resp.Messages[0].FromUID
+		msgPayload = resp.Messages[0].Payload
 	} else {
 		msgIDInt, parseErr := strconv.ParseInt(req.MessageID, 10, 64)
 		if parseErr != nil {
@@ -786,6 +810,7 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 			return
 		}
 		msgFromUID = syncResp.Messages[0].FromUID
+		msgPayload = syncResp.Messages[0].Payload
 		req.MessageSeq = syncResp.Messages[0].MessageSeq
 	}
 	if msgFromUID != robotID {
@@ -812,30 +837,62 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 		}
 	}
 
-	// 图文混排 RichText(=14)：编辑写入口对 content_edit 做与 send 路径对称的
-	// write-strict 校验 + 权威 plain 重算（契约 §2，plain 服务端重算不信客户端）。
-	// 编辑语义为整体替换 content blocks；非 14 / 非 JSON 体为 no-op。脏/超限 payload
-	// 落库前以错误拒绝。MD5 去重 hash 落在 normalize 后的 canonical 体上。
-	// card-message-protocol P1 Decision 7：卡片不可变 —— 先于 Normalize 拦截
-	// type-17 编辑体（Normalize 的 richtext 门会放卡片体「原样、零校验」通过）。
-	// P2 sibling D6 将以 cardmsg 对称校验 + card_seq CAS 解锁本路径。
-	if cardmsg.IsCardContentEdit(req.ContentEdit) {
-		httperr.ResponseErrorL(c, errcode.ErrBotAPICardEditForbidden, nil, nil)
+	// card-message-interaction P2 D6：bot 编辑路径对卡片解锁（user/robot 编辑
+	// 路径仍永久拒绝卡片）。帧不变量：
+	//   (a) 跨类型变异拒绝 —— 卡片消息只能被替换为卡片帧，反之亦然；
+	//   (b) 每帧独立过 cardmsg 白名单（octo/v2 帧在此合法），plain 服务端重算；
+	//   (c) D9 card_seq CAS：带 card_seq 且 ≤ 已存值 → 409 拒绝乱序帧；
+	//       不带则维持 last-write-wins（单写者 bot 零迁移）。
+	origIsCard := cardmsg.IsCardRawPayload(msgPayload)
+	editIsCard := cardmsg.IsCardContentEdit(req.ContentEdit)
+	if origIsCard != editIsCard {
+		ba.Warn("卡片编辑跨类型变异,拒绝", zap.Bool("origIsCard", origIsCard), zap.Bool("editIsCard", editIsCard), zap.String("messageID", req.MessageID))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
 		return
 	}
-	normalizedEdit, err := richtext.NormalizeContentEdit(req.ContentEdit)
-	if err != nil {
-		ba.Warn("RichText content_edit 校验失败", zap.Error(err), zap.String("messageID", req.MessageID))
-		respondBotAPIRequestInvalid(c, "content_edit")
-		return
+	if editIsCard {
+		if !cardmsg.Enabled() {
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardDisabled, nil, nil)
+			return
+		}
+		normalized, cErr := cardmsg.NormalizeContentEdit(req.ContentEdit)
+		if cErr != nil {
+			ba.Warn("InteractiveCard content_edit 校验失败", zap.Error(cErr), zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return
+		}
+		if seq, ok := cardmsg.CardSeqFromContentEdit(normalized); ok {
+			stale, casErr := ba.cardSeqStale(req.MessageID, seq)
+			if casErr != nil {
+				ba.Error("card_seq CAS 查询失败", zap.Error(casErr), zap.String("messageID", req.MessageID))
+				httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+				return
+			}
+			if stale {
+				httperr.ResponseErrorL(c, errcode.ErrBotAPICardSeqConflict, nil, nil)
+				return
+			}
+		}
+		req.ContentEdit = normalized
+	} else {
+		// 图文混排 RichText(=14)：编辑写入口对 content_edit 做与 send 路径对称的
+		// write-strict 校验 + 权威 plain 重算（契约 §2，plain 服务端重算不信客户端）。
+		// 编辑语义为整体替换 content blocks；非 14 / 非 JSON 体为 no-op。脏/超限 payload
+		// 落库前以错误拒绝。MD5 去重 hash 落在 normalize 后的 canonical 体上。
+		normalizedEdit, rErr := richtext.NormalizeContentEdit(req.ContentEdit)
+		if rErr != nil {
+			ba.Warn("RichText content_edit 校验失败", zap.Error(rErr), zap.String("messageID", req.MessageID))
+			respondBotAPIRequestInvalid(c, "content_edit")
+			return
+		}
+		req.ContentEdit = normalizedEdit
 	}
-	req.ContentEdit = normalizedEdit
 
 	contentEdit := dbr.NewNullString(req.ContentEdit).String
 	contentMD5 := util.MD5(contentEdit)
 
 	var existCount int
-	err = ba.ctx.DB().Select("count(*)").From("message_extra").Where("message_id=? and content_edit_hash=?", req.MessageID, contentMD5).LoadOne(&existCount)
+	err := ba.ctx.DB().Select("count(*)").From("message_extra").Where("message_id=? and content_edit_hash=?", req.MessageID, contentMD5).LoadOne(&existCount)
 	if err != nil {
 		ba.Error("查询是否存在相同正文失败！", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)

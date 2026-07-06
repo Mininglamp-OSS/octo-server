@@ -27,7 +27,9 @@ func Validate(payload map[string]interface{}) error {
 	if len(raw) > MaxPayloadBytes {
 		return ErrCardPayloadTooLarge
 	}
-	if profile, _ := payload["profile"].(string); profile != ProfileV1 {
+	profile, _ := payload["profile"].(string)
+	interactive, known := interactiveByProfile(profile)
+	if !known {
 		return fmt.Errorf("%w: profile=%q", ErrCardProfileUnsupported, profile)
 	}
 	if ver, _ := payload["card_version"].(string); ver != CardVersion {
@@ -37,13 +39,14 @@ func Validate(payload map[string]interface{}) error {
 	if !ok || len(card) == 0 {
 		return ErrCardMissing
 	}
-	return validateCard(card)
+	return validateCard(card, interactive)
 }
 
-// validateCard 遍历标准 AC 卡片对象，执行 octo/v1 白名单 + 结构上限校验。
-// 卡片根上的未知标量字段（$schema/speak/lang 等）保持宽容（前向兼容，与信封
-// 顶层字段同口径）；body/actions/selectAction/type/version 严格校验。
-func validateCard(card map[string]interface{}) error {
+// validateCard 遍历标准 AC 卡片对象，按 profile 档位（interactive=octo/v2）执行
+// 白名单 + 结构上限校验。卡片根上的未知标量字段（$schema/speak/lang 等）保持
+// 宽容（前向兼容，与信封顶层字段同口径）；body/actions/selectAction/type/version
+// 严格校验。
+func validateCard(card map[string]interface{}, interactive bool) error {
 	if t, present := card["type"]; present {
 		if s, _ := t.(string); s != "AdaptiveCard" {
 			return fmt.Errorf("%w: card.type=%v", ErrCardBadShape, t)
@@ -54,7 +57,7 @@ func validateCard(card map[string]interface{}) error {
 			return fmt.Errorf("%w: card.version=%v", ErrCardProfileUnsupported, v)
 		}
 	}
-	w := &walker{}
+	w := &walker{interactive: interactive}
 	if body, present := card["body"]; present {
 		items, ok := body.([]interface{})
 		if !ok {
@@ -85,9 +88,10 @@ func validateCard(card map[string]interface{}) error {
 	return nil
 }
 
-// walker 携带遍历状态（递归节点计数）。深度经参数传递。
+// walker 携带遍历状态（递归节点计数 + profile 能力档位）。深度经参数传递。
 type walker struct {
-	nodes int
+	nodes       int
+	interactive bool // octo/v2：放行 Action.Submit 与 Input.*（P2 D1）
 }
 
 func (w *walker) bump(depth int) error {
@@ -200,6 +204,30 @@ func (w *walker) element(el map[string]interface{}, depth int) error {
 				}
 			}
 		}
+	case "Input.Text", "Input.Toggle", "Input.ChoiceSet":
+		// P2 D1：输入控件仅 octo/v2；id 必填（提交时 inputs 以 id 为键）。
+		if !w.interactive {
+			return fmt.Errorf("%w: %q（需要 octo/v2）", ErrCardUnknownElement, t)
+		}
+		if id, _ := el["id"].(string); id == "" {
+			return fmt.Errorf("%w: %s.id 必填", ErrCardBadShape, t)
+		}
+		if t == "Input.ChoiceSet" {
+			if choices, present := el["choices"]; present {
+				list, ok := choices.([]interface{})
+				if !ok {
+					return fmt.Errorf("%w: choices 必须是数组", ErrCardBadShape)
+				}
+				for _, ch := range list {
+					if err := w.bump(depth + 1); err != nil {
+						return err
+					}
+					if _, ok := ch.(map[string]interface{}); !ok {
+						return fmt.Errorf("%w: choice 必须是对象", ErrCardBadShape)
+					}
+				}
+			}
+		}
 	default:
 		return fmt.Errorf("%w: %q", ErrCardUnknownElement, t)
 	}
@@ -239,7 +267,9 @@ func (w *walker) selectAction(el map[string]interface{}) error {
 	return w.action(sa)
 }
 
-// action 校验单个动作对象。P1 白名单仅 Action.OpenUrl（url 必填且过 allowlist）。
+// action 校验单个动作对象。octo/v1 仅 Action.OpenUrl；octo/v2 增加
+// Action.Submit（id 必填 —— card/action 端点按 id 寻址且 D4 幂等键含 id；
+// data 可选对象）。Action.Execute 两档均拒（P3）。
 func (w *walker) action(a interface{}) error {
 	if err := w.bump(1); err != nil {
 		return err
@@ -248,15 +278,29 @@ func (w *walker) action(a interface{}) error {
 	if !ok {
 		return fmt.Errorf("%w: action 必须是对象", ErrCardBadShape)
 	}
-	t, _ := act["type"].(string)
-	if t != "Action.OpenUrl" {
+	switch t, _ := act["type"].(string); t {
+	case "Action.OpenUrl":
+		u, _ := act["url"].(string)
+		if u == "" {
+			return fmt.Errorf("%w: Action.OpenUrl.url 必填", ErrCardBadShape)
+		}
+		return checkURL(u)
+	case "Action.Submit":
+		if !w.interactive {
+			return fmt.Errorf("%w: %q（需要 octo/v2）", ErrCardUnknownAction, t)
+		}
+		if id, _ := act["id"].(string); id == "" {
+			return fmt.Errorf("%w: Action.Submit.id 必填", ErrCardBadShape)
+		}
+		if data, present := act["data"]; present {
+			if _, ok := data.(map[string]interface{}); !ok {
+				return fmt.Errorf("%w: Action.Submit.data 必须是对象", ErrCardBadShape)
+			}
+		}
+		return nil
+	default:
 		return fmt.Errorf("%w: %q", ErrCardUnknownAction, t)
 	}
-	u, _ := act["url"].(string)
-	if u == "" {
-		return fmt.Errorf("%w: Action.OpenUrl.url 必填", ErrCardBadShape)
-	}
-	return checkURL(u)
 }
 
 // checkURL 执行 Decision 3d 的正向 allowlist：仅接受「绝对」http/https URL。

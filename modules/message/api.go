@@ -306,6 +306,7 @@ func (m *Message) Route(r *wkhttp.WKHttp) {
 		message.POST("/readed", m.messageReaded)                  // 消息已读
 		message.GET("/sync/sensitivewords", m.syncSensitiveWords) // 同步敏感词
 		message.POST("/edit", m.messageEdit)                      // 消息编辑
+		message.POST("/card/action", m.cardAction)                // 卡片动作上行（card-message-interaction P2 D3）
 		message.POST("/reminder/sync", m.reminderSync)            // 同步提醒
 		message.POST("/reminder/done", m.reminderDone)            // 提醒已处理完成
 		message.GET("/prohibit_words/sync", m.syncProhibitWords)  // 同步违禁词

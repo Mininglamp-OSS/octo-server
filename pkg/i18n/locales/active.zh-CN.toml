@@ -1246,3 +1246,12 @@ other = "卡片消息暂不支持编辑。"
 
 ["err.server.robot.card_edit_forbidden"]
 other = "卡片消息不支持编辑。"
+
+["err.server.message.card_action_invalid"]
+other = "无效的卡片操作。"
+
+["err.server.message.card_action_denied"]
+other = "你无权操作这张卡片。"
+
+["err.server.bot_api.card_seq_conflict"]
+other = "卡片已被并发更新，请携带更新的 card_seq 重试。"

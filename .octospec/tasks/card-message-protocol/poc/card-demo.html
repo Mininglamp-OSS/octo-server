@@ -67,6 +67,15 @@
     margin: 0 0 8px; font-size: 13px; }
   .ac-factset .t { color: var(--sub); }
   .ac-container { margin: 0 0 4px; }
+
+  /* P2 交互元素(octo/v2) */
+  .ac-input { display: block; width: 100%; margin: 0 0 8px; padding: 6px 10px;
+    border: 1px solid var(--border); border-radius: 6px; font: inherit; }
+  .ac-toggle { display: flex; gap: 6px; align-items: center; margin: 0 0 8px; font-size: 13px; }
+  .octo-card__btn--submit { background: var(--primary); color: #fff; border: none; }
+  .octo-card__btn--submit:hover { opacity: .88; }
+  .octo-card__btn:disabled { opacity: .5; cursor: not-allowed; }
+  .octo-card__hint { padding: 0 14px 10px; font-size: 11px; color: var(--sub); }
 </style>
 </head>
 <body>
@@ -97,10 +106,32 @@ function mdLite(s) {
   return h;
 }
 
-function renderElements(items, into) {
+function renderElements(items, into, inputs) {
   (items || []).forEach(el => {
     if (!el || typeof el !== 'object') return;
     switch (el.type) {
+      case 'Input.Text': {
+        const i = document.createElement('input');
+        i.className = 'ac-input'; i.placeholder = el.placeholder || '';
+        i.addEventListener('input', () => inputs && (inputs[el.id] = i.value));
+        into.appendChild(i); break;
+      }
+      case 'Input.ChoiceSet': {
+        const s = document.createElement('select'); s.className = 'ac-input';
+        (el.choices || []).forEach(ch => {
+          const o = document.createElement('option');
+          o.value = ch.value; o.textContent = ch.title; s.appendChild(o);
+        });
+        s.addEventListener('change', () => inputs && (inputs[el.id] = s.value));
+        into.appendChild(s); break;
+      }
+      case 'Input.Toggle': {
+        const l = document.createElement('label'); l.className = 'ac-toggle';
+        const cb = document.createElement('input'); cb.type = 'checkbox';
+        cb.addEventListener('change', () => inputs && (inputs[el.id] = cb.checked));
+        l.appendChild(cb); l.appendChild(document.createTextNode(el.title || ''));
+        into.appendChild(l); break;
+      }
       case 'TextBlock': {
         const p = document.createElement('p');
         p.className = 'ac-textblock' + (el.weight === 'Bolder' ? ' ac-textblock--bolder' : '');
@@ -116,7 +147,7 @@ function renderElements(items, into) {
       }
       case 'Container': {
         const d = document.createElement('div'); d.className = 'ac-container';
-        renderElements(el.items, d); attachSelectAction(el.selectAction, d);
+        renderElements(el.items, d, inputs); attachSelectAction(el.selectAction, d);
         into.appendChild(d); break;
       }
       case 'ColumnSet': {
@@ -124,7 +155,7 @@ function renderElements(items, into) {
         (el.columns || []).forEach(col => {
           const c = document.createElement('div');
           c.className = 'ac-column' + (col.width === 'auto' ? ' ac-column--auto' : '');
-          renderElements(col.items, c); d.appendChild(c);
+          renderElements(col.items, c, inputs); d.appendChild(c);
         });
         into.appendChild(d); break;
       }
@@ -147,22 +178,43 @@ function attachSelectAction(sa, node) {
   node.addEventListener('click', () => window.open(sa.url, '_blank', 'noopener'));
 }
 
-/* 渲染一个信封。返回 DOM 节点;按契约决定卡片渲染 or plain 降级 */
-function renderCard(envelope, senderIsBot) {
+/* 渲染一个信封。返回 DOM 节点;按契约决定卡片渲染 or plain 降级。
+   clientProfiles 模拟端上能力集(P1 端 ['octo/v1'],P2 端加 'octo/v2');
+   onCardAction(actionId, inputs, cardRoot) 模拟 POST /v1/message/card/action */
+function renderCard(envelope, senderIsBot, clientProfiles = ['octo/v1'], onCardAction) {
   if (!senderIsBot)  return plainBubble(envelope.plain, '⚠ 发送者非 bot 身份,按渲染门禁降级');
-  if (envelope.profile !== 'octo/v1') return plainBubble(envelope.plain, `ⓘ ${envelope.profile} 超出本端能力,降级显示 plain`);
+  if (!clientProfiles.includes(envelope.profile)) return plainBubble(envelope.plain, `ⓘ ${envelope.profile} 超出本端能力,降级显示 plain`);
   const card = envelope.card || {};
+  const inputs = {};
   const root = document.createElement('div'); root.className = 'octo-card';
   const body = document.createElement('div'); body.className = 'octo-card__body';
-  renderElements(card.body, body); root.appendChild(body);
+  renderElements(card.body, body, inputs); root.appendChild(body);
   attachSelectAction(card.selectAction, root);
-  const actions = (card.actions || []).filter(a => a.type === 'Action.OpenUrl' && ALLOW_SCHEME.test(a.url || ''));
+  const actions = (card.actions || []).filter(a =>
+    (a.type === 'Action.OpenUrl' && ALLOW_SCHEME.test(a.url || '')) ||
+    (a.type === 'Action.Submit' && a.id));
   if (actions.length) {
     const bar = document.createElement('div'); bar.className = 'octo-card__actions';
     actions.forEach(a => {
-      const b = document.createElement('a'); b.className = 'octo-card__btn';
-      b.textContent = a.title || '打开'; b.href = a.url; b.target = '_blank'; b.rel = 'noopener';
-      bar.appendChild(b);
+      if (a.type === 'Action.OpenUrl') {
+        const b = document.createElement('a'); b.className = 'octo-card__btn';
+        b.textContent = a.title || '打开'; b.href = a.url; b.target = '_blank'; b.rel = 'noopener';
+        bar.appendChild(b);
+      } else {
+        const b = document.createElement('button');
+        b.className = 'octo-card__btn octo-card__btn--submit'; b.textContent = a.title || '提交';
+        b.addEventListener('click', () => {
+          // 本地瞬时态:禁用防连点(权威防线是服务端 D4 幂等;10s 超时恢复)
+          bar.querySelectorAll('button').forEach(x => { x.disabled = true; });
+          b.textContent = '提交中…';
+          const restore = setTimeout(() => {  // D8 客户端 loading 超时
+            bar.querySelectorAll('button').forEach(x => { x.disabled = false; });
+            b.textContent = a.title || '提交';
+          }, 10000);
+          onCardAction && onCardAction(a.id, { ...inputs }, root, () => clearTimeout(restore));
+        });
+        bar.appendChild(b);
+      }
     });
     root.appendChild(bar);
   }
@@ -254,6 +306,62 @@ chat.appendChild(messageItem(user, renderCard({
   card: { type: 'AdaptiveCard', version: '1.5', body: [
     { type: 'TextBlock', text: '你中奖了!' } ] },
 }, false)));
+
+/* ============ Demo 2:P2 交互闭环(octo/v2 端视角)============ */
+const divider = document.createElement('div');
+divider.className = 'chat-title';
+divider.textContent = '—— Demo 2:P2 交互闭环(点击"通过"→ 幂等提交 → bot 重写整卡)——';
+chat.appendChild(divider);
+
+const P2_PROFILES = ['octo/v1', 'octo/v2'];
+const approvalEnvelope = {
+  type: 17, card_version: '1.5', profile: 'octo/v2', card_seq: 1,
+  plain: '审批单 #42:市场部预算调整\n金额: ¥120,000\n申请人: 王五',
+  card: {
+    type: 'AdaptiveCard', version: '1.5',
+    body: [
+      { type: 'TextBlock', weight: 'Bolder', text: '📋 审批单 #42:市场部预算调整' },
+      { type: 'FactSet', facts: [
+        { title: '金额', value: '¥120,000' }, { title: '申请人', value: '王五' } ] },
+      { type: 'Input.Text', id: 'comment', placeholder: '审批意见(可选)' },
+    ],
+    actions: [
+      { type: 'Action.Submit', id: 'approve_btn', title: '通过' },
+      { type: 'Action.Submit', id: 'reject_btn',  title: '拒绝' },
+    ],
+  },
+};
+
+/* 模拟闭环:card/action → card_action 事件 → bot 处理 → botMessageEdit 整卡替换帧 → CMD 刷新 */
+const approvalBot = { name: '审批助手', color: '#7c3aed', isBot: true, time: '10:05' };
+const approvalItem = messageItem(approvalBot, renderCard(approvalEnvelope, true, P2_PROFILES,
+  (actionId, inputs, cardRoot, done) => {
+    setTimeout(() => {   // 模拟:bot 轮询到 card_action 事件并回写(真实延迟=bot 轮询节奏,D5)
+      done();
+      const approved = actionId === 'approve_btn';
+      const rewrittenFrame = {   // D6:整卡替换,新帧与旧帧结构无关;card_seq 递增(D9)
+        type: 17, card_version: '1.5', profile: 'octo/v2', card_seq: 2,
+        plain: `审批单 #42:${approved ? '✅ 已通过' : '❌ 已拒绝'} by 演示用户`,
+        card: {
+          type: 'AdaptiveCard', version: '1.5',
+          body: [
+            { type: 'TextBlock', weight: 'Bolder',
+              text: `📋 审批单 #42:${approved ? '✅ 已通过' : '❌ 已拒绝'}` },
+            { type: 'FactSet', facts: [
+              { title: '操作人', value: '演示用户' },
+              { title: '意见',   value: inputs.comment || '(无)' },
+              { title: '时间',   value: '10:06' } ] },
+          ],  // 无 actions:按钮随帧消失,旧按钮迟到点击被 D3 生效帧校验 400
+        },
+      };
+      cardRoot.replaceWith(renderCard(rewrittenFrame, true, P2_PROFILES));
+    }, 900);
+  }));
+const hint = document.createElement('div');
+hint.className = 'octo-card__hint';
+hint.textContent = '契约:防重复=服务端幂等(D4)+状态随整卡重写(D6)+本地瞬时禁用(D8,10s 超时恢复);此处 900ms 模拟 bot 轮询+回写延迟';
+approvalItem.querySelector('.wk-message-item__main').appendChild(hint);
+chat.appendChild(approvalItem);
 </script>
 </body>
 </html>
