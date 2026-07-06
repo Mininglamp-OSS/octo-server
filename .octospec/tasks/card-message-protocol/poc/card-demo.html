@@ -76,6 +76,13 @@
   .octo-card__btn--submit:hover { opacity: .88; }
   .octo-card__btn:disabled { opacity: .5; cursor: not-allowed; }
   .octo-card__hint { padding: 0 14px 10px; font-size: 11px; color: var(--sub); }
+
+  /* Demo 3:帧时间线(connector 视角的应用/拒绝日志) */
+  .frame-log { margin-top: 6px; font-size: 11px; color: var(--sub); line-height: 1.7; }
+  .frame-log .rej { color: #d54941; font-weight: 600; }
+  .frame-log details { margin-top: 2px; }
+  .frame-log pre { background: #fff; border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 8px; overflow-x: auto; max-width: var(--card-w); font-size: 10px; }
 </style>
 </head>
 <body>
@@ -362,6 +369,112 @@ hint.className = 'octo-card__hint';
 hint.textContent = '契约:防重复=服务端幂等(D4)+状态随整卡重写(D6)+本地瞬时禁用(D8,10s 超时恢复);此处 900ms 模拟 bot 轮询+回写延迟';
 approvalItem.querySelector('.wk-message-item__main').appendChild(hint);
 chat.appendChild(approvalItem);
+
+/* ============ Demo 3:OpenClaw agent 执行态(异构帧 + 乱序 409 + 动作重入)============ */
+const divider3 = document.createElement('div');
+divider3.className = 'chat-title';
+divider3.textContent = '—— Demo 3:OpenClaw agent 执行态(thinking → tool_call → tool_result → final;D9 乱序帧演示)——';
+chat.appendChild(divider3);
+
+/* connector:OpenClaw 插件标记走私格式 → type-17 信封(源码核实的 marker 常量,
+   openclaw-adaptive-cards constants.ts)。标记格式不上 Octo 的线 —— 提取后转装。 */
+const CARD_OPEN = '<!--adaptive-card-->', CARD_CLOSE = '<!--/adaptive-card-->';
+function connectorExtract(openclawText, profile, seq) {
+  const s = openclawText.indexOf(CARD_OPEN), e = openclawText.indexOf(CARD_CLOSE);
+  if (s < 0 || e < 0) return null;   // 无卡片 → 走纯文本(fallback)通道
+  const card = JSON.parse(openclawText.slice(s + CARD_OPEN.length, e));
+  const fallback = openclawText.slice(0, s).trim();
+  return { type: 17, card_version: '1.5', profile, card_seq: seq,
+           plain: fallback /* 仅作种子,服务端权威重算(Decision 8) */, card };
+}
+/* OpenClaw 插件输出形态:fallback 文本 + 标记内嵌 AC JSON */
+function openclawOutput(fallback, card) {
+  return `${fallback}\n\n${CARD_OPEN}${JSON.stringify(card)}${CARD_CLOSE}`;
+}
+
+/* mock server:D9 card_seq CAS(≤ 已存值 → 409) */
+const mockExtra = { storedSeq: 0 };
+function mockBotMessageEdit(env) {
+  if (env.card_seq !== undefined && env.card_seq <= mockExtra.storedSeq) {
+    return { ok: false, status: 409 };
+  }
+  mockExtra.storedSeq = env.card_seq ?? mockExtra.storedSeq;
+  return { ok: true };
+}
+
+const agentBot = { name: 'OpenClaw 助手', color: '#f77234', isBot: true, time: '10:08' };
+let agentCardNode = plainBubble('…');
+const agentItem = messageItem(agentBot, agentCardNode);
+const frameLog = document.createElement('div');
+frameLog.className = 'frame-log';
+agentItem.querySelector('.wk-message-item__main').appendChild(frameLog);
+chat.appendChild(agentItem);
+
+function logFrame(text, rejected) {
+  const line = document.createElement('div');
+  if (rejected) line.className = 'rej';
+  line.textContent = text;
+  frameLog.appendChild(line);
+}
+
+/* agent 帧(全部以 OpenClaw 插件输出形态产出,经 connector 提取转装;
+   帧间结构完全不同 —— D6 异构帧) */
+const F = {
+  thinking: () => openclawOutput('正在分析请求…', {
+    type: 'AdaptiveCard', version: '1.5',
+    body: [ { type: 'TextBlock', text: '🤔 正在分析请求…' } ] }),
+  tools: (w, s) => openclawOutput(`执行工具:天气 ${w} / 日程 ${s}`, {
+    type: 'AdaptiveCard', version: '1.5',
+    body: [
+      { type: 'TextBlock', weight: 'Bolder', text: '⚙️ 执行工具中(2 个并行)' },
+      { type: 'FactSet', facts: [
+        { title: 'get_weather',  value: w },
+        { title: 'get_schedule', value: s } ] } ] }),
+  final: () => openclawOutput('今日简报:北京晴 3°C;10:00 评审会等 3 个日程', {
+    type: 'AdaptiveCard', version: '1.5',
+    body: [
+      { type: 'TextBlock', weight: 'Bolder', text: '📮 今日简报' },
+      { type: 'ColumnSet', columns: [
+        { items: [ { type: 'FactSet', facts: [ { title: '天气', value: '北京 晴 3°C' } ] } ] },
+        { items: [ { type: 'FactSet', facts: [ { title: '日程', value: '3 个(最近 10:00 评审会)' } ] } ] } ] },
+      { type: 'TextBlock', text: '出门建议:[查看详情](https://example.com/briefing) 备好外套。' },
+    ],
+    actions: [ { type: 'Action.Submit', id: 'regen_btn', title: '🔄 重新生成' } ] }),
+};
+
+function applyFrame(openclawText, profile, seq, label) {
+  const env = connectorExtract(openclawText, profile, seq);
+  const res = mockBotMessageEdit(env);
+  if (!res.ok) {
+    logFrame(`✗ frame seq=${seq}(${label})迟到于 seq=${mockExtra.storedSeq} → 409 card_seq conflict,已拒绝(D9)`, true);
+    return;
+  }
+  const node = renderCard(env, true, P2_PROFILES, onAgentAction);
+  agentCardNode.replaceWith(node); agentCardNode = node;
+  logFrame(`✓ frame seq=${seq} 应用:${label}`);
+}
+
+function onAgentAction(actionId, inputs, cardRoot, done) {
+  /* card_action → connector 转成合成消息喂 agent(对齐 formatActionAsMessage)→ agent 重入 */
+  logFrame(`↩ card_action(action_id=${actionId}) → connector 合成消息 → agent 重入`);
+  setTimeout(() => { done(); runAgentCycle(); }, 400);
+}
+
+let seqCounter = 0;
+function runAgentCycle() {
+  const base = seqCounter;
+  applyFrame(F.thinking(), 'octo/v1', base + 1, 'thinking');
+  setTimeout(() => applyFrame(F.tools('运行中…', '运行中…'), 'octo/v1', base + 2, 'tool_call ×2'), 1100);
+  setTimeout(() => applyFrame(F.tools('✅ 北京 晴 3°C', '运行中…'), 'octo/v1', base + 3, 'tool_result: 天气先回'), 2200);
+  /* 并行工具的乱序场景:网络重试的旧帧(seq=base+2)晚到 → CAS 拒绝 */
+  setTimeout(() => applyFrame(F.tools('运行中…', '运行中…'), 'octo/v1', base + 2, 'tool_call 重试帧'), 3000);
+  setTimeout(() => applyFrame(F.tools('✅ 北京 晴 3°C', '✅ 3 个日程'), 'octo/v1', base + 4, 'tool_result: 日程后回'), 3800);
+  setTimeout(() => { applyFrame(F.final(), 'octo/v2', base + 5, 'final(octo/v2,含重新生成按钮)'); seqCounter = base + 5; }, 4800);
+}
+/* #manual:测试/截图驱动模式(逐帧显式调用,不走定时器);默认自动播放 */
+const MANUAL3 = location.hash.includes('manual');
+if (!MANUAL3) runAgentCycle();
+window.__demo3 = { applyFrame, F, getSeq: () => seqCounter, setSeq: v => { seqCounter = v; } };
 </script>
 </body>
 </html>
