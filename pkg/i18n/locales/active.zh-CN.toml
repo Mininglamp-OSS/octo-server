@@ -1225,3 +1225,24 @@ other = "当前部署未启用搜索功能。"
 
 ["err.server.messages_search.depth_exceeded"]
 other = "搜索翻页已达最大深度上限，请缩小搜索范围。"
+
+["err.server.message.card_send_forbidden"]
+other = "卡片消息仅支持机器人或 Webhook 发送。"
+
+["err.server.message.card_edit_forbidden"]
+other = "卡片消息不支持编辑。"
+
+["err.server.bot_api.card_disabled"]
+other = "当前部署未启用卡片消息。"
+
+["err.server.bot_api.card_invalid"]
+other = "卡片内容不合法。"
+
+["err.server.bot_api.card_obo_forbidden"]
+other = "卡片消息不支持以用户身份代发。"
+
+["err.server.bot_api.card_edit_forbidden"]
+other = "卡片消息暂不支持编辑。"
+
+["err.server.robot.card_edit_forbidden"]
+other = "卡片消息不支持编辑。"

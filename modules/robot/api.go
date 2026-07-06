@@ -31,6 +31,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
@@ -1903,6 +1904,13 @@ func (rb *Robot) botMessageEdit(c *wkhttp.Context) {
 	// write-strict 校验 + 权威 plain 重算（契约 §2，plain 服务端重算不信客户端）。
 	// 编辑语义为整体替换 content blocks；非 14 / 非 JSON 体为 no-op。脏/超限 payload
 	// 落库前以错误拒绝。MD5 去重 hash 落在 normalize 后的 canonical 体上。
+	// card-message-protocol P1 Decision 7：卡片不可变 —— 先于 Normalize 拦截
+	// type-17 编辑体（Normalize 的 richtext 门会放卡片体「原样、零校验」通过，
+	// PR#525 round-2 finding #1）。
+	if cardmsg.IsCardContentEdit(req.ContentEdit) {
+		httperr.ResponseErrorL(c, errcode.ErrRobotCardEditForbidden, nil, nil)
+		return
+	}
 	normalizedEdit, err := richtext.NormalizeContentEdit(req.ContentEdit)
 	if err != nil {
 		rb.Error("RichText content_edit 校验失败", zap.Error(err), zap.String("messageID", req.MessageID))

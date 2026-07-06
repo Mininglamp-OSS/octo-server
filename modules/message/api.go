@@ -31,6 +31,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
@@ -507,6 +508,15 @@ func (m *Message) sendMsg(c *wkhttp.Context) {
 		respondMessageRequestInvalid(c, "payload")
 		return
 	}
+	// card-message-protocol P1 Decision 2 layer (a)：InteractiveCard(=17) 仅
+	// bot/webhook 可发，用户 ingress 一律拒绝（层 (b) 为客户端 from_uid 渲染
+	// 门禁，层 (c) 为 P2 action 端点的 sender 复验 —— webhook 通知是存储后
+	// 无否决权的，HTTP ingress 拦截是服务端唯一入口防线）。
+	if cardmsg.IsCardPayload(req.Payload) {
+		m.Warn("用户 ingress 拒绝卡片消息", zap.String("channelID", req.ReceiveChannelID), zap.String("fromUID", uid))
+		httperr.ResponseErrorL(c, errcode.ErrMessageCardSendForbidden, nil, nil)
+		return
+	}
 	err = m.sendMessage(req.ReceiveChannelID, req.ReceiveChannelType, uid, req.Payload, senderSpaceID)
 	if err != nil {
 		m.Error("发送消息失败", zap.Error(err))
@@ -853,6 +863,15 @@ func (m *Message) messageEdit(c *wkhttp.Context) {
 	// 编辑语义为整体替换 content blocks；canonical JSON 落库后即下游 summary /
 	// search / 复制 的权威来源。非 14 / 非 JSON 体为 no-op，老编辑路径不变。脏/超限
 	// payload 在落库前以 400 拒绝。MD5 去重 hash 落在 normalize 后的 canonical 体上。
+	// card-message-protocol P1 Decision 7：卡片不可变 —— 先于
+	// richtext.NormalizeContentEdit 拦截 type-17 编辑体。Normalize 以
+	// IsRichTextPayload 为门，卡片编辑体会「原样、零校验」通过，使编辑通道
+	// 成为绕过 cardmsg.Validate 的未守卫 ingress（PR#525 round-2 finding #1）。
+	// 用户编辑路径对卡片永久关闭（用户不拥有 bot 卡片）。
+	if cardmsg.IsCardContentEdit(req.ContentEdit) {
+		httperr.ResponseErrorL(c, errcode.ErrMessageCardEditForbidden, nil, nil)
+		return
+	}
 	normalizedEdit, err := richtext.NormalizeContentEdit(req.ContentEdit)
 	if err != nil {
 		m.Error("RichText content_edit 校验失败", zap.Error(err), zap.String("channelID", req.ChannelID), zap.String("messageID", req.MessageID))

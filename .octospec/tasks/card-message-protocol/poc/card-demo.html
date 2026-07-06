@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>octo card-message P1 POC demo</title>
+<style>
+  /* ============================================================
+     消息列表布局:仿 octo-web wk-message-item 结构
+     (octo-web 仓不在本 POC 访问范围,按其典型结构仿写:
+      avatar 左列 + header(name/time) + content;
+      正式接入时把 .wk-message-item 换成真实组件即可,
+      卡片渲染器 renderCard() 与布局解耦、可整体搬移)
+     ============================================================ */
+  :root {
+    --bg: #f5f6f7; --bubble: #ffffff; --bubble-self: #d6e4ff;
+    --border: #e5e6eb; --text: #1d2129; --sub: #86909c;
+    --primary: #165dff; --card-w: 400px;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+  .chat { max-width: 720px; margin: 0 auto; padding: 24px 16px 64px; }
+  .chat-title { text-align: center; color: var(--sub); font-size: 12px; margin: 16px 0; }
+
+  .wk-message-item { display: flex; gap: 10px; margin: 18px 0; }
+  .wk-message-item__avatar { width: 36px; height: 36px; border-radius: 6px;
+    flex: none; display: flex; align-items: center; justify-content: center;
+    color: #fff; font-size: 16px; font-weight: 600; }
+  .wk-message-item__main { max-width: 78%; min-width: 0; }
+  .wk-message-item__header { font-size: 12px; color: var(--sub); margin-bottom: 4px; }
+  .wk-message-item__header .bot-tag { background: var(--primary); color: #fff;
+    border-radius: 3px; padding: 0 4px; font-size: 10px; margin-left: 4px; }
+  .wk-message-item__header time { margin-left: 8px; }
+
+  /* 普通消息:复用气泡样式 */
+  .wk-bubble { background: var(--bubble); border: 1px solid var(--border);
+    border-radius: 2px 10px 10px 10px; padding: 8px 12px; width: fit-content;
+    word-break: break-word; white-space: pre-wrap; }
+  .wk-bubble .degrade-note { display: block; margin-top: 4px; font-size: 11px; color: var(--sub); }
+
+  /* ============================================================
+     卡片消息:独立设计(不走气泡)——扁平卡容器 + 分区 + 底部动作条
+     ============================================================ */
+  .octo-card { width: var(--card-w); max-width: 100%; background: #fff;
+    border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
+    box-shadow: 0 1px 4px rgba(29,33,41,.06); }
+  .octo-card--tappable { cursor: pointer; transition: box-shadow .15s; }
+  .octo-card--tappable:hover { box-shadow: 0 3px 10px rgba(29,33,41,.12); }
+  .octo-card__body { padding: 12px 14px 4px; }
+  .octo-card__actions { display: flex; gap: 8px; padding: 10px 14px 12px;
+    border-top: 1px solid var(--border); margin-top: 8px; }
+  .octo-card__btn { flex: 1; text-align: center; padding: 6px 12px; font-size: 13px;
+    border: 1px solid var(--primary); color: var(--primary); background: #fff;
+    border-radius: 6px; cursor: pointer; text-decoration: none; }
+  .octo-card__btn:hover { background: var(--primary); color: #fff; }
+
+  .ac-textblock { margin: 0 0 8px; }
+  .ac-textblock--bolder { font-weight: 600; font-size: 15px; }
+  .ac-textblock a { color: var(--primary); text-decoration: none; }
+  .ac-image { max-width: 100%; border-radius: 6px; margin: 0 0 8px; display: block; }
+  .ac-image--avatar { width: 40px; height: 40px; border-radius: 50%; }
+  .ac-columnset { display: flex; gap: 10px; margin: 0 0 8px; }
+  .ac-column { flex: 1; min-width: 0; }
+  .ac-column--auto { flex: none; }
+  .ac-factset { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px;
+    margin: 0 0 8px; font-size: 13px; }
+  .ac-factset .t { color: var(--sub); }
+  .ac-container { margin: 0 0 4px; }
+</style>
+</head>
+<body>
+<div class="chat" id="chat">
+  <div class="chat-title">card-message-protocol P1 POC · octo/v1 自研极简渲染器(决策 B 实证,零依赖)</div>
+</div>
+
+<script>
+/* ================================================================
+   octo/v1 极简自研渲染器 —— 与 pkg/cardmsg 白名单一一对应:
+   TextBlock(基础 markdown) / Image / Container / ColumnSet / Column /
+   FactSet / Action.OpenUrl / selectAction(仅 OpenUrl)。
+   契约实现:
+   - from_uid 渲染门禁:sender 非 bot → 不渲染卡片,降级为 plain 气泡;
+   - profile 协商:非 octo/v1 → 降级为 plain 气泡(octo/v2 卡在 P1 端上的表现);
+   - 未知元素:跳过并可在 console 记录(服务端白名单本应拦下,双保险)。
+   ================================================================ */
+
+const ALLOW_SCHEME = /^https?:\/\//i;
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+/* AC 基础 markdown 子集:**bold**、[text](url)(仅 http/https) */
+function mdLite(s) {
+  let h = esc(s);
+  h = h.replace(/\[([^\]]*)\]\(([^)\s]+)[^)]*\)/g, (m, text, url) =>
+    ALLOW_SCHEME.test(url) ? `<a href="${esc(url)}" target="_blank" rel="noopener">${text}</a>` : text);
+  h = h.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>');
+  return h;
+}
+
+function renderElements(items, into) {
+  (items || []).forEach(el => {
+    if (!el || typeof el !== 'object') return;
+    switch (el.type) {
+      case 'TextBlock': {
+        const p = document.createElement('p');
+        p.className = 'ac-textblock' + (el.weight === 'Bolder' ? ' ac-textblock--bolder' : '');
+        p.innerHTML = mdLite(el.text || '');
+        into.appendChild(p); break;
+      }
+      case 'Image': {
+        if (!ALLOW_SCHEME.test(el.url || '')) break;
+        const img = document.createElement('img');
+        img.className = 'ac-image' + (el.style === 'Person' ? ' ac-image--avatar' : '');
+        img.src = el.url; img.alt = el.altText || '';
+        into.appendChild(img); break;
+      }
+      case 'Container': {
+        const d = document.createElement('div'); d.className = 'ac-container';
+        renderElements(el.items, d); attachSelectAction(el.selectAction, d);
+        into.appendChild(d); break;
+      }
+      case 'ColumnSet': {
+        const d = document.createElement('div'); d.className = 'ac-columnset';
+        (el.columns || []).forEach(col => {
+          const c = document.createElement('div');
+          c.className = 'ac-column' + (col.width === 'auto' ? ' ac-column--auto' : '');
+          renderElements(col.items, c); d.appendChild(c);
+        });
+        into.appendChild(d); break;
+      }
+      case 'FactSet': {
+        const g = document.createElement('div'); g.className = 'ac-factset';
+        (el.facts || []).forEach(f => {
+          g.insertAdjacentHTML('beforeend',
+            `<span class="t">${esc(f.title || '')}</span><span>${esc(f.value || '')}</span>`);
+        });
+        into.appendChild(g); break;
+      }
+      default: console.warn('octo/v1 未知元素,跳过:', el.type);
+    }
+  });
+}
+
+function attachSelectAction(sa, node) {
+  if (!sa || sa.type !== 'Action.OpenUrl' || !ALLOW_SCHEME.test(sa.url || '')) return;
+  node.classList.add('octo-card--tappable');
+  node.addEventListener('click', () => window.open(sa.url, '_blank', 'noopener'));
+}
+
+/* 渲染一个信封。返回 DOM 节点;按契约决定卡片渲染 or plain 降级 */
+function renderCard(envelope, senderIsBot) {
+  if (!senderIsBot)  return plainBubble(envelope.plain, '⚠ 发送者非 bot 身份,按渲染门禁降级');
+  if (envelope.profile !== 'octo/v1') return plainBubble(envelope.plain, `ⓘ ${envelope.profile} 超出本端能力,降级显示 plain`);
+  const card = envelope.card || {};
+  const root = document.createElement('div'); root.className = 'octo-card';
+  const body = document.createElement('div'); body.className = 'octo-card__body';
+  renderElements(card.body, body); root.appendChild(body);
+  attachSelectAction(card.selectAction, root);
+  const actions = (card.actions || []).filter(a => a.type === 'Action.OpenUrl' && ALLOW_SCHEME.test(a.url || ''));
+  if (actions.length) {
+    const bar = document.createElement('div'); bar.className = 'octo-card__actions';
+    actions.forEach(a => {
+      const b = document.createElement('a'); b.className = 'octo-card__btn';
+      b.textContent = a.title || '打开'; b.href = a.url; b.target = '_blank'; b.rel = 'noopener';
+      bar.appendChild(b);
+    });
+    root.appendChild(bar);
+  }
+  return root;
+}
+
+function plainBubble(text, note) {
+  const d = document.createElement('div'); d.className = 'wk-bubble';
+  d.textContent = text || '[卡片]';
+  if (note) d.insertAdjacentHTML('beforeend', `<span class="degrade-note">${esc(note)}</span>`);
+  return d;
+}
+
+/* 仿 wk-message-item 的消息行 */
+function messageItem({ name, color, isBot, time }, contentNode) {
+  const item = document.createElement('div'); item.className = 'wk-message-item';
+  item.innerHTML = `
+    <div class="wk-message-item__avatar" style="background:${color}">${esc(name[0])}</div>
+    <div class="wk-message-item__main">
+      <div class="wk-message-item__header">${esc(name)}${isBot ? '<span class="bot-tag">BOT</span>' : ''}<time>${time}</time></div>
+    </div>`;
+  item.querySelector('.wk-message-item__main').appendChild(contentNode);
+  return item;
+}
+
+/* ============ 演示数据 ============ */
+const chat = document.getElementById('chat');
+const bot  = { name: 'CI 助手',  color: '#165dff', isBot: true,  time: '10:01' };
+const user = { name: '演示用户',     color: '#00b42a', isBot: false, time: '10:02' };
+
+/* 1. 普通文本消息 —— 复用气泡 */
+chat.appendChild(messageItem(user, plainBubble('帮我盯一下 #525 的 CI')));
+
+/* 2. GitHub 通知卡(Demo 1 主角,octo/v1 全家桶,与 pkg/cardmsg 测试用例同构) */
+chat.appendChild(messageItem(bot, renderCard({
+  type: 17, card_version: '1.5', profile: 'octo/v1',
+  plain: 'PR #525 merged\n仓库: octo-server\n作者: demo-user\n状态: ✅ 已合并',
+  card: {
+    type: 'AdaptiveCard', version: '1.5',
+    body: [
+      { type: 'ColumnSet', columns: [
+        { width: 'auto', items: [ { type: 'Image', style: 'Person',
+            url: 'https://avatars.githubusercontent.com/u/9919?s=80' } ] },
+        { items: [
+          { type: 'TextBlock', weight: 'Bolder',
+            text: '**PR #525** docs(octospec): card message protocol briefs' },
+          { type: 'TextBlock', text: 'merged into `main` · [查看变更](https://github.com/Mininglamp-OSS/octo-server/pull/525)' },
+        ] },
+      ] },
+      { type: 'FactSet', facts: [
+        { title: '仓库',  value: 'octo-server' },
+        { title: '作者',  value: 'demo-user' },
+        { title: '状态',  value: '✅ 已合并' },
+      ] },
+    ],
+    actions: [
+      { type: 'Action.OpenUrl', title: '查看 PR', url: 'https://github.com/Mininglamp-OSS/octo-server/pull/525' },
+    ],
+  },
+}, true)));
+
+/* 3. 整卡跳转(selectAction=OpenUrl) */
+chat.appendChild(messageItem(bot, renderCard({
+  type: 17, card_version: '1.5', profile: 'octo/v1',
+  plain: '📊 本周部署报告\n成功: 47 次\n失败: 2 次',
+  card: {
+    type: 'AdaptiveCard', version: '1.5',
+    selectAction: { type: 'Action.OpenUrl', url: 'https://example.com/deploy-report' },
+    body: [
+      { type: 'TextBlock', weight: 'Bolder', text: '📊 本周部署报告(点卡片查看)' },
+      { type: 'FactSet', facts: [
+        { title: '成功', value: '47 次' }, { title: '失败', value: '2 次' },
+      ] },
+    ],
+  },
+}, true)));
+
+/* 4. 降级链演示 A:octo/v2 交互卡到达 P1 端 → plain */
+chat.appendChild(messageItem(bot, renderCard({
+  type: 17, card_version: '1.5', profile: 'octo/v2',
+  plain: '审批单 #42:市场部预算调整,等待你的审批',
+  card: { /* 含 Action.Submit,P1 端不渲染 */ },
+}, true)));
+
+/* 5. 降级链演示 B:伪造 bot 卡片(sender 是普通用户)→ 渲染门禁降级 */
+chat.appendChild(messageItem(user, renderCard({
+  type: 17, card_version: '1.5', profile: 'octo/v1',
+  plain: '⚠ 中奖通知:点击领取',
+  card: { type: 'AdaptiveCard', version: '1.5', body: [
+    { type: 'TextBlock', text: '你中奖了!' } ] },
+}, false)));
+</script>
+</body>
+</html>

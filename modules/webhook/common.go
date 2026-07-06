@@ -10,6 +10,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/pushcache"
 	"github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
@@ -194,6 +195,13 @@ func getMessageAlert(msg msgOfflineNotify, toUser *user.Resp, ctx *config.Contex
 		// 「存储后展示路径」，payload 已在派发出口经 EnsurePlain 用 content 重算
 		// 覆盖端上 plain，故信任 plain 是正确且高效的。
 		alert = common.GetRichTextDisplayText(msg.Payload)
+	case cardmsg.InteractiveCard:
+		// card-message-protocol P1 Decision 8：卡片推送正文取 server 权威 plain
+		// （经校验路径永不为空；缺失时现场从 card 重算，再兜底 [卡片]）。
+		// TODO(card P1 实现 PR): Decision 2 residual-risk —— sender 非 bot/webhook
+		// 身份的 type-17（长连接直发，plain 攻击者可控）须改用 DisplayText() 占位，
+		// 待此路径接入 sender 身份判定后落地。
+		alert = cardmsg.PushDisplayText(msg.Payload)
 	}
 	return alert, nil
 }
