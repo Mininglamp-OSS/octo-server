@@ -3,14 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>octo card-message P1 POC demo</title>
+<title>octo card-message POC demo</title>
 <style>
   /* ============================================================
      消息列表布局:仿 octo-web wk-message-item 结构
-     (octo-web 仓不在本 POC 访问范围,按其典型结构仿写:
-      avatar 左列 + header(name/time) + content;
+     (octo-web 仓不在本 POC 访问范围,按其典型结构仿写;
       正式接入时把 .wk-message-item 换成真实组件即可,
-      卡片渲染器 renderCard() 与布局解耦、可整体搬移)
+      渲染器 renderCard() 与布局解耦、可整体搬移)
      ============================================================ */
   :root {
     --bg: #f5f6f7; --bubble: #ffffff; --bubble-self: #d6e4ff;
@@ -20,8 +19,17 @@
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text);
          font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
-  .chat { max-width: 720px; margin: 0 auto; padding: 24px 16px 64px; }
-  .chat-title { text-align: center; color: var(--sub); font-size: 12px; margin: 16px 0; }
+  .shell { max-width: 760px; margin: 0 auto; padding: 16px 16px 64px; }
+
+  /* Tab 导航 */
+  .tabs { display: flex; gap: 4px; border-bottom: 2px solid var(--border);
+    position: sticky; top: 0; background: var(--bg); z-index: 5; padding-top: 8px; }
+  .tabs button { border: none; background: none; font: inherit; padding: 8px 16px;
+    cursor: pointer; color: var(--sub); border-bottom: 2px solid transparent; margin-bottom: -2px; }
+  .tabs button.active { color: var(--primary); border-bottom-color: var(--primary); font-weight: 600; }
+  .tab-panel { display: none; padding-top: 12px; }
+  .tab-panel.active { display: block; }
+  .chat-title { text-align: center; color: var(--sub); font-size: 12px; margin: 12px 0; }
 
   .wk-message-item { display: flex; gap: 10px; margin: 18px 0; }
   .wk-message-item__avatar { width: 36px; height: 36px; border-radius: 6px;
@@ -39,9 +47,7 @@
     word-break: break-word; white-space: pre-wrap; }
   .wk-bubble .degrade-note { display: block; margin-top: 4px; font-size: 11px; color: var(--sub); }
 
-  /* ============================================================
-     卡片消息:独立设计(不走气泡)——扁平卡容器 + 分区 + 底部动作条
-     ============================================================ */
+  /* 卡片消息:独立设计(不走气泡) */
   .octo-card { width: var(--card-w); max-width: 100%; background: #fff;
     border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
     box-shadow: 0 1px 4px rgba(29,33,41,.06); }
@@ -54,6 +60,10 @@
     border: 1px solid var(--primary); color: var(--primary); background: #fff;
     border-radius: 6px; cursor: pointer; text-decoration: none; }
   .octo-card__btn:hover { background: var(--primary); color: #fff; }
+  .octo-card__btn--submit { background: var(--primary); color: #fff; border: none; }
+  .octo-card__btn--submit:hover { opacity: .88; }
+  .octo-card__btn:disabled { opacity: .5; cursor: not-allowed; }
+  .octo-card__hint { padding: 0 14px 10px; font-size: 11px; color: var(--sub); }
 
   .ac-textblock { margin: 0 0 8px; }
   .ac-textblock--bolder { font-weight: 600; font-size: 15px; }
@@ -67,44 +77,67 @@
     margin: 0 0 8px; font-size: 13px; }
   .ac-factset .t { color: var(--sub); }
   .ac-container { margin: 0 0 4px; }
-
-  /* P2 交互元素(octo/v2) */
   .ac-input { display: block; width: 100%; margin: 0 0 8px; padding: 6px 10px;
     border: 1px solid var(--border); border-radius: 6px; font: inherit; }
   .ac-toggle { display: flex; gap: 6px; align-items: center; margin: 0 0 8px; font-size: 13px; }
-  .octo-card__btn--submit { background: var(--primary); color: #fff; border: none; }
-  .octo-card__btn--submit:hover { opacity: .88; }
-  .octo-card__btn:disabled { opacity: .5; cursor: not-allowed; }
-  .octo-card__hint { padding: 0 14px 10px; font-size: 11px; color: var(--sub); }
 
-  /* Demo 3:帧时间线(connector 视角的应用/拒绝日志) */
+  /* 帧时间线 + 变更历史 */
   .frame-log { margin-top: 6px; font-size: 11px; color: var(--sub); line-height: 1.7; }
   .frame-log .rej { color: #d54941; font-weight: 600; }
-  .frame-log details { margin-top: 2px; }
-  .frame-log pre { background: #fff; border: 1px solid var(--border); border-radius: 6px;
-    padding: 6px 8px; overflow-x: auto; max-width: var(--card-w); font-size: 10px; }
+  .rev-link { display: inline-block; margin-top: 4px; font-size: 11px; color: var(--primary);
+    cursor: pointer; user-select: none; }
+  .rev-drawer { position: fixed; right: 0; top: 0; bottom: 0; width: 420px; max-width: 92vw;
+    background: #fff; border-left: 1px solid var(--border); box-shadow: -4px 0 16px rgba(0,0,0,.08);
+    z-index: 20; display: none; flex-direction: column; }
+  .rev-drawer.open { display: flex; }
+  .rev-drawer__head { padding: 12px 16px; border-bottom: 1px solid var(--border);
+    font-weight: 600; display: flex; justify-content: space-between; align-items: center; }
+  .rev-drawer__head span { cursor: pointer; color: var(--sub); font-weight: 400; }
+  .rev-drawer__list { overflow-y: auto; padding: 12px 16px; flex: 1; }
+  .rev-item { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+    margin-bottom: 10px; cursor: pointer; font-size: 12px; }
+  .rev-item:hover { border-color: var(--primary); }
+  .rev-item .meta { color: var(--sub); margin-bottom: 2px; display: flex; justify-content: space-between; }
+  .rev-item .plain { white-space: pre-wrap; }
+  .rev-item .snapshot { margin-top: 8px; display: none; }
+  .rev-item.expanded .snapshot { display: block; }
+  .rev-item .snapshot .octo-card { width: 100%; box-shadow: none; }
+  .rev-note { font-size: 11px; color: var(--sub); margin-bottom: 10px; }
 </style>
 </head>
 <body>
-<div class="chat" id="chat">
-  <div class="chat-title">card-message-protocol P1 POC · octo/v1 自研极简渲染器(决策 B 实证,零依赖)</div>
+<div class="shell">
+  <div class="tabs" id="tabs">
+    <button data-tab="t1" class="active">Demo 1 · 静态卡片(P1)</button>
+    <button data-tab="t2">Demo 2 · 交互闭环(P2)</button>
+    <button data-tab="t3">Demo 3 · Agent 执行态</button>
+  </div>
+  <div class="tab-panel active" id="t1">
+    <div class="chat-title">octo/v1 展示卡 · 降级链 · 渲染门禁(零依赖自研渲染器,决策 B)</div>
+    <div id="chat1"></div>
+  </div>
+  <div class="tab-panel" id="t2">
+    <div class="chat-title">点击“通过”→ 幂等提交 → bot 整卡重写;卡片下方可查看变更历史</div>
+    <div id="chat2"></div>
+  </div>
+  <div class="tab-panel" id="t3">
+    <div class="chat-title">thinking → tool_call → tool_result → final;D9 乱序帧拒绝;connector 超纲降级</div>
+    <div id="chat3"></div>
+  </div>
+</div>
+<div class="rev-drawer" id="revDrawer">
+  <div class="rev-drawer__head">卡片变更历史 <span id="revClose">✕ 关闭</span></div>
+  <div class="rev-drawer__list" id="revList"></div>
 </div>
 
 <script>
 /* ================================================================
-   octo/v1 极简自研渲染器 —— 与 pkg/cardmsg 白名单一一对应:
-   TextBlock(基础 markdown) / Image / Container / ColumnSet / Column /
-   FactSet / Action.OpenUrl / selectAction(仅 OpenUrl)。
-   契约实现:
-   - from_uid 渲染门禁:sender 非 bot → 不渲染卡片,降级为 plain 气泡;
-   - profile 协商:非 octo/v1 → 降级为 plain 气泡(octo/v2 卡在 P1 端上的表现);
-   - 未知元素:跳过并可在 console 记录(服务端白名单本应拦下,双保险)。
+   octo profile 极简自研渲染器(与 pkg/cardmsg 白名单一一对应)。
+   契约实现:from_uid 渲染门禁 / profile 协商降级 / 未知元素跳过。
    ================================================================ */
-
 const ALLOW_SCHEME = /^https?:\/\//i;
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
-/* AC 基础 markdown 子集:**bold**、[text](url)(仅 http/https) */
 function mdLite(s) {
   let h = esc(s);
   h = h.replace(/\[([^\]]*)\]\(([^)\s]+)[^)]*\)/g, (m, text, url) =>
@@ -117,28 +150,6 @@ function renderElements(items, into, inputs) {
   (items || []).forEach(el => {
     if (!el || typeof el !== 'object') return;
     switch (el.type) {
-      case 'Input.Text': {
-        const i = document.createElement('input');
-        i.className = 'ac-input'; i.placeholder = el.placeholder || '';
-        i.addEventListener('input', () => inputs && (inputs[el.id] = i.value));
-        into.appendChild(i); break;
-      }
-      case 'Input.ChoiceSet': {
-        const s = document.createElement('select'); s.className = 'ac-input';
-        (el.choices || []).forEach(ch => {
-          const o = document.createElement('option');
-          o.value = ch.value; o.textContent = ch.title; s.appendChild(o);
-        });
-        s.addEventListener('change', () => inputs && (inputs[el.id] = s.value));
-        into.appendChild(s); break;
-      }
-      case 'Input.Toggle': {
-        const l = document.createElement('label'); l.className = 'ac-toggle';
-        const cb = document.createElement('input'); cb.type = 'checkbox';
-        cb.addEventListener('change', () => inputs && (inputs[el.id] = cb.checked));
-        l.appendChild(cb); l.appendChild(document.createTextNode(el.title || ''));
-        into.appendChild(l); break;
-      }
       case 'TextBlock': {
         const p = document.createElement('p');
         p.className = 'ac-textblock' + (el.weight === 'Bolder' ? ' ac-textblock--bolder' : '');
@@ -174,7 +185,30 @@ function renderElements(items, into, inputs) {
         });
         into.appendChild(g); break;
       }
-      default: console.warn('octo/v1 未知元素,跳过:', el.type);
+      case 'Input.Text': {
+        const i = document.createElement('input');
+        i.className = 'ac-input'; i.placeholder = el.placeholder || '';
+        i.addEventListener('input', () => inputs && (inputs[el.id] = i.value));
+        into.appendChild(i); break;
+      }
+      case 'Input.ChoiceSet': {
+        const s = document.createElement('select'); s.className = 'ac-input';
+        (el.choices || []).forEach(ch => {
+          const o = document.createElement('option');
+          o.value = ch.value; o.textContent = ch.title; s.appendChild(o);
+        });
+        s.addEventListener('change', () => inputs && (inputs[el.id] = s.value));
+        if (el.choices && el.choices.length && inputs) inputs[el.id] = el.choices[0].value;
+        into.appendChild(s); break;
+      }
+      case 'Input.Toggle': {
+        const l = document.createElement('label'); l.className = 'ac-toggle';
+        const cb = document.createElement('input'); cb.type = 'checkbox';
+        cb.addEventListener('change', () => inputs && (inputs[el.id] = cb.checked));
+        l.appendChild(cb); l.appendChild(document.createTextNode(el.title || ''));
+        into.appendChild(l); break;
+      }
+      default: console.warn('octo profile 未知元素,跳过:', el.type);
     }
   });
 }
@@ -185,9 +219,8 @@ function attachSelectAction(sa, node) {
   node.addEventListener('click', () => window.open(sa.url, '_blank', 'noopener'));
 }
 
-/* 渲染一个信封。返回 DOM 节点;按契约决定卡片渲染 or plain 降级。
-   clientProfiles 模拟端上能力集(P1 端 ['octo/v1'],P2 端加 'octo/v2');
-   onCardAction(actionId, inputs, cardRoot) 模拟 POST /v1/message/card/action */
+/* clientProfiles 模拟端上能力集;onCardAction(actionId, inputs, cardRoot, done)
+   模拟 POST /v1/message/card/action */
 function renderCard(envelope, senderIsBot, clientProfiles = ['octo/v1'], onCardAction) {
   if (!senderIsBot)  return plainBubble(envelope.plain, '⚠ 发送者非 bot 身份,按渲染门禁降级');
   if (!clientProfiles.includes(envelope.profile)) return plainBubble(envelope.plain, `ⓘ ${envelope.profile} 超出本端能力,降级显示 plain`);
@@ -211,14 +244,14 @@ function renderCard(envelope, senderIsBot, clientProfiles = ['octo/v1'], onCardA
         const b = document.createElement('button');
         b.className = 'octo-card__btn octo-card__btn--submit'; b.textContent = a.title || '提交';
         b.addEventListener('click', () => {
-          // 本地瞬时态:禁用防连点(权威防线是服务端 D4 幂等;10s 超时恢复)
+          if (!onCardAction) return; // 历史快照等只读场景
           bar.querySelectorAll('button').forEach(x => { x.disabled = true; });
           b.textContent = '提交中…';
           const restore = setTimeout(() => {  // D8 客户端 loading 超时
             bar.querySelectorAll('button').forEach(x => { x.disabled = false; });
             b.textContent = a.title || '提交';
           }, 10000);
-          onCardAction && onCardAction(a.id, { ...inputs }, root, () => clearTimeout(restore));
+          onCardAction(a.id, { ...inputs }, root, () => clearTimeout(restore));
         });
         bar.appendChild(b);
       }
@@ -235,7 +268,6 @@ function plainBubble(text, note) {
   return d;
 }
 
-/* 仿 wk-message-item 的消息行 */
 function messageItem({ name, color, isBot, time }, contentNode) {
   const item = document.createElement('div'); item.className = 'wk-message-item';
   item.innerHTML = `
@@ -247,16 +279,73 @@ function messageItem({ name, color, isBot, time }, contentNode) {
   return item;
 }
 
-/* ============ 演示数据 ============ */
-const chat = document.getElementById('chat');
-const bot  = { name: 'CI 助手',  color: '#165dff', isBot: true,  time: '10:01' };
-const user = { name: '演示用户',     color: '#00b42a', isBot: false, time: '10:02' };
+/* ================================================================
+   变更历史(P2 D10 revision 侧表的前端演示):
+   - 每次整卡替换 recordRevision(带 editor/时间);transient 帧默认不入史;
+   - 抹除操作以显式 tombstone 记录留痕(可抹除但有痕,产品决策 #4)。
+   ================================================================ */
+const revisionStore = {};   // key -> [{env, editor, at, tombstone?}]
+function recordRevision(key, env, editor) {
+  if (env.transient) return;   // 决策 #5:瞬态帧(进度)不入历史
+  (revisionStore[key] = revisionStore[key] || []).push({ env, editor, at: new Date().toLocaleTimeString('zh-CN', {hour12:false}) });
+}
+function recordErasure(key, editor, count) {  // 决策 #4:抹除需显式记录
+  (revisionStore[key] = revisionStore[key] || []).push({ tombstone: `该消息的 ${count} 个历史帧已被 ${editor} 清除`, editor, at: new Date().toLocaleTimeString('zh-CN', {hour12:false}) });
+}
+function revisionLink(key, holder) {
+  const link = document.createElement('span');
+  link.className = 'rev-link';
+  const refresh = () => {
+    const n = (revisionStore[key] || []).length;
+    link.textContent = n > 1 ? `已更新 ${n - 1} 次 · 查看变更历史` : '查看变更历史';
+  };
+  refresh();
+  link.addEventListener('click', () => openRevDrawer(key));
+  holder.appendChild(link);
+  return refresh;
+}
+function openRevDrawer(key) {
+  const list = document.getElementById('revList');
+  list.innerHTML = '<div class="rev-note">可见性:频道成员均可(与消息编辑历史同权)· 瞬态帧(transient)不入史 · 清除历史会留下显式记录</div>';
+  (revisionStore[key] || []).slice().reverse().forEach((rev, idx, arr) => {
+    const item = document.createElement('div'); item.className = 'rev-item';
+    if (rev.tombstone) {
+      item.innerHTML = `<div class="meta"><span>🗑 清除记录</span><time>${rev.at}</time></div><div class="plain">${esc(rev.tombstone)}</div>`;
+    } else {
+      const seq = rev.env.card_seq !== undefined ? `seq=${rev.env.card_seq}` : '';
+      item.innerHTML = `<div class="meta"><span>#${arr.length - idx} ${esc(rev.editor)} ${seq}${idx === 0 ? ' · 当前' : ''}</span><time>${rev.at}</time></div>
+        <div class="plain">${esc(rev.env.plain || '[卡片]')}</div><div class="snapshot"></div>`;
+      item.addEventListener('click', () => {
+        item.classList.toggle('expanded');
+        const snap = item.querySelector('.snapshot');
+        if (item.classList.contains('expanded') && !snap.hasChildNodes()) {
+          // 整卡替换模型的红利:每帧都是完整可渲染信封,历史查看 = 渲染器原样复用(只读)
+          snap.appendChild(renderCard(rev.env, true, ['octo/v1', 'octo/v2']));
+        }
+      });
+    }
+    list.appendChild(item);
+  });
+  document.getElementById('revDrawer').classList.add('open');
+}
+document.getElementById('revClose').addEventListener('click', () =>
+  document.getElementById('revDrawer').classList.remove('open'));
 
-/* 1. 普通文本消息 —— 复用气泡 */
-chat.appendChild(messageItem(user, plainBubble('帮我盯一下 #525 的 CI')));
+/* Tab 切换 */
+document.getElementById('tabs').addEventListener('click', e => {
+  const btn = e.target.closest('button'); if (!btn) return;
+  document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('active', b === btn));
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('active', p.id === btn.dataset.tab));
+});
 
-/* 2. GitHub 通知卡(Demo 1 主角,octo/v1 全家桶,与 pkg/cardmsg 测试用例同构) */
-chat.appendChild(messageItem(bot, renderCard({
+/* ============ 人物(示例用虚拟名称,禁真人姓名)============ */
+const demoUser = { name: '演示用户', color: '#00b42a', isBot: false, time: '10:02' };
+const ciBot    = { name: 'CI 助手',   color: '#165dff', isBot: true,  time: '10:01' };
+
+/* ================= Tab 1:静态卡片 ================= */
+const chat1 = document.getElementById('chat1');
+chat1.appendChild(messageItem(demoUser, plainBubble('帮我盯一下 #525 的 CI')));
+chat1.appendChild(messageItem(ciBot, renderCard({
   type: 17, card_version: '1.5', profile: 'octo/v1',
   plain: 'PR #525 merged\n仓库: octo-server\n作者: demo-user\n状态: ✅ 已合并',
   card: {
@@ -282,9 +371,7 @@ chat.appendChild(messageItem(bot, renderCard({
     ],
   },
 }, true)));
-
-/* 3. 整卡跳转(selectAction=OpenUrl) */
-chat.appendChild(messageItem(bot, renderCard({
+chat1.appendChild(messageItem(ciBot, renderCard({
   type: 17, card_version: '1.5', profile: 'octo/v1',
   plain: '📊 本周部署报告\n成功: 47 次\n失败: 2 次',
   card: {
@@ -298,39 +385,35 @@ chat.appendChild(messageItem(bot, renderCard({
     ],
   },
 }, true)));
-
-/* 4. 降级链演示 A:octo/v2 交互卡到达 P1 端 → plain */
-chat.appendChild(messageItem(bot, renderCard({
+chat1.appendChild(messageItem(ciBot, renderCard({
   type: 17, card_version: '1.5', profile: 'octo/v2',
   plain: '审批单 #42:市场部预算调整,等待你的审批',
   card: { /* 含 Action.Submit,P1 端不渲染 */ },
 }, true)));
-
-/* 5. 降级链演示 B:伪造 bot 卡片(sender 是普通用户)→ 渲染门禁降级 */
-chat.appendChild(messageItem(user, renderCard({
+chat1.appendChild(messageItem(demoUser, renderCard({
   type: 17, card_version: '1.5', profile: 'octo/v1',
   plain: '⚠ 中奖通知:点击领取',
   card: { type: 'AdaptiveCard', version: '1.5', body: [
     { type: 'TextBlock', text: '你中奖了!' } ] },
 }, false)));
 
-/* ============ Demo 2:P2 交互闭环(octo/v2 端视角)============ */
-const divider = document.createElement('div');
-divider.className = 'chat-title';
-divider.textContent = '—— Demo 2:P2 交互闭环(点击"通过"→ 幂等提交 → bot 重写整卡)——';
-chat.appendChild(divider);
-
+/* ================= Tab 2:交互闭环 + 变更历史 ================= */
+const chat2 = document.getElementById('chat2');
 const P2_PROFILES = ['octo/v1', 'octo/v2'];
+const approvalBot = { name: '审批助手', color: '#7c3aed', isBot: true, time: '10:05' };
 const approvalEnvelope = {
   type: 17, card_version: '1.5', profile: 'octo/v2', card_seq: 1,
-  plain: '审批单 #42:市场部预算调整\n金额: ¥120,000\n申请人: 王五',
+  plain: '审批单 #42:市场部预算调整\n金额: ¥120,000\n申请人: 员工甲',
   card: {
     type: 'AdaptiveCard', version: '1.5',
     body: [
       { type: 'TextBlock', weight: 'Bolder', text: '📋 审批单 #42:市场部预算调整' },
       { type: 'FactSet', facts: [
-        { title: '金额', value: '¥120,000' }, { title: '申请人', value: '王五' } ] },
+        { title: '金额', value: '¥120,000' }, { title: '申请人', value: '员工甲' } ] },
       { type: 'Input.Text', id: 'comment', placeholder: '审批意见(可选)' },
+      { type: 'Input.ChoiceSet', id: 'priority', choices: [
+        { title: '正常优先级', value: 'normal' }, { title: '加急', value: 'urgent' } ] },
+      { type: 'Input.Toggle', id: 'notify', title: '通过后通知申请人' },
     ],
     actions: [
       { type: 'Action.Submit', id: 'approve_btn', title: '通过' },
@@ -339,65 +422,67 @@ const approvalEnvelope = {
   },
 };
 
-/* 模拟闭环:card/action → card_action 事件 → bot 处理 → botMessageEdit 整卡替换帧 → CMD 刷新 */
-const approvalBot = { name: '审批助手', color: '#7c3aed', isBot: true, time: '10:05' };
-const approvalItem = messageItem(approvalBot, renderCard(approvalEnvelope, true, P2_PROFILES,
-  (actionId, inputs, cardRoot, done) => {
-    setTimeout(() => {   // 模拟:bot 轮询到 card_action 事件并回写(真实延迟=bot 轮询节奏,D5)
-      done();
-      const approved = actionId === 'approve_btn';
-      const rewrittenFrame = {   // D6:整卡替换,新帧与旧帧结构无关;card_seq 递增(D9)
-        type: 17, card_version: '1.5', profile: 'octo/v2', card_seq: 2,
-        plain: `审批单 #42:${approved ? '✅ 已通过' : '❌ 已拒绝'} by 演示用户`,
-        card: {
-          type: 'AdaptiveCard', version: '1.5',
-          body: [
-            { type: 'TextBlock', weight: 'Bolder',
-              text: `📋 审批单 #42:${approved ? '✅ 已通过' : '❌ 已拒绝'}` },
-            { type: 'FactSet', facts: [
-              { title: '操作人', value: '演示用户' },
-              { title: '意见',   value: inputs.comment || '(无)' },
-              { title: '时间',   value: '10:06' } ] },
-          ],  // 无 actions:按钮随帧消失,旧按钮迟到点击被 D3 生效帧校验 400
-        },
-      };
-      cardRoot.replaceWith(renderCard(rewrittenFrame, true, P2_PROFILES));
-    }, 900);
-  }));
-const hint = document.createElement('div');
-hint.className = 'octo-card__hint';
-hint.textContent = '契约:防重复=服务端幂等(D4)+状态随整卡重写(D6)+本地瞬时禁用(D8,10s 超时恢复);此处 900ms 模拟 bot 轮询+回写延迟';
-approvalItem.querySelector('.wk-message-item__main').appendChild(hint);
-chat.appendChild(approvalItem);
+const approvalItem = messageItem(approvalBot, renderCard(approvalEnvelope, true, P2_PROFILES, onApprovalAction));
+recordRevision('approval', approvalEnvelope, '审批助手');
+const approvalMain = approvalItem.querySelector('.wk-message-item__main');
+const approvalHint = document.createElement('div');
+approvalHint.className = 'octo-card__hint';
+approvalHint.textContent = '契约:防重复=服务端幂等(D4)+状态随整卡重写(D6)+本地瞬时禁用(D8,10s 超时恢复);900ms 模拟 bot 轮询+回写延迟';
+approvalMain.appendChild(approvalHint);
+const refreshApprovalRev = revisionLink('approval', approvalMain);
+chat2.appendChild(approvalItem);
 
-/* ============ Demo 3:OpenClaw agent 执行态(异构帧 + 乱序 409 + 动作重入)============ */
-const divider3 = document.createElement('div');
-divider3.className = 'chat-title';
-divider3.textContent = '—— Demo 3:OpenClaw agent 执行态(thinking → tool_call → tool_result → final;D9 乱序帧演示)——';
-chat.appendChild(divider3);
+function onApprovalAction(actionId, inputs, cardRoot, done) {
+  setTimeout(() => {   // 模拟 bot 轮询到 card_action 并回写(真实延迟=bot 轮询节奏,D5)
+    done();
+    const approved = actionId === 'approve_btn';
+    const rewrittenFrame = {   // D6 整卡替换;card_seq 递增(D9)
+      type: 17, card_version: '1.5', profile: 'octo/v2', card_seq: 2,
+      plain: `审批单 #42:${approved ? '✅ 已通过' : '❌ 已拒绝'} by 演示用户`,
+      card: {
+        type: 'AdaptiveCard', version: '1.5',
+        body: [
+          { type: 'TextBlock', weight: 'Bolder',
+            text: `📋 审批单 #42:${approved ? '✅ 已通过' : '❌ 已拒绝'}` },
+          { type: 'FactSet', facts: [
+            { title: '操作人', value: '演示用户' },
+            { title: '意见',   value: inputs.comment || '(无)' },
+            { title: '优先级', value: inputs.priority === 'urgent' ? '加急' : '正常' },
+            { title: '通知',   value: inputs.notify ? '已通知申请人' : '未通知' } ] },
+        ],  // 无 actions:按钮随帧消失,旧按钮迟到点击被 D3 生效帧校验 400
+      },
+    };
+    recordRevision('approval', rewrittenFrame, '审批助手');
+    refreshApprovalRev();
+    cardRoot.replaceWith(renderCard(rewrittenFrame, true, P2_PROFILES));
+  }, 900);
+}
 
-/* connector:OpenClaw 插件标记走私格式 → type-17 信封(源码核实的 marker 常量,
-   openclaw-adaptive-cards constants.ts)。标记格式不上 Octo 的线 —— 提取后转装。 */
+/* ================= Tab 3:Agent 执行态 ================= */
+const chat3 = document.getElementById('chat3');
 const CARD_OPEN = '<!--adaptive-card-->', CARD_CLOSE = '<!--/adaptive-card-->';
-function connectorExtract(openclawText, profile, seq) {
+
+/* connector:OpenClaw 插件标记走私格式 → type-17 信封(标记格式不上 Octo 的线);
+   octo 白名单(mock):body 中出现白名单外元素 → 服务端 400 → connector 降级发 fallback */
+const OCTO_ELEMENTS = new Set(['TextBlock','Image','Container','ColumnSet','FactSet','Input.Text','Input.ChoiceSet','Input.Toggle']);
+function connectorExtract(openclawText, profile, seq, transient) {
   const s = openclawText.indexOf(CARD_OPEN), e = openclawText.indexOf(CARD_CLOSE);
-  if (s < 0 || e < 0) return null;   // 无卡片 → 走纯文本(fallback)通道
+  if (s < 0 || e < 0) return { fallback: openclawText.trim() };
   const card = JSON.parse(openclawText.slice(s + CARD_OPEN.length, e));
   const fallback = openclawText.slice(0, s).trim();
-  return { type: 17, card_version: '1.5', profile, card_seq: seq,
-           plain: fallback /* 仅作种子,服务端权威重算(Decision 8) */, card };
+  const bad = (card.body || []).find(el => !OCTO_ELEMENTS.has(el.type));
+  if (bad) return { rejected: bad.type, fallback };   // mock cardmsg.Validate 400
+  const env = { type: 17, card_version: '1.5', profile, card_seq: seq, plain: fallback, card };
+  if (transient) env.transient = true;   // 决策 #5:进度帧不入历史
+  return { env };
 }
-/* OpenClaw 插件输出形态:fallback 文本 + 标记内嵌 AC JSON */
 function openclawOutput(fallback, card) {
   return `${fallback}\n\n${CARD_OPEN}${JSON.stringify(card)}${CARD_CLOSE}`;
 }
 
-/* mock server:D9 card_seq CAS(≤ 已存值 → 409) */
 const mockExtra = { storedSeq: 0 };
 function mockBotMessageEdit(env) {
-  if (env.card_seq !== undefined && env.card_seq <= mockExtra.storedSeq) {
-    return { ok: false, status: 409 };
-  }
+  if (env.card_seq !== undefined && env.card_seq <= mockExtra.storedSeq) return { ok: false, status: 409 };
   mockExtra.storedSeq = env.card_seq ?? mockExtra.storedSeq;
   return { ok: true };
 }
@@ -405,10 +490,12 @@ function mockBotMessageEdit(env) {
 const agentBot = { name: 'OpenClaw 助手', color: '#f77234', isBot: true, time: '10:08' };
 let agentCardNode = plainBubble('…');
 const agentItem = messageItem(agentBot, agentCardNode);
+const agentMain = agentItem.querySelector('.wk-message-item__main');
 const frameLog = document.createElement('div');
 frameLog.className = 'frame-log';
-agentItem.querySelector('.wk-message-item__main').appendChild(frameLog);
-chat.appendChild(agentItem);
+agentMain.appendChild(frameLog);
+const refreshAgentRev = revisionLink('agent', agentMain);
+chat3.appendChild(agentItem);
 
 function logFrame(text, rejected) {
   const line = document.createElement('div');
@@ -417,8 +504,6 @@ function logFrame(text, rejected) {
   frameLog.appendChild(line);
 }
 
-/* agent 帧(全部以 OpenClaw 插件输出形态产出,经 connector 提取转装;
-   帧间结构完全不同 —— D6 异构帧) */
 const F = {
   thinking: () => openclawOutput('正在分析请求…', {
     type: 'AdaptiveCard', version: '1.5',
@@ -440,22 +525,32 @@ const F = {
       { type: 'TextBlock', text: '出门建议:[查看详情](https://example.com/briefing) 备好外套。' },
     ],
     actions: [ { type: 'Action.Submit', id: 'regen_btn', title: '🔄 重新生成' } ] }),
+  chart: () => openclawOutput('本周步数统计(图表)', {   // 超纲:Chart 不在 octo 白名单
+    type: 'AdaptiveCard', version: '1.5',
+    body: [ { type: 'Chart.Bar', data: [1,2,3] } ] }),
 };
 
-function applyFrame(openclawText, profile, seq, label) {
-  const env = connectorExtract(openclawText, profile, seq);
-  const res = mockBotMessageEdit(env);
+function applyFrame(openclawText, profile, seq, label, transient) {
+  const out = connectorExtract(openclawText, profile, seq, transient);
+  if (out.rejected) {
+    logFrame(`✗ ${label}:元素 ${out.rejected} 不在 octo 白名单 → 服务端 400 → connector 降级发 fallback 文本`, true);
+    const node = plainBubble(out.fallback, 'ⓘ 卡片超纲被拒,connector 已降级为纯文本');
+    agentCardNode.replaceWith(node); agentCardNode = node;
+    return;
+  }
+  const res = mockBotMessageEdit(out.env);
   if (!res.ok) {
     logFrame(`✗ frame seq=${seq}(${label})迟到于 seq=${mockExtra.storedSeq} → 409 card_seq conflict,已拒绝(D9)`, true);
     return;
   }
-  const node = renderCard(env, true, P2_PROFILES, onAgentAction);
+  recordRevision('agent', out.env, 'OpenClaw 助手');
+  refreshAgentRev();
+  const node = renderCard(out.env, true, P2_PROFILES, onAgentAction);
   agentCardNode.replaceWith(node); agentCardNode = node;
-  logFrame(`✓ frame seq=${seq} 应用:${label}`);
+  logFrame(`${out.env.transient ? '◌' : '✓'} frame seq=${seq} 应用:${label}${out.env.transient ? '(transient,不入历史)' : ''}`);
 }
 
 function onAgentAction(actionId, inputs, cardRoot, done) {
-  /* card_action → connector 转成合成消息喂 agent(对齐 formatActionAsMessage)→ agent 重入 */
   logFrame(`↩ card_action(action_id=${actionId}) → connector 合成消息 → agent 重入`);
   setTimeout(() => { done(); runAgentCycle(); }, 400);
 }
@@ -463,18 +558,34 @@ function onAgentAction(actionId, inputs, cardRoot, done) {
 let seqCounter = 0;
 function runAgentCycle() {
   const base = seqCounter;
-  applyFrame(F.thinking(), 'octo/v1', base + 1, 'thinking');
-  setTimeout(() => applyFrame(F.tools('运行中…', '运行中…'), 'octo/v1', base + 2, 'tool_call ×2'), 1100);
-  setTimeout(() => applyFrame(F.tools('✅ 北京 晴 3°C', '运行中…'), 'octo/v1', base + 3, 'tool_result: 天气先回'), 2200);
-  /* 并行工具的乱序场景:网络重试的旧帧(seq=base+2)晚到 → CAS 拒绝 */
-  setTimeout(() => applyFrame(F.tools('运行中…', '运行中…'), 'octo/v1', base + 2, 'tool_call 重试帧'), 3000);
-  setTimeout(() => applyFrame(F.tools('✅ 北京 晴 3°C', '✅ 3 个日程'), 'octo/v1', base + 4, 'tool_result: 日程后回'), 3800);
+  applyFrame(F.thinking(), 'octo/v1', base + 1, 'thinking', true);
+  setTimeout(() => applyFrame(F.tools('运行中…', '运行中…'), 'octo/v1', base + 2, 'tool_call ×2', true), 1100);
+  setTimeout(() => applyFrame(F.tools('✅ 北京 晴 3°C', '运行中…'), 'octo/v1', base + 3, 'tool_result: 天气先回', true), 2200);
+  /* 并行工具乱序:网络重试的旧帧(seq=base+2)晚到 → CAS 拒绝 */
+  setTimeout(() => applyFrame(F.tools('运行中…', '运行中…'), 'octo/v1', base + 2, 'tool_call 重试帧', true), 3000);
+  setTimeout(() => applyFrame(F.tools('✅ 北京 晴 3°C', '✅ 3 个日程'), 'octo/v1', base + 4, 'tool_result: 日程后回', true), 3800);
   setTimeout(() => { applyFrame(F.final(), 'octo/v2', base + 5, 'final(octo/v2,含重新生成按钮)'); seqCounter = base + 5; }, 4800);
 }
-/* #manual:测试/截图驱动模式(逐帧显式调用,不走定时器);默认自动播放 */
 const MANUAL3 = location.hash.includes('manual');
 if (!MANUAL3) runAgentCycle();
-window.__demo3 = { applyFrame, F, getSeq: () => seqCounter, setSeq: v => { seqCounter = v; } };
+window.__demo3 = { applyFrame, F, getSeq: () => seqCounter, setSeq: v => { seqCounter = v; },
+  recordErasure: () => { const n = (revisionStore['agent'] || []).length; recordErasure('agent', 'OpenClaw 助手', n); refreshAgentRev(); } };
+
+/* connector 超纲降级案例(独立消息,不影响主循环) */
+const chartBot = { name: 'OpenClaw 助手', color: '#f77234', isBot: true, time: '10:09' };
+let chartNode = plainBubble('…');
+const chartItem = messageItem(chartBot, chartNode);
+const chartLog = document.createElement('div'); chartLog.className = 'frame-log';
+chartItem.querySelector('.wk-message-item__main').appendChild(chartLog);
+chat3.appendChild(chartItem);
+(function () {
+  const out = connectorExtract(F.chart(), 'octo/v1', 1, false);
+  const line = document.createElement('div'); line.className = 'rej';
+  line.textContent = `✗ 元素 ${out.rejected} 不在 octo 白名单 → 服务端 400 → connector 降级发 fallback 文本`;
+  chartLog.appendChild(line);
+  const node = plainBubble(out.fallback, 'ⓘ 卡片超纲被拒,connector 已降级为纯文本');
+  chartNode.replaceWith(node);
+})();
 </script>
 </body>
 </html>
