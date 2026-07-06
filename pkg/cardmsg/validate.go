@@ -92,6 +92,21 @@ func validateCard(card map[string]interface{}, interactive bool) error {
 type walker struct {
 	nodes       int
 	interactive bool // octo/v2：放行 Action.Submit 与 Input.*（P2 D1）
+	// seenIDs P2 D1（round-3 nit）：Action.Submit / Input.* 的 id 必须帧内唯一
+	// —— D3 action 寻址、D4 幂等键、D11 inputs 声明匹配都以 id 为键，重复 id
+	// 会让它们悄悄歧义。单一命名空间：Submit 与 Input 之间也不许互撞。
+	seenIDs map[string]struct{}
+}
+
+func (w *walker) registerID(kind, id string) error {
+	if w.seenIDs == nil {
+		w.seenIDs = make(map[string]struct{})
+	}
+	if _, dup := w.seenIDs[id]; dup {
+		return fmt.Errorf("%w: %s.id %q 帧内重复", ErrCardBadShape, kind, id)
+	}
+	w.seenIDs[id] = struct{}{}
+	return nil
 }
 
 func (w *walker) bump(depth int) error {
@@ -205,12 +220,16 @@ func (w *walker) element(el map[string]interface{}, depth int) error {
 			}
 		}
 	case "Input.Text", "Input.Toggle", "Input.ChoiceSet":
-		// P2 D1：输入控件仅 octo/v2；id 必填（提交时 inputs 以 id 为键）。
+		// P2 D1：输入控件仅 octo/v2；id 必填且帧内唯一（提交时 inputs 以 id 为键）。
 		if !w.interactive {
 			return fmt.Errorf("%w: %q（需要 octo/v2）", ErrCardUnknownElement, t)
 		}
-		if id, _ := el["id"].(string); id == "" {
+		id, _ := el["id"].(string)
+		if id == "" {
 			return fmt.Errorf("%w: %s.id 必填", ErrCardBadShape, t)
+		}
+		if err := w.registerID(t, id); err != nil {
+			return err
 		}
 		if t == "Input.ChoiceSet" {
 			if choices, present := el["choices"]; present {
@@ -289,8 +308,12 @@ func (w *walker) action(a interface{}) error {
 		if !w.interactive {
 			return fmt.Errorf("%w: %q（需要 octo/v2）", ErrCardUnknownAction, t)
 		}
-		if id, _ := act["id"].(string); id == "" {
+		id, _ := act["id"].(string)
+		if id == "" {
 			return fmt.Errorf("%w: Action.Submit.id 必填", ErrCardBadShape)
+		}
+		if err := w.registerID(t, id); err != nil {
+			return err
 		}
 		if data, present := act["data"]; present {
 			if _, ok := data.(map[string]interface{}); !ok {

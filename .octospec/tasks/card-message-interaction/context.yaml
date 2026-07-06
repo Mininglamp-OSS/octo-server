@@ -1,0 +1,16 @@
+# POC alignment (round-3 brief revisions): D4 idempotency / D3 anti-IDOR /
+# D11 input validation / D1 frame-unique ids.
+# The canonical brief.md lives on branch docs/card-message-protocol-brief
+# (PR #525); this poc branch forked from main before it landed.
+injected:
+  - id: error-handling
+    source: repo
+  - id: rate-limit
+    source: repo
+  - id: space-isolation
+    source: repo
+  - id: trust-boundary
+    source: repo
+  - id: testing
+    source: repo
+brief: .octospec/tasks/card-message-interaction/brief.md  # on docs/card-message-protocol-brief @ 7a96ca89

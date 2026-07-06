@@ -74,8 +74,9 @@ type IService interface {
 	// for `robotID` to the same queue. card-message-interaction P2 D5:
 	// card_action 事件经此入队 —— 增量事件类型，bot SDK 须容忍未知
 	// event_type。与 EnqueueBotEvent 共用 GenSeq/ZAdd/Expire chokepoint，
-	// 队列语义不可漂移。
-	EnqueueBotTypedEvent(robotID, eventType string, eventData map[string]interface{}) error
+	// 队列语义不可漂移。返回入队事件的 event_id（D4 幂等 confirm 以其为
+	// 标记值，便于排障时把去重键关联回事件）。
+	EnqueueBotTypedEvent(robotID, eventType string, eventData map[string]interface{}) (int64, error)
 	// ExistRobot reports whether `uid` identifies an active robot
 	// (robot.status=1). Mininglamp-OSS/octo-server#144: the ingress
 	// chokepoint that expands `mention.ais=1` into `mention.uids` uses
@@ -158,12 +159,12 @@ func (rb *Robot) EnqueueBotEvent(robotID string, message *config.MessageResp) er
 }
 
 // EnqueueBotTypedEvent — IService — Service variant（card_action 等类型化事件）。
-func (s *Service) EnqueueBotTypedEvent(robotID, eventType string, eventData map[string]interface{}) error {
+func (s *Service) EnqueueBotTypedEvent(robotID, eventType string, eventData map[string]interface{}) (int64, error) {
 	return enqueueBotTypedEventGeneric(s.ctx, robotID, eventType, eventData)
 }
 
 // EnqueueBotTypedEvent — IService — *Robot variant.
-func (rb *Robot) EnqueueBotTypedEvent(robotID, eventType string, eventData map[string]interface{}) error {
+func (rb *Robot) EnqueueBotTypedEvent(robotID, eventType string, eventData map[string]interface{}) (int64, error) {
 	return enqueueBotTypedEventGeneric(rb.ctx, robotID, eventType, eventData)
 }
 
@@ -238,19 +239,19 @@ func enqueueBotEventGeneric(ctx *config.Context, robotID string, message *config
 // Expire 形状（同一 seq 序列、同一 key、同一 TTL），/v1/bot/events 消费端
 // （bot_api events.go 的 robotEvent 解析结构）对两类条目透明。
 // event_data 形状由 card-message-interaction brief 冻结：实现只许增字段。
-func enqueueBotTypedEventGeneric(ctx *config.Context, robotID, eventType string, eventData map[string]interface{}) error {
+func enqueueBotTypedEventGeneric(ctx *config.Context, robotID, eventType string, eventData map[string]interface{}) (int64, error) {
 	if ctx == nil {
-		return errors.New("robot: nil ctx, cannot enqueue bot event")
+		return 0, errors.New("robot: nil ctx, cannot enqueue bot event")
 	}
 	if strings.TrimSpace(robotID) == "" {
-		return errors.New("robot: empty robotID, cannot enqueue bot event")
+		return 0, errors.New("robot: empty robotID, cannot enqueue bot event")
 	}
 	if strings.TrimSpace(eventType) == "" {
-		return errors.New("robot: empty eventType, cannot enqueue bot event")
+		return 0, errors.New("robot: empty eventType, cannot enqueue bot event")
 	}
 	seq, err := ctx.GenSeq(fmt.Sprintf("%s%s", common.RobotEventSeqKey, robotID))
 	if err != nil {
-		return err
+		return 0, err
 	}
 	eventJson := util.ToJson(&robotEvent{
 		EventID:   seq,
@@ -260,13 +261,13 @@ func enqueueBotTypedEventGeneric(ctx *config.Context, robotID, eventType string,
 	})
 	key := fmt.Sprintf("robotEvent:%s", robotID)
 	if err := ctx.GetRedisConn().ZAdd(key, float64(seq), eventJson); err != nil {
-		return err
+		return 0, err
 	}
 	if err := ctx.GetRedisConn().Expire(key, ctx.GetConfig().Robot.MessageExpire); err != nil {
 		// Best-effort TTL refresh — 与 enqueueBotEventGeneric 同口径。
-		return nil
+		return seq, nil
 	}
-	return nil
+	return seq, nil
 }
 
 type Robot struct {

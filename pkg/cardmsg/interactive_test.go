@@ -159,6 +159,101 @@ func TestCardSeq(t *testing.T) {
 	}
 }
 
+// 验收(P2 D1, round-3):Action.Submit / Input.* 的 id 帧内唯一。
+func TestValidateFrameUniqueIDs(t *testing.T) {
+	// Submit id 撞 Submit id
+	dupSubmit := map[string]interface{}{"actions": []interface{}{
+		map[string]interface{}{"type": "Action.Submit", "id": "ok_btn"},
+		map[string]interface{}{"type": "Action.Submit", "id": "ok_btn"},
+	}}
+	if err := Validate(v2Envelope(dupSubmit)); !errors.Is(err, ErrCardBadShape) {
+		t.Errorf("重复 Submit id 应拒, err=%v", err)
+	}
+	// Input id 撞 Input id
+	dupInput := map[string]interface{}{"body": []interface{}{
+		map[string]interface{}{"type": "Input.Text", "id": "f1"},
+		map[string]interface{}{"type": "Input.Toggle", "id": "f1"},
+	}}
+	if err := Validate(v2Envelope(dupInput)); !errors.Is(err, ErrCardBadShape) {
+		t.Errorf("重复 Input id 应拒, err=%v", err)
+	}
+	// Submit 与 Input 互撞(单一命名空间)
+	cross := map[string]interface{}{
+		"body": []interface{}{map[string]interface{}{"type": "Input.Text", "id": "same"}},
+		"actions": []interface{}{
+			map[string]interface{}{"type": "Action.Submit", "id": "same"},
+		},
+	}
+	if err := Validate(v2Envelope(cross)); !errors.Is(err, ErrCardBadShape) {
+		t.Errorf("Submit/Input 互撞应拒, err=%v", err)
+	}
+	// 对照:全不同 id 的审批卡照常放行
+	if err := Validate(v2Envelope(approvalCard())); err != nil {
+		t.Errorf("不同 id 不应误伤: %v", err)
+	}
+}
+
+// 验收(P2 D11, round-3 P1-3):card/action inputs 的信任边界。
+func TestValidateInputs(t *testing.T) {
+	env := v2Envelope(approvalCard()) // 声明 comment(Text)/priority(ChoiceSet:high)/notify(Toggle)
+	raw, _ := json.Marshal(env)
+
+	ok := func(inputs map[string]interface{}) {
+		t.Helper()
+		if err := ValidateInputs(raw, inputs); err != nil {
+			t.Errorf("合法 inputs 被拒 %v: %v", inputs, err)
+		}
+	}
+	bad := func(inputs map[string]interface{}, label string) {
+		t.Helper()
+		if err := ValidateInputs(raw, inputs); !errors.Is(err, ErrCardInputInvalid) {
+			t.Errorf("%s 应拒, err=%v", label, err)
+		}
+	}
+
+	ok(nil)
+	ok(map[string]interface{}{"comment": "LGTM", "priority": "high", "notify": "true"})
+	ok(map[string]interface{}{"priority": ""}) // 单选未选择是合法形状
+	bad(map[string]interface{}{"undeclared": "x"}, "未声明键")
+	bad(map[string]interface{}{"comment": float64(1)}, "非字符串值")
+	bad(map[string]interface{}{"comment": strings.Repeat("a", MaxInputTextBytes+1)}, "Text 超限")
+	bad(map[string]interface{}{"notify": "yes"}, "Toggle 非 valueOn/valueOff")
+	bad(map[string]interface{}{"priority": "bogus"}, "ChoiceSet 未声明选项")
+	// 总量上限先于逐键校验(单值 17KiB 直接触发 16KiB 总量拒绝)
+	bad(map[string]interface{}{"comment": strings.Repeat("a", MaxInputsBytes+1)}, "总量超限")
+	// 生效帧解析失败 → 查无声明即拒绝(fail-closed)
+	if err := ValidateInputs([]byte("not-json"), map[string]interface{}{"comment": "x"}); !errors.Is(err, ErrCardInputInvalid) {
+		t.Errorf("坏生效帧应 fail-closed, err=%v", err)
+	}
+
+	// multiSelect:逗号分隔子集
+	multi := v2Envelope(cardWithBody(map[string]interface{}{
+		"type": "Input.ChoiceSet", "id": "tags", "isMultiSelect": true,
+		"choices": []interface{}{
+			map[string]interface{}{"title": "A", "value": "a"},
+			map[string]interface{}{"title": "B", "value": "b"},
+		},
+	}))
+	rawMulti, _ := json.Marshal(multi)
+	if err := ValidateInputs(rawMulti, map[string]interface{}{"tags": "a,b"}); err != nil {
+		t.Errorf("multiSelect 合法子集被拒: %v", err)
+	}
+	if err := ValidateInputs(rawMulti, map[string]interface{}{"tags": "a,x"}); !errors.Is(err, ErrCardInputInvalid) {
+		t.Errorf("multiSelect 未声明选项应拒, err=%v", err)
+	}
+	// 自定义 valueOn/valueOff 的 Toggle
+	toggled := v2Envelope(cardWithBody(map[string]interface{}{
+		"type": "Input.Toggle", "id": "sw", "valueOn": "on", "valueOff": "off",
+	}))
+	rawToggled, _ := json.Marshal(toggled)
+	if err := ValidateInputs(rawToggled, map[string]interface{}{"sw": "on"}); err != nil {
+		t.Errorf("自定义 valueOn 被拒: %v", err)
+	}
+	if err := ValidateInputs(rawToggled, map[string]interface{}{"sw": "true"}); !errors.Is(err, ErrCardInputInvalid) {
+		t.Errorf("覆盖默认后 true 不再合法, err=%v", err)
+	}
+}
+
 func TestIsCardRawPayload(t *testing.T) {
 	if !IsCardRawPayload([]byte(`{"type":17,"card":{}}`)) {
 		t.Error("type-17 字节应命中")

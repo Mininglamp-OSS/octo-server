@@ -14,6 +14,7 @@ package message
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -24,6 +25,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-server/modules/robot"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/go-redis/redis"
 	"github.com/stretchr/testify/assert"
@@ -50,7 +52,8 @@ func resetCardUIDRateLimit(t *testing.T, ctx *config.Context) {
 	}
 }
 
-// cardEnvelopeJSON 构造 octo/v2 审批卡信封（含指定 Submit action id）。
+// cardEnvelopeJSON 构造 octo/v2 审批卡信封（含指定 Submit action id；body 声明
+// Input.Text "comment" —— D11 之后 inputs 只放行声明过的 id）。
 func cardEnvelopeJSON(t *testing.T, actionIDs ...string) []byte {
 	t.Helper()
 	actions := make([]interface{}, 0, len(actionIDs))
@@ -68,6 +71,7 @@ func cardEnvelopeJSON(t *testing.T, actionIDs ...string) []byte {
 			"type": "AdaptiveCard", "version": "1.5",
 			"body": []interface{}{
 				map[string]interface{}{"type": "TextBlock", "text": "审批单 #42"},
+				map[string]interface{}{"type": "Input.Text", "id": "comment"},
 			},
 			"actions": actions,
 		},
@@ -154,7 +158,10 @@ func TestCardActionEndToEndAndIdempotency(t *testing.T) {
 	assert.Equal(t, map[string]interface{}{"comment": "LGTM"}, ev.EventData["inputs"])
 	assert.NotNil(t, ev.EventData["acted_at"])
 
-	// D4 幂等:同键重放 → replay=true,队列仍恰好 1 条(绝不产生第二个事件)
+	// D4 幂等(round-3 P1-1):去重键是业务身份 (message_id, action_id,
+	// operator_uid) —— 换一个 client_token 重放(模拟 D8 超时后的客户端重试)
+	// 仍是 replay=true,队列恰好 1 条,绝不产生第二个事件。
+	body["client_token"] = "tok-e2e-2"
 	w2 := httptest.NewRecorder()
 	req2, _ := http.NewRequest("POST", "/v1/message/card/action", bytes.NewReader([]byte(util.ToJson(body))))
 	req2.Header.Set("token", testutil.Token)
@@ -163,6 +170,14 @@ func TestCardActionEndToEndAndIdempotency(t *testing.T) {
 	assert.Contains(t, w2.Body.String(), `"replay":true`)
 	entries2, _ := rds.ZRange("robotEvent:"+cardTestBotUID, 0, -1).Result()
 	assert.Len(t, entries2, 1)
+
+	// D4 claim 已 confirm:键值 = event_id(排障关联),TTL 升格为 24h 窗口
+	claimVal, err := rds.Get(fmt.Sprintf("cardaction:%s:%s:%s", "9001", "approve_btn", testutil.UID)).Result()
+	assert.NoError(t, err)
+	assert.Equal(t, fmt.Sprintf("%d", ev.EventID), claimVal)
+	claimTTL, err := rds.TTL(fmt.Sprintf("cardaction:%s:%s:%s", "9001", "approve_btn", testutil.UID)).Result()
+	assert.NoError(t, err)
+	assert.Greater(t, claimTTL, time.Hour, "confirm 后应为 24h 级 TTL,而非 60s pending")
 }
 
 func TestCardActionTrustModel(t *testing.T) {
@@ -224,6 +239,55 @@ func TestCardActionTrustModel(t *testing.T) {
 	})
 	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
 	assert.Contains(t, w.Body.String(), "You cannot act on this card.")
+
+	// ⑤ D11 inputs 信任边界(round-3 P1-3):未声明键 / 非字符串值 → 400
+	for i, badInputs := range []map[string]interface{}{
+		{"undeclared": "x"},       // 生效帧(done_btn 新帧)只声明了 comment
+		{"comment": float64(123)}, // 值必须是字符串(AC submit 线上语义)
+	} {
+		w = do(map[string]interface{}{
+			"message_id": "9102", "channel_id": cardTestBotUID,
+			"channel_type": common.ChannelTypePerson.Uint8(),
+			"action_id":    "done_btn", "inputs": badInputs,
+			"client_token": fmt.Sprintf("tok-t6-%d", i),
+		})
+		assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+		assert.Contains(t, w.Body.String(), "Invalid card action.")
+	}
+
+	// ⑥ 跨频道 IDOR(round-3 P1-4):操作者是 A 群成员、消息在 B 群(非成员)。
+	//    拿 A 的 channel_id 指 B 的 message_id → 频道绑定源自存储行,查不到即
+	//    400;拿 B 的真实 channel_id → 成员资格对存储频道校验,403。两条路都
+	//    不产生 bot 事件。person 频道变体:fake id 含操作者,天然指不到别人的会话。
+	_, err = ctx.DB().InsertBySql("insert into group_member(group_no,uid) values(?,?)", "g_idor_a", testutil.UID).Exec()
+	assert.NoError(t, err)
+	seedCardMessage(t, ctx, 9104, cardTestBotUID, "g_idor_b", common.ChannelTypeGroup.Uint8(), cardEnvelopeJSON(t, "approve_btn"))
+	idorBody := func(chID, tok string) map[string]interface{} {
+		return map[string]interface{}{
+			"message_id": "9104", "channel_id": chID,
+			"channel_type": common.ChannelTypeGroup.Uint8(),
+			"action_id":    "approve_btn", "client_token": tok,
+		}
+	}
+	w = do(idorBody("g_idor_a", "tok-t7"))
+	assert.Equal(t, http.StatusBadRequest, w.Code, "A 群 channel_id 指 B 群消息应 400")
+	assert.Contains(t, w.Body.String(), "Invalid card action.")
+	w = do(idorBody("g_idor_b", "tok-t8"))
+	assert.Equal(t, http.StatusBadRequest, w.Code, "B 群非成员应 denied")
+	assert.Contains(t, w.Body.String(), "You cannot act on this card.")
+	w = do(map[string]interface{}{ // person 变体:声明与 bot 的会话,指群消息 id
+		"message_id": "9104", "channel_id": cardTestBotUID,
+		"channel_type": common.ChannelTypePerson.Uint8(),
+		"action_id":    "approve_btn", "client_token": "tok-t9",
+	})
+	assert.Equal(t, http.StatusBadRequest, w.Code, "person fake 频道指群消息应 400")
+	assert.Contains(t, w.Body.String(), "Invalid card action.")
+	// 整个 ⑥ 未投递任何事件
+	rds := redis.NewClient(&redis.Options{Addr: ctx.GetConfig().DB.RedisAddr, Password: ctx.GetConfig().DB.RedisPass})
+	defer rds.Close()
+	n, err := rds.ZCard("robotEvent:" + cardTestBotUID).Result()
+	assert.NoError(t, err)
+	assert.Equal(t, int64(1), n, "只应有 ③ done_btn 放行产生的那 1 条事件")
 }
 
 func TestCardActionDisabledByFlag(t *testing.T) {
@@ -241,6 +305,77 @@ func TestCardActionDisabledByFlag(t *testing.T) {
 	s.GetRoute().ServeHTTP(w, req)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 	assert.Contains(t, w.Body.String(), "Invalid card action.")
+}
+
+// flakyRobotService 包装真实 robot 服务,按开关注入 EnqueueBotTypedEvent 失败
+// (D4 验收:入队失败必须释放幂等 claim,不得造成 24h 锁死)。
+type flakyRobotService struct {
+	robot.IService
+	fail bool
+}
+
+func (f *flakyRobotService) EnqueueBotTypedEvent(robotID, eventType string, eventData map[string]interface{}) (int64, error) {
+	if f.fail {
+		return 0, errors.New("injected enqueue failure")
+	}
+	return f.IService.EnqueueBotTypedEvent(robotID, eventType, eventData)
+}
+
+// 验收(P2 D4, round-3 P1-1):入队失败 → 5xx 内部封套 + 补偿释放 claim,同一
+// 操作者立即重试成功 —— 半途而废的请求不锁死动作。
+//
+// 与 TestUserCardSendRejected 同理由使用包内 newTestServer + New(ctx):需要拿到
+// Message 实例注入 flaky robotService(testutil 路由绑定的是 sync.Once 缓存的
+// 全局实例,不可注入)。表由同二进制内先跑的 testutil 迁移建出。
+func TestCardActionEnqueueFailureReleasesClaim(t *testing.T) {
+	t.Setenv(cardmsg.EnvEnabled, "true")
+	s, ctx := newTestServer()
+	m := New(ctx)
+	flaky := &flakyRobotService{IService: m.robotService, fail: true}
+	m.robotService = flaky
+	m.Route(s.GetRoute())
+	resetCardUIDRateLimit(t, ctx)
+	defer func() { _ = testutil.CleanAllTables(ctx) }()
+
+	const failBot = "bot_card_fail"
+	seedCardBot(t, ctx, failBot)
+	fake := common.GetFakeChannelIDWith(uid, failBot)
+	seedCardMessage(t, ctx, 9301, failBot, fake, common.ChannelTypePerson.Uint8(), cardEnvelopeJSON(t, "approve_btn"))
+
+	body := map[string]interface{}{
+		"message_id": "9301", "channel_id": failBot,
+		"channel_type": common.ChannelTypePerson.Uint8(),
+		"action_id":    "approve_btn", "client_token": "tok-fail-1",
+	}
+	do := func() *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", "/v1/message/card/action", bytes.NewReader([]byte(util.ToJson(body))))
+		req.Header.Set("token", testutil.Token)
+		s.GetRoute().ServeHTTP(w, req)
+		return w
+	}
+
+	// ①入队失败:内部错误封套(D14 线上仍 400),未 accepted
+	w := do()
+	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.NotContains(t, w.Body.String(), `"accepted":true`)
+
+	// ②claim 已补偿释放(键不存在 —— 不是 24h 锁死,也不是 60s pending 残留)
+	rds := redis.NewClient(&redis.Options{Addr: ctx.GetConfig().DB.RedisAddr, Password: ctx.GetConfig().DB.RedisPass})
+	defer rds.Close()
+	claimKey := fmt.Sprintf("cardaction:%s:%s:%s", "9301", "approve_btn", uid)
+	exists, err := rds.Exists(claimKey).Result()
+	assert.NoError(t, err)
+	assert.Equal(t, int64(0), exists, "入队失败后 claim 应被释放")
+
+	// ③恢复入队 → 同一 client_token 立即重试成功,事件恰好 1 条
+	flaky.fail = false
+	w = do()
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), `"replay":false`)
+	entries, err := rds.ZRange("robotEvent:"+failBot, 0, -1).Result()
+	assert.NoError(t, err)
+	assert.Len(t, entries, 1)
 }
 
 // P1 Decision 2 layer (a):用户 ingress 拒卡(经 /v1/message/send 代发口)。

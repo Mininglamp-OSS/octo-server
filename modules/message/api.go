@@ -221,7 +221,9 @@ type Message struct {
 	userService         user.IService
 	groupService        group.IService
 	// robotService 仅用于 GetCreatorUID (YUJ-60 允许 bot 创建者撤回自己 bot 发的消息)。
-	robotService   robot.IService
+	robotService robot.IService
+	// cardClaims card/action 的 D4 幂等 claim 存储（card_action_claims.go）。
+	cardClaims     *cardActionClaimStore
 	commonService  commonapi.IService
 	fileService    file.IService
 	channelService chservice.IService
@@ -268,6 +270,7 @@ func New(ctx *config.Context) *Message {
 		userService:         user.NewService(ctx),
 		// robotService: 只读 robot 服务，用于 hasRevokePermission 判断 bot 所有者。
 		robotService:   robot.NewService(ctx),
+		cardClaims:     newCardActionClaimStore(ctx),
 		commonService:  commonapi.NewService(ctx),
 		fileService:    file.NewService(ctx),
 		channelService: channel.NewService(ctx),
