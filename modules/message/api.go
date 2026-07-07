@@ -840,6 +840,16 @@ func (m *Message) messageEdit(c *wkhttp.Context) {
 		return
 	}
 
+	// card-message-protocol P1 Decision 7（防御性对称，PR#543 review 🟡）：
+	// 上方 pre-fetch 已拒「编辑体是卡片」这一可达路径；此处再拒「目标消息本身是
+	// 卡片」，与 bot/robot 编辑路径的双向 RejectsCardEdit 对齐。当前不可达（用户
+	// send 绝对拒 type-17 → 用户无法拥有卡片行），保留为 belt-and-suspenders，
+	// 防未来出现用户可拥有卡片的入口时静默回归。
+	if cardmsg.IsCardRawPayload(resp.Messages[0].Payload) {
+		httperr.ResponseErrorL(c, errcode.ErrMessageCardEditForbidden, nil, nil)
+		return
+	}
+
 	// 解散守卫（企业微信式只读）：群解散后禁止编辑消息。
 	if req.ChannelType == common.ChannelTypeGroup.Uint8() {
 		disbanded, err := m.isGroupDisbanded(req.ChannelID)

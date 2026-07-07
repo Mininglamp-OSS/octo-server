@@ -219,8 +219,18 @@ func (w *walker) element(el map[string]interface{}, depth int) error {
 				}
 				for _, k := range [2]string{"title", "value"} {
 					if v, ok := fact[k]; ok {
-						if _, isStr := v.(string); !isStr {
+						s, isStr := v.(string)
+						if !isStr {
 							return fmt.Errorf("%w: Fact.%s 必须是字符串", ErrCardBadShape, k)
+						}
+						// Fact.title/value 同样渲染 AC markdown 子集，是与 TextBlock
+						// 对等的 URL 面 —— markdown 链接目标走同一正向 allowlist
+						// （Decision 6；PR#543 review：FactSet 曾漏这层，校验面必须
+						// ≥ 渲染面）。
+						for _, target := range markdownLinkTargets(s) {
+							if err := checkURL(target); err != nil {
+								return err
+							}
 						}
 					}
 				}

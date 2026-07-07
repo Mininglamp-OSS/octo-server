@@ -79,6 +79,12 @@ func collectPlain(items []interface{}, segs *[]string) {
 					}
 					title, _ := fact["title"].(string)
 					value, _ := fact["value"].(string)
+					// 与 TextBlock 对等：Fact.title/value 渲染 markdown，plain 须剥离
+					// 语法字符（Decision 8：plain 不含原始 markdown；PR#543 review：
+					// FactSet 曾直接拼接 raw title/value，把 `[x](url)`/`**b**` 泄进
+					// 权威 plain）。
+					title = stripMarkdown(title)
+					value = stripMarkdown(value)
 					line := strings.TrimSpace(strings.TrimSuffix(title+": "+value, ": "))
 					if line != "" && line != ":" {
 						*segs = append(*segs, strings.TrimPrefix(line, ": "))

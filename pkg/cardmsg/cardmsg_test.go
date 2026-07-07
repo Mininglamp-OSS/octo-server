@@ -214,6 +214,26 @@ func TestValidateURLAllowlistFullSurface(t *testing.T) {
 	if err := Validate(envelope(ref)); !errors.Is(err, ErrCardBadURLScheme) {
 		t.Errorf("引用式定义 javascript: 应被拒, err=%v", err)
 	}
+	// FactSet.value 里的 markdown 危险链接 —— 与 TextBlock 对等的渲染面,应被拒
+	fs := cardWithBody(map[string]interface{}{
+		"type": "FactSet",
+		"facts": []interface{}{
+			map[string]interface{}{"title": "操作", "value": "[点击](javascript:alert(1))"},
+		},
+	})
+	if err := Validate(envelope(fs)); !errors.Is(err, ErrCardBadURLScheme) {
+		t.Errorf("FactSet.value markdown javascript: 应被拒, err=%v", err)
+	}
+	// FactSet.title 同理
+	fsT := cardWithBody(map[string]interface{}{
+		"type": "FactSet",
+		"facts": []interface{}{
+			map[string]interface{}{"title": "[t](data:text/html,x)", "value": "v"},
+		},
+	})
+	if err := Validate(envelope(fsT)); !errors.Is(err, ErrCardBadURLScheme) {
+		t.Errorf("FactSet.title markdown data: 应被拒, err=%v", err)
+	}
 
 	// —— 放行/不误伤 ——
 	// 合法 https backgroundImage(对象形)放行
@@ -326,6 +346,14 @@ func TestBuildPlainDerivation(t *testing.T) {
 	}})
 	if got := BuildPlain(factset); got != "状态: 已合并\n作者: demo-user" {
 		t.Errorf("FactSet plain=%q", got)
+	}
+	// FactSet.title/value 的 markdown 也须剥离(Decision 8；PR#543 review：曾拼接
+	// raw title/value 泄漏 markdown 到权威 plain)。链接降为文本、星号去除。
+	factsetMD := cardWithBody(map[string]interface{}{"type": "FactSet", "facts": []interface{}{
+		map[string]interface{}{"title": "**动作**", "value": "[详情](https://e.com/x)"},
+	}})
+	if got := BuildPlain(factsetMD); got != "动作: 详情" {
+		t.Errorf("FactSet markdown 剥离 plain=%q want %q", got, "动作: 详情")
 	}
 	// markdown 剥离:链接留文本,星号/反引号去除;文档序拼接;按钮不参与
 	md := map[string]interface{}{
