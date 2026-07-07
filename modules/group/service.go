@@ -72,6 +72,8 @@ type IService interface {
 	GetMemberUIDsOfManager(groupNo string) ([]string, error)
 	// 是否是创建者或管理者
 	IsCreatorOrManager(groupNo string, uid string) (bool, error)
+	// IsRobot 判断某 uid 是否为龙虾(robot)账号（user.robot=1）。
+	IsRobot(uid string) (bool, error)
 	// 获取成员总数量和在线数量
 	// 第一个返回参数为成员总数量
 	// 第二个返回参数为在线数量
@@ -564,6 +566,16 @@ func (s *Service) GetMemberUIDsOfManager(groupNo string) ([]string, error) {
 
 func (s *Service) IsCreatorOrManager(groupNo string, uid string) (bool, error) {
 	return s.db.QueryIsGroupManagerOrCreator(groupNo, uid)
+}
+
+// IsRobot 判断某 uid 是否为龙虾(robot)账号（user.robot=1）。
+func (s *Service) IsRobot(uid string) (bool, error) {
+	var isBot int
+	err := s.ctx.DB().SelectBySql("SELECT COALESCE((SELECT robot FROM `user` WHERE uid=? LIMIT 1), 0)", uid).LoadOne(&isBot)
+	if err != nil {
+		return false, err
+	}
+	return isBot == 1, nil
 }
 
 func (s *Service) GetMemberTotalAndOnlineCount(groupNo string) (int, int, error) {

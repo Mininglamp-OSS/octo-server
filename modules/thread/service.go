@@ -433,7 +433,7 @@ func (s *Service) UpdateName(groupNo, shortID, operatorUID, name string) error {
 	// 权限校验保护。建子区 / 加入 / 归档 / 删除 / GROUP.md 仍由各自守卫拦截。
 
 	// 子区操作权来自「父群活跃成员」身份：被拉黑/移出父群的用户即使是子区创建者也
-	// 无权改名。必须在授予 creator/admin 特权之前先校验。fail-closed。
+	// 无权改名。fail-closed。
 	isActive, err := s.groupService.ExistMemberActive(thread.GroupNo, operatorUID)
 	if err != nil {
 		return fmt.Errorf("check active membership: %w", err)
@@ -442,14 +442,14 @@ func (s *Service) UpdateName(groupNo, shortID, operatorUID, name string) error {
 		return errors.New("no permission to update")
 	}
 
-	if thread.CreatorUID != operatorUID {
-		isManager, err := s.groupService.IsCreatorOrManager(thread.GroupNo, operatorUID)
-		if err != nil {
-			return fmt.Errorf("check permission: %w", err)
-		}
-		if !isManager {
-			return errors.New("no permission to update")
-		}
+	// 改名为低风险写：任何活跃的人类成员都可改子区名，无需是创建者/管理员。
+	// 但龙虾(robot)不是普通成员，禁止其调用改名。
+	isRobot, err := s.groupService.IsRobot(operatorUID)
+	if err != nil {
+		return fmt.Errorf("check robot: %w", err)
+	}
+	if isRobot {
+		return errors.New("no permission to update")
 	}
 
 	if err := s.db.UpdateName(shortID, name, s.threadVersionGen()); err != nil {
