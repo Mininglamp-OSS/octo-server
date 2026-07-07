@@ -58,6 +58,10 @@ func validateCard(card map[string]interface{}, interactive bool) error {
 		}
 	}
 	w := &walker{interactive: interactive}
+	// 卡片根上的 backgroundImage 等 URL 面（AdaptiveCard.backgroundImage）。
+	if err := checkNodeURLs(card); err != nil {
+		return err
+	}
 	if body, present := card["body"]; present {
 		items, ok := body.([]interface{})
 		if !ok {
@@ -133,6 +137,11 @@ func (w *walker) elements(items []interface{}, depth int) error {
 
 func (w *walker) element(el map[string]interface{}, depth int) error {
 	if err := w.bump(depth); err != nil {
+		return err
+	}
+	// 容器/元素级 URL 面（backgroundImage 等）——先于类型分派统一校验，覆盖
+	// Container/ColumnSet 等承载 backgroundImage 的元素（PR#543 review）。
+	if err := checkNodeURLs(el); err != nil {
 		return err
 	}
 	t, _ := el["type"].(string)
@@ -236,6 +245,10 @@ func (w *walker) column(col map[string]interface{}, depth int) error {
 	if err := w.bump(depth); err != nil {
 		return err
 	}
+	// Column.backgroundImage 等 URL 面。
+	if err := checkNodeURLs(col); err != nil {
+		return err
+	}
 	if t, present := col["type"]; present {
 		if s, _ := t.(string); s != "Column" {
 			return fmt.Errorf("%w: columns 内元素类型 %v", ErrCardUnknownElement, t)
@@ -273,6 +286,11 @@ func (w *walker) action(a interface{}) error {
 	if !ok {
 		return fmt.Errorf("%w: action 必须是对象", ErrCardBadShape)
 	}
+	// Action 上的 URL 面（Action.OpenUrl.iconUrl 等）——独立于 url 字段（PR#543
+	// review）。
+	if err := checkNodeURLs(act); err != nil {
+		return err
+	}
 	switch t, _ := act["type"].(string); t {
 	case "Action.OpenUrl":
 		u, _ := act["url"].(string)
@@ -307,7 +325,42 @@ func checkURL(raw string) error {
 	return nil
 }
 
-// markdownLinkRe 提取 AC 基础 markdown 子集里的链接目标 [text](target)。
+// checkNodeURLs 校验一个卡片节点（card 根 / 元素 / 列 / 动作）上、除已单独处理的
+// `url` 外其余会被端上渲染成资源/图标的 URL 承载字段：
+//   - backgroundImage：AC 允许字符串简写或 {url:...} 对象全写，出现在 AdaptiveCard
+//     根 / Container / Column / ColumnSet；
+//   - iconUrl：Action.OpenUrl 的图标。
+//
+// walker 对未知属性宽容（前向兼容），但**不能给这些"会被渲染"的 URL 面开天窗** ——
+// 校验面必须 ≥ 渲染面（Decision 3d，与 markdown 链接、Image.url 同一正向 allowlist）。
+// PR#543 review：backgroundImage/iconUrl 原先完全绕过 checkURL。新的 URL 承载字段
+// 随 profile 演进补进本表即可。
+func checkNodeURLs(node map[string]interface{}) error {
+	if bg, present := node["backgroundImage"]; present {
+		switch v := bg.(type) {
+		case string:
+			if v != "" {
+				if err := checkURL(v); err != nil {
+					return err
+				}
+			}
+		case map[string]interface{}:
+			if u, _ := v["url"].(string); u != "" {
+				if err := checkURL(u); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if icon, _ := node["iconUrl"].(string); icon != "" {
+		if err := checkURL(icon); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// markdownLinkRe 提取 AC 基础 markdown 子集里的内联链接目标 [text](target)。
 // target 取到右括号前的第一段（容忍 "(url title)" 形态取 url 部分）。
 //
 // ⚠️ 括号后允许**前导空白**（`\(\s*`）：CommonMark 渲染器会剥离 destination 的
@@ -316,14 +369,33 @@ func checkURL(raw string) error {
 // 而客户端照样渲染成危险链接 —— 校验面必须 ≥ 渲染面（Decision 3d/6）。
 var markdownLinkRe = regexp.MustCompile(`\[[^\]]*\]\(\s*([^)\s]+)[^)]*\)`)
 
+// autolinkRe 提取 CommonMark autolink `<scheme:...>` 的 URI。通用 CommonMark 渲染器
+// 会把 `<javascript:alert(1)>` 渲成 href=javascript: 的活链接，故这也是一个 URL 面
+// （PR#543 review：内联链接之外的 markdown 渲染面）。要求 `scheme:` 形以压低误报
+// （`<b>`、`<3` 等不含冒号者不匹配）。
+var autolinkRe = regexp.MustCompile(`<([a-zA-Z][a-zA-Z0-9+.\-]*:[^>\s]+)>`)
+
+// refDefRe 提取 CommonMark 链接引用定义 `[label]: destination` 的 destination
+// （配合 `[text][label]` 使用时渲成链接）。仅在 destination 带 scheme 时才交给
+// checkURL（见 markdownLinkTargets）——裸词/相对目标既非危险 scheme 载体，精确
+// 匹配引用定义又易误伤正文（如 "[Note]: do this"），故只挑真正会渲成危险链接的。
+var refDefRe = regexp.MustCompile(`(?m)^[ \t]{0,3}\[[^\]]+\]:[ \t]*<?([^>\s]+)>?`)
+
 func markdownLinkTargets(text string) []string {
-	ms := markdownLinkRe.FindAllStringSubmatch(text, -1)
-	if len(ms) == 0 {
-		return nil
-	}
-	targets := make([]string, 0, len(ms))
-	for _, m := range ms {
+	var targets []string
+	for _, m := range markdownLinkRe.FindAllStringSubmatch(text, -1) {
 		targets = append(targets, m[1])
+	}
+	for _, m := range autolinkRe.FindAllStringSubmatch(text, -1) {
+		targets = append(targets, m[1])
+	}
+	// 引用定义：只提取带 scheme 的 destination（危险 scheme 正是本类攻击面），
+	// 避免把正文里形如 "[标签]: 普通文字" 的非链接行误当 URL 拒绝。
+	for _, m := range refDefRe.FindAllStringSubmatch(text, -1) {
+		dest := strings.TrimSpace(m[1])
+		if u, err := url.Parse(dest); err == nil && u.Scheme != "" {
+			targets = append(targets, dest)
+		}
 	}
 	return targets
 }

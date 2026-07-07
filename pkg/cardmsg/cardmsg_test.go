@@ -179,6 +179,64 @@ func TestValidateURLAllowlist(t *testing.T) {
 	}
 }
 
+// 验收(PR#543 review P1):URL 正向 allowlist 必须覆盖整个渲染面 —— 除 url 外的
+// backgroundImage / iconUrl,以及 markdown 的 autolink / 引用式链接,都不得绕过。
+func TestValidateURLAllowlistFullSurface(t *testing.T) {
+	// backgroundImage —— 字符串简写形(卡片根)
+	rootBg := envelope(nil)
+	rootBg["card"].(map[string]interface{})["backgroundImage"] = "javascript:alert(1)"
+	if err := Validate(rootBg); !errors.Is(err, ErrCardBadURLScheme) {
+		t.Errorf("card 根 backgroundImage(字符串)危险 scheme 应被拒, err=%v", err)
+	}
+	// backgroundImage —— 对象全写形 {url:...}(Container 上)
+	contBg := cardWithBody(map[string]interface{}{
+		"type":            "Container",
+		"backgroundImage": map[string]interface{}{"url": "vbscript:x", "fillMode": "cover"},
+		"items":           []interface{}{map[string]interface{}{"type": "TextBlock", "text": "x"}},
+	})
+	if err := Validate(envelope(contBg)); !errors.Is(err, ErrCardBadURLScheme) {
+		t.Errorf("Container backgroundImage(对象)危险 scheme 应被拒, err=%v", err)
+	}
+	// iconUrl —— Action.OpenUrl 上
+	iconAct := map[string]interface{}{"actions": []interface{}{
+		map[string]interface{}{"type": "Action.OpenUrl", "url": "https://ok.example.com", "iconUrl": "data:image/png;base64,AAAA"},
+	}}
+	if err := Validate(envelope(iconAct)); !errors.Is(err, ErrCardBadURLScheme) {
+		t.Errorf("Action.OpenUrl.iconUrl 危险 scheme 应被拒, err=%v", err)
+	}
+	// autolink <javascript:...> —— 通用 CommonMark 渲成活链接
+	al := cardWithBody(map[string]interface{}{"type": "TextBlock", "text": "see <javascript:alert(1)>"})
+	if err := Validate(envelope(al)); !errors.Is(err, ErrCardBadURLScheme) {
+		t.Errorf("autolink javascript: 应被拒, err=%v", err)
+	}
+	// 引用式定义 [r]: javascript:... —— 带 scheme,应被拒
+	ref := cardWithBody(map[string]interface{}{"type": "TextBlock", "text": "tap [go][r]\n\n[r]: javascript:alert(1)"})
+	if err := Validate(envelope(ref)); !errors.Is(err, ErrCardBadURLScheme) {
+		t.Errorf("引用式定义 javascript: 应被拒, err=%v", err)
+	}
+
+	// —— 放行/不误伤 ——
+	// 合法 https backgroundImage(对象形)放行
+	okBg := cardWithBody(map[string]interface{}{
+		"type":            "Container",
+		"backgroundImage": map[string]interface{}{"url": "https://cdn.example.com/bg.png"},
+		"items":           []interface{}{map[string]interface{}{"type": "TextBlock", "text": "x"}},
+	})
+	if err := Validate(envelope(okBg)); err != nil {
+		t.Errorf("https backgroundImage 应放行: %v", err)
+	}
+	// 正文里形如 "[Note]: do this" 的非链接行不得被误当引用定义拒绝(裸词无 scheme)
+	notRef := cardWithBody(map[string]interface{}{"type": "TextBlock", "text": "[Note]: do this first, then that"})
+	if err := Validate(envelope(notRef)); err != nil {
+		t.Errorf("裸词引用定义式正文不应被误拒: %v", err)
+	}
+	// 合法 https autolink 放行
+	okAl := cardWithBody(map[string]interface{}{"type": "TextBlock", "text": "docs <https://example.com/x>"})
+	if err := Validate(envelope(okAl)); err != nil {
+		t.Errorf("https autolink 应放行: %v", err)
+	}
+}
+
 func TestValidateProfileNegotiation(t *testing.T) {
 	// P1 接受集 = {octo/v1}(Decision 10 分期):octo/v2 与任何未知 profile
 	// 同样是 400 —— P2 sibling 实现 PR 把 octo/v2 加入接受集。

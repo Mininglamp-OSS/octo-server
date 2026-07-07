@@ -47,17 +47,22 @@
 
 - 完整 payload 序列化 ≤ **512 KiB**（发送/编辑路由另有 2 MiB pre-decode body 上限；取 2 MiB 而非 1 MiB 是为不误伤同路由上恰好 1 MiB 的合法 RichText，见 `cardmsg.MaxSendBodyBytes`）；
 - 递归节点数 ≤ **200**，嵌套深度 ≤ **16**；
-- **URL 正向 allowlist**：仅绝对 `http`/`https`（作用于 `Image.url`、
-  `Action.OpenUrl.url`、`selectAction`、markdown 链接目标）。`data:` /
-  `javascript:` / `intent:` / 相对路径等一律拒绝。**app 深链（`octo://` 等）
-  在 P1 被有意排除**——首方 scheme 名单是 P3 议题。
+- **URL 正向 allowlist**：仅绝对 `http`/`https`。作用于**全部会被渲染的 URL 面**：
+  `Image.url`、`Action.OpenUrl.url`、`selectAction`、`AdaptiveCard`/`Container`/
+  `Column`/`ColumnSet` 的 `backgroundImage`（字符串或 `{url:…}` 对象形）、
+  `Action.OpenUrl.iconUrl`、以及 markdown 链接目标（含内联 `[t](url)`、autolink
+  `<scheme:…>`、引用式定义 `[r]: url`）。`data:` / `javascript:` / `intent:` /
+  相对路径等一律拒绝。**app 深链（`octo://` 等）在 P1 被有意排除**——首方 scheme
+  名单是 P3 议题。
 - 服务端**不解引用**任何卡内 URL（无图片代理/unfurl/预取）——引入前必须先过
   SSRF-safe fetcher 决策。
 
 ### 2.1 TextBlock markdown 子集
 
 粗体 `**`、斜体 `*`、列表、链接 `[text](url)`。链接目标走 §2 的同一 URL
-allowlist。plain 派生时剥离语法字符（链接降为链接文本）。
+allowlist —— 内联链接、autolink（`<scheme:…>`）、引用式定义（`[ref]: url`）三种
+渲染形式均校验，与通用 CommonMark 渲染面对齐。plain 派生时剥离语法字符（链接降为
+链接文本）。
 
 ## 3. profile 协商与降级链
 
