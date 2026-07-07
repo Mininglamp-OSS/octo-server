@@ -50,6 +50,16 @@ const (
 	// MaxPayloadBytes 完整 payload 序列化后的硬上限（512KiB，Decision 3a）——
 	// 严格低于 modules/message 同步路径的 1MiB hardParsePayloadLimit 占位线。
 	MaxPayloadBytes = 512 << 10
+	// MaxSendBodyBytes 是 bot/robot send+edit 路由的 pre-decode HTTP body 上限
+	// （Decision 3b）。BindJSON 在校验前完整解码，必须先钉住请求体大小。
+	//
+	// **不变量：必须 > 同路由上最大的合法 payload。** 这些路由同时承载 RichText
+	// （octo-lib RichTextMaxPayloadBytes = 1MiB payload 上限）——若 body 上限取
+	// 1MiB 会把一条恰好 1MiB 的合法 RichText（叠加信封/JSON 转义后 body > 1MiB）
+	// 在 pre-decode 就 413 掉，即回归既有非卡片流量。取 2MiB 给 1MiB RichText +
+	// 512KiB 卡片都留足信封余量，同时仍把无界滥用挡在解码前。voice 路由沿用
+	// 自己的 5MiB。
+	MaxSendBodyBytes = 2 << 20
 	// MaxNodes 卡片树的递归节点数上限（Decision 3c）。
 	MaxNodes = 200
 	// MaxDepth 卡片树的嵌套深度上限（Decision 3c）。

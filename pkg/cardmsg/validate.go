@@ -309,7 +309,12 @@ func checkURL(raw string) error {
 
 // markdownLinkRe 提取 AC 基础 markdown 子集里的链接目标 [text](target)。
 // target 取到右括号前的第一段（容忍 "(url title)" 形态取 url 部分）。
-var markdownLinkRe = regexp.MustCompile(`\[[^\]]*\]\(([^)\s]+)[^)]*\)`)
+//
+// ⚠️ 括号后允许**前导空白**（`\(\s*`）：CommonMark 渲染器会剥离 destination 的
+// 前后空白，故 `[x]( javascript:alert(1))` 在端上就是一个 javascript: 链接。若
+// 正则要求 `(` 后紧跟非空白，服务端就提取不到该 target、URL allowlist 被绕过，
+// 而客户端照样渲染成危险链接 —— 校验面必须 ≥ 渲染面（Decision 3d/6）。
+var markdownLinkRe = regexp.MustCompile(`\[[^\]]*\]\(\s*([^)\s]+)[^)]*\)`)
 
 func markdownLinkTargets(text string) []string {
 	ms := markdownLinkRe.FindAllStringSubmatch(text, -1)

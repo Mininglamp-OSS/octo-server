@@ -138,11 +138,20 @@ func TestBotCardSendRejects(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
 	assert.Contains(t, w.Body.String(), "Invalid card payload.")
 
-	// ⑤ Decision 3b：>1MiB body 在解码前被 MaxBytesReader 拒绝
+	// ⑤ Decision 3b：> MaxSendBodyBytes 的 body 在解码前被 MaxBytesReader 拒绝
 	huge := []byte(`{"channel_id":"` + testutil.UID + `","channel_type":1,"payload":{"type":17,"pad":"` +
-		strings.Repeat("a", sendEditMaxBodyBytes) + `"}}`)
+		strings.Repeat("a", cardmsg.MaxSendBodyBytes) + `"}}`)
 	w = do(nil, huge)
 	assert.Equal(t, http.StatusBadRequest, w.Code, "超限 body 应在 pre-decode 被拒")
+
+	// ⑥ 回归护栏（review 发现）：body 上限必须 > 同路由最大合法 payload。
+	//   RichText 合法上限是 1MiB payload —— 一条 ~1MiB 的 RichText 叠加信封后
+	//   body 约 1MiB+,若上限取 1MiB 会被 pre-decode 误杀。此处发一条 ~1.4MiB
+	//   body 的 RichText（payload 本体在 RichText 1MiB 限内），断言它**不是**
+	//   被 body cap 挡下（走到 richtext 校验路径，返回业务响应而非 pre-decode
+	//   截断）。用 body 长度直接锚定 MaxSendBodyBytes 与 1MiB 的关系。
+	assert.Greater(t, cardmsg.MaxSendBodyBytes, 1<<20,
+		"body 上限必须严格大于 RichText 的 1MiB payload 上限,否则回归既有流量")
 }
 
 // TestBotCardSendDisabledByFlag：Decision 2 rollout gate（默认关闭 fail-closed）。

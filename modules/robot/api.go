@@ -493,13 +493,8 @@ func (rb *Robot) typing(c *wkhttp.Context) {
 	c.ResponseOK()
 }
 
-// sendEditMaxBodyBytes card-message-protocol P1 Decision 3b：send/edit 路由的
-// pre-decode body 上限（1 MiB），与 bot_api 同口径 —— BindJSON 在校验前完整
-// 解码，必须先钉住请求体大小。
-const sendEditMaxBodyBytes = 1 << 20
-
 func (rb *Robot) sendMessage(c *wkhttp.Context) {
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, sendEditMaxBodyBytes)
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, cardmsg.MaxSendBodyBytes)
 	var messageReq *MessageReq
 	if err := c.BindJSON(&messageReq); err != nil {
 		rb.Error("数据格式有误！", zap.Error(err))
@@ -1852,7 +1847,7 @@ func (rb *Robot) botUploadPresigned(c *wkhttp.Context) {
 
 // botMessageEdit Bot 编辑自己发送的消息
 func (rb *Robot) botMessageEdit(c *wkhttp.Context) {
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, sendEditMaxBodyBytes)
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, cardmsg.MaxSendBodyBytes)
 	var req struct {
 		MessageID   string `json:"message_id"`
 		MessageSeq  uint32 `json:"message_seq"`

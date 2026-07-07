@@ -41,14 +41,8 @@ type BotSendMessageReq struct {
 
 // sendMessage handles POST /v1/bot/sendMessage.
 
-// sendEditMaxBodyBytes card-message-protocol P1 Decision 3b：send/edit 路由的
-// pre-decode body 上限（1 MiB）。BindJSON 会在 Validate 之前完整解码请求体 ——
-// 没有它，超大 body 在 512KiB 卡片上限生效前就烧掉 CPU/内存。1 MiB 给正常
-// payload（卡片 512KiB + 信封/转义开销）留足余量；voice 路由沿用自己的 5 MiB。
-const sendEditMaxBodyBytes = 1 << 20
-
 func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, sendEditMaxBodyBytes)
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, cardmsg.MaxSendBodyBytes)
 	var req BotSendMessageReq
 	if err := c.BindJSON(&req); err != nil {
 		respondBotAPIRequestInvalid(c, "")
@@ -688,7 +682,7 @@ func (ba *BotAPI) readReceipt(c *wkhttp.Context) {
 
 // botMessageEdit handles POST /v1/bot/message/edit.
 func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, sendEditMaxBodyBytes)
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, cardmsg.MaxSendBodyBytes)
 	var req struct {
 		MessageID   string `json:"message_id"`
 		MessageSeq  uint32 `json:"message_seq"`

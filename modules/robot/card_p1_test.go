@@ -33,6 +33,7 @@ func p1RobotCardPayload(profile string, imageURL string) map[string]interface{} 
 
 func TestRobotCardIngress(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
+	defer func() { _ = testutil.CleanAllTables(ctx) }()
 	rb := New(ctx)
 
 	// ContentType 17 进入支持集（Decision：robot 是三个生产者入口之一）

@@ -148,6 +148,23 @@ func TestValidateURLAllowlist(t *testing.T) {
 	if err := Validate(envelope(card)); !errors.Is(err, ErrCardBadURLScheme) {
 		t.Errorf("markdown javascript: 链接应被拒, err=%v", err)
 	}
+	// destination 前导空白不得绕过 allowlist —— CommonMark 剥离前后空白后端上
+	// 就是 javascript: 链接;校验面必须覆盖(回归:曾因 `(` 后要求非空白而漏检)。
+	for _, evil := range []string{
+		"click [x]( javascript:alert(1))",
+		"click [x](\tjavascript:alert(1))",
+		"click [x](  data:text/html,x)",
+	} {
+		c := cardWithBody(map[string]interface{}{"type": "TextBlock", "text": evil})
+		if err := Validate(envelope(c)); !errors.Is(err, ErrCardBadURLScheme) {
+			t.Errorf("前导空白 markdown 危险链接应被拒 %q, err=%v", evil, err)
+		}
+	}
+	// 合法 http 链接带前导空白应放行(空白只是格式,target 仍是 https)
+	ok := cardWithBody(map[string]interface{}{"type": "TextBlock", "text": "see [x]( https://example.com)"})
+	if err := Validate(envelope(ok)); err != nil {
+		t.Errorf("前导空白 + https 应放行: %v", err)
+	}
 	// Action.OpenUrl 同
 	c2 := map[string]interface{}{"actions": []interface{}{
 		map[string]interface{}{"type": "Action.OpenUrl", "url": "data:text/html,x"},
