@@ -4,6 +4,7 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -15,9 +16,10 @@ import (
 
 // stickerSnapSettings builds a SystemSettings whose snapshot is exactly `snap`
 // — used by every no-infra test in this file so the read-side clamp logic can be
-// exercised without spinning up a test server.
+// exercised without spinning up a test server. Log is initialised because the
+// clamp getters may emit an over-cap Warn (review R6).
 func stickerSnapSettings(snap map[string]string) *SystemSettings {
-	s := &SystemSettings{}
+	s := &SystemSettings{Log: log.NewTLog("SystemSettingsTest")}
 	m := map[string]string{}
 	for k, v := range snap {
 		m[k] = v
@@ -228,4 +230,63 @@ func TestSystemSettings_StickerCompressTimeoutMs_ClampBehavior(t *testing.T) {
 		})
 		assert.Equalf(t, want, s.StickerCompressTimeoutMs(), "timeout_ms=%q", in)
 	}
+}
+
+// ----- clamp warning dedup (review R6) -----
+
+// TestSystemSettings_StickerClampIntUpper_DedupsWarnPerBoundaryValue 验证
+// 同一 (key, 越界值) 组合在进程周期内只 warn 一次(避免读侧热路径刷屏),
+// 但换成不同的越界值/不同 key 会重新 warn。dedup 状态是 sync.Map,不涉及
+// zap.Logger 输出捕获 —— 直接观察 stickerClampWarned 的 sentinel。
+func TestSystemSettings_StickerClampIntUpper_DedupsWarnPerBoundaryValue(t *testing.T) {
+	s := stickerSnapSettings(map[string]string{
+		"sticker.upload_max_size_kb": "99999", // 超过 5120 hard cap
+	})
+	// 多次调用同一 getter → clamp 到 hard cap,内部只 warn 一次
+	for i := 0; i < 5; i++ {
+		assert.Equal(t, stickerUploadMaxSizeKBHardCap, s.StickerUploadMaxSizeKB())
+	}
+	assertClampWarnedOnce(t, s, "sticker.upload_max_size_kb=99999>5120")
+
+	// 换成不同的越界值,应生成新的 dedup key(即再 warn 一次)。
+	s2 := stickerSnapSettings(map[string]string{
+		"sticker.upload_max_size_kb": "88888",
+	})
+	assert.Equal(t, stickerUploadMaxSizeKBHardCap, s2.StickerUploadMaxSizeKB())
+	assertClampWarnedOnce(t, s2, "sticker.upload_max_size_kb=88888>5120")
+
+	// 换成不同的 key(同越界值 99999 但落在 dimension 的 1024 hard cap 上),
+	// 也应产生新的 dedup key。
+	s3 := stickerSnapSettings(map[string]string{
+		"sticker.upload_max_dimension": "99999",
+	})
+	assert.Equal(t, stickerUploadMaxDimensionHardCap, s3.StickerUploadMaxDimension())
+	assertClampWarnedOnce(t, s3, "sticker.upload_max_dimension=99999>1024")
+}
+
+// TestSystemSettings_StickerClampIntUpper_NoWarnWhenInRange 验证正常配置读时
+// clamp 快路径完全不进 sync.Map(sentinel 为空),读侧热路径零 CPU/内存开销。
+func TestSystemSettings_StickerClampIntUpper_NoWarnWhenInRange(t *testing.T) {
+	s := stickerSnapSettings(map[string]string{
+		"sticker.upload_max_size_kb":   "2048", // 合法
+		"sticker.upload_max_dimension": "512",  // 合法
+	})
+	for i := 0; i < 10; i++ {
+		_ = s.StickerUploadMaxSizeKB()
+		_ = s.StickerUploadMaxDimension()
+	}
+	count := 0
+	s.stickerClampWarned.Range(func(_, _ any) bool {
+		count++
+		return true
+	})
+	assert.Equal(t, 0, count, "in-range values must not populate the dedup map")
+}
+
+// assertClampWarnedOnce 断言 SystemSettings.stickerClampWarned 里存在给定
+// dedup key(且仅有它 —— 或有其它 key 但仍存在这一条)。
+func assertClampWarnedOnce(t *testing.T, s *SystemSettings, want string) {
+	t.Helper()
+	_, ok := s.stickerClampWarned.Load(want)
+	assert.Truef(t, ok, "expected dedup key %q recorded", want)
 }

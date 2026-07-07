@@ -466,8 +466,12 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 	// sticker-upload-compression: 压缩管线，仅当 isStickerUpload && compress_enabled
 	// 才启动，其他类型/格式走原路径（uploadReader==file, finalSize==fileHeader.Size）。
 	// 方案 C: 只压静态 jpg/png；gif/webp 只记 compress_skipped 不改字节。
-	// handle 基于最终 fullURL；本期 path/ext 不因压缩改变，fullURL 与压前一致，
-	// 故 stickersig.Sign 天然基于压缩后的字节（同一 URL 对应最终存储对象）。
+	// 关于 sticker_handle 与压缩的关系（review R5 澄清）：stickersig.Sign 只
+	// HMAC (uid, path) 字符串，提供 URL/uploader 溯源 —— **不是** 内容 hash。
+	// 之所以「压缩前后 handle 都稳定」，是因为本期 path/ext 不因压缩改变，
+	// signed URL 始终解析到最终存储对象；content-integrity 单独由 sha512
+	// 字段承载（下方 sha512 与 service.UploadFile 都基于 uploadReader，即
+	// 压缩后的字节）。
 	var uploadReader io.ReadSeeker = file
 	finalSize := fileHeader.Size
 	if isStickerUpload && stickerLimits.compressEnabled && f.compressor != nil {
@@ -492,7 +496,10 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 					zap.Int64("final_size", result.Size))
 			case stickerCompressOutcomeOverLimit:
 				observeStickerUpload("compress_over_limit")
-				targetKB := f.settings.StickerCompressTargetKB()
+				// 用 snapshot 里的 compressTargetKB(而非 f.settings 的 live 值),
+				// 保证 error/log 数字与 Compress 实际用的 target 严格同源 ——
+				// 兑现"一请求一份快照"的不变式(review R1 / F7 补漏)。
+				targetKB := stickerLimits.compressTargetKB
 				f.Warn("贴纸压缩后仍超目标大小，拒绝上传",
 					zap.String("uid", loginUID),
 					zap.String("ext", ext),

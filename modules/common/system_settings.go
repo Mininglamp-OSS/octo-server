@@ -3,6 +3,7 @@ package common
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
 	"math"
 	"os"
 	"regexp"
@@ -88,6 +89,11 @@ type SystemSettings struct {
 	db        *systemSettingDB
 	snapshot  atomic.Pointer[map[string]string]
 	reloadTTL time.Duration
+	// stickerClampWarned 去重 clamp getter 的越界 Warn(review R6)。key 形如
+	// "sticker.upload_max_size_kb=99999>5120",同一 (key, 越界值) 在进程周期
+	// 内只 log 一次;admin 改到别的越界值会重新 log 一条。避免读侧热路径
+	// 刷屏,同时保留 operator 可观测性。
+	stickerClampWarned sync.Map
 	log.Log
 }
 
@@ -835,11 +841,24 @@ var stickerUploadRasterAllowlist = []string{".gif", ".png", ".jpg", ".jpeg", ".w
 // default; values above hardCap are clamped to hardCap; everything else is
 // returned verbatim. Shared by every KB/px/ms/count sticker upload setting so
 // the clamp policy is single-sourced.
-func stickerClampIntUpper(v, fallback, hardCap int) int {
+//
+// key is the fully qualified setting name (e.g. "sticker.upload_max_size_kb");
+// when v exceeds hardCap this method emits a per-(key, v) one-shot Warn so a
+// bad admin edit is operator-observable without spamming the read hot path
+// (review R6). Admin fixes → new越界 value or in-range value → new Warn or
+// silence, matching human-friendly signal semantics.
+func (s *SystemSettings) stickerClampIntUpper(key string, v, fallback, hardCap int) int {
 	if v <= 0 {
 		return fallback
 	}
 	if v > hardCap {
+		dedupKey := fmt.Sprintf("%s=%d>%d", key, v, hardCap)
+		if _, loaded := s.stickerClampWarned.LoadOrStore(dedupKey, struct{}{}); !loaded {
+			s.Warn("system_setting sticker knob exceeds hard cap; clamped",
+				zap.String("key", key),
+				zap.Int("configured", v),
+				zap.Int("hard_cap", hardCap))
+		}
 		return hardCap
 	}
 	return v
@@ -849,7 +868,7 @@ func stickerClampIntUpper(v, fallback, hardCap int) int {
 // clamped to [1, stickerUploadMaxSizeKBHardCap]; out-of-range falls back to
 // the historical 1024 KB default.
 func (s *SystemSettings) StickerUploadMaxSizeKB() int {
-	return stickerClampIntUpper(
+	return s.stickerClampIntUpper("sticker.upload_max_size_kb",
 		s.getInt("sticker", "upload_max_size_kb", defaultStickerUploadMaxSizeKB),
 		defaultStickerUploadMaxSizeKB,
 		stickerUploadMaxSizeKBHardCap,
@@ -860,7 +879,7 @@ func (s *SystemSettings) StickerUploadMaxSizeKB() int {
 // clamped to [1, stickerUploadMaxDimensionHardCap]; out-of-range falls back to
 // the historical 512-px default.
 func (s *SystemSettings) StickerUploadMaxDimension() int {
-	return stickerClampIntUpper(
+	return s.stickerClampIntUpper("sticker.upload_max_dimension",
 		s.getInt("sticker", "upload_max_dimension", defaultStickerUploadMaxDimension),
 		defaultStickerUploadMaxDimension,
 		stickerUploadMaxDimensionHardCap,
@@ -925,7 +944,7 @@ func (s *SystemSettings) StickerCompressEnabled() bool {
 // Read-side clamped to [1, stickerCompressTargetKBHardCap]; out-of-range falls
 // back to the 1024 KB default.
 func (s *SystemSettings) StickerCompressTargetKB() int {
-	return stickerClampIntUpper(
+	return s.stickerClampIntUpper("sticker.compress_target_kb",
 		s.getInt("sticker", "compress_target_kb", defaultStickerCompressTargetKB),
 		defaultStickerCompressTargetKB,
 		stickerCompressTargetKBHardCap,
@@ -936,7 +955,7 @@ func (s *SystemSettings) StickerCompressTargetKB() int {
 // sticker compressions. Read-side clamped to [1, stickerCompressMaxConcurrencyHardCap];
 // out-of-range falls back to 4.
 func (s *SystemSettings) StickerCompressMaxConcurrency() int {
-	return stickerClampIntUpper(
+	return s.stickerClampIntUpper("sticker.compress_max_concurrency",
 		s.getInt("sticker", "compress_max_concurrency", defaultStickerCompressMaxConcurrency),
 		defaultStickerCompressMaxConcurrency,
 		stickerCompressMaxConcurrencyHardCap,
@@ -947,7 +966,7 @@ func (s *SystemSettings) StickerCompressMaxConcurrency() int {
 // Read-side clamped to [1, stickerCompressTimeoutMsHardCap]; out-of-range falls
 // back to 2000ms.
 func (s *SystemSettings) StickerCompressTimeoutMs() int {
-	return stickerClampIntUpper(
+	return s.stickerClampIntUpper("sticker.compress_timeout_ms",
 		s.getInt("sticker", "compress_timeout_ms", defaultStickerCompressTimeoutMs),
 		defaultStickerCompressTimeoutMs,
 		stickerCompressTimeoutMsHardCap,
