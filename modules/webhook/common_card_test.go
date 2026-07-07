@@ -9,18 +9,10 @@ import (
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
-	"github.com/Mininglamp-OSS/octo-server/modules/incomingwebhook"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/stretchr/testify/assert"
 )
-
-// 跨包常量一致性：webhook 模块本地复制的 iwh_ 前缀必须与 incomingwebhook 的
-// 契约常量一致（生产代码不跨层 import，见 incomingwebhook/display.go 顶注 ——
-// 测试负责兜底编译期不可见的漂移）。
-func TestCardSenderPrefixConsistency(t *testing.T) {
-	assert.Equal(t, incomingwebhook.WebhookIDPrefix, cardSenderPrefixWebhook)
-}
 
 func TestCardSenderTrusted(t *testing.T) {
 	_, ctx := testutil.NewTestServer()

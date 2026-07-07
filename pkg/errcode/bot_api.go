@@ -368,4 +368,35 @@ var (
 // 401; generic internal asserts map to the shared 500.
 var (
 	ErrBotAPISharedAuthRequired = shared("err.shared.auth.required")
+	// ---- InteractiveCard(=17) 卡片消息协议 P1 ------------------------------
+	// P1 只注册展示相；交互相 seq_conflict 随 P2 sibling 实现 PR 落地。
+
+	// ErrBotAPICardDisabled Decision 2 rollout gate：OCTO_CARD_MESSAGE_ENABLED
+	// 未开启（默认关闭，客户端渲染门禁发布前不得开启）。
+	ErrBotAPICardDisabled = register(codes.Code{
+		ID:             "err.server.bot_api.card_disabled",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Card messages are not enabled on this server.",
+	})
+	// ErrBotAPICardInvalid 卡片信封/白名单/大小/URL 校验失败（具体原因进日志，
+	// 不逐因扩码）。
+	ErrBotAPICardInvalid = register(codes.Code{
+		ID:             "err.server.bot_api.card_invalid",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Invalid card payload.",
+	})
+	// ErrBotAPICardOBOForbidden Decision 2b：OBO 路径（含 grantorReplyBypass
+	// 子路径）拒绝卡片 —— 按请求意图拦截，先于 OBO grant 校验。
+	ErrBotAPICardOBOForbidden = register(codes.Code{
+		ID:             "err.server.bot_api.card_obo_forbidden",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Card messages cannot be sent on behalf of a user.",
+	})
+	// ErrBotAPICardEditForbidden Decision 7：P1 卡片不可变（P2 sibling D6 以
+	// cardmsg 对称校验 + card_seq CAS 解锁 bot 编辑路径后此码退役，不复用）。
+	ErrBotAPICardEditForbidden = register(codes.Code{
+		ID:             "err.server.bot_api.card_edit_forbidden",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Card messages cannot be edited yet.",
+	})
 )

@@ -197,4 +197,11 @@ var (
 		HTTPStatus:     http.StatusForbidden,
 		DefaultMessage: "This group has been disbanded and is read-only.",
 	})
+	// ErrRobotCardEditForbidden Decision 7 的 robot 编辑入口对称拦截
+	// （InteractiveCard(=17) 卡片消息协议 P1）。
+	ErrRobotCardEditForbidden = register(codes.Code{
+		ID:             "err.server.robot.card_edit_forbidden",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Card messages cannot be edited.",
+	})
 )

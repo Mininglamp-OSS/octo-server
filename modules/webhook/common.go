@@ -9,7 +9,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
-	"github.com/Mininglamp-OSS/octo-server/modules/robot"
+	"github.com/Mininglamp-OSS/octo-server/modules/cardtrust"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/pushcache"
@@ -458,29 +458,17 @@ func formatGroupPushBody(ctx *config.Context, groupNo, fromUID, fromName, conten
 	return fmt.Sprintf("%s @%s：%s", fromName, suffix, content)
 }
 
-// cardSenderPrefixWebhook 是 incoming webhook 合成发送者 UID 前缀。按仓库分层
-// 惯例本地复制（生产代码不跨层 import modules/incomingwebhook —— 见其
-// display.go 顶注），跨包一致性由 common_card_test.go 的常量一致性测试兜底。
-const cardSenderPrefixWebhook = "iwh_"
-
+// cardTrust 是 type-17 sender 身份判定的进程级单例（Decision 2 residual-risk
+// 的单一实现，modules/cardtrust）。getMessageAlert 经 GetPayload 在离线推送
+// 扇出里【按接收者】被调用；单例 + LRU 让一条卡片消息推给大群时只查一次
+// robot 表，其余接收者命中缓存（此前是每接收者一次 SELECT）。首次调用惰性
+// 用该次 ctx 构造 —— push 路径无 Webhook 接收者可挂，与既有 name-cache 同模式。
 var (
-	cardRobotSvcOnce sync.Once
-	cardRobotSvc     robot.IService
+	cardTrustOnce sync.Once
+	cardTrust     *cardtrust.Resolver
 )
 
-// cardSenderTrusted 判定 type-17 消息的存储 sender 是否 bot/webhook 身份
-// （Decision 2 residual-risk 的调用方职责）。webhook 合成身份看 iwh_ 前缀；
-// bot 查 robot 表（status=1）。查询失败 fail-closed —— 宁可推 [卡片] 也不透出
-// 不可信 plain。
 func cardSenderTrusted(ctx *config.Context, fromUID string) bool {
-	if strings.HasPrefix(fromUID, cardSenderPrefixWebhook) {
-		return true
-	}
-	cardRobotSvcOnce.Do(func() { cardRobotSvc = robot.NewService(ctx) })
-	isBot, err := cardRobotSvc.ExistRobot(fromUID)
-	if err != nil {
-		log.Warn("card sender 身份查询失败,推送按不可信处理", zap.Error(err), zap.String("fromUID", fromUID))
-		return false
-	}
-	return isBot
+	cardTrustOnce.Do(func() { cardTrust = cardtrust.New(ctx) })
+	return cardTrust.Trusted(fromUID)
 }

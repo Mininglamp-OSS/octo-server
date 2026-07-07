@@ -287,7 +287,7 @@ func (h *Handler) singleMessageHit(doc Doc, reqChannelID string, hl map[string][
 	// [卡片]，round-3 P1-2）。message_kind 维持 "text"（swagger 枚举已锁），
 	// snippet 即投影文本。
 	if payloadType(doc.Payload) == payloadTypeCard {
-		mh.Snippet = cardmsg.DisplayTextFor(h.cardSenderTrusted(doc.From), doc.PayloadRaw)
+		mh.Snippet = cardmsg.DisplayTextFor(h.cardTrust.Trusted(doc.From), doc.PayloadRaw)
 	}
 	return mh
 }

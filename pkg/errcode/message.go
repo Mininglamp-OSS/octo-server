@@ -173,4 +173,21 @@ var (
 		DefaultMessage: "Message search failed.",
 		Internal:       true,
 	})
+	// ---- InteractiveCard(=17) 卡片消息协议 P1（spec: .octospec/tasks/
+	// card-message-protocol/brief.md）----------------------------------------
+
+	// ErrMessageCardSendForbidden Decision 2 layer (a)：卡片仅 bot/webhook 可发，
+	// 用户 /v1/message/send 一律拒绝。
+	ErrMessageCardSendForbidden = register(codes.Code{
+		ID:             "err.server.message.card_send_forbidden",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "Card messages can only be sent by bots or webhooks.",
+	})
+	// ErrMessageCardEditForbidden Decision 7：P1 卡片不可变，用户编辑路径拒绝
+	// type-17 content_edit（该路径对卡片永久关闭，P2 也不开放）。
+	ErrMessageCardEditForbidden = register(codes.Code{
+		ID:             "err.server.message.card_edit_forbidden",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Card messages cannot be edited.",
+	})
 )
