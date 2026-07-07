@@ -806,3 +806,91 @@ func TestGetAppConfig_DocsOn_OnVersionShortCircuit(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Contains(t, w.Body.String(), `"docs_on":true`)
 }
+
+// setStickerUploadLimitsSettings upserts the three sticker upload knobs
+// (size KB / max dim / allowed formats CSV) and reloads the shared snapshot.
+// Passing "" for any of them skips writing that row so tests can exercise the
+// "default when unset" branch selectively. Call AFTER cleanAllTablesAndReloadSettings.
+func setStickerUploadLimitsSettings(t *testing.T, ctx *config.Context, sizeKB, maxDim, allowedCSV string) {
+	t.Helper()
+	if sizeKB != "" {
+		_, err := ctx.DB().InsertInto("system_setting").
+			Columns("category", "key_name", "value", "value_type").
+			Values("sticker", "upload_max_size_kb", sizeKB, "int").Exec()
+		require.NoError(t, err)
+	}
+	if maxDim != "" {
+		_, err := ctx.DB().InsertInto("system_setting").
+			Columns("category", "key_name", "value", "value_type").
+			Values("sticker", "upload_max_dimension", maxDim, "int").Exec()
+		require.NoError(t, err)
+	}
+	if allowedCSV != "" {
+		_, err := ctx.DB().InsertInto("system_setting").
+			Columns("category", "key_name", "value", "value_type").
+			Values("sticker", "upload_allowed_formats", allowedCSV, "string").Exec()
+		require.NoError(t, err)
+	}
+	require.NoError(t, EnsureSystemSettings(ctx).Reload())
+}
+
+// appconfig 必须下发 sticker_upload_* 上限。未配置时 = SystemSettings 侧默认
+// (1024 KB / 512 px / 全 5 位图),与 PR #544 之前的历史硬编码严格等价。客户端
+// 据此做本地预校验,失败时提示用户"最大 X MB / X px / 支持 gif/png/..."。
+func TestGetAppConfig_StickerUploadLimits_DefaultsMatchHistoricalHardcoded(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx) // wipes system_setting → 3 keys absent → defaults served
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+	// 嵌套 struct 序列化顺序 = 定义顺序(max_size_kb → max_dimension → allowed_formats),
+	// 因此可以整段字符串匹配。allowed_formats 未配置回退默认 5 位图,顺序 =
+	// stickerUploadRasterAllowlist 定义顺序。
+	assert.Contains(t, body, `"sticker_upload_limits":{"max_size_kb":1024,"max_dimension":512,"allowed_formats":[".gif",".png",".jpg",".jpeg",".webp"]}`)
+}
+
+// 运营在管理台把 3 个上限都放宽/收窄 → appconfig 下发新值(客户端本地预校验
+// 立刻跟随)。同时验证 allowed_formats CSV 归一化(小写、加点、去空格、去重、
+// 非位图丢弃、按输入 CSV 顺序保留)在下发字段里成立。
+func TestGetAppConfig_StickerUploadLimits_DBOverrideServed(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setStickerUploadLimitsSettings(t, ctx, "3072", "900", "PNG, gif , mp4") // mp4 非位图会被读侧丢弃
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+	// 归一化:PNG→.png,gif→.gif,mp4 丢弃;顺序按输入 CSV 保留(稳定,便于
+	// 客户端展示/日志用),下发就是 [".png",".gif"]。
+	assert.Contains(t, body, `"sticker_upload_limits":{"max_size_kb":3072,"max_dimension":900,"allowed_formats":[".png",".gif"]}`)
+}
+
+// version 短路分支同样要下发 sticker_upload_limits:运维在管理台调整后老客户端
+// 命中版本短路也必须拿到最新值,否则被本地缓存住失去实时性(与 StickerHandleRequired
+// / DocsOn 同样的解耦约束)。
+func TestGetAppConfig_StickerUploadLimits_OnVersionShortCircuit(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setStickerUploadLimitsSettings(t, ctx, "3072", "900", "png,jpg")
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig?version=99999999", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+	assert.Contains(t, body, `"sticker_upload_limits":{"max_size_kb":3072,"max_dimension":900,"allowed_formats":[".png",".jpg"]}`)
+}

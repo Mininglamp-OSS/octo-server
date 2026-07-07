@@ -390,6 +390,9 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 			StickerCustomEnabled:   cn.systemSettings.StickerCustomEnabled(),
 			StickerHandleRequired:  cn.systemSettings.StickerHandleRequired(),
 			DocsOn:                 cn.systemSettings.DocsEnabled(),
+			// Sticker 上限:短路分支同样下发,让老客户端在管理台放宽/收窄后
+			// 也能立刻拿到最新值。
+			StickerUploadLimits: buildStickerUploadLimitsResp(cn.systemSettings),
 		})
 		return
 	}
@@ -433,7 +436,21 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 		StickerCustomEnabled:   cn.systemSettings.StickerCustomEnabled(),
 		StickerHandleRequired:  cn.systemSettings.StickerHandleRequired(),
 		DocsOn:                 cn.systemSettings.DocsEnabled(),
+		// Sticker 上限:客户端本地预校验用,兜底仍在服务端 modules/file 侧。
+		StickerUploadLimits: buildStickerUploadLimitsResp(cn.systemSettings),
 	})
+}
+
+// buildStickerUploadLimitsResp 从 SystemSettings 派生一份 stickerUploadLimitsResp
+// 快照。两个 handler 分支(version-shortcut / full-refresh)都用它,避免字段
+// 组装漂移。SystemSettings.StickerUpload* getter 各自内部已做 hard-cap clamp,
+// 拿到的都是安全值。
+func buildStickerUploadLimitsResp(s *SystemSettings) stickerUploadLimitsResp {
+	return stickerUploadLimitsResp{
+		MaxSizeKB:      s.StickerUploadMaxSizeKB(),
+		MaxDimension:   s.StickerUploadMaxDimension(),
+		AllowedFormats: s.StickerUploadAllowedFormats(),
+	}
 }
 
 // oidcProviders 返回 OIDC provider 元数据数组,让前端不再硬编码 provider id/name/authorize_path。
@@ -791,6 +808,44 @@ type appConfigResp struct {
 	// 与 app_config.version 解耦的原因同 LocalLoginOff / SearchEnabled：运维切展示
 	// 策略后老客户端命中 version 短路分支也必须拿到最新值，故两个分支都下发。
 	DocsOn bool `json:"docs_on"`
+
+	// StickerUploadLimits 是自定义贴纸上传的操作端可调上限，与 sticker.upload_*
+	// system_setting 同源（SystemSettings.StickerUpload{MaxSizeKB,MaxDimension,
+	// AllowedFormats}）。用途：让客户端在选图后本地预校验（提示"最大 X MB / 最长
+	// Y px / 支持 gif/png..."），避免大图/非法扩展名先跑完 HTTP 上传才被服务端拒
+	// —— 尤其对移动端流量友好。
+	//
+	// 客户端预校验只是 UX 优化；服务端 modules/file 侧仍对每个 sticker upload
+	// 请求做同一份 stickerLimits 快照兜底（size/format/dimension 三层），客户端
+	// 缓存过期或被绕过都不影响安全边界。默认值与 PR #544 之前的历史硬编码严格
+	// 等价（1024 KB / 512 px / [.gif,.png,.jpg,.jpeg,.webp]），运营不动 knob
+	// 时行为完全无回归。
+	//
+	// 与 app_config.version 解耦的原因同 StickerHandleRequired / DocsOn：运维在
+	// 管理台放宽/收窄上限后，老客户端命中 version 短路分支也必须拿到最新值，否则
+	// 被本地缓存住失去实时性，故两个分支都下发。
+	//
+	// 独立命名空间（不叫 sticker_upload_*）的原因：三个字段是一组"上限"，一起
+	// 生效、一起提示；单独包一层让客户端解析和展示逻辑天然聚合，未来若加非上限
+	// 类的 sticker upload 字段（例如上传行为 toggle）也不会污染这个 object。
+	// 现有的 sticker_custom_enabled / sticker_handle_required 是平铺 bool，形态
+	// 与 limits object 差异明显，风格分裂可接受；语义相近的字段（同为 upload
+	// 上限）优先聚合，与 OIDCProviders 这类 nested resp 同思路。
+	//
+	// 不下发压缩相关 knob（compress_enabled / compress_target_kb /
+	// compress_max_concurrency / compress_timeout_ms）—— 这些是服务端"影子"参数，
+	// 响应字段结构不变、无对应客户端行为，曝光只会泄露实现细节。
+	StickerUploadLimits stickerUploadLimitsResp `json:"sticker_upload_limits"`
+}
+
+// stickerUploadLimitsResp 是 appConfigResp.sticker_upload_limits 的形状。
+// 三个字段一起下发,一起用于客户端预校验。字段名不再带 sticker_upload_ 前缀
+// —— 已经在命名空间下。allowed_formats 内每项含前导点、小写、按输入 CSV
+// 顺序保留(见 SystemSettings.StickerUploadAllowedFormats 契约)。
+type stickerUploadLimitsResp struct {
+	MaxSizeKB      int      `json:"max_size_kb"`
+	MaxDimension   int      `json:"max_dimension"`
+	AllowedFormats []string `json:"allowed_formats"`
 }
 
 type oidcProviderResp struct {
