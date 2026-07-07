@@ -2,8 +2,10 @@ package cardmsg
 
 import (
 	"encoding/json"
-	"regexp"
 	"strings"
+
+	"github.com/yuin/goldmark/ast"
+	"github.com/yuin/goldmark/text"
 )
 
 // Finalize 是 InteractiveCard(=17) 派发出口的权威收尾：必须在所有 server 端
@@ -127,20 +129,48 @@ func collectPlain(items []interface{}, segs *[]string) {
 	}
 }
 
-// stripMarkdown 剥离 AC 基础 markdown 子集的语法字符（Decision 8：plain 不含
-// 原始 `**`/`[]()`）：链接降为链接文本，粗体/斜体星号与反引号移除。下划线不动
-// —— snake_case 文本比 `_斜体_` 常见得多,误伤成本更高（AC 强调以 * 为主）。
+// stripMarkdown 把一段 AC markdown 文本降为可见纯文本（Decision 8：权威 plain
+// 不含原始 markdown 语法）。用与 validate.go 同一个 CommonMark 解析器（goldmark）
+// 提取 AST 里的可见文本节点 —— 链接/图片降为其可见文本(label/alt)、autolink 取
+// 其 URL 文本、强调/行内代码去标记 —— 从而覆盖引用式链接 `[t][l]`、autolink
+// `<url>`、图片 `![alt](url)` 等旧正则漏剥、把原始语法泄进 plain 的形态（PR#543
+// review 🟡：校验侧已 goldmark 完整，plain 剥离侧须同口径）。软/硬换行与段落边界
+// 折成换行,首尾空行裁掉。
 func stripMarkdown(s string) string {
-	s = markdownLinkTextRe.ReplaceAllString(s, "$1")
-	return markdownEmphasisReplacer.Replace(s)
+	if s == "" {
+		return ""
+	}
+	src := []byte(s)
+	doc := markdownParser.Parse(text.NewReader(src))
+	var b strings.Builder
+	_ = ast.Walk(doc, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
+		switch node := n.(type) {
+		case *ast.Text:
+			if entering {
+				b.Write(node.Segment.Value(src))
+				if node.SoftLineBreak() || node.HardLineBreak() {
+					b.WriteByte('\n')
+				}
+			}
+		case *ast.String:
+			if entering {
+				b.Write(node.Value)
+			}
+		case *ast.AutoLink:
+			// autolink 的可见文本就是其 URL（`<https://x>` 端上显示 https://x）。
+			if entering {
+				b.Write(node.URL(src))
+			}
+		case *ast.Paragraph, *ast.Heading:
+			// 块级边界折成换行，避免多段 TextBlock 文本塌成一行。
+			if !entering {
+				b.WriteByte('\n')
+			}
+		}
+		return ast.WalkContinue, nil
+	})
+	return strings.Trim(b.String(), "\n")
 }
-
-var (
-	// markdownLinkTextRe 捕获组是「链接文本」（validate.go 的 markdownLinkRe
-	// 捕获的是链接目标 —— 两处捕获对象不同,不能复用）。
-	markdownLinkTextRe       = regexp.MustCompile(`\[([^\]]*)\]\([^)]*\)`)
-	markdownEmphasisReplacer = strings.NewReplacer("**", "", "*", "", "`", "")
-)
 
 // DisplayTextFor 是「按 plain 描述卡片消息」的所有服务端展示面（离线推送、
 // 搜索命中投影、会话摘要、引用预览）的**单一执法点**（Decision 2 residual-risk

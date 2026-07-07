@@ -181,6 +181,11 @@ func TestValidateURLAllowlist(t *testing.T) {
 
 // 验收(PR#543 review P1):URL 正向 allowlist 必须覆盖整个渲染面 —— 除 url 外的
 // backgroundImage / iconUrl,以及 markdown 的 autolink / 引用式链接,都不得绕过。
+//
+// 本测试 + TestValidateMarkdownRenderSurfaceParity 一起,是 octo/v1 **URL 承载面
+// 的权威枚举**:每类元素/字段(Image.url、Action.OpenUrl.url+iconUrl、各容器
+// backgroundImage、TextBlock/FactSet markdown 链接/图片/autolink)各一条危险用例。
+// 新增会渲染 URL 的元素或字段时,必须在此补一行——保持"校验面 ≥ 渲染面"可复核。
 func TestValidateURLAllowlistFullSurface(t *testing.T) {
 	// backgroundImage —— 字符串简写形(卡片根)
 	rootBg := envelope(nil)
@@ -464,6 +469,25 @@ func TestBuildPlainDerivation(t *testing.T) {
 	)
 	if got := BuildPlain(nested); got != "head\ncol1\ncol2" {
 		t.Errorf("嵌套文档序 plain=%q", got)
+	}
+}
+
+// 验收(PR#543 round-5 🟡):stripMarkdown 走 goldmark 后,旧正则漏剥的形态
+// (引用式链接 / autolink / 图片)不得把原始 markdown 语法泄进权威 plain。
+func TestStripMarkdownRenderForms(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"see [detail](https://e.com)", "see detail"},            // 内联链接 → 文本
+		{"tap [go][l]\n\n[l]: https://e.com", "tap go"},          // 引用式链接 → 文本(定义行不泄漏)
+		{"docs <https://e.com/x>", "docs https://e.com/x"},       // autolink → 可见 URL 文本
+		{"pic ![alt text](https://e.com/a.png)", "pic alt text"}, // 图片 → alt 文本(不泄 ![]() 语法)
+		{"**bold** and `code` and *em*", "bold and code and em"}, // 强调/行内代码去标记
+		{"line1\nline2", "line1\nline2"},                         // 软换行保留
+	}
+	for _, c := range cases {
+		card := cardWithBody(map[string]interface{}{"type": "TextBlock", "text": c.in})
+		if got := BuildPlain(card); got != c.want {
+			t.Errorf("stripMarkdown(%q) plain=%q want %q", c.in, got, c.want)
+		}
 	}
 }
 

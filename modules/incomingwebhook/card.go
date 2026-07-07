@@ -29,8 +29,10 @@ var errCardDisabled = errors.New("incomingwebhook: card messages disabled")
 //     同一权威）；cardmsg.Finalize：重算权威 plain + 完整出站 payload 复检；
 //   - Decision 8 `text` 种子语义：仅当派生 plain 为空（= [卡片] 兜底）且调用方
 //     给了 text 时，用 text 作 plain（rune 上限与纯文本路径一致）；卡片 body
-//     产出文本时 text 被忽略 —— 派生始终权威。8KB body cap 天然钉住种子体积，
-//     无需再跑大小复检。
+//     产出文本时 text 被忽略 —— 派生始终权威。种子覆盖发生在 Finalize 复检之后、
+//     会改变 plain 字节，故覆盖后再复检一次：卡片体逼近 512KiB 时，用种子替换极短
+//     的 [卡片] 占位可能把 payload 顶过上限，不能只靠 8KB body cap 的间接边界
+//     （PR#543 review 🟡）。
 //
 // 错误映射（push 路径）：ErrCardPayloadTooLarge → 413；errCardDisabled →
 // 400 reason=card_disabled；其余校验错误 → 400 reason=card。
@@ -63,6 +65,11 @@ func buildCardPayload(m *incomingWebhookModel, req *pushPayloadReq, allowOverrid
 		seed := req.Text
 		if seed != "" && utf8.RuneCountInString(seed) <= maxContentRunes() {
 			payload["plain"] = seed
+			// 种子改变了权威 plain（在 Finalize 复检之后）——对最终 payload 再复检，
+			// 保证 buildCardPayload 返回的 payload 恒不超 512KiB，不依赖下游远处复检。
+			if err := cardmsg.RecheckPayloadSize(payload); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return payload, nil

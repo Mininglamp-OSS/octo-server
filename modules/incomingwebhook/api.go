@@ -1515,6 +1515,18 @@ func (w *IncomingWebhook) handlePush(c *wkhttp.Context, ad pushAdapter) {
 	broadcastPermitted := w.settings.IncomingWebhookMemberCanBroadcast() || creatorIsAdmin
 	payload, mentionIgnored := w.assemblePushPayload(m, req, payload, broadcastPermitted)
 
+	// card-message-protocol P1 Decision 3a：assemblePushPayload 内的
+	// ExpandAisToBotUIDs 是 Finalize 之后唯一增大 payload 的 mutation（@所有 AI
+	// 展开把群 bot 成员 UID 追加进 mention 子表）。与 bot_api(send.go)/robot(api.go)
+	// 出站口径对称：对真实出站 payload 复检 512KiB —— 三个 type-17 producer 的
+	// 「最后一次 mutation 后复检」不变量在此闭合（PR#543 review：webhook 是第三条
+	// 对称路径，此前遗漏）。非 type-17 为 no-op。
+	if err := cardmsg.RecheckPayloadSize(payload); err != nil {
+		w.submitFailure(m, len(body), ip, ad.name, "too_large", http.StatusRequestEntityTooLarge)
+		pushPayloadTooLarge(c)
+		return
+	}
+
 	// 投递目标由行派生：群 webhook → (group_no, 群)；子区 webhook → (group_no____short_id,
 	// 子区)。这是 URL/body 之外唯一随绑定变化的东西——推送方零适配（见 targetChannel()）。
 	channelID, channelType := m.targetChannel()
