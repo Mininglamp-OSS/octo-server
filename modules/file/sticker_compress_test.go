@@ -2,6 +2,7 @@ package file
 
 import (
 	"bytes"
+	"encoding/binary"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -261,4 +262,173 @@ func min2(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// ---------------------------------------------------------------------------
+// P1 regression: timeout must NOT release the concurrency slot early.
+// Slot lifetime is bound to the worker goroutine, not to Compress's return.
+// ---------------------------------------------------------------------------
+
+// TestStickerCompressor_TimeoutDoesNotBleedConcurrency: maxConcurrency=1 +
+// worker sleeps 500ms + timeout=20ms 场景。首次 Compress 从 timeout 分支返回
+// 时，dangling worker 仍在跑，slot 应保持占用；紧接着来的第二次 Compress 必须
+// 拿到 skipped:concurrency_saturated 而不是 timeout（若 slot 提前释放，就会
+// 走 timeout 分支，等于并发闸被绕过 —— review P1 就是这个 bug）。等 worker
+// 结束后 slot 释放，第三次 Compress 才能真正进压缩管线。
+func TestStickerCompressor_TimeoutDoesNotBleedConcurrency(t *testing.T) {
+	const workerSleep = 500 * time.Millisecond
+	c := &stickerCompressor{
+		settings: &fakeStickerCompressSettings{
+			enabled: true, targetKB: 1024, maxConcurrency: 1, timeoutMs: 20, maxDim: 512,
+		},
+		doCompress: func(ext string, src []byte, maxDim, targetKB int) (stickerCompressResult, error) {
+			time.Sleep(workerSleep)
+			return stickerCompressResult{Outcome: stickerCompressOutcomeCompressed, Bytes: src, Size: int64(len(src))}, nil
+		},
+	}
+
+	// 第一次：worker 慢，Compress 从 timeout 分支返回
+	r1 := c.Compress(".jpg", []byte("x"))
+	require.Equal(t, stickerCompressOutcomeSkipped, r1.Outcome)
+	require.Equal(t, "timeout", r1.Reason)
+
+	// 立即再打：worker 还没跑完，slot 必须仍占用 → 拿到 concurrency_saturated
+	r2 := c.Compress(".jpg", []byte("y"))
+	assert.Equal(t, stickerCompressOutcomeSkipped, r2.Outcome)
+	assert.Equalf(t, "concurrency_saturated", r2.Reason,
+		"slot must remain held by dangling worker after timeout return; got reason=%q", r2.Reason)
+
+	// 等 worker 真正结束 + 少量余量，slot 应被 worker 的 defer release 释放。
+	// 断言点是"reason 变回 timeout"（新一轮成功 acquire，仅是新 worker 又慢导致
+	// 超时）而不是 concurrency_saturated —— 只要不再是 saturated 就证明 slot 已
+	// 归还。这条 test 的 doCompress 是永远慢的固定 fake，用 outcome!=skipped 判
+	// 定会假失败。
+	time.Sleep(workerSleep + 100*time.Millisecond)
+	r3 := c.Compress(".jpg", []byte("z"))
+	assert.Equal(t, stickerCompressOutcomeSkipped, r3.Outcome)
+	assert.NotEqualf(t, "concurrency_saturated", r3.Reason,
+		"after worker finished, slot must be released; got reason=%q", r3.Reason)
+}
+
+// ---------------------------------------------------------------------------
+// P2 regression: APNG must skip compression (would otherwise lose animation).
+// ---------------------------------------------------------------------------
+
+// buildPNGWithChunks 造一个最小 PNG 字节流：signature + 顺序写入 caller 指定的
+// chunk。CRC 全写 0（hasAPNGActlChunk 不校验 CRC，只看结构 marker）。用于测
+// APNG 检测函数在各种 chunk 顺序下的行为。
+func buildPNGWithChunks(t *testing.T, chunks []struct {
+	Type string
+	Data []byte
+},
+) []byte {
+	t.Helper()
+	var b bytes.Buffer
+	b.WriteString("\x89PNG\r\n\x1a\n")
+	for _, ch := range chunks {
+		var lenBytes [4]byte
+		binary.BigEndian.PutUint32(lenBytes[:], uint32(len(ch.Data)))
+		b.Write(lenBytes[:])
+		b.WriteString(ch.Type)
+		b.Write(ch.Data)
+		b.Write([]byte{0, 0, 0, 0}) // fake CRC
+	}
+	return b.Bytes()
+}
+
+// APNG 典型 chunk 顺序：IHDR → acTL → (fcTL/IDAT/fdAT)*  → IEND。acTL 位于
+// IDAT 之前是有效动画的必要条件。
+func TestHasAPNGActlChunk_DetectsAPNG(t *testing.T) {
+	src := buildPNGWithChunks(t, []struct {
+		Type string
+		Data []byte
+	}{
+		{"IHDR", []byte{0, 0, 0, 1, 0, 0, 0, 1, 8, 0, 0, 0, 0}},
+		{"acTL", []byte{0, 0, 0, 2, 0, 0, 0, 0}}, // num_frames=2, num_plays=0
+		{"IDAT", []byte{0x78, 0x9c, 0x62, 0, 0, 0, 0, 1}},
+		{"IEND", nil},
+	})
+	assert.True(t, hasAPNGActlChunk(src))
+	assert.True(t, isAnimatedPNGSource(".png", src))
+	// 非 PNG ext 一律 false（防误挡 JPEG 等）。
+	assert.False(t, isAnimatedPNGSource(".jpg", src))
+}
+
+// 静态 PNG（无 acTL）不应命中。真实 image/png 生成的 PNG 只含 IHDR/IDAT/IEND。
+func TestHasAPNGActlChunk_RejectsStaticPNG(t *testing.T) {
+	assert.False(t, hasAPNGActlChunk(makeTestPNG(t, 16, 16)))
+	// 手工造的"只有 IHDR/IDAT/IEND"字节流也应否定，与 image/png 输出等价。
+	minimalStatic := buildPNGWithChunks(t, []struct {
+		Type string
+		Data []byte
+	}{
+		{"IHDR", []byte{0, 0, 0, 1, 0, 0, 0, 1, 8, 0, 0, 0, 0}},
+		{"IDAT", []byte{0x78, 0x9c, 0x62, 0, 0, 0, 0, 1}},
+		{"IEND", nil},
+	})
+	assert.False(t, hasAPNGActlChunk(minimalStatic))
+}
+
+// 规范：IDAT 之后的 acTL 会被一致的渲染器忽略。我们跟随规范判定为静态 PNG，
+// 保守选择"能压缩"（否则任意有 acTL trailing bytes 的普通 PNG 都被误 skip）。
+func TestHasAPNGActlChunk_IgnoresActlAfterIDAT(t *testing.T) {
+	src := buildPNGWithChunks(t, []struct {
+		Type string
+		Data []byte
+	}{
+		{"IHDR", []byte{0, 0, 0, 1, 0, 0, 0, 1, 8, 0, 0, 0, 0}},
+		{"IDAT", []byte{0x78, 0x9c, 0x62, 0, 0, 0, 0, 1}},
+		{"acTL", []byte{0, 0, 0, 2, 0, 0, 0, 0}}, // trailing acTL —— 无效
+		{"IEND", nil},
+	})
+	assert.False(t, hasAPNGActlChunk(src))
+}
+
+// 恶意/畸形输入：签名不匹配、length 溢出等，函数必须 return false 而不 panic
+// 或越界。fuzz 面覆盖 review P2 的"信任边界"要求。
+func TestHasAPNGActlChunk_MalformedInputsReturnFalse(t *testing.T) {
+	cases := map[string][]byte{
+		"empty":            nil,
+		"short":            []byte{0x89, 0x50, 0x4e},
+		"wrong_signature":  []byte("NOTAPNG!\x00\x00\x00\x00type"),
+		"truncated_length": append([]byte("\x89PNG\r\n\x1a\n"), 0xff, 0xff),
+		"length_overflow": append(
+			[]byte("\x89PNG\r\n\x1a\n"),
+			0xff, 0xff, 0xff, 0xff, // length = MaxUint32
+			'X', 'X', 'X', 'X', // chunk type
+		),
+	}
+	for name, src := range cases {
+		assert.Falsef(t, hasAPNGActlChunk(src), "case=%s", name)
+	}
+}
+
+// TestStickerCompressor_APNGSkips: 压缩入口拿到 APNG → 走 skipped:animated,
+// 不进 doCompress，不占用并发 slot（在 acquire 前拦截）。observability 上
+// 走 counter compress_skipped；不打 duration histogram（disabled/format/
+// animated/concurrency_saturated 一起归属"轻量路径"）。
+func TestStickerCompressor_APNGSkips(t *testing.T) {
+	// 用一个"命中就 fatal"的 doCompress 证明 APNG 路径不到达 worker
+	c := &stickerCompressor{
+		settings: &fakeStickerCompressSettings{
+			enabled: true, targetKB: 1024, maxConcurrency: 4, timeoutMs: 2000, maxDim: 512,
+		},
+		doCompress: func(ext string, src []byte, maxDim, targetKB int) (stickerCompressResult, error) {
+			t.Fatalf("doCompress must not be called for APNG; ext=%s len=%d", ext, len(src))
+			return stickerCompressResult{}, nil
+		},
+	}
+	apng := buildPNGWithChunks(t, []struct {
+		Type string
+		Data []byte
+	}{
+		{"IHDR", []byte{0, 0, 0, 1, 0, 0, 0, 1, 8, 0, 0, 0, 0}},
+		{"acTL", []byte{0, 0, 0, 3, 0, 0, 0, 0}},
+		{"IDAT", []byte{0x78, 0x9c, 0x62, 0, 0, 0, 0, 1}},
+		{"IEND", nil},
+	})
+	r := c.Compress(".png", apng)
+	assert.Equal(t, stickerCompressOutcomeSkipped, r.Outcome)
+	assert.Equal(t, "animated", r.Reason,
+		"APNG must be identified before acquiring a compress slot")
 }

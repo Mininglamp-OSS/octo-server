@@ -2,6 +2,7 @@ package file
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"image"
 	"strings"
@@ -129,8 +130,8 @@ func newStickerCompressor(s stickerCompressSettings) *stickerCompressor {
 //
 // 耗时观测：仅在 acquire slot 之后（真正投入 CPU 的路径）打点，包括
 // compressed / over_limit / failed / skipped:timeout。disabled/format/
-// concurrency_saturated 分支耗时约等于 0，用 counter 观测即可，不打 histogram
-// 以降低噪声。
+// animated/concurrency_saturated 分支耗时约等于 0，用 counter 观测即可，不打
+// histogram 以降低噪声。
 func (c *stickerCompressor) Compress(ext string, src []byte) stickerCompressResult {
 	if !c.settings.StickerCompressEnabled() {
 		return stickerCompressResult{Outcome: stickerCompressOutcomeSkipped, Reason: "disabled"}
@@ -138,11 +139,22 @@ func (c *stickerCompressor) Compress(ext string, src []byte) stickerCompressResu
 	if !canCompressStickerExt(ext) {
 		return stickerCompressResult{Outcome: stickerCompressOutcomeSkipped, Reason: "format"}
 	}
+	// APNG(Animated PNG) 复用 PNG magic 号，会通过 ext + magic + dimension 三
+	// 道门。若不在此显式识别，image.Decode 只解首帧 IDAT，imaging.Encode 重
+	// 编码回 PNG 时动画帧被静默丢失（review P2）。方案 C 明确"gif/animated
+	// 只校验不压"，APNG 同样应走 skipped:animated，字节流原样落库。检测放在
+	// tryAcquireCompressSlot 之前，避免为一次不需要压缩的请求占用并发 slot。
+	if isAnimatedPNGSource(ext, src) {
+		return stickerCompressResult{Outcome: stickerCompressOutcomeSkipped, Reason: "animated"}
+	}
 	maxConc := c.settings.StickerCompressMaxConcurrency()
 	if !c.tryAcquireCompressSlot(maxConc) {
 		return stickerCompressResult{Outcome: stickerCompressOutcomeSkipped, Reason: "concurrency_saturated"}
 	}
-	defer c.releaseCompressSlot()
+	// 关键：**不要**在此 defer release。timeout 分支返回时 doCompress goroutine
+	// 仍在跑，若此时 release 会让下一个请求 acquire 到 slot，真实并发绕过
+	// max_concurrency 上界。改由 worker goroutine 结束时（自然完成或 recover
+	// 后）释放，让 slot 与真正的 CPU 占用生命周期一致（review P1）。
 
 	timeoutMs := c.settings.StickerCompressTimeoutMs()
 	timeout := time.Duration(timeoutMs) * time.Millisecond
@@ -156,6 +168,9 @@ func (c *stickerCompressor) Compress(ext string, src []byte) stickerCompressResu
 	// 缓冲 1 让即使超时后 goroutine 完成也能非阻塞地写回，避免泄漏 sender。
 	ch := make(chan outcome, 1)
 	go func() {
+		// slot 一直持有到真正的 CPU 工作结束（含 recover 兜底），这是 P1 修复
+		// 的核心：Compress 提前 return（timeout）时 slot 仍占用。
+		defer c.releaseCompressSlot()
 		defer func() {
 			if rec := recover(); rec != nil {
 				// image.Decode 依赖第三方解码器，理论上返回 error，但 defence in
@@ -212,6 +227,47 @@ func canCompressStickerExt(ext string) bool {
 	switch ext {
 	case ".jpg", ".jpeg", ".png":
 		return true
+	}
+	return false
+}
+
+// isAnimatedPNGSource 检测 src 是否 APNG (Animated PNG)。ext 必须是 ".png"
+// —— 其他扩展名一律返回 false（JPEG 无动画；GIF/WebP 走 canCompressStickerExt
+// 已挡在压缩管线外）。APNG 通过额外的 acTL chunk 声明动画，标准 image/png
+// 只解首帧 IDAT，若不显式识别会静默丢动画（review P2）。
+func isAnimatedPNGSource(ext string, src []byte) bool {
+	if ext != ".png" {
+		return false
+	}
+	return hasAPNGActlChunk(src)
+}
+
+// hasAPNGActlChunk 扫描 PNG 字节流查找 acTL chunk（Animation Control Chunk）。
+// APNG 规范：acTL 必须出现在**第一个 IDAT 之前**才有效；一致的渲染器会忽略
+// IDAT 之后的 acTL。所以看到 IDAT 先于 acTL 即可判定为静态 PNG，短路结束扫描
+// 也避免扫完整个大文件。CRC 不校验 —— 只关心结构标记，容忍非法字节。
+func hasAPNGActlChunk(data []byte) bool {
+	const pngSignature = "\x89PNG\r\n\x1a\n"
+	if len(data) < 8 || string(data[:8]) != pngSignature {
+		return false
+	}
+	// PNG chunk 格式: 4B length | 4B type | N-B data | 4B CRC
+	pos := 8
+	for pos+8 <= len(data) {
+		length := binary.BigEndian.Uint32(data[pos : pos+4])
+		chunkType := string(data[pos+4 : pos+8])
+		switch chunkType {
+		case "acTL":
+			return true
+		case "IDAT":
+			return false
+		}
+		// 前进到下一个 chunk；用 int64 防 uint32 length + 12 溢出 int。
+		next := int64(pos) + 8 + int64(length) + 4
+		if next <= int64(pos) || next > int64(len(data)) {
+			return false
+		}
+		pos = int(next)
 	}
 	return false
 }
