@@ -45,7 +45,7 @@
 
 结构与大小上限（全部 ingress 一致）：
 
-- 完整 payload 序列化 ≤ **512 KiB**（发送/编辑路由另有 1 MiB pre-decode body 上限）；
+- 完整 payload 序列化 ≤ **512 KiB**（发送/编辑路由另有 2 MiB pre-decode body 上限；取 2 MiB 而非 1 MiB 是为不误伤同路由上恰好 1 MiB 的合法 RichText，见 `cardmsg.MaxSendBodyBytes`）；
 - 递归节点数 ≤ **200**，嵌套深度 ≤ **16**；
 - **URL 正向 allowlist**：仅绝对 `http`/`https`（作用于 `Image.url`、
   `Action.OpenUrl.url`、`selectAction`、markdown 链接目标）。`data:` /

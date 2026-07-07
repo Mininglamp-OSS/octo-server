@@ -382,3 +382,30 @@ func TestIsCardRawPayload(t *testing.T) {
 		t.Error("非卡片/坏字节不应命中")
 	}
 }
+
+// 验收(PR#543 review B1):编辑守卫单点谓词 —— 目标是卡片 OR 编辑体是卡片 都拒。
+// bot_api 与 robot 两个编辑入口共用本谓词，防止两条路各自拼守卫而漂移
+// （原 robot 路径漏了「目标是卡片」这半边，可把已存在卡片改成非卡片正文）。
+func TestRejectsCardEdit(t *testing.T) {
+	cardRaw := []byte(`{"type":17,"card":{}}`)
+	textRaw := []byte(`{"type":1,"content":"hi"}`)
+	cardEdit := `{"type":17,"card":{"body":[]},"profile":"octo/v1","card_version":"1.5"}`
+	textEdit := `{"type":14,"content":[{"type":"text","text":"x"}]}`
+
+	// 目标是卡片、编辑体是非卡片 —— 这是 B1 漏掉的一路：把已存在卡片改成非卡片。
+	if !RejectsCardEdit(cardRaw, textEdit) {
+		t.Error("目标为卡片时应拒绝任何编辑（B1 回归）")
+	}
+	// 目标非卡片、编辑体是卡片 —— 把普通消息改写成卡片。
+	if !RejectsCardEdit(textRaw, cardEdit) {
+		t.Error("编辑体为卡片时应拒绝（绕过 Validate 的 ingress）")
+	}
+	// 两者皆卡片 —— 当然拒。
+	if !RejectsCardEdit(cardRaw, cardEdit) {
+		t.Error("目标与编辑体都为卡片时应拒绝")
+	}
+	// 两者皆非卡片 —— 普通 richtext 编辑放行（老路径不变）。
+	if RejectsCardEdit(textRaw, textEdit) {
+		t.Error("非卡片目标 + 非卡片编辑体不应拒绝（老编辑路径不变）")
+	}
+}

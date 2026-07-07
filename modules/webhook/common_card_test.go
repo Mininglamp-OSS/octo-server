@@ -8,11 +8,28 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/stretchr/testify/assert"
 )
+
+// 验收(PR#543 review B1):type-17 必须通过 containSupportType 门,否则离线推送
+// 在 getMessageAlert 之前就把卡片当「不支持类型」丢弃 —— 下面的 alert 遮蔽分支
+// 成死代码。本测试经真实门(w.supportTypes 由 New→getSupportTypes 装配),而非
+// 直调 getMessageAlert;修复前 InteractiveCard 不在支持集,本断言为 false。
+func TestCardTypeReachesPushGate(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer func() { _ = testutil.CleanAllTables(ctx) }()
+	w := New(ctx)
+
+	assert.True(t, w.containSupportType(cardmsg.InteractiveCard),
+		"InteractiveCard(17) 必须在推送支持集,否则离线推送卡片分支不可达")
+	// 对照:一个明确不支持的类型仍被门挡住(证明门本身有效,非恒真)。
+	assert.False(t, w.containSupportType(common.ContentType(9999)),
+		"未知类型应被 containSupportType 挡住")
+}
 
 func TestCardSenderTrusted(t *testing.T) {
 	_, ctx := testutil.NewTestServer()

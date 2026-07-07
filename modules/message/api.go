@@ -395,6 +395,18 @@ func (m *Message) sendMsg(c *wkhttp.Context) {
 		return
 	}
 
+	// card-message-protocol P1 Decision 2 layer (a)：InteractiveCard(=17) 仅
+	// bot/webhook 可发，用户 ingress 一律拒绝（层 (b) 为客户端 from_uid 渲染
+	// 门禁，层 (c) 为 P2 action 端点的 sender 复验 —— webhook 通知是存储后
+	// 无否决权的，HTTP ingress 拦截是服务端唯一入口防线）。拒卡是与频道类型/
+	// 好友关系无关的绝对策略，故置于频道成员/好友前置检查之前 —— 无论收件人是谁，
+	// 用户都不能发卡片，且该判定不触库（PR#543 review：让拒卡不依赖 DB 前置）。
+	if cardmsg.IsCardPayload(req.Payload) {
+		m.Warn("用户 ingress 拒绝卡片消息", zap.String("channelID", req.ReceiveChannelID), zap.String("fromUID", uid))
+		httperr.ResponseErrorL(c, errcode.ErrMessageCardSendForbidden, nil, nil)
+		return
+	}
+
 	if req.ReceiveChannelType == common.ChannelTypePerson.Uint8() {
 		spaceID, peerID := spacepkg.ParseChannelID(req.ReceiveChannelID)
 		if spaceID != "" {
@@ -506,15 +518,6 @@ func (m *Message) sendMsg(c *wkhttp.Context) {
 	if err := richtext.Validate(req.Payload); err != nil {
 		m.Error("RichText payload 校验失败", zap.Error(err), zap.String("channelID", req.ReceiveChannelID), zap.String("fromUID", uid))
 		respondMessageRequestInvalid(c, "payload")
-		return
-	}
-	// card-message-protocol P1 Decision 2 layer (a)：InteractiveCard(=17) 仅
-	// bot/webhook 可发，用户 ingress 一律拒绝（层 (b) 为客户端 from_uid 渲染
-	// 门禁，层 (c) 为 P2 action 端点的 sender 复验 —— webhook 通知是存储后
-	// 无否决权的，HTTP ingress 拦截是服务端唯一入口防线）。
-	if cardmsg.IsCardPayload(req.Payload) {
-		m.Warn("用户 ingress 拒绝卡片消息", zap.String("channelID", req.ReceiveChannelID), zap.String("fromUID", uid))
-		httperr.ResponseErrorL(c, errcode.ErrMessageCardSendForbidden, nil, nil)
 		return
 	}
 	err = m.sendMessage(req.ReceiveChannelID, req.ReceiveChannelType, uid, req.Payload, senderSpaceID)

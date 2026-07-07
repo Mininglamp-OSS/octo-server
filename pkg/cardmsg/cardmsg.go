@@ -139,6 +139,16 @@ func IsCardContentEdit(contentEdit string) bool {
 	return IsCardPayload(payload)
 }
 
+// RejectsCardEdit 报告一次消息编辑是否必须按 P1 Decision 7（卡片不可变）拒绝：
+// 要么被编辑的目标消息本身已是卡片（originalRaw，把卡片改掉），要么编辑体本身
+// 是卡片信封（contentEdit，把普通消息改写成卡片、绕过 Validate）。两个编辑入口
+// （bot_api、robot）都必须以本谓词单点门控，避免两条路各自拼守卫而漂移 —— PR#543
+// review 发现 robot 路径漏了「目标是卡片」这半边。P2（D6）以 cardmsg 对称校验 +
+// card_seq CAS 解锁编辑，届时调用方移除本 reject。
+func RejectsCardEdit(originalRaw []byte, contentEdit string) bool {
+	return IsCardRawPayload(originalRaw) || IsCardContentEdit(contentEdit)
+}
+
 // Enabled 报告部署级卡片开关（Decision 2 rollout gate）。默认关闭：客户端渲染
 // 门禁发布前不得在生产开启。非法取值按关闭处理（fail-closed）。
 func Enabled() bool {

@@ -1931,10 +1931,13 @@ func (rb *Robot) botMessageEdit(c *wkhttp.Context) {
 	// write-strict 校验 + 权威 plain 重算（契约 §2，plain 服务端重算不信客户端）。
 	// 编辑语义为整体替换 content blocks；非 14 / 非 JSON 体为 no-op。脏/超限 payload
 	// 落库前以错误拒绝。MD5 去重 hash 落在 normalize 后的 canonical 体上。
-	// card-message-protocol P1 Decision 7：卡片不可变 —— 先于 Normalize 拦截
-	// type-17 编辑体（Normalize 的 richtext 门会放卡片体「原样、零校验」通过，
-	// PR#525 round-2 finding #1）。
-	if cardmsg.IsCardContentEdit(req.ContentEdit) {
+	// card-message-protocol P1 Decision 7：卡片不可变 —— 目标消息为 type-17、
+	// 或编辑体为 type-17（把普通消息改写成卡片）都在此拒绝，与 bot_api 编辑路径
+	// 共用 cardmsg.RejectsCardEdit 单点谓词（避免两条路拼守卫漂移 —— PR#543 review
+	// 发现本路径原先漏查目标是否卡片）。richtext 的 NormalizeContentEdit 是
+	// IsRichTextPayload 门控的，卡片体会「原样、零校验」通过（PR#525 round-2
+	// finding #1）。resp.Messages[0] 已在上方属主校验取出。
+	if cardmsg.RejectsCardEdit(resp.Messages[0].Payload, req.ContentEdit) {
 		httperr.ResponseErrorL(c, errcode.ErrRobotCardEditForbidden, nil, nil)
 		return
 	}

@@ -69,26 +69,19 @@ func cardEnvelopeJSON(t *testing.T) []byte {
 // 闭包,handler 绑定的是「进程内第一个测试」的 ctx —— 运行时改本测试 ctx 的
 // SendMessageOn 对 handler 不可见。这里沿用包内旧式 newTestServer() 手动
 // New(ctx)+Route,让 handler 与测试共享同一 ctx,config 开关可控。
-// 该口不触 DB(拒绝发生在派发前),无需迁移建表。
+//
+// 拒卡门现置于频道成员/好友前置检查之前(api.go sendMsg),故本测试完全不触库:
+// 不种好友、不需迁移建表,也就不调 testutil.NewTestServer —— 这既反映了「拒卡是
+// 与收件人无关的绝对策略」的语义,也让本测试不再受 modules/message 包在 -shuffle
+// 下的迁移账本脆弱性(issue #17)牵连(PR#543 review:原先经 testutil 建 friend 表
+// 会在坏 seed 下 panic 于 group_member 重复建表)。
 func TestUserCardSendRejected(t *testing.T) {
 	t.Setenv(cardmsg.EnvEnabled, "true")
-	// 先经 testutil 跑一次迁移(friend 表等)——不依赖包内其它测试的运行顺序;
-	// 其 route/ctx 不使用(sync.Once 陷阱见上)。
-	_, migCtx := testutil.NewTestServer()
-	defer func() { _ = testutil.CleanAllTables(migCtx) }()
 	s, ctx := newTestServer()
 	ctx.GetConfig().Message.SendMessageOn = true
 	m := New(ctx)
 	m.Route(s.GetRoute())
 	resetCardUIDRateLimit(t, ctx)
-
-	// person 频道的好友前置检查在卡片门禁之前 —— 种双向好友关系,让请求
-	// 走到 Decision-2a 的 type-17 拒绝(表由同二进制内先跑的 testutil 迁移建出)。
-	for _, pair := range [][2]string{{uid, cardTestHumanUID}, {cardTestHumanUID, uid}} {
-		_, err := ctx.DB().InsertBySql(
-			"insert into friend(uid,to_uid,is_deleted) values(?,?,0)", pair[0], pair[1]).Exec()
-		assert.NoError(t, err)
-	}
 
 	var payload map[string]interface{}
 	assert.NoError(t, json.Unmarshal(cardEnvelopeJSON(t), &payload))
