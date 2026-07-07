@@ -4,8 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
-	"regexp"
 	"strings"
+
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/ast"
+	"github.com/yuin/goldmark/text"
 )
 
 // Validate 是 InteractiveCard(=17) 发送入口的 write-strict 校验 gate。
@@ -370,42 +373,52 @@ func checkNodeURLs(node map[string]interface{}) error {
 	return nil
 }
 
-// markdownLinkRe 提取 AC 基础 markdown 子集里的内联链接目标 [text](target)。
-// target 取到右括号前的第一段（容忍 "(url title)" 形态取 url 部分）。
+// markdownParser 是提取 markdown 链接面用的 CommonMark 解析器。goldmark 默认
+// 配置即 CommonMark 合规（含内联链接、引用式链接、图片、`<scheme:…>` autolink）。
+// Parser.Parse 每次解析创建独立解析上下文，可并发安全复用单例。
+var markdownParser = goldmark.New().Parser()
+
+// markdownLinkTargets 提取一段 AC markdown 文本里**会被 CommonMark 渲染成活链接
+// 的全部目标 URL**：内联链接 `[t](url)`、引用式链接 `[t][l]`+`[l]: url`、图片
+// `![alt](url)`、autolink `<scheme:url>`。调用方对每个目标一律过 checkURL 的正向
+// http(s) allowlist。
 //
-// ⚠️ 括号后允许**前导空白**（`\(\s*`）：CommonMark 渲染器会剥离 destination 的
-// 前后空白，故 `[x]( javascript:alert(1))` 在端上就是一个 javascript: 链接。若
-// 正则要求 `(` 后紧跟非空白，服务端就提取不到该 target、URL allowlist 被绕过，
-// 而客户端照样渲染成危险链接 —— 校验面必须 ≥ 渲染面（Decision 3d/6）。
-var markdownLinkRe = regexp.MustCompile(`\[[^\]]*\]\(\s*([^)\s]+)[^)]*\)`)
-
-// autolinkRe 提取 CommonMark autolink `<scheme:...>` 的 URI。通用 CommonMark 渲染器
-// 会把 `<javascript:alert(1)>` 渲成 href=javascript: 的活链接，故这也是一个 URL 面
-// （PR#543 review：内联链接之外的 markdown 渲染面）。要求 `scheme:` 形以压低误报
-// （`<b>`、`<3` 等不含冒号者不匹配）。
-var autolinkRe = regexp.MustCompile(`<([a-zA-Z][a-zA-Z0-9+.\-]*:[^>\s]+)>`)
-
-// refDefRe 提取 CommonMark 链接引用定义 `[label]: destination` 的 destination
-// （配合 `[text][label]` 使用时渲成链接）。仅在 destination 带 scheme 时才交给
-// checkURL（见 markdownLinkTargets）——裸词/相对目标既非危险 scheme 载体，精确
-// 匹配引用定义又易误伤正文（如 "[Note]: do this"），故只挑真正会渲成危险链接的。
-var refDefRe = regexp.MustCompile(`(?m)^[ \t]{0,3}\[[^\]]+\]:[ \t]*<?([^>\s]+)>?`)
-
-func markdownLinkTargets(text string) []string {
+// 用真正的 CommonMark 解析器而非正则，是 Decision 3d/6「校验面必须 ≥ 渲染面」的
+// 结构性保证：正则无法覆盖 CommonMark 会渲染、而模式匹配漏抽的形态 —— 嵌套/转义
+// 方括号 label（`[a [b]](url)`、`[x\]](url)`）、转义 scheme 引用定义（`[l]:
+// javascript\:…` 配 `[x][l]`）等（PR#543 round-4：yujiawei/Jerry-Xin byte-verified
+// 两处正则绕过）。因 checkURL 是正向名单，任何非 http(s)（含反斜杠破坏 scheme 的
+// `javascript\:`）都会被拒，故此处**不预判 scheme**（预判正是旧 refDefRe 被绕过的
+// 根因），把全部提取目标交给 checkURL 判定。
+//
+// 只提取「真正成为链接」的目标:未被引用的孤立引用定义(如正文 `[Note]: do this`)
+// 不产出链接节点 → 不误伤(优于旧 refDefRe 的无差别行提取)。空 destination
+// (`[t]()`)跳过 —— 空 href 不承载任何 scheme,拒之只会误伤合法「同页/占位」链接。
+func markdownLinkTargets(s string) []string {
+	if s == "" {
+		return nil
+	}
+	src := []byte(s)
+	doc := markdownParser.Parse(text.NewReader(src))
 	var targets []string
-	for _, m := range markdownLinkRe.FindAllStringSubmatch(text, -1) {
-		targets = append(targets, m[1])
-	}
-	for _, m := range autolinkRe.FindAllStringSubmatch(text, -1) {
-		targets = append(targets, m[1])
-	}
-	// 引用定义：只提取带 scheme 的 destination（危险 scheme 正是本类攻击面），
-	// 避免把正文里形如 "[标签]: 普通文字" 的非链接行误当 URL 拒绝。
-	for _, m := range refDefRe.FindAllStringSubmatch(text, -1) {
-		dest := strings.TrimSpace(m[1])
-		if u, err := url.Parse(dest); err == nil && u.Scheme != "" {
+	add := func(dest string) {
+		if strings.TrimSpace(dest) != "" {
 			targets = append(targets, dest)
 		}
 	}
+	_ = ast.Walk(doc, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
+		if !entering {
+			return ast.WalkContinue, nil
+		}
+		switch v := n.(type) {
+		case *ast.Link:
+			add(string(v.Destination))
+		case *ast.Image:
+			add(string(v.Destination))
+		case *ast.AutoLink:
+			add(string(v.URL(src)))
+		}
+		return ast.WalkContinue, nil
+	})
 	return targets
 }

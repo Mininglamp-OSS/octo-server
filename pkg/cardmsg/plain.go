@@ -26,6 +26,22 @@ func Finalize(payload map[string]interface{}) error {
 		return ErrCardMissing
 	}
 	payload["plain"] = BuildPlain(card)
+	return RecheckPayloadSize(payload)
+}
+
+// RecheckPayloadSize 对「真实出站」payload 复检 512KiB 上限（Decision 3a），供
+// Finalize 之后**仍会改写 payload** 的 server 端场景使用 —— 典型是 mention.ais
+// 展开（mentionrewrite.ExpandAisToBotUIDs 把频道 bot 成员 UID 追加进 mention
+// 子表，size-increasing）。Finalize 的复检发生在那次改写之前，覆盖不到最终字节；
+// 调用方在最后一次 mutation 之后再调本函数，把校验钉在真正出站的 payload 上
+// （与 richtext 的 PR#232「在最后一次 mutation 后复检」不变量一致）。
+//
+// 序列化口径与出站一致：出站走 octo-lib util.ToJson（= json.Marshal），本函数
+// 同用 json.Marshal，故字节数逐字节相等。非 type=17 为 no-op。
+func RecheckPayloadSize(payload map[string]interface{}) error {
+	if !IsCardPayload(payload) {
+		return nil
+	}
 	out, err := json.Marshal(payload)
 	if err != nil {
 		return err

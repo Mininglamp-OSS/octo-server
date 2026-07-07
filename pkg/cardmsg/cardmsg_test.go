@@ -257,6 +257,86 @@ func TestValidateURLAllowlistFullSurface(t *testing.T) {
 	}
 }
 
+// 验收(PR#543 round-4 review P1):markdown URL 提取必须 = CommonMark 渲染面。
+// 旧正则提取器漏抽两类 CommonMark 会渲成活链接的形态,危险 scheme 因此绕过正向
+// allowlist。改用 goldmark 后必须全部被拒;合法链接不误伤。
+func TestValidateMarkdownRenderSurfaceParity(t *testing.T) {
+	// —— 危险:必须被拒(此前正则绕过) ——
+	danger := []string{
+		// 嵌套/转义方括号 label:markdownLinkRe 的 [^\]]* 抽不到,goldmark 能。
+		"click [a [b]](javascript:alert(1))",
+		`click [x\]](javascript:alert(1))`,
+		// 转义 scheme 引用定义 + 引用:refDefRe 的 scheme 预判被 `\:` 破坏而漏检;
+		// goldmark 解析出链接节点,destination 非 http(s) → allowlist 拒。
+		"tap [go][l]\n\n[l]: javascript\\:alert(1)",
+		// markdown 图片 destination 也是渲染面。
+		"![x](vbscript:x)",
+	}
+	for _, txt := range danger {
+		c := cardWithBody(map[string]interface{}{"type": "TextBlock", "text": txt})
+		if err := Validate(envelope(c)); !errors.Is(err, ErrCardBadURLScheme) {
+			t.Errorf("危险 markdown 链接面应被拒 %q, err=%v", txt, err)
+		}
+	}
+	// FactSet 承载同款嵌套 label 危险链接(与 TextBlock 对等)。
+	fs := cardWithBody(map[string]interface{}{
+		"type": "FactSet",
+		"facts": []interface{}{
+			map[string]interface{}{"title": "t", "value": "[a [b]](javascript:alert(1))"},
+		},
+	})
+	if err := Validate(envelope(fs)); !errors.Is(err, ErrCardBadURLScheme) {
+		t.Errorf("FactSet 嵌套 label 危险链接应被拒, err=%v", err)
+	}
+
+	// —— 合法/不误伤:必须放行 ——
+	ok := []string{
+		"see [a [b]](https://example.com)",          // 嵌套 label + https
+		"ref [go][l]\n\n[l]: https://example.com/x", // 引用式 + https
+		"docs <https://example.com>",                // autolink https
+		"[Note]: do this, then that",                // 孤立引用定义(未被引用)不产链接
+		"plain text with a colon: value here",       // 冒号不构成链接
+		"placeholder [t]() link",                    // 空 href 不承载 scheme,不误拒
+	}
+	for _, txt := range ok {
+		c := cardWithBody(map[string]interface{}{"type": "TextBlock", "text": txt})
+		if err := Validate(envelope(c)); err != nil {
+			t.Errorf("合法/非链接 markdown 不应被拒 %q: %v", txt, err)
+		}
+	}
+	// mailto/email 面与正向 allowlist 一致:只放行 http(s),故内联 mailto 与 email
+	// autolink 都应被拒(与 Image.url 的 no-scheme 拒绝同口径)。
+	for _, txt := range []string{
+		"mail [x](mailto:a@b.com)",
+		"contact <a@b.com> please",
+	} {
+		c := cardWithBody(map[string]interface{}{"type": "TextBlock", "text": txt})
+		if err := Validate(envelope(c)); !errors.Is(err, ErrCardBadURLScheme) {
+			t.Errorf("非 http(s) 链接面应被 allowlist 拒 %q, err=%v", txt, err)
+		}
+	}
+}
+
+// 验收(PR#543 round-4 review P1):出站 payload 在 Finalize 之后仍会被 mention.ais
+// 展开等 mutation 增大;RecheckPayloadSize 必须能在最后一次 mutation 后拦下超限,
+// 且序列化口径与 util.ToJson(=json.Marshal) 一致。
+func TestRecheckPayloadSize(t *testing.T) {
+	// 非卡片 no-op
+	if err := RecheckPayloadSize(map[string]interface{}{"type": float64(1), "content": "hi"}); err != nil {
+		t.Errorf("非卡片应 no-op: %v", err)
+	}
+	// 卡片正常大小放行
+	env := envelope(nil)
+	if err := RecheckPayloadSize(env); err != nil {
+		t.Errorf("正常卡片应放行: %v", err)
+	}
+	// 模拟展开后追加的 mention 子表把出站 payload 撑过上限 → 必须拦下
+	env["mention"] = map[string]interface{}{"uids": strings.Repeat("u", MaxPayloadBytes)}
+	if err := RecheckPayloadSize(env); !errors.Is(err, ErrCardPayloadTooLarge) {
+		t.Errorf("出站超限应被 RecheckPayloadSize 拦下, err=%v", err)
+	}
+}
+
 func TestValidateProfileNegotiation(t *testing.T) {
 	// P1 接受集 = {octo/v1}(Decision 10 分期):octo/v2 与任何未知 profile
 	// 同样是 400 —— P2 sibling 实现 PR 把 octo/v2 加入接受集。

@@ -658,6 +658,17 @@ func (rb *Robot) sendMessage(c *wkhttp.Context) {
 	wirePayload := mentionrewrite.CloneForExpansion(payload)
 	wirePayload = mentionrewrite.ExpandAisToBotUIDs(wirePayload, messageReq.ChannelType, messageReq.ChannelID, rb.fetchBotMemberUIDs)
 
+	// card-message-protocol P1 Decision 3a：ExpandAisToBotUIDs 是 Finalize 之后
+	// 唯一会增大 payload 的 mutation（追加频道 bot 成员 UID 到 mention 子表）。
+	// Finalize 的 512KiB 复检发生在展开之前，覆盖不到真实出站字节，故对最终
+	// wirePayload 再复检一次（PR#543 review：与 bot_api 出站口径对称、与 richtext
+	// PR#232「最后一次 mutation 后复检」不变量对齐）。非 type=17 为 no-op。
+	if err := cardmsg.RecheckPayloadSize(wirePayload); err != nil {
+		rb.Error("InteractiveCard 出站 payload 超限", zap.Error(err), zap.String("robotID", robotID), zap.String("channelID", messageReq.ChannelID))
+		respondRobotContentInvalid(c, "payload")
+		return
+	}
+
 	result, err := rb.ctx.SendMessageWithResult(&config.MsgSendReq{
 		StreamNo:    messageReq.StreamNo,
 		ChannelID:   messageReq.ChannelID,

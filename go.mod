@@ -48,6 +48,7 @@ require (
 	github.com/stretchr/testify v1.8.3
 	github.com/tencentyun/qcloud-cos-sts-sdk v0.0.0-20251226100129-1701383cae15
 	github.com/tidwall/gjson v1.15.0
+	github.com/yuin/goldmark v1.4.13
 	go.uber.org/zap v1.24.0
 	golang.org/x/crypto v0.36.0
 	golang.org/x/image v0.5.0

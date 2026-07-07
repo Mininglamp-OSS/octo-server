@@ -50,8 +50,9 @@
 - **URL 正向 allowlist**：仅绝对 `http`/`https`。作用于**全部会被渲染的 URL 面**：
   `Image.url`、`Action.OpenUrl.url`、`selectAction`、`AdaptiveCard`/`Container`/
   `Column`/`ColumnSet` 的 `backgroundImage`（字符串或 `{url:…}` 对象形）、
-  `Action.OpenUrl.iconUrl`、以及 markdown 链接目标（含内联 `[t](url)`、autolink
-  `<scheme:…>`、引用式定义 `[r]: url`）。`data:` / `javascript:` / `intent:` /
+  `Action.OpenUrl.iconUrl`、以及 markdown 链接/图片目标（内联 `[t](url)`、引用式
+  `[t][l]`+`[l]: url`、图片 `![alt](url)`、autolink `<scheme:…>`，经完整 CommonMark
+  解析提取，详见 §2.1）。`data:` / `javascript:` / `intent:` /
   相对路径等一律拒绝。**app 深链（`octo://` 等）在 P1 被有意排除**——首方 scheme
   名单是 P3 议题。
 - 服务端**不解引用**任何卡内 URL（无图片代理/unfurl/预取）——引入前必须先过
@@ -60,9 +61,12 @@
 ### 2.1 TextBlock markdown 子集
 
 粗体 `**`、斜体 `*`、列表、链接 `[text](url)`。链接目标走 §2 的同一 URL
-allowlist —— 内联链接、autolink（`<scheme:…>`）、引用式定义（`[ref]: url`）三种
-渲染形式均校验，与通用 CommonMark 渲染面对齐。plain 派生时剥离语法字符（链接降为
-链接文本）。
+allowlist —— 服务端用**完整 CommonMark 解析器**（非模式匹配）提取一段文本里所有会
+被渲染成活链接的目标：内联链接 `[t](url)`、引用式链接 `[t][l]`+`[l]: url`、图片
+`![alt](url)`、autolink `<scheme:…>`，包括嵌套/转义方括号 label（`[a [b]](url)`、
+`[x\]](url)`）与转义 scheme 引用定义等边角形式，确保**校验面 ≥ 渲染面**。任何非
+`http(s)` 目标（含反斜杠破坏 scheme 的 `javascript\:…`）一律拒绝。plain 派生时剥离
+语法字符（链接降为链接文本）。
 
 ## 3. profile 协商与降级链
 
