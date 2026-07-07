@@ -807,6 +807,16 @@ func (m *Message) messageEdit(c *wkhttp.Context) {
 		return
 	}
 
+	// card-message-protocol P1 Decision 7：卡片不可变 —— 先于属主校验 / IM 查询
+	// 拦截 type-17 编辑体（Normalize 以 IsRichTextPayload 为门，卡片编辑体会「原样、
+	// 零校验」通过，使编辑通道成为绕过 cardmsg.Validate 的未守卫 ingress，PR#525
+	// round-2 finding #1）。用户编辑路径对卡片永久关闭（用户不拥有 bot 卡片，且拒卡
+	// 是与消息归属无关的绝对策略，故不触库、置于 IM 查询前，PR#543 review）。
+	if cardmsg.IsCardContentEdit(req.ContentEdit) {
+		httperr.ResponseErrorL(c, errcode.ErrMessageCardEditForbidden, nil, nil)
+		return
+	}
+
 	// 权限检查：只允许编辑自己发送的消息
 	loginUID := c.GetLoginUID()
 	messageSeqs := []uint32{req.MessageSeq}
@@ -866,15 +876,6 @@ func (m *Message) messageEdit(c *wkhttp.Context) {
 	// 编辑语义为整体替换 content blocks；canonical JSON 落库后即下游 summary /
 	// search / 复制 的权威来源。非 14 / 非 JSON 体为 no-op，老编辑路径不变。脏/超限
 	// payload 在落库前以 400 拒绝。MD5 去重 hash 落在 normalize 后的 canonical 体上。
-	// card-message-protocol P1 Decision 7：卡片不可变 —— 先于
-	// richtext.NormalizeContentEdit 拦截 type-17 编辑体。Normalize 以
-	// IsRichTextPayload 为门，卡片编辑体会「原样、零校验」通过，使编辑通道
-	// 成为绕过 cardmsg.Validate 的未守卫 ingress（PR#525 round-2 finding #1）。
-	// 用户编辑路径对卡片永久关闭（用户不拥有 bot 卡片）。
-	if cardmsg.IsCardContentEdit(req.ContentEdit) {
-		httperr.ResponseErrorL(c, errcode.ErrMessageCardEditForbidden, nil, nil)
-		return
-	}
 	normalizedEdit, err := richtext.NormalizeContentEdit(req.ContentEdit)
 	if err != nil {
 		m.Error("RichText content_edit 校验失败", zap.Error(err), zap.String("channelID", req.ChannelID), zap.String("messageID", req.MessageID))

@@ -3,17 +3,16 @@ package message
 // card-message-protocol P1 集成测试（用户 ingress / 编辑路径 / 置顶文案）。
 // spec: .octospec/tasks/card-message-protocol/brief.md；执行 brief:
 // .octospec/tasks/card-message-p1-display/brief.md。
-// 编辑路径用例需要 WuKongIM(:5001)——messageEdit 的属主校验先经
-// IMGetWithChannelAndSeqs 查真实消息；缺席时 t.Skip 不破坏无 IM 环境。
+// 用户 send / edit 拒卡门均置于频道/好友/属主等 DB·IM 前置检查之前（拒卡是与
+// 收件人/归属无关的绝对策略），故本文件用例不触 IM/DB，也不经 testutil.NewTestServer
+// —— 避免受 modules/message 包在 -shuffle 下的迁移账本脆弱性（issue #17）牵连。
 
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -98,80 +97,31 @@ func TestUserCardSendRejected(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "Card messages can only be sent by bots or webhooks.")
 }
 
-// skipWithoutIM 探测 WuKongIM(:5001)健康端点,不可达则跳过。
-func skipWithoutIM(t *testing.T) {
-	t.Helper()
-	resp, err := http.Get("http://127.0.0.1:5001/health")
-	if err != nil || resp.StatusCode != http.StatusOK {
-		t.Skip("WuKongIM 未运行(需 :5001,见 CI 环境脚本),跳过 IM 集成用例")
-	}
-	_ = resp.Body.Close()
-}
-
-// waitIMMessageSeq 轮询 IMSearchMessages 直到消息完成异步持久化拿到 seq
-// （官方 WuKongIM v2 的 send 响应只带 message_id,seq 由异步持久化后置分配）。
-func waitIMMessageSeq(t *testing.T, ctx *config.Context, channelID string, channelType uint8, loginUID string, messageID int64) uint32 {
-	t.Helper()
-	for i := 0; i < 20; i++ {
-		resp, err := ctx.IMSearchMessages(&config.MsgSearchReq{
-			ChannelID:   channelID,
-			ChannelType: channelType,
-			MessageIds:  []int64{messageID},
-			LoginUID:    loginUID,
-		})
-		if err == nil && resp != nil && len(resp.Messages) > 0 && resp.Messages[0].MessageSeq > 0 {
-			return resp.Messages[0].MessageSeq
-		}
-		time.Sleep(300 * time.Millisecond)
-	}
-	t.Fatalf("消息 %d 在 IM 中未完成持久化(拿不到 message_seq)", messageID)
-	return 0
-}
-
-// TestUserCardEditRejectedIM:P1 Decision 7 —— 用户编辑路径对 type-17
-// content_edit 一律拒绝(该路径对卡片永久关闭)。经真实 IM 链路:
-// SendMessageWithResult 发真消息 → messageEdit 经 IM 属主校验 → 卡片门禁 400;
-// 对照组:同一条消息的普通文本编辑放行(证明 IM 链路通、拒绝确因卡片门禁)。
-func TestUserCardEditRejectedIM(t *testing.T) {
-	skipWithoutIM(t)
-	s, ctx := testutil.NewTestServer()
-	defer func() { _ = testutil.CleanAllTables(ctx) }()
+// TestUserCardEditRejected: P1 Decision 7 —— 用户编辑路径对 type-17 content_edit
+// 一律拒绝(该路径对卡片永久关闭,与 rollout flag 无关)。拒卡门现置于 IM 属主校验
+// 之前(api.go messageEdit),是与消息归属无关的绝对策略,故本测试不触 IM/DB:
+// bare newTestServer + New(ctx)+Route,POST 卡片 content_edit → 400 CardEditForbidden。
+// 不经 testutil.NewTestServer,从而不受 modules/message 包在 -shuffle 下的迁移账本
+// 脆弱性(issue #17)牵连(PR#543 review:原 IM 版在 CI 坏 seed 下 panic 于
+// group_member 重复建表)。
+func TestUserCardEditRejected(t *testing.T) {
+	s, ctx := newTestServer()
+	m := New(ctx)
+	m.Route(s.GetRoute())
 	resetCardUIDRateLimit(t, ctx)
 
-	sendResp, err := ctx.SendMessageWithResult(&config.MsgSendReq{
-		Header:      config.MsgHeader{RedDot: 1},
-		ChannelID:   cardTestHumanUID,
-		ChannelType: common.ChannelTypePerson.Uint8(),
-		FromUID:     testutil.UID,
-		Payload:     []byte(`{"type":1,"content":"hello card edit"}`),
-	})
-	assert.NoError(t, err)
-	assert.NotNil(t, sendResp)
-	assert.NotZero(t, sendResp.MessageID)
-	seq := waitIMMessageSeq(t, ctx, cardTestHumanUID, common.ChannelTypePerson.Uint8(), testutil.UID, sendResp.MessageID)
-
-	edit := func(contentEdit string) *httptest.ResponseRecorder {
-		w := httptest.NewRecorder()
-		req, _ := http.NewRequest("POST", "/v1/message/edit", bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
-			"message_id":   fmt.Sprintf("%d", sendResp.MessageID),
-			"message_seq":  seq,
-			"channel_id":   cardTestHumanUID,
-			"channel_type": common.ChannelTypePerson.Uint8(),
-			"content_edit": contentEdit,
-		}))))
-		req.Header.Set("token", testutil.Token)
-		s.GetRoute().ServeHTTP(w, req)
-		return w
-	}
-
-	// 卡片编辑体 → Decision 7 拒绝
-	w := edit(string(cardEnvelopeJSON(t)))
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/message/edit", bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
+		"message_id":   "1",
+		"message_seq":  1,
+		"channel_id":   cardTestHumanUID,
+		"channel_type": common.ChannelTypePerson.Uint8(),
+		"content_edit": string(cardEnvelopeJSON(t)),
+	}))))
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
 	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
 	assert.Contains(t, w.Body.String(), "Card messages cannot be edited.")
-
-	// 对照:普通文本编辑放行(IM 属主校验链路真实走通)
-	w2 := edit("hello card edit (v2)")
-	assert.Equal(t, http.StatusOK, w2.Code, w2.Body.String())
 }
 
 // 验收(finding #3):置顶等「按内容类型描述消息」文案面经本地 helper,
