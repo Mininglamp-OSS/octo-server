@@ -786,3 +786,170 @@ func (s *SystemSettings) StickerHandleRequired() bool {
 func (s *SystemSettings) DocsEnabled() bool {
 	return s.getBool("docs", "enabled", false)
 }
+
+// ---------------------------------------------------------------------------
+// Custom-sticker upload constraints + optional server-side compression
+// (sticker-upload-compression task).
+//
+// These formerly-hard-coded numbers (modules/file/const.go: StickerMaxFileSize
+// = 1MB, StickerMaxDimension = 512, stickerUploadExts) become operator-tunable
+// through system_setting so a bad configuration can be greyed out / rolled back
+// without a redeploy. Every int key has a server-side HARD CAP that read-side
+// clamp getters enforce even against a direct DB edit — the admin write path
+// already rejects non-positive ints via Positive:true; these clamps are defence
+// in depth against the "someone edits the row by hand" case.
+//
+// stickerUploadRasterAllowlist mirrors modules/file/const.go:stickerUploadExts
+// verbatim. Duplicated intentionally to keep modules/common a leaf (modules/file
+// already imports modules/common; reversing would cycle). Keep in sync — the
+// upload_allowed_formats getter uses this list as the outer bound the config
+// may only narrow from.
+// ---------------------------------------------------------------------------
+
+const (
+	defaultStickerUploadMaxSizeKB   = 1024
+	stickerUploadMaxSizeKBHardCap   = 5 * 1024
+
+	defaultStickerUploadMaxDimension = 512
+	stickerUploadMaxDimensionHardCap = 1024
+
+	defaultStickerCompressEnabled = false
+
+	defaultStickerCompressTargetKB = 1024
+	stickerCompressTargetKBHardCap = 5 * 1024
+
+	defaultStickerCompressMaxConcurrency = 4
+	stickerCompressMaxConcurrencyHardCap = 32
+
+	defaultStickerCompressTimeoutMs = 2000
+	stickerCompressTimeoutMsHardCap = 10000
+)
+
+// stickerUploadRasterAllowlist 与 modules/file/const.go:stickerUploadExts 保持一致。
+// 用于 upload_allowed_formats 配置的读侧交集：管理台只能收窄，不能加入非位图。
+// 若 modules/file 侧改动允许扩展名，此列表也需同步。
+var stickerUploadRasterAllowlist = []string{".gif", ".png", ".jpg", ".jpeg", ".webp"}
+
+// stickerClampIntUpper clamps an int getter to [1, hardCap]. Any value ≤0 or
+// non-numeric (which surface as fallback default from getInt) is served as
+// default; values above hardCap are clamped to hardCap; everything else is
+// returned verbatim. Shared by every KB/px/ms/count sticker upload setting so
+// the clamp policy is single-sourced.
+func stickerClampIntUpper(v, fallback, hardCap int) int {
+	if v <= 0 {
+		return fallback
+	}
+	if v > hardCap {
+		return hardCap
+	}
+	return v
+}
+
+// StickerUploadMaxSizeKB returns the per-file upload cap in KB. Read-side
+// clamped to [1, stickerUploadMaxSizeKBHardCap]; out-of-range falls back to
+// the historical 1024 KB default.
+func (s *SystemSettings) StickerUploadMaxSizeKB() int {
+	return stickerClampIntUpper(
+		s.getInt("sticker", "upload_max_size_kb", defaultStickerUploadMaxSizeKB),
+		defaultStickerUploadMaxSizeKB,
+		stickerUploadMaxSizeKBHardCap,
+	)
+}
+
+// StickerUploadMaxDimension returns the decoded-pixel single-edge cap. Read-side
+// clamped to [1, stickerUploadMaxDimensionHardCap]; out-of-range falls back to
+// the historical 512-px default.
+func (s *SystemSettings) StickerUploadMaxDimension() int {
+	return stickerClampIntUpper(
+		s.getInt("sticker", "upload_max_dimension", defaultStickerUploadMaxDimension),
+		defaultStickerUploadMaxDimension,
+		stickerUploadMaxDimensionHardCap,
+	)
+}
+
+// StickerUploadAllowedFormats returns the sanitized set of allowed extensions
+// (each including the leading dot, lowercased). It is intersected with the
+// built-in raster allowlist (stickerUploadRasterAllowlist) so a mis-config can
+// only narrow — never widen to non-raster (mp4/pdf/svg/...). If the config
+// exists but the intersection is empty (all tokens illegal), the FULL default
+// set is returned instead of an empty slice so a bad config cannot "dark-close"
+// the feature; deployments narrow explicitly by writing a valid CSV.
+//
+// Order of returned slice is deterministic for stability of callers that log
+// or index it; tests sort before comparing regardless.
+func (s *SystemSettings) StickerUploadAllowedFormats() []string {
+	raw, ok := s.lookup("sticker", "upload_allowed_formats")
+	if !ok {
+		out := make([]string, len(stickerUploadRasterAllowlist))
+		copy(out, stickerUploadRasterAllowlist)
+		return out
+	}
+	allowlist := make(map[string]struct{}, len(stickerUploadRasterAllowlist))
+	for _, e := range stickerUploadRasterAllowlist {
+		allowlist[e] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(stickerUploadRasterAllowlist))
+	out := make([]string, 0, len(stickerUploadRasterAllowlist))
+	for _, tok := range strings.Split(raw, ",") {
+		tok = strings.ToLower(strings.TrimSpace(tok))
+		if tok == "" {
+			continue
+		}
+		if !strings.HasPrefix(tok, ".") {
+			tok = "." + tok
+		}
+		if _, ok := allowlist[tok]; !ok {
+			continue
+		}
+		if _, dup := seen[tok]; dup {
+			continue
+		}
+		seen[tok] = struct{}{}
+		out = append(out, tok)
+	}
+	if len(out) == 0 {
+		out = make([]string, len(stickerUploadRasterAllowlist))
+		copy(out, stickerUploadRasterAllowlist)
+	}
+	return out
+}
+
+// StickerCompressEnabled reports whether server-side compression of static
+// sticker images (jpg/png) is turned on. Default false — the feature is
+// opt-in, greyed out until an operator flips this bit.
+func (s *SystemSettings) StickerCompressEnabled() bool {
+	return s.getBool("sticker", "compress_enabled", defaultStickerCompressEnabled)
+}
+
+// StickerCompressTargetKB returns the post-compression target size in KB.
+// Read-side clamped to [1, stickerCompressTargetKBHardCap]; out-of-range falls
+// back to the 1024 KB default.
+func (s *SystemSettings) StickerCompressTargetKB() int {
+	return stickerClampIntUpper(
+		s.getInt("sticker", "compress_target_kb", defaultStickerCompressTargetKB),
+		defaultStickerCompressTargetKB,
+		stickerCompressTargetKBHardCap,
+	)
+}
+
+// StickerCompressMaxConcurrency returns the process-wide cap on concurrent
+// sticker compressions. Read-side clamped to [1, stickerCompressMaxConcurrencyHardCap];
+// out-of-range falls back to 4.
+func (s *SystemSettings) StickerCompressMaxConcurrency() int {
+	return stickerClampIntUpper(
+		s.getInt("sticker", "compress_max_concurrency", defaultStickerCompressMaxConcurrency),
+		defaultStickerCompressMaxConcurrency,
+		stickerCompressMaxConcurrencyHardCap,
+	)
+}
+
+// StickerCompressTimeoutMs returns the per-compression timeout in milliseconds.
+// Read-side clamped to [1, stickerCompressTimeoutMsHardCap]; out-of-range falls
+// back to 2000ms.
+func (s *SystemSettings) StickerCompressTimeoutMs() int {
+	return stickerClampIntUpper(
+		s.getInt("sticker", "compress_timeout_ms", defaultStickerCompressTimeoutMs),
+		defaultStickerCompressTimeoutMs,
+		stickerCompressTimeoutMsHardCap,
+	)
+}

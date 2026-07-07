@@ -1,6 +1,7 @@
 package file
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha512"
 	"encoding/base64"
@@ -26,6 +27,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	"github.com/Mininglamp-OSS/octo-server/pkg/stickersig"
@@ -48,14 +50,24 @@ type File struct {
 	ctx *config.Context
 	log.Log
 	service IService
+	// settings 承载 sticker 上传限制与压缩开关的 SystemSettings 快照读；类型是
+	// stickerSystemSettings 接口而非 *common.SystemSettings，方便单测注入内存 fake。
+	// 历史 unit test 直接 &File{} 构造未挂 settings；stickerLimits() 会 nil-safe
+	// 回落到硬编码默认值。生产路径经 New(ctx) 挂载 *common.SystemSettings。
+	settings stickerSystemSettings
+	// compressor 服务端贴纸压缩器。同 settings, nil 视为 disabled(unit test 场景)。
+	compressor *stickerCompressor
 }
 
 // New New
 func New(ctx *config.Context) *File {
+	settings := common.EnsureSystemSettings(ctx)
 	return &File{
-		ctx:     ctx,
-		Log:     log.NewTLog("File"),
-		service: NewService(ctx),
+		ctx:        ctx,
+		Log:        log.NewTLog("File"),
+		service:    NewService(ctx),
+		settings:   settings,
+		compressor: newStickerCompressor(settings),
 	}
 }
 
@@ -196,6 +208,9 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 	if signature != "" {
 		signatureInt, _ = strconv.ParseInt(signature, 10, 64)
 	}
+	// sticker-upload-compression: 一次请求锁定一份限制快照，后续所有校验、压缩、
+	// 响应都基于同一份值。SystemSettings 60s reload 后新一批请求才用新值。
+	stickerLimits := f.stickerLimits()
 	contentType := c.DefaultPostForm("contenttype", "application/octet-stream")
 	err := f.checkReq(typedFile, uploadPath)
 	if err != nil {
@@ -265,17 +280,17 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 		c.ResponseError(fmt.Errorf("文件大小不能超过%dMB", MaxFileSize/1024/1024))
 		return
 	}
-	// 自定义贴纸单独收紧上限（StickerMaxFileSize），贴纸是高频内联渲染的小图，
-	// 不应允许到通用 MaxFileSize。错误用 c.ResponseError 以与本（未迁移 i18n 的）
-	// file 模块其余响应保持一致。
-	if isStickerUpload && fileHeader.Size > StickerMaxFileSize {
+	// 自定义贴纸单独收紧上限（可运营配置的 sticker.upload_max_size_kb，默认 1024
+	// 硬上限 5120），贴纸是高频内联渲染的小图，不应允许到通用 MaxFileSize。错误用
+	// c.ResponseError 以与本（未迁移 i18n 的）file 模块其余响应保持一致。
+	if isStickerUpload && fileHeader.Size > stickerLimits.maxSize {
 		observeStickerUpload("size_rejected")
 		f.Warn("贴纸文件超出大小限制",
 			zap.String("uid", loginUID),
 			zap.Int64("size", fileHeader.Size),
-			zap.Int64("max", StickerMaxFileSize),
+			zap.Int64("max", stickerLimits.maxSize),
 			zap.Bool("handle_required", stickersig.Enabled()))
-		c.ResponseError(fmt.Errorf("贴纸大小不能超过%dMB", StickerMaxFileSize/1024/1024))
+		c.ResponseError(fmt.Errorf("贴纸大小不能超过%dKB", stickerLimits.maxSize/1024))
 		return
 	}
 
@@ -306,9 +321,11 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 		c.ResponseError(fmt.Errorf("不支持上传%s类型的文件", ext))
 		return
 	}
-	// 贴纸只接受位图格式（stickerUploadExts：gif/png/jpg/jpeg/webp）。全局
-	// allowlist 还允许 pdf/zip/mp4 等，不收紧会让非图对象落入 sticker 桶。
-	if isStickerUpload && !stickerUploadExts[ext] {
+	// 贴纸只接受配置允许的位图格式（stickerLimits.allowedFormats，默认为
+	// gif/png/jpg/jpeg/webp；运营可通过 sticker.upload_allowed_formats 收窄，但
+	// 读侧交集保证不会放开非位图）。全局 allowlist 还允许 pdf/zip/mp4 等，
+	// 不收紧会让非图对象落入 sticker 桶。
+	if isStickerUpload && !stickerLimits.allowedFormats[ext] {
 		observeStickerUpload("format_rejected")
 		f.Warn("贴纸不支持的格式",
 			zap.String("uid", loginUID),
@@ -316,7 +333,7 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 			zap.String("ext", ext),
 			zap.Int64("size", fileHeader.Size),
 			zap.Bool("handle_required", stickersig.Enabled()))
-		c.ResponseError(fmt.Errorf("贴纸仅支持 gif/png/jpg/jpeg/webp，不支持%s", ext))
+		c.ResponseError(fmt.Errorf("贴纸格式不允许：%s", ext))
 		return
 	}
 
@@ -389,11 +406,11 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 		return
 	}
 
-	// 自定义贴纸：限制解码后的像素尺寸。StickerMaxFileSize(1MB) 只约束压缩后的
-	// 字节数，不约束解码维度——一张高压缩比的小文件可解出极大位图把内联渲染端
-	// 撑爆内存，而贴纸会发送给会话对方，等同跨用户 DoS。用 image.DecodeConfig 只读
-	// 图像头拿 W×H（不解整图），任一边超过 StickerMaxDimension(512) 即拒。此时 ext
-	// 已限定在 gif/png/jpg/jpeg/webp，对应解码器均已注册。
+	// 自定义贴纸：限制解码后的像素尺寸。stickerLimits.maxSize（配置的字节数上限）
+	// 只约束压缩后的字节数，不约束解码维度——一张高压缩比的小文件可解出极大位图把
+	// 内联渲染端撑爆内存，而贴纸会发送给会话对方，等同跨用户 DoS。用 image.DecodeConfig
+	// 只读图像头拿 W×H（不解整图），任一边超过 stickerLimits.maxDim 即拒。此时 ext
+	// 已限定在配置允许的位图集合，对应解码器均已注册。
 	if isStickerUpload {
 		cfg, _, decErr := image.DecodeConfig(file)
 		if decErr != nil {
@@ -406,7 +423,7 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 			c.ResponseError(errors.New("无法解析贴纸图像，可能已损坏或格式不受支持"))
 			return
 		}
-		if cfg.Width > StickerMaxDimension || cfg.Height > StickerMaxDimension {
+		if cfg.Width > stickerLimits.maxDim || cfg.Height > stickerLimits.maxDim {
 			observeStickerUpload("dimension_rejected")
 			f.Warn("贴纸尺寸超出限制",
 				zap.String("uid", loginUID),
@@ -414,8 +431,8 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 				zap.Int64("size", fileHeader.Size),
 				zap.Int("width", cfg.Width),
 				zap.Int("height", cfg.Height),
-				zap.Int("max", StickerMaxDimension))
-			c.ResponseError(fmt.Errorf("贴纸尺寸不能超过 %d×%d 像素", StickerMaxDimension, StickerMaxDimension))
+				zap.Int("max", stickerLimits.maxDim))
+			c.ResponseError(fmt.Errorf("贴纸尺寸不能超过 %d×%d 像素", stickerLimits.maxDim, stickerLimits.maxDim))
 			return
 		}
 		// DecodeConfig 读掉了图像头，复位指针供后续签名/上传读取完整内容。
@@ -445,10 +462,80 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 			path = path + ext
 		}
 	}
+
+	// sticker-upload-compression: 压缩管线，仅当 isStickerUpload && compress_enabled
+	// 才启动，其他类型/格式走原路径（uploadReader==file, finalSize==fileHeader.Size）。
+	// 方案 C: 只压静态 jpg/png；gif/webp 只记 compress_skipped 不改字节。
+	// handle 基于最终 fullURL；本期 path/ext 不因压缩改变，fullURL 与压前一致，
+	// 故 stickersig.Sign 天然基于压缩后的字节（同一 URL 对应最终存储对象）。
+	var uploadReader io.ReadSeeker = file
+	finalSize := fileHeader.Size
+	if isStickerUpload && stickerLimits.compressEnabled {
+		if canCompressStickerExt(ext) {
+			srcBytes, readErr := io.ReadAll(file)
+			if readErr != nil {
+				observeStickerUpload("read_failed")
+				f.Error("读取贴纸文件失败", zap.Error(readErr))
+				c.ResponseError(errors.New("读取文件失败"))
+				return
+			}
+			result := f.compressor.Compress(ext, srcBytes)
+			switch result.Outcome {
+			case stickerCompressOutcomeCompressed:
+				observeStickerUpload("compress_success")
+				uploadReader = bytes.NewReader(result.Bytes)
+				finalSize = result.Size
+				f.Info("贴纸压缩成功",
+					zap.String("uid", loginUID),
+					zap.String("ext", ext),
+					zap.Int64("orig_size", fileHeader.Size),
+					zap.Int64("final_size", result.Size))
+			case stickerCompressOutcomeOverLimit:
+				observeStickerUpload("compress_over_limit")
+				targetKB := f.settings.StickerCompressTargetKB()
+				f.Warn("贴纸压缩后仍超目标大小，拒绝上传",
+					zap.String("uid", loginUID),
+					zap.String("ext", ext),
+					zap.Int64("orig_size", fileHeader.Size),
+					zap.Int64("compressed_size", result.Size),
+					zap.Int("target_kb", targetKB))
+				c.ResponseError(fmt.Errorf("贴纸压缩后仍超过 %dKB", targetKB))
+				return
+			case stickerCompressOutcomeFailed:
+				observeStickerUpload("compress_failed")
+				f.Warn("贴纸压缩失败，fail-open 走原字节",
+					zap.String("uid", loginUID),
+					zap.String("ext", ext),
+					zap.String("reason", result.Reason))
+				uploadReader = bytes.NewReader(srcBytes)
+				finalSize = int64(len(srcBytes))
+			default: // stickerCompressOutcomeSkipped
+				observeStickerUpload("compress_skipped")
+				f.Info("贴纸压缩跳过",
+					zap.String("uid", loginUID),
+					zap.String("ext", ext),
+					zap.String("reason", result.Reason))
+				uploadReader = bytes.NewReader(srcBytes)
+				finalSize = int64(len(srcBytes))
+			}
+		} else {
+			// gif/webp 等本期不可压格式：只观测 skip，字节流不变，走 file 直上传路径。
+			observeStickerUpload("compress_skipped")
+		}
+	}
+
 	var sign []byte
 	if signatureInt == 1 {
+		if _, err := uploadReader.Seek(0, io.SeekStart); err != nil {
+			if isStickerUpload {
+				observeStickerUpload("read_failed")
+			}
+			f.Error("签名前重置文件指针失败", zap.Error(err))
+			c.ResponseError(errors.New("签名复制文件错误"))
+			return
+		}
 		h := sha512.New()
-		_, err := io.Copy(h, file)
+		_, err := io.Copy(h, uploadReader)
 		if err != nil {
 			if isStickerUpload {
 				observeStickerUpload("read_failed")
@@ -461,12 +548,12 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 	}
 	contentDisposition := BuildContentDisposition(fileName)
 	_, err = f.service.UploadFile(fmt.Sprintf("%s%s", fileType, path), contentType, contentDisposition, func(w io.Writer) error {
-		_, err := file.Seek(0, io.SeekStart)
+		_, err := uploadReader.Seek(0, io.SeekStart)
 		if err != nil {
 			f.Error("设置文件偏移量错误", zap.Error(err))
 			return err
 		}
-		_, err = io.Copy(w, file)
+		_, err = io.Copy(w, uploadReader)
 		return err
 	})
 	if err != nil {
@@ -487,7 +574,7 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 	resp := map[string]interface{}{
 		"path": fullURL,
 		"name": fileName,
-		"size": fileHeader.Size,
+		"size": finalSize,
 		"ext":  ext,
 	}
 	if signatureInt == 1 {
@@ -511,7 +598,8 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 		f.Info("贴纸上传成功",
 			zap.String("uid", loginUID),
 			zap.String("format", strings.TrimPrefix(ext, ".")),
-			zap.Int64("size", fileHeader.Size),
+			zap.Int64("orig_size", fileHeader.Size),
+			zap.Int64("final_size", finalSize),
 			zap.Bool("handle_required", stickersig.Enabled()))
 	}
 	c.Response(resp)

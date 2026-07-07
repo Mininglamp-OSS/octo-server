@@ -1,6 +1,9 @@
 package common
 
-import "strconv"
+import (
+	"strconv"
+	"strings"
+)
 
 // Value types accepted by system_setting.value_type.
 const (
@@ -152,6 +155,34 @@ var systemSettingSchema = []settingDef{
 	// 不承担任何服务端鉴权。经 GET /v1/common/appconfig 的 docs_on 下发给客户端。
 	{Category: "docs", Key: "enabled", Type: settingTypeBool, Description: "是否向客户端展示文档(docs)模块入口（octo-docs-backend 上线前默认关闭）",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.DocsEnabled()) }},
+
+	// 自定义贴纸上传限制（sticker-upload-compression 任务）。原先硬编码在
+	// modules/file/const.go；挪进 system_setting 后可灰度/回滚，且每键都有
+	// 服务端硬上限（stickerUpload*HardCap / stickerCompress*HardCap），误配也不会
+	// 越出资源上限。全部 Positive:true 走"必须正整数"admin 写侧校验，同时放开
+	// settingTypeInt 默认的 [0,3650] 上界（本组键上限单独校验，见读侧 clamp）。
+	{Category: "sticker", Key: "upload_max_size_kb", Type: settingTypeInt, Description: "自定义贴纸单文件大小上限(KB)，服务端硬上限 5120(5MB)；默认 1024", Positive: true,
+		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.StickerUploadMaxSizeKB()) }},
+	{Category: "sticker", Key: "upload_max_dimension", Type: settingTypeInt, Description: "自定义贴纸解码后单边像素上限，服务端硬上限 1024；默认 512", Positive: true,
+		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.StickerUploadMaxDimension()) }},
+	// upload_allowed_formats 用字符串存 CSV，读侧与内置位图白名单求交集(只能收窄,
+	// 不能放开非位图)。取消 Positive/整数校验，写侧不校验内容(anything goes)，非法
+	// 项在读侧被丢弃；全部非法时读侧回退默认全 5 种，避免误配把功能暗关。
+	{Category: "sticker", Key: "upload_allowed_formats", Type: settingTypeString, Description: "自定义贴纸允许扩展名(逗号分隔，如 gif,png,jpg,jpeg,webp)；只能与内置位图白名单取交集(收窄)，非位图会被读侧丢弃",
+		Effective: func(s *SystemSettings) string { return strings.Join(s.StickerUploadAllowedFormats(), ",") }},
+
+	// 自定义贴纸服务端压缩开关与调参（sticker-upload-compression 任务，方案 C：只压
+	// 静态 jpg/png；webp/gif/动图 validate-only）。compress_enabled 默认关闭，运营
+	// 灰度开启；compress_target_kb 是压缩目标(压缩后仍超即拒)；max_concurrency 与
+	// timeout_ms 是稳定性闸(饱和/超时都 fail-open，走原路径不阻塞主链路)。
+	{Category: "sticker", Key: "compress_enabled", Type: settingTypeBool, Description: "是否开启贴纸服务端压缩(仅静态 jpg/png；webp/gif 恒不压)；默认关闭以支持灰度",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.StickerCompressEnabled()) }},
+	{Category: "sticker", Key: "compress_target_kb", Type: settingTypeInt, Description: "压缩目标(KB)；压缩后仍超此值将拒绝上传；硬上限 5120(5MB)，默认 1024", Positive: true,
+		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.StickerCompressTargetKB()) }},
+	{Category: "sticker", Key: "compress_max_concurrency", Type: settingTypeInt, Description: "同时进行的贴纸压缩数量上限；饱和时该请求跳过压缩走原路径(fail-open)；硬上限 32，默认 4", Positive: true,
+		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.StickerCompressMaxConcurrency()) }},
+	{Category: "sticker", Key: "compress_timeout_ms", Type: settingTypeInt, Description: "单次贴纸压缩超时(毫秒)；超时该请求跳过压缩走原路径(fail-open)；硬上限 10000，默认 2000", Positive: true,
+		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.StickerCompressTimeoutMs()) }},
 
 	// Email server config — formerly yaml-only (Support.* in config.go).
 	{Category: "support", Key: "email", Type: settingTypeString, Description: "技术支持邮箱（发件人）",
