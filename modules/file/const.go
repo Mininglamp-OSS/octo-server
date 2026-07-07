@@ -158,6 +158,10 @@ var stickerUploadExts = map[string]bool{
 // stickerUploadExt 从客户端上传文件名挑选贴纸的存储扩展名，限定在
 // stickerUploadExts。文件名缺失 / 无扩展名 / 不在白名单一律回退 ".gif"
 // —— 历史默认，不传 filename 的老客户端因此保持原有行为不变。
+//
+// 注：这是**硬编码 fallback**（settings 未挂时的老 unit test 路径）；生产
+// 请求走 File.stickerUploadExtForRequest（review F1），它读当前配置的
+// allowedFormats，避免与 POST 侧校验用的配置漂移。
 func stickerUploadExt(filename string) string {
 	ext := strings.ToLower(filepath.Ext(sanitizeFilename(filename)))
 	if stickerUploadExts[ext] {

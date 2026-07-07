@@ -807,8 +807,8 @@ func (s *SystemSettings) DocsEnabled() bool {
 // ---------------------------------------------------------------------------
 
 const (
-	defaultStickerUploadMaxSizeKB   = 1024
-	stickerUploadMaxSizeKBHardCap   = 5 * 1024
+	defaultStickerUploadMaxSizeKB = 1024
+	stickerUploadMaxSizeKBHardCap = 5 * 1024
 
 	defaultStickerUploadMaxDimension = 512
 	stickerUploadMaxDimensionHardCap = 1024

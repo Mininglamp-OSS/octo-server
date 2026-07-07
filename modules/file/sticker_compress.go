@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"image"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -31,12 +32,39 @@ import (
 
 // stickerLimitsSnapshot 是 uploadFile 一次请求内的贴纸限制快照。全部字段在
 // 请求进入时锁定；SystemSettings 60s 后 reload 不影响正在进行的请求，避免
-// "校验通过用一套值、签发 handle 用另一套值"这类跨阶段不一致。
+// "校验通过用一套值、压缩用另一套值"这类跨阶段不一致（review F7）。压缩相关
+// 字段（compressTargetKB/MaxConcurrency/TimeoutMs）也放这里，Compress 通过
+// stickerCompressParams 拿到同一份值，确保 dimension 校验用的 maxDim 与
+// 压缩阶段 Fit 用的 maxDim 严格同源。
 type stickerLimitsSnapshot struct {
-	maxSize         int64
-	maxDim          int
-	allowedFormats  map[string]bool
-	compressEnabled bool
+	maxSize                int64
+	maxDim                 int
+	allowedFormats         map[string]bool
+	compressEnabled        bool
+	compressTargetKB       int
+	compressMaxConcurrency int
+	compressTimeoutMs      int
+}
+
+// stickerCompressParams 是从 stickerLimitsSnapshot 派生出、只喂给 Compress 的
+// 子集，让 compressor 的 API 表面明确表达"这些值由 caller 决定，请求内不再
+// 变化"。Compress 内部**不**再读 c.settings 的对应字段（review F7 修复要点）。
+type stickerCompressParams struct {
+	MaxDim         int
+	TargetKB       int
+	MaxConcurrency int
+	TimeoutMs      int
+}
+
+// compressParams 从 snapshot 派生 Compress 需要的 4 个值。集中在这里派生
+// 是为了让 caller 端一处清晰地展现"这四个值都来自同一份 snapshot"。
+func (s stickerLimitsSnapshot) compressParams() stickerCompressParams {
+	return stickerCompressParams{
+		MaxDim:         s.maxDim,
+		TargetKB:       s.compressTargetKB,
+		MaxConcurrency: s.compressMaxConcurrency,
+		TimeoutMs:      s.compressTimeoutMs,
+	}
 }
 
 // stickerLimits 从 File 挂的 SystemSettings 派生本次请求的限制值；未挂 settings
@@ -50,10 +78,13 @@ func (f *File) stickerLimits() stickerLimitsSnapshot {
 			allow[k] = v
 		}
 		return stickerLimitsSnapshot{
-			maxSize:         StickerMaxFileSize,
-			maxDim:          StickerMaxDimension,
-			allowedFormats:  allow,
-			compressEnabled: false,
+			maxSize:                StickerMaxFileSize,
+			maxDim:                 StickerMaxDimension,
+			allowedFormats:         allow,
+			compressEnabled:        false,
+			compressTargetKB:       0,
+			compressMaxConcurrency: 0,
+			compressTimeoutMs:      0,
 		}
 	}
 	kb := f.settings.StickerUploadMaxSizeKB()
@@ -63,11 +94,47 @@ func (f *File) stickerLimits() stickerLimitsSnapshot {
 		m[e] = true
 	}
 	return stickerLimitsSnapshot{
-		maxSize:         int64(kb) * 1024,
-		maxDim:          f.settings.StickerUploadMaxDimension(),
-		allowedFormats:  m,
-		compressEnabled: f.settings.StickerCompressEnabled(),
+		maxSize:                int64(kb) * 1024,
+		maxDim:                 f.settings.StickerUploadMaxDimension(),
+		allowedFormats:         m,
+		compressEnabled:        f.settings.StickerCompressEnabled(),
+		compressTargetKB:       f.settings.StickerCompressTargetKB(),
+		compressMaxConcurrency: f.settings.StickerCompressMaxConcurrency(),
+		compressTimeoutMs:      f.settings.StickerCompressTimeoutMs(),
 	}
+}
+
+// stickerUploadExtForRequest 是 stickerUploadExt 的"配置感知"版：把客户端
+// filename 匹配到当前配置允许的扩展名集合（settings.StickerUploadAllowedFormats
+// 的读侧交集结果），而不是硬编码历史 5 种。这样运营通过 upload_allowed_formats
+// 收窄格式后，GET-side 生成的 preflight URL 与 POST-side 校验用的允许集保持
+// 一致 —— 客户端不会拿到之后会被 upload 阶段拒的扩展名（review F1）。
+//
+// filename miss / 无扩展名时的 fallback 顺序：
+//  1. 优先 ".gif"（历史默认，不传 filename 的老客户端保持原有行为）
+//  2. 若 .gif 已被运营剔除，按 raster allowlist 固定顺序取第一个仍允许的
+//     (.png → .jpg → .jpeg → .webp) —— 顺序确定性保证 fallback 稳定
+//  3. 极端情况允许集为空（stickerLimits 读侧交集会回退默认所以不会到这里，
+//     但作为兜底）：仍返回 ".gif"
+//
+// 未挂 settings 的路径（老 unit test 构造 &File{}）走 stickerLimits() 的
+// nil-safe 分支，会拿到与老 stickerUploadExt 等价的 stickerUploadExts 集合，
+// 因此本方法在那条路径上与旧行为逐字节等价。
+func (f *File) stickerUploadExtForRequest(filename string) string {
+	ext := strings.ToLower(filepath.Ext(sanitizeFilename(filename)))
+	limits := f.stickerLimits()
+	if limits.allowedFormats[ext] {
+		return ext
+	}
+	if limits.allowedFormats[".gif"] {
+		return ".gif"
+	}
+	for _, cand := range []string{".png", ".jpg", ".jpeg", ".webp"} {
+		if limits.allowedFormats[cand] {
+			return cand
+		}
+	}
+	return ".gif"
 }
 
 // stickerSystemSettings 是 File 只用到的 SystemSettings 子集接口。定义在
@@ -128,11 +195,17 @@ func newStickerCompressor(s stickerCompressSettings) *stickerCompressor {
 // Compress 尝试压缩 src；ext 应是 caller 归一化后的小写扩展名（含前导 "."）。
 // 语义见文件顶部 Outcome 注释。永不 panic：解码 / 编码错误映射成 failed。
 //
+// params 是 caller 从请求进入时锁定的 stickerLimitsSnapshot 派生的一份不可变
+// 副本 —— maxDim/targetKB/maxConcurrency/timeoutMs 都取自同一份快照，兑现
+// "一次请求一份快照"的不变式（review F7）。Compress 内部**不再**读 c.settings
+// 的这四个字段；仅从 c.settings 读 StickerCompressEnabled 做双重短路（保留
+// disabled 单元测试维度）。
+//
 // 耗时观测：仅在 acquire slot 之后（真正投入 CPU 的路径）打点，包括
 // compressed / over_limit / failed / skipped:timeout。disabled/format/
 // animated/concurrency_saturated 分支耗时约等于 0，用 counter 观测即可，不打
 // histogram 以降低噪声。
-func (c *stickerCompressor) Compress(ext string, src []byte) stickerCompressResult {
+func (c *stickerCompressor) Compress(ext string, src []byte, params stickerCompressParams) stickerCompressResult {
 	if !c.settings.StickerCompressEnabled() {
 		return stickerCompressResult{Outcome: stickerCompressOutcomeSkipped, Reason: "disabled"}
 	}
@@ -147,8 +220,7 @@ func (c *stickerCompressor) Compress(ext string, src []byte) stickerCompressResu
 	if isAnimatedPNGSource(ext, src) {
 		return stickerCompressResult{Outcome: stickerCompressOutcomeSkipped, Reason: "animated"}
 	}
-	maxConc := c.settings.StickerCompressMaxConcurrency()
-	if !c.tryAcquireCompressSlot(maxConc) {
+	if !c.tryAcquireCompressSlot(params.MaxConcurrency) {
 		return stickerCompressResult{Outcome: stickerCompressOutcomeSkipped, Reason: "concurrency_saturated"}
 	}
 	// 关键：**不要**在此 defer release。timeout 分支返回时 doCompress goroutine
@@ -156,10 +228,9 @@ func (c *stickerCompressor) Compress(ext string, src []byte) stickerCompressResu
 	// max_concurrency 上界。改由 worker goroutine 结束时（自然完成或 recover
 	// 后）释放，让 slot 与真正的 CPU 占用生命周期一致（review P1）。
 
-	timeoutMs := c.settings.StickerCompressTimeoutMs()
-	timeout := time.Duration(timeoutMs) * time.Millisecond
-	maxDim := c.settings.StickerUploadMaxDimension()
-	targetKB := c.settings.StickerCompressTargetKB()
+	timeout := time.Duration(params.TimeoutMs) * time.Millisecond
+	maxDim := params.MaxDim
+	targetKB := params.TargetKB
 
 	type outcome struct {
 		r   stickerCompressResult

@@ -43,8 +43,8 @@ type fakeStickerSystemSettings struct {
 	timeoutMs       int
 }
 
-func (f *fakeStickerSystemSettings) StickerUploadMaxSizeKB() int       { return f.maxSizeKB }
-func (f *fakeStickerSystemSettings) StickerUploadMaxDimension() int    { return f.maxDim }
+func (f *fakeStickerSystemSettings) StickerUploadMaxSizeKB() int    { return f.maxSizeKB }
+func (f *fakeStickerSystemSettings) StickerUploadMaxDimension() int { return f.maxDim }
 func (f *fakeStickerSystemSettings) StickerUploadAllowedFormats() []string {
 	out := make([]string, len(f.allowedFormats))
 	copy(out, f.allowedFormats)
@@ -99,6 +99,47 @@ func newStickerCompressFile(t *testing.T, s *fakeStickerSystemSettings) (*File, 
 		settings:   s,
 		compressor: newStickerCompressor(s),
 	}, svc
+}
+
+// TestUploadFile_CompressorNilDoesNotPanic 保护异常构造路径：settings 挂了且
+// compressEnabled=true，但 compressor==nil。生产 New(ctx) 里 settings+compressor
+// 是一起初始化的，这种状态不该出现；但 File.compressor 的文档说 nil=disabled，
+// uploadFile 就必须尊重这个合约（review F3）—— fail-open 走原字节，不 nil-panic。
+func TestUploadFile_CompressorNilDoesNotPanic(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const uid = "10000"
+	settings := defaultFakeStickerSettings()
+	settings.compressEnabled = true
+	settings.maxSizeKB = 5120
+	settings.maxDim = 1024
+
+	svc := &capturingMockService{
+		mockService: mockService{downloadURL: "https://cdn.example.com/dm/sticker/" + uid + "/abc.jpg"},
+	}
+	f := &File{
+		Log:      log.NewTLog("FileTest"),
+		service:  svc,
+		settings: settings,
+		// compressor 特意留 nil —— 关键的异常构造点
+	}
+
+	origBytes := makeTestJPEG(t, 128, 128, 80)
+	body, contentType := newMultipartFile(t, "abc.jpg", origBytes)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request, _ = http.NewRequest(http.MethodPost, "/v1/file/upload?type=sticker&path=/"+uid+"/abc.jpg", body)
+	c.Request.Header.Set("Content-Type", contentType)
+	c.Set("uid", uid)
+	wkCtx := &wkhttp.Context{Context: c}
+
+	require.NotPanics(t, func() {
+		f.uploadFile(wkCtx)
+	}, "compressor==nil must not cause a nil-pointer dereference in uploadFile")
+
+	require.Equalf(t, http.StatusOK, w.Code, "must fail-open on nil compressor; body: %s", w.Body.String())
+	assert.Equal(t, origBytes, svc.uploaded,
+		"fail-open path must upload the original bytes byte-for-byte")
 }
 
 // TestUploadFile_CompressEnabled_LargeJPEG_UsesCompressedBytes 集成验证：开启

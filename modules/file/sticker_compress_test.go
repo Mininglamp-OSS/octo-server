@@ -34,6 +34,17 @@ func (f *fakeStickerCompressSettings) StickerCompressMaxConcurrency() int { retu
 func (f *fakeStickerCompressSettings) StickerCompressTimeoutMs() int      { return f.timeoutMs }
 func (f *fakeStickerCompressSettings) StickerUploadMaxDimension() int     { return f.maxDim }
 
+// params 从 fake 组装出 Compress 需要的 stickerCompressParams。测试从 fake
+// 派生参数模拟"caller 已在请求进入时锁定了一份 snapshot"的语义（review F7）。
+func (f *fakeStickerCompressSettings) params() stickerCompressParams {
+	return stickerCompressParams{
+		MaxDim:         f.maxDim,
+		TargetKB:       f.targetKB,
+		MaxConcurrency: f.maxConcurrency,
+		TimeoutMs:      f.timeoutMs,
+	}
+}
+
 // makeTestJPEG 生成 (w,h) JPEG，颜色随机以避免过度可压缩。
 func makeTestJPEG(t *testing.T, w, h, quality int) []byte {
 	t.Helper()
@@ -78,20 +89,22 @@ func newFakeCompressor(fs *fakeStickerCompressSettings) *stickerCompressor {
 }
 
 func TestStickerCompressor_DisabledSkips(t *testing.T) {
-	c := newFakeCompressor(&fakeStickerCompressSettings{
+	fs := &fakeStickerCompressSettings{
 		enabled: false, targetKB: 1024, maxConcurrency: 4, timeoutMs: 2000, maxDim: 512,
-	})
-	r := c.Compress(".png", makeTestPNG(t, 8, 8))
+	}
+	c := newFakeCompressor(fs)
+	r := c.Compress(".png", makeTestPNG(t, 8, 8), fs.params())
 	assert.Equal(t, stickerCompressOutcomeSkipped, r.Outcome)
 	assert.Equal(t, "disabled", r.Reason)
 }
 
 func TestStickerCompressor_UnsupportedFormatSkips(t *testing.T) {
-	c := newFakeCompressor(&fakeStickerCompressSettings{
+	fs := &fakeStickerCompressSettings{
 		enabled: true, targetKB: 1024, maxConcurrency: 4, timeoutMs: 2000, maxDim: 512,
-	})
+	}
+	c := newFakeCompressor(fs)
 	for _, ext := range []string{".gif", ".webp", ".bmp", ".mp4", ".JPG", "", "jpg"} {
-		r := c.Compress(ext, []byte{0})
+		r := c.Compress(ext, []byte{0}, fs.params())
 		assert.Equalf(t, stickerCompressOutcomeSkipped, r.Outcome, "ext=%q", ext)
 		assert.Equalf(t, "format", r.Reason, "ext=%q", ext)
 	}
@@ -103,10 +116,11 @@ func TestStickerCompressor_CompressesLargeJPEG(t *testing.T) {
 	src := makeTestJPEG(t, 1024, 1024, 95)
 	require.Greaterf(t, len(src), 50*1024, "source JPEG %dB must be big enough to test shrinking", len(src))
 
-	c := newFakeCompressor(&fakeStickerCompressSettings{
+	fs := &fakeStickerCompressSettings{
 		enabled: true, targetKB: 256, maxConcurrency: 4, timeoutMs: 5000, maxDim: 512,
-	})
-	r := c.Compress(".jpg", src)
+	}
+	c := newFakeCompressor(fs)
+	r := c.Compress(".jpg", src, fs.params())
 	require.Equalf(t, stickerCompressOutcomeCompressed, r.Outcome, "reason=%q size=%d", r.Reason, r.Size)
 	assert.LessOrEqual(t, r.Size, int64(256*1024))
 	// 结果字节仍是可解码 JPEG，且尺寸缩到 <= maxDim。
@@ -121,10 +135,11 @@ func TestStickerCompressor_CompressesLargeJPEG(t *testing.T) {
 func TestStickerCompressor_CompressesPNG(t *testing.T) {
 	src := makeTestPNG(t, 300, 300)
 
-	c := newFakeCompressor(&fakeStickerCompressSettings{
+	fs := &fakeStickerCompressSettings{
 		enabled: true, targetKB: 1024, maxConcurrency: 4, timeoutMs: 5000, maxDim: 512,
-	})
-	r := c.Compress(".png", src)
+	}
+	c := newFakeCompressor(fs)
+	r := c.Compress(".png", src, fs.params())
 	require.Equalf(t, stickerCompressOutcomeCompressed, r.Outcome, "reason=%q", r.Reason)
 	_, format, err := image.Decode(bytes.NewReader(r.Bytes))
 	require.NoError(t, err)
@@ -136,53 +151,57 @@ func TestStickerCompressor_RejectsWhenOverLimitAfterCompress(t *testing.T) {
 	src := makeTestPNG(t, 512, 512)
 	require.Greaterf(t, len(src), 10*1024, "seed PNG %dB must exceed 10KB so target=1KB is unreachable", len(src))
 
-	c := newFakeCompressor(&fakeStickerCompressSettings{
+	fs := &fakeStickerCompressSettings{
 		enabled: true, targetKB: 1, maxConcurrency: 4, timeoutMs: 10000, maxDim: 512,
-	})
-	r := c.Compress(".png", src)
+	}
+	c := newFakeCompressor(fs)
+	r := c.Compress(".png", src, fs.params())
 	assert.Equal(t, stickerCompressOutcomeOverLimit, r.Outcome)
 	assert.Greater(t, r.Size, int64(1024))
 	assert.Nil(t, r.Bytes, "over_limit result must not surface compressed bytes")
 }
 
 func TestStickerCompressor_FailsOpenOnDecodeError(t *testing.T) {
-	c := newFakeCompressor(&fakeStickerCompressSettings{
+	fs := &fakeStickerCompressSettings{
 		enabled: true, targetKB: 1024, maxConcurrency: 4, timeoutMs: 2000, maxDim: 512,
-	})
-	r := c.Compress(".jpg", []byte("not a real jpeg"))
+	}
+	c := newFakeCompressor(fs)
+	r := c.Compress(".jpg", []byte("not a real jpeg"), fs.params())
 	assert.Equal(t, stickerCompressOutcomeFailed, r.Outcome)
 	assert.Contains(t, r.Reason, "decode")
 }
 
 func TestStickerCompressor_ConcurrencyFailOpen(t *testing.T) {
-	c := newFakeCompressor(&fakeStickerCompressSettings{
+	fs := &fakeStickerCompressSettings{
 		enabled: true, targetKB: 1024, maxConcurrency: 1, timeoutMs: 10000, maxDim: 512,
-	})
+	}
+	c := newFakeCompressor(fs)
 	// 手动 hold 唯一 slot，随后 Compress 应立即 skipped。
 	require.True(t, c.tryAcquireCompressSlot(1))
-	r := c.Compress(".jpg", makeTestJPEG(t, 16, 16, 80))
+	r := c.Compress(".jpg", makeTestJPEG(t, 16, 16, 80), fs.params())
 	assert.Equal(t, stickerCompressOutcomeSkipped, r.Outcome)
 	assert.Equal(t, "concurrency_saturated", r.Reason)
 	c.releaseCompressSlot()
 
 	// 释放后能正常压缩（覆盖 release 语义）。
-	r2 := c.Compress(".jpg", makeTestJPEG(t, 16, 16, 80))
+	r2 := c.Compress(".jpg", makeTestJPEG(t, 16, 16, 80), fs.params())
 	assert.NotEqualf(t, stickerCompressOutcomeSkipped, r2.Outcome, "after release must compress, got reason=%q", r2.Reason)
 }
 
 func TestStickerCompressor_TimeoutFailOpen(t *testing.T) {
 	// 注入一个刻意 sleep 长于 timeout 的 doCompress，验证 select 超时分支。
+	fs := &fakeStickerCompressSettings{
+		enabled: true, targetKB: 1024, maxConcurrency: 4, timeoutMs: 20, maxDim: 512,
+	}
 	c := &stickerCompressor{
-		settings: &fakeStickerCompressSettings{
-			enabled: true, targetKB: 1024, maxConcurrency: 4, timeoutMs: 20, maxDim: 512,
-		},
+		settings: fs,
 		doCompress: func(ext string, src []byte, maxDim, targetKB int) (stickerCompressResult, error) {
 			time.Sleep(200 * time.Millisecond)
 			return stickerCompressResult{Outcome: stickerCompressOutcomeCompressed, Bytes: src, Size: int64(len(src))}, nil
 		},
 	}
 	start := time.Now()
-	r := c.Compress(".jpg", []byte("payload"))
+	r := c.Compress(".jpg", []byte("payload"), fs.params())
 	elapsed := time.Since(start)
 	assert.Equal(t, stickerCompressOutcomeSkipped, r.Outcome)
 	assert.Equal(t, "timeout", r.Reason)
@@ -277,10 +296,11 @@ func min2(a, b int) int {
 // 结束后 slot 释放，第三次 Compress 才能真正进压缩管线。
 func TestStickerCompressor_TimeoutDoesNotBleedConcurrency(t *testing.T) {
 	const workerSleep = 500 * time.Millisecond
+	fs := &fakeStickerCompressSettings{
+		enabled: true, targetKB: 1024, maxConcurrency: 1, timeoutMs: 20, maxDim: 512,
+	}
 	c := &stickerCompressor{
-		settings: &fakeStickerCompressSettings{
-			enabled: true, targetKB: 1024, maxConcurrency: 1, timeoutMs: 20, maxDim: 512,
-		},
+		settings: fs,
 		doCompress: func(ext string, src []byte, maxDim, targetKB int) (stickerCompressResult, error) {
 			time.Sleep(workerSleep)
 			return stickerCompressResult{Outcome: stickerCompressOutcomeCompressed, Bytes: src, Size: int64(len(src))}, nil
@@ -288,12 +308,12 @@ func TestStickerCompressor_TimeoutDoesNotBleedConcurrency(t *testing.T) {
 	}
 
 	// 第一次：worker 慢，Compress 从 timeout 分支返回
-	r1 := c.Compress(".jpg", []byte("x"))
+	r1 := c.Compress(".jpg", []byte("x"), fs.params())
 	require.Equal(t, stickerCompressOutcomeSkipped, r1.Outcome)
 	require.Equal(t, "timeout", r1.Reason)
 
 	// 立即再打：worker 还没跑完，slot 必须仍占用 → 拿到 concurrency_saturated
-	r2 := c.Compress(".jpg", []byte("y"))
+	r2 := c.Compress(".jpg", []byte("y"), fs.params())
 	assert.Equal(t, stickerCompressOutcomeSkipped, r2.Outcome)
 	assert.Equalf(t, "concurrency_saturated", r2.Reason,
 		"slot must remain held by dangling worker after timeout return; got reason=%q", r2.Reason)
@@ -304,7 +324,7 @@ func TestStickerCompressor_TimeoutDoesNotBleedConcurrency(t *testing.T) {
 	// 归还。这条 test 的 doCompress 是永远慢的固定 fake，用 outcome!=skipped 判
 	// 定会假失败。
 	time.Sleep(workerSleep + 100*time.Millisecond)
-	r3 := c.Compress(".jpg", []byte("z"))
+	r3 := c.Compress(".jpg", []byte("z"), fs.params())
 	assert.Equal(t, stickerCompressOutcomeSkipped, r3.Outcome)
 	assert.NotEqualf(t, "concurrency_saturated", r3.Reason,
 		"after worker finished, slot must be released; got reason=%q", r3.Reason)
@@ -409,10 +429,11 @@ func TestHasAPNGActlChunk_MalformedInputsReturnFalse(t *testing.T) {
 // animated/concurrency_saturated 一起归属"轻量路径"）。
 func TestStickerCompressor_APNGSkips(t *testing.T) {
 	// 用一个"命中就 fatal"的 doCompress 证明 APNG 路径不到达 worker
+	fs := &fakeStickerCompressSettings{
+		enabled: true, targetKB: 1024, maxConcurrency: 4, timeoutMs: 2000, maxDim: 512,
+	}
 	c := &stickerCompressor{
-		settings: &fakeStickerCompressSettings{
-			enabled: true, targetKB: 1024, maxConcurrency: 4, timeoutMs: 2000, maxDim: 512,
-		},
+		settings: fs,
 		doCompress: func(ext string, src []byte, maxDim, targetKB int) (stickerCompressResult, error) {
 			t.Fatalf("doCompress must not be called for APNG; ext=%s len=%d", ext, len(src))
 			return stickerCompressResult{}, nil
@@ -427,7 +448,7 @@ func TestStickerCompressor_APNGSkips(t *testing.T) {
 		{"IDAT", []byte{0x78, 0x9c, 0x62, 0, 0, 0, 0, 1}},
 		{"IEND", nil},
 	})
-	r := c.Compress(".png", apng)
+	r := c.Compress(".png", apng, fs.params())
 	assert.Equal(t, stickerCompressOutcomeSkipped, r.Outcome)
 	assert.Equal(t, "animated", r.Reason,
 		"APNG must be identified before acquiring a compress slot")

@@ -181,7 +181,7 @@ func (f *File) getFilePath(c *wkhttp.Context) {
 		// 自定义表情：扩展名由客户端上传文件名（filename query）推导，限定在
 		// gif/png/jpg/jpeg/webp；缺省 / 不在白名单 → 回退 .gif（保持历史行为，
 		// 不传 filename 的老客户端不受影响）。
-		path = fmt.Sprintf("%s/file/upload?type=%s&path=/%s/%s%s", f.ctx.GetConfig().External.APIBaseURL, fileType, loginUID, util.GenerUUID(), stickerUploadExt(c.Query("filename")))
+		path = fmt.Sprintf("%s/file/upload?type=%s&path=/%s/%s%s", f.ctx.GetConfig().External.APIBaseURL, fileType, loginUID, util.GenerUUID(), f.stickerUploadExtForRequest(c.Query("filename")))
 	} else if Type(fileType) == TypeWorkplaceBanner {
 		// 工作台横幅
 		path = fmt.Sprintf("%s/file/upload?type=%s&path=/workplace/banner/%s", f.ctx.GetConfig().External.APIBaseURL, fileType, path)
@@ -470,7 +470,7 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 	// 故 stickersig.Sign 天然基于压缩后的字节（同一 URL 对应最终存储对象）。
 	var uploadReader io.ReadSeeker = file
 	finalSize := fileHeader.Size
-	if isStickerUpload && stickerLimits.compressEnabled {
+	if isStickerUpload && stickerLimits.compressEnabled && f.compressor != nil {
 		if canCompressStickerExt(ext) {
 			srcBytes, readErr := io.ReadAll(file)
 			if readErr != nil {
@@ -479,7 +479,7 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 				c.ResponseError(errors.New("读取文件失败"))
 				return
 			}
-			result := f.compressor.Compress(ext, srcBytes)
+			result := f.compressor.Compress(ext, srcBytes, stickerLimits.compressParams())
 			switch result.Outcome {
 			case stickerCompressOutcomeCompressed:
 				observeStickerUpload("compress_success")

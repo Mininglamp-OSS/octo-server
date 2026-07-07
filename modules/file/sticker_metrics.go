@@ -1,6 +1,7 @@
 package file
 
 import (
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -105,21 +106,20 @@ func observeStickerUploadHandle(result string) {
 }
 
 // normalizeStickerCompressFormat 把 ext 归一化到 low-cardinality 集合，防止
-// caller 传奇怪 ext 时 label 爆炸。ext 允许带或不带前导点，大小写不敏感。
+// caller 传奇怪 ext 时 label 爆炸。ext 允许带或不带前导点，且完全大小写不敏感
+// —— 先 ToLower 再 TrimPrefix，兑现函数注释里的合约（review F2）。
 func normalizeStickerCompressFormat(ext string) string {
-	if len(ext) > 0 && ext[0] == '.' {
-		ext = ext[1:]
-	}
+	ext = strings.TrimPrefix(strings.ToLower(ext), ".")
 	switch ext {
-	case "jpg", "JPG":
+	case "jpg":
 		return "jpg"
-	case "jpeg", "JPEG":
+	case "jpeg":
 		return "jpeg"
-	case "png", "PNG":
+	case "png":
 		return "png"
-	case "gif", "GIF":
+	case "gif":
 		return "gif"
-	case "webp", "WEBP":
+	case "webp":
 		return "webp"
 	}
 	return "other"
