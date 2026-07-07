@@ -28,6 +28,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/robot"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
@@ -1470,6 +1471,26 @@ func (w *IncomingWebhook) handlePush(c *wkhttp.Context, ad pushAdapter) {
 			}
 			w.submitFailure(m, len(body), ip, ad.name, "blocks", http.StatusBadRequest)
 			pushPayloadInvalid(c, "blocks")
+			return
+		}
+		payload = p
+	case msgTypeCard:
+		// card-message-protocol P1：标准 AC JSON → type-17 信封（服务端钉
+		// octo/v1 profile），cardmsg.Validate/Finalize 与 bot ingress 同权威。
+		// 8KB body cap 不变（Decision 3：树上限/512KiB 由 cardmsg 层执行）。
+		p, err := buildCardPayload(m, req, creatorIsAdmin)
+		if err != nil {
+			if errors.Is(err, cardmsg.ErrCardPayloadTooLarge) {
+				w.submitFailure(m, len(body), ip, ad.name, "too_large", http.StatusRequestEntityTooLarge)
+				pushPayloadTooLarge(c)
+				return
+			}
+			reason := "card"
+			if errors.Is(err, errCardDisabled) {
+				reason = "card_disabled"
+			}
+			w.submitFailure(m, len(body), ip, ad.name, reason, http.StatusBadRequest)
+			pushPayloadInvalid(c, reason)
 			return
 		}
 		payload = p

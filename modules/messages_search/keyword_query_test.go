@@ -397,4 +397,3 @@ func TestBuildSearchAllDSL_OneAnalyzePerKeyword(t *testing.T) {
 		t.Fatalf("_search_all must reuse one _analyze across its two Should branches, got %d calls", a.calls)
 	}
 }
-

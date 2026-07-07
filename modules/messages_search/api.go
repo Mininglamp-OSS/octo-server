@@ -8,8 +8,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/message"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
-	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/Mininglamp-OSS/octo-server/pkg/searchbackend"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 )
 
@@ -23,6 +23,9 @@ type Handler struct {
 	groupService   group.IService
 	messageService message.IService
 	threadService  thread.IService
+	// cardSenderTrusted 判定 type-17 命中的存储 sender 是否 bot/webhook 身份
+	// （card.go；Decision 2 residual-risk 投影门）。函数字段便于测试替换。
+	cardSenderTrusted func(string) bool
 	// visibility is the post-filter probe used by the /_search* hot path
 	// (see visibility.go::filterVisible). Defined as an interface so tests
 	// can stub the four signals directly without standing up a real
@@ -46,17 +49,18 @@ func New(ctx *config.Context) *Handler {
 	cfg := loadConfig()
 	msgSvc := message.NewService(ctx)
 	h := &Handler{
-		ctx:            ctx,
-		Log:            log.NewTLog("messages_search"),
-		cfg:            cfg,
-		userService:    user.NewService(ctx),
-		groupService:   group.NewService(ctx),
-		messageService: msgSvc,
-		threadService:  thread.NewService(ctx),
-		visibility:     newMessageVisibilityProbe(msgSvc),
-		limiter:        newUIDLimiter(cfg.RateLimit.QPS, cfg.RateLimit.Burst),
-		cache:          newSenderCache(senderCacheCapacity, senderCacheTTL),
-		mode:           searchbackend.Resolve(ctx.GetConfig().ZincSearch.SearchOn),
+		ctx:               ctx,
+		Log:               log.NewTLog("messages_search"),
+		cfg:               cfg,
+		userService:       user.NewService(ctx),
+		groupService:      group.NewService(ctx),
+		messageService:    msgSvc,
+		threadService:     thread.NewService(ctx),
+		cardSenderTrusted: newCardSenderTrusted(ctx),
+		visibility:        newMessageVisibilityProbe(msgSvc),
+		limiter:           newUIDLimiter(cfg.RateLimit.QPS, cfg.RateLimit.Burst),
+		cache:             newSenderCache(senderCacheCapacity, senderCacheTTL),
+		mode:              searchbackend.Resolve(ctx.GetConfig().ZincSearch.SearchOn),
 	}
 	if cfg.CursorHMAC == "" {
 		// The fallback key in cursor.go is a published constant, so cursors

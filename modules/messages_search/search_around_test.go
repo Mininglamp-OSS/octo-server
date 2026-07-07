@@ -8,8 +8,8 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
-	"github.com/gin-gonic/gin"
 	"github.com/Mininglamp-OSS/octo-server/pkg/searchbackend"
+	"github.com/gin-gonic/gin"
 	"github.com/olivere/elastic"
 )
 

@@ -9,7 +9,9 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
+	"github.com/Mininglamp-OSS/octo-server/modules/robot"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/pushcache"
 	"github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
@@ -187,6 +189,12 @@ func getMessageAlert(msg msgOfflineNotify, toUser *user.Resp, ctx *config.Contex
 		alert = "[emoji表情]"
 	case common.MultipleForward:
 		alert = "[聊天记录]"
+	case cardmsg.InteractiveCard:
+		// card-message-protocol P1 Decision 8 + Decision 2 residual-risk（round-3
+		// P1-2）：推送正文经 DisplayTextFor 单一执法点 —— sender 是 bot/webhook
+		// 身份才信任 server 权威 plain；直连长连接发出的伪造卡片（Finalize 从未
+		// 跑过，plain 攻击者可控）一律 [卡片] 占位。
+		alert = cardmsg.DisplayTextFor(cardSenderTrusted(ctx, msg.FromUID), msg.Payload)
 	case common.RichText:
 		// 图文混排 RichText(=14)：推送正文取 server 已生成的权威 plain（含 [图片]
 		// 占位）。GetRichTextDisplayText 优先用 payload.plain，缺失时现场遍历
@@ -448,4 +456,31 @@ func formatGroupPushBody(ctx *config.Context, groupNo, fromUID, fromName, conten
 		return fmt.Sprintf("%s：%s", fromName, content)
 	}
 	return fmt.Sprintf("%s @%s：%s", fromName, suffix, content)
+}
+
+// cardSenderPrefixWebhook 是 incoming webhook 合成发送者 UID 前缀。按仓库分层
+// 惯例本地复制（生产代码不跨层 import modules/incomingwebhook —— 见其
+// display.go 顶注），跨包一致性由 common_card_test.go 的常量一致性测试兜底。
+const cardSenderPrefixWebhook = "iwh_"
+
+var (
+	cardRobotSvcOnce sync.Once
+	cardRobotSvc     robot.IService
+)
+
+// cardSenderTrusted 判定 type-17 消息的存储 sender 是否 bot/webhook 身份
+// （Decision 2 residual-risk 的调用方职责）。webhook 合成身份看 iwh_ 前缀；
+// bot 查 robot 表（status=1）。查询失败 fail-closed —— 宁可推 [卡片] 也不透出
+// 不可信 plain。
+func cardSenderTrusted(ctx *config.Context, fromUID string) bool {
+	if strings.HasPrefix(fromUID, cardSenderPrefixWebhook) {
+		return true
+	}
+	cardRobotSvcOnce.Do(func() { cardRobotSvc = robot.NewService(ctx) })
+	isBot, err := cardRobotSvc.ExistRobot(fromUID)
+	if err != nil {
+		log.Warn("card sender 身份查询失败,推送按不可信处理", zap.Error(err), zap.String("fromUID", fromUID))
+		return false
+	}
+	return isBot
 }

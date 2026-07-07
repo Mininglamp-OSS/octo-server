@@ -3,6 +3,7 @@ package messages_search
 import (
 	"context"
 	"encoding/json"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"strconv"
 	"strings"
 
@@ -280,6 +281,13 @@ func (h *Handler) singleMessageHit(doc Doc, reqChannelID string, hl map[string][
 	// render via the structured pipeline; nil falls back to snippet.
 	if payloadType(doc.Payload) == payloadTypeRichText {
 		mh.RichText = buildRichTextDetail(doc.PayloadRaw)
+	}
+	// card-message-protocol P1：type-17 命中的响应侧投影 = 遮蔽后的 plain
+	// （单一执法点 DisplayTextFor：bot/webhook sender → 权威 plain；否则
+	// [卡片]，round-3 P1-2）。message_kind 维持 "text"（swagger 枚举已锁），
+	// snippet 即投影文本。
+	if payloadType(doc.Payload) == payloadTypeCard {
+		mh.Snippet = cardmsg.DisplayTextFor(h.cardSenderTrusted(doc.From), doc.PayloadRaw)
 	}
 	return mh
 }

@@ -612,8 +612,8 @@ func TestFilterVisible_VisiblesEmpty_FailOpen(t *testing.T) {
 	probe := &stubProbe{}
 	h := newVisibilityHandler(probe)
 	keep, err := h.filterVisible(context.Background(), "anyone", "C1", []msgRef{
-		{MessageID: "nil"},                          // Visibles == nil
-		{MessageID: "empty", Visibles: []string{}},  // Visibles == []
+		{MessageID: "nil"},                         // Visibles == nil
+		{MessageID: "empty", Visibles: []string{}}, // Visibles == []
 	})
 	if err != nil {
 		t.Fatalf("filter: %v", err)

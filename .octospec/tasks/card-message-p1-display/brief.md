@@ -92,9 +92,13 @@ error responses, size/truncation invariants). PR-A additionally touches:
 - **The protocol brief's entire Acceptance section passes verbatim** — that
   list is the contract and is not duplicated here. Plus PR-A-specific gates:
 - Profile pinning (E2): an envelope with `profile:"octo/v2"` (or any unknown
-  profile) → 400 profile-mismatch; no P2 identifier appears in the diff
-  (`grep -rE 'card/action|EventTypeCardAction|ProfileV2|card_seq'` over the
-  PR's changed files is empty — harvest hygiene, machine-checkable).
+  profile) → 400 profile-mismatch; no P2 **Go symbol** appears in the PR's
+  changed `.go` files (`grep -lE 'ProfileV2|EventTypeCardAction|
+  cardActionClaim|CardSeqFromContentEdit|ValidateInputs|SubmitActionIDs'`
+  is empty — harvest hygiene, machine-checkable). Prose references to the
+  P2 contract in `docs/card-protocol.md` and code comments are expected —
+  the doc MUST describe the P2 action contract per the protocol brief's
+  acceptance.
 - Masking chokepoint (E5): helper-level tests assert bot-sender → `plain`
   and user-sender → `[卡片]`; every listed surface routes through the helper
   (source guard: no surface file contains a private type-17 branch).

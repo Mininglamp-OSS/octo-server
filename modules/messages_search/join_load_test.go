@@ -44,6 +44,7 @@ func (p *countingProbe) ChannelOffset(uid, channelID string) (uint32, error) { r
 // Threshold (measured here, pinned as the gate):
 //   - max IN() list per probe call  <= pageSize * oversampleMultiplier
 //   - total probe round-trips        <= loopBudget * 4 signals
+//
 // At the max page_size of 100 that is <= 300 ids per IN(), <= 12 round-trips —
 // a single bounded JOIN batch per round, never an unbounded fan-out.
 func TestJoinLoad_INListBoundedByPageSize(t *testing.T) {

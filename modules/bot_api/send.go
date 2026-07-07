@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
@@ -38,7 +40,15 @@ type BotSendMessageReq struct {
 }
 
 // sendMessage handles POST /v1/bot/sendMessage.
+
+// sendEditMaxBodyBytes card-message-protocol P1 Decision 3b：send/edit 路由的
+// pre-decode body 上限（1 MiB）。BindJSON 会在 Validate 之前完整解码请求体 ——
+// 没有它，超大 body 在 512KiB 卡片上限生效前就烧掉 CPU/内存。1 MiB 给正常
+// payload（卡片 512KiB + 信封/转义开销）留足余量；voice 路由沿用自己的 5 MiB。
+const sendEditMaxBodyBytes = 1 << 20
+
 func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, sendEditMaxBodyBytes)
 	var req BotSendMessageReq
 	if err := c.BindJSON(&req); err != nil {
 		respondBotAPIRequestInvalid(c, "")
@@ -80,6 +90,28 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 	if payloadHasReservedOBOKey(req.Payload) {
 		httperr.ResponseErrorL(c, errcode.ErrBotAPIOBOReservedField, nil, nil)
 		return
+	}
+
+	// card-message-protocol P1：InteractiveCard(=17) 入站 gate。排序在
+	// checkSendPermission / checkOBO 之前：(a) Decision 2b 要求 OBO 卡片按
+	// 「请求意图」拦截、先于 grant 校验，且覆盖 grantorReplyBypass 子路径
+	// （该子路径 fromUID 仍是 bot —— 拒绝是刻意的过度拒绝，P2 复议）；
+	// (b) 脏卡片 fail-fast，鉴权路径不跑在毒输入上（与上方 OBO 保留键同序）。
+	if cardmsg.IsCardPayload(req.Payload) {
+		if !cardmsg.Enabled() {
+			// Decision 2 rollout gate：客户端渲染门禁发布前默认关闭。
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardDisabled, nil, nil)
+			return
+		}
+		if strings.TrimSpace(req.OnBehalfOf) != "" {
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardOBOForbidden, nil, nil)
+			return
+		}
+		if err := cardmsg.Validate(req.Payload); err != nil {
+			ba.Warn("InteractiveCard payload 校验失败", zap.Error(err), zap.String("channelID", req.ChannelID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return
+		}
 	}
 
 	robotID := getRobotIDFromContext(c)
@@ -203,6 +235,17 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 	// the chokepoint should we ever need to reinstate the rewrite.
 	// Helper is idempotent and safe on nil — see pkg/mentionrewrite.
 	payload = mentionrewrite.RewriteMention(payload)
+
+	// card-message-protocol P1 Decision 8：server 权威 plain 收尾。排在信封级
+	// enrich（space_id 注入 / mention 顶层键改写）之后，使 512KiB 复检覆盖真实
+	// 出站 payload（与 richtext 的 PR#232 口径一致）。Decision 9 保证 enrich 只
+	// 触碰信封顶层键、card 树永不被改写；下方 OBO 标记 enrich 对卡片不可达
+	// （OBO 卡片已在入站 gate 拒绝）。非 type=17 为 no-op。
+	if err := cardmsg.Finalize(payload); err != nil {
+		ba.Error("InteractiveCard finalize 失败", zap.Error(err), zap.String("channelID", channelID))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+		return
+	}
 
 	// YUJ-1166 fan-out loop guard #3: mark this message so the fan-out
 	// listener (see obo_fanout.go) skips it on the way back through the
@@ -645,6 +688,7 @@ func (ba *BotAPI) readReceipt(c *wkhttp.Context) {
 
 // botMessageEdit handles POST /v1/bot/message/edit.
 func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, sendEditMaxBodyBytes)
 	var req struct {
 		MessageID   string `json:"message_id"`
 		MessageSeq  uint32 `json:"message_seq"`
@@ -706,6 +750,7 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 
 	// Permission: bot can only edit its own messages
 	var msgFromUID string
+	var msgPayload []byte // 原消息 payload（Decision 7 需要判定目标消息是否卡片）
 	if req.MessageSeq > 0 {
 		resp, err := ba.ctx.IMGetWithChannelAndSeqs(req.ChannelID, req.ChannelType, robotID, []uint32{req.MessageSeq})
 		if err != nil {
@@ -725,6 +770,7 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 			)
 		}
 		msgFromUID = resp.Messages[0].FromUID
+		msgPayload = resp.Messages[0].Payload
 	} else {
 		msgIDInt, parseErr := strconv.ParseInt(req.MessageID, 10, 64)
 		if parseErr != nil {
@@ -752,6 +798,7 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 			return
 		}
 		msgFromUID = syncResp.Messages[0].FromUID
+		msgPayload = syncResp.Messages[0].Payload
 		req.MessageSeq = syncResp.Messages[0].MessageSeq
 	}
 	if msgFromUID != robotID {
@@ -782,6 +829,15 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 	// write-strict 校验 + 权威 plain 重算（契约 §2，plain 服务端重算不信客户端）。
 	// 编辑语义为整体替换 content blocks；非 14 / 非 JSON 体为 no-op。脏/超限 payload
 	// 落库前以错误拒绝。MD5 去重 hash 落在 normalize 后的 canonical 体上。
+	// card-message-protocol P1 Decision 7：卡片不可变 —— 目标消息为 type-17、
+	// 或编辑体为 type-17（把普通消息改写成卡片）都在此拒绝。richtext 的
+	// NormalizeContentEdit 是 IsRichTextPayload 门控的，卡片体会「原样、零校验」
+	// 通过（PR#525 round-2 finding #1），故必须先拦。P2 sibling（D6）以 cardmsg
+	// 对称校验 + card_seq CAS 解锁本路径，届时本 reject 退役。
+	if cardmsg.IsCardRawPayload(msgPayload) || cardmsg.IsCardContentEdit(req.ContentEdit) {
+		httperr.ResponseErrorL(c, errcode.ErrBotAPICardEditForbidden, nil, nil)
+		return
+	}
 	normalizedEdit, err := richtext.NormalizeContentEdit(req.ContentEdit)
 	if err != nil {
 		ba.Warn("RichText content_edit 校验失败", zap.Error(err), zap.String("messageID", req.MessageID))

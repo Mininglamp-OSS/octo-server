@@ -974,7 +974,7 @@ func TestBuildSearchAfterFromHit_LegacyDocDefaultsSubSeqZero(t *testing.T) {
 // virtual sub-document with subSeq=N, the encoded cursor must carry N back
 // so the next page's search_after resumes exclusively past (ts, msgID, N).
 // This is the load-bearing end-to-end pin for the cross-page-boundary
-//漏图 fix: without subSeq on the cursor, the next page jumps back to (ts,
+// 漏图 fix: without subSeq on the cursor, the next page jumps back to (ts,
 // msgID, 0)'s implicit position and re-emits / skips siblings.
 func TestComputeCursorPagination_CarriesSubSeq(t *testing.T) {
 	cfg := SearchConfig{CursorHMAC: "k"}
@@ -1106,4 +1106,3 @@ func TestPaginate_VirtualSiblingsCrossPageBoundary(t *testing.T) {
 	}
 	_ = lastSA
 }
-

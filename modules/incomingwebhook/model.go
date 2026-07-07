@@ -111,8 +111,12 @@ type pushPayloadReq struct {
 	Content string `json:"content"`
 	// Text 是 Content 的别名（Slack/部分平台用 "text"）：Content 为空时回退到 Text，
 	// 降低从既有集成迁移的改造成本。两者都填以 Content 为准。
-	Text      string                 `json:"text,omitempty"`
-	Blocks    []webhookBlock         `json:"blocks,omitempty"`
+	Text   string         `json:"text,omitempty"`
+	Blocks []webhookBlock `json:"blocks,omitempty"`
+	// Card 是 msg_type:"card" 的标准 Adaptive Cards 1.5 JSON（octo/v1 白名单
+	// 子集，card-message-protocol P1）。Text 在 card 形态下是可选 plain 种子
+	// （仅当卡片派生 plain 为空时使用，Decision 8）。
+	Card      map[string]interface{} `json:"card,omitempty"`
 	Username  string                 `json:"username,omitempty"`
 	AvatarURL string                 `json:"avatar_url,omitempty"`
 	Extra     map[string]interface{} `json:"extra,omitempty"`
