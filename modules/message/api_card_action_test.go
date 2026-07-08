@@ -37,7 +37,9 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/robot"
+	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/go-redis/redis"
 	"github.com/stretchr/testify/assert"
@@ -174,6 +176,19 @@ func TestCardActionEndToEndAndIdempotency(t *testing.T) {
 	// D11：data 是服务端从生效帧提取的作者静态对象（不可伪造）。
 	assert.Equal(t, map[string]interface{}{"action": "approve", "record_id": float64(42)}, ev.EventData["data"])
 
+	// P2-b 线冻结（PR#548 review）：event_data 键集是对 bot 的稳定线契约(additive-only)。
+	// 全量比对(键数 + 每个键都在白名单)——任何漏加断言的新键 / 改名 / 删键都在此暴露,
+	// 而非等到 bot 端解析出错。新增字段须同步更新 bot 契约文档与此白名单。
+	frozenEventDataKeys := map[string]bool{
+		"message_id": true, "channel_id": true, "channel_type": true,
+		"action_id": true, "operator_uid": true, "client_token": true,
+		"inputs": true, "acted_at": true, "data": true,
+	}
+	assert.Equal(t, len(frozenEventDataKeys), len(ev.EventData), "event_data 键数变更需同步 bot 线契约与本冻结")
+	for k := range ev.EventData {
+		assert.Truef(t, frozenEventDataKeys[k], "event_data 出现未冻结的新键: %s", k)
+	}
+
 	// D4 幂等(round-3 P1-1):去重键是业务身份 (message_id, action_id,
 	// operator_uid) —— 换一个 client_token 重放(模拟 D8 超时后的客户端重试)
 	// 仍是 replay=true,队列恰好 1 条,绝不产生第二个事件。
@@ -247,7 +262,10 @@ func TestCardActionTrustModel(t *testing.T) {
 	w = do(baseBody("9102", cardActionBotUID, "done_btn", "tok-t4"))
 	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
-	// ④ 群频道非成员 → denied(群无成员记录)
+	// ④ 群频道非成员 → denied(群存在且 Normal、但无成员记录 —— 隔离成员门禁;
+	//    群状态门禁 H1/P1-a 由 TestCardActionVisibilityParity 覆盖)
+	_, err = ctx.DB().InsertBySql("INSERT INTO `group`(group_no, name, status, space_id) VALUES(?, 'gc', ?, '')", "g_card_test", group.GroupStatusNormal).Exec()
+	assert.NoError(t, err)
 	seedCardMessage(t, ctx, 9103, cardActionBotUID, "g_card_test", common.ChannelTypeGroup.Uint8(), cardV2EnvelopeJSON(t, "approve_btn"))
 	w = do(map[string]interface{}{
 		"message_id": "9103", "channel_id": "g_card_test",
@@ -281,6 +299,9 @@ func TestCardActionTrustModel(t *testing.T) {
 	//    400;拿 B 的真实 channel_id → 成员资格对存储频道校验,denied。两条路都
 	//    不产生 bot 事件。person 频道变体:fake id 含操作者,天然指不到别人的会话。
 	_, err = ctx.DB().InsertBySql("insert into group_member(group_no,uid) values(?,?)", "g_idor_a", testutil.UID).Exec()
+	assert.NoError(t, err)
+	// g_idor_b 存在且 Normal —— 隔离:该分支唯一拒因是操作者非 B 群成员(denied),而非群状态。
+	_, err = ctx.DB().InsertBySql("INSERT INTO `group`(group_no, name, status, space_id) VALUES(?, 'gb', ?, '')", "g_idor_b", group.GroupStatusNormal).Exec()
 	assert.NoError(t, err)
 	seedCardMessage(t, ctx, 9104, cardActionBotUID, "g_idor_b", common.ChannelTypeGroup.Uint8(), cardV2EnvelopeJSON(t, "approve_btn"))
 	idorBody := func(chID, tok string) map[string]interface{} {
@@ -436,24 +457,72 @@ func TestCardActionClaimConfirmedState(t *testing.T) {
 	}
 }
 
+func TestCardActionReleaseOnlyIfPending(t *testing.T) {
+	// PR#548 review P2-c：Release 必须「仅当仍是 pending 才删」(CAS-del)。否则「首请求
+	// stall >60s → pending 过期 → 重试 claim+confirm」后,原请求的补偿 Release 会误删已
+	// confirm 键、重开去重窗口 → 同一动作二次入队。
+	_, ctx := testutil.NewTestServer()
+	defer func() { _ = testutil.CleanAllTables(ctx) }()
+	resetCardActionState(t, ctx)
+	store := newCardActionClaimStore(ctx)
+
+	// ① pending 态 Release → 删除(正常补偿路径:校验失败释放,纠正后可重新 claim)。
+	pendKey := cardActionClaimKey("m_rel", "a", "pending")
+	if ok, err := store.Claim(pendKey); err != nil || !ok {
+		t.Fatalf("Claim 应成功, ok=%v err=%v", ok, err)
+	}
+	if err := store.Release(pendKey); err != nil {
+		t.Fatalf("Release(pending) 应成功, err=%v", err)
+	}
+	if ok, err := store.Claim(pendKey); err != nil || !ok {
+		t.Errorf("pending 被释放后应可重新 Claim, ok=%v err=%v", ok, err)
+	}
+
+	// ② confirmed 态 Release → **不删**(模拟 stale 请求误删已确认键的场景)。
+	confKey := cardActionClaimKey("m_rel", "a", "confirmed")
+	if ok, err := store.Claim(confKey); err != nil || !ok {
+		t.Fatalf("Claim 应成功, ok=%v err=%v", ok, err)
+	}
+	if ok, err := store.Confirm(confKey, 999); err != nil || !ok {
+		t.Fatalf("Confirm 应成功, ok=%v err=%v", ok, err)
+	}
+	if err := store.Release(confKey); err != nil {
+		t.Fatalf("Release(confirmed) 不应报错(只是不删), err=%v", err)
+	}
+	// 键仍在且仍是 confirmed:去重窗口未被重开 —— 新 Claim(SET NX)应失败。
+	if c, err := store.Confirmed(confKey); err != nil || !c {
+		t.Errorf("confirmed 键不应被 Release 误删, c=%v err=%v", c, err)
+	}
+	if ok, err := store.Claim(confKey); err != nil || ok {
+		t.Errorf("confirmed 键仍在 → 新 Claim 应失败(去重窗口未重开), ok=%v err=%v", ok, err)
+	}
+}
+
 func TestCardActionVisibilityParity(t *testing.T) {
-	// PR#548 review round-3 P1：card/action 必须与单条读 respondSingleMessage 的
-	// canonical 可见性同口径 —— 被 visibles 白名单排除的群成员读路径 404，触发
-	// card/action 也必须拒，否则能对不可见卡片触发 bot 副作用。
+	// PR#548 review：card/action 必须与单条读 respondSingleMessage 的 canonical 可见性
+	// 同口径。读路径 404 的不可见状态 —— visibles 白名单排除(round-3 P1)、群被管理员禁用
+	// (H1/P1-a)、子区已删除(P2-a) —— 触发 card/action 都必须拒,否则能对不可见卡片触发
+	// bot 副作用。
 	t.Setenv(cardmsg.EnvEnabled, "true")
 	s, ctx := testutil.NewTestServer()
 	defer func() { _ = testutil.CleanAllTables(ctx) }()
 	resetCardActionState(t, ctx)
 
 	seedCardBot(t, ctx, cardActionBotUID)
-	_, err := ctx.DB().InsertBySql("insert into group_member(group_no,uid) values(?,?)", "g_vis", testutil.UID).Exec()
+	// g_vis 正常群(status=Normal)+ 操作者为成员 —— 让 9601/9602 的唯一区分点落在 visibles。
+	_, err := ctx.DB().InsertBySql("INSERT INTO `group`(group_no, name, status, space_id) VALUES(?, 'vis', ?, '')", "g_vis", group.GroupStatusNormal).Exec()
+	assert.NoError(t, err)
+	_, err = ctx.DB().InsertBySql("insert into group_member(group_no,uid) values(?,?)", "g_vis", testutil.UID).Exec()
 	assert.NoError(t, err)
 
-	do := func(msgID, tok string) *httptest.ResponseRecorder {
+	rds := redis.NewClient(&redis.Options{Addr: ctx.GetConfig().DB.RedisAddr, Password: ctx.GetConfig().DB.RedisPass})
+	defer rds.Close()
+
+	do := func(msgID, channelID string, channelType uint8, tok string) *httptest.ResponseRecorder {
 		w := httptest.NewRecorder()
 		req, _ := http.NewRequest("POST", "/v1/message/card/action", bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
-			"message_id": msgID, "channel_id": "g_vis",
-			"channel_type": common.ChannelTypeGroup.Uint8(),
+			"message_id": msgID, "channel_id": channelID,
+			"channel_type": channelType,
 			"action_id":    "approve_btn", "client_token": tok,
 		}))))
 		req.Header.Set("token", testutil.Token)
@@ -471,21 +540,55 @@ func TestCardActionVisibilityParity(t *testing.T) {
 		b, _ := json.Marshal(env)
 		return b
 	}
+	assertNoNewEvent := func(before int64, label string) {
+		after, _ := rds.ZCard("robotEvent:" + cardActionBotUID).Result()
+		assert.Equal(t, before, after, label+"：拒绝不得新增 bot 事件")
+	}
 
-	// visibles 只含别人(不含操作者)→ 虽是群成员 + bot 发送 + 未撤回，仍必须拒。
+	// ① visibles 只含别人(不含操作者)→ 虽是群成员 + bot 发送 + 未撤回，仍必须拒。
 	seedCardMessage(t, ctx, 9601, cardActionBotUID, "g_vis", common.ChannelTypeGroup.Uint8(), withVisibles("someone_else"))
-	w := do("9601", "tok-vis1")
+	before, _ := rds.ZCard("robotEvent:" + cardActionBotUID).Result()
+	w := do("9601", "g_vis", common.ChannelTypeGroup.Uint8(), "tok-vis1")
 	assert.Equal(t, http.StatusBadRequest, w.Code, "visibles 排除的成员触发 card/action 应拒")
 	assert.Contains(t, w.Body.String(), "Invalid card action.")
-	rds := redis.NewClient(&redis.Options{Addr: ctx.GetConfig().DB.RedisAddr, Password: ctx.GetConfig().DB.RedisPass})
-	defer rds.Close()
-	n, _ := rds.ZCard("robotEvent:" + cardActionBotUID).Result()
-	assert.Equal(t, int64(0), n, "visibles 拒绝不得产生 bot 事件")
+	assertNoNewEvent(before, "visibles 排除")
 
-	// 对照:visibles 含操作者 → 放行(不误伤合法可见成员)。
+	// ② 对照:visibles 含操作者 → 放行(不误伤合法可见成员)。
 	seedCardMessage(t, ctx, 9602, cardActionBotUID, "g_vis", common.ChannelTypeGroup.Uint8(), withVisibles(testutil.UID))
-	w = do("9602", "tok-vis2")
+	w = do("9602", "g_vis", common.ChannelTypeGroup.Uint8(), "tok-vis2")
 	assert.Equal(t, http.StatusOK, w.Code, "visibles 含操作者应放行, body=%s", w.Body.String())
+
+	// ③ H1/P1-a：管理员禁用群(GroupStatusDisabled)—— 禁用只置 group.Status=Disabled、
+	//    成员行仍 Normal、ExistMemberActive 照过;读路径 requireGroupMember 已 404,动作
+	//    路径必须同样拒(在成员门禁之前先判群状态,归并 invalid 防枚举)。
+	_, err = ctx.DB().InsertBySql("INSERT INTO `group`(group_no, name, status, space_id) VALUES(?, 'dis', ?, '')", "g_dis", group.GroupStatusDisabled).Exec()
+	assert.NoError(t, err)
+	_, err = ctx.DB().InsertBySql("insert into group_member(group_no,uid) values(?,?)", "g_dis", testutil.UID).Exec()
+	assert.NoError(t, err)
+	seedCardMessage(t, ctx, 9603, cardActionBotUID, "g_dis", common.ChannelTypeGroup.Uint8(), cardV2EnvelopeJSON(t, "approve_btn"))
+	before, _ = rds.ZCard("robotEvent:" + cardActionBotUID).Result()
+	w = do("9603", "g_dis", common.ChannelTypeGroup.Uint8(), "tok-dis")
+	assert.Equal(t, http.StatusBadRequest, w.Code, "禁用群触发 card/action 应拒")
+	assert.Contains(t, w.Body.String(), "Invalid card action.")
+	assertNoNewEvent(before, "禁用群")
+
+	// ④ P2-a：CommunityTopic 子区已删除(ThreadStatusDeleted)—— 父群 Normal + 成员齐备,
+	//    唯一拒因是子区状态(隔离该门禁);读路径 getThreadMessage 同样 404。归档子区不拒。
+	const topicGroup = "g_topic"
+	const topicShort = "100000000000001" // 15 位纯数字,满足 IsValidShortID
+	_, err = ctx.DB().InsertBySql("INSERT INTO `group`(group_no, name, status, space_id) VALUES(?, 'tg', ?, '')", topicGroup, group.GroupStatusNormal).Exec()
+	assert.NoError(t, err)
+	_, err = ctx.DB().InsertBySql("insert into group_member(group_no,uid) values(?,?)", topicGroup, testutil.UID).Exec()
+	assert.NoError(t, err)
+	_, err = ctx.DB().InsertBySql("INSERT INTO thread(short_id, group_no, name, creator_uid, status, version) VALUES(?, ?, 'del', ?, ?, 1)", topicShort, topicGroup, cardActionBotUID, thread.ThreadStatusDeleted).Exec()
+	assert.NoError(t, err)
+	topicChannel := thread.BuildChannelID(topicGroup, topicShort)
+	seedCardMessage(t, ctx, 9604, cardActionBotUID, topicChannel, common.ChannelTypeCommunityTopic.Uint8(), cardV2EnvelopeJSON(t, "approve_btn"))
+	before, _ = rds.ZCard("robotEvent:" + cardActionBotUID).Result()
+	w = do("9604", topicChannel, common.ChannelTypeCommunityTopic.Uint8(), "tok-thr")
+	assert.Equal(t, http.StatusBadRequest, w.Code, "已删除子区触发 card/action 应拒, body=%s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "Invalid card action.")
+	assertNoNewEvent(before, "已删除子区")
 }
 
 // 验收(P2 D4, round-3 P1-1):入队失败 → 内部封套 + 补偿释放 claim,同一操作者

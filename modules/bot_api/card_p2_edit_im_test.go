@@ -308,6 +308,11 @@ func TestBotCardEditConcurrentCASIM(t *testing.T) {
 // 帧与无 card_seq 帧时,两分支取同一把 message_id 行锁,version 分配序 == 提交序,行
 // version 绝不回退 —— delta-sync(version>? 游标)不丢终帧。修复前非 CAS 分支锁外前置
 // 分配 version,低 version 的无 card_seq 帧后提交会覆盖并发 CAS 帧已提交的高 version。
+// TestBotCardEditMixedFrameVersionMonotonicIM 验证混发 CAS/非 CAS 帧时 version 不回退
+// (finalVersion ≥ 采样峰值) —— 但**仅覆盖单进程内**保证(PR#548 review H2/P1-b)：本测试跑
+// 在单个进程里、共享同一个 GenSeq HiLo 分配器,验证的是「锁内分配使分配序==提交序」关掉的
+// **进程内**竞态。跨副本单调性本测试观测不到(GenSeq 进程级号段,多实例可回退),那是既有性质、
+// 需频道级全序源才能根治,超出 #548 —— 详见 send.go cardVersionInLockWrite 注释 H2/P1-b。
 func TestBotCardEditMixedFrameVersionMonotonicIM(t *testing.T) {
 	skipWithoutIMBot(t)
 	t.Setenv(cardmsg.EnvEnabled, "true")
@@ -414,8 +419,8 @@ func TestBotCardEditMixedFrameVersionMonotonicIM(t *testing.T) {
 	assert.NoError(t, err)
 	pollMu.Lock()
 	defer pollMu.Unlock()
-	assert.False(t, wentBackward, "混发 CAS/非 CAS 帧下 version 观测到回退(非 CAS 分支锁外分配的 lost-update)")
-	assert.GreaterOrEqual(t, finalVersion, maxSeen, "最终 version 必 ≥ 采样峰值(无低 version 覆盖高 version)")
+	assert.False(t, wentBackward, "单进程内混发 CAS/非 CAS 帧下 version 观测到回退(非 CAS 分支锁外分配的 lost-update)")
+	assert.GreaterOrEqual(t, finalVersion, maxSeen, "单进程内最终 version 必 ≥ 采样峰值(无低 version 覆盖高 version;跨副本不保证,见函数注释)")
 }
 
 // TestBotCardEditOwnershipAndLifecycleIM 验收 PR#548 review 两项补强:

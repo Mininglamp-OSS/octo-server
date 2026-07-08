@@ -1030,7 +1030,8 @@ func (ba *BotAPI) cardSeqCASWrite(messageID string, messageSeq uint32, fakeChann
 		}
 		return true, nil
 	}
-	// 锁内分配 version（见函数注释 P1-2）：仅 advancing 写才消费 version,冲突帧不消费。
+	// 锁内分配 version（见函数注释 P1-2；跨副本单调性范围见 cardVersionInLockWrite 注释
+	// H2/P1-b）：仅 advancing 写才消费 version,冲突帧不消费。
 	version, err := ba.ctx.GenSeq(fmt.Sprintf("%s:%s", common.MessageExtraSeqKey, fakeChannelID))
 	if err != nil {
 		return false, err
@@ -1052,6 +1053,16 @@ func (ba *BotAPI) cardSeqCASWrite(messageID string, messageSeq uint32, fakeChann
 // 锁),使 version 分配序 == 提交序,杜绝锁外前置分配的低 version 覆盖并发写(CAS 或非
 // CAS)已提交的高 version 造成的 delta-sync 终帧丢失(PR#548 review P1)。不比较、不写
 // card_seq(保持 LWW 语义与既有 card_seq 值不变)。
+//
+// 单调性范围(PR#548 review H2/P1-b，纠正过度声明)：version 取自 ctx.GenSeq —— octo-lib
+// 的**进程内 HiLo 分配器**(进程级 seqMap+Mutex,每进程预留 seqStep=1000 的号段,DB 只补
+// 号段)。故「分配序==提交序」仅在**单进程内**成立:多副本部署下,持较低号段的实例可能在较
+// 高 version 提交后才抢到行锁、写入更低的 version;delta-sync(db_message_extra.go
+// `where version>? order by version asc`)会永久跳过该终帧,直到该客户端整表 resync。此为
+// **既有性质**(origin/main 富文本编辑亦用同一 GenSeq,本 PR 不触 config/seq.go),非本 PR
+// 引入 —— 本函数只关掉**进程内**竞态,TestBotCardEditMixedFrameVersionMonotonicIM 亦只验
+// 单进程。彻底的跨副本单调需把 version 换成频道级全序源(DB/Redis 原子计数),牵动所有
+// version 载体(含富文本),超出 #548 范围,列为后续。
 func (ba *BotAPI) cardVersionInLockWrite(messageID string, messageSeq uint32, fakeChannelID string, channelType uint8, contentEdit, contentMD5 string, editedAt int) error {
 	tx, err := ba.ctx.DB().Begin()
 	if err != nil {
@@ -1060,9 +1071,10 @@ func (ba *BotAPI) cardVersionInLockWrite(messageID string, messageSeq uint32, fa
 	defer tx.RollbackUnlessCommitted()
 
 	// 取行锁串行化 version 分配(与 cardSeqCASWrite 同一把锁);行不存在时 FOR UPDATE
-	// 取 next-key 锁,让并发首帧也串行。
-	var locked dbr.NullInt64
-	if selErr := tx.SelectBySql("SELECT card_seq FROM message_extra WHERE message_id=? FOR UPDATE", messageID).LoadOne(&locked); selErr != nil && selErr != dbr.ErrNotFound {
+	// 取 next-key 锁,让并发首帧也串行。查出的 card_seq 仅作 LoadOne 目标、刻意不参与下方
+	// upsert(LWW 不动 card_seq) —— 本 SELECT 唯一目的是持锁(PR#548 review nit)。
+	var lockHold dbr.NullInt64
+	if selErr := tx.SelectBySql("SELECT card_seq FROM message_extra WHERE message_id=? FOR UPDATE", messageID).LoadOne(&lockHold); selErr != nil && selErr != dbr.ErrNotFound {
 		return selErr
 	}
 	version, err := ba.ctx.GenSeq(fmt.Sprintf("%s:%s", common.MessageExtraSeqKey, fakeChannelID))

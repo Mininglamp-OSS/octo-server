@@ -158,10 +158,14 @@ func NormalizeContentEdit(contentEdit string) (string, error) {
 
 // CardSeq 读取信封可选的单调帧序号 card_seq（P2 D9 乱序防护）。缺失/非数值
 // 返回 (0, false) —— 无 card_seq 时行为退化为 last-write-wins（单写者 bot 零迁移）。
+//
+// 刻意不接受 float64（PR#548 review P2-d）：float64 尾数仅 52 位,>2^53 的雪花号 /
+// 纳秒 epoch 会被静默坍缩,令 D9 CAS 失真。所有实时调用方经 decodeEnvelope(UseNumber)
+// → json.Number(见 CardSeqFromContentEdit);int/int64 仅供程序化构造,三者皆 int64
+// 精确。若未来有调用方误用裸 json.Unmarshal(→float64),这里返回 (0,false) 退化为 LWW,
+// 而非接受一个被截断的错误序号 —— fail-safe。
 func CardSeq(payload map[string]interface{}) (int64, bool) {
 	switch v := payload["card_seq"].(type) {
-	case float64:
-		return int64(v), true
 	case int:
 		return int64(v), true
 	case int64:

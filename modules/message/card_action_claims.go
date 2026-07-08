@@ -96,8 +96,20 @@ func (s *cardActionClaimStore) Confirmed(key string) (bool, error) {
 	return v != cardActionClaimPending, nil
 }
 
-// Release 入队失败的补偿删除。返回 Redis 错误供调用方记日志（删不掉只是残留至多
-// 60s pending，不影响正确性，但便于发现系统性 Redis 故障）。
+// releaseIfPendingScript 仅当键仍是 pending 时删除（GET==pending 才 DEL，EVAL 内
+// GET+DEL 原子）。避免「首请求 stall >60s → pending 过期 → 重试 claim+confirm(idemTTL)
+// 后，原请求补偿 Release 若无条件 DEL 会误删已 confirm 键 → 去重窗口重开、同一动作
+// 二次入队」（PR#548 review P2-c）。返回被删的键数（1/0），调用方只关心 err。
+var releaseIfPendingScript = rd.NewScript(`
+if redis.call("get", KEYS[1]) == ARGV[1] then
+	return redis.call("del", KEYS[1])
+end
+return 0
+`)
+
+// Release 入队失败的补偿删除 —— 仅当键仍是 pending 时删（CAS-del，见 releaseIfPendingScript）：
+// 键已被并发重试 confirm 时不动它，杜绝误删已确认 claim 而重开去重窗口。返回 Redis 错误
+// 供调用方记日志（删不掉只是残留至多 60s pending，不影响正确性，但便于发现系统性 Redis 故障）。
 func (s *cardActionClaimStore) Release(key string) error {
-	return s.client.Del(key).Err()
+	return releaseIfPendingScript.Run(s.client, []string{key}, cardActionClaimPending).Err()
 }

@@ -30,6 +30,8 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
@@ -114,13 +116,49 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 		}
 	default:
 		groupNo := msgM.ChannelID
+		var threadShortID string
 		if msgM.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
-			parent, err := m.resolveParentGroupNo(msgM.ChannelID)
-			if err != nil {
+			parent, shortID, perr := thread.ParseChannelID(msgM.ChannelID)
+			if perr != nil {
 				respondMessageRequestInvalid(c, "channel_id")
 				return
 			}
 			groupNo = parent
+			threadShortID = shortID
+		}
+		// D3 ②群状态门禁(PR#548 review H1/P1-a)：复刻单条读 requireGroupMember
+		// (api_message_get.go:184) —— 仅 GroupStatusNormal + Disband 可见,Disabled
+		// (管理员禁用)及未来非正常状态 fail closed。原动作路径只查成员资格、漏了群状态：
+		// 禁用群会置 group.Status=Disabled 但成员行仍 status=Normal、ExistMemberActive
+		// 照样为 true —— 于是被禁用群里的成员读路径已 404,却仍能枚举 message_id 触发
+		// bot 副作用。归并单一 invalid(防枚举)。Disband 与读路径同口径放行(bot 编辑路径
+		// 自身 isGroupDisbanded 拦解散群,副作用无法落地,不在此额外收紧)。
+		statusVisible, serr := m.groupStatusVisibleForAction(groupNo)
+		if serr != nil {
+			m.Error("查询群状态失败", zap.Error(serr), zap.String("groupNo", groupNo))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		if !statusVisible {
+			m.Warn("卡片动作目标群非可见状态,拒绝", zap.String("groupNo", groupNo))
+			httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
+			return
+		}
+		// D3 ②子区状态门禁(PR#548 review P2-a)：复刻单条读 getThreadMessage
+		// (api_message_get.go:139) —— 已删除子区(ThreadStatusDeleted)按不存在处理;
+		// 归档子区允许(读历史,与读路径同口径)。
+		if threadShortID != "" {
+			t, terr := m.threadDB.QueryByGroupNoAndShortID(groupNo, threadShortID)
+			if terr != nil {
+				m.Error("查询子区失败", zap.Error(terr), zap.String("groupNo", groupNo), zap.String("shortID", threadShortID))
+				httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+				return
+			}
+			if t == nil || t.Status == thread.ThreadStatusDeleted {
+				m.Warn("卡片动作目标子区已删除,拒绝", zap.String("groupNo", groupNo), zap.String("shortID", threadShortID))
+				httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
+				return
+			}
 		}
 		isMember, err := m.groupService.ExistMemberActive(groupNo, loginUID)
 		if err != nil {
@@ -386,4 +424,22 @@ func (m *Message) groupSpaceIDOrEmpty(groupNo string) string {
 		return ""
 	}
 	return g.SpaceID
+}
+
+// groupStatusVisibleForAction 复刻单条读 requireGroupMember 的群状态门禁
+// (api_message_get.go:184)：仅 GroupStatusNormal + GroupStatusDisband 可见,
+// Disabled(管理员禁用)及未来非正常状态 fail closed。刻意用 groupDB.QueryWithGroupNo
+// (与 requireGroupMember 同一读法)而非 groupService.GetGroupWithGroupNo：后者把「群不存在」
+// 也返回成 error,会被误判成 ErrMessageQueryFailed;QueryWithGroupNo 群不存在返回 (nil,nil)
+// → 判不可见(归并 invalid,与读路径 g==nil→NotFound 同口径),仅真实 DB 错误才 (false,err)
+// → 调用方回 ErrMessageQueryFailed(fail-closed:安全门禁查询失败绝不放行)。
+func (m *Message) groupStatusVisibleForAction(groupNo string) (bool, error) {
+	g, err := m.groupDB.QueryWithGroupNo(groupNo)
+	if err != nil {
+		return false, err
+	}
+	if g == nil || (g.Status != group.GroupStatusNormal && g.Status != group.GroupStatusDisband) {
+		return false, nil
+	}
+	return true, nil
 }

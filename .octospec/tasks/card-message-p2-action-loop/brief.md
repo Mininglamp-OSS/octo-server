@@ -310,6 +310,17 @@ interactive cards, receive actions, and rewrite state.
   bot side-effect on a card they cannot see. Person DMs (2-party, `visibles`
   n/a) keep membership+lifecycle gating. Test: `TestCardActionVisibilityParity`
   (visibles-excluded member → rejected + no event; visibles-included → allowed).
+  **PR#548 review 补强 (round-4 — group/thread status parity, H1/P1-a + P2-a):** round-3
+  still missed two read-path gates the action path also owes. (i) A group in
+  `GroupStatusDisabled` (admin moderation): `requireGroupMember` 404s it, but
+  `ExistMemberActive` still returns true (disabling leaves member rows `status=Normal`),
+  so a disabled-group member could still fire the bot side-effect. Now gated by
+  `groupStatusVisibleForAction` (mirrors `requireGroupMember`: only `Normal`/`Disband`
+  visible; uses `groupDB.QueryWithGroupNo` so a missing group is `nil`→collapsed-invalid,
+  not a query error). (ii) A CommunityTopic whose thread is `ThreadStatusDeleted`
+  (`getThreadMessage` 404s it) — now gated in the topic branch. Both collapse to
+  `invalid`, no event. `TestCardActionVisibilityParity` extended: disabled group →
+  rejected + no new event; deleted thread → rejected + no new event.
 - **Input validation (D11)**: `inputs` key not declared in the effective frame
   → 400; `Input.ChoiceSet` value outside declared choices → 400; `Input.Text`
   value > 4 KiB → 400; valid declared inputs arrive in `event_data.inputs`
@@ -336,6 +347,21 @@ interactive cards, receive actions, and rewrite state.
   higher version, overwrites it and delta-sync (`version>?`) permanently misses
   the final frame. Test: `TestBotCardEditMixedFrameVersionMonotonicIM` (concurrent
   interleaved CAS + non-CAS frames → row `version` never regresses, final ≥ peak).
+  **PR#548 review 补强 (round-4 — version monotonicity scope, H2/P1-b):** the "version
+  never regresses" guarantee holds **only intra-process**, and the claim was scoped down
+  to say so. `version` comes from `ctx.GenSeq`, a per-process HiLo allocator
+  (process-global `seqMap`+mutex, per-process `seqStep=1000` block); the `FOR UPDATE` row
+  lock serializes the *write* but not the *allocation value* — across replicas a
+  lower-block instance can commit a lower version after a higher one, and delta-sync
+  (`version>?`) then permanently skips the terminal frame until a full resync. This is
+  **pre-existing** (richtext edit shares `GenSeq`; the PR doesn't touch `config/seq.go`),
+  not #548-introduced; the fix is honesty — the `cardVersionInLockWrite` comment, the
+  (single-process) test, and this brief now state the intra-process scope. A true
+  cross-replica fix needs a channel-level totally-ordered version source (DB/Redis
+  counter) touching **all** version carriers (richtext included) → out of scope for #548,
+  tracked as follow-up. (Reviewer contradiction resolved from octo-lib `config/seq.go`
+  source: yujiawei/Jerry-Xin correct that `GenSeq` is process-local; OctoBoooot's initial
+  "row lock ⇒ cross-replica monotonic" retracted after byte-reading the allocator.)
 - **Rate limiting**: a route-mount test asserts `SharedUIDRateLimiter` is
   mounted after `AuthMiddleware` on the `/v1/message` group that carries
   `/card/action`.
@@ -352,6 +378,9 @@ interactive cards, receive actions, and rewrite state.
   `TestCardActionD8SharedWindowConstant` asserts `idemTTL == Robot.MessageExpire`.
 - **Wire freeze**: a contract test pins the `card_action` `event_data` field
   set to the frozen example (additive-only).
+  **PR#548 review 补强 (round-4 — P2-b):** `TestCardActionEndToEndAndIdempotency` now
+  asserts the **full** `event_data` key set (count + whitelist), not just individual
+  keys, so an accidental added / renamed / dropped key is caught, not silently shipped.
 - **PR#548 review 补强 (round-2 P2 + CI):** (a) **replay only for a *confirmed*
   claim** — a bare-`pending` claim (concurrent first request still in flight)
   returns a retryable `409 ErrMessageCardActionInProgress`, not a false
@@ -366,3 +395,15 @@ interactive cards, receive actions, and rewrite state.
   entirely), so it no longer collides with the package's bare-create unit tests
   under `-race -shuffle` (`Error 1050 Table already exists`). bot-side D6/D9 CAS
   stays CI-covered via `modules/bot_api`.
+- **PR#548 review 补强 (round-4 — P2 cleanups):** (a) **P2-c** — `Release` is now a
+  release-only-if-pending Lua CAS-del (`releaseIfPendingScript`): a >60s-stalled
+  request's compensating release no longer deletes a *confirmed* claim written by a
+  concurrent retry (which would reopen the dedup window and double-enqueue).
+  `TestCardActionReleaseOnlyIfPending` asserts a confirmed key survives a stale release
+  while a pending key is still deleted. (b) **P2-d** — the dead `case float64` in
+  `cardmsg.CardSeq` is removed: all live callers decode via `UseNumber`→`json.Number`, so
+  a stray `json.Unmarshal`-fed `float64` would only silently truncate `>2^53`; the
+  remaining `int/int64/json.Number` cases are all exact, and an unrecognised type now
+  fail-safes to LWW `(0,false)` instead of accepting a truncated seq. (c) group/thread
+  status test fixtures seed proper `group` rows (the canonical read path requires them
+  too, so this is fixture-completion, not a behaviour change).

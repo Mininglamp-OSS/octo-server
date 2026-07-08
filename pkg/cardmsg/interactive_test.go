@@ -379,9 +379,16 @@ func TestCardSeqReads(t *testing.T) {
 	if _, ok := CardSeq(env); ok {
 		t.Error("无 card_seq 应 ok=false")
 	}
-	env["card_seq"] = float64(3)
+	// json.Number 口径（BindJSON/decodeEnvelope UseNumber 场景，实时唯一入口）；
+	// float64 已刻意不再接受（PR#548 review P2-d，防 >2^53 静默坍缩）。
+	env["card_seq"] = json.Number("3")
 	if seq, ok := CardSeq(env); !ok || seq != 3 {
 		t.Errorf("card_seq 应为 3, got %d ok=%v", seq, ok)
+	}
+	// float64 不再被识别 → 退化为 (0,false)（fail-safe，绝不接受被截断的序号）。
+	env["card_seq"] = float64(3)
+	if _, ok := CardSeq(env); ok {
+		t.Error("float64 card_seq 应不被接受(P2-d)")
 	}
 
 	// json.Number 口径（BindJSON UseNumber 场景）。
