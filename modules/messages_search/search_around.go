@@ -163,7 +163,8 @@ func (h *Handler) fetchAnchor(ctx context.Context, client *elastic.Client, req S
 		Routing(normID).
 		Query(b).
 		Size(1).
-		TrackTotalHits(false)
+		TrackTotalHits(false).
+		FetchSourceContext(fileContentSourceExcludes())
 	svc = applySort(svc, "time_asc")
 	res, err := svc.Do(ctx)
 	if err != nil {
@@ -205,7 +206,8 @@ func (h *Handler) aroundDirection(ctx context.Context, client *elastic.Client, r
 			Routing(normID).
 			Query(dsl).
 			Size(size).
-			TrackTotalHits(false)
+			TrackTotalHits(false).
+			FetchSourceContext(fileContentSourceExcludes())
 		svc = applySort(svc, sortMode)
 		if len(searchAfter) > 0 {
 			svc = svc.SearchAfter(searchAfter...)

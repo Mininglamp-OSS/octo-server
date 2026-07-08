@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -791,6 +793,60 @@ func TestFileContentSourceExcludes_WiredIntoSearchSource(t *testing.T) {
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("SearchSource missing %q in:\n%s", want, body)
+		}
+	}
+}
+
+// TestEveryClientSearchAttachesFileContentSourceExcludes is the structural
+// guard that every file-reachable OS Search call in the module attaches the
+// shared file-body excludes. Scanning source rather than mocking each handler
+// is the same pattern as no_zinc_fallthrough_test.go — it catches a whole
+// class of regressions (a future endpoint added without the exclude, or a
+// silent drop from an existing chain) that per-handler tests would miss.
+//
+// Contract: for every non-test .go file in this directory, the count of
+// `client.Search()` occurrences must equal the count of
+// `fileContentSourceExcludes()` occurrences. The two file-reachable svc
+// chains inside search_around.go are the direct motivation for this pin —
+// see PR #554 review — but the guard is deliberately module-wide so any
+// future file-returning endpoint stays covered without a plan update.
+func TestEveryClientSearchAttachesFileContentSourceExcludes(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Clean(name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		// Strip // line comments so doc references (e.g. a comment naming
+		// `client.Search()` for cross-reference) don't skew the count — only
+		// live call sites matter.
+		var clean strings.Builder
+		for _, line := range strings.Split(string(data), "\n") {
+			if idx := strings.Index(line, "//"); idx >= 0 {
+				line = line[:idx]
+			}
+			clean.WriteString(line)
+			clean.WriteByte('\n')
+		}
+		src := clean.String()
+		searches := strings.Count(src, "client.Search()")
+		if searches == 0 {
+			continue
+		}
+		excludes := strings.Count(src, "fileContentSourceExcludes()")
+		if excludes < searches {
+			t.Errorf("%s: %d `client.Search()` call(s) but only %d "+
+				"`fileContentSourceExcludes()` — every file-reachable Search "+
+				"call must attach the shared _source excludes so the "+
+				"extracted file body never leaks to the wire",
+				name, searches, excludes)
 		}
 	}
 }
