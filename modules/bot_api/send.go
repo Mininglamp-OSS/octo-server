@@ -956,20 +956,21 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 			return
 		}
 	} else {
-		// 非 card_seq 帧:last-write-wins 不变(D9,单写 bot 与既有编辑零行为变化)。
-		// 无 CAS 竞争重排,version 前置分配即可。
-		version, verr := ba.ctx.GenSeq(fmt.Sprintf("%s:%s", common.MessageExtraSeqKey, fakeChannelID))
-		if verr != nil {
-			ba.Error("生成消息扩展序列号失败！", zap.Error(verr))
-			httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
-			return
+		// 非 card_seq 帧:last-write-wins(D9,单写 bot 与既有编辑零行为变化)。仍须在
+		// 行锁内分配 version —— 锁外前置分配会让并发写(与 CAS 帧、或与另一非 CAS 帧)
+		// 的 version 分配序 ≠ 提交序:低 version 的 upsert 若后提交会覆盖已提交的高
+		// version,令 delta-sync(version>? 游标)永久漏掉终帧(PR#548 review P1，与 CAS
+		// 分支同一类单调性缺陷)。有界重试化解 InnoDB 死锁(与 CAS 写同口径)。
+		var werr error
+		for attempt := 0; attempt < cardSeqCASMaxAttempts; attempt++ {
+			werr = ba.cardVersionInLockWrite(req.MessageID, req.MessageSeq, fakeChannelID, req.ChannelType, contentEdit, contentMD5, editedAt)
+			if werr == nil || !isRetriableMySQLLockErr(werr) {
+				break
+			}
+			time.Sleep(time.Duration(attempt+1) * 3 * time.Millisecond)
 		}
-		_, err = ba.ctx.DB().InsertBySql(
-			"INSERT INTO message_extra (message_id,message_seq,channel_id,channel_type,content_edit,content_edit_hash,edited_at,version) VALUES (?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE content_edit=VALUES(content_edit),content_edit_hash=VALUES(content_edit_hash),edited_at=VALUES(edited_at),version=VALUES(version)",
-			req.MessageID, req.MessageSeq, fakeChannelID, req.ChannelType, contentEdit, contentMD5, editedAt, version,
-		).Exec()
-		if err != nil {
-			ba.Error("添加或修改编辑内容失败！", zap.Error(err))
+		if werr != nil {
+			ba.Error("card 编辑(无 card_seq)写入失败！", zap.Error(werr), zap.String("messageID", req.MessageID))
 			httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
 			return
 		}
@@ -1044,6 +1045,37 @@ func (ba *BotAPI) cardSeqCASWrite(messageID string, messageSeq uint32, fakeChann
 		return false, err
 	}
 	return false, nil
+}
+
+// cardVersionInLockWrite 无 card_seq 的卡片编辑(LWW)写入：在行锁内分配 version 后
+// upsert content_edit —— 与 cardSeqCASWrite 取同一把 message_id 行锁(不存在则 next-key
+// 锁),使 version 分配序 == 提交序,杜绝锁外前置分配的低 version 覆盖并发写(CAS 或非
+// CAS)已提交的高 version 造成的 delta-sync 终帧丢失(PR#548 review P1)。不比较、不写
+// card_seq(保持 LWW 语义与既有 card_seq 值不变)。
+func (ba *BotAPI) cardVersionInLockWrite(messageID string, messageSeq uint32, fakeChannelID string, channelType uint8, contentEdit, contentMD5 string, editedAt int) error {
+	tx, err := ba.ctx.DB().Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	// 取行锁串行化 version 分配(与 cardSeqCASWrite 同一把锁);行不存在时 FOR UPDATE
+	// 取 next-key 锁,让并发首帧也串行。
+	var locked dbr.NullInt64
+	if selErr := tx.SelectBySql("SELECT card_seq FROM message_extra WHERE message_id=? FOR UPDATE", messageID).LoadOne(&locked); selErr != nil && selErr != dbr.ErrNotFound {
+		return selErr
+	}
+	version, err := ba.ctx.GenSeq(fmt.Sprintf("%s:%s", common.MessageExtraSeqKey, fakeChannelID))
+	if err != nil {
+		return err
+	}
+	if _, err = tx.InsertBySql(
+		"INSERT INTO message_extra (message_id,message_seq,channel_id,channel_type,content_edit,content_edit_hash,edited_at,version) VALUES (?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE content_edit=VALUES(content_edit),content_edit_hash=VALUES(content_edit_hash),edited_at=VALUES(edited_at),version=VALUES(version)",
+		messageID, messageSeq, fakeChannelID, channelType, contentEdit, contentMD5, editedAt, version,
+	).Exec(); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // isRetriableMySQLLockErr 识别 InnoDB 可重试锁错误：1213 死锁 / 1205 锁等待超时

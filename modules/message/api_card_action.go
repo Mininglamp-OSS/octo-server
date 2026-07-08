@@ -179,6 +179,50 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 		return
 	}
 
+	// D3 ④ canonical 可见性对齐（PR#548 review P1）：card/action 必须与单条读
+	// respondSingleMessage 同口径 —— 否则被 visibles 排除 / 已清理历史的成员，虽过了
+	// 成员+sender+revoke/删除门禁，仍能枚举可读的 message_id 触发不可见卡片的 bot
+	// 副作用。上面已覆盖 revoke/is_deleted + 操作者本地删除；这里补 visibles 白名单
+	// + 消息过期 + 用户清理偏移 + 频道偏移。全部归并到单一 invalid（防枚举）。
+	// visibles 白名单：基于原始 payload 字节解析，对 type-17 卡片同样生效。
+	if !visiblesAllows(msgM.Payload, loginUID) {
+		m.Warn("卡片动作目标消息 visibles 未命中,拒绝", zap.String("messageID", req.MessageID), zap.String("uid", loginUID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
+		return
+	}
+	// 消息自身过期（Expire 秒 TTL，自 Timestamp 起算）—— 与 from() 同口径。
+	if msgM.Expire > 0 && time.Now().Unix()-int64(msgM.Expire) >= int64(msgM.Timestamp) {
+		m.Warn("卡片动作目标消息已过期,拒绝", zap.String("messageID", req.MessageID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
+		return
+	}
+	// 用户清理偏移 + 频道偏移 —— 消息存储频道 msgM.ChannelID 即读路径 channelID
+	// （group=groupNo / topic=topic 频道）。person 单条读不经 respondSingleMessage、
+	// 偏移语义未确立，跳过（2 方 DM：visibles 恒过，已由成员+生命周期门禁兜住），
+	// 也避免对已是 fake id 的 person 频道二次 fake 化。
+	if msgM.ChannelType != common.ChannelTypePerson.Uint8() {
+		if userOffset, oerr := m.channelOffsetDB.queryWithUIDAndChannel(loginUID, msgM.ChannelID, msgM.ChannelType); oerr != nil {
+			m.Error("查询用户清理偏移失败", zap.Error(oerr), zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		} else if userOffset != nil && msgM.MessageSeq <= userOffset.MessageSeq {
+			m.Warn("卡片动作目标消息在用户清理偏移之前,拒绝", zap.String("messageID", req.MessageID), zap.String("uid", loginUID))
+			httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
+			return
+		}
+		channelOffsetSeq, cerr := m.lookupChannelOffsetSeq(msgM.ChannelID, msgM.ChannelType, loginUID)
+		if cerr != nil {
+			m.Error("查询频道偏移失败", zap.Error(cerr), zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		if channelOffsetSeq != 0 && msgM.MessageSeq <= channelOffsetSeq {
+			m.Warn("卡片动作目标消息在频道偏移之前,拒绝", zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
+			return
+		}
+	}
+
 	// D4 ⑤幂等 claim —— **先于生效帧 / inputs 校验**（P1-4, PR#548 review）。业务
 	// 身份键（不含 client_token —— 新 token 重试不得二次触发）。已存在 claim（pending
 	// 或已 confirm）→ 直接回 replay,绝不产生第二个事件。这必须先于下方 stale-frame

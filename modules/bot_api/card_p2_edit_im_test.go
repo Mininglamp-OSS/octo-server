@@ -303,6 +303,121 @@ func TestBotCardEditConcurrentCASIM(t *testing.T) {
 	assert.GreaterOrEqual(t, finalVersion, maxSeen, "最终 version 必 ≥ 采样峰值(赢家帧 version 最大)")
 }
 
+// TestBotCardEditMixedFrameVersionMonotonicIM 验证 P1（PR#548 review round-3）：无
+// card_seq 的编辑帧(LWW,非 CAS 分支)也必须在行锁内分配 version。并发混发 card_seq
+// 帧与无 card_seq 帧时,两分支取同一把 message_id 行锁,version 分配序 == 提交序,行
+// version 绝不回退 —— delta-sync(version>? 游标)不丢终帧。修复前非 CAS 分支锁外前置
+// 分配 version,低 version 的无 card_seq 帧后提交会覆盖并发 CAS 帧已提交的高 version。
+func TestBotCardEditMixedFrameVersionMonotonicIM(t *testing.T) {
+	skipWithoutIMBot(t)
+	t.Setenv(cardmsg.EnvEnabled, "true")
+	s, ctx := testutil.NewTestServer()
+	defer func() { _ = testutil.CleanAllTables(ctx) }()
+
+	const mixBot = "bot_card_mix"
+	_, err := ctx.DB().InsertBySql(
+		"insert into robot(robot_id,bot_token,status) values(?,?,1)", mixBot, "bf_card_mix_token").Exec()
+	assert.NoError(t, err)
+	for _, pair := range [][2]string{{mixBot, testutil.UID}, {testutil.UID, mixBot}} {
+		_, ferr := ctx.DB().InsertBySql(
+			"insert into friend(uid,to_uid,is_deleted) values(?,?,0)", pair[0], pair[1]).Exec()
+		assert.NoError(t, ferr)
+	}
+	do := func(path string, body map[string]interface{}) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", path, bytes.NewReader([]byte(util.ToJson(body))))
+		req.Header.Set("Authorization", "Bearer bf_card_mix_token")
+		s.GetRoute().ServeHTTP(w, req)
+		return w
+	}
+	w := do("/v1/bot/sendMessage", map[string]interface{}{
+		"channel_id": testutil.UID, "channel_type": common.ChannelTypePerson.Uint8(),
+		"payload": imCardEnvelope("m0", -1),
+	})
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var sendResp struct {
+		MessageID int64 `json:"message_id"`
+	}
+	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &sendResp))
+	msgID := fmt.Sprintf("%d", sendResp.MessageID)
+	var msgSeq uint32
+	for i := 0; i < 20; i++ {
+		sr, serr := ctx.IMSearchMessages(&config.MsgSearchReq{
+			ChannelID: testutil.UID, ChannelType: common.ChannelTypePerson.Uint8(),
+			MessageIds: []int64{sendResp.MessageID}, LoginUID: mixBot,
+		})
+		if serr == nil && sr != nil && len(sr.Messages) > 0 && sr.Messages[0].MessageSeq > 0 {
+			msgSeq = sr.Messages[0].MessageSeq
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	assert.NotZero(t, msgSeq)
+
+	var (
+		pollMu       sync.Mutex
+		maxSeen      int64
+		lastSeen     int64
+		wentBackward bool
+	)
+	stopPoll := make(chan struct{})
+	var pollWG sync.WaitGroup
+	pollWG.Add(1)
+	go func() {
+		defer pollWG.Done()
+		for {
+			select {
+			case <-stopPoll:
+				return
+			default:
+			}
+			var v int64
+			if e := ctx.DB().Select("version").From("message_extra").Where("message_id=?", msgID).LoadOne(&v); e == nil {
+				pollMu.Lock()
+				if v < lastSeen {
+					wentBackward = true
+				}
+				lastSeen = v
+				if v > maxSeen {
+					maxSeen = v
+				}
+				pollMu.Unlock()
+			}
+			time.Sleep(200 * time.Microsecond)
+		}
+	}()
+
+	const n = 8
+	var wg sync.WaitGroup
+	for i := 1; i <= n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			// 奇数:带递增 card_seq(CAS 分支);偶数:无 card_seq(LWW 非 CAS 分支)。
+			seq := int64(-1)
+			if i%2 == 1 {
+				seq = int64(i)
+			}
+			do("/v1/bot/message/edit", map[string]interface{}{
+				"message_id": msgID, "message_seq": msgSeq,
+				"channel_id": testutil.UID, "channel_type": common.ChannelTypePerson.Uint8(),
+				"content_edit": util.ToJson(imCardEnvelope(fmt.Sprintf("m%d", i), seq)),
+			})
+		}(i)
+	}
+	wg.Wait()
+	close(stopPoll)
+	pollWG.Wait()
+
+	var finalVersion int64
+	err = ctx.DB().Select("version").From("message_extra").Where("message_id=?", msgID).LoadOne(&finalVersion)
+	assert.NoError(t, err)
+	pollMu.Lock()
+	defer pollMu.Unlock()
+	assert.False(t, wentBackward, "混发 CAS/非 CAS 帧下 version 观测到回退(非 CAS 分支锁外分配的 lost-update)")
+	assert.GreaterOrEqual(t, finalVersion, maxSeen, "最终 version 必 ≥ 采样峰值(无低 version 覆盖高 version)")
+}
+
 // TestBotCardEditOwnershipAndLifecycleIM 验收 PR#548 review 两项补强:
 // ① P0 —— message_id/message_seq 不匹配硬拒绝。所有权只在 (channel, seq) 上验证,
 //

@@ -436,6 +436,58 @@ func TestCardActionClaimConfirmedState(t *testing.T) {
 	}
 }
 
+func TestCardActionVisibilityParity(t *testing.T) {
+	// PR#548 review round-3 P1：card/action 必须与单条读 respondSingleMessage 的
+	// canonical 可见性同口径 —— 被 visibles 白名单排除的群成员读路径 404，触发
+	// card/action 也必须拒，否则能对不可见卡片触发 bot 副作用。
+	t.Setenv(cardmsg.EnvEnabled, "true")
+	s, ctx := testutil.NewTestServer()
+	defer func() { _ = testutil.CleanAllTables(ctx) }()
+	resetCardActionState(t, ctx)
+
+	seedCardBot(t, ctx, cardActionBotUID)
+	_, err := ctx.DB().InsertBySql("insert into group_member(group_no,uid) values(?,?)", "g_vis", testutil.UID).Exec()
+	assert.NoError(t, err)
+
+	do := func(msgID, tok string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", "/v1/message/card/action", bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
+			"message_id": msgID, "channel_id": "g_vis",
+			"channel_type": common.ChannelTypeGroup.Uint8(),
+			"action_id":    "approve_btn", "client_token": tok,
+		}))))
+		req.Header.Set("token", testutil.Token)
+		s.GetRoute().ServeHTTP(w, req)
+		return w
+	}
+	withVisibles := func(uids ...string) []byte {
+		var env map[string]interface{}
+		assert.NoError(t, json.Unmarshal(cardV2EnvelopeJSON(t, "approve_btn"), &env))
+		vis := make([]interface{}, 0, len(uids))
+		for _, u := range uids {
+			vis = append(vis, u)
+		}
+		env["visibles"] = vis
+		b, _ := json.Marshal(env)
+		return b
+	}
+
+	// visibles 只含别人(不含操作者)→ 虽是群成员 + bot 发送 + 未撤回，仍必须拒。
+	seedCardMessage(t, ctx, 9601, cardActionBotUID, "g_vis", common.ChannelTypeGroup.Uint8(), withVisibles("someone_else"))
+	w := do("9601", "tok-vis1")
+	assert.Equal(t, http.StatusBadRequest, w.Code, "visibles 排除的成员触发 card/action 应拒")
+	assert.Contains(t, w.Body.String(), "Invalid card action.")
+	rds := redis.NewClient(&redis.Options{Addr: ctx.GetConfig().DB.RedisAddr, Password: ctx.GetConfig().DB.RedisPass})
+	defer rds.Close()
+	n, _ := rds.ZCard("robotEvent:" + cardActionBotUID).Result()
+	assert.Equal(t, int64(0), n, "visibles 拒绝不得产生 bot 事件")
+
+	// 对照:visibles 含操作者 → 放行(不误伤合法可见成员)。
+	seedCardMessage(t, ctx, 9602, cardActionBotUID, "g_vis", common.ChannelTypeGroup.Uint8(), withVisibles(testutil.UID))
+	w = do("9602", "tok-vis2")
+	assert.Equal(t, http.StatusOK, w.Code, "visibles 含操作者应放行, body=%s", w.Body.String())
+}
+
 // 验收(P2 D4, round-3 P1-1):入队失败 → 内部封套 + 补偿释放 claim,同一操作者
 // 立即重试成功 —— 半途而废的请求不锁死动作。
 //

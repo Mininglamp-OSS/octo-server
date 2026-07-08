@@ -301,6 +301,15 @@ interactive cards, receive actions, and rewrite state.
   channel A but not B, submits B's `message_id` with A's `channel_id` →
   rejected (binding derives from the stored row) — asserted for both person and
   group channels; request body > 64 KiB → rejected pre-decode.
+  **PR#548 review 补强 (round-3 — canonical visibility parity):** the endpoint
+  must mirror the single-read (`respondSingleMessage`) visibility gates, not just
+  a subset — a group member **excluded by the card's `visibles` allowlist**, or
+  whose per-user/channel offset has cleared it, or an **expired** message, is
+  rejected (collapsed `invalid`, no event enqueued) exactly as the read path 404s
+  it; otherwise an excluded member could enumerate the `message_id` and fire the
+  bot side-effect on a card they cannot see. Person DMs (2-party, `visibles`
+  n/a) keep membership+lifecycle gating. Test: `TestCardActionVisibilityParity`
+  (visibles-excluded member → rejected + no event; visibles-included → allowed).
 - **Input validation (D11)**: `inputs` key not declared in the effective frame
   → 400; `Input.ChoiceSet` value outside declared choices → 400; `Input.Text`
   value > 4 KiB → 400; valid declared inputs arrive in `event_data.inputs`
@@ -319,6 +328,14 @@ interactive cards, receive actions, and rewrite state.
   stale-overwrite; two adjacent `card_seq` values `> 2^53` parse to **distinct**
   int64s (no float64 collapse) and survive a `NormalizeContentEdit` round-trip,
   and a non-integral `card_seq` degrades to last-write-wins.
+  **PR#548 review 补强 (round-3 — non-CAS version monotonicity):** the
+  `!hasCardSeq` last-write-wins branch also allocates `version` **inside** a
+  `FOR UPDATE` row lock (`cardVersionInLockWrite`, same lock as the CAS branch),
+  not outside — otherwise a no-`card_seq` frame's lower version, allocated before
+  the lock and committed after a concurrent CAS (or another non-CAS) frame's
+  higher version, overwrites it and delta-sync (`version>?`) permanently misses
+  the final frame. Test: `TestBotCardEditMixedFrameVersionMonotonicIM` (concurrent
+  interleaved CAS + non-CAS frames → row `version` never regresses, final ≥ peak).
 - **Rate limiting**: a route-mount test asserts `SharedUIDRateLimiter` is
   mounted after `AuthMiddleware` on the `/v1/message` group that carries
   `/card/action`.

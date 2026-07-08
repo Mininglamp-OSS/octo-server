@@ -199,17 +199,22 @@ func TestSubmitActionDispatchMatchesValidation(t *testing.T) {
 	if d, found := SubmitAction(mk(inlineCard), "go"); !found || d["k"] != "v" {
 		t.Errorf("inlineAction Submit 应可派发解析并取回 data, found=%v d=%v", found, d)
 	}
-	// 藏在叶子 TextBlock.items[] 下的 Submit：Validate 不递归 TextBlock.items（发送期
-	// 不校验），派发侧也不得解析 —— 否则派发面 > 校验面（修复前 findSubmitInElements
-	// 无条件递归 items 会误命中）。
+	// 藏在叶子 TextBlock.items[] 内某元素 selectAction 下的 Submit：Validate 不递归
+	// TextBlock.items（发送期不校验），派发侧也不得解析 —— 否则派发面 > 校验面。修复前
+	// findSubmitInElements 无条件递归 items 会进到内层、命中其 selectAction Submit；修复
+	// 后仅容器类递归，TextBlock.items 不进。用 selectAction 承载才有区分度（裸 Submit
+	// 元素本就不被 findSubmitInElements 匹配，无论是否递归 —— 那样断言是空跑）。
 	leafCard := cardWithBody(map[string]interface{}{
 		"type": "TextBlock", "text": "x",
 		"items": []interface{}{map[string]interface{}{
-			"type": "Action.Submit", "id": "sneaky", "data": map[string]interface{}{"x": float64(1)},
+			"type": "Container",
+			"selectAction": map[string]interface{}{
+				"type": "Action.Submit", "id": "sneaky", "data": map[string]interface{}{"x": float64(1)},
+			},
 		}},
 	})
 	if _, found := SubmitAction(mk(leafCard), "sneaky"); found {
-		t.Error("藏在 TextBlock.items[] 下的 Submit 不得被派发解析（派发面 ≤ 校验面）")
+		t.Error("藏在 TextBlock.items[] 内元素 selectAction 下的 Submit 不得被派发解析（派发面 ≤ 校验面）")
 	}
 }
 
