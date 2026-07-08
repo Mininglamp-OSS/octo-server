@@ -302,3 +302,87 @@ func TestBotCardEditConcurrentCASIM(t *testing.T) {
 	assert.False(t, wentBackward, "message_extra.version 不得回退(P1-2:CAS 必须锁内分配单调 version)")
 	assert.GreaterOrEqual(t, finalVersion, maxSeen, "最终 version 必 ≥ 采样峰值(赢家帧 version 最大)")
 }
+
+// TestBotCardEditOwnershipAndLifecycleIM 验收 PR#548 review 两项补强:
+// ① P0 —— message_id/message_seq 不匹配硬拒绝。所有权只在 (channel, seq) 上验证,
+//
+//	但写入按调用方另给的 message_id 落 UNIQUE(message_id) 单表 → warn-only 会形成
+//	confused-deputy(攻击 bot 用自己拥有的 seq + 他人 message_id 覆盖他人卡片的
+//	content_edit)。断言:不匹配被拒,且 foreign 行不被写入。
+//
+// ② P2 撤回门禁 —— 已撤回/删除的卡片不可再编辑(与动作端点撤回门禁对称)。
+func TestBotCardEditOwnershipAndLifecycleIM(t *testing.T) {
+	skipWithoutIMBot(t)
+	t.Setenv(cardmsg.EnvEnabled, "true")
+	s, ctx := testutil.NewTestServer()
+	defer func() { _ = testutil.CleanAllTables(ctx) }()
+
+	const bot = "bot_card_own"
+	_, err := ctx.DB().InsertBySql(
+		"insert into robot(robot_id,bot_token,status) values(?,?,1)", bot, "bf_card_own_token").Exec()
+	assert.NoError(t, err)
+	for _, pair := range [][2]string{{bot, testutil.UID}, {testutil.UID, bot}} {
+		_, ferr := ctx.DB().InsertBySql(
+			"insert into friend(uid,to_uid,is_deleted) values(?,?,0)", pair[0], pair[1]).Exec()
+		assert.NoError(t, ferr)
+	}
+	do := func(path string, body map[string]interface{}) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", path, bytes.NewReader([]byte(util.ToJson(body))))
+		req.Header.Set("Authorization", "Bearer bf_card_own_token")
+		s.GetRoute().ServeHTTP(w, req)
+		return w
+	}
+
+	// bot 发自己的卡,拿到真实 message_id + seq
+	w := do("/v1/bot/sendMessage", map[string]interface{}{
+		"channel_id": testutil.UID, "channel_type": common.ChannelTypePerson.Uint8(),
+		"payload": imCardEnvelope("approve_btn", -1),
+	})
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var sendResp struct {
+		MessageID int64 `json:"message_id"`
+	}
+	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &sendResp))
+	ownID := fmt.Sprintf("%d", sendResp.MessageID)
+	var msgSeq uint32
+	for i := 0; i < 20; i++ {
+		sr, serr := ctx.IMSearchMessages(&config.MsgSearchReq{
+			ChannelID: testutil.UID, ChannelType: common.ChannelTypePerson.Uint8(),
+			MessageIds: []int64{sendResp.MessageID}, LoginUID: bot,
+		})
+		if serr == nil && sr != nil && len(sr.Messages) > 0 && sr.Messages[0].MessageSeq > 0 {
+			msgSeq = sr.Messages[0].MessageSeq
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	assert.NotZero(t, msgSeq)
+
+	// ① P0:用拥有的 seq + 一个不属于自己的 message_id 编辑 → 硬拒绝,foreign 行不被写。
+	const foreignID = "9223372036854775000"
+	w = do("/v1/bot/message/edit", map[string]interface{}{
+		"message_id": foreignID, "message_seq": msgSeq,
+		"channel_id": testutil.UID, "channel_type": common.ChannelTypePerson.Uint8(),
+		"content_edit": util.ToJson(imCardEnvelope("attacker_btn", 5)),
+	})
+	assert.Equal(t, http.StatusBadRequest, w.Code, "message_id/message_seq 不匹配必须拒绝")
+	var foreignCnt int
+	_ = ctx.DB().Select("count(*)").From("message_extra").Where("message_id=?", foreignID).LoadOne(&foreignCnt)
+	assert.Zero(t, foreignCnt, "confused-deputy:foreign message_id 行不得被写入")
+
+	// ② P2 撤回门禁:把自己的卡标记撤回,再用正确 id+seq 编辑 → 拒绝,content_edit 不落库。
+	_, err = ctx.DB().InsertBySql(
+		"INSERT INTO message_extra (message_id,message_seq,channel_id,channel_type,`revoke`,version) VALUES (?,?,?,?,?,?)",
+		ownID, msgSeq, common.GetFakeChannelIDWith(bot, testutil.UID), common.ChannelTypePerson.Uint8(), 1, 1).Exec()
+	assert.NoError(t, err)
+	w = do("/v1/bot/message/edit", map[string]interface{}{
+		"message_id": ownID, "message_seq": msgSeq,
+		"channel_id": testutil.UID, "channel_type": common.ChannelTypePerson.Uint8(),
+		"content_edit": util.ToJson(imCardEnvelope("done_btn", 2)),
+	})
+	assert.Equal(t, http.StatusBadRequest, w.Code, "已撤回卡片不可编辑")
+	var edited string
+	_ = ctx.DB().Select("content_edit").From("message_extra").Where("message_id=?", ownID).LoadOne(&edited)
+	assert.NotContains(t, edited, "done_btn", "撤回卡片编辑不得写入 content_edit")
+}

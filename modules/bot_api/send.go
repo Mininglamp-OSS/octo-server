@@ -769,11 +769,20 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 			return
 		}
 		if req.MessageID != strconv.FormatInt(resp.Messages[0].MessageID, 10) {
-			ba.Warn("message_id与message_seq不匹配，保持旧行为继续执行",
+			// P0（PR#548 review）：硬拒绝 message_id/message_seq 不匹配 —— 与用户编辑
+			// 路径 ErrMessageIDSeqMismatch 对称。所有权只在 (channel, seq) 上校验,而
+			// message_extra 写入按调用方另给的 message_id 落行（UNIQUE(message_id) 单
+			// 表,ON DUPLICATE KEY UPDATE 命中任意归属行）。warn-only 会形成 confused-
+			// deputy:攻击 bot 用自己拥有的 seq + 受害 message_id 覆盖他人卡片的
+			// content_edit,进而伪造该卡被点击时下发给受害 bot 的动作面。规范推荐 bot
+			// 省略 message_seq 由服务端解析（走下方 seq==0 安全分支）,合法调用方不受影响。
+			ba.Warn("message_id与message_seq不匹配,拒绝",
 				zap.String("req_message_id", req.MessageID),
 				zap.Int64("actual_message_id", resp.Messages[0].MessageID),
 				zap.Uint32("message_seq", req.MessageSeq),
 			)
+			respondBotAPIRequestInvalid(c, "message_id")
+			return
 		}
 		msgFromUID = resp.Messages[0].FromUID
 		msgPayload = resp.Messages[0].Payload
@@ -850,6 +859,25 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 		hasCardSeq bool
 	)
 	if editIsCard {
+		// P2（PR#548 review）：撤回/删除门禁 —— 已撤回或全局删除的卡片不可再编辑,
+		// 与动作端点（api_card_action.go）的撤回门禁对称,避免在已回收的卡片上重填
+		// content_edit（该 content_edit 是动作端点信任的生效帧）。行不存在=未编辑过,
+		// 非撤回,放行。
+		var lifecycle struct {
+			Revoke    int `db:"revoke"`
+			IsDeleted int `db:"is_deleted"`
+		}
+		if lErr := ba.ctx.DB().SelectBySql("SELECT `revoke`, is_deleted FROM message_extra WHERE message_id=?", req.MessageID).LoadOne(&lifecycle); lErr != nil && lErr != dbr.ErrNotFound {
+			ba.Error("查询卡片撤回/删除状态失败", zap.Error(lErr), zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+			return
+		}
+		if lifecycle.Revoke == 1 || lifecycle.IsDeleted == 1 {
+			ba.Warn("卡片已撤回/删除,拒绝编辑", zap.String("messageID", req.MessageID),
+				zap.Int("revoke", lifecycle.Revoke), zap.Int("isDeleted", lifecycle.IsDeleted))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIMessageNotFound, nil, nil)
+			return
+		}
 		// P2 D6：type-17 content_edit 跑与 send 同一套 cardmsg 校验（白名单/大小/
 		// URL/profile 协商，v2 帧在此合法）+ Finalize 重算权威 plain，返回 canonical
 		// JSON 落库。card_seq（D9）随后做 CAS。

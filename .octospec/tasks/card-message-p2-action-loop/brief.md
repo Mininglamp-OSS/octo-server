@@ -154,6 +154,17 @@ interactive cards, receive actions, and rewrite state.
   existing `content_edit_hash` dedup (`send.go:797`), the `message_extra`
   upsert (`:821`), and the `SendCMD(CMDSyncMessageExtra)` fanout (`:830-835`)
   as-is — **octo-im zero changes**.
+  **PR#548 review 补强:** (i) the own-message binding is now **enforced** —
+  a `message_id`/`message_seq` mismatch is **hard-rejected** (was warn-only),
+  symmetric with the user path's `ErrMessageIDSeqMismatch`. `message_extra` is a
+  single `UNIQUE(message_id)` table, so ownership-checked-on-`(channel, seq)` but
+  written-by-`message_id` was a confused-deputy (a bot could overwrite another
+  bot's card `content_edit` — the frame the action endpoint trusts — and forge its
+  tap-time action surface). The canonical flow omits `message_seq` (server
+  resolves it), so legitimate callers are unaffected. (ii) the card-edit branch
+  now **rejects editing a revoked/globally-deleted card** (`extra.Revoke`/
+  `is_deleted`), symmetric with the action endpoint's revoke gate — no re-populating
+  `content_edit` on a withdrawn card.
 - **D9 `card_seq` CAS stored in `message_extra`** (`wire-contract`): the
   type-17 envelope gains an **optional** monotonic integer `card_seq`. Locked
   decision (2026-07-08): the stored value lives in **`message_extra`** (a new
