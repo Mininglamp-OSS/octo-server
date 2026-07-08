@@ -105,7 +105,8 @@ func (h *Handler) searchFiles(c *wkhttp.Context) {
 			Routing(normID).
 			Query(dsl).
 			Size(size).
-			TrackTotalHits(false)
+			TrackTotalHits(false).
+			FetchSourceContext(fileContentSourceExcludes())
 		svc = applySort(svc, req.Sort)
 		if len(searchAfter) > 0 {
 			svc = svc.SearchAfter(searchAfter...)
@@ -151,6 +152,10 @@ func buildSearchFilesDSL(ctx context.Context, analyzer tokenAnalyzer, stopwordSt
 		clause, err := buildKeywordClauseGated(ctx, analyzer, stopwordStripEnabled, req.Keyword,
 			"payload.file.name^2",
 			"payload.file.caption",
+			// content: full extracted file body from Tika (indexer v1.12).
+			// Default weight ^1 lets name/caption matches still outrank a
+			// pure-body hit. See docs/messages-search/v1.12-file-content-mapping-integration.md.
+			"payload.file.content",
 		)
 		b.Must(clause)
 		analyzeErr = err

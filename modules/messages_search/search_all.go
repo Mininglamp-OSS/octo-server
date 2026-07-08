@@ -88,7 +88,8 @@ func (h *Handler) searchAll(c *wkhttp.Context) {
 			Routing(normID).
 			Query(dsl).
 			Size(size).
-			TrackTotalHits(false)
+			TrackTotalHits(false).
+			FetchSourceContext(fileContentSourceExcludes())
 		if req.Keyword != "" {
 			svc = svc.Highlight(buildSearchAllHighlight())
 		}
@@ -170,6 +171,7 @@ func buildSearchAllDSL(ctx context.Context, analyzer tokenAnalyzer, stopwordStri
 		fileClause := buildKeywordClauseFromAnalyzed(eff, useMSM,
 			"payload.file.name^2",
 			"payload.file.caption",
+			"payload.file.content",
 		)
 		b.Should(textClause, fileClause)
 		b.MinimumShouldMatch("1")

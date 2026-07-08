@@ -119,7 +119,8 @@ func (h *Handler) searchMessages(c *wkhttp.Context) {
 			Routing(normID).
 			Query(dsl).
 			Size(size).
-			TrackTotalHits(false)
+			TrackTotalHits(false).
+			FetchSourceContext(fileContentSourceExcludes())
 		if req.Keyword != "" {
 			svc = svc.Highlight(buildSearchMessagesHighlight())
 		}

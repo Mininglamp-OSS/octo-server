@@ -99,7 +99,8 @@ func (h *Handler) searchGlobalFiles(c *wkhttp.Context) {
 			Index(h.cfg.OSReadAlias).
 			Query(dsl).
 			Size(size).
-			TrackTotalHits(false)
+			TrackTotalHits(false).
+			FetchSourceContext(fileContentSourceExcludes())
 		svc = applySort(svc, req.Sort)
 		if len(searchAfter) > 0 {
 			svc = svc.SearchAfter(searchAfter...)
@@ -196,6 +197,7 @@ func buildGlobalFilesDSL(ctx context.Context, analyzer tokenAnalyzer, stopwordSt
 		clause, err := buildKeywordClauseGated(ctx, analyzer, stopwordStripEnabled, req.Keyword,
 			"payload.file.name^2",
 			"payload.file.caption",
+			"payload.file.content",
 		)
 		b.Must(clause)
 		analyzeErr = err
@@ -289,7 +291,8 @@ func (h *Handler) dispatchSingleFiles(c *wkhttp.Context, req SearchGlobalFilesRe
 			Routing(normID).
 			Query(dsl).
 			Size(size).
-			TrackTotalHits(false)
+			TrackTotalHits(false).
+			FetchSourceContext(fileContentSourceExcludes())
 		svc = applySort(svc, req.Sort)
 		if len(searchAfter) > 0 {
 			svc = svc.SearchAfter(searchAfter...)

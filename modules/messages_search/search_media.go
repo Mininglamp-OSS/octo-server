@@ -94,7 +94,8 @@ func (h *Handler) searchMedia(c *wkhttp.Context) {
 			Routing(normID).
 			Query(dsl).
 			Size(size).
-			TrackTotalHits(false)
+			TrackTotalHits(false).
+			FetchSourceContext(fileContentSourceExcludes())
 		svc = applySort(svc, req.Sort)
 		if len(searchAfter) > 0 {
 			svc = svc.SearchAfter(searchAfter...)

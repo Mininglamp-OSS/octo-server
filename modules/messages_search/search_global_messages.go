@@ -108,7 +108,8 @@ func (h *Handler) searchGlobalMessages(c *wkhttp.Context) {
 			Index(h.cfg.OSReadAlias).
 			Query(dsl).
 			Size(size).
-			TrackTotalHits(false)
+			TrackTotalHits(false).
+			FetchSourceContext(fileContentSourceExcludes())
 		if req.Keyword != "" {
 			svc = svc.Highlight(buildSearchAllHighlight())
 		}
@@ -238,6 +239,7 @@ func buildGlobalMessagesDSL(ctx context.Context, analyzer tokenAnalyzer, stopwor
 		fileClause := buildKeywordClauseFromAnalyzed(eff, useMSM,
 			"payload.file.name^2",
 			"payload.file.caption",
+			"payload.file.content",
 		)
 		b.Should(textClause, fileClause)
 		b.MinimumShouldMatch("1")
@@ -394,7 +396,8 @@ func (h *Handler) searchAllForGlobalFastPath(c *wkhttp.Context, req SearchAllReq
 			Routing(normID).
 			Query(dsl).
 			Size(size).
-			TrackTotalHits(false)
+			TrackTotalHits(false).
+			FetchSourceContext(fileContentSourceExcludes())
 		if req.Keyword != "" {
 			svc = svc.Highlight(buildSearchAllHighlight())
 		}
