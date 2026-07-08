@@ -4,6 +4,25 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-08 (PR-C)
+
+- **Change** — Task `card-message-p2-revision-history` (PR-C, card message P2
+  D10): card revision history. New `octo_message_card_revision` side table +
+  `pkg/cardrevision` shared store (written by bot_api on edits/clear, read by
+  message), `GET /v1/message/card/revisions` (summary / full=1) reusing the
+  extracted `authorizeCardChannelMember` gate, bot revision clear + auditable
+  tombstone, `transient` frame flag (progress frames skip history), and revoke
+  cleanup. Verify caught two P1s (fixed): the query path lacked the
+  revoke/deleted/user-local-delete visibility gate, and the revoke cleanup was
+  mis-ordered after the notify step. Code-review (B1) then caught that the query
+  still enforced a *subset* of the canonical read — missing the `visibles`
+  allowlist / read-offset / channel-offset / expiry layers `card/action` carries;
+  fixed by extracting `cardCanonicalVisibleToViewer` and sharing it across both
+  endpoints (+ `TestCardRevisionsCanonicalVisibility`). Stacked on PR-B; zero
+  octo-im changes. Journal:
+  `.octospec/journal/shared/card-message-p2-revision-history.md`;
+  learning: `.octospec/learnings/pending/card-message-p2-revision-history.md`.
+
 ## 2026-07-08
 
 - **Change** — Task `card-message-p2-action-loop` (PR-B, card message P2
