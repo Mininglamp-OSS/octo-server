@@ -469,7 +469,7 @@ func (h *Handler) resolveGlobalScope(c *wkhttp.Context, loginUID string, channel
 //     stays well inside OpenSearch's `indices.query.bool.max_clause_count`.
 //     Threads share their parent group's membership so no extra auth check
 //     is needed — group membership already gates thread reachability.
-//   - Soft-fail: if QueryActiveShortIDsByGroupNos errors, threads are
+//   - Soft-fail: if QueryNonDeletedShortIDsByGroupNos errors, threads are
 //     dropped from the allowlist but the group + DM parts still serve
 //     (WARN log; the whole request does NOT 500). Same policy as the
 //     external-group / space_member soft-fails elsewhere in this helper.
@@ -478,6 +478,11 @@ func (h *Handler) resolveGlobalScope(c *wkhttp.Context, loginUID string, channel
 //     Beyond either cap we WARN and skip further thread ids for that group
 //     (or the whole request) — the group's own message hits still surface,
 //     only its thread hits get hard-dropped for this request.
+//   - Visibility: archived threads are INCLUDED (contract is "reject deleted,
+//     allow archived" — matches single-channel search + message read; see
+//     thread.DB.QueryNonDeletedShortIDsByGroupNos). Deleted threads are NOT
+//     surfaced. Aligning global search with the rest of the system was RC
+//     blocker on PR #553.
 //
 // Known v1 gap: channelsForMember (the member_uid "包含成员" filter) still
 // scopes to group + DM only; it does NOT filter threads by thread_member
@@ -589,7 +594,13 @@ func (h *Handler) buildAllowlist(_ *wkhttp.Context, loginUID, spaceID string) ([
 // table and turns every (groupNo, shortID) row into a composite
 // `{groupNo}____{shortID}` channelRef with channelType=5. Bounded by two
 // hard caps (maxThreadsPerGroup / maxTotalThreadChannelIDs) so a runaway
-// group cannot alone blow the OS terms clause.
+// group cannot alone blow the OS terms clause. The DB query itself is
+// bounded by thread.NonDeletedByGroupNosDBHardLimit so a pathological
+// membership footprint can't drag tens of thousands of rows into memory.
+//
+// Visibility: threads with status != deleted (i.e. active OR archived) are
+// included, aligning with single-channel search + message read semantics.
+// See modules/thread/db.go::QueryNonDeletedShortIDsByGroupNos.
 //
 // Returns an empty slice on error (WARN logged) — the caller then serves
 // group + DM only, matching the external-group / space_member soft-fail
@@ -600,7 +611,7 @@ func (h *Handler) enumerateThreadsForGroups(groupNos []string) []channelRef {
 	}
 	enum := h.threadEnumFn
 	if enum == nil {
-		enum = thread.NewDB(h.ctx).QueryActiveShortIDsByGroupNos
+		enum = thread.NewDB(h.ctx).QueryNonDeletedShortIDsByGroupNos
 	}
 	byGroup, err := enum(groupNos)
 	if err != nil {

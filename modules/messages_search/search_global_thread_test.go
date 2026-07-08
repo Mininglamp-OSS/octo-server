@@ -175,27 +175,47 @@ func TestBuildAllowlist_ThreadPerGroupCap(t *testing.T) {
 // TestBuildAllowlist_ThreadGlobalAggregateCap — once the running total of
 // thread channelIDs would cross maxTotalThreadChannelIDs on the NEXT group,
 // remaining groups are skipped (their group entries still populate).
+//
+// Real-cap coverage (RC N1 on PR #553): the previous version of this test
+// filled a single "grpB" with `maxTotalThreadChannelIDs - 100` (=1900) rows,
+// which exceeded maxThreadsPerGroup (=200) and made the test t.Skip — so
+// the global-cap branch was never actually exercised. This version uses N
+// groups each filled up to (but not over) the per-group cap, so the sum
+// crosses the global cap while every individual group is under the
+// per-group cap. That way we hit the aggregate-cap `break` and not the
+// per-group `continue`.
 func TestBuildAllowlist_ThreadGlobalAggregateCap(t *testing.T) {
 	loginUID := "me"
-	// Craft two groups whose combined thread count would exceed the global
-	// cap but each individually is under the per-group cap. We deliberately
-	// stay under maxThreadsPerGroup so the cap under test is the global one.
-	// Choose sizes: A = 150, B = maxTotalThreadChannelIDs - 100 (so A+B > cap
-	// while A < maxThreadsPerGroup < B is possible only if the global cap is
-	// > per-group cap, which is our config).
-	sizeA := 150
-	sizeB := maxTotalThreadChannelIDs - 100 // guarantees A + B > global cap
-	if sizeB > maxThreadsPerGroup {
-		// If someone lowers the global cap under the per-group cap, this test
-		// stops being meaningful for the global cap — skip loudly.
-		t.Skipf("test config assumes maxTotalThreadChannelIDs (%d) > maxThreadsPerGroup (%d)",
-			maxTotalThreadChannelIDs, maxThreadsPerGroup)
+
+	// Design: fill N groups each with `maxThreadsPerGroup` shortIDs. Choose
+	// N so that N * maxThreadsPerGroup > maxTotalThreadChannelIDs while
+	// (N-1) * maxThreadsPerGroup < maxTotalThreadChannelIDs. That gives a
+	// deterministic break point on the Nth group: (N-1) groups fit, the Nth
+	// group would push us past the aggregate cap.
+	//
+	// With the shipped constants (per-group=200, total=2000): N=11 gives
+	// 10 * 200 = 2000 fitting exactly, and adding the 11th (200 more) would
+	// exceed 2000 — so grpN is skipped whole and allowThread has exactly
+	// 2000 entries drawn from groups 0..9. (`total + len(shortIDs) > cap`
+	// is a strict >; total==cap after group 9 makes `2000 + 200 > 2000`
+	// true for group 10, triggering the break.)
+	perGroup := maxThreadsPerGroup
+	if perGroup <= 0 {
+		t.Fatalf("maxThreadsPerGroup must be > 0; got %d", perGroup)
 	}
-	gSvc := &stubGroupSvc{
-		groupsByUID: map[string][]*group.InfoResp{
-			loginUID: {{GroupNo: "grpA"}, {GroupNo: "grpB"}},
-		},
+	numGroups := (maxTotalThreadChannelIDs / perGroup) + 1 // guarantees N*perGroup > cap
+	if (numGroups-1)*perGroup > maxTotalThreadChannelIDs {
+		t.Fatalf("config sanity: expected (N-1)*perGroup <= cap, got %d > %d",
+			(numGroups-1)*perGroup, maxTotalThreadChannelIDs)
 	}
+	groupNames := make([]string, 0, numGroups)
+	groupsSlice := make([]*group.InfoResp, 0, numGroups)
+	for i := 0; i < numGroups; i++ {
+		name := "grp" + itoa(i)
+		groupNames = append(groupNames, name)
+		groupsSlice = append(groupsSlice, &group.InfoResp{GroupNo: name})
+	}
+	gSvc := &stubGroupSvc{groupsByUID: map[string][]*group.InfoResp{loginUID: groupsSlice}}
 	uSvc := &stubUserSvc{}
 	h := newAllowlistHandler(t, gSvc, uSvc)
 	makeIDs := func(prefix string, n int) []string {
@@ -206,27 +226,55 @@ func TestBuildAllowlist_ThreadGlobalAggregateCap(t *testing.T) {
 		return out
 	}
 	h.threadEnumFn = func([]string) (map[string][]string, error) {
-		return map[string][]string{
-			"grpA": makeIDs("a", sizeA),
-			"grpB": makeIDs("b", sizeB),
-		}, nil
+		m := make(map[string][]string, numGroups)
+		for _, gn := range groupNames {
+			m[gn] = makeIDs(gn+"_thr", perGroup)
+		}
+		return m, nil
 	}
 
 	_, _, allowThread, err := h.buildAllowlist(nil, loginUID, "")
 	if err != nil {
 		t.Fatalf("buildAllowlist: %v", err)
 	}
-	// Deterministic iteration is groupNos order. grpA fits under the running
-	// total; grpB pushes past and is skipped whole (we do NOT partial-fill
-	// a group — simpler, avoids "some threads visible, some not" UX).
-	if len(allowThread) != sizeA {
-		t.Fatalf("expected exactly grpA's %d threads under global cap, got %d",
-			sizeA, len(allowThread))
+	// (a) Aggregate cap actually kicked in: total must not exceed the cap.
+	if len(allowThread) > maxTotalThreadChannelIDs {
+		t.Fatalf("allowThread must respect global cap %d; got %d",
+			maxTotalThreadChannelIDs, len(allowThread))
 	}
-	prefix := "grpA" + thread.ChannelIDSeparator
+	// (b) It kicked in on the RIGHT group: the last group's threads must
+	//     be missing entirely (skipped whole, not partial-filled).
+	skippedPrefix := groupNames[numGroups-1] + thread.ChannelIDSeparator
 	for _, r := range allowThread {
-		if !strings.HasPrefix(r.OSChannelID, prefix) {
-			t.Errorf("unexpected non-grpA thread in allowlist: %q", r.OSChannelID)
+		if strings.HasPrefix(r.OSChannelID, skippedPrefix) {
+			t.Errorf("grp that trips aggregate cap must be skipped WHOLE; leaked %q",
+				r.OSChannelID)
+		}
+	}
+	// (c) Preceding groups populated exactly: we expect (numGroups-1) groups
+	//     each at perGroup entries when (N-1)*perGroup <= cap.
+	wantFitted := (numGroups - 1) * perGroup
+	if wantFitted > maxTotalThreadChannelIDs {
+		wantFitted = maxTotalThreadChannelIDs
+	}
+	if len(allowThread) != wantFitted {
+		t.Fatalf("expected exactly %d thread entries under global cap, got %d",
+			wantFitted, len(allowThread))
+	}
+	// (d) Each fitted group must show up with all `perGroup` shortIDs.
+	perGroupCount := make(map[string]int)
+	for _, r := range allowThread {
+		for _, gn := range groupNames[:numGroups-1] {
+			if strings.HasPrefix(r.OSChannelID, gn+thread.ChannelIDSeparator) {
+				perGroupCount[gn]++
+				break
+			}
+		}
+	}
+	for _, gn := range groupNames[:numGroups-1] {
+		if perGroupCount[gn] != perGroup {
+			t.Errorf("group %s: expected %d threads, got %d",
+				gn, perGroup, perGroupCount[gn])
 		}
 	}
 }
@@ -364,3 +412,138 @@ func TestResolveGlobalScope_ThreadOutsideMembership(t *testing.T) {
 }
 
 // itoa is provided by visibility_test.go in this package — no local copy.
+
+// TestBuildAllowlist_ArchivedThreadsIncluded — RC blocker on PR #553:
+// archived (=2) threads must be surfaced by global search, matching the
+// single-channel search / message-read contract of "reject deleted, allow
+// archived". The stub returns whatever the underlying DB call would return;
+// after the fix, that call is QueryNonDeletedShortIDsByGroupNos which
+// surfaces status IN (active, archived). This test locks the invariant that
+// whatever the enumerator returns — including shortIDs the DB layer classes
+// as archived — lands in the allowlist verbatim (no downstream status
+// re-filter is silently applied).
+func TestBuildAllowlist_ArchivedThreadsIncluded(t *testing.T) {
+	loginUID := "me"
+	gSvc := &stubGroupSvc{
+		groupsByUID: map[string][]*group.InfoResp{
+			loginUID: {{GroupNo: "grpA"}},
+		},
+	}
+	uSvc := &stubUserSvc{}
+	h := newAllowlistHandler(t, gSvc, uSvc)
+	// The stub simulates the fixed enumerator behaviour: an active thread
+	// AND an archived thread from the same group both surface.
+	active := "thr_active"
+	archived := "thr_archived"
+	h.threadEnumFn = func(groupNos []string) (map[string][]string, error) {
+		return map[string][]string{"grpA": {active, archived}}, nil
+	}
+
+	_, _, allowThread, err := h.buildAllowlist(nil, loginUID, "")
+	if err != nil {
+		t.Fatalf("buildAllowlist: %v", err)
+	}
+	want := map[string]bool{
+		thread.BuildChannelID("grpA", active):   true,
+		thread.BuildChannelID("grpA", archived): true,
+	}
+	if len(allowThread) != len(want) {
+		t.Fatalf("expected %d threads (active + archived), got %d (%+v)",
+			len(want), len(allowThread), allowThread)
+	}
+	for _, r := range allowThread {
+		if !want[r.OSChannelID] {
+			t.Errorf("unexpected channelId %q in allowlist", r.OSChannelID)
+		}
+		delete(want, r.OSChannelID)
+	}
+	if len(want) > 0 {
+		t.Errorf("missing expected channelIds: %v", want)
+	}
+}
+
+// TestBuildAllowlist_DeletedThreadsExcluded — RC blocker on PR #553:
+// deleted threads must NOT leak into the allowlist. The DB-level
+// enforcement lives in QueryNonDeletedShortIDsByGroupNos (`status !=
+// ThreadStatusDeleted`); this stub-level test locks the invariant that
+// the enumerator's exclusions are respected verbatim by buildAllowlist
+// (no rediscovery / re-widening downstream).
+func TestBuildAllowlist_DeletedThreadsExcluded(t *testing.T) {
+	loginUID := "me"
+	gSvc := &stubGroupSvc{
+		groupsByUID: map[string][]*group.InfoResp{
+			loginUID: {{GroupNo: "grpA"}},
+		},
+	}
+	uSvc := &stubUserSvc{}
+	h := newAllowlistHandler(t, gSvc, uSvc)
+	// The stub simulates a group that has one visible (active) thread and
+	// zero returned rows for the deleted thread — that's what the fixed
+	// enumerator does: `status != deleted` filter excludes deleted rows.
+	visible := "thr_visible"
+	h.threadEnumFn = func(groupNos []string) (map[string][]string, error) {
+		// Deleted shortID is deliberately NOT in the returned map — same
+		// as what QueryNonDeletedShortIDsByGroupNos does at the SQL level.
+		return map[string][]string{"grpA": {visible}}, nil
+	}
+
+	_, _, allowThread, err := h.buildAllowlist(nil, loginUID, "")
+	if err != nil {
+		t.Fatalf("buildAllowlist: %v", err)
+	}
+	if len(allowThread) != 1 {
+		t.Fatalf("expected exactly 1 thread (deleted excluded), got %d (%+v)",
+			len(allowThread), allowThread)
+	}
+	wantID := thread.BuildChannelID("grpA", visible)
+	if allowThread[0].OSChannelID != wantID {
+		t.Errorf("expected %q, got %q", wantID, allowThread[0].OSChannelID)
+	}
+	// And a deleted shortID must not appear via any path.
+	deletedID := thread.BuildChannelID("grpA", "thr_deleted")
+	for _, r := range allowThread {
+		if r.OSChannelID == deletedID {
+			t.Errorf("deleted thread channelId %q must not appear in allowlist", deletedID)
+		}
+	}
+}
+
+// TestResolveGlobalScope_ArchivedThreadNarrowingHits — RC blocker on
+// PR #553: an explicit narrowing to an archived thread (visible via
+// single-channel search, msg-read) must now also resolve on the global
+// endpoint. Before the fix, this collapsed to empty scope because
+// enumerateThreadsForGroups excluded archived shortIDs, so the requested
+// channelID was not in allowSet.
+func TestResolveGlobalScope_ArchivedThreadNarrowingHits(t *testing.T) {
+	loginUID := "me"
+	gSvc := &stubGroupSvc{
+		groupsByUID: map[string][]*group.InfoResp{
+			loginUID: {{GroupNo: "grpA"}},
+		},
+	}
+	uSvc := &stubUserSvc{}
+	h := newAllowlistHandler(t, gSvc, uSvc)
+	archivedShortID := "thr_archived"
+	archivedChan := thread.BuildChannelID("grpA", archivedShortID)
+	h.threadEnumFn = func([]string) (map[string][]string, error) {
+		// Post-fix enumerator would return archived alongside active. Here
+		// we simulate only the archived one to prove the narrowing hits it.
+		return map[string][]string{"grpA": {archivedShortID}}, nil
+	}
+
+	c, _ := newValidatorCtx(t)
+	osIDs, _, singleFast, ok := h.resolveGlobalScope(c, loginUID,
+		[]GlobalChannelRef{{ChannelID: archivedChan, ChannelType: channelTypeThread}}, "")
+	if !ok {
+		t.Fatalf("resolveGlobalScope must succeed; a response was already written")
+	}
+	if len(osIDs) != 1 || osIDs[0] != archivedChan {
+		t.Fatalf("scope must be exactly {%q}; got %v", archivedChan, osIDs)
+	}
+	if singleFast == nil {
+		t.Fatalf("single-channel fast path must fire for a lone archived-thread scope")
+	}
+	if singleFast.ChannelType != channelTypeThread || singleFast.OSChannelID != archivedChan {
+		t.Errorf("singleFast mismatch: %+v", singleFast)
+	}
+}

@@ -49,9 +49,10 @@ type Handler struct {
 	dmBotFilterFn func(spaceID string, peers []string) ([]string, error)
 	// threadEnumFn is a test seam for the thread enumeration inside
 	// buildAllowlist. Nil in production (falls through to thread.NewDB(h.ctx)
-	// .QueryActiveShortIDsByGroupNos); tests inject a stub so the thread
-	// coverage on the global feed is exercisable without a real MySQL
-	// connection.
+	// .QueryNonDeletedShortIDsByGroupNos — archived threads are included per
+	// the reject-deleted-only visibility contract; see RC on PR #553); tests
+	// inject a stub so the thread coverage on the global feed is exercisable
+	// without a real MySQL connection.
 	threadEnumFn func(groupNos []string) (map[string][]string, error)
 	// externalGroupFn is a test seam for the external-group lookup inside
 	// buildAllowlist. Nil in production (falls through to group.NewDB(h.ctx)
