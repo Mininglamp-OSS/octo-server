@@ -63,26 +63,41 @@ func findSubmitInElements(items []interface{}, actionID string) (map[string]inte
 		if !ok {
 			continue
 		}
+		t, _ := el["type"].(string)
+		// selectAction：任意元素都可携带（发送期 element() 顶部无条件校验），派发侧对齐。
 		if d, ok := findSubmitAction(el["selectAction"], actionID); ok {
 			return d, true
 		}
-		if sub, ok := el["items"].([]interface{}); ok {
-			if d, ok := findSubmitInElements(sub, actionID); ok {
+		// inlineAction：仅 Input.*（发送期只在 Input 分支校验），派发面 ≤ 校验面。
+		if t == "Input.Text" || t == "Input.Toggle" || t == "Input.ChoiceSet" {
+			if d, ok := findSubmitAction(el["inlineAction"], actionID); ok {
 				return d, true
 			}
 		}
-		if cols, ok := el["columns"].([]interface{}); ok {
-			for _, c := range cols {
-				col, ok := c.(map[string]interface{})
-				if !ok {
-					continue
-				}
-				if d, ok := findSubmitAction(col["selectAction"], actionID); ok {
+		// items/columns 仅对容器类递归，与 Validate 完全一致（发送期只有 Container 递归
+		// items、ColumnSet 递归 columns→Column.items）——否则藏在叶子 items[] 下的
+		// Submit 会「派发可解析、发送期没校验」（PR#548 review：派发面必须 ≤ 校验面）。
+		switch t {
+		case "Container":
+			if sub, ok := el["items"].([]interface{}); ok {
+				if d, ok := findSubmitInElements(sub, actionID); ok {
 					return d, true
 				}
-				if sub, ok := col["items"].([]interface{}); ok {
-					if d, ok := findSubmitInElements(sub, actionID); ok {
+			}
+		case "ColumnSet":
+			if cols, ok := el["columns"].([]interface{}); ok {
+				for _, c := range cols {
+					col, ok := c.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					if d, ok := findSubmitAction(col["selectAction"], actionID); ok {
 						return d, true
+					}
+					if sub, ok := col["items"].([]interface{}); ok {
+						if d, ok := findSubmitInElements(sub, actionID); ok {
+							return d, true
+						}
 					}
 				}
 			}

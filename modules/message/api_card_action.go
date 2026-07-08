@@ -197,8 +197,21 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 		return
 	}
 	if !claimed {
-		// pending 或已 confirm 都是同一答案：这个人对这个动作已经提交过。
-		c.Response(map[string]interface{}{"accepted": true, "replay": true})
+		// 已 confirm → replay（事件确已入队）；仅 pending → 首请求尚在处理、未确认入队，
+		// 回可重试 409 而非虚假成功（PR#548 review P2：避免 A 校验失败释放后 B 拿着 A 的
+		// pending 得到成功 ack 却无事件入队而丢有效动作 —— 客户端按 D8 超时重试自愈）。
+		// Redis 读失败 → 保守当 replay（fail-safe：绝不因读失败重复入队，退化回旧行为）。
+		confirmed, cerr := m.cardClaims.Confirmed(idemKey)
+		if cerr != nil {
+			m.Warn("card_action claim 状态读取失败,按 replay 处理", zap.Error(cerr), zap.String("messageID", req.MessageID))
+			c.Response(map[string]interface{}{"accepted": true, "replay": true})
+			return
+		}
+		if confirmed {
+			c.Response(map[string]interface{}{"accepted": true, "replay": true})
+			return
+		}
+		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInProgress, nil, nil)
 		return
 	}
 

@@ -1,3 +1,12 @@
+//go:build integration
+
+// 构建约束（PR#548 CI 修复）：本文件经 testutil.NewTestServer 跑 sql-migrate，必须带
+// integration tag —— modules/message 默认构建混有「手建最小表」的单元测试
+// （channel_files_blacklist_test.go 等），跑迁移的用例与之在 -race -shuffle 下并存会撞
+// Error 1050 Table already exists（约定见 thread_ext_blacklist_filter_test.go：包内
+// NewTestServer 用例一律 tag/skip；本包 e2e 13+ 文件皆 //go:build integration，
+// api_card_p1_test.go 则改为不触 NewTestServer）。带 -tags integration 运行；bot 侧
+// D6/D9 CAS 由 modules/bot_api 的 IM 用例在 CI 覆盖。
 package message
 
 // card-message-interaction P2 集成测试（MySQL + Redis，无需 WuKongIM ——
@@ -382,6 +391,49 @@ func (f *flakyRobotService) EnqueueBotTypedEvent(robotID, eventType string, even
 		return 0, errors.New("injected enqueue failure")
 	}
 	return f.IService.EnqueueBotTypedEvent(robotID, eventType, eventData)
+}
+
+func TestCardActionD8SharedWindowConstant(t *testing.T) {
+	// D8（PR#548 review）：card_action 去重键 TTL 必须与事件可操作窗口
+	// (Robot.MessageExpire) **同源同值** —— 否则两值之间的窗口里去重键先过期，窗口内
+	// re-tap 会造出第二条 card_action 事件（yujiawei：需 asserted by test）。
+	_, ctx := testutil.NewTestServer()
+	defer func() { _ = testutil.CleanAllTables(ctx) }()
+	store := newCardActionClaimStore(ctx)
+	if store.idemTTL != ctx.GetConfig().Robot.MessageExpire {
+		t.Errorf("幂等 TTL 应 == 可操作窗口 Robot.MessageExpire: idemTTL=%v window=%v",
+			store.idemTTL, ctx.GetConfig().Robot.MessageExpire)
+	}
+	if store.idemTTL <= 0 {
+		t.Errorf("幂等 TTL 应为正, got %v", store.idemTTL)
+	}
+}
+
+func TestCardActionClaimConfirmedState(t *testing.T) {
+	// PR#548 review P2：Confirmed 区分 pending（首请求在途、可重试）与已 confirm
+	// （回 replay:true）—— 只有 confirmed 才让并发的第二请求回 replay，避免首请求校验
+	// 失败释放后第二请求拿着 pending 得到虚假成功却无事件入队而丢有效动作。
+	_, ctx := testutil.NewTestServer()
+	defer func() { _ = testutil.CleanAllTables(ctx) }()
+	resetCardActionState(t, ctx)
+	store := newCardActionClaimStore(ctx)
+	key := cardActionClaimKey("m1", "a1", "u1")
+
+	if c, err := store.Confirmed(key); err != nil || c {
+		t.Errorf("不存在的 key 应未确认, c=%v err=%v", c, err)
+	}
+	if ok, err := store.Claim(key); err != nil || !ok {
+		t.Fatalf("首次 Claim 应成功, ok=%v err=%v", ok, err)
+	}
+	if c, err := store.Confirmed(key); err != nil || c {
+		t.Errorf("pending 占位应未确认（可重试，不回虚假 replay）, c=%v err=%v", c, err)
+	}
+	if ok, err := store.Confirm(key, 12345); err != nil || !ok {
+		t.Fatalf("Confirm 应成功, ok=%v err=%v", ok, err)
+	}
+	if c, err := store.Confirmed(key); err != nil || !c {
+		t.Errorf("confirm 后应已确认, c=%v err=%v", c, err)
+	}
 }
 
 // 验收(P2 D4, round-3 P1-1):入队失败 → 内部封套 + 补偿释放 claim,同一操作者

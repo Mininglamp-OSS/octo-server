@@ -1012,11 +1012,21 @@ func (ba *BotAPI) cardSeqCASWrite(messageID string, messageSeq uint32, fakeChann
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	var stored dbr.NullInt64
-	if selErr := tx.SelectBySql("SELECT card_seq FROM message_extra WHERE message_id=? FOR UPDATE", messageID).LoadOne(&stored); selErr != nil && selErr != dbr.ErrNotFound {
+	var stored struct {
+		CardSeq dbr.NullInt64 `db:"card_seq"`
+		Hash    string        `db:"content_edit_hash"`
+	}
+	if selErr := tx.SelectBySql("SELECT card_seq, content_edit_hash FROM message_extra WHERE message_id=? FOR UPDATE", messageID).LoadOne(&stored); selErr != nil && selErr != dbr.ErrNotFound {
 		return false, selErr
 	}
-	if stored.Valid && stored.Int64 >= cardSeq {
+	if stored.CardSeq.Valid && stored.CardSeq.Int64 >= cardSeq {
+		// stored == cardSeq 且内容逐字节相同 → 并发/重复的幂等重试（两个相同帧都过了
+		// 事务前 content_edit_hash 短路、在此串行化），已存的就是这帧：返回成功、不再写，
+		// 避免对幂等重试误报 409（PR#548 review P2）。stored > cardSeq、或相等但内容不同，
+		// 才是真正的乱序/迟到帧 → conflict。
+		if stored.CardSeq.Int64 == cardSeq && stored.Hash == contentMD5 {
+			return false, nil
+		}
 		return true, nil
 	}
 	// 锁内分配 version（见函数注释 P1-2）：仅 advancing 写才消费 version,冲突帧不消费。

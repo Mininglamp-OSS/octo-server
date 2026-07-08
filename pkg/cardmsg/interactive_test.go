@@ -132,6 +132,87 @@ func TestValidateV2InputInlineAction(t *testing.T) {
 	}
 }
 
+func TestValidateV2InputLabelMarkdown(t *testing.T) {
+	// PR#548 review 补强：Input.label / errorMessage 是 AC markdown 渲染面，其链接目标
+	// 与 TextBlock.text 同走正向 allowlist（校验面 ≥ 渲染面）。
+	inputWith := func(field, val string) map[string]interface{} {
+		return map[string]interface{}{"type": "Input.Text", "id": "c", field: val}
+	}
+	// label 里 javascript: 的 markdown 链接 → 拒。
+	if err := Validate(v2Envelope(cardWithBody(inputWith("label", "点[x](javascript:steal)")))); !errors.Is(err, ErrCardBadURLScheme) {
+		t.Errorf("label markdown 的 javascript: 链接应拒, err=%v", err)
+	}
+	// errorMessage 里非 http scheme 的 markdown 链接 → 拒。
+	if err := Validate(v2Envelope(cardWithBody(inputWith("errorMessage", "[e](vbscript:y)")))); !errors.Is(err, ErrCardBadURLScheme) {
+		t.Errorf("errorMessage markdown 的 vbscript: 链接应拒, err=%v", err)
+	}
+	// 合法 https markdown 链接 / 纯文本 label 放行（不误伤，也不新增类型拒绝面）。
+	if err := Validate(v2Envelope(cardWithBody(inputWith("label", "见[文档](https://example.com)")))); err != nil {
+		t.Errorf("label 里合法 https markdown 链接应放行, err=%v", err)
+	}
+	if err := Validate(v2Envelope(cardWithBody(inputWith("label", "备注")))); err != nil {
+		t.Errorf("纯文本 label 应放行, err=%v", err)
+	}
+}
+
+func TestValidateSelectActionAllElements(t *testing.T) {
+	// PR#548 review P1：selectAction 现由 element() 顶部对**所有**元素无条件校验 ——
+	// TextBlock / FactSet 上的 selectAction 也走 w.action，不能借「叶子不校验 selectAction」
+	// 夹带未过 id/checkURL 纪律的动作（否则派发面 > 校验面）。
+	// TextBlock.selectAction 的无 id Submit → 拒（证明走了 registerID/id 纪律）。
+	tb := v2Envelope(cardWithBody(map[string]interface{}{
+		"type": "TextBlock", "text": "x",
+		"selectAction": map[string]interface{}{"type": "Action.Submit"},
+	}))
+	if err := Validate(tb); !errors.Is(err, ErrCardBadShape) {
+		t.Errorf("TextBlock.selectAction 无 id Submit 应拒, err=%v", err)
+	}
+	// FactSet.selectAction 的 javascript: OpenUrl → 拒（证明走了 checkURL）。
+	fs := v2Envelope(cardWithBody(map[string]interface{}{
+		"type": "FactSet", "facts": []interface{}{},
+		"selectAction": map[string]interface{}{"type": "Action.OpenUrl", "url": "javascript:x"},
+	}))
+	if err := Validate(fs); !errors.Is(err, ErrCardBadURLScheme) {
+		t.Errorf("FactSet.selectAction 的 javascript: OpenUrl 应拒, err=%v", err)
+	}
+	// TextBlock.selectAction 的合法 Submit（带 id）→ 放行（不误伤）。
+	ok := v2Envelope(cardWithBody(map[string]interface{}{
+		"type": "TextBlock", "text": "x",
+		"selectAction": map[string]interface{}{"type": "Action.Submit", "id": "tap"},
+	}))
+	if err := Validate(ok); err != nil {
+		t.Errorf("TextBlock.selectAction 合法 Submit 应放行, err=%v", err)
+	}
+}
+
+func TestSubmitActionDispatchMatchesValidation(t *testing.T) {
+	// PR#548 review P1：派发面必须 ≤ 校验面。
+	mk := func(card map[string]interface{}) []byte {
+		raw, _ := json.Marshal(v2Envelope(card))
+		return raw
+	}
+	// inlineAction Submit 现在派发期可解析（消除死按钮：发送期校验通过的面必须可派发）。
+	inlineCard := cardWithBody(map[string]interface{}{
+		"type": "Input.Text", "id": "c",
+		"inlineAction": map[string]interface{}{"type": "Action.Submit", "id": "go", "data": map[string]interface{}{"k": "v"}},
+	})
+	if d, found := SubmitAction(mk(inlineCard), "go"); !found || d["k"] != "v" {
+		t.Errorf("inlineAction Submit 应可派发解析并取回 data, found=%v d=%v", found, d)
+	}
+	// 藏在叶子 TextBlock.items[] 下的 Submit：Validate 不递归 TextBlock.items（发送期
+	// 不校验），派发侧也不得解析 —— 否则派发面 > 校验面（修复前 findSubmitInElements
+	// 无条件递归 items 会误命中）。
+	leafCard := cardWithBody(map[string]interface{}{
+		"type": "TextBlock", "text": "x",
+		"items": []interface{}{map[string]interface{}{
+			"type": "Action.Submit", "id": "sneaky", "data": map[string]interface{}{"x": float64(1)},
+		}},
+	})
+	if _, found := SubmitAction(mk(leafCard), "sneaky"); found {
+		t.Error("藏在 TextBlock.items[] 下的 Submit 不得被派发解析（派发面 ≤ 校验面）")
+	}
+}
+
 func TestValidateFrameUniqueIDs(t *testing.T) {
 	// D1：Action.Submit / Input.* 的 id 帧内唯一。
 	dupActions := v2Envelope(map[string]interface{}{

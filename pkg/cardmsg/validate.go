@@ -168,6 +168,13 @@ func (w *walker) element(el map[string]interface{}, depth int) error {
 	if err := checkNodeURLs(el); err != nil {
 		return err
 	}
+	// selectAction 是任意元素都可携带的动作面，且派发侧 findSubmitInElements 对每种
+	// 元素都读 el["selectAction"] —— 必须在类型分派前无条件校验，否则 TextBlock /
+	// FactSet 等「叶子」上的 selectAction 会「派发期可解析、发送期没校验」，Action.Submit
+	// 的 D1 帧内唯一 id / data-必须是对象被旁路（PR#548 review：校验面必须 ≥ 派发面）。
+	if err := w.selectAction(el); err != nil {
+		return err
+	}
 	t, _ := el["type"].(string)
 	switch t {
 	case "TextBlock":
@@ -191,9 +198,6 @@ func (w *walker) element(el map[string]interface{}, depth int) error {
 		if err := checkURL(u); err != nil {
 			return err
 		}
-		if err := w.selectAction(el); err != nil {
-			return err
-		}
 	case "Container":
 		if items, present := el["items"]; present {
 			list, ok := items.([]interface{})
@@ -203,9 +207,6 @@ func (w *walker) element(el map[string]interface{}, depth int) error {
 			if err := w.elements(list, depth+1); err != nil {
 				return err
 			}
-		}
-		if err := w.selectAction(el); err != nil {
-			return err
 		}
 	case "ColumnSet":
 		if cols, present := el["columns"]; present {
@@ -222,9 +223,6 @@ func (w *walker) element(el map[string]interface{}, depth int) error {
 					return err
 				}
 			}
-		}
-		if err := w.selectAction(el); err != nil {
-			return err
 		}
 	case "FactSet":
 		facts, present := el["facts"]
@@ -275,6 +273,19 @@ func (w *walker) element(el map[string]interface{}, depth int) error {
 		if err := w.registerID(t, id); err != nil {
 			return err
 		}
+		// Input.label / Input.errorMessage 与 TextBlock.text 同为 AC markdown 渲染面
+		// （AC 1.3+：label 富文本标签、errorMessage 校验失败提示），其 markdown 链接
+		// 目标必须走同一正向 allowlist（Decision 6；PR#548 review 补强：放开 Input.*
+		// 后这两处是新增的 markdown URL 面）。仅在字符串时检查，不新增类型拒绝面。
+		for _, k := range [2]string{"label", "errorMessage"} {
+			if s, ok := el[k].(string); ok {
+				for _, target := range markdownLinkTargets(s) {
+					if err := checkURL(target); err != nil {
+						return err
+					}
+				}
+			}
+		}
 		// Input.ChoiceSet 的 choices 若出现必须是数组（值级枚举在 D11 提交期按
 		// 声明 choices 校验；此处只保结构合法，与 send 期白名单纪律一致）。
 		if t == "Input.ChoiceSet" {
@@ -284,16 +295,12 @@ func (w *walker) element(el map[string]interface{}, depth int) error {
 				}
 			}
 		}
-		// Input.* 携带的可点动作面必须走同一正向 allowlist：inlineAction（AC 1.2+，
-		// 端上渲染成贴附输入右侧的可点动作）与 selectAction 都是「会被渲染 + 派发」的
-		// 动作/URL 面。walker 对未知属性宽容，若不显式路由，Input 白名单一放开即给这
-		// 两个面开天窗 —— inlineAction 可夹带 javascript: 的 Action.OpenUrl 或 P3 的
-		// Action.Execute 绕过校验，Submit 也会逃过 id/registerID 纪律（PR#548 review）。
-		// 校验面必须 ≥ 渲染面（Decision 3d/6）。
+		// Input.* 特有的 inlineAction（AC 1.2+，端上渲染成贴附输入右侧的可点动作）也是
+		// 动作/URL 面，走同一正向 allowlist；不显式路由即给它开天窗 —— 可夹带 javascript:
+		// 的 Action.OpenUrl 或 P3 的 Action.Execute 绕过校验，Submit 也会逃过 id/registerID
+		// 纪律（PR#548 review：校验面必须 ≥ 渲染/派发面，Decision 3d/6）。selectAction
+		// 已由 element() 顶部对所有元素无条件校验，此处不再重复。
 		if err := w.inlineAction(el); err != nil {
-			return err
-		}
-		if err := w.selectAction(el); err != nil {
 			return err
 		}
 	default:

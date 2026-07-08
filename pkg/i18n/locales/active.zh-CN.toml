@@ -1238,6 +1238,9 @@ other = "卡片动作无效。"
 ["err.server.message.card_action_denied"]
 other = "你无权对该卡片执行此操作。"
 
+["err.server.message.card_action_in_progress"]
+other = "该卡片动作正在处理中，请稍后重试。"
+
 ["err.server.bot_api.card_disabled"]
 other = "当前部署未启用卡片消息。"
 

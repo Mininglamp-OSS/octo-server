@@ -113,7 +113,8 @@ func collectInputSpecsFromElements(items []interface{}, specs map[string]inputSp
 		if !ok {
 			continue
 		}
-		if t, _ := el["type"].(string); t == "Input.Text" || t == "Input.Toggle" || t == "Input.ChoiceSet" {
+		t, _ := el["type"].(string)
+		if t == "Input.Text" || t == "Input.Toggle" || t == "Input.ChoiceSet" {
 			if id, _ := el["id"].(string); id != "" {
 				spec := inputSpec{typ: t}
 				switch t {
@@ -141,14 +142,21 @@ func collectInputSpecsFromElements(items []interface{}, specs map[string]inputSp
 				specs[id] = spec
 			}
 		}
-		if sub, ok := el["items"].([]interface{}); ok {
-			collectInputSpecsFromElements(sub, specs)
-		}
-		if cols, ok := el["columns"].([]interface{}); ok {
-			for _, c := range cols {
-				if col, ok := c.(map[string]interface{}); ok {
-					if sub, ok := col["items"].([]interface{}); ok {
-						collectInputSpecsFromElements(sub, specs)
+		// items/columns 仅对容器类递归，与 Validate 一致（叶子元素的 items/columns
+		// 发送期不被遍历，派发侧也不得把其中的 input id 当作「已声明」，否则 D11 声明面
+		// > 校验面 —— 与 findSubmitInElements 同口径）。
+		switch t {
+		case "Container":
+			if sub, ok := el["items"].([]interface{}); ok {
+				collectInputSpecsFromElements(sub, specs)
+			}
+		case "ColumnSet":
+			if cols, ok := el["columns"].([]interface{}); ok {
+				for _, c := range cols {
+					if col, ok := c.(map[string]interface{}); ok {
+						if sub, ok := col["items"].([]interface{}); ok {
+							collectInputSpecsFromElements(sub, specs)
+						}
 					}
 				}
 			}

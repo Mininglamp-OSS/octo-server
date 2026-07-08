@@ -480,6 +480,9 @@ other = "You cannot delete the conversation with yourself."
 ["err.server.message.card_action_denied"]
 other = "You are not allowed to act on this card."
 
+["err.server.message.card_action_in_progress"]
+other = "This card action is being processed, please retry."
+
 ["err.server.message.card_action_invalid"]
 other = "Invalid card action."
 

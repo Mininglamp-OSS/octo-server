@@ -217,6 +217,19 @@ interactive cards, receive actions, and rewrite state.
   `inlineAction` an unvalidated render+dispatch face (a `javascript:`
   `Action.OpenUrl`, or a P3 `Action.Execute`, or an unregistered `Action.Submit`
   smuggled past the gate) — 校验面必须 ≥ 渲染面 (Decision 3d/6).
+  **PR#548 review 补强 (round 2 — 校验面 ≥ 派发面):** the three tree-walks are now
+  aligned so the **dispatch/resolution surface ≤ the validation surface**. (a)
+  `Validate` calls `w.selectAction` **unconditionally** at the top of `element()`,
+  so a `selectAction` on any element (incl. `TextBlock`/`FactSet`, previously
+  skipped) is validated; (b) the dispatch-side walkers `SubmitAction`
+  (`findSubmitInElements`) and `collectInputSpecs` (`collectInputSpecsFromElements`)
+  recurse `items`/`columns` **only for the container types `Validate` recurses**
+  (`Container`/`ColumnSet`→`Column`), not unconditionally — so a Submit/Input under
+  a leaf's `items[]` (e.g. `TextBlock.items[]`) is neither validated nor resolvable;
+  (c) `SubmitAction` also resolves an Input's `inlineAction` Submit (validated at
+  send), closing the send-accepted-but-dispatch-dead face. Prevents an
+  `Action.Submit` escaping D1 frame-unique-id / data-object discipline while still
+  being dispatch-resolvable.
 - **Error responses** (`error-response`, `i18n`): every new rejection via
   `httperr.ResponseErrorL` + registered `pkg/errcode` codes (new codes:
   card-action invalid / denied, card_seq conflict; reuse P1 codes where they
@@ -314,5 +327,25 @@ interactive cards, receive actions, and rewrite state.
   re-polling from a stale `event_id` cursor re-receives in-window events in
   order (at-least-once — documents the bot-side `event_id` idempotency
   requirement).
+  **PR#548 review 补强:** the two were **de-coupled** (dedup TTL hardcoded 24h vs
+  event window `Robot.MessageExpire` = 7d), leaving a 24h–7d gap where a re-tap
+  escaped dedup and produced a **second** event. Fixed by sourcing the dedup
+  key TTL from `Robot.MessageExpire` (the same value `EnqueueBotTypedEvent`
+  stamps on the event), so dedup and event lifetime are literally one constant;
+  `TestCardActionD8SharedWindowConstant` asserts `idemTTL == Robot.MessageExpire`.
 - **Wire freeze**: a contract test pins the `card_action` `event_data` field
   set to the frozen example (additive-only).
+- **PR#548 review 补强 (round-2 P2 + CI):** (a) **replay only for a *confirmed*
+  claim** — a bare-`pending` claim (concurrent first request still in flight)
+  returns a retryable `409 ErrMessageCardActionInProgress`, not a false
+  `replay:true`, so a valid concurrent action isn't lost behind a success ack
+  (`TestCardActionClaimConfirmedState`); (b) **CAS false-409 fix** — a concurrent
+  byte-identical retry (same `card_seq`, same `content_edit_hash`) returns OK
+  instead of a stale-`card_seq` 409 (`send.go cardSeqCASWrite` compares the hash
+  when `stored == cardSeq`); (c) **test isolation** — `api_card_action_test.go`
+  (the only active `testutil.NewTestServer` file in `modules/message`'s default
+  build) is moved behind `//go:build integration`, matching the package
+  convention (13+ e2e files; `api_card_p1_test.go` avoids `NewTestServer`
+  entirely), so it no longer collides with the package's bare-create unit tests
+  under `-race -shuffle` (`Error 1050 Table already exists`). bot-side D6/D9 CAS
+  stays CI-covered via `modules/bot_api`.

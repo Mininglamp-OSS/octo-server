@@ -205,4 +205,13 @@ var (
 		HTTPStatus:     http.StatusForbidden,
 		DefaultMessage: "You are not allowed to act on this card.",
 	})
+	// ErrMessageCardActionInProgress P2 D4（PR#548 review）：并发下同一 (message_id,
+	// action_id, operator_uid) 的首请求尚在处理、只占了 pending 位（未 confirm 入队）。
+	// 回可重试的 409 而非虚假 replay 成功 —— 客户端按 D8 超时重试：彼时首请求要么已
+	// confirm（→ replay），要么已释放（→ 本请求可重新 claim 正常处理），有效动作不丢。
+	ErrMessageCardActionInProgress = register(codes.Code{
+		ID:             "err.server.message.card_action_in_progress",
+		HTTPStatus:     http.StatusConflict,
+		DefaultMessage: "This card action is being processed, please retry.",
+	})
 )
