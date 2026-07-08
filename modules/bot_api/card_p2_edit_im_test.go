@@ -126,6 +126,10 @@ func TestBotCardEditCASIM(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Contains(t, stored, "done_btn", "message_extra 应存最新帧")
 	assert.NotContains(t, stored, "forged-by-client", "plain 必须被服务端重算覆盖")
+	// P1-2：捕获 advancing 写后的 version,用于验证下方冲突帧不改动它。
+	var vAfterDone int64
+	err = ctx.DB().Select("version").From("message_extra").Where("message_id=?", msgID).LoadOne(&vAfterDone)
+	assert.NoError(t, err)
 
 	// ③ D9 CAS：乱序帧（card_seq=1 ≤ 已存 2）→ 冲突（D14 线上 400 + 文案），不覆盖
 	w = do("/v1/bot/message/edit", editBody(imCardEnvelope("stale_btn", 1)))
@@ -134,6 +138,12 @@ func TestBotCardEditCASIM(t *testing.T) {
 	var after string
 	_ = ctx.DB().Select("content_edit").From("message_extra").Where("message_id=?", msgID).LoadOne(&after)
 	assert.Contains(t, after, "done_btn", "乱序帧不得覆盖已存帧")
+	// P1-2：冲突帧什么都不写 —— version 必须原样不动(GenSeq 在 CAS 冲突判定之后,
+	// 乱序帧不消费/推进 version,避免平白推进 delta-sync 游标)。
+	var vAfterStale int64
+	err = ctx.DB().Select("version").From("message_extra").Where("message_id=?", msgID).LoadOne(&vAfterStale)
+	assert.NoError(t, err)
+	assert.Equal(t, vAfterDone, vAfterStale, "冲突帧不得改动 version")
 
 	// ④ D6 跨类型变异：卡片消息被"编辑"为纯文本体 → 拒绝
 	w = do("/v1/bot/message/edit", map[string]interface{}{
@@ -222,6 +232,43 @@ func TestBotCardEditConcurrentCASIM(t *testing.T) {
 	assert.NotZero(t, msgSeq)
 
 	const n = 8
+	// P1-2（PR#548 review）：并发下的 version 单调性。delta-sync 按 version 升序取
+	// 增量帧,若某帧以更小 version 覆盖行,已同步到更高 version 的客户端将永远收不到
+	// 该帧。best-effort poller 采样行 version,记录是否回退与采样到的最大值;修复前
+	// (version 锁外前置分配)可观测到回退或最终 version < 采样峰值。
+	var (
+		pollMu       sync.Mutex
+		maxSeen      int64
+		lastSeen     int64
+		wentBackward bool
+	)
+	stopPoll := make(chan struct{})
+	var pollWG sync.WaitGroup
+	pollWG.Add(1)
+	go func() {
+		defer pollWG.Done()
+		for {
+			select {
+			case <-stopPoll:
+				return
+			default:
+			}
+			var v int64
+			if e := ctx.DB().Select("version").From("message_extra").Where("message_id=?", msgID).LoadOne(&v); e == nil {
+				pollMu.Lock()
+				if v < lastSeen {
+					wentBackward = true
+				}
+				lastSeen = v
+				if v > maxSeen {
+					maxSeen = v
+				}
+				pollMu.Unlock()
+			}
+			time.Sleep(200 * time.Microsecond) // 稀释采样:避免与并发写者抢连接池/空转
+		}
+	}()
+
 	var wg sync.WaitGroup
 	for seq := 1; seq <= n; seq++ {
 		wg.Add(1)
@@ -235,6 +282,8 @@ func TestBotCardEditConcurrentCASIM(t *testing.T) {
 		}(seq)
 	}
 	wg.Wait()
+	close(stopPoll)
+	pollWG.Wait()
 
 	// 不变量:最终 stored 必为最大 seq(n)的帧,不论并发到达顺序。
 	var storedSeq int64
@@ -244,4 +293,12 @@ func TestBotCardEditConcurrentCASIM(t *testing.T) {
 	var stored string
 	_ = ctx.DB().Select("content_edit").From("message_extra").Where("message_id=?", msgID).LoadOne(&stored)
 	assert.Contains(t, stored, fmt.Sprintf("f%d", n), "最终帧必为最大 seq 那一帧")
+
+	// P1-2 version 单调性:行 version 不得回退,且最终 version 必 ≥ 采样峰值(赢家帧 =
+	// 最后一次 advancing 写 = 最大 version;否则终帧对 delta-sync 不可见)。
+	var finalVersion int64
+	err = ctx.DB().Select("version").From("message_extra").Where("message_id=?", msgID).LoadOne(&finalVersion)
+	assert.NoError(t, err)
+	assert.False(t, wentBackward, "message_extra.version 不得回退(P1-2:CAS 必须锁内分配单调 version)")
+	assert.GreaterOrEqual(t, finalVersion, maxSeen, "最终 version 必 ≥ 采样峰值(赢家帧 version 最大)")
 }

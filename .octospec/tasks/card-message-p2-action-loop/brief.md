@@ -95,6 +95,12 @@ interactive cards, receive actions, and rewrite state.
   6. **D4 idempotent enqueue**.
   Anti-enumeration: everything except membership (403-class) collapses to a
   single 400 `invalid`; the specific reason goes to logs only.
+  **P1-4 ordering revision (PR#548):** the D4 idempotency *claim* (step 6) is
+  checked **before** steps 4–5 for the replay path — an existing claim returns the
+  replay ack without re-running the stale-frame/input gates, so a lost-ack retry of
+  an already-accepted action replays even after a rewrite removed its button; a
+  **fresh** claim runs steps 4–5 and is **released** on failure so a corrected
+  retry can re-claim.
 - **`event_data` wire contract is FROZEN by the parent brief** (`wire-contract`,
   `bot-api`): the enqueued `card_action` `event_data` MUST carry exactly the
   frozen keys — `message_id, channel_id, channel_type, space_id, action_id,
@@ -104,6 +110,10 @@ interactive cards, receive actions, and rewrite state.
   anti-forgery — never from the request; present only when the action declared
   one). `inputs` is D11-shape-checked (declared ids only, typed, size-capped);
   content stays untrusted user text. `client_token` is a D4 correlation id only.
+  **`space_id` (P1-3, PR#548)** is the card's authoritative origin Space
+  (server-resolved from the stored row: GROUP/COMMUNITY_TOPIC → group `SpaceID`;
+  PERSONAL → the `space_id` injected into the stored payload at send), **never**
+  the operator's request-context Space; omitted fail-closed when unresolvable.
   A contract test pins the shape.
 - **D4 idempotency store** (`trust-boundary`, `rate-limit`-exception): Redis
   dedup key `(message_id, action_id, operator_uid)` — **not** `client_token` —

@@ -155,7 +155,9 @@ robot API（legacy）`/robot/sendMessage` 同样接受 type-17（校验与 bot i
 - **状态在卡片内容里**：防重复操作 = 服务端幂等（业务身份键
   `message_id+action_id+operator_uid`，`client_token` 只是关联 ID）+ bot 重写
   卡片（按钮随帧消失/置灰）+ 客户端瞬时 loading（**10 s 超时恢复可点**，
-  不得持久化本地动作状态）。
+  不得持久化本地动作状态）。**幂等判定先于生效帧校验**（PR#548 P1-4）：已受理
+  动作的重试即使 bot 已重写移除该按钮，也回 `replay`（而非 stale-frame 400）；
+  但**从未受理**的按钮的迟到点击仍 fail-closed 400。
 - **`action_id` 命名逻辑动作实例**：新帧重新提供同一逻辑动作必须换新 id
   （如 `approve#2`），否则同人 24h 内的合法再操作会撞已消费的幂等桶。
 - **帧模型**：每帧都是完整 type-17 信封、独立过白名单，连续帧结构可任意不同、
@@ -165,6 +167,9 @@ robot API（legacy）`/robot/sendMessage` 同样接受 type-17（校验与 bot i
 - **乱序防护**：可选 `card_seq`（单调递增）；带上时旧帧 → 409。
 - **inputs 信任边界**：提交键必须命中生效帧声明的 `Input.*` id（未声明
   fail-closed），值为字符串、逐类型校验、总量 ≤ 16 KiB。
+- **`event_data.space_id`**（PR#548 P1-3）：卡片**来源 Space**，服务端从存储行
+  解析（群/子区取群 SpaceID；DM 取发送时注入 payload 的 `space_id`），**非**操作者
+  请求上下文 Space；无权威值时省略该键（fail-closed），消费方按可选字段处理。
 - **交互只对 bot-sender 卡片开放**：webhook 卡片是展示-only（无事件消费端）。
 - **时延预期**：bot 侧收事件是游标轮询（快慢 = bot 轮询节奏）；客户端刷新走
   CMD 是实时的。

@@ -10,17 +10,20 @@ package message
 // 内容，由 bot 经 botMessageEdit 重写）：只做 校验 → 幂等 claim → 给消息发送方
 // bot 的事件队列投递 card_action → confirm。
 //
-// 校验顺序（D3，round-3 修订）：存储行定位 + 频道绑定（anti-IDOR：消息按「请求
-// 声明的频道」定位 —— 分表按 channel_id 路由，WHERE 同时钉 channel_id+message_id，
-// 查得到 ⟺ 声明频道与存储行一致；此后所有授权判定一律以存储行为准）→ 操作者对
-// 存储频道的成员资格 → 消息为 type=17 且 sender 是 bot 身份（信任模型 layer (c)；
-// iwh_ webhook 发送者无事件消费端，D7 一并在此拒绝）→ 撤回/删除门禁（已撤回 /
-// 全局删除 / 操作者本地删除的卡片不可再触发动作，与单条读同口径）→ action_id
-// 存在于「生效卡片」（content_edit 优先 —— 被重写移除的旧帧按钮 fail-closed）→
-// D11 inputs 校验 → D4 幂等入队。防枚举：除成员资格（403 语义）外全部归并到单一
-// 400 invalid，具体原因只进日志。
+// 校验顺序（D3，round-3 修订；P1-4 PR#548 review 调整幂等位次）：存储行定位 + 频道
+// 绑定（anti-IDOR：消息按「请求声明的频道」定位 —— 分表按 channel_id 路由，WHERE
+// 同时钉 channel_id+message_id，查得到 ⟺ 声明频道与存储行一致；此后所有授权判定一律
+// 以存储行为准）→ 操作者对存储频道的成员资格 → 消息为 type=17 且 sender 是 bot 身份
+// （信任模型 layer (c)；iwh_ webhook 发送者无事件消费端，D7 一并在此拒绝）→ 撤回/删除
+// 门禁（已撤回 / 全局删除 / 操作者本地删除的卡片不可再触发动作，与单条读同口径）→
+// D4 幂等 claim（已存在 claim 即 replay —— **先于生效帧校验**：已受理的动作在按钮被
+// 重写移除后被重试时必须回 replay，而非撞 stale-frame 误判 400，P1-4）→ action_id
+// 存在于「生效卡片」（content_edit 优先 —— 被重写移除按钮的**首次**迟到点击 fail-closed）
+// → D11 inputs 校验 → 入队 + confirm。首次 claim 后任一校验失败均补偿释放 claim（纠正后
+// 可重试）。防枚举：除成员资格（403 语义）外全部归并到单一 400 invalid，具体原因只进日志。
 
 import (
+	"encoding/json"
 	"net/http"
 	"strings"
 	"time"
@@ -30,7 +33,6 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
-	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
 )
 
@@ -177,31 +179,16 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 		return
 	}
 
-	// 生效帧：content_edit（最新帧）优先于原始 payload —— 重写移除的按钮迟到点击
-	// 在此 400，过期交互天然 fail-closed。同时取回匹配动作的静态 data（D11：服务端
-	// 从生效帧提取，绝不取请求里的 data）。
-	effective := msgM.Payload
-	if extra != nil && extra.ContentEdit.Valid && extra.ContentEdit.String != "" {
-		effective = []byte(extra.ContentEdit.String)
-	}
-	actionData, found := cardmsg.SubmitAction(effective, req.ActionID)
-	if !found {
-		m.Warn("action_id 不在生效卡片中,拒绝", zap.String("actionID", req.ActionID), zap.String("messageID", req.MessageID))
-		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
-		return
-	}
-
-	// D11 ⑤inputs 信任边界（round-3 P1-3）：只放行生效帧声明过的 Input.* id，逐
-	// 类型校验 + 尺寸上限 —— event_data.inputs 从此形状可信（内容仍是不可信用户
-	// 文本，bot 侧照常转义）。
-	if err := cardmsg.ValidateInputs(effective, req.Inputs); err != nil {
-		m.Warn("卡片动作 inputs 校验失败,拒绝", zap.Error(err), zap.String("messageID", req.MessageID))
-		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
-		return
-	}
-
-	// D4 ⑥幂等（round-3 P1-1）：业务身份键（不含 client_token —— 新 token 重试
-	// 不得二次触发），claim → 入队 → confirm；入队失败补偿释放，客户端可重试。
+	// D4 ⑤幂等 claim —— **先于生效帧 / inputs 校验**（P1-4, PR#548 review）。业务
+	// 身份键（不含 client_token —— 新 token 重试不得二次触发）。已存在 claim（pending
+	// 或已 confirm）→ 直接回 replay,绝不产生第二个事件。这必须先于下方 stale-frame
+	// 校验:否则「已受理的动作在 bot 重写移除该按钮后被重试」会撞 stale-frame 而误判
+	// 400，违反 D4「任何已 claim 的请求 → replay」承诺（D8 兜底假设「超时后 re-tap」,
+	// 但按钮已随帧消失、无可再点）。首次 claim 成功后继续跑校验,任一失败都补偿释放
+	// claim（releaseCardClaim），使纠正后的重试仍可重新 claim。
+	// 边角(属 D4「200 ack 不保证已入队」既有语义)：并发下请求 B 撞上 A 尚未释放的首次
+	// claim 时会先回 replay:true,而 A 因校验失败 400、未入队 —— 无虚假事件,靠 D8 超时
+	// re-tap 自愈。
 	idemKey := cardActionClaimKey(req.MessageID, req.ActionID, loginUID)
 	claimed, err := m.cardClaims.Claim(idemKey)
 	if err != nil {
@@ -212,6 +199,32 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 	if !claimed {
 		// pending 或已 confirm 都是同一答案：这个人对这个动作已经提交过。
 		c.Response(map[string]interface{}{"accepted": true, "replay": true})
+		return
+	}
+
+	// D3 ⑥action_id 必须存在于「生效卡片」：content_edit（最新帧）优先于原始 payload
+	// —— 重写移除按钮的**首次**迟到点击在此 400（过期交互 fail-closed）；已 claim 的
+	// 重试已在上方回了 replay,不会到这里。同时取回匹配动作的静态 data（D11：服务端从
+	// 生效帧提取，绝不取请求里的 data）。首次校验失败释放 claim（纠正后可重试）。
+	effective := msgM.Payload
+	if extra != nil && extra.ContentEdit.Valid && extra.ContentEdit.String != "" {
+		effective = []byte(extra.ContentEdit.String)
+	}
+	actionData, found := cardmsg.SubmitAction(effective, req.ActionID)
+	if !found {
+		m.releaseCardClaim(idemKey)
+		m.Warn("action_id 不在生效卡片中,拒绝", zap.String("actionID", req.ActionID), zap.String("messageID", req.MessageID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
+		return
+	}
+
+	// D11 ⑦inputs 信任边界（round-3 P1-3）：只放行生效帧声明过的 Input.* id，逐
+	// 类型校验 + 尺寸上限 —— event_data.inputs 从此形状可信（内容仍是不可信用户
+	// 文本，bot 侧照常转义）。首次校验失败释放 claim。
+	if err := cardmsg.ValidateInputs(effective, req.Inputs); err != nil {
+		m.releaseCardClaim(idemKey)
+		m.Warn("卡片动作 inputs 校验失败,拒绝", zap.Error(err), zap.String("messageID", req.MessageID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
 		return
 	}
 
@@ -226,21 +239,26 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 		"message_id":   req.MessageID,
 		"channel_id":   req.ChannelID,
 		"channel_type": req.ChannelType,
-		"space_id":     spacepkg.GetSpaceID(c),
 		"action_id":    req.ActionID,
 		"inputs":       req.Inputs,
 		"operator_uid": loginUID,
 		"client_token": req.ClientToken,
 		"acted_at":     time.Now().Unix(),
 	}
+	// P1-3（PR#548 review）：space_id 取卡片的**权威来源 Space**（存储行/群表），
+	// 不取操作者请求上下文的 Space —— 后者仅经成员校验,可能与卡片来源 Space 不同
+	// (操作者同属 A、B 两 Space 时可用 X-Space-ID: B 点 A 的卡)。与 send 出口
+	// "服务端权威、无权威值即 strip"同口径:取不到则省略键(fail-closed),绝不回退到
+	// 客户端可影响的上下文 Space。
+	if cardSpaceID := m.resolveCardOriginSpaceID(msgM); cardSpaceID != "" {
+		eventData["space_id"] = cardSpaceID
+	}
 	if actionData != nil {
 		eventData["data"] = actionData
 	}
 	eventID, err := m.robotService.EnqueueBotTypedEvent(msgM.FromUID, cardmsg.EventTypeCardAction, eventData)
 	if err != nil {
-		if relErr := m.cardClaims.Release(idemKey); relErr != nil {
-			m.Error("card_action 入队失败后释放幂等 claim 也失败(残留至多 60s pending)", zap.Error(relErr), zap.String("key", idemKey))
-		}
+		m.releaseCardClaim(idemKey)
 		m.Error("card_action 事件入队失败,已释放幂等 claim", zap.Error(err), zap.String("botUID", msgM.FromUID))
 		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
@@ -253,9 +271,62 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 	c.Response(map[string]interface{}{"accepted": true, "replay": false})
 }
 
+// releaseCardClaim 补偿释放首次校验失败 / 入队失败的幂等 claim（P1-4：首次 claim
+// 后任一失败都要释放，否则纠正后的重试会撞残留 claim 误判 replay）。删不掉只是残留
+// 至多 60s pending，不影响正确性，记日志便于发现系统性 Redis 故障。
+func (m *Message) releaseCardClaim(idemKey string) {
+	if relErr := m.cardClaims.Release(idemKey); relErr != nil {
+		m.Error("释放卡片动作幂等 claim 失败(残留至多 60s pending)", zap.Error(relErr), zap.String("key", idemKey))
+	}
+}
+
 // fakeChannelContainsUID 校验 person 频道存储行的 fake channel id（"a@b"）是否
 // 包含给定 uid —— 成员资格以存储行为准（D3 anti-IDOR）。
 func fakeChannelContainsUID(fakeChannelID, uid string) bool {
 	parts := strings.SplitN(fakeChannelID, "@", 2)
 	return len(parts) == 2 && (parts[0] == uid || parts[1] == uid)
+}
+
+// resolveCardOriginSpaceID 解析卡片的**权威来源 Space**（P1-3, PR#548 review）。
+// card_action 事件的 space_id 必须来自卡片自身的存储权威,而非操作者请求上下文的
+// Space —— SpaceMiddleware 只证明操作者是所声明 Space 的成员,不证明卡片属于该
+// Space(操作者同属 A、B 两 Space 时可用 X-Space-ID: B 点 A 群/DM 的卡)。与 send
+// 出口 enrichPayloadWithSpaceID 同口径:
+//   - GROUP           → 群表 SpaceID
+//   - COMMUNITY_TOPIC → 父群 SpaceID
+//   - PERSONAL        → 发送时服务端注入进 payload 顶层的权威 space_id（DM 无 Space
+//     路由,payload 是收端唯一可信信号源;见 enrich*PayloadWithSpaceID）
+//
+// 任一步取不到 → 返回 ""(fail-closed:调用方省略 event_data.space_id,与 send 路径
+// 无权威值时 strip 客户端 space 的行为对齐;绝不回退到客户端可影响的上下文 Space)。
+func (m *Message) resolveCardOriginSpaceID(msgM *messageModel) string {
+	switch msgM.ChannelType {
+	case common.ChannelTypeGroup.Uint8():
+		return m.groupSpaceIDOrEmpty(msgM.ChannelID)
+	case common.ChannelTypeCommunityTopic.Uint8():
+		parent, err := m.resolveParentGroupNo(msgM.ChannelID)
+		if err != nil || parent == "" {
+			return ""
+		}
+		return m.groupSpaceIDOrEmpty(parent)
+	case common.ChannelTypePerson.Uint8():
+		var env struct {
+			SpaceID string `json:"space_id"`
+		}
+		if err := json.Unmarshal(msgM.Payload, &env); err != nil {
+			return ""
+		}
+		return env.SpaceID
+	default:
+		return ""
+	}
+}
+
+// groupSpaceIDOrEmpty 查群的权威 SpaceID;任何错误 / 空群 / 空 SpaceID → ""。
+func (m *Message) groupSpaceIDOrEmpty(groupNo string) string {
+	g, err := m.groupService.GetGroupWithGroupNo(groupNo)
+	if err != nil || g == nil {
+		return ""
+	}
+	return g.SpaceID
 }

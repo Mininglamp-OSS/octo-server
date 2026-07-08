@@ -248,15 +248,19 @@ func TestCardActionTrustModel(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
 	assert.Contains(t, w.Body.String(), "You are not allowed to act on this card.")
 
-	// ⑤ D11 inputs 信任边界(round-3 P1-3):未声明键 / 非字符串值 → 400
+	// ⑤ D11 inputs 信任边界(round-3 P1-3):未声明键 / 非字符串值 → 400。
+	//    P1-4 后幂等先于校验:必须用一张**未被 claim** 的新卡(复用已 claim 的 done_btn
+	//    会先回 replay 而非跑校验)。校验失败会释放 claim,故两条 bad-input 各自重新
+	//    claim 并 400。
+	seedCardMessage(t, ctx, 9109, cardActionBotUID, fakeBot, common.ChannelTypePerson.Uint8(), cardV2EnvelopeJSON(t, "approve_btn"))
 	for i, badInputs := range []map[string]interface{}{
-		{"undeclared": "x"},       // 生效帧(done_btn 新帧)只声明了 comment
+		{"undeclared": "x"},       // 生效帧只声明了 comment
 		{"comment": float64(123)}, // 值必须是字符串(AC submit 线上语义)
 	} {
 		w = do(map[string]interface{}{
-			"message_id": "9102", "channel_id": cardActionBotUID,
+			"message_id": "9109", "channel_id": cardActionBotUID,
 			"channel_type": common.ChannelTypePerson.Uint8(),
-			"action_id":    "done_btn", "inputs": badInputs,
+			"action_id":    "approve_btn", "inputs": badInputs,
 			"client_token": fmt.Sprintf("tok-t6-%d", i),
 		})
 		assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
@@ -304,7 +308,7 @@ func TestCardActionTrustModel(t *testing.T) {
 		"message_id": "9102", "channel_id": cardActionBotUID,
 		"channel_type": common.ChannelTypePerson.Uint8(),
 		"action_id":    "done_btn", "client_token": "tok-t11",
-		"inputs":       map[string]interface{}{"comment": strings.Repeat("a", 70<<10)},
+		"inputs": map[string]interface{}{"comment": strings.Repeat("a", 70<<10)},
 	})
 	assert.Equal(t, http.StatusBadRequest, w.Code, "超 64KiB body 应 pre-decode 被拒")
 
@@ -435,4 +439,149 @@ func TestCardActionEnqueueFailureReleasesClaim(t *testing.T) {
 	entries, err := rds.ZRange("robotEvent:"+failBot, 0, -1).Result()
 	assert.NoError(t, err)
 	assert.Len(t, entries, 1)
+}
+
+// cardV2EnvelopeWithSpaceID 构造带顶层 space_id 的 octo/v2 卡信封(模拟 send 出口
+// 把权威 SpaceID 注入进存储 payload —— DM 无 Space 路由,payload 是收端唯一信号源)。
+func cardV2EnvelopeWithSpaceID(t *testing.T, spaceID, actionID string) []byte {
+	t.Helper()
+	env := map[string]interface{}{
+		"type":         cardmsg.InteractiveCard.Int(),
+		"card_version": cardmsg.CardVersion,
+		"profile":      cardmsg.ProfileV2,
+		"plain":        "审批单",
+		"card": map[string]interface{}{
+			"type": "AdaptiveCard", "version": "1.5",
+			"body": []interface{}{
+				map[string]interface{}{"type": "TextBlock", "text": "审批单"},
+			},
+			"actions": []interface{}{
+				map[string]interface{}{"type": "Action.Submit", "id": actionID, "title": actionID},
+			},
+		},
+	}
+	if spaceID != "" {
+		env["space_id"] = spaceID
+	}
+	raw, err := json.Marshal(env)
+	assert.NoError(t, err)
+	return raw
+}
+
+// TestCardActionSpaceIDFromCardOrigin 验收 P1-3(PR#548 review):event_data.space_id
+// 取自卡片的**权威来源 Space**(存储 payload / 群表),而非操作者请求上下文的 Space;
+// 卡片无权威 Space 时 fail-closed 省略该键(与 send 出口无权威值即 strip 同口径)。
+func TestCardActionSpaceIDFromCardOrigin(t *testing.T) {
+	t.Setenv(cardmsg.EnvEnabled, "true")
+	s, ctx := testutil.NewTestServer()
+	defer func() { _ = testutil.CleanAllTables(ctx) }()
+	resetCardActionState(t, ctx)
+
+	seedCardBot(t, ctx, cardActionBotUID)
+	fake := common.GetFakeChannelIDWith(testutil.UID, cardActionBotUID)
+	// 9401:payload 顶层带发送时注入的权威 space_id="sp_origin"。
+	seedCardMessage(t, ctx, 9401, cardActionBotUID, fake, common.ChannelTypePerson.Uint8(), cardV2EnvelopeWithSpaceID(t, "sp_origin", "approve_btn"))
+	// 9402:payload 无 space_id(孤儿 bot / 非 Space 部署)。
+	seedCardMessage(t, ctx, 9402, cardActionBotUID, fake, common.ChannelTypePerson.Uint8(), cardV2EnvelopeWithSpaceID(t, "", "approve_btn"))
+
+	act := func(msgID string) {
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", "/v1/message/card/action", bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
+			"message_id": msgID, "channel_id": cardActionBotUID,
+			"channel_type": common.ChannelTypePerson.Uint8(),
+			"action_id":    "approve_btn", "client_token": "tok-" + msgID,
+		}))))
+		req.Header.Set("token", testutil.Token)
+		s.GetRoute().ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	}
+
+	rds := redis.NewClient(&redis.Options{Addr: ctx.GetConfig().DB.RedisAddr, Password: ctx.GetConfig().DB.RedisPass})
+	defer rds.Close()
+	eventDataFor := func(msgID string) map[string]interface{} {
+		entries, err := rds.ZRange("robotEvent:"+cardActionBotUID, 0, -1).Result()
+		assert.NoError(t, err)
+		for _, e := range entries {
+			var ev struct {
+				EventData map[string]interface{} `json:"event_data"`
+			}
+			if json.Unmarshal([]byte(e), &ev) == nil && ev.EventData["message_id"] == msgID {
+				return ev.EventData
+			}
+		}
+		return nil
+	}
+
+	act("9401")
+	ed := eventDataFor("9401")
+	assert.NotNil(t, ed)
+	assert.Equal(t, "sp_origin", ed["space_id"], "space_id 必取卡片来源 Space,而非操作者请求上下文")
+
+	act("9402")
+	ed = eventDataFor("9402")
+	assert.NotNil(t, ed)
+	_, hasSpace := ed["space_id"]
+	assert.False(t, hasSpace, "无权威来源 Space 时必须省略 space_id 键(fail-closed)")
+}
+
+// TestCardActionReplayAfterButtonRemoved 验收 P1-4(PR#548 review):已受理的动作在
+// bot 重写移除该按钮后被重试,必须回 replay(幂等**先于** stale-frame 校验),不撞
+// stale-frame 误判 400、不产生第二个事件;而一个**从未 claim** 的按钮迟到点击仍
+// fail-closed 400(不弱化首次点击的 stale 保护)。
+func TestCardActionReplayAfterButtonRemoved(t *testing.T) {
+	t.Setenv(cardmsg.EnvEnabled, "true")
+	s, ctx := testutil.NewTestServer()
+	defer func() { _ = testutil.CleanAllTables(ctx) }()
+	resetCardActionState(t, ctx)
+
+	seedCardBot(t, ctx, cardActionBotUID)
+	fake := common.GetFakeChannelIDWith(testutil.UID, cardActionBotUID)
+	seedCardMessage(t, ctx, 9501, cardActionBotUID, fake, common.ChannelTypePerson.Uint8(), cardV2EnvelopeJSON(t, "approve_btn", "reject_btn"))
+
+	rds := redis.NewClient(&redis.Options{Addr: ctx.GetConfig().DB.RedisAddr, Password: ctx.GetConfig().DB.RedisPass})
+	defer rds.Close()
+	do := func(actionID, tok string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", "/v1/message/card/action", bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
+			"message_id": "9501", "channel_id": cardActionBotUID,
+			"channel_type": common.ChannelTypePerson.Uint8(),
+			"action_id":    actionID, "client_token": tok,
+		}))))
+		req.Header.Set("token", testutil.Token)
+		s.GetRoute().ServeHTTP(w, req)
+		return w
+	}
+
+	// ① 首次点 approve_btn → 受理 + 入队 1 条
+	w := do("approve_btn", "tok-p4-1")
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), `"replay":false`)
+	n, _ := rds.ZCard("robotEvent:" + cardActionBotUID).Result()
+	assert.Equal(t, int64(1), n)
+
+	// ② bot 重写卡片,把 approve_btn / reject_btn 全移除(新帧只剩 done_btn)——
+	//    模拟"点完即置灰/消失"。
+	newFrame := cardV2EnvelopeJSON(t, "done_btn")
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO message_extra (message_id,message_seq,channel_id,channel_type,content_edit,content_edit_hash,edited_at,version) VALUES (?,?,?,?,?,?,?,?)",
+		"9501", 1, fake, common.ChannelTypePerson.Uint8(), string(newFrame), util.MD5(string(newFrame)), int(time.Now().Unix()), 1,
+	).Exec()
+	assert.NoError(t, err)
+
+	// ③ 丢 ack 后客户端重试同一 (message_id, action_id, operator)(换 token)——
+	//    approve_btn 已从生效帧移除。P1-4:必须回 replay(不是 stale-frame 400),
+	//    且不产生第二个事件。
+	w = do("approve_btn", "tok-p4-2")
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), `"replay":true`, "已 claim 的重试即使按钮被移除也必须回 replay")
+	n, _ = rds.ZCard("robotEvent:" + cardActionBotUID).Result()
+	assert.Equal(t, int64(1), n, "重试不得产生第二个事件")
+
+	// ④ 对照:一个**从未 claim** 的按钮(reject_btn)在被移除后首次点击 → 仍 fail-closed
+	//    400(P1-4 只放行已受理动作的重试,不放行全新的迟到点击)。
+	w = do("reject_btn", "tok-p4-3")
+	assert.Equal(t, http.StatusBadRequest, w.Code, "从未 claim 的按钮迟到点击仍 fail-closed 400")
+	assert.Contains(t, w.Body.String(), "Invalid card action.")
+	n, _ = rds.ZCard("robotEvent:" + cardActionBotUID).Result()
+	assert.Equal(t, int64(1), n, "对照组不得产生事件")
 }

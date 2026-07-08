@@ -899,13 +899,6 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 		fakeChannelID = common.GetFakeChannelIDWith(robotID, req.ChannelID)
 	}
 
-	version, err := ba.ctx.GenSeq(fmt.Sprintf("%s:%s", common.MessageExtraSeqKey, fakeChannelID))
-	if err != nil {
-		ba.Error("生成消息扩展序列号失败！", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
-		return
-	}
-
 	editedAt := int(time.Now().Unix())
 	if hasCardSeq {
 		// P2 D9：带 card_seq 的卡片编辑走条件 CAS。并发首帧在 InnoDB 下可能因
@@ -918,7 +911,7 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 			casErr   error
 		)
 		for attempt := 0; attempt < cardSeqCASMaxAttempts; attempt++ {
-			conflict, casErr = ba.cardSeqCASWrite(req.MessageID, req.MessageSeq, fakeChannelID, req.ChannelType, contentEdit, contentMD5, editedAt, version, cardSeq)
+			conflict, casErr = ba.cardSeqCASWrite(req.MessageID, req.MessageSeq, fakeChannelID, req.ChannelType, contentEdit, contentMD5, editedAt, cardSeq)
 			if casErr == nil || !isRetriableMySQLLockErr(casErr) {
 				break
 			}
@@ -935,6 +928,14 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 			return
 		}
 	} else {
+		// 非 card_seq 帧:last-write-wins 不变(D9,单写 bot 与既有编辑零行为变化)。
+		// 无 CAS 竞争重排,version 前置分配即可。
+		version, verr := ba.ctx.GenSeq(fmt.Sprintf("%s:%s", common.MessageExtraSeqKey, fakeChannelID))
+		if verr != nil {
+			ba.Error("生成消息扩展序列号失败！", zap.Error(verr))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
+			return
+		}
 		_, err = ba.ctx.DB().InsertBySql(
 			"INSERT INTO message_extra (message_id,message_seq,channel_id,channel_type,content_edit,content_edit_hash,edited_at,version) VALUES (?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE content_edit=VALUES(content_edit),content_edit_hash=VALUES(content_edit_hash),edited_at=VALUES(edited_at),version=VALUES(version)",
 			req.MessageID, req.MessageSeq, fakeChannelID, req.ChannelType, contentEdit, contentMD5, editedAt, version,
@@ -968,7 +969,15 @@ const cardSeqCASMaxAttempts = 5
 // card_seq —— 新值 ≤ 已存（非 NULL）→ 返回 conflict=true（乱序/迟到帧，什么都不写）；
 // 否则连 card_seq 一并 upsert 并提交。返回的 err 若是可重试锁错误（1213/1205），
 // 由调用方有界重试化解（死锁瞬时；重试后重读已提交的更高 seq，仍按 CAS 判定）。
-func (ba *BotAPI) cardSeqCASWrite(messageID string, messageSeq uint32, fakeChannelID string, channelType uint8, contentEdit, contentMD5 string, editedAt int, version, cardSeq int64) (conflict bool, err error) {
+//
+// P1-2（PR#548 review）：message_extra.version 在**拿到行锁之后**才分配。GenSeq
+// 是每-channel 单调递增,而 delta-sync 按 version 升序取增量帧
+// （db_message_extra.go:110 `where version>? order by version asc`）。若 version
+// 在锁外前置分配,一个更低 version 的帧可能赢下 card_seq CAS 却以更小 version 覆盖行
+// —— 已同步到更高 version 的客户端从此收不到该终帧（行在库里正确、但对 delta-sync
+// 不可见,违反 D6"各端收敛"/D9"no lost-update"）。锁内分配把竞争写的 GenSeq 调用按
+// 提交顺序串行化：赢家写（最大 seq、最后一次 advancing 写）必得最大 version。
+func (ba *BotAPI) cardSeqCASWrite(messageID string, messageSeq uint32, fakeChannelID string, channelType uint8, contentEdit, contentMD5 string, editedAt int, cardSeq int64) (conflict bool, err error) {
 	tx, err := ba.ctx.DB().Begin()
 	if err != nil {
 		return false, err
@@ -981,6 +990,11 @@ func (ba *BotAPI) cardSeqCASWrite(messageID string, messageSeq uint32, fakeChann
 	}
 	if stored.Valid && stored.Int64 >= cardSeq {
 		return true, nil
+	}
+	// 锁内分配 version（见函数注释 P1-2）：仅 advancing 写才消费 version,冲突帧不消费。
+	version, err := ba.ctx.GenSeq(fmt.Sprintf("%s:%s", common.MessageExtraSeqKey, fakeChannelID))
+	if err != nil {
+		return false, err
 	}
 	if _, err = tx.InsertBySql(
 		"INSERT INTO message_extra (message_id,message_seq,channel_id,channel_type,content_edit,content_edit_hash,edited_at,version,card_seq) VALUES (?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE content_edit=VALUES(content_edit),content_edit_hash=VALUES(content_edit_hash),edited_at=VALUES(edited_at),version=VALUES(version),card_seq=VALUES(card_seq)",
