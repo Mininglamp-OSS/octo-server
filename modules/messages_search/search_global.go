@@ -596,7 +596,9 @@ func (h *Handler) buildAllowlist(_ *wkhttp.Context, loginUID, spaceID string) ([
 // hard caps (maxThreadsPerGroup / maxTotalThreadChannelIDs) so a runaway
 // group cannot alone blow the OS terms clause. The DB query itself is
 // bounded by thread.NonDeletedByGroupNosDBHardLimit so a pathological
-// membership footprint can't drag tens of thousands of rows into memory.
+// membership footprint can't drag tens of thousands of rows into memory;
+// when that DB cap trips, the query signals it via dbLimitHit and we WARN
+// so the tail-drop is observable rather than silent (RC 2 on PR #553).
 //
 // Visibility: threads with status != deleted (i.e. active OR archived) are
 // included, aligning with single-channel search + message read semantics.
@@ -613,11 +615,26 @@ func (h *Handler) enumerateThreadsForGroups(groupNos []string) []channelRef {
 	if enum == nil {
 		enum = thread.NewDB(h.ctx).QueryNonDeletedShortIDsByGroupNos
 	}
-	byGroup, err := enum(groupNos)
+	byGroup, dbLimitHit, err := enum(groupNos)
 	if err != nil {
 		h.Warn("messages_search: thread enumeration failed; thread hits will be hidden for this request",
 			zap.Error(err))
 		return nil
+	}
+	if dbLimitHit {
+		// The DB hard-limit `NonDeletedByGroupNosDBHardLimit` capped the row
+		// set. Because rows are ordered by (group_no, short_id) before the
+		// LIMIT, tail groups (highest group_no) may be missing entirely or
+		// arrive partial. That is invisible to the caller's per-group /
+		// aggregate downgrade branches below (they trigger on TOO-MANY, not
+		// on TOO-FEW). WARN explicitly so operators can observe the silent
+		// degradation and, if it becomes recurrent, either widen the DB cap
+		// or shard the query. See RC 2 on PR #553 for the full analysis.
+		h.Warn("messages_search: thread enumeration hit DB hard limit; tail groups may be partial or missing",
+			zap.Int("db_hard_limit", thread.NonDeletedByGroupNosDBHardLimit),
+			zap.Int("group_count", len(groupNos)),
+			zap.String("first_group", groupNos[0]),
+			zap.String("last_group", groupNos[len(groupNos)-1]))
 	}
 	// Deterministic iteration — range over groupNos, not the map, so the
 	// hard-cap downgrade is reproducible across runs and easy to reason
@@ -644,6 +661,7 @@ func (h *Handler) enumerateThreadsForGroups(groupNos []string) []channelRef {
 				zap.Int("cap", maxTotalThreadChannelIDs))
 			break
 		}
+		appended := 0
 		for _, sid := range shortIDs {
 			if sid == "" {
 				continue
@@ -654,8 +672,13 @@ func (h *Handler) enumerateThreadsForGroups(groupNos []string) []channelRef {
 				WireID:      id,
 				ChannelType: channelTypeThread,
 			})
+			appended++
 		}
-		total += len(shortIDs)
+		// Increment by rows actually appended, not raw len(shortIDs) — the
+		// inner loop skips blank shortIDs (production QueryNonDeletedShort
+		// IDsByGroupNos strips those, but a future threadEnumFn source might
+		// not). Keeps `total` faithful to the OS terms-clause payload.
+		total += appended
 	}
 	return out
 }
@@ -874,8 +897,10 @@ func (h *Handler) channelsForMember(loginUID, memberUID, spaceID string, allowSe
 				// between caller and member.
 				out[id] = ref
 			}
-			// channelTypeThread: intentionally dropped for v1 — see
-			// helper doc-comment above.
+		case channelTypeThread:
+			// Intentionally dropped for v1 — see helper doc-comment above.
+			// Explicit case so a future maintainer adding a default: arm
+			// sees the drop is intentional and not a forgotten branch.
 		}
 	}
 	// spaceID is unused: the caller has already narrowed allowSet to the

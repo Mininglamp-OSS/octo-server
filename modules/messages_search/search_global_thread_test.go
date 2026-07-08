@@ -55,7 +55,7 @@ func TestBuildAllowlist_IncludesThreadChannelIDs(t *testing.T) {
 	}
 	uSvc := &stubUserSvc{friends: []*user.FriendResp{}}
 	h := newAllowlistHandler(t, gSvc, uSvc)
-	h.threadEnumFn = func(groupNos []string) (map[string][]string, error) {
+	h.threadEnumFn = func(groupNos []string) (map[string][]string, bool, error) {
 		// Sanity: caller passes exactly the joined groups.
 		got := map[string]bool{}
 		for _, gn := range groupNos {
@@ -67,7 +67,7 @@ func TestBuildAllowlist_IncludesThreadChannelIDs(t *testing.T) {
 		return map[string][]string{
 			"grpA": {"thr1", "thr2"},
 			"grpB": {"thr3"},
-		}, nil
+		}, false, nil
 	}
 
 	allowGroup, _, allowThread, err := h.buildAllowlist(nil, loginUID, "")
@@ -101,7 +101,7 @@ func TestBuildAllowlist_IncludesThreadChannelIDs(t *testing.T) {
 }
 
 // TestBuildAllowlist_ThreadEnumerateSoftFail — a DB error inside
-// QueryActiveShortIDsByGroupNos must NOT sink the whole request; the
+// QueryNonDeletedShortIDsByGroupNos must NOT sink the whole request; the
 // group + DM parts still populate.
 func TestBuildAllowlist_ThreadEnumerateSoftFail(t *testing.T) {
 	loginUID := "me"
@@ -112,8 +112,8 @@ func TestBuildAllowlist_ThreadEnumerateSoftFail(t *testing.T) {
 	}
 	uSvc := &stubUserSvc{friends: []*user.FriendResp{{UID: "friend1"}}}
 	h := newAllowlistHandler(t, gSvc, uSvc)
-	h.threadEnumFn = func([]string) (map[string][]string, error) {
-		return nil, errors.New("mysql: connection refused")
+	h.threadEnumFn = func([]string) (map[string][]string, bool, error) {
+		return nil, false, errors.New("mysql: connection refused")
 	}
 
 	allowGroup, allowDM, allowThread, err := h.buildAllowlist(nil, loginUID, "")
@@ -147,11 +147,11 @@ func TestBuildAllowlist_ThreadPerGroupCap(t *testing.T) {
 	for i := range fat {
 		fat[i] = "thr" + itoa(i)
 	}
-	h.threadEnumFn = func([]string) (map[string][]string, error) {
+	h.threadEnumFn = func([]string) (map[string][]string, bool, error) {
 		return map[string][]string{
 			"grpFat":  fat,
 			"grpThin": {"thrOK"},
-		}, nil
+		}, false, nil
 	}
 
 	allowGroup, _, allowThread, err := h.buildAllowlist(nil, loginUID, "")
@@ -225,12 +225,12 @@ func TestBuildAllowlist_ThreadGlobalAggregateCap(t *testing.T) {
 		}
 		return out
 	}
-	h.threadEnumFn = func([]string) (map[string][]string, error) {
+	h.threadEnumFn = func([]string) (map[string][]string, bool, error) {
 		m := make(map[string][]string, numGroups)
 		for _, gn := range groupNames {
 			m[gn] = makeIDs(gn+"_thr", perGroup)
 		}
-		return m, nil
+		return m, false, nil
 	}
 
 	_, _, allowThread, err := h.buildAllowlist(nil, loginUID, "")
@@ -288,9 +288,9 @@ func TestBuildAllowlist_EmptyGroupsNoThreadQuery(t *testing.T) {
 	uSvc := &stubUserSvc{}
 	h := newAllowlistHandler(t, gSvc, uSvc)
 	called := false
-	h.threadEnumFn = func(groupNos []string) (map[string][]string, error) {
+	h.threadEnumFn = func(groupNos []string) (map[string][]string, bool, error) {
 		called = true
-		return nil, nil
+		return nil, false, nil
 	}
 
 	_, _, allowThread, err := h.buildAllowlist(nil, loginUID, "")
@@ -355,8 +355,8 @@ func TestResolveGlobalScope_ThreadNarrowingHits(t *testing.T) {
 	uSvc := &stubUserSvc{}
 	h := newAllowlistHandler(t, gSvc, uSvc)
 	threadID := thread.BuildChannelID("grpA", "thr1")
-	h.threadEnumFn = func([]string) (map[string][]string, error) {
-		return map[string][]string{"grpA": {"thr1"}}, nil
+	h.threadEnumFn = func([]string) (map[string][]string, bool, error) {
+		return map[string][]string{"grpA": {"thr1"}}, false, nil
 	}
 
 	// Build a validator context whose spaceID is empty so RequireSpaceID
@@ -391,9 +391,9 @@ func TestResolveGlobalScope_ThreadOutsideMembership(t *testing.T) {
 	}
 	uSvc := &stubUserSvc{}
 	h := newAllowlistHandler(t, gSvc, uSvc)
-	h.threadEnumFn = func([]string) (map[string][]string, error) {
+	h.threadEnumFn = func([]string) (map[string][]string, bool, error) {
 		// grpA has no threads; grpB is not in allowlist.
-		return map[string][]string{}, nil
+		return map[string][]string{}, false, nil
 	}
 
 	c, _ := newValidatorCtx(t)
@@ -412,6 +412,134 @@ func TestResolveGlobalScope_ThreadOutsideMembership(t *testing.T) {
 }
 
 // itoa is provided by visibility_test.go in this package — no local copy.
+
+// TestEnumerateThreadsForGroups_DBLimitHitStillReturnsResults — RC 2 on
+// PR #553. When the underlying DB signals `dbLimitHit=true` (i.e. the
+// SQL `LIMIT NonDeletedByGroupNosDBHardLimit` truncated the row set),
+// enumerateThreadsForGroups must still surface whatever rows *did* come
+// back (partial coverage is better than none) AND emit a WARN so tail-
+// group loss is observable rather than silent.
+//
+// The WARN itself lands in the process-wide zap logger (see
+// octo-lib/pkg/log/logger.go); this test doesn't capture stderr, but it
+// exercises the branch so a future regression that swallows dbLimitHit
+// silently (e.g. renaming the return arg to `_`) breaks the build /
+// test signature immediately.
+func TestEnumerateThreadsForGroups_DBLimitHitStillReturnsResults(t *testing.T) {
+	gSvc := &stubGroupSvc{}
+	uSvc := &stubUserSvc{}
+	h := newAllowlistHandler(t, gSvc, uSvc)
+	h.threadEnumFn = func(groupNos []string) (map[string][]string, bool, error) {
+		// Simulate: DB hit LIMIT, returned partial results (grpA got its
+		// two rows before the LIMIT ran out; a hypothetical grpZ tail
+		// group returned nothing).
+		return map[string][]string{
+			"grpA": {"thr1", "thr2"},
+			// grpZ intentionally absent — the "silent tail drop" symptom.
+		}, true /* dbLimitHit */, nil
+	}
+
+	got := h.enumerateThreadsForGroups([]string{"grpA", "grpZ"})
+	// Partial results survive: grpA's two threads still appear.
+	if len(got) != 2 {
+		t.Fatalf("partial results must still be returned on dbLimitHit; got %d refs", len(got))
+	}
+	want := map[string]bool{
+		thread.BuildChannelID("grpA", "thr1"): true,
+		thread.BuildChannelID("grpA", "thr2"): true,
+	}
+	for _, r := range got {
+		if !want[r.OSChannelID] {
+			t.Errorf("unexpected channelId in partial result: %q", r.OSChannelID)
+		}
+		if r.ChannelType != channelTypeThread {
+			t.Errorf("ChannelType must be thread=5; got %d", r.ChannelType)
+		}
+	}
+	// grpZ (the silently-tail-dropped group) yields nothing — that's
+	// exactly the symptom the WARN emitted above exists to make visible.
+	skippedPrefix := "grpZ" + thread.ChannelIDSeparator
+	for _, r := range got {
+		if strings.HasPrefix(r.OSChannelID, skippedPrefix) {
+			t.Errorf("tail-dropped group must yield no rows here; leaked %q", r.OSChannelID)
+		}
+	}
+}
+
+// TestEnumerateThreadsForGroups_NoTrailingBlankInflation — defensive: the
+// running total that gates the aggregate cap must count *appended* rows,
+// not raw `len(shortIDs)`. Production QueryNonDeletedShortIDsByGroupNos
+// strips blank shortIDs at the SQL parse boundary, but a future
+// threadEnumFn source (mock, alternative backend) may not. Verify a group
+// containing blank shortIDs contributes only its non-blank rows to the
+// caller's aggregate count, so a subsequent group is NOT prematurely
+// starved by phantom rows. (RC N3 on PR #553.)
+func TestEnumerateThreadsForGroups_NoTrailingBlankInflation(t *testing.T) {
+	gSvc := &stubGroupSvc{}
+	uSvc := &stubUserSvc{}
+	h := newAllowlistHandler(t, gSvc, uSvc)
+	// Design: N groups each holding K blanks + K real shortIDs, chosen so
+	// that:
+	//   sum(raw len) across N groups     > maxTotalThreadChannelIDs (2000)
+	//   sum(appended non-blank) across N groups <= maxTotalThreadChannelIDs
+	//   each group's raw len                    <= maxThreadsPerGroup (200)
+	// so per-group cap doesn't fire but the aggregate would fire with the
+	// buggy raw-count accounting. Correct accounting must let all N groups
+	// through and surface a trailing extra group's rows too.
+	const (
+		K      = 90 // per-group non-blank rows
+		blanks = 90 // per-group blank rows (raw len = 180, under per-group cap 200)
+		N      = 14 // N * (K+blanks) = 2520 > 2000 raw aggregate, N * K = 1260 well under
+	)
+	groupNos := make([]string, 0, N+1)
+	enumMap := make(map[string][]string, N+1)
+	for gi := 0; gi < N; gi++ {
+		gn := "grp_pad_" + itoa(gi)
+		groupNos = append(groupNos, gn)
+		ids := make([]string, 0, K+blanks)
+		for si := 0; si < K; si++ {
+			ids = append(ids, gn+"_thr_"+itoa(si))
+		}
+		for si := 0; si < blanks; si++ {
+			ids = append(ids, "") // blank shortIDs — must not inflate aggregate
+		}
+		enumMap[gn] = ids
+	}
+	// Extra tail group with 10 real threads. Under the bug this group is
+	// dropped whole (aggregate cap trips on inflated running total). Under
+	// the fix, it survives.
+	tail := "grp_tail"
+	groupNos = append(groupNos, tail)
+	enumMap[tail] = []string{"tail_a", "tail_b", "tail_c"}
+
+	h.threadEnumFn = func([]string) (map[string][]string, bool, error) {
+		return enumMap, false, nil
+	}
+
+	got := h.enumerateThreadsForGroups(groupNos)
+
+	// Expect exactly N*K + 3 non-blank refs — tail group survives.
+	wantTotal := N*K + 3
+	if len(got) != wantTotal {
+		t.Fatalf("expected %d non-blank refs (N*K + tail); got %d", wantTotal, len(got))
+	}
+	// Confirm tail group actually surfaced (this is the load-bearing check
+	// for the `total += appended` fix; the buggy `total += len(shortIDs)`
+	// would starve it).
+	tailPrefix := tail + thread.ChannelIDSeparator
+	tailHits := 0
+	for _, r := range got {
+		if r.OSChannelID == "" {
+			t.Errorf("blank channelId must never surface")
+		}
+		if strings.HasPrefix(r.OSChannelID, tailPrefix) {
+			tailHits++
+		}
+	}
+	if tailHits != 3 {
+		t.Errorf("tail group must contribute 3 refs (fix for raw-len inflation); got %d", tailHits)
+	}
+}
 
 // TestBuildAllowlist_ArchivedThreadsIncluded — RC blocker on PR #553:
 // archived (=2) threads must be surfaced by global search, matching the
@@ -435,8 +563,8 @@ func TestBuildAllowlist_ArchivedThreadsIncluded(t *testing.T) {
 	// AND an archived thread from the same group both surface.
 	active := "thr_active"
 	archived := "thr_archived"
-	h.threadEnumFn = func(groupNos []string) (map[string][]string, error) {
-		return map[string][]string{"grpA": {active, archived}}, nil
+	h.threadEnumFn = func(groupNos []string) (map[string][]string, bool, error) {
+		return map[string][]string{"grpA": {active, archived}}, false, nil
 	}
 
 	_, _, allowThread, err := h.buildAllowlist(nil, loginUID, "")
@@ -481,10 +609,10 @@ func TestBuildAllowlist_DeletedThreadsExcluded(t *testing.T) {
 	// zero returned rows for the deleted thread — that's what the fixed
 	// enumerator does: `status != deleted` filter excludes deleted rows.
 	visible := "thr_visible"
-	h.threadEnumFn = func(groupNos []string) (map[string][]string, error) {
+	h.threadEnumFn = func(groupNos []string) (map[string][]string, bool, error) {
 		// Deleted shortID is deliberately NOT in the returned map — same
 		// as what QueryNonDeletedShortIDsByGroupNos does at the SQL level.
-		return map[string][]string{"grpA": {visible}}, nil
+		return map[string][]string{"grpA": {visible}}, false, nil
 	}
 
 	_, _, allowThread, err := h.buildAllowlist(nil, loginUID, "")
@@ -525,10 +653,10 @@ func TestResolveGlobalScope_ArchivedThreadNarrowingHits(t *testing.T) {
 	h := newAllowlistHandler(t, gSvc, uSvc)
 	archivedShortID := "thr_archived"
 	archivedChan := thread.BuildChannelID("grpA", archivedShortID)
-	h.threadEnumFn = func([]string) (map[string][]string, error) {
+	h.threadEnumFn = func([]string) (map[string][]string, bool, error) {
 		// Post-fix enumerator would return archived alongside active. Here
 		// we simulate only the archived one to prove the narrowing hits it.
-		return map[string][]string{"grpA": {archivedShortID}}, nil
+		return map[string][]string{"grpA": {archivedShortID}}, false, nil
 	}
 
 	c, _ := newValidatorCtx(t)

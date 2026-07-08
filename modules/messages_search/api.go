@@ -53,7 +53,12 @@ type Handler struct {
 	// the reject-deleted-only visibility contract; see RC on PR #553); tests
 	// inject a stub so the thread coverage on the global feed is exercisable
 	// without a real MySQL connection.
-	threadEnumFn func(groupNos []string) (map[string][]string, error)
+	//
+	// Returns (map[groupNo][]shortID, dbLimitHit, err). dbLimitHit=true means
+	// the DB 硬上限 LIMIT NonDeletedByGroupNosDBHardLimit was reached and the
+	// caller must WARN (tail groups may be partial or missing). See caller
+	// enumerateThreadsForGroups + RC 2 on PR #553.
+	threadEnumFn func(groupNos []string) (map[string][]string, bool, error)
 	// externalGroupFn is a test seam for the external-group lookup inside
 	// buildAllowlist. Nil in production (falls through to group.NewDB(h.ctx)
 	// .QueryExternalGroupNosForUser); tests inject a stub so buildAllowlist

@@ -257,8 +257,8 @@ func (d *DB) QueryNonDeletedShortIDs(shortIDs []string) ([]string, error) {
 	return result, nil
 }
 
-// GroupShortIDRow 是 QueryActiveShortIDsByGroupNos /
-// QueryNonDeletedShortIDsByGroupNos 内部的两列投影，只暴露包内使用。
+// GroupShortIDRow 是 QueryNonDeletedShortIDsByGroupNos 内部的两列投影，只暴露
+// 包内使用。
 type GroupShortIDRow struct {
 	GroupNo string `db:"group_no"`
 	ShortID string `db:"short_id"`
@@ -272,50 +272,9 @@ type GroupShortIDRow struct {
 //
 // 选值 2500 = maxTotalThreadChannelIDs(2000) × 1.25 缓冲，保证 caller 的
 // downgrade WARN 分支仍能被观测到（真正爆过 2000 才降级），同时把 pathological
-// 场景截在一个可预测的量级。命中该 LIMIT 会在 caller 端的 running-total 计算
-// 里自然表现为「某些群拿到的 shortID 不全」——这种情况下 messages_search 侧本
-// 就会走 downgrade / skip 分支，语义等价于 caller 的 cap 触发。
+// 场景截在一个可预测的量级。**命中该 LIMIT 后必须由 caller 走 dbLimitHit 分支
+// 发 WARN**——见函数返回值 truncated（RC 2 on PR #553）。
 const NonDeletedByGroupNosDBHardLimit = 2500
-
-// QueryActiveShortIDsByGroupNos 批量拉取一组 group 下 status=active 的子区 short_id，
-// 返回 map[groupNo][]shortID。
-//
-// 语义（严格的「只看 active」）：archived / deleted 都不返回。
-//   - 保留原因：/v1/conversation/sync 等「只显示活跃子区」的路径仍依赖该语义
-//     和这套现有单测（db_batch_test.go::TestQueryActiveShortIDsByGroupNos）。
-//   - 注意：**messages_search 全局搜索的 allowlist 已不再用这个函数**，改用
-//     QueryNonDeletedShortIDsByGroupNos（archived 允许纳入），以对齐单频道搜索
-//     / getThreadMessage 的可见性契约（只拒 deleted）。参见 RC on PR #553。
-//
-// 单次 SELECT 走 (group_no, status, ...) 覆盖索引 idx_group_status_created_id
-// （见 modules/thread/sql/20260522000002_thread_group_status_created_index.sql），
-// 避免对每个 group 做一次子查询。
-//
-// 保护限制：
-//   - 空入参直接返回空 map，不下发 SQL；
-//   - 内部只取 (group_no, short_id) 两列，无 hot-column 回表；
-//   - 结果规模在调用方再做「单群 shortID 上限」的降级判定；DB 层不硬砍上限
-//     以保留可观测性——若真的爆表也让 caller 明确处理。
-func (d *DB) QueryActiveShortIDsByGroupNos(groupNos []string) (map[string][]string, error) {
-	out := make(map[string][]string)
-	if len(groupNos) == 0 {
-		return out, nil
-	}
-	var rows []GroupShortIDRow
-	_, err := d.session.Select("group_no", "short_id").From("thread").
-		Where("group_no IN ? AND status=?", groupNos, ThreadStatusActive).
-		Load(&rows)
-	if err != nil {
-		return nil, fmt.Errorf("query active short ids by group nos: %w", err)
-	}
-	for _, r := range rows {
-		if r.GroupNo == "" || r.ShortID == "" {
-			continue
-		}
-		out[r.GroupNo] = append(out[r.GroupNo], r.ShortID)
-	}
-	return out, nil
-}
 
 // QueryNonDeletedShortIDsByGroupNos 批量拉取一组 group 下 **status != deleted** 的
 // 子区 short_id（即 active + archived 都纳入，deleted 排除），返回 map[groupNo][]shortID。
@@ -326,27 +285,39 @@ func (d *DB) QueryActiveShortIDsByGroupNos(groupNos []string) (map[string][]stri
 //   - modules/messages_search/authz.go checkThreadAccess → modules/thread/service.go
 //     GetThread（service.go:102）：仅拒 deleted、返回 archived。
 //
-// 之前全局搜索用 QueryActiveShortIDsByGroupNos(status=active)，会把 archived 子区错
-// 误排除——归档子区 **单频道搜索能命中、全局搜不到**，破坏一致性。因为
-// archived 是 ArchiveStaleBatch cron 例行转的（占比不小），影响面很大。
+// 之前全局搜索用 status=active 变体，会把 archived 子区错误排除——归档子区
+// **单频道搜索能命中、全局搜不到**，破坏一致性。因为 archived 是 ArchiveStaleBatch
+// cron 例行转的（占比不小），影响面很大。
 //
-// **DB 层 hard bound**：LIMIT NonDeletedByGroupNosDBHardLimit 防雪崩 (RC N2、PR #553):
-//   - caller 侧 (messages_search/search_global.go enumerateThreadsForGroups) 仍维持
+// **DB 层 hard bound**：LIMIT NonDeletedByGroupNosDBHardLimit 防雪崩 (PR #553):
+//   - caller 侧 (messages_search/search_global.go enumerateThreadsForGroups) 维持
 //     maxThreadsPerGroup / maxTotalThreadChannelIDs 两个语义 cap + WARN downgrade；
 //   - DB 层的 LIMIT 只是上限，避免重度用户 pathological 场景下一次 SELECT 拉几十万行入内
 //     存（MySQL 已返回全部行后才 downgrade 的旧行为在线上不可接受）。
-//   - 命中 LIMIT 时 caller 看到的是「尾部群拿到不全」，自然会走已有的 downgrade / skip
-//     分支，语义与现行 cap 触发一致。
+//   - **命中 LIMIT 与 caller 语义 cap 不等价**：语义 cap 触发时某个 group 返回「太多」
+//     并被 caller 显式降级 + WARN；DB LIMIT 触发时按 ORDER BY 排在尾部的整个 group
+//     可能返回「零 / 部分」行，caller 单看行数分不出「本来就没有」还是「被 SQL 截掉」。
+//     因此 truncated 返回值必须被 caller 观测并单独 WARN；否则重度用户（>2500 非删除
+//     子区）会静默丢失 thread 覆盖（RC 2 on PR #553）。
 //
 // 排序：ORDER BY group_no, short_id 保证 LIMIT 截断在多群场景下确定——同一输入 groupNos
-// 集合总是拿到同一子集，避免引入不确定截断。无 group_no / short_id 的两列覆盖索引时（
-// idx_group_status_created_id）MySQL 也能在索引内完成排序，无 filesort。
+// 集合总是拿到同一子集，避免引入不确定截断。
 //
-// 保护限制同 QueryActiveShortIDsByGroupNos（空入参 → 空 map、仅投影两列）。
-func (d *DB) QueryNonDeletedShortIDsByGroupNos(groupNos []string) (map[string][]string, error) {
+// 索引：无覆盖排序索引与 (group_no IN, status != deleted) 组合完全匹配（idx_group_status
+// _created_id 是 (group_no, status, created_at, id)、uk_group_short 是 (group_no,
+// short_id) 不带 status），MySQL 大概率会 filesort，但 LIMIT=2500 把工作集截在可控
+// 量级——若这条路径变热应用 EXPLAIN 复核并考虑追加合适复合索引。
+//
+// 保护限制：空入参直接返回空 map，不下发 SQL；内部只取 (group_no, short_id) 两列。
+//
+// 返回值 truncated 为 true 当且仅当返回的行数触到 LIMIT（`len(rows) == LIMIT`）。
+// 此时数据是「按 ORDER BY group_no, short_id 的前 LIMIT 行」，尾部 group 可能
+// 部分或全部缺失；caller **必须**将 truncated=true 视为观测点并发 WARN，以免
+// 静默降级（RC 2 on PR #553）。
+func (d *DB) QueryNonDeletedShortIDsByGroupNos(groupNos []string) (map[string][]string, bool, error) {
 	out := make(map[string][]string)
 	if len(groupNos) == 0 {
-		return out, nil
+		return out, false, nil
 	}
 	var rows []GroupShortIDRow
 	_, err := d.session.Select("group_no", "short_id").From("thread").
@@ -355,15 +326,16 @@ func (d *DB) QueryNonDeletedShortIDsByGroupNos(groupNos []string) (map[string][]
 		Limit(uint64(NonDeletedByGroupNosDBHardLimit)).
 		Load(&rows)
 	if err != nil {
-		return nil, fmt.Errorf("query non-deleted short ids by group nos: %w", err)
+		return nil, false, fmt.Errorf("query non-deleted short ids by group nos: %w", err)
 	}
+	truncated := len(rows) >= NonDeletedByGroupNosDBHardLimit
 	for _, r := range rows {
 		if r.GroupNo == "" || r.ShortID == "" {
 			continue
 		}
 		out[r.GroupNo] = append(out[r.GroupNo], r.ShortID)
 	}
-	return out, nil
+	return out, truncated, nil
 }
 
 // QueryActiveShortIDs 批量查询 status=active 的子区 shortID。
