@@ -28,6 +28,9 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/common"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n/codes"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	"github.com/Mininglamp-OSS/octo-server/pkg/stickersig"
@@ -73,6 +76,8 @@ func New(ctx *config.Context) *File {
 
 // Route 路由
 func (f *File) Route(r *wkhttp.WKHttp) {
+	r.Any("/v1/file/local", f.handleLocalSignedFile)
+
 	auth := r.Group("/v1/file", f.ctx.AuthMiddleware(r))
 	stickerUploadHandlers := f.stickerUploadHandlers(r)
 	{
@@ -119,6 +124,235 @@ func stickerOnlyLimiter(limiter wkhttp.HandlerFunc) wkhttp.HandlerFunc {
 		}
 		limiter(c)
 	}
+}
+
+func (f *File) handleLocalSignedFile(c *wkhttp.Context) {
+	writeLocalFileCORSHeaders(c)
+	if c.Request.Method == http.MethodOptions {
+		c.Status(http.StatusNoContent)
+		return
+	}
+	switch c.Request.Method {
+	case http.MethodGet:
+		f.serveLocalSignedFile(c, true)
+	case http.MethodHead:
+		f.serveLocalSignedFile(c, false)
+	case http.MethodPut:
+		f.putLocalSignedFile(c)
+	default:
+		f.respondLocalFileError(c, errcode.ErrFileMethodNotAllowed, errors.New("method not allowed"))
+	}
+}
+
+func writeLocalFileCORSHeaders(c *wkhttp.Context) {
+	c.Header("Access-Control-Allow-Methods", "GET, HEAD, PUT, OPTIONS")
+	c.Header("Access-Control-Allow-Headers", "Content-Type, Content-Length, Content-Disposition, Range")
+	c.Header("Access-Control-Expose-Headers", "Content-Length, Content-Type, Content-Disposition, Accept-Ranges")
+}
+
+func (f *File) serveLocalSignedFile(c *wkhttp.Context, includeBody bool) {
+	req, err := localSignedRequestFromQuery(c, http.MethodGet)
+	if err != nil {
+		f.respondLocalFileError(c, errcode.ErrFileForbidden, err)
+		return
+	}
+	if err := verifyLocalFileRequest(req, c.Query("sig"), time.Now()); err != nil {
+		f.respondLocalFileError(c, errcode.ErrFileForbidden, err)
+		return
+	}
+
+	reader, contentType, err := f.service.GetFile(req.Path)
+	if err != nil {
+		f.respondLocalFileError(c, errcode.ErrFileNotFound, err)
+		return
+	}
+	defer reader.Close()
+
+	filename := req.Filename
+	if filename == "" {
+		filename = filepath.Base(req.Path)
+	}
+	filename = sanitizeFilename(filename)
+	disposition := req.Disposition
+	if disposition != "inline" {
+		disposition = "attachment"
+	}
+	if disposition == "inline" && !localFileInlineAllowed(contentType) {
+		disposition = "attachment"
+		contentType = "application/octet-stream"
+	}
+
+	c.Header("Content-Type", contentType)
+	c.Header("X-Content-Type-Options", "nosniff")
+	escapedFilename := url.PathEscape(filename)
+	c.Header("Content-Disposition", fmt.Sprintf("%s; filename*=UTF-8''%s", disposition, escapedFilename))
+	c.Status(http.StatusOK)
+	if includeBody {
+		_, _ = io.Copy(c.Writer, reader)
+	}
+}
+
+func (f *File) putLocalSignedFile(c *wkhttp.Context) {
+	req, err := localSignedRequestFromQuery(c, http.MethodPut)
+	if err != nil {
+		f.respondLocalFileError(c, errcode.ErrFileForbidden, err)
+		return
+	}
+	if err := verifyLocalFileRequest(req, c.Query("sig"), time.Now()); err != nil {
+		f.respondLocalFileError(c, errcode.ErrFileForbidden, err)
+		return
+	}
+	localBackend := f.localFileBackend()
+	if localBackend == nil {
+		f.respondLocalFileError(c, errcode.ErrFileForbidden, errors.New("本地文件服务未启用"))
+		return
+	}
+	releaseNonce, err := localBackend.reserveUploadNonce(req)
+	if err != nil {
+		f.respondLocalFileError(c, errcode.ErrFileRequestInvalid, err)
+		return
+	}
+	uploadSucceeded := false
+	defer func() {
+		releaseNonce(uploadSucceeded)
+	}()
+	if req.FileSize <= 0 || req.FileSize > MaxFileSize {
+		f.respondLocalFileError(c, errcode.ErrFilePayloadTooLarge, fmt.Errorf("文件大小不能超过%dMB", MaxFileSize/1024/1024))
+		return
+	}
+	if c.Request.ContentLength >= 0 && c.Request.ContentLength != req.FileSize {
+		f.respondLocalFileError(c, errcode.ErrFileRequestInvalid, errors.New("上传内容长度与签名不一致"))
+		return
+	}
+	ext := strings.ToLower(filepath.Ext(req.Path))
+	if ext == "" || IsBlockedExtension(ext) || !IsAllowedExtension(ext) {
+		f.respondLocalFileError(c, errcode.ErrFileRequestInvalid, errors.New("不支持的文件类型"))
+		return
+	}
+	if existing, _, err := f.service.GetFile(req.Path); err == nil {
+		_ = existing.Close()
+		f.respondLocalFileError(c, errcode.ErrFileRequestInvalid, errors.New("签名上传路径已存在"))
+		return
+	}
+	body := http.MaxBytesReader(c.Writer, c.Request.Body, req.FileSize+1)
+
+	contentType := req.ContentType
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	_, err = f.service.UploadFile(req.Path, contentType, req.ContentDisposition, func(w io.Writer) error {
+		written, copyErr := io.Copy(w, body)
+		if copyErr != nil {
+			return copyErr
+		}
+		if written != req.FileSize {
+			return errors.New("上传内容长度与签名不一致")
+		}
+		return nil
+	})
+	if err != nil {
+		f.respondLocalFileError(c, errcode.ErrFileStoreFailed, err)
+		return
+	}
+	uploadSucceeded = true
+	c.Response(map[string]string{
+		"path": req.Path,
+	})
+}
+
+func (f *File) localFileBackend() *LocalFileService {
+	service, ok := f.service.(*Service)
+	if !ok {
+		return nil
+	}
+	localBackend, ok := service.uploadService.(*LocalFileService)
+	if !ok {
+		return nil
+	}
+	return localBackend
+}
+
+func localFileInlineAllowed(contentType string) bool {
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		mediaType = contentType
+	}
+	switch strings.ToLower(mediaType) {
+	case "application/pdf",
+		"image/gif",
+		"image/jpeg",
+		"image/png",
+		"image/webp",
+		"text/plain":
+		return true
+	default:
+		return false
+	}
+}
+
+func (f *File) respondLocalFileError(c *wkhttp.Context, code codes.Code, err error) {
+	if code.Internal {
+		f.Error("本地签名文件请求失败", zap.String("code", code.ID), zap.Error(err))
+	} else {
+		f.Warn("本地签名文件请求失败", zap.String("code", code.ID), zap.Error(err))
+	}
+	httperr.ResponseErrorLWithStatus(c, code, nil, nil)
+}
+
+func localSignedRequestFromQuery(c *wkhttp.Context, method string) (localFileSignedRequest, error) {
+	if c.Query("method") != method {
+		return localFileSignedRequest{}, errors.New("文件链接方法无效")
+	}
+	path := c.Query("path")
+	if strings.TrimSpace(path) == "" {
+		return localFileSignedRequest{}, errors.New("path参数不能为空")
+	}
+	sanitized, err := sanitizePath(path)
+	if err != nil {
+		return localFileSignedRequest{}, errors.New("无效的文件路径")
+	}
+	sanitized = strings.TrimPrefix(filepath.ToSlash(sanitized), "/")
+	if sanitized == "" || sanitized == "." {
+		return localFileSignedRequest{}, errors.New("path参数不能为空")
+	}
+	expiresAt, err := strconv.ParseInt(c.Query("expires"), 10, 64)
+	if err != nil || expiresAt <= 0 {
+		return localFileSignedRequest{}, errors.New("文件链接过期时间无效")
+	}
+	fileSize := int64(0)
+	if raw := strings.TrimSpace(c.Query("fileSize")); raw != "" {
+		fileSize, err = strconv.ParseInt(raw, 10, 64)
+		if err != nil || fileSize <= 0 {
+			return localFileSignedRequest{}, errors.New("文件大小参数无效")
+		}
+	}
+	disposition := c.Query("disposition")
+	if disposition != "" && disposition != "inline" && disposition != "attachment" {
+		return localFileSignedRequest{}, errors.New("文件展示方式无效")
+	}
+	contentDisposition := c.Query("contentDisposition")
+	if encoded := strings.TrimSpace(c.Query("contentDispositionB64")); encoded != "" {
+		decoded, decodeErr := base64.RawURLEncoding.DecodeString(encoded)
+		if decodeErr != nil {
+			return localFileSignedRequest{}, errors.New("文件下载名称参数无效")
+		}
+		contentDisposition = string(decoded)
+	}
+	filename := c.Query("filename")
+	if filename != "" {
+		filename = sanitizeFilename(filename)
+	}
+	return localFileSignedRequest{
+		Method:             method,
+		Path:               sanitized,
+		Filename:           filename,
+		Disposition:        disposition,
+		ContentType:        c.Query("contentType"),
+		ContentDisposition: contentDisposition,
+		FileSize:           fileSize,
+		ExpiresAt:          expiresAt,
+		Nonce:              c.Query("nonce"),
+	}, nil
 }
 
 func (f *File) makeImageCompose(c *wkhttp.Context) {
@@ -856,15 +1090,10 @@ func (f *File) getUploadCredentials(c *wkhttp.Context) {
 		return
 	}
 
-	if ext != "" {
-		inferred := mime.TypeByExtension(ext)
-		if inferred != "" {
-			contentType = inferred
-		}
-	}
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
+	contentType = inferContentType(contentType, ext)
 
 	// When both path and filename are provided, path determines the objectKey
 	// while filename is used for Content-Disposition (friendly download name).

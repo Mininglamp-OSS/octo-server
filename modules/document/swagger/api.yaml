@@ -1,0 +1,83 @@
+openapi: 3.0.0
+info:
+  title: Octo Document Center API
+  version: 1.0.0
+paths:
+  /v1/documents/state:
+    get:
+      summary: Get document center state
+      responses:
+        "200":
+          description: Document state
+  /v1/documents/upload:
+    post:
+      summary: Create a document asset for an uploaded file
+      responses:
+        "200":
+          description: Updated document state
+  /v1/documents/archive:
+    post:
+      summary: Archive a conversation file into a document space
+      responses:
+        "200":
+          description: Updated document state
+  /v1/documents/spaces/{space_id}/bind-conversation:
+    post:
+      summary: Bind a source conversation to a document space
+      parameters:
+        - name: space_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Updated document state
+  /v1/documents/{asset_id}/preview:
+    post:
+      summary: Mark a document asset as previewed
+      parameters:
+        - name: asset_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Updated document state
+  /v1/documents/{asset_id}/download:
+    post:
+      summary: Mark a document asset as downloaded
+      parameters:
+        - name: asset_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Updated document state
+  /v1/documents/{asset_id}/trash:
+    post:
+      summary: Move a document asset to trash
+      parameters:
+        - name: asset_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Updated document state
+  /v1/documents/{asset_id}/restore:
+    post:
+      summary: Restore a document asset
+      parameters:
+        - name: asset_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Updated document state

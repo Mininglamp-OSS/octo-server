@@ -18,6 +18,11 @@ import (
 // (api.go).
 const fileServiceAwsS3 = "awsS3"
 
+// fileServiceLocal stores files on the octo-server filesystem and serves them
+// through short-lived signed URLs. It is intended for single-node deployments
+// and local verification where MinIO/OSS/COS/S3 is not available.
+const fileServiceLocal = "local"
+
 // fileMagicNumbers 文件魔数签名映射表
 // 用于验证文件内容是否与扩展名声称的类型一致
 var fileMagicNumbers = map[string][][]byte{

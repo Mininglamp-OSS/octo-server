@@ -294,6 +294,39 @@ other = "The group and the category are not in the same space."
 ["err.server.category.store_failed"]
 other = "Failed to update category data."
 
+["err.server.document.forbidden"]
+other = "You do not have permission to access this document resource."
+
+["err.server.document.not_found"]
+other = "Document resource not found."
+
+["err.server.document.query_failed"]
+other = "Failed to query document data."
+
+["err.server.document.request_invalid"]
+other = "Invalid document request."
+
+["err.server.document.store_failed"]
+other = "Failed to update document data."
+
+["err.server.file.forbidden"]
+other = "The file link is invalid or expired."
+
+["err.server.file.method_not_allowed"]
+other = "Method not allowed."
+
+["err.server.file.not_found"]
+other = "File not found."
+
+["err.server.file.payload_too_large"]
+other = "The uploaded file exceeds the maximum allowed size."
+
+["err.server.file.request_invalid"]
+other = "Invalid file request."
+
+["err.server.file.store_failed"]
+other = "Failed to store file data."
+
 ["err.server.group.already_member"]
 other = "You are already a member of this group."
 

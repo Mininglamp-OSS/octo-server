@@ -83,6 +83,9 @@ func NewService(ctx *config.Context) IService {
 		// switch over together.
 		uploadService = NewServiceS3(ctx)
 		backend = "s3"
+	} else if service == config.FileService(fileServiceLocal) {
+		uploadService = NewLocalFileService(ctx)
+		backend = "local"
 	} else {
 		uploadService = NewSeaweedFS(ctx)
 		backend = "seaweedfs"

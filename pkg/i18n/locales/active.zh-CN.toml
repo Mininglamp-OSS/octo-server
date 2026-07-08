@@ -932,6 +932,43 @@ other = "查询群搜索数据失败。"
 ["err.server.search.user_query_failed"]
 other = "查询用户搜索数据失败。"
 
+# ---- err.server.file.* (modules/file: api.go) ----
+
+["err.server.file.request_invalid"]
+other = "文件请求参数无效。"
+
+["err.server.file.forbidden"]
+other = "文件链接无效或已过期。"
+
+["err.server.file.not_found"]
+other = "文件不存在。"
+
+["err.server.file.payload_too_large"]
+other = "上传文件超过大小限制。"
+
+["err.server.file.method_not_allowed"]
+other = "不支持该请求方法。"
+
+["err.server.file.store_failed"]
+other = "保存文件数据失败。"
+
+# ---- err.server.document.* (modules/document: api.go) ----
+
+["err.server.document.request_invalid"]
+other = "文档请求参数无效。"
+
+["err.server.document.forbidden"]
+other = "你无权访问该文档资源。"
+
+["err.server.document.not_found"]
+other = "文档资源不存在。"
+
+["err.server.document.query_failed"]
+other = "查询文档数据失败。"
+
+["err.server.document.store_failed"]
+other = "更新文档数据失败。"
+
 # ---- err.server.statistics.* (modules/statistics: api.go) ----
 
 ["err.server.statistics.request_invalid"]

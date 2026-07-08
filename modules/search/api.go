@@ -487,10 +487,20 @@ func (s *Search) global(c *wkhttp.Context) {
 			})
 		}
 	}
+	documentResps := make([]*documentSearchResp, 0)
+	if req.OnlyMessage == 0 {
+		documentResps, err = s.searchDocuments(loginUID, searchSpaceID, req.Keyword, req.Limit)
+		if err != nil {
+			s.Error("查询文档资产错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrSearchMessageQueryFailed, nil, nil)
+			return
+		}
+	}
 	c.Response(map[string]interface{}{
-		"friends":  friendResps,
-		"groups":   groupResps,
-		"messages": messagesResp,
+		"friends":   friendResps,
+		"groups":    groupResps,
+		"messages":  messagesResp,
+		"documents": documentResps,
 	})
 }
 

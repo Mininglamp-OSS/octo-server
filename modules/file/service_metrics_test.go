@@ -5,6 +5,7 @@ import (
 	"io"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -72,6 +73,32 @@ func depOpSampleCount(t *testing.T, reg *prometheus.Registry, op string) uint64 
 		}
 	}
 	return n
+}
+
+func TestNewServiceSetsStableBackendLabel(t *testing.T) {
+	tests := []struct {
+		name        string
+		fileService config.FileService
+		wantBackend string
+	}{
+		{name: "aws s3", fileService: config.FileService(fileServiceAwsS3), wantBackend: "s3"},
+		{name: "local", fileService: config.FileService(fileServiceLocal), wantBackend: "local"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.New()
+			cfg.FileService = tt.fileService
+
+			svc, ok := NewService(config.NewContext(cfg)).(*Service)
+			if !ok {
+				t.Fatalf("NewService returned %T, want *Service", svc)
+			}
+			if svc.backend != tt.wantBackend {
+				t.Fatalf("backend = %q, want %q", svc.backend, tt.wantBackend)
+			}
+		})
+	}
 }
 
 func TestServiceUploadFile_TransparentAndObserved(t *testing.T) {
