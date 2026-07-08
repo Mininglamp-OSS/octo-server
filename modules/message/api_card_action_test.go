@@ -308,7 +308,40 @@ func TestCardActionTrustModel(t *testing.T) {
 	})
 	assert.Equal(t, http.StatusBadRequest, w.Code, "超 64KiB body 应 pre-decode 被拒")
 
-	// 整个 ⑥⑦⑧ 未投递任何事件
+	// ⑨ 撤回门禁（PR#548 review 阻断项）：message_extra.revoke=1 的卡片 → 400，
+	//    不触发 bot 副作用（与单条读 api_message_get.go 同口径）。
+	fakeBotR := common.GetFakeChannelIDWith(testutil.UID, cardActionBotUID)
+	seedCardMessage(t, ctx, 9106, cardActionBotUID, fakeBotR, common.ChannelTypePerson.Uint8(), cardV2EnvelopeJSON(t, "approve_btn"))
+	_, err = ctx.DB().InsertBySql(
+		"INSERT INTO message_extra (message_id,message_seq,channel_id,channel_type,`revoke`,version) VALUES (?,?,?,?,?,?)",
+		"9106", 1, fakeBotR, common.ChannelTypePerson.Uint8(), 1, 1).Exec()
+	assert.NoError(t, err)
+	w = do(baseBody("9106", cardActionBotUID, "approve_btn", "tok-t12"))
+	assert.Equal(t, http.StatusBadRequest, w.Code, "已撤回卡片应拒")
+	assert.Contains(t, w.Body.String(), "Invalid card action.")
+
+	// ⑩ 全局删除门禁：message_extra.is_deleted=1 的卡片 → 400。
+	seedCardMessage(t, ctx, 9107, cardActionBotUID, fakeBotR, common.ChannelTypePerson.Uint8(), cardV2EnvelopeJSON(t, "approve_btn"))
+	_, err = ctx.DB().InsertBySql(
+		"INSERT INTO message_extra (message_id,message_seq,channel_id,channel_type,is_deleted,version) VALUES (?,?,?,?,?,?)",
+		"9107", 1, fakeBotR, common.ChannelTypePerson.Uint8(), 1, 1).Exec()
+	assert.NoError(t, err)
+	w = do(baseBody("9107", cardActionBotUID, "approve_btn", "tok-t13"))
+	assert.Equal(t, http.StatusBadRequest, w.Code, "全局删除卡片应拒")
+	assert.Contains(t, w.Body.String(), "Invalid card action.")
+
+	// ⑪ 操作者本地删除门禁：message_user_extra.message_is_deleted=1 → 400
+	//    （该操作者已从自己视图删除这张卡）。
+	seedCardMessage(t, ctx, 9108, cardActionBotUID, fakeBotR, common.ChannelTypePerson.Uint8(), cardV2EnvelopeJSON(t, "approve_btn"))
+	_, err = ctx.DB().InsertBySql(
+		"INSERT INTO message_user_extra (uid,message_id,message_seq,channel_id,channel_type,message_is_deleted) VALUES (?,?,?,?,?,?)",
+		testutil.UID, "9108", 1, fakeBotR, common.ChannelTypePerson.Uint8(), 1).Exec()
+	assert.NoError(t, err)
+	w = do(baseBody("9108", cardActionBotUID, "approve_btn", "tok-t14"))
+	assert.Equal(t, http.StatusBadRequest, w.Code, "操作者本地删除卡片应拒")
+	assert.Contains(t, w.Body.String(), "Invalid card action.")
+
+	// 整个 ⑥–⑪ 未投递任何事件
 	rds := redis.NewClient(&redis.Options{Addr: ctx.GetConfig().DB.RedisAddr, Password: ctx.GetConfig().DB.RedisPass})
 	defer rds.Close()
 	n, err := rds.ZCard("robotEvent:" + cardActionBotUID).Result()

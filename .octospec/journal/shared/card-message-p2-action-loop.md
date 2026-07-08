@@ -70,6 +70,14 @@ Shipped the first PR of card message P2 — the interaction closed loop
   claim→(failed enqueue)→Release window gets a `replay:true` ack with no event
   enqueued; recovery is the client-side D8 timeout + re-tap (out of scope for this
   repo). This is the brief's explicit D4 caveat, not a defect.
+- **Revoke/delete gate (caught in PR #548 review, blocking)**: the action
+  endpoint read `message_extra` only for `content_edit` and did **not** check
+  `revoke` / `is_deleted` (nor `message_user_extra.message_is_deleted`), so a
+  stale client could tap a recalled/deleted card and trigger bot side effects.
+  Fixed to mirror the single-message read gate (`api_message_get.go:241-248`).
+  **Lesson: any new read/write path over a message must apply the same
+  revoke/delete/user-local-delete visibility gate the existing read paths do —
+  actionability must not outlive visibility.**
 
 ## Out of scope (sibling PRs)
 

@@ -877,6 +877,11 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 	contentEdit := dbr.NewNullString(req.ContentEdit).String
 	contentMD5 := util.MD5(contentEdit)
 
+	// content_edit_hash 去重短路（发生在下方 D9 card_seq CAS 之前）。这**不会**掩盖
+	// D9 stale 冲突：card_seq 是信封字段，已包含在 normalize 后的 canonical 体里，
+	// 故也计入 contentMD5。因此去重命中 ⟺ 与已存最新帧逐字节相同（含相同 card_seq）
+	// = 幂等重发，返回 OK 正确；任何 stale/乱序帧（更低或同 seq 但不同内容）hash 必
+	// 不同 → 不命中 → 走下方 CAS 得到 409。（PR#548 review 非阻塞项，已加测试佐证。）
 	var existCount int
 	err = ba.ctx.DB().Select("count(*)").From("message_extra").Where("message_id=? and content_edit_hash=?", req.MessageID, contentMD5).LoadOne(&existCount)
 	if err != nil {

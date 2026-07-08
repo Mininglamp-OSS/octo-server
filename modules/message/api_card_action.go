@@ -14,10 +14,11 @@ package message
 // 声明的频道」定位 —— 分表按 channel_id 路由，WHERE 同时钉 channel_id+message_id，
 // 查得到 ⟺ 声明频道与存储行一致；此后所有授权判定一律以存储行为准）→ 操作者对
 // 存储频道的成员资格 → 消息为 type=17 且 sender 是 bot 身份（信任模型 layer (c)；
-// iwh_ webhook 发送者无事件消费端，D7 一并在此拒绝）→ action_id 存在于「生效
-// 卡片」（content_edit 优先 —— 被重写移除的旧帧按钮 fail-closed）→ D11 inputs
-// 校验 → D4 幂等入队。防枚举：除成员资格（403 语义）外全部归并到单一 400
-// invalid，具体原因只进日志。
+// iwh_ webhook 发送者无事件消费端，D7 一并在此拒绝）→ 撤回/删除门禁（已撤回 /
+// 全局删除 / 操作者本地删除的卡片不可再触发动作，与单条读同口径）→ action_id
+// 存在于「生效卡片」（content_edit 优先 —— 被重写移除的旧帧按钮 fail-closed）→
+// D11 inputs 校验 → D4 幂等入队。防枚举：除成员资格（403 语义）外全部归并到单一
+// 400 invalid，具体原因只进日志。
 
 import (
 	"net/http"
@@ -149,12 +150,38 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 	// D3 ④action_id 必须存在于「生效卡片」：content_edit（最新帧）优先于原始
 	// payload —— 重写移除的按钮迟到点击在此 400，过期交互天然 fail-closed。同时
 	// 取回匹配动作的静态 data（D11：服务端从生效帧提取，绝不取请求里的 data）。
-	effective := msgM.Payload
-	if extra, err := m.messageExtraDB.queryWithMessageID(req.MessageID); err != nil {
+	// D3 ④撤回/删除门禁 + 生效帧。已撤回(revoke)或全局删除(is_deleted)的卡片不可
+	// 再触发动作 —— 与单条读 api_message_get.go 同口径（extra.Revoke/IsDeleted、
+	// userExtra.MessageIsDeleted 均按「不存在」处理），防止 stale client 点击已从
+	// 可见消息面回收的卡片、触发 bot 副作用。归并到单一 invalid（防枚举）。
+	extra, err := m.messageExtraDB.queryWithMessageID(req.MessageID)
+	if err != nil {
 		m.Error("查询消息扩展失败", zap.Error(err), zap.String("messageID", req.MessageID))
 		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
-	} else if extra != nil && extra.ContentEdit.Valid && extra.ContentEdit.String != "" {
+	}
+	if extra != nil && (extra.Revoke == 1 || extra.IsDeleted == 1) {
+		m.Warn("卡片动作目标消息已撤回/删除,拒绝", zap.String("messageID", req.MessageID),
+			zap.Int("revoke", extra.Revoke), zap.Int("isDeleted", extra.IsDeleted))
+		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
+		return
+	}
+	// 操作者本地删除（单条可见性对齐）：该用户已把这张卡从自己视图删除 → 不可再操作。
+	if userExtras, uerr := m.messageUserExtraDB.queryWithMessageIDsAndUID([]string{req.MessageID}, loginUID); uerr != nil {
+		m.Error("查询消息用户扩展失败", zap.Error(uerr), zap.String("messageID", req.MessageID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+		return
+	} else if len(userExtras) > 0 && userExtras[0].MessageIsDeleted == 1 {
+		m.Warn("卡片动作目标消息已被操作者本地删除,拒绝", zap.String("messageID", req.MessageID), zap.String("uid", loginUID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
+		return
+	}
+
+	// 生效帧：content_edit（最新帧）优先于原始 payload —— 重写移除的按钮迟到点击
+	// 在此 400，过期交互天然 fail-closed。同时取回匹配动作的静态 data（D11：服务端
+	// 从生效帧提取，绝不取请求里的 data）。
+	effective := msgM.Payload
+	if extra != nil && extra.ContentEdit.Valid && extra.ContentEdit.String != "" {
 		effective = []byte(extra.ContentEdit.String)
 	}
 	actionData, found := cardmsg.SubmitAction(effective, req.ActionID)

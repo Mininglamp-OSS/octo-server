@@ -157,6 +157,18 @@ func TestBotCardEditCASIM(t *testing.T) {
 	var count int
 	_ = ctx.DB().Select("count(*)").From("message_extra").Where("message_id=? and content_edit like ?", msgID, "%javascript%").LoadOne(&count)
 	assert.Zero(t, count, "脏帧不得落库")
+
+	// ⑥ 同 seq 不同内容（seq=2，已存 done_btn/seq=2）→ 409（PR#548 review 非阻塞项：
+	//    证明 content_edit_hash 去重不掩盖 D9 stale 冲突 —— 内容不同则 hash 不同、不
+	//    命中去重、走 CAS，2 ≤ 2 得冲突）。
+	w = do("/v1/bot/message/edit", editBody(imCardEnvelope("other_btn", 2)))
+	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "Card update rejected: stale card_seq.")
+
+	// ⑦ 完全相同帧重发（done_btn/seq=2）→ OK 幂等（hash 去重命中，正是应有行为，
+	//    不是被掩盖的 stale 冲突）。
+	w = do("/v1/bot/message/edit", editBody(imCardEnvelope("done_btn", 2)))
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
 }
 
 // TestBotCardEditConcurrentCASIM 验证 D9 CAS 在并发下无 lost-update：并发发若干
