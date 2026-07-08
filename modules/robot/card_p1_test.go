@@ -49,6 +49,6 @@ func TestRobotCardIngress(t *testing.T) {
 	assert.True(t, rb.payloadIsVail(maputil.Data(p1RobotCardPayload(cardmsg.ProfileV1, "https://cdn.example.com/a.png"))))
 	// 脏 URL → 白名单拒绝
 	assert.False(t, rb.payloadIsVail(maputil.Data(p1RobotCardPayload(cardmsg.ProfileV1, "javascript:alert(1)"))))
-	// octo/v2 在 P1 是未知 profile → 拒绝（Decision 10 分期）
-	assert.False(t, rb.payloadIsVail(maputil.Data(p1RobotCardPayload("octo/v2", ""))))
+	// octo/v2（P2 D2）已被接受：展示型 body 无交互元素时同样是合法 v2 卡。
+	assert.True(t, rb.payloadIsVail(maputil.Data(p1RobotCardPayload("octo/v2", ""))))
 }

@@ -4,6 +4,21 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-08
+
+- **Change** — Task `card-message-p2-action-loop` (PR-B, card message P2
+  interaction): shipped the interaction closed loop (contract
+  `card-message-interaction` D3–D9/D11 + octo/v2 whitelist). New
+  `POST /v1/message/card/action` (authz + anti-IDOR + D11 input validation + D4
+  Redis idempotency), typed `card_action` bot event on the existing robot queue,
+  type-17 `botMessageEdit` unlock (cardmsg validation + D9 `card_seq` CAS in
+  `message_extra`), and the `pkg/cardmsg` octo/v2 whitelist filled into the
+  merged-P1 seams. Verify caught a real InnoDB deadlock in the D9 CAS under
+  concurrent frames (fixed via bounded 1213/1205 retry). Zero octo-im changes.
+  D10 revision history / D12 capability manifest split to sibling PRs C/D.
+  Journal: `.octospec/journal/shared/card-message-p2-action-loop.md`;
+  learning: `.octospec/learnings/pending/card-message-p2-action-loop.md`.
+
 ## 2026-07-02
 
 - **Change** — Task `conv-space-catchall-484` (issue #484 follow-up): closed the

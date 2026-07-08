@@ -82,6 +82,17 @@ type IService interface {
 	// expansion best-effort (an unexpanded broadcast is no worse than
 	// the pre-#144 state).
 	ExistRobot(uid string) (bool, error)
+	// EnqueueBotTypedEvent appends a typed (event_type/event_data) event for
+	// `robotID` onto the same bot event queue as EnqueueBotEvent, and returns
+	// the assigned event_id. It is the typed-event sibling of EnqueueBotEvent
+	// (card-message-interaction P2 D5, e.g. event_type="card_action") — it
+	// rides the identical GenSeq / ZAdd / Expire chokepoint rather than
+	// overloading the message-shaped path, so /v1/bot/events serves organic,
+	// synthetic-message, and typed events uniformly. The returned event_id is
+	// the queue cursor position (D4 uses it as the idempotency-confirm value;
+	// bots key at-least-once idempotency on it per D8). Error only on
+	// GenSeq / ZADD failure.
+	EnqueueBotTypedEvent(robotID, eventType string, eventData map[string]interface{}) (int64, error)
 }
 
 // Service robot 模块对外暴露的只读服务实现，供其它模块注入使用。
@@ -172,6 +183,16 @@ func (rb *Robot) ExistRobot(uid string) (bool, error) {
 	return rb.db.exist(uid)
 }
 
+// EnqueueBotTypedEvent — IService — Service variant（card_action 等类型化事件）。
+func (s *Service) EnqueueBotTypedEvent(robotID, eventType string, eventData map[string]interface{}) (int64, error) {
+	return enqueueBotTypedEventGeneric(s.ctx, robotID, eventType, eventData)
+}
+
+// EnqueueBotTypedEvent — IService — *Robot variant.
+func (rb *Robot) EnqueueBotTypedEvent(robotID, eventType string, eventData map[string]interface{}) (int64, error) {
+	return enqueueBotTypedEventGeneric(rb.ctx, robotID, eventType, eventData)
+}
+
 // enqueueBotEventGeneric is the shared write-to-bot-event-queue helper
 // used by saveRobotMessage (listener path) and EnqueueBotEvent (cross-
 // module synthetic path). Centralizing the GenSeq / ZAdd / Expire shape
@@ -215,6 +236,42 @@ func enqueueBotEventGeneric(ctx *config.Context, robotID string, message *config
 		return nil
 	}
 	return nil
+}
+
+// enqueueBotTypedEventGeneric 是类型化事件（event_type/event_data，如 P2 D5 的
+// card_action）入队的共享 helper —— 与 enqueueBotEventGeneric 走同一
+// GenSeq / ZAdd / Expire chokepoint，只是承载 EventType/EventData 而非 Message，
+// 并把分配到的 event_id（= seq）返回给调用方（D4 用作 confirm 值 / D8 bot 幂等键）。
+func enqueueBotTypedEventGeneric(ctx *config.Context, robotID, eventType string, eventData map[string]interface{}) (int64, error) {
+	if ctx == nil {
+		return 0, errors.New("robot: nil ctx, cannot enqueue typed bot event")
+	}
+	if strings.TrimSpace(robotID) == "" {
+		return 0, errors.New("robot: empty robotID, cannot enqueue typed bot event")
+	}
+	if strings.TrimSpace(eventType) == "" {
+		return 0, errors.New("robot: empty eventType, cannot enqueue typed bot event")
+	}
+	seq, err := ctx.GenSeq(fmt.Sprintf("%s%s", common.RobotEventSeqKey, robotID))
+	if err != nil {
+		return 0, err
+	}
+	messageUpdateJson := util.ToJson(&robotEvent{
+		EventID:   seq,
+		EventType: eventType,
+		EventData: eventData,
+		Expire:    time.Now().Add(ctx.GetConfig().Robot.MessageExpire).Unix(),
+	})
+	key := fmt.Sprintf("robotEvent:%s", robotID)
+	if err := ctx.GetRedisConn().ZAdd(key, float64(seq), messageUpdateJson); err != nil {
+		return 0, err
+	}
+	if err := ctx.GetRedisConn().Expire(key, ctx.GetConfig().Robot.MessageExpire); err != nil {
+		// Best-effort TTL refresh — 与 enqueueBotEventGeneric 一致，不因 TTL
+		// 刷新失败而回滚已成功的 ZAdd（event 已入队，event_id 有效）。
+		return seq, nil
+	}
+	return seq, nil
 }
 
 type Robot struct {

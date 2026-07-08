@@ -1,0 +1,167 @@
+package cardmsg
+
+// card-message-interaction P2（spec: .octospec/tasks/card-message-interaction/
+// brief.md）：octo/v2 profile 的交互能力面 + 交互闭环所需的纯函数 helper。
+//
+// 本文件是 P2（PR-B）在已合并 P1 之上的增量：ProfileV2 常量、card_action 事件
+// 类型、以及 card/action 端点 / bot 编辑路径要用的无副作用 helper。profile 档位
+// 判定（interactiveByProfile）与 walker 的 Submit/Input 校验在 validate.go 里就地
+// 扩展，不在此重复定义（避免与 P1 的同名符号冲突）。
+
+import (
+	"encoding/json"
+)
+
+const (
+	// ProfileV2 octo/v2：在 v1 展示集之上增加 Action.Submit（含 selectAction 携带）
+	// 与 Input.Text / Input.Toggle / Input.ChoiceSet（P2 D1/D2）。Action.Execute /
+	// auto-refresh 仍拒绝（P3）。
+	ProfileV2 = "octo/v2"
+
+	// EventTypeCardAction bot 事件队列里的卡片动作事件类型（P2 D5，增量事件类型，
+	// event_data 形状由 brief 冻结：只许增字段）。bot SDK 必须容忍未知 event_type。
+	EventTypeCardAction = "card_action"
+)
+
+// SubmitAction 在「生效卡片」信封字节里按 id 查找一个 Action.Submit，返回其静态
+// data 对象与是否命中（P2 D3 防伪造 + D11 data 提取合一）：
+//   - found=false：该 id 不是生效帧里任何 Action.Submit 的 id —— 调用方 fail-closed
+//     拒绝（伪造 / 被重写移除的过期按钮天然落此分支）。
+//   - found=true, data=nil：命中但该动作未声明 data。
+//   - found=true, data≠nil：命中且带作者静态 data —— 服务端原样塞进 event_data.data
+//     （anti-forgery：绝不取请求里的 data）。
+//
+// envelopeRaw 由调用方决定传哪份（content_edit 优先于原始 payload），据此过期帧
+// 按钮天然 fail-closed。解析失败 / 无 card 返回 (nil, false)。
+func SubmitAction(envelopeRaw []byte, actionID string) (data map[string]interface{}, found bool) {
+	if actionID == "" {
+		return nil, false
+	}
+	var payload struct {
+		Card map[string]interface{} `json:"card"`
+	}
+	if err := json.Unmarshal(envelopeRaw, &payload); err != nil || payload.Card == nil {
+		return nil, false
+	}
+	if d, ok := findSubmitAction(payload.Card["actions"], actionID); ok {
+		return d, true
+	}
+	if d, ok := findSubmitAction(payload.Card["selectAction"], actionID); ok {
+		return d, true
+	}
+	if body, ok := payload.Card["body"].([]interface{}); ok {
+		return findSubmitInElements(body, actionID)
+	}
+	return nil, false
+}
+
+func findSubmitInElements(items []interface{}, actionID string) (map[string]interface{}, bool) {
+	for _, it := range items {
+		el, ok := it.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if d, ok := findSubmitAction(el["selectAction"], actionID); ok {
+			return d, true
+		}
+		if sub, ok := el["items"].([]interface{}); ok {
+			if d, ok := findSubmitInElements(sub, actionID); ok {
+				return d, true
+			}
+		}
+		if cols, ok := el["columns"].([]interface{}); ok {
+			for _, c := range cols {
+				col, ok := c.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				if d, ok := findSubmitAction(col["selectAction"], actionID); ok {
+					return d, true
+				}
+				if sub, ok := col["items"].([]interface{}); ok {
+					if d, ok := findSubmitInElements(sub, actionID); ok {
+						return d, true
+					}
+				}
+			}
+		}
+	}
+	return nil, false
+}
+
+// findSubmitAction 从一个 actions 数组或单个 selectAction 对象里匹配指定 id 的
+// Action.Submit，返回其 data。
+func findSubmitAction(v interface{}, actionID string) (map[string]interface{}, bool) {
+	switch t := v.(type) {
+	case []interface{}:
+		for _, a := range t {
+			if d, ok := findSubmitAction(a, actionID); ok {
+				return d, true
+			}
+		}
+	case map[string]interface{}:
+		if t["type"] == "Action.Submit" {
+			if id, _ := t["id"].(string); id == actionID {
+				data, _ := t["data"].(map[string]interface{})
+				return data, true
+			}
+		}
+	}
+	return nil, false
+}
+
+// NormalizeContentEdit 是 bot 编辑路径的卡片收敛 gate（P2 D6 解锁；user/robot
+// 编辑路径对卡片永久关闭，不得调用本函数放行）。与 richtext.NormalizeContentEdit
+// 对称：
+//   - 非 type=17 编辑体：原样返回（老路径 / richtext 路径不变）；
+//   - type=17：跑与 send 同一套 Validate（白名单/大小/URL/profile 协商，v2 帧
+//     在此合法），随后 Finalize 重算权威 plain，返回 canonical JSON 供落库。
+//
+// 跨类型变异（D6 不变量 (a)）由调用方比对原消息类型后拒绝 —— 本函数只看编辑体。
+func NormalizeContentEdit(contentEdit string) (string, error) {
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(contentEdit), &payload); err != nil {
+		return contentEdit, nil
+	}
+	if !IsCardPayload(payload) {
+		return contentEdit, nil
+	}
+	if err := Validate(payload); err != nil {
+		return "", err
+	}
+	if err := Finalize(payload); err != nil {
+		return "", err
+	}
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+// CardSeq 读取信封可选的单调帧序号 card_seq（P2 D9 乱序防护）。缺失/非数值
+// 返回 (0, false) —— 无 card_seq 时行为退化为 last-write-wins（单写者 bot 零迁移）。
+func CardSeq(payload map[string]interface{}) (int64, bool) {
+	switch v := payload["card_seq"].(type) {
+	case float64:
+		return int64(v), true
+	case int:
+		return int64(v), true
+	case int64:
+		return v, true
+	case json.Number:
+		if i, err := v.Int64(); err == nil {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// CardSeqFromContentEdit 从编辑体 JSON 读取 card_seq。
+func CardSeqFromContentEdit(contentEdit string) (int64, bool) {
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(contentEdit), &payload); err != nil {
+		return 0, false
+	}
+	return CardSeq(payload)
+}

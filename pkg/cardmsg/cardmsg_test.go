@@ -343,12 +343,12 @@ func TestRecheckPayloadSize(t *testing.T) {
 }
 
 func TestValidateProfileNegotiation(t *testing.T) {
-	// P1 接受集 = {octo/v1}(Decision 10 分期):octo/v2 与任何未知 profile
-	// 同样是 400 —— P2 sibling 实现 PR 把 octo/v2 加入接受集。
+	// P2 接受集 = {octo/v1, octo/v2}(D2)：octo/v2 现被接受（展示型 body 无交互
+	// 元素时也合法）；octo/v3 与任何未知 profile 仍是 400。
 	env := envelope(nil)
 	env["profile"] = "octo/v2"
-	if err := Validate(env); !errors.Is(err, ErrCardProfileUnsupported) {
-		t.Errorf("octo/v2 在 P1 应被拒(分期), err=%v", err)
+	if err := Validate(env); err != nil {
+		t.Errorf("octo/v2 应被接受(P2 D2), err=%v", err)
 	}
 	env["profile"] = "octo/v3"
 	if err := Validate(env); !errors.Is(err, ErrCardProfileUnsupported) {

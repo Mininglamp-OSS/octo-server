@@ -190,4 +190,19 @@ var (
 		HTTPStatus:     http.StatusBadRequest,
 		DefaultMessage: "Card messages cannot be edited.",
 	})
+	// ErrMessageCardActionInvalid P2 D3/D7/D11：card/action 上行的单一 400 归并码
+	// （防枚举）——非卡片 / sender 非 bot / iwh_ 发送者 / action_id 不在生效帧 /
+	// inputs 违反声明 / 卡片开关关闭 等具体原因只进日志，对客户端一律 invalid。
+	ErrMessageCardActionInvalid = register(codes.Code{
+		ID:             "err.server.message.card_action_invalid",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Invalid card action.",
+	})
+	// ErrMessageCardActionDenied P2 D3：操作者不是卡片所在频道的成员。唯一的
+	// 403 语义（与 invalid 分开，成员资格是授权面，不归并进防枚举）。
+	ErrMessageCardActionDenied = register(codes.Code{
+		ID:             "err.server.message.card_action_denied",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "You are not allowed to act on this card.",
+	})
 )

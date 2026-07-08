@@ -97,6 +97,10 @@ var (
 	ErrCardTooDeep = errors.New("cardmsg: 卡片嵌套深度超过上限")
 	// ErrCardBadShape 结构性非法（body/actions/items/columns/facts 非期望形状）。
 	ErrCardBadShape = errors.New("cardmsg: 卡片结构非法")
+	// ErrCardInputInvalid card/action 上行 inputs 违反 D11 信任边界（未声明键 /
+	// 类型不符 / 值超限 / 序列化总量超限）。端点侧统一映射到单一 400 invalid
+	// （防枚举），细节只进日志。
+	ErrCardInputInvalid = errors.New("cardmsg: inputs 不符合生效帧声明")
 )
 
 // IsCardPayload 判断 payload map 的 type 字段是否为 InteractiveCard(=17)。

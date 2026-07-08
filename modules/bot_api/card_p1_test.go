@@ -122,14 +122,8 @@ func TestBotCardSendRejects(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
 	assert.Contains(t, w.Body.String(), "Invalid card payload.")
 
-	// ③ Decision 10 分期：octo/v2 在 P1 是未知 profile → 400
-	v2 := p1CardEnvelope()
-	v2["profile"] = "octo/v2"
-	w = do(sendBody(v2), nil)
-	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
-	assert.Contains(t, w.Body.String(), "Invalid card payload.")
-
-	// ④ P2 元素越级（octo/v1 信封携带 Action.Submit）→ 白名单 400
+	// ③ P2 元素越级（octo/v1 信封携带 Action.Submit）→ 白名单 400。
+	//   （octo/v2 profile 本身 P2 起已被接受,其发送 happy path 见 TestBotCardEditCASIM。）
 	submit := p1CardEnvelope()
 	submit["card"].(map[string]interface{})["actions"] = []interface{}{
 		map[string]interface{}{"type": "Action.Submit", "id": "x", "title": "OK"},
@@ -175,7 +169,7 @@ func TestBotCardSendDisabledByFlag(t *testing.T) {
 
 // TestBotCardSendAndEditRejectP1IM：P1 happy path + Decision 7 编辑不可变
 // （真实 WuKongIM 链路）。
-func TestBotCardSendAndEditRejectP1IM(t *testing.T) {
+func TestBotCardSendAndEditP2IM(t *testing.T) {
 	skipWithoutIMBot(t)
 	t.Setenv(cardmsg.EnvEnabled, "true")
 	s, ctx := testutil.NewTestServer()
@@ -235,19 +229,18 @@ func TestBotCardSendAndEditRejectP1IM(t *testing.T) {
 		}
 	}
 
-	// ② Decision 7：卡片消息的任何编辑（替换新卡帧）→ 400，不落 message_extra
+	// ② P2 D6：卡片消息可被 bot 编辑为新卡帧 → 200，落 message_extra（plain 服务端
+	//   重算）。P1 的 blanket-reject 已退役（本 PR-B）。
 	w = do("/v1/bot/message/edit", editBody(util.ToJson(p1CardEnvelope())))
-	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
-	assert.Contains(t, w.Body.String(), "Card messages cannot be edited yet.")
-
-	// ③ Decision 7：卡片消息被"编辑"为纯文本体（跨类型接管）同样 400
-	w = do("/v1/bot/message/edit", editBody("plain text takeover"))
-	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
-	assert.Contains(t, w.Body.String(), "Card messages cannot be edited yet.")
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
 	var extraCount int
 	_ = ctx.DB().Select("count(*)").From("message_extra").Where("message_id=?", msgID).LoadOne(&extraCount)
-	assert.Zero(t, extraCount, "P1 卡片不可变:message_extra 不得有任何写入")
+	assert.Equal(t, 1, extraCount, "P2:卡片编辑应写入 message_extra 一行")
+
+	// ③ D6 不变量 (a)：卡片消息被"编辑"为纯文本体（跨类型变异 card→非card）仍 400。
+	w = do("/v1/bot/message/edit", editBody("plain text takeover"))
+	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
 
 	// ④ 对照:bot 发文本消息再编辑 → 放行（证明编辑链路通、拒绝确因卡片门禁）
 	w = do("/v1/bot/sendMessage", map[string]interface{}{

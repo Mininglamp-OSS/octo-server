@@ -226,6 +226,8 @@ type Message struct {
 	fileService    file.IService
 	channelService chservice.IService
 	threadDB       *thread.DB
+	// cardClaims card/action 的 D4 幂等 claim 存储（card_action_claims.go）。
+	cardClaims *cardActionClaimStore
 	// groupDB: 直查 group 表，区分"群不存在"和"群已解散"两种 404 情况，
 	// groupService.GetGroupWithGroupNo 把 nil 也包成 error 不便分辨。
 	groupDB  *group.DB
@@ -273,6 +275,7 @@ func New(ctx *config.Context) *Message {
 		channelService: channel.NewService(ctx),
 		threadDB:       thread.NewDB(ctx),
 		groupDB:        group.NewDB(ctx),
+		cardClaims:     newCardActionClaimStore(ctx),
 		stopChan:       make(chan struct{}),
 	}
 	m.ctx.AddEventListener(event.GroupMemberAdd, m.handleGroupMemberAddEvent)
@@ -306,6 +309,7 @@ func (m *Message) Route(r *wkhttp.WKHttp) {
 		message.POST("/readed", m.messageReaded)                  // 消息已读
 		message.GET("/sync/sensitivewords", m.syncSensitiveWords) // 同步敏感词
 		message.POST("/edit", m.messageEdit)                      // 消息编辑
+		message.POST("/card/action", m.cardAction)                // 卡片动作上行（card-message-interaction P2 D3）
 		message.POST("/reminder/sync", m.reminderSync)            // 同步提醒
 		message.POST("/reminder/done", m.reminderDone)            // 提醒已处理完成
 		message.GET("/prohibit_words/sync", m.syncProhibitWords)  // 同步违禁词
