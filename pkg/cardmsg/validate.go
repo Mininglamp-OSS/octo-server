@@ -101,11 +101,12 @@ func validateCard(card map[string]interface{}, interactive bool) error {
 // （interactive=true，P2 D1）。其余 profile 一律未知 → 400（分期继承：P1-only
 // 客户端见 octo/v2 走 P1 降级链）。
 func interactiveByProfile(profile string) (interactive, ok bool) {
-	switch profile {
-	case ProfileV1:
-		return false, true
-	case ProfileV2:
-		return true, true
+	// 接受集从 acceptedProfiles（profiles.go）派生 —— 与 D12 能力清单 AcceptedProfiles
+	// 同源，两者不可能漂移。
+	for i := range acceptedProfiles {
+		if acceptedProfiles[i].name == profile {
+			return acceptedProfiles[i].interactive, true
+		}
 	}
 	return false, false
 }

@@ -4,6 +4,24 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-08 (PR-D)
+
+- **Change** — Task `card-message-p2-capability-manifest` (PR-D, card message P2
+  D12): producer capability discovery. New read-only `GET /v1/bot/card/profile`
+  (bot-token, existing `authBot()` chain — no new rate limiter, no Space
+  middleware) returning the deployment's card capability manifest
+  (`enabled` / `card_version` / `profiles` / `limits`) so producers feature-detect
+  instead of send-probing. All values sourced from `pkg/cardmsg` constants; the
+  `profiles` set comes from a new single-authority `cardmsg.AcceptedProfiles()`
+  that `interactiveByProfile` now derives from too (a drift-guard test asserts
+  the manifest can't advertise a profile the validator rejects). `enabled:false`
+  still returns 200 with the full manifest (a both-halves test pins manifest-200
+  + send-still-rejects together). Additive-only wire contract (contract test pins
+  the field set). No new errcode / i18n / DB / migration. Independent of PR-B/PR-C
+  (both merged). Journal:
+  `.octospec/journal/shared/card-message-p2-capability-manifest.md`;
+  learning: `.octospec/learnings/pending/card-message-p2-capability-manifest.md`.
+
 ## 2026-07-08 (PR-C)
 
 - **Change** — Task `card-message-p2-revision-history` (PR-C, card message P2

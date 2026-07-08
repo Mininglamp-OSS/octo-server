@@ -249,6 +249,7 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 		botAPI.GET("/upload/presigned", ba.botUploadPresigned)
 		botAPI.POST("/message/edit", ba.botMessageEdit)
 		botAPI.POST("/message/card/revisions/clear", ba.botCardRevisionsClear) // D10.6 清除卡片修订(写墓碑)
+		botAPI.GET("/card/profile", ba.botCardProfile)                         // D12 卡片能力清单(feature detection)
 		botAPI.GET("/user/info", ba.getUserInfo)
 		// Voice context API (User Bot only)
 		botAPI.PUT("/voice/context", ba.botPutVoiceContext)
