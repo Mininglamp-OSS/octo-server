@@ -36,6 +36,18 @@ type Handler struct {
 	// that package cannot name.
 	visibility visibilityProbe
 
+	// spaceMembersFn is a test seam for the Space-member enumeration used by
+	// enumerateDMPeers. Nil in production (falls through to the raw SQL
+	// implementation on Handler.queryDMSpaceMemberUIDs); tests inject a stub
+	// so the P0-2 union with the friend list can be exercised without a real
+	// MySQL connection.
+	spaceMembersFn func(spaceID, loginUID string) ([]string, error)
+	// dmBotFilterFn is a test seam for the bot-in-Space filter tail of
+	// enumerateDMPeers. Nil in production (falls through to spacepkg.GetBotUIDs
+	// + spacepkg.CheckBotsInSpace on h.ctx.DB()); tests inject a pass-through
+	// stub so enumerateDMPeers is exercisable without a real MySQL connection.
+	dmBotFilterFn func(spaceID string, peers []string) ([]string, error)
+
 	limiter *uidLimiter
 	cache   *senderCache
 	// mode is the resolved OCTO_SEARCH_BACKEND posture. When mode.ESServe is
@@ -103,6 +115,12 @@ func (h *Handler) Route(r *wkhttp.WKHttp) {
 	for _, mount := range routeMounters {
 		mount(h, g)
 	}
+	// _search_file_types must NOT sit under the /_search* chain (§7.5): the
+	// backendGate would refuse it in disabled/zinc deployments and the Space
+	// middleware would 403 clients that haven't picked a Space, even though
+	// the enum is a static dictionary with no backend dependency. Mounted
+	// separately with only AuthMiddleware + the shared UID rate limiter.
+	h.mountFileTypesRoute(r)
 }
 
 // backendGate refuses every _search* request with SEARCH_DISABLED unless the

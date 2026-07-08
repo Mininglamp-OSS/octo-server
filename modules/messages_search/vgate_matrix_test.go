@@ -62,7 +62,7 @@ func TestVGate_V10_MessageHitProjectionNoLeak(t *testing.T) {
 		Visibles:    []string{"admin-only"},
 		Payload:     &Payload{Text: &TextPayload{Content: "hidden body"}},
 	}
-	hit := h.singleMessageHit(doc, "C1", nil)
+	hit := h.singleMessageHit(doc, "C1", 0, nil)
 	b, err := json.Marshal(hit)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -92,7 +92,7 @@ func TestVGate_V10_SearchAllHitProjectionNoLeak(t *testing.T) {
 		Visibles:  []string{"admin-only"},
 		Payload:   &Payload{Text: &TextPayload{Content: "hidden body"}},
 	}
-	entry := h.singleSearchAllHit(doc, SearchAllReq{ChannelID: "C1"}, nil)
+	entry := h.singleSearchAllHit(doc, "C1", 0, nil)
 	b, err := json.Marshal(entry)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)

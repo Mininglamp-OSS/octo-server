@@ -38,6 +38,7 @@ type stubProbe struct {
 	gotUserDeletedUID string
 	gotOffsetUID      string
 	gotOffsetChannel  string
+	gotOffsetChannels []string
 }
 
 func (s *stubProbe) RevokedSet(ids []string) (map[string]struct{}, error) {
@@ -94,6 +95,28 @@ func (s *stubProbe) ChannelOffset(uid, channelID string) (uint32, error) {
 		return 0, s.offsetErr
 	}
 	return s.offsetByUC[uid+":"+channelID], nil
+}
+
+// ChannelOffsets is the batch variant. Reuses offsetByUC / offsetErr so
+// existing tests that only populate the single-channel map continue to work
+// unchanged. Fail-closed error semantics mirror ChannelOffset.
+func (s *stubProbe) ChannelOffsets(uid string, channelIDs []string) (map[string]uint32, error) {
+	s.offsetCalls++
+	s.gotOffsetUID = uid
+	if len(channelIDs) == 1 {
+		s.gotOffsetChannel = channelIDs[0]
+	}
+	s.gotOffsetChannels = append([]string{}, channelIDs...)
+	if s.offsetErr != nil {
+		return nil, s.offsetErr
+	}
+	out := make(map[string]uint32, len(channelIDs))
+	for _, cid := range channelIDs {
+		if v, ok := s.offsetByUC[uid+":"+cid]; ok {
+			out[cid] = v
+		}
+	}
+	return out, nil
 }
 
 func newVisibilityHandler(p visibilityProbe) *Handler {
@@ -423,7 +446,7 @@ func TestPaginateWithFilter_RoundRefillUsesFullPrecisionMessageID(t *testing.T) 
 
 	_, _, _, err := h.paginateWithFilter(
 		context.Background(), "me", "C1", pageSize, nil, false,
-		osQuery, projectDocRef("C1"),
+		osQuery, projectDocRef("C1", ""),
 	)
 	if err != nil {
 		t.Fatalf("paginate: %v", err)
@@ -562,7 +585,7 @@ func wrapHitsQuery(inner func(searchAfter []any, size int) ([]rawHit, error)) os
 // wrapProject is the matching projectFn for hits built by wrapHitsQuery —
 // just delegates to projectDocRef which is what the real handlers use.
 func wrapProject() projectFn {
-	return projectDocRef("C1")
+	return projectDocRef("C1", "")
 }
 
 // TestFilterVisible_VisiblesWhitelist_InListKept — when payload.visibles is
@@ -644,7 +667,7 @@ func TestFilterVisible_VirtualChildHiddenByParentRevoke(t *testing.T) {
 	})
 	src := json.RawMessage(body)
 	hit := &elastic.SearchHit{Source: &src}
-	ref, ok := projectDocRef("C1")(hit)
+	ref, ok := projectDocRef("C1", "")(hit)
 	if !ok {
 		t.Fatalf("projectDocRef must accept virtual sub-doc")
 	}
@@ -676,7 +699,7 @@ func TestProjectDocRef_PopulatesVisibles(t *testing.T) {
 	src := json.RawMessage(body)
 	hit := &elastic.SearchHit{Source: &src}
 
-	ref, ok := projectDocRef("C1")(hit)
+	ref, ok := projectDocRef("C1", "")(hit)
 	if !ok {
 		t.Fatalf("projectDocRef must accept a well-formed hit")
 	}
@@ -702,7 +725,7 @@ func TestProjectDocRef_VirtualSubDocRoutesToParent(t *testing.T) {
 	src := json.RawMessage(body)
 	hit := &elastic.SearchHit{Source: &src}
 
-	ref, ok := projectDocRef("C1")(hit)
+	ref, ok := projectDocRef("C1", "")(hit)
 	if !ok {
 		t.Fatalf("projectDocRef must accept a virtual sub-doc")
 	}
@@ -727,7 +750,7 @@ func TestProjectDocRef_VirtualSafetyBeltOnDivergentParent(t *testing.T) {
 	src := json.RawMessage(body)
 	hit := &elastic.SearchHit{Source: &src}
 
-	ref, ok := projectDocRef("C1")(hit)
+	ref, ok := projectDocRef("C1", "")(hit)
 	if !ok {
 		t.Fatalf("projectDocRef must accept a virtual sub-doc")
 	}
@@ -751,7 +774,7 @@ func TestProjectDocRef_PlainDocKeepsOwnID(t *testing.T) {
 		raw, _ := json.Marshal(body)
 		src := json.RawMessage(raw)
 		hit := &elastic.SearchHit{Source: &src}
-		ref, ok := projectDocRef("C1")(hit)
+		ref, ok := projectDocRef("C1", "")(hit)
 		if !ok {
 			t.Fatalf("case %d: projectDocRef must accept plain doc", i)
 		}
@@ -776,7 +799,7 @@ func TestProjectDocRef_VirtualWithZeroParentFallsBackToOwn(t *testing.T) {
 	})
 	src := json.RawMessage(body)
 	hit := &elastic.SearchHit{Source: &src}
-	ref, ok := projectDocRef("C1")(hit)
+	ref, ok := projectDocRef("C1", "")(hit)
 	if !ok {
 		t.Fatalf("projectDocRef must still accept the hit")
 	}

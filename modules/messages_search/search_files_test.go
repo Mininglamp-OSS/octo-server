@@ -23,7 +23,7 @@ func TestBuildFileHits_FullFields(t *testing.T) {
 		},
 	}
 	h := &Handler{cfg: SearchConfig{}, cache: newSenderCache(8, 0)}
-	got := h.singleFileHit(doc)
+	got := h.singleFileHit(doc, "", 0)
 	if got.FileName != "report.pdf" {
 		t.Errorf("file_name: got %q", got.FileName)
 	}
@@ -69,7 +69,7 @@ func TestResolveFileExt_FallbackFromName(t *testing.T) {
 func TestSingleFileHit_NilPayload(t *testing.T) {
 	h := &Handler{cfg: SearchConfig{}, cache: newSenderCache(8, 0)}
 	doc := Doc{MessageID: 1, MessageSeq: 1, Timestamp: 100}
-	got := h.singleFileHit(doc)
+	got := h.singleFileHit(doc, "", 0)
 	if got.FileName != "" || got.DownloadURL != "" {
 		t.Errorf("nil payload should leave file fields empty: %+v", got)
 	}

@@ -29,7 +29,20 @@ type visibilityProbe interface {
 	// ChannelOffset returns the user's channel-offset seq for channelID, or
 	// 0 when there is no offset record. A non-zero value means messages
 	// with messageSeq <= offset have been cleared from the user's view.
+	//
+	// Retained for backwards compatibility with existing test doubles;
+	// production callers should prefer ChannelOffsets for multi-channel
+	// batching. filterVisible internally routes through ChannelOffsets
+	// with a single-element slice so the two paths behave identically.
 	ChannelOffset(uid, channelID string) (uint32, error)
+	// ChannelOffsets returns the user's channel-offset seq for each of
+	// channelIDs. Missing entries default to 0 (no clear-history record).
+	// Fail-closed contract: any DB error returns (nil, err) — filterVisible
+	// then propagates to INTERNAL_ERROR without releasing any hits.
+	//
+	// This is the batch surface the global endpoints rely on so a page whose
+	// hits span N rooms only pays 1 MySQL round-trip for offsets, not N.
+	ChannelOffsets(uid string, channelIDs []string) (map[string]uint32, error)
 }
 
 // messageVisibilityProbe is the production implementation of
@@ -112,6 +125,26 @@ func (p *messageVisibilityProbe) ChannelOffset(uid, channelID string) (uint32, e
 	return 0, nil
 }
 
+// ChannelOffsets is the batch variant used by the global endpoints so a page
+// spanning N rooms costs one MySQL round-trip instead of N. The underlying
+// message.IService.GetChannelOffsetWithUID already accepts a slice; this is a
+// thin re-shape into map[channelID]seq. Missing rows are omitted from the
+// map (callers treat "no key" as offset 0, same as ChannelOffset).
+func (p *messageVisibilityProbe) ChannelOffsets(uid string, channelIDs []string) (map[string]uint32, error) {
+	if len(channelIDs) == 0 {
+		return map[string]uint32{}, nil
+	}
+	items, err := p.svc.GetChannelOffsetWithUID(uid, channelIDs)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]uint32, len(items))
+	for _, o := range items {
+		out[o.ChannelID] = o.MessageSeq
+	}
+	return out, nil
+}
+
 // msgRef projects a single OS hit into the inputs filterVisible needs to
 // decide whether the message is currently visible to the caller. ChannelID
 // is reserved for future cross-channel callers (e.g. when the indexer fans
@@ -192,9 +225,36 @@ func (h *Handler) filterVisible(ctx context.Context, loginUID, channelID string,
 	if err != nil {
 		return nil, fmt.Errorf("filterVisible: UserDeletedSet: %w", err)
 	}
-	offsetSeq, err := h.visibility.ChannelOffset(loginUID, channelID)
+	// Multi-channel channel-offset lookup (§8.2 generalisation). Each hit is
+	// gated by its own room's clear-history watermark instead of a single
+	// per-request channel. Two invariants preserve legacy behaviour and let
+	// fail-closed still bite:
+	//
+	//   1. refs whose ChannelID is empty fall back to the request-level
+	//      `channelID` parameter. All single-channel callers (search_messages,
+	//      search_all, search_files, search_around) invoke projectDocRef
+	//      today, which stamps the request channel_id on every ref — so the
+	//      set of channels queried collapses to {channelID}, keeping the
+	//      round-trip shape byte-identical to the legacy path.
+	//   2. When ChannelOffsets fails wholesale we surface the error (same
+	//      fail-closed semantics as the other three signals). A channel with
+	//      no offset row is not an error — the map simply omits the key and
+	//      we treat it as offset 0 (mirrors ChannelOffset's contract).
+	channelSet := make(map[string]struct{}, len(refs))
+	for _, r := range refs {
+		if r.ChannelID != "" {
+			channelSet[r.ChannelID] = struct{}{}
+		} else if channelID != "" {
+			channelSet[channelID] = struct{}{}
+		}
+	}
+	channelList := make([]string, 0, len(channelSet))
+	for id := range channelSet {
+		channelList = append(channelList, id)
+	}
+	offsets, err := h.visibility.ChannelOffsets(loginUID, channelList)
 	if err != nil {
-		return nil, fmt.Errorf("filterVisible: ChannelOffset: %w", err)
+		return nil, fmt.Errorf("filterVisible: ChannelOffsets: %w", err)
 	}
 
 	keep := make(map[string]struct{}, len(refs))
@@ -211,6 +271,11 @@ func (h *Handler) filterVisible(ctx context.Context, loginUID, channelID string,
 		if _, bad := userDeletedSet[r.MessageID]; bad {
 			continue
 		}
+		effectiveChannel := r.ChannelID
+		if effectiveChannel == "" {
+			effectiveChannel = channelID
+		}
+		offsetSeq := offsets[effectiveChannel]
 		if offsetSeq > 0 && r.MessageSeq <= offsetSeq {
 			continue
 		}
@@ -472,14 +537,25 @@ func decodeCursorAsSearchAfter(cfg SearchConfig, cursor string, isRelevanceSort 
 	return []any{ts, msgID, subSeq}, true
 }
 
-// projectDocRef returns a projectFn that pulls (messageId, messageSeq) from
-// a hit's typed _source. The reqChannelID parameter is bound here so the
-// closure can fill msgRef.ChannelID with the request's channel_id (the
-// /v1/messages/_search* endpoints are single-channel, so this is constant
-// across all hits in the round). Hits with unparseable _source fail-soft:
-// project returns ok=false and the loop drops them — same behaviour as
-// the legacy buildXxxHits path.
-func projectDocRef(reqChannelID string) projectFn {
+// projectDocRef returns a projectFn that pulls (messageId, messageSeq,
+// channelId) from a hit's typed _source. Every ref carries the doc's OWN
+// channelId — filterVisible then buckets refs per channel and consults each
+// room's clear-history offset independently (§8.2 multi-channel
+// generalisation). Single-channel callers pass their request `channel_id`
+// as reqChannelID so this stays a defensive fallback if the doc's channelId
+// is ever missing (indexer contract says it's always populated). Hits with
+// unparseable _source fail-soft: project returns ok=false and the loop drops
+// them — same behaviour as the legacy buildXxxHits path.
+//
+// DM key alignment: the `channel_offset` MySQL table is keyed by peer uid for
+// DMs, while OS stores the fakeChannelID ("uidA@uidB"). If we handed the raw
+// fake id to ChannelOffsets the lookup would always miss and the caller's
+// clear-history watermark would silently stop applying to search hits. To
+// keep the search-side channel_offset gate in lockstep with the read path we
+// reverse the fake id back to the peer uid here for DMs — the resulting
+// msgRef.ChannelID is exactly the key `channel_offset` uses. Non-DMs pass
+// through unchanged.
+func projectDocRef(reqChannelID, loginUID string) projectFn {
 	return func(hit *elastic.SearchHit) (msgRef, bool) {
 		if hit == nil {
 			return msgRef{}, false
@@ -510,10 +586,19 @@ func projectDocRef(reqChannelID string) projectFn {
 		if d.Virtual && d.ParentMessageID != nil && *d.ParentMessageID != 0 {
 			visKey = *d.ParentMessageID
 		}
+		channelID := d.ChannelID
+		if channelID == "" {
+			channelID = reqChannelID
+		}
+		// DM channel_offset lookup key alignment: reverse fakeChannelID → peer
+		// uid so ChannelOffsets(uid, [peer_uid]) actually hits the row.
+		if uint8(d.ChannelType) == channelTypePerson && loginUID != "" && channelID != "" {
+			channelID = peerFromFakeChannelID(channelID, loginUID)
+		}
 		return msgRef{
 			MessageID:  strconv.FormatInt(visKey, 10),
 			MessageSeq: uint32(d.MessageSeq),
-			ChannelID:  reqChannelID,
+			ChannelID:  channelID,
 			Visibles:   d.Visibles,
 		}, true
 	}

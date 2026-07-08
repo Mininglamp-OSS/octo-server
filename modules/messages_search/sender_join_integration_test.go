@@ -20,12 +20,20 @@ type stubUserSvc struct {
 	err    error
 	calls  int
 	gotIDs []string
+
+	// GetFriends stub — only populated by the allowlist tests.
+	friends    []*user.FriendResp
+	friendsErr error
 }
 
 func (s *stubUserSvc) GetUsers(uids []string) ([]*user.Resp, error) {
 	s.calls++
 	s.gotIDs = append(s.gotIDs, uids...)
 	return s.users, s.err
+}
+
+func (s *stubUserSvc) GetFriends(uid string) ([]*user.FriendResp, error) {
+	return s.friends, s.friendsErr
 }
 
 // stubGroupSvc same idea for group.IService.GetMembers.

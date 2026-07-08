@@ -107,7 +107,7 @@ func (h *Handler) searchAll(c *wkhttp.Context) {
 	}
 
 	filtered, hasMore, nextCursor, err := h.paginateWithFilterDepth(
-		ctx, loginUID, req.ChannelID, pageSize, priorDepth, initialAfter, isRelevance, osQuery, projectDocRef(req.ChannelID),
+		ctx, loginUID, req.ChannelID, pageSize, priorDepth, initialAfter, isRelevance, osQuery, projectDocRef(req.ChannelID, loginUID),
 	)
 	if err != nil {
 		if responder := classifyOSError(err); responder != nil {
@@ -201,7 +201,7 @@ func (h *Handler) buildSearchAllHits(ctx context.Context, hits []*elastic.Search
 			continue
 		}
 		hl := map[string][]string(hit.Highlight)
-		entry := h.singleSearchAllHit(doc, req, hl)
+		entry := h.singleSearchAllHit(doc, req.ChannelID, req.ChannelType, hl)
 		items = append(items, entry)
 		senderIDs = append(senderIDs, doc.From)
 		// Forward children: their senders need the same batched name lookup
@@ -246,15 +246,22 @@ func (h *Handler) buildSearchAllHits(ctx context.Context, hits []*elastic.Search
 // singleSearchAllHit projects a single Doc into the result_type-tagged shape
 // _search_all returns. Extracted so unit tests can drive the dispatcher
 // without hitting OS.
-func (h *Handler) singleSearchAllHit(doc Doc, req SearchAllReq, hl map[string][]string) SearchAllHit {
+//
+// channelID / channelType are echoed onto the inner MessageHit / FileHit.
+// Single-channel callers (/_search_all) pass req.ChannelID / req.ChannelType;
+// global callers (/_search_global_messages) pass doc-derived values (for DM
+// the peer uid via peerFromFakeChannelID; group/thread the doc.ChannelID
+// as-is) so the frontend can jump into the source room from a mixed-room
+// unified feed.
+func (h *Handler) singleSearchAllHit(doc Doc, channelID string, channelType uint8, hl map[string][]string) SearchAllHit {
 	entry := SearchAllHit{SortedAt: msToRFC3339(doc.Timestamp)}
 	if payloadType(doc.Payload) == payloadTypeFile {
-		fh := h.singleFileHit(doc)
+		fh := h.singleFileHit(doc, channelID, channelType)
 		entry.ResultType = "file"
 		entry.File = &fh
 		entry.SortedAt = fh.SentAt
 	} else {
-		mh := h.singleMessageHit(doc, req.ChannelID, hl)
+		mh := h.singleMessageHit(doc, channelID, channelType, hl)
 		entry.ResultType = "message"
 		entry.Message = &mh
 		entry.SortedAt = mh.SentAt

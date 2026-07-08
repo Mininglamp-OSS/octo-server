@@ -110,7 +110,7 @@ func (h *Handler) searchMedia(c *wkhttp.Context) {
 	}
 
 	filtered, hasMore, nextCursor, err := h.paginateWithFilterDepth(
-		ctx, loginUID, req.ChannelID, pageSize, priorDepth, initialAfter, isRelevance, osQuery, projectDocRef(req.ChannelID),
+		ctx, loginUID, req.ChannelID, pageSize, priorDepth, initialAfter, isRelevance, osQuery, projectDocRef(req.ChannelID, loginUID),
 	)
 	if err != nil {
 		if responder := classifyOSError(err); responder != nil {

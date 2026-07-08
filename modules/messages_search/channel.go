@@ -1,6 +1,8 @@
 package messages_search
 
 import (
+	"strings"
+
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 )
@@ -62,4 +64,35 @@ func groupNoFromChannel(channelType uint8, channelID string) string {
 // composite `{group_no}____{thread_short_id}` form.
 func encodeChannelID(channelID string) string {
 	return channelID
+}
+
+// peerFromFakeChannelID reverses the DM fakeChannelID (format `"uidA@uidB"`,
+// hash-sorted) back to the peer uid relative to loginUID. Global search hits
+// carry doc.ChannelID = common.GetFakeChannelIDWith(loginUID, peerUID) for DM
+// (channelType=1), and the wire contract wants the peer uid so the frontend
+// can render `new Channel(channel_id, channel_type)` and jump to the DM.
+//
+// Contract mirrors indexer reversePeer (octo-search-indexer/internal/esindex/
+// buildraw.go:349 — reversePeer). If the input isn't a well-formed fake
+// channelID (no `@`, more than one `@`, or neither side matches loginUID) we
+// return the input unchanged as a defensive fallback rather than crash.
+//
+// Single-channel callers do NOT use this helper — the request already carries
+// the peer uid in req.ChannelID, and encodeChannelID echoes it back.
+func peerFromFakeChannelID(fakeID, loginUID string) string {
+	parts := strings.SplitN(fakeID, "@", 3)
+	if len(parts) != 2 {
+		return fakeID
+	}
+	if parts[0] == loginUID {
+		return parts[1]
+	}
+	return parts[0]
+}
+
+// fakeChannelIDFor is a thin alias over common.GetFakeChannelIDWith so callers
+// in this package have a single import surface for building an OS `channelId`
+// from a (loginUID, peerUID) pair.
+func fakeChannelIDFor(loginUID, peerUID string) string {
+	return common.GetFakeChannelIDWith(loginUID, peerUID)
 }

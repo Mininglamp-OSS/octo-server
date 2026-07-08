@@ -1067,7 +1067,7 @@ func TestPaginate_VirtualSiblingsCrossPageBoundary(t *testing.T) {
 
 	collected, hasMore, nextCursor, err := h.paginateWithFilter(
 		context.Background(), "me", "C1", 2, nil, false,
-		osQuery, projectDocRef("C1"),
+		osQuery, projectDocRef("C1", ""),
 	)
 	if err != nil {
 		t.Fatalf("paginate: %v", err)
