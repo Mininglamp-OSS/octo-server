@@ -10,6 +10,8 @@ package cardmsg
 
 import (
 	"encoding/json"
+	"errors"
+	"strings"
 )
 
 const (
@@ -119,8 +121,8 @@ func findSubmitAction(v interface{}, actionID string) (map[string]interface{}, b
 //
 // 跨类型变异（D6 不变量 (a)）由调用方比对原消息类型后拒绝 —— 本函数只看编辑体。
 func NormalizeContentEdit(contentEdit string) (string, error) {
-	var payload map[string]interface{}
-	if err := json.Unmarshal([]byte(contentEdit), &payload); err != nil {
+	payload, err := decodeEnvelope(contentEdit)
+	if err != nil {
 		return contentEdit, nil
 	}
 	if !IsCardPayload(payload) {
@@ -159,9 +161,30 @@ func CardSeq(payload map[string]interface{}) (int64, bool) {
 
 // CardSeqFromContentEdit 从编辑体 JSON 读取 card_seq。
 func CardSeqFromContentEdit(contentEdit string) (int64, bool) {
-	var payload map[string]interface{}
-	if err := json.Unmarshal([]byte(contentEdit), &payload); err != nil {
+	payload, err := decodeEnvelope(contentEdit)
+	if err != nil {
 		return 0, false
 	}
 	return CardSeq(payload)
+}
+
+// decodeEnvelope 用 json.Decoder + UseNumber 解析信封 map：JSON 整数保留为 json.Number
+// 而非先坍缩到 float64。card_seq（D9）等 64 位整数因此在 normalize 往返与 CAS 读取
+// 全程保精 —— 普通 json.Unmarshal 会把 >2^53 的整数量化到 float64 的 53 位尾数，令
+// 相邻帧坍缩为相等：D9 的 card_seq CAS（stored ≥ incoming 即拒）会把有效推进误判为
+// stale 或接受迟到帧，正是它要防的 lost-update（PR#548 review；纳秒时间戳 ~1.75e18、
+// 雪花号等合法 producer 天然 > 2^53）。整卡其余数值字段一并保精；Validate / Finalize /
+// IsCardPayload / CardSeq 均不做 float64 断言（数值读取处已兼容 json.Number），故换用
+// UseNumber 无副作用。尾部多余数据按与 json.Unmarshal 一致的严格度拒绝。
+func decodeEnvelope(raw string) (map[string]interface{}, error) {
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+	var payload map[string]interface{}
+	if err := dec.Decode(&payload); err != nil {
+		return nil, err
+	}
+	if dec.More() {
+		return nil, errors.New("cardmsg: 信封 JSON 尾部有多余数据")
+	}
+	return payload, nil
 }

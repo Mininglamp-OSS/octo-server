@@ -3,6 +3,7 @@ package cardmsg
 import (
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -73,6 +74,61 @@ func TestValidateV2SelectActionSubmit(t *testing.T) {
 	}
 	if err := Validate(envelope(cardWithBody(body...))); !errors.Is(err, ErrCardUnknownAction) {
 		t.Errorf("octo/v1 selectAction=Submit 应拒, err=%v", err)
+	}
+}
+
+func TestValidateV2InputInlineAction(t *testing.T) {
+	// PR#548 review：Input.* 白名单放开后，inlineAction / selectAction 携带的动作
+	// 必须走同一正向 allowlist，不能借「walker 宽容未知属性」绕过（校验面 ≥ 渲染面）。
+	inputWith := func(prop string, action map[string]interface{}) map[string]interface{} {
+		return map[string]interface{}{"type": "Input.Text", "id": "comment", prop: action}
+	}
+
+	// 合法 http inlineAction 放行（正向名单不误伤真实卡片）。
+	ok := v2Envelope(cardWithBody(inputWith("inlineAction",
+		map[string]interface{}{"type": "Action.OpenUrl", "url": "https://example.com/go"})))
+	if err := Validate(ok); err != nil {
+		t.Errorf("合法 http inlineAction 应放行, err=%v", err)
+	}
+
+	// javascript: 的 inlineAction OpenUrl 必须走 checkURL 拒绝。
+	js := v2Envelope(cardWithBody(inputWith("inlineAction",
+		map[string]interface{}{"type": "Action.OpenUrl", "url": "javascript:alert(1)"})))
+	if err := Validate(js); !errors.Is(err, ErrCardBadURLScheme) {
+		t.Errorf("inlineAction 的 javascript: OpenUrl 应拒, err=%v", err)
+	}
+
+	// Action.Execute（P3）经 inlineAction 也必须拒。
+	exec := v2Envelope(cardWithBody(inputWith("inlineAction",
+		map[string]interface{}{"type": "Action.Execute", "id": "e"})))
+	if err := Validate(exec); !errors.Is(err, ErrCardUnknownAction) {
+		t.Errorf("inlineAction 的 Action.Execute 应拒(P3), err=%v", err)
+	}
+
+	// inlineAction 携带的 Action.Submit 必须走 id 纪律：缺 id → 拒。
+	noID := v2Envelope(cardWithBody(inputWith("inlineAction",
+		map[string]interface{}{"type": "Action.Submit"})))
+	if err := Validate(noID); !errors.Is(err, ErrCardBadShape) {
+		t.Errorf("inlineAction 的无 id Action.Submit 应拒, err=%v", err)
+	}
+
+	// inlineAction Submit 与顶层 action id 撞车 → 同一 seenIDs 命名空间拒（证明确实
+	// 走了 registerID，未逃过帧内唯一，否则 D3/D4 的 id 寻址/幂等会被旁路）。
+	dup := v2Envelope(map[string]interface{}{
+		"type": "AdaptiveCard", "version": "1.5",
+		"body": []interface{}{inputWith("inlineAction",
+			map[string]interface{}{"type": "Action.Submit", "id": "dup"})},
+		"actions": []interface{}{map[string]interface{}{"type": "Action.Submit", "id": "dup"}},
+	})
+	if err := Validate(dup); !errors.Is(err, ErrCardBadShape) {
+		t.Errorf("inlineAction Submit 与 action id 撞车应拒, err=%v", err)
+	}
+
+	// selectAction 面同样被路由：Input.Text.selectAction 的 javascript: OpenUrl → 拒。
+	sel := v2Envelope(cardWithBody(inputWith("selectAction",
+		map[string]interface{}{"type": "Action.OpenUrl", "url": "javascript:alert(1)"})))
+	if err := Validate(sel); !errors.Is(err, ErrCardBadURLScheme) {
+		t.Errorf("Input.selectAction 的 javascript: OpenUrl 应拒, err=%v", err)
 	}
 }
 
@@ -246,6 +302,48 @@ func TestCardSeqReads(t *testing.T) {
 	edit := `{"type":17,"card":{"type":"AdaptiveCard","version":"1.5","body":[{"type":"TextBlock","text":"x"}]},"card_version":"1.5","profile":"octo/v2","card_seq":5}`
 	if seq, ok := CardSeqFromContentEdit(edit); !ok || seq != 5 {
 		t.Errorf("CardSeqFromContentEdit 应为 5, got %d ok=%v", seq, ok)
+	}
+}
+
+func TestCardSeqPrecisionAbove2Pow53(t *testing.T) {
+	// PR#548 review：card_seq 必须以精确 int64 解析。普通 json.Unmarshal 经 float64
+	// 会把 >2^53 的相邻帧序号坍缩为相等，令 D9 CAS（stored ≥ incoming 即拒）失真 ——
+	// 迟到帧被接受或有效推进被误判 stale。纳秒 epoch(~1.75e18)/雪花号皆 > 2^53。
+	const a = int64(1750000000000000001) // > 2^53(=9007199254740992)
+	const b = int64(1750000000000000002)
+	body := `[{"type":"TextBlock","text":"x"}]`
+	editOf := func(seq int64) string {
+		return `{"type":17,"card":{"type":"AdaptiveCard","version":"1.5","body":` + body +
+			`},"card_version":"1.5","profile":"octo/v2","card_seq":` + strconv.FormatInt(seq, 10) + `}`
+	}
+
+	seqA, okA := CardSeqFromContentEdit(editOf(a))
+	seqB, okB := CardSeqFromContentEdit(editOf(b))
+	if !okA || !okB {
+		t.Fatalf("card_seq 应解析成功, okA=%v okB=%v", okA, okB)
+	}
+	if seqA != a || seqB != b {
+		t.Errorf("card_seq 精度丢失: seqA=%d(want %d) seqB=%d(want %d)", seqA, a, seqB, b)
+	}
+	if seqA == seqB {
+		t.Errorf("相邻 >2^53 card_seq 不得坍缩为相等: %d == %d", seqA, seqB)
+	}
+
+	// normalize 往返也必须保精 —— send 路径读的是 NormalizeContentEdit 之后的 card_seq
+	// (send.go: CardSeqFromContentEdit(normalized))，量化点也在这条往返里。
+	norm, err := NormalizeContentEdit(editOf(a))
+	if err != nil {
+		t.Fatalf("normalize 失败: %v", err)
+	}
+	if seq, ok := CardSeqFromContentEdit(norm); !ok || seq != a {
+		t.Errorf("normalize 往返后 card_seq 应仍为 %d, got %d ok=%v", a, seq, ok)
+	}
+
+	// 非整数 card_seq → (0,false)：D9 退化为 last-write-wins，而非误取截断值。
+	frac := `{"type":17,"card":{"type":"AdaptiveCard","version":"1.5","body":` + body +
+		`},"card_version":"1.5","profile":"octo/v2","card_seq":1.5}`
+	if seq, ok := CardSeqFromContentEdit(frac); ok {
+		t.Errorf("非整数 card_seq 应 ok=false, got %d", seq)
 	}
 }
 

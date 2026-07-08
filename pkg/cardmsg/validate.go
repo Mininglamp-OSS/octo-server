@@ -284,6 +284,18 @@ func (w *walker) element(el map[string]interface{}, depth int) error {
 				}
 			}
 		}
+		// Input.* 携带的可点动作面必须走同一正向 allowlist：inlineAction（AC 1.2+，
+		// 端上渲染成贴附输入右侧的可点动作）与 selectAction 都是「会被渲染 + 派发」的
+		// 动作/URL 面。walker 对未知属性宽容，若不显式路由，Input 白名单一放开即给这
+		// 两个面开天窗 —— inlineAction 可夹带 javascript: 的 Action.OpenUrl 或 P3 的
+		// Action.Execute 绕过校验，Submit 也会逃过 id/registerID 纪律（PR#548 review）。
+		// 校验面必须 ≥ 渲染面（Decision 3d/6）。
+		if err := w.inlineAction(el); err != nil {
+			return err
+		}
+		if err := w.selectAction(el); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("%w: %q", ErrCardUnknownElement, t)
 	}
@@ -325,6 +337,20 @@ func (w *walker) selectAction(el map[string]interface{}) error {
 		return nil
 	}
 	return w.action(sa)
+}
+
+// inlineAction 校验 Input.* 上的可选 inlineAction（AC 1.2+：ISelectAction 型，端上
+// 渲染成贴附输入右侧的可点动作，可载 Action.OpenUrl/Submit/Execute/ToggleVisibility）。
+// 与 selectAction 对称 —— 继承所载动作的分期，走同一 w.action 正向 allowlist
+// （checkURL + 动作类型白名单 + Submit id/data/registerID）。PR#548 review：Input
+// 白名单放开后 inlineAction 是新增的动作/URL 面，原先完全绕过 w.action（校验面
+// 必须 ≥ 渲染面，Decision 3d/6）。
+func (w *walker) inlineAction(el map[string]interface{}) error {
+	ia, present := el["inlineAction"]
+	if !present {
+		return nil
+	}
+	return w.action(ia)
 }
 
 // action 校验单个动作对象。octo/v1 仅 Action.OpenUrl；Action.Submit 属 octo/v2

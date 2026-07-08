@@ -178,6 +178,16 @@ interactive cards, receive actions, and rewrite state.
   concurrent edits (conditional `UPDATE ... WHERE card_seq < ? OR card_seq IS
   NULL`, or a `SELECT ... FOR UPDATE` tx) — LWW-with-a-read-then-write race is
   not acceptable.
+  **PR#548 review 补强:** `card_seq` is decoded as an **exact int64**
+  (`json.Decoder` + `UseNumber()` in a shared `decodeEnvelope`, used by both
+  `NormalizeContentEdit` and `CardSeqFromContentEdit`), never via `float64`. A
+  plain `json.Unmarshal` coerces a JSON integer to `float64`, quantizing values
+  `> 2^53` to the 53-bit mantissa **before** the CAS compare — adjacent frames
+  collapse to equal and the no-lost-update guarantee silently fails for realistic
+  producers (ns-epoch ~1.75e18, snowflake). Quantization is closed at **both**
+  decode sites (send reads the incoming `card_seq` from the *normalized* blob, so
+  the round-trip in `NormalizeContentEdit` matters too). Non-integral / overflow
+  `card_seq` degrades to absent = last-write-wins, never a truncated value.
 - **`pkg/cardmsg` octo/v2 whitelist extension** (`wire-contract`,
   `trust-boundary`, `url-destination`): extend the merged P1 `Validate`
   (`pkg/cardmsg/validate.go:22`) to accept `profile: "octo/v2"` in addition to
@@ -198,6 +208,15 @@ interactive cards, receive actions, and rewrite state.
   interactive card before anyone can act on it); no per-ingress send-side
   restriction is added, and webhook-sent v2 cards remain display-only by D7
   (their taps are rejected at the action endpoint, not at send).
+  **PR#548 review 补强:** an accepted `Input.*` element's action-bearing
+  sub-properties (`inlineAction` — a standard AC 1.2+ face — and `selectAction`)
+  are routed through the same positive action allowlist (`w.action`: `checkURL` +
+  action-type whitelist + `Action.Submit` id/`registerID`/data-object discipline)
+  as container `selectAction`. The walker is tolerant of unknown *properties*, so
+  widening the whitelist to accept `Input.*` element **types** otherwise left
+  `inlineAction` an unvalidated render+dispatch face (a `javascript:`
+  `Action.OpenUrl`, or a P3 `Action.Execute`, or an unregistered `Action.Submit`
+  smuggled past the gate) — 校验面必须 ≥ 渲染面 (Decision 3d/6).
 - **Error responses** (`error-response`, `i18n`): every new rejection via
   `httperr.ResponseErrorL` + registered `pkg/errcode` codes (new codes:
   card-action invalid / denied, card_seq conflict; reuse P1 codes where they
@@ -244,6 +263,11 @@ interactive cards, receive actions, and rewrite state.
   `Action.Submit`) **only** under `profile: "octo/v2"`; `Action.Execute` still
   rejected; an octo/v2 card where the caller pinned octo/v1 → rejected; a frame
   with duplicate `Action.Submit` or `Input.*` ids → rejected (frame-uniqueness).
+  An `Input.Text` whose `inlineAction`/`selectAction` carries a `javascript:`
+  `Action.OpenUrl` → rejected (bad URL scheme), an `Action.Execute` → rejected
+  (P3), an id-less `Action.Submit` → rejected, and a `Submit` id colliding with a
+  top-level action id → rejected (proves it goes through `registerID`); a valid
+  `https` `inlineAction` still accepted (no false positive).
 - **Happy-path e2e**: operator in channel taps a bot card action → endpoint
   acks `{accepted:true, replay:false}` → `getEvents` returns exactly one event
   with `event_type="card_action"` and the frozen `event_data` shape (incl.
@@ -279,7 +303,9 @@ interactive cards, receive actions, and rewrite state.
   `card_seq ≤` stored → 409 conflict i18n code, nothing stored (stored value
   read back from `message_extra` unchanged); edit without `card_seq` →
   last-write-wins unchanged; concurrent CAS test asserts no lost-update /
-  stale-overwrite.
+  stale-overwrite; two adjacent `card_seq` values `> 2^53` parse to **distinct**
+  int64s (no float64 collapse) and survive a `NormalizeContentEdit` round-trip,
+  and a non-integral `card_seq` degrades to last-write-wins.
 - **Rate limiting**: a route-mount test asserts `SharedUIDRateLimiter` is
   mounted after `AuthMiddleware` on the `/v1/message` group that carries
   `/card/action`.
