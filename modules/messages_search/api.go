@@ -47,6 +47,17 @@ type Handler struct {
 	// + spacepkg.CheckBotsInSpace on h.ctx.DB()); tests inject a pass-through
 	// stub so enumerateDMPeers is exercisable without a real MySQL connection.
 	dmBotFilterFn func(spaceID string, peers []string) ([]string, error)
+	// threadEnumFn is a test seam for the thread enumeration inside
+	// buildAllowlist. Nil in production (falls through to thread.NewDB(h.ctx)
+	// .QueryActiveShortIDsByGroupNos); tests inject a stub so the thread
+	// coverage on the global feed is exercisable without a real MySQL
+	// connection.
+	threadEnumFn func(groupNos []string) (map[string][]string, error)
+	// externalGroupFn is a test seam for the external-group lookup inside
+	// buildAllowlist. Nil in production (falls through to group.NewDB(h.ctx)
+	// .QueryExternalGroupNosForUser); tests inject a stub so buildAllowlist
+	// is exercisable without a real MySQL connection.
+	externalGroupFn func(loginUID string) (map[string]string, error)
 
 	limiter *uidLimiter
 	cache   *senderCache

@@ -68,6 +68,12 @@ type stubGroupSvc struct {
 	// active for uid; nil map means "all groupNos are active" (default).
 	activeGroupsForMember    map[string]map[string]bool
 	activeGroupsForMemberErr error
+
+	// groupsByUID is an alternate stub for GetGroupsWithMemberUID used by
+	// the thread-coverage tests (search_global_thread_test.go). When set,
+	// it takes precedence over groupsForMember.
+	groupsByUID    map[string][]*group.InfoResp
+	groupsByUIDErr error
 }
 
 func (s *stubGroupSvc) GetMembers(groupNo string) ([]*group.MemberResp, error) {
@@ -76,8 +82,15 @@ func (s *stubGroupSvc) GetMembers(groupNo string) ([]*group.MemberResp, error) {
 }
 
 // GetGroupsWithMemberUID returns the caller's groups, mirroring the
-// production interface but with a fixture-only map.
+// production interface but with a fixture-only map. If groupsByUID is set
+// (thread-coverage tests) it takes precedence over groupsForMember.
 func (s *stubGroupSvc) GetGroupsWithMemberUID(uid string) ([]*group.InfoResp, error) {
+	if s.groupsByUIDErr != nil {
+		return nil, s.groupsByUIDErr
+	}
+	if s.groupsByUID != nil {
+		return s.groupsByUID[uid], nil
+	}
 	if s.groupsForMemberErr != nil {
 		return nil, s.groupsForMemberErr
 	}

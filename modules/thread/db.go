@@ -257,6 +257,44 @@ func (d *DB) QueryNonDeletedShortIDs(shortIDs []string) ([]string, error) {
 	return result, nil
 }
 
+// GroupShortIDRow 是 QueryActiveShortIDsByGroupNos 内部的两列投影，只暴露包内使用。
+type GroupShortIDRow struct {
+	GroupNo string `db:"group_no"`
+	ShortID string `db:"short_id"`
+}
+
+// QueryActiveShortIDsByGroupNos 批量拉取一组 group 下 status=active 的子区 short_id，
+// 返回 map[groupNo][]shortID。用于 messages_search 全局端点构建 allowlist：
+// 单次 SELECT 走 (group_no, status, ...) 覆盖索引 idx_group_status_created_id
+// （见 modules/thread/sql/20260522000002_thread_group_status_created_index.sql），
+// 避免对每个 group 做一次子查询。
+//
+// 保护限制：
+//   - 空入参直接返回空 map，不下发 SQL；
+//   - 内部只取 (group_no, short_id) 两列，无 hot-column 回表；
+//   - 结果规模在调用方（messages_search buildAllowlist）再做「单群 shortID 上限」
+//     的降级判定；DB 层不硬砍上限以保留可观测性——若真的爆表也让 caller 明确处理。
+func (d *DB) QueryActiveShortIDsByGroupNos(groupNos []string) (map[string][]string, error) {
+	out := make(map[string][]string)
+	if len(groupNos) == 0 {
+		return out, nil
+	}
+	var rows []GroupShortIDRow
+	_, err := d.session.Select("group_no", "short_id").From("thread").
+		Where("group_no IN ? AND status=?", groupNos, ThreadStatusActive).
+		Load(&rows)
+	if err != nil {
+		return nil, fmt.Errorf("query active short ids by group nos: %w", err)
+	}
+	for _, r := range rows {
+		if r.GroupNo == "" || r.ShortID == "" {
+			continue
+		}
+		out[r.GroupNo] = append(out[r.GroupNo], r.ShortID)
+	}
+	return out, nil
+}
+
 // QueryActiveShortIDs 批量查询 status=active 的子区 shortID。
 // 用于 /v1/conversation/sync 过滤路径：archived/deleted 子区都不返回给客户端。
 // archived 子区由 server-side cron (#1376) 维护；收到消息时通过

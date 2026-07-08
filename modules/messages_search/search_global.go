@@ -5,6 +5,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/Mininglamp-OSS/octo-server/pkg/util"
@@ -83,6 +84,27 @@ type channelRef struct {
 	WireID      string // channel_id echoed to the client (peer uid for DM)
 	ChannelType uint8
 }
+
+// Thread-enumeration hard limits for the global allowlist.
+//
+//   - maxThreadsPerGroup caps how many active threads from a single group we
+//     fold into the terms(channelId, allowlist) clause. Beyond this the group
+//     downgrades to a "group-only" allowlist entry (its group channel still
+//     works, its thread hits get hard-dropped, no 500). Keeps a
+//     runaway-thread group from blowing the OS terms clause.
+//   - maxTotalThreadChannelIDs is the global aggregate cap across ALL groups
+//     in one request. OpenSearch's `indices.query.bool.max_clause_count`
+//     default is 4096 (Elasticsearch 7.x); we stay well below that so the
+//     rest of the DSL (group + DM + sender filters + ...) has room. On the
+//     first group that pushes us past this cap, we skip its threads (WARN)
+//     and keep serving the request.
+//
+// Both are intentionally conservative first cuts. Tune later once we have
+// prod telemetry on real thread-count distributions.
+const (
+	maxThreadsPerGroup       = 200
+	maxTotalThreadChannelIDs = 2000
+)
 
 // contentTypeSet is the union of every payload.type the indexer emits.
 // validate.contentTypesAllowed uses it to reject unknown values.
@@ -341,17 +363,20 @@ func (h *Handler) resolveGlobalScope(c *wkhttp.Context, loginUID string, channel
 			zap.String("uid", loginUID))
 	}
 
-	allowGroup, allowDM, err := h.buildAllowlist(c, loginUID, spaceID)
+	allowGroup, allowDM, allowThread, err := h.buildAllowlist(c, loginUID, spaceID)
 	if err != nil {
 		h.Error("messages_search: allowlist build failed", zap.Error(err))
 		respondInternal(c)
 		return nil, "", nil, false
 	}
-	allowSet := make(map[string]channelRef, len(allowGroup)+len(allowDM))
+	allowSet := make(map[string]channelRef, len(allowGroup)+len(allowDM)+len(allowThread))
 	for _, r := range allowGroup {
 		allowSet[r.OSChannelID] = r
 	}
 	for _, r := range allowDM {
+		allowSet[r.OSChannelID] = r
+	}
+	for _, r := range allowThread {
 		allowSet[r.OSChannelID] = r
 	}
 
@@ -423,28 +448,55 @@ func (h *Handler) resolveGlobalScope(c *wkhttp.Context, loginUID string, channel
 }
 
 // buildAllowlist enumerates every OS channelId the caller can read within the
-// given Space: joined groups + all threads implicitly reachable through them
-// (indexer uses the composite thread channelId which is already keyed by the
-// parent group's membership) plus DM peers. DM peers come from both the
-// caller's friend list AND the current Space's member list (§6.2) — see
-// enumerateDMPeers for the union + bot-in-space semantics. Threads are NOT
-// enumerated here — they are implicitly reachable via `channelType=5` under
-// the caller's group membership, but we do not enumerate the thread list
-// because the search contract wants a bounded terms query. Instead the DSL
-// relies on the group membership to indirectly gate threads (thread
-// channel_id contains the group no and gets a separate row in OS; without the
-// exact channelId our terms filter cannot include them).
+// given Space: joined groups + DM peers + active threads under those joined
+// groups. DM peers come from both the caller's friend list AND the current
+// Space's member list (§6.2) — see enumerateDMPeers for the union +
+// bot-in-space semantics. Threads are enumerated per-group via
+// enumerateThreadsForGroups (batch IN query over the joined group set), and
+// are subject to two hard caps (maxThreadsPerGroup / maxTotalThreadChannelIDs)
+// so a runaway thread population downgrades gracefully to "group only" rather
+// than blowing the OS terms clause.
 //
-// NOTE — thread gap: v1 accepts that thread messages will not appear in the
-// global feed unless a request explicitly narrows to a thread via
-// filters.channel_ids. §6.2 defers full thread enumeration until it becomes a
-// bottleneck. When we later add it, this helper is the single place to change.
-func (h *Handler) buildAllowlist(_ *wkhttp.Context, loginUID, spaceID string) ([]channelRef, []channelRef, error) {
+// Thread coverage — v1 scope (YUJ-10, supersedes the stage3 v1.1 defer):
+//
+//   - Thread messages surface on BOTH the unfiltered global stream AND when a
+//     request narrows via filters.channel_ids with channel_type=5. In the
+//     terms(channelId, allowlist) DSL that gates every global query, thread
+//     channelIDs (composite `{group_no}____{short_id}`, per
+//     thread.BuildChannelID) sit alongside group + DM channelIDs.
+//   - Rationale: single batch IN query bounded by joined groups (typically
+//     < 1k for even heavy users; each with 5–15 quantile active threads)
+//     stays well inside OpenSearch's `indices.query.bool.max_clause_count`.
+//     Threads share their parent group's membership so no extra auth check
+//     is needed — group membership already gates thread reachability.
+//   - Soft-fail: if QueryActiveShortIDsByGroupNos errors, threads are
+//     dropped from the allowlist but the group + DM parts still serve
+//     (WARN log; the whole request does NOT 500). Same policy as the
+//     external-group / space_member soft-fails elsewhere in this helper.
+//   - Hard caps: per-group threads capped at maxThreadsPerGroup; total
+//     thread channelIDs across all groups capped at maxTotalThreadChannelIDs.
+//     Beyond either cap we WARN and skip further thread ids for that group
+//     (or the whole request) — the group's own message hits still surface,
+//     only its thread hits get hard-dropped for this request.
+//
+// Known v1 gap: channelsForMember (the member_uid "包含成员" filter) still
+// scopes to group + DM only; it does NOT filter threads by thread_member
+// membership. A caller filtering by member_uid will see thread hits only
+// where the parent group is co-inhabited with memberUID — which matches the
+// stage3 authorisation model but is more permissive than the strict
+// thread_member intersection. Tightening this requires a `thread_member`
+// join and is deferred to a follow-up; the tradeoff is documented on
+// channelsForMember.
+func (h *Handler) buildAllowlist(_ *wkhttp.Context, loginUID, spaceID string) ([]channelRef, []channelRef, []channelRef, error) {
 	groups, err := h.groupService.GetGroupsWithMemberUID(loginUID)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	externalGroupMap, extErr := group.NewDB(h.ctx).QueryExternalGroupNosForUser(loginUID)
+	externalLookup := h.externalGroupFn
+	if externalLookup == nil {
+		externalLookup = group.NewDB(h.ctx).QueryExternalGroupNosForUser
+	}
+	externalGroupMap, extErr := externalLookup(loginUID)
 	if extErr != nil {
 		// Same soft-fail as modules/search/api.go — external groups become
 		// invisible for this request but the rest of the allowlist proceeds.
@@ -457,6 +509,7 @@ func (h *Handler) buildAllowlist(_ *wkhttp.Context, loginUID, spaceID string) ([
 	// deterministic OS-terms output.
 	candidateGroupNos := make([]string, 0, len(groups))
 	candidateGroupSet := make(map[string]struct{}, len(groups))
+	groupNos := make([]string, 0, len(groups))
 	for _, g := range groups {
 		if g == nil {
 			continue
@@ -483,7 +536,7 @@ func (h *Handler) buildAllowlist(_ *wkhttp.Context, loginUID, spaceID string) ([
 			h.Error("messages_search: ExistMembersActive lookup failed; fail-closed on group allowlist",
 				zap.String("login_uid", loginUID),
 				zap.Error(gerr))
-			return nil, nil, gerr
+			return nil, nil, nil, gerr
 		}
 		activeGroupSet = make(map[string]struct{}, len(activeNos))
 		for _, no := range activeNos {
@@ -500,6 +553,7 @@ func (h *Handler) buildAllowlist(_ *wkhttp.Context, loginUID, spaceID string) ([
 			WireID:      no,
 			ChannelType: channelTypeGroup,
 		})
+		groupNos = append(groupNos, no)
 	}
 
 	// DM peers: friend list ∪ Space members, minus bots not in the current
@@ -507,7 +561,7 @@ func (h *Handler) buildAllowlist(_ *wkhttp.Context, loginUID, spaceID string) ([
 	// surfaces converge on the same DM candidate set.
 	dmPeers, err := h.enumerateDMPeers(loginUID, spaceID)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	allowDM := make([]channelRef, 0, len(dmPeers))
 	for _, peer := range dmPeers {
@@ -520,9 +574,79 @@ func (h *Handler) buildAllowlist(_ *wkhttp.Context, loginUID, spaceID string) ([
 			ChannelType: channelTypePerson,
 		})
 	}
+
+	// Threads under the joined groups — single batch IN query. Soft-fail:
+	// on error we log + serve group/DM only so a MySQL blip on the thread
+	// side doesn't sink the whole global endpoint.
+	allowThread := h.enumerateThreadsForGroups(groupNos)
+
 	// Kept as separate slices only for readability at the call site; the
-	// caller flattens both into a single set.
-	return allowGroup, allowDM, nil
+	// caller flattens all three into a single set.
+	return allowGroup, allowDM, allowThread, nil
+}
+
+// enumerateThreadsForGroups fans a single batch query against the thread
+// table and turns every (groupNo, shortID) row into a composite
+// `{groupNo}____{shortID}` channelRef with channelType=5. Bounded by two
+// hard caps (maxThreadsPerGroup / maxTotalThreadChannelIDs) so a runaway
+// group cannot alone blow the OS terms clause.
+//
+// Returns an empty slice on error (WARN logged) — the caller then serves
+// group + DM only, matching the external-group / space_member soft-fail
+// policy on the same helper.
+func (h *Handler) enumerateThreadsForGroups(groupNos []string) []channelRef {
+	if len(groupNos) == 0 {
+		return nil
+	}
+	enum := h.threadEnumFn
+	if enum == nil {
+		enum = thread.NewDB(h.ctx).QueryActiveShortIDsByGroupNos
+	}
+	byGroup, err := enum(groupNos)
+	if err != nil {
+		h.Warn("messages_search: thread enumeration failed; thread hits will be hidden for this request",
+			zap.Error(err))
+		return nil
+	}
+	// Deterministic iteration — range over groupNos, not the map, so the
+	// hard-cap downgrade is reproducible across runs and easy to reason
+	// about in tests.
+	out := make([]channelRef, 0)
+	total := 0
+	for _, gn := range groupNos {
+		shortIDs := byGroup[gn]
+		if len(shortIDs) == 0 {
+			continue
+		}
+		if len(shortIDs) > maxThreadsPerGroup {
+			h.Warn("messages_search: thread count per group exceeds cap; downgrading to group-only for this request",
+				zap.String("group_no", gn),
+				zap.Int("thread_count", len(shortIDs)),
+				zap.Int("cap", maxThreadsPerGroup))
+			continue
+		}
+		if total+len(shortIDs) > maxTotalThreadChannelIDs {
+			h.Warn("messages_search: total thread channelIDs would exceed global cap; skipping remaining groups",
+				zap.String("skipped_group_no", gn),
+				zap.Int("running_total", total),
+				zap.Int("would_add", len(shortIDs)),
+				zap.Int("cap", maxTotalThreadChannelIDs))
+			break
+		}
+		for _, sid := range shortIDs {
+			if sid == "" {
+				continue
+			}
+			id := thread.BuildChannelID(gn, sid)
+			out = append(out, channelRef{
+				OSChannelID: id,
+				WireID:      id,
+				ChannelType: channelTypeThread,
+			})
+		}
+		total += len(shortIDs)
+	}
+	return out
 }
 
 // enumerateDMPeers returns the peer UIDs whose DM the caller is allowed to
@@ -704,6 +828,16 @@ func (h *Handler) queryDMSpaceMemberUIDs(spaceID, loginUID string) ([]string, er
 // together: the caller's allowlist ∩ (groups memberUID is in ∪ DM with
 // memberUID). Returned map keys are the OS channelId; values mirror the
 // allowSet entry so the caller can preserve wire-id / channelType.
+//
+// v1 thread scope (YUJ-10): this helper filters ONLY group + DM entries by
+// memberUID's own membership. Thread entries in allowSet are dropped from the
+// returned scope entirely — v1 does NOT resolve `thread_member` for the named
+// member (would require an extra IN join and a schema pass). A caller that
+// sets member_uid therefore sees group + DM hits that co-inhabit memberUID,
+// but NO thread hits at all. This is a deliberate v1 simplification: the
+// primary YUJ-10 requirement is "thread hits appear in the global feed";
+// scoping them by an arbitrary member is a v1.1 follow-up (see the design
+// doc §6.2 known-limitations note).
 func (h *Handler) channelsForMember(loginUID, memberUID, spaceID string, allowSet map[string]channelRef) (map[string]channelRef, error) {
 	out := make(map[string]channelRef)
 	memberGroups, err := h.groupService.GetGroupsWithMemberUID(memberUID)
@@ -718,14 +852,19 @@ func (h *Handler) channelsForMember(loginUID, memberUID, spaceID string, allowSe
 		memberSet[g.GroupNo] = struct{}{}
 	}
 	for id, ref := range allowSet {
-		if ref.ChannelType == channelTypeGroup {
+		switch ref.ChannelType {
+		case channelTypeGroup:
 			if _, ok := memberSet[ref.OSChannelID]; ok {
 				out[id] = ref
 			}
-		} else if ref.ChannelType == channelTypePerson && ref.WireID == memberUID {
-			// The DM with memberUID is trivially the "shared channel" between
-			// caller and member.
-			out[id] = ref
+		case channelTypePerson:
+			if ref.WireID == memberUID {
+				// The DM with memberUID is trivially the "shared channel"
+				// between caller and member.
+				out[id] = ref
+			}
+			// channelTypeThread: intentionally dropped for v1 — see
+			// helper doc-comment above.
 		}
 	}
 	// spaceID is unused: the caller has already narrowed allowSet to the
