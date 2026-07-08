@@ -23,12 +23,12 @@ func TestSingleMessageHitCardProjection(t *testing.T) {
 	}
 
 	trustedHandler := &Handler{cardTrust: stubTrust(true)}
-	mh := trustedHandler.singleMessageHit(doc, "g_1", nil)
+	mh := trustedHandler.singleMessageHit(doc, "g_1", 0, nil)
 	assert.Equal(t, "审批单 #42:待审批", mh.Snippet, "bot sender 命中投影 = 权威 plain")
 	assert.Equal(t, "text", mh.MessageKind, "message_kind 枚举已锁,卡片折入 text")
 
 	untrustedHandler := &Handler{cardTrust: stubTrust(false)}
-	mh = untrustedHandler.singleMessageHit(doc, "g_1", nil)
+	mh = untrustedHandler.singleMessageHit(doc, "g_1", 0, nil)
 	assert.Equal(t, cardmsg.PlaceholderCard, mh.Snippet, "非可信 sender 必须遮蔽为 [卡片]")
 }
 

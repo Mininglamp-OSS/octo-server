@@ -452,7 +452,11 @@ func (h *Handler) buildAllowlist(_ *wkhttp.Context, loginUID, spaceID string) ([
 			zap.Error(extErr))
 		externalGroupMap = map[string]string{}
 	}
-	allowGroup := make([]channelRef, 0, len(groups))
+	// Space-filter FIRST so the active-status gate below only pays the DB round-trip
+	// on rooms the caller could otherwise see. Preserve enumeration order for
+	// deterministic OS-terms output.
+	candidateGroupNos := make([]string, 0, len(groups))
+	candidateGroupSet := make(map[string]struct{}, len(groups))
 	for _, g := range groups {
 		if g == nil {
 			continue
@@ -460,9 +464,40 @@ func (h *Handler) buildAllowlist(_ *wkhttp.Context, loginUID, spaceID string) ([
 		if spaceID != "" && !shouldIncludeGroupForSpaceLocal(g.SpaceID, spaceID, g.GroupNo, externalGroupMap) {
 			continue
 		}
+		if _, dup := candidateGroupSet[g.GroupNo]; dup {
+			continue
+		}
+		candidateGroupSet[g.GroupNo] = struct{}{}
+		candidateGroupNos = append(candidateGroupNos, g.GroupNo)
+	}
+	// Access-control gate: drop groups whose group_member row is non-Normal
+	// (status=Blacklist / future non-active states). Mirrors what the single-
+	// channel path enforces via checkGroupAccess -> ExistMemberActive, so a
+	// group-blacklisted member cannot search that group via the global feed
+	// (YUJ-11 RC blocker #1). Fail-closed on error: return the error instead
+	// of degrading to the un-gated allowlist.
+	activeGroupSet := candidateGroupSet
+	if len(candidateGroupNos) > 0 {
+		activeNos, gerr := h.groupService.ExistMembersActive(candidateGroupNos, loginUID)
+		if gerr != nil {
+			h.Error("messages_search: ExistMembersActive lookup failed; fail-closed on group allowlist",
+				zap.String("login_uid", loginUID),
+				zap.Error(gerr))
+			return nil, nil, gerr
+		}
+		activeGroupSet = make(map[string]struct{}, len(activeNos))
+		for _, no := range activeNos {
+			activeGroupSet[no] = struct{}{}
+		}
+	}
+	allowGroup := make([]channelRef, 0, len(candidateGroupNos))
+	for _, no := range candidateGroupNos {
+		if _, ok := activeGroupSet[no]; !ok {
+			continue
+		}
 		allowGroup = append(allowGroup, channelRef{
-			OSChannelID: g.GroupNo,
-			WireID:      g.GroupNo,
+			OSChannelID: no,
+			WireID:      no,
 			ChannelType: channelTypeGroup,
 		})
 	}
@@ -535,6 +570,12 @@ func (h *Handler) enumerateDMPeers(loginUID, spaceID string) ([]string, error) {
 		}
 	}
 	peers = util.RemoveRepeatedElement(peers)
+	// Bidirectional blacklist gate: mirror single-channel checkP2PAccess (authz.go
+	// Step 3) so a DM peer who has blacklisted the caller, or whom the caller has
+	// blacklisted, does NOT appear in the global allowlist. Runs BEFORE the
+	// bot/Space gate and BEFORE the empty-spaceID early return so friend-only
+	// deployments still enforce it (YUJ-11 RC blocker #2).
+	peers = h.filterBlacklistedDMPeers(loginUID, peers)
 	if spaceID == "" {
 		return peers, nil
 	}
@@ -547,6 +588,46 @@ func (h *Handler) enumerateDMPeers(loginUID, spaceID string) ([]string, error) {
 		return peers, nil
 	}
 	return h.applyDMBotFilter(spaceID, peers)
+}
+
+// filterBlacklistedDMPeers drops peers involved in a bidirectional-blacklist
+// edge with loginUID. Fail-closed on error for the offending peer (skip it),
+// per checkP2PAccess semantics — we would rather hide a legit DM than leak a
+// blacklisted one when the blacklist table is unreachable.
+func (h *Handler) filterBlacklistedDMPeers(loginUID string, peers []string) []string {
+	if len(peers) == 0 {
+		return peers
+	}
+	out := make([]string, 0, len(peers))
+	for _, peer := range peers {
+		if peer == "" || peer == loginUID {
+			continue
+		}
+		blockedByMe, err := h.userService.ExistBlacklist(loginUID, peer)
+		if err != nil {
+			h.Error("messages_search: ExistBlacklist(me->peer) failed; dropping DM peer fail-closed",
+				zap.String("login_uid", loginUID),
+				zap.String("peer_uid", peer),
+				zap.Error(err))
+			continue
+		}
+		if blockedByMe {
+			continue
+		}
+		blockedByPeer, err := h.userService.ExistBlacklist(peer, loginUID)
+		if err != nil {
+			h.Error("messages_search: ExistBlacklist(peer->me) failed; dropping DM peer fail-closed",
+				zap.String("login_uid", loginUID),
+				zap.String("peer_uid", peer),
+				zap.Error(err))
+			continue
+		}
+		if blockedByPeer {
+			continue
+		}
+		out = append(out, peer)
+	}
+	return out
 }
 
 // applyDMBotFilter runs the bot-in-Space suppression on the DM peer set —

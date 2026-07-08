@@ -24,6 +24,11 @@ type stubUserSvc struct {
 	// GetFriends stub — only populated by the allowlist tests.
 	friends    []*user.FriendResp
 	friendsErr error
+
+	// ExistBlacklist stub — only populated by the DM-allowlist tests.
+	// key = fromUID + "->" + toUID; missing key defaults to false (not blocked).
+	blacklist    map[string]bool
+	blacklistErr error
 }
 
 func (s *stubUserSvc) GetUsers(uids []string) ([]*user.Resp, error) {
@@ -36,17 +41,73 @@ func (s *stubUserSvc) GetFriends(uid string) ([]*user.FriendResp, error) {
 	return s.friends, s.friendsErr
 }
 
+// ExistBlacklist returns whether `uid` has blacklisted `toUID`. Default (both
+// zero-value map and uninitialised field) is false so tests that never touch
+// the blacklist axis keep passing.
+func (s *stubUserSvc) ExistBlacklist(uid, toUID string) (bool, error) {
+	if s.blacklistErr != nil {
+		return false, s.blacklistErr
+	}
+	if s.blacklist == nil {
+		return false, nil
+	}
+	return s.blacklist[uid+"->"+toUID], nil
+}
+
 // stubGroupSvc same idea for group.IService.GetMembers.
 type stubGroupSvc struct {
 	group.IService
 	members []*group.MemberResp
 	err     error
 	calls   int
+
+	// Group allowlist / active-status stubs.
+	groupsForMember    map[string][]*group.InfoResp // uid -> groups
+	groupsForMemberErr error
+	// activeGroupsForMember[uid] returns the subset of groupNos considered
+	// active for uid; nil map means "all groupNos are active" (default).
+	activeGroupsForMember    map[string]map[string]bool
+	activeGroupsForMemberErr error
 }
 
 func (s *stubGroupSvc) GetMembers(groupNo string) ([]*group.MemberResp, error) {
 	s.calls++
 	return s.members, s.err
+}
+
+// GetGroupsWithMemberUID returns the caller's groups, mirroring the
+// production interface but with a fixture-only map.
+func (s *stubGroupSvc) GetGroupsWithMemberUID(uid string) ([]*group.InfoResp, error) {
+	if s.groupsForMemberErr != nil {
+		return nil, s.groupsForMemberErr
+	}
+	if s.groupsForMember == nil {
+		return nil, nil
+	}
+	return s.groupsForMember[uid], nil
+}
+
+// ExistMembersActive returns the subset of groupNos where uid is an active
+// member. Default (nil map) is "every requested groupNo is active" so tests
+// that don't care about the blacklist axis keep passing unchanged.
+func (s *stubGroupSvc) ExistMembersActive(groupNos []string, uid string) ([]string, error) {
+	if s.activeGroupsForMemberErr != nil {
+		return nil, s.activeGroupsForMemberErr
+	}
+	if s.activeGroupsForMember == nil {
+		return append([]string(nil), groupNos...), nil
+	}
+	allowed := s.activeGroupsForMember[uid]
+	if allowed == nil {
+		return append([]string(nil), groupNos...), nil
+	}
+	out := make([]string, 0, len(groupNos))
+	for _, no := range groupNos {
+		if allowed[no] {
+			out = append(out, no)
+		}
+	}
+	return out, nil
 }
 
 // newTestHandler constructs a Handler suitable for senderJoin testing. Cache
