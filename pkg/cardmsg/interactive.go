@@ -207,3 +207,31 @@ func decodeEnvelope(raw string) (map[string]interface{}, error) {
 	}
 	return payload, nil
 }
+
+// Transient 读取信封可选的 transient 标记（P2 D10.4）。transient 帧照常应用到
+// content_edit（D6/D9 不变），但不进修订历史 —— 进度帧（thinking/tool-state）不
+// 淹没审批态变更。缺失/非布尔按 false（非 transient，入历史）。
+func Transient(payload map[string]interface{}) bool {
+	t, _ := payload["transient"].(bool)
+	return t
+}
+
+// TransientFromContentEdit 从编辑体 JSON 读取 transient。
+func TransientFromContentEdit(contentEdit string) bool {
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(contentEdit), &payload); err != nil {
+		return false
+	}
+	return Transient(payload)
+}
+
+// PlainFromContentEdit 从编辑体 JSON 读取服务端权威 plain（Finalize 重算后的值），
+// 供修订历史存列表摘要。缺失返回空串。
+func PlainFromContentEdit(contentEdit string) string {
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(contentEdit), &payload); err != nil {
+		return ""
+	}
+	s, _ := payload["plain"].(string)
+	return s
+}

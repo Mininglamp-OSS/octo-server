@@ -16,6 +16,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardrevision"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
@@ -973,6 +974,27 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 			ba.Error("card 编辑(无 card_seq)写入失败！", zap.Error(werr), zap.String("messageID", req.MessageID))
 			httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
 			return
+		}
+	}
+
+	// P2 D10：非 transient 卡片帧追加修订历史（best-effort —— content_edit 已是
+	// 权威状态，history 是次级面，append 失败只记日志、不阻断编辑）。richtext 编辑
+	// 与 transient 进度帧不入历史。
+	if editIsCard && !cardmsg.TransientFromContentEdit(req.ContentEdit) {
+		rev := cardrevision.Revision{
+			MessageID:   req.MessageID,
+			ChannelID:   fakeChannelID,
+			ChannelType: req.ChannelType,
+			Content:     dbr.NewNullString(req.ContentEdit),
+			Plain:       cardmsg.PlainFromContentEdit(req.ContentEdit),
+			EditorUID:   robotID,
+			EditedAt:    int64(editedAt),
+		}
+		if hasCardSeq {
+			rev.CardSeq = dbr.NewNullInt64(cardSeq)
+		}
+		if rerr := ba.cardRevisions.AppendFrame(rev); rerr != nil {
+			ba.Error("卡片修订历史追加失败(不影响编辑)", zap.Error(rerr), zap.String("messageID", req.MessageID))
 		}
 	}
 

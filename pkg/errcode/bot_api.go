@@ -406,4 +406,11 @@ var (
 		HTTPStatus:     http.StatusConflict,
 		DefaultMessage: "Card update rejected: stale card_seq.",
 	})
+	// ErrBotAPICardRevisionClearForbidden P2 D10.6：bot 只能清除自己发的卡片的
+	// 修订历史（属主校验失败 —— sender != 调用 bot）。
+	ErrBotAPICardRevisionClearForbidden = register(codes.Code{
+		ID:             "err.server.bot_api.card_revision_clear_forbidden",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "You can only clear revisions of your own cards.",
+	})
 )

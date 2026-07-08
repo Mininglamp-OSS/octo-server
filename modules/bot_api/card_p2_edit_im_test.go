@@ -506,3 +506,91 @@ func TestBotCardEditOwnershipAndLifecycleIM(t *testing.T) {
 	_ = ctx.DB().Select("content_edit").From("message_extra").Where("message_id=?", ownID).LoadOne(&edited)
 	assert.NotContains(t, edited, "done_btn", "撤回卡片编辑不得写入 content_edit")
 }
+
+// TestBotCardRevisionsIM 验证 D10：非 transient 卡片编辑追加修订帧、transient 帧不
+// 入历史、清除端点删帧 + 写墓碑（需 WuKongIM）。
+func TestBotCardRevisionsIM(t *testing.T) {
+	skipWithoutIMBot(t)
+	t.Setenv(cardmsg.EnvEnabled, "true")
+	s, ctx := testutil.NewTestServer()
+	defer func() { _ = testutil.CleanAllTables(ctx) }()
+
+	const revBot, revTok = "bot_card_rev", "bf_card_rev_token"
+	_, err := ctx.DB().InsertBySql("insert into robot(robot_id,bot_token,status) values(?,?,1)", revBot, revTok).Exec()
+	assert.NoError(t, err)
+	for _, pair := range [][2]string{{revBot, testutil.UID}, {testutil.UID, revBot}} {
+		_, ferr := ctx.DB().InsertBySql("insert into friend(uid,to_uid,is_deleted) values(?,?,0)", pair[0], pair[1]).Exec()
+		assert.NoError(t, ferr)
+	}
+	do := func(path string, body map[string]interface{}) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", path, bytes.NewReader([]byte(util.ToJson(body))))
+		req.Header.Set("Authorization", "Bearer "+revTok)
+		s.GetRoute().ServeHTTP(w, req)
+		return w
+	}
+	frameCount := func(msgID string) int {
+		var n int
+		_ = ctx.DB().Select("count(*)").From("octo_message_card_revision").Where("message_id=? and is_tombstone=0", msgID).LoadOne(&n)
+		return n
+	}
+	tombstoneCount := func(msgID string) int {
+		var n int
+		_ = ctx.DB().Select("count(*)").From("octo_message_card_revision").Where("message_id=? and is_tombstone=1", msgID).LoadOne(&n)
+		return n
+	}
+
+	w := do("/v1/bot/sendMessage", map[string]interface{}{
+		"channel_id": testutil.UID, "channel_type": common.ChannelTypePerson.Uint8(),
+		"payload": imCardEnvelope("s0", -1),
+	})
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var sendResp struct {
+		MessageID int64 `json:"message_id"`
+	}
+	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &sendResp))
+	msgID := fmt.Sprintf("%d", sendResp.MessageID)
+	var msgSeq uint32
+	for i := 0; i < 20; i++ {
+		sr, serr := ctx.IMSearchMessages(&config.MsgSearchReq{
+			ChannelID: testutil.UID, ChannelType: common.ChannelTypePerson.Uint8(),
+			MessageIds: []int64{sendResp.MessageID}, LoginUID: revBot,
+		})
+		if serr == nil && sr != nil && len(sr.Messages) > 0 && sr.Messages[0].MessageSeq > 0 {
+			msgSeq = sr.Messages[0].MessageSeq
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	assert.NotZero(t, msgSeq)
+	edit := func(env map[string]interface{}) *httptest.ResponseRecorder {
+		return do("/v1/bot/message/edit", map[string]interface{}{
+			"message_id": msgID, "message_seq": msgSeq,
+			"channel_id": testutil.UID, "channel_type": common.ChannelTypePerson.Uint8(),
+			"content_edit": util.ToJson(env),
+		})
+	}
+
+	// ① 非 transient 编辑 → 追加 1 帧。
+	assert.Equal(t, http.StatusOK, edit(imCardEnvelope("s1", 2)).Code)
+	assert.Equal(t, 1, frameCount(msgID))
+
+	// ② transient 编辑 → content_edit 更新但不入历史（仍 1 帧）。
+	transient := imCardEnvelope("s2", 3)
+	transient["transient"] = true
+	assert.Equal(t, http.StatusOK, edit(transient).Code)
+	assert.Equal(t, 1, frameCount(msgID), "transient 帧不入修订历史")
+
+	// ③ 再一次非 transient 编辑 → 2 帧。
+	assert.Equal(t, http.StatusOK, edit(imCardEnvelope("s3", 4)).Code)
+	assert.Equal(t, 2, frameCount(msgID))
+
+	// ④ 清除端点：删帧 + 写墓碑。
+	w = do("/v1/bot/message/card/revisions/clear", map[string]interface{}{
+		"message_id": msgID, "channel_id": testutil.UID, "channel_type": common.ChannelTypePerson.Uint8(),
+	})
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), `"cleared":2`)
+	assert.Equal(t, 0, frameCount(msgID), "清除后无帧")
+	assert.Equal(t, 1, tombstoneCount(msgID), "清除写一条墓碑")
+}

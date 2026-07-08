@@ -35,6 +35,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n/codes"
 	"go.uber.org/zap"
 )
 
@@ -78,98 +79,12 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 		return
 	}
 
-	// D3 ①存储行定位 + 频道绑定（round-3 P1-4 anti-IDOR）。消息表按 channel_id
-	// 分表路由，查询 WHERE 同时钉 (channel_id, channel_type, message_id) —— 查得到
-	// 即证明「请求声明的频道 == 存储行的频道」；不一致/不存在统一 400（防枚举，
-	// 两者不可区分）。person 频道的 fake id 由 (loginUID, 对端) 生成，指着别人
-	// 会话的 message_id 天然查不到。
-	lookupChannelID := req.ChannelID
-	switch req.ChannelType {
-	case common.ChannelTypePerson.Uint8():
-		lookupChannelID = common.GetFakeChannelIDWith(loginUID, req.ChannelID)
-	case common.ChannelTypeGroup.Uint8(), common.ChannelTypeCommunityTopic.Uint8():
-		// group / topic：消息就存于声明频道本身。
-	default:
-		respondMessageRequestInvalid(c, "channel_type")
+	// D3 ①②：anti-IDOR 频道绑定 + 存储频道成员资格（抽为共享门禁，与卡片修订查询
+	// 复用同一口径，避免两端授权漂移）。
+	msgM, handled := m.authorizeCardChannelMember(c, loginUID, req.MessageID, req.ChannelID, req.ChannelType,
+		errcode.ErrMessageCardActionInvalid, errcode.ErrMessageCardActionDenied)
+	if handled {
 		return
-	}
-	msgM, err := m.db.queryMessageByID(lookupChannelID, req.ChannelType, req.MessageID)
-	if err != nil {
-		m.Error("查询卡片动作目标消息失败", zap.Error(err), zap.String("messageID", req.MessageID))
-		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
-		return
-	}
-	if msgM == nil || len(msgM.Payload) == 0 || !cardmsg.IsCardRawPayload(msgM.Payload) {
-		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
-		return
-	}
-
-	// D3 ②成员资格 —— 判定对象取自存储行（assert, don't assume：即使 WHERE 已
-	// 证明一致，这里也只读 msgM.* 而非 req.*，让「存储行是授权主体」在代码形状上
-	// 成立）。person：操作者必须是存储 fake 频道的会话双方之一；group/topic：显式
-	// 成员校验（ExistMemberActive 单点查询 —— 白名单变体，排除被拉黑成员）。
-	switch msgM.ChannelType {
-	case common.ChannelTypePerson.Uint8():
-		if !fakeChannelContainsUID(msgM.ChannelID, loginUID) {
-			httperr.ResponseErrorL(c, errcode.ErrMessageCardActionDenied, nil, nil)
-			return
-		}
-	default:
-		groupNo := msgM.ChannelID
-		var threadShortID string
-		if msgM.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
-			parent, shortID, perr := thread.ParseChannelID(msgM.ChannelID)
-			if perr != nil {
-				respondMessageRequestInvalid(c, "channel_id")
-				return
-			}
-			groupNo = parent
-			threadShortID = shortID
-		}
-		// D3 ②群状态门禁(PR#548 review H1/P1-a)：复刻单条读 requireGroupMember
-		// (api_message_get.go:184) —— 仅 GroupStatusNormal + Disband 可见,Disabled
-		// (管理员禁用)及未来非正常状态 fail closed。原动作路径只查成员资格、漏了群状态：
-		// 禁用群会置 group.Status=Disabled 但成员行仍 status=Normal、ExistMemberActive
-		// 照样为 true —— 于是被禁用群里的成员读路径已 404,却仍能枚举 message_id 触发
-		// bot 副作用。归并单一 invalid(防枚举)。Disband 与读路径同口径放行(bot 编辑路径
-		// 自身 isGroupDisbanded 拦解散群,副作用无法落地,不在此额外收紧)。
-		statusVisible, serr := m.groupStatusVisibleForAction(groupNo)
-		if serr != nil {
-			m.Error("查询群状态失败", zap.Error(serr), zap.String("groupNo", groupNo))
-			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
-			return
-		}
-		if !statusVisible {
-			m.Warn("卡片动作目标群非可见状态,拒绝", zap.String("groupNo", groupNo))
-			httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
-			return
-		}
-		// D3 ②子区状态门禁(PR#548 review P2-a)：复刻单条读 getThreadMessage
-		// (api_message_get.go:139) —— 已删除子区(ThreadStatusDeleted)按不存在处理;
-		// 归档子区允许(读历史,与读路径同口径)。
-		if threadShortID != "" {
-			t, terr := m.threadDB.QueryByGroupNoAndShortID(groupNo, threadShortID)
-			if terr != nil {
-				m.Error("查询子区失败", zap.Error(terr), zap.String("groupNo", groupNo), zap.String("shortID", threadShortID))
-				httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
-				return
-			}
-			if t == nil || t.Status == thread.ThreadStatusDeleted {
-				m.Warn("卡片动作目标子区已删除,拒绝", zap.String("groupNo", groupNo), zap.String("shortID", threadShortID))
-				httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
-				return
-			}
-		}
-		isMember, err := m.groupService.ExistMemberActive(groupNo, loginUID)
-		if err != nil {
-			m.Error("查询群成员失败", zap.Error(err), zap.String("groupNo", groupNo))
-			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
-			return
-		}
-		if !isMember {
-			httperr.ResponseErrorL(c, errcode.ErrMessageCardActionDenied, nil, nil)
-			return
-		}
 	}
 
 	// D3 ③sender 必须是 bot 身份（layer (c)）。iwh_ webhook 合成发送者不是 robot
@@ -221,44 +136,17 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 	// respondSingleMessage 同口径 —— 否则被 visibles 排除 / 已清理历史的成员，虽过了
 	// 成员+sender+revoke/删除门禁，仍能枚举可读的 message_id 触发不可见卡片的 bot
 	// 副作用。上面已覆盖 revoke/is_deleted + 操作者本地删除；这里补 visibles 白名单
-	// + 消息过期 + 用户清理偏移 + 频道偏移。全部归并到单一 invalid（防枚举）。
-	// visibles 白名单：基于原始 payload 字节解析，对 type-17 卡片同样生效。
-	if !visiblesAllows(msgM.Payload, loginUID) {
-		m.Warn("卡片动作目标消息 visibles 未命中,拒绝", zap.String("messageID", req.MessageID), zap.String("uid", loginUID))
+	// + 消息过期 + 用户清理偏移 + 频道偏移（抽为 cardCanonicalVisibleToViewer，与
+	// card/revisions 共用同一口径）。查询失败 fail-closed 回 500；不可见归并单一 invalid
+	// （防枚举）。
+	if visible, verr := m.cardCanonicalVisibleToViewer(msgM, loginUID); verr != nil {
+		m.Error("查询卡片动作目标消息可见性失败", zap.Error(verr), zap.String("messageID", req.MessageID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+		return
+	} else if !visible {
+		m.Warn("卡片动作目标消息对操作者不可见,拒绝", zap.String("messageID", req.MessageID), zap.String("uid", loginUID))
 		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
 		return
-	}
-	// 消息自身过期（Expire 秒 TTL，自 Timestamp 起算）—— 与 from() 同口径。
-	if msgM.Expire > 0 && time.Now().Unix()-int64(msgM.Expire) >= int64(msgM.Timestamp) {
-		m.Warn("卡片动作目标消息已过期,拒绝", zap.String("messageID", req.MessageID))
-		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
-		return
-	}
-	// 用户清理偏移 + 频道偏移 —— 消息存储频道 msgM.ChannelID 即读路径 channelID
-	// （group=groupNo / topic=topic 频道）。person 单条读不经 respondSingleMessage、
-	// 偏移语义未确立，跳过（2 方 DM：visibles 恒过，已由成员+生命周期门禁兜住），
-	// 也避免对已是 fake id 的 person 频道二次 fake 化。
-	if msgM.ChannelType != common.ChannelTypePerson.Uint8() {
-		if userOffset, oerr := m.channelOffsetDB.queryWithUIDAndChannel(loginUID, msgM.ChannelID, msgM.ChannelType); oerr != nil {
-			m.Error("查询用户清理偏移失败", zap.Error(oerr), zap.String("messageID", req.MessageID))
-			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
-			return
-		} else if userOffset != nil && msgM.MessageSeq <= userOffset.MessageSeq {
-			m.Warn("卡片动作目标消息在用户清理偏移之前,拒绝", zap.String("messageID", req.MessageID), zap.String("uid", loginUID))
-			httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
-			return
-		}
-		channelOffsetSeq, cerr := m.lookupChannelOffsetSeq(msgM.ChannelID, msgM.ChannelType, loginUID)
-		if cerr != nil {
-			m.Error("查询频道偏移失败", zap.Error(cerr), zap.String("messageID", req.MessageID))
-			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
-			return
-		}
-		if channelOffsetSeq != 0 && msgM.MessageSeq <= channelOffsetSeq {
-			m.Warn("卡片动作目标消息在频道偏移之前,拒绝", zap.String("messageID", req.MessageID))
-			httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
-			return
-		}
 	}
 
 	// D4 ⑤幂等 claim —— **先于生效帧 / inputs 校验**（P1-4, PR#548 review）。业务
@@ -382,6 +270,98 @@ func fakeChannelContainsUID(fakeChannelID, uid string) bool {
 	return len(parts) == 2 && (parts[0] == uid || parts[1] == uid)
 }
 
+// authorizeCardChannelMember 执行卡片消息端点共享的 D3 ①②：anti-IDOR 频道绑定
+// （按请求声明的频道查存储消息 —— 查得到即证明「声明频道 == 存储行的频道」）+ 存储
+// 频道成员资格（person：会话双方之一；group/topic：ExistMemberActive 白名单单点查）。
+// 成功返回存储消息；失败已写好 i18n 错误响应（绑定/不存在/非卡片 → invalidCode，
+// 非成员 → deniedCode，防枚举）并返回 (nil, true=已处理)。cardAction 与卡片修订查询
+// 共用本门禁，保证两端授权口径不漂移（PR-C brief 要求）。
+func (m *Message) authorizeCardChannelMember(c *wkhttp.Context, loginUID, messageID, channelID string, channelType uint8, invalidCode, deniedCode codes.Code) (*messageModel, bool) {
+	lookupChannelID := channelID
+	switch channelType {
+	case common.ChannelTypePerson.Uint8():
+		lookupChannelID = common.GetFakeChannelIDWith(loginUID, channelID)
+	case common.ChannelTypeGroup.Uint8(), common.ChannelTypeCommunityTopic.Uint8():
+		// group / topic：消息就存于声明频道本身。
+	default:
+		respondMessageRequestInvalid(c, "channel_type")
+		return nil, true
+	}
+	msgM, err := m.db.queryMessageByID(lookupChannelID, channelType, messageID)
+	if err != nil {
+		m.Error("查询卡片消息失败", zap.Error(err), zap.String("messageID", messageID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+		return nil, true
+	}
+	if msgM == nil || len(msgM.Payload) == 0 || !cardmsg.IsCardRawPayload(msgM.Payload) {
+		httperr.ResponseErrorL(c, invalidCode, nil, nil)
+		return nil, true
+	}
+	switch msgM.ChannelType {
+	case common.ChannelTypePerson.Uint8():
+		if !fakeChannelContainsUID(msgM.ChannelID, loginUID) {
+			httperr.ResponseErrorL(c, deniedCode, nil, nil)
+			return nil, true
+		}
+	default:
+		groupNo := msgM.ChannelID
+		var threadShortID string
+		if msgM.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
+			parent, shortID, perr := thread.ParseChannelID(msgM.ChannelID)
+			if perr != nil {
+				respondMessageRequestInvalid(c, "channel_id")
+				return nil, true
+			}
+			groupNo = parent
+			threadShortID = shortID
+		}
+		// D3 ②群状态门禁(PR#548 review H1/P1-a)：复刻单条读 requireGroupMember
+		// (api_message_get.go:184) —— 仅 GroupStatusNormal + Disband 可见,Disabled
+		// (管理员禁用)及未来非正常状态 fail closed。只查成员资格会漏群状态：禁用群置
+		// group.Status=Disabled 但成员行仍 status=Normal、ExistMemberActive 照样为 true
+		// —— 于是被禁用群里的成员读路径已 404,却仍能枚举 message_id 触发副作用。归并单一
+		// invalid(防枚举)。Disband 与读路径同口径放行。
+		statusVisible, serr := m.groupStatusVisibleForAction(groupNo)
+		if serr != nil {
+			m.Error("查询群状态失败", zap.Error(serr), zap.String("groupNo", groupNo))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return nil, true
+		}
+		if !statusVisible {
+			m.Warn("卡片目标群非可见状态,拒绝", zap.String("groupNo", groupNo))
+			httperr.ResponseErrorL(c, invalidCode, nil, nil)
+			return nil, true
+		}
+		// D3 ②子区状态门禁(PR#548 review P2-a)：复刻单条读 getThreadMessage
+		// (api_message_get.go:139) —— 已删除子区(ThreadStatusDeleted)按不存在处理;
+		// 归档子区允许(读历史,与读路径同口径)。
+		if threadShortID != "" {
+			t, terr := m.threadDB.QueryByGroupNoAndShortID(groupNo, threadShortID)
+			if terr != nil {
+				m.Error("查询子区失败", zap.Error(terr), zap.String("groupNo", groupNo), zap.String("shortID", threadShortID))
+				httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+				return nil, true
+			}
+			if t == nil || t.Status == thread.ThreadStatusDeleted {
+				m.Warn("卡片目标子区已删除,拒绝", zap.String("groupNo", groupNo), zap.String("shortID", threadShortID))
+				httperr.ResponseErrorL(c, invalidCode, nil, nil)
+				return nil, true
+			}
+		}
+		isMember, merr := m.groupService.ExistMemberActive(groupNo, loginUID)
+		if merr != nil {
+			m.Error("查询群成员失败", zap.Error(merr), zap.String("groupNo", groupNo))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return nil, true
+		}
+		if !isMember {
+			httperr.ResponseErrorL(c, deniedCode, nil, nil)
+			return nil, true
+		}
+	}
+	return msgM, false
+}
+
 // resolveCardOriginSpaceID 解析卡片的**权威来源 Space**（P1-3, PR#548 review）。
 // card_action 事件的 space_id 必须来自卡片自身的存储权威,而非操作者请求上下文的
 // Space —— SpaceMiddleware 只证明操作者是所声明 Space 的成员,不证明卡片属于该
@@ -426,6 +406,42 @@ func (m *Message) groupSpaceIDOrEmpty(groupNo string) string {
 	return g.SpaceID
 }
 
+// cardCanonicalVisibleToViewer 复刻单条读 respondSingleMessage 的「内容可见性」层
+// (api_message_get.go)——成员资格 + 生命周期(revoke/删除)之外的第四类门禁:
+// visibles 白名单 / 消息过期(Expire 秒 TTL) / 用户清理偏移 / 频道偏移。card/action
+// 与 card/revisions 共用本 helper,防止两端可见性口径漂移(与 authorizeCardChannelMember
+// 同理:被 visibles 排除或历史已清理的成员,虽过成员+生命周期门禁,仍不得读到不可见卡片
+// 的内容/触发其副作用)。person 频道跳过偏移(单条读不经 respondSingleMessage、偏移语义
+// 未确立;2 方 DM visibles 恒过,已由成员+生命周期兜住;也避免对已是 fake id 的 person
+// 频道二次 fake 化)。返回 (true,nil)=可见;(false,nil)=对该 viewer 不可见(调用方决定
+// invalid / 空列表);(false,err)=偏移查询失败(调用方 fail-closed 回 500)。
+func (m *Message) cardCanonicalVisibleToViewer(msgM *messageModel, loginUID string) (bool, error) {
+	if !visiblesAllows(msgM.Payload, loginUID) {
+		return false, nil
+	}
+	if msgM.Expire > 0 && time.Now().Unix()-int64(msgM.Expire) >= int64(msgM.Timestamp) {
+		return false, nil
+	}
+	if msgM.ChannelType == common.ChannelTypePerson.Uint8() {
+		return true, nil
+	}
+	userOffset, oerr := m.channelOffsetDB.queryWithUIDAndChannel(loginUID, msgM.ChannelID, msgM.ChannelType)
+	if oerr != nil {
+		return false, oerr
+	}
+	if userOffset != nil && msgM.MessageSeq <= userOffset.MessageSeq {
+		return false, nil
+	}
+	channelOffsetSeq, cerr := m.lookupChannelOffsetSeq(msgM.ChannelID, msgM.ChannelType, loginUID)
+	if cerr != nil {
+		return false, cerr
+	}
+	if channelOffsetSeq != 0 && msgM.MessageSeq <= channelOffsetSeq {
+		return false, nil
+	}
+	return true, nil
+}
+
 // groupStatusVisibleForAction 复刻单条读 requireGroupMember 的群状态门禁
 // (api_message_get.go:184)：仅 GroupStatusNormal + GroupStatusDisband 可见,
 // Disabled(管理员禁用)及未来非正常状态 fail closed。刻意用 groupDB.QueryWithGroupNo
@@ -442,4 +458,30 @@ func (m *Message) groupStatusVisibleForAction(groupNo string) (bool, error) {
 		return false, nil
 	}
 	return true, nil
+}
+
+// isCardMessageWithdrawn 报告一张卡片是否已从可见消息面回收 —— 已撤回
+// (message_extra.revoke) / 全局删除 (message_extra.is_deleted) / 操作者本地删除
+// (message_user_extra.message_is_deleted)。与单条读 api_message_get.go:241 同口径。
+//
+// 动作端点(cardAction ④)内联了同一三项检查(那里顺带复用已查出的 extra 取生效帧,
+// 避免二次查询);查询端点(getCardRevisions)调用本 helper 做可见性兜底 —— 两处必须
+// 保持同步:动作与历史内容都不得在卡片被回收后仍可达(D10「revoked message leaves
+// no queryable content history」;且不依赖 revoke 时 best-effort 删除是否成功)。
+func (m *Message) isCardMessageWithdrawn(messageID, loginUID string) (bool, error) {
+	extra, err := m.messageExtraDB.queryWithMessageID(messageID)
+	if err != nil {
+		return false, err
+	}
+	if extra != nil && (extra.Revoke == 1 || extra.IsDeleted == 1) {
+		return true, nil
+	}
+	userExtras, err := m.messageUserExtraDB.queryWithMessageIDsAndUID([]string{messageID}, loginUID)
+	if err != nil {
+		return false, err
+	}
+	if len(userExtras) > 0 && userExtras[0].MessageIsDeleted == 1 {
+		return true, nil
+	}
+	return false, nil
 }

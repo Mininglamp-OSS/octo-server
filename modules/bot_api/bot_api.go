@@ -15,6 +15,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/modules/voice_adapter"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardrevision"
 )
 
 const (
@@ -47,6 +48,9 @@ type BotAPI struct {
 	// AFTER dispatchFanout succeeds so we only enqueue events that
 	// WuKongIM actually accepted.
 	robotService          robot.IService
+	// cardRevisions is the D10 card revision history store (shared table
+	// octo_message_card_revision; written here on bot card edits + clear).
+	cardRevisions         *cardrevision.Store
 	speechClient          *voice_adapter.SpeechClient
 	maxVoiceContextLength int
 	maxBodySize           int64
@@ -182,6 +186,7 @@ func NewBotAPI(ctx *config.Context) *BotAPI {
 		userDB:                user.NewDB(ctx),
 		threadService:         thread.NewService(ctx),
 		robotService:          robot.NewService(ctx),
+		cardRevisions:         cardrevision.NewStore(ctx.DB()),
 		speechClient:          voice_adapter.NewSpeechClient(speechURL, speechKey, time.Duration(timeoutSec)*time.Second),
 		maxVoiceContextLength: maxCtxLen,
 		maxBodySize:           maxBodySize,
@@ -243,6 +248,7 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 		botAPI.GET("/upload/credentials", ba.botUploadCredentials)
 		botAPI.GET("/upload/presigned", ba.botUploadPresigned)
 		botAPI.POST("/message/edit", ba.botMessageEdit)
+		botAPI.POST("/message/card/revisions/clear", ba.botCardRevisionsClear) // D10.6 清除卡片修订(写墓碑)
 		botAPI.GET("/user/info", ba.getUserInfo)
 		// Voice context API (User Bot only)
 		botAPI.PUT("/voice/context", ba.botPutVoiceContext)

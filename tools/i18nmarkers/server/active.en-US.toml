@@ -72,6 +72,9 @@ other = "Invalid card payload."
 ["err.server.bot_api.card_obo_forbidden"]
 other = "Card messages cannot be sent on behalf of a user."
 
+["err.server.bot_api.card_revision_clear_forbidden"]
+other = "You can only clear revisions of your own cards."
+
 ["err.server.bot_api.card_seq_conflict"]
 other = "Card update rejected: stale card_seq."
 
@@ -488,6 +491,12 @@ other = "Invalid card action."
 
 ["err.server.message.card_edit_forbidden"]
 other = "Card messages cannot be edited."
+
+["err.server.message.card_revision_denied"]
+other = "You are not allowed to view this card's revisions."
+
+["err.server.message.card_revision_invalid"]
+other = "Invalid card revision request."
 
 ["err.server.message.card_send_forbidden"]
 other = "Card messages can only be sent by bots or webhooks."

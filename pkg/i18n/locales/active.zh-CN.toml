@@ -1241,6 +1241,12 @@ other = "你无权对该卡片执行此操作。"
 ["err.server.message.card_action_in_progress"]
 other = "该卡片动作正在处理中，请稍后重试。"
 
+["err.server.message.card_revision_invalid"]
+other = "卡片修订查询无效。"
+
+["err.server.message.card_revision_denied"]
+other = "你无权查看该卡片的修订历史。"
+
 ["err.server.bot_api.card_disabled"]
 other = "当前部署未启用卡片消息。"
 
@@ -1255,6 +1261,9 @@ other = "卡片消息暂不支持编辑。"
 
 ["err.server.bot_api.card_seq_conflict"]
 other = "卡片更新被拒绝：card_seq 已过期。"
+
+["err.server.bot_api.card_revision_clear_forbidden"]
+other = "只能清除自己发送的卡片的修订历史。"
 
 ["err.server.robot.card_edit_forbidden"]
 other = "卡片消息不支持编辑。"

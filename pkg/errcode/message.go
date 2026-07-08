@@ -214,4 +214,18 @@ var (
 		HTTPStatus:     http.StatusConflict,
 		DefaultMessage: "This card action is being processed, please retry.",
 	})
+	// ErrMessageCardRevisionInvalid P2 D10.5：卡片修订查询的单一 400 归并码
+	// （非卡片 / 不存在 / 频道不匹配；防枚举，具体原因只进日志）。
+	ErrMessageCardRevisionInvalid = register(codes.Code{
+		ID:             "err.server.message.card_revision_invalid",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Invalid card revision request.",
+	})
+	// ErrMessageCardRevisionDenied P2 D10.5：查看者不是卡片所在频道的成员
+	// （与 card_action 同门禁；唯一 403 语义）。
+	ErrMessageCardRevisionDenied = register(codes.Code{
+		ID:             "err.server.message.card_revision_denied",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "You are not allowed to view this card's revisions.",
+	})
 )

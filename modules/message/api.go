@@ -32,6 +32,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardrevision"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
@@ -228,6 +229,9 @@ type Message struct {
 	threadDB       *thread.DB
 	// cardClaims card/action 的 D4 幂等 claim 存储（card_action_claims.go）。
 	cardClaims *cardActionClaimStore
+	// cardRevisions D10 卡片修订历史 store（共享表 octo_message_card_revision；
+	// 此处读查询 + 撤回删除）。
+	cardRevisions *cardrevision.Store
 	// groupDB: 直查 group 表，区分"群不存在"和"群已解散"两种 404 情况，
 	// groupService.GetGroupWithGroupNo 把 nil 也包成 error 不便分辨。
 	groupDB  *group.DB
@@ -276,6 +280,7 @@ func New(ctx *config.Context) *Message {
 		threadDB:       thread.NewDB(ctx),
 		groupDB:        group.NewDB(ctx),
 		cardClaims:     newCardActionClaimStore(ctx),
+		cardRevisions:  cardrevision.NewStore(ctx.DB()),
 		stopChan:       make(chan struct{}),
 	}
 	m.ctx.AddEventListener(event.GroupMemberAdd, m.handleGroupMemberAddEvent)
@@ -310,6 +315,7 @@ func (m *Message) Route(r *wkhttp.WKHttp) {
 		message.GET("/sync/sensitivewords", m.syncSensitiveWords) // 同步敏感词
 		message.POST("/edit", m.messageEdit)                      // 消息编辑
 		message.POST("/card/action", m.cardAction)                // 卡片动作上行（card-message-interaction P2 D3）
+		message.GET("/card/revisions", m.getCardRevisions)        // 卡片修订历史查询（P2 D10）
 		message.POST("/reminder/sync", m.reminderSync)            // 同步提醒
 		message.POST("/reminder/done", m.reminderDone)            // 提醒已处理完成
 		message.GET("/prohibit_words/sync", m.syncProhibitWords)  // 同步违禁词
@@ -2824,6 +2830,15 @@ func (m *Message) revoke(c *wkhttp.Context) {
 	}
 	if eventID > 0 {
 		m.ctx.EventCommit(eventID)
+	}
+	// P2 D10.7：撤回提交后立即删除卡片修订历史（best-effort）—— 必须在 SendRevoke
+	// 通知**之前**，否则通知失败提前返回会漏删，DB 已标撤回却留下可查询内容历史。
+	// 非卡片消息为 no-op。查询端另有 revoke/deleted 可见性兜底（isCardMessageWithdrawn），
+	// 两层都在，删除失败也不会泄漏。
+	if cardmsg.IsCardRawPayload(message.Payload) {
+		if derr := m.cardRevisions.DeleteByMessageID(messageIDStr); derr != nil {
+			m.Error("撤回卡片时删除修订历史失败(不影响撤回;查询端有可见性兜底)", zap.Error(derr), zap.String("messageID", messageIDStr))
+		}
 	}
 	for _, msgID := range msgIds {
 		messageIDI, _ := strconv.ParseInt(msgID, 10, 64)
