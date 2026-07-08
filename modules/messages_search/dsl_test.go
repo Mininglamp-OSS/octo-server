@@ -737,6 +737,123 @@ func extractSearchAllTypes(t *testing.T, raw []byte) []int {
 	return nil
 }
 
+// TestFileContentSourceExcludes pins the shared _source excludes context every
+// messages_search endpoint attaches to its OS Search call. Q6 A: excluding
+// payload.file.content and payload.file.contentMeta keeps the Tika-extracted
+// file body (30-100 KB/doc) out of the wire response while still allowing
+// content to participate in relevance scoring via the inverted index.
+func TestFileContentSourceExcludes(t *testing.T) {
+	fsc := fileContentSourceExcludes()
+	if fsc == nil {
+		t.Fatal("fileContentSourceExcludes returned nil")
+	}
+	src, err := fsc.Source()
+	if err != nil {
+		t.Fatalf("Source(): %v", err)
+	}
+	raw, _ := json.Marshal(src)
+	body := string(raw)
+	for _, want := range []string{
+		`"payload.file.content"`,
+		`"payload.file.contentMeta"`,
+		`"excludes"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("fileContentSourceExcludes missing %q in:\n%s", want, body)
+		}
+	}
+}
+
+// TestFileContentSourceExcludes_WiredIntoSearchSource pins that once the
+// helper is attached to an elastic.SearchSource the emitted _source clause
+// carries the excludes onto the wire request. Regression guard: any endpoint
+// that silently drops `.FetchSourceContext(fileContentSourceExcludes())` from
+// its svc chain would still make the multi_match tests pass but start leaking
+// the 30–100 KB file body back to clients — this test walks the shape a
+// production request actually sends to OS.
+func TestFileContentSourceExcludes_WiredIntoSearchSource(t *testing.T) {
+	ss := elastic.NewSearchSource().
+		Query(elastic.NewMatchAllQuery()).
+		FetchSourceContext(fileContentSourceExcludes())
+	src, err := ss.Source()
+	if err != nil {
+		t.Fatalf("Source(): %v", err)
+	}
+	raw, _ := json.Marshal(src)
+	body := string(raw)
+	// _source clause must be present with both excludes; the elastic library
+	// emits `_source: {excludes: [...]}` when FetchSourceContext is attached.
+	for _, want := range []string{
+		`"_source"`,
+		`"excludes"`,
+		`"payload.file.content"`,
+		`"payload.file.contentMeta"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("SearchSource missing %q in:\n%s", want, body)
+		}
+	}
+}
+
+// TestBuildSearchFilesDSL_KeywordIncludesContentField pins the M1 contract:
+// /_search_files keyword DSL includes payload.file.content in the multi_match
+// fields (Q5 A default weight ^1 lets name/caption still outrank a pure body
+// hit).
+func TestBuildSearchFilesDSL_KeywordIncludesContentField(t *testing.T) {
+	req := SearchFilesReq{ChannelType: channelTypeGroup, ChannelID: "g", Keyword: "report"}
+	q, _ := buildSearchFilesDSL(context.Background(), fallbackTestAnalyzer(), true, req, "g", "")
+	body := asJSONString(t, q.(interface{ Source() (any, error) }))
+	if !strings.Contains(body, `"payload.file.content"`) {
+		t.Errorf("_search_files keyword DSL must include payload.file.content:\n%s", body)
+	}
+	// Boost pin: content stays at default ^1, name keeps its ^2 boost so a
+	// filename hit still outranks a pure body hit.
+	if strings.Contains(body, `"payload.file.content^`) {
+		t.Errorf("_search_files content field must carry default weight (no ^N boost):\n%s", body)
+	}
+}
+
+// TestBuildSearchAllDSL_FileClauseIncludesContentField pins M2.
+func TestBuildSearchAllDSL_FileClauseIncludesContentField(t *testing.T) {
+	req := SearchMessagesReq{ChannelType: channelTypeGroup, ChannelID: "g", Keyword: "hello"}
+	q, _ := buildSearchAllDSL(context.Background(), fallbackTestAnalyzer(), true, req, "g", "")
+	body := asJSONString(t, q.(interface{ Source() (any, error) }))
+	if !strings.Contains(body, `"payload.file.content"`) {
+		t.Errorf("_search_all keyword file clause must include payload.file.content:\n%s", body)
+	}
+	if strings.Contains(body, `"payload.file.content^`) {
+		t.Errorf("_search_all content field must carry default weight (no ^N boost):\n%s", body)
+	}
+}
+
+// TestBuildSearchMessagesDSL_ExcludesContentField is the negative regression
+// pin for the Q3 A decision: the chat-tab surface /_search must NOT search
+// file content. Whitelist [Text, MergeForward, RichText] already excludes
+// payload.type=File(8), so the multi_match fields do not reference any
+// payload.file.* field.
+func TestBuildSearchMessagesDSL_ExcludesContentField(t *testing.T) {
+	req := SearchMessagesReq{ChannelType: channelTypeGroup, ChannelID: "g", Keyword: "hello"}
+	q, _ := buildSearchMessagesDSL(context.Background(), fallbackTestAnalyzer(), true, req, "g", "")
+	body := asJSONString(t, q.(interface{ Source() (any, error) }))
+	if strings.Contains(body, `"payload.file.content"`) {
+		t.Errorf("/_search chat-tab DSL must NOT search payload.file.content (Q3 A):\n%s", body)
+	}
+	if strings.Contains(body, `"payload.file.contentMeta"`) {
+		t.Errorf("/_search chat-tab DSL must NOT reference payload.file.contentMeta:\n%s", body)
+	}
+}
+
+// TestBuildSearchAllHighlight_ExcludesFileContent is the Q4 D negative pin:
+// pickSnippet does not promote payload.file.content into the snippet slot, so
+// requesting a highlight on that field would allocate a fragment that no
+// consumer reads.
+func TestBuildSearchAllHighlight_ExcludesFileContent(t *testing.T) {
+	body := asJSONString(t, buildSearchAllHighlight())
+	if strings.Contains(body, `"payload.file.content"`) {
+		t.Errorf("_search_all highlight must NOT include payload.file.content (Q4 D):\n%s", body)
+	}
+}
+
 func TestExtractSortValues(t *testing.T) {
 	ts, msg, score := extractSortValues([]any{float64(1717000000), float64(9876543210)}, false)
 	if ts != 1717000000 || msg != 9876543210 {

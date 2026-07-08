@@ -135,6 +135,37 @@ func TestBuildGlobalFilesDSL_NoKeywordDropsMustClause(t *testing.T) {
 	}
 }
 
+// TestBuildGlobalFilesDSL_KeywordIncludesContentField pins M3: the
+// cross-channel file endpoint's keyword multi_match must reach into
+// payload.file.content so a body-only hit surfaces alongside name / caption
+// matches.
+func TestBuildGlobalFilesDSL_KeywordIncludesContentField(t *testing.T) {
+	req := SearchGlobalFilesReq{Keyword: "report"}
+	q, _ := buildGlobalFilesDSL(context.Background(), fallbackTestAnalyzer(), true, req, []string{"gA"}, "")
+	body := marshalDSL(t, q)
+	if !strings.Contains(body, `"payload.file.content"`) {
+		t.Errorf("_search_global_files keyword DSL must include payload.file.content:\n%s", body)
+	}
+	if strings.Contains(body, `"payload.file.content^`) {
+		t.Errorf("_search_global_files content field must carry default weight (no ^N boost):\n%s", body)
+	}
+}
+
+// TestBuildGlobalMessagesDSL_FileClauseIncludesContentField pins M4: the
+// unified feed's keyword-path fileClause reaches into payload.file.content so
+// body-only hits participate in the merged relevance ranking.
+func TestBuildGlobalMessagesDSL_FileClauseIncludesContentField(t *testing.T) {
+	req := buildGlobalReq("report", GlobalSearchFilters{})
+	q, _ := buildGlobalMessagesDSL(context.Background(), fallbackTestAnalyzer(), true, req, []string{"gA"}, "")
+	body := marshalDSL(t, q)
+	if !strings.Contains(body, `"payload.file.content"`) {
+		t.Errorf("_search_global_messages fileClause must include payload.file.content:\n%s", body)
+	}
+	if strings.Contains(body, `"payload.file.content^`) {
+		t.Errorf("_search_global_messages content field must carry default weight:\n%s", body)
+	}
+}
+
 // P0 wire shape: MessageHit surfaces channel_type when set; FileHit surfaces
 // channel_id + channel_type. Empty values omit via omitempty so single-channel
 // callers stay byte-identical.
