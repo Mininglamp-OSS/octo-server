@@ -105,8 +105,16 @@ Verified live against adaptivecards.io that all three new inputs are AC 1.0 and
   rule: whenever you shortcut the type-dispatched walker to validate a positionally-constrained
   child as a known shape, you inherit the obligation to enforce that shape completely — type AND
   the absence of any nested collection; the allowlist's "校验面 ≥ 渲染面" invariant is only as
-  strong as the weakest place a foreign subtree can enter, labeled or not (PR#556 review P1 +
-  its typeless residual — two review rounds: the conditional fix, then the closed-set closure).
+  strong as the weakest place a foreign subtree can enter, labeled or not. **And "the weakest
+  place" means EVERY such position, not just the one flagged:** reviewers found this class one
+  child collection at a time (ImageSet → its typeless variant → Table rows/cells), each round a
+  fresh instance of the identical bug. The durable fix is to generalize the discipline into one
+  shared helper (`checkConstrainedChild`: a type-pin via a shared `childTypeMatches` predicate +
+  a closed-set `rejectForeignSubtree`) and apply it to ALL flat-validated child positions at once
+  (columns / images / inlines / table rows·cells / facts) — plus reuse the same predicate on the
+  dispatch side so validate-surface == dispatch-surface cannot drift. Patching only the flagged
+  instance guarantees another round on the next one (PR#556 review P1 — three rounds: conditional
+  type-check → typeless closed-set → whole-class generalization).
 
 ## Gotchas
 

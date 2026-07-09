@@ -138,14 +138,20 @@ Acceptance（追加）：`go test -race ./pkg/cardmsg/` 覆盖四元素 v1/v2 �
 替换为 Media/ToggleVisibility）。仍未支持（后续按需）：Media、ShowCard/ToggleVisibility/Execute、
 模板绑定、AC 1.6。
 
-Tier 1 review 加固（PR#556 review，head `7559c526`/`2c8f1003` 后）：
-- **URL allowlist 绕过（P1，阻塞）修复** —— `ImageSet.images[]` / `RichTextBlock.inlines[]` 的子元素
-  必须是**叶子**（Image/TextRun）：类型 present 时 ≠ `Image`/`TextRun` 即拒（`ErrCardUnknownElement`，
-  同 `column()`），**且不得携带任何子集合字段**（`items`/`columns`/`rows`/`cells`/`inlines`/`actions`/
-  `facts`/`images` → `rejectLeafSubtree`）。原逻辑把伪类型子元素当扁平 Image/TextRun 只校 url/selectAction、
-  其 `items` 永不递归 → 夹带 `javascript:` 链接绕过发送期 allowlist（违反「校验面 ≥ 渲染面」，PR#543 铁律）。
-  仅靠类型门（`if type present`）挡不住 **typeless 伪装容器**（无 type + 带 items）—— 该 residual 由
-  `rejectLeafSubtree` 兜底。`TestTier1MislabeledChildRejected`（覆盖伪类型 + typeless 两变体）守卫。
+Tier 1 review 加固（PR#556 review，head `7559c526`→`85baabdf` 多轮）：
+- **flat-validated 子元素的 URL allowlist 绕过（P1，阻塞）—— 全类关闭。** octo 有若干「按位置约束、扁平
+  校验」的子集合位置：`ColumnSet.columns[]`、`ImageSet.images[]`、`RichTextBlock.inlines[]`、`Table.rows[]`·
+  `cells[]`、`FactSet.facts[]`。原逻辑对其中多数不钉子元素类型、也不递归其子树，于是伪类型
+  （`{"type":"Container","items":[…]}`）或 typeless（`{"items":[…]}`）的「伪装容器」被当扁平叶子只校
+  url/selectAction、其 `items` 子树永不走查 → 夹带 `javascript:` 绕过发送期 allowlist（违反「校验面 ≥ 渲染
+  面」，PR#543 铁律）。三位 reviewer 分轮逐个揪出（ImageSet/RichTextBlock → typeless residual → Table）。
+  **统一纪律 `checkConstrainedChild`**：每个约束子位置显式 type 必须匹配其契约类型（缺省放行，同 `column()`），
+  且除该类型合法的那个子集合字段外不得携带任何 `childCollectionFields`。叶子（Image/TextRun/Fact）不许任何
+  子集合；`TableRow` 只许 `cells`、`TableCell`/`Column` 只许 `items`。
+- **派发面 == 校验面（P2）** —— `findSubmitInElements` 对 ImageSet/RichTextBlock/Table 子元素用**同一
+  `childTypeMatches` 谓词**跳过校验期会拒的伪类型子元素，两面共用判定、结构上不可能漂移。
+- `TestTier1MislabeledChildRejected`（伪类型 + typeless，覆盖 Table/Column/Fact）+
+  `TestTier1DispatchSkipsMislabeledChild` 守卫；合规 Image/TextRun/Table 帧不受影响（`TestTier1ElementsAccepted` 仍绿）。
 - **`TableRow.selectAction`（P2）补齐** —— 校验（`w.selectAction(row)`）+ 派发（`findSubmitInElements`
   读 `row.selectAction`）对称补上，使「每个节点的 selectAction 都过同一 allowlist」不留缺口（row 原为
   唯一漏网节点）。

@@ -122,7 +122,7 @@ func TestTier1MislabeledChildRejected(t *testing.T) {
 				map[string]interface{}{"type": "Container", "items": jsChild()},
 			}}),
 		// typeless 变体（residual，PR#556 review）：无 type 字段的「伪装容器」—— 仅靠 type 门禁
-		// （if type present）挡不住，必须靠 rejectLeafSubtree 兜底（子集合字段即拒）。
+		// （if type present）挡不住，必须靠 rejectForeignSubtree 兜底（越界子集合字段即拒）。
 		"ImageSet.child.typeless.items": cardWithBody(map[string]interface{}{
 			"type": "ImageSet", "images": []interface{}{
 				map[string]interface{}{"url": "https://ok.com/a.png", "items": jsChild()},
@@ -130,6 +130,36 @@ func TestTier1MislabeledChildRejected(t *testing.T) {
 		"RichTextBlock.inline.typeless.items": cardWithBody(map[string]interface{}{
 			"type": "RichTextBlock", "inlines": []interface{}{
 				map[string]interface{}{"items": jsChild()},
+			}}),
+		// Table 行/单元格：伪类型 + typeless —— Table 是最后一个未钉类型的子集合（PR#556 review P1）。
+		"Table.cell.type=Image": cardWithBody(map[string]interface{}{
+			"type": "Table", "rows": []interface{}{
+				map[string]interface{}{"type": "TableRow", "cells": []interface{}{
+					map[string]interface{}{"type": "Image", "url": "javascript:alert(1)"},
+				}},
+			}}),
+		"Table.row.type=Container": cardWithBody(map[string]interface{}{
+			"type": "Table", "rows": []interface{}{
+				map[string]interface{}{"type": "Container", "items": jsChild()},
+			}}),
+		"Table.row.typeless.items": cardWithBody(map[string]interface{}{
+			"type": "Table", "rows": []interface{}{
+				map[string]interface{}{"items": jsChild()},
+			}}),
+		"Table.cell.typeless.columns": cardWithBody(map[string]interface{}{
+			"type": "Table", "rows": []interface{}{
+				map[string]interface{}{"type": "TableRow", "cells": []interface{}{
+					map[string]interface{}{"columns": jsChild()},
+				}},
+			}}),
+		// Column / Fact：类型合法但夹带越界子集合字段（全 flat-validated 子位置同一纪律）。
+		"Column.foreign.rows": cardWithBody(map[string]interface{}{
+			"type": "ColumnSet", "columns": []interface{}{
+				map[string]interface{}{"type": "Column", "rows": jsChild()},
+			}}),
+		"FactSet.fact.items": cardWithBody(map[string]interface{}{
+			"type": "FactSet", "facts": []interface{}{
+				map[string]interface{}{"title": "t", "value": "v", "items": jsChild()},
 			}}),
 	}
 	for name, card := range bad {
@@ -261,5 +291,38 @@ func TestTier1TableCellInputCollected(t *testing.T) {
 	// 反向：未声明 id 仍 fail-closed 拒（确认没顺手把声明面开太大）。
 	if err := ValidateInputs(raw, map[string]interface{}{"ghost": "x"}); !errors.Is(err, ErrCardInputInvalid) {
 		t.Errorf("未声明 input 仍应拒, err=%v", err)
+	}
+}
+
+// TestTier1DispatchSkipsMislabeledChild：派发面 == 校验面 —— 即便一帧（绕过发送校验）在
+// ImageSet/RichTextBlock/Table 子位置放了伪类型子元素携带 Submit，findSubmitInElements 也按
+// childTypeMatches 跳过、不派发（防「校验拒、派发认」漂移，PR#556 review P2）。
+func TestTier1DispatchSkipsMislabeledChild(t *testing.T) {
+	sub := map[string]interface{}{"type": "Action.Submit", "id": "go", "data": map[string]interface{}{"k": "v"}}
+	frames := map[string]map[string]interface{}{
+		"ImageSet.foreign.child": cardWithBody(map[string]interface{}{
+			"type": "ImageSet", "images": []interface{}{
+				map[string]interface{}{"type": "Container", "selectAction": sub},
+			}}),
+		"RichTextBlock.foreign.inline": cardWithBody(map[string]interface{}{
+			"type": "RichTextBlock", "inlines": []interface{}{
+				map[string]interface{}{"type": "Container", "selectAction": sub},
+			}}),
+		"Table.foreign.row": cardWithBody(map[string]interface{}{
+			"type": "Table", "rows": []interface{}{
+				map[string]interface{}{"type": "Container", "selectAction": sub},
+			}}),
+		"Table.foreign.cell": cardWithBody(map[string]interface{}{
+			"type": "Table", "rows": []interface{}{
+				map[string]interface{}{"type": "TableRow", "cells": []interface{}{
+					map[string]interface{}{"type": "Image", "selectAction": sub},
+				}},
+			}}),
+	}
+	for name, card := range frames {
+		raw, _ := json.Marshal(v2Envelope(card))
+		if d, found := SubmitAction(raw, "go"); found {
+			t.Errorf("%s：伪类型子元素上的 Submit 不应被派发（派发面须 == 校验面）, d=%v", name, d)
+		}
 	}
 }

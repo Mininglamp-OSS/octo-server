@@ -56,6 +56,19 @@ change-log convention (§7). Newest first.
   validation (`w.selectAction(row)`) and dispatch (`findSubmitInElements` reads
   `row.selectAction`) symmetrically — row was the only node whose `selectAction` was neither
   validated nor dispatched. Brief updated; `inputs` manifest field confirmed in-scope.
+- **Change** — Same task/PR, review hardening cont'd (heads `2c8f1003`→`85baabdf`, three
+  reviewers): the foreign-typed-child bypass turned out to recur one child collection at a time
+  (ImageSet → its typeless variant → `Table` rows/cells), so generalized the fix into one shared
+  discipline instead of patching each instance. New `checkConstrainedChild` (type-pin via a shared
+  `childTypeMatches` predicate + closed-set `rejectForeignSubtree`) is now applied to **every**
+  flat-validated child position — `ColumnSet.columns[]`, `ImageSet.images[]`,
+  `RichTextBlock.inlines[]`, `Table.rows[]`/`cells[]`, `FactSet.facts[]` — closing the `Table`
+  send-time bypass (mislabeled cell as `Image` with a `javascript:` url; mislabeled/typeless row
+  hiding an un-recursed `items` subtree) plus the Column/Fact instances of the same class. The
+  dispatch walker (`findSubmitInElements`) reuses the same `childTypeMatches` predicate to skip
+  foreign-typed children, so validate-surface == dispatch-surface can't drift (P2). Tests:
+  `TestTier1MislabeledChildRejected` (Table/Column/Fact, typed + typeless) +
+  `TestTier1DispatchSkipsMislabeledChild`. Lesson: patch the class, not the flagged instance.
 
 ## 2026-07-08 (PR-D)
 

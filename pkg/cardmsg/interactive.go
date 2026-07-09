@@ -115,6 +115,10 @@ func findSubmitInElements(items []interface{}, actionID string) (map[string]inte
 			if imgs, ok := el["images"].([]interface{}); ok {
 				for _, it := range imgs {
 					if img, ok := it.(map[string]interface{}); ok {
+						// 派发面 == 校验面：非 Image 子元素发送期已拒，派发侧同 childTypeMatches 跳过，两面不漂移（PR#556 review P2）。
+						if !childTypeMatches(img, "Image") {
+							continue
+						}
 						if d, ok := findSubmitAction(img["selectAction"], actionID); ok {
 							return d, true
 						}
@@ -126,6 +130,10 @@ func findSubmitInElements(items []interface{}, actionID string) (map[string]inte
 			if inls, ok := el["inlines"].([]interface{}); ok {
 				for _, it := range inls {
 					if inl, ok := it.(map[string]interface{}); ok {
+						// 同上：非 TextRun 内联对象发送期已拒，派发侧同判定跳过（PR#556 review P2）。
+						if !childTypeMatches(inl, "TextRun") {
+							continue
+						}
 						if d, ok := findSubmitAction(inl["selectAction"], actionID); ok {
 							return d, true
 						}
@@ -141,6 +149,10 @@ func findSubmitInElements(items []interface{}, actionID string) (map[string]inte
 					if !ok {
 						continue
 					}
+					// 非 TableRow 发送期已拒，派发侧同判定跳过（PR#556 review P2）。
+					if !childTypeMatches(row, "TableRow") {
+						continue
+					}
 					// 行级 selectAction 可载 Submit（发送期 w.selectAction(row) 已对齐校验，
 					// PR#556 review P2）。
 					if d, ok := findSubmitAction(row["selectAction"], actionID); ok {
@@ -153,6 +165,10 @@ func findSubmitInElements(items []interface{}, actionID string) (map[string]inte
 					for _, c := range cells {
 						cell, ok := c.(map[string]interface{})
 						if !ok {
+							continue
+						}
+						// 非 TableCell 发送期已拒，派发侧同判定跳过（PR#556 review P2）。
+						if !childTypeMatches(cell, "TableCell") {
 							continue
 						}
 						if d, ok := findSubmitAction(cell["selectAction"], actionID); ok {
