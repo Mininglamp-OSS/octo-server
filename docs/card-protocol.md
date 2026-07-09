@@ -170,8 +170,9 @@ robot API（legacy）`/robot/sendMessage` 同样接受 type-17（校验与 bot i
 - **乱序防护**：可选 `card_seq`（单调递增）；带上时旧帧 → 409。
 - **inputs 信任边界**：提交键必须命中生效帧声明的 `Input.*` id（未声明
   fail-closed），值为字符串、逐类型校验、总量 ≤ 16 KiB。P3-3 起 `Input.Number`
-  按数值+声明 min/max 校验、`Input.Date`（YYYY-MM-DD）/`Input.Time`（HH:MM）按
-  格式+声明区间校验，三者 `""` 均视为未填放行（`isRequired`/`regex` 不服务端强制）。
+  校验为有限数、`Input.Date`（YYYY-MM-DD）/`Input.Time`（HH:MM）校验格式，三者 `""`
+  均视为未填放行；`min`/`max` 区间与 `isRequired`/`regex` 一样**不服务端强制**（AC 规范
+  定义 min/max 为可忽略 hint，区间校验交 bot 业务逻辑，PR#556 定稿）。
 - **`event_data.space_id`**（PR#548 P1-3）：卡片**来源 Space**，服务端从存储行
   解析（群/子区取群 SpaceID；DM 取发送时注入 payload 的 `space_id`），**非**操作者
   请求上下文 Space；无权威值时省略该键（fail-closed），消费方按可选字段处理。

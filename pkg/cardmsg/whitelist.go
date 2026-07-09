@@ -1,12 +1,20 @@
 package cardmsg
 
-// 卡片元素白名单的**单一权威**（card-message-interaction D12.2 / P3-3）。
+// 卡片元素白名单（card-message-interaction D12.2 / P3-3）。二者对外都是 D12 能力清单
+// （GET /v1/bot/card/profile 下发 elements/inputs）的来源，绝不在各处重抄字面量；但它们
+// 与校验器的绑定强度**不同**，注意区分（PR#556 review：勿把 displayElements 也说成三方
+// 结构性单一权威）：
 //
-// displayElements（octo/v1 展示元素，两档共用）与 inputElements（octo/v2 交互输入，
-// octo/v1 携带越级拒）是校验器（validate.go）、inputs 采集（inputs.go 的 isInputElement）、
-// D12 能力清单（GET /v1/bot/card/profile 下发 elements/inputs）三处的共同来源 —— 绝不在
-// 各处重抄字面量，否则白名单变更时对外清单会与校验器静默漂移（清单漂移 = 对 producer /
-// J3 gate 谎报能力）。新增元素只在此追加一处，三方自动同步。
+//   - inputElements（octo/v2 交互输入，octo/v1 携带越级拒）是**真正的三方结构性单一权威**：
+//     校验器（validate.go element() 的 default 分支经 isInputElement）、inputs 采集
+//     （inputs.go collectInputSpecs 经 isInputElement）、D12 清单 inputs 都从它派生 —— 新增
+//     输入元素只改这一处，三方自动同步、不可能漂移。
+//   - displayElements（octo/v1 展示元素，两档共用）只是 **D12 清单 elements 的来源**。校验器
+//     对展示元素是**逐类型手写 case**（TextBlock 查 markdown、Image 查 url、Container 递归
+//     items、ColumnSet 递归 columns、FactSet 查 facts —— 各自校验体不同，无法像输入那样并成
+//     一个 isInputElement 分支）。因此 displayElements 与校验器接受集的一致性**不是结构性
+//     保证，而是由 TestDisplayElementsAuthority 逐个 Validate 守卫**：往这里加展示元素必须
+//     同时给校验器加 case 并让该测试通过，否则清单会广播一个校验器拒绝的元素（漂移 = 谎报能力）。
 //
 // 二者都是 additive-only（同 event_data / D12 wire 演进规则）：只增不改名/删除。
 

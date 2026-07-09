@@ -49,26 +49,39 @@ func TestInputElementsAuthority(t *testing.T) {
 	}
 }
 
-// TestDisplayElementsAuthority：DisplayElements() 与文档 §2 展示元素集一致，且每个成员
-// 放在合法位置都不被校验器判为未知元素；非成员被拒。
+// TestDisplayElementsAuthority：DisplayElements() 与文档 §2 展示元素集一致，且**逐个从
+// 列表派生**校验（PR#556 review）——不像 inputElements 那样有结构性单一权威（校验器对展示
+// 元素是逐类型手写 case），displayElements↔校验器一致性只能靠这个测试守卫。故遍历
+// DisplayElements()，每个元素放在合法位置跑 Validate；缺 fixture 即 fail —— 逼「新增展示
+// 元素」必须同时给校验器加 case 并补 fixture 证明它真被接受，而非只往清单加一行（否则 D12
+// 清单会广播一个校验器拒绝的元素 = 谎报能力）。
 func TestDisplayElementsAuthority(t *testing.T) {
 	want := []string{"TextBlock", "Image", "Container", "ColumnSet", "Column", "FactSet"}
 	got := DisplayElements()
 	if !equalStrs(got, want) {
 		t.Fatalf("DisplayElements()=%v, want %v", got, want)
 	}
-	// 所有展示元素放在合法位置（Column 只存在于 ColumnSet 内）应整卡通过。
-	card := cardWithBody(
-		map[string]interface{}{"type": "TextBlock", "text": "x"},
-		map[string]interface{}{"type": "Image", "url": "https://example.com/i.png"},
-		map[string]interface{}{"type": "Container", "items": []interface{}{}},
-		map[string]interface{}{"type": "ColumnSet", "columns": []interface{}{
+	// 每个展示元素 → 一份放在合法位置的最小卡片（Column 只能在 ColumnSet 内，故包一层）。
+	fixtures := map[string]map[string]interface{}{
+		"TextBlock": cardWithBody(map[string]interface{}{"type": "TextBlock", "text": "x"}),
+		"Image":     cardWithBody(map[string]interface{}{"type": "Image", "url": "https://example.com/i.png"}),
+		"Container": cardWithBody(map[string]interface{}{"type": "Container", "items": []interface{}{}}),
+		"ColumnSet": cardWithBody(map[string]interface{}{"type": "ColumnSet", "columns": []interface{}{}}),
+		"Column": cardWithBody(map[string]interface{}{"type": "ColumnSet", "columns": []interface{}{
 			map[string]interface{}{"type": "Column", "items": []interface{}{}},
-		}},
-		map[string]interface{}{"type": "FactSet", "facts": []interface{}{}},
-	)
-	if err := Validate(v2Envelope(card)); err != nil {
-		t.Errorf("全部展示元素应通过校验, err=%v", err)
+		}}),
+		"FactSet": cardWithBody(map[string]interface{}{"type": "FactSet", "facts": []interface{}{}}),
+	}
+	for _, typ := range got {
+		card, ok := fixtures[typ]
+		if !ok {
+			t.Errorf("展示元素 %s 缺校验 fixture —— 新增展示元素必须补 fixture 证明校验器接受它"+
+				"（否则 displayElements↔校验器漂移、D12 清单谎报能力）", typ)
+			continue
+		}
+		if err := Validate(v2Envelope(card)); err != nil {
+			t.Errorf("展示元素 %s 应通过校验, err=%v", typ, err)
+		}
 	}
 	// 非白名单元素被拒。
 	if err := Validate(v2Envelope(cardWithBody(map[string]interface{}{"type": "Bogus"}))); !errors.Is(err, ErrCardUnknownElement) {

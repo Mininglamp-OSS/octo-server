@@ -85,23 +85,25 @@ func TestValidateStyleTolerance(t *testing.T) {
 	}
 }
 
-// TestValidateInputsNumber：Input.Number 值校验（格式 + min/max + 空放行）。
+// TestValidateInputsNumber：Input.Number 只校验「是合法有限数」——声明了 min/max 也**不**
+// 服务端强制（区间外的合法数字照样放行，range 下放 bot，PR#556）。空串=未填放行。
 func TestValidateInputsNumber(t *testing.T) {
+	// 刻意声明 min/max，用来验证越界值仍放行（服务端不强制区间）。
 	env := v2Envelope(richInputCard(map[string]interface{}{
 		"type": "Input.Number", "id": "qty", "min": float64(1), "max": float64(10),
 	}))
 	raw, _ := json.Marshal(env)
 
-	ok := []string{"1", "10", "5", "3.5", ""} // 区间内 + 空(未填)放行
+	ok := []string{"1", "10", "5", "3.5", "", "0", "11", "1e3", "-7", "999999"} // 含越界值：区间不强制
 	for _, v := range ok {
 		if err := ValidateInputs(raw, map[string]interface{}{"qty": v}); err != nil {
-			t.Errorf("Input.Number 合法值 %q 应通过, err=%v", v, err)
+			t.Errorf("Input.Number 合法有限数 %q 应通过（min/max 不强制）, err=%v", v, err)
 		}
 	}
-	bad := []string{"abc", "0", "11", "1e3"} // 非数字 / 越下界 / 越上界
+	bad := []string{"abc", "1,000", "12/34", "x"} // 只有非数字才拒
 	for _, v := range bad {
 		if err := ValidateInputs(raw, map[string]interface{}{"qty": v}); !errors.Is(err, ErrCardInputInvalid) {
-			t.Errorf("Input.Number 非法值 %q 应拒, err=%v", v, err)
+			t.Errorf("Input.Number 非数字 %q 应拒, err=%v", v, err)
 		}
 	}
 }
@@ -121,44 +123,50 @@ func TestValidateInputsNumberNoBounds(t *testing.T) {
 	}
 }
 
-// TestValidateInputsDate：Input.Date 值校验（YYYY-MM-DD + 区间 + 空放行）。
+// TestValidateInputsDate：Input.Date 只校验 YYYY-MM-DD 格式 + 空放行；声明 min/max 不
+// 服务端强制（区间外的合法日期照样放行，range 下放 bot，PR#556）。
 func TestValidateInputsDate(t *testing.T) {
 	env := v2Envelope(richInputCard(map[string]interface{}{
 		"type": "Input.Date", "id": "day", "min": "2026-01-01", "max": "2026-12-31",
 	}))
 	raw, _ := json.Marshal(env)
 
-	ok := []string{"2026-01-01", "2026-12-31", "2026-07-09", ""}
+	// 合法格式（含声明区间外的 2025-12-31 / 2027-01-01）+ 空 → 放行。
+	ok := []string{"2026-01-01", "2026-12-31", "2026-07-09", "2025-12-31", "2027-01-01", ""}
 	for _, v := range ok {
 		if err := ValidateInputs(raw, map[string]interface{}{"day": v}); err != nil {
-			t.Errorf("Input.Date 合法值 %q 应通过, err=%v", v, err)
+			t.Errorf("Input.Date 合法格式 %q 应通过（区间不强制）, err=%v", v, err)
 		}
 	}
-	bad := []string{"2026/07/09", "07-09-2026", "2025-12-31", "2027-01-01", "2026-13-01", "notadate"}
+	// 非法格式仍拒（错分隔 / 错顺序 / 非法日历日 / 非零填充 / 乱码）。
+	bad := []string{"2026/07/09", "07-09-2026", "2026-13-01", "2026-7-9", "notadate"}
 	for _, v := range bad {
 		if err := ValidateInputs(raw, map[string]interface{}{"day": v}); !errors.Is(err, ErrCardInputInvalid) {
-			t.Errorf("Input.Date 非法值 %q 应拒, err=%v", v, err)
+			t.Errorf("Input.Date 非法格式 %q 应拒, err=%v", v, err)
 		}
 	}
 }
 
-// TestValidateInputsTime：Input.Time 值校验（HH:MM 24h + 区间 + 空放行）。
+// TestValidateInputsTime：Input.Time 只校验 HH:MM(24h) 格式 + 空放行；声明 min/max 不
+// 服务端强制（区间外的合法时间照样放行，range 下放 bot，PR#556）。
 func TestValidateInputsTime(t *testing.T) {
 	env := v2Envelope(richInputCard(map[string]interface{}{
 		"type": "Input.Time", "id": "t", "min": "09:00", "max": "18:00",
 	}))
 	raw, _ := json.Marshal(env)
 
-	ok := []string{"09:00", "18:00", "12:30", ""}
+	// 合法格式（含声明区间外的 08:59 / 18:01）+ 空 → 放行。
+	ok := []string{"09:00", "18:00", "12:30", "08:59", "18:01", "00:00", "23:59", ""}
 	for _, v := range ok {
 		if err := ValidateInputs(raw, map[string]interface{}{"t": v}); err != nil {
-			t.Errorf("Input.Time 合法值 %q 应通过, err=%v", v, err)
+			t.Errorf("Input.Time 合法格式 %q 应通过（区间不强制）, err=%v", v, err)
 		}
 	}
-	bad := []string{"8:00", "08:60", "24:00", "18:01", "08:59", "0900", "notatime"}
+	// 非法格式仍拒。
+	bad := []string{"8:00", "08:60", "24:00", "0900", "notatime"}
 	for _, v := range bad {
 		if err := ValidateInputs(raw, map[string]interface{}{"t": v}); !errors.Is(err, ErrCardInputInvalid) {
-			t.Errorf("Input.Time 非法值 %q 应拒, err=%v", v, err)
+			t.Errorf("Input.Time 非法格式 %q 应拒, err=%v", v, err)
 		}
 	}
 }
@@ -176,9 +184,9 @@ func TestValidateInputsRichUndeclared(t *testing.T) {
 }
 
 // TestValidateInputsNumberRejectsNonFinite：Input.Number 必须拒非有限数。strconv.ParseFloat
-// 接受 "NaN"/"Inf"/"Infinity"（大小写、正负变体）且**不报 error**，其中 NaN 与 min/max 的
-// 所有比较恒 false → 会绕过区间校验。非有限数不是合法数值输入，不得当「形状可信」值透传
-// 给 bot（信任边界）。无界与有界 Number 都必须显式拒。
+// 接受 "NaN"/"Inf"/"Infinity"（大小写、正负变体）且**不报 error** —— 非有限数不是合法数值
+// 输入，不得当「形状可信」值透传给 bot（信任边界；这是格式/类型校验，与已下放 bot 的
+// min/max range 无关）。声明与未声明 min/max 的 Number 都必须显式拒。
 func TestValidateInputsNumberRejectsNonFinite(t *testing.T) {
 	nonFinite := []string{"NaN", "nan", "Inf", "inf", "+Inf", "-Inf", "Infinity", "-infinity"}
 	unbounded := v2Envelope(richInputCard(map[string]interface{}{"type": "Input.Number", "id": "n"}))

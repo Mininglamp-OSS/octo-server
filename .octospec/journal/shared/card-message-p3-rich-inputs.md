@@ -1,7 +1,7 @@
 ---
 type: Journal
 title: "Journal: card-message-p3-rich-inputs (card message P3-3)"
-description: Record of P3-3 — extend the octo/v2 input whitelist with Input.Number/Date/Time (all AC 1.0, within the pinned card_version "1.5"; additive, no version bump), add submit-time value validation (finite Number + declared min/max, Date YYYY-MM-DD, Time HH:MM), refactor the whitelist into a single pkg/cardmsg authority that validator + collector + dispatcher + D12 manifest all derive from, and additively advertise elements/inputs on GET /v1/bot/card/profile. No new errcode/DB/endpoint.
+description: Record of P3-3 — extend the octo/v2 input whitelist with Input.Number/Date/Time (all AC 1.0, within the pinned card_version "1.5"; additive, no version bump), add submit-time format validation (finite Number, Date YYYY-MM-DD, Time HH:MM; min/max range not server-enforced — delegated to bot per PR#556 review), refactor the whitelist into a single pkg/cardmsg authority that validator + collector + dispatcher + D12 manifest all derive from, and additively advertise elements/inputs on GET /v1/bot/card/profile. No new errcode/DB/endpoint.
 tags: ["card", "wire-contract", "trust-boundary", "bot-api", "testing"]
 timestamp: 2026-07-09T01:00:00Z
 # --- octospec extension fields ---
@@ -27,10 +27,12 @@ accepted only 3 of Adaptive Cards' 6 input elements; added the missing three.
   The `element()` type switch no longer enumerates input literals; unknown types
   fall through to `default` and are accepted iff `isInputElement(t)`, so adding
   an input element is a one-line change in `whitelist.go`.
-- **`inputs.go`** — submit-time value validation for the new types (trust
-  boundary D11): Number = finite numeric + declared `min`/`max`; Date =
-  `YYYY-MM-DD` + declared range; Time = `HH:MM` (24h) + declared range; `""`
-  passes as "unfilled". `isRequired`/`regex` remain client-UX + bot concerns.
+- **`inputs.go`** — submit-time **format** validation for the new types (trust
+  boundary D11): Number = finite numeric (reject `NaN`/`±Inf`); Date =
+  `YYYY-MM-DD`; Time = `HH:MM` (24h); `""` passes as "unfilled". `min`/`max`
+  range is **not** server-enforced (delegated to bot — see Open item, resolved
+  by maintainer in PR#556 review); `isRequired`/`regex` likewise remain
+  client-UX + bot concerns.
 - **`interactive.go`** — dispatch (`findSubmitInElements`) walks `inlineAction`
   via the same `isInputElement` predicate as validation.
 - **`modules/bot_api/card_profile.go`** — D12 manifest additively advertises
@@ -59,11 +61,13 @@ Verified live against adaptivecards.io that all three new inputs are AC 1.0 and
   `TestSubmitActionDispatchRichInputInlineAction`) pin the symmetry.
 - **`strconv.ParseFloat` accepts non-finite tokens without error.** `"NaN"`,
   `"Inf"`, `"+Inf"`, `"Infinity"` (case-insensitive) all parse to a valid
-  `float64` with `err == nil`, and `NaN` compares `false` against every bound —
-  so a naive `ParseFloat` + `min/max` check silently accepts non-finite values.
-  Any numeric wire-input validator must add an explicit
-  `math.IsNaN || math.IsInf` reject. This is the numeric analogue of the
-  "validation surface must cover the whole value space" discipline.
+  `float64` with `err == nil` — so a `ParseFloat`-only "is it a number" check
+  silently accepts non-finite values, and `NaN` further compares `false` against
+  any bound (i.e. it would also slip past a naive `min/max` gate). Non-finite is
+  not a valid numeric input regardless of whether a range is enforced: any
+  numeric wire-input validator must add an explicit `math.IsNaN || math.IsInf`
+  reject. This is the numeric analogue of the "validation surface must cover the
+  whole value space" discipline.
 
 ## Gotchas
 
@@ -77,12 +81,18 @@ Verified live against adaptivecards.io that all three new inputs are AC 1.0 and
   `modules/bot_api` / `modules/message` card tests need MySQL (`octo-test-mysql`)
   + `OCTO_MASTER_KEY` (exactly 32 bytes).
 
-## Open (deferred, in brief)
+## Resolved / Open
 
-- Whether server-enforced `min/max` (chosen default, consistent with ChoiceSet /
-  Toggle declared-value checks) should instead be delegated to bot business
-  validation — flagged for maintainer confirmation.
-- AC 1.6 `Data.Query` (dynamic typeahead) is a separate XL item: it needs a new
+- **RESOLVED (PR#556 review, maintainer)** — `min/max` range is **not**
+  server-enforced; it is delegated to bot business validation. The server only
+  format/type-checks (finite number / `YYYY-MM-DD` / `HH:MM`). Rationale: AC's
+  own schema defines `min/max` as an ignorable *hint* (so a spec-conforming
+  client can submit out-of-range), and card/action collapses all validation
+  errors to one anti-enumeration `invalid` (so a range rejection gives the user
+  no actionable feedback). Unlike `ChoiceSet` choices (a *constitutive* bound —
+  a value outside them is forged), `min/max` is *advisory*, in the same class as
+  `isRequired`/`regex` which were already not enforced.
+- **Open** — AC 1.6 `Data.Query` (dynamic typeahead) is a separate XL item: it needs a new
   synchronous client→bot query channel that Octo's async event-queue model does
   not have. Sequenced after modal forms (Goal 4), gated on a real
   remote/huge-choice-set need.

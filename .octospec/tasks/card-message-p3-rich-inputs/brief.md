@@ -29,11 +29,12 @@ source: self
    分支，继承同一套纪律——id 必填且帧内唯一（`registerID`）、`label`/`errorMessage`
    markdown 链接目标走同一正向 URL allowlist、`inlineAction` 路由校验。octo/v1 携带
    新类型仍拒（越级）。
-2. **提交期值校验**（`pkg/cardmsg/inputs.go` `ValidateInputs` + `collectInputSpecs`）：
-   延续「形状可信」信任边界（声明过 + 类型对 + 有界），对三类新输入按声明帧校验上行值：
-   - `Input.Number`：值必须可解析为数字；若声明帧带 `min`/`max` 则强制区间；`""`（未填）放行。
-   - `Input.Date`：值必须是 `YYYY-MM-DD`；若声明帧带 `min`/`max`（ISO 日期）则强制区间；`""` 放行。
-   - `Input.Time`：值必须是 `HH:MM`（24h）；若声明帧带 `min`/`max`（`HH:MM`）则强制区间；`""` 放行。
+2. **提交期值校验**（`pkg/cardmsg/inputs.go` `ValidateInputs`）：延续「形状可信」信任边界
+   （声明过 + 类型对），对三类新输入按声明帧校验上行值的**格式**。`min`/`max` 区间**不**
+   服务端强制（下放 bot 业务校验，「待确认 #1」已定稿，见文末）：
+   - `Input.Number`：值必须可解析为**有限数**（显式拒 `NaN`/`±Inf`）；`""`（未填）放行。
+   - `Input.Date`：值必须是 `YYYY-MM-DD`；`""` 放行。
+   - `Input.Time`：值必须是 `HH:MM`（24h）；`""` 放行。
 
 同时用测试锁定校验器对 **1.5 内 renderer-only 风格属性**的容忍：`Input.Text`
 `style:"password"`、`Input.ChoiceSet` `style:"filtered"|"expanded"`（当前校验器只白名单
@@ -98,10 +99,10 @@ source: self
   - `Input.Number`/`Date`/`Time` 在 octo/v2 放行、在 octo/v1 拒（`ErrCardUnknownElement`）；
   - 三类新输入缺 `id` → `ErrCardBadShape`；帧内 id 重复 → 冲突拒；
   - 新类型的 `label`/`errorMessage` 携带 `javascript:` markdown 链接 → 拒（URL allowlist）；
-  - `ValidateInputs`：
-    - `Input.Number` 非数字值 → `ErrCardInputInvalid`；越 `min`/`max` → 拒；区间内 + `""` → 放行；
-    - `Input.Date` 非 `YYYY-MM-DD` → 拒；越 `min`/`max` → 拒；合法 + `""` → 放行；
-    - `Input.Time` 非 `HH:MM` → 拒；越 `min`/`max` → 拒；合法 + `""` → 放行；
+  - `ValidateInputs`（只做格式/类型校验；min/max 区间**不**服务端强制 —— 即便声明了 min/max，越界的合法值也放行）：
+    - `Input.Number` 非数字 / 非有限数（`NaN`/`±Inf`）→ `ErrCardInputInvalid`；合法有限数（含声明区间外）+ `""` → 放行；
+    - `Input.Date` 非 `YYYY-MM-DD` → 拒；合法格式（含声明区间外）+ `""` → 放行；
+    - `Input.Time` 非 `HH:MM` → 拒；合法格式（含声明区间外）+ `""` → 放行；
     - 未声明键仍 fail-closed 拒；
   - 风格容忍：`Input.Text style:"password"`、`Input.ChoiceSet style:"filtered"|"expanded"` 发送期放行。
 - `docs/card-protocol.md` §2/§7 已列出 6 个输入元素，与 `pkg/cardmsg` 白名单一致。
@@ -111,8 +112,12 @@ source: self
 
 ## 待确认（human confirm）
 
-1. **min/max 区间是否服务端强制**：默认选「强制」（与 `Input.ChoiceSet` 校验声明 choices、
-   `Input.Toggle` 校验 valueOn/valueOff 同构，符合信任边界「有界」语义）。若你认为区间也应
-   下放到 bot 业务校验（只做格式校验），我改为仅校验「是合法数字/日期/时间」。
+1. **min/max 区间是否服务端强制** — **已定稿：不强制，下放 bot**（PR#556 review，maintainer 拍板）。
+   理由:(a) AC 官方 schema 把 `Input.Number/Date/Time` 的 min/max 定义为「hint … may be ignored
+   by some clients」——合规客户端可提交越界值,服务端强制会拒掉合法用户操作;(b) card/action 把
+   所有 `ValidateInputs` 错误折叠成单一 `ErrMessageCardActionInvalid`(反枚举),越界拒绝让用户收到
+   无从更正的笼统错;(c) 区别于 `Input.ChoiceSet` 的 choices(**构成性**约束,值不在其中即伪造)——
+   min/max 是**建议性**约束,与 `isRequired`/`regex` 同类。故服务端只做格式/类型校验(有限数 /
+   `YYYY-MM-DD` / `HH:MM`),区间交 bot 业务逻辑。
 2. **`docs/card-protocol.md` 镜像修订**是否需 maintainer sign-off——roadmap 未把 P3-3 标为
    需 sign-off（区别于 P3-1），倾向按「additive、随代码同 PR 改文档」处理。
