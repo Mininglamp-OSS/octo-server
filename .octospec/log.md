@@ -4,6 +4,27 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-09 (P3-3)
+
+- **Change** — Task `card-message-p3-rich-inputs` (card message P3-3): extend the
+  octo/v2 input whitelist with `Input.Number/Date/Time` (all AC 1.0, within the
+  pinned `card_version:"1.5"` — additive, no version bump). Submit-time value
+  validation added (Number = finite numeric + declared min/max; Date =
+  `YYYY-MM-DD` + range; Time = `HH:MM` + range; `""` = unfilled;
+  `isRequired`/`regex` still not server-enforced). Refactored the element
+  whitelist into a single `pkg/cardmsg` authority (`whitelist.go`:
+  `displayElements`/`inputElements` + `DisplayElements()`/`InputElements()` +
+  `isInputElement`) that send-time validation, submit-time collection, action
+  dispatch, and the D12 manifest all derive from — no drifting literals. D12
+  `GET /v1/bot/card/profile` additively advertises `elements`/`inputs` for
+  element-granularity feature detection. Two review-caught fixes folded in:
+  reject non-finite `Input.Number` (NaN/±Inf bypass `ParseFloat`+bounds), and
+  symmetric `inlineAction` dispatch for the new types (no dead buttons). No new
+  errcode / i18n / DB / migration / endpoint; additive-only wire contract. Brief
+  + journal under `.octospec/tasks/card-message-p3-rich-inputs/` and
+  `.octospec/journal/shared/card-message-p3-rich-inputs.md`; learning candidate
+  in `.octospec/learnings/pending/`.
+
 ## 2026-07-08 (PR-D)
 
 - **Change** — Task `card-message-p2-capability-manifest` (PR-D, card message P2
