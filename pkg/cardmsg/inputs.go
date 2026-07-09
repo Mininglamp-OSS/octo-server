@@ -186,9 +186,10 @@ func collectInputSpecsFromElements(items []interface{}, specs map[string]inputSp
 				specs[id] = spec
 			}
 		}
-		// items/columns 仅对容器类递归，与 Validate 一致（叶子元素的 items/columns
-		// 发送期不被遍历，派发侧也不得把其中的 input id 当作「已声明」，否则 D11 声明面
-		// > 校验面 —— 与 findSubmitInElements 同口径）。
+		// items/columns/cells 仅对容器类递归，与 Validate / findSubmitInElements 完全一致
+		// （叶子元素的 items 发送期不被遍历，采集侧也不得把其中的 input id 当作「已声明」，
+		// 否则声明面 > 校验面）。Table.rows→cells→items 同样承载标准元素（含 Input.*），必须
+		// 递归 —— 否则 Table 单元格内的输入发送/派发都通过、提交却被当「未声明」拒（PR#556）。
 		switch t {
 		case "Container":
 			if sub, ok := el["items"].([]interface{}); ok {
@@ -200,6 +201,26 @@ func collectInputSpecsFromElements(items []interface{}, specs map[string]inputSp
 					if col, ok := c.(map[string]interface{}); ok {
 						if sub, ok := col["items"].([]interface{}); ok {
 							collectInputSpecsFromElements(sub, specs)
+						}
+					}
+				}
+			}
+		case "Table":
+			if rows, ok := el["rows"].([]interface{}); ok {
+				for _, r := range rows {
+					row, ok := r.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					cells, ok := row["cells"].([]interface{})
+					if !ok {
+						continue
+					}
+					for _, c := range cells {
+						if cell, ok := c.(map[string]interface{}); ok {
+							if sub, ok := cell["items"].([]interface{}); ok {
+								collectInputSpecsFromElements(sub, specs)
+							}
 						}
 					}
 				}

@@ -116,3 +116,10 @@ Table(1.5) / ActionSet(1.2)**（版本实测 adaptivecards.io）。每个元素�
 Gotcha：修正了既有 `TestValidateWhitelistRejections` 把 Table 误标「AC 1.6 应拒」——Table 实为
 **1.5**、现已支持，替换为仍未支持的 Media(1.1)/ToggleVisibility(1.2) 保持负向覆盖。仍未支持
 （后续按需）：Media、Action.ShowCard/ToggleVisibility/Execute、模板/数据绑定、AC 1.6 元素。
+
+Gotcha 2（review 追加）：Table 是**第三个**需要同步的镜像面证据。加 Table 时补了校验
+（`w.elements` 递归 cell.items）和派发（`findSubmitInElements` 递归 Table），却漏了**提交期 input
+采集**（`collectInputSpecsFromElements` 只递归 Container/ColumnSet）。后果：Table 单元格里的
+`Input.*` 发送/派发都通过，提交却被当「未声明」拒。修复=采集侧也递归 Table cell items。教训重申：
+「校验 / 派发 / **采集**」是同一白名单的三个消费面，任何递归容器都必须三处同步——理想是共享一个
+遍历器，退而求其次是每个面都有守卫测试（本次补 `TestTier1TableCellInputCollected`）。

@@ -186,3 +186,30 @@ func TestTier1PlainDerivation(t *testing.T) {
 		t.Errorf("ActionSet 按钮标题不应入 plain, got=%q", plain)
 	}
 }
+
+// TestTier1TableCellInputCollected：Table cell 内的 Input.* 提交期必须被采集为「已声明」。
+// 发送期（w.elements 递归 cell.items）与派发期（findSubmitInElements 递归 Table）都进 cell，
+// 采集期 collectInputSpecsFromElements 也必须递归 Table cell items —— 否则合法提交会被当
+// 「未声明 input」拒（三个镜像面必须同步，PR#556 review）。
+func TestTier1TableCellInputCollected(t *testing.T) {
+	env := v2Envelope(cardWithBody(map[string]interface{}{
+		"type": "Table", "rows": []interface{}{
+			map[string]interface{}{"type": "TableRow", "cells": []interface{}{
+				map[string]interface{}{"type": "TableCell", "items": []interface{}{
+					map[string]interface{}{"type": "Input.Text", "id": "table_field"},
+				}},
+			}},
+		}}))
+	if err := Validate(env); err != nil {
+		t.Fatalf("Table 内 Input.Text 发送期应通过, err=%v", err)
+	}
+	raw, _ := json.Marshal(env)
+	// 已声明的 table 内 input 提交必须放行（不能被当未声明拒）。
+	if err := ValidateInputs(raw, map[string]interface{}{"table_field": "hi"}); err != nil {
+		t.Errorf("Table cell 内已声明 input 的提交应通过, err=%v", err)
+	}
+	// 反向：未声明 id 仍 fail-closed 拒（确认没顺手把声明面开太大）。
+	if err := ValidateInputs(raw, map[string]interface{}{"ghost": "x"}); !errors.Is(err, ErrCardInputInvalid) {
+		t.Errorf("未声明 input 仍应拒, err=%v", err)
+	}
+}
