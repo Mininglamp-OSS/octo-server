@@ -294,6 +294,15 @@ func (w *walker) element(el map[string]interface{}, depth int) error {
 					if err := w.bump(depth + 1); err != nil {
 						return err
 					}
+					// AC：inlines[] 的对象必须是 TextRun；显式给出 type 时必须是 "TextRun"（同
+					// column()/imageChild 纪律）—— 拒伪类型对象，堵住「非 TextRun 子树夹带未校验
+					// URL 面」的绕过（PR#556 review P1：校验面 ≥ 渲染面）。TextRun 是叶子，类型钉死
+					// 后无嵌套子树需递归。
+					if t, present := inl["type"]; present {
+						if s, _ := t.(string); s != "TextRun" {
+							return fmt.Errorf("%w: RichTextBlock.inlines[] 内元素类型 %v", ErrCardUnknownElement, t)
+						}
+					}
 					if err := w.selectAction(inl); err != nil {
 						return err
 					}
@@ -319,6 +328,14 @@ func (w *walker) element(el map[string]interface{}, depth int) error {
 					return err
 				}
 				if err := checkNodeURLs(row); err != nil {
+					return err
+				}
+				// TableRow.selectAction 与其它一切节点的 selectAction 同权威过 allowlist
+				// （element() 顶部对每个 body 元素、column()/cell 都无条件校验 selectAction；row
+				// 原先漏了这一层 —— 补齐使「每个节点的 selectAction 都被校验」不留缺口，OpenUrl 的
+				// javascript: 面在 row 上也被拒；派发侧 findSubmitInElements 对齐读 row.selectAction，
+				// PR#556 review P2）。
+				if err := w.selectAction(row); err != nil {
 					return err
 				}
 				cells, present := row["cells"]
@@ -433,6 +450,16 @@ func (w *walker) element(el map[string]interface{}, depth int) error {
 func (w *walker) imageChild(img map[string]interface{}, depth int) error {
 	if err := w.bump(depth); err != nil {
 		return err
+	}
+	// AC：ImageSet.images[] 每项必须是 Image；显式给出 type 时必须是 "Image"（同 column()
+	// 对 Column 的纪律）。否则一个 {"type":"Container","url":"http://ok","items":[…]} 会被当
+	// 扁平 Image 只校验 url、其 items 永不走查 —— 夹带 javascript: 链接的子树绕过发送期校验
+	// （PR#556 review P1：校验面必须 ≥ 渲染面，同 PR#543 对 backgroundImage/iconUrl 立的铁律）。
+	// Image 是叶子，类型钉死后无嵌套子树需递归。
+	if t, present := img["type"]; present {
+		if s, _ := t.(string); s != "Image" {
+			return fmt.Errorf("%w: ImageSet.images[] 内元素类型 %v", ErrCardUnknownElement, t)
+		}
 	}
 	if err := checkNodeURLs(img); err != nil {
 		return err

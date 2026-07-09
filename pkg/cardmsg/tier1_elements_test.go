@@ -81,6 +81,12 @@ func TestTier1ElementsURLAllowlist(t *testing.T) {
 						"items":        []interface{}{}},
 				}},
 			}}),
+		"Table.row.selectAction": cardWithBody(map[string]interface{}{
+			"type": "Table", "rows": []interface{}{
+				map[string]interface{}{"type": "TableRow",
+					"selectAction": map[string]interface{}{"type": "Action.OpenUrl", "url": "javascript:x"},
+					"cells":        []interface{}{}},
+			}}),
 		"ActionSet.action.openurl": cardWithBody(map[string]interface{}{
 			"type": "ActionSet", "actions": []interface{}{
 				map[string]interface{}{"type": "Action.OpenUrl", "url": "javascript:x"},
@@ -89,6 +95,36 @@ func TestTier1ElementsURLAllowlist(t *testing.T) {
 	for name, card := range bad {
 		if err := Validate(v2Envelope(card)); !errors.Is(err, ErrCardBadURLScheme) {
 			t.Errorf("%s 的 javascript: 应被拒(ErrCardBadURLScheme), err=%v", name, err)
+		}
+	}
+}
+
+// TestTier1MislabeledChildRejected：ImageSet.images[] / RichTextBlock.inlines[] 内塞入伪类型
+// 子元素（如 type=Container）必须被拒 —— 否则该子树的 items 永不走查，可夹带 javascript: 链接
+// 绕过发送期 URL allowlist（PR#556 review P1：校验面必须 ≥ 渲染面）。伪类型在类型门即被拒
+// （ErrCardUnknownElement），其内嵌 js 根本到不了。这类是 TestTier1ElementsURLAllowlist（只测
+// 正确类型子元素）漏掉的一面。
+func TestTier1MislabeledChildRejected(t *testing.T) {
+	jsChild := func() []interface{} {
+		return []interface{}{
+			map[string]interface{}{"type": "TextBlock", "text": "[x](javascript:alert(1))"},
+		}
+	}
+	bad := map[string]map[string]interface{}{
+		// url 合法但类型伪装成 Container：旧逻辑当扁平 Image 只校 url、放过 items 里的 js。
+		"ImageSet.child.type=Container": cardWithBody(map[string]interface{}{
+			"type": "ImageSet", "images": []interface{}{
+				map[string]interface{}{"type": "Container", "url": "https://ok.com/a.png", "items": jsChild()},
+			}}),
+		// inline 对象伪装成 Container：旧逻辑只校 selectAction、放过 items 里的 js。
+		"RichTextBlock.inline.type=Container": cardWithBody(map[string]interface{}{
+			"type": "RichTextBlock", "inlines": []interface{}{
+				map[string]interface{}{"type": "Container", "items": jsChild()},
+			}}),
+	}
+	for name, card := range bad {
+		if err := Validate(v2Envelope(card)); !errors.Is(err, ErrCardUnknownElement) {
+			t.Errorf("%s 伪类型子元素应被拒(ErrCardUnknownElement), err=%v", name, err)
 		}
 	}
 }
@@ -126,6 +162,10 @@ func TestTier1SubmitDispatchSymmetry(t *testing.T) {
 		"RichTextBlock.textrun.selectAction": cardWithBody(map[string]interface{}{
 			"type": "RichTextBlock", "inlines": []interface{}{
 				map[string]interface{}{"type": "TextRun", "text": "t", "selectAction": sub("go")},
+			}}),
+		"Table.row.selectAction": cardWithBody(map[string]interface{}{
+			"type": "Table", "rows": []interface{}{
+				map[string]interface{}{"type": "TableRow", "selectAction": sub("go"), "cells": []interface{}{}},
 			}}),
 		"Table.cell.selectAction": cardWithBody(map[string]interface{}{
 			"type": "Table", "rows": []interface{}{

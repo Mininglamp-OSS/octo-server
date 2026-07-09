@@ -42,6 +42,17 @@ change-log convention (§7). Newest first.
   1.5, now supported) → replaced with still-unsupported Media(1.1)/ToggleVisibility(1.2).
   Still out (later, on demand): Media, Action.ShowCard/ToggleVisibility/Execute, templating,
   AC 1.6.
+- **Change** — Same task/PR, review hardening (PR#556 review of head `7559c526`): fixed a
+  **send-time URL-allowlist bypass (P1)** in the two Tier-1 flat-leaf handlers — `imageChild`
+  (`ImageSet.images[]`) and the `RichTextBlock.inlines[]` object branch accepted a child
+  without enforcing its declared `type` and never recursed its `items`, so a mislabeled child
+  (`{"type":"Container","url":"http://ok","items":[TextBlock with javascript:]}`) passed
+  `Validate` with the nested `javascript:` link unchecked. Now both reject a present `type` ≠
+  `Image`/`TextRun` (same discipline as `column()`), restoring "校验面 ≥ 渲染面"
+  (`TestTier1MislabeledChildRejected`). Also completed `TableRow.selectAction` (P2): added it to
+  validation (`w.selectAction(row)`) and dispatch (`findSubmitInElements` reads
+  `row.selectAction`) symmetrically — row was the only node whose `selectAction` was neither
+  validated nor dispatched. Brief updated; `inputs` manifest field confirmed in-scope.
 
 ## 2026-07-08 (PR-D)
 

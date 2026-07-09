@@ -85,6 +85,20 @@ Verified live against adaptivecards.io that all three new inputs are AC 1.0 and
   element as a **top-level `body` element** — the exact shape the manifest promises.
   A drift guard that tests a *different* position than the contract promises is not a
   guard (PR#556 review #4).
+- **A handler that iterates a fixed-type child collection MUST enforce the child's declared
+  type — otherwise a mislabeled child bypasses the type-dispatched validation that would have
+  recursed it.** Top-level `element()` dispatches by `type`, so a `Container` in `body` is
+  routed to the Container case and its `items` are walked. But `ImageSet.images[]` and
+  `RichTextBlock.inlines[]` call a *flat leaf* handler (`imageChild` / inline branch) on
+  **every** child regardless of type — validating it as an Image/TextRun (url / selectAction
+  only) and never recursing `items`. So a child mislabeled `{"type":"Container", url:ok,
+  items:[<js TextBlock>]}` smuggled the nested `javascript:` past the send-time URL allowlist:
+  the flat handler doesn't walk `items`, and the type-dispatch that *would* have is bypassed
+  because the handler never looked at `type`. The fix is the same one-liner `column()` already
+  had — reject a present `type` ≠ the expected leaf type. General rule: whenever you shortcut
+  the type-dispatched walker to validate a positionally-constrained child as a known shape, you
+  inherit the obligation to *enforce* that shape's type; the allowlist's "校验面 ≥ 渲染面"
+  invariant is only as strong as the weakest place a foreign subtree can enter (PR#556 review P1).
 
 ## Gotchas
 

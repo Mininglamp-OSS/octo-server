@@ -133,13 +133,18 @@ func findSubmitInElements(items []interface{}, actionID string) (map[string]inte
 				}
 			}
 		case "Table":
-			// Table rows→cells：单元格 selectAction + 递归 cell.items（与发送期 Table 校验
-			// 完全一致，派发面 == 校验面）。
+			// Table rows→cells：行 selectAction + 单元格 selectAction + 递归 cell.items（与发送
+			// 期 Table 校验完全一致，派发面 == 校验面）。
 			if rows, ok := el["rows"].([]interface{}); ok {
 				for _, r := range rows {
 					row, ok := r.(map[string]interface{})
 					if !ok {
 						continue
+					}
+					// 行级 selectAction 可载 Submit（发送期 w.selectAction(row) 已对齐校验，
+					// PR#556 review P2）。
+					if d, ok := findSubmitAction(row["selectAction"], actionID); ok {
+						return d, true
 					}
 					cells, ok := row["cells"].([]interface{})
 					if !ok {
