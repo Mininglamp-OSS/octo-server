@@ -502,7 +502,13 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 				observeStickerUpload("compress_success")
 				uploadReader = bytes.NewReader(result.Bytes)
 				finalSize = result.Size
-				finalStoredMaxDim = result.OutMaxDim
+				// 只在 OutMaxDim 可信(>0)时用它做落库维度守卫；<=0 视为 compressor
+				// 未如约报告尺寸，回退到源尺寸（Fit 只会缩小，源尺寸是安全上界）——
+				// 超限源因此 fail-closed 被拒，而不是盲信 0 放行超限图（review P2
+				// 纵深防御，防未来 compressor 变体静默 fail-open）。
+				if result.OutMaxDim > 0 {
+					finalStoredMaxDim = result.OutMaxDim
+				}
 				f.Info("贴纸压缩成功",
 					zap.String("uid", loginUID),
 					zap.String("ext", ext),

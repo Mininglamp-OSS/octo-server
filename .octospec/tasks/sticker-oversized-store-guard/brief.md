@@ -81,4 +81,3 @@ reference it from `modules/file` so the compressible-accept ceiling can't drift.
 - `stickerCompressAcceptMaxDim == common.StickerUploadMaxDimensionHardCap`.
 - `go test ./modules/file/... ./modules/common/...` (no-infra subset) + `go vet`
   pass; `make i18n-lint` unaffected.
-</content>

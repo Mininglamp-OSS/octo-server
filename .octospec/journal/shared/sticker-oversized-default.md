@@ -64,10 +64,12 @@ The compute path (`doCompressStaticSticker` → `imaging.Fit` to
 - **Zero-impact when compression off (default).** `effectiveGateDim` returns
   `upload_max_dimension` (512) for every format, and the compressor never runs.
 - **Known edge — APNG.** APNG has ext `.png` so it passes the widened gate, but
-  the compressor detects it (`isAnimatedPNGSource`) and stores it un-shrunk
-  (`skipped:animated`). A 513–1024² APNG is thus stored at full size — rare,
-  bounded by the 1024 hard cap, documented in `effectiveGateDim`. Tightening
-  would need an acTL scan at the gate (deferred).
+  the compressor detects it (`isAnimatedPNGSource`) and can't shrink it
+  (`skipped:animated`). **Superseded by `sticker-oversized-store-guard`:** a
+  >`upload_max_dimension` APNG is now fail-closed **rejected** (not stored), so the
+  ≤`upload_max_dimension` stored invariant holds for animated PNGs too; a
+  ≤`upload_max_dimension` APNG is stored as-is. (This entry originally said such an
+  APNG was stored at full size — true only for the pre-guard increment.)
 
 ## Tests
 
@@ -96,4 +98,3 @@ feature is on) can be made "correct out of the box" without flipping the
 auto-shrink" while preserving the compressor's cautious rollout — and, as a
 bonus, avoided a client-contract change by making the gate compress-aware instead
 of raising the advertised limit.
-</content>

@@ -39,8 +39,10 @@ change-log convention (§7). Newest first.
   client contract stay **512/unchanged** (compress-aware gate avoids the
   appconfig ripple a 1024 default would cause). Zero-impact when compression off
   (gate = 512 for all formats, compressor never runs). Known edge: APNG (ext
-  `.png`) passes the widened gate but stores un-shrunk (`skipped:animated`),
-  bounded by 1024. Getter tests rewritten; gate integration tests added; fake made
+  `.png`) passes the widened gate but can't be shrunk (`skipped:animated`) — later
+  fail-closed **rejected** by `sticker-oversized-store-guard` if >
+  `upload_max_dimension` (this entry's pre-guard "stored un-shrunk" no longer
+  holds). Getter tests rewritten; gate integration tests added; fake made
   faithful to the 512 default. No new errcode / i18n / DB / migration / appconfig
   field. Brief `.octospec/tasks/sticker-oversized-default/brief.md`.
 

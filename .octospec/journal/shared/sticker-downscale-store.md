@@ -88,4 +88,3 @@ to the same source as its own guard is silently inert. When a validation gate an
 a downstream transform read the same limit, the transform can be unreachable —
 worth a decoupling check whenever a resize/normalize step sits behind a reject
 gate keyed on the same dimension.
-</content>

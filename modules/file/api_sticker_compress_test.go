@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"image/gif"
@@ -18,6 +19,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/stickersig"
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -340,6 +342,62 @@ func TestUploadFile_CompressEnabled_HandleTiesToFinalStoredObject(t *testing.T) 
 	assert.NotEmpty(t, svc.uploaded, "capturing service must have received bytes")
 }
 
+// makeTestAPNG 生成 (w,h) 的 APNG：先用 image/png 编一张真 PNG（IHDR 声明 w×h，
+// 供 image.DecodeConfig 取维度），再在 IHDR 之后、IDAT 之前插入一个 acTL chunk，
+// 让 isAnimatedPNGSource 判定为动图（acTL 只按结构识别、不校验 CRC）。
+// PNG 布局固定：8B 签名 + IHDR chunk(4 len + 4 "IHDR" + 13 data + 4 crc = 25B)。
+func makeTestAPNG(t *testing.T, w, h int) []byte {
+	t.Helper()
+	// 复用 makeTestPNG 生成真 PNG（签名 + IHDR + … + IDAT + IEND），再在 IHDR 之后、
+	// IDAT 之前插入一个 acTL chunk 使其成为 APNG。CRC 必须**有效**：Go 的 image.Decode
+	// 会校验未知 chunk 的 CRC，若为 0 整图解码失败——那样一旦动图检测被破坏，图会走
+	// decode-failed 而非 compressed，测试就无法区分"识别为动图"与"字节损坏"（review）。
+	// PNG 布局固定：8B 签名 + IHDR chunk(4 len + 4 "IHDR" + 13 data + 4 crc = 25B)。
+	b := makeTestPNG(t, w, h)
+	const ihdrEnd = 8 + 25
+	require.Greater(t, len(b), ihdrEnd, "encoded PNG shorter than signature+IHDR")
+	data := []byte{
+		0x00, 0x00, 0x00, 0x01, // num_frames = 1
+		0x00, 0x00, 0x00, 0x00, // num_plays = 0
+	}
+	crc := crc32.ChecksumIEEE(append([]byte("acTL"), data...)) // CRC 覆盖 type+data
+	actl := []byte{0x00, 0x00, 0x00, 0x08, 'a', 'c', 'T', 'L'}
+	actl = append(actl, data...)
+	actl = append(actl, byte(crc>>24), byte(crc>>16), byte(crc>>8), byte(crc))
+	out := make([]byte, 0, len(b)+len(actl))
+	out = append(out, b[:ihdrEnd]...)
+	out = append(out, actl...)
+	out = append(out, b[ihdrEnd:]...)
+	return out
+}
+
+// 命名回归（review 共识）：一张 >512 的 APNG（.png 扩展名）通过放宽到 1024 的维度门，
+// 但压缩阶段被识别为 animated → skipped:animated（无法缩放），落库维度守卫据源尺寸
+// fail-closed 拒绝。用 compress_oversized_rejected 计数正向断言"是守卫拒的、不是维度门
+// 拒的"（两处错误文案相同，无法只靠 body 区分）；有效 acTL CRC 保证一旦动图检测失效，
+// 图会解码→缩到 512→落库(200) 而非静默通过本用例。
+func TestUploadFile_OversizedGuard_AnimatedPNGRejected(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const uid = "10000"
+	settings := defaultFakeStickerSettings()
+	settings.compressEnabled = true
+	settings.maxSizeKB = 5120
+	settings.maxDim = 512
+	settings.timeoutMs = 10_000
+
+	f, svc := newStickerCompressFile(t, settings)
+
+	before := testutil.ToFloat64(metricStickerUploadTotal.WithLabelValues("compress_oversized_rejected"))
+	w := uploadStickerForTest(t, f, uid, "anim.png", makeTestAPNG(t, 600, 600))
+
+	require.NotEqualf(t, http.StatusOK, w.Code, "a 600² APNG can't be shrunk and must be rejected, not stored; body: %s", w.Body.String())
+	assert.Nil(t, svc.uploaded, "oversized animated PNG must not reach storage")
+	after := testutil.ToFloat64(metricStickerUploadTotal.WithLabelValues("compress_oversized_rejected"))
+	assert.Equal(t, float64(1), after-before,
+		"must be rejected by the oversized store-guard, not the dimension gate")
+}
+
 // makeTestGIF 生成 (w,h) 的单帧 GIF；gif.Encode 会把 RGBA 量化到调色板。
 func makeTestGIF(t *testing.T, w, h int) []byte {
 	t.Helper()
@@ -518,7 +576,7 @@ func TestUploadFile_CompressEnabled_DefaultCompressMaxDim_ShrinksOversizedTo512(
 // 用例覆盖"压缩实际没缩到位"的各条 fail-open 路径：都必须 fail-closed 拒绝，绝不把
 // 超过 upload_max_dimension 的大图落库。
 
-// A) compressor==nil：整块跳过，源 1024² jpg 若不拦就会原样落库。
+// compressor==nil：整块跳过，源 1024² jpg 若不拦就会原样落库。
 func TestUploadFile_OversizedGuard_NilCompressorRejects(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -545,7 +603,7 @@ func TestUploadFile_OversizedGuard_NilCompressorRejects(t *testing.T) {
 	assert.Nil(t, svc.uploaded, "oversized image must not reach storage on the nil-compressor path")
 }
 
-// B) failed（decode/encode 出错，fail-open 走原字节）：注入必败 doCompress。
+// failed（decode/encode 出错，fail-open 走原字节）：注入必败 doCompress。
 func TestUploadFile_OversizedGuard_CompressFailedRejects(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -569,7 +627,7 @@ func TestUploadFile_OversizedGuard_CompressFailedRejects(t *testing.T) {
 	assert.Nil(t, svc.uploaded, "oversized image must not reach storage on the failed path")
 }
 
-// C) skipped:timeout（并发饱和/超时同类）：注入慢 doCompress + 极小 timeout。
+// skipped:timeout（并发饱和/超时同类）：注入慢 doCompress + 极小 timeout。
 func TestUploadFile_OversizedGuard_CompressTimeoutRejects(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -594,7 +652,39 @@ func TestUploadFile_OversizedGuard_CompressTimeoutRejects(t *testing.T) {
 	assert.Nil(t, svc.uploaded, "oversized image must not reach storage on the timeout-skip path")
 }
 
-// D) 配置陷阱：compress_max_dimension(1024) > upload_max_dimension(512)。1024² jpg
+// 纵深防御（review P2）：compressed 结局但 OutMaxDim<=0（未来 compressor 变体忘填 /
+// 返回 0），守卫不可盲信 —— 回退到源尺寸判断，超限即拒。注入 OutMaxDim=0 + 1024² 源
+// → 必须 fail-closed 拒绝，而不是把未知尺寸的图放行落库。（注入的 doCompress 直接返回
+// compressed，忽略 maxDim/targetKB，故本用例不设 compressMaxDim/targetKB。）
+func TestUploadFile_OversizedGuard_CompressedZeroOutMaxDimRejects(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const uid = "10000"
+	settings := defaultFakeStickerSettings()
+	settings.compressEnabled = true
+	settings.maxSizeKB = 5120
+	settings.maxDim = 512
+	settings.timeoutMs = 10_000
+
+	f, svc := newStickerCompressFile(t, settings)
+	// 注入"压缩成功但没报告输出尺寸"的 compressor（OutMaxDim 留 0）。
+	f.compressor.doCompress = func(ext string, src []byte, maxDim, targetKB int) (stickerCompressResult, error) {
+		return stickerCompressResult{
+			Outcome:   stickerCompressOutcomeCompressed,
+			Bytes:     src,
+			Size:      int64(len(src)),
+			OutMaxDim: 0, // 关键：未填充
+		}, nil
+	}
+
+	w := uploadStickerForTest(t, f, uid, "x.jpg", makeTestJPEG(t, 1024, 1024, 90))
+
+	require.NotEqualf(t, http.StatusOK, w.Code, "compressed outcome with OutMaxDim<=0 on an oversized source must fail closed; body: %s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "512")
+	assert.Nil(t, svc.uploaded, "must not store when OutMaxDim is untrustworthy on an oversized source")
+}
+
+// 配置陷阱：compress_max_dimension(1024) > upload_max_dimension(512)。1024² jpg
 // 压后仍 1024（Fit 目标 1024，不缩），guard 用压后实际尺寸 fail-closed 拒绝。
 func TestUploadFile_OversizedGuard_CompressMaxDimAboveUploadDimRejects(t *testing.T) {
 	gin.SetMode(gin.TestMode)

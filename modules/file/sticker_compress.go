@@ -93,9 +93,10 @@ const stickerCompressAcceptMaxDim = common.StickerUploadMaxDimensionHardCap
 // 大 gif/webp 也不会因放宽而被存成大图。
 //
 // 已知边界：APNG 的扩展名是 .png，canCompressStickerExt 为 true，故会通过放宽门；
-// 但压缩阶段 isAnimatedPNGSource 识别后走 skipped:animated，原样落库（不缩放）。
-// 即一张 513–1024² 的 APNG 会以原尺寸存，比 512 大 —— 但仍 ≤ 解码硬上限 1024²，
-// 内存有界。APNG 罕见，此边界可接受；如需收紧可在门处加 acTL 扫描（暂不做）。
+// 但压缩阶段 isAnimatedPNGSource 识别后走 skipped:animated（无法缩放）。此时由 api.go
+// 压缩块之后的落库维度守卫据源尺寸兜底：>upload_max_dimension 的 APNG 被 fail-closed
+// 拒绝、绝不以原尺寸落库；≤upload_max_dimension 的 APNG 原样存。即放宽门放进来的超限
+// 动图最终被拒，与 gif/webp 一致，不破坏"落库恒 ≤ upload_max_dimension"不变量。
 func (s stickerLimitsSnapshot) effectiveGateDim(ext string) int {
 	if s.compressEnabled && canCompressStickerExt(ext) {
 		return stickerCompressAcceptMaxDim

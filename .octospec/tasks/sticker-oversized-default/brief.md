@@ -108,4 +108,3 @@ decode/frame), so it needs no tuning.
 - Existing sticker upload/compress tests still pass unchanged.
 - `go test ./modules/file/... ./modules/common/...` and `go vet` pass;
   appconfig tests unaffected; `make i18n-lint` unaffected.
-</content>

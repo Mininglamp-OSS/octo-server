@@ -116,5 +116,3 @@ well within `compress_timeout_ms`.
   (`dimension_rejected` unchanged); the accept hard cap is still 1024.
 - `go test ./modules/file/... ./modules/common/...` and `go vet` pass;
   `make i18n-lint` unaffected (no new i18n codes).
-</content>
-</invoke>

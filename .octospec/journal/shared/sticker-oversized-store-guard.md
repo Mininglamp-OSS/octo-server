@@ -91,4 +91,3 @@ was intentionally best-effort/fail-open, so the widen created a hole on every
 fallback path. When you relax a bound trusting a downstream transform, assert the
 post-transform invariant explicitly rather than trusting the transform to always
 run — especially when the transform is fail-open by design.
-</content>
