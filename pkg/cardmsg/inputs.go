@@ -12,7 +12,10 @@ package cardmsg
 import (
 	"encoding/json"
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -29,6 +32,14 @@ type inputSpec struct {
 	multiSelect bool                // isMultiSelect：值为逗号分隔子集（AC 线上格式）
 	valueOn     string              // Input.Toggle；缺省 "true"/"false"
 	valueOff    string
+	// P3-3 声明区间（Number/Date/Time）。存在性由 hasMin/hasMax 标记 —— 缺省即不设界
+	// （区间是「形状可信」的一部分，与 ChoiceSet 校验声明 choices 同构；isRequired/regex
+	// 仍不在服务端强制）。Number 用数值界，Date/Time 用同格式字符串界（固定格式下字典序
+	// == 时序）。malformed 的生产者界在采集期被丢弃（fail-open，绝不因生产者界非法而拒
+	// 用户值）。
+	hasMin, hasMax bool
+	minNum, maxNum float64 // Input.Number
+	minStr, maxStr string  // Input.Date（YYYY-MM-DD）/ Input.Time（HH:MM）
 }
 
 // ValidateInputs 按 D11 校验 card/action 请求的 inputs（fail-closed）：
@@ -36,6 +47,9 @@ type inputSpec struct {
 //   - 值必须是字符串；Input.Text ≤ 4KiB；Input.Toggle 必须等于 valueOn/valueOff；
 //     Input.ChoiceSet 必须命中声明的 choice value（multiSelect 为逗号分隔子集，
 //     单选允许 "" 表示未选择）；
+//   - P3-3：Input.Number 值必须可解析为数字、在声明 min/max 内；Input.Date 必须是
+//     YYYY-MM-DD、在声明区间内；Input.Time 必须是 HH:MM(24h)、在声明区间内；三者
+//     "" 均视为未填放行（isRequired 不服务端强制）；
 //   - 序列化总量 ≤ 16KiB。
 //
 // envelopeRaw 是「生效卡片」信封字节（content_edit 优先，与 SubmitAction 的取帧
@@ -85,6 +99,55 @@ func ValidateInputs(envelopeRaw []byte, inputs map[string]interface{}) error {
 					return fmt.Errorf("%w: input %q 不是声明的选项", ErrCardInputInvalid, key)
 				}
 			}
+		case "Input.Number":
+			// 空串=未填（isRequired 不服务端强制）；否则必须可解析为数字，且在声明区间内。
+			if s == "" {
+				break
+			}
+			n, err := strconv.ParseFloat(s, 64)
+			if err != nil {
+				return fmt.Errorf("%w: input %q 不是合法数字", ErrCardInputInvalid, key)
+			}
+			// strconv.ParseFloat 接受 NaN/±Inf/Infinity 且不报错；NaN 与 min/max 的比较恒
+			// false 会绕过区间校验。非有限数不是合法数值输入，拒（信任边界：交给 bot 的值必须
+			// 是「形状可信」的有限数）。
+			if math.IsNaN(n) || math.IsInf(n, 0) {
+				return fmt.Errorf("%w: input %q 不是有限数", ErrCardInputInvalid, key)
+			}
+			if spec.hasMin && n < spec.minNum {
+				return fmt.Errorf("%w: input %q 小于声明下界", ErrCardInputInvalid, key)
+			}
+			if spec.hasMax && n > spec.maxNum {
+				return fmt.Errorf("%w: input %q 大于声明上界", ErrCardInputInvalid, key)
+			}
+		case "Input.Date":
+			if s == "" {
+				break
+			}
+			if !isValidDate(s) {
+				return fmt.Errorf("%w: input %q 不是合法日期(YYYY-MM-DD)", ErrCardInputInvalid, key)
+			}
+			// 固定 YYYY-MM-DD 格式下字典序即时序，直接比较字符串。
+			if spec.hasMin && s < spec.minStr {
+				return fmt.Errorf("%w: input %q 早于声明下界", ErrCardInputInvalid, key)
+			}
+			if spec.hasMax && s > spec.maxStr {
+				return fmt.Errorf("%w: input %q 晚于声明上界", ErrCardInputInvalid, key)
+			}
+		case "Input.Time":
+			if s == "" {
+				break
+			}
+			if !isValidTime(s) {
+				return fmt.Errorf("%w: input %q 不是合法时间(HH:MM)", ErrCardInputInvalid, key)
+			}
+			// 固定 HH:MM(24h) 格式下字典序即时序。
+			if spec.hasMin && s < spec.minStr {
+				return fmt.Errorf("%w: input %q 早于声明下界", ErrCardInputInvalid, key)
+			}
+			if spec.hasMax && s > spec.maxStr {
+				return fmt.Errorf("%w: input %q 晚于声明上界", ErrCardInputInvalid, key)
+			}
 		}
 	}
 	return nil
@@ -114,7 +177,7 @@ func collectInputSpecsFromElements(items []interface{}, specs map[string]inputSp
 			continue
 		}
 		t, _ := el["type"].(string)
-		if t == "Input.Text" || t == "Input.Toggle" || t == "Input.ChoiceSet" {
+		if isInputElement(t) {
 			if id, _ := el["id"].(string); id != "" {
 				spec := inputSpec{typ: t}
 				switch t {
@@ -138,6 +201,29 @@ func collectInputSpecsFromElements(items []interface{}, specs map[string]inputSp
 						}
 					}
 					spec.multiSelect, _ = el["isMultiSelect"].(bool)
+				case "Input.Number":
+					// AC min/max 为 JSON 数字。
+					if v, ok := el["min"].(float64); ok {
+						spec.hasMin, spec.minNum = true, v
+					}
+					if v, ok := el["max"].(float64); ok {
+						spec.hasMax, spec.maxNum = true, v
+					}
+				case "Input.Date":
+					// AC min/max 为 ISO 日期字符串；仅在生产者界本身合法时启用（fail-open）。
+					if v, ok := el["min"].(string); ok && isValidDate(v) {
+						spec.hasMin, spec.minStr = true, v
+					}
+					if v, ok := el["max"].(string); ok && isValidDate(v) {
+						spec.hasMax, spec.maxStr = true, v
+					}
+				case "Input.Time":
+					if v, ok := el["min"].(string); ok && isValidTime(v) {
+						spec.hasMin, spec.minStr = true, v
+					}
+					if v, ok := el["max"].(string); ok && isValidTime(v) {
+						spec.hasMax, spec.maxStr = true, v
+					}
 				}
 				specs[id] = spec
 			}
@@ -162,4 +248,23 @@ func collectInputSpecsFromElements(items []interface{}, specs map[string]inputSp
 			}
 		}
 	}
+}
+
+// isValidDate 校验 AC Input.Date 线上值格式（严格 YYYY-MM-DD + 真实日历日）。
+// 先卡定宽/分隔位（拒非零填充如 "2026-7-9"），再用 time.Parse 拒非法日历日（如 13 月）。
+func isValidDate(s string) bool {
+	if len(s) != 10 || s[4] != '-' || s[7] != '-' {
+		return false
+	}
+	_, err := time.Parse("2006-01-02", s)
+	return err == nil
+}
+
+// isValidTime 校验 AC Input.Time 线上值格式（严格 HH:MM 24h）。
+func isValidTime(s string) bool {
+	if len(s) != 5 || s[2] != ':' {
+		return false
+	}
+	_, err := time.Parse("15:04", s)
+	return err == nil
 }

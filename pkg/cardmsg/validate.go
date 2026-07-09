@@ -259,10 +259,18 @@ func (w *walker) element(el map[string]interface{}, depth int) error {
 				}
 			}
 		}
-	case "Input.Text", "Input.Toggle", "Input.ChoiceSet":
-		// P2 元素（octo/v2 白名单，sibling brief D1）。octo/v1 一律拒绝：正常情况
-		// octo/v2 信封已被 profile 协商挡在前面，此分支拦截「octo/v1 信封携带
-		// P2 元素」的越级形状。
+	default:
+		// octo/v2 交互输入（Input.*）。白名单单一权威 = inputElements（whitelist.go）——
+		// 校验器不枚举字面量，新增输入元素只改 inputElements 一处，发送期放行 / inputs 采集
+		// / D12 清单三方自动同步（D12.2 反漂移）。非输入类型即未知元素。
+		// 六个输入元素共享发送期纪律：id 必填且帧内唯一、label/errorMessage 的 markdown URL
+		// 面走正向 allowlist、inlineAction 路由。Number/Date/Time 为 P3-3 追加（AC 1.0，落在
+		// 固定 card_version="1.5" 内，白名单增量而非版本升级）。
+		if !isInputElement(t) {
+			return fmt.Errorf("%w: %q", ErrCardUnknownElement, t)
+		}
+		// octo/v1 一律拒绝：正常情况 octo/v2 信封已被 profile 协商挡在前面，此分支拦截
+		// 「octo/v1 信封携带交互元素」的越级形状。
 		if !w.interactive {
 			return fmt.Errorf("%w: %q（octo/v2 起）", ErrCardUnknownElement, t)
 		}
@@ -304,8 +312,6 @@ func (w *walker) element(el map[string]interface{}, depth int) error {
 		if err := w.inlineAction(el); err != nil {
 			return err
 		}
-	default:
-		return fmt.Errorf("%w: %q", ErrCardUnknownElement, t)
 	}
 	return nil
 }

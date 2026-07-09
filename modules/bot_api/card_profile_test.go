@@ -53,6 +53,8 @@ type cardProfileManifest struct {
 	Enabled     bool     `json:"enabled"`
 	CardVersion string   `json:"card_version"`
 	Profiles    []string `json:"profiles"`
+	Elements    []string `json:"elements"`
+	Inputs      []string `json:"inputs"`
 	Limits      struct {
 		MaxPayloadBytes   int `json:"max_payload_bytes"`
 		MaxNodes          int `json:"max_nodes"`
@@ -60,6 +62,23 @@ type cardProfileManifest struct {
 		MaxInputTextBytes int `json:"max_input_text_bytes"`
 		MaxInputsBytes    int `json:"max_inputs_bytes"`
 	} `json:"limits"`
+}
+
+// TestBotCardProfile_ElementsInputsFromConstants（D12.2）：elements/inputs 深等 cardmsg
+// 权威白名单 —— 供 J3 gate 按元素/输入粒度做前向兼容协商（即便 card_version 不变，也能
+// 探测本部署是否接受 Input.Number/Date/Time 等新增元素，消除「版本号不动 → gate 无法
+// 分辨新旧 1.5 部署」的错配）。
+func TestBotCardProfile_ElementsInputsFromConstants(t *testing.T) {
+	t.Setenv(cardmsg.EnvEnabled, "true")
+	handler, _ := setupBotCardProfile(t)
+
+	w := getCardProfile(t, handler, cpBotToken)
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var m cardProfileManifest
+	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &m))
+	assert.Equal(t, cardmsg.DisplayElements(), m.Elements)
+	assert.Equal(t, cardmsg.InputElements(), m.Inputs)
 }
 
 // TestBotCardProfile_ValuesFromConstants：清单每个值必须等于 pkg/cardmsg 常量
@@ -149,7 +168,7 @@ func TestBotCardProfile_AdditiveContractFieldSet(t *testing.T) {
 	for k := range raw {
 		gotTop = append(gotTop, k)
 	}
-	assert.ElementsMatch(t, []string{"enabled", "card_version", "profiles", "limits"}, gotTop,
+	assert.ElementsMatch(t, []string{"enabled", "card_version", "profiles", "limits", "elements", "inputs"}, gotTop,
 		"D12 additive-only：顶层字段集冻结（新增新字段，绝不改名/删除）")
 
 	var limits map[string]json.RawMessage

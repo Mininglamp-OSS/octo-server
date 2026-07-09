@@ -68,8 +68,10 @@ func findSubmitInElements(items []interface{}, actionID string) (map[string]inte
 		if d, ok := findSubmitAction(el["selectAction"], actionID); ok {
 			return d, true
 		}
-		// inlineAction：仅 Input.*（发送期只在 Input 分支校验），派发面 ≤ 校验面。
-		if t == "Input.Text" || t == "Input.Toggle" || t == "Input.ChoiceSet" {
+		// inlineAction：仅 Input.*（发送期只在输入分支校验）。派发面用与校验器同一个
+		// isInputElement 谓词，保证「校验面 == 派发面」—— 否则 Input.Number/Date/Time 的
+		// inlineAction Submit 会「发送通过、点击 not-found」死按钮（P3-3）。
+		if isInputElement(t) {
 			if d, ok := findSubmitAction(el["inlineAction"], actionID); ok {
 				return d, true
 			}

@@ -40,7 +40,7 @@
 |---|---|
 | 元素 | `TextBlock`（markdown 子集，§2.1）、`Image`、`Container`、`ColumnSet`/`Column`、`FactSet` |
 | 动作 | `Action.OpenUrl`；元素/整卡 `selectAction` **仅当**携带 `Action.OpenUrl` |
-| P2 起（octo/v2） | `Action.Submit`（含 selectAction 携带）、`Input.Text` / `Input.Toggle` / `Input.ChoiceSet`（id 必填且帧内唯一） |
+| P2 起（octo/v2） | `Action.Submit`（含 selectAction 携带）、`Input.Text` / `Input.Toggle` / `Input.ChoiceSet` / `Input.Number` / `Input.Date` / `Input.Time`（id 必填且帧内唯一；后三者 P3-3 追加，均 AC 1.0、仍在 `card_version:"1.5"` 内，为白名单增量而非版本升级） |
 | 永不（P3 再议） | `Action.Execute`、`Action.ShowCard`、`ToggleVisibility`、模板/数据绑定、`Table` 等 AC 1.6 元素 |
 
 结构与大小上限（全部 ingress 一致）：
@@ -77,7 +77,10 @@ allowlist —— 服务端用**完整 CommonMark 解析器**（非模式匹配�
   2. 不认识 `profile`（更新的服务端/更旧的客户端）→ 渲染 `plain`；
   3. 连 `type:17` 都不认识（存量客户端）→ octo-lib 未知类型兜底文案。
 - P2 产者能力发现：`GET /v1/bot/card/profile`（D12，随 P2 落地）返回部署的
-  `enabled` / `card_version` / `profiles` / `limits` 清单（只增不改）；P1 期间生产者以发送被
+  `enabled` / `card_version` / `profiles` / `elements` / `inputs` / `limits` 清单（只增不改）；
+  `elements`/`inputs` 是本部署接受的展示元素 / 交互输入白名单（源自 `pkg/cardmsg`
+  权威列表），供 producer 按**元素粒度**前向兼容协商——即便 `card_version` 停在 `"1.5"`，
+  也能探测是否接受 `Input.Number/Date/Time` 等 additive 新增元素。P1 期间生产者以发送被
   400/`card_disabled` 拒绝为「未启用」信号。
 
 ## 4. 信任模型（谁能发卡、谁能信卡）
@@ -166,7 +169,9 @@ robot API（legacy）`/robot/sendMessage` 同样接受 type-17（校验与 bot i
   tombstone、`transient:true` 的进度帧不入史）。
 - **乱序防护**：可选 `card_seq`（单调递增）；带上时旧帧 → 409。
 - **inputs 信任边界**：提交键必须命中生效帧声明的 `Input.*` id（未声明
-  fail-closed），值为字符串、逐类型校验、总量 ≤ 16 KiB。
+  fail-closed），值为字符串、逐类型校验、总量 ≤ 16 KiB。P3-3 起 `Input.Number`
+  按数值+声明 min/max 校验、`Input.Date`（YYYY-MM-DD）/`Input.Time`（HH:MM）按
+  格式+声明区间校验，三者 `""` 均视为未填放行（`isRequired`/`regex` 不服务端强制）。
 - **`event_data.space_id`**（PR#548 P1-3）：卡片**来源 Space**，服务端从存储行
   解析（群/子区取群 SpaceID；DM 取发送时注入 payload 的 `space_id`），**非**操作者
   请求上下文 Space；无权威值时省略该键（fail-closed），消费方按可选字段处理。
