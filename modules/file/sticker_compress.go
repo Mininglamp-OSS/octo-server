@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/disintegration/imaging"
 )
 
@@ -78,11 +79,12 @@ func (s stickerLimitsSnapshot) compressParams() stickerCompressParams {
 }
 
 // stickerCompressAcceptMaxDim 是「压缩开启时可压格式(jpg/png)」的接收维度上限：
-// 放宽到与 common.stickerUploadMaxDimensionHardCap 一致的 1024（解码像素硬上限），
-// 让 >upload_max_dimension 的静态图能被接收进来随后 downscale 到 compressMaxDim。
+// 放宽到解码像素硬上限（common.StickerUploadMaxDimensionHardCap = 1024），让
+// >upload_max_dimension 的静态图能被接收进来随后 downscale 到 compressMaxDim。
 // 保持在硬上限而非另设旋钮：它在落库输出里不可见（图恒被缩到 compressMaxDim），
-// 且 1024²×4=4MB/帧是内存安全上界，无需运营调。若 common 侧硬上限变动需同步。
-const stickerCompressAcceptMaxDim = 1024
+// 且 1024²×4=4MB/帧是内存安全上界，无需运营调。直接引用 common 导出常量，单一
+// 真源，避免两处 1024 字面量漂移（review finding：漂移会悄悄再放宽 bomb 门）。
+const stickerCompressAcceptMaxDim = common.StickerUploadMaxDimensionHardCap
 
 // effectiveGateDim 返回本次上传的维度门上限（sticker-oversized-default）。
 // 可压格式(jpg/png)且压缩开启时放宽到 stickerCompressAcceptMaxDim（随后 Fit 到
@@ -210,6 +212,11 @@ type stickerCompressResult struct {
 	Reason  string // 细分原因（"disabled"/"format"/"concurrency_saturated"/"timeout"/decode 或 encode 错误信息）
 	Bytes   []byte // 仅 Outcome=="compressed" 时有效
 	Size    int64  // 结果字节数（compressed）或压后大小（over_limit）
+	// OutMaxDim 是压缩后图像的单边像素上限（max(w,h)），仅 compressed/over_limit
+	// 有效（其余分支为 0，caller 用源图尺寸兜底）。caller 用它做「落库维度不得超过
+	// upload_max_dimension」的 fail-closed 守卫：Fit 目标(compressMaxDim)可能 ≥ 源边
+	// 或被配置成大于 upload_max_dimension，只有实际压后尺寸才能证明缩到了上限内。
+	OutMaxDim int
 }
 
 // stickerCompressor 承担压缩流程 + 稳定性闸。零值不可用；用 newStickerCompressor。
@@ -416,15 +423,21 @@ func doCompressStaticSticker(ext string, src []byte, maxDim, targetKB int) (stic
 
 	out := buf.Bytes()
 	size := int64(len(out))
+	// 压后实际单边像素上限（缩放/不缩放都取最终 img 尺寸），供 caller 的
+	// 「落库维度不得超过 upload_max_dimension」fail-closed 守卫使用。
+	ob := img.Bounds()
+	outMaxDim := max(ob.Dx(), ob.Dy())
 	if targetKB > 0 && size > int64(targetKB)*1024 {
 		return stickerCompressResult{
-			Outcome: stickerCompressOutcomeOverLimit,
-			Size:    size,
+			Outcome:   stickerCompressOutcomeOverLimit,
+			Size:      size,
+			OutMaxDim: outMaxDim,
 		}, nil
 	}
 	return stickerCompressResult{
-		Outcome: stickerCompressOutcomeCompressed,
-		Bytes:   out,
-		Size:    size,
+		Outcome:   stickerCompressOutcomeCompressed,
+		Bytes:     out,
+		Size:      size,
+		OutMaxDim: outMaxDim,
 	}, nil
 }

@@ -819,6 +819,13 @@ const (
 	defaultStickerUploadMaxDimension = 512
 	stickerUploadMaxDimensionHardCap = 1024
 
+	// StickerUploadMaxDimensionHardCap is the exported alias of the decoded-pixel
+	// dimension hard cap (== stickerUploadMaxDimensionHardCap). modules/file
+	// references it so the compressible-accept ceiling shares this single source
+	// of truth rather than re-declaring a bare 1024 literal (review finding: a
+	// hand-synced duplicate could silently drift and re-widen the bomb gate).
+	StickerUploadMaxDimensionHardCap = stickerUploadMaxDimensionHardCap
+
 	defaultStickerCompressEnabled = false
 
 	defaultStickerCompressTargetKB = 1024

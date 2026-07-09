@@ -4,6 +4,25 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-09 (sticker-oversized-store-guard)
+
+- **Fix** — Task `sticker-oversized-store-guard` (code-review fix on
+  `sticker-oversized-default`): close the regression where the compress-aware
+  gate admitted >512 jpg/png trusting compression to downscale, but every
+  fail-open path (nil compressor, skipped:concurrency_saturated/timeout, failed,
+  or compress_max_dimension > upload_max_dimension) stored the original oversized
+  image up to 1024² and served it to peers — reachable under load / attackable by
+  saturating the compress slots. Added `stickerCompressResult.OutMaxDim` (actual
+  post-compression dimension) + an `api.go` post-block guard that rejects
+  (`compress_oversized_rejected`, new pre-warmed terminal metric) when the final
+  stored dimension exceeds `upload_max_dimension` — dimension fail-CLOSED while
+  compression quality stays fail-OPEN. Deduped the cross-package 1024 literal
+  (exported `common.StickerUploadMaxDimensionHardCap`, referenced by modules/file).
+  Schema note recommends `compress_max_dimension ≤ upload_max_dimension`; test
+  helper reuse cleanup. Four guard regressions (nil/failed/timeout/mis-config) +
+  unbroken happy path. No new errcode / i18n / DB / appconfig change. Briefs
+  `.octospec/tasks/sticker-oversized-store-guard/`.
+
 ## 2026-07-09 (sticker-oversized-default)
 
 - **Change** — Task `sticker-oversized-default` (follow-up to

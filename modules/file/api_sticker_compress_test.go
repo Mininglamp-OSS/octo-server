@@ -3,6 +3,7 @@ package file
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"image"
 	"image/color"
 	"image/gif"
@@ -459,17 +460,7 @@ func TestUploadFile_CompressEnabled_LargeImage_DownscaledAndStored(t *testing.T)
 	f, svc := newStickerCompressFile(t, settings)
 	svc.downloadURL = "https://cdn.example.com/dm/sticker/" + uid + "/big.jpg"
 
-	origBytes := makeTestJPEG(t, 1024, 1024, 90)
-	body, contentType := newMultipartFile(t, "big.jpg", origBytes)
-
-	w := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(w)
-	c.Request, _ = http.NewRequest(http.MethodPost, "/v1/file/upload?type=sticker&path=/"+uid+"/big.jpg", body)
-	c.Request.Header.Set("Content-Type", contentType)
-	c.Set("uid", uid)
-	wkCtx := &wkhttp.Context{Context: c}
-
-	f.uploadFile(wkCtx)
+	w := uploadStickerForTest(t, f, uid, "big.jpg", makeTestJPEG(t, 1024, 1024, 90))
 
 	require.Equalf(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	dec, format, err := image.Decode(bytes.NewReader(svc.uploaded))
@@ -519,4 +510,109 @@ func TestUploadFile_CompressEnabled_DefaultCompressMaxDim_ShrinksOversizedTo512(
 	bounds := dec.Bounds()
 	assert.Equal(t, 512, bounds.Dx(), "default compress_max_dimension (512) must shrink an 800² source to 512")
 	assert.Equal(t, 512, bounds.Dy())
+}
+
+// ----- sticker-oversized-store-guard regression (review findings 1/2/5) -----
+//
+// 维度门为 jpg/png 放宽到 1024 的前提是压缩会把图缩到 upload_max_dimension 内。以下
+// 用例覆盖"压缩实际没缩到位"的各条 fail-open 路径：都必须 fail-closed 拒绝，绝不把
+// 超过 upload_max_dimension 的大图落库。
+
+// A) compressor==nil：整块跳过，源 1024² jpg 若不拦就会原样落库。
+func TestUploadFile_OversizedGuard_NilCompressorRejects(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const uid = "10000"
+	settings := defaultFakeStickerSettings()
+	settings.compressEnabled = true
+	settings.maxSizeKB = 5120
+	settings.maxDim = 512 // upload_max_dimension
+
+	svc := &capturingMockService{
+		mockService: mockService{downloadURL: "https://cdn.example.com/dm/sticker/" + uid + "/big.jpg"},
+	}
+	f := &File{
+		Log:      log.NewTLog("FileTest"),
+		service:  svc,
+		settings: settings,
+		// compressor 特意留 nil
+	}
+
+	w := uploadStickerForTest(t, f, uid, "big.jpg", makeTestJPEG(t, 1024, 1024, 90))
+
+	require.NotEqualf(t, http.StatusOK, w.Code, "nil compressor must not store an oversized image; body: %s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "512")
+	assert.Nil(t, svc.uploaded, "oversized image must not reach storage on the nil-compressor path")
+}
+
+// B) failed（decode/encode 出错，fail-open 走原字节）：注入必败 doCompress。
+func TestUploadFile_OversizedGuard_CompressFailedRejects(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const uid = "10000"
+	settings := defaultFakeStickerSettings()
+	settings.compressEnabled = true
+	settings.maxSizeKB = 5120
+	settings.maxDim = 512
+	settings.targetKB = 4096
+	settings.timeoutMs = 10_000
+
+	f, svc := newStickerCompressFile(t, settings)
+	f.compressor.doCompress = func(ext string, src []byte, maxDim, targetKB int) (stickerCompressResult, error) {
+		return stickerCompressResult{}, errors.New("injected decode failure")
+	}
+
+	w := uploadStickerForTest(t, f, uid, "big.jpg", makeTestJPEG(t, 1024, 1024, 90))
+
+	require.NotEqualf(t, http.StatusOK, w.Code, "compress-failed fail-open must not store an oversized image; body: %s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "512")
+	assert.Nil(t, svc.uploaded, "oversized image must not reach storage on the failed path")
+}
+
+// C) skipped:timeout（并发饱和/超时同类）：注入慢 doCompress + 极小 timeout。
+func TestUploadFile_OversizedGuard_CompressTimeoutRejects(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const uid = "10000"
+	settings := defaultFakeStickerSettings()
+	settings.compressEnabled = true
+	settings.maxSizeKB = 5120
+	settings.maxDim = 512
+	settings.targetKB = 4096
+	settings.timeoutMs = 5 // 极小超时，doCompress 必然抢占失败
+
+	f, svc := newStickerCompressFile(t, settings)
+	f.compressor.doCompress = func(ext string, src []byte, maxDim, targetKB int) (stickerCompressResult, error) {
+		time.Sleep(300 * time.Millisecond) // 远超 5ms timeout → Compress 返回 skipped:timeout
+		return stickerCompressResult{Outcome: stickerCompressOutcomeCompressed, Bytes: src, Size: int64(len(src)), OutMaxDim: 512}, nil
+	}
+
+	w := uploadStickerForTest(t, f, uid, "big.jpg", makeTestJPEG(t, 1024, 1024, 90))
+
+	require.NotEqualf(t, http.StatusOK, w.Code, "compress-timeout skip must not store an oversized image; body: %s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "512")
+	assert.Nil(t, svc.uploaded, "oversized image must not reach storage on the timeout-skip path")
+}
+
+// D) 配置陷阱：compress_max_dimension(1024) > upload_max_dimension(512)。1024² jpg
+// 压后仍 1024（Fit 目标 1024，不缩），guard 用压后实际尺寸 fail-closed 拒绝。
+func TestUploadFile_OversizedGuard_CompressMaxDimAboveUploadDimRejects(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const uid = "10000"
+	settings := defaultFakeStickerSettings()
+	settings.compressEnabled = true
+	settings.maxSizeKB = 5120
+	settings.maxDim = 512          // upload_max_dimension
+	settings.compressMaxDim = 1024 // 大于 upload_max_dimension 的错误配置
+	settings.targetKB = 4096
+	settings.timeoutMs = 10_000
+
+	f, svc := newStickerCompressFile(t, settings)
+
+	w := uploadStickerForTest(t, f, uid, "big.jpg", makeTestJPEG(t, 1024, 1024, 90))
+
+	require.NotEqualf(t, http.StatusOK, w.Code, "compressed-but-not-shrunk (target>upload_max) must be rejected; body: %s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "512")
+	assert.Nil(t, svc.uploaded, "image compressed but still above upload_max_dimension must not be stored")
 }
