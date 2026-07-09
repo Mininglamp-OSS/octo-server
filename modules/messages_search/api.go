@@ -54,11 +54,13 @@ type Handler struct {
 	// inject a stub so the thread coverage on the global feed is exercisable
 	// without a real MySQL connection.
 	//
-	// Returns (map[groupNo][]shortID, dbLimitHit, err). dbLimitHit=true means
-	// the DB 硬上限 LIMIT NonDeletedByGroupNosDBHardLimit was reached and the
-	// caller must WARN (tail groups may be partial or missing). See caller
-	// enumerateThreadsForGroups + RC 2 on PR #553.
-	threadEnumFn func(groupNos []string) (map[string][]string, bool, error)
+	// Returns (map[groupNo][]shortID, err). The DB layer now bounds every
+	// group to `NonDeletedByGroupNosPerGroupHardLimit` (=201) rows via a
+	// UNION ALL of per-group `LIMIT` subqueries, so a single runaway group
+	// can no longer starve other groups' thread coverage (RC 3 on PR #553).
+	// The 1-row overshoot lets the caller's `len(shortIDs) > maxThreadsPerGroup`
+	// cap branch still observe over-cap groups and WARN/downgrade them.
+	threadEnumFn func(groupNos []string) (map[string][]string, error)
 	// externalGroupFn is a test seam for the external-group lookup inside
 	// buildAllowlist. Nil in production (falls through to group.NewDB(h.ctx)
 	// .QueryExternalGroupNosForUser); tests inject a stub so buildAllowlist

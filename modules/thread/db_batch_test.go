@@ -22,9 +22,8 @@ import (
 //     are excluded** (the invariant that was violated before this fix).
 //  3. Un-requested groups don’t appear.
 //  4. Empty input short-circuits to an empty map with no SQL.
-//  5. Result rows are ORDER BY (group_no, short_id), so the DB-side
-//     LIMIT (NonDeletedByGroupNosDBHardLimit) truncates deterministically.
-//  6. `truncated` return is false when the returned rows are under the LIMIT.
+//  5. Each group’s shortIDs come back ordered by short_id — the ROW_NUMBER
+//     PARTITION cap is deterministic across runs.
 //
 // Integration test: requires a running MySQL (see main_test.go), same as
 // every other DB test in this package.
@@ -66,20 +65,17 @@ func TestQueryNonDeletedShortIDsByGroupNos(t *testing.T) {
 		require.NoError(t, db.Insert(m))
 	}
 
-	// (1) Empty input → empty map, no SQL error, truncated=false.
-	empty, truncated, err := db.QueryNonDeletedShortIDsByGroupNos(nil)
+	// (1) Empty input → empty map, no SQL error.
+	empty, err := db.QueryNonDeletedShortIDsByGroupNos(nil)
 	require.NoError(t, err)
 	assert.Empty(t, empty, "empty input must return empty map")
-	assert.False(t, truncated, "empty input must not set truncated")
 
 	// (2) grpA + grpB + grpDeletedOnly: archived rows surface; deleted rows
 	//     stay excluded; grpDeletedOnly is absent because all its rows are
 	//     deleted.
-	got, truncated, err := db.QueryNonDeletedShortIDsByGroupNos(
+	got, err := db.QueryNonDeletedShortIDsByGroupNos(
 		[]string{"grpA", "grpB", "grpDeletedOnly"})
 	require.NoError(t, err)
-	assert.False(t, truncated,
-		"small-fixture query must not report truncated (returned rows well under LIMIT)")
 
 	sort.Strings(got["grpA"])
 	assert.Equal(t, []string{"thr_a1", "thr_a2"}, got["grpA"],
@@ -101,32 +97,32 @@ func TestQueryNonDeletedShortIDsByGroupNos(t *testing.T) {
 	assert.False(t, hasC, "un-requested group must not leak into results")
 
 	// (4) A brand-new group with no rows in the table returns nothing.
-	unknown, truncated, err := db.QueryNonDeletedShortIDsByGroupNos([]string{"grpUnknown"})
+	unknown, err := db.QueryNonDeletedShortIDsByGroupNos([]string{"grpUnknown"})
 	require.NoError(t, err)
-	assert.False(t, truncated)
 	_, present := unknown["grpUnknown"]
 	assert.False(t, present, "group with no rows must not appear")
 }
 
-// TestQueryNonDeletedShortIDsByGroupNos_HardLimit — the DB-side LIMIT
-// (thread.NonDeletedByGroupNosDBHardLimit) exists to keep a pathological
-// membership footprint from dragging tens of thousands of rows into
-// memory. Single-group seed above the LIMIT: assert (a) returned row
-// count == LIMIT, (b) `truncated` sentinel fires so the caller can WARN.
-func TestQueryNonDeletedShortIDsByGroupNos_HardLimit(t *testing.T) {
+// TestQueryNonDeletedShortIDsByGroupNos_PerGroupCap — RC 3 on PR #553.
+// The DB-side per-group cap (thread.NonDeletedByGroupNosPerGroupHardLimit
+// = 201, enforced via UNION ALL of per-group `LIMIT` subqueries) exists so
+// a runaway group cannot dump tens of thousands of rows into memory. Seed
+// a single group above that cap and assert exactly `PerGroupHardLimit`
+// rows come back for it.
+func TestQueryNonDeletedShortIDsByGroupNos_PerGroupCap(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping hard-limit seed test in -short mode")
+		t.Skip("skipping per-group-cap seed test in -short mode")
 	}
 	_, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	db := NewDB(ctx)
 
-	// Seed just above the DB hard limit so LIMIT kicks in.
-	total := NonDeletedByGroupNosDBHardLimit + 50
+	// Seed just above the per-group cap so the PARTITION LIMIT kicks in.
+	total := NonDeletedByGroupNosPerGroupHardLimit + 50
 	groupNo := "grpHuge"
 	for i := 0; i < total; i++ {
 		m := &Model{
-			ShortID:    "thr_" + itoa(i),
+			ShortID:    "thr_" + zeroPad(i, 6),
 			GroupNo:    groupNo,
 			Name:       "t",
 			CreatorUID: testutil.UID,
@@ -136,52 +132,67 @@ func TestQueryNonDeletedShortIDsByGroupNos_HardLimit(t *testing.T) {
 		require.NoError(t, db.Insert(m))
 	}
 
-	got, truncated, err := db.QueryNonDeletedShortIDsByGroupNos([]string{groupNo})
+	got, err := db.QueryNonDeletedShortIDsByGroupNos([]string{groupNo})
 	require.NoError(t, err)
 	rows := got[groupNo]
-	assert.Equal(t, NonDeletedByGroupNosDBHardLimit, len(rows),
-		"seed guarantees exactly LIMIT rows come back")
-	assert.True(t, truncated,
-		"len(rows)==LIMIT must set truncated=true so callers can WARN (RC 2 on PR #553)")
+	assert.Equal(t, NonDeletedByGroupNosPerGroupHardLimit, len(rows),
+		"per-group PARTITION cap must bound the row count for a single fat group")
 }
 
-// TestQueryNonDeletedShortIDsByGroupNos_HardLimit_MultiGroupTailDrop — RC 2
-// on PR #553. The failure mode the outside reviewers built against:
+// TestQueryNonDeletedShortIDsByGroupNos_FatGroupDoesNotStarveOthers —
+// **the RC 3 P1 regression test** for PR #553.
 //
-//   - When the sum of non-deleted rows across N groups exceeds the DB LIMIT,
-//     the `ORDER BY group_no, short_id LIMIT` cut lands mid-stream. Tail
-//     groups (highest `group_no`) may end up partial or entirely missing.
-//   - The caller's per-group (>200) / aggregate-total (>2000) downgrade
-//     branches only trigger on too-MANY rows, so tail zero/partial rows
-//     were silently dropped in the previous revision with NO WARN.
+// Previous revision used one global `ORDER BY group_no, short_id LIMIT 2500`.
+// A group sorting early with >= 2500 non-deleted threads would consume the
+// entire LIMIT budget, and every other group would return zero rows. The
+// caller's `continue` on the fat group's per-group cap (>200 rows) then
+// combined with the empty tail to zero out thread coverage for the WHOLE
+// request — not just the fat group. yujiawei’s RC 3 (2026-07-09) called this
+// as blocking and correctly.
 //
-// This test seeds many groups whose combined rows cross the LIMIT and
-// asserts:
-//   - truncated=true is returned so the caller has a signal to WARN on;
-//   - total returned rows == LIMIT (deterministic cut);
-//   - the head groups (lowest `group_no`) are complete;
-//   - the tail groups (highest `group_no`) after the cut point receive zero
-//     rows — exactly the "silently missing" symptom the WARN now covers.
-func TestQueryNonDeletedShortIDsByGroupNos_HardLimit_MultiGroupTailDrop(t *testing.T) {
+// The fix bounds each group at the SQL layer via ROW_NUMBER() OVER
+// (PARTITION BY group_no) so no single group can starve another. This
+// integration test locks that in: seed a group whose non-deleted thread
+// count would eat the OLD global LIMIT on its own, plus several normal
+// groups sorted AFTER it (higher group_no). Assert:
+//   - fat group returns exactly `PerGroupHardLimit` rows (its own cap);
+//   - every normal group returns its full row set (they are NOT starved).
+func TestQueryNonDeletedShortIDsByGroupNos_FatGroupDoesNotStarveOthers(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping hard-limit multi-group seed test in -short mode")
+		t.Skip("skipping fat-group-starvation seed test in -short mode")
 	}
 	_, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	db := NewDB(ctx)
 
-	// Design: N groups × K threads each, N*K just above LIMIT. Group
-	// naming is zero-padded so ORDER BY group_no is deterministic and
-	// intuitive ("grp_000" < "grp_001" < ... < "grp_009").
+	// The fat group's threads must (a) exceed the per-group PARTITION cap
+	// so it demonstrably takes its share, AND (b) exceed the size of the
+	// old global LIMIT (2500) so this test would fail against the previous
+	// implementation (this is the actual regression bar we are locking in).
 	const (
-		K = 300 // threads per group — well over caller's per-group cap 200
+		fatThreadCount     = 3000 // > old global LIMIT (2500) and > per-group cap (201)
+		normalGroupCount   = 5
+		normalThreadsEach  = 20
+		fatGroupPrefix     = "grp_aaa" // sorts BEFORE the normal groups by group_no
+		normalGroupPrefix  = "grp_bbb_"
 	)
-	N := (NonDeletedByGroupNosDBHardLimit / K) + 2 // guarantees N*K > LIMIT
-	groupNos := make([]string, 0, N)
-	for gi := 0; gi < N; gi++ {
-		gn := "grp_" + zeroPad(gi, 3)
-		groupNos = append(groupNos, gn)
-		for si := 0; si < K; si++ {
+	fatGroup := fatGroupPrefix
+	for i := 0; i < fatThreadCount; i++ {
+		m := &Model{
+			ShortID:    fatGroup + "_thr_" + zeroPad(i, 6),
+			GroupNo:    fatGroup,
+			Name:       "t",
+			CreatorUID: testutil.UID,
+			Status:     ThreadStatusActive,
+			Version:    1,
+		}
+		require.NoError(t, db.Insert(m))
+	}
+	normalGroups := make([]string, 0, normalGroupCount)
+	for gi := 0; gi < normalGroupCount; gi++ {
+		gn := normalGroupPrefix + zeroPad(gi, 3)
+		normalGroups = append(normalGroups, gn)
+		for si := 0; si < normalThreadsEach; si++ {
 			m := &Model{
 				ShortID:    gn + "_thr_" + zeroPad(si, 4),
 				GroupNo:    gn,
@@ -194,52 +205,26 @@ func TestQueryNonDeletedShortIDsByGroupNos_HardLimit_MultiGroupTailDrop(t *testi
 		}
 	}
 
-	got, truncated, err := db.QueryNonDeletedShortIDsByGroupNos(groupNos)
+	groupNos := append([]string{fatGroup}, normalGroups...)
+	got, err := db.QueryNonDeletedShortIDsByGroupNos(groupNos)
 	require.NoError(t, err)
-	assert.True(t, truncated,
-		"multi-group query crossing the LIMIT must report truncated=true")
 
-	// Total rows returned must equal the DB LIMIT.
-	totalReturned := 0
-	for _, ids := range got {
-		totalReturned += len(ids)
-	}
-	assert.Equal(t, NonDeletedByGroupNosDBHardLimit, totalReturned,
-		"LIMIT %d must cap the aggregate row count", NonDeletedByGroupNosDBHardLimit)
+	// Fat group: exactly PerGroupHardLimit rows — its own per-group cap.
+	assert.Equal(t, NonDeletedByGroupNosPerGroupHardLimit, len(got[fatGroup]),
+		"fat group must be bounded by per-group cap (%d), not starve the query",
+		NonDeletedByGroupNosPerGroupHardLimit)
 
-	// The cut point: how many complete head groups fit under the LIMIT +
-	// (optional) one partial group. All tail groups beyond that must
-	// return zero rows.
-	fullHeadCount := NonDeletedByGroupNosDBHardLimit / K
-	partialAt := fullHeadCount // may or may not exist (0..K-1 leftover rows)
-	leftover := NonDeletedByGroupNosDBHardLimit - fullHeadCount*K
-
-	// Head: exactly K rows each.
-	for i := 0; i < fullHeadCount; i++ {
-		gn := groupNos[i]
-		assert.Equal(t, K, len(got[gn]),
-			"head group %q must be complete", gn)
-	}
-	// Partial: leftover rows. Its shortIDs must all start with that group's prefix.
-	if leftover > 0 && partialAt < N {
-		gn := groupNos[partialAt]
-		assert.Equal(t, leftover, len(got[gn]),
-			"boundary group %q must have exactly leftover rows", gn)
+	// Every normal group: its FULL row set, unstarved. Under the pre-fix
+	// implementation these would all be empty (or the whole map would miss
+	// them), which is precisely the P1 blocker this test locks against.
+	for _, gn := range normalGroups {
+		assert.Equal(t, normalThreadsEach, len(got[gn]),
+			"normal group %q must NOT be starved by fat group; got %d rows, want %d",
+			gn, len(got[gn]), normalThreadsEach)
 		for _, sid := range got[gn] {
 			assert.True(t, strings.HasPrefix(sid, gn+"_thr_"),
-				"boundary group rows must belong to that group; got %q under %q", sid, gn)
+				"normal group %q must only contain its own shortIDs; leaked %q", gn, sid)
 		}
-	}
-	// Tail: must be silently absent (zero rows returned for these groups).
-	// This is the exact symptom the truncated=true signal exists to cover.
-	tailStart := partialAt
-	if leftover > 0 {
-		tailStart = partialAt + 1
-	}
-	for i := tailStart; i < N; i++ {
-		gn := groupNos[i]
-		assert.Empty(t, got[gn],
-			"tail group %q past the LIMIT must be silently absent (that's what truncated=true warns about)", gn)
 	}
 }
 
