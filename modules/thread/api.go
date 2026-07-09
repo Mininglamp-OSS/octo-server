@@ -16,6 +16,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n/codes"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
 )
 
@@ -229,6 +230,7 @@ func (t *Thread) createThread(c *wkhttp.Context) {
 
 	resp, err := t.service.CreateThread(&CreateThreadReq{
 		GroupNo:              groupNo,
+		SpaceID:              spacepkg.GetSpaceID(c),
 		Name:                 req.Name,
 		CreatorUID:           loginUID,
 		CreatorName:          loginName,

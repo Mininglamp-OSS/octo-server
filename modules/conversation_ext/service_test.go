@@ -815,6 +815,81 @@ func TestService_FollowThread_ParentGroupNotPreviouslyUnfollowed_StillCreatesThr
 }
 
 // ---------------------------------------------------------------------------
+// FollowThreadForCreator — issue #557
+// ---------------------------------------------------------------------------
+
+// 创建者建子区后必须能在关注 tab 看到该子区：写 thread ext 行。
+func TestService_FollowThreadForCreator_CreatesThreadRow(t *testing.T) {
+	svc := newServiceForTest(t)
+	const uid, space, grp = "u1", "s1", "557-1"
+	threadChannelID := grp + threadSeparator + "thr-1"
+
+	require.NoError(t, svc.FollowThreadForCreator(uid, space, threadChannelID))
+
+	threadRow, err := svc.db.Get(uid, space, targetTypeThread, threadChannelID)
+	require.NoError(t, err)
+	assert.NotNil(t, threadRow, "创建者的 thread ext 行应被写入")
+}
+
+// 关键回归守卫（issue #557 / 前一版 web PR P1 被拒的原因）：
+// 若创建者此前显式取关了父群（group_unfollowed=1），建子区绝不能把它清回 0。
+// FollowThreadForCreator 只写 thread ext 行，父群 follow 状态必须原样保留。
+func TestService_FollowThreadForCreator_DoesNotClearParentUnfollowed(t *testing.T) {
+	svc := newServiceForTest(t)
+	const uid, space, grp = "u1", "s1", "557-2"
+	threadChannelID := grp + threadSeparator + "thr-2"
+
+	// 前置：创建者显式取关父群 → group_unfollowed=1。
+	require.NoError(t, svc.UnfollowChannel(uid, space, grp))
+	m, err := svc.db.Get(uid, space, targetTypeGroup, grp)
+	require.NoError(t, err)
+	require.NotNil(t, m)
+	require.Equal(t, int8(1), m.GroupUnfollowed)
+
+	require.NoError(t, svc.FollowThreadForCreator(uid, space, threadChannelID))
+
+	// 父群 group_unfollowed 必须仍为 1（未被 re-follow）。
+	parentRow, err := svc.db.Get(uid, space, targetTypeGroup, grp)
+	require.NoError(t, err)
+	require.NotNil(t, parentRow)
+	assert.Equal(t, int8(1), parentRow.GroupUnfollowed,
+		"FollowThreadForCreator 绝不能清父群 group_unfollowed（不得因建子区 re-follow 显式取关的父 channel）")
+
+	// thread ext 行仍应写入。
+	threadRow, err := svc.db.Get(uid, space, targetTypeThread, threadChannelID)
+	require.NoError(t, err)
+	assert.NotNil(t, threadRow, "创建者的 thread ext 行应被写入")
+}
+
+// 幂等：重复调用不报错，且不产生重复行 / 状态漂移。
+func TestService_FollowThreadForCreator_Idempotent(t *testing.T) {
+	svc := newServiceForTest(t)
+	const uid, space, grp = "u1", "s1", "557-3"
+	threadChannelID := grp + threadSeparator + "thr-3"
+
+	require.NoError(t, svc.FollowThreadForCreator(uid, space, threadChannelID))
+	require.NoError(t, svc.FollowThreadForCreator(uid, space, threadChannelID))
+
+	threadRow, err := svc.db.Get(uid, space, targetTypeThread, threadChannelID)
+	require.NoError(t, err)
+	assert.NotNil(t, threadRow)
+}
+
+// 输入校验对齐 FollowThread。
+func TestService_FollowThreadForCreator_EmptyUID(t *testing.T) {
+	svc := newServiceForTest(t)
+	err := svc.FollowThreadForCreator("", "s1", "grp-1____thr-1")
+	require.Error(t, err)
+}
+
+func TestService_FollowThreadForCreator_InvalidChannelID(t *testing.T) {
+	svc := newServiceForTest(t)
+	err := svc.FollowThreadForCreator("u1", "s1", "invalid-no-separator")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "thread_channel_id")
+}
+
+// ---------------------------------------------------------------------------
 // UnfollowThread happy path
 // ---------------------------------------------------------------------------
 

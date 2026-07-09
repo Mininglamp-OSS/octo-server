@@ -977,6 +977,36 @@ func (s *Service) FollowThread(uid, spaceID, threadChannelID string) error {
 	})
 }
 
+// FollowThreadForCreator writes the creator's own thread ext row when a thread
+// is created, so the creator always sees their new thread in the follow tab —
+// regardless of whether they follow the parent channel.
+//
+// Unlike FollowThread, it deliberately does NOT clear the parent group's
+// group_unfollowed flag: creating a thread must never silently re-follow a
+// parent channel the user explicitly unfollowed (issue #557 / prior web-PR P1).
+// It only upserts the thread ext row. Idempotent (INSERT ... on the same key is
+// a no-op via upsertTx). No thread auth check: the creator is inherently
+// authorized for the thread they just created.
+func (s *Service) FollowThreadForCreator(uid, spaceID, threadChannelID string) error {
+	if err := validateBase(uid, spaceID); err != nil {
+		return err
+	}
+	if _, _, err := parseThreadChannelID(threadChannelID); err != nil {
+		return err
+	}
+	return s.withTx("FollowThreadForCreator", func(tx *dbr.Tx) error {
+		// bump version before ext write, same lock order as FollowThread/UpdateSort.
+		if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
+			return fmt.Errorf("FollowThreadForCreator bump version: %w", err)
+		}
+		// Upsert ONLY the thread ext row. Do NOT touch the parent group flag.
+		if err := upsertTx(tx, uid, spaceID, targetTypeThread, threadChannelID, ConvExtFields{}); err != nil {
+			return fmt.Errorf("FollowThreadForCreator upsert thread: %w", err)
+		}
+		return nil
+	})
+}
+
 // ---------------------------------------------------------------------------
 // UnfollowThread — delete thread ext row only
 // ---------------------------------------------------------------------------

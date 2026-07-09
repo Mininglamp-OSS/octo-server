@@ -106,6 +106,7 @@ func NewService(ctx *config.Context) IService {
 // CreateThreadReq 创建子区请求
 type CreateThreadReq struct {
 	GroupNo              string
+	SpaceID              string // 创建者所在 space，用于给创建者写 thread ext 行（关注 tab）
 	Name                 string
 	CreatorUID           string
 	CreatorName          string
@@ -307,6 +308,21 @@ func (s *Service) CreateThread(req *CreateThreadReq) (*ThreadResp, error) {
 				zap.String("groupNo", req.GroupNo),
 				zap.String("shortID", shortID),
 				zap.Error(err))
+		}
+	}
+
+	// 创建者本人始终应在关注 tab 看到刚建的子区，与是否关注父 channel 无关。
+	// OnThreadCreated 只 fanout 给"已对父 channel 开启 auto_follow_threads=1"的用户，
+	// 如果创建者没关注父 channel 就会漏看自己新建的子区（issue #557）。这里单独给
+	// 创建者补一行 thread ext。关键约束：FollowThreadForCreator 不会清父群 group_unfollowed，
+	// 绝不因建子区而 re-follow 用户显式取关过的父 channel（沿用 OnThreadCreated 同序）。
+	// 同样 best-effort：失败只警告，不回滚（下次 FollowChannel / refollow 会补齐）。
+	if convSvc := conversation_ext.GetGlobalConvExtService(); convSvc != nil && req.SpaceID != "" {
+		threadChannelID := BuildChannelID(req.GroupNo, shortID)
+		if err := convSvc.FollowThreadForCreator(req.CreatorUID, req.SpaceID, threadChannelID); err != nil {
+			s.Warn("FollowThreadForCreator 失败（thread 已创建，创建者可下次 refollow 补齐）",
+				zap.String("groupNo", req.GroupNo), zap.String("shortID", shortID),
+				zap.String("creatorUID", req.CreatorUID), zap.Error(err))
 		}
 	}
 
