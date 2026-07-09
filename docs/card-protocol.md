@@ -38,10 +38,10 @@
 
 | 类别 | 允许 |
 |---|---|
-| 元素 | `TextBlock`（markdown 子集，§2.1）、`Image`、`Container`、`ColumnSet`/`Column`、`FactSet` |
+| 元素 | `TextBlock`（markdown 子集，§2.1）、`RichTextBlock`、`Image`、`ImageSet`、`Container`、`ColumnSet`/`Column`、`FactSet`、`Table`、`ActionSet`（`RichTextBlock`/`ImageSet`/`Table`/`ActionSet` 为 P3-3 Tier 1 追加，均 AC ≤1.5：ImageSet 1.0 / RichTextBlock 1.2 / ActionSet 1.2 / Table 1.5） |
 | 动作 | `Action.OpenUrl`；元素/整卡 `selectAction` **仅当**携带 `Action.OpenUrl` |
-| P2 起（octo/v2） | `Action.Submit`（含 selectAction 携带）、`Input.Text` / `Input.Toggle` / `Input.ChoiceSet` / `Input.Number` / `Input.Date` / `Input.Time`（id 必填且帧内唯一；后三者 P3-3 追加，均 AC 1.0、仍在 `card_version:"1.5"` 内，为白名单增量而非版本升级） |
-| 永不（P3 再议） | `Action.Execute`、`Action.ShowCard`、`ToggleVisibility`、模板/数据绑定、`Table` 等 AC 1.6 元素 |
+| P2 起（octo/v2） | `Action.Submit`（含 selectAction/ActionSet 携带）、`Input.Text` / `Input.Toggle` / `Input.ChoiceSet` / `Input.Number` / `Input.Date` / `Input.Time`（id 必填且帧内唯一；后三者 P3-3 追加，均 AC 1.0、仍在 `card_version:"1.5"` 内，为白名单增量而非版本升级） |
+| 暂不支持（后续按需） | `Media`(1.1)、`Action.ShowCard`(1.0)、`Action.ToggleVisibility`(1.2)、`Action.Execute`(1.4)、模板/数据绑定，以及 AC 1.6 元素 |
 
 结构与大小上限（全部 ingress 一致）：
 
@@ -110,10 +110,11 @@ allowlist —— 服务端用**完整 CommonMark 解析器**（非模式匹配�
 按文档序遍历 `card.body`：
 
 - `TextBlock` → 剥离 markdown 后的文本；
+- `RichTextBlock` → 拼接 `inlines[]` 的文本（字符串 run + `TextRun.text`；TextRun 非 markdown，不剥离）；
 - `FactSet` → 逐条 `"title: value"` 行；
-- `Image` → `[图片]`；
-- 容器类（`Container`/`ColumnSet`/`Column`）→ 递归；
-- 动作（按钮）**不参与**（按钮是操作面不是内容）。
+- `Image` → `[图片]`；`ImageSet` → 每张图一个 `[图片]`；
+- 容器类（`Container`/`ColumnSet`/`Column`、`Table` 的 `rows→cells→items`）→ 递归；
+- 动作（按钮，含 `ActionSet`）**不参与**（按钮是操作面不是内容）。
 
 段落以换行拼接；结果为空 → `[卡片]` 兜底。**客户端提交的 `plain` 值一律被
 覆盖**。incoming webhook 的 `text` 字段是**兜底种子**：仅当派生结果为空时

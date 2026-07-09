@@ -56,21 +56,37 @@ func TestInputElementsAuthority(t *testing.T) {
 // 元素」必须同时给校验器加 case 并补 fixture 证明它真被接受，而非只往清单加一行（否则 D12
 // 清单会广播一个校验器拒绝的元素 = 谎报能力）。
 func TestDisplayElementsAuthority(t *testing.T) {
-	want := []string{"TextBlock", "Image", "Container", "ColumnSet", "Column", "FactSet"}
+	want := []string{
+		"TextBlock", "RichTextBlock", "Image", "ImageSet",
+		"Container", "ColumnSet", "Column", "FactSet",
+		"Table", "ActionSet",
+	}
 	got := DisplayElements()
 	if !equalStrs(got, want) {
 		t.Fatalf("DisplayElements()=%v, want %v", got, want)
 	}
 	// 每个展示元素 → 一份放在合法位置的最小卡片（Column 只能在 ColumnSet 内，故包一层）。
 	fixtures := map[string]map[string]interface{}{
-		"TextBlock": cardWithBody(map[string]interface{}{"type": "TextBlock", "text": "x"}),
-		"Image":     cardWithBody(map[string]interface{}{"type": "Image", "url": "https://example.com/i.png"}),
+		"TextBlock":     cardWithBody(map[string]interface{}{"type": "TextBlock", "text": "x"}),
+		"RichTextBlock": cardWithBody(map[string]interface{}{"type": "RichTextBlock", "inlines": []interface{}{"x"}}),
+		"Image":         cardWithBody(map[string]interface{}{"type": "Image", "url": "https://example.com/i.png"}),
+		"ImageSet": cardWithBody(map[string]interface{}{"type": "ImageSet", "images": []interface{}{
+			map[string]interface{}{"type": "Image", "url": "https://example.com/i.png"},
+		}}),
 		"Container": cardWithBody(map[string]interface{}{"type": "Container", "items": []interface{}{}}),
 		"ColumnSet": cardWithBody(map[string]interface{}{"type": "ColumnSet", "columns": []interface{}{}}),
 		"Column": cardWithBody(map[string]interface{}{"type": "ColumnSet", "columns": []interface{}{
 			map[string]interface{}{"type": "Column", "items": []interface{}{}},
 		}}),
 		"FactSet": cardWithBody(map[string]interface{}{"type": "FactSet", "facts": []interface{}{}}),
+		"Table": cardWithBody(map[string]interface{}{"type": "Table", "rows": []interface{}{
+			map[string]interface{}{"type": "TableRow", "cells": []interface{}{
+				map[string]interface{}{"type": "TableCell", "items": []interface{}{}},
+			}},
+		}}),
+		"ActionSet": cardWithBody(map[string]interface{}{"type": "ActionSet", "actions": []interface{}{
+			map[string]interface{}{"type": "Action.OpenUrl", "url": "https://example.com"},
+		}}),
 	}
 	for _, typ := range got {
 		card, ok := fixtures[typ]

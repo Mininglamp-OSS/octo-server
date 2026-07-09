@@ -19,7 +19,9 @@ package cardmsg
 // 二者都是 additive-only（同 event_data / D12 wire 演进规则）：只增不改名/删除。
 
 var displayElements = []string{
-	"TextBlock", "Image", "Container", "ColumnSet", "Column", "FactSet",
+	"TextBlock", "RichTextBlock", "Image", "ImageSet",
+	"Container", "ColumnSet", "Column", "FactSet",
+	"Table", "ActionSet",
 }
 
 var inputElements = []string{

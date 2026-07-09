@@ -76,9 +76,10 @@ func findSubmitInElements(items []interface{}, actionID string) (map[string]inte
 				return d, true
 			}
 		}
-		// items/columns 仅对容器类递归，与 Validate 完全一致（发送期只有 Container 递归
-		// items、ColumnSet 递归 columns→Column.items）——否则藏在叶子 items[] 下的
-		// Submit 会「派发可解析、发送期没校验」（PR#548 review：派发面必须 ≤ 校验面）。
+		// 容器/动作面递归，与 Validate 完全一致（发送期递归的位置：Container.items、
+		// ColumnSet→Column.items、以及 P3-3 Tier 1 的 Table→cells.items、ActionSet.actions、
+		// ImageSet.images[].selectAction、RichTextBlock.inlines[].selectAction）——否则藏在
+		// 未遍历位置的 Submit 会「派发可解析、发送期没校验」，或反之成为死按钮（派发面 == 校验面）。
 		switch t {
 		case "Container":
 			if sub, ok := el["items"].([]interface{}); ok {
@@ -99,6 +100,63 @@ func findSubmitInElements(items []interface{}, actionID string) (map[string]inte
 					if sub, ok := col["items"].([]interface{}); ok {
 						if d, ok := findSubmitInElements(sub, actionID); ok {
 							return d, true
+						}
+					}
+				}
+			}
+		case "ActionSet":
+			// P3-3 Tier 1：Submit 可出现在 body 的 ActionSet.actions（发送期 element() 走
+			// w.action 校验），派发侧对齐遍历。
+			if d, ok := findSubmitAction(el["actions"], actionID); ok {
+				return d, true
+			}
+		case "ImageSet":
+			// ImageSet.images[].selectAction 可载 Submit（发送期 imageChild 校验），对齐。
+			if imgs, ok := el["images"].([]interface{}); ok {
+				for _, it := range imgs {
+					if img, ok := it.(map[string]interface{}); ok {
+						if d, ok := findSubmitAction(img["selectAction"], actionID); ok {
+							return d, true
+						}
+					}
+				}
+			}
+		case "RichTextBlock":
+			// RichTextBlock.inlines[] 里的 TextRun.selectAction 可载 Submit（发送期校验），对齐。
+			if inls, ok := el["inlines"].([]interface{}); ok {
+				for _, it := range inls {
+					if inl, ok := it.(map[string]interface{}); ok {
+						if d, ok := findSubmitAction(inl["selectAction"], actionID); ok {
+							return d, true
+						}
+					}
+				}
+			}
+		case "Table":
+			// Table rows→cells：单元格 selectAction + 递归 cell.items（与发送期 Table 校验
+			// 完全一致，派发面 == 校验面）。
+			if rows, ok := el["rows"].([]interface{}); ok {
+				for _, r := range rows {
+					row, ok := r.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					cells, ok := row["cells"].([]interface{})
+					if !ok {
+						continue
+					}
+					for _, c := range cells {
+						cell, ok := c.(map[string]interface{})
+						if !ok {
+							continue
+						}
+						if d, ok := findSubmitAction(cell["selectAction"], actionID); ok {
+							return d, true
+						}
+						if sub, ok := cell["items"].([]interface{}); ok {
+							if d, ok := findSubmitInElements(sub, actionID); ok {
+								return d, true
+							}
 						}
 					}
 				}

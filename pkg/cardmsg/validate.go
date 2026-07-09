@@ -259,8 +259,118 @@ func (w *walker) element(el map[string]interface{}, depth int) error {
 				}
 			}
 		}
+	case "ImageSet":
+		// AC 1.0：一组 Image。images[] 每项是 Image 对象，逐个走与顶层 "Image" 同款纪律
+		// （url 必填 + 正向 allowlist；backgroundImage/selectAction 等 URL/动作面同校验）。
+		if imgs, present := el["images"]; present {
+			list, ok := imgs.([]interface{})
+			if !ok {
+				return fmt.Errorf("%w: ImageSet.images 必须是数组", ErrCardBadShape)
+			}
+			for _, it := range list {
+				img, ok := it.(map[string]interface{})
+				if !ok {
+					return fmt.Errorf("%w: ImageSet.images 元素必须是对象", ErrCardBadShape)
+				}
+				if err := w.imageChild(img, depth+1); err != nil {
+					return err
+				}
+			}
+		}
+	case "RichTextBlock":
+		// AC 1.2：inlines[] 是字符串或 TextRun 对象。TextRun 不渲染 markdown（AC 语义，
+		// 故 text 无 markdown URL 面），但可携带 selectAction —— 那是动作/URL 面，逐个走
+		// allowlist（校验面 ≥ 派发面；element() 顶部只校验 RichTextBlock 自身的 selectAction）。
+		if inlines, present := el["inlines"]; present {
+			list, ok := inlines.([]interface{})
+			if !ok {
+				return fmt.Errorf("%w: RichTextBlock.inlines 必须是数组", ErrCardBadShape)
+			}
+			for _, it := range list {
+				switch inl := it.(type) {
+				case string:
+					// 纯文本 run，无 URL/动作面。
+				case map[string]interface{}:
+					if err := w.bump(depth + 1); err != nil {
+						return err
+					}
+					if err := w.selectAction(inl); err != nil {
+						return err
+					}
+				default:
+					return fmt.Errorf("%w: RichTextBlock.inlines 元素必须是字符串或对象", ErrCardBadShape)
+				}
+			}
+		}
+	case "Table":
+		// AC 1.5：rows[] → TableRow.cells[] → TableCell.items[]（递归标准元素）。行/单元格
+		// 计入节点预算；行/单元格的 backgroundImage、单元格的 selectAction 都是 URL/动作面。
+		if rows, present := el["rows"]; present {
+			list, ok := rows.([]interface{})
+			if !ok {
+				return fmt.Errorf("%w: Table.rows 必须是数组", ErrCardBadShape)
+			}
+			for _, r := range list {
+				row, ok := r.(map[string]interface{})
+				if !ok {
+					return fmt.Errorf("%w: TableRow 必须是对象", ErrCardBadShape)
+				}
+				if err := w.bump(depth + 1); err != nil {
+					return err
+				}
+				if err := checkNodeURLs(row); err != nil {
+					return err
+				}
+				cells, present := row["cells"]
+				if !present {
+					continue
+				}
+				clist, ok := cells.([]interface{})
+				if !ok {
+					return fmt.Errorf("%w: TableRow.cells 必须是数组", ErrCardBadShape)
+				}
+				for _, c := range clist {
+					cell, ok := c.(map[string]interface{})
+					if !ok {
+						return fmt.Errorf("%w: TableCell 必须是对象", ErrCardBadShape)
+					}
+					if err := w.bump(depth + 2); err != nil {
+						return err
+					}
+					if err := checkNodeURLs(cell); err != nil {
+						return err
+					}
+					if err := w.selectAction(cell); err != nil {
+						return err
+					}
+					if items, present := cell["items"]; present {
+						ilist, ok := items.([]interface{})
+						if !ok {
+							return fmt.Errorf("%w: TableCell.items 必须是数组", ErrCardBadShape)
+						}
+						if err := w.elements(ilist, depth+3); err != nil {
+							return err
+						}
+					}
+				}
+			}
+		}
+	case "ActionSet":
+		// AC 1.2：body 内的动作组。actions[] 每项走同一动作 allowlist（Action.OpenUrl；
+		// Action.Submit 仍受 octo/v2 门控）。Submit 由此可出现在 body（非仅 card.actions /
+		// selectAction），派发侧 findSubmitInElements 已对齐遍历 ActionSet.actions。
+		if acts, present := el["actions"]; present {
+			list, ok := acts.([]interface{})
+			if !ok {
+				return fmt.Errorf("%w: ActionSet.actions 必须是数组", ErrCardBadShape)
+			}
+			for _, a := range list {
+				if err := w.action(a); err != nil {
+					return err
+				}
+			}
+		}
 	default:
-		// octo/v2 交互输入（Input.*）。白名单单一权威 = inputElements（whitelist.go）——
 		// 校验器不枚举字面量，新增输入元素只改 inputElements 一处，发送期放行 / inputs 采集
 		// / D12 清单三方自动同步（D12.2 反漂移）。非输入类型即未知元素。
 		// 六个输入元素共享发送期纪律：id 必填且帧内唯一、label/errorMessage 的 markdown URL
@@ -314,6 +424,27 @@ func (w *walker) element(el map[string]interface{}, depth int) error {
 		}
 	}
 	return nil
+}
+
+// imageChild 校验 ImageSet 内的单个 Image。ImageSet.images 不经 element() 分派（其项
+// 常省略 type），故这里补齐顶层 "Image" case 依赖 element() 提供的公共校验：节点预算、
+// backgroundImage 等 URL 面（checkNodeURLs）、selectAction，再加 Image 自身的 url 必填 +
+// 正向 allowlist。
+func (w *walker) imageChild(img map[string]interface{}, depth int) error {
+	if err := w.bump(depth); err != nil {
+		return err
+	}
+	if err := checkNodeURLs(img); err != nil {
+		return err
+	}
+	if err := w.selectAction(img); err != nil {
+		return err
+	}
+	u, _ := img["url"].(string)
+	if u == "" {
+		return fmt.Errorf("%w: ImageSet.images[].url 必填", ErrCardBadShape)
+	}
+	return checkURL(u)
 }
 
 // column 校验 ColumnSet 中的单列。AC 允许 Column 省略 type 字段；显式给出时必须

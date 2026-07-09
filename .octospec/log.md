@@ -24,6 +24,17 @@ change-log convention (§7). Newest first.
   + journal under `.octospec/tasks/card-message-p3-rich-inputs/` and
   `.octospec/journal/shared/card-message-p3-rich-inputs.md`; learning candidate
   in `.octospec/learnings/pending/`.
+- **Change** — Same task/PR, follow-on: **AC 1.5 display-element completion (Tier 1)** —
+  added `ImageSet`(1.0) / `RichTextBlock`(1.2) / `Table`(1.5) / `ActionSet`(1.2) to the
+  octo/v2 display whitelist (versions verified against adaptivecards.io). Each covers
+  send-time validation (structure + URL allowlist + recursion budget), dispatch symmetry
+  (`findSubmitInElements` walks ActionSet.actions / Table cells / ImageSet images /
+  RichTextBlock inlines for Submit — no dead buttons), plain derivation, and D12 manifest
+  `elements` (auto via the displayElements single authority). Corrected the pre-existing
+  `TestValidateWhitelistRejections` which mislabeled Table as "AC 1.6, reject" (Table is
+  1.5, now supported) → replaced with still-unsupported Media(1.1)/ToggleVisibility(1.2).
+  Still out (later, on demand): Media, Action.ShowCard/ToggleVisibility/Execute, templating,
+  AC 1.6.
 
 ## 2026-07-08 (PR-D)
 

@@ -121,3 +121,18 @@ source: self
    `YYYY-MM-DD` / `HH:MM`),区间交 bot 业务逻辑。
 2. **`docs/card-protocol.md` 镜像修订**是否需 maintainer sign-off——roadmap 未把 P3-3 标为
    需 sign-off（区别于 P3-1），倾向按「additive、随代码同 PR 改文档」处理。
+
+## Tier 1 追加（同 PR，PR#556 讨论后加入）
+
+在同一 PR 内把 octo/v2 **展示元素**白名单补齐到 AC ≤1.5，新增 4 个展示元素（实测 adaptivecards.io
+版本）：`ImageSet`(1.0) / `RichTextBlock`(1.2) / `Table`(1.5) / `ActionSet`(1.2)。纯展示类，octo/v1+v2
+均放行；`ActionSet` 内的 `Action.Submit` 仍受 octo/v2 门控。每个元素覆盖：发送期校验（结构 +
+URL allowlist + 递归节点/深度预算）、派发对称（`findSubmitInElements` 遍历 ActionSet.actions /
+Table cells / ImageSet images / RichTextBlock inlines 的 Submit，防死按钮）、plain 派生、D12 清单
+`elements` 自动同步（displayElements 单一权威）。
+
+Acceptance（追加）：`go test -race ./pkg/cardmsg/` 覆盖四元素 v1/v2 放行、URL allowlist 拒
+`javascript:`、结构错拒、Submit 派发对称、plain 派生；`TestDisplayElementsAuthority` 逐 fixture
+守卫 displayElements↔校验器一致；修正既有 `TestValidateWhitelistRejections`（Table 实为 1.5 已支持，
+替换为 Media/ToggleVisibility）。仍未支持（后续按需）：Media、ShowCard/ToggleVisibility/Execute、
+模板绑定、AC 1.6。

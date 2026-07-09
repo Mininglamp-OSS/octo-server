@@ -96,3 +96,23 @@ Verified live against adaptivecards.io that all three new inputs are AC 1.0 and
   synchronous client→bot query channel that Octo's async event-queue model does
   not have. Sequenced after modal forms (Goal 4), gated on a real
   remote/huge-choice-set need.
+
+## Tier 1 追加 — AC 1.5 展示元素补全（同 PR，PR#556 讨论后加入）
+
+同一 PR 内把 octo/v2 展示白名单补齐到 AC ≤1.5：新增 **ImageSet(1.0) / RichTextBlock(1.2) /
+Table(1.5) / ActionSet(1.2)**（版本实测 adaptivecards.io）。每个元素覆盖四个面：
+
+- **校验**（validate.go）：ImageSet 逐图复用 Image 纪律（新 `imageChild`）；RichTextBlock 遍历
+  inlines、TextRun.selectAction 过 URL allowlist（TextRun 非 markdown，text 无链接面）；Table
+  递归 rows→cells→items（计入节点/深度预算）+ cell selectAction/backgroundImage；ActionSet.actions
+  走动作 allowlist（Submit 仍受 octo/v2 门控）。
+- **派发对称**（interactive.go）：`findSubmitInElements` 同步遍历 ActionSet.actions、Table
+  cells、ImageSet images、RichTextBlock inlines 的 selectAction —— 与本 PR 的 inlineAction 教训
+  同源（校验面 == 派发面，防「发送通过、点击死按钮」）。
+- **plain 派生**（plain.go）：RichTextBlock 拼接文本、ImageSet 每图 `[图片]`、Table 递归 cells；
+  ActionSet 不参与。
+- **单一权威**（whitelist.go `displayElements`）：D12 清单 `elements` 自动带上四者。
+
+Gotcha：修正了既有 `TestValidateWhitelistRejections` 把 Table 误标「AC 1.6 应拒」——Table 实为
+**1.5**、现已支持，替换为仍未支持的 Media(1.1)/ToggleVisibility(1.2) 保持负向覆盖。仍未支持
+（后续按需）：Media、Action.ShowCard/ToggleVisibility/Execute、模板/数据绑定、AC 1.6 元素。
