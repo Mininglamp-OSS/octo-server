@@ -829,6 +829,13 @@ const (
 
 	defaultStickerCompressTimeoutMs = 2000
 	stickerCompressTimeoutMsHardCap = 10000
+
+	// defaultStickerCompressMaxDimension is the shrink target the compressor
+	// downscales static jpg/png into. 512 makes ">512 shrinks to 512" the built-in
+	// behavior once compression is enabled. Its hard cap is
+	// stickerUploadMaxDimensionHardCap (1024) — shrink target and compressible-accept
+	// ceiling share the decoded-pixel bound.
+	defaultStickerCompressMaxDimension = 512
 )
 
 // stickerUploadRasterAllowlist 与 modules/file/const.go:stickerUploadExts 保持一致。
@@ -974,38 +981,22 @@ func (s *SystemSettings) StickerCompressTimeoutMs() int {
 }
 
 // StickerCompressMaxDimension returns the target single-edge length the
-// compressor downscales static jpg/png INTO (sticker-downscale-store task).
-// It is decoupled from the upload dimension gate: the gate
-// (StickerUploadMaxDimension) is the ACCEPT ceiling + decompression-bomb bound;
-// this value is the SHRINK target the compressor's imaging.Fit fits into.
+// compressor downscales static jpg/png INTO (sticker-downscale-store /
+// sticker-oversized-default). It is the SHRINK target the compressor's
+// imaging.Fit fits into, decoupled from the upload dimension gate.
 //
-// Semantics:
-//   - unset / ≤0 → falls back to StickerUploadMaxDimension() (no extra downscale;
-//     byte-for-byte identical to pre-task behavior — imaging.Fit never fires
-//     because the value equals the gate that already rejected larger images).
-//   - a value above the effective upload_max_dimension is meaningless (a shrink
-//     target cannot exceed the accept ceiling) → clamped DOWN to it, with a
-//     dedup Warn so the mis-config is operator-observable.
-//   - an in-range [1, upload_max_dimension] value is returned verbatim; static
-//     jpg/png larger than it (but within the gate) get downscaled before store.
-//
-// There is no independent hard cap here: the accept ceiling
-// (StickerUploadMaxDimension, itself hard-capped at 1024) is the upper bound, so
-// the decoded-pixel memory envelope is unchanged by this setting.
+// Read-side clamped to [1, stickerUploadMaxDimensionHardCap] (the 1024
+// decoded-pixel hard cap — the compressible-accept ceiling and the shrink target
+// share that bound); unset / ≤0 / non-numeric falls back to the 512 default,
+// which makes ">512 static jpg/png shrinks to 512" the built-in behavior once
+// compression is enabled. NOT tied to upload_max_dimension: the dimension gate
+// admits compressible formats up to the hard cap (see modules/file
+// effectiveGateDim) and this value only decides how far they are shrunk before
+// store.
 func (s *SystemSettings) StickerCompressMaxDimension() int {
-	ceiling := s.StickerUploadMaxDimension()
-	v := s.getInt("sticker", "compress_max_dimension", 0)
-	if v <= 0 {
-		return ceiling
-	}
-	if v > ceiling {
-		dedupKey := fmt.Sprintf("sticker.compress_max_dimension=%d>%d", v, ceiling)
-		if _, loaded := s.stickerClampWarned.LoadOrStore(dedupKey, struct{}{}); !loaded {
-			s.Warn("system_setting sticker.compress_max_dimension exceeds upload_max_dimension; clamped",
-				zap.Int("configured", v),
-				zap.Int("upload_max_dimension", ceiling))
-		}
-		return ceiling
-	}
-	return v
+	return s.stickerClampIntUpper("sticker.compress_max_dimension",
+		s.getInt("sticker", "compress_max_dimension", defaultStickerCompressMaxDimension),
+		defaultStickerCompressMaxDimension,
+		stickerUploadMaxDimensionHardCap,
+	)
 }

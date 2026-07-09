@@ -42,10 +42,10 @@ type stickerLimitsSnapshot struct {
 	// api.go 的维度门拒绝，永不进压缩管线。
 	maxDim         int
 	allowedFormats map[string]bool
-	// compressMaxDim 是压缩阶段 imaging.Fit 的缩放目标边长（sticker-downscale-store
-	// 任务），与 maxDim **解耦**：静态 jpg/png 若原边长 > compressMaxDim（但 ≤ maxDim
-	// 已过门），会被等比缩到 compressMaxDim 外接框内再重编码。默认 compressMaxDim ==
-	// maxDim 时 Fit 不触发（逐字节兼容压缩前行为）。
+	// compressMaxDim 是压缩阶段 imaging.Fit 的缩放目标边长，与 maxDim 解耦（默认 512）：
+	// 压缩开启时，jpg/png 经 effectiveGateDim 放宽接收到 1024，凡原边长 > compressMaxDim
+	// 者等比缩到 compressMaxDim 外接框内再重编码；compressMaxDim ≥ 源边长时 Fit 不触发
+	// （仅重编码）。gif/webp 及压缩关闭时不走此路径。
 	compressMaxDim         int
 	compressEnabled        bool
 	compressTargetKB       int
@@ -75,6 +75,30 @@ func (s stickerLimitsSnapshot) compressParams() stickerCompressParams {
 		MaxConcurrency: s.compressMaxConcurrency,
 		TimeoutMs:      s.compressTimeoutMs,
 	}
+}
+
+// stickerCompressAcceptMaxDim 是「压缩开启时可压格式(jpg/png)」的接收维度上限：
+// 放宽到与 common.stickerUploadMaxDimensionHardCap 一致的 1024（解码像素硬上限），
+// 让 >upload_max_dimension 的静态图能被接收进来随后 downscale 到 compressMaxDim。
+// 保持在硬上限而非另设旋钮：它在落库输出里不可见（图恒被缩到 compressMaxDim），
+// 且 1024²×4=4MB/帧是内存安全上界，无需运营调。若 common 侧硬上限变动需同步。
+const stickerCompressAcceptMaxDim = 1024
+
+// effectiveGateDim 返回本次上传的维度门上限（sticker-oversized-default）。
+// 可压格式(jpg/png)且压缩开启时放宽到 stickerCompressAcceptMaxDim（随后 Fit 到
+// compressMaxDim）；否则——非可压格式(gif/webp) 或压缩关闭——用 maxDim(=
+// upload_max_dimension)。因此压缩关闭时对所有格式恒等于旧的 512 门（逐字节兼容），
+// 大 gif/webp 也不会因放宽而被存成大图。
+//
+// 已知边界：APNG 的扩展名是 .png，canCompressStickerExt 为 true，故会通过放宽门；
+// 但压缩阶段 isAnimatedPNGSource 识别后走 skipped:animated，原样落库（不缩放）。
+// 即一张 513–1024² 的 APNG 会以原尺寸存，比 512 大 —— 但仍 ≤ 解码硬上限 1024²，
+// 内存有界。APNG 罕见，此边界可接受；如需收紧可在门处加 acTL 扫描（暂不做）。
+func (s stickerLimitsSnapshot) effectiveGateDim(ext string) int {
+	if s.compressEnabled && canCompressStickerExt(ext) {
+		return stickerCompressAcceptMaxDim
+	}
+	return s.maxDim
 }
 
 // stickerLimits 从 File 挂的 SystemSettings 派生本次请求的限制值；未挂 settings

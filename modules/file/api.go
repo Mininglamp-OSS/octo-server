@@ -423,7 +423,10 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 			c.ResponseError(errors.New("无法解析贴纸图像，可能已损坏或格式不受支持"))
 			return
 		}
-		if cfg.Width > stickerLimits.maxDim || cfg.Height > stickerLimits.maxDim {
+		// 维度门对 jpg/png 在压缩开启时放宽到 1024（随后 downscale 到 compress_max_dimension），
+		// gif/webp 及压缩关闭时仍用 upload_max_dimension —— 见 effectiveGateDim。
+		gateMaxDim := stickerLimits.effectiveGateDim(ext)
+		if cfg.Width > gateMaxDim || cfg.Height > gateMaxDim {
 			observeStickerUpload("dimension_rejected")
 			f.Warn("贴纸尺寸超出限制",
 				zap.String("uid", loginUID),
@@ -431,8 +434,8 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 				zap.Int64("size", fileHeader.Size),
 				zap.Int("width", cfg.Width),
 				zap.Int("height", cfg.Height),
-				zap.Int("max", stickerLimits.maxDim))
-			c.ResponseError(fmt.Errorf("贴纸尺寸不能超过 %d×%d 像素", stickerLimits.maxDim, stickerLimits.maxDim))
+				zap.Int("max", gateMaxDim))
+			c.ResponseError(fmt.Errorf("贴纸尺寸不能超过 %d×%d 像素", gateMaxDim, gateMaxDim))
 			return
 		}
 		// DecodeConfig 读掉了图像头，复位指针供后续签名/上传读取完整内容。

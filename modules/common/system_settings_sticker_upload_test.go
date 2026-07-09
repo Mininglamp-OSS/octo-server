@@ -232,56 +232,56 @@ func TestSystemSettings_StickerCompressTimeoutMs_ClampBehavior(t *testing.T) {
 	}
 }
 
-// ----- compress_max_dimension (sticker-downscale-store) -----
+// ----- compress_max_dimension (sticker-oversized-default) -----
 
-// 未配置 → 回落接收上限 StickerUploadMaxDimension()（不额外缩放）。默认接收上限
-// 是 512，所以未配 compress_max_dimension 时缩放目标也 = 512。
-func TestSystemSettings_StickerCompressMaxDimension_DefaultsToUploadCeiling(t *testing.T) {
+// 未配置 → 512 默认缩放目标（让「>512 缩到 512」成为压缩开启后的开箱行为）。
+// 与 upload_max_dimension 解耦：即使接收门是 512，缩放目标仍独立取 512 默认。
+func TestSystemSettings_StickerCompressMaxDimension_DefaultsTo512(t *testing.T) {
 	s := stickerSnapSettings(nil)
-	assert.Equal(t, s.StickerUploadMaxDimension(), s.StickerCompressMaxDimension())
-	assert.Equal(t, defaultStickerUploadMaxDimension, s.StickerCompressMaxDimension())
+	assert.Equal(t, defaultStickerCompressMaxDimension, s.StickerCompressMaxDimension())
+	assert.Equal(t, 512, s.StickerCompressMaxDimension())
 }
 
-// 未配 compress_max_dimension 但接收上限被调高 → 缩放目标跟随接收上限（仍不缩放）。
-func TestSystemSettings_StickerCompressMaxDimension_UnsetTracksRaisedCeiling(t *testing.T) {
+// 与 upload_max_dimension 解耦：接收门调低到 384 不影响缩放目标默认 512
+// （缩放目标的上界是 1024 硬上限，不是 upload_max_dimension）。
+func TestSystemSettings_StickerCompressMaxDimension_DecoupledFromUploadDim(t *testing.T) {
 	s := stickerSnapSettings(map[string]string{
-		"sticker.upload_max_dimension": "1024",
-	})
-	assert.Equal(t, 1024, s.StickerCompressMaxDimension())
-}
-
-// ≤0 / 非数字 → 回落接收上限（等价未配置：不缩放，绝不 dark-close）。
-func TestSystemSettings_StickerCompressMaxDimension_NonPositiveFallsBackToCeiling(t *testing.T) {
-	for _, bad := range []string{"0", "-1", "abc", ""} {
-		s := stickerSnapSettings(map[string]string{
-			"sticker.upload_max_dimension":   "1024",
-			"sticker.compress_max_dimension": bad,
-		})
-		assert.Equalf(t, 1024, s.StickerCompressMaxDimension(),
-			"value=%q must fall back to the accept ceiling", bad)
-	}
-}
-
-// 合法且 ≤ 接收上限 → 原样返回（这是真正激活 downscale 的路径）。
-func TestSystemSettings_StickerCompressMaxDimension_InRangeVerbatim(t *testing.T) {
-	s := stickerSnapSettings(map[string]string{
-		"sticker.upload_max_dimension":   "1024",
-		"sticker.compress_max_dimension": "512",
+		"sticker.upload_max_dimension": "384",
 	})
 	assert.Equal(t, 512, s.StickerCompressMaxDimension())
 }
 
-// 缩放目标 > 接收上限无意义 → clamp 到接收上限，并记一次去重 Warn。
-func TestSystemSettings_StickerCompressMaxDimension_ClampsToUploadCeiling(t *testing.T) {
+// ≤0 / 非数字 → 回落默认 512（绝不 dark-close）。
+func TestSystemSettings_StickerCompressMaxDimension_NonPositiveFallsBackToDefault(t *testing.T) {
+	for _, bad := range []string{"0", "-1", "abc", ""} {
+		s := stickerSnapSettings(map[string]string{
+			"sticker.compress_max_dimension": bad,
+		})
+		assert.Equalf(t, defaultStickerCompressMaxDimension, s.StickerCompressMaxDimension(),
+			"value=%q must fall back to 512", bad)
+	}
+}
+
+// 合法且 ≤ 硬上限 1024 → 原样返回（可 > upload_max_dimension，两者解耦）。
+func TestSystemSettings_StickerCompressMaxDimension_InRangeVerbatim(t *testing.T) {
+	for in, want := range map[string]int{"384": 384, "512": 512, "768": 768, "1024": 1024} {
+		s := stickerSnapSettings(map[string]string{
+			"sticker.compress_max_dimension": in,
+		})
+		assert.Equalf(t, want, s.StickerCompressMaxDimension(), "compress_max_dimension=%q", in)
+	}
+}
+
+// 缩放目标 > 1024 硬上限 → clamp 到 1024，并记一次去重 Warn。
+func TestSystemSettings_StickerCompressMaxDimension_ClampsToHardCap(t *testing.T) {
 	s := stickerSnapSettings(map[string]string{
-		"sticker.upload_max_dimension":   "512",
-		"sticker.compress_max_dimension": "1024",
+		"sticker.compress_max_dimension": "4096",
 	})
 	for i := 0; i < 3; i++ {
-		assert.Equal(t, 512, s.StickerCompressMaxDimension(),
-			"target above the accept ceiling clamps down to it")
+		assert.Equal(t, stickerUploadMaxDimensionHardCap, s.StickerCompressMaxDimension(),
+			"target above the 1024 hard cap clamps down to it")
 	}
-	assertClampWarnedOnce(t, s, "sticker.compress_max_dimension=1024>512")
+	assertClampWarnedOnce(t, s, "sticker.compress_max_dimension=4096>1024")
 }
 
 // ----- clamp warning dedup (review R6) -----

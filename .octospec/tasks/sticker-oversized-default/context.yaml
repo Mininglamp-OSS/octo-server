@@ -1,0 +1,17 @@
+injected:
+  - id: error-handling
+    source: repo
+    why: matched via wire-contract tag + modules/**/*.go. No new error surface — the dimension-gate rejection is pre-existing (c.ResponseError, file module not i18n-migrated); only the gate's effective max changed. No new i18n codes → make i18n-lint unaffected.
+  - id: rate-limit
+    source: repo
+    why: matched via throttle tag. Downscale runs in the existing compressor goroutine under the unchanged concurrency semaphore + timeout; no request-frequency counter touched.
+  - id: trust-boundary
+    source: repo
+    why: matched via external-content tag (image decode of untrusted bytes). "Bound the payload" — the gate now admits jpg/png up to 1024 when compression is on, but 1024 is the UNCHANGED decoded-pixel hard cap, so the decode-memory envelope is not widened; gif/webp + compress-off stay at 512; gate still fails closed on decode error.
+  - id: testing
+    source: repo
+    why: no-infra snapshot getter tests + api-level integration tests inject fake settings + capturing service (no MySQL/Redis). Fake made faithful to production default (unset compress_max_dimension → 512).
+  - id: commit-style
+    source: repo
+    why: English Conventional Commits (feat:).
+brief: .octospec/tasks/sticker-oversized-default/brief.md

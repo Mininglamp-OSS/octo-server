@@ -4,6 +4,27 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-09 (sticker-oversized-default)
+
+- **Change** — Task `sticker-oversized-default` (follow-up to
+  `sticker-downscale-store`): make ">512px static jpg/png auto-shrinks to 512" the
+  built-in default once compression is enabled, without turning compression on for
+  every deployment. `compress_max_dimension` default flips 0(=ceiling)→**512**,
+  decoupled from `upload_max_dimension`, clamp `[1,1024]` (getter collapsed to the
+  shared `stickerClampIntUpper`). New compress-aware dimension gate
+  (`stickerLimitsSnapshot.effectiveGateDim`): jpg/png accept up to the **1024**
+  hard cap when `compress_enabled=true` (then shrink to `compress_max_dimension`),
+  gif/webp and compress-off stay gated at `upload_max_dimension` (512).
+  `compress_enabled` default stays **false** (gray-scale rollout preserved);
+  `upload_max_dimension` default and the appconfig `StickerUploadLimits`
+  client contract stay **512/unchanged** (compress-aware gate avoids the
+  appconfig ripple a 1024 default would cause). Zero-impact when compression off
+  (gate = 512 for all formats, compressor never runs). Known edge: APNG (ext
+  `.png`) passes the widened gate but stores un-shrunk (`skipped:animated`),
+  bounded by 1024. Getter tests rewritten; gate integration tests added; fake made
+  faithful to the 512 default. No new errcode / i18n / DB / migration / appconfig
+  field. Brief `.octospec/tasks/sticker-oversized-default/brief.md`.
+
 ## 2026-07-09 (sticker-downscale-store)
 
 - **Change** — Task `sticker-downscale-store` (phase two of

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"image"
+	"image/color"
+	"image/gif"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -56,11 +58,11 @@ func (f *fakeStickerSystemSettings) StickerCompressTargetKB() int       { return
 func (f *fakeStickerSystemSettings) StickerCompressMaxConcurrency() int { return f.maxConcurrency }
 func (f *fakeStickerSystemSettings) StickerCompressTimeoutMs() int      { return f.timeoutMs }
 
-// StickerCompressMaxDimension 镜像生产 getter：未设置(≤0) → 回落接收上限
-// maxDim（不额外缩放）；设置了则用配置值（测试据此触发 downscale 路径）。
+// StickerCompressMaxDimension 镜像生产 getter：未设置(≤0) → 512 默认缩放目标；
+// 设置了则用配置值（测试据此触发/关闭 downscale 路径）。
 func (f *fakeStickerSystemSettings) StickerCompressMaxDimension() int {
 	if f.compressMaxDim <= 0 {
-		return f.maxDim
+		return 512 // = common.defaultStickerCompressMaxDimension
 	}
 	return f.compressMaxDim
 }
@@ -163,9 +165,11 @@ func TestUploadFile_CompressEnabled_LargeJPEG_UsesCompressedBytes(t *testing.T) 
 	settings := defaultFakeStickerSettings()
 	settings.compressEnabled = true
 	// 允许 5MB 原始大小 + 1024px 维度，让 900px 源图能通过维度门。压缩靠
-	// quality 降低（95→85）+ 去元数据 shrink，无需 downscale。
+	// quality 降低（95→85）+ 去元数据 shrink，无需 downscale：显式把缩放目标设成
+	// 1024（≥源 900）以隔离本用例只测重编码、不测 downscale。
 	settings.maxSizeKB = 5120
 	settings.maxDim = 1024
+	settings.compressMaxDim = 1024
 	settings.targetKB = 512
 
 	f, svc := newStickerCompressFile(t, settings)
@@ -335,6 +339,106 @@ func TestUploadFile_CompressEnabled_HandleTiesToFinalStoredObject(t *testing.T) 
 	assert.NotEmpty(t, svc.uploaded, "capturing service must have received bytes")
 }
 
+// makeTestGIF 生成 (w,h) 的单帧 GIF；gif.Encode 会把 RGBA 量化到调色板。
+func makeTestGIF(t *testing.T, w, h int) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for x := 0; x < w; x++ {
+		for y := 0; y < h; y++ {
+			img.Set(x, y, color.RGBA{byte(x % 255), byte(y % 255), 128, 255})
+		}
+	}
+	var buf bytes.Buffer
+	require.NoError(t, gif.Encode(&buf, img, nil))
+	return buf.Bytes()
+}
+
+// uploadStickerForTest 跑一次贴纸上传，返回 recorder 供断言。集中构造 multipart +
+// gin 上下文，避免每个门测试重复样板。
+func uploadStickerForTest(t *testing.T, f *File, uid, name string, body []byte) *httptest.ResponseRecorder {
+	t.Helper()
+	mbody, contentType := newMultipartFile(t, name, body)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request, _ = http.NewRequest(http.MethodPost, "/v1/file/upload?type=sticker&path=/"+uid+"/"+name, mbody)
+	c.Request.Header.Set("Content-Type", contentType)
+	c.Set("uid", uid)
+	f.uploadFile(&wkhttp.Context{Context: c})
+	return w
+}
+
+// TestUploadFile_OversizedJPEG_AcceptedAndDownscaled_DefaultUploadDim 是
+// sticker-oversized-default 的核心验证：upload_max_dimension 保持默认 512，但压缩
+// 开启后一张 1024² jpg **不再被 512 门拒**（可压格式放宽到 1024 接收），并被 downscale
+// 到 compress_max_dimension=512 落库。
+func TestUploadFile_OversizedJPEG_AcceptedAndDownscaled_DefaultUploadDim(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
+
+	const uid = "10000"
+	settings := defaultFakeStickerSettings()
+	settings.compressEnabled = true
+	settings.maxSizeKB = 5120     // 允许大原图过 size 门
+	settings.maxDim = 512         // upload_max_dimension 保持默认 512
+	settings.compressMaxDim = 512 // 缩放目标 512
+	settings.targetKB = 2048
+	settings.timeoutMs = 10_000
+
+	f, svc := newStickerCompressFile(t, settings)
+	svc.downloadURL = "https://cdn.example.com/dm/sticker/" + uid + "/big.jpg"
+
+	w := uploadStickerForTest(t, f, uid, "big.jpg", makeTestJPEG(t, 1024, 1024, 90))
+
+	require.Equalf(t, http.StatusOK, w.Code, "1024² jpg must be accepted (gate widened to 1024) not rejected at 512; body: %s", w.Body.String())
+	dec, format, err := image.Decode(bytes.NewReader(svc.uploaded))
+	require.NoError(t, err)
+	assert.Equal(t, "jpeg", format)
+	b := dec.Bounds()
+	assert.Equal(t, 512, b.Dx(), "long edge must be downscaled to compress_max_dimension (512)")
+	assert.Equal(t, 512, b.Dy())
+}
+
+// TestUploadFile_OversizedGIF_RejectedWhenCompressOn 验证：gif 无法缩放，压缩开启
+// 也**不**放宽接收门 —— 一张 >512 的 gif 仍在 upload_max_dimension(512) 门被拒，
+// 不会被当作大图存进来。
+func TestUploadFile_OversizedGIF_RejectedWhenCompressOn(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const uid = "10000"
+	settings := defaultFakeStickerSettings()
+	settings.compressEnabled = true
+	settings.maxSizeKB = 5120
+	settings.maxDim = 512 // gif 仍受此约束
+
+	f, svc := newStickerCompressFile(t, settings)
+
+	w := uploadStickerForTest(t, f, uid, "big.gif", makeTestGIF(t, 600, 600))
+
+	require.NotEqualf(t, http.StatusOK, w.Code, "600² gif must be rejected at the 512 gate; body: %s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "512")
+	assert.Nil(t, svc.uploaded, "rejected gif must not reach storage")
+}
+
+// TestUploadFile_OversizedJPEG_RejectedWhenCompressOff 是零影响回归：压缩关闭时，
+// 即使 jpg 可压，也**不**放宽接收门 —— >512 jpg 仍被 512 门拒，与改动前一致。
+func TestUploadFile_OversizedJPEG_RejectedWhenCompressOff(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const uid = "10000"
+	settings := defaultFakeStickerSettings()
+	settings.compressEnabled = false // 关键：压缩关闭
+	settings.maxSizeKB = 5120
+	settings.maxDim = 512
+
+	f, svc := newStickerCompressFile(t, settings)
+
+	w := uploadStickerForTest(t, f, uid, "big.jpg", makeTestJPEG(t, 600, 600, 90))
+
+	require.NotEqualf(t, http.StatusOK, w.Code, "with compress off, >512 jpg must be rejected at 512 (zero-impact); body: %s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "512")
+	assert.Nil(t, svc.uploaded, "rejected jpg must not reach storage")
+}
+
 // TestUploadFile_CompressEnabled_LargeImage_DownscaledAndStored 集成验证
 // sticker-downscale-store：当 compress_max_dimension < upload_max_dimension 时，
 // 一张在接收门内（≤ upload_max_dimension）但大于缩放目标的静态图，被等比缩到
@@ -388,10 +492,10 @@ func TestUploadFile_CompressEnabled_LargeImage_DownscaledAndStored(t *testing.T)
 		"handle must verify against the post-downscale stored object")
 }
 
-// TestUploadFile_CompressEnabled_UnsetCompressMaxDim_NoDownscale 回归：未配置
-// compress_max_dimension（回落 = upload_max_dimension）时，压缩仍只重编码、绝不
-// 缩放 —— 尺寸逐像素保持，兑现「零影响默认」不变式。
-func TestUploadFile_CompressEnabled_UnsetCompressMaxDim_NoDownscale(t *testing.T) {
+// TestUploadFile_CompressEnabled_DefaultCompressMaxDim_ShrinksOversizedTo512 是
+// sticker-oversized-default 的默认行为验证：**未配置** compress_max_dimension（回落
+// 默认 512）时，压缩开启后一张 800² jpg 被自动缩到 512 —— 无需运营额外调旋钮。
+func TestUploadFile_CompressEnabled_DefaultCompressMaxDim_ShrinksOversizedTo512(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
 
@@ -399,30 +503,20 @@ func TestUploadFile_CompressEnabled_UnsetCompressMaxDim_NoDownscale(t *testing.T
 	settings := defaultFakeStickerSettings()
 	settings.compressEnabled = true
 	settings.maxSizeKB = 5120
-	settings.maxDim = 1024
-	// compressMaxDim 特意留 0 → fake 回落 maxDim(1024)，与生产 getter 语义一致。
+	settings.maxDim = 512 // upload_max_dimension 保持默认
+	// compressMaxDim 特意留 0 → fake 回落默认 512，与生产 getter 语义一致。
 	settings.targetKB = 4096
 	settings.timeoutMs = 10_000
 
 	f, svc := newStickerCompressFile(t, settings)
-	svc.downloadURL = "https://cdn.example.com/dm/sticker/" + uid + "/keep.jpg"
+	svc.downloadURL = "https://cdn.example.com/dm/sticker/" + uid + "/big.jpg"
 
-	origBytes := makeTestJPEG(t, 700, 700, 90) // 700 < 1024 门，且 == 缩放目标下不触发 Fit
-	body, contentType := newMultipartFile(t, "keep.jpg", origBytes)
-
-	w := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(w)
-	c.Request, _ = http.NewRequest(http.MethodPost, "/v1/file/upload?type=sticker&path=/"+uid+"/keep.jpg", body)
-	c.Request.Header.Set("Content-Type", contentType)
-	c.Set("uid", uid)
-	wkCtx := &wkhttp.Context{Context: c}
-
-	f.uploadFile(wkCtx)
+	w := uploadStickerForTest(t, f, uid, "big.jpg", makeTestJPEG(t, 800, 800, 90))
 
 	require.Equalf(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	dec, _, err := image.Decode(bytes.NewReader(svc.uploaded))
 	require.NoError(t, err)
 	bounds := dec.Bounds()
-	assert.Equal(t, 700, bounds.Dx(), "unset compress_max_dimension must NOT downscale")
-	assert.Equal(t, 700, bounds.Dy(), "unset compress_max_dimension must NOT downscale")
+	assert.Equal(t, 512, bounds.Dx(), "default compress_max_dimension (512) must shrink an 800² source to 512")
+	assert.Equal(t, 512, bounds.Dy())
 }
