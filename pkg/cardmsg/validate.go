@@ -294,14 +294,17 @@ func (w *walker) element(el map[string]interface{}, depth int) error {
 					if err := w.bump(depth + 1); err != nil {
 						return err
 					}
-					// AC：inlines[] 的对象必须是 TextRun；显式给出 type 时必须是 "TextRun"（同
-					// column()/imageChild 纪律）—— 拒伪类型对象，堵住「非 TextRun 子树夹带未校验
-					// URL 面」的绕过（PR#556 review P1：校验面 ≥ 渲染面）。TextRun 是叶子，类型钉死
-					// 后无嵌套子树需递归。
+					// AC：inlines[] 的对象必须是**叶子 TextRun**：显式给出 type 时必须是 "TextRun"
+					// （同 column()/imageChild 纪律），且不得携带子集合字段（rejectLeafSubtree）——
+					// 堵住伪类型 / typeless 的「伪装容器」把未校验 URL 面藏在 items 等子树里绕过
+					// （PR#556 review P1 + residual：校验面 ≥ 渲染面）。
 					if t, present := inl["type"]; present {
 						if s, _ := t.(string); s != "TextRun" {
 							return fmt.Errorf("%w: RichTextBlock.inlines[] 内元素类型 %v", ErrCardUnknownElement, t)
 						}
+					}
+					if err := rejectLeafSubtree(inl, "RichTextBlock.inlines[]"); err != nil {
+						return err
 					}
 					if err := w.selectAction(inl); err != nil {
 						return err
@@ -447,19 +450,42 @@ func (w *walker) element(el map[string]interface{}, depth int) error {
 // 常省略 type），故这里补齐顶层 "Image" case 依赖 element() 提供的公共校验：节点预算、
 // backgroundImage 等 URL 面（checkNodeURLs）、selectAction，再加 Image 自身的 url 必填 +
 // 正向 allowlist。
+// leafChildCollectionFields 是承载子元素 / 子集合的字段名。ImageSet.images[] 的 Image、
+// RichTextBlock.inlines[] 的 TextRun 都是**叶子**，绝不该有这些字段 —— 出现即是「伪装成叶子的
+// 容器」在夹带未被走查的子树（PR#556 review P1 + residual：typeless 子元素也走这层兜底）。
+var leafChildCollectionFields = [...]string{
+	"items", "columns", "rows", "cells", "inlines", "actions", "facts", "images",
+}
+
+// rejectLeafSubtree 拒绝一个「应为叶子」的节点携带任何子集合字段 —— 堵住 typeless / 伪类型子
+// 元素把未校验的 URL 面藏在 items 等子树里绕过发送期 allowlist（校验面 ≥ 渲染面）。类型门只挡
+// 「显式伪类型」（type 存在且不符）；**typeless 的伪装容器（无 type + 带 items）靠这层挡** ——
+// imageChild 与 RichTextBlock inline 共用。Image/TextRun 是叶子，本就无这些字段，合规卡不受影响。
+func rejectLeafSubtree(node map[string]interface{}, where string) error {
+	for _, f := range leafChildCollectionFields {
+		if _, present := node[f]; present {
+			return fmt.Errorf("%w: %s 内元素不得携带子集合字段 %q（应为叶子）", ErrCardUnknownElement, where, f)
+		}
+	}
+	return nil
+}
+
 func (w *walker) imageChild(img map[string]interface{}, depth int) error {
 	if err := w.bump(depth); err != nil {
 		return err
 	}
-	// AC：ImageSet.images[] 每项必须是 Image；显式给出 type 时必须是 "Image"（同 column()
-	// 对 Column 的纪律）。否则一个 {"type":"Container","url":"http://ok","items":[…]} 会被当
-	// 扁平 Image 只校验 url、其 items 永不走查 —— 夹带 javascript: 链接的子树绕过发送期校验
-	// （PR#556 review P1：校验面必须 ≥ 渲染面，同 PR#543 对 backgroundImage/iconUrl 立的铁律）。
-	// Image 是叶子，类型钉死后无嵌套子树需递归。
+	// AC：ImageSet.images[] 每项必须是**叶子 Image**：显式给出 type 时必须是 "Image"（同
+	// column() 纪律），且不得携带任何子集合字段（rejectLeafSubtree）。否则伪类型
+	// （{"type":"Container",…}）或 typeless（{"url":ok,"items":[…]}）的「伪装容器」会被当扁平
+	// Image 只校 url、其 items 子树永不走查 —— 夹带 javascript: 链接绕过发送期校验（PR#556
+	// review P1 + residual：校验面必须 ≥ 渲染面，同 PR#543 对 backgroundImage/iconUrl 立的铁律）。
 	if t, present := img["type"]; present {
 		if s, _ := t.(string); s != "Image" {
 			return fmt.Errorf("%w: ImageSet.images[] 内元素类型 %v", ErrCardUnknownElement, t)
 		}
+	}
+	if err := rejectLeafSubtree(img, "ImageSet.images[]"); err != nil {
+		return err
 	}
 	if err := checkNodeURLs(img); err != nil {
 		return err

@@ -121,6 +121,16 @@ func TestTier1MislabeledChildRejected(t *testing.T) {
 			"type": "RichTextBlock", "inlines": []interface{}{
 				map[string]interface{}{"type": "Container", "items": jsChild()},
 			}}),
+		// typeless 变体（residual，PR#556 review）：无 type 字段的「伪装容器」—— 仅靠 type 门禁
+		// （if type present）挡不住，必须靠 rejectLeafSubtree 兜底（子集合字段即拒）。
+		"ImageSet.child.typeless.items": cardWithBody(map[string]interface{}{
+			"type": "ImageSet", "images": []interface{}{
+				map[string]interface{}{"url": "https://ok.com/a.png", "items": jsChild()},
+			}}),
+		"RichTextBlock.inline.typeless.items": cardWithBody(map[string]interface{}{
+			"type": "RichTextBlock", "inlines": []interface{}{
+				map[string]interface{}{"items": jsChild()},
+			}}),
 	}
 	for name, card := range bad {
 		if err := Validate(v2Envelope(card)); !errors.Is(err, ErrCardUnknownElement) {

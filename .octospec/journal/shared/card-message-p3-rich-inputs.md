@@ -95,10 +95,18 @@ Verified live against adaptivecards.io that all three new inputs are AC 1.0 and
   items:[<js TextBlock>]}` smuggled the nested `javascript:` past the send-time URL allowlist:
   the flat handler doesn't walk `items`, and the type-dispatch that *would* have is bypassed
   because the handler never looked at `type`. The fix is the same one-liner `column()` already
-  had — reject a present `type` ≠ the expected leaf type. General rule: whenever you shortcut
-  the type-dispatched walker to validate a positionally-constrained child as a known shape, you
-  inherit the obligation to *enforce* that shape's type; the allowlist's "校验面 ≥ 渲染面"
-  invariant is only as strong as the weakest place a foreign subtree can enter (PR#556 review P1).
+  had — reject a present `type` ≠ the expected leaf type. **But a *conditional* type-check
+  (`if type present`) leaves a residual: a *typeless* child skips the reject and is still not
+  recursed — the same subtree smuggles in without a `type` label.** The complete closure is a
+  *closed-set leaf contract*, not a type label: a leaf child (Image/TextRun) must ALSO carry no
+  child-collection field at all (`items`/`columns`/`rows`/`cells`/`inlines`/`actions`/`facts`/
+  `images` — `rejectLeafSubtree`), because a leaf never has a subtree regardless of how it is
+  (or isn't) labeled. Enforce the *shape* (leaf = no subtree), not just the type string. General
+  rule: whenever you shortcut the type-dispatched walker to validate a positionally-constrained
+  child as a known shape, you inherit the obligation to enforce that shape completely — type AND
+  the absence of any nested collection; the allowlist's "校验面 ≥ 渲染面" invariant is only as
+  strong as the weakest place a foreign subtree can enter, labeled or not (PR#556 review P1 +
+  its typeless residual — two review rounds: the conditional fix, then the closed-set closure).
 
 ## Gotchas
 
