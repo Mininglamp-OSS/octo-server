@@ -36,6 +36,7 @@ import (
 type fakeStickerSystemSettings struct {
 	maxSizeKB       int
 	maxDim          int
+	compressMaxDim  int // 0 → 回落 maxDim（不缩放），镜像生产 getter 语义
 	allowedFormats  []string
 	compressEnabled bool
 	targetKB        int
@@ -54,6 +55,15 @@ func (f *fakeStickerSystemSettings) StickerCompressEnabled() bool       { return
 func (f *fakeStickerSystemSettings) StickerCompressTargetKB() int       { return f.targetKB }
 func (f *fakeStickerSystemSettings) StickerCompressMaxConcurrency() int { return f.maxConcurrency }
 func (f *fakeStickerSystemSettings) StickerCompressTimeoutMs() int      { return f.timeoutMs }
+
+// StickerCompressMaxDimension 镜像生产 getter：未设置(≤0) → 回落接收上限
+// maxDim（不额外缩放）；设置了则用配置值（测试据此触发 downscale 路径）。
+func (f *fakeStickerSystemSettings) StickerCompressMaxDimension() int {
+	if f.compressMaxDim <= 0 {
+		return f.maxDim
+	}
+	return f.compressMaxDim
+}
 
 // defaultFakeStickerSettings 复刻改动前的硬编码默认值 —— 大多数测试从这里起手，
 // 只按需要覆盖字段（例如 compressEnabled）。
@@ -323,4 +333,96 @@ func TestUploadFile_CompressEnabled_HandleTiesToFinalStoredObject(t *testing.T) 
 	// 花几毫秒的 compressor 结束后 svc.uploaded 已被填。
 	_ = time.Millisecond
 	assert.NotEmpty(t, svc.uploaded, "capturing service must have received bytes")
+}
+
+// TestUploadFile_CompressEnabled_LargeImage_DownscaledAndStored 集成验证
+// sticker-downscale-store：当 compress_max_dimension < upload_max_dimension 时，
+// 一张在接收门内（≤ upload_max_dimension）但大于缩放目标的静态图，被等比缩到
+// 缩放目标后再落库。这条路径在解耦前不可达（门/目标同源，Fit 恒不触发）。
+func TestUploadFile_CompressEnabled_LargeImage_DownscaledAndStored(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
+
+	const uid = "10000"
+	settings := defaultFakeStickerSettings()
+	settings.compressEnabled = true
+	settings.maxSizeKB = 5120     // 允许大原图过 size 门
+	settings.maxDim = 1024        // 接收上限：1024² 源图能过维度门
+	settings.compressMaxDim = 512 // 缩放目标：解耦后小于接收门 → 触发 Fit
+	settings.targetKB = 2048      // 缩后 512² 远小于此，不会 over_limit
+	settings.timeoutMs = 10_000   // 远大于编码耗时，避免 flaky
+
+	f, svc := newStickerCompressFile(t, settings)
+	svc.downloadURL = "https://cdn.example.com/dm/sticker/" + uid + "/big.jpg"
+
+	origBytes := makeTestJPEG(t, 1024, 1024, 90)
+	body, contentType := newMultipartFile(t, "big.jpg", origBytes)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request, _ = http.NewRequest(http.MethodPost, "/v1/file/upload?type=sticker&path=/"+uid+"/big.jpg", body)
+	c.Request.Header.Set("Content-Type", contentType)
+	c.Set("uid", uid)
+	wkCtx := &wkhttp.Context{Context: c}
+
+	f.uploadFile(wkCtx)
+
+	require.Equalf(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	dec, format, err := image.Decode(bytes.NewReader(svc.uploaded))
+	require.NoError(t, err)
+	assert.Equal(t, "jpeg", format)
+	bounds := dec.Bounds()
+	// 1024² 正方形 Fit 进 512×512 外接框 → 恰好 512×512（等比、不放大）。
+	assert.Equal(t, 512, bounds.Dx(), "long edge must be downscaled to compress_max_dimension")
+	assert.Equal(t, 512, bounds.Dy())
+	assert.LessOrEqual(t, bounds.Dx(), settings.compressMaxDim)
+
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	respSize, _ := resp["size"].(float64)
+	assert.EqualValues(t, len(svc.uploaded), int64(respSize), "resp.size must be the post-downscale byte count")
+	handle, _ := resp["sticker_handle"].(string)
+	path, _ := resp["path"].(string)
+	require.NotEmpty(t, handle)
+	assert.True(t, stickersig.Verify(uid, path, handle),
+		"handle must verify against the post-downscale stored object")
+}
+
+// TestUploadFile_CompressEnabled_UnsetCompressMaxDim_NoDownscale 回归：未配置
+// compress_max_dimension（回落 = upload_max_dimension）时，压缩仍只重编码、绝不
+// 缩放 —— 尺寸逐像素保持，兑现「零影响默认」不变式。
+func TestUploadFile_CompressEnabled_UnsetCompressMaxDim_NoDownscale(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
+
+	const uid = "10000"
+	settings := defaultFakeStickerSettings()
+	settings.compressEnabled = true
+	settings.maxSizeKB = 5120
+	settings.maxDim = 1024
+	// compressMaxDim 特意留 0 → fake 回落 maxDim(1024)，与生产 getter 语义一致。
+	settings.targetKB = 4096
+	settings.timeoutMs = 10_000
+
+	f, svc := newStickerCompressFile(t, settings)
+	svc.downloadURL = "https://cdn.example.com/dm/sticker/" + uid + "/keep.jpg"
+
+	origBytes := makeTestJPEG(t, 700, 700, 90) // 700 < 1024 门，且 == 缩放目标下不触发 Fit
+	body, contentType := newMultipartFile(t, "keep.jpg", origBytes)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request, _ = http.NewRequest(http.MethodPost, "/v1/file/upload?type=sticker&path=/"+uid+"/keep.jpg", body)
+	c.Request.Header.Set("Content-Type", contentType)
+	c.Set("uid", uid)
+	wkCtx := &wkhttp.Context{Context: c}
+
+	f.uploadFile(wkCtx)
+
+	require.Equalf(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	dec, _, err := image.Decode(bytes.NewReader(svc.uploaded))
+	require.NoError(t, err)
+	bounds := dec.Bounds()
+	assert.Equal(t, 700, bounds.Dx(), "unset compress_max_dimension must NOT downscale")
+	assert.Equal(t, 700, bounds.Dy(), "unset compress_max_dimension must NOT downscale")
 }

@@ -4,6 +4,23 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-09 (sticker-downscale-store)
+
+- **Change** — Task `sticker-downscale-store` (phase two of
+  `sticker-upload-compression`): decouple the compressor's `imaging.Fit` downscale
+  target from the upload dimension gate. New server-side key
+  `sticker.compress_max_dimension` (int, `Positive:true`, read-side clamped to
+  `≤ upload_max_dimension`, unset ⇒ `= upload_max_dimension` ⇒ no downscale). Swap
+  `stickerLimitsSnapshot.compressParams().MaxDim` from `maxDim` (accept gate) to a
+  new `compressMaxDim` field so static jpg/png larger than the target but within
+  the unchanged accept ceiling are downscaled before re-encode+store, instead of
+  the Fit branch being unreachable (gate/target were same-source, so it never
+  fired). Accept hard cap stays 1024 (decompression-bomb envelope unchanged);
+  webp/gif still validate-only; not exposed via appconfig. Zero-impact default,
+  byte-for-byte identical to `main` when unset. New getter clamp tests (no-infra)
+  + api-level downscale/regression tests. No new errcode / i18n / DB / migration.
+  Brief `.octospec/tasks/sticker-downscale-store/brief.md`.
+
 ## 2026-07-09 (P3-3)
 
 - **Change** — Task `card-message-p3-rich-inputs` (card message P3-3): extend the

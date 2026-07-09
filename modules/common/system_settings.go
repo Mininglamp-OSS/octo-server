@@ -972,3 +972,40 @@ func (s *SystemSettings) StickerCompressTimeoutMs() int {
 		stickerCompressTimeoutMsHardCap,
 	)
 }
+
+// StickerCompressMaxDimension returns the target single-edge length the
+// compressor downscales static jpg/png INTO (sticker-downscale-store task).
+// It is decoupled from the upload dimension gate: the gate
+// (StickerUploadMaxDimension) is the ACCEPT ceiling + decompression-bomb bound;
+// this value is the SHRINK target the compressor's imaging.Fit fits into.
+//
+// Semantics:
+//   - unset / ≤0 → falls back to StickerUploadMaxDimension() (no extra downscale;
+//     byte-for-byte identical to pre-task behavior — imaging.Fit never fires
+//     because the value equals the gate that already rejected larger images).
+//   - a value above the effective upload_max_dimension is meaningless (a shrink
+//     target cannot exceed the accept ceiling) → clamped DOWN to it, with a
+//     dedup Warn so the mis-config is operator-observable.
+//   - an in-range [1, upload_max_dimension] value is returned verbatim; static
+//     jpg/png larger than it (but within the gate) get downscaled before store.
+//
+// There is no independent hard cap here: the accept ceiling
+// (StickerUploadMaxDimension, itself hard-capped at 1024) is the upper bound, so
+// the decoded-pixel memory envelope is unchanged by this setting.
+func (s *SystemSettings) StickerCompressMaxDimension() int {
+	ceiling := s.StickerUploadMaxDimension()
+	v := s.getInt("sticker", "compress_max_dimension", 0)
+	if v <= 0 {
+		return ceiling
+	}
+	if v > ceiling {
+		dedupKey := fmt.Sprintf("sticker.compress_max_dimension=%d>%d", v, ceiling)
+		if _, loaded := s.stickerClampWarned.LoadOrStore(dedupKey, struct{}{}); !loaded {
+			s.Warn("system_setting sticker.compress_max_dimension exceeds upload_max_dimension; clamped",
+				zap.Int("configured", v),
+				zap.Int("upload_max_dimension", ceiling))
+		}
+		return ceiling
+	}
+	return v
+}

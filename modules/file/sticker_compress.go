@@ -37,9 +37,16 @@ import (
 // stickerCompressParams 拿到同一份值，确保 dimension 校验用的 maxDim 与
 // 压缩阶段 Fit 用的 maxDim 严格同源。
 type stickerLimitsSnapshot struct {
-	maxSize                int64
-	maxDim                 int
-	allowedFormats         map[string]bool
+	maxSize int64
+	// maxDim 是上传接收维度门（+ 解压炸弹防御）用的接收上限：任一边超过即在
+	// api.go 的维度门拒绝，永不进压缩管线。
+	maxDim         int
+	allowedFormats map[string]bool
+	// compressMaxDim 是压缩阶段 imaging.Fit 的缩放目标边长（sticker-downscale-store
+	// 任务），与 maxDim **解耦**：静态 jpg/png 若原边长 > compressMaxDim（但 ≤ maxDim
+	// 已过门），会被等比缩到 compressMaxDim 外接框内再重编码。默认 compressMaxDim ==
+	// maxDim 时 Fit 不触发（逐字节兼容压缩前行为）。
+	compressMaxDim         int
 	compressEnabled        bool
 	compressTargetKB       int
 	compressMaxConcurrency int
@@ -58,9 +65,12 @@ type stickerCompressParams struct {
 
 // compressParams 从 snapshot 派生 Compress 需要的 4 个值。集中在这里派生
 // 是为了让 caller 端一处清晰地展现"这四个值都来自同一份 snapshot"。
+// MaxDim 取 compressMaxDim（缩放目标）而非 maxDim（接收门）—— 这是
+// sticker-downscale-store 解耦的关键：让 imaging.Fit 能把 (compressMaxDim, maxDim]
+// 区间内的静态 jpg/png 缩到 compressMaxDim，而不再因门/目标同源恒不触发。
 func (s stickerLimitsSnapshot) compressParams() stickerCompressParams {
 	return stickerCompressParams{
-		MaxDim:         s.maxDim,
+		MaxDim:         s.compressMaxDim,
 		TargetKB:       s.compressTargetKB,
 		MaxConcurrency: s.compressMaxConcurrency,
 		TimeoutMs:      s.compressTimeoutMs,
@@ -78,8 +88,10 @@ func (f *File) stickerLimits() stickerLimitsSnapshot {
 			allow[k] = v
 		}
 		return stickerLimitsSnapshot{
-			maxSize:                StickerMaxFileSize,
-			maxDim:                 StickerMaxDimension,
+			maxSize: StickerMaxFileSize,
+			maxDim:  StickerMaxDimension,
+			// nil-settings 回落：compressMaxDim == maxDim → Fit 不触发，保持老行为。
+			compressMaxDim:         StickerMaxDimension,
 			allowedFormats:         allow,
 			compressEnabled:        false,
 			compressTargetKB:       0,
@@ -96,6 +108,7 @@ func (f *File) stickerLimits() stickerLimitsSnapshot {
 	return stickerLimitsSnapshot{
 		maxSize:                int64(kb) * 1024,
 		maxDim:                 f.settings.StickerUploadMaxDimension(),
+		compressMaxDim:         f.settings.StickerCompressMaxDimension(),
 		allowedFormats:         m,
 		compressEnabled:        f.settings.StickerCompressEnabled(),
 		compressTargetKB:       f.settings.StickerCompressTargetKB(),
@@ -148,6 +161,7 @@ type stickerSystemSettings interface {
 	StickerCompressTargetKB() int
 	StickerCompressMaxConcurrency() int
 	StickerCompressTimeoutMs() int
+	StickerCompressMaxDimension() int
 }
 
 // stickerCompressSettings 抽出 SystemSettings 需要的接口，方便 test 注入 fake。
