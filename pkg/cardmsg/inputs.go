@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -24,6 +25,15 @@ const (
 	// MaxInputsBytes inputs 序列化总量上限（D11）。
 	MaxInputsBytes = 16 << 10
 )
+
+// jsonNumberPattern 是 RFC 8259 JSON 数字文法（= JS Number / bot 端 JSON 解析口径）：
+// 可选前导负号、整数部分无前导零、可选小数、可选指数。刻意**不**用 strconv.ParseFloat
+// 判定「是不是数字」：ParseFloat 接受 Go 专有文法——下划线分隔（"1_000"）、十六进制浮点
+// （"0x1p4"）、前导 "+"、前导零、裸 "NaN"/"Inf"——是 JSON/JS Number 的**超集**，会放行
+// bot 端 JSON 解析器拒绝或解读不同的串，造成「服务端判合法、bot 拿到的却是另一个数 / 解析
+// 失败」的静默数值错位。用严格文法先把服务端的「合法数字」钉到与 bot 收到的 JSON 一致的
+// 口径，再用 ParseFloat 求值兜溢出（PR#556 review）。
+var jsonNumberPattern = regexp.MustCompile(`^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?$`)
 
 // inputSpec 是生效帧里一个已声明 Input.* 元素的校验视图。
 type inputSpec struct {
@@ -43,7 +53,7 @@ type inputSpec struct {
 //   - 值必须是字符串；Input.Text ≤ 4KiB；Input.Toggle 必须等于 valueOn/valueOff；
 //     Input.ChoiceSet 必须命中声明的 choice value（multiSelect 为逗号分隔子集，
 //     单选允许 "" 表示未选择）；
-//   - P3-3：Input.Number 值必须可解析为有限数；Input.Date 必须是 YYYY-MM-DD；
+//   - P3-3：Input.Number 必须是合法 JSON 数字且有限；Input.Date 必须是 YYYY-MM-DD；
 //     Input.Time 必须是 HH:MM(24h)；三者 "" 均视为未填放行。min/max 区间**不**服务端
 //     强制（AC 规范定义为可忽略 hint，区间校验下放 bot，与 isRequired/regex 同）；
 //   - 序列化总量 ≤ 16KiB。
@@ -96,19 +106,21 @@ func ValidateInputs(envelopeRaw []byte, inputs map[string]interface{}) error {
 				}
 			}
 		case "Input.Number":
-			// 空串=未填（isRequired 不服务端强制）；否则必须可解析为有限数。min/max 区间
-			// 不服务端强制（下放 bot，见 inputSpec 注释）。
+			// 空串=未填（isRequired 不服务端强制）；否则必须匹配严格 JSON 数字文法。min/max
+			// 区间不服务端强制（下放 bot，见 inputSpec 注释）。
 			if s == "" {
 				break
 			}
-			n, err := strconv.ParseFloat(s, 64)
-			if err != nil {
+			// 先过严格 JSON 数字文法（见 jsonNumberPattern 注释：ParseFloat 的文法是 JSON/JS
+			// Number 的超集，会静默放行 bot 端解析不同的串）。
+			if !jsonNumberPattern.MatchString(s) {
 				return fmt.Errorf("%w: input %q 不是合法数字", ErrCardInputInvalid, key)
 			}
-			// strconv.ParseFloat 接受 NaN/±Inf/Infinity 且不报错；非有限数不是合法数值输入，
-			// 拒（信任边界：交给 bot 的值必须是「形状可信」的有限数 —— 这是格式/类型校验，与
-			// 下放给 bot 的 range 无关）。
-			if math.IsNaN(n) || math.IsInf(n, 0) {
+			// 文法已排除 NaN/Inf 字面量与 Go 专有形态；ParseFloat 在此仅用于求值兜数值溢出
+			// （如 "1e999"→±Inf，返回 ErrRange）。非有限数不是合法数值输入，不得当「形状可信」
+			// 值透传给 bot（信任边界：格式/类型校验，与已下放 bot 的 range 无关）。
+			n, err := strconv.ParseFloat(s, 64)
+			if err != nil || math.IsNaN(n) || math.IsInf(n, 0) {
 				return fmt.Errorf("%w: input %q 不是有限数", ErrCardInputInvalid, key)
 			}
 		case "Input.Date":
@@ -127,6 +139,12 @@ func ValidateInputs(envelopeRaw []byte, inputs map[string]interface{}) error {
 			if !isValidTime(s) {
 				return fmt.Errorf("%w: input %q 不是合法时间(HH:MM)", ErrCardInputInvalid, key)
 			}
+		default:
+			// 声明帧里出现「已白名单收集、但校验器无对应 case」的输入类型：fail-closed 拒。
+			// 当前不可达——collectInputSpecs 只从 isInputElement（inputElements）收集，六类都
+			// 有 case——但显式兜底防止未来往 inputElements 加类型却漏加 case 时退化成 fail-open
+			// （「已声明即放行任意值」的天窗）。与信任边界「未覆盖即拒」一致（PR#556 review）。
+			return fmt.Errorf("%w: input %q 类型 %q 无值校验", ErrCardInputInvalid, key, spec.typ)
 		}
 	}
 	return nil
@@ -159,6 +177,9 @@ func collectInputSpecsFromElements(items []interface{}, specs map[string]inputSp
 		if isInputElement(t) {
 			if id, _ := el["id"].(string); id != "" {
 				spec := inputSpec{typ: t}
+				// 仅 Toggle/ChoiceSet 需采集额外声明（valueOn/off、choices、multiSelect）；
+				// Text/Number/Date/Time 只需 typ（提交期值校验只看格式，不采集 min/max —— 区间
+				// 不服务端强制，见 inputSpec 注释），故无 case。
 				switch t {
 				case "Input.Toggle":
 					spec.valueOn, spec.valueOff = "true", "false"
@@ -180,8 +201,6 @@ func collectInputSpecsFromElements(items []interface{}, specs map[string]inputSp
 						}
 					}
 					spec.multiSelect, _ = el["isMultiSelect"].(bool)
-					// Input.Number/Date/Time：只需 typ（值校验只看格式，不采集 min/max
-					// —— 区间不服务端强制，见 inputSpec 注释）。
 				}
 				specs[id] = spec
 			}

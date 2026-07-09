@@ -28,11 +28,12 @@ accepted only 3 of Adaptive Cards' 6 input elements; added the missing three.
   fall through to `default` and are accepted iff `isInputElement(t)`, so adding
   an input element is a one-line change in `whitelist.go`.
 - **`inputs.go`** — submit-time **format** validation for the new types (trust
-  boundary D11): Number = finite numeric (reject `NaN`/`±Inf`); Date =
-  `YYYY-MM-DD`; Time = `HH:MM` (24h); `""` passes as "unfilled". `min`/`max`
-  range is **not** server-enforced (delegated to bot — see Open item, resolved
-  by maintainer in PR#556 review); `isRequired`/`regex` likewise remain
-  client-UX + bot concerns.
+  boundary D11): Number = strict JSON-number grammar + finite (reject `NaN`/`±Inf`
+  and `ParseFloat`'s Go-only superset `1_000`/`0x1p4`/leading-`+`/…); Date =
+  `YYYY-MM-DD`; Time = `HH:MM` (24h); `""` passes as "unfilled"; a `default` arm
+  fail-closes an unhandled declared input type. `min`/`max` range is **not**
+  server-enforced (delegated to bot — see Open item, resolved by maintainer in
+  PR#556 review); `isRequired`/`regex` likewise remain client-UX + bot concerns.
 - **`interactive.go`** — dispatch (`findSubmitInElements`) walks `inlineAction`
   via the same `isInputElement` predicate as validation.
 - **`modules/bot_api/card_profile.go`** — D12 manifest additively advertises
@@ -59,15 +60,31 @@ Verified live against adaptivecards.io that all three new inputs are AC 1.0 and
   through `isInputElement` / `InputElements()` makes the four physically
   incapable of drifting. Guard tests (`TestInputElementsAuthority`,
   `TestSubmitActionDispatchRichInputInlineAction`) pin the symmetry.
-- **`strconv.ParseFloat` accepts non-finite tokens without error.** `"NaN"`,
-  `"Inf"`, `"+Inf"`, `"Infinity"` (case-insensitive) all parse to a valid
-  `float64` with `err == nil` — so a `ParseFloat`-only "is it a number" check
-  silently accepts non-finite values, and `NaN` further compares `false` against
-  any bound (i.e. it would also slip past a naive `min/max` gate). Non-finite is
-  not a valid numeric input regardless of whether a range is enforced: any
-  numeric wire-input validator must add an explicit `math.IsNaN || math.IsInf`
-  reject. This is the numeric analogue of the "validation surface must cover the
-  whole value space" discipline.
+- **`strconv.ParseFloat` accepts a *superset* of the JSON/JS number grammar — in
+  two independent ways.** (1) Non-finite tokens: `"NaN"`, `"Inf"`, `"+Inf"`,
+  `"Infinity"` (case-insensitive) all parse to a valid `float64` with `err == nil`
+  (and `NaN` compares `false` against any bound, slipping past a naive min/max gate
+  too). (2) Go-only lexical forms: underscore digit separators (`"1_000"`), hex
+  floats (`"0x1p4"`), a leading `+`, and leading zeros all parse fine. Both classes
+  mean a `ParseFloat`-only "is it a number" check blesses strings that the *bot's*
+  JSON parser (the downstream consumer) rejects or reads differently — a silent
+  value corruption across the trust boundary. A wire-input numeric validator must
+  validate against the **consumer's** grammar (strict RFC 8259 JSON-number regexp),
+  then reject non-finite explicitly (`math.IsNaN || math.IsInf`, for overflow like
+  `"1e999"→±Inf`). The server's "valid number" must equal what the value re-parses
+  to downstream — not merely "Go can parse it" (PR#556 review #2).
+- **A capability manifest derived from a whitelist must advertise each element in
+  the position the manifest implies — and its drift-guard must test that position,
+  not any legal one.** The D12 `elements` list read as "top-level display elements a
+  producer can place in `body`", but included `Column` — which the validator only
+  accepts *nested inside `ColumnSet`* (no top-level `Column` case). So the manifest
+  advertised a placement the validator rejects. The guard test masked it by wrapping
+  the `Column` fixture in a `ColumnSet` ("legal position"), so it validated a
+  position the manifest does *not* imply. Fix: drop `Column` from the list (it is
+  structurally subsumed by `ColumnSet`) and make the guard validate every advertised
+  element as a **top-level `body` element** — the exact shape the manifest promises.
+  A drift guard that tests a *different* position than the contract promises is not a
+  guard (PR#556 review #4).
 
 ## Gotchas
 

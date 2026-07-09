@@ -38,7 +38,7 @@
 
 | 类别 | 允许 |
 |---|---|
-| 元素 | `TextBlock`（markdown 子集，§2.1）、`RichTextBlock`、`Image`、`ImageSet`、`Container`、`ColumnSet`/`Column`、`FactSet`、`Table`、`ActionSet`（`RichTextBlock`/`ImageSet`/`Table`/`ActionSet` 为 P3-3 Tier 1 追加，均 AC ≤1.5：ImageSet 1.0 / RichTextBlock 1.2 / ActionSet 1.2 / Table 1.5） |
+| 元素 | `TextBlock`（markdown 子集，§2.1）、`RichTextBlock`、`Image`、`ImageSet`、`Container`、`ColumnSet`（含 `Column` 列）、`FactSet`、`Table`、`ActionSet`（`RichTextBlock`/`ImageSet`/`Table`/`ActionSet` 为 P3-3 Tier 1 追加，均 AC ≤1.5：ImageSet 1.0 / RichTextBlock 1.2 / ActionSet 1.2 / Table 1.5） |
 | 动作 | `Action.OpenUrl`；元素/整卡 `selectAction` **仅当**携带 `Action.OpenUrl` |
 | P2 起（octo/v2） | `Action.Submit`（含 selectAction/ActionSet 携带）、`Input.Text` / `Input.Toggle` / `Input.ChoiceSet` / `Input.Number` / `Input.Date` / `Input.Time`（id 必填且帧内唯一；后三者 P3-3 追加，均 AC 1.0、仍在 `card_version:"1.5"` 内，为白名单增量而非版本升级） |
 | 暂不支持（后续按需） | `Media`(1.1)、`Action.ShowCard`(1.0)、`Action.ToggleVisibility`(1.2)、`Action.Execute`(1.4)、模板/数据绑定，以及 AC 1.6 元素 |
@@ -79,7 +79,8 @@ allowlist —— 服务端用**完整 CommonMark 解析器**（非模式匹配�
 - P2 产者能力发现：`GET /v1/bot/card/profile`（D12，随 P2 落地）返回部署的
   `enabled` / `card_version` / `profiles` / `elements` / `inputs` / `limits` 清单（只增不改）；
   `elements`/`inputs` 是本部署接受的展示元素 / 交互输入白名单（源自 `pkg/cardmsg`
-  权威列表），供 producer 按**元素粒度**前向兼容协商——即便 `card_version` 停在 `"1.5"`，
+  权威列表；`elements` 只列**顶层可放置**元素——`Column` 是 `ColumnSet` 的子列、由
+  `ColumnSet` 涵盖，不单列），供 producer 按**元素粒度**前向兼容协商——即便 `card_version` 停在 `"1.5"`，
   也能探测是否接受 `Input.Number/Date/Time` 等 additive 新增元素。P1 期间生产者以发送被
   400/`card_disabled` 拒绝为「未启用」信号。
 

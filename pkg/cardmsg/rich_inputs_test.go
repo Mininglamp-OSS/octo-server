@@ -2,8 +2,9 @@ package cardmsg
 
 // card-message-p3-rich-inputs（P3-3）：octo/v2 输入白名单扩容
 // Input.Number/Date/Time（均 AC 1.0，落在固定 card_version="1.5" 内），
-// 发送期继承现有 Input.* 纪律；提交期按「形状可信」信任边界校验值
-// （声明过 + 类型对 + 声明区间内），isRequired/regex 仍不服务端强制。
+// 发送期继承现有 Input.* 纪律；提交期按「形状可信」信任边界只校验值的**格式/类型**
+// （声明过 + 类型对），min/max 区间不服务端强制（下放 bot，PR#556）；isRequired/regex
+// 同样不服务端强制。
 
 import (
 	"encoding/json"
@@ -11,7 +12,7 @@ import (
 	"testing"
 )
 
-// numDateTimeCard 构造仅含单个新输入元素的 octo/v2 卡片。
+// richInputCard 构造仅含单个新输入元素的 octo/v2 卡片。
 func richInputCard(el map[string]interface{}) map[string]interface{} {
 	return map[string]interface{}{
 		"type": "AdaptiveCard", "version": "1.5",
@@ -183,12 +184,16 @@ func TestValidateInputsRichUndeclared(t *testing.T) {
 	}
 }
 
-// TestValidateInputsNumberRejectsNonFinite：Input.Number 必须拒非有限数。strconv.ParseFloat
-// 接受 "NaN"/"Inf"/"Infinity"（大小写、正负变体）且**不报 error** —— 非有限数不是合法数值
-// 输入，不得当「形状可信」值透传给 bot（信任边界；这是格式/类型校验，与已下放 bot 的
-// min/max range 无关）。声明与未声明 min/max 的 Number 都必须显式拒。
+// TestValidateInputsNumberRejectsNonFinite：Input.Number 必须拒非有限数——两层防线。
+// (1) 字面 "NaN"/"Inf"/"Infinity"（strconv.ParseFloat 接受且**不报 error**）被严格 JSON 数字
+// 文法门先挡下（非 JSON 数字形态）；(2) 文法合法但数值溢出的 "1e999"→±Inf 由 ParseFloat 的
+// ErrRange + math.IsInf 挡下。非有限数不是合法数值输入，不得当「形状可信」值透传给 bot
+// （信任边界；格式/类型校验，与已下放 bot 的 min/max range 无关）。声明与未声明 min/max 都拒。
 func TestValidateInputsNumberRejectsNonFinite(t *testing.T) {
-	nonFinite := []string{"NaN", "nan", "Inf", "inf", "+Inf", "-Inf", "Infinity", "-infinity"}
+	nonFinite := []string{
+		"NaN", "nan", "Inf", "inf", "+Inf", "-Inf", "Infinity", "-infinity", // 文法门挡下
+		"1e999", "-1e999", "1E1000", // 文法合法但溢出 → 有限检查挡下
+	}
 	unbounded := v2Envelope(richInputCard(map[string]interface{}{"type": "Input.Number", "id": "n"}))
 	rawU, _ := json.Marshal(unbounded)
 	bounded := v2Envelope(richInputCard(map[string]interface{}{
@@ -224,5 +229,68 @@ func TestSubmitActionDispatchRichInputInlineAction(t *testing.T) {
 		if d, found := SubmitAction(raw, "go"); !found || d["k"] != "v" {
 			t.Errorf("%s.inlineAction Submit 应派发可解析, found=%v d=%v", typ, found, d)
 		}
+	}
+}
+
+// TestValidateInputsNumberRejectsParseFloatSuperset：strconv.ParseFloat 的文法是 JSON/JS
+// Number 的**超集**（十六进制浮点 "0x1p4"、前导 "+"、前导零、裸小数点、下划线分隔等它都能
+// 解析成有限数），会放行 bot 端 JSON 解析器拒绝或解读不同的串，造成静默数值错位。严格 JSON
+// 数字文法必须把这些非 JSON 形态一并拒——仅靠 ParseFloat+有限检查会漏（PR#556 review #2）。
+func TestValidateInputsNumberRejectsParseFloatSuperset(t *testing.T) {
+	env := v2Envelope(richInputCard(map[string]interface{}{"type": "Input.Number", "id": "n"}))
+	raw, _ := json.Marshal(env)
+	// ParseFloat 宽容 / 非 JSON 数字文法的形态——全部必须拒。
+	nonJSON := []string{
+		"0x1p4", // 十六进制浮点（ParseFloat=16）
+		"+5",    // 前导 +
+		"05",    // 前导零
+		".5",    // 缺整数部分
+		"5.",    // 缺小数部分
+		"1_000", // 下划线分隔（Go 数字字面量）
+		" 5",    // 前导空白
+		"5 ",    // 尾随空白
+		"1e",    // 残缺指数
+		"٥",     // 非 ASCII 数字（Unicode 数字必须拒，[0-9] 只认 ASCII）
+	}
+	for _, v := range nonJSON {
+		if err := ValidateInputs(raw, map[string]interface{}{"n": v}); !errors.Is(err, ErrCardInputInvalid) {
+			t.Errorf("Input.Number 应拒非 JSON 数字文法 %q, err=%v", v, err)
+		}
+	}
+	// 反向锚点：合法 JSON 数字（含指数、负号、小数、-0）必须仍放行。
+	okJSON := []string{"0", "-0", "42", "-7", "3.14", "1e3", "1E3", "1.5e-3", "-2.5E+2"}
+	for _, v := range okJSON {
+		if err := ValidateInputs(raw, map[string]interface{}{"n": v}); err != nil {
+			t.Errorf("Input.Number 合法 JSON 数字 %q 应放行, err=%v", v, err)
+		}
+	}
+}
+
+// TestValidateInputsRichInputNested：新输入类型声明在嵌套 Container / ColumnSet>Column 内时，
+// 提交期 collectInputSpecs 仍能递归采集到并按类型校验（采集面覆盖新类型，与发送期遍历同口径）。
+func TestValidateInputsRichInputNested(t *testing.T) {
+	card := map[string]interface{}{
+		"type": "AdaptiveCard", "version": "1.5",
+		"body": []interface{}{
+			map[string]interface{}{"type": "Container", "items": []interface{}{
+				map[string]interface{}{"type": "Input.Number", "id": "qty"},
+			}},
+			map[string]interface{}{"type": "ColumnSet", "columns": []interface{}{
+				map[string]interface{}{"type": "Column", "items": []interface{}{
+					map[string]interface{}{"type": "Input.Date", "id": "day"},
+				}},
+			}},
+		},
+	}
+	raw, _ := json.Marshal(v2Envelope(card))
+	if err := ValidateInputs(raw, map[string]interface{}{"qty": "5", "day": "2026-07-09"}); err != nil {
+		t.Errorf("嵌套声明的合法输入应放行, err=%v", err)
+	}
+	// 非法值按类型拒 —— 证明递归确实采集到了 spec 并施加了类型/格式校验（而非未声明放行）。
+	if err := ValidateInputs(raw, map[string]interface{}{"qty": "0x1p4"}); !errors.Is(err, ErrCardInputInvalid) {
+		t.Errorf("嵌套 Input.Number 非法值应拒, err=%v", err)
+	}
+	if err := ValidateInputs(raw, map[string]interface{}{"day": "2026/07/09"}); !errors.Is(err, ErrCardInputInvalid) {
+		t.Errorf("嵌套 Input.Date 非法格式应拒, err=%v", err)
 	}
 }

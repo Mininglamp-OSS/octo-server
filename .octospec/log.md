@@ -9,18 +9,25 @@ change-log convention (§7). Newest first.
 - **Change** — Task `card-message-p3-rich-inputs` (card message P3-3): extend the
   octo/v2 input whitelist with `Input.Number/Date/Time` (all AC 1.0, within the
   pinned `card_version:"1.5"` — additive, no version bump). Submit-time value
-  validation added (Number = finite numeric + declared min/max; Date =
-  `YYYY-MM-DD` + range; Time = `HH:MM` + range; `""` = unfilled;
-  `isRequired`/`regex` still not server-enforced). Refactored the element
+  validation added (format/type only: Number = finite JSON number; Date =
+  `YYYY-MM-DD`; Time = `HH:MM`; `""` = unfilled; declared min/max range NOT
+  server-enforced — delegated to bot, same class as `isRequired`/`regex`, which
+  likewise stay unenforced). Refactored the element
   whitelist into a single `pkg/cardmsg` authority (`whitelist.go`:
   `displayElements`/`inputElements` + `DisplayElements()`/`InputElements()` +
   `isInputElement`) that send-time validation, submit-time collection, action
   dispatch, and the D12 manifest all derive from — no drifting literals. D12
   `GET /v1/bot/card/profile` additively advertises `elements`/`inputs` for
-  element-granularity feature detection. Two review-caught fixes folded in:
-  reject non-finite `Input.Number` (NaN/±Inf bypass `ParseFloat`+bounds), and
-  symmetric `inlineAction` dispatch for the new types (no dead buttons). No new
-  errcode / i18n / DB / migration / endpoint; additive-only wire contract. Brief
+  element-granularity feature detection. Review-caught fixes folded in: reject
+  non-finite `Input.Number` (NaN/±Inf bypass `ParseFloat`); strict JSON-number
+  grammar so the server's "valid number" matches the bot's JSON parser (reject
+  `ParseFloat`'s Go-only superset — `1_000`/`0x1p4`/leading-`+`/leading-zero —
+  which would silently corrupt the value the bot re-parses); `default`
+  fail-closed arm in the submit-time type switch; `Column` dropped from the
+  manifest `elements` (it is a `ColumnSet` child, not a top-level element the
+  validator accepts — advertising it lied about capability); and symmetric
+  `inlineAction` dispatch for the new types (no dead buttons). No new errcode /
+  i18n / DB / migration / endpoint; additive-only wire contract. Brief
   + journal under `.octospec/tasks/card-message-p3-rich-inputs/` and
   `.octospec/journal/shared/card-message-p3-rich-inputs.md`; learning candidate
   in `.octospec/learnings/pending/`.

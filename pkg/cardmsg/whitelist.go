@@ -9,18 +9,21 @@ package cardmsg
 //     校验器（validate.go element() 的 default 分支经 isInputElement）、inputs 采集
 //     （inputs.go collectInputSpecs 经 isInputElement）、D12 清单 inputs 都从它派生 —— 新增
 //     输入元素只改这一处，三方自动同步、不可能漂移。
-//   - displayElements（octo/v1 展示元素，两档共用）只是 **D12 清单 elements 的来源**。校验器
-//     对展示元素是**逐类型手写 case**（TextBlock 查 markdown、Image 查 url、Container 递归
-//     items、ColumnSet 递归 columns、FactSet 查 facts —— 各自校验体不同，无法像输入那样并成
-//     一个 isInputElement 分支）。因此 displayElements 与校验器接受集的一致性**不是结构性
-//     保证，而是由 TestDisplayElementsAuthority 逐个 Validate 守卫**：往这里加展示元素必须
-//     同时给校验器加 case 并让该测试通过，否则清单会广播一个校验器拒绝的元素（漂移 = 谎报能力）。
+//   - displayElements（octo/v1 展示元素，两档共用）只是 **D12 清单 elements 的来源**，且只列
+//     **顶层可放置**的展示元素。校验器对展示元素是**逐类型手写 case**（TextBlock 查 markdown、
+//     Image 查 url、Container 递归 items、ColumnSet 递归 columns、FactSet 查 facts —— 各自校验体
+//     不同，无法像输入那样并成一个 isInputElement 分支）。因此 displayElements 与校验器接受集的
+//     一致性**不是结构性保证，而是由 TestDisplayElementsAuthority 逐个按顶层 body 元素 Validate
+//     守卫**：往这里加展示元素必须同时给校验器加顶层 case 并让该测试通过，否则清单会广播一个
+//     校验器拒绝的元素（漂移 = 谎报能力）。Column 刻意**不**在其中——它非独立元素、只作 ColumnSet
+//     的子列（element() 无顶层 Column case，顶层 Column 会被拒），由 ColumnSet 结构性涵盖
+//     （PR#556 review）。
 //
 // 二者都是 additive-only（同 event_data / D12 wire 演进规则）：只增不改名/删除。
 
 var displayElements = []string{
 	"TextBlock", "RichTextBlock", "Image", "ImageSet",
-	"Container", "ColumnSet", "Column", "FactSet",
+	"Container", "ColumnSet", "FactSet",
 	"Table", "ActionSet",
 }
 
