@@ -54,6 +54,34 @@ func (s *stubUserSvc) ExistBlacklist(uid, toUID string) (bool, error) {
 	return s.blacklist[uid+"->"+toUID], nil
 }
 
+// ExistBlacklistsBoth mirrors the production batch semantics (see
+// user.Service.ExistBlacklistsBoth) on top of the same `blacklist` fixture
+// used by ExistBlacklist. Keeps the two paths equivalent under test so
+// filterBlacklistedDMPeers can migrate to the batch call without
+// re-doing every fixture. Empty peers => empty maps.
+func (s *stubUserSvc) ExistBlacklistsBoth(loginUID string, peers []string) (map[string]bool, map[string]bool, error) {
+	if s.blacklistErr != nil {
+		return nil, nil, s.blacklistErr
+	}
+	blockedByMe := map[string]bool{}
+	blockedByPeer := map[string]bool{}
+	if s.blacklist == nil {
+		return blockedByMe, blockedByPeer, nil
+	}
+	for _, p := range peers {
+		if p == "" || p == loginUID {
+			continue
+		}
+		if s.blacklist[loginUID+"->"+p] {
+			blockedByMe[p] = true
+		}
+		if s.blacklist[p+"->"+loginUID] {
+			blockedByPeer[p] = true
+		}
+	}
+	return blockedByMe, blockedByPeer, nil
+}
+
 // stubGroupSvc same idea for group.IService.GetMembers.
 type stubGroupSvc struct {
 	group.IService

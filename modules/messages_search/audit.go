@@ -58,6 +58,54 @@ func (h *Handler) auditMiddleware() wkhttp.HandlerFunc {
 				fields = append(fields, zap.Int("hits", n))
 			}
 		}
+		// Per-phase timings (YUJ-27): emit whichever phases the handler
+		// recorded. Only global endpoints touch these; single-channel paths
+		// leave them unset and the fields drop from the log line.
+		if v, ok := c.Get(auditFieldAllowlistMsKey); ok {
+			if ms, _ := v.(int64); ms >= 0 {
+				fields = append(fields, zap.Int64("allowlist_ms", ms))
+			}
+		}
+		if v, ok := c.Get(auditFieldMemberActiveMsKey); ok {
+			if ms, _ := v.(int64); ms >= 0 {
+				fields = append(fields, zap.Int64("member_active_ms", ms))
+			}
+		}
+		if v, ok := c.Get(auditFieldBlacklistMsKey); ok {
+			if ms, _ := v.(int64); ms >= 0 {
+				fields = append(fields, zap.Int64("blacklist_ms", ms))
+			}
+		}
+		if v, ok := c.Get(auditFieldThreadEnumMsKey); ok {
+			if ms, _ := v.(int64); ms >= 0 {
+				fields = append(fields, zap.Int64("thread_enum_ms", ms))
+			}
+		}
+		if v, ok := c.Get(auditFieldDMPeersMsKey); ok {
+			if ms, _ := v.(int64); ms >= 0 {
+				fields = append(fields, zap.Int64("dm_peers_ms", ms))
+			}
+		}
+		if v, ok := c.Get(auditFieldOSSearchMsKey); ok {
+			if ms, _ := v.(int64); ms >= 0 {
+				fields = append(fields, zap.Int64("os_search_ms", ms))
+			}
+		}
+		if v, ok := c.Get(auditFieldFilterVisibleMsKey); ok {
+			if ms, _ := v.(int64); ms >= 0 {
+				fields = append(fields, zap.Int64("filter_visible_ms", ms))
+			}
+		}
+		if v, ok := c.Get(auditFieldSenderJoinMsKey); ok {
+			if ms, _ := v.(int64); ms >= 0 {
+				fields = append(fields, zap.Int64("sender_join_ms", ms))
+			}
+		}
+		if v, ok := c.Get(auditFieldOversamplePagesKey); ok {
+			if n, _ := v.(int); n >= 0 {
+				fields = append(fields, zap.Int("oversample_pages", n))
+			}
+		}
 		h.Info("messages_search.audit", fields...)
 	}
 }
@@ -80,6 +128,19 @@ const (
 	auditFieldChannelIDKey   = "messages_search.audit.channel_id"
 	auditFieldKeywordHashKey = "messages_search.audit.keyword_hash"
 	auditFieldHitsKey        = "messages_search.audit.hits"
+
+	// Per-phase timing keys (YUJ-27). Set by the global path only — single-
+	// channel handlers may adopt them incrementally. Values stored as int64
+	// milliseconds; oversample_pages is an int round-count.
+	auditFieldAllowlistMsKey     = "messages_search.audit.allowlist_ms"
+	auditFieldMemberActiveMsKey  = "messages_search.audit.member_active_ms"
+	auditFieldBlacklistMsKey     = "messages_search.audit.blacklist_ms"
+	auditFieldThreadEnumMsKey    = "messages_search.audit.thread_enum_ms"
+	auditFieldDMPeersMsKey       = "messages_search.audit.dm_peers_ms"
+	auditFieldOSSearchMsKey      = "messages_search.audit.os_search_ms"
+	auditFieldFilterVisibleMsKey = "messages_search.audit.filter_visible_ms"
+	auditFieldSenderJoinMsKey    = "messages_search.audit.sender_join_ms"
+	auditFieldOversamplePagesKey = "messages_search.audit.oversample_pages"
 )
 
 // recordAudit stores the per-request audit fields the middleware will pick up.
@@ -90,4 +151,56 @@ func recordAudit(c *wkhttp.Context, kind string, channelType uint8, channelID, k
 	c.Set(auditFieldChannelIDKey, channelID)
 	c.Set(auditFieldKeywordHashKey, hashKeyword(keyword))
 	c.Set(auditFieldHitsKey, hits)
+}
+
+// recordAllowlistTimings ferries per-phase MySQL costs measured inside
+// buildAllowlist onto the request context so the audit middleware can emit
+// them next to took_ms. Zero-valued phases (helper not exercised for this
+// request — e.g. empty spaceID -> no thread enumeration) are still recorded
+// so "absent field vs 0 ms" stays distinguishable in the log.
+func recordAllowlistTimings(c *wkhttp.Context, t allowlistTimings) {
+	if c == nil {
+		return
+	}
+	c.Set(auditFieldAllowlistMsKey, t.totalMs())
+	c.Set(auditFieldMemberActiveMsKey, t.memberActive.Milliseconds())
+	c.Set(auditFieldBlacklistMsKey, t.blacklist.Milliseconds())
+	c.Set(auditFieldThreadEnumMsKey, t.threadEnum.Milliseconds())
+	c.Set(auditFieldDMPeersMsKey, t.dmPeers.Milliseconds())
+}
+
+// recordSearchTimings ferries the post-allowlist phase costs into the audit
+// pipeline. Called after paginateWithFilterDepth returns.
+func recordSearchTimings(c *wkhttp.Context, t searchPhaseTimings) {
+	if c == nil {
+		return
+	}
+	c.Set(auditFieldOSSearchMsKey, t.osSearch.Milliseconds())
+	c.Set(auditFieldFilterVisibleMsKey, t.filterVisible.Milliseconds())
+	c.Set(auditFieldSenderJoinMsKey, t.senderJoin.Milliseconds())
+	c.Set(auditFieldOversamplePagesKey, t.oversamplePages)
+}
+
+// allowlistTimings accumulates the per-phase MySQL costs paid inside
+// buildAllowlist. Zero-value fields represent phases that were not touched
+// for a given request (e.g. spaceID="" skips space_member).
+type allowlistTimings struct {
+	memberActive time.Duration // group ExistMembersActive batch
+	blacklist    time.Duration // DM ExistBlacklistsBoth batch
+	threadEnum   time.Duration // thread QueryNonDeletedShortIDsByGroupNos
+	dmPeers      time.Duration // GetFriends + fetchSpaceMemberUIDs + bot filter
+}
+
+func (t allowlistTimings) totalMs() int64 {
+	return (t.memberActive + t.blacklist + t.threadEnum + t.dmPeers).Milliseconds()
+}
+
+// searchPhaseTimings tracks the post-allowlist phases of a global search:
+// wall-clock time spent inside the paginate loop (OS round-trips +
+// filterVisible), sender-join, and how many oversample rounds we ran.
+type searchPhaseTimings struct {
+	osSearch        time.Duration
+	filterVisible   time.Duration
+	senderJoin      time.Duration
+	oversamplePages int
 }

@@ -2,6 +2,7 @@ package messages_search
 
 import (
 	"strings"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
@@ -346,7 +347,7 @@ func applyGlobalDMSpaceScope(b *elastic.BoolQuery, spaceID string) {
 // Empty channelIDs with ok=true means the caller has no readable rooms in
 // this Space OR the channel_ids/member_uid intersection is empty — the
 // handler should return an empty envelope without touching OS.
-func (h *Handler) resolveGlobalScope(c *wkhttp.Context, loginUID string, channelIDs []GlobalChannelRef, memberUID string) (osChannelIDs []string, spaceID string, singleFast *channelRef, ok bool) {
+func (h *Handler) resolveGlobalScope(c *wkhttp.Context, loginUID string, channelIDs []GlobalChannelRef, memberUID string) (osChannelIDs []string, spaceID string, singleFast *channelRef, timings allowlistTimings, ok bool) {
 	spaceID = strings.TrimSpace(spacepkg.GetSpaceID(c))
 	if spaceID == "" {
 		// DM double-guard is space-dependent; without a Space the guard cannot
@@ -357,17 +358,18 @@ func (h *Handler) resolveGlobalScope(c *wkhttp.Context, loginUID string, channel
 		// indexer rollout.
 		if h.cfg.RequireSpaceID {
 			respondNotFound(c, "channel")
-			return nil, "", nil, false
+			return nil, "", nil, timings, false
 		}
 		h.Warn("messages_search: global search without spaceID; OCTO_SEARCH_REQUIRE_SPACE_ID=false escape hatch active",
 			zap.String("uid", loginUID))
 	}
 
-	allowGroup, allowDM, allowThread, err := h.buildAllowlist(c, loginUID, spaceID)
+	allowGroup, allowDM, allowThread, allowTimings, err := h.buildAllowlist(c, loginUID, spaceID)
+	timings = allowTimings
 	if err != nil {
 		h.Error("messages_search: allowlist build failed", zap.Error(err))
 		respondInternal(c)
-		return nil, "", nil, false
+		return nil, "", nil, timings, false
 	}
 	allowSet := make(map[string]channelRef, len(allowGroup)+len(allowDM)+len(allowThread))
 	for _, r := range allowGroup {
@@ -416,7 +418,7 @@ func (h *Handler) resolveGlobalScope(c *wkhttp.Context, loginUID string, channel
 		if mErr != nil {
 			h.Error("messages_search: member-scope resolution failed", zap.Error(mErr))
 			respondInternal(c)
-			return nil, "", nil, false
+			return nil, "", nil, timings, false
 		}
 		// scope ∩ memberScope
 		intersect := make(map[string]channelRef, len(scope))
@@ -429,7 +431,7 @@ func (h *Handler) resolveGlobalScope(c *wkhttp.Context, loginUID string, channel
 	}
 
 	if len(scope) == 0 {
-		return nil, spaceID, nil, true
+		return nil, spaceID, nil, timings, true
 	}
 
 	osChannelIDs = make([]string, 0, len(scope))
@@ -444,7 +446,7 @@ func (h *Handler) resolveGlobalScope(c *wkhttp.Context, loginUID string, channel
 			singleFast = &r
 		}
 	}
-	return osChannelIDs, spaceID, singleFast, true
+	return osChannelIDs, spaceID, singleFast, timings, true
 }
 
 // buildAllowlist enumerates every OS channelId the caller can read within the
@@ -494,10 +496,11 @@ func (h *Handler) resolveGlobalScope(c *wkhttp.Context, loginUID string, channel
 // but it is a real UX gap the API contract should surface. Tightening
 // this requires a `thread_member` join and is deferred to v1.1; the
 // tradeoff is documented on channelsForMember.
-func (h *Handler) buildAllowlist(_ *wkhttp.Context, loginUID, spaceID string) ([]channelRef, []channelRef, []channelRef, error) {
+func (h *Handler) buildAllowlist(_ *wkhttp.Context, loginUID, spaceID string) ([]channelRef, []channelRef, []channelRef, allowlistTimings, error) {
+	var timings allowlistTimings
 	groups, err := h.groupService.GetGroupsWithMemberUID(loginUID)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, timings, err
 	}
 	externalLookup := h.externalGroupFn
 	if externalLookup == nil {
@@ -538,12 +541,14 @@ func (h *Handler) buildAllowlist(_ *wkhttp.Context, loginUID, spaceID string) ([
 	// of degrading to the un-gated allowlist.
 	activeGroupSet := candidateGroupSet
 	if len(candidateGroupNos) > 0 {
+		start := time.Now()
 		activeNos, gerr := h.groupService.ExistMembersActive(candidateGroupNos, loginUID)
+		timings.memberActive += time.Since(start)
 		if gerr != nil {
 			h.Error("messages_search: ExistMembersActive lookup failed; fail-closed on group allowlist",
 				zap.String("login_uid", loginUID),
 				zap.Error(gerr))
-			return nil, nil, nil, gerr
+			return nil, nil, nil, timings, gerr
 		}
 		activeGroupSet = make(map[string]struct{}, len(activeNos))
 		for _, no := range activeNos {
@@ -566,9 +571,12 @@ func (h *Handler) buildAllowlist(_ *wkhttp.Context, loginUID, spaceID string) ([
 	// DM peers: friend list ∪ Space members, minus bots not in the current
 	// Space. Mirrors the filtering in modules/search/api.go so the two
 	// surfaces converge on the same DM candidate set.
-	dmPeers, err := h.enumerateDMPeers(loginUID, spaceID)
-	if err != nil {
-		return nil, nil, nil, err
+	dmStart := time.Now()
+	dmPeers, dmBlacklistMs, dmErr := h.enumerateDMPeersTimed(loginUID, spaceID)
+	timings.dmPeers += time.Since(dmStart) - dmBlacklistMs
+	timings.blacklist += dmBlacklistMs
+	if dmErr != nil {
+		return nil, nil, nil, timings, dmErr
 	}
 	allowDM := make([]channelRef, 0, len(dmPeers))
 	for _, peer := range dmPeers {
@@ -585,11 +593,13 @@ func (h *Handler) buildAllowlist(_ *wkhttp.Context, loginUID, spaceID string) ([
 	// Threads under the joined groups — single batch IN query. Soft-fail:
 	// on error we log + serve group/DM only so a MySQL blip on the thread
 	// side doesn't sink the whole global endpoint.
+	threadStart := time.Now()
 	allowThread := h.enumerateThreadsForGroups(groupNos)
+	timings.threadEnum += time.Since(threadStart)
 
 	// Kept as separate slices only for readability at the call site; the
 	// caller flattens all three into a single set.
-	return allowGroup, allowDM, allowThread, nil
+	return allowGroup, allowDM, allowThread, timings, nil
 }
 
 // enumerateThreadsForGroups fans a single batch query against the thread
@@ -751,39 +761,99 @@ func (h *Handler) enumerateDMPeers(loginUID, spaceID string) ([]string, error) {
 	return h.applyDMBotFilter(spaceID, peers)
 }
 
+// enumerateDMPeersTimed is a timing-aware wrapper around enumerateDMPeers.
+// blacklistDur reports the wall-clock time spent inside
+// ExistBlacklistsBoth so the caller can bucket it under a dedicated
+// audit field (audit's blacklist_ms). The rest of the time — GetFriends,
+// fetchSpaceMemberUIDs, bot filter — is attributed to the dm_peers bucket
+// by the caller subtracting blacklistDur from the wall-clock delta.
+func (h *Handler) enumerateDMPeersTimed(loginUID, spaceID string) ([]string, time.Duration, error) {
+	startToken := time.Now()
+	_ = startToken // reserved: measure sub-phases in enumerateDMPeers itself
+	// We instrument the sole blacklist call via an atomic
+	// counter-style capture. Simplest option: temporarily swap in a
+	// shim on filterBlacklistedDMPeers is intrusive; instead we
+	// re-implement enumerateDMPeers here with the timing hook inlined
+	// so the production path stays a single method. The two must stay
+	// semantically equivalent — tests for enumerateDMPeers exercise
+	// the plain method (below) directly.
+	var blacklistDur time.Duration
+	friends, err := h.userService.GetFriends(loginUID)
+	if err != nil {
+		return nil, 0, err
+	}
+	peers := make([]string, 0, len(friends))
+	for _, f := range friends {
+		if f == nil || f.UID == "" || f.UID == loginUID {
+			continue
+		}
+		peers = append(peers, f.UID)
+	}
+	if spaceID != "" {
+		members, mErr := h.fetchSpaceMemberUIDs(spaceID, loginUID)
+		if mErr != nil {
+			h.Warn("messages_search: space_member enumeration failed; falling back to friends-only DM allowlist",
+				zap.Error(mErr))
+		} else {
+			peers = append(peers, members...)
+		}
+	}
+	peers = util.RemoveRepeatedElement(peers)
+
+	// Time only the bidirectional blacklist gate — the piece YUJ-27
+	// batched from 2N per-peer round-trips down to 1 IN query.
+	blStart := time.Now()
+	peers = h.filterBlacklistedDMPeers(loginUID, peers)
+	blacklistDur = time.Since(blStart)
+
+	if spaceID == "" {
+		return peers, blacklistDur, nil
+	}
+	if len(peers) == 0 {
+		return peers, blacklistDur, nil
+	}
+	filtered, err := h.applyDMBotFilter(spaceID, peers)
+	return filtered, blacklistDur, err
+}
+
 // filterBlacklistedDMPeers drops peers involved in a bidirectional-blacklist
-// edge with loginUID. Fail-closed on error for the offending peer (skip it),
-// per checkP2PAccess semantics — we would rather hide a legit DM than leak a
-// blacklisted one when the blacklist table is unreachable.
+// edge with loginUID. Fail-closed on error: on batch-lookup failure the
+// whole peer set is dropped for this request (mirrors the previous per-peer
+// behaviour which skipped the offending peer; a single batch call means one
+// error affects every peer at once, so fail-closed = drop them all rather
+// than silently downgrade to an un-gated allowlist).
+//
+// Perf (YUJ-27): previously this function did 2N MySQL round-trips (one
+// ExistBlacklist per direction per peer). For a user with a few hundred
+// friends / same-Space members that was the dominant latency source on
+// _search_global_messages / _search_global_files (~4.5s end-to-end even
+// though OS itself served in <20ms). We now issue a single IN-based batch
+// via userService.ExistBlacklistsBoth, which preserves the exact
+// bidirectional semantics of the per-pair check while collapsing 2N
+// round-trips to 1.
 func (h *Handler) filterBlacklistedDMPeers(loginUID string, peers []string) []string {
 	if len(peers) == 0 {
 		return peers
+	}
+	blockedByMe, blockedByPeer, err := h.userService.ExistBlacklistsBoth(loginUID, peers)
+	if err != nil {
+		// Fail-closed: hide every candidate DM rather than leak a
+		// blacklisted one when the blacklist table is unreachable. Matches
+		// the intent of the previous per-peer fail-closed branch (skip the
+		// offender); with a single batch call an error affects the whole
+		// set at once, so drop the whole set.
+		h.Error("messages_search: ExistBlacklistsBoth failed; dropping all DM peers fail-closed",
+			zap.String("login_uid", loginUID),
+			zap.Int("peer_count", len(peers)),
+			zap.Error(err))
+		return nil
 	}
 	out := make([]string, 0, len(peers))
 	for _, peer := range peers {
 		if peer == "" || peer == loginUID {
 			continue
 		}
-		blockedByMe, err := h.userService.ExistBlacklist(loginUID, peer)
-		if err != nil {
-			h.Error("messages_search: ExistBlacklist(me->peer) failed; dropping DM peer fail-closed",
-				zap.String("login_uid", loginUID),
-				zap.String("peer_uid", peer),
-				zap.Error(err))
-			continue
-		}
-		if blockedByMe {
-			continue
-		}
-		blockedByPeer, err := h.userService.ExistBlacklist(peer, loginUID)
-		if err != nil {
-			h.Error("messages_search: ExistBlacklist(peer->me) failed; dropping DM peer fail-closed",
-				zap.String("login_uid", loginUID),
-				zap.String("peer_uid", peer),
-				zap.Error(err))
-			continue
-		}
-		if blockedByPeer {
+		if blockedByMe[peer] || blockedByPeer[peer] {
 			continue
 		}
 		out = append(out, peer)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/olivere/elastic"
@@ -54,10 +55,11 @@ func (h *Handler) searchGlobalFiles(c *wkhttp.Context) {
 		return
 	}
 
-	osChannelIDs, spaceID, singleFast, ok := h.resolveGlobalScope(c, loginUID, req.Filters.ChannelIDs, req.Filters.MemberUID)
+	osChannelIDs, spaceID, singleFast, allowTimings, ok := h.resolveGlobalScope(c, loginUID, req.Filters.ChannelIDs, req.Filters.MemberUID)
 	if !ok {
 		return
 	}
+	recordAllowlistTimings(c, allowTimings)
 	if singleFast != nil {
 		h.dispatchSingleFiles(c, req, *singleFast, loginUID, pageSize)
 		return
@@ -115,8 +117,9 @@ func (h *Handler) searchGlobalFiles(c *wkhttp.Context) {
 		return res.Hits.Hits, nil
 	}
 
-	filtered, hasMore, nextCursor, err := h.paginateWithFilterDepth(
-		ctx, loginUID, "", pageSize, priorDepth, initialAfter, isRelevance, osQuery, projectDocRef("", loginUID),
+	var searchTimings searchPhaseTimings
+	filtered, hasMore, nextCursor, err := h.paginateWithFilterDepthInstr(
+		ctx, loginUID, "", pageSize, priorDepth, initialAfter, isRelevance, osQuery, projectDocRef("", loginUID), &searchTimings,
 	)
 	if err != nil {
 		if responder := classifyOSError(err); responder != nil {
@@ -129,8 +132,11 @@ func (h *Handler) searchGlobalFiles(c *wkhttp.Context) {
 		return
 	}
 
+	sjStart := time.Now()
 	items := h.buildGlobalFileHits(ctx, filtered, loginUID)
+	searchTimings.senderJoin = time.Since(sjStart)
 	recordAudit(c, "search_global_files", 0, "", req.Keyword, len(items))
+	recordSearchTimings(c, searchTimings)
 	c.Response(envelope(items, hasMore, nextCursor))
 }
 

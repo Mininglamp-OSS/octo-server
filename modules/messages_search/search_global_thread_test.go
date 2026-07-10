@@ -70,7 +70,7 @@ func TestBuildAllowlist_IncludesThreadChannelIDs(t *testing.T) {
 		}, nil
 	}
 
-	allowGroup, _, allowThread, err := h.buildAllowlist(nil, loginUID, "")
+	allowGroup, _, allowThread, _, err := h.buildAllowlist(nil, loginUID, "")
 	if err != nil {
 		t.Fatalf("buildAllowlist: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestBuildAllowlist_ThreadEnumerateSoftFail(t *testing.T) {
 		return nil, errors.New("mysql: connection refused")
 	}
 
-	allowGroup, allowDM, allowThread, err := h.buildAllowlist(nil, loginUID, "")
+	allowGroup, allowDM, allowThread, _, err := h.buildAllowlist(nil, loginUID, "")
 	if err != nil {
 		t.Fatalf("thread DB error must NOT propagate; got %v", err)
 	}
@@ -154,7 +154,7 @@ func TestBuildAllowlist_ThreadPerGroupCap(t *testing.T) {
 		}, nil
 	}
 
-	allowGroup, _, allowThread, err := h.buildAllowlist(nil, loginUID, "")
+	allowGroup, _, allowThread, _, err := h.buildAllowlist(nil, loginUID, "")
 	if err != nil {
 		t.Fatalf("buildAllowlist: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestBuildAllowlist_ThreadGlobalAggregateCap(t *testing.T) {
 		return m, nil
 	}
 
-	_, _, allowThread, err := h.buildAllowlist(nil, loginUID, "")
+	_, _, allowThread, _, err := h.buildAllowlist(nil, loginUID, "")
 	if err != nil {
 		t.Fatalf("buildAllowlist: %v", err)
 	}
@@ -293,7 +293,7 @@ func TestBuildAllowlist_EmptyGroupsNoThreadQuery(t *testing.T) {
 		return nil, nil
 	}
 
-	_, _, allowThread, err := h.buildAllowlist(nil, loginUID, "")
+	_, _, allowThread, _, err := h.buildAllowlist(nil, loginUID, "")
 	if err != nil {
 		t.Fatalf("buildAllowlist: %v", err)
 	}
@@ -363,7 +363,7 @@ func TestResolveGlobalScope_ThreadNarrowingHits(t *testing.T) {
 	// stays off (the default) and resolveGlobalScope proceeds without a
 	// Space gate.
 	c, _ := newValidatorCtx(t)
-	osIDs, _, singleFast, ok := h.resolveGlobalScope(c, loginUID,
+	osIDs, _, singleFast, _, ok := h.resolveGlobalScope(c, loginUID,
 		[]GlobalChannelRef{{ChannelID: threadID, ChannelType: channelTypeThread}}, "")
 	if !ok {
 		t.Fatalf("resolveGlobalScope must succeed; a response was already written")
@@ -398,7 +398,7 @@ func TestResolveGlobalScope_ThreadOutsideMembership(t *testing.T) {
 
 	c, _ := newValidatorCtx(t)
 	foreignThread := thread.BuildChannelID("grpB", "thrX")
-	osIDs, _, singleFast, ok := h.resolveGlobalScope(c, loginUID,
+	osIDs, _, singleFast, _, ok := h.resolveGlobalScope(c, loginUID,
 		[]GlobalChannelRef{{ChannelID: foreignThread, ChannelType: channelTypeThread}}, "")
 	if !ok {
 		t.Fatalf("resolveGlobalScope must succeed even when scope collapses to empty")
@@ -574,7 +574,7 @@ func TestBuildAllowlist_ArchivedThreadsIncluded(t *testing.T) {
 		return map[string][]string{"grpA": {active, archived}}, nil
 	}
 
-	_, _, allowThread, err := h.buildAllowlist(nil, loginUID, "")
+	_, _, allowThread, _, err := h.buildAllowlist(nil, loginUID, "")
 	if err != nil {
 		t.Fatalf("buildAllowlist: %v", err)
 	}
@@ -622,7 +622,7 @@ func TestBuildAllowlist_DeletedThreadsExcluded(t *testing.T) {
 		return map[string][]string{"grpA": {visible}}, nil
 	}
 
-	_, _, allowThread, err := h.buildAllowlist(nil, loginUID, "")
+	_, _, allowThread, _, err := h.buildAllowlist(nil, loginUID, "")
 	if err != nil {
 		t.Fatalf("buildAllowlist: %v", err)
 	}
@@ -667,7 +667,7 @@ func TestResolveGlobalScope_ArchivedThreadNarrowingHits(t *testing.T) {
 	}
 
 	c, _ := newValidatorCtx(t)
-	osIDs, _, singleFast, ok := h.resolveGlobalScope(c, loginUID,
+	osIDs, _, singleFast, _, ok := h.resolveGlobalScope(c, loginUID,
 		[]GlobalChannelRef{{ChannelID: archivedChan, ChannelType: channelTypeThread}}, "")
 	if !ok {
 		t.Fatalf("resolveGlobalScope must succeed; a response was already written")

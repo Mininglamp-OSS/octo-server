@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/message"
@@ -357,6 +358,26 @@ func (h *Handler) paginateWithFilterDepth(
 	osQuery osQueryFn,
 	project projectFn,
 ) ([]*elastic.SearchHit, bool, string, error) {
+	return h.paginateWithFilterDepthInstr(ctx, loginUID, channelID, pageSize, priorDepth, initialSearchAfter, isRelevanceSort, osQuery, project, nil)
+}
+
+// paginateWithFilterDepthInstr is paginateWithFilterDepth plus optional
+// per-phase timing capture. Pass a non-nil timings sink to accumulate
+// os_search_ms, filter_visible_ms and oversample_pages across every round
+// of the oversample loop. YUJ-27: the global endpoints hand a sink in so
+// audit can report where the request actually spent time; single-channel
+// handlers pass nil and pay zero timing overhead.
+func (h *Handler) paginateWithFilterDepthInstr(
+	ctx context.Context,
+	loginUID, channelID string,
+	pageSize int,
+	priorDepth int64,
+	initialSearchAfter []any,
+	isRelevanceSort bool,
+	osQuery osQueryFn,
+	project projectFn,
+	timings *searchPhaseTimings,
+) ([]*elastic.SearchHit, bool, string, error) {
 	collected := make([]*elastic.SearchHit, 0, pageSize)
 	searchAfter := initialSearchAfter
 	fetchSize := pageSize * oversampleMultiplier
@@ -367,7 +388,20 @@ func (h *Handler) paginateWithFilterDepth(
 	)
 
 	for round := 0; round < loopBudget; round++ {
-		hits, err := osQuery(searchAfter, fetchSize)
+		if timings != nil {
+			timings.oversamplePages = round + 1
+		}
+		var (
+			hits []*elastic.SearchHit
+			err  error
+		)
+		if timings != nil {
+			start := time.Now()
+			hits, err = osQuery(searchAfter, fetchSize)
+			timings.osSearch += time.Since(start)
+		} else {
+			hits, err = osQuery(searchAfter, fetchSize)
+		}
 		if err != nil {
 			return nil, false, "", err
 		}
@@ -390,9 +424,19 @@ func (h *Handler) paginateWithFilterDepth(
 			refs[i] = r
 			filterInput = append(filterInput, r)
 		}
-		keep, err := h.filterVisible(ctx, loginUID, channelID, filterInput)
-		if err != nil {
-			return nil, false, "", err
+		keep := map[string]struct{}{}
+		if len(filterInput) > 0 {
+			var fverr error
+			if timings != nil {
+				start := time.Now()
+				keep, fverr = h.filterVisible(ctx, loginUID, channelID, filterInput)
+				timings.filterVisible += time.Since(start)
+			} else {
+				keep, fverr = h.filterVisible(ctx, loginUID, channelID, filterInput)
+			}
+			if fverr != nil {
+				return nil, false, "", fverr
+			}
 		}
 
 		filledThisRound := false

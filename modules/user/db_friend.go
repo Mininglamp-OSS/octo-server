@@ -252,6 +252,65 @@ func (d *friendDB) existBlacklist(uid string, toUID string) (bool, error) {
 	_, err := d.session.Select("count(*)").From("user_setting").Where("((uid=? and to_uid=?) or (uid=? and to_uid=?)) and blacklist=1", uid, toUID, toUID, uid).Load(&cn)
 	return cn > 0, err
 }
+
+// existBlacklistsBoth 一次 SQL 拉回△loginUID 与 peers 集合之间的所有拉黑边（任一方向），
+// 并拆成 blockedByMe / blockedByPeer 两个 map。语义与 existBlacklist 逐对调用完全一致：
+// 双向任一方向 blacklist=1 即命中。空 peers 直接返回空 map。
+//
+// 创建的因由：messages_search.buildAllowlist 早前对每个 DM peer 打两次
+// existBlacklist SQL（自己->peer + peer->自己），好友 / 同 Space 成员上百时累积上
+// 千次串行 MySQL round-trip 抛禁全局搜索到秒级（YUJ-27）。本方法把 N 次串行
+// 折成 1 次 IN 查询。
+func (d *friendDB) existBlacklistsBoth(loginUID string, peers []string) (map[string]bool, map[string]bool, error) {
+	blockedByMe := map[string]bool{}
+	blockedByPeer := map[string]bool{}
+	if loginUID == "" || len(peers) == 0 {
+		return blockedByMe, blockedByPeer, nil
+	}
+	// 去重 + 剔除自环和空串，避免把 loginUID 当 peer 传入造成 (uid=? AND to_uid=?)
+	// 两条分支同时命中同一行。
+	seen := make(map[string]struct{}, len(peers))
+	uniq := make([]string, 0, len(peers))
+	for _, p := range peers {
+		if p == "" || p == loginUID {
+			continue
+		}
+		if _, dup := seen[p]; dup {
+			continue
+		}
+		seen[p] = struct{}{}
+		uniq = append(uniq, p)
+	}
+	if len(uniq) == 0 {
+		return blockedByMe, blockedByPeer, nil
+	}
+	var rows []struct {
+		UID   string `db:"uid"`
+		ToUID string `db:"to_uid"`
+	}
+	// 两条分支分别命中「loginUID 拉黑了 peer」和「peer 拉黑了 loginUID」。
+	// dbr 的 IN 子句接受 []string 直接展开为 bind params，与已有的 QueryFriendsWithToUIDs
+	// 使用方式一致（见 db_friend.go）。
+	_, err := d.session.
+		Select("uid", "to_uid").
+		From("user_setting").
+		Where("blacklist=1 and ((uid=? and to_uid in ?) or (uid in ? and to_uid=?))",
+			loginUID, uniq, uniq, loginUID).
+		Load(&rows)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, r := range rows {
+		if r.UID == loginUID && r.ToUID != "" && r.ToUID != loginUID {
+			blockedByMe[r.ToUID] = true
+			continue
+		}
+		if r.ToUID == loginUID && r.UID != "" && r.UID != loginUID {
+			blockedByPeer[r.UID] = true
+		}
+	}
+	return blockedByMe, blockedByPeer, nil
+}
 func (d *friendDB) insertApplyTx(m *FriendApplyModel, tx *dbr.Tx) error {
 	_, err := tx.InsertInto("friend_apply_record").Columns(util.AttrToUnderscore(m)...).Record(m).Exec()
 	return err
