@@ -119,12 +119,22 @@ func newTestRouter(t *testing.T, p *Proxy) *wkhttp.WKHttp {
 			c.AbortWithStatus(http.StatusUnauthorized)
 			return
 		}
-		// 从 token 里派生 uid：简化桩，格式 "tok:<uid>"，回落到 tok 本身。
-		uid := tok
+		// 简化桩："tok:<uid>[:name[:role]]"，只留 uid 时 name/role 走空/未识别路径，
+		// 让 normalizeRole 兜底成 member —— 正好覆盖"登录态没写 role"这种真实场景。
+		uid, name, role := tok, "", ""
 		if strings.HasPrefix(tok, "tok:") {
-			uid = strings.TrimPrefix(tok, "tok:")
+			parts := strings.SplitN(strings.TrimPrefix(tok, "tok:"), ":", 3)
+			uid = parts[0]
+			if len(parts) >= 2 {
+				name = parts[1]
+			}
+			if len(parts) >= 3 {
+				role = parts[2]
+			}
 		}
 		c.Set("uid", uid)
+		c.Set("name", name)
+		c.Set("role", role)
 		c.Next()
 	}
 	if p == nil {
@@ -225,7 +235,8 @@ func TestProxy_InjectsOctoToken_StripsCallerCreds(t *testing.T) {
 	r := newTestRouter(t, p)
 
 	h := http.Header{}
-	h.Set(headerToken, "tok:alice")
+	// tok:<uid>:<name>:<role>：走 admin 分支，验证 role 原样透传。
+	h.Set(headerToken, "tok:alice:Alice A:admin")
 	h.Set(headerAuth, "Bearer leak-me")
 	h.Set(headerCookie, "sess=leak-me")
 	h.Set("X-Business", "keep")
@@ -235,7 +246,10 @@ func TestProxy_InjectsOctoToken_StripsCallerCreds(t *testing.T) {
 	require.Equal(t, int64(1), atomic.LoadInt64(&cap.calls))
 
 	got := cap.headers.Load().(http.Header)
-	assert.Equal(t, "tok:alice", got.Get(headerOctoToken), "X-Octo-Token 必须注入")
+	assert.Equal(t, "tok:alice:Alice A:admin", got.Get(headerOctoToken), "X-Octo-Token 必须注入")
+	assert.Equal(t, "alice", got.Get(headerOctoUID), "X-Octo-Uid 必须注入登录态 uid")
+	assert.Equal(t, "Alice A", got.Get(headerOctoName), "X-Octo-Name 必须注入登录态 name")
+	assert.Equal(t, roleAdmin, got.Get(headerOctoRole), "X-Octo-Role 必须注入登录态 role")
 	assert.Empty(t, got.Get(headerAuth), "Authorization 必须剥掉")
 	assert.Empty(t, got.Get(headerCookie), "Cookie 必须剥掉")
 	assert.Empty(t, got.Get(headerToken), "原始 token header 必须剥掉，只保留 X-Octo-Token")
@@ -415,10 +429,73 @@ func TestDirector_PathRootWhenPrefixOnly(t *testing.T) {
 
 	u, _ := url.Parse("http://example.invalid" + routePrefix)
 	req := &http.Request{URL: u, Header: http.Header{}}
-	req = req.WithContext(withToken(req.Context(), "T"))
+	req = req.WithContext(withIdentity(req.Context(), identity{token: "T", uid: "u", name: "n", role: roleAdmin}))
 	p.director(req)
 	assert.Equal(t, "/", req.URL.Path)
 	assert.Equal(t, "T", req.Header.Get(headerOctoToken))
+	assert.Equal(t, "u", req.Header.Get(headerOctoUID))
+	assert.Equal(t, "n", req.Header.Get(headerOctoName))
+	assert.Equal(t, roleAdmin, req.Header.Get(headerOctoRole))
+}
+
+// OCT-145 方案 C：caller 自带 X-Octo-Uid/Name/Role 必须被 Del 后由反代覆写，
+// 否则外网 caller 可伪造身份。fakeAuth 里 role 走 "admin"，Del 后应看到 admin
+// 而不是 caller 塞的 "superAdmin"。
+func TestProxy_OverridesCallerIdentityHeaders(t *testing.T) {
+	cap := &upstreamCapture{}
+	up := newUpstream(t, cap)
+	p := buildProxy(t, up.URL)
+	r := newTestRouter(t, p)
+
+	h := http.Header{}
+	h.Set(headerToken, "tok:alice:Alice A:admin")
+	// caller 伪造：想把自己变超管、换 uid、换名字。
+	h.Set(headerOctoUID, "attacker")
+	h.Set(headerOctoName, "Root")
+	h.Set(headerOctoRole, roleSuperAdmin)
+
+	w := doReq(t, r, http.MethodGet, "/v1/docs/proxy/x", h, "")
+	assert.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, int64(1), atomic.LoadInt64(&cap.calls))
+
+	got := cap.headers.Load().(http.Header)
+	assert.Equal(t, "alice", got.Get(headerOctoUID), "caller 伪造的 uid 必须被覆写")
+	assert.Equal(t, "Alice A", got.Get(headerOctoName), "caller 伪造的 name 必须被覆写")
+	assert.Equal(t, roleAdmin, got.Get(headerOctoRole), "caller 伪造的 role 必须被覆写")
+}
+
+// 登录态 role 未知/为空时降级 member，不把空串或未识别字面透给 doc。
+func TestProxy_RoleFallsBackToMember(t *testing.T) {
+	cap := &upstreamCapture{}
+	up := newUpstream(t, cap)
+	p := buildProxy(t, up.URL)
+	r := newTestRouter(t, p)
+
+	// tok:<uid> —— fakeAuth 里 name/role 都为空，normalizeRole 兜底成 member。
+	h := http.Header{}
+	h.Set(headerToken, "tok:bob")
+	w := doReq(t, r, http.MethodGet, "/v1/docs/proxy/x", h, "")
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	got := cap.headers.Load().(http.Header)
+	assert.Equal(t, "bob", got.Get(headerOctoUID))
+	assert.Empty(t, got.Get(headerOctoName), "登录态没 name 时不写空串以外的值")
+	assert.Equal(t, roleMember, got.Get(headerOctoRole), "未知 role 一律降级 member")
+}
+
+// normalizeRole 分支穷举：保 superAdmin/admin 原样，其他一律 member。
+func TestNormalizeRole(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{roleSuperAdmin, roleSuperAdmin},
+		{roleAdmin, roleAdmin},
+		{roleMember, roleMember},
+		{"", roleMember},
+		{"weird-role", roleMember},
+		{"SuperAdmin", roleMember}, // 大小写严格；wkhttp 定义就是小驼峰。
+	}
+	for _, c := range cases {
+		assert.Equal(t, c.want, normalizeRole(c.in), "in=%q", c.in)
+	}
 }
 
 // 确认 ctx 传 nil 不会挂：New 只用 ctx 存字段，Route 才真正读 ctx.AuthMiddleware。

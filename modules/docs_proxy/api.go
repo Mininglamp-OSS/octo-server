@@ -2,14 +2,20 @@ package docs_proxy
 
 // 反向代理实现，把 /v1/docs/proxy/*path 转发到 OCTO_DOCS_UPSTREAM。
 //
-// 契约（与父单 OCT-136 §4 + FEAT-1 身份桥一致）：
+// 契约（与父单 OCT-136 §4 + FEAT-1 身份桥 + OCT-145 方案 C 内网信任头一致）：
 //   - AuthMiddleware 已在 group 上：未登录一律 401，匿名不透传。
 //   - 转发时注入 X-Octo-Token = 当前请求的 "token" header 原值（AuthMiddleware
 //     校验过合法性），供 doc 侧 FEAT-1 反查 uid。
+//   - OCT-145 方案 C：反代→doc 走内网信任通道，额外注入身份三元组
+//     X-Octo-Uid / X-Octo-Name / X-Octo-Role，doc 侧直接消费，不再回打 userinfo。
+//     注入前一律 Del 掉 caller 可能自带的同名头，防伪造身份。
 //   - 剥离 caller 侧 Authorization / Cookie / 原始 token header，防止 leak 到 upstream。
 //   - hop-by-hop headers（RFC 7230 §6.1 + Trailer/Upgrade）请求响应两侧都 strip。
 //   - 响应 body 直接 streaming（httputil 默认行为），不整段缓存。
 //   - CORS 预检 OPTIONS：直接放行，不反代（返回 204，Allow-* 由前置网关处理）。
+//
+// 部署侧硬约束（OCT-145 方案 C）：反代→doc 必须走内网，doc 侧只在内网监听。
+// 三个身份头一旦被外网 caller 直接打到 doc 就是身份伪造缺口 —— 见 README.md。
 
 import (
 	"context"
@@ -39,9 +45,18 @@ const (
 
 	// header 常量：常量而不是字面量是为了单测能引用同一份 key，避免测试与实现字面漂移。
 	headerOctoToken = "X-Octo-Token"
+	headerOctoUID   = "X-Octo-Uid"
+	headerOctoName  = "X-Octo-Name"
+	headerOctoRole  = "X-Octo-Role"
 	headerToken     = "token"
 	headerAuth      = "Authorization"
 	headerCookie    = "Cookie"
+
+	// role 值域：doc 侧按稳定字符串判权（superAdmin/admin/member），
+	// 未识别一律降级为 member，避免把空串或未知字面吐给 doc 造成隐式提权。
+	roleSuperAdmin = "superAdmin"
+	roleAdmin      = "admin"
+	roleMember     = "member"
 )
 
 // hopByHop 是 RFC 7230 §6.1 的 hop-by-hop headers，加 Trailer/Upgrade。
@@ -140,8 +155,15 @@ func (p *Proxy) handle(c *wkhttp.Context) {
 		c.AbortWithStatus(http.StatusUnauthorized)
 		return
 	}
-	// director 里要读这个 token 注入到 upstream 请求，用 context 传（不落全局 map）。
-	c.Request = c.Request.WithContext(withToken(c.Request.Context(), token))
+	// OCT-145 方案 C：把已鉴权的登录态一并封进 context，director 里注入内网信任头。
+	// name/role 允许为空（部分登录路径可能没写全）；role 用 normalizeRole 收敛值域。
+	id := identity{
+		token: token,
+		uid:   c.GetLoginUID(),
+		name:  c.GetLoginName(),
+		role:  normalizeRole(c.GetLoginRole()),
+	}
+	c.Request = c.Request.WithContext(withIdentity(c.Request.Context(), id))
 	p.rp.ServeHTTP(c.Writer, c.Request)
 }
 
@@ -168,13 +190,29 @@ func (p *Proxy) director(req *http.Request) {
 	req.Header.Del(headerAuth)
 	req.Header.Del(headerCookie)
 	req.Header.Del(headerToken)
+	// OCT-145 方案 C：三个身份头 Del 后 Set，防 caller 自带同名头伪造身份。
+	// 三个 Del 一个都不能漏 —— 少 Del 一个就是伪造缺口。Set 走已鉴权的登录态。
+	req.Header.Del(headerOctoUID)
+	req.Header.Del(headerOctoName)
+	req.Header.Del(headerOctoRole)
 	// hop-by-hop 请求侧清理。
 	for _, h := range hopByHop {
 		req.Header.Del(h)
 	}
-	// 从 context 拿 handle 阶段落进来的原始 token，注入。
-	if tok, ok := tokenFromContext(req.Context()); ok && tok != "" {
-		req.Header.Set(headerOctoToken, tok)
+	// 从 context 拿 handle 阶段落进来的登录态，token 是必有的，身份三元组按值注入
+	// （uid/name 允许空串 —— 空串代表登录态里就没有，doc 侧自己兜底，不写空避免误覆盖）。
+	if id, ok := identityFromContext(req.Context()); ok {
+		if id.token != "" {
+			req.Header.Set(headerOctoToken, id.token)
+		}
+		if id.uid != "" {
+			req.Header.Set(headerOctoUID, id.uid)
+		}
+		if id.name != "" {
+			req.Header.Set(headerOctoName, id.name)
+		}
+		// role 一定写：normalizeRole 保证一定是 superAdmin/admin/member 之一。
+		req.Header.Set(headerOctoRole, id.role)
 	}
 	// User-Agent 空值时 http 客户端会自加默认 UA，为让 upstream 日志更清楚，显式打标。
 	if req.Header.Get("User-Agent") == "" {
@@ -208,14 +246,36 @@ func (p *Proxy) errorHandler(w http.ResponseWriter, r *http.Request, err error) 
 
 // ---- context key --------------------------------------------------------
 
+// identity 是反代要注入 doc 的登录态快照（OCT-145 方案 C）。放 context 而不是
+// 全局 map，避免并发请求相互覆盖；handle → director 单向传递，值语义无锁。
+type identity struct {
+	token string
+	uid   string
+	name  string
+	role  string
+}
+
 type ctxKey struct{}
 
-func withToken(parent context.Context, token string) context.Context {
-	return context.WithValue(parent, ctxKey{}, token)
+func withIdentity(parent context.Context, id identity) context.Context {
+	return context.WithValue(parent, ctxKey{}, id)
 }
-func tokenFromContext(c context.Context) (string, bool) {
-	v, ok := c.Value(ctxKey{}).(string)
+func identityFromContext(c context.Context) (identity, bool) {
+	v, ok := c.Value(ctxKey{}).(identity)
 	return v, ok
+}
+
+// normalizeRole 把 wkhttp 现成的 role 字面收敛到稳定值域，避免把空串/未知字面
+// 直接吐给 doc。superAdmin/admin 保留原样，其他一律降级 member（不提权）。
+func normalizeRole(raw string) string {
+	switch raw {
+	case roleSuperAdmin:
+		return roleSuperAdmin
+	case roleAdmin:
+		return roleAdmin
+	default:
+		return roleMember
+	}
 }
 
 // singleJoiningSlash 抄 net/http/httputil 的私有工具：合并 basepath 与后续 path，
