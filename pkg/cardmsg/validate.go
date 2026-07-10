@@ -147,7 +147,10 @@ func (w *walker) registerID(kind, id string) error {
 	return nil
 }
 
-// noteIDAndVisibility 处理任意卡片节点上通用的 id / isVisible 属性（展示元素、Column 共用）：
+// noteIDAndVisibility 处理任意卡片节点上通用的 id / isVisible 属性 —— 由**每一个访问 id/isVisible
+// 承载节点**的位置调用（element() 展示/输入元素、column() 列、imageChild() ImageSet 子 Image、
+// Table 的 row/cell），使「任意声明 id 的节点都可作 ToggleVisibility 目标、且其 id 帧内唯一、
+// isVisible 为 bool」这条不变量无缺口（无节点类型被漏登记 → 不会误拒合法 toggle 目标）：
 //   - isVisible 出现时必须是 bool（否则结构非法）；
 //   - id 出现且为非空字符串时，登记进帧内唯一命名空间（registerID，与 Action.Submit/Input.*
 //     共享）并记入 elementIDs 供 targetElements 解析。非字符串 / 空 id 保持宽容（前向兼容，
@@ -400,6 +403,10 @@ func (w *walker) element(el map[string]interface{}, depth int) error {
 				if err := checkConstrainedChild(row, "Table.rows[]", "TableRow", "cells"); err != nil {
 					return err
 				}
+				// TableRow 也可携带 id / isVisible（可作 ToggleVisibility 目标）—— 与展示元素同权威登记/校验。
+				if err := w.noteIDAndVisibility(row); err != nil {
+					return err
+				}
 				cells, present := row["cells"]
 				if !present {
 					continue
@@ -420,6 +427,10 @@ func (w *walker) element(el map[string]interface{}, depth int) error {
 					//（{"type":"Image","url":"javascript:"} 会被当扁平 cell、其 url 永不走查）及 typeless
 					// 伪装容器（PR#556 review P1：校验面 ≥ 渲染面）。
 					if err := checkConstrainedChild(cell, "Table.rows[].cells[]", "TableCell", "items"); err != nil {
+						return err
+					}
+					// TableCell 也可携带 id / isVisible（可作 ToggleVisibility 目标）—— 同权威登记/校验。
+					if err := w.noteIDAndVisibility(cell); err != nil {
 						return err
 					}
 					if err := checkNodeURLs(cell); err != nil {
@@ -578,6 +589,10 @@ func (w *walker) imageChild(img map[string]interface{}, depth int) error {
 		return err
 	}
 	if err := checkNodeURLs(img); err != nil {
+		return err
+	}
+	// ImageSet 子 Image 也可携带 id / isVisible（可作 ToggleVisibility 目标）—— 与展示元素同权威登记/校验。
+	if err := w.noteIDAndVisibility(img); err != nil {
 		return err
 	}
 	if err := w.selectAction(img); err != nil {

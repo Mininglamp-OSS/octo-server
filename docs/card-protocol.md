@@ -86,7 +86,9 @@ allowlist —— 服务端用**完整 CommonMark 解析器**（非模式匹配�
 - 引用的 `id` **必须存在于本卡**（全卡遍历后统一解析 —— 前向引用安全，target 可先于/
   后于其 toggle 出现）；悬空引用整卡拒。
 - 元素 `id` **帧内唯一**（与 `Action.Submit`/`Input.*` 共享同一 id 空间，对齐 AC 的
-  card-global id 模型）。`isVisible` 出现时必须是 bool。
+  card-global id 模型）。`id` 可声明在**任意 id 承载节点**——顶层展示/输入元素、`Column`、
+  `TableRow`/`TableCell`、`ImageSet` 子 `Image`——且**任一均可作 `targetElements` 目标**
+  （校验器逐节点登记，不留缺口）。`isVisible` 出现时必须是 bool。
 - **隐藏内容不豁免任何校验**：`isVisible:false` 的子树仍完整走白名单/URL allowlist、
   计入节点/深度预算（隐藏节点不得成为绕过通道 —— 校验面 ≥ 渲染面）。
 

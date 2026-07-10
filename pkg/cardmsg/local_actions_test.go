@@ -102,6 +102,55 @@ func TestToggleVisibilityInvalid(t *testing.T) {
 	}
 }
 
+// tableWithCell 构造一张单行单元格的 Table（单元格可带 id/isVisible/items）。
+func tableWithCell(cell map[string]interface{}) map[string]interface{} {
+	return map[string]interface{}{"type": "Table", "rows": []interface{}{
+		map[string]interface{}{"type": "TableRow", "cells": []interface{}{cell}},
+	}}
+}
+
+// imageSetWith 构造一张含单张 Image 的 ImageSet（Image 可带 id/isVisible）。
+func imageSetWith(img map[string]interface{}) map[string]interface{} {
+	return map[string]interface{}{"type": "ImageSet", "images": []interface{}{img}}
+}
+
+// TestToggleTargetsNestedNodes：ToggleVisibility 可引用嵌套 id 承载节点（TableCell/TableRow/
+// ImageSet 子 Image），且这些节点的 id 同样帧内唯一、isVisible 同样校验 bool —— 每类 id 承载
+// 节点都被 noteIDAndVisibility 覆盖，不留缺口（code-review 发现 #1）。
+func TestToggleTargetsNestedNodes(t *testing.T) {
+	// TableCell id 作合法 toggle 目标。
+	cellTarget := cardWithBodyAndActions(
+		[]interface{}{tableWithCell(map[string]interface{}{"type": "TableCell", "id": "cell1", "items": []interface{}{}})},
+		[]interface{}{toggle("cell1")},
+	)
+	if err := Validate(envelope(cellTarget)); err != nil {
+		t.Errorf("ToggleVisibility 引用 TableCell id 应放行, err=%v", err)
+	}
+	// ImageSet 子 Image id 作合法 toggle 目标。
+	imgTarget := cardWithBodyAndActions(
+		[]interface{}{imageSetWith(map[string]interface{}{"type": "Image", "id": "img1", "url": "https://example.com/i.png"})},
+		[]interface{}{toggle("img1")},
+	)
+	if err := Validate(envelope(imgTarget)); err != nil {
+		t.Errorf("ToggleVisibility 引用 ImageSet 子 Image id 应放行, err=%v", err)
+	}
+	// TableCell id 撞顶层元素 id → 帧内重复拒。
+	dupCell := cardWithBody(
+		section("dup"),
+		tableWithCell(map[string]interface{}{"type": "TableCell", "id": "dup", "items": []interface{}{}}),
+	)
+	if err := Validate(envelope(dupCell)); !errors.Is(err, ErrCardBadShape) {
+		t.Errorf("TableCell id 撞顶层 id 应拒, err=%v", err)
+	}
+	// TableCell isVisible 非 bool → 拒（该节点的 isVisible 现同样被校验）。
+	badVisCell := cardWithBody(
+		tableWithCell(map[string]interface{}{"type": "TableCell", "isVisible": "no", "items": []interface{}{}}),
+	)
+	if err := Validate(envelope(badVisCell)); !errors.Is(err, ErrCardBadShape) {
+		t.Errorf("TableCell isVisible 非布尔应拒, err=%v", err)
+	}
+}
+
 // TestElementIDUniqueness：任意元素声明的 id 帧内唯一，且与 Action.Submit / Input.* 共享同一
 // 命名空间（重复即拒）。
 func TestElementIDUniqueness(t *testing.T) {
