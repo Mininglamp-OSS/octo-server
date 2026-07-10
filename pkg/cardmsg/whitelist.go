@@ -39,6 +39,26 @@ func DisplayElements() []string { return append([]string(nil), displayElements..
 // InputElements 返回 octo/v2 交互输入白名单副本（D12 清单据此下发 inputs；同上纪律）。
 func InputElements() []string { return append([]string(nil), inputElements...) }
 
+// displayActions 是 octo/v1 展示档接受的**本地动作**白名单 —— 无服务端回调、纯端上生效，与
+// Action.OpenUrl 同档：标准 AC 的 Action.OpenUrl（跳转）、Action.ToggleVisibility（折叠/展开）
+// 与 octo 自定义 Action.CopyToClipboard（本地复制）。D12 能力清单据此下发 actions。
+//
+// Action.Submit 属 octo/v2 交互档（回调服务端、走 card/action 闭环），**刻意不在此列** ——
+// 经 profiles 档位隐式发现（同 inputs 与 octo/v2 的关系）。
+//
+// 与 displayElements 同纪律（非结构性单一权威）：校验器 action() 对每个动作是**逐类型手写
+// case**（OpenUrl 查 url、ToggleVisibility 查 targetElements、CopyToClipboard 查 text，校验体
+// 各不相同），故 displayActions↔校验器接受集的一致性**由 TestDisplayActionsAuthority 逐个守卫**
+// —— 新增本地动作必须同时给校验器加 case 并让该测试通过，否则清单会广播一个校验器拒绝的动作
+// （漂移 = 谎报能力）。additive-only：只增不改名/删除。
+var displayActions = []string{
+	"Action.OpenUrl", "Action.ToggleVisibility", "Action.CopyToClipboard",
+}
+
+// DisplayActions 返回 octo/v1 本地动作白名单副本（D12 清单据此下发 actions；单一权威，调用方
+// MUST 用它而非重抄字面量）。每次返回新切片，调用方改不到内部状态。
+func DisplayActions() []string { return append([]string(nil), displayActions...) }
+
 // isInputElement 报告 t 是否为 octo/v2 交互输入元素（成员属于 inputElements）。校验器
 // （validate.go element 派发）与 inputs 采集（collectInputSpecsFromElements）共用它，确保
 // 「发送期放行集」「提交期声明采集集」「D12 清单 inputs」恒等。

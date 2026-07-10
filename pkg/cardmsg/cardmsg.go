@@ -65,6 +65,11 @@ const (
 	// MaxDepth 卡片树的嵌套深度上限（Decision 3c）。
 	MaxDepth = 16
 
+	// MaxCopyTextBytes Action.CopyToClipboard.text 的字节上限（octo/v1 自定义本地动作；
+	// 复制到剪贴板的明文，4KiB 与单条 Input.Text 同量级）。text 逐字复制、不渲染，无
+	// URL/markdown 面，故只做「必填 + 大小」结构校验。
+	MaxCopyTextBytes = 4 << 10
+
 	// PlaceholderCard 空卡兜底 / 内容型展示占位（Decision 8：plain 永不为空）。
 	PlaceholderCard = "[卡片]"
 	// PlaceholderImage Image 元素在 plain 里的占位，与 RichText 的 [图片] 一致。

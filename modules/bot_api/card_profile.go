@@ -11,8 +11,8 @@ package bot_api
 //
 // 清单值全部取自 pkg/cardmsg 常量（**单一权威**，D12.2）—— 绝不在此重抄字面量，否则
 // 常量变更时清单会与校验器静默漂移。profiles 取 cardmsg.AcceptedProfiles()（与校验器
-// interactiveByProfile 的接受集同源）；elements/inputs 取 cardmsg.DisplayElements()/
-// InputElements()（与校验器白名单同源，反漂移由 pkg/cardmsg 守卫测试锁定）。
+// interactiveByProfile 的接受集同源）；elements/inputs/actions 取 cardmsg.DisplayElements()/
+// InputElements()/DisplayActions()（与校验器白名单同源，反漂移由 pkg/cardmsg 守卫测试锁定）。
 //
 // enabled 直取 cardmsg.Enabled()（部署级 rollout 开关）：即便关闭也返回 200 + 全清单
 // —— feature detection 正是目的；只有 send/edit 路径在关闭时拒绝（send.go:97）。
@@ -43,6 +43,13 @@ func (ba *BotAPI) botCardProfile(c *wkhttp.Context) {
 		// additive 新增元素，消除「版本号不变 → gate 无法分辨新旧 1.5 部署」的错配。
 		"elements": cardmsg.DisplayElements(),
 		"inputs":   cardmsg.InputElements(),
+		// actions：本部署接受的 octo/v1 **本地动作**白名单（OpenUrl / ToggleVisibility /
+		// CopyToClipboard —— 无服务端回调，源自 pkg/cardmsg 权威列表 DisplayActions()，
+		// 反漂移由 TestDisplayActionsAuthority 锁定）。producer 据此按**动作粒度**前向兼容
+		// 协商——即便 card_version 停在 "1.5"、profiles 不变，也能探测本部署是否接受
+		// ToggleVisibility / CopyToClipboard 等 additive 新增本地动作。Action.Submit 属
+		// octo/v2 交互档，经 profiles 隐式发现、不在此列。
+		"actions": cardmsg.DisplayActions(),
 		"limits": map[string]interface{}{
 			"max_payload_bytes":    cardmsg.MaxPayloadBytes,
 			"max_nodes":            cardmsg.MaxNodes,

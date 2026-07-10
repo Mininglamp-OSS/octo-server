@@ -39,9 +39,10 @@
 | 类别 | 允许 |
 |---|---|
 | 元素 | `TextBlock`（markdown 子集，§2.1）、`RichTextBlock`、`Image`、`ImageSet`、`Container`、`ColumnSet`（含 `Column` 列）、`FactSet`、`Table`、`ActionSet`（`RichTextBlock`/`ImageSet`/`Table`/`ActionSet` 为 P3-3 Tier 1 追加，均 AC ≤1.5：ImageSet 1.0 / RichTextBlock 1.2 / ActionSet 1.2 / Table 1.5） |
-| 动作 | `Action.OpenUrl`；元素/整卡 `selectAction` **仅当**携带 `Action.OpenUrl` |
+| 动作（本地，无服务端回调） | `Action.OpenUrl`、`Action.ToggleVisibility`（折叠/展开，见 §2.2）、`Action.CopyToClipboard`（octo 自定义本地复制，见 §2.2）；元素/整卡 `selectAction` 携带上述任一本地动作亦可（分期继承） |
+| 元素通用属性 | `id`（帧内唯一，与 `Action.Submit`/`Input.*` 共享同一 id 空间）、`isVisible`（bool；隐藏子树仍完整校验、计入预算，见 §2.2） |
 | P2 起（octo/v2） | `Action.Submit`（含 selectAction/ActionSet 携带）、`Input.Text` / `Input.Toggle` / `Input.ChoiceSet` / `Input.Number` / `Input.Date` / `Input.Time`（id 必填且帧内唯一；后三者 P3-3 追加，均 AC 1.0、仍在 `card_version:"1.5"` 内，为白名单增量而非版本升级） |
-| 暂不支持（后续按需） | `Media`(1.1)、`Action.ShowCard`(1.0)、`Action.ToggleVisibility`(1.2)、`Action.Execute`(1.4)、模板/数据绑定，以及 AC 1.6 元素 |
+| 暂不支持（后续按需） | `Media`(1.1)、`Action.ShowCard`(1.0)、`Action.Execute`(1.4)、模板/数据绑定，以及 AC 1.6 元素 |
 
 结构与大小上限（全部 ingress 一致）：
 
@@ -68,6 +69,37 @@ allowlist —— 服务端用**完整 CommonMark 解析器**（非模式匹配�
 `http(s)` 目标（含反斜杠破坏 scheme 的 `javascript\:…`）一律拒绝。plain 派生时剥离
 语法字符（链接降为链接文本）。
 
+### 2.2 本地折叠与复制（octo/v1 本地动作）
+
+均为**纯端上、无服务端回调**的动作（不走 `message/card/action`、不入 `card_action`
+事件、无幂等/权限），与 `Action.OpenUrl` 同档，故落 **octo/v1**。
+
+**`Action.ToggleVisibility`** —— 折叠/展开目标子树（如「收起推理 / 展开推理」）：
+
+```json
+{ "type": "Container", "id": "reasoning", "isVisible": false, "items": [] }
+{ "type": "Action.ToggleVisibility", "title": "展开推理", "targetElements": ["reasoning"] }
+```
+
+- `targetElements` 必填、非空数组；每项是元素 `id` 字符串，或 AC `TargetElement`
+  对象 `{ "elementId": "id", "isVisible": true|false }`。
+- 引用的 `id` **必须存在于本卡**（全卡遍历后统一解析 —— 前向引用安全，target 可先于/
+  后于其 toggle 出现）；悬空引用整卡拒。
+- 元素 `id` **帧内唯一**（与 `Action.Submit`/`Input.*` 共享同一 id 空间，对齐 AC 的
+  card-global id 模型）。`isVisible` 出现时必须是 bool。
+- **隐藏内容不豁免任何校验**：`isVisible:false` 的子树仍完整走白名单/URL allowlist、
+  计入节点/深度预算（隐藏节点不得成为绕过通道 —— 校验面 ≥ 渲染面）。
+
+**`Action.CopyToClipboard`**（octo 自定义，标准 AC 无）—— 本地复制一段明文：
+
+```json
+{ "type": "Action.CopyToClipboard", "title": "复制", "text": "SELECT ..." }
+```
+
+- `text` 必填、字符串、≤ **4 KiB**（`cardmsg.MaxCopyTextBytes`）；`title` 可选字符串。
+- `text` **逐字复制、不渲染** —— 无 URL/markdown 面，不过 allowlist。「勿复制隐藏/敏感
+  字段」是生产者/客户端职责，非服务端结构校验。
+
 ## 3. profile 协商与降级链
 
 - **服务端**：P1 只接受 `profile:"octo/v1"` + `card_version:"1.5"`，其它值
@@ -77,12 +109,15 @@ allowlist —— 服务端用**完整 CommonMark 解析器**（非模式匹配�
   2. 不认识 `profile`（更新的服务端/更旧的客户端）→ 渲染 `plain`；
   3. 连 `type:17` 都不认识（存量客户端）→ octo-lib 未知类型兜底文案。
 - P2 产者能力发现：`GET /v1/bot/card/profile`（D12，随 P2 落地）返回部署的
-  `enabled` / `card_version` / `profiles` / `elements` / `inputs` / `limits` 清单（只增不改）；
-  `elements`/`inputs` 是本部署接受的展示元素 / 交互输入白名单（源自 `pkg/cardmsg`
-  权威列表；`elements` 只列**顶层可放置**元素——`Column` 是 `ColumnSet` 的子列、由
-  `ColumnSet` 涵盖，不单列），供 producer 按**元素粒度**前向兼容协商——即便 `card_version` 停在 `"1.5"`，
-  也能探测是否接受 `Input.Number/Date/Time` 等 additive 新增元素。P1 期间生产者以发送被
-  400/`card_disabled` 拒绝为「未启用」信号。
+  `enabled` / `card_version` / `profiles` / `elements` / `inputs` / `actions` / `limits`
+  清单（只增不改）；`elements`/`inputs`/`actions` 是本部署接受的展示元素 / 交互输入 /
+  **本地动作**白名单（源自 `pkg/cardmsg` 权威列表；`elements` 只列**顶层可放置**元素——
+  `Column` 是 `ColumnSet` 的子列、由 `ColumnSet` 涵盖，不单列；`actions` 只列 octo/v1
+  本地动作 `Action.OpenUrl`/`ToggleVisibility`/`CopyToClipboard`——`Action.Submit` 属
+  octo/v2、经 `profiles` 隐式发现，不在 `actions` 内），供 producer 按**元素/动作粒度**
+  前向兼容协商——即便 `card_version` 停在 `"1.5"`、`profiles` 不变，也能探测是否接受
+  `Input.Number/Date/Time`、`ToggleVisibility`/`CopyToClipboard` 等 additive 新增能力。
+  P1 期间生产者以发送被 400/`card_disabled` 拒绝为「未启用」信号。
 
 ## 4. 信任模型（谁能发卡、谁能信卡）
 

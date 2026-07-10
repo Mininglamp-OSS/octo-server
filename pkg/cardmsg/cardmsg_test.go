@@ -124,10 +124,12 @@ func TestValidateWhitelistRejections(t *testing.T) {
 			"type":         "Container",
 			"selectAction": map[string]interface{}{"type": "Action.Submit", "data": map[string]interface{}{}},
 		}), ErrCardUnknownAction},
-		{"Action.ToggleVisibility(未支持,AC1.2)", cardWithBody(map[string]interface{}{
+		// Action.ToggleVisibility 现为 octo/v1 本地动作（见 local_actions_test.go 正/反用例）；
+		// 缺 targetElements 时按结构非法拒（不再是「未知动作」）。
+		{"Action.ToggleVisibility 缺 targetElements", cardWithBody(map[string]interface{}{
 			"type":         "Container",
 			"selectAction": map[string]interface{}{"type": "Action.ToggleVisibility"},
-		}), ErrCardUnknownAction},
+		}), ErrCardBadShape},
 	} {
 		if err := Validate(envelope(tc.card)); !errors.Is(err, tc.want) {
 			t.Errorf("%s: err=%v want %v", tc.name, err, tc.want)

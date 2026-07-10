@@ -55,6 +55,7 @@ type cardProfileManifest struct {
 	Profiles    []string `json:"profiles"`
 	Elements    []string `json:"elements"`
 	Inputs      []string `json:"inputs"`
+	Actions     []string `json:"actions"`
 	Limits      struct {
 		MaxPayloadBytes   int `json:"max_payload_bytes"`
 		MaxNodes          int `json:"max_nodes"`
@@ -79,6 +80,7 @@ func TestBotCardProfile_ElementsInputsFromConstants(t *testing.T) {
 	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &m))
 	assert.Equal(t, cardmsg.DisplayElements(), m.Elements)
 	assert.Equal(t, cardmsg.InputElements(), m.Inputs)
+	assert.Equal(t, cardmsg.DisplayActions(), m.Actions)
 }
 
 // TestBotCardProfile_ValuesFromConstants：清单每个值必须等于 pkg/cardmsg 常量
@@ -168,7 +170,7 @@ func TestBotCardProfile_AdditiveContractFieldSet(t *testing.T) {
 	for k := range raw {
 		gotTop = append(gotTop, k)
 	}
-	assert.ElementsMatch(t, []string{"enabled", "card_version", "profiles", "limits", "elements", "inputs"}, gotTop,
+	assert.ElementsMatch(t, []string{"enabled", "card_version", "profiles", "limits", "elements", "inputs", "actions"}, gotTop,
 		"D12 additive-only：顶层字段集冻结（新增新字段，绝不改名/删除）")
 
 	var limits map[string]json.RawMessage

@@ -93,3 +93,47 @@ func TestDisplayElementsAuthority(t *testing.T) {
 		t.Errorf("非白名单元素 Bogus 应拒, err=%v", err)
 	}
 }
+
+// TestDisplayActionsAuthority：DisplayActions() 与校验器 action() 的 octo/v1 **本地动作**接受集
+// 一致。同 displayElements——校验器对每个动作是手写 case（OpenUrl 查 url、ToggleVisibility 查
+// targetElements、CopyToClipboard 查 text），一致性靠本测试逐个守卫：遍历 DisplayActions()，每个
+// 动作放进 card.actions[] 跑 octo/v1 Validate；缺 fixture 即 fail，逼「新增本地动作」必须同时给校验器
+// 加 case 并补 fixture 证明真被接受（否则 D12 清单 actions 谎报能力）。Action.Submit 属 octo/v2
+// 交互档，刻意不在 DisplayActions() 里——本测试同时断言它在 octo/v1 被拒。
+func TestDisplayActionsAuthority(t *testing.T) {
+	want := []string{"Action.OpenUrl", "Action.ToggleVisibility", "Action.CopyToClipboard"}
+	got := DisplayActions()
+	if !slices.Equal(got, want) {
+		t.Fatalf("DisplayActions()=%v, want %v", got, want)
+	}
+	// 每个本地动作 → 一份放进 card.actions[] 的最小合法 octo/v1 卡。ToggleVisibility 需要一个存在的
+	// 目标元素 id（其 targetElements 引用在全卡走完后解析）。
+	fixtures := map[string]map[string]interface{}{
+		"Action.OpenUrl": cardWithActions(
+			map[string]interface{}{"type": "Action.OpenUrl", "url": "https://example.com"}),
+		"Action.ToggleVisibility": cardWithBodyAndActions(
+			[]interface{}{section("sec")},
+			[]interface{}{toggle("sec")}),
+		"Action.CopyToClipboard": cardWithActions(
+			map[string]interface{}{"type": "Action.CopyToClipboard", "text": "cmd"}),
+	}
+	for _, typ := range got {
+		card, ok := fixtures[typ]
+		if !ok {
+			t.Errorf("本地动作 %s 缺校验 fixture —— 新增本地动作必须补 fixture 证明校验器接受它"+
+				"（否则 displayActions↔校验器漂移、D12 清单 actions 谎报能力）", typ)
+			continue
+		}
+		if err := Validate(envelope(card)); err != nil {
+			t.Errorf("本地动作 %s 应通过 octo/v1 校验, err=%v", typ, err)
+		}
+	}
+	// 非白名单动作被拒。
+	if err := Validate(envelope(cardWithActions(map[string]interface{}{"type": "Action.Bogus"}))); !errors.Is(err, ErrCardUnknownAction) {
+		t.Errorf("非白名单动作 Action.Bogus 应拒, err=%v", err)
+	}
+	// Action.Submit 属 octo/v2——octo/v1 下必须拒（不在 displayActions）。
+	if err := Validate(envelope(cardWithActions(map[string]interface{}{"type": "Action.Submit", "id": "s"}))); !errors.Is(err, ErrCardUnknownAction) {
+		t.Errorf("Action.Submit 在 octo/v1 应拒, err=%v", err)
+	}
+}

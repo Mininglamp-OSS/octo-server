@@ -1,7 +1,7 @@
 ---
 type: Task
 title: "Task: card-message-toggle-visibility"
-description: Add Action.ToggleVisibility (+ element id / isVisible / targetElements) to the octo/v1 display profile of the pkg/cardmsg card validator, and advertise the local action set in the GET /v1/bot/card/profile capability manifest. Enables server-authored collapsible sections (e.g. "collapse/expand reasoning") as a purely local, no-callback client interaction. CopyToClipboard is a separate follow-up.
+description: Add the octo/v1 local-action batch to the pkg/cardmsg card validator — Action.ToggleVisibility (+ element id / isVisible / targetElements) and the octo-custom Action.CopyToClipboard — and advertise the accepted local action set in the GET /v1/bot/card/profile capability manifest. Enables server-authored collapsible sections ("collapse/expand reasoning") and copy-to-clipboard affordances as purely local, no-server-callback client interactions.
 tags: ["card", "wire-contract", "trust-boundary", "bot-api", "validator", "testing", "commit"]
 timestamp: 2026-07-10T00:00:00Z
 # --- octospec extension fields ---
@@ -17,21 +17,25 @@ source: self
 
 ## Goal
 
-Let card producers author **collapsible sections** (fold/expand a subtree — e.g.
-the "收起推理 / 展开推理" control in the deep-thinking card) by supporting the
-standard Adaptive Cards `Action.ToggleVisibility` action plus its supporting
-element attributes (`id`, `isVisible`, `targetElements`) in the octo card
-validator.
+Add the **octo/v1 local-action batch** to the octo card validator so producers
+can author **collapsible sections** (fold/expand a subtree — e.g. the "收起推理 /
+展开推理" control in the deep-thinking card) and **copy-to-clipboard** affordances:
 
-**Placed in `octo/v1` (the display profile), NOT a new `octo/v2`/`octo/v3` tier.**
-`ToggleVisibility` is a purely local UI toggle: it flips client-side visibility
-state and makes **no server callback** (it does not hit `POST
-/v1/message/card/action`, enqueues no `card_action` event, needs no idempotency /
-membership / anti-forgery). That is exactly the class of `Action.OpenUrl`, which
-already lives in `octo/v1`. The capability line therefore becomes:
+- `Action.ToggleVisibility` (standard AC) plus its supporting element attributes
+  `id` / `isVisible` / `targetElements`.
+- `Action.CopyToClipboard` (octo-custom action; standard AC has none) carrying a
+  `text` payload the client copies locally.
+
+**Both go in `octo/v1` (the display profile), NOT a new `octo/v2`/`octo/v3` tier.**
+Each is a purely local interaction that makes **no server callback** (neither hits
+`POST /v1/message/card/action`, enqueues a `card_action` event, nor needs
+idempotency / membership / anti-forgery). That is exactly the class of
+`Action.OpenUrl`, which already lives in `octo/v1`. The capability line therefore
+becomes:
 
 - **octo/v1** = display + local, no-server-callback interactions
-  (`Action.OpenUrl` navigation, `Action.ToggleVisibility` fold/expand).
+  (`Action.OpenUrl` navigation, `Action.ToggleVisibility` fold/expand,
+  `Action.CopyToClipboard` local copy).
 - **octo/v2** = interactions that call back to the server
   (`Action.Submit`, `Input.*`).
 
@@ -119,20 +123,36 @@ advertises `elements`/`inputs` but has **no** actions field.
    (already true).
 6. **Manifest `actions` field (additive wire contract)**: refactor the action
    whitelist into a `pkg/cardmsg` data authority mirroring
-   `displayElements`/`inputElements` — e.g. `displayActions = ["Action.OpenUrl",
-   "Action.ToggleVisibility"]` (octo/v1 local actions) with a `DisplayActions()`
-   accessor, and lock it against the validator accept-set with a new
-   `TestDisplayActionsAuthority` guard. Add `"actions": cardmsg.DisplayActions()`
-   to the manifest response. `Action.Submit` remains discoverable via the
-   `octo/v2` profile tier (status quo — Submit is not advertised by name today);
-   optionally add a symmetric `interactive_actions` list, but default is to keep
-   this PR minimal and add only `actions`.
+   `displayElements`/`inputElements` — `displayActions = ["Action.OpenUrl",
+   "Action.ToggleVisibility", "Action.CopyToClipboard"]` (octo/v1 local actions)
+   with a `DisplayActions()` accessor, locked against the validator accept-set
+   with a new `TestDisplayActionsAuthority` guard. Add `"actions":
+   cardmsg.DisplayActions()` to the manifest response. `Action.Submit` remains
+   discoverable via the `octo/v2` profile tier (status quo — Submit is not
+   advertised by name today); optionally add a symmetric `interactive_actions`
+   list, but default is to keep this PR minimal and add only `actions`.
 7. **Error mapping**: reuse existing `pkg/cardmsg` sentinels — structural
-   problems (`targetElements` wrong shape, non-boolean `isVisible`, duplicate id)
-   map to `ErrCardBadShape`; a dangling `targetElements` reference may use a
-   dedicated internal sentinel (e.g. `ErrCardTargetMissing`) that still collapses
-   to the send path's existing single generic card-invalid 400 (anti-enumeration)
-   — **no new `pkg/errcode` code, no new i18n toml entry, no new migration**.
+   problems (`targetElements` wrong shape, non-boolean `isVisible`, duplicate id,
+   missing/oversized/non-string `CopyToClipboard.text`) map to `ErrCardBadShape`;
+   a dangling `targetElements` reference may use a dedicated internal sentinel
+   (e.g. `ErrCardTargetMissing`) that still collapses to the send path's existing
+   single generic card-invalid 400 (anti-enumeration) — **no new `pkg/errcode`
+   code, no new i18n toml entry, no new migration**.
+8. **`Action.CopyToClipboard` (octo-custom, octo/v1)**: standard AC has no copy
+   action — this is an octo extension; the type name follows the client doc's
+   proposed protocol `{type:"Action.CopyToClipboard", title?, text}` (unprefixed
+   — the only collision risk is a hypothetical future Microsoft action of the
+   same name, judged acceptable, no vendor prefix per the doc). Allowed in **both**
+   profiles (octo/v1-tier, no `w.interactive` gate). Validation: `text`
+   **required, string, ≤ `MaxCopyTextBytes` (4 KiB)**; `title` optional string;
+   the action counts toward the node budget (`w.bump`). **No server callback** —
+   the client copies `text` locally; it never hits `/v1/message/card/action` and
+   enqueues no event, so `interactive.go` dispatch is untouched. `text` is copied
+   **verbatim, not rendered**, so **no URL/markdown allowlist applies**; the
+   producer-side rule "don't copy hidden/sensitive fields" is a client/producer
+   concern, not a server structural check. Add a `MaxCopyTextBytes = 4 << 10`
+   constant to `pkg/cardmsg/cardmsg.go` (source-of-truth; not surfaced in manifest
+   `limits` this PR unless trivially symmetric).
 
 ## Load-bearing list
 <!-- touches: tags drive rule injection. -->
@@ -162,7 +182,6 @@ advertises `elements`/`inputs` but has **no** actions field.
 - **Commit style** — Conventional Commits, English. `touches: commit`.
 
 ## Out of scope
-- `Action.CopyToClipboard` (octo custom action) — separate follow-up PR.
 - Any change to `Action.Submit` / `Input.*` / the `card_action` server-callback
   loop, idempotency, membership, or `interactive.go` dispatch.
 - Introducing `octo/v3` or bumping `card_version` off `"1.5"`.
@@ -194,10 +213,16 @@ advertises `elements`/`inputs` but has **no** actions field.
   - Non-boolean `isVisible` on any element → `ErrCardBadShape`.
   - `isVisible:false` subtree containing an over-budget node or a `javascript:`
     URL is **still** rejected (visibility does not exempt budget/URL checks).
+  - `Action.CopyToClipboard` with a valid `text` → accepted in **both** profiles;
+    missing `text` / non-string `text` / `text` > 4 KiB → `ErrCardBadShape`;
+    optional `title` accepted; `text` carrying a `javascript:`/`data:` string is
+    **accepted** (verbatim clipboard content, not a URL surface).
+  - `Action.CopyToClipboard` does not appear in `SubmitAction` dispatch results
+    (it is not a Submit) — `interactive.go`/`interactive_test.go` untouched.
 - Manifest: `modules/bot_api/card_profile_test.go` updated so `GET
   /v1/bot/card/profile` response includes `actions` containing
-  `"Action.OpenUrl"` and `"Action.ToggleVisibility"`, sourced from
-  `cardmsg.DisplayActions()`.
+  `"Action.OpenUrl"`, `"Action.ToggleVisibility"`, and
+  `"Action.CopyToClipboard"`, sourced from `cardmsg.DisplayActions()`.
 - New `TestDisplayActionsAuthority` in `pkg/cardmsg` locks `DisplayActions()`
   equal to the validator's octo/v1 action accept-set (drift guard, mirroring
   `TestDisplayElementsAuthority`).
@@ -210,5 +235,7 @@ advertises `elements`/`inputs` but has **no** actions field.
 - `docs/card-protocol.md` and
   `.octospec/tasks/card-message-interaction/brief.md` updated together to move
   ToggleVisibility/`isVisible`/`targetElements` from "future" to "supported
-  (octo/v1)", and to document the new manifest `actions` field.
+  (octo/v1)", document the octo-custom `Action.CopyToClipboard` (octo/v1,
+  `text` ≤ 4 KiB, local copy, no callback), and document the new manifest
+  `actions` field.
 - Work committed on branch `claude/client-ac-requirements-fvoizm`.

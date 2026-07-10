@@ -256,7 +256,13 @@ the mapping onto this brief:
 ## Out of scope
 
 - **P3**: `Action.Execute`/auto-refresh, templating/data-binding,
-  `Action.ShowCard`/`ToggleVisibility`, ephemeral (仅本人可见) responses,
+  `Action.ShowCard`, ephemeral (仅本人可见) responses,
+  <!-- `Action.ToggleVisibility` + element `id`/`isVisible`/`targetElements` and the
+       octo-custom `Action.CopyToClipboard` shipped as octo/v1 **local actions**
+       (no server callback) in task `card-message-toggle-visibility`; the D12
+       manifest gained an additive `actions` list advertising the octo/v1 local
+       action set. See `docs/card-protocol.md` §2.2. -->
+
   multi-step forms, cross-ecosystem card mapping, designer tooling,
   bot-side real-time event delivery (D5), **per-element `fallback`**
   (AC-standard element-level degradation — the rendering half of capability
