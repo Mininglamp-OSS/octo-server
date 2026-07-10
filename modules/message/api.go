@@ -113,6 +113,27 @@ func placeholderPayload() map[string]interface{} {
 	}
 }
 
+// revokedPayload 返回撤回消息对外下发的最小 payload：仅保留原始 type，剥离 content
+// 及一切内容承载字段（url / name / reply / content.users …）。
+//
+// 背景（撤回原文泄漏）：Octo 撤回是 message_extra.revoke=1 的软删除，WuKongIM 里
+// 原始 payload 仍在。sync 路径此前把 revoke=1 与「完整原始 payload」一起下发，
+// 原文因此保留在客户端内存（message.content），恶意插件可从 React props 反查还原。
+// 单条直读 api_message_get.go 对 revoke==1 直接返回 404，本函数补上 sync 路径同口径的缺口。
+//
+// 保留 type 而不整条清空：撤回对所有人生效，前端仅凭 revoke=1 渲染撤回提示、不读
+// payload（撤回者名由 revoker UID 单独查，见 octo-web RevokeCell）；保留 type 只为
+// 兼容按 type 分支的老客户端渲染路径，type 本身不含消息正文。
+func revokedPayload(original map[string]interface{}) map[string]interface{} {
+	stripped := map[string]interface{}{}
+	if t, ok := original["type"]; ok {
+		stripped["type"] = t
+	} else {
+		stripped["type"] = common.ContentError.Int()
+	}
+	return stripped
+}
+
 // isTextType 判断 payload type 是否为 common.Text（=1）。兼容 json.Number / float64 / int
 // 几种反序列化结果；string 类型的 "1" 不识别为 Text，避免误命中。
 func isTextType(m map[string]interface{}) bool {
@@ -3315,6 +3336,23 @@ func (m *MsgSyncResp) from(msgResp *config.MessageResp, loginUID string, message
 			streams = append(streams, newStreamItemResp(streamItem))
 		}
 		m.Streams = streams
+	}
+
+	// 撤回消息内容脱敏：撤回对所有人生效，任何客户端都不该再拿到原文。剥离 payload
+	// 正文、加密 signal 密文与流式 blob，只保留 revoke=1 / revoker 供前端渲染撤回
+	// 提示。与单条直读 api_message_get.go 对 revoke==1 返回 404 同口径；这里补上
+	// /message/channel/sync 与 /conversation/sync（两者共用 from()）此前遗漏的缺口。
+	// 必须放在 Payload / SignalPayload / Streams / MessageExtra 全部赋值之后。
+	if m.Revoke == 1 {
+		m.Payload = revokedPayload(m.Payload)
+		m.SignalPayload = ""
+		m.Streams = nil
+		// message_extra.content_edit 是「编辑后的正文」，同样是原文载体：撤回后必须
+		// 一并剥离，否则编辑过的消息被撤回时仍会经 content_edit 把原文下发。
+		if m.MessageExtra != nil {
+			m.MessageExtra.ContentEdit = nil
+			m.MessageExtra.EditedAt = 0
+		}
 	}
 
 }

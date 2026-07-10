@@ -26,6 +26,7 @@ func fillPersonSpaceUnread(
 	defaultSpaceID string,
 	loginUID string,
 	ctx *config.Context,
+	messageExtraDB *messageExtraDB,
 ) {
 	if spaceID == "" || len(conversations) == 0 {
 		return
@@ -61,6 +62,7 @@ func fillPersonSpaceUnread(
 				fallbackMsg := findSpaceLastMessageFallback(
 					conv.ChannelID, conv.ChannelType,
 					loginUID, spaceID, defaultSpaceID, isSysBot, uint32(raw.LastMsgSeq), ctx,
+					messageExtraDB,
 				)
 				if fallbackMsg != nil {
 					conv.SpaceLastMessage = fallbackMsg
@@ -166,6 +168,7 @@ func findSpaceLastMessageFallback(
 	channelID string, channelType uint8,
 	loginUID string, spaceID, defaultSpaceID string,
 	isSysBot bool, lastMsgSeq uint32, ctx *config.Context,
+	messageExtraDB *messageExtraDB,
 ) *MsgSyncResp {
 	if lastMsgSeq == 0 {
 		return nil
@@ -195,10 +198,32 @@ func findSpaceLastMessageFallback(
 		return nil
 	}
 
-	// 从最新到最旧遍历，找第一条匹配的（跳过已删除消息）
-	for i := len(resp.Messages) - 1; i >= 0; i-- {
-		msg := resp.Messages[i]
+	// 撤回消息不得作为 space_last_message 预览下发：兜底路径用 msgRespToSyncResp 直拼
+	// payload，绕过了主 sync 路径 from() 的撤回脱敏，会把撤回原文当成「最后一条消息」
+	// 泄漏。批量查出撤回集合，遍历时与已删除消息一并跳过（与 api_channel_files.go
+	// 过滤撤回消息同口径）。
+	revokedSet := revokedMessageIDSet(resp.Messages, messageExtraDB)
+	chosen := selectSpaceLastMessage(resp.Messages, revokedSet, spaceID, defaultSpaceID, isSysBot)
+	if chosen == nil {
+		return nil
+	}
+	return msgRespToSyncResp(chosen)
+}
+
+// selectSpaceLastMessage 从最新到最旧遍历，返回第一条归属 spaceID、且未删除/未撤回的
+// 消息。纯函数（不做 IO），便于单测；撤回集合由调用方预先查好传入。
+func selectSpaceLastMessage(
+	messages []*config.MessageResp,
+	revoked map[string]bool,
+	spaceID, defaultSpaceID string,
+	isSysBot bool,
+) *config.MessageResp {
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg := messages[i]
 		if msg.IsDeleted == 1 {
+			continue
+		}
+		if revoked[strconv.FormatInt(msg.MessageID, 10)] {
 			continue
 		}
 		payloadMap, err := msg.GetPayloadMap()
@@ -206,10 +231,32 @@ func findSpaceLastMessageFallback(
 			continue
 		}
 		if dmSpaceMatch(dmMessageSpaceID(payloadMap), spaceID, defaultSpaceID, isSysBot) {
-			return msgRespToSyncResp(msg)
+			return msg
 		}
 	}
 	return nil
+}
+
+// revokedMessageIDSet 批量查询给定消息里已撤回（message_extra.revoke=1）的 message_id 集合。
+// messageExtraDB 为空（如单测未注入）时返回空集合，即不跳过任何消息。
+func revokedMessageIDSet(messages []*config.MessageResp, messageExtraDB *messageExtraDB) map[string]bool {
+	set := make(map[string]bool)
+	if messageExtraDB == nil || len(messages) == 0 {
+		return set
+	}
+	ids := make([]string, 0, len(messages))
+	for _, msg := range messages {
+		ids = append(ids, strconv.FormatInt(msg.MessageID, 10))
+	}
+	revoked, err := messageExtraDB.queryRevokedWithMessageIDs(ids)
+	if err != nil {
+		log.Warn("revokedMessageIDSet: 查询撤回消息失败", zap.Error(err))
+		return set
+	}
+	for _, e := range revoked {
+		set[e.MessageID] = true
+	}
+	return set
 }
 
 // msgRespToSyncResp 将 config.MessageResp 转换为 MsgSyncResp（用于预览）。
