@@ -105,10 +105,14 @@ func NewService(ctx *config.Context) IService {
 
 // CreateThreadReq 创建子区请求
 type CreateThreadReq struct {
-	GroupNo              string
-	Name                 string
-	CreatorUID           string
-	CreatorName          string
+	GroupNo     string
+	Name        string
+	CreatorUID  string
+	CreatorName string
+	// CreatorSpaceID 是创建请求所处的 Space（X-Space-ID / ?space_id），用于给创建者
+	// 落一行子区 user_conversation_ext（关注 Tab 是按 space_id 隔离读的，必须与创建者
+	// 读关注列表用的 space 一致）。为空时跳过 creator-follow（best-effort，见 CreateThread）。
+	CreatorSpaceID       string
 	SourceMessageID      *int64
 	SourceMessagePayload json.RawMessage // 源消息原始 payload，用于拷贝到子区
 }
@@ -307,6 +311,29 @@ func (s *Service) CreateThread(req *CreateThreadReq) (*ThreadResp, error) {
 				zap.String("groupNo", req.GroupNo),
 				zap.String("shortID", shortID),
 				zap.Error(err))
+		}
+
+		// issue #557 / OCTO-2228：无条件给「创建者本人」落一行子区 ext，让新建子区
+		// 立即出现在创建者自己的关注 Tab —— 不依赖创建者事先关注了父频道。fanout
+		// 只覆盖 auto_follow_threads=1 的已关注者，创建者不被特殊对待，所以这里补齐。
+		// 与 fanout 同为 best-effort post-commit hook：失败只警告，不回滚 thread 创建。
+		// 顺序与 OnThreadCreated 一致——排在两条客户端可观察消息之前，保证创建者的
+		// 客户端拉 sidebar 时 ext 行已存在。CreatorSpaceID 为空（客户端未带 space）时
+		// 跳过，退化到既有行为，不影响 thread 创建。
+		if req.CreatorSpaceID != "" {
+			if err := convSvc.EnsureCreatorFollowsThread(req.CreatorUID, req.CreatorSpaceID, req.GroupNo, shortID); err != nil {
+				s.Warn("EnsureCreatorFollowsThread 失败（thread 已创建，创建者关注 Tab 会延迟到下次 follow/refollow 补齐）",
+					zap.String("groupNo", req.GroupNo),
+					zap.String("shortID", shortID),
+					zap.String("creatorUID", req.CreatorUID),
+					zap.String("spaceID", req.CreatorSpaceID),
+					zap.Error(err))
+			}
+		} else {
+			s.Warn("CreateThread 缺少 space_id，跳过 creator-follow ext 落行（创建者关注 Tab 暂不出现新子区）",
+				zap.String("groupNo", req.GroupNo),
+				zap.String("shortID", shortID),
+				zap.String("creatorUID", req.CreatorUID))
 		}
 	}
 

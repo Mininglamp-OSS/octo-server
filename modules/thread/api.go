@@ -191,6 +191,14 @@ func (t *Thread) createThread(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	loginName := c.GetLoginName()
 
+	// issue #557 / OCTO-2228：取请求所处的 Space（?space_id 优先，否则 X-Space-ID
+	// header），用于给创建者落子区 ext 行。thread 路由组未挂 SpaceMiddleware，故这里
+	// 与 SpaceMiddleware 同口径手动提取；为空时 CreateThread 会跳过 creator-follow。
+	creatorSpaceID := strings.TrimSpace(c.Query("space_id"))
+	if creatorSpaceID == "" {
+		creatorSpaceID = strings.TrimSpace(c.GetHeader("X-Space-ID"))
+	}
+
 	// 验证 groupNo 格式
 	if !IsValidGroupNo(groupNo) {
 		respondThreadInvalidGroupNo(c)
@@ -232,6 +240,7 @@ func (t *Thread) createThread(c *wkhttp.Context) {
 		Name:                 req.Name,
 		CreatorUID:           loginUID,
 		CreatorName:          loginName,
+		CreatorSpaceID:       creatorSpaceID,
 		SourceMessageID:      req.SourceMessageID,
 		SourceMessagePayload: req.SourceMessagePayload,
 	})

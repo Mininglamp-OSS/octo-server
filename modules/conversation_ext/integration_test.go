@@ -702,3 +702,120 @@ func BenchmarkFollowChannel_Materialize500(b *testing.B) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// issue #557 / OCTO-2228: EnsureCreatorFollowsThread —— 创建者无条件补子区行
+//
+// Bug: 只要创建者本人没有关注父频道，无论用哪个客户端建子区，这个子区都不会进
+// 创建者自己的关注 Tab（CreateThread 不给创建者落 user_conversation_ext 行，
+// OnThreadCreated fanout 也只覆盖 auto_follow_threads=1 的已关注者）。
+// Fix: 创建 hook 里无条件为创建者落一行子区 ext 行，且**不**碰父群行。
+// ---------------------------------------------------------------------------
+
+// 场景 1（核心复现）：创建者未关注父群（无群 ext 行）时创建子区 → 关注 Tab 出现该子区。
+func TestIntegration_Issue557_EnsureCreatorFollowsThread_NoParentFollow_CreatesThreadRow(t *testing.T) {
+	_, svc := newIntegrationDB(t)
+
+	const uid, space, grp, shortID = "int-557-u1", "sp-557", "int-557-grp1", "thr-557-1"
+	threadChannelID := grp + "____" + shortID
+
+	// 前置：创建者对父群完全没有 ext 行（从未关注 / 从未取关）。
+	parent, err := svc.db.Get(uid, space, targetTypeGroup, grp)
+	require.NoError(t, err)
+	require.Nil(t, parent, "precondition: creator has no parent-group ext row")
+	threadRow, err := svc.db.Get(uid, space, targetTypeThread, threadChannelID)
+	require.NoError(t, err)
+	require.Nil(t, threadRow, "precondition: no thread ext row before creation")
+
+	// 动作：补创建者子区行。
+	require.NoError(t, svc.EnsureCreatorFollowsThread(uid, space, grp, shortID))
+
+	// 断言：子区 ext 行必须出现在创建者关注 Tab（ListThreadExts 是 Tab 的读口径）。
+	threadRow2, err := svc.db.Get(uid, space, targetTypeThread, threadChannelID)
+	require.NoError(t, err)
+	require.NotNil(t, threadRow2, "creator's thread ext row must exist after EnsureCreatorFollowsThread")
+
+	threads, err := svc.db.ListThreadExts(uid, space)
+	require.NoError(t, err)
+	require.Len(t, threads, 1, "关注 Tab 应恰好出现这一条新子区")
+	assert.Equal(t, threadChannelID, threads[0].TargetID)
+
+	// 关键边界：**不得**因创建子区而给父群落行/拉回关注（octo-web #293 P1）。
+	parentAfter, err := svc.db.Get(uid, space, targetTypeGroup, grp)
+	require.NoError(t, err)
+	assert.Nil(t, parentAfter,
+		"EnsureCreatorFollowsThread 不得触碰父群行——创建者没关注过父群，这里不应凭空造一行群行")
+}
+
+// 场景 2（P1 red-line）：创建者曾显式取关父群（group_unfollowed=1）时创建子区 →
+// 子区出现在关注 Tab，但父群 group_unfollowed 标志必须保持 1（不被副作用拉回关注）。
+func TestIntegration_Issue557_EnsureCreatorFollowsThread_PreservesUnfollowedParent(t *testing.T) {
+	_, svc := newIntegrationDB(t)
+
+	const uid, space, grp, shortID = "int-557-u2", "sp-557", "int-557-grp2", "thr-557-2"
+	threadChannelID := grp + "____" + shortID
+
+	// 前置：创建者显式取关了父群。
+	require.NoError(t, svc.UnfollowChannel(uid, space, grp))
+	parent, err := svc.db.Get(uid, space, targetTypeGroup, grp)
+	require.NoError(t, err)
+	require.NotNil(t, parent)
+	require.Equal(t, int8(1), parent.GroupUnfollowed, "precondition: parent group explicitly unfollowed")
+
+	// 动作：创建者建子区补行。
+	require.NoError(t, svc.EnsureCreatorFollowsThread(uid, space, grp, shortID))
+
+	// 断言 1：子区行出现。
+	threadRow, err := svc.db.Get(uid, space, targetTypeThread, threadChannelID)
+	require.NoError(t, err)
+	assert.NotNil(t, threadRow, "creator's thread ext row must be created even when parent is unfollowed")
+
+	// 断言 2（P1）：父群 group_unfollowed 仍为 1 —— 创建子区不得把取关过的父群拖回关注。
+	parentAfter, err := svc.db.Get(uid, space, targetTypeGroup, grp)
+	require.NoError(t, err)
+	require.NotNil(t, parentAfter)
+	assert.Equal(t, int8(1), parentAfter.GroupUnfollowed,
+		"group_unfollowed 必须保持 1：创建子区不应副作用地把用户显式取关过的父群拉回关注 Tab")
+}
+
+// 场景 3（幂等）：重复触发只留一行，不产生脏行，且保留创建者手动调过的 follow_sort。
+func TestIntegration_Issue557_EnsureCreatorFollowsThread_Idempotent(t *testing.T) {
+	_, svc := newIntegrationDB(t)
+
+	const uid, space, grp, shortID = "int-557-u3", "sp-557", "int-557-grp3", "thr-557-3"
+	threadChannelID := grp + "____" + shortID
+
+	require.NoError(t, svc.EnsureCreatorFollowsThread(uid, space, grp, shortID))
+
+	// 模拟创建者手动调过关注 Tab 排序。
+	require.NoError(t, svc.db.Upsert(uid, space, targetTypeThread, threadChannelID, ConvExtFields{
+		FollowSort: intPtr(42),
+	}))
+
+	// 再次触发（重复创建/重试）——必须幂等：不重建行、不覆盖 follow_sort。
+	require.NoError(t, svc.EnsureCreatorFollowsThread(uid, space, grp, shortID))
+
+	threads, err := svc.db.ListThreadExts(uid, space)
+	require.NoError(t, err)
+	require.Len(t, threads, 1, "重复触发不得产生第二行")
+	assert.Equal(t, 42, threads[0].FollowSort,
+		"INSERT IGNORE 必须保留创建者手动调过的 follow_sort，重复触发不覆盖")
+
+	// follow_version 单调递增（每次写都 bump），客户端可据此刷新。
+	var version int64
+	require.NoError(t, svc.session.SelectBySql(
+		"SELECT version FROM "+followVersionTable+" WHERE uid=? AND space_id=?",
+		uid, space,
+	).LoadOne(&version))
+	assert.GreaterOrEqual(t, version, int64(2), "两次写至少 bump 到 version=2")
+}
+
+// 场景 4（输入校验）：空 space_id / group_no / short_id 必须报错，不静默写脏行。
+func TestIntegration_Issue557_EnsureCreatorFollowsThread_ValidatesInput(t *testing.T) {
+	_, svc := newIntegrationDB(t)
+
+	assert.Error(t, svc.EnsureCreatorFollowsThread("", "sp", "grp", "sid"), "empty uid must error")
+	assert.Error(t, svc.EnsureCreatorFollowsThread("u", "", "grp", "sid"), "empty space_id must error")
+	assert.Error(t, svc.EnsureCreatorFollowsThread("u", "sp", "", "sid"), "empty group_no must error")
+	assert.Error(t, svc.EnsureCreatorFollowsThread("u", "sp", "grp", ""), "empty short_id must error")
+}

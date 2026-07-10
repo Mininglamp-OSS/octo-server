@@ -978,6 +978,56 @@ func (s *Service) FollowThread(uid, spaceID, threadChannelID string) error {
 }
 
 // ---------------------------------------------------------------------------
+// EnsureCreatorFollowsThread — materialise the creator's own thread ext row
+// ---------------------------------------------------------------------------
+
+// EnsureCreatorFollowsThread 无条件为「子区创建者本人」在 user_conversation_ext
+// 里落一行子区 ext 行（等价于把创建者视为该子区的 follower），让新建子区立即出现在
+// 创建者自己的关注 Tab —— 不再依赖创建者事先关注了父频道（issue #557 / OCTO-2228）。
+//
+// 与 FollowThread 的关键区别（issue #557 注意事项 / octo-web #293 P1）：
+//   - **不触碰父群 ext 行**。FollowThread 会把父群 group_unfollowed 清零把父群拖回
+//     关注 Tab；本方法只写子区行。若创建者曾显式取关过父群，那一状态必须保留——
+//     「创建子区」这个动作不应副作用地把用户取关过的父群拉回关注列表。
+//   - 因此这里既不 upsert 父群行、也不改 auto_follow_threads，只落子区行本身。
+//
+// 幂等与写口径与 OnThreadCreated fanout 一致：
+//   - 同一 tx 内先 BumpFollowVersionTx（在 version 行拿 X 锁）再写 ext 行，与
+//     FollowChannel / UnfollowChannel / OnThreadCreated 等全部写路径同序，避免
+//     (version vs ext) 反向死锁。
+//   - upsertTx 空 ConvExtFields → INSERT IGNORE：重复触发不产生脏行，也不覆盖
+//     创建者可能已手动调过的 follow_sort。
+//
+// 调用方（thread.Service.CreateThread）应在 thread 自身 tx commit 之后、任何客户端
+// 可观察的子区频道消息之前 best-effort 调用；失败只记日志不阻断 thread 创建（下次
+// FollowChannel / refollow / 新子区 fanout 会补齐）。
+func (s *Service) EnsureCreatorFollowsThread(uid, spaceID, groupNo, shortID string) error {
+	if err := validateBase(uid, spaceID); err != nil {
+		return err
+	}
+	if groupNo == "" {
+		return errors.New("group_no must not be empty")
+	}
+	if shortID == "" {
+		return errors.New("short_id must not be empty")
+	}
+	threadChannelID := groupNo + threadSeparator + shortID
+
+	return s.withTx("EnsureCreatorFollowsThread", func(tx *dbr.Tx) error {
+		// 锁序：先 bump version（version 行 X 锁）再写 ext 行，与全包写路径同序。
+		if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
+			return fmt.Errorf("EnsureCreatorFollowsThread bump version: %w", err)
+		}
+		// 只落子区行；**不**碰父群行（不清 group_unfollowed，见上方注释）。
+		// 空 fields → INSERT IGNORE，幂等且保留既有 follow_sort。
+		if err := upsertTx(tx, uid, spaceID, targetTypeThread, threadChannelID, ConvExtFields{}); err != nil {
+			return fmt.Errorf("EnsureCreatorFollowsThread upsert thread: %w", err)
+		}
+		return nil
+	})
+}
+
+// ---------------------------------------------------------------------------
 // UnfollowThread — delete thread ext row only
 // ---------------------------------------------------------------------------
 
