@@ -89,6 +89,13 @@ advertises `elements`/`inputs` but has **no** actions field.
   downgrade the entire card to plain** (losing even renderable parts). Safe
   rollout is web-render-support-first, or keep `OCTO_CARD_MESSAGE_ENABLED` gated
   until the client ships. This task does not flip the gate.
+- **Rollout checklist — backward-incompatible id tightening (PR#561 review)**:
+  display-element `id`s were previously tolerated as unknown scalars; they are now
+  registered into the shared frame-unique namespace, so a card that **reuses** a
+  display `id` now fails closed (whole-card 400). Blast radius is low (feature
+  gated off by default; no known producer assigns display ids today), but before
+  flipping `OCTO_CARD_MESSAGE_ENABLED` confirm no already-deployed/authored cards
+  rely on duplicate display ids so early adopters aren't surprised.
 
 ## Design decisions to pin (for confirmation)
 

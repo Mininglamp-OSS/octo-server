@@ -177,6 +177,32 @@ func TestElementIDUniqueness(t *testing.T) {
 	}
 }
 
+// TestWhitespaceID：纯空白 id 视同缺失（PR#561 review nit）—— 输入控件纯空白 id 按「必填」拒；
+// 展示元素纯空白 id 不登记（不可作 target，指向它 → 悬空 fail-closed）。
+func TestWhitespaceID(t *testing.T) {
+	// Input.* 纯空白 id → 按必填拒（octo/v2）。
+	wsInput := cardWithBody(map[string]interface{}{"type": "Input.Text", "id": "  "})
+	if err := Validate(v2Envelope(wsInput)); !errors.Is(err, ErrCardBadShape) {
+		t.Errorf("Input 纯空白 id 应按必填拒, err=%v", err)
+	}
+	// 展示元素纯空白 id 不登记 → toggle 指向它按悬空引用拒。
+	wsTarget := cardWithBodyAndActions(
+		[]interface{}{map[string]interface{}{"type": "Container", "id": " ", "items": []interface{}{}}},
+		[]interface{}{toggle(" ")},
+	)
+	if err := Validate(envelope(wsTarget)); !errors.Is(err, ErrCardBadShape) {
+		t.Errorf("toggle 指向纯空白 id 应悬空拒, err=%v", err)
+	}
+	// 两个展示元素同为纯空白 id → 均不登记，故**不**判重复（可正常通过）。
+	twoWS := cardWithBody(
+		map[string]interface{}{"type": "Container", "id": " ", "items": []interface{}{}},
+		map[string]interface{}{"type": "Container", "id": " ", "items": []interface{}{}},
+	)
+	if err := Validate(envelope(twoWS)); err != nil {
+		t.Errorf("两个纯空白 id 展示元素均不登记，应不判重复, err=%v", err)
+	}
+}
+
 // TestIsVisibleAndHiddenSubtree：isVisible 必须是布尔；且隐藏子树（isVisible:false）仍完整
 // 校验、计入预算 —— 可见性不豁免 URL/深度检查（trust-boundary：校验面 ≥ 渲染面）。
 func TestIsVisibleAndHiddenSubtree(t *testing.T) {

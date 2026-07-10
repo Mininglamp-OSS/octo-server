@@ -147,14 +147,20 @@ func (w *walker) registerID(kind, id string) error {
 	return nil
 }
 
-// noteIDAndVisibility 处理任意卡片节点上通用的 id / isVisible 属性 —— 由**每一个访问 id/isVisible
-// 承载节点**的位置调用（element() 展示/输入元素、column() 列、imageChild() ImageSet 子 Image、
-// Table 的 row/cell），使「任意声明 id 的节点都可作 ToggleVisibility 目标、且其 id 帧内唯一、
-// isVisible 为 bool」这条不变量无缺口（无节点类型被漏登记 → 不会误拒合法 toggle 目标）：
+// noteIDAndVisibility 处理**可寻址元素/容器**上通用的 id / isVisible 属性 —— 由每一个此类节点的
+// 访问点调用：element()（展示/输入元素）、column()（列）、imageChild()（ImageSet 子 Image）、
+// Table 的 row/cell。使「任一声明 id 的可寻址节点都可作 ToggleVisibility 目标、其 id 帧内唯一、
+// isVisible 为 bool」这条不变量在**可寻址节点**上无缺口。
+//
+// 刻意不覆盖两类**叶子/内联节点**（PR#561 review：AC 未在其上定义 id/isVisible，也不可作 toggle
+// 目标）：FactSet.facts[] 的 Fact（title/value 叶子，checkConstrainedChild 已约束其无子集合）与
+// RichTextBlock.inlines[] 的 TextRun（内联 run）。它们的 title/value markdown、selectAction 仍完整
+// 校验 + 计入预算（无渲染面逃逸）；其上若出现 id 不登记（targetElements 指向它 → 悬空 fail-closed）、
+// isVisible 不做 bool 校验（AC 无该语义，惰性放过）。
 //   - isVisible 出现时必须是 bool（否则结构非法）；
-//   - id 出现且为非空字符串时，登记进帧内唯一命名空间（registerID，与 Action.Submit/Input.*
-//     共享）并记入 elementIDs 供 targetElements 解析。非字符串 / 空 id 保持宽容（前向兼容，
-//     且无法作为合法 target）。
+//   - id 出现且 TrimSpace 后非空时，登记进帧内唯一命名空间（registerID，与 Action.Submit/Input.*
+//     共享）并记入 elementIDs 供 targetElements 解析。非字符串 / 空 / 纯空白 id 保持宽容
+//     （前向兼容，且无法作为合法 target）。
 //
 // 隐藏节点（isVisible:false）仍由调用方照常递归、计入节点/深度预算 —— 可见性**不豁免**任何
 // 白名单/URL/预算校验（trust-boundary：校验面 ≥ 渲染面，隐藏子树不得成为绕过通道）。
@@ -164,7 +170,7 @@ func (w *walker) noteIDAndVisibility(node map[string]interface{}) error {
 			return fmt.Errorf("%w: isVisible 必须是布尔", ErrCardBadShape)
 		}
 	}
-	if id, ok := node["id"].(string); ok && id != "" {
+	if id, ok := node["id"].(string); ok && strings.TrimSpace(id) != "" {
 		if err := w.registerID("element", id); err != nil {
 			return err
 		}
@@ -480,9 +486,10 @@ func (w *walker) element(el map[string]interface{}, depth int) error {
 		if !w.interactive {
 			return fmt.Errorf("%w: %q（octo/v2 起）", ErrCardUnknownElement, t)
 		}
-		// D1：输入控件 id 必填（提交时 inputs 以 id 为键）。帧内唯一 + 记入 elementIDs 已由
-		// element() 顶部 noteIDAndVisibility 统一登记（非空字符串 id 即登记），此处只强制「必填」。
-		if id, _ := el["id"].(string); id == "" {
+		// D1：输入控件 id 必填且须有意义（提交时 inputs 以 id 为键）。帧内唯一 + 记入 elementIDs
+		// 已由 element() 顶部 noteIDAndVisibility 统一登记（TrimSpace 后非空即登记），此处只强制
+		// 「必填」——与登记同口径用 TrimSpace，纯空白 id 视同缺失（PR#561 review nit）。
+		if id, _ := el["id"].(string); strings.TrimSpace(id) == "" {
 			return fmt.Errorf("%w: %s.id 必填", ErrCardBadShape, t)
 		}
 		// Input.label / Input.errorMessage 与 TextBlock.text 同为 AC markdown 渲染面
