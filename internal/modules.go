@@ -34,6 +34,7 @@ import (
 	_ "github.com/Mininglamp-OSS/octo-server/modules/channel"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/common"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
+	_ "github.com/Mininglamp-OSS/octo-server/modules/doc_binding"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/file"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/group"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/incomingwebhook"

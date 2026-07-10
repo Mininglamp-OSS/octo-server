@@ -620,6 +620,23 @@ other = "查询分类数据失败。"
 ["err.server.category.store_failed"]
 other = "保存分类数据失败。"
 
+# ---- modules/doc_binding：slug↔挂载点绑定（OCT-134） ----
+
+["err.server.doc_binding.request_invalid"]
+other = "请求参数有误。"
+
+["err.server.doc_binding.slug_conflict"]
+other = "该 slug 已被绑定。"
+
+["err.server.doc_binding.forbidden"]
+other = "无权修改此 doc 绑定。"
+
+["err.server.doc_binding.not_found"]
+other = "doc 绑定不存在。"
+
+["err.server.doc_binding.store_failed"]
+other = "doc 绑定存储操作失败。"
+
 # ---- modules/sticker：用户自定义贴纸 ----
 
 ["err.server.sticker.request_invalid"]

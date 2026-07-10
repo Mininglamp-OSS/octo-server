@@ -276,6 +276,21 @@ other = "The group and the category are not in the same space."
 ["err.server.category.store_failed"]
 other = "Failed to update category data."
 
+["err.server.doc_binding.forbidden"]
+other = "You do not have permission to modify this doc binding."
+
+["err.server.doc_binding.not_found"]
+other = "Doc binding not found."
+
+["err.server.doc_binding.request_invalid"]
+other = "Invalid request."
+
+["err.server.doc_binding.slug_conflict"]
+other = "This slug is already bound."
+
+["err.server.doc_binding.store_failed"]
+other = "Doc binding storage operation failed."
+
 ["err.server.group.already_member"]
 other = "You are already a member of this group."
 
