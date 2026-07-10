@@ -158,8 +158,10 @@ advertises `elements`/`inputs` but has **no** actions field.
    **verbatim, not rendered**, so **no URL/markdown allowlist applies**; the
    producer-side rule "don't copy hidden/sensitive fields" is a client/producer
    concern, not a server structural check. Add a `MaxCopyTextBytes = 4 << 10`
-   constant to `pkg/cardmsg/cardmsg.go` (source-of-truth; not surfaced in manifest
-   `limits` this PR unless trivially symmetric).
+   constant to `pkg/cardmsg/cardmsg.go` (source-of-truth) and advertise it in the
+   manifest `limits` as `max_copy_text_bytes` (PR#561 review #1 — symmetric with
+   `max_nodes`/`max_depth`/`max_payload_bytes`, so producers feature-detect the
+   threshold instead of learning it via a rejected send).
 
 ## Load-bearing list
 <!-- touches: tags drive rule injection. -->

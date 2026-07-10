@@ -755,14 +755,16 @@ func (w *walker) toggleVisibility(act map[string]interface{}) error {
 func targetElementID(item interface{}) (string, error) {
 	switch v := item.(type) {
 	case string:
-		if v == "" {
-			return "", fmt.Errorf("%w: targetElements 条目 id 不能为空", ErrCardBadShape)
+		// 与 noteIDAndVisibility 的登记口径一致：纯空白 id 视同缺失，在 parse 期即拒
+		// （否则纯空白 ref 会晚到 resolveTargetRefs 才作悬空拒 —— 同为 fail-closed，但理由更含糊）。
+		if strings.TrimSpace(v) == "" {
+			return "", fmt.Errorf("%w: targetElements 条目 id 不能为空/纯空白", ErrCardBadShape)
 		}
 		return v, nil
 	case map[string]interface{}:
 		id, _ := v["elementId"].(string)
-		if id == "" {
-			return "", fmt.Errorf("%w: targetElements 条目缺 elementId", ErrCardBadShape)
+		if strings.TrimSpace(id) == "" {
+			return "", fmt.Errorf("%w: targetElements 条目缺 elementId（或纯空白）", ErrCardBadShape)
 		}
 		if vis, present := v["isVisible"]; present {
 			if _, ok := vis.(bool); !ok {

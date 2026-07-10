@@ -62,6 +62,7 @@ type cardProfileManifest struct {
 		MaxDepth          int `json:"max_depth"`
 		MaxInputTextBytes int `json:"max_input_text_bytes"`
 		MaxInputsBytes    int `json:"max_inputs_bytes"`
+		MaxCopyTextBytes  int `json:"max_copy_text_bytes"`
 	} `json:"limits"`
 }
 
@@ -102,6 +103,7 @@ func TestBotCardProfile_ValuesFromConstants(t *testing.T) {
 	assert.Equal(t, cardmsg.MaxDepth, m.Limits.MaxDepth)
 	assert.Equal(t, cardmsg.MaxInputTextBytes, m.Limits.MaxInputTextBytes)
 	assert.Equal(t, cardmsg.MaxInputsBytes, m.Limits.MaxInputsBytes)
+	assert.Equal(t, cardmsg.MaxCopyTextBytes, m.Limits.MaxCopyTextBytes)
 }
 
 // TestBotCardProfile_DisabledStillReturnsManifestAndSendRejects（D12.3）：rollout
@@ -181,5 +183,6 @@ func TestBotCardProfile_AdditiveContractFieldSet(t *testing.T) {
 	}
 	assert.ElementsMatch(t, []string{
 		"max_payload_bytes", "max_nodes", "max_depth", "max_input_text_bytes", "max_inputs_bytes",
+		"max_copy_text_bytes",
 	}, gotLimits, "D12 additive-only：limits 字段集冻结")
 }

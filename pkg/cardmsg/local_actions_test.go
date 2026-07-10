@@ -185,7 +185,8 @@ func TestWhitespaceID(t *testing.T) {
 	if err := Validate(v2Envelope(wsInput)); !errors.Is(err, ErrCardBadShape) {
 		t.Errorf("Input 纯空白 id 应按必填拒, err=%v", err)
 	}
-	// 展示元素纯空白 id 不登记 → toggle 指向它按悬空引用拒。
+	// 展示元素纯空白 id 不登记；toggle 指向纯空白 ref 在 parse 期即拒（targetElementID 同口径
+	// TrimSpace，PR#561 review #2）——仍为整卡 ErrCardBadShape。
 	wsTarget := cardWithBodyAndActions(
 		[]interface{}{map[string]interface{}{"type": "Container", "id": " ", "items": []interface{}{}}},
 		[]interface{}{toggle(" ")},

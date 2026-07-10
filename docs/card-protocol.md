@@ -99,7 +99,8 @@ allowlist —— 服务端用**完整 CommonMark 解析器**（非模式匹配�
 ```
 
 - `text` 必填、字符串、≤ **4 KiB**（`cardmsg.MaxCopyTextBytes`，按 **UTF-8 字节**计、非字符数
-  ——与 `Input.Text` 同口径；4096 字节 ≈ 1365 个 CJK 字符）；`title` 可选字符串。
+  ——与 `Input.Text` 同口径；4096 字节 ≈ 1365 个 CJK 字符；manifest `limits.max_copy_text_bytes`
+  同步下发，供 producer 按阈值 feature-detect）；`title` 可选字符串。
 - `text` **逐字复制、不渲染** —— 无 URL/markdown 面，不过 allowlist。「勿复制隐藏/敏感
   字段」是生产者/客户端职责，非服务端结构校验。
 

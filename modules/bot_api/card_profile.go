@@ -56,6 +56,9 @@ func (ba *BotAPI) botCardProfile(c *wkhttp.Context) {
 			"max_depth":            cardmsg.MaxDepth,
 			"max_input_text_bytes": cardmsg.MaxInputTextBytes,
 			"max_inputs_bytes":     cardmsg.MaxInputsBytes,
+			// Action.CopyToClipboard.text 的 UTF-8 字节上限（与 actions 里的 CopyToClipboard
+			// 对称，供 producer 按阈值 feature-detect，免去「发一条超限卡看 400」探测）。
+			"max_copy_text_bytes": cardmsg.MaxCopyTextBytes,
 		},
 	})
 }
