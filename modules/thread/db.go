@@ -319,7 +319,7 @@ const NonDeletedByGroupNosDBHardLimit = 2500
 // caller 侧对大群做了 `continue` 降级，正常群也因为 `byGroup[gn]` 为空
 // 被静默跳过，全请求的 thread 覆盖归零。切成 per-group LIMIT 后：
 //   - 大群精准降级到 group-only（返回 201 行 → caller 感知超 cap → WARN
-//     + 跳过该群 thread），
+//   - 跳过该群 thread），
 //   - 其他正常群完整返回，thread 覆盖照常上线，
 //   - 不再存在 group 之间「谁排前面谁吃掉预算」的相互饿死。
 //
@@ -413,22 +413,46 @@ func (d *DB) QuerySourceMessageIDsByShortIDs(shortIDs []string) (map[string]*int
 //   - ORDER BY last_message_at, id：保证 MySQL 复制（statement-based / mixed）确定性，
 //     且和 idx_status_last_msg_id 三列索引同序，避免 filesort。
 //   - last_message_at IS NULL 的子区（从未发过消息）一律保留，避免误归档新建空子区。
+//   - NOT EXISTS(未处理 per-uid @提及)：只要子区里有人被 @ 且尚未处理，就**不归档**
+//     （产品三级优先级 P1，最高：GH #566）。在归档谓词里直接排除，而不是先归档再纠偏——
+//     后者会让同一行每个 tick 在 active↔archived 间反复翻转（两次 GenSeq + 两次 UPDATE +
+//     sync 诈尸），用户可见状态却不变。谓词耦合让稳态下这类行**一次都不被写**。
 //
+// 关于 NOT EXISTS 的成本与正确性：
+//   - 相关子查询按 (channel_id, channel_type, is_deleted) 关联 reminders，配合迁移新增的
+//     idx_channel_type_rtype_deleted 走点查，而非全表扫；且它只作用于「陈旧 active」这一小集合
+//     （由 idx_status_last_msg_id 的 range scan 界定），不是全体 thread。
+//   - reminders 行 uid<>” 排除 @所有人 广播行（否则几乎每个子区都被钉住、归档形同虚设）。
+//   - reminder_type=ReminderTypeMentionMe 显式限定「@我」类提醒，不依赖 channel_type 的巧合，
+//     避免未来任何落在 CommunityTopic 且永无 reminder_done 的 per-uid 提醒把子区永久钉住。
+//   - reminder_done 无 (reminder_id, uid) 对应行 ⇒ 该被 @ 的人尚未处理自己的提及。
+//   - 跨表 collation：reminders/reminder_done 已由迁移 20260711000001 归一到 utf8mb4_general_ci
+//     （与 thread.* 对齐），故此处无需任何 COLLATE pin——也不能加：pin 会让以 channel_id
+//     打头的 idx_channel_type_rtype_deleted 失效、退回全表扫（索引按列原 collation 排序）。
+//
+// channelType 应传 common.ChannelTypeCommunityTopic.Uint8()（thread 子区消息的频道类型）。
 // 整批共享同一个 version（来自 caller 的 GenSeq）：sync API 按 version 单调递增拉取，
 // 一批同 version 不影响 cursor 推进。
-func (d *DB) ArchiveStaleBatch(threshold time.Time, batchSize int, version int64) (int64, error) {
+func (d *DB) ArchiveStaleBatch(threshold time.Time, batchSize int, version int64, channelType uint8) (int64, error) {
 	if batchSize <= 0 {
 		return 0, nil
 	}
 	result, err := d.session.UpdateBySql(
-		"UPDATE thread SET status=?, version=?, updated_at=? "+
-			"WHERE status=? AND last_message_at IS NOT NULL AND last_message_at < ? "+
-			"AND version < ? "+
-			"ORDER BY last_message_at, id "+
+		"UPDATE thread t SET t.status=?, t.version=?, t.updated_at=? "+
+			"WHERE t.status=? AND t.last_message_at IS NOT NULL AND t.last_message_at < ? "+
+			"AND t.version < ? "+
+			"AND NOT EXISTS ("+
+			"SELECT 1 FROM reminders r "+
+			"LEFT JOIN reminder_done rd ON rd.reminder_id=r.id AND rd.uid=r.uid "+
+			"WHERE r.channel_id = CONCAT(t.group_no, ?, t.short_id) "+
+			"AND r.channel_type=? AND r.reminder_type=? AND r.uid<>'' AND r.is_deleted=0 AND rd.id IS NULL"+
+			") "+
+			"ORDER BY t.last_message_at, t.id "+
 			"LIMIT ?",
 		ThreadStatusArchived, version, time.Now(),
 		ThreadStatusActive, threshold,
 		version,
+		ChannelIDSeparator, channelType, ReminderTypeMentionMe,
 		batchSize,
 	).Exec()
 	if err != nil {

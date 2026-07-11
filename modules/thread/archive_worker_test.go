@@ -19,15 +19,17 @@ type stubArchiveDB struct {
 	calls   int
 	err     error
 	// 记录每次调用收到的参数，用于断言。
-	gotThresholds []time.Time
-	gotBatchSizes []int
-	gotVersions   []int64
+	gotThresholds   []time.Time
+	gotBatchSizes   []int
+	gotVersions     []int64
+	gotChannelTypes []uint8
 }
 
-func (s *stubArchiveDB) ArchiveStaleBatch(threshold time.Time, batchSize int, version int64) (int64, error) {
+func (s *stubArchiveDB) ArchiveStaleBatch(threshold time.Time, batchSize int, version int64, channelType uint8) (int64, error) {
 	s.gotThresholds = append(s.gotThresholds, threshold)
 	s.gotBatchSizes = append(s.gotBatchSizes, batchSize)
 	s.gotVersions = append(s.gotVersions, version)
+	s.gotChannelTypes = append(s.gotChannelTypes, channelType)
 	if s.err != nil {
 		return 0, s.err
 	}
@@ -243,7 +245,7 @@ func newSignalArchiveDB() *signalArchiveDB {
 	return &signalArchiveDB{firstCall: make(chan struct{})}
 }
 
-func (s *signalArchiveDB) ArchiveStaleBatch(time.Time, int, int64) (int64, error) {
+func (s *signalArchiveDB) ArchiveStaleBatch(time.Time, int, int64, uint8) (int64, error) {
 	atomic.AddInt64(&s.calls, 1)
 	s.once.Do(func() { close(s.firstCall) })
 	return 0, nil // 立刻返回 0 行，RunOnce 第一批就退出
@@ -287,4 +289,24 @@ func TestStart_DisabledIsNoop(t *testing.T) {
 	defer w.Stop()
 	time.Sleep(30 * time.Millisecond)
 	assert.Equal(t, 0, db.calls, "disabled worker must not tick")
+}
+
+// TestStart_ThresholdZeroStartsGoroutine 验证 reviewer 指出的启动门：Threshold=0 是 config
+// 明文支持的模式（DM_THREAD_AUTO_ARCHIVE_DAYS=0 → 禁用时间归档但 Enabled 仍 true）。
+// 启动门不再因 Threshold<=0 而拒起 goroutine。注意：本测试只断言 goroutine 确实启动
+// （w.cancel 非 nil）；Threshold=0 时 RunOnce 会在碰 DB 前短路，故不断言归档行为。
+func TestStart_ThresholdZeroStartsGoroutine(t *testing.T) {
+	cfg := defaultCfg()
+	cfg.Threshold = 0
+	cfg.Interval = 20 * time.Millisecond
+	db := newSignalArchiveDB()
+	w := newTestWorker(cfg, db, &stubVersionGen{}, time.Now())
+
+	w.Start(context.Background())
+	defer w.Stop()
+
+	// ticker 必须起：RunOnce 会被调到。但 signalArchiveDB 只在 ArchiveStaleBatch 被调时
+	// close firstCall；而 Threshold=0 时 RunOnce 内部短路、不会调 ArchiveStaleBatch。
+	// 故这里不等 firstCall，改为验证 goroutine 确实启动了（cancel 非 nil）。
+	assert.NotNil(t, w.cancel, "ticker goroutine must start even when Threshold=0")
 }
