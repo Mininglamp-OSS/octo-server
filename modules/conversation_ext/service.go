@@ -978,6 +978,58 @@ func (s *Service) FollowThread(uid, spaceID, threadChannelID string) error {
 }
 
 // ---------------------------------------------------------------------------
+// EnsureThreadFollowForCreator — materialize the creator's own thread ext row
+// ---------------------------------------------------------------------------
+
+// EnsureThreadFollowForCreator materializes a target_type=5 thread ext row for
+// the thread's creator, unconditionally and idempotently, WITHOUT touching the
+// parent group's ext row.
+//
+// Motivation (issue #557): a user who creates a thread must always see it in
+// their own follow tab, regardless of whether they follow the parent group. The
+// auto_follow_threads fanout in OnThreadCreated only materializes rows for members
+// who explicitly follow the parent group (auto_follow_threads=1 AND
+// group_unfollowed=0), so the creator is missed whenever they have not followed
+// (or have explicitly unfollowed) the parent group. Because the gap is server-side
+// this backfill fixes iOS / Android / PC / web in one place; octo-web #293 only
+// patched web and only when the parent group was already followed.
+//
+// Deliberately NOT delegated to FollowThread: FollowThread also clears the parent
+// group's group_unfollowed flag (implicit re-follow), which was rejected as a P1
+// in octo-web #293 — creating a thread must not drag a user's explicitly
+// unfollowed parent group back into the follow tab. This method touches ONLY the
+// thread row.
+//
+// spaceID must be the creator's effective space for the parent group (the same
+// value the fanout stores), so the row surfaces under the sidebar's space filter.
+// An empty spaceID is permitted for legacy (space-less) groups, matching the
+// fanout口径; hence validateBase (which rejects empty space_id) is intentionally
+// not used here.
+//
+// Idempotent: the ext write is an INSERT IGNORE (upsertTx with no field changes),
+// so a repeated call — or a race with the OnThreadCreated fanout that already
+// materialized the creator — produces no duplicate row and never clobbers a manual
+// follow_sort. The follow_version bump uses the same version→ext lock order as
+// FollowThread / the fanout (Jerry-Xin round-2/3 P1).
+func (s *Service) EnsureThreadFollowForCreator(uid, spaceID, threadChannelID string) error {
+	if uid == "" {
+		return errors.New("uid must not be empty")
+	}
+	if _, _, err := parseThreadChannelID(threadChannelID); err != nil {
+		return err
+	}
+	return s.withTx("EnsureThreadFollowForCreator", func(tx *dbr.Tx) error {
+		if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
+			return fmt.Errorf("EnsureThreadFollowForCreator bump version: %w", err)
+		}
+		if err := upsertTx(tx, uid, spaceID, targetTypeThread, threadChannelID, ConvExtFields{}); err != nil {
+			return fmt.Errorf("EnsureThreadFollowForCreator upsert thread: %w", err)
+		}
+		return nil
+	})
+}
+
+// ---------------------------------------------------------------------------
 // UnfollowThread — delete thread ext row only
 // ---------------------------------------------------------------------------
 

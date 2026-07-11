@@ -308,6 +308,31 @@ func (s *Service) CreateThread(req *CreateThreadReq) (*ThreadResp, error) {
 				zap.String("shortID", shortID),
 				zap.Error(err))
 		}
+
+		// issue #557：无条件为创建者本人补一条子区 ext 行，让创建者刚建的子区立即
+		// 出现在他自己的关注 Tab。OnThreadCreated 的 fanout 只覆盖「已明确关注父群」
+		// （auto_follow_threads=1 AND group_unfollowed=0）的成员，创建者只要没关注
+		// 父群就会被漏掉——这是跨端（iOS/Android/PC/web）共有的 server 行为缺口，
+		// 在此一处根治。
+		//
+		// 注意（octo-web #293 被拒的 P1）：只补创建者本人的子区行，绝不清父群的
+		// group_unfollowed / 把父群拉回关注——见 EnsureThreadFollowForCreator 注释。
+		// space_id 取创建者对父群的 effective space（内部成员=群 space_id，外部成员=
+		// 其 source_space_id，历史无 space 群=""），与 fanout 落行口径一致，保证行能
+		// 通过 sidebar 的 space 过滤。同为 commit 后 best-effort：失败只警告，不回滚。
+		_, _, _, creatorSpaceID, _, sErr := s.groupService.GetMemberExternalFields(req.GroupNo, req.CreatorUID)
+		if sErr != nil {
+			s.Warn("解析创建者 effective space 失败，跳过创建者子区 ext 补行（下次关注可补齐）",
+				zap.String("groupNo", req.GroupNo),
+				zap.String("uid", req.CreatorUID),
+				zap.Error(sErr))
+		} else if err := convSvc.EnsureThreadFollowForCreator(req.CreatorUID, creatorSpaceID, channelID); err != nil {
+			s.Warn("创建者子区 ext 补行失败（thread 已创建，下次关注/refollow 补齐）",
+				zap.String("groupNo", req.GroupNo),
+				zap.String("shortID", shortID),
+				zap.String("uid", req.CreatorUID),
+				zap.Error(err))
+		}
 	}
 
 	// 拷贝源消息到子区作为首条消息（顺序：在 fanout 之后，客户端收到这条消息时
