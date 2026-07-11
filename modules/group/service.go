@@ -84,6 +84,10 @@ type IService interface {
 	// 白名单语义、fail-closed），排除被拉黑成员。供绕过 IM 直查本地分表的读/发门禁，
 	// 以及子区(CommunityTopic)解析父群后的读/写门禁使用，防止被拉黑用户越权读子区内容。
 	ExistMemberActive(groupNo string, uid string) (bool, error)
+	// ExistMemberActiveInternal 是 ExistMemberActive 的收紧变体：额外要求 is_external=0，
+	// 只把「内部活跃人类成员」视为存在。放开的群/子区改名门禁用它保留 is_external=0
+	// 安全边界，避免跨 Space 外部成员越权改名（YUJ-231 / GH#1289，P1）。
+	ExistMemberActiveInternal(groupNo string, uid string) (bool, error)
 	// 成员是否在某群里存在 返回对应在群里的群编号
 	ExistMembers(groupNos []string, uid string) ([]string, error)
 	// ExistMembersActive 批量版 ExistMemberActive：返回 uid 处于「活跃」状态
@@ -601,6 +605,13 @@ func (s *Service) ExistMember(groupNo string, uid string) (bool, error) {
 // 子区(CommunityTopic)读/发门禁用它替代 ExistMember，避免被拉黑用户越权读/发（YUJ-4185 CR 整改）。
 func (s *Service) ExistMemberActive(groupNo string, uid string) (bool, error) {
 	return s.db.ExistMemberActive(uid, groupNo)
+}
+
+// ExistMemberActiveInternal 是 ExistMemberActive 的收紧变体：额外要求 is_external=0，
+// 只把「内部活跃人类成员」视为存在。放开的群/子区改名门禁用它保留 is_external=0
+// 安全边界，避免跨 Space 外部成员越权改名（YUJ-231 / GH#1289，P1）。
+func (s *Service) ExistMemberActiveInternal(groupNo string, uid string) (bool, error) {
+	return s.db.ExistMemberActiveInternal(uid, groupNo)
 }
 
 func (s *Service) ExistMembers(groupNos []string, uid string) ([]string, error) {

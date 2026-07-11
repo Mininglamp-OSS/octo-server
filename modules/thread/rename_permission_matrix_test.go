@@ -21,6 +21,13 @@ import (
 // 只验证 UpdateName 的权限分档，不依赖频道创建。
 func seedRenameThread(t *testing.T, memberStatus, robot int) (*Service, string, string, string) {
 	t.Helper()
+	return seedRenameThreadExternal(t, memberStatus, robot, 0)
+}
+
+// seedRenameThreadExternal 是 seedRenameThread 的扩展变体，额外指定操作者父群成员行的
+// is_external 档位，用于复现「跨 Space 外部成员改子区名应被拒绝」的边界（YUJ-231 / GH#1289）。
+func seedRenameThreadExternal(t *testing.T, memberStatus, robot, isExternal int) (*Service, string, string, string) {
+	t.Helper()
 
 	_, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
@@ -43,9 +50,9 @@ func seedRenameThread(t *testing.T, memberStatus, robot int) (*Service, string, 
 		GroupNo: groupNo, UID: threadCreatorUID, Role: group.MemberRoleCommon,
 		Status: int(common.GroupMemberStatusNormal), Version: 1, Vercode: util.GenerUUID(),
 	}))
-	// 操作者成员行——状态按档位。
+	// 操作者成员行——状态与 is_external 按档位。
 	require.NoError(t, groupDB.InsertMember(&group.MemberModel{
-		GroupNo: groupNo, UID: operatorUID, Role: group.MemberRoleCommon,
+		GroupNo: groupNo, UID: operatorUID, Role: group.MemberRoleCommon, IsExternal: isExternal,
 		Status: memberStatus, Version: 2, Vercode: util.GenerUUID(),
 	}))
 
@@ -103,4 +110,19 @@ func TestThreadUpdateName_BlacklistMember_Denied(t *testing.T) {
 	got, err := svc.GetThread(groupNo, shortID, operatorUID)
 	require.NoError(t, err)
 	require.Equal(t, "原始子区名", got.Name, "黑名单成员被拒后子区名不变")
+}
+
+// TestThreadUpdateName_ExternalMember_Denied 覆盖安全边界：
+// 跨 Space 外部成员（is_external=1）即便活跃、人类、状态正常，也禁止改子区名——放宽后的
+// 门禁必须保留 is_external=0 边界（YUJ-231 / GH#1289，P1）。
+func TestThreadUpdateName_ExternalMember_Denied(t *testing.T) {
+	svc, groupNo, shortID, operatorUID := seedRenameThreadExternal(t, int(common.GroupMemberStatusNormal), 0, 1)
+
+	err := svc.UpdateName(groupNo, shortID, operatorUID, "外部成员改名")
+	require.Error(t, err, "外部成员应被拒绝改子区名")
+	require.Contains(t, err.Error(), "no permission")
+
+	got, err := svc.GetThread(groupNo, shortID, operatorUID)
+	require.NoError(t, err)
+	require.Equal(t, "原始子区名", got.Name, "外部成员被拒后子区名不变")
 }

@@ -20,6 +20,13 @@ import (
 // avatar_update_test.go 的 seedCreatorGroup 同风格。
 func seedRenameMatrixGroup(t *testing.T, g *Group, groupNo, creatorUID string, role, memberStatus, robot int) {
 	t.Helper()
+	seedRenameMatrixGroupExternal(t, g, groupNo, creatorUID, role, memberStatus, robot, 0)
+}
+
+// seedRenameMatrixGroupExternal 是 seedRenameMatrixGroup 的扩展变体，额外指定操作者成员行的
+// is_external 档位，用于复现「跨 Space 外部成员改名应被拒绝」的边界（YUJ-231 / GH#1289）。
+func seedRenameMatrixGroupExternal(t *testing.T, g *Group, groupNo, creatorUID string, role, memberStatus, robot, isExternal int) {
+	t.Helper()
 
 	uniq := util.GenerUUID()[:8]
 	require.NoError(t, g.userDB.Insert(&user.Model{UID: creatorUID, Name: "创建者", ShortNo: "rm_c_" + uniq}))
@@ -34,7 +41,7 @@ func seedRenameMatrixGroup(t *testing.T, g *Group, groupNo, creatorUID string, r
 	}))
 	// 操作者成员行。
 	require.NoError(t, g.db.InsertMember(&MemberModel{
-		GroupNo: groupNo, UID: testutil.UID, Role: role, Status: memberStatus,
+		GroupNo: groupNo, UID: testutil.UID, Role: role, Status: memberStatus, IsExternal: isExternal,
 		Version: 2, Vercode: fmt.Sprintf("%s@1", util.GenerUUID()),
 	}))
 }
@@ -101,6 +108,29 @@ func TestGroupRename_BlacklistMember_NameOnly_Denied(t *testing.T) {
 	got, err := g.db.QueryWithGroupNo(groupNo)
 	require.NoError(t, err)
 	require.Equal(t, "原始群名", got.Name, "黑名单成员改名应被拒绝，群名不变")
+}
+
+// TestGroupRename_ExternalMember_NameOnly_Denied 覆盖安全边界：
+// 跨 Space 外部成员（is_external=1）即便活跃、人类、状态正常，也禁止改名——放宽后的
+// 门禁必须保留旧 QueryIsGroupManagerOrCreator 的 is_external=0 边界（YUJ-231 / GH#1289，P1）。
+func TestGroupRename_ExternalMember_NameOnly_Denied(t *testing.T) {
+	s, ctx := newTestServer(t)
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	wireI18nRendererForGroupTest(s)
+	g := New(ctx)
+
+	const groupNo = "rm_name_ext"
+	// 操作者活跃、人类、状态正常，但 is_external=1（跨 Space 外部成员）。
+	seedRenameMatrixGroupExternal(t, g, groupNo, "rm_creator_ext", MemberRoleCommon, int(common.GroupMemberStatusNormal), 0, 1)
+
+	w := putGroupUpdate(t, s.GetRoute(), groupNo, map[string]string{"name": "外部成员改名"})
+	require.Equal(t, http.StatusBadRequest, w.Code, "wire status 固定 400, body=%s", w.Body.String())
+	require.Contains(t, w.Body.String(), "err.server.group.not_group_member",
+		"外部成员改名应被拒绝, body=%s", w.Body.String())
+
+	got, err := g.db.QueryWithGroupNo(groupNo)
+	require.NoError(t, err)
+	require.Equal(t, "原始群名", got.Name, "外部成员改名应被拒绝，群名不变")
 }
 
 // TestGroupRename_NormalMemberWithAdvancedFields_Denied 覆盖新行为④：

@@ -1180,8 +1180,11 @@ func (g *Group) groupUpdate(c *wkhttp.Context) {
 			return
 		}
 	} else {
-		// 仅改名：低风险写，活跃人类成员即可，龙虾(robot)不是普通成员，禁止其改名。
-		isActive, err := g.db.ExistMemberActive(loginUID, groupNo)
+		// 仅改名：低风险写，内部活跃人类成员即可，龙虾(robot)不是普通成员，禁止其改名。
+		// 用 ExistMemberActiveInternal（带 is_external=0）而非 ExistMemberActive，保留旧
+		// QueryIsGroupManagerOrCreator 门禁的 is_external=0 边界，避免跨 Space 外部成员越权
+		// 改名（YUJ-231 / GH#1289，P1）。
+		isActive, err := g.db.ExistMemberActiveInternal(loginUID, groupNo)
 		if err != nil {
 			g.Error("查询是否是活跃群成员失败！", zap.Error(err))
 			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
@@ -1191,13 +1194,14 @@ func (g *Group) groupUpdate(c *wkhttp.Context) {
 			httperr.ResponseErrorL(c, errcode.ErrGroupNotMember, nil, nil)
 			return
 		}
-		var isBot int
-		if err := g.ctx.DB().SelectBySql("SELECT COALESCE((SELECT robot FROM `user` WHERE uid=? LIMIT 1), 0)", loginUID).LoadOne(&isBot); err != nil {
+		// 龙虾(robot)排除：复用 Service.IsRobot 单一数据源，避免与其重复内联 SQL。
+		isBot, err := g.groupService.IsRobot(loginUID)
+		if err != nil {
 			g.Error("查询用户是否为龙虾失败！", zap.Error(err))
 			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
 			return
 		}
-		if isBot == 1 {
+		if isBot {
 			httperr.ResponseErrorL(c, errcode.ErrGroupNotMember, nil, nil)
 			return
 		}

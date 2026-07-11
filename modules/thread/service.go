@@ -429,12 +429,14 @@ func (s *Service) UpdateName(groupNo, shortID, operatorUID, name string) error {
 
 	// 企业微信式解散语义（产品决策 2026-06）：子区改名属低风险写，解散后仍允许——
 	// 对齐会话置顶（group/api.go:groupSettingUpdate 的 settingActionMap 豁免解散校验）。
-	// 故此处不再调 ensureGroupNotDisbanded；改名仍受下方「父群活跃成员 + creator/admin」
-	// 权限校验保护。建子区 / 加入 / 归档 / 删除 / GROUP.md 仍由各自守卫拦截。
+	// 故此处不再调 ensureGroupNotDisbanded；改名仍受下方「父群内部活跃人类成员 + 龙虾排除」
+	// 权限校验保护（creator/admin 限制已放开）。建子区 / 加入 / 归档 / 删除 / GROUP.md 仍由各自守卫拦截。
 
-	// 子区操作权来自「父群活跃成员」身份：被拉黑/移出父群的用户即使是子区创建者也
-	// 无权改名。fail-closed。
-	isActive, err := s.groupService.ExistMemberActive(thread.GroupNo, operatorUID)
+	// 子区操作权来自「父群内部活跃成员」身份：被拉黑/移出父群的用户即使是子区创建者也
+	// 无权改名；跨 Space 外部成员(is_external=1)同样无权。fail-closed。
+	// 用 ExistMemberActiveInternal（带 is_external=0）保留旧门禁的 is_external=0 边界
+	// （YUJ-231 / GH#1289，P1）。
+	isActive, err := s.groupService.ExistMemberActiveInternal(thread.GroupNo, operatorUID)
 	if err != nil {
 		return fmt.Errorf("check active membership: %w", err)
 	}
