@@ -549,6 +549,9 @@ other = "Sending messages on behalf of another user is not supported."
 ["err.server.message.query_failed"]
 other = "Failed to query message data."
 
+["err.server.message.reaction_unsupported_type"]
+other = "Only text messages can be reacted to."
+
 ["err.server.message.recall_forbidden"]
 other = "You do not have permission to recall this message."
 

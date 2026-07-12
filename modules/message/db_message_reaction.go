@@ -3,7 +3,6 @@ package message
 import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/db"
-	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -31,36 +30,42 @@ func (d *messageReactionDB) queryReactionWithChannelAndSeq(channelID string, cha
 	return list, err
 }
 
-func (d *messageReactionDB) queryWithMessageIDs(messageIDs []string) ([]*reactionModel, error) {
+func (d *messageReactionDB) queryWithMessageIDsInChannel(channelID string, channelType uint8, messageIDs []string) ([]*reactionModel, error) {
 	if len(messageIDs) <= 0 {
 		return nil, nil
 	}
 	var models []*reactionModel
-	_, err := d.session.Select("*").From("reaction_users").Where("message_id in ?", messageIDs).Load(&models)
+	_, err := d.session.Select("*").From("reaction_users").
+		Where("channel_id=? and channel_type=? and message_id in ?", channelID, channelType, messageIDs).
+		Load(&models)
 	return models, err
 }
 
-// 查询某个用户的回应数据
-func (d *messageReactionDB) queryReactionWithUIDAndMessageID(uid string, messageID string) (*reactionModel, error) {
-	var model *reactionModel
-	_, err := d.session.Select("*").From("reaction_users").Where("uid=? and message_id=?", uid, messageID).Load(&model)
-	return model, err
-}
-
-// 新增回应
-func (d *messageReactionDB) insertReaction(model *reactionModel) error {
-	_, err := d.session.InsertInto("reaction_users").Columns(util.AttrToUnderscore(model)...).Record(model).Exec()
-	return err
-}
-
-// 修改某条消息的回应
-func (d *messageReactionDB) updateReactionStatus(model *reactionModel) error {
-	_, err := d.session.Update("reaction_users").SetMap(map[string]interface{}{
-		"is_deleted": model.IsDeleted,
-		"seq":        model.Seq,
-		"emoji":      model.Emoji,
-	}).Where("message_id=? and uid=?", model.MessageID, model.UID).Exec()
-	return err
+// toggleReaction 对单个 (uid, message_id, channel_id, channel_type, emoji) 做原子 toggle：
+// 首次命中 → 插入 is_deleted=0（点亮）；再次命中唯一键 → is_deleted 翻转（0→1 取消 /
+// 1→0 复活）。依赖迁移 20260712000001 建的唯一索引触发 ON DUPLICATE KEY UPDATE，
+// 单条语句原子完成，天然防并发重复行。每次都写入新的 seq，供频道级增量 sync 感知变更。
+//
+// 多 reaction 语义：不同 emoji 命中不同唯一键 → 各自独立行，互不影响（追加），
+// 不再有"改 emoji 覆盖"分支。
+//
+// upsert 后回读该行最终 is_deleted 返回，供 Web 乐观更新对账（盲翻转 + 并发下需知道结果）。
+func (d *messageReactionDB) toggleReaction(model *reactionModel) (int, error) {
+	_, err := d.session.InsertBySql(
+		"INSERT INTO reaction_users (message_id, seq, channel_id, channel_type, uid, name, emoji, is_deleted) "+
+			"VALUES (?,?,?,?,?,?,?,0) "+
+			"ON DUPLICATE KEY UPDATE is_deleted = 1 - is_deleted, seq = VALUES(seq), name = VALUES(name), updated_at = CURRENT_TIMESTAMP",
+		model.MessageID, model.Seq, model.ChannelID, model.ChannelType, model.UID, model.Name, model.Emoji,
+	).Exec()
+	if err != nil {
+		return 0, err
+	}
+	var isDeleted int
+	err = d.session.Select("is_deleted").From("reaction_users").
+		Where("channel_id=? and channel_type=? and message_id=? and uid=? and emoji=?",
+			model.ChannelID, model.ChannelType, model.MessageID, model.UID, model.Emoji).
+		LoadOne(&isDeleted)
+	return isDeleted, err
 }
 
 type reactionModel struct {

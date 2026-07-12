@@ -44,6 +44,24 @@ func (d *DB) queryMessageByID(channelID string, channelType uint8, messageID str
 	return model, nil
 }
 
+// queryMessagesByIDs 按 (channelID, channelType, message_id IN ...) 批量查同一频道下的
+// 多条消息正文（is_deleted=0）。message_id 列为 VARCHAR(20)，必须以字符串切片绑定才能
+// 命中索引（同 queryMessageByID 的隐式类型转换说明）。同一频道所有消息落同一分表
+// (getTable 按 channelID 取模)，故一次查询即可。
+func (d *DB) queryMessagesByIDs(channelID string, channelType uint8, messageIDs []string) ([]*messageModel, error) {
+	if len(messageIDs) == 0 {
+		return nil, nil
+	}
+	var models []*messageModel
+	_, err := d.session.Select("*").From(d.getTable(channelID)).
+		Where("channel_id=? AND channel_type=? AND message_id in ? AND is_deleted=0", channelID, channelType, messageIDs).
+		Load(&models)
+	if err != nil {
+		return nil, err
+	}
+	return models, nil
+}
+
 func (d *DB) queryMaxMessageSeq(channelID string, channelType uint8) (uint32, error) {
 	var maxMessageSeq uint32
 	err := d.session.Select("IFNULL(max(message_seq),0)").From(d.getTable(channelID)).Where("channel_id=? and channel_type=?", channelID, channelType).LoadOne(&maxMessageSeq)

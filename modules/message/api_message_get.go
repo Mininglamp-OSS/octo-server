@@ -59,6 +59,27 @@ func visiblesAllows(rawPayload []byte, loginUID string) bool {
 	return false
 }
 
+// payloadIsPlainText 从原始 payload 字节解析 type 字段，判定是否为纯文本消息
+// （common.Text=1）。当前 reaction 仅对纯文本开放，其它类型（图片/卡片/系统提示/
+// 通话记录等）一律拒绝。
+//
+// fail-closed：payload 非 JSON / 无 type / type 非整数 / type != 1 一律返回 false。
+// 用 json.Number 解析以兼容整数与被序列化成数字串的场景；1.0 这类浮点写法会因
+// Int64() 失败而落到 false（IM 落库的 type 恒为整数，正常文本消息不受影响）。
+func payloadIsPlainText(rawPayload []byte) bool {
+	var v struct {
+		Type json.Number `json:"type"`
+	}
+	if err := json.Unmarshal(rawPayload, &v); err != nil {
+		return false
+	}
+	n, err := v.Type.Int64()
+	if err != nil {
+		return false
+	}
+	return n == int64(common.Text.Int())
+}
+
 func msgModelToMessageResp(m *messageModel) *config.MessageResp {
 	resp := &config.MessageResp{
 		MessageID:   m.MessageID,
@@ -232,7 +253,7 @@ func (m *Message) respondSingleMessage(c *wkhttp.Context, channelID string, chan
 		return
 	}
 
-	extra, userExtra, reactions, err := m.fetchMessageExtras(messageID, loginUID)
+	extra, userExtra, reactions, err := m.fetchMessageExtras(messageID, loginUID, channelID, channelType)
 	if err != nil {
 		m.Error("查询消息扩展失败", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
@@ -292,7 +313,7 @@ func (m *Message) respondSingleMessage(c *wkhttp.Context, channelID string, chan
 
 // fetchMessageExtras 一次拉取 (message_extra, message_user_extra, reactions)。
 // 任意一步 DB 错误时返回 wrap 后的错误，由调用方决定响应。
-func (m *Message) fetchMessageExtras(messageID int64, loginUID string) (*messageExtraDetailModel, *messageUserExtraModel, []*reactionModel, error) {
+func (m *Message) fetchMessageExtras(messageID int64, loginUID string, channelID string, channelType uint8) (*messageExtraDetailModel, *messageUserExtraModel, []*reactionModel, error) {
 	idList := []string{strconv.FormatInt(messageID, 10)}
 
 	extras, err := m.messageExtraDB.queryWithMessageIDsAndUID(idList, loginUID)
@@ -315,7 +336,7 @@ func (m *Message) fetchMessageExtras(messageID int64, loginUID string) (*message
 		userExtra = userExtras[0]
 	}
 
-	reactions, err := m.messageReactionDB.queryWithMessageIDs(idList)
+	reactions, err := m.messageReactionDB.queryWithMessageIDsInChannel(channelID, channelType, idList)
 	if err != nil {
 		m.Error("查询消息反应失败", zap.Error(err))
 		return nil, nil, nil, errors.Wrap(err, "查询消息反应失败")

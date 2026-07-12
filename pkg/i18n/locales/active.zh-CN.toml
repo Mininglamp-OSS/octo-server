@@ -1253,6 +1253,9 @@ other = "卡片修订查询无效。"
 ["err.server.message.card_revision_denied"]
 other = "你无权查看该卡片的修订历史。"
 
+["err.server.message.reaction_unsupported_type"]
+other = "仅纯文本消息支持回应。"
+
 ["err.server.bot_api.card_disabled"]
 other = "当前部署未启用卡片消息。"
 

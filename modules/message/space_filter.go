@@ -572,6 +572,23 @@ func newSystemBotPlaceholder(uid string) *SyncUserConversationResp {
 //
 // 调用方需保证 spaceID != ""（空串视为未启用 Space 过滤，直接返回原列表），
 // 传入 defaultSpaceID（用户默认 Space，决定规则 2/3），并只对 ChannelTypePerson 调用。
+// personSpaceAllows applies the DM (Person) space-isolation rules (issue #484 /
+// YUJ-226) to a single message's payload space_id. Shared by
+// filterPersonMessagesBySpace (message sync) and the reaction read/write paths so
+// the DM isolation posture cannot drift between entry points. Caller guarantees
+// spaceID != "". Keep only on exact match (rule 1) or unlabeled-in-default-Space
+// forward-compat (rule 2); everything else (cross-Space, unlabeled-non-default,
+// unlabeled-system-bot) is dropped.
+func personSpaceAllows(msgSpaceID string, isSysBot bool, spaceID, defaultSpaceID string) bool {
+	if msgSpaceID == spaceID {
+		return true
+	}
+	if msgSpaceID == "" && !isSysBot && spaceID == defaultSpaceID {
+		return true
+	}
+	return false
+}
+
 func filterPersonMessagesBySpace(msgs []*MsgSyncResp, channelID, spaceID, defaultSpaceID string) []*MsgSyncResp {
 	if spaceID == "" || len(msgs) == 0 {
 		return msgs
@@ -582,27 +599,8 @@ func filterPersonMessagesBySpace(msgs []*MsgSyncResp, channelID, spaceID, defaul
 		if m == nil {
 			continue
 		}
-		msid := extractPayloadSpaceID(m.Payload)
-		switch {
-		case msid == spaceID:
-			// 精确匹配当前 Space → 保留
+		if personSpaceAllows(extractPayloadSpaceID(m.Payload), isSysBot, spaceID, defaultSpaceID) {
 			filtered = append(filtered, m)
-		case msid == "" && !isSysBot && spaceID == defaultSpaceID:
-			// issue #484：无 space_id 的普通 DM 消息（发送方未带 X-Space-ID、
-			// Space 化之前的老消息、转发/名片）只在用户默认 Space 向前兼容保留，
-			// 不再出现在每个 Space —— 修复症状1（跨 Space 历史泄漏）。
-			filtered = append(filtered, m)
-		case msid == "" && !isSysBot:
-			// 非默认 Space：无标签 DM 消息不再 fail-open 放行，丢弃。
-			continue
-		case msid == "" && isSysBot:
-			// 系统 Bot 的无 space_id 历史消息一律隐藏。对齐 Android
-			// filterSystemBotMessages 和 iOS filterMessagesBySpace，避免
-			// 老的 botfather/fileHelper/u_10000 对话全量跨 Space 暴露。
-			continue
-		case msid != spaceID:
-			// 明确跨 Space，丢弃。
-			continue
 		}
 	}
 	return filtered
@@ -623,6 +621,23 @@ func extractPayloadSpaceID(payload map[string]interface{}) string {
 		return ""
 	}
 	return s
+}
+
+// payloadSpaceIDFromRaw 从原始 payload 字节读取 space_id（reaction 目标消息持有的是
+// 未反序列化的 messageModel.Payload []byte）。非 JSON / 缺字段 / 类型不符返回 ""，
+// 与 extractPayloadSpaceID 的"无 space_id"口径一致。只解 space_id 一个字段，避免大
+// payload 建整 map。
+func payloadSpaceIDFromRaw(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var v struct {
+		SpaceID string `json:"space_id"`
+	}
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return ""
+	}
+	return v.SpaceID
 }
 
 // resolveBotFilter 批量查询 Bot 状态和 Space 成员关系。

@@ -338,12 +338,14 @@ func (m *Message) Route(r *wkhttp.WKHttp) {
 		// messages.PUT("/:message_id/voicereaded", m.voiceReaded)
 		messages.GET("/:message_id/receipt", m.messageReceiptList) // 消息回执列表
 	}
-	// 回应
-	reactions := r.Group("/v1/reactions", m.ctx.AuthMiddleware(r), uidLimit)
+	// 回应。挂 SpaceMiddleware：Person(DM)是跨 Space 共享的同一物理频道，
+	// reaction 读/写必须与 /v1/message 一样按已校验的 Space 隔离 DM 消息，
+	// 否则 sync 会泄露其它 Space 的 DM reaction 元数据、write 会给跨 Space DM 消息点回应。
+	reactions := r.Group("/v1/reactions", m.ctx.AuthMiddleware(r), uidLimit, spacepkg.SpaceMiddleware(m.ctx))
 	{
 		reactions.POST("", m.addOrCancelReaction) // 添加或取消回应
 	}
-	reaction := r.Group("/v1/reaction", m.ctx.AuthMiddleware(r), uidLimit)
+	reaction := r.Group("/v1/reaction", m.ctx.AuthMiddleware(r), uidLimit, spacepkg.SpaceMiddleware(m.ctx))
 	{
 		reaction.POST("/sync", m.syncReaction)
 	}
@@ -1689,9 +1691,11 @@ func (m *Message) syncReaction(c *wkhttp.Context) {
 		respondMessageRequestInvalid(c, "")
 		return
 	}
-	// Verify channel membership before syncing reaction data
+	// 同步鉴权必须与写路径（addOrCancelReaction）对齐：Group/子区用 ExistMemberActive
+	// 排除黑名单，子区解析父群并校验未删除，未知类型一律拒绝。否则读/同步路径会成为
+	// 绕过写路径加固的短板（任意登录用户凭 channel_id 拉取 reaction 元数据）。
 	if req.ChannelType == common.ChannelTypeGroup.Uint8() {
-		isMember, err := m.groupService.ExistMember(req.ChannelID, loginUID)
+		isMember, err := m.groupService.ExistMemberActive(req.ChannelID, loginUID)
 		if err != nil {
 			m.Error("查询群成员关系错误", zap.Error(err))
 			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
@@ -1714,6 +1718,36 @@ func (m *Message) syncReaction(c *wkhttp.Context) {
 				return
 			}
 		}
+	} else if req.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
+		parentGroupNo, shortID, perr := thread.ParseChannelID(req.ChannelID)
+		if perr != nil || parentGroupNo == "" {
+			m.Error("解析子区频道ID失败（reaction sync）", zap.Error(perr), zap.String("channelID", req.ChannelID))
+			respondMessageRequestInvalid(c, "channel_id")
+			return
+		}
+		isMember, err := m.groupService.ExistMemberActive(parentGroupNo, loginUID)
+		if err != nil {
+			m.Error("查询父群成员关系错误（reaction sync）", zap.Error(err), zap.String("groupNo", parentGroupNo))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		if !isMember {
+			httperr.ResponseErrorL(c, errcode.ErrMessageChannelAccessDenied, nil, nil)
+			return
+		}
+		ok, terr := m.threadNotDeleted(parentGroupNo, shortID)
+		if terr != nil {
+			m.Error("查询子区状态失败（reaction sync）", zap.Error(terr), zap.String("channelID", req.ChannelID))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		if !ok {
+			httperr.ResponseErrorL(c, errcode.ErrMessageNotFound, nil, nil)
+			return
+		}
+	} else {
+		respondMessageRequestInvalid(c, "channel_type")
+		return
 	}
 
 	fakeChannelID := req.ChannelID
@@ -1745,6 +1779,35 @@ func (m *Message) syncReaction(c *wkhttp.Context) {
 		return
 	}
 
+	// 读时可见性过滤：reaction 行不会在消息撤回/删除/用户清理/偏移截断后被清理，
+	// 必须按调用者当前可见性剔除目标消息不可见的 reaction，避免泄露 message_id/uid/
+	// name/emoji（写路径已拦不可见消息，读路径必须对齐）。
+	//
+	// Person(DM)额外按已校验的 Space 过滤：DM 是跨 Space 共享的同一物理频道，
+	// 不加这层会把其它 Space 的 DM reaction 元数据透出（对齐 /v1/message 的
+	// filterPersonMessagesBySpace / YUJ-226）。SpaceMiddleware 未 opt-in 时
+	// spaceID=="" → 跳过，向前兼容。
+	var spaceID, defaultSpaceID string
+	var isSysBot bool
+	if req.ChannelType == common.ChannelTypePerson.Uint8() {
+		if spaceID = spacepkg.GetSpaceID(c); spaceID != "" {
+			var derr error
+			defaultSpaceID, derr = space.GetUserDefaultSpaceIDE(m.ctx, loginUID)
+			if derr != nil {
+				m.Warn("查询默认 Space 失败，DM reaction 无标签历史按兼容口径保留",
+					zap.Error(derr), zap.String("loginUID", loginUID))
+				defaultSpaceID = spaceID
+			}
+			isSysBot = spacepkg.IsSystemBot(req.ChannelID)
+		}
+	}
+	list, err = m.filterReactionsByMessageVisibility(fakeChannelID, req.ChannelType, loginUID, spaceID, defaultSpaceID, isSysBot, list)
+	if err != nil {
+		m.Error("过滤 reaction 可见性失败", zap.Error(err), zap.String("channel_id", fakeChannelID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+		return
+	}
+
 	toChannelID := common.GetToChannelIDWithFakeChannelID(fakeChannelID, loginUID)
 
 	reactions := make([]*reactionResp, 0)
@@ -1766,6 +1829,106 @@ func (m *Message) syncReaction(c *wkhttp.Context) {
 	c.JSON(http.StatusOK, reactions)
 }
 
+// filterReactionsByMessageVisibility 按调用者对每条目标消息的当前可见性过滤 reaction 行。
+// channelID 为存储态频道 ID（私聊传 fakeChannelID），与 reaction_users / message 分表一致。
+// 固定 5 个批量/单次查询（消息本体 + extra + user_extra + 用户偏移 + 频道偏移），不随
+// reaction 数放大。目标消息在本地分表查不到（nil）一律视为不可见并剔除。
+//
+// spaceID != "" 时对 Person(DM)额外按 Space 过滤（isSysBot/defaultSpaceID 由调用方就
+// 频道预算一次），口径与 filterPersonMessagesBySpace 完全一致（共用 personSpaceAllows）。
+func (m *Message) filterReactionsByMessageVisibility(channelID string, channelType uint8, loginUID string, spaceID, defaultSpaceID string, isSysBot bool, list []*reactionModel) ([]*reactionModel, error) {
+	if len(list) == 0 {
+		return list, nil
+	}
+	spaceScoped := spaceID != "" && channelType == common.ChannelTypePerson.Uint8()
+	seen := make(map[string]struct{}, len(list))
+	ids := make([]string, 0, len(list))
+	for _, r := range list {
+		if _, ok := seen[r.MessageID]; ok {
+			continue
+		}
+		seen[r.MessageID] = struct{}{}
+		ids = append(ids, r.MessageID)
+	}
+
+	msgs, err := m.db.queryMessagesByIDs(channelID, channelType, ids)
+	if err != nil {
+		return nil, err
+	}
+	msgByID := make(map[string]*messageModel, len(msgs))
+	for _, mm := range msgs {
+		msgByID[strconv.FormatInt(mm.MessageID, 10)] = mm
+	}
+
+	extras, err := m.messageExtraDB.queryWithMessageIDsAndUID(ids, loginUID)
+	if err != nil {
+		return nil, err
+	}
+	extraByID := make(map[string]*messageExtraDetailModel, len(extras))
+	for _, e := range extras {
+		extraByID[e.MessageID] = e
+	}
+
+	userExtras, err := m.messageUserExtraDB.queryWithMessageIDsAndUID(ids, loginUID)
+	if err != nil {
+		return nil, err
+	}
+	userExtraByID := make(map[string]*messageUserExtraModel, len(userExtras))
+	for _, ue := range userExtras {
+		userExtraByID[ue.MessageID] = ue
+	}
+
+	var userOffsetSeq uint32
+	userOffset, err := m.channelOffsetDB.queryWithUIDAndChannel(loginUID, channelID, channelType)
+	if err != nil {
+		return nil, err
+	}
+	if userOffset != nil {
+		userOffsetSeq = userOffset.MessageSeq
+	}
+	channelOffsetSeq, err := m.reactionChannelOffsetSeq(channelID, channelType, loginUID)
+	if err != nil {
+		return nil, err
+	}
+
+	visible := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		mm := msgByID[id]
+		if mm == nil {
+			visible[id] = false
+			continue
+		}
+		if !messageVisibleToViewer(mm, extraByID[id], userExtraByID[id], userOffsetSeq, channelOffsetSeq, loginUID) {
+			visible[id] = false
+			continue
+		}
+		if spaceScoped && !personSpaceAllows(payloadSpaceIDFromRaw(mm.Payload), isSysBot, spaceID, defaultSpaceID) {
+			visible[id] = false
+			continue
+		}
+		// 类型门与写路径 payloadIsPlainText 对齐：本期仅纯文本消息可承载 reaction。
+		// 写侧已在 addOrCancelReaction 拦截，但读侧仍需过滤，兜住历史存量或未来其它
+		// 写路径可能绕过的非文本 reaction 行，避免下发。
+		if !payloadIsPlainText(mm.Payload) {
+			visible[id] = false
+			continue
+		}
+		visible[id] = true
+	}
+
+	out := make([]*reactionModel, 0, len(list))
+	for _, r := range list {
+		if visible[r.MessageID] {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
+// maxReactionEmojiRunes 与 reaction_users.emoji 的 varchar(20) 对齐：写入前按 rune
+// 数拦截超长 emoji，避免 DB 静默截断或报错。
+const maxReactionEmojiRunes = 20
+
 // 添加或取消回应
 func (m *Message) addOrCancelReaction(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
@@ -1781,9 +1944,38 @@ func (m *Message) addOrCancelReaction(c *wkhttp.Context) {
 		respondMessageRequestInvalid(c, "")
 		return
 	}
+	req.ChannelID = strings.TrimSpace(req.ChannelID)
+	req.MessageID = strings.TrimSpace(req.MessageID)
+	req.Emoji = strings.TrimSpace(req.Emoji)
+	if req.ChannelID == "" {
+		respondMessageRequestInvalid(c, "channel_id")
+		return
+	}
+	messageID, ok := parsePositiveMessageID(req.MessageID)
+	if !ok {
+		respondMessageRequestInvalid(c, "message_id")
+		return
+	}
+	// 规范化：parsePositiveMessageID 接受 "+910000"/"0910000" 等非规范整数写法，
+	// 但 message_id 在 message / reaction_users 表里以规范十进制串存储。回写后所有
+	// 后续查询（queryMessageByID、toggleReaction、可见性 idList）用同一个规范串，
+	// 避免非规范输入静默 404 / reaction 与消息主行 message_id 串形态不一致。
+	req.MessageID = strconv.FormatInt(messageID, 10)
+	if req.Emoji == "" {
+		respondMessageRequestInvalid(c, "emoji")
+		return
+	}
+	// emoji 存 varchar(20)：按 rune 上限拦截，避免超长输入被 DB 静默截断/报错。
+	// unicode emoji（含 ZWJ 序列）与项目 token（[xxx]）都远短于此。
+	if utf8.RuneCountInString(req.Emoji) > maxReactionEmojiRunes {
+		respondMessageRequestInvalid(c, "emoji")
+		return
+	}
+	fakeChannelID := req.ChannelID
+
 	// Verify channel membership before allowing reaction
 	if req.ChannelType == common.ChannelTypeGroup.Uint8() {
-		isMember, err := m.groupService.ExistMember(req.ChannelID, loginUID)
+		isMember, err := m.groupService.ExistMemberActive(req.ChannelID, loginUID)
 		if err != nil {
 			m.Error("查询群成员关系错误", zap.Error(err))
 			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
@@ -1794,6 +1986,7 @@ func (m *Message) addOrCancelReaction(c *wkhttp.Context) {
 			return
 		}
 	} else if req.ChannelType == common.ChannelTypePerson.Uint8() {
+		fakeChannelID = common.GetFakeChannelIDWith(req.ChannelID, loginUID)
 		if req.ChannelID != loginUID {
 			isFriend, err := m.userService.IsFriend(loginUID, req.ChannelID)
 			if err != nil {
@@ -1806,9 +1999,55 @@ func (m *Message) addOrCancelReaction(c *wkhttp.Context) {
 				return
 			}
 		}
+	} else if req.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
+		parentGroupNo, shortID, perr := thread.ParseChannelID(req.ChannelID)
+		if perr != nil || parentGroupNo == "" {
+			m.Error("解析子区频道ID失败（reaction）", zap.Error(perr), zap.String("channelID", req.ChannelID))
+			respondMessageRequestInvalid(c, "channel_id")
+			return
+		}
+		isMember, err := m.groupService.ExistMemberActive(parentGroupNo, loginUID)
+		if err != nil {
+			m.Error("查询父群成员关系错误", zap.Error(err), zap.String("groupNo", parentGroupNo))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		if !isMember {
+			httperr.ResponseErrorL(c, errcode.ErrMessageChannelAccessDenied, nil, nil)
+			return
+		}
+		// 已删除子区 fail-closed（与 getThreadMessage 一致）：不允许对已删除子区的历史
+		// 消息添加/取消 reaction。thread 不存在/已删除一律 404，防枚举。
+		ok, terr := m.threadNotDeleted(parentGroupNo, shortID)
+		if terr != nil {
+			m.Error("查询子区状态失败（reaction）", zap.Error(terr), zap.String("channelID", req.ChannelID))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		if !ok {
+			httperr.ResponseErrorL(c, errcode.ErrMessageNotFound, nil, nil)
+			return
+		}
+		// 父群解散守卫（企业微信式只读）：与下面 Group 分支同语义，收在这里避免
+		// 再解析一次 ParseChannelID。
+		disbanded, err := m.isGroupDisbanded(parentGroupNo)
+		if err != nil {
+			m.Error("查询父群是否已解散错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		if disbanded {
+			httperr.ResponseErrorL(c, errcode.ErrMessageGroupDisbanded, nil, nil)
+			return
+		}
+	} else {
+		respondMessageRequestInvalid(c, "channel_type")
+		return
 	}
 
 	// 解散守卫（企业微信式只读）：群解散后禁止添加/取消回应。
+	// CommunityTopic 的父群解散判定已在上面的 auth 分支就地完成（复用同一次
+	// ParseChannelID），这里只处理 Group。
 	if req.ChannelType == common.ChannelTypeGroup.Uint8() {
 		disbanded, err := m.isGroupDisbanded(req.ChannelID)
 		if err != nil {
@@ -1820,97 +2059,206 @@ func (m *Message) addOrCancelReaction(c *wkhttp.Context) {
 			httperr.ResponseErrorL(c, errcode.ErrMessageGroupDisbanded, nil, nil)
 			return
 		}
-	} else if req.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
-		parentGroupNo, _, perr := thread.ParseChannelID(req.ChannelID)
-		if perr != nil || parentGroupNo == "" {
-			m.Error("解析子区频道ID失败（reaction）", zap.Error(perr), zap.String("channelID", req.ChannelID))
-			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
-			return
-		}
-		disbanded, err := m.isGroupDisbanded(parentGroupNo)
-		if err != nil {
-			m.Error("查询父群是否已解散错误", zap.Error(err))
-			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
-			return
-		}
-		if disbanded {
-			httperr.ResponseErrorL(c, errcode.ErrMessageGroupDisbanded, nil, nil)
-			return
-		}
 	}
 
-	model, err := m.messageReactionDB.queryReactionWithUIDAndMessageID(loginUID, req.MessageID)
+	msgModel, err := m.db.queryMessageByID(fakeChannelID, req.ChannelType, req.MessageID)
 	if err != nil {
-		m.Error("查询登录用户是否回应消息错误", zap.Error(err))
+		m.Error("查询 reaction 目标消息失败", zap.Error(err), zap.String("channel_id", fakeChannelID), zap.String("message_id", req.MessageID))
 		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
-	fakeChannelID := req.ChannelID
-	if req.ChannelType == common.ChannelTypePerson.Uint8() {
-		fakeChannelID = common.GetFakeChannelIDWith(req.ChannelID, loginUID)
+	if msgModel == nil {
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotFound, nil, nil)
+		return
 	}
-	seq, err := m.genMessageReactionSeq(fakeChannelID) // 下次回复seq
+	visible, err := m.reactionTargetVisibleToViewer(msgModel, messageID, loginUID)
+	if err != nil {
+		m.Error("校验 reaction 目标消息可见性失败", zap.Error(err), zap.String("channel_id", fakeChannelID), zap.String("message_id", req.MessageID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+		return
+	}
+	if !visible {
+		httperr.ResponseErrorL(c, errcode.ErrMessageNotFound, nil, nil)
+		return
+	}
+
+	// Person(DM)Space 隔离：DM 是跨 Space 共享的同一物理频道，禁止给不属于当前
+	// 已校验 Space 的 DM 消息点回应。与 syncReaction 读过滤共用 personSpaceAllows；
+	// 不匹配按 404 归并（防枚举，与不可见同码）。放在类型门之前，避免"跨 Space 非文本"
+	// 泄露类型信号。SpaceMiddleware 未 opt-in 时 spaceID=="" → 跳过（向前兼容）。
+	if req.ChannelType == common.ChannelTypePerson.Uint8() {
+		if spaceID := spacepkg.GetSpaceID(c); spaceID != "" {
+			defaultSpaceID, derr := space.GetUserDefaultSpaceIDE(m.ctx, loginUID)
+			if derr != nil {
+				m.Warn("查询默认 Space 失败，DM reaction 无标签消息按兼容口径放行",
+					zap.Error(derr), zap.String("loginUID", loginUID))
+				defaultSpaceID = spaceID
+			}
+			if !personSpaceAllows(payloadSpaceIDFromRaw(msgModel.Payload), spacepkg.IsSystemBot(req.ChannelID), spaceID, defaultSpaceID) {
+				httperr.ResponseErrorL(c, errcode.ErrMessageNotFound, nil, nil)
+				return
+			}
+		}
+	}
+
+	// 消息类型门：当前仅纯文本消息（common.Text=1）允许 reaction。放在可见性校验之后，
+	// 保证不可见/越权消息仍归并到 404（不泄露"消息存在但类型不支持"信号），只有对
+	// 调用者可见的非文本消息才返回明确的 unsupported_type。
+	if !payloadIsPlainText(msgModel.Payload) {
+		httperr.ResponseErrorL(c, errcode.ErrMessageReactionUnsupportedType, nil, nil)
+		return
+	}
+
+	seq, err := m.genMessageReactionSeq(fakeChannelID) // 本次 toggle 的新 seq
 	if err != nil {
 		m.Error("生成消息回应序列号失败", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
-	if model == nil {
-		//新增回应
-		err = m.messageReactionDB.insertReaction(&reactionModel{
-			ChannelID:   fakeChannelID,
-			ChannelType: req.ChannelType,
-			UID:         loginUID,
-			Name:        loginName,
-			MessageID:   req.MessageID,
-			Emoji:       req.Emoji,
-			Seq:         seq,
-			IsDeleted:   0,
-		})
-		if err != nil {
-			m.Error("新增消息回应错误", zap.Error(err))
-			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
-			return
-		}
-	} else {
-		model.Seq = seq
-		if model.IsDeleted == 1 {
-			model.IsDeleted = 0
-			if model.Emoji != req.Emoji {
-				model.Emoji = req.Emoji
-			}
-		} else {
-			if model.Emoji == req.Emoji {
-				model.IsDeleted = 1
-			} else {
-				model.Emoji = req.Emoji
-			}
-		}
-		err = m.messageReactionDB.updateReactionStatus(model)
-		if err != nil {
-			m.Error("修改消息回应错误", zap.Error(err))
-			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
-			return
-		}
+	// 多 reaction：按 (uid, message_id, channel, emoji) 原子 toggle。同 emoji 命中唯一键翻转
+	// is_deleted，不同 emoji 落各自独立行（追加）。返回最终 is_deleted 供 Web 乐观更新对账。
+	isDeleted, err := m.messageReactionDB.toggleReaction(&reactionModel{
+		ChannelID:   fakeChannelID,
+		ChannelType: req.ChannelType,
+		UID:         loginUID,
+		Name:        loginName,
+		MessageID:   req.MessageID,
+		Emoji:       req.Emoji,
+		Seq:         seq,
+	})
+	if err != nil {
+		m.Error("写入消息回应失败", zap.Error(err), zap.String("channel_id", fakeChannelID), zap.String("message_id", req.MessageID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
+		return
 	}
 
-	//发送同步消息cmd
+	// 发送同步消息 cmd。param 带 message_id/emoji/seq，让 Web 精确定位消息 + emoji，
+	// 并用 seq 做乱序丢弃；无 param 也可降级为频道级失效 + 拉 /v1/reaction/sync 增量。
 	err = m.ctx.SendCMD(config.MsgCMDReq{
 		NoPersist:   true,
 		ChannelID:   req.ChannelID,
 		ChannelType: uint8(req.ChannelType),
 		CMD:         common.CMDSyncMessageReaction,
 		FromUID:     loginUID,
+		Param: map[string]interface{}{
+			"message_id":   req.MessageID,
+			"channel_id":   req.ChannelID,
+			"channel_type": req.ChannelType,
+			"emoji":        req.Emoji,
+			"seq":          seq,
+		},
 	})
 	if err != nil {
-		m.Error("发送同步命令失败！", zap.Error(err))
 		m.Error("发送同步命令失败", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrMessageNotifyFailed, nil, nil)
 		return
 	}
 
-	c.ResponseOK()
+	c.Response(&reactionToggleResp{
+		MessageID:   req.MessageID,
+		ChannelID:   req.ChannelID,
+		ChannelType: req.ChannelType,
+		Emoji:       req.Emoji,
+		Seq:         seq,
+		IsDeleted:   isDeleted,
+	})
 }
+
+// messageVisibleToViewer 是「消息对当前用户是否可见」的纯谓词，写路径（单条）与 sync
+// 路径（批量）共用同一套规则，避免两处判定分叉：
+//   - visibles 白名单未命中
+//   - message_extra 撤回 / 全局删除
+//   - message_user_extra 用户级删除
+//   - expire 过期
+//   - 用户级清理偏移（channel_offset）/ 频道级偏移（channel_setting）截断
+//
+// 入参 extra/userExtra 允许为 nil；offsetSeq 传 0 表示无该维度偏移。
+func messageVisibleToViewer(msg *messageModel, extra *messageExtraDetailModel, userExtra *messageUserExtraModel, userOffsetSeq uint32, channelOffsetSeq uint32, loginUID string) bool {
+	if !visiblesAllows(msg.Payload, loginUID) {
+		return false
+	}
+	if extra != nil && (extra.Revoke == 1 || extra.IsDeleted == 1) {
+		return false
+	}
+	if userExtra != nil && userExtra.MessageIsDeleted == 1 {
+		return false
+	}
+	if msg.Expire > 0 && time.Now().Unix()-int64(msg.Expire) >= int64(msg.Timestamp) {
+		return false
+	}
+	if userOffsetSeq > 0 && msg.MessageSeq <= userOffsetSeq {
+		return false
+	}
+	if channelOffsetSeq != 0 && msg.MessageSeq <= channelOffsetSeq {
+		return false
+	}
+	return true
+}
+
+func (m *Message) reactionTargetVisibleToViewer(msgModel *messageModel, messageID int64, loginUID string) (bool, error) {
+	// 只取 message_extra + message_user_extra（可见性判定所需）；不复用 fetchMessageExtras，
+	// 后者还会查 reactions（写路径用不到，避免多一次无谓 DB 往返）。
+	idList := []string{strconv.FormatInt(messageID, 10)}
+	var extra *messageExtraDetailModel
+	extras, err := m.messageExtraDB.queryWithMessageIDsAndUID(idList, loginUID)
+	if err != nil {
+		return false, err
+	}
+	if len(extras) > 0 {
+		extra = extras[0]
+	}
+	var userExtra *messageUserExtraModel
+	userExtras, err := m.messageUserExtraDB.queryWithMessageIDsAndUID(idList, loginUID)
+	if err != nil {
+		return false, err
+	}
+	if len(userExtras) > 0 {
+		userExtra = userExtras[0]
+	}
+	var userOffsetSeq uint32
+	userOffset, err := m.channelOffsetDB.queryWithUIDAndChannel(loginUID, msgModel.ChannelID, msgModel.ChannelType)
+	if err != nil {
+		return false, err
+	}
+	if userOffset != nil {
+		userOffsetSeq = userOffset.MessageSeq
+	}
+	channelOffsetSeq, err := m.reactionChannelOffsetSeq(msgModel.ChannelID, msgModel.ChannelType, loginUID)
+	if err != nil {
+		return false, err
+	}
+	return messageVisibleToViewer(msgModel, extra, userExtra, userOffsetSeq, channelOffsetSeq, loginUID), nil
+}
+
+// threadNotDeleted 校验子区本身未被删除（成员/父群鉴权由调用方前置完成）。
+// 返回 (ok, err)：err=DB 错误；ok=false 表示子区不存在或已删除（调用方按 404 处理，
+// 与 getThreadMessage 的 deleted fail-closed 一致，防枚举）。
+func (m *Message) threadNotDeleted(groupNo, shortID string) (bool, error) {
+	t, err := m.threadDB.QueryByGroupNoAndShortID(groupNo, shortID)
+	if err != nil {
+		return false, err
+	}
+	if t == nil || t.Status == thread.ThreadStatusDeleted {
+		return false, nil
+	}
+	return true, nil
+}
+
+func (m *Message) reactionChannelOffsetSeq(channelID string, channelType uint8, loginUID string) (uint32, error) {
+	lookupID := channelID
+	if channelType == common.ChannelTypePerson.Uint8() && !fakeChannelContainsUID(channelID, loginUID) {
+		lookupID = common.GetFakeChannelIDWith(channelID, loginUID)
+	}
+	settings, err := m.channelService.GetChannelSettings([]string{lookupID})
+	if err != nil {
+		return 0, err
+	}
+	if len(settings) > 0 && settings[0].OffsetMessageSeq > 0 {
+		return settings[0].OffsetMessageSeq, nil
+	}
+	return 0, nil
+}
+
 func (m *Message) handlerIMError(resp *rest.Response) error {
 	if resp.StatusCode != http.StatusOK {
 		if resp.StatusCode == http.StatusBadRequest {
@@ -3062,8 +3410,13 @@ func newSyncChannelMessageResp(resp *config.SyncChannelMessageResp, loginUID str
 			}
 		}
 
-		// 查询消息回应
-		messageReaction, err := messageReactionDB.queryWithMessageIDs(messageIDs)
+		reactionChannelID := channelID
+		if channelType == common.ChannelTypePerson.Uint8() {
+			reactionChannelID = common.GetFakeChannelIDWith(channelID, loginUID)
+		}
+		// 查询消息回应。必须按频道收口，避免只凭全局 message_id 把其它频道的脏
+		// reaction 行拼进当前消息响应。
+		messageReaction, err := messageReactionDB.queryWithMessageIDsInChannel(reactionChannelID, channelType, messageIDs)
 		if err != nil {
 			log.Error("查询消息回应数据错误", zap.Error(err))
 		}
@@ -3368,6 +3721,17 @@ type reactionSimpleResp struct {
 	Emoji     string `json:"emoji"`      // 回应的emoji
 	IsDeleted int    `json:"is_deleted"` // 是否删除
 	CreatedAt string `json:"created_at"`
+}
+
+// reactionToggleResp POST /v1/reactions 写接口返回该 emoji 的最终态，供 Web 乐观更新对账。
+// is_deleted=0 表示当前已点亮，=1 表示已取消（原子 toggle 盲翻转 + 并发下需回传结果）。
+type reactionToggleResp struct {
+	MessageID   string `json:"message_id"`
+	ChannelID   string `json:"channel_id"`
+	ChannelType uint8  `json:"channel_type"`
+	Emoji       string `json:"emoji"`
+	Seq         int64  `json:"seq"`
+	IsDeleted   int    `json:"is_deleted"`
 }
 
 // type userResp struct {

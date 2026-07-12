@@ -634,8 +634,8 @@ func (m *Message) syncPinnedMessage(c *wkhttp.Context) {
 			messageUserExtraMap[messageUserExtraM.MessageID] = messageUserExtraM
 		}
 	}
-	// 查询消息回应
-	messageReaction, err := m.messageReactionDB.queryWithMessageIDs(messageIds)
+	// 查询消息回应。按 pinned 所属频道收口，避免同 message_id 的跨频道脏数据串入。
+	messageReaction, err := m.messageReactionDB.queryWithMessageIDsInChannel(fakeChannelID, req.ChannelType, messageIds)
 	if err != nil {
 		m.Error("查询消息回应数据错误", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)

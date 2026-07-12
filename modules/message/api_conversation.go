@@ -1504,8 +1504,12 @@ func newSyncUserConversationResp(resp *config.SyncUserConversationResp, extra *c
 				messageExtraMap[messageExtra.MessageID] = messageExtra
 			}
 		}
-		// 消息回应
-		messageReaction, err := messageReactionDB.queryWithMessageIDs(messageIDs)
+		reactionChannelID := resp.ChannelID
+		if resp.ChannelType == common.ChannelTypePerson.Uint8() {
+			reactionChannelID = common.GetFakeChannelIDWith(resp.ChannelID, loginUID)
+		}
+		// 消息回应。按会话频道收口，避免只按 message_id 拉到其它频道 reaction。
+		messageReaction, err := messageReactionDB.queryWithMessageIDsInChannel(reactionChannelID, resp.ChannelType, messageIDs)
 		if err != nil {
 			log.Error("查询消息回应错误", zap.Error(err))
 		}

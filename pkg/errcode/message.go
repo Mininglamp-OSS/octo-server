@@ -228,4 +228,12 @@ var (
 		HTTPStatus:     http.StatusForbidden,
 		DefaultMessage: "You are not allowed to view this card's revisions.",
 	})
+	// ErrMessageReactionUnsupportedType 当前仅纯文本消息（common.Text=1）允许添加/取消
+	// 回应；对图片、卡片、系统提示、通话记录等非文本消息一律拒绝。目标消息存在且对
+	// 调用者可见时才会返回此码（不可见/越权仍归并到 404，避免枚举）。
+	ErrMessageReactionUnsupportedType = register(codes.Code{
+		ID:             "err.server.message.reaction_unsupported_type",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Only text messages can be reacted to.",
+	})
 )
