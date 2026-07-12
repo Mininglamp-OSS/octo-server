@@ -158,7 +158,7 @@ func classifyThreadError(err error) codes.Code {
 
 // Route 注册路由
 func (t *Thread) Route(r *wkhttp.WKHttp) {
-	threads := r.Group("/v1/groups/:group_no/threads", t.ctx.AuthMiddleware(r))
+	threads := r.Group("/v1/groups/:group_no/threads", t.ctx.AuthMiddleware(r), spacepkg.SpaceMiddleware(t.ctx))
 	{
 		threads.POST("", t.createThread)
 		threads.GET("", t.listThreads)
