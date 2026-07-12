@@ -86,3 +86,40 @@ func Test_Issue434_SearchByRealName(t *testing.T) {
 		assert.Equal(t, "Ouyang Feng", resp.List[0].Name, "search result must display the real_name fallback")
 	}
 }
+
+// Test_Issue434_NamedMemberNotSearchableByRealName pins the privacy invariant flagged
+// by the #537 review (three-reviewer consensus): real_name is searchable ONLY when it is
+// the actual display value (user.name blank). A member with a non-empty user.name displays
+// that name and never returns real_name, so their verification real_name must NOT be a
+// search oracle — otherwise an in-space admin could substring-probe a hidden legal name and
+// confirm it via the hit/count. This is the "可检索粒度 == 可见粒度" boundary the file also
+// holds for phone (maskPhone). Without the name-empty gate this test fails (member matched).
+func Test_Issue434_NamedMemberNotSearchableByRealName(t *testing.T) {
+	srv, _, err := setup(t)
+	assert.NoError(t, err)
+
+	const spaceId = "sp-434-realname-oracle"
+	seedMemberSearchSpace(t, spaceId, testutil.UID)
+
+	// Named member: a visible user.name AND a distinct (hidden) verification real_name.
+	const uid = "u434-named-hidden"
+	seedFallbackUser(t, uid, "Visible Name")
+	seedFallbackVerification(t, uid, "Secret Legal Name")
+	seedMemberSearchMember(t, spaceId, uid, 0, 1)
+
+	// Probing the hidden real_name must not match — searchable granularity == visible granularity.
+	w := getMembersSearch(t, srv, testCtx, spaceId, url.Values{"keyword": {"Secret Legal"}})
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	resp := decodeMembersSearchResp(t, w)
+	assert.EqualValues(t, 0, resp.Count, "named member must not be discoverable by their hidden real_name")
+	_, found := findMemberSearchItem(resp.List, uid)
+	assert.False(t, found, "named member's real_name must not act as a search oracle")
+
+	// Sanity: the same member is still findable by their visible name (fallback gate is one-way).
+	w2 := getMembersSearch(t, srv, testCtx, spaceId, url.Values{"keyword": {"Visible"}})
+	assert.Equal(t, http.StatusOK, w2.Code, w2.Body.String())
+	resp2 := decodeMembersSearchResp(t, w2)
+	if item, ok := findMemberSearchItem(resp2.List, uid); assert.True(t, ok, "named member must remain findable by visible name") {
+		assert.Equal(t, "Visible Name", item.Name)
+	}
+}

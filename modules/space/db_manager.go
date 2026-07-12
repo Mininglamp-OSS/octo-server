@@ -54,20 +54,29 @@ func memberSearchWhere(keyword string) (string, []interface{}) {
 //     （响应仅显示 138****5678），admin 无法通过子串查询逐位探测/重建完整号码。
 //
 // 前端注意：phone 检索只匹配后 4 位，传完整号码不会命中——按手机号查找请用后 4 位。
-// uv.real_name 让空 user.name 的成员可按实名被搜到（issue #434）；对应的 uv LEFT JOIN
-// 由 searchMembers / countSearchMembers 以 collation-safe 方式挂入（memberVerificationJoinOn）。
-var memberSearchActiveColumns = []string{"u.name", "u.username", "u.email", "RIGHT(u.phone,4)", "sm.uid", "uv.real_name"}
+// 注意：uv.real_name 不在此列——它只在「作为展示值」时可检索，由 memberSearchActiveWhere
+// 用 name 为空的门禁单独拼接，见该函数注释。
+var memberSearchActiveColumns = []string{"u.name", "u.username", "u.email", "RIGHT(u.phone,4)", "sm.uid"}
 
 // memberSearchActiveWhere 为空间侧 members/search 组装跨列 OR LIKE 条件。
 // list / count 共用同一条件，避免搜索范围漂移导致分页错位。
+//
+// real_name（user_verification 实名，PII）单独处理，且门禁在 user.name 为空：实名
+// **只在它是实际展示值时**（即 user.name 为空、DisplayName 回退到 real_name）才可检索，
+// 使「可检索粒度 == 可见粒度」——与本文件对 phone 只放后 4 位（maskPhone）同一取向。
+// 若无门禁，有 name 的成员响应只显示 name、绝不返回 real_name，却能被实名子串命中，
+// admin 便可把搜索当作实名 oracle 逐位探测出从不展示的法定姓名（#537 review 三人共识）。
 func memberSearchActiveWhere(keyword string) (string, []interface{}) {
 	like := buildLikePattern(keyword)
-	clauses := make([]string, len(memberSearchActiveColumns))
-	args := make([]interface{}, len(memberSearchActiveColumns))
-	for i, col := range memberSearchActiveColumns {
-		clauses[i] = col + " LIKE ?" + likeEscapeClause
-		args[i] = like
+	clauses := make([]string, 0, len(memberSearchActiveColumns)+1)
+	args := make([]interface{}, 0, len(memberSearchActiveColumns)+1)
+	for _, col := range memberSearchActiveColumns {
+		clauses = append(clauses, col+" LIKE ?"+likeEscapeClause)
+		args = append(args, like)
 	}
+	// 门禁与 resolveMemberDisplayName 的回退条件（name 非空即用 name）严格对齐。
+	clauses = append(clauses, "(IFNULL(u.name,'')='' AND uv.real_name LIKE ?"+likeEscapeClause+")")
+	args = append(args, like)
 	return strings.Join(clauses, " OR "), args
 }
 
