@@ -496,6 +496,129 @@ func TestSearchGlobalMessages_EmptyKeywordNoFilter_Browses(t *testing.T) {
 	}
 }
 
+// bug 3 · single-channel fast-path parity for empty-keyword browse.
+//
+// When the caller's readable scope collapses to exactly one room (single
+// joined group, no threads / no DMs), resolveGlobalScope returns
+// singleFast != nil and searchGlobalMessages dispatches through
+// dispatchSingleAll → searchAllForGlobalFastPath — the fast path was
+// silently re-applying the strict single-channel validateSearchNotEmpty
+// guard, so the multi-room browse fix (bug 3) never reached the collapsed
+// case and still returned 400.
+//
+// The load-bearing assertion is negative: the response MUST NOT be a
+// VALIDATION_ERROR complaining about "keyword or at least one filter is
+// required". The fast path may still terminate with an upstream/internal
+// error because no OpenSearch is wired in the test env — that is fine as
+// long as the request survived validation.
+func TestSearchGlobalMessages_SingleGroupFastPath_EmptyKeywordBrowses(t *testing.T) {
+	resetESClientForTest()
+	defer resetESClientForTest()
+	primeESClientForFastPathTests(t)
+
+	loginUID := "me"
+	// Exactly one joined group, no threads and no DM peers → scope collapses
+	// to a single channel → singleFast fires.
+	gSvc := &stubGroupSvc{
+		groupsByUID: map[string][]*group.InfoResp{
+			loginUID: {{GroupNo: "grpSolo"}},
+		},
+	}
+	uSvc := &stubUserSvc{}
+	h := newAllowlistHandler(t, gSvc, uSvc)
+	h.threadEnumFn = func([]string) (map[string][]string, error) { return nil, nil }
+
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	gc, _ := gin.CreateTestContext(rec)
+	gc.Request = httptest.NewRequest("POST", "/v1/messages/_search_global_messages",
+		strings.NewReader(`{"keyword":"","filters":{}}`))
+	gc.Set("uid", loginUID)
+	c := &wkhttp.Context{Context: gc}
+
+	h.searchGlobalMessages(c)
+
+	assertNotEmptySearchGuardRejection(t, rec)
+}
+
+// bug 3 · single-channel fast-path parity via channel_ids narrowing.
+//
+// Same load-bearing assertion as above, but reaches the fast path through a
+// different route: the caller is a member of several groups but the request
+// filters channel_ids down to one group that has no active threads → scope
+// intersect collapses to a single channelId → singleFast fires. This is the
+// realistic frontend shape (picker narrows scope) and is where reviewers
+// most often exercise the bug.
+func TestSearchGlobalMessages_ChannelIDsCollapseToOne_EmptyKeywordBrowses(t *testing.T) {
+	resetESClientForTest()
+	defer resetESClientForTest()
+	primeESClientForFastPathTests(t)
+
+	loginUID := "me"
+	gSvc := &stubGroupSvc{
+		groupsByUID: map[string][]*group.InfoResp{
+			loginUID: {
+				{GroupNo: "grpA"},
+				{GroupNo: "grpB"},
+				{GroupNo: "grpC"},
+			},
+		},
+	}
+	uSvc := &stubUserSvc{}
+	h := newAllowlistHandler(t, gSvc, uSvc)
+	// grpA is the picker target; the other two are ambient membership. None
+	// have threads so the picked group can't fan out.
+	h.threadEnumFn = func([]string) (map[string][]string, error) { return nil, nil }
+
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	gc, _ := gin.CreateTestContext(rec)
+	gc.Request = httptest.NewRequest("POST", "/v1/messages/_search_global_messages",
+		strings.NewReader(`{"keyword":"","filters":{"channel_ids":[{"channel_id":"grpA","channel_type":2}]}}`))
+	gc.Set("uid", loginUID)
+	c := &wkhttp.Context{Context: gc}
+
+	h.searchGlobalMessages(c)
+
+	assertNotEmptySearchGuardRejection(t, rec)
+}
+
+// assertNotEmptySearchGuardRejection fails the test if the response looks
+// like the validateSearchNotEmpty 400 (empty keyword + no filter guard). All
+// other outcomes — 200 browse, upstream/internal after validation — are
+// treated as pass because the load-bearing question is whether the singleFast
+// dispatch reached past the validators.
+func assertNotEmptySearchGuardRejection(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	body := rec.Body.String()
+	// The empty-search guard renders a VALIDATION_ERROR carrying
+	// details.reason="keyword or at least one filter is required" (see
+	// validate.go::validateSearchNotEmpty). Any body containing that reason
+	// means the fast path never got past the strict single-channel gate.
+	if strings.Contains(body, "keyword or at least one filter is required") {
+		t.Fatalf("singleFast branch must accept empty-keyword browse; got the empty-search 400: %s", body)
+	}
+}
+
+// primeESClientForFastPathTests injects a no-ping olivere client into the
+// package singleton so tests that drive the single-channel fast path skip the
+// ~5s startup healthcheck against 127.0.0.1:9200. The client's Search().Do()
+// still fails (no OS behind it) which surfaces as UPSTREAM/INTERNAL — the
+// only guarantee these tests need is that we got past validation.
+func primeESClientForFastPathTests(t *testing.T) {
+	t.Helper()
+	osMu.Lock()
+	defer osMu.Unlock()
+	if osClient != nil {
+		return
+	}
+	c, err := elastic.NewSimpleClient(elastic.SetURL("http://127.0.0.1:9"))
+	if err != nil {
+		t.Fatalf("prime SimpleClient: %v", err)
+	}
+	osClient = c
+}
+
 // newValidatorCtx is a lightweight wkhttp.Context builder for validator
 // tests that only care about the accept/reject bool.
 func newValidatorCtx(t *testing.T) (*wkhttp.Context, *httptest.ResponseRecorder) {

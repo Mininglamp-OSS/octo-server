@@ -102,6 +102,19 @@ type stubGroupSvc struct {
 	// it takes precedence over groupsForMember.
 	groupsByUID    map[string][]*group.InfoResp
 	groupsByUIDErr error
+
+	// groupInfoByNo backs GetGroupWithGroupNo, needed by the checkGroupAccess
+	// gate exercised via the single-channel fast path (dispatchSingleAll).
+	// Unset: returns a synthetic non-nil InfoResp so the "group exists" check
+	// passes without a fixture per groupNo. Set: only listed groups pass.
+	groupInfoByNo    map[string]*group.InfoResp
+	groupInfoByNoErr error
+
+	// existMemberActiveByGroup backs ExistMemberActive (singular). Nil map =
+	// caller is an active member of every group (default). Set to lock a
+	// specific membership shape without touching the batch stub above.
+	existMemberActiveByGroup    map[string]bool
+	existMemberActiveByGroupErr error
 }
 
 func (s *stubGroupSvc) GetMembers(groupNo string) ([]*group.MemberResp, error) {
@@ -149,6 +162,32 @@ func (s *stubGroupSvc) ExistMembersActive(groupNos []string, uid string) ([]stri
 		}
 	}
 	return out, nil
+}
+
+// GetGroupWithGroupNo returns a synthetic non-nil InfoResp so tests that only
+// exercise the "group exists" branch of checkGroupAccess don't have to seed a
+// fixture. Set groupInfoByNo to override (nil entry = "group not found").
+func (s *stubGroupSvc) GetGroupWithGroupNo(groupNo string) (*group.InfoResp, error) {
+	if s.groupInfoByNoErr != nil {
+		return nil, s.groupInfoByNoErr
+	}
+	if s.groupInfoByNo == nil {
+		return &group.InfoResp{GroupNo: groupNo}, nil
+	}
+	return s.groupInfoByNo[groupNo], nil
+}
+
+// ExistMemberActive is the singular variant of ExistMembersActive, needed by
+// checkGroupAccess on the single-channel fast path. Default returns true so
+// tests that don't gate on membership still pass unchanged.
+func (s *stubGroupSvc) ExistMemberActive(groupNo string, uid string) (bool, error) {
+	if s.existMemberActiveByGroupErr != nil {
+		return false, s.existMemberActiveByGroupErr
+	}
+	if s.existMemberActiveByGroup == nil {
+		return true, nil
+	}
+	return s.existMemberActiveByGroup[groupNo], nil
 }
 
 // newTestHandler constructs a Handler suitable for senderJoin testing. Cache
