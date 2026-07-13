@@ -3,12 +3,14 @@ package messages_search
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/gin-gonic/gin"
 	"github.com/olivere/elastic"
@@ -453,26 +455,44 @@ func TestBuildGlobalFileHits_DMChannelReversal(t *testing.T) {
 	}
 }
 
-// validateSearchNotEmptyGlobal accepts every global-only filter dimension as
-// "effective" so a browse-mode caller specifying just channel_ids /
-// channel_types / content_types / member_uid is not falsely rejected.
-func TestValidateSearchNotEmptyGlobal_GlobalOnlyFilters(t *testing.T) {
-	cases := []struct {
-		name    string
-		filters GlobalSearchFilters
-	}{
-		{"channel_ids", GlobalSearchFilters{ChannelIDs: []GlobalChannelRef{{ChannelID: "g", ChannelType: 2}}}},
-		{"channel_types", GlobalSearchFilters{ChannelTypes: []uint8{1}}},
-		{"content_types", GlobalSearchFilters{ContentTypes: []int{payloadTypeText}}},
-		{"member_uid", GlobalSearchFilters{MemberUID: "u"}},
+// bug 3 · empty keyword + no filters is a valid *browse* request on the global
+// messages endpoint. The single-channel-style validateSearchNotEmpty guard was
+// removed (the terms(channelId, allowlist) clause bounds the scan the same way
+// a single channel's channelId does), so such a request must pass validation
+// and reach the browse flow instead of being rejected with a 400.
+//
+// Driving the full handler with an EMPTY allowlist (no joined groups, no
+// friends) lets us assert the accept without touching OpenSearch: the resolved
+// scope collapses to empty and the handler returns the 200 empty-envelope
+// early-return at `len(osChannelIDs) == 0`. A 400 here would mean the guard is
+// still rejecting empty-keyword browse.
+func TestSearchGlobalMessages_EmptyKeywordNoFilter_Browses(t *testing.T) {
+	loginUID := "me"
+	gSvc := &stubGroupSvc{groupsByUID: map[string][]*group.InfoResp{loginUID: nil}}
+	uSvc := &stubUserSvc{}
+	h := newAllowlistHandler(t, gSvc, uSvc)
+
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	gc, _ := gin.CreateTestContext(rec)
+	gc.Request = httptest.NewRequest("POST", "/v1/messages/_search_global_messages",
+		strings.NewReader(`{"keyword":"","filters":{}}`))
+	gc.Set("uid", loginUID)
+	c := &wkhttp.Context{Context: gc}
+
+	h.searchGlobalMessages(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("empty keyword + no filter must be accepted (browse), got HTTP %d: %s",
+			rec.Code, rec.Body.String())
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			c, _ := newValidatorCtx(t)
-			if ok := validateSearchNotEmptyGlobal(c, "", tc.filters); !ok {
-				t.Errorf("%s alone must satisfy the empty-search guard", tc.name)
-			}
-		})
+	var env CursorList
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("response must be a success envelope, got %q (err %v)", rec.Body.String(), err)
+	}
+	data, ok := env.Data.([]any)
+	if !ok || len(data) != 0 {
+		t.Fatalf("empty allowlist must yield an empty data array; got %#v", env.Data)
 	}
 }
 
