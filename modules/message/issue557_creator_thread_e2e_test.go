@@ -95,7 +95,7 @@ func issue557EnsureTables(t *testing.T, ctx *config.Context) {
 	t.Helper()
 	for _, tbl := range []string{
 		"user_conversation_ext", "user_follow_version", "thread_member",
-		"thread", "group_member", "`group`", "user", "space",
+		"thread", "group_member", "`group`", "user", "space", "seq",
 	} {
 		_, err := ctx.DB().Exec("DROP TABLE IF EXISTS " + tbl)
 		require.NoError(t, err, "drop %s", tbl)
@@ -209,6 +209,19 @@ func issue557EnsureTables(t *testing.T, ctx *config.Context) {
 			"  `updated_at` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP," +
 			"  PRIMARY KEY (`uid`, `space_id`)" +
 			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+		// seq：CreateThread 内部 ctx.GenSeq(ThreadSeqKey) 生成 thread 序列号，
+		// GenSeq 读写 seq 表（octo-lib config/seq.go）。列集与 octo-lib GenSeq 期望
+		// 及 modules/common/sql/20211108000001_common_legacy01.sql 的真实迁移逐列对齐
+		// （key 唯一、min_seq/step 数值列），缺此表 GenSeq 报 "Table 'seq' doesn't exist"。
+		"CREATE TABLE `seq` (" +
+			"  `id` INTEGER NOT NULL PRIMARY KEY AUTO_INCREMENT," +
+			"  `key` VARCHAR(100) NOT NULL DEFAULT ''," +
+			"  `min_seq` BIGINT NOT NULL DEFAULT 1000000," +
+			"  `step` INTEGER NOT NULL DEFAULT 1000," +
+			"  `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP," +
+			"  `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP," +
+			"  UNIQUE KEY `seq_uidx` (`key`)" +
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
 	}
 	for _, s := range stmts {
 		_, err := ctx.DB().Exec(s)
