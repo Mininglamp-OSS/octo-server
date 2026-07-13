@@ -21,6 +21,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkevent"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	"github.com/Mininglamp-OSS/octo-server/modules/botidentity"
 	"github.com/Mininglamp-OSS/octo-server/modules/channel"
 	chservice "github.com/Mininglamp-OSS/octo-server/modules/channel/service"
 	commonapi "github.com/Mininglamp-OSS/octo-server/modules/common"
@@ -204,6 +205,10 @@ func truncateRunes(s string, maxRunes int) string {
 	return s
 }
 
+type botIdentityResolver interface {
+	Resolve(uid string) (*botidentity.Identity, error)
+}
+
 // Message 消息相关API
 type Message struct {
 	ctx *config.Context
@@ -221,7 +226,10 @@ type Message struct {
 	pinnedDB            *pinnedDB
 	userService         user.IService
 	groupService        group.IService
-	// robotService 仅用于 GetCreatorUID (YUJ-60 允许 bot 创建者撤回自己 bot 发的消息)。
+	// botIdentity performs live sender authorization for card/action. It has no
+	// cache so App Bot unpublish/revocation takes effect on the next first action.
+	botIdentity botIdentityResolver
+	// robotService retains robot-specific owner, mention, and event-queue operations.
 	robotService   robot.IService
 	commonService  commonapi.IService
 	fileService    file.IService
@@ -272,7 +280,8 @@ func New(ctx *config.Context) *Message {
 		remindersDB:         newRemindersDB(ctx),
 		pinnedDB:            newPinnedDB(ctx),
 		userService:         user.NewService(ctx),
-		// robotService: 只读 robot 服务，用于 hasRevokePermission 判断 bot 所有者。
+		botIdentity:         botidentity.New(ctx),
+		// robotService: robot owner/mention lookups and typed event enqueue.
 		robotService:   robot.NewService(ctx),
 		commonService:  commonapi.NewService(ctx),
 		fileService:    file.NewService(ctx),

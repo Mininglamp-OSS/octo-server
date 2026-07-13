@@ -5,43 +5,53 @@ package botidentity
 import (
 	"testing"
 
-	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/gocraft/dbr/v2"
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestResolverAgainstAuthoritativeBotTables(t *testing.T) {
-	_, ctx := testutil.NewTestServer()
-	require.NoError(t, testutil.CleanAllTables(ctx))
-	defer func() { _ = testutil.CleanAllTables(ctx) }()
+	// Use an isolated real SQL database rather than the process-wide MySQL test
+	// schema: resolver semantics need only the three authoritative columns, and
+	// isolation avoids cross-package migration/cleanup races.
+	conn, err := dbr.Open("sqlite3", ":memory:", nil)
+	require.NoError(t, err)
+	conn.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = conn.Close() })
+	session := conn.NewSession(nil)
+	_, err = session.Exec("CREATE TABLE robot (robot_id TEXT PRIMARY KEY, status INTEGER NOT NULL)")
+	require.NoError(t, err)
+	_, err = session.Exec("CREATE TABLE app_bot (uid TEXT PRIMARY KEY, status INTEGER NOT NULL)")
+	require.NoError(t, err)
+	_, err = session.Exec("CREATE TABLE user (uid TEXT PRIMARY KEY, robot INTEGER NOT NULL, status INTEGER NOT NULL)")
+	require.NoError(t, err)
 
 	insertRobot := func(uid string, status int) {
 		t.Helper()
-		_, err := ctx.DB().InsertBySql("INSERT INTO robot(robot_id,status) VALUES(?,?)", uid, status).Exec()
+		_, err := session.InsertBySql("INSERT INTO robot(robot_id,status) VALUES(?,?)", uid, status).Exec()
 		require.NoError(t, err)
 	}
-	insertAppBot := func(id, uid string, status int) {
+	insertAppBot := func(uid string, status int) {
 		t.Helper()
-		_, err := ctx.DB().InsertBySql(`
-			INSERT INTO app_bot(id,uid,display_name,scope,status,token,created_by)
-			VALUES(?,?,?,'platform',?,?,?)`, id, uid, uid, status, "app_token_"+id, "owner").Exec()
+		_, err := session.InsertBySql("INSERT INTO app_bot(uid,status) VALUES(?,?)", uid, status).Exec()
 		require.NoError(t, err)
 	}
 
-	insertRobot("active_robot", 1)
-	insertRobot("disabled_robot", 0)
-	insertAppBot("published", "published_bot", 1)
-	insertAppBot("draft", "draft_bot", 0)
-	insertAppBot("unpublished", "unpublished_bot", 2)
-	_, err := ctx.DB().InsertBySql(
-		"INSERT INTO user(uid,name,robot,status) VALUES(?,?,1,1)",
-		"presentation_only", "Presentation Only",
+	insertRobot("identity_test_active_robot", 1)
+	insertRobot("identity_test_disabled_robot", 0)
+	insertAppBot("identity_test_published_bot", 1)
+	insertAppBot("identity_test_draft_bot", 0)
+	insertAppBot("identity_test_unpublished_bot", 2)
+	_, err = session.InsertBySql(
+		"INSERT INTO user(uid,robot,status) VALUES(?,1,1)",
+		"identity_test_presentation_only",
 	).Exec()
 	require.NoError(t, err)
-	insertRobot("ambiguous_bot", 1)
-	insertAppBot("ambiguous", "ambiguous_bot", 1)
+	insertRobot("identity_test_ambiguous_bot", 1)
+	insertAppBot("identity_test_ambiguous_bot", 1)
 
-	r := New(ctx)
+	r := &Resolver{store: &dbActiveKindStore{session: session}}
 	tests := []struct {
 		name     string
 		uid      string
@@ -49,14 +59,14 @@ func TestResolverAgainstAuthoritativeBotTables(t *testing.T) {
 		wantNil  bool
 		wantErr  error
 	}{
-		{name: "active robot", uid: "active_robot", wantKind: KindUserBot},
-		{name: "disabled robot", uid: "disabled_robot", wantNil: true},
-		{name: "missing robot", uid: "missing_robot", wantNil: true},
-		{name: "published app bot", uid: "published_bot", wantKind: KindAppBot},
-		{name: "draft app bot", uid: "draft_bot", wantNil: true},
-		{name: "unpublished app bot", uid: "unpublished_bot", wantNil: true},
-		{name: "presentation metadata only", uid: "presentation_only", wantNil: true},
-		{name: "ambiguous identity", uid: "ambiguous_bot", wantErr: ErrAmbiguousIdentity},
+		{name: "active robot", uid: "identity_test_active_robot", wantKind: KindUserBot},
+		{name: "disabled robot", uid: "identity_test_disabled_robot", wantNil: true},
+		{name: "missing robot", uid: "identity_test_missing_robot", wantNil: true},
+		{name: "published app bot", uid: "identity_test_published_bot", wantKind: KindAppBot},
+		{name: "draft app bot", uid: "identity_test_draft_bot", wantNil: true},
+		{name: "unpublished app bot", uid: "identity_test_unpublished_bot", wantNil: true},
+		{name: "presentation metadata only", uid: "identity_test_presentation_only", wantNil: true},
+		{name: "ambiguous identity", uid: "identity_test_ambiguous_bot", wantErr: ErrAmbiguousIdentity},
 	}
 
 	for _, tt := range tests {

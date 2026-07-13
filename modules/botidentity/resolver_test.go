@@ -4,6 +4,9 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/gocraft/dbr/v2"
+	"github.com/gocraft/dbr/v2/dialect"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -67,4 +70,53 @@ func TestResolverActivePreservesErrors(t *testing.T) {
 	active, err := r.Active("both")
 	assert.False(t, active)
 	assert.ErrorIs(t, err, ErrAmbiguousIdentity)
+}
+
+func TestResolverActive(t *testing.T) {
+	r := &Resolver{store: &fakeActiveKindStore{appBot: true}}
+	active, err := r.Active("app")
+	require.NoError(t, err)
+	assert.True(t, active)
+}
+
+func TestResolverUnavailable(t *testing.T) {
+	r := New(nil)
+	identity, err := r.Resolve("bot")
+	assert.Nil(t, identity)
+	assert.ErrorIs(t, err, ErrResolverUnavailable)
+}
+
+func TestDBActiveKindStore(t *testing.T) {
+	newStore := func(t *testing.T) (*dbActiveKindStore, sqlmock.Sqlmock) {
+		t.Helper()
+		rawDB, mock, err := sqlmock.New()
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = rawDB.Close() })
+		conn := &dbr.Connection{DB: rawDB, EventReceiver: &dbr.NullEventReceiver{}, Dialect: dialect.MySQL}
+		return &dbActiveKindStore{session: conn.NewSession(nil)}, mock
+	}
+
+	t.Run("returns both predicates", func(t *testing.T) {
+		store, mock := newStore(t)
+		mock.ExpectQuery(`(?s)SELECT.*EXISTS.*robot.*EXISTS.*app_bot`).
+			WillReturnRows(sqlmock.NewRows([]string{"user_bot", "app_bot"}).AddRow(1, 0))
+
+		userBot, appBot, err := store.activeKinds("bot")
+		require.NoError(t, err)
+		assert.True(t, userBot)
+		assert.False(t, appBot)
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("preserves query error", func(t *testing.T) {
+		store, mock := newStore(t)
+		dbErr := errors.New("query failed")
+		mock.ExpectQuery(`(?s)SELECT.*EXISTS.*robot.*EXISTS.*app_bot`).WillReturnError(dbErr)
+
+		userBot, appBot, err := store.activeKinds("bot")
+		assert.False(t, userBot)
+		assert.False(t, appBot)
+		assert.ErrorIs(t, err, dbErr)
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
 }

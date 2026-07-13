@@ -37,6 +37,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	_ "github.com/Mininglamp-OSS/octo-server/modules/app_bot"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/robot"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
@@ -105,8 +106,8 @@ func seedCardBot(t *testing.T, ctx *config.Context, robotID string) {
 func seedCardAppBot(t *testing.T, ctx *config.Context, id, uid, token string, status int) {
 	t.Helper()
 	_, err := ctx.DB().InsertBySql(`
-		INSERT INTO app_bot(id,uid,display_name,scope,status,token,created_by)
-		VALUES(?,?,?,'platform',?,?,?)`, id, uid, uid, status, token, "owner").Exec()
+		INSERT INTO app_bot(id,uid,display_name,scope,space_id,status,token,created_by)
+		VALUES(?,?,?,'platform','',?,?,?)`, id, uid, uid, status, token, "owner").Exec()
 	require.NoError(t, err)
 }
 
@@ -223,6 +224,7 @@ func TestCardActionEndToEndAndIdempotency(t *testing.T) {
 
 func TestCardActionAppBotEventPollAndAckLifecycle(t *testing.T) {
 	t.Setenv(cardmsg.EnvEnabled, "true")
+	t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
 	s, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	defer func() { _ = testutil.CleanAllTables(ctx) }()

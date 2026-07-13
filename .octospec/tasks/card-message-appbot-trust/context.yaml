@@ -12,6 +12,7 @@ touched_paths:
   - modules/cardtrust/cardtrust.go
   - modules/cardtrust/cardtrust_test.go
   - modules/webhook/common_card_test.go
+  - modules/messages_search/card_appbot_integration_test.go
   - modules/message/api.go
   - modules/message/api_card_action.go
   - modules/message/api_card_action_test.go
@@ -82,7 +83,8 @@ injected_rules:
     why: >
       TDD covers resolver classification and failure modes, cardtrust cache
       behavior, live App Bot action authorization, and the event poll/ACK
-      lifecycle. DB-backed tests use testutil cleanup and clear Redis state.
+      lifecycle. The resolver uses an isolated SQL integration database; HTTP
+      tests use testutil cleanup and explicitly clear shared Redis state.
   - id: commit-style
     priority: 60
     load_bearing: false

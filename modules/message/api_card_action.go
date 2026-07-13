@@ -87,16 +87,22 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 		return
 	}
 
-	// D3 ③sender 必须是 bot 身份（layer (c)）。iwh_ webhook 合成发送者不是 robot
-	// （D7：webhook 卡片无事件消费端）、被绕过渲染门禁的人类发送者卡片，都在此
-	// fail-closed —— 伪造卡片点了也没有任何效果。
-	senderIsBot, err := m.robotService.ExistRobot(msgM.FromUID)
+	// D3 ③sender 必须是当前有效 bot 身份（layer (c)）：robot.status=1 或
+	// app_bot.status=1。这里每次首击都实时解析，不使用展示缓存，确保 App Bot
+	// unpublish/revoke 立即阻止副作用。iwh_ webhook 没有事件消费端、人类发送者也
+	// 没有权威 bot 行，均 fail-closed。
+	if m.botIdentity == nil {
+		m.Error("bot identity resolver 未初始化", zap.String("fromUID", msgM.FromUID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+		return
+	}
+	senderIdentity, err := m.botIdentity.Resolve(msgM.FromUID)
 	if err != nil {
 		m.Error("查询发送者 bot 身份失败", zap.Error(err), zap.String("fromUID", msgM.FromUID))
 		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 		return
 	}
-	if !senderIsBot {
+	if senderIdentity == nil {
 		m.Warn("卡片动作目标消息 sender 非 bot,拒绝", zap.String("fromUID", msgM.FromUID), zap.String("messageID", req.MessageID))
 		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
 		return
