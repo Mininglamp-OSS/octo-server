@@ -148,7 +148,7 @@ func TestIntegration_Sidebar_FollowTab_BasicSmoke(t *testing.T) {
 	// 5. Run the same pure-function pipeline as Sidebar.Sync follow branch.
 	items := buildFollowItems(stubConvs, categorySetting, unfollowedGroups, followedDMs, threadExtMap, nil, nil, nil, nil, "")
 	// mergeThreadEntries: thread is already in IM result, so no new item added.
-	items = mergeThreadEntries(items, threadExtRows, map[string]*time.Time{}, categorySetting, unfollowedGroups, nil, nil, "")
+	items = mergeThreadEntries(items, threadExtRows, map[string]*time.Time{}, categorySetting, unfollowedGroups, nil, nil, "", nil)
 	sortFollowItems(items)
 
 	// 6. Assert exactly 3 items with correct target_type.
@@ -319,7 +319,7 @@ func TestIntegration_Sidebar_MergeThreadEntries_AddsDBOnlyThreads(t *testing.T) 
 		threadInIM:   &alive,
 		threadDBOnly: &alive,
 	}
-	items = mergeThreadEntries(items, threadExtRows, lastMsgAtMap, categorySetting, map[string]struct{}{}, nil, nil, "")
+	items = mergeThreadEntries(items, threadExtRows, lastMsgAtMap, categorySetting, map[string]struct{}{}, nil, nil, "", nil)
 	require.Len(t, items, 2, "mergeThreadEntries must add the DB-only thread")
 
 	// Both thread IDs must be present.

@@ -444,7 +444,7 @@ func TestMergeThreadEntries_AddsNewEntry(t *testing.T) {
 	}
 
 	cat, unfollowed := followedG1()
-	result := mergeThreadEntries(existing, threadExtRows, lastMsgAtMap, cat, unfollowed, nil, nil, "")
+	result := mergeThreadEntries(existing, threadExtRows, lastMsgAtMap, cat, unfollowed, nil, nil, "", nil)
 	require.Len(t, result, 2)
 	ids := []string{result[0].TargetID, result[1].TargetID}
 	assert.Contains(t, ids, th2ChannelID)
@@ -459,14 +459,14 @@ func TestMergeThreadEntries_NoDuplicateIfAlreadyPresent(t *testing.T) {
 	}
 	cat, unfollowed := followedG1()
 	// nil map is fine here: presentIDs short-circuits before the alive check.
-	result := mergeThreadEntries(existing, threadExtRows, nil, cat, unfollowed, nil, nil, "")
+	result := mergeThreadEntries(existing, threadExtRows, nil, cat, unfollowed, nil, nil, "", nil)
 	assert.Len(t, result, 1) // no duplicate
 }
 
 func TestMergeThreadEntries_EmptyExt(t *testing.T) {
 	existing := []*SidebarItem{}
 	cat, unfollowed := followedG1()
-	result := mergeThreadEntries(existing, nil, nil, cat, unfollowed, nil, nil, "")
+	result := mergeThreadEntries(existing, nil, nil, cat, unfollowed, nil, nil, "", nil)
 	assert.Len(t, result, 0)
 }
 
@@ -479,7 +479,7 @@ func TestMergeThreadEntries_SkipWhenThreadDeleted(t *testing.T) {
 	}
 	cat, unfollowed := followedG1()
 	// lastMsgAtMap 为空（thread 已被删除，cleanup 还没清理 ext 行）
-	result := mergeThreadEntries(existing, threadExtRows, map[string]*time.Time{}, cat, unfollowed, nil, nil, "")
+	result := mergeThreadEntries(existing, threadExtRows, map[string]*time.Time{}, cat, unfollowed, nil, nil, "", nil)
 	assert.Len(t, result, 0,
 		"thread 已删除时 ext 行必须被 skip，避免 ghost 条目出现在 follow tab")
 }
@@ -493,7 +493,7 @@ func TestMergeThreadEntries_AliveThreadEmitsTimestamp(t *testing.T) {
 		{TargetID: "g1____alive", FollowSort: 3},
 	}
 	cat, unfollowed := followedG1()
-	result := mergeThreadEntries(existing, threadExtRows, aliveThread("g1____alive", &now), cat, unfollowed, nil, nil, "")
+	result := mergeThreadEntries(existing, threadExtRows, aliveThread("g1____alive", &now), cat, unfollowed, nil, nil, "", nil)
 	require.Len(t, result, 1)
 	assert.Equal(t, now.Unix(), result[0].Timestamp,
 		"alive thread 的 timestamp 必须从 lastMsgAtMap 正确读取")
@@ -509,7 +509,7 @@ func TestMergeThreadEntries_AliveThreadNilLastMsgAt(t *testing.T) {
 	}
 	cat, unfollowed := followedG1()
 	// 键存在但值为 nil = thread 活跃但还没消息
-	result := mergeThreadEntries(existing, threadExtRows, aliveThread("g1____fresh", nil), cat, unfollowed, nil, nil, "")
+	result := mergeThreadEntries(existing, threadExtRows, aliveThread("g1____fresh", nil), cat, unfollowed, nil, nil, "", nil)
 	require.Len(t, result, 1, "活跃 thread 即便 last_message_at=NULL 也必须 emit")
 	assert.Equal(t, int64(0), result[0].Timestamp)
 }
@@ -525,7 +525,7 @@ func TestMergeThreadEntries_SkipWhenParentUnfollowed(t *testing.T) {
 	cat, _ := followedG1()
 	unfollowed := map[string]struct{}{"g1": {}}
 
-	result := mergeThreadEntries(existing, threadExtRows, aliveThread("g1____th-orphan", nil), cat, unfollowed, nil, nil, "")
+	result := mergeThreadEntries(existing, threadExtRows, aliveThread("g1____th-orphan", nil), cat, unfollowed, nil, nil, "", nil)
 	assert.Len(t, result, 0,
 		"thread whose parent group is unfollowed must NOT be merged into follow tab")
 }
@@ -539,9 +539,78 @@ func TestMergeThreadEntries_SkipWhenParentHasNoCategory(t *testing.T) {
 	}
 	cat, unfollowed := followedG1() // only g1 is in the follow set, g-noCat is not
 
-	result := mergeThreadEntries(existing, threadExtRows, aliveThread("g-noCat____th-orphan", nil), cat, unfollowed, nil, nil, "")
+	result := mergeThreadEntries(existing, threadExtRows, aliveThread("g-noCat____th-orphan", nil), cat, unfollowed, nil, nil, "", nil)
 	assert.Len(t, result, 0,
 		"thread whose parent group lacks a category (not in follow set) must NOT be merged")
+}
+
+// issue #557 — 创建者自建子区豁免（读侧修复的纯函数守卫，无 WuKongIM/DB 依赖，
+// 在任何 lane 都跑，与 issue557_creator_thread_e2e_test.go 的端到端覆盖互补）。
+
+// 父群从未关注/未分类，但子区由本人创建（selfCreatedThreads 命中）→ 必须渲染，
+// 落"未分类"桶（CategoryID=nil，CategorySort=0）。
+func TestMergeThreadEntries_SelfCreated_UncategorizedParent_Rendered(t *testing.T) {
+	existing := []*SidebarItem{}
+	cid := "g-noCat____th-self"
+	threadExtRows := []*convext.Model{{TargetID: cid, FollowSort: 7}}
+	cat, unfollowed := followedG1() // g-noCat 不在 follow set
+	selfCreated := map[string]struct{}{cid: {}}
+
+	result := mergeThreadEntries(existing, threadExtRows, aliveThread(cid, nil), cat, unfollowed, nil, nil, "", selfCreated)
+	require.Len(t, result, 1, "创建者自建子区即使父群未分类也必须渲染（issue #557）")
+	assert.Equal(t, cid, result[0].TargetID)
+	assert.True(t, result[0].IsFollowed)
+	assert.Equal(t, "g-noCat", result[0].ParentChannelID)
+	assert.Nil(t, result[0].CategoryID, "父群未分类 → CategoryID=nil（未分类桶）")
+	assert.Equal(t, 0, result[0].CategorySort)
+	assert.Equal(t, 7, result[0].FollowSort)
+}
+
+// 父群被显式取关，但子区由本人创建 → 必须渲染（不因取关父群而隐藏创建者自建子区）。
+func TestMergeThreadEntries_SelfCreated_UnfollowedParent_Rendered(t *testing.T) {
+	existing := []*SidebarItem{}
+	cid := "g1____th-self"
+	threadExtRows := []*convext.Model{{TargetID: cid, FollowSort: 1}}
+	cat, _ := followedG1()
+	unfollowed := map[string]struct{}{"g1": {}} // 父群显式取关
+	selfCreated := map[string]struct{}{cid: {}}
+
+	result := mergeThreadEntries(existing, threadExtRows, aliveThread(cid, nil), cat, unfollowed, nil, nil, "", selfCreated)
+	require.Len(t, result, 1, "父群被取关也不应隐藏创建者自建子区（issue #557）")
+	assert.Equal(t, cid, result[0].TargetID)
+	// 父群 g1 有分类：自建子区仍继承父群分类（豁免只跳过丢弃前置，不改分类归属）。
+	require.NotNil(t, result[0].CategoryID)
+	assert.Equal(t, "cat-1", *result[0].CategoryID)
+	assert.Equal(t, 1, result[0].CategorySort)
+}
+
+// 防误放：豁免严格按 creator_uid==loginUID。非创建者即便有 thread ext 行，
+// 父群未分类时仍必须被丢弃（selfCreatedThreads 不命中）。
+func TestMergeThreadEntries_NonSelfCreated_UncategorizedParent_Dropped(t *testing.T) {
+	existing := []*SidebarItem{}
+	cid := "g-noCat____th-other"
+	threadExtRows := []*convext.Model{{TargetID: cid, FollowSort: 1}}
+	cat, unfollowed := followedG1()
+	// selfCreated 不含 cid（该子区非本人创建）
+	selfCreated := map[string]struct{}{"g-noCat____someone-elses": {}}
+
+	result := mergeThreadEntries(existing, threadExtRows, aliveThread(cid, nil), cat, unfollowed, nil, nil, "", selfCreated)
+	assert.Len(t, result, 0,
+		"非创建者子区不被豁免：父群未分类必须丢弃（防误放）")
+}
+
+// 自建豁免不改活跃性判定：thread 已删除（不在 lastMsgAtMap）时仍必须丢弃。
+func TestMergeThreadEntries_SelfCreated_DeletedThread_StillDropped(t *testing.T) {
+	existing := []*SidebarItem{}
+	cid := "g-noCat____th-self-deleted"
+	threadExtRows := []*convext.Model{{TargetID: cid, FollowSort: 1}}
+	cat, unfollowed := followedG1()
+	selfCreated := map[string]struct{}{cid: {}}
+
+	// lastMsgAtMap 为空 → thread 已删除 / 不存在
+	result := mergeThreadEntries(existing, threadExtRows, map[string]*time.Time{}, cat, unfollowed, nil, nil, "", selfCreated)
+	assert.Len(t, result, 0,
+		"创建者豁免不改活跃性判定：已删除子区仍必须丢弃")
 }
 
 // PR review (Round 3) Blocking #4 — malformed thread channel ID (no separator)
@@ -553,7 +622,7 @@ func TestMergeThreadEntries_SkipMalformedChannelID(t *testing.T) {
 	}
 	cat, unfollowed := followedG1()
 
-	result := mergeThreadEntries(existing, threadExtRows, nil, cat, unfollowed, nil, nil, "")
+	result := mergeThreadEntries(existing, threadExtRows, nil, cat, unfollowed, nil, nil, "", nil)
 	assert.Len(t, result, 0,
 		"malformed thread channel id (no separator) must be skipped")
 }

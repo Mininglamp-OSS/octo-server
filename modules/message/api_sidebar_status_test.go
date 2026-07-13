@@ -72,7 +72,7 @@ func TestLoadThreadLastMsgAt_SurfacesStatus(t *testing.T) {
 		{TargetID: threadChannelID(g, "arc")},
 		{TargetID: threadChannelID(g, "del")},
 	}
-	lastMsgAt, statusMap, err := sb.loadThreadLastMsgAt(extRows)
+	lastMsgAt, statusMap, _, err := sb.loadThreadLastMsgAt(extRows)
 	require.NoError(t, err)
 
 	assert.Equal(t, thread.ThreadStatusActive, statusMap[threadChannelID(g, "act")])
@@ -181,9 +181,9 @@ func TestSidebar_FollowTab_BackfillsStatus(t *testing.T) {
 	sb := NewSidebar(ctx)
 	items := buildFollowItems(stubConvs, categorySetting, nil, nil, threadExtMap, nil, nil, nil, nil, "")
 
-	lastMsgAt, statusMap, err := sb.loadThreadLastMsgAt(threadExtRows)
+	lastMsgAt, statusMap, _, err := sb.loadThreadLastMsgAt(threadExtRows)
 	require.NoError(t, err)
-	items = mergeThreadEntries(items, threadExtRows, lastMsgAt, categorySetting, nil, nil, nil, "")
+	items = mergeThreadEntries(items, threadExtRows, lastMsgAt, categorySetting, nil, nil, nil, "", nil)
 	backfillThreadStatus(items, statusMap)
 
 	byID := map[string]*SidebarItem{}

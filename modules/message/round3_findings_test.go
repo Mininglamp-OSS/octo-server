@@ -211,7 +211,7 @@ func TestSpaceID_Round3_Finding2_Sidebar_EmptySourceFallback(t *testing.T) {
 		}
 		result := mergeThreadEntries(nil, extRows,
 			aliveThread("g_legacy_ext____alive", nil),
-			categorySetting, nil, groupSpaceMap, externalGroupMap, defaultSpaceID)
+			categorySetting, nil, groupSpaceMap, externalGroupMap, defaultSpaceID, nil)
 		require.Len(t, result, 1)
 		assert.Equal(t, "spaceDefault", result[0].MySourceSpaceID,
 			"DB-only thread: 父群 source='' 兜底到 defaultSpaceID")

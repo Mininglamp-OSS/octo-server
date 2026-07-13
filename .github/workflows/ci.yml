@@ -233,6 +233,26 @@ jobs:
           exit 1
 
       - name: Run tests
+        # NOTE (issue #557 / integration build tag): this lane runs the DEFAULT
+        # build (NO `-tags integration`). It intentionally does NOT enable the
+        # `//go:build integration` suite, and here is the load-bearing reason —
+        # do not "just add -tags integration" without addressing it first:
+        #   The integration-tagged tests (modules/conversation_ext/*, and the
+        #   modules/message/*_integration/e2e files that call newSidebarIntegCtx)
+        #   connect to a SEPARATE database `conv_ext_test` with `Migration=false`
+        #   and assume its schema is pre-baked (they run `DeleteFrom(table)`
+        #   before any CREATE — see conversation_ext/service_test.go). This job
+        #   provisions and (re)creates only the `test` database below; it never
+        #   creates `conv_ext_test`, so `go test -tags integration ./...` would
+        #   fail at connect/DeleteFrom. Enabling the full integration suite
+        #   therefore requires FIRST provisioning `conv_ext_test` with its schema
+        #   loaded (the dmworkim `make env-test` path) — a maintainer decision,
+        #   flagged for human confirmation, NOT a blind flag flip here.
+        #   The #557 read-side regression is instead covered WITHOUT the tag by
+        #   modules/message/issue557_creator_thread_e2e_test.go, which creates
+        #   its own isolated DB from this job's MySQL and thus runs in THIS lane
+        #   (it skips cleanly when WuKongIM is unreachable).
+        #
         # `testutil.NewTestServer` runs sql-migrate against the shared `test`
         # database during module.Setup, registering each migration in
         # gorp_migrations. When `go test ./...` walks packages sequentially,

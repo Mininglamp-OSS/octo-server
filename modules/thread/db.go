@@ -199,6 +199,10 @@ type ThreadLite struct {
 	ShortID       string     `db:"short_id"`
 	Status        int        `db:"status"`
 	LastMessageAt *time.Time `db:"last_message_at"`
+	// CreatorUID 让 sidebar 读侧能精确识别「这是创建者本人的子区」，从而对创建者
+	// 自建子区放宽父群未关注/未分类前置（issue #557）。creator_uid 是 thread 表既有列，
+	// 复用现有 QueryActiveByGroupShortIDs 调用带回，无新增查询。
+	CreatorUID string `db:"creator_uid"`
 }
 
 // QueryActiveByGroupShortIDs 按 (group_no, short_id) 批量查询子区。
@@ -227,7 +231,7 @@ func (d *DB) QueryActiveByGroupShortIDs(refs []ShortRef) (map[string]*ThreadLite
 
 	var rows []*ThreadLite
 	_, err := d.session.SelectBySql(
-		"SELECT group_no, short_id, status, last_message_at FROM thread"+
+		"SELECT group_no, short_id, status, last_message_at, creator_uid FROM thread"+
 			" WHERE (group_no, short_id) IN ("+strings.Join(placeholders, ", ")+")"+
 			" AND status != ?",
 		args...,
