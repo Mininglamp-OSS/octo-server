@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/module"
 	libdb "github.com/Mininglamp-OSS/octo-lib/pkg/db"
@@ -23,10 +24,12 @@ import (
 	commonapi "github.com/Mininglamp-OSS/octo-server/modules/base/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	"github.com/Mininglamp-OSS/octo-server/modules/botidentity"
+	"github.com/Mininglamp-OSS/octo-server/modules/notify"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/accesslog"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/Mininglamp-OSS/octo-server/pkg/avatarrender"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	octodb "github.com/Mininglamp-OSS/octo-server/pkg/db"
 	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
@@ -351,9 +354,34 @@ func installCardDispatch(ctx *config.Context) error {
 		Metrics:          carddispatch.NewMetrics(prometheus.DefaultRegisterer),
 		Logger:           log.NewTLog("CardDispatch"),
 	}
-	registry := carddispatch.NewRegistry(deps, nil)
+	// summary-notify pilot (brief › pilot table, all rows confirmed 2026-07-13):
+	// dedicated `summary` User Bot, DM-only, display-only octo/v1,
+	// system-notification Space policy, in-flight 20/process. modules/notify
+	// obtains this producer's bound Sender via carddispatch.SenderFromContext.
+	//
+	// Registration is inert until modules/notify receives a structured card
+	// request (NotifyReq.Card) AND OCTO_CARD_MESSAGE_ENABLED is on; end-to-end
+	// enablement additionally depends on octo-web shipping the /s/:taskId route
+	// and octo-smart-summary switching its send from text to the card fields.
+	specs := []carddispatch.ProducerSpec{
+		{
+			ID:                  summaryNotifyProducerID,
+			Enabled:             true,
+			SenderUID:           notify.SummaryBotUIDValue,
+			AllowedChannelTypes: []uint8{common.ChannelTypePerson.Uint8()},
+			AllowedProfiles:     []string{cardmsg.ProfileV1},
+			SpacePolicy:         carddispatch.SpacePolicySystemNotification,
+			GroupPolicy:         carddispatch.GroupPolicyMemberRequired, // unused at DM pilot; must be a valid value
+			MaxInFlight:         20,
+		},
+	}
+	registry := carddispatch.NewRegistry(deps, specs)
 	return carddispatch.Install(ctx, registry)
 }
+
+// summaryNotifyProducerID mirrors modules/notify's producer ID. Kept here so the
+// composition root can register the spec without importing an unexported const.
+const summaryNotifyProducerID = carddispatch.ProducerID("summary-notify")
 
 func printServerInfo(ctx *config.Context) {
 	infoStr := `

@@ -361,6 +361,16 @@ change-log convention (§7). Newest first.
   templates, slash commands (PR #418).
 - **Creation** — Dogfood task `member-list-name-fallback` (#344 → PR #420).
 
+## 2026-07-13 (card-message-internal-dispatch P2)
+
+- **Pilot** — Enabled the first `internal/carddispatch` producer
+  (`summary-notify`): dedicated `summary` bot + producer spec + `NotifyReq.Card`
+  structured branch building `octo/v1` DM cards via `cardtmpl` and dispatching
+  through the bound `Sender` (per-recipient fan-out, `NotifyResp` preserved).
+  Stacked on the P1 foundation branch, not main. Cross-repo (octo-web route,
+  octo-smart-summary switch) tracked in the summary-notify contract. See
+  [journal](journal/shared/summary-notify-pilot.md).
+
 ## 2026-06-19 (tooling)
 
 - **Update** — Synced OKF-aware slash commands, workflow skill, and task brief

@@ -42,6 +42,9 @@ other = "服务器内部错误。"
 ["err.server.notify.card_not_allowed"]
 other = "内部通知接口不允许发送卡片消息。"
 
+["err.server.notify.card_invalid"]
+other = "卡片通知请求无效。"
+
 ["err.server.thread.group_no_invalid"]
 other = "群编号无效。"
 

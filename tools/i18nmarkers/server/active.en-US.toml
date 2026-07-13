@@ -588,6 +588,9 @@ other = "Search service is temporarily unavailable."
 ["err.server.messages_search.validation_failed"]
 other = "Invalid search request."
 
+["err.server.notify.card_invalid"]
+other = "The card notification request is invalid."
+
 ["err.server.notify.card_not_allowed"]
 other = "Card payloads are not allowed on the internal notification endpoint."
 

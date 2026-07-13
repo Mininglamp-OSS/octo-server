@@ -15,6 +15,13 @@ const (
 	NotifyBotUIDValue = "notification"
 	// notifyBotName is the display name.
 	notifyBotName = "通知助手"
+	// SummaryBotUIDValue is the static UID for the dedicated summary-notification
+	// bot (the `summary-notify` carddispatch producer's sender). It is a full
+	// User Bot provisioned exactly like the notification bot; keeping it separate
+	// decouples DM-notification duty from future summary-card branding/membership.
+	SummaryBotUIDValue = "summary"
+	// summaryBotName is the summary bot display name.
+	summaryBotName = "总结助手"
 )
 
 // NotifyBotUID returns the static notification bot UID.
@@ -22,11 +29,29 @@ func NotifyBotUID() string {
 	return NotifyBotUIDValue
 }
 
+// SummaryBotUID returns the static summary bot UID.
+func SummaryBotUID() string {
+	return SummaryBotUIDValue
+}
+
 // ensureNotifyBot creates the global notification bot if it doesn't exist (idempotent).
 // Returns true if the bot is ready for use.
 func (n *Notify) ensureNotifyBot() bool {
-	botUID := NotifyBotUIDValue
+	return n.ensureBot(NotifyBotUIDValue, notifyBotName)
+}
 
+// ensureSummaryBot creates the dedicated summary bot if it doesn't exist
+// (idempotent). Returns true if the bot is ready for use. It mirrors the
+// notification-bot provisioning so botidentity resolves it as an active
+// KindUserBot (robot.status=1).
+func (n *Notify) ensureSummaryBot() bool {
+	return n.ensureBot(SummaryBotUIDValue, summaryBotName)
+}
+
+// ensureBot provisions a static full User Bot (user + app + robot.status=1) for
+// botUID if absent (idempotent), repairing an orphan user, and returns true when
+// the bot is ready. It is the shared body for the notification and summary bots.
+func (n *Notify) ensureBot(botUID, botName string) bool {
 	// Check if user already exists
 	userResp, err := n.userService.GetUserWithUsername(botUID)
 	if err != nil {
@@ -35,13 +60,13 @@ func (n *Notify) ensureNotifyBot() bool {
 	}
 	if userResp != nil {
 		// Bot exists — ensure name is correct and repair if needed
-		if userResp.Name != notifyBotName {
-			name := notifyBotName
+		if userResp.Name != botName {
+			name := botName
 			if err = n.userService.UpdateUser(user.UserUpdateReq{UID: botUID, Name: &name}); err != nil {
 				n.Error("更新notify bot名称失败", zap.Error(err), zap.String("botUID", botUID))
 			}
 		}
-		n.syncBotNameToWuKongIM(botUID, notifyBotName)
+		n.syncBotNameToWuKongIM(botUID, botName)
 		n.repairBotIfNeeded(botUID)
 		return true
 	}
@@ -52,7 +77,7 @@ func (n *Notify) ensureNotifyBot() bool {
 	if err = n.userService.AddUser(&user.AddUserReq{
 		UID:      botUID,
 		Username: botUID,
-		Name:     notifyBotName,
+		Name:     botName,
 		Robot:    1,
 	}); err != nil {
 		n.Error("创建notify bot用户失败", zap.Error(err), zap.String("botUID", botUID))
@@ -98,7 +123,7 @@ func (n *Notify) ensureNotifyBot() bool {
 	}
 
 	// Step 5: Sync bot name to WuKongIM
-	n.syncBotNameToWuKongIM(botUID, notifyBotName)
+	n.syncBotNameToWuKongIM(botUID, botName)
 
 	n.Info("Notify bot 创建成功", zap.String("botUID", botUID))
 	return true

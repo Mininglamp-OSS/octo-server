@@ -12,6 +12,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/app"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
@@ -25,7 +26,13 @@ import (
 // InternalTokenHeader is the header key for internal service authentication.
 const InternalTokenHeader = "X-Internal-Token"
 
-var errNotifyCardNotAllowed = errors.New("card payload not allowed on internal notify ingress")
+// summaryNotifyProducerID is the carddispatch producer this module owns.
+const summaryNotifyProducerID = "summary-notify"
+
+var (
+	errNotifyCardNotAllowed = errors.New("card payload not allowed on internal notify ingress")
+	errNotifyCardInvalid    = errors.New("card notification request is invalid")
+)
 
 // Notify 通知模块
 type Notify struct {
@@ -36,6 +43,9 @@ type Notify struct {
 	memberCache   *memberCache
 	botMu         sync.Mutex
 	botOK         bool
+	summaryBotMu  sync.Mutex
+	summaryBotOK  bool
+	cardSender    carddispatch.Sender
 	internalToken string
 	log.Log
 }
@@ -57,6 +67,15 @@ func New(ctx *config.Context) *Notify {
 		Log:           log.NewTLog("Notify"),
 	}
 
+	// Obtain the producer-bound card Sender from the single registry composed at
+	// bootstrap (main.installCardDispatch, before module construction). A missing
+	// registration is non-fatal: card notifications degrade to the text DM path.
+	if sender, senderErr := carddispatch.SenderFromContext(ctx, summaryNotifyProducerID); senderErr != nil {
+		n.Warn("summary-notify card sender unavailable; card notifications will degrade to text", zap.Error(senderErr))
+	} else {
+		n.cardSender = sender
+	}
+
 	// 注册缓存失效回调（通过 event 包避免循环依赖）
 	event.SpaceMemberCacheInvalidator = func(spaceID string) {
 		n.memberCache.invalidate(spaceID)
@@ -70,7 +89,7 @@ func New(ctx *config.Context) *Notify {
 	// 监听成员加入事件
 	ctx.AddEventListener(event.SpaceMemberJoin, n.handleSpaceMemberEvent)
 
-	// 启动时创建全局通知 Bot（单例，带 panic recovery）
+	// 启动时创建全局通知 Bot + 专用 summary Bot（单例，带 panic recovery）
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -85,9 +104,27 @@ func New(ctx *config.Context) *Notify {
 		if n.botOK {
 			n.Info("Notify bot ready")
 		}
+		n.ensureSummaryBotReady()
+		if n.summaryBotOK {
+			n.Info("Summary bot ready")
+		}
 	}()
 
 	return n
+}
+
+// ensureSummaryBotReady provisions the dedicated summary bot on demand
+// (idempotent, retriable). The summary bot is the sender for both the card and
+// the text-fallback path, so both require it to exist.
+func (n *Notify) ensureSummaryBotReady() {
+	if n.summaryBotOK {
+		return
+	}
+	n.summaryBotMu.Lock()
+	if !n.summaryBotOK {
+		n.summaryBotOK = n.ensureSummaryBot()
+	}
+	n.summaryBotMu.Unlock()
 }
 
 // Route 路由配置
@@ -137,11 +174,26 @@ func (n *Notify) sendNotify(c *wkhttp.Context) {
 		c.ResponseErrorWithStatus(errors.New("参数格式错误"), http.StatusBadRequest)
 		return
 	}
+	// Payload dropped its binding:"required" so card requests (Payload absent,
+	// Card present) bind cleanly. payload and card are mutually exclusive
+	// (contract); a text request that carries neither keeps the legacy 400.
+	switch {
+	case req.Card != nil && len(req.Payload) > 0:
+		httperr.ResponseErrorL(c, errcode.ErrNotifyCardInvalid, nil, nil)
+		return
+	case req.Card == nil && len(req.Payload) == 0:
+		c.ResponseErrorWithStatus(errors.New("payload不能为空"), http.StatusBadRequest)
+		return
+	}
 
-	resp, err := n.deliverNotification(&req)
+	resp, err := n.dispatchNotify(&req)
 	if err != nil {
 		if errors.Is(err, errNotifyCardNotAllowed) {
 			httperr.ResponseErrorL(c, errcode.ErrNotifyCardNotAllowed, nil, nil)
+			return
+		}
+		if errors.Is(err, errNotifyCardInvalid) {
+			httperr.ResponseErrorL(c, errcode.ErrNotifyCardInvalid, nil, nil)
 			return
 		}
 		n.Error("投递通知失败", zap.Error(err), zap.String("space_id", req.SpaceID))
@@ -149,6 +201,15 @@ func (n *Notify) sendNotify(c *wkhttp.Context) {
 		return
 	}
 	c.Response(resp)
+}
+
+// dispatchNotify routes a single request to the card producer path (when a
+// structured Card is present) or the legacy text path.
+func (n *Notify) dispatchNotify(req *NotifyReq) (*NotifyResp, error) {
+	if req != nil && req.Card != nil {
+		return n.deliverCardNotification(req)
+	}
+	return n.deliverNotification(req)
 }
 
 // sendNotifyBatch handles POST /v1/internal/notify/batch
@@ -168,7 +229,13 @@ func (n *Notify) sendNotifyBatch(c *wkhttp.Context) {
 	}
 	// Preflight the whole batch before delivering any earlier text item. This
 	// preserves the zero-transport guarantee when a later entry is a card.
+	// Card notifications are single-endpoint only (they fan out through the
+	// carddispatch producer), so a Card in a batch entry is rejected outright.
 	for i := range req.Notifications {
+		if req.Notifications[i].Card != nil {
+			httperr.ResponseErrorL(c, errcode.ErrNotifyCardInvalid, nil, nil)
+			return
+		}
 		if cardmsg.IsCardPayload(req.Notifications[i].Payload) {
 			httperr.ResponseErrorL(c, errcode.ErrNotifyCardNotAllowed, nil, nil)
 			return

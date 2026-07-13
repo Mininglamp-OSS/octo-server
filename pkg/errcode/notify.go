@@ -11,3 +11,9 @@ var ErrNotifyCardNotAllowed = register(codes.Code{
 	HTTPStatus:     http.StatusBadRequest,
 	DefaultMessage: "Card payloads are not allowed on the internal notification endpoint.",
 })
+
+var ErrNotifyCardInvalid = register(codes.Code{
+	ID:             "err.server.notify.card_invalid",
+	HTTPStatus:     http.StatusBadRequest,
+	DefaultMessage: "The card notification request is invalid.",
+})
