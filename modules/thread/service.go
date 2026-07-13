@@ -15,6 +15,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/pushcache"
+	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
 )
 
@@ -597,7 +598,74 @@ func (s *Service) GetThread(groupNo, shortID, loginUID string) (*ThreadResp, err
 			resp.Mute = &mute
 		}
 	}
+
+	// plan T8：flag=on 时对 detail 端 status 跑同一四级仲裁（MUTE>P1>P2>P3），
+	// 与 sidebar list 同源，避免详情/列表矛盾（R5）。flag=off 返全局 status（现状）。
+	// fail-open：仲裁内查询失败保留全局 status，不隐藏。
+	if loginUID != "" && PerUserVisibilityEnabled() {
+		resp.Status = s.effectiveStatusForUser(loginUID, groupNo, shortID, resp.Status)
+	}
 	return resp, nil
+}
+
+// effectiveStatusForUser 对单个 thread 跑「按用户」四级仲裁 MUTE>P1>P2>P3（plan T8，detail 端）。
+// globalStatus 是 P3 兜底（当前全局 thread.status）。与 message.computeEffectiveStatus 同口径：
+//   - MUTE（thread_setting.mute）：压 P1 强制可见，隐藏交 P2/P3；detail 无 Unread 概念，只影响 status。
+//   - P1（未处理 per-uid @）：强制可见 active。
+//   - P2（archive_intent 本人意图）：intent==1 归档，否则 active。
+//   - P3：回落 globalStatus。
+//
+// fail-open：任一 per-uid 查询失败 → 返回 globalStatus（不隐藏），记 warn。
+func (s *Service) effectiveStatusForUser(loginUID, groupNo, shortID string, globalStatus int) int {
+	muted := false
+	// QuerySetting 在无 mute 行时可能返回 dbr.ErrNotFound；那不是查询故障，按「未静音」处理，
+	// 不触发 fail-open 回落。只有真实查询错误才 fail-open 保留全局 status。
+	if setting, err := s.db.QuerySetting(groupNo, shortID, loginUID); err != nil {
+		if !errors.Is(err, dbr.ErrNotFound) {
+			s.Warn("detail 仲裁 mute 查询失败（fail-open）", zap.Error(err), zap.String("loginUID", loginUID))
+			return globalStatus
+		}
+	} else if setting != nil {
+		muted = setting.Mute == 1
+	}
+
+	ref := ShortRef{GroupNo: groupNo, ShortID: shortID}
+	states, err := s.db.QueryUserStates(loginUID, []ShortRef{ref})
+	if err != nil {
+		s.Warn("detail 仲裁 user_state 查询失败（fail-open）", zap.Error(err), zap.String("loginUID", loginUID))
+		return globalStatus
+	}
+	state, hasState := states[groupNo+"____"+shortID]
+
+	hasP1, err := s.db.HasUnhandledMention(loginUID, groupNo, shortID)
+	if err != nil {
+		s.Warn("detail 仲裁 P1 查询失败（fail-open）", zap.Error(err), zap.String("loginUID", loginUID))
+		return globalStatus
+	}
+
+	switch {
+	case muted:
+		// MUTE 只压 P1 强制可见：隐藏交 P2/P3。
+		if hasState {
+			return intentToStatus(state.ArchiveIntent)
+		}
+		return globalStatus
+	case hasP1:
+		return ThreadStatusActive
+	case hasState:
+		return intentToStatus(state.ArchiveIntent)
+	default:
+		return globalStatus
+	}
+}
+
+// intentToStatus 把 thread_user_state.archive_intent 映射到契约 status 线值。
+// intent==1 → 2(archived)；否则 → 1(active)。钉死 1 基线值。
+func intentToStatus(intent int) int {
+	if intent == 1 {
+		return ThreadStatusArchived
+	}
+	return ThreadStatusActive
 }
 
 // ArchiveThread 归档子区
@@ -612,6 +680,20 @@ func (s *Service) ArchiveThread(groupNo, shortID, operatorUID string) error {
 	if thread.Status == ThreadStatusDeleted {
 		return errors.New("thread has been deleted")
 	}
+
+	// plan T7：per-user 可见性 flag=on 时改走 per-uid 归档意图（不再改全局 thread.status）。
+	// 全局 status 的「已归档→直接返回」短路只在 flag=off 生效；flag=on 由 per-uid intent 幂等。
+	if PerUserVisibilityEnabled() {
+		canOperate, err := s.canOperate(groupNo, shortID, operatorUID)
+		if err != nil {
+			return fmt.Errorf("check permission: %w", err)
+		}
+		if !canOperate {
+			return errors.New("no permission to archive")
+		}
+		return s.setArchiveIntentPerUser(groupNo, shortID, operatorUID, 1)
+	}
+
 	if thread.Status == ThreadStatusArchived {
 		return nil // 已归档，无需操作
 	}
@@ -651,6 +733,19 @@ func (s *Service) UnarchiveThread(groupNo, shortID, operatorUID string) error {
 	if thread.Status == ThreadStatusDeleted {
 		return errors.New("thread has been deleted")
 	}
+
+	// plan T7：flag=on 时改走 per-uid 归档意图（intent=0 恢复可见），不改全局 thread.status。
+	if PerUserVisibilityEnabled() {
+		canOperate, err := s.canOperate(groupNo, shortID, operatorUID)
+		if err != nil {
+			return fmt.Errorf("check permission: %w", err)
+		}
+		if !canOperate {
+			return errors.New("no permission to unarchive")
+		}
+		return s.setArchiveIntentPerUser(groupNo, shortID, operatorUID, 0)
+	}
+
 	if thread.Status == ThreadStatusActive {
 		return nil // 已激活，无需操作
 	}
@@ -674,6 +769,41 @@ func (s *Service) UnarchiveThread(groupNo, shortID, operatorUID string) error {
 			return errors.New("thread status changed concurrently")
 		}
 		return fmt.Errorf("update thread status: %w", err)
+	}
+	return nil
+}
+
+// setArchiveIntentPerUser 在一个 tx 内写 operatorUID 对该子区的归档意图并 bump follow_version（plan T7）。
+// intent: 1=归档 0=取消归档。
+//
+// 锁序铁律（plan F3/R3）：必须**先** BumpFollowVersionTx（对 user_follow_version 行加 X 锁）
+// **再** UpsertArchiveIntentTx，避免与 UnfollowChannel/UpdateSort 反向交叉造成 InnoDB 死锁。
+// 事务惯例参照 service.go 的 s.db.session.Begin()（勿另造事务框架，遵 STOP-4）。
+func (s *Service) setArchiveIntentPerUser(groupNo, shortID, operatorUID string, intent int) error {
+	spaceID := ""
+	if groupInfo, gerr := s.groupService.GetGroupWithGroupNo(groupNo); gerr == nil && groupInfo != nil {
+		spaceID = groupInfo.SpaceID
+	}
+	version, err := s.threadVersionGen()()
+	if err != nil {
+		return fmt.Errorf("gen version for archive intent: %w", err)
+	}
+
+	tx, err := s.db.session.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx for archive intent: %w", err)
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	// 先 bump（锁序：user_follow_version 先于 user_conversation_ext / 其它写）。
+	if _, err := conversation_ext.BumpFollowVersionTx(tx, operatorUID, spaceID); err != nil {
+		return fmt.Errorf("bump follow_version for archive intent: %w", err)
+	}
+	if err := s.db.UpsertArchiveIntentTx(tx, operatorUID, groupNo, shortID, intent, version); err != nil {
+		return fmt.Errorf("upsert archive intent: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit archive intent tx: %w", err)
 	}
 	return nil
 }
@@ -719,6 +849,12 @@ func (s *Service) DeleteThread(groupNo, shortID, operatorUID string) error {
 	// 清理所有用户对该子区的置顶
 	user.RemovePinnedForChannel(channelID, common.ChannelTypeCommunityTopic.Uint8())
 	conversation_ext.RemoveConvExtForChannel(channelID, common.ChannelTypeCommunityTopic.Uint8())
+
+	// plan T-GC：清理该子区所有用户的 per-user 归档状态行（走 idx_thread），避免孤儿膨胀。
+	// 非致命：删除失败只记 warn，不回滚已完成的删除（与上面清理块同等 fail-open 语义）。
+	if err := s.db.DeleteUserStatesForThread(groupNo, shortID); err != nil {
+		s.Warn("清理 thread_user_state 失败（非致命）", zap.String("groupNo", groupNo), zap.String("shortID", shortID), zap.Error(err))
+	}
 
 	return nil
 }

@@ -70,6 +70,8 @@ type Sidebar struct {
 	convExtDB       *convext.DB
 	threadDB        *thread.DB
 	followVersionDB *convext.FollowVersionDB
+	// remindersDB 供 per-user 可见性仲裁（plan T3 P1：未处理 per-uid @）批量查询使用。
+	remindersDB *remindersDB
 	// PR #21 review (Jerry-Xin Critical)：Space 过滤需要群表查询。
 	groupService group.IService
 	// groupDB 仅用于 thread ext 行的 Space 过滤（PR #21 Round-6 P0-2）查
@@ -86,6 +88,7 @@ func NewSidebar(ctx *config.Context) *Sidebar {
 		convExtDB:       convext.NewDB(ctx),
 		threadDB:        thread.NewDB(ctx),
 		followVersionDB: convext.NewFollowVersionDB(ctx),
+		remindersDB:     newRemindersDB(ctx),
 		groupService:    group.NewService(ctx),
 		groupDB:         group.NewDB(ctx),
 		Log:             log.NewTLog("Sidebar"),
@@ -500,7 +503,14 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 		// TargetID 同口径。同时覆盖 buildFollowItems（IM-present）与 mergeThreadEntries
 		// （DB-only）两条路径；mergeThreadEntries 已把不在 statusMap 中的 thread
 		// （deleted/missing）skip，所以幸存的 thread 条目必有 status。
-		backfillThreadStatus(items, threadStatusMap)
+		//
+		// plan T3/T4：flag=on 时改跑 per-user 四级仲裁 + Unread 二次过滤
+		// （computeEffectiveStatus 内含 fail-open 回落全局 status）；flag=off 逐字等于现状。
+		if thread.PerUserVisibilityEnabled() {
+			sb.computeEffectiveStatus(loginUID, items, threadStatusMap)
+		} else {
+			backfillThreadStatus(items, threadStatusMap)
+		}
 
 		// Issue #151 symptom #2 — materialize ext rows for default-followed
 		// groups (categorized but never touched).  Without this, OnThreadCreated
@@ -566,8 +576,12 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 		// 查询所有 thread 条目的 status（无 N+1），再 backfill。
 		// FAIL-OPEN：查询失败只记 warn 并把 Status 留空（omitempty -> 字段缺省），
 		// 与 recent tab 既有的降级行为一致，绝不 fail-closed。
+		//
+		// plan T3/T4：flag=on 时改跑 per-user 四级仲裁 + Unread 二次过滤；flag=off 逐字等于现状。
 		if statusMap, qerr := sb.loadThreadStatuses(items); qerr != nil {
 			sb.Warn("sidebar sync: thread status query failed (recent tab non-fatal, status omitted)", zap.Error(qerr))
+		} else if thread.PerUserVisibilityEnabled() {
+			sb.computeEffectiveStatus(loginUID, items, statusMap)
 		} else {
 			backfillThreadStatus(items, statusMap)
 		}
@@ -730,6 +744,116 @@ func backfillThreadStatus(items []*SidebarItem, statusMap map[string]int) {
 			it.Status = st
 		}
 	}
+}
+
+// computeEffectiveStatus 对 sidebar 里的 thread 条目跑「按用户」四级仲裁
+// MUTE > P1 > P2 > P3，把 SidebarItem.Status 从「全局 thread.status」改写成
+// 「当前 uid 的有效可见性」；并在同一循环里做 T4 的 Unread 二次过滤
+// （对 per-user 归档隐藏的条目置 Unread=0）。仅在 feature flag DM_THREAD_PERUSER_VISIBILITY
+// = on 时由调用方调用；flag=off 时调用方沿用 backfillThreadStatus（全局 status），本函数不被触及。
+//
+// 四级仲裁（plan 决策2 / §3-T3）：
+//   - MUTE（thread_setting.mute，最高）：压制 P1 的强制可见 + 红点鼓包（badge），
+//     但「是否隐藏」仍交由 P2/P3 决定 → 静音条目走 P2/P3 的 status，且 Unread 清零（不鼓红点）。
+//   - P1（未处理 per-uid @）：强制可见（status=1 active）+ 保留红点。@所有人(uid='')不触发。
+//   - P2（thread_user_state.archive_intent 本人手工意图）：intent==1 → status=2 归档；否则 active。
+//   - P3（全局 thread.status / 时间兜底，即现有 backfill 值）：无 P1/P2 时回落。
+//
+// fail-open 铁律（plan §5-R1）：三份 per-uid 数据（mute / archive_intent / P1）任一查询失败，
+// 只记 warn 并让**该批**条目保持既有全局 status 回填（不 fail-closed 隐藏）；绝不因 per-uid
+// 查询失败把用户能看的子区藏掉。statusMap 为调用方已算好的全局 status（P3 兜底）。
+func (sb *Sidebar) computeEffectiveStatus(loginUID string, items []*SidebarItem, statusMap map[string]int) {
+	if loginUID == "" || len(items) == 0 {
+		// 先按 P3 回填全局 status，保持与现状一致（fail-open 兜底）。
+		backfillThreadStatus(items, statusMap)
+		return
+	}
+
+	// 收集 thread 条目 refs + channelIDs（复用现有 parse，与 TargetID 同口径）。
+	refs := make([]thread.ShortRef, 0)
+	channelIDs := make([]string, 0)
+	for _, it := range items {
+		if it.TargetType != int(common.ChannelTypeCommunityTopic) {
+			continue
+		}
+		gno, sid, err := parseThreadChannelIDSidebar(it.TargetID)
+		if err != nil {
+			continue
+		}
+		refs = append(refs, thread.ShortRef{GroupNo: gno, ShortID: sid})
+		channelIDs = append(channelIDs, it.TargetID)
+	}
+
+	// 先按 P3 全局 status 回填（无 P1/P2 时的兜底基线，也是 fail-open 的回落值）。
+	backfillThreadStatus(items, statusMap)
+	if len(refs) == 0 {
+		return
+	}
+
+	// 一次性批量取三份 per-uid 数据（无 N+1）。任一失败 → fail-open：记 warn 并直接返回，
+	// 条目保持已回填的全局 status（客户端按现状可见）。
+	muteMap, err := sb.threadDB.QueryMuteForUID(loginUID, refs)
+	if err != nil {
+		sb.Warn("sidebar per-user visibility: mute batch query failed (fail-open, fall back to global status)",
+			zap.Error(err), zap.String("loginUID", loginUID))
+		return
+	}
+	stateMap, err := sb.threadDB.QueryUserStates(loginUID, refs)
+	if err != nil {
+		sb.Warn("sidebar per-user visibility: user_state batch query failed (fail-open, fall back to global status)",
+			zap.Error(err), zap.String("loginUID", loginUID))
+		return
+	}
+	p1Set, err := sb.remindersDB.queryUnhandledMentionChannels(loginUID, channelIDs)
+	if err != nil {
+		sb.Warn("sidebar per-user visibility: unhandled-mention (P1) query failed (fail-open, fall back to global status)",
+			zap.Error(err), zap.String("loginUID", loginUID))
+		return
+	}
+
+	// 逐条仲裁 + T4 Unread 二次过滤（同一循环，避免二次遍历）。
+	for _, it := range items {
+		if it.TargetType != int(common.ChannelTypeCommunityTopic) {
+			continue
+		}
+		key := it.TargetID
+		muted := muteMap[key] == 1
+		_, hasP1 := p1Set[key]
+		state, hasState := stateMap[key]
+
+		switch {
+		case muted:
+			// MUTE 只压 P1 强制可见 + 红点：走 P2/P3 决定是否隐藏，并清零 Unread（不鼓红点）。
+			if hasState {
+				it.Status = intentToStatus(state.ArchiveIntent)
+			} // else 保持已回填的全局 status（P3）
+			it.Unread = 0
+			// 若静音后 effective 为归档隐藏，Unread 已是 0；若可见也不鼓红点。
+		case hasP1:
+			// P1 强制可见：拉回 active，保留 Unread（红点）。
+			it.Status = thread.ThreadStatusActive
+		case hasState:
+			// P2 本人手工意图。
+			it.Status = intentToStatus(state.ArchiveIntent)
+			if it.Status == thread.ThreadStatusArchived {
+				it.Unread = 0 // T4：归档隐藏条目 Unread 清零
+			}
+		default:
+			// P3：保持已回填的全局 status。若全局归档也清零 Unread，保持列表内一致。
+			if it.Status == thread.ThreadStatusArchived {
+				it.Unread = 0
+			}
+		}
+	}
+}
+
+// intentToStatus 把 thread_user_state.archive_intent 映射到契约 status 线值。
+// intent==1 → 2(archived)；否则 → 1(active)。钉死 1 基线值，不新增线值。
+func intentToStatus(intent int) int {
+	if intent == 1 {
+		return thread.ThreadStatusArchived
+	}
+	return thread.ThreadStatusActive
 }
 
 // ---------------------------------------------------------------------------

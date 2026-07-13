@@ -7,6 +7,19 @@ import (
 	"time"
 )
 
+// envPerUserVisibility 是「按用户子区可见性」总开关（plan feature flag）。
+// 默认 off：off 时读路径走全局 status、写路径不写 thread_user_state、不新增
+// follow_version bump（除既有 category bump），行为逐字等于现状。回退=翻 flag。
+const envPerUserVisibility = "DM_THREAD_PERUSER_VISIBILITY"
+
+// PerUserVisibilityEnabled 报告 per-user 子区可见性 feature flag 是否开启。
+// 读 env DM_THREAD_PERUSER_VISIBILITY（"true"/"1" 为开），默认 off。
+// 读路径（message.computeEffectiveStatus）与写路径（reminder_done / reminder 触发 /
+// Archive/Unarchive / detail）每步入口先判本 flag，off 分支必须等于现状。
+func PerUserVisibilityEnabled() bool {
+	return parseBool(os.Getenv(envPerUserVisibility))
+}
+
 // ArchiveConfig 子区自动归档 worker 的运行参数。
 type ArchiveConfig struct {
 	// Enabled 总开关。disabled 时 worker 不启动 ticker。

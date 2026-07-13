@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/db"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
@@ -67,10 +68,42 @@ func (r *remindersDB) queryWithUIDAndChannel(uid string, channelID string, chann
 	return list, err
 }
 
+// queryUnhandledMentionChannels 批量查询「本人有未处理 per-uid @」的子区 channel_id 集合（plan T3 P1）。
+//
+// P1 定义（四级仲裁的强制可见级）：reminders LEFT JOIN reminder_done，channel_type=5，
+// uid=本人（per-uid @；@所有人 uid='' 不触发），is_deleted=0，且 reminder_done 无对应行（未 done）。
+//
+// SQL uid 打头（WHERE r.uid=?）以命中现有索引 channel_uid_uidx (uid, channel_id, channel_type)
+// 的 (uid, channel_id) 前缀（plan F8/R4），不新增 reminders 索引。
+// channelIDs 形如 "{groupNo}____{shortID}"。空入参返回空 set、不发查询。
+//
+// 返回集合语义：key 存在 = 该子区对本 uid 有未处理 @（强制可见）。
+func (r *remindersDB) queryUnhandledMentionChannels(uid string, channelIDs []string) (map[string]struct{}, error) {
+	result := make(map[string]struct{}, len(channelIDs))
+	if uid == "" || len(channelIDs) == 0 {
+		return result, nil
+	}
+	var hits []string
+	_, err := r.session.
+		Select("r.channel_id").
+		From(dbr.I("reminders").As("r")).
+		LeftJoin(dbr.I("reminder_done").As("d"), dbr.Expr("d.reminder_id = r.id AND d.uid = ?", uid)).
+		Where("r.uid = ?", uid). // uid 打头命中 channel_uid_uidx；per-uid 排除 @所有人(uid='')
+		Where("r.channel_id IN ?", channelIDs).
+		Where("r.channel_type = ?", uint8(common.ChannelTypeCommunityTopic)).
+		Where("r.is_deleted = 0").
+		Where("d.id IS NULL"). // 未 done
+		Load(&hits)
+	if err != nil {
+		return nil, fmt.Errorf("query unhandled mention channels: %w", err)
+	}
+	for _, ch := range hits {
+		result[ch] = struct{}{}
+	}
+	return result, nil
+}
+
 /*
-*
-同步提醒项
-@param uid 当前登录用户的uid
 @param version 以uid为key的增量版本号
 @param limit 数据限制
 @param channelIDs 频道集合 查询以频道为目标的提醒项
@@ -162,6 +195,27 @@ func (r *remindersDB) batchInsertDonesTx(sortedIds []int64, uid string, tx *dbr.
 func (r *remindersDB) updateVersionTx(version int64, id int64, tx *dbr.Tx) error {
 	_, err := tx.Update("reminders").Set("version", version).Where("id=?", id).Exec()
 	return err
+}
+
+// queryThreadChannelsByIDsTx 在 tx 内按 reminder id 列表反查「本人 per-uid 且属于子区
+// (channel_type=5)」的 reminder 行的去重 channel_id 集合（plan T5）。
+// channel_id 形如 "{groupNo}____{shortID}"。用于 reminder_done 后按子区 bump follow_version。
+// 只取 uid=本人（per-uid @）、channel_type=5 的行；@所有人(uid='')与非子区 reminder 天然排除。
+func (r *remindersDB) queryThreadChannelsByIDsTx(tx *dbr.Tx, ids []int64, uid string) ([]string, error) {
+	if len(ids) == 0 || uid == "" {
+		return nil, nil
+	}
+	var channelIDs []string
+	_, err := tx.Select("DISTINCT channel_id").
+		From("reminders").
+		Where("id IN ?", ids).
+		Where("uid = ?", uid).
+		Where("channel_type = ?", uint8(common.ChannelTypeCommunityTopic)).
+		Load(&channelIDs)
+	if err != nil {
+		return nil, fmt.Errorf("query thread channels by reminder ids: %w", err)
+	}
+	return channelIDs, nil
 }
 
 type remindersDetailModel struct {

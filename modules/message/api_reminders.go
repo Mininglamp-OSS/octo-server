@@ -13,6 +13,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"go.uber.org/zap"
@@ -60,6 +61,25 @@ func (m *Message) reminderDone(c *wkhttp.Context) {
 		if err != nil {
 			tx.Rollback()
 			m.Error("更新提醒项版本失败！", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
+			return
+		}
+	}
+	// plan T5：per-user 可见性 flag=on 时，reminder_done 掉的子区 @（P1 消失）在同一 tx 内
+	// bump 本人 follow_version，客户端据此重拉 sidebar 跑仲裁（子区从"P1 强制可见"回落 P2/P3）。
+	// 遵锁序 F3：本 bump 只碰 user_follow_version、不碰 conversation_ext，先 bump 安全。
+	// 解析范围严格限于 id→channel_id→groupNo→space_id（STOP-2 边界内），不改 done 契约。
+	if thread.PerUserVisibilityEnabled() {
+		threadChannels, qerr := m.remindersDB.queryThreadChannelsByIDsTx(tx, ids, loginUID)
+		if qerr != nil {
+			tx.Rollback()
+			m.Error("查询 reminder 子区频道失败（T5 bump）！", zap.Error(qerr))
+			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
+			return
+		}
+		if berr := m.bumpFollowVersionForThreadChannelsTx(tx, loginUID, threadChannels); berr != nil {
+			tx.Rollback()
+			m.Error("bump follow_version 失败（T5 reminder_done）！", zap.Error(berr))
 			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
@@ -385,6 +405,13 @@ func (m *Message) handleReminders(reminders []*remindersModel) {
 		err := m.remindersDB.inserts(reminders)
 		if err != nil {
 			m.Error("插入提醒项失败！", zap.Error(err))
+		} else if thread.PerUserVisibilityEnabled() {
+			// plan T6：per-uid @ 落 reminder 后，fire-and-forget bump 被@uid 的 follow_version，
+			// 客户端据此重拉 sidebar 让子区从归档状态被 P1 拉回可见。
+			// 绝不包进核心写 tx（R2）：各自独立短 tx、失败只 warn，不阻断消息投递 / CMDSyncReminders。
+			// 快照 reminders 切片供 goroutine 独立消费，不与下方 CMD 发送共享可变状态。
+			bumpReminders := reminders
+			go m.bumpFollowVersionForReminders(bumpReminders)
 		}
 		channels := make([]*config.ChannelReq, 0)
 		uids := make([]string, 0)

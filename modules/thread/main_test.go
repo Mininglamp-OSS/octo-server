@@ -31,6 +31,13 @@ func TestMain(m *testing.M) {
 		// 内的 UNIQUE KEY，避免单独跑 CREATE UNIQUE INDEX IF NOT EXISTS（部分 MySQL 版本不支持
 		// 该语法）。
 		_, _ = db.Exec("CREATE TABLE IF NOT EXISTS `robot` (`id` BIGINT AUTO_INCREMENT PRIMARY KEY, `robot_id` VARCHAR(40) NOT NULL DEFAULT '', `token` VARCHAR(100) NOT NULL DEFAULT '', `version` BIGINT NOT NULL DEFAULT 0, `status` SMALLINT NOT NULL DEFAULT 1, `creator_uid` VARCHAR(40) NOT NULL DEFAULT '', `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE KEY `robot_id_robot_index` (`robot_id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci")
+
+		// reminders / reminder_done 属 message 模块（其迁移在 thread-only 测试进程里不会跑），
+		// 但 T8 detail 端 P1 仲裁（HasUnhandledMention）要查它们。手工建表，schema 与
+		// modules/message/sql/20220418000001_message_legacy01.sql 对齐（含 channel_uid_uidx，
+		// P1 SQL uid 打头命中它）。IF NOT EXISTS 幂等，与 robot 表同款处理。
+		_, _ = db.Exec("CREATE TABLE IF NOT EXISTS `reminders` (`id` BIGINT NOT NULL PRIMARY KEY AUTO_INCREMENT, `channel_id` VARCHAR(100) NOT NULL DEFAULT '', `channel_type` SMALLINT NOT NULL DEFAULT 0, `reminder_type` INTEGER NOT NULL DEFAULT 0, `uid` VARCHAR(40) NOT NULL DEFAULT '', `text` VARCHAR(255) NOT NULL DEFAULT '', `data` VARCHAR(1000) NOT NULL DEFAULT '', `is_locate` SMALLINT NOT NULL DEFAULT 0, `message_seq` BIGINT NOT NULL DEFAULT 0, `message_id` VARCHAR(20) NOT NULL DEFAULT '', `version` BIGINT NOT NULL DEFAULT 0, `is_deleted` SMALLINT NOT NULL DEFAULT 0, `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, KEY `channel_uid_uidx` (`uid`, `channel_id`, `channel_type`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci")
+		_, _ = db.Exec("CREATE TABLE IF NOT EXISTS `reminder_done` (`id` BIGINT NOT NULL PRIMARY KEY AUTO_INCREMENT, `reminder_id` BIGINT NOT NULL DEFAULT 0, `uid` VARCHAR(40) NOT NULL DEFAULT '', `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE KEY `reminder_done_uid_reminder_id_uidx` (`uid`, `reminder_id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci")
 	}
 
 	os.Exit(m.Run())
