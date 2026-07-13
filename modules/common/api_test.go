@@ -807,6 +807,92 @@ func TestGetAppConfig_DocsOn_OnVersionShortCircuit(t *testing.T) {
 	assert.Contains(t, w.Body.String(), `"docs_on":true`)
 }
 
+// setModuleEnabledSetting upserts a `<category>.enabled` bool system_setting and
+// reloads the shared snapshot. Generic sibling of setDocsEnabledSetting for the
+// dmloop / dmpersonal launch flags. Call AFTER cleanAllTablesAndReloadSettings.
+func setModuleEnabledSetting(t *testing.T, ctx *config.Context, category string, enabled bool) {
+	t.Helper()
+	v := "0"
+	if enabled {
+		v = "1"
+	}
+	_, err := ctx.DB().InsertInto("system_setting").
+		Columns("category", "key_name", "value", "value_type").
+		Values(category, "enabled", v, "bool").Exec()
+	require.NoError(t, err)
+	require.NoError(t, EnsureSystemSettings(ctx).Reload())
+}
+
+// appconfig 必须下发 dmloop_on / dmpersonal_on:值来源于 system_setting dmloop.enabled /
+// dmpersonal.enabled。默认 false,客户端据此隐藏「回路」「我的/运行时」入口(后端服务上线前)。
+func TestGetAppConfig_LoopFlags_DefaultFalse(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"dmloop_on":false`)
+	assert.Contains(t, w.Body.String(), `"dmpersonal_on":false`)
+}
+
+// 两个开关独立:dmloop.enabled=true 只放开「回路」,dmpersonal 保持默认关。
+func TestGetAppConfig_DmloopOn_TrueIndependentOfPersonal(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setModuleEnabledSetting(t, ctx, "dmloop", true)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"dmloop_on":true`)
+	assert.Contains(t, w.Body.String(), `"dmpersonal_on":false`)
+}
+
+// dmpersonal.enabled=true 只放开「我的/运行时」,dmloop 保持默认关(证明两开关解耦)。
+func TestGetAppConfig_DmpersonalOn_TrueIndependentOfLoop(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setModuleEnabledSetting(t, ctx, "dmpersonal", true)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"dmpersonal_on":true`)
+	assert.Contains(t, w.Body.String(), `"dmloop_on":false`)
+}
+
+// version 短路分支同样下发两开关:展示开关须与 app_config.version 解耦,避免 admin 切换后
+// 老客户端命中版本短路而继续用旧值(同 docs_on)。
+func TestGetAppConfig_LoopFlags_OnVersionShortCircuit(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setModuleEnabledSetting(t, ctx, "dmloop", true)
+	setModuleEnabledSetting(t, ctx, "dmpersonal", true)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig?version=99999999", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"dmloop_on":true`)
+	assert.Contains(t, w.Body.String(), `"dmpersonal_on":true`)
+}
+
 // setStickerUploadLimitsSettings upserts the three sticker upload knobs
 // (size KB / max dim / allowed formats CSV) and reloads the shared snapshot.
 // Passing "" for any of them skips writing that row so tests can exercise the

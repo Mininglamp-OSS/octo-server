@@ -390,6 +390,8 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 			StickerCustomEnabled:   cn.systemSettings.StickerCustomEnabled(),
 			StickerHandleRequired:  cn.systemSettings.StickerHandleRequired(),
 			DocsOn:                 cn.systemSettings.DocsEnabled(),
+			DmloopOn:               cn.systemSettings.DmloopEnabled(),
+			DmpersonalOn:           cn.systemSettings.DmpersonalEnabled(),
 			// Sticker 上限:短路分支同样下发,让老客户端在管理台放宽/收窄后
 			// 也能立刻拿到最新值。
 			StickerUploadLimits: buildStickerUploadLimitsResp(cn.systemSettings),
@@ -436,6 +438,8 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 		StickerCustomEnabled:   cn.systemSettings.StickerCustomEnabled(),
 		StickerHandleRequired:  cn.systemSettings.StickerHandleRequired(),
 		DocsOn:                 cn.systemSettings.DocsEnabled(),
+		DmloopOn:               cn.systemSettings.DmloopEnabled(),
+		DmpersonalOn:           cn.systemSettings.DmpersonalEnabled(),
 		// Sticker 上限:客户端本地预校验用,兜底仍在服务端 modules/file 侧。
 		StickerUploadLimits: buildStickerUploadLimitsResp(cn.systemSettings),
 	})
@@ -808,6 +812,13 @@ type appConfigResp struct {
 	// 与 app_config.version 解耦的原因同 LocalLoginOff / SearchEnabled：运维切展示
 	// 策略后老客户端命中 version 短路分支也必须拿到最新值，故两个分支都下发。
 	DocsOn bool `json:"docs_on"`
+
+	// dmloop.enabled / dmpersonal.enabled；默认 false —— loop(回路)与「我的/运行时」入口在
+	// 后端服务就绪前先隐藏,上线后由管理台切对应 system_setting 灰度放开。两者分开:
+	// 「我的」将重设计脱离 loop、可独立放量。只表达展示策略,不承担服务端鉴权。与 app_config.version
+	// 解耦(同 DocsOn):运维切策略后老客户端命中 version 短路分支也须拿到最新值,故两分支都下发。
+	DmloopOn     bool `json:"dmloop_on"`
+	DmpersonalOn bool `json:"dmpersonal_on"`
 
 	// StickerUploadLimits 是自定义贴纸上传的操作端可调上限，与 sticker.upload_*
 	// system_setting 同源（SystemSettings.StickerUpload{MaxSizeKB,MaxDimension,
