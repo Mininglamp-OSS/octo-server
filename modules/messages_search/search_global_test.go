@@ -11,6 +11,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/gin-gonic/gin"
 	"github.com/olivere/elastic"
@@ -845,4 +846,220 @@ func TestEnumerateDMPeers_UnionsFriendsAndSpaceMembers(t *testing.T) {
 	if len(peersEmpty) != 1 || peersEmpty[0] != "bob" {
 		t.Fatalf("empty spaceID must yield friends-only; got %v", peersEmpty)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// bug 5 · member_uids multi-select — AND semantics, thread inclusion, DM
+// arity, wire-fallback + self-drop normalisation.
+// ---------------------------------------------------------------------------
+
+// TestResolveGlobalScope_MemberUIDs_ANDSemantics — a request with two named
+// members resolves scope = groups where BOTH members are in (∩), never the
+// union. Any group where only one of the two is a member drops out.
+func TestResolveGlobalScope_MemberUIDs_ANDSemantics(t *testing.T) {
+	loginUID := "me"
+	memberX := "x"
+	memberY := "y"
+	// Caller is in grpAB, grpA, grpB. X is in grpAB + grpA. Y is in grpAB +
+	// grpB. Only grpAB survives the AND.
+	gSvc := &stubGroupSvc{
+		groupsByUID: map[string][]*group.InfoResp{
+			loginUID: {{GroupNo: "grpAB"}, {GroupNo: "grpA"}, {GroupNo: "grpB"}},
+			memberX:  {{GroupNo: "grpAB"}, {GroupNo: "grpA"}},
+			memberY:  {{GroupNo: "grpAB"}, {GroupNo: "grpB"}},
+		},
+	}
+	uSvc := &stubUserSvc{}
+	h := newAllowlistHandler(t, gSvc, uSvc)
+	h.threadEnumFn = func([]string) (map[string][]string, error) { return nil, nil }
+
+	c, _ := newValidatorCtx(t)
+	osIDs, _, _, _, ok := h.resolveGlobalScope(c, loginUID, nil, []string{memberX, memberY})
+	if !ok {
+		t.Fatalf("resolveGlobalScope must succeed")
+	}
+	if len(osIDs) != 1 || osIDs[0] != "grpAB" {
+		t.Fatalf("AND across members must yield only the shared group; got %v", osIDs)
+	}
+}
+
+// TestResolveGlobalScope_MemberUIDs_ThreadsIncluded — bug 5 統一 rule: a group
+// that survives the member filter must also fold in its allowlisted threads.
+// The old "channelsForMember drops threads" behaviour is retired.
+func TestResolveGlobalScope_MemberUIDs_ThreadsIncluded(t *testing.T) {
+	loginUID := "me"
+	memberX := "x"
+	gSvc := &stubGroupSvc{
+		groupsByUID: map[string][]*group.InfoResp{
+			loginUID: {{GroupNo: "grpShared"}},
+			memberX:  {{GroupNo: "grpShared"}},
+		},
+	}
+	uSvc := &stubUserSvc{}
+	h := newAllowlistHandler(t, gSvc, uSvc)
+	h.threadEnumFn = func([]string) (map[string][]string, error) {
+		return map[string][]string{"grpShared": {"t1", "t2"}}, nil
+	}
+
+	c, _ := newValidatorCtx(t)
+	osIDs, _, _, _, ok := h.resolveGlobalScope(c, loginUID, nil, []string{memberX})
+	if !ok {
+		t.Fatalf("resolveGlobalScope must succeed")
+	}
+	want := map[string]bool{
+		"grpShared":                            true,
+		threadIDForTest("grpShared", "t1"):     true,
+		threadIDForTest("grpShared", "t2"):     true,
+	}
+	if len(osIDs) != len(want) {
+		t.Fatalf("member filter must fold in shared group's threads (want %d entries); got %v", len(want), osIDs)
+	}
+	for _, id := range osIDs {
+		if !want[id] {
+			t.Errorf("unexpected channelId %q in member-filtered scope", id)
+		}
+	}
+}
+
+// TestResolveGlobalScope_MemberUIDs_DMSingleMember — exactly one named member
+// who is also a DM peer of the caller: the DM survives, plus any shared
+// groups (none here, so just the DM).
+func TestResolveGlobalScope_MemberUIDs_DMSingleMember(t *testing.T) {
+	loginUID := "me"
+	peer := "colleague"
+	// No shared groups; only a DM edge via friend list. Member is that same
+	// DM peer, so the DM entry alone must survive.
+	gSvc := &stubGroupSvc{
+		groupsByUID: map[string][]*group.InfoResp{
+			loginUID: nil,
+			peer:     nil,
+		},
+	}
+	uSvc := &stubUserSvc{friends: []*user.FriendResp{{UID: peer}}}
+	h := newAllowlistHandler(t, gSvc, uSvc)
+	h.threadEnumFn = func([]string) (map[string][]string, error) { return nil, nil }
+
+	c, _ := newValidatorCtx(t)
+	osIDs, _, singleFast, _, ok := h.resolveGlobalScope(c, loginUID, nil, []string{peer})
+	if !ok {
+		t.Fatalf("resolveGlobalScope must succeed")
+	}
+	fake := fakeChannelIDFor(loginUID, peer)
+	if len(osIDs) != 1 || osIDs[0] != fake {
+		t.Fatalf("single-member DM: scope must be exactly the DM channel; got %v", osIDs)
+	}
+	if singleFast == nil || singleFast.ChannelType != channelTypePerson || singleFast.WireID != peer {
+		t.Errorf("single-member DM should take the single-channel fast path with peer WireID; got %+v", singleFast)
+	}
+}
+
+// TestResolveGlobalScope_MemberUIDs_DMMultiMemberDropped — with more than one
+// named member the DM branch is inapplicable (multi-member DMs do not exist)
+// so any DM entry in allowSet must be dropped even if one of the members is a
+// DM peer.
+func TestResolveGlobalScope_MemberUIDs_DMMultiMemberDropped(t *testing.T) {
+	loginUID := "me"
+	memberX := "x"
+	memberY := "y"
+	// Caller has DMs with both x and y (via friend list). Neither shares a
+	// group with the caller, so the AND across shared groups is empty. The DM
+	// branch must NOT rescue anything for multi-member.
+	gSvc := &stubGroupSvc{
+		groupsByUID: map[string][]*group.InfoResp{
+			loginUID: nil,
+			memberX:  nil,
+			memberY:  nil,
+		},
+	}
+	uSvc := &stubUserSvc{friends: []*user.FriendResp{{UID: memberX}, {UID: memberY}}}
+	h := newAllowlistHandler(t, gSvc, uSvc)
+	h.threadEnumFn = func([]string) (map[string][]string, error) { return nil, nil }
+
+	c, _ := newValidatorCtx(t)
+	osIDs, _, _, _, ok := h.resolveGlobalScope(c, loginUID, nil, []string{memberX, memberY})
+	if !ok {
+		t.Fatalf("resolveGlobalScope must succeed")
+	}
+	if len(osIDs) != 0 {
+		t.Fatalf("multi-member DM is not a thing; scope must be empty; got %v", osIDs)
+	}
+}
+
+// TestSearchGlobalMessagesRequest_MemberUIDSingleFallback — a stale-frontend
+// request carrying only the legacy `member_uid` singular field must still be
+// honoured (backward compat during rolling deploy). normalizeMemberUIDs folds
+// it into the plural path.
+func TestSearchGlobalMessagesRequest_MemberUIDSingleFallback(t *testing.T) {
+	loginUID := "me"
+	member := "colleague"
+	gSvc := &stubGroupSvc{
+		groupsByUID: map[string][]*group.InfoResp{
+			loginUID: {{GroupNo: "grpShared"}},
+			member:   {{GroupNo: "grpShared"}},
+		},
+	}
+	uSvc := &stubUserSvc{}
+	h := newAllowlistHandler(t, gSvc, uSvc)
+	h.threadEnumFn = func([]string) (map[string][]string, error) { return nil, nil }
+
+	c, _ := newValidatorCtx(t)
+	normalized := normalizeMemberUIDs(loginUID, nil, member)
+	if len(normalized) != 1 || normalized[0] != member {
+		t.Fatalf("legacy member_uid must fold into member_uids=[member]; got %v", normalized)
+	}
+	osIDs, _, _, _, ok := h.resolveGlobalScope(c, loginUID, nil, normalized)
+	if !ok {
+		t.Fatalf("resolveGlobalScope must succeed on legacy fallback")
+	}
+	if len(osIDs) != 1 || osIDs[0] != "grpShared" {
+		t.Fatalf("legacy member_uid fallback must still narrow scope; got %v", osIDs)
+	}
+}
+
+// TestSearchGlobalMessagesRequest_MemberUIDsSelfDropped — checkboxing self in
+// the multi-select must be a no-op on that entry (mirrors the frontend
+// `filter(uid !== selfUid)`). Also confirms plural-precedence and dedup on
+// the way through.
+func TestSearchGlobalMessagesRequest_MemberUIDsSelfDropped(t *testing.T) {
+	loginUID := "me"
+	member := "colleague"
+	// Both fields set together (mid-refresh frontend); plural wins, self and
+	// duplicate are stripped. Expected canonical form: [colleague].
+	got := normalizeMemberUIDs(loginUID, []string{loginUID, member, member, "  "}, "ignored")
+	if len(got) != 1 || got[0] != member {
+		t.Fatalf("self/dup/blank stripping failed: got %v", got)
+	}
+	// All-self input collapses to nil so the caller treats "no member
+	// filter", NOT "empty intersection" — checkboxing only yourself must
+	// behave identically to leaving the field blank.
+	if got := normalizeMemberUIDs(loginUID, []string{loginUID}, ""); got != nil {
+		t.Fatalf("all-self input must collapse to nil (no member filter); got %v", got)
+	}
+	// End-to-end: resolveGlobalScope with [self, colleague] behaves the same
+	// as [colleague] alone.
+	gSvc := &stubGroupSvc{
+		groupsByUID: map[string][]*group.InfoResp{
+			loginUID: {{GroupNo: "grpShared"}},
+			member:   {{GroupNo: "grpShared"}},
+		},
+	}
+	uSvc := &stubUserSvc{}
+	h := newAllowlistHandler(t, gSvc, uSvc)
+	h.threadEnumFn = func([]string) (map[string][]string, error) { return nil, nil }
+	c, _ := newValidatorCtx(t)
+	osIDs, _, _, _, ok := h.resolveGlobalScope(c, loginUID, nil,
+		normalizeMemberUIDs(loginUID, []string{loginUID, member}, ""))
+	if !ok {
+		t.Fatalf("resolveGlobalScope must succeed")
+	}
+	if len(osIDs) != 1 || osIDs[0] != "grpShared" {
+		t.Fatalf("self-in-list must be dropped in normalisation; got %v", osIDs)
+	}
+}
+
+// threadIDForTest is a thin wrapper over thread.BuildChannelID so the test
+// file stays self-contained on the composite-id format (matches the same
+// pattern used by search_global_thread_test.go).
+func threadIDForTest(groupNo, shortID string) string {
+	return thread.BuildChannelID(groupNo, shortID)
 }

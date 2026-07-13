@@ -33,8 +33,15 @@ type GlobalChannelRef struct {
 // ignores content_types entirely; file_exts / file_size_min / file_size_max
 // live in SearchGlobalFilesFilters instead.
 type GlobalSearchFilters struct {
-	SenderIDs    []string           `json:"sender_ids,omitempty"`
+	SenderIDs []string `json:"sender_ids,omitempty"`
+	// MemberUID is the legacy single-select "包含成员" field. Superseded by
+	// MemberUIDs (multi-select, bug 5) but kept on the wire for backwards
+	// compatibility with older clients and to survive a rolling deploy window
+	// where a stale frontend can still coexist with a fresh backend. When both
+	// fields arrive, MemberUIDs wins; if only MemberUID is set the handler
+	// folds it into the plural path via normalizeMemberUIDs.
 	MemberUID    string             `json:"member_uid,omitempty"`
+	MemberUIDs   []string           `json:"member_uids,omitempty"`
 	ChannelIDs   []GlobalChannelRef `json:"channel_ids,omitempty"`
 	ChannelTypes []uint8            `json:"channel_types,omitempty"`
 	ContentTypes []int              `json:"content_types,omitempty"`
@@ -45,8 +52,11 @@ type GlobalSearchFilters struct {
 // GlobalFileFilters is the file-endpoint-only filter block: the shared base
 // (via GlobalSearchFilters) plus file_exts / file_size_min / file_size_max.
 type GlobalFileFilters struct {
-	SenderIDs    []string           `json:"sender_ids,omitempty"`
+	SenderIDs []string `json:"sender_ids,omitempty"`
+	// MemberUID / MemberUIDs: see GlobalSearchFilters. Same wire contract on
+	// the file endpoint.
 	MemberUID    string             `json:"member_uid,omitempty"`
+	MemberUIDs   []string           `json:"member_uids,omitempty"`
 	ChannelIDs   []GlobalChannelRef `json:"channel_ids,omitempty"`
 	ChannelTypes []uint8            `json:"channel_types,omitempty"`
 	FileExts     []string           `json:"file_exts,omitempty"`
@@ -150,6 +160,16 @@ func validateGlobalBase(c *wkhttp.Context, cfg SearchConfig, sort, cursor string
 		respondValidation(c, "filters.member_uid", "must be a non-empty uid")
 		return 0, false
 	}
+	for i, uid := range filters.MemberUIDs {
+		if strings.TrimSpace(uid) == "" {
+			respondValidationDetails(c, i18n.Details{
+				"field":  "filters.member_uids",
+				"reason": "empty uid",
+				"index":  i,
+			})
+			return 0, false
+		}
+	}
 	return validateSortCursorPage(c, cfg, sort, cursor, pageSize, allowRelevance)
 }
 
@@ -161,6 +181,7 @@ func validateGlobalFileBase(c *wkhttp.Context, cfg SearchConfig, sort, cursor st
 	shared := GlobalSearchFilters{
 		SenderIDs:    filters.SenderIDs,
 		MemberUID:    filters.MemberUID,
+		MemberUIDs:   filters.MemberUIDs,
 		ChannelIDs:   filters.ChannelIDs,
 		ChannelTypes: filters.ChannelTypes,
 		SentAtFrom:   filters.SentAtFrom,
@@ -168,6 +189,16 @@ func validateGlobalFileBase(c *wkhttp.Context, cfg SearchConfig, sort, cursor st
 	}
 	if _, ok := validateGlobalBaseSharedFields(c, shared); !ok {
 		return 0, false
+	}
+	for i, uid := range filters.MemberUIDs {
+		if strings.TrimSpace(uid) == "" {
+			respondValidationDetails(c, i18n.Details{
+				"field":  "filters.member_uids",
+				"reason": "empty uid",
+				"index":  i,
+			})
+			return 0, false
+		}
 	}
 	for i, ext := range filters.FileExts {
 		norm := strings.ToLower(strings.TrimSpace(ext))
@@ -331,6 +362,50 @@ func applyGlobalDMSpaceScope(b *elastic.BoolQuery, spaceID string) {
 	b.Filter(scope)
 }
 
+// normalizeMemberUIDs collapses the two wire fields (`member_uids` plural,
+// `member_uid` legacy singular) into the canonical dedup + self-exclude form
+// that resolveGlobalScope consumes. Precedence: plural wins whenever it has any
+// entry; otherwise the singular is folded into a single-element slice. Empty
+// strings, whitespace-only entries, and the caller's own uid are dropped
+// (matches the frontend `filter(uid !== selfUid)` convention so a caller that
+// checkboxes themselves gets the same result set as one that did not). A nil
+// return means "no member filter".
+//
+// Both fields are accepted at once (§bug 5): during the rolling deploy an
+// older frontend still ships `member_uid` while a newer one ships
+// `member_uids`; a mixed request from a mid-refresh browser tab is possible
+// and must not double-apply.
+func normalizeMemberUIDs(loginUID string, uids []string, single string) []string {
+	loginUID = strings.TrimSpace(loginUID)
+	raw := uids
+	if len(raw) == 0 && strings.TrimSpace(single) != "" {
+		raw = []string{single}
+	}
+	if len(raw) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(raw))
+	out := make([]string, 0, len(raw))
+	for _, u := range raw {
+		u = strings.TrimSpace(u)
+		if u == "" {
+			continue
+		}
+		if u == loginUID {
+			continue
+		}
+		if _, dup := seen[u]; dup {
+			continue
+		}
+		seen[u] = struct{}{}
+		out = append(out, u)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // resolveGlobalScope resolves the caller's per-request channel scope: the
 // intersection of their allowlist (all rooms they can currently read within
 // the requested Space) with the request's optional channel_ids / member_uid
@@ -347,7 +422,7 @@ func applyGlobalDMSpaceScope(b *elastic.BoolQuery, spaceID string) {
 // Empty channelIDs with ok=true means the caller has no readable rooms in
 // this Space OR the channel_ids/member_uid intersection is empty — the
 // handler should return an empty envelope without touching OS.
-func (h *Handler) resolveGlobalScope(c *wkhttp.Context, loginUID string, channelIDs []GlobalChannelRef, memberUID string) (osChannelIDs []string, spaceID string, singleFast *channelRef, timings allowlistTimings, ok bool) {
+func (h *Handler) resolveGlobalScope(c *wkhttp.Context, loginUID string, channelIDs []GlobalChannelRef, memberUIDs []string) (osChannelIDs []string, spaceID string, singleFast *channelRef, timings allowlistTimings, ok bool) {
 	spaceID = strings.TrimSpace(spacepkg.GetSpaceID(c))
 	if spaceID == "" {
 		// DM double-guard is space-dependent; without a Space the guard cannot
@@ -445,9 +520,9 @@ func (h *Handler) resolveGlobalScope(c *wkhttp.Context, loginUID string, channel
 		scope = intersect
 	}
 
-	memberUID = strings.TrimSpace(memberUID)
-	if memberUID != "" && memberUID != loginUID {
-		memberScope, mErr := h.channelsForMember(loginUID, memberUID, spaceID, allowSet)
+	memberUIDs = normalizeMemberUIDs(loginUID, memberUIDs, "")
+	if len(memberUIDs) > 0 {
+		memberScope, mErr := h.channelsForMembers(loginUID, memberUIDs, spaceID, allowSet)
 		if mErr != nil {
 			h.Error("messages_search: member-scope resolution failed", zap.Error(mErr))
 			respondInternal(c)
@@ -519,16 +594,11 @@ func (h *Handler) resolveGlobalScope(c *wkhttp.Context, loginUID string, channel
 //     surfaced. Aligning global search with the rest of the system was RC
 //     blocker on PR #553.
 //
-// Known v1 gap: channelsForMember (the member_uid "包含成员" filter) still
-// scopes to group + DM only; it explicitly DROPS every thread entry from
-// the allowlist when member_uid is set (see channelsForMember below,
-// `case channelTypeThread:` is a no-op). A caller filtering by member_uid
-// therefore sees zero thread hits, regardless of whether the named member
-// posted in any thread. This is fail-closed (more-restrictive than a
-// hypothetical thread_member intersection), safe on the security axis,
-// but it is a real UX gap the API contract should surface. Tightening
-// this requires a `thread_member` join and is deferred to v1.1; the
-// tradeoff is documented on channelsForMember.
+// Member filter (bug 5, updated): channelsForMembers now folds every thread
+// under a surviving shared group into the returned scope (統一 rule: 群 → 群 +
+// 其子区). The earlier v1 "thread_member unavailable, so drop all threads"
+// behaviour is superseded — threads inherit their parent group's membership
+// gate, so no `thread_member` join is required to be correct.
 func (h *Handler) buildAllowlist(_ *wkhttp.Context, loginUID, spaceID string) ([]channelRef, []channelRef, []channelRef, allowlistTimings, error) {
 	var timings allowlistTimings
 	groups, err := h.groupService.GetGroupsWithMemberUID(loginUID)
@@ -963,59 +1033,91 @@ func (h *Handler) queryDMSpaceMemberUIDs(spaceID, loginUID string) ([]string, er
 	return out, nil
 }
 
-// channelsForMember resolves the "包含成员" (member_uid) filter into the set of
-// OS channelIds where BOTH the caller and the named member are reachable
-// together: the caller's allowlist ∩ (groups memberUID is in ∪ DM with
-// memberUID). Returned map keys are the OS channelId; values mirror the
-// allowSet entry so the caller can preserve wire-id / channelType.
+// channelsForMembers resolves the "包含成员" (member_uids) filter into the set
+// of OS channelIds where the caller AND every named member can co-inhabit:
 //
-// v1 thread scope (YUJ-10): this helper filters ONLY group + DM entries by
-// memberUID's own membership. Thread entries in allowSet are dropped from the
-// returned scope entirely — v1 does NOT resolve `thread_member` for the named
-// member (would require an extra IN join and a schema pass). A caller that
-// sets member_uid therefore sees group + DM hits that co-inhabit memberUID,
-// but NO thread hits at all. This is a deliberate v1 simplification: the
-// primary YUJ-10 requirement is "thread hits appear in the global feed";
-// scoping them by an arbitrary member is a v1.1 follow-up (see the design
-// doc §6.2 known-limitations note).
-func (h *Handler) channelsForMember(loginUID, memberUID, spaceID string, allowSet map[string]channelRef) (map[string]channelRef, error) {
+//   - Groups (channelType=2): intersect across members — a group survives only
+//     when every named member is in it. The統一 rule from the design doc means
+//     each surviving group also folds in its sub-threads from allowSet
+//     (channelType=5, composite `{group_no}____{short_id}`); threads inherit
+//     their parent group's membership, so no per-thread membership query is
+//     needed. This flips the v1 behaviour (which explicitly dropped threads
+//     from the member filter) so a caller filtering by member now sees thread
+//     hits under groups the member is in.
+//   - DM (channelType=1): only meaningful with exactly one named member and
+//     only when the caller has a DM entry for that member. Multi-member DMs
+//     do not exist on this product, so len(memberUIDs) > 1 drops the DM
+//     branch entirely — matching the "AND across members" semantics.
+//
+// self-uid was already stripped by normalizeMemberUIDs so the loop can assume
+// every entry is a real other-party candidate. Returned map is keyed by OS
+// channelId; values mirror the allowSet entry so wire-id / channelType round-
+// trip unchanged.
+func (h *Handler) channelsForMembers(loginUID string, memberUIDs []string, spaceID string, allowSet map[string]channelRef) (map[string]channelRef, error) {
 	out := make(map[string]channelRef)
-	memberGroups, err := h.groupService.GetGroupsWithMemberUID(memberUID)
-	if err != nil {
-		return nil, err
+	if len(memberUIDs) == 0 {
+		return out, nil
 	}
-	memberSet := make(map[string]struct{}, len(memberGroups))
-	for _, g := range memberGroups {
-		if g == nil {
+	// Step 1 — intersect group memberships across every named member.
+	// groupIntersect holds the group_nos where every named member is in.
+	// Seeded from the first member so subsequent members can prune only.
+	var groupIntersect map[string]struct{}
+	for i, member := range memberUIDs {
+		memberGroups, err := h.groupService.GetGroupsWithMemberUID(member)
+		if err != nil {
+			return nil, err
+		}
+		memberSet := make(map[string]struct{}, len(memberGroups))
+		for _, g := range memberGroups {
+			if g == nil {
+				continue
+			}
+			memberSet[g.GroupNo] = struct{}{}
+		}
+		if i == 0 {
+			groupIntersect = memberSet
 			continue
 		}
-		memberSet[g.GroupNo] = struct{}{}
+		for gn := range groupIntersect {
+			if _, ok := memberSet[gn]; !ok {
+				delete(groupIntersect, gn)
+			}
+		}
+		if len(groupIntersect) == 0 {
+			break
+		}
+	}
+	// Step 2 — walk allowSet once, keeping:
+	//   - group entries whose group_no is in groupIntersect;
+	//   - thread entries under those same groups (統一 rule: 群 → 群 + 其子区);
+	//   - the DM entry for the sole named member (single-member case only).
+	singleMember := ""
+	if len(memberUIDs) == 1 {
+		singleMember = memberUIDs[0]
 	}
 	for id, ref := range allowSet {
 		switch ref.ChannelType {
 		case channelTypeGroup:
-			if _, ok := memberSet[ref.OSChannelID]; ok {
-				out[id] = ref
-			}
-		case channelTypePerson:
-			if ref.WireID == memberUID {
-				// The DM with memberUID is trivially the "shared channel"
-				// between caller and member.
+			if _, ok := groupIntersect[ref.OSChannelID]; ok {
 				out[id] = ref
 			}
 		case channelTypeThread:
-			// Intentionally dropped for v1 — see helper doc-comment above.
-			// Explicit case so a future maintainer adding a default: arm
-			// sees the drop is intentional and not a forgotten branch.
+			groupNo, _, err := thread.ParseChannelID(ref.OSChannelID)
+			if err != nil {
+				continue
+			}
+			if _, ok := groupIntersect[groupNo]; ok {
+				out[id] = ref
+			}
+		case channelTypePerson:
+			if singleMember != "" && ref.WireID == singleMember {
+				out[id] = ref
+			}
 		}
 	}
 	// spaceID is unused: the caller has already narrowed allowSet to the
 	// current Space in resolveGlobalScope (via buildAllowlist), so the ∩
-	// against allowSet here inherits the Space filter transitively. The
-	// parameter is kept on the signature both for symmetry with the other
-	// scope helpers and so a future cross-Space feature (e.g. surfacing DMs
-	// from Spaces the member belongs to but the caller does not) has an
-	// obvious pivot without changing the call site.
+	// against allowSet here inherits the Space filter transitively.
 	_ = spaceID
 	return out, nil
 }
