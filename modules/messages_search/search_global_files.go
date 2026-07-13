@@ -55,7 +55,7 @@ func (h *Handler) searchGlobalFiles(c *wkhttp.Context) {
 		return
 	}
 
-	osChannelIDs, spaceID, singleFast, allowTimings, ok := h.resolveGlobalScope(c, loginUID, req.Filters.ChannelIDs, normalizeMemberUIDs(loginUID, req.Filters.MemberUIDs, req.Filters.MemberUID))
+	osChannelIDs, spaceID, singleFast, allowTimings, ok := h.resolveGlobalScope(c, loginUID, req.Filters.ChannelIDs, req.Filters.MemberUIDs, req.Filters.MemberUID)
 	if !ok {
 		return
 	}

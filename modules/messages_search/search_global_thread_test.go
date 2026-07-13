@@ -363,7 +363,7 @@ func TestResolveGlobalScope_ThreadNarrowingHits(t *testing.T) {
 	// Space gate.
 	c, _ := newValidatorCtx(t)
 	osIDs, _, singleFast, _, ok := h.resolveGlobalScope(c, loginUID,
-		[]GlobalChannelRef{{ChannelID: threadID, ChannelType: channelTypeThread}}, nil)
+		[]GlobalChannelRef{{ChannelID: threadID, ChannelType: channelTypeThread}}, nil, "")
 	if !ok {
 		t.Fatalf("resolveGlobalScope must succeed; a response was already written")
 	}
@@ -398,7 +398,7 @@ func TestResolveGlobalScope_ThreadOutsideMembership(t *testing.T) {
 	c, _ := newValidatorCtx(t)
 	foreignThread := thread.BuildChannelID("grpB", "thrX")
 	osIDs, _, singleFast, _, ok := h.resolveGlobalScope(c, loginUID,
-		[]GlobalChannelRef{{ChannelID: foreignThread, ChannelType: channelTypeThread}}, nil)
+		[]GlobalChannelRef{{ChannelID: foreignThread, ChannelType: channelTypeThread}}, nil, "")
 	if !ok {
 		t.Fatalf("resolveGlobalScope must succeed even when scope collapses to empty")
 	}
@@ -667,7 +667,7 @@ func TestResolveGlobalScope_ArchivedThreadNarrowingHits(t *testing.T) {
 
 	c, _ := newValidatorCtx(t)
 	osIDs, _, singleFast, _, ok := h.resolveGlobalScope(c, loginUID,
-		[]GlobalChannelRef{{ChannelID: archivedChan, ChannelType: channelTypeThread}}, nil)
+		[]GlobalChannelRef{{ChannelID: archivedChan, ChannelType: channelTypeThread}}, nil, "")
 	if !ok {
 		t.Fatalf("resolveGlobalScope must succeed; a response was already written")
 	}
@@ -710,7 +710,7 @@ func TestResolveGlobalScope_GroupChannelIncludesThreads(t *testing.T) {
 
 	c, _ := newValidatorCtx(t)
 	osIDs, _, singleFast, _, ok := h.resolveGlobalScope(c, loginUID,
-		[]GlobalChannelRef{{ChannelID: "grpA", ChannelType: channelTypeGroup}}, nil)
+		[]GlobalChannelRef{{ChannelID: "grpA", ChannelType: channelTypeGroup}}, nil, "")
 	if !ok {
 		t.Fatalf("resolveGlobalScope must succeed")
 	}
@@ -752,7 +752,7 @@ func TestResolveGlobalScope_ThreadChannelScopesToThreadOnly(t *testing.T) {
 	target := thread.BuildChannelID("grpA", "t2")
 	c, _ := newValidatorCtx(t)
 	osIDs, _, singleFast, _, ok := h.resolveGlobalScope(c, loginUID,
-		[]GlobalChannelRef{{ChannelID: target, ChannelType: channelTypeThread}}, nil)
+		[]GlobalChannelRef{{ChannelID: target, ChannelType: channelTypeThread}}, nil, "")
 	if !ok {
 		t.Fatalf("resolveGlobalScope must succeed")
 	}
@@ -784,7 +784,7 @@ func TestResolveGlobalScope_GroupExpansionIntersectsAllowlist(t *testing.T) {
 
 	c, _ := newValidatorCtx(t)
 	osIDs, _, singleFast, _, ok := h.resolveGlobalScope(c, loginUID,
-		[]GlobalChannelRef{{ChannelID: "grpZ", ChannelType: channelTypeGroup}}, nil)
+		[]GlobalChannelRef{{ChannelID: "grpZ", ChannelType: channelTypeGroup}}, nil, "")
 	if !ok {
 		t.Fatalf("resolveGlobalScope must succeed even when scope collapses to empty")
 	}

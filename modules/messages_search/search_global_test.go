@@ -874,7 +874,7 @@ func TestResolveGlobalScope_MemberUIDs_ANDSemantics(t *testing.T) {
 	h.threadEnumFn = func([]string) (map[string][]string, error) { return nil, nil }
 
 	c, _ := newValidatorCtx(t)
-	osIDs, _, _, _, ok := h.resolveGlobalScope(c, loginUID, nil, []string{memberX, memberY})
+	osIDs, _, _, _, ok := h.resolveGlobalScope(c, loginUID, nil, []string{memberX, memberY}, "")
 	if !ok {
 		t.Fatalf("resolveGlobalScope must succeed")
 	}
@@ -902,7 +902,7 @@ func TestResolveGlobalScope_MemberUIDs_ThreadsIncluded(t *testing.T) {
 	}
 
 	c, _ := newValidatorCtx(t)
-	osIDs, _, _, _, ok := h.resolveGlobalScope(c, loginUID, nil, []string{memberX})
+	osIDs, _, _, _, ok := h.resolveGlobalScope(c, loginUID, nil, []string{memberX}, "")
 	if !ok {
 		t.Fatalf("resolveGlobalScope must succeed")
 	}
@@ -940,7 +940,7 @@ func TestResolveGlobalScope_MemberUIDs_DMSingleMember(t *testing.T) {
 	h.threadEnumFn = func([]string) (map[string][]string, error) { return nil, nil }
 
 	c, _ := newValidatorCtx(t)
-	osIDs, _, singleFast, _, ok := h.resolveGlobalScope(c, loginUID, nil, []string{peer})
+	osIDs, _, singleFast, _, ok := h.resolveGlobalScope(c, loginUID, nil, []string{peer}, "")
 	if !ok {
 		t.Fatalf("resolveGlobalScope must succeed")
 	}
@@ -976,7 +976,7 @@ func TestResolveGlobalScope_MemberUIDs_DMMultiMemberDropped(t *testing.T) {
 	h.threadEnumFn = func([]string) (map[string][]string, error) { return nil, nil }
 
 	c, _ := newValidatorCtx(t)
-	osIDs, _, _, _, ok := h.resolveGlobalScope(c, loginUID, nil, []string{memberX, memberY})
+	osIDs, _, _, _, ok := h.resolveGlobalScope(c, loginUID, nil, []string{memberX, memberY}, "")
 	if !ok {
 		t.Fatalf("resolveGlobalScope must succeed")
 	}
@@ -1007,7 +1007,9 @@ func TestSearchGlobalMessagesRequest_MemberUIDSingleFallback(t *testing.T) {
 	if len(normalized) != 1 || normalized[0] != member {
 		t.Fatalf("legacy member_uid must fold into member_uids=[member]; got %v", normalized)
 	}
-	osIDs, _, _, _, ok := h.resolveGlobalScope(c, loginUID, nil, normalized)
+	// Pass the legacy wire fields (nil plural, singular set) so the internal
+	// normalize inside resolveGlobalScope exercises the fallback path.
+	osIDs, _, _, _, ok := h.resolveGlobalScope(c, loginUID, nil, nil, member)
 	if !ok {
 		t.Fatalf("resolveGlobalScope must succeed on legacy fallback")
 	}
@@ -1048,7 +1050,7 @@ func TestSearchGlobalMessagesRequest_MemberUIDsSelfDropped(t *testing.T) {
 	h.threadEnumFn = func([]string) (map[string][]string, error) { return nil, nil }
 	c, _ := newValidatorCtx(t)
 	osIDs, _, _, _, ok := h.resolveGlobalScope(c, loginUID, nil,
-		normalizeMemberUIDs(loginUID, []string{loginUID, member}, ""))
+		[]string{loginUID, member}, "")
 	if !ok {
 		t.Fatalf("resolveGlobalScope must succeed")
 	}
@@ -1062,4 +1064,79 @@ func TestSearchGlobalMessagesRequest_MemberUIDsSelfDropped(t *testing.T) {
 // pattern used by search_global_thread_test.go).
 func threadIDForTest(groupNo, shortID string) string {
 	return thread.BuildChannelID(groupNo, shortID)
+}
+
+// bug 5 P1 hardening · member_uids cap. Left uncapped, every uid in
+// filters.member_uids triggered its own GetGroupsWithMemberUID call inside
+// resolveGlobalScope (no batch, serial DB round-trips), so a request with
+// N=1000 uids collapsed into 1000 DB queries before the per-request search
+// Timeout even got a chance to fire. maxMemberUIDs=50 mirrors maxSenderIDs's
+// existing wire-side floor and is enforced in the shared validator path used
+// by both global endpoints.
+
+// TestSearchGlobalMessagesRequest_MemberUIDsAtCapAccepted — exactly 50 uids
+// clears the cap (upper boundary, must NOT reject).
+func TestSearchGlobalMessagesRequest_MemberUIDsAtCapAccepted(t *testing.T) {
+	uids := make([]string, maxMemberUIDs)
+	for i := range uids {
+		uids[i] = "u" + itoa(i)
+	}
+	c, rec := newValidateCtx(t)
+	_, ok := validateGlobalBase(c, SearchConfig{}, "", "",
+		GlobalSearchFilters{MemberUIDs: uids}, 0, false)
+	if !ok {
+		t.Fatalf("member_uids at cap (%d) must be accepted; body=%s", maxMemberUIDs, rec.Body.String())
+	}
+}
+
+// TestSearchGlobalMessagesRequest_MemberUIDsExceedsCap — 51 uids trips the
+// cap and rejects with a VALIDATION_ERROR (400).
+func TestSearchGlobalMessagesRequest_MemberUIDsExceedsCap(t *testing.T) {
+	uids := make([]string, maxMemberUIDs+1)
+	for i := range uids {
+		uids[i] = "u" + itoa(i)
+	}
+	c, rec := newValidateCtx(t)
+	_, ok := validateGlobalBase(c, SearchConfig{}, "", "",
+		GlobalSearchFilters{MemberUIDs: uids}, 0, false)
+	if ok {
+		t.Fatalf("member_uids over cap (%d > %d) must be rejected", len(uids), maxMemberUIDs)
+	}
+	if rec.Body.Len() == 0 {
+		t.Fatalf("rejected member_uids must render a VALIDATION_ERROR envelope")
+	}
+}
+
+// TestSearchGlobalFilesRequest_MemberUIDsAtCapAccepted — same upper-boundary
+// check on the file endpoint validator; both paths go through
+// validateGlobalBaseSharedFields so they must agree on the cap.
+func TestSearchGlobalFilesRequest_MemberUIDsAtCapAccepted(t *testing.T) {
+	uids := make([]string, maxMemberUIDs)
+	for i := range uids {
+		uids[i] = "u" + itoa(i)
+	}
+	c, rec := newValidateCtx(t)
+	_, ok := validateGlobalFileBase(c, SearchConfig{}, "", "",
+		GlobalFileFilters{MemberUIDs: uids}, 0, false)
+	if !ok {
+		t.Fatalf("file endpoint member_uids at cap (%d) must be accepted; body=%s", maxMemberUIDs, rec.Body.String())
+	}
+}
+
+// TestSearchGlobalFilesRequest_MemberUIDsExceedsCap — file endpoint rejects
+// beyond the cap.
+func TestSearchGlobalFilesRequest_MemberUIDsExceedsCap(t *testing.T) {
+	uids := make([]string, maxMemberUIDs+1)
+	for i := range uids {
+		uids[i] = "u" + itoa(i)
+	}
+	c, rec := newValidateCtx(t)
+	_, ok := validateGlobalFileBase(c, SearchConfig{}, "", "",
+		GlobalFileFilters{MemberUIDs: uids}, 0, false)
+	if ok {
+		t.Fatalf("file endpoint member_uids over cap (%d > %d) must be rejected", len(uids), maxMemberUIDs)
+	}
+	if rec.Body.Len() == 0 {
+		t.Fatalf("rejected file endpoint member_uids must render a VALIDATION_ERROR envelope")
+	}
 }

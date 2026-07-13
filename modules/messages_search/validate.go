@@ -11,6 +11,7 @@ import (
 const (
 	maxKeywordLen = 64
 	maxSenderIDs  = 50
+	maxMemberUIDs = 50
 	minPageSize   = 1
 	maxPageSize   = 100
 	defaultPage   = 20

@@ -236,6 +236,19 @@ func validateGlobalBaseSharedFields(c *wkhttp.Context, filters GlobalSearchFilte
 		})
 		return 0, false
 	}
+	// DoS floor: cap wire-side member_uids before resolveGlobalScope fans out
+	// one GetGroupsWithMemberUID per uid. Left uncapped, a caller supplying
+	// N=1000 uids triggered N serial DB queries (and, worse, before the
+	// per-request search Timeout was even wired in). 50 matches maxSenderIDs
+	// as the "obviously reasonable" ceiling for a picker-driven list.
+	if len(filters.MemberUIDs) > maxMemberUIDs {
+		respondValidationDetails(c, i18n.Details{
+			"field":      "filters.member_uids",
+			"reason":     "too many",
+			"max_length": maxMemberUIDs,
+		})
+		return 0, false
+	}
 	if !validateSentAtWindow(c, filters.SentAtFrom, filters.SentAtTo) {
 		return 0, false
 	}
@@ -422,7 +435,7 @@ func normalizeMemberUIDs(loginUID string, uids []string, single string) []string
 // Empty channelIDs with ok=true means the caller has no readable rooms in
 // this Space OR the channel_ids/member_uid intersection is empty — the
 // handler should return an empty envelope without touching OS.
-func (h *Handler) resolveGlobalScope(c *wkhttp.Context, loginUID string, channelIDs []GlobalChannelRef, memberUIDs []string) (osChannelIDs []string, spaceID string, singleFast *channelRef, timings allowlistTimings, ok bool) {
+func (h *Handler) resolveGlobalScope(c *wkhttp.Context, loginUID string, channelIDs []GlobalChannelRef, rawMemberUIDs []string, legacyMemberUID string) (osChannelIDs []string, spaceID string, singleFast *channelRef, timings allowlistTimings, ok bool) {
 	spaceID = strings.TrimSpace(spacepkg.GetSpaceID(c))
 	if spaceID == "" {
 		// DM double-guard is space-dependent; without a Space the guard cannot
@@ -520,7 +533,7 @@ func (h *Handler) resolveGlobalScope(c *wkhttp.Context, loginUID string, channel
 		scope = intersect
 	}
 
-	memberUIDs = normalizeMemberUIDs(loginUID, memberUIDs, "")
+	memberUIDs := normalizeMemberUIDs(loginUID, rawMemberUIDs, legacyMemberUID)
 	if len(memberUIDs) > 0 {
 		memberScope, mErr := h.channelsForMembers(loginUID, memberUIDs, spaceID, allowSet)
 		if mErr != nil {
