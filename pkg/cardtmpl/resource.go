@@ -61,8 +61,13 @@ func BuildSummaryResourceCard(
 	if len(resource.CopyText) > cardmsg.MaxCopyTextBytes {
 		return nil, errors.New("cardtmpl: copy text too large")
 	}
-	if err := requireHTTPS(resource.IconURL); err != nil {
-		return nil, fmt.Errorf("cardtmpl: icon URL: %w", err)
+	// The icon is optional; when present it must be an absolute https URL (the
+	// same positive-allowlist rule cardmsg.Validate re-checks). An empty icon
+	// simply omits the leading image column.
+	if resource.IconURL != "" {
+		if err := requireHTTPS(resource.IconURL); err != nil {
+			return nil, fmt.Errorf("cardtmpl: icon URL: %w", err)
+		}
 	}
 	deepLink, err := summaryDeepLink(webLoginURL, taskID, spaceID)
 	if err != nil {
@@ -88,8 +93,9 @@ func BuildSummaryResourceCard(
 			"wrap":     true,
 		})
 	}
-	body := []interface{}{
-		map[string]interface{}{
+	var header map[string]interface{}
+	if resource.IconURL != "" {
+		header = map[string]interface{}{
 			"type": "ColumnSet",
 			"columns": []interface{}{
 				map[string]interface{}{
@@ -105,8 +111,12 @@ func BuildSummaryResourceCard(
 					"items": titleItems,
 				},
 			},
-		},
+		}
+	} else {
+		// No icon: place the title block(s) directly, without a column wrapper.
+		header = map[string]interface{}{"type": "Container", "items": titleItems}
 	}
+	body := []interface{}{header}
 	if excerpt := truncateRunes(strings.TrimSpace(resource.Excerpt), MaxExcerptRunes); excerpt != "" {
 		body = append(body, map[string]interface{}{
 			"type": "TextBlock",

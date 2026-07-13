@@ -130,6 +130,20 @@ func (a *DBAuthorizer) authorizeGroup(identity *botidentity.Identity, spaceID, g
 		return denyTarget(errors.New("group is not active in target space"))
 	}
 	if policy.GroupPolicy == GroupPolicyMemberExempt {
+		// Member-exempt posting does not require a membership row, but it must
+		// still honor an explicit ban: a bot with a blacklisted membership row
+		// was deliberately removed by a group admin and must not reappear via
+		// this mode. Absence of any row (the pilot bot never joins) still posts.
+		blacklisted, err := a.count(
+			"SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=? AND status=? AND is_deleted=0",
+			groupNo, identity.UID, int(common.GroupMemberStatusBlacklist),
+		)
+		if err != nil {
+			return denyTarget(fmt.Errorf("query bot group blacklist: %w", err))
+		}
+		if blacklisted > 0 {
+			return denyTarget(errors.New("bot is blacklisted from target group"))
+		}
 		return nil
 	}
 	if policy.GroupPolicy != GroupPolicyMemberRequired {

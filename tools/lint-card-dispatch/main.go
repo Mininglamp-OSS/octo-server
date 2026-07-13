@@ -16,18 +16,24 @@ import (
 	"strings"
 )
 
+// AllowlistEntry names one exact reviewed type-17 transport owner. Path is the
+// import-path-style directory suffix (e.g. "modules/bot_api"), NOT a bare
+// package name: matching on the package identifier alone would let any new
+// directory that merely declares the same `package name` + receiver.method
+// inherit the exemption, re-opening the "hidden directory bypass" Decision 12
+// forbids. Anchoring on the path keeps each entry a single reviewed location.
 type AllowlistEntry struct {
-	Package  string
+	Path     string
 	Receiver string
 	Function string
 	Reason   string
 }
 
 var defaultAllowlist = []AllowlistEntry{
-	{Package: "bot_api", Receiver: "BotAPI", Function: "sendMessage", Reason: "reviewed authenticated Bot API card ingress"},
-	{Package: "robot", Receiver: "Robot", Function: "sendMessage", Reason: "reviewed legacy Robot API card ingress"},
-	{Package: "incomingwebhook", Receiver: "IncomingWebhook", Function: "handlePush", Reason: "reviewed Incoming Webhook card ingress"},
-	{Package: "carddispatch", Receiver: "producerSender", Function: "Send", Reason: "sole reviewed server-internal card dispatch boundary"},
+	{Path: "modules/bot_api", Receiver: "BotAPI", Function: "sendMessage", Reason: "reviewed authenticated Bot API card ingress"},
+	{Path: "modules/robot", Receiver: "Robot", Function: "sendMessage", Reason: "reviewed legacy Robot API card ingress"},
+	{Path: "modules/incomingwebhook", Receiver: "IncomingWebhook", Function: "handlePush", Reason: "reviewed Incoming Webhook card ingress"},
+	{Path: "internal/carddispatch", Receiver: "producerSender", Function: "Send", Reason: "sole reviewed server-internal card dispatch boundary"},
 }
 
 type Finding struct {
@@ -59,6 +65,7 @@ type functionAlias struct {
 
 type packageInfo struct {
 	name          string
+	dir           string
 	functions     map[functionKey][]*functionInfo
 	allFunctions  []*functionInfo
 	cardConstants map[string]struct{}
@@ -107,6 +114,7 @@ func Scan(roots []string, allowlist []AllowlistEntry) ([]Finding, error) {
 		if pkg == nil {
 			pkg = &packageInfo{
 				name:          file.Name.Name,
+				dir:           filepath.Dir(path),
 				functions:     make(map[functionKey][]*functionInfo),
 				cardConstants: make(map[string]struct{}),
 			}
@@ -131,9 +139,13 @@ func Scan(roots []string, allowlist []AllowlistEntry) ([]Finding, error) {
 				line:  position.Line,
 				calls: make(map[functionKey]struct{}),
 			}
-			receivers := receiverBindings(fn, key.receiver)
+			// bindings maps in-scope identifiers (the method receiver plus locals
+			// whose type is syntactically knowable) to their struct type name, so
+			// a transport call reached through a method on a package-local value —
+			// not just the enclosing receiver — still records a call-graph edge.
+			bindings := collectLocalBindings(fn.Body, receiverBindings(fn, key.receiver))
 			constants := functionCardConstants(fn.Body, pkg.cardConstants)
-			aliases := functionAliases(fn.Body, receivers)
+			aliases := functionAliases(fn.Body, bindings)
 			ast.Inspect(fn.Body, func(node ast.Node) bool {
 				switch value := node.(type) {
 				case *ast.CompositeLit:
@@ -144,6 +156,14 @@ func Scan(roots []string, allowlist []AllowlistEntry) ([]Finding, error) {
 					if assignmentContainsCardType(value, constants) {
 						info.constructsCard = true
 					}
+				case *ast.SelectorExpr:
+					// Any syntactic reference to the transport selector counts,
+					// whether it is called, stored in a field, or passed as a
+					// higher-order value. A value form still hands transport to
+					// another site, so it cannot be a loophole in the backstop.
+					if isTransportReference(value) {
+						info.directTransport = true
+					}
 				case *ast.CallExpr:
 					if identifier, ok := value.Fun.(*ast.Ident); ok {
 						if alias, exists := aliases[identifier.Name]; exists {
@@ -152,10 +172,10 @@ func Scan(roots []string, allowlist []AllowlistEntry) ([]Finding, error) {
 							} else {
 								info.calls[alias.function] = struct{}{}
 							}
-						} else if called, exists := calledFunctionKey(value.Fun, receivers); exists {
+						} else if called, exists := calledFunctionKey(value.Fun, bindings); exists {
 							info.calls[called] = struct{}{}
 						}
-					} else if called, ok := calledFunctionKey(value.Fun, receivers); ok {
+					} else if called, ok := calledFunctionKey(value.Fun, bindings); ok {
 						info.calls[called] = struct{}{}
 					}
 					name := calledName(value.Fun)
@@ -173,12 +193,12 @@ func Scan(roots []string, allowlist []AllowlistEntry) ([]Finding, error) {
 		}
 	}
 
-	allowed := make(map[string]struct{}, len(allowlist))
+	allowed := make([]AllowlistEntry, 0, len(allowlist))
 	for _, entry := range allowlist {
-		if entry.Package == "" || entry.Function == "" || entry.Reason == "" {
+		if entry.Path == "" || entry.Function == "" || entry.Reason == "" {
 			continue
 		}
-		allowed[allowlistKey(entry.Package, functionKey{receiver: entry.Receiver, name: entry.Function})] = struct{}{}
+		allowed = append(allowed, entry)
 	}
 
 	var findings []Finding
@@ -188,7 +208,7 @@ func Scan(roots []string, allowlist []AllowlistEntry) ([]Finding, error) {
 			if !function.constructsCard || !function.directTransport {
 				continue
 			}
-			if isAllowed(allowed, pkg.name, function.key) {
+			if isAllowed(allowed, pkg.dir, function.key) {
 				continue
 			}
 			findings = append(findings, Finding{
@@ -209,13 +229,13 @@ func Scan(roots []string, allowlist []AllowlistEntry) ([]Finding, error) {
 	return findings, nil
 }
 
-func propagate(pkg *packageInfo, allowed map[string]struct{}) {
+func propagate(pkg *packageInfo, allowed []AllowlistEntry) {
 	changed := true
 	for changed {
 		changed = false
 		for _, function := range pkg.allFunctions {
 			for called := range function.calls {
-				if isAllowed(allowed, pkg.name, called) {
+				if isAllowed(allowed, pkg.dir, called) {
 					continue
 				}
 				for _, callee := range pkg.functions[called] {
@@ -233,13 +253,26 @@ func propagate(pkg *packageInfo, allowed map[string]struct{}) {
 	}
 }
 
-func allowlistKey(packageName string, function functionKey) string {
-	return packageName + "\x00" + function.receiver + "\x00" + function.name
+// isAllowed reports whether a function in package directory pkgDir is a reviewed
+// transport owner. It matches on the directory path (suffix, so the tool works
+// regardless of the root prefix the caller passes) plus the exact receiver and
+// function name — never on the bare package identifier.
+func isAllowed(allowed []AllowlistEntry, pkgDir string, function functionKey) bool {
+	for _, entry := range allowed {
+		if entry.Receiver == function.receiver && entry.Function == function.name && pkgDirMatchesPath(pkgDir, entry.Path) {
+			return true
+		}
+	}
+	return false
 }
 
-func isAllowed(allowed map[string]struct{}, packageName string, function functionKey) bool {
-	_, ok := allowed[allowlistKey(packageName, function)]
-	return ok
+func pkgDirMatchesPath(pkgDir, allowPath string) bool {
+	pkgDir = filepath.ToSlash(pkgDir)
+	allowPath = strings.Trim(filepath.ToSlash(allowPath), "/")
+	if allowPath == "" {
+		return false
+	}
+	return pkgDir == allowPath || strings.HasSuffix(pkgDir, "/"+allowPath)
 }
 
 func declaredFunctionKey(fn *ast.FuncDecl) functionKey {
@@ -259,6 +292,77 @@ func receiverBindings(fn *ast.FuncDecl, receiverType string) map[string]string {
 		bindings[name.Name] = receiverType
 	}
 	return bindings
+}
+
+// collectLocalBindings extends the receiver bindings with local variables whose
+// struct type is syntactically knowable (`var s T`, `s := T{…}`, `s := &T{…}`).
+// This lets calledFunctionKey record `s.method()` edges for a package-local
+// value, closing the extract-method wrapper evasion. Unknowable types (e.g. a
+// constructor return) are simply skipped; the guard stays a best-effort
+// backstop for recognizable shapes.
+func collectLocalBindings(body *ast.BlockStmt, base map[string]string) map[string]string {
+	bindings := make(map[string]string, len(base))
+	for name, typ := range base {
+		bindings[name] = typ
+	}
+	bind := func(name string, expr ast.Expr) {
+		if name == "" || name == "_" {
+			return
+		}
+		if typ := exprTypeName(expr); typ != "" {
+			bindings[name] = typ
+		}
+	}
+	ast.Inspect(body, func(node ast.Node) bool {
+		switch stmt := node.(type) {
+		case *ast.AssignStmt:
+			for index, left := range stmt.Lhs {
+				if index >= len(stmt.Rhs) {
+					continue
+				}
+				if identifier, ok := left.(*ast.Ident); ok {
+					bind(identifier.Name, stmt.Rhs[index])
+				}
+			}
+		case *ast.DeclStmt:
+			generated, ok := stmt.Decl.(*ast.GenDecl)
+			if !ok || generated.Tok != token.VAR {
+				return true
+			}
+			for _, spec := range generated.Specs {
+				values, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				for index, name := range values.Names {
+					if values.Type != nil {
+						if typ := typeName(values.Type); typ != "" && name.Name != "_" {
+							bindings[name.Name] = typ
+						}
+					}
+					if index < len(values.Values) {
+						bind(name.Name, values.Values[index])
+					}
+				}
+			}
+		}
+		return true
+	})
+	return bindings
+}
+
+// exprTypeName recovers a struct type name from a value expression when it is a
+// composite literal (`T{…}`) or address-of composite (`&T{…}`).
+func exprTypeName(expression ast.Expr) string {
+	switch value := expression.(type) {
+	case *ast.CompositeLit:
+		return typeName(value.Type)
+	case *ast.UnaryExpr:
+		if value.Op == token.AND {
+			return exprTypeName(value.X)
+		}
+	}
+	return ""
 }
 
 func functionCardConstants(body *ast.BlockStmt, packageConstants map[string]struct{}) map[string]struct{} {

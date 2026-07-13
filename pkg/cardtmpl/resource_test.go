@@ -76,6 +76,42 @@ func TestBuildSummaryResourceCardSnapshotAndValidation(t *testing.T) {
 	require.NoError(t, cardmsg.Validate(envelope))
 }
 
+func TestBuildSummaryResourceCardIconIsOptional(t *testing.T) {
+	resource := exampleResourceCard()
+	resource.IconURL = ""
+	document, err := BuildSummaryResourceCard(
+		localizedContext("en-US"),
+		"https://im.example.com/login",
+		"task-1",
+		"space-1",
+		resource,
+	)
+	require.NoError(t, err)
+
+	var card struct {
+		Body []map[string]interface{} `json:"body"`
+	}
+	require.NoError(t, json.Unmarshal(document, &card))
+	require.NotEmpty(t, card.Body)
+	assert.Equal(t, "Container", card.Body[0]["type"], "no-icon header should be a plain Container, not a ColumnSet")
+	assert.NotContains(t, string(document), `"type":"Image"`)
+
+	envelope := map[string]interface{}{
+		"type":         cardmsg.InteractiveCard.Int(),
+		"card_version": cardmsg.CardVersion,
+		"profile":      cardmsg.ProfileV1,
+		"card":         mustDecodeCard(t, document),
+	}
+	require.NoError(t, cardmsg.Validate(envelope))
+}
+
+func mustDecodeCard(t *testing.T, document []byte) map[string]interface{} {
+	t.Helper()
+	var card map[string]interface{}
+	require.NoError(t, json.Unmarshal(document, &card))
+	return card
+}
+
 func TestBuildSummaryResourceCardUsesOutboundLanguage(t *testing.T) {
 	document, err := BuildSummaryResourceCard(
 		localizedContext("zh-CN"),

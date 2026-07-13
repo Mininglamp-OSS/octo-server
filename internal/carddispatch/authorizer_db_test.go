@@ -102,6 +102,8 @@ func TestDBAuthorizerPolicyMatrix(t *testing.T) {
 		{name: "user bot group member", identity: userBot, target: Target{SpaceID: "space-a", ChannelID: "group-ok", ChannelType: common.ChannelTypeGroup.Uint8()}, policy: standard, allowed: true},
 		{name: "user bot group non-member", identity: userBot, target: Target{SpaceID: "space-a", ChannelID: "group-no-member", ChannelType: common.ChannelTypeGroup.Uint8()}, policy: standard},
 		{name: "member exempt group", identity: userBot, target: Target{SpaceID: "space-a", ChannelID: "group-no-member", ChannelType: common.ChannelTypeGroup.Uint8()}, policy: memberExempt, allowed: true},
+		{name: "member exempt normal member group", identity: userBot, target: Target{SpaceID: "space-a", ChannelID: "group-ok", ChannelType: common.ChannelTypeGroup.Uint8()}, policy: memberExempt, allowed: true},
+		{name: "member exempt honors explicit blacklist", identity: userBot, target: Target{SpaceID: "space-a", ChannelID: "group-blacklisted", ChannelType: common.ChannelTypeGroup.Uint8()}, policy: memberExempt},
 		{name: "blacklisted bot member", identity: userBot, target: Target{SpaceID: "space-a", ChannelID: "group-blacklisted", ChannelType: common.ChannelTypeGroup.Uint8()}, policy: standard},
 		{name: "external bot member", identity: userBot, target: Target{SpaceID: "space-a", ChannelID: "group-external", ChannelType: common.ChannelTypeGroup.Uint8()}, policy: standard},
 		{name: "deleted bot member", identity: userBot, target: Target{SpaceID: "space-a", ChannelID: "group-deleted-member", ChannelType: common.ChannelTypeGroup.Uint8()}, policy: standard},

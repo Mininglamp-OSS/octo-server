@@ -451,7 +451,11 @@ not implement a mutable generic "send as any UID" service.
    群人数); every such send must be attributable to a recorded triggering
    member action in the owning module (task creation, forward click), and
    group/thread lifecycle plus Space equality remain verified fail-closed at
-   send time. Transport needs no membership (group system tips already post
+   send time. Member-exempt is *no-membership-required*, not
+   *membership-ignored*: an **explicit ban is still honored** — a bot carrying
+   a blacklisted group-member row (`group_member.status=2`) was deliberately
+   removed by an admin and is denied even in this mode. Transport needs no
+   membership (group system tips already post
    member-less, `modules/group/event.go:36`); this is policy, and the
    industry analog is Slack `chat:write.public` no-join posting, scoped to
    normal in-Space groups because DMWork has no public/private split. The
@@ -731,9 +735,10 @@ caller must map them through that endpoint's registered `errcode` facade.
   closed before card finalization/transport.
 - Member-exempt-mode tests prove a producer with the mode posts to a normal
   same-Space group with **no membership row and no member-list/count side
-  effects**, is still denied on disbanded/disabled groups, wrong Space, and
-  invalid threads; a producer without the mode is denied as a non-member; and
-  no dispatch code path creates or mutates group membership.
+  effects**, is still denied on disbanded/disabled groups, wrong Space,
+  invalid threads, and when the bot carries an explicit blacklist row
+  (`group_member.status=2`); a producer without the mode is denied as a
+  non-member; and no dispatch code path creates or mutates group membership.
 - Multi-Space tests prove the explicit request Space is verified and the
   dispatcher never silently selects the first membership.
 
