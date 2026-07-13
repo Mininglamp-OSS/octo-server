@@ -4,6 +4,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-server/modules/botidentity"
 	"github.com/Mininglamp-OSS/octo-server/modules/incomingwebhook"
 	"github.com/stretchr/testify/assert"
 )
@@ -15,57 +16,79 @@ func TestWebhookPrefixConsistency(t *testing.T) {
 	assert.Equal(t, incomingwebhook.WebhookIDPrefix, webhookIDPrefix)
 }
 
-// fakeRobot 是 robot.IService.ExistRobot 的测试替身，记录调用次数以验证缓存。
-type fakeRobot struct {
-	bots  map[string]bool
+// fakeBotIdentity 是统一 bot identity resolver 的测试替身，记录调用次数以验证缓存。
+type fakeBotIdentity struct {
+	kinds map[string]botidentity.Kind
 	err   error
 	calls int
 }
 
-func (f *fakeRobot) ExistRobot(uid string) (bool, error) {
+func (f *fakeBotIdentity) Resolve(uid string) (*botidentity.Identity, error) {
 	f.calls++
 	if f.err != nil {
-		return false, f.err
+		return nil, f.err
 	}
-	return f.bots[uid], nil
+	kind, ok := f.kinds[uid]
+	if !ok {
+		return nil, nil
+	}
+	return &botidentity.Identity{UID: uid, Kind: kind}, nil
 }
 
-// newTestResolver 绕过 robot.NewService，直接注入 fake（cardtrust.New 需要
+// newTestResolver 绕过 botidentity.New，直接注入 fake（cardtrust.New 需要
 // *config.Context，测试里只关心判定 + 缓存逻辑）。
-func newTestResolver(t *testing.T, f *fakeRobot) *Resolver {
+func newTestResolver(t *testing.T, f *fakeBotIdentity) *Resolver {
 	t.Helper()
 	c, err := lruNew(cacheCapacity)
 	assert.NoError(t, err)
-	return &Resolver{svc: f, cache: c, ttl: cacheTTL}
+	return &Resolver{identity: f, cache: c, ttl: cacheTTL}
 }
 
 func TestTrustedWebhookPrefix(t *testing.T) {
-	f := &fakeRobot{}
+	f := &fakeBotIdentity{}
 	r := newTestResolver(t, f)
 	assert.True(t, r.Trusted("iwh_abc"), "webhook 合成身份可信")
-	assert.Equal(t, 0, f.calls, "iwh_ 前缀不应查 robot 表")
+	assert.Equal(t, 0, f.calls, "iwh_ 前缀不应查询 bot identity")
 }
 
 func TestTrustedBotCached(t *testing.T) {
-	f := &fakeRobot{bots: map[string]bool{"bot_x": true, "human_y": false}}
+	f := &fakeBotIdentity{kinds: map[string]botidentity.Kind{
+		"user_bot": botidentity.KindUserBot,
+		"app_bot":  botidentity.KindAppBot,
+	}}
 	r := newTestResolver(t, f)
 
-	assert.True(t, r.Trusted("bot_x"))
-	assert.True(t, r.Trusted("bot_x"), "第二次应命中缓存")
-	assert.Equal(t, 1, f.calls, "同 uid 只查一次 robot 表(缓存生效)")
+	assert.True(t, r.Trusted("user_bot"))
+	assert.True(t, r.Trusted("user_bot"), "第二次应命中缓存")
+	assert.Equal(t, 1, f.calls, "同 uid 只解析一次身份(缓存生效)")
+
+	assert.True(t, r.Trusted("app_bot"), "published App Bot 可信")
+	assert.True(t, r.Trusted("app_bot"), "App Bot 肯定裁决同样缓存")
+	assert.Equal(t, 2, f.calls)
 
 	assert.False(t, r.Trusted("human_y"), "非 bot 不可信")
 	assert.False(t, r.Trusted("human_y"))
-	assert.Equal(t, 2, f.calls, "否定裁决同样缓存")
+	assert.Equal(t, 3, f.calls, "否定裁决同样缓存")
 }
 
 func TestTrustedFailClosedNotCached(t *testing.T) {
-	f := &fakeRobot{err: errors.New("db down")}
+	f := &fakeBotIdentity{err: errors.New("db down")}
 	r := newTestResolver(t, f)
 	assert.False(t, r.Trusted("bot_z"), "查询失败 → fail-closed 不可信")
 	// 错误裁决不得缓存：DB 恢复后应重新查询而非粘住 [卡片]
 	f.err = nil
-	f.bots = map[string]bool{"bot_z": true}
+	f.kinds = map[string]botidentity.Kind{"bot_z": botidentity.KindAppBot}
 	assert.True(t, r.Trusted("bot_z"), "错误裁决不缓存,恢复后重查得到 true")
 	assert.Equal(t, 2, f.calls)
+}
+
+func TestTrustedFailClosedForEmptyNilAndAmbiguousIdentity(t *testing.T) {
+	var nilResolver *Resolver
+	assert.False(t, nilResolver.Trusted("bot"))
+
+	f := &fakeBotIdentity{err: botidentity.ErrAmbiguousIdentity}
+	r := newTestResolver(t, f)
+	assert.False(t, r.Trusted(""), "empty uid 不可信")
+	assert.False(t, r.Trusted("ambiguous"), "跨表身份冲突必须 fail closed")
+	assert.Equal(t, 1, f.calls, "empty uid 应在本地拒绝，不查询 resolver")
 }

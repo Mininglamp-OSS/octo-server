@@ -43,6 +43,20 @@ func TestCardSenderTrusted(t *testing.T) {
 	assert.NoError(t, err)
 	assert.True(t, cardSenderTrusted(ctx, "bot_push_1"))
 
+	// published app_bot 表在册（status=1）→ 可信；无需 robot 表兼容行。
+	_, err = ctx.DB().InsertBySql(`
+		INSERT INTO app_bot(id,uid,display_name,scope,status,token,created_by)
+		VALUES('push_app','app_push_1','Push App','platform',1,'app_push_token_1','owner')`).Exec()
+	assert.NoError(t, err)
+	assert.True(t, cardSenderTrusted(ctx, "app_push_1"))
+
+	// user.robot 只是展示元数据，不能单独建立卡片信任。
+	_, err = ctx.DB().InsertBySql(
+		"INSERT INTO user(uid,name,robot,status) VALUES('presentation_only_push','Presentation Only',1,1)",
+	).Exec()
+	assert.NoError(t, err)
+	assert.False(t, cardSenderTrusted(ctx, "presentation_only_push"))
+
 	// 普通用户 → 不可信（直连长连接可伪造 type-17,plain 攻击者可控）
 	assert.False(t, cardSenderTrusted(ctx, "human_9527"))
 }
@@ -55,6 +69,10 @@ func TestGetMessageAlertCard(t *testing.T) {
 	ctx.GetConfig().Push.ContentDetailOn = true
 
 	_, err := ctx.DB().InsertBySql("insert into robot(robot_id,status) values(?,1)", "bot_push_2").Exec()
+	assert.NoError(t, err)
+	_, err = ctx.DB().InsertBySql(`
+		INSERT INTO app_bot(id,uid,display_name,scope,status,token,created_by)
+		VALUES('push_alert_app','app_push_alert','Push Alert App','platform',1,'app_push_alert_token','owner')`).Exec()
 	assert.NoError(t, err)
 
 	payload := []byte(`{"type":17,"card":{"body":[{"type":"TextBlock","text":"内部字段"}]},"plain":"审批单 #42:待审批","card_version":"1.5","profile":"octo/v1"}`)
@@ -76,6 +94,10 @@ func TestGetMessageAlertCard(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "审批单 #42:待审批", alert, "bot sender 推送正文 = 权威 plain")
 	assert.NotContains(t, alert, "{", "APNs/FCM alert 不得出现原始卡 JSON")
+
+	alert, err = getMessageAlert(mk("app_push_alert"), toUser, ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, "审批单 #42:待审批", alert, "published App Bot 推送正文 = 权威 plain")
 
 	alert, err = getMessageAlert(mk("human_9527"), toUser, ctx)
 	assert.NoError(t, err)

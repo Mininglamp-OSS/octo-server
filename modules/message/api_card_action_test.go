@@ -43,6 +43,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/go-redis/redis"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const cardActionBotUID = "bot_card_1"
@@ -99,6 +100,14 @@ func seedCardBot(t *testing.T, ctx *config.Context, robotID string) {
 	t.Helper()
 	_, err := ctx.DB().InsertBySql("insert into robot(robot_id,status) values(?,1)", robotID).Exec()
 	assert.NoError(t, err)
+}
+
+func seedCardAppBot(t *testing.T, ctx *config.Context, id, uid, token string, status int) {
+	t.Helper()
+	_, err := ctx.DB().InsertBySql(`
+		INSERT INTO app_bot(id,uid,display_name,scope,status,token,created_by)
+		VALUES(?,?,?,'platform',?,?,?)`, id, uid, uid, status, token, "owner").Exec()
+	require.NoError(t, err)
 }
 
 func seedCardMessage(t *testing.T, ctx *config.Context, messageID int64, fromUID, channelID string, channelType uint8, payload []byte) {
@@ -210,6 +219,113 @@ func TestCardActionEndToEndAndIdempotency(t *testing.T) {
 	claimTTL, err := rds.TTL(claimKey).Result()
 	assert.NoError(t, err)
 	assert.Greater(t, claimTTL, time.Hour, "confirm 后应为 24h 级 TTL,而非 60s pending")
+}
+
+func TestCardActionAppBotEventPollAndAckLifecycle(t *testing.T) {
+	t.Setenv(cardmsg.EnvEnabled, "true")
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	defer func() { _ = testutil.CleanAllTables(ctx) }()
+	resetCardActionState(t, ctx)
+
+	const (
+		appID    = "card_action_app"
+		appUID   = "card_action_app_bot"
+		appToken = "app_card_action_lifecycle_token"
+	)
+	seedCardAppBot(t, ctx, appID, appUID, appToken, 1)
+	fake := common.GetFakeChannelIDWith(testutil.UID, appUID)
+	seedCardMessage(t, ctx, 9051, appUID, fake, common.ChannelTypePerson.Uint8(), cardV2EnvelopeJSON(t, "approve_btn"))
+
+	actionBody := map[string]interface{}{
+		"message_id":   "9051",
+		"channel_id":   appUID,
+		"channel_type": common.ChannelTypePerson.Uint8(),
+		"action_id":    "approve_btn",
+		"inputs":       map[string]interface{}{"comment": "ship it"},
+		"client_token": "app-action-1",
+	}
+	postAction := func() *httptest.ResponseRecorder {
+		t.Helper()
+		w := httptest.NewRecorder()
+		req, err := http.NewRequest(http.MethodPost, "/v1/message/card/action", bytes.NewReader([]byte(util.ToJson(actionBody))))
+		require.NoError(t, err)
+		req.Header.Set("token", testutil.Token)
+		s.GetRoute().ServeHTTP(w, req)
+		return w
+	}
+	poll := func() (*httptest.ResponseRecorder, struct {
+		Status  int `json:"status"`
+		Results []struct {
+			EventID   int64                  `json:"event_id"`
+			EventType string                 `json:"event_type"`
+			EventData map[string]interface{} `json:"event_data"`
+		} `json:"results"`
+	}) {
+		t.Helper()
+		w := httptest.NewRecorder()
+		req, err := http.NewRequest(http.MethodPost, "/v1/bot/events", strings.NewReader(`{"event_id":0,"limit":20}`))
+		require.NoError(t, err)
+		req.Header.Set("Authorization", "Bearer "+appToken)
+		s.GetRoute().ServeHTTP(w, req)
+		var body struct {
+			Status  int `json:"status"`
+			Results []struct {
+				EventID   int64                  `json:"event_id"`
+				EventType string                 `json:"event_type"`
+				EventData map[string]interface{} `json:"event_data"`
+			} `json:"results"`
+		}
+		if w.Code == http.StatusOK {
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+		}
+		return w, body
+	}
+
+	// Live authorization: unpublish must block a first attempt immediately and
+	// must not enqueue or claim the action.
+	_, err := ctx.DB().Exec("UPDATE app_bot SET status=2 WHERE uid=?", appUID)
+	require.NoError(t, err)
+	w := postAction()
+	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "Invalid card action.")
+	rds := redis.NewClient(&redis.Options{Addr: ctx.GetConfig().DB.RedisAddr, Password: ctx.GetConfig().DB.RedisPass})
+	defer rds.Close()
+	n, err := rds.ZCard("robotEvent:" + appUID).Result()
+	require.NoError(t, err)
+	assert.Zero(t, n)
+
+	// Re-publishing permits the same previously unclaimed action.
+	_, err = ctx.DB().Exec("UPDATE app_bot SET status=1 WHERE uid=?", appUID)
+	require.NoError(t, err)
+	w = postAction()
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), `"accepted":true`)
+	assert.Contains(t, w.Body.String(), `"replay":false`)
+	n, err = rds.ZCard("robotEvent:" + appUID).Result()
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), n, "exactly one App Bot event must be queued")
+
+	pollW, events := poll()
+	require.Equal(t, http.StatusOK, pollW.Code, pollW.Body.String())
+	require.Equal(t, 1, events.Status)
+	require.Len(t, events.Results, 1)
+	event := events.Results[0]
+	assert.Equal(t, cardmsg.EventTypeCardAction, event.EventType)
+	assert.Equal(t, "9051", event.EventData["message_id"])
+	assert.Equal(t, appUID, event.EventData["channel_id"])
+	assert.Equal(t, testutil.UID, event.EventData["operator_uid"])
+
+	ackW := httptest.NewRecorder()
+	ackReq, err := http.NewRequest(http.MethodPost, fmt.Sprintf("/v1/bot/events/%d/ack", event.EventID), nil)
+	require.NoError(t, err)
+	ackReq.Header.Set("Authorization", "Bearer "+appToken)
+	s.GetRoute().ServeHTTP(ackW, ackReq)
+	require.Equal(t, http.StatusOK, ackW.Code, ackW.Body.String())
+
+	pollW, events = poll()
+	require.Equal(t, http.StatusOK, pollW.Code, pollW.Body.String())
+	assert.Empty(t, events.Results, "ACKed App Bot event must not be returned again")
 }
 
 func TestCardActionTrustModel(t *testing.T) {
