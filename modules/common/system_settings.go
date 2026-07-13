@@ -793,6 +793,21 @@ func (s *SystemSettings) DocsEnabled() bool {
 	return s.getBool("docs", "enabled", false)
 }
 
+// DmloopEnabled reports whether the Loop(回路)module entry should be shown to
+// clients. Default false — the loop feature (backend service + fleet proxy +
+// daemon runtimes) stays hidden until ops flips dmloop.enabled after those deps
+// are deployed. Display policy only; /fleet auth lives in the backend.
+func (s *SystemSettings) DmloopEnabled() bool {
+	return s.getBool("dmloop", "enabled", false)
+}
+
+// DmpersonalEnabled reports whether the「我的/运行时」(personal) module entry
+// should be shown. Kept separate from dmloop.enabled because 我的 will be
+// redesigned to decouple from loop and may roll out on its own schedule.
+func (s *SystemSettings) DmpersonalEnabled() bool {
+	return s.getBool("dmpersonal", "enabled", false)
+}
+
 // ---------------------------------------------------------------------------
 // Custom-sticker upload constraints + optional server-side compression
 // (sticker-upload-compression task).
