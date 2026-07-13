@@ -591,12 +591,16 @@ func TestSearchGlobalMessages_ChannelIDsCollapseToOne_EmptyKeywordBrowses(t *tes
 func assertNotEmptySearchGuardRejection(t *testing.T, rec *httptest.ResponseRecorder) {
 	t.Helper()
 	body := rec.Body.String()
-	// The empty-search guard renders a VALIDATION_ERROR carrying
-	// details.reason="keyword or at least one filter is required" (see
-	// validate.go::validateSearchNotEmpty). Any body containing that reason
-	// means the fast path never got past the strict single-channel gate.
-	if strings.Contains(body, "keyword or at least one filter is required") {
-		t.Fatalf("singleFast branch must accept empty-keyword browse; got the empty-search 400: %s", body)
+	// The empty-search guard renders a VALIDATION_ERROR whose serialized
+	// envelope carries msg="Invalid search request." The internal
+	// details.reason ("keyword or at least one filter is required") is
+	// stripped by httperr's SafeDetailKeys filter before it reaches the wire,
+	// so we must key off the client-visible msg. An upstream/internal 400
+	// (search backend unavailable in the test env) renders a different msg
+	// and is treated as pass — the load-bearing check is only that the
+	// singleFast dispatch cleared validation.
+	if strings.Contains(body, "Invalid search request.") {
+		t.Fatalf("singleFast branch must accept empty-keyword browse; got a validation 400: %s", body)
 	}
 }
 
