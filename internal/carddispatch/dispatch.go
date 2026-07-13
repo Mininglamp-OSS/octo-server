@@ -61,8 +61,12 @@ func (s *producerSender) Send(ctx context.Context, target Target, card Card) (re
 		return nil, categorized(terminal, errors.New("producer concurrency saturated"))
 	}
 
-	// The caller can mutate its RawMessage immediately after this copy without
-	// racing validation, finalization, or transport serialization.
+	// Snapshot the caller's bytes: once copied, a caller that retains and later
+	// mutates its RawMessage cannot affect validation, finalization, or
+	// transport serialization, which all read this private copy. (A caller that
+	// mutates the same slice *concurrently* with this call is a caller-side data
+	// race the copy cannot prevent; callers must not share a Card across
+	// goroutines mid-Send.)
 	document := append([]byte(nil), card.Document...)
 	if err := ctx.Err(); err != nil {
 		terminal = CategoryDispatchFailed

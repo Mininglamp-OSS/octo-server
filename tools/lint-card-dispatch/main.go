@@ -178,8 +178,7 @@ func Scan(roots []string, allowlist []AllowlistEntry) ([]Finding, error) {
 					} else if called, ok := calledFunctionKey(value.Fun, bindings); ok {
 						info.calls[called] = struct{}{}
 					}
-					name := calledName(value.Fun)
-					if name == "SendMessage" || name == "SendMessageWithResult" {
+					if isTransportName(calledName(value.Fun)) {
 						info.directTransport = true
 					}
 					if isCardMarkerCall(value.Fun) {
@@ -461,7 +460,23 @@ func isTransportReference(expression ast.Expr) bool {
 	if !ok {
 		return false
 	}
-	return selector.Sel.Name == "SendMessage" || selector.Sel.Name == "SendMessageWithResult"
+	return isTransportName(selector.Sel.Name)
+}
+
+// isTransportName lists the octo-lib Context methods that hand a payload to the
+// IM transport. SendMessageBatch also carries an arbitrary []byte payload, so a
+// type-17 card sent through it is caught like SendMessage / SendMessageWithResult.
+// NOTE: this guard is intra-package and matches recognizable call/data-flow
+// shapes only — a transport call reached across packages, or built via
+// reflection/codegen, is out of its scope; the runtime ingress gate
+// (Decision 14) is the authoritative defense, this is defense-in-depth.
+func isTransportName(name string) bool {
+	switch name {
+	case "SendMessage", "SendMessageWithResult", "SendMessageBatch":
+		return true
+	default:
+		return false
+	}
 }
 
 func calledFunctionKey(expression ast.Expr, receivers map[string]string) (functionKey, bool) {

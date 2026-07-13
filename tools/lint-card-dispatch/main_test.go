@@ -41,6 +41,12 @@ func bypass() { payload := map[string]interface{}{"type": cardmsg.InteractiveCar
 `},
 		},
 		{
+			name: "direct SendMessageBatch",
+			files: map[string]string{"bypass.go": `package bad
+func bypass() { payload := map[string]interface{}{"type": 17}; ctx.SendMessageBatch(payload) }
+`},
+		},
+		{
 			name: "package local transport wrapper",
 			files: map[string]string{"bypass.go": `package bad
 func dispatch(v interface{}) { ctx.SendMessage(v) }

@@ -115,6 +115,22 @@ sender, _ := registry.Sender("summary-notify")           // inject into notify.N
 - The DB-backed authorizer tests (`TestDBAuthorizerPolicyMatrix` etc.) run on
   sqlite locally but should run against MySQL in CI per the brief.
 
+### P2 preconditions raised in the P1 review (#577)
+
+- **WuKongIM transport timeout.** `SendMessageWithResult` → `network.Post` uses
+  a zero-value `http.Client{}` with no timeout, and the dispatcher holds a
+  producer in-flight slot across that call. A hung upstream would pin slots
+  until `busy`. Pre-existing platform-wide (every `SendMessage*` caller,
+  including today's notify pool) and cancellable transport is out of P1 scope —
+  but ensure the WuKongIM client carries a request timeout before enabling the
+  pilot, so the per-producer budget can't be pinned by a slow upstream.
+- **Large-integer JSON precision (octo/v2 only).** The card document is decoded
+  with default `json.Unmarshal`, so bare JSON numbers become `float64` (ints
+  above 2^53 lose precision on re-serialize). Harmless for `octo/v1` display
+  cards (strings/enums/URLs) and consistent with the `bot_api` ingress. If a
+  future `octo/v2` producer places large integer IDs in card data, switch that
+  path to `json.Decoder` + `UseNumber()`.
+
 ## After P2 (later PRs — brief has the detail)
 
 Each of these is its own follow-up PR after the pilot is live.
