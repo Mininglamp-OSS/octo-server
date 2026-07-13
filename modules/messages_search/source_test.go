@@ -505,11 +505,11 @@ func TestSingleMessageHit_SnippetFallback(t *testing.T) {
 
 	// Keyword path: highlight wins, no fallback.
 	hl := map[string][]string{"payload.text.content": {"群聊<mark>测试</mark>消息"}}
-	if got := h.singleMessageHit(doc, "c", hl).Snippet; got != "群聊<mark>测试</mark>消息" {
+	if got := h.singleMessageHit(doc, "c", 0, hl).Snippet; got != "群聊<mark>测试</mark>消息" {
 		t.Fatalf("highlight should win, got %q", got)
 	}
 	// Empty-keyword browse path: no highlight → fall back to raw content.
-	if got := h.singleMessageHit(doc, "c", nil).Snippet; got != "群聊测试消息" {
+	if got := h.singleMessageHit(doc, "c", 0, nil).Snippet; got != "群聊测试消息" {
 		t.Fatalf("empty highlight should fall back to content, got %q", got)
 	}
 }

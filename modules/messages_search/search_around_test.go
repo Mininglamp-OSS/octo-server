@@ -43,7 +43,7 @@ func TestReverseHits(t *testing.T) {
 // is sliced back into the AroundResult shape with correct anchor placement.
 func TestSplitAroundWindow(t *testing.T) {
 	h := &Handler{cfg: SearchConfig{}}
-	mk := func(id int64) MessageHit { return h.singleMessageHit(Doc{MessageID: id, From: "u1"}, "C1", nil) }
+	mk := func(id int64) MessageHit { return h.singleMessageHit(Doc{MessageID: id, From: "u1"}, "C1", 0, nil) }
 	hits := []MessageHit{mk(1), mk(2), mk(3), mk(4), mk(5)} // before=[1,2], anchor=3, after=[4,5]
 	res := splitAroundWindow(hits, 2, 2, true, false)
 	if len(res.Before) != 2 || res.Before[0].MessageID != "1" || res.Before[1].MessageID != "2" {
@@ -63,7 +63,7 @@ func TestSplitAroundWindow(t *testing.T) {
 // When the before wing is empty the anchor is the first element.
 func TestSplitAroundWindow_NoBefore(t *testing.T) {
 	h := &Handler{cfg: SearchConfig{}}
-	mk := func(id int64) MessageHit { return h.singleMessageHit(Doc{MessageID: id}, "C1", nil) }
+	mk := func(id int64) MessageHit { return h.singleMessageHit(Doc{MessageID: id}, "C1", 0, nil) }
 	hits := []MessageHit{mk(3), mk(4)} // anchor=3, after=[4]
 	res := splitAroundWindow(hits, 0, 1, false, false)
 	if len(res.Before) != 0 {
@@ -94,7 +94,7 @@ func TestSingleMessageHit_AroundMediaSnippetNonEmpty(t *testing.T) {
 			Image: &ImagePayload{Caption: "野餐合影"},
 		},
 	}
-	if got := h.singleMessageHit(imgDoc, "C1", nil).Snippet; got != "野餐合影" {
+	if got := h.singleMessageHit(imgDoc, "C1", 0, nil).Snippet; got != "野餐合影" {
 		t.Fatalf("image hit must carry caption snippet in /_search_around, got %q", got)
 	}
 
@@ -107,7 +107,7 @@ func TestSingleMessageHit_AroundMediaSnippetNonEmpty(t *testing.T) {
 			File: &FilePayload{Name: "season-plan.pdf"},
 		},
 	}
-	if got := h.singleMessageHit(fileDoc, "C1", nil).Snippet; got != "season-plan.pdf" {
+	if got := h.singleMessageHit(fileDoc, "C1", 0, nil).Snippet; got != "season-plan.pdf" {
 		t.Fatalf("file hit must carry filename snippet in /_search_around, got %q", got)
 	}
 }

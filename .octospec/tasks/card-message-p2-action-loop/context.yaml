@@ -1,0 +1,12 @@
+injected:
+  - id: error-handling
+    source: repo
+  - id: rate-limit
+    source: repo
+  - id: space-isolation
+    source: repo
+  - id: trust-boundary
+    source: repo
+  - id: testing
+    source: repo
+brief: .octospec/tasks/card-message-p2-action-loop/brief.md

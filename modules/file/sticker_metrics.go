@@ -25,10 +25,14 @@ func stickerUploadResultLabels() []string {
 		// compress_failed   = 解码/编码失败，fail-open 走原路径（原字节仍上传）
 		// compress_skipped  = 未压缩（禁用/非可压格式/并发满/超时），fail-open 走原路径
 		// compress_over_limit = 压缩后仍超 target_kb，caller 拒绝上传
+		// compress_oversized_rejected = 维度门为 jpg/png 放宽到接收硬上限后，压缩实际
+		//   未把图缩到 upload_max_dimension 以内（compressor==nil / skipped / failed /
+		//   compress_max_dimension 配得过大），fail-closed 拒绝，避免存/发超限大图。
 		"compress_success",
 		"compress_failed",
 		"compress_skipped",
 		"compress_over_limit",
+		"compress_oversized_rejected",
 	}
 }
 

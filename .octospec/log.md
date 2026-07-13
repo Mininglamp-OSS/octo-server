@@ -4,6 +4,183 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-09 (sticker-oversized-store-guard)
+
+- **Fix** — Task `sticker-oversized-store-guard` (code-review fix on
+  `sticker-oversized-default`): close the regression where the compress-aware
+  gate admitted >512 jpg/png trusting compression to downscale, but every
+  fail-open path (nil compressor, skipped:concurrency_saturated/timeout, failed,
+  or compress_max_dimension > upload_max_dimension) stored the original oversized
+  image up to 1024² and served it to peers — reachable under load / attackable by
+  saturating the compress slots. Added `stickerCompressResult.OutMaxDim` (actual
+  post-compression dimension) + an `api.go` post-block guard that rejects
+  (`compress_oversized_rejected`, new pre-warmed terminal metric) when the final
+  stored dimension exceeds `upload_max_dimension` — dimension fail-CLOSED while
+  compression quality stays fail-OPEN. Deduped the cross-package 1024 literal
+  (exported `common.StickerUploadMaxDimensionHardCap`, referenced by modules/file).
+  Schema note recommends `compress_max_dimension ≤ upload_max_dimension`; test
+  helper reuse cleanup. Four guard regressions (nil/failed/timeout/mis-config) +
+  unbroken happy path. No new errcode / i18n / DB / appconfig change. Briefs
+  `.octospec/tasks/sticker-oversized-store-guard/`.
+
+## 2026-07-09 (sticker-oversized-default)
+
+- **Change** — Task `sticker-oversized-default` (follow-up to
+  `sticker-downscale-store`): make ">512px static jpg/png auto-shrinks to 512" the
+  built-in default once compression is enabled, without turning compression on for
+  every deployment. `compress_max_dimension` default flips 0(=ceiling)→**512**,
+  decoupled from `upload_max_dimension`, clamp `[1,1024]` (getter collapsed to the
+  shared `stickerClampIntUpper`). New compress-aware dimension gate
+  (`stickerLimitsSnapshot.effectiveGateDim`): jpg/png accept up to the **1024**
+  hard cap when `compress_enabled=true` (then shrink to `compress_max_dimension`),
+  gif/webp and compress-off stay gated at `upload_max_dimension` (512).
+  `compress_enabled` default stays **false** (gray-scale rollout preserved);
+  `upload_max_dimension` default and the appconfig `StickerUploadLimits`
+  client contract stay **512/unchanged** (compress-aware gate avoids the
+  appconfig ripple a 1024 default would cause). Zero-impact when compression off
+  (gate = 512 for all formats, compressor never runs). Known edge: APNG (ext
+  `.png`) passes the widened gate but can't be shrunk (`skipped:animated`) — later
+  fail-closed **rejected** by `sticker-oversized-store-guard` if >
+  `upload_max_dimension` (this entry's pre-guard "stored un-shrunk" no longer
+  holds). Getter tests rewritten; gate integration tests added; fake made
+  faithful to the 512 default. No new errcode / i18n / DB / migration / appconfig
+  field. Brief `.octospec/tasks/sticker-oversized-default/brief.md`.
+
+## 2026-07-09 (sticker-downscale-store)
+
+- **Change** — Task `sticker-downscale-store` (phase two of
+  `sticker-upload-compression`): decouple the compressor's `imaging.Fit` downscale
+  target from the upload dimension gate. New server-side key
+  `sticker.compress_max_dimension` (int, `Positive:true`, read-side clamped to
+  `≤ upload_max_dimension`, unset ⇒ `= upload_max_dimension` ⇒ no downscale). Swap
+  `stickerLimitsSnapshot.compressParams().MaxDim` from `maxDim` (accept gate) to a
+  new `compressMaxDim` field so static jpg/png larger than the target but within
+  the unchanged accept ceiling are downscaled before re-encode+store, instead of
+  the Fit branch being unreachable (gate/target were same-source, so it never
+  fired). Accept hard cap stays 1024 (decompression-bomb envelope unchanged);
+  webp/gif still validate-only; not exposed via appconfig. Zero-impact default,
+  byte-for-byte identical to `main` when unset. New getter clamp tests (no-infra)
+  + api-level downscale/regression tests. No new errcode / i18n / DB / migration.
+  Brief `.octospec/tasks/sticker-downscale-store/brief.md`.
+
+## 2026-07-09 (P3-3)
+
+- **Change** — Task `card-message-p3-rich-inputs` (card message P3-3): extend the
+  octo/v2 input whitelist with `Input.Number/Date/Time` (all AC 1.0, within the
+  pinned `card_version:"1.5"` — additive, no version bump). Submit-time value
+  validation added (format/type only: Number = finite JSON number; Date =
+  `YYYY-MM-DD`; Time = `HH:MM`; `""` = unfilled; declared min/max range NOT
+  server-enforced — delegated to bot, same class as `isRequired`/`regex`, which
+  likewise stay unenforced). Refactored the element
+  whitelist into a single `pkg/cardmsg` authority (`whitelist.go`:
+  `displayElements`/`inputElements` + `DisplayElements()`/`InputElements()` +
+  `isInputElement`) that send-time validation, submit-time collection, action
+  dispatch, and the D12 manifest all derive from — no drifting literals. D12
+  `GET /v1/bot/card/profile` additively advertises `elements`/`inputs` for
+  element-granularity feature detection. Review-caught fixes folded in: reject
+  non-finite `Input.Number` (NaN/±Inf bypass `ParseFloat`); strict JSON-number
+  grammar so the server's "valid number" matches the bot's JSON parser (reject
+  `ParseFloat`'s Go-only superset — `1_000`/`0x1p4`/leading-`+`/leading-zero —
+  which would silently corrupt the value the bot re-parses); `default`
+  fail-closed arm in the submit-time type switch; `Column` dropped from the
+  manifest `elements` (it is a `ColumnSet` child, not a top-level element the
+  validator accepts — advertising it lied about capability); and symmetric
+  `inlineAction` dispatch for the new types (no dead buttons). No new errcode /
+  i18n / DB / migration / endpoint; additive-only wire contract. Brief
+  + journal under `.octospec/tasks/card-message-p3-rich-inputs/` and
+  `.octospec/journal/shared/card-message-p3-rich-inputs.md`; learning candidate
+  in `.octospec/learnings/pending/`.
+- **Change** — Same task/PR, follow-on: **AC 1.5 display-element completion (Tier 1)** —
+  added `ImageSet`(1.0) / `RichTextBlock`(1.2) / `Table`(1.5) / `ActionSet`(1.2) to the
+  octo/v2 display whitelist (versions verified against adaptivecards.io). Each covers
+  send-time validation (structure + URL allowlist + recursion budget), dispatch symmetry
+  (`findSubmitInElements` walks ActionSet.actions / Table cells / ImageSet images /
+  RichTextBlock inlines for Submit — no dead buttons), plain derivation, and D12 manifest
+  `elements` (auto via the displayElements single authority). Corrected the pre-existing
+  `TestValidateWhitelistRejections` which mislabeled Table as "AC 1.6, reject" (Table is
+  1.5, now supported) → replaced with still-unsupported Media(1.1)/ToggleVisibility(1.2).
+  Still out (later, on demand): Media, Action.ShowCard/ToggleVisibility/Execute, templating,
+  AC 1.6.
+- **Change** — Same task/PR, review hardening (PR#556 review of head `7559c526`): fixed a
+  **send-time URL-allowlist bypass (P1)** in the two Tier-1 flat-leaf handlers — `imageChild`
+  (`ImageSet.images[]`) and the `RichTextBlock.inlines[]` object branch accepted a child
+  without enforcing its declared `type` and never recursed its `items`, so a mislabeled child
+  (`{"type":"Container","url":"http://ok","items":[TextBlock with javascript:]}`) passed
+  `Validate` with the nested `javascript:` link unchecked. Now both enforce a *leaf* contract —
+  reject a present `type` ≠ `Image`/`TextRun` (same discipline as `column()`) AND reject any
+  child-collection field (`items`/`columns`/… via `rejectLeafSubtree`), which also closes the
+  **typeless-child residual** a conditional `if type present` check leaves open (a no-`type`
+  child with a nested subtree) — restoring "校验面 ≥ 渲染面" (`TestTier1MislabeledChildRejected`
+  covers typed + typeless). Also completed `TableRow.selectAction` (P2): added it to
+  validation (`w.selectAction(row)`) and dispatch (`findSubmitInElements` reads
+  `row.selectAction`) symmetrically — row was the only node whose `selectAction` was neither
+  validated nor dispatched. Brief updated; `inputs` manifest field confirmed in-scope.
+- **Change** — Same task/PR, review hardening cont'd (heads `2c8f1003`→`85baabdf`, three
+  reviewers): the foreign-typed-child bypass turned out to recur one child collection at a time
+  (ImageSet → its typeless variant → `Table` rows/cells), so generalized the fix into one shared
+  discipline instead of patching each instance. New `checkConstrainedChild` (type-pin via a shared
+  `childTypeMatches` predicate + closed-set `rejectForeignSubtree`) is now applied to **every**
+  flat-validated child position — `ColumnSet.columns[]`, `ImageSet.images[]`,
+  `RichTextBlock.inlines[]`, `Table.rows[]`/`cells[]`, `FactSet.facts[]` — closing the `Table`
+  send-time bypass (mislabeled cell as `Image` with a `javascript:` url; mislabeled/typeless row
+  hiding an un-recursed `items` subtree) plus the Column/Fact instances of the same class. The
+  dispatch walker (`findSubmitInElements`) reuses the same `childTypeMatches` predicate to skip
+  foreign-typed children, so validate-surface == dispatch-surface can't drift (P2). Tests:
+  `TestTier1MislabeledChildRejected` (Table/Column/Fact, typed + typeless) +
+  `TestTier1DispatchSkipsMislabeledChild`. Lesson: patch the class, not the flagged instance.
+
+## 2026-07-08 (PR-D)
+
+- **Change** — Task `card-message-p2-capability-manifest` (PR-D, card message P2
+  D12): producer capability discovery. New read-only `GET /v1/bot/card/profile`
+  (bot-token, existing `authBot()` chain — no new rate limiter, no Space
+  middleware) returning the deployment's card capability manifest
+  (`enabled` / `card_version` / `profiles` / `limits`) so producers feature-detect
+  instead of send-probing. All values sourced from `pkg/cardmsg` constants; the
+  `profiles` set comes from a new single-authority `cardmsg.AcceptedProfiles()`
+  that `interactiveByProfile` now derives from too (a drift-guard test asserts
+  the manifest can't advertise a profile the validator rejects). `enabled:false`
+  still returns 200 with the full manifest (a both-halves test pins manifest-200
+  + send-still-rejects together). Additive-only wire contract (contract test pins
+  the field set). No new errcode / i18n / DB / migration. Independent of PR-B/PR-C
+  (both merged). Journal:
+  `.octospec/journal/shared/card-message-p2-capability-manifest.md`;
+  learning: `.octospec/learnings/pending/card-message-p2-capability-manifest.md`.
+
+## 2026-07-08 (PR-C)
+
+- **Change** — Task `card-message-p2-revision-history` (PR-C, card message P2
+  D10): card revision history. New `octo_message_card_revision` side table +
+  `pkg/cardrevision` shared store (written by bot_api on edits/clear, read by
+  message), `GET /v1/message/card/revisions` (summary / full=1) reusing the
+  extracted `authorizeCardChannelMember` gate, bot revision clear + auditable
+  tombstone, `transient` frame flag (progress frames skip history), and revoke
+  cleanup. Verify caught two P1s (fixed): the query path lacked the
+  revoke/deleted/user-local-delete visibility gate, and the revoke cleanup was
+  mis-ordered after the notify step. Code-review (B1) then caught that the query
+  still enforced a *subset* of the canonical read — missing the `visibles`
+  allowlist / read-offset / channel-offset / expiry layers `card/action` carries;
+  fixed by extracting `cardCanonicalVisibleToViewer` and sharing it across both
+  endpoints (+ `TestCardRevisionsCanonicalVisibility`). Stacked on PR-B; zero
+  octo-im changes. Journal:
+  `.octospec/journal/shared/card-message-p2-revision-history.md`;
+  learning: `.octospec/learnings/pending/card-message-p2-revision-history.md`.
+
+## 2026-07-08
+
+- **Change** — Task `card-message-p2-action-loop` (PR-B, card message P2
+  interaction): shipped the interaction closed loop (contract
+  `card-message-interaction` D3–D9/D11 + octo/v2 whitelist). New
+  `POST /v1/message/card/action` (authz + anti-IDOR + D11 input validation + D4
+  Redis idempotency), typed `card_action` bot event on the existing robot queue,
+  type-17 `botMessageEdit` unlock (cardmsg validation + D9 `card_seq` CAS in
+  `message_extra`), and the `pkg/cardmsg` octo/v2 whitelist filled into the
+  merged-P1 seams. Verify caught a real InnoDB deadlock in the D9 CAS under
+  concurrent frames (fixed via bounded 1213/1205 retry). Zero octo-im changes.
+  D10 revision history / D12 capability manifest split to sibling PRs C/D.
+  Journal: `.octospec/journal/shared/card-message-p2-action-loop.md`;
+  learning: `.octospec/learnings/pending/card-message-p2-action-loop.md`.
+
 ## 2026-07-02
 
 - **Change** — Task `conv-space-catchall-484` (issue #484 follow-up): closed the

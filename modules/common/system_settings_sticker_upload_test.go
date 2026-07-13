@@ -180,13 +180,13 @@ func TestSystemSettings_StickerCompressEnabled_DBTrueWins(t *testing.T) {
 
 func TestSystemSettings_StickerCompressTargetKB_ClampBehavior(t *testing.T) {
 	tests := map[string]int{
-		"":       defaultStickerCompressTargetKB,      // unset → default
-		"0":      defaultStickerCompressTargetKB,      // ≤0 → default
-		"-1":     defaultStickerCompressTargetKB,      // negative → default
-		"abc":    defaultStickerCompressTargetKB,      // non-numeric → default
-		"999999": stickerCompressTargetKBHardCap,      // over hard cap → hard cap
-		"512":    512,                                 // in-range → verbatim
-		"5120":   stickerCompressTargetKBHardCap,      // exact hard cap → accepted
+		"":       defaultStickerCompressTargetKB, // unset → default
+		"0":      defaultStickerCompressTargetKB, // ≤0 → default
+		"-1":     defaultStickerCompressTargetKB, // negative → default
+		"abc":    defaultStickerCompressTargetKB, // non-numeric → default
+		"999999": stickerCompressTargetKBHardCap, // over hard cap → hard cap
+		"512":    512,                            // in-range → verbatim
+		"5120":   stickerCompressTargetKBHardCap, // exact hard cap → accepted
 	}
 	for in, want := range tests {
 		s := stickerSnapSettings(map[string]string{
@@ -198,13 +198,13 @@ func TestSystemSettings_StickerCompressTargetKB_ClampBehavior(t *testing.T) {
 
 func TestSystemSettings_StickerCompressMaxConcurrency_ClampBehavior(t *testing.T) {
 	tests := map[string]int{
-		"":       defaultStickerCompressMaxConcurrency,
-		"0":      defaultStickerCompressMaxConcurrency,
-		"-2":     defaultStickerCompressMaxConcurrency,
-		"abc":    defaultStickerCompressMaxConcurrency,
-		"999":    stickerCompressMaxConcurrencyHardCap,
-		"8":      8,
-		"32":     stickerCompressMaxConcurrencyHardCap,
+		"":    defaultStickerCompressMaxConcurrency,
+		"0":   defaultStickerCompressMaxConcurrency,
+		"-2":  defaultStickerCompressMaxConcurrency,
+		"abc": defaultStickerCompressMaxConcurrency,
+		"999": stickerCompressMaxConcurrencyHardCap,
+		"8":   8,
+		"32":  stickerCompressMaxConcurrencyHardCap,
 	}
 	for in, want := range tests {
 		s := stickerSnapSettings(map[string]string{
@@ -230,6 +230,58 @@ func TestSystemSettings_StickerCompressTimeoutMs_ClampBehavior(t *testing.T) {
 		})
 		assert.Equalf(t, want, s.StickerCompressTimeoutMs(), "timeout_ms=%q", in)
 	}
+}
+
+// ----- compress_max_dimension (sticker-oversized-default) -----
+
+// 未配置 → 512 默认缩放目标（让「>512 缩到 512」成为压缩开启后的开箱行为）。
+// 与 upload_max_dimension 解耦：即使接收门是 512，缩放目标仍独立取 512 默认。
+func TestSystemSettings_StickerCompressMaxDimension_DefaultsTo512(t *testing.T) {
+	s := stickerSnapSettings(nil)
+	assert.Equal(t, defaultStickerCompressMaxDimension, s.StickerCompressMaxDimension())
+	assert.Equal(t, 512, s.StickerCompressMaxDimension())
+}
+
+// 与 upload_max_dimension 解耦：接收门调低到 384 不影响缩放目标默认 512
+// （缩放目标的上界是 1024 硬上限，不是 upload_max_dimension）。
+func TestSystemSettings_StickerCompressMaxDimension_DecoupledFromUploadDim(t *testing.T) {
+	s := stickerSnapSettings(map[string]string{
+		"sticker.upload_max_dimension": "384",
+	})
+	assert.Equal(t, 512, s.StickerCompressMaxDimension())
+}
+
+// ≤0 / 非数字 → 回落默认 512（绝不 dark-close）。
+func TestSystemSettings_StickerCompressMaxDimension_NonPositiveFallsBackToDefault(t *testing.T) {
+	for _, bad := range []string{"0", "-1", "abc", ""} {
+		s := stickerSnapSettings(map[string]string{
+			"sticker.compress_max_dimension": bad,
+		})
+		assert.Equalf(t, defaultStickerCompressMaxDimension, s.StickerCompressMaxDimension(),
+			"value=%q must fall back to 512", bad)
+	}
+}
+
+// 合法且 ≤ 硬上限 1024 → 原样返回（可 > upload_max_dimension，两者解耦）。
+func TestSystemSettings_StickerCompressMaxDimension_InRangeVerbatim(t *testing.T) {
+	for in, want := range map[string]int{"384": 384, "512": 512, "768": 768, "1024": 1024} {
+		s := stickerSnapSettings(map[string]string{
+			"sticker.compress_max_dimension": in,
+		})
+		assert.Equalf(t, want, s.StickerCompressMaxDimension(), "compress_max_dimension=%q", in)
+	}
+}
+
+// 缩放目标 > 1024 硬上限 → clamp 到 1024，并记一次去重 Warn。
+func TestSystemSettings_StickerCompressMaxDimension_ClampsToHardCap(t *testing.T) {
+	s := stickerSnapSettings(map[string]string{
+		"sticker.compress_max_dimension": "4096",
+	})
+	for i := 0; i < 3; i++ {
+		assert.Equal(t, stickerUploadMaxDimensionHardCap, s.StickerCompressMaxDimension(),
+			"target above the 1024 hard cap clamps down to it")
+	}
+	assertClampWarnedOnce(t, s, "sticker.compress_max_dimension=4096>1024")
 }
 
 // ----- clamp warning dedup (review R6) -----

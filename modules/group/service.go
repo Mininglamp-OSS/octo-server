@@ -72,6 +72,8 @@ type IService interface {
 	GetMemberUIDsOfManager(groupNo string) ([]string, error)
 	// 是否是创建者或管理者
 	IsCreatorOrManager(groupNo string, uid string) (bool, error)
+	// IsRobot 判断某 uid 是否为龙虾(robot)账号（user.robot=1）。
+	IsRobot(uid string) (bool, error)
 	// 获取成员总数量和在线数量
 	// 第一个返回参数为成员总数量
 	// 第二个返回参数为在线数量
@@ -82,6 +84,10 @@ type IService interface {
 	// 白名单语义、fail-closed），排除被拉黑成员。供绕过 IM 直查本地分表的读/发门禁，
 	// 以及子区(CommunityTopic)解析父群后的读/写门禁使用，防止被拉黑用户越权读子区内容。
 	ExistMemberActive(groupNo string, uid string) (bool, error)
+	// ExistMemberActiveInternal 是 ExistMemberActive 的收紧变体：额外要求 is_external=0，
+	// 只把「内部活跃人类成员」视为存在。放开的群/子区改名门禁用它保留 is_external=0
+	// 安全边界，避免跨 Space 外部成员越权改名（YUJ-231 / GH#1289，P1）。
+	ExistMemberActiveInternal(groupNo string, uid string) (bool, error)
 	// 成员是否在某群里存在 返回对应在群里的群编号
 	ExistMembers(groupNos []string, uid string) ([]string, error)
 	// ExistMembersActive 批量版 ExistMemberActive：返回 uid 处于「活跃」状态
@@ -566,6 +572,16 @@ func (s *Service) IsCreatorOrManager(groupNo string, uid string) (bool, error) {
 	return s.db.QueryIsGroupManagerOrCreator(groupNo, uid)
 }
 
+// IsRobot 判断某 uid 是否为龙虾(robot)账号（user.robot=1）。
+func (s *Service) IsRobot(uid string) (bool, error) {
+	var isBot int
+	err := s.ctx.DB().SelectBySql("SELECT COALESCE((SELECT robot FROM `user` WHERE uid=? LIMIT 1), 0)", uid).LoadOne(&isBot)
+	if err != nil {
+		return false, err
+	}
+	return isBot == 1, nil
+}
+
 func (s *Service) GetMemberTotalAndOnlineCount(groupNo string) (int, int, error) {
 	var onlineCount, memberCount int64
 	var err error
@@ -589,6 +605,13 @@ func (s *Service) ExistMember(groupNo string, uid string) (bool, error) {
 // 子区(CommunityTopic)读/发门禁用它替代 ExistMember，避免被拉黑用户越权读/发（YUJ-4185 CR 整改）。
 func (s *Service) ExistMemberActive(groupNo string, uid string) (bool, error) {
 	return s.db.ExistMemberActive(uid, groupNo)
+}
+
+// ExistMemberActiveInternal 是 ExistMemberActive 的收紧变体：额外要求 is_external=0，
+// 只把「内部活跃人类成员」视为存在。放开的群/子区改名门禁用它保留 is_external=0
+// 安全边界，避免跨 Space 外部成员越权改名（YUJ-231 / GH#1289，P1）。
+func (s *Service) ExistMemberActiveInternal(groupNo string, uid string) (bool, error) {
+	return s.db.ExistMemberActiveInternal(uid, groupNo)
 }
 
 func (s *Service) ExistMembers(groupNos []string, uid string) ([]string, error) {

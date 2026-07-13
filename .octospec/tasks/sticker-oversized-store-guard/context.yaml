@@ -1,0 +1,17 @@
+injected:
+  - id: error-handling
+    source: repo
+    why: matched via wire-contract tag + modules/**/*.go. The new rejection uses c.ResponseError (modules/file is unmigrated, out of scope per prior briefs); no new i18n code → make i18n-lint unaffected (verified).
+  - id: rate-limit
+    source: repo
+    why: matched via throttle tag. Guard is a dimension comparison after the existing compress block; no request-frequency counter touched.
+  - id: trust-boundary
+    source: repo
+    why: matched via external-content tag. Core of the fix: "bound the payload" — restore the stored/served dimension bound (≤ upload_max_dimension) that the widened gate had decoupled from actual downscaling; fail-closed on every non-shrunk path.
+  - id: testing
+    source: repo
+    why: api-level guard tests inject fake settings + capturing service + an injected doCompress (fail/slow) to drive the failed/timeout fail-open paths deterministically; no MySQL/Redis.
+  - id: commit-style
+    source: repo
+    why: English Conventional Commits (fix:).
+brief: .octospec/tasks/sticker-oversized-store-guard/brief.md

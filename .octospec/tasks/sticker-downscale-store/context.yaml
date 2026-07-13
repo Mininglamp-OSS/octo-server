@@ -1,0 +1,17 @@
+injected:
+  - id: error-handling
+    source: repo
+    why: matched via wire-contract tag + modules/**/*.go path. No new error surface added — the only rejection path (over_limit) is pre-existing; modules/file stays on c.ResponseError per sibling task. No new i18n codes → make i18n-lint unaffected.
+  - id: rate-limit
+    source: repo
+    why: matched via throttle tag. Compression concurrency semaphore is process-local compute throttle (explicitly allowed exception), NOT a request-frequency Redis counter. Unchanged by this task.
+  - id: trust-boundary
+    source: repo
+    why: matched via external-content tag (image decode of untrusted bytes). "Bound the payload" applies — the decompression-bomb dimension gate (upload_max_dimension, hard cap 1024) is UNCHANGED; new compress_max_dimension only shrinks WITHIN the accept ceiling, so decoded-pixel memory envelope is not widened.
+  - id: testing
+    source: repo
+    why: no-infra snapshot tests for the clamp getter (stickerSnapSettings); api-level integration tests inject fake settings + capturing service, no MySQL/Redis.
+  - id: commit-style
+    source: repo
+    why: English Conventional Commits (feat:).
+brief: .octospec/tasks/sticker-downscale-store/brief.md

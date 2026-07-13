@@ -113,6 +113,56 @@ func collectPlain(items []interface{}, segs *[]string) {
 			if sub, ok := el["items"].([]interface{}); ok {
 				collectPlain(sub, segs)
 			}
+		case "RichTextBlock":
+			// inlines 是字符串或 TextRun{text}。TextRun 不渲染 markdown（AC 语义），故直接
+			// 拼接文本、不走 stripMarkdown；整块作为一段。
+			if inlines, ok := el["inlines"].([]interface{}); ok {
+				var b strings.Builder
+				for _, it := range inlines {
+					switch inl := it.(type) {
+					case string:
+						b.WriteString(inl)
+					case map[string]interface{}:
+						if s, _ := inl["text"].(string); s != "" {
+							b.WriteString(s)
+						}
+					}
+				}
+				if t := strings.TrimSpace(b.String()); t != "" {
+					*segs = append(*segs, t)
+				}
+			}
+		case "ImageSet":
+			// 每张图一个 [图片] 占位（与单 Image 对等）。
+			if imgs, ok := el["images"].([]interface{}); ok {
+				for range imgs {
+					*segs = append(*segs, PlaceholderImage)
+				}
+			}
+		case "Table":
+			// 递归 rows→cells→items（与 Container/ColumnSet 同款内容遍历）。
+			if rows, ok := el["rows"].([]interface{}); ok {
+				for _, r := range rows {
+					row, ok := r.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					cells, ok := row["cells"].([]interface{})
+					if !ok {
+						continue
+					}
+					for _, c := range cells {
+						cell, ok := c.(map[string]interface{})
+						if !ok {
+							continue
+						}
+						if items, ok := cell["items"].([]interface{}); ok {
+							collectPlain(items, segs)
+						}
+					}
+				}
+			}
+		// ActionSet：动作（按钮）不参与 plain —— 按钮是操作面不是内容，无 case。
 		case "ColumnSet":
 			if cols, ok := el["columns"].([]interface{}); ok {
 				for _, c := range cols {

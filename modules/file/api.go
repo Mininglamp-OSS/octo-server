@@ -411,6 +411,11 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 	// 内联渲染端撑爆内存，而贴纸会发送给会话对方，等同跨用户 DoS。用 image.DecodeConfig
 	// 只读图像头拿 W×H（不解整图），任一边超过 stickerLimits.maxDim 即拒。此时 ext
 	// 已限定在配置允许的位图集合，对应解码器均已注册。
+	//
+	// stickerSrcMaxDim 记住源图单边像素上限，供压缩块之后的 fail-closed 守卫复用：
+	// 维度门对 jpg/png 放宽到 1024 的前提是"压缩会把它缩到 upload_max_dimension 内"，
+	// 该前提在 compressor==nil / skipped / failed 时不成立，届时用它判断是否拒绝。
+	var stickerSrcMaxDim int
 	if isStickerUpload {
 		cfg, _, decErr := image.DecodeConfig(file)
 		if decErr != nil {
@@ -423,7 +428,10 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 			c.ResponseError(errors.New("无法解析贴纸图像，可能已损坏或格式不受支持"))
 			return
 		}
-		if cfg.Width > stickerLimits.maxDim || cfg.Height > stickerLimits.maxDim {
+		// 维度门对 jpg/png 在压缩开启时放宽到 1024（随后 downscale 到 compress_max_dimension），
+		// gif/webp 及压缩关闭时仍用 upload_max_dimension —— 见 effectiveGateDim。
+		gateMaxDim := stickerLimits.effectiveGateDim(ext)
+		if cfg.Width > gateMaxDim || cfg.Height > gateMaxDim {
 			observeStickerUpload("dimension_rejected")
 			f.Warn("贴纸尺寸超出限制",
 				zap.String("uid", loginUID),
@@ -431,10 +439,11 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 				zap.Int64("size", fileHeader.Size),
 				zap.Int("width", cfg.Width),
 				zap.Int("height", cfg.Height),
-				zap.Int("max", stickerLimits.maxDim))
-			c.ResponseError(fmt.Errorf("贴纸尺寸不能超过 %d×%d 像素", stickerLimits.maxDim, stickerLimits.maxDim))
+				zap.Int("max", gateMaxDim))
+			c.ResponseError(fmt.Errorf("贴纸尺寸不能超过 %d×%d 像素", gateMaxDim, gateMaxDim))
 			return
 		}
+		stickerSrcMaxDim = max(cfg.Width, cfg.Height)
 		// DecodeConfig 读掉了图像头，复位指针供后续签名/上传读取完整内容。
 		if _, err := file.Seek(0, io.SeekStart); err != nil {
 			observeStickerUpload("read_failed")
@@ -474,6 +483,10 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 	// 压缩后的字节）。
 	var uploadReader io.ReadSeeker = file
 	finalSize := fileHeader.Size
+	// finalStoredMaxDim 是最终落库图像的单边像素上限。默认=源尺寸（所有"存原图"
+	// 分支：compressor==nil / skipped / failed / gif-webp / 压缩关闭）；仅 compressed
+	// 分支改成压后实际尺寸。压缩块之后据它 fail-closed 兜住超限图（见块后守卫）。
+	finalStoredMaxDim := stickerSrcMaxDim
 	if isStickerUpload && stickerLimits.compressEnabled && f.compressor != nil {
 		if canCompressStickerExt(ext) {
 			srcBytes, readErr := io.ReadAll(file)
@@ -489,6 +502,13 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 				observeStickerUpload("compress_success")
 				uploadReader = bytes.NewReader(result.Bytes)
 				finalSize = result.Size
+				// 只在 OutMaxDim 可信(>0)时用它做落库维度守卫；<=0 视为 compressor
+				// 未如约报告尺寸，回退到源尺寸（Fit 只会缩小，源尺寸是安全上界）——
+				// 超限源因此 fail-closed 被拒，而不是盲信 0 放行超限图（review P2
+				// 纵深防御，防未来 compressor 变体静默 fail-open）。
+				if result.OutMaxDim > 0 {
+					finalStoredMaxDim = result.OutMaxDim
+				}
 				f.Info("贴纸压缩成功",
 					zap.String("uid", loginUID),
 					zap.String("ext", ext),
@@ -529,6 +549,24 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 			// gif/webp 等本期不可压格式：只观测 skip，字节流不变，走 file 直上传路径。
 			observeStickerUpload("compress_skipped")
 		}
+	}
+
+	// sticker-oversized-store-guard：维度门为 jpg/png 放宽到接收硬上限(1024)的前提是
+	// 压缩会把它缩到 upload_max_dimension 内。凡压缩实际未缩到位——compressor==nil
+	// (整块跳过)、skipped(并发满/超时/animated)、failed(fail-open 存原字节)，或
+	// compress_max_dimension 被配得大于 upload_max_dimension 导致压后仍超——此处
+	// fail-closed 拒绝，避免存/发超过接收上限的大图（否则并发饱和/超时下就把 1024²
+	// 未压缩大图推给会话对端，正是维度门要防的跨用户 DoS）。gif/webp 与压缩关闭时门
+	// 未放宽，finalStoredMaxDim=源尺寸≤maxDim，天然不触发。
+	if isStickerUpload && finalStoredMaxDim > stickerLimits.maxDim {
+		observeStickerUpload("compress_oversized_rejected")
+		f.Warn("贴纸维度超出上限且未能压缩缩小，拒绝上传",
+			zap.String("uid", loginUID),
+			zap.String("ext", ext),
+			zap.Int("stored_max_dim", finalStoredMaxDim),
+			zap.Int("max", stickerLimits.maxDim))
+		c.ResponseError(fmt.Errorf("贴纸尺寸不能超过 %d×%d 像素", stickerLimits.maxDim, stickerLimits.maxDim))
+		return
 	}
 
 	var sign []byte

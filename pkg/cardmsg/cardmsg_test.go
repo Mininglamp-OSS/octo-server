@@ -113,7 +113,7 @@ func TestValidateWhitelistRejections(t *testing.T) {
 		want error
 	}{
 		{"Input.Text 元素", cardWithBody(map[string]interface{}{"type": "Input.Text", "id": "x"}), ErrCardUnknownElement},
-		{"Table 元素(1.6)", cardWithBody(map[string]interface{}{"type": "Table"}), ErrCardUnknownElement},
+		{"Media 元素(未支持,AC1.1)", cardWithBody(map[string]interface{}{"type": "Media"}), ErrCardUnknownElement},
 		{"Action.Submit", map[string]interface{}{"body": []interface{}{}, "actions": []interface{}{
 			map[string]interface{}{"type": "Action.Submit", "title": "OK"},
 		}}, ErrCardUnknownAction},
@@ -124,7 +124,12 @@ func TestValidateWhitelistRejections(t *testing.T) {
 			"type":         "Container",
 			"selectAction": map[string]interface{}{"type": "Action.Submit", "data": map[string]interface{}{}},
 		}), ErrCardUnknownAction},
-		{"ActionSet 不在白名单", cardWithBody(map[string]interface{}{"type": "ActionSet"}), ErrCardUnknownElement},
+		// Action.ToggleVisibility 现为 octo/v1 本地动作（见 local_actions_test.go 正/反用例）；
+		// 缺 targetElements 时按结构非法拒（不再是「未知动作」）。
+		{"Action.ToggleVisibility 缺 targetElements", cardWithBody(map[string]interface{}{
+			"type":         "Container",
+			"selectAction": map[string]interface{}{"type": "Action.ToggleVisibility"},
+		}), ErrCardBadShape},
 	} {
 		if err := Validate(envelope(tc.card)); !errors.Is(err, tc.want) {
 			t.Errorf("%s: err=%v want %v", tc.name, err, tc.want)
@@ -343,12 +348,12 @@ func TestRecheckPayloadSize(t *testing.T) {
 }
 
 func TestValidateProfileNegotiation(t *testing.T) {
-	// P1 接受集 = {octo/v1}(Decision 10 分期):octo/v2 与任何未知 profile
-	// 同样是 400 —— P2 sibling 实现 PR 把 octo/v2 加入接受集。
+	// P2 接受集 = {octo/v1, octo/v2}(D2)：octo/v2 现被接受（展示型 body 无交互
+	// 元素时也合法）；octo/v3 与任何未知 profile 仍是 400。
 	env := envelope(nil)
 	env["profile"] = "octo/v2"
-	if err := Validate(env); !errors.Is(err, ErrCardProfileUnsupported) {
-		t.Errorf("octo/v2 在 P1 应被拒(分期), err=%v", err)
+	if err := Validate(env); err != nil {
+		t.Errorf("octo/v2 应被接受(P2 D2), err=%v", err)
 	}
 	env["profile"] = "octo/v3"
 	if err := Validate(env); !errors.Is(err, ErrCardProfileUnsupported) {

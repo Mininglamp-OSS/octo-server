@@ -257,6 +257,120 @@ func (d *DB) QueryNonDeletedShortIDs(shortIDs []string) ([]string, error) {
 	return result, nil
 }
 
+// GroupShortIDRow 是 QueryNonDeletedShortIDsByGroupNos 内部的两列投影，只暴露
+// 包内使用。
+type GroupShortIDRow struct {
+	GroupNo string `db:"group_no"`
+	ShortID string `db:"short_id"`
+}
+
+// NonDeletedByGroupNosPerGroupHardLimit 是 QueryNonDeletedShortIDsByGroupNos
+// 在 DB 层的**每群**行数硬上限。它必须 >= caller 的语义 cap
+// (messages_search.maxThreadsPerGroup=200) + 1，让 caller 侧的
+// "len(shortIDs) > maxThreadsPerGroup" 分支仍能感知到超 cap 的群并降级 +
+// WARN（RC 2/3 on PR #553）。
+//
+// 选值 201 = maxThreadsPerGroup(200) + 1：每群只多拉 1 行做观测信号，绝
+// 大多数群完整返回，只有超 cap 的群会被截到 201 行触发 caller 降级。
+const NonDeletedByGroupNosPerGroupHardLimit = 201
+
+// nonDeletedByGroupNosUnionBatchSize 控制 QueryNonDeletedShortIDsByGroupNos
+// 一次 UNION ALL 合并的群数。单次查询 SQL 长度 ≈ batchSize × (~120
+// chars/subquery)；40 个群 ≈ 5KB SQL，远低于 MySQL max_allowed_packet
+// 默认值，又保证一个普通用户（基本不超 40 个群）只发一次 roundtrip。
+const nonDeletedByGroupNosUnionBatchSize = 40
+
+// NonDeletedByGroupNosDBHardLimit was the pre-RC3 global row cap on the
+// old single-query implementation (2500 rows aggregated across all groups
+// via `ORDER BY group_no LIMIT 2500`). It caused the P1 starvation blocker
+// yujiawei called on RC 3 of PR #553: a single fat group with ≥ 2500 rows
+// consumed the entire budget, and every other group returned zero rows
+// from the DB — zeroing thread coverage for the whole request.
+//
+// The implementation is now per-group (see the UNION ALL path above), so
+// this global cap is obsolete. Retained only to keep a stable Go symbol
+// path for any downstream references while the fix stabilises; the value
+// is not consumed by any code path any longer and should be deleted in a
+// follow-up.
+//
+// Deprecated: superseded by NonDeletedByGroupNosPerGroupHardLimit. Do not
+// consume; there is no code path that reads it.
+const NonDeletedByGroupNosDBHardLimit = 2500
+
+// QueryNonDeletedShortIDsByGroupNos 批量拉取一组 group 下 **status != deleted** 的
+// 子区 short_id（即 active + archived 都纳入，deleted 排除），返回 map[groupNo][]shortID。
+//
+// **语义理由（RC on PR #553）**：子区可见性契约在全局一致——只拒 deleted、允许访问
+// archived：
+//   - modules/messages/api_message_get.go:136-139（消息读）仅拒 ThreadStatusDeleted；
+//   - modules/messages_search/authz.go checkThreadAccess → modules/thread/service.go
+//     GetThread（service.go:102）：仅拒 deleted、返回 archived。
+//
+// 之前全局搜索用 status=active 变体，会把 archived 子区错误排除——归档子区
+// **单频道搜索能命中、全局搜不到**，破坏一致性。因为 archived 是 ArchiveStaleBatch
+// cron 例行转的（占比不小），影响面很大。
+//
+// **每群 LIMIT via UNION ALL (RC 3 on PR #553)**：使用 `SELECT ... WHERE
+// group_no = ? ... ORDER BY short_id LIMIT PerGroupHardLimit` 的 UNION ALL
+// 合并（按 nonDeletedByGroupNosUnionBatchSize 分批），严格约束**每个 group
+// 最多返回 NonDeletedByGroupNosPerGroupHardLimit (=201) 行**。上一版用
+// 「全局 LIMIT 2500 + ORDER BY group_no, short_id」会让 group_no 排在前面
+// 的大群把整个 budget 吃光，导致排在后面的正常群一行都拿不到——即使
+// caller 侧对大群做了 `continue` 降级，正常群也因为 `byGroup[gn]` 为空
+// 被静默跳过，全请求的 thread 覆盖归零。切成 per-group LIMIT 后：
+//   - 大群精准降级到 group-only（返回 201 行 → caller 感知超 cap → WARN
+//     + 跳过该群 thread），
+//   - 其他正常群完整返回，thread 覆盖照常上线，
+//   - 不再存在 group 之间「谁排前面谁吃掉预算」的相互饿死。
+//
+// UNION ALL (非 DISTINCT UNION) 避免不必要的去重；子查询需用括号包裹
+// 以避免 ORDER BY / LIMIT 被外层吃掉。兼容性上：MySQL 5.7 / 8.0 /
+// MariaDB 均支持（避开 window function 的 8.0-only 依赖）。
+//
+// 排序：子查询 ORDER BY short_id 保证每群返回的 shortID 集合确定，同
+// 一输入总是拿到同一 201 行子集。外层无 ORDER BY（返回 map 自然无序，
+// caller 自己重新按 groupNos 迭代）。
+//
+// 索引：uk_group_short(group_no, short_id) 对 (group_no=?, ORDER BY short_id)
+// 是覆盖索引，若硬件/优化器给力可完全跑 range scan + limit push-down；
+// (group_no, status) 过滤则无现成复合索引，若该路径变热应用 EXPLAIN
+// 复核并考虑 (group_no, status, short_id) 复合索引。每子查询工作集被
+// 201 行截住，全局工作集被 len(groupNos)*201 截住。
+//
+// 保护限制：空入参直接返回空 map，不下发 SQL；内部只取 (group_no, short_id) 两列。
+func (d *DB) QueryNonDeletedShortIDsByGroupNos(groupNos []string) (map[string][]string, error) {
+	out := make(map[string][]string)
+	if len(groupNos) == 0 {
+		return out, nil
+	}
+	for start := 0; start < len(groupNos); start += nonDeletedByGroupNosUnionBatchSize {
+		end := start + nonDeletedByGroupNosUnionBatchSize
+		if end > len(groupNos) {
+			end = len(groupNos)
+		}
+		batch := groupNos[start:end]
+		subqueries := make([]string, len(batch))
+		args := make([]interface{}, 0, len(batch)*3)
+		for i, gn := range batch {
+			subqueries[i] = "(SELECT group_no, short_id FROM thread WHERE group_no = ? AND status != ? ORDER BY short_id LIMIT ?)"
+			args = append(args, gn, ThreadStatusDeleted, NonDeletedByGroupNosPerGroupHardLimit)
+		}
+		query := strings.Join(subqueries, " UNION ALL ")
+		var rows []GroupShortIDRow
+		_, err := d.session.SelectBySql(query, args...).Load(&rows)
+		if err != nil {
+			return nil, fmt.Errorf("query non-deleted short ids by group nos: %w", err)
+		}
+		for _, r := range rows {
+			if r.GroupNo == "" || r.ShortID == "" {
+				continue
+			}
+			out[r.GroupNo] = append(out[r.GroupNo], r.ShortID)
+		}
+	}
+	return out, nil
+}
+
 // QueryActiveShortIDs 批量查询 status=active 的子区 shortID。
 // 用于 /v1/conversation/sync 过滤路径：archived/deleted 子区都不返回给客户端。
 // archived 子区由 server-side cron (#1376) 维护；收到消息时通过

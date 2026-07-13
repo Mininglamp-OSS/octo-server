@@ -1155,29 +1155,62 @@ func (g *Group) groupUpdate(c *wkhttp.Context) {
 		respondGroupInfoError(c, err)
 		return
 	}
-	// 查询是否是管理者
-	isManager, err := g.db.QueryIsGroupManagerOrCreator(groupNo, loginUID)
-	if err != nil {
-		g.Error("查询是否是群管理者失败！", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
-		return
-	}
-	if !isManager {
-		httperr.ResponseErrorL(c, errcode.ErrGroupManagerOnly, nil, nil)
-		return
-	}
-
+	// 先探测请求包含哪些字段，用于按字段档位做差异化权限校验。
 	// invite 属性不走 Service（Service 只处理 name/notice），仍走原有逻辑
 	inviteValue, hasInvite := groupMap[common.GroupAttrKeyInvite]
 	nameValue, hasName := groupMap[common.GroupAttrKeyName]
 	noticeValue, hasNotice := groupMap[common.GroupAttrKeyNotice]
+	avatarTextValue, hasAvatarText := groupMap[attrKeyAvatarText]
+	avatarColorValue, hasAvatarColor := groupMap[attrKeyAvatarColor]
+
+	// 权限分档：
+	//   高级字段（notice/invite/avatar_text/avatar_color）——仍需管理员/群主。
+	//   仅改名（只含 name、不含任何高级字段）——任何活跃人类成员即可，龙虾除外。
+	//   其它（既无 name 也无高级字段）——保守走管理员校验兜底。
+	hasAdvanced := hasNotice || hasInvite || hasAvatarText || hasAvatarColor
+	if hasAdvanced || !hasName {
+		isManager, err := g.db.QueryIsGroupManagerOrCreator(groupNo, loginUID)
+		if err != nil {
+			g.Error("查询是否是群管理者失败！", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+			return
+		}
+		if !isManager {
+			httperr.ResponseErrorL(c, errcode.ErrGroupManagerOnly, nil, nil)
+			return
+		}
+	} else {
+		// 仅改名：低风险写，内部活跃人类成员即可，龙虾(robot)不是普通成员，禁止其改名。
+		// 用 ExistMemberActiveInternal（带 is_external=0）而非 ExistMemberActive，保留旧
+		// QueryIsGroupManagerOrCreator 门禁的 is_external=0 边界，避免跨 Space 外部成员越权
+		// 改名（YUJ-231 / GH#1289，P1）。
+		isActive, err := g.db.ExistMemberActiveInternal(loginUID, groupNo)
+		if err != nil {
+			g.Error("查询是否是活跃群成员失败！", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+			return
+		}
+		if !isActive {
+			httperr.ResponseErrorL(c, errcode.ErrGroupNotMember, nil, nil)
+			return
+		}
+		// 龙虾(robot)排除：复用 Service.IsRobot 单一数据源，避免与其重复内联 SQL。
+		isBot, err := g.groupService.IsRobot(loginUID)
+		if err != nil {
+			g.Error("查询用户是否为龙虾失败！", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrGroupQueryFailed, nil, nil)
+			return
+		}
+		if isBot {
+			httperr.ResponseErrorL(c, errcode.ErrGroupNotMember, nil, nil)
+			return
+		}
+	}
 
 	// 自定义群头像文字/颜色（二次弹窗保存）：先在任何 mutation 之前完成解析与校验，构造
 	// avatarReq。这样非法的 avatar 字段会在 name/notice/invite 落库之前返回 400，避免
 	// 「返回 400 却已部分写入群名」的非原子部分写入。avatar_text 空串清除自定义文字（回退
 	// is_named 规则:老群群名/新群双人图标），avatar_color "" / "-1" 清除自定义色（回退派生）。超限直接拒绝，不静默截断。
-	avatarTextValue, hasAvatarText := groupMap[attrKeyAvatarText]
-	avatarColorValue, hasAvatarColor := groupMap[attrKeyAvatarColor]
 	var avatarReq *UpdateGroupAvatarCustomServiceReq
 	if hasAvatarText || hasAvatarColor {
 		avatarReq = &UpdateGroupAvatarCustomServiceReq{

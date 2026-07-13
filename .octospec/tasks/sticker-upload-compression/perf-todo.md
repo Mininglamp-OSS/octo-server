@@ -54,16 +54,38 @@ go test -run x -bench='BenchmarkDoCompressStaticSticker' -benchmem -benchtime=3s
 本地基线的 3× / 4× 因子的实测校正值。**若结果偏离本地估算 ±50%，需重新
 评估 concurrency / timeout 默认值**。
 
-- [ ] 生产型号 CPU 上跑一遍 bench，把六行结果贴到本文件
-- [ ] 若 PNG 1024² 单帧 > 1000 ms，把 `compress_timeout_ms` 默认调高到
-      3000 ms 再放量，否则频繁 skip:timeout 会让压缩形同虚设
+- [x] 生产型号 CPU 上跑一遍 bench，把六行结果贴到本文件（下表）
+- [x] 若 PNG 1024² 单帧 > 1000 ms，把 `compress_timeout_ms` 默认调高到
+      3000 ms 再放量 —— **不触发**：实测 PNG 1024² re-encode ≈ 196 ms ≪ 1000 ms。
+
+**实测结果（Intel Xeon @ 2.10GHz · 4C / 16GB · go1.25 linux/amd64 · benchtime=3s）：**
+
+| Benchmark                          | ns/op       | ~ms/op | alloc/op | vs M5 |
+| ---------------------------------- | ----------- | ------ | -------- | ----- |
+| JPEG 512² re-encode                | 20,566,280  | ~20.6  | 936 KB   | 1.71× |
+| PNG 512²  re-encode                | 51,683,464  | ~51.7  | 4.5 MB   | 1.72× |
+| JPEG 1024² → Fit(512) + re-encode  | 60,956,346  | ~61.0  | 5.6 MB   | 1.79× |
+| PNG  1024² → Fit(512) + re-encode  | 93,828,696  | ~93.8  | 11.2 MB  | 1.80× |
+| JPEG 1024² re-encode only          | 82,974,862  | ~83.0  | 3.7 MB   | 1.69× |
+| PNG  1024² re-encode only          | 195,586,513 | ~195.6 | 15.6 MB  | 1.76× |
+
+**结论：**
+- **实测慢化仅 ~1.7–1.8×**（文档原用 3× 保守估算）；偏差朝安全方向，**默认值无需重调**。
+- **最坏单帧 PNG 1024² ≈ 196 ms ≪ 1000 ms**，`compress_timeout_ms=2000` 有 ~10× 余量。
+- 单实例吞吐天花板（concurrency=4）：512² JPEG ≈ 200 QPS、512² PNG ≈ 77 QPS、
+  最坏 1024² PNG ≈ 20 QPS，均远高于业务贴纸创建速率；峰值内存 4×15.6 MB ≈ 60 MB 可控。
+- **注意**：当前实现下压缩 `maxDim` 与维度门 `upload_max_dimension` **同源**，`imaging.Fit`
+  在生产路径不触发，故「ShrinkTo512」两行是理论值——实际只命中 512²(默认) 或
+  1024² ReencodeOnly(maxDim 拉满) 两档。若后续做「大图缩小后存」（解耦
+  `compress_max_dimension`），ShrinkTo512 才成为实际路径，其成本已由上表覆盖。
 
 ### 2.2 pprof CPU / heap 剖面
 
-- [ ] `go test -run x -bench='BenchmarkDoCompressStaticSticker_PNG_1024' -cpuprofile=cpu.out`
-  → `go tool pprof -top cpu.out`，确认 CPU 时间主要在 imaging.Encode / Lanczos，
-  没有奇怪的框架开销
-- [ ] `-memprofile=mem.out`：确认 alloc/op 与 bench 报的一致；无异常泄漏
+- [x] `go test -run x -bench='BenchmarkDoCompressStaticSticker_PNG_1024' -cpuprofile=cpu.out`
+  → `go tool pprof -top cpu.out`：CPU ~100% 落在 PNG 编码链（`image/png.filter` 23.8%
+  + `flate.deflate` 34.6% + `paeth`/`abs8`/`filterPaeth` 等），**无异常框架开销**。✅
+- [~] `-benchmem` 已随上表采集 alloc/op（512² PNG 4.5 MB / 1024² PNG 15.6 MB，与 §1 同量级）；
+  独立 `-memprofile` 泄漏剖面待补。
 
 ### 2.3 端到端 HTTP 压测
 

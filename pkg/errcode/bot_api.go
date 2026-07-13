@@ -399,4 +399,18 @@ var (
 		HTTPStatus:     http.StatusBadRequest,
 		DefaultMessage: "Card messages cannot be edited yet.",
 	})
+	// ErrBotAPICardSeqConflict P2 D9：type-17 编辑体携带的 card_seq ≤ 已存值 ——
+	// 乱序/迟到帧，fail-closed 拒绝（bot 据此得知自己 raced），不覆盖已存帧。
+	ErrBotAPICardSeqConflict = register(codes.Code{
+		ID:             "err.server.bot_api.card_seq_conflict",
+		HTTPStatus:     http.StatusConflict,
+		DefaultMessage: "Card update rejected: stale card_seq.",
+	})
+	// ErrBotAPICardRevisionClearForbidden P2 D10.6：bot 只能清除自己发的卡片的
+	// 修订历史（属主校验失败 —— sender != 调用 bot）。
+	ErrBotAPICardRevisionClearForbidden = register(codes.Code{
+		ID:             "err.server.bot_api.card_revision_clear_forbidden",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "You can only clear revisions of your own cards.",
+	})
 )

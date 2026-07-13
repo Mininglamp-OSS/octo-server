@@ -34,7 +34,7 @@ func TestSingleMessageHit_ForwardCarriesInnerMessages(t *testing.T) {
 		},
 	}
 	h := &Handler{cfg: SearchConfig{}}
-	hit := h.singleMessageHit(doc, "G1", nil)
+	hit := h.singleMessageHit(doc, "G1", 0, nil)
 
 	if hit.MessageKind != "forward" {
 		t.Fatalf("kind: got %q", hit.MessageKind)
@@ -66,7 +66,7 @@ func TestSingleMessageHit_NonForwardHasNoInnerMessages(t *testing.T) {
 		Payload:   &Payload{Type: &tp, Text: &TextPayload{Content: "plain"}},
 	}
 	h := &Handler{cfg: SearchConfig{}}
-	hit := h.singleMessageHit(doc, "G1", nil)
+	hit := h.singleMessageHit(doc, "G1", 0, nil)
 	if hit.InnerMessages != nil {
 		t.Fatalf("text hit must not carry inner_messages: %+v", hit.InnerMessages)
 	}
@@ -209,7 +209,7 @@ func TestBuildMessageHits_EmptyMsgsHasNoInnerMessages(t *testing.T) {
 		},
 	}
 	h := &Handler{cfg: SearchConfig{}}
-	hit := h.singleMessageHit(doc, "G1", nil)
+	hit := h.singleMessageHit(doc, "G1", 0, nil)
 	if hit.InnerMessages != nil {
 		t.Fatalf("empty msgs[] must not surface inner_messages: %+v", hit.InnerMessages)
 	}

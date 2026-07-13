@@ -183,6 +183,12 @@ var systemSettingSchema = []settingDef{
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.StickerCompressMaxConcurrency()) }},
 	{Category: "sticker", Key: "compress_timeout_ms", Type: settingTypeInt, Description: "单次贴纸压缩超时(毫秒)；超时该请求跳过压缩走原路径(fail-open)；硬上限 10000，默认 2000", Positive: true,
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.StickerCompressTimeoutMs()) }},
+	// compress_max_dimension 是压缩缩放目标边长(仅静态 jpg/png)：压缩开启后，大于此
+	// 边长的静态图等比缩小到此值再重编码落库。默认 512 —— 让「>512 缩到 512」成为压缩
+	// 开启后的开箱行为。维度门对 jpg/png 在压缩开启时放宽到硬上限 1024(随后缩到此值)，
+	// gif/webp 及压缩关闭时仍受 upload_max_dimension 约束。硬上限 1024。
+	{Category: "sticker", Key: "compress_max_dimension", Type: settingTypeInt, Description: "贴纸压缩缩放目标边长(px，仅静态 jpg/png)；压缩开启后大于此值等比缩小再存；硬上限 1024，默认 512。建议 ≤ upload_max_dimension，否则压后仍超 upload_max_dimension 的图会被 fail-closed 拒绝", Positive: true,
+		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.StickerCompressMaxDimension()) }},
 
 	// Email server config — formerly yaml-only (Support.* in config.go).
 	{Category: "support", Key: "email", Type: settingTypeString, Description: "技术支持邮箱（发件人）",

@@ -34,6 +34,9 @@ func (p *countingProbe) UserDeletedSet(uid string, ids []string) (map[string]str
 	return map[string]struct{}{}, nil
 }
 func (p *countingProbe) ChannelOffset(uid, channelID string) (uint32, error) { return 0, nil }
+func (p *countingProbe) ChannelOffsets(uid string, channelIDs []string) (map[string]uint32, error) {
+	return map[string]uint32{}, nil
+}
 
 // Step 7 — the per-request MySQL join IN() list MUST stay bounded by
 // pageSize * oversampleMultiplier (one round's oversample fetch), NOT by the

@@ -180,6 +180,19 @@ func (d *DB) ExistMemberActive(uid string, groupNo string) (bool, error) {
 	return count > 0, err
 }
 
+// ExistMemberActiveInternal 是 ExistMemberActive 的收紧变体：在 is_deleted=0 AND
+// status=Normal 之外额外要求 is_external=0，即只把「内部活跃人类成员」视为存在。
+// 放开的群/子区改名门禁用它替代 ExistMemberActive，避免跨 Space 的外部成员
+// (is_external=1) 越权改名——旧的 QueryIsGroupManagerOrCreator 门禁本就带 is_external=0
+// 边界，放宽为活跃成员时必须保留该边界（YUJ-231 / GH#1289，P1）。
+func (d *DB) ExistMemberActiveInternal(uid string, groupNo string) (bool, error) {
+	var count int64
+	_, err := d.session.Select("count(*)").From("group_member").
+		Where("group_no=? and uid=? and is_deleted=0 and is_external=0 and status=?",
+			groupNo, uid, common.GroupMemberStatusNormal).Load(&count)
+	return count > 0, err
+}
+
 func (d *DB) existMembers(groupNos []string, uid string) ([]string, error) {
 	var results []string
 	_, err := d.session.Select("group_no").From("group_member").Where("group_no in ? and uid=? and is_deleted=0", groupNos, uid).Load(&results)

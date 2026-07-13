@@ -819,6 +819,13 @@ const (
 	defaultStickerUploadMaxDimension = 512
 	stickerUploadMaxDimensionHardCap = 1024
 
+	// StickerUploadMaxDimensionHardCap is the exported alias of the decoded-pixel
+	// dimension hard cap (== stickerUploadMaxDimensionHardCap). modules/file
+	// references it so the compressible-accept ceiling shares this single source
+	// of truth rather than re-declaring a bare 1024 literal (review finding: a
+	// hand-synced duplicate could silently drift and re-widen the bomb gate).
+	StickerUploadMaxDimensionHardCap = stickerUploadMaxDimensionHardCap
+
 	defaultStickerCompressEnabled = false
 
 	defaultStickerCompressTargetKB = 1024
@@ -829,6 +836,13 @@ const (
 
 	defaultStickerCompressTimeoutMs = 2000
 	stickerCompressTimeoutMsHardCap = 10000
+
+	// defaultStickerCompressMaxDimension is the shrink target the compressor
+	// downscales static jpg/png into. 512 makes ">512 shrinks to 512" the built-in
+	// behavior once compression is enabled. Its hard cap is
+	// stickerUploadMaxDimensionHardCap (1024) — shrink target and compressible-accept
+	// ceiling share the decoded-pixel bound.
+	defaultStickerCompressMaxDimension = 512
 )
 
 // stickerUploadRasterAllowlist 与 modules/file/const.go:stickerUploadExts 保持一致。
@@ -970,5 +984,26 @@ func (s *SystemSettings) StickerCompressTimeoutMs() int {
 		s.getInt("sticker", "compress_timeout_ms", defaultStickerCompressTimeoutMs),
 		defaultStickerCompressTimeoutMs,
 		stickerCompressTimeoutMsHardCap,
+	)
+}
+
+// StickerCompressMaxDimension returns the target single-edge length the
+// compressor downscales static jpg/png INTO (sticker-downscale-store /
+// sticker-oversized-default). It is the SHRINK target the compressor's
+// imaging.Fit fits into, decoupled from the upload dimension gate.
+//
+// Read-side clamped to [1, stickerUploadMaxDimensionHardCap] (the 1024
+// decoded-pixel hard cap — the compressible-accept ceiling and the shrink target
+// share that bound); unset / ≤0 / non-numeric falls back to the 512 default,
+// which makes ">512 static jpg/png shrinks to 512" the built-in behavior once
+// compression is enabled. NOT tied to upload_max_dimension: the dimension gate
+// admits compressible formats up to the hard cap (see modules/file
+// effectiveGateDim) and this value only decides how far they are shrunk before
+// store.
+func (s *SystemSettings) StickerCompressMaxDimension() int {
+	return s.stickerClampIntUpper("sticker.compress_max_dimension",
+		s.getInt("sticker", "compress_max_dimension", defaultStickerCompressMaxDimension),
+		defaultStickerCompressMaxDimension,
+		stickerUploadMaxDimensionHardCap,
 	)
 }
