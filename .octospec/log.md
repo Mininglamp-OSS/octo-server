@@ -4,6 +4,20 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-13 (card-message-appbot-trust)
+
+- **Fix** — Closed the P0 App Bot card trust split without changing the send
+  pipeline: added a cache-free `modules/botidentity` authority over active
+  `robot` and published `app_bot` rows (same-statement ambiguity detection,
+  `user.robot` never authorizes), moved `cardtrust` display masking onto it while
+  retaining the 60-second bounded cache, and made `card/action` resolve sender
+  identity live before enqueueing through the unchanged robot event queue. Added
+  push/search projection coverage plus App Bot unpublish/republish and full
+  action -> poll -> ACK lifecycle tests. `internal/carddispatch` remains a
+  separate task. Brief/context under
+  `.octospec/tasks/card-message-appbot-trust/`; shared journal
+  `.octospec/journal/shared/card-message-appbot-trust.md`.
+
 ## 2026-07-09 (sticker-oversized-store-guard)
 
 - **Fix** — Task `sticker-oversized-store-guard` (code-review fix on
