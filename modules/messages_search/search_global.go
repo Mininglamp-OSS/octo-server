@@ -385,6 +385,11 @@ func (h *Handler) resolveGlobalScope(c *wkhttp.Context, loginUID string, channel
 	scope := allowSet
 	if len(channelIDs) > 0 {
 		requested := make(map[string]channelRef, len(channelIDs))
+		// requestedGroups collects the OS channelId (== group_no) of every
+		// channel_ids entry that named a group (channelType=2). A selected
+		// group implicitly covers its sub-threads (bug 4), so we fold those in
+		// below before intersecting with the allowlist.
+		requestedGroups := make(map[string]struct{})
 		for _, ref := range channelIDs {
 			id := strings.TrimSpace(ref.ChannelID)
 			if id == "" {
@@ -400,6 +405,34 @@ func (h *Handler) resolveGlobalScope(c *wkhttp.Context, loginUID string, channel
 				wireID = id
 			}
 			requested[osID] = channelRef{OSChannelID: osID, WireID: wireID, ChannelType: ref.ChannelType}
+			if ref.ChannelType == channelTypeGroup {
+				requestedGroups[osID] = struct{}{}
+			}
+		}
+		// Bug 4: selecting a group must search the group body AND all of its
+		// sub-threads, mirroring what the frontend's "所在群聊或子区" filter
+		// implies. Thread channelIds live in allowSet keyed as the composite
+		// `{group_no}____{short_id}` (channelType=5); fold every allowlisted
+		// thread whose parent group was requested into the requested set so the
+		// terms(channelId) clause spans group + threads. Sourcing them from
+		// allowSet (rather than a fresh enumerateThreadsForGroups call) means we
+		// inherit the membership gate + the per-group / aggregate thread caps
+		// buildAllowlist already applied, with no extra DB round-trip. A thread
+		// selected directly (channelType=5) is unaffected: it is not a group, so
+		// it never seeds requestedGroups and stays scoped to itself alone.
+		if len(requestedGroups) > 0 {
+			for osID, ref := range allowSet {
+				if ref.ChannelType != channelTypeThread {
+					continue
+				}
+				groupNo, _, err := thread.ParseChannelID(osID)
+				if err != nil {
+					continue
+				}
+				if _, ok := requestedGroups[groupNo]; ok {
+					requested[osID] = ref
+				}
+			}
 		}
 		// Allowlist ∩ requested — anything the caller cannot read is silently
 		// dropped (per §6.3, an unreachable channel_id is NOT a rejection).
