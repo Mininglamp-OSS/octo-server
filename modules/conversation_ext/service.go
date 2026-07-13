@@ -1000,11 +1000,23 @@ func (s *Service) FollowThread(uid, spaceID, threadChannelID string) error {
 // unfollowed parent group back into the follow tab. This method touches ONLY the
 // thread row.
 //
-// spaceID must be the creator's effective space for the parent group (the same
-// value the fanout stores), so the row surfaces under the sidebar's space filter.
-// An empty spaceID is permitted for legacy (space-less) groups, matching the
-// fanout口径; hence validateBase (which rejects empty space_id) is intentionally
-// not used here.
+// spaceID must be the space under which the sidebar reads this creator's thread
+// rows, so the row surfaces under the sidebar's space filter (ListThreadExts
+// `WHERE space_id=?`). For a modern group that is the creator's effective space
+// (internal member = group space_id, external member = source_space_id). For a
+// legacy (space-less) group the effective space is empty, but modern clients read
+// legacy groups under the reader's NON-empty default space (#484); the caller
+// (thread.resolveCreatorBackfillSpaceID) is therefore responsible for normalizing
+// that path to the creator's default space before calling this method — otherwise
+// a row written at space_id='' is filtered out in SQL and the creator never sees
+// their own thread (issue #557).
+//
+// An empty spaceID is still *accepted* here (validateBase, which rejects empty
+// space_id, is intentionally not used) so this method stays a robust idempotent
+// primitive; but note the auto_follow fanout never stores space_id='': its source
+// group ext rows are only written by follow paths that all go through validateBase,
+// so the earlier "matches the fanout 口径 for empty space" rationale was wrong —
+// fanout always stores a non-empty space, and this backfill must match it.
 //
 // Idempotent: the ext write is an INSERT IGNORE (upsertTx with no field changes),
 // so a repeated call — or a race with the OnThreadCreated fanout that already

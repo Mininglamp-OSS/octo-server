@@ -46,9 +46,20 @@ import (
 // issue557DBName 是本文件专用隔离库名（与共享 test 库、别包迁移/查询完全隔离）。
 const issue557DBName = "octo_msg_issue557_test"
 
-// issue557SpaceID 用空串：模拟历史无 Space 群（legacy wildcard），与
-// GetMemberExternalFields 对内部成员返回的 effective space（群 space_id=""）一致，
-// 保证 EnsureThreadFollowForCreator 落行的 space 与读侧 ListThreadExts 一致。
+// issue557SpaceID 用空串：本 E2E 覆盖「写侧落行 space == 读侧 ListThreadExts space」
+// 的同 space 渲染路径（CreateThread → follow tab 渲染）。
+//
+// ⚠️ 注意（reviewer yujiawei P1）：**空串让写==读，恰好绕过了 legacy 群的真实 bug**。
+// 真实缺陷是：legacy 群（group.space_id=''）里内部成员建子区时，写侧 effective space
+// 为空，但现代客户端读 legacy 群时带的是**非空** default space（#484 口径），
+// ListThreadExts 的 `WHERE space_id=?` 在 SQL 层丢掉 space_id='' 的补行——即写≠读。
+// 本 E2E 不 seed 创建者的 space_member，故写侧归一化（thread.resolveCreatorBackfillSpaceID）
+// 因拿不到 default space 而 no-op 保持 ''，写读仍然都为 ''，**不覆盖**该 legacy 非空读场景。
+//
+// 该 legacy 非空读场景的确定性覆盖放在 thread 包的纯 DB 测试
+// Test_Issue557_LegacyGroup_CreatorBackfillSurvivesSpaceScopedRead（只需 MySQL，不依赖
+// WuKongIM / conv_ext 单例，`-shuffle=on` 下无条件运行，直接命中 SQL 过滤层）。本 E2E
+// 仅补充「CreateThread → 端到端渲染」的同 space 路径断言。
 const issue557SpaceID = ""
 
 // issue557RequireIM 探测 WuKongIM：不可达即 skip（CreateThread 会真实建子区频道）。
