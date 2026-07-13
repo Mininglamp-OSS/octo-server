@@ -326,6 +326,27 @@ jobs:
       - name: Reject direct PERSONAL MsgSendReq literals
         run: go run ./tools/lint-personal-msgsendreq ./modules
 
+  card-dispatch-lint:
+    needs: [changes]
+    if: |
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      needs.changes.outputs.code == 'true'
+    # Internal card producers must use the producer-bound carddispatch sender.
+    # This AST guard is a review backstop for recognizable type-17 construction
+    # and transport flows; runtime payload passthrough is guarded at ingress.
+    name: Card Dispatch Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Reject unreviewed internal type-17 transport owners
+        run: make card-dispatch-lint
+
   i18n-extract-check:
     needs: [changes]
     if: |

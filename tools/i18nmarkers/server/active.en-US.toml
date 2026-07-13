@@ -588,6 +588,9 @@ other = "Search service is temporarily unavailable."
 ["err.server.messages_search.validation_failed"]
 other = "Invalid search request."
 
+["err.server.notify.card_not_allowed"]
+other = "Card payloads are not allowed on the internal notification endpoint."
+
 ["err.server.oidc.bind_already_bound"]
 other = "This identity is already bound. Please sign in via OIDC to continue."
 

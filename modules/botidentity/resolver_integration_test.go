@@ -20,21 +20,21 @@ func TestResolverAgainstAuthoritativeBotTables(t *testing.T) {
 	conn.SetMaxOpenConns(1)
 	t.Cleanup(func() { _ = conn.Close() })
 	session := conn.NewSession(nil)
-	_, err = session.Exec("CREATE TABLE robot (robot_id TEXT PRIMARY KEY, status INTEGER NOT NULL)")
+	_, err = session.Exec("CREATE TABLE robot (robot_id TEXT PRIMARY KEY, status INTEGER NOT NULL, creator_uid TEXT NOT NULL DEFAULT '')")
 	require.NoError(t, err)
-	_, err = session.Exec("CREATE TABLE app_bot (uid TEXT PRIMARY KEY, status INTEGER NOT NULL)")
+	_, err = session.Exec("CREATE TABLE app_bot (uid TEXT PRIMARY KEY, status INTEGER NOT NULL, scope TEXT NOT NULL DEFAULT 'platform', space_id TEXT)")
 	require.NoError(t, err)
 	_, err = session.Exec("CREATE TABLE user (uid TEXT PRIMARY KEY, robot INTEGER NOT NULL, status INTEGER NOT NULL)")
 	require.NoError(t, err)
 
 	insertRobot := func(uid string, status int) {
 		t.Helper()
-		_, err := session.InsertBySql("INSERT INTO robot(robot_id,status) VALUES(?,?)", uid, status).Exec()
+		_, err := session.InsertBySql("INSERT INTO robot(robot_id,status,creator_uid) VALUES(?,?,?)", uid, status, "owner-"+uid).Exec()
 		require.NoError(t, err)
 	}
 	insertAppBot := func(uid string, status int) {
 		t.Helper()
-		_, err := session.InsertBySql("INSERT INTO app_bot(uid,status) VALUES(?,?)", uid, status).Exec()
+		_, err := session.InsertBySql("INSERT INTO app_bot(uid,status,scope,space_id) VALUES(?,?,?,?)", uid, status, "space", "space-a").Exec()
 		require.NoError(t, err)
 	}
 
@@ -85,6 +85,13 @@ func TestResolverAgainstAuthoritativeBotTables(t *testing.T) {
 			require.NotNil(t, got)
 			assert.Equal(t, tt.uid, got.UID)
 			assert.Equal(t, tt.wantKind, got.Kind)
+			if tt.wantKind == KindUserBot {
+				assert.Equal(t, "owner-"+tt.uid, got.CreatorUID)
+			}
+			if tt.wantKind == KindAppBot {
+				assert.Equal(t, ScopeSpace, got.AppScope)
+				assert.Equal(t, "space-a", got.AppSpaceID)
+			}
 		})
 	}
 }

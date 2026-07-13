@@ -19,8 +19,10 @@ import (
 	libwkhttp "github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/server"
 	_ "github.com/Mininglamp-OSS/octo-server/internal"
+	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
 	commonapi "github.com/Mininglamp-OSS/octo-server/modules/base/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	"github.com/Mininglamp-OSS/octo-server/modules/botidentity"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/accesslog"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
@@ -220,6 +222,13 @@ func runAPI(ctx *config.Context) {
 	// 由 sticker 模块在 New() 时落值——策略源在 system_setting(common 模块),故不在此组合根
 	// 设置,避免反向依赖 modules/sticker。
 	metrics.NewStickerMetrics(prometheus.DefaultRegisterer)
+	// Install the one process registry before register.GetModules constructs
+	// module instances. The foundation rollout deliberately has no production
+	// producer registrations; later enablement injects only a bound Sender into
+	// its owning module after the cross-repository route/contract gates pass.
+	if err := installCardDispatch(ctx); err != nil {
+		panic(fmt.Errorf("install internal card dispatch registry: %w", err))
+	}
 	// 构造进程级共享头像渲染缓存,并把观测 hooks 接到上面注册的头像指标。所有头像端点
 	// (user 的 UserAvatar;群组头像渲染合并后亦然——#478)经 avatarrender.GetOrRender
 	// 共用这一个实例:共享 LRU + 同一个渲染信号量(后者唯一,才是真正的进程级渲染并发
@@ -332,6 +341,18 @@ func runAPI(ctx *config.Context) {
 	if err != nil {
 		panic(err)
 	}
+}
+
+func installCardDispatch(ctx *config.Context) error {
+	deps := carddispatch.Dependencies{
+		IdentityResolver: botidentity.New(ctx),
+		Authorizer:       carddispatch.NewDBAuthorizer(ctx.DB()),
+		Transport:        ctx,
+		Metrics:          carddispatch.NewMetrics(prometheus.DefaultRegisterer),
+		Logger:           log.NewTLog("CardDispatch"),
+	}
+	registry := carddispatch.NewRegistry(deps, nil)
+	return carddispatch.Install(ctx, registry)
 }
 
 func printServerInfo(ctx *config.Context) {

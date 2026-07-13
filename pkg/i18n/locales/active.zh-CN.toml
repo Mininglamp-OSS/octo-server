@@ -39,6 +39,9 @@ other = "资源不存在。"
 ["err.shared.internal"]
 other = "服务器内部错误。"
 
+["err.server.notify.card_not_allowed"]
+other = "内部通知接口不允许发送卡片消息。"
+
 ["err.server.thread.group_no_invalid"]
 other = "群编号无效。"
 

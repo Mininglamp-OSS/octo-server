@@ -1,12 +1,12 @@
 ---
 type: Task
 title: "Task: card-message-internal-dispatch"
-description: Add the only supported in-process path for business modules to send trusted interactive cards.
+description: Add the only supported in-process path for business modules to send trusted interactive cards, grounded in the summary-forward and docs-share scenarios.
 tags: ["message", "card", "internal", "trust-boundary", "wire-contract", "auth", "space", "isolation", "acl", "rate-limit", "observability", "testing"]
-timestamp: 2026-07-13T16:17:40+08:00
+timestamp: 2026-07-13T17:00:00+08:00
 # --- octospec extension fields ---
 slug: card-message-internal-dispatch
-upstream: self
+upstream: octo-server#571
 source: self
 ---
 
@@ -18,7 +18,10 @@ source: self
 ## Goal
 
 Add `internal/carddispatch` as the only supported path for an in-process
-business module to originate an `InteractiveCard` (`type=17`) message.
+business module to originate an `InteractiveCard` (`type=17`) message, so that
+server-side scenarios — smart-summary results delivered/forwarded into chats as
+cards, docs share-link cards, and future system cards — have one reviewed,
+trusted origination boundary instead of ad-hoc sends.
 
 The dispatcher binds a reviewed producer capability to one configured active
 bot identity, authorizes the exact Space and target using live database state,
@@ -28,16 +31,88 @@ size recheck in a fixed order, makes at most one `SendMessageWithResult`
 transport attempt per invocation, and emits bounded metrics and structured
 logs.
 
-This closes the architectural hole where a future business module could call
-`config.Context.SendMessageWithResult` directly with a hand-built type-17 map
-and accidentally skip sender trust, Space/target ACLs, authoritative `plain`, or
-the final post-mutation 512 KiB check.
+This closes the architectural hole where a business module (or an internal
+S2S caller relaying through one) could reach `config.Context.SendMessage` /
+`SendMessageWithResult` with a hand-built type-17 map and skip sender trust,
+Space/target ACLs, authoritative `plain`, or the final post-mutation 512 KiB
+check. The cross-repo research below shows this hole is not hypothetical:
+`POST /v1/internal/notify` already forwards a caller-supplied payload map
+verbatim as the trusted `notification` User Bot (Decision 14 closes that
+specific gap in this task).
 
-No HTTP endpoint is added. Existing Bot API, legacy Robot API, and Incoming
-Webhook producers keep their current ingress-specific paths in this task; the
-new boundary governs server-internal business producers.
+No new HTTP endpoint is added. Existing Bot API, legacy Robot API, and
+Incoming Webhook producers keep their current ingress-specific paths in this
+task; the new boundary governs server-internal business producers. The only
+behavior change to an existing endpoint is the fail-closed card-payload
+rejection on `/v1/internal/notify` (Decision 14).
 
 ## Background
+
+### Cross-repo scenario research (2026-07-13)
+
+The two motivating scenarios were traced end-to-end across the four repos.
+
+**Scenario A — 智能总结投递/转发到会话 (smart-summary → chat):**
+
+- `octo-smart-summary` is a standalone Go sidecar (separate binaries
+  `summary-api` / `summary-worker`), not an octo-server module. After a summary
+  task terminates, the worker pushes a **plain-text DM** itself:
+  `POST {OCTO_API_URL}/v1/internal/notify` with header `X-Internal-Token`
+  (`SUMMARY_NOTIFY_TOKEN`), body payload hardcoded to `{"type":1,"content":…}`
+  (`internal/notify/notify.go:283-291`, `internal/notify/client.go:83,156`).
+  Per-recipient dedup/retry state lives in its `summary_notification` table.
+- Delivery back into the **origin group/thread** is explicitly a future
+  enhancement (`internal/notify/target.go:34-37`); today every origin falls
+  back to a creator DM. The repo has zero card/type-17 code.
+- On the octo-server side, `modules/notify` owns that ingress:
+  `POST /v1/internal/notify` and `/v1/internal/notify/batch`
+  (`modules/notify/api.go:90-95`), gated by `NOTIFY_INTERNAL_TOKEN`
+  (fail-closed when unset, constant-time compare). It verifies Space
+  membership, then fans out **DM-only** sends via
+  `config.NewPersonalMsgSendReq` from the static system bot
+  `notification` with a bounded 20-goroutine pool (`api.go:243-303`).
+- The `notification` sender is a **full User Bot**: `ensureNotifyBot`
+  provisions the `user` row, `app` row, and a `robot` row with `status=1`
+  (`modules/notify/bot_manager.go:52-87`). `modules/botidentity` therefore
+  resolves it as an active bot and `modules/cardtrust` trusts it as a card
+  sender.
+- In `octo-web`, "转发到聊天" for a summary sends the summary text as plain
+  `MessageText` chunks via the WuKongIM JS SDK
+  (`packages/dmworksummary/src/pages/SummaryDetailPage.tsx:1018-1043`).
+
+**Scenario B — docs 文档分享链接卡片 (docs share-link card):**
+
+- `octo-docs-backend` (TypeScript/Hocuspocus) has **no outbound IM capability
+  at all** — stated in source (`src/api/routes/accessRequests.ts:13-17`); its
+  octo-server integration is identity-only (token→uid, uid→profile). Share-to-
+  chat is split: docs-backend authorizes recipients (`forward-grant`, invite
+  tokens); the message itself is sent by the web client.
+- In `octo-web`, doc sharing sends a plain `MessageText` whose body is
+  Markdown `**title**\n[url](<url>)` via the JS SDK
+  (`packages/dmworkbase/src/Components/WKBase/index.tsx` `runDocForward`,
+  `ForwardModal/forwardMessageText.ts:55-58`). There is no link-card/unfurl
+  rendering.
+
+**Established platform facts relevant to both:**
+
+- The web client is **receive/render-only** for type-17 by design ("波 1 web
+  不发送 type-17", `packages/dmworkbase/src/Messages/InteractiveCard/`
+  `InteractiveCardContent.ts:22,59`); only re-forwarding an already-received
+  display-only card exists. So every card origination for these scenarios must
+  happen server-side — exactly the boundary this task builds.
+- Inside octo-server, only three modules can emit type-17 today, each with its
+  own ingress trust: `modules/bot_api/send.go`, `modules/robot/api.go`,
+  `modules/incomingwebhook`. All other `SendMessage*` call sites send fixed
+  non-card types from static system identities (`notify`, `botfather`,
+  `app_bot` welcome, group/thread/user system tips).
+- **Live gap:** `modules/notify.deliverNotification` forwards the
+  caller-supplied payload map to transport without any type restriction. A
+  holder of `NOTIFY_INTERNAL_TOKEN` can thus emit a hand-built `type=17` map
+  as the **trusted** `notification` bot, skipping `cardmsg.Enabled`,
+  `Validate`, `Finalize`, authoritative `plain`, and the 512 KiB gates. The
+  planned AST guard cannot see this shape (no card construction in
+  octo-server source — the map arrives over HTTP), so it needs the runtime
+  gate in Decision 14.
 
 ### Existing authoritative pieces
 
@@ -46,7 +121,10 @@ new boundary governs server-internal business producers.
   - `Validate` enforces the profile/version, structure, URL, depth/node and
     complete-payload limits;
   - `Finalize` overwrites untrusted `plain` and rechecks the enriched payload;
-  - `RecheckPayloadSize` checks the final bytes after any later mutation.
+  - `RecheckPayloadSize` checks the final bytes after any later mutation;
+  - `IsCardPayload` / `IsCardRawPayload` are the single card-shape detectors;
+  - profiles: `octo/v1` is display-only, `octo/v2` is the only interactive
+    profile (`profiles.go:19-22`).
 - `modules/botidentity` resolves live bot authority:
   `robot.status=1` or `app_bot.status=1`; `user.robot=1` is presentation only;
   ambiguous or failed lookups fail closed.
@@ -55,6 +133,10 @@ new boundary governs server-internal business producers.
   - `modules/bot_api/send.go`;
   - `modules/robot/api.go`;
   - `modules/incomingwebhook/api.go` + `card.go`.
+- `modules/notify` owns the internal S2S notification ingress
+  (`/v1/internal/notify*`, `X-Internal-Token`) and the static `notification`
+  User Bot (see research above). It is an existing trust surface of this
+  boundary, not a card producer.
 - `pkg/cardmsg/producer_completeness_test.go` already proves every producer that
   expands `mention.ais` performs a final size recheck. It does not prevent a new
   internal producer from bypassing all of the other gates.
@@ -66,35 +148,262 @@ new boundary governs server-internal business producers.
 
 ### Why this is a separate P0
 
-The App Bot trust task fixes consumers of already-sent cards. It deliberately
-does not authorize new in-process producers. Internal dispatch is a separate
-load-bearing boundary: a server module is not authenticated by Bot API
-middleware, so it needs an explicit producer capability and cannot inherit
-HTTP-layer bot/Space checks by accident.
+The App Bot trust task (card-message-appbot-trust, PR #570 lineage) fixes
+consumers of already-sent cards — display masking and the `card_action` gate.
+It deliberately does not authorize new in-process producers. Internal dispatch
+is a separate load-bearing boundary: a server module is not authenticated by
+Bot API middleware, so it needs an explicit producer capability and cannot
+inherit HTTP-layer bot/Space checks by accident.
 
-### Implementation gate: pilot producer must be named
+### Industry practice alignment
 
-Before `/octospec-go card-message-internal-dispatch` enables a pilot producer, a
-maintainer must replace the following `TBD` values in this brief. A deliberately
-dormant foundation may leave them unresolved, but it must register no production
-producer. Do not implement a mutable generic "send as any UID" service while
-they are unknown.
+The design was cross-checked against the public behavior of major IM
+platforms (Slack Block Kit, Feishu/Lark interactive cards, DingTalk robots,
+Microsoft Teams Adaptive Cards — the same card family octo uses). The core
+decisions match established practice:
 
-| Required input | Value |
+- Rich interactive messages are bot/app-only origination; human clients cannot
+  forge them — matches Decision 2.
+- Channel authorization is checked live at send time (Slack `not_in_channel`;
+  Feishu/DingTalk bots must be members of a group before posting into it) —
+  matches Decision 4. For posting **without** membership, DMWork adopts the
+  reviewed member-exempt mode analogous to Slack's `chat:write.public`
+  (no-join posting to public channels), scoped to normal in-Space groups with
+  a recorded triggering member action since DMWork has no public/private
+  split; Feishu/DingTalk reach the same user-visible end state by keeping
+  group robots outside the member list/count.
+- Fallback text next to the rich body is app/platform-authored (Slack `text`
+  alongside blocks; Teams/Feishu card summaries on push surfaces) — matches
+  authoritative `plain`.
+- Interaction callbacks route only to the app that owns the message, and
+  webhook-only identities cannot receive interactions (Teams Incoming Webhook
+  cards cannot carry `Action.Submit`; Feishu custom group bots send
+  non-interactive cards only) — matches Decision 5 and the existing `iwh_`
+  restriction.
+- The platform boundary does schema validation plus hard size caps (Teams
+  ≈28 KB per card, Slack block-count/length limits) — the 512 KiB
+  `pkg/cardmsg` cap is permissive by comparison, not aggressive.
+- First-party traffic goes through the same gateway as third-party traffic (no
+  internal bypass) — matches Decisions 12 and 14.
+- postMessage-style send APIs are not idempotent; retry semantics live in the
+  caller — matches Decision 8.
+
+Two places this design is deliberately weaker than public platforms, declared
+here rather than discovered later:
+
+- **No per-channel send-rate control** (Slack enforces ≈1 msg/s/channel;
+  DingTalk webhooks 20 msg/min/group). Acceptable for the DM-only pilot; a
+  reviewed per-channel rate rule is a **precondition of widening any producer
+  to group/thread targets**.
+- **No cluster-wide quota** — Decision 9's semaphore is per process, while
+  public platform quotas are global. The cluster-cap decision is likewise part
+  of the group/thread widening review, not this task.
+
+## Method: how a scenario onboards (方法概览)
+
+The supported end-to-end path for "some internal service wants to send a card"
+is fixed by this task:
+
+```
+external sidecar service            octo-server process
+(smart-summary, docs-backend, …)
+        │  internal S2S ingress            ┌─────────────────────────────┐
+        └─ X-Internal-Token endpoint ────▶ │ owning business module      │
+           (or the feature is already      │  holds a producer-bound     │
+            in-process: no ingress hop)    │  carddispatch.Sender        │
+                                           └──────────────┬──────────────┘
+                                                          ▼
+                                           internal/carddispatch pipeline:
+                                           producer gate → live bot identity
+                                           → live Space/target ACL → envelope
+                                           → Validate → enrich → Finalize
+                                           → size recheck → ONE transport call
+```
+
+- The **producer** is always an octo-server module (the ingress endpoint's
+  owner for sidecar-driven scenarios; the feature module itself for in-process
+  scenarios). Sidecar services never hold card-send authority directly; their
+  S2S token authenticates them to their ingress module only.
+- The **sender identity** is always a configured active bot resolved live via
+  `modules/botidentity` — never a human UID, never caller-supplied.
+- The web client stays receive-only for type-17; no client card-send path is
+  introduced for these scenarios.
+
+Applied to the motivating scenarios (Scenario A splits into two sub-paths
+with different readiness):
+
+- **Pilot — `summary-notify` (Scenario A1, worker-driven notification):**
+  `modules/notify` becomes the first producer. The existing summary
+  completion/failure DM upgrades from plain text to a display-only (`octo/v1`)
+  card; the sender is a **dedicated `summary` bot** (decided 2026-07-13;
+  provisioning mirrors the `ensureNotifyBot` user+app+robot pattern), while
+  the generic text-notification path keeps the `notification` bot unchanged.
+  The ingress, token, membership verification, and smart-summary's retry/dedup
+  state machine all stay as they are. When smart-summary later implements
+  origin group/thread回发, the same producer widens its allowed channel types
+  in a separate reviewed change — that review must also settle the per-channel
+  rate rule and cluster-cap questions (see Industry practice alignment), and
+  the delivery policy is **member-exempt posting to the origin group**
+  (Decision 4 mode, confirmed 2026-07-13): the bot never joins — member list
+  and 群人数 are untouched — consent comes from the creating member having
+  bound the task to that group, the dispatcher re-verifies group lifecycle
+  and exact Space at send time, and delivery falls back to the creator DM
+  when the group is no longer eligible. The dispatcher's group/thread
+  authorization rules (Decision 4) are specified now so that widening is a
+  config review, not a design change.
+- **Candidate — `summary-forward-card` (Scenario A2, user-triggered
+  转发到聊天):** today the web client sends the summary as plain-text chunks
+  itself; the web cannot and will not send type-17, so a card version means
+  "human triggers, bot sends". The lean shape reuses existing machinery end to
+  end: the forward UI calls a new user-facing endpoint on **summary-api** (the
+  content owner — it already authenticates web users and owns summary
+  visibility), and smart-summary relays through its **existing**
+  `X-Internal-Token` ingress client with the chosen target channel plus
+  `actor_uid` (a field `NotifyReq` already carries); the octo-server producer
+  additionally verifies the actor is an active member of the target channel
+  before dispatch. No reverse octo-server→smart-summary channel and no content
+  round-trip is needed — content authority stays with its owner, which also
+  removes the card-forgery concern. The new endpoint is smart-summary scope;
+  the candidate slot here is reserved.
+  **Message ownership (decided 2026-07-13): bot-sent with a prominent
+  forwarder-attribution card header** (forwarder avatar + name + "分享了智能
+  总结"), matching Slack/Feishu share flows. User-identity (OBO) card
+  forwarding is rejected — the card protocol already forbids OBO cards
+  platform-wide (Decision 2b, see Decision 4) and relaying OBO through a
+  static-token internal ingress would constitute the forbidden "send as any
+  UID" capability. **Targets are split by type (decided 2026-07-13):
+  group/thread targets get the bot card via the member-exempt posting mode
+  (Decision 4) — the bot never joins, member list and count are untouched;
+  person targets keep today's user-identity plain-text forward and get no
+  card.** A person channel is strictly two-party: a bot cannot post into the
+  张三↔李四 conversation at all — a bot DM lands in the bot's own conversation
+  with the recipient, out of context. Slack and Feishu likewise bar apps from
+  posting into human↔human DMs (Slack share-to-DM is the user's own message).
+  Bot-DM cards exist only as A1 notifications inside the summary bot's own
+  conversation.
+- **Candidate — `docs-share-card` (Scenario B):** blocked on ingress design:
+  docs-backend has no octo-server message client and no bot identity, and the
+  share message is currently client-sent. Onboarding requires (a) a docs S2S
+  ingress or an octo-server share endpoint, and (b) a provisioned docs bot
+  identity — both out of scope here. The dispatcher contract already covers
+  what it will need (group + DM targets, display-only profile, explicit
+  Space).
+
+### Interactive cards (octo/v2): how future action scenarios fit
+
+Foreseeable scenarios where the recipient acts on the card — merge a PR,
+close an issue, approve an access/authorization request — are deliberately
+accommodated by this contract and require **no new dispatch machinery**. The
+pilot's cards are display-only (`octo/v1`) with a deep link, but nothing in
+the pilot blocks a later interactive producer. What changes for an
+interactive producer is what it must bring, not how it dispatches:
+
+- **The Decision 5 gate is the whole difference.** A producer registered for
+  `octo/v2` must name the existing bot event consumer that owns `card_action`
+  for its sender bot; the registry refuses the interactive profile otherwise
+  (already in Acceptance › Capability and configuration). Sending an
+  interactive card goes through the exact same pipeline.
+- **The action loop is the existing one**, hardened by
+  card-message-appbot-trust: recipient taps → `POST /v1/message/card/action`
+  → live sender-trust check → `card_action` event on the **sender bot's**
+  event queue → the bot's owning service polls `/v1/bot/events` and ACKs via
+  Bot API. The dispatcher never adds a second callback route (Out of scope
+  holds).
+- **Sender identity choice is therefore scenario-driven.** An interactive
+  producer's bot must be backed by a service that actually runs the event
+  poll loop: e.g. a GitHub-integration bot whose sidecar executes merge/close
+  against GitHub, or a docs bot whose backend executes the approval, then
+  reflects the outcome by **editing the card** through the existing card-edit
+  path (`card_seq` / `pkg/cardrevision`) instead of sending a new card.
+  Display-only producers (the pilot) may use consumer-less bots; upgrading a
+  producer to `octo/v2` later means giving its bot an event consumer first —
+  or registering a separate producer bound to a bot that has one.
+- **Executor responsibilities stay outside the dispatcher**: authorize the
+  acting user in the target system at execution time (a visible button is
+  NOT authorization — the event's actor identity must be checked against the
+  external system's ACL), and handle the poll/ACK at-least-once delivery
+  idempotently (dedup on event/card identity before executing side effects
+  like a merge).
+
+These scenarios (`devops` PR/issue cards, `docs` approval cards) are far
+candidates: each onboards with its own producer table row, a named event
+consumer, and its own brief for the executor side. They are listed here so
+the registry/config schema is designed with the action-owner field from day
+one rather than retrofitted.
+
+### Card template and deep-link (designed, confirmed 2026-07-13)
+
+**Template — a `ResourceCard` family in a small server-side shared library**
+(e.g. `pkg/cardtmpl`), consumed by producer modules only; the carddispatch
+core never imports it (Decision 11 acyclicity — the dispatcher validates via
+`pkg/cardmsg`, it does not know templates). Sidecar services keep sending
+structured fields (the decided ingress contract); template knowledge lives in
+exactly one place. Signature:
+
+```
+ResourceCard{ icon, title, attribution?, excerpt, facts[],
+              primaryAction{title,url}, localActions[]?, lang }
+```
+
+Rendered with octo/v1 whitelist elements only (`ColumnSet` icon+title header,
+subtle attribution `TextBlock` — the decided forwarder-attribution header for
+A2, excerpt `TextBlock`, `FactSet` metadata, `ActionSet` with `Action.OpenUrl`
+"查看详情" plus optional `Action.CopyToClipboard`). One template instantiates
+all near scenarios: A1 completion/failure notification, A2 forward card, the
+future docs share card. Constraints by construction: URLs are absolute https
+(Decision 3d positive allowlist); the excerpt is server-truncated (~300 chars)
+so payloads stay far under `MaxPayloadBytes` and today's chunked-forward hack
+disappears; `plain` needs no template work (`Finalize` recomputes it); labels
+render per recipient via `i18n.OutboundLanguage` (same discipline as email
+templates). Guard tests: JSON snapshot per instantiation plus a test that
+every template output passes `cardmsg.Validate` under `octo/v1` — template
+drift fails CI.
+
+**Deep-link — standalone web route `/s/:taskId?sp={spaceId}`**, mirroring the
+battle-tested `/d/:docId` machinery (cold-load → login bounce → multi-session
+sid recovery, XIN-398 test suite). Root cause of the historical removed link
+(`octo-smart-summary internal/notify/notify.go:396`): summary detail has only
+in-app `WKApp.route` panels (`/summary/detail`), no browser URL route — the
+design closes exactly that hole. Logged-in behavior: enter the app and call
+the existing `WKApp.openSummaryDetail(taskId)`; no standalone renderer is
+needed in wave 1. The URL is built by the octo-server template layer from
+`External` config (reuse `External.WebLoginURL`'s origin or add
+`External.WebBaseURL` — decided at the enablement config review);
+smart-summary passes `taskId` only and never builds URLs. Anti-regression
+contract: octo-web ships a route-contract test asserting `/s/:taskId` is
+registered, octo-server ships a template test pinning the link shape — a path
+change is an explicit cross-repo contract change, so the "link points
+nowhere" failure cannot silently recur.
+
+## Implementation gate: pilot producer table
+
+Before `/octospec-go card-message-internal-dispatch` enables a pilot producer,
+a maintainer must confirm this table. All pilot decisions are now
+**maintainer-confirmed (2026-07-13)**: concurrency, duplicate tolerance,
+replicas, sender bot, message ownership, member-exempt group posting, and the
+card template + deep-link design (Method › Card template and deep-link). The
+remaining work on the template/deep-link is **verification, not decision**:
+the pilot enablement PRs must land the `/s/:taskId` route-contract test in
+octo-web and the template snapshot/Validate guard tests in octo-server before
+the producer is enabled. A deliberately dormant foundation may ship first,
+but it must register no production producer while any row is unconfirmed. Do
+not implement a mutable generic "send as any UID" service.
+
+| Required input | Pilot: `summary-notify` |
 | --- | --- |
-| Producer ID (stable, low-cardinality) | `TBD` |
-| Owning module / constructor | `TBD` |
-| Sender bot UID configuration source | `TBD` |
-| Allowed channel types | `TBD` |
-| Allowed card profiles / action-event owner | `TBD` |
-| Required Space source | `TBD` |
-| Expected peak concurrency / QPS | `TBD` |
-| Business retry/idempotency requirement | `TBD` |
-| Process replicas / required cluster-wide cap | `TBD` |
+| Producer ID (stable, low-cardinality) | `summary-notify` |
+| Owning module / constructor | `modules/notify`; it obtains its producer-bound `Sender` from the single registry composed at server bootstrap (exact wiring resolved in implementation per Decision 11 — must fit the `register.AddModule` module system without mutable package-global registration) |
+| Sender bot UID configuration source | **Decided 2026-07-13: a dedicated `summary` bot** (static UID, provisioned as a full User Bot via the same user+app+robot pattern as `ensureNotifyBot`, `robot.status=1` — botidentity-active). The `notification` bot keeps the generic text-notification path only; separating identities keeps DM-notification duty and future group membership/branding decoupled |
+| Allowed channel types | DM (person) only at pilot; group/thread widening is a separate reviewed change tied to smart-summary origin回发, and that review must include a per-channel rate rule and the cluster-cap decision. Group/thread sends use the member-exempt posting mode (Decision 4): the bot joins no group, member list and 群人数 unchanged |
+| Allowed card profiles / action-event owner | `octo/v1` (display-only) only; `octo/v2` forbidden — the `summary` bot has no bot-event consumer polling `/v1/bot/events`, so no one could own `card_action` (see Method › Interactive cards for the upgrade path) |
+| Required Space source | `NotifyReq.space_id` supplied by the internal caller and member-verified by notify's `memberCache`; the dispatcher independently re-verifies live Space/membership (Decision 3). DM policy = system-notification mode (space-member DM, Decision 4) |
+| Expected peak concurrency / QPS | max-in-flight **20** per process (mirrors notify's existing bounded send pool) — **confirmed 2026-07-13** |
+| Business retry/idempotency requirement | smart-summary already retries per recipient with `summary_notification` dedup state ⇒ at-least-once from the caller side; a transport-ambiguous failure may duplicate a card; dispatcher stays single-attempt (Decision 8). **Confirmed 2026-07-13: duplicates are acceptable for notification cards; no outbox** |
+| Process replicas / required cluster-wide cap | **Confirmed 2026-07-13: per-process bound accepted, no cluster-wide cap required.** Record the actual replica count in the deployment/config review that enables the pilot |
 
-The foundation may be implemented with no enabled production registration, but
-it must not be presented as end-to-end useful until one concrete producer is
-reviewed against this table.
+| Required input | Candidates: `summary-forward-card`, `docs-share-card` |
+| --- | --- |
+| All rows | `TBD` — both blocked on ingress design (a summary-api forward endpoint + actor-verified ingress extension; a docs S2S ingress + docs bot identity — see Method section); neither may be registered until its own table is filled and confirmed |
 
 ## Decisions locked by this task
 
@@ -125,10 +434,36 @@ reviewed against this table.
    App Bots are DM-only, require the existing friend opt-in, and a scope=space
    App Bot may only target an active member of its own active Space. Platform
    App Bots require an active target Space and active recipient membership.
-   User Bots require creator/friend authorization for DMs; group/thread sends
+   User Bots require creator/friend authorization for DMs — except a producer
+   whose registered Space policy is the reviewed **system-notification DM
+   mode**, which instead authorizes DMs by active membership in the verified
+   Space (the semantics `modules/notify` delivers today; industry analog:
+   Slack app DMs and Feishu in-tenant application messages need no
+   friendship). The mode is per-producer registry config, never
+   caller-selectable, and the pilot uses it. Group/thread sends
    require an active internal bot member, a normal parent group, a non-deleted
-   active thread, and exact Space equality. DB errors fail closed. OBO is not
-   supported by internal dispatch.
+   active thread, and exact Space equality — except a producer with the
+   reviewed **member-exempt group posting mode** (confirmed for the summary
+   producers 2026-07-13): the bot posts to a normal group or valid thread in
+   the exact verified Space **without a membership row**, so it never appears
+   in the member list and never increases the member count
+   (`QueryMemberCount` today counts `robot=1` rows, so joining would inflate
+   群人数); every such send must be attributable to a recorded triggering
+   member action in the owning module (task creation, forward click), and
+   group/thread lifecycle plus Space equality remain verified fail-closed at
+   send time. Transport needs no membership (group system tips already post
+   member-less, `modules/group/event.go:36`); this is policy, and the
+   industry analog is Slack `chat:write.public` no-join posting, scoped to
+   normal in-Space groups because DMWork has no public/private split. The
+   dispatcher never mutates membership to make a send succeed (no auto-join);
+   a producer without this mode that is not an active internal member fails
+   closed. DB errors fail closed. OBO
+   is not supported by internal dispatch — consistent with the card protocol's
+   platform-wide prohibition of OBO cards (card-message-protocol Decision 2b:
+   Bot API rejects card + `on_behalf_of` with
+   `err.server.bot_api.card_obo_forbidden`, `modules/bot_api/send.go:92-105`;
+   revisiting that is a card-protocol contract change, not an internal-dispatch
+   option).
 5. **Dispatcher owns the envelope.** The public request accepts a card document
    plus a supported profile, not an arbitrary message payload. The dispatcher
    sets `type`, `card_version`, and profile; caller-supplied `plain`, `space_id`,
@@ -189,7 +524,8 @@ reviewed against this table.
     guard and must onboard through the dispatcher (or add a narrowly reviewed
     external-ingress exemption). The guard is a review backstop for known Go
     syntax/data-flow shapes, not a claim that static analysis is a runtime
-    security boundary.
+    security boundary. It cannot see payload-passthrough shapes where the card
+    map arrives over HTTP — that class is closed at runtime by Decision 14.
 13. **Request-time authorization, no lock across transport.** Identity and ACL
     state are queried without a decision cache on every invocation. The
     dispatcher does not hold database locks or a transaction open across the IM
@@ -198,6 +534,17 @@ reviewed against this table.
     requests fail closed. If the pilot requires linearizable revocation of an
     in-flight send, that stronger cross-system protocol must be designed before
     implementation rather than claimed by this package.
+14. **Existing internal notify ingress fails closed on card payloads.**
+    `modules/notify.deliverNotification` rejects any request whose payload
+    `cardmsg.IsCardPayload` reports as a card (covering `/v1/internal/notify`
+    and `/batch`) before membership verification and with zero transport
+    calls, responding through a registered `pkg/errcode` code (e.g.
+    `err.server.notify.card_not_allowed`, 400, non-Internal) via
+    `httperr.ResponseErrorL`. Today's only known caller (smart-summary) sends
+    `type=1` text exclusively, so no legitimate traffic changes. This gate is
+    the runtime complement to Decision 12 for the trusted `notification`
+    sender; it may only be removed by onboarding notify's card path through
+    `internal/carddispatch` (the `summary-notify` pilot).
 
 ## Proposed internal contract
 
@@ -235,6 +582,11 @@ request. The implementation must document that boundary and must not fake
 cancellation by leaking a goroutine. A context-aware transport extension is a
 separate octo-lib change unless accepted into this task before implementation.
 
+Fan-out stays caller-side: a producer sending one card to N recipients calls
+`Send` N times inside its own loop (as notify does today), each call
+individually authorized and bounded by the producer's in-flight budget. The
+dispatcher does not accept target lists.
+
 Internal errors are typed Go errors with a stable bounded category:
 `invalid_request`, `feature_disabled`, `producer_disabled`,
 `identity_untrusted`, `target_denied`, `card_invalid`, `payload_too_large`,
@@ -256,6 +608,11 @@ caller must map them through that endpoint's registered `errcode` facade.
 - **Card wire contract (`wire-contract`, `trust-boundary`)** — `pkg/cardmsg`
   remains the sole profile/schema authority; `plain` and `space_id` are
   server-authored, and the exact serialized wire payload stays <=512 KiB.
+- **Internal notify ingress (`trust-boundary`, `wire-contract`)** —
+  `/v1/internal/notify*` keeps its text-notification contract for existing
+  callers (smart-summary sends `type=1`); its auth stays `X-Internal-Token`
+  fail-closed; it additionally stops relaying card-shaped payloads
+  (Decision 14). The `notification` bot provisioning is untouched.
 - **Existing ingress behavior (`bot-api`, `wire-contract`)** — Bot API, Robot
   API, and Incoming Webhook validation order, error envelopes, OBO behavior,
   rate limits, and metrics do not change merely because the internal package is
@@ -278,16 +635,40 @@ caller must map them through that endpoint's registered `errcode` facade.
 
 ## Out of scope
 
-- Selecting or implementing the first business producer while the pilot table
-  above remains `TBD`.
+- Enabling the `summary-notify` pilot (switching the summary notification body
+  from text to a card) while any ⚠️ row in the pilot table lacks maintainer
+  sign-off. The foundation plus the Decision 14 gate may ship dormant first.
+- Implementing smart-summary origin group/thread回发 (its `target.go` routing
+  or widening the pilot's channel types) — a separate task in
+  octo-smart-summary + a reviewed config change here, whose review must settle
+  per-channel rate control and the cluster-wide cap (see Industry practice
+  alignment).
+- A platform-level "group robots" presentation change — segmenting `robot=1`
+  members out of the member list and `QueryMemberCount` (Feishu/DingTalk
+  style, also fixing existing AI bots inflating 群人数). It is the long-term
+  alternative to member-exempt posting and a separate product task.
+- The `summary-forward-card` candidate end-to-end: the summary-api forward
+  endpoint (human triggers, bot sends) and the internal-ingress extension for
+  actor-verified channel targets. Only its candidate slot in the table is
+  reserved.
+- The `docs-share-card` producer end-to-end: a docs S2S ingress or share
+  endpoint, docs bot identity provisioning, docs-backend outbound IM client,
+  and any card-composition UI. Only its candidate slot in the table is
+  reserved.
+- Any client-side card sending in octo-web; the web stays receive-only for
+  type-17.
 - Replacing or refactoring `/v1/bot/sendMessage`, legacy Robot API send,
-  Incoming Webhook push/card send, or their public error contracts.
+  Incoming Webhook push/card send, or their public error contracts. Beyond the
+  Decision 14 card gate, `/v1/internal/notify*` behavior (text payload
+  passthrough, DM fan-out, membership filtering, legacy error envelope) is
+  unchanged.
 - Incoming Webhook card actions/callbacks; webhook identities still have no bot
   event consumer.
 - A new internal `card_action` callback/event bus. Interactive profiles retain
   the existing sender-bot event ownership and poll/ACK contract.
-- OBO, fan-out, streams, subscribers, transient/no-persist cards, mention
-  expansion, broadcast cards, typing/read receipts, or card edits/revisions.
+- OBO, fan-out inside the dispatcher, streams, subscribers, transient/no-persist
+  cards, mention expansion, broadcast cards, typing/read receipts, or card
+  edits/revisions.
 - New card profiles/elements/actions, renderer changes, or changes to
   `pkg/cardmsg` limits.
 - New HTTP/gRPC routes, auth middleware, Space middleware, or client SDKs.
@@ -307,12 +688,17 @@ caller must map them through that endpoint's registered `errcode` facade.
 
 ### Planning gate
 
-- The pilot-producer table has no `TBD` values before implementation starts, or
-  the implementation is explicitly limited to a disabled foundation with no
-  claim of end-to-end production usefulness.
-- The chosen sender UID/config source, target kinds, Space source, concurrency,
-  card profile/action owner, replica multiplier, and retry requirements receive
-  maintainer sign-off in this brief.
+- All `summary-notify` pilot decisions are maintainer-confirmed (2026-07-13):
+  concurrency, duplicate tolerance, replicas, sender bot (dedicated `summary`
+  bot), message ownership (bot-sent + forwarder attribution, no OBO),
+  member-exempt group posting, and the card template + deep-link design.
+  Registering/enabling the pilot additionally requires the design's guard
+  tests to exist and pass (see Acceptance › Card template and deep-link).
+  Until then the implementation is explicitly limited to a disabled
+  foundation plus the Decision 14 gate, with no claim of end-to-end
+  production usefulness.
+- `summary-forward-card` and `docs-share-card` remain unregistered until their
+  own tables are filled and reviewed.
 
 ### Capability and configuration
 
@@ -335,13 +721,19 @@ caller must map them through that endpoint's registered `errcode` facade.
   User Bot and App Bot, presentation-only `user.robot=1`, cross-table ambiguity,
   live User Bot creator and App Bot scope/Space policy metadata, and DB errors.
   No failed branch reaches the transport capture.
-- DM tests cover User Bot creator/friend allow, stranger deny, active Space
-  membership, wrong/missing Space, App Bot platform/scope-space rules, and App
-  Bot group/thread denial.
+- DM tests cover User Bot creator/friend allow, stranger deny,
+  system-notification-mode allow for a non-friend active Space member and deny
+  outside the verified Space, active Space membership, wrong/missing Space,
+  App Bot platform/scope-space rules, and App Bot group/thread denial.
 - Group/thread tests cover exact authoritative Space match, normal vs
   disabled/disbanded group, active/internal/blacklisted/deleted/non-member bot,
   valid/malformed/archived/deleted thread, and DB failure. All denials fail
   closed before card finalization/transport.
+- Member-exempt-mode tests prove a producer with the mode posts to a normal
+  same-Space group with **no membership row and no member-list/count side
+  effects**, is still denied on disbanded/disabled groups, wrong Space, and
+  invalid threads; a producer without the mode is denied as a non-member; and
+  no dispatch code path creates or mutates group membership.
 - Multi-Space tests prove the explicit request Space is verified and the
   dispatcher never silently selects the first membership.
 
@@ -363,6 +755,28 @@ caller must map them through that endpoint's registered `errcode` facade.
 - A boundary test starts below the size limit, grows during authoritative
   enrichment, and is rejected by `Finalize`/the final size gate. No mutation
   occurs after the explicit recheck before serialization/dispatch.
+
+### Internal notify card gate (Decision 14)
+
+- Integration tests prove a card-shaped payload (`type=17` map, per
+  `cardmsg.IsCardPayload`) to `/v1/internal/notify` and
+  `/v1/internal/notify/batch` is rejected with the registered error code and
+  produces zero `SendMessage` calls; a `type=1` text payload on the same
+  requests still delivers (existing smart-summary contract unchanged).
+- The new error code passes `make i18n-extract-check` + `make i18n-lint` and
+  has a zh-CN translation.
+
+### Card template and deep-link (pilot enablement)
+
+- Every `ResourceCard` template instantiation has a JSON snapshot test and
+  passes `cardmsg.Validate` under `octo/v1`; the excerpt truncation bound is
+  tested; template labels resolve via `i18n.OutboundLanguage`.
+- The deep-link is built only by the octo-server template layer from
+  `External` config; a template test pins the `/s/{taskId}?sp={spaceId}`
+  shape. smart-summary never constructs the URL.
+- octo-web registers the standalone `/s/:taskId` route with a route-contract
+  test (mirroring the `/d/:docId` cold-load/login/sid patterns); logged-in
+  navigation reaches the existing summary detail view.
 
 ### Dispatch, overload, and observability
 
@@ -399,7 +813,7 @@ caller must map them through that endpoint's registered `errcode` facade.
 - Focused commands pass:
   - `go test -race -cover ./internal/carddispatch/...`
   - target-authorizer DB integration tests;
-  - `go test ./pkg/cardmsg/... ./modules/botidentity/...`
+  - `go test ./pkg/cardmsg/... ./modules/botidentity/... ./modules/notify/...`
   - `go run ./tools/lint-card-dispatch ./modules ./internal`
   - `go vet ./internal/carddispatch/...`
   - `make i18n-extract-check && make i18n-lint`
@@ -407,9 +821,10 @@ caller must map them through that endpoint's registered `errcode` facade.
   - `git diff --check`
 - Broader package/full tests run with the repo's per-package MySQL/Redis reset
   discipline where local infrastructure permits.
-- With zero enabled production registrations, deployment is behaviorally inert.
-  Enabling the pilot is a separate reviewed config/code change with rollback by
-  disabling/removing that one registration; existing public producers continue
-  unaffected.
+- With zero enabled production registrations, deployment is behaviorally inert
+  except the Decision 14 rejection of card-shaped internal notify payloads
+  (no known legitimate caller sends them). Enabling the `summary-notify` pilot
+  is a separate reviewed config/code change with rollback by disabling/removing
+  that one registration; existing public producers continue unaffected.
 - Finish writes a shared journal/log entry and opens a separate PR with Linked
   Spec and substantive COMPREHENSION answers.

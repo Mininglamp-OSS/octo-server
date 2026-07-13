@@ -12,15 +12,14 @@ import (
 )
 
 type fakeActiveKindStore struct {
-	userBot bool
-	appBot  bool
-	err     error
-	calls   int
+	record identityRecord
+	err    error
+	calls  int
 }
 
-func (f *fakeActiveKindStore) activeKinds(string) (bool, bool, error) {
+func (f *fakeActiveKindStore) lookup(string) (identityRecord, error) {
 	f.calls++
-	return f.userBot, f.appBot, f.err
+	return f.record, f.err
 }
 
 func TestResolverResolve(t *testing.T) {
@@ -36,9 +35,9 @@ func TestResolverResolve(t *testing.T) {
 	}{
 		{name: "empty uid", uid: "", store: &fakeActiveKindStore{}, wantNil: true, calls: 0},
 		{name: "missing", uid: "missing", store: &fakeActiveKindStore{}, wantNil: true, calls: 1},
-		{name: "active user bot", uid: "user_bot", store: &fakeActiveKindStore{userBot: true}, wantKind: KindUserBot, calls: 1},
-		{name: "published app bot", uid: "app_bot", store: &fakeActiveKindStore{appBot: true}, wantKind: KindAppBot, calls: 1},
-		{name: "ambiguous active identity", uid: "both", store: &fakeActiveKindStore{userBot: true, appBot: true}, wantErr: ErrAmbiguousIdentity, calls: 1},
+		{name: "active user bot", uid: "user_bot", store: &fakeActiveKindStore{record: identityRecord{UserBot: true, CreatorUID: "owner"}}, wantKind: KindUserBot, calls: 1},
+		{name: "published app bot", uid: "app_bot", store: &fakeActiveKindStore{record: identityRecord{AppBot: true, AppScope: ScopeSpace, AppSpaceID: "space-a"}}, wantKind: KindAppBot, calls: 1},
+		{name: "ambiguous active identity", uid: "both", store: &fakeActiveKindStore{record: identityRecord{UserBot: true, AppBot: true}}, wantErr: ErrAmbiguousIdentity, calls: 1},
 		{name: "lookup failure", uid: "broken", store: &fakeActiveKindStore{err: dbErr}, wantErr: dbErr, calls: 1},
 	}
 
@@ -58,6 +57,13 @@ func TestResolverResolve(t *testing.T) {
 					require.NotNil(t, got)
 					assert.Equal(t, tt.uid, got.UID)
 					assert.Equal(t, tt.wantKind, got.Kind)
+					if tt.wantKind == KindUserBot {
+						assert.Equal(t, "owner", got.CreatorUID)
+					}
+					if tt.wantKind == KindAppBot {
+						assert.Equal(t, ScopeSpace, got.AppScope)
+						assert.Equal(t, "space-a", got.AppSpaceID)
+					}
 				}
 			}
 			assert.Equal(t, tt.calls, tt.store.calls)
@@ -66,14 +72,14 @@ func TestResolverResolve(t *testing.T) {
 }
 
 func TestResolverActivePreservesErrors(t *testing.T) {
-	r := &Resolver{store: &fakeActiveKindStore{userBot: true, appBot: true}}
+	r := &Resolver{store: &fakeActiveKindStore{record: identityRecord{UserBot: true, AppBot: true}}}
 	active, err := r.Active("both")
 	assert.False(t, active)
 	assert.ErrorIs(t, err, ErrAmbiguousIdentity)
 }
 
 func TestResolverActive(t *testing.T) {
-	r := &Resolver{store: &fakeActiveKindStore{appBot: true}}
+	r := &Resolver{store: &fakeActiveKindStore{record: identityRecord{AppBot: true}}}
 	active, err := r.Active("app")
 	require.NoError(t, err)
 	assert.True(t, active)
@@ -98,24 +104,25 @@ func TestDBActiveKindStore(t *testing.T) {
 
 	t.Run("returns both predicates", func(t *testing.T) {
 		store, mock := newStore(t)
-		mock.ExpectQuery(`(?s)SELECT.*EXISTS.*robot.*EXISTS.*app_bot`).
-			WillReturnRows(sqlmock.NewRows([]string{"user_bot", "app_bot"}).AddRow(1, 0))
+		mock.ExpectQuery(`(?s)SELECT.*EXISTS.*robot.*creator_uid.*EXISTS.*app_bot.*scope.*space_id`).
+			WillReturnRows(sqlmock.NewRows([]string{"user_bot", "creator_uid", "app_bot", "app_scope", "app_space_id"}).AddRow(1, "owner-a", 0, "", ""))
 
-		userBot, appBot, err := store.activeKinds("bot")
+		record, err := store.lookup("bot")
 		require.NoError(t, err)
-		assert.True(t, userBot)
-		assert.False(t, appBot)
+		assert.True(t, record.UserBot)
+		assert.False(t, record.AppBot)
+		assert.Equal(t, "owner-a", record.CreatorUID)
 		require.NoError(t, mock.ExpectationsWereMet())
 	})
 
 	t.Run("preserves query error", func(t *testing.T) {
 		store, mock := newStore(t)
 		dbErr := errors.New("query failed")
-		mock.ExpectQuery(`(?s)SELECT.*EXISTS.*robot.*EXISTS.*app_bot`).WillReturnError(dbErr)
+		mock.ExpectQuery(`(?s)SELECT.*EXISTS.*robot.*creator_uid.*EXISTS.*app_bot.*scope.*space_id`).WillReturnError(dbErr)
 
-		userBot, appBot, err := store.activeKinds("bot")
-		assert.False(t, userBot)
-		assert.False(t, appBot)
+		record, err := store.lookup("bot")
+		assert.False(t, record.UserBot)
+		assert.False(t, record.AppBot)
 		assert.ErrorIs(t, err, dbErr)
 		require.NoError(t, mock.ExpectationsWereMet())
 	})

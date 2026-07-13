@@ -15,12 +15,17 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/base/app"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
 )
 
 // InternalTokenHeader is the header key for internal service authentication.
 const InternalTokenHeader = "X-Internal-Token"
+
+var errNotifyCardNotAllowed = errors.New("card payload not allowed on internal notify ingress")
 
 // Notify 通知模块
 type Notify struct {
@@ -135,6 +140,10 @@ func (n *Notify) sendNotify(c *wkhttp.Context) {
 
 	resp, err := n.deliverNotification(&req)
 	if err != nil {
+		if errors.Is(err, errNotifyCardNotAllowed) {
+			httperr.ResponseErrorL(c, errcode.ErrNotifyCardNotAllowed, nil, nil)
+			return
+		}
 		n.Error("投递通知失败", zap.Error(err), zap.String("space_id", req.SpaceID))
 		c.ResponseErrorWithStatus(errors.New("internal error"), http.StatusInternalServerError)
 		return
@@ -156,6 +165,14 @@ func (n *Notify) sendNotifyBatch(c *wkhttp.Context) {
 	if len(req.Notifications) > 50 {
 		c.ResponseErrorWithStatus(errors.New("批量上限50条"), http.StatusBadRequest)
 		return
+	}
+	// Preflight the whole batch before delivering any earlier text item. This
+	// preserves the zero-transport guarantee when a later entry is a card.
+	for i := range req.Notifications {
+		if cardmsg.IsCardPayload(req.Notifications[i].Payload) {
+			httperr.ResponseErrorL(c, errcode.ErrNotifyCardNotAllowed, nil, nil)
+			return
+		}
 	}
 
 	hasErrors := false
@@ -184,6 +201,12 @@ func (n *Notify) sendNotifyBatch(c *wkhttp.Context) {
 
 // deliverNotification 校验、过滤、投递
 func (n *Notify) deliverNotification(req *NotifyReq) (*NotifyResp, error) {
+	if req != nil && cardmsg.IsCardPayload(req.Payload) {
+		return nil, errNotifyCardNotAllowed
+	}
+	if req == nil {
+		return nil, errors.New("request不能为空")
+	}
 	if req.SpaceID == "" {
 		return nil, errors.New("space_id不能为空")
 	}

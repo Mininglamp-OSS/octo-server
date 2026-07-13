@@ -21,6 +21,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/app"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/gin-gonic/gin"
 	"github.com/gocraft/dbr/v2"
 	"github.com/gocraft/dbr/v2/dialect"
@@ -43,14 +45,14 @@ func init() {
 type stubUserService struct {
 	user.IService
 
-	mu                sync.Mutex
-	users             map[string]*user.Resp // keyed by username
-	addUserErr        error
-	addUserCount      int32
-	addUserDelay      time.Duration
+	mu                 sync.Mutex
+	users              map[string]*user.Resp // keyed by username
+	addUserErr         error
+	addUserCount       int32
+	addUserDelay       time.Duration
 	getByUsernameCalls int32
-	updateUserCount   int32
-	updateUserErr     error
+	updateUserCount    int32
+	updateUserErr      error
 }
 
 func newStubUserService() *stubUserService {
@@ -98,9 +100,9 @@ func (s *stubUserService) UpdateUser(req user.UserUpdateReq) error {
 
 // stubAppService mocks app.IService.
 type stubAppService struct {
-	createErr      error
-	createCount    int32
-	deleteCount    int32
+	createErr   error
+	createCount int32
+	deleteCount int32
 }
 
 func (s *stubAppService) GetApp(appID string) (*app.Resp, error) {
@@ -491,6 +493,45 @@ func TestIntegration_SendNotify_InternalErrorSurfaces500(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "internal error")
 }
 
+func TestIntegration_InternalNotifyRejectsCardPayloadBeforeAnyDelivery(t *testing.T) {
+	wk := newWuKongServer()
+	defer wk.close()
+	ctx := newTestContext(t, wk)
+	db, _, closeDB := newMockedDBSession(t)
+	defer closeDB()
+
+	n := newTestNotify(ctx, db, newStubUserService(), &stubAppService{}, "tk")
+	r := buildRouter(n)
+	r.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
+	h := http.Header{}
+	h.Set(InternalTokenHeader, "tk")
+	cardPayload := map[string]interface{}{
+		"type":         cardmsg.InteractiveCard.Int(),
+		"card_version": cardmsg.CardVersion,
+		"profile":      cardmsg.ProfileV1,
+		"card":         map[string]interface{}{"type": "AdaptiveCard", "version": cardmsg.CardVersion},
+	}
+
+	t.Run("single", func(t *testing.T) {
+		w := doJSONRequest(t, r, http.MethodPost, "/v1/internal/notify", h, NotifyReq{
+			SpaceID: "space-a", Service: "summary", Targets: []string{"user-a"}, Payload: cardPayload,
+		})
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+		assert.Contains(t, w.Body.String(), `"code":"err.server.notify.card_not_allowed"`)
+		assert.Zero(t, atomic.LoadInt32(&wk.messageCount))
+	})
+
+	t.Run("batch preflights every entry before delivering text", func(t *testing.T) {
+		w := doJSONRequest(t, r, http.MethodPost, "/v1/internal/notify/batch", h, BatchNotifyReq{Notifications: []NotifyReq{
+			{SpaceID: "space-a", Service: "summary", Targets: []string{"user-a"}, Payload: map[string]interface{}{"type": 1, "content": "legacy"}},
+			{SpaceID: "space-a", Service: "summary", Targets: []string{"user-b"}, Payload: cardPayload},
+		}})
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+		assert.Contains(t, w.Body.String(), `"code":"err.server.notify.card_not_allowed"`)
+		assert.Zero(t, atomic.LoadInt32(&wk.messageCount))
+	})
+}
+
 func TestIntegration_SendNotifyBatch_Empty(t *testing.T) {
 	wk := newWuKongServer()
 	defer wk.close()
@@ -591,8 +632,8 @@ func TestIntegration_SendNotifyBatch_AllSuccess_200(t *testing.T) {
 	h.Set(InternalTokenHeader, "tk")
 	body := BatchNotifyReq{
 		Notifications: []NotifyReq{
-			{SpaceID: spaceID, Service: "svc", Targets: []string{"uid_a"}, Payload: map[string]interface{}{"k": "v1"}},
-			{SpaceID: spaceID, Service: "svc", Targets: []string{"uid_b"}, Payload: map[string]interface{}{"k": "v2"}},
+			{SpaceID: spaceID, Service: "svc", Targets: []string{"uid_a"}, Payload: map[string]interface{}{"type": 1, "content": "v1"}},
+			{SpaceID: spaceID, Service: "svc", Targets: []string{"uid_b"}, Payload: map[string]interface{}{"type": 1, "content": "v2"}},
 		},
 	}
 	w := doJSONRequest(t, r, "POST", "/v1/internal/notify/batch", h, body)
@@ -797,7 +838,6 @@ func TestIntegration_EnsureBot_BotOK_SkipsCreation(t *testing.T) {
 	assert.Equal(t, int32(0), atomic.LoadInt32(&us.getByUsernameCalls))
 }
 
-
 // When memberCache is empty for the space, deliverNotification drives
 // memberCache.refresh which issues a `SELECT uid FROM space_member ...` query.
 func TestIntegration_Deliver_CacheMiss_RefreshesFromDB(t *testing.T) {
@@ -836,7 +876,6 @@ func TestIntegration_Deliver_CacheMiss_RefreshesFromDB(t *testing.T) {
 	require.NoError(t, err)
 	assert.ElementsMatch(t, []string{"uid_b"}, resp2.Delivered)
 }
-
 
 func TestIntegration_HandleSpaceMemberEvent_InvalidatesCache(t *testing.T) {
 	wk := newWuKongServer()
