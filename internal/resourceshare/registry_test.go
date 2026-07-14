@@ -116,6 +116,17 @@ func TestRegistry_UnknownAndDisabledProvidersFailClosed(t *testing.T) {
 	assert.ErrorIs(t, err, ErrProviderDisabled)
 }
 
+func TestRegistry_ReportsEnabledProviderCount(t *testing.T) {
+	key := newIntentTestKey(t)
+	registry, err := NewRegistry([]ProviderSpec{
+		validProviderSpec(t, key),
+		{ID: "docs", Enabled: false},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, registry.EnabledProviderCount())
+	assert.Equal(t, 0, (*Registry)(nil).EnabledProviderCount())
+}
+
 func TestRegistry_RejectsDuplicateAndInvalidEnabledProviders(t *testing.T) {
 	key := newIntentTestKey(t)
 	valid := validProviderSpec(t, key)
