@@ -38,6 +38,19 @@ type Registry struct {
 	providers map[ProviderID]*Provider
 }
 
+func (r *Registry) EnabledProviderCount() int {
+	if r == nil {
+		return 0
+	}
+	count := 0
+	for _, provider := range r.providers {
+		if provider.spec.Enabled {
+			count++
+		}
+	}
+	return count
+}
+
 func NewRegistry(specs []ProviderSpec) (*Registry, error) {
 	registry := &Registry{providers: make(map[ProviderID]*Provider, len(specs))}
 	for _, input := range specs {

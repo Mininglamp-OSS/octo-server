@@ -4,11 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
-	"os"
-	"strconv"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -35,20 +32,15 @@ type API struct {
 }
 
 func New(ctx *config.Context) *API {
-	enabled, err := featureEnabledFromEnv()
+	runtimeConfig, err := loadRuntimeConfigFromEnv()
 	if err != nil {
 		panic(err)
 	}
-	service, err := resourceshare.NewShareService(resourceshare.ShareServiceDependencies{
-		FeatureEnabled: func() bool { return enabled },
-	})
+	api, err := newProductionAPI(ctx, runtimeConfig, reviewedProviderSpecs())
 	if err != nil {
-		// The foundation intentionally ships with no enabled providers or proof
-		// signer. Enabling the route before provider onboarding is a startup
-		// configuration error, not a degraded mode.
 		panic(err)
 	}
-	return newAPI(ctx, service, nil)
+	return api
 }
 
 func newAPI(ctx *config.Context, service shareService, verifier *resourceshare.ProofVerifier) *API {
@@ -56,18 +48,6 @@ func newAPI(ctx *config.Context, service shareService, verifier *resourceshare.P
 		ctx: ctx, service: service, verifier: verifier,
 		Log: log.NewTLog("resource_share"),
 	}
-}
-
-func featureEnabledFromEnv() (bool, error) {
-	raw := strings.TrimSpace(os.Getenv("DM_RESOURCE_SHARE_ENABLED"))
-	if raw == "" {
-		return false, nil
-	}
-	enabled, err := strconv.ParseBool(raw)
-	if err != nil {
-		return false, fmt.Errorf("resource share: invalid DM_RESOURCE_SHARE_ENABLED: %w", err)
-	}
-	return enabled, nil
 }
 
 func (a *API) Route(r *wkhttp.WKHttp) {
