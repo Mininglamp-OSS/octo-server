@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-server/modules/cardtrust"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/stretchr/testify/assert"
 )
@@ -17,22 +18,34 @@ func TestSingleMessageHitCardProjection(t *testing.T) {
 	raw := json.RawMessage(`{"type":17,"card":{"body":[{"type":"TextBlock","text":"内部字段"}]},"plain":"审批单 #42:待审批","card_version":"1.5","profile":"octo/v1"}`)
 	doc := Doc{
 		MessageID:  9001,
-		From:       "bot_x",
+		From:       "human_x",
 		Payload:    &Payload{Type: &cardType},
 		PayloadRaw: raw,
 	}
+	projection := cardProjectionContext{ViewerUID: "viewer-a", SpaceID: "space-a"}
 
-	trustedHandler := &Handler{cardTrust: stubTrust(true)}
-	mh := trustedHandler.singleMessageHit(doc, "g_1", 0, nil)
-	assert.Equal(t, "审批单 #42:待审批", mh.Snippet, "bot sender 命中投影 = 权威 plain")
+	trusted := &captureCardTrust{trusted: true}
+	trustedHandler := &Handler{cardTrust: trusted}
+	mh := trustedHandler.singleMessageHit(doc, "group-a", channelTypeGroup, nil, projection)
+	assert.Equal(t, "审批单 #42:待审批", mh.Snippet, "可信人类分享命中投影 = 权威 plain")
 	assert.Equal(t, "text", mh.MessageKind, "message_kind 枚举已锁,卡片折入 text")
+	assert.Equal(t, "human_x", trusted.observation.FromUID)
+	assert.Equal(t, "viewer-a", trusted.observation.ViewerUID)
+	assert.Equal(t, "space-a", trusted.observation.SpaceID)
+	assert.Equal(t, "group-a", trusted.observation.Target.GroupNo)
+	assert.JSONEq(t, string(raw), string(trusted.observation.Payload))
 
-	untrustedHandler := &Handler{cardTrust: stubTrust(false)}
-	mh = untrustedHandler.singleMessageHit(doc, "g_1", 0, nil)
+	untrustedHandler := &Handler{cardTrust: &captureCardTrust{}}
+	mh = untrustedHandler.singleMessageHit(doc, "group-a", channelTypeGroup, nil, projection)
 	assert.Equal(t, cardmsg.PlaceholderCard, mh.Snippet, "非可信 sender 必须遮蔽为 [卡片]")
 }
 
-// stubTrust 是 cardSenderTruster 的测试替身。
-type stubTrust bool
+type captureCardTrust struct {
+	trusted     bool
+	observation cardtrust.MessageObservation
+}
 
-func (s stubTrust) Trusted(string) bool { return bool(s) }
+func (s *captureCardTrust) TrustedMessage(observation cardtrust.MessageObservation) bool {
+	s.observation = observation
+	return s.trusted
+}
