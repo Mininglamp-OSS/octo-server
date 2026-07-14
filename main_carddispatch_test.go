@@ -27,35 +27,55 @@ func TestCardDispatchRegistryInstalledBeforeModuleConstruction(t *testing.T) {
 	}
 }
 
-func TestSummaryNotifyIsOnlyProductionCardProducer(t *testing.T) {
-	specs := summaryNotifyProducerSpecs()
-	if len(specs) != 1 {
-		t.Fatalf("production registry has %d producers; want summary-notify only", len(specs))
+// TestNotificationCardProducerRegistrations pins the production card-dispatch
+// producers to the reviewed shape (Sender identity, DM-only, octo/v1,
+// system-notification Space policy, MaxInFlight=20). Both `summary-notify` and
+// `docs-notify` share this shape by design (see modules/notify — capability
+// isolation lives on the producer ID, not the sender identity). Any *new*
+// production producer needs its own reviewed entry here, so this test
+// deliberately fails on unknown IDs — the sender-of-cards allowlist is not
+// silently extensible.
+func TestNotificationCardProducerRegistrations(t *testing.T) {
+	specs := cardDispatchProducerSpecs()
+	want := map[carddispatch.ProducerID]bool{
+		"summary-notify": false,
+		"docs-notify":    false,
 	}
+	for _, spec := range specs {
+		seen, known := want[spec.ID]
+		if !known {
+			t.Fatalf("unexpected production producer %q — new senders require a reviewed entry", spec.ID)
+		}
+		if seen {
+			t.Fatalf("producer %q registered twice", spec.ID)
+		}
+		want[spec.ID] = true
 
-	spec := specs[0]
-	if spec.ID != carddispatch.ProducerID("summary-notify") {
-		t.Fatalf("producer ID = %q; want summary-notify", spec.ID)
+		if !spec.Enabled {
+			t.Fatalf("%s producer must be enabled", spec.ID)
+		}
+		if spec.SenderUID != notify.NotifyBotUIDValue {
+			t.Fatalf("%s sender UID = %q; want existing notification bot %q", spec.ID, spec.SenderUID, notify.NotifyBotUIDValue)
+		}
+		if len(spec.AllowedChannelTypes) != 1 || spec.AllowedChannelTypes[0] != common.ChannelTypePerson.Uint8() {
+			t.Fatalf("%s allowed channel types = %v; want DM only", spec.ID, spec.AllowedChannelTypes)
+		}
+		if len(spec.AllowedProfiles) != 1 || spec.AllowedProfiles[0] != cardmsg.ProfileV1 {
+			t.Fatalf("%s allowed profiles = %v; want octo/v1 only", spec.ID, spec.AllowedProfiles)
+		}
+		if spec.SpacePolicy != carddispatch.SpacePolicySystemNotification {
+			t.Fatalf("%s space policy = %q; want system_notification", spec.ID, spec.SpacePolicy)
+		}
+		if spec.GroupPolicy != carddispatch.GroupPolicyMemberRequired {
+			t.Fatalf("%s group policy = %q; want member_required", spec.ID, spec.GroupPolicy)
+		}
+		if spec.MaxInFlight != 20 {
+			t.Fatalf("%s max in flight = %d; want 20", spec.ID, spec.MaxInFlight)
+		}
 	}
-	if !spec.Enabled {
-		t.Fatal("summary-notify producer must be enabled")
-	}
-	if spec.SenderUID != notify.NotifyBotUIDValue {
-		t.Fatalf("sender UID = %q; want existing notification bot %q", spec.SenderUID, notify.NotifyBotUIDValue)
-	}
-	if len(spec.AllowedChannelTypes) != 1 || spec.AllowedChannelTypes[0] != common.ChannelTypePerson.Uint8() {
-		t.Fatalf("allowed channel types = %v; want DM only", spec.AllowedChannelTypes)
-	}
-	if len(spec.AllowedProfiles) != 1 || spec.AllowedProfiles[0] != cardmsg.ProfileV1 {
-		t.Fatalf("allowed profiles = %v; want octo/v1 only", spec.AllowedProfiles)
-	}
-	if spec.SpacePolicy != carddispatch.SpacePolicySystemNotification {
-		t.Fatalf("space policy = %q; want system_notification", spec.SpacePolicy)
-	}
-	if spec.GroupPolicy != carddispatch.GroupPolicyMemberRequired {
-		t.Fatalf("group policy = %q; want member_required", spec.GroupPolicy)
-	}
-	if spec.MaxInFlight != 20 {
-		t.Fatalf("max in flight = %d; want 20", spec.MaxInFlight)
+	for id, seen := range want {
+		if !seen {
+			t.Fatalf("expected producer %q was not registered", id)
+		}
 	}
 }

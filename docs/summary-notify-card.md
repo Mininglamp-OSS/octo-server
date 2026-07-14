@@ -93,6 +93,10 @@ carddispatch.Sender.Send                 （producer-bound；DM/octo/v1/system-n
 {
   "type": "AdaptiveCard",
   "version": "1.5",
+  "metadata": {
+    "webUrl": "https://im.example.com/s/TN_20260713_abcd?sp=spc_xxx",
+    "octo": { "variant": "summary.completed" }
+  },
   "body": [
     { "type": "Container", "items": [
       { "type": "TextBlock", "text": "产品周会纪要", "weight": "Bolder", "wrap": true },
@@ -165,6 +169,10 @@ carddispatch.Sender.Send                 （producer-bound；DM/octo/v1/system-n
 {
   "type": "AdaptiveCard",
   "version": "1.5",
+  "metadata": {
+    "webUrl": "https://im.example.com/s/TN_20260713_abcd?sp=spc_xxx",
+    "octo": { "variant": "summary.failed" }
+  },
   "body": [
     { "type": "Container", "items": [
       { "type": "TextBlock", "text": "产品周会纪要", "weight": "Bolder", "wrap": true },
@@ -191,6 +199,31 @@ carddispatch.Sender.Send                 （producer-bound；DM/octo/v1/system-n
 │ [ 查看详情 ]                                    │
 └───────────────────────────────────────────────┘
 ```
+
+### 2.3 AC `metadata`（跨 producer 共享的约定）
+
+每张卡都在 AdaptiveCard 根上带上标准 AC 1.5 `metadata` 对象，内嵌 **保留命名空间**
+`octo` 供未来渲染层区分卡片家族／样式。字段稳定、低基数，值由服务端生成：
+
+```json
+"metadata": {
+  "webUrl": "<deep-link>",              // AC 1.5 标准字段；与主 Action.OpenUrl.url 同源
+  "octo":   { "variant": "<family>.<kind>" }
+}
+```
+
+`variant` 保留词表（`{producer_family}.{kind}`，只增不改）：
+
+| producer | Kind | variant |
+|---|---|---|
+| `summary-notify` | `completed` | `summary.completed` |
+| `summary-notify` | `failed` | `summary.failed` |
+| `docs-notify` | `shared` / `commented` / `access_requested` | `docs.shared` / `docs.commented` / `docs.access_requested` |
+| 后续新增 producer | 自定 kind | `<family>.<kind>` |
+
+渲染端**可以但不必**读 `variant` —— 未识别的值等同「泛用卡片」。产者永远不塞用户
+输入到 `metadata`（只塞服务端选定的 `variant` + 服务端拼的 `webUrl`），避免绕开
+主体 URL/markdown 白名单（`pkg/cardmsg.Validate` 不解析 `metadata` 子字段）。
 
 ## 3. Ingress 契约（`POST /v1/internal/notify`）
 

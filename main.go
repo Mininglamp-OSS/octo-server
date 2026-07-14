@@ -354,37 +354,47 @@ func installCardDispatch(ctx *config.Context) error {
 		Metrics:          carddispatch.NewMetrics(prometheus.DefaultRegisterer),
 		Logger:           log.NewTLog("CardDispatch"),
 	}
-	registry := carddispatch.NewRegistry(deps, summaryNotifyProducerSpecs())
+	registry := carddispatch.NewRegistry(deps, cardDispatchProducerSpecs())
 	return carddispatch.Install(ctx, registry)
 }
 
-func summaryNotifyProducerSpecs() []carddispatch.ProducerSpec {
-	// summary-notify pilot (brief › pilot table, all rows confirmed 2026-07-13):
-	// existing `notification` User Bot, DM-only, display-only octo/v1,
-	// system-notification Space policy, in-flight 20/process. modules/notify
-	// obtains this producer's bound Sender via carddispatch.SenderFromContext.
+func cardDispatchProducerSpecs() []carddispatch.ProducerSpec {
+	// Every producer here shares the same shape (existing `notification` User
+	// Bot, DM-only, display-only octo/v1, system-notification Space policy,
+	// in-flight 20/process; brief › pilot table, all rows confirmed
+	// 2026-07-13). modules/notify obtains each producer's bound Sender via
+	// carddispatch.SenderFromContext.
 	//
-	// Registration is inert until modules/notify receives a structured card
-	// request (NotifyReq.Card) AND OCTO_CARD_MESSAGE_ENABLED is on; end-to-end
-	// enablement additionally depends on octo-web shipping the /s/:taskId route
-	// and octo-smart-summary switching its send from text to the card fields.
-	return []carddispatch.ProducerSpec{
-		{
-			ID:                  summaryNotifyProducerID,
-			Enabled:             true,
-			SenderUID:           notify.NotifyBotUIDValue,
-			AllowedChannelTypes: []uint8{common.ChannelTypePerson.Uint8()},
-			AllowedProfiles:     []string{cardmsg.ProfileV1},
-			SpacePolicy:         carddispatch.SpacePolicySystemNotification,
-			GroupPolicy:         carddispatch.GroupPolicyMemberRequired, // unused at DM pilot; must be a valid value
-			MaxInFlight:         20,
-		},
+	// Registrations are inert until modules/notify receives a matching
+	// structured card request (NotifyReq.Card or NotifyReq.DocsCard) AND
+	// OCTO_CARD_MESSAGE_ENABLED is on. End-to-end enablement of a producer
+	// additionally depends on octo-web shipping the matching deep-link route
+	// (/s/:taskId for summary — not yet on main; /d/:docId for docs — already
+	// live) and the caller-side switching from text payloads to structured
+	// fields.
+	base := carddispatch.ProducerSpec{
+		Enabled:             true,
+		SenderUID:           notify.NotifyBotUIDValue,
+		AllowedChannelTypes: []uint8{common.ChannelTypePerson.Uint8()},
+		AllowedProfiles:     []string{cardmsg.ProfileV1},
+		SpacePolicy:         carddispatch.SpacePolicySystemNotification,
+		GroupPolicy:         carddispatch.GroupPolicyMemberRequired, // unused at DM pilot; must be a valid value
+		MaxInFlight:         20,
 	}
+	summarySpec := base
+	summarySpec.ID = summaryNotifyProducerID
+	docsSpec := base
+	docsSpec.ID = docsNotifyProducerID
+	return []carddispatch.ProducerSpec{summarySpec, docsSpec}
 }
 
-// summaryNotifyProducerID mirrors modules/notify's producer ID. Kept here so the
-// composition root can register the spec without importing an unexported const.
-const summaryNotifyProducerID = carddispatch.ProducerID("summary-notify")
+// {summaryNotify,docsNotify}ProducerID mirror modules/notify's producer IDs.
+// Kept here so the composition root can register the spec without importing an
+// unexported const.
+const (
+	summaryNotifyProducerID = carddispatch.ProducerID("summary-notify")
+	docsNotifyProducerID    = carddispatch.ProducerID("docs-notify")
+)
 
 func printServerInfo(ctx *config.Context) {
 	infoStr := `

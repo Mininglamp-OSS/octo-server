@@ -27,8 +27,14 @@ import (
 // InternalTokenHeader is the header key for internal service authentication.
 const InternalTokenHeader = "X-Internal-Token"
 
-// summaryNotifyProducerID is the carddispatch producer this module owns.
-const summaryNotifyProducerID = "summary-notify"
+// summaryNotifyProducerID / docsNotifyProducerID are the carddispatch producers
+// this module owns. Both are bound to the shared `notification` User Bot so
+// summary cards, docs cards, and legacy text notifications appear in one system
+// DM conversation; capability isolation lives at the producer level.
+const (
+	summaryNotifyProducerID = "summary-notify"
+	docsNotifyProducerID    = "docs-notify"
+)
 
 var (
 	errNotifyCardNotAllowed = errors.New("card payload not allowed on internal notify ingress")
@@ -45,6 +51,7 @@ type Notify struct {
 	botMu         sync.Mutex
 	botOK         atomic.Bool
 	cardSender    carddispatch.Sender
+	docsSender    carddispatch.Sender
 	internalToken string
 	log.Log
 }
@@ -66,13 +73,18 @@ func New(ctx *config.Context) *Notify {
 		Log:           log.NewTLog("Notify"),
 	}
 
-	// Obtain the producer-bound card Sender from the single registry composed at
+	// Obtain the producer-bound card Senders from the single registry composed at
 	// bootstrap (main.installCardDispatch, before module construction). A missing
 	// registration is non-fatal: card notifications degrade to the text DM path.
 	if sender, senderErr := carddispatch.SenderFromContext(ctx, summaryNotifyProducerID); senderErr != nil {
 		n.Warn("summary-notify card sender unavailable; card notifications will degrade to text", zap.Error(senderErr))
 	} else {
 		n.cardSender = sender
+	}
+	if sender, senderErr := carddispatch.SenderFromContext(ctx, docsNotifyProducerID); senderErr != nil {
+		n.Warn("docs-notify card sender unavailable; docs card notifications will degrade to text", zap.Error(senderErr))
+	} else {
+		n.docsSender = sender
 	}
 
 	// 注册缓存失效回调（通过 event 包避免循环依赖）
@@ -167,13 +179,26 @@ func (n *Notify) sendNotify(c *wkhttp.Context) {
 		return
 	}
 	// Payload dropped its binding:"required" so card requests (Payload absent,
-	// Card present) bind cleanly. payload and card are mutually exclusive
-	// (contract); a text request that carries neither keeps the legacy 400.
+	// Card / DocsCard present) bind cleanly. Payload / Card / DocsCard are
+	// mutually exclusive (contract). Presence uses != nil for Payload (an
+	// explicit `{}` counts as "caller intended to send a payload" and must not
+	// silently combine with Card / DocsCard); the legacy "payload不能为空" 400
+	// still fires when nothing meaningful is provided.
+	present := 0
+	if req.Payload != nil {
+		present++
+	}
+	if req.Card != nil {
+		present++
+	}
+	if req.DocsCard != nil {
+		present++
+	}
 	switch {
-	case req.Card != nil && req.Payload != nil:
+	case present > 1:
 		httperr.ResponseErrorL(c, errcode.ErrNotifyCardInvalid, nil, nil)
 		return
-	case req.Card == nil && len(req.Payload) == 0:
+	case req.Card == nil && req.DocsCard == nil && len(req.Payload) == 0:
 		c.ResponseErrorWithStatus(errors.New("payload不能为空"), http.StatusBadRequest)
 		return
 	}
@@ -195,11 +220,14 @@ func (n *Notify) sendNotify(c *wkhttp.Context) {
 	c.Response(resp)
 }
 
-// dispatchNotify routes a single request to the card producer path (when a
-// structured Card is present) or the legacy text path.
+// dispatchNotify routes a single request to the correct producer path (when a
+// structured Card / DocsCard is present) or the legacy text path.
 func (n *Notify) dispatchNotify(req *NotifyReq) (*NotifyResp, error) {
 	if req != nil && req.Card != nil {
 		return n.deliverCardNotification(req)
+	}
+	if req != nil && req.DocsCard != nil {
+		return n.deliverDocsCardNotification(req)
 	}
 	return n.deliverNotification(req)
 }
@@ -221,10 +249,10 @@ func (n *Notify) sendNotifyBatch(c *wkhttp.Context) {
 	}
 	// Preflight the whole batch before delivering any earlier text item. This
 	// preserves the zero-transport guarantee when a later entry is a card.
-	// Card notifications are single-endpoint only (they fan out through the
-	// carddispatch producer), so a Card in a batch entry is rejected outright.
+	// Card / DocsCard notifications are single-endpoint only (they fan out through
+	// the carddispatch producer), so any card entry in a batch is rejected outright.
 	for i := range req.Notifications {
-		if req.Notifications[i].Card != nil {
+		if req.Notifications[i].Card != nil || req.Notifications[i].DocsCard != nil {
 			httperr.ResponseErrorL(c, errcode.ErrNotifyCardInvalid, nil, nil)
 			return
 		}

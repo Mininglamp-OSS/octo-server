@@ -31,6 +31,8 @@ func exampleResourceCard() ResourceCard {
 			{Title: "Messages", Value: "128"},
 		},
 		CopyText: "summary-42",
+		Variant:  "summary.completed",
+		Source:   Source{Label: "Smart Summary"},
 	}
 }
 
@@ -47,6 +49,13 @@ func TestBuildSummaryResourceCardSnapshotAndValidation(t *testing.T) {
 	want := `{
 	  "type":"AdaptiveCard",
 	  "version":"1.5",
+	  "metadata":{
+	    "webUrl":"https://im.example.com/s/task%2F42?sp=space+a",
+	    "octo":{
+	      "variant":"summary.completed",
+	      "source":{"label":"Smart Summary"}
+	    }
+	  },
 	  "body":[
 	    {"type":"ColumnSet","columns":[
 	      {"type":"Column","width":"auto","items":[{"type":"Image","url":"https://static.example.com/summary.png","size":"Small"}]},

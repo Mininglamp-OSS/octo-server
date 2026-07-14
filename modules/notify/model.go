@@ -2,11 +2,13 @@ package notify
 
 // NotifyReq 通知请求
 //
-// Payload 与 Card 二选一:
-//   - 文本通知(现状):填 Payload{type:1,content:...},Card 省略。
-//   - 卡片通知(summary-notify pilot):填结构化 Card,Payload 省略。服务端用
-//     pkg/cardtmpl 生成 octo/v1 卡片,经 internal/carddispatch 派发。调用方永不
-//     构造 type-17 map(Decision 14 仍拒绝 payload 里的 card 形状)。
+// Payload / Card / DocsCard 三选一:
+//   - 文本通知(现状):填 Payload{type:1,content:...},另两者省略。
+//   - 智能总结卡片(summary-notify pilot):填结构化 Card,另两者省略。服务端用
+//     pkg/cardtmpl 生成 octo/v1 卡片,经 internal/carddispatch 派发。
+//   - 文档通知卡片(docs-notify):填结构化 DocsCard,另两者省略。
+//
+// 调用方永不构造 type-17 map(Decision 14 仍拒绝 payload 里的 card 形状)。
 type NotifyReq struct {
 	SpaceID  string                 `json:"space_id" binding:"required"`
 	Service  string                 `json:"service" binding:"required"`
@@ -15,6 +17,7 @@ type NotifyReq struct {
 	ActorUID string                 `json:"actor_uid"`
 	Payload  map[string]interface{} `json:"payload"`
 	Card     *SummaryCardFields     `json:"card"`
+	DocsCard *DocsCardFields        `json:"docs_card"`
 }
 
 // SummaryCardFields 是 summary-notify 卡片通知的结构化入参(跨仓契约,见
@@ -36,6 +39,29 @@ type SummaryCardFields struct {
 const (
 	SummaryCardKindCompleted = "completed"
 	SummaryCardKindFailed    = "failed"
+)
+
+// DocsCardFields is the docs-notify structured card input (cross-repo contract,
+// see .octospec/tasks/card-message-internal-dispatch/docs-notify-contract.md).
+// Fields carry raw values only; attribution/label copy, layout, and the
+// /d/{doc_id}?sp={space_id} deep-link are owned by the server (pkg/cardtmpl +
+// modules/notify.buildDocsCard + i18n.OutboundLanguage). The docs backend
+// pre-formats display strings it wants surfaced verbatim (ActorName, UpdatedAt)
+// so octo-server does not resolve secondary identities on the card path.
+type DocsCardFields struct {
+	DocID     string `json:"doc_id"`     // maps to /d/{doc_id}?sp={space_id}
+	Kind      string `json:"kind"`       // "shared" | "commented" | "access_requested"
+	Title     string `json:"title"`      // document title
+	ActorName string `json:"actor_name"` // pre-resolved actor display name; empty allowed
+	Excerpt   string `json:"excerpt"`    // optional preview / comment / access reason
+	UpdatedAt string `json:"updated_at"` // pre-formatted timestamp; empty allowed
+}
+
+// Docs card notification kinds.
+const (
+	DocsCardKindShared           = "shared"
+	DocsCardKindCommented        = "commented"
+	DocsCardKindAccessRequested  = "access_requested"
 )
 
 // BatchNotifyReq 批量通知请求

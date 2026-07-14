@@ -34,6 +34,28 @@ type ResourceCard struct {
 	Excerpt     string
 	Facts       []Fact
 	CopyText    string
+	// Variant is the stable, low-cardinality identifier the renderer / client
+	// can key off to style card families independently (e.g. "summary.completed",
+	// "summary.failed", "docs.shared", "docs.commented"). Emitted into
+	// `metadata.octo.variant` on the AdaptiveCard root; unknown values pass
+	// straight through — the renderer decides whether to specialise.
+	// See docs/summary-notify-card.md §2 for the reserved namespace.
+	Variant string
+	// Source names the originating capability so renderers can surface a
+	// "来自 XX" / "From XX" chip / badge (角标) next to the card. Both fields
+	// are optional and land in `metadata.octo.source`; the current template
+	// does NOT auto-render them into the card body — surfacing is a renderer
+	// decision (chip / prefix / silent), which lets the visual pilot stay
+	// unchanged while machine consumers already have the source signal.
+	Source Source
+}
+
+// Source describes the producer family that authored the card, for both
+// display badging and machine identification. Values are server-picked (never
+// user-supplied) and land in `metadata.octo.source`.
+type Source struct {
+	Label   string // human-readable source name, e.g. "智能总结" / "Smart Summary" / "文档" / "Docs"
+	IconURL string // absolute https icon URL, optional; renderers may use it for the chip
 }
 
 func BuildSummaryResourceCard(
@@ -46,6 +68,45 @@ func BuildSummaryResourceCard(
 	if strings.TrimSpace(taskID) == "" || strings.TrimSpace(spaceID) == "" {
 		return nil, errors.New("cardtmpl: task ID and space ID are required")
 	}
+	deepLink, err := summaryDeepLink(webLoginURL, taskID, spaceID)
+	if err != nil {
+		return nil, err
+	}
+	return buildResourceCard(ctx, deepLink, resource)
+}
+
+// BuildDocsResourceCard renders an octo/v1 ResourceCard for a docs-notify
+// notification (docs-backend automated flows: share/comment/access request).
+// The deep-link points at octo-web's /d/:docId standalone route (mirrors
+// summaryDeepLink); labels/attribution mapping stay in the producer module.
+func BuildDocsResourceCard(
+	ctx context.Context,
+	webLoginURL string,
+	docID string,
+	spaceID string,
+	resource ResourceCard,
+) (json.RawMessage, error) {
+	if strings.TrimSpace(docID) == "" || strings.TrimSpace(spaceID) == "" {
+		return nil, errors.New("cardtmpl: doc ID and space ID are required")
+	}
+	deepLink, err := docsDeepLink(webLoginURL, docID, spaceID)
+	if err != nil {
+		return nil, err
+	}
+	return buildResourceCard(ctx, deepLink, resource)
+}
+
+// buildResourceCard assembles the octo/v1 body (header + optional excerpt +
+// optional FactSet + ActionSet) from a validated ResourceCard and an already
+// built https deep-link URL. Callers own scenario-specific input validation
+// (identifier presence, deep-link shape); this helper enforces the
+// scenario-independent bounds (title length, fact count, copy text size,
+// icon-must-be-https) and returns the marshalled AC 1.5 document.
+func buildResourceCard(
+	ctx context.Context,
+	deepLink string,
+	resource ResourceCard,
+) (json.RawMessage, error) {
 	if strings.TrimSpace(resource.Title) == "" || utf8.RuneCountInString(resource.Title) > maxTitleRunes {
 		return nil, errors.New("cardtmpl: resource title is invalid")
 	}
@@ -69,9 +130,13 @@ func BuildSummaryResourceCard(
 			return nil, fmt.Errorf("cardtmpl: icon URL: %w", err)
 		}
 	}
-	deepLink, err := summaryDeepLink(webLoginURL, taskID, spaceID)
-	if err != nil {
-		return nil, err
+	if resource.Source.IconURL != "" {
+		if err := requireHTTPS(resource.Source.IconURL); err != nil {
+			return nil, fmt.Errorf("cardtmpl: source icon URL: %w", err)
+		}
+	}
+	if utf8.RuneCountInString(resource.Source.Label) > maxTitleRunes {
+		return nil, errors.New("cardtmpl: source label too long")
 	}
 
 	lang := i18n.OutboundLanguage(ctx)
@@ -145,9 +210,10 @@ func BuildSummaryResourceCard(
 	body = append(body, map[string]interface{}{"type": "ActionSet", "actions": actions})
 
 	document := map[string]interface{}{
-		"type":    "AdaptiveCard",
-		"version": cardmsg.CardVersion,
-		"body":    body,
+		"type":     "AdaptiveCard",
+		"version":  cardmsg.CardVersion,
+		"metadata": buildMetadata(deepLink, resource.Variant, resource.Source),
+		"body":     body,
 	}
 	raw, err := json.Marshal(document)
 	if err != nil {
@@ -157,12 +223,62 @@ func BuildSummaryResourceCard(
 }
 
 func summaryDeepLink(webLoginURL, taskID, spaceID string) (string, error) {
+	origin, err := webOrigin(webLoginURL)
+	if err != nil {
+		return "", err
+	}
+	return origin + "/s/" + url.PathEscape(taskID) + "?sp=" + url.QueryEscape(spaceID), nil
+}
+
+// docsDeepLink mirrors summaryDeepLink but targets octo-web's already-live
+// standalone doc route /d/:docId (cold-load → login bounce → multi-session
+// sid recovery, XIN-398 suite). The origin comes from External.WebLoginURL
+// (positive-allowlisted absolute https).
+func docsDeepLink(webLoginURL, docID, spaceID string) (string, error) {
+	origin, err := webOrigin(webLoginURL)
+	if err != nil {
+		return "", err
+	}
+	return origin + "/d/" + url.PathEscape(docID) + "?sp=" + url.QueryEscape(spaceID), nil
+}
+
+// buildMetadata assembles the AdaptiveCard 1.5 `metadata` object. The standard
+// `webUrl` sub-field (canonical browser URL for this card) is always set from
+// the same deep-link that drives the primary "View details" action, so
+// client-side features that key off the URL don't need to walk actions. The
+// `octo` sub-object namespaces our extensions:
+//   - `variant`: stable low-cardinality identifier (`summary.completed` etc.)
+//   - `source`:  originating capability {label, iconUrl} for renderer badges
+//
+// Both octo sub-fields are omitted when empty to keep the wire minimal.
+func buildMetadata(deepLink, variant string, source Source) map[string]interface{} {
+	metadata := map[string]interface{}{"webUrl": deepLink}
+	octo := map[string]interface{}{}
+	if strings.TrimSpace(variant) != "" {
+		octo["variant"] = variant
+	}
+	if strings.TrimSpace(source.Label) != "" || strings.TrimSpace(source.IconURL) != "" {
+		s := map[string]interface{}{}
+		if strings.TrimSpace(source.Label) != "" {
+			s["label"] = source.Label
+		}
+		if strings.TrimSpace(source.IconURL) != "" {
+			s["iconUrl"] = source.IconURL
+		}
+		octo["source"] = s
+	}
+	if len(octo) > 0 {
+		metadata["octo"] = octo
+	}
+	return metadata
+}
+
+func webOrigin(webLoginURL string) (string, error) {
 	base, err := url.Parse(strings.TrimSpace(webLoginURL))
 	if err != nil || base.Scheme != "https" || base.Host == "" {
 		return "", errors.New("cardtmpl: web base URL must be absolute https")
 	}
-	origin := (&url.URL{Scheme: base.Scheme, Host: base.Host}).String()
-	return origin + "/s/" + url.PathEscape(taskID) + "?sp=" + url.QueryEscape(spaceID), nil
+	return (&url.URL{Scheme: base.Scheme, Host: base.Host}).String(), nil
 }
 
 func requireHTTPS(raw string) error {

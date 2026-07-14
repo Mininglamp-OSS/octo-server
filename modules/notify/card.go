@@ -176,8 +176,10 @@ func (n *Notify) buildSummaryCard(ctx context.Context, spaceID string, card *Sum
 
 	attribution := labels.completedBanner
 	excerpt := ""
+	variant := "summary.completed"
 	if card.Kind == SummaryCardKindFailed {
 		attribution = labels.failedBanner
+		variant = "summary.failed"
 		if reason := strings.TrimSpace(card.Reason); reason != "" {
 			excerpt = labels.failedPrefix + reason
 		}
@@ -189,6 +191,8 @@ func (n *Notify) buildSummaryCard(ctx context.Context, spaceID string, card *Sum
 		Attribution: attribution,
 		Excerpt:     excerpt,
 		Facts:       facts,
+		Variant:     variant,
+		Source:      cardtmpl.Source{Label: labels.sourceLabel},
 	})
 }
 
@@ -247,6 +251,250 @@ type summaryLabels struct {
 	kvSep             string
 	completedHeadline string // fmt verb for the title, used by the text fallback
 	failedHeadline    string
+	sourceLabel       string // ResourceCard.Source.Label — "智能总结" / "Smart Summary"
+}
+
+// deliverDocsCardNotification is the docs-notify card path. Structurally it
+// mirrors deliverCardNotification (dedup -> actor exclusion -> live member
+// verification -> bounded fan-out) but binds to the docs-notify producer and
+// uses BuildDocsResourceCard for the /d/{doc_id}?sp={space_id} deep link. A
+// build failure degrades the whole request to a plain-text DM so a docs
+// notification is never silently lost.
+func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error) {
+	if req == nil || req.DocsCard == nil {
+		return nil, errNotifyCardInvalid
+	}
+	card := req.DocsCard
+	if strings.TrimSpace(req.SpaceID) == "" || len(req.Targets) == 0 || len(req.Targets) > 200 {
+		return nil, errNotifyCardInvalid
+	}
+	if strings.TrimSpace(card.DocID) == "" || strings.TrimSpace(card.Title) == "" {
+		return nil, errNotifyCardInvalid
+	}
+	if card.Kind != DocsCardKindShared && card.Kind != DocsCardKindCommented &&
+		card.Kind != DocsCardKindAccessRequested {
+		return nil, errNotifyCardInvalid
+	}
+
+	targets := dedupTargets(req.Targets)
+	if req.ActorUID != "" {
+		tmp := make([]string, 0, len(targets))
+		for _, uid := range targets {
+			if uid != req.ActorUID {
+				tmp = append(tmp, uid)
+			}
+		}
+		targets = tmp
+	}
+
+	members, filteredMap, err := n.memberCache.verify(n.db, req.SpaceID, targets)
+	if err != nil {
+		return nil, fmt.Errorf("member verification failed: %w", err)
+	}
+	if len(members) == 0 {
+		return &NotifyResp{Delivered: []string{}, Filtered: filteredMap}, nil
+	}
+
+	n.ensureNotifyBotReady()
+	if !n.botOK.Load() {
+		return nil, errors.New("notification bot unavailable")
+	}
+
+	lang := i18n.OutboundLanguage(context.Background())
+
+	canCard := n.docsSender != nil && cardmsg.Enabled()
+	var document json.RawMessage
+	if canCard {
+		doc, buildErr := n.buildDocsCard(context.Background(), req.SpaceID, card, lang)
+		if buildErr != nil {
+			n.Warn("build docs card failed, degrading to text",
+				zap.Error(buildErr), zap.String("space_id", req.SpaceID), zap.String("doc_id", card.DocID))
+			canCard = false
+		} else {
+			document = doc
+		}
+	}
+	fallbackText := ""
+	if !canCard {
+		fallbackText = buildDocsFallbackText(card, lang)
+	}
+
+	type sendResult struct {
+		uid    string
+		reason string
+	}
+	resultCh := make(chan sendResult, len(members))
+	sem := make(chan struct{}, 20)
+
+	for _, targetUID := range members {
+		sem <- struct{}{}
+		go func(uid string) {
+			defer func() { <-sem }()
+			reason := ""
+			if canCard {
+				_, sendErr := n.docsSender.Send(
+					context.Background(),
+					carddispatch.Target{
+						SpaceID:     req.SpaceID,
+						ChannelID:   uid,
+						ChannelType: common.ChannelTypePerson.Uint8(),
+					},
+					carddispatch.Card{Profile: cardmsg.ProfileV1, Document: document},
+				)
+				if sendErr != nil {
+					reason = string(carddispatch.CategoryOf(sendErr))
+					n.Warn("投递文档卡片失败",
+						zap.String("target", uid), zap.String("space_id", req.SpaceID),
+						zap.String("category", reason), zap.Error(sendErr))
+				}
+			} else if txtErr := n.sendSummaryText(uid, req.SpaceID, fallbackText); txtErr != nil {
+				reason = "send_failed"
+				n.Warn("投递文档文本失败",
+					zap.String("target", uid), zap.String("space_id", req.SpaceID), zap.Error(txtErr))
+			}
+			resultCh <- sendResult{uid: uid, reason: reason}
+		}(targetUID)
+	}
+
+	delivered := make([]string, 0, len(members))
+	for range members {
+		r := <-resultCh
+		if r.reason == "" {
+			delivered = append(delivered, r.uid)
+		} else {
+			filteredMap[r.uid] = r.reason
+		}
+	}
+
+	n.Info("notify_docs_card_delivered",
+		zap.String("service", req.Service),
+		zap.String("space_id", req.SpaceID),
+		zap.String("doc_id", card.DocID),
+		zap.String("kind", card.Kind),
+		zap.Bool("as_card", canCard),
+		zap.Int("targets", len(req.Targets)),
+		zap.Int("delivered", len(delivered)),
+		zap.Int("filtered", len(filteredMap)),
+	)
+
+	return &NotifyResp{Delivered: delivered, Filtered: filteredMap}, nil
+}
+
+// buildDocsCard renders the octo/v1 ResourceCard for a docs-notify
+// notification. Kind maps to Variant / Attribution deterministically; ActorName
+// and UpdatedAt render as optional FactSet rows. Excerpt is the free-form
+// preview / comment / access reason bounded by cardtmpl.MaxExcerptRunes.
+func (n *Notify) buildDocsCard(ctx context.Context, spaceID string, card *DocsCardFields, lang string) (json.RawMessage, error) {
+	labels := docsLabelsFor(lang)
+	facts := make([]cardtmpl.Fact, 0, 2)
+	if actor := strings.TrimSpace(card.ActorName); actor != "" {
+		facts = append(facts, cardtmpl.Fact{Title: labels.actor, Value: actor})
+	}
+	if ts := strings.TrimSpace(card.UpdatedAt); ts != "" {
+		facts = append(facts, cardtmpl.Fact{Title: labels.updatedAt, Value: ts})
+	}
+
+	attribution, variant := docsAttributionAndVariant(card.Kind, card.ActorName, labels)
+
+	webLoginURL := n.ctx.GetConfig().External.WebLoginURL
+	return cardtmpl.BuildDocsResourceCard(ctx, webLoginURL, card.DocID, spaceID, cardtmpl.ResourceCard{
+		Title:       card.Title,
+		Attribution: attribution,
+		Excerpt:     strings.TrimSpace(card.Excerpt),
+		Facts:       facts,
+		Variant:     variant,
+		Source:      cardtmpl.Source{Label: labels.sourceLabel},
+	})
+}
+
+// docsAttributionAndVariant maps DocsCard.Kind to a (localized attribution
+// line, Variant string). When ActorName is present the attribution embeds it;
+// otherwise a subject-less form is used ("Shared a document" / "文档已分享").
+func docsAttributionAndVariant(kind, actorName string, labels docsLabels) (string, string) {
+	actor := strings.TrimSpace(actorName)
+	switch kind {
+	case DocsCardKindCommented:
+		if actor != "" {
+			return fmt.Sprintf(labels.commentedBanner, actor), "docs.commented"
+		}
+		return labels.commentedBannerAnon, "docs.commented"
+	case DocsCardKindAccessRequested:
+		if actor != "" {
+			return fmt.Sprintf(labels.accessRequestedBanner, actor), "docs.access_requested"
+		}
+		return labels.accessRequestedBannerAnon, "docs.access_requested"
+	default: // DocsCardKindShared
+		if actor != "" {
+			return fmt.Sprintf(labels.sharedBanner, actor), "docs.shared"
+		}
+		return labels.sharedBannerAnon, "docs.shared"
+	}
+}
+
+// buildDocsFallbackText mirrors buildSummaryFallbackText: composes the plain
+// DM used when a card cannot be built (feature disabled, sender missing, or
+// template/config error). No information is lost — every field that would
+// appear on the card is emitted as a text line.
+func buildDocsFallbackText(card *DocsCardFields, lang string) string {
+	labels := docsLabelsFor(lang)
+	attribution, _ := docsAttributionAndVariant(card.Kind, card.ActorName, labels)
+	var b strings.Builder
+	b.WriteString(attribution)
+	if title := strings.TrimSpace(card.Title); title != "" {
+		fmt.Fprintf(&b, "\n%s%s", labels.title+labels.kvSep, title)
+	}
+	if excerpt := strings.TrimSpace(card.Excerpt); excerpt != "" {
+		fmt.Fprintf(&b, "\n%s", excerpt)
+	}
+	if ts := strings.TrimSpace(card.UpdatedAt); ts != "" {
+		fmt.Fprintf(&b, "\n%s%s", labels.updatedAt+labels.kvSep, ts)
+	}
+	return b.String()
+}
+
+type docsLabels struct {
+	sharedBanner              string // "%s 分享了文档"
+	sharedBannerAnon          string
+	commentedBanner           string
+	commentedBannerAnon       string
+	accessRequestedBanner     string
+	accessRequestedBannerAnon string
+	title                     string
+	actor                     string
+	updatedAt                 string
+	kvSep                     string
+	sourceLabel               string // ResourceCard.Source.Label — "文档" / "Docs"
+}
+
+func docsLabelsFor(lang string) docsLabels {
+	if strings.EqualFold(lang, "zh-CN") || strings.HasPrefix(strings.ToLower(lang), "zh") {
+		return docsLabels{
+			sharedBanner:              "%s 分享了文档",
+			sharedBannerAnon:          "有人分享了文档",
+			commentedBanner:           "%s 评论了文档",
+			commentedBannerAnon:       "有新评论",
+			accessRequestedBanner:     "%s 请求访问文档",
+			accessRequestedBannerAnon: "有人请求访问文档",
+			title:                     "文档",
+			actor:                     "操作人",
+			updatedAt:                 "时间",
+			kvSep:                     "：",
+			sourceLabel:               "文档",
+		}
+	}
+	return docsLabels{
+		sharedBanner:              "%s shared a document",
+		sharedBannerAnon:          "A document was shared with you",
+		commentedBanner:           "%s commented on a document",
+		commentedBannerAnon:       "A new comment on a document",
+		accessRequestedBanner:     "%s requested access to a document",
+		accessRequestedBannerAnon: "Someone requested access to a document",
+		title:                     "Document",
+		actor:                     "By",
+		updatedAt:                 "At",
+		kvSep:                     ": ",
+		sourceLabel:               "Docs",
+	}
 }
 
 func summaryLabelsFor(lang string) summaryLabels {
@@ -264,6 +512,7 @@ func summaryLabelsFor(lang string) summaryLabels {
 			kvSep:             "：",
 			completedHeadline: "你的总结「%s」已生成完成。",
 			failedHeadline:    "你的总结「%s」生成失败。",
+			sourceLabel:       "智能总结",
 		}
 	}
 	return summaryLabels{
@@ -279,5 +528,6 @@ func summaryLabelsFor(lang string) summaryLabels {
 		kvSep:             ": ",
 		completedHeadline: "Your summary \"%s\" is ready.",
 		failedHeadline:    "Your summary \"%s\" failed to generate.",
+		sourceLabel:       "Smart Summary",
 	}
 }
