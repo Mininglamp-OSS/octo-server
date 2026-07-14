@@ -32,3 +32,16 @@ Bot conversation. The user-share brief now requires a separate authenticated,
 server-minted card path with narrow verifiable provenance. Existing generic
 user type-17, Bot OBO, arbitrary sender, and arbitrary card payload paths remain
 forbidden.
+
+## 2026-07-14 — resource-share platform generalization
+
+The trusted user-share path is a platform capability, not a smart-summary-only
+transport. The design is split into `user-resource-share-card` for provider
+registration, authenticated sender/target/provenance/rate/idempotency/audit
+contracts, and `smart-summary-user-share-card` for the first provider's
+visibility, claims, template, and deep link.
+
+Future docs, task, or approval user shares onboard with provider-specific
+briefs and adapters. They must not duplicate the human-card trust boundary or
+create resource-specific message endpoints. A resource's automated Bot
+notification or interactive action remains a separate capability.

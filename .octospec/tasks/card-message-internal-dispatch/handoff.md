@@ -144,22 +144,23 @@ Each of these is its own follow-up PR after the pilot is live.
   brief › Industry practice alignment). Member-exempt already honors explicit
   group bans (F3). Delivery = post if group eligible, else creator-DM fallback.
   Full contract: `../smart-summary-origin-channel-card/brief.md`.
-- **A2 user share:** a separate user-authenticated, server-minted card flow for
-  **DM, group, and thread** targets. The sharing user is the message sender in
-  the selected conversation; `notification` does not proxy the share. This is
-  not a dynamic-sender `carddispatch` producer and not Bot API OBO. It requires
-  a narrow trusted-human-card provenance contract while generic user type-17
-  remains closed. Full contract: `../smart-summary-user-share-card/brief.md`.
-- **`docs-share-card`:** still blocked on deciding whether it is a user-authored
-  resource share or a docs-Bot notification, plus the corresponding content
-  authorization/ingress design. Do not copy the old A2 Bot-forward assumption.
+- **User resource share platform:** one user-authenticated, provider-based,
+  server-minted card flow for **DM, group, and thread** targets. The sharing
+  user is the sender; `notification` does not proxy the share. Generic contract:
+  `../user-resource-share-card/brief.md`.
+- **Smart-summary share provider:** first onboarding adapter, owning summary
+  visibility, structured claims, template mapping, and `/s/` link contract:
+  `../smart-summary-user-share-card/brief.md`.
+- **Docs user share:** later onboards as another resource provider and does not
+  need a docs Bot. Automated docs notifications/actions would be a different
+  Bot-producer task.
 
 ## Locked decisions (2026-07-13; sender amended 2026-07-14)
 
 | Decision | Value |
 | --- | --- |
 | Sender identity | shared `notification` User Bot; dedicated `summary` choice superseded |
-| User-initiated share ownership | user-authored in selected DM/group/thread; server-minted card; no Bot proxy and no generic OBO |
+| User resource-share ownership | provider-based; user-authored in selected DM/group/thread; server-minted card; no Bot proxy and no generic OBO |
 | Pilot channels / profile | DM only / `octo/v1` display-only |
 | Group posting (post-P2) | member-exempt: no membership required, member list/count untouched, **explicit ban honored** |
 | Concurrency | MaxInFlight 20 / process |

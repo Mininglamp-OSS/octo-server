@@ -260,28 +260,19 @@ with different readiness):
   when the group is no longer eligible. The dispatcher's group/thread
   authorization rules (Decision 4) are specified now so that widening is a
   config review, not a design change.
-- **Separate task — user-initiated summary share (Scenario A2):** today web
-  sends summary text as the authenticated user. The card version keeps that
-  ownership model and supports **DM, group, and thread targets**: the sharing
-  user is the stored message sender in the selected conversation, while the
-  server owns the fixed card template. It must not use the `notification` Bot,
-  because a Bot-to-person send would create a different DM conversation.
-  This cannot be registered as a normal `carddispatch` producer: this
-  dispatcher deliberately binds a static active Bot UID, generic user ingress
-  rejects type-17, and display trust masks unsigned human cards. The separate
-  `smart-summary-user-share-card` brief therefore requires a user-authenticated
-  server-minted share endpoint, summary-api visibility-bound share intent,
-  exact DM/group/thread authorization, and verifiable server provenance for
-  the narrow display-only human card. It is **not Bot API OBO**: no S2S caller
+- **Separate platform — user-initiated resource share (Scenario A2 and B):**
+  user-selected DM/group/thread cards are a generic platform capability, not a
+  smart-summary-specific transport and not a Bot producer. The sharing user is
+  the stored sender in the selected conversation; the resource owner supplies
+  a signed structured intent; octo-server owns target authorization, template
+  finalization, provenance, quotas, idempotency, audit, and transport. The
+  generic contract is `../user-resource-share-card/brief.md`; smart-summary is
+  its first provider (`../smart-summary-user-share-card/brief.md`). A future
+  docs user-share card onboards as another provider and does not require a docs
+  Bot. Automated docs notifications/actions, if desired, remain a separate Bot
+  producer problem. The generic path is **not Bot API OBO**: no S2S caller
   supplies `actor_uid`, no request contains `from_uid`, and arbitrary card
   payloads remain forbidden.
-- **Candidate — `docs-share-card` (Scenario B):** blocked on ingress design:
-  docs-backend has no octo-server message client and no bot identity, and the
-  share message is currently client-sent. Onboarding requires (a) a docs S2S
-  ingress or an octo-server share endpoint, and (b) a provisioned docs bot
-  identity — both out of scope here. The dispatcher contract already covers
-  what it will need (group + DM targets, display-only profile, explicit
-  Space).
 
 ### Interactive cards (octo/v2): how future action scenarios fit
 
@@ -395,10 +386,6 @@ not implement a mutable generic "send as any UID" service.
 | Expected peak concurrency / QPS | max-in-flight **20** per process (mirrors notify's existing bounded send pool) — **confirmed 2026-07-13** |
 | Business retry/idempotency requirement | smart-summary already retries per recipient with `summary_notification` dedup state ⇒ at-least-once from the caller side; a transport-ambiguous failure may duplicate a card; dispatcher stays single-attempt (Decision 8). **Confirmed 2026-07-13: duplicates are acceptable for notification cards; no outbox** |
 | Process replicas / required cluster-wide cap | **Confirmed 2026-07-13: per-process bound accepted, no cluster-wide cap required.** Record the actual replica count in the deployment/config review that enables the pilot |
-
-| Required input | Candidate: `docs-share-card` |
-| --- | --- |
-| All rows | `TBD` — blocked on a docs S2S ingress + docs bot identity; it may not be registered until its own table is filled and confirmed. User-initiated summary sharing is no longer a Bot-producer candidate and has its own user-authenticated server-minted-card brief |
 
 ## Decisions locked by this task
 
@@ -647,14 +634,12 @@ caller must map them through that endpoint's registered `errcode` facade.
   members out of the member list and `QueryMemberCount` (Feishu/DingTalk
   style, also fixing existing AI bots inflating 群人数). It is the long-term
   alternative to member-exempt posting and a separate product task.
-- User-initiated summary-card sharing: this is a separate user-authenticated,
-  server-minted message path supporting DM/group/thread with the sharing user
-  as sender. It does not weaken this dispatcher's static-Bot sender contract;
-  see `../smart-summary-user-share-card/brief.md`.
-- The `docs-share-card` producer end-to-end: a docs S2S ingress or share
-  endpoint, docs bot identity provisioning, docs-backend outbound IM client,
-  and any card-composition UI. Only its candidate slot in the table is
-  reserved.
+- User-initiated resource-card sharing: this is a separate provider-based,
+  user-authenticated server-minted platform supporting DM/group/thread with the
+  sharing user as sender. It does not weaken this dispatcher's static-Bot
+  sender contract; see `../user-resource-share-card/brief.md`. Smart-summary
+  and docs user shares onboard through separate provider briefs rather than
+  creating new Bot producers.
 - Any client-side card sending in octo-web; the web stays receive-only for
   type-17.
 - Replacing or refactoring `/v1/bot/sendMessage`, legacy Robot API send,
@@ -697,9 +682,9 @@ caller must map them through that endpoint's registered `errcode` facade.
   Until then the implementation is explicitly limited to a disabled
   foundation plus the Decision 14 gate, with no claim of end-to-end
   production usefulness.
-- `docs-share-card` remains unregistered until its table is filled and reviewed.
-  User-initiated summary sharing is governed by its separate brief and is not a
-  dynamic-sender registration in this Bot-only dispatcher.
+- User-initiated resource providers are governed by the separate generic share
+  platform and never become dynamic-sender registrations in this Bot-only
+  dispatcher.
 
 ### Capability and configuration
 
