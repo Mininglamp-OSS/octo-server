@@ -354,6 +354,11 @@ func installCardDispatch(ctx *config.Context) error {
 		Metrics:          carddispatch.NewMetrics(prometheus.DefaultRegisterer),
 		Logger:           log.NewTLog("CardDispatch"),
 	}
+	registry := carddispatch.NewRegistry(deps, summaryNotifyProducerSpecs())
+	return carddispatch.Install(ctx, registry)
+}
+
+func summaryNotifyProducerSpecs() []carddispatch.ProducerSpec {
 	// summary-notify pilot (brief › pilot table, all rows confirmed 2026-07-13):
 	// dedicated `summary` User Bot, DM-only, display-only octo/v1,
 	// system-notification Space policy, in-flight 20/process. modules/notify
@@ -363,7 +368,7 @@ func installCardDispatch(ctx *config.Context) error {
 	// request (NotifyReq.Card) AND OCTO_CARD_MESSAGE_ENABLED is on; end-to-end
 	// enablement additionally depends on octo-web shipping the /s/:taskId route
 	// and octo-smart-summary switching its send from text to the card fields.
-	specs := []carddispatch.ProducerSpec{
+	return []carddispatch.ProducerSpec{
 		{
 			ID:                  summaryNotifyProducerID,
 			Enabled:             true,
@@ -375,8 +380,6 @@ func installCardDispatch(ctx *config.Context) error {
 			MaxInFlight:         20,
 		},
 	}
-	registry := carddispatch.NewRegistry(deps, specs)
-	return carddispatch.Install(ctx, registry)
 }
 
 // summaryNotifyProducerID mirrors modules/notify's producer ID. Kept here so the

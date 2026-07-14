@@ -66,7 +66,7 @@ func (n *Notify) deliverCardNotification(req *NotifyReq) (*NotifyResp, error) {
 	// Both the card and the text fallback are sent by the summary bot, so it
 	// must exist. Retry from the caller if provisioning has not completed yet.
 	n.ensureSummaryBotReady()
-	if !n.summaryBotOK {
+	if !n.summaryBotOK.Load() {
 		return nil, errors.New("summary bot unavailable")
 	}
 

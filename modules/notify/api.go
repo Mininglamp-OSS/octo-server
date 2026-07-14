@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
@@ -44,7 +45,7 @@ type Notify struct {
 	botMu         sync.Mutex
 	botOK         bool
 	summaryBotMu  sync.Mutex
-	summaryBotOK  bool
+	summaryBotOK  atomic.Bool
 	cardSender    carddispatch.Sender
 	internalToken string
 	log.Log
@@ -105,7 +106,7 @@ func New(ctx *config.Context) *Notify {
 			n.Info("Notify bot ready")
 		}
 		n.ensureSummaryBotReady()
-		if n.summaryBotOK {
+		if n.summaryBotOK.Load() {
 			n.Info("Summary bot ready")
 		}
 	}()
@@ -117,12 +118,12 @@ func New(ctx *config.Context) *Notify {
 // (idempotent, retriable). The summary bot is the sender for both the card and
 // the text-fallback path, so both require it to exist.
 func (n *Notify) ensureSummaryBotReady() {
-	if n.summaryBotOK {
+	if n.summaryBotOK.Load() {
 		return
 	}
 	n.summaryBotMu.Lock()
-	if !n.summaryBotOK {
-		n.summaryBotOK = n.ensureSummaryBot()
+	if !n.summaryBotOK.Load() {
+		n.summaryBotOK.Store(n.ensureSummaryBot())
 	}
 	n.summaryBotMu.Unlock()
 }
@@ -178,7 +179,7 @@ func (n *Notify) sendNotify(c *wkhttp.Context) {
 	// Card present) bind cleanly. payload and card are mutually exclusive
 	// (contract); a text request that carries neither keeps the legacy 400.
 	switch {
-	case req.Card != nil && len(req.Payload) > 0:
+	case req.Card != nil && req.Payload != nil:
 		httperr.ResponseErrorL(c, errcode.ErrNotifyCardInvalid, nil, nil)
 		return
 	case req.Card == nil && len(req.Payload) == 0:
