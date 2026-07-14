@@ -88,6 +88,40 @@ func TestDurableStore_ClaimIntentStoresOnlyHashesForOpaqueValues(t *testing.T) {
 	assert.NotContains(t, string(idempotencyHash), verified.Intent.IdempotencyKey)
 }
 
+func TestDurableStore_ReclaimPreTransportDeliveryHonorsRetryAndIntentExpiry(t *testing.T) {
+	store, _, now := newStoreHarness(t)
+	verified := verifiedForStore(now)
+	intentClaim, err := store.ClaimIntent(context.Background(), verified)
+	require.NoError(t, err)
+	delivery, err := store.ClaimDelivery(
+		context.Background(), intentClaim.IntentID, verified,
+		Target{Kind: TargetGroup, GroupNo: "group-a"}, "request-1",
+	)
+	require.NoError(t, err)
+	require.NoError(t, store.RecordPreTransportOutcome(
+		context.Background(), delivery.Record.ID, DeliveryRateLimited,
+		now.Add(5*time.Second), "rate_limited", "request-1",
+	))
+
+	err = store.ReclaimPreTransport(context.Background(), delivery.Record.ID, "request-2")
+	assert.ErrorIs(t, err, ErrDeliveryConflict)
+
+	store.now = func() time.Time { return now.Add(6 * time.Second) }
+	require.NoError(t, store.ReclaimPreTransport(context.Background(), delivery.Record.ID, "request-3"))
+	record, err := store.LoadDelivery(context.Background(), delivery.Record.ID)
+	require.NoError(t, err)
+	assert.Equal(t, DeliveryClaimed, record.State)
+	assert.Zero(t, record.RetryAt)
+
+	require.NoError(t, store.RecordPreTransportOutcome(
+		context.Background(), delivery.Record.ID, DeliveryFailed,
+		now.Add(7*time.Second), "authorization_unavailable", "request-3",
+	))
+	store.now = func() time.Time { return time.Unix(verified.Intent.ExpiresAt+1, 0) }
+	err = store.ReclaimPreTransport(context.Background(), delivery.Record.ID, "request-4")
+	assert.ErrorIs(t, err, ErrDeliveryConflict)
+}
+
 func TestDeliveryIdentityBindsActorProviderResourceRevisionSpaceAndTarget(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0).UTC()
 	base := validIntent(now)

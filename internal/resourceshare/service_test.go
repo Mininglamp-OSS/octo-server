@@ -76,11 +76,14 @@ type serviceHarness struct {
 	verifier   *ProofVerifier
 	intentKey  *ecdsa.PrivateKey
 	now        time.Time
+	clock      *time.Time
 }
 
 func newServiceHarness(t *testing.T, intent Intent, disclosures []TargetDisclosure) serviceHarness {
 	t.Helper()
 	store, _, now := newStoreHarness(t)
+	clock := now
+	store.now = func() time.Time { return clock }
 	intentKey := newIntentTestKey(t)
 	proofKey := newIntentTestKey(t)
 	adapter := &serviceAdapter{result: &RevalidatedResource{
@@ -106,12 +109,12 @@ func newServiceHarness(t *testing.T, intent Intent, disclosures []TargetDisclosu
 		ProofSigner:             signer,
 		Transport:               transport,
 		FeatureEnabled:          func() bool { return true },
-		Now:                     func() time.Time { return now },
+		Now:                     func() time.Time { return clock },
 		MaxConcurrentDispatches: 4,
 	})
 	require.NoError(t, err)
 	_ = intent
-	return serviceHarness{service, adapter, authorizer, limiter, transport, verifier, intentKey, now}
+	return serviceHarness{service, adapter, authorizer, limiter, transport, verifier, intentKey, now, &clock}
 }
 
 type dynamicServiceAdapter struct{}
@@ -356,6 +359,32 @@ func TestShareService_AuthorizationAndRateLimitArePerTargetAndFailClosed(t *test
 		assert.Equal(t, int64(10), result.Results[0].RetryAfterSeconds)
 		assert.Empty(t, h.transport.requests)
 	})
+}
+
+func TestShareService_RetriesPreTransportLimitOnlyAfterBoundary(t *testing.T) {
+	intent := validIntent(time.Unix(1_800_000_000, 0).UTC())
+	intent.Targets = []Target{{Kind: TargetGroup, GroupNo: "group-a"}}
+	h := newServiceHarness(t, intent, []TargetDisclosure{disclosureFor(intent.Targets[0], true)})
+	h.limiter.decision = LimitDecision{RetryAfter: 2 * time.Second}
+	compact := signIntent(t, h.intentKey, jose.ES256, "intent-key-1", intent)
+
+	first, err := h.service.Share(context.Background(), "user-a", "space-a", compact, "request-1")
+	require.NoError(t, err)
+	assert.Equal(t, ShareRateLimited, first.Results[0].Outcome)
+	assert.Equal(t, int64(2), first.Results[0].RetryAfterSeconds)
+	assert.Empty(t, h.transport.requests)
+
+	h.limiter.decision = LimitDecision{Allowed: true}
+	beforeBoundary, err := h.service.Share(context.Background(), "user-a", "space-a", compact, "request-2")
+	require.NoError(t, err)
+	assert.Equal(t, ShareRateLimited, beforeBoundary.Results[0].Outcome)
+	assert.Empty(t, h.transport.requests)
+
+	*h.clock = h.clock.Add(3 * time.Second)
+	afterBoundary, err := h.service.Share(context.Background(), "user-a", "space-a", compact, "request-3")
+	require.NoError(t, err)
+	assert.Equal(t, ShareSent, afterBoundary.Results[0].Outcome)
+	assert.Len(t, h.transport.requests, 1)
 }
 
 func TestShareService_FeatureDisabledFailsBeforeIntentProcessing(t *testing.T) {
