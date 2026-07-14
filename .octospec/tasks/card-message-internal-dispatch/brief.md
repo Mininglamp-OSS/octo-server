@@ -267,10 +267,10 @@ with different readiness):
   a signed structured intent; octo-server owns target authorization, template
   finalization, provenance, quotas, idempotency, audit, and transport. The
   generic contract is `../user-resource-share-card/brief.md`; smart-summary is
-  its first provider (`../smart-summary-user-share-card/brief.md`). A future
-  docs user-share card onboards as another provider and does not require a docs
-  Bot. Automated docs notifications/actions, if desired, remain a separate Bot
-  producer problem. The generic path is **not Bot API OBO**: no S2S caller
+  the initial use case, while a future docs user-share card onboards as another
+  provider and does not require a docs Bot. Automated docs notifications/
+  actions, if desired, remain a separate Bot producer problem. The generic
+  path is **not Bot API OBO**: no S2S caller
   supplies `actor_uid`, no request contains `from_uid`, and arbitrary card
   payloads remain forbidden.
 

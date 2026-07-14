@@ -148,9 +148,6 @@ Each of these is its own follow-up PR after the pilot is live.
   server-minted card flow for **DM, group, and thread** targets. The sharing
   user is the sender; `notification` does not proxy the share. Generic contract:
   `../user-resource-share-card/brief.md`.
-- **Smart-summary share provider:** first onboarding adapter, owning summary
-  visibility, structured claims, template mapping, and `/s/` link contract:
-  `../smart-summary-user-share-card/brief.md`.
 - **Docs user share:** later onboards as another resource provider and does not
   need a docs Bot. Automated docs notifications/actions would be a different
   Bot-producer task.

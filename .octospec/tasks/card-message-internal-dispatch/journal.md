@@ -36,10 +36,10 @@ forbidden.
 ## 2026-07-14 — resource-share platform generalization
 
 The trusted user-share path is a platform capability, not a smart-summary-only
-transport. The design is split into `user-resource-share-card` for provider
+transport. `user-resource-share-card` is the single authority for provider
 registration, authenticated sender/target/provenance/rate/idempotency/audit
-contracts, and `smart-summary-user-share-card` for the first provider's
-visibility, claims, template, and deep link.
+contracts. The superseded `smart-summary-user-share-card` brief was removed to
+avoid two competing share contracts.
 
 Future docs, task, or approval user shares onboard with provider-specific
 briefs and adapters. They must not duplicate the human-card trust boundary or
