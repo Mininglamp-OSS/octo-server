@@ -304,9 +304,10 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 		v.POST("/user/login/check_phone", loginLimit, u.loginCheckPhone)           //登录验证设备手机号
 
 		// #################### Token / Bot 认证验证（供 Gateway 调用） ####################
-		v.POST("/auth/verify", verifyLimit, u.authVerifyToken)          // 验证用户 token
-		v.POST("/auth/verify-bot", verifyLimit, u.authVerifyBot)        // 验证 Bot API Key
-		v.POST("/auth/verify-api-key", verifyLimit, u.authVerifyAPIKey) // 验证 daemon API Key (uk_)
+		v.POST("/auth/verify", verifyLimit, u.authVerifyToken)                     // 验证用户 token
+		v.POST("/auth/verify-bot", verifyLimit, u.authVerifyBot)                   // 验证 Bot API Key
+		v.POST("/auth/verify-api-key", verifyLimit, u.authVerifyAPIKey)            // 验证 daemon API Key (uk_)
+		v.POST("/auth/space-membership", verifyLimit, u.authVerifySpaceMembership) // 服务间 Space 成员校验 (docs-backend anyone_in_space)
 		// ↑ Verify endpoints are rate-limited (1000 req/min/IP). For production,
 		// restrict access at network level (nginx allow internal IPs only) or
 		// add X-Internal-Key header validation.
@@ -4480,4 +4481,81 @@ func (u *User) queryOwnedBotsBySpace(creatorUID, spaceID string) ([]string, erro
 		out = out[:ownedBotsLimit]
 	}
 	return out, nil
+}
+
+type authSpaceMembershipReq struct {
+	SpaceID string `json:"space_id"`
+	UID     string `json:"uid"`
+}
+
+type authSpaceMembershipResp struct {
+	SpaceID  string `json:"space_id"`
+	UID      string `json:"uid"`
+	IsMember bool   `json:"is_member"`
+	// Role echoes space_member.role of the active row (0 member / 1 admin /
+	// 2 owner). Pointer + omitempty so it is present-and-0 for a member with
+	// the base role, but omitted entirely when is_member=false (contract:
+	// role is meaningless for a non-member). A plain int would collapse
+	// "member with role 0" and "not a member" into the same wire shape.
+	Role *int `json:"role,omitempty"`
+}
+
+// authVerifySpaceMembership answers "is <uid> an active member of <space_id>?"
+// for internal service callers (octo-docs-backend anyone_in_space share
+// permissions, GH octo-docs #64). Registered in the Gateway verify group with
+// the SAME protection as verify / verify-bot / verify-api-key (network-level
+// internal-IP restriction + verifyLimit rate cap) — deliberately NOT behind
+// end-user session AuthMiddleware, since the caller is a service, not a
+// logged-in user.
+//
+// Thin wrapper over the canonical space_member membership predicate
+// (space_id + uid + status=1, hitting the spacemember_spaceid_uid unique
+// index — O(1), no scan) already used by BotAPI.isSpaceMember
+// (modules/bot_api/send.go). is_member is exactly that predicate's
+// COUNT(...) > 0; we additionally echo the active row's role. Human/bot
+// parity is by construction: a bot has a space_member row just like a human,
+// so the same query answers both with no special-casing.
+func (u *User) authVerifySpaceMembership(c *wkhttp.Context) {
+	var req authSpaceMembershipReq
+	if err := c.BindJSON(&req); err != nil {
+		u.Warn("authVerifySpaceMembership 请求体格式错误", zap.Error(err))
+		respondUserRequestInvalid(c, "")
+		return
+	}
+	if req.SpaceID == "" {
+		respondUserRequestInvalid(c, "space_id")
+		return
+	}
+	if req.UID == "" {
+		respondUserRequestInvalid(c, "uid")
+		return
+	}
+
+	// SELECT role over the same (space_id, uid, status=1) predicate as the
+	// canonical COUNT. The unique index guarantees at most one active row, so
+	// Load returns 0 or 1 rows; is_member = (rows > 0), matching COUNT(...) > 0
+	// without a second query. Load does NOT surface dbr.ErrNotFound on the
+	// zero-row case, so a genuine err is always an infrastructure failure.
+	var roles []int
+	_, err := u.db.session.SelectBySql(
+		"SELECT role FROM space_member WHERE space_id=? AND uid=? AND status=1",
+		req.SpaceID, req.UID,
+	).Load(&roles)
+	if err != nil {
+		u.Error("authVerifySpaceMembership query failed",
+			zap.String("space_id", req.SpaceID), zap.String("uid", req.UID), zap.Error(err))
+		respondUserServiceError(c)
+		return
+	}
+
+	resp := authSpaceMembershipResp{
+		SpaceID:  req.SpaceID,
+		UID:      req.UID,
+		IsMember: len(roles) > 0,
+	}
+	if resp.IsMember {
+		role := roles[0]
+		resp.Role = &role
+	}
+	c.Response(resp)
 }
