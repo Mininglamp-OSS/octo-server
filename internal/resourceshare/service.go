@@ -79,6 +79,14 @@ type shareTransport interface {
 	SendMessageWithResult(*config.MsgSendReq) (*config.MsgSendResp, error)
 }
 
+type ShareObserver interface {
+	ObserveTarget(provider ProviderID, kind TargetKind, outcome ShareOutcome)
+}
+
+type noopShareObserver struct{}
+
+func (noopShareObserver) ObserveTarget(ProviderID, TargetKind, ShareOutcome) {}
+
 type ShareServiceDependencies struct {
 	Registry                *Registry
 	Store                   shareStore
@@ -89,6 +97,7 @@ type ShareServiceDependencies struct {
 	FeatureEnabled          func() bool
 	Now                     func() time.Time
 	MaxConcurrentDispatches int
+	Observer                ShareObserver
 }
 
 type ShareService struct {
@@ -101,6 +110,7 @@ type ShareService struct {
 	featureEnabled func() bool
 	now            func() time.Time
 	dispatchSlots  chan struct{}
+	observer       ShareObserver
 }
 
 func NewShareService(deps ShareServiceDependencies) (*ShareService, error) {
@@ -119,11 +129,16 @@ func NewShareService(deps ShareServiceDependencies) (*ShareService, error) {
 		}
 		maxConcurrentDispatches = 1
 	}
+	observer := deps.Observer
+	if observer == nil {
+		observer = noopShareObserver{}
+	}
 	service := &ShareService{
 		registry: deps.Registry, store: deps.Store, authorizer: deps.Authorizer,
 		limiter: deps.Limiter, proofSigner: deps.ProofSigner, transport: deps.Transport,
 		featureEnabled: featureEnabled, now: now,
 		dispatchSlots: make(chan struct{}, maxConcurrentDispatches),
+		observer:      observer,
 	}
 	if featureEnabled() && !service.ready() {
 		return nil, fmt.Errorf("%w: enabled service has missing dependencies", ErrShareConfig)
@@ -198,10 +213,14 @@ func (s *ShareService) readExpiredResults(ctx context.Context, verified Verified
 	for _, target := range verified.Intent.Targets {
 		record, err := s.store.LookupDelivery(ctx, verified, target)
 		if err != nil {
-			result.Results = append(result.Results, TargetResult{Target: target, Outcome: ShareFailed})
+			targetResult := TargetResult{Target: target, Outcome: ShareFailed}
+			s.observer.ObserveTarget(verified.ProviderID, target.Kind, targetResult.Outcome)
+			result.Results = append(result.Results, targetResult)
 			continue
 		}
-		result.Results = append(result.Results, targetResultFromRecord(target, *record, s.now()))
+		targetResult := targetResultFromRecord(target, *record, s.now())
+		s.observer.ObserveTarget(verified.ProviderID, target.Kind, targetResult.Outcome)
+		result.Results = append(result.Results, targetResult)
 	}
 	return result
 }
@@ -214,7 +233,10 @@ func (s *ShareService) shareTarget(
 	disclosureAllowed bool,
 	card map[string]interface{},
 	requestID string,
-) TargetResult {
+) (result TargetResult) {
+	defer func() {
+		s.observer.ObserveTarget(verified.ProviderID, target.Kind, result.Outcome)
+	}()
 	claim, err := s.store.ClaimDelivery(ctx, intentID, verified, target, requestID)
 	if err != nil {
 		return TargetResult{Target: target, Outcome: ShareFailed}

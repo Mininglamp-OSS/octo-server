@@ -189,6 +189,7 @@ func newProductionAPI(
 		ProofSigner: signer, Transport: productionTransport{ctx: ctx},
 		FeatureEnabled:          func() bool { return true },
 		MaxConcurrentDispatches: runtimeConfig.MaxConcurrentDispatches,
+		Observer:                defaultShareMetrics(),
 	})
 	if err != nil {
 		_ = redisClient.Close()
