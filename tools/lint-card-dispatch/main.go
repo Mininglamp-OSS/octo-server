@@ -34,6 +34,7 @@ var defaultAllowlist = []AllowlistEntry{
 	{Path: "modules/robot", Receiver: "Robot", Function: "sendMessage", Reason: "reviewed legacy Robot API card ingress"},
 	{Path: "modules/incomingwebhook", Receiver: "IncomingWebhook", Function: "handlePush", Reason: "reviewed Incoming Webhook card ingress"},
 	{Path: "internal/carddispatch", Receiver: "producerSender", Function: "Send", Reason: "sole reviewed server-internal card dispatch boundary"},
+	{Path: "internal/resourceshare", Receiver: "ShareService", Function: "shareTarget", Reason: "sole reviewed proof-bound human resource card dispatch boundary"},
 }
 
 type Finding struct {
