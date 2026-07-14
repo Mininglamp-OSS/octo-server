@@ -95,7 +95,10 @@ carddispatch.Sender.Send                 （producer-bound；DM/octo/v1/system-n
   "version": "1.5",
   "metadata": {
     "webUrl": "https://im.example.com/s/TN_20260713_abcd?sp=spc_xxx",
-    "octo": { "variant": "summary.completed" }
+    "octo": {
+      "variant": "summary.completed",
+      "source": { "label": "智能总结" }
+    }
   },
   "body": [
     { "type": "Container", "items": [
@@ -171,7 +174,10 @@ carddispatch.Sender.Send                 （producer-bound；DM/octo/v1/system-n
   "version": "1.5",
   "metadata": {
     "webUrl": "https://im.example.com/s/TN_20260713_abcd?sp=spc_xxx",
-    "octo": { "variant": "summary.failed" }
+    "octo": {
+      "variant": "summary.failed",
+      "source": { "label": "智能总结" }
+    }
   },
   "body": [
     { "type": "Container", "items": [
@@ -203,27 +209,38 @@ carddispatch.Sender.Send                 （producer-bound；DM/octo/v1/system-n
 ### 2.3 AC `metadata`（跨 producer 共享的约定）
 
 每张卡都在 AdaptiveCard 根上带上标准 AC 1.5 `metadata` 对象，内嵌 **保留命名空间**
-`octo` 供未来渲染层区分卡片家族／样式。字段稳定、低基数，值由服务端生成：
+`octo` 供渲染层区分卡片家族／样式、显示来源角标。字段稳定、低基数，值由服务端生成：
 
 ```json
 "metadata": {
   "webUrl": "<deep-link>",              // AC 1.5 标准字段；与主 Action.OpenUrl.url 同源
-  "octo":   { "variant": "<family>.<kind>" }
+  "octo": {
+    "variant": "<family>.<kind>",       // 卡片家族+种类标识，见下表
+    "source":  { "label": "<来源名>", "iconUrl": "<可选 https 角标图标>" }
+  }
 }
 ```
 
-`variant` 保留词表（`{producer_family}.{kind}`，只增不改）：
+- **`variant`** —— 稳定标识，渲染端**可以但不必**读；未识别值等同「泛用卡片」。
+- **`source`** —— 来源能力，供渲染端显示「来自 XX」chip / 角标。`label` 由 producer
+  **按出站语言**传入（`i18n.OutboundLanguage` → `summaryLabelsFor`/`docsLabelsFor` 的
+  `sourceLabel`），与卡片其它文案同一套 i18n；`iconUrl` 可选（当前 pilot 只填 `label`）。
+  模板**不自动**把 `source` 渲进卡体——是否显示、以何形态显示（chip / 前缀 / 静默）由
+  渲染端决定，机器消费方则已拿到来源信号。
 
-| producer | Kind | variant |
-|---|---|---|
-| `summary-notify` | `completed` | `summary.completed` |
-| `summary-notify` | `failed` | `summary.failed` |
-| `docs-notify` | `shared` / `commented` / `access_requested` | `docs.shared` / `docs.commented` / `docs.access_requested` |
-| 后续新增 producer | 自定 kind | `<family>.<kind>` |
+`variant` / `source.label` 保留词表（`{producer_family}.{kind}`，只增不改）：
 
-渲染端**可以但不必**读 `variant` —— 未识别的值等同「泛用卡片」。产者永远不塞用户
-输入到 `metadata`（只塞服务端选定的 `variant` + 服务端拼的 `webUrl`），避免绕开
-主体 URL/markdown 白名单（`pkg/cardmsg.Validate` 不解析 `metadata` 子字段）。
+| producer | Kind | variant | `source.label`（zh-CN / en-US） |
+|---|---|---|---|
+| `summary-notify` | `completed` | `summary.completed` | 智能总结 / Smart Summary |
+| `summary-notify` | `failed` | `summary.failed` | 智能总结 / Smart Summary |
+| `docs-notify` | `shared` / `commented` / `access_requested` | `docs.shared` / `docs.commented` / `docs.access_requested` | 文档 / Docs |
+| 后续新增 producer | 自定 kind | `<family>.<kind>` | 该 producer 的 i18n `sourceLabel` |
+
+产者永远不塞用户输入到 `metadata`（只塞服务端选定的 `variant`/`source` + 服务端拼的
+`webUrl`），避免绕开主体 URL/markdown 白名单（`pkg/cardmsg.Validate` 不解析
+`metadata` 子字段——正因如此，`metadata` 里没有任何调用方可控的输入面）。
+`source.iconUrl` 若设置，`cardtmpl` 会走 `requireHTTPS` 正向校验。
 
 ## 3. Ingress 契约（`POST /v1/internal/notify`）
 

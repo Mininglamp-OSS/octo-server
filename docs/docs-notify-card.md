@@ -10,7 +10,7 @@
 > 同目录 `docs-notify-contract.md`（跨仓 ingress 契约）。两者如有出入，以代码为准。
 >
 > 兄弟文档：`docs/summary-notify-card.md`（`summary-notify` 生产者）— 组装管线、
-> 降级链、Deep-link 前置、`metadata.octo.variant` 保留词表、错误分类**完全一致**，
+> 降级链、Deep-link 前置、`metadata.octo.{variant,source}` 保留词表、错误分类**完全一致**，
 > 本文档只呈现 docs 特有的字段/文案/deep-link 差异。
 
 ## 1. 概览
@@ -86,7 +86,10 @@ brief），发送方为分享用户本人，与本 producer 无关。docs-notify
   "version": "1.5",
   "metadata": {
     "webUrl": "https://im.example.com/d/d_20260713_abcd?sp=spc_xxx",
-    "octo": { "variant": "docs.shared" }
+    "octo": {
+      "variant": "docs.shared",
+      "source": { "label": "文档" }
+    }
   },
   "body": [
     { "type": "Container", "items": [
@@ -250,4 +253,4 @@ Excerpt 与 FactSet 位置可调）。多一个 docs 专属候选：
   - `docs/card-protocol.md` — wire 协议权威
   - `docs/summary-notify-card.md` — 姊妹 producer 文档，共享管线细节
 - 相关 PR：#577（dispatch 基座）、#579（`summary-notify` pilot）、#580（复用
-  `notification` bot 身份）、本 PR（`docs-notify` producer + `metadata.octo.variant`）
+  `notification` bot 身份）、本 PR（`docs-notify` producer + `metadata.octo.{variant,source}`）

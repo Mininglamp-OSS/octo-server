@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -209,21 +210,37 @@ func (n *Notify) sendSummaryText(uid, spaceID, text string) error {
 	))
 }
 
+// sanitizeLine collapses any control character (newline, CR, tab, …) in a
+// caller-supplied string to a single space and trims the result. The plain-text
+// fallback DM is line-structured, so an embedded "\n" in a caller field (title,
+// excerpt, actor name) could otherwise inject a spoofed attribution/label line.
+// Card rendering has its own defence (escapeMarkdown); this is the text-path
+// equivalent. It is a strict superset of strings.TrimSpace for our inputs.
+func sanitizeLine(s string) string {
+	return strings.TrimSpace(strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, s))
+}
+
 // buildSummaryFallbackText composes the plain-text DM used when a card cannot be
 // built. It mirrors the fields the card would carry so no information is lost.
+// Caller fields are sanitizeLine'd so a newline can't inject a spoofed line.
 func buildSummaryFallbackText(card *SummaryCardFields, lang string) string {
 	labels := summaryLabelsFor(lang)
 	var b strings.Builder
-	title := strings.TrimSpace(card.Title)
+	title := sanitizeLine(card.Title)
 	if card.Kind == SummaryCardKindFailed {
 		fmt.Fprintf(&b, labels.failedHeadline, title)
-		if reason := strings.TrimSpace(card.Reason); reason != "" {
+		if reason := sanitizeLine(card.Reason); reason != "" {
 			fmt.Fprintf(&b, "\n%s%s", labels.failedPrefix, reason)
 		}
 		return b.String()
 	}
 	fmt.Fprintf(&b, labels.completedHeadline, title)
-	if tr := strings.TrimSpace(card.TimeRange); tr != "" {
+	if tr := sanitizeLine(card.TimeRange); tr != "" {
 		fmt.Fprintf(&b, "\n%s%s", labels.timeRange+labels.kvSep, tr)
 	}
 	if card.Members > 0 {
@@ -232,7 +249,7 @@ func buildSummaryFallbackText(card *SummaryCardFields, lang string) string {
 	if card.MsgCount > 0 {
 		fmt.Fprintf(&b, "\n%s"+labels.msgCountValue, labels.msgCount+labels.kvSep, card.MsgCount)
 	}
-	if gen := strings.TrimSpace(card.GeneratedAt); gen != "" {
+	if gen := sanitizeLine(card.GeneratedAt); gen != "" {
 		fmt.Fprintf(&b, "\n%s%s", labels.generatedAt+labels.kvSep, gen)
 	}
 	return b.String()
@@ -437,16 +454,18 @@ func docsAttributionAndVariant(kind, actorName string, labels docsLabels) (strin
 // appear on the card is emitted as a text line.
 func buildDocsFallbackText(card *DocsCardFields, lang string) string {
 	labels := docsLabelsFor(lang)
-	attribution, _ := docsAttributionAndVariant(card.Kind, card.ActorName, labels)
+	// sanitizeLine the actor before it flows into the attribution line, and each
+	// other caller field, so an embedded newline can't inject a spoofed line.
+	attribution, _ := docsAttributionAndVariant(card.Kind, sanitizeLine(card.ActorName), labels)
 	var b strings.Builder
 	b.WriteString(attribution)
-	if title := strings.TrimSpace(card.Title); title != "" {
+	if title := sanitizeLine(card.Title); title != "" {
 		fmt.Fprintf(&b, "\n%s%s", labels.title+labels.kvSep, title)
 	}
-	if excerpt := strings.TrimSpace(card.Excerpt); excerpt != "" {
+	if excerpt := sanitizeLine(card.Excerpt); excerpt != "" {
 		fmt.Fprintf(&b, "\n%s", excerpt)
 	}
-	if ts := strings.TrimSpace(card.UpdatedAt); ts != "" {
+	if ts := sanitizeLine(card.UpdatedAt); ts != "" {
 		fmt.Fprintf(&b, "\n%s%s", labels.updatedAt+labels.kvSep, ts)
 	}
 	return b.String()

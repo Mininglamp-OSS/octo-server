@@ -54,8 +54,16 @@ type ResourceCard struct {
 // display badging and machine identification. Values are server-picked (never
 // user-supplied) and land in `metadata.octo.source`.
 type Source struct {
-	Label   string // human-readable source name, e.g. "智能总结" / "Smart Summary" / "文档" / "Docs"
-	IconURL string // absolute https icon URL, optional; renderers may use it for the chip
+	// Label is a human-readable source name. It is already localized by the
+	// caller: producers pass it from their per-language label set
+	// (modules/notify summaryLabelsFor/docsLabelsFor, keyed by
+	// i18n.OutboundLanguage) — e.g. "智能总结"/"Smart Summary",
+	// "文档"/"Docs" — so this template stores whatever localized string it
+	// receives and does not itself pick a language.
+	Label string
+	// IconURL is an optional absolute https icon URL; renderers may use it for
+	// the chip. Empty by default (the pilot sets Label only).
+	IconURL string
 }
 
 func BuildSummaryResourceCard(

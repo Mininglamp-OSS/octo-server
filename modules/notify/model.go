@@ -59,9 +59,9 @@ type DocsCardFields struct {
 
 // Docs card notification kinds.
 const (
-	DocsCardKindShared           = "shared"
-	DocsCardKindCommented        = "commented"
-	DocsCardKindAccessRequested  = "access_requested"
+	DocsCardKindShared          = "shared"
+	DocsCardKindCommented       = "commented"
+	DocsCardKindAccessRequested = "access_requested"
 )
 
 // BatchNotifyReq 批量通知请求

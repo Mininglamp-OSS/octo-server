@@ -162,6 +162,33 @@ func TestDeliverCardNotification_DegradesToTextWhenSenderUnavailable(t *testing.
 	assert.Equal(t, int32(1), atomic.LoadInt32(&wk.messageCount), "exactly one text DM should be sent")
 }
 
+// A non-member target must be excluded from delivery and reported in Filtered,
+// never delivered — this locks the member-verify pre-filter. A regression that
+// dropped it would otherwise pass every other card-path unit test (they only
+// seed the delivered member). carddispatch re-verifies membership independently
+// (Decision 3), but the pre-filter is the first gate and worth pinning. Uses
+// the text-fallback path (nil sender) so no carddispatch mock is needed; the
+// assertion is that the stranger reaches neither Delivered nor transport.
+func TestDeliverCardNotification_NonMemberExcluded(t *testing.T) {
+	wk := newWuKongServer()
+	defer wk.close()
+	ctx := newTestContext(t, wk)
+	n := newTestNotify(ctx, nil, nil, nil, "tk")
+	n.cardSender = nil
+	n.botOK.Store(true)
+	primeMemberCache(n, "spc_1", "uid_member") // uid_stranger is NOT a member
+
+	resp, err := n.deliverCardNotification(&NotifyReq{
+		SpaceID: "spc_1", Service: "summary-service",
+		Targets: []string{"uid_member", "uid_stranger"}, Card: validCard(),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"uid_member"}, resp.Delivered)
+	assert.Equal(t, "not_space_member", resp.Filtered["uid_stranger"])
+	assert.NotContains(t, resp.Delivered, "uid_stranger")
+	assert.Equal(t, int32(1), atomic.LoadInt32(&wk.messageCount), "only the member gets a DM")
+}
+
 // payload and card are mutually exclusive on the single endpoint (contract).
 func TestIntegration_NotifyRejectsPayloadAndCardTogether(t *testing.T) {
 	wk := newWuKongServer()
@@ -311,6 +338,38 @@ func TestDeliverDocsCardNotification_DegradesToTextWhenSenderUnavailable(t *test
 	assert.Equal(t, []string{"uid_a"}, resp.Delivered)
 	assert.Empty(t, resp.Filtered)
 	assert.Equal(t, int32(1), atomic.LoadInt32(&wk.messageCount), "exactly one text DM should be sent")
+}
+
+// Docs path: same non-member pre-filter guarantee as the summary path above.
+func TestDeliverDocsCardNotification_NonMemberExcluded(t *testing.T) {
+	wk := newWuKongServer()
+	defer wk.close()
+	ctx := newTestContext(t, wk)
+	n := newTestNotify(ctx, nil, nil, nil, "tk")
+	n.docsSender = nil
+	n.botOK.Store(true)
+	primeMemberCache(n, "spc_1", "uid_member") // uid_stranger is NOT a member
+
+	resp, err := n.deliverDocsCardNotification(&NotifyReq{
+		SpaceID: "spc_1", Service: "docs-service",
+		Targets: []string{"uid_member", "uid_stranger"}, DocsCard: validDocsCard(),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"uid_member"}, resp.Delivered)
+	assert.Equal(t, "not_space_member", resp.Filtered["uid_stranger"])
+	assert.NotContains(t, resp.Delivered, "uid_stranger")
+	assert.Equal(t, int32(1), atomic.LoadInt32(&wk.messageCount), "only the member gets a DM")
+}
+
+// A newline embedded in a caller field must not inject a spoofed line into the
+// plain-text fallback DM: sanitizeLine collapses control chars to spaces.
+func TestBuildDocsFallbackText_StripsNewlineInjection(t *testing.T) {
+	card := validDocsCard()
+	card.ActorName = "Alice\n系统管理员"
+	card.Title = "标题\n伪造：越权提示"
+	text := buildDocsFallbackText(card, "zh-CN")
+	assert.NotContains(t, text, "\n伪造", "an embedded title newline must not start a new line")
+	assert.Contains(t, text, "Alice 系统管理员 分享了文档", "actor newline collapses to a space in the attribution")
 }
 
 // The single-endpoint mutex also covers DocsCard combined with either Payload
