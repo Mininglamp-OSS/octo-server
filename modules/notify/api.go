@@ -44,8 +44,6 @@ type Notify struct {
 	memberCache   *memberCache
 	botMu         sync.Mutex
 	botOK         atomic.Bool
-	summaryBotMu  sync.Mutex
-	summaryBotOK  atomic.Bool
 	cardSender    carddispatch.Sender
 	internalToken string
 	log.Log
@@ -90,42 +88,35 @@ func New(ctx *config.Context) *Notify {
 	// 监听成员加入事件
 	ctx.AddEventListener(event.SpaceMemberJoin, n.handleSpaceMemberEvent)
 
-	// 启动时创建全局通知 Bot + 专用 summary Bot（单例，带 panic recovery）
+	// 启动时创建全局通知 Bot（单例，带 panic recovery）。summary-notify
+	// 卡片复用同一身份，避免在用户会话列表中产生第二个系统 Bot 会话。
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
 				n.Error("ensureNotifyBot panic", zap.Any("recover", r))
 			}
 		}()
-		n.botMu.Lock()
-		if !n.botOK.Load() {
-			n.botOK.Store(n.ensureNotifyBot())
-		}
-		n.botMu.Unlock()
+		n.ensureNotifyBotReady()
 		if n.botOK.Load() {
 			n.Info("Notify bot ready")
-		}
-		n.ensureSummaryBotReady()
-		if n.summaryBotOK.Load() {
-			n.Info("Summary bot ready")
 		}
 	}()
 
 	return n
 }
 
-// ensureSummaryBotReady provisions the dedicated summary bot on demand
-// (idempotent, retriable). The summary bot is the sender for both the card and
-// the text-fallback path, so both require it to exist.
-func (n *Notify) ensureSummaryBotReady() {
-	if n.summaryBotOK.Load() {
+// ensureNotifyBotReady provisions the shared notification bot on demand
+// (idempotent, retriable). Legacy text notifications, summary cards, and their
+// text fallback all use this one DM identity.
+func (n *Notify) ensureNotifyBotReady() {
+	if n.botOK.Load() {
 		return
 	}
-	n.summaryBotMu.Lock()
-	if !n.summaryBotOK.Load() {
-		n.summaryBotOK.Store(n.ensureSummaryBot())
+	n.botMu.Lock()
+	if !n.botOK.Load() {
+		n.botOK.Store(n.ensureNotifyBot())
 	}
-	n.summaryBotMu.Unlock()
+	n.botMu.Unlock()
 }
 
 // Route 路由配置
@@ -314,13 +305,7 @@ func (n *Notify) deliverNotification(req *NotifyReq) (*NotifyResp, error) {
 	}
 
 	// 确保 Bot 存在（失败可重试，不用 sync.Once）
-	if !n.botOK.Load() {
-		n.botMu.Lock()
-		if !n.botOK.Load() {
-			n.botOK.Store(n.ensureNotifyBot())
-		}
-		n.botMu.Unlock()
-	}
+	n.ensureNotifyBotReady()
 	if !n.botOK.Load() {
 		return nil, errors.New("notify bot unavailable")
 	}

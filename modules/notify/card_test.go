@@ -46,11 +46,6 @@ func assertReadinessIsRaceSafe(t *testing.T, ready *atomic.Bool) {
 	wg.Wait()
 }
 
-func TestSummaryBotReadinessIsRaceSafe(t *testing.T) {
-	var n Notify
-	assertReadinessIsRaceSafe(t, &n.summaryBotOK)
-}
-
 func TestNotifyBotReadinessIsRaceSafe(t *testing.T) {
 	var n Notify
 	assertReadinessIsRaceSafe(t, &n.botOK)
@@ -148,14 +143,14 @@ func TestSendSummaryTextUsesNotificationBot(t *testing.T) {
 }
 
 // When no card sender is wired (or the card feature is off), a card request must
-// still deliver — as a plain-text DM from the summary bot — never be dropped.
+// still deliver — as a plain-text DM from the notification bot — never be dropped.
 func TestDeliverCardNotification_DegradesToTextWhenSenderUnavailable(t *testing.T) {
 	wk := newWuKongServer()
 	defer wk.close()
 	ctx := newTestContext(t, wk)
 	n := newTestNotify(ctx, nil, nil, nil, "tk")
-	n.cardSender = nil         // no producer bound → cannot build a card
-	n.summaryBotOK.Store(true) // summary bot already provisioned
+	n.cardSender = nil  // no producer bound → cannot build a card
+	n.botOK.Store(true) // notification bot already provisioned
 	primeMemberCache(n, "spc_1", "uid_a")
 
 	resp, err := n.deliverCardNotification(&NotifyReq{

@@ -43,9 +43,9 @@ import (
 )
 
 const (
-	e2eSpaceID   = "spc_pilote2e"
-	e2eSummaryID = "summary" // must match notify.SummaryBotUIDValue
-	e2eProducer  = carddispatch.ProducerID("summary-notify")
+	e2eSpaceID     = "spc_pilote2e"
+	e2eNotifyBotID = notify.NotifyBotUIDValue
+	e2eProducer    = carddispatch.ProducerID("summary-notify")
 )
 
 // TestSummaryCard_DispatchesAndPersistsInWuKongIM simulates what octo-smart-summary
@@ -62,7 +62,7 @@ func TestSummaryCard_DispatchesAndPersistsInWuKongIM(t *testing.T) {
 
 	// WuKongIM persists its channel log in ~/.wukong ACROSS test runs (only MySQL
 	// is truncated by CleanAllTables), so use a fresh recipient per run — the
-	// summary↔recipient personal channel then holds exactly this run's card.
+	// notification↔recipient personal channel then holds exactly this run's card.
 	recipient := fmt.Sprintf("uid_pilote2e_%d", time.Now().UnixNano())
 
 	_, ctx := testutil.NewTestServer()
@@ -70,7 +70,7 @@ func TestSummaryCard_DispatchesAndPersistsInWuKongIM(t *testing.T) {
 
 	seedSpace(t, ctx)
 	seedSpaceMember(t, ctx, recipient)
-	seedSummaryRobot(t, ctx)
+	seedNotificationRobot(t, ctx)
 
 	// Build the ONE process registry exactly like main.installCardDispatch, with
 	// the summary-notify producer enabled (DM-only, octo/v1, system-notification).
@@ -84,7 +84,7 @@ func TestSummaryCard_DispatchesAndPersistsInWuKongIM(t *testing.T) {
 	registry := carddispatch.NewRegistry(deps, []carddispatch.ProducerSpec{{
 		ID:                  e2eProducer,
 		Enabled:             true,
-		SenderUID:           e2eSummaryID,
+		SenderUID:           e2eNotifyBotID,
 		AllowedChannelTypes: []uint8{common.ChannelTypePerson.Uint8()},
 		AllowedProfiles:     []string{cardmsg.ProfileV1},
 		SpacePolicy:         carddispatch.SpacePolicySystemNotification,
@@ -136,7 +136,7 @@ func TestSummaryCard_DispatchesAndPersistsInWuKongIM(t *testing.T) {
 	assert.Equal(t, e2eSpaceID, msg["space_id"], "server-authored space_id must be on the wire")
 	assert.NotZero(t, intOf(msg["__message_seq"]), "message must be persisted with a channel sequence")
 	assert.EqualValues(t, result.MessageID, intOf(msg["__message_id"]), "read-back is the exact message we dispatched")
-	assert.Equal(t, e2eSummaryID, msg["__from_uid"], "sender on the wire is the bound summary bot, not a caller-supplied uid")
+	assert.Equal(t, e2eNotifyBotID, msg["__from_uid"], "sender on the wire is the bound notification bot, not a caller-supplied uid")
 	t.Logf("read-back persisted card: message_id=%d message_seq=%d from_uid=%v", intOf(msg["__message_id"]), intOf(msg["__message_seq"]), msg["__from_uid"])
 	t.Logf("read-back persisted card payload: %s", compactJSON(msg))
 }
@@ -146,7 +146,7 @@ func TestSummaryCard_DispatchesAndPersistsInWuKongIM(t *testing.T) {
 // body to the real POST /v1/internal/notify handler (structured Card field, no
 // hand-built type-17 map), lets modules/notify build the card server-side and
 // fan it out through the producer, and confirms the type-17 card persisted in
-// WuKongIM. The summary bot is provisioned by notify.New itself (not seeded).
+// WuKongIM. The notification bot is provisioned by notify.New itself (not seeded).
 func TestSummaryNotify_HTTPEndpointDeliversCardToWuKongIM(t *testing.T) {
 	t.Setenv(cardmsg.EnvEnabled, "true")
 	t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
@@ -175,7 +175,7 @@ func TestSummaryNotify_HTTPEndpointDeliversCardToWuKongIM(t *testing.T) {
 	registry := carddispatch.NewRegistry(deps, []carddispatch.ProducerSpec{{
 		ID:                  e2eProducer,
 		Enabled:             true,
-		SenderUID:           e2eSummaryID,
+		SenderUID:           e2eNotifyBotID,
 		AllowedChannelTypes: []uint8{common.ChannelTypePerson.Uint8()},
 		AllowedProfiles:     []string{cardmsg.ProfileV1},
 		SpacePolicy:         carddispatch.SpacePolicySystemNotification,
@@ -184,7 +184,7 @@ func TestSummaryNotify_HTTPEndpointDeliversCardToWuKongIM(t *testing.T) {
 	}})
 	require.NoError(t, carddispatch.Install(ctx, registry))
 
-	n := notify.New(ctx) // wires the card Sender + starts async summary-bot provisioning
+	n := notify.New(ctx) // wires the card Sender + starts async notification-bot provisioning
 	r := wkhttp.New()
 	n.Route(r)
 	r.SetErrorRenderer(octoi18n.NewErrorRenderer(octoi18n.NewLocalizer(octoi18n.DefaultLanguage)))
@@ -206,8 +206,8 @@ func TestSummaryNotify_HTTPEndpointDeliversCardToWuKongIM(t *testing.T) {
 	}
 	body, _ := json.Marshal(reqBody)
 
-	// Poll until the async summary-bot provisioning completes (card path returns
-	// "summary bot unavailable" → 500 until then), then assert the card delivered.
+	// Poll until async notification-bot provisioning completes (the card path
+	// returns "notification bot unavailable" → 500 until then).
 	var delivered []string
 	var lastCode int
 	var lastBody string
@@ -238,7 +238,7 @@ func TestSummaryNotify_HTTPEndpointDeliversCardToWuKongIM(t *testing.T) {
 	assert.EqualValues(t, cardmsg.InteractiveCard.Int(), intOf(msg["type"]))
 	assert.Equal(t, cardmsg.ProfileV1, msg["profile"])
 	assert.Equal(t, e2eSpaceID, msg["space_id"], "server-authored space_id on the wire")
-	assert.Equal(t, e2eSummaryID, msg["__from_uid"], "delivered by the bound summary bot")
+	assert.Equal(t, e2eNotifyBotID, msg["__from_uid"], "delivered by the bound notification bot")
 	// The deep link the server built from External.WebLoginURL + task_no.
 	assert.Contains(t, compactJSON(msg), "https://im.example.com/s/TN_pilote2e_http?sp="+e2eSpaceID)
 	t.Logf("HTTP-path persisted card: message_id=%d message_seq=%d from_uid=%v",
@@ -273,16 +273,16 @@ func seedSpaceMember(t *testing.T, ctx *config.Context, uid string) {
 	require.NoError(t, err, "seed space_member")
 }
 
-// seedSummaryRobot registers the summary bot as an active robot so botidentity
+// seedNotificationRobot registers the notification bot as an active robot so botidentity
 // resolves it as KindUserBot without going through notify's async provisioning.
-func seedSummaryRobot(t *testing.T, ctx *config.Context) {
+func seedNotificationRobot(t *testing.T, ctx *config.Context) {
 	t.Helper()
 	_, err := ctx.DB().InsertInto("robot").
-		Pair("robot_id", e2eSummaryID).
+		Pair("robot_id", e2eNotifyBotID).
 		Pair("token", "").
 		Pair("status", 1).
 		Pair("placeholder", "").
-		Pair("username", e2eSummaryID).
+		Pair("username", e2eNotifyBotID).
 		Pair("app_id", "").
 		Pair("creator_uid", "").
 		Pair("description", "").
@@ -290,7 +290,7 @@ func seedSummaryRobot(t *testing.T, ctx *config.Context) {
 		Pair("im_token_cache", "").
 		Pair("bot_commands", "").
 		Exec()
-	require.NoError(t, err, "seed robot (summary bot)")
+	require.NoError(t, err, "seed robot (notification bot)")
 }
 
 // readBackType17 polls WuKongIM's /channel/messagesync for the summary↔recipient
@@ -301,8 +301,8 @@ func seedSummaryRobot(t *testing.T, ctx *config.Context) {
 func readBackType17(t *testing.T, apiURL, recipient string, wantID int64) map[string]interface{} {
 	t.Helper()
 	perspectives := []struct{ login, channel string }{
-		{login: recipient, channel: e2eSummaryID},
-		{login: e2eSummaryID, channel: recipient},
+		{login: recipient, channel: e2eNotifyBotID},
+		{login: e2eNotifyBotID, channel: recipient},
 	}
 	for attempt := 0; attempt < 15; attempt++ {
 		for _, p := range perspectives {

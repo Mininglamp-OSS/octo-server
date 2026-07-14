@@ -63,11 +63,11 @@ func (n *Notify) deliverCardNotification(req *NotifyReq) (*NotifyResp, error) {
 		return &NotifyResp{Delivered: []string{}, Filtered: filteredMap}, nil
 	}
 
-	// Both the card and the text fallback are sent by the summary bot, so it
-	// must exist. Retry from the caller if provisioning has not completed yet.
-	n.ensureSummaryBotReady()
-	if !n.summaryBotOK.Load() {
-		return nil, errors.New("summary bot unavailable")
+	// The card and its text fallback reuse the existing notification bot so the
+	// user sees one system DM conversation. Retry if provisioning is not ready.
+	n.ensureNotifyBotReady()
+	if !n.botOK.Load() {
+		return nil, errors.New("notification bot unavailable")
 	}
 
 	// Deployment default outbound language (no per-request negotiation on the
@@ -192,13 +192,13 @@ func (n *Notify) buildSummaryCard(ctx context.Context, spaceID string, card *Sum
 	})
 }
 
-// sendSummaryText delivers the plain-text fallback DM from the summary bot,
+// sendSummaryText delivers the plain-text fallback DM from the notification bot,
 // reusing the same PERSONAL builder + space_id injection as the text path.
 func (n *Notify) sendSummaryText(uid, spaceID, text string) error {
 	payload := map[string]interface{}{"type": 1, "content": text}
 	return n.ctx.SendMessage(config.NewPersonalMsgSendReq(
 		uid,
-		SummaryBotUIDValue,
+		NotifyBotUIDValue,
 		payload,
 		spaceID,
 		config.PersonalMsgOptions{Header: config.MsgHeader{RedDot: 1}},

@@ -360,7 +360,7 @@ func installCardDispatch(ctx *config.Context) error {
 
 func summaryNotifyProducerSpecs() []carddispatch.ProducerSpec {
 	// summary-notify pilot (brief › pilot table, all rows confirmed 2026-07-13):
-	// dedicated `summary` User Bot, DM-only, display-only octo/v1,
+	// existing `notification` User Bot, DM-only, display-only octo/v1,
 	// system-notification Space policy, in-flight 20/process. modules/notify
 	// obtains this producer's bound Sender via carddispatch.SenderFromContext.
 	//
@@ -372,7 +372,7 @@ func summaryNotifyProducerSpecs() []carddispatch.ProducerSpec {
 		{
 			ID:                  summaryNotifyProducerID,
 			Enabled:             true,
-			SenderUID:           notify.SummaryBotUIDValue,
+			SenderUID:           notify.NotifyBotUIDValue,
 			AllowedChannelTypes: []uint8{common.ChannelTypePerson.Uint8()},
 			AllowedProfiles:     []string{cardmsg.ProfileV1},
 			SpacePolicy:         carddispatch.SpacePolicySystemNotification,
