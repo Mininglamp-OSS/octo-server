@@ -1,11 +1,19 @@
 package cardtrust
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
+	"github.com/Mininglamp-OSS/octo-server/internal/resourceshare"
 	"github.com/Mininglamp-OSS/octo-server/modules/botidentity"
 	"github.com/Mininglamp-OSS/octo-server/modules/incomingwebhook"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -14,6 +22,95 @@ import (
 // 编译期不可见的漂移由本测试兜底）。
 func TestWebhookPrefixConsistency(t *testing.T) {
 	assert.Equal(t, incomingwebhook.WebhookIDPrefix, webhookIDPrefix)
+}
+
+func humanSharePayload(t *testing.T, target resourceshare.Target) ([]byte, *resourceshare.ProofVerifier) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	assert.NoError(t, err)
+	signer, err := resourceshare.NewProofSigner(resourceshare.ProofSigningKey{KeyID: "proof-key-1", PrivateKey: key})
+	assert.NoError(t, err)
+	verifier, err := resourceshare.NewProofVerifier([]resourceshare.ProofVerificationKey{{
+		KeyID: "proof-key-1", PublicKey: &key.PublicKey,
+	}})
+	assert.NoError(t, err)
+	sealed, err := signer.Seal(map[string]interface{}{
+		"type": cardmsg.InteractiveCard.Int(), "card_version": cardmsg.CardVersion, "profile": cardmsg.ProfileV1,
+		"card": map[string]interface{}{
+			"type": "AdaptiveCard", "version": cardmsg.CardVersion,
+			"body": []interface{}{map[string]interface{}{"type": "TextBlock", "text": "Quarterly summary"}},
+		},
+	}, resourceshare.ProofContext{
+		ActorUID: "human-a", SpaceID: "space-a", ProviderID: "smart-summary",
+		Resource: resourceshare.ResourceRef{Type: "smart-summary", ID: "summary-1", Revision: "rev-1"},
+		Target:   target, DeliveryID: strings.Repeat("a", 64),
+	})
+	assert.NoError(t, err)
+	encoded, err := json.Marshal(sealed)
+	assert.NoError(t, err)
+	return encoded, verifier
+}
+
+func TestTrustedMessage_AllowsHumanOnlyWithContextBoundShareProof(t *testing.T) {
+	target := resourceshare.Target{Kind: resourceshare.TargetGroup, GroupNo: "group-a"}
+	payload, verifier := humanSharePayload(t, target)
+	resolver := newTestResolver(t, &fakeBotIdentity{})
+	resolver.proofVerifier = verifier
+	observation := MessageObservation{
+		FromUID: "human-a", ViewerUID: "human-b", SpaceID: "space-a",
+		Target: target, Payload: payload,
+	}
+
+	assert.True(t, resolver.TrustedMessage(observation))
+	mutations := []func(*MessageObservation){
+		func(value *MessageObservation) { value.FromUID = "attacker" },
+		func(value *MessageObservation) { value.SpaceID = "space-b" },
+		func(value *MessageObservation) { value.Target.GroupNo = "group-b" },
+		func(value *MessageObservation) { value.Payload = []byte(`{"type":17}`) },
+	}
+	for _, mutate := range mutations {
+		changed := observation
+		mutate(&changed)
+		assert.False(t, resolver.TrustedMessage(changed))
+	}
+}
+
+func TestTrustedMessage_PreservesBotAndWebhookTrustWithoutHumanProof(t *testing.T) {
+	resolver := newTestResolver(t, &fakeBotIdentity{kinds: map[string]botidentity.Kind{
+		"bot-a": botidentity.KindUserBot,
+	}})
+	for _, uid := range []string{"bot-a", "iwh_webhook"} {
+		assert.True(t, resolver.TrustedMessage(MessageObservation{
+			FromUID: uid, Payload: []byte(`{"type":17}`),
+		}))
+	}
+	assert.False(t, resolver.TrustedMessage(MessageObservation{
+		FromUID: "human-a", SpaceID: "space-a",
+		Target:  resourceshare.Target{Kind: resourceshare.TargetDM, PeerUID: "human-b"},
+		Payload: []byte(`{"type":17}`),
+	}))
+}
+
+func TestMessageObservationFromChannelBuildsCanonicalTargets(t *testing.T) {
+	tests := []struct {
+		name        string
+		channelID   string
+		channelType uint8
+		want        resourceshare.Target
+		wantOK      bool
+	}{
+		{name: "dm", channelID: "human-b", channelType: common.ChannelTypePerson.Uint8(), want: resourceshare.Target{Kind: resourceshare.TargetDM, PeerUID: "human-b"}, wantOK: true},
+		{name: "group", channelID: "group-a", channelType: common.ChannelTypeGroup.Uint8(), want: resourceshare.Target{Kind: resourceshare.TargetGroup, GroupNo: "group-a"}, wantOK: true},
+		{name: "thread", channelID: "group-a____topic-a", channelType: common.ChannelTypeCommunityTopic.Uint8(), want: resourceshare.Target{Kind: resourceshare.TargetThread, GroupNo: "group-a", ShortID: "topic-a"}, wantOK: true},
+		{name: "invalid", channelID: "group-a", channelType: 99, wantOK: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			target, ok := TargetFromChannel(tt.channelID, tt.channelType)
+			assert.Equal(t, tt.wantOK, ok)
+			assert.Equal(t, tt.want, target)
+		})
+	}
 }
 
 // fakeBotIdentity 是统一 bot identity resolver 的测试替身，记录调用次数以验证缓存。
