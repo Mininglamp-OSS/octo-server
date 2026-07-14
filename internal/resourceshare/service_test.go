@@ -43,6 +43,20 @@ type allowLimiter struct {
 	calls    int
 }
 
+type observedTarget struct {
+	provider ProviderID
+	kind     TargetKind
+	outcome  ShareOutcome
+}
+
+type captureShareObserver struct {
+	targets []observedTarget
+}
+
+func (o *captureShareObserver) ObserveTarget(provider ProviderID, kind TargetKind, outcome ShareOutcome) {
+	o.targets = append(o.targets, observedTarget{provider: provider, kind: kind, outcome: outcome})
+}
+
 func (l *allowLimiter) Allow(context.Context, LimitRequest) (LimitDecision, error) {
 	l.calls++
 	if l.decision == (LimitDecision{}) && l.err == nil {
@@ -77,6 +91,7 @@ type serviceHarness struct {
 	intentKey  *ecdsa.PrivateKey
 	now        time.Time
 	clock      *time.Time
+	observer   *captureShareObserver
 }
 
 func newServiceHarness(t *testing.T, intent Intent, disclosures []TargetDisclosure) serviceHarness {
@@ -101,6 +116,7 @@ func newServiceHarness(t *testing.T, intent Intent, disclosures []TargetDisclosu
 	authorizer := &allowAuthorizer{}
 	limiter := &allowLimiter{}
 	transport := &captureTransport{response: &config.MsgSendResp{MessageID: 99, MessageSeq: 7, ClientMsgNo: "server-msg"}}
+	observer := &captureShareObserver{}
 	service, err := NewShareService(ShareServiceDependencies{
 		Registry:                registry,
 		Store:                   store,
@@ -111,10 +127,11 @@ func newServiceHarness(t *testing.T, intent Intent, disclosures []TargetDisclosu
 		FeatureEnabled:          func() bool { return true },
 		Now:                     func() time.Time { return clock },
 		MaxConcurrentDispatches: 4,
+		Observer:                observer,
 	})
 	require.NoError(t, err)
 	_ = intent
-	return serviceHarness{service, adapter, authorizer, limiter, transport, verifier, intentKey, now, &clock}
+	return serviceHarness{service, adapter, authorizer, limiter, transport, verifier, intentKey, now, &clock, observer}
 }
 
 type dynamicServiceAdapter struct{}
@@ -248,6 +265,10 @@ func TestShareService_SendsAsLoginUserAndReturnsPerTargetResults(t *testing.T) {
 	assert.Equal(t, ShareDenied, result.Results[1].Outcome)
 	assert.Equal(t, 1, h.adapter.calls)
 	require.Len(t, h.transport.requests, 1)
+	assert.Equal(t, []observedTarget{
+		{provider: "smart-summary", kind: TargetDM, outcome: ShareSent},
+		{provider: "smart-summary", kind: TargetGroup, outcome: ShareDenied},
+	}, h.observer.targets)
 
 	request := h.transport.requests[0]
 	assert.Equal(t, "user-a", request.FromUID)
