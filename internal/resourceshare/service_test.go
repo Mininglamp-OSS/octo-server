@@ -299,7 +299,7 @@ func TestShareService_DropsUnsafeRequestIDFromAuditWithoutRejectingShare(t *test
 	assert.Len(t, h.transport.requests, 1)
 
 	var requestIDs []string
-	_, err = h.session.Select("request_id").From("resource_share_audit").OrderAsc("id").Load(&requestIDs)
+	_, err = h.session.Select("request_id").From("octo_resource_share_audit").OrderAsc("id").Load(&requestIDs)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"", "", ""}, requestIDs)
 }

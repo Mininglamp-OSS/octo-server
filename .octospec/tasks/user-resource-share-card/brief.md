@@ -251,12 +251,12 @@ rejection remains unchanged.
 
 The module owns three append-safe/durable stores:
 
-- `resource_share_intent` uniquely claims the nonce hash and stores the signed
+- `octo_resource_share_intent` uniquely claims the nonce hash and stores the signed
   fingerprint, actor, Space, provider, resource reference, expiry, and bounded
   request state.
-- `resource_share_delivery` uniquely claims the idempotency scope for each
+- `octo_resource_share_delivery` uniquely claims the idempotency scope for each
   canonical target and stores its state, retry boundary, and transport result.
-- `resource_share_audit` records bounded attempt and outcome events without
+- `octo_resource_share_audit` records bounded attempt and outcome events without
   resource content or cryptographic material.
 
 The irreversible per-target transition is `claimed -> dispatching -> sent`.

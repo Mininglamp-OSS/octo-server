@@ -1,6 +1,6 @@
 -- +migrate Up
 
-CREATE TABLE IF NOT EXISTS resource_share_intent (
+CREATE TABLE IF NOT EXISTS octo_resource_share_intent (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   nonce_hash BINARY(32) NOT NULL COMMENT 'SHA-256 of the provider nonce',
   fingerprint BINARY(32) NOT NULL COMMENT 'JCS intent fingerprint',
@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS resource_share_intent (
   KEY idx_resource_share_intent_expiry (expires_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='Durable resource-share intent claims';
 
-CREATE TABLE IF NOT EXISTS resource_share_delivery (
+CREATE TABLE IF NOT EXISTS octo_resource_share_delivery (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   intent_id BIGINT UNSIGNED NOT NULL,
   delivery_id CHAR(64) NOT NULL COMMENT 'per-resource-revision target identity',
@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS resource_share_delivery (
   KEY idx_resource_share_delivery_state_retry (state, retry_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='Per-target resource-share delivery state';
 
-CREATE TABLE IF NOT EXISTS resource_share_audit (
+CREATE TABLE IF NOT EXISTS octo_resource_share_audit (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   intent_id BIGINT UNSIGNED NOT NULL,
   delivery_id CHAR(64) NOT NULL,
@@ -62,6 +62,6 @@ CREATE TABLE IF NOT EXISTS resource_share_audit (
 
 -- +migrate Down
 
-DROP TABLE IF EXISTS resource_share_audit;
-DROP TABLE IF EXISTS resource_share_delivery;
-DROP TABLE IF EXISTS resource_share_intent;
+DROP TABLE IF EXISTS octo_resource_share_audit;
+DROP TABLE IF EXISTS octo_resource_share_delivery;
+DROP TABLE IF EXISTS octo_resource_share_intent;

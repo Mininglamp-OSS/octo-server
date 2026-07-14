@@ -21,15 +21,15 @@ func newStoreHarness(t *testing.T) (*DurableStore, *dbr.Session, time.Time) {
 	t.Cleanup(func() { require.NoError(t, conn.Close()) })
 	session := conn.NewSession(nil)
 	schema := []string{
-		"CREATE TABLE resource_share_intent (id INTEGER PRIMARY KEY AUTOINCREMENT, nonce_hash BLOB NOT NULL UNIQUE, fingerprint BLOB NOT NULL, idempotency_hash BLOB NOT NULL, actor_uid TEXT NOT NULL, space_id TEXT NOT NULL, provider_id TEXT NOT NULL, resource_type TEXT NOT NULL, resource_id TEXT NOT NULL, resource_revision TEXT NOT NULL, expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL)",
-		"CREATE TABLE resource_share_delivery (id INTEGER PRIMARY KEY AUTOINCREMENT, intent_id INTEGER NOT NULL, delivery_id TEXT NOT NULL UNIQUE, target_kind TEXT NOT NULL, target_ref TEXT NOT NULL, state TEXT NOT NULL, retry_at INTEGER NOT NULL DEFAULT 0, message_id TEXT NOT NULL DEFAULT '', message_seq INTEGER NOT NULL DEFAULT 0, client_msg_no TEXT NOT NULL DEFAULT '', outcome_code TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)",
-		"CREATE TABLE resource_share_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, intent_id INTEGER NOT NULL, delivery_id TEXT NOT NULL, actor_uid TEXT NOT NULL, space_id TEXT NOT NULL, provider_id TEXT NOT NULL, resource_type TEXT NOT NULL, resource_id TEXT NOT NULL, resource_revision TEXT NOT NULL, target_kind TEXT NOT NULL, target_ref TEXT NOT NULL, request_id TEXT NOT NULL DEFAULT '', outcome TEXT NOT NULL, created_at INTEGER NOT NULL)",
+		"CREATE TABLE octo_resource_share_intent (id INTEGER PRIMARY KEY AUTOINCREMENT, nonce_hash BLOB NOT NULL UNIQUE, fingerprint BLOB NOT NULL, idempotency_hash BLOB NOT NULL, actor_uid TEXT NOT NULL, space_id TEXT NOT NULL, provider_id TEXT NOT NULL, resource_type TEXT NOT NULL, resource_id TEXT NOT NULL, resource_revision TEXT NOT NULL, expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL)",
+		"CREATE TABLE octo_resource_share_delivery (id INTEGER PRIMARY KEY AUTOINCREMENT, intent_id INTEGER NOT NULL, delivery_id TEXT NOT NULL UNIQUE, target_kind TEXT NOT NULL, target_ref TEXT NOT NULL, state TEXT NOT NULL, retry_at INTEGER NOT NULL DEFAULT 0, message_id TEXT NOT NULL DEFAULT '', message_seq INTEGER NOT NULL DEFAULT 0, client_msg_no TEXT NOT NULL DEFAULT '', outcome_code TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)",
+		"CREATE TABLE octo_resource_share_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, intent_id INTEGER NOT NULL, delivery_id TEXT NOT NULL, actor_uid TEXT NOT NULL, space_id TEXT NOT NULL, provider_id TEXT NOT NULL, resource_type TEXT NOT NULL, resource_id TEXT NOT NULL, resource_revision TEXT NOT NULL, target_kind TEXT NOT NULL, target_ref TEXT NOT NULL, request_id TEXT NOT NULL DEFAULT '', outcome TEXT NOT NULL, created_at INTEGER NOT NULL)",
 	}
 	for _, stmt := range schema {
 		_, err := session.Exec(stmt)
 		require.NoError(t, err)
 	}
-	_, err = session.Exec("CREATE INDEX idx_resource_share_delivery_intent ON resource_share_delivery(intent_id)")
+	_, err = session.Exec("CREATE INDEX idx_resource_share_delivery_intent ON octo_resource_share_delivery(intent_id)")
 	require.NoError(t, err)
 
 	now := time.Unix(1_800_000_000, 0).UTC()
@@ -66,7 +66,7 @@ func TestDurableStore_ClaimIntentDistinguishesFirstUseRetryAndReplay(t *testing.
 	assert.ErrorIs(t, err, ErrIntentReplay)
 
 	var count int
-	require.NoError(t, session.SelectBySql("SELECT COUNT(*) FROM resource_share_intent").LoadOne(&count))
+	require.NoError(t, session.SelectBySql("SELECT COUNT(*) FROM octo_resource_share_intent").LoadOne(&count))
 	assert.Equal(t, 1, count)
 }
 
@@ -78,7 +78,7 @@ func TestDurableStore_ClaimIntentStoresOnlyHashesForOpaqueValues(t *testing.T) {
 
 	var nonceHash, fingerprint, idempotencyHash []byte
 	require.NoError(t, session.QueryRow(
-		"SELECT nonce_hash, fingerprint, idempotency_hash FROM resource_share_intent WHERE id=?",
+		"SELECT nonce_hash, fingerprint, idempotency_hash FROM octo_resource_share_intent WHERE id=?",
 		result.IntentID,
 	).Scan(&nonceHash, &fingerprint, &idempotencyHash))
 	assert.Len(t, nonceHash, 32)
@@ -172,8 +172,8 @@ func TestDurableStore_ClaimDeliveryIsStableAcrossIntentRetries(t *testing.T) {
 	assert.Equal(t, first.Record.DeliveryID, retry.Record.DeliveryID)
 
 	var deliveryCount, auditCount int
-	require.NoError(t, session.SelectBySql("SELECT COUNT(*) FROM resource_share_delivery").LoadOne(&deliveryCount))
-	require.NoError(t, session.SelectBySql("SELECT COUNT(*) FROM resource_share_audit").LoadOne(&auditCount))
+	require.NoError(t, session.SelectBySql("SELECT COUNT(*) FROM octo_resource_share_delivery").LoadOne(&deliveryCount))
+	require.NoError(t, session.SelectBySql("SELECT COUNT(*) FROM octo_resource_share_audit").LoadOne(&auditCount))
 	assert.Equal(t, 1, deliveryCount)
 	assert.Equal(t, 1, auditCount, "idempotent lookup must not append a fake new delivery audit")
 }
@@ -202,7 +202,7 @@ func TestDurableStore_ClaimDeliveryRejectsMismatchedIntentRow(t *testing.T) {
 	assert.ErrorIs(t, err, ErrIntentReplay)
 
 	var deliveryCount int
-	require.NoError(t, session.SelectBySql("SELECT COUNT(*) FROM resource_share_delivery").LoadOne(&deliveryCount))
+	require.NoError(t, session.SelectBySql("SELECT COUNT(*) FROM octo_resource_share_delivery").LoadOne(&deliveryCount))
 	assert.Zero(t, deliveryCount)
 }
 
@@ -228,7 +228,7 @@ func TestDurableStore_DeliveryStateMachineWritesAuditTransactionally(t *testing.
 	assert.Equal(t, uint32(42), record.MessageSeq)
 
 	var outcomes []string
-	_, err = session.Select("outcome").From("resource_share_audit").Where("delivery_id=?", record.DeliveryID).OrderAsc("id").Load(&outcomes)
+	_, err = session.Select("outcome").From("octo_resource_share_audit").Where("delivery_id=?", record.DeliveryID).OrderAsc("id").Load(&outcomes)
 	require.NoError(t, err)
 	assert.Equal(t, []string{string(DeliveryClaimed), string(DeliveryDispatching), string(DeliverySent)}, outcomes)
 
@@ -307,7 +307,7 @@ func TestDurableStore_AuditFailureRollsBackDeliveryTransition(t *testing.T) {
 	require.NoError(t, err)
 	claim, err := store.ClaimDelivery(context.Background(), intentClaim.IntentID, verified, Target{Kind: TargetGroup, GroupNo: "group-a"}, "request-1")
 	require.NoError(t, err)
-	_, err = session.Exec("DROP TABLE resource_share_audit")
+	_, err = session.Exec("DROP TABLE octo_resource_share_audit")
 	require.NoError(t, err)
 
 	err = store.BeginDispatch(context.Background(), claim.Record.ID, "request-1")

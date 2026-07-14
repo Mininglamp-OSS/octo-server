@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"net/url"
 	"strconv"
 	"time"
@@ -162,9 +161,7 @@ func (s *ShareService) Share(
 	if !s.ready() {
 		return nil, ErrShareConfig
 	}
-	if !validAuditValue(requestID, 0, 128) {
-		return nil, fmt.Errorf("%w: request id invalid", ErrIntentInvalid)
-	}
+	requestID = normalizeAuditRequestID(requestID)
 	verified, err := s.registry.VerifyIntentForRetry(ctx, compactIntent, s.now())
 	if err != nil {
 		return nil, err
@@ -407,8 +404,11 @@ func boundedRetryAfter(input time.Duration) time.Duration {
 	return input
 }
 
-func retrySeconds(input time.Duration) int64 {
-	return int64(math.Ceil(input.Seconds()))
+func normalizeAuditRequestID(value string) string {
+	if validAuditValue(value, 0, 128) {
+		return value
+	}
+	return ""
 }
 
 func maxInt64(a, b int64) int64 {

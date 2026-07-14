@@ -79,7 +79,7 @@ func (s *DurableStore) ClaimIntent(ctx context.Context, verified VerifiedIntent)
 	nonceHash := sha256.Sum256([]byte(verified.Intent.Nonce))
 	idempotencyHash := sha256.Sum256([]byte(verified.Intent.IdempotencyKey))
 	now := s.now().Unix()
-	result, insertErr := s.session.InsertInto("resource_share_intent").
+	result, insertErr := s.session.InsertInto("octo_resource_share_intent").
 		Columns(
 			"nonce_hash", "fingerprint", "idempotency_hash", "actor_uid", "space_id",
 			"provider_id", "resource_type", "resource_id", "resource_revision", "expires_at", "created_at",
@@ -103,7 +103,7 @@ func (s *DurableStore) ClaimIntent(ctx context.Context, verified VerifiedIntent)
 		Fingerprint []byte
 	}
 	err := s.session.Select("id", "fingerprint").
-		From("resource_share_intent").
+		From("octo_resource_share_intent").
 		Where("nonce_hash=?", nonceHash[:]).
 		Limit(1).
 		LoadOneContext(ctx, &existing)
@@ -184,7 +184,7 @@ func (s *DurableStore) ClaimDelivery(
 		return nil, err
 	}
 
-	result, insertErr := tx.InsertInto("resource_share_delivery").
+	result, insertErr := tx.InsertInto("octo_resource_share_delivery").
 		Columns(
 			"intent_id", "delivery_id", "target_kind", "target_ref", "state", "retry_at",
 			"message_id", "message_seq", "client_msg_no", "outcome_code", "created_at", "updated_at",
@@ -227,7 +227,7 @@ func verifyIntentBindingTx(
 ) error {
 	var storedBytes []byte
 	err := tx.Select("fingerprint").
-		From("resource_share_intent").
+		From("octo_resource_share_intent").
 		Where("id=?", intentID).
 		Limit(1).
 		LoadOneContext(ctx, &storedBytes)
@@ -313,13 +313,13 @@ func (s *DurableStore) ReclaimPreTransport(ctx context.Context, deliveryRowID in
 	}
 	defer tx.RollbackUnlessCommitted()
 	result, err := tx.ExecContext(ctx, `
-		UPDATE resource_share_delivery
+		UPDATE octo_resource_share_delivery
 		SET state=?, retry_at=0, message_id='', message_seq=0, client_msg_no='', outcome_code='', updated_at=?
 		WHERE id=? AND state IN (?, ?) AND retry_at > 0 AND retry_at <= ?
 		  AND EXISTS (
-		    SELECT 1 FROM resource_share_intent
-		    WHERE resource_share_intent.id=resource_share_delivery.intent_id
-		      AND resource_share_intent.expires_at > ?
+		    SELECT 1 FROM octo_resource_share_intent
+		    WHERE octo_resource_share_intent.id=octo_resource_share_delivery.intent_id
+		      AND octo_resource_share_intent.expires_at > ?
 		  )`,
 		DeliveryClaimed, now, deliveryRowID, DeliveryRateLimited, DeliveryFailed, now, now,
 	)
@@ -350,7 +350,7 @@ func (s *DurableStore) LoadDelivery(ctx context.Context, deliveryRowID int64) (*
 	err := s.session.Select(
 		"id", "intent_id", "delivery_id", "target_kind", "target_ref", "state", "retry_at",
 		"message_id", "message_seq", "client_msg_no", "outcome_code", "created_at", "updated_at",
-	).From("resource_share_delivery").Where("id=?", deliveryRowID).Limit(1).LoadOneContext(ctx, &record)
+	).From("octo_resource_share_delivery").Where("id=?", deliveryRowID).Limit(1).LoadOneContext(ctx, &record)
 	if err != nil {
 		return nil, storeError("load delivery", err)
 	}
@@ -380,7 +380,7 @@ func (s *DurableStore) loadDeliveryByIdentity(ctx context.Context, deliveryID st
 	err := s.session.Select(
 		"id", "intent_id", "delivery_id", "target_kind", "target_ref", "state", "retry_at",
 		"message_id", "message_seq", "client_msg_no", "outcome_code", "created_at", "updated_at",
-	).From("resource_share_delivery").Where("delivery_id=?", deliveryID).Limit(1).LoadOneContext(ctx, &record)
+	).From("octo_resource_share_delivery").Where("delivery_id=?", deliveryID).Limit(1).LoadOneContext(ctx, &record)
 	if err != nil {
 		return nil, err
 	}
@@ -412,7 +412,7 @@ func (s *DurableStore) transition(ctx context.Context, transition deliveryTransi
 		return storeError("begin delivery transition", err)
 	}
 	defer tx.RollbackUnlessCommitted()
-	result, err := tx.Update("resource_share_delivery").
+	result, err := tx.Update("octo_resource_share_delivery").
 		Set("state", transition.To).
 		Set("retry_at", transition.RetryAt).
 		Set("message_id", transition.MessageID).
@@ -450,12 +450,12 @@ func insertDeliveryAudit(
 	now int64,
 ) error {
 	result, err := tx.ExecContext(ctx,
-		"INSERT INTO resource_share_audit ("+
+		"INSERT INTO octo_resource_share_audit ("+
 			"intent_id, delivery_id, actor_uid, space_id, provider_id, resource_type, resource_id, resource_revision, "+
 			"target_kind, target_ref, request_id, outcome, created_at"+
 			") SELECT i.id, d.delivery_id, i.actor_uid, i.space_id, i.provider_id, i.resource_type, i.resource_id, "+
 			"i.resource_revision, d.target_kind, d.target_ref, ?, ?, ? "+
-			"FROM resource_share_delivery d JOIN resource_share_intent i ON i.id=d.intent_id WHERE d.id=?",
+			"FROM octo_resource_share_delivery d JOIN octo_resource_share_intent i ON i.id=d.intent_id WHERE d.id=?",
 		requestID, outcome, now, deliveryRowID,
 	)
 	if err != nil {

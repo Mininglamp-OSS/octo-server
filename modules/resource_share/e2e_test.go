@@ -138,8 +138,8 @@ func TestResourceShareE2E_HTTPToWuKongIMAndIdempotentRetry(t *testing.T) {
 	}
 
 	var deliveries, intents int
-	require.NoError(t, ctx.DB().SelectBySql("SELECT COUNT(*) FROM resource_share_intent").LoadOne(&intents))
-	require.NoError(t, ctx.DB().SelectBySql("SELECT COUNT(*) FROM resource_share_delivery").LoadOne(&deliveries))
+	require.NoError(t, ctx.DB().SelectBySql("SELECT COUNT(*) FROM octo_resource_share_intent").LoadOne(&intents))
+	require.NoError(t, ctx.DB().SelectBySql("SELECT COUNT(*) FROM octo_resource_share_delivery").LoadOne(&deliveries))
 	assert.Equal(t, 1, intents)
 	assert.Equal(t, len(intent.Targets), deliveries)
 }
