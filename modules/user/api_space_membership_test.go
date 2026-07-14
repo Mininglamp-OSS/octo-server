@@ -6,8 +6,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"regexp"
-	"strings"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -34,11 +32,19 @@ const (
 	testSpaceMembershipUID   = "space_membership_uid_001"
 )
 
-// seedSpaceMember inserts a space + one active space_member row with the given
-// role. Idempotent on the space row so multiple members can share a space.
+// seedSpaceMember inserts an active user + active space + one active
+// space_member row with the given role. Idempotent on the user and space rows
+// (INSERT IGNORE) so multiple members can share a space. The user row is
+// required because the membership query INNER JOINs `user` ON u.status=1 —
+// without it the happy-path cases would read as non-members.
 func seedSpaceMember(t *testing.T, ctx *config.Context, spaceID, uid string, role int) {
 	t.Helper()
 	_, err := ctx.DB().Exec(
+		"INSERT IGNORE INTO `user` (uid, name, status, short_no) VALUES (?, ?, ?, ?)",
+		uid, "member_"+uid, 1, "sn_"+uid,
+	)
+	require.NoError(t, err)
+	_, err = ctx.DB().Exec(
 		"INSERT IGNORE INTO space (space_id, name, creator, status) VALUES (?, ?, ?, ?)",
 		spaceID, "Test "+spaceID, uid, 1,
 	)
@@ -51,6 +57,14 @@ func seedSpaceMember(t *testing.T, ctx *config.Context, spaceID, uid string, rol
 
 func doVerifySpaceMembership(t *testing.T, s *server.Server, body interface{}) *httptest.ResponseRecorder {
 	t.Helper()
+	return doVerifySpaceMembershipWithKey(t, s, body, os.Getenv("AUTH_INTERNAL_KEY"))
+}
+
+// doVerifySpaceMembershipWithKey posts with an explicit X-Internal-Key value
+// (empty string => header omitted) so the auth tests can exercise the
+// missing/wrong-key rejection paths.
+func doVerifySpaceMembershipWithKey(t *testing.T, s *server.Server, body interface{}, internalKey string) *httptest.ResponseRecorder {
+	t.Helper()
 	var reqBody *bytes.Reader
 	if body != nil {
 		reqBody = bytes.NewReader([]byte(util.ToJson(body)))
@@ -61,6 +75,9 @@ func doVerifySpaceMembership(t *testing.T, s *server.Server, body interface{}) *
 	req, err := http.NewRequest("POST", "/v1/auth/space-membership", reqBody)
 	require.NoError(t, err)
 	req.Header.Set("Content-Type", "application/json")
+	if internalKey != "" {
+		req.Header.Set("X-Internal-Key", internalKey)
+	}
 	s.GetRoute().ServeHTTP(w, req)
 	return w
 }
@@ -201,6 +218,77 @@ func TestAuthVerifySpaceMembership_NonActiveStatus(t *testing.T) {
 	assert.False(t, resp.IsMember)
 }
 
+// Case 3c: space is disbanded/disabled (space.status=0) but the member row is
+// left active (space_member.status=1) -> is_member=false. disbandSpace
+// (modules/space/db.go) sets space.status=0 without cascading space_member, so
+// a member-status-only query would wrongly report is_member=true and grant
+// docs-backend share access inside a dead space. Mirrors the api-key sibling's
+// TestAuthVerifyAPIKey_DisabledSpace_401. Requires the INNER JOIN space
+// (s.status=1) guard.
+func TestAuthVerifySpaceMembership_DisabledSpace(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+
+	// Active user + active member row, but the space itself is disbanded.
+	_, err := ctx.DB().Exec(
+		"INSERT IGNORE INTO `user` (uid, name, status, short_no) VALUES (?, ?, ?, ?)",
+		testSpaceMembershipUID, "member", 1, "sn_disabled_space",
+	)
+	require.NoError(t, err)
+	_, err = ctx.DB().InsertInto("space").
+		Columns("space_id", "name", "creator", "status").
+		Values(testSpaceMembershipSpace, "Disbanded", testSpaceMembershipUID, 0). // ← space disbanded
+		Exec()
+	require.NoError(t, err)
+	_, err = ctx.DB().InsertInto("space_member").
+		Columns("space_id", "uid", "role", "status").
+		Values(testSpaceMembershipSpace, testSpaceMembershipUID, 0, 1). // ← member left active
+		Exec()
+	require.NoError(t, err)
+
+	w := doVerifySpaceMembership(t, s, map[string]string{
+		"space_id": testSpaceMembershipSpace,
+		"uid":      testSpaceMembershipUID,
+	})
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp spaceMembershipResp
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.False(t, resp.IsMember,
+		"disbanded space (space.status=0) with a lingering active member must report is_member=false")
+	assert.Nil(t, resp.Role)
+}
+
+// Case 3d: globally-banned user (user.status=0) with an active member row in an
+// active space -> is_member=false. liftBanUser sets user.status=0 without
+// touching space_member, matching the api-key path's TestAuthVerifyAPIKey_
+// AccountBanned_401. Requires the INNER JOIN `user` (u.status=1) guard.
+func TestAuthVerifySpaceMembership_BannedUser(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	seedSpaceMember(t, ctx, testSpaceMembershipSpace, testSpaceMembershipUID, 0)
+
+	// Ban the user (mirrors liftBanUser: user.status=0, leave the member row
+	// active to exercise the exact bypass the user-liveness join closes).
+	_, err := ctx.DB().Update("user").
+		Set("status", 0).
+		Where("uid=?", testSpaceMembershipUID).
+		Exec()
+	require.NoError(t, err)
+
+	w := doVerifySpaceMembership(t, s, map[string]string{
+		"space_id": testSpaceMembershipSpace,
+		"uid":      testSpaceMembershipUID,
+	})
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp spaceMembershipResp
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.False(t, resp.IsMember,
+		"globally-banned user (user.status=0) must report is_member=false")
+	assert.Nil(t, resp.Role)
+}
+
 // Case 4: missing space_id -> 400.
 func TestAuthVerifySpaceMembership_MissingSpaceID(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
@@ -241,36 +329,80 @@ func TestAuthVerifySpaceMembership_BotUIDParity(t *testing.T) {
 	assert.Equal(t, 0, *resp.Role)
 }
 
-// TestAuthVerifySpaceMembership_ProtectionContract pins the "same protection as
-// verify-bot" registration requirement via source grep. The endpoint's
-// caller-authorization (401/403 for a non-internal caller) is enforced at the
-// network layer (nginx internal-IP allowlist / X-Internal-Key) shared by the
-// whole verify group, exactly like verify / verify-bot / verify-api-key — it is
-// deliberately NOT behind end-user session AuthMiddleware. This guard fails if
-// a future edit drops the verifyLimit protection primitive or moves the route
-// behind AuthMiddleware, either of which would break the service-to-service
-// contract.
+// TestAuthVerifySpaceMembership_ProtectionContract asserts the endpoint's
+// protection by BEHAVIOR rather than by grepping the route-registration source
+// line (which broke on reformatting and pinned the pre-hardening posture).
+// Two properties matter and both are checked against live request/response:
+//
+//   - A non-internal caller (no X-Internal-Key) is rejected with 401 — the
+//     in-code service-auth gate is actually in front of the handler.
+//   - A caller presenting the valid X-Internal-Key reaches the handler and gets
+//     a real membership answer WITHOUT any end-user session token — i.e. the
+//     route is a service-to-service endpoint, deliberately NOT behind end-user
+//     session AuthMiddleware (which would 401 a token-less request before the
+//     handler ran).
 func TestAuthVerifySpaceMembership_ProtectionContract(t *testing.T) {
-	data, err := os.ReadFile("api.go")
-	require.NoError(t, err)
-	source := string(data)
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	seedSpaceMember(t, ctx, testSpaceMembershipSpace, testSpaceMembershipUID, 0)
 
-	line := "v.POST(\"/auth/space-membership\", verifyLimit, u.authVerifySpaceMembership)"
-	assert.Contains(t, source, line,
-		"space-membership must register in the verify group with verifyLimit, matching verify-bot")
+	// Non-internal caller (no X-Internal-Key) -> rejected.
+	noKey := doVerifySpaceMembershipWithKey(t, s, map[string]string{
+		"space_id": testSpaceMembershipSpace,
+		"uid":      testSpaceMembershipUID,
+	}, "")
+	assert.Equal(t, http.StatusUnauthorized, noKey.Code,
+		"a caller without X-Internal-Key must be rejected")
 
-	// Must sit in the same verify group block as verify-bot (between the group
-	// header comment and the third-party auth block), not in an AuthMiddleware
-	// group.
-	groupStart := strings.Index(source, "Token / Bot 认证验证（供 Gateway 调用）")
-	require.NotEqual(t, -1, groupStart, "verify group header not found")
-	routeIdx := strings.Index(source, line)
-	require.NotEqual(t, -1, routeIdx)
-	assert.Greater(t, routeIdx, groupStart, "space-membership must be inside the Gateway verify group")
+	// Valid internal key, no session token -> handler runs and answers.
+	withKey := doVerifySpaceMembership(t, s, map[string]string{
+		"space_id": testSpaceMembershipSpace,
+		"uid":      testSpaceMembershipUID,
+	})
+	require.Equal(t, http.StatusOK, withKey.Code,
+		"a service caller with a valid X-Internal-Key and no session token must reach the handler (route is not behind end-user AuthMiddleware)")
+	var resp spaceMembershipResp
+	require.NoError(t, json.Unmarshal(withKey.Body.Bytes(), &resp))
+	assert.True(t, resp.IsMember)
+}
 
-	// The route registration must NOT carry an AuthMiddleware wrapper.
-	assert.Regexp(t,
-		regexp.MustCompile(`v\.POST\(\s*"/auth/space-membership",\s*verifyLimit,\s*u\.authVerifySpaceMembership\s*\)`),
-		source,
-		"space-membership must use verifyLimit only, not session AuthMiddleware")
+// TestAuthVerifySpaceMembership_WrongInternalKey_401: a wrong X-Internal-Key is
+// rejected (exercises the ConstantTimeCompare mismatch path).
+func TestAuthVerifySpaceMembership_WrongInternalKey_401(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	seedSpaceMember(t, ctx, testSpaceMembershipSpace, testSpaceMembershipUID, 0)
+
+	w := doVerifySpaceMembershipWithKey(t, s, map[string]string{
+		"space_id": testSpaceMembershipSpace,
+		"uid":      testSpaceMembershipUID,
+	}, "definitely-not-the-key")
+	assert.Equal(t, http.StatusUnauthorized, w.Code,
+		"a wrong X-Internal-Key must be rejected")
+}
+
+// TestAuthVerifySpaceMembership_FailClosedWhenKeyUnset: when AUTH_INTERNAL_KEY
+// is not configured the endpoint rejects EVERY request (even with a header),
+// rather than fall back to network-level restriction alone. Mirrors notify's
+// NOTIFY_INTERNAL_TOKEN fail-closed posture.
+func TestAuthVerifySpaceMembership_FailClosedWhenKeyUnset(t *testing.T) {
+	prev, had := os.LookupEnv("AUTH_INTERNAL_KEY")
+	require.NoError(t, os.Unsetenv("AUTH_INTERNAL_KEY"))
+	defer func() {
+		if had {
+			_ = os.Setenv("AUTH_INTERNAL_KEY", prev)
+		}
+	}()
+
+	// Build the server AFTER unsetting so user.New reads an empty key.
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	seedSpaceMember(t, ctx, testSpaceMembershipSpace, testSpaceMembershipUID, 0)
+
+	w := doVerifySpaceMembershipWithKey(t, s, map[string]string{
+		"space_id": testSpaceMembershipSpace,
+		"uid":      testSpaceMembershipUID,
+	}, "anything")
+	assert.Equal(t, http.StatusUnauthorized, w.Code,
+		"with AUTH_INTERNAL_KEY unset the endpoint must fail closed (reject all requests)")
 }

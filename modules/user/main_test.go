@@ -23,5 +23,12 @@ func TestMain(m *testing.M) {
 		_, _ = rand.Read(key)
 		_ = os.Setenv("OCTO_MASTER_KEY", hex.EncodeToString(key))
 	}
+	// AUTH_INTERNAL_KEY gates /auth/space-membership (fail-closed when unset).
+	// Seed a fixed value so the space-membership happy-path tests can present a
+	// matching X-Internal-Key header; the fail-closed / wrong-key paths manage
+	// the env var themselves. Existing value is respected (CI / dev override).
+	if os.Getenv("AUTH_INTERNAL_KEY") == "" {
+		_ = os.Setenv("AUTH_INTERNAL_KEY", "test-internal-key")
+	}
 	os.Exit(m.Run())
 }
