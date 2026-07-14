@@ -4,6 +4,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"fmt"
+	"math"
 	"math/big"
 	"net/url"
 	"reflect"
@@ -163,7 +164,13 @@ func validProviderLimits(limits ProviderLimits) bool {
 	return limits.MaxClaimsBytes > 0 && limits.MaxClaimsBytes <= PlatformMaxClaimsBytes &&
 		limits.MaxTargets > 0 && limits.MaxTargets <= PlatformMaxTargets &&
 		limits.MaxIntentLifetime > 0 && limits.MaxIntentLifetime <= PlatformMaxIntentLifetime &&
-		limits.ClockSkew >= 0 && limits.ClockSkew <= PlatformMaxClockSkew
+		limits.ClockSkew >= 0 && limits.ClockSkew <= PlatformMaxClockSkew &&
+		validRateBudget(limits.TargetBudget)
+}
+
+func validRateBudget(budget RateBudget) bool {
+	return budget.RatePerSecond > 0 && !math.IsNaN(budget.RatePerSecond) &&
+		!math.IsInf(budget.RatePerSecond, 0) && budget.Burst > 0
 }
 
 func copyP256PublicKey(input interface{}) (*ecdsa.PublicKey, bool) {

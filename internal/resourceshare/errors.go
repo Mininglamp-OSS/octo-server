@@ -20,4 +20,6 @@ var (
 	ErrShareDisabled        = errors.New("resource share disabled")
 	ErrShareForbidden       = errors.New("resource share actor or space mismatch")
 	ErrProviderRevalidation = errors.New("resource share provider revalidation failed")
+	ErrLimitConfig          = errors.New("resource share target limiter configuration invalid")
+	ErrLimitStore           = errors.New("resource share target limiter store failed")
 )

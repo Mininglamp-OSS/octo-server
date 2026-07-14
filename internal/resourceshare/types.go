@@ -110,6 +110,12 @@ type ProviderLimits struct {
 	MaxTargets        int
 	MaxIntentLifetime time.Duration
 	ClockSkew         time.Duration
+	TargetBudget      RateBudget
+}
+
+type RateBudget struct {
+	RatePerSecond float64
+	Burst         int
 }
 
 type ClaimsValidator func(json.RawMessage) error
