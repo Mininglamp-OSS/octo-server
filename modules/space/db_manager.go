@@ -52,9 +52,11 @@ func memberSearchWhere(keyword string) (string, []interface{}) {
 //   - email 明文匹配、明文返回（工作邮箱，无需掩码）；
 //   - phone 仅匹配后 4 位（RIGHT(u.phone,4)），使「可检索粒度 == 可见粒度」
 //     （响应仅显示 138****5678），admin 无法通过子串查询逐位探测/重建完整号码。
+//   - real_name（user_verification.real_name）纳入检索，使空名成员可按实名搜到
+//     （issue #434 P1）；仅管理员可见、且已随成员列表展示，检索粒度未越出展示粒度。
 //
 // 前端注意：phone 检索只匹配后 4 位，传完整号码不会命中——按手机号查找请用后 4 位。
-var memberSearchActiveColumns = []string{"u.name", "u.username", "u.email", "RIGHT(u.phone,4)", "sm.uid"}
+var memberSearchActiveColumns = []string{"u.name", "uv.real_name", "u.username", "u.email", "RIGHT(u.phone,4)", "sm.uid"}
 
 // memberSearchActiveWhere 为空间侧 members/search 组装跨列 OR LIKE 条件。
 // list / count 共用同一条件，避免搜索范围漂移导致分页错位。

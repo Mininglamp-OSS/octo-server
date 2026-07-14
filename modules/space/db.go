@@ -168,15 +168,27 @@ func (d *DB) queryMembers(spaceId string, loginUID string, page uint64, limit ui
 }
 
 func (d *DB) searchMembers(spaceId, keyword string, pageIndex, pageSize int) ([]*memberSearchModel, error) {
+	// name 兜底链（issue #344/#434）：u.name 为空时回退 user_verification.real_name，
+	// 二者皆空时由 mapping 层（memberSearchModel.DisplayName）给稳定占位符——与成员
+	// 列表 queryMembers 对齐，使空名成员在搜索结果里不再渲染为空白行。
+	//
+	// user_verification.user_id 被 base compat-repair 迁移强制转为 utf8mb4_general_ci，
+	// 而 space_member 无显式 COLLATE、随库默认（非规范部署可能是 8.0 的 0900_ai_ci）。
+	// 列对列等值缺少可强制的字面量，MySQL 8.0 会抛 Error 1267（Illegal mix of
+	// collations）。故在 ON 子句用 COLLATE utf8mb4_general_ci 把 sm.uid 显式钉到公共
+	// collation，不依赖「库默认即 general_ci」的隐式假设（沿用 bot_api/resolve_targets
+	// 的既有做法；#420 给 queryMembers 留下的同类风险另单 #482 跟踪）。
 	builder := d.session.Select(
 		"sm.*",
 		"IFNULL(u.name,'') as name",
+		"IFNULL(uv.real_name,'') as real_name",
 		"IFNULL(u.username,'') as username",
 		"IFNULL(u.email,'') as email",
 		"IFNULL(u.phone,'') as phone",
 		"CASE WHEN r.robot_id IS NOT NULL AND r.status=1 THEN 1 ELSE 0 END as robot",
 	).From(dbr.I("space_member").As("sm")).
 		LeftJoin(dbr.I("user").As("u"), "u.uid=sm.uid").
+		LeftJoin(dbr.I("user_verification").As("uv"), "uv.user_id = sm.uid COLLATE utf8mb4_general_ci").
 		LeftJoin(dbr.I("robot").As("r"), "r.robot_id=sm.uid").
 		Where("sm.space_id=? AND sm.status=1", spaceId)
 	if keyword != "" {
@@ -195,9 +207,14 @@ func (d *DB) searchMembers(spaceId, keyword string, pageIndex, pageSize int) ([]
 }
 
 func (d *DB) countSearchMembers(spaceId, keyword string) (int64, error) {
+	// list / count 共用 memberSearchActiveWhere，而该条件现含 uv.real_name（#434），
+	// 故 count 也须挂同一 user_verification LEFT JOIN，否则关键字命中 real_name 时
+	// list 与 count 的行集漂移会导致分页错位。JOIN 的 COLLATE 钉法同 searchMembers。
+	// user_verification.user_id 是主键（1:1），LEFT JOIN 不会放大 COUNT(*)。
 	builder := d.session.Select("COUNT(*)").
 		From(dbr.I("space_member").As("sm")).
 		LeftJoin(dbr.I("user").As("u"), "u.uid=sm.uid").
+		LeftJoin(dbr.I("user_verification").As("uv"), "uv.user_id = sm.uid COLLATE utf8mb4_general_ci").
 		Where("sm.space_id=? AND sm.status=1", spaceId)
 	if keyword != "" {
 		clause, args := memberSearchActiveWhere(keyword)
