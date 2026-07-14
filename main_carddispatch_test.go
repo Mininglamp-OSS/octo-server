@@ -4,6 +4,11 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/Mininglamp-OSS/octo-lib/common"
+	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
+	"github.com/Mininglamp-OSS/octo-server/modules/notify"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 )
 
 func TestCardDispatchRegistryInstalledBeforeModuleConstruction(t *testing.T) {
@@ -22,12 +27,35 @@ func TestCardDispatchRegistryInstalledBeforeModuleConstruction(t *testing.T) {
 	}
 }
 
-func TestDormantFoundationRegistersNoProductionProducer(t *testing.T) {
-	source, err := os.ReadFile("main.go")
-	if err != nil {
-		t.Fatalf("read main.go: %v", err)
+func TestSummaryNotifyIsOnlyProductionCardProducer(t *testing.T) {
+	specs := summaryNotifyProducerSpecs()
+	if len(specs) != 1 {
+		t.Fatalf("production registry has %d producers; want summary-notify only", len(specs))
 	}
-	if !strings.Contains(string(source), "carddispatch.NewRegistry(deps, nil)") {
-		t.Fatal("foundation rollout must install an empty registry until cross-repo enablement gates pass")
+
+	spec := specs[0]
+	if spec.ID != carddispatch.ProducerID("summary-notify") {
+		t.Fatalf("producer ID = %q; want summary-notify", spec.ID)
+	}
+	if !spec.Enabled {
+		t.Fatal("summary-notify producer must be enabled")
+	}
+	if spec.SenderUID != notify.SummaryBotUIDValue {
+		t.Fatalf("sender UID = %q; want %q", spec.SenderUID, notify.SummaryBotUIDValue)
+	}
+	if len(spec.AllowedChannelTypes) != 1 || spec.AllowedChannelTypes[0] != common.ChannelTypePerson.Uint8() {
+		t.Fatalf("allowed channel types = %v; want DM only", spec.AllowedChannelTypes)
+	}
+	if len(spec.AllowedProfiles) != 1 || spec.AllowedProfiles[0] != cardmsg.ProfileV1 {
+		t.Fatalf("allowed profiles = %v; want octo/v1 only", spec.AllowedProfiles)
+	}
+	if spec.SpacePolicy != carddispatch.SpacePolicySystemNotification {
+		t.Fatalf("space policy = %q; want system_notification", spec.SpacePolicy)
+	}
+	if spec.GroupPolicy != carddispatch.GroupPolicyMemberRequired {
+		t.Fatalf("group policy = %q; want member_required", spec.GroupPolicy)
+	}
+	if spec.MaxInFlight != 20 {
+		t.Fatalf("max in flight = %d; want 20", spec.MaxInFlight)
 	}
 }

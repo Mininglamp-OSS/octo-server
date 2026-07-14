@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -24,6 +25,25 @@ func validCard() *SummaryCardFields {
 		MsgCount:    128,
 		GeneratedAt: "2026-07-13 15:04",
 	}
+}
+
+func TestSummaryBotReadinessIsRaceSafe(t *testing.T) {
+	var n Notify
+	var wg sync.WaitGroup
+
+	for i := 0; i < 100; i++ {
+		wg.Add(2)
+		go func(ready bool) {
+			defer wg.Done()
+			n.summaryBotOK.Store(ready)
+		}(i%2 == 0)
+		go func() {
+			defer wg.Done()
+			_ = n.summaryBotOK.Load()
+		}()
+	}
+
+	wg.Wait()
 }
 
 func TestDeliverCardNotification_ValidationRejectsBadFields(t *testing.T) {
@@ -110,8 +130,8 @@ func TestDeliverCardNotification_DegradesToTextWhenSenderUnavailable(t *testing.
 	defer wk.close()
 	ctx := newTestContext(t, wk)
 	n := newTestNotify(ctx, nil, nil, nil, "tk")
-	n.cardSender = nil    // no producer bound → cannot build a card
-	n.summaryBotOK = true // summary bot already provisioned
+	n.cardSender = nil         // no producer bound → cannot build a card
+	n.summaryBotOK.Store(true) // summary bot already provisioned
 	primeMemberCache(n, "spc_1", "uid_a")
 
 	resp, err := n.deliverCardNotification(&NotifyReq{
@@ -137,13 +157,20 @@ func TestIntegration_NotifyRejectsPayloadAndCardTogether(t *testing.T) {
 	h := http.Header{}
 	h.Set(InternalTokenHeader, "tk")
 
-	w := doJSONRequest(t, r, http.MethodPost, "/v1/internal/notify", h, NotifyReq{
-		SpaceID: "spc_1", Service: "summary-service", Targets: []string{"uid_a"},
-		Payload: map[string]interface{}{"type": 1, "content": "ok"}, Card: validCard(),
-	})
-	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "err.server.notify.card_invalid")
-	assert.Zero(t, atomic.LoadInt32(&wk.messageCount))
+	for name, payload := range map[string]map[string]interface{}{
+		"non-empty payload": {"type": 1, "content": "ok"},
+		"empty payload":     {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := doJSONRequest(t, r, http.MethodPost, "/v1/internal/notify", h, NotifyReq{
+				SpaceID: "spc_1", Service: "summary-service", Targets: []string{"uid_a"},
+				Payload: payload, Card: validCard(),
+			})
+			assert.Equal(t, http.StatusBadRequest, w.Code)
+			assert.Contains(t, w.Body.String(), "err.server.notify.card_invalid")
+			assert.Zero(t, atomic.LoadInt32(&wk.messageCount))
+		})
+	}
 }
 
 func TestIntegration_NotifyBatchRejectsCardField(t *testing.T) {
