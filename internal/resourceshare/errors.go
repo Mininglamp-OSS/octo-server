@@ -12,4 +12,6 @@ var (
 	ErrProofConfig      = errors.New("resource share proof configuration invalid")
 	ErrProofMissing     = errors.New("resource share proof missing")
 	ErrProofInvalid     = errors.New("resource share proof invalid")
+	ErrTargetDenied     = errors.New("resource share target denied")
+	ErrTargetQuery      = errors.New("resource share target query failed")
 )
