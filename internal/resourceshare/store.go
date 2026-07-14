@@ -299,6 +299,49 @@ func (s *DurableStore) RecordPreTransportOutcome(
 	})
 }
 
+func (s *DurableStore) ReclaimPreTransport(ctx context.Context, deliveryRowID int64, requestID string) error {
+	if err := s.ready(ctx); err != nil {
+		return err
+	}
+	if deliveryRowID <= 0 || !validAuditValue(requestID, 0, 128) {
+		return storeError("invalid delivery reclaim", errors.New("invalid id or request id"))
+	}
+	now := s.now().Unix()
+	tx, err := s.session.BeginTx(ctx, nil)
+	if err != nil {
+		return storeError("begin delivery reclaim", err)
+	}
+	defer tx.RollbackUnlessCommitted()
+	result, err := tx.ExecContext(ctx, `
+		UPDATE resource_share_delivery
+		SET state=?, retry_at=0, message_id='', message_seq=0, client_msg_no='', outcome_code='', updated_at=?
+		WHERE id=? AND state IN (?, ?) AND retry_at > 0 AND retry_at <= ?
+		  AND EXISTS (
+		    SELECT 1 FROM resource_share_intent
+		    WHERE resource_share_intent.id=resource_share_delivery.intent_id
+		      AND resource_share_intent.expires_at > ?
+		  )`,
+		DeliveryClaimed, now, deliveryRowID, DeliveryRateLimited, DeliveryFailed, now, now,
+	)
+	if err != nil {
+		return storeError("update delivery reclaim", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return storeError("read delivery reclaim result", err)
+	}
+	if affected != 1 {
+		return fmt.Errorf("%w: pre-transport retry unavailable", ErrDeliveryConflict)
+	}
+	if err := insertDeliveryAudit(ctx, tx, deliveryRowID, requestID, DeliveryClaimed, now); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return storeError("commit delivery reclaim", err)
+	}
+	return nil
+}
+
 func (s *DurableStore) LoadDelivery(ctx context.Context, deliveryRowID int64) (*DeliveryRecord, error) {
 	if err := s.ready(ctx); err != nil {
 		return nil, err

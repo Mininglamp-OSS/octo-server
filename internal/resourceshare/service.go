@@ -58,6 +58,7 @@ type shareStore interface {
 	MarkSent(context.Context, int64, TransportResult, string) error
 	MarkUnknown(context.Context, int64, string, string) error
 	RecordPreTransportOutcome(context.Context, int64, DeliveryState, time.Time, string, string) error
+	ReclaimPreTransport(context.Context, int64, string) error
 	LoadDelivery(context.Context, int64) (*DeliveryRecord, error)
 }
 
@@ -199,7 +200,21 @@ func (s *ShareService) shareTarget(
 		return TargetResult{Target: target, Outcome: ShareFailed}
 	}
 	if !claim.Created && claim.Record.State != DeliveryClaimed {
-		return targetResultFromRecord(target, claim.Record, s.now())
+		now := s.now()
+		if (claim.Record.State != DeliveryRateLimited && claim.Record.State != DeliveryFailed) ||
+			claim.Record.RetryAt <= 0 || claim.Record.RetryAt > now.Unix() ||
+			now.Unix() >= verified.Intent.ExpiresAt {
+			return targetResultFromRecord(target, claim.Record, now)
+		}
+		if err := s.store.ReclaimPreTransport(ctx, claim.Record.ID, requestID); err != nil {
+			record, loadErr := s.store.LoadDelivery(ctx, claim.Record.ID)
+			if loadErr != nil || record.State != DeliveryClaimed {
+				if loadErr == nil {
+					return targetResultFromRecord(target, *record, s.now())
+				}
+				return TargetResult{Target: target, Outcome: ShareFailed}
+			}
+		}
 	}
 	rowID := claim.Record.ID
 	if !disclosureAllowed {
