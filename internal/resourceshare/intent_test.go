@@ -245,6 +245,26 @@ func TestVerifyIntent_RespectsContextCancellation(t *testing.T) {
 	assert.ErrorIs(t, err, context.Canceled)
 }
 
+func TestVerifyIntentForRetry_AuthenticatesExpiredIntentWithoutReauthorizingIt(t *testing.T) {
+	key := newIntentTestKey(t)
+	registry := newIntentRegistry(t, key)
+	issuedAt := time.Unix(1_800_000_000, 0).UTC()
+	intent := validIntent(issuedAt)
+	compact := signIntent(t, key, jose.ES256, "intent-key-1", intent)
+	afterExpiry := time.Unix(intent.ExpiresAt, 0).Add(PlatformMaxClockSkew + time.Second)
+
+	_, err := registry.VerifyIntent(context.Background(), compact, afterExpiry)
+	assert.ErrorIs(t, err, ErrIntentInvalid)
+	verified, err := registry.VerifyIntentForRetry(context.Background(), compact, afterExpiry)
+	require.NoError(t, err)
+	assert.True(t, verified.Expired)
+	assert.Equal(t, intent.Nonce, verified.Intent.Nonce)
+
+	tampered := compact[:len(compact)-1] + "x"
+	_, err = registry.VerifyIntentForRetry(context.Background(), tampered, afterExpiry)
+	assert.ErrorIs(t, err, ErrIntentSignature)
+}
+
 func TestClassifyReplay_DistinguishesRetryFromConflict(t *testing.T) {
 	first := IntentFingerprint{1}
 	same := IntentFingerprint{1}

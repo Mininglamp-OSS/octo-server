@@ -278,6 +278,41 @@ func TestShareService_IdenticalRetryDoesNotResendSuccessfulTarget(t *testing.T) 
 	assert.Len(t, h.transport.requests, 1)
 }
 
+func TestShareService_ExpiredRetryReturnsStoredTerminalResultWithoutRevalidation(t *testing.T) {
+	intent := validIntent(time.Unix(1_800_000_000, 0).UTC())
+	intent.Targets = []Target{{Kind: TargetGroup, GroupNo: "group-a"}}
+	h := newServiceHarness(t, intent, []TargetDisclosure{disclosureFor(intent.Targets[0], true)})
+	compact := signIntent(t, h.intentKey, jose.ES256, "intent-key-1", intent)
+
+	first, err := h.service.Share(context.Background(), "user-a", "space-a", compact, "request-1")
+	require.NoError(t, err)
+	assert.Equal(t, ShareSent, first.Results[0].Outcome)
+	assert.Equal(t, 1, h.adapter.calls)
+
+	*h.clock = time.Unix(intent.ExpiresAt, 0).Add(PlatformMaxClockSkew + time.Second)
+	h.adapter.err = errors.New("owner unavailable after original delivery")
+	retry, err := h.service.Share(context.Background(), "user-a", "space-a", compact, "request-2")
+	require.NoError(t, err)
+	assert.Equal(t, ShareAlreadySent, retry.Results[0].Outcome)
+	assert.Equal(t, "99", retry.Results[0].MessageID)
+	assert.Equal(t, 1, h.adapter.calls, "an expired retry may read terminal state but must not revalidate or resume")
+	assert.Len(t, h.transport.requests, 1)
+}
+
+func TestShareService_ExpiredFirstUseCreatesNoDelivery(t *testing.T) {
+	intent := validIntent(time.Unix(1_800_000_000, 0).UTC())
+	h := newServiceHarness(t, intent, []TargetDisclosure{
+		disclosureFor(intent.Targets[0], true), disclosureFor(intent.Targets[1], true),
+	})
+	*h.clock = time.Unix(intent.ExpiresAt, 0).Add(PlatformMaxClockSkew + time.Second)
+	compact := signIntent(t, h.intentKey, jose.ES256, "intent-key-1", intent)
+
+	_, err := h.service.Share(context.Background(), "user-a", "space-a", compact, "request-1")
+	assert.ErrorIs(t, err, ErrIntentInvalid)
+	assert.Zero(t, h.adapter.calls)
+	assert.Empty(t, h.transport.requests)
+}
+
 func TestShareService_TransportFailureBecomesUnknownAndIsNotRetried(t *testing.T) {
 	intent := validIntent(time.Unix(1_800_000_000, 0).UTC())
 	intent.Targets = []Target{{Kind: TargetGroup, GroupNo: "group-a"}}
