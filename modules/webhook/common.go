@@ -194,7 +194,7 @@ func getMessageAlert(msg msgOfflineNotify, toUser *user.Resp, ctx *config.Contex
 		// P1-2）：推送正文经 DisplayTextFor 单一执法点 —— sender 是 bot/webhook
 		// 身份才信任 server 权威 plain；直连长连接发出的伪造卡片（Finalize 从未
 		// 跑过，plain 攻击者可控）一律 [卡片] 占位。
-		alert = cardmsg.DisplayTextFor(cardSenderTrusted(ctx, msg.FromUID), msg.Payload)
+		alert = cardmsg.DisplayTextFor(cardMessageTrusted(ctx, msg, toUser), msg.Payload)
 	case common.RichText:
 		// 图文混排 RichText(=14)：推送正文取 server 已生成的权威 plain（含 [图片]
 		// 占位）。GetRichTextDisplayText 优先用 payload.plain，缺失时现场遍历
@@ -471,4 +471,30 @@ var (
 func cardSenderTrusted(ctx *config.Context, fromUID string) bool {
 	cardTrustOnce.Do(func() { cardTrust = cardtrust.New(ctx) })
 	return cardTrust.Trusted(fromUID)
+}
+
+type cardMessageTruster interface {
+	TrustedMessage(cardtrust.MessageObservation) bool
+}
+
+func cardMessageTrusted(ctx *config.Context, msg msgOfflineNotify, toUser *user.Resp) bool {
+	cardTrustOnce.Do(func() { cardTrust = cardtrust.New(ctx) })
+	return observedCardTrusted(cardTrust, msg, toUser)
+}
+
+func observedCardTrusted(truster cardMessageTruster, msg msgOfflineNotify, toUser *user.Resp) bool {
+	if truster == nil || toUser == nil {
+		return false
+	}
+	channelID := msg.ChannelID
+	if msg.ChannelType == common.ChannelTypePerson.Uint8() && toUser.UID != msg.FromUID {
+		// WuKongIM persists the sender-side target as ChannelID. For the
+		// recipient's view the other DM participant is the observed sender.
+		channelID = msg.FromUID
+	}
+	target, _ := cardtrust.TargetFromChannel(channelID, msg.ChannelType)
+	return truster.TrustedMessage(cardtrust.MessageObservation{
+		FromUID: msg.FromUID, ViewerUID: toUser.UID, SpaceID: msg.SpaceID,
+		Target: target, Payload: msg.Payload,
+	})
 }

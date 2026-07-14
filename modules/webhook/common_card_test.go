@@ -101,7 +101,7 @@ func TestObservedCardTrustedBindsOfflineRecipientAndChannel(t *testing.T) {
 }
 
 func TestObservedCardTrustedFailsClosedWithoutViewerOrCanonicalChannel(t *testing.T) {
-	trust := &captureMessageTrust{trusted: true}
+	trust := &captureMessageTrust{}
 	message := msgOfflineNotify{MsgResp: MsgResp{
 		FromUID: "human-a", ChannelID: "group-a", ChannelType: 99, Payload: []byte(`{"type":17}`),
 	}, SpaceID: "space-a"}
