@@ -32,8 +32,10 @@ it is not a byte-for-byte forward of an existing message or card. Smart
 summaries and documents are separate providers of the same platform capability:
 the resource remains owned by its source service, and octo-server sends only a
 reviewed representation and deep link. Sharing does not copy the underlying
-resource into octo-server or grant recipients access unless the provider's
-reviewed disclosure policy explicitly and atomically does so.
+resource into octo-server and does not grant access by default. A reviewed
+provider may expose a public resource, a safe requestable-access card, or an
+explicit atomic grant policy; the provider landing route authorizes the current
+viewer on every open.
 
 ## Background
 
@@ -74,11 +76,13 @@ The registry also binds a required provider adapter. Given a fully verified
 intent, the adapter revalidates the resource against its authoritative owner
 before any target is dispatched: the actor must still be allowed to share it,
 the signed revision must still be current and shareable, and the provider's
-recipient-access policy must still hold (or its access grant must complete
-atomically). The adapter returns only typed `ResourceCardInput` and per-target
-disclosure decisions. A timeout, unavailable owner, stale revision, partial
-grant, or indeterminate result fails closed with zero transport calls for the
-affected targets.
+reviewed public/requestable/grant policy must still permit the disclosure. A
+requestable card does not require every recipient to have access, but every
+visible field must be safe for all current and future viewers of the target.
+The adapter returns only typed `ResourceCardInput` and per-target disclosure
+decisions. A timeout, unavailable owner, stale revision, partial grant, or
+indeterminate result fails closed with zero transport calls for the affected
+targets.
 
 Intent verification algorithms, issuer keys, and `kid` values are pinned by the
 reviewed specification and loaded from managed startup configuration. A JWS
@@ -127,9 +131,10 @@ No response contains the built card, share proof, signing input, or raw intent.
 
 An intent authorizes only the exact signed resource revision and target set. It
 does not grant a general ability to send messages or read the resource. Every
-provider must define whether sharing requires recipients to already have access
-or atomically creates a provider-owned access grant; the platform never guesses
-or widens resource visibility itself.
+provider must define whether a resource is public, requestable, access-required,
+atomically granted, or forbidden. The platform never guesses or widens resource
+visibility itself. Requestable links reauthorize the current viewer and open
+the provider-owned permission flow when access is absent.
 
 “Single use” is compatible with network retry through the durable intent
 fingerprint. The first successful claim stores `hash(nonce)` and a canonical
@@ -188,7 +193,9 @@ sender/attribution, OBO fields, subscribers, mentions, or transport metadata.
 `Action.OpenUrl`/deep link. It never permits provider-supplied URLs, inputs,
 `Action.Submit`, callbacks, or any action that mutates the resource. The adapter
 returns a typed resource-link input; octo-server applies the registered
-origin/route policy and constructs the final URL.
+origin/route policy and constructs the final URL. The route may open a public
+resource or a permission-request page after current-viewer authorization; the
+card never carries an access credential or performs the request inline.
 
 A human-sender type-17 card is renderable only with a valid platform share proof
 bound to the finalized canonical envelope, actor, Space, target, resource type/
@@ -293,7 +300,10 @@ safe failure.
 4. **Provider onboarding:** smart-summary, docs, tasks, and other resource owners
    each get a separate reviewed adapter/brief for issuer keys, claim schema,
    revision revalidation, disclosure/grant policy, template, deep-link route,
-   traffic budget, and operational ownership.
+   traffic budget, and operational ownership. The shared integration contract
+   is in `provider-onboarding.md`; the first provider briefs are
+   `../smart-summary-resource-share-provider/brief.md` and
+   `../docs-resource-share-provider/brief.md`.
 
 No provider is enabled until the renderer companion, shared client share
 UX/SDK, and that provider's onboarding are deployed. Rollback first disables
@@ -349,6 +359,10 @@ enabled so already persisted messages do not regress to untrusted content.
   sender, attribution, OBO, mention, subscriber, and transport fields cannot
   reach the wire. Every provider output passes `cardmsg.Validate`, `Finalize`,
   and final-size checks.
+- Provider access-policy tests cover public, requestable, and forbidden
+  resources. Requestable cards expose only reviewed safe metadata, carry no
+  access credential, and open a provider route that reauthorizes the current
+  viewer before showing the resource or permission-request flow.
 - Proof conformance vectors pass in octo-server and web. Missing, forged,
   wrong-provider/resource/actor/target/Space, or payload-tampered proofs are
   masked. Old/new verification keys overlap safely during rotation.
