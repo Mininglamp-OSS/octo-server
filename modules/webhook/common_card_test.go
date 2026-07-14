@@ -11,6 +11,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-server/modules/cardtrust"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/stretchr/testify/assert"
@@ -33,6 +34,79 @@ func ensurePushAppBotTable(t *testing.T, ctx *config.Context) {
 		updated_at DATETIME NOT NULL DEFAULT NOW() ON UPDATE NOW()
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`)
 	assert.NoError(t, err)
+}
+
+type captureMessageTrust struct {
+	trusted     bool
+	observation cardtrust.MessageObservation
+}
+
+func (s *captureMessageTrust) TrustedMessage(observation cardtrust.MessageObservation) bool {
+	s.observation = observation
+	return s.trusted
+}
+
+func TestObservedCardTrustedBindsOfflineRecipientAndChannel(t *testing.T) {
+	payload := []byte(`{"type":17,"plain":"summary"}`)
+	tests := []struct {
+		name      string
+		message   msgOfflineNotify
+		viewer    string
+		wantPeer  string
+		wantGroup string
+		wantShort string
+	}{
+		{
+			name: "dm recipient view",
+			message: msgOfflineNotify{MsgResp: MsgResp{
+				FromUID: "human-a", ChannelID: "human-b", ChannelType: common.ChannelTypePerson.Uint8(), Payload: payload,
+			}, SpaceID: "space-a"},
+			viewer: "human-b", wantPeer: "human-a",
+		},
+		{
+			name: "dm sender view",
+			message: msgOfflineNotify{MsgResp: MsgResp{
+				FromUID: "human-a", ChannelID: "human-b", ChannelType: common.ChannelTypePerson.Uint8(), Payload: payload,
+			}, SpaceID: "space-a"},
+			viewer: "human-a", wantPeer: "human-b",
+		},
+		{
+			name: "group",
+			message: msgOfflineNotify{MsgResp: MsgResp{
+				FromUID: "human-a", ChannelID: "group-a", ChannelType: common.ChannelTypeGroup.Uint8(), Payload: payload,
+			}, SpaceID: "space-a"},
+			viewer: "human-b", wantGroup: "group-a",
+		},
+		{
+			name: "thread",
+			message: msgOfflineNotify{MsgResp: MsgResp{
+				FromUID: "human-a", ChannelID: "group-a____topic-a", ChannelType: common.ChannelTypeCommunityTopic.Uint8(), Payload: payload,
+			}, SpaceID: "space-a"},
+			viewer: "human-b", wantGroup: "group-a", wantShort: "topic-a",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			trust := &captureMessageTrust{trusted: true}
+			assert.True(t, observedCardTrusted(trust, tt.message, &user.Resp{UID: tt.viewer}))
+			assert.Equal(t, "human-a", trust.observation.FromUID)
+			assert.Equal(t, tt.viewer, trust.observation.ViewerUID)
+			assert.Equal(t, "space-a", trust.observation.SpaceID)
+			assert.Equal(t, tt.wantPeer, trust.observation.Target.PeerUID)
+			assert.Equal(t, tt.wantGroup, trust.observation.Target.GroupNo)
+			assert.Equal(t, tt.wantShort, trust.observation.Target.ShortID)
+			assert.Equal(t, payload, trust.observation.Payload)
+		})
+	}
+}
+
+func TestObservedCardTrustedFailsClosedWithoutViewerOrCanonicalChannel(t *testing.T) {
+	trust := &captureMessageTrust{trusted: true}
+	message := msgOfflineNotify{MsgResp: MsgResp{
+		FromUID: "human-a", ChannelID: "group-a", ChannelType: 99, Payload: []byte(`{"type":17}`),
+	}, SpaceID: "space-a"}
+	assert.False(t, observedCardTrusted(trust, message, nil))
+	assert.False(t, observedCardTrusted(trust, message, &user.Resp{UID: "human-b"}))
 }
 
 // 验收(PR#543 review B1):type-17 必须通过 containSupportType 门,否则离线推送
