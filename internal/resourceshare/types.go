@@ -85,8 +85,18 @@ type ResourceCardInput struct {
 	Fields      []ResourceCardField
 }
 
+type TargetDisclosure struct {
+	Target  Target
+	Allowed bool
+}
+
+type RevalidatedResource struct {
+	Card        ResourceCardInput
+	Disclosures []TargetDisclosure
+}
+
 type ProviderAdapter interface {
-	Revalidate(context.Context, VerifiedIntent) (*ResourceCardInput, error)
+	Revalidate(context.Context, VerifiedIntent) (*RevalidatedResource, error)
 }
 
 type VerificationKey struct {
@@ -106,6 +116,8 @@ type ClaimsValidator func(json.RawMessage) error
 
 type DeepLinkBuilder func(ResourceRef) (*url.URL, error)
 
+type CardRenderer func(ResourceCardInput, *url.URL) (map[string]interface{}, error)
+
 type ProviderSpec struct {
 	ID               ProviderID
 	Enabled          bool
@@ -118,6 +130,7 @@ type ProviderSpec struct {
 	Limits           ProviderLimits
 	ValidateClaims   ClaimsValidator
 	BuildDeepLink    DeepLinkBuilder
+	RenderCard       CardRenderer
 	Adapter          ProviderAdapter
 }
 

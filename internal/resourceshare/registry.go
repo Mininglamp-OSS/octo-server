@@ -138,6 +138,9 @@ func validateAndCopyProvider(input ProviderSpec) (ProviderSpec, map[string]Verif
 	if input.BuildDeepLink == nil {
 		return ProviderSpec{}, nil, nil, providerConfigError(input.ID, "missing deep link builder")
 	}
+	if input.RenderCard == nil {
+		return ProviderSpec{}, nil, nil, providerConfigError(input.ID, "missing card renderer")
+	}
 	if isNilInterface(input.Adapter) {
 		return ProviderSpec{}, nil, nil, providerConfigError(input.ID, "missing provider adapter")
 	}
