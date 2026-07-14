@@ -78,14 +78,15 @@ type shareTransport interface {
 }
 
 type ShareServiceDependencies struct {
-	Registry       *Registry
-	Store          shareStore
-	Authorizer     shareAuthorizer
-	Limiter        shareLimiter
-	ProofSigner    shareProofSealer
-	Transport      shareTransport
-	FeatureEnabled func() bool
-	Now            func() time.Time
+	Registry                *Registry
+	Store                   shareStore
+	Authorizer              shareAuthorizer
+	Limiter                 shareLimiter
+	ProofSigner             shareProofSealer
+	Transport               shareTransport
+	FeatureEnabled          func() bool
+	Now                     func() time.Time
+	MaxConcurrentDispatches int
 }
 
 type ShareService struct {
@@ -97,6 +98,7 @@ type ShareService struct {
 	transport      shareTransport
 	featureEnabled func() bool
 	now            func() time.Time
+	dispatchSlots  chan struct{}
 }
 
 func NewShareService(deps ShareServiceDependencies) (*ShareService, error) {
@@ -108,10 +110,18 @@ func NewShareService(deps ShareServiceDependencies) (*ShareService, error) {
 	if now == nil {
 		now = time.Now
 	}
+	maxConcurrentDispatches := deps.MaxConcurrentDispatches
+	if maxConcurrentDispatches <= 0 {
+		if featureEnabled() {
+			return nil, fmt.Errorf("%w: enabled service has invalid dispatch concurrency", ErrShareConfig)
+		}
+		maxConcurrentDispatches = 1
+	}
 	service := &ShareService{
 		registry: deps.Registry, store: deps.Store, authorizer: deps.Authorizer,
 		limiter: deps.Limiter, proofSigner: deps.ProofSigner, transport: deps.Transport,
 		featureEnabled: featureEnabled, now: now,
+		dispatchSlots: make(chan struct{}, maxConcurrentDispatches),
 	}
 	if featureEnabled() && !service.ready() {
 		return nil, fmt.Errorf("%w: enabled service has missing dependencies", ErrShareConfig)
@@ -222,6 +232,10 @@ func (s *ShareService) shareTarget(
 	if err != nil {
 		return s.finishPreTransport(ctx, rowID, target, DeliveryFailed, s.now().Add(5*time.Second), "proof_unavailable", requestID)
 	}
+	if err := s.acquireDispatchSlot(ctx); err != nil {
+		return s.finishPreTransport(ctx, rowID, target, DeliveryFailed, s.now().Add(5*time.Second), "dispatch_capacity_unavailable", requestID)
+	}
+	defer s.releaseDispatchSlot()
 	if err := s.store.BeginDispatch(ctx, rowID, requestID); err != nil {
 		if record, loadErr := s.store.LoadDelivery(ctx, rowID); loadErr == nil {
 			return targetResultFromRecord(target, *record, s.now())
@@ -349,5 +363,19 @@ func maxInt64(a, b int64) int64 {
 
 func (s *ShareService) ready() bool {
 	return s != nil && s.registry != nil && s.store != nil && s.authorizer != nil &&
-		s.limiter != nil && s.proofSigner != nil && s.transport != nil && s.now != nil
+		s.limiter != nil && s.proofSigner != nil && s.transport != nil && s.now != nil &&
+		s.dispatchSlots != nil
+}
+
+func (s *ShareService) acquireDispatchSlot(ctx context.Context) error {
+	select {
+	case s.dispatchSlots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *ShareService) releaseDispatchSlot() {
+	<-s.dispatchSlots
 }

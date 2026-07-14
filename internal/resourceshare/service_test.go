@@ -188,6 +188,8 @@ func TestShareService_BoundsTransportConcurrencyAcrossRequests(t *testing.T) {
 	secondIntent.IdempotencyKey = "concurrent-key-two"
 	secondIntent.Resource.ID = "summary-two"
 	secondIntent.Targets = []Target{{Kind: TargetGroup, GroupNo: "group-b"}}
+	firstCompact := signIntent(t, intentKey, jose.ES256, "intent-key-1", firstIntent)
+	secondCompact := signIntent(t, intentKey, jose.ES256, "intent-key-1", secondIntent)
 
 	type shareCallResult struct {
 		result *ShareResult
@@ -195,14 +197,12 @@ func TestShareService_BoundsTransportConcurrencyAcrossRequests(t *testing.T) {
 	}
 	results := make(chan shareCallResult, 2)
 	go func() {
-		result, callErr := service.Share(context.Background(), "user-a", "space-a",
-			signIntent(t, intentKey, jose.ES256, "intent-key-1", firstIntent), "request-1")
+		result, callErr := service.Share(context.Background(), "user-a", "space-a", firstCompact, "request-1")
 		results <- shareCallResult{result: result, err: callErr}
 	}()
 	require.Equal(t, "group-a", <-transport.entered)
 	go func() {
-		result, callErr := service.Share(context.Background(), "user-a", "space-a",
-			signIntent(t, intentKey, jose.ES256, "intent-key-1", secondIntent), "request-2")
+		result, callErr := service.Share(context.Background(), "user-a", "space-a", secondCompact, "request-2")
 		results <- shareCallResult{result: result, err: callErr}
 	}()
 
