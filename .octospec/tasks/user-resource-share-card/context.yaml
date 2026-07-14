@@ -1,0 +1,80 @@
+---
+type: TaskContext
+slug: user-resource-share-card
+timestamp: 2026-07-14T12:06:32+08:00
+---
+
+# Rules resolved while refining the load-bearing implementation contract.
+rules_injected:
+  - id: error-handling
+    tier: repo
+    load_bearing: true
+    why: >
+      The new authenticated endpoint needs localized request-wide failures and
+      stable, non-enumerating per-target outcomes. Production handlers must use
+      httperr.ResponseErrorL and registered errcodes; raw non-OK JSON is not
+      permitted.
+  - id: rate-limit
+    tier: repo
+    load_bearing: true
+    why: >
+      SharedUIDRateLimiter applies after AuthMiddleware, while feature,
+      provider, DM-peer, and channel budgets count canonical targets across
+      replicas and fail closed on limiter-store errors.
+  - id: space-isolation
+    tier: repo
+    load_bearing: true
+    why: >
+      Login Space, signed Space, active Space membership, and every target's
+      authoritative Space must match exactly. Phase one rejects legacy-empty,
+      external fallback, and cross-Space targets.
+  - id: trust-boundary
+    tier: repo
+    load_bearing: true
+    why: >
+      Human-sender type-17 is a narrow exception. The client cannot submit a
+      sender, card, URL, target alias, OBO field, mention, subscriber, or
+      transport metadata; provider intent and platform proof use pinned keys and
+      fail closed.
+  - id: testing
+    tier: repo
+    load_bearing: true
+    why: >
+      The implementation must start with RED tests for registry, intent,
+      revalidation, target authorization, durable state, proof vectors,
+      distributed limits, route middleware, and the no-bypass source guard.
+  - id: commit-style
+    tier: repo
+    load_bearing: false
+    why: >
+      RED and GREEN checkpoints use small English Conventional Commits.
+
+code_read:
+  - modules/message/api.go
+  - modules/cardtrust/cardtrust.go
+  - internal/carddispatch/dispatch.go
+  - internal/carddispatch/authorizer_db.go
+  - pkg/cardmsg/cardmsg.go
+  - pkg/cardmsg/validate.go
+  - pkg/cardmsg/plain.go
+  - modules/messages_search/search_messages.go
+  - modules/webhook/common.go
+
+decisions:
+  - A resource share mints a new server-owned representation; it never forwards
+    an existing message or arbitrary type-17 payload.
+  - Smart-summary and docs are independent provider onboarding increments over
+    one generic platform path.
+  - The generic user send endpoint and Bot dispatcher remain unchanged; only
+    the resource-share service may transport a human-sender type-17 message.
+  - Identical-intent retry reuses durable per-target results; same nonce with a
+    changed signed fingerprint is a replay conflict.
+  - Provider revalidation is required before dispatch to reject stale resource
+    revisions and enforce recipient disclosure/grant policy.
+  - Proofs use asymmetric keys and cross-language canonical vectors; provider
+    and global flags default off until renderer verification is deployed.
+
+implementation_status:
+  phase: contract-refinement
+  production_code_changed: false
+  tests_run: false
