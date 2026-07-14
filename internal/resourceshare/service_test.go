@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"encoding/json"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -98,18 +99,129 @@ func newServiceHarness(t *testing.T, intent Intent, disclosures []TargetDisclosu
 	limiter := &allowLimiter{}
 	transport := &captureTransport{response: &config.MsgSendResp{MessageID: 99, MessageSeq: 7, ClientMsgNo: "server-msg"}}
 	service, err := NewShareService(ShareServiceDependencies{
-		Registry:       registry,
-		Store:          store,
-		Authorizer:     authorizer,
-		Limiter:        limiter,
-		ProofSigner:    signer,
-		Transport:      transport,
-		FeatureEnabled: func() bool { return true },
-		Now:            func() time.Time { return now },
+		Registry:                registry,
+		Store:                   store,
+		Authorizer:              authorizer,
+		Limiter:                 limiter,
+		ProofSigner:             signer,
+		Transport:               transport,
+		FeatureEnabled:          func() bool { return true },
+		Now:                     func() time.Time { return now },
+		MaxConcurrentDispatches: 4,
 	})
 	require.NoError(t, err)
 	_ = intent
 	return serviceHarness{service, adapter, authorizer, limiter, transport, verifier, intentKey, now}
+}
+
+type dynamicServiceAdapter struct{}
+
+func (dynamicServiceAdapter) Revalidate(_ context.Context, intent VerifiedIntent) (*RevalidatedResource, error) {
+	disclosures := make([]TargetDisclosure, 0, len(intent.Intent.Targets))
+	for _, target := range intent.Intent.Targets {
+		disclosures = append(disclosures, disclosureFor(target, true))
+	}
+	return &RevalidatedResource{
+		Card:        ResourceCardInput{Title: "Concurrent share", Description: "Bounded dispatch"},
+		Disclosures: disclosures,
+	}, nil
+}
+
+type statelessAuthorizer struct{}
+
+func (statelessAuthorizer) Authorize(context.Context, string, string, Target) error { return nil }
+
+type statelessLimiter struct{}
+
+func (statelessLimiter) Allow(context.Context, LimitRequest) (LimitDecision, error) {
+	return LimitDecision{Allowed: true}, nil
+}
+
+type blockingTransport struct {
+	entered chan string
+	release chan struct{}
+	active  atomic.Int32
+	max     atomic.Int32
+	seq     atomic.Int64
+}
+
+func (t *blockingTransport) SendMessageWithResult(req *config.MsgSendReq) (*config.MsgSendResp, error) {
+	active := t.active.Add(1)
+	for {
+		previous := t.max.Load()
+		if active <= previous || t.max.CompareAndSwap(previous, active) {
+			break
+		}
+	}
+	t.entered <- req.ChannelID
+	<-t.release
+	t.active.Add(-1)
+	sequence := t.seq.Add(1)
+	return &config.MsgSendResp{MessageID: 100 + sequence, MessageSeq: uint32(sequence)}, nil
+}
+
+func TestShareService_BoundsTransportConcurrencyAcrossRequests(t *testing.T) {
+	store, _, now := newStoreHarness(t)
+	intentKey := newIntentTestKey(t)
+	proofKey := newIntentTestKey(t)
+	spec := validProviderSpec(t, intentKey)
+	spec.Adapter = dynamicServiceAdapter{}
+	registry, err := NewRegistry([]ProviderSpec{spec})
+	require.NoError(t, err)
+	signer, err := NewProofSigner(ProofSigningKey{KeyID: "proof-key-1", PrivateKey: proofKey})
+	require.NoError(t, err)
+	transport := &blockingTransport{entered: make(chan string, 2), release: make(chan struct{}, 2)}
+	service, err := NewShareService(ShareServiceDependencies{
+		Registry: registry, Store: store, Authorizer: statelessAuthorizer{}, Limiter: statelessLimiter{},
+		ProofSigner: signer, Transport: transport, FeatureEnabled: func() bool { return true },
+		Now: func() time.Time { return now }, MaxConcurrentDispatches: 1,
+	})
+	require.NoError(t, err)
+
+	firstIntent := validIntent(now)
+	firstIntent.Nonce = "concurrent-nonce-one"
+	firstIntent.IdempotencyKey = "concurrent-key-one"
+	firstIntent.Resource.ID = "summary-one"
+	firstIntent.Targets = []Target{{Kind: TargetGroup, GroupNo: "group-a"}}
+	secondIntent := validIntent(now)
+	secondIntent.Nonce = "concurrent-nonce-two"
+	secondIntent.IdempotencyKey = "concurrent-key-two"
+	secondIntent.Resource.ID = "summary-two"
+	secondIntent.Targets = []Target{{Kind: TargetGroup, GroupNo: "group-b"}}
+
+	type shareCallResult struct {
+		result *ShareResult
+		err    error
+	}
+	results := make(chan shareCallResult, 2)
+	go func() {
+		result, callErr := service.Share(context.Background(), "user-a", "space-a",
+			signIntent(t, intentKey, jose.ES256, "intent-key-1", firstIntent), "request-1")
+		results <- shareCallResult{result: result, err: callErr}
+	}()
+	require.Equal(t, "group-a", <-transport.entered)
+	go func() {
+		result, callErr := service.Share(context.Background(), "user-a", "space-a",
+			signIntent(t, intentKey, jose.ES256, "intent-key-1", secondIntent), "request-2")
+		results <- shareCallResult{result: result, err: callErr}
+	}()
+
+	select {
+	case channelID := <-transport.entered:
+		t.Fatalf("second dispatch %q entered transport before the first released", channelID)
+	case <-time.After(100 * time.Millisecond):
+	}
+	transport.release <- struct{}{}
+	require.Equal(t, "group-b", <-transport.entered)
+	transport.release <- struct{}{}
+
+	for range 2 {
+		call := <-results
+		require.NoError(t, call.err)
+		require.Len(t, call.result.Results, 1)
+		assert.Equal(t, ShareSent, call.result.Results[0].Outcome)
+	}
+	assert.Equal(t, int32(1), transport.max.Load())
 }
 
 func disclosureFor(target Target, allowed bool) TargetDisclosure {
