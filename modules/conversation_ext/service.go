@@ -651,6 +651,27 @@ func (s *Service) UnfollowChannel(uid, spaceID, groupNo string) error {
 // 调用方应在 thread.Service.CreateThread 的 commit 之后立即调用，错误以 wrap 形式上传，
 // 由调用方决定是否记日志 / 触发告警（thread 创建不应因 fanout 失败回滚）。
 func (s *Service) OnThreadCreated(groupNo, shortID string) error {
+	return s.fanoutThreadFollow(groupNo, shortID)
+}
+
+// OnThreadReactivated 在归档子区被新消息复活（archived -> active）之后调用，
+// 给所有已对 parent channel 开启 auto_follow_threads=1 的用户物化 thread ext 行。
+//
+// issue #586：FollowChannel 物化（EnumerateActiveShortIDs）只枚举 active 子区，
+// 因此关注时处于 archived 的子区从未生成 ext 行；OnThreadCreated 只在创建时 fanout。
+// 结果是被复活的子区右侧 active 列表可见、左侧「关注」列表却永久缺失。此处与
+// OnThreadCreated 对称补齐：复用同一 fanout 逻辑（INSERT IGNORE，幂等，与既有
+// ext 行重叠是 no-op），只在 RecordMessageAndReactivate 确实翻转了 status 时调用。
+//
+// best-effort：与 OnThreadCreated 一样错误以 wrap 形式上传，由调用方记日志不阻断消息摄入。
+func (s *Service) OnThreadReactivated(groupNo, shortID string) error {
+	return s.fanoutThreadFollow(groupNo, shortID)
+}
+
+// fanoutThreadFollow 是 OnThreadCreated / OnThreadReactivated 共用的 fanout 主体：
+// 给所有对 parent channel 开启 auto_follow_threads=1 且未 group_unfollowed 的活跃
+// 成员物化 thread ext 行并 bump 各自的 follow_version。INSERT IGNORE 保证幂等。
+func (s *Service) fanoutThreadFollow(groupNo, shortID string) error {
 	if groupNo == "" {
 		return errors.New("group_no must not be empty")
 	}

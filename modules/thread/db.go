@@ -764,6 +764,9 @@ func (d *DB) CountMembersBatch(threadIDs []int64) (map[int64]int, error) {
 }
 
 // RecordMessageAndReactivate 收到消息时的事务路径：在行锁内决定是否解档。
+// 返回 reactivated 表示本次调用是否真的把 status 从 archived 翻转为 active
+// （archived->active 分支返回 true；纯统计/已 active、以及已删除/不存在分支返回 false）。
+// 调用方据此决定是否补 fanout ext 行（issue #586）。
 //
 // 流程：BEGIN → SELECT ... FOR UPDATE → 看当前 status 决定是否解档 → UPDATE → COMMIT。
 // 关键点：
@@ -778,10 +781,10 @@ func (d *DB) CountMembersBatch(threadIDs []int64) (map[int64]int, error) {
 //     active（新版本号严格 > cron 的版本号，因为 GenSeq 是全局单调）。
 //   - 我们先拿锁 → last_message_at=NOW → cron 的 WHERE last_message_at<cutoff 不匹配
 //     → cron 跳过本行。
-func (d *DB) RecordMessageAndReactivate(shortID, content, senderUID string, newVersion func() (int64, error)) error {
+func (d *DB) RecordMessageAndReactivate(shortID, content, senderUID string, newVersion func() (int64, error)) (reactivated bool, err error) {
 	tx, err := d.session.Begin()
 	if err != nil {
-		return fmt.Errorf("record message: begin tx: %w", err)
+		return false, fmt.Errorf("record message: begin tx: %w", err)
 	}
 	defer tx.RollbackUnlessCommitted()
 
@@ -791,18 +794,18 @@ func (d *DB) RecordMessageAndReactivate(shortID, content, senderUID string, newV
 		shortID, ThreadStatusDeleted,
 	).Load(&status)
 	if err != nil {
-		return fmt.Errorf("record message: lock thread: %w", err)
+		return false, fmt.Errorf("record message: lock thread: %w", err)
 	}
 	if loaded == 0 {
 		// 行不存在或已删除：消息到达不该复活已删的子区，直接放弃，但事务正常 commit。
-		return tx.Commit()
+		return false, tx.Commit()
 	}
 
 	now := time.Now()
 	if status == ThreadStatusArchived {
 		version, gerr := newVersion()
 		if gerr != nil {
-			return fmt.Errorf("record message: gen version: %w", gerr)
+			return false, fmt.Errorf("record message: gen version: %w", gerr)
 		}
 		if _, err := tx.UpdateBySql(
 			"UPDATE thread SET status=?, version=?, last_message_at=?, "+
@@ -811,9 +814,10 @@ func (d *DB) RecordMessageAndReactivate(shortID, content, senderUID string, newV
 				"WHERE short_id=?",
 			ThreadStatusActive, version, now, content, senderUID, now, shortID,
 		).Exec(); err != nil {
-			return fmt.Errorf("record message: reactivate update: %w", err)
+			return false, fmt.Errorf("record message: reactivate update: %w", err)
 		}
-		return tx.Commit()
+		// 本次调用确实把 status 从 archived 翻转为 active，通知调用方补 fanout ext 行。
+		return true, tx.Commit()
 	}
 
 	// status == active：仅更新统计，不动 version。
@@ -823,9 +827,9 @@ func (d *DB) RecordMessageAndReactivate(shortID, content, senderUID string, newV
 			"WHERE short_id=?",
 		now, content, senderUID, now, shortID,
 	).Exec(); err != nil {
-		return fmt.Errorf("record message: stats update: %w", err)
+		return false, fmt.Errorf("record message: stats update: %w", err)
 	}
-	return tx.Commit()
+	return false, tx.Commit()
 }
 
 // UpdateMessageStats 原子更新消息统计（收到消息时调用）

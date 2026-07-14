@@ -680,6 +680,65 @@ func TestService_OnThreadCreated_InvalidInput(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// OnThreadReactivated fanout — issue #586: 归档子区被消息复活后与 OnThreadCreated
+// 对称地给关注父群的用户补 thread ext 行，否则左侧「关注」列表永久缺失该子区。
+// 复用同一 fanout 主体（fanoutThreadFollow），行为与 OnThreadCreated 一致。
+// ---------------------------------------------------------------------------
+
+func TestService_OnThreadReactivated_MaterializesForAutoFollowUsers(t *testing.T) {
+	svc := newServiceForTest(t)
+	const space, grp, shortID = "s1", "grp-ofr-1", "thr-react"
+	channelID := grp + threadSeparator + shortID
+
+	// A：开启 auto_follow_threads（关注了 channel）
+	require.NoError(t, svc.FollowChannel("uA", space, grp))
+	// B：关注过群但显式取关 —— auto_follow_threads 已清零
+	require.NoError(t, svc.UnfollowChannel("uB", space, grp))
+	// C：从未操作过该 channel
+
+	require.NoError(t, svc.OnThreadReactivated(grp, shortID))
+
+	rowA, err := svc.db.Get("uA", space, targetTypeThread, channelID)
+	require.NoError(t, err)
+	assert.NotNil(t, rowA, "auto_follow_threads=1 的用户应在复活 fanout 中拿到 thread 行")
+
+	rowB, err := svc.db.Get("uB", space, targetTypeThread, channelID)
+	require.NoError(t, err)
+	assert.Nil(t, rowB, "已取消关注 channel 的用户不应被复活 fanout 触及")
+
+	rowC, err := svc.db.Get("uC", space, targetTypeThread, channelID)
+	require.NoError(t, err)
+	assert.Nil(t, rowC, "从未关注 channel 的用户不应被复活 fanout 触及")
+}
+
+func TestService_OnThreadReactivated_Idempotent_PreservesExistingRow(t *testing.T) {
+	svc := newServiceForTest(t)
+	const space, grp, shortID = "s1", "grp-ofr-2", "thr-react-dup"
+	channelID := grp + threadSeparator + shortID
+
+	require.NoError(t, svc.FollowChannel("uA", space, grp))
+	// uA 已手动给该 thread 拖到 sort=88（例如关注时子区曾 active 被物化后又归档）
+	require.NoError(t, svc.db.Upsert("uA", space, targetTypeThread, channelID, ConvExtFields{
+		FollowSort: intPtr(88),
+	}))
+
+	// 复活 fanout 与既有 ext 行重叠时必须是 no-op（INSERT IGNORE）。
+	require.NoError(t, svc.OnThreadReactivated(grp, shortID))
+
+	row, err := svc.db.Get("uA", space, targetTypeThread, channelID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, 88, row.FollowSort, "已存在的 thread 行（含手动排序）必须保留，复活 fanout 不应覆盖")
+}
+
+func TestService_OnThreadReactivated_InvalidInput(t *testing.T) {
+	svc := newServiceForTest(t)
+
+	require.Error(t, svc.OnThreadReactivated("", "thr"))
+	require.Error(t, svc.OnThreadReactivated("grp", ""))
+}
+
+// ---------------------------------------------------------------------------
 // UnfollowChannel happy path + cascade
 // ---------------------------------------------------------------------------
 

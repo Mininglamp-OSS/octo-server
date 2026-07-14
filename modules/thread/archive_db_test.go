@@ -177,7 +177,9 @@ func TestRecordMessageAndReactivate_ResurrectsArchived(t *testing.T) {
 	require.Equal(t, ThreadStatusArchived, m.Status)
 
 	// 此后 listener 落库消息统计：必须把 status 抬回 active 并写新版本
-	require.NoError(t, db.RecordMessageAndReactivate("raced", "hello", "sender-1", constVersion(200)))
+	reactivated, err := db.RecordMessageAndReactivate("raced", "hello", "sender-1", constVersion(200))
+	require.NoError(t, err)
+	assert.True(t, reactivated, "archived->active transition must report reactivated=true")
 
 	m, err = db.QueryByShortID("raced")
 	require.NoError(t, err)
@@ -203,10 +205,12 @@ func TestRecordMessageAndReactivate_NoVersionBumpForAlreadyActive(t *testing.T) 
 	insertThreadWithVersion(t, db, "active_thread", ThreadStatusActive, &now, 42)
 
 	called := false
-	require.NoError(t, db.RecordMessageAndReactivate("active_thread", "hi", "u1", func() (int64, error) {
+	reactivated, err := db.RecordMessageAndReactivate("active_thread", "hi", "u1", func() (int64, error) {
 		called = true
 		return 999, nil
-	}))
+	})
+	require.NoError(t, err)
+	assert.False(t, reactivated, "already-active thread must report reactivated=false")
 
 	m, err := db.QueryByShortID("active_thread")
 	require.NoError(t, err)
@@ -226,7 +230,9 @@ func TestRecordMessageAndReactivate_DeletedStaysDeleted(t *testing.T) {
 	now := time.Now()
 	insertThreadWithVersion(t, db, "deleted_thread", ThreadStatusDeleted, &now, 7)
 
-	require.NoError(t, db.RecordMessageAndReactivate("deleted_thread", "x", "u1", constVersion(999)))
+	reactivated, err := db.RecordMessageAndReactivate("deleted_thread", "x", "u1", constVersion(999))
+	require.NoError(t, err)
+	assert.False(t, reactivated, "deleted thread must report reactivated=false")
 
 	m, err := db.QueryByShortID("deleted_thread")
 	require.NoError(t, err)
@@ -269,7 +275,9 @@ func TestRecordMessageAndReactivate_VersionMonotonicVsCronArchive(t *testing.T) 
 		return newV, nil
 	}
 
-	require.NoError(t, db.RecordMessageAndReactivate("monotonic", "msg", "u1", gen))
+	reactivated, err := db.RecordMessageAndReactivate("monotonic", "msg", "u1", gen)
+	require.NoError(t, err)
+	assert.True(t, reactivated, "archived->active transition must report reactivated=true")
 
 	m, err := db.QueryByShortID("monotonic")
 	require.NoError(t, err)
@@ -479,7 +487,7 @@ func TestArchiveStaleBatch_ConcurrentWithMessages(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for r := 0; r < rounds; r++ {
-				_ = db.RecordMessageAndReactivate(sid, "msg", "sender", gen)
+				_, _ = db.RecordMessageAndReactivate(sid, "msg", "sender", gen)
 				time.Sleep(1 * time.Millisecond)
 			}
 		}()
@@ -490,7 +498,8 @@ func TestArchiveStaleBatch_ConcurrentWithMessages(t *testing.T) {
 	// 收尾：最后再跑一遍消息路（确保每个子区最后一次写入是消息，模拟"消息到了之后不再有
 	// cron 在它身上跑"的真实条件，因为生产里 cron 是周期触发不是连续触发）。
 	for _, sid := range shortIDs {
-		require.NoError(t, db.RecordMessageAndReactivate(sid, "final", "sender", gen))
+		_, err := db.RecordMessageAndReactivate(sid, "final", "sender", gen)
+		require.NoError(t, err)
 	}
 
 	// 断言：所有刚发过消息的子区都必须是 active

@@ -11,6 +11,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
@@ -70,10 +71,25 @@ func (t *Thread) onMessages(messages []*config.MessageResp) {
 		if runeLen := len([]rune(content)); runeLen > 500 {
 			content = string([]rune(content)[:500])
 		}
-		if err := t.db.RecordMessageAndReactivate(shortID, content, msg.FromUID, func() (int64, error) {
+		reactivated, err := t.db.RecordMessageAndReactivate(shortID, content, msg.FromUID, func() (int64, error) {
 			return t.ctx.GenSeq(ThreadSeqKey)
-		}); err != nil {
+		})
+		if err != nil {
 			t.Error("更新消息统计/解档失败", zap.Error(err), zap.String("shortID", shortID))
+		} else if reactivated {
+			// issue #586：子区被消息复活（archived->active）时，与 OnThreadCreated 对称地
+			// 给所有关注父群（auto_follow_threads=1 AND group_unfollowed=0）的用户补 thread
+			// ext 行，否则左侧「关注」列表会永久缺失这个已复活的子区（FollowChannel 物化
+			// 只枚举 active 子区，关注时处于 archived 的子区从未生成 ext 行）。
+			// 与 OnThreadCreated 一样是 commit 后 best-effort：失败只警告，不阻断消息摄入。
+			if convSvc := conversation_ext.GetGlobalConvExtService(); convSvc != nil {
+				if ferr := convSvc.OnThreadReactivated(groupNo, shortID); ferr != nil {
+					t.Warn("OnThreadReactivated fanout 失败（子区已复活，sidebar 会延迟到下次 FollowChannel/refollow 补齐）",
+						zap.String("groupNo", groupNo),
+						zap.String("shortID", shortID),
+						zap.Error(ferr))
+				}
+			}
 		}
 
 		// 发送者不是子区成员，自动加入
