@@ -25,6 +25,7 @@ require (
 	github.com/gomarkdown/markdown v0.0.0-20230716120725-531d2d74bc12
 	github.com/google/uuid v1.3.0
 	github.com/gookit/goutil v0.6.12
+	github.com/gowebpki/jcs v1.0.1
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/judwhite/go-svc v1.2.1
 	github.com/longbridgeapp/opencc v0.3.13
@@ -63,7 +64,6 @@ require (
 )
 
 require (
-	github.com/gowebpki/jcs v1.0.1 // indirect
 	github.com/liuzl/cedar-go v0.0.0-20170805034717-80a9c64b256d // indirect
 	github.com/liuzl/da v0.0.0-20180704015230-14771aad5b1d // indirect
 )
