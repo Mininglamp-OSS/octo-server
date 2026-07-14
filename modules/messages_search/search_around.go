@@ -5,6 +5,7 @@ import (
 	"strconv"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/olivere/elastic"
 	"go.uber.org/zap"
 )
@@ -136,7 +137,7 @@ func (h *Handler) searchAround(c *wkhttp.Context) {
 	hits := h.buildMessageHits(ctx, window, SearchMessagesReq{
 		ChannelType: req.ChannelType,
 		ChannelID:   req.ChannelID,
-	}, loginUID)
+	}, loginUID, cardProjectionContext{ViewerUID: loginUID, SpaceID: spacepkg.GetSpaceID(c)})
 
 	result := splitAroundWindow(hits, len(beforeHits), len(afterHits), hasMoreBefore, hasMoreAfter)
 

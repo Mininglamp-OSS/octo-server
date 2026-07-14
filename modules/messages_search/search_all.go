@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/olivere/elastic"
 	"go.uber.org/zap"
 )
@@ -121,7 +122,9 @@ func (h *Handler) searchAll(c *wkhttp.Context) {
 		return
 	}
 
-	items := h.buildSearchAllHits(ctx, filtered, req, loginUID)
+	items := h.buildSearchAllHits(ctx, filtered, req, loginUID, cardProjectionContext{
+		ViewerUID: loginUID, SpaceID: spacepkg.GetSpaceID(c),
+	})
 
 	recordAudit(c, "search_all", req.ChannelType, req.ChannelID, req.Keyword, len(items))
 	c.Response(envelope(items, hasMore, nextCursor))
@@ -190,7 +193,13 @@ func buildSearchAllHighlight() *elastic.Highlight {
 		Field("payload.file.name")
 }
 
-func (h *Handler) buildSearchAllHits(ctx context.Context, hits []*elastic.SearchHit, req SearchAllReq, loginUID string) []SearchAllHit {
+func (h *Handler) buildSearchAllHits(
+	ctx context.Context,
+	hits []*elastic.SearchHit,
+	req SearchAllReq,
+	loginUID string,
+	projection ...cardProjectionContext,
+) []SearchAllHit {
 	if len(hits) == 0 {
 		return []SearchAllHit{}
 	}
@@ -203,7 +212,7 @@ func (h *Handler) buildSearchAllHits(ctx context.Context, hits []*elastic.Search
 			continue
 		}
 		hl := map[string][]string(hit.Highlight)
-		entry := h.singleSearchAllHit(doc, req.ChannelID, req.ChannelType, hl)
+		entry := h.singleSearchAllHit(doc, req.ChannelID, req.ChannelType, hl, projection...)
 		items = append(items, entry)
 		senderIDs = append(senderIDs, doc.From)
 		// Forward children: their senders need the same batched name lookup
@@ -255,7 +264,13 @@ func (h *Handler) buildSearchAllHits(ctx context.Context, hits []*elastic.Search
 // the peer uid via peerFromFakeChannelID; group/thread the doc.ChannelID
 // as-is) so the frontend can jump into the source room from a mixed-room
 // unified feed.
-func (h *Handler) singleSearchAllHit(doc Doc, channelID string, channelType uint8, hl map[string][]string) SearchAllHit {
+func (h *Handler) singleSearchAllHit(
+	doc Doc,
+	channelID string,
+	channelType uint8,
+	hl map[string][]string,
+	projection ...cardProjectionContext,
+) SearchAllHit {
 	entry := SearchAllHit{SortedAt: msToRFC3339(doc.Timestamp)}
 	if payloadType(doc.Payload) == payloadTypeFile {
 		fh := h.singleFileHit(doc, channelID, channelType)
@@ -263,7 +278,7 @@ func (h *Handler) singleSearchAllHit(doc Doc, channelID string, channelType uint
 		entry.File = &fh
 		entry.SortedAt = fh.SentAt
 	} else {
-		mh := h.singleMessageHit(doc, channelID, channelType, hl)
+		mh := h.singleMessageHit(doc, channelID, channelType, hl, projection...)
 		entry.ResultType = "message"
 		entry.Message = &mh
 		entry.SortedAt = mh.SentAt

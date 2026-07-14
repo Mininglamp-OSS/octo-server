@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/olivere/elastic"
 	"go.uber.org/zap"
 )
@@ -159,7 +160,9 @@ func (h *Handler) searchGlobalMessages(c *wkhttp.Context) {
 	}
 
 	sjStart := time.Now()
-	items := h.buildGlobalSearchAllHits(ctx, filtered, loginUID)
+	items := h.buildGlobalSearchAllHits(ctx, filtered, loginUID, cardProjectionContext{
+		ViewerUID: loginUID, SpaceID: spaceID,
+	})
 	searchTimings.senderJoin = time.Since(sjStart)
 
 	recordAudit(c, "search_global_messages", 0, "", req.Keyword, len(items))
@@ -273,7 +276,12 @@ func buildGlobalMessagesDSL(ctx context.Context, analyzer tokenAnalyzer, stopwor
 // (channelType=0, channelID="") signature so it degrades to a plain global
 // user lookup — per §5 step 7 we deliberately skip group-remark scoping
 // because a single global response mixes hits from many rooms.
-func (h *Handler) buildGlobalSearchAllHits(ctx context.Context, hits []*elastic.SearchHit, loginUID string) []SearchAllHit {
+func (h *Handler) buildGlobalSearchAllHits(
+	ctx context.Context,
+	hits []*elastic.SearchHit,
+	loginUID string,
+	projection ...cardProjectionContext,
+) []SearchAllHit {
 	if len(hits) == 0 {
 		return []SearchAllHit{}
 	}
@@ -287,7 +295,7 @@ func (h *Handler) buildGlobalSearchAllHits(ctx context.Context, hits []*elastic.
 		}
 		wireID, wireType := wireChannelFromDoc(doc, loginUID)
 		hl := map[string][]string(hit.Highlight)
-		entry := h.singleSearchAllHit(doc, wireID, wireType, hl)
+		entry := h.singleSearchAllHit(doc, wireID, wireType, hl, projection...)
 		items = append(items, entry)
 		senderIDs = append(senderIDs, doc.From)
 		if entry.Message != nil {
@@ -454,7 +462,9 @@ func (h *Handler) searchAllForGlobalFastPath(c *wkhttp.Context, req SearchAllReq
 		return
 	}
 
-	items := h.buildSearchAllHits(ctx, filtered, req, loginUID)
+	items := h.buildSearchAllHits(ctx, filtered, req, loginUID, cardProjectionContext{
+		ViewerUID: loginUID, SpaceID: spacepkg.GetSpaceID(c),
+	})
 	recordAudit(c, "search_global_messages_fast", req.ChannelType, req.ChannelID, req.Keyword, len(items))
 	c.Response(envelope(items, hasMore, nextCursor))
 }

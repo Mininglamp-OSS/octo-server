@@ -3,11 +3,13 @@ package messages_search
 import (
 	"context"
 	"encoding/json"
-	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"strconv"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/modules/cardtrust"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/olivere/elastic"
 	"go.uber.org/zap"
 )
@@ -37,12 +39,12 @@ type MessageHit struct {
 	// which return hits from many rooms in a single response — omitempty on the
 	// single-channel surfaces keeps the wire shape byte-identical for the
 	// legacy _search / _search_all / _search_around callers that pass 0.
-	ChannelType     uint8          `json:"channel_type,omitempty"`
-	ThumbURL        string         `json:"thumb_url,omitempty"`
-	VideoURL        string         `json:"video_url,omitempty"`
-	Width           int            `json:"width,omitempty"`
-	Height          int            `json:"height,omitempty"`
-	DurationMs      int64          `json:"duration_ms,omitempty"`
+	ChannelType uint8  `json:"channel_type,omitempty"`
+	ThumbURL    string `json:"thumb_url,omitempty"`
+	VideoURL    string `json:"video_url,omitempty"`
+	Width       int    `json:"width,omitempty"`
+	Height      int    `json:"height,omitempty"`
+	DurationMs  int64  `json:"duration_ms,omitempty"`
 	// RichText is the typed projection of a payload.type=14 rich-text message,
 	// emitted only when the hit is rich-text AND the indexer preserved
 	// `_source.payloadRaw`. Older docs (pre-payloadRaw indexer) leave it nil,
@@ -153,7 +155,9 @@ func (h *Handler) searchMessages(c *wkhttp.Context) {
 		return
 	}
 
-	items := h.buildMessageHits(ctx, filtered, req, loginUID)
+	items := h.buildMessageHits(ctx, filtered, req, loginUID, cardProjectionContext{
+		ViewerUID: loginUID, SpaceID: spacepkg.GetSpaceID(c),
+	})
 
 	recordAudit(c, "search_messages", req.ChannelType, req.ChannelID, req.Keyword, len(items))
 	c.Response(envelope(items, hasMore, nextCursor))
@@ -219,7 +223,13 @@ func buildSearchMessagesHighlight() *elastic.Highlight {
 // outer message sender and any inner_messages[].sender_id (forward children),
 // so a single page incurs at most one MySQL round-trip for names regardless of
 // how many forward cards it contains.
-func (h *Handler) buildMessageHits(ctx context.Context, hits []*elastic.SearchHit, req SearchMessagesReq, loginUID string) []MessageHit {
+func (h *Handler) buildMessageHits(
+	ctx context.Context,
+	hits []*elastic.SearchHit,
+	req SearchMessagesReq,
+	loginUID string,
+	projection ...cardProjectionContext,
+) []MessageHit {
 	if len(hits) == 0 {
 		return []MessageHit{}
 	}
@@ -232,7 +242,7 @@ func (h *Handler) buildMessageHits(ctx context.Context, hits []*elastic.SearchHi
 			continue
 		}
 		hl := map[string][]string(hit.Highlight)
-		mh := h.singleMessageHit(doc, req.ChannelID, req.ChannelType, hl)
+		mh := h.singleMessageHit(doc, req.ChannelID, req.ChannelType, hl, projection...)
 		senderIDs = append(senderIDs, mh.SenderID)
 		for _, im := range mh.InnerMessages {
 			if im.SenderID != "" {
@@ -269,7 +279,13 @@ func (h *Handler) buildMessageHits(ctx context.Context, hits []*elastic.SearchHi
 // peerFromFakeChannelID; for group/thread the doc.ChannelID is echoed as-is.
 // A zero channelType (legacy call sites) is omitted on the wire via omitempty
 // so the single-channel response shape stays byte-identical.
-func (h *Handler) singleMessageHit(doc Doc, channelID string, channelType uint8, hl map[string][]string) MessageHit {
+func (h *Handler) singleMessageHit(
+	doc Doc,
+	channelID string,
+	channelType uint8,
+	hl map[string][]string,
+	projection ...cardProjectionContext,
+) MessageHit {
 	// Prefer the keyword highlight fragment; on the empty-keyword browse path
 	// no highlight is requested, so fall back to the raw payload text so the
 	// hit still carries readable content (A-doc §2.1).
@@ -302,7 +318,16 @@ func (h *Handler) singleMessageHit(doc Doc, channelID string, channelType uint8,
 	// [卡片]，round-3 P1-2）。message_kind 维持 "text"（swagger 枚举已锁），
 	// snippet 即投影文本。
 	if payloadType(doc.Payload) == payloadTypeCard {
-		mh.Snippet = cardmsg.DisplayTextFor(h.cardTrust.Trusted(doc.From), doc.PayloadRaw)
+		observation := cardtrust.MessageObservation{FromUID: doc.From, Payload: doc.PayloadRaw}
+		if len(projection) > 0 {
+			observation.ViewerUID = projection[0].ViewerUID
+			observation.SpaceID = projection[0].SpaceID
+		}
+		if target, ok := cardtrust.TargetFromChannel(channelID, channelType); ok {
+			observation.Target = target
+		}
+		trusted := h.cardTrust != nil && h.cardTrust.TrustedMessage(observation)
+		mh.Snippet = cardmsg.DisplayTextFor(trusted, doc.PayloadRaw)
 	}
 	return mh
 }

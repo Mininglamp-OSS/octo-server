@@ -1,5 +1,7 @@
 package messages_search
 
+import "github.com/Mininglamp-OSS/octo-server/modules/cardtrust"
+
 // card-message-protocol P1（spec: .octospec/tasks/card-message-protocol/
 // brief.md）：InteractiveCard(=17) 的搜索命中投影支撑。响应侧只投影 plain
 // （镜像 buildRichTextDetail 的响应侧投影定位），且必须过 Decision-2
@@ -15,5 +17,10 @@ const payloadTypeCard = 17
 // cardSenderTruster 是 singleMessageHit 卡片分支依赖的最小判定接口
 // （生产实现 = *cardtrust.Resolver；测试可注入 stub）。
 type cardSenderTruster interface {
-	Trusted(fromUID string) bool
+	TrustedMessage(cardtrust.MessageObservation) bool
+}
+
+type cardProjectionContext struct {
+	ViewerUID string
+	SpaceID   string
 }
