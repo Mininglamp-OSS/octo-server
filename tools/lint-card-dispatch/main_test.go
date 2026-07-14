@@ -135,6 +135,20 @@ func secondBypass() { payload := map[string]interface{}{"type": 17}; ctx.SendMes
 	assert.Equal(t, "secondBypass", findings[0].Function)
 }
 
+func TestDefaultAllowlistExemptsOnlyReviewedResourceShareTransport(t *testing.T) {
+	dir := t.TempDir()
+	writeFixtureIn(t, dir, "internal/resourceshare", "service.go", `package resourceshare
+type ShareService struct{}
+func (s *ShareService) shareTarget() { payload := map[string]interface{}{"type": 17}; ctx.SendMessageWithResult(payload) }
+func (s *ShareService) bypass() { payload := map[string]interface{}{"type": 17}; ctx.SendMessageWithResult(payload) }
+`)
+	findings, err := Scan([]string{dir}, defaultAllowlist)
+	require.NoError(t, err)
+	require.Len(t, findings, 1)
+	assert.Equal(t, "bypass", findings[0].Function)
+	assert.Equal(t, "ShareService", findings[0].Receiver)
+}
+
 // F2: an impostor directory that merely reuses an allowlisted package name +
 // receiver.method is NOT exempt, because the allowlist anchors on the path.
 func TestScanAllowlistDoesNotExemptImpostorPackageName(t *testing.T) {
