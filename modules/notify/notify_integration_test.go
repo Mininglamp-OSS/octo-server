@@ -359,7 +359,7 @@ func TestIntegration_InternalAuth_CorrectToken_ReachesHandler(t *testing.T) {
 
 	// Set botOK so deliverNotification proceeds.
 	const spaceID = "sp_auth_ok"
-	n.botOK = true
+	n.botOK.Store(true)
 	primeMemberCache(n, spaceID, "uid_a")
 
 	r := buildRouter(n)
@@ -588,7 +588,7 @@ func TestIntegration_SendNotifyBatch_MixedResults_207(t *testing.T) {
 
 	n := newTestNotify(ctx, db, newStubUserService(), &stubAppService{}, "tk")
 	const goodSpace = "sp_good"
-	n.botOK = true
+	n.botOK.Store(true)
 	primeMemberCache(n, goodSpace, "uid_a")
 
 	r := buildRouter(n)
@@ -623,7 +623,7 @@ func TestIntegration_SendNotifyBatch_AllSuccess_200(t *testing.T) {
 
 	n := newTestNotify(ctx, db, newStubUserService(), &stubAppService{}, "tk")
 	const spaceID = "sp_all_ok"
-	n.botOK = true
+	n.botOK.Store(true)
 	primeMemberCache(n, spaceID, "uid_a", "uid_b")
 
 	r := buildRouter(n)
@@ -655,7 +655,7 @@ func TestIntegration_Deliver_DeduplicatesTargets(t *testing.T) {
 
 	n := newTestNotify(ctx, db, newStubUserService(), &stubAppService{}, "tk")
 	const spaceID = "sp_dedup"
-	n.botOK = true
+	n.botOK.Store(true)
 	primeMemberCache(n, spaceID, "uid_a", "uid_b")
 
 	resp, err := n.deliverNotification(&NotifyReq{
@@ -679,7 +679,7 @@ func TestIntegration_Deliver_ExcludesActor(t *testing.T) {
 
 	n := newTestNotify(ctx, db, newStubUserService(), &stubAppService{}, "tk")
 	const spaceID = "sp_actor"
-	n.botOK = true
+	n.botOK.Store(true)
 	primeMemberCache(n, spaceID, "uid_a", "uid_b", "uid_actor")
 
 	resp, err := n.deliverNotification(&NotifyReq{
@@ -703,7 +703,7 @@ func TestIntegration_Deliver_NonMembersAreFiltered(t *testing.T) {
 
 	n := newTestNotify(ctx, db, newStubUserService(), &stubAppService{}, "tk")
 	const spaceID = "sp_filter"
-	n.botOK = true
+	n.botOK.Store(true)
 	primeMemberCache(n, spaceID, "uid_a") // only uid_a is a member
 
 	resp, err := n.deliverNotification(&NotifyReq{
@@ -730,7 +730,7 @@ func TestIntegration_Deliver_SendFailure_MarksFiltered(t *testing.T) {
 
 	n := newTestNotify(ctx, db, newStubUserService(), &stubAppService{}, "tk")
 	const spaceID = "sp_sendfail"
-	n.botOK = true
+	n.botOK.Store(true)
 	primeMemberCache(n, spaceID, "uid_a", "uid_b")
 
 	resp, err := n.deliverNotification(&NotifyReq{
@@ -759,7 +759,7 @@ func TestIntegration_Deliver_PartialSendFailure(t *testing.T) {
 
 	n := newTestNotify(ctx, db, newStubUserService(), &stubAppService{}, "tk")
 	const spaceID = "sp_partial"
-	n.botOK = true
+	n.botOK.Store(true)
 	primeMemberCache(n, spaceID, "uid_a", "uid_b", "uid_c")
 
 	resp, err := n.deliverNotification(&NotifyReq{
@@ -806,7 +806,7 @@ func TestIntegration_Deliver_AllNonMembers_NoBotCreation(t *testing.T) {
 	// No WuKongIM /message/send either.
 	assert.Equal(t, int32(0), atomic.LoadInt32(&wk.messageCount))
 
-	botReady := n.botOK
+	botReady := n.botOK.Load()
 	assert.False(t, botReady, "botOK must not be flipped for empty deliveries")
 }
 
@@ -832,7 +832,7 @@ func TestIntegration_EnsureBot_BotOK_SkipsCreation(t *testing.T) {
 
 	us := newStubUserService()
 	n := newTestNotify(ctx, db, us, &stubAppService{}, "tk")
-	n.botOK = true
+	n.botOK.Store(true)
 
 	// Should not panic or call userService
 	assert.Equal(t, int32(0), atomic.LoadInt32(&us.getByUsernameCalls))
@@ -853,7 +853,7 @@ func TestIntegration_Deliver_CacheMiss_RefreshesFromDB(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"uid"}).AddRow("uid_a").AddRow("uid_b"))
 
 	n := newTestNotify(ctx, db, newStubUserService(), &stubAppService{}, "tk")
-	n.botOK = true
+	n.botOK.Store(true)
 
 	resp, err := n.deliverNotification(&NotifyReq{
 		SpaceID: spaceID,

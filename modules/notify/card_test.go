@@ -27,23 +27,33 @@ func validCard() *SummaryCardFields {
 	}
 }
 
-func TestSummaryBotReadinessIsRaceSafe(t *testing.T) {
-	var n Notify
+func assertReadinessIsRaceSafe(t *testing.T, ready *atomic.Bool) {
+	t.Helper()
 	var wg sync.WaitGroup
 
 	for i := 0; i < 100; i++ {
 		wg.Add(2)
-		go func(ready bool) {
+		go func(readyValue bool) {
 			defer wg.Done()
-			n.summaryBotOK.Store(ready)
+			ready.Store(readyValue)
 		}(i%2 == 0)
 		go func() {
 			defer wg.Done()
-			_ = n.summaryBotOK.Load()
+			_ = ready.Load()
 		}()
 	}
 
 	wg.Wait()
+}
+
+func TestSummaryBotReadinessIsRaceSafe(t *testing.T) {
+	var n Notify
+	assertReadinessIsRaceSafe(t, &n.summaryBotOK)
+}
+
+func TestNotifyBotReadinessIsRaceSafe(t *testing.T) {
+	var n Notify
+	assertReadinessIsRaceSafe(t, &n.botOK)
 }
 
 func TestDeliverCardNotification_ValidationRejectsBadFields(t *testing.T) {
