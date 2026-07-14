@@ -146,7 +146,7 @@ func (p *Provider) validateIntent(intent Intent, now time.Time, allowExpired boo
 	if expired && !allowExpired {
 		return invalid("intent expired")
 	}
-	if time.Duration(intent.ExpiresAt-intent.IssuedAt)*time.Second > p.spec.Limits.MaxIntentLifetime {
+	if intent.ExpiresAt-intent.IssuedAt > int64(p.spec.Limits.MaxIntentLifetime/time.Second) {
 		return invalid("intent lifetime too long")
 	}
 	if intent.Resource.Type != p.spec.ResourceType ||
