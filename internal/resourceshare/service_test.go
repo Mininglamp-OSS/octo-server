@@ -12,6 +12,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	jose "github.com/go-jose/go-jose/v3"
+	"github.com/gocraft/dbr/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -92,11 +93,12 @@ type serviceHarness struct {
 	now        time.Time
 	clock      *time.Time
 	observer   *captureShareObserver
+	session    *dbr.Session
 }
 
 func newServiceHarness(t *testing.T, intent Intent, disclosures []TargetDisclosure) serviceHarness {
 	t.Helper()
-	store, _, now := newStoreHarness(t)
+	store, session, now := newStoreHarness(t)
 	clock := now
 	store.now = func() time.Time { return clock }
 	intentKey := newIntentTestKey(t)
@@ -131,7 +133,7 @@ func newServiceHarness(t *testing.T, intent Intent, disclosures []TargetDisclosu
 	})
 	require.NoError(t, err)
 	_ = intent
-	return serviceHarness{service, adapter, authorizer, limiter, transport, verifier, intentKey, now, &clock, observer}
+	return serviceHarness{service, adapter, authorizer, limiter, transport, verifier, intentKey, now, &clock, observer, session}
 }
 
 type dynamicServiceAdapter struct{}
@@ -282,6 +284,24 @@ func TestShareService_SendsAsLoginUserAndReturnsPerTargetResults(t *testing.T) {
 		SpaceID:   "space-a",
 		Target:    Target{Kind: TargetDM, PeerUID: "user-b"},
 	}))
+}
+
+func TestShareService_DropsUnsafeRequestIDFromAuditWithoutRejectingShare(t *testing.T) {
+	intent := validIntent(time.Unix(1_800_000_000, 0).UTC())
+	intent.Targets = []Target{{Kind: TargetGroup, GroupNo: "group-a"}}
+	h := newServiceHarness(t, intent, []TargetDisclosure{disclosureFor(intent.Targets[0], true)})
+	compact := signIntent(t, h.intentKey, jose.ES256, "intent-key-1", intent)
+
+	result, err := h.service.Share(context.Background(), "user-a", "space-a", compact, "gateway: trace/id+= 7")
+	require.NoError(t, err)
+	require.Len(t, result.Results, 1)
+	assert.Equal(t, ShareSent, result.Results[0].Outcome)
+	assert.Len(t, h.transport.requests, 1)
+
+	var requestIDs []string
+	_, err = h.session.Select("request_id").From("resource_share_audit").OrderAsc("id").Load(&requestIDs)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"", "", ""}, requestIDs)
 }
 
 func TestShareService_IdenticalRetryDoesNotResendSuccessfulTarget(t *testing.T) {

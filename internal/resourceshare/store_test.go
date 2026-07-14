@@ -334,9 +334,9 @@ func TestResourceShareMigrationContainsDurableBoundariesAndNoSecrets(t *testing.
 	require.NoError(t, err)
 	sql := string(raw)
 	for _, required := range []string{
-		"CREATE TABLE IF NOT EXISTS resource_share_intent",
-		"CREATE TABLE IF NOT EXISTS resource_share_delivery",
-		"CREATE TABLE IF NOT EXISTS resource_share_audit",
+		"CREATE TABLE IF NOT EXISTS octo_resource_share_intent",
+		"CREATE TABLE IF NOT EXISTS octo_resource_share_delivery",
+		"CREATE TABLE IF NOT EXISTS octo_resource_share_audit",
 		"UNIQUE KEY uk_resource_share_nonce",
 		"UNIQUE KEY uk_resource_share_delivery",
 		"nonce_hash",
@@ -344,6 +344,8 @@ func TestResourceShareMigrationContainsDurableBoundariesAndNoSecrets(t *testing.
 	} {
 		assert.Contains(t, sql, required)
 	}
+	assert.NotContains(t, sql, "CREATE TABLE IF NOT EXISTS resource_share_",
+		"new tables must use the repository's octo_ prefix")
 	for _, forbidden := range []string{"raw_intent", "card_json", "share_proof", "signature", "private_key"} {
 		assert.NotContains(t, strings.ToLower(sql), forbidden)
 	}
