@@ -43,7 +43,7 @@ type Notify struct {
 	db            *dbr.Session
 	memberCache   *memberCache
 	botMu         sync.Mutex
-	botOK         bool
+	botOK         atomic.Bool
 	summaryBotMu  sync.Mutex
 	summaryBotOK  atomic.Bool
 	cardSender    carddispatch.Sender
@@ -98,11 +98,11 @@ func New(ctx *config.Context) *Notify {
 			}
 		}()
 		n.botMu.Lock()
-		if !n.botOK {
-			n.botOK = n.ensureNotifyBot()
+		if !n.botOK.Load() {
+			n.botOK.Store(n.ensureNotifyBot())
 		}
 		n.botMu.Unlock()
-		if n.botOK {
+		if n.botOK.Load() {
 			n.Info("Notify bot ready")
 		}
 		n.ensureSummaryBotReady()
@@ -314,14 +314,14 @@ func (n *Notify) deliverNotification(req *NotifyReq) (*NotifyResp, error) {
 	}
 
 	// 确保 Bot 存在（失败可重试，不用 sync.Once）
-	if !n.botOK {
+	if !n.botOK.Load() {
 		n.botMu.Lock()
-		if !n.botOK {
-			n.botOK = n.ensureNotifyBot()
+		if !n.botOK.Load() {
+			n.botOK.Store(n.ensureNotifyBot())
 		}
 		n.botMu.Unlock()
 	}
-	if !n.botOK {
+	if !n.botOK.Load() {
 		return nil, errors.New("notify bot unavailable")
 	}
 
