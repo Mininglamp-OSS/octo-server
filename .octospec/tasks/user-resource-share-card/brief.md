@@ -277,15 +277,28 @@ safe failure.
 2. **Renderer companion (octo-web and any other display client):** verify the
    proof for real-time and cold-sync messages, bind it to observed sender/Space/
    target, consume shared conformance vectors, and mask failures to `[卡片]`.
-3. **Provider onboarding:** smart-summary, docs, tasks, and other resource owners
+3. **TODO — shared client share UX/SDK (Web and App):** ship one versioned
+   resource-share component contract, with platform UI adapters where native
+   controls differ, instead of letting each provider page or client rebuild the
+   flow. It owns provider/resource selection hooks, signed-intent acquisition,
+   one DM/group/thread target picker, `POST /v1/resource-shares`, stable
+   `sent`/`already_sent`/`denied`/`rate_limited`/`failed`/`unknown` result
+   mapping, loading/retry/partial-success UX, correlation and observability, and
+   the shared proof-vector/JWKS cache integration. Provider pages inject only
+   resource identity, presentation metadata, and the reviewed intent-acquisition
+   adapter. They must not forward an existing card payload or accept caller-
+   supplied card JSON, URL, sender, proof, or transport fields. The Web/App
+   companion design and ownership must be recorded in their client adaptation
+   tasks before enabling the first provider.
+4. **Provider onboarding:** smart-summary, docs, tasks, and other resource owners
    each get a separate reviewed adapter/brief for issuer keys, claim schema,
    revision revalidation, disclosure/grant policy, template, deep-link route,
    traffic budget, and operational ownership.
 
-No provider is enabled until the renderer companion and that provider's
-onboarding are deployed. Rollback first disables the provider, then the global
-share flag; historic proof verification remains enabled so already persisted
-messages do not regress to untrusted content.
+No provider is enabled until the renderer companion, shared client share
+UX/SDK, and that provider's onboarding are deployed. Rollback first disables
+the provider, then the global share flag; historic proof verification remains
+enabled so already persisted messages do not regress to untrusted content.
 
 ## Load-bearing list
 
@@ -339,6 +352,15 @@ messages do not regress to untrusted content.
 - Proof conformance vectors pass in octo-server and web. Missing, forged,
   wrong-provider/resource/actor/target/Space, or payload-tampered proofs are
   masked. Old/new verification keys overlap safely during rotation.
+- Web and App use the same versioned resource-share component contract/SDK;
+  platform adapters may supply native UI, but provider pages only inject
+  resource identity, presentation metadata, and signed-intent acquisition.
+  They do not independently implement target selection, endpoint calls, result
+  mapping, retry/partial-success behavior, proof-vector handling, or JWKS
+  caching. Real-time and cold-sync rendering apply the same proof policy.
+- Client contract tests prove no provider page or component can bypass the
+  server-minted-card boundary by forwarding a stored card payload or supplying
+  card JSON, URL, sender, proof, or transport fields.
 - Generic user type-17 and Bot-OBO tests remain rejected; the no-bypass guard
   permits only the reviewed generic share transport site and proves the
   Bot-bound dispatcher still rejects dynamic senders.
