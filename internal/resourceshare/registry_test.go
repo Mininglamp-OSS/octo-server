@@ -18,8 +18,8 @@ import (
 
 type testAdapter struct{}
 
-func (testAdapter) Revalidate(context.Context, VerifiedIntent) (*ResourceCardInput, error) {
-	return &ResourceCardInput{}, nil
+func (testAdapter) Revalidate(context.Context, VerifiedIntent) (*RevalidatedResource, error) {
+	return &RevalidatedResource{}, nil
 }
 
 func newIntentTestKey(t *testing.T) *ecdsa.PrivateKey {
@@ -64,6 +64,18 @@ func validProviderSpec(t *testing.T, key *ecdsa.PrivateKey) ProviderSpec {
 		},
 		BuildDeepLink: func(ref ResourceRef) (*url.URL, error) {
 			return url.Parse("https://app.example.test/summaries/" + ref.ID)
+		},
+		RenderCard: func(input ResourceCardInput, link *url.URL) (map[string]interface{}, error) {
+			return map[string]interface{}{
+				"type":    "AdaptiveCard",
+				"version": "1.5",
+				"body": []interface{}{
+					map[string]interface{}{"type": "TextBlock", "text": input.Title},
+				},
+				"actions": []interface{}{
+					map[string]interface{}{"type": "Action.OpenUrl", "title": "Open", "url": link.String()},
+				},
+			}, nil
 		},
 		Adapter: testAdapter{},
 	}
@@ -135,6 +147,7 @@ func TestRegistry_RejectsDuplicateAndInvalidEnabledProviders(t *testing.T) {
 		{"clock skew exceeds platform", func(s *ProviderSpec) { s.Limits.ClockSkew = PlatformMaxClockSkew + time.Second }},
 		{"missing claims validator", func(s *ProviderSpec) { s.ValidateClaims = nil }},
 		{"missing deep link builder", func(s *ProviderSpec) { s.BuildDeepLink = nil }},
+		{"missing card renderer", func(s *ProviderSpec) { s.RenderCard = nil }},
 		{"missing adapter", func(s *ProviderSpec) { s.Adapter = nil }},
 	}
 
