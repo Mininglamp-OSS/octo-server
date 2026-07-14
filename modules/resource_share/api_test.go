@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/internal/resourceshare"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
@@ -98,6 +99,14 @@ func TestAPI_ShareAcceptsOnlyIntentAndUsesAuthenticatedContext(t *testing.T) {
 	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &result))
 	require.Len(t, result.Results, 1)
 	assert.Equal(t, resourceshare.ShareSent, result.Results[0].Outcome)
+}
+
+func TestAPI_ShareRejectsNilServiceResult(t *testing.T) {
+	service := &fakeShareService{}
+	router, _ := resourceShareHarness(service, nil)
+	response := performResourceShare(router, `{"intent":"a.b.c"}`, "space-a")
+	assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+	assertEnvelope(t, response, "err.server.resource_share.unavailable", http.StatusServiceUnavailable)
 }
 
 func TestAPI_ShareRejectsMalformedOrExpandedRequestBeforeService(t *testing.T) {
@@ -208,6 +217,54 @@ func TestAPI_ProofJWKSWithoutConfiguredKeysReturnsEmptySet(t *testing.T) {
 	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/resource-shares/proof-jwks", nil))
 	require.Equal(t, http.StatusOK, recorder.Code)
 	assert.JSONEq(t, `{"keys":[]}`, recorder.Body.String())
+}
+
+func TestFeatureFlagDefaultsOffAndRejectsInvalidConfiguration(t *testing.T) {
+	t.Setenv("DM_RESOURCE_SHARE_ENABLED", "")
+	enabled, err := featureEnabledFromEnv()
+	require.NoError(t, err)
+	assert.False(t, enabled)
+
+	api := New(nil)
+	_, err = api.service.Share(context.Background(), "user-a", "space-a", "a.b.c", "request-1")
+	assert.ErrorIs(t, err, resourceshare.ErrShareDisabled)
+
+	t.Setenv("DM_RESOURCE_SHARE_ENABLED", "definitely-not-a-bool")
+	_, err = featureEnabledFromEnv()
+	assert.Error(t, err)
+	assert.Panics(t, func() { New(nil) })
+
+	t.Setenv("DM_RESOURCE_SHARE_ENABLED", "true")
+	enabled, err = featureEnabledFromEnv()
+	require.NoError(t, err)
+	assert.True(t, enabled)
+	assert.Panics(t, func() { New(nil) }, "enabling without provider and signing dependencies must fail startup")
+}
+
+func TestAPI_RouteMountsPublicJWKSAndProtectedShare(t *testing.T) {
+	cfg := config.New()
+	cfg.Test = true
+	ctx := config.NewContext(cfg)
+	api := newAPI(ctx, &fakeShareService{}, nil)
+	router := wkhttp.New()
+	router.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
+	api.Route(router)
+
+	jwks := httptest.NewRecorder()
+	router.ServeHTTP(jwks, httptest.NewRequest(http.MethodGet, "/v1/resource-shares/proof-jwks", nil))
+	assert.Equal(t, http.StatusOK, jwks.Code, jwks.Body.String())
+
+	share := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/resource-shares", strings.NewReader(`{"intent":"a.b.c"}`))
+	request.Header.Set("X-Space-ID", "space-a")
+	router.ServeHTTP(share, request)
+	assert.NotEqual(t, http.StatusNotFound, share.Code)
+}
+
+func TestValidSpaceHeaderRejectsControlsAndOversize(t *testing.T) {
+	assert.True(t, validSpaceHeader("space-a"))
+	assert.False(t, validSpaceHeader("space\nforged"))
+	assert.False(t, validSpaceHeader(strings.Repeat("s", 129)))
 }
 
 func TestResourceShareNoLegacyResponseError(t *testing.T) {

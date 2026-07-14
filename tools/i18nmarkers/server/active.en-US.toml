@@ -687,6 +687,30 @@ other = "The report session is invalid or has expired."
 ["err.server.report.store_failed"]
 other = "Failed to update report data."
 
+["err.server.resource_share.disabled"]
+other = "Resource sharing is not enabled."
+
+["err.server.resource_share.forbidden"]
+other = "The resource share request is not authorized."
+
+["err.server.resource_share.intent_invalid"]
+other = "The resource share intent is invalid."
+
+["err.server.resource_share.payload_too_large"]
+other = "The resource share request is too large."
+
+["err.server.resource_share.replay_conflict"]
+other = "The resource share request conflicts with an earlier request."
+
+["err.server.resource_share.request_invalid"]
+other = "Invalid resource share request."
+
+["err.server.resource_share.resource_unavailable"]
+other = "The resource can no longer be shared."
+
+["err.server.resource_share.unavailable"]
+other = "Resource sharing is temporarily unavailable."
+
 ["err.server.robot.auth_check_failed"]
 other = "Robot authentication check failed."
 

@@ -1273,3 +1273,29 @@ other = "只能清除自己发送的卡片的修订历史。"
 
 ["err.server.robot.card_edit_forbidden"]
 other = "卡片消息不支持编辑。"
+
+# ---- modules/resource_share：用户资源卡片分享 ----
+
+["err.server.resource_share.request_invalid"]
+other = "资源分享请求无效。"
+
+["err.server.resource_share.payload_too_large"]
+other = "资源分享请求体过大。"
+
+["err.server.resource_share.disabled"]
+other = "当前未启用资源分享功能。"
+
+["err.server.resource_share.forbidden"]
+other = "你无权执行此资源分享请求。"
+
+["err.server.resource_share.replay_conflict"]
+other = "资源分享请求与已有请求冲突。"
+
+["err.server.resource_share.resource_unavailable"]
+other = "该资源当前无法分享。"
+
+["err.server.resource_share.intent_invalid"]
+other = "资源分享凭据无效。"
+
+["err.server.resource_share.unavailable"]
+other = "资源分享服务暂时不可用，请稍后再试。"
