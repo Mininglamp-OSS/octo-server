@@ -49,6 +49,7 @@ func validProviderSpec(t *testing.T, key *ecdsa.PrivateKey) ProviderSpec {
 			MaxTargets:        20,
 			MaxIntentLifetime: 5 * time.Minute,
 			ClockSkew:         30 * time.Second,
+			TargetBudget:      RateBudget{RatePerSecond: 10, Burst: 20},
 		},
 		ValidateClaims: func(raw json.RawMessage) error {
 			var claims struct {
@@ -145,6 +146,7 @@ func TestRegistry_RejectsDuplicateAndInvalidEnabledProviders(t *testing.T) {
 		{"target limit exceeds platform", func(s *ProviderSpec) { s.Limits.MaxTargets = PlatformMaxTargets + 1 }},
 		{"lifetime exceeds platform", func(s *ProviderSpec) { s.Limits.MaxIntentLifetime = PlatformMaxIntentLifetime + time.Second }},
 		{"clock skew exceeds platform", func(s *ProviderSpec) { s.Limits.ClockSkew = PlatformMaxClockSkew + time.Second }},
+		{"missing target traffic budget", func(s *ProviderSpec) { s.Limits.TargetBudget = RateBudget{} }},
 		{"missing claims validator", func(s *ProviderSpec) { s.ValidateClaims = nil }},
 		{"missing deep link builder", func(s *ProviderSpec) { s.BuildDeepLink = nil }},
 		{"missing card renderer", func(s *ProviderSpec) { s.RenderCard = nil }},
