@@ -266,6 +266,18 @@ func loadProofMaterial(signingFile, verificationFile string) (*resourceshare.Pro
 	return signer, verifier, nil
 }
 
+// LoadProofVerifierFromEnv returns the same active+retained verification ring
+// used by the JWKS endpoint, without exposing private key material to callers.
+// Display surfaces use this to verify historic human resource-share cards even
+// while new sharing is disabled.
+func LoadProofVerifierFromEnv() (*resourceshare.ProofVerifier, error) {
+	_, verifier, err := loadProofMaterial(
+		strings.TrimSpace(os.Getenv("DM_RESOURCE_SHARE_PROOF_SIGNING_JWK_FILE")),
+		strings.TrimSpace(os.Getenv("DM_RESOURCE_SHARE_PROOF_VERIFICATION_JWKS_FILE")),
+	)
+	return verifier, err
+}
+
 func addVerificationKey(keys map[string]*ecdsa.PublicKey, keyID string, publicKey *ecdsa.PublicKey) error {
 	if publicKey == nil || publicKey.X == nil || publicKey.Y == nil {
 		return fmt.Errorf("%w: invalid proof public key", resourceshare.ErrProofConfig)

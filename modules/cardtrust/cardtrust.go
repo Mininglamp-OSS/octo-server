@@ -18,12 +18,18 @@
 package cardtrust
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-server/internal/resourceshare"
 	"github.com/Mininglamp-OSS/octo-server/modules/botidentity"
+	resource_share "github.com/Mininglamp-OSS/octo-server/modules/resource_share"
+	"github.com/Mininglamp-OSS/octo-server/modules/thread"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	lru "github.com/hashicorp/golang-lru/v2"
 	"go.uber.org/zap"
 )
@@ -62,10 +68,19 @@ type verdict struct {
 // per-recipient push fan-out and across search pages — a large group's offline
 // push then costs one identity query instead of one per recipient.
 type Resolver struct {
-	identity botIdentityResolver
-	cache    *lru.Cache[string, verdict]
-	ttl      time.Duration
-	log      *zap.Logger
+	identity      botIdentityResolver
+	cache         *lru.Cache[string, verdict]
+	ttl           time.Duration
+	log           *zap.Logger
+	proofVerifier *resourceshare.ProofVerifier
+}
+
+type MessageObservation struct {
+	FromUID   string
+	ViewerUID string
+	SpaceID   string
+	Target    resourceshare.Target
+	Payload   []byte
 }
 
 // New builds a Resolver backed by the authoritative bot identity resolver.
@@ -76,7 +91,14 @@ func New(ctx *config.Context) *Resolver {
 		// unreachable — fail loudly during init.
 		panic(fmt.Sprintf("cardtrust: cache init: %v", err))
 	}
-	return &Resolver{identity: botidentity.New(ctx), cache: c, ttl: cacheTTL, log: zap.L()}
+	proofVerifier, err := resource_share.LoadProofVerifierFromEnv()
+	if err != nil {
+		panic(fmt.Sprintf("cardtrust: proof verifier init: %v", err))
+	}
+	return &Resolver{
+		identity: botidentity.New(ctx), cache: c, ttl: cacheTTL, log: zap.L(),
+		proofVerifier: proofVerifier,
+	}
 }
 
 // lruNew wraps the typed LRU constructor so tests can build a Resolver with an
@@ -114,4 +136,54 @@ func (r *Resolver) Trusted(fromUID string) bool {
 	trusted := identity != nil
 	r.cache.Add(fromUID, verdict{trusted: trusted, at: time.Now()})
 	return trusted
+}
+
+// TrustedMessage preserves the established Bot/Webhook sender trust and adds
+// one narrow human exception: a platform share proof must verify against the
+// observed sender, Space and canonical channel target. Invalid JSON, missing
+// context, oversized payloads and verifier outages all fail closed.
+func (r *Resolver) TrustedMessage(observation MessageObservation) bool {
+	if r == nil || observation.FromUID == "" {
+		return false
+	}
+	if r.Trusted(observation.FromUID) {
+		return true
+	}
+	if r.proofVerifier == nil || len(observation.Payload) == 0 || len(observation.Payload) > cardmsg.MaxPayloadBytes {
+		return false
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(observation.Payload, &payload); err != nil || len(payload) == 0 {
+		return false
+	}
+	if err := r.proofVerifier.Verify(payload, resourceshare.ProofObservation{
+		ActorUID: observation.FromUID, ViewerUID: observation.ViewerUID,
+		SpaceID: observation.SpaceID, Target: observation.Target,
+	}); err != nil {
+		return false
+	}
+	return true
+}
+
+func TargetFromChannel(channelID string, channelType uint8) (resourceshare.Target, bool) {
+	switch channelType {
+	case common.ChannelTypePerson.Uint8():
+		if channelID == "" {
+			return resourceshare.Target{}, false
+		}
+		return resourceshare.Target{Kind: resourceshare.TargetDM, PeerUID: channelID}, true
+	case common.ChannelTypeGroup.Uint8():
+		if channelID == "" {
+			return resourceshare.Target{}, false
+		}
+		return resourceshare.Target{Kind: resourceshare.TargetGroup, GroupNo: channelID}, true
+	case common.ChannelTypeCommunityTopic.Uint8():
+		groupNo, shortID, err := thread.ParseChannelID(channelID)
+		if err != nil {
+			return resourceshare.Target{}, false
+		}
+		return resourceshare.Target{Kind: resourceshare.TargetThread, GroupNo: groupNo, ShortID: shortID}, true
+	default:
+		return resourceshare.Target{}, false
+	}
 }
