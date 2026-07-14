@@ -251,7 +251,7 @@ func (s *DurableStore) BeginDispatch(ctx context.Context, deliveryRowID int64, r
 
 func (s *DurableStore) MarkSent(ctx context.Context, deliveryRowID int64, result TransportResult, requestID string) error {
 	messageID, err := strconv.ParseInt(result.MessageID, 10, 64)
-	if err != nil || messageID <= 0 || result.MessageSeq == 0 ||
+	if err != nil || messageID <= 0 ||
 		!validAuditValue(result.ClientMsgNo, 0, 128) {
 		return storeError("invalid sent transport result", errors.New("invalid message result"))
 	}

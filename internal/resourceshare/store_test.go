@@ -236,6 +236,26 @@ func TestDurableStore_DeliveryStateMachineWritesAuditTransactionally(t *testing.
 	assert.ErrorIs(t, err, ErrDeliveryConflict)
 }
 
+func TestDurableStore_MarkSentAllowsOptionalMessageSequence(t *testing.T) {
+	store, _, now := newStoreHarness(t)
+	verified := verifiedForStore(now)
+	intentClaim, err := store.ClaimIntent(context.Background(), verified)
+	require.NoError(t, err)
+	claim, err := store.ClaimDelivery(context.Background(), intentClaim.IntentID, verified, Target{Kind: TargetDM, PeerUID: "user-b"}, "request-1")
+	require.NoError(t, err)
+	require.NoError(t, store.BeginDispatch(context.Background(), claim.Record.ID, "request-1"))
+
+	require.NoError(t, store.MarkSent(context.Background(), claim.Record.ID, TransportResult{
+		MessageID: "9007199254740993", ClientMsgNo: "server-generated",
+	}, "request-1"))
+
+	record, err := store.LoadDelivery(context.Background(), claim.Record.ID)
+	require.NoError(t, err)
+	assert.Equal(t, DeliverySent, record.State)
+	assert.Equal(t, "9007199254740993", record.MessageID)
+	assert.Zero(t, record.MessageSeq)
+}
+
 func TestDurableStore_AmbiguousTransportBecomesTerminalUnknown(t *testing.T) {
 	store, _, now := newStoreHarness(t)
 	verified := verifiedForStore(now)
