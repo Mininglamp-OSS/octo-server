@@ -60,6 +60,10 @@ type TransportResult struct {
 	ClientMsgNo string
 }
 
+// DurableStore treats returned row IDs as internal capabilities. Mutators that
+// accept one may only receive IDs obtained after ClaimIntent/ClaimDelivery has
+// bound the verified actor, Space, fingerprint, and canonical target. HTTP,
+// provider, and other external inputs must never supply these IDs directly.
 type DurableStore struct {
 	session *dbr.Session
 	now     func() time.Time
@@ -77,6 +81,9 @@ func (s *DurableStore) ClaimIntent(ctx context.Context, verified VerifiedIntent)
 		return nil, err
 	}
 	nonceHash := sha256.Sum256([]byte(verified.Intent.Nonce))
+	// nonceHash is the durable intent replay claim. idempotencyHash retains the
+	// signed idempotency value without storing it in plaintext; per-target
+	// delivery deduplication is enforced separately by DeliveryIdentity.
 	idempotencyHash := sha256.Sum256([]byte(verified.Intent.IdempotencyKey))
 	now := s.now().Unix()
 	result, insertErr := s.session.InsertInto("octo_resource_share_intent").

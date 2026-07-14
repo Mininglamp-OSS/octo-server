@@ -4,7 +4,7 @@ CREATE TABLE IF NOT EXISTS octo_resource_share_intent (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   nonce_hash BINARY(32) NOT NULL COMMENT 'SHA-256 of the provider nonce',
   fingerprint BINARY(32) NOT NULL COMMENT 'JCS intent fingerprint',
-  idempotency_hash BINARY(32) NOT NULL COMMENT 'SHA-256 of the opaque idempotency key',
+  idempotency_hash BINARY(32) NOT NULL COMMENT 'Hashed intent metadata; delivery dedup uses delivery_id',
   actor_uid VARCHAR(128) NOT NULL,
   space_id VARCHAR(128) NOT NULL,
   provider_id VARCHAR(64) NOT NULL,

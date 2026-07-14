@@ -200,7 +200,7 @@ func isNilInterface(value interface{}) bool {
 	}
 	rv := reflect.ValueOf(value)
 	switch rv.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
 		return rv.IsNil()
 	default:
 		return false

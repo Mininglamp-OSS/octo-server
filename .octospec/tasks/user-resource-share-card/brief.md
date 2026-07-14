@@ -241,6 +241,9 @@ rejection remains unchanged.
 - Idempotency is scoped to actor + provider + resource type/ID/revision +
   canonical target. Intent nonce consumption and per-target results are durable.
   Changed inputs with a consumed nonce fail closed.
+- `nonce_hash` is the unique intent replay claim. `idempotency_hash` retains the
+  signed opaque value without plaintext storage, but is not globally unique;
+  per-target deduplication is enforced by the scoped delivery identity.
 - Audit records actor, provider, resource reference, revision, Space, target,
   request/correlation ID, timestamp, and bounded outcome, but not resource
   content, card JSON, proof, intent, token, signature, or credentials.
