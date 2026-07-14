@@ -75,6 +75,14 @@ func New(ctx *config.Context) *Group {
 	g.ctx.AddEventListener(event.OrgOrDeptEmployeeUpdate, g.handleOrgOrDeptEmployeeUpdate)
 	g.ctx.AddEventListener(event.OrgEmployeeExit, g.handleOrgEmployeeExit)
 	source.SetGroupMemberProvider(g)
+
+	// #394: 启动群 IM 频道 reconcile 定时任务，兜底 CreateGroup 补偿删除失败 / 崩溃留下的孤儿群。
+	// 生产环境自启；测试环境(Test)不起 cron，由测试直接驱动 reconcileOnce。
+	if !g.ctx.GetConfig().Test {
+		if err := newChannelReconcileScheduler(g.ctx).Start(); err != nil {
+			g.Error("failed to start group channel reconcile scheduler", zap.Error(err))
+		}
+	}
 	return g
 }
 

@@ -1286,6 +1286,15 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 		}
 	}
 
+	// #394 事务发件箱：在提交前写入一条「IM 频道待确认」的 outbox 行，随 group/group_member
+	// 一起原子提交。IM 频道在 WuKongIM 而非本库、无法入 tx；有了这行，即便 commit 后 IM 创建失败
+	// 且补偿删除也失败（或崩在 commit 与 IM 之间），后台 reconcile 也能据此把孤儿群收口到最终一致。
+	// 频道确认成功后（见下）删除该行。
+	if err := s.db.insertChannelOutboxTx(groupNo, common.ChannelTypeGroup.Uint8(), tx); err != nil {
+		s.Error("insert channel outbox failed", zap.Error(err), zap.String("groupNo", groupNo))
+		return nil, errors.New("failed to record channel creation intent")
+	}
+
 	// 提交事务
 	if err := tx.Commit(); err != nil {
 		s.Error("commit transaction failed", zap.Error(err))
@@ -1344,7 +1353,16 @@ func (s *Service) CreateGroup(req *CreateGroupServiceReq) (*CreateGroupServiceRe
 		if _, delErr := s.ctx.DB().DeleteFrom("group").Where("group_no=?", groupNo).Exec(); delErr != nil {
 			s.Error("compensating delete group failed", zap.Error(delErr), zap.String("groupNo", groupNo))
 		}
+		// #394: 补偿删除是 best-effort（自身失败则 group 行残留）。这里**不**删 outbox 行——
+		// 保留它，让后台 reconcile 兜底：补偿全成功时 reconcile 发现 group 已不存在会清掉陈旧 outbox；
+		// 补偿失败留下孤儿群时 reconcile 会用当前成员幂等重建频道。二者都收口到最终一致。
 		return nil, errors.New("failed to create IM channel, group has been rolled back")
+	}
+
+	// #394: IM 频道确认创建成功，删除 outbox 行（结束该群的待确认状态）。删除失败不阻断建群——
+	// reconcile 下一轮会幂等重建频道(无副作用)再重试删行，不会产生孤儿。
+	if delErr := s.db.deleteChannelOutbox(groupNo); delErr != nil {
+		s.Error("delete channel outbox after IM channel created failed (reconcile will retry)", zap.Error(delErr), zap.String("groupNo", groupNo))
 	}
 
 	// 发送群创建通知
