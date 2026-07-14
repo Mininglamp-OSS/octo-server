@@ -260,7 +260,10 @@ func TestVerifyIntentForRetry_AuthenticatesExpiredIntentWithoutReauthorizingIt(t
 	assert.True(t, verified.Expired)
 	assert.Equal(t, intent.Nonce, verified.Intent.Nonce)
 
-	tampered := compact[:len(compact)-1] + "x"
+	parts := strings.Split(compact, ".")
+	require.Len(t, parts, 3)
+	parts[2] = "A" + parts[2][1:]
+	tampered := strings.Join(parts, ".")
 	_, err = registry.VerifyIntentForRetry(context.Background(), tampered, afterExpiry)
 	assert.ErrorIs(t, err, ErrIntentSignature)
 }

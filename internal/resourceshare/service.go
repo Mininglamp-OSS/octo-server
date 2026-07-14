@@ -60,6 +60,7 @@ type shareStore interface {
 	RecordPreTransportOutcome(context.Context, int64, DeliveryState, time.Time, string, string) error
 	ReclaimPreTransport(context.Context, int64, string) error
 	LoadDelivery(context.Context, int64) (*DeliveryRecord, error)
+	LookupDelivery(context.Context, VerifiedIntent, Target) (*DeliveryRecord, error)
 }
 
 type shareAuthorizer interface {
@@ -149,7 +150,7 @@ func (s *ShareService) Share(
 	if !validAuditValue(requestID, 0, 128) {
 		return nil, fmt.Errorf("%w: request id invalid", ErrIntentInvalid)
 	}
-	verified, err := s.registry.VerifyIntent(ctx, compactIntent, s.now())
+	verified, err := s.registry.VerifyIntentForRetry(ctx, compactIntent, s.now())
 	if err != nil {
 		return nil, err
 	}
@@ -159,6 +160,12 @@ func (s *ShareService) Share(
 	intentClaim, err := s.store.ClaimIntent(ctx, *verified)
 	if err != nil {
 		return nil, err
+	}
+	if verified.Expired {
+		if intentClaim.Disposition == ReplayFirstUse {
+			return nil, fmt.Errorf("%w: expired intent cannot start delivery", ErrIntentInvalid)
+		}
+		return s.readExpiredResults(ctx, *verified), nil
 	}
 	provider, err := s.registry.Provider(verified.ProviderID)
 	if err != nil {
@@ -184,6 +191,19 @@ func (s *ShareService) Share(
 		))
 	}
 	return result, nil
+}
+
+func (s *ShareService) readExpiredResults(ctx context.Context, verified VerifiedIntent) *ShareResult {
+	result := &ShareResult{Results: make([]TargetResult, 0, len(verified.Intent.Targets))}
+	for _, target := range verified.Intent.Targets {
+		record, err := s.store.LookupDelivery(ctx, verified, target)
+		if err != nil {
+			result.Results = append(result.Results, TargetResult{Target: target, Outcome: ShareFailed})
+			continue
+		}
+		result.Results = append(result.Results, targetResultFromRecord(target, *record, s.now()))
+	}
+	return result
 }
 
 func (s *ShareService) shareTarget(

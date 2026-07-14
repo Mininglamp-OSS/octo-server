@@ -357,6 +357,24 @@ func (s *DurableStore) LoadDelivery(ctx context.Context, deliveryRowID int64) (*
 	return &record, nil
 }
 
+func (s *DurableStore) LookupDelivery(ctx context.Context, verified VerifiedIntent, target Target) (*DeliveryRecord, error) {
+	if err := s.ready(ctx); err != nil {
+		return nil, err
+	}
+	if err := validateVerifiedForStore(verified); err != nil {
+		return nil, err
+	}
+	deliveryID, err := DeliveryIdentity(verified.Intent, target)
+	if err != nil {
+		return nil, err
+	}
+	record, err := s.loadDeliveryByIdentity(ctx, deliveryID)
+	if err != nil {
+		return nil, storeError("lookup delivery by identity", err)
+	}
+	return record, nil
+}
+
 func (s *DurableStore) loadDeliveryByIdentity(ctx context.Context, deliveryID string) (*DeliveryRecord, error) {
 	var record DeliveryRecord
 	err := s.session.Select(

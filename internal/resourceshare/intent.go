@@ -31,6 +31,18 @@ const (
 )
 
 func (r *Registry) VerifyIntent(ctx context.Context, compact string, now time.Time) (*VerifiedIntent, error) {
+	return r.verifyIntent(ctx, compact, now, false)
+}
+
+// VerifyIntentForRetry performs the same signature, schema and provider checks
+// as VerifyIntent but returns an authenticated Expired marker after the normal
+// clock-skew window. Callers may use it only to read durable terminal results;
+// it does not authorize new or resumed delivery work.
+func (r *Registry) VerifyIntentForRetry(ctx context.Context, compact string, now time.Time) (*VerifiedIntent, error) {
+	return r.verifyIntent(ctx, compact, now, true)
+}
+
+func (r *Registry) verifyIntent(ctx context.Context, compact string, now time.Time, allowExpired bool) (*VerifiedIntent, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("%w: context is required", ErrIntentInvalid)
 	}
@@ -84,12 +96,13 @@ func (r *Registry) VerifyIntent(ctx context.Context, compact string, now time.Ti
 	if err != nil {
 		return nil, fmt.Errorf("%w: decode: %v", ErrIntentInvalid, err)
 	}
-	if err := provider.validateIntent(intent, now); err != nil {
+	expired, err := provider.validateIntent(intent, now, allowExpired)
+	if err != nil {
 		return nil, err
 	}
 
 	fingerprint := sha256.Sum256(canonical)
-	return &VerifiedIntent{ProviderID: provider.spec.ID, Intent: intent, Fingerprint: fingerprint}, nil
+	return &VerifiedIntent{ProviderID: provider.spec.ID, Intent: intent, Fingerprint: fingerprint, Expired: expired}, nil
 }
 
 func decodeIntentStrict(raw []byte) (Intent, error) {
@@ -108,8 +121,8 @@ func decodeIntentStrict(raw []byte) (Intent, error) {
 	return intent, nil
 }
 
-func (p *Provider) validateIntent(intent Intent, now time.Time) error {
-	invalid := func(reason string) error { return fmt.Errorf("%w: %s", ErrIntentInvalid, reason) }
+func (p *Provider) validateIntent(intent Intent, now time.Time, allowExpired bool) (bool, error) {
+	invalid := func(reason string) (bool, error) { return false, fmt.Errorf("%w: %s", ErrIntentInvalid, reason) }
 	if intent.Provider != p.spec.ID || intent.Version != p.spec.IntentVersion {
 		return invalid("provider or version mismatch")
 	}
@@ -129,7 +142,8 @@ func (p *Provider) validateIntent(intent Intent, now time.Time) error {
 	if time.Unix(intent.IssuedAt, 0).After(now.Add(p.spec.Limits.ClockSkew)) {
 		return invalid("intent issued in future")
 	}
-	if time.Unix(intent.ExpiresAt, 0).Before(now.Add(-p.spec.Limits.ClockSkew)) {
+	expired := time.Unix(intent.ExpiresAt, 0).Before(now.Add(-p.spec.Limits.ClockSkew))
+	if expired && !allowExpired {
 		return invalid("intent expired")
 	}
 	if time.Duration(intent.ExpiresAt-intent.IssuedAt)*time.Second > p.spec.Limits.MaxIntentLifetime {
@@ -156,7 +170,7 @@ func (p *Provider) validateIntent(intent Intent, now time.Time) error {
 	if err := validateTargets(intent.ActorUID, intent.Targets, p.spec.Limits.MaxTargets); err != nil {
 		return invalid("targets invalid")
 	}
-	return nil
+	return expired, nil
 }
 
 func validateTargets(actorUID string, targets []Target, maxTargets int) error {

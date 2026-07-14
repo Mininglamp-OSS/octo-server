@@ -69,6 +69,7 @@ type VerifiedIntent struct {
 	ProviderID  ProviderID
 	Intent      Intent
 	Fingerprint IntentFingerprint
+	Expired     bool
 }
 
 type ResourceCardField struct {
