@@ -163,6 +163,7 @@ type wuKongServer struct {
 	server        *httptest.Server
 	messageCount  int32
 	messageFail   atomic.Bool // when true, /message/send returns 500
+	lastMessage   atomic.Value
 	userUpdates   int32
 	tokenUpdates  int32
 	cmdCount      int32
@@ -175,6 +176,7 @@ func newWuKongServer() *wuKongServer {
 	mux.HandleFunc("/message/send", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		atomic.AddInt32(&s.messageCount, 1)
+		s.lastMessage.Store(append([]byte(nil), body...))
 		if s.messageFail.Load() || (s.messageFilter != nil && s.messageFilter(body)) {
 			http.Error(w, `{"msg":"injected failure"}`, http.StatusInternalServerError)
 			return

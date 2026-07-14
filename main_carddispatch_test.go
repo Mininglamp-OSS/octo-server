@@ -40,8 +40,8 @@ func TestSummaryNotifyIsOnlyProductionCardProducer(t *testing.T) {
 	if !spec.Enabled {
 		t.Fatal("summary-notify producer must be enabled")
 	}
-	if spec.SenderUID != notify.SummaryBotUIDValue {
-		t.Fatalf("sender UID = %q; want %q", spec.SenderUID, notify.SummaryBotUIDValue)
+	if spec.SenderUID != notify.NotifyBotUIDValue {
+		t.Fatalf("sender UID = %q; want existing notification bot %q", spec.SenderUID, notify.NotifyBotUIDValue)
 	}
 	if len(spec.AllowedChannelTypes) != 1 || spec.AllowedChannelTypes[0] != common.ChannelTypePerson.Uint8() {
 		t.Fatalf("allowed channel types = %v; want DM only", spec.AllowedChannelTypes)

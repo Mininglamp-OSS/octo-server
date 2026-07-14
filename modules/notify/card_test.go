@@ -133,6 +133,20 @@ func TestBuildSummaryFallbackText(t *testing.T) {
 	assert.Contains(t, text, "失败原因：超时")
 }
 
+func TestSendSummaryTextUsesNotificationBot(t *testing.T) {
+	wk := newWuKongServer()
+	defer wk.close()
+	ctx := newTestContext(t, wk)
+	n := newTestNotify(ctx, nil, nil, nil, "tk")
+
+	require.NoError(t, n.sendSummaryText("uid_a", "spc_1", "summary ready"))
+	body, ok := wk.lastMessage.Load().([]byte)
+	require.True(t, ok, "WuKongIM request body must be captured")
+	var req map[string]interface{}
+	require.NoError(t, json.Unmarshal(body, &req))
+	assert.Equal(t, NotifyBotUIDValue, req["from_uid"])
+}
+
 // When no card sender is wired (or the card feature is off), a card request must
 // still deliver — as a plain-text DM from the summary bot — never be dropped.
 func TestDeliverCardNotification_DegradesToTextWhenSenderUnavailable(t *testing.T) {
