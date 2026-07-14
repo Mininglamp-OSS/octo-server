@@ -1,0 +1,102 @@
+{
+  "public_jwk": {
+    "use": "sig",
+    "kty": "EC",
+    "kid": "proof-vector-2026-01",
+    "crv": "P-256",
+    "alg": "ES256",
+    "x": "YcmRSw1lDL8mJBmHfVzrUP3DG22L4TtXkjFCwH-ipT8",
+    "y": "N7LeWxjkyzcosFRX10JPBatxQXcgqkgHMXb3dDRQsG8"
+  },
+  "unsigned_payload": {
+    "card": {
+      "actions": [
+        {
+          "title": "Open",
+          "type": "Action.OpenUrl",
+          "url": "https://app.example.test/summaries/summary-1"
+        }
+      ],
+      "body": [
+        {
+          "text": "Quarterly summary",
+          "type": "TextBlock"
+        }
+      ],
+      "type": "AdaptiveCard",
+      "version": "1.5"
+    },
+    "card_version": "1.5",
+    "plain": "attacker controlled",
+    "profile": "octo/v1",
+    "space_id": "wrong-space",
+    "type": 17
+  },
+  "context": {
+    "actor_uid": "user-a",
+    "space_id": "space-a",
+    "provider": "smart-summary",
+    "resource": {
+      "type": "smart-summary",
+      "id": "summary-1",
+      "revision": "rev-3"
+    },
+    "target": {
+      "kind": "group",
+      "group_no": "group-a"
+    },
+    "delivery_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "observation": {
+    "actor_uid": "user-a",
+    "space_id": "space-a",
+    "target": {
+      "kind": "group",
+      "group_no": "group-a"
+    }
+  },
+  "sealed_payload": {
+    "card": {
+      "actions": [
+        {
+          "title": "Open",
+          "type": "Action.OpenUrl",
+          "url": "https://app.example.test/summaries/summary-1"
+        }
+      ],
+      "body": [
+        {
+          "text": "Quarterly summary",
+          "type": "TextBlock"
+        }
+      ],
+      "type": "AdaptiveCard",
+      "version": "1.5"
+    },
+    "card_version": "1.5",
+    "plain": "Quarterly summary",
+    "profile": "octo/v1",
+    "resource_share_proof": {
+      "actor_uid": "user-a",
+      "alg": "ES256",
+      "delivery_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "kid": "proof-vector-2026-01",
+      "provider": "smart-summary",
+      "resource": {
+        "id": "summary-1",
+        "revision": "rev-3",
+        "type": "smart-summary"
+      },
+      "signature": "eyJhbGciOiJFUzI1NiIsImtpZCI6InByb29mLXZlY3Rvci0yMDI2LTAxIn0..UT7GUGHXZ12ATU1fo8JRhNwqtQMiRL2pTmI8dOGwdLo6-0KwIPfXylw-Ix5RG_jn6_3N7vj2yWU0fHlNDw0jWA",
+      "space_id": "space-a",
+      "target": {
+        "group_no": "group-a",
+        "kind": "group"
+      },
+      "v": 1
+    },
+    "space_id": "space-a",
+    "type": 17
+  },
+  "canonical_signing_input": "{\"envelope\":{\"card\":{\"actions\":[{\"title\":\"Open\",\"type\":\"Action.OpenUrl\",\"url\":\"https://app.example.test/summaries/summary-1\"}],\"body\":[{\"text\":\"Quarterly summary\",\"type\":\"TextBlock\"}],\"type\":\"AdaptiveCard\",\"version\":\"1.5\"},\"card_version\":\"1.5\",\"plain\":\"Quarterly summary\",\"profile\":\"octo/v1\",\"space_id\":\"space-a\",\"type\":17},\"metadata\":{\"actor_uid\":\"user-a\",\"delivery_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"provider\":\"smart-summary\",\"resource\":{\"id\":\"summary-1\",\"revision\":\"rev-3\",\"type\":\"smart-summary\"},\"space_id\":\"space-a\",\"target\":{\"group_no\":\"group-a\",\"kind\":\"group\"},\"v\":1}}"
+}

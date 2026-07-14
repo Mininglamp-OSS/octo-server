@@ -9,4 +9,7 @@ var (
 	ErrIntentInvalid    = errors.New("resource share intent invalid")
 	ErrIntentSignature  = errors.New("resource share intent signature invalid")
 	ErrIntentReplay     = errors.New("resource share intent replay conflict")
+	ErrProofConfig      = errors.New("resource share proof configuration invalid")
+	ErrProofMissing     = errors.New("resource share proof missing")
+	ErrProofInvalid     = errors.New("resource share proof invalid")
 )
