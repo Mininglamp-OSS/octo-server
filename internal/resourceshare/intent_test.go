@@ -148,6 +148,7 @@ func TestVerifyIntent_RejectsMalformedOrUnauthorizedClaims(t *testing.T) {
 		{"expired", func(i *Intent) { i.ExpiresAt = now.Add(-time.Minute).Unix() }},
 		{"issued in future", func(i *Intent) { i.IssuedAt = now.Add(time.Minute).Unix() }},
 		{"lifetime too long", func(i *Intent) { i.ExpiresAt = now.Add(6 * time.Minute).Unix() }},
+		{"far-future lifetime overflow", func(i *Intent) { i.ExpiresAt = i.IssuedAt + 10_000_000_000 }},
 		{"missing nonce", func(i *Intent) { i.Nonce = "" }},
 		{"missing idempotency key", func(i *Intent) { i.IdempotencyKey = "" }},
 		{"wrong resource type", func(i *Intent) { i.Resource.Type = "docs" }},
