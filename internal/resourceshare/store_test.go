@@ -144,6 +144,34 @@ func TestDurableStore_ClaimDeliveryIsStableAcrossIntentRetries(t *testing.T) {
 	assert.Equal(t, 1, auditCount, "idempotent lookup must not append a fake new delivery audit")
 }
 
+func TestDurableStore_ClaimDeliveryRejectsMismatchedIntentRow(t *testing.T) {
+	store, session, now := newStoreHarness(t)
+	firstVerified := verifiedForStore(now)
+	firstClaim, err := store.ClaimIntent(context.Background(), firstVerified)
+	require.NoError(t, err)
+
+	otherVerified := verifiedForStore(now)
+	otherVerified.Intent.Nonce = "other-nonce-0123456789"
+	otherVerified.Intent.IdempotencyKey = "other-idem-0123456789"
+	otherVerified.Intent.Resource.ID = "summary-other"
+	otherVerified.Fingerprint = IntentFingerprint{9}
+	_, err = store.ClaimIntent(context.Background(), otherVerified)
+	require.NoError(t, err)
+
+	_, err = store.ClaimDelivery(
+		context.Background(),
+		firstClaim.IntentID,
+		otherVerified,
+		Target{Kind: TargetGroup, GroupNo: "group-a"},
+		"request-mismatch",
+	)
+	assert.ErrorIs(t, err, ErrIntentReplay)
+
+	var deliveryCount int
+	require.NoError(t, session.SelectBySql("SELECT COUNT(*) FROM resource_share_delivery").LoadOne(&deliveryCount))
+	assert.Zero(t, deliveryCount)
+}
+
 func TestDurableStore_DeliveryStateMachineWritesAuditTransactionally(t *testing.T) {
 	store, session, now := newStoreHarness(t)
 	verified := verifiedForStore(now)

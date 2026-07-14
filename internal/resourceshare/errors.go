@@ -14,4 +14,6 @@ var (
 	ErrProofInvalid     = errors.New("resource share proof invalid")
 	ErrTargetDenied     = errors.New("resource share target denied")
 	ErrTargetQuery      = errors.New("resource share target query failed")
+	ErrStore            = errors.New("resource share durable store failed")
+	ErrDeliveryConflict = errors.New("resource share delivery state conflict")
 )
