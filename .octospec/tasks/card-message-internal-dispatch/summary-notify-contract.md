@@ -3,15 +3,17 @@
 > 仓内草稿,供 octo-server P2(`summary-notify` pilot）实现时对齐,PR 打开后整理成英文
 > issue/comment 同步给 `Mininglamp-OSS/octo-smart-summary`。
 > 关联:brief.md(本目录)、handoff.md、octo-server PR #577(P1 地基)。
-> 状态:待 smart-summary owner 确认字段清单。最后更新 2026-07-13。
+> 状态:待 smart-summary owner 确认字段清单。最后更新 2026-07-14。
 
 ## 背景一句话
 
 今天 smart-summary worker 在任务终态后 `POST /v1/internal/notify` 发**纯文本 DM**
 (`payload:{type:1,content:<整段文案>}`),per-recipient 一请求一收件人,dedup/retry 靠
 自己的 `summary_notification` 表 + `Sweep`。P2 把这条 DM **从纯文本升级为 `octo/v1`
-展示卡片**,发送方换成专用 `summary` bot,经 octo-server `internal/carddispatch` 边界
-派发。**不新增 HTTP 路由**(brief Goal / Out-of-scope),而是**扩展现有
+展示卡片**,发送方复用现有 `notification` User Bot,经 octo-server
+`internal/carddispatch` 边界派发。卡片及其纯文本降级都进入同一个系统通知 DM 会话。
+该决定于 2026-07-14 覆盖 2026-07-13 的专用 `summary` Bot 方案。
+**不新增 HTTP 路由**(brief Goal / Out-of-scope),而是**扩展现有
 `/v1/internal/notify` 的 `NotifyReq`**。
 
 ## 契约要点(锁定项)
@@ -93,7 +95,9 @@ X-Internal-Token: <SUMMARY_NOTIFY_TOKEN>
 
 ## octo-server 侧(本 PR 落地,cross-repo 之外)
 
-- 新增专用 `summary` bot(user+app+robot.status=1),`notification` bot 只留纯文本路径。
+- `summary-notify` producer 绑定已有 `notification` Bot
+  (`user`+`app`+`robot.status=1),卡片和纯文本降级复用其 provisioning/readiness;
+  不新增专用 `summary` Bot,也不自动删除环境里可能已存在的旧 `summary` 身份。
 - 注册 `summary-notify` producer(DM/`octo/v1`/system-notification/MaxInFlight 20),
   经 `SenderFromContext` 注入 notify。
 - `card` 分支:`memberCache.verify` → `cardtmpl` 建卡 → 每个成员 `sender.Send` → 汇总

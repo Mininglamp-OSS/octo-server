@@ -235,9 +235,11 @@ with different readiness):
 - **Pilot — `summary-notify` (Scenario A1, worker-driven notification):**
   `modules/notify` becomes the first producer. The existing summary
   completion/failure DM upgrades from plain text to a display-only (`octo/v1`)
-  card; the sender is a **dedicated `summary` bot** (decided 2026-07-13;
-  provisioning mirrors the `ensureNotifyBot` user+app+robot pattern), while
-  the generic text-notification path keeps the `notification` bot unchanged.
+  card. **Decision amended 2026-07-14:** the producer reuses the existing
+  `notification` User Bot, and its text fallback uses the same identity, so the
+  user sees one system-notification DM conversation. This supersedes the
+  dedicated `summary` Bot choice recorded on 2026-07-13; capability isolation
+  remains on the producer even though the sender identity is shared.
   The ingress, token, membership verification, and smart-summary's retry/dedup
   state machine all stay as they are. When smart-summary later implements
   origin group/thread回发, the same producer widens its allowed channel types
@@ -279,8 +281,8 @@ with different readiness):
   张三↔李四 conversation at all — a bot DM lands in the bot's own conversation
   with the recipient, out of context. Slack and Feishu likewise bar apps from
   posting into human↔human DMs (Slack share-to-DM is the user's own message).
-  Bot-DM cards exist only as A1 notifications inside the summary bot's own
-  conversation.
+  Bot-DM cards exist only as A1 notifications inside the shared notification
+  Bot's own conversation.
 - **Candidate — `docs-share-card` (Scenario B):** blocked on ingress design:
   docs-backend has no octo-server message client and no bot identity, and the
   share message is currently client-sent. Onboarding requires (a) a docs S2S
@@ -393,9 +395,9 @@ not implement a mutable generic "send as any UID" service.
 | --- | --- |
 | Producer ID (stable, low-cardinality) | `summary-notify` |
 | Owning module / constructor | `modules/notify`; it obtains its producer-bound `Sender` from the single registry composed at server bootstrap (exact wiring resolved in implementation per Decision 11 — must fit the `register.AddModule` module system without mutable package-global registration) |
-| Sender bot UID configuration source | **Decided 2026-07-13: a dedicated `summary` bot** (static UID, provisioned as a full User Bot via the same user+app+robot pattern as `ensureNotifyBot`, `robot.status=1` — botidentity-active). The `notification` bot keeps the generic text-notification path only; separating identities keeps DM-notification duty and future group membership/branding decoupled |
+| Sender bot UID configuration source | **Amended 2026-07-14: reuse the static `notification` User Bot** provisioned by `ensureNotifyBot` (`user` + `app` + `robot.status=1`). Summary cards, generic text notifications, and summary-card text fallback share one DM identity. This supersedes the dedicated `summary` Bot decision from 2026-07-13; the producer-bound capability still prevents generic notify callers from originating cards |
 | Allowed channel types | DM (person) only at pilot; group/thread widening is a separate reviewed change tied to smart-summary origin回发, and that review must include a per-channel rate rule and the cluster-cap decision. Group/thread sends use the member-exempt posting mode (Decision 4): the bot joins no group, member list and 群人数 unchanged |
-| Allowed card profiles / action-event owner | `octo/v1` (display-only) only; `octo/v2` forbidden — the `summary` bot has no bot-event consumer polling `/v1/bot/events`, so no one could own `card_action` (see Method › Interactive cards for the upgrade path) |
+| Allowed card profiles / action-event owner | `octo/v1` (display-only) only; `octo/v2` forbidden — the notification Bot has no compatible summary action-event consumer polling `/v1/bot/events`, so no one could own `card_action` (see Method › Interactive cards for the upgrade path) |
 | Required Space source | `NotifyReq.space_id` supplied by the internal caller and member-verified by notify's `memberCache`; the dispatcher independently re-verifies live Space/membership (Decision 3). DM policy = system-notification mode (space-member DM, Decision 4) |
 | Expected peak concurrency / QPS | max-in-flight **20** per process (mirrors notify's existing bounded send pool) — **confirmed 2026-07-13** |
 | Business retry/idempotency requirement | smart-summary already retries per recipient with `summary_notification` dedup state ⇒ at-least-once from the caller side; a transport-ambiguous failure may duplicate a card; dispatcher stays single-attempt (Decision 8). **Confirmed 2026-07-13: duplicates are acceptable for notification cards; no outbox** |
@@ -616,7 +618,8 @@ caller must map them through that endpoint's registered `errcode` facade.
   `/v1/internal/notify*` keeps its text-notification contract for existing
   callers (smart-summary sends `type=1`); its auth stays `X-Internal-Token`
   fail-closed; it additionally stops relaying card-shaped payloads
-  (Decision 14). The `notification` bot provisioning is untouched.
+  (Decision 14). The `summary-notify` card producer and fallback reuse the
+  existing `notification` Bot provisioning/readiness path.
 - **Existing ingress behavior (`bot-api`, `wire-contract`)** — Bot API, Robot
   API, and Incoming Webhook validation order, error envelopes, OBO behavior,
   rate limits, and metrics do not change merely because the internal package is
@@ -692,9 +695,10 @@ caller must map them through that endpoint's registered `errcode` facade.
 
 ### Planning gate
 
-- All `summary-notify` pilot decisions are maintainer-confirmed (2026-07-13):
-  concurrency, duplicate tolerance, replicas, sender bot (dedicated `summary`
-  bot), message ownership (bot-sent + forwarder attribution, no OBO),
+- All `summary-notify` pilot decisions are maintainer-confirmed (2026-07-13,
+  with the sender amended 2026-07-14): concurrency, duplicate tolerance,
+  replicas, sender bot (shared `notification` User Bot), message ownership
+  (bot-sent + forwarder attribution, no OBO),
   member-exempt group posting, and the card template + deep-link design.
   Registering/enabling the pilot additionally requires the design's guard
   tests to exist and pass (see Acceptance › Card template and deep-link).

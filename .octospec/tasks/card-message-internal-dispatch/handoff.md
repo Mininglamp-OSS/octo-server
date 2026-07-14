@@ -2,24 +2,26 @@
 
 > Forward-looking guide for the next stage. The spec is `brief.md` in this
 > directory; this file says **where we are** and **what to do next**.
-> Last updated 2026-07-13.
+> Last updated 2026-07-14.
 
 ## TL;DR
 
-This task ships as **two PRs**:
+This task shipped as **two PRs**, followed by a sender-identity UX correction:
 
 - **PR 1 — P1 (done):** the dormant `internal/carddispatch` foundation. Reviewed,
   `go build/vet/test` green, **zero production producers registered**, so the only
   runtime behaviour change is the notify card-payload gate (Decision 14). This is
   the current `feat/card-message-internal-dispatch` branch.
-- **PR 2 — P2 (next stage):** enable the `summary-notify` pilot — a code/config
-  change across three repos that registers the first producer and turns summary
-  DMs into cards. Gated only by landing the template/deep-link guard tests.
+- **PR 2 — P2 (merged as #579):** enabled the `summary-notify` pilot and
+  registered the first production card producer.
+- **Follow-up (2026-07-14):** reuse the existing `notification` User Bot for
+  summary cards and fallback text. This supersedes the dedicated `summary` Bot
+  sender choice so users see one system-notification DM conversation.
 
-Every pilot decision is maintainer-confirmed (2026-07-13). Keeping P1 and P2 as
-separate PRs is deliberate (brief › rollout): the foundation is behaviourally
-inert, so it can merge and sit; enabling the pilot is the reviewed change with a
-one-line rollback (remove the producer spec).
+Every pilot decision is maintainer-confirmed (2026-07-13), with the sender
+identity amended on 2026-07-14. Capability isolation still lives on the
+`summary-notify` producer; sharing the Bot UID does not expose card origination
+to the generic text-notification path.
 
 ### PR hygiene note
 
@@ -36,7 +38,7 @@ re-diff of #570.
 | --- | --- |
 | Brief (`brief.md`) | Complete; all decisions confirmed 2026-07-13 |
 | Foundation (`internal/carddispatch/`, `pkg/cardtmpl/`, `tools/lint-card-dispatch/`) | Implemented, `go build/vet/test` green |
-| Registry wiring (`main.go:346` `installCardDispatch`) | `NewRegistry(deps, nil)` — **zero producers**, behaviourally inert |
+| Registry wiring (`main.go` `installCardDispatch`) | `summary-notify` enabled, DM-only, `octo/v1`, system-notification policy, max-in-flight 20/process |
 | Decision 14 notify gate (`modules/notify/api.go`) | **Live** — rejects card-shaped payloads on `/v1/internal/notify[/batch]` |
 | Code review | Done; F1/F2/F3/F5 fixed (commit `d815947`), F4/F6 deferred (see below) |
 | Branches | `feat/card-message-internal-dispatch` = impl + review fixes. `claude/card-message-dispatch-f7ubz3` = brief only (now redundant; brief is byte-identical on feat) |
@@ -53,12 +55,13 @@ notify gate.
 
 Cross-repo; land together. Owning module is `modules/notify`.
 
-### 2a. octo-server — provision the summary bot
+### 2a. octo-server — reuse the notification bot
 
-- Add a dedicated `summary` bot (static UID) provisioned as a full User Bot
-  (`user` + `app` + `robot.status=1`), mirroring `modules/notify/bot_manager.go`
-  `ensureNotifyBot`. Keep the `notification` bot for the generic text path.
-- Confirm `modules/botidentity` resolves the new UID as `KindUserBot`.
+- Bind the producer to the existing static `notification` User Bot provisioned
+  by `ensureNotifyBot` (`user` + `app` + `robot.status=1`).
+- Card and text-fallback paths share `ensureNotifyBotReady`; do not provision or
+  maintain readiness state for a second `summary` identity.
+- Do not automatically delete an already-provisioned `summary` DB identity.
 
 ### 2b. octo-server — register the pilot producer + inject the Sender
 
@@ -69,7 +72,7 @@ sender into `notify.New`:
 spec := carddispatch.ProducerSpec{
     ID:                  "summary-notify",
     Enabled:             true,
-    SenderUID:           notify.SummaryBotUID,            // the new summary bot
+    SenderUID:           notify.NotifyBotUIDValue,        // shared system-notification bot
     AllowedChannelTypes: []uint8{common.ChannelTypePerson.Uint8()}, // DM only at pilot
     AllowedProfiles:     []string{cardmsg.ProfileV1},     // display-only
     SpacePolicy:         carddispatch.SpacePolicySystemNotification, // notify semantics
@@ -140,20 +143,22 @@ Each of these is its own follow-up PR after the pilot is live.
   add a **per-channel rate rule** and settle the **cluster-wide cap** (see
   brief › Industry practice alignment). Member-exempt already honors explicit
   group bans (F3). Delivery = post if group eligible, else creator-DM fallback.
+  Full contract: `../smart-summary-origin-channel-card/brief.md`.
 - **A2 user forward (`summary-forward-card`):** a new user-facing forward
   endpoint on **summary-api** relaying through the existing `X-Internal-Token`
   ingress with `actor_uid`; octo-server verifies the actor is an active member
   of the target channel. Bot-sent card with a forwarder-attribution header;
   **no OBO** (card-protocol Decision 2b). Person targets keep today's
-  plain-text forward — a bot cannot post into a two-party human DM.
+  plain-text forward — a bot cannot post into a two-party human DM. Full
+  contract: `../smart-summary-user-share-card/brief.md`.
 - **`docs-share-card`:** blocked on a docs S2S ingress + docs bot identity;
   copy the A2 forward shape once those exist.
 
-## Locked decisions (2026-07-13)
+## Locked decisions (2026-07-13; sender amended 2026-07-14)
 
 | Decision | Value |
 | --- | --- |
-| Sender identity | dedicated `summary` bot (not `notification`) |
+| Sender identity | shared `notification` User Bot; dedicated `summary` choice superseded |
 | Message ownership | bot-sent + forwarder-attribution header; OBO rejected |
 | Pilot channels / profile | DM only / `octo/v1` display-only |
 | Group posting (post-P2) | member-exempt: no membership required, member list/count untouched, **explicit ban honored** |
