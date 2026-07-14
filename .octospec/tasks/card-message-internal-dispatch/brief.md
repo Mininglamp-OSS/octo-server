@@ -162,8 +162,10 @@ platforms (Slack Block Kit, Feishu/Lark interactive cards, DingTalk robots,
 Microsoft Teams Adaptive Cards — the same card family octo uses). The core
 decisions match established practice:
 
-- Rich interactive messages are bot/app-only origination; human clients cannot
-  forge them — matches Decision 2.
+- Arbitrary rich interactive messages are bot/app-only; human clients cannot
+  forge them — matches Decision 2. The separately planned user-share card is a
+  fixed, display-only resource-share exception minted by the authenticated
+  server with verifiable provenance, not a generic human card ingress.
 - Channel authorization is checked live at send time (Slack `not_in_channel`;
   Feishu/DingTalk bots must be members of a group before posting into it) —
   matches Decision 4. For posting **without** membership, DMWork adopts the
@@ -229,6 +231,11 @@ external sidecar service            octo-server process
 - The web client stays receive-only for type-17; no client card-send path is
   introduced for these scenarios.
 
+This onboarding method governs **internal Bot producers**. The separately
+specified user-initiated summary share is not an internal service asking to
+send as a Bot: it is a user-authenticated server-minted message with the user as
+sender, and therefore has its own trust boundary and brief.
+
 Applied to the motivating scenarios (Scenario A splits into two sub-paths
 with different readiness):
 
@@ -253,36 +260,21 @@ with different readiness):
   when the group is no longer eligible. The dispatcher's group/thread
   authorization rules (Decision 4) are specified now so that widening is a
   config review, not a design change.
-- **Candidate — `summary-forward-card` (Scenario A2, user-triggered
-  转发到聊天):** today the web client sends the summary as plain-text chunks
-  itself; the web cannot and will not send type-17, so a card version means
-  "human triggers, bot sends". The lean shape reuses existing machinery end to
-  end: the forward UI calls a new user-facing endpoint on **summary-api** (the
-  content owner — it already authenticates web users and owns summary
-  visibility), and smart-summary relays through its **existing**
-  `X-Internal-Token` ingress client with the chosen target channel plus
-  `actor_uid` (a field `NotifyReq` already carries); the octo-server producer
-  additionally verifies the actor is an active member of the target channel
-  before dispatch. No reverse octo-server→smart-summary channel and no content
-  round-trip is needed — content authority stays with its owner, which also
-  removes the card-forgery concern. The new endpoint is smart-summary scope;
-  the candidate slot here is reserved.
-  **Message ownership (decided 2026-07-13): bot-sent with a prominent
-  forwarder-attribution card header** (forwarder avatar + name + "分享了智能
-  总结"), matching Slack/Feishu share flows. User-identity (OBO) card
-  forwarding is rejected — the card protocol already forbids OBO cards
-  platform-wide (Decision 2b, see Decision 4) and relaying OBO through a
-  static-token internal ingress would constitute the forbidden "send as any
-  UID" capability. **Targets are split by type (decided 2026-07-13):
-  group/thread targets get the bot card via the member-exempt posting mode
-  (Decision 4) — the bot never joins, member list and count are untouched;
-  person targets keep today's user-identity plain-text forward and get no
-  card.** A person channel is strictly two-party: a bot cannot post into the
-  张三↔李四 conversation at all — a bot DM lands in the bot's own conversation
-  with the recipient, out of context. Slack and Feishu likewise bar apps from
-  posting into human↔human DMs (Slack share-to-DM is the user's own message).
-  Bot-DM cards exist only as A1 notifications inside the shared notification
-  Bot's own conversation.
+- **Separate task — user-initiated summary share (Scenario A2):** today web
+  sends summary text as the authenticated user. The card version keeps that
+  ownership model and supports **DM, group, and thread targets**: the sharing
+  user is the stored message sender in the selected conversation, while the
+  server owns the fixed card template. It must not use the `notification` Bot,
+  because a Bot-to-person send would create a different DM conversation.
+  This cannot be registered as a normal `carddispatch` producer: this
+  dispatcher deliberately binds a static active Bot UID, generic user ingress
+  rejects type-17, and display trust masks unsigned human cards. The separate
+  `smart-summary-user-share-card` brief therefore requires a user-authenticated
+  server-minted share endpoint, summary-api visibility-bound share intent,
+  exact DM/group/thread authorization, and verifiable server provenance for
+  the narrow display-only human card. It is **not Bot API OBO**: no S2S caller
+  supplies `actor_uid`, no request contains `from_uid`, and arbitrary card
+  payloads remain forbidden.
 - **Candidate — `docs-share-card` (Scenario B):** blocked on ingress design:
   docs-backend has no octo-server message client and no bot identity, and the
   share message is currently client-sent. Onboarding requires (a) a docs S2S
@@ -348,11 +340,12 @@ ResourceCard{ icon, title, attribution?, excerpt, facts[],
 ```
 
 Rendered with octo/v1 whitelist elements only (`ColumnSet` icon+title header,
-subtle attribution `TextBlock` — the decided forwarder-attribution header for
-A2, excerpt `TextBlock`, `FactSet` metadata, `ActionSet` with `Action.OpenUrl`
-"查看详情" plus optional `Action.CopyToClipboard`). One template instantiates
-all near scenarios: A1 completion/failure notification, A2 forward card, the
-future docs share card. Constraints by construction: URLs are absolute https
+optional attribution `TextBlock`, excerpt `TextBlock`, `FactSet` metadata,
+`ActionSet` with `Action.OpenUrl` "查看详情" plus optional
+`Action.CopyToClipboard`). One template family instantiates A1 completion/
+failure notifications, user-authored A2 share cards (which use the normal chat
+sender UI instead of a forwarder-attribution header), and the future docs share
+card. Constraints by construction: URLs are absolute https
 (Decision 3d positive allowlist); the excerpt is server-truncated (~300 chars)
 so payloads stay far under `MaxPayloadBytes` and today's chunked-forward hack
 disappears; `plain` needs no template work (`Finalize` recomputes it); labels
@@ -403,9 +396,9 @@ not implement a mutable generic "send as any UID" service.
 | Business retry/idempotency requirement | smart-summary already retries per recipient with `summary_notification` dedup state ⇒ at-least-once from the caller side; a transport-ambiguous failure may duplicate a card; dispatcher stays single-attempt (Decision 8). **Confirmed 2026-07-13: duplicates are acceptable for notification cards; no outbox** |
 | Process replicas / required cluster-wide cap | **Confirmed 2026-07-13: per-process bound accepted, no cluster-wide cap required.** Record the actual replica count in the deployment/config review that enables the pilot |
 
-| Required input | Candidates: `summary-forward-card`, `docs-share-card` |
+| Required input | Candidate: `docs-share-card` |
 | --- | --- |
-| All rows | `TBD` — both blocked on ingress design (a summary-api forward endpoint + actor-verified ingress extension; a docs S2S ingress + docs bot identity — see Method section); neither may be registered until its own table is filled and confirmed |
+| All rows | `TBD` — blocked on a docs S2S ingress + docs bot identity; it may not be registered until its own table is filled and confirmed. User-initiated summary sharing is no longer a Bot-producer candidate and has its own user-authenticated server-minted-card brief |
 
 ## Decisions locked by this task
 
@@ -465,11 +458,11 @@ not implement a mutable generic "send as any UID" service.
    a producer without this mode that is not an active internal member fails
    closed. DB errors fail closed. OBO
    is not supported by internal dispatch — consistent with the card protocol's
-   platform-wide prohibition of OBO cards (card-message-protocol Decision 2b:
+   Bot-producer prohibition of OBO cards (card-message-protocol Decision 2b:
    Bot API rejects card + `on_behalf_of` with
    `err.server.bot_api.card_obo_forbidden`, `modules/bot_api/send.go:92-105`;
-   revisiting that is a card-protocol contract change, not an internal-dispatch
-   option).
+   the separately reviewed user-authenticated server-minted share authority is
+   not Bot OBO and is not an internal-dispatch option).
 5. **Dispatcher owns the envelope.** The public request accepts a card document
    plus a supported profile, not an arbitrary message payload. The dispatcher
    sets `type`, `card_version`, and profile; caller-supplied `plain`, `space_id`,
@@ -654,10 +647,10 @@ caller must map them through that endpoint's registered `errcode` facade.
   members out of the member list and `QueryMemberCount` (Feishu/DingTalk
   style, also fixing existing AI bots inflating 群人数). It is the long-term
   alternative to member-exempt posting and a separate product task.
-- The `summary-forward-card` candidate end-to-end: the summary-api forward
-  endpoint (human triggers, bot sends) and the internal-ingress extension for
-  actor-verified channel targets. Only its candidate slot in the table is
-  reserved.
+- User-initiated summary-card sharing: this is a separate user-authenticated,
+  server-minted message path supporting DM/group/thread with the sharing user
+  as sender. It does not weaken this dispatcher's static-Bot sender contract;
+  see `../smart-summary-user-share-card/brief.md`.
 - The `docs-share-card` producer end-to-end: a docs S2S ingress or share
   endpoint, docs bot identity provisioning, docs-backend outbound IM client,
   and any card-composition UI. Only its candidate slot in the table is
@@ -697,16 +690,16 @@ caller must map them through that endpoint's registered `errcode` facade.
 
 - All `summary-notify` pilot decisions are maintainer-confirmed (2026-07-13,
   with the sender amended 2026-07-14): concurrency, duplicate tolerance,
-  replicas, sender bot (shared `notification` User Bot), message ownership
-  (bot-sent + forwarder attribution, no OBO),
+  replicas, sender bot (shared `notification` User Bot),
   member-exempt group posting, and the card template + deep-link design.
   Registering/enabling the pilot additionally requires the design's guard
   tests to exist and pass (see Acceptance › Card template and deep-link).
   Until then the implementation is explicitly limited to a disabled
   foundation plus the Decision 14 gate, with no claim of end-to-end
   production usefulness.
-- `summary-forward-card` and `docs-share-card` remain unregistered until their
-  own tables are filled and reviewed.
+- `docs-share-card` remains unregistered until its table is filled and reviewed.
+  User-initiated summary sharing is governed by its separate brief and is not a
+  dynamic-sender registration in this Bot-only dispatcher.
 
 ### Capability and configuration
 

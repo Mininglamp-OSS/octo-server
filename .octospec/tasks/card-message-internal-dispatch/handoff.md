@@ -144,22 +144,22 @@ Each of these is its own follow-up PR after the pilot is live.
   brief › Industry practice alignment). Member-exempt already honors explicit
   group bans (F3). Delivery = post if group eligible, else creator-DM fallback.
   Full contract: `../smart-summary-origin-channel-card/brief.md`.
-- **A2 user forward (`summary-forward-card`):** a new user-facing forward
-  endpoint on **summary-api** relaying through the existing `X-Internal-Token`
-  ingress with `actor_uid`; octo-server verifies the actor is an active member
-  of the target channel. Bot-sent card with a forwarder-attribution header;
-  **no OBO** (card-protocol Decision 2b). Person targets keep today's
-  plain-text forward — a bot cannot post into a two-party human DM. Full
-  contract: `../smart-summary-user-share-card/brief.md`.
-- **`docs-share-card`:** blocked on a docs S2S ingress + docs bot identity;
-  copy the A2 forward shape once those exist.
+- **A2 user share:** a separate user-authenticated, server-minted card flow for
+  **DM, group, and thread** targets. The sharing user is the message sender in
+  the selected conversation; `notification` does not proxy the share. This is
+  not a dynamic-sender `carddispatch` producer and not Bot API OBO. It requires
+  a narrow trusted-human-card provenance contract while generic user type-17
+  remains closed. Full contract: `../smart-summary-user-share-card/brief.md`.
+- **`docs-share-card`:** still blocked on deciding whether it is a user-authored
+  resource share or a docs-Bot notification, plus the corresponding content
+  authorization/ingress design. Do not copy the old A2 Bot-forward assumption.
 
 ## Locked decisions (2026-07-13; sender amended 2026-07-14)
 
 | Decision | Value |
 | --- | --- |
 | Sender identity | shared `notification` User Bot; dedicated `summary` choice superseded |
-| Message ownership | bot-sent + forwarder-attribution header; OBO rejected |
+| User-initiated share ownership | user-authored in selected DM/group/thread; server-minted card; no Bot proxy and no generic OBO |
 | Pilot channels / profile | DM only / `octo/v1` display-only |
 | Group posting (post-P2) | member-exempt: no membership required, member list/count untouched, **explicit ban honored** |
 | Concurrency | MaxInFlight 20 / process |

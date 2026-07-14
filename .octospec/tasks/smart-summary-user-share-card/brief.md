@@ -1,8 +1,8 @@
 ---
 type: Task
 title: "Task: smart-summary-user-share-card"
-description: Let an authenticated user share a visible summary to a group or thread as a Bot-authored card with authoritative forwarder attribution.
-tags: ["summary", "card", "share", "auth", "space", "isolation", "acl", "rate-limit", "idempotency", "audit", "testing"]
+description: Let an authenticated user share a server-minted summary card as themselves to a DM, group, or thread without opening generic user-authored type-17.
+tags: ["summary", "card", "share", "auth", "space", "isolation", "acl", "trust-boundary", "rate-limit", "idempotency", "audit", "testing"]
 timestamp: 2026-07-14T12:00:00+08:00
 # --- octospec extension fields ---
 slug: smart-summary-user-share-card
@@ -14,110 +14,173 @@ source: self
 
 ## Goal
 
-Add an authenticated summary-api operation that lets a user share a summary
-they are authorized to view into a group or thread they are authorized to post
-to. The resulting `octo/v1` card is sent by the shared `notification` Bot and
-includes a server-authored attribution header such as “Alice shared a smart
-summary”.
+Let an authenticated user explicitly share a summary they can view into any
+supported conversation target: a person-to-person DM, group, or thread. The
+message appears as authored by the sharing user in the selected conversation;
+it must not create a separate `notification` Bot DM or show a Bot as the author.
 
-The user triggers the share but does not author the type-17 wire message. This
-preserves the platform rule that rich cards originate only from reviewed Bot
-producers.
+The card body remains server-minted from the summary resource. Neither web nor
+an S2S caller can submit arbitrary type-17 JSON, choose `from_uid`, forge the
+summary content, or use a generic “send as any user” capability.
 
-## Background
+## Distinction from origin delivery
+
+| Capability | Trigger | Destination | Message author | Failure behavior |
+| --- | --- | --- | --- | --- |
+| Origin group/thread delivery | Automatic when a task reaches a terminal state | Immutable group/thread bound when the task was created | `notification` Bot | Permanently invalid origin falls back to creator DM |
+| User-initiated share | Explicit authenticated user action | User-selected DM, group, or thread | Sharing user | Return per-target result; never silently redirect or change message type |
+
+The destination sets overlap for groups and threads, but the trigger,
+provenance, sender, authorization, fallback, idempotency, and audit contracts
+are different. They are therefore separate tasks.
+
+## Background and current blockers
 
 Today web forwards summary content as user-authored plain-text chunks. The web
-client is intentionally receive-only for type-17. A card share therefore needs
-two independent authorization decisions: summary-api verifies access to the
-summary content, and octo-server verifies live permission to the selected chat
-target.
+client is receive-only for type-17, and the current server deliberately enforces
+Bot-only InteractiveCard origination:
 
-The target model is intentionally split. Group/thread shares can use a
-Bot-authored card with user attribution. A person-to-person DM cannot contain a
-third-party Bot message in the same human conversation, so it keeps the current
-user-authored plain-text flow.
+- `modules/message` rejects every user-ingress type-17 request before target DB
+  checks;
+- `modules/cardtrust` trusts only active Bot or webhook senders and masks a
+  human-sender type-17 card;
+- `internal/carddispatch` binds every producer to one static active Bot UID and
+  cannot send as the authenticated actor;
+- Bot API OBO rejects type-17.
+
+Consequently this feature is not implemented by widening `summary-notify`.
+It needs a separate, narrowly scoped server-minted user-share authority while
+the generic user, Bot-OBO, and client-authored type-17 gates remain closed.
 
 ## Contract and decisions
 
-1. **Authenticated content-owner endpoint.** summary-api exposes a user-auth
-   share endpoint following that repository's versioning conventions. It takes
-   a summary identifier, canonical group/thread target, and an idempotency key;
-   it never accepts card JSON, sender UID, attribution name/avatar, `plain`, or
-   arbitrary payload fields.
-2. **Summary authorization.** summary-api resolves the authenticated actor and
-   verifies current visibility of the requested summary before reading or
-   relaying any content. Deleted, expired, revoked, cross-Space, or unauthorized
-   summaries fail closed with the service's localized error contract.
-3. **Target authorization.** The service relays structured summary fields,
-   `actor_uid`, summary Space, target channel/type, and idempotency key through
-   its existing authenticated S2S boundary. octo-server independently verifies
-   active actor membership and post access in the exact same-Space group or
-   thread, including thread-parent access and live lifecycle state.
-4. **Bot sender and attribution.** A distinct `summary-forward-card` producer is
-   bound to `notification`, group/thread only, `octo/v1` only, and
-   member-exempt. octo-server resolves the actor's current profile and builds
-   the visible attribution; caller-supplied display data is ignored/rejected.
-   The Bot is never added to the group and explicit Bot bans remain effective.
-5. **DM split.** A person target is rejected by the card-share endpoint. Web
-   keeps the existing user-authored plain-text forward for human-to-human DMs.
-   A Bot DM is not substituted because it would create a different conversation.
-6. **No OBO or generic card relay.** No path may send type-17 as the actor, add
-   OBO fields, accept a free-form card/document, or expose “send as any UID”.
-   The server-owned summary template is the only accepted card body.
-7. **Rate limits.** Apply authenticated per-user share limits at summary-api,
-   plus the same Redis-backed cluster-wide per-channel and producer-wide
-   outbound buckets required by the origin-delivery brief. Limit exhaustion is
-   retryable only when the API explicitly returns a safe retry-after; it never
-   silently falls back to another target or message type.
-8. **Idempotency and audit.** Require an opaque idempotency key scoped to actor
-   and endpoint. summary-api persists the authorized request/result so client
-   retries return the original outcome and do not intentionally re-dispatch.
-   Record an audit event containing actor, summary reference, Space, canonical
-   target, timestamp, outcome, and request correlation ID. Do not store card
-   JSON or summary text in the audit event. An ambiguous transport failure can
-   still duplicate at WuKongIM and is not represented as exactly-once.
+1. **Two-stage authenticated share intent.** Web first calls a user-authenticated
+   summary-api endpoint with the summary, bounded target list, and idempotency
+   key. After checking visibility, summary-api returns a short-lived, signed,
+   single-use share intent bound to actor UID, summary ID/revision, Space,
+   canonical targets, immutable template fields, expiry, nonce, and idempotency
+   key. Web then calls a new user-authenticated octo-server share endpoint with
+   that intent. octo-server requires `AuthMiddleware` and Space middleware;
+   `login_uid` must equal the intent actor. A static S2S token plus caller-
+   supplied `actor_uid` is insufficient.
+2. **Summary authorization.** summary-api is the content authority and verifies
+   current visibility before minting an intent. Deleted, expired, revoked,
+   cross-Space, or unauthorized summaries fail closed. octo-server verifies the
+   intent signature, audience, expiry, nonce, actor, Space, target binding, and
+   content revision; request fields cannot override signed values.
+3. **All three target types.** A bounded request may contain DMs, groups, and
+   threads. Each target is normalized, authorized, rate-limited, dispatched,
+   and reported independently; partial success is explicit, not transactional.
+   - DM: verify actor and peer are valid participants under the existing Space/
+     friendship policy, then send `from_uid=actor` to the peer so the card lands
+     in their existing human-to-human conversation.
+   - Group: verify active actor membership/post permission, active same-Space
+     group, and explicit bans.
+   - Thread: verify the canonical parent group, actor parent-channel access,
+     same Space, and live thread lifecycle.
+4. **User authorship, server-owned card.** octo-server builds the fixed
+   display-only `octo/v1` summary ResourceCard, derives the deep link, computes
+   authoritative `plain`, finalizes/size-checks it, and transports it with
+   `FromUID=login_uid`. The request has no `from_uid`, card/document, URL,
+   attribution, `plain`, OBO, subscriber, or transport fields. The normal chat
+   sender UI is sufficient attribution; the card does not duplicate a fake
+   “Alice shared” header.
+5. **Narrow trusted-human-card provenance.** A human-sender type-17 card is
+   renderable only when it carries a valid server-only share proof bound to the
+   canonical finalized envelope, actor, Space, target, content revision, and
+   idempotency nonce. The proof includes a key ID and detached signature.
+   Generic user-ingress cards, unsigned cards, tampered cards, and Bot-OBO cards
+   remain rejected/masked exactly as today. All server display surfaces and the
+   web real-time renderer use one versioned verification contract; old
+   verification keys remain available for historic-message rendering during
+   key rotation. Private signing material comes from managed secret/config,
+   never the repository or payload.
+6. **Display-only exception.** The user-share authority permits only the fixed
+   `octo/v1` template and local navigation/copy actions. It does not allow
+   `octo/v2`, `Action.Submit`, inputs, card edits, revisions, or `card_action`.
+   The existing human-sender action rejection remains unchanged.
+7. **No generic OBO or dispatcher weakening.** This endpoint sends as the
+   directly authenticated actor; it is not Bot API OBO and accepts no delegated
+   actor identity. The existing Bot-bound `carddispatch.Sender` remains static.
+   The new path must have its own source guard/allowlist entry and cannot expose
+   a reusable arbitrary-card or arbitrary-sender API.
+8. **Rate limits.** Apply the shared authenticated UID limiter plus a stricter
+   endpoint-specific per-user share quota. Group/thread targets also use the
+   Redis-backed cluster-wide per-channel and feature-wide outbound buckets
+   defined by the origin-delivery brief; DM targets use a per-actor/peer
+   cooldown. Quota values are bounded configuration chosen from observed
+   volume. Limiter-store failure fails closed and returns a safe retry-after.
+9. **Idempotency and audit.** Scope the idempotency key to actor + summary
+   revision + canonical target. Persist intent consumption and per-target send
+   result so retries do not intentionally redispatch successful targets; nonce
+   replay with changed inputs fails closed. Audit actor, summary reference,
+   Space, canonical target, timestamp, request/correlation ID, and outcome, but
+   not summary text, card JSON, signatures, tokens, or credentials. Because the
+   transport has no caller-controlled `client_msg_no`, an ambiguous transport
+   timeout may still duplicate and is not described as exactly-once.
+10. **No fallback target.** Authorization, quota, intent, or transport failure
+    is returned for that selected target. The server never substitutes a Bot
+    DM, plain text, creator DM, or another channel. The UI may offer an explicit
+    retry or explicit plain-text share as a new user action.
 
 ## Load-bearing list
 
-- Summary visibility, retention, and same-Space data-isolation rules.
-- User authentication and anti-enumeration error behavior in summary-api.
-- Existing S2S token boundary and structured ingress contract.
-- Actor membership/post permission and thread-parent access in octo-server.
-- Producer-bound sender, member-exempt Bot policy, template ownership, and
-  type-17 no-bypass guard.
-- Per-user, per-channel, and producer-wide rate control.
-- Durable idempotency, privacy-safe audit events, metrics, and rollback flags.
+- Summary visibility, revision, retention, and same-Space isolation.
+- Short-lived intent signing, verification, replay defense, key rotation, and
+  secret/config management across smart-summary, octo-server, and web.
+- User-authenticated share endpoint, Space middleware, anti-enumeration errors,
+  and exact actor binding.
+- DM friendship/Space checks, group membership/post permission, and thread
+  parent access.
+- Server-owned card template/finalization and the narrow human-card provenance
+  exception across every display surface.
+- Per-user, per-DM, per-channel, and feature-wide traffic control.
+- Per-target idempotency, privacy-safe audit events, metrics, feature flags,
+  and rollback behavior.
 
 ## Out of scope
 
-- Rich-card shares to person-to-person DMs.
-- OBO/user-authored type-17 messages or arbitrary client-authored cards.
+- Automatic task-completion delivery to the origin conversation.
+- Bot-authored or Bot-attributed user shares.
+- Arbitrary client-authored cards, free-form Adaptive Card JSON, generic user
+  type-17 ingress, Bot API OBO cards, or “send as any UID”.
 - Cross-Space sharing, public links, or changing summary visibility grants.
-- Editing/revoking a card after the underlying summary changes or is deleted.
-- Interactive `octo/v2` actions, comments, reactions, or card revisions.
-- Automatically sharing on task completion; origin delivery has its own brief.
+- Interactive `octo/v2` actions, inputs, callbacks, card edits, or revisions.
+- Exactly-once transport delivery or automatic duplicate recall.
 
 ## Acceptance
 
-- Unauthenticated, unauthorized, revoked/deleted, and cross-Space summary
-  requests return the service's safe error envelope and produce zero S2S calls.
-- Group/thread authorization matrix covers active/non-member/removed actor,
-  wrong Space, disabled/disbanded group, invalid/archived/deleted thread,
-  missing parent, explicit Bot ban, and storage error; all failures produce zero
-  transport calls and zero membership mutations.
-- Success persists one `octo/v1` card from `from_uid=notification`; attribution
-  is derived from the authenticated actor's live server profile and cannot be
-  spoofed by request fields.
-- Person targets are rejected by the card endpoint, while the existing web
-  user-authored plain-text DM flow remains covered by a regression test.
-- Source/contract guards reject OBO fields, sender UID, free-form type-17/card
-  payloads, and arbitrary attribution fields at both service boundaries.
-- Repeated requests with the same actor/idempotency key return the recorded
-  result without a second intentional dispatch; keys cannot collide across
-  actors. Ambiguous transport duplicates remain documented and observable.
-- Per-user and cluster-wide outbound limit tests pass across multiple simulated
-  replicas, with bounded retry-after behavior and no fallback sends.
+- Unauthenticated, actor-mismatched, expired, replayed, tampered, wrong-
+  audience, unauthorized, revoked/deleted, stale-revision, and cross-Space
+  intents fail closed before transport with the service's safe localized error.
+- A DM success persists one `octo/v1` card with `from_uid=login_uid` in the
+  existing actor/peer conversation; no `notification` Bot conversation is
+  created. Friendship/Space denial produces zero sends.
+- Group and thread successes also persist `from_uid=login_uid`; authorization
+  tests cover non-member/removed/banned actor, wrong Space, disabled/disbanded
+  group, invalid/archived/deleted thread, missing parent, and storage errors.
+- A mixed bounded target request returns stable per-target delivered/denied/
+  retryable results. Failure of one target does not roll back successes or send
+  to a fallback destination.
+- Card bytes, deep link, `plain`, Space, and sender are server-owned. Contract
+  tests reject request fields for sender, arbitrary card/payload, URL,
+  attribution, OBO, subscribers, or transport metadata.
+- A valid share proof renders on all server surfaces and web real-time/cold-
+  sync paths. Missing, forged, wrong-target, wrong-actor, wrong-Space, or
+  payload-tampered proofs are masked; existing unsigned human type-17 fixtures
+  remain untrusted. Key-rotation tests verify old messages with retained public
+  keys while new messages use the active key.
+- Generic user type-17 ingress and Bot-OBO type-17 tests remain rejected. The
+  no-bypass source guard recognizes only the reviewed server-minted share call
+  site, and the existing Bot-bound dispatcher cannot accept a dynamic sender.
+- Repeating actor + summary revision + target + idempotency key returns the
+  recorded result without a second intentional send; changed target/content
+  with the same nonce is rejected. Ambiguous transport duplicates remain
+  documented and observable.
+- UID, DM, channel, and producer quota tests cover multi-replica behavior,
+  bounded retry-after, configuration validation, and fail-closed store errors.
 - Audit tests prove success and denial outcomes are recorded without summary
-  text/card JSON/secrets; metric labels stay bounded and contain no identifiers.
-- Independent feature flags can disable card sharing and fall the UI back to
-  the existing plain-text behavior without disabling summary notifications.
+  text, card JSON, proof/token, or secrets; metrics use bounded labels only.
+- Independent server/web feature flags can disable user-share cards without
+  disabling summary notifications or origin delivery; rollback requires no
+  destructive data migration.
