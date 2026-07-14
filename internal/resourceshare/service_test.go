@@ -304,6 +304,24 @@ func TestShareService_DropsUnsafeRequestIDFromAuditWithoutRejectingShare(t *test
 	assert.Equal(t, []string{"", "", ""}, requestIDs)
 }
 
+func TestShareService_PersistsSafeRequestIDInAudit(t *testing.T) {
+	intent := validIntent(time.Unix(1_800_000_000, 0).UTC())
+	intent.Targets = []Target{{Kind: TargetGroup, GroupNo: "group-a"}}
+	h := newServiceHarness(t, intent, []TargetDisclosure{disclosureFor(intent.Targets[0], true)})
+	compact := signIntent(t, h.intentKey, jose.ES256, "intent-key-1", intent)
+
+	const requestID = "gateway.trace_id-7~"
+	result, err := h.service.Share(context.Background(), "user-a", "space-a", compact, requestID)
+	require.NoError(t, err)
+	require.Len(t, result.Results, 1)
+	assert.Equal(t, ShareSent, result.Results[0].Outcome)
+
+	var requestIDs []string
+	_, err = h.session.Select("request_id").From("octo_resource_share_audit").OrderAsc("id").Load(&requestIDs)
+	require.NoError(t, err)
+	assert.Equal(t, []string{requestID, requestID, requestID}, requestIDs)
+}
+
 func TestShareService_IdenticalRetryDoesNotResendSuccessfulTarget(t *testing.T) {
 	intent := validIntent(time.Unix(1_800_000_000, 0).UTC())
 	intent.Targets = []Target{{Kind: TargetGroup, GroupNo: "group-a"}}

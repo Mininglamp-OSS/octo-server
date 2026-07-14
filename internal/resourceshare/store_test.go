@@ -344,6 +344,25 @@ func TestResourceShareMigrationContainsDurableBoundariesAndNoSecrets(t *testing.
 	} {
 		assert.Contains(t, sql, required)
 	}
+	for _, boundedColumn := range []string{
+		"actor_uid VARCHAR(128) NOT NULL",
+		"space_id VARCHAR(128) NOT NULL",
+		"provider_id VARCHAR(64) NOT NULL",
+		"resource_type VARCHAR(64) NOT NULL",
+		"resource_id VARCHAR(256) NOT NULL",
+		"resource_revision VARCHAR(128) NOT NULL",
+		"delivery_id CHAR(64) NOT NULL",
+		"target_kind VARCHAR(16) NOT NULL",
+		"target_ref VARCHAR(512) NOT NULL",
+		"state VARCHAR(24) NOT NULL",
+		"message_id VARCHAR(32) NOT NULL DEFAULT ''",
+		"client_msg_no VARCHAR(128) NOT NULL DEFAULT ''",
+		"outcome_code VARCHAR(64) NOT NULL DEFAULT ''",
+		"request_id VARCHAR(128) NOT NULL DEFAULT ''",
+		"outcome VARCHAR(24) NOT NULL",
+	} {
+		assert.Contains(t, sql, boundedColumn)
+	}
 	assert.NotContains(t, sql, "CREATE TABLE IF NOT EXISTS resource_share_",
 		"new tables must use the repository's octo_ prefix")
 	for _, forbidden := range []string{"raw_intent", "card_json", "share_proof", "signature", "private_key"} {
