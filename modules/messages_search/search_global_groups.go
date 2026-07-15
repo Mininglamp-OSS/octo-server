@@ -134,7 +134,21 @@ func (h *Handler) searchGlobalGroups(c *wkhttp.Context) {
 		return
 	}
 
-	result, hasMore := h.buildGroupsResult(ctx, res, req.Sequence, loginUID)
+	result, hasMore, berr := h.buildGroupsResult(ctx, c, res, req.Sequence, loginUID, client, base)
+	if berr != nil {
+		// Deep-probe OS round-trips can fail like any other search; a
+		// classifiable OS error maps to UPSTREAM_UNAVAILABLE, everything else
+		// (notably the fail-closed filterVisible DB gate) is INTERNAL_ERROR so
+		// we never fall through to leaking uncalibrated preview.
+		if responder := classifyOSError(berr); responder != nil {
+			h.Warn("OS presence deep-probe failed", zap.Error(berr))
+			responder(c)
+			return
+		}
+		h.Error("messages_search: presence calibration failed", zap.Error(berr))
+		respondInternal(c)
+		return
+	}
 	recordAudit(c, "search_global_groups", 0, "", req.Keyword, len(result.Groups))
 	c.Response(groupsEnvelope(result, hasMore))
 }
@@ -218,25 +232,56 @@ type parsedBucket struct {
 	hits     []*elastic.SearchHit // already capped to perGroupMax
 }
 
-// buildGroupsResult projects the aggregation response into the L1 data object
-// and reports has_more (命中群数 > maxGroups, signalled by the terms
-// sum_other_doc_count on the single-shard index).
-func (h *Handler) buildGroupsResult(ctx context.Context, res *elastic.SearchResult, seq int64, loginUID string) (GroupsResult, bool) {
+// buildGroupsResult projects the aggregation response into the L1 data object.
+// Backend B: between parse and assemble it runs presence calibration (§2.2) so
+// every returned bucket "确有可见命中" and every preview row is a filterVisible
+// -passed visible hit — the raw top_hits are NEVER projected to the wire (that
+// was the A-review Blocker: uncalibrated preview leaked snippet/sender/time of
+// admin-deleted / self-deleted / cleared-history messages). has_more still
+// reflects 命中群数 > maxGroups (terms sum_other_doc_count on the single-shard
+// index). Returns an error when calibration hits a fail-closed DB gate or a
+// deep-probe OS round-trip fails, so the caller can respond upstream/internal
+// instead of leaking.
+func (h *Handler) buildGroupsResult(ctx context.Context, c *wkhttp.Context, res *elastic.SearchResult, seq int64, loginUID string, client *elastic.Client, base elastic.Query) (GroupsResult, bool, error) {
 	result := emptyGroupsResult(seq)
-	parsed, totalGroups, hasMore, ok := parseGroupsAggregation(res, h.cfg.Groups.PerGroupMax)
+	// Keep the FULL over-fetched top-T sample (T=perGroupMax+presenceProbe) for
+	// calibration — do not truncate to perGroupMax here; preview trimming to the
+	// per-frequency N happens after INCLUDE/EXCLUDE is decided.
+	parsed, totalGroups, hasMore, ok := parseGroupsAggregation(res, h.cfg.Groups.TopHitsSize())
 	result.TotalGroups = totalGroups
 	if !ok {
-		return result, false
+		return result, false, nil
+	}
+
+	var timings searchPhaseTimings
+	calibrated, stats, err := h.calibratePresence(ctx, client, base, parsed, loginUID, &timings)
+	recordSearchTimings(c, timings)
+	recordPresenceStats(c, stats)
+	if err != nil {
+		return result, false, err
+	}
+
+	// Per-frequency N allocation (§4): spread previewBudget across the surviving
+	// buckets weighted by match frequency, then take the most-recent N visible
+	// rows per bucket.
+	ns := allocatePreviewN(calibrated, h.cfg.Groups.PreviewBudget, h.cfg.Groups.PerGroupMax)
+	visibleHits := make([][]*elastic.SearchHit, len(calibrated))
+	for i, cb := range calibrated {
+		k := ns[i]
+		if k > len(cb.visible) {
+			k = len(cb.visible)
+		}
+		visibleHits[i] = cb.visible[:k]
 	}
 
 	var groupNos, shortIDs, peerUIDs []string
-	for _, pb := range parsed {
-		ct, wireID, parentGroupNo, shortID := classifyGroupBucket(pb.key, loginUID)
+	for _, cb := range calibrated {
+		ct, wireID, parentGroupNo, shortID := classifyGroupBucket(cb.pb.key, loginUID)
 		switch ct {
 		case channelTypePerson:
 			peerUIDs = append(peerUIDs, wireID)
 		case channelTypeGroup:
-			groupNos = append(groupNos, pb.key)
+			groupNos = append(groupNos, cb.pb.key)
 		case channelTypeThread:
 			groupNos = append(groupNos, parentGroupNo)
 			shortIDs = append(shortIDs, shortID)
@@ -246,22 +291,24 @@ func (h *Handler) buildGroupsResult(ctx context.Context, res *elastic.SearchResu
 	groupNames := h.resolveGroupNames(groupNos)
 	threadNames := h.resolveThreadNames(shortIDs)
 	peerNames := h.resolvePeerNames(peerUIDs)
-	previews := h.projectPreview(ctx, parsed, loginUID)
+	previews := h.projectPreview(ctx, visibleHits, loginUID)
 
-	for i, pb := range parsed {
-		result.Groups = append(result.Groups, assembleGroupBucket(pb, previews[i], loginUID, groupNames, threadNames, peerNames))
+	for i, cb := range calibrated {
+		result.Groups = append(result.Groups, assembleGroupBucket(cb.pb, previews[i], loginUID, groupNames, threadNames, peerNames))
 	}
-	return result, hasMore
+	return result, hasMore, nil
 }
 
 // parseGroupsAggregation is the pure (I/O-free) reader of the OS aggregation
 // response: it extracts total_groups (cardinality), has_more (terms
 // sum_other_doc_count > 0 on the single-shard index) and each bucket's key /
-// doc_count / latest_at / preview hits (capped to perGroupMax). Kept separate
-// from name resolution so the has_more + bucket parsing can be unit-tested
-// without standing up group/user/thread services. ok=false means the response
-// carried no by_channel terms aggregation.
-func parseGroupsAggregation(res *elastic.SearchResult, perGroupMax int) (buckets []parsedBucket, totalGroups int64, hasMore, ok bool) {
+// doc_count / latest_at / preview hits (capped to capHits). Backend B passes
+// TopHitsSize() as capHits so the full over-fetched top-T sample survives for
+// presence calibration; preview trimming to the per-frequency N happens later.
+// Kept separate from name resolution so the has_more + bucket parsing can be
+// unit-tested without standing up group/user/thread services. ok=false means
+// the response carried no by_channel terms aggregation.
+func parseGroupsAggregation(res *elastic.SearchResult, capHits int) (buckets []parsedBucket, totalGroups int64, hasMore, ok bool) {
 	if res == nil || res.Aggregations == nil {
 		return nil, 0, false, false
 	}
@@ -285,8 +332,8 @@ func parseGroupsAggregation(res *elastic.SearchResult, perGroupMax int) (buckets
 		var hits []*elastic.SearchHit
 		if th, hok := b.TopHits("preview"); hok && th != nil && th.Hits != nil {
 			hits = th.Hits.Hits
-			if perGroupMax > 0 && len(hits) > perGroupMax {
-				hits = hits[:perGroupMax]
+			if capHits > 0 && len(hits) > capHits {
+				hits = hits[:capHits]
 			}
 		}
 		buckets = append(buckets, parsedBucket{key: key, docCount: b.DocCount, latestTS: latestTS, hits: hits})
@@ -294,16 +341,18 @@ func parseGroupsAggregation(res *elastic.SearchResult, perGroupMax int) (buckets
 	return buckets, totalGroups, hasMore, true
 }
 
-// projectPreview turns each bucket's raw top_hits into []MessageHit and fills
-// sender names/avatars in a single batched senderJoin across all buckets (the
-// global endpoints deliberately skip per-group remark scoping — channelType=0
-// degrades senderJoin to a plain user lookup).
-func (h *Handler) projectPreview(ctx context.Context, buckets []parsedBucket, loginUID string) [][]MessageHit {
-	previews := make([][]MessageHit, len(buckets))
+// projectPreview turns each bucket's already-calibrated visible hits into
+// []MessageHit and fills sender names/avatars in a single batched senderJoin
+// across all buckets (the global endpoints deliberately skip per-group remark
+// scoping — channelType=0 degrades senderJoin to a plain user lookup). Input is
+// the presence-calibrated + N-trimmed visible hits per bucket, so nothing here
+// reaches the wire without having passed filterVisible.
+func (h *Handler) projectPreview(ctx context.Context, bucketHits [][]*elastic.SearchHit, loginUID string) [][]MessageHit {
+	previews := make([][]MessageHit, len(bucketHits))
 	var senderIDs []string
-	for bi, pb := range buckets {
-		hits := make([]MessageHit, 0, len(pb.hits))
-		for _, hit := range pb.hits {
+	for bi, hitList := range bucketHits {
+		hits := make([]MessageHit, 0, len(hitList))
+		for _, hit := range hitList {
 			var doc Doc
 			if err := json.Unmarshal(rawSource(hit.Source), &doc); err != nil {
 				h.Warn("messages_search: bad groups preview _source skipped", zap.Error(err))

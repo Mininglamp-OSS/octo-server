@@ -106,6 +106,16 @@ func (h *Handler) auditMiddleware() wkhttp.HandlerFunc {
 				fields = append(fields, zap.Int("oversample_pages", n))
 			}
 		}
+		if v, ok := c.Get(auditFieldPresenceProbeBucketsKey); ok {
+			if n, _ := v.(int); n >= 0 {
+				fields = append(fields, zap.Int("presence_probe_buckets", n))
+			}
+		}
+		if v, ok := c.Get(auditFieldPresenceProbeDocsKey); ok {
+			if n, _ := v.(int); n >= 0 {
+				fields = append(fields, zap.Int("presence_probe_docs", n))
+			}
+		}
 		h.Info("messages_search.audit", fields...)
 	}
 }
