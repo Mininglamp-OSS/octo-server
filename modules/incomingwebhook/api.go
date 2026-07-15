@@ -260,6 +260,10 @@ func (w *IncomingWebhook) Route(r *wkhttp.WKHttp) {
 			push.POST(base+"/github", chain(w.pushGitHub)...)
 			push.POST(base+"/wecom", chain(w.pushWeCom)...)
 			push.POST(base+"/multica", chain(w.pushMultica)...)
+			// /octo 是 /multica 的对外别名（隐藏 multica 产品名）：解析与渲染复用同一套
+			// parseMulticaPush，但用独立的 octoAdapter，使投递审计 adapter 记为 "octo"。
+			// /multica 保留以兼容存量订阅。
+			push.POST(base+"/octo", chain(w.pushOcto)...)
 			push.POST(base+"/gitlab", chain(w.pushGitLab)...)
 			push.POST(base+"/feishu", chain(w.pushFeishu)...)
 		}
@@ -1274,6 +1278,7 @@ func (w *IncomingWebhook) push(c *wkhttp.Context)        { w.handlePush(c, nativ
 func (w *IncomingWebhook) pushGitHub(c *wkhttp.Context)  { w.handlePush(c, githubAdapter) }
 func (w *IncomingWebhook) pushWeCom(c *wkhttp.Context)   { w.handlePush(c, wecomAdapter) }
 func (w *IncomingWebhook) pushMultica(c *wkhttp.Context) { w.handlePush(c, multicaAdapter) }
+func (w *IncomingWebhook) pushOcto(c *wkhttp.Context)    { w.handlePush(c, octoAdapter) }
 func (w *IncomingWebhook) pushGitLab(c *wkhttp.Context)  { w.handlePush(c, gitlabAdapter) }
 func (w *IncomingWebhook) pushFeishu(c *wkhttp.Context)  { w.handlePush(c, feishuAdapter) }
 

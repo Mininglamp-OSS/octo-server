@@ -69,9 +69,12 @@ func TestCreate_ReturnsLocalizedAdapterExamples(t *testing.T) {
 		assert.NotEmpty(t, ex["description"])
 		steps, ok := ex["steps"].([]interface{})
 		require.True(t, ok, "steps must be array for %s", key)
-		assert.NotEmpty(t, steps)
+		// octo 适配器刻意不提供接入步骤（说明已在 description 里），steps 为空是预期。
+		if key != "octo" {
+			assert.NotEmpty(t, steps)
+		}
 	}
-	assert.Equal(t, []string{"github", "gitlab", "feishu", "multica", "wecom"}, keys)
+	assert.Equal(t, []string{"github", "gitlab", "feishu", "octo", "wecom"}, keys)
 	firstDescription, _ := rawExamples[0].(map[string]interface{})["description"].(string)
 	assert.Contains(t, firstDescription, "repository")
 }

@@ -80,6 +80,7 @@ const (
 	adapterGitHub  = "github"  // GitHub 事件适配器（#297 Phase 3）
 	adapterWeCom   = "wecom"   // 企业微信群机器人格式适配器（#297 Phase 3）
 	adapterMultica = "multica" // Multica 出站 webhook 适配器（#426）
+	adapterOcto    = "octo"    // Multica 出站 webhook 的对外别名后缀，与 multica 共用同一解析/渲染
 	adapterGitLab  = "gitlab"  // GitLab 事件适配器（#297 Phase 4）
 	adapterFeishu  = "feishu"  // 飞书自定义机器人格式适配器（#297 Phase 4）
 )

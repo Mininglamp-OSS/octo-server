@@ -45,7 +45,8 @@ var publicAdapterCatalog = []publicAdapterDef{
 	{Key: adapterGitHub, Suffix: adapterGitHub, ContentType: "application/json", Auth: adapterAuthResp{Type: "url_token"}, ShowExample: true},
 	{Key: adapterGitLab, Suffix: adapterGitLab, ContentType: "application/json", Auth: adapterAuthResp{Type: "url_token_and_header", Header: "X-Gitlab-Token", ValueSource: "token"}, ShowExample: true},
 	{Key: adapterFeishu, Suffix: adapterFeishu, ContentType: "application/json", Auth: adapterAuthResp{Type: "url_token"}, ShowExample: true},
-	{Key: adapterMultica, Suffix: adapterMultica, ContentType: "application/json", Auth: adapterAuthResp{Type: "url_token"}, ShowExample: true},
+	{Key: adapterMultica, Suffix: adapterMultica, ContentType: "application/json", Auth: adapterAuthResp{Type: "url_token"}, ShowExample: false},
+	{Key: adapterOcto, Suffix: adapterOcto, ContentType: "application/json", Auth: adapterAuthResp{Type: "url_token"}, ShowExample: true},
 	{Key: adapterWeCom, Suffix: adapterWeCom, ContentType: "application/json", Auth: adapterAuthResp{Type: "url_token"}, ShowExample: true},
 }
 

@@ -47,7 +47,7 @@ func TestAliasPush_WrongToken_Unauthorized(t *testing.T) {
 	assert.Equalf(t, http.StatusUnauthorized, w.Code, "wrong token must 401 via alias; body=%s", w.Body.String())
 }
 
-// 别名适配器路由（GitHub ping）：与 canonical 一致 200 + skipped，证明 6 条推送形态都
+// 别名适配器路由（GitHub ping）：与 canonical 一致 200 + skipped，证明 7 条推送形态都
 // 在别名前缀下注册并走同一条链。
 func TestAliasPush_GitHubPing_SkippedLikeCanonical(t *testing.T) {
 	handler, _, groupNo := setupTestEnv(t)
@@ -62,13 +62,13 @@ func TestAliasPush_GitHubPing_SkippedLikeCanonical(t *testing.T) {
 	assert.Contains(t, w.Body.String(), `"skipped"`, "alias ping must mark delivery skipped, same as canonical")
 }
 
-// 别名前缀下全部 6 条推送形态（native + 5 个适配器）都已注册并走同一条鉴权链：错误 token
-// 一律 401，证明每条别名路由都存在且经过 token 校验。#456 review (Octo-Q P2) 指出 wecom/
-// multica/gitlab/feishu 4 个适配器后缀未在别名上单测——mountPush 闭包让 6 条统一注册、
-// 结构上不可能漏挂，这条遍历测试把该不变量显式钉死（belt & suspenders）。
+// 别名前缀下全部 7 条推送形态（native + 6 个适配器，含 octo 这个 multica 的对外别名）
+// 都已注册并走同一条鉴权链：错误 token 一律 401，证明每条别名路由都存在且经过 token 校验。
+// mountPush 闭包让所有形态统一注册、结构上不可能漏挂，这条遍历测试把该不变量显式钉死
+// （belt & suspenders）。
 func TestAliasPush_AllPushRoutesRegistered(t *testing.T) {
-	// 固定宽松的限流 env，让本测试自包含、不受 CI 全局调低 burst 影响（#456 review
-	// Jerry-Xin 🟡）：6 次错误 token 在默认 burst(60) 下本就安全，但若某环境全局压低
+	// 固定宽松的限流 env，让本测试自包含、不受 CI 全局调低 burst 影响：7 次错误 token 在
+	// 默认 burst(60) 下本就安全，但若某环境全局压低
 	// IP_FAIL_BURST / IP_BURST / local-floor 桶，401 可能翻成 429。strict 限流器与
 	// local floor 在 Route()/New() 构造时读 env，故必须在 setupTestEnv 之前 Setenv。
 	t.Setenv("DM_INCOMINGWEBHOOK_IP_FAIL_RPS", "10000")
@@ -83,13 +83,13 @@ func TestAliasPush_AllPushRoutesRegistered(t *testing.T) {
 	handler, ctx, groupNo := setupTestEnv(t)
 	whID, _ := createWebhookWithToken(t, handler, groupNo)
 
-	// 固定 IP + 重置失败/限流桶：6 次错误 token 走同一 IP，重置桶让本测试与并发的其它
+	// 固定 IP + 重置失败/限流桶：7 次错误 token 走同一 IP，重置桶让本测试与并发的其它
 	// 匿名推送测试互不串桶（env 已宽松，桶容量也足够）。
 	const ip = "203.0.113.201"
 	resetIPFailBucket(t, ctx, ip)
 	resetStrictIPBucket(t, ctx, ip)
 
-	for _, suffix := range []string{"", "github", "wecom", "multica", "gitlab", "feishu"} {
+	for _, suffix := range []string{"", "github", "wecom", "multica", "octo", "gitlab", "feishu"} {
 		path := fmt.Sprintf("/v1/webhooks/%s/%s", whID, "wrong-token")
 		if suffix != "" {
 			path += "/" + suffix

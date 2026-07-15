@@ -20,11 +20,14 @@ func TestAdapterExamplesRenderSupportedLanguages(t *testing.T) {
 				keys = append(keys, ex.Key)
 				assert.NotEmpty(t, ex.Title, "title for %s/%s", lang, ex.Key)
 				assert.NotEmpty(t, ex.Description, "description for %s/%s", lang, ex.Key)
-				assert.NotEmpty(t, ex.Steps, "steps for %s/%s", lang, ex.Key)
+				// octo 适配器刻意不提供接入步骤（说明已在 description 里），steps 为空是预期。
+				if ex.Key != "octo" {
+					assert.NotEmpty(t, ex.Steps, "steps for %s/%s", lang, ex.Key)
+				}
 				assert.Equal(t, "application/json", ex.ContentType)
 				assert.Equal(t, urls[ex.Key], ex.URL, "example URL must stay in sync with urls[%s]", ex.Key)
 			}
-			assert.Equal(t, []string{"github", "gitlab", "feishu", "multica", "wecom"}, keys)
+			assert.Equal(t, []string{"github", "gitlab", "feishu", "octo", "wecom"}, keys)
 		})
 	}
 }

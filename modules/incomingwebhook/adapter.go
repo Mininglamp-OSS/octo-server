@@ -74,7 +74,10 @@ var (
 	// 的固定 JSON envelope）。multica envelope 比 GitHub 事件紧凑（不嵌入
 	// repository 对象），8 KiB 足够，沿用 native 的 bodyLimit。
 	multicaAdapter = pushAdapter{name: adapterMultica, parse: parseMulticaPush, bodyLimit: maxBytes}
-	gitlabAdapter  = pushAdapter{
+	// octoAdapter 是 multica 的对外别名：解析/渲染完全复用 parseMulticaPush，仅 name 不同，
+	// 使经 /octo 推送的投递审计（deliveries.adapter）记为 "octo"，不在审计层暴露 multica 名。
+	octoAdapter   = pushAdapter{name: adapterOcto, parse: parseMulticaPush, bodyLimit: maxBytes}
+	gitlabAdapter = pushAdapter{
 		name:      adapterGitLab,
 		parse:     parseGitLabPush,
 		bodyLimit: gitlabMaxBytes,
