@@ -17,6 +17,11 @@ source: self
 
 ## Goal
 
+> This PR-B brief is authoritative for the external/third-party Bot pull
+> implementation. First-party callback routing and terminal rendering are
+> defined only by
+> [`../card-action-callback-dispatch/brief.md`](../card-action-callback-dispatch/brief.md).
+
 Ship the **first PR of card message P2** (parent contract:
 `.octospec/tasks/card-message-interaction/brief.md`, decisions D1–D12): the
 **interaction closed loop** so a user can tap a button (or fill inputs and

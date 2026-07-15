@@ -3,7 +3,7 @@
 > 仓内草稿,供 octo-server P2(`summary-notify` pilot）实现时对齐,PR 打开后整理成英文
 > issue/comment 同步给 `Mininglamp-OSS/octo-smart-summary`。
 > 关联:brief.md(本目录)、handoff.md、docs-notify-contract.md(姊妹契约,
-> 同一 ingress 端点、同 token、同响应 shape)、octo-server PR #577(P1 地基)、
+> 同一 ingress 端点、独立 capability token、同响应 shape)、octo-server PR #577(P1 地基)、
 > #579(pilot)、#580(共用 notification Bot)。
 > 状态:已实现;`docs-notify` 姊妹 producer 于同 PR 落地(见 handoff)。
 > 最后更新 2026-07-14。

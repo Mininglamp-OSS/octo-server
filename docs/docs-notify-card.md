@@ -1,8 +1,16 @@
 # Docs-Notify 通知卡片（`internal/carddispatch` 第二个生产者）
 
+> 本文只描述 `docs-notify` 的卡片形态与组装。入站鉴权、请求和响应以
+> [docs-notify 跨仓 ingress 契约](../.octospec/tasks/card-message-internal-dispatch/docs-notify-contract.md)
+> 为准；访问审批的路由、可靠投递、终态与部署以
+> [card-action callback 运维文档](./card-action-callback-dispatch.md)为准；消费方验签、
+> 幂等与 typed result 以
+> [callback consumer 对接文档](./card-action-callback-consumer.md)为准。
+
 > **权威声明**：本文档描述 `docs-notify` 生产者当前的卡片形态与组装规则。
 > 权威源码：`pkg/cardtmpl/resource.go`（`BuildDocsResourceCard` + `docsDeepLink`）、
 > `modules/notify/card.go`（`deliverDocsCardNotification` / `buildDocsCard` /
+> `buildDocsAccessRequestCard` /
 > `docsLabelsFor` / `docsAttributionAndVariant`）、`modules/notify/model.go`
 > （`DocsCardFields`）、`internal/carddispatch/`（派发流水线）、
 > `pkg/cardmsg`（wire 协议与校验）。规范源头：
@@ -25,10 +33,10 @@
   （`ensureNotifyBot` provision）；用户会话列表里不产生第二个系统 Bot 会话。**能力
   隔离在 producer 粒度**：不同 producer 各自的 `MaxInFlight` / 允许 profile / 允许
   channel type 独立配置，`docs-backend` 不因共用 Bot 身份而获得跨 producer 越权。
-- **接口层**：仍是 `POST /v1/internal/notify` + `X-Internal-Token`。body 里
-  `Payload` / `Card`（summary） / `DocsCard`（docs） **三选一**，见 §3。
+- **接口层**：以跨仓 ingress 契约为准，本文不重复鉴权和请求结构。
 - **生产者信息**：`ProducerID="docs-notify"`，`SenderUID=NotifyBotUIDValue`，
-  `AllowedChannelTypes=[Person]`，`AllowedProfiles=[octo/v1]`，
+  `AllowedChannelTypes=[Person]`；默认仅允许 `octo/v1`，启用访问审批时同时允许
+  `octo/v2`；
   `SpacePolicy=SystemNotification`，`MaxInFlight=20/process`。
 
 **用户主动分享** 不是 docs-notify 的范围（brief Out-of-scope）：那是一条独立的
@@ -148,28 +156,18 @@ WuKongIM wire 信封（`plain` 由服务端权威派生）：
 - `kind: "access_requested"` + `actor_name: "Bob"` → attribution =
   `"Bob 请求访问文档"`，`metadata.octo.variant = "docs.access_requested"`
 
+`access_requested` 的交互卡、终态和申请人结果通知不在本文重复，统一引用
+[`card-action-callback-dispatch.md`](./card-action-callback-dispatch.md)。
+
 **约定** `docs-backend` 端预格式化 `actor_name`（可含姓+称谓、显示名等，逐字符
 `escapeMarkdown` 后落入 attribution）。octo-server 不做二次身份解析（避免 card 路径
 额外 DB 依赖）；跨仓契约见 `docs-notify-contract.md` §3。
 
 ## 3. Ingress 契约（`POST /v1/internal/notify`）
 
-完整跨仓契约见 `.octospec/tasks/card-message-internal-dispatch/docs-notify-contract.md`。
-摘要：
-
-- 头 `X-Internal-Token`（同 `NOTIFY_INTERNAL_TOKEN`，与 summary 复用；fail-closed）。
-- 一请求一收件人（`targets` 单元素）；`space_id` / `service` / `actor_uid` 语义
-  与 summary 完全对齐。
-- **三选一**：`Payload` / `Card`（summary） / `DocsCard`（docs） 只能出现一个。
-  多于一个 → 400 `err.server.notify.card_invalid`；全都缺失 → 400
-  `payload不能为空`（legacy）。
-- `Payload` 里禁止手搓 type-17（Decision 14；`cardmsg.IsCardPayload` 匹配即 400
-  `err.server.notify.card_not_allowed`）。
-- 响应仍为 `NotifyResp{delivered:[], filtered:{uid:reason}}`，reason 词表与
-  summary 一致（`target_denied` / `dispatch_failed` / `busy` / `not_space_member`
-  / `send_failed`），docs-backend 侧的重试/dedup 逻辑可**照抄** smart-summary。
-- **批量端点 `/notify/batch` 拒绝任何 `Card` / `DocsCard` 条目** — 卡片只能走单请求
-  路径（Preflight 400），因为 batch 走 legacy 文本 fan-out，不经 carddispatch。
+完整跨仓契约见
+[`.octospec/tasks/card-message-internal-dispatch/docs-notify-contract.md`](../.octospec/tasks/card-message-internal-dispatch/docs-notify-contract.md)。
+鉴权 Token、字段约束、请求示例、互斥规则、响应和重试语义只在该契约维护。
 
 ## 4. 服务端组装管线
 
@@ -181,8 +179,9 @@ WuKongIM wire 信封（`plain` 由服务端权威派生）：
    - dedup → actor 排除；
    - `memberCache.verify(space_id, targets)`；非成员进 `Filtered`；
    - `ensureNotifyBotReady()`（与 summary 共享）；
-   - `buildDocsCard` → `docsAttributionAndVariant` → `cardtmpl.BuildDocsResourceCard`；
-   - `carddispatch.Sender.Send(ctx, Target{DM}, Card{octo/v1, document})` 并发（内嵌
+   - 普通展示卡走 `buildDocsCard`；启用访问审批后的 `access_requested` 走
+     `buildDocsAccessRequestCard`；
+   - `carddispatch.Sender.Send(ctx, Target{DM}, Card{profile, document})` 并发（内嵌
      `sem` 20 与 producer `MaxInFlight` 20 一致）。
 3. **派发管线**（`internal/carddispatch`，Decisions 7/8/11）与 summary **完全相同**。
 4. **文本降级**：`canCard` 请求级决策；`cardmsg.Enabled()==false` /
@@ -227,13 +226,7 @@ summary 侧仍在等 octo-web `/s/:taskId` 上线。
 ## 8. 已知调优候选
 
 同 `docs/summary-notify-card.md` §8（`color:"Attention"` / `color:"Good"` / 让
-Excerpt 与 FactSet 位置可调）。多一个 docs 专属候选：
-
-- **访问申请交互按钮**：`access_requested` 变体天生适合「同意 / 拒绝」的交互卡（`octo/v2`），
-  但需要 producer 从 `octo/v1` 升级到 `octo/v2` 并绑定一个跑 `/v1/bot/events` 的
-  action-owner（brief › 「Interactive cards」小节）。docs-backend 目前是 TS/Hocuspocus，
-  不跑 Go bot 事件轮询——如果要走 `octo/v2` 交互，需要单独设计 executor 服务。**这是后续
-  独立议题**，不在本 producer 范围。
+Excerpt 与 FactSet 位置可调）。
 
 ## 9. 参考
 
@@ -250,7 +243,9 @@ Excerpt 与 FactSet 位置可调）。多一个 docs 专属候选：
   - `.octospec/tasks/card-message-internal-dispatch/brief.md`
   - `.octospec/tasks/card-message-internal-dispatch/docs-notify-contract.md`（跨仓）
   - `.octospec/tasks/card-message-internal-dispatch/summary-notify-contract.md`（姊妹）
+  - `docs/card-action-callback-dispatch.md` — 一方 action 路由、队列、部署与运维
+  - `docs/card-action-callback-consumer.md` — 消费方验签、幂等与 typed result
   - `docs/card-protocol.md` — wire 协议权威
   - `docs/summary-notify-card.md` — 姊妹 producer 文档，共享管线细节
 - 相关 PR：#577（dispatch 基座）、#579（`summary-notify` pilot）、#580（复用
-  `notification` bot 身份）、本 PR（`docs-notify` producer + `metadata.octo.{variant,source}`）
+  `notification` bot 身份）、#584（`docs-notify` producer + `metadata.octo.{variant,source}`）

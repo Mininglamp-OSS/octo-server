@@ -21,6 +21,10 @@ briefs are confirmed, and P1/P2 may land in adjacent releases.
 
 ## Goal
 
+> This brief is authoritative for the external/third-party Bot pull and edit
+> contract. First-party callback routing and finalization are defined only by
+> [`../card-action-callback-dispatch/brief.md`](../card-action-callback-dispatch/brief.md).
+
 Make cards interactive: a user taps a button (or fills inputs and submits) on
 a bot-sent card, the owning bot receives a `card_action` event, processes it,
 and rewrites the card so all three clients converge on the new state ("button

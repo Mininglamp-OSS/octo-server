@@ -1,17 +1,23 @@
 # docs-notify 卡片通知 — 跨仓 ingress 契约
 
+> 本文是 docs-backend 调用 `/v1/internal/notify` 的唯一入站契约。访问审批的
+> action 路由、可靠投递、终态与部署引用
+> [`docs/card-action-callback-dispatch.md`](../../../docs/card-action-callback-dispatch.md)；
+> 消费方验签、幂等和 typed result 引用
+> [`docs/card-action-callback-consumer.md`](../../../docs/card-action-callback-consumer.md)，
+> 本文不重复维护该流程。
+
 > 仓内契约，供 octo-server `docs-notify` 生产者与 `octo-docs-backend` 对齐,PR
 > 打开后整理成英文 issue/comment 同步给 `Mininglamp-OSS/octo-docs-backend`。
 > 关联:brief.md(本目录)、summary-notify-contract.md(姊妹契约)、
 > handoff.md、`docs/docs-notify-card.md`。
-> 状态:契约草案,由本 PR 落地 `pkg/cardtmpl` / `modules/notify` 侧。
-> 最后更新 2026-07-14。
+> 状态:已实现。最后更新 2026-07-15。
 
 ## 背景一句话
 
 `docs-notify` 是 `internal/carddispatch` 的**第二个**生产者（首个见
 `summary-notify-contract.md`）,把 docs-backend 想推给用户的**自动化系统通知**
-（分享、评论、访问申请）升级为 `octo/v1` 展示卡片,复用 `notification` User Bot
+（分享、评论、访问申请）升级为服务端模板卡片,复用 `notification` User Bot
 身份 → 用户会话列表**不新增**系统 Bot 会话。docs-backend 不构造 type-17 map、
 不发文本兜底、不做卡片模板 —— 只发**结构化字段** `DocsCardFields`,一切文案 /
 布局 / deep-link / i18n 由 octo-server owning。
@@ -21,17 +27,20 @@
 
 ## 契约要点（锁定项）
 
-1. **同端点、同 token、同粒度**:仍是 `POST /v1/internal/notify`,头
-   `X-Internal-Token`（复用 `NOTIFY_INTERNAL_TOKEN`;fail-closed）,**一请求
+1. **同端点、独立 token、同粒度**:仍是 `POST /v1/internal/notify`,头
+   `X-Internal-Token: <OCTO_DOCS_NOTIFY_TOKEN>`（fail-closed；不得与 legacy、
+   callback 或其它 owner token 复用），**一请求
    一收件人**（`targets` 单元素）。`space_id` / `service` / `actor_uid` 语义
    与 summary 完全相同,octo-server 已有的 dedup / actor 排除 / memberCache
    / ensureNotifyBotReady / carddispatch 派发全部复用。
-2. **三选一互斥**:`Payload` / `Card`（summary） / `DocsCard`（docs）**只能
-   出现一个**。多于一个 → 400 `err.server.notify.card_invalid`;全都缺失
+2. **结构化入口互斥**:`Payload` / `Card`（summary） / `DocsCard`（docs） /
+   `ApprovalCard`（通用审批）**只能出现一个**。多于一个 → 400
+   `err.server.notify.card_invalid`;全都缺失
    → 400 legacy「payload不能为空」。字段级检测:
    - `req.Payload != nil` 计入(包括空 `{}` —— 呼应「显式意图」)。
    - `req.Card != nil` 计入。
    - `req.DocsCard != nil` 计入。
+   - `req.ApprovalCard != nil` 计入。
 3. **禁止客户端手搓 type-17 map**:Decision 14 仍生效 —— `payload` 若被
    `cardmsg.IsCardPayload` 判为卡片(`type=17`)一律 400
    `err.server.notify.card_not_allowed`,无论走 `Card` 还是 `DocsCard`。
@@ -53,7 +62,7 @@
 
 ```jsonc
 POST /v1/internal/notify
-X-Internal-Token: <NOTIFY_INTERNAL_TOKEN>
+X-Internal-Token: <OCTO_DOCS_NOTIFY_TOKEN>
 {
   "space_id":  "spc_xxx",              // 现状:必填,server 用 memberCache 校验收件人
   "service":   "docs-service",         // 现状不变
@@ -61,6 +70,7 @@ X-Internal-Token: <NOTIFY_INTERNAL_TOKEN>
   "actor_uid": "",                     // 现状:通知场景一般留空
   "docs_card": {                       // 新增:非空即走 docs-notify 卡片 producer
     "doc_id":     "d_20260713_abcd",   // ★ 见下「标识」
+    "request_id": "",                  // access_requested + 审批开关开启时必填
     "kind":       "shared",            // "shared" | "commented" | "access_requested"
     "title":      "产品设计方案",         // 原始标题(server 负责转义/截断)
     "actor_name": "Alice",             // 预格式化的操作人显示名;空则用「有人」/「Someone」兜底
@@ -94,6 +104,7 @@ X-Internal-Token: <NOTIFY_INTERNAL_TOKEN>
 | card 字段 | docs-backend 来源(建议) |
 | --- | --- |
 | `doc_id` | 文档实体的 `id` 字段(与 `/d/:docId` 路由 taskId 同义) |
+| `request_id` | 访问申请的稳定业务 ID；`access_requested` 审批卡用于幂等/CAS |
 | `kind` | 触发场景:分享 = `shared`;评论 = `commented`;访问申请 = `access_requested` |
 | `title` | 文档 `title` 字段(空则用「无标题」兜底 —— docs-backend 侧决策) |
 | `actor_name` | 触发者的显示名(docs-backend 已 resolve;匿名场景可留空) |
@@ -105,8 +116,9 @@ X-Internal-Token: <NOTIFY_INTERNAL_TOKEN>
 - `docs-notify` producer 绑定已有 `notification` Bot(`user`+`app`+
   `robot.status=1`),卡片和纯文本降级复用其 provisioning/readiness;
   不新增专用 `docs` Bot。
-- 注册 `docs-notify` producer(DM/`octo/v1`/system-notification/MaxInFlight
-  20),经 `SenderFromContext` 注入 `modules/notify`。与 `summary-notify` 同
+- 注册 `docs-notify` producer(DM/system-notification/MaxInFlight 20)：默认
+  `octo/v1`，启用访问审批时增加 `octo/v2`;经 `SenderFromContext` 注入
+  `modules/notify`。与 `summary-notify` 同
   `ProducerSpec` shape,仅 ID 不同(见 `main.cardDispatchProducerSpecs`)。
 - `docs_card` 分支:`memberCache.verify` → `cardtmpl.BuildDocsResourceCard` →
   每个成员 `sender.Send` → 汇总 `delivered/filtered`。**建卡/配置(如
@@ -129,8 +141,7 @@ X-Internal-Token: <NOTIFY_INTERNAL_TOKEN>
    建议实现要点:
    - 每场景一个函数(`NotifyDocShared` / `NotifyDocCommented` /
      `NotifyDocAccessRequested`),内部塞 `Kind` 常量;
-   - 复用 `X-Internal-Token`(`NOTIFY_INTERNAL_TOKEN` = 同一 token,
-     docs-backend 与 smart-summary 共用);
+   - 使用独立 `X-Internal-Token: <OCTO_DOCS_NOTIFY_TOKEN>`;
    - per-recipient dedup(避免同一评论触发多次通知);
    - 消费 `NotifyResp{delivered,filtered}` —— 只认 `delivered[]` 判真送达,
      `filtered` 内标记为 `not_space_member` / `busy` / `dispatch_failed` 的
@@ -146,9 +157,10 @@ X-Internal-Token: <NOTIFY_INTERNAL_TOKEN>
 
 - 用户主动分享文档到 DM/群/子区 —— 见 `../user-resource-share-card/brief.md`,
   发送方为分享用户本人,非 Bot proxy。
-- 访问申请的交互(「同意 / 拒绝」按钮) —— 需要 producer 升级到 `octo/v2` +
-  绑定一个跑 `/v1/bot/events` 的 action-owner;docs-backend 目前是
-  TS/Hocuspocus,不跑 Go bot 事件轮询,升级为独立议题。
+- 访问申请的点击、decide 回调和终态 —— 由独立的
+  [callback dispatch](../../../docs/card-action-callback-dispatch.md) /
+  [callback consumer](../../../docs/card-action-callback-consumer.md) 文档定义，不在本
+  ingress 契约重复。
 - 群/子区自动通知(如「这份文档被评论了」推到关联群) —— 需要 producer
   widening 到 group/thread channel type,同步需要 per-channel rate rule +
   cluster-wide cap 决策(brief › Industry practice alignment)。

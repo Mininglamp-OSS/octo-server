@@ -2,7 +2,8 @@
 
 > Forward-looking guide for the next stage. The spec is `brief.md` in this
 > directory; this file says **where we are** and **what to do next**.
-> Last updated 2026-07-14.
+> Last updated 2026-07-15. This handoff covers the original dispatch foundation
+> and summary pilot; later docs approval work is referenced rather than restated.
 
 ## TL;DR
 
@@ -148,9 +149,13 @@ Each of these is its own follow-up PR after the pilot is live.
   server-minted card flow for **DM, group, and thread** targets. The sharing
   user is the sender; `notification` does not proxy the share. Generic contract:
   `../user-resource-share-card/brief.md`.
-- **Docs user share:** later onboards as another resource provider and does not
-  need a docs Bot. Automated docs notifications/actions would be a different
-  Bot-producer task.
+- **Docs paths:** user share remains a separate resource provider. Automated
+  docs notifications are defined by [`docs-notify-contract.md`](./docs-notify-contract.md);
+  access approval actions are defined by
+  [`../card-action-callback-dispatch/brief.md`](../card-action-callback-dispatch/brief.md),
+  with separate
+  [operations](../../../docs/card-action-callback-dispatch.md) and
+  [consumer integration](../../../docs/card-action-callback-consumer.md) guides.
 
 ## Locked decisions (2026-07-13; sender amended 2026-07-14)
 

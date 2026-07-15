@@ -17,6 +17,12 @@ source: self
 
 ## Goal
 
+> This brief owns internal card origination only. Current first-party action
+> routing and finalization are defined by
+> [`../card-action-callback-dispatch/brief.md`](../card-action-callback-dispatch/brief.md);
+> the external Bot pull contract remains in
+> [`../card-message-interaction/brief.md`](../card-message-interaction/brief.md).
+
 Add `internal/carddispatch` as the only supported path for an in-process
 business module to originate an `InteractiveCard` (`type=17`) message, so that
 server-side scenarios — smart-summary results delivered/forwarded into chats as
@@ -268,53 +274,25 @@ with different readiness):
   finalization, provenance, quotas, idempotency, audit, and transport. The
   generic contract is `../user-resource-share-card/brief.md`; smart-summary is
   the initial use case, while a future docs user-share card onboards as another
-  provider and does not require a docs Bot. Automated docs notifications/
-  actions, if desired, remain a separate Bot producer problem. The generic
+  provider and does not require a docs Bot. Automated docs notifications are
+  defined by [`docs-notify-contract.md`](./docs-notify-contract.md); access
+  approval actions are defined by
+  [`../card-action-callback-dispatch/brief.md`](../card-action-callback-dispatch/brief.md).
+  The generic
   path is **not Bot API OBO**: no S2S caller
   supplies `actor_uid`, no request contains `from_uid`, and arbitrary card
   payloads remain forbidden.
 
-### Interactive cards (octo/v2): how future action scenarios fit
+### Interactive cards (`octo/v2`)
 
-Foreseeable scenarios where the recipient acts on the card — merge a PR,
-close an issue, approve an access/authorization request — are deliberately
-accommodated by this contract and require **no new dispatch machinery**. The
-pilot's cards are display-only (`octo/v1`) with a deep link, but nothing in
-the pilot blocks a later interactive producer. What changes for an
-interactive producer is what it must bring, not how it dispatches:
+This task defines only the trusted origination boundary for an `octo/v2` card.
+Do not derive action delivery, consumer responsibilities, retries, or terminal
+mutation from this older dispatch brief:
 
-- **The Decision 5 gate is the whole difference.** A producer registered for
-  `octo/v2` must name the existing bot event consumer that owns `card_action`
-  for its sender bot; the registry refuses the interactive profile otherwise
-  (already in Acceptance › Capability and configuration). Sending an
-  interactive card goes through the exact same pipeline.
-- **The action loop is the existing one**, hardened by
-  card-message-appbot-trust: recipient taps → `POST /v1/message/card/action`
-  → live sender-trust check → `card_action` event on the **sender bot's**
-  event queue → the bot's owning service polls `/v1/bot/events` and ACKs via
-  Bot API. The dispatcher never adds a second callback route (Out of scope
-  holds).
-- **Sender identity choice is therefore scenario-driven.** An interactive
-  producer's bot must be backed by a service that actually runs the event
-  poll loop: e.g. a GitHub-integration bot whose sidecar executes merge/close
-  against GitHub, or a docs bot whose backend executes the approval, then
-  reflects the outcome by **editing the card** through the existing card-edit
-  path (`card_seq` / `pkg/cardrevision`) instead of sending a new card.
-  Display-only producers (the pilot) may use consumer-less bots; upgrading a
-  producer to `octo/v2` later means giving its bot an event consumer first —
-  or registering a separate producer bound to a bot that has one.
-- **Executor responsibilities stay outside the dispatcher**: authorize the
-  acting user in the target system at execution time (a visible button is
-  NOT authorization — the event's actor identity must be checked against the
-  external system's ACL), and handle the poll/ACK at-least-once delivery
-  idempotently (dedup on event/card identity before executing side effects
-  like a merge).
-
-These scenarios (`devops` PR/issue cards, `docs` approval cards) are far
-candidates: each onboards with its own producer table row, a named event
-consumer, and its own brief for the executor side. They are listed here so
-the registry/config schema is designed with the action-owner field from day
-one rather than retrofitted.
+- first-party callback routing and finalization:
+  [`../card-action-callback-dispatch/brief.md`](../card-action-callback-dispatch/brief.md);
+- external/third-party Bot pull and edit contract:
+  [`../card-message-interaction/brief.md`](../card-message-interaction/brief.md).
 
 ### Card template and deep-link (designed, confirmed 2026-07-13)
 
@@ -381,7 +359,7 @@ not implement a mutable generic "send as any UID" service.
 | Owning module / constructor | `modules/notify`; it obtains its producer-bound `Sender` from the single registry composed at server bootstrap (exact wiring resolved in implementation per Decision 11 — must fit the `register.AddModule` module system without mutable package-global registration) |
 | Sender bot UID configuration source | **Amended 2026-07-14: reuse the static `notification` User Bot** provisioned by `ensureNotifyBot` (`user` + `app` + `robot.status=1`). Summary cards, generic text notifications, and summary-card text fallback share one DM identity. This supersedes the dedicated `summary` Bot decision from 2026-07-13; the producer-bound capability still prevents generic notify callers from originating cards |
 | Allowed channel types | DM (person) only at pilot; group/thread widening is a separate reviewed change tied to smart-summary origin回发, and that review must include a per-channel rate rule and the cluster-cap decision. Group/thread sends use the member-exempt posting mode (Decision 4): the bot joins no group, member list and 群人数 unchanged |
-| Allowed card profiles / action-event owner | `octo/v1` (display-only) only; `octo/v2` forbidden — the notification Bot has no compatible summary action-event consumer polling `/v1/bot/events`, so no one could own `card_action` (see Method › Interactive cards for the upgrade path) |
+| Allowed card profiles / action-event owner | `octo/v1` (display-only) only; an interactive summary workflow would require its own reviewed owner/action route under [`../card-action-callback-dispatch/brief.md`](../card-action-callback-dispatch/brief.md) |
 | Required Space source | `NotifyReq.space_id` supplied by the internal caller and member-verified by notify's `memberCache`; the dispatcher independently re-verifies live Space/membership (Decision 3). DM policy = system-notification mode (space-member DM, Decision 4) |
 | Expected peak concurrency / QPS | max-in-flight **20** per process (mirrors notify's existing bounded send pool) — **confirmed 2026-07-13** |
 | Business retry/idempotency requirement | smart-summary already retries per recipient with `summary_notification` dedup state ⇒ at-least-once from the caller side; a transport-ambiguous failure may duplicate a card; dispatcher stays single-attempt (Decision 8). **Confirmed 2026-07-13: duplicates are acceptable for notification cards; no outbox** |
@@ -457,10 +435,9 @@ not implement a mutable generic "send as any UID" service.
    transport metadata are impossible through the API. Initial scope rejects
    mentions; a later mention feature must extend the dispatcher and retain the
    post-expansion recheck rather than bypass it.
-   An `octo/v2` producer must name the existing bot event consumer that owns
-   `card_action`; a producer with no such consumer is restricted to the
-   non-interactive profile. The dispatcher does not create a second callback
-   route for internal modules.
+   An `octo/v2` producer must declare its action owner. Action routing and
+   consumer ownership are validated by the contracts linked in
+   “Interactive cards”; this origination dispatcher does not define them.
 6. **Dispatcher owns an immutable input snapshot.** The API accepts a standard
    Adaptive Card document as bytes (or defensively deep-copies an equivalent
    typed value) before validation. It never mutates or retains caller-owned maps
@@ -649,8 +626,9 @@ caller must map them through that endpoint's registered `errcode` facade.
   unchanged.
 - Incoming Webhook card actions/callbacks; webhook identities still have no bot
   event consumer.
-- A new internal `card_action` callback/event bus. Interactive profiles retain
-  the existing sender-bot event ownership and poll/ACK contract.
+- Card-action delivery, callback reliability, and terminal finalization; these
+  belong to [`../card-action-callback-dispatch/brief.md`](../card-action-callback-dispatch/brief.md)
+  and the public Bot interaction contract linked above.
 - OBO, fan-out inside the dispatcher, streams, subscribers, transient/no-persist
   cards, mention expansion, broadcast cards, typing/read receipts, or card
   edits/revisions.

@@ -190,11 +190,28 @@ robot API（legacy）`/robot/sendMessage` 同样接受 type-17（校验与 bot i
 
 ```
 客户端点按钮 → POST /v1/message/card/action     （鉴权/防伪造/幂等,即时 ack）
-            → bot 事件队列 event_type="card_action"（/v1/bot/events 轮询,至少一次）
-            → bot 处理 → /v1/bot/message/edit 整卡替换帧
+            → 服务端按 stored sender + data.owner/action_type 分支：
+              - 注册的一方 sender/route：内部可靠队列 → HMAC callback
+                → octo-server 写终态卡并通知申请人
+              - 其它 Bot：bot 事件队列 event_type="card_action"
+                （/v1/bot/events 轮询,至少一次）→ Bot 调 /v1/bot/message/edit
             → message_extra + CMD /v1/message/extra/sync
             → 三端重渲染新帧（消息列表/sync 响应即卡片状态权威,无独立状态 API）
 ```
+
+一方 callback 路由是静态启动配置，卡片不携带 URL。路由键必须同时匹配消息表中的
+`sender_uid`、服务端模板写入的 `data.owner` 和 `data.action_type`。外部 Bot 即使复制相同
+`data` 仍走原有 pull 队列；已注册的一方 sender 若提交未知/缺失 owner/action，则
+fail-closed，不会落入无人消费的 Bot 队列。传输、队列与运维合同见
+[`card-action-callback-dispatch.md`](./card-action-callback-dispatch.md)。
+
+终态渲染按权威 owner/action 选择：docs 使用专用资源卡模板，其余已注册 route 使用
+服务端标准审批终态模板与申请人通知。因此标准审批消费方只新增 decide endpoint + route；
+只有定制视觉需要增加受审的 octo-server finalizer binding。
+
+标准审批初始卡同样不需要新增代码：route 可配置独立 `notify_token_env`，消费方用该 token
+向 `/v1/internal/notify` 提交结构化 `approval_card`。token 在服务端绑定 sender/owner/action；
+消费方不能自选 owner、callback URL 或提交任意卡片 JSON。
 
 - **状态在卡片内容里**：防重复操作 = 服务端幂等（业务身份键
   `message_id+action_id+operator_uid`，`client_token` 只是关联 ID）+ bot 重写
