@@ -24,12 +24,14 @@ package message
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/internal/cardactiondispatch"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
@@ -245,9 +247,30 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 	if actionData != nil {
 		eventData["data"] = actionData
 	}
-	eventID, err := m.robotService.EnqueueBotTypedEvent(msgM.FromUID, cardmsg.EventTypeCardAction, eventData)
+	owner, actionType := cardActionRouteMetadata(actionData)
+	eventID, err := m.enqueueCardAction(msgM.FromUID, owner, actionType, eventData, cardactiondispatch.Event{
+		SenderUID:   msgM.FromUID,
+		Owner:       owner,
+		ActionType:  actionType,
+		MessageID:   req.MessageID,
+		ChannelID:   req.ChannelID,
+		ChannelType: req.ChannelType,
+		SpaceID:     stringEventField(eventData, "space_id"),
+		ActionID:    req.ActionID,
+		OperatorUID: loginUID,
+		ClientToken: req.ClientToken,
+		ActedAt:     eventData["acted_at"].(int64),
+		Inputs:      req.Inputs,
+		Data:        actionData,
+	})
 	if err != nil {
 		m.releaseCardClaim(idemKey)
+		if errors.Is(err, errInternalCardActionRouteRejected) {
+			m.Warn("内部 card_action 路由未注册,拒绝", zap.String("sender_uid", msgM.FromUID),
+				zap.String("owner", owner), zap.String("action_type", actionType))
+			httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
+			return
+		}
 		m.Error("card_action 事件入队失败,已释放幂等 claim", zap.Error(err), zap.String("botUID", msgM.FromUID))
 		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
@@ -258,6 +281,38 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 		m.Warn("卡片动作幂等 confirm 未生效", zap.Bool("ok", ok), zap.Error(err), zap.String("key", idemKey))
 	}
 	c.Response(map[string]interface{}{"accepted": true, "replay": false})
+}
+
+var errInternalCardActionRouteRejected = errors.New("internal card action route rejected")
+
+func (m *Message) enqueueCardAction(senderUID, owner, actionType string, botEventData map[string]interface{}, internalEvent cardactiondispatch.Event) (int64, error) {
+	service, installed := cardactiondispatch.FromContext(m.ctx)
+	if !installed {
+		return m.robotService.EnqueueBotTypedEvent(senderUID, cardmsg.EventTypeCardAction, botEventData)
+	}
+	resolution := service.Resolve(senderUID, owner, actionType)
+	switch resolution.Kind {
+	case cardactiondispatch.ResolutionCallback:
+		return service.Enqueue(internalEvent)
+	case cardactiondispatch.ResolutionReject:
+		return 0, errInternalCardActionRouteRejected
+	default:
+		return m.robotService.EnqueueBotTypedEvent(senderUID, cardmsg.EventTypeCardAction, botEventData)
+	}
+}
+
+func cardActionRouteMetadata(data map[string]interface{}) (string, string) {
+	if data == nil {
+		return "", ""
+	}
+	owner, _ := data["owner"].(string)
+	actionType, _ := data["action_type"].(string)
+	return strings.TrimSpace(owner), strings.TrimSpace(actionType)
+}
+
+func stringEventField(data map[string]interface{}, key string) string {
+	value, _ := data[key].(string)
+	return value
 }
 
 // releaseCardClaim 补偿释放首次校验失败 / 入队失败的幂等 claim（P1-4：首次 claim

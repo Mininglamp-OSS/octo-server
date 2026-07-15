@@ -14,6 +14,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardrevision"
@@ -930,22 +931,10 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 
 	editedAt := int(time.Now().Unix())
 	if hasCardSeq {
-		// P2 D9：带 card_seq 的卡片编辑走条件 CAS。并发首帧在 InnoDB 下可能因
-		// insert-intention gap-lock 互相死锁（1213）—— 死锁是瞬时的，有界重试即可
-		// 化解：一旦某帧提交、行已存在，后续事务的 SELECT ... FOR UPDATE 只取记录锁，
-		// 不再产生 gap-lock 死锁；重试中重读到已提交的更高 seq 后要么应用要么按 CAS
-		// 拒绝，"最高 seq 必胜"不变量成立。
-		var (
-			conflict bool
-			casErr   error
-		)
-		for attempt := 0; attempt < cardSeqCASMaxAttempts; attempt++ {
-			conflict, casErr = ba.cardSeqCASWrite(req.MessageID, req.MessageSeq, fakeChannelID, req.ChannelType, contentEdit, contentMD5, editedAt, cardSeq)
-			if casErr == nil || !isRetriableMySQLLockErr(casErr) {
-				break
-			}
-			time.Sleep(time.Duration(attempt+1) * 3 * time.Millisecond)
-		}
+		// P2 D9：带 card_seq 的卡片编辑走共享条件 CAS。生产 CardMutator 的 backend
+		// 已统一承担 InnoDB 死锁/锁等待的有界重试；这里单次委托，避免嵌套重试把
+		// 最坏事务次数从 5 放大到 25。
+		conflict, casErr := ba.cardSeqCASWrite(req.MessageID, req.MessageSeq, fakeChannelID, req.ChannelType, contentEdit, contentMD5, editedAt, cardSeq)
 		if casErr != nil {
 			ba.Error("card_seq CAS 写入编辑内容失败！", zap.Error(casErr), zap.String("messageID", req.MessageID))
 			httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
@@ -1018,8 +1007,8 @@ const cardSeqCASMaxAttempts = 5
 // cardSeqCASWrite 执行 P2 D9 的 card_seq 条件 CAS 写：事务内 SELECT ... FOR UPDATE
 // 锁住该消息的 message_extra 行（不存在则取 next-key 锁串行化并发首帧），比对已存
 // card_seq —— 新值 ≤ 已存（非 NULL）→ 返回 conflict=true（乱序/迟到帧，什么都不写）；
-// 否则连 card_seq 一并 upsert 并提交。返回的 err 若是可重试锁错误（1213/1205），
-// 由调用方有界重试化解（死锁瞬时；重试后重读已提交的更高 seq，仍按 CAS 判定）。
+// 否则连 card_seq 一并 upsert 并提交。生产路径的可重试锁错误（1213/1205）由共享
+// CardMutator backend 统一有界重试；此处不再叠加第二层重试。
 //
 // P1-2（PR#548 review）：message_extra.version 在**拿到行锁之后**才分配。GenSeq
 // 是每-channel 单调递增,而 delta-sync 按 version 升序取增量帧
@@ -1029,6 +1018,13 @@ const cardSeqCASMaxAttempts = 5
 // 不可见,违反 D6"各端收敛"/D9"no lost-update"）。锁内分配把竞争写的 GenSeq 调用按
 // 提交顺序串行化：赢家写（最大 seq、最后一次 advancing 写）必得最大 version。
 func (ba *BotAPI) cardSeqCASWrite(messageID string, messageSeq uint32, fakeChannelID string, channelType uint8, contentEdit, contentMD5 string, editedAt int, cardSeq int64) (conflict bool, err error) {
+	if ba.cardMutator != nil {
+		return ba.cardMutator.WriteCAS(carddispatch.CardMutationCASRequest{
+			MessageID: messageID, MessageSeq: messageSeq, ChannelID: fakeChannelID,
+			ChannelType: channelType, ContentEdit: contentEdit, ContentHash: contentMD5,
+			EditedAt: editedAt, CardSeq: cardSeq, StorageChannel: true,
+		})
+	}
 	tx, err := ba.ctx.DB().Begin()
 	if err != nil {
 		return false, err

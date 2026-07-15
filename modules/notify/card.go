@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -289,7 +291,11 @@ func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error
 		return nil, errNotifyCardInvalid
 	}
 	if card.Kind != DocsCardKindShared && card.Kind != DocsCardKindCommented &&
-		card.Kind != DocsCardKindAccessRequested {
+		card.Kind != DocsCardKindAccessRequested && card.Kind != DocsCardKindAccessGranted &&
+		card.Kind != DocsCardKindAccessDenied {
+		return nil, errNotifyCardInvalid
+	}
+	if card.Kind == DocsCardKindAccessRequested && docsApprovalCardsEnabled() && strings.TrimSpace(card.RequestID) == "" {
 		return nil, errNotifyCardInvalid
 	}
 
@@ -320,9 +326,19 @@ func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error
 	lang := i18n.OutboundLanguage(context.Background())
 
 	canCard := n.docsSender != nil && cardmsg.Enabled()
+	profile := cardmsg.ProfileV1
 	var document json.RawMessage
 	if canCard {
-		doc, buildErr := n.buildDocsCard(context.Background(), req.SpaceID, card, lang)
+		var (
+			doc      json.RawMessage
+			buildErr error
+		)
+		if card.Kind == DocsCardKindAccessRequested && docsApprovalCardsEnabled() {
+			profile = cardmsg.ProfileV2
+			doc, buildErr = n.buildDocsAccessRequestCard(context.Background(), req.SpaceID, card, lang)
+		} else {
+			doc, buildErr = n.buildDocsCard(context.Background(), req.SpaceID, card, lang)
+		}
 		if buildErr != nil {
 			n.Warn("build docs card failed, degrading to text",
 				zap.Error(buildErr), zap.String("space_id", req.SpaceID), zap.String("doc_id", card.DocID))
@@ -356,7 +372,7 @@ func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error
 						ChannelID:   uid,
 						ChannelType: common.ChannelTypePerson.Uint8(),
 					},
-					carddispatch.Card{Profile: cardmsg.ProfileV1, Document: document},
+					carddispatch.Card{Profile: profile, Document: document},
 				)
 				if sendErr != nil {
 					reason = string(carddispatch.CategoryOf(sendErr))
@@ -404,7 +420,8 @@ func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error
 func (n *Notify) buildDocsCard(ctx context.Context, spaceID string, card *DocsCardFields, lang string) (json.RawMessage, error) {
 	labels := docsLabelsFor(lang)
 	facts := make([]cardtmpl.Fact, 0, 2)
-	if actor := strings.TrimSpace(card.ActorName); actor != "" {
+	isOutcome := card.Kind == DocsCardKindAccessGranted || card.Kind == DocsCardKindAccessDenied
+	if actor := strings.TrimSpace(card.ActorName); actor != "" && !isOutcome {
 		facts = append(facts, cardtmpl.Fact{Title: labels.actor, Value: actor})
 	}
 	if ts := strings.TrimSpace(card.UpdatedAt); ts != "" {
@@ -417,11 +434,55 @@ func (n *Notify) buildDocsCard(ctx context.Context, spaceID string, card *DocsCa
 	return cardtmpl.BuildDocsResourceCard(ctx, webLoginURL, card.DocID, spaceID, cardtmpl.ResourceCard{
 		Title:       card.Title,
 		Attribution: attribution,
-		Excerpt:     strings.TrimSpace(card.Excerpt),
+		Excerpt:     docsSafeExcerpt(card),
 		Facts:       facts,
 		Variant:     variant,
 		Source:      cardtmpl.Source{Label: labels.sourceLabel},
 	})
+}
+
+func (n *Notify) buildDocsAccessRequestCard(ctx context.Context, spaceID string, card *DocsCardFields, lang string) (json.RawMessage, error) {
+	labels := docsLabelsFor(lang)
+	facts := make([]cardtmpl.Fact, 0, 2)
+	if actor := strings.TrimSpace(card.ActorName); actor != "" {
+		facts = append(facts, cardtmpl.Fact{Title: labels.actor, Value: actor})
+	}
+	if ts := strings.TrimSpace(card.UpdatedAt); ts != "" {
+		facts = append(facts, cardtmpl.Fact{Title: labels.updatedAt, Value: ts})
+	}
+	attribution, variant := docsAttributionAndVariant(card.Kind, card.ActorName, labels)
+	return cardtmpl.BuildDocsAccessRequestCard(
+		ctx,
+		n.ctx.GetConfig().External.WebLoginURL,
+		card.DocID,
+		card.RequestID,
+		spaceID,
+		cardtmpl.ResourceCard{
+			Title:       card.Title,
+			Attribution: attribution,
+			Excerpt:     strings.TrimSpace(card.Excerpt),
+			Facts:       facts,
+			Variant:     variant,
+			Source:      cardtmpl.Source{Label: labels.sourceLabel},
+		},
+		cardtmpl.ApprovalActions{ApproveTitle: labels.approve, DenyTitle: labels.deny},
+	)
+}
+
+func docsApprovalCardsEnabled() bool {
+	enabled, err := strconv.ParseBool(os.Getenv("OCTO_DOCS_APPROVAL_CARD_ENABLED"))
+	return err == nil && enabled
+}
+
+// DocsApprovalCardsEnabled exposes the rollout decision to the composition
+// root so producer capability and callback routing fail closed together.
+func DocsApprovalCardsEnabled() bool { return docsApprovalCardsEnabled() }
+
+func docsSafeExcerpt(card *DocsCardFields) string {
+	if card == nil || card.Kind == DocsCardKindAccessGranted || card.Kind == DocsCardKindAccessDenied {
+		return ""
+	}
+	return strings.TrimSpace(card.Excerpt)
 }
 
 // docsAttributionAndVariant maps DocsCard.Kind to a (localized attribution
@@ -430,6 +491,10 @@ func (n *Notify) buildDocsCard(ctx context.Context, spaceID string, card *DocsCa
 func docsAttributionAndVariant(kind, actorName string, labels docsLabels) (string, string) {
 	actor := strings.TrimSpace(actorName)
 	switch kind {
+	case DocsCardKindAccessGranted:
+		return labels.accessGrantedBanner, "docs.access_granted"
+	case DocsCardKindAccessDenied:
+		return labels.accessDeniedBanner, "docs.access_denied"
 	case DocsCardKindCommented:
 		if actor != "" {
 			return fmt.Sprintf(labels.commentedBanner, actor), "docs.commented"
@@ -456,13 +521,17 @@ func buildDocsFallbackText(card *DocsCardFields, lang string) string {
 	labels := docsLabelsFor(lang)
 	// sanitizeLine the actor before it flows into the attribution line, and each
 	// other caller field, so an embedded newline can't inject a spoofed line.
-	attribution, _ := docsAttributionAndVariant(card.Kind, sanitizeLine(card.ActorName), labels)
+	actorName := card.ActorName
+	if card.Kind == DocsCardKindAccessGranted || card.Kind == DocsCardKindAccessDenied {
+		actorName = ""
+	}
+	attribution, _ := docsAttributionAndVariant(card.Kind, sanitizeLine(actorName), labels)
 	var b strings.Builder
 	b.WriteString(attribution)
 	if title := sanitizeLine(card.Title); title != "" {
 		fmt.Fprintf(&b, "\n%s%s", labels.title+labels.kvSep, title)
 	}
-	if excerpt := sanitizeLine(card.Excerpt); excerpt != "" {
+	if excerpt := sanitizeLine(docsSafeExcerpt(card)); excerpt != "" {
 		fmt.Fprintf(&b, "\n%s", excerpt)
 	}
 	if ts := sanitizeLine(card.UpdatedAt); ts != "" {
@@ -478,6 +547,12 @@ type docsLabels struct {
 	commentedBannerAnon       string
 	accessRequestedBanner     string
 	accessRequestedBannerAnon string
+	accessGrantedBanner       string
+	accessDeniedBanner        string
+	accessCancelledBanner     string
+	accessUnavailableBanner   string
+	approve                   string
+	deny                      string
 	title                     string
 	actor                     string
 	updatedAt                 string
@@ -494,6 +569,12 @@ func docsLabelsFor(lang string) docsLabels {
 			commentedBannerAnon:       "有新评论",
 			accessRequestedBanner:     "%s 请求访问文档",
 			accessRequestedBannerAnon: "有人请求访问文档",
+			accessGrantedBanner:       "文档访问已获批准",
+			accessDeniedBanner:        "访问申请已拒绝",
+			accessCancelledBanner:     "访问申请已取消",
+			accessUnavailableBanner:   "当前无法处理此访问申请",
+			approve:                   "允许",
+			deny:                      "拒绝",
 			title:                     "文档",
 			actor:                     "操作人",
 			updatedAt:                 "时间",
@@ -508,6 +589,12 @@ func docsLabelsFor(lang string) docsLabels {
 		commentedBannerAnon:       "A new comment on a document",
 		accessRequestedBanner:     "%s requested access to a document",
 		accessRequestedBannerAnon: "Someone requested access to a document",
+		accessGrantedBanner:       "Document access granted",
+		accessDeniedBanner:        "Document access request denied",
+		accessCancelledBanner:     "Document access request cancelled",
+		accessUnavailableBanner:   "This access request is no longer actionable",
+		approve:                   "Allow",
+		deny:                      "Deny",
 		title:                     "Document",
 		actor:                     "By",
 		updatedAt:                 "At",
