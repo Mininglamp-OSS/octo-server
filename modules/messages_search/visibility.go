@@ -165,6 +165,33 @@ type msgRef struct {
 	Visibles   []string // sender-set allowlist; non-empty => caller must be in it
 }
 
+// filterVisibleChunkSize bounds the id / channel count in any single probe
+// round-trip so the underlying `... IN (?)` clauses never balloon. The presence
+// batch can present up to maxGroups × T ids at once; the message.IService
+// queries do not chunk internally, so this is where the width is capped.
+const filterVisibleChunkSize = 1000
+
+// chunkStrings splits s into consecutive slices of at most size elements
+// (size <= 0 falls back to a single chunk). Empty input yields no chunks so a
+// zero-id call makes zero round-trips.
+func chunkStrings(s []string, size int) [][]string {
+	if len(s) == 0 {
+		return nil
+	}
+	if size <= 0 {
+		return [][]string{s}
+	}
+	out := make([][]string, 0, (len(s)+size-1)/size)
+	for i := 0; i < len(s); i += size {
+		end := i + size
+		if end > len(s) {
+			end = len(s)
+		}
+		out = append(out, s[i:end])
+	}
+	return out
+}
+
 // filterVisible is the search-side analogue of message.filterMessages. It
 // rejects hits the caller must NOT see based on the same five signals the
 // /messages and /channel_files read paths consult:
@@ -214,17 +241,40 @@ func (h *Handler) filterVisible(ctx context.Context, loginUID, channelID string,
 		uniqueIDs = append(uniqueIDs, r.MessageID)
 	}
 
-	revokedSet, err := h.visibility.RevokedSet(uniqueIDs)
-	if err != nil {
-		return nil, fmt.Errorf("filterVisible: RevokedSet: %w", err)
-	}
-	deletedSet, err := h.visibility.GloballyDeletedSet(uniqueIDs)
-	if err != nil {
-		return nil, fmt.Errorf("filterVisible: GloballyDeletedSet: %w", err)
-	}
-	userDeletedSet, err := h.visibility.UserDeletedSet(loginUID, uniqueIDs)
-	if err != nil {
-		return nil, fmt.Errorf("filterVisible: UserDeletedSet: %w", err)
+	// Chunk the id set before hitting the probe. The presence batch
+	// (calibratePresence) can hand us up to maxGroups × T (200 × 40 = 8000)
+	// unique ids in one shot, and the underlying message.IService queries build
+	// a single `message_id IN (?)` clause with NO chunking — an 8000-element IN
+	// risks blowing the driver's placeholder budget / max_allowed_packet and
+	// planning a pathological scan. Chunking here keeps every IN bounded
+	// regardless of the probe implementation. Single-channel callers stay a
+	// single chunk (their pages are pageSize-bounded), so their round-trip shape
+	// is byte-identical to before.
+	revokedSet := make(map[string]struct{}, len(uniqueIDs))
+	deletedSet := make(map[string]struct{}, len(uniqueIDs))
+	userDeletedSet := make(map[string]struct{}, len(uniqueIDs))
+	for _, chunk := range chunkStrings(uniqueIDs, filterVisibleChunkSize) {
+		rs, err := h.visibility.RevokedSet(chunk)
+		if err != nil {
+			return nil, fmt.Errorf("filterVisible: RevokedSet: %w", err)
+		}
+		for id := range rs {
+			revokedSet[id] = struct{}{}
+		}
+		ds, err := h.visibility.GloballyDeletedSet(chunk)
+		if err != nil {
+			return nil, fmt.Errorf("filterVisible: GloballyDeletedSet: %w", err)
+		}
+		for id := range ds {
+			deletedSet[id] = struct{}{}
+		}
+		uds, err := h.visibility.UserDeletedSet(loginUID, chunk)
+		if err != nil {
+			return nil, fmt.Errorf("filterVisible: UserDeletedSet: %w", err)
+		}
+		for id := range uds {
+			userDeletedSet[id] = struct{}{}
+		}
 	}
 	// Multi-channel channel-offset lookup (§8.2 generalisation). Each hit is
 	// gated by its own room's clear-history watermark instead of a single
@@ -253,9 +303,15 @@ func (h *Handler) filterVisible(ctx context.Context, loginUID, channelID string,
 	for id := range channelSet {
 		channelList = append(channelList, id)
 	}
-	offsets, err := h.visibility.ChannelOffsets(loginUID, channelList)
-	if err != nil {
-		return nil, fmt.Errorf("filterVisible: ChannelOffsets: %w", err)
+	offsets := make(map[string]uint32, len(channelList))
+	for _, chunk := range chunkStrings(channelList, filterVisibleChunkSize) {
+		part, err := h.visibility.ChannelOffsets(loginUID, chunk)
+		if err != nil {
+			return nil, fmt.Errorf("filterVisible: ChannelOffsets: %w", err)
+		}
+		for id, seq := range part {
+			offsets[id] = seq
+		}
 	}
 
 	keep := make(map[string]struct{}, len(refs))

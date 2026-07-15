@@ -91,7 +91,7 @@ func TestAssembleGroupBucket_DMReversal(t *testing.T) {
 	loginUID, peerUID := "me", "peer99"
 	key := fakeChannelIDFor(loginUID, peerUID)
 	pb := parsedBucket{key: key, docCount: 8, latestTS: 1_700_000_000}
-	gb := assembleGroupBucket(pb, nil, loginUID, nil, nil, map[string]string{peerUID: "张三"})
+	gb := assembleGroupBucket(pb, pb.latestTS, nil, loginUID, nil, nil, map[string]string{peerUID: "张三"})
 
 	if gb.ChannelType != channelTypePerson {
 		t.Errorf("DM bucket channel_type=1; got %d", gb.ChannelType)
@@ -119,7 +119,7 @@ func TestAssembleGroupBucket_Thread(t *testing.T) {
 	groupNo, shortID := "gA", "thr1"
 	key := thread.BuildChannelID(groupNo, shortID)
 	pb := parsedBucket{key: key, docCount: 12, latestTS: 1_700_000_100}
-	gb := assembleGroupBucket(pb, []MessageHit{}, loginUID,
+	gb := assembleGroupBucket(pb, pb.latestTS, []MessageHit{}, loginUID,
 		map[string]string{groupNo: "项目群"}, map[string]string{shortID: "需求评审"}, nil)
 
 	if gb.ChannelType != channelTypeThread {
@@ -144,7 +144,7 @@ func TestAssembleGroupBucket_Thread(t *testing.T) {
 
 func TestAssembleGroupBucket_Group(t *testing.T) {
 	pb := parsedBucket{key: "gZ", docCount: 128, latestTS: 1_700_000_200}
-	gb := assembleGroupBucket(pb, nil, "me", map[string]string{"gZ": "大群"}, nil, nil)
+	gb := assembleGroupBucket(pb, pb.latestTS, nil, "me", map[string]string{"gZ": "大群"}, nil, nil)
 
 	if gb.ChannelType != channelTypeGroup {
 		t.Errorf("group bucket channel_type=2; got %d", gb.ChannelType)
@@ -157,6 +157,44 @@ func TestAssembleGroupBucket_Group(t *testing.T) {
 	}
 	if gb.GroupName != "大群" {
 		t.Errorf("group_name mismatch; got %q", gb.GroupName)
+	}
+}
+
+// TestSortByVisibleLatest_NotBiasedByHiddenHits is the RC ordering regression:
+// bucket order must follow the CALIBRATED visible latest_at, not the OS
+// pre-filter max. gHidden has the newest pre-filter max (its newest match is
+// hidden) but the OLDEST visible hit — it must sort LAST, not first.
+func TestSortByVisibleLatest_NotBiasedByHiddenHits(t *testing.T) {
+	calibrated := []calibratedBucket{
+		// OS candidate order (pre-filter max desc): gHidden, gA, gB.
+		{pb: parsedBucket{key: "gHidden", latestTS: 1_700_009_999}, latestVisibleTS: 1_700_000_000},
+		{pb: parsedBucket{key: "gA", latestTS: 1_700_000_500}, latestVisibleTS: 1_700_000_500},
+		{pb: parsedBucket{key: "gB", latestTS: 1_700_000_300}, latestVisibleTS: 1_700_000_300},
+	}
+	sortByVisibleLatest(calibrated)
+
+	gotOrder := []string{calibrated[0].pb.key, calibrated[1].pb.key, calibrated[2].pb.key}
+	wantOrder := []string{"gA", "gB", "gHidden"}
+	for i := range wantOrder {
+		if gotOrder[i] != wantOrder[i] {
+			t.Fatalf("visible-latest order = %v; want %v (gHidden must not jump the order via its hidden newest match)", gotOrder, wantOrder)
+		}
+	}
+}
+
+// TestSortByVisibleLatest_StableTiebreak — equal visible latest_at keeps the OS
+// candidate order (input order) as a deterministic tiebreak.
+func TestSortByVisibleLatest_StableTiebreak(t *testing.T) {
+	calibrated := []calibratedBucket{
+		{pb: parsedBucket{key: "first"}, latestVisibleTS: 1_700_000_000},
+		{pb: parsedBucket{key: "second"}, latestVisibleTS: 1_700_000_000},
+		{pb: parsedBucket{key: "third"}, latestVisibleTS: 1_700_000_000},
+	}
+	sortByVisibleLatest(calibrated)
+	for i, want := range []string{"first", "second", "third"} {
+		if calibrated[i].pb.key != want {
+			t.Errorf("stable tiebreak broken at %d: got %q want %q", i, calibrated[i].pb.key, want)
+		}
 	}
 }
 

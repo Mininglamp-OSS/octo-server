@@ -2,6 +2,7 @@ package messages_search
 
 import (
 	"context"
+	"encoding/json"
 	"sort"
 	"time"
 
@@ -19,9 +20,17 @@ const deepProbePageSize = 50
 // (INCLUDE): it carries the visible hits (most-recent-first) drawn either from
 // the top-T sample or discovered by the deep probe. EXCLUDE buckets are dropped
 // before this stage so they never reach the wire.
+//
+// latestVisibleTS is the timestamp (ms) of the most-recent VISIBLE hit
+// (visible[0]) — the RC fix. The wire `latest_at` and the returned bucket order
+// must both derive from this, NOT from the OS pre-filter max(timestamp) held in
+// pb.latestTS: if the newest match in a bucket is hidden (admin/self-deleted,
+// cleared history, visibles), the OS max would leak that hidden message's
+// recency into latest_at and pull the bucket up the latest-first order.
 type calibratedBucket struct {
-	pb      parsedBucket
-	visible []*elastic.SearchHit
+	pb              parsedBucket
+	visible         []*elastic.SearchHit
+	latestVisibleTS int64
 }
 
 // presenceStats is the §7 埋点 for the presence pass: how many buckets went
@@ -99,7 +108,7 @@ func (h *Handler) calibratePresence(
 		switch classifyPresence(len(pb.hits), pb.docCount, len(vis)) {
 		case presenceInclude:
 			// ≥1 visible hit in the sample.
-			out = append(out, calibratedBucket{pb: pb, visible: vis})
+			out = append(out, calibratedBucket{pb: pb, visible: vis, latestVisibleTS: latestVisibleTS(vis)})
 		case presenceExclude:
 			// 0 visible and the top-T already covered the whole bucket → the
 			// group has no visible hit at all → drop it.
@@ -113,7 +122,7 @@ func (h *Handler) calibratePresence(
 				return nil, stats, err
 			}
 			if found {
-				out = append(out, calibratedBucket{pb: pb, visible: dvis})
+				out = append(out, calibratedBucket{pb: pb, visible: dvis, latestVisibleTS: latestVisibleTS(dvis)})
 			}
 		}
 	}
@@ -145,6 +154,32 @@ func classifyPresence(sampleSize int, docCount int64, visibleCount int) presence
 		return presenceExclude
 	}
 	return presenceUnresolved
+}
+
+// latestVisibleTS returns the timestamp (ms) of the most-recent VISIBLE hit in
+// a calibrated bucket. visible is most-recent-first (top_hits / deep-probe both
+// sort time_desc and the filter preserves that order), so visible[0] is the
+// newest hit the caller may actually see. Empty → 0 (defensive; INCLUDE buckets
+// always carry ≥1 visible hit).
+func latestVisibleTS(visible []*elastic.SearchHit) int64 {
+	if len(visible) == 0 {
+		return 0
+	}
+	return hitTimestampMS(visible[0])
+}
+
+// hitTimestampMS reads the OS doc `timestamp` (ms) off a hit's _source. Used to
+// recompute latest_at from the calibrated visible hit rather than the OS
+// pre-filter max(timestamp), which would leak a hidden message's recency.
+func hitTimestampMS(hit *elastic.SearchHit) int64 {
+	if hit == nil {
+		return 0
+	}
+	var d Doc
+	if err := json.Unmarshal(rawSource(hit.Source), &d); err != nil {
+		return 0
+	}
+	return d.Timestamp
 }
 
 // deepProbeBucket is the UNRESOLVED old-ward probe (§2.2). It resumes strictly

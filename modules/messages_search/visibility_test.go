@@ -807,3 +807,57 @@ func TestProjectDocRef_VirtualWithZeroParentFallsBackToOwn(t *testing.T) {
 		t.Fatalf("zero parent must fall back to own id; got %q", ref.MessageID)
 	}
 }
+
+// TestFilterVisible_ChunksLargeIDSet is the RC non-blocking item: the presence
+// batch can hand filterVisible up to maxGroups × T ids, and the underlying
+// probe builds an unchunked `IN (?)`. filterVisible must split the id set into
+// filterVisibleChunkSize batches (one probe call per chunk) while still
+// filtering correctly across chunk boundaries.
+func TestFilterVisible_ChunksLargeIDSet(t *testing.T) {
+	const n = 2*filterVisibleChunkSize + 500 // 3 chunks
+	refs := make([]msgRef, n)
+	for i := 0; i < n; i++ {
+		refs[i] = msgRef{MessageID: strconv.Itoa(1_000_000 + i), MessageSeq: uint32(i + 1), ChannelID: "gA"}
+	}
+	// Hide one id that lands in the 3rd chunk so the union-across-chunks path is
+	// exercised, not just the first batch.
+	hiddenID := strconv.Itoa(1_000_000 + 2*filterVisibleChunkSize + 100)
+	probe := &stubProbe{deleted: map[string]bool{hiddenID: true}}
+	h := newVisibilityHandler(probe)
+
+	keep, err := h.filterVisible(context.Background(), "me", "", refs)
+	if err != nil {
+		t.Fatalf("filterVisible: %v", err)
+	}
+	wantChunks := (n + filterVisibleChunkSize - 1) / filterVisibleChunkSize
+	if probe.revokedCalls != wantChunks {
+		t.Errorf("RevokedSet must run once per chunk (%d); got %d", wantChunks, probe.revokedCalls)
+	}
+	if probe.deletedCalls != wantChunks {
+		t.Errorf("GloballyDeletedSet must run once per chunk (%d); got %d", wantChunks, probe.deletedCalls)
+	}
+	if probe.userDeletedCalls != wantChunks {
+		t.Errorf("UserDeletedSet must run once per chunk (%d); got %d", wantChunks, probe.userDeletedCalls)
+	}
+	if _, ok := keep[hiddenID]; ok {
+		t.Errorf("hidden id %s (3rd chunk) must be filtered out across the chunk boundary", hiddenID)
+	}
+	if len(keep) != n-1 {
+		t.Errorf("all but the 1 hidden id must be kept; got %d want %d", len(keep), n-1)
+	}
+}
+
+// TestChunkStrings covers the split helper's boundaries.
+func TestChunkStrings(t *testing.T) {
+	if got := chunkStrings(nil, 1000); got != nil {
+		t.Errorf("empty input must yield no chunks; got %v", got)
+	}
+	ids := []string{"a", "b", "c", "d", "e"}
+	got := chunkStrings(ids, 2)
+	if len(got) != 3 || len(got[0]) != 2 || len(got[2]) != 1 {
+		t.Errorf("expected [2,2,1] chunking; got %v", got)
+	}
+	if one := chunkStrings(ids, 0); len(one) != 1 || len(one[0]) != len(ids) {
+		t.Errorf("size<=0 must collapse to a single chunk; got %v", one)
+	}
+}

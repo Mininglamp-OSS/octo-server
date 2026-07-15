@@ -147,6 +147,73 @@ func TestCalibratePresence_FailClosed(t *testing.T) {
 	}
 }
 
+// TestCalibratePresence_LatestVisibleTS is the RC regression: when a bucket's
+// most-recent match is admin-deleted and an older message is visible, the
+// calibrated latest_at must be the OLDER visible message's timestamp — never
+// the hidden newest one's. This is the value assembleGroupBucket puts on the
+// wire and buildGroupsResult sorts by, so a hidden newest match can no longer
+// leak its recency or bias the bucket order.
+func TestCalibratePresence_LatestVisibleTS(t *testing.T) {
+	// hit 10 is the NEWEST match (ts 1_700_000_200) but admin-deleted; hit 11
+	// (ts 1_700_000_100) is the newest VISIBLE one.
+	pb := parsedBucket{
+		key:      "gA",
+		docCount: 2,
+		latestTS: 1_700_000_200, // OS pre-filter max — must NOT reach the wire
+		hits: []*elastic.SearchHit{
+			presenceHit(10, 2, "gA", 2, 1_700_000_200),
+			presenceHit(11, 1, "gA", 2, 1_700_000_100),
+		},
+	}
+	h := presenceHandler(&stubProbe{deleted: deletedIDs(10)}, 500)
+	var tm searchPhaseTimings
+	out, _, err := h.calibratePresence(context.Background(), nil, nil, []parsedBucket{pb}, "me", &tm)
+	if err != nil {
+		t.Fatalf("calibrate: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("bucket with an older visible hit must INCLUDE; got %d", len(out))
+	}
+	if out[0].latestVisibleTS != 1_700_000_100 {
+		t.Errorf("latest_at must be the visible hit's ts 1_700_000_100 (not the deleted newest 1_700_000_200); got %d", out[0].latestVisibleTS)
+	}
+	// The deleted newest hit must not have leaked into the visible set either.
+	for _, hit := range out[0].visible {
+		if id, _ := lastHitMessageIDAndSubSeq(hit); id == 10 {
+			t.Errorf("admin-deleted newest hit 10 leaked into the visible set")
+		}
+	}
+}
+
+// TestCalibratePresence_DeepProbeLatestVisibleTS is the UNRESOLVED-path variant
+// of the RC regression: every top-T hit is hidden, so the bucket only INCLUDEs
+// via the deep probe — and its latest_at must be the deep-probe-found visible
+// hit's timestamp, still never the OS pre-filter max.
+func TestCalibratePresence_DeepProbeLatestVisibleTS(t *testing.T) {
+	// docCount 3 with a top-T of 1 all-hidden hit → sample doesn't cover the
+	// bucket → UNRESOLVED. deepProbeBucket reuses base as an OS query, so route
+	// the probe through a Handler whose visibility hides only the newest.
+	// Here we exercise deepProbeVisible directly for a deterministic stream.
+	stream := []*elastic.SearchHit{
+		presenceHit(20, 3, "gA", 2, 1_700_000_050), // hidden (older than top-T boundary)
+		presenceHit(21, 2, "gA", 2, 1_700_000_040), // visible → newest visible
+		presenceHit(22, 1, "gA", 2, 1_700_000_030), // visible
+	}
+	f := &fakeOS{stream: stream}
+	h := presenceHandler(&stubProbe{deleted: deletedIDs(20)}, 500)
+	var tm searchPhaseTimings
+	found, vis, _, err := h.deepProbeVisible(context.Background(), "me", []any{float64(1_700_000_060), float64(19), float64(0)}, 500, f.fn(), &tm)
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if !found || len(vis) == 0 {
+		t.Fatal("expected the probe to find a visible hit")
+	}
+	if got := latestVisibleTS(vis); got != 1_700_000_040 {
+		t.Errorf("deep-probe latest_at must be the newest visible hit ts 1_700_000_040; got %d", got)
+	}
+}
+
 // --- deepProbeVisible: first-visible / exhausted / K2 budget (②③⑥⑦) --------
 
 // fakeOS models an OpenSearch search_after stream: it returns up to `size` hits

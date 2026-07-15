@@ -3,6 +3,7 @@ package messages_search
 import (
 	"context"
 	"encoding/json"
+	"sort"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
@@ -43,7 +44,9 @@ type GroupsResult struct {
 // thread fields; group buckets set parent_group_no to their own channel_id;
 // thread buckets (channel_type=5) carry parent_group_no + thread_id +
 // thread_name. match_count is the OS doc_count (pre-visibility) so
-// match_count_approx is always true.
+// match_count_approx is always true. latest_at, by contrast, is recomputed from
+// the calibrated visible hit (see calibratedBucket.latestVisibleTS) — never the
+// OS pre-filter max(timestamp) — so a hidden newest match cannot leak its time.
 type GroupBucket struct {
 	ChannelID        string       `json:"channel_id"`
 	ChannelType      uint8        `json:"channel_type"`
@@ -196,9 +199,13 @@ func applyVisiblesWhitelist(b *elastic.BoolQuery, loginUID string) {
 }
 
 // runGroupsAggregation issues the single size:0 terms(channelId) aggregation.
-// Each bucket carries max(timestamp) (latest_at), a top_hits over-fetch of
+// Each bucket carries max(timestamp), a top_hits over-fetch of
 // T=perGroupMax+presenceProbe (preview + backend-B calibration headroom); a
-// sibling cardinality(channelId) yields the approximate total_groups.
+// sibling cardinality(channelId) yields the approximate total_groups. The
+// max(timestamp) sub-agg orders the terms buckets so we pick the latest-active
+// maxGroups CANDIDATES — it is NOT the wire latest_at: that is recomputed from
+// the calibrated visible hit in buildGroupsResult (RC fix), which also re-sorts
+// the survivors by that visible time.
 func (h *Handler) runGroupsAggregation(ctx context.Context, client *elastic.Client, query elastic.Query, withHighlight bool) (*elastic.SearchResult, error) {
 	gc := h.cfg.Groups
 	preview := elastic.NewTopHitsAggregation().
@@ -224,7 +231,10 @@ func (h *Handler) runGroupsAggregation(ctx context.Context, client *elastic.Clie
 		Do(ctx)
 }
 
-// parsedBucket is the pre-projection view of one terms bucket.
+// parsedBucket is the pre-projection view of one terms bucket. latestTS is the
+// OS pre-filter max(timestamp) — retained for the terms candidate ordering and
+// diagnostics only; it is NOT the wire latest_at (which is recomputed from the
+// calibrated visible hit — see calibratedBucket.latestVisibleTS).
 type parsedBucket struct {
 	key      string
 	docCount int64
@@ -261,6 +271,18 @@ func (h *Handler) buildGroupsResult(ctx context.Context, c *wkhttp.Context, res 
 		return result, false, err
 	}
 
+	// RC fix: latest_at and the returned bucket order must reflect the
+	// CALIBRATED visible hit, never the OS pre-filter max(timestamp). The OS
+	// terms agg still orders CANDIDATES by pre-filter max — that only decides
+	// which maxGroups buckets we look at, and since visible ⊆ all a bucket whose
+	// visible latest is recent also has an at-least-as-recent pre-filter max, so
+	// no bucket that should surface is dropped from the candidate set. But the
+	// FINAL order returned to the client is re-sorted here by the visible
+	// latest_at, so a bucket whose newest match is hidden (admin/self-deleted,
+	// cleared history, visibles) no longer jumps the order or leaks its hidden
+	// recency.
+	sortByVisibleLatest(calibrated)
+
 	// Per-frequency N allocation (§4): spread previewBudget across the surviving
 	// buckets weighted by match frequency, then take the most-recent N visible
 	// rows per bucket.
@@ -294,9 +316,20 @@ func (h *Handler) buildGroupsResult(ctx context.Context, c *wkhttp.Context, res 
 	previews := h.projectPreview(ctx, visibleHits, loginUID)
 
 	for i, cb := range calibrated {
-		result.Groups = append(result.Groups, assembleGroupBucket(cb.pb, previews[i], loginUID, groupNames, threadNames, peerNames))
+		result.Groups = append(result.Groups, assembleGroupBucket(cb.pb, cb.latestVisibleTS, previews[i], loginUID, groupNames, threadNames, peerNames))
 	}
 	return result, hasMore, nil
+}
+
+// sortByVisibleLatest reorders the calibrated buckets most-recent-first by the
+// CALIBRATED visible latest_at (RC fix, §2.2). Stable, so equal-timestamp
+// buckets keep the OS candidate order (pre-filter max desc) as a deterministic
+// tiebreak. This is the guarantee that a bucket whose newest match is hidden
+// cannot bias the returned order by its hidden recency.
+func sortByVisibleLatest(calibrated []calibratedBucket) {
+	sort.SliceStable(calibrated, func(i, j int) bool {
+		return calibrated[i].latestVisibleTS > calibrated[j].latestVisibleTS
+	})
 }
 
 // parseGroupsAggregation is the pure (I/O-free) reader of the OS aggregation
@@ -401,9 +434,12 @@ func classifyGroupBucket(key, loginUID string) (channelType uint8, wireID, paren
 }
 
 // assembleGroupBucket builds the wire bucket from the parsed bucket + resolved
-// name maps. Pure (no I/O) so the DM reversal / thread parent_group_no / group
+// name maps. latestAtMS is the CALIBRATED visible latest_at (calibratedBucket
+// .latestVisibleTS) — deliberately passed in rather than read from pb.latestTS
+// (the OS pre-filter max) so a hidden newest match never leaks its timestamp
+// (RC fix). Pure (no I/O) so the DM reversal / thread parent_group_no / group
 // shapes are unit-testable without OS or MySQL.
-func assembleGroupBucket(pb parsedBucket, preview []MessageHit, loginUID string, groupNames, threadNames, peerNames map[string]string) GroupBucket {
+func assembleGroupBucket(pb parsedBucket, latestAtMS int64, preview []MessageHit, loginUID string, groupNames, threadNames, peerNames map[string]string) GroupBucket {
 	if preview == nil {
 		preview = []MessageHit{}
 	}
@@ -413,7 +449,7 @@ func assembleGroupBucket(pb parsedBucket, preview []MessageHit, loginUID string,
 		ChannelType:      ct,
 		MatchCount:       pb.docCount,
 		MatchCountApprox: true,
-		LatestAt:         msToRFC3339(pb.latestTS),
+		LatestAt:         msToRFC3339(latestAtMS),
 		Preview:          preview,
 	}
 	switch ct {
