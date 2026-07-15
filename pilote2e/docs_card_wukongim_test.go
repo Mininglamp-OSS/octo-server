@@ -93,7 +93,8 @@ func TestDocsNotify_HTTPEndpointDeliversCardToWuKongIM(t *testing.T) {
 	t.Setenv(cardmsg.EnvEnabled, "true")
 	t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
 	t.Setenv("OCTO_USER_API_KEY_SECRET", "0123456789abcdef0123456789abcdef")
-	t.Setenv("NOTIFY_INTERNAL_TOKEN", "pilote2e-docs-token")
+	t.Setenv("NOTIFY_INTERNAL_TOKEN", "pilote2e-default-token")
+	t.Setenv("OCTO_DOCS_NOTIFY_TOKEN", "pilote2e-docs-token")
 
 	recipient := fmt.Sprintf("uid_pilote2e_docs_%d", time.Now().UnixNano())
 
@@ -180,6 +181,7 @@ func TestSummaryAndDocsNotify_NoRegression(t *testing.T) {
 	t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
 	t.Setenv("OCTO_USER_API_KEY_SECRET", "0123456789abcdef0123456789abcdef")
 	t.Setenv("NOTIFY_INTERNAL_TOKEN", "pilote2e-both-token")
+	t.Setenv("OCTO_DOCS_NOTIFY_TOKEN", "pilote2e-both-docs-token")
 
 	recipient := fmt.Sprintf("uid_pilote2e_both_%d", time.Now().UnixNano())
 
@@ -217,9 +219,9 @@ func TestSummaryAndDocsNotify_NoRegression(t *testing.T) {
 	n.Route(r)
 	r.SetErrorRenderer(octoi18n.NewErrorRenderer(octoi18n.NewLocalizer(octoi18n.DefaultLanguage)))
 
-	postJSON := func(t *testing.T, body []byte, expected string) {
+	postJSON := func(t *testing.T, token string, body []byte, expected string) {
 		t.Helper()
-		delivered, lastCode, lastBody := postUntilDelivered(t, r, "/v1/internal/notify", "pilote2e-both-token", body, expected)
+		delivered, lastCode, lastBody := postUntilDelivered(t, r, "/v1/internal/notify", token, body, expected)
 		require.Equal(t, http.StatusOK, lastCode, "notify POST must succeed (last body: %s)", truncate(lastBody))
 		require.Contains(t, delivered, expected, "recipient must be delivered")
 	}
@@ -238,8 +240,8 @@ func TestSummaryAndDocsNotify_NoRegression(t *testing.T) {
 			ActorName: "Bob", Excerpt: "review please",
 		},
 	})
-	postJSON(t, summaryBody, recipient)
-	postJSON(t, docsBody, recipient)
+	postJSON(t, "pilote2e-both-token", summaryBody, recipient)
+	postJSON(t, "pilote2e-both-docs-token", docsBody, recipient)
 
 	// Both cards must be readable back from WuKongIM under the recipient's
 	// notification-bot DM channel. Read all persisted type-17s and assert both

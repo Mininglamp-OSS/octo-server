@@ -37,6 +37,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-server/internal/cardactiondispatch"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/app_bot"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/robot"
@@ -46,6 +47,116 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func cardV2InternalEnvelopeJSON(t *testing.T, actionID, actionType string) []byte {
+	t.Helper()
+	envelope := map[string]interface{}{
+		"type":         cardmsg.InteractiveCard.Int(),
+		"card_version": cardmsg.CardVersion,
+		"profile":      cardmsg.ProfileV2,
+		"plain":        "文档访问申请",
+		"space_id":     "space-1",
+		"card": map[string]interface{}{
+			"type": "AdaptiveCard", "version": cardmsg.CardVersion,
+			"body": []interface{}{map[string]interface{}{"type": "TextBlock", "text": "文档访问申请"}},
+			"actions": []interface{}{map[string]interface{}{
+				"type": "Action.Submit", "id": actionID, "title": actionID,
+				"data": map[string]interface{}{
+					"owner": "docs", "action_type": actionType, "decision": "approve",
+					"doc_id": "doc-1", "request_id": "request-1",
+				},
+			}},
+		},
+	}
+	raw, err := json.Marshal(envelope)
+	require.NoError(t, err)
+	return raw
+}
+
+func TestCardActionSenderBoundCallbackRouting(t *testing.T) {
+	t.Setenv(cardmsg.EnvEnabled, "true")
+	t.Setenv("OCTO_DOCS_CARD_ACTION_SECRET", "0123456789abcdef0123456789abcdef")
+	t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
+	s, ctx := testutil.NewTestServer()
+	defer func() { _ = testutil.CleanAllTables(ctx) }()
+	resetCardActionState(t, ctx)
+
+	callbackURL := "https://docs.internal/v1/card-actions/decide"
+	registry, err := cardactiondispatch.NewRegistry([]cardactiondispatch.RouteSpec{{
+		SenderUID: "notification", Owner: "docs", ActionType: "access_request.decision",
+		URL: callbackURL, SecretEnv: "OCTO_DOCS_CARD_ACTION_SECRET",
+	}}, []string{callbackURL}, func(key string) string { return "0123456789abcdef0123456789abcdef" })
+	require.NoError(t, err)
+	rds := redis.NewClient(&redis.Options{Addr: ctx.GetConfig().DB.RedisAddr, Password: ctx.GetConfig().DB.RedisPass})
+	defer rds.Close()
+	queue, err := cardactiondispatch.NewRedisQueue(rds, cardactiondispatch.QueueConfig{
+		Prefix: "test:message:card_action_dispatch", LiveTTL: ctx.GetConfig().Robot.MessageExpire, DLQRetention: 30 * 24 * time.Hour,
+	})
+	require.NoError(t, err)
+	service, err := cardactiondispatch.NewService(registry, queue, ctx)
+	require.NoError(t, err)
+	require.NoError(t, cardactiondispatch.Install(ctx, service))
+
+	seedCardBot(t, ctx, "notification")
+	seedCardBot(t, ctx, "external-copy-bot")
+	notifyChannel := common.GetFakeChannelIDWith(uid, "notification")
+	externalChannel := common.GetFakeChannelIDWith(uid, "external-copy-bot")
+	seedCardMessage(t, ctx, 9701, "notification", notifyChannel, common.ChannelTypePerson.Uint8(), cardV2InternalEnvelopeJSON(t, "approve", "access_request.decision"))
+	seedCardMessage(t, ctx, 9702, "external-copy-bot", externalChannel, common.ChannelTypePerson.Uint8(), cardV2InternalEnvelopeJSON(t, "approve", "access_request.decision"))
+	seedCardMessage(t, ctx, 9703, "notification", notifyChannel, common.ChannelTypePerson.Uint8(), cardV2InternalEnvelopeJSON(t, "approve-unknown", "unknown"))
+
+	post := func(messageID, peer, actionID string) *httptest.ResponseRecorder {
+		t.Helper()
+		w := httptest.NewRecorder()
+		req, reqErr := http.NewRequest(http.MethodPost, "/v1/message/card/action", bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
+			"message_id": messageID, "channel_id": peer, "channel_type": common.ChannelTypePerson.Uint8(),
+			"action_id": actionID, "client_token": "token-" + messageID,
+		}))))
+		require.NoError(t, reqErr)
+		req.Header.Set("token", token)
+		s.GetRoute().ServeHTTP(w, req)
+		return w
+	}
+
+	// Exact (stored sender, owner, action_type) match goes only to the internal queue.
+	w := post("9701", "notification", "approve")
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	depths, err := queue.Depths()
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), depths.Ready)
+	botDepth, err := rds.ZCard("robotEvent:notification").Result()
+	require.NoError(t, err)
+	assert.Zero(t, botDepth)
+	lease, err := queue.Claim(time.Now().Add(time.Second), time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, lease)
+	assert.Equal(t, "notification", lease.Event.SenderUID)
+	assert.Equal(t, "docs", lease.Event.Owner)
+	assert.Equal(t, "access_request.decision", lease.Event.ActionType)
+	assert.Equal(t, uid, lease.Event.OperatorUID)
+	require.True(t, lease.Event.EventID > 0)
+	acked, err := queue.Ack(lease.Event.EventID, lease.Token)
+	require.NoError(t, err)
+	require.True(t, acked)
+
+	// A third-party bot copying identical action data remains on the existing pull path.
+	w = post("9702", "external-copy-bot", "approve")
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	botDepth, err = rds.ZCard("robotEvent:external-copy-bot").Result()
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), botDepth)
+	depths, _ = queue.Depths()
+	assert.Zero(t, depths.Ready)
+
+	// An internal sender with an unknown action fails closed and releases its D4 claim.
+	w = post("9703", "notification", "approve-unknown")
+	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	botDepth, _ = rds.ZCard("robotEvent:notification").Result()
+	assert.Zero(t, botDepth)
+	claimExists, err := rds.Exists(cardActionClaimKey("9703", "approve-unknown", uid)).Result()
+	require.NoError(t, err)
+	assert.Zero(t, claimExists)
+}
 
 const cardActionBotUID = "bot_card_1"
 
