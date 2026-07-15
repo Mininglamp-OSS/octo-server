@@ -2,7 +2,6 @@ package user
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -112,10 +111,6 @@ type User struct {
 	verificationDB           *verificationDB
 	languageService          *LanguageService
 	existingTokenSetter      existingTokenSetter
-	// authInternalKey gates the no-secret internal endpoints in the verify
-	// group (currently /auth/space-membership) via the X-Internal-Key header.
-	// Read once from AUTH_INTERNAL_KEY at construction; empty => fail-closed.
-	authInternalKey string
 }
 
 type existingTokenSetter interface {
@@ -165,15 +160,11 @@ func New(ctx *config.Context) *User {
 		pinnedDB:                 NewPinnedDB(ctx),
 		spaceSettingDB:           NewSpaceSettingDB(ctx.DB()),
 		verificationDB:           newVerificationDB(ctx),
-		authInternalKey:          os.Getenv("AUTH_INTERNAL_KEY"),
 		existingTokenSetter: redisExistingTokenSetter{
 			client: octoredis.NewInstrumentedClient(ctx.GetConfig(), func(o *rd.Options) {
 				o.PoolSize = 10
 			}),
 		},
-	}
-	if u.authInternalKey == "" {
-		u.Warn("AUTH_INTERNAL_KEY not set — /auth/space-membership will reject all requests (fail-closed)")
 	}
 	// LanguageService 与 main.go 注入到 CacheTokenParser 的实例独立构造，但共享
 	// 底层 *DB session / Redis 连接，因此读写同一份 user.language 列与
@@ -313,16 +304,12 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 		v.POST("/user/login/check_phone", loginLimit, u.loginCheckPhone)           //登录验证设备手机号
 
 		// #################### Token / Bot 认证验证（供 Gateway 调用） ####################
-		v.POST("/auth/verify", verifyLimit, u.authVerifyToken)                                             // 验证用户 token
-		v.POST("/auth/verify-bot", verifyLimit, u.authVerifyBot)                                           // 验证 Bot API Key
-		v.POST("/auth/verify-api-key", verifyLimit, u.authVerifyAPIKey)                                    // 验证 daemon API Key (uk_)
-		v.POST("/auth/space-membership", verifyLimit, u.requireInternalKey(), u.authVerifySpaceMembership) // 服务间 Space 成员校验 (docs-backend anyone_in_space)
+		v.POST("/auth/verify", verifyLimit, u.authVerifyToken)          // 验证用户 token
+		v.POST("/auth/verify-bot", verifyLimit, u.authVerifyBot)        // 验证 Bot API Key
+		v.POST("/auth/verify-api-key", verifyLimit, u.authVerifyAPIKey) // 验证 daemon API Key (uk_)
 		// ↑ Verify endpoints are rate-limited (1000 req/min/IP). For production,
 		// restrict access at network level (nginx allow internal IPs only) or
-		// add X-Internal-Key header validation. /auth/space-membership is a
-		// no-secret oracle (no token/api-key in the body, unlike its siblings),
-		// so it additionally carries an in-code X-Internal-Key gate
-		// (requireInternalKey) that fails closed when AUTH_INTERNAL_KEY is unset.
+		// add X-Internal-Key header validation.
 
 		// #################### 第三方授权 ####################
 		v.GET("/user/thirdlogin/authcode", u.thirdAuthcode)     // 第三方授权码获取
@@ -4493,129 +4480,4 @@ func (u *User) queryOwnedBotsBySpace(creatorUID, spaceID string) ([]string, erro
 		out = out[:ownedBotsLimit]
 	}
 	return out, nil
-}
-
-type authSpaceMembershipReq struct {
-	SpaceID string `json:"space_id"`
-	UID     string `json:"uid"`
-}
-
-type authSpaceMembershipResp struct {
-	SpaceID  string `json:"space_id"`
-	UID      string `json:"uid"`
-	IsMember bool   `json:"is_member"`
-	// Role echoes space_member.role of the active row (0 member / 1 admin /
-	// 2 owner). Pointer + omitempty so it is present-and-0 for a member with
-	// the base role, but omitted entirely when is_member=false (contract:
-	// role is meaningless for a non-member). A plain int would collapse
-	// "member with role 0" and "not a member" into the same wire shape.
-	Role *int `json:"role,omitempty"`
-}
-
-// internalKeyHeader is the header a trusted internal service presents to reach
-// the no-secret endpoints in the verify group.
-const internalKeyHeader = "X-Internal-Key"
-
-// requireInternalKey is an in-code service-auth gate for the no-secret verify
-// endpoints (currently /auth/space-membership). Unlike verify / verify-bot /
-// verify-api-key — which each carry a caller secret (token / api-key) in the
-// body — space-membership takes only (space_id, uid), so without this gate any
-// client that reaches the port could enumerate membership and roles. It fails
-// closed: if AUTH_INTERNAL_KEY is unset the endpoint rejects every request
-// rather than fall back to the network layer alone, mirroring notify's
-// NOTIFY_INTERNAL_TOKEN gate. The comparison is constant-time. This is defence
-// in addition to — not a replacement for — the group's network-level
-// internal-IP restriction; the reverse-proxy allowlist must still be confirmed
-// to cover /v1/auth/space-membership before rollout.
-func (u *User) requireInternalKey() wkhttp.HandlerFunc {
-	return func(c *wkhttp.Context) {
-		if u.authInternalKey == "" {
-			u.Warn("authVerifySpaceMembership rejected: AUTH_INTERNAL_KEY not configured (fail-closed)")
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "internal auth not configured"})
-			return
-		}
-		got := c.GetHeader(internalKeyHeader)
-		if subtle.ConstantTimeCompare([]byte(got), []byte(u.authInternalKey)) != 1 {
-			u.Warn("authVerifySpaceMembership rejected: invalid or missing X-Internal-Key")
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "unauthorized"})
-			return
-		}
-		c.Next()
-	}
-}
-
-// authVerifySpaceMembership answers "is <uid> an active member of <space_id>?"
-// for internal service callers (octo-docs-backend anyone_in_space share
-// permissions, GH octo-docs #64). Registered in the Gateway verify group with
-// the SAME baseline protection as verify / verify-bot / verify-api-key
-// (network-level internal-IP restriction + verifyLimit rate cap) — deliberately
-// NOT behind end-user session AuthMiddleware, since the caller is a service,
-// not a logged-in user. Because it is a no-secret oracle (unlike its siblings
-// it carries no caller token/api-key in the body), it additionally sits behind
-// the in-code requireInternalKey gate.
-//
-// Membership is the canonical space_member predicate (space_id + uid +
-// status=1) hardened with space and user liveness (space.status=1 +
-// user.status=1), matching the sibling authVerifyAPIKey — see the query
-// comment below for why the bare member-status check is a bypass. is_member is
-// that predicate's COUNT(...) > 0; we additionally echo the active row's role.
-// Human/bot parity is by construction: a bot has a space_member row just like a
-// human, so the same query answers both with no special-casing.
-func (u *User) authVerifySpaceMembership(c *wkhttp.Context) {
-	var req authSpaceMembershipReq
-	if err := c.BindJSON(&req); err != nil {
-		u.Warn("authVerifySpaceMembership 请求体格式错误", zap.Error(err))
-		respondUserRequestInvalid(c, "")
-		return
-	}
-	if req.SpaceID == "" {
-		respondUserRequestInvalid(c, "space_id")
-		return
-	}
-	if req.UID == "" {
-		respondUserRequestInvalid(c, "uid")
-		return
-	}
-
-	// SELECT role over the (space_id, uid, status=1) membership predicate,
-	// additionally gated on space and user liveness. A member-status-only
-	// query is a reachable authorization bypass, exactly as documented on the
-	// sibling authVerifyAPIKey (api.go:4403-4407):
-	//   - space.status=1 — disbandSpace (modules/space/db.go) sets
-	//     space.status=0 without cascading space_member, so a disbanded space
-	//     would otherwise report its lingering members as active. This endpoint
-	//     backs docs-backend anyone_in_space share permissions, so that would
-	//     grant document access inside a dead space.
-	//   - user.status=1 — liftBanUser sets user.status=0 without touching
-	//     space_member, so a globally banned user would otherwise still read as
-	//     an active member.
-	// INNER JOINs still hit the spacemember_spaceid_uid unique index, so at
-	// most one row is returned; is_member = (rows > 0), matching COUNT(...) > 0.
-	// Load does NOT surface dbr.ErrNotFound on the zero-row case, so a genuine
-	// err is always an infrastructure failure.
-	var roles []int
-	_, err := u.db.session.SelectBySql(
-		"SELECT sm.role FROM space_member sm "+
-			"INNER JOIN space s ON s.space_id=sm.space_id AND s.status=1 "+
-			"INNER JOIN `user` u ON u.uid=sm.uid AND u.status=1 "+
-			"WHERE sm.space_id=? AND sm.uid=? AND sm.status=1",
-		req.SpaceID, req.UID,
-	).Load(&roles)
-	if err != nil {
-		u.Error("authVerifySpaceMembership query failed",
-			zap.String("space_id", req.SpaceID), zap.String("uid", req.UID), zap.Error(err))
-		respondUserServiceError(c)
-		return
-	}
-
-	resp := authSpaceMembershipResp{
-		SpaceID:  req.SpaceID,
-		UID:      req.UID,
-		IsMember: len(roles) > 0,
-	}
-	if resp.IsMember {
-		role := roles[0]
-		resp.Role = &role
-	}
-	c.Response(resp)
 }
