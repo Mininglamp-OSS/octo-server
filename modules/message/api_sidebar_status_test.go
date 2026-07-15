@@ -183,7 +183,7 @@ func TestSidebar_FollowTab_BackfillsStatus(t *testing.T) {
 
 	lastMsgAt, statusMap, _, err := sb.loadThreadLastMsgAt(threadExtRows)
 	require.NoError(t, err)
-	items = mergeThreadEntries(items, threadExtRows, lastMsgAt, categorySetting, nil, nil, nil, "", nil)
+	items = mergeThreadEntries(items, threadExtRows, lastMsgAt, categorySetting, nil, nil, nil, "", nil, statusMap)
 	backfillThreadStatus(items, statusMap)
 
 	byID := map[string]*SidebarItem{}

@@ -102,7 +102,7 @@ func TestSpaceID_MergeThreadEntries_FillsParentSpaceID(t *testing.T) {
 	}
 	groupSpaceMap := map[string]string{"g1": "spaceC"}
 
-	result := mergeThreadEntries(nil, threadExtRows, aliveThread("g1____alive", nil), categorySetting, nil, groupSpaceMap, nil, "", nil)
+	result := mergeThreadEntries(nil, threadExtRows, aliveThread("g1____alive", nil), categorySetting, nil, groupSpaceMap, nil, "", nil, nil)
 
 	if assert.Len(t, result, 1) {
 		assert.Equal(t, "g1____alive", result[0].TargetID)

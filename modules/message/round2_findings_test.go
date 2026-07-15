@@ -85,7 +85,7 @@ func TestSpaceID_Round2_Finding2_DBOnlyThreadInheritsParentSpace(t *testing.T) {
 	}
 
 	items := mergeThreadEntries(nil, extRows, aliveThread("g_db_parent____th9", nil),
-		categorySetting, nil, groupSpaceMap, nil, "", nil)
+		categorySetting, nil, groupSpaceMap, nil, "", nil, nil)
 
 	require.Len(t, items, 1)
 	assert.Equal(t, "spaceX", items[0].SpaceID,
@@ -182,7 +182,7 @@ func TestSpaceID_Round2_Finding3_MergeThreadEntries_ExternalGroupMySource(t *tes
 
 	result := mergeThreadEntries(nil, threadExtRows,
 		aliveThread("g_external____alive", nil),
-		categorySetting, nil, groupSpaceMap, externalGroupMap, "", nil)
+		categorySetting, nil, groupSpaceMap, externalGroupMap, "", nil, nil)
 
 	require.Len(t, result, 1)
 	assert.Equal(t, "spaceB", result[0].SpaceID)

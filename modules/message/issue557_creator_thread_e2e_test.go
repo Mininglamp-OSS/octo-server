@@ -262,7 +262,7 @@ func issue557FollowTabThreadItems(t *testing.T, sb *Sidebar, loginUID string, un
 	rows, err = sb.filterThreadExtsByParentMembership(rows, loginUID)
 	require.NoError(t, err, "filterThreadExtsByParentMembership")
 
-	lastMsgAt, _, creatorMap, err := sb.loadThreadLastMsgAt(rows)
+	lastMsgAt, statusMap, creatorMap, err := sb.loadThreadLastMsgAt(rows)
 	require.NoError(t, err, "loadThreadLastMsgAt")
 
 	selfCreated := make(map[string]struct{})
@@ -278,6 +278,7 @@ func issue557FollowTabThreadItems(t *testing.T, sb *Sidebar, loginUID string, un
 		unfollowedGroups,
 		map[string]string{}, map[string]string{}, "",
 		selfCreated,
+		statusMap,
 	)
 }
 
