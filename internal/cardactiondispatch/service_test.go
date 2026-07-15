@@ -31,7 +31,7 @@ func (s valueStore) SetValue(value interface{}, key string) { s[key] = value }
 func (s valueStore) Value(key string) interface{}           { return s[key] }
 
 func TestServiceAllocatesEventIDAndInstallsPerContext(t *testing.T) {
-	registry, err := NewRegistry([]RouteSpec{validRouteSpec()}, []string{validRouteSpec().URL}, testGetenv)
+	registry, err := NewRegistry([]RouteSpec{validRouteSpec()}, testGetenv)
 	if err != nil {
 		t.Fatalf("NewRegistry() error = %v", err)
 	}
@@ -63,7 +63,7 @@ func TestServiceAllocatesEventIDAndInstallsPerContext(t *testing.T) {
 }
 
 func TestServiceRejectsUnregisteredOrCallerAssignedEvents(t *testing.T) {
-	registry, err := NewRegistry([]RouteSpec{validRouteSpec()}, []string{validRouteSpec().URL}, testGetenv)
+	registry, err := NewRegistry([]RouteSpec{validRouteSpec()}, testGetenv)
 	if err != nil {
 		t.Fatalf("NewRegistry() error = %v", err)
 	}

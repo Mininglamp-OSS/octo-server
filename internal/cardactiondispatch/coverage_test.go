@@ -35,7 +35,7 @@ func (q *idleDispatchQueue) ReclaimExpired(time.Time, int) (int, error) {
 }
 
 func TestDispatcherLifecycleStartsStopsAndRejectsDoubleStart(t *testing.T) {
-	registry, err := NewRegistry([]RouteSpec{validRouteSpec()}, []string{validRouteSpec().URL}, testGetenv)
+	registry, err := NewRegistry([]RouteSpec{validRouteSpec()}, testGetenv)
 	if err != nil {
 		t.Fatalf("NewRegistry() error = %v", err)
 	}
@@ -76,9 +76,6 @@ func (*stubDeliverer) Deliver(context.Context, *Route, DecisionRequest) (Decisio
 }
 
 func TestConfigAndValidationErrorPathsFailClosed(t *testing.T) {
-	if got := LoadAllowedURLs(" https://a.internal/x, ,https://b.internal/y "); len(got) != 2 {
-		t.Fatalf("LoadAllowedURLs() = %v", got)
-	}
 	for _, raw := range []string{
 		`not-json`,
 		`[{"sender_uid":"notification","unknown":true}]`,
@@ -109,7 +106,7 @@ func TestConfigAndValidationErrorPathsFailClosed(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			spec := validRouteSpec()
 			tt.mutate(&spec)
-			_, err := NewRegistry([]RouteSpec{spec}, []string{spec.URL}, testGetenv)
+			_, err := NewRegistry([]RouteSpec{spec}, testGetenv)
 			if err == nil {
 				t.Fatal("NewRegistry() error = nil")
 			}

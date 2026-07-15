@@ -128,7 +128,7 @@ func TestCardActionCallbackOrchestrationWithMockDocs(t *testing.T) {
 	registry, err := cardactiondispatch.NewRegistry([]cardactiondispatch.RouteSpec{{
 		SenderUID: "notification", Owner: "docs", ActionType: "access_request.decision",
 		URL: callbackURL, SecretEnv: "OCTO_DOCS_CARD_ACTION_SECRET",
-	}}, []string{callbackURL}, func(string) string { return secret })
+	}}, func(string) string { return secret })
 	require.NoError(t, err)
 	queue, err := cardactiondispatch.NewRedisQueue(rds, cardactiondispatch.QueueConfig{
 		Prefix: prefix, LiveTTL: ctx.GetConfig().Robot.MessageExpire, DLQRetention: 30 * 24 * time.Hour,
@@ -249,7 +249,7 @@ func TestCardActionCallbackOrchestrationUsesStandardFinalizerForNewOwner(t *test
 	registry, err := cardactiondispatch.NewRegistry([]cardactiondispatch.RouteSpec{{
 		SenderUID: "notification", Owner: "tasks", ActionType: "task.decision",
 		URL: callbackURL, SecretEnv: "OCTO_TASKS_CARD_ACTION_SECRET",
-	}}, []string{callbackURL}, func(string) string { return secret })
+	}}, func(string) string { return secret })
 	require.NoError(t, err)
 	queue, err := cardactiondispatch.NewRedisQueue(rds, cardactiondispatch.QueueConfig{
 		Prefix: prefix, LiveTTL: time.Hour, DLQRetention: 30 * 24 * time.Hour,
@@ -366,4 +366,112 @@ func cleanupRedisPatterns(t *testing.T, client *redis.Client, patterns ...string
 			require.NoError(t, client.Del(keys...).Err())
 		}
 	}
+}
+
+// TestCardActionCallbackOrchestrationForwardsCustomDecisionEndToEnd is the
+// end-to-end guard for the http-actions follow-up: a caller-supplied custom
+// decision (`execute`) must round-trip from the enqueued click through the
+// signed callback body to the consumer's typed response, and the standard
+// finalizer must render the state the consumer picked (`approved`) instead of
+// hardcoding a decision-derived state.
+func TestCardActionCallbackOrchestrationForwardsCustomDecisionEndToEnd(t *testing.T) {
+	t.Setenv(cardmsg.EnvEnabled, "true")
+	t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
+	const secret = "0123456789abcdef0123456789abcdef"
+	callbackCalls := make(chan docsCallbackCapture, 1)
+	consumer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		capture := docsCallbackCapture{method: r.Method, path: r.URL.EscapedPath(), err: err}
+		if err == nil {
+			capture.err = json.Unmarshal(body, &capture.request)
+		}
+		capture.signatureValid = cardactiondispatch.Verify(
+			secret, r.Header.Get(cardactiondispatch.HeaderSignature), r.Method, r.URL.EscapedPath(),
+			r.Header.Get(cardactiondispatch.HeaderTimestamp), r.Header.Get(cardactiondispatch.HeaderEventID), body,
+		)
+		callbackCalls <- capture
+		w.Header().Set("Content-Type", "application/json")
+		// The consumer maps the caller's custom `execute` decision to the
+		// standard `approved` state; octo-server must respect that mapping.
+		_, _ = w.Write([]byte(`{"disposition":"applied","state":"approved","requester_uid":"user-a","display":{"title":"Execute task"}}`))
+	}))
+	defer consumer.Close()
+
+	_, ctx := testutil.NewTestServer()
+	defer func() { _ = testutil.CleanAllTables(ctx) }()
+	rds := redis.NewClient(&redis.Options{Addr: ctx.GetConfig().DB.RedisAddr, Password: ctx.GetConfig().DB.RedisPass})
+	prefix := fmt.Sprintf("test:card_action_custom_decision_e2e:%d", time.Now().UnixNano())
+	cleanupRedisPatterns(t, rds, prefix+"*")
+	t.Cleanup(func() {
+		cleanupRedisPatterns(t, rds, prefix+"*")
+		_ = rds.Close()
+	})
+
+	callbackURL := consumer.URL + "/v1/card-actions/decide"
+	registry, err := cardactiondispatch.NewRegistry([]cardactiondispatch.RouteSpec{{
+		SenderUID: "notification", Owner: "tasks", ActionType: "task.execute.decision",
+		URL: callbackURL, SecretEnv: "OCTO_TASKS_CARD_ACTION_SECRET",
+	}}, func(string) string { return secret })
+	require.NoError(t, err)
+	queue, err := cardactiondispatch.NewRedisQueue(rds, cardactiondispatch.QueueConfig{
+		Prefix: prefix, LiveTTL: time.Hour, DLQRetention: 30 * 24 * time.Hour,
+	})
+	require.NoError(t, err)
+	service, err := cardactiondispatch.NewService(registry, queue, ctx)
+	require.NoError(t, err)
+
+	// Simulate the click on the custom `execute` Action.Submit button. The
+	// action ID mirrors what pkg/cardtmpl derives for a custom decision.
+	eventID, err := service.Enqueue(cardactiondispatch.Event{
+		SenderUID: "notification", Owner: "tasks", ActionType: "task.execute.decision",
+		MessageID: "task-message-custom-1", ChannelID: "notification", ChannelType: common.ChannelTypePerson.Uint8(),
+		SpaceID: "space-1", ActionID: "approval-execute", OperatorUID: "user-b", ActedAt: time.Now().Unix(),
+		Data: map[string]interface{}{
+			"owner": "tasks", "action_type": "task.execute.decision",
+			"decision": "execute", "task_id": "task-1",
+		},
+	})
+	require.NoError(t, err)
+
+	mutator := &callbackE2EMutator{}
+	sender := &callbackE2ESender{}
+	standard, err := notify.NewStandardActionFinalizer(mutator, sender)
+	require.NoError(t, err)
+	finalizers, err := cardactiondispatch.NewFinalizerRegistry(standard, nil)
+	require.NoError(t, err)
+	dispatcher, err := cardactiondispatch.NewDispatcher(
+		queue, registry, cardactiondispatch.NewHTTPDeliverer(consumer.Client().Transport, time.Now), finalizers,
+		cardactiondispatch.DispatcherConfig{},
+	)
+	require.NoError(t, err)
+	processed, err := dispatcher.ProcessOne(context.Background(), time.Now().Add(time.Second))
+	require.NoError(t, err)
+	require.True(t, processed)
+
+	callback := <-callbackCalls
+	require.NoError(t, callback.err)
+	assert.True(t, callback.signatureValid, "custom-decision callback must still sign the exact body")
+	assert.Equal(t, eventID, callback.request.EventID)
+	assert.Equal(t, "execute", callback.request.Decision,
+		"custom decision must reach the consumer unmodified — no server-side rewrite to approve/deny")
+	assert.Equal(t, "approval-execute", callback.request.ActionID,
+		"action ID must follow the derived approval-<decision> convention")
+	assert.Equal(t, "task-1", callback.request.Data["task_id"])
+	assert.Equal(t, "execute", callback.request.Data["decision"],
+		"reserved decision field in Data must mirror the top-level decision")
+
+	// Standard finalizer must use the consumer-returned state (approved), not
+	// something derived from the custom decision name.
+	require.Len(t, mutator.requests, 1)
+	assert.Equal(t, "user-b", mutator.requests[0].ChannelID)
+	assert.Contains(t, mutator.requests[0].ContentEdit, "approval.approved",
+		"terminal card must render the consumer-picked state, not the decision string")
+	require.Len(t, sender.targets, 1)
+	assert.Equal(t, "user-a", sender.targets[0].ChannelID,
+		"requester notification must fire on approved regardless of the custom decision label")
+	assert.Equal(t, cardmsg.ProfileV1, sender.cards[0].Profile)
+
+	depths, err := queue.Depths()
+	require.NoError(t, err)
+	assert.Equal(t, cardactiondispatch.QueueDepths{}, depths, "queue must drain cleanly on successful custom-decision callback")
 }

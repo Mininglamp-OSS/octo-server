@@ -85,7 +85,7 @@ func TestCardActionSenderBoundCallbackRouting(t *testing.T) {
 	registry, err := cardactiondispatch.NewRegistry([]cardactiondispatch.RouteSpec{{
 		SenderUID: "notification", Owner: "docs", ActionType: "access_request.decision",
 		URL: callbackURL, SecretEnv: "OCTO_DOCS_CARD_ACTION_SECRET",
-	}}, []string{callbackURL}, func(key string) string { return "0123456789abcdef0123456789abcdef" })
+	}}, func(key string) string { return "0123456789abcdef0123456789abcdef" })
 	require.NoError(t, err)
 	rds := redis.NewClient(&redis.Options{Addr: ctx.GetConfig().DB.RedisAddr, Password: ctx.GetConfig().DB.RedisPass})
 	defer rds.Close()

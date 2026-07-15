@@ -4,6 +4,25 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-16 (card-action-internal-http-actions)
+
+- **Follow-up** — Two small extensions to #588 plus one bundled config
+  collapse. `OCTO_CARD_ACTION_ROUTES[].url` now accepts `http://` in addition
+  to `https://`; hostname form is intentionally not inspected (route
+  registration = operator authorization). URL validator tightened at the same
+  time: `Hostname() != ""` (blocks `http://:8080/x`), `ForceQuery` (blocks
+  trailing `?`), raw-`#` prefilter (blocks trailing/embedded `#`).
+  `OCTO_CARD_ACTION_ALLOWED_URLS` is deleted from code paths and emits a
+  structured deprecation WARN if still set, so rolling upgrades do not fail.
+  `approval_card.actions` grew an optional 1..5 bounded slice: server-derived
+  action IDs, reserved metadata enforced, control-character-in-title checked
+  on the raw string, `nil` preserves byte-for-byte legacy approve/deny while a
+  non-nil empty slice is rejected as a caller bug. Callback wire contract
+  (states, requester notification, HMAC canonical) is deliberately unchanged.
+  Coverage — cardactiondispatch 81.5%, cardtmpl 89.9%, notify 71.2%. Brief/context
+  under `.octospec/tasks/card-action-internal-http-actions/`; shared journal
+  `.octospec/journal/shared/card-action-internal-http-actions.md`.
+
 ## 2026-07-13 (card-message-appbot-trust)
 
 - **Fix** — Closed the P0 App Bot card trust split without changing the send

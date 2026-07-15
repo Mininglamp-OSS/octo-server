@@ -474,11 +474,14 @@ func installCardActionDispatch(ctx *config.Context) (*cardActionDispatchRuntime,
 	if err != nil {
 		return nil, err
 	}
-	registry, err := cardactiondispatch.NewRegistry(
-		specs,
-		cardactiondispatch.LoadAllowedURLs(os.Getenv("OCTO_CARD_ACTION_ALLOWED_URLS")),
-		os.Getenv,
-	)
+	if legacy := strings.TrimSpace(os.Getenv("OCTO_CARD_ACTION_ALLOWED_URLS")); legacy != "" {
+		// OCTO_CARD_ACTION_ROUTES[].url is itself the exact allowlist since the
+		// http-actions follow-up. The dual-write env is intentionally ignored to
+		// avoid drift; keep the WARN so rolling upgrades surface the leftover.
+		log.Warn("OCTO_CARD_ACTION_ALLOWED_URLS is deprecated and ignored; remove it from the deployment configuration",
+			zap.String("deprecated_env", "OCTO_CARD_ACTION_ALLOWED_URLS"))
+	}
+	registry, err := cardactiondispatch.NewRegistry(specs, os.Getenv)
 	if err != nil {
 		return nil, err
 	}

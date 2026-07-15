@@ -161,3 +161,37 @@ func TestConfiguredApprovalRouteRejectsNonNotificationSender(t *testing.T) {
 		t.Fatal("cardActionApprovalProducerSpecs() error = nil")
 	}
 }
+
+// TestDeprecatedAllowedURLsEnvIsIgnoredWithStructuredWarn locks the
+// http-actions follow-up decision (b): OCTO_CARD_ACTION_ALLOWED_URLS must be
+// treated as deprecated. Startup must not fail on it (rolling upgrades still
+// carry the variable) and must emit a single structured WARN so operators can
+// see it in the ConfigMap review.
+func TestDeprecatedAllowedURLsEnvIsIgnoredWithStructuredWarn(t *testing.T) {
+	source, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	text := string(source)
+	if !strings.Contains(text, `os.Getenv("OCTO_CARD_ACTION_ALLOWED_URLS")`) {
+		t.Fatal("main.go no longer reads OCTO_CARD_ACTION_ALLOWED_URLS; expected a deprecation branch")
+	}
+	// The WARN must be emitted through the shared log helper (log.Warn) so it
+	// lands in the standard structured logger pipeline rather than stderr.
+	if !strings.Contains(text, "log.Warn(\"OCTO_CARD_ACTION_ALLOWED_URLS is deprecated") {
+		t.Fatal("expected log.Warn call announcing the deprecation on startup")
+	}
+	// Include a machine-readable deprecated_env field so log ingestion can
+	// route/alert on it without regex-parsing the message string.
+	if !strings.Contains(text, `zap.String("deprecated_env", "OCTO_CARD_ACTION_ALLOWED_URLS")`) {
+		t.Fatal("deprecation WARN must include a deprecated_env structured field")
+	}
+	// The variable must no longer feed into NewRegistry — the whole point of
+	// the follow-up is to keep it out of the routing decision.
+	if strings.Contains(text, "LoadAllowedURLs(") {
+		t.Fatal("LoadAllowedURLs is deleted; main.go must not reference it")
+	}
+	if !strings.Contains(text, "cardactiondispatch.NewRegistry(specs, os.Getenv)") {
+		t.Fatal("NewRegistry must be called with the two-argument (specs, getenv) signature")
+	}
+}

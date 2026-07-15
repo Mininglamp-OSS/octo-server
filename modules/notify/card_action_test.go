@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -184,7 +186,7 @@ func TestIntegration_GenericApprovalTokenIsOwnerBoundAndSendsV2(t *testing.T) {
 			URL:       "https://summary.internal/v1/card-actions/decide",
 			SecretEnv: "OCTO_SMART_SUMMARY_CARD_ACTION_SECRET", NotifyTokenEnv: "OCTO_SMART_SUMMARY_NOTIFY_TOKEN",
 		},
-	}, []string{"https://summary.internal/v1/card-actions/decide"}, func(key string) string {
+	}, func(key string) string {
 		switch key {
 		case "OCTO_SMART_SUMMARY_CARD_ACTION_SECRET":
 			return callbackSecret
@@ -237,6 +239,127 @@ func TestIntegration_GenericApprovalTokenIsOwnerBoundAndSendsV2(t *testing.T) {
 	}
 	docsResponse := doJSONRequest(t, router, http.MethodPost, "/v1/internal/notify", actionHeader, docsAttempt)
 	assert.Equal(t, http.StatusBadRequest, docsResponse.Code)
+}
+
+// TestIntegration_ApprovalCardCustomActionsRenderInOrder verifies the
+// http-actions follow-up wire path: a caller-supplied 1-5 actions slice ends
+// up as server-built Action.Submit buttons with the reserved owner/action_type
+// metadata injected and the router-owned action IDs, without leaking a URL.
+func TestIntegration_ApprovalCardCustomActionsRenderInOrder(t *testing.T) {
+	t.Setenv("OCTO_CARD_MESSAGE_ENABLED", "true")
+	const (
+		callbackSecret = "0123456789abcdef0123456789abcdef"
+		notifyToken    = "abcdef0123456789abcdef0123456789"
+	)
+	wk := newWuKongServer()
+	defer wk.close()
+	ctx := newTestContext(t, wk)
+	registry, err := cardactiondispatch.NewRegistry([]cardactiondispatch.RouteSpec{
+		{
+			SenderUID: "notification", Owner: "tasks", ActionType: "task.execute.decision",
+			URL:       "https://tasks.internal/v1/card-actions/decide",
+			SecretEnv: "OCTO_TASKS_CARD_ACTION_SECRET", NotifyTokenEnv: "OCTO_TASKS_NOTIFY_TOKEN",
+		},
+	}, func(key string) string {
+		switch key {
+		case "OCTO_TASKS_CARD_ACTION_SECRET":
+			return callbackSecret
+		case "OCTO_TASKS_NOTIFY_TOKEN":
+			return notifyToken
+		default:
+			return ""
+		}
+	})
+	require.NoError(t, err)
+	service, err := cardactiondispatch.NewService(registry, unusedActionQueue{}, ctx)
+	require.NoError(t, err)
+	capability := cardactiondispatch.NotifyCapability{SenderUID: "notification", Owner: "tasks"}
+	capture := &capturingCardSender{}
+	n := newTestNotify(ctx, nil, nil, nil, "legacy-token")
+	n.actionService = service
+	n.actionSenders = map[cardactiondispatch.NotifyCapability]carddispatch.Sender{capability: capture}
+	n.botOK.Store(true)
+	primeMemberCache(n, "space-1", "user-b")
+	router := buildRouter(n)
+	router.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
+
+	request := NotifyReq{
+		SpaceID: "space-1", Service: "tasks", Targets: []string{"user-b"}, ActorUID: "user-a",
+		ApprovalCard: &ApprovalCardFields{
+			ActionType: "task.execute.decision", Title: "Execute task", Description: "Pick one",
+			Data: map[string]string{"task_id": "task-1"},
+			Actions: []ApprovalCardAction{
+				{Decision: "execute", Title: "Execute"},
+				{Decision: "reject", Title: "Reject"},
+				{Decision: "cancel", Title: "Cancel"},
+			},
+		},
+	}
+	header := http.Header{InternalTokenHeader: []string{notifyToken}}
+	response := doJSONRequest(t, router, http.MethodPost, "/v1/internal/notify", header, request)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.Len(t, capture.cards, 1)
+
+	document := capture.last().Document
+	assert.NotContains(t, string(document), "http")
+	assert.Contains(t, string(document), `"id":"approval-execute"`)
+	assert.Contains(t, string(document), `"id":"approval-reject"`)
+	assert.Contains(t, string(document), `"id":"approval-cancel"`)
+	assert.Contains(t, string(document), `"title":"Execute"`)
+	assert.Contains(t, string(document), `"title":"Cancel"`)
+	assert.NotContains(t, string(document), `"id":"approval-approve"`)
+
+	var card map[string]interface{}
+	require.NoError(t, json.Unmarshal(document, &card))
+	actions, _ := card["actions"].([]interface{})
+	require.Len(t, actions, 3)
+	for _, value := range actions {
+		action, _ := value.(map[string]interface{})
+		data, _ := action["data"].(map[string]interface{})
+		assert.Equal(t, "tasks", data["owner"])
+		assert.Equal(t, "task.execute.decision", data["action_type"])
+		assert.Equal(t, "task-1", data["task_id"])
+	}
+
+	invalid := request
+	invalid.ApprovalCard = &ApprovalCardFields{
+		ActionType: "task.execute.decision", Title: "Execute task",
+		Actions: []ApprovalCardAction{
+			{Decision: "Execute", Title: "bad"},
+		},
+	}
+	rejected := doJSONRequest(t, router, http.MethodPost, "/v1/internal/notify", header, invalid)
+	assert.Equal(t, http.StatusBadRequest, rejected.Code)
+	assert.Len(t, capture.cards, 1, "invalid decisions must not reach transport")
+
+	// Verify the on-the-wire JSON boundary: an explicit "actions": [] is a
+	// caller bug, not a fallback to approve/deny. Send raw JSON to make sure
+	// nil vs non-nil-empty is preserved through gin's binder.
+	rawEmpty := `{"space_id":"space-1","service":"tasks","targets":["user-b"],"actor_uid":"user-a",` +
+		`"approval_card":{"action_type":"task.execute.decision","title":"Execute task",` +
+		`"description":"Pick one","data":{"task_id":"task-1"},"actions":[]}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/internal/notify", strings.NewReader(rawEmpty))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(InternalTokenHeader, notifyToken)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+	assert.Len(t, capture.cards, 1, "explicit empty actions must not fall back to approve/deny")
+
+	// Sanity: omitting the field ("actions" not present) is equivalent to
+	// nil and still succeeds via the localized approve/deny template.
+	rawOmitted := `{"space_id":"space-1","service":"tasks","targets":["user-b"],"actor_uid":"user-a",` +
+		`"approval_card":{"action_type":"task.execute.decision","title":"Execute task",` +
+		`"description":"Pick one","data":{"task_id":"task-1"}}}`
+	reqOmit := httptest.NewRequest(http.MethodPost, "/v1/internal/notify", strings.NewReader(rawOmitted))
+	reqOmit.Header.Set("Content-Type", "application/json")
+	reqOmit.Header.Set(InternalTokenHeader, notifyToken)
+	recOmit := httptest.NewRecorder()
+	router.ServeHTTP(recOmit, reqOmit)
+	assert.Equal(t, http.StatusOK, recOmit.Code, recOmit.Body.String())
+	require.Len(t, capture.cards, 2)
+	assert.Contains(t, string(capture.last().Document), `"id":"approval-approve"`,
+		"omitted actions must reach the localized approve/deny template")
 }
 
 func TestIntegration_MissingDocsTokenFailsClosed(t *testing.T) {

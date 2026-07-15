@@ -92,12 +92,27 @@ func (n *Notify) buildApprovalRequestCard(card *ApprovalCardFields, capability c
 	if card == nil {
 		return nil, errNotifyCardInvalid
 	}
-	labels := approvalActionLabelsFor(lang)
-	return cardtmpl.BuildApprovalRequestCard(cardtmpl.ApprovalRequestCard{
+	tmpl := cardtmpl.ApprovalRequestCard{
 		Title: card.Title, Description: card.Description, Owner: capability.Owner,
 		ActionType: card.ActionType, Data: card.Data,
-		ApproveTitle: labels.approve, DenyTitle: labels.deny,
-	})
+	}
+	// nil = caller omitted the field → server-owned localized approve/deny.
+	// Non-nil (including explicit []) enters the custom path so cardtmpl can
+	// reject the empty slice as a caller bug instead of silently falling back.
+	if card.Actions == nil {
+		labels := approvalActionLabelsFor(lang)
+		tmpl.ApproveTitle = labels.approve
+		tmpl.DenyTitle = labels.deny
+	} else {
+		actions := make([]cardtmpl.ApprovalRequestAction, 0, len(card.Actions))
+		for _, a := range card.Actions {
+			actions = append(actions, cardtmpl.ApprovalRequestAction{
+				Decision: a.Decision, Title: a.Title,
+			})
+		}
+		tmpl.Actions = actions
+	}
+	return cardtmpl.BuildApprovalRequestCard(tmpl)
 }
 
 type approvalActionLabels struct {

@@ -95,13 +95,9 @@ type Registry struct {
 	callbackSecrets   map[string]struct{}
 }
 
-func NewRegistry(specs []RouteSpec, allowedURLs []string, getenv func(string) string) (*Registry, error) {
+func NewRegistry(specs []RouteSpec, getenv func(string) string) (*Registry, error) {
 	if getenv == nil {
 		return nil, errors.New("cardactiondispatch: getenv is required")
-	}
-	allowed, err := validateAllowedURLs(allowedURLs)
-	if err != nil {
-		return nil, err
 	}
 	registry := &Registry{
 		routes:          make(map[routeKey]*Route, len(specs)),
@@ -113,7 +109,7 @@ func NewRegistry(specs []RouteSpec, allowedURLs []string, getenv func(string) st
 	tokenOwners := make(map[string]NotifyCapability)
 	for i, input := range specs {
 		spec := withRouteDefaults(input)
-		if err := validateRouteSpec(spec, allowed, getenv); err != nil {
+		if err := validateRouteSpec(spec, getenv); err != nil {
 			return nil, fmt.Errorf("cardactiondispatch: route %d: %w", i, err)
 		}
 		key := routeKey{senderUID: spec.SenderUID, owner: spec.Owner, actionType: spec.ActionType}
@@ -277,7 +273,7 @@ func withRouteDefaults(spec RouteSpec) RouteSpec {
 	return spec
 }
 
-func validateRouteSpec(spec RouteSpec, allowed map[string]struct{}, getenv func(string) string) error {
+func validateRouteSpec(spec RouteSpec, getenv func(string) string) error {
 	if !senderPattern.MatchString(spec.SenderUID) || strings.HasPrefix(spec.SenderUID, "iwh_") {
 		return errors.New("invalid sender_uid")
 	}
@@ -287,12 +283,8 @@ func validateRouteSpec(spec RouteSpec, allowed map[string]struct{}, getenv func(
 	if !actionTypePattern.MatchString(spec.ActionType) {
 		return errors.New("invalid action_type")
 	}
-	canonical, err := validateCallbackURL(spec.URL)
-	if err != nil {
+	if _, err := validateCallbackURL(spec.URL); err != nil {
 		return err
-	}
-	if _, ok := allowed[canonical]; !ok {
-		return errors.New("callback URL is not in the exact allowlist")
 	}
 	if !secretEnvPattern.MatchString(spec.SecretEnv) {
 		return errors.New("invalid secret_env")
@@ -330,25 +322,21 @@ func validateRouteSpec(spec RouteSpec, allowed map[string]struct{}, getenv func(
 	return nil
 }
 
-func validateAllowedURLs(values []string) (map[string]struct{}, error) {
-	allowed := make(map[string]struct{}, len(values))
-	for i, value := range values {
-		canonical, err := validateCallbackURL(value)
-		if err != nil {
-			return nil, fmt.Errorf("cardactiondispatch: allowed URL %d: %w", i, err)
-		}
-		allowed[canonical] = struct{}{}
-	}
-	return allowed, nil
-}
-
 func validateCallbackURL(raw string) (string, error) {
 	if strings.TrimSpace(raw) != raw || raw == "" {
 		return "", errors.New("invalid callback URL")
 	}
+	// Fragments are stripped by url.Parse *before* setting the Fragment field
+	// when they are empty (e.g. "https://host/path#"), so checking u.Fragment
+	// alone lets a trailing '#' through. Reject on the raw string first.
+	if strings.ContainsRune(raw, '#') {
+		return "", errors.New("callback URL must not contain a fragment")
+	}
 	u, err := url.Parse(raw)
-	if err != nil || u.Scheme != "https" || u.Host == "" || u.Opaque != "" {
-		return "", errors.New("callback URL must be an absolute HTTPS URL")
+	// Hostname() strips the ":port" so that URLs like "http://:8080/path" are
+	// rejected as host-less. Host alone contains the port and would pass.
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" || u.Opaque != "" {
+		return "", errors.New("callback URL must be an absolute http(s) URL")
 	}
 	if u.User != nil {
 		return "", errors.New("callback URL must not contain credentials")
@@ -356,7 +344,9 @@ func validateCallbackURL(raw string) (string, error) {
 	if u.Fragment != "" {
 		return "", errors.New("callback URL must not contain a fragment")
 	}
-	if u.RawQuery != "" {
+	// ForceQuery covers the "trailing ?" form where RawQuery is empty but the
+	// separator was present, which url.String would preserve on the wire.
+	if u.RawQuery != "" || u.ForceQuery {
 		return "", errors.New("callback URL must not contain a query")
 	}
 	return u.String(), nil

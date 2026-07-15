@@ -136,7 +136,7 @@ func (d *contextAwareBlockingDeliverer) Deliver(ctx context.Context, _ *Route, _
 func TestDispatcherHonorsPerRouteConcurrency(t *testing.T) {
 	spec := validRouteSpec()
 	spec.MaxInFlight = 2
-	registry, err := NewRegistry([]RouteSpec{spec}, []string{spec.URL}, testGetenv)
+	registry, err := NewRegistry([]RouteSpec{spec}, testGetenv)
 	if err != nil {
 		t.Fatalf("NewRegistry() error = %v", err)
 	}
@@ -185,7 +185,7 @@ func TestDispatcherDefersSaturatedRouteAndProcessesOtherRoute(t *testing.T) {
 	tasks.Owner = "tasks"
 	tasks.ActionType = "task.decision"
 	tasks.URL = "https://tasks.internal/v1/card-actions/decide"
-	registry, err := NewRegistry([]RouteSpec{docs, tasks}, []string{docs.URL, tasks.URL}, testGetenv)
+	registry, err := NewRegistry([]RouteSpec{docs, tasks}, testGetenv)
 	if err != nil {
 		t.Fatalf("NewRegistry() error = %v", err)
 	}
@@ -254,7 +254,7 @@ func TestDispatcherDefersSaturatedRouteAndProcessesOtherRoute(t *testing.T) {
 func TestDispatcherStopDoesNotWaitOnSaturatedRouteSlot(t *testing.T) {
 	spec := validRouteSpec()
 	spec.MaxInFlight = 1
-	registry, err := NewRegistry([]RouteSpec{spec}, []string{spec.URL}, testGetenv)
+	registry, err := NewRegistry([]RouteSpec{spec}, testGetenv)
 	if err != nil {
 		t.Fatalf("NewRegistry() error = %v", err)
 	}
@@ -297,7 +297,7 @@ func TestDispatcherStopDoesNotWaitOnSaturatedRouteSlot(t *testing.T) {
 func TestDispatcherStartProcessesUpToPerRouteConcurrency(t *testing.T) {
 	spec := validRouteSpec()
 	spec.MaxInFlight = 2
-	registry, err := NewRegistry([]RouteSpec{spec}, []string{spec.URL}, testGetenv)
+	registry, err := NewRegistry([]RouteSpec{spec}, testGetenv)
 	if err != nil {
 		t.Fatalf("NewRegistry() error = %v", err)
 	}
@@ -340,7 +340,7 @@ func TestDispatcherStartProcessesUpToPerRouteConcurrency(t *testing.T) {
 
 func TestDispatcherStopCompletesClaimedEvent(t *testing.T) {
 	spec := validRouteSpec()
-	registry, err := NewRegistry([]RouteSpec{spec}, []string{spec.URL}, testGetenv)
+	registry, err := NewRegistry([]RouteSpec{spec}, testGetenv)
 	if err != nil {
 		t.Fatalf("NewRegistry() error = %v", err)
 	}
@@ -398,7 +398,7 @@ func TestDispatcherStopCompletesClaimedEvent(t *testing.T) {
 
 func TestDispatcherRenewsLeaseDuringSlowFinalization(t *testing.T) {
 	spec := validRouteSpec()
-	registry, err := NewRegistry([]RouteSpec{spec}, []string{spec.URL}, testGetenv)
+	registry, err := NewRegistry([]RouteSpec{spec}, testGetenv)
 	if err != nil {
 		t.Fatalf("NewRegistry() error = %v", err)
 	}
@@ -519,7 +519,7 @@ func TestRedisQueueDeferPreservesAttemptAndOwnership(t *testing.T) {
 
 func TestDispatcherSchedulesRetryFromFailureTime(t *testing.T) {
 	spec := validRouteSpec()
-	registry, err := NewRegistry([]RouteSpec{spec}, []string{spec.URL}, testGetenv)
+	registry, err := NewRegistry([]RouteSpec{spec}, testGetenv)
 	if err != nil {
 		t.Fatalf("NewRegistry() error = %v", err)
 	}
@@ -555,7 +555,7 @@ func TestDispatcherSchedulesRetryFromFailureTime(t *testing.T) {
 func TestDispatcherDeadLettersLeaseBeyondRouteAttemptLimitWithoutDelivery(t *testing.T) {
 	spec := validRouteSpec()
 	spec.MaxAttempts = 2
-	registry, err := NewRegistry([]RouteSpec{spec}, []string{spec.URL}, testGetenv)
+	registry, err := NewRegistry([]RouteSpec{spec}, testGetenv)
 	if err != nil {
 		t.Fatalf("NewRegistry() error = %v", err)
 	}
@@ -823,7 +823,7 @@ func registryForTestServer(t *testing.T, callbackURL string, maxAttempts int) *R
 	spec := validRouteSpec()
 	spec.URL = callbackURL
 	spec.MaxAttempts = maxAttempts
-	registry, err := NewRegistry([]RouteSpec{spec}, []string{callbackURL}, testGetenv)
+	registry, err := NewRegistry([]RouteSpec{spec}, testGetenv)
 	if err != nil {
 		t.Fatalf("NewRegistry(test server) error = %v", err)
 	}

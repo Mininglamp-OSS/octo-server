@@ -65,14 +65,3 @@ func LoadRouteSpecs(raw string) ([]RouteSpec, error) {
 	}
 	return specs, nil
 }
-
-func LoadAllowedURLs(raw string) []string {
-	parts := strings.Split(raw, ",")
-	urls := make([]string, 0, len(parts))
-	for _, part := range parts {
-		if value := strings.TrimSpace(part); value != "" {
-			urls = append(urls, value)
-		}
-	}
-	return urls
-}

@@ -205,13 +205,10 @@ robot API（legacy）`/robot/sendMessage` 同样接受 type-17（校验与 bot i
 fail-closed，不会落入无人消费的 Bot 队列。传输、队列与运维合同见
 [`card-action-callback-dispatch.md`](./card-action-callback-dispatch.md)。
 
-终态渲染按权威 owner/action 选择：docs 使用专用资源卡模板，其余已注册 route 使用
-服务端标准审批终态模板与申请人通知。因此标准审批消费方只新增 decide endpoint + route；
-只有定制视觉需要增加受审的 octo-server finalizer binding。
-
-标准审批初始卡同样不需要新增代码：route 可配置独立 `notify_token_env`，消费方用该 token
-向 `/v1/internal/notify` 提交结构化 `approval_card`。token 在服务端绑定 sender/owner/action；
-消费方不能自选 owner、callback URL 或提交任意卡片 JSON。
+一方消费方的 route/notify 配置、标准 action 卡、终态约束、回调验签、幂等、重试与 DLQ
+统一以 [`card-action-callback-dispatch.md`](./card-action-callback-dispatch.md) 和
+[`card-action-callback-consumer.md`](./card-action-callback-consumer.md) 为准；本文不重复维护
+消费方接入合同。
 
 - **状态在卡片内容里**：防重复操作 = 服务端幂等（业务身份键
   `message_id+action_id+operator_uid`，`client_token` 只是关联 ID）+ bot 重写

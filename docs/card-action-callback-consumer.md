@@ -1,8 +1,9 @@
 # Card action callback consumer integration
 
-This guide is for first-party services that consume interactive card actions
-from octo-server. A consumer implements one HTTPS decision endpoint; it does not
-poll a Bot queue, hold a Bot token, or call message/card APIs.
+This guide is for any first-party service that consumes interactive card
+actions from octo-server. A consumer implements one signed decision endpoint;
+it does not poll a Bot queue, hold a Bot token, or call message/card APIs. The
+contract is language- and owner-independent.
 
 For octo-server route configuration, monitoring, DLQ replay, and rollout, see
 [`card-action-callback-dispatch.md`](./card-action-callback-dispatch.md).
@@ -11,7 +12,10 @@ For octo-server route configuration, monitoring, DLQ replay, and rollout, see
 
 Before enabling a producer:
 
-1. Deploy an exact HTTPS endpoint with no redirect.
+1. Deploy an exact HTTPS endpoint with no redirect. An in-cluster or local
+   `http://` endpoint is also allowed when it is declared explicitly in the
+   octo-server `OCTO_CARD_ACTION_ROUTES` registry; the operations guide covers
+   its confidentiality and network-isolation requirements.
 2. Provision a callback HMAC secret of at least 32 random bytes in both
    services. For generic approval ingress, provision a second, distinct notify
    bearer token of the same minimum length.
@@ -24,33 +28,41 @@ Before enabling a producer:
    response in the same transaction.
 
 The callback is at-least-once. A timeout, process crash, or lost response can
-cause the same `event_id` to be delivered again.
+cause the same `event_id` to be delivered again. Keep clocks synchronized and
+reject timestamps outside a bounded freshness window; the reference
+implementation uses five minutes.
 
-## Standard approval onboarding
+## Standard action-card onboarding
 
 For a consumer using the standard terminal visual, no owner-specific
 octo-server code is required:
 
-1. Add the exact sender-bound callback route to `OCTO_CARD_ACTION_ROUTES`, set
-   `notify_token_env`, and add its URL to `OCTO_CARD_ACTION_ALLOWED_URLS`.
+1. Add the exact sender-bound callback route to `OCTO_CARD_ACTION_ROUTES` and
+   set `notify_token_env`. The route's `url` is itself the exact allowlist
+   entry — no separate URL list to maintain.
 2. Implement this signed decide contract and return a typed result.
 3. Call `/v1/internal/notify` with the route-bound token and an
-   `approval_card` containing `action_type`, display text, and bounded domain
-   identifiers.
+   `approval_card` containing `action_type`, display text, bounded domain
+   identifiers, and optional bounded actions.
 
 Example initial-card request:
 
 ```json
 {
   "space_id": "space-1",
-  "service": "smart-summary",
+  "service": "tasks",
   "targets": ["user-b"],
   "actor_uid": "user-a",
   "approval_card": {
-    "action_type": "summary.publish.decision",
-    "title": "Publish summary",
-    "description": "Review before publishing",
-    "data": {"task_no": "task-1"}
+    "action_type": "task.execute.decision",
+    "title": "Execute task",
+    "description": "Choose how to handle this task",
+    "data": {"task_id": "task-1"},
+    "actions": [
+      {"decision": "execute", "title": "Execute"},
+      {"decision": "reject", "title": "Reject"},
+      {"decision": "cancel", "title": "Cancel"}
+    ]
   }
 }
 ```
@@ -58,8 +70,27 @@ Example initial-card request:
 Send `X-Internal-Token: <the value named by notify_token_env>`. The token fixes
 `sender_uid` and `owner`; callers cannot select either. It can mint cards only
 for action types whose route repeats that `notify_token_env`. The server owns
-the Allow/Deny labels, action IDs, reserved metadata, layout, escaping, and
-profile. The request accepts neither callback URLs nor arbitrary card JSON.
+action IDs, reserved metadata, layout, escaping, and profile. The request
+accepts neither callback URLs nor arbitrary card JSON.
+
+`actions` is optional. Omit it to preserve the localized Allow/Deny actions and
+their `approve`/`deny` decisions. Sending `"actions": []` (an explicit empty
+array) is treated as a caller bug and rejected — the fallback path is nil, not
+an empty slice. When present, it contains 1-5 entries:
+
+- `decision`: a unique stable value matching `[a-z][a-z0-9_.-]{0,47}`;
+- `title`: trimmed display text containing 1-80 Unicode code points; control
+  characters (including tabs, newlines, and the BEL byte) are rejected so the
+  server never emits an unrenderable button label.
+
+octo-server derives each action ID as `approval-<decision>` and injects the
+route-bound owner/action type into every submit payload. Per-action data,
+styles, URLs, inputs, and caller-authored card JSON are not supported. Put
+bounded shared domain identifiers in the card's `data` map.
+
+Custom action titles are caller-provided display text. Supply the language
+appropriate for the target audience; octo-server validates and renders the
+text but does not translate consumer-specific wording.
 
 The generic request exposes consumer-specific identifiers in `data`. The
 docs-only `doc_id` and `request_id` top-level conveniences may be absent. For a
@@ -88,18 +119,15 @@ Example request body:
 ```json
 {
   "event_id": "9007199254740993",
-  "action_id": "approve",
-  "decision": "approve",
+  "action_id": "approval-execute",
+  "decision": "execute",
   "operator_uid": "user-b",
-  "doc_id": "doc-1",
-  "request_id": "request-1",
   "inputs": {},
   "data": {
-    "owner": "docs",
-    "action_type": "access_request.decision",
-    "decision": "approve",
-    "doc_id": "doc-1",
-    "request_id": "request-1"
+    "owner": "tasks",
+    "action_type": "task.execute.decision",
+    "decision": "execute",
+    "task_id": "task-1"
   },
   "message_id": "190001234567890",
   "channel_id": "notification",
@@ -113,6 +141,10 @@ Example request body:
 authorization grant. The consumer must still verify that this user can decide
 the referenced request. `data`, `channel_id`, and display fields must not be
 used as substitutes for consumer-owned ACL or request state.
+
+Treat `decision` as an enum owned by the consumer endpoint. Reject values that
+were not configured for this business action; never dispatch it as a method
+name, SQL fragment, URL, or other executable input.
 
 `event_id` is deliberately encoded as a decimal string because its full `int64`
 range exceeds JavaScript's safe integer range. Store and compare it as a string;
@@ -132,6 +164,25 @@ The signature is `v1=` followed by the lowercase hex HMAC-SHA256 of that
 canonical value. Hash the exact bytes received on the wire. Re-serializing JSON
 before verification changes the signature.
 
+### Language-neutral test vector
+
+Use this fixed non-production vector to verify any implementation. The body is
+the single UTF-8 line shown below with no trailing newline.
+
+```text
+secret:    0123456789abcdef0123456789abcdef
+method:    POST
+path:      /v1/card-actions/decide
+timestamp: 1784073600
+event_id:  9007199254740993
+body:      {"event_id":"9007199254740993","action_id":"approval-execute","decision":"execute","operator_uid":"user-b","inputs":{},"data":{"owner":"tasks","action_type":"task.execute.decision","decision":"execute","task_id":"task-1"},"message_id":"190001234567890","channel_id":"notification","channel_type":1,"space_id":"space-1","acted_at":1784073600}
+body_sha256: e5f9edc7558b6dbac6f754308b161d79a84e9d4635377a8afd6f95b6baa4c6cc
+X-Octo-Signature: v1=77d6abe3e80bd90d70545ce90d8c87daafd65a22b62919cee71b450613d6e50f
+```
+
+Changing any body byte, the escaped path, timestamp, or event ID must produce a
+different signature.
+
 The following Express example uses a fixed callback path and a five-minute
 freshness window. Mount `express.raw` for this route before any global
 `express.json` middleware.
@@ -143,7 +194,8 @@ import express, { type Request, type Response } from "express";
 const app = express();
 const callbackPath = "/v1/card-actions/decide";
 const maxSkewSeconds = 300;
-const configuredSecret = process.env.OCTO_DOCS_CARD_ACTION_SECRET;
+// Bind this name to the secret_env configured for this route.
+const configuredSecret = process.env.OCTO_CARD_ACTION_SECRET;
 
 type DecisionRequest = {
   event_id: string;
@@ -183,6 +235,7 @@ function parseDecisionRequest(value: unknown): DecisionRequest {
     "decision",
     "operator_uid",
     "message_id",
+    "channel_id",
   ];
   if (
     requiredStrings.some(
@@ -221,7 +274,7 @@ function parseDecisionRequest(value: unknown): DecisionRequest {
 
 if (!configuredSecret || Buffer.byteLength(configuredSecret) < 32) {
   throw new Error(
-    "OCTO_DOCS_CARD_ACTION_SECRET must contain at least 32 bytes",
+    "OCTO_CARD_ACTION_SECRET must contain at least 32 bytes",
   );
 }
 const secret = configuredSecret;
@@ -308,10 +361,11 @@ BEGIN
   SELECT stored_response FROM card_action_receipt WHERE event_id = ?
   if found: COMMIT and replay stored_response
 
-  lock the domain request identified by request_id/doc_id
+  validate the expected action_type and decision enum
+  lock the domain request identified by consumer-owned data (for example task_id)
   verify the request belongs to the expected Space/resource
   re-check operator_uid is currently authorized
-  CAS pending -> approved/denied (first valid decision wins)
+  apply the selected business operation with a CAS (first valid decision wins)
   INSERT card_action_receipt(event_id, stored_response) with UNIQUE(event_id)
 COMMIT
 return stored_response
@@ -334,19 +388,19 @@ type DecisionResult = {
 };
 ```
 
-Applied approval example:
+Applied action example:
 
 ```json
 {
   "disposition": "applied",
   "state": "approved",
   "requester_uid": "user-a",
-  "display": { "title": "Roadmap" }
+  "display": { "title": "Execute task" }
 }
 ```
 
 An idempotent replay must return the exact stored result for the same
-`event_id`. If the original result was the applied approval above, repeat that
+`event_id`. If the original result was the applied action above, repeat that
 same result; do not rewrite its disposition merely because this HTTP delivery
 is a replay. `replayed` is valid when it was the authoritative result initially
 stored for that event, for example when the business transition had already
@@ -357,7 +411,7 @@ been committed by another decision path:
   "disposition": "replayed",
   "state": "approved",
   "requester_uid": "user-a",
-  "display": { "title": "Roadmap" }
+  "display": { "title": "Execute task" }
 }
 ```
 
@@ -367,10 +421,29 @@ Business rejection is also a typed HTTP 200 response, not an HTTP 403:
 { "disposition": "forbidden", "state": "pending" }
 ```
 
+The selected `decision` and returned `state` are separate contracts. A custom
+decision such as `execute`, `reject`, or `cancel` does not create a new state:
+
+- return `approved` when the requested operation was accepted/completed;
+- return `denied` when it was authoritatively rejected;
+- return `cancelled` when the underlying request was cancelled;
+- use `pending` only to report the current authoritative non-terminal domain
+  state. octo-server still removes the actions and renders the standard
+  unavailable terminal visual; it does not leave the card interactive.
+
+Every valid typed response finalizes and ACKs this card action. If these four
+states or the standard terminal wording cannot represent the result, the
+consumer needs a separately reviewed finalizer/template rather than inventing
+callback response fields.
+
 `requester_uid` is required whenever `state` is `approved` or `denied`, because
-octo-server must notify the applicant. Responses are limited to 64 KiB and the
-current decoder rejects unknown top-level fields. Coordinate schema additions
-with an octo-server release.
+octo-server must notify the applicant. It must be the consumer-authoritative
+request initiator, not the operator or an unverified callback field. Responses
+are limited to 64 KiB and the current decoder rejects unknown top-level fields.
+`display` accepts at most 32 string fields; keys are non-empty and at most 64
+bytes, and values are at most 500 Unicode code points. The standard finalizer
+currently consumes only `display.title`. Coordinate schema additions with an
+octo-server release.
 
 For standard approval routes, the originating card must carry an authoritative
 `space_id`; terminal requester notification fails closed without it.
@@ -379,7 +452,7 @@ For standard approval routes, the originating card must carry an authoritative
 
 | Consumer response                             | octo-server behavior                               |
 | --------------------------------------------- | -------------------------------------------------- |
-| `2xx` + valid typed body                      | Finalize card and applicant notification, then ACK |
+| `2xx` + valid typed body                      | Finalize card; approved/denied also notify requester; then ACK |
 | `408`, `429`, or `5xx`                        | Retry with bounded exponential backoff             |
 | Other `4xx`                                   | Permanent rejection; move to DLQ                   |
 | `3xx`                                         | Redirect rejected; move to DLQ                     |
@@ -396,7 +469,8 @@ Do not return HTTP 403/404 for normal domain outcomes; use the typed
 - stale timestamp fails verification;
 - header/body `event_id` mismatch fails verification;
 - duplicate `event_id` replays one stored response without a second transition;
-- concurrent approve/deny produces one domain winner;
+- an unknown `decision` is rejected without a domain transition;
+- concurrent decisions produce one domain winner;
 - operator removed from ACL before click returns `forbidden`;
 - terminal `approved`/`denied` always includes `requester_uid`;
 - transient `5xx` can be retried safely.

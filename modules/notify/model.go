@@ -28,6 +28,18 @@ type ApprovalCardFields struct {
 	Title       string            `json:"title"`
 	Description string            `json:"description"`
 	Data        map[string]string `json:"data"`
+	// Actions is optional. When omitted, octo-server renders the localized
+	// approve/deny buttons (byte-compatible with the pre-http-actions release).
+	// When present, it must contain 1..MaxApprovalCustomActions items; each
+	// decision is a stable callback token and each title is display text.
+	Actions []ApprovalCardAction `json:"actions,omitempty"`
+}
+
+// ApprovalCardAction lets the caller name a bounded, custom button on the
+// generic approval card. Server owns the action ID and reserved metadata.
+type ApprovalCardAction struct {
+	Decision string `json:"decision"`
+	Title    string `json:"title"`
 }
 
 // SummaryCardFields 是 summary-notify 卡片通知的结构化入参(跨仓契约,见

@@ -48,8 +48,9 @@ func Retryable(err error) bool {
 func NewHTTPDeliverer(transport http.RoundTripper, clock func() time.Time) *HTTPDeliverer {
 	if transport == nil {
 		base := http.DefaultTransport.(*http.Transport).Clone()
-		// Routes are already exact, static HTTPS URLs. Ignoring proxy environment
-		// variables prevents deployment-level proxy settings from reopening SSRF.
+		// Routes are already exact, static URLs registered by operators.
+		// Ignoring proxy environment variables prevents deployment-level proxy
+		// settings from reopening SSRF for both http and https destinations.
 		base.Proxy = nil
 		transport = base
 	}

@@ -42,7 +42,6 @@ func testGetenv(key string) string {
 func TestRegistryResolveIsBoundToStoredSender(t *testing.T) {
 	registry, err := NewRegistry(
 		[]RouteSpec{validRouteSpec()},
-		[]string{"https://docs.internal/v1/card-actions/decide"},
 		testGetenv,
 	)
 	if err != nil {
@@ -103,46 +102,47 @@ func TestNewRegistryRejectsUnsafeOrAmbiguousRoutes(t *testing.T) {
 	tests := []struct {
 		name       string
 		mutate     func(*RouteSpec)
-		allowed    []string
 		getenv     func(string) string
 		additional []RouteSpec
 	}{
 		{
-			name: "non https URL",
+			name: "unsupported scheme",
 			mutate: func(spec *RouteSpec) {
-				spec.URL = "http://docs.internal/v1/card-actions/decide"
+				spec.URL = "ftp://docs.internal/v1/card-actions/decide"
 			},
-			allowed: []string{"http://docs.internal/v1/card-actions/decide"},
 		},
 		{
 			name: "credential bearing URL",
 			mutate: func(spec *RouteSpec) {
 				spec.URL = "https://user:pass@docs.internal/v1/card-actions/decide"
 			},
-			allowed: []string{"https://user:pass@docs.internal/v1/card-actions/decide"},
 		},
 		{
 			name: "fragment bearing URL",
 			mutate: func(spec *RouteSpec) {
 				spec.URL = "https://docs.internal/v1/card-actions/decide#fragment"
 			},
-			allowed: []string{"https://docs.internal/v1/card-actions/decide#fragment"},
 		},
 		{
-			name:    "URL not in exact allowlist",
-			mutate:  func(*RouteSpec) {},
-			allowed: []string{"https://other.internal/v1/card-actions/decide"},
+			name: "query bearing URL",
+			mutate: func(spec *RouteSpec) {
+				spec.URL = "https://docs.internal/v1/card-actions/decide?trace=1"
+			},
 		},
 		{
-			name:    "missing secret",
-			mutate:  func(*RouteSpec) {},
-			allowed: []string{"https://docs.internal/v1/card-actions/decide"},
-			getenv:  func(string) string { return "" },
+			name: "URL missing host",
+			mutate: func(spec *RouteSpec) {
+				spec.URL = "https:///v1/card-actions/decide"
+			},
 		},
 		{
-			name:    "duplicate route key",
-			mutate:  func(*RouteSpec) {},
-			allowed: []string{"https://docs.internal/v1/card-actions/decide"},
+			name:   "missing secret",
+			mutate: func(*RouteSpec) {},
+			getenv: func(string) string { return "" },
+		},
+		{
+			name:   "duplicate route key",
+			mutate: func(*RouteSpec) {},
 			additional: []RouteSpec{
 				validRouteSpec(),
 			},
@@ -157,7 +157,7 @@ func TestNewRegistryRejectsUnsafeOrAmbiguousRoutes(t *testing.T) {
 			if getenv == nil {
 				getenv = testGetenv
 			}
-			_, err := NewRegistry(append([]RouteSpec{spec}, tt.additional...), tt.allowed, getenv)
+			_, err := NewRegistry(append([]RouteSpec{spec}, tt.additional...), getenv)
 			if err == nil {
 				t.Fatal("NewRegistry() error = nil, want configuration rejection")
 			}
@@ -216,7 +216,7 @@ func TestRegistryBindsNotifyTokenToOnlyConfiguredOwnerActions(t *testing.T) {
 			return ""
 		}
 	}
-	registry, err := NewRegistry([]RouteSpec{primary, secondary}, []string{primary.URL}, getenv)
+	registry, err := NewRegistry([]RouteSpec{primary, secondary}, getenv)
 	if err != nil {
 		t.Fatalf("NewRegistry() error = %v", err)
 	}
@@ -314,7 +314,7 @@ func TestRegistryRejectsUnsafeNotifyTokenBindings(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, err := NewRegistry(tt.specs(), []string{validRouteSpec().URL}, tt.getenv); err == nil {
+			if _, err := NewRegistry(tt.specs(), tt.getenv); err == nil {
 				t.Fatal("NewRegistry() error = nil")
 			}
 		})
@@ -330,7 +330,7 @@ func TestRegistryRejectsNotifyTokenThatConflictsWithBroaderIngress(t *testing.T)
 		}
 		return testGetenv(key)
 	}
-	registry, err := NewRegistry([]RouteSpec{spec}, []string{spec.URL}, getenv)
+	registry, err := NewRegistry([]RouteSpec{spec}, getenv)
 	if err != nil {
 		t.Fatalf("NewRegistry() error = %v", err)
 	}
