@@ -29,8 +29,17 @@ type SearchGlobalGroupsReq struct {
 
 // GroupsResult is the `data` object of the L1 response. The outer envelope is
 // the shared {data, pagination} shell (pagination.has_more = 命中群数 >
-// maxGroups; next_cursor is always ""). total_groups is a cardinality HLL
-// estimate so total_groups_approx is always true.
+// maxGroups; next_cursor is always "").
+//
+// total_groups is a cardinality HLL estimate over the PRE-visibility candidate
+// set, so total_groups_approx is always true. Per the aggregation-first design
+// §6 ("count 近似，精确计数成本无界不做") this is an accepted, non-sensitive
+// pre-filter approximation — deliberately NOT post-calibrated against
+// filterVisible (owner decision, option A): recomputing it could only count the
+// visible docs inside the bounded sampling window, which is itself an
+// approximation at unbounded cost. Contrast latest_at / bucket order, which WERE
+// real leaks of hidden messages' recency and are now recomputed from the visible
+// hit (see GroupBucket.LatestAt).
 type GroupsResult struct {
 	Sequence          int64         `json:"sequence"`
 	QueryID           string        `json:"query_id"`
@@ -43,10 +52,20 @@ type GroupsResult struct {
 // reversed peer uid in ChannelID (channel_type=1) with no parent_group_no /
 // thread fields; group buckets set parent_group_no to their own channel_id;
 // thread buckets (channel_type=5) carry parent_group_no + thread_id +
-// thread_name. match_count is the OS doc_count (pre-visibility) so
-// match_count_approx is always true. latest_at, by contrast, is recomputed from
-// the calibrated visible hit (see calibratedBucket.latestVisibleTS) — never the
-// OS pre-filter max(timestamp) — so a hidden newest match cannot leak its time.
+// thread_name.
+//
+// match_count is the OS doc_count — a PRE-visibility approximate metric, so
+// match_count_approx is always true. Per design §6 + owner decision (option A)
+// it is deliberately left as the pre-filter count and NOT post-calibrated: it
+// therefore INCLUDES hits hidden from the caller by the five visibility gates
+// (admin/mutual delete, self-delete, cleared history, visibles) and so may read
+// HIGHER than the number of messages the caller can actually open. This is an
+// accepted, non-sensitive approximation (it exposes only a possibly-inflated
+// count, never a hidden message's content/sender/time); match_count_approx=true
+// is the wire signal of exactly this. latest_at, by contrast, IS recomputed
+// from the calibrated visible hit (see calibratedBucket.latestVisibleTS) — never
+// the OS pre-filter max(timestamp) — because a hidden newest match there would
+// leak its time and bias bucket order (a real leak, now fixed).
 type GroupBucket struct {
 	ChannelID        string       `json:"channel_id"`
 	ChannelType      uint8        `json:"channel_type"`
@@ -54,6 +73,9 @@ type GroupBucket struct {
 	GroupName        string       `json:"group_name"`
 	ThreadID         string       `json:"thread_id,omitempty"`
 	ThreadName       string       `json:"thread_name,omitempty"`
+	// MatchCount is the pre-visibility OS doc_count (may exceed the caller's
+	// visible count — see the type doc). Left as-is by design §6 / owner
+	// option A; MatchCountApprox flags it.
 	MatchCount       int64        `json:"match_count"`
 	MatchCountApprox bool         `json:"match_count_approx"`
 	LatestAt         string       `json:"latest_at"`
@@ -445,8 +467,11 @@ func assembleGroupBucket(pb parsedBucket, latestAtMS int64, preview []MessageHit
 	}
 	ct, wireID, parentGroupNo, threadShortID := classifyGroupBucket(pb.key, loginUID)
 	gb := GroupBucket{
-		ChannelID:        wireID,
-		ChannelType:      ct,
+		ChannelID:   wireID,
+		ChannelType: ct,
+		// match_count = pre-visibility OS doc_count (design §6 / owner option A):
+		// kept as the pre-filter approximation, may include hidden hits, flagged
+		// by MatchCountApprox. Only latest_at is recalibrated to visible hits.
 		MatchCount:       pb.docCount,
 		MatchCountApprox: true,
 		LatestAt:         msToRFC3339(latestAtMS),
