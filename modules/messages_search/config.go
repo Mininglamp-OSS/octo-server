@@ -65,6 +65,34 @@ type SearchConfig struct {
 	//     misclassifying queries in production and a one-line config flip
 	//     is preferable to a redeploy.
 	StopwordStripEnabled bool
+	// Groups holds the L1 group-aggregation (_search_global_groups) knobs.
+	// See aggregation-first design doc §9; every value is config-driven, never
+	// hardcoded, and never controlled by the request.
+	Groups GroupAggConfig
+}
+
+// GroupAggConfig carries the L1 aggregation (_search_global_groups) tunables.
+//
+//   - MaxGroups: terms(channelId) bucket cap. Beyond it the response sets
+//     pagination.has_more=true and returns the most-active MaxGroups buckets.
+//   - PerGroupMax: single-group preview cap (clamp N to this).
+//   - PresenceProbe: over-fetch margin. top_hits size T = PerGroupMax +
+//     PresenceProbe so backend B's presence calibration has sample headroom.
+//   - PreviewBudget / K2: reserved for backend B (per-frequency preview
+//     allocation / presence deep-probe cap); read here so the config surface
+//     is complete and the two PRs don't re-open config.go.
+type GroupAggConfig struct {
+	MaxGroups     int
+	PerGroupMax   int
+	PresenceProbe int
+	PreviewBudget int
+	K2            int
+}
+
+// TopHitsSize is the over-fetch size T for the per-bucket top_hits preview
+// aggregation: PerGroupMax preview slots + PresenceProbe calibration headroom.
+func (g GroupAggConfig) TopHitsSize() int {
+	return g.PerGroupMax + g.PresenceProbe
 }
 
 // RateLimitCfg drives the per-loginUID 5 QPS / 20 burst limiter.
@@ -94,6 +122,13 @@ func loadConfig() SearchConfig {
 		// the ops kill switch documented in
 		// docs/messages-search/2026-06-23-multimatch-or-trap-fix.md §8.
 		StopwordStripEnabled: parseBool(os.Getenv("OCTO_SEARCH_STOPWORD_STRIP_ENABLED"), true),
+		Groups: GroupAggConfig{
+			MaxGroups:     parseInt(os.Getenv("OCTO_SEARCH_GROUPS_MAX_GROUPS"), 200),
+			PerGroupMax:   parseInt(os.Getenv("OCTO_SEARCH_GROUPS_PER_GROUP_MAX"), 20),
+			PresenceProbe: parseInt(os.Getenv("OCTO_SEARCH_GROUPS_PRESENCE_PROBE"), 20),
+			PreviewBudget: parseInt(os.Getenv("OCTO_SEARCH_GROUPS_PREVIEW_BUDGET"), 500),
+			K2:            parseInt(os.Getenv("OCTO_SEARCH_GROUPS_K2"), 500),
+		},
 	}
 }
 

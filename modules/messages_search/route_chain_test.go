@@ -16,11 +16,11 @@ import (
 // test would flag the drift.
 func TestRouteMountersCoverAllEndpoints(t *testing.T) {
 	// _search, _search_media, _search_files, _search_all, _search_around,
-	// _search_global_messages, _search_global_files. The _search_file_types
-	// enum endpoint is intentionally NOT mounted via registerRoute — it lives
-	// on a separate group without backendGate/Space (§7.5), so it must be
-	// excluded from this counter.
-	const wantEndpoints = 7
+	// _search_global_messages, _search_global_files, _search_global_groups.
+	// The _search_file_types enum endpoint is intentionally NOT mounted via
+	// registerRoute — it lives on a separate group without backendGate/Space
+	// (§7.5), so it must be excluded from this counter.
+	const wantEndpoints = 8
 	if len(routeMounters) != wantEndpoints {
 		t.Fatalf("expected %d endpoints registered via registerRoute (so all go "+
 			"through the shared rate-limit/audit/backendGate chain), got %d. "+
