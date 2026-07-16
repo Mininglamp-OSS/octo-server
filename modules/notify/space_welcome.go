@@ -31,6 +31,27 @@ import (
 
 const langResolveTimeout = 2 * time.Second
 
+// swBotReadyTimeout caps the (context-less) bot-readiness probe so a hung
+// WuKongIM / DB dependency cannot wedge the single worker goroutine or Stop().
+const swBotReadyTimeout = 5 * time.Second
+
+// callWithTimeout runs fn in a goroutine and returns (result, true) if it
+// completes within d, or (zero, false) on timeout. On timeout the goroutine is
+// left to finish in the background (a bounded leak on a degenerate hung
+// dependency) — the point is that the caller (the worker) is never blocked
+// beyond d, so pre-IM retry / clean Stop always make progress.
+func callWithTimeout[T any](d time.Duration, fn func() T) (T, bool) {
+	ch := make(chan T, 1)
+	go func() { ch <- fn() }()
+	select {
+	case v := <-ch:
+		return v, true
+	case <-time.After(d):
+		var zero T
+		return zero, false
+	}
+}
+
 // spaceWelcomeService owns the reconciler + worker goroutines and the enqueue
 // path. It is constructed once per process by Notify.New and started/stopped via
 // the module Start/Stop hooks.
@@ -274,6 +295,13 @@ func (s *spaceWelcomeService) runWorkerWake(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		// Re-read the config each iteration (a cheap atomic snapshot read) so an
+		// admin disable or Space switch stops NEW claims immediately on this
+		// replica, rather than after the current wake's 20-row budget drains.
+		cur := s.settings.SpaceWelcomeConfig()
+		if !cur.Enabled || cur.SpaceID != cfg.SpaceID {
+			return
+		}
 		claimCtx, cancel := context.WithTimeout(ctx, swDBCallTimeout)
 		row, err := s.store.claimOne(claimCtx, cfg.SpaceID, s.now())
 		cancel()
@@ -343,12 +371,32 @@ func (s *spaceWelcomeService) dispatch(ctx context.Context, cfg common.SpaceWelc
 	}
 
 	// Bot must be ready before we cross into dispatching. Not ready → pre-IM.
-	if s.botReady != nil && !s.botReady() {
-		s.preIMFailure(ctx, row, swErrBotNotReady)
+	// Bounded: ensureNotifyBotReady issues DB + network calls with no context of
+	// its own, so we cap it here — a hung dependency must not wedge the single
+	// worker (nor Stop()). A timeout is treated as bot-not-ready (pre-IM retry).
+	if s.botReady != nil {
+		ready, ok := callWithTimeout(swBotReadyTimeout, s.botReady)
+		if !ok || !ready {
+			s.preIMFailure(ctx, row, swErrBotNotReady)
+			return
+		}
+	}
+
+	// Preflight the IM endpoint BEFORE crossing into dispatching. An unconfigured
+	// APIURL means no HTTP will be sent — that is a definitive pre-IM failure
+	// (retryable once config is fixed), NOT a transport-ambiguous unknown.
+	if s.ctx.GetConfig().WuKongIM.APIURL == "" {
+		s.preIMFailure(ctx, row, swErrConfigRead)
 		return
 	}
 
-	lang := s.resolveLanguage(row.UID)
+	// Language resolution is bounded the same way: the 2s context inside
+	// resolveLanguage may not interrupt a hung cache/DB, so cap the whole call
+	// and fall back to the default language on timeout (never a retryable error).
+	lang, langOK := callWithTimeout(langResolveTimeout+time.Second, func() string { return s.resolveLanguage(row.UID) })
+	if !langOK {
+		lang = i18n.OutboundLanguage(context.Background())
+	}
 
 	dsCtx, cancel := context.WithTimeout(ctx, swDBCallTimeout)
 	ok, err := s.store.casToDispatching(dsCtx, row.ID, lang, s.now())

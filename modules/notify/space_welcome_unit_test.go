@@ -122,3 +122,27 @@ func TestClaimOwnerID(t *testing.T) {
 	assert.Contains(t, owner, ":", "owner must be <hostname>:<pid>")
 	assert.NotEqual(t, ":", owner)
 }
+
+func TestResolveLanguage_FallbackWhenNoService(t *testing.T) {
+	// langSvc == nil (no cache in this env) must fall back to the default
+	// outbound language, never empty, never an error/retry.
+	svc := &spaceWelcomeService{}
+	lang := svc.resolveLanguage("u_1")
+	assert.NotEmpty(t, lang, "must fall back to OCTO_DEFAULT_LANGUAGE, never empty")
+}
+
+func TestCallWithTimeout(t *testing.T) {
+	// Completes within the deadline → (value, true).
+	v, ok := callWithTimeout(time.Second, func() int { return 42 })
+	assert.True(t, ok)
+	assert.Equal(t, 42, v)
+
+	// Exceeds the deadline → (zero, false); the caller is unblocked promptly.
+	start := time.Now()
+	_, ok = callWithTimeout(50*time.Millisecond, func() string {
+		time.Sleep(500 * time.Millisecond)
+		return "late"
+	})
+	assert.False(t, ok, "a hung call must time out")
+	assert.Less(t, time.Since(start), 300*time.Millisecond, "caller must not block for the full call")
+}

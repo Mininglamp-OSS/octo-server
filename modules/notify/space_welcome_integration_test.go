@@ -2,6 +2,7 @@ package notify
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -604,3 +605,106 @@ func TestService_ReconcileOnce_CatchUp(t *testing.T) {
 }
 
 func ptrTime(t time.Time) *time.Time { return &t }
+
+// ---------------------------------------------------------------------------
+// Review follow-ups: worker drive-loop cap, immediate disable, config-error
+// preflight (P1-2 / P2-4).
+// ---------------------------------------------------------------------------
+
+// TestService_Worker_WakeCap seeds more than the per-wake cap of pending rows
+// and verifies one runWorkerWake claims at most swWorkerWakeCap of them.
+func TestService_Worker_WakeCap(t *testing.T) {
+	ctx := swTestServer(t)
+	settings := common.EnsureSystemSettings(ctx)
+	activeFrom := time.Now().UTC().Add(-time.Hour)
+	swInsertSpace(t, ctx, "spc_1", 1)
+	swSetConfig(t, ctx, settings, swEnabledConfig("spc_1", activeFrom))
+
+	total := swWorkerWakeCap + 5
+	for i := 0; i < total; i++ {
+		uid := fmt.Sprintf("u_%02d", i)
+		swInsertUser(t, ctx, uid, 0)
+		swInsertMember(t, ctx, "spc_1", uid, 1, time.Now().UTC())
+		swInsertLedger(t, ctx, "spc_1", uid, swStatusPending, "", nil, 0)
+	}
+
+	svc := swNewService(ctx, settings)
+	svc.sendFn = func(_ context.Context, _ *config.MsgSendReq) (*swSendResult, error) {
+		return &swSendResult{messageID: 1, clientMsgNo: "x"}, nil
+	}
+	svc.runWorkerWake(bg())
+
+	var sent, pending int64
+	sent, _ = svc.store.countByStatus(bg(), "spc_1", swStatusSent)
+	pending, _ = svc.store.countByStatus(bg(), "spc_1", swStatusPending)
+	assert.EqualValues(t, swWorkerWakeCap, sent, "one wake sends at most the per-wake cap")
+	assert.EqualValues(t, 5, pending, "the remainder stays pending for the next wake")
+}
+
+// TestService_Worker_ImmediateDisableMidDrain flips the config to disabled after
+// the first successful send; the worker must stop claiming the rest of this wake
+// (not drain the full cap). Guards the P1-2 fix.
+func TestService_Worker_ImmediateDisableMidDrain(t *testing.T) {
+	ctx := swTestServer(t)
+	settings := common.EnsureSystemSettings(ctx)
+	activeFrom := time.Now().UTC().Add(-time.Hour)
+	swInsertSpace(t, ctx, "spc_1", 1)
+	swSetConfig(t, ctx, settings, swEnabledConfig("spc_1", activeFrom))
+
+	for i := 0; i < 3; i++ {
+		uid := fmt.Sprintf("u_%02d", i)
+		swInsertUser(t, ctx, uid, 0)
+		swInsertMember(t, ctx, "spc_1", uid, 1, time.Now().UTC())
+		swInsertLedger(t, ctx, "spc_1", uid, swStatusPending, "", nil, 0)
+	}
+
+	svc := swNewService(ctx, settings)
+	svc.sendFn = func(_ context.Context, _ *config.MsgSendReq) (*swSendResult, error) {
+		// Disable the feature right after the first delivery, mimicking an admin
+		// flip mid-wake, and reload the shared snapshot.
+		_, _ = ctx.DB().InsertBySql(
+			"INSERT INTO system_setting (category, key_name, value, value_type, description) VALUES ('onboarding','space_welcome_enabled','0','bool','') " +
+				"ON DUPLICATE KEY UPDATE value='0'").Exec()
+		_ = settings.Reload()
+		return &swSendResult{messageID: 1, clientMsgNo: "x"}, nil
+	}
+	svc.runWorkerWake(bg())
+
+	sent, _ := svc.store.countByStatus(bg(), "spc_1", swStatusSent)
+	pending, _ := svc.store.countByStatus(bg(), "spc_1", swStatusPending)
+	assert.EqualValues(t, 1, sent, "disable mid-wake stops further claims immediately")
+	assert.EqualValues(t, 2, pending, "rows not yet claimed stay pending")
+}
+
+// TestService_Dispatch_EmptyAPIURL_PreIMNotUnknown verifies an unconfigured IM
+// endpoint is a retryable pre-IM failure (attempts+1, back to pending), NOT a
+// terminal unknown. Guards the P2-4 fix.
+func TestService_Dispatch_EmptyAPIURL_PreIMNotUnknown(t *testing.T) {
+	ctx := swTestServer(t)
+	settings := common.EnsureSystemSettings(ctx)
+	activeFrom := time.Now().UTC().Add(-time.Hour)
+	swInsertSpace(t, ctx, "spc_1", 1)
+	swInsertUser(t, ctx, "u_1", 0)
+	swInsertMember(t, ctx, "spc_1", "u_1", 1, time.Now().UTC())
+	swSetConfig(t, ctx, settings, swEnabledConfig("spc_1", activeFrom))
+
+	svc := swNewService(ctx, settings)
+	sendCalled := false
+	svc.sendFn = func(_ context.Context, _ *config.MsgSendReq) (*swSendResult, error) {
+		sendCalled = true
+		return &swSendResult{messageID: 1}, nil
+	}
+	// Blank the IM endpoint and restore afterwards.
+	cfg := ctx.GetConfig()
+	orig := cfg.WuKongIM.APIURL
+	cfg.WuKongIM.APIURL = ""
+	defer func() { cfg.WuKongIM.APIURL = orig }()
+
+	id := swInsertLedger(t, ctx, "spc_1", "u_1", swStatusClaimed, svc.store.claimOwner, ptrTime(time.Now().UTC().Add(time.Minute)), 0)
+	svc.dispatch(bg(), settings.SpaceWelcomeConfig(), &spaceWelcomeRow{ID: id, SpaceID: "spc_1", UID: "u_1"})
+
+	status, attempts, _, _, _ := swRowStatus(t, ctx, id)
+	assert.Equal(t, swStatusPending, status, "config error must be pre-IM retryable, not unknown")
+	assert.Equal(t, 1, attempts, "pre-IM failure increments attempts")
+	assert.False(t, sendCalled, "no HTTP send should be attempted with an empty APIURL")
+}

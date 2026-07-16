@@ -325,3 +325,18 @@ func (s *spaceWelcomeStore) spaceActive(ctx context.Context, spaceID string) (bo
 	}
 	return n > 0, nil
 }
+
+// countByStatus returns the number of ledger rows for spaceID in the given
+// status. Used by the drive-loop / disable tests to assert claimed vs pending
+// counts (and available for a future pending_backlog gauge).
+func (s *spaceWelcomeStore) countByStatus(ctx context.Context, spaceID string, status int) (int64, error) {
+	var n int64
+	err := s.db.SelectBySql(
+		"SELECT COUNT(*) FROM "+spaceWelcomeTable+" WHERE space_id=? AND status=?",
+		spaceID, status,
+	).LoadOneContext(ctx, &n)
+	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
+		return 0, err
+	}
+	return n, nil
+}
