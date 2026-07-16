@@ -146,10 +146,12 @@ func buildApprovalActions(input ApprovalRequestCard, baseData map[string]interfa
 		denyData["decision"] = "deny"
 		return []interface{}{
 			map[string]interface{}{
-				"type": "Action.Submit", "id": ApprovalApproveActionID, "title": approveTitle, "data": approveData,
+				"type": "Action.Submit", "id": ApprovalApproveActionID, "title": approveTitle,
+				"style": "positive", "data": approveData,
 			},
 			map[string]interface{}{
-				"type": "Action.Submit", "id": ApprovalDenyActionID, "title": denyTitle, "data": denyData,
+				"type": "Action.Submit", "id": ApprovalDenyActionID, "title": denyTitle,
+				"style": "destructive", "data": denyData,
 			},
 		}, nil
 	}

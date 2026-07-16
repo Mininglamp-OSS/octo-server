@@ -36,6 +36,7 @@ func TestBuildApprovalRequestCardOwnsActionsAndReservedMetadata(t *testing.T) {
 		t.Fatalf("actions = %+v", actions)
 	}
 	decisions := map[string]bool{}
+	styles := map[string]string{}
 	for _, value := range actions {
 		action, _ := value.(map[string]interface{})
 		data, _ := action["data"].(map[string]interface{})
@@ -44,9 +45,16 @@ func TestBuildApprovalRequestCardOwnsActionsAndReservedMetadata(t *testing.T) {
 		}
 		decision, _ := data["decision"].(string)
 		decisions[decision] = true
+		styles[decision], _ = action["style"].(string)
 	}
 	if !decisions["approve"] || !decisions["deny"] {
 		t.Fatalf("decisions = %+v", decisions)
+	}
+	// approve/deny carry ActionStyle so clients render a primary vs secondary
+	// affordance instead of two identical buttons. cardmsg.Validate (above)
+	// already accepted style, so this is a pure additive on the wire.
+	if styles["approve"] != "positive" || styles["deny"] != "destructive" {
+		t.Fatalf("action styles = %+v (want approve=positive, deny=destructive)", styles)
 	}
 	if strings.Contains(string(raw), "http") {
 		t.Fatalf("approval request leaked a callback URL: %s", raw)

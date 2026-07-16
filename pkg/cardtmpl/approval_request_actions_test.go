@@ -65,11 +65,17 @@ func TestBuildApprovalRequestCardCustomActionsRenderServerBuiltButtons(t *testin
 	}
 }
 
-// TestBuildApprovalRequestCardOmittedActionsIsByteCompatible verifies the
-// http-actions change does not perturb the legacy approve/deny output. The
-// exact bytes below are captured from the pre-http-actions release; any drift
-// in ordering, keys, escaping, or reserved metadata will fail this test and
-// force a wire-contract review before shipping.
+// TestBuildApprovalRequestCardOmittedActionsIsByteCompatible pins the legacy
+// approve/deny wire form. The golden below is the frozen reference; any drift
+// in ordering, keys, escaping, or reserved metadata fails this test and forces
+// a deliberate wire-contract review before shipping.
+//
+// Reviewed change: the approve/deny buttons now carry ActionStyle
+// (approve="positive", deny="destructive") so clients render a primary vs
+// secondary affordance instead of two identical buttons. cardmsg.Validate
+// accepts it (type-based action validation, no whitelist change), and it is a
+// purely additive key — no existing key/order/escaping moved. Golden updated
+// to match; everything else stays byte-identical to #588.
 func TestBuildApprovalRequestCardOmittedActionsIsByteCompatible(t *testing.T) {
 	raw, err := BuildApprovalRequestCard(ApprovalRequestCard{
 		Title:        "Publish summary",
@@ -83,9 +89,9 @@ func TestBuildApprovalRequestCardOmittedActionsIsByteCompatible(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildApprovalRequestCard() error = %v", err)
 	}
-	const golden = `{"actions":[{"data":{"action_type":"summary.publish.decision","decision":"approve","owner":"smart-summary","task_no":"task-1"},"id":"approval-approve","title":"Allow","type":"Action.Submit"},{"data":{"action_type":"summary.publish.decision","decision":"deny","owner":"smart-summary","task_no":"task-1"},"id":"approval-deny","title":"Deny","type":"Action.Submit"}],"body":[{"text":"Publish summary","type":"TextBlock","weight":"Bolder","wrap":true},{"text":"Review before publishing","type":"TextBlock","wrap":true}],"type":"AdaptiveCard","version":"1.5"}`
+	const golden = `{"actions":[{"data":{"action_type":"summary.publish.decision","decision":"approve","owner":"smart-summary","task_no":"task-1"},"id":"approval-approve","style":"positive","title":"Allow","type":"Action.Submit"},{"data":{"action_type":"summary.publish.decision","decision":"deny","owner":"smart-summary","task_no":"task-1"},"id":"approval-deny","style":"destructive","title":"Deny","type":"Action.Submit"}],"body":[{"text":"Publish summary","type":"TextBlock","weight":"Bolder","wrap":true},{"text":"Review before publishing","type":"TextBlock","wrap":true}],"type":"AdaptiveCard","version":"1.5"}`
 	if string(raw) != golden {
-		t.Fatalf("legacy approve/deny bytes drifted from #588\n  got: %s\n want: %s", raw, golden)
+		t.Fatalf("legacy approve/deny bytes drifted from reviewed baseline\n  got: %s\n want: %s", raw, golden)
 	}
 }
 
