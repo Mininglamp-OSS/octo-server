@@ -290,10 +290,12 @@ func (m *Message) pinnedMessage(c *wkhttp.Context) {
 			if contentStr, ok := payloadMap["content"].(string); ok {
 				content = fmt.Sprintf("`%s`", contentStr)
 			} else {
-				content = common.GetDisplayText(contentType)
+				content = displayContentTypeText(contentType)
 			}
 		} else {
-			content = common.GetDisplayText(contentType)
+			// card-message-protocol P1 finding #3：经本地 helper，type-17 置顶
+			// tip 显示 [卡片] 而非「未知消息类型」。
+			content = displayContentTypeText(contentType)
 		}
 		mesageContent := fmt.Sprintf("{0} 置顶了%s", content)
 		// YUJ-660 Medium-1 partial: 此 Tip 在 PERSONAL DM 上同样需要服务端权威

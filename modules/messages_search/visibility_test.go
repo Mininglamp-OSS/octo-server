@@ -38,6 +38,7 @@ type stubProbe struct {
 	gotUserDeletedUID string
 	gotOffsetUID      string
 	gotOffsetChannel  string
+	gotOffsetChannels []string
 }
 
 func (s *stubProbe) RevokedSet(ids []string) (map[string]struct{}, error) {
@@ -94,6 +95,28 @@ func (s *stubProbe) ChannelOffset(uid, channelID string) (uint32, error) {
 		return 0, s.offsetErr
 	}
 	return s.offsetByUC[uid+":"+channelID], nil
+}
+
+// ChannelOffsets is the batch variant. Reuses offsetByUC / offsetErr so
+// existing tests that only populate the single-channel map continue to work
+// unchanged. Fail-closed error semantics mirror ChannelOffset.
+func (s *stubProbe) ChannelOffsets(uid string, channelIDs []string) (map[string]uint32, error) {
+	s.offsetCalls++
+	s.gotOffsetUID = uid
+	if len(channelIDs) == 1 {
+		s.gotOffsetChannel = channelIDs[0]
+	}
+	s.gotOffsetChannels = append([]string{}, channelIDs...)
+	if s.offsetErr != nil {
+		return nil, s.offsetErr
+	}
+	out := make(map[string]uint32, len(channelIDs))
+	for _, cid := range channelIDs {
+		if v, ok := s.offsetByUC[uid+":"+cid]; ok {
+			out[cid] = v
+		}
+	}
+	return out, nil
 }
 
 func newVisibilityHandler(p visibilityProbe) *Handler {
@@ -423,7 +446,7 @@ func TestPaginateWithFilter_RoundRefillUsesFullPrecisionMessageID(t *testing.T) 
 
 	_, _, _, err := h.paginateWithFilter(
 		context.Background(), "me", "C1", pageSize, nil, false,
-		osQuery, projectDocRef("C1"),
+		osQuery, projectDocRef("C1", ""),
 	)
 	if err != nil {
 		t.Fatalf("paginate: %v", err)
@@ -562,7 +585,7 @@ func wrapHitsQuery(inner func(searchAfter []any, size int) ([]rawHit, error)) os
 // wrapProject is the matching projectFn for hits built by wrapHitsQuery —
 // just delegates to projectDocRef which is what the real handlers use.
 func wrapProject() projectFn {
-	return projectDocRef("C1")
+	return projectDocRef("C1", "")
 }
 
 // TestFilterVisible_VisiblesWhitelist_InListKept — when payload.visibles is
@@ -612,8 +635,8 @@ func TestFilterVisible_VisiblesEmpty_FailOpen(t *testing.T) {
 	probe := &stubProbe{}
 	h := newVisibilityHandler(probe)
 	keep, err := h.filterVisible(context.Background(), "anyone", "C1", []msgRef{
-		{MessageID: "nil"},                          // Visibles == nil
-		{MessageID: "empty", Visibles: []string{}},  // Visibles == []
+		{MessageID: "nil"},                         // Visibles == nil
+		{MessageID: "empty", Visibles: []string{}}, // Visibles == []
 	})
 	if err != nil {
 		t.Fatalf("filter: %v", err)
@@ -644,7 +667,7 @@ func TestFilterVisible_VirtualChildHiddenByParentRevoke(t *testing.T) {
 	})
 	src := json.RawMessage(body)
 	hit := &elastic.SearchHit{Source: &src}
-	ref, ok := projectDocRef("C1")(hit)
+	ref, ok := projectDocRef("C1", "")(hit)
 	if !ok {
 		t.Fatalf("projectDocRef must accept virtual sub-doc")
 	}
@@ -676,7 +699,7 @@ func TestProjectDocRef_PopulatesVisibles(t *testing.T) {
 	src := json.RawMessage(body)
 	hit := &elastic.SearchHit{Source: &src}
 
-	ref, ok := projectDocRef("C1")(hit)
+	ref, ok := projectDocRef("C1", "")(hit)
 	if !ok {
 		t.Fatalf("projectDocRef must accept a well-formed hit")
 	}
@@ -702,7 +725,7 @@ func TestProjectDocRef_VirtualSubDocRoutesToParent(t *testing.T) {
 	src := json.RawMessage(body)
 	hit := &elastic.SearchHit{Source: &src}
 
-	ref, ok := projectDocRef("C1")(hit)
+	ref, ok := projectDocRef("C1", "")(hit)
 	if !ok {
 		t.Fatalf("projectDocRef must accept a virtual sub-doc")
 	}
@@ -727,7 +750,7 @@ func TestProjectDocRef_VirtualSafetyBeltOnDivergentParent(t *testing.T) {
 	src := json.RawMessage(body)
 	hit := &elastic.SearchHit{Source: &src}
 
-	ref, ok := projectDocRef("C1")(hit)
+	ref, ok := projectDocRef("C1", "")(hit)
 	if !ok {
 		t.Fatalf("projectDocRef must accept a virtual sub-doc")
 	}
@@ -751,7 +774,7 @@ func TestProjectDocRef_PlainDocKeepsOwnID(t *testing.T) {
 		raw, _ := json.Marshal(body)
 		src := json.RawMessage(raw)
 		hit := &elastic.SearchHit{Source: &src}
-		ref, ok := projectDocRef("C1")(hit)
+		ref, ok := projectDocRef("C1", "")(hit)
 		if !ok {
 			t.Fatalf("case %d: projectDocRef must accept plain doc", i)
 		}
@@ -776,11 +799,65 @@ func TestProjectDocRef_VirtualWithZeroParentFallsBackToOwn(t *testing.T) {
 	})
 	src := json.RawMessage(body)
 	hit := &elastic.SearchHit{Source: &src}
-	ref, ok := projectDocRef("C1")(hit)
+	ref, ok := projectDocRef("C1", "")(hit)
 	if !ok {
 		t.Fatalf("projectDocRef must still accept the hit")
 	}
 	if ref.MessageID != "42" {
 		t.Fatalf("zero parent must fall back to own id; got %q", ref.MessageID)
+	}
+}
+
+// TestFilterVisible_ChunksLargeIDSet is the RC non-blocking item: the presence
+// batch can hand filterVisible up to maxGroups × T ids, and the underlying
+// probe builds an unchunked `IN (?)`. filterVisible must split the id set into
+// filterVisibleChunkSize batches (one probe call per chunk) while still
+// filtering correctly across chunk boundaries.
+func TestFilterVisible_ChunksLargeIDSet(t *testing.T) {
+	const n = 2*filterVisibleChunkSize + 500 // 3 chunks
+	refs := make([]msgRef, n)
+	for i := 0; i < n; i++ {
+		refs[i] = msgRef{MessageID: strconv.Itoa(1_000_000 + i), MessageSeq: uint32(i + 1), ChannelID: "gA"}
+	}
+	// Hide one id that lands in the 3rd chunk so the union-across-chunks path is
+	// exercised, not just the first batch.
+	hiddenID := strconv.Itoa(1_000_000 + 2*filterVisibleChunkSize + 100)
+	probe := &stubProbe{deleted: map[string]bool{hiddenID: true}}
+	h := newVisibilityHandler(probe)
+
+	keep, err := h.filterVisible(context.Background(), "me", "", refs)
+	if err != nil {
+		t.Fatalf("filterVisible: %v", err)
+	}
+	wantChunks := (n + filterVisibleChunkSize - 1) / filterVisibleChunkSize
+	if probe.revokedCalls != wantChunks {
+		t.Errorf("RevokedSet must run once per chunk (%d); got %d", wantChunks, probe.revokedCalls)
+	}
+	if probe.deletedCalls != wantChunks {
+		t.Errorf("GloballyDeletedSet must run once per chunk (%d); got %d", wantChunks, probe.deletedCalls)
+	}
+	if probe.userDeletedCalls != wantChunks {
+		t.Errorf("UserDeletedSet must run once per chunk (%d); got %d", wantChunks, probe.userDeletedCalls)
+	}
+	if _, ok := keep[hiddenID]; ok {
+		t.Errorf("hidden id %s (3rd chunk) must be filtered out across the chunk boundary", hiddenID)
+	}
+	if len(keep) != n-1 {
+		t.Errorf("all but the 1 hidden id must be kept; got %d want %d", len(keep), n-1)
+	}
+}
+
+// TestChunkStrings covers the split helper's boundaries.
+func TestChunkStrings(t *testing.T) {
+	if got := chunkStrings(nil, 1000); got != nil {
+		t.Errorf("empty input must yield no chunks; got %v", got)
+	}
+	ids := []string{"a", "b", "c", "d", "e"}
+	got := chunkStrings(ids, 2)
+	if len(got) != 3 || len(got[0]) != 2 || len(got[2]) != 1 {
+		t.Errorf("expected [2,2,1] chunking; got %v", got)
+	}
+	if one := chunkStrings(ids, 0); len(one) != 1 || len(one[0]) != len(ids) {
+		t.Errorf("size<=0 must collapse to a single chunk; got %v", one)
 	}
 }

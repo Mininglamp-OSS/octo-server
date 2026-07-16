@@ -23,6 +23,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
@@ -128,7 +129,11 @@ func New(ctx *config.Context) *Webhook {
 	}
 }
 func getSupportTypes() []common.ContentType {
-	return []common.ContentType{common.Text, common.Image, common.GIF, common.Voice, common.Video, common.File, common.Location, common.Card, common.MultipleForward, common.VectorSticker, common.EmojiSticker, common.RichText}
+	// card-message-protocol P1：InteractiveCard(=17) 必须在推送支持集里，否则
+	// containSupportType 会把 type-17 当「不支持类型」在 getMessageAlert 之前丢弃
+	// （PR#543 review B1：离线推送卡片分支成死代码）。flag 关时 ingress 已拒卡、
+	// 库中无 type-17，列它无害；flag 开时才走 getMessageAlert 的卡片遮蔽分支。
+	return []common.ContentType{common.Text, common.Image, common.GIF, common.Voice, common.Video, common.File, common.Location, common.Card, common.MultipleForward, common.VectorSticker, common.EmojiSticker, common.RichText, cardmsg.InteractiveCard}
 }
 
 // Route 路由配置

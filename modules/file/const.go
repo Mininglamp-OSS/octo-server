@@ -158,6 +158,10 @@ var stickerUploadExts = map[string]bool{
 // stickerUploadExt 从客户端上传文件名挑选贴纸的存储扩展名，限定在
 // stickerUploadExts。文件名缺失 / 无扩展名 / 不在白名单一律回退 ".gif"
 // —— 历史默认，不传 filename 的老客户端因此保持原有行为不变。
+//
+// 注：这是**硬编码 fallback**（settings 未挂时的老 unit test 路径）；生产
+// 请求走 File.stickerUploadExtForRequest（review F1），它读当前配置的
+// allowedFormats，避免与 POST 侧校验用的配置漂移。
 func stickerUploadExt(filename string) string {
 	ext := strings.ToLower(filepath.Ext(sanitizeFilename(filename)))
 	if stickerUploadExts[ext] {
@@ -171,14 +175,24 @@ var allowedExtensions = map[string]bool{
 	// 图片
 	".jpg": true, ".jpeg": true, ".png": true, ".gif": true,
 	".bmp": true, ".webp": true, ".ico": true,
+	".heic": true, ".heif": true, ".tiff": true, ".tif": true,
 	// 文档
 	".pdf": true, ".doc": true, ".docx": true, ".xls": true,
 	".xlsx": true, ".ppt": true, ".pptx": true, ".txt": true,
 	".csv": true, ".rtf": true, ".odt": true, ".ods": true,
-	".md": true, ".html": true, ".htm": true,
+	".odp": true, ".md": true, ".html": true, ".htm": true,
+	// Apple iWork（基于 zip 的文档，无执行风险）
+	".key": true, ".numbers": true, ".pages": true,
+	// 电子书
+	".epub": true, ".mobi": true,
+	// 纯文本/数据
+	".toml": true, ".ini": true, ".log": true, ".tsv": true, ".ndjson": true,
+	// 字幕
+	".srt": true, ".vtt": true, ".ass": true,
 	// 音频
 	".mp3": true, ".wav": true, ".aac": true, ".flac": true,
 	".ogg": true, ".wma": true, ".m4a": true, ".amr": true,
+	".opus": true, ".aiff": true,
 	// 视频
 	".mp4": true, ".avi": true, ".mov": true, ".wmv": true,
 	".flv": true, ".mkv": true, ".webm": true, ".m4v": true,

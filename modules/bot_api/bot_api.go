@@ -9,12 +9,14 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/robot"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/modules/voice_adapter"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardrevision"
 )
 
 const (
@@ -29,13 +31,13 @@ const (
 // BotAPI is the public Bot API gateway module.
 // It handles all bot-facing endpoints (/v1/bot/*) with unified auth.
 type BotAPI struct {
-	ctx                   *config.Context
-	db                    *botAPIDB
-	userService           user.IService
-	fileService           file.IService
-	groupService          group.IService
-	userDB                *user.DB
-	threadService         thread.IService
+	ctx           *config.Context
+	db            *botAPIDB
+	userService   user.IService
+	fileService   file.IService
+	groupService  group.IService
+	userDB        *user.DB
+	threadService thread.IService
 	// robotService gives the OBO fan-out path a way to enqueue synthetic
 	// events directly into a grantee bot's /v1/bot/events queue. The
 	// webhook layer drops NoPersist=1 messages before NotifyMessagesListeners
@@ -46,7 +48,14 @@ type BotAPI struct {
 	// Jerry-Xin review blocker. fanoutForMessage calls robotService
 	// AFTER dispatchFanout succeeds so we only enqueue events that
 	// WuKongIM actually accepted.
-	robotService          robot.IService
+	robotService robot.IService
+	// cardRevisions is the D10 card revision history store (shared table
+	// octo_message_card_revision; written here on bot card edits + clear).
+	cardRevisions *cardrevision.Store
+	// cardMutator owns the card_seq CAS primitive shared with first-party
+	// callback finalization. Existing tests that construct BotAPI literals keep
+	// the legacy local fallback in cardSeqCASWrite when this field is nil.
+	cardMutator           *carddispatch.CardMutator
 	speechClient          *voice_adapter.SpeechClient
 	maxVoiceContextLength int
 	maxBodySize           int64
@@ -182,6 +191,8 @@ func NewBotAPI(ctx *config.Context) *BotAPI {
 		userDB:                user.NewDB(ctx),
 		threadService:         thread.NewService(ctx),
 		robotService:          robot.NewService(ctx),
+		cardRevisions:         cardrevision.NewStore(ctx.DB()),
+		cardMutator:           carddispatch.NewCardMutator(ctx),
 		speechClient:          voice_adapter.NewSpeechClient(speechURL, speechKey, time.Duration(timeoutSec)*time.Second),
 		maxVoiceContextLength: maxCtxLen,
 		maxBodySize:           maxBodySize,
@@ -243,6 +254,8 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 		botAPI.GET("/upload/credentials", ba.botUploadCredentials)
 		botAPI.GET("/upload/presigned", ba.botUploadPresigned)
 		botAPI.POST("/message/edit", ba.botMessageEdit)
+		botAPI.POST("/message/card/revisions/clear", ba.botCardRevisionsClear) // D10.6 清除卡片修订(写墓碑)
+		botAPI.GET("/card/profile", ba.botCardProfile)                         // D12 卡片能力清单(feature detection)
 		botAPI.GET("/user/info", ba.getUserInfo)
 		// Voice context API (User Bot only)
 		botAPI.PUT("/voice/context", ba.botPutVoiceContext)

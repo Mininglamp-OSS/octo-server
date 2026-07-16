@@ -1,0 +1,97 @@
+# octospec context — records which rules were injected for this task and why.
+# Resolution: brief.md load-bearing tags ∪ touched file paths → matched rules
+# (see .octospec/rules/_index.yaml inject_when).
+schema_version: 1
+task: card-message-appbot-trust
+brief: .octospec/tasks/card-message-appbot-trust/brief.md
+
+touched_paths:
+  - modules/botidentity/resolver.go
+  - modules/botidentity/resolver_test.go
+  - modules/botidentity/resolver_integration_test.go
+  - modules/cardtrust/cardtrust.go
+  - modules/cardtrust/cardtrust_test.go
+  - modules/webhook/common_card_test.go
+  - modules/messages_search/card_appbot_integration_test.go
+  - modules/message/api.go
+  - modules/message/api_card_action.go
+  - modules/message/api_card_action_test.go
+
+load_bearing_tags:
+  - trust-boundary
+  - wire-contract
+  - auth
+  - bot-api
+  - space
+  - isolation
+  - acl
+  - error-response
+  - i18n
+  - rate-limit
+  - testing
+
+injected_rules:
+  - id: space-isolation
+    priority: 92
+    load_bearing: true
+    matched_by:
+      paths: ["modules/**/*.go"]
+      touches: ["space", "isolation", "auth", "bot-api", "acl"]
+    why: >
+      card/action is a side-effect boundary. The change may replace only the
+      stored sender identity predicate; existing channel binding, operator
+      membership, Space, group/thread status, visibility, and event ownership
+      gates must remain unchanged and fail closed.
+  - id: trust-boundary
+    priority: 90
+    load_bearing: true
+    matched_by:
+      paths: ["modules/webhook/**/*.go"]
+      touches: ["trust-boundary", "wire-contract", "webhook"]
+    why: >
+      Stored card plain text may surface only for an active User Bot, a
+      published App Bot, or the existing incoming-webhook synthetic identity.
+      Human, presentation-only, inactive, ambiguous, and lookup-error identities
+      remain untrusted; webhook action rejection remains unchanged.
+  - id: error-handling
+    priority: 85
+    load_bearing: true
+    matched_by:
+      paths: ["modules/**/*.go"]
+      touches: ["error-response", "i18n", "wire-contract"]
+    why: >
+      Identity lookup and invariant errors at card/action continue through the
+      existing localized query-failed envelope, while inactive or unknown
+      senders continue through the collapsed invalid-action response. No raw
+      response or client-visible identity enumeration is introduced.
+  - id: rate-limit
+    priority: 80
+    load_bearing: true
+    matched_by:
+      paths: ["modules/**/*.go"]
+      touches: ["rate-limit"]
+    why: >
+      No route or middleware changes are allowed. The existing shared UID rate
+      limiter on card/action and Bot API limits remain in force; integration
+      setup explicitly clears shared Redis rate-limit state.
+  - id: testing
+    priority: 70
+    load_bearing: false
+    matched_by:
+      paths: ["modules/**/*_test.go", "**/*_test.go"]
+      touches: ["testing"]
+    why: >
+      TDD covers resolver classification and failure modes, cardtrust cache
+      behavior, live App Bot action authorization, and the event poll/ACK
+      lifecycle. The resolver uses an isolated SQL integration database; HTTP
+      tests use testutil cleanup and explicitly clear shared Redis state.
+  - id: commit-style
+    priority: 60
+    load_bearing: false
+    matched_by:
+      paths: ["**"]
+      touches: ["commit"]
+    why: >
+      RED and GREEN checkpoints use English Conventional Commit messages and
+      remain reachable from the task branch; the final PR links this spec and
+      answers the load-bearing comprehension questions.

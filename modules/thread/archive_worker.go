@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 
@@ -14,7 +15,7 @@ import (
 
 // archiveDB 抽出 ArchiveWorker 需要的最小 DB 接口，便于单测 mock。
 type archiveDB interface {
-	ArchiveStaleBatch(threshold time.Time, batchSize int, version int64) (int64, error)
+	ArchiveStaleBatch(threshold time.Time, batchSize int, version int64, channelType uint8) (int64, error)
 }
 
 // versionGen 抽出版本号生成，便于单测注入确定性版本号。
@@ -45,17 +46,21 @@ func NewArchiveWorker(ctx *config.Context, cfg ArchiveConfig) *ArchiveWorker {
 	}
 }
 
-// Start 启动后台 ticker。Enabled=false 或参数非法时不启动新 goroutine，但仍会
+// Start 启动后台 ticker。Enabled=false 或 Interval 非法时不启动新 goroutine，但仍会
 // 先停掉可能存在的旧 goroutine——避免未来热更新（enabled: true→false 再 Start）
 // 留下孤儿 ticker。
 // 重复调用幂等：先 stop 旧 goroutine 再启动新的。
+//
+// 启动门不再卡 Threshold：Threshold=0 是 config 明文支持的模式（DM_THREAD_AUTO_ARCHIVE_DAYS=0
+// → 禁用时间归档但 Enabled 仍为 true）。此时 ticker 照常起，RunOnce 内部的 Threshold<=0
+// 短路让每轮空转；行为可预测，且为将来 worker 承载其它时间无关动作预留余地。
 func (w *ArchiveWorker) Start(ctx context.Context) {
 	if w.cancel != nil {
 		w.cancel()
 		w.wg.Wait()
 		w.cancel = nil
 	}
-	if !w.cfg.Enabled || w.cfg.Interval <= 0 || w.cfg.Threshold <= 0 {
+	if !w.cfg.Enabled || w.cfg.Interval <= 0 {
 		w.Info("thread auto-archive worker disabled",
 			zap.Bool("enabled", w.cfg.Enabled),
 			zap.Duration("interval", w.cfg.Interval),
@@ -119,7 +124,7 @@ func (w *ArchiveWorker) RunOnce(ctx context.Context) (int64, error) {
 		if err != nil {
 			return total, err
 		}
-		rows, err := w.db.ArchiveStaleBatch(cutoff, w.cfg.BatchSize, version)
+		rows, err := w.db.ArchiveStaleBatch(cutoff, w.cfg.BatchSize, version, common.ChannelTypeCommunityTopic.Uint8())
 		if err != nil {
 			return total, err
 		}

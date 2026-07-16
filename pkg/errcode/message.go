@@ -173,4 +173,59 @@ var (
 		DefaultMessage: "Message search failed.",
 		Internal:       true,
 	})
+	// ---- InteractiveCard(=17) 卡片消息协议 P1（spec: .octospec/tasks/
+	// card-message-protocol/brief.md）----------------------------------------
+
+	// ErrMessageCardSendForbidden Decision 2 layer (a)：卡片仅 bot/webhook 可发，
+	// 用户 /v1/message/send 一律拒绝。
+	ErrMessageCardSendForbidden = register(codes.Code{
+		ID:             "err.server.message.card_send_forbidden",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "Card messages can only be sent by bots or webhooks.",
+	})
+	// ErrMessageCardEditForbidden Decision 7：P1 卡片不可变，用户编辑路径拒绝
+	// type-17 content_edit（该路径对卡片永久关闭，P2 也不开放）。
+	ErrMessageCardEditForbidden = register(codes.Code{
+		ID:             "err.server.message.card_edit_forbidden",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Card messages cannot be edited.",
+	})
+	// ErrMessageCardActionInvalid P2 D3/D7/D11：card/action 上行的单一 400 归并码
+	// （防枚举）——非卡片 / sender 非 bot / iwh_ 发送者 / action_id 不在生效帧 /
+	// inputs 违反声明 / 卡片开关关闭 等具体原因只进日志，对客户端一律 invalid。
+	ErrMessageCardActionInvalid = register(codes.Code{
+		ID:             "err.server.message.card_action_invalid",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Invalid card action.",
+	})
+	// ErrMessageCardActionDenied P2 D3：操作者不是卡片所在频道的成员。唯一的
+	// 403 语义（与 invalid 分开，成员资格是授权面，不归并进防枚举）。
+	ErrMessageCardActionDenied = register(codes.Code{
+		ID:             "err.server.message.card_action_denied",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "You are not allowed to act on this card.",
+	})
+	// ErrMessageCardActionInProgress P2 D4（PR#548 review）：并发下同一 (message_id,
+	// action_id, operator_uid) 的首请求尚在处理、只占了 pending 位（未 confirm 入队）。
+	// 回可重试的 409 而非虚假 replay 成功 —— 客户端按 D8 超时重试：彼时首请求要么已
+	// confirm（→ replay），要么已释放（→ 本请求可重新 claim 正常处理），有效动作不丢。
+	ErrMessageCardActionInProgress = register(codes.Code{
+		ID:             "err.server.message.card_action_in_progress",
+		HTTPStatus:     http.StatusConflict,
+		DefaultMessage: "This card action is being processed, please retry.",
+	})
+	// ErrMessageCardRevisionInvalid P2 D10.5：卡片修订查询的单一 400 归并码
+	// （非卡片 / 不存在 / 频道不匹配；防枚举，具体原因只进日志）。
+	ErrMessageCardRevisionInvalid = register(codes.Code{
+		ID:             "err.server.message.card_revision_invalid",
+		HTTPStatus:     http.StatusBadRequest,
+		DefaultMessage: "Invalid card revision request.",
+	})
+	// ErrMessageCardRevisionDenied P2 D10.5：查看者不是卡片所在频道的成员
+	// （与 card_action 同门禁；唯一 403 语义）。
+	ErrMessageCardRevisionDenied = register(codes.Code{
+		ID:             "err.server.message.card_revision_denied",
+		HTTPStatus:     http.StatusForbidden,
+		DefaultMessage: "You are not allowed to view this card's revisions.",
+	})
 )

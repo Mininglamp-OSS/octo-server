@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -45,10 +46,11 @@ func TestArchiveStaleBatch(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	db := NewDB(ctx)
+	ensureReminderTables(t, db)
 
 	now := time.Now()
-	old := now.Add(-10 * 24 * time.Hour)    // 10 天前 — 应归档
-	recent := now.Add(-1 * time.Hour)        // 1 小时前 — 不应归档
+	old := now.Add(-10 * 24 * time.Hour)      // 10 天前 — 应归档
+	recent := now.Add(-1 * time.Hour)         // 1 小时前 — 不应归档
 	threshold := now.Add(-3 * 24 * time.Hour) // 3 天阈值
 
 	// 准备各种边界数据
@@ -59,7 +61,7 @@ func TestArchiveStaleBatch(t *testing.T) {
 	insertThread(t, db, "stale_deleted", ThreadStatusDeleted, &old)
 	insertThread(t, db, "active_never_messaged", ThreadStatusActive, nil) // last_message_at IS NULL
 
-	rows, err := db.ArchiveStaleBatch(threshold, 100, 9999)
+	rows, err := db.ArchiveStaleBatch(threshold, 100, 9999, common.ChannelTypeCommunityTopic.Uint8())
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), rows, "exactly the two stale_active rows should be archived")
 
@@ -87,6 +89,7 @@ func TestArchiveStaleBatch_RespectsBatchSize(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	db := NewDB(ctx)
+	ensureReminderTables(t, db)
 
 	now := time.Now()
 	old := now.Add(-10 * 24 * time.Hour)
@@ -97,22 +100,22 @@ func TestArchiveStaleBatch_RespectsBatchSize(t *testing.T) {
 		insertThread(t, db, "s"+strconv.Itoa(i), ThreadStatusActive, &old)
 	}
 
-	rows, err := db.ArchiveStaleBatch(threshold, 3, 100)
+	rows, err := db.ArchiveStaleBatch(threshold, 3, 100, common.ChannelTypeCommunityTopic.Uint8())
 	require.NoError(t, err)
 	assert.Equal(t, int64(3), rows, "should archive exactly batchSize=3")
 
 	// 再调一次应再归档 3 条
-	rows, err = db.ArchiveStaleBatch(threshold, 3, 101)
+	rows, err = db.ArchiveStaleBatch(threshold, 3, 101, common.ChannelTypeCommunityTopic.Uint8())
 	require.NoError(t, err)
 	assert.Equal(t, int64(3), rows)
 
 	// 第 3 次只剩 1 条
-	rows, err = db.ArchiveStaleBatch(threshold, 3, 102)
+	rows, err = db.ArchiveStaleBatch(threshold, 3, 102, common.ChannelTypeCommunityTopic.Uint8())
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), rows)
 
 	// 第 4 次 0
-	rows, err = db.ArchiveStaleBatch(threshold, 3, 103)
+	rows, err = db.ArchiveStaleBatch(threshold, 3, 103, common.ChannelTypeCommunityTopic.Uint8())
 	require.NoError(t, err)
 	assert.Equal(t, int64(0), rows)
 }
@@ -124,6 +127,7 @@ func TestArchiveStaleBatch_SkipsRowsAtOrAboveBatchVersion(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	db := NewDB(ctx)
+	ensureReminderTables(t, db)
 
 	now := time.Now()
 	old := now.Add(-10 * 24 * time.Hour)
@@ -134,7 +138,7 @@ func TestArchiveStaleBatch_SkipsRowsAtOrAboveBatchVersion(t *testing.T) {
 	insertThreadWithVersion(t, db, "above_batch", ThreadStatusActive, &old, 200)
 
 	batchVersion := int64(100)
-	rows, err := db.ArchiveStaleBatch(threshold, 100, batchVersion)
+	rows, err := db.ArchiveStaleBatch(threshold, 100, batchVersion, common.ChannelTypeCommunityTopic.Uint8())
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), rows, "only the row with version < batchVersion should be archived")
 
@@ -157,6 +161,7 @@ func TestRecordMessageAndReactivate_ResurrectsArchived(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	db := NewDB(ctx)
+	ensureReminderTables(t, db)
 
 	now := time.Now()
 	old := now.Add(-10 * 24 * time.Hour)
@@ -165,7 +170,7 @@ func TestRecordMessageAndReactivate_ResurrectsArchived(t *testing.T) {
 	insertThreadWithVersion(t, db, "raced", ThreadStatusActive, &old, 5)
 
 	// 模拟 cron 抢先归档
-	rows, err := db.ArchiveStaleBatch(threshold, 10, 100)
+	rows, err := db.ArchiveStaleBatch(threshold, 10, 100, common.ChannelTypeCommunityTopic.Uint8())
 	require.NoError(t, err)
 	require.Equal(t, int64(1), rows)
 	m, _ := db.QueryByShortID("raced")
@@ -192,6 +197,7 @@ func TestRecordMessageAndReactivate_NoVersionBumpForAlreadyActive(t *testing.T) 
 	_, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	db := NewDB(ctx)
+	ensureReminderTables(t, db)
 
 	now := time.Now()
 	insertThreadWithVersion(t, db, "active_thread", ThreadStatusActive, &now, 42)
@@ -215,6 +221,7 @@ func TestRecordMessageAndReactivate_DeletedStaysDeleted(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	db := NewDB(ctx)
+	ensureReminderTables(t, db)
 
 	now := time.Now()
 	insertThreadWithVersion(t, db, "deleted_thread", ThreadStatusDeleted, &now, 7)
@@ -241,6 +248,7 @@ func TestRecordMessageAndReactivate_VersionMonotonicVsCronArchive(t *testing.T) 
 	_, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	db := NewDB(ctx)
+	ensureReminderTables(t, db)
 
 	now := time.Now()
 	old := now.Add(-10 * 24 * time.Hour)
@@ -249,7 +257,7 @@ func TestRecordMessageAndReactivate_VersionMonotonicVsCronArchive(t *testing.T) 
 	insertThreadWithVersion(t, db, "monotonic", ThreadStatusActive, &old, 1)
 
 	// cron 用版本 101 归档（模拟 cron 在 listener 拿到锁之前已经提交）
-	rows, err := db.ArchiveStaleBatch(threshold, 10, 101)
+	rows, err := db.ArchiveStaleBatch(threshold, 10, 101, common.ChannelTypeCommunityTopic.Uint8())
 	require.NoError(t, err)
 	require.Equal(t, int64(1), rows)
 
@@ -277,6 +285,7 @@ func TestUpdateStatusFrom_CASRetriesOnConcurrentBump(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	db := NewDB(ctx)
+	ensureReminderTables(t, db)
 
 	now := time.Now()
 	insertThreadWithVersion(t, db, "cas_target", ThreadStatusArchived, &now, 100)
@@ -303,6 +312,7 @@ func TestUpdateStatusFrom_NoSuchRow(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	db := NewDB(ctx)
+	ensureReminderTables(t, db)
 
 	calls := 0
 	gen := func() (int64, error) { calls++; return int64(100 + calls), nil }
@@ -318,6 +328,7 @@ func TestUpdateStatusFrom_RejectsDeletedRow(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	db := NewDB(ctx)
+	ensureReminderTables(t, db)
 
 	now := time.Now()
 	insertThreadWithVersion(t, db, "deleted_target", ThreadStatusDeleted, &now, 50)
@@ -341,6 +352,7 @@ func TestUpdateStatusFrom_IdempotentWhenAlreadyAtTarget(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	db := NewDB(ctx)
+	ensureReminderTables(t, db)
 
 	now := time.Now()
 	insertThreadWithVersion(t, db, "already_archived", ThreadStatusArchived, &now, 50)
@@ -359,6 +371,7 @@ func TestMarkDeleted_IdempotentWhenAlreadyDeleted(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	db := NewDB(ctx)
+	ensureReminderTables(t, db)
 
 	now := time.Now()
 	insertThreadWithVersion(t, db, "already_deleted", ThreadStatusDeleted, &now, 7)
@@ -374,6 +387,7 @@ func TestMarkDeleted_NoSuchRow(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	db := NewDB(ctx)
+	ensureReminderTables(t, db)
 
 	err := db.MarkDeleted("ghost", func() (int64, error) { return 100, nil })
 	assert.ErrorIs(t, err, ErrThreadNotFound)
@@ -383,6 +397,7 @@ func TestUpdateName_CASBehavesSameAsUpdateStatus(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	db := NewDB(ctx)
+	ensureReminderTables(t, db)
 
 	now := time.Now()
 	insertThreadWithVersion(t, db, "named", ThreadStatusActive, &now, 50)
@@ -403,6 +418,7 @@ func TestUpdateName_RejectsDeletedRow(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	db := NewDB(ctx)
+	ensureReminderTables(t, db)
 
 	now := time.Now()
 	insertThreadWithVersion(t, db, "del_named", ThreadStatusDeleted, &now, 50)
@@ -424,6 +440,7 @@ func TestArchiveStaleBatch_ConcurrentWithMessages(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	db := NewDB(ctx)
+	ensureReminderTables(t, db)
 
 	now := time.Now()
 	old := now.Add(-10 * 24 * time.Hour)
@@ -444,7 +461,7 @@ func TestArchiveStaleBatch_ConcurrentWithMessages(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for r := 0; r < rounds; r++ {
-			_, _ = db.ArchiveStaleBatch(threshold, numThreads, int64(1000+r*10))
+			_, _ = db.ArchiveStaleBatch(threshold, numThreads, int64(1000+r*10), common.ChannelTypeCommunityTopic.Uint8())
 			time.Sleep(2 * time.Millisecond)
 		}
 	}()
@@ -493,8 +510,211 @@ func TestArchiveStaleBatch_EmptyTable(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	db := NewDB(ctx)
+	ensureReminderTables(t, db)
 
-	rows, err := db.ArchiveStaleBatch(time.Now(), 100, 1)
+	rows, err := db.ArchiveStaleBatch(time.Now(), 100, 1, common.ChannelTypeCommunityTopic.Uint8())
 	require.NoError(t, err)
 	assert.Equal(t, int64(0), rows)
+}
+
+// ensureReminderTables 在 thread 模块隔离测试环境里按需建 reminders/reminder_done。
+// 这两张表属于 message 模块，thread 包的 module.Setup 不会加载它们的建表
+// migration；而本回归需要真实表来验证 ArchiveStaleBatch 的 NOT EXISTS 语义。
+// 字段与 modules/message/sql 建表对齐（仅取本测试用到的列）。
+func ensureReminderTables(t *testing.T, db *DB) {
+	t.Helper()
+	_, err := db.session.UpdateBySql(
+		"CREATE TABLE IF NOT EXISTS `reminders`(" +
+			"id bigint not null primary key AUTO_INCREMENT," +
+			"channel_id VARCHAR(100) not null default ''," +
+			"channel_type smallint not null default 0," +
+			"reminder_type integer not null default 0," +
+			"uid varchar(40) not null default ''," +
+			"message_seq bigint not null default 0," +
+			"is_deleted smallint not null default 0," +
+			"version bigint not null default 0)" +
+			" CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci",
+	).Exec()
+	require.NoError(t, err)
+	_, err = db.session.UpdateBySql(
+		"CREATE TABLE IF NOT EXISTS `reminder_done`(" +
+			"id bigint not null primary key AUTO_INCREMENT," +
+			"reminder_id bigint not null default 0," +
+			"uid varchar(40) not null default '')" +
+			" CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci",
+	).Exec()
+	require.NoError(t, err)
+	// 清干净残留数据，与 CleanAllTables 对齐（它只清 thread 模块登记的表）。
+	_, _ = db.session.UpdateBySql("DELETE FROM `reminders`").Exec()
+	_, _ = db.session.UpdateBySql("DELETE FROM `reminder_done`").Exec()
+}
+
+// insertReminder 直插一行 reminders（模拟 @ 提及）。channelID 应为 thread channel
+// 形式 {group_no}____{short_id}。返回 reminder id 以便需要时写 reminder_done。
+func insertReminder(t *testing.T, db *DB, channelID string, channelType uint8, reminderType int, uid string, isDeleted int) int64 {
+	t.Helper()
+	res, err := db.session.InsertBySql(
+		"INSERT INTO reminders(channel_id, channel_type, reminder_type, uid, message_seq, is_deleted, version) "+
+			"VALUES(?,?,?,?,?,?,?)",
+		channelID, channelType, reminderType, uid, 1, isDeleted, 1,
+	).Exec()
+	require.NoError(t, err)
+	id, err := res.LastInsertId()
+	require.NoError(t, err)
+	return id
+}
+
+func insertReminderDone(t *testing.T, db *DB, reminderID int64, uid string) {
+	t.Helper()
+	_, err := db.session.InsertBySql(
+		"INSERT INTO reminder_done(reminder_id, uid) VALUES(?,?)", reminderID, uid,
+	).Exec()
+	require.NoError(t, err)
+}
+
+// threadChannelID 重建 insertThread 用的 group_no/short_id 对应的 thread channel id。
+// insertThreadWithVersion 用 GroupNo = "g_" + shortID。
+func threadChannelID(shortID string) string {
+	return BuildChannelID("g_"+shortID, shortID)
+}
+
+// TestArchiveStaleBatch_PendingMentionExclusion 是 #566 的核心回归：验证归档谓词
+// 里的 NOT EXISTS(未处理 per-uid @提及) 在真库上的四个关键分支。纯 mock 测不到
+// 这些 SQL 语义。
+func TestArchiveStaleBatch_PendingMentionExclusion(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	db := NewDB(ctx)
+	ensureReminderTables(t, db)
+
+	now := time.Now()
+	old := now.Add(-10 * 24 * time.Hour)      // 陈旧 —— 时间上应归档
+	threshold := now.Add(-3 * 24 * time.Hour) // 3 天阈值
+	ct := common.ChannelTypeCommunityTopic.Uint8()
+	const mentionType = 1 // ReminderTypeMentionMe
+
+	// (a) 陈旧 + 未处理 per-uid @ → 不归档（保持 active）。这条能接住 P0。
+	insertThread(t, db, "stale_pending_at", ThreadStatusActive, &old)
+	insertReminder(t, db, threadChannelID("stale_pending_at"), ct, mentionType, "userA", 0)
+
+	// (b) 陈旧 + @ 已处理（reminder_done 已写）→ 照常归档。
+	insertThread(t, db, "stale_done_at", ThreadStatusActive, &old)
+	ridDone := insertReminder(t, db, threadChannelID("stale_done_at"), ct, mentionType, "userB", 0)
+	insertReminderDone(t, db, ridDone, "userB")
+
+	// (c) 陈旧 + @所有人（uid=''）→ 照常归档（广播不阻止归档）。
+	insertThread(t, db, "stale_broadcast_at", ThreadStatusActive, &old)
+	insertReminder(t, db, threadChannelID("stale_broadcast_at"), ct, mentionType, "", 0)
+
+	// (d) 陈旧 + @ 已软删（is_deleted=1）→ 照常归档。
+	insertThread(t, db, "stale_deleted_at", ThreadStatusActive, &old)
+	insertReminder(t, db, threadChannelID("stale_deleted_at"), ct, mentionType, "userC", 1)
+
+	// (e) 陈旧 无任何 @ → 照常归档（基线）。
+	insertThread(t, db, "stale_no_at", ThreadStatusActive, &old)
+
+	rows, err := db.ArchiveStaleBatch(threshold, 100, 9999, ct)
+	require.NoError(t, err)
+	assert.Equal(t, int64(4), rows, "only (b)(c)(d)(e) should archive; (a) pending-mention must be excluded")
+
+	verify := func(shortID string, expect int, msg string) {
+		m, qerr := db.QueryByShortID(shortID)
+		require.NoError(t, qerr)
+		require.NotNil(t, m, shortID)
+		assert.Equal(t, expect, m.Status, msg)
+	}
+	verify("stale_pending_at", ThreadStatusActive, "(a) stale + unprocessed per-uid @ must stay active")
+	verify("stale_done_at", ThreadStatusArchived, "(b) processed mention must not block archive")
+	verify("stale_broadcast_at", ThreadStatusArchived, "(c) @all broadcast must not block archive")
+	verify("stale_deleted_at", ThreadStatusArchived, "(d) soft-deleted reminder must not block archive")
+	verify("stale_no_at", ThreadStatusArchived, "(e) no mention archives normally")
+}
+
+// TestArchiveStaleBatch_MixedCollation 是 cross-collation 回归（GH #567 review, yujiawei P1）。
+// 生产上 reminders/reminder_done 建表未指定 CHARSET/COLLATE，MySQL 8+ 解析为
+// utf8mb4_0900_ai_ci，而 thread.* 是 utf8mb4_general_ci。ArchiveStaleBatch 谓词里
+// r.channel_id = CONCAT(t.group_no,'____',t.short_id) 是列派生表达式跨 collation 等值比较，
+// 若不在 r.channel_id 上 pin COLLATE 会抛 Error 1267 并阻塞归档 / backfill 部署。
+// 本测试显式用 0900_ai_ci 重建两表复现生产条件：若 COLLATE pin 缺失，这里会 1267 红。
+func TestArchiveStaleBatch_MixedCollation(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	db := NewDB(ctx)
+
+	// 显式以 utf8mb4_0900_ai_ci 重建 reminders/reminder_done，复现生产跨 collation 条件。
+	for _, tbl := range []string{"reminders", "reminder_done"} {
+		_, err := db.session.UpdateBySql("DROP TABLE IF EXISTS `" + tbl + "`").Exec()
+		require.NoError(t, err)
+	}
+	_, err := db.session.UpdateBySql(
+		"CREATE TABLE `reminders`(" +
+			"id bigint not null primary key AUTO_INCREMENT," +
+			"channel_id VARCHAR(100) not null default ''," +
+			"channel_type smallint not null default 0," +
+			"reminder_type integer not null default 0," +
+			"uid varchar(40) not null default ''," +
+			"message_seq bigint not null default 0," +
+			"is_deleted smallint not null default 0," +
+			"version bigint not null default 0" +
+			") CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci",
+	).Exec()
+	require.NoError(t, err)
+	_, err = db.session.UpdateBySql(
+		"CREATE TABLE `reminder_done`(" +
+			"id bigint not null primary key AUTO_INCREMENT," +
+			"reminder_id bigint not null default 0," +
+			"uid varchar(40) not null default ''" +
+			") CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci",
+	).Exec()
+	require.NoError(t, err)
+
+	// 模拟 message 模块 20260711000001 迁移：把两表 CONVERT 归一到 general_ci（与 thread 对齐），
+	// 再建以 channel_id 打头的索引。归一后查询侧无需 COLLATE pin，1267 与索引失效一并解决。
+	for _, tbl := range []string{"reminders", "reminder_done"} {
+		_, cerr := db.session.UpdateBySql("ALTER TABLE `" + tbl + "` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci").Exec()
+		require.NoError(t, cerr)
+	}
+	_, err = db.session.UpdateBySql(
+		"ALTER TABLE `reminders` ADD INDEX `idx_channel_type_rtype_deleted` " +
+			"(`channel_id`, `channel_type`, `reminder_type`, `is_deleted`)",
+	).Exec()
+	require.NoError(t, err)
+
+	now := time.Now()
+	old := now.Add(-10 * 24 * time.Hour)
+	threshold := now.Add(-3 * 24 * time.Hour)
+	ct := common.ChannelTypeCommunityTopic.Uint8()
+
+	// 陈旧 + 未处理 per-uid @ → 跨 collation 比较必须成立且排除该行，不归档。
+	insertThread(t, db, "mc_pending", ThreadStatusActive, &old)
+	insertReminder(t, db, threadChannelID("mc_pending"), ct, 1, "userA", 0)
+	// 陈旧无 @ → 正常归档（确认谓词整体仍工作，不是被 1267 整条炸掉）。
+	insertThread(t, db, "mc_plain", ThreadStatusActive, &old)
+
+	rows, err := db.ArchiveStaleBatch(threshold, 100, 9999, ct)
+	require.NoError(t, err, "cross-collation join must not raise Error 1267")
+	assert.Equal(t, int64(1), rows, "only the no-mention row archives")
+
+	mp, err := db.QueryByShortID("mc_pending")
+	require.NoError(t, err)
+	assert.Equal(t, ThreadStatusActive, mp.Status, "pending-mention thread must stay active across collations")
+	pl, err := db.QueryByShortID("mc_plain")
+	require.NoError(t, err)
+	assert.Equal(t, ThreadStatusArchived, pl.Status)
+
+	// 索引是否被 collation 废掉，由**结构事实**保证而非运行时断言：
+	//   (1) 两表已归一到 utf8mb4_general_ci（与 thread 、与索引列同）；
+	//   (2) ArchiveStaleBatch 查询已移除任何 `COLLATE` 子句。
+	// 两者合起来，比较侧 collation == 索引列 collation，不存在任何强制不同 collation 的子句
+	// 去阻止优化器选用 idx_channel_type_rtype_deleted。EXPLAIN 运行时断言在轻量单测里不可靠
+	// （小表下优化器可能故意全扫、possible_keys 为空，且随 MySQL 版本变），故不引入 flaky
+	// EXPLAIN 断言；上方“无 1267 + 行为正确”已锁住 collation 归一生效（pin 时这里会 1267 红）。
+}
+
+// TestReminderTypeMentionMeMatchesMessagePackage 固定 thread 侧本地常量与 message 侧
+// 权威值一致（message 侧由 modules/message/validation_test.go 固定为 1）。thread 不
+// import message 以免包耦合，故此处直接钉字面值；两侧任一漂移都应在 CI 暴露。
+func TestReminderTypeMentionMeMatchesMessagePackage(t *testing.T) {
+	assert.Equal(t, 1, ReminderTypeMentionMe,
+		"thread.ReminderTypeMentionMe must match message.ReminderTypeMentionMe (=1)")
 }

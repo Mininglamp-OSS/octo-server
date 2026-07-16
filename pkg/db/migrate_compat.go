@@ -176,6 +176,7 @@ var threadModuleSnapshotMigrationIDs = []string{
 // on disk so drift in either direction surfaces in CI.
 var threadModulePostSnapshotMigrationIDs = []string{
 	"20260522000002_thread_group_status_created_index.sql",
+	"20260711000002_thread_unarchive_pending_mention_backfill.sql",
 }
 
 // ReconcileThreadSchemaRecords pre-seeds gorp_migrations with the thread

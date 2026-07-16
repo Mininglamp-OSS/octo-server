@@ -86,6 +86,11 @@ func TestFanout_ContentTypeAgnostic(t *testing.T) {
 		{name: "vector_sticker_type_12", payload: `{"type":12,"url":"https://cdn/sticker.json","mention":{"uids":["user_yu"]}}`},
 		{name: "emoji_sticker_type_13", payload: `{"type":13,"url":"https://cdn/emoji.png","mention":{"uids":["user_yu"]}}`},
 		{name: "rich_text_type_14", payload: `{"type":14,"content":[{"type":"text","text":"hello"}],"mention":{"uids":["user_yu"]}}`},
+		// card-message-protocol P1：fan-out 是 relay 不是 ingress —— 对
+		// InteractiveCard(=17) 同样内容型不可知地转发（Decision 2 的强制点在
+		// 三个 HTTP ingress + 客户端渲染门禁，不在中继；fan-out 副本的
+		// from_uid 是人类 grantor，端上渲染门禁自然把它降级为 plain）。
+		{name: "interactive_card_type_17", payload: `{"type":17,"card":{"type":"AdaptiveCard","version":"1.5","body":[{"type":"TextBlock","text":"审批单"}]},"plain":"审批单","card_version":"1.5","profile":"octo/v1","mention":{"uids":["user_yu"]}}`},
 		// Defensive: an inbound message with no `type` field at all
 		// must STILL fan out — the fan-out listener has no business
 		// rejecting payloads that fail the bot-side payload validator;

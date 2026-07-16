@@ -94,7 +94,8 @@ func (h *Handler) searchMedia(c *wkhttp.Context) {
 			Routing(normID).
 			Query(dsl).
 			Size(size).
-			TrackTotalHits(false)
+			TrackTotalHits(false).
+			FetchSourceContext(fileContentSourceExcludes())
 		svc = applySort(svc, req.Sort)
 		if len(searchAfter) > 0 {
 			svc = svc.SearchAfter(searchAfter...)
@@ -110,7 +111,7 @@ func (h *Handler) searchMedia(c *wkhttp.Context) {
 	}
 
 	filtered, hasMore, nextCursor, err := h.paginateWithFilterDepth(
-		ctx, loginUID, req.ChannelID, pageSize, priorDepth, initialAfter, isRelevance, osQuery, projectDocRef(req.ChannelID),
+		ctx, loginUID, req.ChannelID, pageSize, priorDepth, initialAfter, isRelevance, osQuery, projectDocRef(req.ChannelID, loginUID),
 	)
 	if err != nil {
 		if responder := classifyOSError(err); responder != nil {

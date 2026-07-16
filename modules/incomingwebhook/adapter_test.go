@@ -75,8 +75,8 @@ func TestSafeMarkdownURL(t *testing.T) {
 
 	bad := []string{
 		"",
-		"javascript:alert(1)",                       // non-http scheme
-		"data:text/html,x",                          // non-http scheme
+		"javascript:alert(1)", // non-http scheme
+		"data:text/html,x",    // non-http scheme
 		"https://ok.com/) [phish](https://evil.com", // link-destination injection
 		"https://ok.com/issue)",                     // trailing paren ends destination
 		"https://ok.com/a b",                        // embedded space

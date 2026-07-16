@@ -3,6 +3,7 @@ package messages_search
 import (
 	"context"
 	"encoding/json"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"strconv"
 	"strings"
 
@@ -32,6 +33,11 @@ type MessageHit struct {
 	OuterPreview    *OuterPreview  `json:"outer_preview,omitempty"`
 	InnerMessages   []InnerMessage `json:"inner_messages,omitempty"`
 	ChannelID       string         `json:"channel_id"`
+	// ChannelType is echoed only for the global endpoints (_search_global_*),
+	// which return hits from many rooms in a single response — omitempty on the
+	// single-channel surfaces keeps the wire shape byte-identical for the
+	// legacy _search / _search_all / _search_around callers that pass 0.
+	ChannelType     uint8          `json:"channel_type,omitempty"`
 	ThumbURL        string         `json:"thumb_url,omitempty"`
 	VideoURL        string         `json:"video_url,omitempty"`
 	Width           int            `json:"width,omitempty"`
@@ -113,7 +119,8 @@ func (h *Handler) searchMessages(c *wkhttp.Context) {
 			Routing(normID).
 			Query(dsl).
 			Size(size).
-			TrackTotalHits(false)
+			TrackTotalHits(false).
+			FetchSourceContext(fileContentSourceExcludes())
 		if req.Keyword != "" {
 			svc = svc.Highlight(buildSearchMessagesHighlight())
 		}
@@ -132,7 +139,7 @@ func (h *Handler) searchMessages(c *wkhttp.Context) {
 	}
 
 	filtered, hasMore, nextCursor, err := h.paginateWithFilterDepth(
-		ctx, loginUID, req.ChannelID, pageSize, priorDepth, initialAfter, isRelevance, osQuery, projectDocRef(req.ChannelID),
+		ctx, loginUID, req.ChannelID, pageSize, priorDepth, initialAfter, isRelevance, osQuery, projectDocRef(req.ChannelID, loginUID),
 	)
 	if err != nil {
 		if responder := classifyOSError(err); responder != nil {
@@ -225,7 +232,7 @@ func (h *Handler) buildMessageHits(ctx context.Context, hits []*elastic.SearchHi
 			continue
 		}
 		hl := map[string][]string(hit.Highlight)
-		mh := h.singleMessageHit(doc, req.ChannelID, hl)
+		mh := h.singleMessageHit(doc, req.ChannelID, req.ChannelType, hl)
 		senderIDs = append(senderIDs, mh.SenderID)
 		for _, im := range mh.InnerMessages {
 			if im.SenderID != "" {
@@ -254,7 +261,15 @@ func (h *Handler) buildMessageHits(ctx context.Context, hits []*elastic.SearchHi
 // singleMessageHit projects a single Doc into a MessageHit. Extracted so unit
 // tests can drive the field mapping (kind / snippet / outer_preview) without
 // standing up a full search loop, and so search_all can reuse it.
-func (h *Handler) singleMessageHit(doc Doc, reqChannelID string, hl map[string][]string) MessageHit {
+//
+// channelID / channelType are the values echoed on the wire. Single-channel
+// callers pass req.ChannelID / req.ChannelType so the response mirrors the
+// request. Global callers pass doc-derived values: for DM (channelType=1) the
+// caller must reverse the OS fakeChannelID back to the peer uid via
+// peerFromFakeChannelID; for group/thread the doc.ChannelID is echoed as-is.
+// A zero channelType (legacy call sites) is omitted on the wire via omitempty
+// so the single-channel response shape stays byte-identical.
+func (h *Handler) singleMessageHit(doc Doc, channelID string, channelType uint8, hl map[string][]string) MessageHit {
 	// Prefer the keyword highlight fragment; on the empty-keyword browse path
 	// no highlight is requested, so fall back to the raw payload text so the
 	// hit still carries readable content (A-doc §2.1).
@@ -271,7 +286,8 @@ func (h *Handler) singleMessageHit(doc Doc, reqChannelID string, hl map[string][
 		SentAt:        msToRFC3339(doc.Timestamp),
 		OuterPreview:  buildOuterPreview(doc.Payload),
 		InnerMessages: buildInnerMessages(doc.Payload),
-		ChannelID:     encodeChannelID(reqChannelID),
+		ChannelID:     encodeChannelID(channelID),
+		ChannelType:   channelType,
 	}
 	applyMediaProjection(&mh, doc.Payload)
 	// Rich-text projection runs as an additive layer: message_kind stays "text"
@@ -280,6 +296,13 @@ func (h *Handler) singleMessageHit(doc Doc, reqChannelID string, hl map[string][
 	// render via the structured pipeline; nil falls back to snippet.
 	if payloadType(doc.Payload) == payloadTypeRichText {
 		mh.RichText = buildRichTextDetail(doc.PayloadRaw)
+	}
+	// card-message-protocol P1：type-17 命中的响应侧投影 = 遮蔽后的 plain
+	// （单一执法点 DisplayTextFor：bot/webhook sender → 权威 plain；否则
+	// [卡片]，round-3 P1-2）。message_kind 维持 "text"（swagger 枚举已锁），
+	// snippet 即投影文本。
+	if payloadType(doc.Payload) == payloadTypeCard {
+		mh.Snippet = cardmsg.DisplayTextFor(h.cardTrust.Trusted(doc.From), doc.PayloadRaw)
 	}
 	return mh
 }

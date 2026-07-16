@@ -60,6 +60,24 @@ other = "The bot is not available."
 ["err.server.bot_api.cannot_remove_privileged"]
 other = "The group owner and managers cannot be removed through the bot API."
 
+["err.server.bot_api.card_disabled"]
+other = "Card messages are not enabled on this server."
+
+["err.server.bot_api.card_edit_forbidden"]
+other = "Card messages cannot be edited yet."
+
+["err.server.bot_api.card_invalid"]
+other = "Invalid card payload."
+
+["err.server.bot_api.card_obo_forbidden"]
+other = "Card messages cannot be sent on behalf of a user."
+
+["err.server.bot_api.card_revision_clear_forbidden"]
+other = "You can only clear revisions of your own cards."
+
+["err.server.bot_api.card_seq_conflict"]
+other = "Card update rejected: stale card_seq."
+
 ["err.server.bot_api.content_too_large"]
 other = "The content exceeds the maximum allowed size."
 
@@ -462,6 +480,27 @@ other = "The banned word does not exist."
 ["err.server.message.cannot_delete_self_conversation"]
 other = "You cannot delete the conversation with yourself."
 
+["err.server.message.card_action_denied"]
+other = "You are not allowed to act on this card."
+
+["err.server.message.card_action_in_progress"]
+other = "This card action is being processed, please retry."
+
+["err.server.message.card_action_invalid"]
+other = "Invalid card action."
+
+["err.server.message.card_edit_forbidden"]
+other = "Card messages cannot be edited."
+
+["err.server.message.card_revision_denied"]
+other = "You are not allowed to view this card's revisions."
+
+["err.server.message.card_revision_invalid"]
+other = "Invalid card revision request."
+
+["err.server.message.card_send_forbidden"]
+other = "Card messages can only be sent by bots or webhooks."
+
 ["err.server.message.channel_access_denied"]
 other = "You do not have permission to operate on this channel."
 
@@ -548,6 +587,12 @@ other = "Search service is temporarily unavailable."
 
 ["err.server.messages_search.validation_failed"]
 other = "Invalid search request."
+
+["err.server.notify.card_invalid"]
+other = "The card notification request is invalid."
+
+["err.server.notify.card_not_allowed"]
+other = "Card payloads are not allowed on the internal notification endpoint."
 
 ["err.server.oidc.bind_already_bound"]
 other = "This identity is already bound. Please sign in via OIDC to continue."
@@ -647,6 +692,9 @@ other = "Robot authentication check failed."
 
 ["err.server.robot.auth_failed"]
 other = "Robot authentication failed."
+
+["err.server.robot.card_edit_forbidden"]
+other = "Card messages cannot be edited."
 
 ["err.server.robot.channel_send_forbidden"]
 other = "Sending messages to this channel is not allowed."

@@ -35,9 +35,13 @@ mode: "debug" #   运行模式 debug or release
 
 ##################### 外网配置 ####################
 #external:
-#  ip: "" # 外网ip
-#  baseURL: "" # 外网访问地址 例如 http://192.0.2.1:8090
-#  webLoginURL: "" # web im的登录地址 例如 https://web.tangsengdaodao.com
+#  ip: "" # 外网ip；仅当 baseURL 空时作为兜底 host（见 pkg/botutil/connect.go）
+#  baseURL: "" # 外网 API 访问地址 例如 http://192.0.2.1:8090（baseURL 已给出时 ip 冗余，两者保留是历史兜底）
+#  webLoginURL: "" # web im 的登录/门户地址 例如 https://web.tangsengdaodao.com
+#  # webLoginURL 是**卡片通知 deep-link** 的 origin 来源（/s/:taskId、/d/:docId）；
+#  # 未配置或非 https 时，summary-notify / docs-notify 建卡失败，会静默降级为纯文本 DM
+#  # （见 pkg/cardtmpl/resource.go summaryDeepLink / docsDeepLink 与
+#  # modules/notify/card.go 的 build-then-degrade 分支）。
 
 ##################### 日志配置 ####################
 #logger:

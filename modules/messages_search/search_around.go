@@ -163,7 +163,8 @@ func (h *Handler) fetchAnchor(ctx context.Context, client *elastic.Client, req S
 		Routing(normID).
 		Query(b).
 		Size(1).
-		TrackTotalHits(false)
+		TrackTotalHits(false).
+		FetchSourceContext(fileContentSourceExcludes())
 	svc = applySort(svc, "time_asc")
 	res, err := svc.Do(ctx)
 	if err != nil {
@@ -174,7 +175,7 @@ func (h *Handler) fetchAnchor(ctx context.Context, client *elastic.Client, req S
 	}
 	hit := res.Hits.Hits[0]
 
-	ref, ok := projectDocRef(req.ChannelID)(hit)
+	ref, ok := projectDocRef(req.ChannelID, loginUID)(hit)
 	if !ok {
 		return nil, nil
 	}
@@ -205,7 +206,8 @@ func (h *Handler) aroundDirection(ctx context.Context, client *elastic.Client, r
 			Routing(normID).
 			Query(dsl).
 			Size(size).
-			TrackTotalHits(false)
+			TrackTotalHits(false).
+			FetchSourceContext(fileContentSourceExcludes())
 		svc = applySort(svc, sortMode)
 		if len(searchAfter) > 0 {
 			svc = svc.SearchAfter(searchAfter...)
@@ -220,7 +222,7 @@ func (h *Handler) aroundDirection(ctx context.Context, client *elastic.Client, r
 		return res.Hits.Hits, nil
 	}
 	hits, hasMore, _, err := h.paginateWithFilterDepth(
-		ctx, loginUID, req.ChannelID, pageSize, 0, anchorSort, false, osQuery, projectDocRef(req.ChannelID),
+		ctx, loginUID, req.ChannelID, pageSize, 0, anchorSort, false, osQuery, projectDocRef(req.ChannelID, loginUID),
 	)
 	return hits, hasMore, err
 }

@@ -1,0 +1,14 @@
+injected:
+  - id: space-isolation
+    source: repo
+  - id: trust-boundary
+    source: repo
+  - id: error-handling
+    source: repo
+  - id: rate-limit
+    source: repo
+  - id: testing
+    source: repo
+  - id: commit-style
+    source: repo
+brief: .octospec/tasks/card-action-callback-dispatch/brief.md

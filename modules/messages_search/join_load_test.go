@@ -34,6 +34,9 @@ func (p *countingProbe) UserDeletedSet(uid string, ids []string) (map[string]str
 	return map[string]struct{}{}, nil
 }
 func (p *countingProbe) ChannelOffset(uid, channelID string) (uint32, error) { return 0, nil }
+func (p *countingProbe) ChannelOffsets(uid string, channelIDs []string) (map[string]uint32, error) {
+	return map[string]uint32{}, nil
+}
 
 // Step 7 — the per-request MySQL join IN() list MUST stay bounded by
 // pageSize * oversampleMultiplier (one round's oversample fetch), NOT by the
@@ -44,6 +47,7 @@ func (p *countingProbe) ChannelOffset(uid, channelID string) (uint32, error) { r
 // Threshold (measured here, pinned as the gate):
 //   - max IN() list per probe call  <= pageSize * oversampleMultiplier
 //   - total probe round-trips        <= loopBudget * 4 signals
+//
 // At the max page_size of 100 that is <= 300 ids per IN(), <= 12 round-trips —
 // a single bounded JOIN batch per round, never an unbounded fan-out.
 func TestJoinLoad_INListBoundedByPageSize(t *testing.T) {

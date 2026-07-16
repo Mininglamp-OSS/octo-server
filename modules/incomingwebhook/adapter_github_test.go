@@ -233,7 +233,7 @@ func TestParseGitHubPush_Release(t *testing.T) {
 
 // 公开仓库可控的链接文本（PR/issue/release 标题）里的 `]`/`[` 必须转义，否则一个
 // 形如 `evil]( ` 的标题会提前闭合 `[...]` 把后续 URL 暴露成可见文本甚至错位渲染
-//（PR #330 review 跟进）。
+// （PR #330 review 跟进）。
 func TestParseGitHubPush_LinkTextEscaped(t *testing.T) {
 	// 标题里塞入会破坏链接结构的字符；断言渲染结果里这些字符已被反斜杠转义，
 	// 且原始的 URL 边界 `](` 不会被标题内容提前引入。

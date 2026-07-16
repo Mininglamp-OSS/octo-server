@@ -21,6 +21,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
+
 	// 该模块自身需注册以触发其 SQL 迁移
 	_ "github.com/Mininglamp-OSS/octo-server/modules/incomingwebhook"
 	// 迁移依赖链：以下模块的 SQL 迁移会修改本模块依赖的 group/group_member/user 表，
@@ -40,6 +42,12 @@ func TestMain(m *testing.M) {
 	if os.Getenv("OCTO_MASTER_KEY") == "" {
 		os.Setenv("OCTO_MASTER_KEY", "12345678901234567890123456789012")
 	}
+	// The github/gitlab adapters branch on cardmsg.Enabled() (OCTO_CARD_MESSAGE_ENABLED),
+	// so force it OFF as the deterministic test baseline — otherwise the text-path
+	// adapter tests (which assert the flag-off markdown output) become sensitive to an
+	// ambient/CI value of the var (PR #596 review, Jerry-Xin). Card tests opt in
+	// per-case via t.Setenv(cardmsg.EnvEnabled, "1").
+	os.Setenv(cardmsg.EnvEnabled, "")
 	os.Exit(m.Run())
 }
 

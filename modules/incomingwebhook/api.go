@@ -28,6 +28,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/robot"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
 	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
@@ -259,6 +260,10 @@ func (w *IncomingWebhook) Route(r *wkhttp.WKHttp) {
 			push.POST(base+"/github", chain(w.pushGitHub)...)
 			push.POST(base+"/wecom", chain(w.pushWeCom)...)
 			push.POST(base+"/multica", chain(w.pushMultica)...)
+			// /octo 是 /multica 的对外别名（隐藏 multica 产品名）：解析与渲染复用同一套
+			// parseMulticaPush，但用独立的 octoAdapter，使投递审计 adapter 记为 "octo"。
+			// /multica 保留以兼容存量订阅。
+			push.POST(base+"/octo", chain(w.pushOcto)...)
 			push.POST(base+"/gitlab", chain(w.pushGitLab)...)
 			push.POST(base+"/feishu", chain(w.pushFeishu)...)
 		}
@@ -1273,6 +1278,7 @@ func (w *IncomingWebhook) push(c *wkhttp.Context)        { w.handlePush(c, nativ
 func (w *IncomingWebhook) pushGitHub(c *wkhttp.Context)  { w.handlePush(c, githubAdapter) }
 func (w *IncomingWebhook) pushWeCom(c *wkhttp.Context)   { w.handlePush(c, wecomAdapter) }
 func (w *IncomingWebhook) pushMultica(c *wkhttp.Context) { w.handlePush(c, multicaAdapter) }
+func (w *IncomingWebhook) pushOcto(c *wkhttp.Context)    { w.handlePush(c, octoAdapter) }
 func (w *IncomingWebhook) pushGitLab(c *wkhttp.Context)  { w.handlePush(c, gitlabAdapter) }
 func (w *IncomingWebhook) pushFeishu(c *wkhttp.Context)  { w.handlePush(c, feishuAdapter) }
 
@@ -1473,6 +1479,26 @@ func (w *IncomingWebhook) handlePush(c *wkhttp.Context, ad pushAdapter) {
 			return
 		}
 		payload = p
+	case msgTypeCard:
+		// card-message-protocol P1：标准 AC JSON → type-17 信封（服务端钉
+		// octo/v1 profile），cardmsg.Validate/Finalize 与 bot ingress 同权威。
+		// 8KB body cap 不变（Decision 3：树上限/512KiB 由 cardmsg 层执行）。
+		p, err := buildCardPayload(m, req, creatorIsAdmin)
+		if err != nil {
+			if errors.Is(err, cardmsg.ErrCardPayloadTooLarge) {
+				w.submitFailure(m, len(body), ip, ad.name, "too_large", http.StatusRequestEntityTooLarge)
+				pushPayloadTooLarge(c)
+				return
+			}
+			reason := "card"
+			if errors.Is(err, errCardDisabled) {
+				reason = "card_disabled"
+			}
+			w.submitFailure(m, len(body), ip, ad.name, reason, http.StatusBadRequest)
+			pushPayloadInvalid(c, reason)
+			return
+		}
+		payload = p
 	default:
 		w.submitFailure(m, len(body), ip, ad.name, "msg_type", http.StatusBadRequest)
 		pushPayloadInvalid(c, "msg_type")
@@ -1493,6 +1519,18 @@ func (w *IncomingWebhook) handlePush(c *wkhttp.Context, ad pushAdapter) {
 	// 创建的 webhook 的广播位立即剥离；管理员建的不受影响。定向 @uid 不走此闸（不是广播、风险低）。
 	broadcastPermitted := w.settings.IncomingWebhookMemberCanBroadcast() || creatorIsAdmin
 	payload, mentionIgnored := w.assemblePushPayload(m, req, payload, broadcastPermitted)
+
+	// card-message-protocol P1 Decision 3a：assemblePushPayload 内的
+	// ExpandAisToBotUIDs 是 Finalize 之后唯一增大 payload 的 mutation（@所有 AI
+	// 展开把群 bot 成员 UID 追加进 mention 子表）。与 bot_api(send.go)/robot(api.go)
+	// 出站口径对称：对真实出站 payload 复检 512KiB —— 三个 type-17 producer 的
+	// 「最后一次 mutation 后复检」不变量在此闭合（PR#543 review：webhook 是第三条
+	// 对称路径，此前遗漏）。非 type-17 为 no-op。
+	if err := cardmsg.RecheckPayloadSize(payload); err != nil {
+		w.submitFailure(m, len(body), ip, ad.name, "too_large", http.StatusRequestEntityTooLarge)
+		pushPayloadTooLarge(c)
+		return
+	}
 
 	// 投递目标由行派生：群 webhook → (group_no, 群)；子区 webhook → (group_no____short_id,
 	// 子区)。这是 URL/body 之外唯一随绑定变化的东西——推送方零适配（见 targetChannel()）。

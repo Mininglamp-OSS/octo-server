@@ -49,7 +49,7 @@ env-test:
 #                   - lint-unregistered-code: no inline codes.Code{} literals
 #                     passed to httperr.ResponseErrorL (registry bypass)
 
-.PHONY: i18n-extract i18n-extract-check i18n-merge i18n-lint
+.PHONY: i18n-extract i18n-extract-check i18n-merge i18n-lint card-dispatch-lint
 
 i18n-extract:
 	go run ./pkg/i18n/cmd/octo-i18n-extract
@@ -60,6 +60,9 @@ i18n-lint:
 
 i18n-extract-check:
 	go run ./pkg/i18n/cmd/octo-i18n-extract -check
+
+card-dispatch-lint:
+	go run ./tools/lint-card-dispatch ./modules ./internal
 
 i18n-merge: i18n-extract
 	@command -v goi18n >/dev/null 2>&1 || { \

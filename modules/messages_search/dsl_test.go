@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -737,6 +739,177 @@ func extractSearchAllTypes(t *testing.T, raw []byte) []int {
 	return nil
 }
 
+// TestFileContentSourceExcludes pins the shared _source excludes context every
+// messages_search endpoint attaches to its OS Search call. Q6 A: excluding
+// payload.file.content and payload.file.contentMeta keeps the Tika-extracted
+// file body (30-100 KB/doc) out of the wire response while still allowing
+// content to participate in relevance scoring via the inverted index.
+func TestFileContentSourceExcludes(t *testing.T) {
+	fsc := fileContentSourceExcludes()
+	if fsc == nil {
+		t.Fatal("fileContentSourceExcludes returned nil")
+	}
+	src, err := fsc.Source()
+	if err != nil {
+		t.Fatalf("Source(): %v", err)
+	}
+	raw, _ := json.Marshal(src)
+	body := string(raw)
+	for _, want := range []string{
+		`"payload.file.content"`,
+		`"payload.file.contentMeta"`,
+		`"excludes"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("fileContentSourceExcludes missing %q in:\n%s", want, body)
+		}
+	}
+}
+
+// TestFileContentSourceExcludes_WiredIntoSearchSource pins that once the
+// helper is attached to an elastic.SearchSource the emitted _source clause
+// carries the excludes onto the wire request. Regression guard: any endpoint
+// that silently drops `.FetchSourceContext(fileContentSourceExcludes())` from
+// its svc chain would still make the multi_match tests pass but start leaking
+// the 30–100 KB file body back to clients — this test walks the shape a
+// production request actually sends to OS.
+func TestFileContentSourceExcludes_WiredIntoSearchSource(t *testing.T) {
+	ss := elastic.NewSearchSource().
+		Query(elastic.NewMatchAllQuery()).
+		FetchSourceContext(fileContentSourceExcludes())
+	src, err := ss.Source()
+	if err != nil {
+		t.Fatalf("Source(): %v", err)
+	}
+	raw, _ := json.Marshal(src)
+	body := string(raw)
+	// _source clause must be present with both excludes; the elastic library
+	// emits `_source: {excludes: [...]}` when FetchSourceContext is attached.
+	for _, want := range []string{
+		`"_source"`,
+		`"excludes"`,
+		`"payload.file.content"`,
+		`"payload.file.contentMeta"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("SearchSource missing %q in:\n%s", want, body)
+		}
+	}
+}
+
+// TestEveryClientSearchAttachesFileContentSourceExcludes is the structural
+// guard that every file-reachable OS Search call in the module attaches the
+// shared file-body excludes. Scanning source rather than mocking each handler
+// is the same pattern as no_zinc_fallthrough_test.go — it catches a whole
+// class of regressions (a future endpoint added without the exclude, or a
+// silent drop from an existing chain) that per-handler tests would miss.
+//
+// Contract: for every non-test .go file in this directory, the count of
+// `client.Search()` occurrences must equal the count of
+// `fileContentSourceExcludes()` occurrences. The two file-reachable svc
+// chains inside search_around.go are the direct motivation for this pin —
+// see PR #554 review — but the guard is deliberately module-wide so any
+// future file-returning endpoint stays covered without a plan update.
+func TestEveryClientSearchAttachesFileContentSourceExcludes(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Clean(name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		// Strip // line comments so doc references (e.g. a comment naming
+		// `client.Search()` for cross-reference) don't skew the count — only
+		// live call sites matter.
+		var clean strings.Builder
+		for _, line := range strings.Split(string(data), "\n") {
+			if idx := strings.Index(line, "//"); idx >= 0 {
+				line = line[:idx]
+			}
+			clean.WriteString(line)
+			clean.WriteByte('\n')
+		}
+		src := clean.String()
+		searches := strings.Count(src, "client.Search()")
+		if searches == 0 {
+			continue
+		}
+		excludes := strings.Count(src, "fileContentSourceExcludes()")
+		if excludes < searches {
+			t.Errorf("%s: %d `client.Search()` call(s) but only %d "+
+				"`fileContentSourceExcludes()` — every file-reachable Search "+
+				"call must attach the shared _source excludes so the "+
+				"extracted file body never leaks to the wire",
+				name, searches, excludes)
+		}
+	}
+}
+
+// TestBuildSearchFilesDSL_KeywordIncludesContentField pins the M1 contract:
+// /_search_files keyword DSL includes payload.file.content in the multi_match
+// fields (Q5 A default weight ^1 lets name/caption still outrank a pure body
+// hit).
+func TestBuildSearchFilesDSL_KeywordIncludesContentField(t *testing.T) {
+	req := SearchFilesReq{ChannelType: channelTypeGroup, ChannelID: "g", Keyword: "report"}
+	q, _ := buildSearchFilesDSL(context.Background(), fallbackTestAnalyzer(), true, req, "g", "")
+	body := asJSONString(t, q.(interface{ Source() (any, error) }))
+	if !strings.Contains(body, `"payload.file.content"`) {
+		t.Errorf("_search_files keyword DSL must include payload.file.content:\n%s", body)
+	}
+	// Boost pin: content stays at default ^1, name keeps its ^2 boost so a
+	// filename hit still outranks a pure body hit.
+	if strings.Contains(body, `"payload.file.content^`) {
+		t.Errorf("_search_files content field must carry default weight (no ^N boost):\n%s", body)
+	}
+}
+
+// TestBuildSearchAllDSL_FileClauseIncludesContentField pins M2.
+func TestBuildSearchAllDSL_FileClauseIncludesContentField(t *testing.T) {
+	req := SearchMessagesReq{ChannelType: channelTypeGroup, ChannelID: "g", Keyword: "hello"}
+	q, _ := buildSearchAllDSL(context.Background(), fallbackTestAnalyzer(), true, req, "g", "")
+	body := asJSONString(t, q.(interface{ Source() (any, error) }))
+	if !strings.Contains(body, `"payload.file.content"`) {
+		t.Errorf("_search_all keyword file clause must include payload.file.content:\n%s", body)
+	}
+	if strings.Contains(body, `"payload.file.content^`) {
+		t.Errorf("_search_all content field must carry default weight (no ^N boost):\n%s", body)
+	}
+}
+
+// TestBuildSearchMessagesDSL_ExcludesContentField is the negative regression
+// pin for the Q3 A decision: the chat-tab surface /_search must NOT search
+// file content. Whitelist [Text, MergeForward, RichText] already excludes
+// payload.type=File(8), so the multi_match fields do not reference any
+// payload.file.* field.
+func TestBuildSearchMessagesDSL_ExcludesContentField(t *testing.T) {
+	req := SearchMessagesReq{ChannelType: channelTypeGroup, ChannelID: "g", Keyword: "hello"}
+	q, _ := buildSearchMessagesDSL(context.Background(), fallbackTestAnalyzer(), true, req, "g", "")
+	body := asJSONString(t, q.(interface{ Source() (any, error) }))
+	if strings.Contains(body, `"payload.file.content"`) {
+		t.Errorf("/_search chat-tab DSL must NOT search payload.file.content (Q3 A):\n%s", body)
+	}
+	if strings.Contains(body, `"payload.file.contentMeta"`) {
+		t.Errorf("/_search chat-tab DSL must NOT reference payload.file.contentMeta:\n%s", body)
+	}
+}
+
+// TestBuildSearchAllHighlight_ExcludesFileContent is the Q4 D negative pin:
+// pickSnippet does not promote payload.file.content into the snippet slot, so
+// requesting a highlight on that field would allocate a fragment that no
+// consumer reads.
+func TestBuildSearchAllHighlight_ExcludesFileContent(t *testing.T) {
+	body := asJSONString(t, buildSearchAllHighlight())
+	if strings.Contains(body, `"payload.file.content"`) {
+		t.Errorf("_search_all highlight must NOT include payload.file.content (Q4 D):\n%s", body)
+	}
+}
+
 func TestExtractSortValues(t *testing.T) {
 	ts, msg, score := extractSortValues([]any{float64(1717000000), float64(9876543210)}, false)
 	if ts != 1717000000 || msg != 9876543210 {
@@ -974,7 +1147,7 @@ func TestBuildSearchAfterFromHit_LegacyDocDefaultsSubSeqZero(t *testing.T) {
 // virtual sub-document with subSeq=N, the encoded cursor must carry N back
 // so the next page's search_after resumes exclusively past (ts, msgID, N).
 // This is the load-bearing end-to-end pin for the cross-page-boundary
-//漏图 fix: without subSeq on the cursor, the next page jumps back to (ts,
+// 漏图 fix: without subSeq on the cursor, the next page jumps back to (ts,
 // msgID, 0)'s implicit position and re-emits / skips siblings.
 func TestComputeCursorPagination_CarriesSubSeq(t *testing.T) {
 	cfg := SearchConfig{CursorHMAC: "k"}
@@ -1067,7 +1240,7 @@ func TestPaginate_VirtualSiblingsCrossPageBoundary(t *testing.T) {
 
 	collected, hasMore, nextCursor, err := h.paginateWithFilter(
 		context.Background(), "me", "C1", 2, nil, false,
-		osQuery, projectDocRef("C1"),
+		osQuery, projectDocRef("C1", ""),
 	)
 	if err != nil {
 		t.Fatalf("paginate: %v", err)
@@ -1106,4 +1279,3 @@ func TestPaginate_VirtualSiblingsCrossPageBoundary(t *testing.T) {
 	}
 	_ = lastSA
 }
-

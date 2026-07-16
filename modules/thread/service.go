@@ -13,6 +13,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/pushcache"
 	"go.uber.org/zap"
@@ -308,6 +309,32 @@ func (s *Service) CreateThread(req *CreateThreadReq) (*ThreadResp, error) {
 				zap.String("shortID", shortID),
 				zap.Error(err))
 		}
+
+		// issue #557：无条件为创建者本人补一条子区 ext 行，让创建者刚建的子区立即
+		// 出现在他自己的关注 Tab。OnThreadCreated 的 fanout 只覆盖「已明确关注父群」
+		// （auto_follow_threads=1 AND group_unfollowed=0）的成员，创建者只要没关注
+		// 父群就会被漏掉——这是跨端（iOS/Android/PC/web）共有的 server 行为缺口，
+		// 在此一处根治。
+		//
+		// 注意（octo-web #293 被拒的 P1）：只补创建者本人的子区行，绝不清父群的
+		// group_unfollowed / 把父群拉回关注——见 EnsureThreadFollowForCreator 注释。
+		// space_id 取创建者对父群的补行 space（resolveCreatorBackfillSpaceID：内部成员=
+		// 群 space_id、外部成员=其 source_space_id；legacy 无 space 内部群归一到创建者
+		// default space，见该函数注释），保证补行落在读侧 sidebar 以非空 default space 读
+		// 时能命中的同一 space。同为 commit 后 best-effort：失败只警告，不回滚。
+		creatorSpaceID, sErr := s.resolveCreatorBackfillSpaceID(req.GroupNo, req.CreatorUID)
+		if sErr != nil {
+			s.Warn("解析创建者补行 space 失败，跳过创建者子区 ext 补行（下次关注可补齐）",
+				zap.String("groupNo", req.GroupNo),
+				zap.String("uid", req.CreatorUID),
+				zap.Error(sErr))
+		} else if err := convSvc.EnsureThreadFollowForCreator(req.CreatorUID, creatorSpaceID, channelID); err != nil {
+			s.Warn("创建者子区 ext 补行失败（thread 已创建，下次关注/refollow 补齐）",
+				zap.String("groupNo", req.GroupNo),
+				zap.String("shortID", shortID),
+				zap.String("uid", req.CreatorUID),
+				zap.Error(err))
+		}
 	}
 
 	// 拷贝源消息到子区作为首条消息（顺序：在 fanout 之后，客户端收到这条消息时
@@ -332,6 +359,55 @@ func (s *Service) CreateThread(req *CreateThreadReq) (*ThreadResp, error) {
 	resp := s.toThreadRespWithID(thread)
 	resp.MemberCount = 1 // 创建者
 	return resp, nil
+}
+
+// resolveCreatorBackfillSpaceID 解析创建者子区补行应落的 space_id，使其与读侧
+// sidebar 的 space 过滤（ListThreadExts 的 `WHERE space_id=?`）命中同一个 space。
+//
+// 起点是创建者对父群的 effective space（GetMemberExternalFields 第 4 返回值）：
+//   - 外部成员                       -> 其 source_space_id
+//   - 现代（有 space）内部群的内部成员 -> 群自身 space_id
+//   - legacy（无 space）内部群的内部成员 -> ""（group.space_id==''）
+//
+// 只有最后一种 legacy 情况需要归一化：effective space 为空，但现代客户端读 legacy
+// 群时带的是**非空** default space（#484 口径），补行若落 space_id='' 会在 SQL 层被
+// 过滤掉，创建者永远看不到自己刚建的子区（issue #557 的 silent no-op）。因此**仅对
+// 这一路径**（内部成员 + 空 effective space）把 space 归一到创建者自己的 default
+// space——正是读侧（以及 auto_follow fanout 的 follower 行）所在的 space。外部成员、
+// 现代内部群的既有正确行为一律不动。
+//
+// 与 fanout 的关系：fanout（OnThreadCreated）的源数据来自群 ext 行，而群 ext 行只能
+// 由走 validateBase（拒空 space_id）的 follow 路径写入，所以 fanout 复制的必是非空
+// space，**永远不会**落 space_id=''。归一化到创建者 default space 后，创建者补行才
+// 与 fanout 的 follower 行落在同一非空 space。
+//
+// best-effort 降级：拿不到 default space（查询失败或用户无 default space）时，返回
+// 原始（空）值并记警告，不阻断建 thread 主流程（保持既有 best-effort 语义，下次关注/
+// refollow 会补齐）。
+func (s *Service) resolveCreatorBackfillSpaceID(groupNo, creatorUID string) (string, error) {
+	isExternal, _, _, creatorSpaceID, _, err := s.groupService.GetMemberExternalFields(groupNo, creatorUID)
+	if err != nil {
+		return "", err
+	}
+	// 仅归一化「legacy 无 space 内部群」这一路径：内部成员且 effective space 为空。
+	// （GetMemberExternalFields 对「非成员/零值」也返回 isExternal=0 + space=""，会流入
+	// 本分支；但创建者必是自己刚建 thread 的成员，且归一化只落到创建者自己的 default
+	// space，无越权，故该退化输入无害。）
+	if creatorSpaceID == "" && isExternal != 1 {
+		defaultSpaceID, dErr := space.GetUserDefaultSpaceIDE(s.ctx, creatorUID)
+		if dErr != nil {
+			s.Warn("解析创建者 default space 失败，legacy 群创建者子区补行可能不出现在其关注 Tab（下次关注/refollow 补齐）",
+				zap.String("groupNo", groupNo), zap.String("uid", creatorUID), zap.Error(dErr))
+			return "", nil
+		}
+		if defaultSpaceID == "" {
+			s.Warn("创建者无 default space，legacy 群创建者子区补行可能不出现在其关注 Tab（下次关注/refollow 补齐）",
+				zap.String("groupNo", groupNo), zap.String("uid", creatorUID))
+			return "", nil
+		}
+		return defaultSpaceID, nil
+	}
+	return creatorSpaceID, nil
 }
 
 // buildThreadCreatedPayload 构建子区创建通知消息的 payload
@@ -429,12 +505,14 @@ func (s *Service) UpdateName(groupNo, shortID, operatorUID, name string) error {
 
 	// 企业微信式解散语义（产品决策 2026-06）：子区改名属低风险写，解散后仍允许——
 	// 对齐会话置顶（group/api.go:groupSettingUpdate 的 settingActionMap 豁免解散校验）。
-	// 故此处不再调 ensureGroupNotDisbanded；改名仍受下方「父群活跃成员 + creator/admin」
-	// 权限校验保护。建子区 / 加入 / 归档 / 删除 / GROUP.md 仍由各自守卫拦截。
+	// 故此处不再调 ensureGroupNotDisbanded；改名仍受下方「父群内部活跃人类成员 + 龙虾排除」
+	// 权限校验保护（creator/admin 限制已放开）。建子区 / 加入 / 归档 / 删除 / GROUP.md 仍由各自守卫拦截。
 
-	// 子区操作权来自「父群活跃成员」身份：被拉黑/移出父群的用户即使是子区创建者也
-	// 无权改名。必须在授予 creator/admin 特权之前先校验。fail-closed。
-	isActive, err := s.groupService.ExistMemberActive(thread.GroupNo, operatorUID)
+	// 子区操作权来自「父群内部活跃成员」身份：被拉黑/移出父群的用户即使是子区创建者也
+	// 无权改名；跨 Space 外部成员(is_external=1)同样无权。fail-closed。
+	// 用 ExistMemberActiveInternal（带 is_external=0）保留旧门禁的 is_external=0 边界
+	// （YUJ-231 / GH#1289，P1）。
+	isActive, err := s.groupService.ExistMemberActiveInternal(thread.GroupNo, operatorUID)
 	if err != nil {
 		return fmt.Errorf("check active membership: %w", err)
 	}
@@ -442,14 +520,14 @@ func (s *Service) UpdateName(groupNo, shortID, operatorUID, name string) error {
 		return errors.New("no permission to update")
 	}
 
-	if thread.CreatorUID != operatorUID {
-		isManager, err := s.groupService.IsCreatorOrManager(thread.GroupNo, operatorUID)
-		if err != nil {
-			return fmt.Errorf("check permission: %w", err)
-		}
-		if !isManager {
-			return errors.New("no permission to update")
-		}
+	// 改名为低风险写：任何活跃的人类成员都可改子区名，无需是创建者/管理员。
+	// 但龙虾(robot)不是普通成员，禁止其调用改名。
+	isRobot, err := s.groupService.IsRobot(operatorUID)
+	if err != nil {
+		return fmt.Errorf("check robot: %w", err)
+	}
+	if isRobot {
+		return errors.New("no permission to update")
 	}
 
 	if err := s.db.UpdateName(shortID, name, s.threadVersionGen()); err != nil {

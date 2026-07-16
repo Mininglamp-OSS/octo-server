@@ -462,3 +462,19 @@ func buildSearchAfterFromHit(hit *elastic.SearchHit, isRelevance bool) ([]any, b
 	ts := numericTo64(hit.Sort[0])
 	return []any{ts, msgID, subSeq}, true
 }
+
+// fileContentSourceExcludes returns the shared _source excludes context every
+// messages_search endpoint attaches to its OS Search call. The excluded fields
+// carry the Tika-extracted file body (payload.file.content, avg 30–100 KB per
+// doc) and its extraction metadata (payload.file.contentMeta); both participate
+// in the multi_match relevance score via the inverted index but never surface
+// on the wire — Q1 C keeps FileHit without a contentSnippet field, and Q4 D
+// keeps pickSnippet from promoting content into the snippet slot. Highlight
+// fragments are drawn from the inverted index rather than _source, so this
+// exclude does not affect highlight functionality.
+func fileContentSourceExcludes() *elastic.FetchSourceContext {
+	return elastic.NewFetchSourceContext(true).Exclude(
+		"payload.file.content",
+		"payload.file.contentMeta",
+	)
+}

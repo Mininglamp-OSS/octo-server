@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/message"
@@ -29,7 +30,20 @@ type visibilityProbe interface {
 	// ChannelOffset returns the user's channel-offset seq for channelID, or
 	// 0 when there is no offset record. A non-zero value means messages
 	// with messageSeq <= offset have been cleared from the user's view.
+	//
+	// Retained for backwards compatibility with existing test doubles;
+	// production callers should prefer ChannelOffsets for multi-channel
+	// batching. filterVisible internally routes through ChannelOffsets
+	// with a single-element slice so the two paths behave identically.
 	ChannelOffset(uid, channelID string) (uint32, error)
+	// ChannelOffsets returns the user's channel-offset seq for each of
+	// channelIDs. Missing entries default to 0 (no clear-history record).
+	// Fail-closed contract: any DB error returns (nil, err) — filterVisible
+	// then propagates to INTERNAL_ERROR without releasing any hits.
+	//
+	// This is the batch surface the global endpoints rely on so a page whose
+	// hits span N rooms only pays 1 MySQL round-trip for offsets, not N.
+	ChannelOffsets(uid string, channelIDs []string) (map[string]uint32, error)
 }
 
 // messageVisibilityProbe is the production implementation of
@@ -112,6 +126,26 @@ func (p *messageVisibilityProbe) ChannelOffset(uid, channelID string) (uint32, e
 	return 0, nil
 }
 
+// ChannelOffsets is the batch variant used by the global endpoints so a page
+// spanning N rooms costs one MySQL round-trip instead of N. The underlying
+// message.IService.GetChannelOffsetWithUID already accepts a slice; this is a
+// thin re-shape into map[channelID]seq. Missing rows are omitted from the
+// map (callers treat "no key" as offset 0, same as ChannelOffset).
+func (p *messageVisibilityProbe) ChannelOffsets(uid string, channelIDs []string) (map[string]uint32, error) {
+	if len(channelIDs) == 0 {
+		return map[string]uint32{}, nil
+	}
+	items, err := p.svc.GetChannelOffsetWithUID(uid, channelIDs)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]uint32, len(items))
+	for _, o := range items {
+		out[o.ChannelID] = o.MessageSeq
+	}
+	return out, nil
+}
+
 // msgRef projects a single OS hit into the inputs filterVisible needs to
 // decide whether the message is currently visible to the caller. ChannelID
 // is reserved for future cross-channel callers (e.g. when the indexer fans
@@ -129,6 +163,33 @@ type msgRef struct {
 	MessageSeq uint32 // matches channel_offset.message_seq
 	ChannelID  string
 	Visibles   []string // sender-set allowlist; non-empty => caller must be in it
+}
+
+// filterVisibleChunkSize bounds the id / channel count in any single probe
+// round-trip so the underlying `... IN (?)` clauses never balloon. The presence
+// batch can present up to maxGroups × T ids at once; the message.IService
+// queries do not chunk internally, so this is where the width is capped.
+const filterVisibleChunkSize = 1000
+
+// chunkStrings splits s into consecutive slices of at most size elements
+// (size <= 0 falls back to a single chunk). Empty input yields no chunks so a
+// zero-id call makes zero round-trips.
+func chunkStrings(s []string, size int) [][]string {
+	if len(s) == 0 {
+		return nil
+	}
+	if size <= 0 {
+		return [][]string{s}
+	}
+	out := make([][]string, 0, (len(s)+size-1)/size)
+	for i := 0; i < len(s); i += size {
+		end := i + size
+		if end > len(s) {
+			end = len(s)
+		}
+		out = append(out, s[i:end])
+	}
+	return out
 }
 
 // filterVisible is the search-side analogue of message.filterMessages. It
@@ -180,21 +241,77 @@ func (h *Handler) filterVisible(ctx context.Context, loginUID, channelID string,
 		uniqueIDs = append(uniqueIDs, r.MessageID)
 	}
 
-	revokedSet, err := h.visibility.RevokedSet(uniqueIDs)
-	if err != nil {
-		return nil, fmt.Errorf("filterVisible: RevokedSet: %w", err)
+	// Chunk the id set before hitting the probe. The presence batch
+	// (calibratePresence) can hand us up to maxGroups × T (200 × 40 = 8000)
+	// unique ids in one shot, and the underlying message.IService queries build
+	// a single `message_id IN (?)` clause with NO chunking — an 8000-element IN
+	// risks blowing the driver's placeholder budget / max_allowed_packet and
+	// planning a pathological scan. Chunking here keeps every IN bounded
+	// regardless of the probe implementation. Single-channel callers stay a
+	// single chunk (their pages are pageSize-bounded), so their round-trip shape
+	// is byte-identical to before.
+	revokedSet := make(map[string]struct{}, len(uniqueIDs))
+	deletedSet := make(map[string]struct{}, len(uniqueIDs))
+	userDeletedSet := make(map[string]struct{}, len(uniqueIDs))
+	for _, chunk := range chunkStrings(uniqueIDs, filterVisibleChunkSize) {
+		rs, err := h.visibility.RevokedSet(chunk)
+		if err != nil {
+			return nil, fmt.Errorf("filterVisible: RevokedSet: %w", err)
+		}
+		for id := range rs {
+			revokedSet[id] = struct{}{}
+		}
+		ds, err := h.visibility.GloballyDeletedSet(chunk)
+		if err != nil {
+			return nil, fmt.Errorf("filterVisible: GloballyDeletedSet: %w", err)
+		}
+		for id := range ds {
+			deletedSet[id] = struct{}{}
+		}
+		uds, err := h.visibility.UserDeletedSet(loginUID, chunk)
+		if err != nil {
+			return nil, fmt.Errorf("filterVisible: UserDeletedSet: %w", err)
+		}
+		for id := range uds {
+			userDeletedSet[id] = struct{}{}
+		}
 	}
-	deletedSet, err := h.visibility.GloballyDeletedSet(uniqueIDs)
-	if err != nil {
-		return nil, fmt.Errorf("filterVisible: GloballyDeletedSet: %w", err)
+	// Multi-channel channel-offset lookup (§8.2 generalisation). Each hit is
+	// gated by its own room's clear-history watermark instead of a single
+	// per-request channel. Two invariants preserve legacy behaviour and let
+	// fail-closed still bite:
+	//
+	//   1. refs whose ChannelID is empty fall back to the request-level
+	//      `channelID` parameter. All single-channel callers (search_messages,
+	//      search_all, search_files, search_around) invoke projectDocRef
+	//      today, which stamps the request channel_id on every ref — so the
+	//      set of channels queried collapses to {channelID}, keeping the
+	//      round-trip shape byte-identical to the legacy path.
+	//   2. When ChannelOffsets fails wholesale we surface the error (same
+	//      fail-closed semantics as the other three signals). A channel with
+	//      no offset row is not an error — the map simply omits the key and
+	//      we treat it as offset 0 (mirrors ChannelOffset's contract).
+	channelSet := make(map[string]struct{}, len(refs))
+	for _, r := range refs {
+		if r.ChannelID != "" {
+			channelSet[r.ChannelID] = struct{}{}
+		} else if channelID != "" {
+			channelSet[channelID] = struct{}{}
+		}
 	}
-	userDeletedSet, err := h.visibility.UserDeletedSet(loginUID, uniqueIDs)
-	if err != nil {
-		return nil, fmt.Errorf("filterVisible: UserDeletedSet: %w", err)
+	channelList := make([]string, 0, len(channelSet))
+	for id := range channelSet {
+		channelList = append(channelList, id)
 	}
-	offsetSeq, err := h.visibility.ChannelOffset(loginUID, channelID)
-	if err != nil {
-		return nil, fmt.Errorf("filterVisible: ChannelOffset: %w", err)
+	offsets := make(map[string]uint32, len(channelList))
+	for _, chunk := range chunkStrings(channelList, filterVisibleChunkSize) {
+		part, err := h.visibility.ChannelOffsets(loginUID, chunk)
+		if err != nil {
+			return nil, fmt.Errorf("filterVisible: ChannelOffsets: %w", err)
+		}
+		for id, seq := range part {
+			offsets[id] = seq
+		}
 	}
 
 	keep := make(map[string]struct{}, len(refs))
@@ -211,6 +328,11 @@ func (h *Handler) filterVisible(ctx context.Context, loginUID, channelID string,
 		if _, bad := userDeletedSet[r.MessageID]; bad {
 			continue
 		}
+		effectiveChannel := r.ChannelID
+		if effectiveChannel == "" {
+			effectiveChannel = channelID
+		}
+		offsetSeq := offsets[effectiveChannel]
 		if offsetSeq > 0 && r.MessageSeq <= offsetSeq {
 			continue
 		}
@@ -292,6 +414,26 @@ func (h *Handler) paginateWithFilterDepth(
 	osQuery osQueryFn,
 	project projectFn,
 ) ([]*elastic.SearchHit, bool, string, error) {
+	return h.paginateWithFilterDepthInstr(ctx, loginUID, channelID, pageSize, priorDepth, initialSearchAfter, isRelevanceSort, osQuery, project, nil)
+}
+
+// paginateWithFilterDepthInstr is paginateWithFilterDepth plus optional
+// per-phase timing capture. Pass a non-nil timings sink to accumulate
+// os_search_ms, filter_visible_ms and oversample_pages across every round
+// of the oversample loop. YUJ-27: the global endpoints hand a sink in so
+// audit can report where the request actually spent time; single-channel
+// handlers pass nil and pay zero timing overhead.
+func (h *Handler) paginateWithFilterDepthInstr(
+	ctx context.Context,
+	loginUID, channelID string,
+	pageSize int,
+	priorDepth int64,
+	initialSearchAfter []any,
+	isRelevanceSort bool,
+	osQuery osQueryFn,
+	project projectFn,
+	timings *searchPhaseTimings,
+) ([]*elastic.SearchHit, bool, string, error) {
 	collected := make([]*elastic.SearchHit, 0, pageSize)
 	searchAfter := initialSearchAfter
 	fetchSize := pageSize * oversampleMultiplier
@@ -302,7 +444,20 @@ func (h *Handler) paginateWithFilterDepth(
 	)
 
 	for round := 0; round < loopBudget; round++ {
-		hits, err := osQuery(searchAfter, fetchSize)
+		if timings != nil {
+			timings.oversamplePages = round + 1
+		}
+		var (
+			hits []*elastic.SearchHit
+			err  error
+		)
+		if timings != nil {
+			start := time.Now()
+			hits, err = osQuery(searchAfter, fetchSize)
+			timings.osSearch += time.Since(start)
+		} else {
+			hits, err = osQuery(searchAfter, fetchSize)
+		}
 		if err != nil {
 			return nil, false, "", err
 		}
@@ -325,9 +480,19 @@ func (h *Handler) paginateWithFilterDepth(
 			refs[i] = r
 			filterInput = append(filterInput, r)
 		}
-		keep, err := h.filterVisible(ctx, loginUID, channelID, filterInput)
-		if err != nil {
-			return nil, false, "", err
+		keep := map[string]struct{}{}
+		if len(filterInput) > 0 {
+			var fverr error
+			if timings != nil {
+				start := time.Now()
+				keep, fverr = h.filterVisible(ctx, loginUID, channelID, filterInput)
+				timings.filterVisible += time.Since(start)
+			} else {
+				keep, fverr = h.filterVisible(ctx, loginUID, channelID, filterInput)
+			}
+			if fverr != nil {
+				return nil, false, "", fverr
+			}
 		}
 
 		filledThisRound := false
@@ -472,14 +637,25 @@ func decodeCursorAsSearchAfter(cfg SearchConfig, cursor string, isRelevanceSort 
 	return []any{ts, msgID, subSeq}, true
 }
 
-// projectDocRef returns a projectFn that pulls (messageId, messageSeq) from
-// a hit's typed _source. The reqChannelID parameter is bound here so the
-// closure can fill msgRef.ChannelID with the request's channel_id (the
-// /v1/messages/_search* endpoints are single-channel, so this is constant
-// across all hits in the round). Hits with unparseable _source fail-soft:
-// project returns ok=false and the loop drops them — same behaviour as
-// the legacy buildXxxHits path.
-func projectDocRef(reqChannelID string) projectFn {
+// projectDocRef returns a projectFn that pulls (messageId, messageSeq,
+// channelId) from a hit's typed _source. Every ref carries the doc's OWN
+// channelId — filterVisible then buckets refs per channel and consults each
+// room's clear-history offset independently (§8.2 multi-channel
+// generalisation). Single-channel callers pass their request `channel_id`
+// as reqChannelID so this stays a defensive fallback if the doc's channelId
+// is ever missing (indexer contract says it's always populated). Hits with
+// unparseable _source fail-soft: project returns ok=false and the loop drops
+// them — same behaviour as the legacy buildXxxHits path.
+//
+// DM key alignment: the `channel_offset` MySQL table is keyed by peer uid for
+// DMs, while OS stores the fakeChannelID ("uidA@uidB"). If we handed the raw
+// fake id to ChannelOffsets the lookup would always miss and the caller's
+// clear-history watermark would silently stop applying to search hits. To
+// keep the search-side channel_offset gate in lockstep with the read path we
+// reverse the fake id back to the peer uid here for DMs — the resulting
+// msgRef.ChannelID is exactly the key `channel_offset` uses. Non-DMs pass
+// through unchanged.
+func projectDocRef(reqChannelID, loginUID string) projectFn {
 	return func(hit *elastic.SearchHit) (msgRef, bool) {
 		if hit == nil {
 			return msgRef{}, false
@@ -510,10 +686,19 @@ func projectDocRef(reqChannelID string) projectFn {
 		if d.Virtual && d.ParentMessageID != nil && *d.ParentMessageID != 0 {
 			visKey = *d.ParentMessageID
 		}
+		channelID := d.ChannelID
+		if channelID == "" {
+			channelID = reqChannelID
+		}
+		// DM channel_offset lookup key alignment: reverse fakeChannelID → peer
+		// uid so ChannelOffsets(uid, [peer_uid]) actually hits the row.
+		if uint8(d.ChannelType) == channelTypePerson && loginUID != "" && channelID != "" {
+			channelID = peerFromFakeChannelID(channelID, loginUID)
+		}
 		return msgRef{
 			MessageID:  strconv.FormatInt(visKey, 10),
 			MessageSeq: uint32(d.MessageSeq),
-			ChannelID:  reqChannelID,
+			ChannelID:  channelID,
 			Visibles:   d.Visibles,
 		}, true
 	}

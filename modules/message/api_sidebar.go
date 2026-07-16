@@ -488,11 +488,24 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 		// Append standalone thread ext entries not present in IM result.
 		// Pass categorySetting + unfollowedGroups so parent-follow filter applies
 		// to DB-only thread entries as well (PR review Round-3 Blocking #4).
-		lastMsgAtMap, threadStatusMap, err := sb.loadThreadLastMsgAt(threadExtRows)
+		lastMsgAtMap, threadStatusMap, threadCreatorMap, err := sb.loadThreadLastMsgAt(threadExtRows)
 		if failClosedForFollow("thread last_message_at query", err) {
 			return
 		}
-		items = mergeThreadEntries(items, threadExtRows, lastMsgAtMap, categorySetting, unfollowedGroups, groupSpaceMap, externalGroupMap, defaultSpaceID)
+		// issue #557：创建者自建子区必须能出现在自己的关注 Tab，即使父群从未关注/
+		// 未分类/被显式取关。用 thread.creator_uid==loginUID 精确识别「本人自建」，据此
+		// 对这些子区放宽 mergeThreadEntries 的父群前置丢弃。键为 "{groupNo}____{shortID}"，
+		// 与 thread 条目 TargetID 同口径。
+		// 注意：豁免只跳过「分类/取关」前置，绝不跳过 space 过滤（2a.5）与父群成员过滤
+		// （2a.6）——这两个安全过滤在此之前已对 threadExtRows 生效，被移出父群/跨 Space
+		// 的创建者子区行早已被剔除，不会走到这里。
+		selfCreatedThreads := make(map[string]struct{}, len(threadCreatorMap))
+		for key, creatorUID := range threadCreatorMap {
+			if creatorUID == loginUID {
+				selfCreatedThreads[key] = struct{}{}
+			}
+		}
+		items = mergeThreadEntries(items, threadExtRows, lastMsgAtMap, categorySetting, unfollowedGroups, groupSpaceMap, externalGroupMap, defaultSpaceID, selfCreatedThreads, threadStatusMap)
 
 		// GH octo-server#310：把 thread 生命周期状态回填到 thread 条目。statusMap
 		// 来自 loadThreadLastMsgAt（复用 QueryActiveByGroupShortIDs 已 SELECT 的
@@ -649,11 +662,16 @@ func (sb *Sidebar) loadPinnedSet(uid, spaceID string) (map[string]struct{}, erro
 // GH octo-server#310：QueryActiveByGroupShortIDs 同时 SELECT 了 status，这里把它
 // 一并 surface 出来（statusMap，键同为 "{groupNo}____{shortID}"），让 follow tab
 // 在 backfill 阶段把 thread 生命周期状态回填到 SidebarItem.Status，零额外查询。
-func (sb *Sidebar) loadThreadLastMsgAt(extRows []*convext.Model) (lastMsgAt map[string]*time.Time, statusMap map[string]int, err error) {
+//
+// issue #557：同理把 creator_uid 一并带回（creatorMap，键同为 "{groupNo}____{shortID}"）。
+// 调用方据此判定「这是 loginUID 自建的子区」，从而对创建者自建子区放宽父群未关注/
+// 未分类的前置丢弃（见 mergeThreadEntries selfCreatedThreads）。同样零额外查询。
+func (sb *Sidebar) loadThreadLastMsgAt(extRows []*convext.Model) (lastMsgAt map[string]*time.Time, statusMap map[string]int, creatorMap map[string]string, err error) {
 	result := make(map[string]*time.Time, len(extRows))
 	statuses := make(map[string]int, len(extRows))
+	creators := make(map[string]string, len(extRows))
 	if len(extRows) == 0 {
-		return result, statuses, nil
+		return result, statuses, creators, nil
 	}
 	refs := make([]thread.ShortRef, 0, len(extRows))
 	for _, m := range extRows {
@@ -664,18 +682,19 @@ func (sb *Sidebar) loadThreadLastMsgAt(extRows []*convext.Model) (lastMsgAt map[
 		refs = append(refs, thread.ShortRef{GroupNo: gno, ShortID: sid})
 	}
 	if len(refs) == 0 {
-		return result, statuses, nil
+		return result, statuses, creators, nil
 	}
 	threadMap, qerr := sb.threadDB.QueryActiveByGroupShortIDs(refs)
 	if qerr != nil {
-		return nil, nil, fmt.Errorf("sidebar load thread last_message_at: %w", qerr)
+		return nil, nil, nil, fmt.Errorf("sidebar load thread last_message_at: %w", qerr)
 	}
 	// QueryActiveByGroupShortIDs 已经按 "{groupNo}____{shortID}" 做键，直接转写。
 	for key, lite := range threadMap {
 		result[key] = lite.LastMessageAt
 		statuses[key] = lite.Status
+		creators[key] = lite.CreatorUID
 	}
-	return result, statuses, nil
+	return result, statuses, creators, nil
 }
 
 // loadThreadStatuses 批量查询给定 sidebar items 里 thread 条目（target_type=5）
@@ -1199,6 +1218,24 @@ func buildRecentItems(
 // unfollowed (or whose category was removed) would still surface in the follow
 // tab, exposing stale state.
 //
+// issue #557 — 例外：创建者自建的**active**子区（selfCreatedThreads 命中且
+// status==ThreadStatusActive）必须始终渲染，即使父群从未关注/未分类/被显式取关。
+// 识别口径是 thread.creator_uid==loginUID（硬事实，来自 thread 表，不可能命中别人
+// 的子区），因此只对创建者本人放宽，对 fanout / 关注者行零影响，Blocking #4 的保护
+// 原样保留。为何安全：
+//  1. 豁免键严格等于 creator_uid==loginUID，别人的子区永不匹配；
+//  2. 豁免只跳过「分类/取关」前置，space 过滤（2a.5）与父群成员过滤（2a.6）
+//     在本函数之前执行且不受影响——被移出父群/跨 Space 的创建者行早已被剔除；
+//  3. UnfollowChannel 取关父群即删该群所有 thread ext 行，fanout 又只补
+//     auto_follow=1 AND group_unfollowed=0 的成员——「thread 行存在但父群未关注/
+//     未分类」几乎只能是创建者补行，豁免不会复活任何本应被删的 fanout 行；
+//  4. alive（lastMsgAtMap）检查不变，已删除子区仍被丢弃。
+//
+// XIN-1135（块B）— 豁免加 active 守卫：已归档(status=2)的自建子区不再享受 #557 豁免，
+// 回落到常规 parent-follow 谓词，避免归档子区在每次 /sidebar/sync 被无条件重新 emit
+// 进关注 Tab。对齐 /conversation/sync 的 server 端 active 语义。status 复用
+// threadStatusMap，零额外查询。见 selfCreated 分支内注释。
+//
 // PR review follow-up：ext 行存在但目标 thread 已被删除（cleanup 延迟 / 失败）的
 // 情况，loadThreadLastMsgAt 不会把它放进 lastMsgAtMap。本函数据此 skip，
 // 避免把 timestamp=0 的"幽灵 thread"emit 给客户端。
@@ -1218,6 +1255,14 @@ func mergeThreadEntries(
 	groupSpaceMap map[string]string,
 	externalGroupMap map[string]string,
 	defaultSpaceID string,
+	// selfCreatedThreads 的键是 ext.TargetID，命中表示该子区由 loginUID 本人创建
+	// （issue #557）。命中时跳过父群未关注/未分类前置丢弃，但分类字段仍安全取值
+	// （父群无分类时 catID=nil，落"未分类"桶）。
+	selfCreatedThreads map[string]struct{},
+	// threadStatusMap 的键同为 ext.TargetID（"{groupNo}____{shortID}"），值为 thread
+	// 生命周期 status（来自 loadThreadLastMsgAt 复用的 QueryActiveByGroupShortIDs，
+	// 零额外查询）。用于给 #557 自建豁免加 active 守卫：仅 active 自建子区放宽 emit。
+	threadStatusMap map[string]int,
 ) []*SidebarItem {
 	if len(threadExtRows) == 0 {
 		return existing
@@ -1246,13 +1291,37 @@ func mergeThreadEntries(
 		if !alive {
 			continue
 		}
-		// Apply parent-follow predicate (mirrors buildFollowItems thread branch).
-		cs, ok := categorySetting[groupNo]
-		if !ok || cs.CategoryID == nil {
-			continue // parent group not in follow set
+		_, selfCreated := selfCreatedThreads[ext.TargetID]
+		// XIN-1135 (块B) — 自建豁免加 server 端 active 守卫：只有 active 的自建子区
+		// 才放宽父群前置丢弃。已归档(status=2)的自建子区必须回落到常规 parent-follow
+		// 谓词，否则它会在每次 /sidebar/sync 被无条件重新 emit 进关注 Tab（线上「归档
+		// 子区刷新后重现」的直接成因，根因 #565 selfCreated 豁免缺 status 守卫）。对齐
+		// /conversation/sync 的 QueryActiveShortIDs status=active 语义。status 复用
+		// threadStatusMap（loadThreadLastMsgAt 已带回），零额外查询；alive 检查已保证
+		// 存活行必在 statusMap 中，故 != ThreadStatusActive 精确命中 archived。
+		if selfCreated && threadStatusMap[ext.TargetID] != thread.ThreadStatusActive {
+			selfCreated = false
 		}
-		if _, unfollowed := unfollowedGroups[groupNo]; unfollowed {
-			continue // parent group explicitly unfollowed
+		// Apply parent-follow predicate (mirrors buildFollowItems thread branch),
+		// except for the creator's own ACTIVE thread (issue #557 + XIN-1135 guard).
+		cs, hasCategory := categorySetting[groupNo]
+		if !selfCreated {
+			if !hasCategory || cs.CategoryID == nil {
+				continue // parent group not in follow set
+			}
+			if _, unfollowed := unfollowedGroups[groupNo]; unfollowed {
+				continue // parent group explicitly unfollowed
+			}
+		}
+		// 分类字段安全取值：父群未分类（!hasCategory 或 CategoryID==nil）时 catID=nil，
+		// 该子区落"未分类"桶（CategorySort=0）。仅创建者自建子区会走到这个 nil 分支——
+		// 非创建者子区在上面已被 continue 丢弃。
+		var catID *string
+		var catGroupSort, catSort int
+		if hasCategory && cs != nil {
+			catID = cs.CategoryID
+			catGroupSort = cs.CategoryGroupSort
+			catSort = cs.CategorySort
 		}
 		var ts int64
 		if lastMsgAt != nil {
@@ -1273,9 +1342,9 @@ func mergeThreadEntries(
 			IsFollowed:        true,
 			FollowSort:        ext.FollowSort,
 			ParentChannelID:   groupNo,
-			CategoryID:        cs.CategoryID,
-			CategorySort:      cs.CategoryGroupSort,
-			intraCategorySort: cs.CategorySort,
+			CategoryID:        catID,
+			CategorySort:      catGroupSort,
+			intraCategorySort: catSort,
 		})
 	}
 	return result

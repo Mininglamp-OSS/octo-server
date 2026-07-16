@@ -138,7 +138,7 @@ func TestSingleMessageHit_RichText(t *testing.T) {
 		Payload:    &Payload{Type: &rt, RichText: &RichTextPayload{SearchText: "标题"}},
 		PayloadRaw: raw,
 	}
-	mh := h.singleMessageHit(doc, "g", nil)
+	mh := h.singleMessageHit(doc, "g", 0, nil)
 	if mh.RichText == nil {
 		t.Fatalf("rich_text must be populated for type=14 + payloadRaw")
 	}
@@ -162,7 +162,7 @@ func TestSingleMessageHit_RichText(t *testing.T) {
 		MessageID: 102,
 		Payload:   &Payload{Type: &rt, RichText: &RichTextPayload{SearchText: "标题"}},
 	}
-	mhNoRaw := h.singleMessageHit(docNoRaw, "g", nil)
+	mhNoRaw := h.singleMessageHit(docNoRaw, "g", 0, nil)
 	if mhNoRaw.RichText != nil {
 		t.Errorf("missing payloadRaw must yield nil rich_text, got %+v", mhNoRaw.RichText)
 	}
@@ -178,7 +178,7 @@ func TestSingleMessageHit_RichText(t *testing.T) {
 		Payload:    &Payload{Type: &tp, Text: &TextPayload{Content: "hi"}},
 		PayloadRaw: raw,
 	}
-	mhText := h.singleMessageHit(docText, "g", nil)
+	mhText := h.singleMessageHit(docText, "g", 0, nil)
 	if mhText.RichText != nil {
 		t.Errorf("non-richtext type must not project rich_text, got %+v", mhText.RichText)
 	}

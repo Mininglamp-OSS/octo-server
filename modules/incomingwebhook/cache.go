@@ -23,9 +23,9 @@ import (
 //     内**：本模块只订阅 GroupDisband，不订阅 GroupUpdate，所以 admin 禁用群后，push 鉴权
 //     的群闸在【所有实例（含执行禁用的那台）】上最多 stale 一个 TTL，而非「本实例即时」。
 //     这是有意为之、经维护者确认接受的取舍（不是「本实例即时、对等 TTL」那一类）：
-//       * 破坏性路径（解散）仍是即时的；admin 禁用是可逆的运营动作，秒级延迟可接受。
-//       * 被禁用的群其 IM 频道同时被 Ban，下游消息投递本就被拦，鉴权闸短暂放行不等于真投递。
-//       * 需要即时生效就把 TTL 调小或设 0。
+//   - 破坏性路径（解散）仍是即时的；admin 禁用是可逆的运营动作，秒级延迟可接受。
+//   - 被禁用的群其 IM 频道同时被 Ban，下游消息投递本就被拦，鉴权闸短暂放行不等于真投递。
+//   - 需要即时生效就把 TTL 调小或设 0。
 //     若日后要求 admin 禁用也即时，最小改动是订阅 event.GroupUpdate 并 invalidate 群条目
 //     （与 handleGroupDisband 对称）。TestPush_GroupAdminDisable_TTLBounded 钉住当前语义。
 //   - **创建者退群 / 管理员降级（memberCache）同属 TTL 兜底**：创建者在群闸与 push

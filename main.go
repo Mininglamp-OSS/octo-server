@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/module"
 	libdb "github.com/Mininglamp-OSS/octo-lib/pkg/db"
@@ -19,12 +21,17 @@ import (
 	libwkhttp "github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-lib/server"
 	_ "github.com/Mininglamp-OSS/octo-server/internal"
+	"github.com/Mininglamp-OSS/octo-server/internal/cardactiondispatch"
+	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
 	commonapi "github.com/Mininglamp-OSS/octo-server/modules/base/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	"github.com/Mininglamp-OSS/octo-server/modules/botidentity"
+	"github.com/Mininglamp-OSS/octo-server/modules/notify"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/accesslog"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/Mininglamp-OSS/octo-server/pkg/avatarrender"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	octodb "github.com/Mininglamp-OSS/octo-server/pkg/db"
 	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
@@ -220,6 +227,17 @@ func runAPI(ctx *config.Context) {
 	// 由 sticker 模块在 New() 时落值——策略源在 system_setting(common 模块),故不在此组合根
 	// 设置,避免反向依赖 modules/sticker。
 	metrics.NewStickerMetrics(prometheus.DefaultRegisterer)
+	// Install the one process registry before register.GetModules constructs
+	// module instances. The foundation rollout deliberately has no production
+	// producer registrations; later enablement injects only a bound Sender into
+	// its owning module after the cross-repository route/contract gates pass.
+	if err := installCardDispatch(ctx); err != nil {
+		panic(fmt.Errorf("install internal card dispatch registry: %w", err))
+	}
+	cardActionRuntime, err := installCardActionDispatch(ctx)
+	if err != nil {
+		panic(fmt.Errorf("install card action callback dispatch: %w", err))
+	}
 	// 构造进程级共享头像渲染缓存,并把观测 hooks 接到上面注册的头像指标。所有头像端点
 	// (user 的 UserAvatar;群组头像渲染合并后亦然——#478)经 avatarrender.GetOrRender
 	// 共用这一个实例:共享 LRU + 同一个渲染信号量(后者唯一,才是真正的进程级渲染并发
@@ -254,7 +272,8 @@ func runAPI(ctx *config.Context) {
 	libdb.SetDBObserver(metrics.ObserveDB)
 	libredis.SetRedisObserver(metrics.ObserveRedisCmd)
 	metrics.RegisterPoolCollectors(prometheus.DefaultRegisterer, ctx.DB().DB, map[string]*rd.Client{
-		"ratelimit": rlRedis,
+		"ratelimit":            rlRedis,
+		"card_action_dispatch": cardActionRuntime.redisClient,
 	})
 	// 在所有指标族注册完成后再起 scrape 端点,避免启动窗口内的 scrape 漏掉
 	// 依赖/连接池指标族(Jerry-Xin #442 review)。
@@ -295,7 +314,12 @@ func runAPI(ctx *config.Context) {
 	// 模块安装
 	err = module.Setup(ctx)
 	if err != nil {
+		cardActionRuntime.Stop()
 		panic(err)
+	}
+	if err := cardActionRuntime.Start(context.Background()); err != nil {
+		cardActionRuntime.Stop()
+		panic(fmt.Errorf("start card action callback dispatcher: %w", err))
 	}
 	//开始定时处理事件
 	cn := cron.New()
@@ -317,6 +341,7 @@ func runAPI(ctx *config.Context) {
 
 	// 运行: 阻塞直到 go-svc 收到 SIGINT/SIGTERM 并完成业务 Stop。
 	err = svc.Run(s)
+	cardActionRuntime.Stop()
 
 	// 业务停下后再 graceful shutdown metrics scrape 端点 — 时序上避开和 go-svc
 	// 的信号处理竞态(go-svc 自己调 signal.Notify, 我们不再额外抢信号)。
@@ -333,6 +358,200 @@ func runAPI(ctx *config.Context) {
 		panic(err)
 	}
 }
+
+func installCardDispatch(ctx *config.Context) error {
+	actionRoutes, err := cardactiondispatch.LoadRouteSpecs(os.Getenv("OCTO_CARD_ACTION_ROUTES"))
+	if err != nil {
+		return err
+	}
+	actionProducers, err := cardActionApprovalProducerSpecs(actionRoutes)
+	if err != nil {
+		return err
+	}
+	deps := carddispatch.Dependencies{
+		IdentityResolver: botidentity.New(ctx),
+		Authorizer:       carddispatch.NewDBAuthorizer(ctx.DB()),
+		Transport:        ctx,
+		Metrics:          carddispatch.NewMetrics(prometheus.DefaultRegisterer),
+		Logger:           log.NewTLog("CardDispatch"),
+	}
+	producerSpecs := append(cardDispatchProducerSpecs(), actionProducers...)
+	registry := carddispatch.NewRegistry(deps, producerSpecs)
+	return carddispatch.Install(ctx, registry)
+}
+
+func cardActionApprovalProducerSpecs(routes []cardactiondispatch.RouteSpec) ([]carddispatch.ProducerSpec, error) {
+	seen := make(map[cardactiondispatch.NotifyCapability]struct{})
+	result := make([]carddispatch.ProducerSpec, 0)
+	for _, route := range routes {
+		if route.NotifyTokenEnv == "" {
+			continue
+		}
+		capability := cardactiondispatch.NotifyCapability{SenderUID: route.SenderUID, Owner: route.Owner}
+		if capability.SenderUID != notify.NotifyBotUIDValue {
+			return nil, errors.New("action notify routes must use the shared notification sender")
+		}
+		if _, ok := seen[capability]; ok {
+			continue
+		}
+		seen[capability] = struct{}{}
+		result = append(result, carddispatch.ProducerSpec{
+			ID: notify.ActionNotifyProducerID(capability.Owner), Enabled: true,
+			SenderUID:           capability.SenderUID,
+			AllowedChannelTypes: []uint8{common.ChannelTypePerson.Uint8()},
+			AllowedProfiles:     []string{cardmsg.ProfileV2},
+			ActionEventOwner:    capability.Owner,
+			SpacePolicy:         carddispatch.SpacePolicySystemNotification,
+			GroupPolicy:         carddispatch.GroupPolicyMemberRequired,
+			MaxInFlight:         20,
+		})
+	}
+	return result, nil
+}
+
+func cardDispatchProducerSpecs() []carddispatch.ProducerSpec {
+	// Every producer here shares the same shape (existing `notification` User
+	// Bot, DM-only, display-only octo/v1, system-notification Space policy,
+	// in-flight 20/process; brief › pilot table, all rows confirmed
+	// 2026-07-13). modules/notify obtains each producer's bound Sender via
+	// carddispatch.SenderFromContext.
+	//
+	// Registrations are inert until modules/notify receives a matching
+	// structured card request (NotifyReq.Card or NotifyReq.DocsCard) AND
+	// OCTO_CARD_MESSAGE_ENABLED is on. End-to-end enablement of a producer
+	// additionally depends on octo-web shipping the matching deep-link route
+	// (/s/:taskId for summary — not yet on main; /d/:docId for docs — already
+	// live) and the caller-side switching from text payloads to structured
+	// fields.
+	base := carddispatch.ProducerSpec{
+		Enabled:             true,
+		SenderUID:           notify.NotifyBotUIDValue,
+		AllowedChannelTypes: []uint8{common.ChannelTypePerson.Uint8()},
+		AllowedProfiles:     []string{cardmsg.ProfileV1},
+		SpacePolicy:         carddispatch.SpacePolicySystemNotification,
+		GroupPolicy:         carddispatch.GroupPolicyMemberRequired, // unused at DM pilot; must be a valid value
+		MaxInFlight:         20,
+	}
+	summarySpec := base
+	summarySpec.ID = summaryNotifyProducerID
+	docsSpec := base
+	docsSpec.ID = docsNotifyProducerID
+	actionOutcomeSpec := base
+	actionOutcomeSpec.ID = actionOutcomeProducerID
+	if notify.DocsApprovalCardsEnabled() {
+		docsSpec.AllowedProfiles = []string{cardmsg.ProfileV1, cardmsg.ProfileV2}
+		docsSpec.ActionEventOwner = "docs"
+	}
+	return []carddispatch.ProducerSpec{summarySpec, docsSpec, actionOutcomeSpec}
+}
+
+type cardActionDispatchRuntime struct {
+	dispatcher  *cardactiondispatch.Dispatcher
+	redisClient *rd.Client
+}
+
+func (r *cardActionDispatchRuntime) Start(ctx context.Context) error {
+	if r == nil || r.dispatcher == nil {
+		return errors.New("card action dispatch runtime unavailable")
+	}
+	return r.dispatcher.Start(ctx)
+}
+
+func (r *cardActionDispatchRuntime) Stop() {
+	if r == nil {
+		return
+	}
+	if r.dispatcher != nil {
+		r.dispatcher.Stop()
+	}
+	if r.redisClient != nil {
+		_ = r.redisClient.Close()
+	}
+}
+
+func installCardActionDispatch(ctx *config.Context) (*cardActionDispatchRuntime, error) {
+	specs, err := cardactiondispatch.LoadRouteSpecs(os.Getenv("OCTO_CARD_ACTION_ROUTES"))
+	if err != nil {
+		return nil, err
+	}
+	if legacy := strings.TrimSpace(os.Getenv("OCTO_CARD_ACTION_ALLOWED_URLS")); legacy != "" {
+		// OCTO_CARD_ACTION_ROUTES[].url is itself the exact allowlist since the
+		// http-actions follow-up. The dual-write env is intentionally ignored to
+		// avoid drift; keep the WARN so rolling upgrades surface the leftover.
+		log.Warn("OCTO_CARD_ACTION_ALLOWED_URLS is deprecated and ignored; remove it from the deployment configuration",
+			zap.String("deprecated_env", "OCTO_CARD_ACTION_ALLOWED_URLS"))
+	}
+	registry, err := cardactiondispatch.NewRegistry(specs, os.Getenv)
+	if err != nil {
+		return nil, err
+	}
+	if err := registry.ValidateNotifyTokenExclusions(os.Getenv("NOTIFY_INTERNAL_TOKEN"), os.Getenv("OCTO_DOCS_NOTIFY_TOKEN")); err != nil {
+		return nil, err
+	}
+	if len(registry.NotifyProducers()) > 0 && !cardmsg.Enabled() {
+		return nil, errors.New("action notify routes require OCTO_CARD_MESSAGE_ENABLED")
+	}
+	if notify.DocsApprovalCardsEnabled() {
+		if !cardmsg.Enabled() {
+			return nil, errors.New("OCTO_DOCS_APPROVAL_CARD_ENABLED requires OCTO_CARD_MESSAGE_ENABLED")
+		}
+		resolution := registry.Resolve(notify.NotifyBotUIDValue, "docs", "access_request.decision")
+		if resolution.Kind != cardactiondispatch.ResolutionCallback {
+			return nil, errors.New("docs approval cards require a notification/docs/access_request.decision callback route")
+		}
+	}
+	redisClient := octoredis.NewInstrumentedClient(ctx.GetConfig(), func(options *rd.Options) {
+		options.MaxRetries = 1
+		options.PoolSize = 10
+	})
+	queue, err := cardactiondispatch.NewRedisQueue(redisClient, cardactiondispatch.QueueConfig{
+		Prefix:       "card_action_dispatch",
+		LiveTTL:      ctx.GetConfig().Robot.MessageExpire,
+		DLQRetention: 30 * 24 * time.Hour,
+	})
+	if err != nil {
+		_ = redisClient.Close()
+		return nil, err
+	}
+	service, err := cardactiondispatch.NewService(registry, queue, ctx)
+	if err != nil {
+		_ = redisClient.Close()
+		return nil, err
+	}
+	if err := cardactiondispatch.Install(ctx, service); err != nil {
+		_ = redisClient.Close()
+		return nil, err
+	}
+	finalizer, err := notify.NewActionFinalizerFromContext(ctx)
+	if err != nil {
+		_ = redisClient.Close()
+		return nil, err
+	}
+	dispatcher, err := cardactiondispatch.NewDispatcher(
+		queue,
+		registry,
+		cardactiondispatch.NewHTTPDeliverer(nil, time.Now),
+		finalizer,
+		cardactiondispatch.DispatcherConfig{
+			Metrics: cardactiondispatch.NewMetrics(prometheus.DefaultRegisterer),
+			Logger:  log.NewTLog("CardActionDispatch"),
+		},
+	)
+	if err != nil {
+		_ = redisClient.Close()
+		return nil, err
+	}
+	return &cardActionDispatchRuntime{dispatcher: dispatcher, redisClient: redisClient}, nil
+}
+
+// {summaryNotify,docsNotify}ProducerID mirror modules/notify's producer IDs.
+// Kept here so the composition root can register the spec without importing an
+// unexported const.
+const (
+	summaryNotifyProducerID = carddispatch.ProducerID("summary-notify")
+	docsNotifyProducerID    = carddispatch.ProducerID("docs-notify")
+	actionOutcomeProducerID = carddispatch.ProducerID("action-outcome")
+)
 
 func printServerInfo(ctx *config.Context) {
 	infoStr := `

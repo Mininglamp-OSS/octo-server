@@ -81,6 +81,16 @@ type IService interface {
 	GetOnlineCount() (int64, error)
 	// 存在黑明单
 	ExistBlacklist(uid string, toUID string) (bool, error)
+	// ExistBlacklistsBoth 批量版 ExistBlacklist（fail-closed 双向拉黑批查）：一次
+	// 查询同时返回「loginUID 拉黑了哪些 peer」以及「哪些 peer 拉黑了 loginUID」。
+	// 输入 peers 会去空/去重（保持首次出现顺序仅内部使用，对返回集合无影响）；
+	// 返回的两个 map 只包含命中的 peer（未命中 = 未拉黑）。
+	//
+	// 语义与逐对 ExistBlacklist(loginUID, peer) + ExistBlacklist(peer, loginUID)
+	// 完全等价，只是把 N 次串行 SQL 折成 1 次 IN 查询——供 messages_search
+	// 全局搜索 buildAllowlist 的 DM 双向拉黑门禁使用，避免每个好友/同 Space
+	// 成员付两次 MySQL round-trip 的秒级延迟（YUJ-27）。
+	ExistBlacklistsBoth(loginUID string, peers []string) (blockedByMe map[string]bool, blockedByPeer map[string]bool, err error)
 	// QueryPeerRobotInfo 返回目标用户是否为 bot 及其创建者 UID。
 	// 实现委托给 PinnedDB（user/db_pinned.go），与置顶频道访问校验共用同一 SQL 真源。
 	// 用于 messages_search 等模块的 p2p 访问门禁区分本人 bot / 他人 bot / 真人。
@@ -1248,6 +1258,11 @@ func (s *Service) GetOnlineCount() (int64, error) {
 
 func (s *Service) ExistBlacklist(uid string, toUID string) (bool, error) {
 	return s.friendDB.existBlacklist(uid, toUID)
+}
+
+// ExistBlacklistsBoth 批量版双向拉黑查询，见 IService 接口文档。
+func (s *Service) ExistBlacklistsBoth(loginUID string, peers []string) (map[string]bool, map[string]bool, error) {
+	return s.friendDB.existBlacklistsBoth(loginUID, peers)
 }
 
 // QueryPeerRobotInfo 委托 PinnedDB，详见 IService 注释。

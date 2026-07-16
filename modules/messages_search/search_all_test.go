@@ -17,7 +17,7 @@ func TestSingleSearchAllHit_File(t *testing.T) {
 		},
 	}
 	h := &Handler{cfg: SearchConfig{}, cache: newSenderCache(8, 0)}
-	got := h.singleSearchAllHit(doc, SearchAllReq{ChannelType: channelTypeGroup, ChannelID: "g"}, nil)
+	got := h.singleSearchAllHit(doc, "g", channelTypeGroup, nil)
 	if got.ResultType != "file" {
 		t.Errorf("result_type: got %q", got.ResultType)
 	}
@@ -46,7 +46,7 @@ func TestSingleSearchAllHit_TextMessage(t *testing.T) {
 	}
 	h := &Handler{cfg: SearchConfig{}, cache: newSenderCache(8, 0)}
 	hl := map[string][]string{"payload.text.content": {"<mark>hello</mark>"}}
-	got := h.singleSearchAllHit(doc, SearchAllReq{ChannelType: channelTypeGroup, ChannelID: "g"}, hl)
+	got := h.singleSearchAllHit(doc, "g", channelTypeGroup, hl)
 	if got.ResultType != "message" {
 		t.Errorf("result_type: got %q", got.ResultType)
 	}
@@ -72,7 +72,7 @@ func TestSingleSearchAllHit_ForwardKeepsMessageType(t *testing.T) {
 		},
 	}
 	h := &Handler{cfg: SearchConfig{}, cache: newSenderCache(8, 0)}
-	got := h.singleSearchAllHit(doc, SearchAllReq{ChannelType: channelTypeGroup, ChannelID: "g"}, nil)
+	got := h.singleSearchAllHit(doc, "g", channelTypeGroup, nil)
 	if got.ResultType != "message" {
 		t.Errorf("forward must be 'message' (file is type=8 only): got %q", got.ResultType)
 	}
@@ -104,7 +104,7 @@ func TestSingleSearchAllHit_RichTextKeepsMessageType(t *testing.T) {
 	h := &Handler{cfg: SearchConfig{}, cache: newSenderCache(8, 0)}
 	// Keyword path: highlight on richText.searchText wins via pickSnippet.
 	hl := map[string][]string{"payload.richText.searchText": {"富文本<mark>搜索</mark>"}}
-	got := h.singleSearchAllHit(doc, SearchAllReq{ChannelType: channelTypeGroup, ChannelID: "g"}, hl)
+	got := h.singleSearchAllHit(doc, "g", channelTypeGroup, hl)
 	if got.ResultType != "message" {
 		t.Errorf("richtext must be 'message': got %q", got.ResultType)
 	}
@@ -118,7 +118,7 @@ func TestSingleSearchAllHit_RichTextKeepsMessageType(t *testing.T) {
 		t.Errorf("richtext keyword snippet: got %q", got.Message.Snippet)
 	}
 	// Empty-keyword browse path: no highlight → fall back to raw richText.
-	got2 := h.singleSearchAllHit(doc, SearchAllReq{ChannelType: channelTypeGroup, ChannelID: "g"}, nil)
+	got2 := h.singleSearchAllHit(doc, "g", channelTypeGroup, nil)
 	if got2.Message.Snippet != "富文本搜索 命中预览" {
 		t.Errorf("richtext browse fallback snippet: got %q", got2.Message.Snippet)
 	}
@@ -156,7 +156,7 @@ func TestSingleSearchAllHit_Image(t *testing.T) {
 		},
 	}
 	h := &Handler{cfg: SearchConfig{}, cache: newSenderCache(8, 0)}
-	got := h.singleSearchAllHit(doc, SearchAllReq{ChannelType: channelTypeGroup, ChannelID: "g"}, nil)
+	got := h.singleSearchAllHit(doc, "g", channelTypeGroup, nil)
 	if got.ResultType != "message" {
 		t.Errorf("result_type: got %q want message", got.ResultType)
 	}
@@ -206,7 +206,7 @@ func TestSingleSearchAllHit_Video(t *testing.T) {
 		},
 	}
 	h := &Handler{cfg: SearchConfig{}, cache: newSenderCache(8, 0)}
-	got := h.singleSearchAllHit(doc, SearchAllReq{ChannelType: channelTypeGroup, ChannelID: "g"}, nil)
+	got := h.singleSearchAllHit(doc, "g", channelTypeGroup, nil)
 	if got.ResultType != "message" {
 		t.Errorf("result_type: got %q want message", got.ResultType)
 	}

@@ -1,26 +1,64 @@
 package notify
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/internal/cardactiondispatch"
+	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/app"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
 )
 
 // InternalTokenHeader is the header key for internal service authentication.
 const InternalTokenHeader = "X-Internal-Token"
+
+const notifyCapabilityContextKey = "octo.notify.capability"
+
+type notifyCapabilityKind string
+
+const (
+	notifyCapabilityLegacy notifyCapabilityKind = "legacy"
+	notifyCapabilityDocs   notifyCapabilityKind = "docs"
+	notifyCapabilityAction notifyCapabilityKind = "action"
+)
+
+type notifyCapability struct {
+	Kind   notifyCapabilityKind
+	Action cardactiondispatch.NotifyCapability
+}
+
+// These carddispatch producers are bound to the shared `notification` User Bot
+// so summary cards, docs cards, generic action outcomes, and legacy text
+// notifications appear in one system DM conversation. Capability isolation
+// lives at the producer level.
+const (
+	summaryNotifyProducerID = "summary-notify"
+	docsNotifyProducerID    = "docs-notify"
+	actionOutcomeProducerID = "action-outcome"
+)
+
+var (
+	errNotifyCardNotAllowed = errors.New("card payload not allowed on internal notify ingress")
+	errNotifyCardInvalid    = errors.New("card notification request is invalid")
+)
 
 // Notify 通知模块
 type Notify struct {
@@ -30,16 +68,29 @@ type Notify struct {
 	db            *dbr.Session
 	memberCache   *memberCache
 	botMu         sync.Mutex
-	botOK         bool
+	botOK         atomic.Bool
+	cardSender    carddispatch.Sender
+	docsSender    carddispatch.Sender
+	actionService *cardactiondispatch.Service
+	actionSenders map[cardactiondispatch.NotifyCapability]carddispatch.Sender
 	internalToken string
+	docsToken     string
 	log.Log
 }
 
 // New 创建 Notify 实例
 func New(ctx *config.Context) *Notify {
 	token := os.Getenv("NOTIFY_INTERNAL_TOKEN")
+	docsToken := os.Getenv("OCTO_DOCS_NOTIFY_TOKEN")
 	if token == "" {
 		log.NewTLog("Notify").Warn("NOTIFY_INTERNAL_TOKEN not set — internal API will reject all requests")
+	}
+	if docsToken == "" {
+		log.NewTLog("Notify").Warn("OCTO_DOCS_NOTIFY_TOKEN not set — docs notification requests will be rejected")
+	}
+	if token != "" && docsToken == token {
+		log.NewTLog("Notify").Error("OCTO_DOCS_NOTIFY_TOKEN must differ from NOTIFY_INTERNAL_TOKEN; docs capability disabled")
+		docsToken = ""
 	}
 
 	n := &Notify{
@@ -49,7 +100,34 @@ func New(ctx *config.Context) *Notify {
 		db:            ctx.DB(),
 		memberCache:   newMemberCache(),
 		internalToken: token,
+		docsToken:     docsToken,
 		Log:           log.NewTLog("Notify"),
+		actionSenders: make(map[cardactiondispatch.NotifyCapability]carddispatch.Sender),
+	}
+
+	// Obtain the producer-bound card Senders from the single registry composed at
+	// bootstrap (main.installCardDispatch, before module construction). A missing
+	// registration is non-fatal: card notifications degrade to the text DM path.
+	if sender, senderErr := carddispatch.SenderFromContext(ctx, summaryNotifyProducerID); senderErr != nil {
+		n.Warn("summary-notify card sender unavailable; card notifications will degrade to text", zap.Error(senderErr))
+	} else {
+		n.cardSender = sender
+	}
+	if sender, senderErr := carddispatch.SenderFromContext(ctx, docsNotifyProducerID); senderErr != nil {
+		n.Warn("docs-notify card sender unavailable; docs card notifications will degrade to text", zap.Error(senderErr))
+	} else {
+		n.docsSender = sender
+	}
+	if actionService, ok := cardactiondispatch.FromContext(ctx); ok {
+		n.actionService = actionService
+		for _, capability := range actionService.NotifyProducers() {
+			sender, senderErr := carddispatch.SenderFromContext(ctx, ActionNotifyProducerID(capability.Owner))
+			if senderErr != nil {
+				n.Error("action-notify card sender unavailable", zap.String("owner", capability.Owner), zap.Error(senderErr))
+				continue
+			}
+			n.actionSenders[capability] = sender
+		}
 	}
 
 	// 注册缓存失效回调（通过 event 包避免循环依赖）
@@ -65,24 +143,35 @@ func New(ctx *config.Context) *Notify {
 	// 监听成员加入事件
 	ctx.AddEventListener(event.SpaceMemberJoin, n.handleSpaceMemberEvent)
 
-	// 启动时创建全局通知 Bot（单例，带 panic recovery）
+	// 启动时创建全局通知 Bot（单例，带 panic recovery）。summary-notify
+	// 卡片复用同一身份，避免在用户会话列表中产生第二个系统 Bot 会话。
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
 				n.Error("ensureNotifyBot panic", zap.Any("recover", r))
 			}
 		}()
-		n.botMu.Lock()
-		if !n.botOK {
-			n.botOK = n.ensureNotifyBot()
-		}
-		n.botMu.Unlock()
-		if n.botOK {
+		n.ensureNotifyBotReady()
+		if n.botOK.Load() {
 			n.Info("Notify bot ready")
 		}
 	}()
 
 	return n
+}
+
+// ensureNotifyBotReady provisions the shared notification bot on demand
+// (idempotent, retriable). Legacy text notifications, summary cards, and their
+// text fallback all use this one DM identity.
+func (n *Notify) ensureNotifyBotReady() {
+	if n.botOK.Load() {
+		return
+	}
+	n.botMu.Lock()
+	if !n.botOK.Load() {
+		n.botOK.Store(n.ensureNotifyBot())
+	}
+	n.botMu.Unlock()
 }
 
 // Route 路由配置
@@ -98,12 +187,22 @@ func (n *Notify) Route(r *wkhttp.WKHttp) {
 // token 未配置时 fail-closed（拒绝所有请求）。
 func (n *Notify) internalAuthMiddleware() wkhttp.HandlerFunc {
 	return func(c *wkhttp.Context) {
-		if n.internalToken == "" {
+		if n.internalToken == "" && n.docsToken == "" && n.actionService == nil {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, map[string]string{"error": "internal API auth not configured"})
 			return
 		}
 		token := c.GetHeader(InternalTokenHeader)
-		if subtle.ConstantTimeCompare([]byte(token), []byte(n.internalToken)) != 1 {
+		switch {
+		case n.internalToken != "" && subtle.ConstantTimeCompare([]byte(token), []byte(n.internalToken)) == 1:
+			c.Set(notifyCapabilityContextKey, notifyCapability{Kind: notifyCapabilityLegacy})
+		case n.docsToken != "" && subtle.ConstantTimeCompare([]byte(token), []byte(n.docsToken)) == 1:
+			c.Set(notifyCapabilityContextKey, notifyCapability{Kind: notifyCapabilityDocs})
+		default:
+			if action, ok := n.actionService.ResolveNotifyToken(token); ok {
+				c.Set(notifyCapabilityContextKey, notifyCapability{Kind: notifyCapabilityAction, Action: action})
+				c.Next()
+				return
+			}
 			c.AbortWithStatusJSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}
@@ -132,14 +231,70 @@ func (n *Notify) sendNotify(c *wkhttp.Context) {
 		c.ResponseErrorWithStatus(errors.New("参数格式错误"), http.StatusBadRequest)
 		return
 	}
+	// Payload dropped its binding:"required" so card requests (Payload absent,
+	// Card / DocsCard present) bind cleanly. Payload / Card / DocsCard are
+	// mutually exclusive (contract). Presence uses != nil for Payload (an
+	// explicit `{}` counts as "caller intended to send a payload" and must not
+	// silently combine with Card / DocsCard); the legacy "payload不能为空" 400
+	// still fires when nothing meaningful is provided.
+	present := 0
+	if req.Payload != nil {
+		present++
+	}
+	if req.Card != nil {
+		present++
+	}
+	if req.DocsCard != nil {
+		present++
+	}
+	if req.ApprovalCard != nil {
+		present++
+	}
+	switch {
+	case present > 1:
+		httperr.ResponseErrorL(c, errcode.ErrNotifyCardInvalid, nil, nil)
+		return
+	case req.Card == nil && req.DocsCard == nil && req.ApprovalCard == nil && len(req.Payload) == 0:
+		c.ResponseErrorWithStatus(errors.New("payload不能为空"), http.StatusBadRequest)
+		return
+	}
+	capability, _ := c.Get(notifyCapabilityContextKey)
+	typedCapability, _ := capability.(notifyCapability)
+	if !n.notifyCapabilityAllows(typedCapability, &req) {
+		httperr.ResponseErrorL(c, errcode.ErrNotifyCardNotAllowed, nil, nil)
+		return
+	}
 
-	resp, err := n.deliverNotification(&req)
+	resp, err := n.dispatchNotify(&req, typedCapability)
 	if err != nil {
+		if errors.Is(err, errNotifyCardNotAllowed) {
+			httperr.ResponseErrorL(c, errcode.ErrNotifyCardNotAllowed, nil, nil)
+			return
+		}
+		if errors.Is(err, errNotifyCardInvalid) {
+			httperr.ResponseErrorL(c, errcode.ErrNotifyCardInvalid, nil, nil)
+			return
+		}
 		n.Error("投递通知失败", zap.Error(err), zap.String("space_id", req.SpaceID))
 		c.ResponseErrorWithStatus(errors.New("internal error"), http.StatusInternalServerError)
 		return
 	}
 	c.Response(resp)
+}
+
+// dispatchNotify routes a single request to the correct producer path (when a
+// structured Card / DocsCard is present) or the legacy text path.
+func (n *Notify) dispatchNotify(req *NotifyReq, capability notifyCapability) (*NotifyResp, error) {
+	if req != nil && req.Card != nil {
+		return n.deliverCardNotification(req)
+	}
+	if req != nil && req.DocsCard != nil {
+		return n.deliverDocsCardNotification(req)
+	}
+	if req != nil && req.ApprovalCard != nil {
+		return n.deliverApprovalCardNotification(req, capability.Action)
+	}
+	return n.deliverNotification(req)
 }
 
 // sendNotifyBatch handles POST /v1/internal/notify/batch
@@ -156,6 +311,26 @@ func (n *Notify) sendNotifyBatch(c *wkhttp.Context) {
 	if len(req.Notifications) > 50 {
 		c.ResponseErrorWithStatus(errors.New("批量上限50条"), http.StatusBadRequest)
 		return
+	}
+	capabilityValue, _ := c.Get(notifyCapabilityContextKey)
+	capability, _ := capabilityValue.(notifyCapability)
+	if capability.Kind == notifyCapabilityDocs || capability.Kind == notifyCapabilityAction {
+		httperr.ResponseErrorL(c, errcode.ErrNotifyCardNotAllowed, nil, nil)
+		return
+	}
+	// Preflight the whole batch before delivering any earlier text item. This
+	// preserves the zero-transport guarantee when a later entry is a card.
+	// Card / DocsCard notifications are single-endpoint only (they fan out through
+	// the carddispatch producer), so any card entry in a batch is rejected outright.
+	for i := range req.Notifications {
+		if req.Notifications[i].Card != nil || req.Notifications[i].DocsCard != nil || req.Notifications[i].ApprovalCard != nil {
+			httperr.ResponseErrorL(c, errcode.ErrNotifyCardInvalid, nil, nil)
+			return
+		}
+		if cardmsg.IsCardPayload(req.Notifications[i].Payload) {
+			httperr.ResponseErrorL(c, errcode.ErrNotifyCardNotAllowed, nil, nil)
+			return
+		}
 	}
 
 	hasErrors := false
@@ -182,8 +357,38 @@ func (n *Notify) sendNotifyBatch(c *wkhttp.Context) {
 	}
 }
 
+func (n *Notify) notifyCapabilityAllows(capability notifyCapability, req *NotifyReq) bool {
+	if n == nil || req == nil {
+		return false
+	}
+	switch capability.Kind {
+	case notifyCapabilityLegacy:
+		return req.DocsCard == nil && req.ApprovalCard == nil
+	case notifyCapabilityDocs:
+		return req.DocsCard != nil && req.Card == nil && req.ApprovalCard == nil && req.Payload == nil
+	case notifyCapabilityAction:
+		return req.ApprovalCard != nil && req.Card == nil && req.DocsCard == nil && req.Payload == nil &&
+			n.actionService != nil && n.actionService.CanNotify(capability.Action, req.ApprovalCard.ActionType)
+	default:
+		return false
+	}
+}
+
+// ActionNotifyProducerID maps one route-bound owner to a stable internal
+// producer without putting unbounded owner text into registry identifiers.
+func ActionNotifyProducerID(owner string) carddispatch.ProducerID {
+	digest := sha256.Sum256([]byte(owner))
+	return carddispatch.ProducerID("action-notify-" + hex.EncodeToString(digest[:8]))
+}
+
 // deliverNotification 校验、过滤、投递
 func (n *Notify) deliverNotification(req *NotifyReq) (*NotifyResp, error) {
+	if req != nil && cardmsg.IsCardPayload(req.Payload) {
+		return nil, errNotifyCardNotAllowed
+	}
+	if req == nil {
+		return nil, errors.New("request不能为空")
+	}
 	if req.SpaceID == "" {
 		return nil, errors.New("space_id不能为空")
 	}
@@ -223,14 +428,8 @@ func (n *Notify) deliverNotification(req *NotifyReq) (*NotifyResp, error) {
 	}
 
 	// 确保 Bot 存在（失败可重试，不用 sync.Once）
-	if !n.botOK {
-		n.botMu.Lock()
-		if !n.botOK {
-			n.botOK = n.ensureNotifyBot()
-		}
-		n.botMu.Unlock()
-	}
-	if !n.botOK {
+	n.ensureNotifyBotReady()
+	if !n.botOK.Load() {
 		return nil, errors.New("notify bot unavailable")
 	}
 

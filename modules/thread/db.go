@@ -199,6 +199,10 @@ type ThreadLite struct {
 	ShortID       string     `db:"short_id"`
 	Status        int        `db:"status"`
 	LastMessageAt *time.Time `db:"last_message_at"`
+	// CreatorUID 让 sidebar 读侧能精确识别「这是创建者本人的子区」，从而对创建者
+	// 自建子区放宽父群未关注/未分类前置（issue #557）。creator_uid 是 thread 表既有列，
+	// 复用现有 QueryActiveByGroupShortIDs 调用带回，无新增查询。
+	CreatorUID string `db:"creator_uid"`
 }
 
 // QueryActiveByGroupShortIDs 按 (group_no, short_id) 批量查询子区。
@@ -227,7 +231,7 @@ func (d *DB) QueryActiveByGroupShortIDs(refs []ShortRef) (map[string]*ThreadLite
 
 	var rows []*ThreadLite
 	_, err := d.session.SelectBySql(
-		"SELECT group_no, short_id, status, last_message_at FROM thread"+
+		"SELECT group_no, short_id, status, last_message_at, creator_uid FROM thread"+
 			" WHERE (group_no, short_id) IN ("+strings.Join(placeholders, ", ")+")"+
 			" AND status != ?",
 		args...,
@@ -255,6 +259,120 @@ func (d *DB) QueryNonDeletedShortIDs(shortIDs []string) ([]string, error) {
 		return nil, err
 	}
 	return result, nil
+}
+
+// GroupShortIDRow 是 QueryNonDeletedShortIDsByGroupNos 内部的两列投影，只暴露
+// 包内使用。
+type GroupShortIDRow struct {
+	GroupNo string `db:"group_no"`
+	ShortID string `db:"short_id"`
+}
+
+// NonDeletedByGroupNosPerGroupHardLimit 是 QueryNonDeletedShortIDsByGroupNos
+// 在 DB 层的**每群**行数硬上限。它必须 >= caller 的语义 cap
+// (messages_search.maxThreadsPerGroup=200) + 1，让 caller 侧的
+// "len(shortIDs) > maxThreadsPerGroup" 分支仍能感知到超 cap 的群并降级 +
+// WARN（RC 2/3 on PR #553）。
+//
+// 选值 201 = maxThreadsPerGroup(200) + 1：每群只多拉 1 行做观测信号，绝
+// 大多数群完整返回，只有超 cap 的群会被截到 201 行触发 caller 降级。
+const NonDeletedByGroupNosPerGroupHardLimit = 201
+
+// nonDeletedByGroupNosUnionBatchSize 控制 QueryNonDeletedShortIDsByGroupNos
+// 一次 UNION ALL 合并的群数。单次查询 SQL 长度 ≈ batchSize × (~120
+// chars/subquery)；40 个群 ≈ 5KB SQL，远低于 MySQL max_allowed_packet
+// 默认值，又保证一个普通用户（基本不超 40 个群）只发一次 roundtrip。
+const nonDeletedByGroupNosUnionBatchSize = 40
+
+// NonDeletedByGroupNosDBHardLimit was the pre-RC3 global row cap on the
+// old single-query implementation (2500 rows aggregated across all groups
+// via `ORDER BY group_no LIMIT 2500`). It caused the P1 starvation blocker
+// yujiawei called on RC 3 of PR #553: a single fat group with ≥ 2500 rows
+// consumed the entire budget, and every other group returned zero rows
+// from the DB — zeroing thread coverage for the whole request.
+//
+// The implementation is now per-group (see the UNION ALL path above), so
+// this global cap is obsolete. Retained only to keep a stable Go symbol
+// path for any downstream references while the fix stabilises; the value
+// is not consumed by any code path any longer and should be deleted in a
+// follow-up.
+//
+// Deprecated: superseded by NonDeletedByGroupNosPerGroupHardLimit. Do not
+// consume; there is no code path that reads it.
+const NonDeletedByGroupNosDBHardLimit = 2500
+
+// QueryNonDeletedShortIDsByGroupNos 批量拉取一组 group 下 **status != deleted** 的
+// 子区 short_id（即 active + archived 都纳入，deleted 排除），返回 map[groupNo][]shortID。
+//
+// **语义理由（RC on PR #553）**：子区可见性契约在全局一致——只拒 deleted、允许访问
+// archived：
+//   - modules/messages/api_message_get.go:136-139（消息读）仅拒 ThreadStatusDeleted；
+//   - modules/messages_search/authz.go checkThreadAccess → modules/thread/service.go
+//     GetThread（service.go:102）：仅拒 deleted、返回 archived。
+//
+// 之前全局搜索用 status=active 变体，会把 archived 子区错误排除——归档子区
+// **单频道搜索能命中、全局搜不到**，破坏一致性。因为 archived 是 ArchiveStaleBatch
+// cron 例行转的（占比不小），影响面很大。
+//
+// **每群 LIMIT via UNION ALL (RC 3 on PR #553)**：使用 `SELECT ... WHERE
+// group_no = ? ... ORDER BY short_id LIMIT PerGroupHardLimit` 的 UNION ALL
+// 合并（按 nonDeletedByGroupNosUnionBatchSize 分批），严格约束**每个 group
+// 最多返回 NonDeletedByGroupNosPerGroupHardLimit (=201) 行**。上一版用
+// 「全局 LIMIT 2500 + ORDER BY group_no, short_id」会让 group_no 排在前面
+// 的大群把整个 budget 吃光，导致排在后面的正常群一行都拿不到——即使
+// caller 侧对大群做了 `continue` 降级，正常群也因为 `byGroup[gn]` 为空
+// 被静默跳过，全请求的 thread 覆盖归零。切成 per-group LIMIT 后：
+//   - 大群精准降级到 group-only（返回 201 行 → caller 感知超 cap → WARN
+//   - 跳过该群 thread），
+//   - 其他正常群完整返回，thread 覆盖照常上线，
+//   - 不再存在 group 之间「谁排前面谁吃掉预算」的相互饿死。
+//
+// UNION ALL (非 DISTINCT UNION) 避免不必要的去重；子查询需用括号包裹
+// 以避免 ORDER BY / LIMIT 被外层吃掉。兼容性上：MySQL 5.7 / 8.0 /
+// MariaDB 均支持（避开 window function 的 8.0-only 依赖）。
+//
+// 排序：子查询 ORDER BY short_id 保证每群返回的 shortID 集合确定，同
+// 一输入总是拿到同一 201 行子集。外层无 ORDER BY（返回 map 自然无序，
+// caller 自己重新按 groupNos 迭代）。
+//
+// 索引：uk_group_short(group_no, short_id) 对 (group_no=?, ORDER BY short_id)
+// 是覆盖索引，若硬件/优化器给力可完全跑 range scan + limit push-down；
+// (group_no, status) 过滤则无现成复合索引，若该路径变热应用 EXPLAIN
+// 复核并考虑 (group_no, status, short_id) 复合索引。每子查询工作集被
+// 201 行截住，全局工作集被 len(groupNos)*201 截住。
+//
+// 保护限制：空入参直接返回空 map，不下发 SQL；内部只取 (group_no, short_id) 两列。
+func (d *DB) QueryNonDeletedShortIDsByGroupNos(groupNos []string) (map[string][]string, error) {
+	out := make(map[string][]string)
+	if len(groupNos) == 0 {
+		return out, nil
+	}
+	for start := 0; start < len(groupNos); start += nonDeletedByGroupNosUnionBatchSize {
+		end := start + nonDeletedByGroupNosUnionBatchSize
+		if end > len(groupNos) {
+			end = len(groupNos)
+		}
+		batch := groupNos[start:end]
+		subqueries := make([]string, len(batch))
+		args := make([]interface{}, 0, len(batch)*3)
+		for i, gn := range batch {
+			subqueries[i] = "(SELECT group_no, short_id FROM thread WHERE group_no = ? AND status != ? ORDER BY short_id LIMIT ?)"
+			args = append(args, gn, ThreadStatusDeleted, NonDeletedByGroupNosPerGroupHardLimit)
+		}
+		query := strings.Join(subqueries, " UNION ALL ")
+		var rows []GroupShortIDRow
+		_, err := d.session.SelectBySql(query, args...).Load(&rows)
+		if err != nil {
+			return nil, fmt.Errorf("query non-deleted short ids by group nos: %w", err)
+		}
+		for _, r := range rows {
+			if r.GroupNo == "" || r.ShortID == "" {
+				continue
+			}
+			out[r.GroupNo] = append(out[r.GroupNo], r.ShortID)
+		}
+	}
+	return out, nil
 }
 
 // QueryActiveShortIDs 批量查询 status=active 的子区 shortID。
@@ -299,22 +417,46 @@ func (d *DB) QuerySourceMessageIDsByShortIDs(shortIDs []string) (map[string]*int
 //   - ORDER BY last_message_at, id：保证 MySQL 复制（statement-based / mixed）确定性，
 //     且和 idx_status_last_msg_id 三列索引同序，避免 filesort。
 //   - last_message_at IS NULL 的子区（从未发过消息）一律保留，避免误归档新建空子区。
+//   - NOT EXISTS(未处理 per-uid @提及)：只要子区里有人被 @ 且尚未处理，就**不归档**
+//     （产品三级优先级 P1，最高：GH #566）。在归档谓词里直接排除，而不是先归档再纠偏——
+//     后者会让同一行每个 tick 在 active↔archived 间反复翻转（两次 GenSeq + 两次 UPDATE +
+//     sync 诈尸），用户可见状态却不变。谓词耦合让稳态下这类行**一次都不被写**。
 //
+// 关于 NOT EXISTS 的成本与正确性：
+//   - 相关子查询按 (channel_id, channel_type, is_deleted) 关联 reminders，配合迁移新增的
+//     idx_channel_type_rtype_deleted 走点查，而非全表扫；且它只作用于「陈旧 active」这一小集合
+//     （由 idx_status_last_msg_id 的 range scan 界定），不是全体 thread。
+//   - reminders 行 uid<>” 排除 @所有人 广播行（否则几乎每个子区都被钉住、归档形同虚设）。
+//   - reminder_type=ReminderTypeMentionMe 显式限定「@我」类提醒，不依赖 channel_type 的巧合，
+//     避免未来任何落在 CommunityTopic 且永无 reminder_done 的 per-uid 提醒把子区永久钉住。
+//   - reminder_done 无 (reminder_id, uid) 对应行 ⇒ 该被 @ 的人尚未处理自己的提及。
+//   - 跨表 collation：reminders/reminder_done 已由迁移 20260711000001 归一到 utf8mb4_general_ci
+//     （与 thread.* 对齐），故此处无需任何 COLLATE pin——也不能加：pin 会让以 channel_id
+//     打头的 idx_channel_type_rtype_deleted 失效、退回全表扫（索引按列原 collation 排序）。
+//
+// channelType 应传 common.ChannelTypeCommunityTopic.Uint8()（thread 子区消息的频道类型）。
 // 整批共享同一个 version（来自 caller 的 GenSeq）：sync API 按 version 单调递增拉取，
 // 一批同 version 不影响 cursor 推进。
-func (d *DB) ArchiveStaleBatch(threshold time.Time, batchSize int, version int64) (int64, error) {
+func (d *DB) ArchiveStaleBatch(threshold time.Time, batchSize int, version int64, channelType uint8) (int64, error) {
 	if batchSize <= 0 {
 		return 0, nil
 	}
 	result, err := d.session.UpdateBySql(
-		"UPDATE thread SET status=?, version=?, updated_at=? "+
-			"WHERE status=? AND last_message_at IS NOT NULL AND last_message_at < ? "+
-			"AND version < ? "+
-			"ORDER BY last_message_at, id "+
+		"UPDATE thread t SET t.status=?, t.version=?, t.updated_at=? "+
+			"WHERE t.status=? AND t.last_message_at IS NOT NULL AND t.last_message_at < ? "+
+			"AND t.version < ? "+
+			"AND NOT EXISTS ("+
+			"SELECT 1 FROM reminders r "+
+			"LEFT JOIN reminder_done rd ON rd.reminder_id=r.id AND rd.uid=r.uid "+
+			"WHERE r.channel_id = CONCAT(t.group_no, ?, t.short_id) "+
+			"AND r.channel_type=? AND r.reminder_type=? AND r.uid<>'' AND r.is_deleted=0 AND rd.id IS NULL"+
+			") "+
+			"ORDER BY t.last_message_at, t.id "+
 			"LIMIT ?",
 		ThreadStatusArchived, version, time.Now(),
 		ThreadStatusActive, threshold,
 		version,
+		ChannelIDSeparator, channelType, ReminderTypeMentionMe,
 		batchSize,
 	).Exec()
 	if err != nil {

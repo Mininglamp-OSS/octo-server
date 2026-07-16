@@ -16,9 +16,14 @@ import (
 //
 // preview_url is always nil this release: business payload doesn't supply a
 // preview link and indexer doesn't carry one in the document. A doc v4.2 §2.3
-// permits the field to be null when previewing isn't available. channel_id is
-// not on the spec table (the request channel is implicit) so we don't return
-// it.
+// permits the field to be null when previewing isn't available.
+//
+// channel_id / channel_type are omitempty because single-channel callers
+// (_search_files) historically didn't return them (the request channel is
+// implicit). Global callers (_search_global_files, _search_global_messages
+// via SearchAllHit.file) MUST populate both so the frontend has a route to
+// jump into the source room; for DM the channel_id is the peer uid, not the
+// OS fakeChannelID (see peerFromFakeChannelID in channel.go).
 type FileHit struct {
 	MessageID       string  `json:"message_id"`
 	MessageSeq      int64   `json:"message_seq"`
@@ -31,6 +36,8 @@ type FileHit struct {
 	SenderName      string  `json:"sender_name,omitempty"`
 	SenderAvatarURL string  `json:"sender_avatar_url,omitempty"`
 	SentAt          string  `json:"sent_at"`
+	ChannelID       string  `json:"channel_id,omitempty"`
+	ChannelType     uint8   `json:"channel_type,omitempty"`
 }
 
 func init() {
@@ -98,7 +105,8 @@ func (h *Handler) searchFiles(c *wkhttp.Context) {
 			Routing(normID).
 			Query(dsl).
 			Size(size).
-			TrackTotalHits(false)
+			TrackTotalHits(false).
+			FetchSourceContext(fileContentSourceExcludes())
 		svc = applySort(svc, req.Sort)
 		if len(searchAfter) > 0 {
 			svc = svc.SearchAfter(searchAfter...)
@@ -114,7 +122,7 @@ func (h *Handler) searchFiles(c *wkhttp.Context) {
 	}
 
 	filtered, hasMore, nextCursor, err := h.paginateWithFilterDepth(
-		ctx, loginUID, req.ChannelID, pageSize, priorDepth, initialAfter, isRelevance, osQuery, projectDocRef(req.ChannelID),
+		ctx, loginUID, req.ChannelID, pageSize, priorDepth, initialAfter, isRelevance, osQuery, projectDocRef(req.ChannelID, loginUID),
 	)
 	if err != nil {
 		if responder := classifyOSError(err); responder != nil {
@@ -144,6 +152,10 @@ func buildSearchFilesDSL(ctx context.Context, analyzer tokenAnalyzer, stopwordSt
 		clause, err := buildKeywordClauseGated(ctx, analyzer, stopwordStripEnabled, req.Keyword,
 			"payload.file.name^2",
 			"payload.file.caption",
+			// content: full extracted file body from Tika (indexer v1.12).
+			// Default weight ^1 lets name/caption matches still outrank a
+			// pure-body hit. See docs/messages-search/v1.12-file-content-mapping-integration.md.
+			"payload.file.content",
 		)
 		b.Must(clause)
 		analyzeErr = err
@@ -163,7 +175,7 @@ func (h *Handler) buildFileHits(ctx context.Context, hits []*elastic.SearchHit, 
 			h.Warn("messages_search: bad file _source skipped", zap.Error(err))
 			continue
 		}
-		items = append(items, h.singleFileHit(doc))
+		items = append(items, h.singleFileHit(doc, req.ChannelID, req.ChannelType))
 		senderIDs = append(senderIDs, doc.From)
 	}
 
@@ -180,14 +192,22 @@ func (h *Handler) buildFileHits(ctx context.Context, hits []*elastic.SearchHit, 
 
 // singleFileHit projects a single Doc into a FileHit. Extracted so unit tests
 // can assert ext fallback / preview_url null without going through ES.
-func (h *Handler) singleFileHit(doc Doc) FileHit {
+//
+// channelID / channelType are echoed on the wire (both omitempty). Global
+// callers must pass doc-derived values — for DM (channelType=1) the peer uid
+// via peerFromFakeChannelID; for group/thread the doc.ChannelID as-is.
+// Single-channel callers pass req.ChannelID / req.ChannelType so the response
+// mirrors the request.
+func (h *Handler) singleFileHit(doc Doc, channelID string, channelType uint8) FileHit {
 	fp := filePayloadOf(doc.Payload)
 	fh := FileHit{
-		MessageID:  strconv.FormatInt(doc.MessageID, 10),
-		MessageSeq: int64(doc.MessageSeq),
-		SenderID:   doc.From,
-		SentAt:     msToRFC3339(doc.Timestamp),
-		PreviewURL: nil,
+		MessageID:   strconv.FormatInt(doc.MessageID, 10),
+		MessageSeq:  int64(doc.MessageSeq),
+		SenderID:    doc.From,
+		SentAt:      msToRFC3339(doc.Timestamp),
+		PreviewURL:  nil,
+		ChannelID:   channelID,
+		ChannelType: channelType,
 	}
 	if fp != nil {
 		fh.FileName = fp.Name

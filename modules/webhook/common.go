@@ -9,7 +9,9 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
+	"github.com/Mininglamp-OSS/octo-server/modules/cardtrust"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/pushcache"
 	"github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
@@ -187,6 +189,12 @@ func getMessageAlert(msg msgOfflineNotify, toUser *user.Resp, ctx *config.Contex
 		alert = "[emoji表情]"
 	case common.MultipleForward:
 		alert = "[聊天记录]"
+	case cardmsg.InteractiveCard:
+		// card-message-protocol P1 Decision 8 + Decision 2 residual-risk（round-3
+		// P1-2）：推送正文经 DisplayTextFor 单一执法点 —— sender 是 bot/webhook
+		// 身份才信任 server 权威 plain；直连长连接发出的伪造卡片（Finalize 从未
+		// 跑过，plain 攻击者可控）一律 [卡片] 占位。
+		alert = cardmsg.DisplayTextFor(cardSenderTrusted(ctx, msg.FromUID), msg.Payload)
 	case common.RichText:
 		// 图文混排 RichText(=14)：推送正文取 server 已生成的权威 plain（含 [图片]
 		// 占位）。GetRichTextDisplayText 优先用 payload.plain，缺失时现场遍历
@@ -448,4 +456,19 @@ func formatGroupPushBody(ctx *config.Context, groupNo, fromUID, fromName, conten
 		return fmt.Sprintf("%s：%s", fromName, content)
 	}
 	return fmt.Sprintf("%s @%s：%s", fromName, suffix, content)
+}
+
+// cardTrust 是 type-17 sender 身份判定的进程级单例（Decision 2 residual-risk
+// 的单一实现，modules/cardtrust）。getMessageAlert 经 GetPayload 在离线推送
+// 扇出里【按接收者】被调用；单例 + LRU 让一条卡片消息推给大群时只查一次
+// robot 表，其余接收者命中缓存（此前是每接收者一次 SELECT）。首次调用惰性
+// 用该次 ctx 构造 —— push 路径无 Webhook 接收者可挂，与既有 name-cache 同模式。
+var (
+	cardTrustOnce sync.Once
+	cardTrust     *cardtrust.Resolver
+)
+
+func cardSenderTrusted(ctx *config.Context, fromUID string) bool {
+	cardTrustOnce.Do(func() { cardTrust = cardtrust.New(ctx) })
+	return cardTrust.Trusted(fromUID)
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -13,11 +14,15 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardrevision"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
 	"github.com/Mininglamp-OSS/octo-server/pkg/richtext"
+	"github.com/go-sql-driver/mysql"
 	"github.com/gocraft/dbr/v2"
 	"go.uber.org/zap"
 )
@@ -38,7 +43,9 @@ type BotSendMessageReq struct {
 }
 
 // sendMessage handles POST /v1/bot/sendMessage.
+
 func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, cardmsg.MaxSendBodyBytes)
 	var req BotSendMessageReq
 	if err := c.BindJSON(&req); err != nil {
 		respondBotAPIRequestInvalid(c, "")
@@ -80,6 +87,28 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 	if payloadHasReservedOBOKey(req.Payload) {
 		httperr.ResponseErrorL(c, errcode.ErrBotAPIOBOReservedField, nil, nil)
 		return
+	}
+
+	// card-message-protocol P1：InteractiveCard(=17) 入站 gate。排序在
+	// checkSendPermission / checkOBO 之前：(a) Decision 2b 要求 OBO 卡片按
+	// 「请求意图」拦截、先于 grant 校验，且覆盖 grantorReplyBypass 子路径
+	// （该子路径 fromUID 仍是 bot —— 拒绝是刻意的过度拒绝，P2 复议）；
+	// (b) 脏卡片 fail-fast，鉴权路径不跑在毒输入上（与上方 OBO 保留键同序）。
+	if cardmsg.IsCardPayload(req.Payload) {
+		if !cardmsg.Enabled() {
+			// Decision 2 rollout gate：客户端渲染门禁发布前默认关闭。
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardDisabled, nil, nil)
+			return
+		}
+		if strings.TrimSpace(req.OnBehalfOf) != "" {
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardOBOForbidden, nil, nil)
+			return
+		}
+		if err := cardmsg.Validate(req.Payload); err != nil {
+			ba.Warn("InteractiveCard payload 校验失败", zap.Error(err), zap.String("channelID", req.ChannelID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return
+		}
 	}
 
 	robotID := getRobotIDFromContext(c)
@@ -204,6 +233,17 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 	// Helper is idempotent and safe on nil — see pkg/mentionrewrite.
 	payload = mentionrewrite.RewriteMention(payload)
 
+	// card-message-protocol P1 Decision 8：server 权威 plain 收尾。排在信封级
+	// enrich（space_id 注入 / mention 顶层键改写）之后，使 512KiB 复检覆盖真实
+	// 出站 payload（与 richtext 的 PR#232 口径一致）。Decision 9 保证 enrich 只
+	// 触碰信封顶层键、card 树永不被改写；下方 OBO 标记 enrich 对卡片不可达
+	// （OBO 卡片已在入站 gate 拒绝）。非 type=17 为 no-op。
+	if err := cardmsg.Finalize(payload); err != nil {
+		ba.Error("InteractiveCard finalize 失败", zap.Error(err), zap.String("channelID", channelID))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+		return
+	}
+
 	// YUJ-1166 fan-out loop guard #3: mark this message so the fan-out
 	// listener (see obo_fanout.go) skips it on the way back through the
 	// listener pipeline. Marker key lives in the reserved `__obo_*`
@@ -241,6 +281,17 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 	// for the clone contract.
 	wirePayload := mentionrewrite.CloneForExpansion(payload)
 	wirePayload = mentionrewrite.ExpandAisToBotUIDs(wirePayload, req.ChannelType, channelID, ba.fetchBotMemberUIDs)
+
+	// card-message-protocol P1 Decision 3a：ExpandAisToBotUIDs 是 Finalize 之后
+	// 唯一会增大 payload 的 mutation（追加频道 bot 成员 UID 到 mention 子表）。
+	// Finalize 的 512KiB 复检发生在展开之前，覆盖不到真实出站字节，故对最终
+	// wirePayload 再复检一次（PR#543 review：与 richtext PR#232「最后一次 mutation
+	// 后复检」不变量对齐）。非 type=17 为 no-op。
+	if err := cardmsg.RecheckPayloadSize(wirePayload); err != nil {
+		ba.Error("InteractiveCard 出站 payload 超限", zap.Error(err), zap.String("channelID", channelID))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+		return
+	}
 
 	msgReq := &config.MsgSendReq{
 		Header: config.MsgHeader{
@@ -645,6 +696,7 @@ func (ba *BotAPI) readReceipt(c *wkhttp.Context) {
 
 // botMessageEdit handles POST /v1/bot/message/edit.
 func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, cardmsg.MaxSendBodyBytes)
 	var req struct {
 		MessageID   string `json:"message_id"`
 		MessageSeq  uint32 `json:"message_seq"`
@@ -706,6 +758,7 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 
 	// Permission: bot can only edit its own messages
 	var msgFromUID string
+	var msgPayload []byte // 原消息 payload（Decision 7 需要判定目标消息是否卡片）
 	if req.MessageSeq > 0 {
 		resp, err := ba.ctx.IMGetWithChannelAndSeqs(req.ChannelID, req.ChannelType, robotID, []uint32{req.MessageSeq})
 		if err != nil {
@@ -718,13 +771,23 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 			return
 		}
 		if req.MessageID != strconv.FormatInt(resp.Messages[0].MessageID, 10) {
-			ba.Warn("message_id与message_seq不匹配，保持旧行为继续执行",
+			// P0（PR#548 review）：硬拒绝 message_id/message_seq 不匹配 —— 与用户编辑
+			// 路径 ErrMessageIDSeqMismatch 对称。所有权只在 (channel, seq) 上校验,而
+			// message_extra 写入按调用方另给的 message_id 落行（UNIQUE(message_id) 单
+			// 表,ON DUPLICATE KEY UPDATE 命中任意归属行）。warn-only 会形成 confused-
+			// deputy:攻击 bot 用自己拥有的 seq + 受害 message_id 覆盖他人卡片的
+			// content_edit,进而伪造该卡被点击时下发给受害 bot 的动作面。规范推荐 bot
+			// 省略 message_seq 由服务端解析（走下方 seq==0 安全分支）,合法调用方不受影响。
+			ba.Warn("message_id与message_seq不匹配,拒绝",
 				zap.String("req_message_id", req.MessageID),
 				zap.Int64("actual_message_id", resp.Messages[0].MessageID),
 				zap.Uint32("message_seq", req.MessageSeq),
 			)
+			respondBotAPIRequestInvalid(c, "message_id")
+			return
 		}
 		msgFromUID = resp.Messages[0].FromUID
+		msgPayload = resp.Messages[0].Payload
 	} else {
 		msgIDInt, parseErr := strconv.ParseInt(req.MessageID, 10, 64)
 		if parseErr != nil {
@@ -752,6 +815,7 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 			return
 		}
 		msgFromUID = syncResp.Messages[0].FromUID
+		msgPayload = syncResp.Messages[0].Payload
 		req.MessageSeq = syncResp.Messages[0].MessageSeq
 	}
 	if msgFromUID != robotID {
@@ -778,21 +842,76 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 		}
 	}
 
-	// 图文混排 RichText(=14)：编辑写入口对 content_edit 做与 send 路径对称的
-	// write-strict 校验 + 权威 plain 重算（契约 §2，plain 服务端重算不信客户端）。
-	// 编辑语义为整体替换 content blocks；非 14 / 非 JSON 体为 no-op。脏/超限 payload
-	// 落库前以错误拒绝。MD5 去重 hash 落在 normalize 后的 canonical 体上。
-	normalizedEdit, err := richtext.NormalizeContentEdit(req.ContentEdit)
-	if err != nil {
-		ba.Warn("RichText content_edit 校验失败", zap.Error(err), zap.String("messageID", req.MessageID))
+	// content_edit 收敛：编辑语义为整体替换正文，plain 服务端重算不信客户端。
+	// P2 D6：bot 卡片编辑路径解锁 —— 目标消息与编辑体的「是否卡片」必须一致
+	// （跨类型变异 card↔非card 双向拒绝，不变量 (a)）；两者皆卡片走 cardmsg 与 send
+	// 对称的 write-strict 校验 + 权威 plain 重算 + D9 card_seq；两者皆非卡片走
+	// richtext（=14）原有路径。user/robot 编辑路径对卡片仍永久拒绝（各自守卫）。
+	origIsCard := cardmsg.IsCardRawPayload(msgPayload)
+	editIsCard := cardmsg.IsCardContentEdit(req.ContentEdit)
+	if origIsCard != editIsCard {
+		ba.Warn("卡片编辑跨类型变异,拒绝", zap.String("messageID", req.MessageID),
+			zap.Bool("origIsCard", origIsCard), zap.Bool("editIsCard", editIsCard))
 		respondBotAPIRequestInvalid(c, "content_edit")
 		return
 	}
-	req.ContentEdit = normalizedEdit
+	var (
+		err        error
+		cardSeq    int64
+		hasCardSeq bool
+	)
+	if editIsCard {
+		// P2（PR#548 review）：撤回/删除门禁 —— 已撤回或全局删除的卡片不可再编辑,
+		// 与动作端点（api_card_action.go）的撤回门禁对称,避免在已回收的卡片上重填
+		// content_edit（该 content_edit 是动作端点信任的生效帧）。行不存在=未编辑过,
+		// 非撤回,放行。
+		var lifecycle struct {
+			Revoke    int `db:"revoke"`
+			IsDeleted int `db:"is_deleted"`
+		}
+		if lErr := ba.ctx.DB().SelectBySql("SELECT `revoke`, is_deleted FROM message_extra WHERE message_id=?", req.MessageID).LoadOne(&lifecycle); lErr != nil && lErr != dbr.ErrNotFound {
+			ba.Error("查询卡片撤回/删除状态失败", zap.Error(lErr), zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+			return
+		}
+		if lifecycle.Revoke == 1 || lifecycle.IsDeleted == 1 {
+			ba.Warn("卡片已撤回/删除,拒绝编辑", zap.String("messageID", req.MessageID),
+				zap.Int("revoke", lifecycle.Revoke), zap.Int("isDeleted", lifecycle.IsDeleted))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIMessageNotFound, nil, nil)
+			return
+		}
+		// P2 D6：type-17 content_edit 跑与 send 同一套 cardmsg 校验（白名单/大小/
+		// URL/profile 协商，v2 帧在此合法）+ Finalize 重算权威 plain，返回 canonical
+		// JSON 落库。card_seq（D9）随后做 CAS。
+		normalized, cErr := cardmsg.NormalizeContentEdit(req.ContentEdit)
+		if cErr != nil {
+			ba.Warn("InteractiveCard content_edit 校验失败", zap.Error(cErr), zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return
+		}
+		req.ContentEdit = normalized
+		cardSeq, hasCardSeq = cardmsg.CardSeqFromContentEdit(normalized)
+	} else {
+		// 图文混排 RichText(=14)：编辑写入口对 content_edit 做与 send 路径对称的
+		// write-strict 校验 + 权威 plain 重算。非 14 / 非 JSON 体为 no-op。MD5 去重
+		// hash 落在 normalize 后的 canonical 体上。
+		normalizedEdit, rErr := richtext.NormalizeContentEdit(req.ContentEdit)
+		if rErr != nil {
+			ba.Warn("RichText content_edit 校验失败", zap.Error(rErr), zap.String("messageID", req.MessageID))
+			respondBotAPIRequestInvalid(c, "content_edit")
+			return
+		}
+		req.ContentEdit = normalizedEdit
+	}
 
 	contentEdit := dbr.NewNullString(req.ContentEdit).String
 	contentMD5 := util.MD5(contentEdit)
 
+	// content_edit_hash 去重短路（发生在下方 D9 card_seq CAS 之前）。这**不会**掩盖
+	// D9 stale 冲突：card_seq 是信封字段，已包含在 normalize 后的 canonical 体里，
+	// 故也计入 contentMD5。因此去重命中 ⟺ 与已存最新帧逐字节相同（含相同 card_seq）
+	// = 幂等重发，返回 OK 正确；任何 stale/乱序帧（更低或同 seq 但不同内容）hash 必
+	// 不同 → 不命中 → 走下方 CAS 得到 409。（PR#548 review 非阻塞项，已加测试佐证。）
 	var existCount int
 	err = ba.ctx.DB().Select("count(*)").From("message_extra").Where("message_id=? and content_edit_hash=?", req.MessageID, contentMD5).LoadOne(&existCount)
 	if err != nil {
@@ -810,21 +929,62 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 		fakeChannelID = common.GetFakeChannelIDWith(robotID, req.ChannelID)
 	}
 
-	version, err := ba.ctx.GenSeq(fmt.Sprintf("%s:%s", common.MessageExtraSeqKey, fakeChannelID))
-	if err != nil {
-		ba.Error("生成消息扩展序列号失败！", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
-		return
+	editedAt := int(time.Now().Unix())
+	if hasCardSeq {
+		// P2 D9：带 card_seq 的卡片编辑走共享条件 CAS。生产 CardMutator 的 backend
+		// 已统一承担 InnoDB 死锁/锁等待的有界重试；这里单次委托，避免嵌套重试把
+		// 最坏事务次数从 5 放大到 25。
+		conflict, casErr := ba.cardSeqCASWrite(req.MessageID, req.MessageSeq, fakeChannelID, req.ChannelType, contentEdit, contentMD5, editedAt, cardSeq)
+		if casErr != nil {
+			ba.Error("card_seq CAS 写入编辑内容失败！", zap.Error(casErr), zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
+			return
+		}
+		if conflict {
+			ba.Warn("card_seq 乱序/迟到帧,拒绝", zap.String("messageID", req.MessageID), zap.Int64("incoming", cardSeq))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardSeqConflict, nil, nil)
+			return
+		}
+	} else {
+		// 非 card_seq 帧:last-write-wins(D9,单写 bot 与既有编辑零行为变化)。仍须在
+		// 行锁内分配 version —— 锁外前置分配会让并发写(与 CAS 帧、或与另一非 CAS 帧)
+		// 的 version 分配序 ≠ 提交序:低 version 的 upsert 若后提交会覆盖已提交的高
+		// version,令 delta-sync(version>? 游标)永久漏掉终帧(PR#548 review P1，与 CAS
+		// 分支同一类单调性缺陷)。有界重试化解 InnoDB 死锁(与 CAS 写同口径)。
+		var werr error
+		for attempt := 0; attempt < cardSeqCASMaxAttempts; attempt++ {
+			werr = ba.cardVersionInLockWrite(req.MessageID, req.MessageSeq, fakeChannelID, req.ChannelType, contentEdit, contentMD5, editedAt)
+			if werr == nil || !isRetriableMySQLLockErr(werr) {
+				break
+			}
+			time.Sleep(time.Duration(attempt+1) * 3 * time.Millisecond)
+		}
+		if werr != nil {
+			ba.Error("card 编辑(无 card_seq)写入失败！", zap.Error(werr), zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
+			return
+		}
 	}
 
-	_, err = ba.ctx.DB().InsertBySql(
-		"INSERT INTO message_extra (message_id,message_seq,channel_id,channel_type,content_edit,content_edit_hash,edited_at,version) VALUES (?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE content_edit=VALUES(content_edit),content_edit_hash=VALUES(content_edit_hash),edited_at=VALUES(edited_at),version=VALUES(version)",
-		req.MessageID, req.MessageSeq, fakeChannelID, req.ChannelType, contentEdit, contentMD5, int(time.Now().Unix()), version,
-	).Exec()
-	if err != nil {
-		ba.Error("添加或修改编辑内容失败！", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
-		return
+	// P2 D10：非 transient 卡片帧追加修订历史（best-effort —— content_edit 已是
+	// 权威状态，history 是次级面，append 失败只记日志、不阻断编辑）。richtext 编辑
+	// 与 transient 进度帧不入历史。
+	if editIsCard && !cardmsg.TransientFromContentEdit(req.ContentEdit) {
+		rev := cardrevision.Revision{
+			MessageID:   req.MessageID,
+			ChannelID:   fakeChannelID,
+			ChannelType: req.ChannelType,
+			Content:     dbr.NewNullString(req.ContentEdit),
+			Plain:       cardmsg.PlainFromContentEdit(req.ContentEdit),
+			EditorUID:   robotID,
+			EditedAt:    int64(editedAt),
+		}
+		if hasCardSeq {
+			rev.CardSeq = dbr.NewNullInt64(cardSeq)
+		}
+		if rerr := ba.cardRevisions.AppendFrame(rev); rerr != nil {
+			ba.Error("卡片修订历史追加失败(不影响编辑)", zap.Error(rerr), zap.String("messageID", req.MessageID))
+		}
 	}
 
 	err = ba.ctx.SendCMD(config.MsgCMDReq{
@@ -839,4 +999,121 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 	}
 
 	c.ResponseOK()
+}
+
+// cardSeqCASMaxAttempts 是 D9 CAS 遇 InnoDB 死锁/锁等待超时的有界重试次数。
+const cardSeqCASMaxAttempts = 5
+
+// cardSeqCASWrite 执行 P2 D9 的 card_seq 条件 CAS 写：事务内 SELECT ... FOR UPDATE
+// 锁住该消息的 message_extra 行（不存在则取 next-key 锁串行化并发首帧），比对已存
+// card_seq —— 新值 ≤ 已存（非 NULL）→ 返回 conflict=true（乱序/迟到帧，什么都不写）；
+// 否则连 card_seq 一并 upsert 并提交。生产路径的可重试锁错误（1213/1205）由共享
+// CardMutator backend 统一有界重试；此处不再叠加第二层重试。
+//
+// P1-2（PR#548 review）：message_extra.version 在**拿到行锁之后**才分配。GenSeq
+// 是每-channel 单调递增,而 delta-sync 按 version 升序取增量帧
+// （db_message_extra.go:110 `where version>? order by version asc`）。若 version
+// 在锁外前置分配,一个更低 version 的帧可能赢下 card_seq CAS 却以更小 version 覆盖行
+// —— 已同步到更高 version 的客户端从此收不到该终帧（行在库里正确、但对 delta-sync
+// 不可见,违反 D6"各端收敛"/D9"no lost-update"）。锁内分配把竞争写的 GenSeq 调用按
+// 提交顺序串行化：赢家写（最大 seq、最后一次 advancing 写）必得最大 version。
+func (ba *BotAPI) cardSeqCASWrite(messageID string, messageSeq uint32, fakeChannelID string, channelType uint8, contentEdit, contentMD5 string, editedAt int, cardSeq int64) (conflict bool, err error) {
+	if ba.cardMutator != nil {
+		return ba.cardMutator.WriteCAS(carddispatch.CardMutationCASRequest{
+			MessageID: messageID, MessageSeq: messageSeq, ChannelID: fakeChannelID,
+			ChannelType: channelType, ContentEdit: contentEdit, ContentHash: contentMD5,
+			EditedAt: editedAt, CardSeq: cardSeq, StorageChannel: true,
+		})
+	}
+	tx, err := ba.ctx.DB().Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	var stored struct {
+		CardSeq dbr.NullInt64 `db:"card_seq"`
+		Hash    string        `db:"content_edit_hash"`
+	}
+	if selErr := tx.SelectBySql("SELECT card_seq, content_edit_hash FROM message_extra WHERE message_id=? FOR UPDATE", messageID).LoadOne(&stored); selErr != nil && selErr != dbr.ErrNotFound {
+		return false, selErr
+	}
+	if stored.CardSeq.Valid && stored.CardSeq.Int64 >= cardSeq {
+		// stored == cardSeq 且内容逐字节相同 → 并发/重复的幂等重试（两个相同帧都过了
+		// 事务前 content_edit_hash 短路、在此串行化），已存的就是这帧：返回成功、不再写，
+		// 避免对幂等重试误报 409（PR#548 review P2）。stored > cardSeq、或相等但内容不同，
+		// 才是真正的乱序/迟到帧 → conflict。
+		if stored.CardSeq.Int64 == cardSeq && stored.Hash == contentMD5 {
+			return false, nil
+		}
+		return true, nil
+	}
+	// 锁内分配 version（见函数注释 P1-2；跨副本单调性范围见 cardVersionInLockWrite 注释
+	// H2/P1-b）：仅 advancing 写才消费 version,冲突帧不消费。
+	version, err := ba.ctx.GenSeq(fmt.Sprintf("%s:%s", common.MessageExtraSeqKey, fakeChannelID))
+	if err != nil {
+		return false, err
+	}
+	if _, err = tx.InsertBySql(
+		"INSERT INTO message_extra (message_id,message_seq,channel_id,channel_type,content_edit,content_edit_hash,edited_at,version,card_seq) VALUES (?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE content_edit=VALUES(content_edit),content_edit_hash=VALUES(content_edit_hash),edited_at=VALUES(edited_at),version=VALUES(version),card_seq=VALUES(card_seq)",
+		messageID, messageSeq, fakeChannelID, channelType, contentEdit, contentMD5, editedAt, version, cardSeq,
+	).Exec(); err != nil {
+		return false, err
+	}
+	if err = tx.Commit(); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+// cardVersionInLockWrite 无 card_seq 的卡片编辑(LWW)写入：在行锁内分配 version 后
+// upsert content_edit —— 与 cardSeqCASWrite 取同一把 message_id 行锁(不存在则 next-key
+// 锁),使 version 分配序 == 提交序,杜绝锁外前置分配的低 version 覆盖并发写(CAS 或非
+// CAS)已提交的高 version 造成的 delta-sync 终帧丢失(PR#548 review P1)。不比较、不写
+// card_seq(保持 LWW 语义与既有 card_seq 值不变)。
+//
+// 单调性范围(PR#548 review H2/P1-b，纠正过度声明)：version 取自 ctx.GenSeq —— octo-lib
+// 的**进程内 HiLo 分配器**(进程级 seqMap+Mutex,每进程预留 seqStep=1000 的号段,DB 只补
+// 号段)。故「分配序==提交序」仅在**单进程内**成立:多副本部署下,持较低号段的实例可能在较
+// 高 version 提交后才抢到行锁、写入更低的 version;delta-sync(db_message_extra.go
+// `where version>? order by version asc`)会永久跳过该终帧,直到该客户端整表 resync。此为
+// **既有性质**(origin/main 富文本编辑亦用同一 GenSeq,本 PR 不触 config/seq.go),非本 PR
+// 引入 —— 本函数只关掉**进程内**竞态,TestBotCardEditMixedFrameVersionMonotonicIM 亦只验
+// 单进程。彻底的跨副本单调需把 version 换成频道级全序源(DB/Redis 原子计数),牵动所有
+// version 载体(含富文本),超出 #548 范围,列为后续。
+func (ba *BotAPI) cardVersionInLockWrite(messageID string, messageSeq uint32, fakeChannelID string, channelType uint8, contentEdit, contentMD5 string, editedAt int) error {
+	tx, err := ba.ctx.DB().Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	// 取行锁串行化 version 分配(与 cardSeqCASWrite 同一把锁);行不存在时 FOR UPDATE
+	// 取 next-key 锁,让并发首帧也串行。查出的 card_seq 仅作 LoadOne 目标、刻意不参与下方
+	// upsert(LWW 不动 card_seq) —— 本 SELECT 唯一目的是持锁(PR#548 review nit)。
+	var lockHold dbr.NullInt64
+	if selErr := tx.SelectBySql("SELECT card_seq FROM message_extra WHERE message_id=? FOR UPDATE", messageID).LoadOne(&lockHold); selErr != nil && selErr != dbr.ErrNotFound {
+		return selErr
+	}
+	version, err := ba.ctx.GenSeq(fmt.Sprintf("%s:%s", common.MessageExtraSeqKey, fakeChannelID))
+	if err != nil {
+		return err
+	}
+	if _, err = tx.InsertBySql(
+		"INSERT INTO message_extra (message_id,message_seq,channel_id,channel_type,content_edit,content_edit_hash,edited_at,version) VALUES (?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE content_edit=VALUES(content_edit),content_edit_hash=VALUES(content_edit_hash),edited_at=VALUES(edited_at),version=VALUES(version)",
+		messageID, messageSeq, fakeChannelID, channelType, contentEdit, contentMD5, editedAt, version,
+	).Exec(); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// isRetriableMySQLLockErr 识别 InnoDB 可重试锁错误：1213 死锁 / 1205 锁等待超时
+// （与 modules/conversation_ext 同口径，errors.As 兼容包装错误）。
+func isRetriableMySQLLockErr(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	if !errors.As(err, &mysqlErr) {
+		return false
+	}
+	return mysqlErr.Number == 1213 || mysqlErr.Number == 1205
 }
