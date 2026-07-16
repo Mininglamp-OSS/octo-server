@@ -4,6 +4,26 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-16 (space-new-user-welcome-message)
+
+- **Feature** — At-most-once Space welcome DM from the `notification` bot on a
+  human user's first join to a designated Space. New `octo_space_welcome_delivery`
+  ledger (migration in `modules/notify/sql/`; `notify/1module.go` gains
+  `//go:embed sql` + `SQLDir`), a 60s reconciler and a single-row send worker
+  (claim via `FOR UPDATE SKIP LOCKED`, CAS guarded by `status + claim_owner`,
+  `attempts` grows only on pre-IM failure with backoff {5s,30s,120s}→failed,
+  any post-dispatch failure → `unknown` never retried). Config is five
+  `system_setting` keys under `onboarding`; `modules/common` gains an atomic
+  `SpaceWelcomeConfig()` snapshot accessor + prospective composite validation on
+  the manager write path + i18n code `err.server.common.space_welcome_config_invalid`.
+  A notify-local 15s context-aware HTTP sender replaces octo-lib's timeout-less
+  helper (octo-lib unmodified). `active_from` vs `space_member.created_at`
+  compared via `UNIX_TIMESTAMP` (mirrors `modules/opanalytics`). Observability
+  kept minimal (in-process counters + logs). Ships `enabled=false`; three
+  product/ops sign-off items gate turning it on. Brief under
+  `.octospec/tasks/space-new-user-welcome-message/`; shared journal
+  `.octospec/journal/shared/space-new-user-welcome-message.md`.
+
 ## 2026-07-16 (card-action-internal-http-actions)
 
 - **Follow-up** — Two small extensions to #588 plus one bundled config

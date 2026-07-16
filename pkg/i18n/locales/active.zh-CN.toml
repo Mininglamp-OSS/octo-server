@@ -42,6 +42,9 @@ other = "服务器内部错误。"
 ["err.server.notify.card_not_allowed"]
 other = "内部通知接口不允许发送卡片消息。"
 
+["err.server.common.space_welcome_config_invalid"]
+other = "空间欢迎语配置无效，请检查目标空间是否存在且未解散、生效时间格式，以及中英文文案是否非空且未超长。"
+
 ["err.server.notify.card_invalid"]
 other = "卡片通知请求无效。"
 

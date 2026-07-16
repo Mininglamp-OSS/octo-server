@@ -294,6 +294,9 @@ other = "The group and the category are not in the same space."
 ["err.server.category.store_failed"]
 other = "Failed to update category data."
 
+["err.server.common.space_welcome_config_invalid"]
+other = "Invalid space welcome configuration."
+
 ["err.server.group.already_member"]
 other = "You are already a member of this group."
 

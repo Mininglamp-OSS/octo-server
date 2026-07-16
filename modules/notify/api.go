@@ -19,6 +19,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/app"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	"github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
@@ -75,6 +76,7 @@ type Notify struct {
 	actionSenders map[cardactiondispatch.NotifyCapability]carddispatch.Sender
 	internalToken string
 	docsToken     string
+	spaceWelcome  *spaceWelcomeService
 	log.Log
 }
 
@@ -143,6 +145,24 @@ func New(ctx *config.Context) *Notify {
 	// 监听成员加入事件
 	ctx.AddEventListener(event.SpaceMemberJoin, n.handleSpaceMemberEvent)
 
+	// Space 新成员欢迎语（task space-new-user-welcome-message）。langSvc 在无缓存
+	// 的测试环境下为 nil，resolveLanguage 会回退到 OCTO_DEFAULT_LANGUAGE。服务对象
+	// 在此构造，reconciler/worker goroutine 由模块 Start() 启动、Stop() 停止。
+	var langSvc *user.LanguageService
+	if ctx.Cache() != nil {
+		langSvc = user.NewLanguageService(user.NewDB(ctx), ctx.Cache())
+	}
+	n.spaceWelcome = newSpaceWelcomeService(
+		ctx,
+		common.EnsureSystemSettings(ctx),
+		langSvc,
+		NotifyBotUID(),
+		func() bool {
+			n.ensureNotifyBotReady()
+			return n.botOK.Load()
+		},
+	)
+
 	// 启动时创建全局通知 Bot（单例，带 panic recovery）。summary-notify
 	// 卡片复用同一身份，避免在用户会话列表中产生第二个系统 Bot 会话。
 	go func() {
@@ -210,7 +230,7 @@ func (n *Notify) internalAuthMiddleware() wkhttp.HandlerFunc {
 	}
 }
 
-// handleSpaceMemberEvent 成员变动时失效缓存
+// handleSpaceMemberEvent 成员变动时失效缓存，并在命中欢迎语配置时入队一条待投递。
 func (n *Notify) handleSpaceMemberEvent(data []byte, commit config.EventCommit) {
 	var req map[string]interface{}
 	if err := util.ReadJsonByByte(data, &req); err != nil {
@@ -218,10 +238,33 @@ func (n *Notify) handleSpaceMemberEvent(data []byte, commit config.EventCommit) 
 		commit(nil)
 		return
 	}
-	if spaceID, _ := req["space_id"].(string); spaceID != "" {
+	spaceID, _ := req["space_id"].(string)
+	uid, _ := req["uid"].(string)
+	if spaceID != "" {
 		n.memberCache.invalidate(spaceID)
 	}
+	// 低延迟入队：命中欢迎语配置的首次加入 human 成员写一条 pending 行。入队失败
+	// 只记日志、绝不阻塞或回滚已完成的加入（对账 goroutine 会兜底补齐）。
+	if n.spaceWelcome != nil && spaceID != "" && uid != "" {
+		n.spaceWelcome.handleMemberJoin(spaceID, uid)
+	}
 	commit(nil)
+}
+
+// Start 启动欢迎语的对账 + 发送 worker goroutine（模块生命周期钩子）。
+func (n *Notify) Start() error {
+	if n.spaceWelcome != nil {
+		n.spaceWelcome.Start()
+	}
+	return nil
+}
+
+// Stop 停止欢迎语后台 goroutine（context.Cancel + 等待清理退出）。
+func (n *Notify) Stop() error {
+	if n.spaceWelcome != nil {
+		n.spaceWelcome.Stop()
+	}
+	return nil
 }
 
 // sendNotify handles POST /v1/internal/notify

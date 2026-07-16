@@ -10,6 +10,10 @@ import (
 	commonbase "github.com/Mininglamp-OSS/octo-server/modules/base/common"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
 )
 
@@ -283,6 +287,60 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 			// Anything goes.
 		}
 		plans = append(plans, p)
+	}
+
+	// Prospective composite validation for the onboarding space-welcome
+	// five-tuple (task space-new-user-welcome-message). A partial update
+	// (e.g. changing only space_id) must be validated against
+	// merge(current snapshot, incoming items), NOT the pre-write snapshot
+	// alone: validating the current snapshot would wrongly accept a patch that
+	// breaks the composite and wrongly reject a patch that repairs it. We
+	// therefore start from SpaceWelcomeConfig() and overlay the just-validated
+	// plan values before validating. Only runs when this batch touches an
+	// onboarding.* key, so unrelated writes pay nothing.
+	welcomeIncoming := map[string]string{}
+	for _, p := range plans {
+		if p.def.Category == "onboarding" {
+			welcomeIncoming[p.def.Key] = p.value
+		}
+	}
+	if len(welcomeIncoming) > 0 {
+		prospective := m.systemSettings.SpaceWelcomeConfig()
+		if v, ok := welcomeIncoming["space_welcome_enabled"]; ok {
+			prospective.Enabled = v == "1"
+		}
+		if v, ok := welcomeIncoming["space_welcome_space_id"]; ok {
+			prospective.SpaceID = v
+		}
+		if v, ok := welcomeIncoming["space_welcome_active_from"]; ok {
+			prospective.ActiveFromRaw = v
+		}
+		if v, ok := welcomeIncoming["space_welcome_message_zh_cn"]; ok {
+			prospective.MessageZhCN = v
+		}
+		if v, ok := welcomeIncoming["space_welcome_message_en_us"]; ok {
+			prospective.MessageEnUS = v
+		}
+		field, verr := ValidateSpaceWelcomeCombination(prospective, func(spaceID string) (bool, error) {
+			// GetSpaceName returns "" (no error) when the space is missing or
+			// dissolved (status!=1), non-empty when it exists and is active.
+			name, e := spacepkg.GetSpaceName(m.ctx.DB(), spaceID)
+			if e != nil {
+				return false, e
+			}
+			return name != "", nil
+		})
+		if verr != nil {
+			// Infrastructure error (space lookup DB read failed). Do not leak
+			// the DB detail — log it, respond with the generic internal code.
+			m.Error("校验 space welcome 目标空间失败", zap.Error(verr))
+			httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+			return
+		}
+		if field != "" {
+			httperr.ResponseErrorL(c, errcode.ErrSpaceWelcomeConfigInvalid, nil, i18n.Details{"field": field})
+			return
+		}
 	}
 
 	// Atomic batch: open one transaction, queue every upsert, commit only

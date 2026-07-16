@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
@@ -200,6 +201,14 @@ func (s *SystemSettings) getBool(category, key string, fallback bool) bool {
 	if !ok {
 		return fallback
 	}
+	return parseSettingBool(v, fallback)
+}
+
+// parseSettingBool applies the canonical system_setting bool literal rules
+// (1/true/TRUE → true, 0/false/FALSE → false, anything else → fallback).
+// Shared by getBool and the atomic SpaceWelcomeConfig reader so both spell the
+// parse the same way.
+func parseSettingBool(v string, fallback bool) bool {
 	switch v {
 	case "1", "true", "TRUE":
 		return true
@@ -351,13 +360,14 @@ var oidcProviderIDRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
 // the safety override and lock everyone out.
 //
 // Why duplicated instead of importing modules/oidc:
-//   modules/common ← system_settings.go would need to import modules/oidc,
-//   but modules/oidc transitively imports modules/user → modules/common,
-//   creating a cycle. Extracting oidc.LoadConfig into its own leaf package
-//   was considered and rejected as out-of-scope churn for this PR. The
-//   trade-off is mirroring the required-env list here; modules/oidc/
-//   config.go carries a reciprocal comment so adding a new required env
-//   prompts updating both places.
+//
+//	modules/common ← system_settings.go would need to import modules/oidc,
+//	but modules/oidc transitively imports modules/user → modules/common,
+//	creating a cycle. Extracting oidc.LoadConfig into its own leaf package
+//	was considered and rejected as out-of-scope churn for this PR. The
+//	trade-off is mirroring the required-env list here; modules/oidc/
+//	config.go carries a reciprocal comment so adding a new required env
+//	prompts updating both places.
 //
 // Mirrored requirements (keep in sync with modules/oidc/config.go):
 //   - DM_OIDC_ENABLED  parsed by strconv.ParseBool — accepts 1/0/t/T/true/
@@ -428,13 +438,14 @@ func isOIDCFullyConfigured() bool {
 // works after flipping the switch.
 //
 // Why localOff is a parameter, not read from snapshot here:
-//   Callers know the intended value with stronger guarantees than the
-//   shared snapshot. The manager-write path can pass the just-validated
-//   request value (independent of whether Reload succeeded — PR #104 P2
-//   from yujiawei). Startup passes the freshly-loaded snapshot value.
-//   Reading the snapshot directly inside this method would silently miss
-//   the warning when Reload fails right after a write, exactly when ops
-//   most needs the signal.
+//
+//	Callers know the intended value with stronger guarantees than the
+//	shared snapshot. The manager-write path can pass the just-validated
+//	request value (independent of whether Reload succeeded — PR #104 P2
+//	from yujiawei). Startup passes the freshly-loaded snapshot value.
+//	Reading the snapshot directly inside this method would silently miss
+//	the warning when Reload fails right after a write, exactly when ops
+//	most needs the signal.
 //
 // Callers: invoke once at server startup (Common.Route) after Load
 // completes, and from the manager update handler after a write that
@@ -469,11 +480,11 @@ const envSpaceDisableUserCreate = "DM_SPACE_DISABLE_USER_CREATE"
 // SpaceDisableUserCreate reports whether the user-facing「创建空间」入口应被
 // 关闭。完整 fallback 链(按优先级):
 //
-//	1. DB 行存在且 value 非空 → 走 getBool 解析(1/true/TRUE → true;
-//	   0/false/FALSE → false; 未知字面量 → false)。**不再回退到 env** —— 与
-//	   其他 bool 设置一致,未知字面量等同 "admin 不希望关闭"。
-//	2. DB 行不存在,或 value="" → env DM_SPACE_DISABLE_USER_CREATE
-//	3. 都缺失 → false (保持开放)
+//  1. DB 行存在且 value 非空 → 走 getBool 解析(1/true/TRUE → true;
+//     0/false/FALSE → false; 未知字面量 → false)。**不再回退到 env** —— 与
+//     其他 bool 设置一致,未知字面量等同 "admin 不希望关闭"。
+//  2. DB 行不存在,或 value="" → env DM_SPACE_DISABLE_USER_CREATE
+//  3. 都缺失 → false (保持开放)
 //
 // 注：manager 写接口对 bool 值已做规范化(只接受 0/1/true/false 及大小写
 // 变体),正常路径不会出现未知字面量;此规则覆盖的是有人绕过 API 直接改 DB
@@ -1021,4 +1032,117 @@ func (s *SystemSettings) StickerCompressMaxDimension() int {
 		defaultStickerCompressMaxDimension,
 		stickerUploadMaxDimensionHardCap,
 	)
+}
+
+// ---------------------------------------------------------------------------
+// Space new-user welcome (onboarding.space_welcome_*) — task
+// space-new-user-welcome-message
+// ---------------------------------------------------------------------------
+
+const (
+	// spaceWelcomeCategory is the system_setting category for the five
+	// onboarding welcome keys.
+	spaceWelcomeCategory = "onboarding"
+	// spaceWelcomeMessageMaxRunes bounds each localized welcome body in Unicode
+	// code points (validated on the manager write path and re-validated at
+	// runtime).
+	spaceWelcomeMessageMaxRunes = 2000
+)
+
+// SpaceWelcomeConfig is an atomic, point-in-time view of the five
+// onboarding.space_welcome_* settings. All five fields are read from the SAME
+// SystemSettings snapshot in one access, so a caller can never straddle a
+// background Reload() and combine values from two different snapshots. The
+// event handler, send worker, reconciler and the manager write path all rely
+// on this atomicity — reading the keys individually would risk an inconsistent
+// five-tuple.
+type SpaceWelcomeConfig struct {
+	Enabled       bool
+	SpaceID       string
+	ActiveFromRaw string
+	MessageZhCN   string
+	MessageEnUS   string
+}
+
+// SpaceWelcomeConfig returns the current five-tuple, all read from one snapshot.
+func (s *SystemSettings) SpaceWelcomeConfig() SpaceWelcomeConfig {
+	snapPtr := s.snapshot.Load()
+	get := func(key string) string {
+		if snapPtr == nil {
+			return ""
+		}
+		return (*snapPtr)[schemaKey(spaceWelcomeCategory, key)]
+	}
+	return SpaceWelcomeConfig{
+		Enabled:       parseSettingBool(get("space_welcome_enabled"), false),
+		SpaceID:       get("space_welcome_space_id"),
+		ActiveFromRaw: get("space_welcome_active_from"),
+		MessageZhCN:   get("space_welcome_message_zh_cn"),
+		MessageEnUS:   get("space_welcome_message_en_us"),
+	}
+}
+
+// ParsedActiveFrom parses ActiveFromRaw as RFC3339 and returns it in UTC.
+// ok is false when the value is empty or unparseable — callers treat that as an
+// invalid combination (fail closed) when the feature is enabled.
+func (c SpaceWelcomeConfig) ParsedActiveFrom() (time.Time, bool) {
+	if c.ActiveFromRaw == "" {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339, c.ActiveFromRaw)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t.UTC(), true
+}
+
+// validWelcomeMessage reports whether a localized body is non-empty after trim
+// and within the code-point limit.
+func validWelcomeMessage(msg string) bool {
+	if strings.TrimSpace(msg) == "" {
+		return false
+	}
+	return utf8.RuneCountInString(msg) <= spaceWelcomeMessageMaxRunes
+}
+
+// ValidateSpaceWelcomeCombination validates the five-tuple as a coherent
+// combination.
+//
+//   - When disabled it always passes: a partial or empty config is fine while
+//     the feature is off.
+//   - When enabled it requires a non-empty space_id that isActiveSpace confirms
+//     exists and is not dissolved, a parseable RFC3339 active_from, and both
+//     message bodies non-empty (after trim) within spaceWelcomeMessageMaxRunes.
+//
+// The (field, err) contract lets the caller distinguish a validation failure
+// (err == nil, field != "" naming the first offending key) from an
+// infrastructure error (err != nil, e.g. the space lookup DB read failed). A
+// nil isActiveSpace skips only the space existence check — used by callers that
+// cannot reach the DB or want the pure static checks.
+func ValidateSpaceWelcomeCombination(cfg SpaceWelcomeConfig, isActiveSpace func(spaceID string) (bool, error)) (field string, err error) {
+	if !cfg.Enabled {
+		return "", nil
+	}
+	if strings.TrimSpace(cfg.SpaceID) == "" {
+		return "space_welcome_space_id", nil
+	}
+	if _, ok := cfg.ParsedActiveFrom(); !ok {
+		return "space_welcome_active_from", nil
+	}
+	if !validWelcomeMessage(cfg.MessageZhCN) {
+		return "space_welcome_message_zh_cn", nil
+	}
+	if !validWelcomeMessage(cfg.MessageEnUS) {
+		return "space_welcome_message_en_us", nil
+	}
+	if isActiveSpace != nil {
+		active, checkErr := isActiveSpace(cfg.SpaceID)
+		if checkErr != nil {
+			return "space_welcome_space_id", checkErr
+		}
+		if !active {
+			return "space_welcome_space_id", nil
+		}
+	}
+	return "", nil
 }
