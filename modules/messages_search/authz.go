@@ -207,6 +207,50 @@ func (h *Handler) checkP2PAccess(c *wkhttp.Context, peerUID, loginUID string) bo
 	return true
 }
 
+// botCheckP2PAccess gates DM search for an as-bot principal (#C / YUJ-50). The
+// bot subject's rule is deliberately narrower than the real-user
+// checkP2PAccess: allow iff the bot and the peer are friends, and NOTHING else.
+//
+//   - No Space segment: a bot has no `space_member` row, so the same-Space
+//     branch of the real-user gate can never fire for it. Consulting Space
+//     here would only add a lookup that is structurally always false.
+//   - No P2P blacklist, either direction (决策已确认):
+//     · bot→peer  — a bot can't blacklist anyone (addBlacklist is a real-user
+//     session feature, user/api.go), so this side is always empty;
+//     · peer→bot  — deliberately NOT consulted: a bot must stay able to search
+//     a conversation it is party to even if the peer has blocked it.
+//     So blacklistPolicy for userBotPrincipal is `none` (principal.go) and this
+//     gate never calls ExistBlacklist.
+//   - No bot-classification of the peer (QueryPeerRobotInfo): friendship alone
+//     decides. The peer may be a real user or another bot; the single IsFriend
+//     edge is the whole predicate.
+//
+// Direction: IsFriend(botUID, peer) — the same single-direction query the
+// real-user gate uses (authz.go, real-user path) and the exact enumeration dual
+// of #E's GetFriends(botUID) in buildBotAllowlist. Keeping this one edge (not a
+// two-call bidirectional check) is what makes 决策九 hold: 单频道门放行 ⇔ 出现在
+// global allowlist. Friend rows are stored as mutual pairs, so this still means
+// "互为好友".
+//
+// Denials render NOT_FOUND/resource=channel (anti-enumeration, identical to the
+// real-user path); an IsFriend lookup error fail-closes with INTERNAL_ERROR.
+func (h *Handler) botCheckP2PAccess(c *wkhttp.Context, botUID, peerUID string) bool {
+	isFriend, err := h.userService.IsFriend(botUID, peerUID)
+	if err != nil {
+		h.Error("as-bot p2p access check failed: IsFriend",
+			zap.Error(err),
+			zap.String("bot_uid", botUID),
+			zap.String("peer", peerUID))
+		respondInternal(c)
+		return false
+	}
+	if !isFriend {
+		respondNotFound(c, "channel")
+		return false
+	}
+	return true
+}
+
 // checkGroupAccess fail-closes if the group is missing, then gates on active
 // membership. Disbanded groups are NOT rejected here: per the 企业微信式 disband
 // semantics (产品决策 2026-06), history & search stay readable after disband —

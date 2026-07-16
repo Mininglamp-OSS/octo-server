@@ -3,6 +3,7 @@ package messages_search
 import (
 	"errors"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
@@ -354,6 +355,119 @@ func TestCanReadChannel_UserBotFailsClosed(t *testing.T) {
 	}
 	if rec.Body.Len() == 0 {
 		t.Fatalf("as-bot denial must render a response (NOT_FOUND)")
+	}
+}
+
+// TestCanReadChannel_UserBotP2PFriendAllowed — as-bot DM gate (#C): a bot that
+// is friends with the peer may search that DM. Space and blacklist must NOT be
+// consulted (bot has no Space row; blacklistPolicy=none).
+func TestCanReadChannel_UserBotP2PFriendAllowed(t *testing.T) {
+	uSvc := &stubAuthzUserSvc{
+		friends: map[string]bool{friendKey("bot9", "peer"): true},
+		// A peer→bot blacklist row is present to prove the gate never reads it.
+		blacklists: map[string]bool{blacklistKey("peer", "bot9"): true},
+	}
+	h := newAuthzHandlerFull(&stubAuthzGroupSvc{}, uSvc, &stubAuthzThreadSvc{})
+	c, rec := newAuthzCtx(t)
+
+	if !h.canReadChannel(c, userBotPrincipal{botUID: "bot9"}, channelTypePerson, "peer") {
+		t.Fatalf("as-bot friend DM must pass the p2p gate")
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("no response should be written on allow, got %q", rec.Body.String())
+	}
+	if uSvc.friendCalls != 1 {
+		t.Fatalf("expected exactly one IsFriend lookup, got %d", uSvc.friendCalls)
+	}
+	if uSvc.blCalls != 0 || uSvc.spaceCalls != 0 || uSvc.robotCalls != 0 {
+		t.Fatalf("as-bot p2p must skip blacklist/Space/bot-classification; got bl=%d space=%d robot=%d",
+			uSvc.blCalls, uSvc.spaceCalls, uSvc.robotCalls)
+	}
+}
+
+// TestCanReadChannel_UserBotP2PBlacklistedButFriendAllowed — 决策不取: friend but
+// blocked BY the peer still searchable (a bot must stay able to search a DM it
+// is party to). Directly asserts the acceptance criterion.
+func TestCanReadChannel_UserBotP2PBlacklistedButFriendAllowed(t *testing.T) {
+	uSvc := &stubAuthzUserSvc{
+		friends: map[string]bool{friendKey("bot9", "peer"): true},
+		blacklists: map[string]bool{
+			blacklistKey("peer", "bot9"): true, // peer blocked the bot
+			blacklistKey("bot9", "peer"): true, // and (hypothetically) vice-versa
+		},
+	}
+	h := newAuthzHandlerFull(&stubAuthzGroupSvc{}, uSvc, &stubAuthzThreadSvc{})
+	c, rec := newAuthzCtx(t)
+
+	if !h.canReadChannel(c, userBotPrincipal{botUID: "bot9"}, channelTypePerson, "peer") {
+		t.Fatalf("as-bot friend DM must remain searchable regardless of blacklist (决策不取)")
+	}
+	if uSvc.blCalls != 0 {
+		t.Fatalf("as-bot p2p must never query blacklist; got %d calls", uSvc.blCalls)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("no response on allow, got %q", rec.Body.String())
+	}
+}
+
+// TestCanReadChannel_UserBotP2PNotFriendDenied — a bot that is not friends with
+// the peer is denied as NOT_FOUND (anti-enumeration), no blacklist follow-up.
+func TestCanReadChannel_UserBotP2PNotFriendDenied(t *testing.T) {
+	uSvc := &stubAuthzUserSvc{friends: map[string]bool{}}
+	h := newAuthzHandlerFull(&stubAuthzGroupSvc{}, uSvc, &stubAuthzThreadSvc{})
+	c, rec := newAuthzCtx(t)
+
+	if h.canReadChannel(c, userBotPrincipal{botUID: "bot9"}, channelTypePerson, "peer") {
+		t.Fatalf("as-bot non-friend DM must be denied")
+	}
+	if uSvc.blCalls != 0 {
+		t.Fatalf("blacklist must not be queried after non-friend rejection; got %d", uSvc.blCalls)
+	}
+	if !strings.Contains(rec.Body.String(), "not found") {
+		t.Fatalf("denial should render the not_found envelope, got %q", rec.Body.String())
+	}
+}
+
+// TestCanReadChannel_UserBotP2PIsFriendErrorFailsClosed — an IsFriend DB error
+// must fail closed (deny) rather than leak access.
+func TestCanReadChannel_UserBotP2PIsFriendErrorFailsClosed(t *testing.T) {
+	uSvc := &stubAuthzUserSvc{friendErr: errors.New("db down")}
+	h := newAuthzHandlerFull(&stubAuthzGroupSvc{}, uSvc, &stubAuthzThreadSvc{})
+	c, _ := newAuthzCtx(t)
+
+	if h.canReadChannel(c, userBotPrincipal{botUID: "bot9"}, channelTypePerson, "peer") {
+		t.Fatalf("as-bot IsFriend error must fail closed")
+	}
+}
+
+// TestCanReadChannel_UserBotP2PUsesBotUID — the gate keys IsFriend on the bot's
+// own SubjectUID (botUID), not the login uid. Proves the subject substitution.
+func TestCanReadChannel_UserBotP2PUsesBotUID(t *testing.T) {
+	uSvc := &stubAuthzUserSvc{friends: map[string]bool{friendKey("bot9", "peer"): true}}
+	h := newAuthzHandlerFull(&stubAuthzGroupSvc{}, uSvc, &stubAuthzThreadSvc{})
+	c, _ := newAuthzCtx(t)
+
+	// Friend edge exists for bot9→peer only; a different bot must be denied.
+	if h.canReadChannel(c, userBotPrincipal{botUID: "other"}, channelTypePerson, "peer") {
+		t.Fatalf("gate must key IsFriend on the bot SubjectUID; a non-friend bot must be denied")
+	}
+	if !h.canReadChannel(c, userBotPrincipal{botUID: "bot9"}, channelTypePerson, "peer") {
+		t.Fatalf("the friend bot (bot9) must be allowed")
+	}
+}
+
+// TestCanReadChannel_UserBotGroupThreadFailClosed — group/thread remain #D's
+// unwired seam after #C: still deny fail-closed with NOT_FOUND.
+func TestCanReadChannel_UserBotGroupThreadFailClosed(t *testing.T) {
+	for _, ct := range []uint8{channelTypeGroup, channelTypeThread} {
+		h := newAuthzHandlerFull(&stubAuthzGroupSvc{}, &stubAuthzUserSvc{}, &stubAuthzThreadSvc{})
+		c, rec := newAuthzCtx(t)
+		if h.canReadChannel(c, userBotPrincipal{botUID: "bot9"}, ct, "chan") {
+			t.Fatalf("as-bot group/thread gate must fail closed until #D wires it (ct=%d)", ct)
+		}
+		if rec.Body.Len() == 0 {
+			t.Fatalf("as-bot group/thread denial must render a response (ct=%d)", ct)
+		}
 	}
 }
 
