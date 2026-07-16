@@ -341,6 +341,15 @@ func (m *Message) authorizeCardChannelMember(c *wkhttp.Context, loginUID, messag
 	lookupChannelID := channelID
 	switch channelType {
 	case common.ChannelTypePerson.Uint8():
+		// 观测点（不改语义）：person 频道的 channel_id 是**对端 uid**，客户端不该把它
+		// 提成操作者自身。self-loop 会算出 fakeChannel(self,self) 必然 miss → 归并到
+		// invalid（防枚举，行为不变）。打一条 WARN 让「客户端提交 self-loop channel」类
+		// 问题可被立即定位 —— 典型来源是与系统 bot（notification 等）的 DM，其 recv 包
+		// channelID 塌缩为接收人自身而非对端 bot（见 octo-web#831，客户端已回退到 fromUID）。
+		if channelID == loginUID {
+			m.Warn("卡片动作 channel_id 为操作者自身(person self-loop),按 invalid 处理",
+				zap.String("uid", loginUID), zap.String("messageID", messageID))
+		}
 		lookupChannelID = common.GetFakeChannelIDWith(loginUID, channelID)
 	case common.ChannelTypeGroup.Uint8(), common.ChannelTypeCommunityTopic.Uint8():
 		// group / topic：消息就存于声明频道本身。
