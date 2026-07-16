@@ -17,6 +17,7 @@ package incomingwebhook
 // 字段（白名单解析），其余 payload 字段一律忽略。
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
@@ -24,6 +25,9 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 )
 
 // 渲染的提交列表上限（与 GitHub 适配器一致：全列会刷屏）。
@@ -158,9 +162,21 @@ type glPipelineEvent struct {
 		ID     int    `json:"id"`
 		Ref    string `json:"ref"`
 		Status string `json:"status"`
+		// Duration 是流水线耗时（秒，GitLab 在终态事件里给出）。仅卡片路径渲染
+		// （文本路径保持历史输出不变）。可能缺省(0)/为 null → 不展示。
+		Duration float64 `json:"duration"`
 	} `json:"object_attributes"`
 	User    glUser    `json:"user"`
 	Project glProject `json:"project"`
+	// Builds 是本次流水线的作业列表（GitLab 在 Pipeline Hook 里给出）。仅卡片路径用于
+	// "Jobs (N)" 事实行；缺省即不展示该行。
+	Builds []glBuild `json:"builds"`
+}
+
+// glBuild 是流水线里的单个作业（白名单解析：只取渲染需要的字段）。
+type glBuild struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`
 }
 
 // parseGitLabPush 把 GitLab webhook 事件翻译成 native 推送请求（pushAdapter.parse）。
@@ -202,7 +218,14 @@ func parseGitLabPush(header http.Header, body []byte) (*pushPayloadReq, string, 
 		// 事件类型支持、但动作不在渲染子集内（MR update / pipeline running / ...）：skip。
 		return nil, "event", ""
 	}
-	return &pushPayloadReq{Content: clipRunes(content, maxContentRunes())}, "", ""
+	// card-message webhook-cardmsg-adapter：开关开时渲成 InteractiveCard(=17)，关闭
+	//（或卡片自校验失败）时 vcsPushReq 降级回上面的 markdown 文本路径（文本渲染器原样
+	// 保留，flag-off 字节与历史一致）。与 github 适配器同一套卡片骨架 / 转义器（parity）。
+	var card map[string]interface{}
+	if cardmsg.Enabled() {
+		card = buildGitLabEventCard(event, body, i18n.OutboundLanguage(context.Background()))
+	}
+	return vcsPushReq(content, card), "", ""
 }
 
 func renderGitLabPush(body []byte) (string, error) {
@@ -405,4 +428,219 @@ func glShortSHA(sha string) string {
 		return sha[:8]
 	}
 	return sha
+}
+
+// ============================================================
+// Card rendering (card-message webhook-cardmsg-adapter)
+// ============================================================
+//
+// buildGitLabEventCard mirrors the text renderers' event/action decisions but emits
+// an octo/v1 card object using the SAME anatomy + escaper as the github adapter
+// (adapter_card.go) — parity. Returns nil for subset-outside actions / parse errors
+// (→ degrade to text via vcsPushReq).
+
+func buildGitLabEventCard(event string, body []byte, lang string) map[string]interface{} {
+	switch event {
+	case "Push Hook":
+		return buildGitLabPushCard(body, lang)
+	case "Tag Push Hook":
+		return buildGitLabTagPushCard(body, lang)
+	case "Merge Request Hook":
+		return buildGitLabMergeRequestCard(body, lang)
+	case "Issue Hook":
+		return buildGitLabIssueCard(body, lang)
+	case "Note Hook":
+		return buildGitLabNoteCard(body, lang)
+	case "Pipeline Hook":
+		return buildGitLabPipelineCard(body, lang)
+	}
+	return nil
+}
+
+// glActorCard is glActor for the card path: username (restricted charset) or the
+// free-text display name, both escaped for a TextBlock leaf.
+func glActorCard(username, name string) string {
+	if username != "" {
+		return escapeCardText(username, cardActorMax)
+	}
+	if name != "" {
+		return escapeCardText(name, cardActorMax)
+	}
+	return "someone"
+}
+
+func buildGitLabPushCard(body []byte, lang string) map[string]interface{} {
+	var ev glPushEvent
+	if err := json.Unmarshal(body, &ev); err != nil {
+		return nil
+	}
+	who := glActorCard(ev.UserUsername, ev.UserName)
+	ref := cardCodeSpan(glShortRef(ev.Ref), cardRefMax)
+	d := vcsCardData{
+		source:   cardSourceGitLab,
+		variant:  "vcs.gitlab.push",
+		subtitle: escapeCardText(ev.Project.PathWithNamespace, cardTitleMax),
+		url:      httpURLForCard(ev.Project.WebURL),
+	}
+	switch {
+	case glIsZeroSHA(ev.After):
+		d.headline = fmt.Sprintf("%s deleted branch %s", who, ref)
+	case glIsZeroSHA(ev.Before) && len(ev.Commits) == 0:
+		d.headline = fmt.Sprintf("%s created branch %s", who, ref)
+	case len(ev.Commits) == 0:
+		return nil
+	default:
+		n := max(ev.TotalCommits, len(ev.Commits))
+		d.headline = fmt.Sprintf("%s pushed %d commit(s) to %s", who, n, ref)
+		for i, cm := range ev.Commits {
+			if i == maxRenderedGitLabCommits {
+				d.lines = append(d.lines, fmt.Sprintf("…and %d more", n-maxRenderedGitLabCommits))
+				break
+			}
+			d.lines = append(d.lines, joinShaMsg(
+				cardCodeSpan(glShortSHA(cm.ID), cardShaMax),
+				escapeCardText(firstLine(cm.Message), cardCommitMsgMax)))
+		}
+	}
+	return d.card(lang)
+}
+
+func buildGitLabTagPushCard(body []byte, lang string) map[string]interface{} {
+	var ev glPushEvent
+	if err := json.Unmarshal(body, &ev); err != nil {
+		return nil
+	}
+	who := glActorCard(ev.UserUsername, ev.UserName)
+	tag := cardCodeSpan(glShortRef(ev.Ref), cardRefMax)
+	headline := fmt.Sprintf("%s pushed tag %s", who, tag)
+	if glIsZeroSHA(ev.After) {
+		headline = fmt.Sprintf("%s deleted tag %s", who, tag)
+	}
+	return vcsCardData{
+		source:   cardSourceGitLab,
+		variant:  "vcs.gitlab.tag_push",
+		headline: headline,
+		subtitle: escapeCardText(ev.Project.PathWithNamespace, cardTitleMax),
+		url:      httpURLForCard(ev.Project.WebURL),
+	}.card(lang)
+}
+
+func buildGitLabMergeRequestCard(body []byte, lang string) map[string]interface{} {
+	var ev glMergeRequestEvent
+	if err := json.Unmarshal(body, &ev); err != nil {
+		return nil
+	}
+	verb := glActionVerb(ev.ObjectAttributes.Action)
+	if verb == "" {
+		return nil
+	}
+	return vcsCardData{
+		source:   cardSourceGitLab,
+		variant:  "vcs.gitlab.merge_request",
+		headline: fmt.Sprintf("%s %s a merge request", glActorCard(ev.User.Username, ev.User.Name), verb),
+		subtitle: escapeCardText(ev.Project.PathWithNamespace, cardTitleMax),
+		lines:    []string{numberedTitle("!", ev.ObjectAttributes.IID, ev.ObjectAttributes.Title)},
+		url:      httpURLForCard(ev.ObjectAttributes.URL),
+	}.card(lang)
+}
+
+func buildGitLabIssueCard(body []byte, lang string) map[string]interface{} {
+	var ev glIssueEvent
+	if err := json.Unmarshal(body, &ev); err != nil {
+		return nil
+	}
+	verb := glActionVerb(ev.ObjectAttributes.Action)
+	if verb == "" {
+		return nil
+	}
+	return vcsCardData{
+		source:   cardSourceGitLab,
+		variant:  "vcs.gitlab.issue",
+		headline: fmt.Sprintf("%s %s an issue", glActorCard(ev.User.Username, ev.User.Name), verb),
+		subtitle: escapeCardText(ev.Project.PathWithNamespace, cardTitleMax),
+		lines:    []string{numberedTitle("#", ev.ObjectAttributes.IID, ev.ObjectAttributes.Title)},
+		url:      httpURLForCard(ev.ObjectAttributes.URL),
+	}.card(lang)
+}
+
+func buildGitLabNoteCard(body []byte, lang string) map[string]interface{} {
+	var ev glNoteEvent
+	if err := json.Unmarshal(body, &ev); err != nil {
+		return nil
+	}
+	if ev.ObjectAttributes.System {
+		return nil
+	}
+	var target string
+	switch ev.ObjectAttributes.NoteableType {
+	case "MergeRequest":
+		target = numberedTitle("!", ev.MergeRequest.IID, ev.MergeRequest.Title)
+	case "Issue":
+		target = numberedTitle("#", ev.Issue.IID, ev.Issue.Title)
+	case "Commit":
+		target = "commit " + cardCodeSpan(glShortSHA(ev.Commit.ID), cardShaMax)
+	default:
+		target = "a comment"
+	}
+	return vcsCardData{
+		source:   cardSourceGitLab,
+		variant:  "vcs.gitlab.note",
+		headline: fmt.Sprintf("%s commented", glActorCard(ev.User.Username, ev.User.Name)),
+		subtitle: escapeCardText(ev.Project.PathWithNamespace, cardTitleMax),
+		lines:    []string{target},
+		quote:    escapeCardText(ev.ObjectAttributes.Note, cardQuoteMax),
+		url:      httpURLForCard(ev.ObjectAttributes.URL),
+	}.card(lang)
+}
+
+func buildGitLabPipelineCard(body []byte, lang string) map[string]interface{} {
+	var ev glPipelineEvent
+	if err := json.Unmarshal(body, &ev); err != nil {
+		return nil
+	}
+	switch ev.ObjectAttributes.Status {
+	case "success", "failed", "canceled":
+	default:
+		return nil
+	}
+	// 卡片专属的结构化 FactSet（分支 / 状态 / 耗时 / 作业）——文本路径不含这些字段，
+	// 故 flag-off 字节不变。标签本地化（内容标签，非 errcode），值在叶子处转义。
+	labels := pipelineLabelsFor(lang)
+	facts := []vcsFact{
+		{title: labels.branch, value: escapeCardText(glShortRef(ev.ObjectAttributes.Ref), cardRefMax)},
+		{title: labels.status, value: escapeCardText(ev.ObjectAttributes.Status, cardActorMax)},
+	}
+	if dur := formatPipelineDuration(int(ev.ObjectAttributes.Duration)); dur != "" {
+		facts = append(facts, vcsFact{title: labels.duration, value: dur})
+	}
+	if len(ev.Builds) > 0 {
+		names := make([]string, 0, maxRenderedJobs)
+		for i, b := range ev.Builds {
+			if i == maxRenderedJobs {
+				break
+			}
+			names = append(names, escapeCardText(b.Name, cardActorMax))
+		}
+		value := strings.Join(names, " / ")
+		if len(ev.Builds) > maxRenderedJobs {
+			value += " …"
+		}
+		facts = append(facts, vcsFact{
+			title: fmt.Sprintf("%s (%d)", labels.jobs, len(ev.Builds)),
+			value: value,
+		})
+	}
+	url := ""
+	if p := httpURLForCard(ev.Project.WebURL); p != "" {
+		url = fmt.Sprintf("%s/-/pipelines/%d", strings.TrimRight(p, "/"), ev.ObjectAttributes.ID)
+	}
+	return vcsCardData{
+		source:   cardSourceGitLab,
+		variant:  "vcs.gitlab.pipeline",
+		headline: fmt.Sprintf("Pipeline #%d", ev.ObjectAttributes.ID),
+		status:   pipelineStatusColor(ev.ObjectAttributes.Status),
+		subtitle: escapeCardText(ev.Project.PathWithNamespace, cardTitleMax),
+		facts:    facts,
+		url:      url,
+	}.card(lang)
 }

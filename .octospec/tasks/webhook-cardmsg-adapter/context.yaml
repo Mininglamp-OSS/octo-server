@@ -1,0 +1,42 @@
+slug: webhook-cardmsg-adapter
+rules_injected:
+  - id: trust-boundary
+    tier: repo
+    load_bearing: true
+    why: github/gitlab are attacker-influenced ingress; the card path escapes every external
+         leaf (actor/repo/title/commit msg/comment) at the card TextBlock/FactSet via a shared
+         escaper, and routes all URLs (Action.OpenUrl) through cardmsg's positive http(s)
+         allowlist. Parity held — one shared card escaper + one anatomy helper for BOTH adapters;
+         primary navigation is a structured Action.OpenUrl (no markdown-destination breakout).
+  - id: error-handling
+    tier: repo
+    load_bearing: true
+    why: no new error codes / responses. Cards degrade to the existing text path when the flag is
+         off OR the built card fails self-validation, so the happy path never becomes a new 400;
+         the msgTypeCard branch's existing error mapping is reused unchanged.
+  - id: space-isolation
+    tier: repo
+    load_bearing: true
+    why: card envelope still routes through buildCardPayload — space_id server-derived from the
+         group (never caller-set), from.kind=webhook pinned; targetChannel/delivery unchanged.
+         The adapter only produces the card body; no new data-access surface.
+  - id: testing
+    tier: repo
+    load_bearing: false
+    why: new adapter_card_test.go (card shape + validate + trust-boundary parity + degrade) plus
+         extend adapter_github_test.go / adapter_gitlab_test.go (flag-off bytes identical, flag-on card).
+  - id: commit-style
+    tier: repo
+    load_bearing: false
+    why: Conventional Commits, English.
+files_touched:
+  - modules/incomingwebhook/adapter_card.go     # NEW shared card model+assembler+escaper+url allowlist+view label+self-validate+selector
+  - modules/incomingwebhook/adapter_github.go   # add per-event card builders; parse tail picks card (flag on) else text
+  - modules/incomingwebhook/adapter_gitlab.go   # add per-event card builders; parse tail picks card (flag on) else text
+  - modules/incomingwebhook/api_i18n_test.go    # add adapter_card.go to the NoLegacyResponseError guard list
+parity_decisions:
+  - "Card leaf escaping uses one shared escapeCardText (mirrors pkg/cardtmpl.escapeMarkdown) + cardCodeSpan; both github and gitlab card builders use only these — no divergent per-adapter escaping."
+  - "Bold is TextBlock weight:Bolder (not markdown **), refs/SHAs are code spans (backticks stripped from content) — so escaped external text can never re-open emphasis or a link."
+  - "Primary link is a structured Action.OpenUrl validated by httpURLForCard (parse+scheme http(s)+host); non-http(s) → button omitted (card still valid), never a markdown destination interpolation."
+  - "Card-vs-text chosen per push via cardmsg.Enabled(); on Enabled()+build the card self-validates through cardmsg.Validate — any failure degrades to the untouched text path (flag-off bytes identical, guaranteed by unchanged text renderers)."
+  - "Outbound language = i18n.OutboundLanguage(context.Background()) (deployment default, no request ctx) — same discipline as modules/notify + cardtmpl; 'View on {GitHub|GitLab}' / '在 {..} 查看' localized in-Go (content label, not an errcode)."

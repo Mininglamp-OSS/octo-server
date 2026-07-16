@@ -23,6 +23,20 @@ change-log convention (§7). Newest first.
   under `.octospec/tasks/card-action-internal-http-actions/`; shared journal
   `.octospec/journal/shared/card-action-internal-http-actions.md`.
 
+## 2026-07-16 (webhook-cardmsg-adapter)
+
+- **Feature** — The GitHub/GitLab incoming-webhook adapters render their event
+  subset as `InteractiveCard` (=17) octo/v1 cards (structured header + body + a
+  "View on {GitHub|GitLab}" `Action.OpenUrl`) when `OCTO_CARD_MESSAGE_ENABLED`
+  is on, and degrade to the untouched markdown text path when off (flag-off wire
+  byte-identical). New `adapter_card.go` holds the shared card anatomy + one leaf
+  escaper + http(s) allowlist + self-validate/degrade selector, used by both
+  adapters (trust-boundary parity). GitLab pipeline cards render a
+  Branch/Status/Duration/Jobs FactSet (parses `duration` + `builds[]`, card-only).
+  Server-only: octo-web already ships the octo/v1 renderer + `iwh_` sender trust.
+  Brief/context under `.octospec/tasks/webhook-cardmsg-adapter/`; shared journal
+  `.octospec/journal/shared/webhook-cardmsg-adapter.md`.
+
 ## 2026-07-13 (card-message-appbot-trust)
 
 - **Fix** — Closed the P0 App Bot card trust split without changing the send

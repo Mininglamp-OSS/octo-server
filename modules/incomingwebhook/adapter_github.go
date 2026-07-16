@@ -18,12 +18,16 @@ package incomingwebhook
 // 所有 gh* 结构体只声明渲染需要的字段（白名单解析），其余 payload 字段一律忽略。
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 )
 
 // 渲染的提交列表上限：push 事件单次最多带 20 个 commit（GitHub 截断），全列会刷屏。
@@ -73,13 +77,16 @@ type ghCommit struct {
 }
 
 type ghPushEvent struct {
-	Ref        string     `json:"ref"`
-	Created    bool       `json:"created"`
-	Deleted    bool       `json:"deleted"`
-	Forced     bool       `json:"forced"`
-	Commits    []ghCommit `json:"commits"`
-	Repository ghRepo     `json:"repository"`
-	Sender     ghUser     `json:"sender"`
+	Ref     string     `json:"ref"`
+	Created bool       `json:"created"`
+	Deleted bool       `json:"deleted"`
+	Forced  bool       `json:"forced"`
+	Commits []ghCommit `json:"commits"`
+	// Compare is GitHub's canonical diff URL for the push (card "View" target;
+	// unused by the text renderer). Falls back to the repo URL when absent.
+	Compare    string `json:"compare"`
+	Repository ghRepo `json:"repository"`
+	Sender     ghUser `json:"sender"`
 }
 
 type ghPullRequestEvent struct {
@@ -171,8 +178,15 @@ func parseGitHubPush(header http.Header, body []byte) (*pushPayloadReq, string, 
 		// 事件类型支持、但动作不在渲染子集内（synchronize / labeled / ...）：同上 skip。
 		return nil, "event", ""
 	}
-	// 事件体里的标题 / 提交信息长度不受我们控制：钳到语义上限内，绝不让平台流量 413。
-	return &pushPayloadReq{Content: clipRunes(content, maxContentRunes())}, "", ""
+	// card-message webhook-cardmsg-adapter：开关开时把同一事件渲成 InteractiveCard(=17)，
+	// 关闭（或卡片自校验失败）时 vcsPushReq 降级回上面的 markdown 文本路径——文本渲染器
+	// 保持原样，故 flag-off 的 content 字节与历史完全一致。事件体里的标题 / 提交信息长度
+	// 不受我们控制：文本路径钳到语义上限内（vcsPushReq 内），绝不让平台流量 413。
+	var card map[string]interface{}
+	if cardmsg.Enabled() {
+		card = buildGitHubEventCard(event, body, i18n.OutboundLanguage(context.Background()))
+	}
+	return vcsPushReq(content, card), "", ""
 }
 
 func renderGitHubPush(body []byte) (string, error) {
@@ -326,4 +340,196 @@ func ghShortSHA(sha string) string {
 		return sha[:7]
 	}
 	return sha
+}
+
+// ============================================================
+// Card rendering (card-message webhook-cardmsg-adapter)
+// ============================================================
+//
+// buildGitHubEventCard mirrors the text renderers' event/action decisions but emits
+// an octo/v1 card object (see adapter_card.go). It returns nil for any event/action
+// outside the rendered subset (the caller already handled skip via the text
+// renderer's empty content) or on a parse error — nil degrades to text via
+// vcsPushReq. It re-unmarshals the same gh* structs the text path uses; only one
+// path runs per request (flag on OR off), so there is no double-unmarshal at runtime.
+
+func buildGitHubEventCard(event string, body []byte, lang string) map[string]interface{} {
+	switch event {
+	case "push":
+		return buildGitHubPushCard(body, lang)
+	case "pull_request":
+		return buildGitHubPullRequestCard(body, lang)
+	case "issues":
+		return buildGitHubIssuesCard(body, lang)
+	case "issue_comment":
+		return buildGitHubIssueCommentCard(body, lang)
+	case "release":
+		return buildGitHubReleaseCard(body, lang)
+	}
+	return nil
+}
+
+// ghActorCard is ghLogin for the card path: escaped for a TextBlock leaf (a GitHub
+// login has a restricted charset, but escaping is harmless and keeps parity with the
+// free-text GitLab display name).
+func ghActorCard(u ghUser) string {
+	if u.Login == "" {
+		return "someone"
+	}
+	return escapeCardText(u.Login, cardActorMax)
+}
+
+// ghRepoURLCard prefers the push compare URL, else the repo HTML URL, each through
+// the http(s) allowlist ("" when neither is a valid absolute http(s) URL → button
+// omitted).
+func ghRepoURLCard(compare string, r ghRepo) string {
+	if u := httpURLForCard(compare); u != "" {
+		return u
+	}
+	return httpURLForCard(r.HTMLURL)
+}
+
+func buildGitHubPushCard(body []byte, lang string) map[string]interface{} {
+	var ev ghPushEvent
+	if err := json.Unmarshal(body, &ev); err != nil {
+		return nil
+	}
+	who := ghActorCard(ev.Sender)
+	ref := cardCodeSpan(ghShortRef(ev.Ref), cardRefMax)
+	d := vcsCardData{
+		source:   cardSourceGitHub,
+		variant:  "vcs.github.push",
+		subtitle: escapeCardText(ev.Repository.FullName, cardTitleMax),
+		url:      ghRepoURLCard(ev.Compare, ev.Repository),
+	}
+	switch {
+	case strings.HasPrefix(ev.Ref, "refs/tags/"):
+		if ev.Deleted {
+			d.headline = fmt.Sprintf("%s deleted tag %s", who, ref)
+		} else {
+			d.headline = fmt.Sprintf("%s pushed tag %s", who, ref)
+		}
+	case ev.Deleted:
+		d.headline = fmt.Sprintf("%s deleted branch %s", who, ref)
+	case ev.Created && len(ev.Commits) == 0:
+		d.headline = fmt.Sprintf("%s created branch %s", who, ref)
+	case len(ev.Commits) == 0:
+		// 退化 ref 更新（无提交、非建/删）：文本路径 skip，卡片同样不产出。
+		return nil
+	default:
+		verb := "pushed"
+		if ev.Forced {
+			verb = "force-pushed"
+		}
+		d.headline = fmt.Sprintf("%s %s %d commit(s) to %s", who, verb, len(ev.Commits), ref)
+		for i, cm := range ev.Commits {
+			if i == maxRenderedCommits {
+				d.lines = append(d.lines, fmt.Sprintf("…and %d more", len(ev.Commits)-maxRenderedCommits))
+				break
+			}
+			d.lines = append(d.lines, joinShaMsg(
+				cardCodeSpan(ghShortSHA(cm.ID), cardShaMax),
+				escapeCardText(firstLine(cm.Message), cardCommitMsgMax)))
+		}
+	}
+	return d.card(lang)
+}
+
+// ghPRVerbPhrase maps a pull_request action to a card headline verb phrase; ""
+// signals a subset-outside action (card not produced).
+func ghPRVerbPhrase(action string, merged bool) string {
+	switch action {
+	case "opened":
+		return "opened a pull request"
+	case "reopened":
+		return "reopened a pull request"
+	case "ready_for_review":
+		return "marked a pull request ready for review"
+	case "closed":
+		if merged {
+			return "merged a pull request"
+		}
+		return "closed a pull request"
+	}
+	return ""
+}
+
+func buildGitHubPullRequestCard(body []byte, lang string) map[string]interface{} {
+	var ev ghPullRequestEvent
+	if err := json.Unmarshal(body, &ev); err != nil {
+		return nil
+	}
+	phrase := ghPRVerbPhrase(ev.Action, ev.PullRequest.Merged)
+	if phrase == "" {
+		return nil
+	}
+	return vcsCardData{
+		source:   cardSourceGitHub,
+		variant:  "vcs.github.pull_request",
+		headline: fmt.Sprintf("%s %s", ghActorCard(ev.Sender), phrase),
+		subtitle: escapeCardText(ev.Repository.FullName, cardTitleMax),
+		lines:    []string{numberedTitle("#", ev.PullRequest.Number, ev.PullRequest.Title)},
+		url:      httpURLForCard(ev.PullRequest.HTMLURL),
+	}.card(lang)
+}
+
+func buildGitHubIssuesCard(body []byte, lang string) map[string]interface{} {
+	var ev ghIssuesEvent
+	if err := json.Unmarshal(body, &ev); err != nil {
+		return nil
+	}
+	switch ev.Action {
+	case "opened", "closed", "reopened":
+	default:
+		return nil
+	}
+	return vcsCardData{
+		source:   cardSourceGitHub,
+		variant:  "vcs.github.issues",
+		headline: fmt.Sprintf("%s %s an issue", ghActorCard(ev.Sender), ev.Action),
+		subtitle: escapeCardText(ev.Repository.FullName, cardTitleMax),
+		lines:    []string{numberedTitle("#", ev.Issue.Number, ev.Issue.Title)},
+		url:      httpURLForCard(ev.Issue.HTMLURL),
+	}.card(lang)
+}
+
+func buildGitHubIssueCommentCard(body []byte, lang string) map[string]interface{} {
+	var ev ghIssueCommentEvent
+	if err := json.Unmarshal(body, &ev); err != nil {
+		return nil
+	}
+	if ev.Action != "created" {
+		return nil
+	}
+	return vcsCardData{
+		source:   cardSourceGitHub,
+		variant:  "vcs.github.issue_comment",
+		headline: fmt.Sprintf("%s commented on an issue", ghActorCard(ev.Sender)),
+		subtitle: escapeCardText(ev.Repository.FullName, cardTitleMax),
+		lines:    []string{numberedTitle("#", ev.Issue.Number, ev.Issue.Title)},
+		quote:    escapeCardText(ev.Comment.Body, cardQuoteMax),
+		url:      httpURLForCard(ev.Comment.HTMLURL),
+	}.card(lang)
+}
+
+func buildGitHubReleaseCard(body []byte, lang string) map[string]interface{} {
+	var ev ghReleaseEvent
+	if err := json.Unmarshal(body, &ev); err != nil {
+		return nil
+	}
+	if ev.Action != "published" {
+		return nil
+	}
+	title := ev.Release.Name
+	if strings.TrimSpace(title) == "" {
+		title = ev.Release.TagName
+	}
+	return vcsCardData{
+		source:   cardSourceGitHub,
+		variant:  "vcs.github.release",
+		headline: fmt.Sprintf("%s published a release", ghActorCard(ev.Sender)),
+		subtitle: escapeCardText(ev.Repository.FullName, cardTitleMax),
+		lines:    []string{escapeCardText(title, cardTitleMax)},
+		url:      httpURLForCard(ev.Release.HTMLURL),
+	}.card(lang)
 }
