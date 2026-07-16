@@ -33,12 +33,27 @@ var (
 	// to the consumer through DecisionRequest.decision. Lowercase, starts with
 	// a letter, digits/underscore/dot/dash allowed, 1-48 chars.
 	approvalDecisionPattern = regexp.MustCompile(`^[a-z][a-z0-9_.-]{0,47}$`)
+
+	// reservedApprovalDecisions matches the tokens the legacy approve/deny
+	// template emits (`approval-approve` / `approval-deny`). A custom-actions
+	// caller that picked either of these would render buttons whose IDs
+	// collide with the legacy template on any client-side analytics or replay
+	// log keyed only on action_id. Reject to keep the ID namespace clean.
+	reservedApprovalDecisions = map[string]struct{}{
+		"approve": {},
+		"deny":    {},
+	}
 )
 
 // ApprovalRequestAction lets the caller name a bounded, custom Action.Submit
 // button on the generic approval card. Server owns the action ID, the injected
 // owner/action_type metadata, and the card layout; callers only supply the
 // stable callback token (decision) and a display label (title).
+//
+// The tokens "approve" and "deny" are reserved for the legacy 2-button
+// template; passing either as Decision returns a validation error to keep the
+// server-derived "approval-<decision>" action IDs collision-free with the
+// legacy ApprovalApproveActionID / ApprovalDenyActionID.
 type ApprovalRequestAction struct {
 	Decision string
 	Title    string
@@ -153,6 +168,9 @@ func buildApprovalActions(input ApprovalRequestCard, baseData map[string]interfa
 		decision := action.Decision
 		if !approvalDecisionPattern.MatchString(decision) {
 			return nil, errors.New("cardtmpl: approval action decision is invalid")
+		}
+		if _, reserved := reservedApprovalDecisions[decision]; reserved {
+			return nil, errors.New("cardtmpl: approval action decision collides with reserved approve/deny namespace")
 		}
 		if _, dup := seen[decision]; dup {
 			return nil, errors.New("cardtmpl: approval action decisions must be unique")

@@ -156,16 +156,18 @@ callers must inspect both `delivered` and `filtered`.
 
 The token supplies the authoritative owner; the request cannot choose it. The
 server adds reserved metadata and builds every action. `actions` is optional:
-omitting the field preserves the existing localized approve/deny buttons.
-Sending `"actions": []` (explicit empty array) is a caller bug and rejected —
-the fallback path is nil, not an empty slice. When present, it must contain
-1-5 items. Each `decision` is unique and matches `[a-z][a-z0-9_.-]{0,47}`;
-each trimmed `title` is 1-80 Unicode code points and cannot contain control
-characters (tabs, newlines, BEL, etc.). octo-server derives the action ID as
-`approval-<decision>` and the callback receives that decision unchanged. `data`
-accepts at most 32 lower-case keys with string values up to 500 runes; `owner`,
-`action_type`, and `decision` are reserved. No per-action data, URL, input,
-style, or arbitrary card JSON is accepted.
+omitting the field (or sending explicit JSON `null` — equivalent on the wire)
+preserves the existing localized approve/deny buttons. Sending `"actions": []`
+(explicit empty array) is a caller bug and rejected — the fallback path is
+nil, not an empty slice. When present, it must contain 1-5 items. Each
+`decision` is unique and matches `[a-z][a-z0-9_.-]{0,47}`; the tokens
+`approve` and `deny` are reserved for the legacy template and rejected as
+custom decisions. Each trimmed `title` is 1-80 Unicode code points and cannot
+contain control characters (tabs, newlines, BEL, etc.). octo-server derives
+the action ID as `approval-<decision>` and the callback receives that decision
+unchanged. `data` accepts at most 32 lower-case keys with string values up to
+500 runes; `owner`, `action_type`, and `decision` are reserved. No per-action
+data, URL, input, style, or arbitrary card JSON is accepted.
 
 Custom decisions do not add callback result states. The consumer still returns
 one authoritative `state`: `approved`, `denied`, `cancelled`, or `pending`.

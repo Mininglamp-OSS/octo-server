@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 )
 
 // TestBuildApprovalRequestCardCustomActionsRenderServerBuiltButtons locks the
@@ -131,6 +133,16 @@ func TestBuildApprovalRequestCardRejectsInvalidCustomActions(t *testing.T) {
 			{Decision: "execute", Title: "Execute"},
 			{Decision: "execute", Title: "Redo"},
 		}},
+		{"reserved decision approve collides with legacy template", []ApprovalRequestAction{
+			{Decision: "approve", Title: "Allow"},
+		}},
+		{"reserved decision deny collides with legacy template", []ApprovalRequestAction{
+			{Decision: "deny", Title: "Reject"},
+		}},
+		{"reserved decision approve mixed with other valid decisions", []ApprovalRequestAction{
+			{Decision: "execute", Title: "Execute"},
+			{Decision: "approve", Title: "Allow"},
+		}},
 		{"empty title", []ApprovalRequestAction{{Decision: "execute", Title: ""}}},
 		{"whitespace title", []ApprovalRequestAction{{Decision: "execute", Title: "   "}}},
 		{"title too long", []ApprovalRequestAction{{Decision: "execute", Title: strings.Repeat("字", 81)}}},
@@ -188,4 +200,99 @@ func TestBuildApprovalRequestCardMaxCustomActionsIsAccepted(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("BuildApprovalRequestCard(max) error = %v", err)
 	}
+}
+
+// TestBuildApprovalRequestCardRoundTripsThroughSubmitAction stitches the
+// builder to the runtime extractor. The two sides are exercised separately
+// elsewhere, but the click path relies on their shapes agreeing: builder emits
+// `id = "approval-<decision>"` with a top-level `actions[]`, and
+// cardmsg.SubmitAction traverses `card["actions"]` matching by type/id and
+// returns the authored `data`. A silent drift in either side (id derivation
+// change, key rename, moving actions off the top-level) would fail this test
+// while every isolated test in this PR still passed.
+//
+// Covers both branches — custom actions and the legacy approve/deny — plus a
+// synthetic action ID lookup that must miss.
+func TestBuildApprovalRequestCardRoundTripsThroughSubmitAction(t *testing.T) {
+	newEnvelope := func(t *testing.T, raw json.RawMessage) []byte {
+		t.Helper()
+		var card map[string]interface{}
+		if err := json.Unmarshal(raw, &card); err != nil {
+			t.Fatalf("decode card: %v", err)
+		}
+		envelope, err := json.Marshal(map[string]interface{}{
+			"type":         cardmsg.InteractiveCard.Int(),
+			"card_version": cardmsg.CardVersion,
+			"profile":      cardmsg.ProfileV2,
+			"card":         card,
+		})
+		if err != nil {
+			t.Fatalf("marshal envelope: %v", err)
+		}
+		return envelope
+	}
+
+	t.Run("custom actions", func(t *testing.T) {
+		raw, err := BuildApprovalRequestCard(ApprovalRequestCard{
+			Title:      "Execute task",
+			Owner:      "tasks",
+			ActionType: "task.execute.decision",
+			Data:       map[string]string{"task_id": "task-1"},
+			Actions: []ApprovalRequestAction{
+				{Decision: "execute", Title: "Execute"},
+				{Decision: "reject", Title: "Reject"},
+				{Decision: "cancel", Title: "Cancel"},
+			},
+		})
+		if err != nil {
+			t.Fatalf("BuildApprovalRequestCard() error = %v", err)
+		}
+		envelope := newEnvelope(t, raw)
+
+		for decision, wantTaskID := range map[string]string{"execute": "task-1", "reject": "task-1", "cancel": "task-1"} {
+			id := "approval-" + decision
+			data, found := cardmsg.SubmitAction(envelope, id)
+			if !found {
+				t.Fatalf("SubmitAction(%q) found = false; builder emitted a button the extractor cannot find", id)
+			}
+			if data["decision"] != decision {
+				t.Fatalf("SubmitAction(%q).decision = %v, want %q", id, data["decision"], decision)
+			}
+			if data["owner"] != "tasks" || data["action_type"] != "task.execute.decision" {
+				t.Fatalf("reserved metadata lost on %q: %+v", id, data)
+			}
+			if data["task_id"] != wantTaskID {
+				t.Fatalf("shared data lost on %q: task_id = %v, want %q", id, data["task_id"], wantTaskID)
+			}
+		}
+
+		if _, found := cardmsg.SubmitAction(envelope, "approval-nope"); found {
+			t.Fatal("SubmitAction(bogus) found = true; extractor accepted an ID the builder never emitted")
+		}
+	})
+
+	t.Run("legacy approve deny", func(t *testing.T) {
+		raw, err := BuildApprovalRequestCard(ApprovalRequestCard{
+			Title:        "Publish summary",
+			Owner:        "smart-summary",
+			ActionType:   "summary.publish.decision",
+			Data:         map[string]string{"task_no": "task-7"},
+			ApproveTitle: "Allow",
+			DenyTitle:    "Deny",
+		})
+		if err != nil {
+			t.Fatalf("BuildApprovalRequestCard() error = %v", err)
+		}
+		envelope := newEnvelope(t, raw)
+
+		approveData, found := cardmsg.SubmitAction(envelope, ApprovalApproveActionID)
+		if !found || approveData["decision"] != "approve" ||
+			approveData["owner"] != "smart-summary" || approveData["task_no"] != "task-7" {
+			t.Fatalf("legacy approve action lost round-trip: found=%v data=%+v", found, approveData)
+		}
+		denyData, found := cardmsg.SubmitAction(envelope, ApprovalDenyActionID)
+		if !found || denyData["decision"] != "deny" {
+			t.Fatalf("legacy deny action lost round-trip: found=%v data=%+v", found, denyData)
+		}
+	})
 }

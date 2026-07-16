@@ -73,12 +73,16 @@ for action types whose route repeats that `notify_token_env`. The server owns
 action IDs, reserved metadata, layout, escaping, and profile. The request
 accepts neither callback URLs nor arbitrary card JSON.
 
-`actions` is optional. Omit it to preserve the localized Allow/Deny actions and
-their `approve`/`deny` decisions. Sending `"actions": []` (an explicit empty
-array) is treated as a caller bug and rejected — the fallback path is nil, not
-an empty slice. When present, it contains 1-5 entries:
+`actions` is optional. Omit it (or send explicit JSON `null` — equivalent on
+the wire) to preserve the localized Allow/Deny actions and their
+`approve`/`deny` decisions. Sending `"actions": []` (an explicit empty array)
+is treated as a caller bug and rejected — the fallback path is nil, not an
+empty slice. When present, it contains 1-5 entries:
 
-- `decision`: a unique stable value matching `[a-z][a-z0-9_.-]{0,47}`;
+- `decision`: a unique stable value matching `[a-z][a-z0-9_.-]{0,47}`. The
+  tokens `approve` and `deny` are reserved for the legacy 2-button template
+  and rejected as custom decisions so their derived action IDs stay
+  collision-free with `approval-approve` / `approval-deny`;
 - `title`: trimmed display text containing 1-80 Unicode code points; control
   characters (including tabs, newlines, and the BEL byte) are rejected so the
   server never emits an unrenderable button label.

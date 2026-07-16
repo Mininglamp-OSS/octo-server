@@ -360,6 +360,23 @@ func TestIntegration_ApprovalCardCustomActionsRenderInOrder(t *testing.T) {
 	require.Len(t, capture.cards, 2)
 	assert.Contains(t, string(capture.last().Document), `"id":"approval-approve"`,
 		"omitted actions must reach the localized approve/deny template")
+
+	// Wire equivalence: explicit "actions": null MUST decode to a nil slice
+	// (Go's encoding/json contract) and therefore reach the same legacy
+	// approve/deny template as an omitted field. This pins the doc claim that
+	// null and omit are interchangeable on the wire.
+	rawNull := `{"space_id":"space-1","service":"tasks","targets":["user-b"],"actor_uid":"user-a",` +
+		`"approval_card":{"action_type":"task.execute.decision","title":"Execute task",` +
+		`"description":"Pick one","data":{"task_id":"task-1"},"actions":null}}`
+	reqNull := httptest.NewRequest(http.MethodPost, "/v1/internal/notify", strings.NewReader(rawNull))
+	reqNull.Header.Set("Content-Type", "application/json")
+	reqNull.Header.Set(InternalTokenHeader, notifyToken)
+	recNull := httptest.NewRecorder()
+	router.ServeHTTP(recNull, reqNull)
+	assert.Equal(t, http.StatusOK, recNull.Code, recNull.Body.String())
+	require.Len(t, capture.cards, 3)
+	assert.Contains(t, string(capture.last().Document), `"id":"approval-approve"`,
+		`explicit "actions": null must decode to nil and take the legacy approve/deny template`)
 }
 
 func TestIntegration_MissingDocsTokenFailsClosed(t *testing.T) {
