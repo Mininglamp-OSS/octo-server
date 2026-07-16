@@ -7,6 +7,8 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/gin-gonic/gin"
 )
 
@@ -86,10 +88,10 @@ func TestPrincipalCarrier_RateLimitKey(t *testing.T) {
 // neither (login_uid alone suffices).
 func TestPrincipalCarrier_AuditUIDs(t *testing.T) {
 	cases := []struct {
-		name          string
-		p             Principal
-		wantBot       string
-		wantGrantor   string
+		name        string
+		p           Principal
+		wantBot     string
+		wantGrantor string
 	}{
 		{"user", userPrincipal{uid: "alice"}, "", ""},
 		{"user_bot", userBotPrincipal{botUID: "bot9"}, "bot9", ""},
@@ -355,14 +357,28 @@ func TestCanReadChannel_UserBotFailsClosed(t *testing.T) {
 	}
 }
 
-// TestEnumerateReadableChannels_UserBotNotImplemented — the as-bot allowlist
-// enumeration is #E's seam; until then it fails closed with an error.
-func TestEnumerateReadableChannels_UserBotNotImplemented(t *testing.T) {
-	h := newAuthzHandlerFull(&stubAuthzGroupSvc{}, &stubAuthzUserSvc{}, &stubAuthzThreadSvc{})
+// TestEnumerateReadableChannels_UserBotEnumerates — the as-bot allowlist
+// enumeration is #E (YUJ-52). enumerateReadableChannels must dispatch a
+// userBotPrincipal to buildBotAllowlist (friends ∪ groups ∪ threads), NOT the
+// old fail-closed placeholder. Full behaviour is covered in
+// search_global_test.go; here we only assert the dispatch is wired.
+func TestEnumerateReadableChannels_UserBotEnumerates(t *testing.T) {
+	gSvc := &stubGroupSvc{groupsByUID: map[string][]*group.InfoResp{"bot9": {{GroupNo: "g1"}}}}
+	uSvc := &stubUserSvc{friends: []*user.FriendResp{{UID: "alice"}}}
+	h := newHandlerForGlobalTests()
+	h.groupService = gSvc
+	h.userService = uSvc
+	h.threadEnumFn = func([]string) (map[string][]string, error) { return nil, nil }
 	c, _ := newAuthzCtx(t)
-	_, _, _, _, err := h.enumerateReadableChannels(c, userBotPrincipal{botUID: "bot9"})
-	if !errors.Is(err, errBotPredicateNotImplemented) {
-		t.Fatalf("as-bot enumeration must fail closed until #E, got err=%v", err)
+	allowGroup, allowDM, _, _, err := h.enumerateReadableChannels(c, userBotPrincipal{botUID: "bot9"})
+	if err != nil {
+		t.Fatalf("as-bot enumeration must succeed once #E is wired, got err=%v", err)
+	}
+	if len(allowGroup) != 1 || allowGroup[0].OSChannelID != "g1" {
+		t.Fatalf("expected bot group g1 in allowlist, got %+v", allowGroup)
+	}
+	if len(allowDM) != 1 || allowDM[0].WireID != "alice" {
+		t.Fatalf("expected bot friend alice in DM allowlist, got %+v", allowDM)
 	}
 }
 
