@@ -345,13 +345,15 @@ func TestCanReadChannel_RealUserDelegates(t *testing.T) {
 	}
 }
 
-// TestCanReadChannel_UserBotFailsClosed — the as-bot branch is a #C/#D seam;
-// until wired it must deny fail-closed with NOT_FOUND (never silently allow).
-func TestCanReadChannel_UserBotFailsClosed(t *testing.T) {
+// TestCanReadChannel_UserBotP2PFailsClosed — the as-bot DM (person) branch is
+// #C's seam (YUJ-50); until wired it must deny fail-closed with NOT_FOUND
+// (never silently allow). The group/thread branches are wired by #D and are
+// covered in authz_bot_test.go.
+func TestCanReadChannel_UserBotP2PFailsClosed(t *testing.T) {
 	h := newAuthzHandlerFull(&stubAuthzGroupSvc{}, &stubAuthzUserSvc{}, &stubAuthzThreadSvc{})
 	c, rec := newAuthzCtx(t)
-	if h.canReadChannel(c, userBotPrincipal{botUID: "bot9"}, channelTypeGroup, "g1") {
-		t.Fatalf("as-bot gate must fail closed until #C/#D wire it")
+	if h.canReadChannel(c, userBotPrincipal{botUID: "bot9"}, channelTypePerson, "peer") {
+		t.Fatalf("as-bot P2P gate must fail closed until #C wires it")
 	}
 	if rec.Body.Len() == 0 {
 		t.Fatalf("as-bot denial must render a response (NOT_FOUND)")
