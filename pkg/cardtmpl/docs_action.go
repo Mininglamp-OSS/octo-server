@@ -62,12 +62,14 @@ func BuildDocsAccessRequestCard(
 			"type":  "Action.Submit",
 			"id":    DocsApproveActionID,
 			"title": actions.ApproveTitle,
+			"style": "positive",
 			"data":  approveData,
 		},
 		map[string]interface{}{
 			"type":  "Action.Submit",
 			"id":    DocsDenyActionID,
 			"title": actions.DenyTitle,
+			"style": "destructive",
 			"data":  denyData,
 		},
 	}

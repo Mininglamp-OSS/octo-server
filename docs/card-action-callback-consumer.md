@@ -89,8 +89,10 @@ empty slice. When present, it contains 1-5 entries:
 
 octo-server derives each action ID as `approval-<decision>` and injects the
 route-bound owner/action type into every submit payload. Per-action data,
-styles, URLs, inputs, and caller-authored card JSON are not supported. Put
-bounded shared domain identifiers in the card's `data` map.
+styles, URLs, inputs, and caller-authored card JSON are not supported from
+callers. (The server sets an `ActionStyle` on its own legacy approve/deny
+buttons — approve `positive`, deny `destructive`; custom actions carry none.)
+Put bounded shared domain identifiers in the card's `data` map.
 
 Custom action titles are caller-provided display text. Supply the language
 appropriate for the target audience; octo-server validates and renders the

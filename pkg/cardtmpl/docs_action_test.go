@@ -30,10 +30,11 @@ func TestBuildDocsAccessRequestCardProducesReviewedV2Actions(t *testing.T) {
 	want := []struct {
 		id       string
 		title    string
+		style    string
 		decision string
 	}{
-		{id: DocsApproveActionID, title: "允许", decision: "approve"},
-		{id: DocsDenyActionID, title: "拒绝", decision: "deny"},
+		{id: DocsApproveActionID, title: "允许", style: "positive", decision: "approve"},
+		{id: DocsDenyActionID, title: "拒绝", style: "destructive", decision: "deny"},
 	}
 	for i, expected := range want {
 		action, ok := actions[i].(map[string]interface{})
@@ -41,6 +42,10 @@ func TestBuildDocsAccessRequestCardProducesReviewedV2Actions(t *testing.T) {
 		assert.Equal(t, "Action.Submit", action["type"])
 		assert.Equal(t, expected.id, action["id"])
 		assert.Equal(t, expected.title, action["title"])
+		// Parity with the generic approval card (approval_request.go): approve =
+		// primary (positive), deny = secondary (destructive) so the docs access
+		// request card and the generic approval card render consistently.
+		assert.Equal(t, expected.style, action["style"])
 		data, ok := action["data"].(map[string]interface{})
 		require.True(t, ok)
 		assert.Equal(t, "docs", data["owner"])
