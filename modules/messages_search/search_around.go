@@ -51,7 +51,8 @@ func (h *Handler) searchAround(c *wkhttp.Context) {
 		respondValidation(c, "body", "invalid JSON")
 		return
 	}
-	loginUID := c.GetLoginUID()
+	p := h.principal(c)
+	loginUID := p.SubjectUID()
 
 	// Reuse the shared field validation (channel form, page_size, filters).
 	// No sort/cursor on this endpoint; relevance is not applicable.
@@ -64,7 +65,7 @@ func (h *Handler) searchAround(c *wkhttp.Context) {
 		respondValidation(c, "anchor_message_id", "must be a positive integer id")
 		return
 	}
-	if !h.checkChannelAccess(c, req.ChannelType, req.ChannelID, loginUID) {
+	if !h.canReadChannel(c, p, req.ChannelType, req.ChannelID) {
 		return
 	}
 	spaceID, ok := h.resolveP2PSpaceScope(c, req.ChannelType, loginUID)

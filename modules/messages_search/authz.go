@@ -1,11 +1,8 @@
 package messages_search
 
 import (
-	"strings"
-
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
-	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
 )
 
@@ -142,7 +139,9 @@ func (h *Handler) checkP2PAccess(c *wkhttp.Context, peerUID, loginUID string) bo
 		// covers enterprise contact-book deployments where friend is empty;
 		// friend fallback preserves legacy non-Space deployments.
 		allowed := false
-		spaceID := strings.TrimSpace(spacepkg.GetSpaceID(c))
+		// spaceID 走 principal（决策十）：真人等价于 GetSpaceID(c)；bot 无 space_member
+		// 行、Space 为空（as-bot 的 P2P 分支由 #C 用 bot 谓词接管，不落此真人分支）。
+		spaceID := h.principal(c).SpaceID()
 		if spaceID != "" {
 			sameSpace, serr := h.userService.AreSpaceMembers(spaceID, loginUID, peerUID)
 			if serr != nil {

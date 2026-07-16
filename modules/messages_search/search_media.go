@@ -47,7 +47,8 @@ func (h *Handler) searchMedia(c *wkhttp.Context) {
 		return
 	}
 	req.Keyword = strings.TrimSpace(req.Keyword)
-	loginUID := c.GetLoginUID()
+	p := h.principal(c)
+	loginUID := p.SubjectUID()
 
 	if !validateKeywordMustBeEmpty(c, req.Keyword) {
 		return
@@ -56,7 +57,7 @@ func (h *Handler) searchMedia(c *wkhttp.Context) {
 	if !ok {
 		return
 	}
-	if !h.checkChannelAccess(c, req.ChannelType, req.ChannelID, loginUID) {
+	if !h.canReadChannel(c, p, req.ChannelType, req.ChannelID) {
 		return
 	}
 	spaceID, ok := h.resolveP2PSpaceScope(c, req.ChannelType, loginUID)

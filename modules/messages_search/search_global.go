@@ -436,7 +436,9 @@ func normalizeMemberUIDs(loginUID string, uids []string, single string) []string
 // this Space OR the channel_ids/member_uid intersection is empty — the
 // handler should return an empty envelope without touching OS.
 func (h *Handler) resolveGlobalScope(c *wkhttp.Context, loginUID string, channelIDs []GlobalChannelRef, rawMemberUIDs []string, legacyMemberUID string) (osChannelIDs []string, spaceID string, singleFast *channelRef, timings allowlistTimings, ok bool) {
-	spaceID = strings.TrimSpace(spacepkg.GetSpaceID(c))
+	// spaceID 走 principal（决策十）：真人等价于 GetSpaceID(c)；bot 路由无 SpaceMiddleware
+	// 故为空；uk 取 api_key_space_id.
+	spaceID = h.principal(c).SpaceID()
 	if spaceID == "" {
 		// DM double-guard is space-dependent; without a Space the guard cannot
 		// fire (§6.5). We fail-closed on the DM side identically to
@@ -452,7 +454,11 @@ func (h *Handler) resolveGlobalScope(c *wkhttp.Context, loginUID string, channel
 			zap.String("uid", loginUID))
 	}
 
-	allowGroup, allowDM, allowThread, allowTimings, err := h.buildAllowlist(c, loginUID, spaceID)
+	// 全局 allowlist 枚举经归一化谓词 enumerateReadableChannels（决策九）：真人语义主体
+	// 委托 buildAllowlist（现状不变），as-bot 分支在 #E 落——保证单频道门与 allowlist
+	// 共用同一谓词，不各写一套。principalForSubject 优先取路由显式写入的 principal
+	//（bot/uk，#B），否则用已解析的 (loginUID, spaceID) 组装真人载体（现网/既有单测行为不变）。
+	allowGroup, allowDM, allowThread, allowTimings, err := h.enumerateReadableChannels(c, principalForSubject(c, loginUID, spaceID))
 	timings = allowTimings
 	if err != nil {
 		h.Error("messages_search: allowlist build failed", zap.Error(err))

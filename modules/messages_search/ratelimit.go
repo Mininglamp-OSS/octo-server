@@ -121,7 +121,9 @@ func (l *uidLimiter) sweepLocked(now time.Time) {
 // request through unmetered.
 func (h *Handler) searchRateLimiter() wkhttp.HandlerFunc {
 	return func(c *wkhttp.Context) {
-		key := c.GetLoginUID()
+		// 限流键走 principal（决策十）：真人=自身 uid（现状不变）；as-bot / obo 都按
+		// botUID 计（防单 bot 打爆）；uk 按 key UID。
+		key := h.principal(c).RateLimitKey()
 		if key == "" {
 			key = "ip:" + c.ClientIP()
 		}

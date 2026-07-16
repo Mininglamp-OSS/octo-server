@@ -46,7 +46,7 @@ func (h *Handler) searchGlobalMessages(c *wkhttp.Context) {
 		return
 	}
 	req.Keyword = strings.TrimSpace(req.Keyword)
-	loginUID := c.GetLoginUID()
+	loginUID := h.principal(c).SubjectUID()
 
 	if !validateKeywordOptional(c, req.Keyword) {
 		return
@@ -351,10 +351,12 @@ func (h *Handler) dispatchSingleAll(c *wkhttp.Context, req SearchGlobalMessagesR
 			SentAtTo:   req.Filters.SentAtTo,
 		},
 	}
-	// Preserve authorisation shape by explicitly running checkChannelAccess
-	// here — the caller already resolved the room via the allowlist gate but
-	// the single-channel path assumes this check has already happened.
-	if !h.checkChannelAccess(c, inner.ChannelType, inner.ChannelID, loginUID) {
+	// Preserve authorisation shape by explicitly running the readable-channel
+	// gate here — the caller already resolved the room via the allowlist gate
+	// but the single-channel path assumes this check has already happened.
+	// Routed through canReadChannel so #C/#D's per-principal single-channel gate
+	// covers the global fast path too (决策九: 同一谓词).
+	if !h.canReadChannel(c, principalForSubject(c, loginUID, ""), inner.ChannelType, inner.ChannelID) {
 		return
 	}
 	// Rebuild the wire request context by rewriting BindJSON's already-

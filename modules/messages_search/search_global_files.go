@@ -45,7 +45,7 @@ func (h *Handler) searchGlobalFiles(c *wkhttp.Context) {
 		return
 	}
 	req.Keyword = strings.TrimSpace(req.Keyword)
-	loginUID := c.GetLoginUID()
+	loginUID := h.principal(c).SubjectUID()
 
 	if !validateKeywordOptional(c, req.Keyword) {
 		return
@@ -250,8 +250,9 @@ func (h *Handler) buildGlobalFileHits(ctx context.Context, hits []*elastic.Searc
 // need to apply. So instead of forwarding to h.searchFiles (which would drop
 // those), we re-scope this handler's own query to the single channel.
 func (h *Handler) dispatchSingleFiles(c *wkhttp.Context, req SearchGlobalFilesReq, target channelRef, loginUID string, pageSize int) {
-	// Access gate mirrors the single-channel path.
-	if !h.checkChannelAccess(c, target.ChannelType, target.WireID, loginUID) {
+	// Access gate mirrors the single-channel path. Routed through canReadChannel
+	// so the global fast path shares #C/#D's per-principal gate (决策九).
+	if !h.canReadChannel(c, principalForSubject(c, loginUID, ""), target.ChannelType, target.WireID) {
 		return
 	}
 	// Fast path: run the same global DSL with a scope of one channel. This

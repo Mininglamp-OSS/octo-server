@@ -27,11 +27,22 @@ func (h *Handler) auditMiddleware() wkhttp.HandlerFunc {
 		c.Next()
 		took := time.Since(start)
 
+		// 审计主体走 principal（决策十）：login_uid 记搜索主体（真人=登录 uid，as-bot=botUID，
+		// obo=grantorUID，uk=key UID）；as-user 场景再同时记 bot_uid + grantor_uid 以追溯
+		//（哪个 bot 代哪个 grantor 发起）。真人路径 bot_uid/grantor_uid 为空、字段自动省略，
+		// 日志形态与现状一致。
+		principal := h.principal(c)
 		fields := []zap.Field{
 			zap.String("path", c.FullPath()),
-			zap.String("login_uid", c.GetLoginUID()),
+			zap.String("login_uid", principal.SubjectUID()),
 			zap.Int64("took_ms", took.Milliseconds()),
 			zap.Int("status", c.Writer.Status()),
+		}
+		if botUID := principal.AuditBotUID(); botUID != "" {
+			fields = append(fields, zap.String("bot_uid", botUID))
+		}
+		if grantorUID := principal.AuditGrantorUID(); grantorUID != "" {
+			fields = append(fields, zap.String("grantor_uid", grantorUID))
 		}
 		if v, ok := c.Get(auditFieldKindKey); ok {
 			if s, _ := v.(string); s != "" {

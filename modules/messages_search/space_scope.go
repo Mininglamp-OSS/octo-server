@@ -1,10 +1,7 @@
 package messages_search
 
 import (
-	"strings"
-
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
-	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
 )
 
@@ -33,7 +30,10 @@ func (h *Handler) resolveP2PSpaceScope(c *wkhttp.Context, channelType uint8, log
 	if channelType != channelTypePerson {
 		return "", true
 	}
-	spaceID := strings.TrimSpace(spacepkg.GetSpaceID(c))
+	// spaceID 走 principal（决策十）：真人主体等价于 GetSpaceID(c)；bot 路由不挂
+	// SpaceMiddleware 故为空；uk 取 api_key_space_id。The principal is the single
+	// source so the p2p Space scope stays consistent across all four subjects.
+	spaceID := h.principal(c).SpaceID()
 	if spaceID != "" {
 		return spaceID, true
 	}
