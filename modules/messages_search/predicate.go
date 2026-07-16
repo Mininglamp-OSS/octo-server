@@ -11,10 +11,12 @@ import (
 //	canReadChannel(principal, channel)         // 单频道门对一个频道求值
 //	enumerateReadableChannels(principal)       // 全局 allowlist 枚举同一谓词
 //
-// 本层（YUJ-48）只定义接口 + dispatch，不改鉴权语义：
-//   - user / obo / uk 三类真人语义主体 → 复用现有 checkChannelAccess / buildAllowlist，
-//     仅主体 uid 由 principal.SubjectUID() 提供（obo=grantor、uk=key UID）。
-//   - as-bot 分支是 #C/#D（canReadChannel）与 #E（enumerateReadableChannels）的接线点：
+// 本层（YUJ-48）定义接口 + dispatch；各主体分支语义分文件落地：
+//   - user / uk：真人语义主体 → 复用现有 checkChannelAccess / buildAllowlist，仅主体 uid
+//     由 principal.SubjectUID() 提供（uk=key UID）。
+//   - obo：grantor 真人分支 ∩ OBO 已授 scope（YUJ-53 / #F，见 obo.go）——单频道门与
+//     allowlist 共用同一 oboChecker 谓词。
+//   - as-bot：#C/#D（canReadChannel）与 #E（enumerateReadableChannels）的接线点：
 //     #C（YUJ-50）已接线 DM 门（IsFriend，跳过 blacklist）、#D（YUJ-51）已接线群/子区门
 //     （复用 ExistMemberActive，主体=botUID）、#E（YUJ-52）已接线 global allowlist 枚举。
 
@@ -25,8 +27,11 @@ func (h *Handler) canReadChannel(c *wkhttp.Context, p Principal, channelType uin
 	switch p.Kind() {
 	case principalKindUserBot:
 		return h.botCanReadChannel(c, p, channelType, channelID)
+	case principalKindOBO:
+		// as-user(OBO)：grantor 真人分支 ∩ OBO 已授 scope（YUJ-53 / #F，见 obo.go）。
+		return h.oboCanReadChannel(c, p, channelType, channelID)
 	default:
-		// user / obo / uk：真人语义，主体 uid 各异。checkChannelAccess 内部的
+		// user / uk：真人语义，主体 uid 各异。checkChannelAccess 内部的
 		// 双向黑名单由 blacklistPolicy 决定（真人语义主体均为 bidirectional）。
 		return h.checkChannelAccess(c, channelType, channelID, p.SubjectUID())
 	}
@@ -41,6 +46,10 @@ func (h *Handler) enumerateReadableChannels(c *wkhttp.Context, p Principal) ([]c
 	switch p.Kind() {
 	case principalKindUserBot:
 		return h.botEnumerateReadableChannels(c, p)
+	case principalKindOBO:
+		// as-user(OBO)：grantor 真人可达集 ∩ OBO 已授 scope，与 oboCanReadChannel 同一
+		// 谓词（决策九，见 obo.go）。
+		return h.oboEnumerateReadableChannels(c, p)
 	default:
 		return h.buildAllowlist(c, p.SubjectUID(), p.SpaceID())
 	}

@@ -69,6 +69,13 @@ type Handler struct {
 
 	limiter *uidLimiter
 	cache   *senderCache
+	// oboCheck is the as-user(OBO) scope gate seam (YUJ-53 / #F). Nil until
+	// the bot search route (#B) injects a bot_api-backed adapter via
+	// SetOBOChecker; *bot_api.BotAPI.SearchOBOAllowed satisfies oboChecker
+	// structurally so messages_search stays decoupled from bot_api. When an
+	// obo principal reaches the gate with this nil, the gate fails closed
+	// (never degrades to un-scoped grantor search). See obo.go.
+	oboCheck oboChecker
 	// mode is the resolved OCTO_SEARCH_BACKEND posture. When mode.ESServe is
 	// false the backendGate middleware refuses every _search* request with
 	// SEARCH_DISABLED — the OS path never serves under zinc/disabled.

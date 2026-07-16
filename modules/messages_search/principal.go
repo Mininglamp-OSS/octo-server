@@ -218,8 +218,9 @@ func authenticateUserBot(c *wkhttp.Context) (Principal, error) {
 }
 
 // authenticateOBO 组装 as-user(OBO) 主体：subjectUID = grantorUID（以 grantor 身份搜、
-// 走真人分支），限流/审计仍按 botUID。grant + scope + TOCTOU 的实时权限校验是 #F 的职责
-//（复用 bot_api/obo_check.go），本构造器只从两个已校验入参组装载体。
+// 走真人分支），限流/审计仍按 botUID。grant + scope + TOCTOU 的实时权限校验在搜索热路径
+// per-channel 进行（YUJ-53 / #F，见 obo.go 的 oboCanReadChannel），因为 checkOBO 需 channel
+// 维度；本构造器只从已解析入参组装载体。
 func authenticateOBO(botUID, grantorUID, spaceID string) (Principal, error) {
 	if botUID == "" || grantorUID == "" {
 		return nil, errPrincipalUnauthenticated
@@ -233,6 +234,27 @@ func authenticateOBO(botUID, grantorUID, spaceID string) (Principal, error) {
 		grantorUID: grantorUID,
 		spaceID:    strings.TrimSpace(spaceID),
 	}, nil
+}
+
+// authenticateOBOFromContext 从 authBot() 落的 context 组装 as-user(OBO) 主体（#B 在解析
+// 请求体 on_behalf_of 后调用，grantorUID 由其传入）。相较 authenticateOBO 多两道 context
+// 侧的 fail-closed 门：
+//   - botUID 取自 "robot_id"（authBot 落）；缺失 → errPrincipalUnauthenticated。
+//   - App Bot 显式拒绝（YUJ-53 / #F 验收）：一期整体不做 App Bot，且 App Bot 拿不到 OBO
+//     grant（grant 只查 robot 表，App Bot 在 app_bot 表）。此处在主体构造阶段就 fail-closed
+//     显式拒绝，而非放行后靠 checkOBO 静默返回空——避免 App Bot 搜索被误当作"无结果"。
+//
+// spaceID 走 grantor 的 Space（spacepkg.GetSpaceID 读 space_id / X-Space-Id）；bot 路由不挂
+// SpaceMiddleware 时通常为空，P2P 分支即回退到 grantor 好友判定（安全，grantor=创建者）。
+func authenticateOBOFromContext(c *wkhttp.Context, grantorUID string) (Principal, error) {
+	botUID := ctxString(c, ctxKeyRobotID)
+	if botUID == "" {
+		return nil, errPrincipalUnauthenticated
+	}
+	if ctxString(c, ctxKeyBotKind) == botKindApp {
+		return nil, errPrincipalAppBotDenied
+	}
+	return authenticateOBO(botUID, grantorUID, spacepkg.GetSpaceID(c))
 }
 
 // authenticateUK 解析 uk_ 主体（一期正式接线，完整实现，非桩）：subjectUID = keyModel.UID，

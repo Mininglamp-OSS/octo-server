@@ -211,6 +211,34 @@ func (ba *BotAPI) checkOBO(botUID, grantor, channelID string, channelType uint8)
 	return nil
 }
 
+// SearchOBOAllowed adapts checkOBO for the messages_search as-user(OBO) search
+// gate (YUJ-53 / search-as-user). It answers the same per-channel question as
+// the send path — "may grantee bot botUID read (channelID, channelType) as
+// grantor?" — reusing the identical grant + scope + grantorCanReadChannel
+// (TOCTOU) logic, so search authorization can never diverge from send.
+//
+// It exists so messages_search can consume the OBO decision through a narrow
+// (bool, error) seam WITHOUT importing bot_api's internals or the
+// ErrOBONotAuthorized sentinel: the "existence-hidden" outcome collapses to
+// (false, nil) while genuine infra failures propagate for fail-closed
+// handling.
+//
+// Return contract for the search layer:
+//   - (true,  nil) — authorized; search may proceed as grantor.
+//   - (false, nil) — ErrOBONotAuthorized: no active grant / scope disabled /
+//     grantor lost live channel access. The caller hides existence (NOT_FOUND).
+//   - (false, err) — infra error; the caller fails closed (INTERNAL_ERROR).
+func (ba *BotAPI) SearchOBOAllowed(botUID, grantorUID, channelID string, channelType uint8) (bool, error) {
+	err := ba.checkOBO(botUID, grantorUID, channelID, channelType)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, ErrOBONotAuthorized) {
+		return false, nil
+	}
+	return false, err
+}
+
 // oboStoreOrDefault returns the test-injected oboStore if set, else the
 // production DB-backed one. Mirrors spaceQuerierOrDefault so the test seam
 // is consistent across the module.
