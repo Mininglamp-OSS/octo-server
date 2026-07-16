@@ -460,13 +460,17 @@ func (s *spaceWelcomeService) dispatch(ctx context.Context, cfg common.SpaceWelc
 // grows): backs off to pending, or fails terminally after the retry budget.
 func (s *spaceWelcomeService) preIMFailure(ctx context.Context, row *spaceWelcomeRow, class string) {
 	c, cancel := context.WithTimeout(ctx, swDBCallTimeout)
-	_, err := s.store.casPreIMFailure(c, row.ID, row.Attempts, class, s.now())
+	ok, err := s.store.casPreIMFailure(c, row.ID, row.Attempts, class, s.now())
 	cancel()
 	if err != nil {
 		s.Warn("welcome cas pre-IM failure failed", zap.Int64("delivery_id", row.ID), zap.String("error_class", class), zap.Error(err))
 		return
 	}
-	if row.Attempts+1 > swMaxPreIMAttempts {
+	// Only count a terminal failure when THIS replica actually made the
+	// transition. ok=false means a peer's sweep reclaimed the row (it may still
+	// be retried by its new owner), so counting send_failed here would
+	// over-report terminal failures in a multi-replica deployment.
+	if ok && row.Attempts+1 > swMaxPreIMAttempts {
 		s.metrics.incSendFailed()
 		s.Warn("welcome delivery failed (retry budget exhausted)", zap.Int64("delivery_id", row.ID), zap.String("error_class", class))
 	}

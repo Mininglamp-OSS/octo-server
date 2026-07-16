@@ -103,7 +103,7 @@ func (s *spaceWelcomeStore) sweepClaimed(ctx context.Context, spaceID string, no
 // (we cannot prove whether the IM call happened). Never auto-retried.
 func (s *spaceWelcomeStore) sweepDispatching(ctx context.Context, spaceID string, now time.Time) (int64, error) {
 	res, err := s.db.UpdateBySql(
-		"UPDATE "+spaceWelcomeTable+" SET status=?, error_class=?, updated_at=? "+
+		"UPDATE "+spaceWelcomeTable+" SET status=?, error_class=?, claim_owner=NULL, claim_expire_at=NULL, updated_at=? "+
 			"WHERE space_id=? AND status=? AND claim_expire_at IS NOT NULL AND claim_expire_at<=?",
 		swStatusUnknown, swErrClaimExpired, now, spaceID, swStatusDispatching, now,
 	).ExecContext(ctx)
@@ -226,6 +226,11 @@ type precheckResult struct {
 // scoped strictly to the recipient uid — the sender identity is never touched
 // here.
 func (s *spaceWelcomeStore) precheckRecipient(ctx context.Context, spaceID, uid string, isSystemBot func(string) bool) (precheckResult, error) {
+	// System-bot exclusion is the PRIMARY self-DM guard: the sender uid
+	// `notification` lives in pkg/space.SystemBots, so this drops it (and any
+	// other system bot) as a recipient. The robot=1 check below is the backstop
+	// — keep both; weakening the SystemBots map must not silently open a
+	// notification→notification self-DM.
 	if isSystemBot != nil && isSystemBot(uid) {
 		return precheckResult{eligible: false, errClass: swErrHumanFilter}, nil
 	}

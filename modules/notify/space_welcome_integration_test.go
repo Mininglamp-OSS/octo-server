@@ -247,9 +247,10 @@ func TestStore_SweepDispatching_ToUnknown(t *testing.T) {
 	require.NoError(t, err)
 	assert.EqualValues(t, 1, n)
 
-	status, _, errClass, _, _ := swRowStatus(t, ctx, id)
+	status, _, errClass, owner, _ := swRowStatus(t, ctx, id)
 	assert.Equal(t, swStatusUnknown, status)
 	assert.Equal(t, swErrClaimExpired, errClass)
+	assert.Empty(t, owner, "terminal sweep must clear claim_owner (no phantom-leased terminal rows)")
 }
 
 // A not-yet-expired lease must survive the sweep.
