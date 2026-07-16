@@ -1,6 +1,7 @@
 package incomingwebhook
 
 import (
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
@@ -9,6 +10,36 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// The card builders take the already-parsed *ev (parse unmarshals once); these
+// helpers unmarshal a JSON fixture and build, keeping the tests fixture-driven.
+func ghPushCardFrom(t *testing.T, body string) map[string]interface{} {
+	t.Helper()
+	var ev ghPushEvent
+	require.NoError(t, json.Unmarshal([]byte(body), &ev))
+	return buildGitHubPushCard(&ev, "en-US")
+}
+
+func ghIssueCommentCardFrom(t *testing.T, body string) map[string]interface{} {
+	t.Helper()
+	var ev ghIssueCommentEvent
+	require.NoError(t, json.Unmarshal([]byte(body), &ev))
+	return buildGitHubIssueCommentCard(&ev, "en-US")
+}
+
+func glPushCardFrom(t *testing.T, body string) map[string]interface{} {
+	t.Helper()
+	var ev glPushEvent
+	require.NoError(t, json.Unmarshal([]byte(body), &ev))
+	return buildGitLabPushCard(&ev, "en-US")
+}
+
+func glPipelineCardFrom(t *testing.T, body string) map[string]interface{} {
+	t.Helper()
+	var ev glPipelineEvent
+	require.NoError(t, json.Unmarshal([]byte(body), &ev))
+	return buildGitLabPipelineCard(&ev, "en-US")
+}
 
 // Card-path unit tests for the github/gitlab adapters (card-message
 // webhook-cardmsg-adapter). No DB/Redis/IM: the builders are pure translation and
@@ -61,7 +92,7 @@ func cardOpenURL(card map[string]interface{}) (url, title string) {
 func cardActionURL(card map[string]interface{}) string { u, _ := cardOpenURL(card); return u }
 
 func TestBuildGitHubPushCard(t *testing.T) {
-	body := []byte(`{
+	card := ghPushCardFrom(t, `{
 		"ref": "refs/heads/main",
 		"compare": "https://github.com/octo/repo/compare/aaaa...bbbb",
 		"commits": [
@@ -71,7 +102,6 @@ func TestBuildGitHubPushCard(t *testing.T) {
 		"repository": {"full_name": "octo/repo", "html_url": "https://github.com/octo/repo"},
 		"sender": {"login": "alice"}
 	}`)
-	card := buildGitHubPushCard(body, "en-US")
 	require.NotNil(t, card)
 	// Authoritative gate: the produced card is a valid octo/v1 card.
 	require.NoError(t, validateVCSCard(card), "server-built card must pass cardmsg.Validate")
@@ -93,7 +123,7 @@ func TestBuildGitHubPushCard(t *testing.T) {
 }
 
 func TestBuildGitLabPipelineCard_StatusColor(t *testing.T) {
-	body := []byte(`{
+	card := glPipelineCardFrom(t, `{
 		"object_attributes": {"id": 4567, "ref": "test", "status": "success", "duration": 446},
 		"user": {"username": "bob"},
 		"project": {"path_with_namespace": "grp/app", "web_url": "https://gitlab.com/grp/app"},
@@ -105,7 +135,6 @@ func TestBuildGitLabPipelineCard_StatusColor(t *testing.T) {
 			{"name": "deploy", "status": "success"}
 		]
 	}`)
-	card := buildGitLabPipelineCard(body, "en-US")
 	require.NotNil(t, card)
 	require.NoError(t, validateVCSCard(card))
 
@@ -121,7 +150,7 @@ func TestBuildGitLabPipelineCard_StatusColor(t *testing.T) {
 	assert.Equal(t, "https://gitlab.com/grp/app/-/pipelines/4567", cardActionURL(card))
 
 	// Non-terminal status → no card (degrades to text/skip upstream).
-	assert.Nil(t, buildGitLabPipelineCard([]byte(`{"object_attributes":{"status":"running"}}`), "en-US"))
+	assert.Nil(t, glPipelineCardFrom(t, `{"object_attributes":{"status":"running"}}`))
 }
 
 func TestFormatPipelineDuration(t *testing.T) {
@@ -137,13 +166,13 @@ func TestFormatPipelineDuration(t *testing.T) {
 // for BOTH github and gitlab with the same assertions.
 func TestVCSCard_TrustBoundary(t *testing.T) {
 	// A commit message that tries to inject a link + bold, and a hostile repo URL.
-	ghBody := []byte(`{
+	ghCard := ghPushCardFrom(t, `{
 		"ref": "refs/heads/main",
 		"commits": [{"id":"0badc0de","message":"[click](javascript:alert(1)) **not bold** ]break[","url":"u"}],
 		"repository": {"full_name": "a]b*c/repo", "html_url": "javascript:alert(1)"},
 		"sender": {"login": "mallory"}
 	}`)
-	glBody := []byte(`{
+	glCard := glPushCardFrom(t, `{
 		"ref": "refs/heads/main",
 		"commits": [{"id":"0badc0de","message":"[click](javascript:alert(1)) **not bold** ]break["}],
 		"user": {"name": "m]a*l"},
@@ -154,8 +183,8 @@ func TestVCSCard_TrustBoundary(t *testing.T) {
 		name string
 		card map[string]interface{}
 	}{
-		{"github", buildGitHubPushCard(ghBody, "en-US")},
-		{"gitlab", buildGitLabPushCard(glBody, "en-US")},
+		{"github", ghCard},
+		{"gitlab", glCard},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			require.NotNil(t, tc.card)
@@ -183,6 +212,54 @@ func TestVCSCard_TrustBoundary(t *testing.T) {
 	}
 }
 
+func TestNeutralizeLeadingBlockMarker(t *testing.T) {
+	// Leading bullet / ordered / thematic-break markers are neutralized.
+	assert.Equal(t, `\- rm -rf`, neutralizeLeadingBlockMarker("- rm -rf"))
+	assert.Equal(t, `\+ item`, neutralizeLeadingBlockMarker("+ item"))
+	assert.Equal(t, `\---`, neutralizeLeadingBlockMarker("---"))
+	assert.Equal(t, `1\. Deploy`, neutralizeLeadingBlockMarker("1. Deploy"))
+	assert.Equal(t, `12\. x`, neutralizeLeadingBlockMarker("12. x"))
+	// Non-markers and already-escaped leads are untouched.
+	assert.Equal(t, "alice pushed", neutralizeLeadingBlockMarker("alice pushed"))
+	assert.Equal(t, `\[x`, neutralizeLeadingBlockMarker(`\[x`))
+	assert.Equal(t, "1.5 rating", neutralizeLeadingBlockMarker("1.5 rating"), "ordered marker needs whitespace/end after the dot")
+	assert.Equal(t, "", neutralizeLeadingBlockMarker(""))
+}
+
+// TestVCSCard_ListMarkerNeutralized proves the trust-boundary defense for BLOCK
+// markdown: attacker-controlled text at a TextBlock line start (issue-comment body →
+// quote; GitLab display-name fallback → headline) cannot open a bullet/ordered list.
+func TestVCSCard_ListMarkerNeutralized(t *testing.T) {
+	t.Run("github issue_comment quote", func(t *testing.T) {
+		card := ghIssueCommentCardFrom(t, `{
+			"action":"created",
+			"issue":{"number":7,"title":"t","html_url":"h"},
+			"comment":{"html_url":"https://github.com/o/r/issues/7#c1","body":"1. Deploy approved now"},
+			"repository":{"full_name":"o/r"},"sender":{"login":"mallory"}}`)
+		require.NotNil(t, card)
+		require.NoError(t, validateVCSCard(card))
+		leaves := cardBodyText(card)
+		assert.Contains(t, leaves, `1\. Deploy approved now`, "leading ordered marker must be escaped so the quote can't become a numbered list")
+		assert.NotContains(t, leaves, "\n1. ", "no live ordered-list marker at a leaf line start")
+		// The comment content is preserved in the authoritative plain (search/quote).
+		assert.Contains(t, cardmsg.BuildPlain(card), "Deploy approved now")
+	})
+
+	t.Run("gitlab display-name headline", func(t *testing.T) {
+		// username absent → free-text user_name fallback lands at the headline line start.
+		card := glPushCardFrom(t, `{
+			"ref":"refs/heads/main",
+			"commits":[{"id":"abc1234","message":"m","url":"u"}],
+			"user_name":"- Security Team",
+			"project":{"path_with_namespace":"o/r","web_url":"https://gitlab.com/o/r"}}`)
+		require.NotNil(t, card)
+		require.NoError(t, validateVCSCard(card))
+		headline := card["body"].([]interface{})[0].(map[string]interface{})["text"].(string)
+		assert.True(t, strings.HasPrefix(headline, `\- Security Team`),
+			"a display name starting with '- ' must not open a bullet list in the headline; got %q", headline)
+	})
+}
+
 // TestVCSPushReq_Degrade covers the degrade contract: nil card or a card that fails
 // self-validation falls back to the text payload (never a card request / 400).
 func TestVCSPushReq_Degrade(t *testing.T) {
@@ -206,7 +283,7 @@ func TestVCSPushReq_Degrade(t *testing.T) {
 	})
 
 	t.Run("valid card → card path", func(t *testing.T) {
-		good := buildGitHubPushCard([]byte(`{"ref":"refs/heads/main","commits":[{"id":"abc1234","message":"m","url":"u"}],"repository":{"full_name":"o/r","html_url":"https://github.com/o/r"},"sender":{"login":"a"}}`), "en-US")
+		good := ghPushCardFrom(t, `{"ref":"refs/heads/main","commits":[{"id":"abc1234","message":"m","url":"u"}],"repository":{"full_name":"o/r","html_url":"https://github.com/o/r"},"sender":{"login":"a"}}`)
 		require.NotNil(t, good)
 		req := vcsPushReq("fallback text", good)
 		assert.Equal(t, msgTypeCard, req.MsgType)

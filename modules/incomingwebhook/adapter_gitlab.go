@@ -191,58 +191,98 @@ func parseGitLabPush(header http.Header, body []byte) (*pushPayloadReq, string, 
 		return nil, "", "no_event"
 	}
 
+	// card-message webhook-cardmsg-adapter：开关开时渲成 InteractiveCard(=17)，关闭
+	//（或卡片自校验失败）时 vcsPushReq 降级回 markdown 文本路径（文本渲染器输出不变，
+	// flag-off 字节与历史一致）。body 每事件【只反序列化一次】，文本与卡片共用同一 *ev。
+	// 与 github 适配器同一套卡片骨架 / 转义器（parity）。
+	wantCard := cardmsg.Enabled()
+	lang := ""
+	if wantCard {
+		lang = i18n.OutboundLanguage(context.Background())
+	}
 	var content string
-	var err error
+	var card map[string]interface{}
 	switch event {
 	case "Push Hook":
-		content, err = renderGitLabPush(body)
+		var ev glPushEvent
+		if err := json.Unmarshal(body, &ev); err != nil {
+			return nil, "", "json"
+		}
+		content = renderGitLabPush(&ev)
+		if content != "" && wantCard {
+			card = buildGitLabPushCard(&ev, lang)
+		}
 	case "Tag Push Hook":
-		content, err = renderGitLabTagPush(body)
+		var ev glPushEvent
+		if err := json.Unmarshal(body, &ev); err != nil {
+			return nil, "", "json"
+		}
+		content = renderGitLabTagPush(&ev)
+		if content != "" && wantCard {
+			card = buildGitLabTagPushCard(&ev, lang)
+		}
 	case "Merge Request Hook":
-		content, err = renderGitLabMergeRequest(body)
+		var ev glMergeRequestEvent
+		if err := json.Unmarshal(body, &ev); err != nil {
+			return nil, "", "json"
+		}
+		content = renderGitLabMergeRequest(&ev)
+		if content != "" && wantCard {
+			card = buildGitLabMergeRequestCard(&ev, lang)
+		}
 	case "Issue Hook":
-		content, err = renderGitLabIssue(body)
+		var ev glIssueEvent
+		if err := json.Unmarshal(body, &ev); err != nil {
+			return nil, "", "json"
+		}
+		content = renderGitLabIssue(&ev)
+		if content != "" && wantCard {
+			card = buildGitLabIssueCard(&ev, lang)
+		}
 	case "Note Hook":
-		content, err = renderGitLabNote(body)
+		var ev glNoteEvent
+		if err := json.Unmarshal(body, &ev); err != nil {
+			return nil, "", "json"
+		}
+		content = renderGitLabNote(&ev)
+		if content != "" && wantCard {
+			card = buildGitLabNoteCard(&ev, lang)
+		}
 	case "Pipeline Hook":
-		content, err = renderGitLabPipeline(body)
+		var ev glPipelineEvent
+		if err := json.Unmarshal(body, &ev); err != nil {
+			return nil, "", "json"
+		}
+		content = renderGitLabPipeline(&ev)
+		if content != "" && wantCard {
+			card = buildGitLabPipelineCard(&ev, lang)
+		}
 	default:
 		// 渲染子集之外的事件类型（Job Hook / Wiki Page Hook / ...）：通常只是订阅范围
 		// 大于我们渲染的子集，调用方无需修复 → 200 + skipped。
 		return nil, "event", ""
 	}
-	if err != nil {
-		return nil, "", "json"
-	}
 	if content == "" {
 		// 事件类型支持、但动作不在渲染子集内（MR update / pipeline running / ...）：skip。
 		return nil, "event", ""
 	}
-	// card-message webhook-cardmsg-adapter：开关开时渲成 InteractiveCard(=17)，关闭
-	//（或卡片自校验失败）时 vcsPushReq 降级回上面的 markdown 文本路径（文本渲染器原样
-	// 保留，flag-off 字节与历史一致）。与 github 适配器同一套卡片骨架 / 转义器（parity）。
-	var card map[string]interface{}
-	if cardmsg.Enabled() {
-		card = buildGitLabEventCard(event, body, i18n.OutboundLanguage(context.Background()))
-	}
 	return vcsPushReq(content, card), "", ""
 }
 
-func renderGitLabPush(body []byte) (string, error) {
-	var ev glPushEvent
-	if err := json.Unmarshal(body, &ev); err != nil {
-		return "", err
-	}
+// renderGitLabPush and its siblings render the text-path markdown from the shared
+// *ev (parseGitLabPush unmarshals once). "" means the event/action is outside the
+// rendered subset (caller treats "" as skip).
+func renderGitLabPush(ev *glPushEvent) string {
 	who := glActor(ev.UserUsername, ev.UserName)
 	ref := glShortRef(ev.Ref)
 	switch {
 	case glIsZeroSHA(ev.After):
-		return glWithRepo(fmt.Sprintf("**%s** deleted branch `%s`", who, ref), ev.Project), nil
+		return glWithRepo(fmt.Sprintf("**%s** deleted branch `%s`", who, ref), ev.Project)
 	case glIsZeroSHA(ev.Before) && len(ev.Commits) == 0:
-		return glWithRepo(fmt.Sprintf("**%s** created branch `%s`", who, ref), ev.Project), nil
+		return glWithRepo(fmt.Sprintf("**%s** created branch `%s`", who, ref), ev.Project)
 	case len(ev.Commits) == 0:
 		// 退化 ref 更新（无提交、非建/删）：渲染 "pushed 0 commit(s)" 只是噪音 → skip。
-		return "", nil
+		return ""
 	}
 
 	// n = total_commits_count，但绝不小于实际渲染的 commits 数：total 缺省(0)时回退
@@ -263,61 +303,45 @@ func renderGitLabPush(body []byte) (string, error) {
 		}
 		fmt.Fprintf(&b, "\n- [`%s`](%s) %s", glShortSHA(cm.ID), cm.URL, clipRunes(firstLine(cm.Message), 120))
 	}
-	return b.String(), nil
+	return b.String()
 }
 
-func renderGitLabTagPush(body []byte) (string, error) {
-	var ev glPushEvent
-	if err := json.Unmarshal(body, &ev); err != nil {
-		return "", err
-	}
+func renderGitLabTagPush(ev *glPushEvent) string {
 	who := glActor(ev.UserUsername, ev.UserName)
 	tag := glShortRef(ev.Ref)
 	if glIsZeroSHA(ev.After) {
-		return glWithRepo(fmt.Sprintf("**%s** deleted tag `%s`", who, tag), ev.Project), nil
+		return glWithRepo(fmt.Sprintf("**%s** deleted tag `%s`", who, tag), ev.Project)
 	}
-	return glWithRepo(fmt.Sprintf("**%s** pushed tag `%s`", who, tag), ev.Project), nil
+	return glWithRepo(fmt.Sprintf("**%s** pushed tag `%s`", who, tag), ev.Project)
 }
 
-func renderGitLabMergeRequest(body []byte) (string, error) {
-	var ev glMergeRequestEvent
-	if err := json.Unmarshal(body, &ev); err != nil {
-		return "", err
-	}
+func renderGitLabMergeRequest(ev *glMergeRequestEvent) string {
 	verb := glActionVerb(ev.ObjectAttributes.Action)
 	if verb == "" {
 		// update / approved / unapproved / ... 刷屏动作不渲染 → skip。
-		return "", nil
+		return ""
 	}
 	return glWithRepo(fmt.Sprintf("**%s** %s merge request [!%d %s](%s)",
 		glActor(ev.User.Username, ev.User.Name), verb, ev.ObjectAttributes.IID,
 		mdLinkText(ev.ObjectAttributes.Title, 200), ev.ObjectAttributes.URL),
-		ev.Project), nil
+		ev.Project)
 }
 
-func renderGitLabIssue(body []byte) (string, error) {
-	var ev glIssueEvent
-	if err := json.Unmarshal(body, &ev); err != nil {
-		return "", err
-	}
+func renderGitLabIssue(ev *glIssueEvent) string {
 	verb := glActionVerb(ev.ObjectAttributes.Action)
 	if verb == "" {
-		return "", nil
+		return ""
 	}
 	return glWithRepo(fmt.Sprintf("**%s** %s issue [#%d %s](%s)",
 		glActor(ev.User.Username, ev.User.Name), verb, ev.ObjectAttributes.IID,
 		mdLinkText(ev.ObjectAttributes.Title, 200), ev.ObjectAttributes.URL),
-		ev.Project), nil
+		ev.Project)
 }
 
-func renderGitLabNote(body []byte) (string, error) {
-	var ev glNoteEvent
-	if err := json.Unmarshal(body, &ev); err != nil {
-		return "", err
-	}
+func renderGitLabNote(ev *glNoteEvent) string {
 	if ev.ObjectAttributes.System {
 		// 系统备注（改标签/指派/状态等自动生成）：与 GitHub 只渲染人写评论一致，skip。
-		return "", nil
+		return ""
 	}
 	who := glActor(ev.User.Username, ev.User.Name)
 	url := ev.ObjectAttributes.URL
@@ -339,19 +363,15 @@ func renderGitLabNote(body []byte) (string, error) {
 	if snippet := clipRunes(oneLine(ev.ObjectAttributes.Note), 300); snippet != "" {
 		line += "\n> " + snippet
 	}
-	return line, nil
+	return line
 }
 
-func renderGitLabPipeline(body []byte) (string, error) {
-	var ev glPipelineEvent
-	if err := json.Unmarshal(body, &ev); err != nil {
-		return "", err
-	}
+func renderGitLabPipeline(ev *glPipelineEvent) string {
 	// 只渲染终态：running / pending / created / manual / skipped 都会刷屏 → skip。
 	switch ev.ObjectAttributes.Status {
 	case "success", "failed", "canceled":
 	default:
-		return "", nil
+		return ""
 	}
 	// Pipeline 是唯一自拼 URL 的事件（MR/Issue/Note 直接用 object_attributes.url 绝对
 	// 地址）。project.web_url 缺失时（白名单解析不保证字段必到）退化为不带链接的纯文本，
@@ -365,7 +385,7 @@ func renderGitLabPipeline(body []byte) (string, error) {
 		line = fmt.Sprintf("Pipeline #%d %s on `%s`",
 			ev.ObjectAttributes.ID, ev.ObjectAttributes.Status, glShortRef(ev.ObjectAttributes.Ref))
 	}
-	return glWithRepo(line, ev.Project), nil
+	return glWithRepo(line, ev.Project)
 }
 
 // glActor 优先用 username（GitLab 用户名字符集受限：[a-zA-Z0-9_.-]，进 `**X**` 粗体
@@ -434,28 +454,11 @@ func glShortSHA(sha string) string {
 // Card rendering (card-message webhook-cardmsg-adapter)
 // ============================================================
 //
-// buildGitLabEventCard mirrors the text renderers' event/action decisions but emits
+// The card builders below mirror the text renderers' event/action decisions but emit
 // an octo/v1 card object using the SAME anatomy + escaper as the github adapter
-// (adapter_card.go) — parity. Returns nil for subset-outside actions / parse errors
+// (adapter_card.go) — parity. They operate on the SAME *ev the text renderer used
+// (parseGitLabPush unmarshals once), returning nil for subset-outside actions
 // (→ degrade to text via vcsPushReq).
-
-func buildGitLabEventCard(event string, body []byte, lang string) map[string]interface{} {
-	switch event {
-	case "Push Hook":
-		return buildGitLabPushCard(body, lang)
-	case "Tag Push Hook":
-		return buildGitLabTagPushCard(body, lang)
-	case "Merge Request Hook":
-		return buildGitLabMergeRequestCard(body, lang)
-	case "Issue Hook":
-		return buildGitLabIssueCard(body, lang)
-	case "Note Hook":
-		return buildGitLabNoteCard(body, lang)
-	case "Pipeline Hook":
-		return buildGitLabPipelineCard(body, lang)
-	}
-	return nil
-}
 
 // glActorCard is glActor for the card path: username (restricted charset) or the
 // free-text display name, both escaped for a TextBlock leaf.
@@ -469,11 +472,7 @@ func glActorCard(username, name string) string {
 	return "someone"
 }
 
-func buildGitLabPushCard(body []byte, lang string) map[string]interface{} {
-	var ev glPushEvent
-	if err := json.Unmarshal(body, &ev); err != nil {
-		return nil
-	}
+func buildGitLabPushCard(ev *glPushEvent, lang string) map[string]interface{} {
 	who := glActorCard(ev.UserUsername, ev.UserName)
 	ref := cardCodeSpan(glShortRef(ev.Ref), cardRefMax)
 	d := vcsCardData{
@@ -505,11 +504,7 @@ func buildGitLabPushCard(body []byte, lang string) map[string]interface{} {
 	return d.card(lang)
 }
 
-func buildGitLabTagPushCard(body []byte, lang string) map[string]interface{} {
-	var ev glPushEvent
-	if err := json.Unmarshal(body, &ev); err != nil {
-		return nil
-	}
+func buildGitLabTagPushCard(ev *glPushEvent, lang string) map[string]interface{} {
 	who := glActorCard(ev.UserUsername, ev.UserName)
 	tag := cardCodeSpan(glShortRef(ev.Ref), cardRefMax)
 	headline := fmt.Sprintf("%s pushed tag %s", who, tag)
@@ -525,11 +520,7 @@ func buildGitLabTagPushCard(body []byte, lang string) map[string]interface{} {
 	}.card(lang)
 }
 
-func buildGitLabMergeRequestCard(body []byte, lang string) map[string]interface{} {
-	var ev glMergeRequestEvent
-	if err := json.Unmarshal(body, &ev); err != nil {
-		return nil
-	}
+func buildGitLabMergeRequestCard(ev *glMergeRequestEvent, lang string) map[string]interface{} {
 	verb := glActionVerb(ev.ObjectAttributes.Action)
 	if verb == "" {
 		return nil
@@ -544,11 +535,7 @@ func buildGitLabMergeRequestCard(body []byte, lang string) map[string]interface{
 	}.card(lang)
 }
 
-func buildGitLabIssueCard(body []byte, lang string) map[string]interface{} {
-	var ev glIssueEvent
-	if err := json.Unmarshal(body, &ev); err != nil {
-		return nil
-	}
+func buildGitLabIssueCard(ev *glIssueEvent, lang string) map[string]interface{} {
 	verb := glActionVerb(ev.ObjectAttributes.Action)
 	if verb == "" {
 		return nil
@@ -563,11 +550,7 @@ func buildGitLabIssueCard(body []byte, lang string) map[string]interface{} {
 	}.card(lang)
 }
 
-func buildGitLabNoteCard(body []byte, lang string) map[string]interface{} {
-	var ev glNoteEvent
-	if err := json.Unmarshal(body, &ev); err != nil {
-		return nil
-	}
+func buildGitLabNoteCard(ev *glNoteEvent, lang string) map[string]interface{} {
 	if ev.ObjectAttributes.System {
 		return nil
 	}
@@ -593,11 +576,7 @@ func buildGitLabNoteCard(body []byte, lang string) map[string]interface{} {
 	}.card(lang)
 }
 
-func buildGitLabPipelineCard(body []byte, lang string) map[string]interface{} {
-	var ev glPipelineEvent
-	if err := json.Unmarshal(body, &ev); err != nil {
-		return nil
-	}
+func buildGitLabPipelineCard(ev *glPipelineEvent, lang string) map[string]interface{} {
 	switch ev.ObjectAttributes.Status {
 	case "success", "failed", "canceled":
 	default:

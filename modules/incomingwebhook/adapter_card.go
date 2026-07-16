@@ -61,10 +61,44 @@ var cardMarkdownEscaper = strings.NewReplacer(
 	`|`, `\|`,
 )
 
-// escapeCardText clamps external text to max runes (single line) then escapes it for
-// safe placement in a card TextBlock leaf.
+// escapeCardText clamps external text to max runes (single line), escapes inline
+// markdown, then neutralizes a leading block marker — safe for placement at a card
+// TextBlock / Fact line start.
 func escapeCardText(s string, max int) string {
-	return cardMarkdownEscaper.Replace(clipRunes(oneLine(s), max))
+	return neutralizeLeadingBlockMarker(cardMarkdownEscaper.Replace(clipRunes(oneLine(s), max)))
+}
+
+// neutralizeLeadingBlockMarker backslash-escapes a leading markdown BLOCK marker so
+// external text placed at a TextBlock/Fact line start cannot open a bullet/ordered
+// list or a thematic break. octo-web's CardMarkdown renders ul/ol/li (and <hr>), and
+// these markers are NOT covered by cardMarkdownEscaper — it only neutralizes INLINE
+// markers (`* _ [ ] ( ) < > \` # ~ |`); the ordered `)` marker and `*`/`_` are
+// already escaped there, leaving `-`, `+`, and ordered `N.` as the injection surface
+// (e.g. a hostile issue-comment body `1. Deploy approved` forging a numbered list in
+// a trusted-webhook card). Operates on the already-inline-escaped string; a leading
+// backslash/other char is a no-op. stripMarkdown unescapes for the authoritative
+// plain, so the literal marker still shows in search/quote text.
+func neutralizeLeadingBlockMarker(s string) string {
+	if s == "" {
+		return s
+	}
+	// Bullet list markers (`- x`, `+ x`) and dash thematic breaks (`---`): a leading
+	// backslash makes the char literal and the line neither a list nor an <hr>.
+	if s[0] == '-' || s[0] == '+' {
+		return `\` + s
+	}
+	// Ordered list marker `N.` followed by whitespace/end — escape the dot. (`N)` is
+	// already neutralized because `)` is inline-escaped above.)
+	i := 0
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
+	}
+	if i > 0 && i < len(s) && s[i] == '.' {
+		if rest := s[i+1:]; rest == "" || rest[0] == ' ' || rest[0] == '\t' {
+			return s[:i] + `\.` + rest
+		}
+	}
+	return s
 }
 
 // cardCodeSpan renders an external short token (branch / tag / short SHA) as a
