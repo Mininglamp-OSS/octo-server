@@ -19,6 +19,7 @@ import (
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
+	"go.uber.org/zap"
 )
 
 const (
@@ -59,6 +60,10 @@ var cardMarkdownEscaper = strings.NewReplacer(
 	`#`, `\#`,
 	`~`, `\~`,
 	`|`, `\|`,
+	// `!` guards image syntax `![alt](url)`: cardmsg.Validate already allowlists any
+	// image destination (defence in depth), but escaping `!` stops the image node
+	// from ever forming (PR #596 review, mochashanyao nit).
+	`!`, `\!`,
 )
 
 // escapeCardText clamps external text to max runes (single line), escapes inline
@@ -198,15 +203,18 @@ func (d vcsCardData) card(lang string) map[string]interface{} {
 	if d.variant != "" {
 		metaOcto["variant"] = d.variant
 	}
-	metadata := map[string]interface{}{"octo": metaOcto}
 	card := map[string]interface{}{
 		"type":     "AdaptiveCard",
 		"version":  cardmsg.CardVersion,
-		"metadata": metadata,
+		"metadata": map[string]interface{}{"octo": metaOcto},
 		"body":     body,
 	}
+	// Navigation is the single structured Action.OpenUrl (allowlisted by both
+	// httpURLForCard and cardmsg.Validate). We deliberately do NOT also mirror the URL
+	// into metadata.webUrl: cardmsg's validator does not walk the metadata subtree, so
+	// carrying a URL there would rely on incidental coupling for the "every rendered URL
+	// was allowlisted" invariant (PR #596 review, yujiawei P2).
 	if d.url != "" {
-		metadata["webUrl"] = d.url
 		card["actions"] = []interface{}{
 			map[string]interface{}{
 				"type": "Action.OpenUrl", "title": vcsViewLabel(d.source, lang), "url": d.url,
@@ -248,8 +256,18 @@ func validateVCSCard(card map[string]interface{}) error {
 // path — flag off OR card build/validate failure). Card plain is derived by Finalize
 // from the card body, so no text seed is needed.
 func vcsPushReq(text string, card map[string]interface{}) *pushPayloadReq {
-	if card != nil && validateVCSCard(card) == nil {
-		return &pushPayloadReq{MsgType: msgTypeCard, Card: card}
+	if card != nil {
+		if err := validateVCSCard(card); err != nil {
+			// A server-built card failing self-validation is a card-builder bug (an
+			// attacker-controlled field can't reach here un-escaped). We still degrade to
+			// text so delivery is preserved, but log it so the regression is visible in
+			// production instead of silent (PR #596 review, Jerry-Xin). Response contract
+			// unchanged. zap.L() is the package-scope logger (cf. modules/cardtrust).
+			zap.L().Warn("incomingwebhook: built VCS card failed self-validation; degrading to text",
+				zap.Error(err))
+		} else {
+			return &pushPayloadReq{MsgType: msgTypeCard, Card: card}
+		}
 	}
 	return &pushPayloadReq{Content: clipRunes(text, maxContentRunes())}
 }
@@ -270,11 +288,22 @@ func pipelineLabelsFor(lang string) pipelineLabels {
 	return pipelineLabels{branch: "Branch", status: "Status", duration: "Duration", jobs: "Jobs"}
 }
 
+// maxPipelineDurationSec sanity-caps the rendered duration. GitLab's
+// object_attributes.duration is an unbounded external float64; without a cap a
+// hostile/buggy self-hosted instance sending e.g. 1e12 would render an absurd
+// "277777777h 46m" string (PR #596 review, yujiawei P2). 100h is far above any real
+// pipeline; anything larger renders as the cap.
+const maxPipelineDurationSec = 100 * 3600
+
 // formatPipelineDuration renders a pipeline elapsed time (seconds) as a compact,
-// language-neutral "1h 2m" / "3m 42s" / "42s". <= 0 (missing / null) → "".
+// language-neutral "1h 2m" / "3m 42s" / "42s". <= 0 (missing / null) → ""; values
+// above the sanity cap are clamped.
 func formatPipelineDuration(sec int) string {
 	if sec <= 0 {
 		return ""
+	}
+	if sec > maxPipelineDurationSec {
+		sec = maxPipelineDurationSec
 	}
 	h := sec / 3600
 	m := (sec % 3600) / 60

@@ -158,6 +158,55 @@ func TestFormatPipelineDuration(t *testing.T) {
 	assert.Equal(t, "42s", formatPipelineDuration(42))
 	assert.Equal(t, "7m 26s", formatPipelineDuration(446))
 	assert.Equal(t, "1h 2m", formatPipelineDuration(3720))
+	// A hostile/absurd external duration is clamped, not rendered as "277777777h …".
+	assert.Equal(t, "100h 0m", formatPipelineDuration(1_000_000_000))
+}
+
+// TestAllVCSCardBuilders_Smoke exercises every event-specific builder (the ones only
+// indirectly covered elsewhere: GitHub PR/issues/release, GitLab tag/note) so a
+// regression in any one is caught: card is non-nil, passes the authoritative
+// validator, derives non-empty plain, and carries the expected headline.
+func TestAllVCSCardBuilders_Smoke(t *testing.T) {
+	cases := []struct {
+		name     string
+		build    func(t *testing.T) map[string]interface{}
+		headline string
+	}{
+		{"gh pull_request opened", func(t *testing.T) map[string]interface{} {
+			var ev ghPullRequestEvent
+			require.NoError(t, json.Unmarshal([]byte(`{"action":"opened","pull_request":{"number":9,"title":"Add cards","html_url":"https://github.com/o/r/pull/9"},"repository":{"full_name":"o/r"},"sender":{"login":"alice"}}`), &ev))
+			return buildGitHubPullRequestCard(&ev, "en-US")
+		}, "alice opened a pull request"},
+		{"gh issues closed", func(t *testing.T) map[string]interface{} {
+			var ev ghIssuesEvent
+			require.NoError(t, json.Unmarshal([]byte(`{"action":"closed","issue":{"number":3,"title":"Bug","html_url":"https://github.com/o/r/issues/3"},"repository":{"full_name":"o/r"},"sender":{"login":"bob"}}`), &ev))
+			return buildGitHubIssuesCard(&ev, "en-US")
+		}, "bob closed an issue"},
+		{"gh release published", func(t *testing.T) map[string]interface{} {
+			var ev ghReleaseEvent
+			require.NoError(t, json.Unmarshal([]byte(`{"action":"published","release":{"tag_name":"v1.2.0","name":"v1.2.0","html_url":"https://github.com/o/r/releases/v1.2.0"},"repository":{"full_name":"o/r"},"sender":{"login":"carol"}}`), &ev))
+			return buildGitHubReleaseCard(&ev, "en-US")
+		}, "carol published a release"},
+		{"gl tag push", func(t *testing.T) map[string]interface{} {
+			var ev glPushEvent
+			require.NoError(t, json.Unmarshal([]byte(`{"ref":"refs/tags/v2.0.0","after":"abc123","user_username":"dave","project":{"path_with_namespace":"o/r","web_url":"https://gitlab.com/o/r"}}`), &ev))
+			return buildGitLabTagPushCard(&ev, "en-US")
+		}, "dave pushed tag"},
+		{"gl note on MR", func(t *testing.T) map[string]interface{} {
+			var ev glNoteEvent
+			require.NoError(t, json.Unmarshal([]byte(`{"user":{"username":"erin"},"object_attributes":{"note":"lgtm","noteable_type":"MergeRequest","url":"https://gitlab.com/o/r/-/merge_requests/5#note_1"},"merge_request":{"iid":5,"title":"Refactor"},"project":{"path_with_namespace":"o/r","web_url":"https://gitlab.com/o/r"}}`), &ev))
+			return buildGitLabNoteCard(&ev, "en-US")
+		}, "erin commented"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			card := c.build(t)
+			require.NotNil(t, card)
+			require.NoError(t, validateVCSCard(card), "server-built card must pass cardmsg.Validate")
+			assert.NotEmpty(t, cardmsg.BuildPlain(card))
+			assert.Contains(t, cardBodyText(card), c.headline)
+		})
+	}
 }
 
 // TestVCSCard_TrustBoundary is the parity gate: a hostile actor / title / commit
