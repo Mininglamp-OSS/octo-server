@@ -380,6 +380,41 @@ func TestVCSParse_FlagGate(t *testing.T) {
 	})
 }
 
+// TestBuildCardPayload_AdapterEnvelope locks the full production envelope path: an
+// adapter-produced req.Card fed through buildCardPayload must yield a type-17 payload
+// with server-pinned card_version/profile, a from.kind=webhook identity carrying the
+// webhook_id + configured name, the server-derived space_id, and a non-placeholder
+// authoritative plain derived by Finalize (PR #596 review, Jerry-Xin).
+func TestBuildCardPayload_AdapterEnvelope(t *testing.T) {
+	t.Setenv(cardmsg.EnvEnabled, "1")
+	card := ghPushCardFrom(t, `{
+		"ref":"refs/heads/main",
+		"commits":[{"id":"abc1234","message":"fix: guard nil","url":"https://github.com/o/r/commit/abc1234"}],
+		"repository":{"full_name":"o/r","html_url":"https://github.com/o/r"},
+		"sender":{"login":"alice"}}`)
+	require.NotNil(t, card)
+
+	m := &incomingWebhookModel{WebhookID: "iwh_abc", SpaceID: "sp_1", Name: "CI Bot"}
+	payload, err := buildCardPayload(m, &pushPayloadReq{MsgType: msgTypeCard, Card: card}, false)
+	require.NoError(t, err)
+
+	assert.Equal(t, cardmsg.InteractiveCard.Int(), payload["type"])
+	assert.Equal(t, cardmsg.CardVersion, payload["card_version"])
+	assert.Equal(t, cardmsg.ProfileV1, payload["profile"])
+	assert.Equal(t, "sp_1", payload["space_id"], "space_id is server-derived from the webhook row")
+
+	from, _ := payload["from"].(map[string]interface{})
+	require.NotNil(t, from)
+	assert.Equal(t, extraKindValue, from["kind"])
+	assert.Equal(t, "iwh_abc", from["webhook_id"])
+	assert.Equal(t, "CI Bot", from["name"])
+
+	plain, _ := payload["plain"].(string)
+	assert.NotEmpty(t, plain, "Finalize derives an authoritative plain")
+	assert.NotEqual(t, cardmsg.PlaceholderCard, plain, "plain comes from the card body, not the [卡片] fallback")
+	assert.Contains(t, plain, "pushed")
+}
+
 func TestVCSViewLabel(t *testing.T) {
 	assert.Equal(t, "View on GitHub", vcsViewLabel(cardSourceGitHub, "en-US"))
 	assert.Equal(t, "在 GitHub 查看", vcsViewLabel(cardSourceGitHub, "zh-CN"))
