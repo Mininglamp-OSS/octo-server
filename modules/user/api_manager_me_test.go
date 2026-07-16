@@ -22,10 +22,10 @@ func TestManagerCapabilities(t *testing.T) {
 
 	superOnly := []string{
 		"system_setting", "backup", "appversion.write", "dashboard.trigger", "space.destructive",
-		"users.write", "users.manage_admin", "groups.write", "mcp.write",
+		"users.write", "users.manage_admin", "groups.write", "mcp.write", "mcp.read",
 	}
 	adminTier := []string{
-		"appversion.read", "dashboard.read", "users.read", "groups.read", "space.read", "space.write", "mcp.read",
+		"appversion.read", "dashboard.read", "users.read", "groups.read", "space.read", "space.write",
 	}
 
 	for _, k := range superOnly {
@@ -115,11 +115,11 @@ func TestManagerMe_AdminGetsReadCapsNotWrite(t *testing.T) {
 	assert.True(t, resp.Capabilities["users.read"], "admin should have users.read")
 	assert.True(t, resp.Capabilities["groups.read"], "admin should have groups.read")
 	assert.True(t, resp.Capabilities["space.write"], "admin should have space.write (admin-allowed space writes)")
-	assert.True(t, resp.Capabilities["mcp.read"], "admin should have mcp.read (view system MCP catalog)")
 	assert.False(t, resp.Capabilities["users.write"], "admin must NOT have users.write")
 	assert.False(t, resp.Capabilities["users.manage_admin"], "admin must NOT have users.manage_admin")
 	assert.False(t, resp.Capabilities["groups.write"], "admin must NOT have groups.write")
 	assert.False(t, resp.Capabilities["space.destructive"], "admin must NOT have space.destructive")
+	assert.False(t, resp.Capabilities["mcp.read"], "admin must NOT have mcp.read (system MCP list/detail is superAdmin-only)")
 	assert.False(t, resp.Capabilities["mcp.write"], "admin must NOT have mcp.write (system MCP create/edit/delete)")
 	assert.False(t, resp.Capabilities["system_setting"], "admin must NOT have system_setting")
 }

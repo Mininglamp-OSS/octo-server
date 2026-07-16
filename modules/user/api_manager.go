@@ -129,7 +129,7 @@ func (m *Manager) me(c *wkhttp.Context) {
 //   - space.read        = 空间/成员/邀请/入群申请 列表查询（requireAdmin）
 //   - space.write       = 建空间/改资料/加成员/邀请增改禁用/通过拒绝入群申请（requireAdmin，故恒 true）
 //   - space.destructive = 强制解散/封禁/强制移除/改成员角色（requireSuperAdmin）
-//   - mcp.read          = 系统 MCP 列表/详情查看（admin ∪ superAdmin，恒 true）
+//   - mcp.read          = 系统 MCP 列表/详情查看（requireSuperAdmin）
 //   - mcp.write         = 系统 MCP 创建/编辑/删除（requireSuperAdmin）
 //
 // TODO(#366 Part 2): 目前这张表按各端点当前档位手工维护；集中式 authz 策略表落地
@@ -145,7 +145,8 @@ func managerCapabilities(isSuper bool) map[string]bool {
 		"users.write":        isSuper, // 重置密码 / 新增用户 / 解封 / 改密
 		"users.manage_admin": isSuper, // 管理员账号 增/查/删
 		"groups.write":       isSuper, // 解散封禁群 / 强制移除成员
-		"mcp.write":          isSuper, // 系统 MCP 创建/编辑/删除（marketplace admin surface）
+		"mcp.read":           isSuper, // 系统 MCP 列表/详情（marketplace admin surface 只认共享 X-Admin-Token 不分 role，此处收窄到超管以缩小页面暴露面）
+		"mcp.write":          isSuper, // 系统 MCP 创建/编辑/删除（同上）
 		// admin ∪ superAdmin（此处恒 true，列出供前端统一读取）
 		"appversion.read": true, // 版本列表
 		"dashboard.read":  true, // 运营看板查看
@@ -153,7 +154,6 @@ func managerCapabilities(isSuper bool) map[string]bool {
 		"groups.read":     true, // 群组列表 / 禁用群 / 群成员 / 群黑名单
 		"space.read":      true, // 空间查看 / 列表
 		"space.write":     true, // 建空间 / 改资料 / 加成员 / 邀请增改禁用 / 通过拒绝入群申请（requireAdmin）
-		"mcp.read":        true, // 系统 MCP 列表 / 详情（octo-admin SystemMcp 页面入口）
 	}
 }
 
