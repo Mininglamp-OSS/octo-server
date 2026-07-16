@@ -56,6 +56,13 @@ func TestBuildApprovalRequestCardCustomActionsRenderServerBuiltButtons(t *testin
 		if want, _ := strings.CutPrefix(id, "approval-"); decision != want {
 			t.Fatalf("decision on %s = %q, want %q", id, decision, want)
 		}
+		// Custom actions carry no ActionStyle: the server only assigns
+		// positive/destructive to the built-in approve/deny pair, which have
+		// inherent semantics. Pin the invariant so a future permissive binding
+		// (e.g. map[string]interface{}) can't silently let a caller inject style.
+		if _, hasStyle := action["style"]; hasStyle {
+			t.Fatalf("custom action %s must not carry a style key: %+v", id, action)
+		}
 	}
 	if len(want) != 0 {
 		t.Fatalf("missing actions in output: %+v", want)
