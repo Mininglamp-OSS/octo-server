@@ -15,6 +15,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/botfather/cmdmenu"
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/messages_search"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/botutil"
@@ -39,6 +40,11 @@ type BotFather struct {
 	robotEventPrefix string
 	initOnce         sync.Once
 	msgSem           chan struct{} // 限制并发消息处理的信号量
+	// searchHandler 是共享的消息搜索 Handler（messages_search.Shared）。uk 搜索路由
+	// /v1/user/messages/_search* 复用它（YUJ-49 / #B，决策十正式接线）：authUserAPIKey
+	// 鉴权、principal=uk（subjectUID=keyModel.UID，spaceID=api_key_space_id）。与 web、
+	// bot 入口共用同一实例，共享限流桶与 sender 缓存。
+	searchHandler *messages_search.Handler
 	log.Log
 }
 
@@ -57,6 +63,7 @@ func New(ctx *config.Context) *BotFather {
 		threadService:    thread.NewService(ctx),
 		robotEventPrefix: "robotEvent:",
 		msgSem:           make(chan struct{}, 100),
+		searchHandler:    messages_search.Shared(ctx),
 		Log:              log.NewTLog("BotFather"),
 	}
 
@@ -94,6 +101,10 @@ func (bf *BotFather) Route(r *wkhttp.WKHttp) {
 
 	// User Bot API 端点（使用User API Key认证）
 	bf.setupUserAPIRoutes(r)
+
+	// 消息搜索（YUJ-49 / #B，决策十正式接线）：/v1/user/messages/_search*，
+	// authUserAPIKey 鉴权，principal=uk（直接真人身份）。实现在 search_route.go。
+	bf.mountSearchRoutes(r)
 
 	// Robot Apply API 端点（使用用户认证）
 	bf.setupApplyRoutes(r)

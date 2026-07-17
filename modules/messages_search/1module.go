@@ -15,7 +15,9 @@ func init() {
 		return register.Module{
 			Name: "messages_search",
 			SetupAPI: func() register.APIRouter {
-				return New(ctx.(*config.Context))
+				// Shared 单例：web / bot / uk 三条路由树共用同一 Handler（YUJ-49），
+				// 共享限流桶与 sender 缓存。bot_api / botfather 也经 Shared 取同一实例。
+				return Shared(ctx.(*config.Context))
 			},
 			Swagger: swaggerContent,
 		}

@@ -12,6 +12,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/messages_search"
 	"github.com/Mininglamp-OSS/octo-server/modules/robot"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
@@ -137,6 +138,11 @@ type BotAPI struct {
 	// full user-service stack.
 	// nil in production → the real userService.IsFriend runs.
 	friendCheckOverride func(uid, toUID string) (bool, error)
+	// searchHandler 是共享的消息搜索 Handler（messages_search.Shared），bot 搜索路由
+	// /v1/bot/messages/_search* 复用它（YUJ-49 / #B）。与 web、uk 入口共用同一实例，
+	// 从而共享限流桶与 sender 缓存。principal 由本模块的 resolveSearchPrincipal 按
+	// on_behalf_of 区分 as-bot / as-user(OBO)。
+	searchHandler *messages_search.Handler
 	log.Log
 }
 
@@ -197,6 +203,7 @@ func NewBotAPI(ctx *config.Context) *BotAPI {
 		maxVoiceContextLength: maxCtxLen,
 		maxBodySize:           maxBodySize,
 		maxFileSize:           maxFileSize,
+		searchHandler:         messages_search.Shared(ctx),
 		Log:                   log.NewTLog("BotAPI"),
 	}
 	// YUJ-1166 / Mininglamp-OSS/octo-server#81 — Persona Clone fan-out.
@@ -287,6 +294,10 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 	// 群入站 Webhook 管理（bot token 面），与用户路由共用 incomingwebhook 实例与
 	// 权限矩阵（管理员 bot 同权人类管理员）。实现在 incoming_webhook.go。
 	ba.registerIncomingWebhookRoutes(r)
+
+	// 消息搜索（YUJ-49 / #B）：/v1/bot/messages/_search*，authBot 鉴权，principal 由
+	// on_behalf_of 区分 as-bot / as-user(OBO)。实现在 search_route.go。
+	ba.mountSearchRoutes(r)
 }
 
 // ==================== Helper Functions ====================
