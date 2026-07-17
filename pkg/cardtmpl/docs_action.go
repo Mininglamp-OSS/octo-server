@@ -25,7 +25,13 @@ const (
 
 	maxActorRunes     = 120
 	maxTimestampRunes = 80
-	maxReasonRunes    = MaxExcerptRunes
+	// maxReasonRunes bounds the reason text rendered on the card and the hidden
+	// input's maxLength hint. Note this is independent of the server-side submit
+	// enforcement boundary: cardmsg.ValidateInputs caps a submitted deny_reason by
+	// cardmsg.MaxInputTextBytes (4 KiB, byte-based), not by this rune count — a
+	// client that ignores maxLength can still submit up to that byte cap, and the
+	// display path re-truncates to this bound. Keep the two limits in mind separately.
+	maxReasonRunes = MaxExcerptRunes
 )
 
 type ApprovalActions struct {
@@ -140,8 +146,11 @@ func BuildDocsAccessRequestCard(
 		// render "<actor> will not get access to <title>". They are not the reason
 		// channel (that is the declared deny_reason input) and the server still
 		// re-extracts data from the stored frame — a client copy is never trusted.
+		// Bound both to the same caps the render paths use so the persisted frame /
+		// wire payload can't grow unbounded (Title is already validated <= maxTitleRunes
+		// at entry; Actor is only display-truncated in the helpers, so bound it here).
 		"doc_title": content.Title,
-		"actor":     content.Actor,
+		"actor":     truncateRunes(strings.TrimSpace(content.Actor), maxActorRunes),
 	}
 	approveData := copyActionData(baseData)
 	approveData["decision"] = "approve"
@@ -277,11 +286,18 @@ func docsBanner(actor, suffix string) map[string]interface{} {
 			"size": "Medium", "isSubtle": true, "wrap": true, "spacing": "Default",
 		}
 	}
+	// TextRun renders its text as literal plain text (no markdown surface — see
+	// pkg/cardmsg/validate.go "TextRun 不渲染 markdown" and plain.go), so it must NOT
+	// be escapeMarkdown'd: escaping here would show literal backslashes for actors
+	// with markdown metachars (e.g. "Wang (FE)" → "Wang \(FE\)"). Values are still
+	// truncateRunes-bounded above, and TextRun carries no link/URL surface, so raw
+	// text cannot inject markup. (The anonymous branch above uses a TextBlock, which
+	// DOES render markdown, so its escapeMarkdown is correct and stays.)
 	return map[string]interface{}{
 		"type": "RichTextBlock", "spacing": "Default",
 		"inlines": []interface{}{
-			map[string]interface{}{"type": "TextRun", "text": escapeMarkdown(actor + " "), "size": "Medium", "weight": "Bolder"},
-			map[string]interface{}{"type": "TextRun", "text": escapeMarkdown(suffix), "size": "Medium", "isSubtle": true},
+			map[string]interface{}{"type": "TextRun", "text": actor + " ", "size": "Medium", "weight": "Bolder"},
+			map[string]interface{}{"type": "TextRun", "text": suffix, "size": "Medium", "isSubtle": true},
 		},
 	}
 }

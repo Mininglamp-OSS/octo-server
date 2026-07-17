@@ -243,6 +243,79 @@ func anyTextContains(nodes []map[string]interface{}, want string) bool {
 	return false
 }
 
+func TestBuildDocsAccessRequestCardBannerTextRunNotEscaped(t *testing.T) {
+	// TextRun renders literal text (no markdown surface), so the bold-actor banner
+	// must NOT be backslash-escaped — otherwise "Wang (FE)" shows as "Wang \(FE\)".
+	c := exampleDocsApprovalContent()
+	c.Actor = "Wang (FE)_lead"
+	c.BannerSuffix = "requested access."
+	doc, err := BuildDocsAccessRequestCard(
+		localizedContext("en-US"), "https://im.example.com/login", "d", "r", "s", c,
+		ApprovalActions{ApproveTitle: "Allow", DenyTitle: "Deny"},
+	)
+	require.NoError(t, err)
+	nodes := flattenCardNodes(mustCardMap(t, doc)["body"])
+	runs := nodesOfType(nodes, "TextRun")
+	require.NotEmpty(t, runs, "enriched banner should use RichTextBlock TextRun inlines")
+	rawActor := false
+	for _, r := range runs {
+		s, _ := r["text"].(string)
+		if strings.Contains(s, `\(`) || strings.Contains(s, `\_`) {
+			t.Fatalf("banner TextRun must not be markdown-escaped: %q", s)
+		}
+		if strings.Contains(s, "Wang (FE)_lead") {
+			rawActor = true
+		}
+	}
+	assert.True(t, rawActor, "banner TextRun should carry the raw (unescaped) actor")
+	// The requester-row name is a TextBlock (markdown-rendered) and MUST stay escaped.
+	assert.True(t, anyTextContains(nodes, `Wang \(FE\)\_lead`), "requester-row TextBlock actor stays escaped")
+}
+
+func TestBuildDocsAccessRequestCardAnonymous(t *testing.T) {
+	c := exampleDocsApprovalContent()
+	c.Actor = ""
+	c.ActorAvatar = ""
+	c.BannerSuffix = "Someone requested access to this document."
+	doc, err := BuildDocsAccessRequestCard(
+		localizedContext("en-US"), "https://im.example.com/login", "d", "r", "s", c,
+		ApprovalActions{ApproveTitle: "Allow", DenyTitle: "Deny"},
+	)
+	require.NoError(t, err)
+	card := mustCardMap(t, doc)
+	nodes := flattenCardNodes(card["body"])
+	// Anonymous: subject-less banner is a plain TextBlock (no TextRun inlines) and
+	// there is no requester row (no avatar Image).
+	assert.Empty(t, nodesOfType(nodes, "TextRun"), "anonymous banner must not use TextRun inlines")
+	assert.Empty(t, nodesOfType(nodes, "Image"), "anonymous request has no avatar row")
+	assert.True(t, cardHasText(nodes, "Someone requested access to this document."))
+	require.NoError(t, cardmsg.Validate(map[string]interface{}{
+		"type": cardmsg.InteractiveCard.Int(), "card_version": cardmsg.CardVersion,
+		"profile": cardmsg.ProfileV2, "card": card,
+	}))
+}
+
+func TestBuildDocsAccessRequestCardBoundsActorInData(t *testing.T) {
+	c := exampleDocsApprovalContent()
+	c.Actor = strings.Repeat("名", maxActorRunes+50)
+	doc, err := BuildDocsAccessRequestCard(
+		localizedContext("zh-CN"), "https://im.example.com/login", "d", "r", "s", c,
+		ApprovalActions{ApproveTitle: "允许", DenyTitle: "拒绝"},
+	)
+	require.NoError(t, err)
+	actions := mustCardMap(t, doc)["actions"].([]interface{})
+	for _, a := range actions {
+		m := a.(map[string]interface{})
+		data, ok := m["data"].(map[string]interface{})
+		if !ok {
+			continue // Action.OpenUrl has no data
+		}
+		actorInData, _ := data["actor"].(string)
+		assert.LessOrEqual(t, len([]rune(actorInData)), maxActorRunes,
+			"data.actor must be bounded to maxActorRunes")
+	}
+}
+
 func TestBuildDocsApprovalOutcomeCard(t *testing.T) {
 	base := "https://im.example.com/login"
 
