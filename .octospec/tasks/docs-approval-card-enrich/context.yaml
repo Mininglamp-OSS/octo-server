@@ -1,0 +1,31 @@
+slug: docs-approval-card-enrich
+rules_injected:
+  - id: trust-boundary
+    load_bearing: true
+    why: card renders caller-supplied strings (actor name, title, reason, deny_reason) and an avatar URL; escape leaf text + https-validate URL destinations.
+  - id: error-handling
+    load_bearing: true
+    why: modules/notify + new i18n labels; no new errcode (labels are template-local); run i18n gates.
+  - id: space-isolation
+    load_bearing: true
+    why: docs card delivery path enforces member verification + space_id envelope; enrichment must stay body-only, no isolation change.
+  - id: testing
+    load_bearing: false
+    why: add pkg/cardtmpl (pure) + modules/notify tests.
+  - id: commit-style
+    load_bearing: false
+    why: conventional commits, English.
+key_files:
+  server:
+    - pkg/cardtmpl/docs_action.go        # pending card builder (rewrite → enriched)
+    - pkg/cardtmpl/resource.go           # escapeMarkdown / requireHTTPS helpers (reuse)
+    - modules/notify/card.go             # buildDocsAccessRequestCard producer + docsLabels
+    - modules/notify/model.go            # DocsCardFields (+ ActorAvatarURL)
+    - modules/notify/action_finalizer.go # terminal card rebuild (+ deny_reason)
+  web:
+    - packages/dmworkbase/src/Messages/InteractiveCard/InteractiveCardCell.tsx  # deny interception
+    - packages/dmworkbase/src/Messages/InteractiveCard/cardAction.ts            # submit inputs
+decisions:
+  - deny reason rides in a declared hidden Input.Text id=deny_reason (server ValidateInputs requires declared).
+  - avatar via additive optional actor_avatar_url (https-only), rendered only when present.
+  - terminal card constrained to header+title+result box (finalizer lacks actor/timestamp).

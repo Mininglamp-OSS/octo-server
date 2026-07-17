@@ -10,6 +10,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/internal/cardactiondispatch"
 	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 )
 
 type captureCardMutator struct {
@@ -87,6 +88,53 @@ func TestDocsActionFinalizerUsesEventIDAsCardSeqAndNotifiesRequester(t *testing.
 	}
 	if len(mutator.requests) != 2 || mutator.requests[0].ContentEdit != mutator.requests[1].ContentEdit {
 		t.Fatal("replay did not produce a byte-identical deterministic terminal frame")
+	}
+}
+
+func TestDocsActionFinalizerEnrichedTerminalAndDenyReason(t *testing.T) {
+	wk := newWuKongServer()
+	defer wk.close()
+	ctx := newTestContext(t, wk)
+	ctx.GetConfig().External.WebLoginURL = "https://im.example.com/login"
+
+	build := func(state cardactiondispatch.State, inputs map[string]interface{}) string {
+		mutator := &captureCardMutator{}
+		finalizer, err := NewDocsActionFinalizer(ctx, mutator, &capturingCardSender{})
+		if err != nil {
+			t.Fatalf("NewDocsActionFinalizer() error = %v", err)
+		}
+		event := cardactiondispatch.Event{
+			EventID: 7, SenderUID: NotifyBotUIDValue, Owner: "docs", ActionType: "access_request.decision",
+			MessageID: "1001", ChannelID: NotifyBotUIDValue, ChannelType: 1, SpaceID: "space-1",
+			OperatorUID: "user-b",
+			Data:        map[string]interface{}{"doc_id": "doc-1", "request_id": "request-1"},
+			Inputs:      inputs,
+		}
+		result := cardactiondispatch.DecisionResult{
+			Disposition: cardactiondispatch.DispositionApplied, State: state,
+			RequesterUID: "user-a", Display: map[string]string{"title": "Roadmap"},
+		}
+		if err := finalizer.Finalize(context.Background(), event, result); err != nil {
+			t.Fatalf("Finalize() error = %v", err)
+		}
+		if len(mutator.requests) != 1 {
+			t.Fatalf("mutation count = %d, want 1", len(mutator.requests))
+		}
+		return mutator.requests[0].ContentEdit
+	}
+
+	approved := build(cardactiondispatch.StateApproved, nil)
+	if !strings.Contains(approved, "已允许") || !strings.Contains(approved, "申请人已获得所申请的文档权限。") {
+		t.Fatalf("approved terminal card missing enriched result box: %s", approved)
+	}
+
+	// The reviewer deny reason rides in via event.Inputs and is surfaced on the
+	// denied terminal card.
+	denied := build(cardactiondispatch.StateDenied, map[string]interface{}{
+		cardtmpl.DocsDenyReasonInputID: "范围不符，请缩小到 Q3",
+	})
+	if !strings.Contains(denied, "已拒绝") || !strings.Contains(denied, "范围不符，请缩小到 Q3") {
+		t.Fatalf("denied terminal card missing status or reason: %s", denied)
 	}
 }
 

@@ -443,27 +443,30 @@ func (n *Notify) buildDocsCard(ctx context.Context, spaceID string, card *DocsCa
 
 func (n *Notify) buildDocsAccessRequestCard(ctx context.Context, spaceID string, card *DocsCardFields, lang string) (json.RawMessage, error) {
 	labels := docsLabelsFor(lang)
-	facts := make([]cardtmpl.Fact, 0, 2)
-	if actor := strings.TrimSpace(card.ActorName); actor != "" {
-		facts = append(facts, cardtmpl.Fact{Title: labels.actor, Value: actor})
+	actor := strings.TrimSpace(card.ActorName)
+	bannerSuffix := labels.requestBannerSuffix
+	if actor == "" {
+		bannerSuffix = labels.requestBannerAnon
 	}
-	if ts := strings.TrimSpace(card.UpdatedAt); ts != "" {
-		facts = append(facts, cardtmpl.Fact{Title: labels.updatedAt, Value: ts})
-	}
-	attribution, variant := docsAttributionAndVariant(card.Kind, card.ActorName, labels)
 	return cardtmpl.BuildDocsAccessRequestCard(
 		ctx,
 		n.ctx.GetConfig().External.WebLoginURL,
 		card.DocID,
 		card.RequestID,
 		spaceID,
-		cardtmpl.ResourceCard{
-			Title:       card.Title,
-			Attribution: attribution,
-			Excerpt:     strings.TrimSpace(card.Excerpt),
-			Facts:       facts,
-			Variant:     variant,
-			Source:      cardtmpl.Source{Label: labels.sourceLabel},
+		cardtmpl.DocsApprovalContent{
+			Title:        card.Title,
+			Actor:        actor,
+			ActorAvatar:  strings.TrimSpace(card.ActorAvatarURL),
+			Timestamp:    strings.TrimSpace(card.UpdatedAt),
+			Reason:       strings.TrimSpace(card.Excerpt),
+			Variant:      "docs.access_requested",
+			Source:       cardtmpl.Source{Label: labels.sourceLabel},
+			HeaderLabel:  labels.approvalHeader,
+			StatusLabel:  labels.pendingStatus,
+			BannerSuffix: bannerSuffix,
+			RoleLabel:    labels.roleRequester,
+			ReasonLabel:  labels.reasonLabel,
 		},
 		cardtmpl.ApprovalActions{ApproveTitle: labels.approve, DenyTitle: labels.deny},
 	)
@@ -558,6 +561,18 @@ type docsLabels struct {
 	updatedAt                 string
 	kvSep                     string
 	sourceLabel               string // ResourceCard.Source.Label — "文档" / "Docs"
+	// Enriched access-request / outcome card copy (docs-approval-card-enrich).
+	approvalHeader      string // header label — "文档申请" / "Document access"
+	pendingStatus       string // "待你处理" / "Pending"
+	approvedStatus      string // "已允许" / "Approved"
+	deniedStatus        string // "已拒绝" / "Denied"
+	requestBannerSuffix string // subtle sentence after the bold actor
+	requestBannerAnon   string // subject-less banner when actor is unknown
+	roleRequester       string // "申请人" / "Requester"
+	reasonLabel         string // "申请原因" / "Reason"
+	denyReasonLabel     string // "拒绝原因" / "Reason for denial"
+	approvedResult      string // result-box copy on approval
+	deniedResult        string // result-box copy on denial
 }
 
 func docsLabelsFor(lang string) docsLabels {
@@ -580,6 +595,17 @@ func docsLabelsFor(lang string) docsLabels {
 			updatedAt:                 "时间",
 			kvSep:                     "：",
 			sourceLabel:               "文档",
+			approvalHeader:            "文档申请",
+			pendingStatus:             "待你处理",
+			approvedStatus:            "已允许",
+			deniedStatus:              "已拒绝",
+			requestBannerSuffix:       "申请成为此文档的查看者。",
+			requestBannerAnon:         "有人申请成为此文档的查看者。",
+			roleRequester:             "申请人",
+			reasonLabel:               "申请原因",
+			denyReasonLabel:           "拒绝原因",
+			approvedResult:            "申请人已获得所申请的文档权限。",
+			deniedResult:              "申请已被拒绝。",
 		}
 	}
 	return docsLabels{
@@ -600,6 +626,17 @@ func docsLabelsFor(lang string) docsLabels {
 		updatedAt:                 "At",
 		kvSep:                     ": ",
 		sourceLabel:               "Docs",
+		approvalHeader:            "Document access",
+		pendingStatus:             "Pending",
+		approvedStatus:            "Approved",
+		deniedStatus:              "Denied",
+		requestBannerSuffix:       "is requesting viewer access to this document.",
+		requestBannerAnon:         "Someone is requesting viewer access to this document.",
+		roleRequester:             "Requester",
+		reasonLabel:               "Reason",
+		denyReasonLabel:           "Reason for denial",
+		approvedResult:            "The requester now has the requested document access.",
+		deniedResult:              "The access request was denied.",
 	}
 }
 

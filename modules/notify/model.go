@@ -76,8 +76,14 @@ type DocsCardFields struct {
 	Kind      string `json:"kind"`       // "shared" | "commented" | "access_requested"
 	Title     string `json:"title"`      // document title
 	ActorName string `json:"actor_name"` // pre-resolved actor display name; empty allowed
-	Excerpt   string `json:"excerpt"`    // optional preview / comment / access reason
-	UpdatedAt string `json:"updated_at"` // pre-formatted timestamp; empty allowed
+	// ActorAvatarURL is an optional absolute https avatar for the requester,
+	// surfaced on the access-request approval card. Additive & backward
+	// compatible: empty (or omitted) renders no avatar; a non-https value fails
+	// the card build (same positive allowlist as any rendered image URL). The
+	// docs backend owns population; octo-server does not resolve it.
+	ActorAvatarURL string `json:"actor_avatar_url"`
+	Excerpt        string `json:"excerpt"`    // optional preview / comment / access reason
+	UpdatedAt      string `json:"updated_at"` // pre-formatted timestamp; empty allowed
 }
 
 // Docs card notification kinds.

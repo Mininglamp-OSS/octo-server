@@ -4,6 +4,16 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-17 (docs-approval-card-enrich)
+
+- **Feature** — Enriched the docs access-request approval card (header + colored
+  status, big title, requester row with optional avatar, boxed reason) across
+  pending + terminal states, and added a reviewer deny-reason dialog whose value
+  rides a declared hidden `deny_reason` input through
+  `DecisionRequest.Inputs` to the docs backend. Additive optional
+  `DocsCardFields.actor_avatar_url` (https-validated). Cross-repo (octo-web deny
+  dialog). See [journal](journal/shared/docs-approval-card-enrich.md).
+
 ## 2026-07-16 (space-new-user-welcome-message)
 
 - **Feature** — At-most-once Space welcome DM from the `notification` bot on a
