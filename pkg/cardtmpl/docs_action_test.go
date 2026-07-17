@@ -133,6 +133,36 @@ func cardHasText(nodes []map[string]interface{}, want string) bool {
 	return false
 }
 
+// TestDocsAccessRequestCardDenyReasonSubmitContract closes the load-bearing seam
+// of the reason channel without infra: the enriched card declares the deny_reason
+// input, so the real card/action inputs validator (cardmsg.ValidateInputs)
+// accepts a submitted inputs[deny_reason] and fail-closes on undeclared keys.
+func TestDocsAccessRequestCardDenyReasonSubmitContract(t *testing.T) {
+	document, err := BuildDocsAccessRequestCard(
+		localizedContext("zh-CN"), "https://im.example.com/login", "doc-1", "request-1", "space-1",
+		exampleDocsApprovalContent(), ApprovalActions{ApproveTitle: "允许", DenyTitle: "拒绝"},
+	)
+	require.NoError(t, err)
+	var card map[string]interface{}
+	require.NoError(t, json.Unmarshal(document, &card))
+	envelope, err := json.Marshal(map[string]interface{}{"card": card})
+	require.NoError(t, err)
+
+	// The reviewer reason submits under the declared deny_reason input → accepted.
+	require.NoError(t, cardmsg.ValidateInputs(envelope, map[string]interface{}{
+		DocsDenyReasonInputID: "范围不符，请对齐后再申请",
+	}))
+	// Empty reason is a valid shape (the server does not enforce isRequired; the
+	// dialog does). Approve submits deny_reason:"" harmlessly.
+	require.NoError(t, cardmsg.ValidateInputs(envelope, map[string]interface{}{
+		DocsDenyReasonInputID: "",
+	}))
+	// An undeclared input is rejected fail-closed — a forged key can't ride along.
+	require.Error(t, cardmsg.ValidateInputs(envelope, map[string]interface{}{
+		"totally_undeclared": "x",
+	}))
+}
+
 func TestBuildDocsAccessRequestCardRejectsMissingRequestID(t *testing.T) {
 	_, err := BuildDocsAccessRequestCard(
 		localizedContext("en-US"),
