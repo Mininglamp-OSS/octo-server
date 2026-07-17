@@ -145,17 +145,12 @@ func New(ctx *config.Context) *Notify {
 	// 监听成员加入事件
 	ctx.AddEventListener(event.SpaceMemberJoin, n.handleSpaceMemberEvent)
 
-	// Space 新成员欢迎语（task space-new-user-welcome-message）。langSvc 在无缓存
-	// 的测试环境下为 nil，resolveLanguage 会回退到 OCTO_DEFAULT_LANGUAGE。服务对象
-	// 在此构造，reconciler/worker goroutine 由模块 Start() 启动、Stop() 停止。
-	var langSvc *user.LanguageService
-	if ctx.Cache() != nil {
-		langSvc = user.NewLanguageService(user.NewDB(ctx), ctx.Cache())
-	}
+	// Space 新成员欢迎语（task space-new-user-welcome-message）。欢迎语是所有人
+	// 同一份纯文本（不区分语言）。服务对象在此构造，reconciler/worker goroutine
+	// 由模块 Start() 启动、Stop() 停止。
 	n.spaceWelcome = newSpaceWelcomeService(
 		ctx,
 		common.EnsureSystemSettings(ctx),
-		langSvc,
 		NotifyBotUID(),
 		func() bool {
 			n.ensureNotifyBotReady()

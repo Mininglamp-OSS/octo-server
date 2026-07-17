@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
-	"github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -107,28 +106,10 @@ func TestSpaceWelcomeSender_ContextTimeoutIsTransportAmbiguous(t *testing.T) {
 	assert.Equal(t, swErrIMTimeout, se.class, "a timeout must classify as transport-ambiguous")
 }
 
-func TestMessageForLang(t *testing.T) {
-	svc := &spaceWelcomeService{}
-	cfg := common.SpaceWelcomeConfig{MessageZhCN: "中文", MessageEnUS: "english"}
-	assert.Equal(t, "中文", svc.messageForLang(cfg, "zh-CN"))
-	assert.Equal(t, "中文", svc.messageForLang(cfg, "zh-Hans"))
-	assert.Equal(t, "english", svc.messageForLang(cfg, "en-US"))
-	assert.Equal(t, "english", svc.messageForLang(cfg, ""))
-	assert.Equal(t, "english", svc.messageForLang(cfg, "fr-FR"))
-}
-
 func TestClaimOwnerID(t *testing.T) {
 	owner := claimOwnerID()
 	assert.Contains(t, owner, ":", "owner must be <hostname>:<pid>")
 	assert.NotEqual(t, ":", owner)
-}
-
-func TestResolveLanguage_FallbackWhenNoService(t *testing.T) {
-	// langSvc == nil (no cache in this env) must fall back to the default
-	// outbound language, never empty, never an error/retry.
-	svc := &spaceWelcomeService{}
-	lang := svc.resolveLanguage("u_1")
-	assert.NotEmpty(t, lang, "must fall back to OCTO_DEFAULT_LANGUAGE, never empty")
 }
 
 func TestCallWithTimeout(t *testing.T) {

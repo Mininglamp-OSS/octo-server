@@ -440,16 +440,15 @@ func swSetConfig(t *testing.T, ctx *config.Context, settings *common.SystemSetti
 
 func swEnabledConfig(spaceID string, activeFrom time.Time) map[string]string {
 	return map[string]string{
-		"space_welcome_enabled":       "1",
-		"space_welcome_space_id":      spaceID,
-		"space_welcome_active_from":   activeFrom.UTC().Format(time.RFC3339),
-		"space_welcome_message_zh_cn": "欢迎加入本空间",
-		"space_welcome_message_en_us": "Welcome to the space",
+		"space_welcome_enabled":     "1",
+		"space_welcome_space_id":    spaceID,
+		"space_welcome_active_from": activeFrom.UTC().Format(time.RFC3339),
+		"space_welcome_message":     "欢迎加入本空间\n有问题随时找我",
 	}
 }
 
 func swNewService(ctx *config.Context, settings *common.SystemSettings) *spaceWelcomeService {
-	svc := newSpaceWelcomeService(ctx, settings, nil, NotifyBotUID(), func() bool { return true })
+	svc := newSpaceWelcomeService(ctx, settings, NotifyBotUID(), func() bool { return true })
 	return svc
 }
 
@@ -480,6 +479,9 @@ func TestService_Dispatch_Success(t *testing.T) {
 	require.NotNil(t, gotReq)
 	assert.Equal(t, "notification", gotReq.FromUID)
 	assert.EqualValues(t, 1, gotReq.Header.RedDot)
+	// Single plain-text body sent verbatim, newlines preserved (type:1 content).
+	assert.Contains(t, string(gotReq.Payload), "欢迎加入本空间\\n有问题随时找我",
+		"the configured single message (with newline) must be sent verbatim")
 }
 
 func TestService_Dispatch_Unknown(t *testing.T) {

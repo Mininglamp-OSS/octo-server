@@ -315,11 +315,8 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 		if v, ok := welcomeIncoming["space_welcome_active_from"]; ok {
 			prospective.ActiveFromRaw = v
 		}
-		if v, ok := welcomeIncoming["space_welcome_message_zh_cn"]; ok {
-			prospective.MessageZhCN = v
-		}
-		if v, ok := welcomeIncoming["space_welcome_message_en_us"]; ok {
-			prospective.MessageEnUS = v
+		if v, ok := welcomeIncoming["space_welcome_message"]; ok {
+			prospective.Message = v
 		}
 		field, verr := ValidateSpaceWelcomeCombination(prospective, func(spaceID string) (bool, error) {
 			// GetSpaceName returns "" (no error) when the space is missing or

@@ -1040,31 +1040,33 @@ func (s *SystemSettings) StickerCompressMaxDimension() int {
 // ---------------------------------------------------------------------------
 
 const (
-	// spaceWelcomeCategory is the system_setting category for the five
-	// onboarding welcome keys.
+	// spaceWelcomeCategory is the system_setting category for the onboarding
+	// welcome keys.
 	spaceWelcomeCategory = "onboarding"
-	// spaceWelcomeMessageMaxRunes bounds each localized welcome body in Unicode
-	// code points (validated on the manager write path and re-validated at
-	// runtime).
+	// spaceWelcomeMessageMaxRunes bounds the welcome body in Unicode code points
+	// (validated on the manager write path and re-validated at runtime).
 	spaceWelcomeMessageMaxRunes = 2000
 )
 
-// SpaceWelcomeConfig is an atomic, point-in-time view of the five
-// onboarding.space_welcome_* settings. All five fields are read from the SAME
+// SpaceWelcomeConfig is an atomic, point-in-time view of the four
+// onboarding.space_welcome_* settings. All fields are read from the SAME
 // SystemSettings snapshot in one access, so a caller can never straddle a
 // background Reload() and combine values from two different snapshots. The
 // event handler, send worker, reconciler and the manager write path all rely
 // on this atomicity — reading the keys individually would risk an inconsistent
-// five-tuple.
+// combination.
+//
+// Message is a single plain-text body sent to every recipient (no per-language
+// split); it may contain line breaks (\n preserved verbatim; clients render
+// type:1 text with newlines) but no markdown.
 type SpaceWelcomeConfig struct {
 	Enabled       bool
 	SpaceID       string
 	ActiveFromRaw string
-	MessageZhCN   string
-	MessageEnUS   string
+	Message       string
 }
 
-// SpaceWelcomeConfig returns the current five-tuple, all read from one snapshot.
+// SpaceWelcomeConfig returns the current tuple, all read from one snapshot.
 func (s *SystemSettings) SpaceWelcomeConfig() SpaceWelcomeConfig {
 	snapPtr := s.snapshot.Load()
 	get := func(key string) string {
@@ -1077,8 +1079,7 @@ func (s *SystemSettings) SpaceWelcomeConfig() SpaceWelcomeConfig {
 		Enabled:       parseSettingBool(get("space_welcome_enabled"), false),
 		SpaceID:       get("space_welcome_space_id"),
 		ActiveFromRaw: get("space_welcome_active_from"),
-		MessageZhCN:   get("space_welcome_message_zh_cn"),
-		MessageEnUS:   get("space_welcome_message_en_us"),
+		Message:       get("space_welcome_message"),
 	}
 }
 
@@ -1096,8 +1097,9 @@ func (c SpaceWelcomeConfig) ParsedActiveFrom() (time.Time, bool) {
 	return t.UTC(), true
 }
 
-// validWelcomeMessage reports whether a localized body is non-empty after trim
-// and within the code-point limit.
+// validWelcomeMessage reports whether the body is non-empty after trim and
+// within the code-point limit. Internal newlines are preserved (TrimSpace only
+// strips leading/trailing whitespace), so multi-line plain-text bodies pass.
 func validWelcomeMessage(msg string) bool {
 	if strings.TrimSpace(msg) == "" {
 		return false
@@ -1105,14 +1107,13 @@ func validWelcomeMessage(msg string) bool {
 	return utf8.RuneCountInString(msg) <= spaceWelcomeMessageMaxRunes
 }
 
-// ValidateSpaceWelcomeCombination validates the five-tuple as a coherent
-// combination.
+// ValidateSpaceWelcomeCombination validates the tuple as a coherent combination.
 //
 //   - When disabled it always passes: a partial or empty config is fine while
 //     the feature is off.
 //   - When enabled it requires a non-empty space_id that isActiveSpace confirms
-//     exists and is not dissolved, a parseable RFC3339 active_from, and both
-//     message bodies non-empty (after trim) within spaceWelcomeMessageMaxRunes.
+//     exists and is not dissolved, a parseable RFC3339 active_from, and a
+//     message non-empty (after trim) within spaceWelcomeMessageMaxRunes.
 //
 // The (field, err) contract lets the caller distinguish a validation failure
 // (err == nil, field != "" naming the first offending key) from an
@@ -1129,11 +1130,8 @@ func ValidateSpaceWelcomeCombination(cfg SpaceWelcomeConfig, isActiveSpace func(
 	if _, ok := cfg.ParsedActiveFrom(); !ok {
 		return "space_welcome_active_from", nil
 	}
-	if !validWelcomeMessage(cfg.MessageZhCN) {
-		return "space_welcome_message_zh_cn", nil
-	}
-	if !validWelcomeMessage(cfg.MessageEnUS) {
-		return "space_welcome_message_en_us", nil
+	if !validWelcomeMessage(cfg.Message) {
+		return "space_welcome_message", nil
 	}
 	if isActiveSpace != nil {
 		active, checkErr := isActiveSpace(cfg.SpaceID)

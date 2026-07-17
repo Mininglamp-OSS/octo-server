@@ -5,15 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-server/modules/common"
-	"github.com/Mininglamp-OSS/octo-server/modules/user"
-	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"go.uber.org/zap"
 )
@@ -28,8 +25,9 @@ import (
 //   - the low-latency event path (handleMemberJoin) upserts a pending row;
 //   - the reconciler catches dropped events / restarts / the addMembers path;
 //   - the send worker claims pending rows, re-checks eligibility, and delivers.
-
-const langResolveTimeout = 2 * time.Second
+//
+// The welcome body is a single plain-text message for all recipients (no
+// per-language routing).
 
 // swBotReadyTimeout caps the (context-less) bot-readiness probe so a hung
 // WuKongIM / DB dependency cannot wedge the single worker goroutine or Stop().
@@ -59,7 +57,6 @@ type spaceWelcomeService struct {
 	ctx      *config.Context
 	store    *spaceWelcomeStore
 	settings *common.SystemSettings
-	langSvc  *user.LanguageService
 	metrics  *spaceWelcomeMetrics
 	fromUID  string
 	// sendFn delivers one personal DM. Defaults to the notify-local
@@ -78,14 +75,13 @@ type spaceWelcomeService struct {
 	log.Log
 }
 
-func newSpaceWelcomeService(ctx *config.Context, settings *common.SystemSettings, langSvc *user.LanguageService, fromUID string, botReady func() bool) *spaceWelcomeService {
+func newSpaceWelcomeService(ctx *config.Context, settings *common.SystemSettings, fromUID string, botReady func() bool) *spaceWelcomeService {
 	owner := claimOwnerID()
 	sender := newSpaceWelcomeSender(ctx)
 	return &spaceWelcomeService{
 		ctx:      ctx,
 		store:    newSpaceWelcomeStore(ctx.DB(), owner),
 		settings: settings,
-		langSvc:  langSvc,
 		metrics:  newSpaceWelcomeMetrics(),
 		fromUID:  fromUID,
 		sendFn:   sender.send,
@@ -390,16 +386,10 @@ func (s *spaceWelcomeService) dispatch(ctx context.Context, cfg common.SpaceWelc
 		return
 	}
 
-	// Language resolution is bounded the same way: the 2s context inside
-	// resolveLanguage may not interrupt a hung cache/DB, so cap the whole call
-	// and fall back to the default language on timeout (never a retryable error).
-	lang, langOK := callWithTimeout(langResolveTimeout+time.Second, func() string { return s.resolveLanguage(row.UID) })
-	if !langOK {
-		lang = i18n.OutboundLanguage(context.Background())
-	}
-
 	dsCtx, cancel := context.WithTimeout(ctx, swDBCallTimeout)
-	ok, err := s.store.casToDispatching(dsCtx, row.ID, lang, s.now())
+	// lang is recorded empty: the welcome body is a single language-agnostic
+	// plain-text message, so there is no per-recipient language to resolve.
+	ok, err := s.store.casToDispatching(dsCtx, row.ID, "", s.now())
 	cancel()
 	if err != nil {
 		s.Warn("welcome cas to dispatching failed", zap.String("stage", swStageDispatch), zap.Int64("delivery_id", row.ID), zap.Error(err))
@@ -414,8 +404,9 @@ func (s *spaceWelcomeService) dispatch(ctx context.Context, cfg common.SpaceWelc
 	}
 
 	// Build the personal DM. NewPersonalMsgSendReq is authoritative for
-	// payload.space_id; red_dot=1; payload.type=Text plain body.
-	payload := map[string]interface{}{"type": 1, "content": s.messageForLang(cfg, lang)}
+	// payload.space_id; red_dot=1; payload.type=Text plain body (single message
+	// for all recipients; newlines preserved verbatim, no markdown rendering).
+	payload := map[string]interface{}{"type": 1, "content": cfg.Message}
 	req := config.NewPersonalMsgSendReq(row.UID, s.fromUID, payload, cfg.SpaceID,
 		config.PersonalMsgOptions{Header: config.MsgHeader{RedDot: 1}})
 
@@ -453,7 +444,7 @@ func (s *spaceWelcomeService) dispatch(ctx context.Context, cfg common.SpaceWelc
 	}
 	s.metrics.incSendSuccess()
 	s.Info("welcome delivered", zap.String("stage", swStagePersist), zap.Int64("delivery_id", row.ID),
-		zap.String("space_id", cfg.SpaceID), zap.String("uid", row.UID), zap.String("lang", lang))
+		zap.String("space_id", cfg.SpaceID), zap.String("uid", row.UID))
 }
 
 // preIMFailure records a definitive pre-IM failure (the only place attempts
@@ -519,29 +510,6 @@ func (s *spaceWelcomeService) validateRuntime(ctx context.Context, cfg common.Sp
 		return false
 	}
 	return true
-}
-
-// resolveLanguage resolves the recipient's outbound language (zh-CN/en-US). On
-// any lookup failure or unset preference it falls back to OCTO_DEFAULT_LANGUAGE
-// — language lookup is never a retryable error.
-func (s *spaceWelcomeService) resolveLanguage(uid string) string {
-	if s.langSvc != nil {
-		rctx, cancel := context.WithTimeout(context.Background(), langResolveTimeout)
-		lang, err := s.langSvc.Resolve(rctx, uid)
-		cancel()
-		if err == nil && lang != "" {
-			return lang
-		}
-	}
-	return i18n.OutboundLanguage(context.Background())
-}
-
-// messageForLang picks the localized body. zh-* → zh copy, otherwise en copy.
-func (s *spaceWelcomeService) messageForLang(cfg common.SpaceWelcomeConfig, lang string) string {
-	if strings.HasPrefix(strings.ToLower(lang), "zh") {
-		return cfg.MessageZhCN
-	}
-	return cfg.MessageEnUS
 }
 
 // safeRun runs fn with panic recovery so one bad cycle cannot kill the loop.
