@@ -119,24 +119,26 @@ metrics + logs for operator handling.
   - `onboarding.space_welcome_enabled` (bool, default false)
   - `onboarding.space_welcome_space_id` (string)
   - `onboarding.space_welcome_active_from` (UTC RFC3339 string)
-  - `onboarding.space_welcome_message_zh_cn` (string, trimmed non-empty,
-    ≤ 2000 Unicode code points)
-  - `onboarding.space_welcome_message_en_us` (same rule)
+  - `onboarding.space_welcome_message` (string, trimmed non-empty,
+    ≤ 2000 Unicode code points; single plain-text body sent to every
+    recipient — no per-language split; newlines preserved verbatim, no
+    markdown rendering. Superseded the earlier `_message_zh_cn` /
+    `_message_en_us` bilingual pair in PR #606.)
   - **Snapshot accessor** — `modules/common` must expose a single
-    `SpaceWelcomeConfig()` returning a struct with all five fields read from
+    `SpaceWelcomeConfig()` returning a struct with all four fields read from
     the **same** `SystemSettings` snapshot in one atomic access. Callers
     (event handler, worker, reconciler, manager write path) must not read
-    the five keys individually; splitting the reads risks straddling a
+    the four keys individually; splitting the reads risks straddling a
     background `Reload()` and using an inconsistent combination.
-- **Configuration validation** — When enabling, all five keys must form a
-  **valid combination**: Space exists and is active, time parses, both message
-  bodies non-empty within the length limit.
+- **Configuration validation** — When enabling, all four keys must form a
+  **valid combination**: Space exists and is active, time parses, and the
+  message body is non-empty within the length limit.
   - **Manager write path uses prospective validation** — the write endpoint
     must NOT validate the current `SpaceWelcomeConfig()` snapshot; it must
     construct `prospective = merge(current snapshot, incoming items)` and
     validate that composite. Rationale: partial updates (e.g. changing only
-    `space_id` while leaving message bodies unchanged) must pass if the
-    resulting five-tuple is valid, and must fail if any incoming field
+    `space_id` while leaving the message unchanged) must pass if the
+    resulting composite is valid, and must fail if any incoming field
     breaks the composite — using the pre-write snapshot alone gets both
     directions wrong. Validate first, then commit the items in one
     transaction, then trigger `SystemSettings.Reload()` on the handling
@@ -406,7 +408,7 @@ metrics + logs for operator handling.
   directly to the DB fail closed at the worker/reconciler and increment
   `config_invalid_total`.
 - **Prospective validation**: a partial update touching only a subset of
-  the five keys is accepted iff `merge(current snapshot, incoming items)`
+  the four keys is accepted iff `merge(current snapshot, incoming items)`
   is a valid combination. A test where the current snapshot is valid, the
   incoming patch alone would look valid, but the merge is invalid, is
   rejected; and vice versa (invalid snapshot + valid patch that repairs
@@ -528,7 +530,7 @@ metrics + logs for operator handling.
   - `go test -race ./...`
   - `git diff --check`
 - **Rollout**: land migration + deploy with `enabled=false` → write target
-  `space_id`, UTC `active_from`, and zh/en message bodies → verify with two
+  `space_id`, UTC `active_from`, and the welcome message body → verify with two
   fresh test accounts that the DM, red dot, copy, ledger row (`status=3`),
   and metrics are correct → flip the switch. On incident, flip the switch
   off first; retain the ledger and migration for audit and recovery.

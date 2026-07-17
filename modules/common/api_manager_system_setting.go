@@ -290,7 +290,7 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 	}
 
 	// Prospective composite validation for the onboarding space-welcome
-	// five-tuple (task space-new-user-welcome-message). A partial update
+	// config (task space-new-user-welcome-message). A partial update
 	// (e.g. changing only space_id) must be validated against
 	// merge(current snapshot, incoming items), NOT the pre-write snapshot
 	// alone: validating the current snapshot would wrongly accept a patch that
