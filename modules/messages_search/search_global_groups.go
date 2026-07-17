@@ -101,7 +101,11 @@ func (h *Handler) searchGlobalGroups(c *wkhttp.Context) {
 		return
 	}
 	req.Keyword = strings.TrimSpace(req.Keyword)
-	loginUID := c.GetLoginUID()
+	// 主体统一走 principal.SubjectUID()（决策十）—— 与 _search_global_messages /
+	// _search_global_files 对齐。OBO 路由下 context login uid 是 botUID，但搜索主体
+	// 必须是 grantorUID，否则 DM fake channel / applyVisiblesWhitelist / 审计会用错
+	// 主体，与另两条 global 路径漂移（YUJ-57）。
+	loginUID := h.principal(c).SubjectUID()
 
 	if !validateKeywordOptional(c, req.Keyword) {
 		return

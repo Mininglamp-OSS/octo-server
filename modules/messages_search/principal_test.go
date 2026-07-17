@@ -145,6 +145,30 @@ func TestPrincipalBlacklistPolicy(t *testing.T) {
 	}
 }
 
+// TestPrincipalRequiresSpaceScope — YUJ-57: the fail-close Space gate applies
+// ONLY to space-scoped principals (user / uk). Space-less principals (as-bot /
+// OBO) legitimately carry no Space, so RequiresSpaceScope must be false — they
+// must NOT be blocked by RequireSpaceID before reaching the allowlist predicate.
+func TestPrincipalRequiresSpaceScope(t *testing.T) {
+	cases := []struct {
+		name string
+		p    Principal
+		want bool
+	}{
+		{"user", userPrincipal{uid: "alice", spaceID: "S1"}, true},
+		{"uk", ukPrincipal{keyUID: "kate", spaceID: "S2"}, true},
+		{"user_bot", userBotPrincipal{botUID: "bot9"}, false},
+		{"obo", oboPrincipal{botUID: "bot9", grantorUID: "grace"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.p.RequiresSpaceScope(); got != tc.want {
+				t.Fatalf("RequiresSpaceScope = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // ---------- Authenticate: user ----------
 
 func TestAuthenticateUser(t *testing.T) {

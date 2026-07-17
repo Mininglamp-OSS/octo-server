@@ -107,6 +107,13 @@ type Principal interface {
 	SubjectUID() string
 	// SpaceID 请求所属 Space；bot 路由不挂 SpaceMiddleware 故为空，uk 取 api_key_space_id。
 	SpaceID() string
+	// RequiresSpaceScope 报告「空 Space 是否必须 fail-close」（决策十 / YUJ-57）。
+	// 真人语义且实际驻留在某个 Space 的主体（user / uk）依赖 spaceId 段收窄跨 Space
+	// DM 泄露，空 Space 触发必填门 fail-close；而**天然无 Space** 的主体（user_bot /
+	// obo）根本不属于任何 Space，其可读频道集由 per-principal 谓词
+	//（IsFriend / grantor allowlist）枚举，DM 可见性无需 spaceId 段兜底，故空 Space
+	// 合法、**不**被必填门提前挡下（否则无 space 的 bot 永远搜不到任何结果）。
+	RequiresSpaceScope() bool
 	// BlacklistPolicy 报告是否对该主体套用真人双向黑名单门。
 	BlacklistPolicy() blacklistPolicy
 	// RateLimitKey 限流令牌桶键：as-bot / obo 都按 botUID 计（防单 bot 打爆），
@@ -124,26 +131,28 @@ type userPrincipal struct {
 	spaceID string
 }
 
-func (p userPrincipal) Kind() principalKind             { return principalKindUser }
-func (p userPrincipal) SubjectUID() string              { return p.uid }
-func (p userPrincipal) SpaceID() string                 { return p.spaceID }
+func (p userPrincipal) Kind() principalKind              { return principalKindUser }
+func (p userPrincipal) SubjectUID() string               { return p.uid }
+func (p userPrincipal) SpaceID() string                  { return p.spaceID }
+func (p userPrincipal) RequiresSpaceScope() bool         { return true }
 func (p userPrincipal) BlacklistPolicy() blacklistPolicy { return blacklistRealUserBidirectional }
-func (p userPrincipal) RateLimitKey() string            { return p.uid }
-func (p userPrincipal) AuditBotUID() string             { return "" }
-func (p userPrincipal) AuditGrantorUID() string         { return "" }
+func (p userPrincipal) RateLimitKey() string             { return p.uid }
+func (p userPrincipal) AuditBotUID() string              { return "" }
+func (p userPrincipal) AuditGrantorUID() string          { return "" }
 
 // userBotPrincipal as-bot：主体 = botUID，Space 空，黑名单不查，限流/审计按 botUID。
 type userBotPrincipal struct {
 	botUID string
 }
 
-func (p userBotPrincipal) Kind() principalKind             { return principalKindUserBot }
-func (p userBotPrincipal) SubjectUID() string              { return p.botUID }
-func (p userBotPrincipal) SpaceID() string                 { return "" }
+func (p userBotPrincipal) Kind() principalKind              { return principalKindUserBot }
+func (p userBotPrincipal) SubjectUID() string               { return p.botUID }
+func (p userBotPrincipal) SpaceID() string                  { return "" }
+func (p userBotPrincipal) RequiresSpaceScope() bool         { return false }
 func (p userBotPrincipal) BlacklistPolicy() blacklistPolicy { return blacklistNone }
-func (p userBotPrincipal) RateLimitKey() string            { return p.botUID }
-func (p userBotPrincipal) AuditBotUID() string             { return p.botUID }
-func (p userBotPrincipal) AuditGrantorUID() string         { return "" }
+func (p userBotPrincipal) RateLimitKey() string             { return p.botUID }
+func (p userBotPrincipal) AuditBotUID() string              { return p.botUID }
+func (p userBotPrincipal) AuditGrantorUID() string          { return "" }
 
 // oboPrincipal as-user(OBO)：主体 = grantorUID（走真人分支），黑名单复用真人双向，
 // 限流/审计按 botUID，审计并记 grantorUID 以追溯。
@@ -153,13 +162,14 @@ type oboPrincipal struct {
 	spaceID    string
 }
 
-func (p oboPrincipal) Kind() principalKind             { return principalKindOBO }
-func (p oboPrincipal) SubjectUID() string              { return p.grantorUID }
-func (p oboPrincipal) SpaceID() string                 { return p.spaceID }
+func (p oboPrincipal) Kind() principalKind              { return principalKindOBO }
+func (p oboPrincipal) SubjectUID() string               { return p.grantorUID }
+func (p oboPrincipal) SpaceID() string                  { return p.spaceID }
+func (p oboPrincipal) RequiresSpaceScope() bool         { return false }
 func (p oboPrincipal) BlacklistPolicy() blacklistPolicy { return blacklistRealUserBidirectional }
-func (p oboPrincipal) RateLimitKey() string            { return p.botUID }
-func (p oboPrincipal) AuditBotUID() string             { return p.botUID }
-func (p oboPrincipal) AuditGrantorUID() string         { return p.grantorUID }
+func (p oboPrincipal) RateLimitKey() string             { return p.botUID }
+func (p oboPrincipal) AuditBotUID() string              { return p.botUID }
+func (p oboPrincipal) AuditGrantorUID() string          { return p.grantorUID }
 
 // ukPrincipal as-user(uk)：主体 = keyModel.UID（直接真人身份，不做 OBO scope 收窄），
 // 黑名单复用真人双向，Space 取 api_key_space_id，限流/审计按 key UID。
@@ -168,13 +178,14 @@ type ukPrincipal struct {
 	spaceID string
 }
 
-func (p ukPrincipal) Kind() principalKind             { return principalKindUK }
-func (p ukPrincipal) SubjectUID() string              { return p.keyUID }
-func (p ukPrincipal) SpaceID() string                 { return p.spaceID }
+func (p ukPrincipal) Kind() principalKind              { return principalKindUK }
+func (p ukPrincipal) SubjectUID() string               { return p.keyUID }
+func (p ukPrincipal) SpaceID() string                  { return p.spaceID }
+func (p ukPrincipal) RequiresSpaceScope() bool         { return true }
 func (p ukPrincipal) BlacklistPolicy() blacklistPolicy { return blacklistRealUserBidirectional }
-func (p ukPrincipal) RateLimitKey() string            { return p.keyUID }
-func (p ukPrincipal) AuditBotUID() string             { return "" }
-func (p ukPrincipal) AuditGrantorUID() string         { return "" }
+func (p ukPrincipal) RateLimitKey() string             { return p.keyUID }
+func (p ukPrincipal) AuditBotUID() string              { return "" }
+func (p ukPrincipal) AuditGrantorUID() string          { return "" }
 
 // setPrincipal 把显式解析出的主体写入 context（bot / uk / obo 路由在 #B 使用）。
 // 真人路由不调用，依赖 Handler.principal 的惰性默认。

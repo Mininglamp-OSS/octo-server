@@ -267,3 +267,46 @@ func TestResolveP2PSpaceScope_P2PWhitespaceSpaceIDTreatedAsMissing_RequireFalse(
 		t.Fatalf("escape hatch must not write an error response: %q", rec.Body.String())
 	}
 }
+
+// TestResolveP2PSpaceScope_BotBypassesGate_RequireTrue — YUJ-57: an as-bot
+// principal carries no Space (bot routes have no SpaceMiddleware). Even with
+// RequireSpaceID=true the p2p gate must NOT fail-close — the bot's DM
+// reachability is bounded by the per-principal readable predicate, not a
+// spaceId term. This is the single-DM fast path a global bot search collapses
+// to; without the bypass it would 404 despite resolveGlobalScope letting it in.
+func TestResolveP2PSpaceScope_BotBypassesGate_RequireTrue(t *testing.T) {
+	h := newSpaceHandler(true)
+	c, rec := newSpaceCtx(t, "")
+	setPrincipal(c, userBotPrincipal{botUID: "bot9"})
+	got, ok := h.resolveP2PSpaceScope(c, channelTypePerson, "bot9")
+	if !ok {
+		t.Fatalf("as-bot p2p must bypass the space fail-close, got ok=false")
+	}
+	if got != "" {
+		t.Fatalf("as-bot has no Space; expected empty spaceID, got %q", got)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("bot bypass must not write a response: %q", rec.Body.String())
+	}
+}
+
+// TestResolveP2PSpaceScope_UKStillGated_RequireTrue — the exemption is scoped
+// to space-less principals. A uk principal is real-user-semantic and space
+// scoped; if its Space is empty it must STILL fail-close under RequireSpaceID,
+// exactly like a plain web user (regression guard against over-broadening the
+// YUJ-57 bypass).
+func TestResolveP2PSpaceScope_UKStillGated_RequireTrue(t *testing.T) {
+	h := newSpaceHandler(true)
+	c, rec := newSpaceCtx(t, "")
+	setPrincipal(c, ukPrincipal{keyUID: "kate"}) // empty api_key_space_id
+	got, ok := h.resolveP2PSpaceScope(c, channelTypePerson, "kate")
+	if ok {
+		t.Fatalf("uk with empty Space must still fail-close, got ok=true")
+	}
+	if got != "" {
+		t.Fatalf("fail-close must return empty spaceID, got %q", got)
+	}
+	if !strings.Contains(rec.Body.String(), "not found") {
+		t.Fatalf("uk fail-close must render NOT_FOUND, got %q", rec.Body.String())
+	}
+}

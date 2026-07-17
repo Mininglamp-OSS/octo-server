@@ -19,7 +19,12 @@ import (
 //     attach the term filter so the search is scoped to that Space.
 //   - p2p && spaceID empty && RequireSpaceID=true → fail-closed.
 //     respondNotFound (resource=channel) so we don't leak whether the peer
-//     exists in any Space, and return false to abort the handler.
+//     exists in any Space, and return false to abort the handler. This gate
+//     applies ONLY to space-scoped principals (user / uk); a space-less
+//     principal (as-bot / OBO, see Principal.RequiresSpaceScope) proceeds with
+//     ("", true) regardless of RequireSpaceID — it has no Space to resolve and
+//     its DM reachability is bounded by the per-principal readable predicate,
+//     not a spaceId term (YUJ-57).
 //   - p2p && spaceID empty && RequireSpaceID=false → ("", true) with a
 //     WARN log. Operational escape hatch only; intended for the rollout
 //     window before the v1.9 indexer is writing `payload.space_id` and the
@@ -33,15 +38,24 @@ func (h *Handler) resolveP2PSpaceScope(c *wkhttp.Context, channelType uint8, log
 	// spaceID 走 principal（决策十）：真人主体等价于 GetSpaceID(c)；bot 路由不挂
 	// SpaceMiddleware 故为空；uk 取 api_key_space_id。The principal is the single
 	// source so the p2p Space scope stays consistent across all four subjects.
-	spaceID := h.principal(c).SpaceID()
+	p := h.principal(c)
+	spaceID := p.SpaceID()
 	if spaceID != "" {
 		return spaceID, true
 	}
-	if h.cfg.RequireSpaceID {
-		respondNotFound(c, "channel")
-		return "", false
+	// YUJ-57: space-less principals (as-bot / OBO) legitimately carry no Space,
+	// so the fail-close gate must not apply to them — otherwise a global search
+	// whose scope collapses to a single DM (routed through this p2p gate via the
+	// fast path) would 404 for a bot even after resolveGlobalScope let it in.
+	// Their DM reachability is bounded by the per-principal readable predicate,
+	// not a spaceId term, so we proceed with spaceID="".
+	if p.RequiresSpaceScope() {
+		if h.cfg.RequireSpaceID {
+			respondNotFound(c, "channel")
+			return "", false
+		}
+		h.Warn("messages_search: p2p search without spaceID; OCTO_SEARCH_REQUIRE_SPACE_ID=false escape hatch active",
+			zap.String("uid", loginUID))
 	}
-	h.Warn("messages_search: p2p search without spaceID; OCTO_SEARCH_REQUIRE_SPACE_ID=false escape hatch active",
-		zap.String("uid", loginUID))
 	return "", true
 }

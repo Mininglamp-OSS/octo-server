@@ -438,14 +438,23 @@ func normalizeMemberUIDs(loginUID string, uids []string, single string) []string
 func (h *Handler) resolveGlobalScope(c *wkhttp.Context, loginUID string, channelIDs []GlobalChannelRef, rawMemberUIDs []string, legacyMemberUID string) (osChannelIDs []string, spaceID string, singleFast *channelRef, timings allowlistTimings, ok bool) {
 	// spaceID 走 principal（决策十）：真人等价于 GetSpaceID(c)；bot 路由无 SpaceMiddleware
 	// 故为空；uk 取 api_key_space_id.
-	spaceID = h.principal(c).SpaceID()
-	if spaceID == "" {
+	p := h.principal(c)
+	spaceID = p.SpaceID()
+	if spaceID == "" && p.RequiresSpaceScope() {
 		// DM double-guard is space-dependent; without a Space the guard cannot
 		// fire (§6.5). We fail-closed on the DM side identically to
 		// resolveP2PSpaceScope so a missing Space cannot silently escape the
 		// filter. RequireSpaceID=false is the operator escape hatch — we
 		// mirror it here so the two paths behave the same during the v1.9
 		// indexer rollout.
+		//
+		// YUJ-57: only real-user-scoped principals (user / uk) are subject to
+		// this gate. Space-less principals (as-bot / OBO) legitimately carry no
+		// Space and their allowlist is enumerated by the per-principal readable
+		// predicate (IsFriend / grantor allowlist), which already bounds DM
+		// visibility without a spaceId term — so they proceed with spaceID=""
+		// (applyGlobalDMSpaceScope then emits no DM clause) instead of being
+		// blocked here before ever reaching enumerateReadableChannels.
 		if h.cfg.RequireSpaceID {
 			respondNotFound(c, "channel")
 			return nil, "", nil, timings, false
