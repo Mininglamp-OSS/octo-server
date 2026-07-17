@@ -163,20 +163,6 @@ func New(ctx *config.Context) *Notify {
 		},
 	)
 
-	// 启动时创建全局通知 Bot（单例，带 panic recovery）。summary-notify
-	// 卡片复用同一身份，避免在用户会话列表中产生第二个系统 Bot 会话。
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				n.Error("ensureNotifyBot panic", zap.Any("recover", r))
-			}
-		}()
-		n.ensureNotifyBotReady()
-		if n.botOK.Load() {
-			n.Info("Notify bot ready")
-		}
-	}()
-
 	return n
 }
 
@@ -253,6 +239,21 @@ func (n *Notify) handleSpaceMemberEvent(data []byte, commit config.EventCommit) 
 
 // Start 启动欢迎语的对账 + 发送 worker goroutine（模块生命周期钩子）。
 func (n *Notify) Start() error {
+	// 通知 Bot 的 provisioning 放在 Start()（而非 New()）：New() 现在于
+	// register.GetModules 阶段被调用，早于 module.Setup 跑迁移；若在 New() 里就
+	// 写库，可能对尚未建好的 schema 做写入。Start() 在迁移完成后才执行，安全。
+	// 带 panic recovery；失败可由 deliverNotification / worker 的 lazy 重试自愈。
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				n.Error("ensureNotifyBot panic", zap.Any("recover", r))
+			}
+		}()
+		n.ensureNotifyBotReady()
+		if n.botOK.Load() {
+			n.Info("Notify bot ready")
+		}
+	}()
 	if n.spaceWelcome != nil {
 		n.spaceWelcome.Start()
 	}

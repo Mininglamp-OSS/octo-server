@@ -479,14 +479,19 @@ func (s *spaceWelcomeService) preIMFailure(ctx context.Context, row *spaceWelcom
 // toUnknown records a transport-ambiguous outcome (never auto-retried).
 func (s *spaceWelcomeService) toUnknown(ctx context.Context, row *spaceWelcomeRow, class string) {
 	c, cancel := context.WithTimeout(ctx, swDBCallTimeout)
-	_, err := s.store.casToUnknown(c, row.ID, class, s.now())
+	ok, err := s.store.casToUnknown(c, row.ID, class, s.now())
 	cancel()
 	if err != nil {
 		s.Error("welcome cas to unknown failed", zap.Int64("delivery_id", row.ID), zap.String("error_class", class), zap.Error(err))
 		return
 	}
-	s.metrics.incSendUnknown()
-	s.Warn("welcome delivery outcome unknown", zap.String("stage", swStageDispatch), zap.Int64("delivery_id", row.ID), zap.String("error_class", class))
+	// Only count when THIS replica made the transition; ok=false means a peer
+	// sweep already moved the row, so counting here would over-report (mirrors
+	// the CAS-gating in preIMFailure).
+	if ok {
+		s.metrics.incSendUnknown()
+		s.Warn("welcome delivery outcome unknown", zap.String("stage", swStageDispatch), zap.Int64("delivery_id", row.ID), zap.String("error_class", class))
+	}
 }
 
 // ---------------------------------------------------------------------------
