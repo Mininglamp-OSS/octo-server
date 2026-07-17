@@ -1,6 +1,7 @@
 package bot_api
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,10 +14,12 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// YUJ-49 (#B) — bot search entry: resolveSearchPrincipal distinguishes as-bot
-// (no on_behalf_of) from as-user(OBO) (on_behalf_of present), and App Bot is
-// explicitly denied. The OBO real-permission check (grant/scope/TOCTOU) is #F;
-// until it wires validateSearchOBO, on_behalf_of搜索 fails closed.
+// YUJ-49 (#B) / YUJ-53 (#F) — bot search entry: resolveSearchPrincipal
+// distinguishes as-bot (no on_behalf_of) from as-user(OBO) (on_behalf_of
+// present). App Bot is explicitly denied on both branches. The OBO entry does
+// a channel-agnostic grant-existence fail-fast (validateSearchOBO); the
+// per-channel scope + grantorCanReadChannel (TOCTOU) check is reused by the
+// messages_search obo gate via the injected ba.SearchOBOAllowed.
 
 func newBotSearchCtx(t *testing.T, body string) (*wkhttp.Context, *httptest.ResponseRecorder) {
 	t.Helper()
@@ -70,8 +73,45 @@ func TestResolveSearchPrincipal_AppBotDenied(t *testing.T) {
 	}
 }
 
-func TestResolveSearchPrincipal_OBOFailClosedUntilF(t *testing.T) {
-	ba := newSearchTestBotAPI()
+func TestResolveSearchPrincipal_OBOAuthorizedSetsPrincipal(t *testing.T) {
+	// A live grant (active=1, global_enabled=1) exists for (grantor, bot):
+	// the entry fail-fast passes and an obo principal is set. Per-channel
+	// scope/TOCTOU is left to the messages_search obo gate.
+	s := newFakeOBOStore()
+	gid, err := s.insertGrant("grantor_2", "bot_1", "auto", "")
+	if err != nil {
+		t.Fatalf("insertGrant: %v", err)
+	}
+	enable := 1
+	if err := s.updateGrant(gid, "", &enable, nil); err != nil {
+		t.Fatalf("updateGrant: %v", err)
+	}
+	ba := newBotAPIWithFakeStore(s)
+
+	c, rec := newBotSearchCtx(t, `{"on_behalf_of":"grantor_2","keyword":"x"}`)
+	c.Set(CtxKeyRobotID, "bot_1")
+	c.Set(CtxKeyBotKind, BotKindUser)
+
+	ba.resolveSearchPrincipal(c)
+
+	if c.IsAborted() {
+		t.Fatalf("authorized OBO must not abort, body=%q", rec.Body.String())
+	}
+	if got := messages_search.PrincipalKind(c); got != "obo" {
+		t.Fatalf("principal kind = %q, want obo", got)
+	}
+	// Body must still be readable by the downstream _search* handler.
+	b, _ := io.ReadAll(c.Request.Body)
+	if !strings.Contains(string(b), "keyword") {
+		t.Fatalf("request body not restored for handler BindJSON, got %q", string(b))
+	}
+}
+
+func TestResolveSearchPrincipal_OBONoGrantDenied(t *testing.T) {
+	// No grant row at all → entry fail-fast rejects the whole request
+	// (existence-hidden), never degrades to a 200 empty result.
+	ba := newBotAPIWithFakeStore(newFakeOBOStore())
+
 	c, rec := newBotSearchCtx(t, `{"on_behalf_of":"grantor_2","keyword":"x"}`)
 	c.Set(CtxKeyRobotID, "bot_1")
 	c.Set(CtxKeyBotKind, BotKindUser)
@@ -79,13 +119,63 @@ func TestResolveSearchPrincipal_OBOFailClosedUntilF(t *testing.T) {
 	ba.resolveSearchPrincipal(c)
 
 	if !c.IsAborted() {
-		t.Fatalf("on_behalf_of search must fail closed until #F wires validateSearchOBO")
+		t.Fatalf("OBO with no grant must abort")
 	}
 	if got := messages_search.PrincipalKind(c); got != "" {
-		t.Fatalf("fail-closed OBO must not set a principal, got %q", got)
+		t.Fatalf("unauthorized OBO must not set a principal, got %q", got)
 	}
 	if rec.Code == http.StatusOK {
-		t.Fatalf("fail-closed OBO must not return 200")
+		t.Fatalf("unauthorized OBO must not return 200")
+	}
+}
+
+func TestResolveSearchPrincipal_OBOAppBotDenied(t *testing.T) {
+	// App Bot cannot hold an OBO grant; it must be denied at principal
+	// construction, not silently returned as "no results".
+	s := newFakeOBOStore()
+	gid, _ := s.insertGrant("grantor_2", "app_1", "auto", "")
+	enable := 1
+	_ = s.updateGrant(gid, "", &enable, nil)
+	ba := newBotAPIWithFakeStore(s)
+
+	c, rec := newBotSearchCtx(t, `{"on_behalf_of":"grantor_2","keyword":"x"}`)
+	c.Set(CtxKeyRobotID, "app_1")
+	c.Set(CtxKeyBotKind, BotKindApp)
+
+	ba.resolveSearchPrincipal(c)
+
+	if !c.IsAborted() {
+		t.Fatalf("App Bot OBO search must be denied (决策五), chain must abort")
+	}
+	if got := messages_search.PrincipalKind(c); got != "" {
+		t.Fatalf("App Bot must not set a search principal, got %q", got)
+	}
+	if rec.Code == http.StatusOK {
+		t.Fatalf("App Bot denial must not return 200")
+	}
+}
+
+func TestResolveSearchPrincipal_OBOInfraErrorFailsClosed(t *testing.T) {
+	// A DB error on the grant lookup must fail closed (abort, non-200), never
+	// fall through to an unauthenticated / unscoped search.
+	s := newFakeOBOStore()
+	s.failFindActiveGrant = errors.New("db down")
+	ba := newBotAPIWithFakeStore(s)
+
+	c, rec := newBotSearchCtx(t, `{"on_behalf_of":"grantor_2","keyword":"x"}`)
+	c.Set(CtxKeyRobotID, "bot_1")
+	c.Set(CtxKeyBotKind, BotKindUser)
+
+	ba.resolveSearchPrincipal(c)
+
+	if !c.IsAborted() {
+		t.Fatalf("OBO infra error must fail closed (abort)")
+	}
+	if got := messages_search.PrincipalKind(c); got != "" {
+		t.Fatalf("infra-error OBO must not set a principal, got %q", got)
+	}
+	if rec.Code == http.StatusOK {
+		t.Fatalf("infra-error OBO must not return 200")
 	}
 }
 

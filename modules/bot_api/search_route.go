@@ -40,6 +40,11 @@ type searchOBOFieldProbe struct {
 
 // mountSearchRoutes 挂载 bot 搜索子树。由 Route() 调用。
 func (ba *BotAPI) mountSearchRoutes(r *wkhttp.WKHttp) {
+	// YUJ-53 / #F：把 as-user(OBO) 的 scope 门注入共享搜索 Handler。messages_search 的
+	// obo gate（oboCanReadChannel / oboEnumerateReadableChannels）逐频道经此 checker 复用
+	// 发消息侧的 grant + scope + grantorCanReadChannel 实时权限（TOCTOU 一致）。缺此注入则
+	// obo gate 走 errOBONoChecker fail-closed，OBO 搜索会被整体拒绝。
+	ba.searchHandler.SetOBOChecker(ba)
 	ba.searchHandler.MountSubtree(r, "/v1/bot/messages",
 		ba.authBot(),
 		ba.botActorUID(),
@@ -50,7 +55,10 @@ func (ba *BotAPI) mountSearchRoutes(r *wkhttp.WKHttp) {
 
 // resolveSearchPrincipal 是 bot 搜索的 principal 解析中间件（authBot 之后、
 // searchRateLimiter 之前运行）。它按 on_behalf_of 落 as-bot 或 as-user(OBO) 主体，
-// 供后续限流/审计/handler 统一经 principal 读取。
+// 供后续限流/审计/handler 统一经 principal 读取。App Bot 在两条分支都在主体构造阶段
+// fail-closed 拒绝（一期不做）。as-user(OBO) 分支在入口做 channel 无关的 grant 存在性
+// fail-fast（validateSearchOBO），逐频道的 scope + TOCTOU 收敛下沉到 messages_search 的
+// obo gate（复用注入的 ba.SearchOBOAllowed，见 mountSearchRoutes）。
 func (ba *BotAPI) resolveSearchPrincipal(c *wkhttp.Context) {
 	obo := parseSearchOnBehalfOf(c)
 	if obo == "" {
@@ -73,14 +81,28 @@ func (ba *BotAPI) resolveSearchPrincipal(c *wkhttp.Context) {
 		return
 	}
 
-	// as-user(OBO)：on_behalf_of 存在 → 以 grantor 身份搜索。grant + scope +
-	// grantorCanReadChannel 的实时权限校验（TOCTOU 与发消息侧一致）由 validateSearchOBO
-	// 承载——YUJ-53 / #F 复用 obo_check.go 接线；在其落地前本层 fail-closed，绝不放行
-	// 未校验的 as-user 搜索。
+	// as-user(OBO)：on_behalf_of 存在 → 以 grantor 身份搜索。
 	botUID := getRobotIDFromContext(c)
+
+	// App Bot 一期整体不做，且拿不到 OBO grant（grant 只查 robot 表，App Bot 在 app_bot
+	// 表）。在主体构造阶段显式 fail-closed 拒绝——与 as-bot 分支一致，而非放行后靠 obo gate
+	// 静默返回空，避免 App Bot 搜索被误当作「无结果」。
+	if getBotKindFromContext(c) == BotKindApp {
+		ba.Warn("search OBO denied: app bot is not supported (YUJ-49)",
+			zap.String("bot", botUID))
+		httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIBotUnavailable, nil, nil)
+		c.Abort()
+		return
+	}
+
+	// 入口 grant 存在性 fail-fast（channel 无关）：bot 当前是否被 grantor 授权（active=1 且
+	// global_enabled=1，与发消息侧 checkOBO 的 grant 门同一谓词）。无 grant → 整体拒绝，
+	// 避免把完全未授权的 OBO 搜索降级为「逐频道过滤后 200 空结果」。逐频道的 scope +
+	// grantorCanReadChannel 实时权限（TOCTOU 与发消息侧一致）由 messages_search 的 obo gate
+	// 经注入的 ba.SearchOBOAllowed 收敛（见 mountSearchRoutes / obo.go）。
 	if err := ba.validateSearchOBO(c, botUID, obo); err != nil {
 		if errors.Is(err, ErrOBONotAuthorized) {
-			ba.Warn("search OBO denied: no active grant/scope",
+			ba.Warn("search OBO denied: no active grant",
 				zap.String("bot", botUID), zap.String("on_behalf_of", obo))
 			httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIOBONotAuthorized, nil, nil)
 			c.Abort()
@@ -92,9 +114,8 @@ func (ba *BotAPI) resolveSearchPrincipal(c *wkhttp.Context) {
 		c.Abort()
 		return
 	}
-	// spaceID 目前不从 bot 请求携带（bot 无 space_member）；OBO 场景的 Space 归属由 #F
-	// 随 grantor 解析并注入。#B 先以空 spaceID 组装载体（在 validateSearchOBO 放行前不
-	// 可达此处），待 #F 接线后补全。
+	// spaceID 不从 bot 请求携带（bot 无 space_member）。P2P 分支回退到 grantor 好友判定
+	// （安全，grantor=创建者）；群/子区经 obo gate 逐频道 ∩ scope 收敛，不依赖 spaceID。
 	p, err := messages_search.NewOBOPrincipal(botUID, obo, "")
 	if err != nil {
 		ba.Warn("search OBO principal build failed",
@@ -107,16 +128,31 @@ func (ba *BotAPI) resolveSearchPrincipal(c *wkhttp.Context) {
 	c.Next()
 }
 
-// validateSearchOBO 是 as-user(OBO) 搜索的实时权限校验挂载点（YUJ-53 / #F）。
-// #F 将在此复用 obo_check.go 的 grant + scope + grantorCanReadChannel（TOCTOU 与发消息
-// 侧一致）做实时收敛。#B（本层仅入口接线）fail-closed：on_behalf_of 搜索在 #F 落地前
-// 一律按未授权拒绝，杜绝放行任何未经校验的 as-user 搜索。返回 ErrOBONotAuthorized 时
-// 调用方隐藏 grant 是否存在（与发消息侧一致的存在性隐藏）。
+// validateSearchOBO 是 as-user(OBO) 搜索的入口 fail-fast：channel 无关地校验 bot 当前是否
+// 被 grantor 授权（active=1 且 global_enabled=1 的 grant 行，与发消息侧 checkOBO 的 grant
+// 门同一谓词）。逐频道的 scope + grantorCanReadChannel 实时权限（TOCTOU）不在此层——它需要
+// channel 维度，由 messages_search 的 obo gate 经注入的 ba.SearchOBOAllowed 承载（决策九：
+// 单频道门与 global allowlist 共用同一谓词）。
+//
+// 返回约定：
+//   - nil                    → grant 存在，principal 可组装；越权收敛交给逐频道 gate。
+//   - ErrOBONotAuthorized     → 无 active+enabled grant / 主体缺失 / 自授 → 整体拒绝
+//     （存在性隐藏，与发消息侧一致，不泄露 grant 是否存在）。
+//   - 其他 err                → 基础设施错误 → 调用方 fail-closed（INTERNAL）。
 func (ba *BotAPI) validateSearchOBO(c *wkhttp.Context, botUID, grantorUID string) error {
 	_ = c
-	_ = botUID
-	_ = grantorUID
-	return ErrOBONotAuthorized
+	if botUID == "" || grantorUID == "" || botUID == grantorUID {
+		// 与 checkOBO 一致的 fail-closed：主体缺失 / 自授一律未授权。
+		return ErrOBONotAuthorized
+	}
+	grant, err := ba.oboStoreOrDefault().findActiveGrantByGrantorBot(grantorUID, botUID)
+	if err != nil {
+		return err
+	}
+	if grant == nil {
+		return ErrOBONotAuthorized
+	}
+	return nil
 }
 
 // parseSearchOnBehalfOf 读取并还原请求 body，解析出 on_behalf_of（缺失 / body 为空 /
