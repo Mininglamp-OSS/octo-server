@@ -286,16 +286,17 @@ func docsBanner(actor, suffix string) map[string]interface{} {
 	}
 }
 
-// docsRequesterRow builds [avatar?] [name / role] [timestamp]. Returns nil when
-// there is nothing to show (no actor, no timestamp).
+// docsRequesterRow builds [avatar?] [name / role] [timestamp]. Returns nil for an
+// anonymous request (no actor): the banner already conveys it, and a lone
+// role/timestamp with no name reads as broken.
 func docsRequesterRow(actor, avatar, roleLabel, timestamp string) map[string]interface{} {
 	actor = truncateRunes(strings.TrimSpace(actor), maxActorRunes)
 	timestamp = truncateRunes(strings.TrimSpace(timestamp), maxTimestampRunes)
-	if actor == "" && timestamp == "" {
+	if actor == "" {
 		return nil
 	}
 	var columns []interface{}
-	if actor != "" && avatar != "" {
+	if avatar != "" {
 		columns = append(columns, map[string]interface{}{
 			"type": "Column", "width": "auto", "verticalContentAlignment": "Center",
 			"items": []interface{}{
@@ -306,12 +307,11 @@ func docsRequesterRow(actor, avatar, roleLabel, timestamp string) map[string]int
 			},
 		})
 	}
-	nameItems := []interface{}{}
-	if actor != "" {
-		nameItems = append(nameItems, map[string]interface{}{
+	nameItems := []interface{}{
+		map[string]interface{}{
 			"type": "TextBlock", "text": escapeMarkdown(actor),
 			"weight": "Bolder", "wrap": false, "spacing": "None",
-		})
+		},
 	}
 	if strings.TrimSpace(roleLabel) != "" {
 		nameItems = append(nameItems, map[string]interface{}{
