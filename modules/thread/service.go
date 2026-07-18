@@ -467,6 +467,44 @@ func (s *Service) sendThreadCreatedMessage(groupNo, shortID, name, creatorUID, c
 	}
 }
 
+// buildThreadRenamedPayload 构建子区改名 Tip 系统消息的 payload。
+// 与群改名（octo-lib msg_group.go SendGroupUpdate 的 GroupAttrKeyName 分支）对称：
+// content 以 "{0}" 占位符开头，客户端渲染时用 extra[0] 的用户名替换成 operator 显示名。
+func buildThreadRenamedPayload(operatorUID, operatorName, name string) map[string]interface{} {
+	return map[string]interface{}{
+		"from_uid":  operatorUID,
+		"from_name": operatorName,
+		"content":   fmt.Sprintf(`{0}修改子区名为"%s"`, name),
+		"extra": []config.UserBaseVo{
+			{UID: operatorUID, Name: operatorName},
+		},
+		"type": common.Tip,
+	}
+}
+
+// sendThreadRenamedMessage 子区改名成功后向子区 channel 发一条 Tip 系统消息，
+// 与群改名（octo-lib SendGroupUpdate）对称。best-effort：失败仅告警，改名已落库不回滚，
+// 推送标题缓存失效 + TTL 兜底。
+func (s *Service) sendThreadRenamedMessage(groupNo, shortID, operatorUID, name string) {
+	channelID := BuildChannelID(groupNo, shortID)
+	payload := buildThreadRenamedPayload(operatorUID, s.getUserName(operatorUID), name)
+
+	err := s.ctx.SendMessage(&config.MsgSendReq{
+		Header: config.MsgHeader{
+			NoPersist: 0,
+			RedDot:    1,
+			SyncOnce:  0,
+		},
+		FromUID:     operatorUID,
+		ChannelID:   channelID,
+		ChannelType: common.ChannelTypeCommunityTopic.Uint8(),
+		Payload:     []byte(util.ToJson(payload)),
+	})
+	if err != nil {
+		s.Warn("发送子区改名消息失败", zap.Error(err), zap.String("channel_id", channelID))
+	}
+}
+
 // sendSourceMessage 将源消息拷贝到子区频道作为首条消息
 // fromUID 应该是经过服务端验证的原始消息发送者
 func (s *Service) sendSourceMessage(channelID, fromUID string, payload json.RawMessage) {
@@ -546,6 +584,9 @@ func (s *Service) UpdateName(groupNo, shortID, operatorUID, name string) error {
 	if err := pushcache.InvalidateThreadName(s.ctx.GetRedisConn(), channelID); err != nil {
 		s.Warn("失效子区名推送缓存失败", zap.String("channel_id", channelID), zap.Error(err))
 	}
+
+	// 子区改名补发 Tip 系统消息，与群改名对称（防滥用 + 可追溯）。best-effort：失败不回滚改名。
+	s.sendThreadRenamedMessage(groupNo, shortID, operatorUID, name)
 	return nil
 }
 
