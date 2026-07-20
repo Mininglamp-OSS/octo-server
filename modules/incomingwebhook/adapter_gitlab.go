@@ -338,8 +338,12 @@ func renderGitLabMergeRequest(ev *glMergeRequestEvent) string {
 		// 缺 action 字段的畸形 payload：没有可渲染的动作 → skip（唯一保留的过滤）。
 		return ""
 	}
+	// verb 可能是 glActionVerb 未知动作时原样透传的外部 action 值：拼进
+	// `**actor** verb merge request` 纯文本前必须转义，否则一个恶意 action（如
+	// `**pwn** [x](http://evil)`）能伪造粗体/可点击链接——与 actor/title 等外部字段
+	// 同一套 mdInertText 处理（trust-boundary.md，Opus 4.8 code review 发现）。
 	return glWithRepo(fmt.Sprintf("**%s** %s merge request [!%d %s](%s)",
-		glActor(ev.User.Username, ev.User.Name), verb, ev.ObjectAttributes.IID,
+		glActor(ev.User.Username, ev.User.Name), mdInertText(verb, glActorMax), ev.ObjectAttributes.IID,
 		mdLinkText(ev.ObjectAttributes.Title, 200), ev.ObjectAttributes.URL),
 		ev.Project)
 }
@@ -350,7 +354,7 @@ func renderGitLabIssue(ev *glIssueEvent) string {
 		return ""
 	}
 	return glWithRepo(fmt.Sprintf("**%s** %s issue [#%d %s](%s)",
-		glActor(ev.User.Username, ev.User.Name), verb, ev.ObjectAttributes.IID,
+		glActor(ev.User.Username, ev.User.Name), mdInertText(verb, glActorMax), ev.ObjectAttributes.IID,
 		mdLinkText(ev.ObjectAttributes.Title, 200), ev.ObjectAttributes.URL),
 		ev.Project)
 }
@@ -424,6 +428,10 @@ func glActor(username, name string) string {
 // 曾经跳过的动作现在也推送）——返回空仅表示 action 字段本身缺省（畸形 payload，没
 // 有可渲染的动作），调用方据此走 skip，这是唯一保留的过滤。已知值给出通顺的英文
 // 过去式；未知/GitLab 未来新增的值原样透传，避免每次 GitLab 加新 action 都要改代码。
+//
+// ⚠️ 未知值分支直接回传外部输入本身（action 字段无枚举校验，任何持有 URL token 的
+// 调用方都能自定义）——调用方必须在拼进 markdown/card 前用 mdInertText / escapeCardText
+// 转义这个返回值，不能假设它总是字面量安全（Opus 4.8 code review 发现的注入口）。
 func glActionVerb(action string) string {
 	switch action {
 	case "":
@@ -569,7 +577,7 @@ func buildGitLabMergeRequestCard(ev *glMergeRequestEvent, lang string) map[strin
 	return vcsCardData{
 		source:   cardSourceGitLab,
 		variant:  "vcs.gitlab.merge_request",
-		headline: fmt.Sprintf("%s %s a merge request", glActorCard(ev.User.Username, ev.User.Name), verb),
+		headline: fmt.Sprintf("%s %s a merge request", glActorCard(ev.User.Username, ev.User.Name), escapeCardText(verb, cardActorMax)),
 		subtitle: escapeCardText(ev.Project.PathWithNamespace, cardTitleMax),
 		lines:    []string{numberedTitle("!", ev.ObjectAttributes.IID, ev.ObjectAttributes.Title)},
 		facts:    facts,
@@ -589,7 +597,7 @@ func buildGitLabIssueCard(ev *glIssueEvent, lang string) map[string]interface{} 
 	return vcsCardData{
 		source:   cardSourceGitLab,
 		variant:  "vcs.gitlab.issue",
-		headline: fmt.Sprintf("%s %s an issue", glActorCard(ev.User.Username, ev.User.Name), verb),
+		headline: fmt.Sprintf("%s %s an issue", glActorCard(ev.User.Username, ev.User.Name), escapeCardText(verb, cardActorMax)),
 		subtitle: escapeCardText(ev.Project.PathWithNamespace, cardTitleMax),
 		lines:    []string{numberedTitle("#", ev.ObjectAttributes.IID, ev.ObjectAttributes.Title)},
 		facts:    facts,
@@ -598,26 +606,21 @@ func buildGitLabIssueCard(ev *glIssueEvent, lang string) map[string]interface{} 
 }
 
 // glLabelsFact builds the shared "Labels (N)" FactSet row for the MR/Issue cards
-// (nil when the event carries no labels, so the caller omits the row entirely).
-// Label titles are project-defined free text — escaped per leaf like the pipeline
-// card's Jobs fact — and capped at maxRenderedLabels with a trailing "…"; the count
-// in the title always reflects the true total, not the truncated list.
+// (nil when there is nothing to show — no labels, or every label title is blank —
+// so the caller omits the row entirely). Label titles are project-defined free text,
+// escaped/capped by the shared glCappedFactValue (same convention as the pipeline
+// card's Jobs fact); the count in the title reflects the real (non-blank) total, not
+// the truncated list.
 func glLabelsFact(title string, labels []glLabel) *vcsFact {
-	if len(labels) == 0 {
+	names := make([]string, len(labels))
+	for i, l := range labels {
+		names[i] = l.Title
+	}
+	value, n := glCappedFactValue(names, maxRenderedLabels)
+	if n == 0 {
 		return nil
 	}
-	names := make([]string, 0, maxRenderedLabels)
-	for i, l := range labels {
-		if i == maxRenderedLabels {
-			break
-		}
-		names = append(names, escapeCardText(l.Title, cardActorMax))
-	}
-	value := strings.Join(names, " / ")
-	if len(labels) > maxRenderedLabels {
-		value += " …"
-	}
-	return &vcsFact{title: fmt.Sprintf("%s (%d)", title, len(labels)), value: value}
+	return &vcsFact{title: fmt.Sprintf("%s (%d)", title, n), value: value}
 }
 
 func buildGitLabNoteCard(ev *glNoteEvent, lang string) map[string]interface{} {
@@ -661,21 +664,13 @@ func buildGitLabPipelineCard(ev *glPipelineEvent, lang string) map[string]interf
 		facts = append(facts, vcsFact{title: labels.duration, value: dur})
 	}
 	if len(ev.Builds) > 0 {
-		names := make([]string, 0, maxRenderedJobs)
+		names := make([]string, len(ev.Builds))
 		for i, b := range ev.Builds {
-			if i == maxRenderedJobs {
-				break
-			}
-			names = append(names, escapeCardText(b.Name, cardActorMax))
+			names[i] = b.Name
 		}
-		value := strings.Join(names, " / ")
-		if len(ev.Builds) > maxRenderedJobs {
-			value += " …"
+		if value, n := glCappedFactValue(names, maxRenderedJobs); n > 0 {
+			facts = append(facts, vcsFact{title: fmt.Sprintf("%s (%d)", labels.jobs, n), value: value})
 		}
-		facts = append(facts, vcsFact{
-			title: fmt.Sprintf("%s (%d)", labels.jobs, len(ev.Builds)),
-			value: value,
-		})
 	}
 	url := ""
 	if p := httpURLForCard(ev.Project.WebURL); p != "" {

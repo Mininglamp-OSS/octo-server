@@ -247,6 +247,19 @@ func TestBuildGitLabMergeRequestCard_Facts(t *testing.T) {
 	t.Run("missing action has no card (nothing to render)", func(t *testing.T) {
 		assert.Nil(t, glMergeRequestCardFrom(t, `{"object_attributes":{}}`))
 	})
+
+	t.Run("hostile unknown action is escaped in the card headline (trust-boundary)", func(t *testing.T) {
+		// action is an unvalidated external field (any URL-token holder sets it) — the
+		// glActionVerb raw-passthrough fallback must be escaped before it reaches the
+		// card headline TextBlock, same as every other external leaf on this card.
+		card := glMergeRequestCardFrom(t, `{"user":{"username":"carol"},
+			"object_attributes":{"iid":1,"title":"x","action":"**pwn** [x](http://evil.example)"}}`)
+		require.NotNil(t, card)
+		require.NoError(t, validateVCSCard(card), "server-built card must pass cardmsg.Validate")
+		leaves := cardBodyText(card)
+		assert.Contains(t, leaves, `\*\*pwn\*\* \[x\]\(http://evil.example\)`,
+			"markdown metacharacters in an unmapped action must be escaped, never form a live link/emphasis")
+	})
 }
 
 func TestBuildGitLabIssueCard_Facts(t *testing.T) {
@@ -273,6 +286,14 @@ func TestBuildGitLabIssueCard_Facts(t *testing.T) {
 			el, _ := it.(map[string]interface{})
 			assert.NotEqual(t, "FactSet", el["type"])
 		}
+	})
+
+	t.Run("hostile unknown action is escaped in the card headline (trust-boundary)", func(t *testing.T) {
+		card := glIssueCardFrom(t, `{"user":{"username":"dave"},
+			"object_attributes":{"iid":7,"title":"Login broken","action":"**pwn** [x](http://evil.example)"}}`)
+		require.NotNil(t, card)
+		require.NoError(t, validateVCSCard(card), "server-built card must pass cardmsg.Validate")
+		assert.Contains(t, cardBodyText(card), `\*\*pwn\*\* \[x\]\(http://evil.example\)`)
 	})
 }
 

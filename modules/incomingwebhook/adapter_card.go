@@ -280,6 +280,36 @@ const maxRenderedJobs = 8
 // fact lists before eliding — same elide convention as maxRenderedJobs.
 const maxRenderedLabels = 10
 
+// glCappedFactValue builds a capped, "/"-joined FactSet value from raw external name
+// strings — shared by the pipeline card's Jobs fact and the GitLab MR/Issue Labels
+// fact (previously duplicated inline at each call site, which could let their
+// escaping/capping decisions silently drift apart). Each name is escaped via
+// escapeCardText; blank names (e.g. an empty label title) are dropped before capping
+// and counting, so the fact never shows an empty slot or an inflated (N). Returns
+// ("", 0) when there is nothing left to show — the caller omits the FactSet row
+// entirely in that case.
+func glCappedFactValue(rawNames []string, max int) (value string, count int) {
+	names := make([]string, 0, len(rawNames))
+	for _, n := range rawNames {
+		if v := escapeCardText(n, cardActorMax); v != "" {
+			names = append(names, v)
+		}
+	}
+	if len(names) == 0 {
+		return "", 0
+	}
+	shown := names
+	overflow := len(names) > max
+	if overflow {
+		shown = names[:max]
+	}
+	value = strings.Join(shown, " / ")
+	if overflow {
+		value += " …"
+	}
+	return value, len(names)
+}
+
 // vcsCardLabels are the localized FactSet titles for the GitLab merge_request card's
 // Source/Target branch rows and the Labels row shared with the issue card (issues
 // have no source/target branch).

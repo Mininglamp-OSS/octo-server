@@ -228,10 +228,26 @@ func TestParseGitLabPush_MergeRequest(t *testing.T) {
 		require.NotNil(t, req)
 		assert.Contains(t, req.Content, "**carol** updated merge request [!12 Add feature](https://gitlab.com/o/r/-/merge_requests/12)")
 	})
-	t.Run("unknown action falls back to the raw value", func(t *testing.T) {
+	t.Run("known unfiltered action gets a natural verb", func(t *testing.T) {
 		req, _, _ := parseGitLabPush(glHeader("Merge Request Hook"), []byte(fmt.Sprintf(tpl, "approved")))
 		require.NotNil(t, req)
 		assert.Contains(t, req.Content, "**carol** approved merge request")
+	})
+	t.Run("truly unknown action falls back to the raw value", func(t *testing.T) {
+		// A value with no case in glActionVerb (unlike "approved"/"update" above, which
+		// are explicitly mapped) — exercises the default: return action branch. The `_`
+		// is escaped by mdInertText like any other external field (expected, not a bug).
+		req, _, _ := parseGitLabPush(glHeader("Merge Request Hook"), []byte(fmt.Sprintf(tpl, "resolve_all_discussions")))
+		require.NotNil(t, req)
+		assert.Contains(t, req.Content, `**carol** resolve\_all\_discussions merge request`)
+	})
+	t.Run("hostile unknown action is escaped, not rendered live (trust-boundary)", func(t *testing.T) {
+		// action has no enum validation — any URL-token holder can set it. The
+		// raw-passthrough fallback in glActionVerb must not let it forge markdown.
+		req, _, _ := parseGitLabPush(glHeader("Merge Request Hook"), []byte(fmt.Sprintf(tpl, "**pwn** [x](http://evil.example)")))
+		require.NotNil(t, req)
+		assert.Contains(t, req.Content, `\*\*pwn\*\* \[x\](http://evil.example)`,
+			"markdown metacharacters in an unmapped action must be escaped, not rendered live")
 	})
 	t.Run("missing action is still skipped (malformed payload)", func(t *testing.T) {
 		body := `{"user":{"username":"carol"},"object_attributes":{"iid":12,"title":"Add feature","url":"https://gitlab.com/o/r/-/merge_requests/12"}}`
@@ -254,6 +270,12 @@ func TestParseGitLabPush_Issue(t *testing.T) {
 		req, _, _ := parseGitLabPush(glHeader("Issue Hook"), []byte(body))
 		require.NotNil(t, req)
 		assert.Contains(t, req.Content, "**dan** updated issue [#3 Bug](https://gitlab.com/o/r/-/issues/3)")
+	})
+	t.Run("hostile unknown action is escaped (trust-boundary, same call site as MR)", func(t *testing.T) {
+		body := `{"user":{"username":"dan"},"object_attributes":{"iid":3,"title":"Bug","url":"https://gitlab.com/o/r/-/issues/3","action":"**pwn** [x](http://evil.example)"}}`
+		req, _, _ := parseGitLabPush(glHeader("Issue Hook"), []byte(body))
+		require.NotNil(t, req)
+		assert.Contains(t, req.Content, `\*\*pwn\*\* \[x\](http://evil.example)`)
 	})
 	t.Run("missing action is still skipped (malformed payload)", func(t *testing.T) {
 		body := `{"user":{"username":"dan"},"object_attributes":{"iid":3,"title":"Bug","url":"https://gitlab.com/o/r/-/issues/3"}}`
