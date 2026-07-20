@@ -1,7 +1,7 @@
 ---
 type: Journal
 title: "Journal: gitlab-mr-issue-cards"
-description: GitLab merge_request/issue cards gained a Source/Target branch + Labels FactSet; the adapter stopped filtering MR/Issue actions and pipeline statuses per explicit product decision. Two follow-up reviews (one delegated, one human PR review) each caught a real trust-boundary bug introduced by the filter removal — the second was the exact same bug class applied to a sibling field the first fix missed.
+description: GitLab merge_request/issue cards gained a Source/Target branch + Labels FactSet; the adapter stopped filtering MR/Issue actions and pipeline statuses per explicit product decision. Three independent review passes each caught a real trust-boundary escaping gap in the same file, two introduced by the filter removal and one pre-existing — all three the same "whitelist-gate-as-implicit-sanitizer" bug class.
 tags: ["incomingwebhook", "adapter", "gitlab", "card", "trust-boundary", "external-content", "markdown", "code-review"]
 timestamp: 2026-07-20T00:00:00Z
 # --- octospec extension fields ---
@@ -13,7 +13,7 @@ source: self
 
 ## What was done
 
-Three commits on `feat/gitlab-mr-issue-cards`:
+Five commits on `feat/gitlab-mr-issue-cards`:
 
 1. **Add source/target branch + labels to GitLab MR/Issue cards.** The
    `merge_request`/`issue` InteractiveCards (shipped in #596) only carried a
@@ -47,19 +47,38 @@ Three commits on `feat/gitlab-mr-issue-cards`:
    minor bug where a blank label title would inflate the `Labels(N)` count
    with an empty slot.
 
-4. **Fix: escape the pipeline status too (caught by human PR review).** After
-   the PR was opened, a human reviewer (lml2468) found that commit 2 removed
+4. **Fix: escape the pipeline status too (caught by PR review).** After
+   the PR was opened, a reviewer (lml2468) found that commit 2 removed
    the *pipeline* status whitelist gate but the raw `ev.ObjectAttributes.Status`
    was still interpolated unescaped in `renderGitLabPipeline`'s text path (the
    pipeline card path was already correctly escaped via `escapeCardText`,
    only the text path had the gap). This is the **identical bug class** as
    commit 3, on the sibling field the earlier review didn't examine — the
-   delegated review had only seen the diff up to commit 2, and my own commit
+   first review had only seen the diff up to commit 2, and my own commit
    3 fix pattern-matched on `glActionVerb` specifically without checking
    whether the same "gate removed, escaping not added" gap existed anywhere
    else the same PR touched. Fixed identically: `mdInertText(status, glActorMax)`
    at both `renderGitLabPipeline` branches, with regression tests for both
    (web_url present/absent).
+
+5. **Fix: escape `glActor`'s `username` branch (pre-existing, folded in on
+   re-review).** A second reviewer (yujiawei) re-reviewed after commit 4 and
+   found a *third* instance of the same bug class — this one pre-existing,
+   byte-identical to `main`, not introduced by this task. `glActor` assumed
+   GitLab's restricted username charset (`[a-zA-Z0-9_.-]`) made the `username`
+   branch safe to interpolate raw; that assumption does not hold at this
+   endpoint's actual trust boundary (it only verifies a shared secret token,
+   not that the payload genuinely came from GitLab), so a token holder could
+   set `username` to arbitrary markdown-bearing text. Folded into this PR
+   (rather than filed separately) since it's the same file, same pattern, and
+   the fix is the one-line change already applied twice above:
+   `mdInertText(username, glActorMax)`, matching `glActorCard`'s card-path
+   equivalent which was already correct. Also addressed two non-blocking
+   review nits picked up in the same pass: `formatPipelineDuration` now
+   prefixes `>` when it clamps a hostile duration (so a clamped value reads
+   distinctly from a genuine ~100h pipeline), and `glCappedFactValue` uses a
+   new dedicated `cardFactItemMax` constant instead of reusing the
+   actor-name-sized `cardActorMax` for job/label name truncation.
 
 ## Load-bearing decisions
 
@@ -72,39 +91,50 @@ Three commits on `feat/gitlab-mr-issue-cards`:
   the render call sites — the bug shipped in the same commit as the filter
   removal and was only caught by an independent review pass. See the pending
   learning below.
-- **Escape at the leaf, not at the source-of-truth function.** The fix escapes
-  `verb` at each of the 4 interpolation sites (2 text, 2 card) rather than
-  inside `glActionVerb` itself, matching this file's existing convention
-  (`glActor`/`glActorCard` are also un-escaped and escaped by their callers)
-  and keeping the text/card paths' different escapers (`mdInertText` vs
-  `escapeCardText`) correctly separated.
+- **Escape at the boundary that's actually load-bearing, not by convention
+  alone.** `verb` is escaped at each of its 4 interpolation sites (2 text, 2
+  card) rather than inside `glActionVerb`, because callers need it as a plain
+  string for both a `mdInertText`- and an `escapeCardText`-shaped context.
+  `glActor`/`glActorCard`, by contrast, escape *inside* the helper (as of
+  commit 5) — there both call sites want the same one string back, so there's
+  no reason to push the escaping decision out to callers. Same principle
+  ("escape once, correctly, at whichever point makes every caller safe by
+  construction"), different shape depending on how many distinct contexts a
+  value flows into.
 - **Filtering removal is a product decision, not a technical default.** The
   user was shown the concrete consequence before confirming; this is recorded
   here so a future reader doesn't mistake the wide-open behavior for an
   oversight and "fix" it back to filtered without checking history first.
 
-## Process note: two independent reviews, two instances of the same bug class
+## Process note: three independent review passes, three instances of the same bug class
 
-The user asked to delegate a code review to a fresh Opus 4.8 subagent (via the
-`Agent` tool, `code-review` skill, high effort) against the diff at that point
-(commits 1+2, before commit 3 existed). It correctly identified the `action`
-escaping gap as HIGH severity, correctly identified that the existing "unknown
-action" test didn't actually exercise the raw-passthrough branch (it used
+A first review pass (before commit 3 existed) caught the `action` escaping
+gap as HIGH severity, correctly identified that the existing "unknown action"
+test didn't actually exercise the raw-passthrough branch (it used
 `"approved"`, which is an explicitly-mapped case), and flagged the Jobs/Labels
 duplication. All three were fixed in commit 3.
 
-A human PR reviewer (lml2468) then found that the fix in commit 3 was
-*incomplete*: it treated the bug as specific to `glActionVerb`/`action` and
-didn't check whether the same "gate removed → escaping assumption broken"
-pattern applied to `status`, which the very same commit-2 change had also
-un-gated. It had. This is a direct, concrete instance of the pending learning
-this task itself filed (`gitlab-mr-issue-cards-whitelist-gate-sanitizer.md`)
-— point 4 of that learning ("when reviewing a widen-this-gate change, ask
-whether the restricted output range was load-bearing for escaping anywhere
-downstream") should have been applied to *both* fields removed by commit 2,
-not just the one a first review happened to flag. Fixed in commit 4 with the
-identical pattern, plus regression tests for both `renderGitLabPipeline`
-branches.
+A PR reviewer (lml2468) then found that the fix in commit 3 was *incomplete*:
+it treated the bug as specific to `glActionVerb`/`action` and didn't check
+whether the same "gate removed → escaping assumption broken" pattern applied
+to `status`, which the very same commit-2 change had also un-gated. It had.
+This is a direct, concrete instance of the pending learning this task itself
+filed (`gitlab-mr-issue-cards-whitelist-gate-sanitizer.md`) — point 4 of that
+learning ("when reviewing a widen-this-gate change, ask whether the
+restricted output range was load-bearing for escaping anywhere downstream")
+should have been applied to *both* fields removed by commit 2, not just the
+one a first review happened to flag. Fixed in commit 4.
+
+A second reviewer (yujiawei) re-reviewed after commit 4 and found a *third*
+instance — pre-existing in `glActor`, not introduced by this PR, but the same
+"an assumption made the field implicitly safe, and the assumption was never
+actually enforced by code" shape (here: assumed GitLab's username charset,
+rather than a removed whitelist, made escaping unnecessary). Fixed in
+commit 5, along with two smaller non-blocking review nits (mochashanyao:
+duration-clamp indicator; yujiawei: dedicated fact-item-length constant).
+Three passes, three real findings, zero false positives — worth noting for
+calibrating how much a single review pass should be trusted on
+trust-boundary-classified changes.
 
 ## Verification
 

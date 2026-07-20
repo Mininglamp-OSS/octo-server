@@ -341,7 +341,7 @@ func renderGitLabMergeRequest(ev *glMergeRequestEvent) string {
 	// verb 可能是 glActionVerb 未知动作时原样透传的外部 action 值：拼进
 	// `**actor** verb merge request` 纯文本前必须转义，否则一个恶意 action（如
 	// `**pwn** [x](http://evil)`）能伪造粗体/可点击链接——与 actor/title 等外部字段
-	// 同一套 mdInertText 处理（trust-boundary.md，Opus 4.8 code review 发现）。
+	// 同一套 mdInertText 处理（trust-boundary.md）。
 	return glWithRepo(fmt.Sprintf("**%s** %s merge request [!%d %s](%s)",
 		glActor(ev.User.Username, ev.User.Name), mdInertText(verb, glActorMax), ev.ObjectAttributes.IID,
 		mdLinkText(ev.ObjectAttributes.Title, 200), ev.ObjectAttributes.URL),
@@ -414,14 +414,19 @@ func renderGitLabPipeline(ev *glPipelineEvent) string {
 	return glWithRepo(line, ev.Project)
 }
 
-// glActor 优先用 username（GitLab 用户名字符集受限：[a-zA-Z0-9_.-]，进 `**X**` 粗体
-// 无注入面），回退 display name，再兜底 "someone"。display name 是自由文本，进粗体上
-// 下文必须经 mdInertText 转义（`*`/`[`/`]`/`<` 等），否则一个名为
-// `**evil** [x](http://attacker)` 的用户能往群消息里注入粗体+可点击链接——与
-// adapter_multica.go 对 actor/identifier 的处理同口径（#423 review，Jerry-Xin/mochashanyao）。
+// glActor 优先用 username，回退 display name，再兜底 "someone"。两者都经
+// mdInertText 转义（`*`/`[`/`]`/`<` 等），否则一个名为 `**evil** [x](http://attacker)`
+// 的 username/display name 能往群消息里注入粗体+可点击链接——与 adapter_multica.go
+// 对 actor/identifier 的处理同口径（#423 review，Jerry-Xin/mochashanyao）。
+//
+// username 不能只按「GitLab 用户名字符集受限」豁免转义：本端点只校验共享密钥
+// token，并不验证请求真的来自 GitLab，持有 token 的调用方能把 username 设成任意
+// 字符串——与 action/status 曾经「白名单收窄=隐式安全」是同一类陷阱（#610 review，
+// yujiawei 二审发现，预存在于本文件、随本次改动一并修复）。card 路径的 glActorCard
+// 一直就是两个分支都转义，这里是把文本路径补齐到同一口径。
 func glActor(username, name string) string {
 	if username != "" {
-		return username
+		return mdInertText(username, glActorMax)
 	}
 	if name != "" {
 		return mdInertText(name, glActorMax)
@@ -437,7 +442,7 @@ func glActor(username, name string) string {
 //
 // ⚠️ 未知值分支直接回传外部输入本身（action 字段无枚举校验，任何持有 URL token 的
 // 调用方都能自定义）——调用方必须在拼进 markdown/card 前用 mdInertText / escapeCardText
-// 转义这个返回值，不能假设它总是字面量安全（Opus 4.8 code review 发现的注入口）。
+// 转义这个返回值，不能假设它总是字面量安全。
 func glActionVerb(action string) string {
 	switch action {
 	case "":

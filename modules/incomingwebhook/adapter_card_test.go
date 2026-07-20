@@ -200,8 +200,11 @@ func TestFormatPipelineDuration(t *testing.T) {
 	assert.Equal(t, "42s", formatPipelineDuration(42))
 	assert.Equal(t, "7m 26s", formatPipelineDuration(446))
 	assert.Equal(t, "1h 2m", formatPipelineDuration(3720))
-	// A hostile/absurd external duration is clamped, not rendered as "277777777h …".
-	assert.Equal(t, "100h 0m", formatPipelineDuration(1_000_000_000))
+	// A hostile/absurd external duration is clamped, not rendered as "277777777h …",
+	// and prefixed ">" so it reads distinctly from a genuine ~100h pipeline.
+	assert.Equal(t, ">100h 0m", formatPipelineDuration(1_000_000_000))
+	// A duration that lands exactly on the cap is real, not clamped — no prefix.
+	assert.Equal(t, "100h 0m", formatPipelineDuration(maxPipelineDurationSec))
 }
 
 func TestBuildGitLabMergeRequestCard_Facts(t *testing.T) {
@@ -330,6 +333,24 @@ func TestGlLabelsFact_OverflowAndEscaping(t *testing.T) {
 		leaves := cardBodyText(card)
 		assert.Contains(t, leaves, `\*\*evil\*\* \[x\]\(http://attacker\)`,
 			"markdown metacharacters in a label title must be escaped, never form a live link/emphasis")
+	})
+
+	t.Run("whitespace-only label title is dropped, not counted as a blank slot", func(t *testing.T) {
+		// escapeCardText's oneLine() trims a whitespace-only title to "" (unlike a
+		// lone backtick, which cardMarkdownEscaper *escapes* to `\`` rather than
+		// stripping — it does not go blank). glCappedFactValue must drop titles that
+		// come out blank, from both the joined value and the (N) count (PR #610
+		// review, mochashanyao P2: verifies this documented behavior explicitly).
+		card := glMergeRequestCardFrom(t, `{
+			"user": {"username": "carol"},
+			"object_attributes": {"iid": 1, "title": "x", "url": "https://gitlab.com/o/r/-/merge_requests/1", "action": "open"},
+			"labels": [{"title": "backend"}, {"title": "   "}],
+			"project": {"path_with_namespace": "o/r"}
+		}`)
+		require.NotNil(t, card)
+		require.NoError(t, validateVCSCard(card))
+		plain := cardmsg.BuildPlain(card)
+		assert.Contains(t, plain, "Labels (1): backend", "blank title is dropped from both the list and the (N) count")
 	})
 }
 

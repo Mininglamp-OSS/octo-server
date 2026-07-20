@@ -164,6 +164,22 @@ func TestParseGitLabPush_ActorNameEscaped(t *testing.T) {
 	assert.Contains(t, req.Content, `\[x\]`, "actor brackets must be escaped so no clickable link is injected")
 }
 
+// glActor's username branch was historically un-escaped on the assumption that
+// GitLab's real username charset ([a-zA-Z0-9_.-]) makes it injection-free — but this
+// endpoint only verifies a shared secret token, not that the payload is genuinely
+// from GitLab, so a token holder can set username to anything. Same trust-boundary
+// class as the action/status fixes above, found on re-review of this PR after those
+// landed (PR #610 review, yujiawei — pre-existing in glActor, folded in here since
+// it's the exact same file/pattern this change already addresses).
+func TestParseGitLabPush_ActorUsernameEscaped(t *testing.T) {
+	body := `{"user":{"username":"**pwn** [x](http://evil.example)"},
+		"object_attributes":{"iid":1,"title":"t","url":"https://gitlab.com/o/r/-/merge_requests/1","action":"open"}}`
+	req, _, _ := parseGitLabPush(glHeader("Merge Request Hook"), []byte(body))
+	require.NotNil(t, req)
+	assert.Contains(t, req.Content, `\*\*pwn\*\* \[x\](http://evil.example)`,
+		"a hostile username must render as literal escaped text, never forged bold/a live link")
+}
+
 // SHA256 object-format 仓库的全零占位是 64 个 0（SHA1 是 40）。建/删 ref 必须两种都认
 // （#423 review，yujiawei P2.3）。
 func TestParseGitLabPush_SHA256ZeroSentinel(t *testing.T) {

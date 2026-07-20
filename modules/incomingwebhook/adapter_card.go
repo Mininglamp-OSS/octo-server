@@ -280,6 +280,13 @@ const maxRenderedJobs = 8
 // fact lists before eliding — same elide convention as maxRenderedJobs.
 const maxRenderedLabels = 10
 
+// cardFactItemMax bounds a single Jobs/Labels fact item (job name / label title)
+// before it enters the "/"-joined FactSet value. Deliberately its own constant
+// rather than reusing cardActorMax: job names and label titles are a different
+// domain (project-defined, can legitimately run longer) than an actor display
+// name, even though both happened to want 64 today (PR #610 review, yujiawei P2).
+const cardFactItemMax = 64
+
 // glCappedFactValue builds a capped, "/"-joined FactSet value from raw external name
 // strings — shared by the pipeline card's Jobs fact and the GitLab MR/Issue Labels
 // fact (previously duplicated inline at each call site, which could let their
@@ -291,7 +298,7 @@ const maxRenderedLabels = 10
 func glCappedFactValue(rawNames []string, max int) (value string, count int) {
 	names := make([]string, 0, len(rawNames))
 	for _, n := range rawNames {
-		if v := escapeCardText(n, cardActorMax); v != "" {
+		if v := escapeCardText(n, cardFactItemMax); v != "" {
 			names = append(names, v)
 		}
 	}
@@ -345,24 +352,27 @@ const maxPipelineDurationSec = 100 * 3600
 
 // formatPipelineDuration renders a pipeline elapsed time (seconds) as a compact,
 // language-neutral "1h 2m" / "3m 42s" / "42s". <= 0 (missing / null) → ""; values
-// above the sanity cap are clamped.
+// above the sanity cap are clamped and prefixed ">" so a clamped value reads
+// distinctly from a genuine ~100h pipeline (PR #610 review, mochashanyao P2).
 func formatPipelineDuration(sec int) string {
 	if sec <= 0 {
 		return ""
 	}
+	prefix := ""
 	if sec > maxPipelineDurationSec {
 		sec = maxPipelineDurationSec
+		prefix = ">"
 	}
 	h := sec / 3600
 	m := (sec % 3600) / 60
 	s := sec % 60
 	switch {
 	case h > 0:
-		return fmt.Sprintf("%dh %dm", h, m)
+		return prefix + fmt.Sprintf("%dh %dm", h, m)
 	case m > 0:
-		return fmt.Sprintf("%dm %ds", m, s)
+		return prefix + fmt.Sprintf("%dm %ds", m, s)
 	default:
-		return fmt.Sprintf("%ds", s)
+		return prefix + fmt.Sprintf("%ds", s)
 	}
 }
 
