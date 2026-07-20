@@ -4,6 +4,22 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-20 (gitlab-mr-issue-cards)
+
+- **Feature** — GitLab merge_request/issue InteractiveCards gained a
+  Source/Target branch (MR) + Labels(N) FactSet, mirroring the existing
+  pipeline card. Card-only; text degrade path unchanged.
+- **Behavior change** — GitLab adapter no longer filters MR/Issue events by
+  action or pipeline events by status (explicit product decision); every
+  action/status now renders on both text and card paths.
+- **Fix** — A follow-up code review (delegated to an independent Opus 4.8
+  subagent) found the filter-removal had silently reopened a markdown/link
+  injection: `glActionVerb`'s raw-passthrough fallback for unmapped actions
+  was interpolated unescaped. Fixed by escaping at every call site; also
+  deduped the pipeline Jobs / new Labels fact cap-and-join logic. See
+  [journal](journal/shared/gitlab-mr-issue-cards.md) and the pending learning
+  on whitelist-gates-as-implicit-sanitizers.
+
 ## 2026-07-17 (docs-approval-card-enrich)
 
 - **Feature** — Enriched the docs access-request approval card (header + colored
