@@ -154,3 +154,20 @@ trust-boundary-classified changes.
   reintroduced at the same two gate points (`glActionVerb`'s default case,
   `renderGitLabPipeline`/`buildGitLabPipelineCard`'s status check) — now with
   the escaping fix in place regardless of which way that goes.
+- **Deferred (yujiawei, PR #610 review): text-path ref/branch code-span
+  backtick breakout.** `glShortRef` doesn't strip backticks, and its output
+  goes raw into a `` `%s` `` text-path code span at 6 sites: GitLab push
+  branch create/delete, push commit-count line, tag push (2 sites), and
+  pipeline (2 sites — the only ones this PR's changes actually widen
+  exposure to, by rendering non-terminal statuses that previously never
+  reached this code path). A ref/branch name containing a literal backtick
+  is not rejected by git's ref-name rules, so this is a real, not just
+  theoretical, gap. The card path is already safe (`cardCodeSpan` strips
+  backticks via `mdCodeSpanText`). **Not fixed here**: a correct fix needs to
+  touch `renderGitLabPush`/`renderGitLabTagPush` (functions this PR never
+  modified) and, per this repo's adapter-parity rule, the equivalent sink in
+  `adapter_github.go` — fixing only the pipeline half here would leave push/
+  tag/GitHub with the identical gap, which is a worse, inconsistent posture
+  than not touching it. Tracked as a separate follow-up task: harden every
+  GitLab **and** GitHub text-path ref/branch code span (likely route through
+  `mdCodeSpanText`, mirroring what the card path already does).
