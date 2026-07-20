@@ -223,8 +223,19 @@ func TestParseGitLabPush_MergeRequest(t *testing.T) {
 		require.NotNil(t, req)
 		assert.Contains(t, req.Content, "merged merge request")
 	})
-	t.Run("update is skipped", func(t *testing.T) {
-		req, skip, invalid := parseGitLabPush(glHeader("Merge Request Hook"), []byte(fmt.Sprintf(tpl, "update")))
+	t.Run("update is rendered (no longer filtered)", func(t *testing.T) {
+		req, _, _ := parseGitLabPush(glHeader("Merge Request Hook"), []byte(fmt.Sprintf(tpl, "update")))
+		require.NotNil(t, req)
+		assert.Contains(t, req.Content, "**carol** updated merge request [!12 Add feature](https://gitlab.com/o/r/-/merge_requests/12)")
+	})
+	t.Run("unknown action falls back to the raw value", func(t *testing.T) {
+		req, _, _ := parseGitLabPush(glHeader("Merge Request Hook"), []byte(fmt.Sprintf(tpl, "approved")))
+		require.NotNil(t, req)
+		assert.Contains(t, req.Content, "**carol** approved merge request")
+	})
+	t.Run("missing action is still skipped (malformed payload)", func(t *testing.T) {
+		body := `{"user":{"username":"carol"},"object_attributes":{"iid":12,"title":"Add feature","url":"https://gitlab.com/o/r/-/merge_requests/12"}}`
+		req, skip, invalid := parseGitLabPush(glHeader("Merge Request Hook"), []byte(body))
 		assert.Nil(t, req)
 		assert.Equal(t, "event", skip)
 		assert.Empty(t, invalid)
@@ -238,8 +249,14 @@ func TestParseGitLabPush_Issue(t *testing.T) {
 		require.NotNil(t, req)
 		assert.Contains(t, req.Content, "**dan** opened issue [#3 Bug](https://gitlab.com/o/r/-/issues/3)")
 	})
-	t.Run("update is skipped", func(t *testing.T) {
-		body := `{"user":{"username":"dan"},"object_attributes":{"iid":3,"title":"Bug","action":"update"}}`
+	t.Run("update is rendered (no longer filtered)", func(t *testing.T) {
+		body := `{"user":{"username":"dan"},"object_attributes":{"iid":3,"title":"Bug","url":"https://gitlab.com/o/r/-/issues/3","action":"update"}}`
+		req, _, _ := parseGitLabPush(glHeader("Issue Hook"), []byte(body))
+		require.NotNil(t, req)
+		assert.Contains(t, req.Content, "**dan** updated issue [#3 Bug](https://gitlab.com/o/r/-/issues/3)")
+	})
+	t.Run("missing action is still skipped (malformed payload)", func(t *testing.T) {
+		body := `{"user":{"username":"dan"},"object_attributes":{"iid":3,"title":"Bug","url":"https://gitlab.com/o/r/-/issues/3"}}`
 		req, skip, _ := parseGitLabPush(glHeader("Issue Hook"), []byte(body))
 		assert.Nil(t, req)
 		assert.Equal(t, "event", skip)
@@ -289,8 +306,14 @@ func TestParseGitLabPush_Pipeline(t *testing.T) {
 		require.NotNil(t, req)
 		assert.Contains(t, req.Content, "Pipeline [#99](https://gitlab.com/o/r/-/pipelines/99) success on `main`")
 	})
-	t.Run("running is skipped", func(t *testing.T) {
-		req, skip, _ := parseGitLabPush(glHeader("Pipeline Hook"), []byte(fmt.Sprintf(tpl, "running")))
+	t.Run("running is rendered (no longer filtered to terminal statuses)", func(t *testing.T) {
+		req, _, _ := parseGitLabPush(glHeader("Pipeline Hook"), []byte(fmt.Sprintf(tpl, "running")))
+		require.NotNil(t, req)
+		assert.Contains(t, req.Content, "Pipeline [#99](https://gitlab.com/o/r/-/pipelines/99) running on `main`")
+	})
+	t.Run("missing status is still skipped (malformed payload)", func(t *testing.T) {
+		body := `{"object_attributes":{"id":99,"ref":"main"},"project":{"path_with_namespace":"o/r","web_url":"https://gitlab.com/o/r"}}`
+		req, skip, _ := parseGitLabPush(glHeader("Pipeline Hook"), []byte(body))
 		assert.Nil(t, req)
 		assert.Equal(t, "event", skip)
 	})

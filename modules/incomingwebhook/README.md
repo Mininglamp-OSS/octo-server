@@ -297,10 +297,10 @@ POST /v1/incoming-webhooks/:webhook_id/:token/gitlab
 |------|-----------|------|
 | `Push Hook` | — | 分支 push、建/删分支；最多列 5 条提交 |
 | `Tag Push Hook` | — | 建/删标签 |
-| `Merge Request Hook` | `open` / `merge` / `close` / `reopen` | `update`/`approved` 等刷屏动作跳过 |
-| `Issue Hook` | `open` / `close` / `reopen` | `update` 跳过 |
-| `Note Hook` | 评论（MR / Issue / Commit） | 评论摘要压成单行、截断 300 rune |
-| `Pipeline Hook` | `success` / `failed` / `canceled` | `running`/`pending` 等非终态跳过 |
+| `Merge Request Hook` | 所有 action（`open`/`close`/`reopen`/`merge`/`update`/`approved`/... ） | 卡片带 Source/Target 分支 + Labels FactSet；只有缺 `action` 字段的畸形 payload 才跳过 |
+| `Issue Hook` | 所有 action | 卡片带 Labels FactSet；只有缺 `action` 字段的畸形 payload 才跳过 |
+| `Note Hook` | 评论（MR / Issue / Commit） | 评论摘要压成单行、截断 300 rune；GitLab 自动生成的系统备注（改标签/指派等）跳过 |
+| `Pipeline Hook` | 所有 status（`success`/`failed`/`canceled`/`running`/`pending`/...） | 卡片带 Branch/Status/Duration/Jobs FactSet；只有缺 `status` 字段的畸形 payload 才跳过 |
 
 子集之外的事件/动作返回 200 + `{"skipped":"event"}`（GitLab 侧投递成功、不标红），缺
 `X-Gitlab-Event` 头按 400 `reason=no_event` 拒绝（与 github 同口径，可在 deliveries 里

@@ -182,8 +182,17 @@ func TestBuildGitLabPipelineCard_StatusColor(t *testing.T) {
 	assert.Contains(t, plain, "Jobs (5): build / unit / lint / e2e / deploy")
 	assert.Equal(t, "https://gitlab.com/grp/app/-/pipelines/4567", cardActionURL(card))
 
-	// Non-terminal status → no card (degrades to text/skip upstream).
-	assert.Nil(t, glPipelineCardFrom(t, `{"object_attributes":{"status":"running"}}`))
+	// Non-terminal status is rendered too (no longer filtered to success/failed/canceled) —
+	// no color mapping for it, so the headline keeps the default color.
+	running := glPipelineCardFrom(t, `{"object_attributes":{"id":1,"status":"running"}}`)
+	require.NotNil(t, running)
+	require.NoError(t, validateVCSCard(running))
+	runningBody0 := running["body"].([]interface{})[0].(map[string]interface{})
+	assert.NotContains(t, runningBody0, "color", "unmapped status keeps the default headline color")
+	assert.Contains(t, cardmsg.BuildPlain(running), "Status: running")
+
+	// Missing status (malformed payload, nothing to render) → no card.
+	assert.Nil(t, glPipelineCardFrom(t, `{"object_attributes":{"id":1}}`))
 }
 
 func TestFormatPipelineDuration(t *testing.T) {
@@ -228,8 +237,15 @@ func TestBuildGitLabMergeRequestCard_Facts(t *testing.T) {
 		}
 	})
 
-	t.Run("update action still has no card (outside the rendered action subset)", func(t *testing.T) {
-		assert.Nil(t, glMergeRequestCardFrom(t, `{"object_attributes":{"action":"update"}}`))
+	t.Run("update action is rendered too (no longer filtered)", func(t *testing.T) {
+		card := glMergeRequestCardFrom(t, `{"user":{"username":"carol"},"object_attributes":{"iid":1,"title":"x","action":"update"}}`)
+		require.NotNil(t, card)
+		require.NoError(t, validateVCSCard(card))
+		assert.Contains(t, cardmsg.BuildPlain(card), "carol updated a merge request")
+	})
+
+	t.Run("missing action has no card (nothing to render)", func(t *testing.T) {
+		assert.Nil(t, glMergeRequestCardFrom(t, `{"object_attributes":{}}`))
 	})
 }
 

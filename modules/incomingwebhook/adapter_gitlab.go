@@ -12,9 +12,11 @@ package incomingwebhook
 // 是配置错误而非枚举探测（见 handlePush 注释 + #297 鉴权决定）。
 //
 // 渲染策略与 GitHub 适配器一致：按 X-Gitlab-Event 把常用事件翻译成 markdown 文本
-// （走 native 纯文本路径），刻意只渲染「人关心的」动作子集，刷屏动作（MR update /
-// pipeline running 等）返回 200 + skipped 落审计。所有 gl* 结构体只声明渲染需要的
-// 字段（白名单解析），其余 payload 字段一律忽略。
+// （走 native 纯文本路径）。MR/Issue 的所有 action、pipeline 的所有 status 均会渲染
+// （产品决定：不按「是否刷屏」过滤——旧版本只渲染终态/open-close-reopen-merge 子集，
+// 现已放开）；仍在渲染子集之外的只有事件【类型】本身（Job Hook / Wiki Page Hook 等，
+// 见 parseGitLabPush 的 default 分支）与畸形 payload（缺 action/status 字段）。所有
+// gl* 结构体只声明渲染需要的字段（白名单解析），其余 payload 字段一律忽略。
 
 import (
 	"context"
@@ -333,7 +335,7 @@ func renderGitLabTagPush(ev *glPushEvent) string {
 func renderGitLabMergeRequest(ev *glMergeRequestEvent) string {
 	verb := glActionVerb(ev.ObjectAttributes.Action)
 	if verb == "" {
-		// update / approved / unapproved / ... 刷屏动作不渲染 → skip。
+		// 缺 action 字段的畸形 payload：没有可渲染的动作 → skip（唯一保留的过滤）。
 		return ""
 	}
 	return glWithRepo(fmt.Sprintf("**%s** %s merge request [!%d %s](%s)",
@@ -382,10 +384,9 @@ func renderGitLabNote(ev *glNoteEvent) string {
 }
 
 func renderGitLabPipeline(ev *glPipelineEvent) string {
-	// 只渲染终态：running / pending / created / manual / skipped 都会刷屏 → skip。
-	switch ev.ObjectAttributes.Status {
-	case "success", "failed", "canceled":
-	default:
+	if ev.ObjectAttributes.Status == "" {
+		// 缺 status 字段的畸形 payload：没有可渲染的状态 → skip（唯一保留的过滤——
+		// 所有非空状态，包括 pending/running/created/manual/skipped，均渲染）。
 		return ""
 	}
 	// Pipeline 是唯一自拼 URL 的事件（MR/Issue/Note 直接用 object_attributes.url 绝对
@@ -418,10 +419,15 @@ func glActor(username, name string) string {
 	return "someone"
 }
 
-// glActionVerb 把 GitLab 的 MR/Issue object_attributes.action 映射为渲染动词；
-// 返回空表示该动作在渲染子集之外（调用方无需修复，走 skip）。
+// glActionVerb 把 GitLab 的 MR/Issue object_attributes.action 映射为渲染动词。所有
+// action 都会渲染（产品决定：不再按「是否刷屏」过滤，update/approved/unapproved 等
+// 曾经跳过的动作现在也推送）——返回空仅表示 action 字段本身缺省（畸形 payload，没
+// 有可渲染的动作），调用方据此走 skip，这是唯一保留的过滤。已知值给出通顺的英文
+// 过去式；未知/GitLab 未来新增的值原样透传，避免每次 GitLab 加新 action 都要改代码。
 func glActionVerb(action string) string {
 	switch action {
+	case "":
+		return ""
 	case "open":
 		return "opened"
 	case "close":
@@ -430,8 +436,14 @@ func glActionVerb(action string) string {
 		return "reopened"
 	case "merge":
 		return "merged"
+	case "update":
+		return "updated"
+	case "approved":
+		return "approved"
+	case "unapproved":
+		return "unapproved"
 	default:
-		return ""
+		return action
 	}
 }
 
@@ -472,8 +484,9 @@ func glShortSHA(sha string) string {
 // The card builders below mirror the text renderers' event/action decisions but emit
 // an octo/v1 card object using the SAME anatomy + escaper as the github adapter
 // (adapter_card.go) — parity. They operate on the SAME *ev the text renderer used
-// (parseGitLabPush unmarshals once), returning nil for subset-outside actions
-// (→ degrade to text via vcsPushReq).
+// (parseGitLabPush unmarshals once), returning nil only when the payload has nothing
+// to render (missing action/status — see glActionVerb / buildGitLabPipelineCard),
+// never because of which action/status it is (→ degrade to text via vcsPushReq).
 
 // glActorCard is glActor for the card path: username (restricted charset) or the
 // free-text display name, both escaped for a TextBlock leaf.
@@ -634,9 +647,7 @@ func buildGitLabNoteCard(ev *glNoteEvent, lang string) map[string]interface{} {
 }
 
 func buildGitLabPipelineCard(ev *glPipelineEvent, lang string) map[string]interface{} {
-	switch ev.ObjectAttributes.Status {
-	case "success", "failed", "canceled":
-	default:
+	if ev.ObjectAttributes.Status == "" {
 		return nil
 	}
 	// 卡片专属的结构化 FactSet（分支 / 状态 / 耗时 / 作业）——文本路径不含这些字段，
