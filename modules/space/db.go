@@ -174,9 +174,11 @@ func (d *DB) searchMembers(spaceId, keyword string, pageIndex, pageSize int) ([]
 		"IFNULL(u.username,'') as username",
 		"IFNULL(u.email,'') as email",
 		"IFNULL(u.phone,'') as phone",
+		"IFNULL(uv.real_name,'') as real_name",
 		"CASE WHEN r.robot_id IS NOT NULL AND r.status=1 THEN 1 ELSE 0 END as robot",
 	).From(dbr.I("space_member").As("sm")).
 		LeftJoin(dbr.I("user").As("u"), "u.uid=sm.uid").
+		LeftJoin(dbr.I("user_verification").As("uv"), "uv.user_id=sm.uid").
 		LeftJoin(dbr.I("robot").As("r"), "r.robot_id=sm.uid").
 		Where("sm.space_id=? AND sm.status=1", spaceId)
 	if keyword != "" {
@@ -198,6 +200,7 @@ func (d *DB) countSearchMembers(spaceId, keyword string) (int64, error) {
 	builder := d.session.Select("COUNT(*)").
 		From(dbr.I("space_member").As("sm")).
 		LeftJoin(dbr.I("user").As("u"), "u.uid=sm.uid").
+		LeftJoin(dbr.I("user_verification").As("uv"), "uv.user_id=sm.uid").
 		Where("sm.space_id=? AND sm.status=1", spaceId)
 	if keyword != "" {
 		clause, args := memberSearchActiveWhere(keyword)

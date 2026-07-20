@@ -46,8 +46,8 @@ func (s *Space) searchMembers(c *wkhttp.Context) {
 	if pageIndex > maxMemberSearchPageIndex {
 		pageIndex = maxMemberSearchPageIndex
 	}
-	// keyword 跨列匹配 name/username/email(明文)/uid；phone 仅匹配后 4 位
-	// （见 memberSearchActiveWhere）——前端按手机号检索时只需传后 4 位。
+	// keyword 跨列匹配 name/username/email(明文)/uid/real_name(实名兜底)；phone
+	// 仅匹配后 4 位（见 memberSearchActiveWhere）——前端按手机号检索时只需传后 4 位。
 	keyword := strings.TrimSpace(c.Query("keyword"))
 	count, err := s.db.countSearchMembers(spaceId, keyword)
 	if err != nil {
@@ -70,7 +70,7 @@ func (s *Space) searchMembers(c *wkhttp.Context) {
 	for _, m := range members {
 		resps = append(resps, memberSearchResp{
 			UID:       m.UID,
-			Name:      m.Name,
+			Name:      m.DisplayName(),
 			Username:  m.Username,
 			Email:     m.Email,
 			Phone:     maskPhone(m.Phone),

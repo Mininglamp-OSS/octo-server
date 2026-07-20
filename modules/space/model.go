@@ -47,7 +47,21 @@ type memberSearchModel struct {
 	Username string
 	Email    string
 	Phone    string
+	RealName string // 实名兜底（user_verification.real_name），仅作 name 为空时的回退源
 	Robot    int
+}
+
+// DisplayName 返回搜索结果的展示名，与成员列表 MemberDetailModel.DisplayName
+// 使用同一条 issue #344 兜底链（u.name → user_verification.real_name → 占位符），
+// 确保「搜到后展示的名字」与「列表里看到的名字」一致，不出现搜到却显示空白/占位。
+func (m *memberSearchModel) DisplayName() string {
+	if m.Name != "" {
+		return m.Name
+	}
+	if m.RealName != "" {
+		return m.RealName
+	}
+	return memberDisplayNamePlaceholderPrefix + m.UID
 }
 
 // InvitationModel 邀请表模型
