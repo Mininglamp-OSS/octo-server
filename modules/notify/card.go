@@ -325,6 +325,10 @@ func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error
 
 	lang := i18n.OutboundLanguage(context.Background())
 
+	// Fill the actor display name server-side when the producer sent only the
+	// uid (empty ActorName + non-empty ActorUID). Best-effort; see hydrateActorName.
+	n.hydrateActorName(card)
+
 	canCard := n.docsSender != nil && cardmsg.Enabled()
 	profile := cardmsg.ProfileV1
 	var document json.RawMessage
@@ -411,6 +415,25 @@ func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error
 	)
 
 	return &NotifyResp{Delivered: delivered, Filtered: filteredMap}, nil
+}
+
+// hydrateActorName fills card.ActorName from card.ActorUID via the user service
+// when the producer sent only the uid (empty name). octo-server is the identity
+// authority, so this removes the producer's need for a user-lookup credential
+// (e.g. docs-backend's short-lived session token). Best-effort and idempotent:
+// a pre-resolved name is left untouched, and any lookup miss/error leaves the
+// name empty so the card degrades to the anonymous banner exactly as before.
+func (n *Notify) hydrateActorName(card *DocsCardFields) {
+	if card == nil || strings.TrimSpace(card.ActorName) != "" {
+		return
+	}
+	actorUID := strings.TrimSpace(card.ActorUID)
+	if actorUID == "" || n.userService == nil {
+		return
+	}
+	if resp, err := n.userService.GetUser(actorUID); err == nil && resp != nil {
+		card.ActorName = resp.Name
+	}
 }
 
 // buildDocsCard renders the octo/v1 ResourceCard for a docs-notify
