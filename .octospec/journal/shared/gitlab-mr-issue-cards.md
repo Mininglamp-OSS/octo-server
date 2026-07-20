@@ -154,20 +154,48 @@ trust-boundary-classified changes.
   reintroduced at the same two gate points (`glActionVerb`'s default case,
   `renderGitLabPipeline`/`buildGitLabPipelineCard`'s status check) — now with
   the escaping fix in place regardless of which way that goes.
-- **Deferred (yujiawei, PR #610 review): text-path ref/branch code-span
-  backtick breakout.** `glShortRef` doesn't strip backticks, and its output
-  goes raw into a `` `%s` `` text-path code span at 6 sites: GitLab push
-  branch create/delete, push commit-count line, tag push (2 sites), and
-  pipeline (2 sites — the only ones this PR's changes actually widen
-  exposure to, by rendering non-terminal statuses that previously never
-  reached this code path). A ref/branch name containing a literal backtick
-  is not rejected by git's ref-name rules, so this is a real, not just
-  theoretical, gap. The card path is already safe (`cardCodeSpan` strips
-  backticks via `mdCodeSpanText`). **Not fixed here**: a correct fix needs to
-  touch `renderGitLabPush`/`renderGitLabTagPush` (functions this PR never
-  modified) and, per this repo's adapter-parity rule, the equivalent sink in
-  `adapter_github.go` — fixing only the pipeline half here would leave push/
-  tag/GitHub with the identical gap, which is a worse, inconsistent posture
-  than not touching it. Tracked as a separate follow-up task: harden every
-  GitLab **and** GitHub text-path ref/branch code span (likely route through
-  `mdCodeSpanText`, mirroring what the card path already does).
+- **Deferred (yujiawei, PR #610 review): text-path markdown-breakout family
+  in GitLab/GitHub adapters.** Two related, pre-existing gaps in the same
+  spirit as the bugs this PR fixed for `action`/`status`/`username`, both
+  unchanged from `main` and both out of scope to fix in this PR (see
+  reasoning below):
+  - **Ref/branch code-span backtick breakout.** `glShortRef` doesn't strip
+    backticks, and its output goes raw into a `` `%s` `` text-path code span
+    at 6 sites: GitLab push branch create/delete, push commit-count line, tag
+    push (2 sites), and pipeline (2 sites — the only ones this PR's changes
+    actually widen exposure to, by rendering non-terminal statuses that
+    previously never reached this code path). A ref/branch name containing a
+    literal backtick is not rejected by git's ref-name rules, so this is
+    real, not just theoretical. The card path is already safe (`cardCodeSpan`
+    strips backticks via `mdCodeSpanText`).
+  - **Raw URL destinations in markdown link syntax.** `renderGitLabMergeRequest`/
+    `renderGitLabIssue`/`renderGitLabNote` place `object_attributes.url` (and
+    the note URL) directly as a link destination `](%s)`; a `)` in that
+    token can close the link early and let the rest of the string inject
+    forged markdown after it. Same class of bug, different sink — flagged by
+    yujiawei's second review pass as worth closing in the same follow-up
+    rather than treating as unrelated.
+  - **Not fixed here**: a correct fix for either needs to touch
+    `renderGitLabPush`/`renderGitLabTagPush`/`renderGitLabNote` (functions
+    this PR never modified) and, per this repo's adapter-parity rule, the
+    equivalent sinks in `adapter_github.go` — a partial, pipeline-only patch
+    here would leave push/tag/note/GitHub with the identical gap, a worse,
+    inconsistent posture than not touching it. **Tracked as one follow-up
+    task**: harden every GitLab *and* GitHub text-path ref/branch code span
+    (route through `mdCodeSpanText`, mirroring the card path) *and* every
+    raw URL-destination interpolation (needs a `safeMarkdownURL`-style
+    destination validator/escaper on the text path — `adapter.go` already
+    has `safeMarkdownURL` for a different purpose, worth checking if it
+    applies directly).
+
+- **Noted, not tracked as a task (yujiawei, PR #610 review, both explicitly
+  "awareness only" / cosmetic, no panic or injection risk):**
+  - `int(ev.ObjectAttributes.Duration)` on an absurd external JSON float
+    (e.g. `1e100`) can saturate before `formatPipelineDuration`'s upper
+    clamp runs, silently dropping the duration fact instead of showing
+    `>100h 0m`. Safe (no panic, no absurd string), just a display gap for a
+    payload no real GitLab instance would ever send.
+  - The text path still clamps `verb`/`status` with `glActorMax` while the
+    card path has a dedicated `cardFactItemMax` — harmless today (same
+    value), just a naming/domain mismatch if either constant's value
+    diverges later.
