@@ -10,10 +10,12 @@ package incomingwebhook
 // X-Hub-Signature-256 校验留作后续可选项，参考 modules/webhook/hmac.go）。
 //
 // 渲染策略：按 X-GitHub-Event 把常用事件翻译成 markdown 文本（走 native 纯文本路径，
-// 客户端按 markdown 渲染）。刻意只渲染「人关心的」动作子集——例如 pull_request 的
-// synchronize（PR 分支每次 push 都触发）若也进群会刷屏。子集之外的事件 / 动作返回
-// 200 并以 auditSkipped 落审计：GitHub 侧显示绿色投递成功（不会把 webhook 标红），
-// 管理端 deliveries 里 reason=event 可见，两边都不糊弄。
+// 客户端按 markdown 渲染）。pull_request/issues/issue_comment/release 的所有 action
+// 均会渲染（产品决定：不按「是否刷屏」过滤，与 GitLab 适配器同一决定——旧版本只渲染
+// open/close/reopen/merge 等子集，现已放开）；仍在渲染子集之外的只有事件【类型】本身
+// （watch / star 等未实现的事件类型）与畸形 payload（缺 action 字段）。子集之外的
+// 事件返回 200 并以 auditSkipped 落审计：GitHub 侧显示绿色投递成功（不会把 webhook
+// 标红），管理端 deliveries 里 reason=event 可见，两边都不糊弄。
 //
 // 所有 gh* 结构体只声明渲染需要的字段（白名单解析），其余 payload 字段一律忽略。
 
@@ -89,6 +91,13 @@ type ghPushEvent struct {
 	Sender     ghUser `json:"sender"`
 }
 
+// ghLabel is a GitHub label object (the `labels[]` array GitHub attaches to
+// pull_request/issues event payloads, nested under pull_request/issue rather than
+// top-level like GitLab's). Only Name is rendered.
+type ghLabel struct {
+	Name string `json:"name"`
+}
+
 type ghPullRequestEvent struct {
 	Action      string `json:"action"`
 	PullRequest struct {
@@ -96,6 +105,16 @@ type ghPullRequestEvent struct {
 		Title   string `json:"title"`
 		HTMLURL string `json:"html_url"`
 		Merged  bool   `json:"merged"`
+		// Base/Head feed the card-only Target/Source FactSet rows (text path
+		// unchanged, same "card-only" convention as the GitLab MR card).
+		Base struct {
+			Ref string `json:"ref"`
+		} `json:"base"`
+		Head struct {
+			Ref string `json:"ref"`
+		} `json:"head"`
+		// Labels feeds the card-only Labels FactSet row;缺省即不展示该行。
+		Labels []ghLabel `json:"labels"`
 	} `json:"pull_request"`
 	Repository ghRepo `json:"repository"`
 	Sender     ghUser `json:"sender"`
@@ -107,6 +126,8 @@ type ghIssuesEvent struct {
 		Number  int    `json:"number"`
 		Title   string `json:"title"`
 		HTMLURL string `json:"html_url"`
+		// Labels feeds the card-only Labels FactSet row;缺省即不展示该行。
+		Labels []ghLabel `json:"labels"`
 	} `json:"issue"`
 	Repository ghRepo `json:"repository"`
 	Sender     ghUser `json:"sender"`
@@ -265,47 +286,41 @@ func renderGitHubPush(ev *ghPushEvent) string {
 }
 
 func renderGitHubPullRequest(ev *ghPullRequestEvent) string {
-	var verb string
-	switch ev.Action {
-	case "opened", "reopened":
-		verb = ev.Action
-	case "ready_for_review":
-		verb = "marked ready for review:"
-	case "closed":
-		verb = "closed"
-		if ev.PullRequest.Merged {
-			verb = "merged"
-		}
-	default:
-		// synchronize / labeled / review_requested / ... 刷屏动作不渲染 → skip。
+	verb := ghPRVerb(ev.Action, ev.PullRequest.Merged)
+	if verb == "" {
+		// 缺 action 字段的畸形 payload：没有可渲染的动作 → skip（唯一保留的过滤）。
 		return ""
 	}
 	return ghWithRepo(fmt.Sprintf("**%s** %s pull request [#%d %s](%s)",
-		ghLogin(ev.Sender), verb, ev.PullRequest.Number,
+		ghLogin(ev.Sender), mdInertText(verb, glActorMax), ev.PullRequest.Number,
 		mdLinkText(ev.PullRequest.Title, 200), ev.PullRequest.HTMLURL),
 		ev.Repository)
 }
 
 func renderGitHubIssues(ev *ghIssuesEvent) string {
-	switch ev.Action {
-	case "opened", "closed", "reopened":
-	default:
+	verb := ghIssueVerb(ev.Action)
+	if verb == "" {
 		return ""
 	}
 	return ghWithRepo(fmt.Sprintf("**%s** %s issue [#%d %s](%s)",
-		ghLogin(ev.Sender), ev.Action, ev.Issue.Number,
+		ghLogin(ev.Sender), mdInertText(verb, glActorMax), ev.Issue.Number,
 		mdLinkText(ev.Issue.Title, 200), ev.Issue.HTMLURL),
 		ev.Repository)
 }
 
 func renderGitHubIssueComment(ev *ghIssueCommentEvent) string {
-	if ev.Action != "created" {
+	verb := ghCommentVerb(ev.Action)
+	if verb == "" {
 		return ""
 	}
-	line := ghWithRepo(fmt.Sprintf("**%s** commented on [#%d %s](%s)",
-		ghLogin(ev.Sender), ev.Issue.Number,
+	line := ghWithRepo(fmt.Sprintf("**%s** %s [#%d %s](%s)",
+		ghLogin(ev.Sender), mdInertText(verb, glActorMax), ev.Issue.Number,
 		mdLinkText(ev.Issue.Title, 200), ev.Comment.HTMLURL),
 		ev.Repository)
+	if ev.Action == "deleted" {
+		// 已删除的评论没有正文可引用。
+		return line
+	}
 	if snippet := clipRunes(oneLine(ev.Comment.Body), 300); snippet != "" {
 		line += "\n> " + snippet
 	}
@@ -313,35 +328,168 @@ func renderGitHubIssueComment(ev *ghIssueCommentEvent) string {
 }
 
 func renderGitHubRelease(ev *ghReleaseEvent) string {
-	if ev.Action != "published" {
+	verb := ghReleaseVerb(ev.Action)
+	if verb == "" {
 		return ""
 	}
 	title := ev.Release.Name
 	if strings.TrimSpace(title) == "" {
 		title = ev.Release.TagName
 	}
-	return ghWithRepo(fmt.Sprintf("**%s** published release [%s](%s)",
-		ghLogin(ev.Sender), mdLinkText(title, 200), ev.Release.HTMLURL),
+	return ghWithRepo(fmt.Sprintf("**%s** %s release [%s](%s)",
+		ghLogin(ev.Sender), mdInertText(verb, glActorMax), mdLinkText(title, 200), ev.Release.HTMLURL),
 		ev.Repository)
 }
 
-// ghLogin 兜底空 sender（GitHub 偶发不带 sender，如某些 App 触发的事件）。
+// ghPRVerb 把 GitHub pull_request 的 action 映射为渲染动词。所有 action 都会渲染
+// （产品决定，与 GitLab glActionVerb 同一决定）——返回空仅表示 action 字段本身缺省，
+// 这是唯一保留的过滤。已知值给出通顺的英文；未知/GitHub 未来新增的值原样透传。
+//
+// ⚠️ 未知值分支直接回传外部输入本身——调用方必须在拼进 markdown/card 前用
+// mdInertText / escapeCardText 转义这个返回值，不能假设它总是字面量安全（与
+// glActionVerb 同一契约，见 GitLab #610 review 的教训）。
+func ghPRVerb(action string, merged bool) string {
+	switch action {
+	case "":
+		return ""
+	case "opened":
+		return "opened"
+	case "reopened":
+		return "reopened"
+	case "closed":
+		if merged {
+			return "merged"
+		}
+		return "closed"
+	case "ready_for_review":
+		return "marked ready for review"
+	case "converted_to_draft":
+		return "converted to draft"
+	case "synchronize":
+		return "pushed new commits to"
+	case "edited":
+		return "edited"
+	case "labeled":
+		return "labeled"
+	case "unlabeled":
+		return "unlabeled"
+	case "assigned":
+		return "assigned"
+	case "unassigned":
+		return "unassigned"
+	case "review_requested":
+		return "requested review on"
+	case "review_request_removed":
+		return "removed review request on"
+	case "locked":
+		return "locked"
+	case "unlocked":
+		return "unlocked"
+	default:
+		return action
+	}
+}
+
+// ghIssueVerb 同 ghPRVerb，覆盖 issues 事件的 action。同一转义契约。
+func ghIssueVerb(action string) string {
+	switch action {
+	case "":
+		return ""
+	case "opened":
+		return "opened"
+	case "closed":
+		return "closed"
+	case "reopened":
+		return "reopened"
+	case "edited":
+		return "edited"
+	case "labeled":
+		return "labeled"
+	case "unlabeled":
+		return "unlabeled"
+	case "assigned":
+		return "assigned"
+	case "unassigned":
+		return "unassigned"
+	case "pinned":
+		return "pinned"
+	case "unpinned":
+		return "unpinned"
+	case "locked":
+		return "locked"
+	case "unlocked":
+		return "unlocked"
+	default:
+		return action
+	}
+}
+
+// ghCommentVerb 同 ghPRVerb，覆盖 issue_comment 事件的 action。已知值直接拼出完整
+// 动词短语（含 "on"/"a comment on"），使调用方 "**actor** VERB [#N title]" 的拼接
+// 模板保持一致。同一转义契约。
+func ghCommentVerb(action string) string {
+	switch action {
+	case "":
+		return ""
+	case "created":
+		return "commented on"
+	case "edited":
+		return "edited a comment on"
+	case "deleted":
+		return "deleted a comment on"
+	default:
+		return action
+	}
+}
+
+// ghReleaseVerb 同 ghPRVerb，覆盖 release 事件的 action。同一转义契约。
+func ghReleaseVerb(action string) string {
+	switch action {
+	case "":
+		return ""
+	case "published":
+		return "published"
+	case "unpublished":
+		return "unpublished"
+	case "created":
+		return "created"
+	case "edited":
+		return "edited"
+	case "deleted":
+		return "deleted"
+	case "prereleased":
+		return "pre-released"
+	case "released":
+		return "released"
+	default:
+		return action
+	}
+}
+
+// ghLogin 兜底空 sender（GitHub 偶发不带 sender，如某些 App 触发的事件），非空时
+// 经 mdInertText 转义。login 字符集虽受 GitHub 官方限制，但本端点不校验请求真的来自
+// GitHub（只查共享 URL token，无强制 HMAC——见文件头注释），持有 token 的调用方能把
+// login 设成任意字符串；不转义会重现 GitLab glActor 的 username 注入（GitLab #610
+// review，yujiawei 发现）。card 路径的 ghActorCard 一直就转义，这里补齐文本路径。
 func ghLogin(u ghUser) string {
 	if u.Login == "" {
 		return "someone"
 	}
-	return u.Login
+	return mdInertText(u.Login, glActorMax)
 }
 
 // ghWithRepo 给消息行追加 " · [repo](url)" 尾注；repo 信息缺失时原样返回。
+// FullName 经 mdInertText 转义——同 ghLogin 的理由，不能假设仓库全名字面量安全
+// （与 GitLab glWithRepo 对 PathWithNamespace 的处理同口径）。
 func ghWithRepo(line string, r ghRepo) string {
 	if r.FullName == "" {
 		return line
 	}
+	name := mdInertText(r.FullName, 200)
 	if r.HTMLURL == "" {
-		return line + " · " + r.FullName
+		return line + " · " + name
 	}
-	return fmt.Sprintf("%s · [%s](%s)", line, r.FullName, r.HTMLURL)
+	return fmt.Sprintf("%s · [%s](%s)", line, name, r.HTMLURL)
 }
 
 // ghShortRef 把 refs/heads/main → main、refs/tags/v1.0 → v1.0。
@@ -430,73 +578,92 @@ func buildGitHubPushCard(ev *ghPushEvent, lang string) map[string]interface{} {
 	return d.card(lang)
 }
 
-// ghPRVerbPhrase maps a pull_request action to a card headline verb phrase; ""
-// signals a subset-outside action (card not produced).
-func ghPRVerbPhrase(action string, merged bool) string {
-	switch action {
-	case "opened":
-		return "opened a pull request"
-	case "reopened":
-		return "reopened a pull request"
-	case "ready_for_review":
-		return "marked a pull request ready for review"
-	case "closed":
-		if merged {
-			return "merged a pull request"
-		}
-		return "closed a pull request"
-	}
-	return ""
-}
-
 func buildGitHubPullRequestCard(ev *ghPullRequestEvent, lang string) map[string]interface{} {
-	phrase := ghPRVerbPhrase(ev.Action, ev.PullRequest.Merged)
-	if phrase == "" {
+	verb := ghPRVerb(ev.Action, ev.PullRequest.Merged)
+	if verb == "" {
 		return nil
+	}
+	// 卡片专属的结构化 FactSet（源分支 / 目标分支 / 标签）——文本路径不含这些字段，
+	// 故 flag-off 字节不变，与 GitLab MR 卡片同一约定（见 buildGitLabMergeRequestCard）。
+	labels := vcsCardLabelsFor(lang)
+	var facts []vcsFact
+	if src := cardCodeSpan(ev.PullRequest.Head.Ref, cardRefMax); src != "" {
+		facts = append(facts, vcsFact{title: labels.source, value: src})
+	}
+	if tgt := cardCodeSpan(ev.PullRequest.Base.Ref, cardRefMax); tgt != "" {
+		facts = append(facts, vcsFact{title: labels.target, value: tgt})
+	}
+	if f := ghLabelsFact(labels.labels, ev.PullRequest.Labels); f != nil {
+		facts = append(facts, *f)
 	}
 	return vcsCardData{
 		source:   cardSourceGitHub,
 		variant:  "vcs.github.pull_request",
-		headline: fmt.Sprintf("%s %s", ghActorCard(ev.Sender), phrase),
+		headline: fmt.Sprintf("%s %s a pull request", ghActorCard(ev.Sender), escapeCardText(verb, cardActorMax)),
 		subtitle: escapeCardText(ev.Repository.FullName, cardTitleMax),
 		lines:    []string{numberedTitle("#", ev.PullRequest.Number, ev.PullRequest.Title)},
+		facts:    facts,
 		url:      httpURLForCard(ev.PullRequest.HTMLURL),
 	}.card(lang)
 }
 
 func buildGitHubIssuesCard(ev *ghIssuesEvent, lang string) map[string]interface{} {
-	switch ev.Action {
-	case "opened", "closed", "reopened":
-	default:
+	verb := ghIssueVerb(ev.Action)
+	if verb == "" {
 		return nil
+	}
+	var facts []vcsFact
+	if f := ghLabelsFact(vcsCardLabelsFor(lang).labels, ev.Issue.Labels); f != nil {
+		facts = append(facts, *f)
 	}
 	return vcsCardData{
 		source:   cardSourceGitHub,
 		variant:  "vcs.github.issues",
-		headline: fmt.Sprintf("%s %s an issue", ghActorCard(ev.Sender), ev.Action),
+		headline: fmt.Sprintf("%s %s an issue", ghActorCard(ev.Sender), escapeCardText(verb, cardActorMax)),
 		subtitle: escapeCardText(ev.Repository.FullName, cardTitleMax),
 		lines:    []string{numberedTitle("#", ev.Issue.Number, ev.Issue.Title)},
+		facts:    facts,
 		url:      httpURLForCard(ev.Issue.HTMLURL),
 	}.card(lang)
 }
 
-func buildGitHubIssueCommentCard(ev *ghIssueCommentEvent, lang string) map[string]interface{} {
-	if ev.Action != "created" {
+// ghLabelsFact builds the shared "Labels (N)" FactSet row for the PR/Issue cards
+// (nil when there is nothing to show), mirroring GitLab's glLabelsFact — same
+// escaping/capping contract via the shared cappedFactValue helper.
+func ghLabelsFact(title string, labels []ghLabel) *vcsFact {
+	names := make([]string, len(labels))
+	for i, l := range labels {
+		names[i] = l.Name
+	}
+	value, n := cappedFactValue(names, maxRenderedLabels)
+	if n == 0 {
 		return nil
 	}
-	return vcsCardData{
+	return &vcsFact{title: fmt.Sprintf("%s (%d)", title, n), value: value}
+}
+
+func buildGitHubIssueCommentCard(ev *ghIssueCommentEvent, lang string) map[string]interface{} {
+	verb := ghCommentVerb(ev.Action)
+	if verb == "" {
+		return nil
+	}
+	d := vcsCardData{
 		source:   cardSourceGitHub,
 		variant:  "vcs.github.issue_comment",
-		headline: fmt.Sprintf("%s commented on an issue", ghActorCard(ev.Sender)),
+		headline: fmt.Sprintf("%s %s an issue", ghActorCard(ev.Sender), escapeCardText(verb, cardActorMax)),
 		subtitle: escapeCardText(ev.Repository.FullName, cardTitleMax),
 		lines:    []string{numberedTitle("#", ev.Issue.Number, ev.Issue.Title)},
-		quote:    escapeCardText(ev.Comment.Body, cardQuoteMax),
 		url:      httpURLForCard(ev.Comment.HTMLURL),
-	}.card(lang)
+	}
+	if ev.Action != "deleted" {
+		d.quote = escapeCardText(ev.Comment.Body, cardQuoteMax)
+	}
+	return d.card(lang)
 }
 
 func buildGitHubReleaseCard(ev *ghReleaseEvent, lang string) map[string]interface{} {
-	if ev.Action != "published" {
+	verb := ghReleaseVerb(ev.Action)
+	if verb == "" {
 		return nil
 	}
 	title := ev.Release.Name
@@ -506,7 +673,7 @@ func buildGitHubReleaseCard(ev *ghReleaseEvent, lang string) map[string]interfac
 	return vcsCardData{
 		source:   cardSourceGitHub,
 		variant:  "vcs.github.release",
-		headline: fmt.Sprintf("%s published a release", ghActorCard(ev.Sender)),
+		headline: fmt.Sprintf("%s %s a release", ghActorCard(ev.Sender), escapeCardText(verb, cardActorMax)),
 		subtitle: escapeCardText(ev.Repository.FullName, cardTitleMax),
 		lines:    []string{escapeCardText(title, cardTitleMax)},
 		url:      httpURLForCard(ev.Release.HTMLURL),

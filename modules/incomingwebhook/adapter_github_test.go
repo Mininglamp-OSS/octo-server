@@ -171,8 +171,26 @@ func TestParseGitHubPush_PullRequest(t *testing.T) {
 		require.NotNil(t, req)
 		assert.Contains(t, req.Content, "closed pull request")
 	})
-	t.Run("synchronize is skipped", func(t *testing.T) {
-		req, skip, invalid := parseGitHubPush(ghHeader("pull_request"), []byte(fmt.Sprintf(tpl, "synchronize", false)))
+	t.Run("synchronize is rendered (no longer filtered)", func(t *testing.T) {
+		req, _, _ := parseGitHubPush(ghHeader("pull_request"), []byte(fmt.Sprintf(tpl, "synchronize", false)))
+		require.NotNil(t, req)
+		assert.Contains(t, req.Content, "**carol** pushed new commits to pull request [#12 Add feature](https://github.com/o/r/pull/12)")
+	})
+	t.Run("truly unknown action falls back to the raw value", func(t *testing.T) {
+		// `_` is escaped by mdInertText like any other external field (expected).
+		req, _, _ := parseGitHubPush(ghHeader("pull_request"), []byte(fmt.Sprintf(tpl, "auto_merge_enabled", false)))
+		require.NotNil(t, req)
+		assert.Contains(t, req.Content, `**carol** auto\_merge\_enabled pull request`)
+	})
+	t.Run("hostile unknown action is escaped, not rendered live (trust-boundary)", func(t *testing.T) {
+		req, _, _ := parseGitHubPush(ghHeader("pull_request"), []byte(fmt.Sprintf(tpl, "**pwn** [x](http://evil.example)", false)))
+		require.NotNil(t, req)
+		assert.Contains(t, req.Content, `\*\*pwn\*\* \[x\](http://evil.example)`,
+			"markdown metacharacters in an unmapped action must be escaped")
+	})
+	t.Run("missing action is still skipped (malformed payload)", func(t *testing.T) {
+		body := `{"pull_request":{"number":12,"title":"Add feature","html_url":"https://github.com/o/r/pull/12"},"sender":{"login":"carol"}}`
+		req, skip, invalid := parseGitHubPush(ghHeader("pull_request"), []byte(body))
 		assert.Nil(t, req)
 		assert.Equal(t, "event", skip)
 		assert.Empty(t, invalid)
@@ -186,8 +204,20 @@ func TestParseGitHubPush_IssuesAndComments(t *testing.T) {
 		require.NotNil(t, req)
 		assert.Contains(t, req.Content, "**dan** opened issue [#3 Bug](https://github.com/o/r/issues/3)")
 	})
-	t.Run("issue labeled is skipped", func(t *testing.T) {
-		body := `{"action":"labeled","issue":{"number":3,"title":"Bug"},"sender":{"login":"dan"}}`
+	t.Run("issue labeled is rendered (no longer filtered)", func(t *testing.T) {
+		body := `{"action":"labeled","issue":{"number":3,"title":"Bug","html_url":"https://github.com/o/r/issues/3"},"sender":{"login":"dan"}}`
+		req, _, _ := parseGitHubPush(ghHeader("issues"), []byte(body))
+		require.NotNil(t, req)
+		assert.Contains(t, req.Content, "**dan** labeled issue [#3 Bug](https://github.com/o/r/issues/3)")
+	})
+	t.Run("hostile unknown issue action is escaped (trust-boundary)", func(t *testing.T) {
+		body := `{"action":"**pwn** [x](http://evil.example)","issue":{"number":3,"title":"Bug","html_url":"https://github.com/o/r/issues/3"},"sender":{"login":"dan"}}`
+		req, _, _ := parseGitHubPush(ghHeader("issues"), []byte(body))
+		require.NotNil(t, req)
+		assert.Contains(t, req.Content, `\*\*pwn\*\* \[x\](http://evil.example)`)
+	})
+	t.Run("missing issue action is still skipped (malformed payload)", func(t *testing.T) {
+		body := `{"issue":{"number":3,"title":"Bug"},"sender":{"login":"dan"}}`
 		req, skip, _ := parseGitHubPush(ghHeader("issues"), []byte(body))
 		assert.Nil(t, req)
 		assert.Equal(t, "event", skip)
@@ -202,8 +232,22 @@ func TestParseGitHubPush_IssuesAndComments(t *testing.T) {
 		assert.Contains(t, req.Content, "**eve** commented on [#3 Bug](https://github.com/o/r/issues/3#c1)")
 		assert.Contains(t, req.Content, "> line one line two", "comment body is flattened to one line")
 	})
-	t.Run("comment edited is skipped", func(t *testing.T) {
-		body := `{"action":"edited","issue":{"number":3},"comment":{"body":"x"},"sender":{"login":"eve"}}`
+	t.Run("comment edited is rendered (no longer filtered)", func(t *testing.T) {
+		body := `{"action":"edited","issue":{"number":3,"title":"Bug"},"comment":{"html_url":"https://github.com/o/r/issues/3#c1","body":"x"},"sender":{"login":"eve"}}`
+		req, _, _ := parseGitHubPush(ghHeader("issue_comment"), []byte(body))
+		require.NotNil(t, req)
+		assert.Contains(t, req.Content, "**eve** edited a comment on [#3 Bug](https://github.com/o/r/issues/3#c1)")
+		assert.Contains(t, req.Content, "> x")
+	})
+	t.Run("comment deleted has no body to quote", func(t *testing.T) {
+		body := `{"action":"deleted","issue":{"number":3,"title":"Bug"},"comment":{"html_url":"https://github.com/o/r/issues/3#c1","body":"gone"},"sender":{"login":"eve"}}`
+		req, _, _ := parseGitHubPush(ghHeader("issue_comment"), []byte(body))
+		require.NotNil(t, req)
+		assert.Contains(t, req.Content, "**eve** deleted a comment on [#3 Bug](https://github.com/o/r/issues/3#c1)")
+		assert.NotContains(t, req.Content, "gone", "a deleted comment's body is not meaningful to quote")
+	})
+	t.Run("missing comment action is still skipped (malformed payload)", func(t *testing.T) {
+		body := `{"issue":{"number":3},"comment":{"body":"x"},"sender":{"login":"eve"}}`
 		req, skip, _ := parseGitHubPush(ghHeader("issue_comment"), []byte(body))
 		assert.Nil(t, req)
 		assert.Equal(t, "event", skip)
@@ -223,11 +267,46 @@ func TestParseGitHubPush_Release(t *testing.T) {
 		require.NotNil(t, req)
 		assert.Contains(t, req.Content, "[v2.0.0](u)")
 	})
-	t.Run("created is skipped", func(t *testing.T) {
-		body := `{"action":"created","release":{"tag_name":"v2.0.0"},"sender":{"login":"fred"}}`
+	t.Run("created is rendered (no longer filtered)", func(t *testing.T) {
+		body := `{"action":"created","release":{"tag_name":"v2.0.0","html_url":"u"},"sender":{"login":"fred"}}`
+		req, _, _ := parseGitHubPush(ghHeader("release"), []byte(body))
+		require.NotNil(t, req)
+		assert.Contains(t, req.Content, "**fred** created release [v2.0.0](u)")
+	})
+	t.Run("hostile unknown release action is escaped (trust-boundary)", func(t *testing.T) {
+		body := `{"action":"**pwn** [x](http://evil.example)","release":{"tag_name":"v2.0.0","html_url":"u"},"sender":{"login":"fred"}}`
+		req, _, _ := parseGitHubPush(ghHeader("release"), []byte(body))
+		require.NotNil(t, req)
+		assert.Contains(t, req.Content, `\*\*pwn\*\* \[x\](http://evil.example)`)
+	})
+	t.Run("missing release action is still skipped (malformed payload)", func(t *testing.T) {
+		body := `{"release":{"tag_name":"v2.0.0"},"sender":{"login":"fred"}}`
 		req, skip, _ := parseGitHubPush(ghHeader("release"), []byte(body))
 		assert.Nil(t, req)
 		assert.Equal(t, "event", skip)
+	})
+}
+
+// GitHub sender.login / repository.full_name were historically un-escaped on the
+// assumption GitHub's restricted charset makes them injection-free — but this
+// endpoint only verifies a shared URL token, not that the payload is genuinely from
+// GitHub, so a token holder can set either field to anything. Same trust-boundary
+// class as GitLab's glActor/glWithRepo fix (GitLab #610 review, yujiawei); closed
+// here for GitHub parity.
+func TestParseGitHubPush_ActorAndRepoNameEscaped(t *testing.T) {
+	t.Run("hostile sender login", func(t *testing.T) {
+		body := `{"ref":"refs/heads/main","commits":[{"id":"abc","message":"m","url":"u"}],
+			"repository":{"full_name":"o/r"},"sender":{"login":"**evil** [x](http://attacker)"}}`
+		req, _, _ := parseGitHubPush(ghHeader("push"), []byte(body))
+		require.NotNil(t, req)
+		assert.Contains(t, req.Content, `\*\*evil\*\* \[x\](http://attacker)`)
+	})
+	t.Run("hostile repository full_name", func(t *testing.T) {
+		body := `{"ref":"refs/heads/main","commits":[{"id":"abc","message":"m","url":"u"}],
+			"repository":{"full_name":"**evil** [x](http://attacker)","html_url":"https://github.com/o/r"},"sender":{"login":"a"}}`
+		req, _, _ := parseGitHubPush(ghHeader("push"), []byte(body))
+		require.NotNil(t, req)
+		assert.Contains(t, req.Content, `\*\*evil\*\* \[x\](http://attacker)`)
 	})
 }
 

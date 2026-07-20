@@ -287,7 +287,7 @@ const maxRenderedLabels = 10
 // name, even though both happened to want 64 today (PR #610 review, yujiawei P2).
 const cardFactItemMax = 64
 
-// glCappedFactValue builds a capped, "/"-joined FactSet value from raw external name
+// cappedFactValue builds a capped, "/"-joined FactSet value from raw external name
 // strings — shared by the pipeline card's Jobs fact and the GitLab MR/Issue Labels
 // fact (previously duplicated inline at each call site, which could let their
 // escaping/capping decisions silently drift apart). Each name is escaped via
@@ -295,7 +295,7 @@ const cardFactItemMax = 64
 // and counting, so the fact never shows an empty slot or an inflated (N). Returns
 // ("", 0) when there is nothing left to show — the caller omits the FactSet row
 // entirely in that case.
-func glCappedFactValue(rawNames []string, max int) (value string, count int) {
+func cappedFactValue(rawNames []string, max int) (value string, count int) {
 	names := make([]string, 0, len(rawNames))
 	for _, n := range rawNames {
 		if v := escapeCardText(n, cardFactItemMax); v != "" {

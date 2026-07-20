@@ -28,6 +28,20 @@ func ghIssueCommentCardFrom(t *testing.T, body string) map[string]interface{} {
 	return buildGitHubIssueCommentCard(&ev, "en-US")
 }
 
+func ghPullRequestCardFrom(t *testing.T, body string) map[string]interface{} {
+	t.Helper()
+	var ev ghPullRequestEvent
+	require.NoError(t, json.Unmarshal([]byte(body), &ev))
+	return buildGitHubPullRequestCard(&ev, "en-US")
+}
+
+func ghIssuesCardFrom(t *testing.T, body string) map[string]interface{} {
+	t.Helper()
+	var ev ghIssuesEvent
+	require.NoError(t, json.Unmarshal([]byte(body), &ev))
+	return buildGitHubIssuesCard(&ev, "en-US")
+}
+
 func glPushCardFrom(t *testing.T, body string) map[string]interface{} {
 	t.Helper()
 	var ev glPushEvent
@@ -153,6 +167,107 @@ func TestBuildGitHubPushCard(t *testing.T) {
 	url, title := cardOpenURL(card)
 	assert.Equal(t, "https://github.com/octo/repo/compare/aaaa...bbbb", url)
 	assert.Equal(t, "View on GitHub", title)
+}
+
+func TestBuildGitHubPullRequestCard_Facts(t *testing.T) {
+	card := ghPullRequestCardFrom(t, `{
+		"action": "opened",
+		"pull_request": {"number": 42, "title": "Add cards", "html_url": "https://github.com/o/r/pull/42",
+			"base": {"ref": "main"}, "head": {"ref": "feature/cards"},
+			"labels": [{"name": "backend"}, {"name": "needs-review"}]},
+		"repository": {"full_name": "o/r"},
+		"sender": {"login": "carol"}
+	}`)
+	require.NotNil(t, card)
+	require.NoError(t, validateVCSCard(card))
+
+	plain := cardmsg.BuildPlain(card)
+	assert.Contains(t, plain, "carol opened a pull request")
+	assert.Contains(t, plain, "#42 · Add cards")
+	assert.Contains(t, plain, "Source: feature/cards")
+	assert.Contains(t, plain, "Target: main")
+	assert.Contains(t, plain, "Labels (2): backend / needs-review")
+
+	t.Run("no base/head/labels omits the facts entirely", func(t *testing.T) {
+		card := ghPullRequestCardFrom(t, `{
+			"action": "opened",
+			"pull_request": {"number": 42, "title": "Add cards", "html_url": "https://github.com/o/r/pull/42"},
+			"repository": {"full_name": "o/r"},
+			"sender": {"login": "carol"}
+		}`)
+		require.NotNil(t, card)
+		require.NoError(t, validateVCSCard(card))
+		body, _ := card["body"].([]interface{})
+		for _, it := range body {
+			el, _ := it.(map[string]interface{})
+			assert.NotEqual(t, "FactSet", el["type"], "no FactSet block when there is nothing to show")
+		}
+	})
+
+	t.Run("synchronize action is rendered too (no longer filtered)", func(t *testing.T) {
+		card := ghPullRequestCardFrom(t, `{"action":"synchronize","pull_request":{"number":1,"title":"x"},"sender":{"login":"carol"}}`)
+		require.NotNil(t, card)
+		require.NoError(t, validateVCSCard(card))
+		assert.Contains(t, cardmsg.BuildPlain(card), "carol pushed new commits to a pull request")
+	})
+
+	t.Run("missing action has no card (nothing to render)", func(t *testing.T) {
+		assert.Nil(t, ghPullRequestCardFrom(t, `{"pull_request":{"number":1}}`))
+	})
+
+	t.Run("hostile unknown action is escaped in the card headline (trust-boundary)", func(t *testing.T) {
+		card := ghPullRequestCardFrom(t, `{"action":"**pwn** [x](http://evil.example)",
+			"pull_request":{"number":1,"title":"x"},"sender":{"login":"carol"}}`)
+		require.NotNil(t, card)
+		require.NoError(t, validateVCSCard(card), "server-built card must pass cardmsg.Validate")
+		leaves := cardBodyText(card)
+		assert.Contains(t, leaves, `\*\*pwn\*\* \[x\]\(http://evil.example\)`,
+			"markdown metacharacters in an unmapped action must be escaped, never form a live link/emphasis")
+	})
+}
+
+func TestBuildGitHubIssuesCard_Facts(t *testing.T) {
+	card := ghIssuesCardFrom(t, `{
+		"action": "opened",
+		"issue": {"number": 7, "title": "Login broken", "html_url": "https://github.com/o/r/issues/7",
+			"labels": [{"name": "bug"}, {"name": "P1"}]},
+		"repository": {"full_name": "o/r"},
+		"sender": {"login": "dave"}
+	}`)
+	require.NotNil(t, card)
+	require.NoError(t, validateVCSCard(card))
+	plain := cardmsg.BuildPlain(card)
+	assert.Contains(t, plain, "Labels (2): bug / P1")
+
+	t.Run("no labels omits the fact", func(t *testing.T) {
+		card := ghIssuesCardFrom(t, `{
+			"action": "opened",
+			"issue": {"number": 7, "title": "Login broken"},
+			"repository": {"full_name": "o/r"},
+			"sender": {"login": "dave"}
+		}`)
+		require.NotNil(t, card)
+		body, _ := card["body"].([]interface{})
+		for _, it := range body {
+			el, _ := it.(map[string]interface{})
+			assert.NotEqual(t, "FactSet", el["type"])
+		}
+	})
+
+	t.Run("labeled action is rendered too (no longer filtered)", func(t *testing.T) {
+		card := ghIssuesCardFrom(t, `{"action":"labeled","issue":{"number":1,"title":"x"},"sender":{"login":"dave"}}`)
+		require.NotNil(t, card)
+		require.NoError(t, validateVCSCard(card))
+		assert.Contains(t, cardmsg.BuildPlain(card), "dave labeled an issue")
+	})
+
+	t.Run("hostile unknown action is escaped in the card headline (trust-boundary)", func(t *testing.T) {
+		card := ghIssuesCardFrom(t, `{"action":"**pwn** [x](http://evil.example)",
+			"issue":{"number":1,"title":"x"},"sender":{"login":"dave"}}`)
+		require.NotNil(t, card)
+		require.NoError(t, validateVCSCard(card), "server-built card must pass cardmsg.Validate")
+		assert.Contains(t, cardBodyText(card), `\*\*pwn\*\* \[x\]\(http://evil.example\)`)
+	})
 }
 
 func TestBuildGitLabPipelineCard_StatusColor(t *testing.T) {
@@ -355,7 +470,7 @@ func TestGlLabelsFact_OverflowAndEscaping(t *testing.T) {
 	t.Run("whitespace-only label title is dropped, not counted as a blank slot", func(t *testing.T) {
 		// escapeCardText's oneLine() trims a whitespace-only title to "" (unlike a
 		// lone backtick, which cardMarkdownEscaper *escapes* to `\`` rather than
-		// stripping — it does not go blank). glCappedFactValue must drop titles that
+		// stripping — it does not go blank). cappedFactValue must drop titles that
 		// come out blank, from both the joined value and the (N) count (PR #610
 		// review, mochashanyao P2: verifies this documented behavior explicitly).
 		card := glMergeRequestCardFrom(t, `{
@@ -583,8 +698,9 @@ func TestVCSParse_FlagGate(t *testing.T) {
 		// missing event header → still no_event
 		_, _, invalid := parseGitHubPush(http.Header{}, []byte(`{}`))
 		assert.Equal(t, "no_event", invalid)
-		// subset-outside action → still skip
-		_, skip, _ := parseGitHubPush(ghHeader("pull_request"), []byte(`{"action":"synchronize"}`))
+		// missing action field → still skip (the one remaining filter, now that
+		// action-based filtering is removed)
+		_, skip, _ := parseGitHubPush(ghHeader("pull_request"), []byte(`{}`))
 		assert.Equal(t, "event", skip)
 	})
 }

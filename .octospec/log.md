@@ -4,6 +4,26 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-20 (github-webhook-parity)
+
+- **Feature** — GitHub `pull_request`/`issues` InteractiveCards gained
+  Source/Target branch (PR) + Labels(N) FactSet rows, mirroring the GitLab
+  MR/Issue cards from `gitlab-mr-issue-cards` earlier the same day.
+- **Behavior change** — GitHub adapter no longer filters
+  `pull_request`/`issues`/`issue_comment`/`release` events by action
+  (explicit product decision, mirroring the GitLab one); every action now
+  renders on both text and card paths.
+- **Fix** — Applied the `gitlab-mr-issue-cards` task's pending learning
+  (whitelist-gate-as-implicit-sanitizer) proactively: every field the filter
+  removal exposed was escaped in the same commit (verified by enumerating
+  and grepping every call site before committing, not discovered via a
+  later review round). Also folded in a pre-existing, previously-unfixed
+  escaping gap in `ghLogin`/`ghWithRepo` (GitHub's twin of GitLab's already-
+  fixed `glActor`/`glWithRepo`), for adapter parity. Renamed the shared
+  `glCappedFactValue` helper to `cappedFactValue` since GitHub's new Labels
+  fact now calls it too. See
+  [journal](journal/shared/github-webhook-parity.md).
+
 ## 2026-07-20 (gitlab-mr-issue-cards)
 
 - **Feature** — GitLab merge_request/issue InteractiveCards gained a

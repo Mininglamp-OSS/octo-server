@@ -197,17 +197,17 @@ POST /v1/incoming-webhooks/:webhook_id/:token/github
 |------|-----------|------|
 | `ping` | — | 返回 200 不发消息（GitHub 创建 webhook 时的连通性测试） |
 | `push` | — | 分支/标签 push、删除、force-push；最多列 5 条提交 |
-| `pull_request` | `opened` / `closed`(含 merged) / `reopened` / `ready_for_review` | `synchronize` 等刷屏动作跳过 |
-| `issues` | `opened` / `closed` / `reopened` | |
-| `issue_comment` | `created` | 评论摘要压成单行、截断 300 rune |
-| `release` | `published` | |
+| `pull_request` | 所有 action（`opened`/`closed`(含 merged)/`reopened`/`synchronize`/`labeled`/...） | 卡片带 Source/Target 分支 + Labels FactSet；只有缺 `action` 字段的畸形 payload 才跳过 |
+| `issues` | 所有 action | 卡片带 Labels FactSet；只有缺 `action` 字段的畸形 payload 才跳过 |
+| `issue_comment` | 所有 action（`created`/`edited`/`deleted`） | 评论摘要压成单行、截断 300 rune；`deleted` 无正文可引用 |
+| `release` | 所有 action（`published`/`created`/`edited`/...） | |
 
-**子集之外的事件/动作返回 200 + `{"skipped":"event"}`**（GitHub 侧显示投递成功、
-不标红；deliveries 里以 `status=3` 可见），缺 `X-GitHub-Event` 头则按 400
-`reason=no_event` 拒绝——配置错误与「正常但不渲染」用不同 reason 区分，deliveries 里
-只看 reason 即可分辨。事件里的超长字段（标题/提交信息/评论）服务端截断；GitHub 可控的
-链接文本（PR/issue/release 标题）里的 `]`/`[` 会被转义，防止破坏渲染出的链接。GitHub
-流量不会触发 413。
+**子集之外的事件类型返回 200 + `{"skipped":"event"}`**（未实现的事件类型，如 `watch`/
+`star`；GitHub 侧显示投递成功、不标红；deliveries 里以 `status=3` 可见），缺
+`X-GitHub-Event` 头则按 400 `reason=no_event` 拒绝——配置错误与「正常但不渲染」用不同
+reason 区分，deliveries 里只看 reason 即可分辨。事件里的超长字段（标题/提交信息/评论）
+服务端截断；GitHub 可控的字段（actor login、仓库全名、PR/issue/release 标题、未知
+action 值等）均经转义，防止破坏渲染出的链接或伪造粗体/链接。GitHub 流量不会触发 413。
 
 **body 上限独立于 native**：GitHub 事件 JSON 由平台生成（真实 push/PR 事件普遍
 >8KiB，发送方无法修短），github 路由的请求体上限默认 **1MiB**

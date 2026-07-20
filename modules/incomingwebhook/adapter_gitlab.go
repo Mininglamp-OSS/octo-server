@@ -619,7 +619,7 @@ func buildGitLabIssueCard(ev *glIssueEvent, lang string) map[string]interface{} 
 // glLabelsFact builds the shared "Labels (N)" FactSet row for the MR/Issue cards
 // (nil when there is nothing to show — no labels, or every label title is blank —
 // so the caller omits the row entirely). Label titles are project-defined free text,
-// escaped/capped by the shared glCappedFactValue (same convention as the pipeline
+// escaped/capped by the shared cappedFactValue (same convention as the pipeline
 // card's Jobs fact); the count in the title reflects the real (non-blank) total, not
 // the truncated list.
 func glLabelsFact(title string, labels []glLabel) *vcsFact {
@@ -627,7 +627,7 @@ func glLabelsFact(title string, labels []glLabel) *vcsFact {
 	for i, l := range labels {
 		names[i] = l.Title
 	}
-	value, n := glCappedFactValue(names, maxRenderedLabels)
+	value, n := cappedFactValue(names, maxRenderedLabels)
 	if n == 0 {
 		return nil
 	}
@@ -679,7 +679,7 @@ func buildGitLabPipelineCard(ev *glPipelineEvent, lang string) map[string]interf
 		for i, b := range ev.Builds {
 			names[i] = b.Name
 		}
-		if value, n := glCappedFactValue(names, maxRenderedJobs); n > 0 {
+		if value, n := cappedFactValue(names, maxRenderedJobs); n > 0 {
 			facts = append(facts, vcsFact{title: fmt.Sprintf("%s (%d)", labels.jobs, n), value: value})
 		}
 	}
