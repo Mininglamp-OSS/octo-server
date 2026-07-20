@@ -113,6 +113,40 @@ func (s *spaceWelcomeStore) sweepDispatching(ctx context.Context, spaceID string
 	return res.RowsAffected()
 }
 
+// sweepClaimedAll recycles lease-expired claimed rows across ALL Spaces back to
+// pending. The multi-space worker (task space-welcome-per-space-admin-crud)
+// claims only from currently-enabled Spaces, so a per-enabled-space sweep would
+// never promote stale rows left behind by a Space that was disabled while rows
+// were in-flight. Sweeping every Space is safe (the per-row claim_owner CAS
+// still protects correctness) and index-backed by idx_sweep (status,
+// claim_expire_at). attempts is not touched (it was not incremented at claim).
+func (s *spaceWelcomeStore) sweepClaimedAll(ctx context.Context, now time.Time) (int64, error) {
+	res, err := s.db.UpdateBySql(
+		"UPDATE "+spaceWelcomeTable+" SET status=?, next_retry_at=?, claim_owner=NULL, claim_expire_at=NULL, updated_at=? "+
+			"WHERE status=? AND claim_expire_at IS NOT NULL AND claim_expire_at<=?",
+		swStatusPending, now, now, swStatusClaimed, now,
+	).ExecContext(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("sweep claimed welcome rows (all spaces): %w", err)
+	}
+	return res.RowsAffected()
+}
+
+// sweepDispatchingAll promotes lease-expired dispatching rows across ALL Spaces
+// to unknown (transport-ambiguous; never auto-retried). See sweepClaimedAll for
+// why the sweep is cross-space.
+func (s *spaceWelcomeStore) sweepDispatchingAll(ctx context.Context, now time.Time) (int64, error) {
+	res, err := s.db.UpdateBySql(
+		"UPDATE "+spaceWelcomeTable+" SET status=?, error_class=?, claim_owner=NULL, claim_expire_at=NULL, updated_at=? "+
+			"WHERE status=? AND claim_expire_at IS NOT NULL AND claim_expire_at<=?",
+		swStatusUnknown, swErrClaimExpired, now, swStatusDispatching, now,
+	).ExecContext(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("sweep dispatching welcome rows (all spaces): %w", err)
+	}
+	return res.RowsAffected()
+}
+
 // cas runs a CAS UPDATE guarded by id + expected status + claim_owner=self, so a
 // lease-expired sweep on another replica cannot be overwritten by this replica.
 // Returns ok=false when no row matched (ownership lost / status moved on).

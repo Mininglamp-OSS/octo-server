@@ -56,6 +56,7 @@ func callWithTimeout[T any](d time.Duration, fn func() T) (T, bool) {
 type spaceWelcomeService struct {
 	ctx      *config.Context
 	store    *spaceWelcomeStore
+	cfgStore *common.SpaceWelcomeConfigStore
 	settings *common.SystemSettings
 	metrics  *spaceWelcomeMetrics
 	fromUID  string
@@ -67,6 +68,11 @@ type spaceWelcomeService struct {
 	botReady func() bool
 	// now returns the current time; injectable for tests. Always UTC.
 	now func() time.Time
+
+	// reconcileCursor rotates the reconciler's per-cycle starting Space so a
+	// shared global budget cannot perpetually starve the tail of the enabled-Space
+	// list. Touched only by the single reconcile goroutine — no lock needed.
+	reconcileCursor int
 
 	mu     sync.Mutex
 	cancel context.CancelFunc
@@ -81,6 +87,7 @@ func newSpaceWelcomeService(ctx *config.Context, settings *common.SystemSettings
 	return &spaceWelcomeService{
 		ctx:      ctx,
 		store:    newSpaceWelcomeStore(ctx.DB(), owner),
+		cfgStore: common.NewSpaceWelcomeConfigStore(ctx.DB()),
 		settings: settings,
 		metrics:  newSpaceWelcomeMetrics(),
 		fromUID:  fromUID,
@@ -138,17 +145,72 @@ func (s *spaceWelcomeService) Stop() {
 // Event path (low latency)
 // ---------------------------------------------------------------------------
 
-// handleMemberJoin is invoked from the SpaceMemberJoin listener. When the event
-// matches the enabled config and the recipient is a first-join human member of
-// the target Space, it upserts a pending ledger row. Enqueue failure never
-// blocks or rolls back the completed join — it is logged and dropped (the
-// reconciler will catch it up).
+// effectiveConfig resolves the config in effect for spaceID: a per-Space row (if
+// present) overrides the platform-global fallback outright, else the global
+// config applies iff it is enabled and names spaceID. A DB error is returned so
+// callers can fail closed. The returned SpaceWelcomeConfig reuses the existing
+// shape, so ValidateSpaceWelcomeCombination / ParsedActiveFrom apply unchanged.
+func (s *spaceWelcomeService) effectiveConfig(ctx context.Context, spaceID string) (common.SpaceWelcomeConfig, error) {
+	row, found, err := s.cfgStore.Get(ctx, spaceID)
+	if err != nil {
+		return common.SpaceWelcomeConfig{}, err
+	}
+	return common.ResolveEffectiveSpaceWelcome(row, found, s.settings.SpaceWelcomeConfig(), spaceID), nil
+}
+
+// enabledEffectiveConfigs returns the effective config for every Space that has
+// an active welcome: each enabled per-Space row, plus the global-fallback Space
+// iff it is enabled AND has no per-Space row overriding it (a present row wins
+// regardless of its enabled flag). DB calls are individually bounded.
+func (s *spaceWelcomeService) enabledEffectiveConfigs(ctx context.Context) ([]common.SpaceWelcomeConfig, error) {
+	lc, cancel := context.WithTimeout(ctx, swDBCallTimeout)
+	rows, err := s.cfgStore.ListEnabled(lc)
+	cancel()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]common.SpaceWelcomeConfig, 0, len(rows)+1)
+	for _, r := range rows {
+		out = append(out, common.SpaceWelcomeConfig{
+			Enabled:       true,
+			SpaceID:       r.SpaceID,
+			ActiveFromRaw: r.ActiveFromRaw,
+			Message:       r.Message,
+		})
+	}
+	global := s.settings.SpaceWelcomeConfig()
+	if global.Enabled && global.SpaceID != "" {
+		ec, cancel2 := context.WithTimeout(ctx, swDBCallTimeout)
+		exists, err := s.cfgStore.Exists(ec, global.SpaceID)
+		cancel2()
+		if err != nil {
+			return nil, err
+		}
+		if !exists {
+			out = append(out, global)
+		}
+	}
+	return out, nil
+}
+
+// handleMemberJoin is invoked from the SpaceMemberJoin listener. When the target
+// Space's effective config is enabled and the recipient is a first-join human
+// member, it upserts a pending ledger row. Enqueue failure never blocks or rolls
+// back the completed join — it is logged and dropped (the reconciler catches it
+// up).
 func (s *spaceWelcomeService) handleMemberJoin(spaceID, uid string) {
 	if s == nil || spaceID == "" || uid == "" {
 		return
 	}
-	cfg := s.settings.SpaceWelcomeConfig()
-	if !cfg.Enabled || spaceID != cfg.SpaceID {
+	cfgCtx, cancelCfg := context.WithTimeout(context.Background(), swDBCallTimeout)
+	cfg, err := s.effectiveConfig(cfgCtx, spaceID)
+	cancelCfg()
+	if err != nil {
+		s.Warn("welcome enqueue effective config read failed",
+			zap.String("stage", swStageEnqueue), zap.String("space_id", spaceID), zap.String("uid", uid), zap.Error(err))
+		return
+	}
+	if !cfg.Enabled {
 		return
 	}
 	// Static combination re-validation (no space-existence DB check on the hot
@@ -170,16 +232,16 @@ func (s *spaceWelcomeService) handleMemberJoin(spaceID, uid string) {
 
 	callCtx, cancel := context.WithTimeout(context.Background(), swDBCallTimeout)
 	defer cancel()
-	eligible, err := s.store.firstJoinHumanMember(callCtx, cfg.SpaceID, uid, activeFrom)
+	eligible, err := s.store.firstJoinHumanMember(callCtx, spaceID, uid, activeFrom)
 	if err != nil {
 		s.Warn("welcome enqueue eligibility check failed",
-			zap.String("stage", swStageEnqueue), zap.String("space_id", cfg.SpaceID), zap.String("uid", uid), zap.Error(err))
+			zap.String("stage", swStageEnqueue), zap.String("space_id", spaceID), zap.String("uid", uid), zap.Error(err))
 		return
 	}
 	if !eligible {
 		return
 	}
-	s.enqueue(callCtx, cfg.SpaceID, uid, swSourceEvent)
+	s.enqueue(callCtx, spaceID, uid, swSourceEvent)
 }
 
 // enqueue upserts a pending row and splits enqueue_total vs enqueue_dedup_total.
@@ -216,38 +278,62 @@ func (s *spaceWelcomeService) reconcileLoop(ctx context.Context) {
 	}
 }
 
-// runReconcileOnce reads the config, re-validates (fail closed), scans the
-// target Space for active human members lacking a ledger row, and enqueues up
-// to swReconcileCap of them.
+// runReconcileOnce enumerates every Space with an enabled effective config,
+// re-validates each (fail closed per Space), and scans it for active human
+// members lacking a ledger row, enqueueing them. A shared global budget
+// (swReconcileCap) bounds total work per cycle, each Space is capped at
+// swReconcilePerSpaceCap, and the starting Space rotates (reconcileCursor) so a
+// backlogged head Space cannot perpetually starve the tail.
 func (s *spaceWelcomeService) runReconcileOnce(ctx context.Context) {
-	cfg := s.settings.SpaceWelcomeConfig()
-	if !cfg.Enabled {
-		return
-	}
-	if !s.validateRuntime(ctx, cfg) {
-		return
-	}
-	activeFrom, _ := cfg.ParsedActiveFrom()
-
-	scanCtx, cancel := context.WithTimeout(ctx, swDBCallTimeout)
-	uids, err := s.store.reconcileScan(scanCtx, cfg.SpaceID, activeFrom, spacepkg.SystemBotList(), swReconcileCap)
-	cancel()
+	configs, err := s.enabledEffectiveConfigs(ctx)
 	if err != nil {
-		s.Warn("welcome reconcile scan failed",
-			zap.String("stage", swStageEnqueue), zap.String("space_id", cfg.SpaceID), zap.Error(err))
+		s.Warn("welcome reconcile list enabled failed", zap.String("stage", swStageEnqueue), zap.Error(err))
 		return
 	}
-	for _, uid := range uids {
+	n := len(configs)
+	if n == 0 {
+		return
+	}
+	start := s.reconcileCursor % n
+	s.reconcileCursor++
+	budget := swReconcileCap
+
+	for i := 0; i < n && budget > 0; i++ {
 		if ctx.Err() != nil {
 			return
 		}
-		callCtx, c := context.WithTimeout(ctx, swDBCallTimeout)
-		s.enqueue(callCtx, cfg.SpaceID, uid, swSourceReconciler)
-		c()
-	}
-	if len(uids) > 0 {
-		s.Info("welcome reconcile enqueued",
-			zap.String("space_id", cfg.SpaceID), zap.Int("candidates", len(uids)))
+		cfg := configs[(start+i)%n]
+		// Per-Space runtime re-validation (space active + static combination).
+		if !s.validateRuntime(ctx, cfg) {
+			continue
+		}
+		activeFrom, _ := cfg.ParsedActiveFrom()
+		per := budget
+		if per > swReconcilePerSpaceCap {
+			per = swReconcilePerSpaceCap
+		}
+
+		scanCtx, cancel := context.WithTimeout(ctx, swDBCallTimeout)
+		uids, scanErr := s.store.reconcileScan(scanCtx, cfg.SpaceID, activeFrom, spacepkg.SystemBotList(), per)
+		cancel()
+		if scanErr != nil {
+			s.Warn("welcome reconcile scan failed",
+				zap.String("stage", swStageEnqueue), zap.String("space_id", cfg.SpaceID), zap.Error(scanErr))
+			continue
+		}
+		for _, uid := range uids {
+			if ctx.Err() != nil {
+				return
+			}
+			callCtx, c := context.WithTimeout(ctx, swDBCallTimeout)
+			s.enqueue(callCtx, cfg.SpaceID, uid, swSourceReconciler)
+			c()
+		}
+		budget -= len(uids)
+		if len(uids) > 0 {
+			s.Info("welcome reconcile enqueued",
+				zap.String("space_id", cfg.SpaceID), zap.Int("candidates", len(uids)))
+		}
 	}
 }
 
@@ -270,69 +356,100 @@ func (s *spaceWelcomeService) workerLoop(ctx context.Context) {
 	}
 }
 
-// runWorkerWake sweeps stale rows (always, even when disabled, so lease-expired
-// rows still reach a terminal state), then — when enabled and valid — drains up
-// to swWorkerWakeCap claimed rows. The per-wake cap is a safety valve; the next
-// wake resumes after the idle sleep.
+// runWorkerWake sweeps stale rows across ALL Spaces (always, even when every
+// Space is disabled, so lease-expired rows still reach a terminal state), then
+// round-robins over the enabled Spaces draining up to swWorkerWakeCap claimed
+// rows total. The per-wake cap is a safety valve; the next wake resumes after
+// the idle sleep. Per-Space enabled/validity is snapshotted at wake start —
+// disabling a Space stops NEW claims from the next wake; rows already claimed
+// this wake are allowed to complete (mirrors "in-flight dispatch completes").
 func (s *spaceWelcomeService) runWorkerWake(ctx context.Context) {
-	cfg := s.settings.SpaceWelcomeConfig()
+	// Cross-space sweep runs unconditionally: a Space disabled while rows were
+	// in-flight still has its lease-expired claimed/dispatching rows promoted.
+	s.sweepAll(ctx)
 
-	// Sweep runs against the configured Space regardless of enabled, so that a
-	// disabled feature still promotes stale claimed/dispatching rows.
-	if cfg.SpaceID != "" {
-		s.sweep(ctx, cfg.SpaceID)
+	configs, err := s.enabledEffectiveConfigs(ctx)
+	if err != nil {
+		s.Warn("welcome worker list enabled failed", zap.String("stage", swStageClaim), zap.Error(err))
+		return
 	}
-
-	if !cfg.Enabled || !s.validateRuntime(ctx, cfg) {
+	if len(configs) == 0 {
 		return
 	}
 
-	for claimed := 0; claimed < swWorkerWakeCap; claimed++ {
-		if ctx.Err() != nil {
-			return
+	// Per-Space runtime re-validation once per wake (space active + static
+	// combination). Only valid Spaces are claimed from.
+	valid := make([]common.SpaceWelcomeConfig, 0, len(configs))
+	for _, cfg := range configs {
+		if s.validateRuntime(ctx, cfg) {
+			valid = append(valid, cfg)
 		}
-		// Re-read the config each iteration (a cheap atomic snapshot read) so an
-		// admin disable or Space switch stops NEW claims immediately on this
-		// replica, rather than after the current wake's 20-row budget drains.
-		cur := s.settings.SpaceWelcomeConfig()
-		if !cur.Enabled || cur.SpaceID != cfg.SpaceID {
-			return
+	}
+
+	claimed := 0
+	for _, cfg := range valid {
+		for {
+			if ctx.Err() != nil || claimed >= swWorkerWakeCap {
+				return
+			}
+			// Re-resolve this Space's effective config before every NEW claim so an
+			// admin disable / delete / message edit mid-wake takes effect
+			// immediately on this replica (a claimed row already in flight is still
+			// allowed to complete). This mirrors the single-Space worker's
+			// per-iteration re-read; the fresh config also supplies the current
+			// message body passed to dispatch.
+			curCtx, curCancel := context.WithTimeout(ctx, swDBCallTimeout)
+			cur, curErr := s.effectiveConfig(curCtx, cfg.SpaceID)
+			curCancel()
+			if curErr != nil {
+				s.Warn("welcome worker config re-read failed", zap.String("stage", swStageClaim), zap.String("space_id", cfg.SpaceID), zap.Error(curErr))
+				break
+			}
+			if !cur.Enabled {
+				break // disabled/deleted mid-wake — stop claiming this Space
+			}
+			if field, _ := common.ValidateSpaceWelcomeCombination(cur, nil); field != "" {
+				s.metrics.incConfigInvalid()
+				break
+			}
+			claimCtx, cancel := context.WithTimeout(ctx, swDBCallTimeout)
+			row, claimErr := s.store.claimOne(claimCtx, cur.SpaceID, s.now())
+			cancel()
+			if claimErr != nil {
+				s.Warn("welcome claim failed", zap.String("stage", swStageClaim), zap.String("space_id", cur.SpaceID), zap.Error(claimErr))
+				break // move on to the next Space
+			}
+			if row == nil {
+				break // this Space drained — next Space
+			}
+			claimed++
+			s.dispatch(ctx, cur, row)
 		}
-		claimCtx, cancel := context.WithTimeout(ctx, swDBCallTimeout)
-		row, err := s.store.claimOne(claimCtx, cfg.SpaceID, s.now())
-		cancel()
-		if err != nil {
-			s.Warn("welcome claim failed", zap.String("stage", swStageClaim), zap.String("space_id", cfg.SpaceID), zap.Error(err))
-			return
-		}
-		if row == nil {
-			return // idle — fall through to sleep
-		}
-		s.dispatch(ctx, cfg, row)
 	}
 }
 
-// sweep reclaims lease-expired claimed rows (-> pending) and promotes
-// lease-expired dispatching rows (-> unknown). Runs once per wake.
-func (s *spaceWelcomeService) sweep(ctx context.Context, spaceID string) {
+// sweepAll reclaims lease-expired claimed rows (-> pending) and promotes
+// lease-expired dispatching rows (-> unknown) across ALL Spaces. Runs once per
+// wake. Cross-space so a now-disabled Space's stale rows are not stranded.
+func (s *spaceWelcomeService) sweepAll(ctx context.Context) {
 	now := s.now()
 	c1, cancel1 := context.WithTimeout(ctx, swDBCallTimeout)
-	reclaimed, err := s.store.sweepClaimed(c1, spaceID, now)
+	reclaimed, err := s.store.sweepClaimedAll(c1, now)
 	cancel1()
 	if err != nil {
-		s.Warn("welcome sweep claimed failed", zap.String("stage", swStageSweep), zap.String("space_id", spaceID), zap.Error(err))
+		s.Warn("welcome sweep claimed failed", zap.String("stage", swStageSweep), zap.Error(err))
 	} else {
 		s.metrics.addSweepClaimed(reclaimed)
 	}
 
 	c2, cancel2 := context.WithTimeout(ctx, swDBCallTimeout)
-	promoted, err := s.store.sweepDispatching(c2, spaceID, now)
+	promoted, err := s.store.sweepDispatchingAll(c2, now)
 	cancel2()
 	if err != nil {
-		s.Warn("welcome sweep dispatching failed", zap.String("stage", swStageSweep), zap.String("space_id", spaceID), zap.Error(err))
+		s.Warn("welcome sweep dispatching failed", zap.String("stage", swStageSweep), zap.Error(err))
 	} else if promoted > 0 {
 		s.metrics.addSweepDispatching(promoted)
-		s.Warn("welcome dispatching rows swept to unknown", zap.String("space_id", spaceID), zap.Int64("count", promoted))
+		s.Warn("welcome dispatching rows swept to unknown", zap.Int64("count", promoted))
 	}
 }
 
