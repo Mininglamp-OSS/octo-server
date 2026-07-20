@@ -77,7 +77,6 @@ func (s *Space) Route(r *wkhttp.WKHttp) {
 		auth.PUT("/:space_id", s.updateSpace)
 		auth.DELETE("/:space_id", s.disbandSpace)
 
-		auth.GET("/:space_id/members", s.listMembers)
 		auth.POST("/:space_id/members/add", s.addMembers)
 		auth.POST("/:space_id/members/remove", s.removeMembers)
 		auth.POST("/:space_id/leave", s.leaveSpace)
@@ -99,6 +98,10 @@ func (s *Space) Route(r *wkhttp.WKHttp) {
 
 	search := r.Group("/v1/space", s.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, s.ctx))
 	{
+		// listMembers 支持 keyword 的非索引 %kw% 联表扫描，属昂贵查询，须与 members/search
+		// 同组挂 SharedUIDRateLimiter 限流（PR #618 review：Jerry-Xin）。限流阈值 120 req/min、
+		// 桶 60，首屏全量浏览（fetchSpaceRoster ≈12 连发）远在预算内，不误伤。
+		search.GET("/:space_id/members", s.listMembers)
 		search.GET("/:space_id/members/search", s.searchMembers)
 	}
 
@@ -591,6 +594,9 @@ func (s *Space) mySpaces(c *wkhttp.Context) {
 	c.Response(resps)
 }
 
+// maxMemberKeywordRunes 限制成员列表检索关键词长度，防止超长 keyword 驱动无索引 LIKE 扫描。
+const maxMemberKeywordRunes = 64
+
 // listMembers 获取空间成员列表
 func (s *Space) listMembers(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
@@ -620,7 +626,17 @@ func (s *Space) listMembers(c *wkhttp.Context) {
 		limit = 10000
 	}
 
-	members, err := s.db.queryMembers(spaceId, loginUID, page, limit)
+	// keyword（可选）：非空时按 name/real_name/uid 服务端检索。文档成员选择器改为
+	// 服务端搜索后走此参数——避免前端全量拉取+本地过滤在超大空间被分页上限截断
+	// （5760 人空间：靠后成员搜不到）。任意成员可调，权限与列表一致。
+	keyword := c.Query("keyword")
+	// 关键词长度封顶：防止用户驱动的超长 %kw% 无索引扫描（与 members/search 的加固口径靠拢）。
+	// 用 rune 截断，避免把多字节字符切成无效 UTF-8。
+	if r := []rune(keyword); len(r) > maxMemberKeywordRunes {
+		keyword = string(r[:maxMemberKeywordRunes])
+	}
+
+	members, err := s.db.queryMembers(spaceId, loginUID, page, limit, keyword)
 	if err != nil {
 		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
 		return
