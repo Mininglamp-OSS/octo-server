@@ -138,6 +138,40 @@ func TestDocsActionFinalizerEnrichedTerminalAndDenyReason(t *testing.T) {
 	}
 }
 
+// The applicant's outcome notification (a fresh resource card sent to the
+// requester, distinct from the reviewer's in-place terminal rewrite) must also
+// carry the deny reason — a denial is useless to the applicant without it.
+func TestDocsActionFinalizerApplicantNotifyCarriesDenyReason(t *testing.T) {
+	wk := newWuKongServer()
+	defer wk.close()
+	ctx := newTestContext(t, wk)
+	ctx.GetConfig().External.WebLoginURL = "https://im.example.com/login"
+
+	sender := &capturingCardSender{}
+	finalizer, err := NewDocsActionFinalizer(ctx, &captureCardMutator{}, sender)
+	if err != nil {
+		t.Fatalf("NewDocsActionFinalizer() error = %v", err)
+	}
+	event := cardactiondispatch.Event{
+		EventID: 8, SenderUID: NotifyBotUIDValue, Owner: "docs", ActionType: "access_request.decision",
+		MessageID: "1001", ChannelID: NotifyBotUIDValue, ChannelType: 1, SpaceID: "space-1",
+		OperatorUID: "user-b",
+		Data:        map[string]interface{}{"doc_id": "doc-1", "request_id": "request-1"},
+		Inputs:      map[string]interface{}{cardtmpl.DocsDenyReasonInputID: "范围不符，请缩小到 Q3"},
+	}
+	result := cardactiondispatch.DecisionResult{
+		Disposition: cardactiondispatch.DispositionApplied, State: cardactiondispatch.StateDenied,
+		RequesterUID: "user-a", Display: map[string]string{"title": "Roadmap"},
+	}
+	if err := finalizer.Finalize(context.Background(), event, result); err != nil {
+		t.Fatalf("Finalize() error = %v", err)
+	}
+	outcome := sender.last()
+	if !strings.Contains(string(outcome.Document), "范围不符，请缩小到 Q3") {
+		t.Fatalf("applicant outcome card missing deny reason: %s", outcome.Document)
+	}
+}
+
 func TestDocsActionFinalizerRejectsTerminalResultWithoutRequesterBeforeMutation(t *testing.T) {
 	wk := newWuKongServer()
 	defer wk.close()
