@@ -387,6 +387,11 @@ func pipelineStatusColor(status string) string {
 		return "Attention"
 	case "canceled":
 		return "Warning"
+	case "running", "pending", "created", "waiting_for_resource", "preparing", "scheduled":
+		// In-progress-ish statuses only became reachable once the terminal-status
+		// filter was removed; without a color they were visually indistinguishable
+		// from an unrecognized status (PR #610 review, mochashanyao P2).
+		return "Accent"
 	}
 	return ""
 }

@@ -182,14 +182,31 @@ func TestBuildGitLabPipelineCard_StatusColor(t *testing.T) {
 	assert.Contains(t, plain, "Jobs (5): build / unit / lint / e2e / deploy")
 	assert.Equal(t, "https://gitlab.com/grp/app/-/pipelines/4567", cardActionURL(card))
 
-	// Non-terminal status is rendered too (no longer filtered to success/failed/canceled) —
-	// no color mapping for it, so the headline keeps the default color.
-	running := glPipelineCardFrom(t, `{"object_attributes":{"id":1,"status":"running"}}`)
-	require.NotNil(t, running)
-	require.NoError(t, validateVCSCard(running))
-	runningBody0 := running["body"].([]interface{})[0].(map[string]interface{})
-	assert.NotContains(t, runningBody0, "color", "unmapped status keeps the default headline color")
-	assert.Contains(t, cardmsg.BuildPlain(running), "Status: running")
+	// Non-terminal statuses are rendered too (no longer filtered to success/failed/canceled).
+	// In-progress-ish ones get a distinct "Accent" color so they don't look identical to
+	// an unrecognized status (PR #610 review, mochashanyao P2).
+	for _, status := range []string{"running", "pending", "created", "waiting_for_resource", "preparing", "scheduled"} {
+		t.Run("color for "+status, func(t *testing.T) {
+			card := glPipelineCardFrom(t, fmt.Sprintf(`{"object_attributes":{"id":1,"status":%q}}`, status))
+			require.NotNil(t, card)
+			require.NoError(t, validateVCSCard(card))
+			body0 := card["body"].([]interface{})[0].(map[string]interface{})
+			assert.Equal(t, "Accent", body0["color"])
+			// `_` is escaped by escapeCardText (`_` → `\_`); BuildPlain's stripMarkdown
+			// (a real markdown parser) does not fold that back to a bare `_`, so the
+			// plain rendering keeps the backslash — confirmed empirically here.
+			assert.Contains(t, cardmsg.BuildPlain(card), "Status: "+strings.ReplaceAll(status, "_", `\_`))
+		})
+	}
+
+	// A genuinely unrecognized status (not one of the 9 mapped values) keeps the
+	// default headline color — proves the fallback still exists, not that "running"
+	// specifically is unmapped (it no longer is).
+	unknown := glPipelineCardFrom(t, `{"object_attributes":{"id":1,"status":"some_future_gitlab_status"}}`)
+	require.NotNil(t, unknown)
+	require.NoError(t, validateVCSCard(unknown))
+	unknownBody0 := unknown["body"].([]interface{})[0].(map[string]interface{})
+	assert.NotContains(t, unknownBody0, "color", "unmapped status keeps the default headline color")
 
 	// Missing status (malformed payload, nothing to render) → no card.
 	assert.Nil(t, glPipelineCardFrom(t, `{"object_attributes":{"id":1}}`))
