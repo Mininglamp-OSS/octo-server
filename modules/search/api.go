@@ -309,12 +309,24 @@ func (s *Search) global(c *wkhttp.Context) {
 	if req.OnlyMessage == 0 {
 		if searchSpaceID != "" {
 			var members []struct {
-				UID  string `db:"uid"`
-				Name string `db:"name"`
+				UID      string `db:"uid"`
+				Name     string `db:"name"`
+				RealName string `db:"real_name"`
 			}
+			// 检索列必须覆盖展示名兜底链（issue #344：u.name 为空回退 user_verification.real_name），
+			// 否则 u.name 为空、仅靠实名显示的成员「看得见却搜不到」——5760 人空间里王姓实名用户
+			// 搜不到即此因。email/phone 不在本结果返回、也不参与检索（privacy）。
+			//
+			// real_name 匹配 gate 到 IFNULL(u.name,'')=''：real_name 仅在 u.name 为空时才展示，
+			// 无条件检索会让有昵称用户的隐藏实名「搜得到却看不见」，构成身份 oracle。gate 后
+			// 可检索粒度 == 可见粒度（同 PR #618 review 口径）。
 			_, err := s.ctx.DB().SelectBySql(
-				"SELECT sm.uid, IFNULL(u.name,'') as name FROM space_member sm LEFT JOIN user u ON sm.uid=u.uid WHERE sm.space_id=? AND sm.status=1 AND (u.name LIKE ? OR sm.uid LIKE ?)",
-				searchSpaceID, "%"+req.Keyword+"%", "%"+req.Keyword+"%",
+				"SELECT sm.uid, IFNULL(u.name,'') as name, IFNULL(uv.real_name,'') as real_name "+
+					"FROM space_member sm "+
+					"LEFT JOIN user u ON sm.uid=u.uid "+
+					"LEFT JOIN user_verification uv ON uv.user_id=sm.uid "+
+					"WHERE sm.space_id=? AND sm.status=1 AND (u.name LIKE ? OR (IFNULL(u.name,'')='' AND uv.real_name LIKE ?) OR sm.uid LIKE ?)",
+				searchSpaceID, "%"+req.Keyword+"%", "%"+req.Keyword+"%", "%"+req.Keyword+"%",
 			).Load(&members)
 			if err != nil {
 				s.Error("搜索Space成员错误", zap.Error(err))
@@ -323,8 +335,14 @@ func (s *Search) global(c *wkhttp.Context) {
 				if m.UID == loginUID {
 					continue
 				}
+				// 展示名兜底（同 MemberDetailModel.DisplayName 的 issue #344 链）：u.name 为空
+				// 时用实名，否则靠 real_name 命中的成员结果行会是空名。
+				displayName := m.Name
+				if displayName == "" {
+					displayName = m.RealName
+				}
 				escapedKeyword := html.EscapeString(req.Keyword)
-				escapedName := html.EscapeString(m.Name)
+				escapedName := html.EscapeString(displayName)
 				name := strings.ReplaceAll(escapedName, escapedKeyword, fmt.Sprintf("<mark>%s</mark>", escapedKeyword))
 				friendResps = append(friendResps, &channelResp{
 					ChannelID:   m.UID,
