@@ -41,6 +41,21 @@ independent code-review pass — the "unknown action" test that already existed
 didn't catch it either, because it exercised `"approved"` (an explicitly
 mapped, safe case), not a genuinely unmapped value.
 
+## It recurred in the same PR, on the sibling field
+
+The same commit that widened `glActionVerb` *also* removed the equivalent
+whitelist gate on GitLab pipeline `status` (`success`/`failed`/`canceled` →
+any non-empty value), in `renderGitLabPipeline`. The fix for `action` shipped
+in a follow-up commit — but that fix was scoped to `glActionVerb` specifically
+and didn't re-check `status`, which had the identical shape of bug: raw
+`ev.ObjectAttributes.Status` interpolated unescaped into the text-path
+markdown once its gate was gone. It took a **second**, independent review (a
+human PR review, after a first AI-delegated review had already caught and
+"fixed" the `action` half) to catch it. Point 4 below is not hypothetical —
+it's exactly the check that would have caught this the first time, and it
+needed to be applied to *every* field a gate-removal commit touches, not just
+the one an initial finding happened to name.
+
 ## The rule
 
 When a function's return value has been implicitly safe only because its
@@ -59,7 +74,11 @@ include (or pass through) external input:
    new code *happens* to map explicitly (like `"approved"` here) proves
    nothing about the new raw-passthrough branch.
 4. When reviewing a "widen this gate" change, explicitly ask: was this gate's
-   restricted output range load-bearing for escaping anywhere downstream?
+   restricted output range load-bearing for escaping anywhere downstream? —
+   and enumerate **every** field the same commit un-gated, not just the one
+   already flagged. A gate-removal commit that touches N fields needs this
+   check done N times, independently; fixing the first one found does not
+   imply the others were checked.
 
 ## Candidate rule promotion
 

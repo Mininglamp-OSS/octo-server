@@ -347,6 +347,23 @@ func TestParseGitLabPush_Pipeline(t *testing.T) {
 		assert.NotContains(t, req.Content, "](/-/pipelines", "must not emit a relative-path link when web_url is absent")
 		assert.NotContains(t, req.Content, "[#99]", "no markdown link without an absolute base url")
 	})
+	t.Run("hostile unknown status is escaped, not rendered live (trust-boundary, web_url present)", func(t *testing.T) {
+		// status lost its success/failed/canceled whitelist gate when filtering was
+		// removed — like glActionVerb's verb, it is now unvalidated external input
+		// (any URL-token holder can set it) and must be escaped at the text-path
+		// interpolation site (PR #610 review, lml2468: this branch was missed in the
+		// initial filter-removal fix, which only covered glActionVerb's verb).
+		req, _, _ := parseGitLabPush(glHeader("Pipeline Hook"), []byte(fmt.Sprintf(tpl, "**pwn** [x](http://evil.example)")))
+		require.NotNil(t, req)
+		assert.Contains(t, req.Content, `\*\*pwn\*\* \[x\](http://evil.example)`,
+			"markdown metacharacters in an unmapped status must be escaped")
+	})
+	t.Run("hostile unknown status is escaped, not rendered live (trust-boundary, web_url absent)", func(t *testing.T) {
+		body := `{"object_attributes":{"id":99,"ref":"main","status":"**pwn** [x](http://evil.example)"},"project":{"path_with_namespace":"o/r"}}`
+		req, _, _ := parseGitLabPush(glHeader("Pipeline Hook"), []byte(body))
+		require.NotNil(t, req)
+		assert.Contains(t, req.Content, `\*\*pwn\*\* \[x\](http://evil.example)`)
+	})
 }
 
 // 平台事件里的超长字段被钳制，绝不让 GitLab 流量撞 413（调用方无法修短一个事件）。

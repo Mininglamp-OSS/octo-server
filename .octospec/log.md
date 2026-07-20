@@ -16,9 +16,13 @@ change-log convention (§7). Newest first.
   subagent) found the filter-removal had silently reopened a markdown/link
   injection: `glActionVerb`'s raw-passthrough fallback for unmapped actions
   was interpolated unescaped. Fixed by escaping at every call site; also
-  deduped the pipeline Jobs / new Labels fact cap-and-join logic. See
+  deduped the pipeline Jobs / new Labels fact cap-and-join logic.
+- **Fix** — A second, human PR review (lml2468, PR #610) then found the exact
+  same bug class on the sibling field the first fix missed: GitLab pipeline
+  `status` also lost its whitelist gate in the same commit, and was still
+  interpolated raw on the text path. Fixed identically. See
   [journal](journal/shared/gitlab-mr-issue-cards.md) and the pending learning
-  on whitelist-gates-as-implicit-sanitizers.
+  on whitelist-gates-as-implicit-sanitizers (updated with this recurrence).
 
 ## 2026-07-17 (docs-approval-card-enrich)
 

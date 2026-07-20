@@ -1,7 +1,7 @@
 ---
 type: Journal
 title: "Journal: gitlab-mr-issue-cards"
-description: GitLab merge_request/issue cards gained a Source/Target branch + Labels FactSet; the adapter stopped filtering MR/Issue actions and pipeline statuses per explicit product decision. A follow-up review caught and fixed a real trust-boundary bug introduced by the filter removal.
+description: GitLab merge_request/issue cards gained a Source/Target branch + Labels FactSet; the adapter stopped filtering MR/Issue actions and pipeline statuses per explicit product decision. Two follow-up reviews (one delegated, one human PR review) each caught a real trust-boundary bug introduced by the filter removal — the second was the exact same bug class applied to a sibling field the first fix missed.
 tags: ["incomingwebhook", "adapter", "gitlab", "card", "trust-boundary", "external-content", "markdown", "code-review"]
 timestamp: 2026-07-20T00:00:00Z
 # --- octospec extension fields ---
@@ -47,6 +47,20 @@ Three commits on `feat/gitlab-mr-issue-cards`:
    minor bug where a blank label title would inflate the `Labels(N)` count
    with an empty slot.
 
+4. **Fix: escape the pipeline status too (caught by human PR review).** After
+   the PR was opened, a human reviewer (lml2468) found that commit 2 removed
+   the *pipeline* status whitelist gate but the raw `ev.ObjectAttributes.Status`
+   was still interpolated unescaped in `renderGitLabPipeline`'s text path (the
+   pipeline card path was already correctly escaped via `escapeCardText`,
+   only the text path had the gap). This is the **identical bug class** as
+   commit 3, on the sibling field the earlier review didn't examine — the
+   delegated review had only seen the diff up to commit 2, and my own commit
+   3 fix pattern-matched on `glActionVerb` specifically without checking
+   whether the same "gate removed, escaping not added" gap existed anywhere
+   else the same PR touched. Fixed identically: `mdInertText(status, glActorMax)`
+   at both `renderGitLabPipeline` branches, with regression tests for both
+   (web_url present/absent).
+
 ## Load-bearing decisions
 
 - **A whitelist gate doubles as an implicit sanitizer — removing it does not
@@ -69,17 +83,28 @@ Three commits on `feat/gitlab-mr-issue-cards`:
   here so a future reader doesn't mistake the wide-open behavior for an
   oversight and "fix" it back to filtered without checking history first.
 
-## Process note: delegated review caught a real bug
+## Process note: two independent reviews, two instances of the same bug class
 
 The user asked to delegate a code review to a fresh Opus 4.8 subagent (via the
 `Agent` tool, `code-review` skill, high effort) against the diff at that point
-(commits 1+2, before commit 3 existed). It correctly identified the escaping
-gap as HIGH severity, correctly identified that the existing "unknown action"
-test didn't actually exercise the raw-passthrough branch (it used `"approved"`,
-which is an explicitly-mapped case), and flagged the Jobs/Labels duplication.
-All three were fixed in commit 3, with new regression tests using the review's
-own example payload (`"**pwn** [x](http://evil.example)"`) on both the text and
-card paths, for both MR and issue events.
+(commits 1+2, before commit 3 existed). It correctly identified the `action`
+escaping gap as HIGH severity, correctly identified that the existing "unknown
+action" test didn't actually exercise the raw-passthrough branch (it used
+`"approved"`, which is an explicitly-mapped case), and flagged the Jobs/Labels
+duplication. All three were fixed in commit 3.
+
+A human PR reviewer (lml2468) then found that the fix in commit 3 was
+*incomplete*: it treated the bug as specific to `glActionVerb`/`action` and
+didn't check whether the same "gate removed → escaping assumption broken"
+pattern applied to `status`, which the very same commit-2 change had also
+un-gated. It had. This is a direct, concrete instance of the pending learning
+this task itself filed (`gitlab-mr-issue-cards-whitelist-gate-sanitizer.md`)
+— point 4 of that learning ("when reviewing a widen-this-gate change, ask
+whether the restricted output range was load-bearing for escaping anywhere
+downstream") should have been applied to *both* fields removed by commit 2,
+not just the one a first review happened to flag. Fixed in commit 4 with the
+identical pattern, plus regression tests for both `renderGitLabPipeline`
+branches.
 
 ## Verification
 

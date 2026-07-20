@@ -396,14 +396,20 @@ func renderGitLabPipeline(ev *glPipelineEvent) string {
 	// Pipeline 是唯一自拼 URL 的事件（MR/Issue/Note 直接用 object_attributes.url 绝对
 	// 地址）。project.web_url 缺失时（白名单解析不保证字段必到）退化为不带链接的纯文本，
 	// 避免渲染出 [#99](/-/pipelines/99) 这种不可点击的相对路径（#423 review，lml2468）。
+	//
+	// status 曾经只可能是 switch 已放行的三个终态字面量（安全），过滤放开后它是外部原样
+	// 输入（任何持有 URL token 的调用方都能自定义），拼进纯文本前必须转义——与
+	// glActionVerb 的 verb 同一类「白名单收窄=隐式转义」陷阱，同一套 mdInertText 处理
+	// （#610 review，lml2468 P1：这次过滤放开只修了 verb，漏了 status）。
+	status := mdInertText(ev.ObjectAttributes.Status, glActorMax)
 	var line string
 	if ev.Project.WebURL != "" {
 		line = fmt.Sprintf("Pipeline [#%d](%s/-/pipelines/%d) %s on `%s`",
 			ev.ObjectAttributes.ID, ev.Project.WebURL, ev.ObjectAttributes.ID,
-			ev.ObjectAttributes.Status, glShortRef(ev.ObjectAttributes.Ref))
+			status, glShortRef(ev.ObjectAttributes.Ref))
 	} else {
 		line = fmt.Sprintf("Pipeline #%d %s on `%s`",
-			ev.ObjectAttributes.ID, ev.ObjectAttributes.Status, glShortRef(ev.ObjectAttributes.Ref))
+			ev.ObjectAttributes.ID, status, glShortRef(ev.ObjectAttributes.Ref))
 	}
 	return glWithRepo(line, ev.Project)
 }
