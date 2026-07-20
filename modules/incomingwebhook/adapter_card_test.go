@@ -211,6 +211,20 @@ func TestBuildGitHubPullRequestCard_Facts(t *testing.T) {
 		assert.Contains(t, cardmsg.BuildPlain(card), "carol pushed new commits to a pull request")
 	})
 
+	t.Run("ready_for_review headline places the object mid-phrase", func(t *testing.T) {
+		card := ghPullRequestCardFrom(t, `{"action":"ready_for_review","pull_request":{"number":1,"title":"x"},"sender":{"login":"carol"}}`)
+		require.NotNil(t, card)
+		require.NoError(t, validateVCSCard(card))
+		assert.Contains(t, cardmsg.BuildPlain(card), "carol marked a pull request ready for review")
+	})
+
+	t.Run("converted_to_draft headline places the object mid-phrase", func(t *testing.T) {
+		card := ghPullRequestCardFrom(t, `{"action":"converted_to_draft","pull_request":{"number":1,"title":"x"},"sender":{"login":"carol"}}`)
+		require.NotNil(t, card)
+		require.NoError(t, validateVCSCard(card))
+		assert.Contains(t, cardmsg.BuildPlain(card), "carol converted a pull request to draft")
+	})
+
 	t.Run("missing action has no card (nothing to render)", func(t *testing.T) {
 		assert.Nil(t, ghPullRequestCardFrom(t, `{"pull_request":{"number":1}}`))
 	})

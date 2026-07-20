@@ -176,6 +176,16 @@ func TestParseGitHubPush_PullRequest(t *testing.T) {
 		require.NotNil(t, req)
 		assert.Contains(t, req.Content, "**carol** pushed new commits to pull request [#12 Add feature](https://github.com/o/r/pull/12)")
 	})
+	t.Run("ready_for_review reads naturally (object mid-phrase, not appended)", func(t *testing.T) {
+		req, _, _ := parseGitHubPush(ghHeader("pull_request"), []byte(fmt.Sprintf(tpl, "ready_for_review", false)))
+		require.NotNil(t, req)
+		assert.Contains(t, req.Content, "**carol** marked pull request [#12 Add feature](https://github.com/o/r/pull/12) ready for review")
+	})
+	t.Run("converted_to_draft reads naturally (object mid-phrase, not appended)", func(t *testing.T) {
+		req, _, _ := parseGitHubPush(ghHeader("pull_request"), []byte(fmt.Sprintf(tpl, "converted_to_draft", false)))
+		require.NotNil(t, req)
+		assert.Contains(t, req.Content, "**carol** converted pull request [#12 Add feature](https://github.com/o/r/pull/12) to draft")
+	})
 	t.Run("truly unknown action falls back to the raw value", func(t *testing.T) {
 		// `_` is escaped by mdInertText like any other external field (expected).
 		req, _, _ := parseGitHubPush(ghHeader("pull_request"), []byte(fmt.Sprintf(tpl, "auto_merge_enabled", false)))

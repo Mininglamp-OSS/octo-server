@@ -110,6 +110,30 @@ review-driven follow-ups):
   PR/issue payloads render sensibly on both paths (see PR description for
   the actual output).
 
+## Review round (PR #611)
+
+Three independent reviewers (lml2468, Jerry-Xin, yujiawei) approved with no
+P0/P1 findings — the proactive escaping (see "Load-bearing decisions" above)
+meant none of them found a repeat of the GitLab task's "widened gate, missed
+an escape site" bug. One P2 non-blocking finding, folded in directly rather
+than deferred (all three reviews were in hand, so this was a single batched
+decision, not a one-at-a-time back-and-forth):
+
+- **yujiawei**: `ready_for_review`/`converted_to_draft` are complete
+  predicate phrases ("marked ready for review", "converted to draft"), not
+  transitive verbs — running them through the generic `"%s %s pull request
+  [#N]"` / `"%s %s a pull request"` templates put the object in the wrong
+  place ("actor marked ready for review a pull request"). Fixed by special-
+  casing these two known-literal actions in both
+  `renderGitHubPullRequest`/`buildGitHubPullRequestCard` to place the PR
+  reference mid-phrase ("actor marked pull request [#N] ready for review" /
+  "actor converted a pull request to draft"); every other action keeps the
+  uniform template unchanged. No escaping impact — both branches match on
+  the literal `ev.Action` string, not on interpolated content.
+- Jerry-Xin's and lml2468's findings were both "no action needed, already
+  tracked" — restating the same deferred URL-destination / comment-body
+  items this journal already lists below.
+
 ## Follow-ups / notes
 
 - The already-tracked deferred hardening item (ref/branch code-span

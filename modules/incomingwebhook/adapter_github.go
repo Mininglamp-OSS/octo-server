@@ -291,9 +291,19 @@ func renderGitHubPullRequest(ev *ghPullRequestEvent) string {
 		// 缺 action 字段的畸形 payload：没有可渲染的动作 → skip（唯一保留的过滤）。
 		return ""
 	}
-	return ghWithRepo(fmt.Sprintf("**%s** %s pull request [#%d %s](%s)",
-		ghLogin(ev.Sender), mdInertText(verb, glActorMax), ev.PullRequest.Number,
-		mdLinkText(ev.PullRequest.Title, 200), ev.PullRequest.HTMLURL),
+	pr := fmt.Sprintf("pull request [#%d %s](%s)", ev.PullRequest.Number,
+		mdLinkText(ev.PullRequest.Title, 200), ev.PullRequest.HTMLURL)
+	// ready_for_review/converted_to_draft 是完整谓语短语，不是能直接接宾语的及物动词，
+	// 套用通用的 "VERB pull request [#N]" 模板会语序错乱（"marked ready for review
+	// pull request #N"）。这两个 action 是已知字面量分支，宾语单独摆在短语中间。
+	switch ev.Action {
+	case "ready_for_review":
+		return ghWithRepo(fmt.Sprintf("**%s** marked %s ready for review", ghLogin(ev.Sender), pr), ev.Repository)
+	case "converted_to_draft":
+		return ghWithRepo(fmt.Sprintf("**%s** converted %s to draft", ghLogin(ev.Sender), pr), ev.Repository)
+	}
+	return ghWithRepo(fmt.Sprintf("**%s** %s %s",
+		ghLogin(ev.Sender), mdInertText(verb, glActorMax), pr),
 		ev.Repository)
 }
 
@@ -596,10 +606,19 @@ func buildGitHubPullRequestCard(ev *ghPullRequestEvent, lang string) map[string]
 	if f := ghLabelsFact(labels.labels, ev.PullRequest.Labels); f != nil {
 		facts = append(facts, *f)
 	}
+	var headline string
+	switch ev.Action {
+	case "ready_for_review":
+		headline = fmt.Sprintf("%s marked a pull request ready for review", ghActorCard(ev.Sender))
+	case "converted_to_draft":
+		headline = fmt.Sprintf("%s converted a pull request to draft", ghActorCard(ev.Sender))
+	default:
+		headline = fmt.Sprintf("%s %s a pull request", ghActorCard(ev.Sender), escapeCardText(verb, cardActorMax))
+	}
 	return vcsCardData{
 		source:   cardSourceGitHub,
 		variant:  "vcs.github.pull_request",
-		headline: fmt.Sprintf("%s %s a pull request", ghActorCard(ev.Sender), escapeCardText(verb, cardActorMax)),
+		headline: headline,
 		subtitle: escapeCardText(ev.Repository.FullName, cardTitleMax),
 		lines:    []string{numberedTitle("#", ev.PullRequest.Number, ev.PullRequest.Title)},
 		facts:    facts,
