@@ -111,6 +111,12 @@ type glPushEvent struct {
 	Project      glProject  `json:"project"`
 }
 
+// glLabel is a GitLab label object (the top-level `labels[]` array GitLab attaches
+// to Merge Request Hook / Issue Hook payloads). Only Title is rendered.
+type glLabel struct {
+	Title string `json:"title"`
+}
+
 type glMergeRequestEvent struct {
 	User             glUser `json:"user"`
 	ObjectAttributes struct {
@@ -118,7 +124,14 @@ type glMergeRequestEvent struct {
 		Title  string `json:"title"`
 		URL    string `json:"url"`
 		Action string `json:"action"`
+		// SourceBranch / TargetBranch feed the card-only Source/Target FactSet rows
+		// (text path unchanged, same "card-only" convention as pipeline's
+		// Duration/Jobs — see glPipelineEvent).
+		SourceBranch string `json:"source_branch"`
+		TargetBranch string `json:"target_branch"`
 	} `json:"object_attributes"`
+	// Labels feeds the card-only Labels FactSet row;缺省即不展示该行。
+	Labels  []glLabel `json:"labels"`
 	Project glProject `json:"project"`
 }
 
@@ -130,6 +143,8 @@ type glIssueEvent struct {
 		URL    string `json:"url"`
 		Action string `json:"action"`
 	} `json:"object_attributes"`
+	// Labels feeds the card-only Labels FactSet row;缺省即不展示该行。
+	Labels  []glLabel `json:"labels"`
 	Project glProject `json:"project"`
 }
 
@@ -525,12 +540,26 @@ func buildGitLabMergeRequestCard(ev *glMergeRequestEvent, lang string) map[strin
 	if verb == "" {
 		return nil
 	}
+	// 卡片专属的结构化 FactSet（源分支 / 目标分支 / 标签）——文本路径不含这些字段，
+	// 故 flag-off 字节不变，与 pipeline 卡片同一约定（见 buildGitLabPipelineCard）。
+	labels := vcsCardLabelsFor(lang)
+	var facts []vcsFact
+	if src := cardCodeSpan(ev.ObjectAttributes.SourceBranch, cardRefMax); src != "" {
+		facts = append(facts, vcsFact{title: labels.source, value: src})
+	}
+	if tgt := cardCodeSpan(ev.ObjectAttributes.TargetBranch, cardRefMax); tgt != "" {
+		facts = append(facts, vcsFact{title: labels.target, value: tgt})
+	}
+	if f := glLabelsFact(labels.labels, ev.Labels); f != nil {
+		facts = append(facts, *f)
+	}
 	return vcsCardData{
 		source:   cardSourceGitLab,
 		variant:  "vcs.gitlab.merge_request",
 		headline: fmt.Sprintf("%s %s a merge request", glActorCard(ev.User.Username, ev.User.Name), verb),
 		subtitle: escapeCardText(ev.Project.PathWithNamespace, cardTitleMax),
 		lines:    []string{numberedTitle("!", ev.ObjectAttributes.IID, ev.ObjectAttributes.Title)},
+		facts:    facts,
 		url:      httpURLForCard(ev.ObjectAttributes.URL),
 	}.card(lang)
 }
@@ -540,14 +569,42 @@ func buildGitLabIssueCard(ev *glIssueEvent, lang string) map[string]interface{} 
 	if verb == "" {
 		return nil
 	}
+	var facts []vcsFact
+	if f := glLabelsFact(vcsCardLabelsFor(lang).labels, ev.Labels); f != nil {
+		facts = append(facts, *f)
+	}
 	return vcsCardData{
 		source:   cardSourceGitLab,
 		variant:  "vcs.gitlab.issue",
 		headline: fmt.Sprintf("%s %s an issue", glActorCard(ev.User.Username, ev.User.Name), verb),
 		subtitle: escapeCardText(ev.Project.PathWithNamespace, cardTitleMax),
 		lines:    []string{numberedTitle("#", ev.ObjectAttributes.IID, ev.ObjectAttributes.Title)},
+		facts:    facts,
 		url:      httpURLForCard(ev.ObjectAttributes.URL),
 	}.card(lang)
+}
+
+// glLabelsFact builds the shared "Labels (N)" FactSet row for the MR/Issue cards
+// (nil when the event carries no labels, so the caller omits the row entirely).
+// Label titles are project-defined free text — escaped per leaf like the pipeline
+// card's Jobs fact — and capped at maxRenderedLabels with a trailing "…"; the count
+// in the title always reflects the true total, not the truncated list.
+func glLabelsFact(title string, labels []glLabel) *vcsFact {
+	if len(labels) == 0 {
+		return nil
+	}
+	names := make([]string, 0, maxRenderedLabels)
+	for i, l := range labels {
+		if i == maxRenderedLabels {
+			break
+		}
+		names = append(names, escapeCardText(l.Title, cardActorMax))
+	}
+	value := strings.Join(names, " / ")
+	if len(labels) > maxRenderedLabels {
+		value += " …"
+	}
+	return &vcsFact{title: fmt.Sprintf("%s (%d)", title, len(labels)), value: value}
 }
 
 func buildGitLabNoteCard(ev *glNoteEvent, lang string) map[string]interface{} {

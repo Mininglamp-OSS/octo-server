@@ -276,6 +276,24 @@ func vcsPushReq(text string, card map[string]interface{}) *pushPayloadReq {
 // before eliding — the (N) count still reflects the true total.
 const maxRenderedJobs = 8
 
+// maxRenderedLabels bounds how many GitLab MR/Issue label titles the "Labels (N)"
+// fact lists before eliding — same elide convention as maxRenderedJobs.
+const maxRenderedLabels = 10
+
+// vcsCardLabels are the localized FactSet titles for the GitLab merge_request card's
+// Source/Target branch rows and the Labels row shared with the issue card (issues
+// have no source/target branch).
+type vcsCardLabels struct {
+	source, target, labels string
+}
+
+func vcsCardLabelsFor(lang string) vcsCardLabels {
+	if isZhLang(lang) {
+		return vcsCardLabels{source: "源分支", target: "目标分支", labels: "标签"}
+	}
+	return vcsCardLabels{source: "Source", target: "Target", labels: "Labels"}
+}
+
 // pipelineLabels are the localized FactSet titles for the pipeline card.
 type pipelineLabels struct {
 	branch, status, duration, jobs string

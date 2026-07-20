@@ -2,6 +2,7 @@ package incomingwebhook
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -41,14 +42,28 @@ func glPipelineCardFrom(t *testing.T, body string) map[string]interface{} {
 	return buildGitLabPipelineCard(&ev, "en-US")
 }
 
+func glMergeRequestCardFrom(t *testing.T, body string) map[string]interface{} {
+	t.Helper()
+	var ev glMergeRequestEvent
+	require.NoError(t, json.Unmarshal([]byte(body), &ev))
+	return buildGitLabMergeRequestCard(&ev, "en-US")
+}
+
+func glIssueCardFrom(t *testing.T, body string) map[string]interface{} {
+	t.Helper()
+	var ev glIssueEvent
+	require.NoError(t, json.Unmarshal([]byte(body), &ev))
+	return buildGitLabIssueCard(&ev, "en-US")
+}
+
 // Card-path unit tests for the github/gitlab adapters (card-message
 // webhook-cardmsg-adapter). No DB/Redis/IM: the builders are pure translation and
 // cardmsg.Validate/BuildPlain are the authoritative gates exercised directly.
 
 // cardBodyText concatenates every rendered TextBlock leaf (recursing into
-// Container.items) so a test can assert what a leaf carries. It is the render-facing
-// counterpart to cardmsg.BuildPlain (which strips markdown); here we keep the raw
-// leaf text to prove escaping happened.
+// Container.items) plus every FactSet title/value so a test can assert what a leaf
+// carries. It is the render-facing counterpart to cardmsg.BuildPlain (which strips
+// markdown); here we keep the raw leaf text to prove escaping happened.
 func cardBodyText(card map[string]interface{}) string {
 	var b strings.Builder
 	var walk func(items []interface{})
@@ -62,6 +77,24 @@ func cardBodyText(card map[string]interface{}) string {
 				if s, _ := el["text"].(string); s != "" {
 					b.WriteString(s)
 					b.WriteByte('\n')
+				}
+			}
+			if el["type"] == "FactSet" {
+				if facts, ok := el["facts"].([]interface{}); ok {
+					for _, f := range facts {
+						fact, _ := f.(map[string]interface{})
+						if fact == nil {
+							continue
+						}
+						if s, _ := fact["title"].(string); s != "" {
+							b.WriteString(s)
+							b.WriteByte('\n')
+						}
+						if s, _ := fact["value"].(string); s != "" {
+							b.WriteString(s)
+							b.WriteByte('\n')
+						}
+					}
 				}
 			}
 			if sub, ok := el["items"].([]interface{}); ok {
@@ -160,6 +193,107 @@ func TestFormatPipelineDuration(t *testing.T) {
 	assert.Equal(t, "1h 2m", formatPipelineDuration(3720))
 	// A hostile/absurd external duration is clamped, not rendered as "277777777h …".
 	assert.Equal(t, "100h 0m", formatPipelineDuration(1_000_000_000))
+}
+
+func TestBuildGitLabMergeRequestCard_Facts(t *testing.T) {
+	card := glMergeRequestCardFrom(t, `{
+		"user": {"username": "carol"},
+		"object_attributes": {"iid": 42, "title": "Add cards", "url": "https://gitlab.com/o/r/-/merge_requests/42",
+			"action": "open", "source_branch": "feature/cards", "target_branch": "main"},
+		"labels": [{"title": "backend"}, {"title": "needs-review"}],
+		"project": {"path_with_namespace": "o/r"}
+	}`)
+	require.NotNil(t, card)
+	require.NoError(t, validateVCSCard(card))
+
+	plain := cardmsg.BuildPlain(card)
+	assert.Contains(t, plain, "carol opened a merge request")
+	assert.Contains(t, plain, "!42 · Add cards")
+	assert.Contains(t, plain, "Source: feature/cards")
+	assert.Contains(t, plain, "Target: main")
+	assert.Contains(t, plain, "Labels (2): backend / needs-review")
+
+	t.Run("no source/target/labels omits the facts entirely", func(t *testing.T) {
+		card := glMergeRequestCardFrom(t, `{
+			"user": {"username": "carol"},
+			"object_attributes": {"iid": 42, "title": "Add cards", "url": "https://gitlab.com/o/r/-/merge_requests/42", "action": "open"},
+			"project": {"path_with_namespace": "o/r"}
+		}`)
+		require.NotNil(t, card)
+		require.NoError(t, validateVCSCard(card))
+		body, _ := card["body"].([]interface{})
+		for _, it := range body {
+			el, _ := it.(map[string]interface{})
+			assert.NotEqual(t, "FactSet", el["type"], "no FactSet block when there is nothing to show")
+		}
+	})
+
+	t.Run("update action still has no card (outside the rendered action subset)", func(t *testing.T) {
+		assert.Nil(t, glMergeRequestCardFrom(t, `{"object_attributes":{"action":"update"}}`))
+	})
+}
+
+func TestBuildGitLabIssueCard_Facts(t *testing.T) {
+	card := glIssueCardFrom(t, `{
+		"user": {"username": "dave"},
+		"object_attributes": {"iid": 7, "title": "Login broken", "url": "https://gitlab.com/o/r/-/issues/7", "action": "open"},
+		"labels": [{"title": "bug"}, {"title": "P1"}],
+		"project": {"path_with_namespace": "o/r"}
+	}`)
+	require.NotNil(t, card)
+	require.NoError(t, validateVCSCard(card))
+	plain := cardmsg.BuildPlain(card)
+	assert.Contains(t, plain, "Labels (2): bug / P1")
+
+	t.Run("no labels omits the fact", func(t *testing.T) {
+		card := glIssueCardFrom(t, `{
+			"user": {"username": "dave"},
+			"object_attributes": {"iid": 7, "title": "Login broken", "url": "https://gitlab.com/o/r/-/issues/7", "action": "open"},
+			"project": {"path_with_namespace": "o/r"}
+		}`)
+		require.NotNil(t, card)
+		body, _ := card["body"].([]interface{})
+		for _, it := range body {
+			el, _ := it.(map[string]interface{})
+			assert.NotEqual(t, "FactSet", el["type"])
+		}
+	})
+}
+
+// GitLab MR labels are project-defined but attacker-influencable (the URL token
+// holder can POST arbitrary JSON); glLabelsFact must escape each title like every
+// other card leaf, and cap the rendered list like the pipeline card's Jobs fact —
+// the (N) count must still reflect the true total, not the truncated list.
+func TestGlLabelsFact_OverflowAndEscaping(t *testing.T) {
+	names := make([]string, 0, maxRenderedLabels+3)
+	for i := 0; i < maxRenderedLabels+3; i++ {
+		names = append(names, fmt.Sprintf(`{"title":"label-%d"}`, i))
+	}
+	card := glMergeRequestCardFrom(t, fmt.Sprintf(`{
+		"user": {"username": "carol"},
+		"object_attributes": {"iid": 1, "title": "x", "url": "https://gitlab.com/o/r/-/merge_requests/1", "action": "open"},
+		"labels": [%s],
+		"project": {"path_with_namespace": "o/r"}
+	}`, strings.Join(names, ",")))
+	require.NotNil(t, card)
+	require.NoError(t, validateVCSCard(card))
+	plain := cardmsg.BuildPlain(card)
+	assert.Contains(t, plain, fmt.Sprintf("Labels (%d):", maxRenderedLabels+3))
+	assert.NotContains(t, plain, fmt.Sprintf("label-%d", maxRenderedLabels+2), "labels beyond the cap are not rendered")
+
+	t.Run("label title is escaped as a card leaf", func(t *testing.T) {
+		card := glMergeRequestCardFrom(t, `{
+			"user": {"username": "carol"},
+			"object_attributes": {"iid": 1, "title": "x", "url": "https://gitlab.com/o/r/-/merge_requests/1", "action": "open"},
+			"labels": [{"title": "**evil** [x](http://attacker)"}],
+			"project": {"path_with_namespace": "o/r"}
+		}`)
+		require.NotNil(t, card)
+		require.NoError(t, validateVCSCard(card), "server-built card must pass cardmsg.Validate")
+		leaves := cardBodyText(card)
+		assert.Contains(t, leaves, `\*\*evil\*\* \[x\]\(http://attacker\)`,
+			"markdown metacharacters in a label title must be escaped, never form a live link/emphasis")
+	})
 }
 
 // TestAllVCSCardBuilders_Smoke exercises every event-specific builder (the ones only
