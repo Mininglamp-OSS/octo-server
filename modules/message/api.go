@@ -124,14 +124,33 @@ func placeholderPayload() map[string]interface{} {
 // 保留 type 而不整条清空：撤回对所有人生效，前端仅凭 revoke=1 渲染撤回提示、不读
 // payload（撤回者名由 revoker UID 单独查，见 octo-web RevokeCell）；保留 type 只为
 // 兼容按 type 分支的老客户端渲染路径，type 本身不含消息正文。
+//
+// type 必须规范化为数字标量（scalarContentType）：payload 是不可信的调用方 JSON，
+// send 路径不约束 type 必须是数字（只剥 __obo_* / 处理 mention/space_id/richtext），
+// 若原样透传，攻击者可把正文藏进 type（字符串 / 对象 / 数组）绕过脱敏原样下发。
+// 服务端所有 type 消费方（isTextType / payloadMsgType）都严格按数字读取、非数字一律
+// 视为未知，故强制数字标量、非数字 fallback ContentError 不影响任何合法渲染（D23 安全整改）。
 func revokedPayload(original map[string]interface{}) map[string]interface{} {
-	stripped := map[string]interface{}{}
-	if t, ok := original["type"]; ok {
-		stripped["type"] = t
-	} else {
-		stripped["type"] = common.ContentError.Int()
+	return map[string]interface{}{
+		"type": scalarContentType(original["type"]),
 	}
-	return stripped
+}
+
+// scalarContentType 把 payload 的 type 归一为已识别的数字 content-type：
+// float64 / int / json.Number 三种反序列化结果转 int，其余（string / map / array / 缺失）
+// 一律 fallback common.ContentError，杜绝非标量 type 承载正文逃逸。
+func scalarContentType(v interface{}) int {
+	switch t := v.(type) {
+	case float64:
+		return int(t)
+	case int:
+		return t
+	case json.Number:
+		if i, err := t.Int64(); err == nil {
+			return int(i)
+		}
+	}
+	return common.ContentError.Int()
 }
 
 // isTextType 判断 payload type 是否为 common.Text（=1）。兼容 json.Number / float64 / int
@@ -1993,7 +2012,12 @@ func (m *Message) sync(c *wkhttp.Context) {
 	// 全局扩充数据
 	messageExtras, err := m.messageExtraDB.queryWithMessageIDsAndUID(messageIDs, c.GetLoginUID())
 	if err != nil {
-		log.Error("查询消息扩展字段失败！", zap.Error(err))
+		// fail-closed：撤回脱敏依赖 message_extra.revoke。查询失败则 messageExtraMap 为空，
+		// from() 拿不到 Revoke=1、会漏做脱敏并原样下发撤回原文。与 /message/channel/sync、
+		// /conversation/sync 及单条直查 api_message_get.go 同口径，中止请求而非继续。
+		m.Error("查询消息扩展字段失败！", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+		return
 	}
 	messageExtraMap := map[string]*messageExtraDetailModel{}
 	if len(messageExtras) > 0 {

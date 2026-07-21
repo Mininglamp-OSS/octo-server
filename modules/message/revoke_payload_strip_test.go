@@ -33,6 +33,36 @@ func TestRevokedPayload(t *testing.T) {
 		assert.Equal(t, common.ContentError.Int(), out["type"])
 		assert.Len(t, out, 1)
 	})
+
+	// 安全回归：type 是不可信调用方数据，send 路径不约束其为数字标量。若把正文藏进
+	// 非标量 type（字符串 / 对象 / 数组），必须被规范化为 ContentError 而非原样透传，
+	// 否则撤回脱敏可被绕过（D23 整改 / PR #628 review by Jerry-Xin + yujiawei）。
+	t.Run("non-scalar type carrying content is normalized, never leaked", func(t *testing.T) {
+		const secret = "secret hidden in type field"
+		cases := map[string]interface{}{
+			"string type": secret,
+			"object type": map[string]interface{}{"nested": secret},
+			"array type":  []interface{}{secret},
+			"bool type":   true,
+		}
+		for name, badType := range cases {
+			t.Run(name, func(t *testing.T) {
+				out := revokedPayload(map[string]interface{}{"type": badType, "content": secret})
+				assert.Equal(t, common.ContentError.Int(), out["type"], "non-scalar type must fall back to ContentError")
+				assert.Len(t, out, 1)
+				body, err := json.Marshal(out)
+				assert.NoError(t, err)
+				assert.NotContains(t, string(body), secret, "no content may survive via the type field")
+			})
+		}
+	})
+
+	// 合法数字 type 的三种反序列化结果都必须原样保留（不会被误判为 ContentError）。
+	t.Run("numeric type is preserved across float64/int/json.Number", func(t *testing.T) {
+		assert.Equal(t, common.Text.Int(), revokedPayload(map[string]interface{}{"type": float64(common.Text.Int())})["type"])
+		assert.Equal(t, common.Text.Int(), revokedPayload(map[string]interface{}{"type": common.Text.Int()})["type"])
+		assert.Equal(t, common.Text.Int(), revokedPayload(map[string]interface{}{"type": json.Number("1")})["type"])
+	})
 }
 
 // TestMsgSyncRespFrom_RevokedStripsContent 是核心回归：撤回消息经 from()
