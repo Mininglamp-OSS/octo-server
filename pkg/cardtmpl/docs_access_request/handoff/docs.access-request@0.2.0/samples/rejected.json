@@ -4,7 +4,8 @@
   "document": {
     "title": "2026 Q3 产品路线图",
     "url": "https://example.com/documents/2026-q3-roadmap",
-    "sourceName": "Q3 产品规划"
+    "sourceName": "Q3 产品规划",
+    "docId": "d_2026-q3-okr"
   },
   "requester": {
     "name": "李四",

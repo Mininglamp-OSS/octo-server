@@ -71,6 +71,7 @@ type pendingFields struct {
 	RequestedAtDisplay string `json:"requestedAtDisplay"`
 	MessageTimeDisplay string `json:"messageTimeDisplay"`
 	Document           struct {
+		DocID      string `json:"docId"` // 服务端 mapping 层从 DocsCardFields.DocID 填入
 		Title      string `json:"title"`
 		URL        string `json:"url"`
 		SourceName string `json:"sourceName"`
@@ -107,16 +108,12 @@ func (t *Template) Build(
 
 	labels := pendingLabels(env.Lang, pf)
 
-	// docID 来自 requestId 的前缀? 不对 —— docID 是 deepLink 的路由标识,handoff schema
-	// 的 document.url 是"文档 URL",docID 需要另建映射。当前 pilot 从 document.url 派生
-	// 无解;正确做法是让上游 mapping 层把 docID 单独传入。以 requestId 拿作 doc_id
-	// 会污染 callback data 语义。
-	//
-	// 决定:在 pending 阶段,docID 由 mapping 层通过 fields 里预留的 requestId 补齐 —— 但
-	// handoff schema 未声明 doc_id 字段。折衷:当前 pilot 用 pf.RequestID 作 docID
-	// 兼容既有 deepLink 拼接(/d/{docID}?sp={spaceID}),后续 mapping PR 引入 docId
-	// 字段并 backfill schema 时切换。这是已知妥协,写死到 Variant 备注,回头统一治理。
-	docID := pf.RequestID
+	// docID 优先取 document.docId (mapping 层从 DocsCardFields.DocID 填);
+	// 缺失兜底到 requestId (与 pilot smoke test / handoff sample 语义一致)。
+	docID := strings.TrimSpace(pf.Document.DocID)
+	if docID == "" {
+		docID = pf.RequestID
+	}
 
 	content := docsApprovalContentFromFields(pf, labels)
 	actions := cardtmplApprovalActions(labels.approveTitle, labels.denyTitle)

@@ -335,11 +335,28 @@ func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error
 		)
 		if card.Kind == DocsCardKindAccessRequested && docsApprovalCardsEnabled() {
 			profile = cardmsg.ProfileV2
-			doc, buildErr = n.buildDocsAccessRequestCard(context.Background(), req.SpaceID, card, lang)
+			doc, buildErr = n.buildDocsAccessRequestCardViaRegistry(context.Background(), req.SpaceID, card, lang)
+			// If Registry.Render is unwired (SetDefaultRegistry not called, e.g.
+			// legacy composition), fall back to the pre-registry builder so the
+			// pilot rollout is bisectable without a hard boot dependency.
+			if errors.Is(buildErr, errCardTmplRegistryUnwired) {
+				doc, buildErr = n.buildDocsAccessRequestCard(context.Background(), req.SpaceID, card, lang)
+			}
 		} else {
 			doc, buildErr = n.buildDocsCard(context.Background(), req.SpaceID, card, lang)
 		}
 		if buildErr != nil {
+			// C1 policy (docs/platform-card-base.md §10):
+			// - schema-level field errors (typed cardtmpl.ErrFieldsInvalid) → 400,
+			//   zero delivery. Reject the whole request instead of silently
+			//   masking a caller contract violation as a plain-text DM.
+			// - other build errors (render failure / marshal / dependency) →
+			//   degrade to plain-text so the notification still lands.
+			if errors.Is(buildErr, cardtmpl.ErrFieldsInvalid) {
+				n.Warn("docs access-request card rejected: fields did not pass schema (400)",
+					zap.Error(buildErr), zap.String("space_id", req.SpaceID), zap.String("doc_id", card.DocID))
+				return nil, errNotifyCardInvalid
+			}
 			n.Warn("build docs card failed, degrading to text",
 				zap.Error(buildErr), zap.String("space_id", req.SpaceID), zap.String("doc_id", card.DocID))
 			canCard = false

@@ -6,12 +6,7 @@
   "required": [
     "requestId",
     "state",
-    "document",
-    "requester",
-    "permission",
-    "requestReason",
-    "requestedAtDisplay",
-    "messageTimeDisplay"
+    "document"
   ],
   "properties": {
     "requestId": {
@@ -35,11 +30,13 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "title",
-        "url",
-        "sourceName"
+        "title"
       ],
       "properties": {
+        "docId": {
+          "type": "string",
+          "description": "文档服务侧稳定 doc ID（可空；用于 deep-link 拼接 /d/{docId}）"
+        },
         "title": {
           "type": "string",
           "minLength": 1,
@@ -47,52 +44,39 @@
         },
         "url": {
           "type": "string",
-          "format": "uri",
-          "pattern": "^https://",
-          "description": "文档 HTTPS 地址"
+          "description": "文档 HTTPS 地址（可空，服务端由 webLoginURL + docId 拼接）"
         },
         "sourceName": {
           "type": "string",
-          "description": "文档所在空间或目录"
+          "description": "文档所在空间或目录（可空）"
         }
       }
     },
     "requester": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "name",
-        "avatarUrl"
-      ],
       "properties": {
         "name": {
           "type": "string",
-          "minLength": 1,
-          "description": "申请人展示名称"
+          "description": "申请人展示名称（可空，空时卡片走匿名兜底文案）"
         },
         "avatarUrl": {
           "type": "string",
-          "format": "uri",
-          "pattern": "^https://",
-          "description": "申请人 HTTPS 头像"
+          "description": "申请人 HTTPS 头像（可空，空时省略头像列）"
         }
       }
     },
     "permission": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "label",
-        "roleLabel"
-      ],
       "properties": {
         "label": {
           "type": "string",
-          "description": "权限标签，例如协作权限"
+          "description": "权限标签，例如协作权限（服务端本地化字典，调用方可留空）"
         },
         "roleLabel": {
           "type": "string",
-          "description": "申请后的角色，例如协作者"
+          "description": "申请后的角色，例如协作者（服务端本地化字典，调用方可留空）"
         }
       }
     },

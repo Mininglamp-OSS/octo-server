@@ -186,7 +186,7 @@ func BuildDocsAccessRequestBodyWithLang(
 	denyData["decision"] = "deny"
 
 	cardActions = []interface{}{
-		map[string]interface{}{"type": "Action.OpenUrl", "title": labels.viewDetails, "url": deepLink},
+		map[string]interface{}{"type": "Action.OpenUrl", "id": "view_document", "title": labels.viewDetails, "url": deepLink},
 		map[string]interface{}{
 			"type": "Action.Submit", "id": DocsDenyActionID, "title": actions.DenyTitle,
 			"style": "destructive", "data": denyData,

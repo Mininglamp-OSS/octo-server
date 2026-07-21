@@ -21,12 +21,14 @@ type pendingLabelSet struct {
 	fallbackAnon  string // format: "<docTitle>"
 }
 
-// pendingLabels 选择语言;permission.roleLabel 若非空,套用到 banner 里替代 "查看者" 默认值。
+// pendingLabels 选择语言;permission.roleLabel 若非空,套用到 banner 里替代默认"查看者"。
+// 默认词表与 modules/notify.docsLabelsFor 保持一致 —— legacy builder 现值:
+// zh-CN "查看者" + "申请成为此文档的查看者。";en "viewer"。
 func pendingLabels(lang string, pf pendingFields) pendingLabelSet {
 	roleLabel := strings.TrimSpace(pf.Permission.RoleLabel)
 	if strings.EqualFold(lang, "zh-CN") || strings.HasPrefix(strings.ToLower(lang), "zh") {
 		if roleLabel == "" {
-			roleLabel = "协作者"
+			roleLabel = "查看者"
 		}
 		return pendingLabelSet{
 			headerLabel:   "文档申请",
@@ -41,12 +43,12 @@ func pendingLabels(lang string, pf pendingFields) pendingLabelSet {
 		}
 	}
 	if roleLabel == "" {
-		roleLabel = "collaborator"
+		roleLabel = "viewer"
 	}
 	return pendingLabelSet{
 		headerLabel:   "Document access",
 		statusLabel:   "Pending",
-		bannerSuffix:  "is requesting " + roleLabel + " access to this document.",
+		bannerSuffix:  "requested " + roleLabel + " access to this document.",
 		roleLabel:     "Requester",
 		reasonLabel:   "Reason",
 		approveTitle:  "Allow",
