@@ -4,6 +4,22 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-21 (agent-message-reactions)
+
+- **Feature** — New `POST /v1/bot/message/reaction` (authBot) lets a bot/agent
+  add or remove an emoji reaction on a message it can see — explicit + idempotent
+  (`action=add|remove`), unlike the user path's toggle, so agent retries never
+  cancel a live reaction. App Bots stay DM-only.
+- **Refactor** — Reaction write + the #603 validation chain (membership /
+  visibility / text-only / thread / disband / DM-Space) extracted into a single
+  authority `message.ReactionService.WriteReaction`; the user handler
+  `addOrCancelReaction` now delegates to it (toggle mode), behaviour-preserving.
+  bot_api delegates as-bot via a standalone `message.NewReactionService(ctx)`.
+- **Cross-repo** — openclaw-channel-octo gained `capabilities.reactions:true`, a
+  `react` message-tool action, and an opt-in Discord-style 👀 ack
+  (`ackReactionScope`, off by default). See
+  [journal](journal/shared/agent-message-reactions.md).
+
 ## 2026-07-20 (github-webhook-parity)
 
 - **Feature** — GitHub `pull_request`/`issues` InteractiveCards gained
