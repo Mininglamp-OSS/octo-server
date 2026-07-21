@@ -58,12 +58,13 @@ var (
 		Buckets:   []float64{1, 2, 5, 10, 50, 100, 500, 1000},
 	})
 
-	// 当前生效的 allocator 模式(0=legacy,1=transactional)。每次 state 读刷新。
-	metricAllocatorMode = promauto.NewGauge(prometheus.GaugeOpts{
+	// 当前生效的 allocator 模式,带 mode label(D8 契约:mode=legacy|transactional)。
+	// 每次 state 读把生效模式置 1、另一个置 0,dashboard 可稳定枚举两条序列。
+	metricAllocatorMode = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: metricNamespace,
 		Name:      "allocator_mode",
-		Help:      "active allocator mode: 0=legacy, 1=transactional",
-	})
+		Help:      "active allocator mode (1 on the active label)",
+	}, []string{"mode"})
 
 	// 当前 allocator 代(state.epoch)。仅观测,不参与判定(brief C1)。
 	metricAllocatorEpoch = promauto.NewGauge(prometheus.GaugeOpts{
@@ -86,3 +87,16 @@ var (
 		Help:      "defensive invariant violations observed by the allocator",
 	})
 )
+
+// setAllocatorModeGauge sets the active mode label to 1 and the other to 0, so
+// both series are always present for dashboards (D8 mode=legacy|transactional).
+func setAllocatorModeGauge(mode int) {
+	legacy, transactional := 0.0, 0.0
+	if mode == ModeTransactional {
+		transactional = 1
+	} else {
+		legacy = 1
+	}
+	metricAllocatorMode.WithLabelValues("legacy").Set(legacy)
+	metricAllocatorMode.WithLabelValues("transactional").Set(transactional)
+}

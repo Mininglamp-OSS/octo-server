@@ -22,7 +22,8 @@ CREATE TABLE `octo_message_extra_version_state` (
   `mode`          TINYINT          NOT NULL DEFAULT 0 COMMENT '0=legacy,1=transactional',
   `epoch`         BIGINT UNSIGNED  NOT NULL DEFAULT 0 COMMENT '换代计数(operator CAS 递增,仅观测)',
   `cutover_floor` BIGINT           NOT NULL DEFAULT 0 COMMENT 'cutover 校验后的版本下界',
-  PRIMARY KEY (`singleton_id`)
+  PRIMARY KEY (`singleton_id`),
+  CONSTRAINT `chk_message_extra_version_singleton` CHECK (`singleton_id` = 1)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='message_extra allocator 全局状态单例(#627)';
 
 INSERT INTO `octo_message_extra_version_state`

@@ -100,6 +100,9 @@ func New(ctx *config.Context) *Store {
 // gates stay in the caller (brief D6, space-isolation rule).
 func (s *Store) ReserveTx(tx *dbr.Tx, channelID string, channelType uint8, count int) ([]int64, error) {
 	start := time.Now()
+	// Observe latency on every path (success, failure, blocked) so failed/blocked
+	// reservations are not excluded from the histogram.
+	defer func() { metricReserveSeconds.Observe(time.Since(start).Seconds()) }()
 	if count <= 0 || count > MaxReserveCount {
 		metricReserveTotal.WithLabelValues("failure").Inc()
 		return nil, ErrInvalidCount
@@ -130,7 +133,6 @@ func (s *Store) ReserveTx(tx *dbr.Tx, channelID string, channelType uint8, count
 	}
 
 	metricReserveTotal.WithLabelValues("success").Inc()
-	metricReserveSeconds.Observe(time.Since(start).Seconds())
 	return versions, nil
 }
 
@@ -162,7 +164,7 @@ func (s *Store) readStateForShare(tx *dbr.Tx) (State, error) {
 			// expected-mode config check (D9), not this read. The gauge below still
 			// surfaces mode=legacy so an operator can detect an unexpected state.
 			st := State{Mode: ModeLegacy}
-			metricAllocatorMode.Set(float64(st.Mode))
+			setAllocatorModeGauge(st.Mode)
 			metricCutoverFloor.Set(0)
 			return st, nil
 		}
@@ -173,7 +175,7 @@ func (s *Store) readStateForShare(tx *dbr.Tx) (State, error) {
 	}
 	st := State{Mode: row.Mode, Epoch: uint64(row.Epoch), CutoverFloor: row.CutoverFloor}
 	// Refresh observability gauges from the authoritative row.
-	metricAllocatorMode.Set(float64(st.Mode))
+	setAllocatorModeGauge(st.Mode)
 	metricAllocatorEpoch.Set(float64(st.Epoch))
 	metricCutoverFloor.Set(float64(st.CutoverFloor))
 	return st, nil
@@ -241,47 +243,71 @@ func (s *Store) reserveTransactional(tx *dbr.Tx, channelID string, channelType u
 // lockSequenceRow returns the current last_version for the channel with the
 // sequence row locked FOR UPDATE. If the row does not exist it is initialized
 // concurrency-safely (brief D3): a race-safe upsert materializes it at the
-// bootstrap baseline, then a locking re-read returns the winning row so a
-// duplicate initializer never proceeds on a private baseline.
+// bootstrap baseline, then the locking read below locks an already-existing row.
+//
+// Ordering matters for deadlock-freedom: we must NEVER issue SELECT ... FOR
+// UPDATE against a not-yet-existing row. Under REPEATABLE READ that takes a gap
+// lock, and two concurrent first-use initializers holding compatible gap locks
+// deadlock (MySQL 1213) on the subsequent insert. So a non-locking existence
+// read gates the materialize step, and the FOR UPDATE only ever targets a row
+// that already exists (a record lock — no gap, no first-use deadlock).
 func (s *Store) lockSequenceRow(tx *dbr.Tx, channelID string, channelType uint8, floor int64) (int64, error) {
 	lockStart := time.Now()
+	if _, found, err := s.selectSequence(tx, channelID, channelType); err != nil {
+		s.logFailure("lock", channelID, channelType, err)
+		return 0, err
+	} else if !found {
+		// First use: compute the bootstrap baseline and materialize the row with a
+		// race-safe upsert. INSERT ... ON DUPLICATE KEY UPDATE serializes concurrent
+		// initializers on the row/insert-intention lock (they wait, they do not
+		// deadlock) and never leaves a duplicate initializer on a private baseline.
+		baseline, berr := s.computeBootstrap(tx, channelID, channelType, floor)
+		if berr != nil {
+			s.logFailure("initialize", channelID, channelType, berr)
+			return 0, berr
+		}
+		if _, ierr := tx.InsertBySql(
+			"INSERT INTO `octo_message_extra_channel_seq` (`channel_id`,`channel_type`,`last_version`) VALUES (?,?,?) ON DUPLICATE KEY UPDATE `last_version`=`last_version`",
+			channelID, channelType, baseline,
+		).Exec(); ierr != nil {
+			s.logFailure("initialize", channelID, channelType, ierr)
+			return 0, fmt.Errorf("msgextraseq: initialize sequence: %w", ierr)
+		}
+	}
+	// The row now exists (pre-existing or just materialized): lock it.
 	cur, found, err := s.selectSequenceForUpdate(tx, channelID, channelType)
 	if err != nil {
 		s.logFailure("lock", channelID, channelType, err)
 		return 0, err
 	}
-	if found {
-		metricLockWaitSeconds.Observe(time.Since(lockStart).Seconds())
-		return cur, nil
-	}
-
-	// First use: compute the bootstrap baseline, materialize the row race-safely,
-	// then re-read under the lock.
-	baseline, err := s.computeBootstrap(tx, channelID, channelType, floor)
-	if err != nil {
-		s.logFailure("initialize", channelID, channelType, err)
-		return 0, err
-	}
-	if _, err := tx.InsertBySql(
-		"INSERT INTO `octo_message_extra_channel_seq` (`channel_id`,`channel_type`,`last_version`) VALUES (?,?,?) ON DUPLICATE KEY UPDATE `last_version`=`last_version`",
-		channelID, channelType, baseline,
-	).Exec(); err != nil {
-		s.logFailure("initialize", channelID, channelType, err)
-		return 0, fmt.Errorf("msgextraseq: initialize sequence: %w", err)
-	}
-	cur, found, err = s.selectSequenceForUpdate(tx, channelID, channelType)
-	if err != nil {
-		s.logFailure("lock", channelID, channelType, err)
-		return 0, err
-	}
 	if !found {
-		// Row must exist after the upsert; treat as an invariant violation.
+		// Must exist after the upsert; a vanished row is an invariant violation.
 		metricInvariantViolationTotal.Inc()
 		s.logFailure("initialize", channelID, channelType, ErrInvariantViolation)
 		return 0, ErrInvariantViolation
 	}
 	metricLockWaitSeconds.Observe(time.Since(lockStart).Seconds())
 	return cur, nil
+}
+
+// selectSequence reads the channel sequence row WITHOUT locking (no FOR UPDATE),
+// so a missing row does not take a gap lock. found is false (nil error) when the
+// row does not exist.
+func (s *Store) selectSequence(tx *dbr.Tx, channelID string, channelType uint8) (int64, bool, error) {
+	var row struct {
+		LastVersion int64 `db:"last_version"`
+	}
+	err := tx.SelectBySql(
+		"SELECT `last_version` FROM `octo_message_extra_channel_seq` WHERE `channel_id`=? AND `channel_type`=?",
+		channelID, channelType,
+	).LoadOne(&row)
+	if err != nil {
+		if errors.Is(err, dbr.ErrNotFound) {
+			return 0, false, nil
+		}
+		return 0, false, fmt.Errorf("msgextraseq: read sequence: %w", err)
+	}
+	return row.LastVersion, true, nil
 }
 
 // selectSequenceForUpdate reads and locks the channel sequence row. found is

@@ -38,7 +38,7 @@ func ensureSchema(t *testing.T, db *dbr.Session) {
 		"CREATE TABLE IF NOT EXISTS `seq` (`key` VARCHAR(100) NOT NULL, `min_seq` BIGINT NOT NULL DEFAULT 0, `step` INT NOT NULL DEFAULT 0, PRIMARY KEY (`key`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
 		"CREATE TABLE IF NOT EXISTS `message_extra` (`id` BIGINT NOT NULL AUTO_INCREMENT, `message_id` VARCHAR(20) NOT NULL DEFAULT '', `message_seq` BIGINT NOT NULL DEFAULT 0, `channel_id` VARCHAR(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL DEFAULT '', `channel_type` SMALLINT NOT NULL DEFAULT 0, `is_deleted` SMALLINT NOT NULL DEFAULT 0, `version` BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (`id`), UNIQUE KEY `message_id` (`message_id`), KEY `channel_version_idx` (`channel_id`,`channel_type`,`version`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
 		"CREATE TABLE IF NOT EXISTS `octo_message_extra_channel_seq` (`channel_id` VARCHAR(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL DEFAULT '', `channel_type` SMALLINT NOT NULL DEFAULT 0, `last_version` BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (`channel_id`,`channel_type`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
-		"CREATE TABLE IF NOT EXISTS `octo_message_extra_version_state` (`singleton_id` TINYINT UNSIGNED NOT NULL, `mode` TINYINT NOT NULL DEFAULT 0, `epoch` BIGINT UNSIGNED NOT NULL DEFAULT 0, `cutover_floor` BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (`singleton_id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+		"CREATE TABLE IF NOT EXISTS `octo_message_extra_version_state` (`singleton_id` TINYINT UNSIGNED NOT NULL, `mode` TINYINT NOT NULL DEFAULT 0, `epoch` BIGINT UNSIGNED NOT NULL DEFAULT 0, `cutover_floor` BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (`singleton_id`), CONSTRAINT `chk_message_extra_version_singleton` CHECK (`singleton_id` = 1)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
 	}
 	for _, s := range stmts {
 		if _, err := db.UpdateBySql(s).Exec(); err != nil {
@@ -483,4 +483,67 @@ func TestReserveTx_StateDefaultsAndFailClosed(t *testing.T) {
 		}
 		_ = tx.Rollback()
 	})
+}
+
+// TestStateSingletonConstraint proves the schema structurally forbids a second
+// state row (CHECK singleton_id=1), so the "duplicate row" case the spec requires
+// to fail closed cannot arise (the reader only trusts id=1).
+func TestStateSingletonConstraint(t *testing.T) {
+	ctx := setup(t, msgextraseq.ModeTransactional, 1000)
+	if _, err := ctx.DB().InsertBySql(
+		"INSERT INTO `octo_message_extra_version_state` (`singleton_id`,`mode`,`epoch`,`cutover_floor`) VALUES (2,1,0,0)",
+	).Exec(); err == nil {
+		t.Fatal("inserting a second state row (singleton_id=2) succeeded; CHECK (singleton_id=1) not enforced")
+	}
+}
+
+// TestReserveTx_BatchPaginatesViaCursor exercises the real delta-sync read
+// contract: reserve a range, persist message_extra rows carrying those versions,
+// then page through them with `version > cursor ORDER BY version ASC LIMIT k`
+// over the composite index and assert every version is returned exactly once,
+// in order, with no gaps or duplicates.
+func TestReserveTx_BatchPaginatesViaCursor(t *testing.T) {
+	floor := int64(1000)
+	ctx := setup(t, msgextraseq.ModeTransactional, floor)
+	s := msgextraseq.New(ctx)
+	ch, ct := "c-cursor", uint8(2)
+	const n = 7
+
+	versions := reserveCommitted(t, ctx, s, ch, ct, n)
+	for i, v := range versions {
+		if _, err := ctx.DB().InsertBySql(
+			"INSERT INTO `message_extra` (`message_id`,`message_seq`,`channel_id`,`channel_type`,`version`) VALUES (?,?,?,?,?)",
+			fmt.Sprintf("cur-%d", i), i+1, ch, ct, v,
+		).Exec(); err != nil {
+			t.Fatalf("seed message_extra: %v", err)
+		}
+	}
+
+	// Page through with limit=3, advancing the cursor like the sync endpoint.
+	var got []int64
+	cursor := floor // start below the first reserved version
+	for {
+		var page []int64
+		_, err := ctx.DB().SelectBySql(
+			"SELECT `version` FROM `message_extra` WHERE `channel_id`=? AND `channel_type`=? AND `version`>? ORDER BY `version` ASC LIMIT 3",
+			ch, ct, cursor,
+		).Load(&page)
+		if err != nil {
+			t.Fatalf("paginate: %v", err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		got = append(got, page...)
+		cursor = page[len(page)-1]
+	}
+
+	if len(got) != n {
+		t.Fatalf("paginated %d rows want %d (gaps or duplicates)", len(got), n)
+	}
+	for i, v := range got {
+		if v != versions[i] {
+			t.Fatalf("page[%d]=%d want %d (order/coverage mismatch)", i, v, versions[i])
+		}
+	}
 }
