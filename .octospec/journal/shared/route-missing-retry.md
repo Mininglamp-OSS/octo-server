@@ -161,3 +161,26 @@ folded into a second follow-up commit.
 was a misread — `observeError` sits *above* the expiry gate, so it does fire per re-check and the
 doc is correct. yujiawei's `acted_at` type-assertion note is verified safe (same in-memory map, no
 JSON round-trip). The "summary says 7d" note was already fixed by the PR-body update.
+
+## Review round 3 (re-review of the first-miss marker)
+
+6. **`route_missing_since` marker leaked** (Jerry-Xin, Critical). The round-2 marker is one shared
+   Redis hash with a whole-hash `PEXPIRE`. Redis has no per-field TTL, and every miss refreshes the
+   hash TTL, so under sustained route-missing traffic (a route absent across a rolling deploy touches
+   many events) the key never expires and a field per COMPLETED event accumulates forever — the
+   marker was only cleared on `ReplayDLQ`, not on `Ack` or terminal `Nack`. My round-2 comment's
+   "self-reaps via TTL" claim was wrong. **Fix:** `HDEL` the marker on every exit transition —
+   `ackScript` (delivery) and `nackScript` (one `HDEL` after the token check, covering both the
+   requeue and dead-letter branches); `replayDLQScript` already cleared it. Both `Ack` and `Nack`
+   invoke the script with `q.scriptKeys()`, so `KEYS[9]` (the marker hash) is in scope. New
+   Redis-backed lifecycle test `TestRouteMissingMarkerClearedOnTerminalTransitions` proves the field
+   is gone after Ack and after terminal dead-letter. Validated against a real local Redis — all
+   Redis-backed tests plus the existing lease/ack/nack/replay contract tests pass, so the added
+   `HDEL`s don't regress the transition contract. Octo-Q flagged the same field but as a non-blocking
+   nit ("self-reaps via TTL; event IDs never recur"); it under-weighted the whole-hash-TTL-refresh
+   interaction, so Jerry-Xin's blocking call was the correct one.
+
+**Round-3 non-blocking, fixed in the same commit** (both doc drift from earlier deltas): the
+`card-action-dlq` CLI comment still said replay "refuses (and prunes)" — corrected to non-destructive;
+the pending learning still prescribed an `ActedAt`-based deadline — rewritten to the first-observed-miss
+design plus a new point on per-item marker lifecycle vs whole-key TTL.

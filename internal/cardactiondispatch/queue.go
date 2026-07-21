@@ -94,6 +94,7 @@ redis.call('ZREM', KEYS[2], ARGV[1])
 redis.call('HDEL', KEYS[3], ARGV[1])
 redis.call('HDEL', KEYS[4], ARGV[1])
 redis.call('HDEL', KEYS[5], ARGV[1])
+redis.call('HDEL', KEYS[9], ARGV[1])
 return 1
 `)
 
@@ -122,6 +123,7 @@ local payload = redis.call('HGET', KEYS[3], ARGV[1])
 local attempt = tonumber(redis.call('HGET', KEYS[4], ARGV[1]) or '0')
 redis.call('ZREM', KEYS[2], ARGV[1])
 redis.call('HDEL', KEYS[5], ARGV[1])
+redis.call('HDEL', KEYS[9], ARGV[1])
 if attempt >= tonumber(ARGV[4]) then
 	local expired = redis.call('ZRANGEBYSCORE', KEYS[6], '-inf', ARGV[8])
 	for _, expired_id in ipairs(expired) do
@@ -195,10 +197,13 @@ return #expired
 // at dispatch, and returns that timestamp (unix ms). KEYS[1] = route_missing_since hash;
 // ARGV[1] = event_id, ARGV[2] = now_ms, ARGV[3] = ttl_ms. HSETNX-then-read semantics: the
 // first miss stamps now, later misses read the stored stamp, so the bounded route-missing
-// window is measured from the FIRST miss (not from Event.ActedAt). The hash carries the live
-// TTL so a marker for an event that is delivered/dead-lettered and never replayed self-reaps;
-// event IDs never recur, so a leaked marker is harmless. ReplayDLQ clears the marker so a
-// replayed event starts a fresh window.
+// window is measured from the FIRST miss (not from Event.ActedAt). The marker is explicitly
+// removed on every exit transition — ackScript, nackScript (both requeue and dead-letter),
+// and replayDLQScript all HDEL the field — so the hash only ever holds markers for events
+// currently waiting in the route-missing defer loop and CANNOT grow unbounded under sustained
+// route-missing traffic (a whole-hash PEXPIRE cannot expire individual fields, so relying on
+// TTL alone would leak). The hash-level TTL refreshed here to liveTTL is only a backstop that
+// reaps the whole key once misses stop.
 var routeMissingSinceScript = rd.NewScript(`
 local v = redis.call('HGET', KEYS[1], ARGV[1])
 if not v then

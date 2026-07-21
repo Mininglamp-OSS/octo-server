@@ -50,6 +50,15 @@ change-log convention (§7). Newest first.
   past the CLI's resolved retention is refused without being deleted, so the running server stays
   the single pruning authority (a shorter CLI window can no longer silently destroy a
   server-retained entry).
+- **Fix (review round 3, PR #621 re-review)** — the round-2 first-miss marker
+  (`route_missing_since`) leaked: it is one shared Redis hash with a whole-hash TTL (no per-field
+  expiry), refreshed on every miss, so under sustained route-missing traffic a field per COMPLETED
+  event accumulated unbounded (it was cleared only on replay, not on delivery or dead-letter).
+  Fixed by `HDEL`-ing the marker on every exit transition (`ackScript`, `nackScript`
+  requeue+dead-letter, and the existing `replayDLQScript`); a new Redis-backed lifecycle test proves
+  the field is gone after Ack and after terminal dead-letter. Also folded in two doc-drift fixes (a
+  stale CLI "refuses (and prunes)" comment; the pending learning's `ActedAt`-based deadline →
+  first-observed-miss, plus a new marker-lifecycle-vs-whole-key-TTL point).
 
 ## 2026-07-20 (github-webhook-parity)
 

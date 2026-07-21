@@ -81,9 +81,16 @@ DLQ, `Deliver`/`Finalize` never called.
   (Review-driven: the CLI resolves retention from its own env; a shorter window could otherwise
   silently delete a server-retained entry.) A successful replay clears the first-miss marker so
   the re-queued event starts a fresh window.
+- The first-miss marker has a **bounded lifecycle**: it is HDEL'd on every exit transition —
+  `ackScript` (delivery), `nackScript` (both requeue and terminal dead-letter), and `replayDLQScript`
+  — so the shared `route_missing_since` hash holds markers only for events currently waiting in the
+  defer loop and cannot grow unbounded. (Review-driven: a whole-hash `PEXPIRE` cannot expire
+  individual fields, and every miss refreshes it, so relying on TTL alone leaked a field per
+  completed event under sustained route-missing traffic.)
 - Green: `go test ./internal/cardactiondispatch/`; clean: `go build ./...`, `go vet`, `golangci-lint`.
 - Tests: `internal/cardactiondispatch/route_missing_test.go`
   (`TestRouteMissingDefersWithoutConsumingAttempt`, `TestRouteMissingDeadLettersAfterWindow`,
   `TestRouteMissingOldActedAtDefersOnFirstMiss`, `TestRouteMissingExpired`) and
   `route_missing_queue_test.go` (`TestReplayDLQPastRetentionIsNonDestructive`,
-  `TestRouteMissingSeenAtAnchorsOnFirstMiss`, Redis-backed).
+  `TestRouteMissingSeenAtAnchorsOnFirstMiss`, `TestRouteMissingMarkerClearedOnTerminalTransitions`,
+  Redis-backed).

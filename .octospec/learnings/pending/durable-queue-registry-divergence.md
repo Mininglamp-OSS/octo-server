@@ -50,12 +50,21 @@ startup** (env, in-memory registry, feature flags):
 5. **A per-process config table + a cross-process durable queue is a divergence source by
    construction** — enqueue and dispatch can run under different config even on one replica
    (across a restart) and trivially across replicas/rollouts. Design the consumer to tolerate it.
-6. **A bounded "wait it out" needs a trustworthy clock; if the item lacks the field the window
-   is measured against, dead-letter immediately — don't defer.** The bound here is elapsed time
-   since the event's `ActedAt`; an item with `ActedAt<=0` (legacy/malformed, and enqueue didn't
-   validate it) has nothing to measure against, so "not expired yet" is true on every re-check and
-   the item defers forever — never delivered, never dead-lettered — the exact permanent-loss the
-   defer was meant to prevent, now silent. Treat "can't evaluate the deadline" as *past* the
-   deadline (fail toward the visible DLQ), and prefer a runtime guard over an enqueue guard when
-   items may already be sitting in the durable queue. (PR #621 review caught this; the first defer
-   cut returned not-expired for a missing timestamp.)
+6. **Anchor a bounded "wait it out" on when the WAIT started, recorded per item — not on a
+   business timestamp like acted-at.** The window here bounds "how long we wait on a missing
+   route." Measuring it from `Event.ActedAt` (when the user acted) is wrong: an item can be far
+   older than the window for reasons unrelated to the wait — queue backlog, an outage, redelivery
+   — so on its FIRST miss `now - ActedAt` already exceeds the window and it dead-letters with zero
+   self-heal, exactly in the long-outage/rollout case the wait was meant to cover. And a missing or
+   zero acted-at has nothing to measure against at all (a permanent-defer wedge). The robust design
+   is a durable per-item marker written when the wait first begins (first observed miss) and read on
+   every re-check; the window is `now - firstSeen`. That needs no business timestamp and no
+   special-case for legacy/zero values.
+7. **A per-item marker in a shared structure needs explicit lifecycle cleanup — a whole-key TTL is
+   not per-field GC.** The first-miss marker lived as a field in one Redis hash with a hash-level
+   `PEXPIRE`. Redis cannot expire individual fields, and every new miss refreshed the whole-hash
+   TTL, so under sustained traffic the key never expired and a field-per-item leaked for every
+   completed event. Delete the marker on EVERY exit transition (success, terminal dead-letter,
+   replay); keep the TTL only as a backstop that reaps the key once activity stops. (PR #621 walked
+   this exact path across review rounds: acted-at anchor → zero-acted-at special-case → first-miss
+   marker → marker-lifecycle cleanup, each step caught by a reviewer.)

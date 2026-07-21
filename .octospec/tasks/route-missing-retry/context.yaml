@@ -99,3 +99,20 @@ notes:
     not per re-check" was a misread (observeError sits above the expiry gate, so it does fire per
     re-check — doc is correct); yujiawei's acted_at type-assertion note verified safe (same in-memory
     map, no JSON round-trip); the "PR summary says 7d" note was already resolved by the body update.
+  - PR review round 3 (re-review of the first-miss marker) produced one more blocking correction:
+    (6) BLOCKING (Jerry-Xin, Critical) — the round-2 route_missing_since marker leaked. It is one
+    shared Redis hash with a whole-hash PEXPIRE; Redis cannot expire individual fields, and every
+    miss refreshed the hash TTL, so under sustained route-missing traffic the key never expired and
+    a field per COMPLETED event accumulated forever (the marker was only cleared on ReplayDLQ, not on
+    Ack/terminal Nack). The round-2 comment's "self-reaps via TTL" claim was wrong. Fixed by HDEL'ing
+    the marker on every exit transition: ackScript (delivery), nackScript (both requeue and
+    dead-letter branches — one HDEL after the token check covers both), plus the existing
+    replayDLQScript. New Redis-backed lifecycle test TestRouteMissingMarkerClearedOnTerminalTransitions
+    asserts the field is gone after Ack and after terminal dead-letter. Validated against a real local
+    Redis (all Redis-backed tests + existing lease/ack/nack/replay contract tests pass), not just the
+    fakes. Octo-Q flagged the same thing but as a non-blocking nit ("self-reaps via TTL, event IDs
+    never recur") — it under-weighted the whole-hash-TTL-refresh interaction; Jerry-Xin's blocking
+    call was correct.
+  - Round-3 non-blocking, fixed in the same commit (both doc drift from earlier deltas): the
+    card-action-dlq CLI comment said replay "refuses (and prunes)" (replay is now non-destructive);
+    the pending learning still prescribed an ActedAt-based deadline (superseded by first-observed-miss).
