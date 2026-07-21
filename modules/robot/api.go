@@ -774,8 +774,11 @@ func (rb *Robot) payloadIsVail(payloadResult maputil.Data) bool {
 		// 的 send gate 对称（rollout flag + write-strict Validate）。本 ingress
 		// 的错误形状是单一 content-invalid 400（防枚举）——flag 关闭 / 白名单 /
 		// 大小 / URL 失败的具体原因只进日志。
-		if !cardmsg.Enabled() {
-			rb.Warn("卡片消息未启用,robot ingress 拒绝(Decision 2 rollout gate)")
+		if !cardmsg.BotEnabled() {
+			// bot 侧有效门禁：总开关 OCTO_CARD_MESSAGE_ENABLED（Decision 2 rollout
+			// gate）AND bot 子开关 OCTO_BOT_CARD_ENABLED；robot 是 bot 生产者之一，
+			// 与 bot_api send/edit 及 /v1/bot/card/profile.enabled 同源。
+			rb.Warn("卡片消息未启用,robot ingress 拒绝(部署总开关或 bot 子开关关闭)")
 			return false
 		}
 		if err := cardmsg.Validate(map[string]interface{}(payloadResult)); err != nil {

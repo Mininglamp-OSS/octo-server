@@ -14,8 +14,11 @@ package bot_api
 // interactiveByProfile 的接受集同源）；elements/inputs/actions 取 cardmsg.DisplayElements()/
 // InputElements()/DisplayActions()（与校验器白名单同源，反漂移由 pkg/cardmsg 守卫测试锁定）。
 //
-// enabled 直取 cardmsg.Enabled()（部署级 rollout 开关）：即便关闭也返回 200 + 全清单
-// —— feature detection 正是目的；只有 send/edit 路径在关闭时拒绝（send.go:97）。
+// enabled 取 cardmsg.BotEnabled()（部署级总开关 OCTO_CARD_MESSAGE_ENABLED AND bot 子
+// 开关 OCTO_BOT_CARD_ENABLED 的有效门禁）：即便关闭也返回 200 + 全清单 —— feature
+// detection 正是目的。清单与实际发卡门禁**同源**：send/edit 路径同样 gate 在
+// BotEnabled()（send.go / card_revision.go），故 enabled 必然与「发卡是否会被受理」
+// 一致，绝不出现「报 enabled 却发被拒」。
 //
 // wire contract 只增不改（additive-only，同 event_data 演进规则）：字段可新增，绝不
 // 改名/删除/改类型 —— SDK 与适配器据此做能力探测与上限读取，改名等同破坏 event_data。
@@ -34,7 +37,7 @@ func (ba *BotAPI) botCardProfile(c *wkhttp.Context) {
 		return
 	}
 	c.Response(map[string]interface{}{
-		"enabled":      cardmsg.Enabled(),
+		"enabled":      cardmsg.BotEnabled(),
 		"card_version": cardmsg.CardVersion,
 		"profiles":     cardmsg.AcceptedProfiles(),
 		// elements/inputs：本部署接受的展示元素 / 交互输入白名单（源自 pkg/cardmsg 权威

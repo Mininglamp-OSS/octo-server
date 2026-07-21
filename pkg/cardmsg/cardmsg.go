@@ -78,6 +78,11 @@ const (
 	// EnvEnabled 部署级开关（Decision 2 rollout gate，默认关闭）。
 	// 前缀用 OCTO_（维护者决策：DM_ 为历史遗留，新开关不再使用）。
 	EnvEnabled = "OCTO_CARD_MESSAGE_ENABLED"
+
+	// EnvBotEnabled bot 侧卡片生成子开关（OCTO_ 前缀，同 EnvEnabled 约定）。
+	// 与部署级总开关 EnvEnabled 的关系是「AND 且从属」：默认（未设/非法值）视为开启，
+	// 只有显式 false 才单独禁掉 bot 发/改卡——语义见 BotEnabled。
+	EnvBotEnabled = "OCTO_BOT_CARD_ENABLED"
 )
 
 // 校验错误（sentinel，调用方用 errors.Is 判定；细节经 %w 包装携带）。
@@ -167,6 +172,31 @@ func Enabled() bool {
 	}
 	on, err := strconv.ParseBool(v)
 	return err == nil && on
+}
+
+// BotEnabled 报告 bot 侧是否允许生成卡片。bot_api 的发卡（send）/改卡（card edit）、
+// legacy robot ingress，以及 /v1/bot/card/profile 的 `enabled` 字段共用这一个「有效
+// 门禁」，三者永不背离——profile 是 bot 的能力清单，若它报 enabled 而发卡却被拒，就
+// 等于清单撒谎，破坏 feature detection。
+//
+// 语义是「总闸 AND 子开关」，与全局卡片能力解耦但从属于它：
+//   - 部署级总开关 Enabled()（OCTO_CARD_MESSAGE_ENABLED）为假时恒为假——客户端渲染
+//     门禁没放开，任何生产者都不该发卡，bot 不例外。
+//   - 总开关为真时再看 bot 子开关 OCTO_BOT_CARD_ENABLED：未设或非法值默认「开启」
+//     （向后兼容，行为同历史上「总开关开 ⇒ bot 能发」），仅显式 false 才单独把 bot
+//     发/改卡关掉；此时内部通知 / incoming webhook / card_action 仍按总开关照常发卡。
+func BotEnabled() bool {
+	if !Enabled() {
+		return false
+	}
+	v := os.Getenv(EnvBotEnabled)
+	if v == "" {
+		return true
+	}
+	on, err := strconv.ParseBool(v)
+	// 非法值不误伤既有 bot 生产者：回退到「开启」（跟随总开关），只有可解析的 false
+	// 才是明确的「单独关闭 bot 发卡」意图。
+	return err != nil || on
 }
 
 // DisplayText 返回卡片消息的内容型占位文案，供会话摘要/置顶/引用等「按内容类型

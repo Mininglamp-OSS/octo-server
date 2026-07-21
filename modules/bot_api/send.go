@@ -95,8 +95,10 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 	// （该子路径 fromUID 仍是 bot —— 拒绝是刻意的过度拒绝，P2 复议）；
 	// (b) 脏卡片 fail-fast，鉴权路径不跑在毒输入上（与上方 OBO 保留键同序）。
 	if cardmsg.IsCardPayload(req.Payload) {
-		if !cardmsg.Enabled() {
-			// Decision 2 rollout gate：客户端渲染门禁发布前默认关闭。
+		if !cardmsg.BotEnabled() {
+			// bot 侧有效门禁：总开关 OCTO_CARD_MESSAGE_ENABLED（Decision 2 rollout
+			// gate）AND bot 子开关 OCTO_BOT_CARD_ENABLED。与 /v1/bot/card/profile 的
+			// enabled 同源，故 profile 报什么、这里就受理什么。
 			httperr.ResponseErrorL(c, errcode.ErrBotAPICardDisabled, nil, nil)
 			return
 		}
@@ -861,6 +863,15 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 		hasCardSeq bool
 	)
 	if editIsCard {
+		// bot 侧有效门禁：改卡与发卡（send.go 上方）、/v1/bot/card/profile.enabled 同源。
+		// 子开关 OCTO_BOT_CARD_ENABLED 关（或部署总开关关）时改卡一律拒绝——否则会出现
+		// 「profile 报 enabled:false、发卡被拒，却仍能经 /v1/bot/message/edit 改动已存在
+		// 卡片」的缺口，破坏「清单与实际门禁同源」不变量。排在撤回/删除与 normalize/CAS
+		// 之前 fail-fast。
+		if !cardmsg.BotEnabled() {
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardDisabled, nil, nil)
+			return
+		}
 		// P2（PR#548 review）：撤回/删除门禁 —— 已撤回或全局删除的卡片不可再编辑,
 		// 与动作端点（api_card_action.go）的撤回门禁对称,避免在已回收的卡片上重填
 		// content_edit（该 content_edit 是动作端点信任的生效帧）。行不存在=未编辑过,

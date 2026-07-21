@@ -123,7 +123,7 @@ func TestFillPersonSpaceUnread_OnlyPersonChannels(t *testing.T) {
 		},
 	}
 
-	fillPersonSpaceUnread(convs, rawConvs, "spaceA", "", "me", nil)
+	fillPersonSpaceUnread(convs, rawConvs, "spaceA", "", "me", nil, nil)
 
 	// Group 不应有 space_unread
 	assert.Nil(t, convs[0].SpaceUnread)
@@ -140,7 +140,7 @@ func TestFillPersonSpaceUnread_ZeroUnread(t *testing.T) {
 		{ChannelID: "user1", ChannelType: common.ChannelTypePerson.Uint8(), Unread: 0, LastMsgSeq: 10},
 	}
 
-	fillPersonSpaceUnread(convs, rawConvs, "spaceA", "", "me", nil)
+	fillPersonSpaceUnread(convs, rawConvs, "spaceA", "", "me", nil, nil)
 	assert.Nil(t, convs[0].SpaceUnread)
 }
 
@@ -149,7 +149,7 @@ func TestFillPersonSpaceUnread_EmptySpaceID(t *testing.T) {
 		{ChannelID: "user1", ChannelType: common.ChannelTypePerson.Uint8(), Unread: 3},
 	}
 
-	fillPersonSpaceUnread(convs, nil, "", "", "me", nil)
+	fillPersonSpaceUnread(convs, nil, "", "", "me", nil, nil)
 	assert.Nil(t, convs[0].SpaceUnread)
 }
 
@@ -173,7 +173,7 @@ func TestFillPersonSpaceUnread_RecentsCoversAllUnread(t *testing.T) {
 	}
 
 	// readSeq = 20 - 3 = 17, 未读: seq 18(A), 19(B), 20(A) → spaceA=2
-	fillPersonSpaceUnread(convs, rawConvs, "spaceA", "", "me", nil)
+	fillPersonSpaceUnread(convs, rawConvs, "spaceA", "", "me", nil, nil)
 	assert.NotNil(t, convs[0].SpaceUnread)
 	assert.Equal(t, 2, *convs[0].SpaceUnread)
 }
@@ -194,7 +194,7 @@ func TestFillPersonSpaceUnread_AllUnreadInDifferentSpace(t *testing.T) {
 	}
 
 	// readSeq = 5 - 2 = 3, 未读 seq 4(B) 5(B) → spaceA=0
-	fillPersonSpaceUnread(convs, rawConvs, "spaceA", "", "me", nil)
+	fillPersonSpaceUnread(convs, rawConvs, "spaceA", "", "me", nil, nil)
 	assert.NotNil(t, convs[0].SpaceUnread)
 	assert.Equal(t, 0, *convs[0].SpaceUnread)
 }
@@ -206,7 +206,7 @@ func TestFillPersonSpaceUnread_NoRawConversation(t *testing.T) {
 	}
 	rawConvs := []*config.SyncUserConversationResp{}
 
-	fillPersonSpaceUnread(convs, rawConvs, "spaceA", "", "me", nil)
+	fillPersonSpaceUnread(convs, rawConvs, "spaceA", "", "me", nil, nil)
 	assert.Nil(t, convs[0].SpaceUnread)
 }
 
@@ -311,14 +311,14 @@ func TestFillPersonSpaceUnread_SystemBotUntaggedExcluded(t *testing.T) {
 
 	// System bot ("botfather"): untagged excluded from default-Space preview + unread.
 	botConvs, botRaw := mkConv("botfather")
-	fillPersonSpaceUnread(botConvs, botRaw, def, def, "login", nil)
+	fillPersonSpaceUnread(botConvs, botRaw, def, def, "login", nil, nil)
 	assert.Nil(t, botConvs[0].SpaceLastMessage, "system-bot untagged → no default-space preview")
 	assert.NotNil(t, botConvs[0].SpaceUnread)
 	assert.Equal(t, 0, *botConvs[0].SpaceUnread, "system-bot untagged → 0 default-space unread")
 
 	// Regular DM: the same untagged messages DO belong to the default Space.
 	regConvs, regRaw := mkConv("regular-peer")
-	fillPersonSpaceUnread(regConvs, regRaw, def, def, "login", nil)
+	fillPersonSpaceUnread(regConvs, regRaw, def, def, "login", nil, nil)
 	assert.NotNil(t, regConvs[0].SpaceLastMessage, "regular DM untagged → default-space preview")
 	assert.NotNil(t, regConvs[0].SpaceUnread)
 	assert.Equal(t, 2, *regConvs[0].SpaceUnread, "regular DM untagged → counted as default-space unread")
@@ -337,7 +337,7 @@ func TestFillPersonSpaceUnread_SetsSpaceLastMessage(t *testing.T) {
 		},
 	}
 
-	fillPersonSpaceUnread(convs, nil, "spaceA", "", "login", nil)
+	fillPersonSpaceUnread(convs, nil, "spaceA", "", "login", nil, nil)
 
 	// SpaceLastMessage 应为 spaceA 的消息 "111"
 	assert.NotNil(t, convs[0].SpaceLastMessage)

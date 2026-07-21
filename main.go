@@ -451,8 +451,13 @@ type cardActionDispatchRuntime struct {
 }
 
 func (r *cardActionDispatchRuntime) Start(ctx context.Context) error {
-	if r == nil || r.dispatcher == nil {
+	if r == nil {
 		return errors.New("card action dispatch runtime unavailable")
+	}
+	if r.dispatcher == nil {
+		// Inert runtime: OCTO_CARD_MESSAGE_ENABLED is off, so no dispatch worker
+		// was constructed. Nothing to start — boot must not panic on the gate.
+		return nil
 	}
 	return r.dispatcher.Start(ctx)
 }
@@ -488,13 +493,31 @@ func installCardActionDispatch(ctx *config.Context) (*cardActionDispatchRuntime,
 	if err := registry.ValidateNotifyTokenExclusions(os.Getenv("NOTIFY_INTERNAL_TOKEN"), os.Getenv("OCTO_DOCS_NOTIFY_TOKEN")); err != nil {
 		return nil, err
 	}
-	if len(registry.NotifyProducers()) > 0 && !cardmsg.Enabled() {
-		return nil, errors.New("action notify routes require OCTO_CARD_MESSAGE_ENABLED")
+	// OCTO_CARD_MESSAGE_ENABLED is the deployment-level master gate (rollout /
+	// emergency rollback). With it off, the card_action ingress rejects every
+	// interaction (modules/message/api_card_action.go) and the notify/approval
+	// send paths refuse to emit cards (modules/notify), so no callback can ever
+	// enqueue and the dispatch worker would have no work. Skip the worker and its
+	// Redis consumer entirely and return an inert runtime so the server still
+	// boots with routes (and OCTO_DOCS_APPROVAL_CARD_ENABLED) left in the config —
+	// flipping the gate off on an otherwise-valid config must not panic (runbook
+	// rollback: "global OCTO_CARD_MESSAGE_ENABLED=false"). This is NOT a bypass for
+	// config validation: LoadRouteSpecs / NewRegistry / ValidateNotifyTokenExclusions
+	// run ABOVE this branch, so genuinely malformed route config (bad URL, short
+	// secret, token reuse) still aborts boot loudly regardless of the gate.
+	// Configured-but-inert routes/features only WARN so operators can see they will
+	// resume once the gate is flipped back on.
+	if !cardmsg.Enabled() {
+		if producers := len(registry.NotifyProducers()); producers > 0 {
+			log.Warn("OCTO_CARD_MESSAGE_ENABLED is off; card action notify routes are configured but inert until the gate is re-enabled",
+				zap.Int("notify_producers", producers))
+		}
+		if notify.DocsApprovalCardsEnabled() {
+			log.Warn("OCTO_CARD_MESSAGE_ENABLED is off; OCTO_DOCS_APPROVAL_CARD_ENABLED is set but inert until the gate is re-enabled")
+		}
+		return &cardActionDispatchRuntime{}, nil
 	}
 	if notify.DocsApprovalCardsEnabled() {
-		if !cardmsg.Enabled() {
-			return nil, errors.New("OCTO_DOCS_APPROVAL_CARD_ENABLED requires OCTO_CARD_MESSAGE_ENABLED")
-		}
 		resolution := registry.Resolve(notify.NotifyBotUIDValue, "docs", "access_request.decision")
 		if resolution.Kind != cardactiondispatch.ResolutionCallback {
 			return nil, errors.New("docs approval cards require a notification/docs/access_request.decision callback route")

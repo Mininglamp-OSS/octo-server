@@ -371,8 +371,10 @@ var (
 	// ---- InteractiveCard(=17) 卡片消息协议 P1 ------------------------------
 	// P1 只注册展示相；交互相 seq_conflict 随 P2 sibling 实现 PR 落地。
 
-	// ErrBotAPICardDisabled Decision 2 rollout gate：OCTO_CARD_MESSAGE_ENABLED
-	// 未开启（默认关闭，客户端渲染门禁发布前不得开启）。
+	// ErrBotAPICardDisabled bot 侧卡片门禁未开启：部署级总开关
+	// OCTO_CARD_MESSAGE_ENABLED 未开启（Decision 2 rollout gate，默认关闭），或
+	// 总开关已开但 bot 子开关 OCTO_BOT_CARD_ENABLED 被显式设为 false 单独禁掉了 bot
+	// 发/改卡。两种情形对 bot 而言都是「卡片不可用」，映射到同一码（防枚举，具体原因不外泄）。
 	ErrBotAPICardDisabled = register(codes.Code{
 		ID:             "err.server.bot_api.card_disabled",
 		HTTPStatus:     http.StatusBadRequest,
