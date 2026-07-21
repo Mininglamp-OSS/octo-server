@@ -863,6 +863,15 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 		hasCardSeq bool
 	)
 	if editIsCard {
+		// bot 侧有效门禁：改卡与发卡（send.go 上方）、/v1/bot/card/profile.enabled 同源。
+		// 子开关 OCTO_BOT_CARD_ENABLED 关（或部署总开关关）时改卡一律拒绝——否则会出现
+		// 「profile 报 enabled:false、发卡被拒，却仍能经 /v1/bot/message/edit 改动已存在
+		// 卡片」的缺口，破坏「清单与实际门禁同源」不变量。排在撤回/删除与 normalize/CAS
+		// 之前 fail-fast。
+		if !cardmsg.BotEnabled() {
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardDisabled, nil, nil)
+			return
+		}
 		// P2（PR#548 review）：撤回/删除门禁 —— 已撤回或全局删除的卡片不可再编辑,
 		// 与动作端点（api_card_action.go）的撤回门禁对称,避免在已回收的卡片上重填
 		// content_edit（该 content_edit 是动作端点信任的生效帧）。行不存在=未编辑过,

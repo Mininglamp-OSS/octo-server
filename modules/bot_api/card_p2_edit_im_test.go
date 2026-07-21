@@ -181,6 +181,94 @@ func TestBotCardEditCASIM(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
 }
 
+// TestBotCardEditRejectedWhenBotCardDisabledIM 验证 bot 子开关 OCTO_BOT_CARD_ENABLED
+// 关闭时**改卡**与发卡同源被拒（send.go botMessageEdit 的 editIsCard 分支 gate 在
+// BotEnabled()），且非卡片（文本）编辑不受影响。锁死「profile.enabled/发卡/改卡三者
+// 同源」不变量——堵住「profile 报 disabled、发卡被拒，却仍能经 /v1/bot/message/edit
+// 改动已存在卡片」的缺口。
+func TestBotCardEditRejectedWhenBotCardDisabledIM(t *testing.T) {
+	skipWithoutIMBot(t)
+	// 先以「总开关开、子开关默认开」发出目标消息（BotEnabled=true 才能发卡）。
+	t.Setenv(cardmsg.EnvEnabled, "true")
+	s, ctx := testutil.NewTestServer()
+	defer func() { _ = testutil.CleanAllTables(ctx) }()
+
+	const disBot, disTok = "bot_card_disabled_edit", "bf_card_dis_edit_token"
+	_, err := ctx.DB().InsertBySql(
+		"insert into robot(robot_id,bot_token,status) values(?,?,1)", disBot, disTok).Exec()
+	assert.NoError(t, err)
+	for _, pair := range [][2]string{{disBot, testutil.UID}, {testutil.UID, disBot}} {
+		_, ferr := ctx.DB().InsertBySql(
+			"insert into friend(uid,to_uid,is_deleted) values(?,?,0)", pair[0], pair[1]).Exec()
+		assert.NoError(t, ferr)
+	}
+	do := func(path string, body map[string]interface{}) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", path, bytes.NewReader([]byte(util.ToJson(body))))
+		req.Header.Set("Authorization", "Bearer "+disTok)
+		s.GetRoute().ServeHTTP(w, req)
+		return w
+	}
+	// pollSeq 等 message 完成 IM 异步持久化，返回其 message_seq。
+	pollSeq := func(messageID int64) uint32 {
+		var seq uint32
+		for i := 0; i < 20; i++ {
+			sr, serr := ctx.IMSearchMessages(&config.MsgSearchReq{
+				ChannelID: testutil.UID, ChannelType: common.ChannelTypePerson.Uint8(),
+				MessageIds: []int64{messageID}, LoginUID: disBot,
+			})
+			if serr == nil && sr != nil && len(sr.Messages) > 0 && sr.Messages[0].MessageSeq > 0 {
+				seq = sr.Messages[0].MessageSeq
+				break
+			}
+			time.Sleep(300 * time.Millisecond)
+		}
+		return seq
+	}
+	sendAndSeq := func(payload interface{}) (string, uint32) {
+		w := do("/v1/bot/sendMessage", map[string]interface{}{
+			"channel_id": testutil.UID, "channel_type": common.ChannelTypePerson.Uint8(),
+			"payload": payload,
+		})
+		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		var resp struct {
+			MessageID int64 `json:"message_id"`
+		}
+		assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		assert.NotZero(t, resp.MessageID)
+		seq := pollSeq(resp.MessageID)
+		assert.NotZero(t, seq, "消息未完成 IM 异步持久化")
+		return fmt.Sprintf("%d", resp.MessageID), seq
+	}
+
+	// 子开关开时发出一张卡 + 一条文本（作为改卡/改文本的目标）。
+	cardID, cardSeq := sendAndSeq(imCardEnvelope("approve_btn", -1))
+	textID, textSeq := sendAndSeq(map[string]interface{}{"type": common.Text.Int(), "content": "hi"})
+
+	// 现在单独关掉 bot 子开关（总开关仍开）。BotEnabled() 逐次读 env，改卡即刻受门禁。
+	t.Setenv(cardmsg.EnvBotEnabled, "false")
+
+	// ① 改卡：被同源门禁拒绝（与发卡同一 ErrBotAPICardDisabled），且不落库。
+	wCard := do("/v1/bot/message/edit", map[string]interface{}{
+		"message_id": cardID, "message_seq": cardSeq,
+		"channel_id": testutil.UID, "channel_type": common.ChannelTypePerson.Uint8(),
+		"content_edit": util.ToJson(imCardEnvelope("done_btn", 2)),
+	})
+	assert.Equal(t, http.StatusBadRequest, wCard.Code, wCard.Body.String())
+	assert.Contains(t, wCard.Body.String(), "Card messages are not enabled on this server.")
+	var storedCard string
+	_ = ctx.DB().Select("content_edit").From("message_extra").Where("message_id=?", cardID).LoadOne(&storedCard)
+	assert.NotContains(t, storedCard, "done_btn", "子开关关时改卡不得落库")
+
+	// ② 改文本（非卡片）：不受 bot 卡片子开关影响，正常成功。
+	wText := do("/v1/bot/message/edit", map[string]interface{}{
+		"message_id": textID, "message_seq": textSeq,
+		"channel_id": testutil.UID, "channel_type": common.ChannelTypePerson.Uint8(),
+		"content_edit": "updated text after bot card disabled",
+	})
+	assert.Equal(t, http.StatusOK, wText.Code, "非卡片编辑不应被 bot 卡片子开关拦截; body=%s", wText.Body.String())
+}
+
 // TestBotCardEditConcurrentCASIM 验证 D9 CAS 在并发下无 lost-update：并发发若干
 // 递增 card_seq 的编辑帧,不论到达顺序,最终 stored 必为最大 seq 那一帧 —— 一旦
 // 最大 seq 帧落库,任何更小 seq 都被拒；而最大 seq 帧到达时 stored 必 < 它,故必被
