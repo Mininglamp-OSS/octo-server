@@ -138,6 +138,40 @@ func TestDocsActionFinalizerEnrichedTerminalAndDenyReason(t *testing.T) {
 	}
 }
 
+// The applicant's outcome notification (a fresh resource card sent to the
+// requester, distinct from the reviewer's in-place terminal rewrite) must also
+// carry the deny reason — a denial is useless to the applicant without it.
+func TestDocsActionFinalizerApplicantNotifyCarriesDenyReason(t *testing.T) {
+	wk := newWuKongServer()
+	defer wk.close()
+	ctx := newTestContext(t, wk)
+	ctx.GetConfig().External.WebLoginURL = "https://im.example.com/login"
+
+	sender := &capturingCardSender{}
+	finalizer, err := NewDocsActionFinalizer(ctx, &captureCardMutator{}, sender)
+	if err != nil {
+		t.Fatalf("NewDocsActionFinalizer() error = %v", err)
+	}
+	event := cardactiondispatch.Event{
+		EventID: 8, SenderUID: NotifyBotUIDValue, Owner: "docs", ActionType: "access_request.decision",
+		MessageID: "1001", ChannelID: NotifyBotUIDValue, ChannelType: 1, SpaceID: "space-1",
+		OperatorUID: "user-b",
+		Data:        map[string]interface{}{"doc_id": "doc-1", "request_id": "request-1"},
+		Inputs:      map[string]interface{}{cardtmpl.DocsDenyReasonInputID: "范围不符，请缩小到 Q3"},
+	}
+	result := cardactiondispatch.DecisionResult{
+		Disposition: cardactiondispatch.DispositionApplied, State: cardactiondispatch.StateDenied,
+		RequesterUID: "user-a", Display: map[string]string{"title": "Roadmap"},
+	}
+	if err := finalizer.Finalize(context.Background(), event, result); err != nil {
+		t.Fatalf("Finalize() error = %v", err)
+	}
+	outcome := sender.last()
+	if !strings.Contains(string(outcome.Document), "范围不符，请缩小到 Q3") {
+		t.Fatalf("applicant outcome card missing deny reason: %s", outcome.Document)
+	}
+}
+
 func TestDocsActionFinalizerRejectsTerminalResultWithoutRequesterBeforeMutation(t *testing.T) {
 	wk := newWuKongServer()
 	defer wk.close()
@@ -323,5 +357,48 @@ func TestStandardActionFinalizerUsesAuthoritativeGroupChannel(t *testing.T) {
 	}
 	if len(sender.cards) != 0 {
 		t.Fatalf("non-terminal requester notification count = %d, want 0", len(sender.cards))
+	}
+}
+
+// A reviewer reason over cardtmpl's per-fact limit (the input allows up to 4 KiB,
+// only byte-capped by ValidateInputs, not maxLength) must be truncated, not
+// dropped — an over-long FactSet value fails the applicant card build and loses
+// the denial notification entirely, retries included.
+func TestDocsActionFinalizerLongDenyReasonTruncatedNotDropped(t *testing.T) {
+	wk := newWuKongServer()
+	defer wk.close()
+	ctx := newTestContext(t, wk)
+	ctx.GetConfig().External.WebLoginURL = "https://im.example.com/login"
+
+	sender := &capturingCardSender{}
+	finalizer, err := NewDocsActionFinalizer(ctx, &captureCardMutator{}, sender)
+	if err != nil {
+		t.Fatalf("NewDocsActionFinalizer() error = %v", err)
+	}
+	event := cardactiondispatch.Event{
+		EventID: 9, SenderUID: NotifyBotUIDValue, Owner: "docs", ActionType: "access_request.decision",
+		MessageID: "1001", ChannelID: NotifyBotUIDValue, ChannelType: 1, SpaceID: "space-1",
+		OperatorUID: "user-b",
+		Data:        map[string]interface{}{"doc_id": "doc-1", "request_id": "request-1"},
+		Inputs:      map[string]interface{}{cardtmpl.DocsDenyReasonInputID: strings.Repeat("超", 600)},
+	}
+	result := cardactiondispatch.DecisionResult{
+		Disposition: cardactiondispatch.DispositionApplied, State: cardactiondispatch.StateDenied,
+		RequesterUID: "user-a", Display: map[string]string{"title": "Roadmap"},
+	}
+	// Must NOT error — before the fix a 600-rune reason failed the card build.
+	if err := finalizer.Finalize(context.Background(), event, result); err != nil {
+		t.Fatalf("Finalize() with a 600-rune reason must not fail: %v", err)
+	}
+	doc := string(sender.last().Document)
+	if len(doc) == 0 {
+		t.Fatal("applicant outcome card was dropped for a long deny reason")
+	}
+	// Truncated to MaxExcerptRunes(300): 300 consecutive runes survive, 301 do not.
+	if !strings.Contains(doc, strings.Repeat("超", cardtmpl.MaxExcerptRunes)) {
+		t.Fatalf("expected reason truncated to %d runes to appear", cardtmpl.MaxExcerptRunes)
+	}
+	if strings.Contains(doc, strings.Repeat("超", cardtmpl.MaxExcerptRunes+1)) {
+		t.Fatalf("reason exceeded %d runes — not truncated", cardtmpl.MaxExcerptRunes)
 	}
 }

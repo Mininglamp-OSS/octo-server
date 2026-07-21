@@ -97,7 +97,7 @@ func (f *DocsActionFinalizer) Finalize(ctx context.Context, event cardactiondisp
 	if result.State != cardactiondispatch.StateApproved && result.State != cardactiondispatch.StateDenied {
 		return nil
 	}
-	outcomeDocument, err := f.buildOutcomeDocument(ctx, lang, docID, event.SpaceID, title, result.State)
+	outcomeDocument, err := f.buildOutcomeDocument(ctx, lang, docID, event.SpaceID, title, denyReason, result.State)
 	if err != nil {
 		return err
 	}
@@ -140,15 +140,30 @@ func (f *DocsActionFinalizer) buildTerminalDocument(ctx context.Context, lang, d
 	})
 }
 
-func (f *DocsActionFinalizer) buildOutcomeDocument(ctx context.Context, lang, docID, spaceID, title string, state cardactiondispatch.State) (json.RawMessage, error) {
+func (f *DocsActionFinalizer) buildOutcomeDocument(ctx context.Context, lang, docID, spaceID, title, denyReason string, state cardactiondispatch.State) (json.RawMessage, error) {
 	labels := docsLabelsFor(lang)
 	attribution := labels.accessGrantedBanner
 	variant := "docs.access_granted"
+	var facts []cardtmpl.Fact
 	if state == cardactiondispatch.StateDenied {
 		attribution, variant = labels.accessDeniedBanner, "docs.access_denied"
+		// Surface the reviewer's reason to the applicant — a denial is useless to
+		// them without it. Rides as a labeled FactSet row on the same resource
+		// card (no profile/card-type change); omitted when no reason was typed.
+		if reason := strings.TrimSpace(denyReason); reason != "" {
+			// cardtmpl caps FactSet values at maxFactRunes; an over-long reason
+			// fails the whole card build and drops the denial notification
+			// entirely (retries included). Truncate to MaxExcerptRunes — the
+			// same bound the terminal card's reason box uses — so a long reason
+			// is trimmed, never silently lost.
+			if r := []rune(reason); len(r) > cardtmpl.MaxExcerptRunes {
+				reason = string(r[:cardtmpl.MaxExcerptRunes])
+			}
+			facts = append(facts, cardtmpl.Fact{Title: labels.denyReasonLabel, Value: reason})
+		}
 	}
 	return cardtmpl.BuildDocsResourceCard(ctx, f.ctx.GetConfig().External.WebLoginURL, docID, spaceID, cardtmpl.ResourceCard{
-		Title: title, Attribution: attribution, Variant: variant, Source: cardtmpl.Source{Label: labels.sourceLabel},
+		Title: title, Attribution: attribution, Variant: variant, Facts: facts, Source: cardtmpl.Source{Label: labels.sourceLabel},
 	})
 }
 
