@@ -35,10 +35,11 @@ the self-heal window was really `route.MaxAttempts` (~seconds), not the advertis
 minutes. Deferring consumes no attempt, so the event delivers on its original budget
 whenever the route returns — the fix the change was meant to be.
 
-`internal/cardactiondispatch/route_missing_test.go` (new) — pins: early attempt requeues
-with a non-zero backoff against the bounded budget (not `lease.Attempt`); the final attempt
-still dead-letters with the reason preserved; `Deliver`/`Finalize` never run while the route
-is missing; `routeMissingBackoff` is positive, capped, monotonic.
+`internal/cardactiondispatch/route_missing_test.go` (new) — pins: a fresh route-missing event
+**defers** and is NOT nacked (the guard against the attempt-budget bug); an event past
+`routeMissingMaxWindow` dead-letters immediately with the reason preserved; `Deliver`/`Finalize`
+never run while the route is missing; and `routeMissingExpired` covers the window boundary plus
+the unset/negative `ActedAt` guard.
 
 ## Why (root cause)
 
@@ -71,9 +72,9 @@ has no response."
   they need a manual DLQ replay.
 - Operational root cause (a run without `OCTO_CARD_ACTION_ROUTES` loaded) is config/deploy
   hygiene, out of scope for this code change.
-- A genuinely unconfigured route still DLQs, just after `routeMissingMaxAttempts` (~a few
-  minutes) rather than on attempt 1 — deliberate trade of slightly-later DLQ visibility for
-  self-healing a transient window.
+- A genuinely unconfigured route still DLQs, just after `routeMissingMaxWindow` (15m) rather
+  than on attempt 1 — deliberate trade of slightly-later DLQ visibility for self-healing a
+  transient window.
 
 ## Learning
 
@@ -82,14 +83,47 @@ process-shared work queue combined with a per-process in-memory config table (bu
 startup from env) can dead-letter valid work across a restart/rollout that changes the config;
 "transient config absence" should be a bounded retry, not a first-attempt DLQ.
 
-## Follow-up: DLQ retention is now configurable (default 7d)
+## Follow-up: DLQ retention is now configurable (default 30d, opt into shorter)
 
 Same branch, separate concern. The DLQ retention was a hardcoded `30 * 24 * time.Hour`
 duplicated in `main.go` and `tools/card-action-dlq/main.go`. Replaced with a shared resolver
-`cardactiondispatch.DLQRetention(os.Getenv)` (in `config.go`) reading
-`OCTO_CARD_ACTION_DLQ_RETENTION_DAYS` (whole days, 1–365; empty/invalid → `DefaultDLQRetention`),
-and **changed the default 30 → 7 days**. Both binaries now share one resolver so they cannot
-drift (the CLI must match the running server, or it prunes/replays against a different window).
-Trade-off: dead-lettered events are recoverable for 7 days by default instead of 30 — set the
-env higher where a longer recovery window is wanted. Test: `dlq_retention_test.go`
-(`TestDLQRetentionFromEnv`). Doc updated: `docs/card-action-callback-dispatch.md`.
+`cardactiondispatch.DLQRetentionFromEnv(os.Getenv)` (in `config.go`) reading
+`OCTO_CARD_ACTION_DLQ_RETENTION_DAYS` (whole days, 1–365; empty/invalid → `DefaultDLQRetention`).
+Both binaries share the one resolver so the CODE value cannot drift. `DefaultDLQRetention` stays
+**30 days** — the value the code already shipped with — so an upgrade that does not set the
+override keeps the existing recovery window and never silently prunes older DLQ entries on first
+deploy. Opt into a shorter window (e.g. `7`) per deployment via the env var. Test:
+`dlq_retention_test.go` (`TestDLQRetentionFromEnv`). Doc updated: `docs/card-action-callback-dispatch.md`.
+
+## Review round (PR #621, 4 reviewers)
+
+The PR drew four independent reviews (lml2468 APPROVE, then Jerry-Xin, mochashanyao/Octo-Q, and
+yujiawei CHANGES_REQUESTED). Three blocking corrections, all folded into this branch as a
+follow-up commit; the metric-noise nit was intentionally left as-is.
+
+1. **route_missing with `ActedAt<=0` deferred forever** (Jerry-Xin Critical, yujiawei P2).
+   `routeMissingExpired` returned "not-expired" for a non-positive `ActedAt`, so a legacy/malformed
+   event with a missing route would re-defer every 5s indefinitely — never delivered, never
+   dead-lettered — silently breaking the bounded-window guarantee. The wait is bounded by
+   elapsed-since-`ActedAt`, and there is nothing to measure against when it is unset. **Fix:**
+   non-positive `ActedAt` is now EXPIRED → immediate dead-letter (`reason=route_missing`, visible
+   and replayable). Chose the runtime guard over an `Enqueue`-time guard because it also protects
+   events already sitting in the durable queue and avoids churning many test event builders.
+   New test: `TestRouteMissingZeroActedAtDeadLetters`; `TestRouteMissingExpired` flipped.
+
+2. **DLQ default 30→7d silently prunes on deploy** (Octo-Q P1, yujiawei P1 follow-up). The
+   configurability change had lowered the default to 7d; yujiawei traced that the *server itself*
+   (`refreshDepthMetrics → Depths → pruneDLQScript`, ~every 250ms) would irreversibly prune
+   8–30-day-old DLQ entries on the first event after deploy, no operator action needed. **Fix:**
+   restored `DefaultDLQRetention = 30d`; 7d (or any 1–365) remains available via the env var. The
+   user chose this over shipping 7d-with-a-warning.
+
+3. **CLI `depth` deletes on a read** (yujiawei P1). The read-only `depth` command called
+   `Depths()`, which prunes using retention resolved from the *CLI's* env — so inspecting the DLQ
+   from a shell without the server's env var could delete recoverable entries. **Fix:** new
+   `RedisQueue.DepthsNoPrune()` (ZCard only); `depth` uses it. The running server is now the sole
+   pruning authority. `main.go` also logs the raw override value so an invalid-→-fallback is visible.
+
+**Left as-is (documented, not a defect):** `observeError(route_missing)` fires once per 5s
+re-check while an event waits. That is intentional and documented in the runbook's alerting
+section; folding it to fire only on dead-letter would drop the "route currently missing" signal.

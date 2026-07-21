@@ -50,3 +50,12 @@ startup** (env, in-memory registry, feature flags):
 5. **A per-process config table + a cross-process durable queue is a divergence source by
    construction** — enqueue and dispatch can run under different config even on one replica
    (across a restart) and trivially across replicas/rollouts. Design the consumer to tolerate it.
+6. **A bounded "wait it out" needs a trustworthy clock; if the item lacks the field the window
+   is measured against, dead-letter immediately — don't defer.** The bound here is elapsed time
+   since the event's `ActedAt`; an item with `ActedAt<=0` (legacy/malformed, and enqueue didn't
+   validate it) has nothing to measure against, so "not expired yet" is true on every re-check and
+   the item defers forever — never delivered, never dead-lettered — the exact permanent-loss the
+   defer was meant to prevent, now silent. Treat "can't evaluate the deadline" as *past* the
+   deadline (fail toward the visible DLQ), and prefer a runtime guard over an enqueue guard when
+   items may already be sitting in the durable queue. (PR #621 review caught this; the first defer
+   cut returned not-expired for a missing timestamp.)

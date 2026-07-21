@@ -344,11 +344,19 @@ const routeMissingMaxWindow = 15 * time.Minute
 const routeMissingDeferInterval = 5 * time.Second
 
 // routeMissingExpired reports whether an event acted at actedAtUnix (unix seconds) has
-// waited on a missing route past routeMissingMaxWindow. A non-positive actedAt (unset)
-// is treated as not-expired, so a missing timestamp never forces a premature dead-letter.
+// waited on a missing route past routeMissingMaxWindow and must now be dead-lettered.
+//
+// A non-positive actedAt (unset / legacy / malformed) is treated as EXPIRED. The defer
+// loop bounds the wait by elapsed time since actedAt; with no trustworthy timestamp there
+// is nothing to measure against, so returning "not expired" here would re-defer the event
+// on every re-check forever — never delivered, never dead-lettered — silently breaking the
+// bounded-window guarantee (flagged in review). Dead-lettering immediately instead keeps the
+// event visible and replayable (reason=route_missing) rather than wedged in permanent defer.
+// Production always stamps ActedAt at enqueue (modules/message/api_card_action.go), so this
+// only ever catches a legacy/malformed event that predates or violates that invariant.
 func routeMissingExpired(actedAtUnix int64, now time.Time) bool {
 	if actedAtUnix <= 0 {
-		return false
+		return true
 	}
 	return now.Unix()-actedAtUnix >= int64(routeMissingMaxWindow/time.Second)
 }

@@ -354,10 +354,24 @@ func (q *RedisQueue) ReplayDLQ(eventID int64, due time.Time) (bool, error) {
 	return value == 1, nil
 }
 
+// Depths prunes DLQ entries older than the retention window, then reports queue depths.
+// The running server calls this (via refreshDepthMetrics), so it is the single pruning
+// authority and prunes lazily with its own resolved retention. Read-only inspectors must
+// use DepthsNoPrune instead so observing the queue cannot delete recoverable entries.
 func (q *RedisQueue) Depths() (QueueDepths, error) {
 	if _, err := pruneDLQScript.Run(q.client, q.scriptKeys(), unixMillis(time.Now().Add(-q.dlqRetention))).Result(); err != nil {
 		return QueueDepths{}, fmt.Errorf("cardactiondispatch: prune expired DLQ events: %w", err)
 	}
+	return q.DepthsNoPrune()
+}
+
+// DepthsNoPrune reports queue depths WITHOUT pruning the DLQ. Use it for read-only
+// inspection (the card-action-dlq `depth` command) so merely observing the DLQ can never
+// delete recoverable entries — even from a shell whose OCTO_CARD_ACTION_DLQ_RETENTION_DAYS
+// differs from the server's. Pruning stays the running server's job (see Depths). The
+// reported DLQ count therefore includes any not-yet-pruned expired entries, which is the
+// honest current contents for a manual inspection.
+func (q *RedisQueue) DepthsNoPrune() (QueueDepths, error) {
 	pipe := q.client.Pipeline()
 	ready := pipe.ZCard(q.keys.ready)
 	leased := pipe.ZCard(q.keys.leased)

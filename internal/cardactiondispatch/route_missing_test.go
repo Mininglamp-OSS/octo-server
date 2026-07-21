@@ -127,7 +127,69 @@ func TestRouteMissingDeadLettersAfterWindow(t *testing.T) {
 	}
 }
 
+// TestRouteMissingZeroActedAtDeadLetters proves a route-missing event whose ActedAt is
+// unset (0) dead-letters immediately instead of deferring forever. Enqueue validation does
+// not require ActedAt, so a legacy/malformed event with ActedAt<=0 is a reachable persisted
+// state; without this guard the defer loop would re-check it every routeMissingDeferInterval
+// indefinitely — never delivered, never dead-lettered — silently breaking the bounded window.
+func TestRouteMissingZeroActedAtDeadLetters(t *testing.T) {
+	registry, err := NewRegistry(nil, testGetenv)
+	if err != nil {
+		t.Fatalf("NewRegistry() error = %v", err)
+	}
+	neverDeliver := callbackDelivererFunc(func(context.Context, *Route, DecisionRequest) (DecisionResult, error) {
+		t.Fatal("Deliver must not run when the route is missing")
+		return DecisionResult{}, nil
+	})
+	neverFinalize := FinalizerFunc(func(context.Context, Event, DecisionResult) error {
+		t.Fatal("Finalize must not run when the route is missing")
+		return nil
+	})
+
+	// ActedAt deliberately unset (0) → no basis to measure the wait → dead-letter now.
+	event := Event{
+		EventID: 1003002, SenderUID: "notification", Owner: "docs",
+		ActionType: "access_request.decision", ActedAt: 0,
+	}
+	queue := &concurrentLeaseQueue{
+		leases:   []Lease{{Event: event, Token: "lease", Attempt: 1}},
+		nacked:   make(chan nackCall, 1),
+		deferred: make(chan deferCall, 1),
+	}
+	dispatcher, err := NewDispatcher(queue, registry, neverDeliver, neverFinalize, DispatcherConfig{
+		LeaseDuration: time.Second,
+		PollInterval:  time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewDispatcher() error = %v", err)
+	}
+
+	processed, procErr := dispatcher.ProcessOne(context.Background(), time.Now())
+	if !processed || procErr != nil {
+		t.Fatalf("ProcessOne() = (%v, %v), want (true, nil)", processed, procErr)
+	}
+
+	select {
+	case dc := <-queue.deferred:
+		t.Fatalf("zero-ActedAt route-missing event was deferred (%+v); want an immediate dead-letter, not a permanent defer loop", dc)
+	default:
+	}
+	select {
+	case nc := <-queue.nacked:
+		if nc.reason != "route_missing" {
+			t.Fatalf("nack reason = %q, want route_missing", nc.reason)
+		}
+		if nc.leaseAttempt < nc.maxAttempts {
+			t.Fatalf("leaseAttempt=%d < maxAttempts=%d; want an immediate dead-letter", nc.leaseAttempt, nc.maxAttempts)
+		}
+	default:
+		t.Fatal("zero-ActedAt route-missing event was neither deferred nor dead-lettered")
+	}
+}
+
 // TestRouteMissingExpired covers the window boundary and the unset-timestamp guard.
+// A non-positive acted_at is EXPIRED (dead-letter immediately) rather than never-expired:
+// with no timestamp to measure the wait against, deferring forever would wedge the event.
 func TestRouteMissingExpired(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	windowSecs := int64(routeMissingMaxWindow / time.Second)
@@ -136,8 +198,8 @@ func TestRouteMissingExpired(t *testing.T) {
 		actedAt int64
 		want    bool
 	}{
-		{"unset acted_at is never expired", 0, false},
-		{"negative acted_at is never expired", -5, false},
+		{"unset acted_at dead-letters immediately (never wedged in defer)", 0, true},
+		{"negative acted_at dead-letters immediately", -5, true},
 		{"just acted", now.Unix(), false},
 		{"one second before the window", now.Unix() - windowSecs + 1, false},
 		{"exactly at the window", now.Unix() - windowSecs, true},

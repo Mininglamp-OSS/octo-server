@@ -13,8 +13,12 @@ import (
 const (
 	// DefaultDLQRetention is the fallback dead-letter retention: how long a
 	// dead-lettered card-action event stays replayable (via tools/card-action-dlq)
-	// before pruning, when the env override is unset or invalid.
-	DefaultDLQRetention = 7 * 24 * time.Hour
+	// before pruning, when the env override is unset or invalid. It matches the
+	// value the code shipped with before the retention became configurable, so an
+	// upgrade that does not set the override keeps the existing recovery window and
+	// never silently prunes older DLQ entries on first deploy. Opt into a shorter
+	// window via DLQRetentionEnv.
+	DefaultDLQRetention = 30 * 24 * time.Hour
 	// DLQRetentionEnv names the retention override, expressed in whole days.
 	DLQRetentionEnv = "OCTO_CARD_ACTION_DLQ_RETENTION_DAYS"
 	// maxDLQRetentionDays bounds the override so a typo cannot pin the DLQ open for
@@ -27,9 +31,10 @@ const (
 // DefaultDLQRetention so a misconfigured override degrades to a safe window rather than
 // truncating the recovery span (NewRedisQueue rejects a non-positive retention outright).
 // Shared by main.go and tools/card-action-dlq so the two binaries never drift on the CODE
-// value — but note both read the process env, so an operator must export the SAME
-// OCTO_CARD_ACTION_DLQ_RETENTION_DAYS when running the CLI as the server uses, or the CLI's
-// prune-on-read (Depths/ReplayDLQ) will delete events at a different window than the server.
+// value. The server is the pruning authority: it prunes lazily on its own Depths() calls with
+// this resolved window. The CLI only ever applies retention on an explicit `replay`; its
+// read-only `depth` never prunes (see DepthsNoPrune), so merely inspecting the DLQ from a shell
+// that lacks the env var can no longer delete server-retained events.
 func DLQRetentionFromEnv(getenv func(string) string) time.Duration {
 	raw := strings.TrimSpace(getenv(DLQRetentionEnv))
 	if raw == "" {

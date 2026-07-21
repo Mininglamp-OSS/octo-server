@@ -208,11 +208,17 @@ are reclaimed; a stale worker cannot renew or ACK another worker's lease.
 If a route has reached `max_in_flight`, its lease is atomically deferred for one
 poll interval without consuming an attempt, so other routes and shutdown remain
 unblocked.
-Live retention equals `Robot.MessageExpire`. DLQ retention defaults to 7 days and
+Live retention equals `Robot.MessageExpire`. DLQ retention defaults to 30 days and
 is overridable via `OCTO_CARD_ACTION_DLQ_RETENTION_DAYS` (whole days, 1–365; empty
-or invalid values fall back to the default). The retention clock starts when the
-event is dead-lettered, and pruning is lazy (on `Depths()` / `ReplayDLQ`), so replay
-a dead-lettered event within the window.
+or invalid values fall back to the default). The default preserves the recovery window
+the code shipped with before retention was configurable, so an upgrade that does not set
+the override never silently prunes older DLQ entries on first deploy; set the env to a
+smaller value (e.g. `7`) to opt into a shorter window. The retention clock starts when the
+event is dead-lettered, and pruning is lazy — the running server is the pruning authority,
+pruning on its own `Depths()` calls with its resolved window. Replay a dead-lettered event
+within the window. The `card-action-dlq` CLI's `depth` command is read-only and never
+prunes; only its `replay` applies retention, so export the same
+`OCTO_CARD_ACTION_DLQ_RETENTION_DAYS` the server uses before replaying.
 
 Alert from these bounded-label metrics:
 
@@ -235,7 +241,11 @@ waited ~15 minutes, after which it dead-letters (`reason=route_missing`). So
 `error_total{category="route_missing"}` increments **once per re-check** while an
 event waits, not once per event — treat sustained non-zero `route_missing` (or DLQ
 entries with that reason) as a route-config divergence to fix, and size any rate
-alert accordingly.
+alert accordingly. The wait is bounded by elapsed time since the event's acted-at
+timestamp; an event whose acted-at is missing or non-positive (a legacy/malformed
+event — production always stamps it at enqueue) cannot be time-bounded, so on a route
+miss it dead-letters immediately (`reason=route_missing`) rather than deferring, which
+keeps it visible and replayable instead of wedged in a permanent defer loop.
 
 ## Manual DLQ replay
 

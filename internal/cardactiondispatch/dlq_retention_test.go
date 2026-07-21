@@ -6,8 +6,10 @@ import (
 )
 
 func TestDLQRetentionFromEnv(t *testing.T) {
-	if DefaultDLQRetention != 7*24*time.Hour {
-		t.Fatalf("DefaultDLQRetention = %v, want 7 days", DefaultDLQRetention)
+	// The default matches the value shipped before retention was configurable, so an
+	// upgrade that does not set the override keeps the existing 30-day recovery window.
+	if DefaultDLQRetention != 30*24*time.Hour {
+		t.Fatalf("DefaultDLQRetention = %v, want 30 days", DefaultDLQRetention)
 	}
 	tests := []struct {
 		name string
@@ -16,7 +18,7 @@ func TestDLQRetentionFromEnv(t *testing.T) {
 	}{
 		{"unset falls back to default", "", DefaultDLQRetention},
 		{"whitespace falls back to default", "   ", DefaultDLQRetention},
-		{"explicit default", "7", 7 * 24 * time.Hour},
+		{"seven-day override", "7", 7 * 24 * time.Hour},
 		{"one day", "1", 24 * time.Hour},
 		{"valid whole days", "14", 14 * 24 * time.Hour},
 		{"at max is accepted", "365", 365 * 24 * time.Hour},

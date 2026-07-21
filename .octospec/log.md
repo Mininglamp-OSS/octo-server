@@ -26,8 +26,19 @@ change-log convention (§7). Newest first.
 - **Change (config)** — Card-action DLQ retention is now configurable via
   `OCTO_CARD_ACTION_DLQ_RETENTION_DAYS` (whole days, 1–365) through a shared
   `cardactiondispatch.DLQRetentionFromEnv` resolver used by both `main.go` and
-  `tools/card-action-dlq` (so they can't drift). **Default lowered 30 → 7 days**;
-  set the env higher for a longer recovery window. Doc updated.
+  `tools/card-action-dlq` (so they can't drift). **Default stays 30 days** (the pre-change
+  value), so an upgrade that doesn't set the override keeps the existing recovery window and
+  never prunes older DLQ entries on first deploy; set the env to a smaller value (e.g. `7`) to
+  opt into a shorter window. Doc updated.
+- **Fix (review round, PR #621, 4 reviewers)** — three blocking corrections folded in:
+  (1) a `route_missing` event with a non-positive `ActedAt` now **dead-letters immediately**
+  instead of deferring forever (the wait is bounded by elapsed-since-`ActedAt`, so an unset
+  timestamp had nothing to measure against and re-deferred every 5s indefinitely);
+  (2) the DLQ-retention default was kept at **30 days** rather than lowered to 7 (the running
+  server's lazy prune would otherwise silently delete 8–30-day-old DLQ entries on first deploy);
+  (3) the `card-action-dlq` CLI's read-only `depth` no longer prunes (new `DepthsNoPrune`), so
+  inspecting the DLQ can't delete recoverable entries. The metric-noise nit (per-re-check
+  `observeError`) was left as documented-intentional.
 
 ## 2026-07-20 (github-webhook-parity)
 

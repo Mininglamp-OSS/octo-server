@@ -58,3 +58,22 @@ notes:
     delivery attempt (Nack). The first cut used a bounded nack and an xhigh code review
     caught that it shared the delivery attempt budget → attempts_exhausted on route return.
     Learning staged: learnings/pending/durable-queue-registry-divergence.md.
+  - PR review round (4 reviewers on #621) produced three corrections, all folded into this task:
+    (1) BLOCKING — routeMissingExpired returned "not-expired" for a non-positive ActedAt, so a
+    legacy/malformed event with ActedAt<=0 and a missing route would re-defer every 5s forever
+    (never delivered, never dead-lettered). Fixed: non-positive ActedAt is now EXPIRED → immediate
+    dead-letter (reason preserved, visible/replayable). Runtime guard chosen over an Enqueue-time
+    guard because it also covers already-queued legacy events and avoids churning many test event
+    builders. Test: TestRouteMissingZeroActedAtDeadLetters.
+    (2) BLOCKING — the separate DLQ-retention change had lowered the default 30→7d; on deploy the
+    server (refreshDepthMetrics → Depths → pruneDLQScript) would irreversibly prune 8–30-day-old
+    DLQ entries with no operator action. Fixed: DefaultDLQRetention restored to 30d (the pre-change
+    value); 7d (or any 1–365) stays available via OCTO_CARD_ACTION_DLQ_RETENTION_DAYS. User chose
+    this (keep the existing contract as default, opt into shorter per deploy).
+    (3) BLOCKING — the card-action-dlq CLI's read-only `depth` pruned via Depths() using retention
+    resolved from the CLI's own env, so inspecting the DLQ from a shell without the server's env
+    could delete recoverable entries. Fixed: new RedisQueue.DepthsNoPrune() (ZCard only); `depth`
+    uses it. The server remains the sole pruning authority.
+  - The metric-noise nit (observeError fires once per 5s re-check while waiting) is left as-is:
+    it is intentional and documented (docs/card-action-callback-dispatch.md "Queue and alerts"),
+    and moving it would drop the "route currently missing" operational signal. Not a defect.

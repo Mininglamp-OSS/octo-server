@@ -69,8 +69,12 @@ DLQ, `Deliver`/`Finalize` never called.
   the original attempt (never trips `attempts_exhausted`).
 - `route_missing` past `routeMissingMaxWindow` **dead-letters** immediately (reason preserved).
 - `Deliver` and `Finalize` are never invoked while the route is missing.
-- `routeMissingExpired` treats a non-positive `ActedAt` as not-expired (no premature DLQ).
+- `routeMissingExpired` treats a non-positive `ActedAt` as **expired** — a route-missing event
+  with an unset/invalid `ActedAt` dead-letters immediately (reason preserved) instead of
+  deferring. (Review-driven correction: the first cut returned "not-expired" here, which wedged
+  such an event in a permanent 5s defer loop — never delivered, never dead-lettered — because
+  the wait is bounded by elapsed-since-`ActedAt` and there was nothing to measure against.)
 - Green: `go test ./internal/cardactiondispatch/`; clean: `go build ./...`, `go vet`, `golangci-lint`.
 - Tests: `internal/cardactiondispatch/route_missing_test.go`
   (`TestRouteMissingDefersWithoutConsumingAttempt`, `TestRouteMissingDeadLettersAfterWindow`,
-  `TestRouteMissingExpired`).
+  `TestRouteMissingZeroActedAtDeadLetters`, `TestRouteMissingExpired`).
