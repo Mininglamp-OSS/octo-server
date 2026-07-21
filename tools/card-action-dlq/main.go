@@ -29,8 +29,14 @@ func main() {
 	}
 	client := octoredis.NewInstrumentedClient(cfg)
 	defer client.Close()
+	dlqRetention := cardactiondispatch.DLQRetentionFromEnv(os.Getenv)
+	// depth and replay both PRUNE the DLQ using this retention, so surface it: an
+	// operator running the CLI without the server's OCTO_CARD_ACTION_DLQ_RETENTION_DAYS
+	// would otherwise silently prune at the default window and delete recoverable events.
+	fmt.Fprintf(os.Stderr, "card-action-dlq: DLQ retention = %s (must match the server's %s)\n", dlqRetention, cardactiondispatch.DLQRetentionEnv)
 	queue, err := cardactiondispatch.NewRedisQueue(client, cardactiondispatch.QueueConfig{
-		Prefix: "card_action_dispatch", LiveTTL: cfg.Robot.MessageExpire, DLQRetention: 30 * 24 * time.Hour,
+		Prefix: "card_action_dispatch", LiveTTL: cfg.Robot.MessageExpire,
+		DLQRetention: dlqRetention,
 	})
 	if err != nil {
 		fatal(err)

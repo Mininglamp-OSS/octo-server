@@ -5,9 +5,42 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 )
+
+const (
+	// DefaultDLQRetention is the fallback dead-letter retention: how long a
+	// dead-lettered card-action event stays replayable (via tools/card-action-dlq)
+	// before pruning, when the env override is unset or invalid.
+	DefaultDLQRetention = 7 * 24 * time.Hour
+	// DLQRetentionEnv names the retention override, expressed in whole days.
+	DLQRetentionEnv = "OCTO_CARD_ACTION_DLQ_RETENTION_DAYS"
+	// maxDLQRetentionDays bounds the override so a typo cannot pin the DLQ open for
+	// an unreasonable span.
+	maxDLQRetentionDays = 365
+)
+
+// DLQRetentionFromEnv resolves the dead-letter retention from OCTO_CARD_ACTION_DLQ_RETENTION_DAYS
+// (whole days). Empty / non-integer / non-positive / over-max values fall back to
+// DefaultDLQRetention so a misconfigured override degrades to a safe window rather than
+// truncating the recovery span (NewRedisQueue rejects a non-positive retention outright).
+// Shared by main.go and tools/card-action-dlq so the two binaries never drift on the CODE
+// value — but note both read the process env, so an operator must export the SAME
+// OCTO_CARD_ACTION_DLQ_RETENTION_DAYS when running the CLI as the server uses, or the CLI's
+// prune-on-read (Depths/ReplayDLQ) will delete events at a different window than the server.
+func DLQRetentionFromEnv(getenv func(string) string) time.Duration {
+	raw := strings.TrimSpace(getenv(DLQRetentionEnv))
+	if raw == "" {
+		return DefaultDLQRetention
+	}
+	days, err := strconv.Atoi(raw)
+	if err != nil || days <= 0 || days > maxDLQRetentionDays {
+		return DefaultDLQRetention
+	}
+	return time.Duration(days) * 24 * time.Hour
+}
 
 type routeJSON struct {
 	SenderUID      string `json:"sender_uid"`
