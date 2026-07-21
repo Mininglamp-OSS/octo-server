@@ -2,6 +2,7 @@ package notify
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -10,6 +11,18 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// swSeedPending seeds n deliverable pending rows (user + active member + ledger)
+// in spaceID, with uids disambiguated by offset so repeated top-ups don't collide.
+func swSeedPending(t *testing.T, ctx *config.Context, spaceID string, n, offset int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		uid := fmt.Sprintf("%s_u%04d", spaceID, offset+i)
+		swInsertUser(t, ctx, uid, 0)
+		swInsertMember(t, ctx, spaceID, uid, 1, time.Now().UTC())
+		swInsertLedger(t, ctx, spaceID, uid, swStatusPending, "", nil, 0)
+	}
+}
 
 // Per-Space welcome config + multi-Space delivery
 // (task space-welcome-per-space-admin-crud).
@@ -155,6 +168,38 @@ func TestPerSpace_HandleMemberJoin_ScopedToConfiguredSpace(t *testing.T) {
 
 	assert.Equal(t, 1, swCountRows(t, ctx, "spc_a"))
 	assert.Equal(t, 0, swCountRows(t, ctx, "spc_b"), "a Space with no enabled config enqueues nothing")
+}
+
+// TestPerSpace_Worker_FairRotation: a Space that keeps saturating the per-wake
+// cap must not starve the others. spc_a is kept over-cap before every wake;
+// without the rotating worker cursor it (ordered first) would consume the whole
+// cap every wake and spc_b would never be served. With rotation, spc_b's small
+// backlog is drained within len(spaces) wakes.
+func TestPerSpace_Worker_FairRotation(t *testing.T) {
+	ctx := swTestServer(t)
+	settings := common.EnsureSystemSettings(ctx)
+	af := time.Now().UTC().Add(-time.Hour)
+	swInsertSpace(t, ctx, "spc_a", 1)
+	swInsertSpace(t, ctx, "spc_b", 1)
+	swSetSpaceConfig(t, ctx, "spc_a", true, af, "A")
+	swSetSpaceConfig(t, ctx, "spc_b", true, af, "B")
+
+	svc := swNewService(ctx, settings)
+	svc.sendFn = func(_ context.Context, _ *config.MsgSendReq) (*swSendResult, error) {
+		return &swSendResult{messageID: 1, clientMsgNo: "x"}, nil
+	}
+
+	swSeedPending(t, ctx, "spc_b", 3, 0) // small fixed backlog
+
+	off := 0
+	for w := 0; w < 2; w++ {
+		swSeedPending(t, ctx, "spc_a", swWorkerWakeCap+5, off) // keep spc_a saturated
+		off += swWorkerWakeCap + 5
+		svc.runWorkerWake(bg())
+	}
+
+	sentB, _ := svc.store.countByStatus(bg(), "spc_b", swStatusSent)
+	assert.EqualValues(t, 3, sentB, "rotation serves spc_b despite spc_a saturating the per-wake cap")
 }
 
 // TestPerSpace_SweepAll_CrossSpace: lease-expired claimed rows in different

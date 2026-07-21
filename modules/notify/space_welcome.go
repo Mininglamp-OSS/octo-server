@@ -73,6 +73,11 @@ type spaceWelcomeService struct {
 	// shared global budget cannot perpetually starve the tail of the enabled-Space
 	// list. Touched only by the single reconcile goroutine — no lock needed.
 	reconcileCursor int
+	// workerCursor rotates the send worker's per-wake starting Space for the same
+	// reason: without it, a Space that keeps saturating the per-wake claim cap
+	// (ordered first by space_id) would starve later Spaces. Touched only by the
+	// single worker goroutine — no lock needed.
+	workerCursor int
 
 	mu     sync.Mutex
 	cancel context.CancelFunc
@@ -385,9 +390,20 @@ func (s *spaceWelcomeService) runWorkerWake(ctx context.Context) {
 			valid = append(valid, cfg)
 		}
 	}
+	if len(valid) == 0 {
+		return
+	}
+
+	// Rotate the starting Space each wake so a Space that keeps saturating the
+	// per-wake cap cannot perpetually starve the others (the cap bounds one wake;
+	// the rotation bounds a starved Space's wait to len(valid) wakes).
+	vn := len(valid)
+	wstart := s.workerCursor % vn
+	s.workerCursor++
 
 	claimed := 0
-	for _, cfg := range valid {
+	for i := 0; i < vn; i++ {
+		cfg := valid[(wstart+i)%vn]
 		for {
 			if ctx.Err() != nil || claimed >= swWorkerWakeCap {
 				return
