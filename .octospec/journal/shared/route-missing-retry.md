@@ -110,6 +110,8 @@ follow-up commit; the metric-noise nit was intentionally left as-is.
    and replayable). Chose the runtime guard over an `Enqueue`-time guard because it also protects
    events already sitting in the durable queue and avoids churning many test event builders.
    New test: `TestRouteMissingZeroActedAtDeadLetters`; `TestRouteMissingExpired` flipped.
+   *(Superseded in review round 2 — the window was re-anchored on the first observed miss, which
+   removes the `ActedAt<=0` edge by construction; this test was replaced accordingly. See below.)*
 
 2. **DLQ default 30→7d silently prunes on deploy** (Octo-Q P1, yujiawei P1 follow-up). The
    configurability change had lowered the default to 7d; yujiawei traced that the *server itself*
@@ -127,3 +129,35 @@ follow-up commit; the metric-noise nit was intentionally left as-is.
 **Left as-is (documented, not a defect):** `observeError(route_missing)` fires once per 5s
 re-check while an event waits. That is intentional and documented in the runbook's alerting
 section; folding it to fire only on dead-letter would drop the "route currently missing" signal.
+
+## Review round 2 (re-reviews on the fixed head)
+
+The re-reviews confirmed round 1's three fixes and surfaced two more blocking corrections, both
+folded into a second follow-up commit.
+
+4. **Window anchored on `ActedAt`, not first-miss** (Jerry-Xin, Critical). The 15-minute window
+   was measured from `Event.ActedAt` (when the user acted), so an event that dwelt in the durable
+   queue past the window before its FIRST dispatch attempt — a long restart / outage / backlog,
+   exactly the window this feature guards — got **zero** self-heal window and dead-lettered on its
+   first miss. **Fix:** anchor the window on the FIRST observed miss. A durable per-event marker
+   (Redis hash `route_missing_since`, `HSETNX`-then-read, TTL = live TTL) is written/read by
+   `RedisQueue.RouteMissingSeenAt`; the dispatcher measures `now - firstSeen` and `routeMissingExpired`
+   now takes that `firstSeen` time. This **supersedes** round 1's `ActedAt<=0` special-case: `ActedAt`
+   is no longer consulted for the window, the marker is always a real stamp, so the unset-timestamp
+   edge and the permanent-defer wedge are gone by construction. `ReplayDLQ` clears the marker so a
+   replayed event starts a fresh window. Tests: `TestRouteMissingOldActedAtDefersOnFirstMiss`
+   (old `ActedAt`, first miss → defer — the exact case Jerry-Xin asked for),
+   `TestRouteMissingSeenAtAnchorsOnFirstMiss` (Redis: marker stable across calls, cleared on replay).
+
+5. **`replay` silently deletes a server-retained entry** (yujiawei, P1). `replayDLQScript`'s expiry
+   branch deleted an entry older than the CLI's *own* resolved retention before returning 0 ("not
+   present"), so a CLI whose window was shorter than the server's could destroy a recoverable entry —
+   the same destructive-tool class `DepthsNoPrune` fixed for `depth`. **Fix:** the expiry branch now
+   just `return 0` — no delete; the running server's `Depths()` prune is the single pruning authority.
+   Test: `TestReplayDLQPastRetentionIsNonDestructive` (Redis: refused replay leaves the entry, a
+   within-window replay then succeeds).
+
+**Round-2 non-blocking, no code change:** Octo-Q's "metric fires once per event, not per re-check"
+was a misread — `observeError` sits *above* the expiry gate, so it does fire per re-check and the
+doc is correct. yujiawei's `acted_at` type-assertion note is verified safe (same in-memory map, no
+JSON round-trip). The "summary says 7d" note was already fixed by the PR-body update.

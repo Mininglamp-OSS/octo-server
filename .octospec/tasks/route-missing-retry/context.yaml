@@ -77,3 +77,25 @@ notes:
   - The metric-noise nit (observeError fires once per 5s re-check while waiting) is left as-is:
     it is intentional and documented (docs/card-action-callback-dispatch.md "Queue and alerts"),
     and moving it would drop the "route currently missing" operational signal. Not a defect.
+  - PR review round 2 (re-reviews on the fixed head) produced two more blocking corrections:
+    (4) BLOCKING (Jerry-Xin, Critical) — the bounded window was anchored on Event.ActedAt, so an
+    event that dwelt in the durable queue past the window before its FIRST dispatch (long
+    restart/outage/backlog — exactly this feature's target scenario) got zero self-heal window and
+    dead-lettered on its first miss. Fixed by anchoring the window on the FIRST observed miss: a
+    durable per-event marker (Redis hash route_missing_since, HSETNX-then-read, TTL=liveTTL) written
+    by RedisQueue.RouteMissingSeenAt and read in the dispatcher; routeMissingExpired now takes that
+    firstSeen time. This SUPERSEDES round-1's ActedAt<=0 special-case (correction 1): ActedAt is no
+    longer consulted for the window, the marker is always a real stamp, so the unset-timestamp edge
+    and the permanent-defer wedge are both gone by construction. ReplayDLQ clears the marker so a
+    replayed event starts a fresh window. New tests: TestRouteMissingOldActedAtDefersOnFirstMiss,
+    TestRouteMissingSeenAtAnchorsOnFirstMiss (Redis).
+    (5) BLOCKING (yujiawei, P1) — the DLQ `replay` path deleted an entry older than the CLI's
+    resolved retention before returning 0, so a CLI whose window was shorter than the server's could
+    silently destroy a server-retained entry — the same destructive-tool class DepthsNoPrune fixed
+    for `depth`. Fixed by making replayDLQScript's expiry branch non-destructive (return 0 without
+    deleting); the running server's Depths() prune is the single pruning authority. New test:
+    TestReplayDLQPastRetentionIsNonDestructive (Redis).
+  - Non-blocking notes from round 2 that needed NO code change: Octo-Q's "metric fires once per event
+    not per re-check" was a misread (observeError sits above the expiry gate, so it does fire per
+    re-check — doc is correct); yujiawei's acted_at type-assertion note verified safe (same in-memory
+    map, no JSON round-trip); the "PR summary says 7d" note was already resolved by the body update.

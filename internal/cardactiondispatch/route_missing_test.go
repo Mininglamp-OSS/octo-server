@@ -68,9 +68,10 @@ func TestRouteMissingDefersWithoutConsumingAttempt(t *testing.T) {
 	}
 }
 
-// TestRouteMissingDeadLettersAfterWindow: an event that has waited on a missing route
-// past routeMissingMaxWindow is a genuine misconfiguration — dead-letter it (immediate
-// DLQ, reason preserved) so it stays visible, instead of deferring forever.
+// TestRouteMissingDeadLettersAfterWindow: an event whose route was FIRST observed missing
+// more than routeMissingMaxWindow ago is a genuine misconfiguration — dead-letter it (immediate
+// DLQ, reason preserved) so it stays visible, instead of deferring forever. The window is
+// anchored on the first-observed miss (pre-seeded here), not on Event.ActedAt.
 func TestRouteMissingDeadLettersAfterWindow(t *testing.T) {
 	registry, err := NewRegistry(nil, testGetenv)
 	if err != nil {
@@ -85,16 +86,18 @@ func TestRouteMissingDeadLettersAfterWindow(t *testing.T) {
 		return nil
 	})
 
-	// Acted well past routeMissingMaxWindow ago.
 	event := Event{
 		EventID: 1003002, SenderUID: "notification", Owner: "docs",
-		ActionType: "access_request.decision",
-		ActedAt:    time.Now().Add(-routeMissingMaxWindow - time.Minute).Unix(),
+		ActionType: "access_request.decision", ActedAt: time.Now().Unix(),
 	}
 	queue := &concurrentLeaseQueue{
 		leases:   []Lease{{Event: event, Token: "lease", Attempt: 1}},
 		nacked:   make(chan nackCall, 1),
 		deferred: make(chan deferCall, 1),
+		// Route first observed missing well past the window → dead-letter on this claim.
+		routeMissingSince: map[int64]time.Time{
+			event.EventID: time.Now().Add(-routeMissingMaxWindow - time.Minute),
+		},
 	}
 	dispatcher, err := NewDispatcher(queue, registry, neverDeliver, neverFinalize, DispatcherConfig{
 		LeaseDuration: time.Second,
@@ -127,12 +130,14 @@ func TestRouteMissingDeadLettersAfterWindow(t *testing.T) {
 	}
 }
 
-// TestRouteMissingZeroActedAtDeadLetters proves a route-missing event whose ActedAt is
-// unset (0) dead-letters immediately instead of deferring forever. Enqueue validation does
-// not require ActedAt, so a legacy/malformed event with ActedAt<=0 is a reachable persisted
-// state; without this guard the defer loop would re-check it every routeMissingDeferInterval
-// indefinitely — never delivered, never dead-lettered — silently breaking the bounded window.
-func TestRouteMissingZeroActedAtDeadLetters(t *testing.T) {
+// TestRouteMissingOldActedAtDefersOnFirstMiss proves the window is anchored on the FIRST
+// observed miss, not on Event.ActedAt. An event that sat in the durable queue far longer than
+// routeMissingMaxWindow before its first dispatch attempt — a long restart / outage / backlog,
+// exactly the window this guards — must still DEFER on its first transient miss and get the full
+// self-heal window, not be dead-lettered immediately because its acted-at is already old. (An
+// unset ActedAt=0 is just an extreme of the same case: with no marker yet, the first miss stamps
+// now and the event defers — so it can never wedge in a permanent defer loop either.)
+func TestRouteMissingOldActedAtDefersOnFirstMiss(t *testing.T) {
 	registry, err := NewRegistry(nil, testGetenv)
 	if err != nil {
 		t.Fatalf("NewRegistry() error = %v", err)
@@ -146,15 +151,18 @@ func TestRouteMissingZeroActedAtDeadLetters(t *testing.T) {
 		return nil
 	})
 
-	// ActedAt deliberately unset (0) → no basis to measure the wait → dead-letter now.
+	// Acted (and enqueued) an hour ago, far past routeMissingMaxWindow, but this is its FIRST
+	// route miss — no first-seen marker yet, so the window starts now.
 	event := Event{
 		EventID: 1003002, SenderUID: "notification", Owner: "docs",
-		ActionType: "access_request.decision", ActedAt: 0,
+		ActionType: "access_request.decision",
+		ActedAt:    time.Now().Add(-time.Hour).Unix(),
 	}
 	queue := &concurrentLeaseQueue{
 		leases:   []Lease{{Event: event, Token: "lease", Attempt: 1}},
 		nacked:   make(chan nackCall, 1),
 		deferred: make(chan deferCall, 1),
+		// No routeMissingSince entry → first miss stamps now → full window ahead.
 	}
 	dispatcher, err := NewDispatcher(queue, registry, neverDeliver, neverFinalize, DispatcherConfig{
 		LeaseDuration: time.Second,
@@ -169,46 +177,40 @@ func TestRouteMissingZeroActedAtDeadLetters(t *testing.T) {
 		t.Fatalf("ProcessOne() = (%v, %v), want (true, nil)", processed, procErr)
 	}
 
+	// Must DEFER on its first miss despite the hour-old ActedAt.
 	select {
 	case dc := <-queue.deferred:
-		t.Fatalf("zero-ActedAt route-missing event was deferred (%+v); want an immediate dead-letter, not a permanent defer loop", dc)
+		if dc.eventID != event.EventID {
+			t.Fatalf("defer targeted %+v, want event %d", dc, event.EventID)
+		}
 	default:
+		t.Fatal("old-ActedAt event on its FIRST route miss was not deferred; the window must anchor on the first observed miss, not ActedAt")
 	}
 	select {
 	case nc := <-queue.nacked:
-		if nc.reason != "route_missing" {
-			t.Fatalf("nack reason = %q, want route_missing", nc.reason)
-		}
-		if nc.leaseAttempt < nc.maxAttempts {
-			t.Fatalf("leaseAttempt=%d < maxAttempts=%d; want an immediate dead-letter", nc.leaseAttempt, nc.maxAttempts)
-		}
+		t.Fatalf("old-ActedAt event was dead-lettered on its first miss (%+v); the window must anchor on the first observed miss, not ActedAt", nc)
 	default:
-		t.Fatal("zero-ActedAt route-missing event was neither deferred nor dead-lettered")
 	}
 }
 
-// TestRouteMissingExpired covers the window boundary and the unset-timestamp guard.
-// A non-positive acted_at is EXPIRED (dead-letter immediately) rather than never-expired:
-// with no timestamp to measure the wait against, deferring forever would wedge the event.
+// TestRouteMissingExpired covers the window boundary. The window is anchored on the first
+// observed miss (firstSeen), so it is a pure elapsed-time check with no unset-timestamp edge.
 func TestRouteMissingExpired(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
-	windowSecs := int64(routeMissingMaxWindow / time.Second)
 	cases := []struct {
-		name    string
-		actedAt int64
-		want    bool
+		name      string
+		firstSeen time.Time
+		want      bool
 	}{
-		{"unset acted_at dead-letters immediately (never wedged in defer)", 0, true},
-		{"negative acted_at dead-letters immediately", -5, true},
-		{"just acted", now.Unix(), false},
-		{"one second before the window", now.Unix() - windowSecs + 1, false},
-		{"exactly at the window", now.Unix() - windowSecs, true},
-		{"past the window", now.Unix() - windowSecs - 60, true},
+		{"just observed missing", now, false},
+		{"one second before the window", now.Add(-routeMissingMaxWindow + time.Second), false},
+		{"exactly at the window", now.Add(-routeMissingMaxWindow), true},
+		{"past the window", now.Add(-routeMissingMaxWindow - time.Minute), true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := routeMissingExpired(tc.actedAt, now); got != tc.want {
-				t.Fatalf("routeMissingExpired(%d, now) = %v, want %v", tc.actedAt, got, tc.want)
+			if got := routeMissingExpired(tc.firstSeen, now); got != tc.want {
+				t.Fatalf("routeMissingExpired(%v, now) = %v, want %v", tc.firstSeen, got, tc.want)
 			}
 		})
 	}

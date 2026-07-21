@@ -39,6 +39,17 @@ change-log convention (§7). Newest first.
   (3) the `card-action-dlq` CLI's read-only `depth` no longer prunes (new `DepthsNoPrune`), so
   inspecting the DLQ can't delete recoverable entries. The metric-noise nit (per-re-check
   `observeError`) was left as documented-intentional.
+- **Fix (review round 2, PR #621 re-reviews)** — two further blocking corrections folded in:
+  (4) the bounded route-missing window is now anchored on the **first observed miss** (a durable
+  per-event `route_missing_since` marker via `RouteMissingSeenAt`), not on `Event.ActedAt` — an
+  event that dwelt in the durable queue past the window before its first dispatch (long
+  restart/outage/backlog) now still defers on its first transient miss instead of dead-lettering
+  immediately; this supersedes round 1's `ActedAt<=0` special-case (the marker is always a real
+  stamp, so that edge is gone by construction), and `ReplayDLQ` clears the marker so a replayed
+  event starts fresh; (5) the `card-action-dlq replay` path is now **non-destructive** — an entry
+  past the CLI's resolved retention is refused without being deleted, so the running server stays
+  the single pruning authority (a shorter CLI window can no longer silently destroy a
+  server-retained entry).
 
 ## 2026-07-20 (github-webhook-parity)
 

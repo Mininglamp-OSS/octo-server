@@ -17,6 +17,10 @@ type dispatchQueue interface {
 	Ack(eventID int64, token string) (bool, error)
 	Nack(lease Lease, now time.Time, delay time.Duration, maxAttempts int, reason string) (NackOutcome, error)
 	ReclaimExpired(now time.Time, limit int) (int, error)
+	// RouteMissingSeenAt records (once) and returns when this event's route was first
+	// observed missing at dispatch, so the bounded route-missing window is measured from
+	// that point rather than from Event.ActedAt.
+	RouteMissingSeenAt(eventID int64, now time.Time) (time.Time, error)
 }
 
 type callbackDeliverer interface {
@@ -134,10 +138,23 @@ func (d *Dispatcher) ProcessOne(ctx context.Context, now time.Time) (bool, error
 		// out the window and dispatches on its ORIGINAL attempt budget once the route
 		// returns. Consuming an attempt here (a nack) would let route-absence waiting
 		// exhaust route.MaxAttempts, so the event would trip the attempts_exhausted
-		// gate the moment its route came back — the opposite of self-healing. Only once
-		// the event has waited past routeMissingMaxWindow do we dead-letter it as a
-		// genuine misconfiguration, preserving the DLQ breadcrumb (reason=route_missing).
-		if routeMissingExpired(lease.Event.ActedAt, d.clock()) {
+		// gate the moment its route came back — the opposite of self-healing.
+		//
+		// The window is measured from the FIRST observed miss (persisted per event via
+		// RouteMissingSeenAt), NOT from Event.ActedAt. An event can sit in the durable
+		// queue arbitrarily long before its first dispatch attempt — a long restart /
+		// outage / backlog, exactly the window this guards — and must still get the full
+		// self-heal window on its first transient miss, instead of being dead-lettered
+		// immediately because its acted-at is already older than the window. Only after it
+		// has waited past routeMissingMaxWindow SINCE that first miss do we dead-letter it
+		// as a genuine misconfiguration, preserving the DLQ breadcrumb (reason=route_missing).
+		firstSeen, seenErr := d.queue.RouteMissingSeenAt(lease.Event.EventID, d.clock())
+		if seenErr != nil {
+			d.metrics.observeError(owner, "queue_error")
+			d.refreshDepthMetrics()
+			return true, seenErr
+		}
+		if routeMissingExpired(firstSeen, d.clock()) {
 			outcome, nackErr := d.nack(*lease, d.clock(), false, lease.Attempt, "route_missing")
 			resultLabel = resultForNack(outcome, nackErr)
 			d.logTransition(lease, "route_missing", outcome, nackErr)
@@ -343,22 +360,15 @@ const routeMissingMaxWindow = 15 * time.Minute
 // long-missing route does not busy re-claim the same event every poll tick.
 const routeMissingDeferInterval = 5 * time.Second
 
-// routeMissingExpired reports whether an event acted at actedAtUnix (unix seconds) has
-// waited on a missing route past routeMissingMaxWindow and must now be dead-lettered.
-//
-// A non-positive actedAt (unset / legacy / malformed) is treated as EXPIRED. The defer
-// loop bounds the wait by elapsed time since actedAt; with no trustworthy timestamp there
-// is nothing to measure against, so returning "not expired" here would re-defer the event
-// on every re-check forever — never delivered, never dead-lettered — silently breaking the
-// bounded-window guarantee (flagged in review). Dead-lettering immediately instead keeps the
-// event visible and replayable (reason=route_missing) rather than wedged in permanent defer.
-// Production always stamps ActedAt at enqueue (modules/message/api_card_action.go), so this
-// only ever catches a legacy/malformed event that predates or violates that invariant.
-func routeMissingExpired(actedAtUnix int64, now time.Time) bool {
-	if actedAtUnix <= 0 {
-		return true
-	}
-	return now.Unix()-actedAtUnix >= int64(routeMissingMaxWindow/time.Second)
+// routeMissingExpired reports whether an event whose route was first observed missing at
+// firstSeen has now waited past routeMissingMaxWindow and must be dead-lettered. The window
+// is anchored on the FIRST observed miss (a durable per-event marker set by RouteMissingSeenAt),
+// not on Event.ActedAt, so a long queue dwell before the first dispatch attempt never robs the
+// event of its self-heal window. firstSeen is always a real stamp (the marker is written on the
+// first miss), so there is no "unset timestamp" edge — an event with any ActedAt, including an
+// unset/legacy one, gets a full window from its first miss and can never wedge in permanent defer.
+func routeMissingExpired(firstSeen time.Time, now time.Time) bool {
+	return now.Sub(firstSeen) >= routeMissingMaxWindow
 }
 
 func errorCategory(err error) string {

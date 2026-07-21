@@ -67,14 +67,23 @@ DLQ, `Deliver`/`Finalize` never called.
 - `route_missing` within `routeMissingMaxWindow` **defers** (no attempt consumed) — it is
   NOT nacked, so the delivery attempt budget is untouched and a returning route delivers on
   the original attempt (never trips `attempts_exhausted`).
-- `route_missing` past `routeMissingMaxWindow` **dead-letters** immediately (reason preserved).
+- The bounded window is anchored on the **first observed route-miss** (a durable per-event
+  marker, `RouteMissingSeenAt`), NOT on `Event.ActedAt`. An event that dwelt in the queue past
+  the window before its first dispatch (long restart/outage/backlog) still **defers** on its
+  first transient miss; only after waiting past `routeMissingMaxWindow` *since that first miss*
+  does it dead-letter (reason preserved). This also removes the `ActedAt<=0` edge entirely — the
+  marker is always a real stamp, so there is no unset-timestamp case and no permanent-defer wedge.
+  (Review-driven: anchoring on `ActedAt` gave a backlogged event zero self-heal window; earlier
+  cuts anchored on `ActedAt` and special-cased `ActedAt<=0`.)
 - `Deliver` and `Finalize` are never invoked while the route is missing.
-- `routeMissingExpired` treats a non-positive `ActedAt` as **expired** — a route-missing event
-  with an unset/invalid `ActedAt` dead-letters immediately (reason preserved) instead of
-  deferring. (Review-driven correction: the first cut returned "not-expired" here, which wedged
-  such an event in a permanent 5s defer loop — never delivered, never dead-lettered — because
-  the wait is bounded by elapsed-since-`ActedAt` and there was nothing to measure against.)
+- The DLQ `replay` path is **non-destructive**: an entry past the CLI's resolved retention is
+  refused (returns false) but NOT deleted — the running server stays the single pruning authority.
+  (Review-driven: the CLI resolves retention from its own env; a shorter window could otherwise
+  silently delete a server-retained entry.) A successful replay clears the first-miss marker so
+  the re-queued event starts a fresh window.
 - Green: `go test ./internal/cardactiondispatch/`; clean: `go build ./...`, `go vet`, `golangci-lint`.
 - Tests: `internal/cardactiondispatch/route_missing_test.go`
   (`TestRouteMissingDefersWithoutConsumingAttempt`, `TestRouteMissingDeadLettersAfterWindow`,
-  `TestRouteMissingZeroActedAtDeadLetters`, `TestRouteMissingExpired`).
+  `TestRouteMissingOldActedAtDefersOnFirstMiss`, `TestRouteMissingExpired`) and
+  `route_missing_queue_test.go` (`TestReplayDLQPastRetentionIsNonDestructive`,
+  `TestRouteMissingSeenAtAnchorsOnFirstMiss`, Redis-backed).
