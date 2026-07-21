@@ -500,9 +500,13 @@ func installCardActionDispatch(ctx *config.Context) (*cardActionDispatchRuntime,
 	// enqueue and the dispatch worker would have no work. Skip the worker and its
 	// Redis consumer entirely and return an inert runtime so the server still
 	// boots with routes (and OCTO_DOCS_APPROVAL_CARD_ENABLED) left in the config —
-	// turning the gate off must never panic (runbook rollback: "global
-	// OCTO_CARD_MESSAGE_ENABLED=false"). Configured-but-inert routes/features only
-	// WARN so operators can see they will resume once the gate is flipped back on.
+	// flipping the gate off on an otherwise-valid config must not panic (runbook
+	// rollback: "global OCTO_CARD_MESSAGE_ENABLED=false"). This is NOT a bypass for
+	// config validation: LoadRouteSpecs / NewRegistry / ValidateNotifyTokenExclusions
+	// run ABOVE this branch, so genuinely malformed route config (bad URL, short
+	// secret, token reuse) still aborts boot loudly regardless of the gate.
+	// Configured-but-inert routes/features only WARN so operators can see they will
+	// resume once the gate is flipped back on.
 	if !cardmsg.Enabled() {
 		if producers := len(registry.NotifyProducers()); producers > 0 {
 			log.Warn("OCTO_CARD_MESSAGE_ENABLED is off; card action notify routes are configured but inert until the gate is re-enabled",

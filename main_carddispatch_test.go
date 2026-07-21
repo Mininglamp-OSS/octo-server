@@ -189,6 +189,50 @@ func TestCardActionDispatchInertWhenCardsDisabled(t *testing.T) {
 	runtime.Stop()
 }
 
+// TestCardActionDispatchInertWhenGateUnsetWithDocsApproval covers the two other
+// documented gate-off inputs the first test does not: an UNSET gate (not just
+// "false") and OCTO_DOCS_APPROVAL_CARD_ENABLED=true. Both formerly panicked
+// ("action notify routes require ..." / "OCTO_DOCS_APPROVAL_CARD_ENABLED
+// requires ..."); with the kill switch they must boot inert instead.
+func TestCardActionDispatchInertWhenGateUnsetWithDocsApproval(t *testing.T) {
+	t.Setenv("OCTO_CARD_MESSAGE_ENABLED", "") // unset ⇒ gate off (not the literal "false")
+	t.Setenv("OCTO_DOCS_APPROVAL_CARD_ENABLED", "true")
+	t.Setenv("OCTO_TASKS_CARD_ACTION_SECRET", strings.Repeat("a", 32))
+	t.Setenv("OCTO_TASKS_NOTIFY_TOKEN", strings.Repeat("b", 32))
+	t.Setenv("OCTO_CARD_ACTION_ROUTES", `[{"sender_uid":"notification","owner":"tasks","action_type":"task.execute.decision","url":"https://tasks.internal/v1/card-actions/decide","secret_env":"OCTO_TASKS_CARD_ACTION_SECRET","notify_token_env":"OCTO_TASKS_NOTIFY_TOKEN"}]`)
+
+	runtime, err := installCardActionDispatch(nil)
+	if err != nil {
+		t.Fatalf("unset gate + docs-approval on must boot inert, got error %v", err)
+	}
+	if runtime == nil || runtime.dispatcher != nil || runtime.redisClient != nil {
+		t.Fatalf("expected an inert runtime (no dispatcher/redis), got %+v", runtime)
+	}
+	if err := runtime.Start(context.Background()); err != nil {
+		t.Fatalf("inert runtime Start() must be a no-op, got %v", err)
+	}
+	runtime.Stop()
+}
+
+// TestCardActionDispatchValidatesRoutesWhenGateOff pins the validate-before-inert
+// ordering: the gate is a kill switch for enablement, NOT a bypass for config
+// validation. With the gate off, a genuinely malformed route (here: a callback
+// secret < 32 bytes) must still fail startup rather than boot inert.
+func TestCardActionDispatchValidatesRoutesWhenGateOff(t *testing.T) {
+	t.Setenv("OCTO_CARD_MESSAGE_ENABLED", "false")
+	t.Setenv("OCTO_DOCS_APPROVAL_CARD_ENABLED", "false")
+	t.Setenv("OCTO_TASKS_CARD_ACTION_SECRET", "too-short") // < 32 bytes ⇒ NewRegistry rejects
+	t.Setenv("OCTO_CARD_ACTION_ROUTES", `[{"sender_uid":"notification","owner":"tasks","action_type":"task.execute.decision","url":"https://tasks.internal/v1/card-actions/decide","secret_env":"OCTO_TASKS_CARD_ACTION_SECRET"}]`)
+
+	runtime, err := installCardActionDispatch(nil)
+	if err == nil {
+		t.Fatal("malformed route config must fail startup even with the gate off (validate-before-inert)")
+	}
+	if runtime != nil {
+		t.Fatalf("expected a nil runtime on validation error, got %+v", runtime)
+	}
+}
+
 func TestConfiguredApprovalRouteRejectsNonNotificationSender(t *testing.T) {
 	_, err := cardActionApprovalProducerSpecs([]cardactiondispatch.RouteSpec{
 		{
