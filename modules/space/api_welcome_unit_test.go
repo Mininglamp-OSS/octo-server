@@ -65,8 +65,8 @@ func TestBuildWelcomeResp(t *testing.T) {
 		if resp.Message != "hello\nworld" {
 			t.Fatalf("Message = %q, want newline preserved verbatim", resp.Message)
 		}
-		if resp.UpdatedBy != "u_admin" || resp.UpdatedAt == "" {
-			t.Fatalf("audit fields not surfaced: %+v", resp)
+		if resp.UpdatedBy != "u_admin" || resp.UpdatedAt != "2026-07-10T01:02:03Z" {
+			t.Fatalf("audit fields not surfaced/formatted (want RFC3339 updated_at): %+v", resp)
 		}
 		if resp.Effective.Source != "space" || !resp.Effective.Enabled {
 			t.Fatalf("effective = %+v, want source=space enabled=true", resp.Effective)

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	commonmod "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -148,6 +149,19 @@ func TestWelcomePut_MessageTooLong(t *testing.T) {
 
 	long := strings.Repeat("我", 2001) // > 2000 code points
 	body := `{"enabled":false,"message":"` + long + `"}`
+	w := doWelcome(t, http.MethodPut, "spc_1", body)
+	assertSpaceErrorCode(t, w, "err.server.space.field_too_long")
+}
+
+func TestWelcomePut_ActiveFromTooLong(t *testing.T) {
+	setup(t)
+	seedWelcomeSpace(t, "spc_1", 1)
+
+	// Over the active_from VARCHAR(40) column width. enabled=false skips the
+	// RFC3339 parse, so the column guard (not the combination validator) must
+	// reject it with a clean field-too-long 400 rather than a store 500.
+	long := strings.Repeat("9", commonmod.SpaceWelcomeActiveFromMaxLen+10)
+	body := `{"enabled":false,"active_from":"` + long + `"}`
 	w := doWelcome(t, http.MethodPut, "spc_1", body)
 	assertSpaceErrorCode(t, w, "err.server.space.field_too_long")
 }

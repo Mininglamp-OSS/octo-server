@@ -30,6 +30,14 @@ import (
 // duplicating the constant.
 const SpaceWelcomeMessageMaxRunes = spaceWelcomeMessageMaxRunes
 
+// SpaceWelcomeActiveFromMaxLen bounds the active_from string to its storage
+// column width (VARCHAR(40) in the config migration). Enforced on the write path
+// independently of enabled/parse: a disabled config skips the RFC3339 parse
+// entirely, and time.Parse otherwise accepts arbitrarily long fractional
+// seconds, so without this guard an over-column value could reach the upsert and
+// fail as a driver/store 500 (strict sql_mode) or truncate silently (permissive).
+const SpaceWelcomeActiveFromMaxLen = 40
+
 const spaceWelcomeConfigTable = "octo_space_welcome_config"
 
 // SpaceWelcomeSpaceConfig is one per-Space welcome config row.
@@ -135,6 +143,91 @@ func (s *SpaceWelcomeConfigStore) Upsert(ctx context.Context, cfg SpaceWelcomeSp
 		return fmt.Errorf("upsert space welcome config: %w", err)
 	}
 	return nil
+}
+
+// UpsertMerged performs a read-modify-write of the per-Space config inside a
+// single transaction that holds a row lock (SELECT ... FOR UPDATE), closing the
+// lost-update window when two admins PUT the same Space concurrently: the second
+// transaction blocks on the first's row lock, then re-reads the just-written
+// state before merge runs, so neither admin's fields are silently reverted.
+//
+// merge receives the current row (found=false when absent) and returns the
+// config to persist. A non-nil error from merge aborts the write (the tx rolls
+// back) and is returned verbatim — callers use this to surface validation
+// failures without writing. On success the persisted row, re-read inside the tx,
+// is returned. now is the app-computed UTC timestamp for created_at/updated_at.
+//
+// Note: FOR UPDATE only locks an existing row; two racing first-creates of the
+// same space_id are still resolved last-writer-wins by the UNIQUE key +
+// ON DUPLICATE KEY UPDATE (no torn state, no error). The lost-update the
+// reviewers flagged is co-admins editing an existing config, which the row lock
+// fully serializes.
+func (s *SpaceWelcomeConfigStore) UpsertMerged(
+	ctx context.Context,
+	spaceID string,
+	now time.Time,
+	merge func(cur *SpaceWelcomeSpaceConfig, found bool) (SpaceWelcomeSpaceConfig, error),
+) (*SpaceWelcomeSpaceConfig, error) {
+	if spaceID == "" {
+		return nil, errors.New("space welcome upsert: empty space id")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin space welcome upsert tx: %w", err)
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	var row spaceWelcomeConfigRow
+	found := true
+	if err := tx.SelectBySql(
+		"SELECT "+spaceWelcomeConfigCols+" FROM "+spaceWelcomeConfigTable+" WHERE space_id=? FOR UPDATE",
+		spaceID,
+	).LoadOneContext(ctx, &row); err != nil {
+		if errors.Is(err, dbr.ErrNotFound) {
+			found = false
+		} else {
+			return nil, fmt.Errorf("lock space welcome config: %w", err)
+		}
+	}
+
+	var cur *SpaceWelcomeSpaceConfig
+	if found {
+		c := row.toConfig()
+		cur = &c
+	}
+	next, err := merge(cur, found)
+	if err != nil {
+		return nil, err
+	}
+
+	enabled := 0
+	if next.Enabled {
+		enabled = 1
+	}
+	if _, err := tx.InsertBySql(
+		"INSERT INTO "+spaceWelcomeConfigTable+" (space_id, enabled, active_from, message, updated_by, created_at, updated_at) "+
+			"VALUES (?, ?, ?, ?, ?, ?, ?) "+
+			"ON DUPLICATE KEY UPDATE enabled=VALUES(enabled), active_from=VALUES(active_from), "+
+			"message=VALUES(message), updated_by=VALUES(updated_by), updated_at=VALUES(updated_at)",
+		next.SpaceID, enabled, next.ActiveFromRaw, next.Message, next.UpdatedBy, now, now,
+	).ExecContext(ctx); err != nil {
+		return nil, fmt.Errorf("upsert space welcome config: %w", err)
+	}
+
+	// Re-read inside the tx so the returned view reflects the persisted row
+	// (created_at from the original insert, updated_at=now).
+	var out spaceWelcomeConfigRow
+	if err := tx.SelectBySql(
+		"SELECT "+spaceWelcomeConfigCols+" FROM "+spaceWelcomeConfigTable+" WHERE space_id=?",
+		spaceID,
+	).LoadOneContext(ctx, &out); err != nil {
+		return nil, fmt.Errorf("reload space welcome config: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit space welcome upsert tx: %w", err)
+	}
+	cfg := out.toConfig()
+	return &cfg, nil
 }
 
 // Delete hard-deletes the per-Space config row. deleted=false when none existed

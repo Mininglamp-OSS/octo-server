@@ -2,6 +2,7 @@ package space
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -13,6 +14,11 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"go.uber.org/zap"
 )
+
+// errWelcomeValidation is the sentinel a putWelcome merge closure returns after
+// it has already written a localized validation response; UpsertMerged rolls the
+// transaction back and putWelcome then just returns without a second response.
+var errWelcomeValidation = errors.New("space welcome validation failed")
 
 // Per-Space onboarding welcome config CRUD (task
 // space-welcome-per-space-admin-crud). A Space admin (Role>=1) manages ONE
@@ -118,69 +124,74 @@ func (s *Space) putWelcome(c *wkhttp.Context) {
 	ctx, cancel := context.WithTimeout(context.Background(), welcomeConfigDBTimeout)
 	defer cancel()
 
-	// Start from the existing row (or defaults) and overlay the provided fields.
-	row, found, err := s.welcomeStore.Get(ctx, spaceId)
+	// Read-merge-write under a row lock so two admins PUTting the same Space
+	// concurrently can't lose each other's fields: the second PUT blocks on the
+	// lock and merges onto the first's committed write. Validation runs inside the
+	// merge (against the locked current row) and, on failure, writes the localized
+	// response and returns errWelcomeValidation so the tx aborts and no row is
+	// written.
+	persisted, err := s.welcomeStore.UpsertMerged(ctx, spaceId, time.Now().UTC(),
+		func(cur *commonmod.SpaceWelcomeSpaceConfig, found bool) (commonmod.SpaceWelcomeSpaceConfig, error) {
+			// Start from the existing row (or defaults) and overlay the provided fields.
+			prospective := commonmod.SpaceWelcomeSpaceConfig{SpaceID: spaceId}
+			if found {
+				prospective = *cur
+			}
+			prospective.SpaceID = spaceId
+			if req.Enabled != nil {
+				prospective.Enabled = *req.Enabled
+			}
+			if req.ActiveFrom != nil {
+				prospective.ActiveFromRaw = strings.TrimSpace(*req.ActiveFrom)
+			}
+			if req.Message != nil {
+				// Preserve internal newlines verbatim (plain text, no markdown); only
+				// the composite validator trims for the non-empty check.
+				prospective.Message = *req.Message
+			}
+
+			// Column guards: bound message and active_from to their VARCHAR widths
+			// regardless of enabled, so an oversized value is rejected with a clean
+			// 400 instead of a driver/store failure (strict sql_mode) or a silent
+			// truncation (permissive), even for a disabled config that skips parsing.
+			if utf8.RuneCountInString(prospective.Message) > commonmod.SpaceWelcomeMessageMaxRunes {
+				respondSpaceFieldTooLong(c, "message", commonmod.SpaceWelcomeMessageMaxRunes)
+				return commonmod.SpaceWelcomeSpaceConfig{}, errWelcomeValidation
+			}
+			if utf8.RuneCountInString(prospective.ActiveFromRaw) > commonmod.SpaceWelcomeActiveFromMaxLen {
+				respondSpaceFieldTooLong(c, "active_from", commonmod.SpaceWelcomeActiveFromMaxLen)
+				return commonmod.SpaceWelcomeSpaceConfig{}, errWelcomeValidation
+			}
+
+			// Composite validation via the shared validator. nil isActiveSpace: the
+			// target Space is the path Space, already confirmed active by
+			// requireSpaceAdmin, so no second existence check is needed.
+			combo := commonmod.SpaceWelcomeConfig{
+				Enabled:       prospective.Enabled,
+				SpaceID:       spaceId,
+				ActiveFromRaw: prospective.ActiveFromRaw,
+				Message:       prospective.Message,
+			}
+			if field, _ := commonmod.ValidateSpaceWelcomeCombination(combo, nil); field != "" {
+				httperr.ResponseErrorL(c, errcode.ErrSpaceWelcomeConfigInvalid, nil, i18n.Details{"field": welcomeClientField(field)})
+				return commonmod.SpaceWelcomeSpaceConfig{}, errWelcomeValidation
+			}
+
+			prospective.UpdatedBy = loginUID
+			return prospective, nil
+		})
 	if err != nil {
-		s.Error("查询空间欢迎语配置失败", zap.Error(err), zap.String("space_id", spaceId))
-		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
-		return
-	}
-	prospective := commonmod.SpaceWelcomeSpaceConfig{SpaceID: spaceId}
-	if found {
-		prospective = *row
-	}
-	prospective.SpaceID = spaceId
-	if req.Enabled != nil {
-		prospective.Enabled = *req.Enabled
-	}
-	if req.ActiveFrom != nil {
-		prospective.ActiveFromRaw = strings.TrimSpace(*req.ActiveFrom)
-	}
-	if req.Message != nil {
-		// Preserve internal newlines verbatim (plain text, no markdown); only the
-		// composite validator trims for the non-empty check.
-		prospective.Message = *req.Message
-	}
-
-	// Column guard: bound the message length regardless of enabled so an
-	// oversized body is rejected even for a disabled config (protects the
-	// VARCHAR(2000) column and avoids silent truncation).
-	if utf8.RuneCountInString(prospective.Message) > commonmod.SpaceWelcomeMessageMaxRunes {
-		respondSpaceFieldTooLong(c, "message", commonmod.SpaceWelcomeMessageMaxRunes)
-		return
-	}
-
-	// Composite validation via the shared validator. nil isActiveSpace: the
-	// target Space is the path Space, already confirmed active by
-	// requireSpaceAdmin, so no second existence check is needed.
-	eff := commonmod.SpaceWelcomeConfig{
-		Enabled:       prospective.Enabled,
-		SpaceID:       spaceId,
-		ActiveFromRaw: prospective.ActiveFromRaw,
-		Message:       prospective.Message,
-	}
-	if field, _ := commonmod.ValidateSpaceWelcomeCombination(eff, nil); field != "" {
-		httperr.ResponseErrorL(c, errcode.ErrSpaceWelcomeConfigInvalid, nil, i18n.Details{"field": welcomeClientField(field)})
-		return
-	}
-
-	prospective.UpdatedBy = loginUID
-	if err := s.welcomeStore.Upsert(ctx, prospective, time.Now().UTC()); err != nil {
+		if errors.Is(err, errWelcomeValidation) {
+			return // the merge already wrote the localized validation response
+		}
 		s.Error("写入空间欢迎语配置失败", zap.Error(err), zap.String("space_id", spaceId))
 		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
 	}
-	s.Info("空间欢迎语配置已更新", zap.String("operator_uid", loginUID), zap.String("space_id", spaceId), zap.Bool("enabled", prospective.Enabled))
+	s.Info("空间欢迎语配置已更新", zap.String("operator_uid", loginUID), zap.String("space_id", spaceId), zap.Bool("enabled", persisted.Enabled))
 
-	// Re-read so the response carries the persisted updated_at / effective view.
-	row, found, err = s.welcomeStore.Get(ctx, spaceId)
-	if err != nil {
-		s.Error("回读空间欢迎语配置失败", zap.Error(err), zap.String("space_id", spaceId))
-		httperr.ResponseErrorL(c, errcode.ErrSpaceQueryFailed, nil, nil)
-		return
-	}
-	eff2 := commonmod.ResolveEffectiveSpaceWelcome(row, found, s.settings.SpaceWelcomeConfig(), spaceId)
-	c.Response(buildWelcomeResp(row, found, eff2))
+	eff := commonmod.ResolveEffectiveSpaceWelcome(persisted, true, s.settings.SpaceWelcomeConfig(), spaceId)
+	c.Response(buildWelcomeResp(persisted, true, eff))
 }
 
 // deleteWelcome hard-deletes the per-Space config; the Space then reverts to the
@@ -215,7 +226,10 @@ func buildWelcomeResp(row *commonmod.SpaceWelcomeSpaceConfig, found bool, eff co
 		resp.Message = row.Message
 		resp.UpdatedBy = row.UpdatedBy
 		if !row.UpdatedAt.IsZero() {
-			resp.UpdatedAt = row.UpdatedAt.String()
+			// Stable, client-parseable RFC3339 (UTC) rather than Go's
+			// time.Time.String() representation. updated_at is a second-precision
+			// DATETIME, so RFC3339 is exact.
+			resp.UpdatedAt = row.UpdatedAt.UTC().Format(time.RFC3339)
 		}
 	}
 	resp.Effective = welcomeEffectiveResp{

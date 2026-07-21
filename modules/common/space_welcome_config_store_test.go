@@ -2,6 +2,7 @@ package common
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -87,4 +88,75 @@ func TestSpaceWelcomeConfigStore_CRUD(t *testing.T) {
 	_, found, err = store.Get(bg, "spc_1")
 	require.NoError(t, err)
 	assert.False(t, found)
+}
+
+// TestSpaceWelcomeConfigStore_UpsertMerged_NoLostUpdate is the concurrent
+// partial-update regression (reviewer-requested). Two admins patch DIFFERENT
+// fields of the same Space simultaneously. UpsertMerged reads under a row lock
+// (SELECT ... FOR UPDATE), so whichever transaction runs second merges onto the
+// first's committed write — the final row must reflect BOTH patches regardless
+// of interleaving. Without the lock, one admin's field would be silently lost.
+func TestSpaceWelcomeConfigStore_UpsertMerged_NoLostUpdate(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	t.Cleanup(func() { _ = testutil.CleanAllTables(ctx) })
+
+	store := NewSpaceWelcomeConfigStore(ctx.DB())
+	bg := context.Background()
+
+	// Seed the enabled config both admins start from.
+	require.NoError(t, store.Upsert(bg, SpaceWelcomeSpaceConfig{
+		SpaceID:       "spc_race",
+		Enabled:       true,
+		ActiveFromRaw: "2026-07-10T00:00:00Z",
+		Message:       "orig",
+		UpdatedBy:     "seed",
+	}, time.Now().UTC()))
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Admin A: change only the message, preserving whatever enabled it reads.
+	go func() {
+		defer wg.Done()
+		<-start
+		_, err := store.UpsertMerged(bg, "spc_race", time.Now().UTC(),
+			func(cur *SpaceWelcomeSpaceConfig, found bool) (SpaceWelcomeSpaceConfig, error) {
+				next := SpaceWelcomeSpaceConfig{SpaceID: "spc_race"}
+				if cur != nil {
+					next = *cur
+				}
+				next.Message = "msg-A"
+				next.UpdatedBy = "admin_A"
+				return next, nil
+			})
+		assert.NoError(t, err)
+	}()
+
+	// Admin B: disable, preserving whatever message it reads.
+	go func() {
+		defer wg.Done()
+		<-start
+		_, err := store.UpsertMerged(bg, "spc_race", time.Now().UTC(),
+			func(cur *SpaceWelcomeSpaceConfig, found bool) (SpaceWelcomeSpaceConfig, error) {
+				next := SpaceWelcomeSpaceConfig{SpaceID: "spc_race"}
+				if cur != nil {
+					next = *cur
+				}
+				next.Enabled = false
+				next.UpdatedBy = "admin_B"
+				return next, nil
+			})
+		assert.NoError(t, err)
+	}()
+
+	close(start) // release both goroutines to contend on the row lock
+	wg.Wait()
+
+	row, found, err := store.Get(bg, "spc_race")
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, "msg-A", row.Message, "admin A's message must not be lost")
+	assert.False(t, row.Enabled, "admin B's disable must not be lost")
 }
