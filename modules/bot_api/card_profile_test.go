@@ -124,8 +124,45 @@ func TestBotCardProfile_DisabledStillReturnsManifestAndSendRejects(t *testing.T)
 	assert.Equal(t, cardmsg.AcceptedProfiles(), m.Profiles)
 	assert.Equal(t, cardmsg.MaxPayloadBytes, m.Limits.MaxPayloadBytes)
 
-	// 半 2：send 路径对卡片仍拒绝（同一 cardmsg.Enabled() 门禁，send.go:97 —— 在
-	// IM 派发前拒绝，无需 WuKongIM）。
+	// 半 2：send 路径对卡片仍拒绝（同源 bot 门禁 BotEnabled，此处经部署级总开关关闭
+	// 而生效，send.go —— 在 IM 派发前拒绝，无需 WuKongIM）。
+	body := map[string]interface{}{
+		"channel_id":   testutil.UID,
+		"channel_type": common.ChannelTypePerson.Uint8(),
+		"payload": map[string]interface{}{
+			"type":         cardmsg.InteractiveCard.Int(),
+			"card_version": cardmsg.CardVersion,
+			"profile":      cardmsg.ProfileV1,
+			"card":         map[string]interface{}{"type": "AdaptiveCard", "version": "1.5"},
+		},
+	}
+	ws := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/bot/sendMessage", bytes.NewReader([]byte(util.ToJson(body))))
+	req.Header.Set("Authorization", "Bearer "+cpBotToken)
+	handler.ServeHTTP(ws, req)
+	assert.Equal(t, http.StatusBadRequest, ws.Code, ws.Body.String())
+	assert.Contains(t, ws.Body.String(), "Card messages are not enabled on this server.")
+}
+
+// TestBotCardProfile_BotSubSwitchDisablesProfileAndSend：总开关开、但 bot 子开关
+// OCTO_BOT_CARD_ENABLED=false 单独禁掉 bot 发卡时——(半 1) 清单的 enabled 反映**有效
+// bot 门禁** → false（仍返 200 + 全清单）；(半 2) send 路径同源门禁在 IM 派发前拒绝。
+// 锁死「profile.enabled 与实际发卡门禁同源、绝不背离」：清单报什么、send 就受理什么。
+func TestBotCardProfile_BotSubSwitchDisablesProfileAndSend(t *testing.T) {
+	t.Setenv(cardmsg.EnvEnabled, "true")     // 部署级总开关：开
+	t.Setenv(cardmsg.EnvBotEnabled, "false") // bot 子开关：单独关
+	handler, _ := setupBotCardProfile(t)
+
+	// 半 1：profile.enabled 跟随 bot 子开关 → false；完整清单仍返回。
+	w := getCardProfile(t, handler, cpBotToken)
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var m cardProfileManifest
+	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &m))
+	assert.False(t, m.Enabled, "总开关开但 bot 子开关关 → profile.enabled:false")
+	assert.Equal(t, cardmsg.CardVersion, m.CardVersion, "子开关关时仍返完整清单")
+	assert.Equal(t, cardmsg.AcceptedProfiles(), m.Profiles)
+
+	// 半 2：send 路径同源门禁（BotEnabled）→ 拒绝，与 profile 一致。
 	body := map[string]interface{}{
 		"channel_id":   testutil.UID,
 		"channel_type": common.ChannelTypePerson.Uint8(),

@@ -45,7 +45,9 @@ func (ba *BotAPI) botCardRevisionsClear(c *wkhttp.Context) {
 		respondBotAPIRequestInvalid(c, "channel_type")
 		return
 	}
-	if !cardmsg.Enabled() {
+	if !cardmsg.BotEnabled() {
+		// bot 侧有效门禁（总开关 AND bot 子开关 OCTO_BOT_CARD_ENABLED），与发卡
+		// 路径及 /v1/bot/card/profile.enabled 同源。
 		httperr.ResponseErrorL(c, errcode.ErrBotAPICardDisabled, nil, nil)
 		return
 	}

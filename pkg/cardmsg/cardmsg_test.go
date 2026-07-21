@@ -541,6 +541,34 @@ func TestEnabledFlag(t *testing.T) {
 	}
 }
 
+// TestBotEnabledFlag 锁死 bot 侧有效门禁的真值表：BotEnabled = 总开关 AND bot 子开关，
+// 子开关默认（未设/非法）为开，仅显式 false 单独关闭 bot 发卡。
+func TestBotEnabledFlag(t *testing.T) {
+	cases := []struct {
+		name    string
+		global  string
+		bot     string
+		wantBot bool
+	}{
+		{"总开关关-子开关未设 → 关", "", "", false},
+		{"总开关关-子开关开 → 关(从属总开关)", "", "true", false},
+		{"总开关开-子开关未设 → 开(向后兼容)", "true", "", true},
+		{"总开关开-子开关显式true → 开", "true", "true", true},
+		{"总开关开-子开关显式false → 关(单独禁 bot)", "true", "false", false},
+		{"总开关开-子开关非法值 → 开(不误伤既有生产者)", "true", "not-a-bool", true},
+		{"总开关非法-子开关开 → 关(总开关 fail-closed)", "not-a-bool", "true", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(EnvEnabled, tc.global)
+			t.Setenv(EnvBotEnabled, tc.bot)
+			if got := BotEnabled(); got != tc.wantBot {
+				t.Errorf("BotEnabled()=%v, want %v (global=%q bot=%q)", got, tc.wantBot, tc.global, tc.bot)
+			}
+		})
+	}
+}
+
 func TestPushDisplayText(t *testing.T) {
 	if got := PushDisplayText([]byte(`{"type":17,"plain":"审批单 #42","card":{}}`)); got != "审批单 #42" {
 		t.Errorf("优先取权威 plain, got %q", got)

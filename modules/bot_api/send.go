@@ -95,8 +95,10 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 	// （该子路径 fromUID 仍是 bot —— 拒绝是刻意的过度拒绝，P2 复议）；
 	// (b) 脏卡片 fail-fast，鉴权路径不跑在毒输入上（与上方 OBO 保留键同序）。
 	if cardmsg.IsCardPayload(req.Payload) {
-		if !cardmsg.Enabled() {
-			// Decision 2 rollout gate：客户端渲染门禁发布前默认关闭。
+		if !cardmsg.BotEnabled() {
+			// bot 侧有效门禁：总开关 OCTO_CARD_MESSAGE_ENABLED（Decision 2 rollout
+			// gate）AND bot 子开关 OCTO_BOT_CARD_ENABLED。与 /v1/bot/card/profile 的
+			// enabled 同源，故 profile 报什么、这里就受理什么。
 			httperr.ResponseErrorL(c, errcode.ErrBotAPICardDisabled, nil, nil)
 			return
 		}
