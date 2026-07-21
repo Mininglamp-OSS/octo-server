@@ -1,0 +1,171 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "文档访问申请卡数据契约",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "requestId",
+    "state",
+    "document",
+    "requester",
+    "permission",
+    "requestReason",
+    "requestedAtDisplay",
+    "messageTimeDisplay"
+  ],
+  "properties": {
+    "requestId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "文档服务中的访问申请唯一 ID",
+      "examples": [
+        "DOC-REQ-024"
+      ]
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "approved",
+        "rejected"
+      ],
+      "description": "卡片业务状态"
+    },
+    "document": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "title",
+        "url",
+        "sourceName"
+      ],
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "description": "文档标题"
+        },
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https://",
+          "description": "文档 HTTPS 地址"
+        },
+        "sourceName": {
+          "type": "string",
+          "description": "文档所在空间或目录"
+        }
+      }
+    },
+    "requester": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "avatarUrl"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "申请人展示名称"
+        },
+        "avatarUrl": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https://",
+          "description": "申请人 HTTPS 头像"
+        }
+      }
+    },
+    "permission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "label",
+        "roleLabel"
+      ],
+      "properties": {
+        "label": {
+          "type": "string",
+          "description": "权限标签，例如协作权限"
+        },
+        "roleLabel": {
+          "type": "string",
+          "description": "申请后的角色，例如协作者"
+        }
+      }
+    },
+    "requestReason": {
+      "type": "string",
+      "description": "申请原因"
+    },
+    "requestedAtDisplay": {
+      "type": "string",
+      "description": "人员行右侧展示时间"
+    },
+    "messageTimeDisplay": {
+      "type": "string",
+      "description": "页脚申请或处理时间"
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operatorName",
+        "decidedAtDisplay"
+      ],
+      "properties": {
+        "operatorName": {
+          "type": "string",
+          "description": "审批人展示名称"
+        },
+        "decidedAtDisplay": {
+          "type": "string",
+          "description": "审批时间"
+        },
+        "rejectionReason": {
+          "type": "string",
+          "description": "拒绝原因，仅 rejected 必填"
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "enum": [
+              "approved",
+              "rejected"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "decision"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "const": "rejected"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "decision": {
+            "required": [
+              "rejectionReason"
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

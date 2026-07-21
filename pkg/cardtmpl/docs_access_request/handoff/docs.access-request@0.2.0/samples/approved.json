@@ -1,0 +1,24 @@
+{
+  "requestId": "DOC-REQ-024",
+  "state": "approved",
+  "document": {
+    "title": "2026 Q3 OKR",
+    "url": "https://example.com/documents/2026-q3-okr",
+    "sourceName": "Q3 产品规划"
+  },
+  "requester": {
+    "name": "张三",
+    "avatarUrl": "https://api.dicebear.com/9.x/initials/svg?seed=Zhang%20San&backgroundColor=f2f3f4&fontSize=40"
+  },
+  "permission": {
+    "label": "协作权限",
+    "roleLabel": "协作者"
+  },
+  "requestReason": "希望加入协作，以补充 KR3 数据。",
+  "requestedAtDisplay": "2026-07-16 11:00",
+  "messageTimeDisplay": "刚刚",
+  "decision": {
+    "operatorName": "林澈",
+    "decidedAtDisplay": "刚刚"
+  }
+}

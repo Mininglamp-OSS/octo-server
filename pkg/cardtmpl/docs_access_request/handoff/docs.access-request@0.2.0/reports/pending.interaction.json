@@ -1,0 +1,83 @@
+{
+  "actions": [
+    {
+      "path": "$.body[1].items[0].selectAction",
+      "type": "Action.OpenUrl"
+    },
+    {
+      "path": "$.body[1].items[4].items[4].actions[0]",
+      "type": "Action.ToggleVisibility"
+    },
+    {
+      "path": "$.body[1].items[4].items[4].actions[1]",
+      "type": "Action.Submit",
+      "id": "deny",
+      "associatedInputs": "auto",
+      "dataKeys": [
+        "action",
+        "request_id"
+      ],
+      "inputIds": [
+        "deny_reason"
+      ]
+    },
+    {
+      "path": "$.body[2].items[0].columns[1].items[0].actions[0]",
+      "type": "Action.OpenUrl",
+      "id": "view_document"
+    },
+    {
+      "path": "$.body[2].items[0].columns[1].items[0].actions[1]",
+      "type": "Action.ToggleVisibility"
+    },
+    {
+      "path": "$.body[2].items[0].columns[1].items[0].actions[2]",
+      "type": "Action.Submit",
+      "id": "approve",
+      "associatedInputs": "none",
+      "dataKeys": [
+        "action",
+        "request_id"
+      ],
+      "inputIds": []
+    }
+  ],
+  "inputs": [
+    {
+      "path": "$.body[1].items[4].items[2]",
+      "id": "deny_reason",
+      "type": "Input.Text",
+      "isRequired": true,
+      "isVisible": false,
+      "maxLength": 200
+    }
+  ],
+  "toggles": [
+    {
+      "path": "$.body[1].items[4].items[4].actions[0]",
+      "targets": [
+        {
+          "elementId": "deny_panel",
+          "isVisible": false
+        },
+        {
+          "elementId": "primary_actions",
+          "isVisible": true
+        }
+      ]
+    },
+    {
+      "path": "$.body[2].items[0].columns[1].items[0].actions[1]",
+      "targets": [
+        {
+          "elementId": "deny_panel",
+          "isVisible": true
+        },
+        {
+          "elementId": "primary_actions",
+          "isVisible": false
+        }
+      ]
+    }
+  ]
+}

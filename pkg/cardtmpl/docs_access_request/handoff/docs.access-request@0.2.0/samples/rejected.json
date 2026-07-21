@@ -1,0 +1,25 @@
+{
+  "requestId": "DOC-REQ-025",
+  "state": "rejected",
+  "document": {
+    "title": "2026 Q3 产品路线图",
+    "url": "https://example.com/documents/2026-q3-roadmap",
+    "sourceName": "Q3 产品规划"
+  },
+  "requester": {
+    "name": "李四",
+    "avatarUrl": "https://api.dicebear.com/9.x/initials/svg?seed=Li%20Si&backgroundColor=f2f3f4&fontSize=40"
+  },
+  "permission": {
+    "label": "查看权限",
+    "roleLabel": "查看者"
+  },
+  "requestReason": "申请查看权限，用于对齐 Q3 交付节奏。",
+  "requestedAtDisplay": "2026-07-16 11:15",
+  "messageTimeDisplay": "刚刚",
+  "decision": {
+    "operatorName": "林澈",
+    "decidedAtDisplay": "刚刚",
+    "rejectionReason": "信息不完整，请补充用途说明。"
+  }
+}
