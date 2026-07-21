@@ -1397,7 +1397,12 @@ func (m *Message) syncChannelMessage(c *wkhttp.Context) {
 	if len(channelSettings) > 0 && channelSettings[0].OffsetMessageSeq > 0 {
 		channelOffsetMessageSeq = channelSettings[0].OffsetMessageSeq
 	}
-	syncResp := newSyncChannelMessageResp(resp, c.GetLoginUID(), req.DeviceUUID, req.ChannelID, req.ChannelType, m.messageExtraDB, m.messageUserExtraDB, m.messageReactionDB, m.channelOffsetDB, m.deviceOffsetDB, channelOffsetMessageSeq)
+	syncResp, err := newSyncChannelMessageResp(resp, c.GetLoginUID(), req.DeviceUUID, req.ChannelID, req.ChannelType, m.messageExtraDB, m.messageUserExtraDB, m.messageReactionDB, m.channelOffsetDB, m.deviceOffsetDB, channelOffsetMessageSeq)
+	if err != nil {
+		m.Error("构建同步消息响应失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+		return
+	}
 
 	// 群消息中的 ThreadCreated 消息：用实时数据覆盖 payload 中的快照字段
 	if req.ChannelType == common.ChannelTypeGroup.Uint8() {
@@ -2982,7 +2987,7 @@ type syncChannelMessageResp struct {
 	Messages        []*MsgSyncResp  `json:"messages"`          // 消息数据
 }
 
-func newSyncChannelMessageResp(resp *config.SyncChannelMessageResp, loginUID string, deviceUUID string, channelID string, channelType uint8, messageExtraDB *messageExtraDB, messageUserExtraDB *messageUserExtraDB, messageReactionDB *messageReactionDB, channelOffsetDB *channelOffsetDB, deviceOffsetDB *deviceOffsetDB, channelOffsetMessageSeq uint32) *syncChannelMessageResp {
+func newSyncChannelMessageResp(resp *config.SyncChannelMessageResp, loginUID string, deviceUUID string, channelID string, channelType uint8, messageExtraDB *messageExtraDB, messageUserExtraDB *messageUserExtraDB, messageReactionDB *messageReactionDB, channelOffsetDB *channelOffsetDB, deviceOffsetDB *deviceOffsetDB, channelOffsetMessageSeq uint32) (*syncChannelMessageResp, error) {
 	messages := make([]*MsgSyncResp, 0, len(resp.Messages))
 	if len(resp.Messages) > 0 {
 		messageIDs := make([]string, 0, len(resp.Messages))
@@ -3012,7 +3017,12 @@ func newSyncChannelMessageResp(resp *config.SyncChannelMessageResp, loginUID str
 		// 消息全局扩张
 		messageExtras, err := messageExtraDB.queryWithMessageIDsAndUID(messageIDs, loginUID)
 		if err != nil {
+			// fail-closed：撤回脱敏依赖 message_extra.revoke。查询失败则 messageExtraMap
+			// 为空，from() 拿不到 Revoke=1、会漏做脱敏并原样下发撤回原文。此处中止整个
+			// 同步、把 error 冒泡给调用方返回错误响应，与单条直查 api_message_get.go 同口径，
+			// 绝不带着不完整的撤回信息继续。
 			log.Error("查询消息扩展字段失败！", zap.Error(err))
+			return nil, err
 		}
 		// 修改消息扩展字段
 		for _, message := range resp.Messages {
@@ -3122,7 +3132,7 @@ func newSyncChannelMessageResp(resp *config.SyncChannelMessageResp, loginUID str
 		EndMessageSeq:   resp.EndMessageSeq,
 		PullMode:        resp.PullMode,
 		Messages:        messages,
-	}
+	}, nil
 }
 
 // 消息头

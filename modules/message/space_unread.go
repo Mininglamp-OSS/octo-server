@@ -202,7 +202,18 @@ func findSpaceLastMessageFallback(
 	// payload，绕过了主 sync 路径 from() 的撤回脱敏，会把撤回原文当成「最后一条消息」
 	// 泄漏。批量查出撤回集合，遍历时与已删除消息一并跳过（与 api_channel_files.go
 	// 过滤撤回消息同口径）。
-	revokedSet := revokedMessageIDSet(resp.Messages, messageExtraDB)
+	//
+	// fail-closed：撤回集合查询失败时，无法判定哪些消息已撤回，宁可不下发预览兜底，
+	// 也不能把可能已撤回的原文当成 space_last_message 泄漏（与 api_channel_files.go
+	// filterMessages 出错即中止、绝不下发未过滤数据同口径）。
+	revokedSet, err := revokedMessageIDSet(resp.Messages, messageExtraDB)
+	if err != nil {
+		log.Warn("findSpaceLastMessageFallback: 查询撤回集合失败，跳过预览兜底",
+			zap.Error(err),
+			zap.String("channelID", channelID),
+			zap.String("loginUID", loginUID))
+		return nil
+	}
 	chosen := selectSpaceLastMessage(resp.Messages, revokedSet, spaceID, defaultSpaceID, isSysBot)
 	if chosen == nil {
 		return nil
@@ -238,11 +249,13 @@ func selectSpaceLastMessage(
 }
 
 // revokedMessageIDSet 批量查询给定消息里已撤回（message_extra.revoke=1）的 message_id 集合。
-// messageExtraDB 为空（如单测未注入）时返回空集合，即不跳过任何消息。
-func revokedMessageIDSet(messages []*config.MessageResp, messageExtraDB *messageExtraDB) map[string]bool {
+// messageExtraDB 为空（如单测未注入）或消息为空时返回空集合、nil error，即不跳过任何消息。
+// 查询出错时返回 error（fail-closed）：调用方须据此中止预览兜底，绝不能拿一个「谁都没撤回」
+// 的空集合继续，否则会把已撤回原文当成 space_last_message 下发（见 findSpaceLastMessageFallback）。
+func revokedMessageIDSet(messages []*config.MessageResp, messageExtraDB *messageExtraDB) (map[string]bool, error) {
 	set := make(map[string]bool)
 	if messageExtraDB == nil || len(messages) == 0 {
-		return set
+		return set, nil
 	}
 	ids := make([]string, 0, len(messages))
 	for _, msg := range messages {
@@ -250,13 +263,12 @@ func revokedMessageIDSet(messages []*config.MessageResp, messageExtraDB *message
 	}
 	revoked, err := messageExtraDB.queryRevokedWithMessageIDs(ids)
 	if err != nil {
-		log.Warn("revokedMessageIDSet: 查询撤回消息失败", zap.Error(err))
-		return set
+		return nil, err
 	}
 	for _, e := range revoked {
 		set[e.MessageID] = true
 	}
-	return set
+	return set, nil
 }
 
 // msgRespToSyncResp 将 config.MessageResp 转换为 MsgSyncResp（用于预览）。

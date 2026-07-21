@@ -241,10 +241,17 @@ func TestSelectSpaceLastMessage_SkipsRevoked(t *testing.T) {
 	})
 }
 
-// TestRevokedMessageIDSet_NilDB 校验注入的 messageExtraDB 为空时返回空集合（不跳过），
-// 保证纯逻辑单测路径不依赖 DB。
+// TestRevokedMessageIDSet_NilDB 校验注入的 messageExtraDB 为空时返回空集合、nil error
+// （不跳过），保证纯逻辑单测路径不依赖 DB。查询出错的 fail-closed 语义（返回 error →
+// findSpaceLastMessageFallback 跳过预览兜底）依赖真实 DB，由 infra-gated 集成测试覆盖。
 func TestRevokedMessageIDSet_NilDB(t *testing.T) {
 	msgs := []*config.MessageResp{{MessageID: 1}, {MessageID: 2}}
-	assert.Empty(t, revokedMessageIDSet(msgs, nil))
-	assert.Empty(t, revokedMessageIDSet(nil, nil))
+
+	set, err := revokedMessageIDSet(msgs, nil)
+	assert.NoError(t, err)
+	assert.Empty(t, set)
+
+	set, err = revokedMessageIDSet(nil, nil)
+	assert.NoError(t, err)
+	assert.Empty(t, set)
 }
