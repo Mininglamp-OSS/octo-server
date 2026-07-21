@@ -160,3 +160,69 @@ func TestSpaceWelcomeConfigStore_UpsertMerged_NoLostUpdate(t *testing.T) {
 	assert.Equal(t, "msg-A", row.Message, "admin A's message must not be lost")
 	assert.False(t, row.Enabled, "admin B's disable must not be lost")
 }
+
+// TestSpaceWelcomeConfigStore_UpsertMerged_ConcurrentCreate is the concurrent
+// FIRST-create regression (reviewer-requested): two admins issue the first PUT
+// for the SAME absent config at once, each patching a different field. A plain
+// SELECT ... FOR UPDATE cannot lock a not-yet-existing row, so without the
+// insert-then-lock strategy both would merge onto defaults and the later write
+// would clobber the earlier's field. With it, the second create serializes on
+// the row the first inserted and merges onto its committed state — both fields
+// survive and there is exactly one row (no duplicate, no error).
+func TestSpaceWelcomeConfigStore_UpsertMerged_ConcurrentCreate(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	t.Cleanup(func() { _ = testutil.CleanAllTables(ctx) })
+
+	store := NewSpaceWelcomeConfigStore(ctx.DB())
+	bg := context.Background()
+
+	// No seed row: this is a first-time create race for an ABSENT config.
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Admin A: create with a message only (leaves enabled at default false).
+	go func() {
+		defer wg.Done()
+		<-start
+		_, err := store.UpsertMerged(bg, "spc_new", time.Now().UTC(),
+			func(cur *SpaceWelcomeSpaceConfig, found bool) (SpaceWelcomeSpaceConfig, error) {
+				next := SpaceWelcomeSpaceConfig{SpaceID: "spc_new"}
+				if cur != nil {
+					next = *cur
+				}
+				next.Message = "msg-A"
+				next.UpdatedBy = "admin_A"
+				return next, nil
+			})
+		assert.NoError(t, err)
+	}()
+
+	// Admin B: create with enabled=true only (leaves message at default "").
+	go func() {
+		defer wg.Done()
+		<-start
+		_, err := store.UpsertMerged(bg, "spc_new", time.Now().UTC(),
+			func(cur *SpaceWelcomeSpaceConfig, found bool) (SpaceWelcomeSpaceConfig, error) {
+				next := SpaceWelcomeSpaceConfig{SpaceID: "spc_new"}
+				if cur != nil {
+					next = *cur
+				}
+				next.Enabled = true
+				next.UpdatedBy = "admin_B"
+				return next, nil
+			})
+		assert.NoError(t, err)
+	}()
+
+	close(start)
+	wg.Wait()
+
+	// Exactly one row, and neither admin's field was lost.
+	row, found, err := store.Get(bg, "spc_new")
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, "msg-A", row.Message, "admin A's message must not be lost on concurrent create")
+	assert.True(t, row.Enabled, "admin B's enable must not be lost on concurrent create")
+}

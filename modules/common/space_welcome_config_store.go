@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	mysql "github.com/go-sql-driver/mysql"
 	"github.com/gocraft/dbr/v2"
 )
 
@@ -145,23 +146,33 @@ func (s *SpaceWelcomeConfigStore) Upsert(ctx context.Context, cfg SpaceWelcomeSp
 	return nil
 }
 
+// spaceWelcomeUpsertMaxAttempts bounds the insert-then-lock retry on a transient
+// InnoDB deadlock / lock-wait-timeout (see UpsertMerged).
+const spaceWelcomeUpsertMaxAttempts = 3
+
 // UpsertMerged performs a read-modify-write of the per-Space config inside a
-// single transaction that holds a row lock (SELECT ... FOR UPDATE), closing the
-// lost-update window when two admins PUT the same Space concurrently: the second
-// transaction blocks on the first's row lock, then re-reads the just-written
-// state before merge runs, so neither admin's fields are silently reverted.
+// transaction, serialized so that two admins PUTting the same Space concurrently
+// never lose each other's fields — whether they are editing an existing config
+// OR both creating it for the first time.
 //
-// merge receives the current row (found=false when absent) and returns the
-// config to persist. A non-nil error from merge aborts the write (the tx rolls
-// back) and is returned verbatim — callers use this to surface validation
-// failures without writing. On success the persisted row, re-read inside the tx,
-// is returned. now is the app-computed UTC timestamp for created_at/updated_at.
+// It uses an insert-then-lock strategy: first an idempotent INSERT ... ON
+// DUPLICATE KEY UPDATE ensures the row exists (no-op if it already does), THEN a
+// SELECT ... FOR UPDATE locks that now-guaranteed row before merge runs. This is
+// the fix for concurrent FIRST creates: a plain SELECT ... FOR UPDATE cannot
+// lock a row that does not exist yet, so two creators would both merge onto
+// defaults and the later write would clobber the earlier's disjoint field (or
+// gap-lock deadlock under REPEATABLE READ). Doing the INSERT first — without a
+// preceding gap-locking SELECT — gives the lock a real row to serialize on and
+// avoids the gap-lock deadlock (the config table has a single UNIQUE key, so
+// concurrent same-key inserts are a linear wait, not a cycle). A rare transient
+// deadlock/lock-timeout is retried up to spaceWelcomeUpsertMaxAttempts.
 //
-// Note: FOR UPDATE only locks an existing row; two racing first-creates of the
-// same space_id are still resolved last-writer-wins by the UNIQUE key +
-// ON DUPLICATE KEY UPDATE (no torn state, no error). The lost-update the
-// reviewers flagged is co-admins editing an existing config, which the row lock
-// fully serializes.
+// merge receives the current row (found=false when this PUT just created the
+// default row) and returns the config to persist. A non-nil error from merge
+// aborts the write (tx rolls back) and is returned verbatim — callers use it to
+// surface validation failures without writing, and it is never retried. On
+// success the persisted row, re-read inside the tx, is returned. now is the
+// app-computed UTC timestamp for created_at/updated_at.
 func (s *SpaceWelcomeConfigStore) UpsertMerged(
 	ctx context.Context,
 	spaceID string,
@@ -171,51 +182,87 @@ func (s *SpaceWelcomeConfigStore) UpsertMerged(
 	if spaceID == "" {
 		return nil, errors.New("space welcome upsert: empty space id")
 	}
+	var lastErr error
+	for attempt := 1; attempt <= spaceWelcomeUpsertMaxAttempts; attempt++ {
+		cfg, err := s.upsertMergedOnce(ctx, spaceID, now, merge)
+		if err == nil {
+			return cfg, nil
+		}
+		// A merge (validation) error and any non-transient DB error are terminal
+		// and surfaced verbatim so the caller's errors.Is checks still work.
+		if !isRetryableTxErr(err) {
+			return nil, err
+		}
+		lastErr = err
+	}
+	return nil, fmt.Errorf("upsert space welcome config: retries exhausted: %w", lastErr)
+}
+
+// upsertMergedOnce is a single insert-then-lock attempt; see UpsertMerged.
+func (s *SpaceWelcomeConfigStore) upsertMergedOnce(
+	ctx context.Context,
+	spaceID string,
+	now time.Time,
+	merge func(cur *SpaceWelcomeSpaceConfig, found bool) (SpaceWelcomeSpaceConfig, error),
+) (*SpaceWelcomeSpaceConfig, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin space welcome upsert tx: %w", err)
 	}
 	defer tx.RollbackUnlessCommitted()
 
+	// 1) Ensure the row exists (idempotent). The ON DUPLICATE clause is a no-op
+	//    (space_id=space_id) so an existing row's fields — and its created_at —
+	//    are untouched. affected==1 => inserted (this PUT is a first create);
+	//    affected==0 => the row already existed.
+	res, err := tx.InsertBySql(
+		"INSERT INTO "+spaceWelcomeConfigTable+" (space_id, enabled, active_from, message, updated_by, created_at, updated_at) "+
+			"VALUES (?, 0, '', '', '', ?, ?) ON DUPLICATE KEY UPDATE space_id=space_id",
+		spaceID, now, now,
+	).ExecContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("ensure space welcome row: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("ensure space welcome row affected: %w", err)
+	}
+	created := affected == 1
+
+	// 2) Lock the now-existing row and read the current state under the lock.
 	var row spaceWelcomeConfigRow
-	found := true
 	if err := tx.SelectBySql(
 		"SELECT "+spaceWelcomeConfigCols+" FROM "+spaceWelcomeConfigTable+" WHERE space_id=? FOR UPDATE",
 		spaceID,
 	).LoadOneContext(ctx, &row); err != nil {
-		if errors.Is(err, dbr.ErrNotFound) {
-			found = false
-		} else {
-			return nil, fmt.Errorf("lock space welcome config: %w", err)
-		}
+		return nil, fmt.Errorf("lock space welcome config: %w", err)
 	}
 
+	// 3) Merge. found=false when we just created the default row, so the caller
+	//    starts from its own defaults (identical to the inserted default row).
 	var cur *SpaceWelcomeSpaceConfig
-	if found {
+	if !created {
 		c := row.toConfig()
 		cur = &c
 	}
-	next, err := merge(cur, found)
+	next, err := merge(cur, !created)
 	if err != nil {
-		return nil, err
+		return nil, err // terminal (validation): surfaced verbatim, tx rolls back
 	}
 
+	// 4) Persist with a plain UPDATE (row guaranteed present; created_at preserved).
 	enabled := 0
 	if next.Enabled {
 		enabled = 1
 	}
-	if _, err := tx.InsertBySql(
-		"INSERT INTO "+spaceWelcomeConfigTable+" (space_id, enabled, active_from, message, updated_by, created_at, updated_at) "+
-			"VALUES (?, ?, ?, ?, ?, ?, ?) "+
-			"ON DUPLICATE KEY UPDATE enabled=VALUES(enabled), active_from=VALUES(active_from), "+
-			"message=VALUES(message), updated_by=VALUES(updated_by), updated_at=VALUES(updated_at)",
-		next.SpaceID, enabled, next.ActiveFromRaw, next.Message, next.UpdatedBy, now, now,
+	if _, err := tx.UpdateBySql(
+		"UPDATE "+spaceWelcomeConfigTable+" SET enabled=?, active_from=?, message=?, updated_by=?, updated_at=? WHERE space_id=?",
+		enabled, next.ActiveFromRaw, next.Message, next.UpdatedBy, now, spaceID,
 	).ExecContext(ctx); err != nil {
-		return nil, fmt.Errorf("upsert space welcome config: %w", err)
+		return nil, fmt.Errorf("update space welcome config: %w", err)
 	}
 
-	// Re-read inside the tx so the returned view reflects the persisted row
-	// (created_at from the original insert, updated_at=now).
+	// 5) Re-read inside the tx so the returned view reflects the persisted row.
 	var out spaceWelcomeConfigRow
 	if err := tx.SelectBySql(
 		"SELECT "+spaceWelcomeConfigCols+" FROM "+spaceWelcomeConfigTable+" WHERE space_id=?",
@@ -228,6 +275,16 @@ func (s *SpaceWelcomeConfigStore) UpsertMerged(
 	}
 	cfg := out.toConfig()
 	return &cfg, nil
+}
+
+// isRetryableTxErr reports whether err is a transient InnoDB deadlock (1213) or
+// lock-wait timeout (1205) that a fresh attempt may resolve.
+func isRetryableTxErr(err error) bool {
+	var myErr *mysql.MySQLError
+	if errors.As(err, &myErr) {
+		return myErr.Number == 1213 || myErr.Number == 1205
+	}
+	return false
 }
 
 // Delete hard-deletes the per-Space config row. deleted=false when none existed

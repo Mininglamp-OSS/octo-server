@@ -48,9 +48,10 @@ type putWelcomeReq struct {
 // welcomeEffectiveResp describes the config actually in effect for the Space,
 // after resolving per-Space over global fallback.
 type welcomeEffectiveResp struct {
-	Enabled bool   `json:"enabled"`
-	Source  string `json:"source"` // space | global | none
-	Message string `json:"message"`
+	Enabled    bool   `json:"enabled"`
+	Source     string `json:"source"`      // space | global | none
+	ActiveFrom string `json:"active_from"` // effective RFC3339 window start ("" when off/unset)
+	Message    string `json:"message"`
 }
 
 // welcomeConfigResp is the GET/PUT response.
@@ -233,9 +234,10 @@ func buildWelcomeResp(row *commonmod.SpaceWelcomeSpaceConfig, found bool, eff co
 		}
 	}
 	resp.Effective = welcomeEffectiveResp{
-		Enabled: eff.Enabled,
-		Message: eff.Message,
-		Source:  welcomeSource(found, eff),
+		Enabled:    eff.Enabled,
+		Message:    eff.Message,
+		Source:     welcomeSource(found, eff),
+		ActiveFrom: eff.ActiveFromRaw,
 	}
 	return resp
 }

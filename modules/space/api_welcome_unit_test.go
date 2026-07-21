@@ -57,7 +57,7 @@ func TestBuildWelcomeResp(t *testing.T) {
 			UpdatedBy:     "u_admin",
 			UpdatedAt:     time.Date(2026, 7, 10, 1, 2, 3, 0, time.UTC),
 		}
-		eff := commonmod.SpaceWelcomeConfig{Enabled: true, SpaceID: "spc_1", Message: "hello\nworld"}
+		eff := commonmod.SpaceWelcomeConfig{Enabled: true, SpaceID: "spc_1", ActiveFromRaw: "2026-07-10T00:00:00Z", Message: "hello\nworld"}
 		resp := buildWelcomeResp(row, true, eff)
 		if !resp.Configured || !resp.Enabled {
 			t.Fatalf("Configured/Enabled = %v/%v, want true/true", resp.Configured, resp.Enabled)
@@ -70,6 +70,9 @@ func TestBuildWelcomeResp(t *testing.T) {
 		}
 		if resp.Effective.Source != "space" || !resp.Effective.Enabled {
 			t.Fatalf("effective = %+v, want source=space enabled=true", resp.Effective)
+		}
+		if resp.Effective.ActiveFrom != "2026-07-10T00:00:00Z" {
+			t.Fatalf("effective active_from = %q, want the resolved window start", resp.Effective.ActiveFrom)
 		}
 	})
 
