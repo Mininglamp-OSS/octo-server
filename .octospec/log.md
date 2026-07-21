@@ -4,6 +4,30 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-21 (space-welcome-per-space-admin-crud)
+
+- **Feature** — The onboarding welcome message became **per-Space and
+  self-service**. Space admins (Role>=1) CRUD one config per Space via
+  `GET/PUT/DELETE /v1/space/:space_id/welcome` (new `octo_space_welcome_config`
+  table + `common.SpaceWelcomeConfigStore`). Follows #604/#606 which shipped a
+  single platform-designated Space, superadmin-only; lifts that task's
+  out-of-scope "per-Space admin self-service" item into scope.
+- **Precedence** — A present per-Space row wins over the platform-global config
+  outright, even when disabled (opt a Space out of a global campaign); no row →
+  the global config applies iff it names the Space; else off. Global config kept
+  as a superadmin fallback. Ships `enabled=false` per Space (no behavior change).
+- **Delivery driver** — notify's event/reconciler/worker went single-Space →
+  all-enabled-Spaces, resolving the per-Space effective config each cycle. Both
+  reconciler and worker rotate a per-replica cursor over the enabled set for
+  fairness (a greedy in-order worker starved tail Spaces under sustained load —
+  see [learning](learnings/pending/multi-space-worker-rotating-cursor.md)).
+  Cross-space sweep added (`idx_sweep`); ledger state machine / at-most-once /
+  sender identity unchanged.
+- **Verified** — all gates + `-race` suites green; real-wire e2e against live
+  MySQL/Redis/WuKongIM confirmed actual receipt and no cross-Space mixing (each
+  recipient's channel read back from the IM). See
+  [journal](journal/shared/space-welcome-per-space-admin-crud.md).
+
 ## 2026-07-20 (github-webhook-parity)
 
 - **Feature** — GitHub `pull_request`/`issues` InteractiveCards gained
