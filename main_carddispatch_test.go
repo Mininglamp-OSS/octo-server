@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"strings"
 	"testing"
@@ -148,6 +149,44 @@ func TestConfiguredApprovalRouteAddsOwnerBoundV2Producer(t *testing.T) {
 	if len(spec.AllowedProfiles) != 1 || spec.AllowedProfiles[0] != cardmsg.ProfileV2 {
 		t.Fatalf("profiles = %v, want [octo/v2]", spec.AllowedProfiles)
 	}
+}
+
+// TestCardActionDispatchInertWhenCardsDisabled pins the rollback story from the
+// runbook ("global OCTO_CARD_MESSAGE_ENABLED=false"): with the deployment gate
+// off, notify routes may stay in the config without crashing startup. The gate
+// is a master kill switch — the card_action ingress and the notify/approval send
+// paths already refuse cards when it is off, so the dispatch worker has no work
+// and must be skipped rather than demanded. Before the fix this panicked with
+// "action notify routes require OCTO_CARD_MESSAGE_ENABLED".
+//
+// The disabled branch never touches the *config.Context (Redis/worker
+// construction only happens on the enabled path), so a nil ctx exercises it
+// without standing up MySQL/Redis/WuKongIM.
+func TestCardActionDispatchInertWhenCardsDisabled(t *testing.T) {
+	t.Setenv("OCTO_CARD_MESSAGE_ENABLED", "false")
+	t.Setenv("OCTO_DOCS_APPROVAL_CARD_ENABLED", "false")
+	t.Setenv("OCTO_TASKS_CARD_ACTION_SECRET", strings.Repeat("a", 32))
+	t.Setenv("OCTO_TASKS_NOTIFY_TOKEN", strings.Repeat("b", 32))
+	t.Setenv("OCTO_CARD_ACTION_ROUTES", `[{"sender_uid":"notification","owner":"tasks","action_type":"task.execute.decision","url":"https://tasks.internal/v1/card-actions/decide","secret_env":"OCTO_TASKS_CARD_ACTION_SECRET","notify_token_env":"OCTO_TASKS_NOTIFY_TOKEN"}]`)
+
+	runtime, err := installCardActionDispatch(nil)
+	if err != nil {
+		t.Fatalf("installCardActionDispatch() with cards disabled must not error, got %v", err)
+	}
+	if runtime == nil {
+		t.Fatal("installCardActionDispatch() returned a nil runtime; boot dereferences it")
+	}
+	if runtime.dispatcher != nil {
+		t.Fatal("disabled gate must not construct a dispatch worker")
+	}
+	if runtime.redisClient != nil {
+		t.Fatal("disabled gate must not construct a redis consumer")
+	}
+	// Start/Stop must be safe no-ops so main's boot sequence does not panic.
+	if err := runtime.Start(context.Background()); err != nil {
+		t.Fatalf("inert runtime Start() must be a no-op, got %v", err)
+	}
+	runtime.Stop()
 }
 
 func TestConfiguredApprovalRouteRejectsNonNotificationSender(t *testing.T) {

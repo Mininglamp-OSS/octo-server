@@ -109,8 +109,18 @@ a network zone, or a public boundary.
 produced elsewhere. When present, it dynamically installs an `octo/v2`,
 DM-only producer bound to the route owner and the shared `notification` sender.
 The token must differ from the callback secret, `NOTIFY_INTERNAL_TOKEN`, every
-other owner token, and `OCTO_DOCS_NOTIFY_TOKEN`. `OCTO_CARD_MESSAGE_ENABLED`
-must be `true`.
+other owner token, and `OCTO_DOCS_NOTIFY_TOKEN`. The producer only sends cards
+while `OCTO_CARD_MESSAGE_ENABLED` is `true`.
+
+`OCTO_CARD_MESSAGE_ENABLED` is the deployment-level master gate. With it off
+(unset or `false`) octo-server still starts with routes left in the config: the
+gate is a kill switch, not a reason to crash. The card action ingress rejects
+every interaction and the notify/approval send paths refuse to emit cards, so no
+callback can enqueue; the dispatch worker is skipped and its Redis consumer is
+not started. Configured notify routes (and `OCTO_DOCS_APPROVAL_CARD_ENABLED`)
+are left inert and log a single startup `WARN` each, resuming automatically when
+the gate is flipped back on. This is exactly the documented rollback — flip the
+gate off without tearing down `OCTO_CARD_ACTION_ROUTES` and its secrets.
 
 The service creates the standard initial card through the existing notify API:
 
