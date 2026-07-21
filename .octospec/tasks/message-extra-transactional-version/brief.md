@@ -132,12 +132,13 @@ VALUES (1, 0, 0, 0);
   behavior (existing `GenSeq`), which a deploy also sees before the migration
   seeds the row and which test setups leave after `CleanAllTables`; this is not
   fail-closed. An unrecognized `mode` value or an unreadable row **does** fail
-  closed. `epoch` is never a write-abort condition (see D3). Guarding against a
-  row deleted while in transactional mode is the job of the optional
-  expected-mode config check (D9), not this read; the mode gauge still surfaces
-  `legacy` so an operator can detect an unexpected state. Environment variables
-  may assert an expected mode for rollout diagnostics, but must never select an
-  allocator independently of this DB row.
+  closed. `epoch` is never a write-abort condition (see D3). A row deleted while
+  in transactional mode is guarded by the **expected-mode check** on the state
+  read (`OCTO_MESSAGE_EXTRA_VERSION_EXPECTED_MODE`): when a deployment declares
+  `transactional`, a resolved mode that is not transactional (including a missing
+  row → legacy) fails closed. Unset makes no assertion (pre-migration deploys and
+  test setups keep the legacy default). Environment variables assert an expected
+  mode but must never select an allocator independently of this DB row.
 - Separately, add on the **existing `message_extra` table** the composite index
   the delta-sync read path needs: `(channel_id, channel_type, version)`. Today
   `message_extra` carries only `channel_idx (channel_id, channel_type)`, so the

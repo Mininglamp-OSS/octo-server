@@ -547,3 +547,57 @@ func TestReserveTx_BatchPaginatesViaCursor(t *testing.T) {
 		}
 	}
 }
+
+// TestExpectedModeGuard proves the D9 read-side safety net: a deployment that
+// declares OCTO_MESSAGE_EXTRA_VERSION_EXPECTED_MODE=transactional fails closed
+// when the resolved mode (including a missing row → legacy) is not transactional,
+// so a lost/deleted state row cannot silently revert to legacy after cutover.
+// Unset (the default used by every other test) makes no assertion.
+func TestExpectedModeGuard(t *testing.T) {
+	const env = "OCTO_MESSAGE_EXTRA_VERSION_EXPECTED_MODE"
+
+	t.Run("expected transactional, missing row fails closed", func(t *testing.T) {
+		ctx := setup(t, msgextraseq.ModeTransactional, 1000)
+		if _, err := ctx.DB().UpdateBySql("DELETE FROM `octo_message_extra_version_state`").Exec(); err != nil {
+			t.Fatalf("delete state: %v", err)
+		}
+		t.Setenv(env, "transactional")
+		s := msgextraseq.New(ctx)
+		tx, _ := ctx.DB().Begin()
+		if _, err := s.ReserveTx(tx, "c-x", 2, 1); !errors.Is(err, msgextraseq.ErrExpectedModeMismatch) {
+			t.Fatalf("err=%v want ErrExpectedModeMismatch", err)
+		}
+		_ = tx.Rollback()
+	})
+
+	t.Run("expected transactional, transactional row ok", func(t *testing.T) {
+		ctx := setup(t, msgextraseq.ModeTransactional, 1000)
+		t.Setenv(env, "transactional")
+		s := msgextraseq.New(ctx)
+		if got := reserveCommitted(t, ctx, s, "c-ok", 2, 1); len(got) != 1 {
+			t.Fatalf("len=%d want 1", len(got))
+		}
+	})
+
+	t.Run("expected legacy, transactional row fails closed", func(t *testing.T) {
+		ctx := setup(t, msgextraseq.ModeTransactional, 1000)
+		t.Setenv(env, "legacy")
+		s := msgextraseq.New(ctx)
+		tx, _ := ctx.DB().Begin()
+		if _, err := s.ReserveTx(tx, "c-x", 2, 1); !errors.Is(err, msgextraseq.ErrExpectedModeMismatch) {
+			t.Fatalf("err=%v want ErrExpectedModeMismatch", err)
+		}
+		_ = tx.Rollback()
+	})
+
+	t.Run("malformed expected fails closed", func(t *testing.T) {
+		ctx := setup(t, msgextraseq.ModeLegacy, 0)
+		t.Setenv(env, "bogus")
+		s := msgextraseq.New(ctx)
+		tx, _ := ctx.DB().Begin()
+		if _, err := s.ReserveTx(tx, "c-x", 2, 1); !errors.Is(err, msgextraseq.ErrExpectedModeMismatch) {
+			t.Fatalf("err=%v want ErrExpectedModeMismatch", err)
+		}
+		_ = tx.Rollback()
+	})
+}

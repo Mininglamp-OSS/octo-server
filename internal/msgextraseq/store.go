@@ -8,9 +8,11 @@ package msgextraseq
 //
 // The allocator is selected at runtime by the DB-authoritative state row
 // octo_message_extra_version_state (brief D2/D9). In mode=legacy it delegates to
-// the process-local octo-lib GenSeq HiLo allocator (the single allowlisted
-// GenSeq(MessageExtraSeqKey) call site in the codebase); in mode=transactional
-// it reserves versions from octo_message_extra_channel_seq under a row lock held
+// the process-local octo-lib GenSeq HiLo allocator; reserveLegacy here will
+// become the single allowlisted GenSeq(MessageExtraSeqKey) call site once the
+// existing production callers are migrated and the PR-2c source-guard test lands
+// (today those callers still call GenSeq directly). In mode=transactional it
+// reserves versions from octo_message_extra_channel_seq under a row lock held
 // until the caller commits, so commit order == version order and versions are
 // unique per storage channel across replicas.
 //
@@ -21,6 +23,7 @@ package msgextraseq
 import (
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
@@ -40,6 +43,11 @@ const (
 // stateSingletonID is the fixed primary key of the single allocator-state row.
 const stateSingletonID = 1
 
+// envExpectedMode optionally declares the allocator mode a deployment expects.
+// Unset makes no assertion; "legacy"/"transactional" fail closed on mismatch
+// (brief D9 read-side guard).
+const envExpectedMode = "OCTO_MESSAGE_EXTRA_VERSION_EXPECTED_MODE"
+
 // MaxReserveCount bounds a single reservation (brief D3). It matches this
 // module's existing chunk magnitude (api_manager.go). Callers that exceed it
 // either reject client input or reserve in chunks.
@@ -58,6 +66,9 @@ var (
 	ErrOverflow = errors.New("msgextraseq: version would exceed 2^53-1")
 	// ErrUnknownMode is returned when the state row carries an unrecognized mode.
 	ErrUnknownMode = errors.New("msgextraseq: unknown allocator mode")
+	// ErrExpectedModeMismatch is returned when the resolved mode does not match the
+	// deployment's OCTO_MESSAGE_EXTRA_VERSION_EXPECTED_MODE (or that env is malformed).
+	ErrExpectedModeMismatch = errors.New("msgextraseq: allocator mode does not match expected")
 	// ErrInvariantViolation is returned when a defensive post-write check fails.
 	ErrInvariantViolation = errors.New("msgextraseq: allocator invariant violated")
 )
@@ -78,11 +89,26 @@ type Store struct {
 		Error(string, ...zap.Field)
 		Warn(string, ...zap.Field)
 	}
+	// expected-mode guard, parsed once from envExpectedMode at construction.
+	expectedModeSet       bool
+	expectedMode          int
+	expectedModeMalformed bool
 }
 
 // New builds a Store bound to the given octo-lib context.
 func New(ctx *config.Context) *Store {
-	return &Store{ctx: ctx, logger: liblog.NewTLog("MsgExtraSeq")}
+	s := &Store{ctx: ctx, logger: liblog.NewTLog("MsgExtraSeq")}
+	switch os.Getenv(envExpectedMode) {
+	case "":
+		// no assertion
+	case "legacy":
+		s.expectedModeSet, s.expectedMode = true, ModeLegacy
+	case "transactional":
+		s.expectedModeSet, s.expectedMode = true, ModeTransactional
+	default:
+		s.expectedModeSet, s.expectedModeMalformed = true, true
+	}
+	return s
 }
 
 // ReserveTx reserves count message_extra versions for the given storage channel
@@ -154,36 +180,60 @@ func (s *Store) readStateForShare(tx *dbr.Tx) (State, error) {
 		stateSingletonID,
 	).LoadOne(&row)
 	metricStateLockWaitSeconds.Observe(time.Since(lockStart).Seconds())
+	var st State
 	if err != nil {
 		if errors.Is(err, dbr.ErrNotFound) {
 			// A missing state row defaults to legacy — the safe pre-task behavior
 			// (GenSeq), which is also what a deploy sees before the migration seeds
 			// the row, and what test setups leave after CleanAllTables. This is NOT
-			// fail-closed: legacy is the conservative default. Guarding against a row
-			// deleted while in transactional mode is the job of the optional
-			// expected-mode config check (D9), not this read. The gauge below still
-			// surfaces mode=legacy so an operator can detect an unexpected state.
-			st := State{Mode: ModeLegacy}
-			setAllocatorModeGauge(st.Mode)
-			metricCutoverFloor.Set(0)
-			return st, nil
+			// fail-closed by itself; the expected-mode guard below is what makes a
+			// lost/deleted row safe once a deployment expects transactional.
+			st = State{Mode: ModeLegacy}
+		} else {
+			return State{}, fmt.Errorf("msgextraseq: read state: %w", err)
 		}
-		return State{}, fmt.Errorf("msgextraseq: read state: %w", err)
+	} else {
+		if row.Mode != ModeLegacy && row.Mode != ModeTransactional {
+			return State{}, fmt.Errorf("%w: %d", ErrUnknownMode, row.Mode)
+		}
+		st = State{Mode: row.Mode, Epoch: uint64(row.Epoch), CutoverFloor: row.CutoverFloor}
 	}
-	if row.Mode != ModeLegacy && row.Mode != ModeTransactional {
-		return State{}, fmt.Errorf("%w: %d", ErrUnknownMode, row.Mode)
+	// Expected-mode guard (brief D9 read side): a deployment declares the mode it
+	// expects via OCTO_MESSAGE_EXTRA_VERSION_EXPECTED_MODE. If the resolved mode
+	// (including a missing row → legacy) does not match, fail closed. This is the
+	// durable safety net that stops a lost/deleted state row from silently
+	// re-enabling the legacy allocator after a transactional cutover. Unset (the
+	// default, and what tests use) makes no assertion, preserving the legacy
+	// default for pre-migration deploys and CleanAllTables-based test setups.
+	if err := s.assertExpectedMode(st.Mode); err != nil {
+		return State{}, err
 	}
-	st := State{Mode: row.Mode, Epoch: uint64(row.Epoch), CutoverFloor: row.CutoverFloor}
-	// Refresh observability gauges from the authoritative row.
+	// Refresh observability gauges from the resolved state.
 	setAllocatorModeGauge(st.Mode)
 	metricAllocatorEpoch.Set(float64(st.Epoch))
 	metricCutoverFloor.Set(float64(st.CutoverFloor))
 	return st, nil
 }
 
-// reserveLegacy delegates to the process-local octo-lib GenSeq allocator. This
-// is the ONLY call site allowed to call GenSeq with MessageExtraSeqKey; the
-// source-guard test (PR-2c) enforces the allowlist. count GenSeq calls yield
+// assertExpectedMode enforces the optional OCTO_MESSAGE_EXTRA_VERSION_EXPECTED_MODE
+// deployment guard. Unset → no assertion. A malformed value, or a resolved mode
+// that differs from the expectation, fails closed.
+func (s *Store) assertExpectedMode(mode int) error {
+	if !s.expectedModeSet {
+		return nil
+	}
+	if s.expectedModeMalformed {
+		return fmt.Errorf("%w: malformed %s", ErrExpectedModeMismatch, envExpectedMode)
+	}
+	if mode != s.expectedMode {
+		return fmt.Errorf("%w: expected %d, resolved %d", ErrExpectedModeMismatch, s.expectedMode, mode)
+	}
+	return nil
+}
+
+// reserveLegacy delegates to the process-local octo-lib GenSeq allocator. After
+// the writer cutover this becomes the single allowlisted GenSeq(MessageExtraSeqKey)
+// call site, enforced by the PR-2c source-guard test. count GenSeq calls yield
 // count distinct values, matching pre-task per-message behavior.
 func (s *Store) reserveLegacy(channelID string, count int) ([]int64, error) {
 	key := fmt.Sprintf("%s:%s", common.MessageExtraSeqKey, channelID)

@@ -35,3 +35,10 @@ VALUES (1, 0, 0, 0);
 -- MySQL 8.0 下朴素 CREATE INDEX 即 INPLACE/LOCK=NONE 在线(不 pin 算法，遵仓库约定)；
 -- message_extra 为大表，运维应安排低峰窗口 + 监控(时长问题，非阻塞)。
 CREATE INDEX `channel_version_idx` ON `message_extra` (`channel_id`,`channel_type`,`version`);
+
+-- +migrate Down
+
+-- 逆向:删索引 + 两张新表(纯增量,回滚无数据迁移)。message_extra 现有行不受影响。
+DROP INDEX `channel_version_idx` ON `message_extra`;
+DROP TABLE IF EXISTS `octo_message_extra_version_state`;
+DROP TABLE IF EXISTS `octo_message_extra_channel_seq`;
