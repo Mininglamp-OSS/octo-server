@@ -1,0 +1,46 @@
+# octospec Implement-phase context: rules resolved + files touched.
+slug: agent-message-reactions
+rules_injected:
+  - id: space-isolation
+    load_bearing: true
+    why: >
+      New bot reaction endpoint is an ACL-bearing write. Reuses the #603
+      validation (membership / DM friend-or-self / thread-not-deleted /
+      disband / visibility-to-viewer / DM per-Space isolation) via a shared
+      ReactionService; bot ownership validated (robotID) + App-Bot DM-only gate.
+  - id: error-handling
+    load_bearing: true
+    why: >
+      New endpoint + refactored user handler must use httperr.ResponseErrorL
+      with registered pkg/errcode codes; guard tests + i18n-extract-check +
+      i18n-lint must stay green. Wire contract of /v1/reactions preserved.
+  - id: rate-limit
+    load_bearing: true
+    why: >
+      Bot endpoint uses bot-token auth (authBot), consistent with every other
+      /v1/bot/* route — no SharedUIDRateLimiter (UID buckets don't apply to
+      bots) and no hand-rolled Redis counter. Documented no-op.
+  - id: testing
+    load_bearing: false
+    why: New bot_api reaction test + preserved message reaction tests.
+  - id: commit-style
+    load_bearing: false
+    why: Conventional Commits.
+files_planned:
+  server:
+    - modules/message/db_message_reaction.go       # + setReaction (idempotent)
+    - modules/message/service_reaction.go           # NEW ReactionService.WriteReaction
+    - modules/message/api.go                         # addOrCancelReaction delegates
+    - modules/bot_api/reaction.go                    # NEW botMessageReaction handler + route
+    - modules/bot_api/bot_api.go                     # wire reactionService + route
+    - pkg/errcode/message.go / bot_api.go            # reuse; add codes only if needed
+    - modules/bot_api/*_test.go                      # new reaction test
+  plugin_phaseA:
+    - src/api-fetch.ts                               # sendReaction primitive
+    - src/channel.ts                                 # reactions:true + getAvailableActions + react
+    - src/actions.ts                                 # react case (readReactionParams + resolveReactionMessageId)
+  plugin_phaseB:
+    - src/inbound.ts                                 # SDK ack-reaction wiring
+    - src/config-schema.ts                           # ackReaction/ackReactionScope (if needed)
+env:
+  test_infra: "MySQL+Redis+WuKongIM up locally (integration tests runnable)"

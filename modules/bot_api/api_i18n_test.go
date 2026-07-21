@@ -39,6 +39,7 @@ func TestBotAPINoLegacyResponseError(t *testing.T) {
 		"voice_adapter.go", "obo_api.go", "resolve_targets.go", "incoming_webhook.go",
 		"card_revision.go",
 		"card_profile.go",
+		"reaction.go",
 	}
 	banned := []string{
 		".ResponseError(",

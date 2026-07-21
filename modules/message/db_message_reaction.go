@@ -68,6 +68,25 @@ func (d *messageReactionDB) toggleReaction(model *reactionModel) (int, error) {
 	return isDeleted, err
 }
 
+// setReaction 对单个 (uid, message_id, channel_id, channel_type, emoji) 做「幂等」写：
+// 与 toggleReaction 不同，它把 is_deleted 显式落成入参目标值而非盲翻转 —— 供 Bot API
+// 的显式 add(isDeleted=0) / remove(isDeleted=1) 语义使用，天然重试安全（agent 侧超时
+// 重试不会像 toggle 那样把已点亮的 reaction 意外取消）。命中迁移 20260712000001 建的
+// 唯一索引触发 ON DUPLICATE KEY UPDATE，把该行覆盖为目标 is_deleted 并刷新 seq/name/
+// updated_at，单条语句原子完成。写后最终 is_deleted 恒等于入参（显式落值，无需回读）。
+func (d *messageReactionDB) setReaction(model *reactionModel, isDeleted int) (int, error) {
+	_, err := d.session.InsertBySql(
+		"INSERT INTO reaction_users (message_id, seq, channel_id, channel_type, uid, name, emoji, is_deleted) "+
+			"VALUES (?,?,?,?,?,?,?,?) "+
+			"ON DUPLICATE KEY UPDATE is_deleted = VALUES(is_deleted), seq = VALUES(seq), name = VALUES(name), updated_at = CURRENT_TIMESTAMP",
+		model.MessageID, model.Seq, model.ChannelID, model.ChannelType, model.UID, model.Name, model.Emoji, isDeleted,
+	).Exec()
+	if err != nil {
+		return 0, err
+	}
+	return isDeleted, nil
+}
+
 type reactionModel struct {
 	MessageID   string // 消息唯一ID
 	Seq         int64  // 回复序列号

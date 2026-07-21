@@ -59,3 +59,39 @@ func TestMessageReactionDB_ToggleReactionUpsertsAndReadsBack(t *testing.T) {
 	require.Equal(t, 1, isDeleted)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
+
+// TestMessageReactionDB_SetReactionIdempotent pins the Bot-API explicit add/remove
+// primitive: unlike toggleReaction's blind flip, setReaction writes is_deleted to
+// the requested target value (VALUES(is_deleted), not 1 - is_deleted) so a retried
+// add never cancels a live reaction. It also does NOT read back — the final state
+// equals the requested value, returned directly.
+func TestMessageReactionDB_SetReactionIdempotent(t *testing.T) {
+	model := func() *reactionModel {
+		return &reactionModel{
+			ChannelID: "group-a", ChannelType: 2, UID: "u1", Name: "User 1",
+			MessageID: "9001", Emoji: "👍", Seq: 7,
+		}
+	}
+
+	t.Run("add writes is_deleted=0 and returns it without a read-back", func(t *testing.T) {
+		db, mock, cleanup := newMockReactionDB(t)
+		defer cleanup()
+		mock.ExpectExec("INSERT INTO reaction_users .*VALUES \\('9001',7,'group-a',2,'u1','User 1','👍',0\\) ON DUPLICATE KEY UPDATE is_deleted = VALUES\\(is_deleted\\), seq = VALUES\\(seq\\), name = VALUES\\(name\\)").
+			WillReturnResult(sqlmock.NewResult(1, 1))
+		isDeleted, err := db.setReaction(model(), 0)
+		require.NoError(t, err)
+		require.Equal(t, 0, isDeleted)
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("remove writes is_deleted=1", func(t *testing.T) {
+		db, mock, cleanup := newMockReactionDB(t)
+		defer cleanup()
+		mock.ExpectExec("INSERT INTO reaction_users .*VALUES \\('9001',7,'group-a',2,'u1','User 1','👍',1\\) ON DUPLICATE KEY UPDATE is_deleted = VALUES\\(is_deleted\\)").
+			WillReturnResult(sqlmock.NewResult(1, 1))
+		isDeleted, err := db.setReaction(model(), 1)
+		require.NoError(t, err)
+		require.Equal(t, 1, isDeleted)
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+}

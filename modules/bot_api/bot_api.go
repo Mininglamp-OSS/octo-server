@@ -12,6 +12,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/message"
 	"github.com/Mininglamp-OSS/octo-server/modules/messages_search"
 	"github.com/Mininglamp-OSS/octo-server/modules/robot"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
@@ -143,6 +144,13 @@ type BotAPI struct {
 	// 从而共享限流桶与 sender 缓存。principal 由本模块的 resolveSearchPrincipal 按
 	// on_behalf_of 区分 as-bot / as-user(OBO)。
 	searchHandler *messages_search.Handler
+	// reactionService is the shared reaction write authority owned by the
+	// message module. The bot reaction endpoint (POST /v1/bot/message/reaction)
+	// delegates to it as-bot, reusing the exact ACL/visibility/text-only
+	// validation the user-facing /v1/reactions path uses (no divergence).
+	// Constructed standalone (NewReactionService) rather than message.New so we
+	// do NOT double-register message's group-member event listeners.
+	reactionService *message.ReactionService
 	log.Log
 }
 
@@ -204,6 +212,7 @@ func NewBotAPI(ctx *config.Context) *BotAPI {
 		maxBodySize:           maxBodySize,
 		maxFileSize:           maxFileSize,
 		searchHandler:         messages_search.Shared(ctx),
+		reactionService:       message.NewReactionService(ctx),
 		Log:                   log.NewTLog("BotAPI"),
 	}
 	// YUJ-1166 / Mininglamp-OSS/octo-server#81 — Persona Clone fan-out.
@@ -261,6 +270,7 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 		botAPI.GET("/upload/credentials", ba.botUploadCredentials)
 		botAPI.GET("/upload/presigned", ba.botUploadPresigned)
 		botAPI.POST("/message/edit", ba.botMessageEdit)
+		botAPI.POST("/message/reaction", ba.botMessageReaction)                // add/remove emoji reaction (as-bot, idempotent)
 		botAPI.POST("/message/card/revisions/clear", ba.botCardRevisionsClear) // D10.6 清除卡片修订(写墓碑)
 		botAPI.GET("/card/profile", ba.botCardProfile)                         // D12 卡片能力清单(feature detection)
 		botAPI.GET("/user/info", ba.getUserInfo)

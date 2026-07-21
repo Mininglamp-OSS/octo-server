@@ -35,6 +35,18 @@ func respondMessagePinnedLimitExceeded(c *wkhttp.Context, max int) {
 	httperr.ResponseErrorL(c, errcode.ErrMessagePinnedLimitExceeded, nil, i18n.Details{"max": max})
 }
 
+// respondReactionFailure maps a ReactionService failure onto the localized error
+// envelope. The service already logged any internal cause (zap.Error); here we
+// only surface the code (+ request-invalid field detail). Shared by the user
+// handler and — via message.ReactionFailure — by the Bot API reaction endpoint.
+func respondReactionFailure(c *wkhttp.Context, fail *ReactionFailure) {
+	details := i18n.Details{}
+	if fail.Field != "" {
+		details["field"] = fail.Field
+	}
+	httperr.ResponseErrorL(c, fail.Code, nil, details)
+}
+
 // errSharedAuthRequired / errSharedTokenInvalid cache the shared auth codes so
 // the per-handler login / token guards do not pay a registry lookup on every
 // miss. Looked up at package init; a missing registration panics loudly rather
