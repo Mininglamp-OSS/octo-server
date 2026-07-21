@@ -4,6 +4,31 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-20 (route-missing-retry)
+
+- **Fix** — Card-action dispatch (`internal/cardactiondispatch`) now **defers** a
+  `route_missing` at dispatch time (no attempt consumed) instead of dead-lettering on
+  the first attempt. An event only enters the queue when its route existed at enqueue
+  time, so a miss at dispatch means the process restarted into a run whose
+  `OCTO_CARD_ACTION_ROUTES` lacked the route while the durable queue carried the event
+  across — previously a permanent, non-self-healing DLQ that read at the UI as docs
+  approve/deny cards never updating. Deferring (rather than nacking) matters: a nack
+  spends `route.MaxAttempts`, so the event would trip `attempts_exhausted` the moment
+  its route returned. Within `routeMissingMaxWindow` (15m) the event waits and then
+  dispatches on its original attempt budget; past the window it dead-letters
+  (`reason=route_missing`) so a genuine misconfiguration stays visible. The attempt-budget
+  interaction was caught by an `xhigh` code review of the first (nack-based) cut. See
+  [brief](tasks/route-missing-retry/brief.md) · [journal](journal/shared/route-missing-retry.md).
+- **Learning (pending)** — `durable-queue-registry-divergence`: a durable/shared work
+  queue consumed against per-process, startup-loaded config can dead-letter valid work
+  across a config-divergent restart; treat "config absent at consume time" as a bounded
+  retry, not a first-attempt DLQ.
+- **Change (config)** — Card-action DLQ retention is now configurable via
+  `OCTO_CARD_ACTION_DLQ_RETENTION_DAYS` (whole days, 1–365) through a shared
+  `cardactiondispatch.DLQRetentionFromEnv` resolver used by both `main.go` and
+  `tools/card-action-dlq` (so they can't drift). **Default lowered 30 → 7 days**;
+  set the env higher for a longer recovery window. Doc updated.
+
 ## 2026-07-20 (github-webhook-parity)
 
 - **Feature** — GitHub `pull_request`/`issues` InteractiveCards gained

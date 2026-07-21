@@ -208,7 +208,11 @@ are reclaimed; a stale worker cannot renew or ACK another worker's lease.
 If a route has reached `max_in_flight`, its lease is atomically deferred for one
 poll interval without consuming an attempt, so other routes and shutdown remain
 unblocked.
-Live retention equals `Robot.MessageExpire`; DLQ retention is 30 days.
+Live retention equals `Robot.MessageExpire`. DLQ retention defaults to 7 days and
+is overridable via `OCTO_CARD_ACTION_DLQ_RETENTION_DAYS` (whole days, 1–365; empty
+or invalid values fall back to the default). The retention clock starts when the
+event is dead-lettered, and pruning is lazy (on `Depths()` / `ReplayDLQ`), so replay
+a dead-lettered event within the window.
 
 Alert from these bounded-label metrics:
 
@@ -223,6 +227,15 @@ Alert from these bounded-label metrics:
 Deployment-specific thresholds belong in the monitoring repository. At
 minimum, alert on sustained DLQ depth above zero and sustained `consumer_5xx`,
 `invalid_response`, or applicant notification failures.
+
+A `route_missing` at dispatch is treated as transient (a rolling deploy / restart
+that came up before `OCTO_CARD_ACTION_ROUTES` loaded the route): the event is
+**deferred** (no attempt consumed) and re-checked until the route returns or it has
+waited ~15 minutes, after which it dead-letters (`reason=route_missing`). So
+`error_total{category="route_missing"}` increments **once per re-check** while an
+event waits, not once per event — treat sustained non-zero `route_missing` (or DLQ
+entries with that reason) as a route-config divergence to fix, and size any rate
+alert accordingly.
 
 ## Manual DLQ replay
 

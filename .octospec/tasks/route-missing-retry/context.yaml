@@ -1,0 +1,60 @@
+# Rules resolved for this task (octospec Implement phase).
+slug: route-missing-retry
+resolved_at: 2026-07-20T16:30:00+08:00
+
+# Files touched: internal/cardactiondispatch/dispatcher.go,
+#                internal/cardactiondispatch/route_missing_test.go
+# Path-glob matches: rate-limit (internal/**/*.go), space-isolation (internal/**/*.go),
+#                    testing (**/*_test.go), commit-style (**).
+
+rules_injected:
+  - id: space-isolation
+    tier: repo
+    load_bearing: true
+    why: >
+      Path glob internal/**/*.go matches. Checked for cross-space leakage.
+    applied:
+      - N/A — no data access and no Space boundary is crossed. The dispatcher acts on
+        events already space-validated at enqueue time (modules/message card/action
+        endpoint). This change only decides retry-vs-DLQ on a route-lookup miss keyed by
+        (sender_uid, owner, action_type); it reads no user data and grants nothing.
+      - Retrying does not widen access: re-delivery targets the exact same event; the
+        consumer re-checks operator authorization per its own contract.
+  - id: rate-limit
+    tier: repo
+    load_bearing: true
+    why: >
+      Path glob internal/**/*.go matches; the change adds a defer/re-check schedule.
+    applied:
+      - N/A — not request-frequency limiting. route_missing reuses the queue's EXISTING
+        Defer mechanism (the same one the max_in_flight capacity path uses) on a fixed
+        routeMissingDeferInterval. No hand-rolled Redis counter is introduced; no HTTP
+        throttling.
+  - id: testing
+    tier: repo
+    load_bearing: false
+    applied:
+      - Risk-proportional package unit tests added (route_missing retry, eventual DLQ,
+        backoff bounds, and that Deliver/Finalize never run while the route is missing).
+      - Tests use the package's in-memory fake queue (concurrentLeaseQueue); they need no
+        MySQL/Redis/WuKongIM, so the testutil NewTestServer/CleanAllTables setup does not apply.
+  - id: commit-style
+    tier: repo
+    load_bearing: false
+    applied:
+      - Conventional Commit `fix(cardaction): ...`, English body.
+      - No linked GitHub issue (diagnosed from a live prod investigation, not an issue).
+
+notes:
+  - error-handling rule does NOT match (paths are modules/**, pkg/errcode/**, pkg/**/httperr/**;
+    internal/** is excluded) and the change emits no user-facing error response — it only
+    changes an internal dispatch nack policy. No new error codes; make i18n-* not required.
+  - trust-boundary rule does NOT match (adapter/webhook/richtext paths only).
+  - Design residual (documented): a genuinely unconfigured route now dead-letters after
+    routeMissingMaxWindow (15m from Event.ActedAt) instead of on attempt 1 — a deliberate
+    trade of later DLQ visibility for fully self-healing a transient rolling-deploy /
+    restart window. The DLQ signal (reason=route_missing) is preserved, just delayed.
+  - route_missing is modeled as "not ready yet" (Defer, no attempt consumed), NOT a failed
+    delivery attempt (Nack). The first cut used a bounded nack and an xhigh code review
+    caught that it shared the delivery attempt budget → attempts_exhausted on route return.
+    Learning staged: learnings/pending/durable-queue-registry-divergence.md.
