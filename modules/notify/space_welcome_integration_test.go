@@ -227,7 +227,7 @@ func TestStore_SweepClaimed_BackToPending(t *testing.T) {
 	past := now.Add(-time.Minute)
 	id := swInsertLedger(t, ctx, "spc_1", "u_1", swStatusClaimed, "owner-dead", &past, 2)
 
-	n, err := store.sweepClaimed(bg(), "spc_1", now)
+	n, err := store.sweepClaimedAll(bg(), now)
 	require.NoError(t, err)
 	assert.EqualValues(t, 1, n)
 
@@ -243,7 +243,7 @@ func TestStore_SweepDispatching_ToUnknown(t *testing.T) {
 	past := now.Add(-time.Minute)
 	id := swInsertLedger(t, ctx, "spc_1", "u_1", swStatusDispatching, "owner-dead", &past, 0)
 
-	n, err := store.sweepDispatching(bg(), "spc_1", now)
+	n, err := store.sweepDispatchingAll(bg(), now)
 	require.NoError(t, err)
 	assert.EqualValues(t, 1, n)
 
@@ -261,7 +261,7 @@ func TestStore_Sweep_RespectsLease(t *testing.T) {
 	future := now.Add(time.Minute)
 	id := swInsertLedger(t, ctx, "spc_1", "u_1", swStatusClaimed, "owner-live", &future, 0)
 
-	n, err := store.sweepClaimed(bg(), "spc_1", now)
+	n, err := store.sweepClaimedAll(bg(), now)
 	require.NoError(t, err)
 	assert.EqualValues(t, 0, n)
 	status, _, _, _, _ := swRowStatus(t, ctx, id)
