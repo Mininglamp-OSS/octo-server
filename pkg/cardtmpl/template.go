@@ -45,7 +45,9 @@ type ViewSpec struct {
 // Source 在 pkg/cardtmpl/resource.go 已定义,本文件复用。
 // 结构:{Label, IconURL string},均可选;运行期由 producer 从 i18n 词表拿本地化文案后注入。
 
-// TemplateMeta 是注册期一次性构造的静态元数据,不可变。Template.Meta() 零成本返回。
+// TemplateMeta 是注册期一次性构造的静态元数据。内部持有 map/slice/*ptr,
+// 对外暴露必须经 Clone() 深拷贝 (Template.Meta() / Registry.List()),
+// 保证冻结后契约不可变、并发读安全。
 type TemplateMeta struct {
 	// ID / Version / Protocol 三字段唯一标识一版本模板。
 	ID       ID
@@ -138,7 +140,11 @@ type BuildResult struct {
 
 // Template 是每张业务卡实现的接口。3 个行为方法,元数据一次拿走。
 type Template interface {
-	// Meta 返回注册期固化的静态元数据。零成本调用 (不 IO 不重算)。
+	// Meta 返回注册期固化静态元数据的**防御性深拷贝** (m.Clone())。调用方可安全
+	// 读取甚至修改返值而不污染 Registry 内部 —— 冻结后契约必须不可变,直接返回
+	// 内部含 map/slice/*ptr 的浅拷贝等于把内部状态交给外部改坏 (还有并发 race)。
+	// 因此本方法非零成本 (克隆若干小 map),但 Render 热路径内部直接读 entry.meta
+	// 不经过 Meta(),吞吐不受影响 (R3-2)。
 	Meta() TemplateMeta
 
 	// Build 渲染指定业务状态下的卡片业务片段。
@@ -151,27 +157,25 @@ type Template interface {
 	FallbackText(state State, fields json.RawMessage, lang string) (string, error)
 }
 
-// cloneTemplateMeta 深拷贝 TemplateMeta,让外部持有者 (如 List 返值 / 未来 HTTP
-// 端点) 修改不会影响 Registry 内部。R2-6: 冻结后 Meta 契约应不可变,但 struct
-// 里含 map/slice/*ptr 共享,直接返值等于让外部修改内部状态 (还有并发 race)。
-func cloneTemplateMeta(m TemplateMeta) TemplateMeta {
+// Clone 深拷贝 TemplateMeta,让外部持有者 (Template.Meta() 返值 / List() 返值 /
+// 未来 HTTP 端点) 修改不会影响 Registry 内部 (R3-2:冻结后契约不可变;struct 里
+// 含 map/slice/*ptr 共享,直接返值等于让外部改内部状态,还有并发 race)。
+// InputSchema 是编译好的 jsonschema.Schema (santhosh-tekuri 库持有),对外只暴露
+// Validate、内部不可变,故共享指针安全,不深拷贝。
+func (m TemplateMeta) Clone() TemplateMeta {
 	out := TemplateMeta{
-		ID:       m.ID,
-		Version:  m.Version,
-		Protocol: m.Protocol,
-		Source:   m.Source,
+		ID:          m.ID,
+		Version:     m.Version,
+		Protocol:    m.Protocol,
+		Source:      m.Source,
+		InputSchema: m.InputSchema,
 	}
 	if m.Manifest != nil {
 		out.Manifest = append(json.RawMessage(nil), m.Manifest...)
 	}
-	if m.InputSchema != nil {
-		// InputSchema 是编译好的 jsonschema.Schema (由 santhosh-tekuri 库持有);
-		// 该库对外只暴露 Validate,内部不可变。共享指针安全,不深拷贝。
-		out.InputSchema = m.InputSchema
-	}
 	if m.ActionContract != nil {
-		copy := *m.ActionContract
-		out.ActionContract = &copy
+		c := *m.ActionContract
+		out.ActionContract = &c
 	}
 	if m.Views != nil {
 		out.Views = make(map[ViewKey]ViewSpec, len(m.Views))

@@ -3,6 +3,7 @@ package cardtmpl
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -95,7 +96,7 @@ func renderCore(
 	}
 
 	// step 5: DeepLink 强制校验 (§5 约束 4)
-	if err := validateHTTPS(br.DeepLink); err != nil {
+	if err := AbsoluteHTTPSURL(br.DeepLink); err != nil {
 		metricBuildResult(meta.ID, meta.Version, string(view), "render_error")
 		return nil, fmt.Errorf("%w: DeepLink: %v", ErrRenderFailed, err)
 	}
@@ -175,14 +176,23 @@ func (r *Registry) RenderCard(
 	return b, profile, nil
 }
 
-// validateHTTPS 强制绝对 https URL,与 pkg/cardtmpl/resource.go:requireHTTPS 语义一致。
-func validateHTTPS(raw string) error {
-	if strings.TrimSpace(raw) == "" {
-		return fmt.Errorf("must be absolute https, got empty")
+// AbsoluteHTTPSURL 是本包"必须为绝对 https URL"规则的**唯一真源**。它用真正的
+// url.Parse 断言 scheme==https 且 host 非空 —— 正则无法可靠判定 host 存在
+// (例 "https://?x" / "https://#x" 的 host 为空却能被 `^https://[^/].*$` 之类
+// 的近似 pattern 放行,随后在 Build 内的 requireHTTPS 才失败、被误分类成
+// render_error 降级)。需要 C1 级字段校验的调用方 (modules/notify preflight)
+// 必须调本函数在 ingress 前置拦截,而不是依赖 schema 的正则近似。
+//
+// pkg/cardtmpl 内 requireHTTPS (resource.go) 与 renderCore step5 均委托本函数,
+// 保证 preflight 通过 ⇒ Build 的 https 校验必然通过 (同一实现,零缝隙)。
+func AbsoluteHTTPSURL(raw string) error {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return errors.New("cardtmpl: url must be absolute https, got empty")
 	}
-	u, err := url.Parse(strings.TrimSpace(raw))
+	u, err := url.Parse(s)
 	if err != nil || u.Scheme != "https" || u.Host == "" {
-		return fmt.Errorf("must be absolute https, got %q", raw)
+		return fmt.Errorf("cardtmpl: url must be absolute https, got %q", raw)
 	}
 	return nil
 }

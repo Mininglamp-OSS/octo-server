@@ -41,12 +41,12 @@ source: self
 - **`NotifyReq` 外部形状**(`modules/notify/model.go:14-24`)`{Payload, Card, DocsCard, ApprovalCard}` 四选一——不动字段/tag/binding;`DocsCardFields`(model.go:73-87)不动;调用方零改动。
 - **`cardactiondispatch.NotifyCapability`/`routeKey`/`RouteSpec`/`CanNotify`/`notifyCapabilityAllows`**——全部不动;本 PR 引入正交的 `TemplateActionContract`,不侵入现有 capability 模型。
 - **docs callback route 契约** `{sender_uid=notification, owner=docs, action_type=access_request.decision}`(`main.go:521`、`docs_action.go:141-142`)——不动;pilot ActionContract 精确一致。
-- **`cardtmpl.BuildDocsAccessRequestCard` 公开签名**(`docs_action.go:85`)——保留为 **legacy wrapper**(内部仍 marshal 完整 AC + 注入 metadata,供**未走 Registry.Render 的存量调用者/测试**兜底),不删除、不改签名;pilot Template.Build 走**新抽出**的 `buildDocsAccessRequestBodyWithLang(lang, ...) → BuildResult` 私有实现。
+- **`cardtmpl.BuildDocsAccessRequestCard` 公开签名**(`docs_action.go:85`)——保留为 **legacy wrapper**(内部仍 marshal 完整 AC + 注入 metadata,供**未走 Registry.Render 的存量调用者/测试**兜底),不删除、不改签名;pilot Template.Build 调**导出**的 `cardtmpl.BuildDocsAccessRequestBodyWithLang(lang, ...) (body, actions, deepLink, err)`(只产业务片段),再由 pilot 自行组装 `BuildResult`(含按 lang 本地化的 `Source`)。
 - **`cardmsg.ValidateInputs` + hidden `deny_reason` input id + action id 常量**(`docs_action.go:16-24`)——不动值;interaction report 引用这些常量。
 - **`cardmsg.ProfileV1/V2` + `AcceptedProfiles`**(`profiles.go`)——不动;pilot pending view profile == `ProfileV2`。
 - **`docsApprovalCardsEnabled()` gate**(`card.go:336`)——不动;pilot 只接管 gate 开启后的 `access_requested` 分支。
 - **docs-notify fallback policy**(`card.go:342-345`)——**决策 C1 定向修改**:builder 内 schema 级字段错从"降级文本"改为"返回 `errNotifyCardInvalid`(→400)";render 级错沿用降级。api.go:307-318 映射链不动。
-- **`escapeMarkdown`/`truncateRunes`/`requireHTTPS`/`labelsForLanguage`**(`resource.go:284-340`)——语义不动;抽到 `helpers.go` 共享,现有 `_test.go` 回归。
+- **`escapeMarkdown`/`truncateRunes`/`requireHTTPS`/`labelsForLanguage`**(`resource.go:284-340`)——语义不动,**留在 `resource.go`**(未拆 helpers.go);`requireHTTPS` 改为委托新导出的单一真源 `cardtmpl.AbsoluteHTTPSURL`(render.go),现有 `_test.go` 回归。
 - **`i18n.OutboundLanguage` 语义**——不动;通过 `BuildEnv.Lang` 由调用点提前解析后传入(A10)。
 - **现有测试全绿**:`pkg/cardtmpl/*_test.go`、`modules/notify/{card_test,card_action_test}.go`、`internal/{carddispatch,cardactiondispatch}/*_test.go`。
 
@@ -106,7 +106,10 @@ source: self
   ```
   ErrFieldsInvalid / ErrStateUnknown / ErrTemplateUnknown 三类 typed error 由调用点区分处理(决策 C1)。
 
-- **A4** 新增 `pkg/cardtmpl/helpers.go`:从 `resource.go` 迁 `escapeMarkdown`/`truncateRunes`/`requireHTTPS`/`labelsForLanguage`;不再单独提供 `FinalizeCard` 导出函数(metadata 注入由 A3 `Registry.Render` 内部完成,`resource.go`/`docs_action.go` 已有的直接构造完整 AC 的老函数保留自己的 metadata 逻辑作为 legacy 分支,不被新链路调用)。
+- **A4** 卡片渲染 helpers 与 metadata 注入落位(实际交付,取代早期"新增 helpers.go"设想):
+  - `escapeMarkdown`/`truncateRunes`/`labelsForLanguage` 等**留在 `resource.go`**,未新增 `helpers.go`(避免无谓搬动+回归风险);
+  - "必须为绝对 https URL"的判定提炼为**唯一导出真源** `cardtmpl.AbsoluteHTTPSURL`(`render.go`),`resource.go:requireHTTPS` 与 `renderCore` step5 均委托它,保证 preflight 与 Build 零缝隙(R3-1);
+  - 不提供 `FinalizeCard` 导出函数:metadata 注入由 A3 `renderCore` 内部完成;`resource.go`/`docs_action.go` 直接构造完整 AC 的老函数保留各自 metadata 逻辑作为 legacy 分支,不被新链路调用。
 
 - **A5** 新增 `pkg/cardtmpl/metrics.go`(§13):Prometheus counter `cardtmpl_build_total{template_id, version, view, result}`,`result` 枚举 `ok|fields_invalid|state_unknown|template_unknown|render_error`。由 `Registry.Render` 内部打点。
 
@@ -128,7 +131,7 @@ source: self
     - Unmarshal `fields` 到私有 struct(schema 校验已在 Registry.Render 前置完成,此处只做类型转换);
     - 调新增私有函数 `buildDocsAccessRequestBodyWithLang(env.Lang, docID, requestID, spaceID, content, actions, env.WebLoginURL) (BuildResult, error)`——把现有 `cardtmpl.BuildDocsAccessRequestCard` 逻辑抽出,**只**产生 `body[]` 与 `actions[]` 与 `DeepLink`,不 marshal 顶层、不写 metadata;
     - `Variant := "docs.access_requested"`(与 `card.go:463` 现值一致);
-    - 返回 `BuildResult{Body, Actions, Variant, DeepLink, Source: nil(用 Meta.Source)}`;
+    - 返回 `BuildResult{Body, Actions, Variant, DeepLink, Source: &src}`,其中 `src = sourceForLang(env.Lang)` 按语言本地化(zh-CN"文档"/en"Docs"),覆盖 Meta.Source 从 manifest.sourceLabel 载入的中文默认值(F5);
   - `FallbackText(state, fields, lang)` 复用 `modules/notify/card.go:buildDocsFallbackText` 逻辑或抽到 helper;
   - `ID()`/`Version()`/`Protocol()`/`ActionContract()` 语义等价从 `Meta()` 派生,不额外方法。
 
@@ -143,12 +146,12 @@ source: self
   ```
   **不再直接调 `cardtmpl.BuildDocsAccessRequestCard`**(legacy wrapper 保留但脱离新链路)。gate 关时行为不变(走 `buildDocsCard` v1)。
 
-- **A10** 抽 `buildDocsAccessRequestBodyWithLang(lang string, ...)` 私有实现于 `pkg/cardtmpl/docs_action.go`,`i18n.OutboundLanguage(ctx)` 调用从原 `BuildDocsAccessRequestCard` 顶层上移(要么在 wrapper 保留调用后转调,要么留给调用点解析后传入)。保留公开 `BuildDocsAccessRequestCard(ctx, ...)` 作**legacy 薄 wrapper**:内部拼装完整 AC + 注入 `metadata.octo.{webUrl,variant,source}`(**不写 protocol/template**,legacy 分支不承担新 metadata 责任),给未走 Registry 的存量测试/调用者兜底。中英文各加一条 pilot Template Build 等价回归(同输入不同 lang → 文案切换,body/actions 结构一致)。
+- **A10** 抽 `BuildDocsAccessRequestBodyWithLang(lang string, ...)` **导出**实现于 `pkg/cardtmpl/docs_action.go`(pilot Template 与 legacy wrapper 共用),`i18n.OutboundLanguage(ctx)` 调用从原 `BuildDocsAccessRequestCard` 顶层上移(wrapper 保留 ctx→lang 解析后转调;新链路由 modules/notify 调用点解析后经 `BuildEnv.Lang` 传入)。保留公开 `BuildDocsAccessRequestCard(ctx, ...)` 作**legacy 薄 wrapper**:内部拼装完整 AC + 注入 `metadata.octo.{webUrl,variant,source}`(**不写 protocol/template**,legacy 分支不承担新 metadata 责任),给未走 Registry 的存量测试/调用者兜底。中英文各加一条 pilot Template Build 等价回归(同输入不同 lang → 文案切换,body/actions 结构一致)。
 
-- **A11** **迁移前后自输出等价基线**(取代锁 handoff golden):
-  - 保存迁移前 `buildDocsAccessRequestCard` 对固定 fixture 的输出为 `.golden` 文件;
-  - 断言 `Registry.Render` 迁移后输出**删除 `metadata.octo.protocol` 与 `metadata.octo.template` 两个新增字段后**与基线字节相等 —— 上一版 brief 只删 template 字段,遗漏 protocol,现修正;
-  - 这是本 PR 对"结构漂移"的唯一锁,基线来自 octo-server 自身,不锁 handoff 视觉。
+- **A11** **迁移前后自输出字节等价基线**(取代锁 handoff golden;实际实现见 `modules/notify/card_via_registry_baseline_test.go`):
+  - **不落 `.golden` 文件**:同一测试内先跑 legacy `buildDocsAccessRequestCard` 拿 pre-migration 输出作基线,再跑 `Registry.Render` 拿 post-migration 输出,两侧用递归 sorted-key **canonical JSON** 序列化后 `bytes.Equal` 断言;
+  - 比较前从新链路输出剥除**三个**明确"仅新链路才有"的白名单差异:`metadata.octo.protocol`、`metadata.octo.template`(§5 强制注入)、`actions[Action.OpenUrl].id=="view_document"`(pilot 按 interaction 契约加,legacy 无 id);
+  - 任何**其它**新增/顺序/别名漂移都会使字节不等而失败。基线来自 octo-server 自身,不锁 handoff 视觉。
 
 - **A12** `docsApprovalCardsEnabled()==false` 时行为不变,`card_test.go` 相关测试全绿。
 

@@ -11,11 +11,12 @@ import (
 	docsaccessrequest "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/docs_access_request"
 )
 
-// TestBuildDocsAccessRequestCardViaRegistry_UnwiredFailsExplicitly 验证 F7:
-// DefaultRegistry 未注入 (composition bug) 现在直接返回 non-nil error;
-// 不再返回 sentinel 让 caller 静默回退到 legacy —— 那样会遮蔽 wiring 漏洞。
-// caller (deliverDocsCardNotification) 会把这个 error 按 render_error 分类,
-// 降级为纯文本 DM (通过 F6 的 buildDocsFallbackText),同时 ERROR 日志促使 SRE 修 wiring。
+// TestBuildDocsAccessRequestCardViaRegistry_UnwiredFailsExplicitly 验证 F7 + R2-2:
+// DefaultRegistry 未注入 (composition bug) 时,build 通路返回 typed
+// errCardTmplUnavailable —— 不再返回 sentinel 让 caller 静默回退到 legacy,
+// 也**不是** ErrFieldsInvalid。caller (deliverDocsCardNotification) 对该 typed
+// error 走 500 不降级 (见 TestDeliverDocsAccessRequest_UnwiredRegistryFailsClosed),
+// 让 wiring 漏洞立即暴露而不是伪装成一条成功文本 DM。
 func TestBuildDocsAccessRequestCardViaRegistry_UnwiredFailsExplicitly(t *testing.T) {
 	prev := cardtmpl.DefaultRegistry()
 	cardtmpl.SetDefaultRegistry(nil)
@@ -31,7 +32,11 @@ func TestBuildDocsAccessRequestCardViaRegistry_UnwiredFailsExplicitly(t *testing
 	if err == nil {
 		t.Fatalf("want non-nil error when registry unwired")
 	}
-	// 不应该是 typed ErrFieldsInvalid (那会被 caller 翻 400,而 wiring bug 应走 500/降级)。
+	// R3-3: 精确锁定 typed errCardTmplUnavailable (500 分类),而非只断言"不是 400"。
+	if !errors.Is(err, errCardTmplUnavailable) {
+		t.Fatalf("want errCardTmplUnavailable, got %v", err)
+	}
+	// 且绝不能是 ErrFieldsInvalid (那会被 caller 翻 400,而 wiring bug 应走 500)。
 	if errors.Is(err, cardtmpl.ErrFieldsInvalid) {
 		t.Fatalf("unwired should NOT be typed ErrFieldsInvalid, got %v", err)
 	}

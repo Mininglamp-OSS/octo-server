@@ -95,7 +95,30 @@ func TestRegisterAndRender_Smoke(t *testing.T) {
 	t.Logf("payload size = %d bytes", len(raw))
 }
 
-// TestBuild_SourceLocalization 验证 F5:zh-CN → "文档",en → "Docs";
+// TestFallbackText_SanitizesNewlines 验证 R2-3:FallbackText 对 actor/title 里
+// 嵌入的换行/回车/制表等控制字符做 sanitizeLine (替空格) —— 防止调用方通过
+// "Ann\nEvil line" 伪造多行 DM 视觉。产物必须是单行纯文本。
+func TestFallbackText_SanitizesNewlines(t *testing.T) {
+	tmpl := docsaccessrequest.New() // FallbackText 不依赖 Meta,无需 Register
+	fields := json.RawMessage(
+		`{"requestId":"r1","state":"pending",` +
+			`"document":{"title":"Title\nInjected"},` +
+			`"requester":{"name":"Ann\r\nEvil\tspoof"}}`,
+	)
+	for _, lang := range []string{"zh-CN", "en"} {
+		text, err := tmpl.FallbackText(docsaccessrequest.StatePending, fields, lang)
+		if err != nil {
+			t.Fatalf("FallbackText(lang=%q): %v", lang, err)
+		}
+		if strings.ContainsAny(text, "\n\r\t") {
+			t.Errorf("lang=%q fallback contains raw control char: %q", lang, text)
+		}
+		if text == "" {
+			t.Errorf("lang=%q fallback empty", lang)
+		}
+	}
+}
+
 // Registry 从 manifest.sourceLabel 载入的中文默认值必须被 pilot Build 按
 // env.Lang 覆盖,避免英文卡片带中文来源角标。
 func TestBuild_SourceLocalization(t *testing.T) {

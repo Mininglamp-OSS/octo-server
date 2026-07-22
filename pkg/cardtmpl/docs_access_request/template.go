@@ -59,9 +59,11 @@ func (t *Template) SetMeta(m cardtmpl.TemplateMeta) {
 	t.meta = m
 }
 
-// Meta 返回注册期固化的静态元数据,零成本调用。
+// Meta 返回注册期固化静态元数据的防御性深拷贝 (R3-2):调用方修改返值不会
+// 污染 Registry 内部,冻结后契约不可变。非零成本 (克隆若干小 map),但生产
+// 热路径 Registry.Render 内部直接读 entry.meta 不经过本方法,吞吐不受影响。
 func (t *Template) Meta() cardtmpl.TemplateMeta {
-	return t.meta
+	return t.meta.Clone()
 }
 
 // pendingFields 是 pending sample 反序列化后的数据契约。字段结构与

@@ -75,6 +75,17 @@ func preflightDocsAccessRequestSchema(card *DocsCardFields) error {
 		cardtmpl.RecordFieldsInvalid(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersion)
 		return fmt.Errorf("%w: %v", cardtmpl.ErrFieldsInvalid, err)
 	}
+	// R3-1: schema 的 avatarUrl pattern 只做粗粒度前缀防护,正则无法可靠判定 host
+	// 存在 —— "https://?x" / "https://#y" 的 host 为空却能过 pattern,随后在 Build
+	// 内 requireHTTPS 才失败、被误分类成 render_error 降级文本 (绕过 C1 400)。
+	// 这里用与 Build 同一个 URL parser (cardtmpl.AbsoluteHTTPSURL) 在 ingress 前置
+	// 断言绝对 https,把坏字段确定性收敛成 C1 400,零缝隙、零降级。空头像合法 (省略头像列)。
+	if avatar := strings.TrimSpace(card.ActorAvatarURL); avatar != "" {
+		if err := cardtmpl.AbsoluteHTTPSURL(avatar); err != nil {
+			cardtmpl.RecordFieldsInvalid(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersion)
+			return fmt.Errorf("%w: actor_avatar_url: %v", cardtmpl.ErrFieldsInvalid, err)
+		}
+	}
 	return nil
 }
 

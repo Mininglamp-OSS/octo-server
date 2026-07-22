@@ -289,12 +289,10 @@ func webOrigin(webLoginURL string) (string, error) {
 	return (&url.URL{Scheme: base.Scheme, Host: base.Host}).String(), nil
 }
 
+// requireHTTPS 委托 AbsoluteHTTPSURL (render.go) —— 单一真源,避免与 preflight
+// 的绝对-https 判定漂移。空串由本包各调用点在调用前 guard (空头像/空 icon 合法)。
 func requireHTTPS(raw string) error {
-	parsed, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
-		return errors.New("must be absolute https")
-	}
-	return nil
+	return AbsoluteHTTPSURL(raw)
 }
 
 func truncateRunes(value string, limit int) string {

@@ -232,7 +232,7 @@ func (r *Registry) List() []TemplateMeta {
 	defer r.mu.RUnlock()
 	out := make([]TemplateMeta, 0, len(r.entries))
 	for _, e := range r.entries {
-		out = append(out, cloneTemplateMeta(e.meta))
+		out = append(out, e.meta.Clone())
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].ID != out[j].ID {

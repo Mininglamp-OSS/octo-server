@@ -44,7 +44,7 @@
 ├──────────────────────────────────────────────────────────────────┤
 │ L1  单卡契约 (每业务卡一份,版本化)                                │
 │     manifest.json · contract/data.schema.json                    │
-│     reports/*.interaction.json · samples/ · goldens/             │
+│     reports/*.interaction.json · samples/                        │
 │     (纯 JSON 制品,与代码同仓,不含 Go 代码)                        │
 ├──────────────────────────────────────────────────────────────────┤
 │ L2a 平台内置卡片 (octo 团队维护)                                  │
@@ -63,7 +63,7 @@
 
 | 层 | 谁维护 | 稳定性承诺 | 代码归属 | 变更影响面 |
 |---|---|---|---|---|
-| L0 | 平台组(octo-server core) | 大版本(major)变更需通告所有 L2;小版本向后兼容 | `pkg/cardtmpl/{template,registry,helpers,updater,metrics}.go`、`pkg/cardmsg/*`、`internal/carddispatch/*`、`internal/cardactiondispatch/*` | 全平台;PR 强制两名 L0 维护者 review |
+| L0 | 平台组(octo-server core) | 大版本(major)变更需通告所有 L2;小版本向后兼容 | `pkg/cardtmpl/{template,registry,render,metrics,default_registry}.go`、`pkg/cardmsg/*`、`internal/carddispatch/*`、`internal/cardactiondispatch/*` | 全平台;PR 强制两名 L0 维护者 review |
 | L1 | 与对应 L2 卡同人维护 | 卡的 `version` 变即算新契约,老版本永不修改 | `pkg/cardtmpl/<card>/handoff/<id>@<ver>/` (每卡自持 embed) | 单卡;PR review 者需含平台组一人 |
 | L2a | 平台组 + 业务组 | 卡自身版本管理;调用方 API 兼容期由业务组承诺 | `pkg/cardtmpl/<card>/*.go` | 单卡业务链路 |
 | L2b | 业务方 | 卡自身版本管理;不受 L2a 排期约束 | `pkg/cardtmpl/ext/<owner>/<card>/*.go`(或业务独立 module) | 该业务 owner 命名空间内 |
@@ -166,14 +166,14 @@
 ├── manifest.json              # 卡元数据
 ├── contract/
 │   └── data.schema.json       # 调用方入参 JSON Schema (draft-07)
-├── templates/                 # JSON 模式用,代码模式下可选
+├── templates/                 # JSON 模式用,代码模式下可选 (Registry 不载入)
 │   ├── <view>.template.json
-├── samples/                   # 入参样本,每个样本=一个典型状态
+├── samples/                   # 入参样本,每个样本=一个典型状态 (Registry 载入并 self-check)
 │   ├── <state>.json
-├── goldens/                   # 编译后 AC JSON 基线(删除 template 元数据后字节相等)
-│   └── <state>.card.json
+├── goldens/                   # 可选,编译后 AC JSON 基线;Registry 不载入。
+│   └── <state>.card.json      # pilot 未提交,迁移基线走调用侧 canonical diff (见 A11)
 └── reports/
-    └── <state>.interaction.json   # 该视图交互契约
+    └── <state>.interaction.json   # 该视图交互契约 (v2 view 必需,Registry 载入)
 ```
 
 ### 4.1 manifest.json
@@ -197,13 +197,11 @@
       "states": ["pending"],                          // 该视图承载的业务状态,一个 state 只能属于一个 view
       "template": "templates/pending.template.json",  // JSON 模式路径;代码模式可忽略
       "samples": ["samples/pending.json"]
-    },
-    "result": {
-      "wireProfile": "octo/v1",
-      "states": ["approved", "rejected"],
-      "template": "templates/result.template.json",
-      "samples": ["samples/approved.json", "samples/rejected.json"]
     }
+    // 注:0.2.0 pilot 只注册 pending 单视图 (octo/v2 交互档)。
+    // 终态 result 视图 (approved/rejected,octo/v1) 与其 approved/rejected
+    // samples 由后续 outcome PR 以新版本 docs.access-request@0.3.0 发布,
+    // 老版本目录一经发布即冻结不改 (§2.1 L1 变更规则)。
   }
 }
 ```
