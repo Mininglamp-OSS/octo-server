@@ -310,6 +310,13 @@ func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error
 	// other kinds keep the historical validate-in-builder behavior.
 	if card.Kind == DocsCardKindAccessRequested && docsApprovalCardsEnabled() {
 		if err := preflightDocsAccessRequestSchema(card); err != nil {
+			// R2-2: preflight 现在能返 typed errCardTmplUnavailable (Registry/Template
+			// 未注入,composition bug) —— 与 schema 400 分开处理,让 500 不降级。
+			if errors.Is(err, errCardTmplUnavailable) {
+				n.Error("docs access-request card preflight: cardtmpl unavailable (composition bug, 500)",
+					zap.Error(err), zap.String("space_id", req.SpaceID), zap.String("doc_id", card.DocID))
+				return nil, err // api.go 兜底走 500
+			}
 			n.Warn("docs access-request card rejected at preflight: schema (400)",
 				zap.Error(err), zap.String("space_id", req.SpaceID), zap.String("doc_id", card.DocID))
 			return nil, errNotifyCardInvalid
@@ -363,12 +370,20 @@ func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error
 			// - schema-level field errors (typed cardtmpl.ErrFieldsInvalid) → 400,
 			//   zero delivery. Reject the whole request instead of silently
 			//   masking a caller contract violation as a plain-text DM.
+			// - Registry/Template unavailable (typed errCardTmplUnavailable,
+			//   composition bug) → propagate as internal error (500 from api.go
+			//   layer),不降级 —— 静默走 text 会遮蔽 wiring 漏洞 (R2-2 / A14)。
 			// - other build errors (render failure / marshal / dependency) →
 			//   degrade to plain-text so the notification still lands.
 			if errors.Is(buildErr, cardtmpl.ErrFieldsInvalid) {
 				n.Warn("docs access-request card rejected: fields did not pass schema (400)",
 					zap.Error(buildErr), zap.String("space_id", req.SpaceID), zap.String("doc_id", card.DocID))
 				return nil, errNotifyCardInvalid
+			}
+			if errors.Is(buildErr, errCardTmplUnavailable) {
+				n.Error("docs access-request card: cardtmpl unavailable (composition bug, 500)",
+					zap.Error(buildErr), zap.String("space_id", req.SpaceID), zap.String("doc_id", card.DocID))
+				return nil, buildErr // 不 wrap 为 errNotifyCardInvalid,api.go 兜底走 500
 			}
 			n.Warn("build docs card failed, degrading to text",
 				zap.Error(buildErr), zap.String("space_id", req.SpaceID), zap.String("doc_id", card.DocID))

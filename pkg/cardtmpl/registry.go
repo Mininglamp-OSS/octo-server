@@ -1,6 +1,7 @@
 package cardtmpl
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -223,12 +224,15 @@ func (r *Registry) Lookup(id ID, version string) (Template, error) {
 }
 
 // List 导出已注册模板元数据 (稳定顺序,按 id@version 升序),供 /v1/message/card/templates 使用。
+// R2-6: 深拷贝 Views / stateIndex / interactions / *ActionContract / Manifest bytes,
+// 保证外部持有者(如 HTTP handler 或 test)修改返值不会影响 Registry 内部 (frozen 后
+// 契约仍不可变)。热路径 Render 走 renderCore 直接读 e.meta 不经过 List,不受影响。
 func (r *Registry) List() []TemplateMeta {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	out := make([]TemplateMeta, 0, len(r.entries))
 	for _, e := range r.entries {
-		out = append(out, e.meta)
+		out = append(out, cloneTemplateMeta(e.meta))
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].ID != out[j].ID {
@@ -454,13 +458,13 @@ func (r *Registry) selfCheckSamples(t Template, meta TemplateMeta, samples map[s
 
 // renderWithinLock 是 selfCheckSamples 用的内部渲染入口,避免 Render 内部再走 entryOf
 // (需要 mu.RLock,而 Register 已 mu.Lock,会 deadlock)。逻辑与 Render 一致但直接
-// 拿 t 和 meta,不 Lookup。
+// 拿 t 和 meta,不 Lookup。R2-7: 注册期无 caller ctx,传 context.Background()。
 func (r *Registry) renderWithinLock(
 	t Template, meta TemplateMeta,
 	state State, fields json.RawMessage, env BuildEnv,
 ) (map[string]any, error) {
 	// 复用 Render 的核心;把 entry 已知的部分直接传入,避免 lookup。
-	return renderCore(t, meta, state, fields, env)
+	return renderCore(context.Background(), t, meta, state, fields, env)
 }
 
 // assertActionContract 断言 payload["card"]["actions"][*] 里每个 Action.Submit

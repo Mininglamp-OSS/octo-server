@@ -61,3 +61,12 @@ func metricBuildResult(id ID, version, view, result string) {
 	globalMetricsMu.RUnlock()
 	m.buildResult(string(id), version, view, result)
 }
+
+// RecordFieldsInvalid 是 preflight-only path 的导出入口 (R2-8):
+// caller 在 Registry.Render 之前独立跑 schema 校验(如 modules/notify
+// preflightDocsAccessRequestSchema),失败时 Render 不会被触发,`build_total`
+// 就漏一条 400 路径。此入口只允许 result="fields_invalid",view 传空。
+// 用法与直接调 metricBuildResult 等价,只是限定为 preflight 场景避免误用。
+func RecordFieldsInvalid(id ID, version string) {
+	metricBuildResult(id, version, "", "fields_invalid")
+}

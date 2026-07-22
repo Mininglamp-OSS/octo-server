@@ -13,10 +13,10 @@ import (
 )
 
 // TestBuildDocsAccessRequestCard_MigrationBaseline 是 A11 的"迁移前后自输出字节等价"锁:
-//   1. legacy `BuildDocsAccessRequestCard` 输出作为 pre-migration baseline;
-//   2. Registry.Render 输出抽出 payload["card"] 后,**删除 metadata.octo.protocol 与
-//      metadata.octo.template** 两个新增字段;
-//   3. 用 canonical (sorted-key) JSON 序列化两侧,断言字节完全相等。
+//  1. legacy `BuildDocsAccessRequestCard` 输出作为 pre-migration baseline;
+//  2. Registry.Render 输出抽出 payload["card"] 后,**删除 metadata.octo.protocol 与
+//     metadata.octo.template** 两个新增字段;
+//  3. 用 canonical (sorted-key) JSON 序列化两侧,断言字节完全相等。
 //
 // 相较早期版本 (structural DeepEqual + 只删 template),本版:
 //   - 补删 protocol (§5 强制注入的第二个新 field);
@@ -82,6 +82,7 @@ func TestBuildDocsAccessRequestCard_MigrationBaseline(t *testing.T) {
 //   - metadata.octo.template (§5 强制注入)
 //   - actions[Action.OpenUrl].id == "view_document"  (pilot Template 按
 //     reports/pending.interaction.json 加,legacy 无 id;两侧行为分叉的唯一 action-level 差异)
+//
 // 返回新 map,不修改入参。这三个删除项是 A11 "迁移前后自输出字节等价" 允许的
 // 白名单差异 —— 任何**其它**新增/顺序/别名漂移都会失败。
 func stripOctoNewFields(card map[string]any) map[string]any {

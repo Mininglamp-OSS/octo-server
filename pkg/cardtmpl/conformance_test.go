@@ -21,12 +21,13 @@ const notifyBotUID = "notification"
 
 // TestConformance_AllRegisteredTemplates 遍历 RegisteredForTest 集合,对每张 Template
 // 每个已注册 v2 view 断言 docs/platform-card-base.md §4.3 里 4 条 + §5 metadata 5 条:
-//   A15a schema 通过 sample
-//   A15b Registry.Render 无错;cardmsg.Validate 隐式 (Render 内 step 8) 通过
-//   A15c 交互契约完整锁 (4 子条:id 集合相等 / input 必出现 / dataKeys 相等 / associatedInputs 一致)
-//   A15d metadata.octo.template = {id,version}
-//   A15e metadata.octo.protocol = "octo-card@1.0"
-//   A15f metadata.webUrl 是绝对 https
+//
+//	A15a schema 通过 sample
+//	A15b Registry.Render 无错;cardmsg.Validate 隐式 (Render 内 step 8) 通过
+//	A15c 交互契约完整锁 (4 子条:id 集合相等 / input 必出现 / dataKeys 相等 / associatedInputs 一致)
+//	A15d metadata.octo.template = {id,version}
+//	A15e metadata.octo.protocol = "octo-card@1.0"
+//	A15f metadata.webUrl 是绝对 https
 func TestConformance_AllRegisteredTemplates(t *testing.T) {
 	registry := freshRegistry(t)
 	env := cardtmpl.BuildEnv{
@@ -96,11 +97,11 @@ func TestConformance_AllRegisteredTemplates(t *testing.T) {
 }
 
 // TestActionContract_ThreeWayConsistency 严格实现 A16 三方一致性:
-//   1. Meta.ActionContract == 期望值 (pilot: docs/access_request.decision)
-//   2. Render 产物 Action.Submit.data.owner/action_type == ActionContract
-//   3. 用 cardactiondispatch.NewRegistry + Resolve(NotifyBotUID, contract.Owner,
-//      contract.ActionType) 必须命中 ResolutionCallback,与 main.go:521 的启动
-//      fail-close 语义同源 —— 任何一处 owner 值 rename 都会立刻在 CI 抓到。
+//  1. Meta.ActionContract == 期望值 (pilot: docs/access_request.decision)
+//  2. Render 产物 Action.Submit.data.owner/action_type == ActionContract
+//  3. 用 cardactiondispatch.NewRegistry + Resolve(NotifyBotUID, contract.Owner,
+//     contract.ActionType) 必须命中 ResolutionCallback,与 main.go:521 的启动
+//     fail-close 语义同源 —— 任何一处 owner 值 rename 都会立刻在 CI 抓到。
 func TestActionContract_ThreeWayConsistency(t *testing.T) {
 	registry := freshRegistry(t)
 	env := cardtmpl.BuildEnv{
@@ -190,6 +191,72 @@ func TestActionContract_ThreeWayConsistency(t *testing.T) {
 				cardactiondispatch.ResolutionCallback,
 			)
 		}
+	}
+}
+
+// TestActionContract_PilotPinned 是 A16 的锚定断言 (R2-5):
+// 泛型 TestActionContract_ThreeWayConsistency 用 Meta.ActionContract 构造 RouteSpec
+// 再用相同值 Resolve —— 属于自证 (owner 一起被 rename 也不会挂)。本 test 用
+// **本地硬编码字面量** 独立锚定 pilot 的生产契约值 (与 main.go:521 的
+// `Resolve(NotifyBotUIDValue, "docs", "access_request.decision")` 三方一致):
+//   - Meta.ActionContract.{Owner,ActionType} 必须精确等于 "docs" / "access_request.decision";
+//   - 用同一硬编码构造的 RouteSpec Resolve 必须命中 ResolutionCallback。
+//
+// 任何一处漂移(pilot Template 改 owner / manifest 改 actionType / callback route
+// 改字面量) 都会在本 test + main.go 启动 fail-close 至少一处炸出。
+func TestActionContract_PilotPinned(t *testing.T) {
+	const (
+		wantOwner      = "docs"
+		wantActionType = "access_request.decision"
+	)
+	registry := freshRegistry(t)
+	var found bool
+	for _, tmpl := range registry.RegisteredForTest() {
+		meta := tmpl.Meta()
+		if meta.ID != "docs.access-request" {
+			continue
+		}
+		found = true
+		if meta.ActionContract == nil {
+			t.Fatalf("docs.access-request Meta.ActionContract is nil")
+		}
+		if meta.ActionContract.Owner != wantOwner {
+			t.Errorf("docs.access-request ActionContract.Owner = %q, want %q",
+				meta.ActionContract.Owner, wantOwner)
+		}
+		if meta.ActionContract.ActionType != wantActionType {
+			t.Errorf("docs.access-request ActionContract.ActionType = %q, want %q",
+				meta.ActionContract.ActionType, wantActionType)
+		}
+	}
+	if !found {
+		t.Fatalf("docs.access-request pilot Template not registered by freshRegistry")
+	}
+	// Resolve 用同一份硬编码字面量,与 main.go:521 的启动断言同源:
+	//   registry.Resolve(NotifyBotUIDValue, "docs", "access_request.decision")
+	aRegistry, err := cardactiondispatch.NewRegistry(
+		[]cardactiondispatch.RouteSpec{{
+			SenderUID:   notifyBotUID,
+			Owner:       wantOwner,
+			ActionType:  wantActionType,
+			URL:         "https://test.internal/v1/callback",
+			SecretEnv:   "OCTO_TEST_CALLBACK_SECRET",
+			Timeout:     3 * time.Second,
+			MaxAttempts: 3,
+		}},
+		func(key string) string {
+			if key == "OCTO_TEST_CALLBACK_SECRET" {
+				return "test-callback-secret-32-bytes-min-len!"
+			}
+			return ""
+		},
+	)
+	if err != nil {
+		t.Fatalf("build cardactiondispatch registry: %v", err)
+	}
+	if r := aRegistry.Resolve(notifyBotUID, wantOwner, wantActionType); r.Kind != cardactiondispatch.ResolutionCallback {
+		t.Errorf("pinned Resolve(%q,%q,%q).Kind = %v, want %v",
+			notifyBotUID, wantOwner, wantActionType, r.Kind, cardactiondispatch.ResolutionCallback)
 	}
 }
 

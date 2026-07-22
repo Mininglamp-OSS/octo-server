@@ -8,7 +8,7 @@
 > 分层与生命周期规则见 §2。
 >
 > **读者**:业务后端(docs-backend / summary-backend / 未来 L2b 业务方)、octo-web、
-> 平台组内部。跨仓联调请以本文档 + `pkg/cardtmpl/testdata/handoff/<id>@<ver>/`
+> 平台组内部。跨仓联调请以本文档 + `pkg/cardtmpl/<card>/handoff/<id>@<ver>/`
 > 制品为准。
 
 > 本文定义 octo-server 卡片消息的平台级基座契约（L0），所有业务卡片（文档/智能总结/审批/Git/...）都在此基座上以版本化模板（L1）形式注册与运行。
@@ -64,7 +64,7 @@
 | 层 | 谁维护 | 稳定性承诺 | 代码归属 | 变更影响面 |
 |---|---|---|---|---|
 | L0 | 平台组(octo-server core) | 大版本(major)变更需通告所有 L2;小版本向后兼容 | `pkg/cardtmpl/{template,registry,helpers,updater,metrics}.go`、`pkg/cardmsg/*`、`internal/carddispatch/*`、`internal/cardactiondispatch/*` | 全平台;PR 强制两名 L0 维护者 review |
-| L1 | 与对应 L2 卡同人维护 | 卡的 `version` 变即算新契约,老版本永不修改 | `pkg/cardtmpl/testdata/handoff/<card>@<ver>/` | 单卡;PR review 者需含平台组一人 |
+| L1 | 与对应 L2 卡同人维护 | 卡的 `version` 变即算新契约,老版本永不修改 | `pkg/cardtmpl/<card>/handoff/<id>@<ver>/` (每卡自持 embed) | 单卡;PR review 者需含平台组一人 |
 | L2a | 平台组 + 业务组 | 卡自身版本管理;调用方 API 兼容期由业务组承诺 | `pkg/cardtmpl/<card>/*.go` | 单卡业务链路 |
 | L2b | 业务方 | 卡自身版本管理;不受 L2a 排期约束 | `pkg/cardtmpl/ext/<owner>/<card>/*.go`(或业务独立 module) | 该业务 owner 命名空间内 |
 
@@ -130,8 +130,8 @@
 | `internal/cardactiondispatch/*`(Registry/Route/Finalizer) | L0 | 不动,复用;新增 owner 前缀校验(见 §2.2 约束 1) |
 | `modules/cardtrust/*`(签名/信任) | L0 | 不动,复用 |
 | `pkg/cardtmpl/{resource,approval_request,approval_result,docs_action}.go` | L2a | 保留;pilot 起逐张迁到 Template 接口 |
-| `pkg/cardtmpl/testdata/handoff/<card>@<ver>/`(本 PR 引入) | L1 | JSON 制品目录 |
-| `pkg/cardtmpl/{template,registry,helpers,updater,metrics}.go`(本 PR 新增) | L0 | 新增,平台组维护 |
+| `pkg/cardtmpl/<card>/handoff/<id>@<ver>/`(本 PR 引入,每卡自持 embed) | L1 | JSON 制品目录 |
+| `pkg/cardtmpl/{template,registry,render,metrics,default_registry}.go`(本 PR 新增) | L0 | 新增,平台组维护 |
 | `modules/notify/*`(现有 docs/summary/approval 通道) | L2a 业务链路 | 方案 B 内壳走 Registry.Render |
 | `pkg/cardtmpl/ext/<owner>/<card>/`(未来) | L2b | 目录规划占位,本 PR 不建 |
 

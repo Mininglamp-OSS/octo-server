@@ -67,8 +67,8 @@
         "avatarUrl": {
           "type": "string",
           "maxLength": 2048,
-          "pattern": "^(|https://.+)$",
-          "description": "申请人头像 URL。非空时必须绝对 https;空字符串允许(空时省略头像列)"
+          "pattern": "^(|https://[^/].*)$",
+          "description": "申请人头像 URL。非空时必须绝对 https 且 host 非空 (拒绝 https:/// 等无 host 形式);空字符串允许(空时省略头像列)"
         }
       }
     },

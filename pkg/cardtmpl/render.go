@@ -45,13 +45,17 @@ func (r *Registry) Render(
 		metricBuildResult(id, version, "", "template_unknown")
 		return nil, err
 	}
-	return renderCore(e.tmpl, e.meta, state, fields, env)
+	return renderCore(ctx, e.tmpl, e.meta, state, fields, env)
 }
 
 // renderCore 是 Render 与 Register 期 selfCheckSamples 共享的核心。它接收已解析的
 // Template + Meta,不再走 registry 锁 —— 由调用方确保并发安全 (Render 已经 entryOf
 // 拿到不可变引用后释放锁;selfCheckSamples 已在 Register 的 mu.Lock 内)。
+// R2-7: 显式接收 ctx 并传给 Template.Build,让 Template 能观察调用方的
+// cancel/deadline (跨语言模板、慢 build、外部依赖 fetch 等场景)。selfCheckSamples
+// 传 context.Background() —— 注册期没有 caller ctx 可传。
 func renderCore(
+	ctx context.Context,
 	t Template, meta TemplateMeta,
 	state State, fields json.RawMessage, env BuildEnv,
 ) (map[string]any, error) {
@@ -83,8 +87,8 @@ func renderCore(
 		return nil, fmt.Errorf("%w: view %q missing spec", ErrStateUnknown, view)
 	}
 
-	// step 4: Build
-	br, err := t.Build(context.Background(), state, fields, env)
+	// step 4: Build (R2-7 传 caller ctx)
+	br, err := t.Build(ctx, state, fields, env)
 	if err != nil {
 		metricBuildResult(meta.ID, meta.Version, string(view), "render_error")
 		return nil, fmt.Errorf("%w: build: %v", ErrRenderFailed, err)

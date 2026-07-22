@@ -114,13 +114,13 @@ source: self
 
 ### L1 单卡契约 + L2a pilot Template
 
-- **A7** 提交 handoff 4 类制品到 `pkg/cardtmpl/testdata/handoff/docs.access-request@0.2.0/`:
-  - `manifest.json`(必须补 `owner:"docs"` / `actionType:"access_request.decision"` / `views.pending.states:["pending"]` / `views.result.states:["approved","rejected"]` / `protocol:"octo-card@1.0"` 五个字段,handoff 原样本缺,**在提交时 backfill**);
-  - `contract/data.schema.json`(handoff 原样);
-  - `samples/{pending,approved,rejected}.json`(handoff 原样);
-  - `reports/pending.interaction.json`(handoff 原样,pending 视图交互契约);
-  - **不提交** `templates/*.tmpl.json`(不引入 `${}` 引擎)、`goldens/*.card.json`(理由 A11)、`README.md`、`reports/{approved,rejected}.interaction.json`(outcome 不在本次范围)。
-  Registry 加载时校验 `pending.states=["pending"]` 独占,`result.states=["approved","rejected"]` 但因本次 Template 只**注册 pending view**(见 A9),`result` view 从 manifest 里**移除**或**只保留 states 声明用于将来**——取后者(保留声明供未来 outcome PR),`Register` 仅要求已注册 view 完整有 reports/samples,未注册 view(result)对 conformance test 跳过。
+- **A7** 提交 handoff 4 类制品到 **pilot 子包**:`pkg/cardtmpl/docs_access_request/handoff/docs.access-request@0.2.0/` (每卡自持 embed;Go 的 `//go:embed` 拒绝 `.`/`..` 和跨父目录,所以每张 L2a 卡在自己子包内 embed 自己的 handoff):
+  - `manifest.json`(补 `owner:"docs"` / `actionType:"access_request.decision"` / `views.pending.states:["pending"]` / `protocol:"octo-card@1.0"` / `sourceLabel:"文档"` 五个字段,handoff 原样本缺,**在提交时 backfill**;**R1-#2 修复后 result view 从 manifest 移除**,pending 是唯一注册视图;approved/rejected 待 outcome PR 以 `0.3.0` 新版本发布);
+  - `contract/data.schema.json`(**R2-#4 修复后** avatarUrl pattern 补 host,所有 string 字段补 maxLength;`state` enum 收敛到 `["pending"]`);
+  - `samples/pending.json`(handoff 原样;`approved.json` / `rejected.json` 已删,配合 result view 移除);
+  - `reports/pending.interaction.json`(**R1 修复后** action id/dataKeys/inputIds 与 Go 常量 `DocsApproveActionID`/`DocsDenyActionID`/`DocsDenyReasonInputID` + `baseData` 严格一致,而非 handoff 原样);
+  - **不提交** `templates/*.tmpl.json`(不引入 `${}` 引擎)、`goldens/*.card.json`(理由 A11)、`README.md`。
+  Registry 加载时校验 `pending.states=["pending"]` 独占;v2 view 缺 report → **注册期 panic**(R2-#3 fail-close)。
 
 - **A8** 新增 pilot Template `pkg/cardtmpl/docs_access_request/template.go`:
   - `Meta()` 返回构造好的 `TemplateMeta`(注册期由 Registry 组装完成后传入,Template 只持引用);

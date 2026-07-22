@@ -150,3 +150,66 @@ type Template interface {
 	// FallbackText 返回纯文本 fallback,渲染失败/低版本客户端/gate 关闭时使用。
 	FallbackText(state State, fields json.RawMessage, lang string) (string, error)
 }
+
+// cloneTemplateMeta 深拷贝 TemplateMeta,让外部持有者 (如 List 返值 / 未来 HTTP
+// 端点) 修改不会影响 Registry 内部。R2-6: 冻结后 Meta 契约应不可变,但 struct
+// 里含 map/slice/*ptr 共享,直接返值等于让外部修改内部状态 (还有并发 race)。
+func cloneTemplateMeta(m TemplateMeta) TemplateMeta {
+	out := TemplateMeta{
+		ID:       m.ID,
+		Version:  m.Version,
+		Protocol: m.Protocol,
+		Source:   m.Source,
+	}
+	if m.Manifest != nil {
+		out.Manifest = append(json.RawMessage(nil), m.Manifest...)
+	}
+	if m.InputSchema != nil {
+		// InputSchema 是编译好的 jsonschema.Schema (由 santhosh-tekuri 库持有);
+		// 该库对外只暴露 Validate,内部不可变。共享指针安全,不深拷贝。
+		out.InputSchema = m.InputSchema
+	}
+	if m.ActionContract != nil {
+		copy := *m.ActionContract
+		out.ActionContract = &copy
+	}
+	if m.Views != nil {
+		out.Views = make(map[ViewKey]ViewSpec, len(m.Views))
+		for k, v := range m.Views {
+			states := append([]State(nil), v.States...)
+			out.Views[k] = ViewSpec{WireProfile: v.WireProfile, States: states}
+		}
+	}
+	if m.stateIndex != nil {
+		out.stateIndex = make(map[State]ViewKey, len(m.stateIndex))
+		for k, v := range m.stateIndex {
+			out.stateIndex[k] = v
+		}
+	}
+	if m.interactions != nil {
+		out.interactions = make(map[ViewKey]InteractionReport, len(m.interactions))
+		for k, v := range m.interactions {
+			out.interactions[k] = cloneInteractionReport(v)
+		}
+	}
+	return out
+}
+
+func cloneInteractionReport(r InteractionReport) InteractionReport {
+	out := InteractionReport{}
+	if r.Actions != nil {
+		out.Actions = make([]DeclaredAction, len(r.Actions))
+		for i, a := range r.Actions {
+			out.Actions[i] = a
+			out.Actions[i].DataKeys = append([]string(nil), a.DataKeys...)
+			out.Actions[i].InputIDs = append([]string(nil), a.InputIDs...)
+		}
+	}
+	if r.Inputs != nil {
+		out.Inputs = append([]DeclaredInput(nil), r.Inputs...)
+	}
+	if r.Toggles != nil {
+		out.Toggles = append([]DeclaredToggle(nil), r.Toggles...)
+	}
+	return out
+}

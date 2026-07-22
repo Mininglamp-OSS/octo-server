@@ -2,10 +2,11 @@
 // 与 pkg/cardtmpl (L0 基座) 的分层关系见 docs/platform-card-base.md §2。
 //
 // 注册流程 (在 composition root 里):
-//   registry := cardtmpl.NewRegistry()
-//   registry.Register(docsaccessrequest.New(), docsaccessrequest.Assets, docsaccessrequest.HandoffRoot)
-//   registry.SetDefault(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersion)
-//   registry.Freeze()
+//
+//	registry := cardtmpl.NewRegistry()
+//	registry.Register(docsaccessrequest.New(), docsaccessrequest.Assets, docsaccessrequest.HandoffRoot)
+//	registry.SetDefault(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersion)
+//	registry.Freeze()
 package docsaccessrequest
 
 import (
@@ -14,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 )
@@ -63,7 +65,7 @@ func (t *Template) Meta() cardtmpl.TemplateMeta {
 }
 
 // pendingFields 是 pending sample 反序列化后的数据契约。字段结构与
-// pkg/cardtmpl/testdata/handoff/docs.access-request@0.2.0/contract/data.schema.json 对齐。
+// pkg/cardtmpl/docs_access_request/handoff/docs.access-request@0.2.0/contract/data.schema.json 对齐。
 type pendingFields struct {
 	RequestID          string `json:"requestId"`
 	State              string `json:"state"`
@@ -88,13 +90,17 @@ type pendingFields struct {
 
 // Build 渲染指定状态下的卡片业务片段。
 // 本 PR pilot 只实现 StatePending;其它状态由 Registry.Render 前置的 ViewFor 挡下。
+// R2-7: 尊重 caller ctx (cancel/deadline);Template 内部虽为纯 CPU 计算,
+// 一次早退以匹配 renderCore 传入的 ctx 语义。
 func (t *Template) Build(
 	ctx context.Context,
 	state cardtmpl.State,
 	fields json.RawMessage,
 	env cardtmpl.BuildEnv,
 ) (cardtmpl.BuildResult, error) {
-	_ = ctx // Build 不再依赖 ctx;i18n 走 env.Lang
+	if err := ctx.Err(); err != nil {
+		return cardtmpl.BuildResult{}, err
+	}
 	if state != StatePending {
 		// Registry.Render 已经在前置 ViewFor 挡下未注册 state;
 		// 这里作为深度防御,避免未来 result view 上线时 Template 悄悄 fallthrough。
@@ -149,7 +155,8 @@ func (t *Template) Build(
 }
 
 // FallbackText 返回纯文本 fallback。当前 pilot 采用简洁模板,与 modules/notify.buildDocsFallbackText
-// 的 access_requested 分支等价。
+// 的 access_requested 分支等价。R2-3: actor/title 用 sanitizeLine 消除内部换行/控制字符,
+// 防止调用方通过嵌入 "\n" 伪造多行 DM 视觉 (同 modules/notify.sanitizeLine 语义)。
 func (t *Template) FallbackText(state cardtmpl.State, fields json.RawMessage, lang string) (string, error) {
 	if state != StatePending {
 		return "", fmt.Errorf("docs.access-request: fallback for state %q not implemented", state)
@@ -159,9 +166,21 @@ func (t *Template) FallbackText(state cardtmpl.State, fields json.RawMessage, la
 		return "", fmt.Errorf("docs.access-request: unmarshal fields: %w", err)
 	}
 	labels := pendingLabels(lang, pf)
-	actor := strings.TrimSpace(pf.Requester.Name)
+	actor := sanitizeLine(pf.Requester.Name)
+	title := sanitizeLine(pf.Document.Title)
 	if actor == "" {
-		return fmt.Sprintf(labels.fallbackAnon, pf.Document.Title), nil
+		return fmt.Sprintf(labels.fallbackAnon, title), nil
 	}
-	return fmt.Sprintf(labels.fallbackNamed, actor, pf.Document.Title), nil
+	return fmt.Sprintf(labels.fallbackNamed, actor, title), nil
+}
+
+// sanitizeLine 与 modules/notify.sanitizeLine 语义一致:控制字符 (含 \n \r \t) 替换成
+// 空格,再 TrimSpace。防止调用方在 actor/title 里嵌换行伪造多行 DM。
+func sanitizeLine(s string) string {
+	return strings.TrimSpace(strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, s))
 }

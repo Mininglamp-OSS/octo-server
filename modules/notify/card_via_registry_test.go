@@ -147,3 +147,13 @@ func freshPilotRegistry(t *testing.T) *cardtmpl.Registry {
 	r.Freeze()
 	return r
 }
+
+// installTestCardTmplRegistry 装配一个 fresh Registry 并注入到 cardtmpl.DefaultRegistry,
+// t.Cleanup 恢复原值。任何走 Registry.Render 的 test (v2 分支) 都要调本 helper,
+// 否则 R2-2 fail-close 会返 500 error 让 test 崩掉。
+func installTestCardTmplRegistry(t *testing.T) {
+	t.Helper()
+	prev := cardtmpl.DefaultRegistry()
+	cardtmpl.SetDefaultRegistry(freshPilotRegistry(t))
+	t.Cleanup(func() { cardtmpl.SetDefaultRegistry(prev) })
+}

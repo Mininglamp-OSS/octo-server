@@ -11,7 +11,9 @@ import (
 )
 
 // TestRegisterAndRender_Smoke 端到端跑一遍:
-//   NewRegistry → Register(pilot) → SetDefault → Freeze → Render(pending sample)
+//
+//	NewRegistry → Register(pilot) → SetDefault → Freeze → Render(pending sample)
+//
 // 断言产物含 metadata.octo.{protocol,template} + webUrl,且 body/actions 非空。
 func TestRegisterAndRender_Smoke(t *testing.T) {
 	r := cardtmpl.NewRegistry()
@@ -111,8 +113,8 @@ func TestBuild_SourceLocalization(t *testing.T) {
 	}
 
 	cases := []struct {
-		lang     string
-		wantSrc  string
+		lang    string
+		wantSrc string
 	}{
 		{"zh-CN", "文档"},
 		{"en", "Docs"},

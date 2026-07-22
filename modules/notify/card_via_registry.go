@@ -12,9 +12,11 @@ import (
 	"go.uber.org/zap"
 )
 
-// F7 已删 errCardTmplRegistryUnwired sentinel:composition root 未注入 Registry
-// 现在直接作为 render_error 分类 (返回 non-typed error),而不是让 caller 静默回退
-// 到 legacy 通路——那样会遮蔽 wiring 漏洞。所有 test 必须显式 SetDefaultRegistry。
+// errCardTmplUnavailable 是 preflight / build 通路上 "Registry 未注入 / Template
+// 未注册" 的 typed 内部错误。caller (deliverDocsCardNotification) 对它走
+// **500 不降级**——这是 composition bug,不应把错请求伪装成成功文本 (§10 / A14)。
+// 与 cardtmpl.ErrFieldsInvalid 对齐 typed:前者是 500,后者是 400。
+var errCardTmplUnavailable = errors.New("notify: cardtmpl registry/template unavailable (composition bug)")
 
 // templateFallbackText 是 F6 分工:access_requested + gate + Registry-ready 时,
 // buildDocsFallbackText 会先调本函数,让 fallback 文本走 pilot Template 的 L0
@@ -39,19 +41,25 @@ func templateFallbackText(card *DocsCardFields, lang string) (string, bool) {
 	}
 	return text, true
 }
-// 在 memberCache / docsSender / cardmsg.Enabled 任意 gate 之前独立跑一次
-// pilot Template 的 InputSchema 校验。命中 → 返回 typed 错(caller 翻 400 零投递,
-// C1 policy)。Registry 未注入 (composition bug) → 返回 nil 让下游按现网走,
-// 稍后 render 阶段仍会失败并 fallback 到 legacy;这里选 nil 而非 fail,是为了
-// 在 test 环境和 gate-off 部署中不引入新硬依赖。
+
+// preflightDocsAccessRequestSchema 在 access_requested + gate 开的通路上,在
+// memberCache / docsSender / cardmsg.Enabled 任意 gate 之前独立跑一次 pilot
+// Template 的 InputSchema 校验。返回值分类:
+//   - schema 不合法 → cardtmpl.ErrFieldsInvalid (400 零投递,C1)
+//   - Registry / Template 未注入 → errCardTmplUnavailable (500 不降级)
+//   - nil → 通过
+//
+// R2-2 修正:前版当 registry nil 时返 nil 让 caller 继续走 v2 分支,后者最终降级
+// 文本 —— 那样"错请求"仍然会成功送达一条文本,与 §10 / A14 冲突。现在 preflight
+// 阶段就报 500,让 wiring bug 立刻可见。
 func preflightDocsAccessRequestSchema(card *DocsCardFields) error {
 	registry := cardtmpl.DefaultRegistry()
 	if registry == nil {
-		return nil // 无 registry 就没有 schema,fallback 到 legacy 走原路径
+		return fmt.Errorf("%w: default registry not wired", errCardTmplUnavailable)
 	}
 	tmpl, err := registry.Lookup(docsaccessrequest.TemplateID, "")
 	if err != nil {
-		return nil // 同上
+		return fmt.Errorf("%w: lookup %s: %v", errCardTmplUnavailable, docsaccessrequest.TemplateID, err)
 	}
 	fields, err := mapDocsCardFieldsToJSON(card, "zh-CN") // preflight 只关心 schema shape,lang 无差异
 	if err != nil {
@@ -62,26 +70,23 @@ func preflightDocsAccessRequestSchema(card *DocsCardFields) error {
 		return fmt.Errorf("%w: %v", cardtmpl.ErrFieldsInvalid, err)
 	}
 	if err := tmpl.Meta().InputSchema.Validate(parsed); err != nil {
+		// R2-8: preflight schema 失败也打 fields_invalid metric (Render 未被触发,
+		// 否则 metric 永远漏这条最"合法"的 400 路径)。
+		cardtmpl.RecordFieldsInvalid(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersion)
 		return fmt.Errorf("%w: %v", cardtmpl.ErrFieldsInvalid, err)
 	}
 	return nil
 }
 
-// buildDocsAccessRequestCardViaRegistry 走 L0 Registry.Render 生成 docs.access-request
-// 卡片。相较 buildDocsAccessRequestCard 差异:
-//   - metadata.octo 新增 {protocol, template:{id,version}} 由基座强制注入;
-//   - schema 校验失败返回 typed cardtmpl.ErrFieldsInvalid (由 caller 翻 400,C1);
-//   - render 级错沿用 buildErr 语义,caller 降级为纯文本。
 // buildDocsAccessRequestCardViaRegistry 走 L0 Registry.Render 生成
 // docs.access-request 卡片。相较 buildDocsAccessRequestCard 差异:
 //   - metadata.octo 新增 {protocol, template:{id,version}} 由基座强制注入;
 //   - schema 校验失败返回 typed cardtmpl.ErrFieldsInvalid (由 caller 翻 400,C1);
-//   - render 级错沿用 buildErr 语义,caller 降级为纯文本。
+//   - Registry/Template 未注入返 errCardTmplUnavailable (R2-2:caller 翻 500 不降级);
+//   - 其他 render 级错 non-typed,caller 走 render_error 降级为纯文本 (F6/§10)。
 //
-// F7: DefaultRegistry nil 不再返回 sentinel 让 caller 回退到 legacy —— composition
-// bug 必须显式暴露。返回 non-typed error,caller 走 render_error 降级为文本 DM,
-// 同时打 ERROR 日志促使 SRE 修 wiring。原 errCardTmplRegistryUnwired 走的 "test
-// 环境未 wire → fallback legacy" 通路已删,test 必须自行 SetDefaultRegistry。
+// R2-2 更正:DefaultRegistry nil 走 typed errCardTmplUnavailable —— 与 preflight
+// 同分类,让 wiring bug 在 caller 那里映射到 500 不降级。
 func (n *Notify) buildDocsAccessRequestCardViaRegistry(
 	ctx context.Context, spaceID string, card *DocsCardFields, lang string,
 ) (json.RawMessage, error) {
@@ -89,7 +94,7 @@ func (n *Notify) buildDocsAccessRequestCardViaRegistry(
 	if registry == nil {
 		n.Error("cardtmpl DefaultRegistry unwired — composition bug",
 			zap.String("space_id", spaceID), zap.String("doc_id", card.DocID))
-		return nil, errors.New("notify: cardtmpl default registry unwired (composition bug)")
+		return nil, fmt.Errorf("%w: default registry not wired", errCardTmplUnavailable)
 	}
 
 	fields, err := mapDocsCardFieldsToJSON(card, lang)
