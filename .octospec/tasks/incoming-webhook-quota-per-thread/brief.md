@@ -6,7 +6,7 @@ tags: ["incomingwebhook", "thread", "webhook", "quota", "space", "isolation", "b
 timestamp: 2026-07-22T10:44:01Z
 # --- octospec extension fields ---
 slug: incoming-webhook-quota-per-thread
-upstream: self
+upstream: Mininglamp-OSS/octo-server#640
 source: self
 ---
 
