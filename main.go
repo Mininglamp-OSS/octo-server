@@ -32,6 +32,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/Mininglamp-OSS/octo-server/pkg/avatarrender"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
+	docsaccessrequest "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/docs_access_request"
 	octodb "github.com/Mininglamp-OSS/octo-server/pkg/db"
 	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
@@ -234,6 +236,7 @@ func runAPI(ctx *config.Context) {
 	if err := installCardDispatch(ctx); err != nil {
 		panic(fmt.Errorf("install internal card dispatch registry: %w", err))
 	}
+	installCardTmplRegistry() // pkg/cardtmpl L0 registry: pilot Templates + Freeze (fail-close)
 	cardActionRuntime, err := installCardActionDispatch(ctx)
 	if err != nil {
 		panic(fmt.Errorf("install card action callback dispatch: %w", err))
@@ -695,4 +698,20 @@ func replaceWebConfig(cfg *config.Config) {
 	if err := os.WriteFile(path, []byte(newConfigContent), 0644); err != nil {
 		log.Error("failed to write web config", zap.String("path", path), zap.Error(err))
 	}
+}
+
+// installCardTmplRegistry 装配 L0 cardtmpl.Registry 并注入到 pkg-scoped default。
+// 本 PR (cardtmpl-registry-pilot) 只注册 docs.access-request@0.2.0 一张 L2a 卡;
+// 后续 PR 逐张迁移 summary/docs.shared/generic.approval 到本函数。
+//
+// Fail-close 契约:任一 Register/SetDefault 失败 → panic(与 main.go:521 现有的
+// docs approval callback route 校验同源)。init 期 schema/manifest 语法错无
+// runtime env 可挽救,回滚 = 镜像 revert。
+func installCardTmplRegistry() {
+	registry := cardtmpl.NewRegistry()
+	registry.Register(docsaccessrequest.New(), docsaccessrequest.Assets, docsaccessrequest.HandoffRoot)
+	registry.SetDefault(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersion)
+	registry.Freeze()
+	cardtmpl.SetGlobalMetrics(cardtmpl.NewMetrics(prometheus.DefaultRegisterer))
+	cardtmpl.SetDefaultRegistry(registry)
 }

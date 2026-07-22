@@ -89,6 +89,9 @@ func TestDeliverDocsAccessRequestHonorsApprovalFlag(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv("OCTO_DOCS_APPROVAL_CARD_ENABLED", tt.flag)
 			t.Setenv("OCTO_CARD_MESSAGE_ENABLED", "true")
+			// 装配 pilot registry (v2 分支要求 Registry.Render 唯一入口,composition
+			// bug 会返回 error 而不再回退 legacy —— 见 F7)。t.Cleanup 恢复,避免污染其它子测试。
+			installTestCardTmplRegistry(t)
 			wk := newWuKongServer()
 			defer wk.close()
 			ctx := newTestContext(t, wk)

@@ -91,34 +91,69 @@ func BuildDocsAccessRequestCard(
 	content DocsApprovalContent,
 	actions ApprovalActions,
 ) (json.RawMessage, error) {
+	lang := i18n.OutboundLanguage(ctx)
+	body, cardActions, deepLink, err := BuildDocsAccessRequestBodyWithLang(
+		lang, webLoginURL, docID, requestID, spaceID, content, actions,
+	)
+	if err != nil {
+		return nil, err
+	}
+	document := map[string]interface{}{
+		"type":     "AdaptiveCard",
+		"version":  cardmsg.CardVersion,
+		"metadata": buildMetadata(deepLink, content.Variant, content.Source),
+		"body":     body,
+		"actions":  cardActions,
+	}
+	raw, err := json.Marshal(document)
+	if err != nil {
+		return nil, fmt.Errorf("cardtmpl: marshal docs access request card: %w", err)
+	}
+	return raw, nil
+}
+
+// BuildDocsAccessRequestBodyWithLang 抽出 BuildDocsAccessRequestCard 的核心构造逻辑,
+// 只产生 body[] / actions[] / deepLink;不 marshal AC 顶层、不写 metadata。
+// pilot Template (pkg/cardtmpl/docs_access_request) 调用本函数,由 Registry.Render
+// 统一注入 metadata (metadata.octo.{protocol,template,variant,source} + webUrl)。
+//
+// lang 由调用方从 i18n.OutboundLanguage(ctx) 提前解析后传入;本函数不再触碰 ctx。
+func BuildDocsAccessRequestBodyWithLang(
+	lang string,
+	webLoginURL string,
+	docID string,
+	requestID string,
+	spaceID string,
+	content DocsApprovalContent,
+	actions ApprovalActions,
+) (body []interface{}, cardActions []interface{}, deepLink string, err error) {
 	if strings.TrimSpace(requestID) == "" || utf8.RuneCountInString(requestID) > 200 {
-		return nil, errors.New("cardtmpl: request ID is invalid")
+		return nil, nil, "", errors.New("cardtmpl: request ID is invalid")
 	}
 	if strings.TrimSpace(actions.ApproveTitle) == "" || strings.TrimSpace(actions.DenyTitle) == "" ||
 		utf8.RuneCountInString(actions.ApproveTitle) > 80 || utf8.RuneCountInString(actions.DenyTitle) > 80 {
-		return nil, errors.New("cardtmpl: approval action labels are invalid")
+		return nil, nil, "", errors.New("cardtmpl: approval action labels are invalid")
 	}
 	if strings.TrimSpace(content.Title) == "" || utf8.RuneCountInString(content.Title) > maxTitleRunes {
-		return nil, errors.New("cardtmpl: resource title is invalid")
+		return nil, nil, "", errors.New("cardtmpl: resource title is invalid")
 	}
 	if content.ActorAvatar != "" {
 		if err := requireHTTPS(content.ActorAvatar); err != nil {
-			return nil, fmt.Errorf("cardtmpl: actor avatar URL: %w", err)
+			return nil, nil, "", fmt.Errorf("cardtmpl: actor avatar URL: %w", err)
 		}
 	}
 	if content.Source.IconURL != "" {
 		if err := requireHTTPS(content.Source.IconURL); err != nil {
-			return nil, fmt.Errorf("cardtmpl: source icon URL: %w", err)
+			return nil, nil, "", fmt.Errorf("cardtmpl: source icon URL: %w", err)
 		}
 	}
-	deepLink, err := docsDeepLink(webLoginURL, docID, spaceID)
+	deepLink, err = docsDeepLink(webLoginURL, docID, spaceID)
 	if err != nil {
-		return nil, err
+		return nil, nil, "", err
 	}
-	lang := i18n.OutboundLanguage(ctx)
 	labels := labelsForLanguage(lang)
 
-	body := []interface{}{
+	body = []interface{}{
 		docsApprovalHeader(content.HeaderLabel, content.StatusLabel, "Warning"),
 		docsApprovalTitle(content.Title),
 		docsBanner(content.Actor, content.BannerSuffix),
@@ -142,43 +177,32 @@ func BuildDocsAccessRequestCard(
 		"action_type": "access_request.decision",
 		"doc_id":      docID,
 		"request_id":  requestID,
-		// doc_title / actor are display context the web deny dialog reads locally to
-		// render "<actor> will not get access to <title>". They are not the reason
-		// channel (that is the declared deny_reason input) and the server still
-		// re-extracts data from the stored frame — a client copy is never trusted.
-		// Bound both to the same caps the render paths use so the persisted frame /
-		// wire payload can't grow unbounded (Title is already validated <= maxTitleRunes
-		// at entry; Actor is only display-truncated in the helpers, so bound it here).
-		"doc_title": content.Title,
-		"actor":     truncateRunes(strings.TrimSpace(content.Actor), maxActorRunes),
+		"doc_title":   content.Title,
+		"actor":       truncateRunes(strings.TrimSpace(content.Actor), maxActorRunes),
 	}
 	approveData := copyActionData(baseData)
 	approveData["decision"] = "approve"
 	denyData := copyActionData(baseData)
 	denyData["decision"] = "deny"
 
-	document := map[string]interface{}{
-		"type":     "AdaptiveCard",
-		"version":  cardmsg.CardVersion,
-		"metadata": buildMetadata(deepLink, content.Variant, content.Source),
-		"body":     body,
-		"actions": []interface{}{
-			map[string]interface{}{"type": "Action.OpenUrl", "title": labels.viewDetails, "url": deepLink},
-			map[string]interface{}{
-				"type": "Action.Submit", "id": DocsDenyActionID, "title": actions.DenyTitle,
-				"style": "destructive", "data": denyData,
-			},
-			map[string]interface{}{
-				"type": "Action.Submit", "id": DocsApproveActionID, "title": actions.ApproveTitle,
-				"style": "positive", "data": approveData,
-			},
+	cardActions = []interface{}{
+		// Note: Action.OpenUrl has no id here — the interaction contract lock
+		// (pkg/cardtmpl/docs_access_request/handoff/.../reports/pending.interaction.json)
+		// expects the "view_document" id only in the Registry.Render path;
+		// the legacy wrapper (BuildDocsAccessRequestCard) keeps its historical
+		// no-id shape byte-for-byte, so the migration baseline diff is truly
+		// only the two new metadata.octo.{protocol,template} fields.
+		map[string]interface{}{"type": "Action.OpenUrl", "title": labels.viewDetails, "url": deepLink},
+		map[string]interface{}{
+			"type": "Action.Submit", "id": DocsDenyActionID, "title": actions.DenyTitle,
+			"style": "destructive", "data": denyData,
+		},
+		map[string]interface{}{
+			"type": "Action.Submit", "id": DocsApproveActionID, "title": actions.ApproveTitle,
+			"style": "positive", "data": approveData,
 		},
 	}
-	raw, err := json.Marshal(document)
-	if err != nil {
-		return nil, fmt.Errorf("cardtmpl: marshal docs access request card: %w", err)
-	}
-	return raw, nil
+	return body, cardActions, deepLink, nil
 }
 
 // BuildDocsApprovalOutcomeCard renders the terminal (已允许 / 已拒绝) docs card:

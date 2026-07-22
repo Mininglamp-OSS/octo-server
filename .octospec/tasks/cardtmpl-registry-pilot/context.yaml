@@ -1,0 +1,17 @@
+injected:
+  - id: error-handling
+    source: repo
+    reason: brief tags include error-response/i18n/wire-contract; touches pkg/errcode use and httperr.ResponseErrorL mapping in modules/notify path.
+  - id: trust-boundary
+    source: repo
+    reason: brief tags include trust-boundary/escape/markdown/url-destination; deep-link https allowlist, escapeMarkdown, and Action.Submit data whitelist all cross the boundary between docs-backend input and rendered card body.
+  - id: space-isolation
+    source: repo
+    reason: brief tags include auth; docs-notify path already flows through spaceID + memberCache verification; new Registry.Render integration must preserve those checks (pilot does not add new routes, only reshapes internal call).
+  - id: testing
+    source: repo
+    reason: brief adds conformance test + regression baseline + interaction lock; A15/A16/A11 spell out coverage-proportional tests.
+  - id: commit-style
+    source: repo
+    reason: applies universally; PR title/body English + Conventional Commits.
+brief: .octospec/tasks/cardtmpl-registry-pilot/brief.md

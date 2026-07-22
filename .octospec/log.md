@@ -4,6 +4,35 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-22 (cardtmpl-registry-pilot)
+
+- **Feature** — Introduced the octo-card@1.0 platform base
+  (`pkg/cardtmpl.Template` + `Registry` + `Registry.Render`
+  8-step pipeline) and migrated `docs.access-request@0.2.0` as the
+  first L2a pilot. `metadata.octo.{protocol,template}` are now
+  injected by the base on every payload rendered through the registry
+  (docs approval-request cards, initially).
+- **Contract** — `docs/platform-card-base.md` is added as the L0
+  authoritative contract; `docs/l2b-owners.md` reserves the empty L2b
+  owner allowlist. Handoff artefacts (manifest / contract /
+  samples / reports) live at
+  `pkg/cardtmpl/docs_access_request/handoff/docs.access-request@0.2.0/`
+  and are the machine-readable cross-repo reference.
+- **Behavior change** — For docs `access_requested` cards with the
+  approval gate on, schema-level field errors returned by
+  `Registry.Render` (typed `cardtmpl.ErrFieldsInvalid`) now become
+  **HTTP 400 zero-delivery** rather than degrading to a plain-text DM
+  (C1 policy).
+- **Fix / hardening** — Rewrote the pilot `pending.interaction.json`
+  to match real Go action IDs and dataKeys, so the A15c interaction
+  contract lock is code-vs-report equality instead of a
+  design-phase-vs-code superset check.
+- **Learning** — Deposited
+  `cardtmpl-registry-pilot.md` under `.octospec/learnings/pending/`:
+  a handoff schema authored for a *full compiled card* is NOT the
+  same as a caller-input schema and should not be wired unchanged as
+  the Registry input contract.
+
 ## 2026-07-20 (route-missing-retry)
 
 - **Fix** — Card-action dispatch (`internal/cardactiondispatch`) now **defers** a
