@@ -379,6 +379,10 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 	// 后者是收敛后的真源 key（与 octo-web ChannelSearch、octo-admin messages_search
 	// 命名一致）。两个分支共用同一计算结果，避免 Resolve 被调用多次。
 	searchEnabled := searchbackend.Resolve(cn.ctx.GetConfig().ZincSearch.SearchOn).SearchEnabled()
+	messageReaction := buildMessageReactionCapability(
+		cn.systemSettings.MessageReactionReadEnabled(),
+		cn.systemSettings.MessageReactionWriteEnabled(),
+	)
 	if versionI64 != 0 && int(versionI64) >= appConfigM.Version {
 		c.JSON(http.StatusOK, &appConfigResp{
 			Version:                appConfigM.Version,
@@ -392,6 +396,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 			DocsOn:                 cn.systemSettings.DocsEnabled(),
 			DmloopOn:               cn.systemSettings.DmloopEnabled(),
 			DmpersonalOn:           cn.systemSettings.DmpersonalEnabled(),
+			MessageReaction:        messageReaction,
 			// Sticker 上限:短路分支同样下发,让老客户端在管理台放宽/收窄后
 			// 也能立刻拿到最新值。
 			StickerUploadLimits: buildStickerUploadLimitsResp(cn.systemSettings),
@@ -440,9 +445,14 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 		DocsOn:                 cn.systemSettings.DocsEnabled(),
 		DmloopOn:               cn.systemSettings.DmloopEnabled(),
 		DmpersonalOn:           cn.systemSettings.DmpersonalEnabled(),
+		MessageReaction:        messageReaction,
 		// Sticker 上限:客户端本地预校验用,兜底仍在服务端 modules/file 侧。
 		StickerUploadLimits: buildStickerUploadLimitsResp(cn.systemSettings),
 	})
+}
+
+func buildMessageReactionCapability(read, write bool) messageReactionCapabilityResp {
+	return messageReactionCapabilityResp{Read: read, Write: write}
 }
 
 // buildStickerUploadLimitsResp 从 SystemSettings 派生一份 stickerUploadLimitsResp
@@ -820,6 +830,12 @@ type appConfigResp struct {
 	DmloopOn     bool `json:"dmloop_on"`
 	DmpersonalOn bool `json:"dmpersonal_on"`
 
+	// MessageReaction is the deployment-wide default capability for ordinary
+	// Web/iOS/Android clients. It is intentionally identity-agnostic because
+	// /v1/common/appconfig is public; Bot-specific overrides belong to the
+	// authenticated Bot profile contract.
+	MessageReaction messageReactionCapabilityResp `json:"message_reaction"`
+
 	// StickerUploadLimits 是自定义贴纸上传的操作端可调上限，与 sticker.upload_*
 	// system_setting 同源（SystemSettings.StickerUpload{MaxSizeKB,MaxDimension,
 	// AllowedFormats}）。用途：让客户端在选图后本地预校验（提示"最大 X MB / 最长
@@ -847,6 +863,11 @@ type appConfigResp struct {
 	// compress_max_concurrency / compress_timeout_ms）—— 这些是服务端"影子"参数，
 	// 响应字段结构不变、无对应客户端行为，曝光只会泄露实现细节。
 	StickerUploadLimits stickerUploadLimitsResp `json:"sticker_upload_limits"`
+}
+
+type messageReactionCapabilityResp struct {
+	Read  bool `json:"read"`
+	Write bool `json:"write"`
 }
 
 // stickerUploadLimitsResp 是 appConfigResp.sticker_upload_limits 的形状。

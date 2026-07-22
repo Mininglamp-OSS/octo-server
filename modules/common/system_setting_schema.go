@@ -141,6 +141,13 @@ var systemSettingSchema = []settingDef{
 	{Category: "sticker", Key: "custom_enabled", Type: settingTypeBool, Description: "是否向客户端展示自定义贴纸管理入口",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.StickerCustomEnabled()) }},
 
+	// 普通 Web/iOS/Android 客户端的消息 Reaction 能力。read/write 独立灰度：默认可读
+	// 不可写；Bot 身份覆盖后续由独立 /v1/bot/profile 处理，不在公共 appconfig 推断身份。
+	{Category: "message_reaction", Key: "read", Type: settingTypeBool, Description: "是否向普通客户端展示和下发消息 Reaction（默认开启；Bot 能力另行下发）",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.MessageReactionReadEnabled()) }},
+	{Category: "message_reaction", Key: "write", Type: settingTypeBool, Description: "是否向普通客户端展示添加/取消 Reaction 入口（默认关闭；Bot 能力另行下发）",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.MessageReactionWriteEnabled()) }},
+
 	// 自定义贴纸上传句柄强制开关（P0: Sticker Handle Enforcement Rollout）。这是「强制
 	// 策略」，与「签名能力」OCTO_MASTER_KEY 彻底解耦——能力是部署级 env，策略是运营可
 	// 在管理台热切的 DB 真源，互不派生。关闭（默认）= 兼容期：缺 handle 暂放行并记
