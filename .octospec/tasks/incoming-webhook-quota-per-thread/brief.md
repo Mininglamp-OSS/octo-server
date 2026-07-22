@@ -1,7 +1,7 @@
 ---
 type: Task
 title: "Task: incoming-webhook-quota-per-thread"
-description: Move the incoming-webhook creation quota from per-parent-group to per-delivery-scope so each 子区 (thread) gets its own independent webhook budget; the group itself and every thread each count against their own cap instead of sharing one.
+description: Move the incoming-webhook creation quota from per-parent-group to per-delivery-scope so each 子区 (thread) gets its own independent webhook budget, plus two precise-control knobs — max_per_thread (per-thread cap decoupled from the group cap) and max_total_per_group (group-wide aggregate ceiling).
 tags: ["incomingwebhook", "thread", "webhook", "quota", "space", "isolation", "bot-api", "error-response", "i18n"]
 timestamp: 2026-07-22T10:44:01Z
 # --- octospec extension fields ---
@@ -38,6 +38,23 @@ Concretely, both quota layers in `insertWithQuota`
 
 The `FOR UPDATE` lock stays on the **parent group row** (`db.go:58-63`) — only the
 count dimension narrows. No schema change, no data migration.
+
+**Follow-on (added per user request during implementation): precise control.**
+Two system-settings knobs let operators tune the counts instead of one shared
+value (revises decision A below):
+
+- **`max_per_thread`** — a per-thread scope cap **decoupled** from the group-self
+  `max_per_group` (so e.g. group 10 / each thread 3). Unset → falls back to
+  `max_per_group`, so behavior is unchanged until configured.
+- **`max_total_per_group`** — a group-wide **aggregate ceiling** across the group
+  and all its threads; `0` = disabled (default). Bounds the
+  `max_per_scope × (threads+1)` growth that per-scope quotas alone allow, since
+  thread creation itself is uncapped (raised in review by yujiawei).
+
+`insertWithQuota` becomes `insertWithQuota(m, quotaLimits{scope, perCreator,
+total})` and evaluates all three layers inside the **same** parent-group
+`FOR UPDATE` critical section, so the added aggregate dimension is race-exact
+(no new lock, no lock-scope change).
 
 ## Background
 
@@ -79,6 +96,12 @@ count dimension narrows. No schema change, no data migration.
     dedicated `max_per_thread` can be added later if per-thread tuning is ever
     needed. (Alternative considered: separate `max_per_thread` setting — more
     config surface + schema/i18n for marginal v1 benefit.)
+    **Revised during implementation** (user request «群聊和子区的 WebHook 数量
+    怎么精确控制»): the `max_per_thread` follow-on WAS added so group-self and each
+    thread can carry different caps, plus a new `max_total_per_group` aggregate
+    ceiling. `max_per_group` keeps its key but now means the *group-self scope*
+    cap; `max_per_creator` still reuses one value per scope (no per-thread-creator
+    knob). See Goal › Follow-on.
   - **(B) Re-scope the per-creator cap too.** Keeping it group-wide while the
     group cap goes per-scope makes the *personal* budget the new bottleneck
     (a member maxes out at 5 across all threads) — which directly re-creates the
@@ -131,11 +154,18 @@ count dimension narrows. No schema change, no data migration.
 
 ## Out of scope
 
-- **A separate `max_per_thread` (or per-creator-per-thread) system_setting** —
-  proposed decision (A) reuses the existing values per-scope; a dedicated
-  per-thread knob is a possible later follow-up, not this task.
+- **A per-creator-per-thread *separate* setting** — the per-creator cap is
+  re-scoped per delivery scope (decision B) but keeps reusing `max_per_creator`;
+  no distinct per-thread-creator knob. (`max_per_thread` and `max_total_per_group`
+  themselves ARE delivered — see Goal › Follow-on.)
+- **Per-group / per-thread quota *overrides*** (a specific group X gets cap Y) —
+  all knobs stay global system-settings; no per-resource config table.
+- **A cap on the *number of threads* per group** — bounding the `(threads+1)`
+  factor at its source lives in the `thread` module, not here; `max_total_per_group`
+  bounds the webhook total instead.
 - **Changing the `FOR UPDATE` lock granularity** — it stays on the parent group
-  row; only the `COUNT(*)` predicate changes.
+  row; only the `COUNT(*)` predicates change (the added aggregate count reuses the
+  same lock).
 - **Any schema / index migration or data backfill** — `channel_type`,
   `thread_short_id`, and `idx_incoming_webhook_thread` already exist; column
   defaults already classify existing rows into the group-self bucket.
@@ -172,10 +202,22 @@ count dimension narrows. No schema change, no data migration.
 - **Both faces enforce identically.** The user face and the bot face
   (`/v1/bot/groups/:group_no/threads/:short_id/incoming-webhooks`) both enforce
   the per-scope caps.
+- **Per-thread cap decoupled (`max_per_thread`).** With `max_per_group=2`,
+  `max_per_thread=1`: the group face allows 2, a thread face allows 1; unset
+  `max_per_thread` falls back to `max_per_group`. Asserted at the settings and
+  HTTP layers.
+- **Aggregate ceiling (`max_total_per_group`).** With the ceiling set to K and
+  scope caps high, creating across the group + threads stops at K total even when
+  a scope still has room; a fresh empty thread scope is blocked once the group
+  total hits K; `0` disables it; soft-delete frees an aggregate slot. Holds under
+  concurrency (12 goroutines across group + 2 threads → exactly K succeed, group
+  total == K, green under `-race`).
 - **Backward compatible.** Existing group webhooks (`thread_short_id=''`) keep
   working; no schema migration is added; the `FOR UPDATE` lock is still on the
-  parent group row (asserted by unchanged concurrency test, if present).
-- **Green checks.** `go test ./modules/incomingwebhook/...` passes including new
-  per-scope quota tests (group/thread and thread/thread independence, per-creator
-  per-scope); `go test ./modules/common/...` passes (settings semantics/desc);
-  `golangci-lint run ./modules/incomingwebhook/... ./modules/common/...` is clean.
+  parent group row; `max_per_thread`/`max_total_per_group` default to "same as
+  group" / "disabled", so nothing changes until an operator opts in.
+- **Green checks.** `go test ./modules/incomingwebhook/...` and
+  `./modules/common/...` pass — **run as real integration tests against MySQL 8.0
+  + Redis + WuKongIM, green under `-race`** (incl. the concurrent per-scope and
+  aggregate-ceiling tests); `golangci-lint run` clean; `make i18n-extract-check` +
+  `make i18n-lint` pass.

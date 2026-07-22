@@ -21,7 +21,15 @@ change-log convention (§7). Newest first.
   (10 / 5) but are reinterpreted "per delivery scope"; setting docs +
   admin schema descriptions + the two 409 quota messages (en-US markers
   + zh-CN) updated. No schema/data migration; existing rows
-  (`thread_short_id=''`) fall into the group-self bucket. See
+  (`thread_short_id=''`) fall into the group-self bucket.
+- **Config (follow-on)** — added two precise-control knobs:
+  `incomingwebhook.max_per_thread` (per-thread scope cap, decoupled from
+  `max_per_group`; falls back to it when unset) and
+  `incomingwebhook.max_total_per_group` (group-wide aggregate ceiling
+  across the group + all threads; `0`=disabled default). `insertWithQuota`
+  evaluates all three quota layers inside the one parent-group `FOR UPDATE`
+  critical section (race-exact; verified by a concurrent aggregate-ceiling
+  test under `-race`). New 409 `mgmt_total_quota_exceeded`. See
   [journal](journal/shared/incoming-webhook-quota-per-thread.md).
 
 ## 2026-07-22 (cardtmpl-registry-pilot)

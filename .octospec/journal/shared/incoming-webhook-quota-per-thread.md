@@ -1,7 +1,7 @@
 ---
 type: Journal
 title: "Journal: incoming-webhook-quota-per-thread"
-description: Re-scoped the incoming-webhook creation quota from per-parent-group to per-delivery-scope (group_no, thread_short_id) so the group itself and each thread (子区) get independent webhook budgets; the FOR UPDATE serialization lock deliberately stays on the parent group row while only the COUNT(*) predicate narrows. Reuses max_per_group/max_per_creator per-scope with no new setting and no schema migration.
+description: Re-scoped the incoming-webhook creation quota from per-parent-group to per-delivery-scope (group_no, thread_short_id) so the group itself and each thread (子区) get independent webhook budgets, then added two precise-control knobs — max_per_thread (per-thread cap decoupled from the group cap) and max_total_per_group (group-wide aggregate ceiling). All quota layers evaluate inside the one parent-group FOR UPDATE critical section, so it stays race-exact; no schema migration.
 tags: ["incomingwebhook", "thread", "webhook", "quota", "space", "isolation", "bot-api", "error-response", "i18n", "testing"]
 timestamp: 2026-07-22T10:44:01Z
 # --- octospec extension fields ---
@@ -55,6 +55,43 @@ task explicitly locked "thread webhooks share the parent group's
 (`.octospec/tasks/incoming-webhook-thread/brief.md`). Product reversed it: Octo
 Loop makes per-thread webhooks routine, so the shared cap became a usability
 blocker.
+
+## Follow-on: precise control (max_per_thread + max_total_per_group)
+
+After the per-scope re-scoping landed, the user asked how to *precisely* control
+group vs thread counts and whether it stays correct under high concurrency. Two
+knobs were added (commit `feat(incomingwebhook): add max_per_thread +
+max_total_per_group quota knobs`):
+
+- **`max_per_thread`** (`Positive`; env `DM_INCOMINGWEBHOOK_MAX_PER_THREAD`) — the
+  thread-scope cap, decoupled from the group-self `max_per_group`. Its getter
+  falls back to `IncomingWebhookMaxPerGroup()` when unset, so it's a pure
+  superset: no behavior change until an operator sets it. The create handler
+  picks `max_per_group` for a group webhook, `max_per_thread` for a thread one.
+- **`max_total_per_group`** (non-`Positive`, `0`=disabled, `[0,3650]`; env
+  `DM_INCOMINGWEBHOOK_MAX_TOTAL_PER_GROUP`) — a group-wide aggregate ceiling. This
+  is the answer to yujiawei's review P2: per-scope quota makes the group total
+  `max_per_scope × (threads+1)`, and thread creation is uncapped, so without a
+  ceiling the aggregate is unbounded. `insertWithQuota` adds a third `COUNT(*)`
+  (no thread filter) when `total > 0`.
+
+`insertWithQuota(m, max, maxPerCreator)` became `insertWithQuota(m,
+quotaLimits{scope, perCreator, total})` — a named struct beats a three-int tail.
+
+**The concurrency answer, made concrete.** All three counts run inside the one
+`SELECT id FROM group … FOR UPDATE` critical section, so adding the aggregate
+dimension is race-exact by construction — no new lock, no lock-scope change. This
+is the direct payoff of the lock-vs-count-scope decoupling (see the learning
+below): once the parent-group row serializes every same-group create, you can add
+*any* number of count dimensions (scope, per-creator, group-total) and each is
+still evaluated against the latest committed state. Pinned by
+`TestThread_TotalQuotaCeilingConcurrent` (12 goroutines across group + 2 threads,
+ceiling K → exactly K succeed, group total == K, green under `-race`).
+
+**Integration-verified.** Unlike the initial landing (static gates only), this
+round was run as real integration tests: MySQL 8.0 + Redis + WuKongIM brought up
+in-sandbox (WuKongIM via the release binary + CI's `WK_*` env, `WK_TOKENAUTHON=false`),
+`go test -race ./modules/common/ ./modules/incomingwebhook/` both green.
 
 ## Structural learnings worth remembering
 
