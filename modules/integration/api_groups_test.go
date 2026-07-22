@@ -542,6 +542,12 @@ func TestIntegrationCreateTeamGroupKeepsIdempotencyKeyOnCreateFailure(t *testing
 	// FRESH integration handler bound to THIS ctx, whose WuKongIM URL points at a dead port, so
 	// CreateGroup's post-commit IMCreateOrUpdateChannel deterministically fails — exercising the
 	// "CreateGroup can error after commit" path the P1 fix is about.
+	// setupIntegrationAPITest shares a single config.Context across the package's
+	// integration tests, so mutating WuKongIM.APIURL here leaks into sibling tests
+	// unless restored. Save the original and restore it via t.Cleanup so the dead
+	// port cannot poison later CreateGroup tests running against the same ctx.
+	origAPIURL := ctx.GetConfig().WuKongIM.APIURL
+	t.Cleanup(func() { ctx.GetConfig().WuKongIM.APIURL = origAPIURL })
 	ctx.GetConfig().WuKongIM.APIURL = "http://127.0.0.1:1"
 	route := libwkhttp.New()
 	route.SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.SourceLanguage)))

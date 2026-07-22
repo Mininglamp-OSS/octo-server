@@ -71,6 +71,20 @@ func (s *stubUserService) GetUserWithUsername(username string) (*user.Resp, erro
 	return nil, nil
 }
 
+// GetUser resolves by uid (scans the seeded users by their UID field), mirroring
+// user.Service.GetUser. Used by Notify.hydrateActorName's server-side name fill.
+func (s *stubUserService) GetUser(uid string) (*user.Resp, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, u := range s.users {
+		if u.UID == uid {
+			cp := *u
+			return &cp, nil
+		}
+	}
+	return nil, nil
+}
+
 func (s *stubUserService) AddUser(req *user.AddUserReq) error {
 	atomic.AddInt32(&s.addUserCount, 1)
 	if s.addUserDelay > 0 {
@@ -929,4 +943,25 @@ func TestNotifyBotUID_FitsUserUIDColumn(t *testing.T) {
 	assert.LessOrEqual(t, len(uid), userUIDColumnLimit,
 		"NotifyBotUID() = %q (%d chars) exceeds user.uid VARCHAR(%d)",
 		uid, len(uid), userUIDColumnLimit)
+}
+
+// hydrateActorName resolves the display name from ActorUID server-side (the
+// durable path: no producer-held user-lookup credential). A pre-resolved name
+// is preserved; an unknown uid leaves the name empty (anonymous fallback).
+func TestNotifyHydrateActorNameFromUID(t *testing.T) {
+	us := newStubUserService()
+	us.users["小明-username"] = &user.Resp{UID: "u-req", Name: "小明"}
+	n := &Notify{userService: us}
+
+	resolved := &DocsCardFields{ActorUID: "u-req"}
+	n.hydrateActorName(resolved)
+	assert.Equal(t, "小明", resolved.ActorName, "uid-only card should resolve the name server-side")
+
+	preset := &DocsCardFields{ActorName: "已给名", ActorUID: "u-req"}
+	n.hydrateActorName(preset)
+	assert.Equal(t, "已给名", preset.ActorName, "a pre-resolved name must not be overridden")
+
+	miss := &DocsCardFields{ActorUID: "u-unknown"}
+	n.hydrateActorName(miss)
+	assert.Equal(t, "", miss.ActorName, "unknown uid leaves name empty (anonymous fallback)")
 }
