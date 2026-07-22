@@ -19,14 +19,14 @@ through `GET /v1/common/appconfig` as:
 {"message_reaction":{"read":true,"write":true}}
 ```
 
-The capability is controlled by the hot-reloaded `system_setting` key
-`message_reaction.enabled`.
+The capability is controlled by the hot-reloaded `system_setting` keys
+`message_reaction.read` and `message_reaction.write`.
 
 ## Load-bearing list
 
-- `message_reaction.enabled` is the single configuration source.
-- The unset default is enabled to preserve the currently deployed user behavior.
-- Enabled maps atomically to `read=true, write=true`; disabled maps to both false.
+- `message_reaction.read` and `message_reaction.write` are the configuration source.
+- The unset defaults are `read=true` and `write=false`.
+- Read and write can be changed independently for staged rollout.
 - Both the full appconfig response and the `version` short-circuit response carry
   the nested capability so an operator toggle is not hidden by client caching.
 
@@ -39,9 +39,8 @@ The capability is controlled by the hot-reloaded `system_setting` key
 
 ## Acceptance
 
-- With no DB override, appconfig returns `read=true, write=true`.
-- With `message_reaction.enabled=false`, appconfig returns both values false.
+- With no DB override, appconfig returns `read=true, write=false`.
+- DB overrides for `message_reaction.read/write` are reflected independently.
 - The version short-circuit response returns the same current capability.
 - The setting is listed and writable through the existing system-setting manager
   surface without a schema migration.
-

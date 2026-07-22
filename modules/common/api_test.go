@@ -761,14 +761,16 @@ func TestGetAppConfig_StickerCustomEnabled_OnVersionShortCircuit(t *testing.T) {
 
 func TestGetAppConfig_MessageReactionCapability(t *testing.T) {
 	tests := []struct {
-		name       string
-		dbEnabled *bool
-		version    string
-		want       bool
+		name      string
+		dbRead    *bool
+		dbWrite   *bool
+		version   string
+		wantRead  bool
+		wantWrite bool
 	}{
-		{name: "unset defaults enabled", want: true},
-		{name: "DB false disables read and write", dbEnabled: boolPtr(false), want: false},
-		{name: "version short circuit keeps current capability", version: "99999999", want: true},
+		{name: "unset defaults read only", wantRead: true, wantWrite: false},
+		{name: "DB overrides read and write independently", dbRead: boolPtr(false), dbWrite: boolPtr(true), wantRead: false, wantWrite: true},
+		{name: "version short circuit keeps current capability", version: "99999999", wantRead: true, wantWrite: false},
 	}
 
 	for _, tt := range tests {
@@ -776,8 +778,11 @@ func TestGetAppConfig_MessageReactionCapability(t *testing.T) {
 			s, ctx := testutil.NewTestServer()
 			f := New(ctx)
 			cleanAllTablesAndReloadSettings(t, ctx)
-			if tt.dbEnabled != nil {
-				setModuleEnabledSetting(t, ctx, "message_reaction", *tt.dbEnabled)
+			if tt.dbRead != nil {
+				setMessageReactionCapabilitySetting(t, ctx, "read", *tt.dbRead)
+			}
+			if tt.dbWrite != nil {
+				setMessageReactionCapabilitySetting(t, ctx, "write", *tt.dbWrite)
 			}
 			require.NoError(t, f.appConfigDB.insert(&appConfigModel{}))
 
@@ -797,13 +802,26 @@ func TestGetAppConfig_MessageReactionCapability(t *testing.T) {
 				} `json:"message_reaction"`
 			}
 			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
-			assert.Equal(t, tt.want, resp.MessageReaction.Read)
-			assert.Equal(t, tt.want, resp.MessageReaction.Write)
+			assert.Equal(t, tt.wantRead, resp.MessageReaction.Read)
+			assert.Equal(t, tt.wantWrite, resp.MessageReaction.Write)
 		})
 	}
 }
 
 func boolPtr(v bool) *bool { return &v }
+
+func setMessageReactionCapabilitySetting(t *testing.T, ctx *config.Context, key string, enabled bool) {
+	t.Helper()
+	v := "0"
+	if enabled {
+		v = "1"
+	}
+	_, err := ctx.DB().InsertInto("system_setting").
+		Columns("category", "key_name", "value", "value_type").
+		Values("message_reaction", key, v, settingTypeBool).Exec()
+	require.NoError(t, err)
+	require.NoError(t, EnsureSystemSettings(ctx).Reload())
+}
 
 // appconfig 必须下发 docs_on：值来源于 system_setting docs.enabled。默认 false，
 // 客户端据此隐藏 docs 模块入口（octo-docs-backend 上线前）。
