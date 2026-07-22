@@ -901,6 +901,14 @@ func (s *Space) updateMemberRole(c *wkhttp.Context) {
 }
 
 // createInvite 创建邀请链接
+// createInviteReq 创建邀请码请求体。
+//
+// Duration 可选，单位秒；0 或缺省表示「永久」（不过期）。
+// 正值按秒计算过期时刻；超长值（> 10 年）在写入层截断，不在此处校验。
+type createInviteReq struct {
+	Duration *int64 `json:"duration"`
+}
+
 func (s *Space) createInvite(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	spaceId := c.Param("space_id")
@@ -919,12 +927,33 @@ func (s *Space) createInvite(c *wkhttp.Context) {
 		return
 	}
 
+	// 解析可选 duration 字段；body 缺失或解析失败时退化为默认行为。
+	var req createInviteReq
+	_ = c.BindJSON(&req)
+
+	now := time.Now()
 	inviteModel := &InvitationModel{
 		SpaceId: spaceId,
 		Creator: loginUID,
 		Status:  1,
 	}
-	applyAutoInviteDefaults(inviteModel, time.Now())
+
+	if req.Duration != nil {
+		if *req.Duration == 0 {
+			// 0 = 永久，ExpiresAt 保持 nil
+		} else if *req.Duration > 0 {
+			t := db.Time(now.Add(time.Duration(*req.Duration) * time.Second))
+			inviteModel.ExpiresAt = &t
+		} else {
+			// 负值：拒绝，duration 无意义
+			respondSpaceRequestInvalid(c, "duration")
+			return
+		}
+	} else {
+		// 未传 duration：使用环境变量 / 默认 TTL（72h）
+		applyAutoInviteDefaults(inviteModel, now)
+	}
+
 	inviteCode, err := s.insertInvitationWithRetry(inviteModel)
 	if err != nil {
 		s.Error("创建邀请链接失败", zap.Error(err), zap.String("spaceId", spaceId))
@@ -932,8 +961,15 @@ func (s *Space) createInvite(c *wkhttp.Context) {
 		return
 	}
 
+	// 构造 expire 字段：永久返回空字符串，有过期时间返回 RFC3339。
+	expireStr := ""
+	if inviteModel.ExpiresAt != nil {
+		expireStr = time.Time(*inviteModel.ExpiresAt).UTC().Format(time.RFC3339)
+	}
+
 	c.Response(map[string]string{
 		"invite_code": inviteCode,
+		"expire":      expireStr,
 	})
 }
 
