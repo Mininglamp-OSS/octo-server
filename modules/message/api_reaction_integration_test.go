@@ -89,7 +89,7 @@ func queryReactionRow(t *testing.T, ctx *config.Context, messageID int64, channe
 	t.Helper()
 	var model *reactionModel
 	_, err := ctx.DB().Select("*").From("reaction_users").
-		Where("channel_id=? and channel_type=? and message_id=? and uid=? and emoji=?",
+		Where("channel_id=? and channel_type=? and message_id=? and uid=? and BINARY emoji=BINARY ?",
 			channelID, channelType, strconv.FormatInt(messageID, 10), testutil.UID, emoji).
 		Load(&model)
 	require.NoError(t, err)
@@ -103,6 +103,17 @@ func decodeToggleResp(t *testing.T, w *httptest.ResponseRecorder) reactionToggle
 	var resp reactionToggleResp
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp), w.Body.String())
 	return resp
+}
+
+func TestReactionEmojiColumnUsesBinaryCollation(t *testing.T) {
+	_, ctx, _ := setupGroupTestData(t)
+
+	var collation string
+	err := ctx.DB().Select("collation_name").From("information_schema.columns").
+		Where("table_schema=database() and table_name='reaction_users' and column_name='emoji'").
+		LoadOne(&collation)
+	require.NoError(t, err)
+	require.Equal(t, "utf8mb4_bin", collation)
 }
 
 func TestReactionAcceptsVisibleMessageAndToggles(t *testing.T) {
@@ -151,21 +162,65 @@ func TestReactionMultipleEmojisIndependent(t *testing.T) {
 		return postReaction(t, s, b)
 	}
 
-	// 点 👍 → 一行
-	require.Equal(t, http.StatusOK, post("👍").Code)
+	// utf8mb4_general_ci 会错误地把两个补充平面 emoji 判等；binary collation
+	// 必须让它们成为两个独立 reaction。
+	thumbsUpResp := post("👍")
+	require.Equal(t, http.StatusOK, thumbsUpResp.Code, thumbsUpResp.Body.String())
+	thumbsUpToggle := decodeToggleResp(t, thumbsUpResp)
+	require.Equal(t, "👍", thumbsUpToggle.Emoji)
+	require.Equal(t, 0, thumbsUpToggle.IsDeleted)
 	assert.Equal(t, 1, countReactionRows(t, ctx, mid))
 
-	// 点 ❤️（不同 emoji）→ 追加独立第二行，两行均 is_deleted=0
-	require.Equal(t, http.StatusOK, post("❤️").Code)
-	assert.Equal(t, 2, countReactionRows(t, ctx, mid))
-	assert.Equal(t, 0, queryReactionRow(t, ctx, mid, groupNo, ct, "👍").IsDeleted)
-	assert.Equal(t, 0, queryReactionRow(t, ctx, mid, groupNo, ct, "❤️").IsDeleted)
+	partyResp := post("🎉")
+	require.Equal(t, http.StatusOK, partyResp.Code, partyResp.Body.String())
+	partyToggle := decodeToggleResp(t, partyResp)
+	require.Equal(t, "🎉", partyToggle.Emoji)
+	require.Equal(t, 0, partyToggle.IsDeleted)
+	require.Equal(t, 2, countReactionRows(t, ctx, mid))
+	thumbsUp := queryReactionRow(t, ctx, mid, groupNo, ct, "👍")
+	party := queryReactionRow(t, ctx, mid, groupNo, ct, "🎉")
+	require.Equal(t, 0, thumbsUp.IsDeleted)
+	require.Equal(t, 0, party.IsDeleted)
+	require.Equal(t, partyToggle.Seq, party.Seq)
 
-	// 再点 👍 → 仅 👍 行 toggle 取消，❤️ 不受影响
-	require.Equal(t, http.StatusOK, post("👍").Code)
-	assert.Equal(t, 1, queryReactionRow(t, ctx, mid, groupNo, ct, "👍").IsDeleted, "👍 独立取消")
-	assert.Equal(t, 0, queryReactionRow(t, ctx, mid, groupNo, ct, "❤️").IsDeleted, "❤️ 不受影响")
-	assert.Equal(t, 2, countReactionRows(t, ctx, mid), "仍是两行，独立 toggle 不新增")
+	w := postReactionSync(t, s, map[string]interface{}{
+		"channel_id": groupNo, "channel_type": ct, "seq": 0,
+	})
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var synced []reactionResp
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &synced), w.Body.String())
+	active := make(map[string]int)
+	for _, reaction := range synced {
+		if reaction.MessageID == strconv.FormatInt(mid, 10) {
+			active[reaction.Emoji] = reaction.IsDeleted
+		}
+	}
+	require.Equal(t, map[string]int{"👍": 0, "🎉": 0}, active)
+
+	// 再点 🎉 → 仅 🎉 行 toggle 取消，👍 不受影响；增量 sync 返回持久化的 🎉 最终态。
+	partyCancelResp := post("🎉")
+	require.Equal(t, http.StatusOK, partyCancelResp.Code, partyCancelResp.Body.String())
+	partyCancel := decodeToggleResp(t, partyCancelResp)
+	require.Equal(t, "🎉", partyCancel.Emoji)
+	require.Equal(t, 1, partyCancel.IsDeleted)
+	require.Greater(t, partyCancel.Seq, partyToggle.Seq)
+	thumbsUp = queryReactionRow(t, ctx, mid, groupNo, ct, "👍")
+	party = queryReactionRow(t, ctx, mid, groupNo, ct, "🎉")
+	require.Equal(t, 0, thumbsUp.IsDeleted, "🎉 toggle must not change 👍")
+	require.Equal(t, 1, party.IsDeleted)
+	require.Equal(t, partyCancel.Seq, party.Seq)
+	require.Equal(t, 2, countReactionRows(t, ctx, mid), "different emoji keep independent rows")
+
+	w = postReactionSync(t, s, map[string]interface{}{
+		"channel_id": groupNo, "channel_type": ct, "seq": partyToggle.Seq,
+	})
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	synced = nil
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &synced), w.Body.String())
+	require.Len(t, synced, 1)
+	require.Equal(t, "🎉", synced[0].Emoji)
+	require.Equal(t, partyCancel.Seq, synced[0].Seq)
+	require.Equal(t, 1, synced[0].IsDeleted)
 }
 
 func TestReactionSameEmojiUpsertNoDuplicate(t *testing.T) {
@@ -278,6 +333,19 @@ func seedReactionFriend(t *testing.T, ctx *config.Context, uid, toUID string) {
 	require.NoError(t, err)
 }
 
+func seedReactionSpaceMember(t *testing.T, ctx *config.Context, spaceID, uid, createdAt string) {
+	t.Helper()
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO `space` (space_id, name, creator, status, created_at, updated_at) VALUES (?,?,?,1,?,?)",
+		spaceID, spaceID, uid, createdAt, createdAt).Exec()
+	require.NoError(t, err)
+	_, err = ctx.DB().InsertBySql(
+		"INSERT INTO `space_member` (space_id, uid, role, status, created_at, updated_at) VALUES (?,?,0,1,?,?)",
+		spaceID, uid, createdAt, createdAt).Exec()
+	require.NoError(t, err)
+	_ = ctx.GetRedisConn().Del("space:member:" + spaceID + ":" + uid)
+}
+
 // insertPersonMessageWithSpace 在 DM 物理频道(fakeChannelID)插入一条带 space_id 的纯文本消息。
 func insertPersonMessageWithSpace(t *testing.T, ctx *config.Context, fakeChannelID string, mid int64, spaceID string) {
 	t.Helper()
@@ -313,8 +381,8 @@ func setupCrossSpaceDM(t *testing.T) (*server.Server, *config.Context, string, i
 	s, ctx := testutil.NewTestServer()
 	resetReactionUIDRateLimit(t, ctx)
 	spaceA, spaceB := "spcA"+strconv.FormatInt(nextShortID.Add(1), 10), "spcB"+strconv.FormatInt(nextShortID.Add(1), 10)
-	seedSpaceMemberRepro(t, ctx, spaceA, testutil.UID, "2020-01-01 00:00:00")
-	seedSpaceMemberRepro(t, ctx, spaceB, testutil.UID, "2020-06-01 00:00:00")
+	seedReactionSpaceMember(t, ctx, spaceA, testutil.UID, "2020-01-01 00:00:00")
+	seedReactionSpaceMember(t, ctx, spaceB, testutil.UID, "2020-06-01 00:00:00")
 	seedReactionFriend(t, ctx, testutil.UID, reactionPeerUID)
 	fakeChannelID := common.GetFakeChannelIDWith(testutil.UID, reactionPeerUID)
 	const mid int64 = 920001
