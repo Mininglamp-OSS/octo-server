@@ -19,6 +19,8 @@ type pendingLabelSet struct {
 	denyTitle     string
 	fallbackNamed string // format: "<actor> ... <docTitle>"
 	fallbackAnon  string // format: "<docTitle>"
+	timeLabel     string // 降级文本里时间行前缀,与 modules/notify.docsLabels.updatedAt 对齐
+	kvSep         string // key/value 分隔符,与 modules/notify.docsLabels.kvSep 对齐
 }
 
 // pendingLabels 选择语言;permission.roleLabel 若非空,套用到 banner 里替代默认"查看者"。
@@ -40,6 +42,8 @@ func pendingLabels(lang string, pf pendingFields) pendingLabelSet {
 			denyTitle:     "拒绝",
 			fallbackNamed: "%s 申请查看文档「%s」,请前往处理。",
 			fallbackAnon:  "有新的文档访问申请「%s」,请前往处理。",
+			timeLabel:     "时间",
+			kvSep:         "：",
 		}
 	}
 	if roleLabel == "" {
@@ -55,6 +59,8 @@ func pendingLabels(lang string, pf pendingFields) pendingLabelSet {
 		denyTitle:     "Deny",
 		fallbackNamed: "%s requested access to \"%s\", please review.",
 		fallbackAnon:  "New access request for \"%s\", please review.",
+		timeLabel:     "At",
+		kvSep:         ": ",
 	}
 }
 

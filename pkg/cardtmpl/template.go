@@ -56,7 +56,10 @@ type TemplateMeta struct {
 	// Views 承载 manifest 里所有已声明的视图 (含未激活的占位视图)。
 	Views map[ViewKey]ViewSpec
 	// ActionContract 非 nil 时,本卡的所有 Action.Submit.data 必须包含
-	// {owner:Owner, action_type:ActionType};注册期与运行期均校验。
+	// {owner:Owner, action_type:ActionType}。校验时机:**注册期、且仅对有 sample 的
+	// v2 view**(selfCheckSamples→assertActionContract,只遍历 card.actions 顶层)。
+	// renderCore 运行期不再重复断言(pilot 由 TestActionContract_ThreeWayConsistency
+	// 覆盖);运行期强断言 + 内联 ActionSet 遍历是 roadmap 的基座硬化项 (#633 P2-3)。
 	ActionContract *TemplateActionContract
 	// Manifest 保留原始 manifest.json bytes,供 /v1/message/card/templates 端点透出。
 	Manifest json.RawMessage

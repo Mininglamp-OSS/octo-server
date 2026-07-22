@@ -92,7 +92,9 @@ func renderCore(
 	br, err := t.Build(ctx, state, fields, env)
 	if err != nil {
 		metricBuildResult(meta.ID, meta.Version, string(view), "render_error")
-		return nil, fmt.Errorf("%w: build: %v", ErrRenderFailed, err)
+		// R4-2: 用 %w 包裹底层 err,让 errors.Is 能穿透探到 context.Canceled /
+		// DeadlineExceeded(caller 取消/超时);此前 %v 丢链,上游只能看到 ErrRenderFailed。
+		return nil, fmt.Errorf("%w: build: %w", ErrRenderFailed, err)
 	}
 
 	// step 5: DeepLink 强制校验 (§5 约束 4)
@@ -105,6 +107,16 @@ func renderCore(
 	src := meta.Source
 	if br.Source != nil {
 		src = *br.Source
+	}
+	// P2-2 (#633): source.iconUrl 也走绝对-https 校验后才注入 metadata。cardmsg.Validate
+	// 只校验渲染卡节点里的 URL,不看 metadata 字段;pilot 服务端置空所以今天 inert,
+	// 但未来模板从较不可信来源填 IconURL 时,不校验会把 javascript:/data:/相对 URL
+	// 透到客户端。DeepLink 已在 step5 校验,这里补上 source iconUrl,保持"上线 URL 全校验"。
+	if strings.TrimSpace(src.IconURL) != "" {
+		if err := AbsoluteHTTPSURL(src.IconURL); err != nil {
+			metricBuildResult(meta.ID, meta.Version, string(view), "render_error")
+			return nil, fmt.Errorf("%w: source iconUrl: %v", ErrRenderFailed, err)
+		}
 	}
 	octo := map[string]any{
 		"protocol": meta.Protocol,
@@ -191,7 +203,11 @@ func AbsoluteHTTPSURL(raw string) error {
 		return errors.New("cardtmpl: url must be absolute https, got empty")
 	}
 	u, err := url.Parse(s)
-	if err != nil || u.Scheme != "https" || u.Host == "" {
+	// R4-3: 用 u.Hostname()!="" 而非 u.Host!="" —— "https://:443/x" 的 Host 是 ":443"
+	// 但 Hostname() 为空(纯端口无主机),旧检查会放过;同时拒绝 userinfo
+	// ("https://user@host") 以避免歧义/钓鱼式 URL。本函数是绝对-https 规则唯一真源
+	// (requireHTTPS / renderCore 的 DeepLink+source iconUrl 均委托),收紧一次全链受益。
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil {
 		return fmt.Errorf("cardtmpl: url must be absolute https, got %q", raw)
 	}
 	return nil

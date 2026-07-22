@@ -156,9 +156,14 @@ func (t *Template) Build(
 	}, nil
 }
 
-// FallbackText 返回纯文本 fallback。当前 pilot 采用简洁模板,与 modules/notify.buildDocsFallbackText
-// 的 access_requested 分支等价。R2-3: actor/title 用 sanitizeLine 消除内部换行/控制字符,
-// 防止调用方通过嵌入 "\n" 伪造多行 DM 视觉 (同 modules/notify.sanitizeLine 语义)。
+// FallbackText 返回纯文本 fallback。R2-3: actor/title 用 sanitizeLine 消除内部换行/
+// 控制字符,防止调用方通过嵌入 "\n" 伪造多行 DM 视觉 (同 modules/notify.sanitizeLine 语义)。
+//
+// R4-1 (#633 blocking): 必须保留申请原因(excerpt)与时间——与迁移前
+// modules/notify.buildDocsFallbackText 的 access_requested 4 行(attribution/title/
+// excerpt/time)信息量对齐。字段均由 mapDocsCardFieldsToJSON 传入(requestReason /
+// requestedAtDisplay);先前只出 actor+title 一行会在降级路径静默丢字段。每个字段
+// 各自 sanitizeLine 后再用 "\n" 连接,内部换行注入仍被消除,只有字段间是合法换行。
 func (t *Template) FallbackText(state cardtmpl.State, fields json.RawMessage, lang string) (string, error) {
 	if state != StatePending {
 		return "", fmt.Errorf("docs.access-request: fallback for state %q not implemented", state)
@@ -170,10 +175,28 @@ func (t *Template) FallbackText(state cardtmpl.State, fields json.RawMessage, la
 	labels := pendingLabels(lang, pf)
 	actor := sanitizeLine(pf.Requester.Name)
 	title := sanitizeLine(pf.Document.Title)
+
+	var b strings.Builder
 	if actor == "" {
-		return fmt.Sprintf(labels.fallbackAnon, title), nil
+		b.WriteString(fmt.Sprintf(labels.fallbackAnon, title))
+	} else {
+		b.WriteString(fmt.Sprintf(labels.fallbackNamed, actor, title))
 	}
-	return fmt.Sprintf(labels.fallbackNamed, actor, title), nil
+	// 申请原因(与 legacy excerpt 行对齐:裸文本一行)
+	if reason := sanitizeLine(pf.RequestReason); reason != "" {
+		b.WriteString("\n")
+		b.WriteString(reason)
+	}
+	// 时间(与 legacy "时间：<ts>" 行对齐);requestedAtDisplay 优先,回退 messageTimeDisplay
+	ts := sanitizeLine(pf.RequestedAtDisplay)
+	if ts == "" {
+		ts = sanitizeLine(pf.MessageTimeDisplay)
+	}
+	if ts != "" {
+		b.WriteString("\n")
+		b.WriteString(labels.timeLabel + labels.kvSep + ts)
+	}
+	return b.String(), nil
 }
 
 // sanitizeLine 与 modules/notify.sanitizeLine 语义一致:控制字符 (含 \n \r \t) 替换成

@@ -92,10 +92,46 @@ func TestRender_HonorsCancelledContext(t *testing.T) {
 	if !errors.Is(err, cardtmpl.ErrRenderFailed) {
 		t.Errorf("want ErrRenderFailed, got %v", err)
 	}
+	// R4-2: renderCore 用 %w 包裹 Build err,errors.Is 必须能穿透探到 context.Canceled。
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("want errors.Is(err, context.Canceled) true (ctx chain preserved), got %v", err)
+	}
 
 	// sanity:未取消时同样输入必须成功,证明失败确由 ctx 取消所致。
 	if _, err := r.Render(context.Background(),
 		docsaccessrequest.TemplateID, "", docsaccessrequest.StatePending, sample, env); err != nil {
 		t.Fatalf("baseline (uncancelled) Render failed: %v", err)
+	}
+}
+
+// TestAbsoluteHTTPSURL 验证 R4-3:绝对-https 单一真源。除 scheme/空 host 外,
+// 还要拒绝 "https://:443"(纯端口无 hostname,旧 u.Host!="" 会放过)与 userinfo。
+func TestAbsoluteHTTPSURL(t *testing.T) {
+	ok := []string{
+		"https://cdn.example.com/a.png",
+		"https://host:8443/x",
+		"https://a.b.c",
+	}
+	bad := []string{
+		"",                     // 空
+		"http://ok.com",        // 非 https
+		"ftp://x",              // 非 https
+		"https://",             // 无 host
+		"https:///path",        // 无 host(首字符斜杠)
+		"https://?q=1",         // host 空(query 紧跟)
+		"https://#frag",        // host 空(fragment 紧跟)
+		"https://:443/x",       // 纯端口无 hostname —— R4-3 收紧点
+		"https://user@host/x",  // userinfo —— R4-3 拒绝
+		"https://user:pw@host", // userinfo —— R4-3 拒绝
+	}
+	for _, u := range ok {
+		if err := cardtmpl.AbsoluteHTTPSURL(u); err != nil {
+			t.Errorf("AbsoluteHTTPSURL(%q) = %v, want nil", u, err)
+		}
+	}
+	for _, u := range bad {
+		if err := cardtmpl.AbsoluteHTTPSURL(u); err == nil {
+			t.Errorf("AbsoluteHTTPSURL(%q) = nil, want error", u)
+		}
 	}
 }

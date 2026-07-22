@@ -95,27 +95,50 @@ func TestRegisterAndRender_Smoke(t *testing.T) {
 	t.Logf("payload size = %d bytes", len(raw))
 }
 
-// TestFallbackText_SanitizesNewlines 验证 R2-3:FallbackText 对 actor/title 里
-// 嵌入的换行/回车/制表等控制字符做 sanitizeLine (替空格) —— 防止调用方通过
-// "Ann\nEvil line" 伪造多行 DM 视觉。产物必须是单行纯文本。
-func TestFallbackText_SanitizesNewlines(t *testing.T) {
+// TestFallbackText_ParityAndSanitize 验证:
+//   - R4-1 (#633 blocking):FallbackText 保留 excerpt(requestReason)与时间
+//     (requestedAtDisplay),不在降级路径丢字段(与 legacy 4 行信息量对齐);
+//   - R2-3:每个字段各自 sanitizeLine,内部 \n\r\t 被替空格,只有字段间是合法换行
+//     —— 调用方无法通过 "Ann\nEvil" 在字段内伪造多余行。
+func TestFallbackText_ParityAndSanitize(t *testing.T) {
 	tmpl := docsaccessrequest.New() // FallbackText 不依赖 Meta,无需 Register
 	fields := json.RawMessage(
 		`{"requestId":"r1","state":"pending",` +
 			`"document":{"title":"Title\nInjected"},` +
-			`"requester":{"name":"Ann\r\nEvil\tspoof"}}`,
+			`"requester":{"name":"Ann\r\nEvil\tspoof"},` +
+			`"requestReason":"why\nplease","requestedAtDisplay":"2026-01-01\t12:00"}`,
 	)
 	for _, lang := range []string{"zh-CN", "en"} {
 		text, err := tmpl.FallbackText(docsaccessrequest.StatePending, fields, lang)
 		if err != nil {
 			t.Fatalf("FallbackText(lang=%q): %v", lang, err)
 		}
-		if strings.ContainsAny(text, "\n\r\t") {
-			t.Errorf("lang=%q fallback contains raw control char: %q", lang, text)
+		// 字段内 \r/\t 必须已被 sanitize 成空格,全文不得残留。
+		if strings.ContainsAny(text, "\r\t") {
+			t.Errorf("lang=%q fallback contains raw CR/TAB: %q", lang, text)
 		}
-		if text == "" {
-			t.Errorf("lang=%q fallback empty", lang)
+		// 恰好 3 个字段行(actor+title / reason / time);证明注入的 "\n" 未新增行。
+		lines := strings.Split(text, "\n")
+		if len(lines) != 3 {
+			t.Errorf("lang=%q want 3 field lines, got %d: %q", lang, len(lines), text)
 		}
+		// R4-1 parity:excerpt 与 time 内容必须出现(sanitize 后)。
+		if !strings.Contains(text, "why please") {
+			t.Errorf("lang=%q fallback dropped excerpt: %q", lang, text)
+		}
+		if !strings.Contains(text, "2026-01-01 12:00") {
+			t.Errorf("lang=%q fallback dropped time: %q", lang, text)
+		}
+	}
+
+	// 无 reason/time 时退回单行(actor+title),不产生空字段行。
+	minimal := json.RawMessage(`{"requestId":"r1","state":"pending","document":{"title":"T"},"requester":{"name":"Ann"}}`)
+	text, err := tmpl.FallbackText(docsaccessrequest.StatePending, minimal, "zh-CN")
+	if err != nil {
+		t.Fatalf("FallbackText(minimal): %v", err)
+	}
+	if strings.ContainsAny(text, "\n\r\t") {
+		t.Errorf("minimal fallback should be single line, got %q", text)
 	}
 }
 
