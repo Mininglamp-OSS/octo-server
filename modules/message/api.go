@@ -2162,7 +2162,7 @@ func (m *Message) addOrCancelReaction(c *wkhttp.Context) {
 	}
 	// 多 reaction：按 (uid, message_id, channel, emoji) 原子 toggle。同 emoji 命中唯一键翻转
 	// is_deleted，不同 emoji 落各自独立行（追加）。返回最终 is_deleted 供 Web 乐观更新对账。
-	isDeleted, err := m.messageReactionDB.toggleReaction(&reactionModel{
+	toggleResult, err := m.messageReactionDB.toggleReaction(&reactionModel{
 		ChannelID:   fakeChannelID,
 		ChannelType: req.ChannelType,
 		UID:         loginUID,
@@ -2173,6 +2173,17 @@ func (m *Message) addOrCancelReaction(c *wkhttp.Context) {
 	})
 	if err != nil {
 		m.Error("写入消息回应失败", zap.Error(err), zap.String("channel_id", fakeChannelID), zap.String("message_id", req.MessageID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
+		return
+	}
+	if toggleResult.Emoji != req.Emoji {
+		m.Error("reaction 持久化结果与请求 emoji 不一致",
+			zap.String("channel_id", fakeChannelID),
+			zap.String("message_id", req.MessageID),
+			zap.String("uid", loginUID),
+			zap.String("requested_emoji", req.Emoji),
+			zap.String("persisted_emoji", toggleResult.Emoji),
+			zap.Int64("persisted_seq", toggleResult.Seq))
 		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
@@ -2189,8 +2200,8 @@ func (m *Message) addOrCancelReaction(c *wkhttp.Context) {
 			"message_id":   req.MessageID,
 			"channel_id":   req.ChannelID,
 			"channel_type": req.ChannelType,
-			"emoji":        req.Emoji,
-			"seq":          seq,
+			"emoji":        toggleResult.Emoji,
+			"seq":          toggleResult.Seq,
 		},
 	})
 	if err != nil {
@@ -2203,9 +2214,9 @@ func (m *Message) addOrCancelReaction(c *wkhttp.Context) {
 		MessageID:   req.MessageID,
 		ChannelID:   req.ChannelID,
 		ChannelType: req.ChannelType,
-		Emoji:       req.Emoji,
-		Seq:         seq,
-		IsDeleted:   isDeleted,
+		Emoji:       toggleResult.Emoji,
+		Seq:         toggleResult.Seq,
+		IsDeleted:   toggleResult.IsDeleted,
 	})
 }
 
