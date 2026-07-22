@@ -186,7 +186,13 @@ func BuildDocsAccessRequestBodyWithLang(
 	denyData["decision"] = "deny"
 
 	cardActions = []interface{}{
-		map[string]interface{}{"type": "Action.OpenUrl", "id": "view_document", "title": labels.viewDetails, "url": deepLink},
+		// Note: Action.OpenUrl has no id here — the interaction contract lock
+		// (pkg/cardtmpl/docs_access_request/handoff/.../reports/pending.interaction.json)
+		// expects the "view_document" id only in the Registry.Render path;
+		// the legacy wrapper (BuildDocsAccessRequestCard) keeps its historical
+		// no-id shape byte-for-byte, so the migration baseline diff is truly
+		// only the two new metadata.octo.{protocol,template} fields.
+		map[string]interface{}{"type": "Action.OpenUrl", "title": labels.viewDetails, "url": deepLink},
 		map[string]interface{}{
 			"type": "Action.Submit", "id": DocsDenyActionID, "title": actions.DenyTitle,
 			"style": "destructive", "data": denyData,

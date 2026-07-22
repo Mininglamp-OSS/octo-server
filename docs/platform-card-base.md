@@ -618,41 +618,58 @@ label `template_id` 基数 = 注册表大小（硬编码），无基数爆炸。
 
 按 brief 走，基座能力随 pilot 一起交付：
 
-1. **PR-0（基座骨架，无业务迁移）**
-   - 新增 `pkg/cardtmpl/template.go`（Template 接口+类型）、`registry.go`、`helpers.go`（从 resource.go 抽出共用工具）、`updater.go`（封装 CardUpdater）、`metrics.go`；
-   - 新增 `pkg/cardtmpl/testdata/handoff/` 目录结构说明（仅 README，不放业务卡）；
-   - 新增 `/v1/message/card/templates` 只读端点(pilot 注册前返回空);
-   - conformance test 骨架（A7），空 registry 下通过。
+1. **PR-0 + PR-1（合并交付,cardtmpl-registry-pilot task）**
+   实际落地形态(与早期规划的差异都源自 §16 显式收敛 + Go embed 约束):
+   - `pkg/cardtmpl/template.go`(Template 接口 3 方法 + `TemplateMeta` 等类型);
+   - `pkg/cardtmpl/registry.go`(`Register/SetDefault/Freeze/Lookup/List/RegisteredForTest` + owner allowlist + Register 期 sample self-check);
+   - `pkg/cardtmpl/render.go`(唯一入口 `Registry.Render` 8 步流水线 + `renderCore`);
+   - `pkg/cardtmpl/metrics.go`(`cardtmpl_build_total`);
+   - `pkg/cardtmpl/default_registry.go`(pkg-scoped default,composition root SetDefaultRegistry);
+   - **未新增独立 `helpers.go`**:legacy `pkg/cardtmpl/resource.go` 里的 `escapeMarkdown`/`truncateRunes`/`requireHTTPS`/`labelsForLanguage` 是包内可见的私有函数,pilot 与 legacy 同包内直接复用,不需要抽独立文件;
+   - **未新增 `updater.go`**(§16 显式列 out-of-scope,等 outcome PR 一起做);
+   - **未新增 `/v1/message/card/templates` 端点**(§16 显式列 out-of-scope,`Registry.List` 内部可用);
+   - handoff 4 类制品(manifest / contract / samples / reports)**直接落到 pilot 子包**:
+     `pkg/cardtmpl/docs_access_request/handoff/docs.access-request@0.2.0/` —— 而非最初设计的
+     `pkg/cardtmpl/testdata/handoff/…`。原因:Go 的 `//go:embed` 拒绝 `.`/`..` 且不能跨父目录,
+     每张 L2a 卡都必须在自己的子包里 embed 自己的 handoff。**每张卡自持 handoff 是 L1 目录的正解**,
+     未来 L2a 增卡直接照 pilot 目录形态复制即可;
+   - `pkg/cardtmpl/docs_access_request/{template.go, labels.go}` 实现 Template 接口(3 方法:Meta/Build/FallbackText);Build 内部调抽出的 `BuildDocsAccessRequestBodyWithLang(lang,...)` 返回 `BuildResult{Body,Actions,Variant,DeepLink,Source}`;pilot 侧给顶层 Action.OpenUrl 补 `id:"view_document"`(interaction contract 要求),legacy wrapper 保持无 id;
+   - `Source` 按 `env.Lang` 本地化(zh-CN → "文档",其他 → "Docs"),覆盖 Meta.Source 中文默认值(F5);
+   - composition root(`main.installCardTmplRegistry()`)注册 + Freeze,fail-close;
+   - `modules/notify/card.go` access_requested 分支改走 Registry.Render(F7:Registry 未注入 = composition bug,直接 error + ERROR log,不 fallback legacy);
+   - **schema 前移**(F1):`preflightDocsAccessRequestSchema` 在 memberCache/docsSender/gate 之前独立校验,C1 policy 不被"无成员/gate 关"绕过;
+   - **schema 强化**(F1):avatarUrl 补 `pattern:"^(|https://.+)$"`;所有 string 字段补 maxLength;
+   - **fallback 分工**(F6):`buildDocsFallbackText` 对 access_requested + gate + Registry-ready 分支优先走 Template.FallbackText;
+   - conformance test(A15a-f 五条 + A16 三方一致性)全绿,含**真实的 `cardactiondispatch.Registry.Resolve` 调用**(F3c);
+   - 迁移前/后**字节等价基线**(A11/F4):canonical JSON diff 允许仅三个字段差集(metadata.octo.protocol / metadata.octo.template / Action.OpenUrl.id=view_document)。
 
-2. **PR-1（pilot docs.access-request@0.2.0）**
-   - 把 handoff 4 类制品（manifest/contract/samples/reports）落到 `pkg/cardtmpl/testdata/handoff/docs.access-request@0.2.0/`（**不提 templates/*.tmpl.json 和 goldens**，按 brief A6）；
-   - 新增 `pkg/cardtmpl/docs_access_request/template.go` 实现 Template 接口(3 方法:Meta/Build/FallbackText);Build 内部调抽出的 `buildDocsAccessRequestBodyWithLang(lang,...)` 返回 `BuildResult{Body,Actions,Variant,DeepLink}`,不 marshal AC 顶层、不注入 metadata(由 `Registry.Render` 强制注入);现有 `BuildDocsAccessRequestCard` 保留为 legacy 薄 wrapper(内部仍 marshal 完整 AC,给非 Registry 调用者兜底,后续 PR 迁移完可删);
-   - composition root 注册 + Freeze；
-   - 修改 `modules/notify/card.go` access_requested 分支为 Lookup→Build（A9），schema/kind 错返 400，render 错仍降级（决策 C1）；
-   - 加入迁移前/后字节等价基线（A11）；
-   - ActionContract 三方一致性 test（A8）；conformance test 全绿。
+2. **PR-2(文档,独立)** — 未合入本 PR
+   - 更新 `.octospec/tasks/card-message-internal-dispatch/docs-notify-contract.md`,引用本基座文档和 handoff 路径;
+   - 本基座文档已随 pilot PR 迁入 `docs/platform-card-base.md`(仓库权威路径),不再等 PR-2。
 
-3. **PR-2（文档）**
-   - 更新 `.octospec/tasks/card-message-internal-dispatch/docs-notify-contract.md`，引用基座契约文档和 testdata 路径；
-   - 在 `.context/docs/` 或 `docs/` 放本基座契约文档的对外版本（给 docs-backend/octo-web 联调）；
-   - 把本文件搬到正式 docs 路径。
-
-4. **后续 PR（非 pilot）**
-   - 迁 `docs.shared/commented`、`summary.completed/failed`、`generic.approval`、`docs.access.outcome` 到 Registry；
-   - 开放 JSON 模板模式（`templates/*.template.json` + 表达式引擎）；
-   - 开放 envelope 模式（调用方显式传 `template_id`），替换 `NotifyReq` 四选一；
+3. **后续 PR(非 pilot)**
+   - 迁 `docs.shared/commented`、`summary.completed/failed`、`generic.approval`、`docs.access.outcome` 到 Registry;outcome 与 `pkg/cardrevision` + `standard_action_finalizer` 联动,同一 PR 引入 `CardUpdater`;
+   - 开放 `/v1/message/card/templates` 只读端点(涉及 per-owner 可见性 / i18n 文案透出);
+   - 开放 JSON 模板模式(`templates/*.template.json` + 表达式引擎);
+   - 开放 envelope 模式(调用方显式传 `template_id`),替换 `NotifyReq` 四选一;
    - 契约导出端点的 i18n 文案返回。
 
 ---
 
 ## 16. 不做什么（Out of scope, 对齐 brief）
 
-- 不引入 `${}` 表达式引擎（PR-1 阶段）；
-- 不改 `NotifyReq` 外部形状（方案 B）；
-- 不迁非 pilot 模板；
-- 不做客户端渲染分支（只写入 `metadata.octo.template`，客户端侧独立迭代）；
-- 不新增 kill switch env（依赖启动 fail-close + 镜像 revert + 现有卡片总开关）；
-- 不提交 handoff 的 `templates/*.tmpl.json` 和 `goldens/*.card.json`；
+本 PR (cardtmpl-registry-pilot) 明确不做,后续 PR 承接:
+
+- 不引入 `${}` 表达式引擎(PR-1 阶段);
+- 不改 `NotifyReq` 外部形状(方案 B);
+- 不迁非 pilot 模板(summary / docs.shared/commented / generic.approval / docs.access.outcome);
+- **不实现 `CardUpdater`** (§8 定义) —— outcome PR 才有第一个调用者(finalizer 视图切换),提前实现即死代码;
+- **不新增 `/v1/message/card/templates` 公开端点** —— 涉及 per-owner 可见性、能力发现权限、i18n 文案透出,与 pilot 核心无关,单开 PR 更稳;`Registry.List` 内部方法已就位;
+- **不新增独立 `helpers.go` 文件** —— pilot 与 legacy 同 `pkg/cardtmpl` 包,直接复用私有函数;抽独立文件对包外无收益;
+- 不做客户端渲染分支(只写入 `metadata.octo.template`,客户端侧独立迭代);
+- 不新增 kill switch env(依赖启动 fail-close + 镜像 revert + 现有卡片总开关);
+- 不提交 handoff 的 `templates/*.tmpl.json` 和 `goldens/*.card.json`(视觉基线走 pilot 自身输出的迁移前后 canonical diff,不锁 handoff 视觉);
+- **不发布未实现的视图** —— pilot manifest 只声明 pending view;approved/rejected(result view)延后到 outcome PR 发新版本 `docs.access-request@0.3.0`(L1 契约"发布即冻结",不用"未来占位 view");
 - **不开放 L2b 业务自定义通道**:本次只交付 L0 + L2a(`docs.access-request`);L2b 开放条件见 §2.2 约束 5,本 PR 仅引入空 `docs/l2b-owners.md` 清单占位与 `pkg/cardtmpl/ext/` 目录规划,不放代码、不接 owner 前缀校验入生产链路(校验逻辑本 PR 落但只跑 L2a owner 白名单,`ext.` 分支 dead code 有 test 但不 wire)。
 
 ---

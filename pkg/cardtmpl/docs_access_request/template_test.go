@@ -92,3 +92,55 @@ func TestRegisterAndRender_Smoke(t *testing.T) {
 	raw, _ := json.MarshalIndent(payload, "", "  ")
 	t.Logf("payload size = %d bytes", len(raw))
 }
+
+// TestBuild_SourceLocalization 验证 F5:zh-CN → "文档",en → "Docs";
+// Registry 从 manifest.sourceLabel 载入的中文默认值必须被 pilot Build 按
+// env.Lang 覆盖,避免英文卡片带中文来源角标。
+func TestBuild_SourceLocalization(t *testing.T) {
+	r := cardtmpl.NewRegistry()
+	tmpl := docsaccessrequest.New()
+	r.Register(tmpl, docsaccessrequest.Assets, docsaccessrequest.HandoffRoot)
+	r.SetDefault(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersion)
+	r.Freeze()
+
+	sample, err := docsaccessrequest.Assets.ReadFile(
+		docsaccessrequest.HandoffRoot + "/samples/pending.json",
+	)
+	if err != nil {
+		t.Fatalf("read pending sample: %v", err)
+	}
+
+	cases := []struct {
+		lang     string
+		wantSrc  string
+	}{
+		{"zh-CN", "文档"},
+		{"en", "Docs"},
+		{"en-US", "Docs"},
+		{"", "Docs"}, // 未知 lang 默认走英文分支
+	}
+	for _, tc := range cases {
+		t.Run(tc.lang, func(t *testing.T) {
+			env := cardtmpl.BuildEnv{
+				WebLoginURL: "https://web.example.com",
+				Lang:        tc.lang,
+				SpaceID:     "space-1",
+			}
+			payload, err := r.Render(context.Background(),
+				docsaccessrequest.TemplateID, "",
+				docsaccessrequest.StatePending, sample, env)
+			if err != nil {
+				t.Fatalf("Render(lang=%q): %v", tc.lang, err)
+			}
+			card, _ := payload["card"].(map[string]any)
+			metadata, _ := card["metadata"].(map[string]any)
+			octo, _ := metadata["octo"].(map[string]any)
+			source, _ := octo["source"].(map[string]any)
+			got, _ := source["label"].(string)
+			if got != tc.wantSrc {
+				t.Errorf("lang=%q metadata.octo.source.label = %q, want %q",
+					tc.lang, got, tc.wantSrc)
+			}
+		})
+	}
+}

@@ -299,6 +299,23 @@ func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error
 		return nil, errNotifyCardInvalid
 	}
 
+	// C1 policy (docs/platform-card-base.md §10):
+	// Schema-level field errors are caller contract violations — they must reject
+	// the whole request with 400 zero delivery, and be observable at ingress.
+	// Running schema check here (before memberCache, before docsSender gate,
+	// before cardmsg.Enabled) guarantees the check cannot be silently skipped by:
+	//   (a) an empty-member request (200 with delivered=[]),
+	//   (b) docsSender==nil / cardmsg.Enabled()==false (text degradation).
+	// Only the access_requested + gate-on branch flows through Registry.Render;
+	// other kinds keep the historical validate-in-builder behavior.
+	if card.Kind == DocsCardKindAccessRequested && docsApprovalCardsEnabled() {
+		if err := preflightDocsAccessRequestSchema(card); err != nil {
+			n.Warn("docs access-request card rejected at preflight: schema (400)",
+				zap.Error(err), zap.String("space_id", req.SpaceID), zap.String("doc_id", card.DocID))
+			return nil, errNotifyCardInvalid
+		}
+	}
+
 	targets := dedupTargets(req.Targets)
 	if req.ActorUID != "" {
 		tmp := make([]string, 0, len(targets))
@@ -335,13 +352,9 @@ func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error
 		)
 		if card.Kind == DocsCardKindAccessRequested && docsApprovalCardsEnabled() {
 			profile = cardmsg.ProfileV2
+			// F7: 唯一入口。Registry 未注入 = composition bug,不再 fallback 到 legacy
+			// (那样会遮蔽 wiring 漏洞);buildErr non-nil 分类走 render_error 降级文本。
 			doc, buildErr = n.buildDocsAccessRequestCardViaRegistry(context.Background(), req.SpaceID, card, lang)
-			// If Registry.Render is unwired (SetDefaultRegistry not called, e.g.
-			// legacy composition), fall back to the pre-registry builder so the
-			// pilot rollout is bisectable without a hard boot dependency.
-			if errors.Is(buildErr, errCardTmplRegistryUnwired) {
-				doc, buildErr = n.buildDocsAccessRequestCard(context.Background(), req.SpaceID, card, lang)
-			}
 		} else {
 			doc, buildErr = n.buildDocsCard(context.Background(), req.SpaceID, card, lang)
 		}
@@ -537,7 +550,18 @@ func docsAttributionAndVariant(kind, actorName string, labels docsLabels) (strin
 // DM used when a card cannot be built (feature disabled, sender missing, or
 // template/config error). No information is lost — every field that would
 // appear on the card is emitted as a text line.
+//
+// F6: for the access_requested + gate-on + Registry-wired branch, delegate to
+// pilot Template.FallbackText — that is the L0 authoritative fallback for the
+// pilot Template. Other kinds keep the historical multi-line composition.
+// If Template.FallbackText is unavailable (Registry unwired / mapping fails),
+// fall back to the historical composition so callers never lose the text path.
 func buildDocsFallbackText(card *DocsCardFields, lang string) string {
+	if card != nil && card.Kind == DocsCardKindAccessRequested && docsApprovalCardsEnabled() {
+		if text, ok := templateFallbackText(card, lang); ok {
+			return text
+		}
+	}
 	labels := docsLabelsFor(lang)
 	// sanitizeLine the actor before it flows into the attribution line, and each
 	// other caller field, so an embedded newline can't inject a spoofed line.

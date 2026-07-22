@@ -124,12 +124,27 @@ func (t *Template) Build(
 	if err != nil {
 		return cardtmpl.BuildResult{}, err
 	}
+	// pilot Template 给顶层 Action.OpenUrl 补 id "view_document",与
+	// reports/pending.interaction.json 声明一致 (A15c 交互契约锁)。legacy
+	// wrapper (BuildDocsAccessRequestCard) 不加 id,保持迁移前后字节等价基线
+	// (F4);两条路径故意分叉,由本处的一行本地增改承担 "pilot 侧独有" 的差异。
+	for _, a := range cardActions {
+		if am, ok := a.(map[string]interface{}); ok && am["type"] == "Action.OpenUrl" {
+			if _, has := am["id"]; !has {
+				am["id"] = "view_document"
+			}
+			break // 只给第一个 (顶层查看详情) 加 id
+		}
+	}
+	// Source 按 env.Lang 本地化 —— 覆盖 Meta.Source (Registry 从
+	// manifest.sourceLabel 载入中文默认 "文档");F5: 英文卡片不能带中文来源。
+	src := sourceForLang(env.Lang)
 	return cardtmpl.BuildResult{
 		Body:     body,
 		Actions:  cardActions,
 		Variant:  Variant,
 		DeepLink: deepLink,
-		// Source 用 Meta.Source (Registry 从 manifest.sourceLabel 载入)
+		Source:   &src,
 	}, nil
 }
 

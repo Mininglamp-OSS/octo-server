@@ -7,10 +7,17 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/Mininglamp-OSS/octo-server/internal/cardactiondispatch"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	docsaccessrequest "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/docs_access_request"
 )
+
+// notifyBotUID 与 modules/notify.NotifyBotUIDValue 同源;此处直接用字面量,
+// 避免 pkg/cardtmpl_test 反向 import notify 造成循环 (notify 已 import cardtmpl)。
+// 如二者漂移,test 会红,和 main.go:521 的启动 fail-close 一并暴露。
+const notifyBotUID = "notification"
 
 // TestConformance_AllRegisteredTemplates 遍历 RegisteredForTest 集合,对每张 Template
 // 每个已注册 v2 view 断言 docs/platform-card-base.md §4.3 里 4 条 + §5 metadata 5 条:
@@ -88,12 +95,12 @@ func TestConformance_AllRegisteredTemplates(t *testing.T) {
 	}
 }
 
-// TestActionContract_ThreeWayConsistency 修 A16:
+// TestActionContract_ThreeWayConsistency 严格实现 A16 三方一致性:
 //   1. Meta.ActionContract == 期望值 (pilot: docs/access_request.decision)
 //   2. Render 产物 Action.Submit.data.owner/action_type == ActionContract
-//   3. 与 cardactiondispatch.RouteSpec 名字兼容 (Owner/ActionType 命名 pattern)
-// 本 test 只做 owner/action_type 值一致性;真实 Route.Resolve 由
-// internal/cardactiondispatch 的现有 test 覆盖 (main.go:521 启动 fail-close 已保证)。
+//   3. 用 cardactiondispatch.NewRegistry + Resolve(NotifyBotUID, contract.Owner,
+//      contract.ActionType) 必须命中 ResolutionCallback,与 main.go:521 的启动
+//      fail-close 语义同源 —— 任何一处 owner 值 rename 都会立刻在 CI 抓到。
 func TestActionContract_ThreeWayConsistency(t *testing.T) {
 	registry := freshRegistry(t)
 	env := cardtmpl.BuildEnv{
@@ -145,6 +152,43 @@ func TestActionContract_ThreeWayConsistency(t *testing.T) {
 		if submits == 0 {
 			t.Errorf("[%s@%s view state=%s] no Action.Submit in card actions",
 				meta.ID, meta.Version, state)
+		}
+
+		// A16-3: 真去构造 cardactiondispatch.Registry 并 Resolve
+		aRegistry, err := cardactiondispatch.NewRegistry(
+			[]cardactiondispatch.RouteSpec{{
+				SenderUID:   notifyBotUID,
+				Owner:       meta.ActionContract.Owner,
+				ActionType:  meta.ActionContract.ActionType,
+				URL:         "https://test.internal/v1/callback",
+				SecretEnv:   "OCTO_TEST_CALLBACK_SECRET",
+				Timeout:     3 * time.Second,
+				MaxAttempts: 3,
+			}},
+			func(key string) string {
+				if key == "OCTO_TEST_CALLBACK_SECRET" {
+					return "test-callback-secret-32-bytes-min-len!"
+				}
+				return ""
+			},
+		)
+		if err != nil {
+			t.Fatalf("[%s@%s] build cardactiondispatch registry: %v", meta.ID, meta.Version, err)
+		}
+		resolution := aRegistry.Resolve(
+			notifyBotUID,
+			meta.ActionContract.Owner,
+			meta.ActionContract.ActionType,
+		)
+		if resolution.Kind != cardactiondispatch.ResolutionCallback {
+			t.Errorf("[%s@%s] cardactiondispatch.Resolve(%s, %s, %s).Kind = %v, want %v",
+				meta.ID, meta.Version,
+				notifyBotUID,
+				meta.ActionContract.Owner,
+				meta.ActionContract.ActionType,
+				resolution.Kind,
+				cardactiondispatch.ResolutionCallback,
+			)
 		}
 	}
 }

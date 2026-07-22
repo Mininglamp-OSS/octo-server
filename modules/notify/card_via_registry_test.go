@@ -11,18 +11,29 @@ import (
 	docsaccessrequest "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/docs_access_request"
 )
 
-// TestBuildDocsAccessRequestCardViaRegistry_UnwiredFallback 验证 DefaultRegistry
-// 未注入时返回 sentinel error;caller 依赖它判定是否降级到 legacy builder。
-// 这是"新 pilot 不接管失败旧路径也能继续跑"的兼容契约。
-func TestBuildDocsAccessRequestCardViaRegistry_UnwiredFallback(t *testing.T) {
+// TestBuildDocsAccessRequestCardViaRegistry_UnwiredFailsExplicitly 验证 F7:
+// DefaultRegistry 未注入 (composition bug) 现在直接返回 non-nil error;
+// 不再返回 sentinel 让 caller 静默回退到 legacy —— 那样会遮蔽 wiring 漏洞。
+// caller (deliverDocsCardNotification) 会把这个 error 按 render_error 分类,
+// 降级为纯文本 DM (通过 F6 的 buildDocsFallbackText),同时 ERROR 日志促使 SRE 修 wiring。
+func TestBuildDocsAccessRequestCardViaRegistry_UnwiredFailsExplicitly(t *testing.T) {
 	prev := cardtmpl.DefaultRegistry()
 	cardtmpl.SetDefaultRegistry(nil)
 	defer cardtmpl.SetDefaultRegistry(prev)
 
-	n := &Notify{} // ctx nil ok, function should short-circuit on nil registry
+	// 需要 ctx + Log 才不 nil deref;用最小 test notify。
+	wk := newWuKongServer()
+	defer wk.close()
+	ctx := newTestContext(t, wk)
+	n := newTestNotify(ctx, nil, nil, nil, "tk")
+
 	_, err := n.buildDocsAccessRequestCardViaRegistry(context.Background(), "s1", validAccessRequestDocsCard(), "zh-CN")
-	if err == nil || !errors.Is(err, errCardTmplRegistryUnwired) {
-		t.Fatalf("want errCardTmplRegistryUnwired, got %v", err)
+	if err == nil {
+		t.Fatalf("want non-nil error when registry unwired")
+	}
+	// 不应该是 typed ErrFieldsInvalid (那会被 caller 翻 400,而 wiring bug 应走 500/降级)。
+	if errors.Is(err, cardtmpl.ErrFieldsInvalid) {
+		t.Fatalf("unwired should NOT be typed ErrFieldsInvalid, got %v", err)
 	}
 }
 

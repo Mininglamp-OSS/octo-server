@@ -170,6 +170,18 @@ func (r *Registry) Register(t Template, assets embed.FS, root string) {
 		panic(fmt.Errorf("cardtmpl: duplicate registration %s@%s", meta.ID, meta.Version))
 	}
 	r.entries[key] = &entry{tmpl: t, meta: meta, samples: samples}
+
+	// Sample self-check (§5 约束 3 + brief A8/A15/A16 硬化):
+	// 每份 sample 走一次 Render,断言:
+	//   1) Render 无错(schema 通过 sample 已在 loadSamples 保证;这里再验 view/Build 联动);
+	//   2) 若 Meta.ActionContract 非空,产物里每个 Action.Submit.data.{owner,action_type}
+	//      必须与 ActionContract 严格一致 —— 防止 owner 值散布多处飘移,把"code-vs-report
+	//      三方一致性"锁到注册期而非只在 CI test 里(生产 boot 就 fail-close)。
+	// selfCheckEnv 用最小合法值(https origin, zh-CN, space="__selfcheck__"),
+	// deep-link 拼接对 caller 输入无副作用。
+	if err := r.selfCheckSamples(t, meta, samples); err != nil {
+		panic(fmt.Errorf("cardtmpl: register self-check %s@%s: %w", meta.ID, meta.Version, err))
+	}
 }
 
 // SetDefault 显式设置某 id 的默认版本。Freeze 之后调用 → panic。
@@ -327,9 +339,12 @@ func loadInteractionReports(fs embed.FS, root string, views map[ViewKey]struct {
 		p := path.Join(root, "reports", string(vk)+".interaction.json")
 		b, err := fs.ReadFile(p)
 		if err != nil {
-			// 允许"占位式"视图 (声明 states 但未在本 PR 交付 report) 缺失。
-			// 缺失即不注册交互契约,Render 到该 view 时 Build 阶段自然失败。
-			continue
+			// v2 view 声明就必须提供 interaction report。缺失 → 注册期 panic (fail-close),
+			// 与 docs/platform-card-base.md §5 约束 3 一致 —— 交互契约是本档的强制机读锁,
+			// 允许"占位式声明"会导致 Register 通过、Render 到该 view 时才失败。
+			// 需要占位视图? 不要在 manifest.views 里声明它。
+			panic(fmt.Errorf("cardtmpl: v2 view %q declared in %s/manifest.json but %s missing: %w",
+				vk, root, p, err))
 		}
 		var rep InteractionReport
 		if err := json.Unmarshal(b, &rep); err != nil {
@@ -397,4 +412,85 @@ func (r *Registry) entryOf(id ID, version string) (*entry, error) {
 		return nil, fmt.Errorf("%w: %s@%s", ErrTemplateUnknown, id, version)
 	}
 	return e, nil
+}
+
+// selfCheckSamples 在 Register 期用每份 sample 跑一次 Render(不走 mu 加锁,因为
+// 调用方已在 mu.Lock 内),对 v2 视图断言:
+//   - Render 无错(与 cardmsg.Validate 联动);
+//   - 若 Meta.ActionContract 非空,产物里每个 Action.Submit.data.{owner,action_type}
+//     必须与 ActionContract 严格一致。
+//
+// 该 self-check 只 covering 有 sample 的 view;没 sample 的 view 由 conformance test
+// 或运行期 Render 自然捕获。
+func (r *Registry) selfCheckSamples(t Template, meta TemplateMeta, samples map[string]json.RawMessage) error {
+	// 反向索引:name → state (samples 命名与 state 值同名,例 pending.json → State("pending"))
+	for name, raw := range samples {
+		st := State(name)
+		view, ok := meta.stateIndex[st]
+		if !ok {
+			continue // sample 没对应 state 声明,跳过(loader 已对齐 schema,这里只做 render 验证)
+		}
+		vs, hasView := meta.Views[view]
+		if !hasView || vs.WireProfile != profileV2 {
+			continue // 非 v2 view 无 interaction 契约,不需要 self-check owner/action_type
+		}
+		env := BuildEnv{
+			WebLoginURL: "https://selfcheck.internal",
+			Lang:        "zh-CN",
+			SpaceID:     "__cardtmpl_selfcheck__",
+		}
+		payload, err := r.renderWithinLock(t, meta, st, raw, env)
+		if err != nil {
+			return fmt.Errorf("sample %s (state=%s, view=%s) render: %w", name, st, view, err)
+		}
+		if meta.ActionContract != nil {
+			if err := assertActionContract(payload, *meta.ActionContract); err != nil {
+				return fmt.Errorf("sample %s: %w", name, err)
+			}
+		}
+	}
+	return nil
+}
+
+// renderWithinLock 是 selfCheckSamples 用的内部渲染入口,避免 Render 内部再走 entryOf
+// (需要 mu.RLock,而 Register 已 mu.Lock,会 deadlock)。逻辑与 Render 一致但直接
+// 拿 t 和 meta,不 Lookup。
+func (r *Registry) renderWithinLock(
+	t Template, meta TemplateMeta,
+	state State, fields json.RawMessage, env BuildEnv,
+) (map[string]any, error) {
+	// 复用 Render 的核心;把 entry 已知的部分直接传入,避免 lookup。
+	return renderCore(t, meta, state, fields, env)
+}
+
+// assertActionContract 断言 payload["card"]["actions"][*] 里每个 Action.Submit
+// 的 data.owner/action_type 与 contract 一致。
+func assertActionContract(payload map[string]any, contract TemplateActionContract) error {
+	card, _ := payload["card"].(map[string]any)
+	if card == nil {
+		return errors.New("card missing from payload")
+	}
+	acts, _ := card["actions"].([]any)
+	seenSubmit := false
+	for i, a := range acts {
+		am, _ := a.(map[string]any)
+		if am == nil || am["type"] != "Action.Submit" {
+			continue
+		}
+		seenSubmit = true
+		data, _ := am["data"].(map[string]any)
+		if data == nil {
+			return fmt.Errorf("actions[%d] Action.Submit missing data", i)
+		}
+		if o, _ := data["owner"].(string); o != contract.Owner {
+			return fmt.Errorf("actions[%d] data.owner=%q, want %q", i, o, contract.Owner)
+		}
+		if at, _ := data["action_type"].(string); at != contract.ActionType {
+			return fmt.Errorf("actions[%d] data.action_type=%q, want %q", i, at, contract.ActionType)
+		}
+	}
+	if !seenSubmit {
+		return errors.New("ActionContract non-nil but no Action.Submit in card.actions")
+	}
+	return nil
 }

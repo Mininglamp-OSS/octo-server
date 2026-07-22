@@ -45,8 +45,16 @@ func (r *Registry) Render(
 		metricBuildResult(id, version, "", "template_unknown")
 		return nil, err
 	}
-	meta := e.meta
+	return renderCore(e.tmpl, e.meta, state, fields, env)
+}
 
+// renderCore 是 Render 与 Register 期 selfCheckSamples 共享的核心。它接收已解析的
+// Template + Meta,不再走 registry 锁 —— 由调用方确保并发安全 (Render 已经 entryOf
+// 拿到不可变引用后释放锁;selfCheckSamples 已在 Register 的 mu.Lock 内)。
+func renderCore(
+	t Template, meta TemplateMeta,
+	state State, fields json.RawMessage, env BuildEnv,
+) (map[string]any, error) {
 	// step 2: schema 校验入参
 	if len(fields) == 0 {
 		metricBuildResult(meta.ID, meta.Version, "", "fields_invalid")
@@ -76,7 +84,7 @@ func (r *Registry) Render(
 	}
 
 	// step 4: Build
-	br, err := e.tmpl.Build(ctx, state, fields, env)
+	br, err := t.Build(context.Background(), state, fields, env)
 	if err != nil {
 		metricBuildResult(meta.ID, meta.Version, string(view), "render_error")
 		return nil, fmt.Errorf("%w: build: %v", ErrRenderFailed, err)

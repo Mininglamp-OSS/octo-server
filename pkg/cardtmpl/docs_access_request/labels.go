@@ -85,3 +85,14 @@ func cardtmplApprovalActions(approveTitle, denyTitle string) cardtmpl.ApprovalAc
 		DenyTitle:    denyTitle,
 	}
 }
+
+// sourceForLang 返回 metadata.octo.source 的本地化默认值。zh-CN → "文档",
+// 其他 → "Docs"。与 modules/notify.docsLabelsFor.sourceLabel 保持一致 —— 一处
+// 改词表两处都要跟。Registry 会用它覆盖 Meta.Source (从 manifest.sourceLabel 载入
+// 的中文默认值),避免英文卡片带中文来源角标 (F5)。
+func sourceForLang(lang string) cardtmpl.Source {
+	if strings.EqualFold(lang, "zh-CN") || strings.HasPrefix(strings.ToLower(lang), "zh") {
+		return cardtmpl.Source{Label: "文档"}
+	}
+	return cardtmpl.Source{Label: "Docs"}
+}
