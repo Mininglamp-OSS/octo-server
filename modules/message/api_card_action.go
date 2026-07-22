@@ -35,6 +35,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n/codes"
@@ -218,6 +219,14 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
 		return
 	}
+	cardContext, err := resolveRegistryCardContext(effective, req.ActionID)
+	if err != nil {
+		m.releaseCardClaim(idemKey)
+		m.Warn("registry 卡片 action 与已发布交互契约不一致,拒绝",
+			zap.Error(err), zap.String("messageID", req.MessageID), zap.String("actionID", req.ActionID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
+		return
+	}
 
 	// D5 投递 card_action（event_data 形状由 brief 冻结：只许增字段）。
 	//   - data：匹配 Action.Submit 的作者静态对象，从生效帧提取（D11，仅当声明了
@@ -262,6 +271,7 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 		ActedAt:     eventData["acted_at"].(int64),
 		Inputs:      req.Inputs,
 		Data:        actionData,
+		Card:        cardContext,
 	})
 	if err != nil {
 		m.releaseCardClaim(idemKey)
@@ -281,6 +291,30 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 		m.Warn("卡片动作幂等 confirm 未生效", zap.Bool("ok", ok), zap.Error(err), zap.String("key", idemKey))
 	}
 	c.Response(map[string]interface{}{"accepted": true, "replay": false})
+}
+
+// resolveRegistryCardContext binds callback context to metadata and interaction
+// reports from the effective server-authored frame. Cards without octo-card
+// template metadata retain the legacy zero context.
+func resolveRegistryCardContext(effective []byte, actionID string) (cardactiondispatch.CardContext, error) {
+	ref, ok := cardmsg.CardTemplateContext(effective)
+	if !ok {
+		if cardmsg.HasCardTemplateMetadata(effective) {
+			return cardactiondispatch.CardContext{}, errors.New("message: card template metadata is incomplete")
+		}
+		return cardactiondispatch.CardContext{}, nil
+	}
+	registry := cardtmpl.DefaultRegistry()
+	if registry == nil {
+		return cardactiondispatch.CardContext{}, errors.New("message: cardtmpl registry unavailable")
+	}
+	view, err := registry.ActionView(cardtmpl.ID(ref.ID), ref.Version, actionID)
+	if err != nil {
+		return cardactiondispatch.CardContext{}, err
+	}
+	return cardactiondispatch.CardContext{
+		TemplateID: ref.ID, TemplateVersion: ref.Version, View: string(view),
+	}, nil
 }
 
 var errInternalCardActionRouteRejected = errors.New("internal card action route rejected")

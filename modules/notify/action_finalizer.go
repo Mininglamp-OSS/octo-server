@@ -13,6 +13,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
+	docsaccessrequest "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/docs_access_request"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 )
 
@@ -23,6 +24,7 @@ type cardActionMutator interface {
 type DocsActionFinalizer struct {
 	ctx     *config.Context
 	mutator cardActionMutator
+	updater cardtmpl.CardUpdater
 	sender  carddispatch.Sender
 }
 
@@ -42,12 +44,24 @@ func NewDocsActionFinalizer(ctx *config.Context, mutator cardActionMutator, send
 	return &DocsActionFinalizer{ctx: ctx, mutator: mutator, sender: sender}, nil
 }
 
+func NewDocsActionFinalizerWithUpdater(ctx *config.Context, updater cardtmpl.CardUpdater, mutator cardActionMutator, sender carddispatch.Sender) (*DocsActionFinalizer, error) {
+	if ctx == nil || updater == nil || mutator == nil || sender == nil {
+		return nil, errors.New("notify: docs action finalizer dependencies are required")
+	}
+	return &DocsActionFinalizer{ctx: ctx, updater: updater, mutator: mutator, sender: sender}, nil
+}
+
 func NewDocsActionFinalizerFromContext(ctx *config.Context) (*DocsActionFinalizer, error) {
 	sender, err := carddispatch.SenderFromContext(ctx, docsNotifyProducerID)
 	if err != nil {
 		return nil, err
 	}
-	return NewDocsActionFinalizer(ctx, carddispatch.NewCardMutator(ctx), sender)
+	mutator := carddispatch.NewCardMutator(ctx)
+	updater, err := cardtmpl.NewCardUpdater(cardtmpl.DefaultRegistry(), mutator)
+	if err != nil {
+		return nil, err
+	}
+	return NewDocsActionFinalizerWithUpdater(ctx, updater, mutator, sender)
 }
 
 func (f *DocsActionFinalizer) Finalize(ctx context.Context, event cardactiondispatch.Event, result cardactiondispatch.DecisionResult) error {
@@ -72,6 +86,9 @@ func (f *DocsActionFinalizer) Finalize(ctx context.Context, event cardactiondisp
 	lang := i18n.OutboundLanguage(ctx)
 	title := strings.TrimSpace(result.Display["title"])
 	if title == "" {
+		title, _ = event.Data["doc_title"].(string)
+	}
+	if strings.TrimSpace(title) == "" {
 		title = docID
 	}
 	// The reviewer deny reason (if any) rode in as a declared input; surface it on
@@ -80,21 +97,28 @@ func (f *DocsActionFinalizer) Finalize(ctx context.Context, event cardactiondisp
 	if v, ok := event.Inputs[cardtmpl.DocsDenyReasonInputID].(string); ok {
 		denyReason = strings.TrimSpace(v)
 	}
-	terminalDocument, err := f.buildTerminalDocument(ctx, lang, docID, event.SpaceID, title, denyReason, result)
-	if err != nil {
-		return err
+	terminal := result.State == cardactiondispatch.StateApproved || result.State == cardactiondispatch.StateDenied
+	if terminal && f.updater != nil {
+		if err := f.replaceWithRegistryResult(ctx, event, result, channelID, lang, title, denyReason); err != nil {
+			return err
+		}
+	} else {
+		terminalDocument, err := f.buildTerminalDocument(ctx, lang, docID, event.SpaceID, title, denyReason, result)
+		if err != nil {
+			return err
+		}
+		contentEdit, err := buildTerminalEnvelope(terminalDocument, event.SpaceID, event.EventID)
+		if err != nil {
+			return err
+		}
+		if _, err := f.mutator.Mutate(ctx, carddispatch.CardMutationRequest{
+			SenderUID: event.SenderUID, MessageID: event.MessageID, ChannelID: channelID,
+			ChannelType: event.ChannelType, ContentEdit: contentEdit,
+		}); err != nil {
+			return err
+		}
 	}
-	contentEdit, err := buildTerminalEnvelope(terminalDocument, event.SpaceID, event.EventID)
-	if err != nil {
-		return err
-	}
-	if _, err := f.mutator.Mutate(ctx, carddispatch.CardMutationRequest{
-		SenderUID: event.SenderUID, MessageID: event.MessageID, ChannelID: channelID,
-		ChannelType: event.ChannelType, ContentEdit: contentEdit,
-	}); err != nil {
-		return err
-	}
-	if result.State != cardactiondispatch.StateApproved && result.State != cardactiondispatch.StateDenied {
+	if !terminal {
 		return nil
 	}
 	outcomeDocument, err := f.buildOutcomeDocument(ctx, lang, docID, event.SpaceID, title, denyReason, result.State)
@@ -108,6 +132,82 @@ func (f *DocsActionFinalizer) Finalize(ctx context.Context, event cardactiondisp
 		return &actionFinalizeError{category: "applicant_notify_failed", err: err}
 	}
 	return nil
+}
+
+func (f *DocsActionFinalizer) replaceWithRegistryResult(ctx context.Context, event cardactiondispatch.Event,
+	result cardactiondispatch.DecisionResult, channelID, lang, title, denyReason string) error {
+	state := docsaccessrequest.StateApproved
+	wireState := "approved"
+	if result.State == cardactiondispatch.StateDenied {
+		state = docsaccessrequest.StateRejected
+		wireState = "rejected"
+	}
+	if runes := []rune(denyReason); len(runes) > cardtmpl.MaxExcerptRunes {
+		denyReason = string(runes[:cardtmpl.MaxExcerptRunes])
+	}
+	requestID, _ := event.Data["request_id"].(string)
+	actor, _ := event.Data["actor"].(string)
+	operatorName := strings.TrimSpace(result.Display["operator_name"])
+	if operatorName == "" {
+		operatorName = event.OperatorUID
+	}
+	document := map[string]any{
+		"docId": strings.TrimSpace(stringEventData(event.Data, "doc_id")), "title": strings.TrimSpace(title),
+	}
+	requester := map[string]any{"name": strings.TrimSpace(actor)}
+	if value := strings.TrimSpace(stringEventData(event.Data, "source_name")); value != "" {
+		document["sourceName"] = value
+	}
+	if value := strings.TrimSpace(stringEventData(event.Data, "actor_avatar_url")); value != "" {
+		requester["avatarUrl"] = value
+	}
+	fields := map[string]any{
+		"requestId": strings.TrimSpace(requestID),
+		"state":     wireState,
+		"document":  document,
+		"requester": requester,
+		"decision": map[string]any{
+			"operatorName": operatorName, "decidedAtDisplay": strings.TrimSpace(result.Display["decided_at"]),
+		},
+	}
+	for destination, source := range map[string]string{
+		"requestReason": "request_reason", "requestedAtDisplay": "requested_at_display",
+		"messageTimeDisplay": "message_time_display",
+	} {
+		if value := strings.TrimSpace(stringEventData(event.Data, source)); value != "" {
+			fields[destination] = value
+		}
+	}
+	permission := make(map[string]any, 2)
+	if value := strings.TrimSpace(stringEventData(event.Data, "permission_label")); value != "" {
+		permission["label"] = value
+	}
+	if value := strings.TrimSpace(stringEventData(event.Data, "permission_role_label")); value != "" {
+		permission["roleLabel"] = value
+	}
+	if len(permission) > 0 {
+		fields["permission"] = permission
+	}
+	if wireState == "rejected" && denyReason != "" {
+		fields["decision"].(map[string]any)["rejectionReason"] = denyReason
+	}
+	raw, err := json.Marshal(fields)
+	if err != nil {
+		return fmt.Errorf("notify: marshal registry result fields: %w", err)
+	}
+	return f.updater.ReplaceView(ctx, cardtmpl.UpdateTarget{
+		Target: carddispatch.Target{
+			SpaceID: event.SpaceID, ChannelID: channelID, ChannelType: event.ChannelType,
+		},
+		SenderUID: event.SenderUID, MessageID: event.MessageID, CardSeq: event.EventID,
+	}, docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3, state, raw, cardtmpl.BuildEnv{
+		WebLoginURL: f.ctx.GetConfig().External.WebLoginURL, Lang: lang, SpaceID: event.SpaceID,
+	})
+}
+
+func stringEventData(data map[string]interface{}, key string) string {
+	value, _ := data[key].(string)
+	return value
 }
 
 func (f *DocsActionFinalizer) buildTerminalDocument(ctx context.Context, lang, docID, spaceID, title, denyReason string, result cardactiondispatch.DecisionResult) (json.RawMessage, error) {

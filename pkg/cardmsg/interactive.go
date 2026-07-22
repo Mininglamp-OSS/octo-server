@@ -14,6 +14,56 @@ import (
 	"strings"
 )
 
+// TemplateContext is the immutable registry identity embedded by
+// cardtmpl.Registry.Render in metadata.octo. It is read only from the effective
+// server-authored card frame; clients never provide it to the action ingress.
+type TemplateContext struct {
+	Protocol string
+	ID       string
+	Version  string
+}
+
+// CardTemplateContext extracts a complete octo-card template identity from a
+// type-17 envelope. Partial, malformed, or foreign-protocol metadata is absent.
+func CardTemplateContext(envelopeRaw []byte) (TemplateContext, bool) {
+	payload, err := decodeEnvelope(string(envelopeRaw))
+	if err != nil || !IsCardPayload(payload) {
+		return TemplateContext{}, false
+	}
+	card, _ := payload["card"].(map[string]interface{})
+	metadata, _ := card["metadata"].(map[string]interface{})
+	octo, _ := metadata["octo"].(map[string]interface{})
+	template, _ := octo["template"].(map[string]interface{})
+	ctx := TemplateContext{}
+	ctx.Protocol, _ = octo["protocol"].(string)
+	ctx.ID, _ = template["id"].(string)
+	ctx.Version, _ = template["version"].(string)
+	if ctx.Protocol != "octo-card@1.0" || strings.TrimSpace(ctx.ID) != ctx.ID || ctx.ID == "" ||
+		strings.TrimSpace(ctx.Version) != ctx.Version || ctx.Version == "" {
+		return TemplateContext{}, false
+	}
+	return ctx, true
+}
+
+// HasCardTemplateMetadata distinguishes a truly legacy card from a card that
+// declares protocol/template metadata but cannot produce a complete trusted
+// TemplateContext. Callers use this to fail closed on partial/corrupt identity.
+func HasCardTemplateMetadata(envelopeRaw []byte) bool {
+	payload, err := decodeEnvelope(string(envelopeRaw))
+	if err != nil || !IsCardPayload(payload) {
+		return false
+	}
+	card, _ := payload["card"].(map[string]interface{})
+	metadata, _ := card["metadata"].(map[string]interface{})
+	octo, _ := metadata["octo"].(map[string]interface{})
+	if octo == nil {
+		return false
+	}
+	_, hasProtocol := octo["protocol"]
+	_, hasTemplate := octo["template"]
+	return hasProtocol || hasTemplate
+}
+
 const (
 	// ProfileV2 octo/v2：在 v1 展示集之上增加 Action.Submit（含 selectAction 携带）
 	// 与 Input.Text / Input.Toggle / Input.ChoiceSet（P2 D1/D2）。Action.Execute /

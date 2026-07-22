@@ -12,7 +12,9 @@ import (
 // label 基数 = 注册表大小 (template_id 值只来自 Template.ID() 硬编码),天花板
 // 可预期 <20,无基数爆炸风险 (§13)。
 type Metrics struct {
-	build *prometheus.CounterVec
+	build    *prometheus.CounterVec
+	callback *prometheus.CounterVec
+	update   *prometheus.CounterVec
 }
 
 // NewMetrics 构造并注册指标。传 nil registerer 得到 no-op 实例。
@@ -25,9 +27,39 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "dmwork_cardtmpl_build_total",
 			Help: "Total cardtmpl Registry.Render outcomes by template_id/version/view/result.",
 		}, []string{"template_id", "version", "view", "result"}),
+		callback: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "dmwork_cardtmpl_callback_total",
+			Help: "Total card template callback outcomes by template_id/version/action_id/result.",
+		}, []string{"template_id", "version", "action_id", "result"}),
+		update: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "dmwork_cardtmpl_update_total",
+			Help: "Total card template update outcomes by template_id/version/result.",
+		}, []string{"template_id", "version", "result"}),
 	}
-	reg.MustRegister(m.build)
+	reg.MustRegister(m.build, m.callback, m.update)
 	return m
+}
+
+func (m *Metrics) callbackResult(templateID, version, actionID, result string) {
+	if m == nil {
+		return
+	}
+	switch result {
+	case "ok", "rejected", "error":
+	default:
+		result = "error"
+	}
+	m.callback.WithLabelValues(templateID, version, actionID, result).Inc()
+}
+
+func (m *Metrics) updateResult(templateID, version, result string) {
+	if m == nil {
+		return
+	}
+	if result != "ok" {
+		result = "error"
+	}
+	m.update.WithLabelValues(templateID, version, result).Inc()
 }
 
 // buildResult 记录一次 Render 的结果。view 可能为空 (若在决定 view 前失败)。
@@ -69,4 +101,21 @@ func metricBuildResult(id ID, version, view, result string) {
 // 用法与直接调 metricBuildResult 等价,只是限定为 preflight 场景避免误用。
 func RecordFieldsInvalid(id ID, version string) {
 	metricBuildResult(id, version, "", "fields_invalid")
+}
+
+// RecordCallback records a bounded callback outcome for a registry-backed card.
+// Callers must only pass template/action identifiers resolved from registered
+// metadata and the effective server-authored frame.
+func RecordCallback(id ID, version, actionID, result string) {
+	globalMetricsMu.RLock()
+	m := globalMetrics
+	globalMetricsMu.RUnlock()
+	m.callbackResult(string(id), version, actionID, result)
+}
+
+func recordUpdate(id ID, version, result string) {
+	globalMetricsMu.RLock()
+	m := globalMetrics
+	globalMetricsMu.RUnlock()
+	m.updateResult(string(id), version, result)
 }

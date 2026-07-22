@@ -523,7 +523,8 @@ func freshRegistry(t *testing.T) *cardtmpl.Registry {
 	t.Helper()
 	r := cardtmpl.NewRegistry()
 	r.Register(docsaccessrequest.New(), docsaccessrequest.Assets, docsaccessrequest.HandoffRoot)
-	r.SetDefault(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersion)
+	r.Register(docsaccessrequest.NewV3(), docsaccessrequest.Assets, docsaccessrequest.HandoffRootV3)
+	r.SetDefault(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3)
 	r.Freeze()
 	return r
 }
@@ -535,6 +536,9 @@ func loadSampleForState(t *testing.T, tmpl cardtmpl.Template, state cardtmpl.Sta
 	// docsaccessrequest 的 samples 命名与 state 值同名
 	fs := docsaccessrequest.Assets
 	root := docsaccessrequest.HandoffRoot
+	if tmpl.Meta().Version == docsaccessrequest.TemplateVersionV3 {
+		root = docsaccessrequest.HandoffRootV3
+	}
 	b, err := fs.ReadFile(root + "/samples/" + string(state) + ".json")
 	if err != nil {
 		t.Fatalf("read sample for state %q: %v", state, err)

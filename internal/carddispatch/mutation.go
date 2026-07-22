@@ -2,6 +2,7 @@ package carddispatch
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -41,6 +42,23 @@ type CardMutationResult struct {
 	Replay  bool
 }
 
+// CardMutationTarget identifies an existing message using only authoritative
+// server-side values. MessageSeq is an optional lookup optimization.
+type CardMutationTarget struct {
+	SenderUID   string
+	MessageID   string
+	MessageSeq  uint32
+	ChannelID   string
+	ChannelType uint8
+}
+
+// CardMutationSnapshot is the current effective type-17 frame. Envelope is
+// content_edit when present, otherwise the immutable original payload.
+type CardMutationSnapshot struct {
+	Envelope json.RawMessage
+	CardSeq  int64
+}
+
 type CardMutationCASRequest struct {
 	MessageID   string
 	MessageSeq  uint32
@@ -78,6 +96,7 @@ type cardMutationWrite struct {
 type cardMutationBackend interface {
 	Lookup(context.Context, CardMutationRequest) (storedCardMessage, error)
 	Lifecycle(messageID string) (revoked bool, deleted bool, err error)
+	EffectiveContent(messageID string) (content string, cardSeq int64, found bool, err error)
 	ContentHashExists(messageID, hash string) (bool, error)
 	CASWrite(cardMutationWrite) (conflict bool, replay bool, err error)
 	AppendRevision(cardMutationWrite) error
@@ -97,6 +116,52 @@ func NewCardMutator(ctx *config.Context) *CardMutator {
 
 func newCardMutator(backend cardMutationBackend) *CardMutator {
 	return &CardMutator{backend: backend}
+}
+
+// Snapshot returns the active effective card after applying the same sender and
+// lifecycle gates as Mutate. It exists for read-modify-write operations such as
+// CardUpdater.Append; the subsequent Mutate still performs all checks again and
+// owns the CAS.
+func (m *CardMutator) Snapshot(ctx context.Context, target CardMutationTarget) (CardMutationSnapshot, error) {
+	if m == nil || m.backend == nil || ctx == nil || target.SenderUID == "" || target.MessageID == "" || target.ChannelID == "" {
+		return CardMutationSnapshot{}, ErrCardMutationInvalid
+	}
+	request := CardMutationRequest{
+		SenderUID: target.SenderUID, MessageID: target.MessageID, MessageSeq: target.MessageSeq,
+		ChannelID: target.ChannelID, ChannelType: target.ChannelType,
+	}
+	message, err := m.backend.Lookup(ctx, request)
+	if err != nil {
+		return CardMutationSnapshot{}, err
+	}
+	if message.MessageID != target.MessageID || message.FromUID != target.SenderUID {
+		return CardMutationSnapshot{}, ErrCardMutationForbidden
+	}
+	if !cardmsg.IsCardRawPayload(message.Payload) {
+		return CardMutationSnapshot{}, ErrCardMutationInvalid
+	}
+	revoked, deleted, err := m.backend.Lifecycle(target.MessageID)
+	if err != nil {
+		return CardMutationSnapshot{}, fmt.Errorf("carddispatch: query card lifecycle: %w", err)
+	}
+	if revoked || deleted {
+		return CardMutationSnapshot{}, ErrCardMutationNotFound
+	}
+	content, seq, found, err := m.backend.EffectiveContent(target.MessageID)
+	if err != nil {
+		return CardMutationSnapshot{}, fmt.Errorf("carddispatch: query effective card: %w", err)
+	}
+	if !found {
+		return CardMutationSnapshot{Envelope: append(json.RawMessage(nil), message.Payload...)}, nil
+	}
+	if !cardmsg.IsCardContentEdit(content) {
+		return CardMutationSnapshot{}, ErrCardMutationInvalid
+	}
+	parsedSeq, ok := cardmsg.CardSeqFromContentEdit(content)
+	if !ok || parsedSeq <= 0 || parsedSeq != seq {
+		return CardMutationSnapshot{}, ErrCardMutationInvalid
+	}
+	return CardMutationSnapshot{Envelope: json.RawMessage(content), CardSeq: seq}, nil
 }
 
 func (m *CardMutator) Mutate(ctx context.Context, request CardMutationRequest) (CardMutationResult, error) {
@@ -239,6 +304,27 @@ func (b *productionMutationBackend) Lifecycle(messageID string) (bool, bool, err
 		return false, false, nil
 	}
 	return lifecycle.Revoke == 1, lifecycle.IsDeleted == 1, err
+}
+
+func (b *productionMutationBackend) EffectiveContent(messageID string) (string, int64, bool, error) {
+	var current struct {
+		Content dbr.NullString `db:"content_edit"`
+		CardSeq dbr.NullInt64  `db:"card_seq"`
+	}
+	err := b.ctx.DB().Select("content_edit", "card_seq").From("message_extra").Where("message_id=?", messageID).LoadOne(&current)
+	if err == dbr.ErrNotFound {
+		return "", 0, false, nil
+	}
+	if err != nil {
+		return "", 0, false, err
+	}
+	if !current.Content.Valid || current.Content.String == "" {
+		return "", 0, false, nil
+	}
+	if !current.CardSeq.Valid {
+		return current.Content.String, 0, true, nil
+	}
+	return current.Content.String, current.CardSeq.Int64, true, nil
 }
 
 func (b *productionMutationBackend) ContentHashExists(messageID, hash string) (bool, error) {
