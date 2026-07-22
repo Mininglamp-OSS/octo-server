@@ -61,19 +61,32 @@ type DocsApprovalContent struct {
 }
 
 // DocsOutcomeContent carries the enriched terminal (已允许 / 已拒绝) card fields.
-// The finalizer only has title + decision (+ the reviewer reason for denials), so
-// this state renders header + title + a result box — not the full requester row.
+// Optional requester/source/permission/time fields let registry-backed 0.3
+// results preserve the pending-card context; legacy callers may leave them empty.
 type DocsOutcomeContent struct {
 	Title   string
 	Variant string
 	Source  Source
 	Denied  bool // true => denied (attention), false => approved (good)
 
-	HeaderLabel string // "文档申请"
-	StatusLabel string // "已允许" / "已拒绝"
-	ResultText  string // "申请人已获得所申请的文档权限。" / "申请已被拒绝。"
-	ReasonLabel string // "拒绝原因"
-	Reason      string // reviewer deny reason (denied only); "" => omit
+	HeaderLabel     string // "文档申请"
+	SourceName      string // optional document/source display name
+	StatusLabel     string // "已允许" / "已拒绝"
+	PermissionLabel string // optional permission vocabulary beside status
+	ResultText      string // "申请人已获得所申请的文档权限。" / "申请已被拒绝。"
+	ReasonLabel     string // "拒绝原因"
+	Reason          string // reviewer deny reason (denied only); "" => omit
+
+	Actor              string
+	ActorAvatar        string
+	RequestedAtDisplay string
+	RequestReason      string
+	BannerSuffix       string
+	RoleLabel          string
+	RequestReasonLabel string
+	DecisionSummary    string
+	MessageTimeLabel   string
+	MessageTimeDisplay string
 }
 
 // BuildDocsAccessRequestCard renders the enriched docs access-request approval
@@ -215,39 +228,11 @@ func BuildDocsApprovalOutcomeCard(
 	spaceID string,
 	content DocsOutcomeContent,
 ) (json.RawMessage, error) {
-	if strings.TrimSpace(content.Title) == "" || utf8.RuneCountInString(content.Title) > maxTitleRunes {
-		return nil, errors.New("cardtmpl: resource title is invalid")
-	}
-	if content.Source.IconURL != "" {
-		if err := requireHTTPS(content.Source.IconURL); err != nil {
-			return nil, fmt.Errorf("cardtmpl: source icon URL: %w", err)
-		}
-	}
-	deepLink, err := docsDeepLink(webLoginURL, docID, spaceID)
+	body, deepLink, err := BuildDocsApprovalOutcomeBodyWithLang(
+		i18n.OutboundLanguage(ctx), webLoginURL, docID, spaceID, content,
+	)
 	if err != nil {
 		return nil, err
-	}
-	lang := i18n.OutboundLanguage(ctx)
-	labels := labelsForLanguage(lang)
-
-	statusColor := "Good"
-	boxStyle := "good"
-	if content.Denied {
-		statusColor, boxStyle = "Attention", "attention"
-	}
-	body := []interface{}{
-		docsApprovalHeader(content.HeaderLabel, content.StatusLabel, statusColor),
-		docsApprovalTitle(content.Title),
-		docsResultBox(boxStyle, statusColor, content.ResultText, content.ReasonLabel, content.Reason),
-		// view-details rides as a body ActionSet (not a root action) so the
-		// terminal card carries no decision/submit actions — the approve/deny
-		// buttons are gone once the request is resolved.
-		map[string]interface{}{
-			"type": "ActionSet",
-			"actions": []interface{}{
-				map[string]interface{}{"type": "Action.OpenUrl", "title": labels.viewDetails, "url": deepLink},
-			},
-		},
 	}
 	document := map[string]interface{}{
 		"type":     "AdaptiveCard",
@@ -260,6 +245,135 @@ func BuildDocsApprovalOutcomeCard(
 		return nil, fmt.Errorf("cardtmpl: marshal docs outcome card: %w", err)
 	}
 	return raw, nil
+}
+
+// BuildDocsApprovalOutcomeBodyWithLang is the fragment-only counterpart used
+// by registry-backed result views. Registry.Render owns metadata and envelope.
+func BuildDocsApprovalOutcomeBodyWithLang(
+	lang string,
+	webLoginURL string,
+	docID string,
+	spaceID string,
+	content DocsOutcomeContent,
+) ([]interface{}, string, error) {
+	if strings.TrimSpace(content.Title) == "" || utf8.RuneCountInString(content.Title) > maxTitleRunes {
+		return nil, "", errors.New("cardtmpl: resource title is invalid")
+	}
+	if content.Source.IconURL != "" {
+		if err := requireHTTPS(content.Source.IconURL); err != nil {
+			return nil, "", fmt.Errorf("cardtmpl: source icon URL: %w", err)
+		}
+	}
+	if content.ActorAvatar != "" {
+		if err := requireHTTPS(content.ActorAvatar); err != nil {
+			return nil, "", fmt.Errorf("cardtmpl: actor avatar URL: %w", err)
+		}
+	}
+	deepLink, err := docsDeepLink(webLoginURL, docID, spaceID)
+	if err != nil {
+		return nil, "", err
+	}
+	labels := labelsForLanguage(lang)
+
+	statusColor := "Good"
+	boxStyle := "good"
+	if content.Denied {
+		statusColor, boxStyle = "Attention", "attention"
+	}
+	body := []interface{}{
+		docsOutcomeHeader(content.HeaderLabel, content.SourceName, content.StatusLabel, content.PermissionLabel, statusColor),
+		docsApprovalTitle(content.Title),
+	}
+	if strings.TrimSpace(content.Actor) != "" || strings.TrimSpace(content.BannerSuffix) != "" {
+		body = append(body, docsBanner(content.Actor, content.BannerSuffix))
+	}
+	if row := docsRequesterRow(content.Actor, content.ActorAvatar, content.RoleLabel, content.RequestedAtDisplay); row != nil {
+		body = append(body, row)
+	}
+	if box := docsReasonBox(content.RequestReasonLabel, content.RequestReason); box != nil {
+		body = append(body, box)
+	}
+	body = append(body,
+		docsResultBox(boxStyle, statusColor, content.ResultText, content.DecisionSummary, content.ReasonLabel, content.Reason),
+		docsOutcomeFooter(content.MessageTimeLabel, content.MessageTimeDisplay, labels.viewDetails, deepLink),
+	)
+	return body, deepLink, nil
+}
+
+func docsOutcomeHeader(headerLabel, sourceName, statusLabel, permissionLabel, statusColor string) map[string]interface{} {
+	sourceName = truncateRunes(strings.TrimSpace(sourceName), maxTitleRunes)
+	permissionLabel = truncateRunes(strings.TrimSpace(permissionLabel), maxTimestampRunes)
+	leftWidth := "stretch"
+	if sourceName != "" {
+		leftWidth = "auto"
+	}
+	columns := []interface{}{
+		map[string]interface{}{
+			"type": "Column", "width": leftWidth,
+			"items": []interface{}{map[string]interface{}{
+				"type": "TextBlock", "text": escapeMarkdown(headerLabel), "size": "Small",
+				"weight": "Bolder", "spacing": "None", "wrap": false,
+			}},
+		},
+	}
+	if sourceName != "" {
+		columns = append(columns, map[string]interface{}{
+			"type": "Column", "width": "stretch", "spacing": "Small",
+			"items": []interface{}{map[string]interface{}{
+				"type": "TextBlock", "text": escapeMarkdown("· " + sourceName), "size": "Small",
+				"isSubtle": true, "spacing": "None", "wrap": false,
+			}},
+		})
+	}
+	if strings.TrimSpace(statusLabel) != "" {
+		columns = append(columns, map[string]interface{}{
+			"type": "Column", "width": "auto",
+			"items": []interface{}{map[string]interface{}{
+				"type": "TextBlock", "text": escapeMarkdown(statusLabel), "size": "Small",
+				"weight": "Bolder", "color": statusColor, "spacing": "None", "wrap": false,
+			}},
+		})
+	}
+	if permissionLabel != "" {
+		columns = append(columns, map[string]interface{}{
+			"type": "Column", "width": "auto", "spacing": "Small",
+			"items": []interface{}{map[string]interface{}{
+				"type": "TextBlock", "text": escapeMarkdown(permissionLabel), "size": "Small",
+				"isSubtle": true, "spacing": "None", "wrap": false,
+			}},
+		})
+	}
+	return map[string]interface{}{"type": "ColumnSet", "spacing": "None", "columns": columns}
+}
+
+// docsOutcomeFooter keeps the terminal card free of submit actions while
+// preserving the handoff's processed-time context and view-details link.
+func docsOutcomeFooter(timeLabel, timeDisplay, viewDetails, deepLink string) map[string]interface{} {
+	actionSet := map[string]interface{}{
+		"type": "ActionSet", "spacing": "None",
+		"actions": []interface{}{
+			map[string]interface{}{"type": "Action.OpenUrl", "id": "view_document", "title": viewDetails, "url": deepLink},
+		},
+	}
+	timeDisplay = truncateRunes(strings.TrimSpace(timeDisplay), maxTimestampRunes)
+	if timeDisplay == "" {
+		return actionSet
+	}
+	processedAt := strings.TrimSpace(timeLabel + " " + timeDisplay)
+	return map[string]interface{}{
+		"type": "ColumnSet", "spacing": "Medium", "columns": []interface{}{
+			map[string]interface{}{
+				"type": "Column", "width": "stretch", "verticalContentAlignment": "Center",
+				"items": []interface{}{map[string]interface{}{
+					"type": "TextBlock", "text": escapeMarkdown(processedAt), "size": "Small",
+					"isSubtle": true, "spacing": "None", "wrap": false,
+				}},
+			},
+			map[string]interface{}{
+				"type": "Column", "width": "auto", "items": []interface{}{actionSet},
+			},
+		},
+	}
 }
 
 // docsApprovalHeader is the shared top row: a bold source label on the left and a
@@ -398,12 +512,18 @@ func docsReasonBox(label, reason string) map[string]interface{} {
 
 // docsResultBox is the terminal good/attention result section. For denials it
 // appends the reviewer reason as a labeled sub-line.
-func docsResultBox(boxStyle, textColor, resultText, reasonLabel, reason string) map[string]interface{} {
+func docsResultBox(boxStyle, textColor, resultText, decisionSummary, reasonLabel, reason string) map[string]interface{} {
 	items := []interface{}{
 		map[string]interface{}{
 			"type": "TextBlock", "text": escapeMarkdown(strings.TrimSpace(resultText)),
 			"size": "Medium", "weight": "Bolder", "color": textColor, "wrap": true, "spacing": "None",
 		},
+	}
+	if summary := truncateRunes(strings.TrimSpace(decisionSummary), maxTitleRunes); summary != "" {
+		items = append(items, map[string]interface{}{
+			"type": "TextBlock", "text": escapeMarkdown(summary),
+			"size": "Small", "isSubtle": true, "spacing": "Small",
+		})
 	}
 	if r := truncateRunes(strings.TrimSpace(reason), maxReasonRunes); r != "" {
 		label := strings.TrimSpace(reasonLabel)

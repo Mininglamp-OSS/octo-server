@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	"go.uber.org/zap"
 )
 
@@ -212,6 +213,7 @@ func (d *Dispatcher) ProcessOne(ctx context.Context, now time.Time) (bool, error
 	workCtx := context.WithoutCancel(ctx)
 	result, err := d.deliverer.Deliver(workCtx, route, DecisionRequestFromEvent(lease.Event))
 	if err != nil {
+		recordTemplateCallback(lease.Event, callbackMetricResultForError(err))
 		category := errorCategory(err)
 		d.metrics.observeError(owner, category)
 		retry := Retryable(err)
@@ -224,6 +226,11 @@ func (d *Dispatcher) ProcessOne(ctx context.Context, now time.Time) (bool, error
 		d.refreshDepthMetrics()
 		return true, nackErr
 	}
+	callbackResult := "ok"
+	if result.Disposition != DispositionApplied && result.Disposition != DispositionReplayed {
+		callbackResult = "rejected"
+	}
+	recordTemplateCallback(lease.Event, callbackResult)
 	stopHeartbeat := d.startLeaseHeartbeat(*lease)
 	finalizeErr := d.finalizer.Finalize(workCtx, lease.Event, result)
 	if renewErr := stopHeartbeat(); renewErr != nil {
@@ -258,6 +265,21 @@ func (d *Dispatcher) ProcessOne(ctx context.Context, now time.Time) (bool, error
 	resultLabel = "ok"
 	d.refreshDepthMetrics()
 	return true, nil
+}
+
+func recordTemplateCallback(event Event, result string) {
+	if event.Card.TemplateID == "" || event.Card.TemplateVersion == "" || event.ActionID == "" {
+		return
+	}
+	cardtmpl.RecordCallback(cardtmpl.ID(event.Card.TemplateID), event.Card.TemplateVersion, event.ActionID, result)
+}
+
+func callbackMetricResultForError(err error) string {
+	var deliveryErr *DeliveryError
+	if errors.As(err, &deliveryErr) && deliveryErr.Status >= 400 && deliveryErr.Status < 500 {
+		return "rejected"
+	}
+	return "error"
 }
 
 func (d *Dispatcher) startLeaseHeartbeat(lease Lease) func() error {

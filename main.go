@@ -701,8 +701,8 @@ func replaceWebConfig(cfg *config.Config) {
 }
 
 // installCardTmplRegistry 装配 L0 cardtmpl.Registry 并注入到 pkg-scoped default。
-// 本 PR (cardtmpl-registry-pilot) 只注册 docs.access-request@0.2.0 一张 L2a 卡;
-// 后续 PR 逐张迁移 summary/docs.shared/generic.approval 到本函数。
+// 同时保留已发布冻结的 0.2.0 与带 result 视图的 0.3.0;新消息默认 0.3.0,
+// 旧 0.2.0 pending 消息仍可由 finalizer 升级成 0.3.0/result。
 //
 // Fail-close 契约:任一 Register/SetDefault 失败 → panic(与 main.go:521 现有的
 // docs approval callback route 校验同源)。init 期 schema/manifest 语法错无
@@ -710,7 +710,8 @@ func replaceWebConfig(cfg *config.Config) {
 func installCardTmplRegistry() {
 	registry := cardtmpl.NewRegistry()
 	registry.Register(docsaccessrequest.New(), docsaccessrequest.Assets, docsaccessrequest.HandoffRoot)
-	registry.SetDefault(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersion)
+	registry.Register(docsaccessrequest.NewV3(), docsaccessrequest.Assets, docsaccessrequest.HandoffRootV3)
+	registry.SetDefault(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3)
 	registry.Freeze()
 	cardtmpl.SetGlobalMetrics(cardtmpl.NewMetrics(prometheus.DefaultRegisterer))
 	cardtmpl.SetDefaultRegistry(registry)
