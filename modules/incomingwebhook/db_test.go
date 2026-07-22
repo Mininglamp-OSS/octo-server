@@ -301,7 +301,8 @@ func TestCreatorQuotaIsPerScope(t *testing.T) {
 	groupNo := "g_" + util.GenerUUID()[:12]
 	creator := "u_" + util.GenerUUID()[:12]
 	const groupCap, creatorCap = 100, 1
-	const thread = "100000000000001"
+	const threadA = "100000000000001"
+	const threadB = "100000000000002"
 
 	// 群本体作用域：该创建者建满个人额度(1)。
 	first := &incomingWebhookModel{WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, CreatorUID: creator, Name: "wh", Status: statusEnabled}
@@ -310,12 +311,27 @@ func TestCreatorQuotaIsPerScope(t *testing.T) {
 	second := &incomingWebhookModel{WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, CreatorUID: creator, Name: "wh", Status: statusEnabled}
 	assert.ErrorIs(t, d.insertWithQuota(second, groupCap, creatorCap), ErrCreatorQuotaExceeded, "creator cap is per-scope; the group-self scope is full")
 
-	// 同一创建者在子区作用域有独立个人额度：可建。
-	inThread := &incomingWebhookModel{
+	// 同一创建者在子区 A 作用域有独立个人额度：可建满 creatorCap。
+	inThreadA := &incomingWebhookModel{
 		WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, CreatorUID: creator, Name: "wh", Status: statusEnabled,
-		ChannelType: int(common.ChannelTypeCommunityTopic.Uint8()), ThreadShortID: thread,
+		ChannelType: int(common.ChannelTypeCommunityTopic.Uint8()), ThreadShortID: threadA,
 	}
-	assert.NoError(t, d.insertWithQuota(inThread, groupCap, creatorCap), "creator's per-scope cap in the thread is independent of the group-self scope")
+	assert.NoError(t, d.insertWithQuota(inThreadA, groupCap, creatorCap), "creator's per-scope cap in thread A is independent of the group-self scope")
+
+	// 子区 A 的个人额度也【真的】受约束：同一创建者在子区 A 再建被拒——防回归把非空
+	// thread_short_id 误豁免 per-creator 校验（那样本用例前一步已过、这步会漏网）。
+	overThreadA := &incomingWebhookModel{
+		WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, CreatorUID: creator, Name: "wh", Status: statusEnabled,
+		ChannelType: int(common.ChannelTypeCommunityTopic.Uint8()), ThreadShortID: threadA,
+	}
+	assert.ErrorIs(t, d.insertWithQuota(overThreadA, groupCap, creatorCap), ErrCreatorQuotaExceeded, "per-creator cap must actually apply within a thread scope")
+
+	// 跨子区创建者额度独立：子区 A 满【不影响】同一创建者在子区 B 建。
+	inThreadB := &incomingWebhookModel{
+		WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, CreatorUID: creator, Name: "wh", Status: statusEnabled,
+		ChannelType: int(common.ChannelTypeCommunityTopic.Uint8()), ThreadShortID: threadB,
+	}
+	assert.NoError(t, d.insertWithQuota(inThreadB, groupCap, creatorCap), "creator's per-scope cap in thread B is independent of thread A")
 }
 
 // TestDisableByGroupNo_CoversThreadWebhook 群解散级联禁用覆盖子区 webhook（同 group_no）：

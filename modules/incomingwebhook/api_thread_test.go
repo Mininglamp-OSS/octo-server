@@ -138,6 +138,38 @@ func TestThread_ScopeIsolation(t *testing.T) {
 		"group webhook must NOT be deletable via the thread path")
 }
 
+// TestThread_QuotaIsPerScope 端到端验证配额按投递作用域独立（API 层）：把每作用域上限降到 1，
+// 群本体桶填满后子区面仍可创建（互不共享），子区桶填满后另一子区仍可创建。补齐 DB 层
+// TestThreadWebhookQuotaIsPerScope 之上的「path-param → model → 配额」链路覆盖（PR #639 Octo-Q
+// review P2）。
+func TestThread_QuotaIsPerScope(t *testing.T) {
+	handler, ctx, groupNo := setupTestEnv(t)
+	defer testutil.CleanAllTables(ctx)
+	t.Setenv("DM_INCOMINGWEBHOOK_MAX_PER_GROUP", "1")
+
+	threadA := seedThread(t, ctx, groupNo, thread.ThreadStatusActive)
+	threadB := seedThread(t, ctx, groupNo, thread.ThreadStatusActive)
+
+	create := func(path, name string) int {
+		return do(handler, authReq("POST", path, map[string]interface{}{"name": name})).Code
+	}
+	groupPath := fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo)
+
+	// 群本体桶：建 1 个占满，第 2 个 409。
+	assert.Equal(t, http.StatusOK, create(groupPath, "g1"))
+	assert.Equal(t, http.StatusConflict, create(groupPath, "g2"), "group-self bucket is full at cap=1")
+
+	// 群本体满【不影响】子区 A：独立桶，可建；同一子区第 2 个 409。
+	assert.Equalf(t, http.StatusOK, create(threadWebhooksPath(groupNo, threadA), "a1"),
+		"thread A has an independent bucket; group being full must not block it")
+	assert.Equal(t, http.StatusConflict, create(threadWebhooksPath(groupNo, threadA), "a2"),
+		"thread A bucket is full at cap=1")
+
+	// 子区 A 满【不影响】子区 B：独立桶，可建。
+	assert.Equalf(t, http.StatusOK, create(threadWebhooksPath(groupNo, threadB), "b1"),
+		"thread B has an independent bucket; thread A being full must not block it")
+}
+
 // listWebhookIDs GETs a management list path and returns the webhook_id set.
 func listWebhookIDs(t *testing.T, handler http.Handler, path string) []string {
 	t.Helper()
