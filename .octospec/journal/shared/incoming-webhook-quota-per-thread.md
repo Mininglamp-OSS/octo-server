@@ -93,6 +93,18 @@ round was run as real integration tests: MySQL 8.0 + Redis + WuKongIM brought up
 in-sandbox (WuKongIM via the release binary + CI's `WK_*` env, `WK_TOKENAUTHON=false`),
 `go test -race ./modules/common/ ./modules/incomingwebhook/` both green.
 
+**Critical-section optimization.** The scope count and the per-creator count run
+on the same `(group_no, thread_short_id, status)` index range, differing only by a
+`creator_uid` predicate, so they were folded into ONE conditional-aggregation
+query — `count(*) AS scope_cnt, count(CASE WHEN creator_uid=? THEN 1 END) AS
+creator_cnt`. This shortens the parent-group `FOR UPDATE` critical section (a
+member create drops from two counts to one; admin stays one), directly improving
+concurrent-create throughput — the exact axis this whole change is about. The
+aggregate `total` count stays a separate, `total > 0`-gated query since it spans
+a different range (whole group, no thread filter) and folding it would force a
+group-wide scan on the common disabled path. `count(CASE …)` (not `SUM(bool)`)
+keeps the column BIGINT and sidesteps the `SUM`→`DECIMAL`→`int` scan pitfall.
+
 ## Structural learnings worth remembering
 
 ### A quota's serialization lock and its counting predicate are separable
