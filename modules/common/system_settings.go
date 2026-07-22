@@ -576,16 +576,21 @@ const (
 	envIncomingWebhookEnabled         = "DM_INCOMINGWEBHOOK_ENABLED"
 	envIncomingWebhookPerWebhookRPS   = "DM_INCOMINGWEBHOOK_RPS"
 	envIncomingWebhookPerWebhookBurst = "DM_INCOMINGWEBHOOK_BURST"
-	envIncomingWebhookMaxPerGroup     = "DM_INCOMINGWEBHOOK_MAX_PER_GROUP"
-	envIncomingWebhookMaxPerCreator   = "DM_INCOMINGWEBHOOK_MAX_PER_CREATOR"
+	envIncomingWebhookMaxPerGroup      = "DM_INCOMINGWEBHOOK_MAX_PER_GROUP"
+	envIncomingWebhookMaxPerThread     = "DM_INCOMINGWEBHOOK_MAX_PER_THREAD"
+	envIncomingWebhookMaxPerCreator    = "DM_INCOMINGWEBHOOK_MAX_PER_CREATOR"
+	envIncomingWebhookMaxTotalPerGroup = "DM_INCOMINGWEBHOOK_MAX_TOTAL_PER_GROUP"
 	// 控制非管理员成员创建的 webhook 是否可用广播型 @（@所有人 / @所有 AI）。
 	envIncomingWebhookMemberCanBroadcast = "OCTO_INCOMINGWEBHOOK_MEMBER_CAN_BROADCAST"
 
-	defaultIncomingWebhookEnabled            = true
-	defaultIncomingWebhookPerWebhookRPS      = 5.0
-	defaultIncomingWebhookPerWebhookBurst    = 10
-	defaultIncomingWebhookMaxPerGroup        = 10
-	defaultIncomingWebhookMaxPerCreator      = 5
+	defaultIncomingWebhookEnabled         = true
+	defaultIncomingWebhookPerWebhookRPS   = 5.0
+	defaultIncomingWebhookPerWebhookBurst = 10
+	defaultIncomingWebhookMaxPerGroup     = 10
+	defaultIncomingWebhookMaxPerCreator   = 5
+	// max_total_per_group 默认 0 = 不启用群级聚合天花板（只受各作用域的
+	// max_per_group / max_per_thread 约束）。设为正数才封顶单群 webhook 总量。
+	defaultIncomingWebhookMaxTotalPerGroup   = 0
 	defaultIncomingWebhookMemberCanBroadcast = true
 )
 
@@ -651,6 +656,21 @@ func (s *SystemSettings) IncomingWebhookMaxPerGroup() int {
 	return v
 }
 
+// IncomingWebhookMaxPerThread 单个【子区作用域】可创建的 webhook 数量上限，与群本体的
+// max_per_group 解耦，用于「群和子区分别精确设数量」。
+// DB(incomingwebhook.max_per_thread) → env(DM_INCOMINGWEBHOOK_MAX_PER_THREAD) → 回退到
+// IncomingWebhookMaxPerGroup()。即【未单独配置子区上限时，子区与群本体同额度】——与本
+// 特性上线时「群/子区共用 max_per_group」的行为逐字节一致，配置向后兼容。
+// 读侧防御：≤0 回退默认（同 max_per_group，避免误配成子区一个都建不了的「暗关」）。
+func (s *SystemSettings) IncomingWebhookMaxPerThread() int {
+	def := s.incomingWebhookMaxPerThreadEnvDefault()
+	v := s.getInt("incomingwebhook", "max_per_thread", def)
+	if v <= 0 {
+		return def
+	}
+	return v
+}
+
 // incomingWebhookEnabledEnvDefault 解析 DM_INCOMINGWEBHOOK_ENABLED（缺省/无法识别
 // 视为开启），作为 DB 未配置时的 fallback。比 getBool 的 DB 解析更宽松，接受
 // 1/0/true/false/yes/no/on/off（大小写不敏感、允许前后空格）。
@@ -695,6 +715,18 @@ func incomingWebhookMaxPerGroupEnvDefault() int {
 	return defaultIncomingWebhookMaxPerGroup
 }
 
+// incomingWebhookMaxPerThreadEnvDefault 解析 DM_INCOMINGWEBHOOK_MAX_PER_THREAD；仅接受
+// 正整数，否则【回退到 IncomingWebhookMaxPerGroup()】——未单独配置子区上限时子区与群本体
+// 同额度（本方法带 s 接收者正是为了拿到这个动态回退，而非一个静态 code default）。
+func (s *SystemSettings) incomingWebhookMaxPerThreadEnvDefault() int {
+	if v := os.Getenv(envIncomingWebhookMaxPerThread); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return s.IncomingWebhookMaxPerGroup()
+}
+
 // IncomingWebhookMaxPerCreator 单个普通成员/bot 在一个【投递作用域】（群本体或每个
 // 子区）内可创建的 webhook 数量上限（群主/管理员豁免，仅受作用域级 max_per_group
 // 约束）。DB → env → 默认 5。
@@ -717,6 +749,32 @@ func incomingWebhookMaxPerCreatorEnvDefault() int {
 		}
 	}
 	return defaultIncomingWebhookMaxPerCreator
+}
+
+// IncomingWebhookMaxTotalPerGroup 单个群【跨群本体 + 所有子区】的 webhook 聚合总数上限，
+// 用于挡住「子区可无限创建 → 单群 webhook 总量 = 作用域上限 ×(子区数+1) 失控」。
+// DB(incomingwebhook.max_total_per_group) → env(DM_INCOMINGWEBHOOK_MAX_TOTAL_PER_GROUP) →
+// 默认 0。
+// 语义与作用域上限【不同】：0（或负）表示【不启用】聚合天花板——只受 max_per_group /
+// max_per_thread 约束；仅当 > 0 时 insertWithQuota 才多做一次全群计数校验。因此读侧把
+// 负值夹到 0（关闭）而非回退某默认值：0 是有意义的「关闭」哨兵，不是误配。
+func (s *SystemSettings) IncomingWebhookMaxTotalPerGroup() int {
+	v := s.getInt("incomingwebhook", "max_total_per_group", incomingWebhookMaxTotalPerGroupEnvDefault())
+	if v < 0 {
+		return 0
+	}
+	return v
+}
+
+// incomingWebhookMaxTotalPerGroupEnvDefault 解析 DM_INCOMINGWEBHOOK_MAX_TOTAL_PER_GROUP；
+// 接受【非负】整数（0 = 关闭），否则回退默认 0。
+func incomingWebhookMaxTotalPerGroupEnvDefault() int {
+	if v := os.Getenv(envIncomingWebhookMaxTotalPerGroup); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return defaultIncomingWebhookMaxTotalPerGroup
 }
 
 // ---------------------------------------------------------------------------

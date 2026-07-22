@@ -164,6 +164,15 @@ var (
 		DefaultMessage: "You can create at most {{.max}} webhooks in this group or thread.",
 	})
 
+	// ErrIncomingWebhookTotalQuotaExceeded (409) — the group has reached its
+	// aggregate webhook ceiling across the group itself and all of its threads
+	// (max_total_per_group). Params["max"] carries the configured cap.
+	ErrIncomingWebhookTotalQuotaExceeded = register(codes.Code{
+		ID:             "err.server.incomingwebhook.mgmt_total_quota_exceeded",
+		HTTPStatus:     http.StatusConflict,
+		DefaultMessage: "This group has reached its total of {{.max}} webhooks across the group and all threads.",
+	})
+
 	// ErrIncomingWebhookCreatorLeft (409) — the webhook's creator is no longer
 	// an (internal, active) member of the group, so operations that would make
 	// or keep it pushable (enable / regenerate / test push) are refused. The

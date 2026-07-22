@@ -23,6 +23,23 @@ var ErrQuotaExceeded = errors.New("incomingwebhook: per-scope quota exceeded")
 // 受限，管理员豁免），同样由 insertWithQuota 在事务内原子判定。
 var ErrCreatorQuotaExceeded = errors.New("incomingwebhook: per-creator quota exceeded")
 
+// ErrTotalQuotaExceeded 单群【跨群本体 + 所有子区】的 webhook 聚合总数已达上限
+// （max_total_per_group，仅在 > 0 时启用），同样由 insertWithQuota 在事务内原子判定。
+// 挡住「子区可无限建 → 单群总量失控」，与作用域/个人配额共享同一把父群行锁。
+var ErrTotalQuotaExceeded = errors.New("incomingwebhook: per-group total quota exceeded")
+
+// quotaLimits 描述一次创建要校验的三层上限。三层都在【同一把父群行锁】的串行临界区内
+// 评估，故任意维度都精确、无 check-then-act 竞态（新增维度只是同事务内多一条 COUNT）：
+//   - scope      本投递作用域 (group_no, thread_short_id) 可建上限：群本体传 max_per_group、
+//                子区传 max_per_thread。必须 > 0（调用方已按读侧防御夹紧）。
+//   - perCreator 本作用域下单个 creator_uid 的上限；<= 0 表示不启用（管理员创建路径）。
+//   - total      单群跨所有作用域的聚合总数上限；<= 0 表示不启用（未配置聚合天花板）。
+type quotaLimits struct {
+	scope      int
+	perCreator int
+	total      int
+}
+
 type incomingWebhookDB struct {
 	session *dbr.Session
 	ctx     *config.Context
@@ -51,10 +68,12 @@ func newDB(ctx *config.Context) *incomingWebhookDB {
 // 重试，合法并发创建会以不透明的"创建失败"500 收场。锁父群这一必然存在的单行可彻底
 // 串行化而不触发 gap-lock 死锁（PR #31 yujiawei / Jerry-Xin review）。incoming_webhook
 // 体量小，父群级串行化成本可忽略；配额口径细到子区、锁口径粗到父群，两者独立。
-// maxPerCreator <= 0 表示不启用个人配额（管理员创建路径）；> 0 时在同一事务内对
+// lim.perCreator <= 0 表示不启用个人配额（管理员创建路径）；> 0 时在同一事务内对
 // 【同一作用域下的】creator_uid 维度再做一次计数校验，超限返回 ErrCreatorQuotaExceeded。
-// 个人配额与作用域配额共享同一把父群行锁，无需额外加锁。
-func (d *incomingWebhookDB) insertWithQuota(m *incomingWebhookModel, max, maxPerCreator int) error {
+// lim.total > 0 时再多做一次【全群】(group_no，不带 thread 过滤) 的聚合计数校验，超限返回
+// ErrTotalQuotaExceeded——这就是「群聚合天花板」，挡住子区无限建导致的总量膨胀。三层配额
+// 共享同一把父群行锁，无需额外加锁；锁粗（父群）、算细（作用域/个人/全群任意维度）。
+func (d *incomingWebhookDB) insertWithQuota(m *incomingWebhookModel, lim quotaLimits) error {
 	tx, err := d.session.Begin()
 	if err != nil {
 		return fmt.Errorf("incomingwebhook: begin tx: %w", err)
@@ -78,11 +97,11 @@ func (d *incomingWebhookDB) insertWithQuota(m *incomingWebhookModel, max, maxPer
 	).Load(&count); err != nil {
 		return fmt.Errorf("incomingwebhook: count: %w", err)
 	}
-	if count >= max {
+	if count >= lim.scope {
 		return ErrQuotaExceeded
 	}
 
-	if maxPerCreator > 0 {
+	if lim.perCreator > 0 {
 		var creatorCount int
 		if _, err = tx.SelectBySql(
 			// 与作用域配额同口径：限定同一 (group_no, thread_short_id) 作用域、只排除软
@@ -98,8 +117,25 @@ func (d *incomingWebhookDB) insertWithQuota(m *incomingWebhookModel, max, maxPer
 		).Load(&creatorCount); err != nil {
 			return fmt.Errorf("incomingwebhook: creator count: %w", err)
 		}
-		if creatorCount >= maxPerCreator {
+		if creatorCount >= lim.perCreator {
 			return ErrCreatorQuotaExceeded
+		}
+	}
+
+	if lim.total > 0 {
+		var totalCount int
+		if _, err = tx.SelectBySql(
+			// 群级聚合天花板：不带 thread_short_id 过滤，计【整个群】跨群本体+所有子区的
+			// 未删除 webhook 总数。父群行锁已把同群并发串行化，此处普通读即精确——即便另
+			// 一个作用域此刻有空位，只要全群总数触顶就拒绝，正是本天花板的用途。命中
+			// idx_incoming_webhook_thread(group_no, ...) 的 group_no 前缀。
+			"SELECT count(*) FROM incoming_webhook WHERE group_no=? AND status != ?",
+			m.GroupNo, statusDeleted,
+		).Load(&totalCount); err != nil {
+			return fmt.Errorf("incomingwebhook: total count: %w", err)
+		}
+		if totalCount >= lim.total {
+			return ErrTotalQuotaExceeded
 		}
 	}
 

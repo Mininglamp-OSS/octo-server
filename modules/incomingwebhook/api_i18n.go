@@ -134,6 +134,13 @@ func mgmtCreatorQuotaExceeded(c *wkhttp.Context, max int) {
 	httperr.ResponseErrorLWithStatus(c, errcode.ErrIncomingWebhookCreatorQuotaExceeded, i18n.Params{"max": max}, nil)
 }
 
+// mgmtTotalQuotaExceeded returns 409 — the group hit its aggregate webhook
+// ceiling across the group itself and all its threads (max_total_per_group);
+// max carries the configured limit.
+func mgmtTotalQuotaExceeded(c *wkhttp.Context, max int) {
+	httperr.ResponseErrorLWithStatus(c, errcode.ErrIncomingWebhookTotalQuotaExceeded, i18n.Params{"max": max}, nil)
+}
+
 // mgmtCreatorLeft returns 409 — the webhook's creator is no longer in the
 // group; enable / regenerate / test push are refused (delete stays available).
 func mgmtCreatorLeft(c *wkhttp.Context) {

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -168,6 +169,81 @@ func TestThread_QuotaIsPerScope(t *testing.T) {
 	// 子区 A 满【不影响】子区 B：独立桶，可建。
 	assert.Equalf(t, http.StatusOK, create(threadWebhooksPath(groupNo, threadB), "b1"),
 		"thread B has an independent bucket; thread A being full must not block it")
+}
+
+// TestThread_MaxPerThreadDistinctFromGroup 群本体与子区可分别精确设上限（①）：
+// max_per_group=2、max_per_thread=1 → 群面可建 2、子区面只可建 1。
+func TestThread_MaxPerThreadDistinctFromGroup(t *testing.T) {
+	handler, ctx, groupNo := setupTestEnv(t)
+	defer testutil.CleanAllTables(ctx)
+	t.Setenv("DM_INCOMINGWEBHOOK_MAX_PER_GROUP", "2")
+	t.Setenv("DM_INCOMINGWEBHOOK_MAX_PER_THREAD", "1")
+	shortID := seedThread(t, ctx, groupNo, thread.ThreadStatusActive)
+
+	create := func(path, name string) int {
+		return do(handler, authReq("POST", path, map[string]interface{}{"name": name})).Code
+	}
+	groupPath := fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo)
+	threadPath := threadWebhooksPath(groupNo, shortID)
+
+	// 群面：2 个 OK，第 3 个 409（群本体上限 max_per_group=2）。
+	assert.Equal(t, http.StatusOK, create(groupPath, "g1"))
+	assert.Equal(t, http.StatusOK, create(groupPath, "g2"))
+	assert.Equal(t, http.StatusConflict, create(groupPath, "g3"), "group cap = max_per_group = 2")
+
+	// 子区面：1 个 OK，第 2 个 409（子区上限 max_per_thread=1，与群本体解耦）。
+	assert.Equal(t, http.StatusOK, create(threadPath, "t1"))
+	assert.Equal(t, http.StatusConflict, create(threadPath, "t2"),
+		"thread cap = max_per_thread = 1, distinct from the group cap of 2")
+}
+
+// TestThread_TotalQuotaCeilingConcurrent 群级聚合天花板在高并发下精确守住（②）：跨群本体 +
+// 多个子区并发建 webhook，max_total_per_group=K，恰好 K 个成功、全群总数=K。验证三层配额都
+// 在同一父群行锁的串行临界区内评估——加了聚合维度也不在并发下泄漏。
+func TestThread_TotalQuotaCeilingConcurrent(t *testing.T) {
+	handler, ctx, groupNo := setupTestEnv(t)
+	defer testutil.CleanAllTables(ctx)
+	const total = 4
+	const fanout = 12
+	// 作用域上限放大，只测聚合天花板；聚合上限设为 total。
+	t.Setenv("DM_INCOMINGWEBHOOK_MAX_PER_GROUP", "100")
+	t.Setenv("DM_INCOMINGWEBHOOK_MAX_PER_THREAD", "100")
+	t.Setenv("DM_INCOMINGWEBHOOK_MAX_TOTAL_PER_GROUP", fmt.Sprintf("%d", total))
+
+	// 预建活跃子区，让并发请求分散到群本体 + 各子区（跨作用域打同一个聚合桶）。
+	threadA := seedThread(t, ctx, groupNo, thread.ThreadStatusActive)
+	threadB := seedThread(t, ctx, groupNo, thread.ThreadStatusActive)
+	paths := []string{
+		fmt.Sprintf("/v1/groups/%s/incoming-webhooks", groupNo),
+		threadWebhooksPath(groupNo, threadA),
+		threadWebhooksPath(groupNo, threadB),
+	}
+
+	var wg sync.WaitGroup
+	codes := make([]int, fanout)
+	for i := 0; i < fanout; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			path := paths[idx%len(paths)]
+			codes[idx] = do(handler, authReq("POST", path, map[string]interface{}{"name": fmt.Sprintf("wh-%d", idx)})).Code
+		}(i)
+	}
+	wg.Wait()
+
+	ok := 0
+	for _, c := range codes {
+		if c == http.StatusOK {
+			ok++
+		}
+	}
+	assert.Equalf(t, total, ok, "exactly %d concurrent creates should succeed under the aggregate ceiling, got %d (codes=%v)", total, ok, codes)
+
+	// 全群总数（跨所有作用域）必须恰好等于天花板——聚合配额在并发下无泄漏。
+	var rows int
+	_, err := ctx.DB().SelectBySql("SELECT count(*) FROM incoming_webhook WHERE group_no=? AND status != 2", groupNo).Load(&rows)
+	assert.NoError(t, err)
+	assert.Equal(t, total, rows, "group-wide total must equal the ceiling; aggregate quota leaked under concurrency")
 }
 
 // listWebhookIDs GETs a management list path and returns the webhook_id set.

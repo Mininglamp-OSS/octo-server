@@ -447,6 +447,9 @@ other = "Invalid request."
 ["err.server.incomingwebhook.mgmt_thread_not_found"]
 other = "The thread does not exist or is not available."
 
+["err.server.incomingwebhook.mgmt_total_quota_exceeded"]
+other = "This group has reached its total of {{.max}} webhooks across the group and all threads."
+
 ["err.server.incomingwebhook.push_delivery_failed"]
 other = "Failed to deliver the webhook message."
 

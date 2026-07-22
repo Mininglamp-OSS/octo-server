@@ -202,6 +202,59 @@ func TestSystemSettings_IncomingWebhookRPS_EnvFallbackWhenDBUnset(t *testing.T) 
 	assert.Equal(t, 7.0, s.IncomingWebhookPerWebhookRPS(), "DB 未配置 → env 生效")
 }
 
+// TestSystemSettings_IncomingWebhookMaxPerThread_FallbackAndOverride pins ①:
+// 子区上限 max_per_thread 未配置时回退到群本体 max_per_group（本特性上线时的行为，向后
+// 兼容）；单独配置后与群本体解耦，可分别精确设数。
+func TestSystemSettings_IncomingWebhookMaxPerThread_FallbackAndOverride(t *testing.T) {
+	t.Setenv(envIncomingWebhookMaxPerGroup, "")
+	t.Setenv(envIncomingWebhookMaxPerThread, "")
+	s := newTestSystemSettings(t, nil)
+
+	// 均未配置 → 子区上限回退到群本体上限（默认 10）。
+	assert.Equal(t, defaultIncomingWebhookMaxPerGroup, s.IncomingWebhookMaxPerThread(),
+		"unset max_per_thread must fall back to max_per_group")
+
+	// 仅配置 max_per_group → 子区仍跟随群本体值。
+	require.NoError(t, s.db.upsert("incomingwebhook", "max_per_group", "7", settingTypeInt, ""))
+	require.NoError(t, s.Reload())
+	assert.Equal(t, 7, s.IncomingWebhookMaxPerThread(), "still follows max_per_group when max_per_thread unset")
+
+	// 配置 max_per_thread → 与群本体解耦。
+	require.NoError(t, s.db.upsert("incomingwebhook", "max_per_thread", "3", settingTypeInt, ""))
+	require.NoError(t, s.Reload())
+	assert.Equal(t, 7, s.IncomingWebhookMaxPerGroup())
+	assert.Equal(t, 3, s.IncomingWebhookMaxPerThread(), "max_per_thread overrides independently of max_per_group")
+}
+
+func TestSystemSettings_IncomingWebhookMaxPerThread_EnvFallbackWhenDBUnset(t *testing.T) {
+	t.Setenv(envIncomingWebhookMaxPerThread, "4")
+	s := newTestSystemSettings(t, nil)
+	assert.Equal(t, 4, s.IncomingWebhookMaxPerThread(), "DB 未配置 → env 生效")
+}
+
+// TestSystemSettings_IncomingWebhookMaxTotalPerGroup_DefaultEnvDB pins ②:
+// 群级聚合天花板默认 0（关闭）；DB 可覆盖为正数；负值读侧夹到 0（关闭），不回退默认。
+func TestSystemSettings_IncomingWebhookMaxTotalPerGroup_DefaultEnvDB(t *testing.T) {
+	t.Setenv(envIncomingWebhookMaxTotalPerGroup, "")
+	s := newTestSystemSettings(t, nil)
+	assert.Equal(t, 0, s.IncomingWebhookMaxTotalPerGroup(), "default is 0 = disabled")
+
+	require.NoError(t, s.db.upsert("incomingwebhook", "max_total_per_group", "50", settingTypeInt, ""))
+	require.NoError(t, s.Reload())
+	assert.Equal(t, 50, s.IncomingWebhookMaxTotalPerGroup())
+
+	// 负值 → 夹到 0（关闭），而非回退某默认值（0 是有意义的「关闭」哨兵）。
+	require.NoError(t, s.db.upsert("incomingwebhook", "max_total_per_group", "-5", settingTypeInt, ""))
+	require.NoError(t, s.Reload())
+	assert.Equal(t, 0, s.IncomingWebhookMaxTotalPerGroup(), "negative clamps to 0 (disabled)")
+}
+
+func TestSystemSettings_IncomingWebhookMaxTotalPerGroup_EnvFallbackWhenDBUnset(t *testing.T) {
+	t.Setenv(envIncomingWebhookMaxTotalPerGroup, "20")
+	s := newTestSystemSettings(t, nil)
+	assert.Equal(t, 20, s.IncomingWebhookMaxTotalPerGroup(), "DB 未配置 → env 生效")
+}
+
 // TestSystemSettings_IncomingWebhook_ReadSideClamp_NoInfra pins the read-side
 // defence (#292 review): a snapshot carrying NaN / ±Inf / ≤0 — which a direct DB
 // edit could introduce even though the admin write path now rejects them — must
