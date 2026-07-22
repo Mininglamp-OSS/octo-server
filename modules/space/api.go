@@ -911,14 +911,15 @@ type createInviteReq struct {
 	Duration *int64 `json:"duration"`
 }
 
+// mysqlTimestampMax 是 MySQL TIMESTAMP 列的最大可表示时刻（2038-01-19 03:14:07 UTC）。
+// space_invitation.expires_at 使用 TIMESTAMP 类型，超出此时刻的值
+// 会因 sql_mode 不同而报错或被截断为错误值。
+// 所有写入 expires_at 的路径均应确保 time.Time <= mysqlTimestampMax。
+var mysqlTimestampMax = time.Date(2038, 1, 19, 3, 14, 7, 0, time.UTC)
+
 // maxInviteDurationSeconds 邀请码最大有效期（秒）。
-//
-// 约 10 年（3650 天），满足以下约束：
-//   - 远低于 time.Duration（int64 纳秒）溢出点（~292 年）。
-//   - 加上当前时间后不超过 MySQL TIMESTAMP 上限（2038-01-19），
-//     只要在 2028 年以前调用本接口即成立（最坏情况：2028 + 10 = 2038）。
-//
-// 如需修改，请同时评估数据库列类型（当前 TIMESTAMP，上限 2038-01-19）。
+// 约 10 年（3650 天），远低于 time.Duration（int64 纳秒）溢出点（~292 年）。
+// 仅防溢出；MySQL TIMESTAMP 上限由 createInvite 中对 mysqlTimestampMax 的绝对校验负责。
 const maxInviteDurationSeconds = int64(3650 * 24 * 3600) // ~10 年
 
 func (s *Space) createInvite(c *wkhttp.Context) {
@@ -969,8 +970,13 @@ func (s *Space) createInvite(c *wkhttp.Context) {
 			// 永久：清除默认 ExpiresAt
 			inviteModel.ExpiresAt = nil
 		default:
-			// 正整数：覆盖默认 ExpiresAt
-			t := db.Time(now.Add(time.Duration(*req.Duration) * time.Second))
+			// 正整数：校验绝对上限，防止超出 MySQL TIMESTAMP 范围（2038-01-19）。
+			candidate := now.Add(time.Duration(*req.Duration) * time.Second)
+			if candidate.After(mysqlTimestampMax) {
+				respondSpaceRequestInvalid(c, "duration")
+				return
+			}
+			t := db.Time(candidate)
 			inviteModel.ExpiresAt = &t
 		}
 	}
