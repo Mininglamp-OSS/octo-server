@@ -486,6 +486,13 @@ func (n *Notify) buildDocsCard(ctx context.Context, spaceID string, card *DocsCa
 	})
 }
 
+// buildDocsAccessRequestCard 是**迁移前的 legacy 构造路径,已不在生产链路上**:
+// deliverDocsCardNotification 的 access_requested + gate 分支走
+// buildDocsAccessRequestCardViaRegistry(Registry.Render 唯一入口)。本方法仅存留作
+// 迁移基线 —— card_via_registry_baseline_test.go 用它产出 pre-migration 输出,
+// 断言与 Registry.Render 字节等价;card_action_test.go 也引用它。请勿把它误当成
+// 第二条活的生产渲染路径;真要改 access-request 卡的生产行为,改 pilot Template
+// (pkg/cardtmpl/docs_access_request) 或 Registry.Render。
 func (n *Notify) buildDocsAccessRequestCard(ctx context.Context, spaceID string, card *DocsCardFields, lang string) (json.RawMessage, error) {
 	labels := docsLabelsFor(lang)
 	actor := strings.TrimSpace(card.ActorName)
