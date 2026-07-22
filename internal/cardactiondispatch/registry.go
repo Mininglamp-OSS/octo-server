@@ -46,18 +46,20 @@ type RouteSpec struct {
 	BaseBackoff    time.Duration
 	MaxBackoff     time.Duration
 	MaxInFlight    int
+	CallbackFormat CallbackFormat
 }
 
 type Route struct {
-	SenderUID   string
-	Owner       string
-	ActionType  string
-	URL         string
-	Timeout     time.Duration
-	MaxAttempts int
-	BaseBackoff time.Duration
-	MaxBackoff  time.Duration
-	MaxInFlight int
+	SenderUID      string
+	Owner          string
+	ActionType     string
+	URL            string
+	Timeout        time.Duration
+	MaxAttempts    int
+	BaseBackoff    time.Duration
+	MaxBackoff     time.Duration
+	MaxInFlight    int
+	CallbackFormat CallbackFormat
 
 	secret string
 }
@@ -118,16 +120,17 @@ func NewRegistry(specs []RouteSpec, getenv func(string) string) (*Registry, erro
 		}
 		callbackSecret := getenv(spec.SecretEnv)
 		registry.routes[key] = &Route{
-			SenderUID:   spec.SenderUID,
-			Owner:       spec.Owner,
-			ActionType:  spec.ActionType,
-			URL:         spec.URL,
-			Timeout:     spec.Timeout,
-			MaxAttempts: spec.MaxAttempts,
-			BaseBackoff: spec.BaseBackoff,
-			MaxBackoff:  spec.MaxBackoff,
-			MaxInFlight: spec.MaxInFlight,
-			secret:      callbackSecret,
+			SenderUID:      spec.SenderUID,
+			Owner:          spec.Owner,
+			ActionType:     spec.ActionType,
+			URL:            spec.URL,
+			Timeout:        spec.Timeout,
+			MaxAttempts:    spec.MaxAttempts,
+			BaseBackoff:    spec.BaseBackoff,
+			MaxBackoff:     spec.MaxBackoff,
+			MaxInFlight:    spec.MaxInFlight,
+			CallbackFormat: spec.CallbackFormat,
+			secret:         callbackSecret,
 		}
 		registry.callbackSecrets[callbackSecret] = struct{}{}
 		registry.internalSenders[spec.SenderUID] = struct{}{}
@@ -270,6 +273,9 @@ func withRouteDefaults(spec RouteSpec) RouteSpec {
 	if spec.MaxInFlight == 0 {
 		spec.MaxInFlight = defaultMaxInFlight
 	}
+	if spec.CallbackFormat == "" {
+		spec.CallbackFormat = CallbackFormatLegacy
+	}
 	return spec
 }
 
@@ -282,6 +288,9 @@ func validateRouteSpec(spec RouteSpec, getenv func(string) string) error {
 	}
 	if !actionTypePattern.MatchString(spec.ActionType) {
 		return errors.New("invalid action_type")
+	}
+	if spec.CallbackFormat != CallbackFormatLegacy && spec.CallbackFormat != CallbackFormatOctoCardV1 {
+		return errors.New("invalid callback_format")
 	}
 	if _, err := validateCallbackURL(spec.URL); err != nil {
 		return err

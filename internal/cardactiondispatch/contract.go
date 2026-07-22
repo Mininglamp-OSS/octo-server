@@ -46,7 +46,23 @@ type Event struct {
 	ActedAt     int64                  `json:"acted_at"`
 	Inputs      map[string]interface{} `json:"inputs"`
 	Data        map[string]interface{} `json:"data,omitempty"`
+	Card        CardContext            `json:"card,omitempty"`
 }
+
+// CardContext is derived from the effective server-authored card frame before
+// enqueue. Zero value means a legacy card without registry metadata.
+type CardContext struct {
+	TemplateID      string `json:"template_id,omitempty"`
+	TemplateVersion string `json:"template_version,omitempty"`
+	View            string `json:"view,omitempty"`
+}
+
+type CallbackFormat string
+
+const (
+	CallbackFormatLegacy     CallbackFormat = "legacy"
+	CallbackFormatOctoCardV1 CallbackFormat = "octo-card-v1"
+)
 
 type DecisionRequest struct {
 	EventID     int64                  `json:"event_id,string"`
@@ -62,6 +78,7 @@ type DecisionRequest struct {
 	ChannelType uint8                  `json:"channel_type"`
 	SpaceID     string                 `json:"space_id,omitempty"`
 	ActedAt     int64                  `json:"acted_at"`
+	event       *Event
 }
 
 type DecisionResult struct {
@@ -76,7 +93,7 @@ func DecisionRequestFromEvent(event Event) DecisionRequest {
 	if inputs == nil {
 		inputs = map[string]interface{}{}
 	}
-	return DecisionRequest{
+	request := DecisionRequest{
 		EventID:     event.EventID,
 		ActionID:    event.ActionID,
 		Decision:    stringField(event.Data, "decision"),
@@ -91,6 +108,85 @@ func DecisionRequestFromEvent(event Event) DecisionRequest {
 		SpaceID:     event.SpaceID,
 		ActedAt:     event.ActedAt,
 	}
+	request.event = &event
+	return request
+}
+
+type callbackEnvelope struct {
+	Protocol  string         `json:"protocol"`
+	Type      string         `json:"type"`
+	Action    callbackAction `json:"action"`
+	Card      callbackCard   `json:"card"`
+	Actor     callbackActor  `json:"actor"`
+	TriggerID string         `json:"trigger_id"`
+}
+
+type callbackAction struct {
+	ID     string                 `json:"id"`
+	Data   map[string]interface{} `json:"data,omitempty"`
+	Inputs map[string]interface{} `json:"inputs"`
+}
+
+type callbackCard struct {
+	TemplateID      string `json:"template_id"`
+	TemplateVersion string `json:"template_version"`
+	View            string `json:"view"`
+	MessageID       string `json:"message_id"`
+	ChannelID       string `json:"channel_id"`
+	ChannelType     uint8  `json:"channel_type"`
+}
+
+type callbackActor struct {
+	UID string `json:"uid"`
+}
+
+// MarshalCallbackRequest encodes either the frozen flat request or the
+// route-opted-in octo-card envelope. response_url is intentionally absent until
+// a signed inbound response contract exists.
+func MarshalCallbackRequest(event Event, format CallbackFormat) ([]byte, error) {
+	if format == "" || format == CallbackFormatLegacy {
+		return json.Marshal(DecisionRequestFromEvent(event))
+	}
+	if format != CallbackFormatOctoCardV1 {
+		return nil, errors.New("cardactiondispatch: unsupported callback format")
+	}
+	if event.EventID <= 0 || event.Card.TemplateID == "" || event.Card.TemplateVersion == "" || event.Card.View == "" {
+		return nil, errors.New("cardactiondispatch: octo-card callback context is incomplete")
+	}
+	inputs := event.Inputs
+	if inputs == nil {
+		inputs = map[string]interface{}{}
+	}
+	return json.Marshal(callbackEnvelope{
+		Protocol: "octo-card@1.0",
+		Type:     "card.action",
+		Action: callbackAction{
+			ID: event.ActionID, Data: event.Data, Inputs: inputs,
+		},
+		Card: callbackCard{
+			TemplateID: event.Card.TemplateID, TemplateVersion: event.Card.TemplateVersion, View: event.Card.View,
+			MessageID: event.MessageID, ChannelID: event.ChannelID, ChannelType: event.ChannelType,
+		},
+		Actor:     callbackActor{UID: event.OperatorUID},
+		TriggerID: fmt.Sprintf("%d", event.EventID),
+	})
+}
+
+func marshalDecisionRequest(request DecisionRequest, format CallbackFormat) ([]byte, error) {
+	if format == "" || format == CallbackFormatLegacy {
+		return json.Marshal(request)
+	}
+	if request.event == nil {
+		return nil, errors.New("cardactiondispatch: callback request has no source event")
+	}
+	// Routes may opt into the new format while pre-registry cards are still in
+	// flight. A completely absent CardContext identifies that legacy path and
+	// preserves its flat payload; partial context still reaches
+	// MarshalCallbackRequest and fails closed as corrupt/incomplete metadata.
+	if format == CallbackFormatOctoCardV1 && request.event.Card == (CardContext{}) {
+		return json.Marshal(request)
+	}
+	return MarshalCallbackRequest(*request.event, format)
 }
 
 func DecodeDecisionResult(reader io.Reader) (DecisionResult, error) {

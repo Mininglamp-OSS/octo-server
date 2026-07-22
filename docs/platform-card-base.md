@@ -4,7 +4,8 @@
 > `pkg/cardtmpl/{template,registry,helpers,updater,metrics}.go`、`pkg/cardmsg/`、
 > `internal/carddispatch/`、`internal/cardactiondispatch/` 的实现互为镜像 ——
 > 两者如有出入,以代码为准并视为本文档的 bug。规范源头:
-> `.octospec/tasks/cardtmpl-registry-pilot/brief.md`(基座落地 + docs.access-request pilot);
+> `.octospec/tasks/cardtmpl-registry-pilot/brief.md`(基座落地 + docs.access-request pilot)与
+> `.octospec/tasks/cardtmpl-interaction-closure/brief.md`(post-#633 交互闭环);
 > 分层与生命周期规则见 §2。
 >
 > **读者**:业务后端(docs-backend / summary-backend / 未来 L2b 业务方)、octo-web、
@@ -13,7 +14,8 @@
 
 > 本文定义 octo-server 卡片消息的平台级基座契约（L0），所有业务卡片（文档/智能总结/审批/Git/...）都在此基座上以版本化模板（L1）形式注册与运行。
 >
-> 首个验证样板：`docs.access-request@0.2.0`（web 侧起草）。
+> 首个验证样板：冻结的 `docs.access-request@0.2.0/pending`，以及兼容演进的
+> `docs.access-request@0.3.0`（`pending` + `approved/rejected` result）。
 >
 > 对齐参考：Slack Block Kit、飞书卡片 JSON 2.0；复用现有 octo 实现，不重复造轮子。
 
@@ -200,7 +202,7 @@
     }
     // 注:0.2.0 pilot 只注册 pending 单视图 (octo/v2 交互档)。
     // 终态 result 视图 (approved/rejected,octo/v1) 与其 approved/rejected
-    // samples 由后续 outcome PR 以新版本 docs.access-request@0.3.0 发布,
+    // samples 已由后续交互闭环以新版本 docs.access-request@0.3.0 发布,
     // 老版本目录一经发布即冻结不改 (§2.1 L1 变更规则)。
   }
 }
@@ -479,7 +481,11 @@ func (r *Registry) RegisteredForTest() []Template
 
 ## 7. 统一交互回调契约
 
-复用 `internal/cardactiondispatch`，统一回调 payload 顶层结构（对齐 Slack/飞书交互 payload 结构）：
+复用 `internal/cardactiondispatch`。现有 route 默认 `callback_format=legacy`，保持扁平
+`DecisionRequest` 字节兼容；只有 route 显式配置 `callback_format=octo-card-v1` 时才发送
+下列标准 envelope。升级后的 route 遇到完全没有模板 metadata 的在途 legacy 卡时仍发送
+扁平 payload；部分/损坏 metadata 则 fail-close。两种格式均对最终 HTTP body 原始字节
+做现有 HMAC 签名。
 
 ```jsonc
 {
@@ -498,40 +504,50 @@ func (r *Registry) RegisteredForTest() []Template
   },
   "card": {
     "template_id": "docs.access-request",
-    "template_version": "0.2.0",
+    "template_version": "0.3.0",
     "view": "pending",
-    "message_id": 12345,
+    "message_id": "12345",
     "channel_id": "uid_xxx",
     "channel_type": 1
   },
   "actor": { "uid": "uid_xxx" },
-  "trigger_id": "...",                  // 短期令牌,用于 modal/延迟响应
-  "response_url": "..."                 // 异步更新卡片用,5min 有效
+  "trigger_id": "..."                   // durable event_id 的稳定字符串；关联用，不是授权凭据
 }
 ```
 
+`response_url` 当前为保留能力，不会出现在 payload 中。其请求体、鉴权、TTL、重放与
+运维归属尚未形成独立契约，在此之前不得发布不可调用的伪 URL。
+
 ### 业务方回调处理
 - 业务方实现 `cardactiondispatch.Finalizer`（复用现有 finalizer 机制），按 `(owner, action_type)` 绑定；
-- Finalizer 调用 `Registry.Lookup(templateId, version)` → 校验业务状态 → 调用 `Build(resultState, resultFields, env)` → 通过 `CardUpdater` 更新原消息（切换视图/替换 body），对齐 Slack response_url / 飞书流式更新体验。
+- Finalizer 校验业务状态后，通过 `CardUpdater.ReplaceView` 走
+  `Registry.RenderCard → CardMutator` 更新原消息；调用方不得自行拼 type-17 envelope。
 
 ---
 
 ## 8. 统一更新接口（视图切换/终态）
 
 ```go
-// pkg/cardtmpl/updater.go (在现有 pkg/cardrevision 与 carddispatch 之上封装)
-type CardUpdater interface {
-    // ReplaceView 切换到同模板另一视图(如 pending → result),
-    // 服务端权威重渲染,替换原消息 body,保持 message_id 不变。
-    ReplaceView(ctx context.Context, target carddispatch.Target,
-        templateID ID, version string, newState string, fields json.RawMessage) error
+type UpdateTarget struct {
+    Target     carddispatch.Target // 权威 Space/channel/channel_type
+    SenderUID  string
+    MessageID  string
+    MessageSeq uint32              // 可选查询优化
+    CardSeq    int64               // 正数、单调递增
+}
 
-    // Append 追加内容到卡片底部(如进度帧),不替换原 body;v1/v2 均支持。
-    Append(ctx context.Context, target carddispatch.Target, element json.RawMessage) error
+type CardUpdater interface {
+    ReplaceView(ctx context.Context, target UpdateTarget,
+        templateID ID, version string, newState State,
+        fields json.RawMessage, env BuildEnv) error
+
+    Append(ctx context.Context, target UpdateTarget, element json.RawMessage) error
 }
 ```
 
-底层复用现有 `pkg/cardrevision` 修订账本 + `carddispatch` 发送层，不新造通路。
+`ReplaceView` 服务端权威重渲染并保持 `message_id`；`Append` 读取当前生效帧，只允许
+`target.CardSeq == snapshot.CardSeq + 1`，追加一个 JSON object 后重验完整卡片。两者均
+复用 `CardMutator` 的 sender/lifecycle/CAS、修订账本与 CMD 同步，不新造写通路。
 
 ---
 
@@ -588,9 +604,9 @@ type CardUpdater interface {
 
 | 指标 | labels | 说明 |
 |---|---|---|
-| `cardtmpl_build_total` | template_id, version, view, result=ok\|fields_invalid\|render_error | Build 结果；fields_invalid 应在 400 返回前就拦截，本指标反映防线穿透情况。 |
-| `cardtmpl_callback_total` | template_id, version, action_id, result=ok\|rejected\|error | 交互回调结果。 |
-| `cardtmpl_update_total` | template_id, version, result=ok\|error | 卡片更新（视图切换/追加）结果。 |
+| `dmwork_cardtmpl_build_total` | template_id, version, view, result=ok\|fields_invalid\|render_error | Build 结果；fields_invalid 应在 400 返回前就拦截，本指标反映防线穿透情况。 |
+| `dmwork_cardtmpl_callback_total` | template_id, version, action_id, result=ok\|rejected\|error | 交互回调结果。 |
+| `dmwork_cardtmpl_update_total` | template_id, version, result=ok\|error | 卡片更新（视图切换/追加）结果。 |
 
 label `template_id` 基数 = 注册表大小（硬编码），无基数爆炸。
 
@@ -602,7 +618,7 @@ label `template_id` 基数 = 注册表大小（硬编码），无基数爆炸。
 |---|---|---|
 | AdaptiveCard 构建/校验/白名单 | `pkg/cardmsg/*` | 不动，复用 |
 | 派发/bot 身份/空间鉴权 | `internal/carddispatch/*` | 不动；Sender.Send 接受的 Card.Profile 从 Registry 拿 |
-| 回调路由/finalizer | `internal/cardactiondispatch/*` | 回调 payload 顶层结构标准化（第 7 节），RouteSpec 不动 |
+| 回调路由/finalizer | `internal/cardactiondispatch/*` | `RouteSpec.CallbackFormat` 显式 opt-in 标准 envelope；默认 legacy |
 | 信任边界/签名校验 | `modules/cardtrust/*` | 不动 |
 | 业务 builder | `pkg/cardtmpl/{resource,approval_request,approval_result,docs_action}.go` | 保留为 L2 实现；抽出 Template 接口、Registry、helpers |
 | notify 入口/能力准入 | `modules/notify/{api,card,approval_card}.go` | 方案 B：外壳不动，内部 `deliver*` 改为 `Lookup→Build`；docs 通路 card.go 分支改造，保持 `notifyCapabilityAllows` 准入 |
@@ -645,8 +661,16 @@ label `template_id` 基数 = 注册表大小（硬编码），无基数爆炸。
    - 更新 `.octospec/tasks/card-message-internal-dispatch/docs-notify-contract.md`,引用本基座文档和 handoff 路径;
    - 本基座文档已随 pilot PR 迁入 `docs/platform-card-base.md`(仓库权威路径),不再等 PR-2。
 
-3. **后续 PR(非 pilot)**
-   - 迁 `docs.shared/commented`、`summary.completed/failed`、`generic.approval`、`docs.access.outcome` 到 Registry;outcome 与 `pkg/cardrevision` + `standard_action_finalizer` 联动,同一 PR 引入 `CardUpdater`;
+3. **post-#633 交互闭环（cardtmpl-interaction-closure task）**
+   - 新增并同时注册 `docs.access-request@0.3.0`；`pending` 使用 `octo/v2`，
+     `approved/rejected` result 使用 `octo/v1`；冻结的 `0.2.0` 字节不修改；
+   - 引入 `CardUpdater.ReplaceView/Append`，docs terminal finalizer 用 `0.3.0/result`
+     原消息更新；旧 `0.2.0/pending` action data 缺少装饰字段时安全省略；
+   - callback route 默认 legacy，显式 `octo-card-v1` 才发送标准 envelope；
+   - 增加 callback/update 两个有界指标，且不发布 `response_url`。
+
+4. **后续 PR**
+   - 迁 `docs.shared/commented`、`summary.completed/failed`、`generic.approval` 等模板到 Registry；
    - 开放 `/v1/message/card/templates` 只读端点(涉及 per-owner 可见性 / i18n 文案透出);
    - 开放 JSON 模板模式(`templates/*.template.json` + 表达式引擎);
    - 开放 envelope 模式(调用方显式传 `template_id`),替换 `NotifyReq` 四选一;
@@ -654,9 +678,10 @@ label `template_id` 基数 = 注册表大小（硬编码），无基数爆炸。
 
 ---
 
-## 16. 不做什么（Out of scope, 对齐 brief）
+## 16. #633 pilot 当时不做什么（历史记录）
 
-本 PR (cardtmpl-registry-pilot) 明确不做,后续 PR 承接:
+以下条目描述 #633 pilot 的边界；其中 `CardUpdater` 与 `0.3.0/result` 已由 §15.3
+承接完成，其余仍按独立 brief 推进：
 
 - 不引入 `${}` 表达式引擎(PR-1 阶段);
 - 不改 `NotifyReq` 外部形状(方案 B);
@@ -681,6 +706,6 @@ label `template_id` 基数 = 注册表大小（硬编码），无基数爆炸。
 | 组件白名单 | 官方 block types | 官方 `tag` | `pkg/cardmsg/whitelist.go` |
 | 交互元素 ID | `block_id` + `action_id` | `element_id` 全局唯一 | `DeclaredAction.ID` / `DeclaredInput.ID`，机读 interaction report |
 | 回调 | block_actions 事件 | action 回调 | `POST /v1/message/card/action`,payload 第 7 节 |
-| response_url 更新 | response_url(5min) | 延迟更新/流式更新 | `CardUpdater.ReplaceView/Append` + response_url 预留 |
+| response_url 更新 | response_url(5min) | 延迟更新/流式更新 | `CardUpdater.ReplaceView/Append` 已落地；response_url 仅保留、不发出 |
 | 降级 | 未知 block 忽略 + text fallback | schema 不兼容提示升级 | Profile 分档 + FallbackText（第 10 节） |
 | 能力分档 | 全量交互 | 全量交互 | octo/v1 展示 / octo/v2 交互 |

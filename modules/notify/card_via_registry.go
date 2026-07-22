@@ -72,7 +72,7 @@ func preflightDocsAccessRequestSchema(card *DocsCardFields) error {
 	if err := tmpl.Meta().InputSchema.Validate(parsed); err != nil {
 		// R2-8: preflight schema 失败也打 fields_invalid metric (Render 未被触发,
 		// 否则 metric 永远漏这条最"合法"的 400 路径)。
-		cardtmpl.RecordFieldsInvalid(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersion)
+		cardtmpl.RecordFieldsInvalid(docsaccessrequest.TemplateID, tmpl.Meta().Version)
 		return fmt.Errorf("%w: %v", cardtmpl.ErrFieldsInvalid, err)
 	}
 	// R3-1: schema 的 avatarUrl pattern 只做粗粒度前缀防护,正则无法可靠判定 host
@@ -88,7 +88,7 @@ func preflightDocsAccessRequestSchema(card *DocsCardFields) error {
 	// 让基座统一前置校验,消除这条硬编码耦合。
 	if avatar := strings.TrimSpace(card.ActorAvatarURL); avatar != "" {
 		if err := cardtmpl.AbsoluteHTTPSURL(avatar); err != nil {
-			cardtmpl.RecordFieldsInvalid(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersion)
+			cardtmpl.RecordFieldsInvalid(docsaccessrequest.TemplateID, tmpl.Meta().Version)
 			return fmt.Errorf("%w: actor_avatar_url: %v", cardtmpl.ErrFieldsInvalid, err)
 		}
 	}

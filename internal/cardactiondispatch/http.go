@@ -3,7 +3,6 @@ package cardactiondispatch
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -72,7 +71,7 @@ func (d *HTTPDeliverer) Deliver(ctx context.Context, route *Route, request Decis
 	if ctx == nil || route == nil {
 		return DecisionResult{}, &DeliveryError{Category: "invalid_request"}
 	}
-	body, err := json.Marshal(request)
+	body, err := marshalDecisionRequest(request, route.CallbackFormat)
 	if err != nil {
 		return DecisionResult{}, &DeliveryError{Category: "encode_failed", cause: err}
 	}

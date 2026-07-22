@@ -32,6 +32,28 @@ change-log convention (§7). Newest first.
   test under `-race`). New 409 `mgmt_total_quota_exceeded`. See
   [journal](journal/shared/incoming-webhook-quota-per-thread.md).
 
+## 2026-07-22 (cardtmpl-interaction-closure)
+
+- **Feature** — Closed the post-#633 interactive-card loop (roadmap group A).
+  `CardUpdater` (`ReplaceView` + progress-frame `Append`) composes the existing
+  `CardMutator` CAS/revision/CMD path; `docs.access-request@0.3.0` adds an
+  `approved`/`rejected` `result` view (`octo/v1`) registered beside the frozen
+  `0.2.0`; the docs finalizer now upgrades approved/denied cards in place to
+  `0.3.0/result`. In-flight `0.2.0` pending cards upgrade too — missing
+  decorative fields are omitted, not fabricated.
+- **Contract** — Route-versioned callback envelope: `legacy` flat body remains
+  the default (byte-compatible), `octo-card-v1` opt-in nested envelope carries
+  `protocol`/`type=card.action`/`card.{…}`/`trigger_id`; `response_url` stays
+  reserved (no authenticated response body defined in §7). See
+  [journal](journal/shared/cardtmpl-interaction-closure.md).
+- **Observability** — Bounded counters `dmwork_cardtmpl_callback_total`
+  (`ok|rejected|error`) + `dmwork_cardtmpl_update_total` (`ok|error`); labels
+  only from registered metadata + declared interactions.
+- **Learning (pending)** — `card_seq` for authoritative updates must come from
+  a monotonic source; the docs finalizer reuses `event.EventID`, an implicit
+  contract now documented. See
+  [learning](learnings/pending/cardtmpl-interaction-closure.md).
+
 ## 2026-07-22 (cardtmpl-registry-pilot)
 
 - **Feature** — Introduced the octo-card@1.0 platform base

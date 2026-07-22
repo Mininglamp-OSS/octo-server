@@ -59,6 +59,7 @@ type routeJSON struct {
 	BaseBackoffMS  int64  `json:"base_backoff_ms"`
 	MaxBackoffMS   int64  `json:"max_backoff_ms"`
 	MaxInFlight    int    `json:"max_in_flight"`
+	CallbackFormat string `json:"callback_format"`
 }
 
 func LoadRouteSpecs(raw string) ([]RouteSpec, error) {
@@ -80,6 +81,10 @@ func LoadRouteSpecs(raw string) ([]RouteSpec, error) {
 		if item.TimeoutMS < 0 || item.BaseBackoffMS < 0 || item.MaxBackoffMS < 0 {
 			return nil, errors.New("cardactiondispatch: route durations must not be negative")
 		}
+		format := CallbackFormat(item.CallbackFormat)
+		if format != "" && format != CallbackFormatLegacy && format != CallbackFormatOctoCardV1 {
+			return nil, errors.New("cardactiondispatch: invalid callback_format")
+		}
 		spec := RouteSpec{
 			SenderUID:      item.SenderUID,
 			Owner:          item.Owner,
@@ -89,6 +94,7 @@ func LoadRouteSpecs(raw string) ([]RouteSpec, error) {
 			NotifyTokenEnv: item.NotifyTokenEnv,
 			MaxAttempts:    item.MaxAttempts,
 			MaxInFlight:    item.MaxInFlight,
+			CallbackFormat: format,
 		}
 		if item.TimeoutMS > 0 {
 			spec.Timeout = time.Duration(item.TimeoutMS) * time.Millisecond

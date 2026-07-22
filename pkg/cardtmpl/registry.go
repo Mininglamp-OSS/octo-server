@@ -34,6 +34,7 @@ var (
 	ErrFieldsInvalid   = errors.New("cardtmpl: fields did not pass input schema")
 	ErrRenderFailed    = errors.New("cardtmpl: render failed post-build")
 	ErrRegistryFrozen  = errors.New("cardtmpl: registry frozen")
+	ErrActionUnknown   = errors.New("cardtmpl: action not declared by template")
 )
 
 // manifestFile 是 Registry 从 assets FS 解析的 manifest.json 形状。
@@ -53,6 +54,35 @@ type manifestFile struct {
 	// SourceLabel / SourceIconURL 可选,若手动指定则覆盖 Template 默认 Source。
 	SourceLabel   string `json:"sourceLabel,omitempty"`
 	SourceIconURL string `json:"sourceIconUrl,omitempty"`
+}
+
+// ActionView resolves one declared Action.Submit to its registered view. It is
+// used by the action ingress after extracting template identity from the
+// effective server-authored frame; OpenUrl and undeclared actions are rejected.
+func (r *Registry) ActionView(id ID, version, actionID string) (ViewKey, error) {
+	if strings.TrimSpace(actionID) == "" {
+		return "", ErrActionUnknown
+	}
+	e, err := r.entryOf(id, version)
+	if err != nil {
+		return "", err
+	}
+	var matched ViewKey
+	for view, report := range e.meta.interactions {
+		for _, action := range report.Actions {
+			if action.Type != "Action.Submit" || action.ID != actionID {
+				continue
+			}
+			if matched != "" && matched != view {
+				return "", fmt.Errorf("%w: %s@%s action %q is ambiguous", ErrActionUnknown, id, version, actionID)
+			}
+			matched = view
+		}
+	}
+	if matched == "" {
+		return "", fmt.Errorf("%w: %s@%s action %q", ErrActionUnknown, id, version, actionID)
+	}
+	return matched, nil
 }
 
 // Registry 是进程内模板注册中心。
