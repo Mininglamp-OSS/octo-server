@@ -4,6 +4,26 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-22 (incoming-webhook-quota-per-thread)
+
+- **Behavior change** — Incoming Webhook creation quota re-scoped from
+  *per parent group* to *per delivery scope* `(group_no,
+  thread_short_id)`: the group itself and each thread (子区) now hold
+  independent webhook budgets instead of sharing one per-group cap.
+  `insertWithQuota` narrows both the group-level and per-creator
+  `COUNT(*)` by `thread_short_id`; the `FOR UPDATE` serialization lock
+  stays on the parent `group` row (narrowing it would reintroduce the
+  gap-lock deadlock). Motivated by Octo Loop provisioning a webhook per
+  thread. Supersedes the `incoming-webhook-thread` task's locked
+  "threads share `max_per_group`" decision.
+- **Config** — `incomingwebhook.max_per_group` /
+  `incomingwebhook.max_per_creator` keep their keys and defaults
+  (10 / 5) but are reinterpreted "per delivery scope"; setting docs +
+  admin schema descriptions + the two 409 quota messages (en-US markers
+  + zh-CN) updated. No schema/data migration; existing rows
+  (`thread_short_id=''`) fall into the group-self bucket. See
+  [journal](journal/shared/incoming-webhook-quota-per-thread.md).
+
 ## 2026-07-22 (cardtmpl-registry-pilot)
 
 - **Feature** — Introduced the octo-card@1.0 platform base
