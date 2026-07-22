@@ -49,8 +49,9 @@ func (d *messageReactionDB) queryWithMessageIDsInChannel(channelID string, chann
 // 多 reaction 语义：不同 emoji 命中不同唯一键 → 各自独立行，互不影响（追加），
 // 不再有"改 emoji 覆盖"分支。
 //
-// upsert 后回读该行最终 is_deleted 返回，供 Web 乐观更新对账（盲翻转 + 并发下需知道结果）。
-func (d *messageReactionDB) toggleReaction(model *reactionModel) (int, error) {
+// upsert 后回读该行持久化的 emoji/seq/is_deleted，供 Web 乐观更新对账。调用方必须
+// 使用这份结果构造 CMD 与 HTTP 响应，不能回显请求值掩盖存储层不变量漂移。
+func (d *messageReactionDB) toggleReaction(model *reactionModel) (*reactionToggleResult, error) {
 	_, err := d.session.InsertBySql(
 		"INSERT INTO reaction_users (message_id, seq, channel_id, channel_type, uid, name, emoji, is_deleted) "+
 			"VALUES (?,?,?,?,?,?,?,0) "+
@@ -58,14 +59,23 @@ func (d *messageReactionDB) toggleReaction(model *reactionModel) (int, error) {
 		model.MessageID, model.Seq, model.ChannelID, model.ChannelType, model.UID, model.Name, model.Emoji,
 	).Exec()
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	var isDeleted int
-	err = d.session.Select("is_deleted").From("reaction_users").
+	result := &reactionToggleResult{}
+	err = d.session.Select("emoji", "seq", "is_deleted").From("reaction_users").
 		Where("channel_id=? and channel_type=? and message_id=? and uid=? and emoji=?",
 			model.ChannelID, model.ChannelType, model.MessageID, model.UID, model.Emoji).
-		LoadOne(&isDeleted)
-	return isDeleted, err
+		LoadOne(result)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+type reactionToggleResult struct {
+	Emoji     string
+	Seq       int64
+	IsDeleted int
 }
 
 type reactionModel struct {
