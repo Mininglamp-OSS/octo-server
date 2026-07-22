@@ -904,11 +904,22 @@ func (s *Space) updateMemberRole(c *wkhttp.Context) {
 // createInvite 创建邀请链接
 // createInviteReq 创建邀请码请求体。
 //
-// Duration 可选，单位秒；0 或缺省表示「永久」（不过期）。
-// 正值按秒计算过期时刻；超长值（> 10 年）在写入层截断，不在此处校验。
+// Duration 可选，单位秒；0 表示「永久」（不过期）；正整数按秒计算过期时刻。
+// 上限为 maxInviteDurationSeconds（约 10 年），超出或负值返回 400。
+// 字段缺省时沿用运营配置默认 TTL（DM_SPACE_INVITE_DEFAULT_TTL，默认 72h）。
 type createInviteReq struct {
 	Duration *int64 `json:"duration"`
 }
+
+// maxInviteDurationSeconds 邀请码最大有效期（秒）。
+//
+// 约 10 年（3650 天），满足以下约束：
+//   - 远低于 time.Duration（int64 纳秒）溢出点（~292 年）。
+//   - 加上当前时间后不超过 MySQL TIMESTAMP 上限（2038-01-19），
+//     只要在 2028 年以前调用本接口即成立（最坏情况：2028 + 10 = 2038）。
+//
+// 如需修改，请同时评估数据库列类型（当前 TIMESTAMP，上限 2038-01-19）。
+const maxInviteDurationSeconds = int64(3650 * 24 * 3600) // ~10 年
 
 func (s *Space) createInvite(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
@@ -928,9 +939,10 @@ func (s *Space) createInvite(c *wkhttp.Context) {
 		return
 	}
 
-	// 解析可选 duration 字段；body 缺失或解析失败时退化为默认行为。
+	// ShouldBindJSON：body 缺失/EOF 时不写 4xx，仅返回 error；
+	// 与 BindJSON(MustBindWith) 不同，不会在 empty body 时 abort 请求。
 	var req createInviteReq
-	_ = c.BindJSON(&req)
+	_ = c.ShouldBindJSON(&req)
 
 	now := time.Now()
 	inviteModel := &InvitationModel{
@@ -939,21 +951,30 @@ func (s *Space) createInvite(c *wkhttp.Context) {
 		Status:  1,
 	}
 
+	// 始终先应用运营默认值（MaxUses + 默认 ExpiresAt），
+	// 再按 duration 字段覆盖 ExpiresAt，确保 MaxUses 策略始终生效。
+	applyAutoInviteDefaults(inviteModel, now)
+
 	if req.Duration != nil {
-		if *req.Duration == 0 {
-			// 0 = 永久，ExpiresAt 保持 nil
-		} else if *req.Duration > 0 {
-			t := db.Time(now.Add(time.Duration(*req.Duration) * time.Second))
-			inviteModel.ExpiresAt = &t
-		} else {
-			// 负值：拒绝，duration 无意义
+		switch {
+		case *req.Duration < 0:
+			// 负值无意义，拒绝
 			respondSpaceRequestInvalid(c, "duration")
 			return
+		case *req.Duration > maxInviteDurationSeconds:
+			// 超出上限，防止 time.Duration 溢出及 MySQL TIMESTAMP 越界
+			respondSpaceRequestInvalid(c, "duration")
+			return
+		case *req.Duration == 0:
+			// 永久：清除默认 ExpiresAt
+			inviteModel.ExpiresAt = nil
+		default:
+			// 正整数：覆盖默认 ExpiresAt
+			t := db.Time(now.Add(time.Duration(*req.Duration) * time.Second))
+			inviteModel.ExpiresAt = &t
 		}
-	} else {
-		// 未传 duration：使用环境变量 / 默认 TTL（72h）
-		applyAutoInviteDefaults(inviteModel, now)
 	}
+	// duration 缺省：保留 applyAutoInviteDefaults 写入的默认 ExpiresAt
 
 	inviteCode, err := s.insertInvitationWithRetry(inviteModel)
 	if err != nil {
