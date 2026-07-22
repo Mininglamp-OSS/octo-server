@@ -184,7 +184,7 @@ func (r *Registry) RenderCard(
 // 必须调本函数在 ingress 前置拦截,而不是依赖 schema 的正则近似。
 //
 // pkg/cardtmpl 内 requireHTTPS (resource.go) 与 renderCore step5 均委托本函数,
-// 保证 preflight 通过 ⇒ Build 的 https 校验必然通过 (同一实现,零缝隙)。
+// 保证 preflight 通过 → Build 的 https 校验必然通过 (同一实现,零缝隙)。
 func AbsoluteHTTPSURL(raw string) error {
 	s := strings.TrimSpace(raw)
 	if s == "" {

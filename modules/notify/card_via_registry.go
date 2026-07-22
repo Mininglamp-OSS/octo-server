@@ -80,6 +80,12 @@ func preflightDocsAccessRequestSchema(card *DocsCardFields) error {
 	// 内 requireHTTPS 才失败、被误分类成 render_error 降级文本 (绕过 C1 400)。
 	// 这里用与 Build 同一个 URL parser (cardtmpl.AbsoluteHTTPSURL) 在 ingress 前置
 	// 断言绝对 https,把坏字段确定性收敛成 C1 400,零缝隙、零降级。空头像合法 (省略头像列)。
+	//
+	// 维护约束:本校验按字段硬编码 (当前 pilot 唯一的用户可控 URL 字段是 avatar;
+	// Source.IconURL 由服务端置空)。**L1 schema 若新增任何 URL 字段,必须在此同步
+	// 补 AbsoluteHTTPSURL 校验**,否则该字段又会退回"schema 过 → Build 失败 →
+	// render_error 降级"的同类缝隙。未来可由 Template 声明"须绝对 https 的字段集"
+	// 让基座统一前置校验,消除这条硬编码耦合。
 	if avatar := strings.TrimSpace(card.ActorAvatarURL); avatar != "" {
 		if err := cardtmpl.AbsoluteHTTPSURL(avatar); err != nil {
 			cardtmpl.RecordFieldsInvalid(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersion)
