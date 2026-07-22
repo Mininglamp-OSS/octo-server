@@ -1,6 +1,7 @@
 package message
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -59,5 +60,35 @@ func TestMessageReactionDB_ToggleReactionUpsertsAndReadsBack(t *testing.T) {
 	require.Equal(t, "👍", result.Emoji)
 	require.Equal(t, int64(7), result.Seq)
 	require.Equal(t, 1, result.IsDeleted)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestMessageReactionDB_ToggleReactionReturnsInsertError(t *testing.T) {
+	db, mock, cleanup := newMockReactionDB(t)
+	defer cleanup()
+
+	mock.ExpectExec("INSERT INTO reaction_users").WillReturnError(errors.New("insert failed"))
+	result, err := db.toggleReaction(&reactionModel{
+		ChannelID: "group-a", ChannelType: 2, UID: "u1", Name: "User 1",
+		MessageID: "9001", Emoji: "👍", Seq: 7,
+	})
+	require.EqualError(t, err, "insert failed")
+	require.Nil(t, result)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestMessageReactionDB_ToggleReactionReturnsReadBackError(t *testing.T) {
+	db, mock, cleanup := newMockReactionDB(t)
+	defer cleanup()
+
+	mock.ExpectExec("INSERT INTO reaction_users").WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery("SELECT emoji, seq, is_deleted FROM reaction_users").
+		WillReturnError(errors.New("read back failed"))
+	result, err := db.toggleReaction(&reactionModel{
+		ChannelID: "group-a", ChannelType: 2, UID: "u1", Name: "User 1",
+		MessageID: "9001", Emoji: "👍", Seq: 7,
+	})
+	require.EqualError(t, err, "read back failed")
+	require.Nil(t, result)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
