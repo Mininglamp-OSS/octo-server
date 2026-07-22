@@ -683,6 +683,23 @@ func TestSystemSettings_StickerCustomEnabled_DBTrueWins(t *testing.T) {
 	assert.True(t, s.StickerCustomEnabled(), "DB true -> custom sticker management enabled")
 }
 
+func TestSystemSettings_MessageReactionCapability_DefaultsReadOnly(t *testing.T) {
+	s := newTestSystemSettings(t, nil)
+
+	assert.True(t, s.MessageReactionReadEnabled(), "DB empty -> reaction display enabled")
+	assert.False(t, s.MessageReactionWriteEnabled(), "DB empty -> reaction writes disabled")
+}
+
+func TestSystemSettings_MessageReactionCapability_DBOverridesIndependently(t *testing.T) {
+	s := newTestSystemSettings(t, nil)
+	require.NoError(t, s.db.upsert("message_reaction", "read", "0", settingTypeBool, ""))
+	require.NoError(t, s.db.upsert("message_reaction", "write", "1", settingTypeBool, ""))
+	require.NoError(t, s.Reload())
+
+	assert.False(t, s.MessageReactionReadEnabled(), "DB false -> hide reaction display")
+	assert.True(t, s.MessageReactionWriteEnabled(), "DB true -> expose reaction write entry")
+}
+
 func TestSystemSettings_DocsEnabled_DefaultsFalse(t *testing.T) {
 	s := newTestSystemSettings(t, nil)
 

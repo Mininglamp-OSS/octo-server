@@ -781,6 +781,21 @@ func (s *SystemSettings) StickerCustomEnabled() bool {
 	return s.getBool("sticker", "custom_enabled", false)
 }
 
+// MessageReactionReadEnabled reports whether ordinary Web/iOS/Android clients
+// should display message reactions. Read defaults on so existing reactions stay
+// visible unless an operator explicitly disables message_reaction.read.
+func (s *SystemSettings) MessageReactionReadEnabled() bool {
+	return s.getBool("message_reaction", "read", true)
+}
+
+// MessageReactionWriteEnabled reports whether ordinary Web/iOS/Android clients
+// should expose add/cancel controls. Write defaults off for a staged rollout and
+// can be enabled independently through message_reaction.write. These capability
+// getters are presentation policy; server-side authorization stays independent.
+func (s *SystemSettings) MessageReactionWriteEnabled() bool {
+	return s.getBool("message_reaction", "write", false)
+}
+
 // StickerHandleRequired reports whether custom-sticker registration must reject a
 // missing upload handle (POST /v1/sticker/user). This is the enforcement POLICY,
 // deliberately independent of the signing CAPABILITY (OCTO_MASTER_KEY): it lives
