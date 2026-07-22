@@ -683,6 +683,20 @@ func TestSystemSettings_StickerCustomEnabled_DBTrueWins(t *testing.T) {
 	assert.True(t, s.StickerCustomEnabled(), "DB true -> custom sticker management enabled")
 }
 
+func TestSystemSettings_MessageReactionEnabled_DefaultsTrue(t *testing.T) {
+	s := newTestSystemSettings(t, nil)
+
+	assert.True(t, s.MessageReactionEnabled(), "DB empty -> preserve current reaction behavior")
+}
+
+func TestSystemSettings_MessageReactionEnabled_DBFalseWins(t *testing.T) {
+	s := newTestSystemSettings(t, nil)
+	require.NoError(t, s.db.upsert("message_reaction", "enabled", "0", settingTypeBool, ""))
+	require.NoError(t, s.Reload())
+
+	assert.False(t, s.MessageReactionEnabled(), "DB false -> hide ordinary-client reaction capability")
+}
+
 func TestSystemSettings_DocsEnabled_DefaultsFalse(t *testing.T) {
 	s := newTestSystemSettings(t, nil)
 

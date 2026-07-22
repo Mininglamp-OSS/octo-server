@@ -2,6 +2,7 @@ package common
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -757,6 +758,52 @@ func TestGetAppConfig_StickerCustomEnabled_OnVersionShortCircuit(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Contains(t, w.Body.String(), `"sticker_custom_enabled":true`)
 }
+
+func TestGetAppConfig_MessageReactionCapability(t *testing.T) {
+	tests := []struct {
+		name       string
+		dbEnabled *bool
+		version    string
+		want       bool
+	}{
+		{name: "unset defaults enabled", want: true},
+		{name: "DB false disables read and write", dbEnabled: boolPtr(false), want: false},
+		{name: "version short circuit keeps current capability", version: "99999999", want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, ctx := testutil.NewTestServer()
+			f := New(ctx)
+			cleanAllTablesAndReloadSettings(t, ctx)
+			if tt.dbEnabled != nil {
+				setModuleEnabledSetting(t, ctx, "message_reaction", *tt.dbEnabled)
+			}
+			require.NoError(t, f.appConfigDB.insert(&appConfigModel{}))
+
+			path := "/v1/common/appconfig"
+			if tt.version != "" {
+				path += "?version=" + tt.version
+			}
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequest(http.MethodGet, path, nil)
+			s.GetRoute().ServeHTTP(w, req)
+			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+			var resp struct {
+				MessageReaction struct {
+					Read  bool `json:"read"`
+					Write bool `json:"write"`
+				} `json:"message_reaction"`
+			}
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+			assert.Equal(t, tt.want, resp.MessageReaction.Read)
+			assert.Equal(t, tt.want, resp.MessageReaction.Write)
+		})
+	}
+}
+
+func boolPtr(v bool) *bool { return &v }
 
 // appconfig 必须下发 docs_on：值来源于 system_setting docs.enabled。默认 false，
 // 客户端据此隐藏 docs 模块入口（octo-docs-backend 上线前）。
