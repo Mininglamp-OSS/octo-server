@@ -37,7 +37,9 @@ import (
 	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
 	"github.com/Mininglamp-OSS/octo-server/pkg/richtext"
+	"github.com/Mininglamp-OSS/octo-server/pkg/space"
 	pkgutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
+	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis"
 	"github.com/gocraft/dbr/v2"
@@ -334,6 +336,11 @@ func (rb *Robot) Route(r *wkhttp.WKHttp) {
 		auth.PUT("/robot/:robot_id/groups/:group_no/mention_pref", rb.setMentionPref)       // UPSERT 群级免@偏好
 		auth.DELETE("/robot/:robot_id/groups/:group_no/mention_pref", rb.deleteMentionPref) // 删除回退默认（幂等）
 		auth.GET("/robot/:robot_id/groups/:group_no/mention_pref", rb.getMentionPref)       // 读群级免@偏好
+	}
+
+	ownedBots := r.Group("/v1", rb.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, rb.ctx), space.SpaceMiddleware(rb.ctx))
+	{
+		ownedBots.GET("/robot/owned_bots", rb.ownedBots)
 	}
 
 	robotAuth := r.Group("/v1/robots/:robot_id/:app_key", rb.authRobot()) // :robot_id即user的username
@@ -1657,6 +1664,53 @@ func (rb *Robot) myBots(c *wkhttp.Context) {
 			"description":  b.Description,
 			"creator_uid":  b.CreatorUID,
 			"creator_name": creatorNameMap[b.CreatorUID],
+			"bot_commands": b.BotCommands,
+		})
+	}
+	c.Response(results)
+}
+
+// ownedBots 我创建的 Bot — 仅返回【登录用户创建、robot.status=1、属于指定 Space 且 space_member.status=1】的 Bot。
+// 与 myBots(已加好友) / spaceBots(Space 全部) 区分：owner 语义。
+func (rb *Robot) ownedBots(c *wkhttp.Context) {
+	loginUID := c.GetLoginUID()
+	spaceID := space.GetSpaceID(c)
+	if spaceID == "" {
+		respondRobotRequestInvalid(c, "space_id")
+		return
+	}
+
+	// creator_uid=loginUID 与 space_id 双重过滤即 space 隔离点，均为占位符，不可绕过。
+	// 仅暴露 uid/name/description/bot_commands，绝不返回 token/凭据。
+	type ownedBotRow struct {
+		UID         string `db:"uid"`
+		Name        string `db:"name"`
+		Description string `db:"description"`
+		BotCommands string `db:"bot_commands"`
+	}
+	var bots []ownedBotRow
+	_, err := rb.ctx.DB().SelectBySql(`
+		SELECT r.robot_id as uid, IFNULL(u.name,'') as name,
+			IFNULL(r.description,'') as description,
+			IFNULL(r.bot_commands,'') as bot_commands
+		FROM robot r
+		INNER JOIN user u ON u.uid = r.robot_id AND u.robot = 1
+		INNER JOIN space_member sm ON sm.uid = r.robot_id AND sm.space_id = ? AND sm.status = 1
+		WHERE r.creator_uid = ? AND r.status = 1
+		ORDER BY r.created_at DESC
+	`, spaceID, loginUID).Load(&bots)
+	if err != nil {
+		rb.Error("查询我创建的 Bot 列表失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
+		return
+	}
+
+	results := make([]map[string]interface{}, 0, len(bots))
+	for _, b := range bots {
+		results = append(results, map[string]interface{}{
+			"uid":          b.UID,
+			"name":         b.Name,
+			"description":  b.Description,
 			"bot_commands": b.BotCommands,
 		})
 	}

@@ -13,12 +13,14 @@ import (
 	"testing"
 	"time"
 
-	pkgutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
-	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/server"
+	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	pkgutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var uid = "10000"
@@ -285,4 +287,128 @@ func TestRobotProxyFileNewPath(t *testing.T) {
 	path := fmt.Sprintf("chat/%d/%s/file.xlsx", time.Now().Unix(), uuid)
 	got := pkgutil.ExtractFilenameFromPath(path)
 	assert.Equal(t, "file.xlsx", got)
+}
+
+// TestOwnedBots verifies /robot/owned_bots only returns bots created by the
+// login user, with robot.status=1 and an active space_member row in the given
+// Space. It must not leak bots from other spaces, bots created by others (even
+// if befriended), soft-deleted bots, or removed space members. Missing
+// space_id must be a request-invalid error.
+func TestOwnedBots(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	require.NoError(t, ctx.GetRedisConn().Del("ratelimit:uid:"+uid))
+	t.Cleanup(func() { _ = testutil.CleanAllTables(ctx) })
+
+	db := ctx.DB()
+	testSpaceID := "space_owned_836"
+	otherSpaceID := "space_other_836"
+	nonMemberSpaceID := "space_nonmember_836"
+	removedMemberSpaceID := "space_removed_member_836"
+	disabledSpaceID := "space_disabled_836"
+	other := "other_user_836"
+
+	mine := "owned_mine_836"
+	mineOther := "owned_other_sp_836"
+	friendBot := "owned_friend_836"
+	deletedBot := "owned_deleted_836"
+	removedBot := "owned_removed_836"
+
+	spaceIDs := []string{testSpaceID, otherSpaceID, nonMemberSpaceID, removedMemberSpaceID, disabledSpaceID}
+	t.Cleanup(func() {
+		_ = ctx.GetRedisConn().Del("ratelimit:uid:" + uid)
+		for _, spaceID := range spaceIDs {
+			_ = ctx.GetRedisConn().Del("space:member:" + spaceID + ":" + uid)
+		}
+	})
+
+	_, err := db.InsertInto("user").Columns("uid", "name", "short_no", "status").Values(uid, "TestUser", uid, 1).Exec()
+	require.NoError(t, err)
+	_, err = db.InsertInto("user").Columns("uid", "name", "short_no", "status").Values(other, "OtherUser", other, 1).Exec()
+	require.NoError(t, err)
+
+	for _, fixture := range []struct {
+		spaceID string
+		status  int
+	}{
+		{testSpaceID, 1},
+		{otherSpaceID, 1},
+		{nonMemberSpaceID, 1},
+		{removedMemberSpaceID, 1},
+		{disabledSpaceID, 0},
+	} {
+		_, err = db.InsertInto("space").Columns("space_id", "name", "creator", "status").
+			Values(fixture.spaceID, fixture.spaceID, uid, fixture.status).Exec()
+		require.NoError(t, err)
+	}
+	for _, fixture := range []struct {
+		spaceID string
+		status  int
+	}{
+		{testSpaceID, 1},
+		{otherSpaceID, 1},
+		{removedMemberSpaceID, 0},
+		{disabledSpaceID, 1},
+	} {
+		_, err = db.InsertInto("space_member").Columns("space_id", "uid", "status").
+			Values(fixture.spaceID, uid, fixture.status).Exec()
+		require.NoError(t, err)
+	}
+
+	mkBot := func(botUID, name string, robotStatus int, creator, spaceID string, memberStatus int) {
+		_, err := db.InsertInto("user").Columns("uid", "name", "short_no", "robot", "status").Values(botUID, name, botUID, 1, 1).Exec()
+		require.NoError(t, err)
+		_, err = db.InsertInto("robot").Columns("robot_id", "status", "creator_uid", "description", "bot_commands").
+			Values(botUID, robotStatus, creator, name+" desc", "/start").Exec()
+		require.NoError(t, err)
+		_, err = db.InsertInto("space_member").Columns("space_id", "uid", "status").Values(spaceID, botUID, memberStatus).Exec()
+		require.NoError(t, err)
+	}
+
+	mkBot(mine, "MineBot", 1, uid, testSpaceID, 1)
+	mkBot(mineOther, "MineOtherSpace", 1, uid, otherSpaceID, 1)
+	mkBot(friendBot, "FriendBot", 1, other, testSpaceID, 1)
+	mkBot(deletedBot, "DeletedBot", 0, uid, testSpaceID, 1)
+	mkBot(removedBot, "RemovedBot", 1, uid, testSpaceID, 0)
+
+	_, err = db.InsertInto("friend").Columns("uid", "to_uid", "is_deleted").Values(uid, friendBot, 0).Exec()
+	require.NoError(t, err)
+
+	request := func(t *testing.T, spaceID string) *httptest.ResponseRecorder {
+		t.Helper()
+		w := httptest.NewRecorder()
+		req, err := http.NewRequest("GET", "/v1/robot/owned_bots?space_id="+spaceID, nil)
+		require.NoError(t, err)
+		req.Header.Set("token", token)
+		s.GetRoute().ServeHTTP(w, req)
+		return w
+	}
+
+	wMissing := request(t, "")
+	assert.NotEqual(t, http.StatusOK, wMissing.Code)
+
+	for name, spaceID := range map[string]string{
+		"non-member":     nonMemberSpaceID,
+		"removed member": removedMemberSpaceID,
+		"disabled Space": disabledSpaceID,
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, http.StatusForbidden, request(t, spaceID).Code)
+		})
+	}
+
+	w := request(t, testSpaceID)
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "uid", w.Header().Get("X-RateLimit-Scope"))
+
+	var results []map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &results))
+	require.Len(t, results, 1)
+	assert.Equal(t, mine, results[0]["uid"])
+	assert.Equal(t, "MineBot", results[0]["name"])
+	assert.Equal(t, "/start", results[0]["bot_commands"])
+	_, hasToken := results[0]["token"]
+	assert.False(t, hasToken)
+	_, hasBotToken := results[0]["bot_token"]
+	assert.False(t, hasBotToken)
 }
