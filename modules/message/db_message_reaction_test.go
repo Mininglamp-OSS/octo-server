@@ -47,15 +47,17 @@ func TestMessageReactionDB_ToggleReactionUpsertsAndReadsBack(t *testing.T) {
 	// dbr 默认客户端插值，sqlmock 收到的是已内联值的语句（无占位参数）。
 	mock.ExpectExec("INSERT INTO reaction_users .*VALUES \\('9001',7,'group-a',2,'u1','User 1','👍',0\\) ON DUPLICATE KEY UPDATE is_deleted = 1 - is_deleted").
 		WillReturnResult(sqlmock.NewResult(1, 1))
-	// 回读该 (channel, message, uid, emoji) 行的最终 is_deleted。
-	mock.ExpectQuery("SELECT is_deleted FROM reaction_users WHERE \\(channel_id='group-a' and channel_type=2 and message_id='9001' and uid='u1' and emoji='👍'\\)").
-		WillReturnRows(sqlmock.NewRows([]string{"is_deleted"}).AddRow(1))
+	// 回读该 (channel, message, uid, emoji) 行的持久化最终态，避免写响应回显请求值。
+	mock.ExpectQuery("SELECT emoji, seq, is_deleted FROM reaction_users WHERE \\(channel_id='group-a' and channel_type=2 and message_id='9001' and uid='u1' and emoji='👍'\\)").
+		WillReturnRows(sqlmock.NewRows([]string{"emoji", "seq", "is_deleted"}).AddRow("👍", 7, 1))
 
-	isDeleted, err := db.toggleReaction(&reactionModel{
+	result, err := db.toggleReaction(&reactionModel{
 		ChannelID: "group-a", ChannelType: 2, UID: "u1", Name: "User 1",
 		MessageID: "9001", Emoji: "👍", Seq: 7,
 	})
 	require.NoError(t, err)
-	require.Equal(t, 1, isDeleted)
+	require.Equal(t, "👍", result.Emoji)
+	require.Equal(t, int64(7), result.Seq)
+	require.Equal(t, 1, result.IsDeleted)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
