@@ -55,9 +55,16 @@ func HasCardTemplateMetadata(envelopeRaw []byte) bool {
 	}
 	card, _ := payload["card"].(map[string]interface{})
 	metadata, _ := card["metadata"].(map[string]interface{})
-	octo, _ := metadata["octo"].(map[string]interface{})
-	if octo == nil {
+	octoRaw, hasOcto := metadata["octo"]
+	if !hasOcto {
 		return false
+	}
+	octo, ok := octoRaw.(map[string]interface{})
+	if !ok {
+		// metadata.octo 存在但非对象(损坏)→ 视为"声明了模板元数据但无法产出
+		// 完整可信身份",fail closed:调用方据此拒绝,而非退化成 legacy 空上下文
+		// (PR#641 review P2)。
+		return true
 	}
 	_, hasProtocol := octo["protocol"]
 	_, hasTemplate := octo["template"]

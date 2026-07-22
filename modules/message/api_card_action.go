@@ -219,7 +219,7 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
 		return
 	}
-	cardContext, err := resolveRegistryCardContext(effective, req.ActionID)
+	cardContext, err := resolveRegistryCardContext(effective, req.ActionID, actionData)
 	if err != nil {
 		m.releaseCardClaim(idemKey)
 		m.Warn("registry 卡片 action 与已发布交互契约不一致,拒绝",
@@ -296,7 +296,7 @@ func (m *Message) cardAction(c *wkhttp.Context) {
 // resolveRegistryCardContext binds callback context to metadata and interaction
 // reports from the effective server-authored frame. Cards without octo-card
 // template metadata retain the legacy zero context.
-func resolveRegistryCardContext(effective []byte, actionID string) (cardactiondispatch.CardContext, error) {
+func resolveRegistryCardContext(effective []byte, actionID string, actionData map[string]interface{}) (cardactiondispatch.CardContext, error) {
 	ref, ok := cardmsg.CardTemplateContext(effective)
 	if !ok {
 		if cardmsg.HasCardTemplateMetadata(effective) {
@@ -311,6 +311,22 @@ func resolveRegistryCardContext(effective []byte, actionID string) (cardactiondi
 	view, err := registry.ActionView(cardtmpl.ID(ref.ID), ref.Version, actionID)
 	if err != nil {
 		return cardactiondispatch.CardContext{}, err
+	}
+	// 交叉校验(PR#641 review P2):envelope 携带的模板身份(metadata.octo)必须与该
+	// 动作实际选路的 owner 一致。route owner 取自生效帧 Action.Submit.data.owner
+	// (cardActionRouteMetadata 据此选路)。对 Registry.Render 产的卡,
+	// assertActionContract 已强制 data.owner==template owner,故此断言只挡手工构造的
+	// 错配卡:防止一张 metadata 声明 docs 模板、data.owner 却指向别的已注册路由的卡,
+	// 把带 docs 身份的 octo-card-v1 信封投递到错误路由。
+	tmpl, err := registry.Lookup(cardtmpl.ID(ref.ID), ref.Version)
+	if err != nil {
+		return cardactiondispatch.CardContext{}, err
+	}
+	if contract := tmpl.Meta().ActionContract; contract != nil {
+		routeOwner, _ := actionData["owner"].(string)
+		if strings.TrimSpace(routeOwner) != contract.Owner {
+			return cardactiondispatch.CardContext{}, errors.New("message: card template owner does not match action route owner")
+		}
 	}
 	return cardactiondispatch.CardContext{
 		TemplateID: ref.ID, TemplateVersion: ref.Version, View: string(view),

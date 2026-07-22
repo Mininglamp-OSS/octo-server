@@ -14,7 +14,11 @@ import (
 var ErrUpdateInvalid = errors.New("cardtmpl: invalid card update")
 
 // UpdateTarget binds a render/update to one authoritative stored message.
-// CardSeq is the positive monotonic sequence persisted by CardMutator CAS.
+// CardSeq is the positive sequence enforced by the CardMutator CAS. ReplaceView
+// requires it strictly greater than the stored frame's card_seq (monotonic, as
+// the CAS mandates). Append additionally requires it to be exactly consecutive
+// (snapshot.CardSeq+1): a progress-frame appender owns its own frame numbering,
+// so a gap signals a lost/out-of-order frame and is rejected as a conflict.
 type UpdateTarget struct {
 	Target     carddispatch.Target
 	SenderUID  string

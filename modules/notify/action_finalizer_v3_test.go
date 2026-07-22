@@ -3,6 +3,7 @@ package notify
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-server/internal/cardactiondispatch"
@@ -128,5 +129,67 @@ func TestDocsActionFinalizerV3OmitsUnavailableV2Decoration(t *testing.T) {
 	}
 	if _, exists := requester["avatarUrl"]; exists {
 		t.Errorf("legacy 0.2 data fabricated avatarUrl: %+v", requester)
+	}
+}
+
+// okMutator 是 cardtmpl.mutationGateway 的最小实现:ReplaceView 只调 Mutate,
+// 让真实 updater 走完 RenderCard(触发 0.3.0 InputSchema 校验)。
+type okMutator struct{ mutated bool }
+
+func (m *okMutator) Snapshot(context.Context, carddispatch.CardMutationTarget) (carddispatch.CardMutationSnapshot, error) {
+	return carddispatch.CardMutationSnapshot{}, nil
+}
+
+func (m *okMutator) Mutate(context.Context, carddispatch.CardMutationRequest) (carddispatch.CardMutationResult, error) {
+	m.mutated = true
+	return carddispatch.CardMutationResult{}, nil
+}
+
+// P1(PR#641 review):回调 Display / event.Data 的合法长值(≤500 runes)必须在渲染
+// 前截断到 0.3.0 schema cap。用真实 updater 驱动 RenderCard —— 若不截断,超长字段
+// 会命中 InputSchema.Validate 的 maxLength → ErrFieldsInvalid,ReplaceView 确定性
+// 失败(审批卡卡在 pending、申请人漏通知)。截断后必须渲染成功并写入 mutator。
+func TestDocsActionFinalizerV3TruncatesOversizedDisplayFields(t *testing.T) {
+	wk := newWuKongServer()
+	defer wk.close()
+	ctx := newTestContext(t, wk)
+	ctx.GetConfig().External.WebLoginURL = "https://im.example.com/login"
+
+	registry := cardtmpl.NewRegistry()
+	registry.Register(docsaccessrequest.New(), docsaccessrequest.Assets, docsaccessrequest.HandoffRoot)
+	registry.Register(docsaccessrequest.NewV3(), docsaccessrequest.Assets, docsaccessrequest.HandoffRootV3)
+	registry.SetDefault(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3)
+	registry.Freeze()
+	mut := &okMutator{}
+	realUpdater, err := cardtmpl.NewCardUpdater(registry, mut)
+	if err != nil {
+		t.Fatalf("NewCardUpdater: %v", err)
+	}
+	finalizer := &DocsActionFinalizer{ctx: ctx, updater: realUpdater}
+
+	// 每个来源字段都超出对应 schema cap,但都在 ≤500 rune 的回调契约内。
+	over := func(n int) string { return strings.Repeat("字", n) }
+	event := cardactiondispatch.Event{
+		EventID: 44, SenderUID: NotifyBotUIDValue, MessageID: "1003", ChannelID: NotifyBotUIDValue,
+		ChannelType: 1, SpaceID: "space-1", OperatorUID: "reviewer-1",
+		Data: map[string]any{
+			"doc_id": "doc-3", "request_id": "request-3", "actor": over(200),
+			"actor_avatar_url": "https://cdn.example.com/a.png", "source_name": over(300),
+			"request_reason": over(400), "requested_at_display": over(200), "message_time_display": over(200),
+			"permission_label": over(200), "permission_role_label": over(200),
+		},
+	}
+	result := cardactiondispatch.DecisionResult{
+		State: cardactiondispatch.StateDenied,
+		Display: map[string]string{
+			"operator_name": over(200), "decided_at": over(200), "title": over(400),
+		},
+	}
+	if err := finalizer.replaceWithRegistryResult(context.Background(), event, result,
+		NotifyBotUIDValue, "en", over(400), over(400)); err != nil {
+		t.Fatalf("replaceWithRegistryResult with oversized display fields must succeed after truncation: %v", err)
+	}
+	if !mut.mutated {
+		t.Fatal("mutator was never called — terminal update did not persist")
 	}
 }

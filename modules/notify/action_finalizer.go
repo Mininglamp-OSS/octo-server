@@ -134,6 +134,30 @@ func (f *DocsActionFinalizer) Finalize(ctx context.Context, event cardactiondisp
 	return nil
 }
 
+// 0.3.0 result view schema 的各字段 rune 上限(见
+// handoff/docs.access-request@0.3.0/contract/data.schema.json)。回调 Display 与
+// event.Data 的值合法可达 500 runes(cardactiondispatch 契约),必须在渲染前截断
+// 到各自 schema cap —— 否则 RenderCard 的 InputSchema 校验返回 ErrFieldsInvalid,
+// ReplaceView 确定性失败,审批卡永远停在 pending 且申请人漏通知(PR#641 review P1)。
+// 截断而非编造,与 denyReason 既有做法一致。
+const (
+	capResultTitle      = 200                     // document.title / document.sourceName
+	capResultName       = 120                     // requester.name / decision.operatorName
+	capResultShortLabel = 80                      // decidedAt/requestedAt/messageTime/permission.*
+	capResultReason     = cardtmpl.MaxExcerptRunes // requestReason / rejectionReason (= 300)
+)
+
+// truncRunes 按 rune 截断到 max(max<=0 视为不限)。
+func truncRunes(s string, max int) string {
+	if max <= 0 {
+		return s
+	}
+	if r := []rune(s); len(r) > max {
+		return string(r[:max])
+	}
+	return s
+}
+
 func (f *DocsActionFinalizer) replaceWithRegistryResult(ctx context.Context, event cardactiondispatch.Event,
 	result cardactiondispatch.DecisionResult, channelID, lang, title, denyReason string) error {
 	state := docsaccessrequest.StateApproved
@@ -142,8 +166,8 @@ func (f *DocsActionFinalizer) replaceWithRegistryResult(ctx context.Context, eve
 		state = docsaccessrequest.StateRejected
 		wireState = "rejected"
 	}
-	if runes := []rune(denyReason); len(runes) > cardtmpl.MaxExcerptRunes {
-		denyReason = string(runes[:cardtmpl.MaxExcerptRunes])
+	if runes := []rune(denyReason); len(runes) > capResultReason {
+		denyReason = string(runes[:capResultReason])
 	}
 	requestID, _ := event.Data["request_id"].(string)
 	actor, _ := event.Data["actor"].(string)
@@ -152,13 +176,15 @@ func (f *DocsActionFinalizer) replaceWithRegistryResult(ctx context.Context, eve
 		operatorName = event.OperatorUID
 	}
 	document := map[string]any{
-		"docId": strings.TrimSpace(stringEventData(event.Data, "doc_id")), "title": strings.TrimSpace(title),
+		"docId": strings.TrimSpace(stringEventData(event.Data, "doc_id")),
+		"title": truncRunes(strings.TrimSpace(title), capResultTitle),
 	}
-	requester := map[string]any{"name": strings.TrimSpace(actor)}
+	requester := map[string]any{"name": truncRunes(strings.TrimSpace(actor), capResultName)}
 	if value := strings.TrimSpace(stringEventData(event.Data, "source_name")); value != "" {
-		document["sourceName"] = value
+		document["sourceName"] = truncRunes(value, capResultTitle)
 	}
 	if value := strings.TrimSpace(stringEventData(event.Data, "actor_avatar_url")); value != "" {
+		// URL 不截断:schema 无 maxLength(https 由渲染层校验),截断会破坏链接。
 		requester["avatarUrl"] = value
 	}
 	fields := map[string]any{
@@ -167,23 +193,29 @@ func (f *DocsActionFinalizer) replaceWithRegistryResult(ctx context.Context, eve
 		"document":  document,
 		"requester": requester,
 		"decision": map[string]any{
-			"operatorName": operatorName, "decidedAtDisplay": strings.TrimSpace(result.Display["decided_at"]),
+			"operatorName":     truncRunes(operatorName, capResultName),
+			"decidedAtDisplay": truncRunes(strings.TrimSpace(result.Display["decided_at"]), capResultShortLabel),
 		},
+	}
+	dataCaps := map[string]int{
+		"requestReason":      capResultReason,
+		"requestedAtDisplay": capResultShortLabel,
+		"messageTimeDisplay": capResultShortLabel,
 	}
 	for destination, source := range map[string]string{
 		"requestReason": "request_reason", "requestedAtDisplay": "requested_at_display",
 		"messageTimeDisplay": "message_time_display",
 	} {
 		if value := strings.TrimSpace(stringEventData(event.Data, source)); value != "" {
-			fields[destination] = value
+			fields[destination] = truncRunes(value, dataCaps[destination])
 		}
 	}
 	permission := make(map[string]any, 2)
 	if value := strings.TrimSpace(stringEventData(event.Data, "permission_label")); value != "" {
-		permission["label"] = value
+		permission["label"] = truncRunes(value, capResultShortLabel)
 	}
 	if value := strings.TrimSpace(stringEventData(event.Data, "permission_role_label")); value != "" {
-		permission["roleLabel"] = value
+		permission["roleLabel"] = truncRunes(value, capResultShortLabel)
 	}
 	if len(permission) > 0 {
 		fields["permission"] = permission
@@ -199,6 +231,10 @@ func (f *DocsActionFinalizer) replaceWithRegistryResult(ctx context.Context, eve
 		Target: carddispatch.Target{
 			SpaceID: event.SpaceID, ChannelID: channelID, ChannelType: event.ChannelType,
 		},
+		// card_seq 单调性来源:event.EventID 是全局单调递增的 snowflake,直接用作
+		// card_seq 满足 CardMutator CAS 的严格递增要求(见
+		// .octospec/learnings/pending/cardtmpl-interaction-closure.md)。若未来 event
+		// ID 生成器改为非单调,CAS 会静默丢弃合法更新——务必同步复核。
 		SenderUID: event.SenderUID, MessageID: event.MessageID, CardSeq: event.EventID,
 	}, docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3, state, raw, cardtmpl.BuildEnv{
 		WebLoginURL: f.ctx.GetConfig().External.WebLoginURL, Lang: lang, SpaceID: event.SpaceID,
