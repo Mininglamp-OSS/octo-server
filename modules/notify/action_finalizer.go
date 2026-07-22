@@ -250,20 +250,14 @@ func (f *DocsActionFinalizer) buildTerminalDocument(ctx context.Context, lang, d
 	labels := docsLabelsFor(lang)
 	webLoginURL := f.ctx.GetConfig().External.WebLoginURL
 	// Approved / denied get the enriched outcome card (header + title + result
-	// box); the denied box surfaces the reviewer reason.
+	// box); the denied box surfaces the reviewer reason. Rendered through the
+	// shared builder so the click-driven terminal card and the sibling cards the
+	// access-decision card-sync endpoint mutates are byte-identical.
 	switch result.State {
 	case cardactiondispatch.StateApproved:
-		return cardtmpl.BuildDocsApprovalOutcomeCard(ctx, webLoginURL, docID, spaceID, cardtmpl.DocsOutcomeContent{
-			Title: title, Variant: "docs.access_approved", Source: cardtmpl.Source{Label: labels.sourceLabel},
-			Denied: false, HeaderLabel: labels.approvalHeader, StatusLabel: labels.approvedStatus,
-			ResultText: labels.approvedResult,
-		})
+		return buildDocsDecisionTerminalDocument(ctx, webLoginURL, lang, docID, spaceID, title, denyReason, false)
 	case cardactiondispatch.StateDenied:
-		return cardtmpl.BuildDocsApprovalOutcomeCard(ctx, webLoginURL, docID, spaceID, cardtmpl.DocsOutcomeContent{
-			Title: title, Variant: "docs.access_denied", Source: cardtmpl.Source{Label: labels.sourceLabel},
-			Denied: true, HeaderLabel: labels.approvalHeader, StatusLabel: labels.deniedStatus,
-			ResultText: labels.deniedResult, ReasonLabel: labels.denyReasonLabel, Reason: denyReason,
-		})
+		return buildDocsDecisionTerminalDocument(ctx, webLoginURL, lang, docID, spaceID, title, denyReason, true)
 	}
 	// Cancelled / unavailable are transient states without an enriched design —
 	// keep the prior plain resource-card rebuild.
@@ -273,6 +267,26 @@ func (f *DocsActionFinalizer) buildTerminalDocument(ctx context.Context, lang, d
 	}
 	return cardtmpl.BuildDocsResourceCard(ctx, webLoginURL, docID, spaceID, cardtmpl.ResourceCard{
 		Title: title, Attribution: attribution, Variant: variant, Source: cardtmpl.Source{Label: labels.sourceLabel},
+	})
+}
+
+// buildDocsDecisionTerminalDocument renders the enriched approved/denied outcome
+// card. Shared by the click-driven finalizer (buildTerminalDocument) and the
+// access-decision card-sync endpoint (mutateDocsCard) so the terminal card a
+// clicker sees and the sibling cards other approvers see are byte-identical.
+func buildDocsDecisionTerminalDocument(ctx context.Context, webLoginURL, lang, docID, spaceID, title, denyReason string, denied bool) (json.RawMessage, error) {
+	labels := docsLabelsFor(lang)
+	if denied {
+		return cardtmpl.BuildDocsApprovalOutcomeCard(ctx, webLoginURL, docID, spaceID, cardtmpl.DocsOutcomeContent{
+			Title: title, Variant: "docs.access_denied", Source: cardtmpl.Source{Label: labels.sourceLabel},
+			Denied: true, HeaderLabel: labels.approvalHeader, StatusLabel: labels.deniedStatus,
+			ResultText: labels.deniedResult, ReasonLabel: labels.denyReasonLabel, Reason: denyReason,
+		})
+	}
+	return cardtmpl.BuildDocsApprovalOutcomeCard(ctx, webLoginURL, docID, spaceID, cardtmpl.DocsOutcomeContent{
+		Title: title, Variant: "docs.access_approved", Source: cardtmpl.Source{Label: labels.sourceLabel},
+		Denied: false, HeaderLabel: labels.approvalHeader, StatusLabel: labels.approvedStatus,
+		ResultText: labels.approvedResult,
 	})
 }
 

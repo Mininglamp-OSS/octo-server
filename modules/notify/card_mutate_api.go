@@ -1,0 +1,191 @@
+package notify
+
+import (
+	"errors"
+	"strings"
+
+	"github.com/Mininglamp-OSS/octo-lib/common"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"go.uber.org/zap"
+)
+
+// docsCardMutateSeqKey is the single shared GenSeq flag for docs access-card
+// mutations. card_seq only needs to be strictly positive and greater than the
+// target card's stored card_seq; a sibling card was sent fresh (no message_extra
+// row => NULL card_seq), so one globally-monotonic counter suffices and avoids
+// an unbounded per-message key space.
+const docsCardMutateSeqKey = common.MessageExtraSeqKey + ":docs-card-mutate"
+
+// docsAccessVariantPrefix gates which cards this docs-capability endpoint may
+// mutate. The shared `notification` bot sends summary / docs / action-outcome
+// cards, so "sender == notification" does NOT prove a card is docs-owned. The
+// server-authored card variant (metadata.octo.variant, e.g.
+// "docs.access_requested" / "docs.access_granted") is the authoritative
+// docs-domain discriminator; only cards in this family may be touched.
+const docsAccessVariantPrefix = "docs.access_"
+
+// docsAccessCardVariant reports the target card's variant and whether it belongs
+// to the docs access family, from the effective card envelope. Pure so the
+// capability gate is unit-testable without a live card store.
+func docsAccessCardVariant(envelope []byte) (variant string, isDocsAccess bool) {
+	variant, ok := cardmsg.CardVariant(envelope)
+	if !ok {
+		return "", false
+	}
+	return variant, strings.HasPrefix(variant, docsAccessVariantPrefix)
+}
+
+// CardMutateReq is the access-decision card-sync request (task
+// docs-access-decision-card-sync). docs-backend calls this once per sibling
+// approver card after a decision commits, to drive that card to its terminal
+// state so no approver is left holding an actionable card.
+//
+// The card is located by (ChannelID, MessageID); SpaceID is used ONLY to render
+// the terminal card + its deep link, never to locate the card. MessageID is a
+// decimal string because IM message ids are int64 and exceed JS's safe-integer
+// range. SenderUID is NOT part of the request — it is resolved server-side to
+// the docs producer bot (identical source to /notify), so the caller passes zero
+// bot identity and a sender mismatch is structurally impossible.
+type CardMutateReq struct {
+	SpaceID     string `json:"space_id"`
+	ChannelID   string `json:"channel_id"`
+	ChannelType uint8  `json:"channel_type"`
+	MessageID   string `json:"message_id"`
+	Kind        string `json:"kind"` // access_granted | access_denied
+	DocID       string `json:"doc_id"`
+	Title       string `json:"title"`
+	DenyReason  string `json:"deny_reason"` // surfaced on the denied terminal card; empty on approve
+}
+
+// CardMutateResp reports whether the card is now terminal.
+type CardMutateResp struct {
+	Mutated bool `json:"mutated"`
+}
+
+// mutateCard handles POST /v1/internal/cards/mutate. It drives one already-
+// delivered docs access card to its terminal (approved/denied) state in place,
+// reusing the exact terminal-card builder the click-driven finalizer uses so a
+// clicker's card and the sibling cards stay byte-identical. Docs capability only.
+func (n *Notify) mutateCard(c *wkhttp.Context) {
+	capability, _ := c.Get(notifyCapabilityContextKey)
+	typedCapability, _ := capability.(notifyCapability)
+	if typedCapability.Kind != notifyCapabilityDocs {
+		httperr.ResponseErrorL(c, errcode.ErrNotifyCardNotAllowed, nil, nil)
+		return
+	}
+
+	var req CardMutateReq
+	if err := c.BindJSON(&req); err != nil {
+		httperr.ResponseErrorL(c, errcode.ErrNotifyCardMutateInvalid, nil, nil)
+		return
+	}
+	if req.SpaceID == "" || req.ChannelID == "" || req.MessageID == "" || req.DocID == "" ||
+		(req.Kind != DocsCardKindAccessGranted && req.Kind != DocsCardKindAccessDenied) {
+		httperr.ResponseErrorL(c, errcode.ErrNotifyCardMutateInvalid, nil, nil)
+		return
+	}
+	denied := req.Kind == DocsCardKindAccessDenied
+
+	ctx := c.Request.Context()
+	channelType := req.ChannelType
+	if channelType == 0 {
+		channelType = common.ChannelTypePerson.Uint8()
+	}
+
+	// Capability containment (P0, security): this docs-capability endpoint may
+	// ONLY drive docs access cards to terminal. Because the `notification` bot is
+	// shared across producers, the downstream sender check ("card is from
+	// notification") is NOT sufficient to prove the target is a docs card — a
+	// docs token could otherwise overwrite any notification card (a summary card,
+	// an action-outcome card, someone else's) into a docs terminal card. So read
+	// the target's CURRENT card and require its own variant to be docs.access_*
+	// BEFORE mutating. Snapshot also enforces sender==notification + lifecycle.
+	mutator := carddispatch.NewCardMutator(n.ctx)
+	snap, err := mutator.Snapshot(ctx, carddispatch.CardMutationTarget{
+		SenderUID:   NotifyBotUIDValue,
+		MessageID:   req.MessageID,
+		ChannelID:   req.ChannelID,
+		ChannelType: channelType,
+	})
+	if err != nil {
+		// Malformed target (bad id / not a card) is the caller's bug (400); a
+		// missing / sender-mismatched / backend-errored card is transient-or-benign
+		// (409) — the caller retries or falls back to re-notify. Never fabricate
+		// success: the decision is already committed and 409-guarded downstream.
+		if errors.Is(err, carddispatch.ErrCardMutationInvalid) {
+			n.Warn("card mutate snapshot invalid",
+				zap.Error(err), zap.String("space_id", req.SpaceID), zap.String("message_id", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrNotifyCardMutateInvalid, nil, nil)
+			return
+		}
+		n.Warn("card mutate snapshot failed",
+			zap.Error(err), zap.String("space_id", req.SpaceID), zap.String("message_id", req.MessageID))
+		httperr.ResponseErrorL(c, errcode.ErrNotifyCardMutateFailed, nil, nil)
+		return
+	}
+	variant, isDocsAccess := docsAccessCardVariant(snap.Envelope)
+	if !isDocsAccess {
+		n.Warn("card mutate rejected: target is not a docs access card",
+			zap.String("space_id", req.SpaceID), zap.String("message_id", req.MessageID),
+			zap.String("variant", variant))
+		httperr.ResponseErrorL(c, errcode.ErrNotifyCardMutateForbidden, nil, nil)
+		return
+	}
+
+	lang := i18n.OutboundLanguage(ctx)
+	document, err := buildDocsDecisionTerminalDocument(
+		ctx, n.ctx.GetConfig().External.WebLoginURL, lang, req.DocID, req.SpaceID, req.Title, req.DenyReason, denied)
+	if err != nil {
+		n.Warn("build terminal card for mutate failed",
+			zap.Error(err), zap.String("doc_id", req.DocID), zap.String("space_id", req.SpaceID))
+		httperr.ResponseErrorL(c, errcode.ErrNotifyCardMutateInvalid, nil, nil)
+		return
+	}
+
+	cardSeq, err := n.ctx.GenSeq(docsCardMutateSeqKey)
+	if err != nil {
+		n.Error("gen card_seq for mutate failed", zap.Error(err), zap.String("message_id", req.MessageID))
+		httperr.ResponseErrorL(c, errcode.ErrNotifyCardMutateFailed, nil, nil)
+		return
+	}
+	contentEdit, err := buildTerminalEnvelope(document, req.SpaceID, cardSeq)
+	if err != nil {
+		n.Warn("build terminal envelope for mutate failed",
+			zap.Error(err), zap.String("doc_id", req.DocID))
+		httperr.ResponseErrorL(c, errcode.ErrNotifyCardMutateInvalid, nil, nil)
+		return
+	}
+
+	// SenderUID = docs producer bot, resolved server-side (see type doc). Never
+	// caller-supplied. Snapshot above already confirmed this is that bot's card.
+	if _, err = mutator.Mutate(ctx, carddispatch.CardMutationRequest{
+		SenderUID:   NotifyBotUIDValue,
+		MessageID:   req.MessageID,
+		ChannelID:   req.ChannelID,
+		ChannelType: channelType,
+		ContentEdit: contentEdit,
+	}); err != nil {
+		// A malformed edit is the caller's bug (400). Not-found / sender-mismatch
+		// / stale / backend errors are transient-or-benign from the caller's view
+		// (409): it retries or falls back to re-notify. The decision itself is
+		// already committed and protected by the docs-backend pending guard, so a
+		// mutate miss never corrupts state — it only leaves one stale card.
+		if errors.Is(err, carddispatch.ErrCardMutationInvalid) {
+			n.Warn("card mutate invalid",
+				zap.Error(err), zap.String("space_id", req.SpaceID), zap.String("message_id", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrNotifyCardMutateInvalid, nil, nil)
+			return
+		}
+		n.Warn("card mutate failed", zap.Error(err),
+			zap.String("space_id", req.SpaceID), zap.String("message_id", req.MessageID),
+			zap.String("kind", req.Kind))
+		httperr.ResponseErrorL(c, errcode.ErrNotifyCardMutateFailed, nil, nil)
+		return
+	}
+	c.Response(CardMutateResp{Mutated: true})
+}
