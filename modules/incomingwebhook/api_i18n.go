@@ -120,14 +120,16 @@ func mgmtThreadNotFound(c *wkhttp.Context) {
 	httperr.ResponseErrorLWithStatus(c, errcode.ErrIncomingWebhookThreadNotFound, nil, nil)
 }
 
-// mgmtQuotaExceeded returns 409 — per-group webhook cap reached; max carries
-// the configured limit for the message.
+// mgmtQuotaExceeded returns 409 — the per-delivery-scope webhook cap is reached
+// (the group itself and each thread each have an independent bucket); max
+// carries the configured limit for the message.
 func mgmtQuotaExceeded(c *wkhttp.Context, max int) {
 	httperr.ResponseErrorLWithStatus(c, errcode.ErrIncomingWebhookQuotaExceeded, i18n.Params{"max": max}, nil)
 }
 
 // mgmtCreatorQuotaExceeded returns 409 — the calling member/bot reached its
-// per-creator cap (admins are exempt); max carries the configured limit.
+// per-creator cap in this delivery scope (admins are exempt); max carries the
+// configured limit.
 func mgmtCreatorQuotaExceeded(c *wkhttp.Context, max int) {
 	httperr.ResponseErrorLWithStatus(c, errcode.ErrIncomingWebhookCreatorQuotaExceeded, i18n.Params{"max": max}, nil)
 }

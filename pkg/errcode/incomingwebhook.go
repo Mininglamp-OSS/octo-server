@@ -144,21 +144,24 @@ var (
 		DefaultMessage: "The webhook does not exist.",
 	})
 
-	// ErrIncomingWebhookQuotaExceeded (409) — the group already holds the
-	// maximum number of webhooks. Params["max"] carries the configured cap.
+	// ErrIncomingWebhookQuotaExceeded (409) — the delivery scope (the group
+	// itself, or a single thread) already holds the maximum number of webhooks;
+	// the group and each thread have independent quotas. Params["max"] carries
+	// the configured cap.
 	ErrIncomingWebhookQuotaExceeded = register(codes.Code{
 		ID:             "err.server.incomingwebhook.mgmt_quota_exceeded",
 		HTTPStatus:     http.StatusConflict,
-		DefaultMessage: "Each group allows at most {{.max}} webhooks.",
+		DefaultMessage: "At most {{.max}} webhooks are allowed in this group or thread.",
 	})
 
 	// ErrIncomingWebhookCreatorQuotaExceeded (409) — the calling member/bot has
-	// reached its per-creator cap in this group (owners/admins are exempt and
-	// only bounded by the group cap). Params["max"] carries the configured cap.
+	// reached its per-creator cap in this delivery scope (the group itself or a
+	// single thread; owners/admins are exempt and only bounded by the scope
+	// cap). Params["max"] carries the configured cap.
 	ErrIncomingWebhookCreatorQuotaExceeded = register(codes.Code{
 		ID:             "err.server.incomingwebhook.mgmt_creator_quota_exceeded",
 		HTTPStatus:     http.StatusConflict,
-		DefaultMessage: "You can create at most {{.max}} webhooks in this group.",
+		DefaultMessage: "You can create at most {{.max}} webhooks in this group or thread.",
 	})
 
 	// ErrIncomingWebhookCreatorLeft (409) — the webhook's creator is no longer

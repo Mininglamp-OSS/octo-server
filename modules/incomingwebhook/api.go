@@ -794,7 +794,7 @@ func (w *IncomingWebhook) create(c *wkhttp.Context) {
 		AllowMentionBots: boolToInt(boolPtrTrue(req.AllowMentionBots)),
 		MentionUids:      mentionUIDsJSON,
 	}
-	// 配额校验 + 写入在事务内原子完成；FOR UPDATE 锁住 group_no 范围，防止并发越限。
+	// 配额校验 + 写入在事务内原子完成；FOR UPDATE 锁父群行把同群并发串行化，防止越限。
 	//
 	// TOCTOU 说明：requireActiveGroup 的 status 检查是 insert 事务之前的非事务读，
 	// 事务内仅靠 group 行锁串行化、不重查 status。极小窗口内群被解散仍可能写入一条
@@ -802,8 +802,10 @@ func (w *IncomingWebhook) create(c *wkhttp.Context) {
 	// requireActiveGroup 重查才是权威闸（群非 Normal 一律 401），且 disband 级联会把
 	// status 翻 0。故此处不在事务内重读 group.status，避免给热路径加锁负担。
 	//
-	// 配额双层：群级 max_per_group 对所有人生效；per-creator 仅约束普通成员/bot
-	// （管理员能删任意 webhook，对其限个人额度无安全意义）。
+	// 配额双层，均按【投递作用域】(group_no, thread_short_id) 计——群本体与每个子区
+	// 各有独立配额、复用同一组 max 值、互不共享名额（m.ThreadShortID 已在上方按父群
+	// 校验绑定，count 据此收敛到本作用域）：作用域级 max_per_group 对所有人生效；
+	// per-creator 仅约束普通成员/bot（管理员能删任意 webhook，对其限个人额度无安全意义）。
 	maxWH := w.settings.IncomingWebhookMaxPerGroup()
 	maxPerCreator := 0
 	if !actor.isAdmin {

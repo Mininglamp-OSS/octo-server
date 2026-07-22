@@ -252,27 +252,70 @@ func TestInsertAndQueryAudit(t *testing.T) {
 	assert.Len(t, limited, 1)
 }
 
-// TestThreadWebhookSharesParentGroupQuota 子区 webhook 与群 webhook 共用父群 max_per_group
-// 配额池：insertWithQuota 按 group_no 计数、不按 thread_short_id 细分，避免「每子区独立配额」
-// 让单群 webhook 总量失控（acceptance：共享父群配额）。
-func TestThreadWebhookSharesParentGroupQuota(t *testing.T) {
+// TestThreadWebhookQuotaIsPerScope 群 webhook 与每个子区 webhook 各有【独立】配额：
+// insertWithQuota 按投递作用域 (group_no, thread_short_id) 计数——群本体
+// (thread_short_id='')、子区 A、子区 B 各占一份 max 名额，互不共享（子区多的群 /
+// octo-loop 不再被父群总量卡死，acceptance：每子区独立配额）。
+func TestThreadWebhookQuotaIsPerScope(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	defer testutil.CleanAllTables(ctx)
 	d := newDB(ctx)
 
 	groupNo := "g_" + util.GenerUUID()[:12]
 	const max = 2
-	mustInsertWebhookWithMax(t, d, groupNo, max)                          // 1 个群 webhook
-	mustInsertThreadWebhookWithMax(t, d, groupNo, "100000000000001", max) // 1 个子区 webhook —— 共用池已满 2
+	const threadA = "100000000000001"
+	const threadB = "100000000000002"
 
-	// 第三个（无论群 / 子区）都应被同一父群配额拒绝。
+	// 群本体桶填满 max。
+	mustInsertWebhookWithMax(t, d, groupNo, max)
+	mustInsertWebhookWithMax(t, d, groupNo, max)
+	// 群本体桶已满：再建【群】webhook 被拒。
 	overGroup := &incomingWebhookModel{WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, Name: "wh", Status: statusEnabled}
-	assert.ErrorIs(t, d.insertWithQuota(overGroup, max, 0), ErrQuotaExceeded, "group webhook must hit the shared parent-group quota")
-	overThread := &incomingWebhookModel{
+	assert.ErrorIs(t, d.insertWithQuota(overGroup, max, 0), ErrQuotaExceeded, "group-self bucket must enforce its own cap")
+
+	// 群本体桶满【不影响】子区 A：子区 A 有独立配额，可各自建满 max。
+	mustInsertThreadWebhookWithMax(t, d, groupNo, threadA, max)
+	mustInsertThreadWebhookWithMax(t, d, groupNo, threadA, max)
+	// 子区 A 桶已满：再建子区 A webhook 被拒。
+	overThreadA := &incomingWebhookModel{
 		WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, Name: "wh", Status: statusEnabled,
-		ChannelType: int(common.ChannelTypeCommunityTopic.Uint8()), ThreadShortID: "100000000000002",
+		ChannelType: int(common.ChannelTypeCommunityTopic.Uint8()), ThreadShortID: threadA,
 	}
-	assert.ErrorIs(t, d.insertWithQuota(overThread, max, 0), ErrQuotaExceeded, "thread webhook must hit the same shared parent-group quota")
+	assert.ErrorIs(t, d.insertWithQuota(overThreadA, max, 0), ErrQuotaExceeded, "thread A bucket must enforce its own cap independently")
+
+	// 群本体 + 子区 A 都已满【不影响】子区 B：另一子区仍有独立名额可建。
+	freshThreadB := &incomingWebhookModel{
+		WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, Name: "wh", Status: statusEnabled,
+		ChannelType: int(common.ChannelTypeCommunityTopic.Uint8()), ThreadShortID: threadB,
+	}
+	assert.NoError(t, d.insertWithQuota(freshThreadB, max, 0), "thread B has an independent bucket; other scopes being full must not block it")
+}
+
+// TestCreatorQuotaIsPerScope per-creator 个人配额同样按投递作用域计：同一创建者在群
+// 本体填满个人额度后，在子区作用域内仍有【独立】的个人额度可继续创建。
+func TestCreatorQuotaIsPerScope(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer testutil.CleanAllTables(ctx)
+	d := newDB(ctx)
+
+	groupNo := "g_" + util.GenerUUID()[:12]
+	creator := "u_" + util.GenerUUID()[:12]
+	const groupCap, creatorCap = 100, 1
+	const thread = "100000000000001"
+
+	// 群本体作用域：该创建者建满个人额度(1)。
+	first := &incomingWebhookModel{WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, CreatorUID: creator, Name: "wh", Status: statusEnabled}
+	assert.NoError(t, d.insertWithQuota(first, groupCap, creatorCap))
+	// 群本体作用域个人额度已满：同一创建者再建被拒。
+	second := &incomingWebhookModel{WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, CreatorUID: creator, Name: "wh", Status: statusEnabled}
+	assert.ErrorIs(t, d.insertWithQuota(second, groupCap, creatorCap), ErrCreatorQuotaExceeded, "creator cap is per-scope; the group-self scope is full")
+
+	// 同一创建者在子区作用域有独立个人额度：可建。
+	inThread := &incomingWebhookModel{
+		WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, CreatorUID: creator, Name: "wh", Status: statusEnabled,
+		ChannelType: int(common.ChannelTypeCommunityTopic.Uint8()), ThreadShortID: thread,
+	}
+	assert.NoError(t, d.insertWithQuota(inThread, groupCap, creatorCap), "creator's per-scope cap in the thread is independent of the group-self scope")
 }
 
 // TestDisableByGroupNo_CoversThreadWebhook 群解散级联禁用覆盖子区 webhook（同 group_no）：

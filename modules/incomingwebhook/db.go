@@ -14,11 +14,13 @@ import (
 	"github.com/gocraft/dbr/v2"
 )
 
-// ErrQuotaExceeded 创建时群级配额已满，由 insertWithQuota 在事务内原子判定。
-var ErrQuotaExceeded = errors.New("incomingwebhook: per-group quota exceeded")
+// ErrQuotaExceeded 创建时【投递作用域】配额已满，由 insertWithQuota 在事务内原子判定。
+// 作用域 = (group_no, thread_short_id)：群本体（thread_short_id='')与每个子区各有一份
+// 独立配额、互不共享名额（子区多的群 / octo-loop 不再被父群总量卡死）。
+var ErrQuotaExceeded = errors.New("incomingwebhook: per-scope quota exceeded")
 
-// ErrCreatorQuotaExceeded 创建者个人配额已满（仅普通成员/bot 受限，管理员豁免），
-// 同样由 insertWithQuota 在事务内原子判定。
+// ErrCreatorQuotaExceeded 创建者在【当前投递作用域】的个人配额已满（仅普通成员/bot
+// 受限，管理员豁免），同样由 insertWithQuota 在事务内原子判定。
 var ErrCreatorQuotaExceeded = errors.New("incomingwebhook: per-creator quota exceeded")
 
 type incomingWebhookDB struct {
@@ -34,19 +36,24 @@ func newDB(ctx *config.Context) *incomingWebhookDB {
 //  1. SELECT id FROM `group` ... FOR UPDATE：对父群行加 X 记录锁（group_no 命中
 //     UNIQUE 索引 group_groupNo，锁的是必然存在的单行 record lock）。并发的同 group
 //     创建请求在此串行化，逐个进入配额校验+写入。
-//  2. SELECT count(*) FROM incoming_webhook WHERE group_no=?：父群行锁已串行化，
-//     此处普通读即可；count >= max 返回 ErrQuotaExceeded，事务回滚。
+//  2. SELECT count(*) FROM incoming_webhook WHERE group_no=? AND thread_short_id=?：
+//     配额按【投递作用域】(group_no, thread_short_id) 计数——群本体（thread_short_id='')
+//     与每个子区各有一份独立配额、互不共享（子区多的群 / octo-loop 不再被父群总量卡死）。
+//     父群行锁已把同群并发串行化，此处普通读即可；count >= max 返回 ErrQuotaExceeded，
+//     事务回滚。命中 idx_incoming_webhook_thread(group_no, thread_short_id, status)。
 //  3. 显式回填 CreatedAt：dbr 的 InsertInto.Record 不会从 DB 默认值回读时间，
 //     不写就会导致响应里的 created_at = epoch(0)。
 //
-// 为何锁父群行而非 `SELECT count(*) FROM incoming_webhook ... FOR UPDATE`：后者在
-// 空群首次插入时只命中 0 行 → 纯 gap lock。gap-X 锁互相兼容，并发事务会全部通过
+// 锁粒度【刻意】仍是父群行，比 per-scope 计数更粗（同群跨子区的并发创建也被串行化），
+// 但这是正确性必需、非遗漏：换成对 (group_no, thread_short_id) 范围 `... FOR UPDATE`，
+// 在空作用域首插时只命中 0 行 → 纯 gap lock。gap-X 锁互相兼容，并发事务会全部通过
 // count 检查、各自 INSERT 抢 insert-intention lock 互等 → InnoDB 死锁(1213)，且无
 // 重试，合法并发创建会以不透明的"创建失败"500 收场。锁父群这一必然存在的单行可彻底
-// 串行化而不触发 gap-lock 死锁（PR #31 yujiawei / Jerry-Xin review）。
+// 串行化而不触发 gap-lock 死锁（PR #31 yujiawei / Jerry-Xin review）。incoming_webhook
+// 体量小，父群级串行化成本可忽略；配额口径细到子区、锁口径粗到父群，两者独立。
 // maxPerCreator <= 0 表示不启用个人配额（管理员创建路径）；> 0 时在同一事务内对
-// creator_uid 维度再做一次计数校验，超限返回 ErrCreatorQuotaExceeded。个人配额与
-// 群级配额共享同一把父群行锁，无需额外加锁。
+// 【同一作用域下的】creator_uid 维度再做一次计数校验，超限返回 ErrCreatorQuotaExceeded。
+// 个人配额与作用域配额共享同一把父群行锁，无需额外加锁。
 func (d *incomingWebhookDB) insertWithQuota(m *incomingWebhookModel, max, maxPerCreator int) error {
 	tx, err := d.session.Begin()
 	if err != nil {
@@ -64,9 +71,10 @@ func (d *incomingWebhookDB) insertWithQuota(m *incomingWebhookModel, max, maxPer
 
 	var count int
 	if _, err = tx.SelectBySql(
+		// 按投递作用域 (group_no, thread_short_id) 计数：群本体与每个子区各占独立名额。
 		// 软删除（statusDeleted）的行不占配额：删除即释放名额（#254）。
-		"SELECT count(*) FROM incoming_webhook WHERE group_no=? AND status != ?",
-		m.GroupNo, statusDeleted,
+		"SELECT count(*) FROM incoming_webhook WHERE group_no=? AND thread_short_id=? AND status != ?",
+		m.GroupNo, m.ThreadShortID, statusDeleted,
 	).Load(&count); err != nil {
 		return fmt.Errorf("incomingwebhook: count: %w", err)
 	}
@@ -77,15 +85,16 @@ func (d *incomingWebhookDB) insertWithQuota(m *incomingWebhookModel, max, maxPer
 	if maxPerCreator > 0 {
 		var creatorCount int
 		if _, err = tx.SelectBySql(
-			// 与群级配额同口径：只排除软删除（statusDeleted）。【禁用】的 webhook 刻意
-			// 仍占个人配额——否则成员可用 disable→create→disable→create 循环无限囤积
-			// 可随时启用的 webhook，配额就形同虚设。释放名额只能走删除。这也意味着：
+			// 与作用域配额同口径：限定同一 (group_no, thread_short_id) 作用域、只排除软
+			// 删除（statusDeleted）。【禁用】的 webhook 刻意仍占个人配额——否则成员可用
+			// disable→create→disable→create 循环无限囤积可随时启用的 webhook，配额就形同
+			// 虚设。释放名额只能走删除。这也意味着：
 			//   - 创建者退群被懒级联禁用的 webhook 仍占其个人配额，本人重新入群后可
 			//     自行删除释放；
 			//   - 配额是【创建闸】而非持续约束：调低 max_per_creator 不会回收已超额
 			//     成员的存量，只是不允许再建。
-			"SELECT count(*) FROM incoming_webhook WHERE group_no=? AND creator_uid=? AND status != ?",
-			m.GroupNo, m.CreatorUID, statusDeleted,
+			"SELECT count(*) FROM incoming_webhook WHERE group_no=? AND thread_short_id=? AND creator_uid=? AND status != ?",
+			m.GroupNo, m.ThreadShortID, m.CreatorUID, statusDeleted,
 		).Load(&creatorCount); err != nil {
 			return fmt.Errorf("incomingwebhook: creator count: %w", err)
 		}
