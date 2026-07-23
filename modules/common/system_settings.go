@@ -643,8 +643,9 @@ func (s *SystemSettings) IncomingWebhookPerWebhookBurst() int {
 	return v
 }
 
-// IncomingWebhookMaxPerGroup 单个【投递作用域】可创建的 webhook 数量上限：群本体与
-// 每个子区各按此上限独立计数（不共享名额）。DB → env → 默认 10。
+// IncomingWebhookMaxPerGroup 群本体作用域（thread_short_id='')可创建的 webhook 数量上限。
+// 子区作用域另用 IncomingWebhookMaxPerThread（未配置时回退到本值），两者独立计数、不共享
+// 名额。DB → env → 默认 10。
 // 读侧防御：≤0 回退默认（max_per_group=0 会让每次 create 都 ErrQuotaExceeded，是
 // 总开关之外一种更难诊断的「暗关」）。
 func (s *SystemSettings) IncomingWebhookMaxPerGroup() int {

@@ -118,7 +118,7 @@ var systemSettingSchema = []settingDef{
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.IncomingWebhookPerWebhookBurst()) }},
 	{Category: "incomingwebhook", Key: "max_per_group", Type: settingTypeInt, Description: "群本体作用域最多可创建的 Webhook 数量（子区另见 max_per_thread）", Positive: true,
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.IncomingWebhookMaxPerGroup()) }},
-	{Category: "incomingwebhook", Key: "max_per_thread", Type: settingTypeInt, Description: "单个子区作用域最多可创建的 Webhook 数量（未配置时与群本体 max_per_group 一致）", Positive: true,
+	{Category: "incomingwebhook", Key: "max_per_thread", Type: settingTypeInt, Description: "单个子区作用域最多可创建的 Webhook 数量（未配置或 0/≤0 时回退到群本体 max_per_group，并非「禁止子区建 Webhook」；写入要求为正整数）", Positive: true,
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.IncomingWebhookMaxPerThread()) }},
 	{Category: "incomingwebhook", Key: "max_per_creator", Type: settingTypeInt, Description: "单个普通成员/机器人在一个投递作用域（群本体或每个子区）内最多可创建的 Webhook 数量（群主/管理员不受限）", Positive: true,
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.IncomingWebhookMaxPerCreator()) }},

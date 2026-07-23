@@ -54,12 +54,18 @@ webhook 可被创建为绑定到某个子区，推送即投递进子区频道（
 - 隐私提示：list 响应包含每个 webhook 的 `creator_uid`（供客户端判断"是否我创建的"
   并展示归属），即任意群成员可见全群 webhook 的创建者身份——群成员名册本就互相可见，
   属有意设计；token / 推送 URL 绝不出现在 list 中。对隐私敏感的部署请知悉此暴露面。
-- 配额双层，均按【投递作用域】`(group_no, thread_short_id)` 计——群本体与每个子区各有
-  独立配额、复用同一组 max 值、互不共享名额（子区多的群 / octo-loop 不被父群总量卡死）：
-  作用域级 `max_per_group`（默认 10）对所有人生效；普通成员/bot 另受 per-creator 配额
-  （system_setting `incomingwebhook.max_per_creator`，默认 5，env
-  `DM_INCOMINGWEBHOOK_MAX_PER_CREATOR`）约束，管理员豁免。超限 409。计数串行化锁仍锚
-  父群行（避免空作用域首插的 gap-lock 死锁），锁粗、计数细，两者独立。
+- 配额三层，均按【投递作用域】`(group_no, thread_short_id)` 计——群本体与每个子区各有
+  独立配额、互不共享名额（子区多的群 / octo-loop 不被父群总量卡死）。超限 409；计数串行化
+  锁仍锚父群行（避免空作用域首插的 gap-lock 死锁），锁粗、计数细，两者独立：
+  - **作用域级**：群本体用 `incomingwebhook.max_per_group`（默认 10，env
+    `DM_INCOMINGWEBHOOK_MAX_PER_GROUP`）；每个子区用 `incomingwebhook.max_per_thread`
+    （env `DM_INCOMINGWEBHOOK_MAX_PER_THREAD`，**未配置或填 0/≤0 时回退到 `max_per_group`**，
+    并非「子区禁建」）——二者解耦，可分别精确设数（如群 10 / 每子区 3）。对所有人生效。
+  - **per-creator**：普通成员/bot 在【本作用域】内另受 `incomingwebhook.max_per_creator`
+    （默认 5，env `DM_INCOMINGWEBHOOK_MAX_PER_CREATOR`）约束，管理员豁免。
+  - **群聚合天花板**：`incomingwebhook.max_total_per_group`（env
+    `DM_INCOMINGWEBHOOK_MAX_TOTAL_PER_GROUP`，**默认 0 = 不启用**）封顶单群跨群本体 + 所有
+    子区的 webhook 总数，挡住「子区可无限建 → 总量 = 作用域上限 ×(子区数+1) 失控」。
 - **创建者退群即失效**：push 路径校验创建者仍是群内（内部、正常）成员，不满足则
   统一 401 并把该 webhook 懒级联禁用（status→0）；启用/regenerate/测试推送对
   创建者已退群的 webhook 返回 409（`mgmt_creator_left`），只能删除重建。创建者
