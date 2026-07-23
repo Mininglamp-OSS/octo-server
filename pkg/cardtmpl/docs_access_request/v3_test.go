@@ -126,6 +126,95 @@ func TestV3PendingCarriesResultContextInServerAuthoredActionData(t *testing.T) {
 	}
 }
 
+func TestV3UsesForgeLayout(t *testing.T) {
+	r := cardtmpl.NewRegistry()
+	r.Register(docsaccessrequest.New(), docsaccessrequest.Assets, docsaccessrequest.HandoffRoot)
+	r.Register(docsaccessrequest.NewV3(), docsaccessrequest.Assets, docsaccessrequest.HandoffRootV3)
+	r.SetDefault(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3)
+	r.Freeze()
+	env := cardtmpl.BuildEnv{WebLoginURL: "https://web.example.com", Lang: "zh-CN", SpaceID: "space-1"}
+
+	for _, state := range []cardtmpl.State{
+		docsaccessrequest.StatePending,
+		docsaccessrequest.StateApproved,
+		docsaccessrequest.StateRejected,
+	} {
+		sample, err := docsaccessrequest.Assets.ReadFile(docsaccessrequest.HandoffRootV3 + "/samples/" + string(state) + ".json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload, err := r.Render(context.Background(), docsaccessrequest.TemplateID, "", state, sample, env)
+		if err != nil {
+			t.Fatalf("Render(%s): %v", state, err)
+		}
+		card := payload["card"].(map[string]any)
+		body := card["body"].([]any)
+		if len(body) != 3 {
+			t.Fatalf("Render(%s) top-level body count = %d, want header/content/footer", state, len(body))
+		}
+		if header := body[0].(map[string]any); header["type"] != "ColumnSet" || header["spacing"] != "None" {
+			t.Errorf("Render(%s) header = %+v", state, header)
+		}
+		assertForgeSurface(t, state, body[1], "accent")
+		assertForgeSurface(t, state, body[2], "emphasis")
+		if findNodeByID(card, "octo-badge-neutral-permission") == nil {
+			t.Errorf("Render(%s) permission semantic badge missing", state)
+		}
+
+		if state == docsaccessrequest.StatePending {
+			if _, ok := card["actions"]; ok {
+				t.Error("pending Forge layout must keep actions in the inline footer")
+			}
+			for _, id := range []string{cardtmpl.DocsApproveActionID, cardtmpl.DocsDenyActionID, cardtmpl.DocsDenyReasonInputID} {
+				if findNodeByID(card, id) == nil {
+					t.Errorf("pending Forge layout missing production id %q", id)
+				}
+			}
+			input := findNodeByID(card, cardtmpl.DocsDenyReasonInputID)
+			if input["isVisible"] != false || input["maxLength"] != float64(cardtmpl.MaxExcerptRunes) && input["maxLength"] != cardtmpl.MaxExcerptRunes {
+				t.Errorf("deny input contract drift: %+v", input)
+			}
+		} else {
+			if findNodeByID(card, cardtmpl.DocsApproveActionID) != nil || findNodeByID(card, cardtmpl.DocsDenyActionID) != nil {
+				t.Errorf("terminal Forge layout retained decision actions for state %s", state)
+			}
+			if findNodeByID(card, "approval_actions") != nil {
+				t.Errorf("terminal Forge layout retained pending action-set id for state %s", state)
+			}
+		}
+	}
+}
+
+func assertForgeSurface(t *testing.T, state cardtmpl.State, value any, style string) {
+	t.Helper()
+	node := value.(map[string]any)
+	if node["type"] != "Container" || node["style"] != style || node["bleed"] != true ||
+		node["separator"] != true || node["spacing"] != "None" {
+		t.Errorf("Render(%s) %s surface = %+v", state, style, node)
+	}
+}
+
+func findNodeByID(value any, id string) map[string]any {
+	switch node := value.(type) {
+	case map[string]any:
+		if node["id"] == id {
+			return node
+		}
+		for _, child := range node {
+			if found := findNodeByID(child, id); found != nil {
+				return found
+			}
+		}
+	case []any:
+		for _, child := range node {
+			if found := findNodeByID(child, id); found != nil {
+				return found
+			}
+		}
+	}
+	return nil
+}
+
 func TestV3FallbackTextLocalizesResultsAndRejectsUnknownState(t *testing.T) {
 	tmpl := docsaccessrequest.NewV3()
 	fields := json.RawMessage(`{
