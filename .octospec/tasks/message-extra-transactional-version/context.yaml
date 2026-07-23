@@ -1,0 +1,31 @@
+injected:
+  - id: error-handling
+    source: repo
+  - id: space-isolation
+    source: repo
+  - id: testing
+    source: repo
+brief: .octospec/tasks/message-extra-transactional-version/brief.md
+
+# PR-1 scope: schema migration (octo_message_extra_channel_seq +
+# octo_message_extra_version_state + message_extra composite index) and the new
+# leaf package internal/msgextraseq (ReserveTx / state dispatch / legacy adapter
+# / metrics). Production stays inert (mode=legacy). No writer cutover here.
+#
+# rule notes:
+#   - error-handling: allocator returns plain Go errors; user-facing envelope is
+#     the writer's job (PR-2 reuses existing errcode via httperr.ResponseErrorL).
+#     No raw responses introduced.
+#   - space-isolation: allocator takes an already-derived storage channel key and
+#     does no cross-Space lookup; ownership/Space gates stay in the callers (D6).
+#   - testing: real MySQL required; tests use testutil.NewTestServer +
+#     CleanAllTables; migration file follows modules/message/sql/ naming.
+#
+# API refinement flagged for human review (deviation from brief D3):
+#   ReserveTx returns []int64 (the assigned versions in order), NOT a single
+#   `first int64`. Rationale: a contiguous range is only guaranteeable in
+#   transactional mode (row lock). In legacy mode the values come from N
+#   ctx.GenSeq calls and are NOT contiguity-guaranteed under concurrency, so
+#   returning `first` + caller assigning first..first+N-1 would be unsafe during
+#   the Prepare window. []int64 is behavior-preserving in both modes and keeps
+#   callers mode-agnostic. brief D3 signature to be updated if accepted.
