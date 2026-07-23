@@ -12,6 +12,44 @@ source: self
 
 # Journal: cardtmpl-l2a-summary-migration (PR-2)
 
+## Review round (PR #650, 4× APPROVE)
+
+4 members approved (`lml2468` / `Jerry-Xin` / `mochashanyao` / `yujiawei`), zero
+P0/P1. Addressed the actionable P2s in-branch:
+
+- **P2-1 — C1 schema-cap was a delivery regression.** Legacy `buildSummaryCard`
+  never validated length; an over-length `title`/`reason`/`timeRange`/
+  `generatedAt` still delivered (truncated card or text DM). Under the new C1
+  preflight it would flip to a 400 zero-delivery. Fix:
+  `mapSummaryCardFieldsToJSON` now server-side truncates the display fields to
+  the schema/render budgets (`title`→`cardtmpl.MaxTitleRunes`,
+  `reason`→`cardtmpl.MaxExcerptRunes`, `timeRange`/`generatedAt`→local consts
+  mirroring schema `maxLength`) and clamps negative `members`/`msgCount` to 0.
+  `taskNo` is **not** truncated — it's the deep-link key, so an over-length
+  taskNo stays a genuine C1 400. Exported `cardtmpl.MaxTitleRunes` +
+  `cardtmpl.TruncateRunes` so ingress and render share one cap/impl (G9).
+  Within-budget inputs are unchanged, so the byte-equivalence baseline still
+  holds; `TestMapSummaryFields_TruncatesDisplayFields` locks the new behavior
+  (huge input delivers, over-length taskNo 400s).
+- **P2-2 — misleading log label.** The docs display-card build-error branch
+  logged `"docs access-request card ..."` for `docs.commented`/`docs.shared`
+  too and omitted `kind`. Made kind-generic + added `zap.String("kind", ...)`.
+  (PR-1-introduced; fixed here since reviewers flagged it on #650.)
+- **Nit — `docs_shared` en test.** Added `TestRenderEnglishSourceLocalized`
+  (the other three new packages already had it).
+
+Deferred (non-blocking, → roadmap C finalization PR): P2-3 (summary text
+fallback doesn't delegate to `Template.FallbackText` — copy identical today),
+P2-4 (build-site nil-registry diagnostic log). Refuted (yujiawei): the
+"excerpt prefix inside the 300-rune budget" concern — legacy does the identical
+`prefix + reason` concat then truncates at the same cap; changing it would
+*break* byte-equivalence. Pre-existing, out of scope.
+
+Also updated `docs/platform-card-base.md` §2.2 gate ② + §15.4 to record that
+#649/#650 put 5 L2a cards on the Registry (register/Render/conformance/baseline
+dimensions met; production-canary dimension still pending, so gate ② not yet
+整体 satisfied).
+
 ## What was done
 
 Second slice of roadmap group C — two more L2a display cards migrated onto

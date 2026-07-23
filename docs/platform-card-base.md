@@ -119,6 +119,7 @@
    - **L2b 开放硬门槛**(写死,平台组可通过 RFC 评估微调,但不允许在无 RFC 情况下降低):
      ① L0 (`octo-card@1.x`) 至少一个 release 无 breaking change;
      ② L2a 至少 **3 张**卡片走完 Registry 全链路(注册 + Render + conformance test + 生产灰度),覆盖至少两种视图模式(纯展示 v1 / 交互 v2);
+       - **进度(2026-07)**:注册 + Render + conformance + 字节等价基线维度已达标 —— **5 张** L2a 卡在 Registry 上:`docs.access-request`(v2 交互,#633/#641)、`docs.commented` + `docs.shared`(v1 展示,#649)、`summary.completed` + `summary.failed`(v1 展示,#650),两种视图模式全覆盖。**仍缺"生产灰度"这一维度**(线上放量观测),故门槛 ② 尚未整体满足;`generic.approval` 因动态 owner 与静态 `TemplateActionContract` 冲突暂未迁(见 §15.4)。
      ③ `docs/l2b-owners.md` 空清单已合入,且有至少一份未通过审核的 L2b 申请 PR 作为流程演练;
      ④ callback URL 白名单机制、独立 token 通道、per-owner 观测指标全部在 L0 落地。
    - **消息通道位置**:L2b 卡片在客户端 UI 上默认不做特殊突出显示(与 L2a 同渠道到达);渲染顺序、置顶、折叠策略由客户端自行决定,L0 不承诺。
@@ -701,7 +702,8 @@ label `template_id` 基数 = 注册表大小（硬编码），无基数爆炸。
    - 增加 callback/update 两个有界指标，且不发布 `response_url`。
 
 4. **后续 PR**
-   - 迁 `docs.shared/commented`、`summary.completed/failed`、`generic.approval` 等模板到 Registry；
+   - 迁 `docs.shared/commented`、`summary.completed/failed`、`generic.approval` 等模板到 Registry;
+     - **进度**:`docs.commented` + `docs.shared` 已迁(#649,roadmap C PR-1);`summary.completed` + `summary.failed` 已迁(#650,roadmap C PR-2)。四张 legacy 展示卡的 `deliver*` 分支现全部走 `Registry.Render`(方案 B 外壳不变);连同 pilot `docs.access-request` 共 5 张 L2a 卡在 Registry 上。**`generic.approval` 未迁** —— 其调用方动态 `owner`/`action_type` 与静态 `TemplateActionContract` 冲突,需单独决策(固定 owner 模板 vs 保留动态特例)后再迁。legacy `buildSummaryCard`/`buildDocsCard` 暂留作字节等价基线,删除留到 roadmap C 收尾 PR。
    - 开放 `/v1/message/card/templates` 只读端点(涉及 per-owner 可见性 / i18n 文案透出);
    - 开放 JSON 模板模式(`templates/*.template.json` + 表达式引擎);
    - 开放 envelope 模式(调用方显式传 `template_id`),替换 `NotifyReq` 四选一;

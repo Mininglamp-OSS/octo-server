@@ -4,12 +4,66 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	summarycompleted "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/summary_completed"
 	summaryfailed "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/summary_failed"
 )
+
+// TestMapSummaryFields_TruncatesDisplayFields 断言 P2-1(PR #650 review):超长
+// 展示字段(title/reason/timeRange/generatedAt)被服务端截断到 schema cap 后仍能
+// 投递(preflight 通过 + build 成功,不再翻 400);负数 members/msgCount 被 clamp 到
+// 0 后省略。而 taskNo(deep-link key)超长仍是 C1 400 —— 绝不静默截断。
+// 同时锁 notify 本地 cap 常量与 schema maxLength 对齐:若某个 cap 设大于 schema,
+// 截断后仍超 schema → preflight 会 400,本测试即失败。
+func TestMapSummaryFields_TruncatesDisplayFields(t *testing.T) {
+	wk := newWuKongServer()
+	defer wk.close()
+	ctx := newTestContext(t, wk)
+	ctx.GetConfig().External.WebLoginURL = "https://im.example.com/login"
+
+	registry := cardtmpl.NewRegistry()
+	registry.Register(summarycompleted.New(), summarycompleted.Assets, summarycompleted.HandoffRoot)
+	registry.SetDefault(summarycompleted.TemplateID, summarycompleted.TemplateVersion)
+	registry.Register(summaryfailed.New(), summaryfailed.Assets, summaryfailed.HandoffRoot)
+	registry.SetDefault(summaryfailed.TemplateID, summaryfailed.TemplateVersion)
+	registry.Freeze()
+	prev := cardtmpl.DefaultRegistry()
+	cardtmpl.SetDefaultRegistry(registry)
+	defer cardtmpl.SetDefaultRegistry(prev)
+
+	n := newTestNotify(ctx, nil, nil, nil, "tk")
+
+	// 全字段远超 schema cap + 负数计数 → 截断/clamp 后 preflight 通过 + build 成功。
+	huge := &SummaryCardFields{
+		TaskNo:      "sum_ok",
+		Kind:        SummaryCardKindFailed,
+		Title:       strings.Repeat("标", 500),  // cap 200
+		Reason:      strings.Repeat("因", 1000), // cap 300
+		TimeRange:   strings.Repeat("时", 500),  // cap 200
+		GeneratedAt: strings.Repeat("刻", 300),  // cap 80
+		Members:     -5,
+		MsgCount:    -1,
+	}
+	if err := preflightSummarySchema(huge, summaryfailed.TemplateID); err != nil {
+		t.Fatalf("preflight should PASS after truncation, got %v", err)
+	}
+	if _, _, err := n.buildSummaryCardViaRegistry(context.Background(),
+		"space-c", huge, "zh-CN", summaryfailed.TemplateID, summaryfailed.StateShown); err != nil {
+		t.Fatalf("build should SUCCEED after truncation, got %v", err)
+	}
+
+	// taskNo 超长(>200)→ 仍 C1 400:deep-link key 不截断。
+	badTask := &SummaryCardFields{
+		TaskNo: strings.Repeat("x", 300), Title: "OK", Kind: SummaryCardKindCompleted,
+	}
+	err := preflightSummarySchema(badTask, summarycompleted.TemplateID)
+	if err == nil || !errorsIsFieldsInvalid(err) {
+		t.Fatalf("over-length taskNo must stay C1 400, got %v", err)
+	}
+}
 
 // TestBuildSummaryCards_MigrationBaseline 是 roadmap C PR-2 的字节等价基线:
 // 对 summary.completed / summary.failed 两张 v1 展示卡,断言 legacy

@@ -400,8 +400,9 @@ func SanitizeLine(s string) string {
 // when it actually cuts. Exported so producer mapping layers (modules/notify)
 // can pre-truncate display fields to the same schema/render budgets and preserve
 // card delivery, instead of an over-length field flipping to a C1 400 at
-// preflight (see modules/notify.mapDocsCardFieldsToDisplayJSON). Wraps the
-// internal truncateRunes so the render layer and ingress layer share one impl.
+// preflight (see modules/notify.mapDocsCardFieldsToDisplayJSON /
+// mapSummaryCardFieldsToJSON). Wraps the internal truncateRunes so the render
+// layer and ingress layer share one implementation.
 func TruncateRunes(value string, limit int) string { return truncateRunes(value, limit) }
 
 func truncateRunes(value string, limit int) string {

@@ -270,25 +270,54 @@ func mapDocsCardFieldsToJSON(card *DocsCardFields, lang string) (json.RawMessage
 	return json.RawMessage(raw), nil
 }
 
+// summaryTimeRangeMaxRunes / summaryGeneratedAtMaxRunes mirror the summary card
+// data.schema.json maxLength for these display fields. mapSummaryCardFieldsToJSON
+// truncates to them (title/reason reuse the exported cardtmpl caps) so an
+// over-length display string renders truncated rather than flipping to a C1 400
+// (P2-1, PR #650 review). The schema maxLength is the backstop —
+// TestMapSummaryFields_TruncatesDisplayFields locks these in sync (truncation must
+// leave the field within schema, else preflight would still 400).
+const (
+	summaryTimeRangeMaxRunes   = 200
+	summaryGeneratedAtMaxRunes = 80
+)
+
+// clampNonNegative floors a caller-supplied count at 0. Legacy buildSummaryCard
+// omitted non-positive members/msgCount via a `> 0` guard; the schema's
+// minimum:0 would otherwise 400 a negative sentinel. Clamping to 0 reproduces
+// the legacy omit-and-deliver behavior (the Template's `> 0` guard drops the fact).
+func clampNonNegative(v int) int {
+	if v < 0 {
+		return 0
+	}
+	return v
+}
+
 // mapSummaryCardFieldsToJSON 把扁平 SummaryCardFields 映射成 summary.completed /
 // summary.failed 契约期望的 JSON 形状(与 mapDocsCardFieldsToDisplayJSON 同思路,
 // 只是字段集不同)。Kind == failed 时保留 reason;completed 时省略 reason(其
 // schema 里根本没这个字段, additionalProperties:false 会拒绝)。字节等价基线依
 // 赖此映射与 legacy buildSummaryCard 提取自同一 SummaryCardFields。
+//
+// P2-1 (PR #650 review):展示字段服务端截断到 schema maxLength / 渲染预算。legacy
+// buildSummaryCard 从不校验长度 —— 超长 title/reason 仍会投递(截断后的卡或文本
+// DM)。走 C1 preflight 后,超长字段本会翻成 400 零投递。这里截断保住"通知永不丢"
+// 不变量,同时对**真正的结构性违规**(缺失/空必填、类型错、未知字段、以及超长的
+// taskNo —— deep-link key,绝不能静默截断)保留 C1 硬 400。
 func mapSummaryCardFieldsToJSON(card *SummaryCardFields) (json.RawMessage, error) {
 	if card == nil {
 		return nil, errors.New("mapSummaryCardFieldsToJSON: nil card")
 	}
 	m := map[string]any{
-		"taskNo":      strings.TrimSpace(card.TaskNo),
-		"title":       strings.TrimSpace(card.Title),
-		"timeRange":   strings.TrimSpace(card.TimeRange),
-		"members":     card.Members,
-		"msgCount":    card.MsgCount,
-		"generatedAt": strings.TrimSpace(card.GeneratedAt),
+		"taskNo":      strings.TrimSpace(card.TaskNo), // deep-link key:不截断(超长 → C1 400)
+		"title":       cardtmpl.TruncateRunes(strings.TrimSpace(card.Title), cardtmpl.MaxTitleRunes),
+		"timeRange":   cardtmpl.TruncateRunes(strings.TrimSpace(card.TimeRange), summaryTimeRangeMaxRunes),
+		"members":     clampNonNegative(card.Members),
+		"msgCount":    clampNonNegative(card.MsgCount),
+		"generatedAt": cardtmpl.TruncateRunes(strings.TrimSpace(card.GeneratedAt), summaryGeneratedAtMaxRunes),
 	}
 	if card.Kind == SummaryCardKindFailed {
-		m["reason"] = strings.TrimSpace(card.Reason)
+		m["reason"] = cardtmpl.TruncateRunes(strings.TrimSpace(card.Reason), cardtmpl.MaxExcerptRunes)
 	}
 	raw, err := json.Marshal(m)
 	if err != nil {
