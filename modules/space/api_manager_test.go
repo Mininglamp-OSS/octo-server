@@ -1784,3 +1784,135 @@ func TestManager_UpdateMemberRoleIdempotent(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, 2, owner.Role)
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// parseInviteExpiresAt 三态单元测试（review #653 P2 回归）
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestParseInviteExpiresAt_ThreeState(t *testing.T) {
+	t.Run("nil → notProvided", func(t *testing.T) {
+		r, err := parseInviteExpiresAt(nil)
+		assert.NoError(t, err)
+		assert.True(t, r.notProvided)
+		assert.Nil(t, r.expiresAt)
+	})
+	t.Run("empty string → notProvided", func(t *testing.T) {
+		s := ""
+		r, err := parseInviteExpiresAt(&s)
+		assert.NoError(t, err)
+		assert.True(t, r.notProvided)
+		assert.Nil(t, r.expiresAt)
+	})
+	t.Run(`"never" → permanent`, func(t *testing.T) {
+		s := "never"
+		r, err := parseInviteExpiresAt(&s)
+		assert.NoError(t, err)
+		assert.False(t, r.notProvided)
+		assert.Nil(t, r.expiresAt, "explicit permanent: expiresAt must be nil")
+	})
+	t.Run(`"Never" (mixed-case) → permanent`, func(t *testing.T) {
+		s := "Never"
+		r, err := parseInviteExpiresAt(&s)
+		assert.NoError(t, err)
+		assert.False(t, r.notProvided)
+		assert.Nil(t, r.expiresAt)
+	})
+	t.Run(`" never " (padded) → permanent`, func(t *testing.T) {
+		s := " never "
+		r, err := parseInviteExpiresAt(&s)
+		assert.NoError(t, err)
+		assert.False(t, r.notProvided)
+		assert.Nil(t, r.expiresAt)
+	})
+	t.Run("valid timestamp → specific time", func(t *testing.T) {
+		s := "2030-06-15 12:00:00"
+		r, err := parseInviteExpiresAt(&s)
+		assert.NoError(t, err)
+		assert.False(t, r.notProvided)
+		assert.NotNil(t, r.expiresAt)
+	})
+	t.Run("invalid string → error", func(t *testing.T) {
+		s := "not-a-date"
+		_, err := parseInviteExpiresAt(&s)
+		assert.Error(t, err)
+	})
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Manager.createInvite "never" → DB NULL 集成测试（review #653 P2 回归）
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestManager_CreateInvite_Never_DBNull(t *testing.T) {
+	s, _, err := setup(t)
+	assert.NoError(t, err)
+	token := adminToken(t)
+
+	seedSpace(t, "mgr-inv-never1", "inv never create", "u-owner", SpaceStatusNormal)
+
+	body := `{"expires_at":"never"}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/manager/spaces/mgr-inv-never1/invites", bytes.NewBufferString(body))
+	req.Header.Set("token", token)
+	req.Header.Set("Content-Type", "application/json")
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code, "create with never should succeed: %s", w.Body.String())
+
+	var resp struct {
+		InviteCode string `json:"invite_code"`
+		ExpiresAt  string `json:"expires_at"`
+	}
+	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, "never", resp.ExpiresAt, `response expires_at must be "never" for permanent invite`)
+
+	inv, err := testSpaceDB.queryInvitationByCode(resp.InviteCode)
+	assert.NoError(t, err)
+	assert.NotNil(t, inv)
+	assert.Nil(t, inv.ExpiresAt, "DB expires_at must be NULL for permanent invite")
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Manager.updateInvite "never" → DB NULL 集成测试（review #653 P2 回归）
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestManager_UpdateInvite_ClearExpiry_Never(t *testing.T) {
+	s, _, err := setup(t)
+	assert.NoError(t, err)
+	token := adminToken(t)
+
+	seedSpace(t, "mgr-inv-never2", "inv never update", "u-owner", SpaceStatusNormal)
+
+	// 先建一个有具体过期时间的邀请码
+	bodyCreate := `{"expires_at":"2030-01-01 00:00:00","max_uses":10}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/manager/spaces/mgr-inv-never2/invites", bytes.NewBufferString(bodyCreate))
+	req.Header.Set("token", token)
+	req.Header.Set("Content-Type", "application/json")
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var createResp struct {
+		InviteCode string `json:"invite_code"`
+	}
+	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &createResp))
+	code := createResp.InviteCode
+	assert.NotEmpty(t, code)
+
+	// 验证创建后 expires_at 非 NULL
+	inv, err := testSpaceDB.queryInvitationByCode(code)
+	assert.NoError(t, err)
+	assert.NotNil(t, inv.ExpiresAt, "before update: should have a concrete expiry")
+
+	// 用 "never" 更新为永久
+	bodyUpdate := `{"expires_at":"never"}`
+	w2 := httptest.NewRecorder()
+	req2, _ := http.NewRequest("PUT", "/v1/manager/spaces/mgr-inv-never2/invites/"+code, bytes.NewBufferString(bodyUpdate))
+	req2.Header.Set("token", token)
+	req2.Header.Set("Content-Type", "application/json")
+	s.GetRoute().ServeHTTP(w2, req2)
+	assert.Equal(t, http.StatusOK, w2.Code, "update to never should succeed: %s", w2.Body.String())
+
+	// 验证 DB expires_at 已被清为 NULL
+	inv2, err := testSpaceDB.queryInvitationByCode(code)
+	assert.NoError(t, err)
+	assert.Nil(t, inv2.ExpiresAt, "after update with never: DB expires_at must be NULL")
+}

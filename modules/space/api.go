@@ -1502,11 +1502,7 @@ func (s *Space) updateInvite(c *wkhttp.Context) {
 		respondSpaceRequestInvalid(c, "expires_at")
 		return
 	}
-	clearExpires := !expiresResult.notProvided && expiresResult.expiresAt == nil
-	var updateExpiresAt *time.Time
-	if !expiresResult.notProvided {
-		updateExpiresAt = expiresResult.expiresAt
-	}
+	updateExpiresAt, clearExpires := expiresResult.updateArgs()
 
 	// 复用管理端的 updateInvitationAdmin：
 	//   - WHERE 无 status=1 限制，可对已禁用邀请码重启用（status=1）
