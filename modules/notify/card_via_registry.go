@@ -269,3 +269,86 @@ func mapDocsCardFieldsToJSON(card *DocsCardFields, lang string) (json.RawMessage
 	}
 	return json.RawMessage(raw), nil
 }
+
+// mapSummaryCardFieldsToJSON 把扁平 SummaryCardFields 映射成 summary.completed /
+// summary.failed 契约期望的 JSON 形状(与 mapDocsCardFieldsToDisplayJSON 同思路,
+// 只是字段集不同)。Kind == failed 时保留 reason;completed 时省略 reason(其
+// schema 里根本没这个字段, additionalProperties:false 会拒绝)。字节等价基线依
+// 赖此映射与 legacy buildSummaryCard 提取自同一 SummaryCardFields。
+func mapSummaryCardFieldsToJSON(card *SummaryCardFields) (json.RawMessage, error) {
+	if card == nil {
+		return nil, errors.New("mapSummaryCardFieldsToJSON: nil card")
+	}
+	m := map[string]any{
+		"taskNo":      strings.TrimSpace(card.TaskNo),
+		"title":       strings.TrimSpace(card.Title),
+		"timeRange":   strings.TrimSpace(card.TimeRange),
+		"members":     card.Members,
+		"msgCount":    card.MsgCount,
+		"generatedAt": strings.TrimSpace(card.GeneratedAt),
+	}
+	if card.Kind == SummaryCardKindFailed {
+		m["reason"] = strings.TrimSpace(card.Reason)
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		return nil, fmt.Errorf("marshal mapped summary fields: %w", err)
+	}
+	return json.RawMessage(raw), nil
+}
+
+// buildSummaryCardViaRegistry 通过 Registry.Render 生成 summary.completed /
+// summary.failed 展示卡(v1)。错误分类与 buildDocsDisplayCardViaRegistry 对齐:
+//   - Registry 未注入 → errCardTmplUnavailable(caller 翻 500,不降级);
+//   - schema 校验失败 → cardtmpl.ErrFieldsInvalid(caller 翻 400 零投递,C1);
+//   - 其他 render 级错 → non-typed,caller 走 render_error 降级文本。
+func (n *Notify) buildSummaryCardViaRegistry(
+	ctx context.Context, spaceID string, card *SummaryCardFields, lang string,
+	templateID cardtmpl.ID, state cardtmpl.State,
+) (json.RawMessage, string, error) {
+	registry := cardtmpl.DefaultRegistry()
+	if registry == nil {
+		return nil, "", fmt.Errorf("%w: default registry not wired", errCardTmplUnavailable)
+	}
+	fields, err := mapSummaryCardFieldsToJSON(card)
+	if err != nil {
+		return nil, "", fmt.Errorf("notify: map SummaryCardFields to schema JSON: %w", err)
+	}
+	env := cardtmpl.BuildEnv{
+		WebLoginURL: n.ctx.GetConfig().External.WebLoginURL,
+		Lang:        lang,
+		SpaceID:     spaceID,
+	}
+	cardDoc, _, renderProfile, err := registry.RenderCardWithProfiles(ctx, templateID, "", state, fields, env)
+	if err != nil {
+		return nil, "", err
+	}
+	return cardDoc, renderProfile, nil
+}
+
+// preflightSummarySchema 与 preflightDocsDisplaySchema 同思路:在 memberCache /
+// docsSender / gate 之前独立跑一次 InputSchema 校验(C1 不被绕过)。summary 卡
+// 无用户可控 URL 字段,不需要 https 前置校验。
+func preflightSummarySchema(card *SummaryCardFields, templateID cardtmpl.ID) error {
+	registry := cardtmpl.DefaultRegistry()
+	if registry == nil {
+		return fmt.Errorf("%w: default registry not wired", errCardTmplUnavailable)
+	}
+	tmpl, err := registry.Lookup(templateID, "")
+	if err != nil {
+		return fmt.Errorf("%w: lookup %s: %v", errCardTmplUnavailable, templateID, err)
+	}
+	fields, err := mapSummaryCardFieldsToJSON(card)
+	if err != nil {
+		return fmt.Errorf("%w: map: %v", cardtmpl.ErrFieldsInvalid, err)
+	}
+	var parsed any
+	if err := json.Unmarshal(fields, &parsed); err != nil {
+		return fmt.Errorf("%w: %v", cardtmpl.ErrFieldsInvalid, err)
+	}
+	if err := tmpl.Meta().InputSchema.Validate(parsed); err != nil {
+		cardtmpl.RecordFieldsInvalid(templateID, tmpl.Meta().Version)
+		return fmt.Errorf("%w: %v", cardtmpl.ErrFieldsInvalid, err)
+	}
+	return nil
+}
