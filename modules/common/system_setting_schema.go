@@ -232,6 +232,15 @@ var systemSettingSchema = []settingDef{
 	{Category: "onboarding", Key: "space_welcome_message", Type: settingTypeString, Description: "欢迎语文案（纯文本，所有人同一份，trim 后非空，≤2000 字符；支持换行 \\n，不渲染 markdown）",
 		Effective: func(s *SystemSettings) string { return s.SpaceWelcomeConfig().Message }},
 
+	// Group 入群欢迎语总开关（onboarding.group_welcome_enabled）— task
+	// group-welcome-message。平台级 dark-launch 开关：默认关闭；开启后，各群由群主/
+	// 管理员在 /v1/groups/:group_no/welcome 自助配置的欢迎语，才会在成员首次入群时被
+	// 公开发到群频道。回落 false 即为即时 kill（事件停写 + worker 停发，随快照多实例
+	// 收敛），且不触及任何 per-group 配置行。与 space_welcome_* 不同：此开关仅管「启用」，
+	// 没有平台级文案兜底（群文案恒来自各群自己的行）。是「总开关 AND 每群 enabled」的外层。
+	{Category: "onboarding", Key: "group_welcome_enabled", Type: settingTypeBool, Description: "是否开启「群入群欢迎语」总功能（默认关闭；开启后各群由群主/管理员自助配置的欢迎语才会在成员首次入群时公开发到群频道；关闭=即时停发，不影响各群已保存的配置）",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.GroupWelcomeEnabled()) }},
+
 	// Email server config — formerly yaml-only (Support.* in config.go).
 	{Category: "support", Key: "email", Type: settingTypeString, Description: "技术支持邮箱（发件人）",
 		Effective: func(s *SystemSettings) string { return s.SupportEmail() }},

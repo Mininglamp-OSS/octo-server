@@ -40,9 +40,26 @@ Locked product decisions (design review, this task):
    **placeholder** that renders to the new member's display name / @mention at
    send time (公开欢迎语点名新成员) — the personalization the Space version
    deliberately omitted. This also makes the per-member post non-repetitive.
+5. **Platform master switch, default OFF (dark launch).** A single
+   `system_setting onboarding.group_welcome_enabled` (bool) gates the whole
+   feature: the event path enqueues nothing and the worker posts nothing while it
+   is off. It is **enablement only** — it does NOT introduce any platform-global
+   *content* fallback (decision #2 stands; a group's body always comes from its own
+   row). Flipping it back to off is an instant kill switch (no per-group rows
+   touched, converges across replicas within the settings snapshot TTL). This is
+   the outer AND over each group's own `enabled`.
+6. **Coalesce a burst of joins into ONE post.** A batch invite arrives as a single
+   `GroupMemberAdd` event → many `(group_no, uid)` rows at once; delivering one
+   public post per joiner would spam the channel. Instead the worker claims a
+   group's due rows as a batch and posts **one** message naming everyone
+   (`{member}` → the joined name list; a large batch collapses the tail to
+   `… 等 N 人`). At-most-once per `(group_no, uid)` is preserved (each row still
+   transitions independently); a burst larger than the per-post cap spills its tail
+   into later worker wakes (a few posts, not N).
 
-Ships with per-group configs defaulting to `enabled=false` (no behaviour change
-on deploy until a group admin opts in).
+Ships with the master switch **off** and per-group configs defaulting to
+`enabled=false` — double-inert on deploy: nothing happens until an operator turns
+on the platform switch AND a group admin opts that group in.
 
 **Architecture: mirror, don't refactor.** The per-Space welcome delivery engine
 (`modules/notify/space_welcome*.go` + `octo_space_welcome_delivery` ledger) is
@@ -222,6 +239,22 @@ refactor — explicitly out of scope here.)
     backoff, `unknown`/`failed` terminal handling — same contract as Space.
   - **Enqueue idempotency:** `INSERT … ON DUPLICATE KEY UPDATE id=id` on
     `(group_no, uid)`.
+  - **Platform master switch (tags: notify, observability).** A single bool
+    `system_setting onboarding.group_welcome_enabled` (registered in the schema,
+    read via `SystemSettings.GroupWelcomeEnabled()`, default **false**). Checked at
+    the event enqueue, the reconciler, and the worker (post-sweep) — off ⇒ no
+    enqueue, no post; the cross-group sweep still runs so in-flight rows reach a
+    terminal state. Enablement only, **no content fallback** (a group's body is
+    always its own row). Hot-reloaded with the snapshot; flip-off is an instant,
+    reversible kill that touches no per-group rows.
+  - **Burst coalescing (tags: notify, wire-contract).** A freshly-enqueued row is
+    held back from the worker until `now + coalesceWindow` (via `next_retry_at`) so
+    co-arriving joins collect; the worker `claimBatch`es a group's due rows (≤
+    `groupWelcomeCoalesceMax`) and `dispatchBatch` posts **one** message whose
+    `{member}` renders to the joined name list. One coalesced post per group per
+    wake also naturally rate-limits a single group's welcomes; a burst beyond the
+    cap spills into later wakes. Each row keeps its own CAS/at-most-once transition
+    and shares the one message's `message_id`.
 
 - **Group-channel send contract (tags: notify, wire-contract).**
   - The send builds a `config.MsgSendReq` to `channel_id=group_no`,
@@ -278,8 +311,11 @@ refactor — explicitly out of scope here.)
   otherwise untouched.
 - **Multiple welcome messages per group / audience targeting / scheduling** — one
   config per group, single plain-text body, no `welcome_id`.
-- **Global / platform-wide group welcome fallback** — deliberately none (per the
-  locked decision); no `system_setting` keys for group welcome.
+- **Global / platform-wide group welcome *content* fallback** — deliberately none
+  (per the locked decision): a group's body always comes from its own row. The
+  **one** `system_setting` key added (`onboarding.group_welcome_enabled`) is an
+  enablement master switch (decision #5), NOT a content fallback — it never
+  supplies a body, target, or default for any group.
 - **Delivery reliability semantics** — state machine, at-most-once, sweep,
   backoff, CAS, lease, `SELECT … FOR UPDATE SKIP LOCKED`, no leader election —
   copied unchanged from the Space engine, not re-designed.
@@ -316,6 +352,15 @@ refactor — explicitly out of scope here.)
 - **Isolation / eligibility (regression).** System bots/robots as joiners get no
   welcome; a disabled or absent config → no post; one group's backlog never posts
   into another group; fail-closed on any anomaly.
+- **Platform master switch.** With `onboarding.group_welcome_enabled=false` (the
+  default), an otherwise-deliverable enabled group produces no enqueue and no post;
+  turning it on lets delivery proceed; turning it back off stops new posts (a
+  regression test asserts both directions). The switch adds no content fallback.
+- **Burst coalescing.** N members joining a group at once are delivered as **one**
+  public post naming all of them (`{member}` → joined list; overflow → `… 等 N 人`),
+  not N posts; every joiner in the batch is marked SENT (at-most-once each). A
+  group whose burst exceeds the per-post cap posts one coalesced batch per wake and
+  spills the remainder to later wakes without starving other groups.
 - **Multi-group + fairness.** Two enabled groups each welcome their own first-join
   members independently; disabling group A does not affect B; the reconciler
   catches up all enabled groups within a cycle under a global cap; a group kept

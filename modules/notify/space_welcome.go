@@ -177,7 +177,10 @@ func (s *spaceWelcomeService) enabledEffectiveConfigs(ctx context.Context) ([]co
 	out := make([]common.SpaceWelcomeConfig, 0, len(rows)+1)
 	for _, r := range rows {
 		out = append(out, common.SpaceWelcomeConfig{
-			Enabled:       true,
+			// Read r.Enabled rather than hardcoding true: ListEnabled filters
+			// enabled=1 so this is always true today, but reading the row keeps the
+			// code self-documenting and resilient if that WHERE clause ever changes.
+			Enabled:       r.Enabled,
 			SpaceID:       r.SpaceID,
 			ActiveFromRaw: r.ActiveFromRaw,
 			Message:       r.Message,

@@ -28,7 +28,7 @@ func httperrL(c *wkhttp.Context, code codes.Code) {
 // guard. The c.ResponseError(common.ErrData.Error(), ...) zap LOG calls are not
 // responses and are intentionally allowed (they match neither banned token).
 func TestGroupNoLegacyResponseError(t *testing.T) {
-	files := []string{"api.go", "api_manager.go", "invite.go"}
+	files := []string{"api.go", "api_manager.go", "invite.go", "api_welcome.go"}
 	banned := []string{".ResponseError(", ".ResponseErrorf(", ".ResponseErrorWithStatus(", "c.Response(\""}
 	for _, f := range files {
 		t.Run(f, func(t *testing.T) {

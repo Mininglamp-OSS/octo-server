@@ -90,7 +90,7 @@ func (s *Space) getWelcome(c *wkhttp.Context) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), welcomeConfigDBTimeout)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), welcomeConfigDBTimeout)
 	defer cancel()
 	row, found, err := s.welcomeStore.Get(ctx, spaceId)
 	if err != nil {
@@ -122,7 +122,7 @@ func (s *Space) putWelcome(c *wkhttp.Context) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), welcomeConfigDBTimeout)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), welcomeConfigDBTimeout)
 	defer cancel()
 
 	// Read-merge-write under a row lock so two admins PUTting the same Space
@@ -205,7 +205,7 @@ func (s *Space) deleteWelcome(c *wkhttp.Context) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), welcomeConfigDBTimeout)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), welcomeConfigDBTimeout)
 	defer cancel()
 	deleted, err := s.welcomeStore.Delete(ctx, spaceId)
 	if err != nil {
