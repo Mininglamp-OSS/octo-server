@@ -734,10 +734,13 @@ other = "webhook 不存在。"
 other = "子区不存在或不可用。"
 
 ["err.server.incomingwebhook.mgmt_quota_exceeded"]
-other = "每个群最多 {{.max}} 个 webhook。"
+other = "每个群或子区最多 {{.max}} 个 webhook。"
 
 ["err.server.incomingwebhook.mgmt_creator_quota_exceeded"]
-other = "你在该群最多可创建 {{.max}} 个 webhook。"
+other = "你在该群或子区最多可创建 {{.max}} 个 webhook。"
+
+["err.server.incomingwebhook.mgmt_total_quota_exceeded"]
+other = "该群（含所有子区）的 webhook 总数已达上限 {{.max}} 个。"
 
 ["err.server.incomingwebhook.mgmt_creator_left"]
 other = "该 webhook 的创建者已退出群聊，暂时无法启用；待创建者重新入群后可再启用，或删除后由群内成员重新创建。"

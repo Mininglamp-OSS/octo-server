@@ -14,12 +14,31 @@ import (
 	"github.com/gocraft/dbr/v2"
 )
 
-// ErrQuotaExceeded 创建时群级配额已满，由 insertWithQuota 在事务内原子判定。
-var ErrQuotaExceeded = errors.New("incomingwebhook: per-group quota exceeded")
+// ErrQuotaExceeded 创建时【投递作用域】配额已满，由 insertWithQuota 在事务内原子判定。
+// 作用域 = (group_no, thread_short_id)：群本体（thread_short_id='')与每个子区各有一份
+// 独立配额、互不共享名额（子区多的群 / octo-loop 不再被父群总量卡死）。
+var ErrQuotaExceeded = errors.New("incomingwebhook: per-scope quota exceeded")
 
-// ErrCreatorQuotaExceeded 创建者个人配额已满（仅普通成员/bot 受限，管理员豁免），
-// 同样由 insertWithQuota 在事务内原子判定。
+// ErrCreatorQuotaExceeded 创建者在【当前投递作用域】的个人配额已满（仅普通成员/bot
+// 受限，管理员豁免），同样由 insertWithQuota 在事务内原子判定。
 var ErrCreatorQuotaExceeded = errors.New("incomingwebhook: per-creator quota exceeded")
+
+// ErrTotalQuotaExceeded 单群【跨群本体 + 所有子区】的 webhook 聚合总数已达上限
+// （max_total_per_group，仅在 > 0 时启用），同样由 insertWithQuota 在事务内原子判定。
+// 挡住「子区可无限建 → 单群总量失控」，与作用域/个人配额共享同一把父群行锁。
+var ErrTotalQuotaExceeded = errors.New("incomingwebhook: per-group total quota exceeded")
+
+// quotaLimits 描述一次创建要校验的三层上限。三层都在【同一把父群行锁】的串行临界区内
+// 评估，故任意维度都精确、无 check-then-act 竞态（新增维度只是同事务内多一条 COUNT）：
+//   - scope      本投递作用域 (group_no, thread_short_id) 可建上限：群本体传 max_per_group、
+//                子区传 max_per_thread。必须 > 0（调用方已按读侧防御夹紧）。
+//   - perCreator 本作用域下单个 creator_uid 的上限；<= 0 表示不启用（管理员创建路径）。
+//   - total      单群跨所有作用域的聚合总数上限；<= 0 表示不启用（未配置聚合天花板）。
+type quotaLimits struct {
+	scope      int
+	perCreator int
+	total      int
+}
 
 type incomingWebhookDB struct {
 	session *dbr.Session
@@ -34,20 +53,29 @@ func newDB(ctx *config.Context) *incomingWebhookDB {
 //  1. SELECT id FROM `group` ... FOR UPDATE：对父群行加 X 记录锁（group_no 命中
 //     UNIQUE 索引 group_groupNo，锁的是必然存在的单行 record lock）。并发的同 group
 //     创建请求在此串行化，逐个进入配额校验+写入。
-//  2. SELECT count(*) FROM incoming_webhook WHERE group_no=?：父群行锁已串行化，
-//     此处普通读即可；count >= max 返回 ErrQuotaExceeded，事务回滚。
+//  2. SELECT count(*) FROM incoming_webhook WHERE group_no=? AND thread_short_id=?：
+//     配额按【投递作用域】(group_no, thread_short_id) 计数——群本体（thread_short_id='')
+//     与每个子区各有一份独立配额、互不共享（子区多的群 / octo-loop 不再被父群总量卡死）。
+//     父群行锁已把同群并发串行化，此处普通读即可；count >= max 返回 ErrQuotaExceeded，
+//     事务回滚。命中 idx_incoming_webhook_thread(group_no, thread_short_id, status)。
 //  3. 显式回填 CreatedAt：dbr 的 InsertInto.Record 不会从 DB 默认值回读时间，
 //     不写就会导致响应里的 created_at = epoch(0)。
 //
-// 为何锁父群行而非 `SELECT count(*) FROM incoming_webhook ... FOR UPDATE`：后者在
-// 空群首次插入时只命中 0 行 → 纯 gap lock。gap-X 锁互相兼容，并发事务会全部通过
+// 锁粒度【刻意】仍是父群行，比 per-scope 计数更粗（同群跨子区的并发创建也被串行化），
+// 但这是正确性必需、非遗漏：换成对 (group_no, thread_short_id) 范围 `... FOR UPDATE`，
+// 在空作用域首插时只命中 0 行 → 纯 gap lock。gap-X 锁互相兼容，并发事务会全部通过
 // count 检查、各自 INSERT 抢 insert-intention lock 互等 → InnoDB 死锁(1213)，且无
 // 重试，合法并发创建会以不透明的"创建失败"500 收场。锁父群这一必然存在的单行可彻底
-// 串行化而不触发 gap-lock 死锁（PR #31 yujiawei / Jerry-Xin review）。
-// maxPerCreator <= 0 表示不启用个人配额（管理员创建路径）；> 0 时在同一事务内对
-// creator_uid 维度再做一次计数校验，超限返回 ErrCreatorQuotaExceeded。个人配额与
-// 群级配额共享同一把父群行锁，无需额外加锁。
-func (d *incomingWebhookDB) insertWithQuota(m *incomingWebhookModel, max, maxPerCreator int) error {
+// 串行化而不触发 gap-lock 死锁（PR #31 yujiawei / Jerry-Xin review）。incoming_webhook
+// 体量小，父群级串行化成本可忽略；配额口径细到子区、锁口径粗到父群，两者独立。
+// lim.perCreator <= 0 表示不启用个人配额（管理员创建路径）；> 0 时校验【同一作用域下的】
+// creator_uid 计数，超限返回 ErrCreatorQuotaExceeded。作用域计数与该 per-creator 计数跑在
+// 同一 (group_no, thread_short_id, status) 索引区间、仅差 creator_uid 谓词，故【合并为一次
+// 条件聚合查询】(count(*) + count(CASE WHEN creator_uid=? ...)) 拿全，缩短持锁临界区。
+// lim.total > 0 时再多做一次【全群】(group_no，不带 thread 过滤) 的聚合计数校验，超限返回
+// ErrTotalQuotaExceeded——这就是「群聚合天花板」，挡住子区无限建导致的总量膨胀。三层配额
+// 共享同一把父群行锁，无需额外加锁；锁粗（父群）、算细（作用域/个人/全群任意维度）。
+func (d *incomingWebhookDB) insertWithQuota(m *incomingWebhookModel, lim quotaLimits) error {
 	tx, err := d.session.Begin()
 	if err != nil {
 		return fmt.Errorf("incomingwebhook: begin tx: %w", err)
@@ -62,35 +90,48 @@ func (d *incomingWebhookDB) insertWithQuota(m *incomingWebhookModel, max, maxPer
 		return fmt.Errorf("incomingwebhook: lock group for update: %w", err)
 	}
 
-	var count int
-	if _, err = tx.SelectBySql(
-		// 软删除（statusDeleted）的行不占配额：删除即释放名额（#254）。
-		"SELECT count(*) FROM incoming_webhook WHERE group_no=? AND status != ?",
-		m.GroupNo, statusDeleted,
-	).Load(&count); err != nil {
-		return fmt.Errorf("incomingwebhook: count: %w", err)
+	// 作用域计数 + per-creator 计数【合并为一次条件聚合查询】：二者跑在同一个
+	// (group_no, thread_short_id, status) 索引区间上，仅差 creator_uid 谓词，用
+	// COUNT(CASE ...) 一次拿全，缩短父群锁的持锁临界区（普通成员建 webhook 由两查降为
+	// 一查 → 同群并发建的吞吐更好；管理员场景仍是一查，零回归）。COUNT(CASE) 而非
+	// SUM(bool) 是为了返回 BIGINT、避免 SUM 的 DECIMAL 扫进 int 的驱动转换坑。
+	// 软删除（statusDeleted）的行不占配额：删除即释放名额（#254）。【禁用】的 webhook
+	// 刻意仍占配额（含个人配额）——否则成员可用 disable→create→disable→create 循环无限
+	// 囤积可随时启用的 webhook，配额就形同虚设；释放名额只能走删除。个人配额是【创建闸】
+	// 而非持续约束：调低 max_per_creator 不回收已超额成员的存量，只是不允许再建。
+	var scoped struct {
+		Scope   int `db:"scope_cnt"`
+		Creator int `db:"creator_cnt"`
 	}
-	if count >= max {
+	if _, err = tx.SelectBySql(
+		"SELECT count(*) AS scope_cnt, "+
+			"count(CASE WHEN creator_uid = ? THEN 1 END) AS creator_cnt "+
+			"FROM incoming_webhook WHERE group_no=? AND thread_short_id=? AND status != ?",
+		m.CreatorUID, m.GroupNo, m.ThreadShortID, statusDeleted,
+	).Load(&scoped); err != nil {
+		return fmt.Errorf("incomingwebhook: scope count: %w", err)
+	}
+	if scoped.Scope >= lim.scope {
 		return ErrQuotaExceeded
 	}
+	if lim.perCreator > 0 && scoped.Creator >= lim.perCreator {
+		return ErrCreatorQuotaExceeded
+	}
 
-	if maxPerCreator > 0 {
-		var creatorCount int
+	if lim.total > 0 {
+		var totalCount int
 		if _, err = tx.SelectBySql(
-			// 与群级配额同口径：只排除软删除（statusDeleted）。【禁用】的 webhook 刻意
-			// 仍占个人配额——否则成员可用 disable→create→disable→create 循环无限囤积
-			// 可随时启用的 webhook，配额就形同虚设。释放名额只能走删除。这也意味着：
-			//   - 创建者退群被懒级联禁用的 webhook 仍占其个人配额，本人重新入群后可
-			//     自行删除释放；
-			//   - 配额是【创建闸】而非持续约束：调低 max_per_creator 不会回收已超额
-			//     成员的存量，只是不允许再建。
-			"SELECT count(*) FROM incoming_webhook WHERE group_no=? AND creator_uid=? AND status != ?",
-			m.GroupNo, m.CreatorUID, statusDeleted,
-		).Load(&creatorCount); err != nil {
-			return fmt.Errorf("incomingwebhook: creator count: %w", err)
+			// 群级聚合天花板：不带 thread_short_id 过滤，计【整个群】跨群本体+所有子区的
+			// 未删除 webhook 总数。父群行锁已把同群并发串行化，此处普通读即精确——即便另
+			// 一个作用域此刻有空位，只要全群总数触顶就拒绝，正是本天花板的用途。命中
+			// idx_incoming_webhook_thread(group_no, ...) 的 group_no 前缀。
+			"SELECT count(*) FROM incoming_webhook WHERE group_no=? AND status != ?",
+			m.GroupNo, statusDeleted,
+		).Load(&totalCount); err != nil {
+			return fmt.Errorf("incomingwebhook: total count: %w", err)
 		}
-		if creatorCount >= maxPerCreator {
-			return ErrCreatorQuotaExceeded
+		if totalCount >= lim.total {
+			return ErrTotalQuotaExceeded
 		}
 	}
 

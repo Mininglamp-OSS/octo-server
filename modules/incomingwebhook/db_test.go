@@ -92,12 +92,12 @@ func TestSoftDelete_FreesQuota(t *testing.T) {
 
 	// 配额已满：第三个被拒。
 	over := &incomingWebhookModel{WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, Name: "wh", Status: statusEnabled}
-	assert.ErrorIs(t, d.insertWithQuota(over, max, 0), ErrQuotaExceeded)
+	assert.ErrorIs(t, d.insertWithQuota(over, quotaLimits{scope: max}), ErrQuotaExceeded)
 
 	// 软删一个释放配额后可再建一个。
 	assert.NoError(t, d.deleteByWebhookID(id1))
 	again := &incomingWebhookModel{WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, Name: "wh", Status: statusEnabled}
-	assert.NoError(t, d.insertWithQuota(again, max, 0), "soft-delete must free per-group quota")
+	assert.NoError(t, d.insertWithQuota(again, quotaLimits{scope: max}), "soft-delete must free per-group quota")
 }
 
 // TestDisableByGroupNo_SkipsDeleted 验证群解散级联禁用不会"复活"已软删除的 webhook：
@@ -252,27 +252,127 @@ func TestInsertAndQueryAudit(t *testing.T) {
 	assert.Len(t, limited, 1)
 }
 
-// TestThreadWebhookSharesParentGroupQuota 子区 webhook 与群 webhook 共用父群 max_per_group
-// 配额池：insertWithQuota 按 group_no 计数、不按 thread_short_id 细分，避免「每子区独立配额」
-// 让单群 webhook 总量失控（acceptance：共享父群配额）。
-func TestThreadWebhookSharesParentGroupQuota(t *testing.T) {
+// TestThreadWebhookQuotaIsPerScope 群 webhook 与每个子区 webhook 各有【独立】配额：
+// insertWithQuota 按投递作用域 (group_no, thread_short_id) 计数——群本体
+// (thread_short_id='')、子区 A、子区 B 各占一份 max 名额，互不共享（子区多的群 /
+// octo-loop 不再被父群总量卡死，acceptance：每子区独立配额）。
+func TestThreadWebhookQuotaIsPerScope(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	defer testutil.CleanAllTables(ctx)
 	d := newDB(ctx)
 
 	groupNo := "g_" + util.GenerUUID()[:12]
 	const max = 2
-	mustInsertWebhookWithMax(t, d, groupNo, max)                          // 1 个群 webhook
-	mustInsertThreadWebhookWithMax(t, d, groupNo, "100000000000001", max) // 1 个子区 webhook —— 共用池已满 2
+	const threadA = "100000000000001"
+	const threadB = "100000000000002"
 
-	// 第三个（无论群 / 子区）都应被同一父群配额拒绝。
+	// 群本体桶填满 max。
+	mustInsertWebhookWithMax(t, d, groupNo, max)
+	mustInsertWebhookWithMax(t, d, groupNo, max)
+	// 群本体桶已满：再建【群】webhook 被拒。
 	overGroup := &incomingWebhookModel{WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, Name: "wh", Status: statusEnabled}
-	assert.ErrorIs(t, d.insertWithQuota(overGroup, max, 0), ErrQuotaExceeded, "group webhook must hit the shared parent-group quota")
-	overThread := &incomingWebhookModel{
+	assert.ErrorIs(t, d.insertWithQuota(overGroup, quotaLimits{scope: max}), ErrQuotaExceeded, "group-self bucket must enforce its own cap")
+
+	// 群本体桶满【不影响】子区 A：子区 A 有独立配额，可各自建满 max。
+	mustInsertThreadWebhookWithMax(t, d, groupNo, threadA, max)
+	mustInsertThreadWebhookWithMax(t, d, groupNo, threadA, max)
+	// 子区 A 桶已满：再建子区 A webhook 被拒。
+	overThreadA := &incomingWebhookModel{
 		WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, Name: "wh", Status: statusEnabled,
-		ChannelType: int(common.ChannelTypeCommunityTopic.Uint8()), ThreadShortID: "100000000000002",
+		ChannelType: int(common.ChannelTypeCommunityTopic.Uint8()), ThreadShortID: threadA,
 	}
-	assert.ErrorIs(t, d.insertWithQuota(overThread, max, 0), ErrQuotaExceeded, "thread webhook must hit the same shared parent-group quota")
+	assert.ErrorIs(t, d.insertWithQuota(overThreadA, quotaLimits{scope: max}), ErrQuotaExceeded, "thread A bucket must enforce its own cap independently")
+
+	// 群本体 + 子区 A 都已满【不影响】子区 B：另一子区仍有独立名额可建。
+	freshThreadB := &incomingWebhookModel{
+		WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, Name: "wh", Status: statusEnabled,
+		ChannelType: int(common.ChannelTypeCommunityTopic.Uint8()), ThreadShortID: threadB,
+	}
+	assert.NoError(t, d.insertWithQuota(freshThreadB, quotaLimits{scope: max}), "thread B has an independent bucket; other scopes being full must not block it")
+}
+
+// TestCreatorQuotaIsPerScope per-creator 个人配额同样按投递作用域计：同一创建者在群
+// 本体填满个人额度后，在子区作用域内仍有【独立】的个人额度可继续创建。
+func TestCreatorQuotaIsPerScope(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer testutil.CleanAllTables(ctx)
+	d := newDB(ctx)
+
+	groupNo := "g_" + util.GenerUUID()[:12]
+	creator := "u_" + util.GenerUUID()[:12]
+	const groupCap, creatorCap = 100, 1
+	const threadA = "100000000000001"
+	const threadB = "100000000000002"
+
+	// 群本体作用域：该创建者建满个人额度(1)。
+	first := &incomingWebhookModel{WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, CreatorUID: creator, Name: "wh", Status: statusEnabled}
+	assert.NoError(t, d.insertWithQuota(first, quotaLimits{scope: groupCap, perCreator: creatorCap}))
+	// 群本体作用域个人额度已满：同一创建者再建被拒。
+	second := &incomingWebhookModel{WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, CreatorUID: creator, Name: "wh", Status: statusEnabled}
+	assert.ErrorIs(t, d.insertWithQuota(second, quotaLimits{scope: groupCap, perCreator: creatorCap}), ErrCreatorQuotaExceeded, "creator cap is per-scope; the group-self scope is full")
+
+	// 同一创建者在子区 A 作用域有独立个人额度：可建满 creatorCap。
+	inThreadA := &incomingWebhookModel{
+		WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, CreatorUID: creator, Name: "wh", Status: statusEnabled,
+		ChannelType: int(common.ChannelTypeCommunityTopic.Uint8()), ThreadShortID: threadA,
+	}
+	assert.NoError(t, d.insertWithQuota(inThreadA, quotaLimits{scope: groupCap, perCreator: creatorCap}), "creator's per-scope cap in thread A is independent of the group-self scope")
+
+	// 子区 A 的个人额度也【真的】受约束：同一创建者在子区 A 再建被拒——防回归把非空
+	// thread_short_id 误豁免 per-creator 校验（那样本用例前一步已过、这步会漏网）。
+	overThreadA := &incomingWebhookModel{
+		WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, CreatorUID: creator, Name: "wh", Status: statusEnabled,
+		ChannelType: int(common.ChannelTypeCommunityTopic.Uint8()), ThreadShortID: threadA,
+	}
+	assert.ErrorIs(t, d.insertWithQuota(overThreadA, quotaLimits{scope: groupCap, perCreator: creatorCap}), ErrCreatorQuotaExceeded, "per-creator cap must actually apply within a thread scope")
+
+	// 跨子区创建者额度独立：子区 A 满【不影响】同一创建者在子区 B 建。
+	inThreadB := &incomingWebhookModel{
+		WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, CreatorUID: creator, Name: "wh", Status: statusEnabled,
+		ChannelType: int(common.ChannelTypeCommunityTopic.Uint8()), ThreadShortID: threadB,
+	}
+	assert.NoError(t, d.insertWithQuota(inThreadB, quotaLimits{scope: groupCap, perCreator: creatorCap}), "creator's per-scope cap in thread B is independent of thread A")
+}
+
+// TestTotalQuotaCeiling 群级聚合天花板 max_total_per_group（②）：跨群本体 + 所有子区计总数，
+// 即便某作用域仍有空位，只要全群总数触顶即拒绝（ErrTotalQuotaExceeded）；软删除释放名额；
+// total<=0 时不启用。
+func TestTotalQuotaCeiling(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer testutil.CleanAllTables(ctx)
+	d := newDB(ctx)
+
+	groupNo := "g_" + util.GenerUUID()[:12]
+	const total = 3
+	// 作用域上限放大（100），让「聚合天花板」成为唯一约束。
+	lim := quotaLimits{scope: 100, total: total}
+	mkThread := func(shortID string) *incomingWebhookModel {
+		return &incomingWebhookModel{WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, Name: "wh", Status: statusEnabled,
+			ChannelType: int(common.ChannelTypeCommunityTopic.Uint8()), ThreadShortID: shortID}
+	}
+
+	// 群本体 1 + 子区 A 2 = 3，恰好触顶。
+	groupWH := &incomingWebhookModel{WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, Name: "wh", Status: statusEnabled}
+	assert.NoError(t, d.insertWithQuota(groupWH, lim))
+	assert.NoError(t, d.insertWithQuota(mkThread("100000000000001"), lim))
+	assert.NoError(t, d.insertWithQuota(mkThread("100000000000001"), lim))
+
+	// 全群总数=3=total：另一个【全新空作用域】子区 B 虽 scope(100) 有空位，仍被聚合天花板拒。
+	assert.ErrorIs(t, d.insertWithQuota(mkThread("100000000000002"), lim), ErrTotalQuotaExceeded,
+		"aggregate ceiling must block even a fresh empty scope once the group total is reached")
+
+	// 聚合计数排除软删除：删掉群本体那个后全群总数回到 2，天花板下可再建一个（回到 3）。
+	assert.NoError(t, d.deleteByWebhookID(groupWH.WebhookID))
+	assert.NoError(t, d.insertWithQuota(mkThread("100000000000002"), lim),
+		"soft-delete must free an aggregate slot under the ceiling")
+
+	// 再次触顶（总数=3）：又被拒。
+	assert.ErrorIs(t, d.insertWithQuota(mkThread("100000000000003"), lim), ErrTotalQuotaExceeded,
+		"ceiling re-applies once the group total is reached again")
+
+	// total<=0 关闭天花板：同一个此时可建。
+	assert.NoError(t, d.insertWithQuota(mkThread("100000000000003"), quotaLimits{scope: 100, total: 0}),
+		"total<=0 disables the aggregate ceiling")
 }
 
 // TestDisableByGroupNo_CoversThreadWebhook 群解散级联禁用覆盖子区 webhook（同 group_no）：
@@ -311,7 +411,7 @@ func mustInsertThreadWebhookWithMax(t *testing.T, d *incomingWebhookDB, groupNo,
 		ChannelType:   int(common.ChannelTypeCommunityTopic.Uint8()),
 		ThreadShortID: shortID,
 	}
-	assert.NoError(t, d.insertWithQuota(m, max, 0))
+	assert.NoError(t, d.insertWithQuota(m, quotaLimits{scope: max}))
 	return m.WebhookID
 }
 
@@ -329,6 +429,6 @@ func mustInsertWebhookWithMax(t *testing.T, d *incomingWebhookDB, groupNo string
 		Name:      "wh",
 		Status:    statusEnabled,
 	}
-	assert.NoError(t, d.insertWithQuota(m, max, 0))
+	assert.NoError(t, d.insertWithQuota(m, quotaLimits{scope: max}))
 	return m.WebhookID
 }

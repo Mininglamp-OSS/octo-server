@@ -1079,11 +1079,12 @@ func TestCreate_QuotaConcurrent(t *testing.T) {
 	}
 	assert.Equalf(t, cap, ok, "exactly %d concurrent creates should succeed, got %d (codes=%v)", cap, ok, codes)
 
-	// DB 里也应当只有 cap 条有效记录。按 status != statusDeleted(2) 计——与
-	// insertWithQuota 的有效计数同语义；本测试无软删除行，过滤与否结果相同，但保持
-	// 一致可避免将来扩展（先删再并发建）时断言被软删除行误导。
+	// DB 里也应当只有 cap 条有效记录。查询口径必须与生产 insertWithQuota 的作用域计数
+	// 完全对齐：按 (group_no, thread_short_id='') 群本体作用域 + status != statusDeleted(2)。
+	// 本测试全建群 webhook（thread_short_id=''），补上 thread_short_id='' 让本断言不因将来
+	// 扩展（同群下并发建子区 webhook）而误把其它作用域的行计入，从而虚报“配额泄漏”。
 	var rows int
-	_, err := ctx.DB().SelectBySql("SELECT count(*) FROM incoming_webhook WHERE group_no=? AND status != 2", groupNo).Load(&rows)
+	_, err := ctx.DB().SelectBySql("SELECT count(*) FROM incoming_webhook WHERE group_no=? AND thread_short_id='' AND status != 2", groupNo).Load(&rows)
 	assert.NoError(t, err)
 	assert.Equal(t, cap, rows, "DB row count must equal cap; quota leaked under concurrency")
 }

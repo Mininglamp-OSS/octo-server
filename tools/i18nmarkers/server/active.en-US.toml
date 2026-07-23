@@ -418,7 +418,7 @@ other = "You do not have permission to view this."
 other = "The webhook's creator has left the group, so it cannot be enabled. It can be re-enabled after the creator rejoins, or deleted and recreated by someone in the group."
 
 ["err.server.incomingwebhook.mgmt_creator_quota_exceeded"]
-other = "You can create at most {{.max}} webhooks in this group."
+other = "You can create at most {{.max}} webhooks in this group or thread."
 
 ["err.server.incomingwebhook.mgmt_disabled"]
 other = "The incoming webhook feature is currently disabled."
@@ -439,13 +439,16 @@ other = "The operation failed. Please try again later."
 other = "Failed to query webhook information."
 
 ["err.server.incomingwebhook.mgmt_quota_exceeded"]
-other = "Each group allows at most {{.max}} webhooks."
+other = "At most {{.max}} webhooks are allowed in this group or thread."
 
 ["err.server.incomingwebhook.mgmt_request_invalid"]
 other = "Invalid request."
 
 ["err.server.incomingwebhook.mgmt_thread_not_found"]
 other = "The thread does not exist or is not available."
+
+["err.server.incomingwebhook.mgmt_total_quota_exceeded"]
+other = "This group has reached its total of {{.max}} webhooks across the group and all threads."
 
 ["err.server.incomingwebhook.push_delivery_failed"]
 other = "Failed to deliver the webhook message."
