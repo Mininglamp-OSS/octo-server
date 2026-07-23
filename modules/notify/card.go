@@ -8,13 +8,14 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"unicode"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
+	docscommented "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/docs_commented"
+	docsshared "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/docs_shared"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"go.uber.org/zap"
 )
@@ -212,19 +213,11 @@ func (n *Notify) sendSummaryText(uid, spaceID, text string) error {
 	))
 }
 
-// sanitizeLine collapses any control character (newline, CR, tab, …) in a
-// caller-supplied string to a single space and trims the result. The plain-text
-// fallback DM is line-structured, so an embedded "\n" in a caller field (title,
-// excerpt, actor name) could otherwise inject a spoofed attribution/label line.
-// Card rendering has its own defence (escapeMarkdown); this is the text-path
-// equivalent. It is a strict superset of strings.TrimSpace for our inputs.
+// sanitizeLine 委托 pkg/cardtmpl.SanitizeLine —— 与 L2a Template FallbackText
+// 共用单一实现,消除词表漂移(G5, roadmap C)。保留本包 wrapper 避免大范围改
+// 调用点。
 func sanitizeLine(s string) string {
-	return strings.TrimSpace(strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) {
-			return ' '
-		}
-		return r
-	}, s))
+	return cardtmpl.SanitizeLine(s)
 }
 
 // buildSummaryFallbackText composes the plain-text DM used when a card cannot be
@@ -322,6 +315,28 @@ func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error
 			return nil, errNotifyCardInvalid
 		}
 	}
+	// roadmap C:commented/shared 迁到 Registry 后同享 C1 preflight,避免 memberCache/
+	// docsSender/gate 之后才发现 schema 错(空 members 会 200 delivered=[] 掩盖违规)。
+	if card.Kind == DocsCardKindCommented || card.Kind == DocsCardKindShared {
+		var tid cardtmpl.ID
+		if card.Kind == DocsCardKindCommented {
+			tid = docscommented.TemplateID
+		} else {
+			tid = docsshared.TemplateID
+		}
+		if err := preflightDocsDisplaySchema(card, tid); err != nil {
+			if errors.Is(err, errCardTmplUnavailable) {
+				n.Error("docs display card preflight: cardtmpl unavailable (composition bug, 500)",
+					zap.Error(err), zap.String("space_id", req.SpaceID), zap.String("doc_id", card.DocID),
+					zap.String("kind", card.Kind))
+				return nil, err
+			}
+			n.Warn("docs display card rejected at preflight: schema (400)",
+				zap.Error(err), zap.String("space_id", req.SpaceID), zap.String("doc_id", card.DocID),
+				zap.String("kind", card.Kind))
+			return nil, errNotifyCardInvalid
+		}
+	}
 
 	targets := dedupTargets(req.Targets)
 	if req.ActorUID != "" {
@@ -367,6 +382,19 @@ func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error
 			// F7: 唯一入口。Registry 未注入 = composition bug,不再 fallback 到 legacy
 			// (那样会遮蔽 wiring 漏洞);buildErr non-nil 分类走 render_error 降级文本。
 			doc, renderProfile, buildErr = n.buildDocsAccessRequestCardViaRegistry(context.Background(), req.SpaceID, card, lang)
+		} else if card.Kind == DocsCardKindCommented {
+			// roadmap C:docs.commented@0.1.0 走 Registry.Render(v1 展示卡)。
+			// 与 access_requested 同 policy —— preflight 早跑 C1、Registry 未注入
+			// 直接 500 不降级(F7)。字节等价 legacy buildDocsCard 由 body 共享
+			// assembleResourceCardBody 保证。
+			doc, renderProfile, buildErr = n.buildDocsDisplayCardViaRegistry(
+				context.Background(), req.SpaceID, card, lang,
+				docscommented.TemplateID, docscommented.StateShown)
+		} else if card.Kind == DocsCardKindShared {
+			// roadmap C:docs.shared@0.1.0 走 Registry.Render(与 commented 对称)。
+			doc, renderProfile, buildErr = n.buildDocsDisplayCardViaRegistry(
+				context.Background(), req.SpaceID, card, lang,
+				docsshared.TemplateID, docsshared.StateShown)
 		} else {
 			doc, buildErr = n.buildDocsCard(context.Background(), req.SpaceID, card, lang)
 		}
@@ -381,13 +409,15 @@ func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error
 			// - other build errors (render failure / marshal / dependency) →
 			//   degrade to plain-text so the notification still lands.
 			if errors.Is(buildErr, cardtmpl.ErrFieldsInvalid) {
-				n.Warn("docs access-request card rejected: fields did not pass schema (400)",
-					zap.Error(buildErr), zap.String("space_id", req.SpaceID), zap.String("doc_id", card.DocID))
+				n.Warn("docs card rejected: fields did not pass schema (400)",
+					zap.Error(buildErr), zap.String("space_id", req.SpaceID), zap.String("doc_id", card.DocID),
+					zap.String("kind", card.Kind))
 				return nil, errNotifyCardInvalid
 			}
 			if errors.Is(buildErr, errCardTmplUnavailable) {
-				n.Error("docs access-request card: cardtmpl unavailable (composition bug, 500)",
-					zap.Error(buildErr), zap.String("space_id", req.SpaceID), zap.String("doc_id", card.DocID))
+				n.Error("docs card: cardtmpl unavailable (composition bug, 500)",
+					zap.Error(buildErr), zap.String("space_id", req.SpaceID), zap.String("doc_id", card.DocID),
+					zap.String("kind", card.Kind))
 				return nil, buildErr // 不 wrap 为 errNotifyCardInvalid,api.go 兜底走 500
 			}
 			n.Warn("build docs card failed, degrading to text",

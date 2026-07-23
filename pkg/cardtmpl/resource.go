@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
@@ -17,9 +18,14 @@ import (
 
 const (
 	MaxExcerptRunes = 300
-	maxFacts        = 20
-	maxTitleRunes   = 200
-	maxFactRunes    = 500
+	// MaxTitleRunes is the render-layer title cap. Exported so producer mapping
+	// layers (e.g. modules/notify) can pre-truncate display titles to the exact
+	// budget assembleResourceCardBody enforces — a single source of truth for the
+	// title cap (G9), used by both the render guard and the ingress truncation.
+	MaxTitleRunes = 200
+	maxFacts      = 20
+	maxTitleRunes = MaxTitleRunes
+	maxFactRunes  = 500
 )
 
 type Fact struct {
@@ -83,6 +89,34 @@ func BuildSummaryResourceCard(
 	return buildResourceCard(ctx, deepLink, resource)
 }
 
+// BuildSummaryResourceCardBodyWithLang is the fragment-only counterpart of
+// BuildSummaryResourceCard for Registry-backed octo/v1 summary Templates
+// (roadmap C PR-2: summary.completed / summary.failed). Shape mirrors
+// BuildDocsResourceCardBodyWithLang — returns the assembled body + https
+// deep-link and never marshals the AC top level or writes metadata; that is
+// Registry.Render's job. Both this helper and the legacy BuildSummaryResourceCard
+// share assembleResourceCardBody, so migrated cards render byte-identical bodies.
+func BuildSummaryResourceCardBodyWithLang(
+	lang string,
+	webLoginURL string,
+	taskID string,
+	spaceID string,
+	resource ResourceCard,
+) (body []interface{}, deepLink string, err error) {
+	if strings.TrimSpace(taskID) == "" || strings.TrimSpace(spaceID) == "" {
+		return nil, "", errors.New("cardtmpl: task ID and space ID are required")
+	}
+	deepLink, err = summaryDeepLink(webLoginURL, taskID, spaceID)
+	if err != nil {
+		return nil, "", err
+	}
+	body, err = assembleResourceCardBody(lang, deepLink, resource)
+	if err != nil {
+		return nil, "", err
+	}
+	return body, deepLink, nil
+}
+
 // BuildDocsResourceCard renders an octo/v1 ResourceCard for a docs-notify
 // notification (docs-backend automated flows: share/comment/access request).
 // The deep-link points at octo-web's /d/:docId standalone route (mirrors
@@ -115,6 +149,67 @@ func buildResourceCard(
 	deepLink string,
 	resource ResourceCard,
 ) (json.RawMessage, error) {
+	body, err := assembleResourceCardBody(i18n.OutboundLanguage(ctx), deepLink, resource)
+	if err != nil {
+		return nil, err
+	}
+	document := map[string]interface{}{
+		"type":     "AdaptiveCard",
+		"version":  cardmsg.CardVersion,
+		"metadata": buildMetadata(deepLink, resource.Variant, resource.Source),
+		"body":     body,
+	}
+	raw, err := json.Marshal(document)
+	if err != nil {
+		return nil, fmt.Errorf("cardtmpl: marshal resource card: %w", err)
+	}
+	return json.RawMessage(raw), nil
+}
+
+// BuildDocsResourceCardBodyWithLang is the fragment-only counterpart of
+// BuildDocsResourceCard used by Registry-backed octo/v1 display Templates
+// (e.g. pkg/cardtmpl/docs_commented). It returns the assembled body (header +
+// optional excerpt + optional FactSet + in-body ActionSet) and the https
+// deep-link, but does NOT marshal the AC top level or write metadata — that is
+// Registry.Render's job. It shares assembleResourceCardBody with the legacy
+// BuildDocsResourceCard wrapper, so migrated cards render byte-identical bodies.
+//
+// lang is passed explicitly (resolved by the caller from i18n.OutboundLanguage);
+// this helper never touches ctx, matching BuildDocsAccessRequestBodyWithLang.
+func BuildDocsResourceCardBodyWithLang(
+	lang string,
+	webLoginURL string,
+	docID string,
+	spaceID string,
+	resource ResourceCard,
+) (body []interface{}, deepLink string, err error) {
+	if strings.TrimSpace(docID) == "" || strings.TrimSpace(spaceID) == "" {
+		return nil, "", errors.New("cardtmpl: doc ID and space ID are required")
+	}
+	deepLink, err = docsDeepLink(webLoginURL, docID, spaceID)
+	if err != nil {
+		return nil, "", err
+	}
+	body, err = assembleResourceCardBody(lang, deepLink, resource)
+	if err != nil {
+		return nil, "", err
+	}
+	return body, deepLink, nil
+}
+
+// assembleResourceCardBody validates the scenario-independent bounds (title
+// length, fact count/shape, copy-text size, icon-must-be-https, source bounds)
+// and assembles the octo/v1 body: header (optional icon column) + optional
+// excerpt + optional FactSet + a trailing ActionSet (view-details + optional
+// copy). Both buildResourceCard (marshals a full document + metadata) and
+// BuildDocsResourceCardBodyWithLang (fragment-only) call it, so the rendered
+// body is a single source of truth across the legacy and Registry paths.
+//
+// The excerpt is truncated to MaxExcerptRunes here (render-time cap); a card's
+// input schema declares the same maxLength, and the ingress mapping layer
+// truncates to it before preflight, so the three never drift — asserted by the
+// docs_commented / docs_shared TestSchemaCapsMatchRenderCaps (G9).
+func assembleResourceCardBody(lang string, deepLink string, resource ResourceCard) ([]interface{}, error) {
 	if strings.TrimSpace(resource.Title) == "" || utf8.RuneCountInString(resource.Title) > maxTitleRunes {
 		return nil, errors.New("cardtmpl: resource title is invalid")
 	}
@@ -147,7 +242,6 @@ func buildResourceCard(
 		return nil, errors.New("cardtmpl: source label too long")
 	}
 
-	lang := i18n.OutboundLanguage(ctx)
 	labels := labelsForLanguage(lang)
 	titleItems := []interface{}{
 		map[string]interface{}{
@@ -217,17 +311,7 @@ func buildResourceCard(
 	}
 	body = append(body, map[string]interface{}{"type": "ActionSet", "actions": actions})
 
-	document := map[string]interface{}{
-		"type":     "AdaptiveCard",
-		"version":  cardmsg.CardVersion,
-		"metadata": buildMetadata(deepLink, resource.Variant, resource.Source),
-		"body":     body,
-	}
-	raw, err := json.Marshal(document)
-	if err != nil {
-		return nil, fmt.Errorf("cardtmpl: marshal resource card: %w", err)
-	}
-	return json.RawMessage(raw), nil
+	return body, nil
 }
 
 func summaryDeepLink(webLoginURL, taskID, spaceID string) (string, error) {
@@ -294,6 +378,31 @@ func webOrigin(webLoginURL string) (string, error) {
 func requireHTTPS(raw string) error {
 	return AbsoluteHTTPSURL(raw)
 }
+
+// SanitizeLine collapses any control character (newline, CR, tab, …) in a
+// caller-supplied string to a single space and trims the result. Text-path
+// (plain-text DM) fallbacks are line-structured, so an embedded "\n" in a
+// caller field (title, excerpt, actor name) could otherwise inject a spoofed
+// attribution/label line. Card rendering has its own defence (escapeMarkdown);
+// this is the text-path equivalent. It is a strict superset of strings.TrimSpace
+// for our inputs. Shared source of truth for modules/notify and each L2a
+// Template's FallbackText — do NOT re-implement (G5, roadmap C).
+func SanitizeLine(s string) string {
+	return strings.TrimSpace(strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, s))
+}
+
+// TruncateRunes truncates value to at most limit runes, appending an ellipsis
+// when it actually cuts. Exported so producer mapping layers (modules/notify)
+// can pre-truncate display fields to the same schema/render budgets and preserve
+// card delivery, instead of an over-length field flipping to a C1 400 at
+// preflight (see modules/notify.mapDocsCardFieldsToDisplayJSON). Wraps the
+// internal truncateRunes so the render layer and ingress layer share one impl.
+func TruncateRunes(value string, limit int) string { return truncateRunes(value, limit) }
 
 func truncateRunes(value string, limit int) string {
 	runes := []rune(value)

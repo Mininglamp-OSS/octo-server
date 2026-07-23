@@ -1,0 +1,36 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "文档分享通知卡数据契约",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["docId", "title"],
+  "properties": {
+    "docId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "文档服务侧稳定 doc ID（用于 deep-link 拼接 /d/{docId}）"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "文档标题"
+    },
+    "actorName": {
+      "type": "string",
+      "maxLength": 120,
+      "description": "分享者展示名称（可空，空时卡片走匿名兜底文案“有人分享了文档”）"
+    },
+    "excerpt": {
+      "type": "string",
+      "maxLength": 300,
+      "description": "分享附言/摘要。上限对齐 cardtmpl.MaxExcerptRunes（G9 单一真源）"
+    },
+    "updatedAt": {
+      "type": "string",
+      "maxLength": 80,
+      "description": "分享时间的展示字符串（调用方按时区预格式化，服务端不解析）"
+    }
+  }
+}

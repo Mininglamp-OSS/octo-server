@@ -34,6 +34,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	docsaccessrequest "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/docs_access_request"
+	docscommented "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/docs_commented"
+	docsshared "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/docs_shared"
 	octodb "github.com/Mininglamp-OSS/octo-server/pkg/db"
 	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
@@ -712,6 +714,12 @@ func installCardTmplRegistry() {
 	registry.Register(docsaccessrequest.New(), docsaccessrequest.Assets, docsaccessrequest.HandoffRoot)
 	registry.Register(docsaccessrequest.NewV3(), docsaccessrequest.Assets, docsaccessrequest.HandoffRootV3)
 	registry.SetDefault(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3)
+	// roadmap C:纯展示 v1 卡 —— docs.commented / docs.shared 迁入 Registry。
+	// 每张卡自持 handoff embed;register-time sample self-check 与 fail-close 沿用。
+	registry.Register(docscommented.New(), docscommented.Assets, docscommented.HandoffRoot)
+	registry.SetDefault(docscommented.TemplateID, docscommented.TemplateVersion)
+	registry.Register(docsshared.New(), docsshared.Assets, docsshared.HandoffRoot)
+	registry.SetDefault(docsshared.TemplateID, docsshared.TemplateVersion)
 	registry.Freeze()
 	cardtmpl.SetGlobalMetrics(cardtmpl.NewMetrics(prometheus.DefaultRegisterer))
 	cardtmpl.SetDefaultRegistry(registry)
