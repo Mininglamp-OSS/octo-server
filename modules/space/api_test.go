@@ -959,7 +959,7 @@ func TestJoinSpaceApprovalMode_AlreadyMember(t *testing.T) {
 	s.GetRoute().ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "已经是该空间成员")
+	assert.Contains(t, w.Body.String(), "已经是该 Space 成员")
 }
 
 func TestJoinApplies_ListPending(t *testing.T) {
@@ -1145,7 +1145,7 @@ func TestApproveJoinApply_SpaceFull(t *testing.T) {
 	s.GetRoute().ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "空间已满")
+	assert.Contains(t, w.Body.String(), "Space 已满")
 }
 
 func TestJoinSpaceDirectMode_StillWorks(t *testing.T) {
@@ -1664,7 +1664,7 @@ func TestJoinSpaceDirect_AlreadyMemberRefundsInvite(t *testing.T) {
 	s.GetRoute().ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "你已经是该空间成员")
+	assert.Contains(t, w.Body.String(), "你已经是该 Space 成员")
 
 	inv, err := f.db.queryInvitationByCode(inviteCode)
 	assert.NoError(t, err)
@@ -1827,7 +1827,7 @@ func TestApproveJoinApply_SpaceFullRefundsInvite(t *testing.T) {
 	s.GetRoute().ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "空间已满")
+	assert.Contains(t, w.Body.String(), "Space 已满")
 
 	// 邀请码名额应被回滚
 	inv, err := f.db.queryInvitationByCode(inviteCode)

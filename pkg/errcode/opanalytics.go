@@ -24,7 +24,7 @@ var (
 	ErrOpanalyticsNotFound = register(codes.Code{
 		ID:             "err.server.opanalytics.not_found",
 		HTTPStatus:     http.StatusNotFound,
-		DefaultMessage: "The space does not exist.",
+		DefaultMessage: "The Space does not exist.",
 	})
 	ErrOpanalyticsQueryFailed = register(codes.Code{
 		ID:             "err.server.opanalytics.query_failed",

@@ -208,14 +208,14 @@ function renderPreview(d) {
     meta.innerHTML = "";
 
     if (d.invite_type === TYPE_OWNER) {
-        setText("v-title", d.planned_name || "团队空间");
+        setText("v-title", d.planned_name || "Space");
         setText("v-sub", "邀请你创建并成为该空间的所有者");
         var rowDesc = renderInfoRow("空间描述", d.planned_description);
         if (rowDesc) meta.appendChild(rowDesc);
         var rowMax = renderInfoRow("成员上限", d.planned_max_users ? String(d.planned_max_users) : "");
         if (rowMax) meta.appendChild(rowMax);
     } else if (d.invite_type === TYPE_MEMBER) {
-        setText("v-title", d.space_name || "团队空间");
+        setText("v-title", d.space_name || "Space");
         var roleLabel = d.role === ROLE_ADMIN ? "管理员" : "成员";
         setText("v-sub", "邀请你以「" + roleLabel + "」身份加入");
         var rowMembers = renderInfoRow("成员数", typeof d.member_count === "number" ? String(d.member_count) : "");

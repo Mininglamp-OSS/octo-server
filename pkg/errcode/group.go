@@ -37,7 +37,7 @@ var (
 	ErrGroupCategorySpaceMismatch = register(codes.Code{
 		ID:             "err.server.group.category_space_mismatch",
 		HTTPStatus:     http.StatusBadRequest,
-		DefaultMessage: "The group category does not match the space.",
+		DefaultMessage: "The group chat category does not match the Space.",
 	})
 	ErrGroupTargetNotBot = register(codes.Code{
 		ID:             "err.server.group.target_not_bot",
@@ -141,7 +141,7 @@ var (
 	ErrGroupBotNotInSpace = register(codes.Code{
 		ID:             "err.server.group.bot_not_in_space",
 		HTTPStatus:     http.StatusForbidden,
-		DefaultMessage: "This bot does not belong to your space.",
+		DefaultMessage: "This bot does not belong to your Space.",
 	})
 	ErrGroupAuthCodeUserMismatch = register(codes.Code{
 		ID:             "err.server.group.auth_code_user_mismatch",

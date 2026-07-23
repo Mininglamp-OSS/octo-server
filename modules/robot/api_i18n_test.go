@@ -192,7 +192,7 @@ func TestRespondRobotHelpers(t *testing.T) {
 			wantCodeID:      "err.server.robot.channel_send_forbidden",
 			wantSemStatus:   http.StatusForbidden,
 			wantTransStatus: http.StatusBadRequest,
-			wantContains:    "不允许向该频道发送消息",
+			wantContains:    "不允许向该会话发送消息",
 		},
 		{
 			name:            "respondManagerForbidden collapses to shared 403",

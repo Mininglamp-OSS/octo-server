@@ -149,7 +149,7 @@ func TestRespondCategoryHelpers(t *testing.T) {
 			wantCodeID:      "err.server.category.name_too_long",
 			wantSemStatus:   http.StatusBadRequest,
 			wantTransStatus: http.StatusBadRequest,
-			wantContains:    "100",
+			wantContains:    "分组名称不能超过 100 个字符",
 			wantDetails:     map[string]any{"field": "name", "max_length": float64(100)},
 		},
 		{
@@ -158,7 +158,7 @@ func TestRespondCategoryHelpers(t *testing.T) {
 			wantCodeID:      "err.server.category.limit_exceeded",
 			wantSemStatus:   http.StatusConflict,
 			wantTransStatus: http.StatusBadRequest,
-			wantContains:    "20",
+			wantContains:    "每个 Space 最多创建 20 个分组",
 			wantDetails:     map[string]any{"max": float64(20)},
 		},
 		{
@@ -167,7 +167,7 @@ func TestRespondCategoryHelpers(t *testing.T) {
 			wantCodeID:      "err.server.category.space_member_required",
 			wantSemStatus:   http.StatusForbidden,
 			wantTransStatus: http.StatusBadRequest,
-			wantContains:    "你不是该空间成员",
+			wantContains:    "你不是该 Space 成员",
 		},
 		{
 			name:            "ErrCategoryGroupMemberRequired surfaces 403 zh-CN copy",
@@ -183,7 +183,7 @@ func TestRespondCategoryHelpers(t *testing.T) {
 			wantCodeID:      "err.server.category.permission_denied",
 			wantSemStatus:   http.StatusForbidden,
 			wantTransStatus: http.StatusBadRequest,
-			wantContains:    "无权操作此分类",
+			wantContains:    "无权操作此分组",
 		},
 		{
 			name:            "ErrCategoryDefaultImmutable surfaces 403 zh-CN copy",
@@ -191,7 +191,7 @@ func TestRespondCategoryHelpers(t *testing.T) {
 			wantCodeID:      "err.server.category.default_immutable",
 			wantSemStatus:   http.StatusForbidden,
 			wantTransStatus: http.StatusBadRequest,
-			wantContains:    "默认分类不可修改",
+			wantContains:    "默认分组不可修改",
 		},
 		{
 			name:            "ErrCategoryDefaultUndeletable surfaces 403 zh-CN copy",
@@ -199,7 +199,7 @@ func TestRespondCategoryHelpers(t *testing.T) {
 			wantCodeID:      "err.server.category.default_undeletable",
 			wantSemStatus:   http.StatusForbidden,
 			wantTransStatus: http.StatusBadRequest,
-			wantContains:    "默认分类不可删除",
+			wantContains:    "默认分组不可删除",
 		},
 		{
 			name:            "ErrCategoryNotFound surfaces 404 zh-CN copy",
@@ -207,7 +207,7 @@ func TestRespondCategoryHelpers(t *testing.T) {
 			wantCodeID:      "err.server.category.not_found",
 			wantSemStatus:   http.StatusNotFound,
 			wantTransStatus: http.StatusBadRequest,
-			wantContains:    "分类不存在",
+			wantContains:    "分组不存在",
 		},
 		{
 			name:            "ErrCategorySpaceMismatch surfaces 400 zh-CN copy",
@@ -215,7 +215,7 @@ func TestRespondCategoryHelpers(t *testing.T) {
 			wantCodeID:      "err.server.category.space_mismatch",
 			wantSemStatus:   http.StatusBadRequest,
 			wantTransStatus: http.StatusBadRequest,
-			wantContains:    "不在同一空间",
+			wantContains:    "群聊和分组不在同一 Space",
 		},
 		{
 			name:            "ErrCategorySortListMismatch surfaces 400 zh-CN copy",
@@ -223,7 +223,15 @@ func TestRespondCategoryHelpers(t *testing.T) {
 			wantCodeID:      "err.server.category.sort_list_mismatch",
 			wantSemStatus:   http.StatusBadRequest,
 			wantTransStatus: http.StatusBadRequest,
-			wantContains:    "数量不匹配",
+			wantContains:    "分组列表数量不匹配",
+		},
+		{
+			name:            "ErrCategorySortListDuplicate surfaces 400 zh-CN copy",
+			probe:           func(c *wkhttp.Context) { httperrL(c, errcode.ErrCategorySortListDuplicate) },
+			wantCodeID:      "err.server.category.sort_list_duplicate",
+			wantSemStatus:   http.StatusBadRequest,
+			wantTransStatus: http.StatusBadRequest,
+			wantContains:    "分组列表存在重复",
 		},
 		{
 			name:            "ErrCategoryGroupSpaceMissing surfaces 400 zh-CN copy",
@@ -231,7 +239,7 @@ func TestRespondCategoryHelpers(t *testing.T) {
 			wantCodeID:      "err.server.category.group_space_missing",
 			wantSemStatus:   http.StatusBadRequest,
 			wantTransStatus: http.StatusBadRequest,
-			wantContains:    "不属于任何空间",
+			wantContains:    "该群聊不属于任何 Space",
 		},
 		{
 			name:            "ErrCategoryQueryFailed (Internal=true) collapses to shared internal copy",

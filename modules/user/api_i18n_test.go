@@ -409,7 +409,7 @@ func TestRespondUserHelpers(t *testing.T) {
 			wantCodeID:      "err.server.user.pinned_limit_exceeded",
 			wantSemStatus:   http.StatusBadRequest,
 			wantTransStatus: http.StatusBadRequest,
-			wantContains:    "置顶频道数量已达上限",
+			wantContains:    "置顶会话数量已达上限",
 			wantDetails:     map[string]any{"max": float64(7)},
 		},
 		{
@@ -418,7 +418,7 @@ func TestRespondUserHelpers(t *testing.T) {
 			wantCodeID:      "err.server.user.channel_access_denied",
 			wantSemStatus:   http.StatusForbidden,
 			wantTransStatus: http.StatusBadRequest,
-			wantContains:    "无权访问该频道",
+			wantContains:    "无权访问该会话",
 		},
 		{
 			name:            "ErrUserOAuthStateExpired surfaces zh-CN copy",

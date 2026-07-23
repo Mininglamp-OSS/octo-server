@@ -55,7 +55,7 @@ var (
 	ErrSpaceNotMember = register(codes.Code{
 		ID:             "err.server.space.not_member",
 		HTTPStatus:     http.StatusForbidden,
-		DefaultMessage: "You are not a member of this space.",
+		DefaultMessage: "You are not a member of this Space.",
 	})
 	// ErrSpaceCreationDisabled covers the admin-disabled space-creation switch.
 	ErrSpaceCreationDisabled = register(codes.Code{
@@ -120,7 +120,7 @@ var (
 	ErrSpaceAlreadyMember = register(codes.Code{
 		ID:             "err.server.space.already_member",
 		HTTPStatus:     http.StatusConflict,
-		DefaultMessage: "You are already a member of this space.",
+		DefaultMessage: "You are already a member of this Space.",
 	})
 	// ErrSpaceApplyProcessed covers approving / rejecting an application that has
 	// already been handled.
@@ -133,14 +133,14 @@ var (
 	ErrSpaceFull = register(codes.Code{
 		ID:             "err.server.space.full",
 		HTTPStatus:     http.StatusConflict,
-		DefaultMessage: "The space is full.",
+		DefaultMessage: "The Space is full.",
 	})
 	// ErrSpaceImmutable covers mutations rejected because the space is disbanded
 	// or banned (cannot modify / add members / update status).
 	ErrSpaceImmutable = register(codes.Code{
 		ID:             "err.server.space.immutable",
 		HTTPStatus:     http.StatusConflict,
-		DefaultMessage: "The space has been disbanded or banned and cannot be modified.",
+		DefaultMessage: "The Space has been disbanded or banned and cannot be modified.",
 	})
 	// ErrSpaceOwnerConstraint covers owner-specific transfer/leave/demote
 	// constraints (owner must transfer ownership before leaving; cannot remove or
@@ -192,7 +192,7 @@ var (
 	ErrSpaceQueryFailed = register(codes.Code{
 		ID:             "err.server.space.query_failed",
 		HTTPStatus:     http.StatusInternalServerError,
-		DefaultMessage: "Failed to query space data.",
+		DefaultMessage: "Failed to query Space data.",
 		Internal:       true,
 	})
 	// ErrSpaceStoreFailed covers mutation-path failures (create / update / join /
@@ -201,7 +201,7 @@ var (
 	ErrSpaceStoreFailed = register(codes.Code{
 		ID:             "err.server.space.store_failed",
 		HTTPStatus:     http.StatusInternalServerError,
-		DefaultMessage: "Failed to update space data.",
+		DefaultMessage: "Failed to update Space data.",
 		Internal:       true,
 	})
 )

@@ -42,7 +42,7 @@ var (
 	ErrMessagePeerNotInSpace = register(codes.Code{
 		ID:             "err.server.message.peer_not_in_space",
 		HTTPStatus:     http.StatusForbidden,
-		DefaultMessage: "The other party is not in this space.",
+		DefaultMessage: "The other party is not in this Space.",
 	})
 	ErrMessageConversationForbidden = register(codes.Code{
 		ID:             "err.server.message.conversation_forbidden",
@@ -57,7 +57,7 @@ var (
 	ErrMessageChannelAccessDenied = register(codes.Code{
 		ID:             "err.server.message.channel_access_denied",
 		HTTPStatus:     http.StatusForbidden,
-		DefaultMessage: "You do not have permission to operate on this channel.",
+		DefaultMessage: "You do not have permission to operate on this conversation.",
 	})
 	ErrMessageNotGroupMember = register(codes.Code{
 		ID:             "err.server.message.not_group_member",

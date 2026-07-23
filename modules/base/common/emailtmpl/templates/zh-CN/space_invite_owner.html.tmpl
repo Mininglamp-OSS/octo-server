@@ -3,11 +3,11 @@
 <div style="max-width:520px;margin:0 auto;background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:32px;">
   <h2 style="color:#7c3aed;margin:0 0 16px;">Octo Space 邀请</h2>
   <p style="color:#111;font-size:15px;line-height:1.6;">
-    {{if .InviterName}}{{.InviterName}}{{else}}Octo 管理员{{end}} 邀请你创建并成为团队空间 <strong>{{.PlannedName}}</strong> 的所有者。
+    {{if .InviterName}}{{.InviterName}}{{else}}Octo 管理员{{end}} 邀请你创建 Space <strong>{{.PlannedName}}</strong> 并成为其所有者。
   </p>
-  {{if .PlannedDesc}}<p style="color:#555;font-size:14px;line-height:1.6;">空间描述：{{.PlannedDesc}}</p>{{end}}
+  {{if .PlannedDesc}}<p style="color:#555;font-size:14px;line-height:1.6;">Space 描述：{{.PlannedDesc}}</p>{{end}}
   <p style="text-align:center;margin:28px 0;">
-    <a href="{{.AcceptURL}}" style="display:inline-block;background:#7c3aed;color:#fff;text-decoration:none;padding:12px 28px;border-radius:6px;font-weight:600;">接受邀请并创建空间</a>
+    <a href="{{.AcceptURL}}" style="display:inline-block;background:#7c3aed;color:#fff;text-decoration:none;padding:12px 28px;border-radius:6px;font-weight:600;">接受邀请并创建 Space</a>
   </p>
   <p style="color:#888;font-size:12px;line-height:1.6;">
     若按钮无法点击，请复制下方链接到浏览器打开：<br/>

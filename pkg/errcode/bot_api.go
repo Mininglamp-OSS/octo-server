@@ -149,7 +149,7 @@ var (
 	ErrBotAPINotSpaceMember = register(codes.Code{
 		ID:             "err.server.bot_api.not_space_member",
 		HTTPStatus:     http.StatusForbidden,
-		DefaultMessage: "Not a member of this space.",
+		DefaultMessage: "Not a member of this Space.",
 	})
 	// ErrBotAPIAppBotUnsupported covers operations an App Bot may not perform
 	// (group operations, voice operations) — App Bots are DM-scoped.
@@ -163,7 +163,7 @@ var (
 	ErrBotAPIAppBotDMOnly = register(codes.Code{
 		ID:             "err.server.bot_api.app_bot_dm_only",
 		HTTPStatus:     http.StatusForbidden,
-		DefaultMessage: "App bots can only operate on direct message channels.",
+		DefaultMessage: "App bots can only operate in direct messages.",
 	})
 	// ErrBotAPINotFriend covers the user-bot friend gate (the target user has not
 	// added / opted into the bot).
@@ -246,7 +246,7 @@ var (
 	ErrBotAPIOBOChannelNotFound = register(codes.Code{
 		ID:             "err.server.bot_api.obo_channel_not_found",
 		HTTPStatus:     http.StatusNotFound,
-		DefaultMessage: "Channel not found.",
+		DefaultMessage: "The conversation was not found or you do not have access to it.",
 	})
 
 	// ---- conflict (409) ------------------------------------------------------

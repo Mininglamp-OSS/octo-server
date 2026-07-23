@@ -43,7 +43,7 @@ var (
 	ErrQRCodeGroupSpaceForbidden = register(codes.Code{
 		ID:             "err.server.qrcode.group_space_forbidden",
 		HTTPStatus:     http.StatusForbidden,
-		DefaultMessage: "Only members of this space can join the group.",
+		DefaultMessage: "Only members of this Space can join the group chat.",
 	})
 	ErrQRCodeQueryFailed = register(codes.Code{
 		ID:             "err.server.qrcode.query_failed",

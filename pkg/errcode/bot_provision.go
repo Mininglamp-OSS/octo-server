@@ -63,7 +63,7 @@ var (
 	ErrBotProvisionSpaceForbidden = register(codes.Code{
 		ID:             "err.server.bot_provision.space_forbidden",
 		HTTPStatus:     http.StatusForbidden,
-		DefaultMessage: "You are not a member of this space.",
+		DefaultMessage: "You are not a member of this Space.",
 	})
 	// ErrBotProvisionBotForbidden covers the daemon token endpoint when the
 	// caller's api_key uid is not the bot's creator — a clean 403 with no leak of

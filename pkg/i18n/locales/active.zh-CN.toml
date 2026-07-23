@@ -43,7 +43,7 @@ other = "服务器内部错误。"
 other = "内部通知接口不允许发送卡片消息。"
 
 ["err.server.common.space_welcome_config_invalid"]
-other = "空间欢迎语配置无效，请检查目标空间是否存在且未解散、生效时间格式，以及欢迎语文案是否非空且未超长。"
+other = "Space 欢迎语配置无效，请检查目标 Space 是否存在且未解散、生效时间格式，以及欢迎语文案是否非空且未超长。"
 
 ["err.server.notify.card_invalid"]
 other = "卡片通知请求无效。"
@@ -280,7 +280,7 @@ other = "不能添加自己为好友。"
 other = "已经是好友，无需重复申请。"
 
 ["err.server.user.bot_not_in_space"]
-other = "该机器人不在当前空间中，无法添加。"
+other = "该机器人不在当前 Space 中，无法添加。"
 
 ["err.server.user.friend_apply_not_found"]
 other = "好友申请记录不存在。"
@@ -311,13 +311,13 @@ other = "账号状态已变化，请刷新后重试。"
 other = "账号未在注销中。"
 
 ["err.server.user.pinned_already_exists"]
-other = "该频道已置顶。"
+other = "该会话已置顶。"
 
 ["err.server.user.pinned_limit_exceeded"]
-other = "置顶频道数量已达上限。"
+other = "置顶会话数量已达上限。"
 
 ["err.server.user.channel_access_denied"]
-other = "你无权访问该频道。"
+other = "你无权访问该会话。"
 
 ["err.server.user.pinned_sort_invalid"]
 other = "置顶排序参数无效。"
@@ -384,7 +384,7 @@ other = "添加的用户不是好友，请先添加好友。"
 other = "不支持将“文件助手”加入群聊。"
 
 ["err.server.group.category_space_mismatch"]
-other = "群聊分组与空间不匹配。"
+other = "群聊分组与 Space 不匹配。"
 
 ["err.server.group.target_not_bot"]
 other = "目标成员不是机器人。"
@@ -444,7 +444,7 @@ other = "无权限使用此群聊分组。"
 other = "你没有权限邀请该机器人。"
 
 ["err.server.group.bot_not_in_space"]
-other = "该机器人不属于你的空间。"
+other = "该机器人不属于你的 Space。"
 
 ["err.server.group.auth_code_user_mismatch"]
 other = "授权码与当前登录用户不匹配。"
@@ -501,7 +501,7 @@ other = "消息 ID 与消息序号不匹配。"
 other = "你与对方不是好友。"
 
 ["err.server.message.peer_not_in_space"]
-other = "对方不在该空间内。"
+other = "对方不在该 Space 内。"
 
 ["err.server.message.conversation_forbidden"]
 other = "你没有权限操作此会话。"
@@ -510,7 +510,7 @@ other = "你没有权限操作此会话。"
 other = "不能删除与自己的会话。"
 
 ["err.server.message.channel_access_denied"]
-other = "你没有权限操作此频道。"
+other = "你没有权限操作此会话。"
 
 ["err.server.message.not_group_member"]
 other = "你不是该群成员。"
@@ -588,40 +588,40 @@ other = "保存工作台数据失败。"
 other = "请求参数有误。"
 
 ["err.server.category.name_too_long"]
-other = "类别名称不能超过100个字符。"
+other = "分组名称不能超过 100 个字符。"
 
 ["err.server.category.sort_list_mismatch"]
-other = "分类列表数量不匹配。"
+other = "分组列表数量不匹配。"
 
 ["err.server.category.sort_list_duplicate"]
-other = "分类列表存在重复。"
+other = "分组列表存在重复。"
 
 ["err.server.category.group_space_missing"]
-other = "该群组不属于任何空间。"
+other = "该群聊不属于任何 Space。"
 
 ["err.server.category.space_mismatch"]
-other = "群组和分类不在同一空间。"
+other = "群聊和分组不在同一 Space。"
 
 ["err.server.category.space_member_required"]
-other = "你不是该空间成员。"
+other = "你不是该 Space 成员。"
 
 ["err.server.category.group_member_required"]
 other = "你不是该群成员。"
 
 ["err.server.category.permission_denied"]
-other = "无权操作此分类。"
+other = "无权操作此分组。"
 
 ["err.server.category.default_immutable"]
-other = "默认分类不可修改。"
+other = "默认分组不可修改。"
 
 ["err.server.category.default_undeletable"]
-other = "默认分类不可删除。"
+other = "默认分组不可删除。"
 
 ["err.server.category.not_found"]
-other = "分类不存在。"
+other = "分组不存在。"
 
 ["err.server.category.limit_exceeded"]
-other = "每个空间最多创建20个分类。"
+other = "每个 Space 最多创建 20 个分组。"
 
 ["err.server.category.query_failed"]
 other = "查询分类数据失败。"
@@ -775,7 +775,7 @@ other = "用户不存在。"
 other = "群不存在。"
 
 ["err.server.qrcode.group_space_forbidden"]
-other = "该群仅允许本空间成员加入。"
+other = "该群聊仅允许本 Space 成员加入。"
 
 ["err.server.qrcode.query_failed"]
 other = "查询二维码数据失败。"
@@ -824,7 +824,7 @@ other = "仅机器人创建者可执行此操作。"
 other = "只能编辑自己发送的消息。"
 
 ["err.server.robot.channel_send_forbidden"]
-other = "不允许向该频道发送消息。"
+other = "不允许向该会话发送消息。"
 
 ["err.server.robot.not_found"]
 other = "机器人不存在。"
@@ -857,7 +857,7 @@ other = "生成机器人令牌失败。"
 other = "机器人鉴权校验失败。"
 
 ["err.server.robot.group_disbanded"]
-other = "群组已解散，只能查看。"
+other = "群聊已解散，只能查看。"
 
 # ---- err.server.space.* (modules/space: api.go / api_manager.go / api_email_invite*.go) ----
 
@@ -874,13 +874,13 @@ other = "单次处理的成员数量过多。"
 other = "你没有权限执行此操作。"
 
 ["err.server.space.not_member"]
-other = "你不是该空间成员。"
+other = "你不是该 Space 成员。"
 
 ["err.server.space.creation_disabled"]
-other = "管理员已关闭空间创建功能。"
+other = "管理员已关闭 Space 创建功能。"
 
 ["err.server.space.not_found"]
-other = "空间不存在或已解散。"
+other = "Space 不存在或已解散。"
 
 ["err.server.space.apply_not_found"]
 other = "申请记录不存在。"
@@ -898,16 +898,16 @@ other = "邀请码无效或已过期。"
 other = "邀请码已达到使用次数上限。"
 
 ["err.server.space.already_member"]
-other = "你已经是该空间成员。"
+other = "你已经是该 Space 成员。"
 
 ["err.server.space.apply_processed"]
 other = "该申请已被处理。"
 
 ["err.server.space.full"]
-other = "空间已满。"
+other = "Space 已满。"
 
 ["err.server.space.immutable"]
-other = "空间已解散或已封禁，无法修改。"
+other = "Space 已解散或已封禁，无法修改。"
 
 ["err.server.space.owner_constraint"]
 other = "请先转让拥有权后再执行此操作。"
@@ -925,10 +925,10 @@ other = "该邀请已被处理。"
 other = "邮箱与邀请目标不一致。"
 
 ["err.server.space.query_failed"]
-other = "查询空间数据失败。"
+other = "查询 Space 数据失败。"
 
 ["err.server.space.store_failed"]
-other = "更新空间数据失败。"
+other = "更新 Space 数据失败。"
 
 # ---- err.server.search.* (modules/search: api.go) ----
 
@@ -987,7 +987,7 @@ other = "请求参数有误。"
 other = "认证失败。"
 
 ["err.server.bot_provision.space_forbidden"]
-other = "你不是该空间的成员，无法在此创建 Bot。"
+other = "你不是该 Space 的成员，无法在此创建 Bot。"
 
 ["err.server.bot_provision.bot_forbidden"]
 other = "无权访问该 Bot。"
@@ -1041,13 +1041,13 @@ other = "机器人不是该群管理员。"
 other = "群主和管理员不能通过机器人 API 移除。"
 
 ["err.server.bot_api.not_space_member"]
-other = "不是该空间成员。"
+other = "不是该 Space 成员。"
 
 ["err.server.bot_api.app_bot_unsupported"]
 other = "应用机器人不支持该操作。"
 
 ["err.server.bot_api.app_bot_dm_only"]
-other = "应用机器人仅支持私聊频道操作。"
+other = "应用机器人仅支持私聊操作。"
 
 ["err.server.bot_api.not_friend"]
 other = "机器人不是该用户的好友。"
@@ -1065,7 +1065,7 @@ other = "无权代表该用户操作。"
 other = "机器人不可用。"
 
 ["err.server.bot_api.group_not_found"]
-other = "群组不存在。"
+other = "群聊不存在。"
 
 ["err.server.bot_api.message_not_found"]
 other = "消息不存在。"
@@ -1083,7 +1083,7 @@ other = "OBO 授权不存在。"
 other = "OBO 授权范围不存在。"
 
 ["err.server.bot_api.obo_channel_not_found"]
-other = "频道不存在。"
+other = "未找到该会话，或你无权访问。"
 
 ["err.server.bot_api.obo_grant_exists"]
 other = "OBO 授权已存在。"
@@ -1167,10 +1167,10 @@ other = "运行时接入配置未完成。"
 other = "生成运行时接入配置失败。"
 
 ["err.server.botfather.runtime_onboarding_forbidden"]
-other = "你无权为该空间创建运行时接入配置。"
+other = "你无权为该 Space 创建运行时接入配置。"
 
 ["err.server.botfather.runtime_onboarding_space_required"]
-other = "请选择空间。"
+other = "请选择 Space。"
 
 ["err.server.botfather.store_failed"]
 other = "更新数据失败。"
@@ -1230,7 +1230,7 @@ other = "搜索服务内部错误。"
 other = "搜索请求过于频繁，请稍后再试。"
 
 ["err.server.messages_search.not_found"]
-other = "未找到对应频道或资源。"
+other = "未找到相关内容，或当前无法访问。"
 
 ["err.server.messages_search.disabled"]
 other = "当前部署未启用搜索功能。"

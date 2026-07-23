@@ -37,7 +37,7 @@ other = "The token was rotated by another request; please retry."
 other = "Bot is already occupied by another agent."
 
 ["err.server.bot_api.app_bot_dm_only"]
-other = "App bots can only operate on direct message channels."
+other = "App bots can only operate in direct messages."
 
 ["err.server.bot_api.app_bot_unsupported"]
 other = "This operation is not supported for app bots."
@@ -124,10 +124,10 @@ other = "The bot is not an admin of this group."
 other = "The bot is not a member of this group."
 
 ["err.server.bot_api.not_space_member"]
-other = "Not a member of this space."
+other = "Not a member of this Space."
 
 ["err.server.bot_api.obo_channel_not_found"]
-other = "Channel not found."
+other = "The conversation was not found or you do not have access to it."
 
 ["err.server.bot_api.obo_grant_exists"]
 other = "An OBO grant already exists."
@@ -193,7 +193,7 @@ other = "Bot not found."
 other = "Invalid request."
 
 ["err.server.bot_provision.space_forbidden"]
-other = "You are not a member of this space."
+other = "You are not a member of this Space."
 
 ["err.server.botfather.already_friends"]
 other = "You are already friends."
@@ -214,7 +214,7 @@ other = "Bot authentication failed."
 other = "The bot does not exist or you do not have permission."
 
 ["err.server.botfather.bot_not_in_space"]
-other = "The bot does not belong to the current space."
+other = "The bot does not belong to the current Space."
 
 ["err.server.botfather.cannot_apply_own_bot"]
 other = "No need to apply for a bot you own."
@@ -238,7 +238,7 @@ other = "Runtime onboarding is not configured."
 other = "Failed to prepare runtime onboarding."
 
 ["err.server.botfather.runtime_onboarding_forbidden"]
-other = "You cannot create runtime onboarding for this space."
+other = "You cannot create runtime onboarding for this Space."
 
 ["err.server.botfather.runtime_onboarding_space_required"]
 other = "Space is required."
@@ -259,10 +259,10 @@ other = "The default category cannot be deleted."
 other = "You are not a member of this group."
 
 ["err.server.category.group_space_missing"]
-other = "The group does not belong to any space."
+other = "The group chat does not belong to any Space."
 
 ["err.server.category.limit_exceeded"]
-other = "You can create at most 20 categories per space."
+other = "You can create at most 20 categories per Space."
 
 ["err.server.category.name_too_long"]
 other = "The category name cannot exceed 100 characters."
@@ -286,16 +286,16 @@ other = "The category list contains duplicates."
 other = "The category list does not match the existing categories."
 
 ["err.server.category.space_member_required"]
-other = "You are not a member of this space."
+other = "You are not a member of this Space."
 
 ["err.server.category.space_mismatch"]
-other = "The group and the category are not in the same space."
+other = "The group chat and the category are not in the same Space."
 
 ["err.server.category.store_failed"]
 other = "Failed to update category data."
 
 ["err.server.common.space_welcome_config_invalid"]
-other = "Invalid space welcome configuration."
+other = "Invalid Space welcome configuration."
 
 ["err.server.group.already_member"]
 other = "You are already a member of this group."
@@ -307,7 +307,7 @@ other = "The authorization code is invalid or has expired."
 other = "The authorization code does not match the current user."
 
 ["err.server.group.bot_not_in_space"]
-other = "This bot does not belong to your space."
+other = "This bot does not belong to your Space."
 
 ["err.server.group.bot_ownership_denied"]
 other = "You do not have permission to invite this bot."
@@ -328,7 +328,7 @@ other = "You do not have permission to use this group category."
 other = "Group category not found."
 
 ["err.server.group.category_space_mismatch"]
-other = "The group category does not match the space."
+other = "The group chat category does not match the Space."
 
 ["err.server.group.creator_only"]
 other = "Only the group owner can perform this action."
@@ -508,7 +508,7 @@ other = "Invalid card revision request."
 other = "Card messages can only be sent by bots or webhooks."
 
 ["err.server.message.channel_access_denied"]
-other = "You do not have permission to operate on this channel."
+other = "You do not have permission to operate on this conversation."
 
 ["err.server.message.conversation_forbidden"]
 other = "You do not have permission to operate on this conversation."
@@ -541,7 +541,7 @@ other = "You are not a member of this group."
 other = "Failed to dispatch the message command."
 
 ["err.server.message.peer_not_in_space"]
-other = "The other party is not in this space."
+other = "The other party is not in this Space."
 
 ["err.server.message.pinned_forbidden"]
 other = "You do not have permission to pin or unpin messages."
@@ -586,7 +586,7 @@ other = "Search is not enabled on this deployment."
 other = "Internal search error."
 
 ["err.server.messages_search.not_found"]
-other = "Channel or resource not found for search."
+other = "The requested content was not found or is unavailable."
 
 ["err.server.messages_search.rate_limited"]
 other = "Search rate limit exceeded."
@@ -649,7 +649,7 @@ other = "Failed to trigger analytics ETL."
 other = "Only a super admin can access the analytics dashboard."
 
 ["err.server.opanalytics.not_found"]
-other = "The space does not exist."
+other = "The Space does not exist."
 
 ["err.server.opanalytics.query_failed"]
 other = "Failed to query analytics data."
@@ -661,7 +661,7 @@ other = "Invalid analytics request."
 other = "Group not found."
 
 ["err.server.qrcode.group_space_forbidden"]
-other = "Only members of this space can join the group."
+other = "Only members of this Space can join the group chat."
 
 ["err.server.qrcode.not_found"]
 other = "The QR code is invalid or has expired."
@@ -706,7 +706,7 @@ other = "Robot authentication failed."
 other = "Card messages cannot be edited."
 
 ["err.server.robot.channel_send_forbidden"]
-other = "Sending messages to this channel is not allowed."
+other = "Sending messages to this conversation is not allowed."
 
 ["err.server.robot.content_invalid"]
 other = "Invalid message content."
@@ -772,7 +772,7 @@ other = "Invalid search request."
 other = "Failed to query user search data."
 
 ["err.server.space.already_member"]
-other = "You are already a member of this space."
+other = "You are already a member of this Space."
 
 ["err.server.space.apply_not_found"]
 other = "Join application not found."
@@ -802,10 +802,10 @@ other = "This invite has already been processed."
 other = "The field exceeds the maximum allowed length."
 
 ["err.server.space.full"]
-other = "The space is full."
+other = "The Space is full."
 
 ["err.server.space.immutable"]
-other = "The space has been disbanded or banned and cannot be modified."
+other = "The Space has been disbanded or banned and cannot be modified."
 
 ["err.server.space.invite_code_exhausted"]
 other = "The invite code has reached its usage limit."
@@ -823,7 +823,7 @@ other = "The target member does not exist or has been removed."
 other = "Space not found or has been disbanded."
 
 ["err.server.space.not_member"]
-other = "You are not a member of this space."
+other = "You are not a member of this Space."
 
 ["err.server.space.owner_constraint"]
 other = "Transfer ownership before performing this operation."
@@ -832,13 +832,13 @@ other = "Transfer ownership before performing this operation."
 other = "You do not have permission to perform this operation."
 
 ["err.server.space.query_failed"]
-other = "Failed to query space data."
+other = "Failed to query Space data."
 
 ["err.server.space.request_invalid"]
 other = "Invalid request."
 
 ["err.server.space.store_failed"]
-other = "Failed to update space data."
+other = "Failed to update Space data."
 
 ["err.server.statistics.query_failed"]
 other = "Failed to query statistics data."
@@ -967,7 +967,7 @@ other = "Authorization payload is invalid."
 other = "Scanner and authorizer are not the same user."
 
 ["err.server.user.bot_not_in_space"]
-other = "This bot is not in the current space and cannot be added."
+other = "This bot is not in the current Space and cannot be added."
 
 ["err.server.user.cannot_add_self"]
 other = "You cannot add yourself as a friend."
@@ -976,7 +976,7 @@ other = "You cannot add yourself as a friend."
 other = "The super administrator account cannot be deleted."
 
 ["err.server.user.channel_access_denied"]
-other = "You do not have access to this channel."
+other = "You do not have access to this conversation."
 
 ["err.server.user.chat_pwd_update_failed"]
 other = "Failed to update chat password."
@@ -1108,10 +1108,10 @@ other = "Password must be at least 6 characters."
 other = "Only mainland China phone numbers are supported."
 
 ["err.server.user.pinned_already_exists"]
-other = "This channel is already pinned."
+other = "This conversation is already pinned."
 
 ["err.server.user.pinned_limit_exceeded"]
-other = "The pinned channel limit has been reached."
+other = "The pinned conversation limit has been reached."
 
 ["err.server.user.pinned_sort_invalid"]
 other = "Invalid pinned sort request."

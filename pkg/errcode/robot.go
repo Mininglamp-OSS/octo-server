@@ -83,7 +83,7 @@ var (
 	ErrRobotChannelSendForbidden = register(codes.Code{
 		ID:             "err.server.robot.channel_send_forbidden",
 		HTTPStatus:     http.StatusForbidden,
-		DefaultMessage: "Sending messages to this channel is not allowed.",
+		DefaultMessage: "Sending messages to this conversation is not allowed.",
 	})
 
 	// ---- not found (404) -----------------------------------------------------

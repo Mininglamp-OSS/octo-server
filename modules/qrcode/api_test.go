@@ -92,7 +92,7 @@ func TestHandleJoinGroup_CrossSpaceAllowedByDefault(t *testing.T) {
 	// 预检不拦截：返回 200，body 应包含 auth_code（非 Space 成员也走到发 auth_code 的分支）
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.NotContains(t, w.Body.String(), "请先加入该空间后再扫码入群")
-	assert.NotContains(t, w.Body.String(), "该群仅允许本空间成员加入")
+	assert.NotContains(t, w.Body.String(), "该群聊仅允许本 Space 成员加入")
 	assert.Contains(t, w.Body.String(), "auth_code")
 }
 
@@ -132,5 +132,5 @@ func TestHandleJoinGroup_CrossSpaceBlockedWhenAllowExternalOff(t *testing.T) {
 	s.GetRoute().ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "该群仅允许本空间成员加入")
+	assert.Contains(t, w.Body.String(), "该群聊仅允许本 Space 成员加入")
 }

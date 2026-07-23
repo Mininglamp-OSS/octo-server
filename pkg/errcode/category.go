@@ -42,12 +42,12 @@ var (
 	ErrCategoryGroupSpaceMissing = register(codes.Code{
 		ID:             "err.server.category.group_space_missing",
 		HTTPStatus:     http.StatusBadRequest,
-		DefaultMessage: "The group does not belong to any space.",
+		DefaultMessage: "The group chat does not belong to any Space.",
 	})
 	ErrCategorySpaceMismatch = register(codes.Code{
 		ID:             "err.server.category.space_mismatch",
 		HTTPStatus:     http.StatusBadRequest,
-		DefaultMessage: "The group and the category are not in the same space.",
+		DefaultMessage: "The group chat and the category are not in the same Space.",
 	})
 
 	// ---- permission / authorization (403) ------------------------------------
@@ -55,7 +55,7 @@ var (
 	ErrCategorySpaceMemberRequired = register(codes.Code{
 		ID:             "err.server.category.space_member_required",
 		HTTPStatus:     http.StatusForbidden,
-		DefaultMessage: "You are not a member of this space.",
+		DefaultMessage: "You are not a member of this Space.",
 	})
 	ErrCategoryGroupMemberRequired = register(codes.Code{
 		ID:             "err.server.category.group_member_required",
@@ -95,7 +95,7 @@ var (
 	ErrCategoryLimitExceeded = register(codes.Code{
 		ID:             "err.server.category.limit_exceeded",
 		HTTPStatus:     http.StatusConflict,
-		DefaultMessage: "You can create at most 20 categories per space.",
+		DefaultMessage: "You can create at most 20 categories per Space.",
 		SafeDetailKeys: []string{"max"},
 	})
 

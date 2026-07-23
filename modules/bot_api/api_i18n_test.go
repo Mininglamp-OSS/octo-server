@@ -212,7 +212,7 @@ func TestRespondBotAPIHelpers(t *testing.T) {
 			wantCodeID:      "err.server.bot_api.group_not_found",
 			wantSemStatus:   http.StatusNotFound,
 			wantTransStatus: http.StatusBadRequest,
-			wantContains:    "群组不存在",
+			wantContains:    "群聊不存在",
 		},
 		{
 			name:            "ErrBotAPIMessageNotDelivered 409 semantic, wire 400",

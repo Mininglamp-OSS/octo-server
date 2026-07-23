@@ -396,7 +396,7 @@ var (
 	ErrUserBotNotInSpace = register(codes.Code{
 		ID:             "err.server.user.bot_not_in_space",
 		HTTPStatus:     http.StatusForbidden,
-		DefaultMessage: "This bot is not in the current space and cannot be added.",
+		DefaultMessage: "This bot is not in the current Space and cannot be added.",
 	})
 	ErrUserFriendApplyNotFound = register(codes.Code{
 		ID:             "err.server.user.friend_apply_not_found",
@@ -450,12 +450,12 @@ var (
 	ErrUserPinnedAlreadyExists = register(codes.Code{
 		ID:             "err.server.user.pinned_already_exists",
 		HTTPStatus:     http.StatusConflict,
-		DefaultMessage: "This channel is already pinned.",
+		DefaultMessage: "This conversation is already pinned.",
 	})
 	ErrUserPinnedLimitExceeded = register(codes.Code{
 		ID:             "err.server.user.pinned_limit_exceeded",
 		HTTPStatus:     http.StatusBadRequest,
-		DefaultMessage: "The pinned channel limit has been reached.",
+		DefaultMessage: "The pinned conversation limit has been reached.",
 		SafeDetailKeys: []string{"max"},
 	})
 	// ErrUserChannelAccessDenied collapses the validateChannelAccess guard
@@ -465,7 +465,7 @@ var (
 	ErrUserChannelAccessDenied = register(codes.Code{
 		ID:             "err.server.user.channel_access_denied",
 		HTTPStatus:     http.StatusForbidden,
-		DefaultMessage: "You do not have access to this channel.",
+		DefaultMessage: "You do not have access to this conversation.",
 	})
 	ErrUserPinnedSortInvalid = register(codes.Code{
 		ID:             "err.server.user.pinned_sort_invalid",

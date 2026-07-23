@@ -63,7 +63,7 @@ var (
 	ErrBotfatherBotNotInSpace = register(codes.Code{
 		ID:             "err.server.botfather.bot_not_in_space",
 		HTTPStatus:     http.StatusForbidden,
-		DefaultMessage: "The bot does not belong to the current space.",
+		DefaultMessage: "The bot does not belong to the current Space.",
 	})
 	// ErrBotfatherRuntimeOnboardingForbidden covers a session user who cannot
 	// create onboarding material for the requested space (not an active member
@@ -71,7 +71,7 @@ var (
 	ErrBotfatherRuntimeOnboardingForbidden = register(codes.Code{
 		ID:             "err.server.botfather.runtime_onboarding_forbidden",
 		HTTPStatus:     http.StatusForbidden,
-		DefaultMessage: "You cannot create runtime onboarding for this space.",
+		DefaultMessage: "You cannot create runtime onboarding for this Space.",
 	})
 
 	// ---- not found (404) -----------------------------------------------------

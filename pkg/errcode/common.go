@@ -17,7 +17,7 @@ var (
 	ErrSpaceWelcomeConfigInvalid = register(codes.Code{
 		ID:             "err.server.common.space_welcome_config_invalid",
 		HTTPStatus:     http.StatusBadRequest,
-		DefaultMessage: "Invalid space welcome configuration.",
+		DefaultMessage: "Invalid Space welcome configuration.",
 		SafeDetailKeys: []string{"field"},
 	})
 )

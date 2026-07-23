@@ -64,7 +64,7 @@ func TestBotProvisionZhParity(t *testing.T) {
 	}{
 		{"err.server.bot_provision.request_invalid", "请求参数有误。", "Invalid request."},
 		{"err.server.bot_provision.auth_failed", "认证失败。", "Authentication failed."},
-		{"err.server.bot_provision.space_forbidden", "你不是该空间的成员，无法在此创建 Bot。", "You are not a member of this space."},
+		{"err.server.bot_provision.space_forbidden", "你不是该 Space 的成员，无法在此创建 Bot。", "You are not a member of this Space."},
 		{"err.server.bot_provision.bot_forbidden", "无权访问该 Bot。", "Not authorized for this bot."},
 		{"err.server.bot_provision.bot_not_found", "Bot 不存在。", "Bot not found."},
 		// shared codes reused by bot_provision

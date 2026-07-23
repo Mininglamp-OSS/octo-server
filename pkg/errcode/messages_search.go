@@ -50,7 +50,7 @@ var (
 	ErrMessagesSearchNotFound = register(codes.Code{
 		ID:             "err.server.messages_search.not_found",
 		HTTPStatus:     http.StatusNotFound,
-		DefaultMessage: "Channel or resource not found for search.",
+		DefaultMessage: "The requested content was not found or is unavailable.",
 		SafeDetailKeys: []string{"resource"},
 	})
 
