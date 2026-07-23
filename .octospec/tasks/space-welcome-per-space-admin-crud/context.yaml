@@ -1,0 +1,19 @@
+injected:
+  - id: space-isolation
+    source: repo        # load_bearing; per-Space admin authz + delivery isolation (core of this task)
+  - id: error-handling
+    source: repo        # load_bearing; CRUD errors via httperr + errcode i18n envelope
+  - id: rate-limit
+    source: repo        # load_bearing; CRUD group mounts SharedUIDRateLimiter after AuthMiddleware
+  - id: trust-boundary
+    source: repo        # matched via wire-contract tag; body is plain-text type:1 (no markdown render) — no adapter surface, kept for parity awareness
+  - id: testing
+    source: repo        # test setup/DB/migration conventions
+  - id: commit-style
+    source: repo        # Conventional Commits, English
+brief: .octospec/tasks/space-welcome-per-space-admin-crud/brief.md
+decisions:
+  - single config per Space (PUT upsert / DELETE hard-delete row)
+  - admin scope Role >= 1 (admin + owner)
+  - platform-global config kept as superadmin fallback; DELETE reverts to fallback
+  - CRUD mounts SharedUIDRateLimiter

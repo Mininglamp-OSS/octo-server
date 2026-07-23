@@ -55,8 +55,14 @@ const (
 	swClaimLease = 30 * time.Second
 	// swReconcileInterval is the reconciler cadence (compile-time constant).
 	swReconcileInterval = 60 * time.Second
-	// swReconcileCap bounds rows enqueued per reconcile cycle.
+	// swReconcileCap bounds rows enqueued per reconcile cycle across ALL Spaces
+	// (shared global budget for the multi-Space reconciler).
 	swReconcileCap = 500
+	// swReconcilePerSpaceCap bounds rows enqueued for a single Space in one
+	// reconcile cycle so one backlogged Space cannot consume the whole global
+	// budget in a single pass; the rotating cursor + this sub-cap keep the
+	// enabled-Space set fairly served.
+	swReconcilePerSpaceCap = 200
 	// swWorkerWakeCap is the per-wake safety valve: after this many successful
 	// claims in one wake the worker falls through to the idle sleep so a single
 	// goroutine cannot monopolise the shared DB session.

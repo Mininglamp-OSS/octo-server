@@ -83,32 +83,36 @@ func (s *spaceWelcomeStore) claimOne(ctx context.Context, spaceID string, now ti
 	return &row, nil
 }
 
-// sweepClaimed recycles claimed rows whose lease expired back to pending. Safe
-// because the IM call was not yet started; attempts is not decremented (and was
-// not incremented at claim). next_retry_at is set to now so the row is
-// immediately re-claimable.
-func (s *spaceWelcomeStore) sweepClaimed(ctx context.Context, spaceID string, now time.Time) (int64, error) {
+// sweepClaimedAll recycles lease-expired claimed rows across ALL Spaces back to
+// pending. The multi-space worker (task space-welcome-per-space-admin-crud)
+// claims only from currently-enabled Spaces, so a per-enabled-space sweep would
+// never promote stale rows left behind by a Space that was disabled while rows
+// were in-flight. Sweeping every Space is safe (the per-row claim_owner CAS
+// still protects correctness) and index-backed by idx_sweep (status,
+// claim_expire_at). attempts is not touched (it was not incremented at claim).
+func (s *spaceWelcomeStore) sweepClaimedAll(ctx context.Context, now time.Time) (int64, error) {
 	res, err := s.db.UpdateBySql(
 		"UPDATE "+spaceWelcomeTable+" SET status=?, next_retry_at=?, claim_owner=NULL, claim_expire_at=NULL, updated_at=? "+
-			"WHERE space_id=? AND status=? AND claim_expire_at IS NOT NULL AND claim_expire_at<=?",
-		swStatusPending, now, now, spaceID, swStatusClaimed, now,
+			"WHERE status=? AND claim_expire_at IS NOT NULL AND claim_expire_at<=?",
+		swStatusPending, now, now, swStatusClaimed, now,
 	).ExecContext(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("sweep claimed welcome rows: %w", err)
+		return 0, fmt.Errorf("sweep claimed welcome rows (all spaces): %w", err)
 	}
 	return res.RowsAffected()
 }
 
-// sweepDispatching promotes dispatching rows whose lease expired to unknown
-// (we cannot prove whether the IM call happened). Never auto-retried.
-func (s *spaceWelcomeStore) sweepDispatching(ctx context.Context, spaceID string, now time.Time) (int64, error) {
+// sweepDispatchingAll promotes lease-expired dispatching rows across ALL Spaces
+// to unknown (transport-ambiguous; never auto-retried). See sweepClaimedAll for
+// why the sweep is cross-space.
+func (s *spaceWelcomeStore) sweepDispatchingAll(ctx context.Context, now time.Time) (int64, error) {
 	res, err := s.db.UpdateBySql(
 		"UPDATE "+spaceWelcomeTable+" SET status=?, error_class=?, claim_owner=NULL, claim_expire_at=NULL, updated_at=? "+
-			"WHERE space_id=? AND status=? AND claim_expire_at IS NOT NULL AND claim_expire_at<=?",
-		swStatusUnknown, swErrClaimExpired, now, spaceID, swStatusDispatching, now,
+			"WHERE status=? AND claim_expire_at IS NOT NULL AND claim_expire_at<=?",
+		swStatusUnknown, swErrClaimExpired, now, swStatusDispatching, now,
 	).ExecContext(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("sweep dispatching welcome rows: %w", err)
+		return 0, fmt.Errorf("sweep dispatching welcome rows (all spaces): %w", err)
 	}
 	return res.RowsAffected()
 }

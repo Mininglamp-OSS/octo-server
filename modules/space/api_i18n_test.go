@@ -27,6 +27,7 @@ func TestSpaceNoLegacyResponseError(t *testing.T) {
 	files := []string{
 		"api.go",
 		"api_member_search.go",
+		"api_welcome.go",
 		"api_manager.go",
 		"api_email_invite.go",
 		"api_email_invite_public.go",
