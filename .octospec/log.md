@@ -4,6 +4,27 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-23 (cardtmpl-l2a-migration PR-1)
+
+- **Feature** — Roadmap C first slice: `docs.commented@0.1.0` and
+  `docs.shared@0.1.0` (v1 display cards) migrated onto `Registry.Render` via
+  the pilot copy-directory shape. `NotifyReq`/`DocsCardFields` external shape
+  unchanged (plan B); `deliverDocsCardNotification` routes both kinds through
+  Registry with F7 fail-close, matching `access_requested`. Both manifests
+  declare `renderProfile` + `renderProfileCompatibility` (#647).
+- **Milestone** — §2.2-5 L2b hard gate ② is now met: `docs.access-request`
+  (v2) + `docs.commented` (v1) + `docs.shared` (v1) = 3 L2a cards running
+  the full Registry path across both wire profiles.
+- **Base helpers** — `pkg/cardtmpl.SanitizeLine` is the single source of
+  truth (G5, notify + pilot become wrappers).
+  `BuildSummaryResourceCardBodyWithLang` added to scaffold PR-2.
+- **Test** — `card_via_registry_display_baseline_test.go` runs 4 fixtures
+  through legacy `buildDocsCard` vs `buildDocsDisplayCardViaRegistry` and
+  asserts canonical byte-equality after stripping the two injected
+  `metadata.octo` fields. `modules/notify/testmain_test.go` wires the
+  Registry once for the whole test package (mirrors production wiring). See
+  [journal](journal/shared/cardtmpl-l2a-migration.md).
+
 ## 2026-07-22 (incoming-webhook-quota-per-thread)
 
 - **Behavior change** — Incoming Webhook creation quota re-scoped from
