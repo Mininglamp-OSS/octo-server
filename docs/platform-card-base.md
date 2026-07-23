@@ -157,6 +157,18 @@
 
 每张模板在 `manifest.views[].wireProfile` 声明视图使用的 profile（对齐 handoff）；render 前由 `cardmsg.Validate(doc, profile)` 严格校验。
 
+### 3.3 Render Profile（视觉兼容档）
+
+`profile` 只描述消息能力，`render_profile` 描述 Web 应选择哪一代 HostConfig/CSS，二者不得混用：
+
+- manifest 的 `renderProfile` 固定 Forge 验证制品的精确不可变版本，例如 `octo-chat@1.2.0-rc.1`；
+- manifest 的 `renderProfileCompatibility` 是客户端稳定兼容键，例如 `octo-chat/v1`；
+- type-17 信封只发送稳定键：`"render_profile": "octo-chat/v1"`，Web 不需要保存每个 Forge 历史包；
+- 未声明 `renderProfileCompatibility` 的历史卡不写 `render_profile`，永久走 Legacy 渲染；
+- 服务端只接受已注册的稳定键，未知值在发送/写入边界 fail-close。
+
+当前 `docs.access-request@0.3.0` 固定 `octo-chat@1.2.0-rc.1` 并发送 `octo-chat/v1`；冻结的 `0.2.0` 不发送视觉兼容键。
+
 ---
 
 ## 4. L1 单卡契约目录规范
@@ -206,6 +218,13 @@
     // 老版本目录一经发布即冻结不改 (§2.1 L1 变更规则)。
   }
 }
+```
+
+新视觉档模板额外声明稳定兼容键，例如 `docs.access-request@0.3.0`：
+
+```jsonc
+"renderProfile": "octo-chat@1.2.0-rc.1",
+"renderProfileCompatibility": "octo-chat/v1"
 ```
 
 **state↔view 映射契约**:每个 `state` 值在整个 manifest 内**只能出现一次**(单向映射),由 `TemplateMeta.ViewFor(state)` 提供机读查询;Registry 加载 manifest 时校验唯一性,违例 → 注册期 panic。业务代码不允许自行维护 state→view 映射,一律走 `Meta().ViewFor(state)`。
@@ -322,16 +341,17 @@ type Source struct {
 // TemplateMeta 静态元数据,注册期一次性构造完成后不可变;
 // 通过 Template.Meta() 一次拿走,不再逐字段方法调用。
 type TemplateMeta struct {
-    ID             ID
-    Version        string
-    Protocol       string                        // 恒 "octo-card@1.0"
-    Views          map[ViewKey]ViewSpec
-    ActionContract *TemplateActionContract       // nil = 纯展示卡
-    Manifest       json.RawMessage               // 原始 manifest.json,供 /v1/message/card/templates 端点透出
-    InputSchema    *jsonschema.Schema
-    Source         Source                        // metadata.octo.source 默认值,可被 BuildResult.Source 覆盖
-    stateIndex     map[State]ViewKey             // 由 Views 反推;查询走 ViewFor()
-    interactions   map[ViewKey]InteractionReport // 由 reports/*.interaction.json 载入
+    ID                         ID
+    Version                    string
+    Protocol                   string                        // 恒 "octo-card@1.0"
+    RenderProfileCompatibility string                        // type-17 稳定视觉兼容键；空=Legacy
+    Views                      map[ViewKey]ViewSpec
+    ActionContract             *TemplateActionContract       // nil = 纯展示卡
+    Manifest                   json.RawMessage               // 原始 manifest.json,供 /v1/message/card/templates 端点透出
+    InputSchema                *jsonschema.Schema
+    Source                     Source                        // metadata.octo.source 默认值,可被 BuildResult.Source 覆盖
+    stateIndex                 map[State]ViewKey             // 由 Views 反推;查询走 ViewFor()
+    interactions               map[ViewKey]InteractionReport // 由 reports/*.interaction.json 载入
 }
 
 // ViewFor 是 state↔view 的唯一查询入口;业务代码不允许自行维护映射。

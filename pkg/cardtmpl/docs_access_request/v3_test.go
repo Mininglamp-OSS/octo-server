@@ -248,4 +248,50 @@ func TestV3MetaIsPopulatedByRegistry(t *testing.T) {
 	if meta.ID != docsaccessrequest.TemplateID || meta.Version != docsaccessrequest.TemplateVersionV3 {
 		t.Fatalf("Meta() = %+v", meta)
 	}
+	if meta.RenderProfileCompatibility != cardmsg.RenderProfileOctoChatV1 {
+		t.Fatalf("Meta() render profile compatibility = %q", meta.RenderProfileCompatibility)
+	}
+	var manifest struct {
+		RenderProfile string `json:"renderProfile"`
+	}
+	if err := json.Unmarshal(meta.Manifest, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if manifest.RenderProfile != "octo-chat@1.2.0-rc.1" {
+		t.Fatalf("manifest renderProfile = %q", manifest.RenderProfile)
+	}
+}
+
+func TestV3UsesStableRenderProfileWithoutChangingV2(t *testing.T) {
+	r := cardtmpl.NewRegistry()
+	r.Register(docsaccessrequest.New(), docsaccessrequest.Assets, docsaccessrequest.HandoffRoot)
+	r.Register(docsaccessrequest.NewV3(), docsaccessrequest.Assets, docsaccessrequest.HandoffRootV3)
+	r.SetDefault(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3)
+	r.Freeze()
+	env := cardtmpl.BuildEnv{WebLoginURL: "https://web.example.com", Lang: "zh-CN", SpaceID: "space-1"}
+	v3Sample, err := docsaccessrequest.Assets.ReadFile(docsaccessrequest.HandoffRootV3 + "/samples/pending.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v3, err := r.Render(context.Background(), docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3,
+		docsaccessrequest.StatePending, v3Sample, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := v3["render_profile"]; got != cardmsg.RenderProfileOctoChatV1 {
+		t.Errorf("0.3.0 render_profile = %v", got)
+	}
+
+	v2Sample, err := docsaccessrequest.Assets.ReadFile(docsaccessrequest.HandoffRoot + "/samples/pending.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2, err := r.Render(context.Background(), docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersion,
+		docsaccessrequest.StatePending, v2Sample, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := v2["render_profile"]; ok {
+		t.Error("frozen 0.2.0 must remain on the legacy renderer")
+	}
 }

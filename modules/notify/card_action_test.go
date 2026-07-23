@@ -78,11 +78,17 @@ func TestBuildDocsAccessRequestCardProducesValidOctoV2(t *testing.T) {
 
 func TestDeliverDocsAccessRequestHonorsApprovalFlag(t *testing.T) {
 	tests := []struct {
-		name        string
-		flag        string
-		wantProfile string
+		name              string
+		flag              string
+		wantProfile       string
+		wantRenderProfile string
 	}{
-		{name: "enabled sends v2", flag: "true", wantProfile: cardmsg.ProfileV2},
+		{
+			name:              "enabled sends v2",
+			flag:              "true",
+			wantProfile:       cardmsg.ProfileV2,
+			wantRenderProfile: cardmsg.RenderProfileOctoChatV1,
+		},
 		{name: "disabled preserves v1", flag: "false", wantProfile: cardmsg.ProfileV1},
 	}
 	for _, tt := range tests {
@@ -109,6 +115,7 @@ func TestDeliverDocsAccessRequestHonorsApprovalFlag(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, []string{"user-b"}, response.Delivered)
 			assert.Equal(t, tt.wantProfile, capture.last().Profile)
+			assert.Equal(t, tt.wantRenderProfile, capture.last().RenderProfile)
 		})
 	}
 }

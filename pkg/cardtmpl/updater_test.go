@@ -60,7 +60,7 @@ func TestCardUpdaterReplaceViewRendersV3AndPreservesMessageIdentity(t *testing.T
 		req.ChannelID != target.Target.ChannelID || req.ChannelType != target.Target.ChannelType {
 		t.Fatalf("mutation target = %+v, want %+v", req, target)
 	}
-	assertUpdateEnvelope(t, req.ContentEdit, 42, cardmsg.ProfileV1, docsaccessrequest.TemplateVersionV3)
+	assertUpdateEnvelope(t, req.ContentEdit, 42, cardmsg.ProfileV1, cardmsg.RenderProfileOctoChatV1, docsaccessrequest.TemplateVersionV3)
 }
 
 func TestCardUpdaterAppendUsesEffectiveFrameAndValidatesWholeCard(t *testing.T) {
@@ -104,7 +104,7 @@ func TestCardUpdaterAppendUsesEffectiveFrameAndValidatesWholeCard(t *testing.T) 
 	if len(body) != 2 || body[1].(map[string]any)["text"] != "after" {
 		t.Fatalf("appended body = %#v", body)
 	}
-	assertUpdateEnvelope(t, gateway.requests[0].ContentEdit, 5, cardmsg.ProfileV1, "0.3.0")
+	assertUpdateEnvelope(t, gateway.requests[0].ContentEdit, 5, cardmsg.ProfileV1, "", "0.3.0")
 }
 
 func TestCardUpdaterAppendRejectsNonContiguousCardSequence(t *testing.T) {
@@ -191,7 +191,7 @@ func TestCardUpdaterFailsClosedOnInvalidInputsAndDependencies(t *testing.T) {
 	}
 }
 
-func assertUpdateEnvelope(t *testing.T, raw string, seq int64, profile, version string) {
+func assertUpdateEnvelope(t *testing.T, raw string, seq int64, profile, renderProfile, version string) {
 	t.Helper()
 	var envelope map[string]any
 	if err := json.Unmarshal([]byte(raw), &envelope); err != nil {
@@ -199,6 +199,9 @@ func assertUpdateEnvelope(t *testing.T, raw string, seq int64, profile, version 
 	}
 	if envelope["card_seq"] != float64(seq) || envelope["profile"] != profile || envelope["space_id"] != "space-1" {
 		t.Fatalf("envelope = %+v", envelope)
+	}
+	if got, _ := envelope["render_profile"].(string); got != renderProfile {
+		t.Fatalf("render_profile = %q, want %q", got, renderProfile)
 	}
 	card := envelope["card"].(map[string]any)
 	metadata := card["metadata"].(map[string]any)

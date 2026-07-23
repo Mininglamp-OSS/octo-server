@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
@@ -45,9 +46,14 @@ type manifestFile struct {
 	Version         string `json:"version"`
 	ContractVersion string `json:"contractVersion"`
 	Protocol        string `json:"protocol"`
-	Owner           string `json:"owner"`
-	ActionType      string `json:"actionType"`
-	Views           map[ViewKey]struct {
+	// RenderProfile is provenance-only metadata for the exact Forge artifact.
+	// RenderProfileCompatibility is the stable value written to the type-17
+	// envelope and is the only render-profile value retained at runtime.
+	RenderProfile              string `json:"renderProfile"`
+	RenderProfileCompatibility string `json:"renderProfileCompatibility,omitempty"`
+	Owner                      string `json:"owner"`
+	ActionType                 string `json:"actionType"`
+	Views                      map[ViewKey]struct {
 		WireProfile string  `json:"wireProfile"`
 		States      []State `json:"states"`
 	} `json:"views"`
@@ -169,6 +175,13 @@ func (r *Registry) Register(t Template, assets embed.FS, root string) {
 	if protocol != Protocol {
 		panic(fmt.Errorf("cardtmpl: manifest protocol %q != base protocol %q", protocol, Protocol))
 	}
+	renderProfileCompatibility := strings.TrimSpace(mf.RenderProfileCompatibility)
+	if !cardmsg.IsAcceptedRenderProfile(renderProfileCompatibility) {
+		panic(fmt.Errorf("cardtmpl: unsupported render profile compatibility %q", renderProfileCompatibility))
+	}
+	if renderProfileCompatibility != "" && strings.TrimSpace(mf.RenderProfile) == "" {
+		panic(errors.New("cardtmpl: renderProfile is required when renderProfileCompatibility is set"))
+	}
 
 	// ActionContract 派生
 	var contract *TemplateActionContract
@@ -177,16 +190,17 @@ func (r *Registry) Register(t Template, assets embed.FS, root string) {
 	}
 
 	meta := TemplateMeta{
-		ID:             mf.ID,
-		Version:        mf.Version,
-		Protocol:       protocol,
-		Views:          views,
-		ActionContract: contract,
-		Manifest:       manifestBytes(assets, root),
-		InputSchema:    schema,
-		Source:         Source{Label: mf.SourceLabel, IconURL: mf.SourceIconURL},
-		stateIndex:     stateIndex,
-		interactions:   interactions,
+		ID:                         mf.ID,
+		Version:                    mf.Version,
+		Protocol:                   protocol,
+		RenderProfileCompatibility: renderProfileCompatibility,
+		Views:                      views,
+		ActionContract:             contract,
+		Manifest:                   manifestBytes(assets, root),
+		InputSchema:                schema,
+		Source:                     Source{Label: mf.SourceLabel, IconURL: mf.SourceIconURL},
+		stateIndex:                 stateIndex,
+		interactions:               interactions,
 	}
 
 	// 注入 Meta 到 Template

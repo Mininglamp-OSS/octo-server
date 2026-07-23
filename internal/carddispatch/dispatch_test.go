@@ -290,8 +290,9 @@ func TestSendBuildsAuthoritativeEnvelopeAndReturnsTransportResult(t *testing.T) 
 	require.NoError(t, err)
 
 	result, err := sender.Send(context.Background(), validTarget(), Card{
-		Profile:  cardmsg.ProfileV1,
-		Document: validCardDocument(),
+		Profile:       cardmsg.ProfileV1,
+		RenderProfile: cardmsg.RenderProfileOctoChatV1,
+		Document:      validCardDocument(),
 	})
 	require.NoError(t, err)
 	assert.Equal(t, &Result{MessageID: 42, MessageSeq: 7, ClientMsgNo: "client-42"}, result)
@@ -313,6 +314,7 @@ func TestSendBuildsAuthoritativeEnvelopeAndReturnsTransportResult(t *testing.T) 
 	assert.Equal(t, float64(cardmsg.InteractiveCard.Int()), payload["type"])
 	assert.Equal(t, cardmsg.CardVersion, payload["card_version"])
 	assert.Equal(t, cardmsg.ProfileV1, payload["profile"])
+	assert.Equal(t, cardmsg.RenderProfileOctoChatV1, payload["render_profile"])
 	assert.Equal(t, "space-a", payload["space_id"])
 	assert.Equal(t, "hello", payload["plain"])
 	assert.NotContains(t, payload, "from_uid")
@@ -450,6 +452,7 @@ func TestSendRejectsMalformedRequestsAndDocuments(t *testing.T) {
 		{name: "nil context", target: validTarget(), card: Card{Profile: cardmsg.ProfileV1, Document: validCardDocument()}, want: CategoryInvalidRequest},
 		{name: "unsupported target", ctx: context.Background(), target: Target{SpaceID: "space-a", ChannelID: "x", ChannelType: 255}, card: Card{Profile: cardmsg.ProfileV1, Document: validCardDocument()}, want: CategoryInvalidRequest},
 		{name: "missing document", ctx: context.Background(), target: validTarget(), card: Card{Profile: cardmsg.ProfileV1}, want: CategoryInvalidRequest},
+		{name: "unsupported render profile", ctx: context.Background(), target: validTarget(), card: Card{Profile: cardmsg.ProfileV1, RenderProfile: "octo-chat/v2", Document: validCardDocument()}, want: CategoryInvalidRequest},
 		{name: "malformed json", ctx: context.Background(), target: validTarget(), card: Card{Profile: cardmsg.ProfileV1, Document: json.RawMessage(`{"type":`)}, want: CategoryCardInvalid},
 		{name: "empty object", ctx: context.Background(), target: validTarget(), card: Card{Profile: cardmsg.ProfileV1, Document: json.RawMessage(`{}`)}, want: CategoryCardInvalid},
 	}

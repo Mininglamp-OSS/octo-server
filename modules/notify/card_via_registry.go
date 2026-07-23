@@ -106,17 +106,17 @@ func preflightDocsAccessRequestSchema(card *DocsCardFields) error {
 // 同分类,让 wiring bug 在 caller 那里映射到 500 不降级。
 func (n *Notify) buildDocsAccessRequestCardViaRegistry(
 	ctx context.Context, spaceID string, card *DocsCardFields, lang string,
-) (json.RawMessage, error) {
+) (json.RawMessage, string, error) {
 	registry := cardtmpl.DefaultRegistry()
 	if registry == nil {
 		n.Error("cardtmpl DefaultRegistry unwired — composition bug",
 			zap.String("space_id", spaceID), zap.String("doc_id", card.DocID))
-		return nil, fmt.Errorf("%w: default registry not wired", errCardTmplUnavailable)
+		return nil, "", fmt.Errorf("%w: default registry not wired", errCardTmplUnavailable)
 	}
 
 	fields, err := mapDocsCardFieldsToJSON(card, lang)
 	if err != nil {
-		return nil, fmt.Errorf("notify: map DocsCardFields to schema JSON: %w", err)
+		return nil, "", fmt.Errorf("notify: map DocsCardFields to schema JSON: %w", err)
 	}
 
 	env := cardtmpl.BuildEnv{
@@ -124,13 +124,13 @@ func (n *Notify) buildDocsAccessRequestCardViaRegistry(
 		Lang:        lang,
 		SpaceID:     spaceID,
 	}
-	cardDoc, _, err := registry.RenderCard(ctx,
+	cardDoc, _, renderProfile, err := registry.RenderCardWithProfiles(ctx,
 		docsaccessrequest.TemplateID, "",
 		docsaccessrequest.StatePending, fields, env)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return cardDoc, nil
+	return cardDoc, renderProfile, nil
 }
 
 // mapDocsCardFieldsToJSON 把扁平 DocsCardFields 映射成 pilot data.schema.json 期望的

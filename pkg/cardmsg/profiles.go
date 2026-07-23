@@ -1,5 +1,17 @@
 package cardmsg
 
+// RenderProfileOctoChatV1 is the stable runtime compatibility key for the
+// first Forge-owned host configuration generation. Exact package versions stay
+// in template manifests; message envelopes carry this stable key so clients do
+// not need to retain every artifact version.
+const RenderProfileOctoChatV1 = "octo-chat/v1"
+
+// IsAcceptedRenderProfile validates an explicit runtime visual profile. An
+// empty value means the permanent legacy renderer and is intentionally valid.
+func IsAcceptedRenderProfile(value string) bool {
+	return value == "" || value == RenderProfileOctoChatV1
+}
+
 // 卡片 profile 能力档位的**单一权威**（card-message-interaction D2 / D12）。
 //
 // 校验器 interactiveByProfile（validate.go：判定某 profile 是否放行 Action.Submit /

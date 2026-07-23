@@ -53,13 +53,17 @@ type TemplateMeta struct {
 	ID       ID
 	Version  string
 	Protocol string
+	// RenderProfileCompatibility is the stable type-17 envelope value consumed
+	// by clients; empty permanently selects the legacy renderer. The exact Forge
+	// artifact remains provenance-only data in Manifest.
+	RenderProfileCompatibility string
 	// Views 承载 manifest 里所有已声明的视图 (含未激活的占位视图)。
 	Views map[ViewKey]ViewSpec
 	// ActionContract 非 nil 时,本卡的所有 Action.Submit.data 必须包含
 	// {owner:Owner, action_type:ActionType}。校验时机:**注册期、且仅对有 sample 的
-	// v2 view**(selfCheckSamples→assertActionContract,只遍历 card.actions 顶层)。
+	// v2 view**(selfCheckSamples→assertActionContract,遍历顶层与内联 ActionSet)。
 	// renderCore 运行期不再重复断言(pilot 由 TestActionContract_ThreeWayConsistency
-	// 覆盖);运行期强断言 + 内联 ActionSet 遍历是 roadmap 的基座硬化项 (#633 P2-3)。
+	// 覆盖)。
 	ActionContract *TemplateActionContract
 	// Manifest 保留原始 manifest.json bytes,供 /v1/message/card/templates 端点透出。
 	Manifest json.RawMessage
@@ -167,11 +171,12 @@ type Template interface {
 // Validate、内部不可变,故共享指针安全,不深拷贝。
 func (m TemplateMeta) Clone() TemplateMeta {
 	out := TemplateMeta{
-		ID:          m.ID,
-		Version:     m.Version,
-		Protocol:    m.Protocol,
-		Source:      m.Source,
-		InputSchema: m.InputSchema,
+		ID:                         m.ID,
+		Version:                    m.Version,
+		Protocol:                   m.Protocol,
+		RenderProfileCompatibility: m.RenderProfileCompatibility,
+		Source:                     m.Source,
+		InputSchema:                m.InputSchema,
 	}
 	if m.Manifest != nil {
 		out.Manifest = append(json.RawMessage(nil), m.Manifest...)
