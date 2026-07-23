@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 2,
+  "id": "docs.shared",
+  "name": "文档分享通知",
+  "version": "0.1.0",
+  "contractVersion": "1.0.0",
+  "protocol": "octo-card@1.0",
+  "adaptiveCardVersion": "1.5",
+  "renderProfile": "octo-chat@1.2.0-rc.1",
+  "renderProfileCompatibility": "octo-chat/v1",
+  "defaultLocale": "zh-CN",
+  "sourceLabel": "文档",
+  "dataSchema": "contract/data.schema.json",
+  "views": {
+    "default": {
+      "wireProfile": "octo/v1",
+      "states": ["shown"],
+      "samples": ["samples/shown.json"]
+    }
+  }
+}

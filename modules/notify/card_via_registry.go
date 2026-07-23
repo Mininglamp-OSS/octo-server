@@ -133,6 +133,84 @@ func (n *Notify) buildDocsAccessRequestCardViaRegistry(
 	return cardDoc, renderProfile, nil
 }
 
+// mapDocsCardFieldsToDisplayJSON 把扁平 DocsCardFields 映射成 docs.commented /
+// docs.shared 契约期望的 JSON 形状(与 pilot mapDocsCardFieldsToJSON 同思路,
+// 只是纯展示卡的字段集更小 —— 无 requestId/permission/头像/申请理由)。字节
+// 等价基线依赖此映射与 legacy buildDocsCard 提取自同一 DocsCardFields。
+func mapDocsCardFieldsToDisplayJSON(card *DocsCardFields) (json.RawMessage, error) {
+	if card == nil {
+		return nil, errors.New("mapDocsCardFieldsToDisplayJSON: nil card")
+	}
+	m := map[string]any{
+		"docId":     strings.TrimSpace(card.DocID),
+		"title":     strings.TrimSpace(card.Title),
+		"actorName": strings.TrimSpace(card.ActorName),
+		"excerpt":   strings.TrimSpace(card.Excerpt),
+		"updatedAt": strings.TrimSpace(card.UpdatedAt),
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		return nil, fmt.Errorf("marshal mapped display fields: %w", err)
+	}
+	return json.RawMessage(raw), nil
+}
+
+// buildDocsDisplayCardViaRegistry 通过 Registry.Render 生成 docs.commented /
+// docs.shared 展示卡(v1)。错误分类与 buildDocsAccessRequestCardViaRegistry 对齐:
+//   - Registry 未注入 → errCardTmplUnavailable(caller 翻 500,不降级);
+//   - schema 校验失败 → cardtmpl.ErrFieldsInvalid(caller 翻 400 零投递,C1);
+//   - 其他 render 级错 → non-typed,caller 走 render_error 降级文本。
+func (n *Notify) buildDocsDisplayCardViaRegistry(
+	ctx context.Context, spaceID string, card *DocsCardFields, lang string,
+	templateID cardtmpl.ID, state cardtmpl.State,
+) (json.RawMessage, string, error) {
+	registry := cardtmpl.DefaultRegistry()
+	if registry == nil {
+		return nil, "", fmt.Errorf("%w: default registry not wired", errCardTmplUnavailable)
+	}
+	fields, err := mapDocsCardFieldsToDisplayJSON(card)
+	if err != nil {
+		return nil, "", fmt.Errorf("notify: map DocsCardFields to display schema JSON: %w", err)
+	}
+	env := cardtmpl.BuildEnv{
+		WebLoginURL: n.ctx.GetConfig().External.WebLoginURL,
+		Lang:        lang,
+		SpaceID:     spaceID,
+	}
+	cardDoc, _, renderProfile, err := registry.RenderCardWithProfiles(ctx, templateID, "", state, fields, env)
+	if err != nil {
+		return nil, "", err
+	}
+	return cardDoc, renderProfile, nil
+}
+
+// preflightDocsDisplaySchema 与 preflightDocsAccessRequestSchema 同思路:在
+// memberCache/docsSender/gate 之前独立跑一次 InputSchema 校验(C1 不被绕过)。
+// docs.commented / docs.shared 无用户可控 URL 字段,不需要 avatar https 前置校验。
+func preflightDocsDisplaySchema(card *DocsCardFields, templateID cardtmpl.ID) error {
+	registry := cardtmpl.DefaultRegistry()
+	if registry == nil {
+		return fmt.Errorf("%w: default registry not wired", errCardTmplUnavailable)
+	}
+	tmpl, err := registry.Lookup(templateID, "")
+	if err != nil {
+		return fmt.Errorf("%w: lookup %s: %v", errCardTmplUnavailable, templateID, err)
+	}
+	fields, err := mapDocsCardFieldsToDisplayJSON(card)
+	if err != nil {
+		return fmt.Errorf("%w: map: %v", cardtmpl.ErrFieldsInvalid, err)
+	}
+	var parsed any
+	if err := json.Unmarshal(fields, &parsed); err != nil {
+		return fmt.Errorf("%w: %v", cardtmpl.ErrFieldsInvalid, err)
+	}
+	if err := tmpl.Meta().InputSchema.Validate(parsed); err != nil {
+		cardtmpl.RecordFieldsInvalid(templateID, tmpl.Meta().Version)
+		return fmt.Errorf("%w: %v", cardtmpl.ErrFieldsInvalid, err)
+	}
+	return nil
+}
+
 // mapDocsCardFieldsToJSON 把扁平 DocsCardFields 映射成 pilot data.schema.json 期望的
 // 嵌套 JSON 形状。服务端字典字段(permission/document.sourceName/requestedAtDisplay/
 // messageTimeDisplay)按当前收件人语言从本地化词表补齐;不接受调用方传入。

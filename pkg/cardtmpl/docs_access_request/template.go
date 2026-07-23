@@ -15,7 +15,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"unicode"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 )
@@ -199,13 +198,8 @@ func (t *Template) FallbackText(state cardtmpl.State, fields json.RawMessage, la
 	return b.String(), nil
 }
 
-// sanitizeLine 与 modules/notify.sanitizeLine 语义一致:控制字符 (含 \n \r \t) 替换成
-// 空格,再 TrimSpace。防止调用方在 actor/title 里嵌换行伪造多行 DM。
+// sanitizeLine 委托 pkg/cardtmpl.SanitizeLine —— 与 modules/notify 共用单一
+// 实现,消除词表漂移(G5, roadmap C)。保留本包 wrapper 避免改所有调用点。
 func sanitizeLine(s string) string {
-	return strings.TrimSpace(strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) {
-			return ' '
-		}
-		return r
-	}, s))
+	return cardtmpl.SanitizeLine(s)
 }

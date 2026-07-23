@@ -1,0 +1,18 @@
+injected:
+  - id: error-handling
+    source: repo
+  - id: trust-boundary
+    source: repo
+  - id: space-isolation
+    source: repo
+  - id: testing
+    source: repo
+  - id: commit-style
+    source: repo
+brief: .octospec/tasks/cardtmpl-l2a-migration/brief.md
+notes: |
+  rate-limit (paths modules/**/*.go matched notify/card.go) reviewed but NOT
+  applicable — this migration changes no request-frequency limiting.
+  First increment: docs.commented打样 (pkg/cardtmpl/docs_commented +
+  handoff/docs.commented@0.1.0 + notify branch -> Registry.Render). Then
+  batch docs.shared / summary.completed / summary.failed.
