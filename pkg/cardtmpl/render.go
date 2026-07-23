@@ -155,6 +155,9 @@ func renderCore(
 		"card_version": cardmsg.CardVersion,
 		"profile":      vs.WireProfile,
 	}
+	if meta.RenderProfileCompatibility != "" {
+		payload["render_profile"] = meta.RenderProfileCompatibility
+	}
 
 	// step 8: cardmsg.Validate 一次总校验 (白名单 / 上限 / interaction 门)
 	if err := cardmsg.Validate(payload); err != nil {
@@ -186,6 +189,30 @@ func (r *Registry) RenderCard(
 	}
 	profile, _ = payload["profile"].(string)
 	return b, profile, nil
+}
+
+// RenderCardWithProfiles is the envelope-preserving counterpart used by
+// internal dispatch/update paths that must carry both the wire capability
+// profile and the optional visual compatibility profile.
+func (r *Registry) RenderCardWithProfiles(
+	ctx context.Context,
+	id ID,
+	version string,
+	state State,
+	fields json.RawMessage,
+	env BuildEnv,
+) (cardDoc json.RawMessage, profile, renderProfile string, err error) {
+	payload, err := r.Render(ctx, id, version, state, fields, env)
+	if err != nil {
+		return nil, "", "", err
+	}
+	b, marshalErr := json.Marshal(payload["card"])
+	if marshalErr != nil {
+		return nil, "", "", fmt.Errorf("%w: marshal card: %v", ErrRenderFailed, marshalErr)
+	}
+	profile, _ = payload["profile"].(string)
+	renderProfile, _ = payload["render_profile"].(string)
+	return b, profile, renderProfile, nil
 }
 
 // AbsoluteHTTPSURL 是本包"必须为绝对 https URL"规则的**唯一真源**。它用真正的

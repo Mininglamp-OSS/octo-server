@@ -355,6 +355,7 @@ func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error
 
 	canCard := n.docsSender != nil && cardmsg.Enabled()
 	profile := cardmsg.ProfileV1
+	renderProfile := ""
 	var document json.RawMessage
 	if canCard {
 		var (
@@ -365,7 +366,7 @@ func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error
 			profile = cardmsg.ProfileV2
 			// F7: 唯一入口。Registry 未注入 = composition bug,不再 fallback 到 legacy
 			// (那样会遮蔽 wiring 漏洞);buildErr non-nil 分类走 render_error 降级文本。
-			doc, buildErr = n.buildDocsAccessRequestCardViaRegistry(context.Background(), req.SpaceID, card, lang)
+			doc, renderProfile, buildErr = n.buildDocsAccessRequestCardViaRegistry(context.Background(), req.SpaceID, card, lang)
 		} else {
 			doc, buildErr = n.buildDocsCard(context.Background(), req.SpaceID, card, lang)
 		}
@@ -421,7 +422,7 @@ func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error
 						ChannelID:   uid,
 						ChannelType: common.ChannelTypePerson.Uint8(),
 					},
-					carddispatch.Card{Profile: profile, Document: document},
+					carddispatch.Card{Profile: profile, RenderProfile: renderProfile, Document: document},
 				)
 				if sendErr != nil {
 					reason = string(carddispatch.CategoryOf(sendErr))

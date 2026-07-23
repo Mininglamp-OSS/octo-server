@@ -38,6 +38,12 @@ func Validate(payload map[string]interface{}) error {
 	if ver, _ := payload["card_version"].(string); ver != CardVersion {
 		return fmt.Errorf("%w: card_version=%q", ErrCardProfileUnsupported, ver)
 	}
+	if value, present := payload["render_profile"]; present {
+		renderProfile, ok := value.(string)
+		if !ok || !IsAcceptedRenderProfile(renderProfile) || renderProfile == "" {
+			return fmt.Errorf("%w: render_profile=%q", ErrCardProfileUnsupported, renderProfile)
+		}
+	}
 	card, ok := payload["card"].(map[string]interface{})
 	if !ok || len(card) == 0 {
 		return ErrCardMissing

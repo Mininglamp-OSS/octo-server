@@ -28,7 +28,7 @@ func TestBuildDocsAccessRequestCardViaRegistry_UnwiredFailsExplicitly(t *testing
 	ctx := newTestContext(t, wk)
 	n := newTestNotify(ctx, nil, nil, nil, "tk")
 
-	_, err := n.buildDocsAccessRequestCardViaRegistry(context.Background(), "s1", validAccessRequestDocsCard(), "zh-CN")
+	_, _, err := n.buildDocsAccessRequestCardViaRegistry(context.Background(), "s1", validAccessRequestDocsCard(), "zh-CN")
 	if err == nil {
 		t.Fatalf("want non-nil error when registry unwired")
 	}
@@ -89,9 +89,12 @@ func TestBuildDocsAccessRequestCardViaRegistry_HappyPath(t *testing.T) {
 	n := newTestNotify(ctx, nil, nil, nil, "tk")
 	card := validAccessRequestDocsCard()
 
-	doc, err := n.buildDocsAccessRequestCardViaRegistry(context.Background(), "space-1", card, "zh-CN")
+	doc, renderProfile, err := n.buildDocsAccessRequestCardViaRegistry(context.Background(), "space-1", card, "zh-CN")
 	if err != nil {
 		t.Fatalf("build: %v", err)
+	}
+	if renderProfile != "octo-chat/v1" {
+		t.Fatalf("render profile = %q, want octo-chat/v1", renderProfile)
 	}
 	var ac map[string]any
 	if err := json.Unmarshal(doc, &ac); err != nil {
@@ -103,7 +106,7 @@ func TestBuildDocsAccessRequestCardViaRegistry_HappyPath(t *testing.T) {
 	if id, _ := tpl["id"].(string); id != string(docsaccessrequest.TemplateID) {
 		t.Errorf("template.id: %v", id)
 	}
-	if v, _ := tpl["version"].(string); v != docsaccessrequest.TemplateVersion {
+	if v, _ := tpl["version"].(string); v != docsaccessrequest.TemplateVersionV3 {
 		t.Errorf("template.version: %v", v)
 	}
 	if proto, _ := octo["protocol"].(string); proto != cardtmpl.Protocol {
@@ -133,7 +136,7 @@ func TestBuildDocsAccessRequestCardViaRegistry_FieldsInvalid(t *testing.T) {
 	card := validAccessRequestDocsCard()
 	card.Title = "" // schema violation: document.title minLength=1
 
-	_, err := n.buildDocsAccessRequestCardViaRegistry(context.Background(), "space-1", card, "zh-CN")
+	_, _, err := n.buildDocsAccessRequestCardViaRegistry(context.Background(), "space-1", card, "zh-CN")
 	if err == nil {
 		t.Fatalf("want error, got nil")
 	}
@@ -148,7 +151,8 @@ func freshPilotRegistry(t *testing.T) *cardtmpl.Registry {
 	t.Helper()
 	r := cardtmpl.NewRegistry()
 	r.Register(docsaccessrequest.New(), docsaccessrequest.Assets, docsaccessrequest.HandoffRoot)
-	r.SetDefault(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersion)
+	r.Register(docsaccessrequest.NewV3(), docsaccessrequest.Assets, docsaccessrequest.HandoffRootV3)
+	r.SetDefault(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3)
 	r.Freeze()
 	return r
 }

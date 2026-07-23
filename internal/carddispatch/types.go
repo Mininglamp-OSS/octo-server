@@ -35,8 +35,9 @@ type Target struct {
 }
 
 type Card struct {
-	Profile  string
-	Document json.RawMessage
+	Profile       string
+	RenderProfile string
+	Document      json.RawMessage
 }
 
 type Result struct {

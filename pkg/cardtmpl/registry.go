@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
@@ -45,9 +46,14 @@ type manifestFile struct {
 	Version         string `json:"version"`
 	ContractVersion string `json:"contractVersion"`
 	Protocol        string `json:"protocol"`
-	Owner           string `json:"owner"`
-	ActionType      string `json:"actionType"`
-	Views           map[ViewKey]struct {
+	// RenderProfile is provenance-only metadata for the exact Forge artifact.
+	// RenderProfileCompatibility is the stable value written to the type-17
+	// envelope and is the only render-profile value retained at runtime.
+	RenderProfile              string `json:"renderProfile"`
+	RenderProfileCompatibility string `json:"renderProfileCompatibility,omitempty"`
+	Owner                      string `json:"owner"`
+	ActionType                 string `json:"actionType"`
+	Views                      map[ViewKey]struct {
 		WireProfile string  `json:"wireProfile"`
 		States      []State `json:"states"`
 	} `json:"views"`
@@ -169,6 +175,13 @@ func (r *Registry) Register(t Template, assets embed.FS, root string) {
 	if protocol != Protocol {
 		panic(fmt.Errorf("cardtmpl: manifest protocol %q != base protocol %q", protocol, Protocol))
 	}
+	renderProfileCompatibility := strings.TrimSpace(mf.RenderProfileCompatibility)
+	if !cardmsg.IsAcceptedRenderProfile(renderProfileCompatibility) {
+		panic(fmt.Errorf("cardtmpl: unsupported render profile compatibility %q", renderProfileCompatibility))
+	}
+	if renderProfileCompatibility != "" && strings.TrimSpace(mf.RenderProfile) == "" {
+		panic(errors.New("cardtmpl: renderProfile is required when renderProfileCompatibility is set"))
+	}
 
 	// ActionContract 派生
 	var contract *TemplateActionContract
@@ -177,16 +190,17 @@ func (r *Registry) Register(t Template, assets embed.FS, root string) {
 	}
 
 	meta := TemplateMeta{
-		ID:             mf.ID,
-		Version:        mf.Version,
-		Protocol:       protocol,
-		Views:          views,
-		ActionContract: contract,
-		Manifest:       manifestBytes(assets, root),
-		InputSchema:    schema,
-		Source:         Source{Label: mf.SourceLabel, IconURL: mf.SourceIconURL},
-		stateIndex:     stateIndex,
-		interactions:   interactions,
+		ID:                         mf.ID,
+		Version:                    mf.Version,
+		Protocol:                   protocol,
+		RenderProfileCompatibility: renderProfileCompatibility,
+		Views:                      views,
+		ActionContract:             contract,
+		Manifest:                   manifestBytes(assets, root),
+		InputSchema:                schema,
+		Source:                     Source{Label: mf.SourceLabel, IconURL: mf.SourceIconURL},
+		stateIndex:                 stateIndex,
+		interactions:               interactions,
 	}
 
 	// 注入 Meta 到 Template
@@ -497,34 +511,69 @@ func (r *Registry) renderWithinLock(
 	return renderCore(context.Background(), t, meta, state, fields, env)
 }
 
-// assertActionContract 断言 payload["card"]["actions"][*] 里每个 Action.Submit
-// 的 data.owner/action_type 与 contract 一致。
+// assertActionContract checks both top-level actions and inline ActionSets.
+// Forge-aligned layouts place their production actions in a full-bleed footer,
+// so checking only card.actions would leave the registration fail-close gate
+// blind to the actual interactive surface.
 func assertActionContract(payload map[string]any, contract TemplateActionContract) error {
 	card, _ := payload["card"].(map[string]any)
 	if card == nil {
 		return errors.New("card missing from payload")
 	}
-	acts, _ := card["actions"].([]any)
-	seenSubmit := false
-	for i, a := range acts {
-		am, _ := a.(map[string]any)
-		if am == nil || am["type"] != "Action.Submit" {
-			continue
-		}
-		seenSubmit = true
-		data, _ := am["data"].(map[string]any)
+	seenSubmit := 0
+	check := func(path string, action map[string]any) error {
+		seenSubmit++
+		data, _ := action["data"].(map[string]any)
 		if data == nil {
-			return fmt.Errorf("actions[%d] Action.Submit missing data", i)
+			return fmt.Errorf("%s Action.Submit missing data", path)
 		}
-		if o, _ := data["owner"].(string); o != contract.Owner {
-			return fmt.Errorf("actions[%d] data.owner=%q, want %q", i, o, contract.Owner)
+		if owner, _ := data["owner"].(string); owner != contract.Owner {
+			return fmt.Errorf("%s data.owner=%q, want %q", path, owner, contract.Owner)
 		}
-		if at, _ := data["action_type"].(string); at != contract.ActionType {
-			return fmt.Errorf("actions[%d] data.action_type=%q, want %q", i, at, contract.ActionType)
+		if actionType, _ := data["action_type"].(string); actionType != contract.ActionType {
+			return fmt.Errorf("%s data.action_type=%q, want %q", path, actionType, contract.ActionType)
+		}
+		return nil
+	}
+	for _, root := range []struct {
+		path  string
+		value any
+	}{
+		{path: "card.actions", value: card["actions"]},
+		{path: "card.body", value: card["body"]},
+		{path: "card.selectAction", value: card["selectAction"]},
+	} {
+		if err := walkSubmitActions(root.value, root.path, check); err != nil {
+			return err
 		}
 	}
-	if !seenSubmit {
-		return errors.New("ActionContract non-nil but no Action.Submit in card.actions")
+	if seenSubmit == 0 {
+		return errors.New("ActionContract non-nil but no Action.Submit in card")
+	}
+	return nil
+}
+
+func walkSubmitActions(value any, path string, visit func(string, map[string]any) error) error {
+	switch node := value.(type) {
+	case []any:
+		for i, child := range node {
+			if err := walkSubmitActions(child, fmt.Sprintf("%s[%d]", path, i), visit); err != nil {
+				return err
+			}
+		}
+	case map[string]any:
+		if node["type"] == "Action.Submit" {
+			if err := visit(path, node); err != nil {
+				return err
+			}
+		}
+		for _, key := range []string{"actions", "items", "columns", "selectAction"} {
+			if child, ok := node[key]; ok {
+				if err := walkSubmitActions(child, path+"."+key, visit); err != nil {
+					return err
+				}
+			}
+		}
 	}
 	return nil
 }

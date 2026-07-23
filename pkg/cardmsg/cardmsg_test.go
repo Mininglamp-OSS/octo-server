@@ -375,6 +375,19 @@ func TestValidateProfileNegotiation(t *testing.T) {
 	if err := Validate(env4); !errors.Is(err, ErrCardProfileUnsupported) {
 		t.Errorf("card.version=1.6 应被拒, err=%v", err)
 	}
+
+	withRenderProfile := envelope(nil)
+	withRenderProfile["render_profile"] = RenderProfileOctoChatV1
+	if err := Validate(withRenderProfile); err != nil {
+		t.Errorf("已注册 render_profile 应被接受, err=%v", err)
+	}
+	for _, invalid := range []interface{}{"octo-chat/v2", "", float64(1)} {
+		withInvalidRenderProfile := envelope(nil)
+		withInvalidRenderProfile["render_profile"] = invalid
+		if err := Validate(withInvalidRenderProfile); !errors.Is(err, ErrCardProfileUnsupported) {
+			t.Errorf("未知或非法 render_profile=%v 应被拒, err=%v", invalid, err)
+		}
+	}
 }
 
 func TestValidateStructureCaps(t *testing.T) {

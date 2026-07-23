@@ -67,11 +67,11 @@ func (u *updater) ReplaceView(ctx context.Context, target UpdateTarget, id ID, v
 		}
 		recordUpdate(id, version, result)
 	}()
-	document, profile, err := u.registry.RenderCard(ctx, id, version, state, fields, env)
+	document, profile, renderProfile, err := u.registry.RenderCardWithProfiles(ctx, id, version, state, fields, env)
 	if err != nil {
 		return err
 	}
-	contentEdit, err := updateEnvelope(document, profile, target.Target.SpaceID, target.CardSeq)
+	contentEdit, err := updateEnvelope(document, profile, renderProfile, target.Target.SpaceID, target.CardSeq)
 	if err != nil {
 		return err
 	}
@@ -162,7 +162,7 @@ func mutationRequest(target UpdateTarget, contentEdit string) carddispatch.CardM
 	}
 }
 
-func updateEnvelope(document json.RawMessage, profile, spaceID string, cardSeq int64) (string, error) {
+func updateEnvelope(document json.RawMessage, profile, renderProfile, spaceID string, cardSeq int64) (string, error) {
 	var card map[string]interface{}
 	if err := json.Unmarshal(document, &card); err != nil || card == nil {
 		return "", fmt.Errorf("%w: decode rendered card", ErrUpdateInvalid)
@@ -170,6 +170,9 @@ func updateEnvelope(document json.RawMessage, profile, spaceID string, cardSeq i
 	envelope := map[string]interface{}{
 		"type": cardmsg.InteractiveCard.Int(), "card_version": cardmsg.CardVersion,
 		"profile": profile, "space_id": spaceID, "card_seq": cardSeq, "card": card,
+	}
+	if renderProfile != "" {
+		envelope["render_profile"] = renderProfile
 	}
 	raw, err := json.Marshal(envelope)
 	if err != nil {

@@ -52,7 +52,7 @@ func TestBuildDocsAccessRequestCard_MigrationBaseline(t *testing.T) {
 	}
 
 	// post-migration new path
-	newRaw, err := n.buildDocsAccessRequestCardViaRegistry(context.Background(), "space-1", card, "zh-CN")
+	newRaw, _, err := n.buildDocsAccessRequestCardViaRegistry(context.Background(), "space-1", card, "zh-CN")
 	if err != nil {
 		t.Fatalf("new build: %v", err)
 	}

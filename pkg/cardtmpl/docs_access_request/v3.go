@@ -3,7 +3,6 @@ package docsaccessrequest
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 
@@ -67,28 +66,29 @@ func (t *TemplateV3) Build(ctx context.Context, state cardtmpl.State, fields jso
 		if err := json.Unmarshal(fields, &input); err != nil {
 			return cardtmpl.BuildResult{}, fmt.Errorf("docs.access-request@0.3.0: unmarshal pending fields: %w", err)
 		}
-		result, err := New().Build(ctx, state, fields, env)
+		labels := pendingLabels(env.Lang, input)
+		docID := strings.TrimSpace(input.Document.DocID)
+		if docID == "" {
+			docID = input.RequestID
+		}
+		body, deepLink, err := cardtmpl.BuildDocsAccessRequestV3BodyWithLang(
+			env.Lang, env.WebLoginURL, docID, input.RequestID, env.SpaceID,
+			cardtmpl.DocsAccessRequestV3Content{
+				DocsApprovalContent: docsApprovalContentFromFields(input, labels),
+				SourceName:          input.Document.SourceName,
+				PermissionLabel:     input.Permission.Label,
+				PermissionRoleLabel: input.Permission.RoleLabel,
+				MessageTimeDisplay:  input.MessageTimeDisplay,
+			},
+			cardtmplApprovalActions(labels.approveTitle, labels.denyTitle),
+		)
 		if err != nil {
 			return cardtmpl.BuildResult{}, err
 		}
-		for _, action := range result.Actions {
-			action, ok := action.(map[string]interface{})
-			if !ok || action["type"] != "Action.Submit" {
-				continue
-			}
-			data, ok := action["data"].(map[string]interface{})
-			if !ok {
-				return cardtmpl.BuildResult{}, errors.New("docs.access-request@0.3.0: pending submit action data is invalid")
-			}
-			data["actor_avatar_url"] = input.Requester.AvatarURL
-			data["request_reason"] = input.RequestReason
-			data["requested_at_display"] = input.RequestedAtDisplay
-			data["message_time_display"] = input.MessageTimeDisplay
-			data["permission_label"] = input.Permission.Label
-			data["permission_role_label"] = input.Permission.RoleLabel
-			data["source_name"] = input.Document.SourceName
-		}
-		return result, nil
+		source := sourceForLang(env.Lang)
+		return cardtmpl.BuildResult{
+			Body: body, Variant: Variant, DeepLink: deepLink, Source: &source,
+		}, nil
 	}
 	if state != StateApproved && state != StateRejected {
 		return cardtmpl.BuildResult{}, fmt.Errorf("docs.access-request@0.3.0: unsupported state %q", state)
@@ -106,7 +106,7 @@ func (t *TemplateV3) Build(ctx context.Context, state cardtmpl.State, fields jso
 	if state == StateRejected {
 		variant = VariantRejected
 	}
-	body, deepLink, err := cardtmpl.BuildDocsApprovalOutcomeBodyWithLang(env.Lang, env.WebLoginURL, docID, env.SpaceID, cardtmpl.DocsOutcomeContent{
+	body, deepLink, err := cardtmpl.BuildDocsApprovalOutcomeV3BodyWithLang(env.Lang, env.WebLoginURL, docID, env.SpaceID, cardtmpl.DocsOutcomeContent{
 		Title: input.Document.Title, Variant: variant, Denied: state == StateRejected,
 		HeaderLabel: labels.header, SourceName: input.Document.SourceName,
 		StatusLabel: labels.status, PermissionLabel: input.Permission.Label, ResultText: labels.result,

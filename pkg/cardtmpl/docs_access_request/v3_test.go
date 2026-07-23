@@ -126,6 +126,95 @@ func TestV3PendingCarriesResultContextInServerAuthoredActionData(t *testing.T) {
 	}
 }
 
+func TestV3UsesForgeLayout(t *testing.T) {
+	r := cardtmpl.NewRegistry()
+	r.Register(docsaccessrequest.New(), docsaccessrequest.Assets, docsaccessrequest.HandoffRoot)
+	r.Register(docsaccessrequest.NewV3(), docsaccessrequest.Assets, docsaccessrequest.HandoffRootV3)
+	r.SetDefault(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3)
+	r.Freeze()
+	env := cardtmpl.BuildEnv{WebLoginURL: "https://web.example.com", Lang: "zh-CN", SpaceID: "space-1"}
+
+	for _, state := range []cardtmpl.State{
+		docsaccessrequest.StatePending,
+		docsaccessrequest.StateApproved,
+		docsaccessrequest.StateRejected,
+	} {
+		sample, err := docsaccessrequest.Assets.ReadFile(docsaccessrequest.HandoffRootV3 + "/samples/" + string(state) + ".json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload, err := r.Render(context.Background(), docsaccessrequest.TemplateID, "", state, sample, env)
+		if err != nil {
+			t.Fatalf("Render(%s): %v", state, err)
+		}
+		card := payload["card"].(map[string]any)
+		body := card["body"].([]any)
+		if len(body) != 3 {
+			t.Fatalf("Render(%s) top-level body count = %d, want header/content/footer", state, len(body))
+		}
+		if header := body[0].(map[string]any); header["type"] != "ColumnSet" || header["spacing"] != "None" {
+			t.Errorf("Render(%s) header = %+v", state, header)
+		}
+		assertForgeSurface(t, state, body[1], "accent")
+		assertForgeSurface(t, state, body[2], "emphasis")
+		if findNodeByID(card, "octo-badge-neutral-permission") == nil {
+			t.Errorf("Render(%s) permission semantic badge missing", state)
+		}
+
+		if state == docsaccessrequest.StatePending {
+			if _, ok := card["actions"]; ok {
+				t.Error("pending Forge layout must keep actions in the inline footer")
+			}
+			for _, id := range []string{cardtmpl.DocsApproveActionID, cardtmpl.DocsDenyActionID, cardtmpl.DocsDenyReasonInputID} {
+				if findNodeByID(card, id) == nil {
+					t.Errorf("pending Forge layout missing production id %q", id)
+				}
+			}
+			input := findNodeByID(card, cardtmpl.DocsDenyReasonInputID)
+			if input["isVisible"] != false || input["maxLength"] != float64(cardtmpl.MaxExcerptRunes) && input["maxLength"] != cardtmpl.MaxExcerptRunes {
+				t.Errorf("deny input contract drift: %+v", input)
+			}
+		} else {
+			if findNodeByID(card, cardtmpl.DocsApproveActionID) != nil || findNodeByID(card, cardtmpl.DocsDenyActionID) != nil {
+				t.Errorf("terminal Forge layout retained decision actions for state %s", state)
+			}
+			if findNodeByID(card, "approval_actions") != nil {
+				t.Errorf("terminal Forge layout retained pending action-set id for state %s", state)
+			}
+		}
+	}
+}
+
+func assertForgeSurface(t *testing.T, state cardtmpl.State, value any, style string) {
+	t.Helper()
+	node := value.(map[string]any)
+	if node["type"] != "Container" || node["style"] != style || node["bleed"] != true ||
+		node["separator"] != true || node["spacing"] != "None" {
+		t.Errorf("Render(%s) %s surface = %+v", state, style, node)
+	}
+}
+
+func findNodeByID(value any, id string) map[string]any {
+	switch node := value.(type) {
+	case map[string]any:
+		if node["id"] == id {
+			return node
+		}
+		for _, child := range node {
+			if found := findNodeByID(child, id); found != nil {
+				return found
+			}
+		}
+	case []any:
+		for _, child := range node {
+			if found := findNodeByID(child, id); found != nil {
+				return found
+			}
+		}
+	}
+	return nil
+}
+
 func TestV3FallbackTextLocalizesResultsAndRejectsUnknownState(t *testing.T) {
 	tmpl := docsaccessrequest.NewV3()
 	fields := json.RawMessage(`{
@@ -158,5 +247,51 @@ func TestV3MetaIsPopulatedByRegistry(t *testing.T) {
 	meta := tmpl.Meta()
 	if meta.ID != docsaccessrequest.TemplateID || meta.Version != docsaccessrequest.TemplateVersionV3 {
 		t.Fatalf("Meta() = %+v", meta)
+	}
+	if meta.RenderProfileCompatibility != cardmsg.RenderProfileOctoChatV1 {
+		t.Fatalf("Meta() render profile compatibility = %q", meta.RenderProfileCompatibility)
+	}
+	var manifest struct {
+		RenderProfile string `json:"renderProfile"`
+	}
+	if err := json.Unmarshal(meta.Manifest, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if manifest.RenderProfile != "octo-chat@1.2.0-rc.1" {
+		t.Fatalf("manifest renderProfile = %q", manifest.RenderProfile)
+	}
+}
+
+func TestV3UsesStableRenderProfileWithoutChangingV2(t *testing.T) {
+	r := cardtmpl.NewRegistry()
+	r.Register(docsaccessrequest.New(), docsaccessrequest.Assets, docsaccessrequest.HandoffRoot)
+	r.Register(docsaccessrequest.NewV3(), docsaccessrequest.Assets, docsaccessrequest.HandoffRootV3)
+	r.SetDefault(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3)
+	r.Freeze()
+	env := cardtmpl.BuildEnv{WebLoginURL: "https://web.example.com", Lang: "zh-CN", SpaceID: "space-1"}
+	v3Sample, err := docsaccessrequest.Assets.ReadFile(docsaccessrequest.HandoffRootV3 + "/samples/pending.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v3, err := r.Render(context.Background(), docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3,
+		docsaccessrequest.StatePending, v3Sample, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := v3["render_profile"]; got != cardmsg.RenderProfileOctoChatV1 {
+		t.Errorf("0.3.0 render_profile = %v", got)
+	}
+
+	v2Sample, err := docsaccessrequest.Assets.ReadFile(docsaccessrequest.HandoffRoot + "/samples/pending.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2, err := r.Render(context.Background(), docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersion,
+		docsaccessrequest.StatePending, v2Sample, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := v2["render_profile"]; ok {
+		t.Error("frozen 0.2.0 must remain on the legacy renderer")
 	}
 }

@@ -106,6 +106,9 @@ func (s *producerSender) Send(ctx context.Context, target Target, card Card) (re
 		"profile":      card.Profile,
 		"card":         cardDocument,
 	}
+	if card.RenderProfile != "" {
+		payload["render_profile"] = card.RenderProfile
+	}
 	if validateErr := cardmsg.Validate(payload); validateErr != nil {
 		terminal = cardErrorCategory(validateErr)
 		return nil, categorized(terminal, validateErr)
@@ -190,6 +193,9 @@ func validateRequest(ctx context.Context, target Target, card Card) error {
 	}
 	if strings.TrimSpace(card.Profile) == "" || len(card.Document) == 0 {
 		return errors.New("profile and card document are required")
+	}
+	if !cardmsg.IsAcceptedRenderProfile(card.RenderProfile) {
+		return errors.New("unsupported render profile")
 	}
 	return nil
 }

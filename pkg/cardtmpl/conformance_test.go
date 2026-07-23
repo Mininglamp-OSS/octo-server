@@ -132,14 +132,9 @@ func TestActionContract_ThreeWayConsistency(t *testing.T) {
 			t.Fatalf("[%s@%s] Render: %v", meta.ID, meta.Version, err)
 		}
 		card, _ := payload["card"].(map[string]any)
-		actions, _ := card["actions"].([]any)
-		submits := 0
-		for _, a := range actions {
-			am, _ := a.(map[string]any)
-			if am["type"] != "Action.Submit" {
-				continue
-			}
-			submits++
+		submits := map[string]map[string]any{}
+		collectActionsFromCard(card, submits)
+		for _, am := range submits {
 			data, _ := am["data"].(map[string]any)
 			if o, _ := data["owner"].(string); o != meta.ActionContract.Owner {
 				t.Errorf("[%s@%s] Action.Submit.data.owner = %q, want %q",
@@ -150,8 +145,8 @@ func TestActionContract_ThreeWayConsistency(t *testing.T) {
 					meta.ID, meta.Version, at, meta.ActionContract.ActionType)
 			}
 		}
-		if submits == 0 {
-			t.Errorf("[%s@%s view state=%s] no Action.Submit in card actions",
+		if len(submits) == 0 {
+			t.Errorf("[%s@%s view state=%s] no Action.Submit in card",
 				meta.ID, meta.Version, state)
 		}
 
