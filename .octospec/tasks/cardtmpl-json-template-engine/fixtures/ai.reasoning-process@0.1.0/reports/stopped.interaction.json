@@ -1,0 +1,23 @@
+{
+  "actions": [
+    {
+      "path": "$.body[3].items[0].actions[0]",
+      "type": "Action.ToggleVisibility",
+      "id": "reasoning_toggle"
+    }
+  ],
+  "inputs": [],
+  "toggles": [
+    {
+      "path": "$.body[3].items[0].actions[0]",
+      "targets": [
+        {
+          "elementId": "trace_panel"
+        },
+        {
+          "elementId": "collapsed_panel"
+        }
+      ]
+    }
+  ]
+}

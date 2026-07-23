@@ -49,17 +49,25 @@ type manifestFile struct {
 	// RenderProfile is provenance-only metadata for the exact Forge artifact.
 	// RenderProfileCompatibility is the stable value written to the type-17
 	// envelope and is the only render-profile value retained at runtime.
-	RenderProfile              string `json:"renderProfile"`
-	RenderProfileCompatibility string `json:"renderProfileCompatibility,omitempty"`
-	Owner                      string `json:"owner"`
-	ActionType                 string `json:"actionType"`
-	Views                      map[ViewKey]struct {
-		WireProfile string  `json:"wireProfile"`
-		States      []State `json:"states"`
-	} `json:"views"`
+	RenderProfile              string                   `json:"renderProfile"`
+	RenderProfileCompatibility string                   `json:"renderProfileCompatibility,omitempty"`
+	Owner                      string                   `json:"owner"`
+	ActionType                 string                   `json:"actionType"`
+	Views                      map[ViewKey]manifestView `json:"views"`
 	// SourceLabel / SourceIconURL 可选,若手动指定则覆盖 Template 默认 Source。
 	SourceLabel   string `json:"sourceLabel,omitempty"`
 	SourceIconURL string `json:"sourceIconUrl,omitempty"`
+}
+
+// manifestView is one entry of manifest.views. Template/Samples are only present
+// for JSON-mode cards (roadmap E1): Template is the repo-relative path to the
+// view's `.template.json`, Samples the sample files exercising it. Go-mode cards
+// (hand-written Template.Build) omit both — the fields are ignored there.
+type manifestView struct {
+	WireProfile string   `json:"wireProfile"`
+	States      []State  `json:"states"`
+	Template    string   `json:"template,omitempty"`
+	Samples     []string `json:"samples,omitempty"`
 }
 
 // ActionView resolves one declared Action.Submit to its registered view. It is
@@ -375,10 +383,7 @@ func loadSchema(fs embed.FS, root string) *jsonschema.Schema {
 	return sch
 }
 
-func loadInteractionReports(fs embed.FS, root string, views map[ViewKey]struct {
-	WireProfile string  `json:"wireProfile"`
-	States      []State `json:"states"`
-}) map[ViewKey]InteractionReport {
+func loadInteractionReports(fs embed.FS, root string, views map[ViewKey]manifestView) map[ViewKey]InteractionReport {
 	out := make(map[ViewKey]InteractionReport)
 	for vk, vs := range views {
 		if vs.WireProfile != profileV2 {

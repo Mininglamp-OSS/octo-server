@@ -97,10 +97,15 @@ func renderCore(
 		return nil, fmt.Errorf("%w: build: %w", ErrRenderFailed, err)
 	}
 
-	// step 5: DeepLink 强制校验 (§5 约束 4)
-	if err := AbsoluteHTTPSURL(br.DeepLink); err != nil {
-		metricBuildResult(meta.ID, meta.Version, string(view), "render_error")
-		return nil, fmt.Errorf("%w: DeepLink: %v", ErrRenderFailed, err)
+	// step 5: DeepLink 可选;非空则强制绝对 https (§5 约束 4)。空 DeepLink 表示本卡
+	// 没有规范浏览器 URL(如 JSON 模板的纯展示进度卡,无 OpenUrl/webUrl)—— 跳过
+	// https 校验并在 step 6 省略 metadata.webUrl。既有卡片一律提供 DeepLink,行为不变。
+	hasDeepLink := strings.TrimSpace(br.DeepLink) != ""
+	if hasDeepLink {
+		if err := AbsoluteHTTPSURL(br.DeepLink); err != nil {
+			metricBuildResult(meta.ID, meta.Version, string(view), "render_error")
+			return nil, fmt.Errorf("%w: DeepLink: %v", ErrRenderFailed, err)
+		}
 	}
 
 	// step 6: 组装 AC 顶层 + metadata
@@ -138,11 +143,15 @@ func renderCore(
 		}
 		octo["source"] = s
 	}
+	metadata := map[string]any{"octo": octo}
+	if hasDeepLink {
+		metadata["webUrl"] = br.DeepLink
+	}
 	card := map[string]any{
 		"type":     "AdaptiveCard",
 		"version":  cardmsg.CardVersion,
 		"body":     br.Body,
-		"metadata": map[string]any{"webUrl": br.DeepLink, "octo": octo},
+		"metadata": metadata,
 	}
 	if len(br.Actions) > 0 {
 		card["actions"] = br.Actions

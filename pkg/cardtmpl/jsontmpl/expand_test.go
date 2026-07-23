@@ -1,0 +1,149 @@
+package jsontmpl
+
+import (
+	"encoding/json"
+	"testing"
+)
+
+// parseJSON is a test helper: unmarshal a template/data literal into any.
+func parseJSON(t *testing.T, s string) any {
+	t.Helper()
+	var v any
+	if err := json.Unmarshal([]byte(s), &v); err != nil {
+		t.Fatalf("parseJSON: %v", err)
+	}
+	return v
+}
+
+func dataMap(t *testing.T, s string) map[string]any {
+	t.Helper()
+	v := parseJSON(t, s)
+	m, ok := v.(map[string]any)
+	if !ok {
+		t.Fatalf("dataMap: not an object: %T", v)
+	}
+	return m
+}
+
+// canonical marshals with sorted keys (encoding/json sorts map keys) so tests
+// compare structure, not key order.
+func canonical(t *testing.T, v any) string {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return string(b)
+}
+
+func TestExpand_FieldBinding(t *testing.T) {
+	tmpl := parseJSON(t, `{"type":"TextBlock","text":"${title}"}`)
+	data := dataMap(t, `{"title":"hello"}`)
+	got, err := Expand(tmpl, Scope{Data: data}, noEscape)
+	if err != nil {
+		t.Fatalf("expand: %v", err)
+	}
+	want := parseJSON(t, `{"type":"TextBlock","text":"hello"}`)
+	if canonical(t, got) != canonical(t, want) {
+		t.Fatalf("got %s want %s", canonical(t, got), canonical(t, want))
+	}
+}
+
+func TestExpand_TypedBoolBinding(t *testing.T) {
+	tmpl := parseJSON(t, `{"type":"Container","isVisible":"${traceExpanded}"}`)
+	data := dataMap(t, `{"traceExpanded":false}`)
+	got, err := Expand(tmpl, Scope{Data: data}, noEscape)
+	if err != nil {
+		t.Fatalf("expand: %v", err)
+	}
+	// isVisible must be a real JSON boolean, not the string "false".
+	want := parseJSON(t, `{"type":"Container","isVisible":false}`)
+	if canonical(t, got) != canonical(t, want) {
+		t.Fatalf("got %s want %s", canonical(t, got), canonical(t, want))
+	}
+}
+
+func TestExpand_DataArrayRepeatsWithIndex(t *testing.T) {
+	tmpl := parseJSON(t, `{
+		"type":"Container",
+		"items":[
+			{"$data":"${phases}","type":"TextBlock","text":"${thought}","spacing":"${if($index == 0, 'None', 'Large')}"},
+			{"type":"TextBlock","text":"footer"}
+		]
+	}`)
+	data := dataMap(t, `{"phases":[{"thought":"a"},{"thought":"b"}]}`)
+	got, err := Expand(tmpl, Scope{Data: data}, noEscape)
+	if err != nil {
+		t.Fatalf("expand: %v", err)
+	}
+	want := parseJSON(t, `{
+		"type":"Container",
+		"items":[
+			{"type":"TextBlock","text":"a","spacing":"None"},
+			{"type":"TextBlock","text":"b","spacing":"Large"},
+			{"type":"TextBlock","text":"footer"}
+		]
+	}`)
+	if canonical(t, got) != canonical(t, want) {
+		t.Fatalf("\n got %s\nwant %s", canonical(t, got), canonical(t, want))
+	}
+}
+
+func TestExpand_NestedDataScopes(t *testing.T) {
+	tmpl := parseJSON(t, `{
+		"$data":"${phases}",
+		"type":"Container",
+		"items":[
+			{"$data":"${actions}","type":"TextBlock","text":"${tool}"}
+		]
+	}`)
+	// wrap in an array so the outer $data repetition is observable
+	root := []any{tmpl}
+	data := dataMap(t, `{"phases":[{"actions":[{"tool":"x"},{"tool":"y"}]}]}`)
+	got, err := Expand(root, Scope{Data: data}, noEscape)
+	if err != nil {
+		t.Fatalf("expand: %v", err)
+	}
+	want := parseJSON(t, `[{
+		"type":"Container",
+		"items":[
+			{"type":"TextBlock","text":"x"},
+			{"type":"TextBlock","text":"y"}
+		]
+	}]`)
+	if canonical(t, got) != canonical(t, want) {
+		t.Fatalf("\n got %s\nwant %s", canonical(t, got), canonical(t, want))
+	}
+}
+
+func TestExpand_DataNotArray_Errors(t *testing.T) {
+	tmpl := parseJSON(t, `{"items":[{"$data":"${notarr}","type":"X"}]}`)
+	data := dataMap(t, `{"notarr":"scalar"}`)
+	if _, err := Expand(tmpl, Scope{Data: data}, noEscape); err == nil {
+		t.Fatal("expected error when $data does not resolve to an array")
+	}
+}
+
+func TestExpand_StaticPassthrough(t *testing.T) {
+	tmpl := parseJSON(t, `{"type":"AdaptiveCard","version":"1.5","bleed":true,"spacing":"None"}`)
+	got, err := Expand(tmpl, Scope{Data: map[string]any{}}, noEscape)
+	if err != nil {
+		t.Fatalf("expand: %v", err)
+	}
+	if canonical(t, got) != canonical(t, tmpl) {
+		t.Fatalf("got %s want %s", canonical(t, got), canonical(t, tmpl))
+	}
+}
+
+func TestExpand_EscapesDataLeaf(t *testing.T) {
+	tmpl := parseJSON(t, `{"text":"${detail}"}`)
+	data := dataMap(t, `{"detail":"a*b"}`)
+	got, err := Expand(tmpl, Scope{Data: data}, markdownish)
+	if err != nil {
+		t.Fatalf("expand: %v", err)
+	}
+	want := parseJSON(t, `{"text":"a\\*b"}`)
+	if canonical(t, got) != canonical(t, want) {
+		t.Fatalf("got %s want %s", canonical(t, got), canonical(t, want))
+	}
+}
