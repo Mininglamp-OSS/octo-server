@@ -46,8 +46,11 @@ func (m *messageExtraDB) insertOrUpdatePinnedTx(md *messageExtraModel, tx *dbr.T
 	return err
 }
 
-func (m *messageExtraDB) insertOrUpdateDeleted(md *messageExtraModel) error {
-	_, err := m.session.InsertBySql("INSERT INTO message_extra (message_id,message_seq,channel_id,channel_type,is_deleted,version) VALUES (?,?,?,?,?,?) ON DUPLICATE KEY UPDATE is_deleted=VALUES(is_deleted),version=VALUES(version)", md.MessageID, md.MessageSeq, md.ChannelID, md.ChannelType, md.IsDeleted, md.Version).Exec()
+// insertOrUpdateDeletedTx is the transactional variant used by the mutual-delete
+// writer (#627): the message_extra version is allocated under the channel
+// sequence lock in the same transaction as the business row.
+func (m *messageExtraDB) insertOrUpdateDeletedTx(md *messageExtraModel, tx *dbr.Tx) error {
+	_, err := tx.InsertBySql("INSERT INTO message_extra (message_id,message_seq,channel_id,channel_type,is_deleted,version) VALUES (?,?,?,?,?,?) ON DUPLICATE KEY UPDATE is_deleted=VALUES(is_deleted),version=VALUES(version)", md.MessageID, md.MessageSeq, md.ChannelID, md.ChannelType, md.IsDeleted, md.Version).Exec()
 	return err
 }
 

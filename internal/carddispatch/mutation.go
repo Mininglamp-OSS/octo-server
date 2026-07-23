@@ -12,6 +12,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	liblog "github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-server/internal/msgextraseq"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardrevision"
 	"github.com/go-sql-driver/mysql"
@@ -245,13 +246,14 @@ func (m *CardMutator) WriteCAS(request CardMutationCASRequest) (bool, error) {
 type productionMutationBackend struct {
 	ctx       *config.Context
 	revisions *cardrevision.Store
+	seq       *msgextraseq.Store
 }
 
 func newProductionMutationBackend(ctx *config.Context) *productionMutationBackend {
 	if ctx == nil {
 		return nil
 	}
-	return &productionMutationBackend{ctx: ctx, revisions: cardrevision.NewStore(ctx.DB())}
+	return &productionMutationBackend{ctx: ctx, revisions: cardrevision.NewStore(ctx.DB()), seq: msgextraseq.New(ctx)}
 }
 
 func (b *productionMutationBackend) Lookup(_ context.Context, request CardMutationRequest) (storedCardMessage, error) {
@@ -343,6 +345,13 @@ func (b *productionMutationBackend) CASWrite(write cardMutationWrite) (bool, boo
 		if err == nil || !isMutationRetriableLockError(err) {
 			break
 		}
+		// Whole-transaction retry on a retriable lock error (1213/1205): each
+		// casWriteOnce opens a fresh tx, so re-running is safe. Report the retry
+		// on the shared allocator metric (reserve_total result=retry). With the
+		// #627 D4 mode-aware lock order this loop is a backstop (1205 lock-wait
+		// under load / any unforeseen source) — the transactional card-vs-seq
+		// same-message deadlock is removed at the root, not merely retried here.
+		b.seq.ObserveReserveRetry()
 		time.Sleep(time.Duration(attempt+1) * 3 * time.Millisecond)
 	}
 	return conflict, replay, err
@@ -355,27 +364,47 @@ func (b *productionMutationBackend) casWriteOnce(write cardMutationWrite) (bool,
 	}
 	defer tx.RollbackUnlessCommitted()
 
-	var stored struct {
-		CardSeq dbr.NullInt64 `db:"card_seq"`
-		Hash    string        `db:"content_edit_hash"`
-	}
-	if err := tx.SelectBySql("SELECT card_seq, content_edit_hash FROM message_extra WHERE message_id=? FOR UPDATE", write.MessageID).LoadOne(&stored); err != nil && err != dbr.ErrNotFound {
-		return false, false, err
-	}
-	if stored.CardSeq.Valid && stored.CardSeq.Int64 >= write.CardSeq {
-		if stored.CardSeq.Int64 == write.CardSeq && stored.Hash == write.ContentHash {
-			return false, true, nil
-		}
-		return true, false, nil
-	}
 	fakeChannelID := write.ChannelID
 	if write.ChannelType == common.ChannelTypePerson.Uint8() && !write.StorageChannel {
 		fakeChannelID = common.GetFakeChannelIDWith(write.SenderUID, write.ChannelID)
 	}
-	version, err := b.ctx.GenSeq(fmt.Sprintf("%s:%s", common.MessageExtraSeqKey, fakeChannelID))
+
+	// #627 D4: pick the lock order by allocator mode so the GLOBAL order is uniform
+	// across every message_extra writer and cannot deadlock.
+	//   - transactional: reserve the channel sequence FIRST, then take the
+	//     message-row lock (state → channel-seq → message-row). This matches the
+	//     non-card writers (all seq-first), so no AB-BA cycle exists. Version order
+	//     == commit order gives monotonicity; a stale-frame CAS reject rolls the tx
+	//     back, reverting the sequence advance, so no version is consumed.
+	//   - legacy: the version comes from GenSeq (no serializing lock), so the
+	//     message-row lock must come FIRST to preserve single-process version
+	//     monotonicity (PR#548, TestBotCardEditMixedFrameVersionMonotonicIM).
+	mode, err := b.seq.Mode(tx)
 	if err != nil {
 		return false, false, err
 	}
+
+	var version int64
+	if mode == msgextraseq.ModeTransactional {
+		versions, rerr := b.seq.ReserveTx(tx, fakeChannelID, write.ChannelType, 1)
+		if rerr != nil {
+			return false, false, rerr
+		}
+		version = versions[0]
+		if conflict, replay, done, cerr := b.casGate(tx, write); cerr != nil || done {
+			return conflict, replay, cerr
+		}
+	} else {
+		if conflict, replay, done, cerr := b.casGate(tx, write); cerr != nil || done {
+			return conflict, replay, cerr
+		}
+		versions, rerr := b.seq.ReserveTx(tx, fakeChannelID, write.ChannelType, 1)
+		if rerr != nil {
+			return false, false, rerr
+		}
+		version = versions[0]
+	}
+
 	if _, err := tx.InsertBySql(
 		"INSERT INTO message_extra (message_id,message_seq,channel_id,channel_type,content_edit,content_edit_hash,edited_at,version,card_seq) VALUES (?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE content_edit=VALUES(content_edit),content_edit_hash=VALUES(content_edit_hash),edited_at=VALUES(edited_at),version=VALUES(version),card_seq=VALUES(card_seq)",
 		write.MessageID, write.MessageSeq, fakeChannelID, write.ChannelType, write.ContentEdit, write.ContentHash, write.EditedAt, version, write.CardSeq,
@@ -383,6 +412,37 @@ func (b *productionMutationBackend) casWriteOnce(write cardMutationWrite) (bool,
 		return false, false, err
 	}
 	return false, false, tx.Commit()
+}
+
+// casGate takes the message-row lock FOR UPDATE and evaluates the card_seq CAS.
+// done=true means the caller must stop before writing — either a stale-frame
+// conflict (conflict=true) or an idempotent replay of the same frame
+// (replay=true). done=false means the frame is accepted and the caller writes.
+// Only an accepted frame ever reaches the INSERT, so a rejected frame consumes no
+// version (in transactional mode the caller's rollback reverts the seq advance).
+//
+// Pre-existing hazard (predates #627, not a regression): the FOR UPDATE below
+// targets message_id, which for a brand-new card message does not yet exist, so
+// under REPEATABLE READ it takes a gap lock. Two first-frame writes on different
+// channels whose message_ids are index-adjacent can gap-lock-deadlock (1213) on
+// their subsequent INSERTs. This is masked by the outer CASWrite bounded retry
+// (a fresh tx re-reads an existing row → record lock, no gap), so it self-heals;
+// eliminating it (upsert-first, à la msgextraseq.lockSequenceRow) is a follow-up.
+func (b *productionMutationBackend) casGate(tx *dbr.Tx, write cardMutationWrite) (conflict, replay, done bool, err error) {
+	var stored struct {
+		CardSeq dbr.NullInt64 `db:"card_seq"`
+		Hash    string        `db:"content_edit_hash"`
+	}
+	if serr := tx.SelectBySql("SELECT card_seq, content_edit_hash FROM message_extra WHERE message_id=? FOR UPDATE", write.MessageID).LoadOne(&stored); serr != nil && serr != dbr.ErrNotFound {
+		return false, false, true, serr
+	}
+	if stored.CardSeq.Valid && stored.CardSeq.Int64 >= write.CardSeq {
+		if stored.CardSeq.Int64 == write.CardSeq && stored.Hash == write.ContentHash {
+			return false, true, true, nil
+		}
+		return true, false, true, nil
+	}
+	return false, false, false, nil
 }
 
 func (b *productionMutationBackend) AppendRevision(write cardMutationWrite) error {

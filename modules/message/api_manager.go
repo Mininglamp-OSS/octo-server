@@ -16,6 +16,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkevent"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/internal/msgextraseq"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
@@ -34,6 +35,7 @@ type Manager struct {
 	groupService group.IService
 	managerDB    *managerDB
 	pinnedDB     *pinnedDB
+	seqStore     *msgextraseq.Store
 }
 
 // NewManager NewManager
@@ -45,6 +47,7 @@ func NewManager(ctx *config.Context) *Manager {
 		groupService: group.NewService(ctx),
 		managerDB:    newManagerDB(ctx),
 		pinnedDB:     newPinnedDB(ctx),
+		seqStore:     msgextraseq.New(ctx),
 	}
 }
 
@@ -142,6 +145,12 @@ func (m *Manager) delete(c *wkhttp.Context) {
 		respondMessageRequestInvalid(c, "msg_ids")
 		return
 	}
+	// #627: bound the client-supplied batch so a single request cannot reserve an
+	// oversized version range while holding the channel sequence lock.
+	if len(req.List) > msgextraseq.MaxReserveCount {
+		respondMessageRequestInvalid(c, "list")
+		return
+	}
 	if req.ChannelType == uint8(common.ChannelTypePerson) && (req.FromUID == "" || req.ChannelID == req.FromUID) {
 		respondMessageRequestInvalid(c, "from_uid")
 		return
@@ -194,13 +203,17 @@ func (m *Manager) delete(c *wkhttp.Context) {
 		}
 	}()
 	msgIds := make([]string, 0)
-	for _, msg := range req.List {
-		version, err := m.genMessageExtraSeq(fakeChannelID)
-		if err != nil {
-			m.Error("生成消息扩展序列号失败", zap.Error(err))
-			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
-			return
-		}
+	// #627: reserve the whole batch once before writing message_extra (lock order
+	// state → channel seq → message_extra → pinned). req.List is bounded above.
+	versions, err := m.seqStore.ReserveTx(tx, fakeChannelID, req.ChannelType, len(req.List))
+	if err != nil {
+		tx.Rollback()
+		m.Error("生成消息扩展序列号失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
+		return
+	}
+	for i, msg := range req.List {
+		version := versions[i]
 		msgIds = append(msgIds, msg.MessageID)
 		err = m.managerDB.updateMsgExtraVersionAndDeletedTx(&messageExtraModel{
 			ChannelID:   fakeChannelID,
@@ -972,10 +985,6 @@ func (m *managerSendMsgReq) check() error {
 		return errors.New("接受者类型错误")
 	}
 	return nil
-}
-
-func (m *Manager) genMessageExtraSeq(channelID string) (int64, error) {
-	return m.ctx.GenSeq(fmt.Sprintf("%s:%s", common.MessageExtraSeqKey, channelID))
 }
 
 type managerSendMsgReq struct {

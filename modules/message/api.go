@@ -20,6 +20,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkevent"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/internal/msgextraseq"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	"github.com/Mininglamp-OSS/octo-server/modules/botidentity"
 	"github.com/Mininglamp-OSS/octo-server/modules/channel"
@@ -285,6 +286,11 @@ type Message struct {
 	groupDB  *group.DB
 	mutex    sync.Mutex
 	stopChan chan struct{}
+	// seqStore is the shared transactional message_extra version allocator
+	// (#627). All message_extra version allocation in this module goes through
+	// it; it selects legacy GenSeq vs the transactional channel sequence by the
+	// DB-authoritative state row.
+	seqStore *msgextraseq.Store
 	// reminderSeqOverride lets unit tests stub the version generator
 	// used by getReminders so the matrix helpers can run without
 	// standing up the seq table / MySQL. Production path: nil →
@@ -330,6 +336,7 @@ func New(ctx *config.Context) *Message {
 		groupDB:        group.NewDB(ctx),
 		cardClaims:     newCardActionClaimStore(ctx),
 		cardRevisions:  cardrevision.NewStore(ctx.DB()),
+		seqStore:       msgextraseq.New(ctx),
 		stopChan:       make(chan struct{}),
 	}
 	m.ctx.AddEventListener(event.GroupMemberAdd, m.handleGroupMemberAddEvent)
@@ -987,12 +994,13 @@ func (m *Message) messageEdit(c *wkhttp.Context) {
 		fakeChannelID = common.GetFakeChannelIDWith(c.GetLoginUID(), req.ChannelID)
 	}
 
-	version, err := m.genMessageExtraSeq(fakeChannelID)
+	versions, err := m.seqStore.ReserveTx(tx, fakeChannelID, req.ChannelType, 1)
 	if err != nil {
 		m.Error("生成消息扩展序列号失败！", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
+	version := versions[0]
 	err = m.messageExtraDB.insertOrUpdateContentEditTx(&messageExtraModel{
 		MessageID:       req.MessageID,
 		MessageSeq:      req.MessageSeq,
@@ -2574,21 +2582,33 @@ func (m *Message) mutualDelete(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrMessageIDSeqMismatch, nil, nil)
 		return
 	}
-	version, err := m.genMessageExtraSeq(fakeChannelID)
+	tx, err := m.db.session.Begin()
+	if err != nil {
+		m.Error("开启事务失败！", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
+		return
+	}
+	defer tx.RollbackUnlessCommitted()
+	versions, err := m.seqStore.ReserveTx(tx, fakeChannelID, req.ChannelType, 1)
 	if err != nil {
 		m.Error("生成消息扩展序列号失败！", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
-	err = m.messageExtraDB.insertOrUpdateDeleted(&messageExtraModel{
+	err = m.messageExtraDB.insertOrUpdateDeletedTx(&messageExtraModel{
 		MessageID:   resolvedMessageID,
 		ChannelID:   fakeChannelID,
 		ChannelType: req.ChannelType,
 		IsDeleted:   1,
-		Version:     version,
-	})
+		Version:     versions[0],
+	}, tx)
 	if err != nil {
 		m.Error("删除消息错误", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		m.Error("事务提交失败", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
@@ -2733,8 +2753,25 @@ func (m *Message) delete(c *wkhttp.Context) {
 	c.ResponseOK()
 }
 
-func (m *Message) genMessageExtraSeq(channelID string) (int64, error) {
-	return m.ctx.GenSeq(fmt.Sprintf("%s:%s", common.MessageExtraSeqKey, channelID))
+// reserveVersions reserves n message_extra versions for a storage channel within
+// tx, chunking into MaxReserveCount-sized reservations so an unbounded batch
+// (e.g. a large read-receipt channel group) cannot exceed the allocator cap.
+// Repeated reservations on the same channel stay monotonic (#627).
+func (m *Message) reserveVersions(tx *dbr.Tx, channelID string, channelType uint8, n int) ([]int64, error) {
+	out := make([]int64, 0, n)
+	for n > 0 {
+		c := n
+		if c > msgextraseq.MaxReserveCount {
+			c = msgextraseq.MaxReserveCount
+		}
+		vs, err := m.seqStore.ReserveTx(tx, channelID, channelType, c)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, vs...)
+		n -= c
+	}
+	return out, nil
 }
 func (m *Message) genMessageReactionSeq(channelID string) (int64, error) {
 	return m.ctx.GenSeq(fmt.Sprintf("%s:%s", common.MessageReactionSeqKey, channelID))
@@ -3170,18 +3207,27 @@ func (m *Message) revoke(c *wkhttp.Context) {
 		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
+	// Unconditional rollback safety net: every error path below returns without an
+	// explicit Rollback in at least one case (deletePinnedMessage), and after the
+	// #627 cutover a leaked tx holds the channel-seq FOR UPDATE + the state
+	// FOR SHARE, which would stall same-channel writers and wedge the activation
+	// drain barrier. Matches messageEdit/mutualDelete. The explicit tx.Rollback()
+	// calls below are now harmless no-ops.
+	defer tx.RollbackUnlessCommitted()
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
 			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
-	version, err := m.genMessageExtraSeq(fakeChannelID)
+	versions, err := m.seqStore.ReserveTx(tx, fakeChannelID, uint8(channelTypeI), 1)
 	if err != nil {
+		tx.Rollback()
 		m.Error("生成消息扩展序列号失败！", zap.Error(err), zap.String("channelID", fakeChannelID))
 		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 		return
 	}
+	version := versions[0]
 	if messageExtra != nil {
 		messageExtra.Revoke = 1
 		messageExtra.Revoker = loginUID

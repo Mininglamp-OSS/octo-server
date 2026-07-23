@@ -186,6 +186,17 @@ func (m *Message) pinnedMessage(c *wkhttp.Context) {
 			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
+	// #627: reserve the message_extra version first (lock order state → channel
+	// seq → message_extra → pinned) so this path and revoke acquire the sequence
+	// and pinned rows in the same order, preventing a cross-writer deadlock.
+	versions, err := m.seqStore.ReserveTx(tx, fakeChannelID, req.ChannelType, 1)
+	if err != nil {
+		tx.Rollback()
+		m.Error("生成消息扩展序列号失败！", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
+		return
+	}
+	version := versions[0]
 	isPinned := 0
 	isSendSystemMsg := false
 	if pinnedMessage == nil {
@@ -221,13 +232,6 @@ func (m *Message) pinnedMessage(c *wkhttp.Context) {
 			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
 			return
 		}
-	}
-	version, err := m.genMessageExtraSeq(fakeChannelID)
-	if err != nil {
-		tx.Rollback()
-		m.Error("生成消息扩展序列号失败！", zap.Error(err))
-		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
-		return
 	}
 	err = m.messageExtraDB.insertOrUpdatePinnedTx(&messageExtraModel{
 		MessageID:   req.MessageID,
@@ -472,7 +476,17 @@ func (m *Message) clearPinnedMessage(c *wkhttp.Context) {
 			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
-	for _, msg := range updateModel {
+	// #627: reserve the whole range once before the pinned writes (lock order
+	// state → channel seq → message_extra → pinned), then assign deterministically.
+	// updateModel is bounded by the per-channel pinned cap, well under the cap.
+	versions, err := m.seqStore.ReserveTx(tx, fakeChannelID, req.ChannelType, len(updateModel))
+	if err != nil {
+		tx.Rollback()
+		m.Error("生成消息扩展序列号失败！", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
+		return
+	}
+	for i, msg := range updateModel {
 		err = m.pinnedDB.updateTx(msg, tx)
 		if err != nil {
 			tx.Rollback()
@@ -481,13 +495,7 @@ func (m *Message) clearPinnedMessage(c *wkhttp.Context) {
 			return
 		}
 
-		version, err := m.genMessageExtraSeq(fakeChannelID)
-		if err != nil {
-			tx.Rollback()
-			m.Error("生成消息扩展序列号失败！", zap.Error(err))
-			httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
-			return
-		}
+		version := versions[i]
 		err = m.messageExtraDB.insertOrUpdatePinnedTx(&messageExtraModel{
 			MessageID:   msg.MessageId,
 			MessageSeq:  msg.MessageSeq,

@@ -26,6 +26,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/internal/msgextraseq"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/app"
 	"github.com/Mininglamp-OSS/octo-server/modules/botfather/cmdmenu"
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
@@ -295,6 +296,11 @@ type Robot struct {
 	// spaceQuerier overrides &rb.db for enrichBotPayloadWithSpaceID (test injection).
 	// nil in production; tests set it to stub the DB call deterministically.
 	spaceQuerier robotSpaceQuerier
+	// seqStore is the shared transactional message_extra version allocator
+	// (#627). All message_extra version allocation in this module goes through
+	// it; it selects legacy GenSeq vs the transactional channel sequence by the
+	// DB-authoritative state row.
+	seqStore *msgextraseq.Store
 }
 
 func New(ctx *config.Context) *Robot {
@@ -311,6 +317,7 @@ func New(ctx *config.Context) *Robot {
 		inlineQueryEventResultChanMap: map[string]chan *InlineQueryResult{},
 		mentionRegexp:                 regexp.MustCompile(`@\S+`),
 		msgSem:                        make(chan struct{}, 100), // limit concurrent message processing goroutines
+		seqStore:                      msgextraseq.New(ctx),
 	}
 	ctx.AddMessagesListener(rb.messagesListen)
 
@@ -2108,21 +2115,38 @@ func (rb *Robot) botMessageEdit(c *wkhttp.Context) {
 		fakeChannelID = common.GetFakeChannelIDWith(robotID, req.ChannelID)
 	}
 
-	// 生成 message_extra 版本号
-	version, err := rb.ctx.GenSeq(fmt.Sprintf("%s:%s", common.MessageExtraSeqKey, fakeChannelID))
+	// #627 message_extra 版本号在业务事务内经序列行 FOR UPDATE 保留，持锁到 commit，
+	// 使提交序=版本序、跨副本唯一。allocator 内部按 DB 状态行分派 legacy/transactional。
+	// tx 需在触发 SendCMD（外部副作用）之前 commit，避免客户端在提交前拿到 stale。
+	tx, err := rb.ctx.DB().Begin()
+	if err != nil {
+		rb.Error("开启事务失败！", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
+		return
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	versions, err := rb.seqStore.ReserveTx(tx, fakeChannelID, req.ChannelType, 1)
 	if err != nil {
 		rb.Error("生成消息扩展序列号失败！", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
 		return
 	}
+	version := versions[0]
 
 	// 写入 message_extra
-	_, err = rb.ctx.DB().InsertBySql(
+	_, err = tx.InsertBySql(
 		"INSERT INTO message_extra (message_id,message_seq,channel_id,channel_type,content_edit,content_edit_hash,edited_at,version) VALUES (?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE content_edit=VALUES(content_edit),content_edit_hash=VALUES(content_edit_hash),edited_at=VALUES(edited_at),version=VALUES(version)",
 		req.MessageID, req.MessageSeq, fakeChannelID, req.ChannelType, contentEdit, contentMD5, int(time.Now().Unix()), version,
 	).Exec()
 	if err != nil {
 		rb.Error("添加或修改编辑内容失败！", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		rb.Error("提交事务失败！", zap.Error(err))
 		httperr.ResponseErrorL(c, errcode.ErrRobotStoreFailed, nil, nil)
 		return
 	}
