@@ -59,8 +59,8 @@ webhook 可被创建为绑定到某个子区，推送即投递进子区频道（
   锁仍锚父群行（避免空作用域首插的 gap-lock 死锁），锁粗、计数细，两者独立：
   - **作用域级**：群本体用 `incomingwebhook.max_per_group`（默认 10，env
     `DM_INCOMINGWEBHOOK_MAX_PER_GROUP`）；每个子区用 `incomingwebhook.max_per_thread`
-    （env `DM_INCOMINGWEBHOOK_MAX_PER_THREAD`，**未配置时回退到 `max_per_group`**）——二者
-    解耦，可分别精确设数（如群 10 / 每子区 3）。对所有人生效。
+    （env `DM_INCOMINGWEBHOOK_MAX_PER_THREAD`，**未配置或填 0/≤0 时回退到 `max_per_group`**，
+    并非「子区禁建」）——二者解耦，可分别精确设数（如群 10 / 每子区 3）。对所有人生效。
   - **per-creator**：普通成员/bot 在【本作用域】内另受 `incomingwebhook.max_per_creator`
     （默认 5，env `DM_INCOMINGWEBHOOK_MAX_PER_CREATOR`）约束，管理员豁免。
   - **群聚合天花板**：`incomingwebhook.max_total_per_group`（env
