@@ -576,16 +576,21 @@ const (
 	envIncomingWebhookEnabled         = "DM_INCOMINGWEBHOOK_ENABLED"
 	envIncomingWebhookPerWebhookRPS   = "DM_INCOMINGWEBHOOK_RPS"
 	envIncomingWebhookPerWebhookBurst = "DM_INCOMINGWEBHOOK_BURST"
-	envIncomingWebhookMaxPerGroup     = "DM_INCOMINGWEBHOOK_MAX_PER_GROUP"
-	envIncomingWebhookMaxPerCreator   = "DM_INCOMINGWEBHOOK_MAX_PER_CREATOR"
+	envIncomingWebhookMaxPerGroup      = "DM_INCOMINGWEBHOOK_MAX_PER_GROUP"
+	envIncomingWebhookMaxPerThread     = "DM_INCOMINGWEBHOOK_MAX_PER_THREAD"
+	envIncomingWebhookMaxPerCreator    = "DM_INCOMINGWEBHOOK_MAX_PER_CREATOR"
+	envIncomingWebhookMaxTotalPerGroup = "DM_INCOMINGWEBHOOK_MAX_TOTAL_PER_GROUP"
 	// 控制非管理员成员创建的 webhook 是否可用广播型 @（@所有人 / @所有 AI）。
 	envIncomingWebhookMemberCanBroadcast = "OCTO_INCOMINGWEBHOOK_MEMBER_CAN_BROADCAST"
 
-	defaultIncomingWebhookEnabled            = true
-	defaultIncomingWebhookPerWebhookRPS      = 5.0
-	defaultIncomingWebhookPerWebhookBurst    = 10
-	defaultIncomingWebhookMaxPerGroup        = 10
-	defaultIncomingWebhookMaxPerCreator      = 5
+	defaultIncomingWebhookEnabled         = true
+	defaultIncomingWebhookPerWebhookRPS   = 5.0
+	defaultIncomingWebhookPerWebhookBurst = 10
+	defaultIncomingWebhookMaxPerGroup     = 10
+	defaultIncomingWebhookMaxPerCreator   = 5
+	// max_total_per_group 默认 0 = 不启用群级聚合天花板（只受各作用域的
+	// max_per_group / max_per_thread 约束）。设为正数才封顶单群 webhook 总量。
+	defaultIncomingWebhookMaxTotalPerGroup   = 0
 	defaultIncomingWebhookMemberCanBroadcast = true
 )
 
@@ -638,12 +643,29 @@ func (s *SystemSettings) IncomingWebhookPerWebhookBurst() int {
 	return v
 }
 
-// IncomingWebhookMaxPerGroup 单个群可创建的 webhook 数量上限。DB → env → 默认 10。
+// IncomingWebhookMaxPerGroup 群本体作用域（thread_short_id='')可创建的 webhook 数量上限。
+// 子区作用域另用 IncomingWebhookMaxPerThread（未配置时回退到本值），两者独立计数、不共享
+// 名额。DB → env → 默认 10。
 // 读侧防御：≤0 回退默认（max_per_group=0 会让每次 create 都 ErrQuotaExceeded，是
 // 总开关之外一种更难诊断的「暗关」）。
 func (s *SystemSettings) IncomingWebhookMaxPerGroup() int {
 	def := incomingWebhookMaxPerGroupEnvDefault()
 	v := s.getInt("incomingwebhook", "max_per_group", def)
+	if v <= 0 {
+		return def
+	}
+	return v
+}
+
+// IncomingWebhookMaxPerThread 单个【子区作用域】可创建的 webhook 数量上限，与群本体的
+// max_per_group 解耦，用于「群和子区分别精确设数量」。
+// DB(incomingwebhook.max_per_thread) → env(DM_INCOMINGWEBHOOK_MAX_PER_THREAD) → 回退到
+// IncomingWebhookMaxPerGroup()。即【未单独配置子区上限时，子区与群本体同额度】——与本
+// 特性上线时「群/子区共用 max_per_group」的行为逐字节一致，配置向后兼容。
+// 读侧防御：≤0 回退默认（同 max_per_group，避免误配成子区一个都建不了的「暗关」）。
+func (s *SystemSettings) IncomingWebhookMaxPerThread() int {
+	def := s.incomingWebhookMaxPerThreadEnvDefault()
+	v := s.getInt("incomingwebhook", "max_per_thread", def)
 	if v <= 0 {
 		return def
 	}
@@ -694,8 +716,21 @@ func incomingWebhookMaxPerGroupEnvDefault() int {
 	return defaultIncomingWebhookMaxPerGroup
 }
 
-// IncomingWebhookMaxPerCreator 单个普通成员/bot 在一个群内可创建的 webhook 数量
-// 上限（群主/管理员豁免，仅受群级 max_per_group 约束）。DB → env → 默认 5。
+// incomingWebhookMaxPerThreadEnvDefault 解析 DM_INCOMINGWEBHOOK_MAX_PER_THREAD；仅接受
+// 正整数，否则【回退到 IncomingWebhookMaxPerGroup()】——未单独配置子区上限时子区与群本体
+// 同额度（本方法带 s 接收者正是为了拿到这个动态回退，而非一个静态 code default）。
+func (s *SystemSettings) incomingWebhookMaxPerThreadEnvDefault() int {
+	if v := os.Getenv(envIncomingWebhookMaxPerThread); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return s.IncomingWebhookMaxPerGroup()
+}
+
+// IncomingWebhookMaxPerCreator 单个普通成员/bot 在一个【投递作用域】（群本体或每个
+// 子区）内可创建的 webhook 数量上限（群主/管理员豁免，仅受作用域级 max_per_group
+// 约束）。DB → env → 默认 5。
 // 读侧防御：≤0 回退默认（同 max_per_group，避免误配成"任何成员都建不了"的暗关）。
 func (s *SystemSettings) IncomingWebhookMaxPerCreator() int {
 	def := incomingWebhookMaxPerCreatorEnvDefault()
@@ -715,6 +750,32 @@ func incomingWebhookMaxPerCreatorEnvDefault() int {
 		}
 	}
 	return defaultIncomingWebhookMaxPerCreator
+}
+
+// IncomingWebhookMaxTotalPerGroup 单个群【跨群本体 + 所有子区】的 webhook 聚合总数上限，
+// 用于挡住「子区可无限创建 → 单群 webhook 总量 = 作用域上限 ×(子区数+1) 失控」。
+// DB(incomingwebhook.max_total_per_group) → env(DM_INCOMINGWEBHOOK_MAX_TOTAL_PER_GROUP) →
+// 默认 0。
+// 语义与作用域上限【不同】：0（或负）表示【不启用】聚合天花板——只受 max_per_group /
+// max_per_thread 约束；仅当 > 0 时 insertWithQuota 才多做一次全群计数校验。因此读侧把
+// 负值夹到 0（关闭）而非回退某默认值：0 是有意义的「关闭」哨兵，不是误配。
+func (s *SystemSettings) IncomingWebhookMaxTotalPerGroup() int {
+	v := s.getInt("incomingwebhook", "max_total_per_group", incomingWebhookMaxTotalPerGroupEnvDefault())
+	if v < 0 {
+		return 0
+	}
+	return v
+}
+
+// incomingWebhookMaxTotalPerGroupEnvDefault 解析 DM_INCOMINGWEBHOOK_MAX_TOTAL_PER_GROUP；
+// 接受【非负】整数（0 = 关闭），否则回退默认 0。
+func incomingWebhookMaxTotalPerGroupEnvDefault() int {
+	if v := os.Getenv(envIncomingWebhookMaxTotalPerGroup); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return defaultIncomingWebhookMaxTotalPerGroup
 }
 
 // ---------------------------------------------------------------------------
@@ -779,6 +840,21 @@ func (s *SystemSettings) StickerUserMaxCount() int {
 // handler checks. Default false supports a controlled client rollout.
 func (s *SystemSettings) StickerCustomEnabled() bool {
 	return s.getBool("sticker", "custom_enabled", false)
+}
+
+// MessageReactionReadEnabled reports whether ordinary Web/iOS/Android clients
+// should display message reactions. Read defaults on so existing reactions stay
+// visible unless an operator explicitly disables message_reaction.read.
+func (s *SystemSettings) MessageReactionReadEnabled() bool {
+	return s.getBool("message_reaction", "read", true)
+}
+
+// MessageReactionWriteEnabled reports whether ordinary Web/iOS/Android clients
+// should expose add/cancel controls. Write defaults off for a staged rollout and
+// can be enabled independently through message_reaction.write. These capability
+// getters are presentation policy; server-side authorization stays independent.
+func (s *SystemSettings) MessageReactionWriteEnabled() bool {
+	return s.getBool("message_reaction", "write", false)
 }
 
 // StickerHandleRequired reports whether custom-sticker registration must reject a

@@ -320,6 +320,24 @@ func TestBuildDocsFallbackText(t *testing.T) {
 	assert.Contains(t, text, "时间：2026-07-13 15:04")
 }
 
+// R4-1 (#633 blocking): the gated access-request fallback delegates to the pilot
+// Template.FallbackText (F6). It must preserve excerpt + time — the pre-migration
+// buildDocsFallbackText emitted a 4-line DM (attribution/title/excerpt/time), so a
+// degraded plaintext DM on this path must not silently drop the excerpt or time.
+func TestBuildDocsFallbackText_AccessRequestedPreservesExcerptAndTime(t *testing.T) {
+	t.Setenv("OCTO_DOCS_APPROVAL_CARD_ENABLED", "true")
+	installTestCardTmplRegistry(t) // so templateFallbackText resolves the pilot
+	card := validAccessRequestDocsCard()
+	card.Excerpt = "需要评审季度计划"
+	card.UpdatedAt = "2026-07-20 09:30"
+
+	text := buildDocsFallbackText(card, "zh-CN")
+	assert.Contains(t, text, "需要评审季度计划", "access-request fallback dropped the excerpt")
+	assert.Contains(t, text, "2026-07-20 09:30", "access-request fallback dropped the time")
+	assert.Contains(t, text, "Alice", "actor should still appear")
+	assert.Contains(t, text, "产品设计方案", "doc title should still appear")
+}
+
 // Text fallback path when the docs card sender is unavailable: still delivers,
 // never silently dropped. Mirrors the summary DegradesToText test.
 func TestDeliverDocsCardNotification_DegradesToTextWhenSenderUnavailable(t *testing.T) {

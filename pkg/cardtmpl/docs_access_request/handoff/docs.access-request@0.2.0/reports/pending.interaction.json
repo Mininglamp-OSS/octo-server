@@ -1,0 +1,34 @@
+{
+  "actions": [
+    {
+      "id": "view_document",
+      "type": "Action.OpenUrl",
+      "dataKeys": [],
+      "inputIds": []
+    },
+    {
+      "id": "docs-access-deny",
+      "type": "Action.Submit",
+      "associatedInputs": "auto",
+      "dataKeys": ["owner", "action_type", "doc_id", "request_id", "doc_title", "actor", "decision"],
+      "inputIds": ["deny_reason"]
+    },
+    {
+      "id": "docs-access-approve",
+      "type": "Action.Submit",
+      "associatedInputs": "auto",
+      "dataKeys": ["owner", "action_type", "doc_id", "request_id", "doc_title", "actor", "decision"],
+      "inputIds": []
+    }
+  ],
+  "inputs": [
+    {
+      "id": "deny_reason",
+      "type": "Input.Text",
+      "isRequired": false,
+      "isVisible": false,
+      "maxLength": 300
+    }
+  ],
+  "toggles": []
+}

@@ -76,6 +76,10 @@ type DocsCardFields struct {
 	Kind      string `json:"kind"`       // "shared" | "commented" | "access_requested"
 	Title     string `json:"title"`      // document title
 	ActorName string `json:"actor_name"` // pre-resolved actor display name; empty allowed
+	// ActorUID is the requester's uid. When ActorName is empty, octo-server (the
+	// identity authority) resolves the display name from it server-side, so the
+	// producer need not hold a user-lookup credential. Empty => no resolution.
+	ActorUID string `json:"actor_uid"`
 	// ActorAvatarURL is an optional absolute https avatar for the requester,
 	// surfaced on the access-request approval card. Additive & backward
 	// compatible: empty (or omitted) renders no avatar; a non-https value fails

@@ -22,6 +22,10 @@ type concurrentLeaseQueue struct {
 	nacked   chan nackCall
 	renewed  chan renewCall
 	deferred chan deferCall
+	// routeMissingSince fakes the durable first-observed-miss marker. A test may pre-seed an
+	// entry to simulate an event that has already waited (→ past the window); otherwise the
+	// first RouteMissingSeenAt call stamps `now`, mirroring the real HSETNX-then-read.
+	routeMissingSince map[int64]time.Time
 }
 
 type nackCall struct {
@@ -85,6 +89,18 @@ func (q *concurrentLeaseQueue) Defer(eventID int64, token string, due time.Time)
 	return true, nil
 }
 func (*concurrentLeaseQueue) ReclaimExpired(time.Time, int) (int, error) { return 0, nil }
+func (q *concurrentLeaseQueue) RouteMissingSeenAt(eventID int64, now time.Time) (time.Time, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.routeMissingSince == nil {
+		q.routeMissingSince = make(map[int64]time.Time)
+	}
+	if seen, ok := q.routeMissingSince[eventID]; ok {
+		return seen, nil
+	}
+	q.routeMissingSince[eventID] = now
+	return now, nil
+}
 
 type capturingDeliverer struct {
 	owners chan string

@@ -48,14 +48,15 @@ type RedisQueue struct {
 }
 
 type queueKeys struct {
-	ready      string
-	leased     string
-	payload    string
-	attempts   string
-	tokens     string
-	dlq        string
-	dlqPayload string
-	dlqMeta    string
+	ready             string
+	leased            string
+	payload           string
+	attempts          string
+	tokens            string
+	dlq               string
+	dlqPayload        string
+	dlqMeta           string
+	routeMissingSince string
 }
 
 var enqueueScript = rd.NewScript(`
@@ -93,6 +94,7 @@ redis.call('ZREM', KEYS[2], ARGV[1])
 redis.call('HDEL', KEYS[3], ARGV[1])
 redis.call('HDEL', KEYS[4], ARGV[1])
 redis.call('HDEL', KEYS[5], ARGV[1])
+redis.call('HDEL', KEYS[9], ARGV[1])
 return 1
 `)
 
@@ -121,6 +123,7 @@ local payload = redis.call('HGET', KEYS[3], ARGV[1])
 local attempt = tonumber(redis.call('HGET', KEYS[4], ARGV[1]) or '0')
 redis.call('ZREM', KEYS[2], ARGV[1])
 redis.call('HDEL', KEYS[5], ARGV[1])
+redis.call('HDEL', KEYS[9], ARGV[1])
 if attempt >= tonumber(ARGV[4]) then
 	local expired = redis.call('ZRANGEBYSCORE', KEYS[6], '-inf', ARGV[8])
 	for _, expired_id in ipairs(expired) do
@@ -155,19 +158,24 @@ for i = 1, 5 do redis.call('PEXPIRE', KEYS[i], ARGV[3]) end
 return #ids
 `)
 
+// replayDLQScript returns a dead-lettered event to ready and resets its attempts. It is
+// NON-DESTRUCTIVE on a past-retention entry: it refuses (return 0) WITHOUT deleting, so the
+// running server's Depths() prune stays the single pruning authority. This matters because the
+// CLI resolves retention from its OWN env; if that window is shorter than the server's, deleting
+// here would silently destroy an entry the server still retains. On a successful replay it also
+// clears the route-missing first-seen marker (KEYS[9]) so the re-queued event starts a fresh
+// bounded window rather than inheriting its pre-DLQ first-miss time.
 var replayDLQScript = rd.NewScript(`
 local payload = redis.call('HGET', KEYS[7], ARGV[1])
 if not payload then return 0 end
 local score = redis.call('ZSCORE', KEYS[6], ARGV[1])
 if not score or tonumber(score) <= tonumber(ARGV[4]) then
-	redis.call('ZREM', KEYS[6], ARGV[1])
-	redis.call('HDEL', KEYS[7], ARGV[1])
-	redis.call('HDEL', KEYS[8], ARGV[1])
 	return 0
 end
 redis.call('ZREM', KEYS[6], ARGV[1])
 redis.call('HDEL', KEYS[7], ARGV[1])
 redis.call('HDEL', KEYS[8], ARGV[1])
+redis.call('HDEL', KEYS[9], ARGV[1])
 redis.call('HSET', KEYS[3], ARGV[1], payload)
 redis.call('HSET', KEYS[4], ARGV[1], 0)
 redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
@@ -185,6 +193,27 @@ redis.call('ZREMRANGEBYSCORE', KEYS[6], '-inf', ARGV[1])
 return #expired
 `)
 
+// routeMissingSinceScript records — once — when an event's route was first observed missing
+// at dispatch, and returns that timestamp (unix ms). KEYS[1] = route_missing_since hash;
+// ARGV[1] = event_id, ARGV[2] = now_ms, ARGV[3] = ttl_ms. HSETNX-then-read semantics: the
+// first miss stamps now, later misses read the stored stamp, so the bounded route-missing
+// window is measured from the FIRST miss (not from Event.ActedAt). The marker is explicitly
+// removed on every exit transition — ackScript, nackScript (both requeue and dead-letter),
+// and replayDLQScript all HDEL the field — so the hash only ever holds markers for events
+// currently waiting in the route-missing defer loop and CANNOT grow unbounded under sustained
+// route-missing traffic (a whole-hash PEXPIRE cannot expire individual fields, so relying on
+// TTL alone would leak). The hash-level TTL refreshed here to liveTTL is only a backstop that
+// reaps the whole key once misses stop.
+var routeMissingSinceScript = rd.NewScript(`
+local v = redis.call('HGET', KEYS[1], ARGV[1])
+if not v then
+  redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+  v = ARGV[2]
+end
+redis.call('PEXPIRE', KEYS[1], ARGV[3])
+return v
+`)
+
 func NewRedisQueue(client *rd.Client, cfg QueueConfig) (*RedisQueue, error) {
 	if client == nil {
 		return nil, errors.New("cardactiondispatch: Redis client is required")
@@ -199,14 +228,15 @@ func NewRedisQueue(client *rd.Client, cfg QueueConfig) (*RedisQueue, error) {
 	return &RedisQueue{
 		client: client,
 		keys: queueKeys{
-			ready:      base + "ready",
-			leased:     base + "leased",
-			payload:    base + "payload",
-			attempts:   base + "attempts",
-			tokens:     base + "tokens",
-			dlq:        base + "dlq",
-			dlqPayload: base + "dlq_payload",
-			dlqMeta:    base + "dlq_meta",
+			ready:             base + "ready",
+			leased:            base + "leased",
+			payload:           base + "payload",
+			attempts:          base + "attempts",
+			tokens:            base + "tokens",
+			dlq:               base + "dlq",
+			dlqPayload:        base + "dlq_payload",
+			dlqMeta:           base + "dlq_meta",
+			routeMissingSince: base + "route_missing_since",
 		},
 		liveTTL:      cfg.LiveTTL,
 		dlqRetention: cfg.DLQRetention,
@@ -354,10 +384,24 @@ func (q *RedisQueue) ReplayDLQ(eventID int64, due time.Time) (bool, error) {
 	return value == 1, nil
 }
 
+// Depths prunes DLQ entries older than the retention window, then reports queue depths.
+// The running server calls this (via refreshDepthMetrics), so it is the single pruning
+// authority and prunes lazily with its own resolved retention. Read-only inspectors must
+// use DepthsNoPrune instead so observing the queue cannot delete recoverable entries.
 func (q *RedisQueue) Depths() (QueueDepths, error) {
 	if _, err := pruneDLQScript.Run(q.client, q.scriptKeys(), unixMillis(time.Now().Add(-q.dlqRetention))).Result(); err != nil {
 		return QueueDepths{}, fmt.Errorf("cardactiondispatch: prune expired DLQ events: %w", err)
 	}
+	return q.DepthsNoPrune()
+}
+
+// DepthsNoPrune reports queue depths WITHOUT pruning the DLQ. Use it for read-only
+// inspection (the card-action-dlq `depth` command) so merely observing the DLQ can never
+// delete recoverable entries — even from a shell whose OCTO_CARD_ACTION_DLQ_RETENTION_DAYS
+// differs from the server's. Pruning stays the running server's job (see Depths). The
+// reported DLQ count therefore includes any not-yet-pruned expired entries, which is the
+// honest current contents for a manual inspection.
+func (q *RedisQueue) DepthsNoPrune() (QueueDepths, error) {
 	pipe := q.client.Pipeline()
 	ready := pipe.ZCard(q.keys.ready)
 	leased := pipe.ZCard(q.keys.leased)
@@ -372,7 +416,23 @@ func (q *RedisQueue) scriptKeys() []string {
 	return []string{
 		q.keys.ready, q.keys.leased, q.keys.payload, q.keys.attempts,
 		q.keys.tokens, q.keys.dlq, q.keys.dlqPayload, q.keys.dlqMeta,
+		q.keys.routeMissingSince,
 	}
+}
+
+// RouteMissingSeenAt records (once) and returns when this event's route was first observed
+// missing at dispatch. The bounded route-missing defer window is measured from this point —
+// NOT from Event.ActedAt — so an event that sat in the durable queue for a long time before
+// its first dispatch attempt (a long restart/outage/backlog window carried by the durable
+// queue) still gets the full self-heal window on its first transient miss, instead of being
+// dead-lettered immediately because its acted-at is already older than the window.
+func (q *RedisQueue) RouteMissingSeenAt(eventID int64, now time.Time) (time.Time, error) {
+	ms, err := routeMissingSinceScript.Run(q.client, []string{q.keys.routeMissingSince},
+		strconv.FormatInt(eventID, 10), unixMillis(now), durationMillis(q.liveTTL)).Int64()
+	if err != nil {
+		return time.Time{}, fmt.Errorf("cardactiondispatch: record route-missing first-seen: %w", err)
+	}
+	return time.UnixMilli(ms), nil
 }
 
 func newLeaseToken() (string, error) {

@@ -2,6 +2,7 @@ package common
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -756,6 +757,70 @@ func TestGetAppConfig_StickerCustomEnabled_OnVersionShortCircuit(t *testing.T) {
 	s.GetRoute().ServeHTTP(w, req)
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Contains(t, w.Body.String(), `"sticker_custom_enabled":true`)
+}
+
+func TestGetAppConfig_MessageReactionCapability(t *testing.T) {
+	tests := []struct {
+		name      string
+		dbRead    *bool
+		dbWrite   *bool
+		version   string
+		wantRead  bool
+		wantWrite bool
+	}{
+		{name: "unset defaults read only", wantRead: true, wantWrite: false},
+		{name: "DB overrides read and write independently", dbRead: boolPtr(false), dbWrite: boolPtr(true), wantRead: false, wantWrite: true},
+		{name: "version short circuit keeps current capability", version: "99999999", wantRead: true, wantWrite: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, ctx := testutil.NewTestServer()
+			f := New(ctx)
+			cleanAllTablesAndReloadSettings(t, ctx)
+			if tt.dbRead != nil {
+				setMessageReactionCapabilitySetting(t, ctx, "read", *tt.dbRead)
+			}
+			if tt.dbWrite != nil {
+				setMessageReactionCapabilitySetting(t, ctx, "write", *tt.dbWrite)
+			}
+			require.NoError(t, f.appConfigDB.insert(&appConfigModel{}))
+
+			path := "/v1/common/appconfig"
+			if tt.version != "" {
+				path += "?version=" + tt.version
+			}
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequest(http.MethodGet, path, nil)
+			s.GetRoute().ServeHTTP(w, req)
+			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+			var resp struct {
+				MessageReaction struct {
+					Read  bool `json:"read"`
+					Write bool `json:"write"`
+				} `json:"message_reaction"`
+			}
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+			assert.Equal(t, tt.wantRead, resp.MessageReaction.Read)
+			assert.Equal(t, tt.wantWrite, resp.MessageReaction.Write)
+		})
+	}
+}
+
+func boolPtr(v bool) *bool { return &v }
+
+func setMessageReactionCapabilitySetting(t *testing.T, ctx *config.Context, key string, enabled bool) {
+	t.Helper()
+	v := "0"
+	if enabled {
+		v = "1"
+	}
+	_, err := ctx.DB().InsertInto("system_setting").
+		Columns("category", "key_name", "value", "value_type").
+		Values("message_reaction", key, v, settingTypeBool).Exec()
+	require.NoError(t, err)
+	require.NoError(t, EnsureSystemSettings(ctx).Reload())
 }
 
 // appconfig 必须下发 docs_on：值来源于 system_setting docs.enabled。默认 false，

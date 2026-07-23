@@ -33,6 +33,9 @@ func (q *idleDispatchQueue) ReclaimExpired(time.Time, int) (int, error) {
 	q.reclaims.Add(1)
 	return 0, nil
 }
+func (*idleDispatchQueue) RouteMissingSeenAt(_ int64, now time.Time) (time.Time, error) {
+	return now, nil
+}
 
 func TestDispatcherLifecycleStartsStopsAndRejectsDoubleStart(t *testing.T) {
 	registry, err := NewRegistry([]RouteSpec{validRouteSpec()}, testGetenv)

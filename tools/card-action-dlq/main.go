@@ -29,8 +29,16 @@ func main() {
 	}
 	client := octoredis.NewInstrumentedClient(cfg)
 	defer client.Close()
+	dlqRetention := cardactiondispatch.DLQRetentionFromEnv(os.Getenv)
+	// `depth` is read-only (DepthsNoPrune) and never prunes. `replay` is non-destructive too:
+	// it refuses an entry already past this retention window but does NOT delete it (the server
+	// is the sole pruning authority). Surface the resolved value so an operator replaying from a
+	// shell without the server's OCTO_CARD_ACTION_DLQ_RETENTION_DAYS notices a mismatch (a
+	// too-short window would refuse — not destroy — an entry the server still retains).
+	fmt.Fprintf(os.Stderr, "card-action-dlq: DLQ retention = %s (replay only; must match the server's %s)\n", dlqRetention, cardactiondispatch.DLQRetentionEnv)
 	queue, err := cardactiondispatch.NewRedisQueue(client, cardactiondispatch.QueueConfig{
-		Prefix: "card_action_dispatch", LiveTTL: cfg.Robot.MessageExpire, DLQRetention: 30 * 24 * time.Hour,
+		Prefix: "card_action_dispatch", LiveTTL: cfg.Robot.MessageExpire,
+		DLQRetention: dlqRetention,
 	})
 	if err != nil {
 		fatal(err)
@@ -38,7 +46,9 @@ func main() {
 
 	switch action {
 	case "depth":
-		depths, err := queue.Depths()
+		// DepthsNoPrune: inspecting the DLQ must never delete entries, so `depth` reads
+		// the current counts without pruning. The server prunes on its own schedule.
+		depths, err := queue.DepthsNoPrune()
 		if err != nil {
 			fatal(err)
 		}

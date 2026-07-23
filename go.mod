@@ -41,6 +41,7 @@ require (
 	github.com/robfig/cron v1.2.0
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/rubenv/sql-migrate v1.5.2
+	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
 	github.com/sendgrid/rest v2.6.9+incompatible
 	github.com/sideshow/apns2 v0.23.0
 	github.com/sourcegraph/syntaxhighlight v0.0.0-20170531221838-bd320f5d308e

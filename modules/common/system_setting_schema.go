@@ -116,10 +116,16 @@ var systemSettingSchema = []settingDef{
 		Effective: func(s *SystemSettings) string { return floatToCanonical(s.IncomingWebhookPerWebhookRPS()) }},
 	{Category: "incomingwebhook", Key: "per_webhook_burst", Type: settingTypeInt, Description: "单个 Webhook 推送突发上限（令牌桶 burst）", Positive: true,
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.IncomingWebhookPerWebhookBurst()) }},
-	{Category: "incomingwebhook", Key: "max_per_group", Type: settingTypeInt, Description: "单个群最多可创建的 Webhook 数量", Positive: true,
+	{Category: "incomingwebhook", Key: "max_per_group", Type: settingTypeInt, Description: "群本体作用域最多可创建的 Webhook 数量（子区另见 max_per_thread）", Positive: true,
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.IncomingWebhookMaxPerGroup()) }},
-	{Category: "incomingwebhook", Key: "max_per_creator", Type: settingTypeInt, Description: "单个普通成员/机器人在一个群内最多可创建的 Webhook 数量（群主/管理员不受限）", Positive: true,
+	{Category: "incomingwebhook", Key: "max_per_thread", Type: settingTypeInt, Description: "单个子区作用域最多可创建的 Webhook 数量（未配置或 0/≤0 时回退到群本体 max_per_group，并非「禁止子区建 Webhook」；写入要求为正整数）", Positive: true,
+		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.IncomingWebhookMaxPerThread()) }},
+	{Category: "incomingwebhook", Key: "max_per_creator", Type: settingTypeInt, Description: "单个普通成员/机器人在一个投递作用域（群本体或每个子区）内最多可创建的 Webhook 数量（群主/管理员不受限）", Positive: true,
 		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.IncomingWebhookMaxPerCreator()) }},
+	// 群级聚合天花板：非 Positive（允许 0=关闭），写入范围 [0, 3650]。0 表示不限制群 webhook
+	// 总量，只受 max_per_group / max_per_thread 约束；> 0 才封顶单群跨所有作用域的 webhook 总数。
+	{Category: "incomingwebhook", Key: "max_total_per_group", Type: settingTypeInt, Description: "单个群跨群本体+所有子区的 Webhook 总数上限；0=不限制（默认）",
+		Effective: func(s *SystemSettings) string { return strconv.Itoa(s.IncomingWebhookMaxTotalPerGroup()) }},
 	{Category: "incomingwebhook", Key: "member_can_broadcast", Type: settingTypeBool, Description: "非管理员成员创建的 Webhook 是否可用广播型 @（@所有人/@所有 AI）；关闭后即时收回成员广播，管理员创建的不受影响",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.IncomingWebhookMemberCanBroadcast()) }},
 
@@ -140,6 +146,13 @@ var systemSettingSchema = []settingDef{
 	// 不改变 /v1/sticker/user 已有服务端读写权限；默认关闭，便于新能力灰度放量。
 	{Category: "sticker", Key: "custom_enabled", Type: settingTypeBool, Description: "是否向客户端展示自定义贴纸管理入口",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.StickerCustomEnabled()) }},
+
+	// 普通 Web/iOS/Android 客户端的消息 Reaction 能力。read/write 独立灰度：默认可读
+	// 不可写；Bot 身份覆盖后续由独立 /v1/bot/profile 处理，不在公共 appconfig 推断身份。
+	{Category: "message_reaction", Key: "read", Type: settingTypeBool, Description: "是否向普通客户端展示和下发消息 Reaction（默认开启；Bot 能力另行下发）",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.MessageReactionReadEnabled()) }},
+	{Category: "message_reaction", Key: "write", Type: settingTypeBool, Description: "是否向普通客户端展示添加/取消 Reaction 入口（默认关闭；Bot 能力另行下发）",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.MessageReactionWriteEnabled()) }},
 
 	// 自定义贴纸上传句柄强制开关（P0: Sticker Handle Enforcement Rollout）。这是「强制
 	// 策略」，与「签名能力」OCTO_MASTER_KEY 彻底解耦——能力是部署级 env，策略是运营可

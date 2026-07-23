@@ -1,0 +1,7 @@
+{
+  "actions": [
+    {"id": "view_document", "type": "Action.OpenUrl", "dataKeys": [], "inputIds": []}
+  ],
+  "inputs": [],
+  "toggles": []
+}

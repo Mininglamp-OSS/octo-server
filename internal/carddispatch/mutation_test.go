@@ -23,6 +23,14 @@ type fakeMutationBackend struct {
 	writes        []cardMutationWrite
 	revisions     []cardMutationWrite
 	syncs         []cardMutationWrite
+	effective     string
+	effectiveSeq  int64
+	effectiveSet  bool
+	effectiveErr  error
+}
+
+func (b *fakeMutationBackend) EffectiveContent(string) (string, int64, bool, error) {
+	return b.effective, b.effectiveSeq, b.effectiveSet, b.effectiveErr
 }
 
 func (b *fakeMutationBackend) Lookup(_ context.Context, _ CardMutationRequest) (storedCardMessage, error) {

@@ -4,6 +4,85 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-22 (incoming-webhook-quota-per-thread)
+
+- **Behavior change** — Incoming Webhook creation quota re-scoped from
+  *per parent group* to *per delivery scope* `(group_no,
+  thread_short_id)`: the group itself and each thread (子区) now hold
+  independent webhook budgets instead of sharing one per-group cap.
+  `insertWithQuota` narrows both the group-level and per-creator
+  `COUNT(*)` by `thread_short_id`; the `FOR UPDATE` serialization lock
+  stays on the parent `group` row (narrowing it would reintroduce the
+  gap-lock deadlock). Motivated by Octo Loop provisioning a webhook per
+  thread. Supersedes the `incoming-webhook-thread` task's locked
+  "threads share `max_per_group`" decision.
+- **Config** — `incomingwebhook.max_per_group` /
+  `incomingwebhook.max_per_creator` keep their keys and defaults
+  (10 / 5) but are reinterpreted "per delivery scope"; setting docs +
+  admin schema descriptions + the two 409 quota messages (en-US markers
+  + zh-CN) updated. No schema/data migration; existing rows
+  (`thread_short_id=''`) fall into the group-self bucket.
+- **Config (follow-on)** — added two precise-control knobs:
+  `incomingwebhook.max_per_thread` (per-thread scope cap, decoupled from
+  `max_per_group`; falls back to it when unset) and
+  `incomingwebhook.max_total_per_group` (group-wide aggregate ceiling
+  across the group + all threads; `0`=disabled default). `insertWithQuota`
+  evaluates all three quota layers inside the one parent-group `FOR UPDATE`
+  critical section (race-exact; verified by a concurrent aggregate-ceiling
+  test under `-race`). New 409 `mgmt_total_quota_exceeded`. See
+  [journal](journal/shared/incoming-webhook-quota-per-thread.md).
+
+## 2026-07-22 (cardtmpl-interaction-closure)
+
+- **Feature** — Closed the post-#633 interactive-card loop (roadmap group A).
+  `CardUpdater` (`ReplaceView` + progress-frame `Append`) composes the existing
+  `CardMutator` CAS/revision/CMD path; `docs.access-request@0.3.0` adds an
+  `approved`/`rejected` `result` view (`octo/v1`) registered beside the frozen
+  `0.2.0`; the docs finalizer now upgrades approved/denied cards in place to
+  `0.3.0/result`. In-flight `0.2.0` pending cards upgrade too — missing
+  decorative fields are omitted, not fabricated.
+- **Contract** — Route-versioned callback envelope: `legacy` flat body remains
+  the default (byte-compatible), `octo-card-v1` opt-in nested envelope carries
+  `protocol`/`type=card.action`/`card.{…}`/`trigger_id`; `response_url` stays
+  reserved (no authenticated response body defined in §7). See
+  [journal](journal/shared/cardtmpl-interaction-closure.md).
+- **Observability** — Bounded counters `dmwork_cardtmpl_callback_total`
+  (`ok|rejected|error`) + `dmwork_cardtmpl_update_total` (`ok|error`); labels
+  only from registered metadata + declared interactions.
+- **Learning (pending)** — `card_seq` for authoritative updates must come from
+  a monotonic source; the docs finalizer reuses `event.EventID`, an implicit
+  contract now documented. See
+  [learning](learnings/pending/cardtmpl-interaction-closure.md).
+
+## 2026-07-22 (cardtmpl-registry-pilot)
+
+- **Feature** — Introduced the octo-card@1.0 platform base
+  (`pkg/cardtmpl.Template` + `Registry` + `Registry.Render`
+  8-step pipeline) and migrated `docs.access-request@0.2.0` as the
+  first L2a pilot. `metadata.octo.{protocol,template}` are now
+  injected by the base on every payload rendered through the registry
+  (docs approval-request cards, initially).
+- **Contract** — `docs/platform-card-base.md` is added as the L0
+  authoritative contract; `docs/l2b-owners.md` reserves the empty L2b
+  owner allowlist. Handoff artefacts (manifest / contract /
+  samples / reports) live at
+  `pkg/cardtmpl/docs_access_request/handoff/docs.access-request@0.2.0/`
+  and are the machine-readable cross-repo reference.
+- **Behavior change** — For docs `access_requested` cards with the
+  approval gate on, schema-level field errors returned by
+  `Registry.Render` (typed `cardtmpl.ErrFieldsInvalid`) now become
+  **HTTP 400 zero-delivery** rather than degrading to a plain-text DM
+  (C1 policy).
+- **Fix / hardening** — Rewrote the pilot `pending.interaction.json`
+  to match real Go action IDs and dataKeys, so the A15c interaction
+  contract lock is code-vs-report equality instead of a
+  design-phase-vs-code superset check.
+- **Learning** — Deposited
+  `cardtmpl-registry-pilot.md` under `.octospec/learnings/pending/`:
+  a handoff schema authored for a *full compiled card* is NOT the
+  same as a caller-input schema and should not be wired unchanged as
+  the Registry input contract.
+
 ## 2026-07-21 (space-welcome-per-space-admin-crud)
 
 - **Feature** — The onboarding welcome message became **per-Space and
@@ -27,6 +106,62 @@ change-log convention (§7). Newest first.
   MySQL/Redis/WuKongIM confirmed actual receipt and no cross-Space mixing (each
   recipient's channel read back from the IM). See
   [journal](journal/shared/space-welcome-per-space-admin-crud.md).
+
+## 2026-07-20 (route-missing-retry)
+
+- **Fix** — Card-action dispatch (`internal/cardactiondispatch`) now **defers** a
+  `route_missing` at dispatch time (no attempt consumed) instead of dead-lettering on
+  the first attempt. An event only enters the queue when its route existed at enqueue
+  time, so a miss at dispatch means the process restarted into a run whose
+  `OCTO_CARD_ACTION_ROUTES` lacked the route while the durable queue carried the event
+  across — previously a permanent, non-self-healing DLQ that read at the UI as docs
+  approve/deny cards never updating. Deferring (rather than nacking) matters: a nack
+  spends `route.MaxAttempts`, so the event would trip `attempts_exhausted` the moment
+  its route returned. Within `routeMissingMaxWindow` (15m) the event waits and then
+  dispatches on its original attempt budget; past the window it dead-letters
+  (`reason=route_missing`) so a genuine misconfiguration stays visible. The attempt-budget
+  interaction was caught by an `xhigh` code review of the first (nack-based) cut. See
+  [brief](tasks/route-missing-retry/brief.md) · [journal](journal/shared/route-missing-retry.md).
+- **Learning (pending)** — `durable-queue-registry-divergence`: a durable/shared work
+  queue consumed against per-process, startup-loaded config can dead-letter valid work
+  across a config-divergent restart; treat "config absent at consume time" as a bounded
+  retry, not a first-attempt DLQ.
+- **Change (config)** — Card-action DLQ retention is now configurable via
+  `OCTO_CARD_ACTION_DLQ_RETENTION_DAYS` (whole days, 1–365) through a shared
+  `cardactiondispatch.DLQRetentionFromEnv` resolver used by both `main.go` and
+  `tools/card-action-dlq` (so they can't drift). **Default stays 30 days** (the pre-change
+  value), so an upgrade that doesn't set the override keeps the existing recovery window and
+  never prunes older DLQ entries on first deploy; set the env to a smaller value (e.g. `7`) to
+  opt into a shorter window. Doc updated.
+- **Fix (review round, PR #621, 4 reviewers)** — three blocking corrections folded in:
+  (1) a `route_missing` event with a non-positive `ActedAt` now **dead-letters immediately**
+  instead of deferring forever (the wait is bounded by elapsed-since-`ActedAt`, so an unset
+  timestamp had nothing to measure against and re-deferred every 5s indefinitely);
+  (2) the DLQ-retention default was kept at **30 days** rather than lowered to 7 (the running
+  server's lazy prune would otherwise silently delete 8–30-day-old DLQ entries on first deploy);
+  (3) the `card-action-dlq` CLI's read-only `depth` no longer prunes (new `DepthsNoPrune`), so
+  inspecting the DLQ can't delete recoverable entries. The metric-noise nit (per-re-check
+  `observeError`) was left as documented-intentional.
+- **Fix (review round 2, PR #621 re-reviews)** — two further blocking corrections folded in:
+  (4) the bounded route-missing window is now anchored on the **first observed miss** (a durable
+  per-event `route_missing_since` marker via `RouteMissingSeenAt`), not on `Event.ActedAt` — an
+  event that dwelt in the durable queue past the window before its first dispatch (long
+  restart/outage/backlog) now still defers on its first transient miss instead of dead-lettering
+  immediately; this supersedes round 1's `ActedAt<=0` special-case (the marker is always a real
+  stamp, so that edge is gone by construction), and `ReplayDLQ` clears the marker so a replayed
+  event starts fresh; (5) the `card-action-dlq replay` path is now **non-destructive** — an entry
+  past the CLI's resolved retention is refused without being deleted, so the running server stays
+  the single pruning authority (a shorter CLI window can no longer silently destroy a
+  server-retained entry).
+- **Fix (review round 3, PR #621 re-review)** — the round-2 first-miss marker
+  (`route_missing_since`) leaked: it is one shared Redis hash with a whole-hash TTL (no per-field
+  expiry), refreshed on every miss, so under sustained route-missing traffic a field per COMPLETED
+  event accumulated unbounded (it was cleared only on replay, not on delivery or dead-letter).
+  Fixed by `HDEL`-ing the marker on every exit transition (`ackScript`, `nackScript`
+  requeue+dead-letter, and the existing `replayDLQScript`); a new Redis-backed lifecycle test proves
+  the field is gone after Ack and after terminal dead-letter. Also folded in two doc-drift fixes (a
+  stale CLI "refuses (and prunes)" comment; the pending learning's `ActedAt`-based deadline →
+  first-observed-miss, plus a new marker-lifecycle-vs-whole-key-TTL point).
 
 ## 2026-07-20 (github-webhook-parity)
 

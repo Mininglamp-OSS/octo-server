@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	"go.uber.org/zap"
 )
 
@@ -17,6 +18,10 @@ type dispatchQueue interface {
 	Ack(eventID int64, token string) (bool, error)
 	Nack(lease Lease, now time.Time, delay time.Duration, maxAttempts int, reason string) (NackOutcome, error)
 	ReclaimExpired(now time.Time, limit int) (int, error)
+	// RouteMissingSeenAt records (once) and returns when this event's route was first
+	// observed missing at dispatch, so the bounded route-missing window is measured from
+	// that point rather than from Event.ActedAt.
+	RouteMissingSeenAt(eventID int64, now time.Time) (time.Time, error)
 }
 
 type callbackDeliverer interface {
@@ -125,11 +130,52 @@ func (d *Dispatcher) ProcessOne(ctx context.Context, now time.Time) (bool, error
 	route, ok := d.registry.Route(lease.Event.SenderUID, lease.Event.Owner, lease.Event.ActionType)
 	if !ok {
 		d.metrics.observeError(owner, "route_missing")
-		outcome, nackErr := d.nack(*lease, now, false, lease.Attempt, "route_missing")
-		resultLabel = resultForNack(outcome, nackErr)
-		d.logTransition(lease, "route_missing", outcome, nackErr)
+		// A missing route is TRANSIENT, not permanent: an event only reaches this
+		// queue when its route existed at enqueue time (Registry.Resolve returned a
+		// callback), so a miss here means the route was absent from THIS process's
+		// registry at dispatch time — a rolling deploy, or a restart/redeploy that
+		// came up before OCTO_CARD_ACTION_ROUTES carried the route — while the durable
+		// queue outlived that window. DEFER (no attempt consumed) so the event rides
+		// out the window and dispatches on its ORIGINAL attempt budget once the route
+		// returns. Consuming an attempt here (a nack) would let route-absence waiting
+		// exhaust route.MaxAttempts, so the event would trip the attempts_exhausted
+		// gate the moment its route came back — the opposite of self-healing.
+		//
+		// The window is measured from the FIRST observed miss (persisted per event via
+		// RouteMissingSeenAt), NOT from Event.ActedAt. An event can sit in the durable
+		// queue arbitrarily long before its first dispatch attempt — a long restart /
+		// outage / backlog, exactly the window this guards — and must still get the full
+		// self-heal window on its first transient miss, instead of being dead-lettered
+		// immediately because its acted-at is already older than the window. Only after it
+		// has waited past routeMissingMaxWindow SINCE that first miss do we dead-letter it
+		// as a genuine misconfiguration, preserving the DLQ breadcrumb (reason=route_missing).
+		firstSeen, seenErr := d.queue.RouteMissingSeenAt(lease.Event.EventID, d.clock())
+		if seenErr != nil {
+			d.metrics.observeError(owner, "queue_error")
+			d.refreshDepthMetrics()
+			return true, seenErr
+		}
+		if routeMissingExpired(firstSeen, d.clock()) {
+			outcome, nackErr := d.nack(*lease, d.clock(), false, lease.Attempt, "route_missing")
+			resultLabel = resultForNack(outcome, nackErr)
+			d.logTransition(lease, "route_missing", outcome, nackErr)
+			d.refreshDepthMetrics()
+			return true, nackErr
+		}
+		deferred, deferErr := d.queue.Defer(lease.Event.EventID, lease.Token, d.clock().Add(routeMissingDeferInterval))
+		if deferErr != nil {
+			d.metrics.observeError(owner, "queue_error")
+			d.refreshDepthMetrics()
+			return true, deferErr
+		}
+		if !deferred {
+			d.metrics.observeError(owner, "ack_lost")
+			d.refreshDepthMetrics()
+			return true, errors.New("cardactiondispatch: lease ownership lost before route-missing defer")
+		}
+		resultLabel = "deferred"
 		d.refreshDepthMetrics()
-		return true, nackErr
+		return true, nil
 	}
 	if lease.Attempt > route.MaxAttempts {
 		const category = "attempts_exhausted"
@@ -167,6 +213,7 @@ func (d *Dispatcher) ProcessOne(ctx context.Context, now time.Time) (bool, error
 	workCtx := context.WithoutCancel(ctx)
 	result, err := d.deliverer.Deliver(workCtx, route, DecisionRequestFromEvent(lease.Event))
 	if err != nil {
+		recordTemplateCallback(lease.Event, callbackMetricResultForError(err))
 		category := errorCategory(err)
 		d.metrics.observeError(owner, category)
 		retry := Retryable(err)
@@ -179,6 +226,11 @@ func (d *Dispatcher) ProcessOne(ctx context.Context, now time.Time) (bool, error
 		d.refreshDepthMetrics()
 		return true, nackErr
 	}
+	callbackResult := "ok"
+	if result.Disposition != DispositionApplied && result.Disposition != DispositionReplayed {
+		callbackResult = "rejected"
+	}
+	recordTemplateCallback(lease.Event, callbackResult)
 	stopHeartbeat := d.startLeaseHeartbeat(*lease)
 	finalizeErr := d.finalizer.Finalize(workCtx, lease.Event, result)
 	if renewErr := stopHeartbeat(); renewErr != nil {
@@ -213,6 +265,21 @@ func (d *Dispatcher) ProcessOne(ctx context.Context, now time.Time) (bool, error
 	resultLabel = "ok"
 	d.refreshDepthMetrics()
 	return true, nil
+}
+
+func recordTemplateCallback(event Event, result string) {
+	if event.Card.TemplateID == "" || event.Card.TemplateVersion == "" || event.ActionID == "" {
+		return
+	}
+	cardtmpl.RecordCallback(cardtmpl.ID(event.Card.TemplateID), event.Card.TemplateVersion, event.ActionID, result)
+}
+
+func callbackMetricResultForError(err error) string {
+	var deliveryErr *DeliveryError
+	if errors.As(err, &deliveryErr) && deliveryErr.Status >= 400 && deliveryErr.Status < 500 {
+		return "rejected"
+	}
+	return "error"
 }
 
 func (d *Dispatcher) startLeaseHeartbeat(lease Lease) func() error {
@@ -301,6 +368,29 @@ func retryBackoff(attempt int, route *Route) time.Duration {
 		return route.MaxBackoff
 	}
 	return delay
+}
+
+// routeMissingMaxWindow bounds how long an event may wait on a missing route before
+// it is dead-lettered as a genuine misconfiguration. It is generous enough to ride
+// out a rolling deploy / restart window; within it the event is DEFERRED (no attempt
+// consumed), so a route that returns still delivers on its original attempt budget
+// rather than tripping the attempts_exhausted gate.
+const routeMissingMaxWindow = 15 * time.Minute
+
+// routeMissingDeferInterval is how often a route-missing event is re-checked while it
+// waits inside routeMissingMaxWindow. It is deliberately coarser than PollInterval so a
+// long-missing route does not busy re-claim the same event every poll tick.
+const routeMissingDeferInterval = 5 * time.Second
+
+// routeMissingExpired reports whether an event whose route was first observed missing at
+// firstSeen has now waited past routeMissingMaxWindow and must be dead-lettered. The window
+// is anchored on the FIRST observed miss (a durable per-event marker set by RouteMissingSeenAt),
+// not on Event.ActedAt, so a long queue dwell before the first dispatch attempt never robs the
+// event of its self-heal window. firstSeen is always a real stamp (the marker is written on the
+// first miss), so there is no "unset timestamp" edge — an event with any ActedAt, including an
+// unset/legacy one, gets a full window from its first miss and can never wedge in permanent defer.
+func routeMissingExpired(firstSeen time.Time, now time.Time) bool {
+	return now.Sub(firstSeen) >= routeMissingMaxWindow
 }
 
 func errorCategory(err error) string {

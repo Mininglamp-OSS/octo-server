@@ -1,0 +1,14 @@
+injected:
+  - id: space-isolation      # priority 92, load_bearing — quota keys on parent group_no; count narrows by thread_short_id
+    source: repo
+  - id: trust-boundary       # priority 90, load_bearing — incomingwebhook module; thread_short_id from validated row, not request
+    source: repo
+  - id: error-handling       # priority 85, load_bearing — 409 quota-exceeded via httperr.ResponseErrorL + errcode; i18n
+    source: repo
+  - id: rate-limit           # priority 80, path-matched — tangential: DB count gate, not a Redis frequency limiter (not violated)
+    source: repo
+  - id: testing              # priority 70 — new per-scope quota tests
+    source: repo
+  - id: commit-style         # priority 60 — Conventional Commits (Finish phase)
+    source: repo
+brief: .octospec/tasks/incoming-webhook-quota-per-thread/brief.md

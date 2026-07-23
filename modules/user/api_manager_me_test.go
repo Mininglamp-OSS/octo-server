@@ -22,7 +22,7 @@ func TestManagerCapabilities(t *testing.T) {
 
 	superOnly := []string{
 		"system_setting", "backup", "appversion.write", "dashboard.trigger", "space.destructive",
-		"users.write", "users.manage_admin", "groups.write", "mcp.write", "mcp.read",
+		"users.write", "users.manage_admin", "groups.write", "skill.write", "skill.read", "mcp.write", "mcp.read",
 	}
 	adminTier := []string{
 		"appversion.read", "dashboard.read", "users.read", "groups.read", "space.read", "space.write",
@@ -119,6 +119,8 @@ func TestManagerMe_AdminGetsReadCapsNotWrite(t *testing.T) {
 	assert.False(t, resp.Capabilities["users.manage_admin"], "admin must NOT have users.manage_admin")
 	assert.False(t, resp.Capabilities["groups.write"], "admin must NOT have groups.write")
 	assert.False(t, resp.Capabilities["space.destructive"], "admin must NOT have space.destructive")
+	assert.False(t, resp.Capabilities["skill.read"], "admin must NOT have skill.read (system Skill list/detail is superAdmin-only)")
+	assert.False(t, resp.Capabilities["skill.write"], "admin must NOT have skill.write (system Skill create/edit/delete/category management)")
 	assert.False(t, resp.Capabilities["mcp.read"], "admin must NOT have mcp.read (system MCP list/detail is superAdmin-only)")
 	assert.False(t, resp.Capabilities["mcp.write"], "admin must NOT have mcp.write (system MCP create/edit/delete)")
 	assert.False(t, resp.Capabilities["system_setting"], "admin must NOT have system_setting")
@@ -142,6 +144,8 @@ func TestManagerMe_SuperAdminGetsWriteCaps(t *testing.T) {
 	assert.True(t, resp.Capabilities["groups.write"], "superAdmin should have groups.write")
 	assert.True(t, resp.Capabilities["system_setting"], "superAdmin should have system_setting")
 	assert.True(t, resp.Capabilities["users.read"], "superAdmin should have users.read")
+	assert.True(t, resp.Capabilities["skill.write"], "superAdmin should have skill.write")
+	assert.True(t, resp.Capabilities["skill.read"], "superAdmin should have skill.read")
 	assert.True(t, resp.Capabilities["mcp.write"], "superAdmin should have mcp.write")
 	assert.True(t, resp.Capabilities["mcp.read"], "superAdmin should have mcp.read")
 }

@@ -718,7 +718,12 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 			channelOffsetM := channelOffsetModelMap[channelKey]
 			deviceOffsetM := deviceOffsetModelMap[channelKey]
 			extra := conversationExtraMap[channelKey]
-			syncUserConversationResp := newSyncUserConversationResp(conversation, extra, loginUID, co.messageExtraDB, co.messageReactionDB, co.messageUserExtraDB, mute, stick, channelOffsetM, deviceOffsetM, channelOffsetMessageSeq)
+			syncUserConversationResp, err := newSyncUserConversationResp(conversation, extra, loginUID, co.messageExtraDB, co.messageReactionDB, co.messageUserExtraDB, mute, stick, channelOffsetM, deviceOffsetM, channelOffsetMessageSeq)
+			if err != nil {
+				log.Error("构建会话同步响应失败", zap.Error(err), zap.String("channelID", conversation.ChannelID))
+				httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+				return
+			}
 			// 填充群组分类信息
 			if conversation.ChannelType == common.ChannelTypeGroup.Uint8() {
 				if categorySetting := groupCategoryMap[conversation.ChannelID]; categorySetting != nil {
@@ -888,7 +893,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	// Space 过滤
 	if hasSpaceFilter {
 		// Person 频道：计算 per-Space 未读计数（在过滤之前，需要原始会话数据）
-		fillPersonSpaceUnread(syncUserConversationResps, conversations, filterSpaceID, defaultSpaceID, loginUID, co.ctx)
+		fillPersonSpaceUnread(syncUserConversationResps, conversations, filterSpaceID, defaultSpaceID, loginUID, co.ctx, co.messageExtraDB)
 
 		syncUserConversationResps = FilterConversationsBySpace(
 			syncUserConversationResps, filterSpaceID, loginUID, co.ctx, co.groupService,
@@ -1472,7 +1477,7 @@ type SyncUserConversationResp struct {
 	BotType          string                 `json:"bot_type,omitempty"`           // Bot 类型（"app_bot" 表示应用 Bot）
 }
 
-func newSyncUserConversationResp(resp *config.SyncUserConversationResp, extra *conversationExtraResp, loginUID string, messageExtraDB *messageExtraDB, messageReactionDB *messageReactionDB, messageUserExtraDB *messageUserExtraDB, mute int, stick int, channelOffsetM *channelOffsetModel, deviceOffsetM *deviceOffsetModel, channelOffsetMessageSeq uint32) *SyncUserConversationResp {
+func newSyncUserConversationResp(resp *config.SyncUserConversationResp, extra *conversationExtraResp, loginUID string, messageExtraDB *messageExtraDB, messageReactionDB *messageReactionDB, messageUserExtraDB *messageUserExtraDB, mute int, stick int, channelOffsetM *channelOffsetModel, deviceOffsetM *deviceOffsetModel, channelOffsetMessageSeq uint32) (*SyncUserConversationResp, error) {
 	recents := make([]*MsgSyncResp, 0, len(resp.Recents))
 	lastClientMsgNo := "" // 最新未被删除的消息的clientMsgNo
 	if len(resp.Recents) > 0 {
@@ -1496,7 +1501,11 @@ func newSyncUserConversationResp(resp *config.SyncUserConversationResp, extra *c
 		// 消息扩充数据
 		messageExtras, err := messageExtraDB.queryWithMessageIDsAndUID(messageIDs, loginUID)
 		if err != nil {
+			// fail-closed：撤回脱敏依赖 message_extra.revoke。查询失败则 messageExtraMap
+			// 为空，from() 拿不到 Revoke=1、会漏做脱敏并原样下发撤回原文。冒泡给调用方
+			// 中止整个会话同步，与单条直查 api_message_get.go 同口径。
 			log.Error("查询消息扩展字段失败！", zap.Error(err))
+			return nil, err
 		}
 		messageExtraMap := map[string]*messageExtraDetailModel{}
 		if len(messageExtras) > 0 {
@@ -1565,7 +1574,7 @@ func newSyncUserConversationResp(resp *config.SyncUserConversationResp, extra *c
 		Stick:           stick,
 		Recents:         recents,
 		Extra:           extra,
-	}
+	}, nil
 }
 
 // threadMetaResp 子区元数据（仅 thread 频道返回）

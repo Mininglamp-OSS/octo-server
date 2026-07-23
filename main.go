@@ -32,6 +32,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
 	"github.com/Mininglamp-OSS/octo-server/pkg/avatarrender"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
+	docsaccessrequest "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/docs_access_request"
 	octodb "github.com/Mininglamp-OSS/octo-server/pkg/db"
 	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
@@ -234,6 +236,7 @@ func runAPI(ctx *config.Context) {
 	if err := installCardDispatch(ctx); err != nil {
 		panic(fmt.Errorf("install internal card dispatch registry: %w", err))
 	}
+	installCardTmplRegistry() // pkg/cardtmpl L0 registry: pilot Templates + Freeze (fail-close)
 	cardActionRuntime, err := installCardActionDispatch(ctx)
 	if err != nil {
 		panic(fmt.Errorf("install card action callback dispatch: %w", err))
@@ -527,10 +530,18 @@ func installCardActionDispatch(ctx *config.Context) (*cardActionDispatchRuntime,
 		options.MaxRetries = 1
 		options.PoolSize = 10
 	})
+	dlqRetention := cardactiondispatch.DLQRetentionFromEnv(os.Getenv)
+	// Log both the raw override and the resolved retention so a typo'd
+	// OCTO_CARD_ACTION_DLQ_RETENTION_DAYS that silently fell back to the default is visible
+	// (raw="90x" but retention=720h reveals the fallback), and so operators can match the CLI.
+	log.NewTLog("CardActionDispatch").Info("card action DLQ retention resolved",
+		zap.Duration("retention", dlqRetention),
+		zap.String("env", cardactiondispatch.DLQRetentionEnv),
+		zap.String("raw", os.Getenv(cardactiondispatch.DLQRetentionEnv)))
 	queue, err := cardactiondispatch.NewRedisQueue(redisClient, cardactiondispatch.QueueConfig{
 		Prefix:       "card_action_dispatch",
 		LiveTTL:      ctx.GetConfig().Robot.MessageExpire,
-		DLQRetention: 30 * 24 * time.Hour,
+		DLQRetention: dlqRetention,
 	})
 	if err != nil {
 		_ = redisClient.Close()
@@ -687,4 +698,21 @@ func replaceWebConfig(cfg *config.Config) {
 	if err := os.WriteFile(path, []byte(newConfigContent), 0644); err != nil {
 		log.Error("failed to write web config", zap.String("path", path), zap.Error(err))
 	}
+}
+
+// installCardTmplRegistry 装配 L0 cardtmpl.Registry 并注入到 pkg-scoped default。
+// 同时保留已发布冻结的 0.2.0 与带 result 视图的 0.3.0;新消息默认 0.3.0,
+// 旧 0.2.0 pending 消息仍可由 finalizer 升级成 0.3.0/result。
+//
+// Fail-close 契约:任一 Register/SetDefault 失败 → panic(与 main.go:521 现有的
+// docs approval callback route 校验同源)。init 期 schema/manifest 语法错无
+// runtime env 可挽救,回滚 = 镜像 revert。
+func installCardTmplRegistry() {
+	registry := cardtmpl.NewRegistry()
+	registry.Register(docsaccessrequest.New(), docsaccessrequest.Assets, docsaccessrequest.HandoffRoot)
+	registry.Register(docsaccessrequest.NewV3(), docsaccessrequest.Assets, docsaccessrequest.HandoffRootV3)
+	registry.SetDefault(docsaccessrequest.TemplateID, docsaccessrequest.TemplateVersionV3)
+	registry.Freeze()
+	cardtmpl.SetGlobalMetrics(cardtmpl.NewMetrics(prometheus.DefaultRegisterer))
+	cardtmpl.SetDefaultRegistry(registry)
 }

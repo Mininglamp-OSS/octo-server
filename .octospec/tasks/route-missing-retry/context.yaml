@@ -1,0 +1,118 @@
+# Rules resolved for this task (octospec Implement phase).
+slug: route-missing-retry
+resolved_at: 2026-07-20T16:30:00+08:00
+
+# Files touched: internal/cardactiondispatch/dispatcher.go,
+#                internal/cardactiondispatch/route_missing_test.go
+# Path-glob matches: rate-limit (internal/**/*.go), space-isolation (internal/**/*.go),
+#                    testing (**/*_test.go), commit-style (**).
+
+rules_injected:
+  - id: space-isolation
+    tier: repo
+    load_bearing: true
+    why: >
+      Path glob internal/**/*.go matches. Checked for cross-space leakage.
+    applied:
+      - N/A — no data access and no Space boundary is crossed. The dispatcher acts on
+        events already space-validated at enqueue time (modules/message card/action
+        endpoint). This change only decides retry-vs-DLQ on a route-lookup miss keyed by
+        (sender_uid, owner, action_type); it reads no user data and grants nothing.
+      - Retrying does not widen access: re-delivery targets the exact same event; the
+        consumer re-checks operator authorization per its own contract.
+  - id: rate-limit
+    tier: repo
+    load_bearing: true
+    why: >
+      Path glob internal/**/*.go matches; the change adds a defer/re-check schedule.
+    applied:
+      - N/A — not request-frequency limiting. route_missing reuses the queue's EXISTING
+        Defer mechanism (the same one the max_in_flight capacity path uses) on a fixed
+        routeMissingDeferInterval. No hand-rolled Redis counter is introduced; no HTTP
+        throttling.
+  - id: testing
+    tier: repo
+    load_bearing: false
+    applied:
+      - Risk-proportional package unit tests added (route_missing retry, eventual DLQ,
+        backoff bounds, and that Deliver/Finalize never run while the route is missing).
+      - Tests use the package's in-memory fake queue (concurrentLeaseQueue); they need no
+        MySQL/Redis/WuKongIM, so the testutil NewTestServer/CleanAllTables setup does not apply.
+  - id: commit-style
+    tier: repo
+    load_bearing: false
+    applied:
+      - Conventional Commit `fix(cardaction): ...`, English body.
+      - No linked GitHub issue (diagnosed from a live prod investigation, not an issue).
+
+notes:
+  - error-handling rule does NOT match (paths are modules/**, pkg/errcode/**, pkg/**/httperr/**;
+    internal/** is excluded) and the change emits no user-facing error response — it only
+    changes an internal dispatch nack policy. No new error codes; make i18n-* not required.
+  - trust-boundary rule does NOT match (adapter/webhook/richtext paths only).
+  - Design residual (documented): a genuinely unconfigured route now dead-letters after
+    routeMissingMaxWindow (15m from Event.ActedAt) instead of on attempt 1 — a deliberate
+    trade of later DLQ visibility for fully self-healing a transient rolling-deploy /
+    restart window. The DLQ signal (reason=route_missing) is preserved, just delayed.
+  - route_missing is modeled as "not ready yet" (Defer, no attempt consumed), NOT a failed
+    delivery attempt (Nack). The first cut used a bounded nack and an xhigh code review
+    caught that it shared the delivery attempt budget → attempts_exhausted on route return.
+    Learning staged: learnings/pending/durable-queue-registry-divergence.md.
+  - PR review round (4 reviewers on #621) produced three corrections, all folded into this task:
+    (1) BLOCKING — routeMissingExpired returned "not-expired" for a non-positive ActedAt, so a
+    legacy/malformed event with ActedAt<=0 and a missing route would re-defer every 5s forever
+    (never delivered, never dead-lettered). Fixed: non-positive ActedAt is now EXPIRED → immediate
+    dead-letter (reason preserved, visible/replayable). Runtime guard chosen over an Enqueue-time
+    guard because it also covers already-queued legacy events and avoids churning many test event
+    builders. Test: TestRouteMissingZeroActedAtDeadLetters.
+    (2) BLOCKING — the separate DLQ-retention change had lowered the default 30→7d; on deploy the
+    server (refreshDepthMetrics → Depths → pruneDLQScript) would irreversibly prune 8–30-day-old
+    DLQ entries with no operator action. Fixed: DefaultDLQRetention restored to 30d (the pre-change
+    value); 7d (or any 1–365) stays available via OCTO_CARD_ACTION_DLQ_RETENTION_DAYS. User chose
+    this (keep the existing contract as default, opt into shorter per deploy).
+    (3) BLOCKING — the card-action-dlq CLI's read-only `depth` pruned via Depths() using retention
+    resolved from the CLI's own env, so inspecting the DLQ from a shell without the server's env
+    could delete recoverable entries. Fixed: new RedisQueue.DepthsNoPrune() (ZCard only); `depth`
+    uses it. The server remains the sole pruning authority.
+  - The metric-noise nit (observeError fires once per 5s re-check while waiting) is left as-is:
+    it is intentional and documented (docs/card-action-callback-dispatch.md "Queue and alerts"),
+    and moving it would drop the "route currently missing" operational signal. Not a defect.
+  - PR review round 2 (re-reviews on the fixed head) produced two more blocking corrections:
+    (4) BLOCKING (Jerry-Xin, Critical) — the bounded window was anchored on Event.ActedAt, so an
+    event that dwelt in the durable queue past the window before its FIRST dispatch (long
+    restart/outage/backlog — exactly this feature's target scenario) got zero self-heal window and
+    dead-lettered on its first miss. Fixed by anchoring the window on the FIRST observed miss: a
+    durable per-event marker (Redis hash route_missing_since, HSETNX-then-read, TTL=liveTTL) written
+    by RedisQueue.RouteMissingSeenAt and read in the dispatcher; routeMissingExpired now takes that
+    firstSeen time. This SUPERSEDES round-1's ActedAt<=0 special-case (correction 1): ActedAt is no
+    longer consulted for the window, the marker is always a real stamp, so the unset-timestamp edge
+    and the permanent-defer wedge are both gone by construction. ReplayDLQ clears the marker so a
+    replayed event starts a fresh window. New tests: TestRouteMissingOldActedAtDefersOnFirstMiss,
+    TestRouteMissingSeenAtAnchorsOnFirstMiss (Redis).
+    (5) BLOCKING (yujiawei, P1) — the DLQ `replay` path deleted an entry older than the CLI's
+    resolved retention before returning 0, so a CLI whose window was shorter than the server's could
+    silently destroy a server-retained entry — the same destructive-tool class DepthsNoPrune fixed
+    for `depth`. Fixed by making replayDLQScript's expiry branch non-destructive (return 0 without
+    deleting); the running server's Depths() prune is the single pruning authority. New test:
+    TestReplayDLQPastRetentionIsNonDestructive (Redis).
+  - Non-blocking notes from round 2 that needed NO code change: Octo-Q's "metric fires once per event
+    not per re-check" was a misread (observeError sits above the expiry gate, so it does fire per
+    re-check — doc is correct); yujiawei's acted_at type-assertion note verified safe (same in-memory
+    map, no JSON round-trip); the "PR summary says 7d" note was already resolved by the body update.
+  - PR review round 3 (re-review of the first-miss marker) produced one more blocking correction:
+    (6) BLOCKING (Jerry-Xin, Critical) — the round-2 route_missing_since marker leaked. It is one
+    shared Redis hash with a whole-hash PEXPIRE; Redis cannot expire individual fields, and every
+    miss refreshed the hash TTL, so under sustained route-missing traffic the key never expired and
+    a field per COMPLETED event accumulated forever (the marker was only cleared on ReplayDLQ, not on
+    Ack/terminal Nack). The round-2 comment's "self-reaps via TTL" claim was wrong. Fixed by HDEL'ing
+    the marker on every exit transition: ackScript (delivery), nackScript (both requeue and
+    dead-letter branches — one HDEL after the token check covers both), plus the existing
+    replayDLQScript. New Redis-backed lifecycle test TestRouteMissingMarkerClearedOnTerminalTransitions
+    asserts the field is gone after Ack and after terminal dead-letter. Validated against a real local
+    Redis (all Redis-backed tests + existing lease/ack/nack/replay contract tests pass), not just the
+    fakes. Octo-Q flagged the same thing but as a non-blocking nit ("self-reaps via TTL, event IDs
+    never recur") — it under-weighted the whole-hash-TTL-refresh interaction; Jerry-Xin's blocking
+    call was correct.
+  - Round-3 non-blocking, fixed in the same commit (both doc drift from earlier deltas): the
+    card-action-dlq CLI comment said replay "refuses (and prunes)" (replay is now non-destructive);
+    the pending learning still prescribed an ActedAt-based deadline (superseded by first-observed-miss).

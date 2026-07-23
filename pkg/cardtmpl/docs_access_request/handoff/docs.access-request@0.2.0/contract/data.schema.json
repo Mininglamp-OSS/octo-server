@@ -1,0 +1,107 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "文档访问申请卡数据契约",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "requestId",
+    "state",
+    "document"
+  ],
+  "properties": {
+    "requestId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "文档服务中的访问申请唯一 ID",
+      "examples": [
+        "DOC-REQ-024"
+      ]
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "pending"
+      ],
+      "description": "卡片业务状态。本 L1 契约当前只声明 pending;approved/rejected 待 0.3.0 outcome 版本"
+    },
+    "document": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "title"
+      ],
+      "properties": {
+        "docId": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "文档服务侧稳定 doc ID（可空；用于 deep-link 拼接 /d/{docId}）"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "文档标题"
+        },
+        "url": {
+          "type": "string",
+          "maxLength": 2048,
+          "description": "文档 HTTPS 地址（可空，服务端由 webLoginURL + docId 拼接）"
+        },
+        "sourceName": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "文档所在空间或目录（可空）"
+        }
+      }
+    },
+    "requester": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "maxLength": 120,
+          "description": "申请人展示名称（可空，空时卡片走匿名兜底文案）"
+        },
+        "avatarUrl": {
+          "type": "string",
+          "maxLength": 2048,
+          "pattern": "^(|https://[^/].*)$",
+          "description": "申请人头像 URL。pattern 只做粗粒度前缀防护(拒 https:/// 等首字符为斜杠的形式);host 非空由服务端 preflight 的 URL parser 权威校验(cardtmpl.AbsoluteHTTPSURL,C1 400)—— 正则无法可靠判定 host,如 https://?x 会漏过 pattern。空字符串允许(空时省略头像列)"
+        }
+      }
+    },
+    "permission": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "type": "string",
+          "maxLength": 80,
+          "description": "权限标签，例如协作权限（服务端本地化字典，调用方可留空）"
+        },
+        "roleLabel": {
+          "type": "string",
+          "maxLength": 80,
+          "description": "申请后的角色，例如协作者（服务端本地化字典，调用方可留空）"
+        }
+      }
+    },
+    "requestReason": {
+      "type": "string",
+      "maxLength": 300,
+      "description": "申请原因"
+    },
+    "requestedAtDisplay": {
+      "type": "string",
+      "maxLength": 80,
+      "description": "人员行右侧展示时间"
+    },
+    "messageTimeDisplay": {
+      "type": "string",
+      "maxLength": 80,
+      "description": "页脚申请或处理时间"
+    }
+  }
+}

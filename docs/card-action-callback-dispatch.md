@@ -208,7 +208,20 @@ are reclaimed; a stale worker cannot renew or ACK another worker's lease.
 If a route has reached `max_in_flight`, its lease is atomically deferred for one
 poll interval without consuming an attempt, so other routes and shutdown remain
 unblocked.
-Live retention equals `Robot.MessageExpire`; DLQ retention is 30 days.
+Live retention equals `Robot.MessageExpire`. DLQ retention defaults to 30 days and
+is overridable via `OCTO_CARD_ACTION_DLQ_RETENTION_DAYS` (whole days, 1–365; empty
+or invalid values fall back to the default). The default preserves the recovery window
+the code shipped with before retention was configurable, so an upgrade that does not set
+the override never silently prunes older DLQ entries on first deploy; set the env to a
+smaller value (e.g. `7`) to opt into a shorter window. The retention clock starts when the
+event is dead-lettered, and pruning is lazy — the running server is the **sole** pruning
+authority, pruning on its own `Depths()` calls with its resolved window. Replay a dead-lettered
+event within the window. The `card-action-dlq` CLI never prunes: `depth` is read-only, and
+`replay` is non-destructive — if the entry is older than the CLI's resolved window it refuses
+(prints "not present") but does **not** delete it, so inspecting or replaying from a shell whose
+`OCTO_CARD_ACTION_DLQ_RETENTION_DAYS` is shorter than the server's can never destroy a
+server-retained entry. Still, export the same value the server uses so `replay` doesn't refuse an
+entry the server still retains.
 
 Alert from these bounded-label metrics:
 
@@ -224,6 +237,21 @@ Deployment-specific thresholds belong in the monitoring repository. At
 minimum, alert on sustained DLQ depth above zero and sustained `consumer_5xx`,
 `invalid_response`, or applicant notification failures.
 
+A `route_missing` at dispatch is treated as transient (a rolling deploy / restart
+that came up before `OCTO_CARD_ACTION_ROUTES` loaded the route): the event is
+**deferred** (no attempt consumed) and re-checked until the route returns or it has
+waited ~15 minutes, after which it dead-letters (`reason=route_missing`). So
+`error_total{category="route_missing"}` increments **once per re-check** while an
+event waits, not once per event — treat sustained non-zero `route_missing` (or DLQ
+entries with that reason) as a route-config divergence to fix, and size any rate
+alert accordingly. The wait is bounded by elapsed time since the route-miss was **first
+observed** (persisted per event), not since the user acted — so an event that sat in the
+durable queue for a long time before its first dispatch attempt (a long restart / outage /
+backlog carried by the durable queue) still gets the full ~15-minute self-heal window on its
+first transient miss, rather than being dead-lettered immediately because its acted-at is
+already old. The first-miss marker is cleared when the event is replayed from the DLQ, so a
+replayed event starts a fresh window.
+
 ## Manual DLQ replay
 
 First inspect logs/metrics and fix the consumer or configuration. Record the
@@ -238,6 +266,11 @@ Replay resets attempts and returns that one event to ready state. The consumer
 must remain idempotent: its domain decision may already have committed. Terminal
 card mutation is also idempotent (`card_seq=event_id`). Applicant notification
 is at-least-once, so replay may duplicate it at the documented crash boundary.
+Replay is non-destructive: an entry older than the CLI's resolved retention is
+refused (`event_id N was not present in the DLQ`) but left intact for the server to
+prune — it never deletes a server-retained entry. If a replay reports "not present"
+for an entry you expect to exist, re-run with `OCTO_CARD_ACTION_DLQ_RETENTION_DAYS`
+set to the server's value.
 
 ## Rollout and rollback
 
