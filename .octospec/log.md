@@ -24,6 +24,15 @@ change-log convention (§7). Newest first.
   `metadata.octo` fields. `modules/notify/testmain_test.go` wires the
   Registry once for the whole test package (mirrors production wiring). See
   [journal](journal/shared/cardtmpl-l2a-migration.md).
+- **Review fix (P1, PR #649)** — Over-length display fields were flipping to a
+  400 zero-delivery under the C1 preflight where legacy truncated & delivered.
+  `mapDocsCardFieldsToDisplayJSON` now server-side truncates title/actorName/
+  excerpt/updatedAt to the schema/render caps before preflight (delivery
+  preserved); `docId` stays a hard C1 400 (deep-link key). Exported
+  `cardtmpl.MaxTitleRunes` + `cardtmpl.TruncateRunes` (single cap/impl, G9);
+  added `TestSchemaCapsMatchRenderCaps` (closes the previously-dangling G9
+  field-cap reference) + `TestMapDocsDisplayFields_TruncatesDisplayFields` +
+  `docs_shared` en test; made the docs build-error log label kind-generic.
 
 ## 2026-07-22 (incoming-webhook-quota-per-thread)
 

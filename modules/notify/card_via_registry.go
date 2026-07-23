@@ -133,20 +133,39 @@ func (n *Notify) buildDocsAccessRequestCardViaRegistry(
 	return cardDoc, renderProfile, nil
 }
 
+// docsActorNameMaxRunes / docsUpdatedAtMaxRunes mirror the docs.commented /
+// docs.shared data.schema.json maxLength for these display fields.
+// mapDocsCardFieldsToDisplayJSON truncates to them (title/excerpt reuse the
+// exported cardtmpl caps) so an over-length display string renders truncated
+// rather than flipping to a C1 400 (P1, PR #649 review). The schema maxLength is
+// the backstop — TestSchemaCapsMatchRenderCaps (docs_commented/docs_shared)
+// asserts no drift, and TestMapDocsDisplayFields_TruncatesDisplayFields locks
+// that truncation leaves the field within schema.
+const (
+	docsActorNameMaxRunes = 120
+	docsUpdatedAtMaxRunes = 80
+)
+
 // mapDocsCardFieldsToDisplayJSON 把扁平 DocsCardFields 映射成 docs.commented /
 // docs.shared 契约期望的 JSON 形状(与 pilot mapDocsCardFieldsToJSON 同思路,
 // 只是纯展示卡的字段集更小 —— 无 requestId/permission/头像/申请理由)。字节
 // 等价基线依赖此映射与 legacy buildDocsCard 提取自同一 DocsCardFields。
+//
+// P1 (PR #649 review):展示字段服务端截断到 schema maxLength / 渲染预算。legacy
+// buildDocsCard 从不按长度拒 —— 超长 excerpt 在 render 时 truncateRunes 截断后照常
+// 投递。走 C1 preflight 后,超长字段本会翻成 400 零投递(连 text 兜底都不触发)。
+// 这里截断保住"通知永不丢"不变量,同时对 docId(deep-link key,绝不能静默截断)
+// 保留 C1 硬 400 —— 与 summary 侧 taskNo 同处置(见 mapSummaryCardFieldsToJSON)。
 func mapDocsCardFieldsToDisplayJSON(card *DocsCardFields) (json.RawMessage, error) {
 	if card == nil {
 		return nil, errors.New("mapDocsCardFieldsToDisplayJSON: nil card")
 	}
 	m := map[string]any{
-		"docId":     strings.TrimSpace(card.DocID),
-		"title":     strings.TrimSpace(card.Title),
-		"actorName": strings.TrimSpace(card.ActorName),
-		"excerpt":   strings.TrimSpace(card.Excerpt),
-		"updatedAt": strings.TrimSpace(card.UpdatedAt),
+		"docId":     strings.TrimSpace(card.DocID), // deep-link key:不截断(超长 → C1 400)
+		"title":     cardtmpl.TruncateRunes(strings.TrimSpace(card.Title), cardtmpl.MaxTitleRunes),
+		"actorName": cardtmpl.TruncateRunes(strings.TrimSpace(card.ActorName), docsActorNameMaxRunes),
+		"excerpt":   cardtmpl.TruncateRunes(strings.TrimSpace(card.Excerpt), cardtmpl.MaxExcerptRunes),
+		"updatedAt": cardtmpl.TruncateRunes(strings.TrimSpace(card.UpdatedAt), docsUpdatedAtMaxRunes),
 	}
 	raw, err := json.Marshal(m)
 	if err != nil {

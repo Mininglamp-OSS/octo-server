@@ -133,6 +133,31 @@ func TestSchemaC1RejectsShortTitle(t *testing.T) {
 	}
 }
 
+// TestSchemaCapsMatchRenderCaps 锁 G9 单一真源:handoff data.schema.json 里
+// excerpt / title 的 maxLength 必须与渲染层 cardtmpl.MaxExcerptRunes /
+// MaxTitleRunes 一致。补上 yujiawei 在 #649 review 指出的"悬空引用的 G9
+// field-cap test"(resource.go assembleResourceCardBody 注释所引)。
+func TestSchemaCapsMatchRenderCaps(t *testing.T) {
+	raw, err := docscommented.Assets.ReadFile(docscommented.HandoffRoot + "/contract/data.schema.json")
+	if err != nil {
+		t.Fatalf("read schema: %v", err)
+	}
+	var schema struct {
+		Properties map[string]struct {
+			MaxLength int `json:"maxLength"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		t.Fatalf("unmarshal schema: %v", err)
+	}
+	if got := schema.Properties["excerpt"].MaxLength; got != cardtmpl.MaxExcerptRunes {
+		t.Errorf("excerpt maxLength = %d, want cardtmpl.MaxExcerptRunes = %d", got, cardtmpl.MaxExcerptRunes)
+	}
+	if got := schema.Properties["title"].MaxLength; got != cardtmpl.MaxTitleRunes {
+		t.Errorf("title maxLength = %d, want cardtmpl.MaxTitleRunes = %d", got, cardtmpl.MaxTitleRunes)
+	}
+}
+
 func isFieldsInvalid(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "fields did not pass input schema")
 }

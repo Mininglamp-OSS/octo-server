@@ -409,13 +409,15 @@ func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error
 			// - other build errors (render failure / marshal / dependency) →
 			//   degrade to plain-text so the notification still lands.
 			if errors.Is(buildErr, cardtmpl.ErrFieldsInvalid) {
-				n.Warn("docs access-request card rejected: fields did not pass schema (400)",
-					zap.Error(buildErr), zap.String("space_id", req.SpaceID), zap.String("doc_id", card.DocID))
+				n.Warn("docs card rejected: fields did not pass schema (400)",
+					zap.Error(buildErr), zap.String("space_id", req.SpaceID), zap.String("doc_id", card.DocID),
+					zap.String("kind", card.Kind))
 				return nil, errNotifyCardInvalid
 			}
 			if errors.Is(buildErr, errCardTmplUnavailable) {
-				n.Error("docs access-request card: cardtmpl unavailable (composition bug, 500)",
-					zap.Error(buildErr), zap.String("space_id", req.SpaceID), zap.String("doc_id", card.DocID))
+				n.Error("docs card: cardtmpl unavailable (composition bug, 500)",
+					zap.Error(buildErr), zap.String("space_id", req.SpaceID), zap.String("doc_id", card.DocID),
+					zap.String("kind", card.Kind))
 				return nil, buildErr // 不 wrap 为 errNotifyCardInvalid,api.go 兜底走 500
 			}
 			n.Warn("build docs card failed, degrading to text",

@@ -18,15 +18,15 @@ var Assets embed.FS
 
 const (
 	HandoffRoot                    = "handoff/docs.shared@0.1.0"
-	TemplateID     cardtmpl.ID     = "docs.shared"
+	TemplateID      cardtmpl.ID    = "docs.shared"
 	TemplateVersion                = "0.1.0"
-	StateShown     cardtmpl.State  = "shown"
+	StateShown      cardtmpl.State = "shown"
 	Variant                        = "docs.shared"
 )
 
 type Template struct{ meta cardtmpl.TemplateMeta }
 
-func New() *Template                           { return &Template{} }
+func New() *Template                                { return &Template{} }
 func (t *Template) SetMeta(m cardtmpl.TemplateMeta) { t.meta = m }
 func (t *Template) Meta() cardtmpl.TemplateMeta     { return t.meta.Clone() }
 

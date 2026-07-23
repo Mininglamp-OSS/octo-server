@@ -18,9 +18,14 @@ import (
 
 const (
 	MaxExcerptRunes = 300
-	maxFacts        = 20
-	maxTitleRunes   = 200
-	maxFactRunes    = 500
+	// MaxTitleRunes is the render-layer title cap. Exported so producer mapping
+	// layers (e.g. modules/notify) can pre-truncate display titles to the exact
+	// budget assembleResourceCardBody enforces — a single source of truth for the
+	// title cap (G9), used by both the render guard and the ingress truncation.
+	MaxTitleRunes = 200
+	maxFacts      = 20
+	maxTitleRunes = MaxTitleRunes
+	maxFactRunes  = 500
 )
 
 type Fact struct {
@@ -201,8 +206,9 @@ func BuildDocsResourceCardBodyWithLang(
 // body is a single source of truth across the legacy and Registry paths.
 //
 // The excerpt is truncated to MaxExcerptRunes here (render-time cap); a card's
-// input schema declares the same maxLength so the two never drift (see the
-// docs_commented G9 field-cap test).
+// input schema declares the same maxLength, and the ingress mapping layer
+// truncates to it before preflight, so the three never drift — asserted by the
+// docs_commented / docs_shared TestSchemaCapsMatchRenderCaps (G9).
 func assembleResourceCardBody(lang string, deepLink string, resource ResourceCard) ([]interface{}, error) {
 	if strings.TrimSpace(resource.Title) == "" || utf8.RuneCountInString(resource.Title) > maxTitleRunes {
 		return nil, errors.New("cardtmpl: resource title is invalid")
@@ -389,6 +395,14 @@ func SanitizeLine(s string) string {
 		return r
 	}, s))
 }
+
+// TruncateRunes truncates value to at most limit runes, appending an ellipsis
+// when it actually cuts. Exported so producer mapping layers (modules/notify)
+// can pre-truncate display fields to the same schema/render budgets and preserve
+// card delivery, instead of an over-length field flipping to a C1 400 at
+// preflight (see modules/notify.mapDocsCardFieldsToDisplayJSON). Wraps the
+// internal truncateRunes so the render layer and ingress layer share one impl.
+func TruncateRunes(value string, limit int) string { return truncateRunes(value, limit) }
 
 func truncateRunes(value string, limit int) string {
 	runes := []rune(value)
