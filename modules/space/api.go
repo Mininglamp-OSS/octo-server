@@ -36,15 +36,22 @@ type Space struct {
 	log.Log
 	db  *DB
 	mdb *managerDB // 用户侧需要复用管理端按 space_id 作用域的邀请码写操作时使用
+	// settings / welcomeStore back the per-Space onboarding welcome CRUD
+	// (task space-welcome-per-space-admin-crud). settings supplies the platform
+	// global fallback; welcomeStore is the per-Space config source of truth.
+	settings     *commonmod.SystemSettings
+	welcomeStore *commonmod.SpaceWelcomeConfigStore
 }
 
 // New 创建Space实例
 func New(ctx *config.Context) *Space {
 	return &Space{
-		ctx: ctx,
-		Log: log.NewTLog("Space"),
-		db:  NewDB(ctx),
-		mdb: newManagerDB(ctx.DB()),
+		ctx:          ctx,
+		Log:          log.NewTLog("Space"),
+		db:           NewDB(ctx),
+		mdb:          newManagerDB(ctx.DB()),
+		settings:     commonmod.EnsureSystemSettings(ctx),
+		welcomeStore: commonmod.NewSpaceWelcomeConfigStore(ctx.DB()),
 	}
 }
 
@@ -100,6 +107,13 @@ func (s *Space) Route(r *wkhttp.WKHttp) {
 	search := r.Group("/v1/space", s.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, s.ctx))
 	{
 		search.GET("/:space_id/members/search", s.searchMembers)
+
+		// Per-Space onboarding welcome config CRUD (space admin, Role>=1). Shares
+		// the authenticated + UID-rate-limited group; per-Space authorization is
+		// enforced in each handler via requireSpaceAdmin.
+		search.GET("/:space_id/welcome", s.getWelcome)
+		search.PUT("/:space_id/welcome", s.putWelcome)
+		search.DELETE("/:space_id/welcome", s.deleteWelcome)
 	}
 
 	// 邀请码预览端点（公开无认证）严格 per-IP 限流：防枚举 + 暴破（issue #1000）。
