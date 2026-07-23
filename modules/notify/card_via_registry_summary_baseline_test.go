@@ -65,6 +65,102 @@ func TestMapSummaryFields_TruncatesDisplayFields(t *testing.T) {
 	}
 }
 
+// TestMapSummaryFields_ClampsOverMaxCounts 断言 Jerry-Xin PR #650 re-review 的阻断
+// 项:超过 schema `maximum` 的 members/msgCount 被 clamp 到 max 后仍能投递(preflight
+// 通过 + build 成功,不再翻 400 零投递)。clamp 前只 floor 负数、不封上限,一个巨大的
+// 正整数计数会被 schema `maximum` 直接 400 掉 —— legacy buildSummaryCard 却会照常投递
+// 任意正整数。本 fix 与超长展示字段的截断处置对称,共同保住"通知永不丢"不变量。
+// 同时锁 notify 本地计数 cap 与 schema `maximum` 对齐:若某个本地 cap > schema,
+// clamp 后仍超 schema → preflight 会 400,本测试即失败。
+func TestMapSummaryFields_ClampsOverMaxCounts(t *testing.T) {
+	// 单元层:mapSummaryCardFieldsToJSON 把超上限计数 clamp 到 schema max。
+	over := &SummaryCardFields{
+		TaskNo: "sum_over", Title: "OK", Kind: SummaryCardKindCompleted,
+		Members: summaryMembersMax + 1234, MsgCount: summaryMsgCountMax + 1,
+	}
+	raw, err := mapSummaryCardFieldsToJSON(over)
+	if err != nil {
+		t.Fatalf("map: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got := int(m["members"].(float64)); got != summaryMembersMax {
+		t.Errorf("members = %d, want clamp to %d", got, summaryMembersMax)
+	}
+	if got := int(m["msgCount"].(float64)); got != summaryMsgCountMax {
+		t.Errorf("msgCount = %d, want clamp to %d", got, summaryMsgCountMax)
+	}
+
+	// 集成层:超上限计数经 clamp 后 preflight 通过 + build 成功(completed/failed 两个
+	// 模板都测),证明 clamp 值确实落在 schema [0, maximum] 内(cap↔schema 对齐锁)。
+	wk := newWuKongServer()
+	defer wk.close()
+	ctx := newTestContext(t, wk)
+	ctx.GetConfig().External.WebLoginURL = "https://im.example.com/login"
+
+	registry := cardtmpl.NewRegistry()
+	registry.Register(summarycompleted.New(), summarycompleted.Assets, summarycompleted.HandoffRoot)
+	registry.SetDefault(summarycompleted.TemplateID, summarycompleted.TemplateVersion)
+	registry.Register(summaryfailed.New(), summaryfailed.Assets, summaryfailed.HandoffRoot)
+	registry.SetDefault(summaryfailed.TemplateID, summaryfailed.TemplateVersion)
+	registry.Freeze()
+	prev := cardtmpl.DefaultRegistry()
+	cardtmpl.SetDefaultRegistry(registry)
+	defer cardtmpl.SetDefaultRegistry(prev)
+
+	n := newTestNotify(ctx, nil, nil, nil, "tk")
+
+	specs := []struct {
+		name       string
+		kind       string
+		templateID cardtmpl.ID
+		state      cardtmpl.State
+	}{
+		{"completed", SummaryCardKindCompleted, summarycompleted.TemplateID, summarycompleted.StateShown},
+		{"failed", SummaryCardKindFailed, summaryfailed.TemplateID, summaryfailed.StateShown},
+	}
+	for _, s := range specs {
+		t.Run(s.name, func(t *testing.T) {
+			card := &SummaryCardFields{
+				TaskNo: "sum_over", Title: "OK", Kind: s.kind,
+				Members: summaryMembersMax + 9, MsgCount: summaryMsgCountMax + 9,
+			}
+			if s.kind == SummaryCardKindFailed {
+				card.Reason = "boom"
+			}
+			if err := preflightSummarySchema(card, s.templateID); err != nil {
+				t.Fatalf("preflight should PASS after count clamp, got %v", err)
+			}
+			if _, _, err := n.buildSummaryCardViaRegistry(context.Background(),
+				"space-c", card, "zh-CN", s.templateID, s.state); err != nil {
+				t.Fatalf("build should SUCCEED after count clamp, got %v", err)
+			}
+		})
+	}
+}
+
+// TestMapSummaryFields_PreservesTaskNoVerbatim 断言 taskNo 原样透传(不 TrimSpace),
+// 与 legacy buildSummaryCard 用原值拼 deep-link 保持字节一致(Jerry-Xin PR #650
+// re-review 的 🟡 note:trim 会静默改写身份字段并让 padded 输入相对 legacy 漂移)。
+// 空/纯空白 taskNo 在 deliverCardNotification 入口即被挡回,不会到这里。
+func TestMapSummaryFields_PreservesTaskNoVerbatim(t *testing.T) {
+	const padded = " sum_2026-07-16 " // 前后空白 —— 不应被静默 trim
+	card := &SummaryCardFields{TaskNo: padded, Title: "OK", Kind: SummaryCardKindCompleted}
+	raw, err := mapSummaryCardFieldsToJSON(card)
+	if err != nil {
+		t.Fatalf("map: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got := m["taskNo"].(string); got != padded {
+		t.Errorf("taskNo = %q, want verbatim %q (no trim)", got, padded)
+	}
+}
+
 // TestBuildSummaryCards_MigrationBaseline 是 roadmap C PR-2 的字节等价基线:
 // 对 summary.completed / summary.failed 两张 v1 展示卡,断言 legacy
 // buildSummaryCard 与 Registry.Render 出的 card 节点在删除

@@ -277,18 +277,37 @@ func mapDocsCardFieldsToJSON(card *DocsCardFields, lang string) (json.RawMessage
 // (P2-1, PR #650 review). The schema maxLength is the backstop —
 // TestMapSummaryFields_TruncatesDisplayFields locks these in sync (truncation must
 // leave the field within schema, else preflight would still 400).
+//
+// summaryMembersMax / summaryMsgCountMax mirror the summary card data.schema.json
+// `maximum` for the two integer counters. mapSummaryCardFieldsToJSON clamps
+// caller-supplied counts to [0, max] so an over-max count renders capped rather
+// than flipping to a C1 400 zero-delivery (Jerry-Xin PR #650 re-review): legacy
+// buildSummaryCard rendered any positive int, so the schema `maximum` would
+// otherwise turn a huge value into a 400 at ingress — the same delivery
+// regression the display-field truncation already fixed, applied symmetrically to
+// the counts. The schema `maximum` is the backstop —
+// TestMapSummaryFields_ClampsOverMaxCounts locks these in sync (a local cap above
+// schema would still 400 after clamp, failing the test).
 const (
 	summaryTimeRangeMaxRunes   = 200
 	summaryGeneratedAtMaxRunes = 80
+	summaryMembersMax          = 1_000_000
+	summaryMsgCountMax         = 1_000_000_000
 )
 
-// clampNonNegative floors a caller-supplied count at 0. Legacy buildSummaryCard
-// omitted non-positive members/msgCount via a `> 0` guard; the schema's
-// minimum:0 would otherwise 400 a negative sentinel. Clamping to 0 reproduces
-// the legacy omit-and-deliver behavior (the Template's `> 0` guard drops the fact).
-func clampNonNegative(v int) int {
+// clampCount clamps a caller-supplied count to the schema's [0, max] range.
+// Legacy buildSummaryCard omitted non-positive members/msgCount via a `> 0` guard
+// and rendered any positive int; the schema's minimum:0 / maximum would otherwise
+// 400 a negative sentinel or an over-max value at C1 preflight. Clamping to
+// [0, max] reproduces the legacy omit-and-deliver behavior for negatives (the
+// Template's `> 0` guard drops the 0 fact) while preserving delivery for an
+// over-max count (rendered capped at max) instead of a C1 400 zero-delivery.
+func clampCount(v, limit int) int {
 	if v < 0 {
 		return 0
+	}
+	if v > limit {
+		return limit
 	}
 	return v
 }
@@ -299,21 +318,27 @@ func clampNonNegative(v int) int {
 // schema 里根本没这个字段, additionalProperties:false 会拒绝)。字节等价基线依
 // 赖此映射与 legacy buildSummaryCard 提取自同一 SummaryCardFields。
 //
-// P2-1 (PR #650 review):展示字段服务端截断到 schema maxLength / 渲染预算。legacy
-// buildSummaryCard 从不校验长度 —— 超长 title/reason 仍会投递(截断后的卡或文本
-// DM)。走 C1 preflight 后,超长字段本会翻成 400 零投递。这里截断保住"通知永不丢"
-// 不变量,同时对**真正的结构性违规**(缺失/空必填、类型错、未知字段、以及超长的
-// taskNo —— deep-link key,绝不能静默截断)保留 C1 硬 400。
+// P2-1 (PR #650 review):展示字段服务端截断到 schema maxLength / 渲染预算,计数
+// 字段 clamp 到 schema [0, maximum]。legacy buildSummaryCard 从不校验长度/上限 ——
+// 超长 title/reason 仍会投递(截断后的卡或文本 DM),任意正整数 members/msgCount
+// 也照常渲染。走 C1 preflight 后,超长/超上限字段本会翻成 400 零投递。这里截断/
+// clamp 保住"通知永不丢"不变量,同时对**真正的结构性违规**(缺失/空必填、类型错、
+// 未知字段、以及超长的 taskNo —— deep-link key,绝不能静默改写)保留 C1 硬 400。
+//
+// taskNo 原样透传(不 TrimSpace):它是 deep-link 的结构性 key,legacy
+// buildSummaryCard 也用原值拼 /s/{taskNo}(见 card.go),trim 会静默改写身份字段并
+// 让 padded 输入与 legacy 字节漂移(Jerry-Xin PR #650 re-review)。空/纯空白的
+// taskNo 在 deliverCardNotification 入口即被 errNotifyCardInvalid 挡回,不会到这里。
 func mapSummaryCardFieldsToJSON(card *SummaryCardFields) (json.RawMessage, error) {
 	if card == nil {
 		return nil, errors.New("mapSummaryCardFieldsToJSON: nil card")
 	}
 	m := map[string]any{
-		"taskNo":      strings.TrimSpace(card.TaskNo), // deep-link key:不截断(超长 → C1 400)
+		"taskNo":      card.TaskNo, // deep-link key:原样透传(与 legacy 一致);超长 → C1 400,不 trim/截断
 		"title":       cardtmpl.TruncateRunes(strings.TrimSpace(card.Title), cardtmpl.MaxTitleRunes),
 		"timeRange":   cardtmpl.TruncateRunes(strings.TrimSpace(card.TimeRange), summaryTimeRangeMaxRunes),
-		"members":     clampNonNegative(card.Members),
-		"msgCount":    clampNonNegative(card.MsgCount),
+		"members":     clampCount(card.Members, summaryMembersMax),
+		"msgCount":    clampCount(card.MsgCount, summaryMsgCountMax),
 		"generatedAt": cardtmpl.TruncateRunes(strings.TrimSpace(card.GeneratedAt), summaryGeneratedAtMaxRunes),
 	}
 	if card.Kind == SummaryCardKindFailed {
