@@ -560,14 +560,21 @@ func (d *managerDB) disableInvitation(spaceId, code string) (int64, error) {
 // 有意设计：WHERE 不限制 status，管理员可以对已禁用（status=0）的邀请码执行 PUT，
 // 包括通过 {"status": 1} 重新启用——这是管理操作的必要能力（如误禁恢复）。
 // 若要禁止重新启用，应在 API 层决策，不在此函数加 AND status=1。
-func (d *managerDB) updateInvitationAdmin(spaceId, code string, maxUses *int, expiresAt *time.Time, status *int) (int64, error) {
+// updateInvitationAdmin 更新邀请码字段。
+// clearExpiresAt=true 时将 expires_at 置为 NULL（永久），优先级高于 expiresAt。
+// expiresAt!=nil 时写入具体时间；两者均为零值时该列保持不变。
+func (d *managerDB) updateInvitationAdmin(spaceId, code string, maxUses *int, expiresAt *time.Time, clearExpiresAt bool, status *int) (int64, error) {
 	builder := d.session.Update("space_invitation")
 	changed := false
 	if maxUses != nil {
 		builder = builder.Set("max_uses", *maxUses)
 		changed = true
 	}
-	if expiresAt != nil {
+	if clearExpiresAt {
+		// 显式永久：写 NULL
+		builder = builder.Set("expires_at", nil)
+		changed = true
+	} else if expiresAt != nil {
 		builder = builder.Set("expires_at", *expiresAt)
 		changed = true
 	}

@@ -1497,16 +1497,21 @@ func (s *Space) updateInvite(c *wkhttp.Context) {
 	}
 
 	// 解析过期时间：与管理端 parseInviteExpiresAt 共用 time.Local 约定，避免双路径写库时区漂移。
-	expiresAt, err := parseInviteExpiresAt(req.ExpiresAt)
+	expiresResult, err := parseInviteExpiresAt(req.ExpiresAt)
 	if err != nil {
 		respondSpaceRequestInvalid(c, "expires_at")
 		return
+	}
+	clearExpires := !expiresResult.notProvided && expiresResult.expiresAt == nil
+	var updateExpiresAt *time.Time
+	if !expiresResult.notProvided {
+		updateExpiresAt = expiresResult.expiresAt
 	}
 
 	// 复用管理端的 updateInvitationAdmin：
 	//   - WHERE 无 status=1 限制，可对已禁用邀请码重启用（status=1）
 	//   - 按 space_id + invite_code 双匹配，天然防跨空间越权
-	affected, err := s.mdb.updateInvitationAdmin(spaceId, code, req.MaxUses, expiresAt, req.Status)
+	affected, err := s.mdb.updateInvitationAdmin(spaceId, code, req.MaxUses, updateExpiresAt, clearExpires, req.Status)
 	if err != nil {
 		httperr.ResponseErrorL(c, errcode.ErrSpaceStoreFailed, nil, nil)
 		return
