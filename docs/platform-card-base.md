@@ -28,8 +28,8 @@
 | **server-authoritative** | 卡片布局、文案、交互 ID 由服务端拥有；调用方只传结构化业务字段，不构造 AC JSON。 |
 | **版本化** | 每张卡有独立 `templateId@version`；历史消息永远按当时模板版本渲染，新模板不影响在途消息。 |
 | **契约机读** | 数据 schema、交互契约、样本都以 JSON 文件随代码提交，CI 自动校验；不依赖 Markdown 文档或 Go 注释作为跨仓契约。 |
-| **双模式兼容** | 基座同时支持 ①Go 代码模板（强校验/性能好，pilot 优先）②JSON 模板+变量绑定（设计/运营可改，后续开放）。 |
-| **显式降级** | 每张模板必须声明 fallback 文本；render 失败/低版本客户端/功能 gate 关闭时自动降级，通知"必达"。 |
+| **双模式兼容（协议预留）** | 协议为双模式预留位置：①Go 代码模板**已落地**（强校验/性能好，当前唯一在用模式）；②JSON 模板+变量绑定（`${}` 引擎，设计/运营可改）**尚未实现**，见 roadmap E1。 |
+| **显式降级** | 每张模板必须声明 fallback 文本；render 失败 / gate 关闭 / 总开关关时服务端降级为 `FallbackText` 纯文本 DM。**低版本客户端**（不认识 profile）是另一机制：客户端渲染 envelope 里的服务端权威 `plain`（协商在渲染侧，见 `docs/card-protocol.md` §3），不经 `FallbackText`。 |
 | **白名单默认关** | 组件、action、profile 全部走白名单（复用 `pkg/cardmsg/whitelist.go`），未知元素默认拒绝。 |
 
 ---
@@ -427,28 +427,32 @@ type Template interface {
     // - 产物只包含业务片段,不 marshal AC 顶层,不写 metadata。
     Build(ctx context.Context, state State, fields json.RawMessage, env BuildEnv) (BuildResult, error)
 
-    // FallbackText 返回纯文本 fallback;渲染失败/低版本客户端/功能 gate 关闭时使用。
+    // FallbackText 返回纯文本 fallback;render 失败 / gate 关闭 / 总开关关时服务端降级用
+    // (低版本客户端不认识 profile 走 envelope 的 plain,是客户端侧协商,不经此方法)。
     FallbackText(state State, fields json.RawMessage, lang string) (string, error)
 }
 
 // ---- 基座 wrapper(强制 metadata 注入,pkg/cardtmpl 内部实现) ----
 
-// Render 是"Template.Build → 完整 AC JSON" 的唯一路径:
+// Render 是"Template.Build → 完整 type-17 InteractiveCard envelope" 的唯一路径:
 //  1. Lookup(id, version) 命中 Template;
 //  2. Meta().InputSchema.Validate(fields) → 失败返 ErrFieldsInvalid;
 //  3. Meta().ViewFor(state) 决定 view / profile → 未注册 state 返 ErrStateUnknown;
 //  4. Template.Build(ctx, state, fields, env) 拿 BuildResult;
-//  5. 组装 AC 顶层 + 注入 metadata.octo.{protocol,template,variant,source} + webUrl;
-//  6. cardmsg.Validate(doc, profile) → 失败视为 render_error。
+//  5. 组装 AC card 节点(注入 metadata.octo.{protocol,template,variant,source} + webUrl),
+//     再包成 type-17 envelope {type, card, card_version, profile};
+//  6. cardmsg.Validate(payload) → 失败视为 render_error。
 // 业务代码只调 Render,不允许调 Template.Build 后自己拼装。
+// Render 返回完整 type-17 envelope map(type/card/card_version/profile,未 marshal);
+// 需要已 marshal 字节的更新路径见 §6 RenderCard。
 func (r *Registry) Render(ctx context.Context, id ID, version string,
-    state State, fields json.RawMessage, env BuildEnv) (json.RawMessage, error)
+    state State, fields json.RawMessage, env BuildEnv) (map[string]any, error)
 ```
 
 ### 关键约束(基座强制,非"模板自觉")
 
 1. **metadata 由基座注入**:`metadata.octo.protocol` / `template.{id,version}` / `variant` / `source` 和 `metadata.webUrl` 全部由 `Registry.Render` 写入,模板返回 `BuildResult` 不接触这些字段。
-2. **`cardmsg.Validate(doc, profile)` 由基座调用**:Template 无法绕过;view→profile 从 `Meta.Views[view].WireProfile` 取。
+2. **`cardmsg.Validate(payload)` 由基座调用**（payload 为完整 type-17 envelope，profile 在其中）：Template 无法绕过；view→profile 从 `Meta.Views[view].WireProfile` 取。
 3. **`Action.Submit.data["owner"]` / `["action_type"]` 与 `ActionContract` 一致性**:conformance test 校验;pilot 注册时用其 sample 跑一次 `Render` + 断言,失败 → 注册期 panic(fail-close)。
 4. **`DeepLink` 必填且绝对 https**:`BuildResult.DeepLink == ""` 或非 https → Render 返 error;deep-link 由模板私有拼接函数从 `env.WebLoginURL` 组装,不接受调用方任意域名。
 5. **禁止未声明的 `metadata.octo.*` 扩展**:如需扩展走本文档 PR 审查。
@@ -479,10 +483,17 @@ func (r *Registry) Freeze()
 // 命中只返回 Template(不返回 Meta,由调用方按需 t.Meta())。
 func (r *Registry) Lookup(id ID, version string) (Template, error)
 
-// Render 是"Template.Build → 完整 AC JSON"的唯一路径(见 §5)。
+// Render 是"Template.Build → 完整 type-17 envelope"的唯一路径(见 §5)。
 // 业务代码只调 Render,不允许直接调 Template.Build 后自己拼装。
+// 返回完整 type-17 envelope map(type/card/card_version/profile,未 marshal)。
 func (r *Registry) Render(ctx context.Context, id ID, version string,
-    state State, fields json.RawMessage, env BuildEnv) (json.RawMessage, error)
+    state State, fields json.RawMessage, env BuildEnv) (map[string]any, error)
+
+// RenderCard 复用 Render,返回其 envelope 里的裸 `card` 节点(marshal 成 JSON 字节)
+// + wire profile(post-#633 交互闭环新增),供 CardUpdater.ReplaceView 重组更新帧、
+// 走 CardMutator 更新原消息。
+func (r *Registry) RenderCard(ctx context.Context, id ID, version string,
+    state State, fields json.RawMessage, env BuildEnv) (cardDoc json.RawMessage, profile string, err error)
 
 // List 导出已注册模板元数据,供 GET /v1/message/card/templates 使用。
 func (r *Registry) List() []TemplateMeta
@@ -592,7 +603,7 @@ type CardUpdater interface {
 |---|---|
 | `OCTO_CARD_MESSAGE_ENABLED=false`（总开关） | 全量走模板 `FallbackText()` 发纯文本 DM。 |
 | 模板 gate（如 `OCTO_DOCS_APPROVAL_CARD_ENABLED=false`） | 该模板回退到对应 v1 视图（如 resource card），不发交互卡。 |
-| 客户端 profile < 模板要求（`octo/v2` 卡发向 v1 客户端） | 发送 v1 展示视图；若模板无 v1 视图则发 fallback 文本。 |
+| 客户端 profile < 模板要求（`octo/v2` 卡发向 v1 客户端） | **客户端侧责任 / 未来能力**：服务端当前按频道发单份卡，**无逐接收者 profile 协商/重渲染**；低能力客户端由客户端自行降级或走 fallback。服务端逐接收者重渲染尚未实现。 |
 | **输入校验失败**（schema 不通过、必填缺失） | **400 `ErrNotifyCardInvalid`，零投递，不降级**（对齐 brief 决策 C1，禁止把错请求伪装成成功文本）。 |
 | 服务端 render 错（cardmsg.Validate 失败/marshal 失败） | 打 `cardtmpl_build_total{result=render_error}` metrics，降级为 fallback 文本，保证必达。 |
 | Registry 未命中（composition bug，理论不应发生） | 500 internal error，打 error log；不降级为错文本。 |
@@ -624,7 +635,7 @@ type CardUpdater interface {
 
 | 指标 | labels | 说明 |
 |---|---|---|
-| `dmwork_cardtmpl_build_total` | template_id, version, view, result=ok\|fields_invalid\|render_error | Build 结果；fields_invalid 应在 400 返回前就拦截，本指标反映防线穿透情况。 |
+| `dmwork_cardtmpl_build_total` | template_id, version, view, result=ok\|fields_invalid\|render_error\|template_unknown\|state_unknown | Build 结果；`fields_invalid` 应在 400 返回前就拦截，本指标反映防线穿透情况；`template_unknown`/`state_unknown` 为 Render 运行期模板查找 / 状态解析未命中（非注册期错误）。 |
 | `dmwork_cardtmpl_callback_total` | template_id, version, action_id, result=ok\|rejected\|error | 交互回调结果。 |
 | `dmwork_cardtmpl_update_total` | template_id, version, result=ok\|error | 卡片更新（视图切换/追加）结果。 |
 
