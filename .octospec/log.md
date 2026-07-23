@@ -97,6 +97,39 @@ change-log convention (§7). Newest first.
   extend the pattern PR-1 established. `TestMain` grows to register the two
   new cards. See [journal](journal/shared/cardtmpl-l2a-summary-migration.md).
 
+## 2026-07-23 (group-welcome-message)
+
+- **Feature** — Group new-member welcome (群入群欢迎语): a group's
+  creator/manager configures **one** welcome via `GET/PUT/DELETE
+  /v1/groups/:group_no/welcome` (new `octo_group_welcome_config`, insert-then-lock
+  `UpsertMerged`), and on a human member's **first** join it is **posted publicly
+  into the group channel** (`channel_type=GROUP`), at most once per `(group_no,
+  uid)` via the new `octo_group_welcome_delivery` ledger. The body supports a
+  `{member}` placeholder rendered to the joiner's display name. Delivery mirrors
+  the per-Space engine (reconciler + worker + rotating cursor + `FOR UPDATE SKIP
+  LOCKED` + CAS/at-most-once) as a **parallel, group-scoped** copy — not a
+  refactor of the reviewed space code. **No platform-global content fallback**: a
+  group with no enabled row gets no welcome.
+- **Config** — new master switch `onboarding.group_welcome_enabled` (bool,
+  **default off** = dark launch), read via `SystemSettings.GroupWelcomeEnabled()`,
+  checked at enqueue/reconcile/worker. Enablement only — no content fallback;
+  flip-off is an instant, reversible kill that touches no per-group rows. Ships
+  double-inert (master off AND per-group `enabled=false` by default).
+- **Behavior** — burst coalescing: a batch invite (one `GroupMemberAdd` event → N
+  rows) is delivered as **one** public post naming everyone (`{member}` → joined
+  list; overflow → `…、nameK 等 N 人`) instead of N posts. Freshly-enqueued rows are
+  held a short coalesce window via `next_retry_at`; the worker `claimBatch`es a
+  group's due rows and posts once, preserving per-row at-most-once (shared
+  `message_id`). One coalesced post per group per wake also rate-limits a single
+  group's welcomes.
+- **Test** — full `-race` suites green for `common`/`notify`/`group`/`space`;
+  committed **live e2e** (`group_welcome_e2e_test.go`) drives the whole pipeline
+  against real WuKongIM, confirming `notification` posts into a group channel it
+  is not a member of and that a burst coalesces to one `message_id`. Incidental
+  polish carried from #646 (Upsert doc caveat, `r.Enabled` read, request-context
+  DB, DELETE→enabled-global-fallback test). See
+  [journal](journal/shared/group-welcome-message.md).
+
 ## 2026-07-23 (cardtmpl-l2a-migration PR-1)
 
 - **Feature** — Roadmap C first slice: `docs.commented@0.1.0` and
