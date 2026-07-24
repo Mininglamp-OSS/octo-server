@@ -262,6 +262,29 @@ func TestBotMessageEditRegistryTemplateDisabledAndWiringFailures(t *testing.T) {
 	})
 }
 
+func TestBotMessageEditRegistryTemplateRejectsDualModeByFieldPresence(t *testing.T) {
+	t.Setenv(cardmsg.EnvEnabled, "true")
+	catalog, err := newBotCardTemplateCatalog(testBotTemplateRegistry(t), defaultBotTemplateRefs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutator := &fakeBotCardMutator{}
+	ba := &BotAPI{
+		Log: log.NewTLog("BotAPI-template-edit-dual-mode"), cardTemplates: catalog, cardMutator: mutator,
+	}
+	body := registryEditBody(t, "completed", testReasoningData(t, "completed"), 2, false)
+	body["content_edit"] = " "
+
+	recorder := invokeTemplateEdit(t, ba, body)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if mutator.snapshotCalls != 0 || len(mutator.mutateRequests) != 0 {
+		t.Fatalf("dual-mode request reached mutation path: snapshots=%d mutate=%d",
+			mutator.snapshotCalls, len(mutator.mutateRequests))
+	}
+}
+
 func initialRegistryEnvelope(t *testing.T, catalog *botCardTemplateCatalog) []byte {
 	t.Helper()
 	payload, err := catalog.RenderPayload(context.Background(), registrySendBody(t,
