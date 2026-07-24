@@ -191,3 +191,41 @@ func TestExpand_EscapesDataLeaf(t *testing.T) {
 		t.Fatalf("got %s want %s", canonical(t, got), canonical(t, want))
 	}
 }
+
+// TestExpand_DirectiveOnlyElement_ChargesBudget locks the PR #654 P1 fix:
+// a $data repetition element carrying ONLY the directive (no sibling value
+// fields) must still charge the node budget per item, so a large caller array
+// cannot bypass maxExpandNodes. Before the fix this expanded 50k items with a
+// nil error (expandObject charged zero for a keyless element).
+func TestExpand_DirectiveOnlyElement_ChargesBudget(t *testing.T) {
+	// directive-only repeated element over an over-cap array.
+	tmpl := parseJSON(t, `{"items":[{"$data":"${rows}"}]}`)
+	rows := make([]any, maxExpandNodes+1)
+	for i := range rows {
+		rows[i] = map[string]any{} // object (satisfies the element-must-be-object check)
+	}
+	data := map[string]any{"rows": rows}
+
+	_, err := Expand(context.Background(), tmpl, Scope{Data: data}, noEscape)
+	if err == nil {
+		t.Fatal("expected node-budget error for directive-only element over an over-cap $data array")
+	}
+	if !strings.Contains(err.Error(), "node budget") {
+		t.Fatalf("want node-budget error, got %v", err)
+	}
+}
+
+// TestExpand_UnderBudget_DirectiveOnly confirms a directive-only element under
+// the cap still expands correctly (charging per item, not rejecting legit use).
+func TestExpand_UnderBudget_DirectiveOnly(t *testing.T) {
+	tmpl := parseJSON(t, `{"items":[{"$data":"${rows}","type":"TextBlock","text":"${label}"}]}`)
+	data := dataMap(t, `{"rows":[{"label":"a"},{"label":"b"},{"label":"c"}]}`)
+	got, err := Expand(context.Background(), tmpl, Scope{Data: data}, noEscape)
+	if err != nil {
+		t.Fatalf("under-budget expand failed: %v", err)
+	}
+	items := got.(map[string]any)["items"].([]any)
+	if len(items) != 3 {
+		t.Fatalf("items = %d, want 3", len(items))
+	}
+}

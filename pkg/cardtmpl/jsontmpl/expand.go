@@ -104,6 +104,16 @@ func (e *expander) expandArray(arr []any, sc Scope) ([]any, error) {
 					if err := e.ctx.Err(); err != nil {
 						return nil, err
 					}
+					// Charge one budget unit per repetition BEFORE expanding it.
+					// expandObject only decrements for the element's *value* fields,
+					// so a directive-only element ({"$data":"${arr}"} with no sibling
+					// keys) would otherwise charge zero per item and let a large caller
+					// array bypass the maxExpandNodes ceiling entirely (PR #654 review:
+					// Jerry-Xin / yujiawei P1 — the emitted repetition is itself a node).
+					if e.budget <= 0 {
+						return nil, fmt.Errorf("jsontmpl: expansion exceeded %d-node budget (possible unbounded $data)", maxExpandNodes)
+					}
+					e.budget--
 					itemData, ok := item.(map[string]any)
 					if !ok {
 						return nil, fmt.Errorf("jsontmpl: $data element %d is %T, want object", i, item)

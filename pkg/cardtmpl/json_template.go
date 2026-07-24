@@ -78,11 +78,13 @@ func (t *jsonTemplate) Build(ctx context.Context, state State, fields json.RawMe
 // — the same plain derivation the send path uses — so the fallback matches what
 // clients reduce the card to. Unlike Render this path does not run the full
 // cardmsg.Validate gate (the built card is a body/actions fragment, not a wire
-// payload), but its resource surface is bounded on both ends: Build goes through
-// jsontmpl.Expand's maxExpandNodes ceiling (so an unbounded $data array can't
-// balloon the fragment) and BuildPlain enforces cardmsg.MaxPayloadBytes on its
-// output. Injection is not a concern here — BuildPlain reduces markdown links to
-// their visible label (PR #654 review P2 — fallback node/size backstop).
+// payload). Its resource surface is bounded on the input side by jsontmpl.Expand's
+// maxExpandNodes ceiling (so an unbounded $data array can't balloon the fragment);
+// note BuildPlain itself imposes NO payload-size limit (only Finalize /
+// RecheckPayloadSize do, neither runs here — PR #654 review yujiawei P2). Injection
+// is not a concern — BuildPlain reduces markdown links to their visible label.
+// When this path is first wired to a send path it should additionally run
+// InputSchema.Validate + a payload-size check (no production caller today).
 func (t *jsonTemplate) FallbackText(state State, fields json.RawMessage, lang string) (string, error) {
 	br, err := t.Build(context.Background(), state, fields, BuildEnv{Lang: lang})
 	if err != nil {
