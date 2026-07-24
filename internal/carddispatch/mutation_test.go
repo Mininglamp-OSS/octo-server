@@ -90,6 +90,32 @@ func TestCardMutatorPreservesOwnershipLifecycleCASAndReplay(t *testing.T) {
 		}
 	})
 
+	t.Run("transient frame skips revision but still syncs", func(t *testing.T) {
+		transient := testCardEnvelope(t, 43, false)
+		var envelope map[string]any
+		if err := json.Unmarshal(transient, &envelope); err != nil {
+			t.Fatal(err)
+		}
+		envelope["transient"] = true
+		transient, _ = json.Marshal(envelope)
+		backend := &fakeMutationBackend{message: storedCardMessage{
+			MessageID: "1001", MessageSeq: 7, FromUID: "notification", Payload: original,
+		}}
+		result, err := newCardMutator(backend).Mutate(context.Background(), CardMutationRequest{
+			SenderUID: "notification", MessageID: "1001", ChannelID: "user-b", ChannelType: 1,
+			ContentEdit: string(transient),
+		})
+		if err != nil || !result.Applied {
+			t.Fatalf("Mutate(transient) = (%+v, %v)", result, err)
+		}
+		if len(backend.writes) != 1 || len(backend.syncs) != 1 {
+			t.Fatalf("write/sync counts = %d/%d, want 1/1", len(backend.writes), len(backend.syncs))
+		}
+		if len(backend.revisions) != 0 {
+			t.Fatalf("transient revisions = %d, want 0", len(backend.revisions))
+		}
+	})
+
 	t.Run("byte identical frame is idempotent replay", func(t *testing.T) {
 		backend := &fakeMutationBackend{
 			message:    storedCardMessage{MessageID: "1001", MessageSeq: 7, FromUID: "notification", Payload: original},

@@ -16,6 +16,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -26,6 +27,9 @@ const (
 
 func setupBotCardProfile(t *testing.T) (http.Handler, *config.Context) {
 	t.Helper()
+	previousRegistry := cardtmpl.DefaultRegistry()
+	cardtmpl.SetDefaultRegistry(testBotTemplateRegistry(t))
+	t.Cleanup(func() { cardtmpl.SetDefaultRegistry(previousRegistry) })
 	s, ctx := testutil.NewTestServer()
 	assert.NoError(t, testutil.CleanAllTables(ctx))
 	_, err := ctx.DB().InsertBySql(
@@ -50,12 +54,13 @@ func getCardProfile(t *testing.T, handler http.Handler, token string) *httptest.
 
 // cardProfileManifest pins the D12 wire shape (field names decode-checked).
 type cardProfileManifest struct {
-	Enabled     bool     `json:"enabled"`
-	CardVersion string   `json:"card_version"`
-	Profiles    []string `json:"profiles"`
-	Elements    []string `json:"elements"`
-	Inputs      []string `json:"inputs"`
-	Actions     []string `json:"actions"`
+	Enabled     bool                    `json:"enabled"`
+	CardVersion string                  `json:"card_version"`
+	Profiles    []string                `json:"profiles"`
+	Elements    []string                `json:"elements"`
+	Inputs      []string                `json:"inputs"`
+	Actions     []string                `json:"actions"`
+	Templating  botTemplatingCapability `json:"templating"`
 	Limits      struct {
 		MaxPayloadBytes   int `json:"max_payload_bytes"`
 		MaxNodes          int `json:"max_nodes"`
@@ -82,6 +87,9 @@ func TestBotCardProfile_ElementsInputsFromConstants(t *testing.T) {
 	assert.Equal(t, cardmsg.DisplayElements(), m.Elements)
 	assert.Equal(t, cardmsg.InputElements(), m.Inputs)
 	assert.Equal(t, cardmsg.DisplayActions(), m.Actions)
+	assert.True(t, m.Templating.Supported)
+	assert.Equal(t, botTemplateWireV1, m.Templating.Wire)
+	assert.Len(t, m.Templating.Templates, 1)
 }
 
 // TestBotCardProfile_ValuesFromConstants：清单每个值必须等于 pkg/cardmsg 常量
@@ -104,6 +112,7 @@ func TestBotCardProfile_ValuesFromConstants(t *testing.T) {
 	assert.Equal(t, cardmsg.MaxInputTextBytes, m.Limits.MaxInputTextBytes)
 	assert.Equal(t, cardmsg.MaxInputsBytes, m.Limits.MaxInputsBytes)
 	assert.Equal(t, cardmsg.MaxCopyTextBytes, m.Limits.MaxCopyTextBytes)
+	assert.Equal(t, newMustTestCatalog(t).Capability(), m.Templating)
 }
 
 // TestBotCardProfile_DisabledStillReturnsManifestAndSendRejects（D12.3）：rollout
@@ -123,6 +132,8 @@ func TestBotCardProfile_DisabledStillReturnsManifestAndSendRejects(t *testing.T)
 	assert.Equal(t, cardmsg.CardVersion, m.CardVersion, "关闭时仍返完整清单")
 	assert.Equal(t, cardmsg.AcceptedProfiles(), m.Profiles)
 	assert.Equal(t, cardmsg.MaxPayloadBytes, m.Limits.MaxPayloadBytes)
+	assert.True(t, m.Templating.Supported, "关闭时仍返完整模板清单")
+	assert.Len(t, m.Templating.Templates, 1)
 
 	// 半 2：send 路径对卡片仍拒绝（同源 bot 门禁 BotEnabled，此处经部署级总开关关闭
 	// 而生效，send.go —— 在 IM 派发前拒绝，无需 WuKongIM）。
@@ -161,6 +172,8 @@ func TestBotCardProfile_BotSubSwitchDisablesProfileAndSend(t *testing.T) {
 	assert.False(t, m.Enabled, "总开关开但 bot 子开关关 → profile.enabled:false")
 	assert.Equal(t, cardmsg.CardVersion, m.CardVersion, "子开关关时仍返完整清单")
 	assert.Equal(t, cardmsg.AcceptedProfiles(), m.Profiles)
+	assert.True(t, m.Templating.Supported, "bot 子开关关闭时仍返完整模板清单")
+	assert.Len(t, m.Templating.Templates, 1)
 
 	// 半 2：send 路径同源门禁（BotEnabled）→ 拒绝，与 profile 一致。
 	body := map[string]interface{}{
@@ -209,7 +222,7 @@ func TestBotCardProfile_AdditiveContractFieldSet(t *testing.T) {
 	for k := range raw {
 		gotTop = append(gotTop, k)
 	}
-	assert.ElementsMatch(t, []string{"enabled", "card_version", "profiles", "limits", "elements", "inputs", "actions"}, gotTop,
+	assert.ElementsMatch(t, []string{"enabled", "card_version", "profiles", "limits", "elements", "inputs", "actions", "templating"}, gotTop,
 		"D12 additive-only：顶层字段集冻结（新增新字段，绝不改名/删除）")
 
 	var limits map[string]json.RawMessage
@@ -222,4 +235,11 @@ func TestBotCardProfile_AdditiveContractFieldSet(t *testing.T) {
 		"max_payload_bytes", "max_nodes", "max_depth", "max_input_text_bytes", "max_inputs_bytes",
 		"max_copy_text_bytes",
 	}, gotLimits, "D12 additive-only：limits 字段集冻结")
+}
+
+func newMustTestCatalog(t *testing.T) *botCardTemplateCatalog {
+	t.Helper()
+	catalog, err := newBotCardTemplateCatalog(testBotTemplateRegistry(t), defaultBotTemplateRefs())
+	assert.NoError(t, err)
+	return catalog
 }

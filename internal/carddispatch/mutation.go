@@ -219,8 +219,10 @@ func (m *CardMutator) Mutate(ctx context.Context, request CardMutationRequest) (
 	}
 	// Revision history and CMD fanout are secondary to the authoritative
 	// content_edit, matching the existing Bot API semantics.
-	if err := m.backend.AppendRevision(write); err != nil && m.logger != nil {
-		m.logger.Error("card mutation revision append failed", zap.Error(err), zap.String("message_id", request.MessageID))
+	if !cardmsg.TransientFromContentEdit(normalized) {
+		if err := m.backend.AppendRevision(write); err != nil && m.logger != nil {
+			m.logger.Error("card mutation revision append failed", zap.Error(err), zap.String("message_id", request.MessageID))
+		}
 	}
 	if err := m.backend.Sync(write); err != nil && m.logger != nil {
 		m.logger.Error("card mutation CMD sync failed", zap.Error(err), zap.String("message_id", request.MessageID))
