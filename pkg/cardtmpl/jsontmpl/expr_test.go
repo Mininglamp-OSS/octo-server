@@ -162,3 +162,39 @@ func TestEvalValue_IndexOutsideLoop_Errors(t *testing.T) {
 		t.Fatal("expected error for $index outside loop, got nil")
 	}
 }
+
+// TestEvalCond_NumericIntVsFloat asserts a condition comparing an int literal to
+// a JSON number (float64) still matches — Go's raw `==` is false across the two
+// concrete types, which would take the wrong if() branch (PR #654 P3).
+func TestEvalCond_NumericIntVsFloat(t *testing.T) {
+	sc := Scope{Data: map[string]any{"count": float64(1)}} // JSON numbers unmarshal to float64
+	got, err := EvalValue("${if(count == 1, 'yes', 'no')}", sc, noEscape)
+	if err != nil {
+		t.Fatalf("eval: %v", err)
+	}
+	if got != "yes" {
+		t.Fatalf("float64(1) == int(1) should be true, got %#v", got)
+	}
+}
+
+// TestEvalCond_EqualsInsideStringLiteral asserts the `==` inside a single-quoted
+// literal is not mistaken for the comparison operator (PR #654 P3).
+func TestEvalCond_EqualsInsideStringLiteral(t *testing.T) {
+	sc := Scope{Data: map[string]any{"k": "a==b"}}
+	got, err := EvalValue("${if(k == 'a==b', 'match', 'no')}", sc, noEscape)
+	if err != nil {
+		t.Fatalf("eval: %v", err)
+	}
+	if got != "match" {
+		t.Fatalf("quoted '==' literal should compare equal, got %#v", got)
+	}
+}
+
+// TestEvalCond_UncomparableOperand_Errors asserts comparing an array-valued
+// operand with `==` returns a clean error instead of panicking (PR #654 P3).
+func TestEvalCond_UncomparableOperand_Errors(t *testing.T) {
+	sc := Scope{Data: map[string]any{"arr": []any{1, 2}}}
+	if _, err := EvalValue("${if(arr == 1, 'a', 'b')}", sc, noEscape); err == nil {
+		t.Fatal("expected error comparing an array operand with ==, got nil")
+	}
+}

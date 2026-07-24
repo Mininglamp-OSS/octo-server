@@ -141,7 +141,7 @@ type BuildResult struct {
 	Body     []any   // AC body 元素
 	Actions  []any   // AC 顶层 actions
 	Variant  string  // metadata.octo.variant
-	DeepLink string  // metadata.webUrl (必填绝对 https)
+	DeepLink string  // metadata.webUrl (可选;非空则须绝对 https,空则省略 webUrl)
 	Source   *Source // 覆盖 Meta.Source,nil 表示不覆盖
 }
 

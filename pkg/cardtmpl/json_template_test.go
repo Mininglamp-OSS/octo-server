@@ -101,9 +101,8 @@ func TestRegisterJSON_C1_RejectsBadFields(t *testing.T) {
 	}
 }
 
-// TestRegisterJSON_MissingTemplateFile_FailClose asserts a JSON view whose
-// template path does not exist panics at register time (fail-close), not at
-// first render.
+// TestRegisterJSON_FallbackText_DerivesPlain asserts FallbackText compiles the
+// view and reduces it to plain text carrying the card's title.
 func TestRegisterJSON_FallbackText_DerivesPlain(t *testing.T) {
 	reg := NewRegistry()
 	reg.RegisterJSON(jsonCardTestData, "testdata/test.jsoncard@0.1.0")
@@ -127,6 +126,14 @@ func TestRegisterJSON_FallbackText_DerivesPlain(t *testing.T) {
 // caller-injected dangerous markdown link in a text field is caught by the L0
 // backstop cardmsg.Validate (positive URL allowlist over TextBlock markdown
 // links), which renderCore runs on the compiled card → ErrRenderFailed.
+//
+// The fields are FULLY valid (rows present) so Build SUCCEEDS and the injected
+// link actually reaches renderCore step-8 cardmsg.Validate — the layer under
+// test. An earlier version omitted "rows", so Build failed first with
+// `field "rows" not found` and the assertion passed vacuously without ever
+// exercising Validate (both build failures and Validate failures wrap
+// ErrRenderFailed). This test now asserts the cardmsg.Validate wrapper specifically
+// and adds a benign-title control proving the link is the sole cause (PR #654 P1).
 func TestRegisterJSON_MarkdownLinkInjection_RejectedByValidate(t *testing.T) {
 	reg := NewRegistry()
 	reg.RegisterJSON(jsonCardTestData, "testdata/test.jsoncard@0.1.0")
@@ -134,15 +141,30 @@ func TestRegisterJSON_MarkdownLinkInjection_RejectedByValidate(t *testing.T) {
 	reg.Freeze()
 
 	// title carries a javascript: markdown link; schema permits it (plain string),
-	// so it must be the render-layer Validate that rejects it.
-	fields := json.RawMessage(`{"title":"[tap](javascript:alert(1))","expanded":false}`)
-	_, err := reg.Render(context.Background(), "test.jsoncard", "0.1.0", "shown", fields,
+	// so it must be the render-layer Validate that rejects it. rows/expanded are
+	// present so Build succeeds and the link reaches step 8.
+	const validTail = `,"expanded":true,"rows":[{"label":"a"}]}`
+	malicious := json.RawMessage(`{"title":"[tap](javascript:alert(1))"` + validTail)
+	_, err := reg.Render(context.Background(), "test.jsoncard", "0.1.0", "shown", malicious,
 		BuildEnv{Lang: "zh-CN", SpaceID: "s1"})
 	if err == nil {
 		t.Fatal("expected ErrRenderFailed (Validate rejects non-https markdown link), got nil — engine has an injection gap")
 	}
 	if !strings.Contains(err.Error(), ErrRenderFailed.Error()) {
-		t.Fatalf("want ErrRenderFailed from cardmsg.Validate, got %v", err)
+		t.Fatalf("want ErrRenderFailed, got %v", err)
+	}
+	// Must be the step-8 cardmsg.Validate rejection, NOT an earlier Build failure —
+	// both wrap ErrRenderFailed, so pinning the Validate wrapper is the whole point.
+	if !strings.Contains(err.Error(), "cardmsg.Validate") {
+		t.Fatalf("injection must be caught by cardmsg.Validate (render step 8), got %v", err)
+	}
+
+	// Benign-title control: identical fields, safe title → renders cleanly. Proves
+	// the injected link (not a missing/!valid field) is the sole cause above.
+	benign := json.RawMessage(`{"title":"tap here"` + validTail)
+	if _, err := reg.Render(context.Background(), "test.jsoncard", "0.1.0", "shown", benign,
+		BuildEnv{Lang: "zh-CN", SpaceID: "s1"}); err != nil {
+		t.Fatalf("benign control must render cleanly, got %v", err)
 	}
 }
 

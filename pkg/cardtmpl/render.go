@@ -26,8 +26,8 @@ const (
 //  2. Meta.InputSchema.Validate(fields) → 失败返 ErrFieldsInvalid;
 //  3. Meta.ViewFor(state) 决定 view/profile → 未注册 state 返 ErrStateUnknown;
 //  4. Template.Build(ctx, state, fields, env) 拿 BuildResult;
-//  5. 校验 BuildResult.DeepLink 为绝对 https;
-//  6. 组装 AC 顶层文档 + 注入 metadata.octo.{protocol, template, variant, source} + metadata.webUrl;
+//  5. BuildResult.DeepLink 可选:非空则校验为绝对 https,空则跳过(无 metadata.webUrl);
+//  6. 组装 AC 顶层文档 + 注入 metadata.octo.{protocol, template, variant, source};DeepLink 非空时再注入 metadata.webUrl;
 //  7. 构造 InteractiveCard payload envelope (type=17 / card / card_version / profile);
 //  8. cardmsg.Validate(payload) → 失败包裹 ErrRenderFailed 返回。
 //
@@ -100,7 +100,12 @@ func renderCore(
 	// step 5: DeepLink 可选;非空则强制绝对 https (§5 约束 4)。空 DeepLink 表示本卡
 	// 没有规范浏览器 URL(如 JSON 模板的纯展示进度卡,无 OpenUrl/webUrl)—— 跳过
 	// https 校验并在 step 6 省略 metadata.webUrl。既有卡片一律提供 DeepLink,行为不变。
-	hasDeepLink := strings.TrimSpace(br.DeepLink) != ""
+	//
+	// "可选" 只放行**真正空**的 DeepLink(""):一个非空但 trim 后为空(纯空白)的
+	// DeepLink 是畸形值,走 AbsoluteHTTPSURL 判定为 render_error 而非被静默当作
+	// "无链接"。否则 (a) 一张误产出空白链接的 Go 卡会静默丢掉 webUrl,(b) 空白与
+	// 真链接在 metric 上无法区分 —— 均破坏 fail-close(PR #654 review)。
+	hasDeepLink := br.DeepLink != ""
 	if hasDeepLink {
 		if err := AbsoluteHTTPSURL(br.DeepLink); err != nil {
 			metricBuildResult(meta.ID, meta.Version, string(view), "render_error")

@@ -1,6 +1,7 @@
 package jsontmpl
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -40,7 +41,7 @@ func TestConformance_ReasoningGoldens(t *testing.T) {
 			}
 			tmpl := readJSON(t, filepath.Join(root, tmplPath))
 
-			got, err := Expand(tmpl, Scope{Data: data}, func(s string) string { return s })
+			got, err := Expand(context.Background(), tmpl, Scope{Data: data}, func(s string) string { return s })
 			if err != nil {
 				t.Fatalf("expand %s (view %s): %v", name, view, err)
 			}

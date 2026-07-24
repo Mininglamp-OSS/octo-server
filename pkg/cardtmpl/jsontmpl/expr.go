@@ -138,19 +138,79 @@ func evalIf(args string, sc Scope) (any, error) {
 // in the supported subset).
 func evalCond(src string, sc Scope) (bool, error) {
 	src = strings.TrimSpace(src)
-	idx := strings.Index(src, "==")
-	if idx < 0 {
+	lraw, rraw, ok := splitEquality(src)
+	if !ok {
 		return false, fmt.Errorf("jsontmpl: unsupported condition %q (only == is supported)", src)
 	}
-	left, err := evalOperand(strings.TrimSpace(src[:idx]), sc)
+	left, err := evalOperand(strings.TrimSpace(lraw), sc)
 	if err != nil {
 		return false, err
 	}
-	right, err := evalOperand(strings.TrimSpace(src[idx+2:]), sc)
+	right, err := evalOperand(strings.TrimSpace(rraw), sc)
 	if err != nil {
 		return false, err
 	}
-	return left == right, nil
+	return equalOperands(left, right)
+}
+
+// splitEquality finds the top-level `==` operator that is not inside a single-
+// quoted string literal and returns the two operand substrings. ok=false when
+// there is no such operator (so `'a==b'` alone is not mistaken for a comparison).
+func splitEquality(s string) (left, right string, ok bool) {
+	inQuote := false
+	for i := 0; i+1 < len(s); i++ {
+		switch s[i] {
+		case '\'':
+			inQuote = !inQuote
+		case '=':
+			if !inQuote && s[i+1] == '=' {
+				return s[:i], s[i+2:], true
+			}
+		}
+	}
+	return "", "", false
+}
+
+// equalOperands compares two evaluated operands with equality semantics for the
+// bounded subset (string / bool / number). Numbers coerce across int and float64
+// — JSON numbers unmarshal to float64 while integer literals and $index are int,
+// and Go's `==` is false across differing concrete types, so a raw `left == right`
+// would take the wrong branch for `${if(count == 1, …)}` on JSON data. Kinds that
+// `==` cannot compare (slice / map / func) return a clean error instead of
+// panicking. (PR #654 review.)
+func equalOperands(l, r any) (bool, error) {
+	if lf, lok := toFloat(l); lok {
+		rf, rok := toFloat(r)
+		return rok && lf == rf, nil // number vs non-number is never equal
+	}
+	switch l.(type) {
+	case string, bool, nil:
+		// r's dynamic type may differ (e.g. string vs bool); comparing two
+		// interfaces of differing comparable types is false, not a panic.
+		switch r.(type) {
+		case string, bool, nil:
+			return l == r, nil
+		default:
+			return false, nil
+		}
+	default:
+		return false, fmt.Errorf("jsontmpl: cannot compare %T with == (unsupported operand type)", l)
+	}
+}
+
+// toFloat coerces the numeric kinds the evaluator produces to float64 for
+// cross-type equality; ok=false for non-numeric values.
+func toFloat(v any) (float64, bool) {
+	switch n := v.(type) {
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case float64:
+		return n, true
+	default:
+		return 0, false
+	}
 }
 
 // evalOperand resolves a single token: `$index`, an integer/bool/'string'

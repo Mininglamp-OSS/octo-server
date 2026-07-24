@@ -61,8 +61,15 @@ type manifestFile struct {
 
 // manifestView is one entry of manifest.views. Template/Samples are only present
 // for JSON-mode cards (roadmap E1): Template is the repo-relative path to the
-// view's `.template.json`, Samples the sample files exercising it. Go-mode cards
-// (hand-written Template.Build) omit both — the fields are ignored there.
+// view's `.template.json`. Go-mode cards (hand-written Template.Build) omit both
+// — the fields are ignored there.
+//
+// Samples is currently informational only: the register-time self-check globs the
+// handoff's `samples/` directory (loadSamples), so a per-view `samples` list is
+// NOT a fail-close allowlist — a listed-but-missing sample is not caught here, and
+// an unlisted sample file is still loaded. It is parsed (not dropped) so a future
+// L0 PR can promote it to an allowlist without a manifest schema change; until
+// then, treat `samples/` on disk as the source of truth (PR #654 review P2).
 type manifestView struct {
 	WireProfile string   `json:"wireProfile"`
 	States      []State  `json:"states"`

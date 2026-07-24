@@ -1,10 +1,24 @@
 package jsontmpl
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 // dataDirective is the reserved key that marks an element for $data-driven
 // repetition; it is consumed during expansion and never emitted.
 const dataDirective = "$data"
+
+// maxExpandNodes bounds the total number of nodes a single Expand may emit. It is
+// a fail-closed backstop against unbounded / multiplicative $data expansion
+// (CWE-400/770, PR #654 review): a caller-supplied $data array repeats its element
+// template once per item and nested $data multiplies, so without a ceiling a large
+// array would allocate the whole tree before cardmsg.Validate — the functional
+// MaxNodes gate, which renderCore only runs AFTER Build — ever sees it. The cap
+// sits far above the largest shipped golden (~600 nodes) so it never rejects a
+// legitimate template, but turns a runaway array from unbounded allocation into a
+// fast, bounded error.
+const maxExpandNodes = 10000
 
 // Expand walks a parsed Adaptive Card template (map/slice/scalar tree) and
 // returns a new tree with every ${...} expression resolved against sc. Objects
@@ -12,14 +26,44 @@ const dataDirective = "$data"
 // scope exposing `$index`); the directive key itself is dropped. String leaves
 // go through EvalValue, so a whole-value `"${bool}"` becomes a native boolean
 // and caller data is escaped. The input tree is never mutated.
-func Expand(node any, sc Scope, escape EscapeFunc) (any, error) {
+//
+// ctx is honored between nodes so a caller cancel/deadline interrupts a large
+// expansion (R2-7 context propagation); the total emitted nodes are bounded by
+// maxExpandNodes (see the const). A nil ctx is treated as context.Background().
+func Expand(ctx context.Context, node any, sc Scope, escape EscapeFunc) (any, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ex := &expander{ctx: ctx, escape: escape, budget: maxExpandNodes}
+	return ex.expand(node, sc)
+}
+
+// expander carries the per-Expand state shared across the whole recursion: the
+// caller ctx (for cancellation), the data escaper, and the remaining node budget.
+type expander struct {
+	ctx    context.Context
+	escape EscapeFunc
+	budget int
+}
+
+// expand dispatches on node kind, decrementing the shared node budget and
+// checking the caller ctx before each node so a runaway/cancelled expansion stops
+// promptly instead of allocating the full tree.
+func (e *expander) expand(node any, sc Scope) (any, error) {
+	if err := e.ctx.Err(); err != nil {
+		return nil, err
+	}
+	if e.budget <= 0 {
+		return nil, fmt.Errorf("jsontmpl: expansion exceeded %d-node budget (possible unbounded $data)", maxExpandNodes)
+	}
+	e.budget--
 	switch n := node.(type) {
 	case map[string]any:
-		return expandObject(n, sc, escape)
+		return e.expandObject(n, sc)
 	case []any:
-		return expandArray(n, sc, escape)
+		return e.expandArray(n, sc)
 	case string:
-		return EvalValue(n, sc, escape)
+		return EvalValue(n, sc, e.escape)
 	default:
 		// bool / float64 / nil literals pass through unchanged.
 		return node, nil
@@ -28,13 +72,13 @@ func Expand(node any, sc Scope, escape EscapeFunc) (any, error) {
 
 // expandObject expands every value of m under sc, skipping the $data directive
 // key (repetition is handled by expandArray on the parent).
-func expandObject(m map[string]any, sc Scope, escape EscapeFunc) (map[string]any, error) {
+func (e *expander) expandObject(m map[string]any, sc Scope) (map[string]any, error) {
 	out := make(map[string]any, len(m))
 	for k, v := range m {
 		if k == dataDirective {
 			continue
 		}
-		ev, err := Expand(v, sc, escape)
+		ev, err := e.expand(v, sc)
 		if err != nil {
 			return nil, err
 		}
@@ -44,22 +88,27 @@ func expandObject(m map[string]any, sc Scope, escape EscapeFunc) (map[string]any
 }
 
 // expandArray expands each element; an element object carrying `$data` is
-// repeated once per resolved array item under a loop scope.
-func expandArray(arr []any, sc Scope, escape EscapeFunc) ([]any, error) {
+// repeated once per resolved array item under a loop scope. Each repetition is
+// budget-counted (via expandObject → expand on its values) and ctx-checked, so a
+// large or multiplicative $data array fails fast rather than allocating in full.
+func (e *expander) expandArray(arr []any, sc Scope) ([]any, error) {
 	out := make([]any, 0, len(arr))
 	for _, el := range arr {
 		if m, ok := el.(map[string]any); ok {
 			if raw, has := m[dataDirective]; has {
-				items, err := resolveDataArray(raw, sc, escape)
+				items, err := e.resolveDataArray(raw, sc)
 				if err != nil {
 					return nil, err
 				}
 				for i, item := range items {
+					if err := e.ctx.Err(); err != nil {
+						return nil, err
+					}
 					itemData, ok := item.(map[string]any)
 					if !ok {
 						return nil, fmt.Errorf("jsontmpl: $data element %d is %T, want object", i, item)
 					}
-					expanded, err := expandObject(m, Scope{Data: itemData, Index: i, InLoop: true}, escape)
+					expanded, err := e.expandObject(m, Scope{Data: itemData, Index: i, InLoop: true})
 					if err != nil {
 						return nil, err
 					}
@@ -68,7 +117,7 @@ func expandArray(arr []any, sc Scope, escape EscapeFunc) ([]any, error) {
 				continue
 			}
 		}
-		expanded, err := Expand(el, sc, escape)
+		expanded, err := e.expand(el, sc)
 		if err != nil {
 			return nil, err
 		}
@@ -79,12 +128,12 @@ func expandArray(arr []any, sc Scope, escape EscapeFunc) ([]any, error) {
 
 // resolveDataArray evaluates a `$data` binding (a `"${field}"` string) to the
 // backing array. The result must be a JSON array; anything else is an error.
-func resolveDataArray(raw any, sc Scope, escape EscapeFunc) ([]any, error) {
+func (e *expander) resolveDataArray(raw any, sc Scope) ([]any, error) {
 	expr, ok := raw.(string)
 	if !ok {
 		return nil, fmt.Errorf("jsontmpl: $data must be a %q string, got %T", "${...}", raw)
 	}
-	v, err := EvalValue(expr, sc, escape)
+	v, err := EvalValue(expr, sc, e.escape)
 	if err != nil {
 		return nil, err
 	}
