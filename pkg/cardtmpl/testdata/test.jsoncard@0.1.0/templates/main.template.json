@@ -1,0 +1,22 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "type": "AdaptiveCard",
+  "version": "1.5",
+  "body": [
+    { "type": "TextBlock", "text": "✦  ${title}", "weight": "Bolder", "wrap": true },
+    {
+      "type": "Container",
+      "id": "rows_panel",
+      "isVisible": "${expanded}",
+      "items": [
+        {
+          "$data": "${rows}",
+          "type": "TextBlock",
+          "text": "${label}",
+          "spacing": "${if($index == 0, 'None', 'Small')}",
+          "wrap": true
+        }
+      ]
+    }
+  ]
+}

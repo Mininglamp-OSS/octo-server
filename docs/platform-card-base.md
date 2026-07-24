@@ -106,7 +106,7 @@
 3. **能力与安全边界(与 L2a 完全一致,不放松)**
    - 组件白名单、URL https、markdown escape、input 白名单、data key 白名单 **一律走 L0** `pkg/cardmsg` 与 `Registry.Render`,业务方无法绕过;
    - 业务方不能自选 `WireProfile`(仍限 `octo/v1`/`octo/v2`);
-   - `BuildResult.DeepLink` 必须是 https,业务方不能传入任意域名;由业务方在 Template 构造时注入自己允许的 `WebLoginURL` 白名单(平台组通过 PR 审核域名);
+   - `BuildResult.DeepLink` 可选;若提供则必须是绝对 https,业务方不能传入任意域名,由业务方在 Template 构造时注入自己允许的 `WebLoginURL` 白名单(平台组通过 PR 审核域名);纯展示卡(如 JSON 进度卡)可留空以省略 `metadata.webUrl`;
    - 不允许写 `metadata.octo.*` 未声明字段,如需扩展走 L0 PR 审查(其它 owner 也能看见)。
 
 4. **发布通道**
@@ -407,13 +407,13 @@ type BuildEnv struct {
 
 // BuildResult 是 Template.Build 的返回值,只承载业务片段;
 // 基座 wrapper(Registry.Render)负责组装完整 AC 顶层文档并注入
-// metadata.octo.{protocol,template,variant,source} + metadata.webUrl。
+// metadata.octo.{protocol,template,variant,source},以及 metadata.webUrl(仅当 DeepLink 非空)。
 // 模板不 marshal AC 顶层,不写 metadata 字段。
 type BuildResult struct {
     Body     []any   // AC body 元素(TextBlock/ColumnSet/Container/...)
     Actions  []any   // AC 顶层 actions(Action.Submit / Action.OpenUrl / ...)
     Variant  string  // metadata.octo.variant,如 "docs.access_requested"
-    DeepLink string  // metadata.webUrl 与"查看详情"按钮共同来源,必填绝对 https
+    DeepLink string  // metadata.webUrl;可选:非空则须绝对 https,空则省略 webUrl(纯展示卡无规范 URL)
     Source   *Source // 覆盖 Meta.Source;nil = 不覆盖
 }
 
@@ -440,7 +440,7 @@ type Template interface {
 //  2. Meta().InputSchema.Validate(fields) → 失败返 ErrFieldsInvalid;
 //  3. Meta().ViewFor(state) 决定 view / profile → 未注册 state 返 ErrStateUnknown;
 //  4. Template.Build(ctx, state, fields, env) 拿 BuildResult;
-//  5. 组装 AC card 节点(注入 metadata.octo.{protocol,template,variant,source} + webUrl),
+//  5. 组装 AC card 节点(注入 metadata.octo.{protocol,template,variant,source};DeepLink 非空时再注入 webUrl),
 //     再包成 type-17 envelope {type, card, card_version, profile};
 //  6. cardmsg.Validate(payload) → 失败视为 render_error。
 // 业务代码只调 Render,不允许调 Template.Build 后自己拼装。
@@ -452,10 +452,10 @@ func (r *Registry) Render(ctx context.Context, id ID, version string,
 
 ### 关键约束(基座强制,非"模板自觉")
 
-1. **metadata 由基座注入**:`metadata.octo.protocol` / `template.{id,version}` / `variant` / `source` 和 `metadata.webUrl` 全部由 `Registry.Render` 写入,模板返回 `BuildResult` 不接触这些字段。
+1. **metadata 由基座注入**:`metadata.octo.protocol` / `template.{id,version}` / `variant` / `source` 全部由 `Registry.Render` 写入(`metadata.webUrl` 仅当 `DeepLink` 非空时注入),模板返回 `BuildResult` 不接触这些字段。
 2. **`cardmsg.Validate(payload)` 由基座调用**（payload 为完整 type-17 envelope，profile 在其中）：Template 无法绕过；view→profile 从 `Meta.Views[view].WireProfile` 取。
 3. **`Action.Submit.data["owner"]` / `["action_type"]` 与 `ActionContract` 一致性**:conformance test 校验;pilot 注册时用其 sample 跑一次 `Render` + 断言,失败 → 注册期 panic(fail-close)。
-4. **`DeepLink` 必填且绝对 https**:`BuildResult.DeepLink == ""` 或非 https → Render 返 error;deep-link 由模板私有拼接函数从 `env.WebLoginURL` 组装,不接受调用方任意域名。
+4. **`DeepLink` 可选,非空则绝对 https**:`BuildResult.DeepLink == ""` 表示本卡无规范浏览器 URL(如 JSON 纯展示进度卡)→ 跳过校验并省略 `metadata.webUrl`;非空则必须绝对 https(**含纯空白也判为畸形 → Render 返 error**,不静默当作"无链接"),deep-link 由模板私有拼接函数从 `env.WebLoginURL` 组装,不接受调用方任意域名。
 5. **禁止未声明的 `metadata.octo.*` 扩展**:如需扩展走本文档 PR 审查。
 
 ---

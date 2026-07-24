@@ -4,6 +4,18 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-23 (cardtmpl-json-template-engine, roadmap E1)
+
+- **Feature** — Added a JSON-template render path to `pkg/cardtmpl` (roadmap E1):
+  a bounded Adaptive Card Templating engine (`pkg/cardtmpl/jsontmpl/`) + a generic
+  `jsonTemplate` + `Registry.RegisterJSON`, so a card can register and render via
+  `Registry.Render` from a JSON handoff without a hand-written Go `Build()`.
+  Validated byte-for-byte against the `ai.reasoning-process@0.1.0` goldens. Made
+  `BuildResult.DeepLink` optional (D7) for cards with no canonical URL. The 5 Go
+  cards are untouched. See
+  [journal](journal/shared/cardtmpl-json-template-engine.md); learning candidate
+  `learnings/pending/template-engine-literal-bind-validate-backstop.md`.
+
 ## 2026-07-23 (cardtmpl-l2a-summary-migration PR-2)
 
 - **Feature** — Roadmap C second slice: `summary.completed@0.1.0` and

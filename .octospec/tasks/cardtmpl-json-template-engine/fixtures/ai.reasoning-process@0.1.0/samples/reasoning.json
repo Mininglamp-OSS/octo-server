@@ -1,0 +1,66 @@
+{
+  "reasoningId": "reasoning-channel-b-001",
+  "state": "reasoning",
+  "title": "已深度思考",
+  "statusLabel": "思考中",
+  "statusTone": "Accent",
+  "timerText": "正在深度思考…",
+  "traceExpanded": true,
+  "traceCollapsed": false,
+  "collapsedSummary": "推理仍在进行 · 点击可查看当前过程",
+  "progressText": "正在执行下一步…",
+  "phases": [
+    {
+      "thought": "先把渠道 B 转化下降的范围圈出来：拆成线索、试用激活、付费三段漏斗，取近 90 天数据。",
+      "actions": [
+        {
+          "tool": "query_metrics",
+          "detail": "channel=B · range=90d · group=stage",
+          "statusGlyph": "●",
+          "statusTone": "Good"
+        },
+        {
+          "tool": "read_file",
+          "detail": "~/analytics/funnel_definition.sql · ×2",
+          "statusGlyph": "●",
+          "statusTone": "Good"
+        },
+        {
+          "tool": "run_sql",
+          "detail": "按漏斗阶段汇总数量与转化率",
+          "statusGlyph": "●",
+          "statusTone": "Good"
+        }
+      ]
+    },
+    {
+      "thought": "口径正常，但激活率掉得比线索量快；继续拉行业标签、客服工单和 NPS 交叉验证。",
+      "actions": [
+        {
+          "tool": "query_metrics",
+          "detail": "channel=B · dims=industry · metric=activation_rate",
+          "statusGlyph": "●",
+          "statusTone": "Good"
+        },
+        {
+          "tool": "search_tickets",
+          "detail": "渠道 B · 试用 / 激活失败 · 近 60 天",
+          "statusGlyph": "●",
+          "statusTone": "Good"
+        },
+        {
+          "tool": "read_file",
+          "detail": "~/nps/2026Q2_channelB.csv",
+          "statusGlyph": "●",
+          "statusTone": "Good"
+        },
+        {
+          "tool": "query_metrics",
+          "detail": "正在叠加季节性校正…",
+          "statusGlyph": "●",
+          "statusTone": "Accent"
+        }
+      ]
+    }
+  ]
+}
