@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-server/internal/msgextraseq"
+	"github.com/go-sql-driver/mysql"
 )
 
 // TestRolloutOrdering_ActivateBeforeExpectedMode locks the activation runbook's
@@ -183,5 +185,102 @@ func TestActivateRejectsFloorAboveMax(t *testing.T) {
 	// The maximum floor itself is accepted.
 	if flipped, err := s.Activate(msgextraseq.MaxCutoverFloor); err != nil || !flipped {
 		t.Fatalf("Activate(MaxCutoverFloor) = (%v, %v), want (true, nil)", flipped, err)
+	}
+}
+
+// TestLegacyToTransactionalRolloutOrdering exercises the production order in
+// tools/msgextra-version/README.md: upgraded replicas first run with no expected
+// mode assertion, the DB-authoritative state flips, existing processes observe
+// transactional mode immediately, and only then do restarted replicas enable
+// the durable transactional guard.
+func TestLegacyToTransactionalRolloutOrdering(t *testing.T) {
+	const env = "OCTO_MESSAGE_EXTRA_VERSION_EXPECTED_MODE"
+	t.Setenv(env, "")
+
+	ctx := setup(t, msgextraseq.ModeLegacy, 0)
+	preCutoverStore := msgextraseq.New(ctx)
+	channelID, channelType := "c-rollout", uint8(2)
+
+	legacyVersion := reserveCommitted(t, ctx, preCutoverStore, channelID, channelType, 1)[0]
+	if got := lastVersion(t, ctx, channelID, channelType); got != 0 {
+		t.Fatalf("legacy write touched transactional sequence row: last_version=%d", got)
+	}
+
+	preflight, err := preCutoverStore.Preflight()
+	if err != nil {
+		t.Fatalf("Preflight: %v", err)
+	}
+	flipped, err := preCutoverStore.Activate(preflight.RecommendedFloor)
+	if err != nil || !flipped {
+		t.Fatalf("Activate = (%v, %v), want (true, nil)", flipped, err)
+	}
+
+	// Existing processes parsed an unset guard at startup, but select the new
+	// allocator immediately because every transaction rereads the DB state row.
+	transactionalVersion := reserveCommitted(t, ctx, preCutoverStore, channelID, channelType, 1)[0]
+	if transactionalVersion <= legacyVersion {
+		t.Fatalf("post-activate version=%d must exceed legacy version=%d", transactionalVersion, legacyVersion)
+	}
+	if got := lastVersion(t, ctx, channelID, channelType); got != transactionalVersion {
+		t.Fatalf("transactional sequence last_version=%d want %d", got, transactionalVersion)
+	}
+
+	// The guard is enabled only after the DB flip. A newly restarted process then
+	// accepts writes because its expectation matches the authoritative mode.
+	t.Setenv(env, "transactional")
+	guardedStore := msgextraseq.New(ctx)
+	guardedVersion := reserveCommitted(t, ctx, guardedStore, channelID, channelType, 1)[0]
+	if guardedVersion != transactionalVersion+1 {
+		t.Fatalf("guarded version=%d want %d", guardedVersion, transactionalVersion+1)
+	}
+}
+
+// TestActivateFailsFastWhenWriterDrainIncomplete locks the operational safety
+// contract: if a writer still holds the shared state lock, activation must time
+// out quickly instead of queueing an exclusive lock that stalls later writers.
+func TestActivateFailsFastWhenWriterDrainIncomplete(t *testing.T) {
+	ctx := setup(t, msgextraseq.ModeLegacy, 0)
+	s := msgextraseq.New(ctx)
+
+	writerTx, err := ctx.DB().Begin()
+	if err != nil {
+		t.Fatalf("begin writer tx: %v", err)
+	}
+	defer writerTx.RollbackUnlessCommitted()
+	if _, err := s.Mode(writerTx); err != nil {
+		t.Fatalf("lock state FOR SHARE: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.Activate(0)
+		done <- err
+	}()
+
+	const failFastDeadline = 6 * time.Second
+	select {
+	case err := <-done:
+		var mysqlErr *mysql.MySQLError
+		if !errors.As(err, &mysqlErr) || mysqlErr.Number != 1205 {
+			t.Fatalf("Activate error=%v, want MySQL 1205 lock-wait timeout", err)
+		}
+	case <-time.After(failFastDeadline):
+		// Release the blocker so the goroutine cannot leak after this failure.
+		_ = writerTx.Rollback()
+		select {
+		case err := <-done:
+			t.Fatalf("Activate did not fail within %s; completed only after releasing the writer lock: %v", failFastDeadline, err)
+		case <-time.After(failFastDeadline):
+			t.Fatalf("Activate remained blocked for more than %s after releasing the writer lock", 2*failFastDeadline)
+		}
+	}
+
+	_ = writerTx.Rollback()
+	state, err := s.Preflight()
+	if err != nil {
+		t.Fatalf("Preflight after timeout: %v", err)
+	}
+	if state.CurrentMode != msgextraseq.ModeLegacy {
+		t.Fatalf("activation changed mode despite lock timeout: %+v", state)
 	}
 }

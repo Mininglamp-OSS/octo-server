@@ -556,6 +556,17 @@ func TestReserveTx_BatchPaginatesViaCursor(t *testing.T) {
 func TestExpectedModeGuard(t *testing.T) {
 	const env = "OCTO_MESSAGE_EXTRA_VERSION_EXPECTED_MODE"
 
+	t.Run("expected transactional before activation fails closed", func(t *testing.T) {
+		ctx := setup(t, msgextraseq.ModeLegacy, 0)
+		t.Setenv(env, "transactional")
+		s := msgextraseq.New(ctx)
+		tx, _ := ctx.DB().Begin()
+		if _, err := s.ReserveTx(tx, "c-x", 2, 1); !errors.Is(err, msgextraseq.ErrExpectedModeMismatch) {
+			t.Fatalf("err=%v want ErrExpectedModeMismatch", err)
+		}
+		_ = tx.Rollback()
+	})
+
 	t.Run("expected transactional, missing row fails closed", func(t *testing.T) {
 		ctx := setup(t, msgextraseq.ModeTransactional, 1000)
 		if _, err := ctx.DB().UpdateBySql("DELETE FROM `octo_message_extra_version_state`").Exec(); err != nil {
