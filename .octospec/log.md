@@ -4,6 +4,28 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-24 (bot-send-permission-error-classification)
+
+- **Error classification** — Bot API sends to a missing group or missing thread
+  parent now reuse `err.server.bot_api.group_not_found` (wire 400, semantic
+  404); real group-status and membership query failures remain internal
+  `query_failed` results. Existing DM, Space, disbanded-group, and non-member
+  denials are unchanged.
+- **Observability and privacy** — added the bounded
+  `dmwork_bot_send_permission_failure_total{stage,reason}` counter and one
+  request-correlated terminal log without raw Bot/user/channel/group/thread/
+  Space identifiers. OBO friend-gate lookup failures retain `not_friend`
+  fail-closed behavior while using the same sanitized observer.
+- **Verification** — handler tests cover group and parent-group absence, real
+  DB failure, D14 wire semantics, trace correlation, and zero dispatch; focused
+  tests cover DM/App Bot/Space/OBO outcomes and metric cardinality. All build,
+  test, vet, lint, and i18n gates are green. See
+  [journal](journal/shared/bot-send-permission-error-classification.md).
+- **Learning (pending)** — when fail-closed authorization intentionally
+  collapses an infrastructure error into a business denial, preserve a bounded
+  internal diagnostic signal and emit it once at the request boundary. See
+  [learning](learnings/pending/fail-closed-diagnostic-signal.md).
+
 ## 2026-07-23 (cardtmpl-l2a-migration PR-1)
 
 - **Feature** — Roadmap C first slice: `docs.commented@0.1.0` and
