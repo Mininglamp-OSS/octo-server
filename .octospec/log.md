@@ -26,6 +26,19 @@ change-log convention (§7). Newest first.
   internal diagnostic signal and emit it once at the request boundary. See
   [learning](learnings/pending/fail-closed-diagnostic-signal.md).
 
+## 2026-07-24 (cardtmpl-reasoning-progress-card, roadmap E1a)
+
+- **Feature** — Onboarded `ai.reasoning-process@0.1.0` as the first live JSON-mode
+  card on the E1 engine (#654), via `Registry.RegisterJSON` (no Go `Build()`).
+  Decision A: the producer's action buttons are kept (`reasoning_stop` /
+  `reasoning_retry` `Action.Submit` + toggle) under a fixed owner `ai` /
+  action_type `reasoning.control` (added `ai` to the L2a allowlist); `active`/
+  `error` are octo/v2, the display-only `result` view is octo/v1 (mirrors
+  docs.access-request 0.3.0). `Submit.data` carries owner/action_type so the
+  ActionContract self-check passes; goldens synced. The button handler +
+  RouteSpec + bot streaming delivery are downstream — the card is registered and
+  renderable only. See [journal](journal/shared/cardtmpl-reasoning-progress-card.md).
+
 ## 2026-07-23 (cardtmpl-json-template-engine, roadmap E1)
 
 - **Feature** — Added a JSON-template render path to `pkg/cardtmpl` (roadmap E1):

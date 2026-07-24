@@ -1,0 +1,422 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "type": "AdaptiveCard",
+  "version": "1.5",
+  "body": [
+    {
+      "type": "Container",
+      "id": "octo-surface-accent-header-reasoning-error",
+      "style": "accent",
+      "bleed": true,
+      "spacing": "None",
+      "items": [
+        {
+          "type": "ColumnSet",
+          "spacing": "None",
+          "columns": [
+            {
+              "type": "Column",
+              "width": "stretch",
+              "items": [
+                {
+                  "type": "TextBlock",
+                  "text": "✦  已深度思考",
+                  "color": "Accent",
+                  "weight": "Bolder",
+                  "wrap": true,
+                  "spacing": "None"
+                },
+                {
+                  "type": "TextBlock",
+                  "text": "已中断",
+                  "size": "Small",
+                  "isSubtle": true,
+                  "wrap": true,
+                  "spacing": "Small"
+                }
+              ]
+            },
+            {
+              "type": "Column",
+              "width": "auto",
+              "verticalContentAlignment": "Center",
+              "items": [
+                {
+                  "type": "TextBlock",
+                  "id": "octo-badge-reasoning-error-status",
+                  "text": "生成失败",
+                  "color": "Attention",
+                  "weight": "Bolder",
+                  "size": "Small",
+                  "wrap": true,
+                  "spacing": "None"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "Container",
+      "id": "trace_panel",
+      "isVisible": true,
+      "spacing": "Large",
+      "items": [
+        {
+          "type": "Container",
+          "spacing": "None",
+          "separator": false,
+          "items": [
+            {
+              "type": "TextBlock",
+              "text": "先拆分线索、试用激活与付费三段漏斗，核对近 90 天数据。",
+              "size": "Small",
+              "wrap": true,
+              "spacing": "None"
+            },
+            {
+              "type": "Container",
+              "style": "emphasis",
+              "spacing": "Small",
+              "items": [
+                {
+                  "type": "ColumnSet",
+                  "spacing": "None",
+                  "columns": [
+                    {
+                      "type": "Column",
+                      "width": "auto",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "●",
+                          "color": "Good",
+                          "size": "Small",
+                          "spacing": "None"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "Column",
+                      "width": "auto",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "query_metrics",
+                          "weight": "Bolder",
+                          "size": "Small",
+                          "wrap": true,
+                          "spacing": "None"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "Column",
+                      "width": "stretch",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "channel=B · range=90d · group=stage",
+                          "isSubtle": true,
+                          "size": "Small",
+                          "wrap": true,
+                          "spacing": "None"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "ColumnSet",
+                  "spacing": "Small",
+                  "columns": [
+                    {
+                      "type": "Column",
+                      "width": "auto",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "●",
+                          "color": "Good",
+                          "size": "Small",
+                          "spacing": "None"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "Column",
+                      "width": "auto",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "read_file",
+                          "weight": "Bolder",
+                          "size": "Small",
+                          "wrap": true,
+                          "spacing": "None"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "Column",
+                      "width": "stretch",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "~/analytics/funnel_definition.sql · ×2",
+                          "isSubtle": true,
+                          "size": "Small",
+                          "wrap": true,
+                          "spacing": "None"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "ColumnSet",
+                  "spacing": "Small",
+                  "columns": [
+                    {
+                      "type": "Column",
+                      "width": "auto",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "●",
+                          "color": "Good",
+                          "size": "Small",
+                          "spacing": "None"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "Column",
+                      "width": "auto",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "run_sql",
+                          "weight": "Bolder",
+                          "size": "Small",
+                          "wrap": true,
+                          "spacing": "None"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "Column",
+                      "width": "stretch",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "按漏斗阶段汇总数量与转化率",
+                          "isSubtle": true,
+                          "size": "Small",
+                          "wrap": true,
+                          "spacing": "None"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "Container",
+          "spacing": "Large",
+          "separator": true,
+          "items": [
+            {
+              "type": "TextBlock",
+              "text": "准备交叉核验行业结构、客服工单与 NPS 时，推理服务连接中断。",
+              "size": "Small",
+              "wrap": true,
+              "spacing": "None"
+            },
+            {
+              "type": "Container",
+              "style": "emphasis",
+              "spacing": "Small",
+              "items": [
+                {
+                  "type": "ColumnSet",
+                  "spacing": "None",
+                  "columns": [
+                    {
+                      "type": "Column",
+                      "width": "auto",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "●",
+                          "color": "Good",
+                          "size": "Small",
+                          "spacing": "None"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "Column",
+                      "width": "auto",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "query_metrics",
+                          "weight": "Bolder",
+                          "size": "Small",
+                          "wrap": true,
+                          "spacing": "None"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "Column",
+                      "width": "stretch",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "按行业拆分激活率",
+                          "isSubtle": true,
+                          "size": "Small",
+                          "wrap": true,
+                          "spacing": "None"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "ColumnSet",
+                  "spacing": "Small",
+                  "columns": [
+                    {
+                      "type": "Column",
+                      "width": "auto",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "●",
+                          "color": "Attention",
+                          "size": "Small",
+                          "spacing": "None"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "Column",
+                      "width": "auto",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "search_tickets",
+                          "weight": "Bolder",
+                          "size": "Small",
+                          "wrap": true,
+                          "spacing": "None"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "Column",
+                      "width": "stretch",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "连接超时，调用未完成",
+                          "isSubtle": true,
+                          "size": "Small",
+                          "wrap": true,
+                          "spacing": "None"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "Container",
+      "id": "collapsed_panel",
+      "isVisible": false,
+      "spacing": "Medium",
+      "items": [
+        {
+          "type": "TextBlock",
+          "text": "生成已中断 · 点击可查看停止前的过程",
+          "size": "Small",
+          "isSubtle": true,
+          "wrap": true,
+          "spacing": "None"
+        }
+      ]
+    },
+    {
+      "type": "Container",
+      "style": "attention",
+      "spacing": "Large",
+      "items": [
+        {
+          "type": "TextBlock",
+          "text": "生成失败",
+          "color": "Attention",
+          "weight": "Bolder",
+          "wrap": true,
+          "spacing": "None"
+        },
+        {
+          "type": "TextBlock",
+          "text": "推理服务连接超时，已停止本次生成。可以重试，已完成的过程会保留。",
+          "wrap": true,
+          "spacing": "Small"
+        }
+      ]
+    },
+    {
+      "type": "Container",
+      "id": "octo-surface-default-footer-reasoning-error",
+      "style": "emphasis",
+      "bleed": true,
+      "separator": true,
+      "spacing": "Large",
+      "items": [
+        {
+          "type": "ActionSet",
+          "horizontalAlignment": "Right",
+          "actions": [
+            {
+              "type": "Action.Submit",
+              "id": "reasoning_retry",
+              "title": "重试",
+              "style": "positive",
+              "associatedInputs": "none",
+              "data": {
+                "action": "reasoning_retry",
+                "effect": "retry_reasoning",
+                "reasoning_id": "reasoning-channel-b-003",
+                "owner": "ai",
+                "action_type": "reasoning.control"
+              }
+            },
+            {
+              "type": "Action.ToggleVisibility",
+              "id": "reasoning_toggle",
+              "title": "显示 / 隐藏推理",
+              "targetElements": [
+                "trace_panel",
+                "collapsed_panel"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
