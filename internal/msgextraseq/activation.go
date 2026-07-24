@@ -14,7 +14,7 @@ package msgextraseq
 // change cannot invalidate that in-memory cache. Rollback is therefore a
 // documented, maintenance-window coordinated procedure (drain writes → raise the
 // legacy seq boundaries above the transactional max → restart every replica →
-// flip mode); see tools/msgextra-version/README.md §5.
+// flip mode); see tools/msgextra-version/README.md §6.
 //
 // The cutover floor must be at least every version already handed out (or the
 // transactional sequence could reissue a value ≤ an existing one and re-open the

@@ -3,9 +3,10 @@ package msgextraseq_test
 // Tests for the #627 operator activation surface (PR-3): Preflight (read-only
 // floor recommendation) and Activate (legacy→transactional drain-barrier flip
 // with floor lower/upper bound enforcement + idempotency). There is no online
-// deactivate to test — rollback is a documented coordinated procedure (README §5).
+// deactivate to test — rollback is a documented coordinated procedure (README §6).
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 
@@ -13,17 +14,60 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/internal/msgextraseq"
 )
 
+// TestRolloutOrdering_ActivateBeforeExpectedMode locks the activation runbook's
+// mandatory sequencing (README §3 flip BEFORE §5 guard): the durable expected-mode
+// guard (OCTO_MESSAGE_EXTRA_VERSION_EXPECTED_MODE=transactional) must only be
+// enabled AFTER the DB flip commits. Enabling it while the state row is still
+// legacy — e.g. a rolling deploy that ships the env before activation lands —
+// fails every writer closed with ErrExpectedModeMismatch (a self-inflicted
+// outage). Once Activate flips the row to transactional, the same writer succeeds.
+// This is the read-side proof that the runbook's activate-first order is the safe
+// one (Jerry-Xin PR #648 re-review).
+func TestRolloutOrdering_ActivateBeforeExpectedMode(t *testing.T) {
+	// Pre-activation: DB mode=legacy, but a replica already booted expecting
+	// transactional (guard-before-flip — the misordering the runbook forbids).
+	ctx := setup(t, msgextraseq.ModeLegacy, 0)
+	t.Setenv("OCTO_MESSAGE_EXTRA_VERSION_EXPECTED_MODE", "transactional")
+	s := msgextraseq.New(ctx)
+
+	// Guard-before-flip: writers fail closed — the outage the §2 warning avoids.
+	tx, err := ctx.DB().Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if _, err := s.ReserveTx(tx, "c-order", 2, 1); !errors.Is(err, msgextraseq.ErrExpectedModeMismatch) {
+		t.Fatalf("legacy row + expected=transactional must fail closed, got %v", err)
+	}
+	_ = tx.Rollback()
+
+	// Flip the DB to transactional. Activate does NOT consult the expected-mode
+	// guard, so the operator can always run it first (runbook §3).
+	flipped, err := s.Activate(0)
+	if err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+	if !flipped {
+		t.Fatal("Activate should have flipped legacy->transactional")
+	}
+
+	// Post-activation (runbook §5 order): the same writer now succeeds because the
+	// resolved mode matches the expected mode.
+	if got := reserveCommitted(t, ctx, s, "c-order", 2, 1); len(got) != 1 {
+		t.Fatalf("post-activation reserve len=%d want 1", len(got))
+	}
+}
+
 // TestLegacySeqKeyFormatMatchesRunbook locks the legacy GenSeq key scheme that
 // two out-of-band consumers depend on: Preflight/Activate's observedMaxima keys
 // the legacy boundary by the `seq:messageExtra:%` LIKE prefix, and the coordinated
-// rollback runbook (tools/msgextra-version/README.md §5) raises those same
+// rollback runbook (tools/msgextra-version/README.md §6) raises those same
 // `seq:messageExtra:<channel>` rows above the transactional high-water. Since
 // rollback correctness now lives only in docs (there is no online Deactivate),
 // this guards the runbook SQL against silently drifting from the allocator's key
 // scheme (Jerry-Xin PR #648 re-review note). A pure assertion — no DB.
 func TestLegacySeqKeyFormatMatchesRunbook(t *testing.T) {
 	if got := common.MessageExtraSeqKey; got != "messageExtra" {
-		t.Fatalf("MessageExtraSeqKey = %q, want %q — README §5 rollback SQL keys on seq:messageExtra:<channel>", got, "messageExtra")
+		t.Fatalf("MessageExtraSeqKey = %q, want %q — README §6 rollback SQL keys on seq:messageExtra:<channel>", got, "messageExtra")
 	}
 	const wantPrefix = "seq:messageExtra:%"
 	if got := fmt.Sprintf("seq:%s:%%", common.MessageExtraSeqKey); got != wantPrefix {

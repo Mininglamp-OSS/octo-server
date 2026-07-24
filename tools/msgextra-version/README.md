@@ -33,13 +33,17 @@ one and re-open the exact skip window #627 closes.
 - Deploy the PR-2 writer-cutover build to **all** replicas and confirm it is
   stable in `mode=legacy` (behavior-neutral; `reserve_total{result=success}`
   climbing, no `invariant_violation_total`).
-- Set `OCTO_MESSAGE_EXTRA_VERSION_EXPECTED_MODE=transactional` on every replica
-  **as part of the same rollout that activates** (see §5). This is the durable
-  guard: if the state row is ever lost/reset, a replica that expects
-  transactional fails closed instead of silently reverting to legacy.
 - Verify the `octo_message_extra_channel_seq.channel_id` collation matches
   `message_extra.channel_id` in production (the migration pins
   `utf8mb4_general_ci`; confirm the live table agrees).
+- **Do NOT set `OCTO_MESSAGE_EXTRA_VERSION_EXPECTED_MODE=transactional` yet.** The
+  expected-mode guard fails **every** `message_extra` writer closed
+  (`ErrExpectedModeMismatch`) whenever a replica expects `transactional` while the
+  state row is still `legacy`. Enabling it before the flip (§3) commits — e.g. a
+  rolling deploy that ships the env in the same wave as activation, where an
+  un-flipped replica reboots and picks up `transactional` first — is a
+  self-inflicted write outage. The guard is the **last** step, only after
+  activation is verified (§5).
 
 ## 3. Activate
 
@@ -63,7 +67,28 @@ idempotent (a second run is a no-op). `epoch` is bumped for observability.
 - Metrics: `allocator_mode{mode="transactional"}=1`, `cutover_floor` set,
   `reserve_total{result=retry}` near zero (the card retry loop is only a backstop).
 
-## 5. Rollback to legacy (coordinated, maintenance-window only)
+## 5. Enable the durable expected-mode guard (only after §4 confirms transactional)
+
+Once `preflight` reports `mode=transactional` (§4), set
+
+```
+OCTO_MESSAGE_EXTRA_VERSION_EXPECTED_MODE=transactional
+```
+
+on every replica (a normal config rollout / restart). This is the durable
+read-side guard: if the state row is ever lost or reset to `legacy`, a replica
+that expects `transactional` fails closed (`ErrExpectedModeMismatch`) instead of
+silently reverting to the process-local `GenSeq` and re-opening the skip window.
+
+**Ordering is mandatory and one-directional.** The DB flip (§3) must commit and be
+confirmed (§4) *before* any replica boots with this env. Never ship the env in the
+same rollout wave that performs the flip — an un-flipped replica that picks up
+`transactional` fails every writer until activation lands (see the §2 warning).
+The read-side proof is `TestRolloutOrdering_ActivateBeforeExpectedMode`: a legacy
+state row with `expected=transactional` fails writers closed; after `Activate`
+flips the row, the same writer succeeds.
+
+## 6. Rollback to legacy (coordinated, maintenance-window only)
 
 **There is no online `deactivate` action, by design.** Rolling back to legacy
 cannot be done safely by a single mode flip: octo-lib's `GenSeq` HiLo allocator

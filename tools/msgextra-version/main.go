@@ -11,7 +11,7 @@
 // There is no "deactivate" action: rolling back to legacy cannot be done safely
 // online (octo-lib's in-memory GenSeq HiLo cache would resume below the
 // transactional high-water), so rollback is a documented maintenance-window
-// coordinated procedure — see README.md §5.
+// coordinated procedure — see README.md §6.
 //
 // Activation is a runtime state-row flip, NOT a code deploy: it takes effect
 // immediately across all replicas via the DB-authoritative state row. Run
