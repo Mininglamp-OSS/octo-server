@@ -573,7 +573,6 @@ func TestSendPermissionObservationBoundsUnexpectedValues(t *testing.T) {
 		common.ChannelTypePerson.Uint8(),
 		sendPermissionFailureStage("sensitive-stage-id"),
 		sendPermissionFailureReason("sensitive-error-text"),
-		nil,
 	)
 
 	assert.Equal(t, float64(1), testutil.ToFloat64(metrics.failures.WithLabelValues("unknown", "unknown")))

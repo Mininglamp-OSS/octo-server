@@ -63,7 +63,6 @@ func (ba *BotAPI) observeSendPermissionFailure(
 	channelType uint8,
 	stage sendPermissionFailureStage,
 	reason sendPermissionFailureReason,
-	err error,
 ) {
 	stage = stage.bounded()
 	reason = reason.bounded()
@@ -82,9 +81,6 @@ func (ba *BotAPI) observeSendPermissionFailure(
 		zap.String("failure_reason", string(reason)),
 		zap.String("bot_kind", safeBotKind(botKind)),
 		zap.Uint8("channel_type", channelType),
-	}
-	if err != nil {
-		fields = append(fields, zap.Error(err))
 	}
 	if reason == sendPermissionReasonNotFound {
 		ba.Warn("bot send permission check denied", fields...)

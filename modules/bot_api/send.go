@@ -347,7 +347,7 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 		// Rule 2: Must have friend relationship (user opt-in via /v1/robot/apply)
 		isFriend, err := ba.isFriend(robotID, channelID)
 		if err != nil {
-			ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageFriend, sendPermissionReasonQueryError, err)
+			ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageFriend, sendPermissionReasonQueryError)
 			return errBotSendPermCheckFailed
 		}
 		if !isFriend {
@@ -358,12 +358,12 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 			spaceIDStr, _ := c.Get(CtxKeyAppBotSpaceID)
 			sid, _ := spaceIDStr.(string)
 			if sid == "" {
-				ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageSpaceContext, sendPermissionReasonMissingContext, nil)
+				ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageSpaceContext, sendPermissionReasonMissingContext)
 				return errBotSendPermCheckFailed
 			}
 			isMember, memberErr := ba.isSpaceMember(channelID, sid)
 			if memberErr != nil {
-				ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageSpaceMember, sendPermissionReasonQueryError, memberErr)
+				ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageSpaceMember, sendPermissionReasonQueryError)
 				return errBotSendPermCheckFailed
 			}
 			if !isMember {
@@ -384,10 +384,10 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 			// of OBO context.
 			if disbanded, err := ba.isGroupDisbanded(channelID); err != nil {
 				if errors.Is(err, dbr.ErrNotFound) {
-					ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageGroupStatus, sendPermissionReasonNotFound, err)
+					ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageGroupStatus, sendPermissionReasonNotFound)
 					return errBotSendPermGroupNotFound
 				}
-				ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageGroupStatus, sendPermissionReasonQueryError, err)
+				ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageGroupStatus, sendPermissionReasonQueryError)
 				return errBotSendPermCheckFailed
 			} else if disbanded {
 				return errBotSendPermGroupDisbanded
@@ -400,7 +400,7 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 				// Group: check bot is a group member
 				count, err := ba.queryBotGroupMemberCount(channelID, robotID)
 				if err != nil {
-					ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageGroupMember, sendPermissionReasonQueryError, err)
+					ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageGroupMember, sendPermissionReasonQueryError)
 					return errBotSendPermCheckFailed
 				}
 				if count == 0 {
@@ -420,10 +420,10 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 			}
 			if disbanded, err := ba.isGroupDisbanded(topicParts[0]); err != nil {
 				if errors.Is(err, dbr.ErrNotFound) {
-					ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageGroupStatus, sendPermissionReasonNotFound, err)
+					ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageGroupStatus, sendPermissionReasonNotFound)
 					return errBotSendPermGroupNotFound
 				}
-				ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageGroupStatus, sendPermissionReasonQueryError, err)
+				ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageGroupStatus, sendPermissionReasonQueryError)
 				return errBotSendPermCheckFailed
 			} else if disbanded {
 				return errBotSendPermGroupDisbanded
@@ -450,7 +450,7 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 				}
 				count, err := ba.queryBotGroupMemberCount(parts[0], robotID)
 				if err != nil {
-					ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageGroupMember, sendPermissionReasonQueryError, err)
+					ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageGroupMember, sendPermissionReasonQueryError)
 					return errBotSendPermCheckFailed
 				}
 				if count == 0 {
@@ -480,7 +480,7 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 				// rationale and the regression that motivated R7.
 				allowed, err := ba.isFriendOrOBOBypass(robotID, channelID, channelType, hasOBOContext)
 				if err != nil {
-					ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageFriend, sendPermissionReasonQueryError, err)
+					ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageFriend, sendPermissionReasonQueryError)
 					if errors.Is(err, errBotSendPermOBOCheckFailed) {
 						return errBotSendPermNotFriend
 					}
@@ -494,7 +494,7 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 		return nil
 
 	default:
-		ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageBotKind, sendPermissionReasonUnknown, nil)
+		ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageBotKind, sendPermissionReasonUnknown)
 		return errBotSendPermCheckFailed
 	}
 }

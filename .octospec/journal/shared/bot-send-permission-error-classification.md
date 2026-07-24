@@ -23,7 +23,9 @@ source: self
   `conversation_not_started`, and Space/member denials are unchanged.
 - Added `dmwork_bot_send_permission_failure_total{stage,reason}` with closed
   label enums and one structured terminal log carrying only `trace_id`, stage,
-  reason, bounded Bot kind, channel type, and a safe error message.
+  reason, bounded Bot kind, and channel type. Raw error text is excluded at the
+  observer API boundary so future driver or wrapper changes cannot leak request
+  identifiers or SQL arguments.
 - Removed raw Bot/channel/grantor identifiers from OBO friend-gate failure logs.
   OBO lookup and grantor-access failures now reach the same sanitized observer
   while preserving the historical fail-closed `not_friend` response.
@@ -66,4 +68,3 @@ source: self
 - A fail-closed helper may intentionally keep a business denial on the wire,
   but it must not discard the diagnostic signal needed for request-correlated
   logs and persistent metrics.
-
