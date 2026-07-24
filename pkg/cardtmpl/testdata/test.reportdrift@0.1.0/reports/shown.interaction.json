@@ -1,0 +1,12 @@
+{
+  "actions": [
+    {
+      "id": "declared_action",
+      "type": "Action.Submit",
+      "associatedInputs": "none",
+      "dataKeys": ["owner", "action_type", "action"],
+      "inputIds": []
+    }
+  ],
+  "inputs": []
+}

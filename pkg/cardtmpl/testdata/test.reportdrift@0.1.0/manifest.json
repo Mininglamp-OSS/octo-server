@@ -1,0 +1,15 @@
+{
+  "id": "test.reportdrift",
+  "version": "0.1.0",
+  "protocol": "octo-card@1.0",
+  "owner": "ai",
+  "actionType": "reasoning.control",
+  "views": {
+    "shown": {
+      "wireProfile": "octo/v2",
+      "states": ["shown"],
+      "template": "templates/shown.template.json",
+      "samples": ["samples/shown.json"]
+    }
+  }
+}

@@ -181,6 +181,20 @@ func TestRegisterJSON_ViewMissingTemplate_FailClose(t *testing.T) {
 	}
 }
 
+// TestRegisterJSON_InteractionReportDrift_FailClose locks the production
+// guarantee consumed by the Bot template catalog: advertised Submit ids come
+// from the interaction report, so a report that differs from the rendered
+// sample must fail at registration instead of publishing a false capability.
+func TestRegisterJSON_InteractionReportDrift_FailClose(t *testing.T) {
+	rec := tryRegisterJSON("testdata/test.reportdrift@0.1.0")
+	if rec == nil {
+		t.Fatal("expected register-time panic for interaction report drift")
+	}
+	if !strings.Contains(toStr(rec), "interaction") {
+		t.Fatalf("want interaction drift panic, got %v", rec)
+	}
+}
+
 func toStr(v any) string {
 	if e, ok := v.(error); ok {
 		return e.Error()
