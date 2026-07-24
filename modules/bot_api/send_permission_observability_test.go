@@ -124,7 +124,7 @@ func TestCheckSendPermissionClassifiesGroupStatusFailures(t *testing.T) {
 			name:         "database error",
 			channelID:    "sensitive-group",
 			channelType:  common.ChannelTypeGroup.Uint8(),
-			lookupErr:    errors.New("database unavailable"),
+			lookupErr:    errors.New("database unavailable for group_no=sensitive-group uid=sensitive-bot"),
 			wantErr:      errBotSendPermCheckFailed,
 			wantReason:   sendPermissionReasonQueryError,
 			wantLogLevel: "error",
@@ -164,6 +164,7 @@ func TestCheckSendPermissionClassifiesGroupStatusFailures(t *testing.T) {
 			assert.Equal(t, BotKindUser, entry.fields["bot_kind"])
 			assert.NotContains(t, entry.fields, "robot_id")
 			assert.NotContains(t, entry.fields, "channel_id")
+			assert.NotContains(t, entry.fields, "error", "permission logs must never accept raw error text")
 			serialized := fmt.Sprint(entry.fields)
 			assert.NotContains(t, serialized, "sensitive-bot")
 			assert.NotContains(t, serialized, "sensitive-group")
