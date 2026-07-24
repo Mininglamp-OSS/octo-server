@@ -1,0 +1,24 @@
+{
+  "type": "AdaptiveCard",
+  "version": "1.5",
+  "body": [
+    {
+      "type": "TextBlock",
+      "text": "${title}"
+    },
+    {
+      "type": "Input.Text",
+      "id": "query",
+      "label": "Query",
+      "inlineAction": {
+        "type": "Action.Submit",
+        "id": "inline_action",
+        "title": "Run",
+        "associatedInputs": "none",
+        "data": {
+          "action": "run"
+        }
+      }
+    }
+  ]
+}

@@ -195,6 +195,52 @@ func TestRegisterJSON_InteractionReportDrift_FailClose(t *testing.T) {
 	}
 }
 
+// TestRegisterJSON_InlineActionInteractionReportDrift_FailClose proves the
+// registration guard sees Action.Submit when it is attached to Input.* via
+// inlineAction. Without that traversal, this fixture registers successfully
+// while publishing an interaction report that omits a real Submit action.
+func TestRegisterJSON_InlineActionInteractionReportDrift_FailClose(t *testing.T) {
+	rec := tryRegisterJSON("testdata/test.inlineaction-reportdrift@0.1.0")
+	if rec == nil {
+		t.Fatal("expected register-time panic for inlineAction interaction report drift")
+	}
+	got := toStr(rec)
+	if !strings.Contains(got, "Action.Submit ids") || !strings.Contains(got, "inline_action") {
+		t.Fatalf("want inlineAction Submit drift panic, got %v", rec)
+	}
+}
+
+// TestAssertActionContract_InlineAction keeps the action-contract walker in
+// lockstep with the interaction-report walker for the same supported surface.
+func TestAssertActionContract_InlineAction(t *testing.T) {
+	payload := map[string]any{
+		"card": map[string]any{
+			"body": []any{
+				map[string]any{
+					"type": "Input.Text",
+					"id":   "query",
+					"inlineAction": map[string]any{
+						"type": "Action.Submit",
+						"id":   "inline_action",
+						"data": map[string]any{
+							"owner":       "ai",
+							"action_type": "reasoning.control",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	err := assertActionContract(payload, TemplateActionContract{
+		Owner:      "ai",
+		ActionType: "reasoning.control",
+	})
+	if err != nil {
+		t.Fatalf("inlineAction Submit must satisfy action contract: %v", err)
+	}
+}
+
 func toStr(v any) string {
 	if e, ok := v.(error); ok {
 		return e.Error()
