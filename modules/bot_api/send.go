@@ -790,6 +790,26 @@ type botMessageEditReq struct {
 	Data        map[string]any `json:"data"`
 	CardSeq     int64          `json:"card_seq"`
 	Transient   bool           `json:"transient"`
+	// Presence is tracked separately from decoded values so the raw/Registry
+	// XOR cannot be bypassed with content_edit:"" or template_ref:null.
+	contentEditSet bool
+	templateRefSet bool
+}
+
+func (r *botMessageEditReq) UnmarshalJSON(data []byte) error {
+	type wire botMessageEditReq
+	var decoded wire
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*r = botMessageEditReq(decoded)
+	_, r.contentEditSet = fields["content_edit"]
+	_, r.templateRefSet = fields["template_ref"]
+	return nil
 }
 
 // botMessageEdit handles POST /v1/bot/message/edit.
@@ -808,13 +828,17 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 		respondBotAPIRequestInvalid(c, "channel_id")
 		return
 	}
-	rawMode := strings.TrimSpace(req.ContentEdit) != ""
-	templateMode := req.TemplateRef != nil
+	rawMode := req.contentEditSet
+	templateMode := req.templateRefSet
 	if rawMode && templateMode {
 		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
 		return
 	}
 	if !rawMode && !templateMode {
+		respondBotAPIRequestInvalid(c, "content_edit")
+		return
+	}
+	if rawMode && strings.TrimSpace(req.ContentEdit) == "" {
 		respondBotAPIRequestInvalid(c, "content_edit")
 		return
 	}
