@@ -126,8 +126,8 @@ func TestBotCardTemplateCatalogRenderPayload(t *testing.T) {
 	if got["profile"] != "octo/v2" || got["render_profile"] != "octo-chat/v1" {
 		t.Fatalf("profiles = profile:%v render:%v", got["profile"], got["render_profile"])
 	}
-	if _, ok := got["template_ref"]; ok {
-		t.Fatal("template_ref must not reach the wire payload")
+	if !reflect.DeepEqual(got["template_ref"], payload["template_ref"]) {
+		t.Fatalf("server-authored template_ref = %#v", got["template_ref"])
 	}
 	if _, ok := got["data"]; ok {
 		t.Fatal("data must not reach the wire payload")
@@ -269,6 +269,11 @@ func TestEffectiveCardTemplateIdentity(t *testing.T) {
 	want := botTemplateRef{ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersion}
 	if err := requireEffectiveCardTemplate(raw, want); err != nil {
 		t.Fatalf("requireEffectiveCardTemplate: %v", err)
+	}
+	delete(payload, "template_ref")
+	metadataOnly, _ := json.Marshal(payload)
+	if err := requireEffectiveCardTemplate(metadataOnly, want); !errors.Is(err, errBotTemplateRequestInvalid) {
+		t.Fatalf("metadata-only target error = %v", err)
 	}
 	if err := requireEffectiveCardTemplate(raw, botTemplateRef{ID: want.ID, Version: "9.9.9"}); !errors.Is(err, errBotTemplateRequestInvalid) {
 		t.Fatalf("mismatch error = %v", err)

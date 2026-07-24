@@ -228,6 +228,12 @@ func (c *botCardTemplateCatalog) RenderPayload(
 		}
 		return nil, fmt.Errorf("bot template render %s@%s: %w", ref.ID, ref.Version, err)
 	}
+	// Retain only the canonical ref as server-authored provenance. Raw Model B
+	// ingress rejects card+template_ref, so edit can distinguish a Registry frame
+	// from a caller-authored card that merely forged metadata.octo.template.
+	rendered["template_ref"] = map[string]any{
+		"id": string(ref.ID), "version": ref.Version,
+	}
 	for _, key := range []string{"mention", "reply"} {
 		if value, ok := inbound[key]; ok {
 			rendered[key] = value
@@ -255,6 +261,10 @@ func requireEffectiveCardTemplate(envelope []byte, want botTemplateRef) error {
 	var payload map[string]any
 	if err := decoder.Decode(&payload); err != nil || !cardmsg.IsCardPayload(payload) {
 		return fmt.Errorf("%w: effective target is not a card", errBotTemplateRequestInvalid)
+	}
+	provenance, err := parseBotTemplateRef(payload["template_ref"])
+	if err != nil || provenance != want {
+		return fmt.Errorf("%w: effective Registry provenance mismatch", errBotTemplateRequestInvalid)
 	}
 	card, _ := payload["card"].(map[string]any)
 	metadata, _ := card["metadata"].(map[string]any)

@@ -180,6 +180,10 @@ Rules:
   authority for `state -> view -> wire_profile/render_profile`.
 - Registry mode rejects caller-supplied render-owned fields: `card`, `plain`,
   `profile`, `card_version`, `render_profile`, and `space_id`.
+- The compiled outbound/effective envelope retains a server-authored
+  `template_ref` containing the exact catalogued `id@version`; request `state`
+  and `data` are consumed and omitted. Raw Model B send/edit rejects this field,
+  so it acts as provenance rather than trusting forgeable card metadata alone.
 - Existing orthogonal send-envelope features (`mention`, `reply`, and other
   already-accepted non-render fields) keep their current behavior. The handler
   carries only allowed existing fields onto the rendered payload before the
@@ -222,7 +226,8 @@ Rules:
 - `transient:true` preserves the existing D10 meaning: apply and sync the frame
   but do not append it to revision history. Terminal frames omit/false it.
 - The target must be an effective Registry-authored card whose stored
-  `metadata.octo.template.{id,version}` exactly matches the requested ref.
+  server-authored top-level `template_ref` and
+  `metadata.octo.template.{id,version}` both exactly match the requested ref.
   Cross-template and cross-version rewrites are rejected; a future migration
   protocol must be explicit rather than smuggled through this endpoint.
 - Bot identity, original-message ownership, message-id/seq binding, channel and
@@ -347,6 +352,8 @@ Rules:
 - Caller attempts to inject `card`, `plain`, profile fields, render metadata, or
   `space_id` in Registry mode fail closed. Existing OBO card rejection and send
   permission tests remain green.
+- The outbound frame retains only a server-authored `template_ref` as provenance;
+  request `state`/`data` are absent. Raw Model B cannot send or edit that marker.
 
 ### Registry edit mode
 

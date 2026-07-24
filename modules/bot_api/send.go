@@ -956,6 +956,11 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 	// richtext（=14）原有路径。user/robot 编辑路径对卡片仍永久拒绝（各自守卫）。
 	origIsCard := cardmsg.IsCardRawPayload(msgPayload)
 	editIsCard := cardmsg.IsCardContentEdit(req.ContentEdit)
+	if origIsCard && cardEnvelopeHasTemplateRef(msgPayload) {
+		ba.Warn("raw card edit attempted to replace Registry-authored target", zap.String("messageID", req.MessageID))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+		return
+	}
 	if origIsCard != editIsCard {
 		ba.Warn("卡片编辑跨类型变异,拒绝", zap.String("messageID", req.MessageID),
 			zap.Bool("origIsCard", origIsCard), zap.Bool("editIsCard", editIsCard))
@@ -975,6 +980,11 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 		// 之前 fail-fast。
 		if !cardmsg.BotEnabled() {
 			httperr.ResponseErrorL(c, errcode.ErrBotAPICardDisabled, nil, nil)
+			return
+		}
+		if contentEditHasTemplateRef(req.ContentEdit) {
+			ba.Warn("raw card edit attempted to forge Registry provenance", zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
 			return
 		}
 		// P2（PR#548 review）：撤回/删除门禁 —— 已撤回或全局删除的卡片不可再编辑,
@@ -1257,6 +1267,19 @@ func effectiveEnvelopeSpaceID(raw json.RawMessage) string {
 	}
 	spaceID, _ := payload["space_id"].(string)
 	return spaceID
+}
+
+func contentEditHasTemplateRef(contentEdit string) bool {
+	return cardEnvelopeHasTemplateRef([]byte(contentEdit))
+}
+
+func cardEnvelopeHasTemplateRef(raw []byte) bool {
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return false
+	}
+	_, exists := payload["template_ref"]
+	return exists
 }
 
 // cardSeqCASMaxAttempts 是 D9 CAS 遇 InnoDB 死锁/锁等待超时的有界重试次数。

@@ -58,8 +58,8 @@ func TestSendMessageRegistryTemplateRendersAndDispatches(t *testing.T) {
 	if plain, _ := wire["plain"].(string); plain == "" {
 		t.Fatal("server-authoritative plain missing")
 	}
-	if _, ok := wire["template_ref"]; ok {
-		t.Fatal("template_ref leaked to outbound payload")
+	if ref, ok := wire["template_ref"].(map[string]any); !ok || ref["id"] != string(aireasoningprocess.TemplateID) || ref["version"] != aireasoningprocess.TemplateVersion {
+		t.Fatalf("server-authored template_ref missing: %#v", wire["template_ref"])
 	}
 	if _, ok := wire["data"]; ok {
 		t.Fatal("template data leaked to outbound payload")
@@ -70,6 +70,35 @@ func TestSendMessageRegistryTemplateRendersAndDispatches(t *testing.T) {
 	if _, ok := wire["reply"].(map[string]any); !ok {
 		t.Fatalf("reply not preserved: %#v", wire["reply"])
 	}
+}
+
+func TestRawContentEditCannotForgeRegistryProvenance(t *testing.T) {
+	raw := imCardEnvelope("raw", 1)
+	raw["template_ref"] = map[string]any{
+		"id": string(aireasoningprocess.TemplateID), "version": aireasoningprocess.TemplateVersion,
+	}
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contentEditHasTemplateRef(string(encoded)) {
+		t.Fatal("raw content_edit provenance marker was not detected")
+	}
+	if !cardEnvelopeHasTemplateRef(encoded) {
+		t.Fatal("Registry-authored target provenance marker was not detected")
+	}
+	if contentEditHasTemplateRef(string(mustJSON(t, imCardEnvelope("raw", 1)))) {
+		t.Fatal("ordinary raw content_edit falsely detected as Registry provenance")
+	}
+}
+
+func mustJSON(t *testing.T, value any) []byte {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
 }
 
 func TestSendMessageRegistryTemplateRejectsInvalidWithoutDispatch(t *testing.T) {
