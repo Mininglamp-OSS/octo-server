@@ -1215,6 +1215,7 @@ func (ba *BotAPI) botMessageEditViaRegistry(c *wkhttp.Context, req *botMessageEd
 	if ba.ctx != nil && ba.ctx.GetConfig() != nil {
 		webLoginURL = ba.ctx.GetConfig().External.WebLoginURL
 	}
+	spaceID := effectiveEnvelopeSpaceID(snapshot.Envelope)
 	rendered, err := ba.cardTemplates.RenderPayload(c.Request.Context(), map[string]any{
 		"type":         cardmsg.InteractiveCard.Int(),
 		"template_ref": req.TemplateRef,
@@ -1223,7 +1224,7 @@ func (ba *BotAPI) botMessageEditViaRegistry(c *wkhttp.Context, req *botMessageEd
 	}, cardtmpl.BuildEnv{
 		WebLoginURL: webLoginURL,
 		Lang:        i18n.OutboundLanguage(c.Request.Context()),
-		SpaceID:     effectiveEnvelopeSpaceID(snapshot.Envelope),
+		SpaceID:     spaceID,
 	})
 	if err != nil {
 		if errors.Is(err, errBotTemplateRequestInvalid) {
@@ -1234,6 +1235,16 @@ func (ba *BotAPI) botMessageEditViaRegistry(c *wkhttp.Context, req *botMessageEd
 		ba.Error("Bot Registry edit 模板渲染失败", zap.Error(err), zap.String("messageID", req.MessageID))
 		httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
 		return
+	}
+	// Registry.Render owns card content but intentionally does not emit the
+	// envelope-level Space identity. Preserve only the server-authored value
+	// pinned by Snapshot; never re-resolve from the bot's current Space or accept
+	// a caller-supplied value, either of which could move an existing DM card
+	// across tenant views. Delete first so an empty authoritative value remains
+	// fail-closed even if a future renderer starts returning a space_id field.
+	delete(rendered, "space_id")
+	if spaceID != "" {
+		rendered["space_id"] = spaceID
 	}
 	rendered["card_seq"] = req.CardSeq
 	if req.Transient {
