@@ -25,12 +25,21 @@ package msgextraseq
 // stale/out-of-range floor is rejected rather than trusted.
 
 import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/gocraft/dbr/v2"
 )
+
+// activationLockWaitTimeoutSeconds keeps an accidental pre-drain activation
+// from queueing behind a long-running writer and stalling later writers behind
+// the pending exclusive state-row lock. The runbook still requires an explicit
+// write drain; this is a fail-fast backstop, not a substitute for that drain.
+const activationLockWaitTimeoutSeconds = 3
 
 // ErrStateRowMissing is returned when the singleton state row is absent (the
 // migration seeds it; a missing row means the schema is not in place).
@@ -109,12 +118,17 @@ func (s *Store) Preflight() (PreflightResult, error) {
 // maxima it recomputes under the lock are final. floor must be >= that max or the
 // flip is refused (ErrFloorTooLow). Returns flipped=false with a nil error when
 // the allocator is already transactional (idempotent).
-func (s *Store) Activate(floor int64) (bool, error) {
-	tx, err := s.ctx.DB().Begin()
+func (s *Store) Activate(floor int64) (flipped bool, retErr error) {
+	activationTx, err := s.beginActivationTransaction()
 	if err != nil {
 		return false, fmt.Errorf("msgextraseq: activate begin: %w", err)
 	}
-	defer tx.RollbackUnlessCommitted()
+	defer func() {
+		if cleanupErr := activationTx.cleanup(); cleanupErr != nil {
+			retErr = errors.Join(retErr, cleanupErr)
+		}
+	}()
+	tx := activationTx.tx
 
 	mode, epoch, err := s.lockStateForUpdate(tx)
 	if err != nil {
@@ -167,6 +181,12 @@ func (s *Store) Activate(floor int64) (bool, error) {
 		metricInvariantViolationTotal.Inc()
 		return false, ErrInvariantViolation
 	}
+	// Restore the pooled connection's session setting before commit. A restore
+	// failure rolls the mode change back; cleanup retries after rollback and
+	// discards the connection if the session cannot be restored safely.
+	if err := activationTx.restoreBeforeCommit(); err != nil {
+		return false, err
+	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("msgextraseq: activate commit: %w", err)
 	}
@@ -174,6 +194,100 @@ func (s *Store) Activate(floor int64) (bool, error) {
 	metricCutoverFloor.Set(float64(floor))
 	metricAllocatorEpoch.Set(float64(epoch + 1))
 	return true, nil
+}
+
+// activationTransaction pins one SQL connection so the operator-only lock-wait
+// timeout can be restored before that connection returns to the shared pool.
+type activationTransaction struct {
+	tx                      *dbr.Tx
+	conn                    *sql.Conn
+	previousLockWaitTimeout int64
+	restored                bool
+}
+
+func (s *Store) beginActivationTransaction() (*activationTransaction, error) {
+	ctx := context.Background()
+	session := s.ctx.DB()
+	conn, err := session.DB.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var previous int64
+	if err := conn.QueryRowContext(ctx, "SELECT @@SESSION.innodb_lock_wait_timeout").Scan(&previous); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("read session lock-wait timeout: %w", err)
+	}
+	if _, err := conn.ExecContext(
+		ctx,
+		"SET SESSION innodb_lock_wait_timeout = ?",
+		activationLockWaitTimeoutSeconds,
+	); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("set session lock-wait timeout: %w", err)
+	}
+
+	sqlTx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		restoreErr := restoreActivationLockWaitTimeout(conn, previous)
+		closeErr := closeActivationConnection(conn, restoreErr != nil)
+		return nil, errors.Join(err, restoreErr, closeErr)
+	}
+	return &activationTransaction{
+		tx: &dbr.Tx{
+			EventReceiver: session.EventReceiver,
+			Dialect:       session.Dialect,
+			Tx:            sqlTx,
+			Timeout:       session.GetTimeout(),
+		},
+		conn:                    conn,
+		previousLockWaitTimeout: previous,
+	}, nil
+}
+
+func (a *activationTransaction) restoreBeforeCommit() error {
+	if err := restoreActivationLockWaitTimeout(a.tx, a.previousLockWaitTimeout); err != nil {
+		return err
+	}
+	a.restored = true
+	return nil
+}
+
+func (a *activationTransaction) cleanup() error {
+	a.tx.RollbackUnlessCommitted()
+	var restoreErr error
+	if !a.restored {
+		restoreErr = restoreActivationLockWaitTimeout(a.conn, a.previousLockWaitTimeout)
+	}
+	closeErr := closeActivationConnection(a.conn, restoreErr != nil)
+	return errors.Join(restoreErr, closeErr)
+}
+
+type contextExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func restoreActivationLockWaitTimeout(execer contextExecer, previous int64) error {
+	if _, err := execer.ExecContext(
+		context.Background(),
+		"SET SESSION innodb_lock_wait_timeout = ?",
+		previous,
+	); err != nil {
+		return fmt.Errorf("msgextraseq: restore session lock-wait timeout: %w", err)
+	}
+	return nil
+}
+
+func closeActivationConnection(conn *sql.Conn, discard bool) error {
+	if discard {
+		// Returning driver.ErrBadConn prevents database/sql from putting a
+		// connection with an unknown session setting back into the pool.
+		_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+	}
+	if err := conn.Close(); err != nil {
+		return fmt.Errorf("msgextraseq: close activation connection: %w", err)
+	}
+	return nil
 }
 
 // lockStateForUpdate takes the exclusive drain-barrier lock on the singleton

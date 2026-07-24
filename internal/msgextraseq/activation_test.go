@@ -284,3 +284,37 @@ func TestActivateFailsFastWhenWriterDrainIncomplete(t *testing.T) {
 		t.Fatalf("activation changed mode despite lock timeout: %+v", state)
 	}
 }
+
+func TestActivateRestoresSessionLockWaitTimeout(t *testing.T) {
+	ctx := setup(t, msgextraseq.ModeLegacy, 0)
+	db := ctx.DB()
+	// Force all statements through one pooled connection so this test observes
+	// the exact session Activate temporarily modifies.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	var original int64
+	if err := db.SelectBySql("SELECT @@SESSION.innodb_lock_wait_timeout").LoadOne(&original); err != nil {
+		t.Fatalf("read original lock-wait timeout: %v", err)
+	}
+	sentinel := original + 7
+	if _, err := db.UpdateBySql("SET SESSION innodb_lock_wait_timeout = ?", sentinel).Exec(); err != nil {
+		t.Fatalf("set sentinel lock-wait timeout: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.UpdateBySql("SET SESSION innodb_lock_wait_timeout = ?", original).Exec()
+	})
+
+	s := msgextraseq.New(ctx)
+	if flipped, err := s.Activate(0); err != nil || !flipped {
+		t.Fatalf("Activate = (%v, %v), want (true, nil)", flipped, err)
+	}
+
+	var after int64
+	if err := db.SelectBySql("SELECT @@SESSION.innodb_lock_wait_timeout").LoadOne(&after); err != nil {
+		t.Fatalf("read restored lock-wait timeout: %v", err)
+	}
+	if after != sentinel {
+		t.Fatalf("session lock-wait timeout=%d after Activate, want restored sentinel %d", after, sentinel)
+	}
+}

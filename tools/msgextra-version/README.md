@@ -33,6 +33,9 @@ one and re-open the exact skip window #627 closes.
 - Deploy the PR-2 writer-cutover build to **all** replicas and confirm it is
   stable in `mode=legacy` (behavior-neutral; `reserve_total{result=success}`
   climbing, no `invariant_violation_total`).
+- Prove that no pre-cutover binary remains by checking the image digest/version
+  on every replica. An old binary does not read the DB state row and can keep
+  issuing versions from a cached legacy HiLo block after activation.
 - Verify the `octo_message_extra_channel_seq.channel_id` collation matches
   `message_extra.channel_id` in production (the migration pins
   `utf8mb4_general_ci`; confirm the live table agrees).
@@ -45,7 +48,12 @@ one and re-open the exact skip window #627 closes.
   self-inflicted write outage. The guard is the **last** step, only after
   activation is verified (§5).
 
-## 3. Activate
+## 3. Drain and activate
+
+1. Drain or pause writes to `message_extra` (edits, revokes, pins, read receipts,
+   bot/card edits) and wait for in-flight requests to finish.
+2. Rerun `preflight` after the drain and review the final recommended floor.
+3. Activate while the write drain remains in place:
 
 ```
 /tmp/msgextra-version -config configs/tsdd.yaml -action activate -yes
@@ -57,16 +65,24 @@ one and re-open the exact skip window #627 closes.
 every in-flight writer (each holds the row `FOR SHARE` until it commits) to finish
 under legacy, then flips while no writer can proceed. It recomputes the maxima
 under that lock and refuses a floor below them (`ErrFloorTooLow`). It is
-idempotent (a second run is a no-op). `epoch` is bumped for observability.
+idempotent (a second run is a no-op). `epoch` is bumped for observability. The
+activation session uses a 3-second `innodb_lock_wait_timeout` as a fail-fast
+backstop: if the drain is incomplete, activation fails instead of queueing behind
+a long writer and stalling later writes. Fix the drain and retry; do not enable
+the expected-mode guard after a failed activation.
 
-## 4. Verify
+## 4. Verify and resume
 
-- `preflight` shows `mode=transactional` at the new epoch.
-- `message_extra.version` is strictly increasing per channel; delta-sync no longer
-  skips terminal card frames.
-- Metrics: `allocator_mode{mode="transactional"}=1`, `cutover_floor` set,
-  `reserve_total{result=retry}` near zero (the card retry loop is only a backstop).
+Run these steps in order:
 
+1. Confirm `preflight` shows `mode=transactional` at the new epoch.
+2. Confirm `message_extra.version` is strictly increasing per channel and
+   delta-sync no longer skips terminal card frames. Verify metrics:
+   `allocator_mode{mode="transactional"}=1`, `cutover_floor` set,
+   `reserve_total{result=retry}` near zero, and no invariant violations.
+3. Resume message-extra writes after the DB flip and verification succeed.
+   Existing upgraded processes have no expected-mode assertion, but immediately
+   use the transactional allocator because every transaction rereads the DB row.
 ## 5. Enable the durable expected-mode guard (only after §4 confirms transactional)
 
 Once `preflight` reports `mode=transactional` (§4), set
@@ -87,6 +103,13 @@ same rollout wave that performs the flip — an un-flipped replica that picks up
 The read-side proof is `TestRolloutOrdering_ActivateBeforeExpectedMode`: a legacy
 state row with `expected=transactional` fails writers closed; after `Activate`
 flips the row, the same writer succeeds.
+
+Confirm every restarted replica reports transactional mode and serves a
+message-extra write successfully. If activation succeeds but the guard rollout
+is partial or fails, keep the DB mode transactional and repair the rollout. Do
+**not** flip the DB back to legacy. Normal application rollback may use only a
+binary that understands the transactional allocator; the allocator mode remains
+transactional.
 
 ## 6. Rollback to legacy (coordinated, maintenance-window only)
 
