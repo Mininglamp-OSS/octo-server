@@ -6,10 +6,30 @@ package msgextraseq_test
 // deactivate to test — rollback is a documented coordinated procedure (README §5).
 
 import (
+	"fmt"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-server/internal/msgextraseq"
 )
+
+// TestLegacySeqKeyFormatMatchesRunbook locks the legacy GenSeq key scheme that
+// two out-of-band consumers depend on: Preflight/Activate's observedMaxima keys
+// the legacy boundary by the `seq:messageExtra:%` LIKE prefix, and the coordinated
+// rollback runbook (tools/msgextra-version/README.md §5) raises those same
+// `seq:messageExtra:<channel>` rows above the transactional high-water. Since
+// rollback correctness now lives only in docs (there is no online Deactivate),
+// this guards the runbook SQL against silently drifting from the allocator's key
+// scheme (Jerry-Xin PR #648 re-review note). A pure assertion — no DB.
+func TestLegacySeqKeyFormatMatchesRunbook(t *testing.T) {
+	if got := common.MessageExtraSeqKey; got != "messageExtra" {
+		t.Fatalf("MessageExtraSeqKey = %q, want %q — README §5 rollback SQL keys on seq:messageExtra:<channel>", got, "messageExtra")
+	}
+	const wantPrefix = "seq:messageExtra:%"
+	if got := fmt.Sprintf("seq:%s:%%", common.MessageExtraSeqKey); got != wantPrefix {
+		t.Fatalf("observedMaxima legacy LIKE prefix = %q, want %q", got, wantPrefix)
+	}
+}
 
 func TestPreflightRecommendsMaxOfEvidence(t *testing.T) {
 	ctx := setup(t, msgextraseq.ModeLegacy, 0)

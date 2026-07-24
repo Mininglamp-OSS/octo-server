@@ -150,11 +150,22 @@ func (s *Store) Activate(floor int64) (bool, error) {
 		return false, fmt.Errorf("%w: floor=%d max=%d", ErrFloorTooHigh, floor, int64(MaxCutoverFloor))
 	}
 
-	if _, err := tx.UpdateBySql(
+	res, err := tx.UpdateBySql(
 		"UPDATE `octo_message_extra_version_state` SET `mode`=?, `cutover_floor`=?, `epoch`=? WHERE `singleton_id`=? AND `mode`=?",
 		ModeTransactional, floor, epoch+1, stateSingletonID, ModeLegacy,
-	).Exec(); err != nil {
+	).Exec()
+	if err != nil {
 		return false, fmt.Errorf("msgextraseq: activate update: %w", err)
+	}
+	// Defense-in-depth: we read mode==ModeLegacy while holding the state row
+	// FOR UPDATE, so the mode-conditional UPDATE must match exactly one row. A
+	// zero-row result means the drain barrier was lost (e.g. a future refactor drops
+	// lockStateForUpdate) and a concurrent flip slipped in — surface it instead of
+	// committing and reporting a phantom flipped=true. Mirrors reserveTransactional's
+	// post-write invariant guard.
+	if n, aerr := res.RowsAffected(); aerr == nil && n == 0 {
+		metricInvariantViolationTotal.Inc()
+		return false, ErrInvariantViolation
 	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("msgextraseq: activate commit: %w", err)
