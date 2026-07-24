@@ -104,7 +104,7 @@ func TestBotCardTemplateCatalogRenderPayload(t *testing.T) {
 		t.Fatal(err)
 	}
 	payload := map[string]any{
-		"type": int64(17),
+		"type": 17,
 		"template_ref": map[string]any{
 			"id":      string(aireasoningprocess.TemplateID),
 			"version": aireasoningprocess.TemplateVersion,
@@ -141,6 +141,67 @@ func TestBotCardTemplateCatalogRenderPayload(t *testing.T) {
 	template, _ := octo["template"].(map[string]any)
 	if template["id"] != string(aireasoningprocess.TemplateID) || template["version"] != aireasoningprocess.TemplateVersion {
 		t.Fatalf("authoritative template metadata = %#v", template)
+	}
+}
+
+func TestBotCardTemplateCatalogInvalidAndInternalRenderClassification(t *testing.T) {
+	registry := testBotTemplateRegistry(t)
+	catalog, err := newBotCardTemplateCatalog(registry, defaultBotTemplateRefs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := (*botCardTemplateCatalog)(nil).Capability(); got.Supported || got.Wire != botTemplateWireV1 || got.Templates == nil {
+		t.Fatalf("nil catalog capability = %+v", got)
+	}
+	if _, err := newBotCardTemplateCatalog(registry, nil); err == nil {
+		t.Fatal("empty catalog must fail closed")
+	}
+	if _, err := newBotCardTemplateCatalog(nil, defaultBotTemplateRefs()); !errors.Is(err, errBotTemplateCatalogUnavailable) {
+		t.Fatalf("nil registry error = %v", err)
+	}
+
+	base := func() map[string]any {
+		return map[string]any{
+			"type": 17,
+			"template_ref": map[string]any{
+				"id": string(aireasoningprocess.TemplateID), "version": aireasoningprocess.TemplateVersion,
+			},
+			"state": "reasoning",
+			"data":  rawJSONToMap(t, testReasoningData(t, "reasoning")),
+		}
+	}
+	invalid := []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{name: "wrong type", mutate: func(p map[string]any) { p["type"] = 1 }},
+		{name: "missing ref", mutate: func(p map[string]any) { delete(p, "template_ref") }},
+		{name: "extra ref field", mutate: func(p map[string]any) { p["template_ref"].(map[string]any)["view"] = "active" }},
+		{name: "blank state", mutate: func(p map[string]any) { p["state"] = " " }},
+		{name: "schema invalid", mutate: func(p map[string]any) { delete(p["data"].(map[string]any), "title") }},
+		{name: "unknown state", mutate: func(p map[string]any) {
+			p["state"] = "unknown"
+			p["data"].(map[string]any)["state"] = "unknown"
+		}},
+	}
+	for _, tc := range invalid {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := base()
+			tc.mutate(payload)
+			if _, err := catalog.RenderPayload(context.Background(), payload, cardtmpl.BuildEnv{}); !errors.Is(err, errBotTemplateRequestInvalid) {
+				t.Fatalf("error = %v, want request invalid", err)
+			}
+		})
+	}
+
+	// Schema-valid markdown reaches cardmsg.Validate and is a post-build render
+	// failure, not a caller-schema error. It remains zero-write and maps to the
+	// generic internal facade until the bounded successor schema lands.
+	malicious := base()
+	malicious["data"].(map[string]any)["progressText"] = "[tap](javascript:alert(1))"
+	_, err = catalog.RenderPayload(context.Background(), malicious, cardtmpl.BuildEnv{})
+	if err == nil || errors.Is(err, errBotTemplateRequestInvalid) {
+		t.Fatalf("post-build error classification = %v", err)
 	}
 }
 

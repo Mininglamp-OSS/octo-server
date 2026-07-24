@@ -126,12 +126,48 @@ func TestBotMessageEditRegistryTemplateFailsClosed(t *testing.T) {
 			},
 		},
 		{
+			name: "post build render failure",
+			body: func(t *testing.T) map[string]any {
+				body := registryEditBody(t, "reasoning", testReasoningData(t, "reasoning"), 2, false)
+				body["data"].(map[string]any)["progressText"] = "[tap](javascript:alert(1))"
+				return body
+			},
+		},
+		{
 			name: "stale card seq",
 			body: func(t *testing.T) map[string]any {
 				return registryEditBody(t, "completed", testReasoningData(t, "completed"), 2, false)
 			},
 			mutateErr:   carddispatch.ErrCardMutationConflict,
 			wantMessage: "stale card_seq",
+		},
+		{
+			name: "ownership changes between snapshot and mutate",
+			body: func(t *testing.T) map[string]any {
+				return registryEditBody(t, "completed", testReasoningData(t, "completed"), 2, false)
+			},
+			mutateErr: carddispatch.ErrCardMutationForbidden,
+		},
+		{
+			name: "target revoked between snapshot and mutate",
+			body: func(t *testing.T) map[string]any {
+				return registryEditBody(t, "completed", testReasoningData(t, "completed"), 2, false)
+			},
+			mutateErr: carddispatch.ErrCardMutationNotFound,
+		},
+		{
+			name: "replacement rejected by mutator",
+			body: func(t *testing.T) map[string]any {
+				return registryEditBody(t, "completed", testReasoningData(t, "completed"), 2, false)
+			},
+			mutateErr: carddispatch.ErrCardMutationInvalid,
+		},
+		{
+			name: "mutation infrastructure failure",
+			body: func(t *testing.T) map[string]any {
+				return registryEditBody(t, "completed", testReasoningData(t, "completed"), 2, false)
+			},
+			mutateErr: errors.New("store unavailable"),
 		},
 	}
 	for _, tc := range tests {
@@ -171,6 +207,7 @@ func TestBotMessageEditRegistryTemplateMapsOwnershipAndLifecycle(t *testing.T) {
 		{name: "not owner", err: carddispatch.ErrCardMutationForbidden},
 		{name: "revoked or deleted", err: carddispatch.ErrCardMutationNotFound},
 		{name: "non registry target", err: carddispatch.ErrCardMutationInvalid},
+		{name: "snapshot infrastructure failure", err: errors.New("lookup unavailable")},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -183,6 +220,46 @@ func TestBotMessageEditRegistryTemplateMapsOwnershipAndLifecycle(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBotMessageEditRegistryTemplateDisabledAndWiringFailures(t *testing.T) {
+	catalog, err := newBotCardTemplateCatalog(testBotTemplateRegistry(t), defaultBotTemplateRefs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := registryEditBody(t, "completed", testReasoningData(t, "completed"), 2, false)
+
+	t.Run("disabled", func(t *testing.T) {
+		t.Setenv(cardmsg.EnvEnabled, "")
+		mutator := &fakeBotCardMutator{}
+		ba := &BotAPI{Log: log.NewTLog("BotAPI-template-edit-disabled"), cardTemplates: catalog, cardMutator: mutator}
+		recorder := invokeTemplateEdit(t, ba, body)
+		if recorder.Code != http.StatusBadRequest || mutator.snapshotCalls != 0 {
+			t.Fatalf("status=%d snapshots=%d body=%s", recorder.Code, mutator.snapshotCalls, recorder.Body.String())
+		}
+	})
+
+	t.Run("catalog missing", func(t *testing.T) {
+		t.Setenv(cardmsg.EnvEnabled, "true")
+		mutator := &fakeBotCardMutator{}
+		ba := &BotAPI{Log: log.NewTLog("BotAPI-template-edit-unwired"), cardMutator: mutator}
+		recorder := invokeTemplateEdit(t, ba, body)
+		if recorder.Code != http.StatusBadRequest || mutator.snapshotCalls != 0 {
+			t.Fatalf("status=%d snapshots=%d body=%s", recorder.Code, mutator.snapshotCalls, recorder.Body.String())
+		}
+	})
+
+	t.Run("malformed ref", func(t *testing.T) {
+		t.Setenv(cardmsg.EnvEnabled, "true")
+		mutator := &fakeBotCardMutator{}
+		ba := &BotAPI{Log: log.NewTLog("BotAPI-template-edit-ref"), cardTemplates: catalog, cardMutator: mutator}
+		bad := registryEditBody(t, "completed", testReasoningData(t, "completed"), 2, false)
+		bad["template_ref"].(map[string]any)["view"] = "result"
+		recorder := invokeTemplateEdit(t, ba, bad)
+		if recorder.Code != http.StatusBadRequest || mutator.snapshotCalls != 0 {
+			t.Fatalf("status=%d snapshots=%d body=%s", recorder.Code, mutator.snapshotCalls, recorder.Body.String())
+		}
+	})
 }
 
 func initialRegistryEnvelope(t *testing.T, catalog *botCardTemplateCatalog) []byte {
@@ -237,5 +314,3 @@ func invokeTemplateEdit(t *testing.T, ba *BotAPI, body map[string]any) *httptest
 func cardtmplBuildEnvForTest() cardtmpl.BuildEnv {
 	return cardtmpl.BuildEnv{Lang: "zh-CN", SpaceID: "space-1"}
 }
-
-var _ = errors.Is

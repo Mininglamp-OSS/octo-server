@@ -181,7 +181,7 @@ func (c *botCardTemplateCatalog) RenderPayload(
 	if c == nil || c.registry == nil {
 		return nil, errBotTemplateCatalogUnavailable
 	}
-	if !isInteractiveCardType(inbound["type"]) {
+	if !cardmsg.IsCardPayload(inbound) {
 		return nil, fmt.Errorf("%w: type must be 17", errBotTemplateRequestInvalid)
 	}
 	allowedKeys := map[string]struct{}{
@@ -266,36 +266,4 @@ func requireEffectiveCardTemplate(envelope []byte, want botTemplateRef) error {
 		return fmt.Errorf("%w: effective template mismatch", errBotTemplateRequestInvalid)
 	}
 	return nil
-}
-
-func isInteractiveCardType(value any) bool {
-	switch typed := value.(type) {
-	case int:
-		return typed == cardmsg.InteractiveCard.Int()
-	case int8:
-		return int(typed) == cardmsg.InteractiveCard.Int()
-	case int16:
-		return int(typed) == cardmsg.InteractiveCard.Int()
-	case int32:
-		return int(typed) == cardmsg.InteractiveCard.Int()
-	case int64:
-		return typed == int64(cardmsg.InteractiveCard.Int())
-	case uint:
-		return typed == uint(cardmsg.InteractiveCard.Int())
-	case uint8:
-		return typed == uint8(cardmsg.InteractiveCard.Int())
-	case uint16:
-		return typed == uint16(cardmsg.InteractiveCard.Int())
-	case uint32:
-		return typed == uint32(cardmsg.InteractiveCard.Int())
-	case uint64:
-		return typed == uint64(cardmsg.InteractiveCard.Int())
-	case float64:
-		return typed == float64(cardmsg.InteractiveCard.Int())
-	case json.Number:
-		value, err := typed.Int64()
-		return err == nil && value == int64(cardmsg.InteractiveCard.Int())
-	default:
-		return false
-	}
 }

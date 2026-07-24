@@ -242,7 +242,10 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 			httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
 			return
 		}
-		spaceID := ba.resolveBotActiveSpaceID(c, robotID)
+		spaceID := ""
+		if req.ChannelType == common.ChannelTypePerson.Uint8() {
+			spaceID = ba.resolveBotActiveSpaceID(c, robotID)
+		}
 		webLoginURL := ""
 		if ba.ctx != nil && ba.ctx.GetConfig() != nil {
 			webLoginURL = ba.ctx.GetConfig().External.WebLoginURL
