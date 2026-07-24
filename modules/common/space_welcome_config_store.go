@@ -125,9 +125,15 @@ func (s *SpaceWelcomeConfigStore) Exists(ctx context.Context, spaceID string) (b
 	return n > 0, nil
 }
 
-// Upsert inserts or updates the per-Space config. An empty ActiveFromRaw is
-// stored as the empty string ("" = unset). now is the application-computed UTC
-// value written to created_at (on insert) and updated_at (both).
+// Upsert inserts or updates the per-Space config in a single statement. An empty
+// ActiveFromRaw is stored as the empty string ("" = unset). now is the
+// application-computed UTC value written to created_at (on insert) and updated_at
+// (both).
+//
+// NOTE: this is a simple idempotent write for single-writer / test contexts.
+// Production admin CRUD MUST use UpsertMerged, which serializes concurrent PUTs
+// (insert-then-lock + deadlock retry) to prevent lost partial updates when two
+// admins edit the same Space at once; Upsert has no such protection.
 func (s *SpaceWelcomeConfigStore) Upsert(ctx context.Context, cfg SpaceWelcomeSpaceConfig, now time.Time) error {
 	enabled := 0
 	if cfg.Enabled {

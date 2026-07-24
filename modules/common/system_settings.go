@@ -573,9 +573,9 @@ func (s *SystemSettings) SupportEmailPwd() string {
 // systemSettingSchema 的 incomingwebhook 行；reciprocal sync 注释见
 // modules/incomingwebhook/api.go 的 New / allowPerWebhook / create。
 const (
-	envIncomingWebhookEnabled         = "DM_INCOMINGWEBHOOK_ENABLED"
-	envIncomingWebhookPerWebhookRPS   = "DM_INCOMINGWEBHOOK_RPS"
-	envIncomingWebhookPerWebhookBurst = "DM_INCOMINGWEBHOOK_BURST"
+	envIncomingWebhookEnabled          = "DM_INCOMINGWEBHOOK_ENABLED"
+	envIncomingWebhookPerWebhookRPS    = "DM_INCOMINGWEBHOOK_RPS"
+	envIncomingWebhookPerWebhookBurst  = "DM_INCOMINGWEBHOOK_BURST"
 	envIncomingWebhookMaxPerGroup      = "DM_INCOMINGWEBHOOK_MAX_PER_GROUP"
 	envIncomingWebhookMaxPerThread     = "DM_INCOMINGWEBHOOK_MAX_PER_THREAD"
 	envIncomingWebhookMaxPerCreator    = "DM_INCOMINGWEBHOOK_MAX_PER_CREATOR"
@@ -643,7 +643,7 @@ func (s *SystemSettings) IncomingWebhookPerWebhookBurst() int {
 	return v
 }
 
-// IncomingWebhookMaxPerGroup 群本体作用域（thread_short_id='')可创建的 webhook 数量上限。
+// IncomingWebhookMaxPerGroup 群本体作用域（thread_short_id=”)可创建的 webhook 数量上限。
 // 子区作用域另用 IncomingWebhookMaxPerThread（未配置时回退到本值），两者独立计数、不共享
 // 名额。DB → env → 默认 10。
 // 读侧防御：≤0 回退默认（max_per_group=0 会让每次 create 都 ErrQuotaExceeded，是
@@ -1219,4 +1219,25 @@ func ValidateSpaceWelcomeCombination(cfg SpaceWelcomeConfig, isActiveSpace func(
 		}
 	}
 	return "", nil
+}
+
+// ---------------------------------------------------------------------------
+// Group new-member welcome master switch (onboarding.group_welcome_enabled) —
+// task group-welcome-message
+// ---------------------------------------------------------------------------
+
+// GroupWelcomeEnabled is the platform master switch for the group new-member
+// welcome (群入群欢迎语). Default false (dark launch): the feature ships off, and an
+// operator flips onboarding.group_welcome_enabled to turn it on across every
+// group. Flipping it back is an instant kill switch — the event path stops
+// enqueuing and the send worker stops posting within the snapshot TTL — without
+// touching any per-group config row. Read from the SAME snapshot as every other
+// setting, so it hot-reloads and converges across replicas within reloadTTL.
+//
+// Unlike the Space welcome's onboarding keys this is enablement ONLY: there is no
+// platform-global content fallback, so a group's body always comes from its own
+// row (see brief: no global fallback). The per-group config.Enabled still gates
+// each group individually; this switch is the outer AND.
+func (s *SystemSettings) GroupWelcomeEnabled() bool {
+	return s.getBool(spaceWelcomeCategory, "group_welcome_enabled", false)
 }

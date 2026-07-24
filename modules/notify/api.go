@@ -13,6 +13,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/pool"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/internal/cardactiondispatch"
@@ -77,6 +78,7 @@ type Notify struct {
 	internalToken string
 	docsToken     string
 	spaceWelcome  *spaceWelcomeService
+	groupWelcome  *groupWelcomeService
 	log.Log
 }
 
@@ -144,11 +146,27 @@ func New(ctx *config.Context) *Notify {
 
 	// 监听成员加入事件
 	ctx.AddEventListener(event.SpaceMemberJoin, n.handleSpaceMemberEvent)
+	// 监听群成员加入事件（群入群欢迎语 task group-welcome-message）。GroupMemberAdd
+	// 是多监听者事件（message/group 模块也监听），fan-out 到所有 AddEventListener。
+	ctx.AddEventListener(event.GroupMemberAdd, n.handleGroupMemberAddEvent)
 
 	// Space 新成员欢迎语（task space-new-user-welcome-message）。欢迎语是所有人
 	// 同一份纯文本（不区分语言）。服务对象在此构造，reconciler/worker goroutine
 	// 由模块 Start() 启动、Stop() 停止。
 	n.spaceWelcome = newSpaceWelcomeService(
+		ctx,
+		common.EnsureSystemSettings(ctx),
+		NotifyBotUID(),
+		func() bool {
+			n.ensureNotifyBotReady()
+			return n.botOK.Load()
+		},
+	)
+
+	// 群入群欢迎语（task group-welcome-message）：每群一条、群主/管理员自助，首次入群
+	// 时把管理员配置的欢迎语（支持 {member} 点名）公开发到群频道。复用同一个
+	// notification 发送身份；reconciler/worker 由模块 Start()/Stop() 管理。
+	n.groupWelcome = newGroupWelcomeService(
 		ctx,
 		common.EnsureSystemSettings(ctx),
 		NotifyBotUID(),
@@ -233,6 +251,40 @@ func (n *Notify) handleSpaceMemberEvent(data []byte, commit config.EventCommit) 
 	commit(nil)
 }
 
+// handleGroupMemberAddEvent 群成员加入时，为命中欢迎语配置的首次入群 human 成员各写
+// 一条 pending 行（群入群欢迎语 task group-welcome-message）。入队失败只记日志、绝不
+// 阻塞（reconciler 兜底）。GroupMemberAdd 是多监听者事件，commit(nil) 与既有 space
+// 处理保持一致。
+func (n *Notify) handleGroupMemberAddEvent(data []byte, commit config.EventCommit) {
+	// GroupMemberAdd is a multi-member batch event with no handlerMap entry, so
+	// listeners run sequentially on the shared event-dispatch goroutine. Offload
+	// the per-member fan-out (up to N DB round-trips) to the EventPool so this
+	// listener returns immediately and does not stall the sibling message/group
+	// listeners or back up the event queue on a bulk invite (mirrors the group
+	// module's own GroupMemberAdd listener).
+	n.ctx.EventPool.Work <- &pool.Job{
+		Data: data,
+		JobFunc: func(_ int64, d interface{}) {
+			var req config.MsgGroupMemberAddReq
+			if err := util.ReadJsonByByte(d.([]byte), &req); err != nil {
+				n.Warn("解析GroupMemberAdd事件失败", zap.Error(err))
+				commit(nil)
+				return
+			}
+			if n.groupWelcome != nil && req.GroupNo != "" {
+				uids := make([]string, 0, len(req.Members))
+				for _, m := range req.Members {
+					if m != nil && m.UID != "" {
+						uids = append(uids, m.UID)
+					}
+				}
+				n.groupWelcome.handleMemberJoinBatch(req.GroupNo, uids)
+			}
+			commit(nil)
+		},
+	}
+}
+
 // Start 启动欢迎语的对账 + 发送 worker goroutine（模块生命周期钩子）。
 func (n *Notify) Start() error {
 	// 通知 Bot 的 provisioning 放在 Start()（而非 New()）：New() 现在于
@@ -253,6 +305,9 @@ func (n *Notify) Start() error {
 	if n.spaceWelcome != nil {
 		n.spaceWelcome.Start()
 	}
+	if n.groupWelcome != nil {
+		n.groupWelcome.Start()
+	}
 	return nil
 }
 
@@ -260,6 +315,9 @@ func (n *Notify) Start() error {
 func (n *Notify) Stop() error {
 	if n.spaceWelcome != nil {
 		n.spaceWelcome.Stop()
+	}
+	if n.groupWelcome != nil {
+		n.groupWelcome.Stop()
 	}
 	return nil
 }

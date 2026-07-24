@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	commonmod "github.com/Mininglamp-OSS/octo-server/modules/common"
@@ -187,6 +188,56 @@ func TestWelcomePut_PartialMergePreservesMessage(t *testing.T) {
 	resp := decodeWelcomeResp(t, w)
 	assert.False(t, resp.Enabled)
 	assert.Equal(t, "keep me", resp.Message, "partial patch keeps the existing message")
+}
+
+// setSpaceGlobalWelcome writes the platform-global onboarding.space_welcome_*
+// keys (enabled, naming spaceID) and reloads the settings singleton the handler
+// reads.
+func setSpaceGlobalWelcome(t *testing.T, spaceID string, activeFrom time.Time) {
+	t.Helper()
+	settings := commonmod.EnsureSystemSettings(testCtx)
+	kv := map[string]string{
+		"space_welcome_enabled":     "1",
+		"space_welcome_space_id":    spaceID,
+		"space_welcome_active_from": activeFrom.UTC().Format(time.RFC3339),
+		"space_welcome_message":     "global-welcome",
+	}
+	for k, v := range kv {
+		vt := "string"
+		if k == "space_welcome_enabled" {
+			vt = "bool"
+		}
+		_, err := testCtx.DB().InsertBySql(
+			"INSERT INTO system_setting (category, key_name, value, value_type, description) VALUES ('onboarding', ?, ?, ?, '') "+
+				"ON DUPLICATE KEY UPDATE value=VALUES(value), value_type=VALUES(value_type)",
+			k, v, vt,
+		).Exec()
+		require.NoError(t, err)
+	}
+	require.NoError(t, settings.Load())
+}
+
+// TestWelcomeDelete_RevertsToEnabledGlobalFallback (incidental polish, task
+// group-welcome-message): DELETE of a per-Space row reverts a Space to the
+// enabled platform-global fallback that names it — locking the full GET response
+// contract at the HTTP layer.
+func TestWelcomeDelete_RevertsToEnabledGlobalFallback(t *testing.T) {
+	setup(t)
+	seedWelcomeSpace(t, "spc_1", 1)
+	setSpaceGlobalWelcome(t, "spc_1", time.Now().UTC().Add(-time.Hour))
+
+	require.Equal(t, http.StatusOK,
+		doWelcome(t, http.MethodPut, "spc_1", `{"enabled":true,"active_from":"2026-07-10T00:00:00Z","message":"space-local"}`).Code)
+	require.Equal(t, "space", decodeWelcomeResp(t, doWelcome(t, http.MethodGet, "spc_1", "")).Effective.Source)
+
+	w := doWelcome(t, http.MethodDelete, "spc_1", "")
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	g := decodeWelcomeResp(t, doWelcome(t, http.MethodGet, "spc_1", ""))
+	assert.False(t, g.Configured, "per-Space row gone")
+	assert.Equal(t, "global", g.Effective.Source, "reverts to the enabled global fallback")
+	assert.True(t, g.Effective.Enabled)
+	assert.Equal(t, "global-welcome", g.Effective.Message)
 }
 
 func TestWelcomeDelete_RevertsToUnconfigured(t *testing.T) {

@@ -53,6 +53,8 @@ type Group struct {
 	groupService  IService
 	fileService   file.IService
 	commonService common2.IService
+	// welcomeStore backs the per-group 入群欢迎语 CRUD (task group-welcome-message).
+	welcomeStore *common2.GroupWelcomeConfigStore
 }
 
 // New New
@@ -67,6 +69,7 @@ func New(ctx *config.Context) *Group {
 		groupService:  NewService(ctx),
 		fileService:   file.NewService(ctx),
 		commonService: common2.NewService(ctx),
+		welcomeStore:  common2.NewGroupWelcomeConfigStore(ctx.DB()),
 	}
 	g.ctx.AddEventListener(event.GroupDisband, g.handleGroupDisbandEvent)
 	g.ctx.AddEventListener(event.EventUserRegister, g.handleRegisterUserEvent)
@@ -124,6 +127,14 @@ func (g *Group) Route(r *wkhttp.WKHttp) {
 	authGroups := r.Group("/v1/groups", g.ctx.AuthMiddleware(r))
 	{
 		authGroups.GET("/:group_no/scanjoin", g.groupScanJoin) // 扫码加入群（需要认证）
+	}
+	// 群入群欢迎语 CRUD（群主/管理员自助，task group-welcome-message）。挂 auth +
+	// SharedUIDRateLimiter：认证路由默认按登录用户公平限流（与 /v1/message 等一致）。
+	welcomeGroups := r.Group("/v1/groups", g.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, g.ctx))
+	{
+		welcomeGroups.GET("/:group_no/welcome", g.getWelcome)
+		welcomeGroups.PUT("/:group_no/welcome", g.putWelcome)
+		welcomeGroups.DELETE("/:group_no/welcome", g.deleteWelcome)
 	}
 	// H5 公开落地页配套的认证接口：把公开 code（二维码 UUID）换成当前登录用户的 auth_code。
 	// 之后前端直接调用 /v1/groups/:group_no/scanjoin?auth_code=xxx 完成入群。
