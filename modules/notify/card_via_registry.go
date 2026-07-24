@@ -269,3 +269,140 @@ func mapDocsCardFieldsToJSON(card *DocsCardFields, lang string) (json.RawMessage
 	}
 	return json.RawMessage(raw), nil
 }
+
+// summaryTimeRangeMaxRunes / summaryGeneratedAtMaxRunes mirror the summary card
+// data.schema.json maxLength for these display fields. mapSummaryCardFieldsToJSON
+// truncates to them (title/reason reuse the exported cardtmpl caps) so an
+// over-length display string renders truncated rather than flipping to a C1 400
+// (P2-1, PR #650 review). The schema maxLength is the backstop —
+// TestMapSummaryFields_TruncatesDisplayFields locks these in sync (truncation must
+// leave the field within schema, else preflight would still 400).
+//
+// summaryMembersMax / summaryMsgCountMax mirror the summary card data.schema.json
+// `maximum` for the two integer counters. mapSummaryCardFieldsToJSON clamps
+// caller-supplied counts to [0, max] so an over-max count renders capped rather
+// than flipping to a C1 400 zero-delivery (Jerry-Xin PR #650 re-review): legacy
+// buildSummaryCard rendered any positive int, so the schema `maximum` would
+// otherwise turn a huge value into a 400 at ingress — the same delivery
+// regression the display-field truncation already fixed, applied symmetrically to
+// the counts. The schema `maximum` is the backstop —
+// TestMapSummaryFields_ClampsOverMaxCounts locks these in sync (a local cap above
+// schema would still 400 after clamp, failing the test).
+const (
+	summaryTimeRangeMaxRunes   = 200
+	summaryGeneratedAtMaxRunes = 80
+	summaryMembersMax          = 1_000_000
+	summaryMsgCountMax         = 1_000_000_000
+)
+
+// clampCount clamps a caller-supplied count to the schema's [0, max] range.
+// Legacy buildSummaryCard omitted non-positive members/msgCount via a `> 0` guard
+// and rendered any positive int; the schema's minimum:0 / maximum would otherwise
+// 400 a negative sentinel or an over-max value at C1 preflight. Clamping to
+// [0, max] reproduces the legacy omit-and-deliver behavior for negatives (the
+// Template's `> 0` guard drops the 0 fact) while preserving delivery for an
+// over-max count (rendered capped at max) instead of a C1 400 zero-delivery.
+func clampCount(v, limit int) int {
+	if v < 0 {
+		return 0
+	}
+	if v > limit {
+		return limit
+	}
+	return v
+}
+
+// mapSummaryCardFieldsToJSON 把扁平 SummaryCardFields 映射成 summary.completed /
+// summary.failed 契约期望的 JSON 形状(与 mapDocsCardFieldsToDisplayJSON 同思路,
+// 只是字段集不同)。Kind == failed 时保留 reason;completed 时省略 reason(其
+// schema 里根本没这个字段, additionalProperties:false 会拒绝)。字节等价基线依
+// 赖此映射与 legacy buildSummaryCard 提取自同一 SummaryCardFields。
+//
+// P2-1 (PR #650 review):展示字段服务端截断到 schema maxLength / 渲染预算,计数
+// 字段 clamp 到 schema [0, maximum]。legacy buildSummaryCard 从不校验长度/上限 ——
+// 超长 title/reason 仍会投递(截断后的卡或文本 DM),任意正整数 members/msgCount
+// 也照常渲染。走 C1 preflight 后,超长/超上限字段本会翻成 400 零投递。这里截断/
+// clamp 保住"通知永不丢"不变量,同时对**真正的结构性违规**(缺失/空必填、类型错、
+// 未知字段、以及超长的 taskNo —— deep-link key,绝不能静默改写)保留 C1 硬 400。
+//
+// taskNo 原样透传(不 TrimSpace):它是 deep-link 的结构性 key,legacy
+// buildSummaryCard 也用原值拼 /s/{taskNo}(见 card.go),trim 会静默改写身份字段并
+// 让 padded 输入与 legacy 字节漂移(Jerry-Xin PR #650 re-review)。空/纯空白的
+// taskNo 在 deliverCardNotification 入口即被 errNotifyCardInvalid 挡回,不会到这里。
+func mapSummaryCardFieldsToJSON(card *SummaryCardFields) (json.RawMessage, error) {
+	if card == nil {
+		return nil, errors.New("mapSummaryCardFieldsToJSON: nil card")
+	}
+	m := map[string]any{
+		"taskNo":      card.TaskNo, // deep-link key:原样透传(与 legacy 一致);超长 → C1 400,不 trim/截断
+		"title":       cardtmpl.TruncateRunes(strings.TrimSpace(card.Title), cardtmpl.MaxTitleRunes),
+		"timeRange":   cardtmpl.TruncateRunes(strings.TrimSpace(card.TimeRange), summaryTimeRangeMaxRunes),
+		"members":     clampCount(card.Members, summaryMembersMax),
+		"msgCount":    clampCount(card.MsgCount, summaryMsgCountMax),
+		"generatedAt": cardtmpl.TruncateRunes(strings.TrimSpace(card.GeneratedAt), summaryGeneratedAtMaxRunes),
+	}
+	if card.Kind == SummaryCardKindFailed {
+		m["reason"] = cardtmpl.TruncateRunes(strings.TrimSpace(card.Reason), cardtmpl.MaxExcerptRunes)
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		return nil, fmt.Errorf("marshal mapped summary fields: %w", err)
+	}
+	return json.RawMessage(raw), nil
+}
+
+// buildSummaryCardViaRegistry 通过 Registry.Render 生成 summary.completed /
+// summary.failed 展示卡(v1)。错误分类与 buildDocsDisplayCardViaRegistry 对齐:
+//   - Registry 未注入 → errCardTmplUnavailable(caller 翻 500,不降级);
+//   - schema 校验失败 → cardtmpl.ErrFieldsInvalid(caller 翻 400 零投递,C1);
+//   - 其他 render 级错 → non-typed,caller 走 render_error 降级文本。
+func (n *Notify) buildSummaryCardViaRegistry(
+	ctx context.Context, spaceID string, card *SummaryCardFields, lang string,
+	templateID cardtmpl.ID, state cardtmpl.State,
+) (json.RawMessage, string, error) {
+	registry := cardtmpl.DefaultRegistry()
+	if registry == nil {
+		return nil, "", fmt.Errorf("%w: default registry not wired", errCardTmplUnavailable)
+	}
+	fields, err := mapSummaryCardFieldsToJSON(card)
+	if err != nil {
+		return nil, "", fmt.Errorf("notify: map SummaryCardFields to schema JSON: %w", err)
+	}
+	env := cardtmpl.BuildEnv{
+		WebLoginURL: n.ctx.GetConfig().External.WebLoginURL,
+		Lang:        lang,
+		SpaceID:     spaceID,
+	}
+	cardDoc, _, renderProfile, err := registry.RenderCardWithProfiles(ctx, templateID, "", state, fields, env)
+	if err != nil {
+		return nil, "", err
+	}
+	return cardDoc, renderProfile, nil
+}
+
+// preflightSummarySchema 与 preflightDocsDisplaySchema 同思路:在 memberCache /
+// docsSender / gate 之前独立跑一次 InputSchema 校验(C1 不被绕过)。summary 卡
+// 无用户可控 URL 字段,不需要 https 前置校验。
+func preflightSummarySchema(card *SummaryCardFields, templateID cardtmpl.ID) error {
+	registry := cardtmpl.DefaultRegistry()
+	if registry == nil {
+		return fmt.Errorf("%w: default registry not wired", errCardTmplUnavailable)
+	}
+	tmpl, err := registry.Lookup(templateID, "")
+	if err != nil {
+		return fmt.Errorf("%w: lookup %s: %v", errCardTmplUnavailable, templateID, err)
+	}
+	fields, err := mapSummaryCardFieldsToJSON(card)
+	if err != nil {
+		return fmt.Errorf("%w: map: %v", cardtmpl.ErrFieldsInvalid, err)
+	}
+	var parsed any
+	if err := json.Unmarshal(fields, &parsed); err != nil {
+		return fmt.Errorf("%w: %v", cardtmpl.ErrFieldsInvalid, err)
+	}
+	if err := tmpl.Meta().InputSchema.Validate(parsed); err != nil {
+		cardtmpl.RecordFieldsInvalid(templateID, tmpl.Meta().Version)
+		return fmt.Errorf("%w: %v", cardtmpl.ErrFieldsInvalid, err)
+	}
+	return nil
+}

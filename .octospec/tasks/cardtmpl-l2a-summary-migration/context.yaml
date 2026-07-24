@@ -1,0 +1,19 @@
+injected:
+  - id: error-handling
+    source: repo
+  - id: trust-boundary
+    source: repo
+  - id: space-isolation
+    source: repo
+  - id: testing
+    source: repo
+  - id: commit-style
+    source: repo
+brief: .octospec/tasks/cardtmpl-l2a-summary-migration/brief.md
+notes: |
+  Stacked on PR-1 (#649, cardtmpl-l2a-migration). Same rules apply:
+  rate-limit reviewed but NOT applicable — no request-frequency limiting change.
+  Two new subpackages (summary_completed + summary_failed) using PR-1's
+  BuildSummaryResourceCardBodyWithLang scaffold; same F7/C1 policies, same
+  byte-equivalence baseline pattern (assembleResourceCardBody shared with
+  legacy).

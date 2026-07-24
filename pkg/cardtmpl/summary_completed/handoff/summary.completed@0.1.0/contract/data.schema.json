@@ -1,0 +1,43 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "总结完成通知卡数据契约",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["taskNo", "title"],
+  "properties": {
+    "taskNo": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "summary_task.task_no,用于 deep-link 拼接 /s/{taskNo}"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "总结标题"
+    },
+    "timeRange": {
+      "type": "string",
+      "maxLength": 200,
+      "description": "已格式化的时间范围（调用方按时区预格式化）;空则省略 FactSet 行"
+    },
+    "members": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1000000,
+      "description": "参与成员数;<=0 省略"
+    },
+    "msgCount": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1000000000,
+      "description": "消息条数;<=0 省略"
+    },
+    "generatedAt": {
+      "type": "string",
+      "maxLength": 80,
+      "description": "已格式化的生成时间;空则省略"
+    }
+  }
+}
