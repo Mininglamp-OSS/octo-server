@@ -188,6 +188,36 @@ func TestActivateRejectsFloorAboveMax(t *testing.T) {
 	}
 }
 
+func TestPreflightAndActivateRejectMissingStateRow(t *testing.T) {
+	ctx := setup(t, msgextraseq.ModeLegacy, 0)
+	s := msgextraseq.New(ctx)
+	if _, err := ctx.DB().UpdateBySql("DELETE FROM `octo_message_extra_version_state`").Exec(); err != nil {
+		t.Fatalf("delete state row: %v", err)
+	}
+
+	if _, err := s.Preflight(); !errors.Is(err, msgextraseq.ErrStateRowMissing) {
+		t.Fatalf("Preflight error=%v want ErrStateRowMissing", err)
+	}
+	if _, err := s.Activate(0); !errors.Is(err, msgextraseq.ErrStateRowMissing) {
+		t.Fatalf("Activate error=%v want ErrStateRowMissing", err)
+	}
+}
+
+func TestActivateRejectsUnknownMode(t *testing.T) {
+	ctx := setup(t, msgextraseq.ModeLegacy, 0)
+	s := msgextraseq.New(ctx)
+	if _, err := ctx.DB().UpdateBySql(
+		"UPDATE `octo_message_extra_version_state` SET `mode`=? WHERE `singleton_id`=1",
+		99,
+	).Exec(); err != nil {
+		t.Fatalf("seed unknown mode: %v", err)
+	}
+
+	if _, err := s.Activate(0); !errors.Is(err, msgextraseq.ErrUnknownMode) {
+		t.Fatalf("Activate error=%v want ErrUnknownMode", err)
+	}
+}
+
 // TestLegacyToTransactionalRolloutOrdering exercises the production order in
 // tools/msgextra-version/README.md: upgraded replicas first run with no expected
 // mode assertion, the DB-authoritative state flips, existing processes observe
