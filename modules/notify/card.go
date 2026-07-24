@@ -494,8 +494,11 @@ func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error
 	}
 
 	type sendResult struct {
-		uid    string
-		reason string
+		uid         string
+		reason      string
+		card        bool  // true when this send delivered a mutatable card (not text fallback)
+		messageID   int64 // IM message id, only meaningful when card && reason == ""
+		clientMsgNo string
 	}
 	resultCh := make(chan sendResult, len(members))
 	sem := make(chan struct{}, 20)
@@ -505,8 +508,9 @@ func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error
 		go func(uid string) {
 			defer func() { <-sem }()
 			reason := ""
+			var sent *carddispatch.Result
 			if canCard {
-				_, sendErr := n.docsSender.Send(
+				res, sendErr := n.docsSender.Send(
 					context.Background(),
 					carddispatch.Target{
 						SpaceID:     req.SpaceID,
@@ -520,21 +524,41 @@ func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error
 					n.Warn("投递文档卡片失败",
 						zap.String("target", uid), zap.String("space_id", req.SpaceID),
 						zap.String("category", reason), zap.Error(sendErr))
+				} else {
+					sent = res
 				}
 			} else if txtErr := n.sendSummaryText(uid, req.SpaceID, fallbackText); txtErr != nil {
 				reason = "send_failed"
 				n.Warn("投递文档文本失败",
 					zap.String("target", uid), zap.String("space_id", req.SpaceID), zap.Error(txtErr))
 			}
-			resultCh <- sendResult{uid: uid, reason: reason}
+			sr := sendResult{uid: uid, reason: reason, card: canCard}
+			if sent != nil {
+				sr.messageID = sent.MessageID
+				sr.clientMsgNo = sent.ClientMsgNo
+			}
+			resultCh <- sr
 		}(targetUID)
 	}
 
 	delivered := make([]string, 0, len(members))
+	// deliveredCards holds locators only for successfully delivered CARDS (the
+	// text-fallback path has nothing to mutate later). Left empty/omitted when no
+	// card was sent, keeping the response identical for legacy/text flows.
+	deliveredCards := make([]DeliveredCard, 0, len(members))
 	for range members {
 		r := <-resultCh
 		if r.reason == "" {
 			delivered = append(delivered, r.uid)
+			if r.card && r.messageID != 0 {
+				deliveredCards = append(deliveredCards, DeliveredCard{
+					UID:         r.uid,
+					ChannelID:   r.uid,
+					ChannelType: common.ChannelTypePerson.Uint8(),
+					MessageID:   strconv.FormatInt(r.messageID, 10),
+					ClientMsgNo: r.clientMsgNo,
+				})
+			}
 		} else {
 			filteredMap[r.uid] = r.reason
 		}
@@ -551,7 +575,7 @@ func (n *Notify) deliverDocsCardNotification(req *NotifyReq) (*NotifyResp, error
 		zap.Int("filtered", len(filteredMap)),
 	)
 
-	return &NotifyResp{Delivered: delivered, Filtered: filteredMap}, nil
+	return &NotifyResp{Delivered: delivered, Filtered: filteredMap, DeliveredCards: deliveredCards}, nil
 }
 
 // hydrateActorName fills card.ActorName from card.ActorUID via the user service

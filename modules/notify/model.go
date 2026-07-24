@@ -108,6 +108,26 @@ type BatchNotifyReq struct {
 type NotifyResp struct {
 	Delivered []string          `json:"delivered"`
 	Filtered  map[string]string `json:"filtered"`
+	// DeliveredCards carries the IM coordinates of each successfully delivered
+	// docs card so a producer can later locate and mutate it in place (docs
+	// access-decision card sync, task docs-access-decision-card-sync). Populated
+	// only on the docs-card path and only for card (not text-fallback) sends;
+	// omitted on legacy/text paths. Additive + omitempty so existing consumers
+	// that read only Delivered are unaffected.
+	DeliveredCards []DeliveredCard `json:"delivered_cards,omitempty"`
+}
+
+// DeliveredCard is the IM locator of one delivered card. The card is located by
+// (ChannelID, MessageID); ClientMsgNo is carried for idempotency/audit.
+// MessageID is a decimal STRING, not a number: IM message ids are int64 and can
+// exceed JS's 2^53 safe-integer range, so a JSON number would silently lose
+// precision in the docs-backend (Node) consumer.
+type DeliveredCard struct {
+	UID         string `json:"uid"`
+	ChannelID   string `json:"channel_id"`
+	ChannelType uint8  `json:"channel_type"`
+	MessageID   string `json:"message_id"`
+	ClientMsgNo string `json:"client_msg_no"`
 }
 
 // BatchNotifyResult 批量通知中单条结果
