@@ -140,6 +140,15 @@ func TestGroupWelcomeCRUD_AuthzMatrix(t *testing.T) {
 		w := doGroupWelcome(t, f, s, http.MethodGet, "g_dead", "")
 		gwAssertErrCode(t, w, "err.server.group.not_found")
 	})
+
+	t.Run("disabled group is not found", func(t *testing.T) {
+		// Parity with the space welcome's checkSpaceActive: an admin-disabled
+		// (non-Normal) group must reject welcome CRUD, not just a disbanded one.
+		f, s := setupGroupWelcome(t)
+		gwSeedGroup(t, f, "g_disabled", MemberRoleCreator, GroupStatusDisabled)
+		w := doGroupWelcome(t, f, s, http.MethodGet, "g_disabled", "")
+		gwAssertErrCode(t, w, "err.server.group.not_found")
+	})
 }
 
 func TestGroupWelcomePut_CreateThenGet(t *testing.T) {

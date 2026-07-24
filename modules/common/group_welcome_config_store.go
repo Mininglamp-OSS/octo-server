@@ -15,7 +15,7 @@ import (
 //
 // This is the group counterpart to the per-Space welcome config
 // (SpaceWelcomeConfigStore). A group owner/manager manages one row per group via
-// modules/group's /v1/group/:group_no/welcome CRUD; modules/notify reads the
+// modules/group's /v1/groups/:group_no/welcome CRUD; modules/notify reads the
 // effective config on the delivery path. The store is a stateless read-through
 // (PK-indexed), so an admin write is visible on the next read across replicas
 // with no snapshot TTL.

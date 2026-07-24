@@ -20,7 +20,7 @@ CREATE TABLE `octo_group_welcome_delivery` (
   `client_msg_no`   VARCHAR(100) NULL                        COMMENT 'IM 返回的 client_msg_no（对齐 message 表宽度）',
   `claim_owner`     VARCHAR(128) NULL                        COMMENT '<hostname>:<pid>；每次 claim 后 update 的 CAS 断言',
   `claim_expire_at` DATETIME     NULL                        COMMENT 'UTC；应用侧写入；claim 租约到期时间',
-  `error_class`     VARCHAR(64)  NULL                        COMMENT '错误分类：member_left/human_filter/orphan_member/config_read/im_timeout/im_bad_response/sent_persist/claim_expired',
+  `error_class`     VARCHAR(64)  NULL                        COMMENT '错误分类：human_filter/orphan_member/config_read/bot_not_ready/im_timeout/im_bad_response/im_rejected/sent_persist/claim_expired',
   `created_at`      DATETIME     NOT NULL                    COMMENT 'UTC；应用侧写入，禁 NOW()',
   `updated_at`      DATETIME     NOT NULL                    COMMENT 'UTC；应用侧写入，禁 NOW()',
   UNIQUE KEY `uk_group_uid` (`group_no`, `uid`),

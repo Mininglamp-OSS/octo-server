@@ -52,8 +52,9 @@ Locked product decisions (design review, this task):
    `GroupMemberAdd` event → many `(group_no, uid)` rows at once; delivering one
    public post per joiner would spam the channel. Instead the worker claims a
    group's due rows as a batch and posts **one** message naming everyone
-   (`{member}` → the joined name list; a large batch collapses the tail to
-   `… 等 N 人`). At-most-once per `(group_no, uid)` is preserved (each row still
+   (`{member}` → the joined name list; a batch larger than
+   `groupWelcomeCoalesceNames` lists the first K names then appends `等 N 人`, e.g.
+   `张三、李四、…、王五 等 20 人`). At-most-once per `(group_no, uid)` is preserved (each row still
    transitions independently); a burst larger than the per-post cap spills its tail
    into later worker wakes (a few posts, not N).
 
@@ -187,8 +188,8 @@ refactor — explicitly out of scope here.)
   - New ledger table `octo_group_welcome_delivery`, `UNIQUE(group_no, uid)`, same
     state machine columns as `octo_space_welcome_delivery` (status, attempts,
     claim_owner, claim_expire_at, next_retry_at, error_class, timestamps), plus a
-    sweep index `(status, claim_expire_at)` and a claim index leading with
-    `(status, next_retry_at)` for the cross-group claim.
+    cross-group sweep index `(status, claim_expire_at)` and a per-group claim index
+    `(group_no, status, next_retry_at)` for the batch claim.
   - **Precedence (simpler than Space — no global fallback):** effective config for
     a group = the per-group row **iff present AND enabled**; else off. Deterministic,
     exactly one effective config per group.
@@ -231,12 +232,14 @@ refactor — explicitly out of scope here.)
     first-join human members past `active_from` lacking a ledger row, under a
     **global per-cycle cap** + per-group sub-cap + a **rotating start cursor**
     (fairness — no group starves another; copy the Space fix).
-  - Worker claims **across groups** (`status=pending AND next_retry_at<=?`,
-    `FOR UPDATE SKIP LOCKED`, index-backed), re-resolves the claimed row's group
-    config for the body, re-checks eligibility, then **posts to the group
-    channel**; cross-group sweep (`sweepClaimedAll`/`sweepDispatchingAll` + sweep
-    index) reclaims lease-expired rows. At-most-once, CAS-on-`claim_owner`, lease,
-    backoff, `unknown`/`failed` terminal handling — same contract as Space.
+  - Worker **rotates over the enabled groups** and, per group, **batch-claims**
+    that group's due rows (`group_no=? AND status=pending AND next_retry_at<=?`,
+    `FOR UPDATE SKIP LOCKED`, index-backed) and posts ONE coalesced message; it
+    re-resolves the group config for the body and re-checks eligibility first. The
+    **sweep** is cross-group (`sweepClaimedAll`/`sweepDispatchingAll` + sweep index)
+    and reclaims lease-expired rows regardless of group. At-most-once,
+    CAS-on-`claim_owner`, lease, backoff, `unknown`/`failed`/retry terminal
+    handling — same contract as Space (plus a definitive-reject→retry path, below).
   - **Enqueue idempotency:** `INSERT … ON DUPLICATE KEY UPDATE id=id` on
     `(group_no, uid)`.
   - **Platform master switch (tags: notify, observability).** A single bool
@@ -332,7 +335,7 @@ refactor — explicitly out of scope here.)
 
 ## Acceptance
 
-- **Group-admin CRUD authz.** `GET/PUT/DELETE /v1/group/:group_no/welcome` succeed
+- **Group-admin CRUD authz.** `GET/PUT/DELETE /v1/groups/:group_no/welcome` succeed
   for a creator/manager of that group; a plain member, a non-member, and a caller
   against a disbanded group all get the generic permission-denied path (no
   privilege-reason leak). A request affects only the path `:group_no`.
@@ -357,7 +360,8 @@ refactor — explicitly out of scope here.)
   turning it on lets delivery proceed; turning it back off stops new posts (a
   regression test asserts both directions). The switch adds no content fallback.
 - **Burst coalescing.** N members joining a group at once are delivered as **one**
-  public post naming all of them (`{member}` → joined list; overflow → `… 等 N 人`),
+  public post naming all of them (`{member}` → joined list; overflow lists the
+  first K names then `等 N 人`),
   not N posts; every joiner in the batch is marked SENT (at-most-once each). A
   group whose burst exceeds the per-post cap posts one coalesced batch per wake and
   spills the remainder to later wakes without starving other groups.
@@ -365,9 +369,10 @@ refactor — explicitly out of scope here.)
   members independently; disabling group A does not affect B; the reconciler
   catches up all enabled groups within a cycle under a global cap; a group kept
   over-cap does not starve others (rotating-cursor regression test).
-- **Cross-group claim.** The worker claims from any enabled group; the claim
-  predicate is index-backed (no full scan) — verified by a `(status, next_retry_at)`
-  -leading index. A claimed row posts with its own group's body.
+- **Per-group batch claim.** The worker rotates over enabled groups and batch-
+  claims each group's due rows; the claim predicate is index-backed (no full scan)
+  — backed by the `(group_no, status, next_retry_at)` claim index. A claimed batch
+  posts with its own group's body.
 - **Sender contract + placeholder.** The posted message's sender is the fixed
   server-chosen identity (not admin-forgeable); `payload.type=Text`, authoritative
   `payload.group_no`. The rendered body equals the configured message with the
@@ -405,7 +410,7 @@ refactor — explicitly out of scope here.)
   at-most-once public post to the correct group channel; `{member}` placeholder
   renders each joiner's own name (unknown tokens left verbatim); leave/rejoin no
   re-post; pre-`active_from` skip; human/system-bot exclusion; multi-group independent
-  delivery + per-group disable; cross-group claim single winner
+  delivery + per-group disable; per-group batch claim single winner
   (`FOR UPDATE SKIP LOCKED`); worker fair-rotation; migration executes on a fresh
   DB; UID rate-limit headers.
 

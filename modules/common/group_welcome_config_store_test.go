@@ -11,6 +11,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestGroupWelcomeEnabled_DefaultOff: the platform master switch defaults OFF
+// (dark launch) when onboarding.group_welcome_enabled is absent — flipping the
+// getBool fallback to true would be a dark-launch regression this pins.
+func TestGroupWelcomeEnabled_DefaultOff(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	settings := EnsureSystemSettings(ctx)
+	// Guarantee the key is absent regardless of CleanAllTables coverage.
+	_, err := ctx.DB().DeleteBySql(
+		"DELETE FROM system_setting WHERE category='onboarding' AND key_name='group_welcome_enabled'").Exec()
+	require.NoError(t, err)
+	require.NoError(t, settings.Reload())
+	assert.False(t, settings.GroupWelcomeEnabled(), "master switch defaults OFF when the key is absent")
+}
+
 // TestValidateGroupWelcomeCombination pins the pure validator (no DB).
 func TestValidateGroupWelcomeCombination(t *testing.T) {
 	af := time.Now().UTC().Format(time.RFC3339)

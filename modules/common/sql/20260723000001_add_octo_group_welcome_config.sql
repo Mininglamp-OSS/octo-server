@@ -1,7 +1,7 @@
 -- +migrate Up
 
 -- Per-group 入群欢迎语配置（task group-welcome-message）。
--- 每群至多一行；群主/管理员(role∈{creator,manager})经 /v1/group/:group_no/welcome
+-- 每群至多一行；群主/管理员(role∈{creator,manager})经 /v1/groups/:group_no/welcome
 -- 自助增删改。与 Space 版不同：本表【没有】平台级全局兜底 —— 一个 group 有该行且
 -- enabled 才有欢迎语，无行或未启用即关闭。
 -- 时间纪律：active_from 存 RFC3339 UTC 字符串（复用 ParsedActiveFrom /

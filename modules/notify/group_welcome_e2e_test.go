@@ -1,6 +1,7 @@
 package notify
 
 import (
+	"net/http"
 	"testing"
 	"time"
 
@@ -9,6 +10,23 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// liveWuKongIMReachable probes <APIURL>/health so the e2e SKIPS (not fails) when
+// no live WuKongIM is running. Checking APIURL != "" is not enough: config.New()
+// defaults APIURL to http://127.0.0.1:5001, so the empty-check never triggers and
+// the package would fail hard on a dev box without a live IM.
+func liveWuKongIMReachable(apiURL string) bool {
+	if apiURL == "" {
+		return false
+	}
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(apiURL + "/health")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
 
 // TestGroupWelcome_E2E_LiveCoalescedPost drives the FULL group-welcome pipeline
 // against a live WuKongIM (the real sender is NOT stubbed): config + two first-join
@@ -21,8 +39,8 @@ import (
 // green; CI (which provisions WuKongIM) exercises the real wire.
 func TestGroupWelcome_E2E_LiveCoalescedPost(t *testing.T) {
 	ctx := swTestServer(t)
-	if ctx.GetConfig().WuKongIM.APIURL == "" {
-		t.Skip("no live WuKongIM APIURL configured")
+	if !liveWuKongIMReachable(ctx.GetConfig().WuKongIM.APIURL) {
+		t.Skip("no live WuKongIM reachable at APIURL/health — skipping live e2e")
 	}
 
 	const groupNo = "g_e2e"

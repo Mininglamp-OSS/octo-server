@@ -187,7 +187,18 @@ func (s *groupWelcomeService) enabledEffectiveConfigs(ctx context.Context) ([]co
 // uid. When the group's config is enabled and the joiner is a first-join human
 // member, it upserts a pending ledger row. Enqueue failure never blocks the join.
 func (s *groupWelcomeService) handleMemberJoin(groupNo, uid string) {
-	if s == nil || groupNo == "" || uid == "" {
+	s.handleMemberJoinBatch(groupNo, []string{uid})
+}
+
+// handleMemberJoinBatch is the GroupMemberAdd fan-out entry. A bulk invite arrives
+// as ONE event with many members, so it resolves the group's effective config +
+// active_from ONCE for the whole batch, then for each first-join human member
+// upserts a pending ledger row. Enqueue failure never blocks/rolls back the
+// completed join (the reconciler catches it up). The GroupMemberAdd listener runs
+// this off the shared event-dispatch goroutine (see handleGroupMemberAddEvent), so
+// the N per-member DB checks do not stall event delivery on a large invite.
+func (s *groupWelcomeService) handleMemberJoinBatch(groupNo string, uids []string) {
+	if s == nil || groupNo == "" || len(uids) == 0 {
 		return
 	}
 	// Platform master switch (dark-launch default off). When off the event path
@@ -200,7 +211,7 @@ func (s *groupWelcomeService) handleMemberJoin(groupNo, uid string) {
 	cancelCfg()
 	if err != nil {
 		s.Warn("group welcome enqueue effective config read failed",
-			zap.String("stage", swStageEnqueue), zap.String("group_no", groupNo), zap.String("uid", uid), zap.Error(err))
+			zap.String("stage", swStageEnqueue), zap.String("group_no", groupNo), zap.Error(err))
 		return
 	}
 	if !cfg.Enabled {
@@ -215,23 +226,26 @@ func (s *groupWelcomeService) handleMemberJoin(groupNo, uid string) {
 		s.metrics.incConfigInvalid()
 		return
 	}
-	// System-bot exclusion is scoped strictly to the joiner uid.
-	if spacepkg.IsSystemBot(uid) {
-		return
+	for _, uid := range uids {
+		// System-bot exclusion is scoped strictly to the joiner uid.
+		if uid == "" || spacepkg.IsSystemBot(uid) {
+			continue
+		}
+		callCtx, cancel := context.WithTimeout(context.Background(), swDBCallTimeout)
+		eligible, err := s.store.firstJoinHumanMember(callCtx, groupNo, uid, activeFrom)
+		if err != nil {
+			s.Warn("group welcome enqueue eligibility check failed",
+				zap.String("stage", swStageEnqueue), zap.String("group_no", groupNo), zap.String("uid", uid), zap.Error(err))
+			cancel()
+			continue
+		}
+		if !eligible {
+			cancel()
+			continue
+		}
+		s.enqueue(callCtx, groupNo, uid, swSourceEvent)
+		cancel()
 	}
-
-	callCtx, cancel := context.WithTimeout(context.Background(), swDBCallTimeout)
-	defer cancel()
-	eligible, err := s.store.firstJoinHumanMember(callCtx, groupNo, uid, activeFrom)
-	if err != nil {
-		s.Warn("group welcome enqueue eligibility check failed",
-			zap.String("stage", swStageEnqueue), zap.String("group_no", groupNo), zap.String("uid", uid), zap.Error(err))
-		return
-	}
-	if !eligible {
-		return
-	}
-	s.enqueue(callCtx, groupNo, uid, swSourceEvent)
 }
 
 // enqueue upserts a pending row and splits enqueue_total vs enqueue_dedup_total.
@@ -559,28 +573,43 @@ func (s *groupWelcomeService) dispatchBatch(ctx context.Context, cfg common.Grou
 		Payload:     []byte(util.ToJson(payload)),
 	}
 
-	sendCtx := context.WithoutCancel(ctx)
-	result, sendErr := s.sendFn(sendCtx, req)
+	// The IM call and everything after it are post-decision bookkeeping that must
+	// finish even if Stop() cancels the worker mid-batch — otherwise a delivered
+	// row is stranded in `dispatching` and only a peer sweep (falsely) promotes it
+	// to `unknown`. Derive the send + persist contexts from a non-cancellable base
+	// (the 15s HTTP timeout / swDBCallTimeout still bound them).
+	postSend := context.WithoutCancel(ctx)
+	result, sendErr := s.sendFn(postSend, req)
 	if sendErr != nil {
 		class := swErrIMTimeout
 		var se *swSendError
 		if errors.As(sendErr, &se) {
 			class = se.class
 		}
+		// A definitive reject (non-2xx) posted NOTHING → re-queue the whole batch
+		// (backoff, at-most-once-safe) instead of terminal-`unknown`-ing it, so one
+		// transient WuKongIM 5xx during a bulk invite cannot permanently suppress
+		// the coalesced welcome. Ambiguous errors (timeout / empty-200) stay
+		// `unknown` — they may have posted, and this is a PUBLIC message, so a retry
+		// could double-post.
 		for _, row := range winners {
-			s.toUnknown(ctx, row, class)
+			if class == swErrIMRejected {
+				s.dispatchRetry(postSend, row, class)
+			} else {
+				s.toUnknown(postSend, row, class)
+			}
 		}
 		return
 	}
 
 	// 5) Persist success on every winner, sharing the one message's identifiers.
 	for _, row := range winners {
-		persistCtx, cancel := context.WithTimeout(ctx, swDBCallTimeout)
+		persistCtx, cancel := context.WithTimeout(postSend, swDBCallTimeout)
 		sentOK, persistErr := s.store.casToSent(persistCtx, row.ID, result.messageID, result.clientMsgNo, s.now())
 		cancel()
 		if persistErr != nil {
 			s.Error("group welcome sent persist failed", zap.String("stage", swStagePersist), zap.Int64("delivery_id", row.ID), zap.Error(persistErr))
-			s.toUnknown(ctx, row, swErrSentPersist)
+			s.toUnknown(postSend, row, swErrSentPersist)
 			continue
 		}
 		if !sentOK {
@@ -590,6 +619,23 @@ func (s *groupWelcomeService) dispatchBatch(ctx context.Context, cfg common.Grou
 		s.metrics.incSendSuccess()
 		s.Info("group welcome delivered", zap.String("stage", swStagePersist), zap.Int64("delivery_id", row.ID),
 			zap.String("group_no", cfg.GroupNo), zap.String("uid", row.UID))
+	}
+}
+
+// dispatchRetry re-queues a dispatching row after a definitively-not-delivered
+// send (backoff to pending, or terminal `failed` after the retry budget). Shares
+// the pre-IM backoff schedule/budget; only fired for swErrIMRejected.
+func (s *groupWelcomeService) dispatchRetry(ctx context.Context, row *groupWelcomeRow, class string) {
+	c, cancel := context.WithTimeout(ctx, swDBCallTimeout)
+	ok, err := s.store.casDispatchingRetry(c, row.ID, row.Attempts, class, s.now())
+	cancel()
+	if err != nil {
+		s.Warn("group welcome cas dispatching retry failed", zap.Int64("delivery_id", row.ID), zap.String("error_class", class), zap.Error(err))
+		return
+	}
+	if ok && row.Attempts+1 > swMaxPreIMAttempts {
+		s.metrics.incSendFailed()
+		s.Warn("group welcome delivery failed (send-retry budget exhausted)", zap.Int64("delivery_id", row.ID), zap.String("error_class", class))
 	}
 }
 

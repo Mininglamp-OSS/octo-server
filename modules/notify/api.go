@@ -13,6 +13,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/pool"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/internal/cardactiondispatch"
@@ -255,20 +256,33 @@ func (n *Notify) handleSpaceMemberEvent(data []byte, commit config.EventCommit) 
 // 阻塞（reconciler 兜底）。GroupMemberAdd 是多监听者事件，commit(nil) 与既有 space
 // 处理保持一致。
 func (n *Notify) handleGroupMemberAddEvent(data []byte, commit config.EventCommit) {
-	var req config.MsgGroupMemberAddReq
-	if err := util.ReadJsonByByte(data, &req); err != nil {
-		n.Warn("解析GroupMemberAdd事件失败", zap.Error(err))
-		commit(nil)
-		return
-	}
-	if n.groupWelcome != nil && req.GroupNo != "" {
-		for _, m := range req.Members {
-			if m != nil && m.UID != "" {
-				n.groupWelcome.handleMemberJoin(req.GroupNo, m.UID)
+	// GroupMemberAdd is a multi-member batch event with no handlerMap entry, so
+	// listeners run sequentially on the shared event-dispatch goroutine. Offload
+	// the per-member fan-out (up to N DB round-trips) to the EventPool so this
+	// listener returns immediately and does not stall the sibling message/group
+	// listeners or back up the event queue on a bulk invite (mirrors the group
+	// module's own GroupMemberAdd listener).
+	n.ctx.EventPool.Work <- &pool.Job{
+		Data: data,
+		JobFunc: func(_ int64, d interface{}) {
+			var req config.MsgGroupMemberAddReq
+			if err := util.ReadJsonByByte(d.([]byte), &req); err != nil {
+				n.Warn("解析GroupMemberAdd事件失败", zap.Error(err))
+				commit(nil)
+				return
 			}
-		}
+			if n.groupWelcome != nil && req.GroupNo != "" {
+				uids := make([]string, 0, len(req.Members))
+				for _, m := range req.Members {
+					if m != nil && m.UID != "" {
+						uids = append(uids, m.UID)
+					}
+				}
+				n.groupWelcome.handleMemberJoinBatch(req.GroupNo, uids)
+			}
+			commit(nil)
+		},
 	}
-	commit(nil)
 }
 
 // Start 启动欢迎语的对账 + 发送 worker goroutine（模块生命周期钩子）。

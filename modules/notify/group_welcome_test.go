@@ -6,9 +6,12 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	libcommon "github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
 	"github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -394,4 +397,354 @@ func TestGroupWelcome_SweepAll_CrossGroup(t *testing.T) {
 	stB, _ := gwRowStatus(t, ctx, idB)
 	assert.Equal(t, swStatusPending, stA, "lease-expired claimed row in g_a reclaimed")
 	assert.Equal(t, swStatusPending, stB, "lease-expired claimed row in g_b reclaimed")
+}
+
+// ---------------------------------------------------------------------------
+// Review-hardening coverage (PR #655)
+// ---------------------------------------------------------------------------
+
+// gwRowFull returns status, attempts and error_class for a ledger row.
+func gwRowFull(t *testing.T, ctx *config.Context, id int64) (status, attempts int, errClass string) {
+	t.Helper()
+	var row struct {
+		Status   int    `db:"status"`
+		Attempts int    `db:"attempts"`
+		ErrClass string `db:"error_class"`
+	}
+	err := ctx.DB().SelectBySql(
+		"SELECT status, attempts, COALESCE(error_class,'') AS error_class FROM "+groupWelcomeTable+" WHERE id=?", id,
+	).LoadOne(&row)
+	require.NoError(t, err)
+	return row.Status, row.Attempts, row.ErrClass
+}
+
+func gwSetMemberLeft(t *testing.T, ctx *config.Context, groupNo, uid string) {
+	t.Helper()
+	_, err := ctx.DB().UpdateBySql("UPDATE `group_member` SET is_deleted=1 WHERE group_no=? AND uid=?", groupNo, uid).Exec()
+	require.NoError(t, err)
+}
+
+func gwSetMemberRejoined(t *testing.T, ctx *config.Context, groupNo, uid string, createdAt time.Time) {
+	t.Helper()
+	_, err := ctx.DB().UpdateBySql(
+		"UPDATE `group_member` SET is_deleted=0, created_at=FROM_UNIXTIME(?) WHERE group_no=? AND uid=?",
+		createdAt.Unix(), groupNo, uid,
+	).Exec()
+	require.NoError(t, err)
+}
+
+func gwWaitRows(t *testing.T, ctx *config.Context, groupNo string, want int) {
+	t.Helper()
+	for i := 0; i < 100; i++ {
+		if gwCountRows(t, ctx, groupNo) >= want {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	require.Equal(t, want, gwCountRows(t, ctx, groupNo), "expected %d rows for %s", want, groupNo)
+}
+
+// TestGroupWelcome_Coalesce_HoldsBackUntilWindow: a freshly-enqueued row is NOT
+// claimable until now+coalesceWindow (guards the hold-back that makes bursts
+// coalesce). Uses a whole-second clock so MySQL DATETIME(0) rounding cannot mask it.
+func TestGroupWelcome_Coalesce_HoldsBackUntilWindow(t *testing.T) {
+	ctx := swTestServer(t)
+	af := time.Now().UTC().Add(-time.Hour)
+	gwInsertGroup(t, ctx, "g_1", 1)
+	gwInsertUserNamed(t, ctx, "u_1", "Alice", 0)
+	gwInsertGroupMember(t, ctx, "g_1", "u_1", 0, 1, time.Now().UTC())
+	gwSetGroupConfig(t, ctx, "g_1", true, af, "hi {member}")
+
+	svc := gwNewService(t, ctx)
+	clock := time.Now().UTC().Truncate(time.Second)
+	svc.now = func() time.Time { return clock }
+	posts := 0
+	svc.sendFn = func(_ context.Context, _ *config.MsgSendReq) (*swSendResult, error) {
+		posts++
+		return &swSendResult{messageID: 1, clientMsgNo: "x"}, nil
+	}
+
+	svc.handleMemberJoin("g_1", "u_1") // enqueue, due at clock+coalesceWindow
+	svc.runWorkerWake(bg())            // same clock: not yet due
+	assert.Equal(t, 0, posts, "row held back until the coalesce window elapses")
+	sent, _ := svc.store.countByStatus(bg(), "g_1", swStatusSent)
+	assert.EqualValues(t, 0, sent)
+
+	clock = clock.Add(groupWelcomeCoalesceWindow + time.Second) // past the window
+	svc.runWorkerWake(bg())
+	assert.Equal(t, 1, posts, "claimable once the window has elapsed")
+	sent, _ = svc.store.countByStatus(bg(), "g_1", swStatusSent)
+	assert.EqualValues(t, 1, sent)
+}
+
+// TestGroupWelcome_LeaveRejoin_NoRepost: a full deliver → leave → rejoin (fresh
+// created_at) cycle re-posts NOTHING — the ledger UNIQUE(group_no,uid), not the
+// reset group_member.created_at, is the at-most-once authority.
+func TestGroupWelcome_LeaveRejoin_NoRepost(t *testing.T) {
+	ctx := swTestServer(t)
+	af := time.Now().UTC().Add(-time.Hour)
+	gwInsertGroup(t, ctx, "g_1", 1)
+	gwInsertUserNamed(t, ctx, "u_1", "Alice", 0)
+	gwInsertGroupMember(t, ctx, "g_1", "u_1", 0, 1, time.Now().UTC())
+	gwSetGroupConfig(t, ctx, "g_1", true, af, "hi {member}")
+
+	svc := gwNewService(t, ctx)
+	clock := time.Now().UTC().Truncate(time.Second)
+	svc.now = func() time.Time { return clock }
+	posts := 0
+	svc.sendFn = func(_ context.Context, _ *config.MsgSendReq) (*swSendResult, error) {
+		posts++
+		return &swSendResult{messageID: 1, clientMsgNo: "x"}, nil
+	}
+
+	svc.handleMemberJoin("g_1", "u_1")
+	clock = clock.Add(time.Minute)
+	svc.runWorkerWake(bg())
+	require.Equal(t, 1, posts)
+	ids := gwPendingIDs(t, ctx, "g_1")
+	require.Len(t, ids, 1)
+	st, _ := gwRowStatus(t, ctx, ids[0])
+	require.Equal(t, swStatusSent, st)
+
+	// Leave, then rejoin with a fresh created_at.
+	gwSetMemberLeft(t, ctx, "g_1", "u_1")
+	clock = clock.Add(time.Minute)
+	gwSetMemberRejoined(t, ctx, "g_1", "u_1", clock)
+
+	svc.handleMemberJoin("g_1", "u_1") // event path on rejoin
+	svc.runReconcileOnce(bg())         // reconciler catch-up
+	clock = clock.Add(time.Minute)
+	svc.runWorkerWake(bg())
+
+	assert.Equal(t, 1, posts, "rejoin does not re-post")
+	assert.Equal(t, 1, gwCountRows(t, ctx, "g_1"), "still exactly one ledger row")
+	st, _ = gwRowStatus(t, ctx, ids[0])
+	assert.Equal(t, swStatusSent, st, "the row stays SENT across leave/rejoin")
+}
+
+// TestGroupWelcome_HandleMemberJoinBatch_FanOutAndFilters: one batch call resolves
+// the config once and enqueues only the eligible humans (robot / pre-active_from /
+// system-bot / empty uid all filtered).
+func TestGroupWelcome_HandleMemberJoinBatch_FanOutAndFilters(t *testing.T) {
+	ctx := swTestServer(t)
+	af := time.Now().UTC()
+	gwInsertGroup(t, ctx, "g_1", 1)
+	gwSetGroupConfig(t, ctx, "g_1", true, af, "hi {member}")
+	gwInsertUserNamed(t, ctx, "h1", "H1", 0)
+	gwInsertGroupMember(t, ctx, "g_1", "h1", 0, 1, time.Now().UTC())
+	gwInsertUserNamed(t, ctx, "h2", "H2", 0)
+	gwInsertGroupMember(t, ctx, "g_1", "h2", 0, 1, time.Now().UTC())
+	gwInsertUserNamed(t, ctx, "bot", "bot", 1)
+	gwInsertGroupMember(t, ctx, "g_1", "bot", 0, 1, time.Now().UTC())
+	gwInsertUserNamed(t, ctx, "early", "E", 0)
+	gwInsertGroupMember(t, ctx, "g_1", "early", 0, 1, af.Add(-time.Hour))
+
+	svc := gwNewService(t, ctx)
+	svc.handleMemberJoinBatch("g_1", []string{"h1", "h2", "bot", "early", NotifyBotUID(), ""})
+	assert.Equal(t, 2, gwCountRows(t, ctx, "g_1"), "only the two eligible humans from the batch are enqueued")
+}
+
+// TestGroupWelcome_Event_ParsesFansOutAndCommits: the production listener entry
+// (JSON parse → fan-out → commit), driven through the real EventPool.
+func TestGroupWelcome_Event_ParsesFansOutAndCommits(t *testing.T) {
+	ctx := swTestServer(t)
+	af := time.Now().UTC().Add(-time.Hour)
+	gwInsertGroup(t, ctx, "g_1", 1)
+	gwInsertUserNamed(t, ctx, "u_1", "A", 0)
+	gwInsertGroupMember(t, ctx, "g_1", "u_1", 0, 1, time.Now().UTC())
+	gwInsertUserNamed(t, ctx, "u_2", "B", 0)
+	gwInsertGroupMember(t, ctx, "g_1", "u_2", 0, 1, time.Now().UTC())
+	gwSetGroupConfig(t, ctx, "g_1", true, af, "hi {member}")
+
+	svc := gwNewService(t, ctx)
+	n := &Notify{ctx: ctx, groupWelcome: svc, Log: log.NewTLog("gwtest")}
+
+	data := []byte(util.ToJson(config.MsgGroupMemberAddReq{
+		GroupNo: "g_1", Members: []*config.UserBaseVo{{UID: "u_1"}, {UID: "u_2"}},
+	}))
+	done := make(chan error, 1)
+	n.handleGroupMemberAddEvent(data, func(err error) { done <- err })
+	select {
+	case err := <-done:
+		require.NoError(t, err, "listener commits nil")
+	case <-time.After(3 * time.Second):
+		t.Fatal("GroupMemberAdd event not committed")
+	}
+	gwWaitRows(t, ctx, "g_1", 2)
+
+	// Malformed JSON still commits and does not crash / enqueue.
+	done2 := make(chan error, 1)
+	n.handleGroupMemberAddEvent([]byte("not json"), func(err error) { done2 <- err })
+	select {
+	case <-done2:
+	case <-time.After(3 * time.Second):
+		t.Fatal("malformed event not committed")
+	}
+}
+
+// TestGroupWelcome_Dispatch_SendTimeout_Unknown: an ambiguous send error
+// (timeout) terminals the row to `unknown` and is NEVER auto-retried.
+func TestGroupWelcome_Dispatch_SendTimeout_Unknown(t *testing.T) {
+	ctx := swTestServer(t)
+	af := time.Now().UTC().Add(-time.Hour)
+	gwInsertGroup(t, ctx, "g_1", 1)
+	gwInsertUserNamed(t, ctx, "u_1", "A", 0)
+	gwInsertGroupMember(t, ctx, "g_1", "u_1", 0, 1, time.Now().UTC())
+	gwSetGroupConfig(t, ctx, "g_1", true, af, "hi {member}")
+	id := gwInsertGroupLedger(t, ctx, "g_1", "u_1", swStatusPending, "", nil, 0)
+
+	svc := gwNewService(t, ctx)
+	calls := 0
+	svc.sendFn = func(_ context.Context, _ *config.MsgSendReq) (*swSendResult, error) {
+		calls++
+		return nil, &swSendError{class: swErrIMTimeout}
+	}
+	svc.runWorkerWake(bg())
+	st, _, ec := gwRowFull(t, ctx, id)
+	assert.Equal(t, swStatusUnknown, st, "ambiguous timeout -> unknown (terminal)")
+	assert.Equal(t, swErrIMTimeout, ec)
+	svc.runWorkerWake(bg())
+	assert.Equal(t, 1, calls, "unknown is never re-sent (avoids public double-post)")
+}
+
+// TestGroupWelcome_Dispatch_SendRejected_RetriesThenDelivers: a definitive reject
+// (non-2xx = nothing posted) re-queues with backoff and is delivered on a later
+// wake — exactly once, no double post.
+func TestGroupWelcome_Dispatch_SendRejected_RetriesThenDelivers(t *testing.T) {
+	ctx := swTestServer(t)
+	af := time.Now().UTC().Add(-time.Hour)
+	gwInsertGroup(t, ctx, "g_1", 1)
+	gwInsertUserNamed(t, ctx, "u_1", "A", 0)
+	gwInsertGroupMember(t, ctx, "g_1", "u_1", 0, 1, time.Now().UTC())
+	gwSetGroupConfig(t, ctx, "g_1", true, af, "hi {member}")
+	id := gwInsertGroupLedger(t, ctx, "g_1", "u_1", swStatusPending, "", nil, 0)
+
+	svc := gwNewService(t, ctx)
+	clock := time.Now().UTC().Truncate(time.Second)
+	svc.now = func() time.Time { return clock }
+	okSends, rejected := 0, false
+	svc.sendFn = func(_ context.Context, _ *config.MsgSendReq) (*swSendResult, error) {
+		if !rejected {
+			rejected = true
+			return nil, &swSendError{class: swErrIMRejected}
+		}
+		okSends++
+		return &swSendResult{messageID: 9, clientMsgNo: "x"}, nil
+	}
+
+	svc.runWorkerWake(bg()) // wake 1: rejected -> pending backoff
+	st, attempts, ec := gwRowFull(t, ctx, id)
+	assert.Equal(t, swStatusPending, st, "definitive reject -> retryable pending")
+	assert.Equal(t, 1, attempts)
+	assert.Equal(t, swErrIMRejected, ec)
+	assert.Equal(t, 0, okSends, "nothing posted on the rejected attempt")
+
+	clock = clock.Add(swBackoff[0] + time.Second) // past the retry backoff
+	svc.runWorkerWake(bg())                       // wake 2: re-claimed and delivered
+	st, _, _ = gwRowFull(t, ctx, id)
+	assert.Equal(t, swStatusSent, st, "retried post succeeds")
+	assert.Equal(t, 1, okSends, "delivered exactly once")
+}
+
+// TestGroupWelcome_Dispatch_OrphanJoiner_Skipped: a joiner with no user row is
+// skipped at pre-send re-check and never posted.
+func TestGroupWelcome_Dispatch_OrphanJoiner_Skipped(t *testing.T) {
+	ctx := swTestServer(t)
+	af := time.Now().UTC().Add(-time.Hour)
+	gwInsertGroup(t, ctx, "g_1", 1)
+	gwSetGroupConfig(t, ctx, "g_1", true, af, "hi {member}")
+	id := gwInsertGroupLedger(t, ctx, "g_1", "ghost", swStatusPending, "", nil, 0)
+
+	svc := gwNewService(t, ctx)
+	sent := false
+	svc.sendFn = func(_ context.Context, _ *config.MsgSendReq) (*swSendResult, error) {
+		sent = true
+		return &swSendResult{messageID: 1}, nil
+	}
+	svc.runWorkerWake(bg())
+	st, _, ec := gwRowFull(t, ctx, id)
+	assert.Equal(t, swStatusSkipped, st, "orphan joiner -> skipped")
+	assert.Equal(t, swErrOrphanMember, ec)
+	assert.False(t, sent, "no post for an ineligible joiner")
+}
+
+// TestGroupWelcome_SweepAll_DispatchingToUnknown: a lease-expired dispatching row
+// is promoted to unknown (transport-ambiguous) by the cross-group sweep.
+func TestGroupWelcome_SweepAll_DispatchingToUnknown(t *testing.T) {
+	ctx := swTestServer(t)
+	gwInsertGroup(t, ctx, "g_1", 1)
+	svc := gwNewService(t, ctx)
+	past := time.Now().UTC().Add(-time.Minute)
+	id := gwInsertGroupLedger(t, ctx, "g_1", "u_1", swStatusDispatching, "dead", &past, 0)
+	svc.sweepAll(bg())
+	st, _, ec := gwRowFull(t, ctx, id)
+	assert.Equal(t, swStatusUnknown, st, "lease-expired dispatching row -> unknown")
+	assert.Equal(t, swErrClaimExpired, ec)
+}
+
+// TestGroupWelcome_HandleMemberJoin_SystemBotExcluded: a system-bot uid enqueues
+// nothing even though the group's config is enabled and it is an active member.
+func TestGroupWelcome_HandleMemberJoin_SystemBotExcluded(t *testing.T) {
+	ctx := swTestServer(t)
+	af := time.Now().UTC().Add(-time.Hour)
+	gwInsertGroup(t, ctx, "g_1", 1)
+	gwSetGroupConfig(t, ctx, "g_1", true, af, "hi {member}")
+	gwInsertGroupMember(t, ctx, "g_1", NotifyBotUID(), 0, 1, time.Now().UTC())
+	svc := gwNewService(t, ctx)
+	svc.handleMemberJoin("g_1", NotifyBotUID())
+	assert.Equal(t, 0, gwCountRows(t, ctx, "g_1"), "system-bot joiner is excluded")
+}
+
+// TestGroupWelcome_ActiveFromBoundary_Inclusive: created_at == active_from is
+// eligible (>=); one second before is not.
+func TestGroupWelcome_ActiveFromBoundary_Inclusive(t *testing.T) {
+	ctx := swTestServer(t)
+	af := time.Now().UTC().Truncate(time.Second)
+	gwInsertGroup(t, ctx, "g_1", 1)
+	gwSetGroupConfig(t, ctx, "g_1", true, af, "hi {member}")
+	gwInsertUserNamed(t, ctx, "onedge", "Edge", 0)
+	gwInsertGroupMember(t, ctx, "g_1", "onedge", 0, 1, af) // exactly at active_from
+	gwInsertUserNamed(t, ctx, "before", "Before", 0)
+	gwInsertGroupMember(t, ctx, "g_1", "before", 0, 1, af.Add(-time.Second)) // 1s before
+
+	svc := gwNewService(t, ctx)
+	svc.handleMemberJoin("g_1", "onedge")
+	svc.handleMemberJoin("g_1", "before")
+	assert.Equal(t, 1, gwCountRows(t, ctx, "g_1"), "created_at == active_from eligible; 1s before excluded")
+}
+
+// TestGroupWelcome_Worker_RotationServesBeyondWakeCap: with more enabled groups
+// than the per-wake post cap, the rotating cursor serves every group across two
+// wakes (removing workerCursor++ would strand the tail groups).
+func TestGroupWelcome_Worker_RotationServesBeyondWakeCap(t *testing.T) {
+	ctx := swTestServer(t)
+	af := time.Now().UTC().Add(-time.Hour)
+	total := swWorkerWakeCap + 2
+	for i := 0; i < total; i++ {
+		g := fmt.Sprintf("g_r%02d", i)
+		gwInsertGroup(t, ctx, g, 1)
+		gwSetGroupConfig(t, ctx, g, true, af, "hi {member}")
+		gwSeedPending(t, ctx, g, 1, 0)
+	}
+	svc := gwNewService(t, ctx)
+	svc.sendFn = func(_ context.Context, _ *config.MsgSendReq) (*swSendResult, error) {
+		return &swSendResult{messageID: 1, clientMsgNo: "x"}, nil
+	}
+	svc.runWorkerWake(bg()) // per-wake post cap leaves 2 groups unserved
+	svc.runWorkerWake(bg()) // rotation serves the previously-skipped groups
+
+	got := 0
+	for i := 0; i < total; i++ {
+		s, _ := svc.store.countByStatus(bg(), fmt.Sprintf("g_r%02d", i), swStatusSent)
+		got += int(s)
+	}
+	assert.Equal(t, total, got, "rotating cursor serves every group across two wakes despite the per-wake post cap")
+}
+
+// TestRenderGroupWelcomeBody_TruncatesAtCap pins the rendered-body rune cap.
+func TestRenderGroupWelcomeBody_TruncatesAtCap(t *testing.T) {
+	long := strings.Repeat("x", groupWelcomeRenderedMaxRunes+500)
+	out := renderGroupWelcomeBody(long, "")
+	assert.Equal(t, groupWelcomeRenderedMaxRunes, utf8.RuneCountInString(out), "rendered body truncated to the rune cap")
+	assert.Equal(t, "欢迎 Alice", renderGroupWelcomeBody("欢迎 {member}", "Alice"), "under-cap body unchanged")
 }

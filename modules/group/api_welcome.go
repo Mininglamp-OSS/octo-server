@@ -71,8 +71,17 @@ type groupWelcomeConfigResp struct {
 // construction. Returns the caller uid and ok=false when a response was written.
 func (g *Group) authorizeGroupWelcomeAdmin(c *wkhttp.Context, groupNo string) (loginUID string, ok bool) {
 	loginUID = c.GetLoginUID()
-	if _, err := g.getGroupInfo(groupNo); err != nil {
+	group, err := g.getGroupInfo(groupNo)
+	if err != nil {
 		respondGroupInfoError(c, err)
+		return "", false
+	}
+	// Require a Normal group (parity with the space welcome's checkSpaceActive):
+	// getGroupInfo already rejects Disband(2); also reject Disabled(0) so an
+	// admin-disabled group's welcome config cannot be read/written. Same
+	// not-found response as a disbanded group (no status-reason leak).
+	if group.Status != GroupStatusNormal {
+		respondGroupInfoError(c, errGroupInfoNotFound)
 		return "", false
 	}
 	isAdmin, err := g.db.QueryIsGroupManagerOrCreator(groupNo, loginUID)
