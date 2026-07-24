@@ -496,6 +496,19 @@ func (s *groupWelcomeService) dispatchBatch(ctx context.Context, cfg common.Grou
 		return
 	}
 
+	// The pre-send re-check validates each joiner against the CURRENT config's
+	// active_from window, so a pending row is never posted outside the
+	// currently-configured cutoff (admin moved active_from forward, or
+	// deleted+recreated the config). The worker only claims valid, enabled configs,
+	// so this parse succeeds; fail closed (skip the batch) if it ever does not.
+	activeFrom, ok := cfg.ParsedActiveFrom()
+	if !ok {
+		s.metrics.incConfigInvalid()
+		s.Warn("group welcome dispatch: config active_from unparseable; skipping batch",
+			zap.String("stage", swStagePrecheck), zap.String("group_no", cfg.GroupNo))
+		return
+	}
+
 	// 1) Per-joiner pre-send re-check (bypasses cache; resolves the {member} name
 	//    + eligibility). Ineligible joiners are skipped individually and excluded
 	//    from the post; a DB error is a definitive pre-IM failure for that row.
@@ -506,7 +519,7 @@ func (s *groupWelcomeService) dispatchBatch(ctx context.Context, cfg common.Grou
 	eligible := make([]eligibleRow, 0, len(rows))
 	for _, row := range rows {
 		pcCtx, cancel := context.WithTimeout(ctx, swDBCallTimeout)
-		pc, err := s.store.precheckRecipient(pcCtx, row.UID, spacepkg.IsSystemBot)
+		pc, err := s.store.precheckRecipient(pcCtx, cfg.GroupNo, row.UID, activeFrom, spacepkg.IsSystemBot)
 		cancel()
 		if err != nil {
 			s.Warn("group welcome precheck failed", zap.String("stage", swStagePrecheck), zap.Int64("delivery_id", row.ID),
@@ -605,6 +618,16 @@ func (s *groupWelcomeService) dispatchBatch(ctx context.Context, cfg common.Grou
 		}
 		for _, row := range winners {
 			s.toUnknown(postSend, row, class)
+		}
+		return
+	}
+	if result == nil {
+		// Defensive: a sender must return a non-nil result on nil error. Guard the
+		// boundary so a malformed sender response cannot panic the worker at
+		// result.messageID; treat it as transport-ambiguous (unknown).
+		s.Warn("group welcome sender returned nil result on nil error", zap.String("stage", swStagePersist), zap.String("group_no", cfg.GroupNo))
+		for _, row := range winners {
+			s.toUnknown(postSend, row, swErrIMBadResponse)
 		}
 		return
 	}

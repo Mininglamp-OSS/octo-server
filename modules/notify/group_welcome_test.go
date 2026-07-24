@@ -736,3 +736,77 @@ func TestRenderGroupWelcomeBody_TruncatesAtCap(t *testing.T) {
 	assert.Equal(t, groupWelcomeRenderedMaxRunes, utf8.RuneCountInString(out), "rendered body truncated to the rune cap")
 	assert.Equal(t, "欢迎 Alice", renderGroupWelcomeBody("欢迎 {member}", "Alice"), "under-cap body unchanged")
 }
+
+// TestGroupWelcome_Dispatch_ActiveFromMovedForward_Skipped: a row enqueued under an
+// earlier window is NOT posted after an admin moves active_from past the joiner's
+// join time — the pre-send re-check enforces the CURRENT cutoff.
+func TestGroupWelcome_Dispatch_ActiveFromMovedForward_Skipped(t *testing.T) {
+	ctx := swTestServer(t)
+	base := time.Now().UTC().Truncate(time.Second)
+	gwInsertGroup(t, ctx, "g_1", 1)
+	gwInsertUserNamed(t, ctx, "u_1", "Alice", 0)
+	gwInsertGroupMember(t, ctx, "g_1", "u_1", 0, 1, base) // joined at base
+	gwSetGroupConfig(t, ctx, "g_1", true, base.Add(-time.Hour), "hi {member}")
+
+	svc := gwNewService(t, ctx)
+	clock := base
+	svc.now = func() time.Time { return clock }
+	sent := false
+	svc.sendFn = func(_ context.Context, _ *config.MsgSendReq) (*swSendResult, error) {
+		sent = true
+		return &swSendResult{messageID: 1}, nil
+	}
+
+	svc.handleMemberJoin("g_1", "u_1") // eligible under the current window → enqueued
+	ids := gwPendingIDs(t, ctx, "g_1")
+	require.Len(t, ids, 1)
+
+	// Admin moves active_from forward, past the joiner's created_at.
+	gwSetGroupConfig(t, ctx, "g_1", true, base.Add(time.Hour), "hi {member}")
+	clock = clock.Add(time.Minute) // past the coalesce window
+
+	svc.runWorkerWake(bg())
+	st, _, ec := gwRowFull(t, ctx, ids[0])
+	assert.Equal(t, swStatusSkipped, st, "pending row outside the current active_from window is skipped")
+	assert.Equal(t, swErrActiveFromMoved, ec)
+	assert.False(t, sent, "no public post outside the configured window")
+}
+
+// TestGroupWelcome_Dispatch_ConfigDeletedRecreated_WindowEnforced: DELETE does not
+// discard pending rows, but recreating the config with a later window does NOT
+// resurrect a stale welcome — the pre-send re-check skips rows outside the new
+// cutoff.
+func TestGroupWelcome_Dispatch_ConfigDeletedRecreated_WindowEnforced(t *testing.T) {
+	ctx := swTestServer(t)
+	base := time.Now().UTC().Truncate(time.Second)
+	gwInsertGroup(t, ctx, "g_1", 1)
+	gwInsertUserNamed(t, ctx, "u_1", "Alice", 0)
+	gwInsertGroupMember(t, ctx, "g_1", "u_1", 0, 1, base)
+	gwSetGroupConfig(t, ctx, "g_1", true, base.Add(-time.Hour), "old {member}")
+
+	svc := gwNewService(t, ctx)
+	clock := base
+	svc.now = func() time.Time { return clock }
+	sent := false
+	svc.sendFn = func(_ context.Context, _ *config.MsgSendReq) (*swSendResult, error) {
+		sent = true
+		return &swSendResult{messageID: 1}, nil
+	}
+
+	svc.handleMemberJoin("g_1", "u_1")
+	ids := gwPendingIDs(t, ctx, "g_1")
+	require.Len(t, ids, 1)
+
+	// Delete the config (the pending row remains), then recreate with a later window.
+	store := common.NewGroupWelcomeConfigStore(ctx.DB())
+	_, err := store.Delete(bg(), "g_1")
+	require.NoError(t, err)
+	gwSetGroupConfig(t, ctx, "g_1", true, base.Add(time.Hour), "new {member}")
+	clock = clock.Add(time.Minute)
+
+	svc.runWorkerWake(bg())
+	st, _, ec := gwRowFull(t, ctx, ids[0])
+	assert.Equal(t, swStatusSkipped, st, "resurrected pending row is skipped under the recreated (later) window")
+	assert.Equal(t, swErrActiveFromMoved, ec)
+	assert.False(t, sent, "delete+recreate does not resurrect a stale out-of-window welcome")
+}

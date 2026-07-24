@@ -159,6 +159,19 @@ visible, unrecallable message. Reverted to the space engine's conservative polic
 any post-send failure → terminal `unknown`, never auto-retried. For a public
 message, a missed welcome (invisible) is a safer failure than a duplicate one.
 
+**Dispatch-time active_from re-check (round-3 blocker).** A reviewer found that a
+pending row was delivered without re-validating the CURRENT config's `active_from`
+— so an admin moving `active_from` forward, or deleting+recreating the config
+(DELETE does not discard pending rows), could post a welcome to someone whose join
+predates the new window. `precheckRecipient` now re-checks
+`group_member.created_at >= cfg.active_from` at send time and CAS-skips
+(`active_from_moved`) any row outside the current window. It re-checks only the
+join-time window, NOT membership — "post-then-leave still fires" is preserved, and
+rejoin dedup stays keyed on the ledger UNIQUE. (Note: neither engine re-checked
+active_from at dispatch before; group needed it more because, unlike space, it does
+not re-check membership either.) Also added a nil-`result`-on-nil-`err` guard on the
+sender boundary.
+
 ## Open items
 
 - **Batch blast radius (known limitation, fix-before-enable).** One send failure

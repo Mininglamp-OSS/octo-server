@@ -237,7 +237,7 @@ type userNameRow struct {
 // placeholder. It does NOT require current membership — the public group post is
 // keyed to the first-join event and fires even if the member has since left
 // (task group-welcome-message decision "post-then-leave still fires").
-func (s *groupWelcomeStore) precheckRecipient(ctx context.Context, uid string, isSystemBot func(string) bool) (groupPrecheckResult, error) {
+func (s *groupWelcomeStore) precheckRecipient(ctx context.Context, groupNo, uid string, activeFrom time.Time, isSystemBot func(string) bool) (groupPrecheckResult, error) {
 	if isSystemBot != nil && isSystemBot(uid) {
 		return groupPrecheckResult{eligible: false, errClass: swErrHumanFilter}, nil
 	}
@@ -252,6 +252,28 @@ func (s *groupWelcomeStore) precheckRecipient(ctx context.Context, uid string, i
 	if row.Robot == 1 {
 		return groupPrecheckResult{eligible: false, errClass: swErrHumanFilter}, nil
 	}
+
+	// Re-validate the joiner against the CURRENT config's active_from window: a row
+	// enqueued under an earlier config must not be delivered after an admin moved
+	// active_from forward, or deleted+recreated the config with a later window
+	// (a DELETE does not discard pending rows). We check only the join-time window
+	// (`created_at >= active_from`), NOT current membership — leaving is intentional
+	// ("post-then-leave still fires"), and rejoin dedup stays keyed on the ledger
+	// UNIQUE, not this timestamp. created_at is a session-wall-clock DATETIME while
+	// activeFrom is a UTC instant, so compare epoch-to-epoch via UNIX_TIMESTAMP (see
+	// firstJoinHumanMember).
+	var inWindow int
+	err = s.db.SelectBySql(
+		"SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=? AND UNIX_TIMESTAMP(created_at) >= ?",
+		groupNo, uid, activeFrom.Unix(),
+	).LoadOneContext(ctx, &inWindow)
+	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
+		return groupPrecheckResult{}, fmt.Errorf("precheck active_from window: %w", err)
+	}
+	if inWindow == 0 {
+		return groupPrecheckResult{eligible: false, errClass: swErrActiveFromMoved}, nil
+	}
+
 	name := row.Name
 	if name == "" {
 		name = uid // fall back to the uid if the display name is empty

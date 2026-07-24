@@ -24,15 +24,20 @@ const (
 
 // error_class enumeration (structured log field + ledger column).
 const (
-	swErrBotNotReady   = "bot_not_ready"
-	swErrMemberLeft    = "member_left"
-	swErrHumanFilter   = "human_filter"
-	swErrOrphanMember  = "orphan_member"
-	swErrConfigRead    = "config_read"
-	swErrIMTimeout     = "im_timeout"
-	swErrIMBadResponse = "im_bad_response"
-	swErrSentPersist   = "sent_persist"
-	swErrClaimExpired  = "claim_expired"
+	swErrBotNotReady  = "bot_not_ready"
+	swErrMemberLeft   = "member_left"
+	swErrHumanFilter  = "human_filter"
+	swErrOrphanMember = "orphan_member"
+	// swErrActiveFromMoved (group only): a pending row's joiner no longer satisfies
+	// the CURRENT config's active_from at pre-send re-check (admin moved active_from
+	// forward, or deleted+recreated the config with a later window). CAS-skip so a
+	// welcome is never posted outside the currently-configured cutoff.
+	swErrActiveFromMoved = "active_from_moved"
+	swErrConfigRead      = "config_read"
+	swErrIMTimeout       = "im_timeout"
+	swErrIMBadResponse   = "im_bad_response"
+	swErrSentPersist     = "sent_persist"
+	swErrClaimExpired    = "claim_expired"
 )
 
 // stage enumeration (structured log field).
