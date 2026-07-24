@@ -4,6 +4,28 @@ Change history for this repo's `.octospec/`, following the
 [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 change-log convention (§7). Newest first.
 
+## 2026-07-23 (cardtmpl-l2a-summary-migration PR-2)
+
+- **Feature** — Roadmap C second slice: `summary.completed@0.1.0` and
+  `summary.failed@0.1.0` (v1 display cards) migrated onto `Registry.Render`
+  reusing the PR-1 (#649) copy-directory shape and the PR-1
+  `BuildSummaryResourceCardBodyWithLang` scaffold. `NotifyReq` /
+  `SummaryCardFields` external shape unchanged (plan B);
+  `deliverCardNotification` routes both kinds through Registry with F7
+  fail-close and C1 preflight, matching the docs display cards. Both
+  manifests declare `renderProfile` + `renderProfileCompatibility` (#647).
+- **Milestone** — After PR-2 the Registry holds 5 L2a cards
+  (docs.access-request v2 + docs.commented v1 + docs.shared v1 +
+  summary.completed v1 + summary.failed v1); every legacy display-card
+  deliver branch is Registry-backed. Only `generic.approval` remains legacy
+  (dynamic-owner conflict, tracked separately).
+- **Test** — `card_via_registry_summary_baseline_test.go` runs 4 fixtures
+  through legacy `buildSummaryCard` vs `buildSummaryCardViaRegistry` and
+  asserts canonical byte-equality after stripping
+  `metadata.octo.{protocol,template}`; C1 preflight and F7 unwired assertions
+  extend the pattern PR-1 established. `TestMain` grows to register the two
+  new cards. See [journal](journal/shared/cardtmpl-l2a-summary-migration.md).
+
 ## 2026-07-23 (cardtmpl-l2a-migration PR-1)
 
 - **Feature** — Roadmap C first slice: `docs.commented@0.1.0` and
