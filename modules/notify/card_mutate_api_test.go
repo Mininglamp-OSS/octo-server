@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	docsaccessrequest "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/docs_access_request"
 )
 
@@ -84,10 +85,11 @@ func TestReplaceSiblingWithRegistryResultUsesV3AndStoredContext(t *testing.T) {
 	}`)}
 	req := CardMutateReq{
 		SpaceID: "space-1", ChannelID: "reviewer-b", ChannelType: 1,
-		MessageID: "1002", Kind: DocsCardKindAccessGranted, DocID: "doc-1", Title: "caller title ignored",
+		MessageID: "1002", Kind: DocsCardKindAccessGranted, DocID: "doc-1", Title: "Current Roadmap",
 	}
 
-	if err := replaceSiblingWithRegistryResult(context.Background(), updater, req, snapshot, 99, "en"); err != nil {
+	if err := replaceSiblingWithRegistryResult(context.Background(), updater, req, snapshot, 99,
+		cardtmpl.BuildEnv{WebLoginURL: "https://im.example.com/login", Lang: "en", SpaceID: "space-1"}); err != nil {
 		t.Fatalf("replaceSiblingWithRegistryResult: %v", err)
 	}
 	if updater.id != docsaccessrequest.TemplateID || updater.version != docsaccessrequest.TemplateVersionV3 ||
@@ -108,7 +110,7 @@ func TestReplaceSiblingWithRegistryResultUsesV3AndStoredContext(t *testing.T) {
 	requester := fields["requester"].(map[string]any)
 	permission := fields["permission"].(map[string]any)
 	decision := fields["decision"].(map[string]any)
-	if document["docId"] != "doc-1" || document["title"] != "Roadmap" || document["sourceName"] != "Docs" ||
+	if document["docId"] != "doc-1" || document["title"] != "Current Roadmap" || document["sourceName"] != "Docs" ||
 		requester["name"] != "Alice" || requester["avatarUrl"] != "https://cdn.example.com/alice.png" ||
 		permission["label"] != "Access" || permission["roleLabel"] != "Viewer" ||
 		fields["requestReason"] != "Need quarterly access" || fields["requestedAtDisplay"] != "2026-07-24 10:00" ||
@@ -144,7 +146,8 @@ func TestReplaceSiblingWithRegistryResultRejectsCallerIdentityMismatch(t *testin
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := replaceSiblingWithRegistryResult(context.Background(), &captureViewUpdater{}, tt.req, snapshot, 99, "en")
+			err := replaceSiblingWithRegistryResult(context.Background(), &captureViewUpdater{}, tt.req, snapshot, 99,
+				cardtmpl.BuildEnv{WebLoginURL: "https://im.example.com/login", Lang: "en", SpaceID: tt.req.SpaceID})
 			if err == nil {
 				t.Fatal("replaceSiblingWithRegistryResult error = nil")
 			}
@@ -166,7 +169,8 @@ func TestReplaceSiblingWithRegistryResultMapsDeniedState(t *testing.T) {
 	req := CardMutateReq{SpaceID: "space-1", ChannelID: "reviewer-b", ChannelType: 1,
 		MessageID: "1002", Kind: DocsCardKindAccessDenied, DocID: "doc-1", DenyReason: "Out of scope"}
 
-	if err := replaceSiblingWithRegistryResult(context.Background(), updater, req, snapshot, 100, "en"); err != nil {
+	if err := replaceSiblingWithRegistryResult(context.Background(), updater, req, snapshot, 100,
+		cardtmpl.BuildEnv{WebLoginURL: "https://im.example.com/login", Lang: "en", SpaceID: "space-1"}); err != nil {
 		t.Fatalf("replaceSiblingWithRegistryResult: %v", err)
 	}
 	if updater.state != docsaccessrequest.StateRejected {
