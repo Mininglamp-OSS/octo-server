@@ -1,0 +1,35 @@
+{
+  "actions": [
+    {
+      "path": "$.body[4].items[0].actions[0]",
+      "type": "Action.Submit",
+      "id": "reasoning_retry",
+      "associatedInputs": "none",
+      "dataKeys": [
+        "action",
+        "effect",
+        "reasoning_id"
+      ],
+      "inputIds": []
+    },
+    {
+      "path": "$.body[4].items[0].actions[1]",
+      "type": "Action.ToggleVisibility",
+      "id": "reasoning_toggle"
+    }
+  ],
+  "inputs": [],
+  "toggles": [
+    {
+      "path": "$.body[4].items[0].actions[1]",
+      "targets": [
+        {
+          "elementId": "trace_panel"
+        },
+        {
+          "elementId": "collapsed_panel"
+        }
+      ]
+    }
+  ]
+}

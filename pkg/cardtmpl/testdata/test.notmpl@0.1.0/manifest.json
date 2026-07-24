@@ -1,0 +1,5 @@
+{
+  "schemaVersion": 2, "id": "test.notmpl", "version": "0.1.0",
+  "adaptiveCardVersion": "1.5", "dataSchema": "contract/data.schema.json",
+  "views": { "main": { "wireProfile": "octo/v1", "states": ["shown"] } }
+}

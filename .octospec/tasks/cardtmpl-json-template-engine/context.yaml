@@ -1,0 +1,11 @@
+injected:
+  - id: trust-boundary
+    source: repo
+    why: 引擎把调用方不可信 data 绑进 .template.json 叶子文本/URL；须在渲染边界转义（复用 escapeMarkdown/truncateRunes/AbsoluteHTTPSURL），模板作者文本可信不转义，data 代入值转义；结构限界 + URL 百分号编码；cardmsg.Validate 作 L0 兜底。
+  - id: error-handling
+    source: repo
+    why: 引擎返 typed error（ErrFieldsInvalid→400 零投递 / ErrRenderFailed→500 / ErrTemplateUnknown），由下游 caller 翻译；引擎本身不写 HTTP 响应，不直接碰 httperr（下游 send.go 才 httperr.ResponseErrorL）。
+  - id: testing
+    source: repo
+    why: TDD；纯 pkg/cardtmpl 单测不依赖 MySQL/Redis（Registry/Render 是内存态）；表驱动 + goldens 字节对照 + -race。
+brief: .octospec/tasks/cardtmpl-json-template-engine/brief.md
