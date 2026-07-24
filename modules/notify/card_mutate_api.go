@@ -47,6 +47,21 @@ func docsAccessCardVariant(envelope []byte) (variant string, isDocsAccess bool) 
 	return variant, strings.HasPrefix(variant, docsAccessVariantPrefix)
 }
 
+// docsAccessMutationDisposition protects retry idempotency after the first
+// successful mutation has removed the pending Submit actions. A repeated
+// decision for the same terminal state is already applied; the opposite state
+// is a conflict and must never overwrite a committed decision.
+func docsAccessMutationDisposition(variant, kind string) (alreadyApplied, conflict bool) {
+	switch variant {
+	case docsaccessrequest.VariantApproved:
+		return kind == DocsCardKindAccessGranted, kind == DocsCardKindAccessDenied
+	case docsaccessrequest.VariantRejected:
+		return kind == DocsCardKindAccessDenied, kind == DocsCardKindAccessGranted
+	default:
+		return false, false
+	}
+}
+
 // CardMutateReq is the access-decision card-sync request (task
 // docs-access-decision-card-sync). docs-backend calls this once per sibling
 // approver card after a decision commits, to drive that card to its terminal
@@ -144,6 +159,16 @@ func (n *Notify) mutateCard(c *wkhttp.Context) {
 			zap.String("space_id", req.SpaceID), zap.String("message_id", req.MessageID),
 			zap.String("variant", variant))
 		httperr.ResponseErrorL(c, errcode.ErrNotifyCardMutateForbidden, nil, nil)
+		return
+	}
+	if alreadyApplied, conflict := docsAccessMutationDisposition(variant, req.Kind); alreadyApplied {
+		c.Response(CardMutateResp{Mutated: true})
+		return
+	} else if conflict {
+		n.Warn("card mutate rejected: target already has opposite terminal state",
+			zap.String("space_id", req.SpaceID), zap.String("message_id", req.MessageID),
+			zap.String("variant", variant), zap.String("kind", req.Kind))
+		httperr.ResponseErrorL(c, errcode.ErrNotifyCardMutateFailed, nil, nil)
 		return
 	}
 
