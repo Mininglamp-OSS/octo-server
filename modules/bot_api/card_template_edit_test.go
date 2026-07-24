@@ -85,6 +85,48 @@ func TestBotMessageEditRegistryTemplateRendersSameIdentity(t *testing.T) {
 	}
 }
 
+func TestBotMessageEditRegistryTemplatePreservesAuthoritativeSpaceAcrossEdits(t *testing.T) {
+	t.Setenv(cardmsg.EnvEnabled, "true")
+	catalog, err := newBotCardTemplateCatalog(testBotTemplateRegistry(t), defaultBotTemplateRefs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	effective := initialRegistryEnvelope(t, catalog)
+	tests := []struct {
+		state     string
+		cardSeq   int64
+		transient bool
+	}{
+		{state: "answering", cardSeq: 2, transient: true},
+		{state: "completed", cardSeq: 3, transient: false},
+	}
+	for _, tc := range tests {
+		mutator := &fakeBotCardMutator{
+			snapshot:     carddispatch.CardMutationSnapshot{Envelope: effective, CardSeq: tc.cardSeq - 1},
+			mutateResult: carddispatch.CardMutationResult{Applied: true},
+		}
+		ba := &BotAPI{
+			Log: log.NewTLog("BotAPI-template-edit-space"), cardTemplates: catalog, cardMutator: mutator,
+		}
+		recorder := invokeTemplateEdit(t, ba,
+			registryEditBody(t, tc.state, testReasoningData(t, tc.state), tc.cardSeq, tc.transient))
+		if recorder.Code != http.StatusOK || len(mutator.mutateRequests) != 1 {
+			t.Fatalf("state=%s status=%d mutations=%d body=%s",
+				tc.state, recorder.Code, len(mutator.mutateRequests), recorder.Body.String())
+		}
+		contentEdit := mutator.mutateRequests[0].ContentEdit
+		var frame map[string]any
+		if err := json.Unmarshal([]byte(contentEdit), &frame); err != nil {
+			t.Fatalf("state=%s decode replacement: %v", tc.state, err)
+		}
+		if got := frame["space_id"]; got != cardtmplBuildEnvForTest().SpaceID {
+			t.Fatalf("state=%s space_id=%v, want authoritative %q",
+				tc.state, got, cardtmplBuildEnvForTest().SpaceID)
+		}
+		effective = []byte(contentEdit)
+	}
+}
+
 func TestBotMessageEditRegistryTemplateRejectsUnlistedRefBeforeTargetLookup(t *testing.T) {
 	t.Setenv(cardmsg.EnvEnabled, "true")
 	catalog, err := newBotCardTemplateCatalog(testBotTemplateRegistry(t), defaultBotTemplateRefs())
@@ -349,6 +391,7 @@ func initialRegistryEnvelope(t *testing.T, catalog *botCardTemplateCatalog) []by
 	if err != nil {
 		t.Fatal(err)
 	}
+	payload["space_id"] = cardtmplBuildEnvForTest().SpaceID
 	payload["card_seq"] = int64(1)
 	if err := cardmsg.Finalize(payload); err != nil {
 		t.Fatal(err)
