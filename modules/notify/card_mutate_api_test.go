@@ -53,6 +53,45 @@ func TestDocsAccessCardVariant(t *testing.T) {
 	}
 }
 
+func TestDocsAccessMutationDisposition(t *testing.T) {
+	tests := []struct {
+		name         string
+		variant      string
+		kind         string
+		wantApplied  bool
+		wantConflict bool
+	}{
+		{
+			name: "pending approval", variant: "docs.access_requested", kind: DocsCardKindAccessGranted,
+		},
+		{
+			name: "approved retry", variant: "docs.access_approved", kind: DocsCardKindAccessGranted,
+			wantApplied: true,
+		},
+		{
+			name: "denied retry", variant: "docs.access_denied", kind: DocsCardKindAccessDenied,
+			wantApplied: true,
+		},
+		{
+			name: "approved cannot become denied", variant: "docs.access_approved", kind: DocsCardKindAccessDenied,
+			wantConflict: true,
+		},
+		{
+			name: "denied cannot become approved", variant: "docs.access_denied", kind: DocsCardKindAccessGranted,
+			wantConflict: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			applied, conflict := docsAccessMutationDisposition(tt.variant, tt.kind)
+			if applied != tt.wantApplied || conflict != tt.wantConflict {
+				t.Fatalf("disposition = applied:%v conflict:%v, want applied:%v conflict:%v",
+					applied, conflict, tt.wantApplied, tt.wantConflict)
+			}
+		})
+	}
+}
+
 func TestReplaceSiblingWithRegistryResultUsesV3AndStoredContext(t *testing.T) {
 	updater := &captureViewUpdater{}
 	snapshot := carddispatch.CardMutationSnapshot{Envelope: json.RawMessage(`{
