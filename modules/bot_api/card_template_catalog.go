@@ -196,12 +196,9 @@ func (c *botCardTemplateCatalog) RenderPayload(
 	if _, hasCard := inbound["card"]; hasCard {
 		return nil, fmt.Errorf("%w: raw card and template_ref are mutually exclusive", errBotTemplateRequestInvalid)
 	}
-	ref, err := parseBotTemplateRef(inbound["template_ref"])
+	ref, err := c.requireAllowedRef(inbound["template_ref"])
 	if err != nil {
 		return nil, err
-	}
-	if _, ok := c.allowed[ref]; !ok {
-		return nil, fmt.Errorf("%w: template is not Bot-callable", errBotTemplateRequestInvalid)
 	}
 	state, ok := inbound["state"].(string)
 	if !ok || state == "" || state != strings.TrimSpace(state) {
@@ -240,6 +237,23 @@ func (c *botCardTemplateCatalog) RenderPayload(
 		}
 	}
 	return rendered, nil
+}
+
+// requireAllowedRef is the single Bot catalog authorization boundary for a
+// caller-supplied template_ref. Call it before any target lookup so an unlisted
+// ref cannot use edit responses as a message existence or ownership oracle.
+func (c *botCardTemplateCatalog) requireAllowedRef(value any) (botTemplateRef, error) {
+	if c == nil || c.registry == nil {
+		return botTemplateRef{}, errBotTemplateCatalogUnavailable
+	}
+	ref, err := parseBotTemplateRef(value)
+	if err != nil {
+		return botTemplateRef{}, err
+	}
+	if _, ok := c.allowed[ref]; !ok {
+		return botTemplateRef{}, fmt.Errorf("%w: template is not Bot-callable", errBotTemplateRequestInvalid)
+	}
+	return ref, nil
 }
 
 func parseBotTemplateRef(value any) (botTemplateRef, error) {

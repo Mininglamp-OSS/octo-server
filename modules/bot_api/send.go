@@ -1166,10 +1166,15 @@ func (ba *BotAPI) botMessageEditViaRegistry(c *wkhttp.Context, req *botMessageEd
 		httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
 		return
 	}
-	ref, err := parseBotTemplateRef(req.TemplateRef)
+	ref, err := ba.cardTemplates.requireAllowedRef(req.TemplateRef)
 	if err != nil {
-		ba.Warn("Bot Registry edit template_ref 非法", zap.Error(err), zap.String("messageID", req.MessageID))
-		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+		if errors.Is(err, errBotTemplateRequestInvalid) {
+			ba.Warn("Bot Registry edit template_ref 非法或未开放", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return
+		}
+		ba.Error("Bot Registry edit catalog 不可用", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
 		return
 	}
 
