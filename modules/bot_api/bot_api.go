@@ -138,6 +138,22 @@ type BotAPI struct {
 	// full user-service stack.
 	// nil in production → the real userService.IsFriend runs.
 	friendCheckOverride func(uid, toUID string) (bool, error)
+	// groupStatusQueryOverride lets focused permission tests inject the
+	// group.status lookup without a live MySQL session. Production preserves the
+	// raw lookup error so errors.Is(dbr.ErrNotFound) remains available upstream.
+	groupStatusQueryOverride func(groupNo string) (int, error)
+	// spaceMemberQueryOverride lets focused App Bot permission tests exercise a
+	// failed Space membership lookup without a live MySQL session. The helper
+	// returns the error without logging identifiers; the permission observer owns
+	// the single desensitized terminal log.
+	spaceMemberQueryOverride func(uid, spaceID string) (bool, error)
+	// groupMemberCountOverride lets focused permission tests distinguish an
+	// empty active membership from a query failure without a live MySQL session.
+	groupMemberCountOverride func(groupNo, robotID string) (int, error)
+	// sendPermissionMetrics records terminal permission-check failures with
+	// bounded stage/reason labels. Struct-literal tests may leave it nil and use
+	// the package default registered once at startup.
+	sendPermissionMetrics *botSendPermissionMetrics
 	// searchHandler 是共享的消息搜索 Handler（messages_search.Shared），bot 搜索路由
 	// /v1/bot/messages/_search* 复用它（YUJ-49 / #B）。与 web、uk 入口共用同一实例，
 	// 从而共享限流桶与 sender 缓存。principal 由本模块的 resolveSearchPrincipal 按
@@ -203,6 +219,7 @@ func NewBotAPI(ctx *config.Context) *BotAPI {
 		maxVoiceContextLength: maxCtxLen,
 		maxBodySize:           maxBodySize,
 		maxFileSize:           maxFileSize,
+		sendPermissionMetrics: defaultBotSendPermissionMetrics,
 		searchHandler:         messages_search.Shared(ctx),
 		Log:                   log.NewTLog("BotAPI"),
 	}

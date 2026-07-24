@@ -18,8 +18,10 @@ import (
 
 // httperrL / httperrLWS are terse shims for the two ResponseErrorL call shapes
 // (D14 fixed-400 vs status-preserving) exercised by the direct-code cases.
-func httperrL(c *wkhttp.Context, code codes.Code)   { httperr.ResponseErrorL(c, code, nil, nil) }
-func httperrLWS(c *wkhttp.Context, code codes.Code) { httperr.ResponseErrorLWithStatus(c, code, nil, nil) }
+func httperrL(c *wkhttp.Context, code codes.Code) { httperr.ResponseErrorL(c, code, nil, nil) }
+func httperrLWS(c *wkhttp.Context, code codes.Code) {
+	httperr.ResponseErrorLWithStatus(c, code, nil, nil)
+}
 
 // TestBotAPINoLegacyResponseError pins the Phase 2.1 contract that every
 // migrated modules/bot_api handler renders through the i18n envelope and never
@@ -362,6 +364,14 @@ func TestRespondBotAPIHelpers(t *testing.T) {
 			wantTransStatus: http.StatusBadRequest,
 			wantContains:    "请求参数有误",
 			wantDetails:     map[string]any{"field": "channel_id"},
+		},
+		{
+			name:            "respondSendPermissionError maps missing group → 404 group_not_found",
+			probe:           func(c *wkhttp.Context) { respondSendPermissionError(c, errBotSendPermGroupNotFound) },
+			wantCodeID:      "err.server.bot_api.group_not_found",
+			wantSemStatus:   http.StatusNotFound,
+			wantTransStatus: http.StatusBadRequest,
+			wantContains:    "群组不存在",
 		},
 		{
 			name:            "respondSendPermissionError maps infra failure → 500 query_failed no leak",
