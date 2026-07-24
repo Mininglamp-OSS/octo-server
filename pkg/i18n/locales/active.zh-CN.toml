@@ -48,6 +48,15 @@ other = "空间欢迎语配置无效，请检查目标空间是否存在且未�
 ["err.server.notify.card_invalid"]
 other = "卡片通知请求无效。"
 
+["err.server.notify.card_mutate_invalid"]
+other = "卡片更新请求无效。"
+
+["err.server.notify.card_mutate_failed"]
+other = "卡片更新失败。"
+
+["err.server.notify.card_mutate_forbidden"]
+other = "该卡片不允许被此接口更新。"
+
 ["err.server.thread.group_no_invalid"]
 other = "群编号无效。"
 

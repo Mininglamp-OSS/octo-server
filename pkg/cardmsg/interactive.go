@@ -45,6 +45,27 @@ func CardTemplateContext(envelopeRaw []byte) (TemplateContext, bool) {
 	return ctx, true
 }
 
+// CardVariant extracts card.metadata.octo.variant from a type-17 envelope. The
+// variant is the authoritative card-family discriminator authored server-side
+// (e.g. "docs.access_requested", "docs.access_granted"), so a caller can gate a
+// mutation on the target card's own family even when the sender bot is shared
+// across producers. Returns ("", false) when absent, blank, malformed, or the
+// payload is not a card.
+func CardVariant(envelopeRaw []byte) (string, bool) {
+	payload, err := decodeEnvelope(string(envelopeRaw))
+	if err != nil || !IsCardPayload(payload) {
+		return "", false
+	}
+	card, _ := payload["card"].(map[string]interface{})
+	metadata, _ := card["metadata"].(map[string]interface{})
+	octo, _ := metadata["octo"].(map[string]interface{})
+	variant, _ := octo["variant"].(string)
+	if strings.TrimSpace(variant) == "" {
+		return "", false
+	}
+	return variant, true
+}
+
 // HasCardTemplateMetadata distinguishes a truly legacy card from a card that
 // declares protocol/template metadata but cannot produce a complete trusted
 // TemplateContext. Callers use this to fail closed on partial/corrupt identity.

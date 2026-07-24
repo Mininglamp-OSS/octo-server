@@ -600,6 +600,15 @@ other = "Invalid search request."
 ["err.server.notify.card_invalid"]
 other = "The card notification request is invalid."
 
+["err.server.notify.card_mutate_failed"]
+other = "The card could not be mutated."
+
+["err.server.notify.card_mutate_forbidden"]
+other = "The target card cannot be mutated by this capability."
+
+["err.server.notify.card_mutate_invalid"]
+other = "The card mutation request is invalid."
+
 ["err.server.notify.card_not_allowed"]
 other = "Card payloads are not allowed on the internal notification endpoint."
 

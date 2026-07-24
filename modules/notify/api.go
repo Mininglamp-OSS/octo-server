@@ -181,6 +181,7 @@ func (n *Notify) Route(r *wkhttp.WKHttp) {
 	{
 		internal.POST("/notify", n.sendNotify)
 		internal.POST("/notify/batch", n.sendNotifyBatch)
+		internal.POST("/cards/mutate", n.mutateCard)
 	}
 }
 

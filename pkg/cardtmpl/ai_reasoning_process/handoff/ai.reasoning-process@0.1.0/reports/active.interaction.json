@@ -1,0 +1,22 @@
+{
+  "actions": [
+    {
+      "id": "reasoning_stop",
+      "type": "Action.Submit",
+      "associatedInputs": "none",
+      "dataKeys": [
+        "action",
+        "effect",
+        "reasoning_id",
+        "owner",
+        "action_type"
+      ],
+      "inputIds": []
+    },
+    {
+      "id": "reasoning_toggle",
+      "type": "Action.ToggleVisibility"
+    }
+  ],
+  "inputs": []
+}

@@ -1,0 +1,525 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "type": "AdaptiveCard",
+  "version": "1.5",
+  "body": [
+    {
+      "type": "Container",
+      "id": "octo-surface-accent-header-reasoning-active",
+      "style": "accent",
+      "bleed": true,
+      "spacing": "None",
+      "items": [
+        {
+          "type": "ColumnSet",
+          "spacing": "None",
+          "columns": [
+            {
+              "type": "Column",
+              "width": "stretch",
+              "verticalContentAlignment": "Center",
+              "items": [
+                {
+                  "type": "TextBlock",
+                  "text": "✦  已深度思考",
+                  "color": "Accent",
+                  "weight": "Bolder",
+                  "wrap": true,
+                  "spacing": "None"
+                },
+                {
+                  "type": "TextBlock",
+                  "text": "正在深度思考…",
+                  "size": "Small",
+                  "isSubtle": true,
+                  "wrap": true,
+                  "spacing": "Small"
+                }
+              ]
+            },
+            {
+              "type": "Column",
+              "width": "auto",
+              "verticalContentAlignment": "Center",
+              "items": [
+                {
+                  "type": "TextBlock",
+                  "id": "octo-badge-reasoning-active-status",
+                  "text": "思考中",
+                  "color": "Accent",
+                  "weight": "Bolder",
+                  "size": "Small",
+                  "wrap": true,
+                  "spacing": "None"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "Container",
+      "id": "trace_panel",
+      "isVisible": true,
+      "spacing": "Large",
+      "items": [
+        {
+          "type": "Container",
+          "spacing": "None",
+          "separator": false,
+          "items": [
+            {
+              "type": "TextBlock",
+              "text": "先把渠道 B 转化下降的范围圈出来：拆成线索、试用激活、付费三段漏斗，取近 90 天数据。",
+              "size": "Small",
+              "wrap": true,
+              "spacing": "None"
+            },
+            {
+              "type": "Container",
+              "style": "emphasis",
+              "spacing": "Small",
+              "items": [
+                {
+                  "type": "ColumnSet",
+                  "spacing": "None",
+                  "columns": [
+                    {
+                      "type": "Column",
+                      "width": "auto",
+                      "verticalContentAlignment": "Center",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "●",
+                          "color": "Good",
+                          "size": "Small",
+                          "spacing": "None"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "Column",
+                      "width": "auto",
+                      "verticalContentAlignment": "Center",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "query_metrics",
+                          "weight": "Bolder",
+                          "size": "Small",
+                          "wrap": true,
+                          "spacing": "None"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "Column",
+                      "width": "stretch",
+                      "verticalContentAlignment": "Center",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "channel=B · range=90d · group=stage",
+                          "isSubtle": true,
+                          "size": "Small",
+                          "wrap": true,
+                          "spacing": "None"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "ColumnSet",
+                  "spacing": "Small",
+                  "columns": [
+                    {
+                      "type": "Column",
+                      "width": "auto",
+                      "verticalContentAlignment": "Center",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "●",
+                          "color": "Good",
+                          "size": "Small",
+                          "spacing": "None"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "Column",
+                      "width": "auto",
+                      "verticalContentAlignment": "Center",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "read_file",
+                          "weight": "Bolder",
+                          "size": "Small",
+                          "wrap": true,
+                          "spacing": "None"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "Column",
+                      "width": "stretch",
+                      "verticalContentAlignment": "Center",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "~/analytics/funnel_definition.sql · ×2",
+                          "isSubtle": true,
+                          "size": "Small",
+                          "wrap": true,
+                          "spacing": "None"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "ColumnSet",
+                  "spacing": "Small",
+                  "columns": [
+                    {
+                      "type": "Column",
+                      "width": "auto",
+                      "verticalContentAlignment": "Center",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "●",
+                          "color": "Good",
+                          "size": "Small",
+                          "spacing": "None"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "Column",
+                      "width": "auto",
+                      "verticalContentAlignment": "Center",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "run_sql",
+                          "weight": "Bolder",
+                          "size": "Small",
+                          "wrap": true,
+                          "spacing": "None"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "Column",
+                      "width": "stretch",
+                      "verticalContentAlignment": "Center",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "按漏斗阶段汇总数量与转化率",
+                          "isSubtle": true,
+                          "size": "Small",
+                          "wrap": true,
+                          "spacing": "None"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "Container",
+          "spacing": "Large",
+          "separator": true,
+          "items": [
+            {
+              "type": "TextBlock",
+              "text": "口径正常，但激活率掉得比线索量快；继续拉行业标签、客服工单和 NPS 交叉验证。",
+              "size": "Small",
+              "wrap": true,
+              "spacing": "None"
+            },
+            {
+              "type": "Container",
+              "style": "emphasis",
+              "spacing": "Small",
+              "items": [
+                {
+                  "type": "ColumnSet",
+                  "spacing": "None",
+                  "columns": [
+                    {
+                      "type": "Column",
+                      "width": "auto",
+                      "verticalContentAlignment": "Center",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "●",
+                          "color": "Good",
+                          "size": "Small",
+                          "spacing": "None"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "Column",
+                      "width": "auto",
+                      "verticalContentAlignment": "Center",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "query_metrics",
+                          "weight": "Bolder",
+                          "size": "Small",
+                          "wrap": true,
+                          "spacing": "None"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "Column",
+                      "width": "stretch",
+                      "verticalContentAlignment": "Center",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "channel=B · dims=industry · metric=activation_rate",
+                          "isSubtle": true,
+                          "size": "Small",
+                          "wrap": true,
+                          "spacing": "None"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "ColumnSet",
+                  "spacing": "Small",
+                  "columns": [
+                    {
+                      "type": "Column",
+                      "width": "auto",
+                      "verticalContentAlignment": "Center",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "●",
+                          "color": "Good",
+                          "size": "Small",
+                          "spacing": "None"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "Column",
+                      "width": "auto",
+                      "verticalContentAlignment": "Center",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "search_tickets",
+                          "weight": "Bolder",
+                          "size": "Small",
+                          "wrap": true,
+                          "spacing": "None"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "Column",
+                      "width": "stretch",
+                      "verticalContentAlignment": "Center",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "渠道 B · 试用 / 激活失败 · 近 60 天",
+                          "isSubtle": true,
+                          "size": "Small",
+                          "wrap": true,
+                          "spacing": "None"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "ColumnSet",
+                  "spacing": "Small",
+                  "columns": [
+                    {
+                      "type": "Column",
+                      "width": "auto",
+                      "verticalContentAlignment": "Center",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "●",
+                          "color": "Good",
+                          "size": "Small",
+                          "spacing": "None"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "Column",
+                      "width": "auto",
+                      "verticalContentAlignment": "Center",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "read_file",
+                          "weight": "Bolder",
+                          "size": "Small",
+                          "wrap": true,
+                          "spacing": "None"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "Column",
+                      "width": "stretch",
+                      "verticalContentAlignment": "Center",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "~/nps/2026Q2_channelB.csv",
+                          "isSubtle": true,
+                          "size": "Small",
+                          "wrap": true,
+                          "spacing": "None"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "ColumnSet",
+                  "spacing": "Small",
+                  "columns": [
+                    {
+                      "type": "Column",
+                      "width": "auto",
+                      "verticalContentAlignment": "Center",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "●",
+                          "color": "Accent",
+                          "size": "Small",
+                          "spacing": "None"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "Column",
+                      "width": "auto",
+                      "verticalContentAlignment": "Center",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "query_metrics",
+                          "weight": "Bolder",
+                          "size": "Small",
+                          "wrap": true,
+                          "spacing": "None"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "Column",
+                      "width": "stretch",
+                      "verticalContentAlignment": "Center",
+                      "items": [
+                        {
+                          "type": "TextBlock",
+                          "text": "正在叠加季节性校正…",
+                          "isSubtle": true,
+                          "size": "Small",
+                          "wrap": true,
+                          "spacing": "None"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "TextBlock",
+          "text": "◌  正在执行下一步…",
+          "color": "Accent",
+          "size": "Small",
+          "wrap": true,
+          "spacing": "Large"
+        }
+      ]
+    },
+    {
+      "type": "Container",
+      "id": "collapsed_panel",
+      "isVisible": false,
+      "spacing": "Medium",
+      "items": [
+        {
+          "type": "TextBlock",
+          "text": "✓  推理仍在进行 · 点击可查看当前过程",
+          "size": "Small",
+          "isSubtle": true,
+          "wrap": true,
+          "spacing": "None"
+        }
+      ]
+    },
+    {
+      "type": "Container",
+      "id": "octo-surface-default-footer-reasoning-active",
+      "style": "emphasis",
+      "bleed": true,
+      "separator": true,
+      "spacing": "Large",
+      "items": [
+        {
+          "type": "ActionSet",
+          "horizontalAlignment": "Right",
+          "actions": [
+            {
+              "type": "Action.Submit",
+              "id": "reasoning_stop",
+              "title": "停止",
+              "style": "destructive",
+              "associatedInputs": "none",
+              "data": {
+                "action": "reasoning_stop",
+                "effect": "stop_reasoning",
+                "reasoning_id": "reasoning-channel-b-001",
+                "owner": "ai",
+                "action_type": "reasoning.control"
+              }
+            },
+            {
+              "type": "Action.ToggleVisibility",
+              "id": "reasoning_toggle",
+              "title": "显示 / 隐藏推理",
+              "targetElements": [
+                "trace_panel",
+                "collapsed_panel"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
