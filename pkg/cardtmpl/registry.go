@@ -587,7 +587,7 @@ func walkSubmitActions(value any, path string, visit func(string, map[string]any
 				return err
 			}
 		}
-		for _, key := range []string{"body", "actions", "items", "columns", "rows", "cells", "selectAction"} {
+		for _, key := range []string{"body", "actions", "items", "columns", "rows", "cells", "selectAction", "inlineAction"} {
 			if child, ok := node[key]; ok {
 				if err := walkSubmitActions(child, path+"."+key, visit); err != nil {
 					return err

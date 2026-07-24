@@ -80,7 +80,7 @@ func walkInteractionNodes(value any, actions, inputs map[string]map[string]any) 
 				inputs[id] = node
 			}
 		}
-		for _, key := range []string{"body", "actions", "items", "columns", "rows", "cells", "selectAction"} {
+		for _, key := range []string{"body", "actions", "items", "columns", "rows", "cells", "selectAction", "inlineAction"} {
 			if child, ok := node[key]; ok {
 				walkInteractionNodes(child, actions, inputs)
 			}
