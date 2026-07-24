@@ -18,8 +18,10 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardrevision"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
 	"github.com/Mininglamp-OSS/octo-server/pkg/richtext"
 	"github.com/go-sql-driver/mysql"
@@ -89,12 +91,20 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 		return
 	}
 
+	_, templateMode := req.Payload["template_ref"]
+	cardIntent := cardmsg.IsCardPayload(req.Payload) || templateMode
+	if templateMode && !cardmsg.IsCardPayload(req.Payload) {
+		ba.Warn("Bot Registry 卡片请求 type 非 17", zap.String("channelID", req.ChannelID))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+		return
+	}
+
 	// card-message-protocol P1：InteractiveCard(=17) 入站 gate。排序在
 	// checkSendPermission / checkOBO 之前：(a) Decision 2b 要求 OBO 卡片按
 	// 「请求意图」拦截、先于 grant 校验，且覆盖 grantorReplyBypass 子路径
 	// （该子路径 fromUID 仍是 bot —— 拒绝是刻意的过度拒绝，P2 复议）；
 	// (b) 脏卡片 fail-fast，鉴权路径不跑在毒输入上（与上方 OBO 保留键同序）。
-	if cardmsg.IsCardPayload(req.Payload) {
+	if cardIntent {
 		if !cardmsg.BotEnabled() {
 			// bot 侧有效门禁：总开关 OCTO_CARD_MESSAGE_ENABLED（Decision 2 rollout
 			// gate）AND bot 子开关 OCTO_BOT_CARD_ENABLED。与 /v1/bot/card/profile 的
@@ -106,10 +116,21 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 			httperr.ResponseErrorL(c, errcode.ErrBotAPICardOBOForbidden, nil, nil)
 			return
 		}
-		if err := cardmsg.Validate(req.Payload); err != nil {
-			ba.Warn("InteractiveCard payload 校验失败", zap.Error(err), zap.String("channelID", req.ChannelID))
-			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
-			return
+		if templateMode {
+			// Model A 与 Model B 是 total XOR。完整 Registry 字段校验和 schema
+			// render 在授权完成后执行；这里先拒绝最明显的双模式请求，避免让脏
+			// raw card 进入权限/Space 查询路径。
+			if _, hasRawCard := req.Payload["card"]; hasRawCard {
+				ba.Warn("Bot 卡片 raw/Registry 双模式同时出现", zap.String("channelID", req.ChannelID))
+				httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+				return
+			}
+		} else {
+			if err := cardmsg.Validate(req.Payload); err != nil {
+				ba.Warn("InteractiveCard payload 校验失败", zap.Error(err), zap.String("channelID", req.ChannelID))
+				httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+				return
+			}
 		}
 	}
 
@@ -215,7 +236,40 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 	// 理由：grant 仅授权身份替换，不应改变租户隔离边界 — bot 的 Space 归属
 	// 是部署时确定的，与 grantor 的 Space 归属解耦。
 	payload := req.Payload
-	if req.ChannelType == common.ChannelTypePerson.Uint8() {
+	if templateMode {
+		if ba.cardTemplates == nil {
+			ba.Error("Bot Registry 模板 catalog 未注入", zap.String("channelID", channelID))
+			httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+			return
+		}
+		spaceID := ""
+		if req.ChannelType == common.ChannelTypePerson.Uint8() {
+			spaceID = ba.resolveBotActiveSpaceID(c, robotID)
+		}
+		webLoginURL := ""
+		if ba.ctx != nil && ba.ctx.GetConfig() != nil {
+			webLoginURL = ba.ctx.GetConfig().External.WebLoginURL
+		}
+		rendered, renderErr := ba.cardTemplates.RenderPayload(c.Request.Context(), req.Payload, cardtmpl.BuildEnv{
+			WebLoginURL: webLoginURL,
+			Lang:        i18n.OutboundLanguage(c.Request.Context()),
+			SpaceID:     spaceID,
+		})
+		if renderErr != nil {
+			if errors.Is(renderErr, errBotTemplateRequestInvalid) {
+				ba.Warn("Bot Registry 模板请求非法", zap.Error(renderErr), zap.String("channelID", channelID))
+				httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+				return
+			}
+			ba.Error("Bot Registry 模板渲染失败", zap.Error(renderErr), zap.String("channelID", channelID))
+			httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+			return
+		}
+		payload = rendered
+		if req.ChannelType == common.ChannelTypePerson.Uint8() {
+			payload = ba.enrichBotPayloadWithResolvedSpaceID(robotID, payload, spaceID)
+		}
+	} else if req.ChannelType == common.ChannelTypePerson.Uint8() {
 		payload = ba.enrichBotPayloadWithSpaceID(c, robotID, payload)
 	}
 
@@ -725,16 +779,43 @@ func (ba *BotAPI) readReceipt(c *wkhttp.Context) {
 
 // ==================== Message Edit ====================
 
+type botMessageEditReq struct {
+	MessageID   string         `json:"message_id"`
+	MessageSeq  uint32         `json:"message_seq"`
+	ChannelID   string         `json:"channel_id"`
+	ChannelType uint8          `json:"channel_type"`
+	ContentEdit string         `json:"content_edit"`
+	TemplateRef map[string]any `json:"template_ref"`
+	State       string         `json:"state"`
+	Data        map[string]any `json:"data"`
+	CardSeq     int64          `json:"card_seq"`
+	Transient   bool           `json:"transient"`
+	// Presence is tracked separately from decoded values so the raw/Registry
+	// XOR cannot be bypassed with content_edit:"" or template_ref:null.
+	contentEditSet bool
+	templateRefSet bool
+}
+
+func (r *botMessageEditReq) UnmarshalJSON(data []byte) error {
+	type wire botMessageEditReq
+	var decoded wire
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*r = botMessageEditReq(decoded)
+	_, r.contentEditSet = fields["content_edit"]
+	_, r.templateRefSet = fields["template_ref"]
+	return nil
+}
+
 // botMessageEdit handles POST /v1/bot/message/edit.
 func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, cardmsg.MaxSendBodyBytes)
-	var req struct {
-		MessageID   string `json:"message_id"`
-		MessageSeq  uint32 `json:"message_seq"`
-		ChannelID   string `json:"channel_id"`
-		ChannelType uint8  `json:"channel_type"`
-		ContentEdit string `json:"content_edit"`
-	}
+	var req botMessageEditReq
 	if err := c.BindJSON(&req); err != nil {
 		respondBotAPIRequestInvalid(c, "")
 		return
@@ -747,8 +828,22 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 		respondBotAPIRequestInvalid(c, "channel_id")
 		return
 	}
-	if strings.TrimSpace(req.ContentEdit) == "" {
+	rawMode := req.contentEditSet
+	templateMode := req.templateRefSet
+	if rawMode && templateMode {
+		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+		return
+	}
+	if !rawMode && !templateMode {
 		respondBotAPIRequestInvalid(c, "content_edit")
+		return
+	}
+	if rawMode && strings.TrimSpace(req.ContentEdit) == "" {
+		respondBotAPIRequestInvalid(c, "content_edit")
+		return
+	}
+	if templateMode && (strings.TrimSpace(req.State) == "" || req.Data == nil || req.CardSeq <= 0) {
+		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
 		return
 	}
 
@@ -785,6 +880,11 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 			httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIGroupDisbanded, nil, nil)
 			return
 		}
+	}
+
+	if templateMode {
+		ba.botMessageEditViaRegistry(c, &req, robotID)
+		return
 	}
 
 	// Permission: bot can only edit its own messages
@@ -880,6 +980,11 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 	// richtext（=14）原有路径。user/robot 编辑路径对卡片仍永久拒绝（各自守卫）。
 	origIsCard := cardmsg.IsCardRawPayload(msgPayload)
 	editIsCard := cardmsg.IsCardContentEdit(req.ContentEdit)
+	if origIsCard && cardEnvelopeHasTemplateRef(msgPayload) {
+		ba.Warn("raw card edit attempted to replace Registry-authored target", zap.String("messageID", req.MessageID))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+		return
+	}
 	if origIsCard != editIsCard {
 		ba.Warn("卡片编辑跨类型变异,拒绝", zap.String("messageID", req.MessageID),
 			zap.Bool("origIsCard", origIsCard), zap.Bool("editIsCard", editIsCard))
@@ -899,6 +1004,11 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 		// 之前 fail-fast。
 		if !cardmsg.BotEnabled() {
 			httperr.ResponseErrorL(c, errcode.ErrBotAPICardDisabled, nil, nil)
+			return
+		}
+		if contentEditHasTemplateRef(req.ContentEdit) {
+			ba.Warn("raw card edit attempted to forge Registry provenance", zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
 			return
 		}
 		// P2（PR#548 review）：撤回/删除门禁 —— 已撤回或全局删除的卡片不可再编辑,
@@ -1039,6 +1149,177 @@ func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
 	}
 
 	c.ResponseOK()
+}
+
+// botMessageEditViaRegistry compiles one complete replacement frame and hands
+// it to the same CardMutator used by first-party card updates. The mutator owns
+// the second authoritative lookup plus ownership/lifecycle/CAS/revision/CMD
+// checks; Snapshot is used only to pin the effective stored template identity
+// before rendering.
+func (ba *BotAPI) botMessageEditViaRegistry(c *wkhttp.Context, req *botMessageEditReq, robotID string) {
+	if !cardmsg.BotEnabled() {
+		httperr.ResponseErrorL(c, errcode.ErrBotAPICardDisabled, nil, nil)
+		return
+	}
+	if ba.cardTemplates == nil || ba.cardMutator == nil {
+		ba.Error("Bot Registry edit wiring unavailable", zap.String("messageID", req.MessageID))
+		httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+		return
+	}
+	ref, err := ba.cardTemplates.requireAllowedRef(req.TemplateRef)
+	if err != nil {
+		if errors.Is(err, errBotTemplateRequestInvalid) {
+			ba.Warn("Bot Registry edit template_ref 非法或未开放", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return
+		}
+		ba.Error("Bot Registry edit catalog 不可用", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+		return
+	}
+
+	snapshot, err := ba.cardMutator.Snapshot(c.Request.Context(), carddispatch.CardMutationTarget{
+		SenderUID: robotID, MessageID: req.MessageID, MessageSeq: req.MessageSeq,
+		ChannelID: req.ChannelID, ChannelType: req.ChannelType,
+	})
+	if err != nil {
+		ba.respondBotTemplateSnapshotError(c, req.MessageID, err)
+		return
+	}
+	if err := requireEffectiveCardTemplate(snapshot.Envelope, ref); err != nil {
+		ba.Warn("Bot Registry edit 目标模板不匹配", zap.Error(err), zap.String("messageID", req.MessageID))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+		return
+	}
+
+	// Preserve the existing App Bot edit contract after target ownership is
+	// established: App Bots remain DM-only and the peer must be a friend.
+	if getBotKindFromContext(c) == BotKindApp {
+		if req.ChannelType != common.ChannelTypePerson.Uint8() {
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIAppBotDMOnly, nil, nil)
+			return
+		}
+		isFriend, friendErr := ba.userService.IsFriend(robotID, req.ChannelID)
+		if friendErr != nil {
+			ba.Error("verify app bot friend failed", zap.Error(friendErr), zap.String("robotID", robotID), zap.String("channelID", req.ChannelID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+			return
+		}
+		if !isFriend {
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIConversationNotStarted, nil, nil)
+			return
+		}
+	}
+
+	webLoginURL := ""
+	if ba.ctx != nil && ba.ctx.GetConfig() != nil {
+		webLoginURL = ba.ctx.GetConfig().External.WebLoginURL
+	}
+	spaceID := effectiveEnvelopeSpaceID(snapshot.Envelope)
+	rendered, err := ba.cardTemplates.RenderPayload(c.Request.Context(), map[string]any{
+		"type":         cardmsg.InteractiveCard.Int(),
+		"template_ref": req.TemplateRef,
+		"state":        req.State,
+		"data":         req.Data,
+	}, cardtmpl.BuildEnv{
+		WebLoginURL: webLoginURL,
+		Lang:        i18n.OutboundLanguage(c.Request.Context()),
+		SpaceID:     spaceID,
+	})
+	if err != nil {
+		if errors.Is(err, errBotTemplateRequestInvalid) {
+			ba.Warn("Bot Registry edit 模板请求非法", zap.Error(err), zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return
+		}
+		ba.Error("Bot Registry edit 模板渲染失败", zap.Error(err), zap.String("messageID", req.MessageID))
+		httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+		return
+	}
+	// Registry.Render owns card content but intentionally does not emit the
+	// envelope-level Space identity. Preserve only the server-authored value
+	// pinned by Snapshot; never re-resolve from the bot's current Space or accept
+	// a caller-supplied value, either of which could move an existing DM card
+	// across tenant views. Delete first so an empty authoritative value remains
+	// fail-closed even if a future renderer starts returning a space_id field.
+	delete(rendered, "space_id")
+	if spaceID != "" {
+		rendered["space_id"] = spaceID
+	}
+	rendered["card_seq"] = req.CardSeq
+	if req.Transient {
+		rendered["transient"] = true
+	}
+	raw, err := json.Marshal(rendered)
+	if err != nil {
+		ba.Error("Bot Registry edit marshal 失败", zap.Error(err), zap.String("messageID", req.MessageID))
+		httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+		return
+	}
+	contentEdit, err := cardmsg.NormalizeContentEdit(string(raw))
+	if err != nil {
+		ba.Error("Bot Registry edit normalize 失败", zap.Error(err), zap.String("messageID", req.MessageID))
+		httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+		return
+	}
+
+	_, err = ba.cardMutator.Mutate(c.Request.Context(), carddispatch.CardMutationRequest{
+		SenderUID: robotID, MessageID: req.MessageID, MessageSeq: req.MessageSeq,
+		ChannelID: req.ChannelID, ChannelType: req.ChannelType, ContentEdit: contentEdit,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, carddispatch.ErrCardMutationConflict):
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardSeqConflict, nil, nil)
+		case errors.Is(err, carddispatch.ErrCardMutationForbidden):
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIMessageEditForbidden, nil, nil)
+		case errors.Is(err, carddispatch.ErrCardMutationNotFound):
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIMessageNotFound, nil, nil)
+		case errors.Is(err, carddispatch.ErrCardMutationInvalid):
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+		default:
+			ba.Error("Bot Registry edit mutation 失败", zap.Error(err), zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
+		}
+		return
+	}
+	c.ResponseOK()
+}
+
+func (ba *BotAPI) respondBotTemplateSnapshotError(c *wkhttp.Context, messageID string, err error) {
+	switch {
+	case errors.Is(err, carddispatch.ErrCardMutationForbidden):
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIMessageEditForbidden, nil, nil)
+	case errors.Is(err, carddispatch.ErrCardMutationNotFound):
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIMessageNotFound, nil, nil)
+	case errors.Is(err, carddispatch.ErrCardMutationInvalid):
+		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+	default:
+		ba.Error("Bot Registry edit snapshot 失败", zap.Error(err), zap.String("messageID", messageID))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+	}
+}
+
+func effectiveEnvelopeSpaceID(raw json.RawMessage) string {
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return ""
+	}
+	spaceID, _ := payload["space_id"].(string)
+	return spaceID
+}
+
+func contentEditHasTemplateRef(contentEdit string) bool {
+	return cardEnvelopeHasTemplateRef([]byte(contentEdit))
+}
+
+func cardEnvelopeHasTemplateRef(raw []byte) bool {
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return false
+	}
+	_, exists := payload["template_ref"]
+	return exists
 }
 
 // cardSeqCASMaxAttempts 是 D9 CAS 遇 InnoDB 死锁/锁等待超时的有界重试次数。

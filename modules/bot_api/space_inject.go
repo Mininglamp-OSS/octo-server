@@ -77,10 +77,17 @@ type botSpaceQuerier interface {
 // client 上送的 payload["space_id"]，并发监控 warn。这是 bot_api 层独立的 strip
 // 语义，不能依赖 message 层的 senderSpaceID="" strip（bot_api 不走 sendMsg）。
 func (ba *BotAPI) enrichBotPayloadWithSpaceID(c *wkhttp.Context, robotID string, payload map[string]interface{}) map[string]interface{} {
+	return ba.enrichBotPayloadWithResolvedSpaceID(robotID, payload, ba.resolveBotActiveSpaceID(c, robotID))
+}
+
+// enrichBotPayloadWithResolvedSpaceID applies a Space identity already resolved
+// by the caller. Registry rendering needs that same authoritative value in
+// BuildEnv, so this seam prevents a second DB lookup and guarantees the rendered
+// card and outbound envelope observe one Space snapshot.
+func (ba *BotAPI) enrichBotPayloadWithResolvedSpaceID(robotID string, payload map[string]interface{}, spaceID string) map[string]interface{} {
 	if payload == nil {
 		payload = make(map[string]interface{})
 	}
-	spaceID := ba.resolveBotActiveSpaceID(c, robotID)
 	if spaceID != "" {
 		payload["space_id"] = spaceID
 		return payload

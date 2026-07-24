@@ -1,0 +1,11 @@
+{
+  "actions": [],
+  "inputs": [
+    {
+      "id": "query",
+      "type": "Input.Text",
+      "isRequired": false,
+      "isVisible": true
+    }
+  ]
+}

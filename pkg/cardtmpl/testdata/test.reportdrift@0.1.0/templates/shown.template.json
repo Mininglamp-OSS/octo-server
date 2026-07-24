@@ -1,0 +1,20 @@
+{
+  "type": "AdaptiveCard",
+  "version": "1.5",
+  "body": [
+    {"type": "TextBlock", "text": "${title}"}
+  ],
+  "actions": [
+    {
+      "type": "Action.Submit",
+      "id": "actual_action",
+      "title": "Run",
+      "associatedInputs": "none",
+      "data": {
+        "owner": "ai",
+        "action_type": "reasoning.control",
+        "action": "run"
+      }
+    }
+  ]
+}

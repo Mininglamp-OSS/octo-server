@@ -1,6 +1,7 @@
 package bot_api
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strconv"
@@ -18,6 +19,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/modules/voice_adapter"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardrevision"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 )
 
 const (
@@ -56,7 +58,11 @@ type BotAPI struct {
 	// cardMutator owns the card_seq CAS primitive shared with first-party
 	// callback finalization. Existing tests that construct BotAPI literals keep
 	// the legacy local fallback in cardSeqCASWrite when this field is nil.
-	cardMutator           *carddispatch.CardMutator
+	cardMutator botAPICardMutator
+	// cardTemplates is the deployment-global, code-reviewed Bot allowlist over
+	// the broader cardtmpl Registry. Production construction fails closed when
+	// any advertised ref is missing or internally inconsistent.
+	cardTemplates         *botCardTemplateCatalog
 	speechClient          *voice_adapter.SpeechClient
 	maxVoiceContextLength int
 	maxBodySize           int64
@@ -162,6 +168,16 @@ type BotAPI struct {
 	log.Log
 }
 
+// botAPICardMutator is the narrow mutation surface used by raw and Registry
+// edit modes. The interface keeps handler tests deterministic while production
+// uses carddispatch.CardMutator for ownership, lifecycle, CAS, revision, and
+// CMD synchronization.
+type botAPICardMutator interface {
+	Snapshot(context.Context, carddispatch.CardMutationTarget) (carddispatch.CardMutationSnapshot, error)
+	Mutate(context.Context, carddispatch.CardMutationRequest) (carddispatch.CardMutationResult, error)
+	WriteCAS(carddispatch.CardMutationCASRequest) (bool, error)
+}
+
 // dispatchMsgSendReq sends a built MsgSendReq to WuKongIM via ba.ctx, OR to a
 // test-injected dispatchOverride for handler-level integration tests.
 func (ba *BotAPI) dispatchMsgSendReq(req *config.MsgSendReq) (*config.MsgSendResp, error) {
@@ -204,6 +220,15 @@ func NewBotAPI(ctx *config.Context) *BotAPI {
 		}
 	}
 
+	var cardTemplates *botCardTemplateCatalog
+	if registry := cardtmpl.DefaultRegistry(); registry != nil {
+		var err error
+		cardTemplates, err = newBotCardTemplateCatalog(registry, defaultBotTemplateRefs())
+		if err != nil {
+			panic(fmt.Errorf("install Bot card template catalog: %w", err))
+		}
+	}
+
 	ba := &BotAPI{
 		ctx:                   ctx,
 		db:                    newBotAPIDB(ctx),
@@ -215,6 +240,7 @@ func NewBotAPI(ctx *config.Context) *BotAPI {
 		robotService:          robot.NewService(ctx),
 		cardRevisions:         cardrevision.NewStore(ctx.DB()),
 		cardMutator:           carddispatch.NewCardMutator(ctx),
+		cardTemplates:         cardTemplates,
 		speechClient:          voice_adapter.NewSpeechClient(speechURL, speechKey, time.Duration(timeoutSec)*time.Second),
 		maxVoiceContextLength: maxCtxLen,
 		maxBodySize:           maxBodySize,

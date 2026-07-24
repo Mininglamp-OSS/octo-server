@@ -509,6 +509,13 @@ func (r *Registry) selfCheckSamples(t Template, meta TemplateMeta, samples map[s
 				return fmt.Errorf("sample %s: %w", name, err)
 			}
 		}
+		report, ok := meta.Interaction(view)
+		if !ok {
+			return fmt.Errorf("sample %s: interaction report missing for v2 view %s", name, view)
+		}
+		if err := assertInteractionReport(payload, report); err != nil {
+			return fmt.Errorf("sample %s: %w", name, err)
+		}
 	}
 	return nil
 }
@@ -580,7 +587,7 @@ func walkSubmitActions(value any, path string, visit func(string, map[string]any
 				return err
 			}
 		}
-		for _, key := range []string{"actions", "items", "columns", "selectAction"} {
+		for _, key := range []string{"body", "actions", "items", "columns", "rows", "cells", "selectAction", "inlineAction"} {
 			if child, ok := node[key]; ok {
 				if err := walkSubmitActions(child, path+"."+key, visit); err != nil {
 					return err
