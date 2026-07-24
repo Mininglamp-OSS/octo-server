@@ -43,4 +43,3 @@ Fail-closed authorization can be correct for security while still being
 operationally opaque or privacy-unsafe. Separating the public denial from the
 internal diagnostic signal preserves both properties and prevents future
 incident triage from depending on short-lived container logs.
-
