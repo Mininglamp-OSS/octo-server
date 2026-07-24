@@ -232,6 +232,17 @@ redis.call('PEXPIRE', KEYS[1], ARGV[3])
 return v
 `)
 
+// minLiveTTL is the smallest LiveTTL NewRedisQueue accepts. A deferred event (a route-missing
+// re-check, or capacity backpressure) is re-scheduled up to routeMissingDeferInterval into the
+// future, and every queue operation PEXPIREs the event's ready/payload keys to LiveTTL. If LiveTTL
+// did not comfortably exceed that defer interval, a deferred key could expire BEFORE the event
+// became claimable — silently dropping the event instead of delivering it. The margin (4×) leaves
+// room to actually claim and process the event after it becomes due, not merely to survive to the
+// due instant. LiveTTL is Robot.MessageExpire, which defaults to 7 days and can never sensibly sit
+// in the seconds range (no user acts on a card that fast), so this only rejects a pathological
+// config — failing fast at construction (server boot) rather than dropping events at runtime.
+const minLiveTTL = 4 * routeMissingDeferInterval
+
 func NewRedisQueue(client *rd.Client, cfg QueueConfig) (*RedisQueue, error) {
 	if client == nil {
 		return nil, errors.New("cardactiondispatch: Redis client is required")
@@ -241,6 +252,10 @@ func NewRedisQueue(client *rd.Client, cfg QueueConfig) (*RedisQueue, error) {
 	}
 	if cfg.LiveTTL <= 0 || cfg.DLQRetention <= 0 {
 		return nil, errors.New("cardactiondispatch: queue retention must be positive")
+	}
+	if cfg.LiveTTL < minLiveTTL {
+		return nil, fmt.Errorf("cardactiondispatch: LiveTTL %s is below the %s floor required to outlast the route-missing defer interval (%s); a deferred event could expire before it becomes claimable",
+			cfg.LiveTTL, minLiveTTL, routeMissingDeferInterval)
 	}
 	base := cfg.Prefix + ":{queue}:"
 	return &RedisQueue{

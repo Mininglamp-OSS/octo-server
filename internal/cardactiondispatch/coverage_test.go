@@ -137,7 +137,9 @@ func TestDecisionAndQueueInputBounds(t *testing.T) {
 	if _, err := NewRedisQueue(client, QueueConfig{Prefix: "bad prefix", LiveTTL: time.Second, DLQRetention: time.Second}); err == nil {
 		t.Fatal("NewRedisQueue(bad prefix) error = nil")
 	}
-	queue, err := NewRedisQueue(client, QueueConfig{Prefix: "bounds", LiveTTL: time.Second, DLQRetention: time.Second})
+	// LiveTTL must clear minLiveTTL (see TestNewRedisQueueRejectsLiveTTLBelowDeferFloor); a
+	// second-scale TTL is a pathological config the constructor now rejects outright.
+	queue, err := NewRedisQueue(client, QueueConfig{Prefix: "bounds", LiveTTL: time.Minute, DLQRetention: time.Second})
 	if err != nil {
 		t.Fatalf("NewRedisQueue() error = %v", err)
 	}
@@ -152,6 +154,43 @@ func TestDecisionAndQueueInputBounds(t *testing.T) {
 	}
 	if _, err := queue.ReclaimExpired(time.Now(), 0); err == nil {
 		t.Fatal("ReclaimExpired(zero limit) error = nil")
+	}
+}
+
+// TestNewRedisQueueRejectsLiveTTLBelowDeferFloor pins the LiveTTL guard. A deferred event is
+// rescheduled up to routeMissingDeferInterval ahead and its keys are PEXPIRE'd to LiveTTL, so a
+// LiveTTL that does not comfortably clear that interval could let a deferred key expire before the
+// event becomes claimable — silently dropping it. The constructor now rejects such a config so it
+// fails fast at boot rather than at runtime. LiveTTL is Robot.MessageExpire (7-day default), so
+// this only ever fires on a pathological value.
+func TestNewRedisQueueRejectsLiveTTLBelowDeferFloor(t *testing.T) {
+	client := rd.NewClient(&rd.Options{Addr: "127.0.0.1:1"})
+	defer client.Close()
+
+	rejected := []struct {
+		name    string
+		liveTTL time.Duration
+	}{
+		{"equal to the defer interval", routeMissingDeferInterval},
+		{"just below the floor", minLiveTTL - time.Nanosecond},
+	}
+	for _, tc := range rejected {
+		if _, err := NewRedisQueue(client, QueueConfig{Prefix: "p", LiveTTL: tc.liveTTL, DLQRetention: time.Hour}); err == nil {
+			t.Fatalf("NewRedisQueue(LiveTTL %s: %s) error = nil, want a floor rejection", tc.liveTTL, tc.name)
+		}
+	}
+
+	accepted := []struct {
+		name    string
+		liveTTL time.Duration
+	}{
+		{"exactly at the floor", minLiveTTL},
+		{"comfortably above the floor", time.Hour},
+	}
+	for _, tc := range accepted {
+		if _, err := NewRedisQueue(client, QueueConfig{Prefix: "p", LiveTTL: tc.liveTTL, DLQRetention: time.Hour}); err != nil {
+			t.Fatalf("NewRedisQueue(LiveTTL %s: %s) error = %v, want success", tc.liveTTL, tc.name, err)
+		}
 	}
 }
 
