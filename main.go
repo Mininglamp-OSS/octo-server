@@ -33,6 +33,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/avatarrender"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
+	aireasoningprocess "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/ai_reasoning_process"
 	docsaccessrequest "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/docs_access_request"
 	docscommented "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/docs_commented"
 	docsshared "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/docs_shared"
@@ -728,6 +729,12 @@ func installCardTmplRegistry() {
 	registry.SetDefault(summarycompleted.TemplateID, summarycompleted.TemplateVersion)
 	registry.Register(summaryfailed.New(), summaryfailed.Assets, summaryfailed.HandoffRoot)
 	registry.SetDefault(summaryfailed.TemplateID, summaryfailed.TemplateVersion)
+	// roadmap E1:首张 JSON 模板卡 —— ai.reasoning-process 走 RegisterJSON,由基座
+	// 编译 .template.json,无手写 Go Build()。active/error 为 octo/v2(带 Submit,
+	// owner=ai),result 为 octo/v1(仅折叠)。按钮的 handler + RouteSpec + bot 流式
+	// 下发是下游任务,本卡先注册可渲染。
+	registry.RegisterJSON(aireasoningprocess.Assets, aireasoningprocess.HandoffRoot)
+	registry.SetDefault(aireasoningprocess.TemplateID, aireasoningprocess.TemplateVersion)
 	registry.Freeze()
 	cardtmpl.SetGlobalMetrics(cardtmpl.NewMetrics(prometheus.DefaultRegisterer))
 	cardtmpl.SetDefaultRegistry(registry)
