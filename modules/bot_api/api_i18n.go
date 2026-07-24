@@ -120,6 +120,11 @@ var (
 	errBotSendPermGroupDisbanded = errors.New("the group has been disbanded")
 	errBotSendPermNotSpaceMember = errors.New("user is no longer a member of bot's space")
 	errBotSendPermBadThreadChan  = errors.New("invalid thread channel_id format")
+	// errBotSendPermOBOCheckFailed is an internal diagnostic sentinel. The
+	// caller records it through the sanitized permission observer, but keeps the
+	// historical not_friend response so an OBO lookup outage cannot widen access
+	// or change the DM anti-enumeration contract.
+	errBotSendPermOBOCheckFailed = errors.New("OBO friend-gate permission check failed")
 	errBotSendPermCheckFailed    = errors.New("permission check failed")
 )
 

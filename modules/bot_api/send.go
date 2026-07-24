@@ -481,6 +481,9 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 				allowed, err := ba.isFriendOrOBOBypass(robotID, channelID, channelType, hasOBOContext)
 				if err != nil {
 					ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageFriend, sendPermissionReasonQueryError, err)
+					if errors.Is(err, errBotSendPermOBOCheckFailed) {
+						return errBotSendPermNotFriend
+					}
 					return errBotSendPermCheckFailed
 				}
 				if !allowed {

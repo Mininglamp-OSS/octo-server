@@ -48,10 +48,6 @@
 // skip the bypass entirely and go straight back to `isFriend`.
 package bot_api
 
-import (
-	"go.uber.org/zap"
-)
-
 // hasOBOAccessToChannel reports whether bot `botUID` has any active OBO
 // grant covering (channelID, channelType) where the grantor still has
 // live read access to that channel. Used by the friend gate
@@ -85,16 +81,12 @@ func (ba *BotAPI) hasOBOAccessToChannel(botUID, channelID string, channelType ui
 	store := ba.oboStoreOrDefault()
 	grants, err := store.findActiveGrantsForChannel(channelID, channelType)
 	if err != nil {
-		ba.Error("OBO friend-gate bypass lookup failed",
-			zap.String("bot", botUID),
-			zap.String("channel_id", channelID),
-			zap.Uint8("channel_type", channelType),
-			zap.Error(err))
-		return false, err
+		return false, errBotSendPermOBOCheckFailed
 	}
 	if len(grants) == 0 {
 		return false, nil
 	}
+	recheckFailed := false
 	for _, g := range grants {
 		if g.GranteeBotUID != botUID {
 			// Other grantors' grants for the same channel don't
@@ -104,21 +96,18 @@ func (ba *BotAPI) hasOBOAccessToChannel(botUID, channelID string, channelType ui
 		}
 		ok, err := ba.grantorCanReadChannel(g.GrantorUID, channelID, channelType)
 		if err != nil {
-			// Single grant's check errored — log and try the next.
-			// Don't propagate so that a transient blip on one
-			// grantor's row doesn't block a bypass that another
-			// grantor's row would satisfy.
-			ba.Warn("OBO friend-gate grantor access re-check failed; trying next grant",
-				zap.String("bot", botUID),
-				zap.String("grantor", g.GrantorUID),
-				zap.String("channel_id", channelID),
-				zap.Uint8("channel_type", channelType),
-				zap.Error(err))
+			// Keep trying: another grantor may still authorize the bypass. If
+			// none does, surface one bounded diagnostic sentinel so the caller
+			// can emit exactly one terminal metric/log without identifiers.
+			recheckFailed = true
 			continue
 		}
 		if ok {
 			return true, nil
 		}
+	}
+	if recheckFailed {
+		return false, errBotSendPermOBOCheckFailed
 	}
 	return false, nil
 }
@@ -145,11 +134,10 @@ func (ba *BotAPI) hasOBOAccessToChannel(botUID, channelID string, channelType ui
 // bot could send a direct bot→target DM without the user opt-in
 // (Jerry-Xin R7 finding on head a07b372).
 //
-// Errors from IsFriend are surfaced verbatim — the caller treats them
-// as "permission verification failed". Errors from hasOBOAccessToChannel
-// are logged and converted to a `false` bypass answer (fail-closed) so
-// the original "not a friend" error is returned, preserving the
-// pre-fix behaviour when no OBO bypass would have applied anyway.
+// Errors from IsFriend are surfaced verbatim. OBO lookup/re-check failures are
+// collapsed to errBotSendPermOBOCheckFailed so checkSendPermission can record
+// one sanitized terminal observation while preserving the historical
+// "not a friend" response and fail-closed authorization behavior.
 //
 // Test seam: see friendCheckOverride on BotAPI.
 func (ba *BotAPI) isFriendOrOBOBypass(botUID, targetUID string, channelType uint8, hasOBOContext bool) (bool, error) {
@@ -168,8 +156,7 @@ func (ba *BotAPI) isFriendOrOBOBypass(botUID, targetUID string, channelType uint
 		return false, nil
 	}
 	// OBO context present → try the managed-persona conditional bypass.
-	bypass, _ := ba.hasOBOAccessToChannel(botUID, targetUID, channelType)
-	return bypass, nil
+	return ba.hasOBOAccessToChannel(botUID, targetUID, channelType)
 }
 
 // isFriend wraps userService.IsFriend behind a test seam. Production
