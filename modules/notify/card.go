@@ -16,6 +16,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	docscommented "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/docs_commented"
 	docsshared "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/docs_shared"
+	summarycompleted "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/summary_completed"
+	summaryfailed "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/summary_failed"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"go.uber.org/zap"
 )
@@ -41,6 +43,34 @@ func (n *Notify) deliverCardNotification(req *NotifyReq) (*NotifyResp, error) {
 		return nil, errNotifyCardInvalid
 	}
 	if card.Kind != SummaryCardKindCompleted && card.Kind != SummaryCardKindFailed {
+		return nil, errNotifyCardInvalid
+	}
+
+	// C1 policy (docs/platform-card-base.md §10):
+	// Schema-level field errors are caller contract violations — they must reject
+	// the whole request with 400 zero delivery, and be observable at ingress.
+	// Running schema check here (before memberCache, before cardSender gate,
+	// before cardmsg.Enabled) guarantees the check cannot be silently skipped by:
+	//   (a) an empty-member request (200 with delivered=[]),
+	//   (b) cardSender==nil / cardmsg.Enabled()==false (text degradation).
+	// Preflight mirrors the docs-notify migration (roadmap C PR-1); same F7
+	// fail-close for wiring bugs (Registry unwired → 500, not silent text).
+	var summaryTid cardtmpl.ID
+	if card.Kind == SummaryCardKindCompleted {
+		summaryTid = summarycompleted.TemplateID
+	} else {
+		summaryTid = summaryfailed.TemplateID
+	}
+	if err := preflightSummarySchema(card, summaryTid); err != nil {
+		if errors.Is(err, errCardTmplUnavailable) {
+			n.Error("summary card preflight: cardtmpl unavailable (composition bug, 500)",
+				zap.Error(err), zap.String("space_id", req.SpaceID), zap.String("task_no", card.TaskNo),
+				zap.String("kind", card.Kind))
+			return nil, err // api 层兜底走 500
+		}
+		n.Warn("summary card rejected at preflight: schema (400)",
+			zap.Error(err), zap.String("space_id", req.SpaceID), zap.String("task_no", card.TaskNo),
+			zap.String("kind", card.Kind))
 		return nil, errNotifyCardInvalid
 	}
 
@@ -80,11 +110,42 @@ func (n *Notify) deliverCardNotification(req *NotifyReq) (*NotifyResp, error) {
 
 	// Decide card vs text once, up front. A build failure degrades the entire
 	// request to text rather than dropping the notification.
+	//
+	// F7 (roadmap C PR-2): Registry unwired = composition bug = 500, no legacy
+	// fallback. schema 违规 (typed cardtmpl.ErrFieldsInvalid) 已在 preflight 上游
+	// 提前挡回 400 零投递,这里 buildErr non-typed 才走 render_error 降级为文本 DM。
 	canCard := n.cardSender != nil && cardmsg.Enabled()
+	renderProfile := ""
 	var document json.RawMessage
 	if canCard {
-		doc, buildErr := n.buildSummaryCard(context.Background(), req.SpaceID, card, lang)
+		var (
+			doc      json.RawMessage
+			buildErr error
+		)
+		if card.Kind == SummaryCardKindCompleted {
+			doc, renderProfile, buildErr = n.buildSummaryCardViaRegistry(
+				context.Background(), req.SpaceID, card, lang,
+				summarycompleted.TemplateID, summarycompleted.StateShown)
+		} else {
+			doc, renderProfile, buildErr = n.buildSummaryCardViaRegistry(
+				context.Background(), req.SpaceID, card, lang,
+				summaryfailed.TemplateID, summaryfailed.StateShown)
+		}
 		if buildErr != nil {
+			// C1: schema 违规理论上已被 preflight 拦掉,这里再 typed 断言一次
+			// 兜底(避免 Build 内部新增校验后绕过 preflight)。
+			if errors.Is(buildErr, cardtmpl.ErrFieldsInvalid) {
+				n.Warn("summary card rejected: fields did not pass schema (400)",
+					zap.Error(buildErr), zap.String("space_id", req.SpaceID), zap.String("task_no", card.TaskNo),
+					zap.String("kind", card.Kind))
+				return nil, errNotifyCardInvalid
+			}
+			if errors.Is(buildErr, errCardTmplUnavailable) {
+				n.Error("summary card: cardtmpl unavailable (composition bug, 500)",
+					zap.Error(buildErr), zap.String("space_id", req.SpaceID), zap.String("task_no", card.TaskNo),
+					zap.String("kind", card.Kind))
+				return nil, buildErr
+			}
 			n.Warn("build summary card failed, degrading to text",
 				zap.Error(buildErr), zap.String("space_id", req.SpaceID), zap.String("task_no", card.TaskNo))
 			canCard = false
@@ -117,7 +178,7 @@ func (n *Notify) deliverCardNotification(req *NotifyReq) (*NotifyResp, error) {
 						ChannelID:   uid,
 						ChannelType: common.ChannelTypePerson.Uint8(),
 					},
-					carddispatch.Card{Profile: cardmsg.ProfileV1, Document: document},
+					carddispatch.Card{Profile: cardmsg.ProfileV1, RenderProfile: renderProfile, Document: document},
 				)
 				if sendErr != nil {
 					reason = string(carddispatch.CategoryOf(sendErr))

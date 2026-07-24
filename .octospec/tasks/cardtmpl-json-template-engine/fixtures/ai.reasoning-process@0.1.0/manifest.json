@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 2,
+  "id": "ai.reasoning-process",
+  "name": "推理过程卡",
+  "version": "0.1.0",
+  "contractVersion": "1.0.0",
+  "adaptiveCardVersion": "1.5",
+  "renderProfile": "octo-chat@latest",
+  "defaultLocale": "zh-CN",
+  "dataSchema": "contract/data.schema.json",
+  "views": {
+    "active": {
+      "wireProfile": "octo/v2",
+      "template": "templates/active.template.json",
+      "samples": [
+        "samples/reasoning.json",
+        "samples/answering.json"
+      ]
+    },
+    "result": {
+      "wireProfile": "octo/v2",
+      "template": "templates/result.template.json",
+      "samples": [
+        "samples/completed.json",
+        "samples/stopped.json"
+      ]
+    },
+    "error": {
+      "wireProfile": "octo/v2",
+      "template": "templates/error.template.json",
+      "samples": [
+        "samples/error.json"
+      ]
+    }
+  }
+}

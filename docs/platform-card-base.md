@@ -106,7 +106,7 @@
 3. **能力与安全边界(与 L2a 完全一致,不放松)**
    - 组件白名单、URL https、markdown escape、input 白名单、data key 白名单 **一律走 L0** `pkg/cardmsg` 与 `Registry.Render`,业务方无法绕过;
    - 业务方不能自选 `WireProfile`(仍限 `octo/v1`/`octo/v2`);
-   - `BuildResult.DeepLink` 必须是 https,业务方不能传入任意域名;由业务方在 Template 构造时注入自己允许的 `WebLoginURL` 白名单(平台组通过 PR 审核域名);
+   - `BuildResult.DeepLink` 可选;若提供则必须是绝对 https,业务方不能传入任意域名,由业务方在 Template 构造时注入自己允许的 `WebLoginURL` 白名单(平台组通过 PR 审核域名);纯展示卡(如 JSON 进度卡)可留空以省略 `metadata.webUrl`;
    - 不允许写 `metadata.octo.*` 未声明字段,如需扩展走 L0 PR 审查(其它 owner 也能看见)。
 
 4. **发布通道**
@@ -119,6 +119,7 @@
    - **L2b 开放硬门槛**(写死,平台组可通过 RFC 评估微调,但不允许在无 RFC 情况下降低):
      ① L0 (`octo-card@1.x`) 至少一个 release 无 breaking change;
      ② L2a 至少 **3 张**卡片走完 Registry 全链路(注册 + Render + conformance test + 生产灰度),覆盖至少两种视图模式(纯展示 v1 / 交互 v2);
+       - **进度(2026-07)**:注册 + Render + conformance + 字节等价基线维度已达标 —— **5 张** L2a 卡在 Registry 上:`docs.access-request`(v2 交互,#633/#641)、`docs.commented` + `docs.shared`(v1 展示,#649)、`summary.completed` + `summary.failed`(v1 展示,#650),两种视图模式全覆盖。**仍缺"生产灰度"这一维度**(线上放量观测),故门槛 ② 尚未整体满足;`generic.approval` 因动态 owner 与静态 `TemplateActionContract` 冲突暂未迁(见 §15.4)。
      ③ `docs/l2b-owners.md` 空清单已合入,且有至少一份未通过审核的 L2b 申请 PR 作为流程演练;
      ④ callback URL 白名单机制、独立 token 通道、per-owner 观测指标全部在 L0 落地。
    - **消息通道位置**:L2b 卡片在客户端 UI 上默认不做特殊突出显示(与 L2a 同渠道到达);渲染顺序、置顶、折叠策略由客户端自行决定,L0 不承诺。
@@ -406,13 +407,13 @@ type BuildEnv struct {
 
 // BuildResult 是 Template.Build 的返回值,只承载业务片段;
 // 基座 wrapper(Registry.Render)负责组装完整 AC 顶层文档并注入
-// metadata.octo.{protocol,template,variant,source} + metadata.webUrl。
+// metadata.octo.{protocol,template,variant,source},以及 metadata.webUrl(仅当 DeepLink 非空)。
 // 模板不 marshal AC 顶层,不写 metadata 字段。
 type BuildResult struct {
     Body     []any   // AC body 元素(TextBlock/ColumnSet/Container/...)
     Actions  []any   // AC 顶层 actions(Action.Submit / Action.OpenUrl / ...)
     Variant  string  // metadata.octo.variant,如 "docs.access_requested"
-    DeepLink string  // metadata.webUrl 与"查看详情"按钮共同来源,必填绝对 https
+    DeepLink string  // metadata.webUrl;可选:非空则须绝对 https,空则省略 webUrl(纯展示卡无规范 URL)
     Source   *Source // 覆盖 Meta.Source;nil = 不覆盖
 }
 
@@ -439,7 +440,7 @@ type Template interface {
 //  2. Meta().InputSchema.Validate(fields) → 失败返 ErrFieldsInvalid;
 //  3. Meta().ViewFor(state) 决定 view / profile → 未注册 state 返 ErrStateUnknown;
 //  4. Template.Build(ctx, state, fields, env) 拿 BuildResult;
-//  5. 组装 AC card 节点(注入 metadata.octo.{protocol,template,variant,source} + webUrl),
+//  5. 组装 AC card 节点(注入 metadata.octo.{protocol,template,variant,source};DeepLink 非空时再注入 webUrl),
 //     再包成 type-17 envelope {type, card, card_version, profile};
 //  6. cardmsg.Validate(payload) → 失败视为 render_error。
 // 业务代码只调 Render,不允许调 Template.Build 后自己拼装。
@@ -451,10 +452,10 @@ func (r *Registry) Render(ctx context.Context, id ID, version string,
 
 ### 关键约束(基座强制,非"模板自觉")
 
-1. **metadata 由基座注入**:`metadata.octo.protocol` / `template.{id,version}` / `variant` / `source` 和 `metadata.webUrl` 全部由 `Registry.Render` 写入,模板返回 `BuildResult` 不接触这些字段。
+1. **metadata 由基座注入**:`metadata.octo.protocol` / `template.{id,version}` / `variant` / `source` 全部由 `Registry.Render` 写入(`metadata.webUrl` 仅当 `DeepLink` 非空时注入),模板返回 `BuildResult` 不接触这些字段。
 2. **`cardmsg.Validate(payload)` 由基座调用**（payload 为完整 type-17 envelope，profile 在其中）：Template 无法绕过；view→profile 从 `Meta.Views[view].WireProfile` 取。
 3. **`Action.Submit.data["owner"]` / `["action_type"]` 与 `ActionContract` 一致性**:conformance test 校验;pilot 注册时用其 sample 跑一次 `Render` + 断言,失败 → 注册期 panic(fail-close)。
-4. **`DeepLink` 必填且绝对 https**:`BuildResult.DeepLink == ""` 或非 https → Render 返 error;deep-link 由模板私有拼接函数从 `env.WebLoginURL` 组装,不接受调用方任意域名。
+4. **`DeepLink` 可选,非空则绝对 https**:`BuildResult.DeepLink == ""` 表示本卡无规范浏览器 URL(如 JSON 纯展示进度卡)→ 跳过校验并省略 `metadata.webUrl`;非空则必须绝对 https(**含纯空白也判为畸形 → Render 返 error**,不静默当作"无链接"),deep-link 由模板私有拼接函数从 `env.WebLoginURL` 组装,不接受调用方任意域名。
 5. **禁止未声明的 `metadata.octo.*` 扩展**:如需扩展走本文档 PR 审查。
 
 ---
@@ -701,7 +702,8 @@ label `template_id` 基数 = 注册表大小（硬编码），无基数爆炸。
    - 增加 callback/update 两个有界指标，且不发布 `response_url`。
 
 4. **后续 PR**
-   - 迁 `docs.shared/commented`、`summary.completed/failed`、`generic.approval` 等模板到 Registry；
+   - 迁 `docs.shared/commented`、`summary.completed/failed`、`generic.approval` 等模板到 Registry;
+     - **进度**:`docs.commented` + `docs.shared` 已迁(#649,roadmap C PR-1);`summary.completed` + `summary.failed` 已迁(#650,roadmap C PR-2)。四张 legacy 展示卡的 `deliver*` 分支现全部走 `Registry.Render`(方案 B 外壳不变);连同 pilot `docs.access-request` 共 5 张 L2a 卡在 Registry 上。**`generic.approval` 未迁** —— 其调用方动态 `owner`/`action_type` 与静态 `TemplateActionContract` 冲突,需单独决策(固定 owner 模板 vs 保留动态特例)后再迁。legacy `buildSummaryCard`/`buildDocsCard` 暂留作字节等价基线,删除留到 roadmap C 收尾 PR。
    - 开放 `/v1/message/card/templates` 只读端点(涉及 per-owner 可见性 / i18n 文案透出);
    - 开放 JSON 模板模式(`templates/*.template.json` + 表达式引擎);
    - 开放 envelope 模式(调用方显式传 `template_id`),替换 `NotifyReq` 四选一;

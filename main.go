@@ -36,6 +36,8 @@ import (
 	docsaccessrequest "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/docs_access_request"
 	docscommented "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/docs_commented"
 	docsshared "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/docs_shared"
+	summarycompleted "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/summary_completed"
+	summaryfailed "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/summary_failed"
 	octodb "github.com/Mininglamp-OSS/octo-server/pkg/db"
 	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
@@ -720,6 +722,12 @@ func installCardTmplRegistry() {
 	registry.SetDefault(docscommented.TemplateID, docscommented.TemplateVersion)
 	registry.Register(docsshared.New(), docsshared.Assets, docsshared.HandoffRoot)
 	registry.SetDefault(docsshared.TemplateID, docsshared.TemplateVersion)
+	// roadmap C PR-2:summary.completed / summary.failed 迁入 Registry。
+	// 达成 §2.2-5 L2b 硬门槛 ②(≥3 张 L2a 走 Registry 全链路;PR-2 后共 5 张)。
+	registry.Register(summarycompleted.New(), summarycompleted.Assets, summarycompleted.HandoffRoot)
+	registry.SetDefault(summarycompleted.TemplateID, summarycompleted.TemplateVersion)
+	registry.Register(summaryfailed.New(), summaryfailed.Assets, summaryfailed.HandoffRoot)
+	registry.SetDefault(summaryfailed.TemplateID, summaryfailed.TemplateVersion)
 	registry.Freeze()
 	cardtmpl.SetGlobalMetrics(cardtmpl.NewMetrics(prometheus.DefaultRegisterer))
 	cardtmpl.SetDefaultRegistry(registry)
