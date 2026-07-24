@@ -16,6 +16,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
 	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
 	aireasoningprocess "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/ai_reasoning_process"
+	docsaccessrequest "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/docs_access_request"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/gin-gonic/gin"
 )
 
@@ -80,6 +82,61 @@ func TestBotMessageEditRegistryTemplateRendersSameIdentity(t *testing.T) {
 		ID: aireasoningprocess.TemplateID, Version: aireasoningprocess.TemplateVersion,
 	}); err != nil {
 		t.Fatalf("replacement identity: %v", err)
+	}
+}
+
+func TestBotMessageEditRegistryTemplateRejectsUnlistedRefBeforeTargetLookup(t *testing.T) {
+	t.Setenv(cardmsg.EnvEnabled, "true")
+	catalog, err := newBotCardTemplateCatalog(testBotTemplateRegistry(t), defaultBotTemplateRefs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	validSnapshot := carddispatch.CardMutationSnapshot{
+		Envelope: initialRegistryEnvelope(t, catalog), CardSeq: 1,
+	}
+	tests := []struct {
+		name        string
+		snapshot    carddispatch.CardMutationSnapshot
+		snapshotErr error
+	}{
+		{name: "valid target", snapshot: validSnapshot},
+		{name: "missing target", snapshotErr: carddispatch.ErrCardMutationNotFound},
+		{name: "foreign target", snapshotErr: carddispatch.ErrCardMutationForbidden},
+	}
+	var firstEnvelope []byte
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mutator := &fakeBotCardMutator{snapshot: tc.snapshot, snapshotErr: tc.snapshotErr}
+			ba := &BotAPI{
+				Log: log.NewTLog("BotAPI-template-edit-unlisted"), cardTemplates: catalog, cardMutator: mutator,
+			}
+			body := registryEditBody(t, "completed", testReasoningData(t, "completed"), 2, false)
+			body["template_ref"] = map[string]any{
+				"id": string(docsaccessrequest.TemplateID), "version": docsaccessrequest.TemplateVersionV3,
+			}
+
+			recorder := invokeTemplateEdit(t, ba, body)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			var envelope errEnvelope
+			if err := json.Unmarshal(recorder.Body.Bytes(), &envelope); err != nil {
+				t.Fatalf("decode error envelope: %v; body=%s", err, recorder.Body.String())
+			}
+			if envelope.Msg != errcode.ErrBotAPICardInvalid.DefaultMessage || envelope.Status != http.StatusBadRequest {
+				t.Fatalf("error envelope=%+v, want card-invalid; body=%s", envelope, recorder.Body.String())
+			}
+			if mutator.snapshotCalls != 0 || len(mutator.mutateRequests) != 0 {
+				t.Fatalf("unlisted ref reached target state: snapshots=%d mutations=%d",
+					mutator.snapshotCalls, len(mutator.mutateRequests))
+			}
+			if firstEnvelope == nil {
+				firstEnvelope = append([]byte(nil), recorder.Body.Bytes()...)
+			} else if !bytes.Equal(firstEnvelope, recorder.Body.Bytes()) {
+				t.Fatalf("target state changed rejection envelope:\nfirst=%s\ncurrent=%s",
+					firstEnvelope, recorder.Body.Bytes())
+			}
+		})
 	}
 }
 
