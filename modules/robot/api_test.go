@@ -18,6 +18,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/server"
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	pkgutil "github.com/Mininglamp-OSS/octo-server/pkg/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -296,6 +297,7 @@ func TestRobotProxyFileNewPath(t *testing.T) {
 // space_id must be a request-invalid error.
 func TestOwnedBots(t *testing.T) {
 	s, ctx := testutil.NewTestServer()
+	s.GetRoute().SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
 	require.NoError(t, testutil.CleanAllTables(ctx))
 	require.NoError(t, ctx.GetRedisConn().Del("ratelimit:uid:"+uid))
 	t.Cleanup(func() { _ = testutil.CleanAllTables(ctx) })
@@ -384,8 +386,22 @@ func TestOwnedBots(t *testing.T) {
 		return w
 	}
 
+	assertEnvelope := func(t *testing.T, w *httptest.ResponseRecorder, code string, semanticStatus int) {
+		t.Helper()
+		require.Equal(t, http.StatusBadRequest, w.Code)
+		var body struct {
+			Error struct {
+				Code       string `json:"code"`
+				HTTPStatus int    `json:"http_status"`
+			} `json:"error"`
+		}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+		assert.Equal(t, code, body.Error.Code)
+		assert.Equal(t, semanticStatus, body.Error.HTTPStatus)
+	}
+
 	wMissing := request(t, "")
-	assert.NotEqual(t, http.StatusOK, wMissing.Code)
+	assertEnvelope(t, wMissing, "err.server.robot.request_invalid", http.StatusBadRequest)
 
 	for name, spaceID := range map[string]string{
 		"non-member":     nonMemberSpaceID,
@@ -393,7 +409,7 @@ func TestOwnedBots(t *testing.T) {
 		"disabled Space": disabledSpaceID,
 	} {
 		t.Run(name, func(t *testing.T) {
-			assert.Equal(t, http.StatusForbidden, request(t, spaceID).Code)
+			assertEnvelope(t, request(t, spaceID), "err.shared.auth.forbidden", http.StatusForbidden)
 		})
 	}
 
@@ -411,4 +427,32 @@ func TestOwnedBots(t *testing.T) {
 	assert.False(t, hasToken)
 	_, hasBotToken := results[0]["bot_token"]
 	assert.False(t, hasBotToken)
+}
+
+func TestOwnedBots_CheckMembershipDBError(t *testing.T) {
+	s, ctx := newTestServer()
+	s.GetRoute().SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
+	rb := New(ctx)
+	rb.Route(s.GetRoute())
+	require.NoError(t, ctx.GetRedisConn().Del("ratelimit:uid:"+uid))
+	t.Cleanup(func() { _ = ctx.GetRedisConn().Del("ratelimit:uid:" + uid) })
+
+	require.NoError(t, ctx.DB().Close())
+
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("GET", "/v1/robot/owned_bots?space_id=space_db_error_836", nil)
+	require.NoError(t, err)
+	req.Header.Set("token", token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	var body struct {
+		Error struct {
+			Code       string `json:"code"`
+			HTTPStatus int    `json:"http_status"`
+		} `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, "err.server.robot.query_failed", body.Error.Code)
+	assert.Equal(t, http.StatusInternalServerError, body.Error.HTTPStatus)
 }

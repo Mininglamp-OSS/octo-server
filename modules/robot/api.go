@@ -338,7 +338,7 @@ func (rb *Robot) Route(r *wkhttp.WKHttp) {
 		auth.GET("/robot/:robot_id/groups/:group_no/mention_pref", rb.getMentionPref)       // 读群级免@偏好
 	}
 
-	ownedBots := r.Group("/v1", rb.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, rb.ctx), space.SpaceMiddleware(rb.ctx))
+	ownedBots := r.Group("/v1", rb.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, rb.ctx))
 	{
 		ownedBots.GET("/robot/owned_bots", rb.ownedBots)
 	}
@@ -1674,9 +1674,20 @@ func (rb *Robot) myBots(c *wkhttp.Context) {
 // 与 myBots(已加好友) / spaceBots(Space 全部) 区分：owner 语义。
 func (rb *Robot) ownedBots(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
-	spaceID := space.GetSpaceID(c)
+	spaceID := c.Query("space_id")
 	if spaceID == "" {
 		respondRobotRequestInvalid(c, "space_id")
+		return
+	}
+
+	isMember, err := space.CheckMembership(rb.ctx.DB(), spaceID, loginUID)
+	if err != nil {
+		rb.Error("校验 Space 成员身份失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrRobotQueryFailed, nil, nil)
+		return
+	}
+	if !isMember {
+		httperr.ResponseErrorL(c, errcode.ErrSharedForbidden, nil, nil)
 		return
 	}
 
@@ -1689,7 +1700,7 @@ func (rb *Robot) ownedBots(c *wkhttp.Context) {
 		BotCommands string `db:"bot_commands"`
 	}
 	var bots []ownedBotRow
-	_, err := rb.ctx.DB().SelectBySql(`
+	_, err = rb.ctx.DB().SelectBySql(`
 		SELECT r.robot_id as uid, IFNULL(u.name,'') as name,
 			IFNULL(r.description,'') as description,
 			IFNULL(r.bot_commands,'') as bot_commands
