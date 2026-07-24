@@ -129,8 +129,45 @@ group admin opts that group in.
 reads `r.Enabled`; Space CRUD derives DB context from the request; a Space
 `DELETE`→enabled-global-fallback HTTP test.
 
+## Review round 2 (PR #655)
+
+Three reviewers cleared the design/security; the actionable fixes:
+
+- **e2e skip guard was ineffective** — `config.New()` defaults `WuKongIM.APIURL`
+  to `127.0.0.1:5001`, so the `APIURL==""` check never skipped and the package
+  failed hard on a box without a live IM. Now probes `<APIURL>/health` (verified:
+  SKIP when down, PASS when up).
+- **Event fan-out** offloaded to `EventPool.Work` + config read once per batch
+  (`handleMemberJoinBatch`), so a bulk invite no longer runs N sequential DB
+  round-trips on the shared event-dispatch goroutine before `commit`.
+- **Shutdown-safe post-send** — `casToSent`/`toUnknown` now use
+  `context.WithoutCancel`, so a `Stop()` after a successful send cannot strand a
+  delivered row in `dispatching`.
+- **CRUD gate** tightened to require `GroupStatusNormal` (parity with the space
+  welcome's `checkSpaceActive`).
+- **Batch coalesce timestamp** — all members of one `GroupMemberAdd` event share
+  one due time, so a slow insert can't split a sub-cap batch into two posts.
+- **Master switch re-checked** before each group's claim (tighter mid-wake kill).
+- A large batch of failure-branch / boundary / fairness / listener-entry tests.
+
+**Reverted a mis-step (P1):** an earlier fix classified a non-2xx as
+"definitely-not-delivered" and *retried* the coalesced post on it, to avoid a
+transient IM failure suppressing a whole batch. A reviewer correctly flagged that
+without a message-level idempotency key (and given the send may traverse a proxy
+that can 5xx *after* WuKongIM persisted), retrying a PUBLIC post can double-post a
+visible, unrecallable message. Reverted to the space engine's conservative policy:
+any post-send failure → terminal `unknown`, never auto-retried. For a public
+message, a missed welcome (invisible) is a safer failure than a duplicate one.
+
 ## Open items
 
+- **Batch blast radius (known limitation, fix-before-enable).** One send failure
+  marks the whole coalesced batch (≤50 winners) terminal-`unknown`; the reconciler
+  only re-enqueues rows with no ledger row, so those are not auto-recovered. This
+  is safe (no double-post) but suppresses the burst's welcome until an operator
+  acts. Proper fix before the master switch is enabled: attach a stable
+  idempotency key so WuKongIM de-dupes a retried post (needs verifying WuKongIM's
+  `client_msg_no` de-dup semantics), or a bounded operator-driven recovery.
 - Very large bursts (> per-post cap) spill their tail into later worker wakes (a
   few posts, not one) — natural rate-limit, `log()`-visible, acceptable.
 - `{member}` renders a plain-text name; a clickable WuKongIM @mention is a

@@ -31,15 +31,8 @@ const (
 	swErrConfigRead    = "config_read"
 	swErrIMTimeout     = "im_timeout"
 	swErrIMBadResponse = "im_bad_response"
-	// swErrIMRejected is a definitive non-2xx from WuKongIM /message/send: the
-	// request was rejected and NOTHING was posted, so it is safe to retry (unlike
-	// the transport-ambiguous swErrIMTimeout / empty-200 swErrIMBadResponse, which
-	// may have been delivered and must never be auto-retried). The group welcome
-	// uses this to retry a failed coalesced post instead of terminal-`unknown`-ing
-	// the whole batch; the space welcome treats it like any other send error.
-	swErrIMRejected   = "im_rejected"
-	swErrSentPersist  = "sent_persist"
-	swErrClaimExpired = "claim_expired"
+	swErrSentPersist   = "sent_persist"
+	swErrClaimExpired  = "claim_expired"
 )
 
 // stage enumeration (structured log field).

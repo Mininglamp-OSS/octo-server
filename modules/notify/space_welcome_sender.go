@@ -101,12 +101,7 @@ func (s *spaceWelcomeSender) send(ctx context.Context, req *config.MsgSendReq) (
 		return nil, &swSendError{class: swErrIMTimeout, err: fmt.Errorf("read send response: %w", err)}
 	}
 	if resp.StatusCode != http.StatusOK {
-		// A definitive non-2xx: WuKongIM rejected the request and persisted
-		// nothing, so this is safe to retry (distinct from the ambiguous
-		// empty-200 / transport cases below). The space welcome still treats it as
-		// a send error; the group welcome uses this class to retry a failed
-		// coalesced post rather than terminal-unknown the whole batch.
-		return nil, &swSendError{class: swErrIMRejected, err: fmt.Errorf("IM /message/send status %d", resp.StatusCode)}
+		return nil, &swSendError{class: swErrIMBadResponse, err: fmt.Errorf("IM /message/send status %d", resp.StatusCode)}
 	}
 
 	// Parse the stable response shape { "data": { message_id, client_msg_no,

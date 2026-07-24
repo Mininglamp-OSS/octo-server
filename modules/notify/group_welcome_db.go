@@ -218,39 +218,6 @@ func (s *groupWelcomeStore) casPreIMFailure(ctx context.Context, id int64, attem
 	return ok, nil
 }
 
-// casDispatchingRetry transitions dispatching -> pending with backoff (or ->
-// failed after the retry budget), guarded by claim_owner. Used ONLY for a
-// definitively-not-delivered coalesced send (swErrIMRejected — a non-2xx from
-// WuKongIM that posted nothing): re-queuing is at-most-once-safe because the
-// public message never appeared, so the whole batch is re-attempted (re-coalesced)
-// on a later wake instead of being terminal-`unknown`-ed by one transient reject.
-// It mirrors casPreIMFailure's backoff/attempts machine but transitions from
-// `dispatching` (post-send) rather than `claimed` (pre-send).
-func (s *groupWelcomeStore) casDispatchingRetry(ctx context.Context, id int64, attempts int, errClass string, now time.Time) (bool, error) {
-	newAttempts := attempts + 1
-	if newAttempts > swMaxPreIMAttempts {
-		ok, err := s.cas(ctx,
-			"UPDATE "+groupWelcomeTable+" SET status=?, attempts=?, error_class=?, claim_owner=NULL, claim_expire_at=NULL, updated_at=? "+
-				"WHERE id=? AND status=? AND claim_owner=?",
-			swStatusFailed, newAttempts, errClass, now, id, swStatusDispatching, s.claimOwner,
-		)
-		if err != nil {
-			return false, fmt.Errorf("cas dispatching to failed: %w", err)
-		}
-		return ok, nil
-	}
-	nextRetry := now.Add(swBackoff[newAttempts-1])
-	ok, err := s.cas(ctx,
-		"UPDATE "+groupWelcomeTable+" SET status=?, attempts=?, error_class=?, next_retry_at=?, claim_owner=NULL, claim_expire_at=NULL, updated_at=? "+
-			"WHERE id=? AND status=? AND claim_owner=?",
-		swStatusPending, newAttempts, errClass, nextRetry, now, id, swStatusDispatching, s.claimOwner,
-	)
-	if err != nil {
-		return false, fmt.Errorf("cas dispatching retry: %w", err)
-	}
-	return ok, nil
-}
-
 // groupPrecheckResult is the outcome of the pre-send joiner re-check.
 type groupPrecheckResult struct {
 	eligible bool

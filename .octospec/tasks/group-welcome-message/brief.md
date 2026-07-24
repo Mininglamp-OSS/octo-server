@@ -238,8 +238,11 @@ refactor — explicitly out of scope here.)
     re-resolves the group config for the body and re-checks eligibility first. The
     **sweep** is cross-group (`sweepClaimedAll`/`sweepDispatchingAll` + sweep index)
     and reclaims lease-expired rows regardless of group. At-most-once,
-    CAS-on-`claim_owner`, lease, backoff, `unknown`/`failed`/retry terminal
-    handling — same contract as Space (plus a definitive-reject→retry path, below).
+    CAS-on-`claim_owner`, lease, backoff, `unknown`/`failed` terminal handling —
+    same contract as Space. A post-send failure marks every winner `unknown` and
+    is **never auto-retried** (the coalesced post is PUBLIC and carries no
+    idempotency key, so a retry could double-post a visible, unrecallable
+    message) — see the known-limitation on batch blast radius in the journal.
   - **Enqueue idempotency:** `INSERT … ON DUPLICATE KEY UPDATE id=id` on
     `(group_no, uid)`.
   - **Platform master switch (tags: notify, observability).** A single bool

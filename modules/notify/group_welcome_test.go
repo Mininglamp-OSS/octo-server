@@ -607,10 +607,11 @@ func TestGroupWelcome_Dispatch_SendTimeout_Unknown(t *testing.T) {
 	assert.Equal(t, 1, calls, "unknown is never re-sent (avoids public double-post)")
 }
 
-// TestGroupWelcome_Dispatch_SendRejected_RetriesThenDelivers: a definitive reject
-// (non-2xx = nothing posted) re-queues with backoff and is delivered on a later
-// wake — exactly once, no double post.
-func TestGroupWelcome_Dispatch_SendRejected_RetriesThenDelivers(t *testing.T) {
+// TestGroupWelcome_Dispatch_SendBadResponse_UnknownNotRetried: a non-2xx / ambiguous
+// send error is terminal `unknown` and is NEVER auto-retried — the send carries no
+// idempotency key and this is a PUBLIC post, so a retry could double-post a visible,
+// unrecallable welcome. Mirrors the space engine's conservative post-send policy.
+func TestGroupWelcome_Dispatch_SendBadResponse_UnknownNotRetried(t *testing.T) {
 	ctx := swTestServer(t)
 	af := time.Now().UTC().Add(-time.Hour)
 	gwInsertGroup(t, ctx, "g_1", 1)
@@ -620,30 +621,17 @@ func TestGroupWelcome_Dispatch_SendRejected_RetriesThenDelivers(t *testing.T) {
 	id := gwInsertGroupLedger(t, ctx, "g_1", "u_1", swStatusPending, "", nil, 0)
 
 	svc := gwNewService(t, ctx)
-	clock := time.Now().UTC().Truncate(time.Second)
-	svc.now = func() time.Time { return clock }
-	okSends, rejected := 0, false
+	calls := 0
 	svc.sendFn = func(_ context.Context, _ *config.MsgSendReq) (*swSendResult, error) {
-		if !rejected {
-			rejected = true
-			return nil, &swSendError{class: swErrIMRejected}
-		}
-		okSends++
-		return &swSendResult{messageID: 9, clientMsgNo: "x"}, nil
+		calls++
+		return nil, &swSendError{class: swErrIMBadResponse}
 	}
-
-	svc.runWorkerWake(bg()) // wake 1: rejected -> pending backoff
-	st, attempts, ec := gwRowFull(t, ctx, id)
-	assert.Equal(t, swStatusPending, st, "definitive reject -> retryable pending")
-	assert.Equal(t, 1, attempts)
-	assert.Equal(t, swErrIMRejected, ec)
-	assert.Equal(t, 0, okSends, "nothing posted on the rejected attempt")
-
-	clock = clock.Add(swBackoff[0] + time.Second) // past the retry backoff
-	svc.runWorkerWake(bg())                       // wake 2: re-claimed and delivered
-	st, _, _ = gwRowFull(t, ctx, id)
-	assert.Equal(t, swStatusSent, st, "retried post succeeds")
-	assert.Equal(t, 1, okSends, "delivered exactly once")
+	svc.runWorkerWake(bg())
+	st, _, ec := gwRowFull(t, ctx, id)
+	assert.Equal(t, swStatusUnknown, st, "post-send failure is terminal unknown for a public post")
+	assert.Equal(t, swErrIMBadResponse, ec)
+	svc.runWorkerWake(bg())
+	assert.Equal(t, 1, calls, "unknown is never re-sent — no public double-post risk")
 }
 
 // TestGroupWelcome_Dispatch_OrphanJoiner_Skipped: a joiner with no user row is

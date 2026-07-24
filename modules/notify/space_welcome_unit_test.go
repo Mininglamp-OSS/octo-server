@@ -58,7 +58,7 @@ func TestSpaceWelcomeSender_SetsHeadersAndParsesResult(t *testing.T) {
 	assert.EqualValues(t, 1, gotBody["channel_type"]) // ChannelTypePerson
 }
 
-func TestSpaceWelcomeSender_Non200IsRejected(t *testing.T) {
+func TestSpaceWelcomeSender_Non200IsBadResponse(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte(`boom`))
@@ -70,9 +70,7 @@ func TestSpaceWelcomeSender_Non200IsRejected(t *testing.T) {
 	require.Error(t, err)
 	var se *swSendError
 	require.ErrorAs(t, err, &se)
-	// A definitive non-2xx is "rejected / not delivered" — distinct from the
-	// ambiguous empty-200 case below — so a caller may safely retry it.
-	assert.Equal(t, swErrIMRejected, se.class)
+	assert.Equal(t, swErrIMBadResponse, se.class)
 }
 
 func TestSpaceWelcomeSender_Empty200IsBadResponse(t *testing.T) {

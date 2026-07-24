@@ -226,6 +226,8 @@ func (s *groupWelcomeService) handleMemberJoinBatch(groupNo string, uids []strin
 		s.metrics.incConfigInvalid()
 		return
 	}
+	// One due time for the whole event so all its members coalesce into one post.
+	batchNow := s.now()
 	for _, uid := range uids {
 		// System-bot exclusion is scoped strictly to the joiner uid.
 		if uid == "" || spacepkg.IsSystemBot(uid) {
@@ -243,16 +245,17 @@ func (s *groupWelcomeService) handleMemberJoinBatch(groupNo string, uids []strin
 			cancel()
 			continue
 		}
-		s.enqueue(callCtx, groupNo, uid, swSourceEvent)
+		s.enqueue(callCtx, groupNo, uid, swSourceEvent, batchNow)
 		cancel()
 	}
 }
 
 // enqueue upserts a pending row and splits enqueue_total vs enqueue_dedup_total.
 // The row is held back from the worker until now+coalesceWindow so co-arriving
-// joins collect into one post (see claimBatch / dispatchBatch).
-func (s *groupWelcomeService) enqueue(ctx context.Context, groupNo, uid, source string) {
-	now := s.now()
+// joins collect into one post (see claimBatch / dispatchBatch). now is passed in
+// so every member of ONE GroupMemberAdd event shares a single due time (a batch's
+// rows must not straddle the coalesce window and split into multiple posts).
+func (s *groupWelcomeService) enqueue(ctx context.Context, groupNo, uid, source string, now time.Time) {
 	inserted, err := s.store.upsertPending(ctx, groupNo, uid, now, now.Add(s.coalesceWindow))
 	if err != nil {
 		s.Warn("group welcome enqueue upsert failed",
@@ -335,7 +338,7 @@ func (s *groupWelcomeService) runReconcileOnce(ctx context.Context) {
 				return
 			}
 			callCtx, c := context.WithTimeout(ctx, swDBCallTimeout)
-			s.enqueue(callCtx, cfg.GroupNo, uid, swSourceReconciler)
+			s.enqueue(callCtx, cfg.GroupNo, uid, swSourceReconciler, s.now())
 			c()
 		}
 		budget -= len(uids)
@@ -410,6 +413,12 @@ func (s *groupWelcomeService) runWorkerWake(ctx context.Context) {
 	posts := 0
 	for i := 0; i < vn; i++ {
 		if ctx.Err() != nil || posts >= swWorkerWakeCap {
+			return
+		}
+		// Re-check the master switch before each new group's claim so an operator
+		// flipping it off mid-wake stops further posts at once (a batch already
+		// claimed this wake still completes).
+		if !s.settings.GroupWelcomeEnabled() {
 			return
 		}
 		cfg := valid[(wstart+i)%vn]
@@ -581,23 +590,21 @@ func (s *groupWelcomeService) dispatchBatch(ctx context.Context, cfg common.Grou
 	postSend := context.WithoutCancel(ctx)
 	result, sendErr := s.sendFn(postSend, req)
 	if sendErr != nil {
+		// Any post-send failure is transport-ambiguous for a PUBLIC message: the
+		// coalesced post may or may not have appeared in the channel, and the send
+		// carries no idempotency key, so auto-retrying could double-post a visible,
+		// unrecallable welcome. Mirror the space engine: mark every winner `unknown`
+		// (terminal, never auto-retried) and leave recovery to an operator. This
+		// means one send failure suppresses the whole coalesced batch — a documented
+		// blast-radius limitation to revisit (with message-level idempotency) before
+		// the master switch is enabled.
 		class := swErrIMTimeout
 		var se *swSendError
 		if errors.As(sendErr, &se) {
 			class = se.class
 		}
-		// A definitive reject (non-2xx) posted NOTHING → re-queue the whole batch
-		// (backoff, at-most-once-safe) instead of terminal-`unknown`-ing it, so one
-		// transient WuKongIM 5xx during a bulk invite cannot permanently suppress
-		// the coalesced welcome. Ambiguous errors (timeout / empty-200) stay
-		// `unknown` — they may have posted, and this is a PUBLIC message, so a retry
-		// could double-post.
 		for _, row := range winners {
-			if class == swErrIMRejected {
-				s.dispatchRetry(postSend, row, class)
-			} else {
-				s.toUnknown(postSend, row, class)
-			}
+			s.toUnknown(postSend, row, class)
 		}
 		return
 	}
@@ -619,23 +626,6 @@ func (s *groupWelcomeService) dispatchBatch(ctx context.Context, cfg common.Grou
 		s.metrics.incSendSuccess()
 		s.Info("group welcome delivered", zap.String("stage", swStagePersist), zap.Int64("delivery_id", row.ID),
 			zap.String("group_no", cfg.GroupNo), zap.String("uid", row.UID))
-	}
-}
-
-// dispatchRetry re-queues a dispatching row after a definitively-not-delivered
-// send (backoff to pending, or terminal `failed` after the retry budget). Shares
-// the pre-IM backoff schedule/budget; only fired for swErrIMRejected.
-func (s *groupWelcomeService) dispatchRetry(ctx context.Context, row *groupWelcomeRow, class string) {
-	c, cancel := context.WithTimeout(ctx, swDBCallTimeout)
-	ok, err := s.store.casDispatchingRetry(c, row.ID, row.Attempts, class, s.now())
-	cancel()
-	if err != nil {
-		s.Warn("group welcome cas dispatching retry failed", zap.Int64("delivery_id", row.ID), zap.String("error_class", class), zap.Error(err))
-		return
-	}
-	if ok && row.Attempts+1 > swMaxPreIMAttempts {
-		s.metrics.incSendFailed()
-		s.Warn("group welcome delivery failed (send-retry budget exhausted)", zap.Int64("delivery_id", row.ID), zap.String("error_class", class))
 	}
 }
 
